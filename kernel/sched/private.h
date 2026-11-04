@@ -55,7 +55,9 @@ struct kernel_scheduler {
     struct kernel_task boot_idle;
     struct kernel_task *cleanup_task;
     struct kernel_wait_queue cleanup_queue;
+#if BOAROS_MAX_CPUS == 1
     struct kernel_sched_runqueue runqueue;
+#endif
 #if BOAROS_USER_SMP
     struct kernel_sched_runqueue rt_services;
 #endif
@@ -177,8 +179,6 @@ enum kernel_scheduler_status release_task_stack(struct kernel_task *task);
 void kernel_task_release_io_scratch(struct kernel_task *task);
 enum kernel_scheduler_status release_task_storage(struct kernel_task *task,
     enum kernel_scheduler_status original_status);
-struct kernel_task *ready_first(void);
-struct kernel_task *ready_next(const struct kernel_task *task);
 void ready_remove(struct kernel_task *task);
 void ready_enqueue(struct kernel_task *task, int head);
 void scheduler_account_runtime(void);
@@ -227,7 +227,9 @@ enum kernel_signal_status kernel_signal_release_table(
 void kernel_signal_task_exit(struct kernel_task *task);
 
 
-void ready_enqueue_locked(struct kernel_task *task, int head);
+/* ready_flags携带换栈后的本核轮转意图；阻塞提交清零，不影响wake放置。 */
+enum { SCHED_READY_HEAD = 1, SCHED_READY_LOCAL = 2 };
+void ready_enqueue_locked(struct kernel_task *task, int flags);
 struct kernel_task *ready_best_locked(void);
 void ready_remove_locked(struct kernel_task *task);
 /* 调度域固定task与CPU owner；CPU片段数值由本CPU序列发布，快照返回纳秒。 */

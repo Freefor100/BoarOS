@@ -211,7 +211,7 @@ int main(void)
     }
     setup(KERNEL_SCHED_FIFO, 50, 60);
     assert(scheduler_reschedule(0, 0, 1) == KERNEL_SCHEDULER_STATUS_OK);
-    assert(switches == 1 && selected == &peer && running.wait.ready_head == 1);
+    assert(switches == 1 && selected == &peer && running.wait.ready_flags == 1);
     setup(KERNEL_SCHED_FIFO, 50, 0);
     cpu.rt_bandwidth.consumed_ns = (uint64_t)cpu.rt_bandwidth.runtime_ns;
     assert(scheduler_reschedule(0, 0, 1) == KERNEL_SCHEDULER_STATUS_OK);

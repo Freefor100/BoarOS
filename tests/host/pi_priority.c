@@ -43,11 +43,13 @@ static void setup(void)
 static void ready_and_running(void)
 {
     setup();KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+    tasks[0].cpu_mask=tasks[1].cpu_mask=1;
     ready_enqueue_locked(&tasks[0],0);ready_enqueue_locked(&tasks[1],0);
     assert(ready_best_locked()==&tasks[1]);
     scheduler_pi_priority_locked(&tasks[0],10,80);
     assert(tasks[0].scheduling.priority==80 && ready_best_locked()==&tasks[0]);
-    for(unsigned i=0;i<4;i++)assert(cpus[i].eligible.first->owner==&tasks[0]);
+    assert(tasks[0].ready_cpu==&cpus[0] && cpus[0].runqueue.first->owner==&tasks[0]);
+    for(unsigned i=1;i<4;i++)assert(!cpus[i].runqueue.first);
     scheduler_pi_priority_locked(&tasks[0],10,0);
     assert(tasks[0].scheduling.priority==10 && ready_best_locked()==&tasks[1]);
     ready_remove_locked(&tasks[0]);tasks[0].state=KERNEL_THREAD_STATE_RUNNING;
@@ -81,6 +83,7 @@ static void service_and_bandwidth(void)
     assert(scheduler.rt_services.first->priority==10 && cpus[1].user_reservations.first->priority==10);
     scheduler_user_reservation_release_locked(&tasks[0]);ready_remove_locked(&tasks[0]);
     tasks[0].user_service=0;
+    tasks[0].cpu_mask=tasks[1].cpu_mask=tasks[3].cpu_mask=1;
     ready_enqueue_locked(&tasks[0],0);ready_enqueue_locked(&tasks[1],0);ready_enqueue_locked(&tasks[3],0);
     cpus[0].rt_bandwidth.runtime_ns=0;
     assert(ready_best_locked()==&tasks[3]);
@@ -94,6 +97,7 @@ static void service_and_bandwidth(void)
 static void equal_priority_order(void)
 {
     setup();KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+    tasks[0].cpu_mask=tasks[2].cpu_mask=1;
     ready_enqueue_locked(&tasks[2],0);ready_enqueue_locked(&tasks[0],0);
     scheduler_pi_priority_locked(&tasks[0],10,70);
     assert(tasks[2].ready_node.next==&tasks[0].ready_node);
@@ -160,5 +164,5 @@ int main(void)
 {
     assert(scheduler_pi_priority_locked && "PI effective-priority publication is missing");
     ready_and_running();unchanged_owner_priority();service_and_bandwidth();equal_priority_order();donation_chain();long_existing_chain();
-    puts("PI priority: ready/running, four eligibilities, service reservation, throttling, FIFO and donation chain passed");
+    puts("PI priority: ready/running, unique CPU owner, service reservation, throttling, FIFO and donation chain passed");
 }

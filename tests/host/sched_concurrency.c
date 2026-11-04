@@ -73,7 +73,7 @@ uint64_t kernel_timer_fd_next;
 struct kernel_wait_record *kernel_wait_record_of(struct kernel_task *task)
 { return &task->wait; }
 void kernel_wait_backend_ready(struct kernel_task *task)
-{ ready_enqueue_locked(task, task->wait.ready_head); }
+{ ready_enqueue_locked(task, task->wait.ready_flags); }
 int kernel_wait_backend_initialized(void) { return 1; }
 struct kernel_task *kernel_wait_current_task(void) { return active_cpu->current; }
 struct kernel_wait_node *kernel_wait_default_node(struct kernel_task *task)
@@ -805,7 +805,7 @@ static void concurrent_claim(unsigned count)
         assert(!pthread_join(threads[i], 0));
         claims += selected[i] != 0;
     }
-    assert(claims == 1 && !scheduler.runqueue.first && tasks[0].wait.on_cpu);
+    assert(claims == 1 && !tasks[0].ready_cpu && tasks[0].wait.on_cpu);
     active_cpu = tasks[0].cpu;
     sync_test_irq = 1;
     {

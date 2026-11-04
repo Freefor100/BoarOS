@@ -203,7 +203,7 @@ void kernel_wait_backend_commit(struct kernel_task *task, uint64_t deadline, int
 #if BOAROS_USER_SMP
     scheduler_user_reservation_release_locked(task);
 #endif
-    task->wait.ready_head = 0;
+    task->wait.ready_flags = 0;
     if (task->wait.deadline != deadline || task->wait.interruptible != (uint32_t)interruptible) __builtin_trap();
     if (deadline) {
         deadline_index_insert(task);
@@ -229,7 +229,7 @@ void kernel_wait_backend_notify(struct kernel_task *task, uint32_t reason)
     (void)reason; /* 通知者在摘除期限索引后发布record.reason/phase。 */
     task->state = KERNEL_THREAD_STATE_READY;
 }
-void kernel_wait_backend_ready(struct kernel_task *task) { ready_enqueue_locked(task, task->wait.ready_head); }
+void kernel_wait_backend_ready(struct kernel_task *task) { ready_enqueue_locked(task, task->wait.ready_flags); }
 enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *task)
 { return scheduler_switch_current_away(task); }
 void kernel_wait_backend_quiesce(void)

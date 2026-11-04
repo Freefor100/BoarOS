@@ -8,7 +8,7 @@ struct kernel_raw_lock kernel_wait_domain __attribute__((weak));
 _Thread_local uintptr_t sync_test_irq;
 static _Thread_local struct kernel_cpu *active;
 static struct kernel_cpu cpus[BOAROS_MAX_CPUS];
-static struct kernel_task idles[BOAROS_MAX_CPUS], tasks[4];
+static struct kernel_task idles[BOAROS_MAX_CPUS], tasks[BOAROS_MAX_CPUS>4?BOAROS_MAX_CPUS:4];
 static pthread_barrier_t gate;
 static struct kernel_task *selected[BOAROS_MAX_CPUS];
 static unsigned deliveries;
@@ -78,14 +78,161 @@ static void *publish_and_claim(void *argument)
     }
 }
 
-#if BOAROS_MAX_CPUS == 4
-static void four_claims(void)
+static void reset_two_queues(void)
 {
-    for (unsigned task_count = 1; task_count <= 4; task_count += 3) {
+    scheduler=(struct kernel_scheduler){0};
+    scheduler.rt_configuration=(struct kernel_rt_configuration){1000000000,950000000};
+    for (unsigned i=0;i<2;i++) {
+        kernel_cpu_initialize(&cpus[i],7+i*12,0); cpus[i].logical_id=i;
+        cpus[i].state=KERNEL_CPU_ONLINE;
+        idles[i]=(struct kernel_task){.state=KERNEL_THREAD_STATE_IDLE};
+        idles[i].wait.on_cpu=1; cpus[i].current=&idles[i]; active=&cpus[i];
+        scheduler_cpu_initialize(active,&idles[i],1);
+    }
+}
+
+static void assert_ready_owner(struct kernel_task *task,struct kernel_cpu *owner)
+{
+    unsigned matches=0;
+    for (struct kernel_cpu *cpu=scheduler.cpus;cpu;cpu=cpu->scheduler_next) {
+        unsigned count=0;
+        for (struct kernel_sched_node *node=cpu->runqueue.first;node;node=node->next) {
+            count++;
+            struct kernel_task *queued=node->owner;
+            assert(node==&queued->ready_node && queued->ready_cpu==cpu && !queued->wait.on_cpu);
+            matches+=queued==task;
+        }
+        assert(count==cpu->runqueue.count);
+    }
+    assert(matches==1 && task->ready_node.queued && task->ready_cpu==owner);
+}
+
+static void placement_blocker_cases(void)
+{
+    reset_two_queues();active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      cpus[0].rt_bandwidth.runtime_ns=cpus[1].rt_bandwidth.runtime_ns=-1;
+      setup_task(1,1,99);
+      tasks[2]=(struct kernel_task){.accounted=1,.cpu=&cpus[1],
+          .state=KERNEL_THREAD_STATE_RUNNING,.wait.on_cpu=1};
+      tasks[2].scheduling.policy=KERNEL_SCHED_FIFO;tasks[2].scheduling.priority=10;cpus[1].current=&tasks[2];idles[1].wait.on_cpu=0;
+      kernel_cpu_consume_schedule(&cpus[0]);kernel_cpu_consume_schedule(&cpus[1]);
+      tasks[0]=(struct kernel_task){.accounted=1,.cpu_mask=3,.cpu=&cpus[0],
+          .state=KERNEL_THREAD_STATE_READY};
+      tasks[0].scheduling.policy=KERNEL_SCHED_FIFO;
+      tasks[0].scheduling.priority=80;ready_enqueue_locked(&tasks[0],0);
+      /* idle的CPU0即将运行pinned FIFO99，RT80必须抢占CPU1的FIFO10。 */
+      assert_ready_owner(&tasks[0],&cpus[1]);
+      assert(!kernel_cpu_schedule_requested(&cpus[0]) && kernel_cpu_schedule_requested(&cpus[1]));
+      ready_remove_locked(&tasks[0]);ready_remove_locked(&tasks[1]); }
+    puts("PASS placement: queued pinned FIFO99 cannot hide executable FIFO80 behind an idle last CPU");
+
+    reset_two_queues();active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      cpus[0].rt_bandwidth.consumed_ns=cpus[0].rt_bandwidth.runtime_ns;
+      tasks[2]=(struct kernel_task){.accounted=1,.cpu=&cpus[1],
+          .state=KERNEL_THREAD_STATE_RUNNING,.wait.on_cpu=1};
+      cpus[1].current=&tasks[2];idles[1].wait.on_cpu=0;
+      kernel_cpu_consume_schedule(&cpus[0]);kernel_cpu_consume_schedule(&cpus[1]);
+      tasks[0]=(struct kernel_task){.accounted=1,.cpu_mask=3,.cpu=&cpus[0],
+          .state=KERNEL_THREAD_STATE_READY};
+      tasks[0].scheduling.policy=KERNEL_SCHED_FIFO;
+      tasks[0].scheduling.priority=80;ready_enqueue_locked(&tasks[0],0);
+      assert_ready_owner(&tasks[0],&cpus[1]);
+      assert(!kernel_cpu_schedule_requested(&cpus[0]) && kernel_cpu_schedule_requested(&cpus[1]));
+      ready_remove_locked(&tasks[0]);
+      /* 所有核都无预算时仍有唯一排队owner，恢复预算后可取得执行资格。 */
+      cpus[1].rt_bandwidth.consumed_ns=cpus[1].rt_bandwidth.runtime_ns;
+      ready_enqueue_locked(&tasks[0],0);assert_ready_owner(&tasks[0],&cpus[0]);
+      assert(!ready_best_locked());
+      cpus[0].rt_bandwidth.consumed_ns=0;
+      assert(ready_best_locked()==&tasks[0]);ready_remove_locked(&tasks[0]);
+      /* 捐赠优先级的持锁者不受上述预算排除，仍选空闲的CPU0。 */
+      cpus[0].rt_bandwidth.consumed_ns=cpus[0].rt_bandwidth.runtime_ns;
+      cpus[1].rt_bandwidth.consumed_ns=0;
+      tasks[0].scheduling.policy=KERNEL_SCHED_OTHER;tasks[0].pi_base_priority=1;
+      ready_enqueue_locked(&tasks[0],0);assert_ready_owner(&tasks[0],&cpus[0]);
+      assert(ready_best_locked()==&tasks[0]);ready_remove_locked(&tasks[0]); }
+    puts("PASS placement: prefer usable RT budget; all-throttled fallback and PI exemption retain progress");
+    reset_two_queues();
+}
+
+static void owned_queue_cases(void)
+{
+    reset_two_queues();active=&cpus[1];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      for (unsigned i=0;i<2;i++) {
+          tasks[i]=(struct kernel_task){.accounted=1,.cpu_mask=3,
+              .state=KERNEL_THREAD_STATE_READY,.cpu=&cpus[0]};
+          ready_enqueue_locked(&tasks[i],0);
+      }
+      assert_ready_owner(&tasks[0],&cpus[0]);assert_ready_owner(&tasks[1],&cpus[1]);
+      struct kernel_sched_node *unrelated=cpus[1].runqueue.first;
+      scheduler_pi_priority_locked(&tasks[0],0,80);
+      assert_ready_owner(&tasks[0],&cpus[0]);
+      assert(cpus[1].runqueue.first==unrelated && cpus[1].runqueue.count==1 &&
+          !cpus[1].runqueue.boosted && cpus[0].runqueue.boosted==1);
+      scheduler_pi_priority_locked(&tasks[0],80,0);
+      kernel_cpu_consume_schedule(&cpus[0]);kernel_cpu_consume_schedule(&cpus[1]);
+      /* 实际优先级相同但解除PI节流时仍通知真实owner。 */
+      scheduler_pi_priority_locked(&tasks[0],0,80);
+      assert(cpus[0].runqueue.boosted==1 && kernel_cpu_schedule_requested(&cpus[0]) &&
+          !kernel_cpu_schedule_requested(&cpus[1]));
+      scheduler_pi_priority_locked(&tasks[0],0,0);
+      ready_remove_locked(&tasks[0]);ready_remove_locked(&tasks[1]);
+      tasks[0].cpu=0;ready_enqueue_locked(&tasks[0],0);
+      assert_ready_owner(&tasks[0],&cpus[1]);ready_remove_locked(&tasks[0]);
+    }
+    kernel_cpu_initialize(&publishers[0],100,0);active=&publishers[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      ready_enqueue_locked(&tasks[0],0);
+      assert_ready_owner(&tasks[0],&cpus[0]);ready_remove_locked(&tasks[0]); }
+    active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      for (unsigned i=0;i<2;i++) {
+          tasks[2+i]=(struct kernel_task){.accounted=1,.state=KERNEL_THREAD_STATE_RUNNING,
+              .cpu=&cpus[i],.wait.on_cpu=1};
+          tasks[2+i].scheduling.priority=i?10:90;cpus[i].current=&tasks[2+i];
+          kernel_cpu_consume_schedule(&cpus[i]);
+      }
+      setup_task(1,2,0);
+      tasks[0]=(struct kernel_task){.accounted=1,.cpu_mask=3,.cpu=&cpus[0],
+          .state=KERNEL_THREAD_STATE_READY};
+      tasks[0].scheduling.priority=50;ready_enqueue_locked(&tasks[0],0);
+      assert_ready_owner(&tasks[0],&cpus[1]);
+      assert(kernel_cpu_schedule_requested(&cpus[1]) && !kernel_cpu_schedule_requested(&cpus[0]));
+      ready_remove_locked(&tasks[0]);ready_remove_locked(&tasks[1]); }
+    puts("PASS ready placement: load, last/caller/ID ties, sole priority owner and actual RT preemption target");
+
+    reset_two_queues();active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      setup_task(0,1,99);
+      for (unsigned i=1;i<3;i++) {
+          tasks[i]=(struct kernel_task){.accounted=1,.cpu_mask=3,.cpu=&cpus[0],
+              .state=KERNEL_THREAD_STATE_READY};
+          tasks[i].scheduling.priority=i==1?80:10;
+          ready_enqueue_locked(&tasks[i],SCHED_READY_LOCAL);
+          assert_ready_owner(&tasks[i],&cpus[0]);
+      } }
+    active=&cpus[1];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      assert(ready_best_locked()==&tasks[1]);
+      assert(tasks[1].ready_cpu==&cpus[0] && !tasks[1].wait.on_cpu);
+      assert(scheduler_select_next_locked(active,active->current,1)==&tasks[1]);
+      assert(!tasks[1].ready_cpu && tasks[1].wait.on_cpu && tasks[1].cpu==active);
+      assert_ready_owner(&tasks[0],&cpus[0]);assert_ready_owner(&tasks[2],&cpus[0]); }
+    puts("PASS idle pull: skip pinned head, select highest eligible priority, remove only the actual ready owner");
+    reset_two_queues();
+}
+
+#if BOAROS_MAX_CPUS >= 4
+static void many_claims(void)
+{
+    for (unsigned task_count = 1; task_count <= BOAROS_MAX_CPUS; task_count += BOAROS_MAX_CPUS-1) {
         scheduler = (struct kernel_scheduler){0};
         scheduler.rt_configuration.period_ns = 1000000000;
         scheduler.rt_configuration.runtime_ns = 950000000;
-        for (unsigned i=0; i<4; i++) {
+        for (unsigned i=0; i<BOAROS_MAX_CPUS; i++) {
             kernel_cpu_initialize(&cpus[i],7+i*19,0);cpus[i].logical_id=i;
             active=&cpus[i];idles[i]=(struct kernel_task){0};
             idles[i].wait.on_cpu=1;idles[i].state=KERNEL_THREAD_STATE_IDLE;
@@ -94,27 +241,30 @@ static void four_claims(void)
         }
         active=&cpus[0];
         { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-          for(unsigned i=0;i<task_count;i++)setup_task(i,15,0); }
-        assert(!pthread_barrier_init(&gate,0,4));pthread_t threads[4];
-        for(unsigned i=0;i<4;i++)assert(!pthread_create(&threads[i],0,claim,(void *)(uintptr_t)i));
-        for(unsigned i=0;i<4;i++)assert(!pthread_join(threads[i],0));
+          for(unsigned i=0;i<task_count;i++)setup_task(i,(1U<<BOAROS_MAX_CPUS)-1,0); }
+        assert(!pthread_barrier_init(&gate,0,BOAROS_MAX_CPUS));pthread_t threads[BOAROS_MAX_CPUS];
+        for(unsigned i=0;i<BOAROS_MAX_CPUS;i++)assert(!pthread_create(&threads[i],0,claim,(void *)(uintptr_t)i));
+        for(unsigned i=0;i<BOAROS_MAX_CPUS;i++)assert(!pthread_join(threads[i],0));
         for(unsigned t=0;t<task_count;t++) {
             unsigned owners=0;
-            for(unsigned i=0;i<4;i++) {
+            for(unsigned i=0;i<BOAROS_MAX_CPUS;i++) {
                 owners+=selected[i]==&tasks[t];
-                assert(!tasks[t].eligible_nodes[i].queued && !cpus[i].eligible.first);
+                assert(!cpus[i].runqueue.first);
             }
-            assert(owners==1 && tasks[t].wait.on_cpu && !tasks[t].ready_node.queued);
+            assert(owners==1 && tasks[t].wait.on_cpu && !tasks[t].ready_node.queued && !tasks[t].ready_cpu);
         }
-        assert(!scheduler.runqueue.first);pthread_barrier_destroy(&gate);
+        pthread_barrier_destroy(&gate);
     }
-    puts("SMP four simultaneous selectors claim one/four tasks exactly once and remove every eligibility");
+    puts("SMP simultaneous selectors claim one/all tasks exactly once and release their ready owners");
 }
 #endif
 
 int main(void)
 {
     kernel_raw_lock_init(&kernel_wait_domain, KERNEL_RAW_RANK_SCHEDULER);
+    owned_queue_cases();
+    placement_blocker_cases();
+    scheduler=(struct kernel_scheduler){0};
     scheduler.rt_configuration.period_ns = 1000000000;
     scheduler.rt_configuration.runtime_ns = 950000000;
     for (unsigned i = 0; i < 2; i++) {
@@ -153,15 +303,15 @@ int main(void)
       assert(ready_best_locked() == &tasks[2]);
       ready_remove_locked(&tasks[2]); ready_remove_locked(&tasks[0]);
       setup_task(3, 3, 0); }
-    /* 两CPU同时准备取得同一全局runnable owner，唯一一个claim可成功。 */
+    /* 本核owner和异核pull同时取得同一任务，唯一一个claim可成功。 */
     assert(!pthread_barrier_init(&gate, 0, 2));
     pthread_t threads[2];
     for (unsigned i = 0; i < 2; i++) assert(!pthread_create(&threads[i], 0, claim, (void *)(uintptr_t)i));
     for (unsigned i = 0; i < 2; i++) assert(!pthread_join(threads[i], 0));
     assert((selected[0] == &tasks[3]) + (selected[1] == &tasks[3]) == 1);
     assert(tasks[3].wait.on_cpu && !tasks[3].ready_node.queued);
-    assert(!tasks[3].eligible_nodes[0].queued && !tasks[3].eligible_nodes[1].queued);
-    assert(!cpus[0].eligible.first && !cpus[1].eligible.first && !scheduler.runqueue.first);
+    assert(!tasks[3].ready_cpu);
+    assert(!cpus[0].runqueue.first && !cpus[1].runqueue.first);
     unsigned owner = tasks[3].cpu->logical_id;
     assert(cpus[owner].switch_previous == &idles[owner] && idles[owner].wait.on_cpu);
     assert(deliveries);
@@ -193,12 +343,12 @@ int main(void)
     for (unsigned i = 0; i < 4; i++) assert(!pthread_create(&actors[i], 0, publish_and_claim, (void *)(uintptr_t)i));
     for (unsigned i = 0; i < 4; i++) assert(!pthread_join(actors[i], 0));
     assert(selected[0] != selected[1] && selected[0] && selected[1]);
-    assert(!scheduler.runqueue.first && !cpus[0].eligible.first && !cpus[1].eligible.first);
+    assert(!cpus[0].runqueue.first && !cpus[1].runqueue.first);
     assert(tasks[0].wait.on_cpu && tasks[1].wait.on_cpu && tasks[0].cpu != tasks[1].cpu);
     pthread_barrier_destroy(&gate);
-#if BOAROS_MAX_CPUS == 4
-    four_claims();
+#if BOAROS_MAX_CPUS >= 4
+    many_claims();
 #endif
-    puts("SMP eligibility FIFO, global membership and concurrent execution claim passed");
+    puts("SMP owned FIFO queues, idle pull and concurrent execution claim passed");
     return 0;
 }

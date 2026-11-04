@@ -279,7 +279,7 @@ static void edge_cases(void)
             "duplicate-notify");
     { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
       require(edge_join.task->wait.on_cpu && edge_join.task->wait.ready_pending &&
-              !edge_join.task->ready_node.queued && !edge_join.task->eligible_nodes[1].queued,
+              !edge_join.task->ready_node.queued && !edge_join.task->ready_cpu,
               "early-ready-excluded"); }
     require(kernel_thread_set_cpu_mask(&edge_join, 1) == KERNEL_SCHEDULER_STATUS_BUSY,
             "old-stack-mask-busy");
@@ -999,7 +999,7 @@ static void creation_stop_race(void)
             !creation_gate.registrations && !creation_gate.borrows &&
             physical_page_available(allocator) == available, "creation-stopped-rollback-owner");
     { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-      require(!scheduler.controlled_owners && !riscv_smp_cpu(1)->eligible.first,
+      require(!scheduler.controlled_owners && !riscv_smp_cpu(1)->runqueue.first,
               "creation-stopped-no-publication"); }
     virt_uart_puts("BoarOS: SMP sleeping create rechecks STOPPED and returns private owners\n");
 }

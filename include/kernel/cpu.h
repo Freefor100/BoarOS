@@ -62,7 +62,7 @@ struct kernel_cpu {
 #if BOAROS_MAX_CPUS > 1
     uint32_t logical_id, state, events, outbound;
     struct { uint64_t period, next_deadline; int armed; } timer;
-    struct kernel_sched_runqueue eligible;
+    struct kernel_sched_runqueue runqueue;
     uint64_t ipi_sent, ipi_received, rfence_requests;
 #if BOAROS_USER_SMP
     /* 借用任务执行/就绪owner，保留服务往返期间的实时用户资格。 */

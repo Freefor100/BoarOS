@@ -368,6 +368,32 @@ enum kernel_scheduler_status activate_thread_address_space(
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
+static enum kernel_scheduler_status validate_ready_queue(
+    struct kernel_sched_runqueue *queue
+#if BOAROS_MAX_CPUS > 1
+    ,struct kernel_cpu *owner
+#endif
+    )
+{
+    if (!!queue->first != !!queue->last || !!queue->first != !!queue->count ||
+        (queue->first && queue->first->previous) || (queue->last && queue->last->next))
+        return KERNEL_SCHEDULER_STATUS_QUEUE_CORRUPT;
+    struct kernel_sched_node *ends[2]={queue->first,queue->last};
+    for (unsigned i=0; i<2 && ends[i]; i++) {
+        struct kernel_sched_node *node=ends[i];
+        struct kernel_task *task=node->owner;
+        if (!task || node!=&task->ready_node || !node->queued || task->wait.on_cpu ||
+            node->priority!=(unsigned)task->scheduling.priority
+#if BOAROS_MAX_CPUS > 1
+            || task->ready_cpu!=owner
+#endif
+            ) return KERNEL_SCHEDULER_STATUS_QUEUE_CORRUPT;
+        enum kernel_scheduler_status status=validate_thread(task,KERNEL_THREAD_STATE_READY);
+        if (status!=KERNEL_SCHEDULER_STATUS_OK) return status;
+    }
+    return KERNEL_SCHEDULER_STATUS_OK;
+}
+
 enum kernel_scheduler_status validate_queues_locked(void)
     __attribute__((noinline, noclone));
 
@@ -379,27 +405,23 @@ enum kernel_scheduler_status validate_queues_locked(void)
     enum kernel_scheduler_status status;
 
 
-    if (!!scheduler.runqueue.first != !!scheduler.runqueue.last ||
-        (scheduler.runqueue.first && scheduler.runqueue.first->previous) ||
-        (scheduler.runqueue.last && scheduler.runqueue.last->next))
-        return KERNEL_SCHEDULER_STATUS_QUEUE_CORRUPT;
-    status = validate_queue_shape(scheduler.exited_head,
-                                  scheduler.exited_tail);
-    if (status != KERNEL_SCHEDULER_STATUS_OK) {
-        return status;
-    }
-    if (ready_first() != 0) {
-        status = validate_thread(ready_first(),
-                                 KERNEL_THREAD_STATE_READY);
-        if (status != KERNEL_SCHEDULER_STATUS_OK) {
-            return status;
+#if BOAROS_MAX_CPUS > 1
+    for (struct kernel_cpu *owner=scheduler.cpus;owner;owner=owner->scheduler_next) {
+        status=validate_ready_queue(&owner->runqueue,owner);
+        if (status!=KERNEL_SCHEDULER_STATUS_OK) return status;
+#if BOAROS_USER_SMP
+        if (!owner->logical_id) {
+            status=validate_ready_queue(&scheduler.rt_services,owner);
+            if (status!=KERNEL_SCHEDULER_STATUS_OK) return status;
         }
-        status = validate_thread((struct kernel_task *)scheduler.runqueue.last->owner,
-                                 KERNEL_THREAD_STATE_READY);
-        if (status != KERNEL_SCHEDULER_STATUS_OK) {
-            return status;
-        }
+#endif
     }
+#else
+    status=validate_ready_queue(&scheduler.runqueue);
+    if (status!=KERNEL_SCHEDULER_STATUS_OK) return status;
+#endif
+    status=validate_queue_shape(scheduler.exited_head,scheduler.exited_tail);
+    if (status!=KERNEL_SCHEDULER_STATUS_OK) return status;
     if (scheduler.exited_head != 0) {
         if (scheduler.exited_head->magic != KERNEL_THREAD_MAGIC ||
             scheduler.exited_tail->magic != KERNEL_THREAD_MAGIC ||
@@ -870,7 +892,9 @@ enum kernel_scheduler_status kernel_scheduler_init(
     kernel_cpu_current()->current = &scheduler.boot_idle;
     scheduler.cleanup_task = 0;
     kernel_wait_queue_init(&scheduler.cleanup_queue);
+#if BOAROS_MAX_CPUS == 1
     memset(&scheduler.runqueue, 0, sizeof(scheduler.runqueue));
+#endif
     uint64_t now = kernel_time_monotonic_ns();
     struct kernel_rt_bandwidth initial_budget;
     kernel_rt_bandwidth_init(&initial_budget, now);
@@ -1041,7 +1065,7 @@ int kernel_scheduler_core_quiescent(struct kernel_cpu *cpu)
 {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     return !scheduler.controlled_owners && cpu && cpu->current == cpu->idle &&
-        !cpu->switch_previous && !cpu->eligible.first && !cpu->active_mm_record
+        !cpu->switch_previous && !cpu->runqueue.first && !cpu->active_mm_record
 #if BOAROS_USER_SMP
         && !cpu->user_reservations.first && !scheduler.rt_services.first
 #endif
