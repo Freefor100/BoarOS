@@ -1,13 +1,15 @@
 /* One ELF compares fixed WAIT/WAKE work on both the old and new kernels. */
 enum { FUTEX_PERF_WAIT_PRIVATE=128,FUTEX_PERF_WAKE_PRIVATE=129 };
-struct futex_perf_pair { uint32_t sequence;uint64_t request,reply; };
+struct futex_perf_pair { uint32_t sequence;uint64_t request,reply,request_tail[7],reply_tail[7]; };
 struct futex_perf_mutex { uint32_t state;uint64_t value,check; };
 struct futex_perf_work {
     unsigned cpus,mode,completed[8],wait_calls[8],wake_calls[8];
+    unsigned rounds,message_words,linear_actors;
     pthread_barrier_t gate;
     struct futex_perf_pair pairs[4];
     struct futex_perf_mutex locks[4];
     uint64_t cpu[8],samples[32768];
+    uint64_t begin[8],end[8];
 };
 struct futex_perf_actor { struct futex_perf_work *work;unsigned id; };
 static _Thread_local unsigned futex_perf_wait_calls,futex_perf_wake_calls;
@@ -45,23 +47,32 @@ static void *futex_perf_run(void *argument)
     struct futex_perf_actor *actor=argument;struct futex_perf_work *w=actor->work;
     unsigned id=actor->id,pair=id/2,role=id%2;
     futex_perf_wait_calls=futex_perf_wake_calls=0;
-    queue_pin((pair+role)%w->cpus);queue_gate(&w->gate);queue_gate(&w->gate);
+    queue_pin(w->linear_actors?id:(pair+role)%w->cpus);queue_gate(&w->gate);queue_gate(&w->gate);
     uint64_t cpu=queue_clock(CLOCK_THREAD_CPUTIME_ID);
+    if(w->rounds)w->begin[id]=now();
     if(!w->mode) {
         struct futex_perf_pair *p=&w->pairs[pair];
-        for(unsigned i=0;i<1024;i++) {
+        unsigned rounds=w->rounds?w->rounds:1024;
+        CHECK(w->message_words<=8);
+        for(unsigned i=0;i<rounds;i++) {
             uint64_t value=futex_perf_value(pair,i),start=0;
             if(!role) {
                 start=now();p->request=value;
+                for(unsigned j=1;j<w->message_words;j++)p->request_tail[j-1]=value^((uint64_t)j<<48);
                 __atomic_store_n(&p->sequence,2*i+1,__ATOMIC_RELEASE);futex_perf_wake(&p->sequence);
                 futex_perf_until(&p->sequence,2*i+2);CHECK(p->reply==~value);
-                w->samples[pair*1024+i]=now()-start;
+                for(unsigned j=1;j<w->message_words;j++)CHECK(p->reply_tail[j-1]==~(value^((uint64_t)j<<48)));
+                w->samples[pair*rounds+i]=now()-start;
             } else {
                 futex_perf_until(&p->sequence,2*i+1);CHECK(p->request==value);p->reply=~value;
+                for(unsigned j=1;j<w->message_words;j++) {
+                    CHECK(p->request_tail[j-1]==(value^((uint64_t)j<<48)));
+                    p->reply_tail[j-1]=~p->request_tail[j-1];
+                }
                 __atomic_store_n(&p->sequence,2*i+2,__ATOMIC_RELEASE);futex_perf_wake(&p->sequence);
             }
         }
-        w->completed[id]=1024;
+        w->completed[id]=rounds;
     } else {
         struct futex_perf_mutex *lock=&w->locks[w->mode==1?pair:0];
         for(unsigned i=0;i<4096;i++) {
@@ -72,6 +83,7 @@ static void *futex_perf_run(void *argument)
         }
         w->completed[id]=4096;
     }
+    if(w->rounds)w->end[id]=now();
     w->cpu[id]=queue_clock(CLOCK_THREAD_CPUTIME_ID)-cpu;
     w->wait_calls[id]=futex_perf_wait_calls;w->wake_calls[id]=futex_perf_wake_calls;
     queue_gate(&w->gate);return 0;
