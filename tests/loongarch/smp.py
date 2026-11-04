@@ -24,7 +24,7 @@ def parse_cpus(raw):
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--kernel',type=Path,required=True);p.add_argument('--program',type=Path,required=True)
-    p.add_argument('--output',type=Path,required=True);p.add_argument('--cpus',type=int,choices=(1,2,3,4),default=2)
+    p.add_argument('--output',type=Path,required=True);p.add_argument('--cpus',type=int,choices=range(1,9),default=2)
     p.add_argument('--performance',action='store_true');p.add_argument('--host-vcpus');p.add_argument('--host-io',type=int,default=8);p.add_argument('--perf-stat',action='store_true')
     p.add_argument('--loader',type=Path);p.add_argument('--system',choices=('boaros','linux'),default='boaros');p.add_argument('--expect-failure');p.add_argument('--failure-target',type=int);p.add_argument('--expect-protocol',action='store_true');p.add_argument('--memory',default='512M');a=p.parse_args()
     interpreter=None;loader_hash=None

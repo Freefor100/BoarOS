@@ -20,7 +20,7 @@
 #include <string.h>
 #include <time.h>
 #define CHECK(x) do {if(!(x)){printf("LA-SMP FAIL line=%d errno=%d\n",__LINE__,errno);fflush(NULL);exit(1);}}while(0)
-#define MAX_CPUS 4
+#define MAX_CPUS 8
 static unsigned cpus,cases;static size_t page;
 static _Thread_local unsigned tls,handled,expected_fault;
 static _Thread_local sigjmp_buf fault_return;
