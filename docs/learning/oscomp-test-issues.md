@@ -232,3 +232,11 @@ O_DIRECT等缺口按内核能力处理；CPU-time sleep及RLIMIT_CPU已接入，
 ## 原盘futex覆盖范围
 
 2026-10-25核对RV/LA、glibc/musl四份发布目录：均有普通WAIT/WAKE、CMP_REQUEUE、BITSET和waitv程序，没有独立的LOCK_PI／UNLOCK_PI测例。因此原`futex_wait01/wake01/cmp_requeue01`的17/17用于普通路径回归；新增PI mutex的功能依据来自两架构直接程序、libc的PTHREAD_PRIO_INHERIT消费者及固定Linux差分。原ELF与判分保持原样，结果见[本批futex结果](oscomp-ltp-analysis.md#pi-mutex接入后的原futex短例2026-10-25)。该批未实现的waitv已在后续多地址等待阶段接入，原程序的版本检查结果见上表。
+
+## 自有调度查询差分夹具的并发假设
+
+`sched_getattr` 的固定 Linux 实现仅在 RCU 读侧保护目标寿命，依次读取策略、RESET_ON_FORK、实时优先级；与另一线程修改策略并发时，各字段可来自不同更新。LA glibc 的自有消费者曾因只接受两种完整组合而失败，实际读到 FIFO／优先级21／RESET_ON_FORK=1。
+
+夹具现在以用户态更新版本和明确握手检查稳定窗口；查询跨越更新时，Linux 检查字段的合法来源，BoarOS 仍始终检查身份保护内的完整快照。固定Linux同ELF对照七项通过，Linux有307次混合快照，BoarOS为0。这是自有夹具的假设修正，不属于原LTP发布输入。固定源码路径为`kernel/sched/syscalls.c`中的`sched_getattr`及`__sched_setscheduler`。
+
+另一个假设是`pthread_join`返回后旧TID立即从PID索引消失。Linux可先通过clear_child_tid唤醒join，再撤下身份；夹具改为有界等待该身份结束，已有快照仍严格核对。相关功能结果与性能见[本批记录](cpu-accounting-cost.md#单一就绪队列与-rv-八核la-四核2026-11-04)。
