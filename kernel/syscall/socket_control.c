@@ -35,7 +35,7 @@ int kernel_socket_call_begin(struct kernel_socket_call *call, struct kernel_file
     if (kernel_task_socket_call_register(call->task,call)!=KERNEL_TASK_STATUS_OK) __builtin_trap();
     return 0;
 }
-static void socket_call_cleanup(struct kernel_socket_call *call, int aborting)
+void kernel_socket_call_message_end(struct kernel_socket_call *call)
 {
     if (call->fd_reserved) {
         struct kernel_files_fd_reservation reservation={call->files,call->reserved_fd};
@@ -50,6 +50,11 @@ static void socket_call_cleanup(struct kernel_socket_call *call, int aborting)
         call->iov_snapshot=0;
     }
     if (call->address) {kernel_socket_address_release(call->address);call->address=0;}
+    call->message=(struct kernel_socket_message){0};
+}
+static void socket_call_cleanup(struct kernel_socket_call *call, int aborting)
+{
+    kernel_socket_call_message_end(call);
     if (aborting && call->socket_owner) {
         enum kernel_files_status status=kernel_files_release_uninstalled_description(call->files,call->socket_owner);
         if (status!=KERNEL_FILES_STATUS_OK && status!=KERNEL_FILES_STATUS_CLEANUP_REQUIRED) __builtin_trap();

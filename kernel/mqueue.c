@@ -46,6 +46,7 @@ struct mq_notification {
     int32_t type,signal;
 };
 struct kernel_mqueue {
+    struct kernel_flock_identity flock_identity;
     struct kernel_mqueue *next;
     struct kernel_raw_lock lock;
     struct kernel_wait_queue waiters;
@@ -141,6 +142,7 @@ void kernel_mqueue_put(struct kernel_mqueue *q)
 {
     if(__atomic_sub_fetch(&q->references,1,__ATOMIC_ACQ_REL))return;
     if(q->linked||q->send_head||q->recv_head)__builtin_trap();
+    kernel_flock_destroy(&q->flock_identity);
     if(kernel_wait_queue_close(&q->waiters))__builtin_trap();
     while(kernel_wait_queue_destroy(&q->waiters)==KERNEL_SCHEDULER_STATUS_BUSY)
         if(kernel_scheduler_yield_current())__builtin_trap();
@@ -288,6 +290,8 @@ int kernel_mqueue_next(uint64_t *cursor,uint64_t *id,char *name,size_t capacity)
 }
 static struct kernel_mqueue *file_queue(struct kernel_open_file_description *file)
 { return ((struct mq_file *)file)->queue; }
+struct kernel_flock_identity *kernel_mqueue_flock_identity(struct kernel_open_file_description *file)
+{ return &file_queue(file)->flock_identity; }
 static int file_create(struct kernel_heap *heap,struct kernel_mqueue *q,uint32_t flags,
     struct kernel_open_file_description **out)
 {

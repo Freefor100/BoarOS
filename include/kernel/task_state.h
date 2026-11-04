@@ -266,6 +266,8 @@ struct kernel_task {
     struct kernel_mqueue_request *mqueue_request;
     uint8_t exit_signal;
     struct kernel_io_priority_context *io_priority;
+    struct kernel_files_change *files_change;
+    struct kernel_open_file_description *flock_file;
 } __attribute__((aligned(16)));
 
 #endif

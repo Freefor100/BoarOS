@@ -42,6 +42,7 @@ static void filesystem_cost(unsigned cpus)
     for(unsigned i=0;i<4;i++){char path[32];snprintf(path,sizeof(path),"/la-cost/%u",i);CHECK(!close(workers[i].fd)&&!unlink(path));}
     CHECK(!rmdir("/la-cost"));
 }
+#ifndef LA_SMP_COST_EMBEDDED
 static void compute_cost(unsigned cpus)
 {
     pthread_barrier_t gate;CHECK(!pthread_barrier_init(&gate,NULL,5));struct posix_worker workers[4];pthread_t threads[4];
@@ -63,3 +64,4 @@ int main(void)
     config=fopen("/account-altstack","r");CHECK(config&&!stack_cost_main(config));
     futex_perf(cpus);compute_cost(cpus);filesystem_cost(cpus);puts("LA-SMP-PERF END 7");return 0;
 }
+#endif

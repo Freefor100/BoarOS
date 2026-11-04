@@ -3,6 +3,7 @@
 
 #include "vfs_internal.h"
 #include "record_lock.h"
+#include "flock.h"
 #include <kernel/cost.h>
 #include <kernel/vfs.h>
 #include <kernel/heap.h>
@@ -57,6 +58,7 @@ struct kernel_vfs_node {
     struct kernel_memory_object *memory;
     struct kernel_file_mapping_state *mapping_state;
     struct kernel_record_lock_state record_locks;
+    struct kernel_flock_identity flock_identity;
     struct kernel_vfs_instance *instance;
     struct kernel_vfs_mount *mount;
     void *backend_data;

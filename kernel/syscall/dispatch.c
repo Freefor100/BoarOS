@@ -258,7 +258,27 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
     struct kernel_syscall_result *result)
 {
     struct kernel_syscall_result decoded;
-    if (request->number == 179U) {
+    if (request->number == 32U) {
+        if(syscall_handle_flock(caller,request,&decoded))return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 436U) {
+        if(syscall_handle_close_range(caller,request,&decoded))return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 285U) {
+        if(syscall_handle_copy_range(caller,request,&decoded))return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 243U || request->number == 269U) {
+        if(syscall_handle_socket_mmessage(caller,request,&decoded))return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+#if !defined(BOAROS_ARCH_LOONGARCH)
+    } else if(request->number == 259U) {
+        decoded.action=KERNEL_SYSCALL_ACTION_RETURN;
+        if(request->arguments[2]&~UINT64_C(1)) decoded.value=-KERNEL_EINVAL;
+        else {
+            struct kernel_mm *mm;
+            if(kernel_task_mm_borrow_mutable(caller,&mm) ||
+                kernel_mm_flush_instructions(mm,!!request->arguments[2]))
+                return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+            decoded.value=0;
+        }
+#endif
+    } else if (request->number == 179U) {
         if (syscall_handle_sysinfo(caller, request->arguments[0], &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number==30U || request->number==31U) {
@@ -365,7 +385,7 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
-    } else if (request->number == LINUX_SYSCALL_EPOLL_PWAIT) {
+    } else if (request->number == LINUX_SYSCALL_EPOLL_PWAIT || request->number == 441U) {
         if (syscall_handle_epoll_pwait(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
@@ -413,7 +433,7 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
                                 request->number == LINUX_SYSCALL_FCHOWN) !=
             KERNEL_SYSCALL_STATUS_OK) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_FCHMOD ||
-               request->number == LINUX_SYSCALL_FCHMODAT) {
+               request->number == LINUX_SYSCALL_FCHMODAT || request->number == 452U) {
         if (syscall_handle_chmod(caller, request, &decoded,
                 request->number == LINUX_SYSCALL_FCHMOD) !=
             KERNEL_SYSCALL_STATUS_OK)

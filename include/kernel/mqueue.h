@@ -15,6 +15,8 @@ struct kernel_vfs_timespec;
 struct kernel_vfs_timespec;
 struct kernel_linux_statfs;
 struct kernel_mqueue;
+struct kernel_flock_identity;
+struct kernel_flock_identity *kernel_mqueue_flock_identity(struct kernel_open_file_description *);
 struct kernel_mqueue_request;
 struct kernel_mq_attr {
     int64_t flags, maxmsg, msgsize, curmsgs, reserved[4];

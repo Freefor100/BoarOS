@@ -12,6 +12,7 @@
 #define PIDFD_NONBLOCK 04000U
 #define PIDFD_BUCKETS 64U
 struct pidfd_observer {
+    struct kernel_flock_identity flock_identity;
     struct pidfd_observer *next;
     struct kernel_pid *identity;
     struct kernel_heap *heap;
@@ -22,6 +23,8 @@ struct pidfd_file {
     struct kernel_open_file_description file;
     struct pidfd_observer *observer;
 };
+struct kernel_flock_identity *kernel_pidfd_flock_identity(struct kernel_open_file_description *file)
+{ return &((struct pidfd_file *)file)->observer->flock_identity; }
 /* Entries exist only while actual pidfd OFDs or an in-flight notification own
  * them. The PID stays in its original 64-byte allocation class. */
 static struct pidfd_observer *observers[PIDFD_BUCKETS];
@@ -48,6 +51,7 @@ static void observer_put(struct pidfd_observer *o)
         }
     }
     if(!last)return;
+    kernel_flock_destroy(&o->flock_identity);
     if(kernel_wait_queue_close(&o->changed))__builtin_trap();
     kernel_task_identity_put(o->identity);
     kernel_heap_release(o->heap,o);

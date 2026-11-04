@@ -92,6 +92,7 @@ static void pipe_release_page(struct kernel_pipe *pipe,void *page)
 
 static enum kernel_pipe_status pipe_destroy(struct kernel_pipe *pipe)
 {
+    kernel_flock_destroy(&pipe->flock_identity);
     if (pipe->read_queue.initialized) {
         struct kernel_wait_queue *queues[]={&pipe->read_queue,&pipe->write_queue,&pipe->both_queue};
         for (unsigned i=0;i<3;i++) {

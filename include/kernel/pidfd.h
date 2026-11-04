@@ -8,6 +8,8 @@ struct kernel_open_file_description;
 struct kernel_signal_wait_info;
 struct kernel_wait_queue;
 struct kernel_raw_lock;
+struct kernel_flock_identity;
+struct kernel_flock_identity *kernel_pidfd_flock_identity(struct kernel_open_file_description *);
 struct kernel_pidfd_prepared {
     struct kernel_files *files;
     struct kernel_open_file_description *file;

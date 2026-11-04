@@ -120,6 +120,8 @@ enum kernel_task_status kernel_task_mm_borrow_mutable(
 enum kernel_task_status kernel_task_files_borrow(
     struct kernel_task *task,
     struct kernel_files **files);
+int64_t kernel_task_close_range(struct kernel_task *, uint32_t first,
+    uint32_t last, uint32_t flags);
 
 
 enum kernel_task_status kernel_task_fs_context_borrow(

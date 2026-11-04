@@ -363,6 +363,8 @@ VMA 编辑使用写资格，匿名、COW 与共享内存缺页在多 CPU 构建�
 
 active CPU 位图与 TLB 代次在 MM raw 内维护。撤映射、降权、COW 和截断先发布翻译变更并固定退休 owner，raw 外完成本地 SFENCE 与同步 SBI RFENCE，确认后才归还数据和表页。新加入者在相同保护下登记；换根由架构入口完成一次全量失效，同根仅在加入或翻译代次变化时补做失效。CPU 记录实际观察到的翻译代次，相同 MM、相同代次的再次激活不清空 TLB。可执行页的填充、COW、执行权限发布及文件尾清零另推进指令代次；首次进入和未观察到该代次的 CPU 执行指令同步，不把普通 PTE 修改一概当作代码变化。离开者在旧翻译停止后清活动位。固件失败保留实际资源并 fatal。
 
+RISC-V的riscv_flush_icache(259)复用上述指令代次，按固定[`sys_riscv.c`](../../references/linux/arch/riscv/kernel/sys_riscv.c)忽略start/end，仅接受LOCAL标志。`kernel_mm_flush_instructions`持有独立MM引用，在禁止抢占期间推进指令代次并捕获活动CPU集合，先用数据fence发布代码写入，再执行本地FENCE.I；全MM调用通过同步SBI远端FENCE.I等待已活动CPU确认，整个过程不修改PTE或刷新TLB。LOCAL只同步当前CPU，其他CPU在随后激活该MM时补齐。捕获集合后加入的CPU同样检查代次；调用者只记录本次捕获的代次，远端等待期间并发发布的新代次仍须另行观察。
+
 `kernel_mm_proc_memory_snapshot()`在 gate 下固定 VMA 数组、raw 下取得页表计数；statistics 使用 raw 快照。匿名 `msync` 保留既有区间和 errno，在 gate 下读取；自持 pin 的 gate 忙冲突在此 int 接口对应 `-EAGAIN`，不伪报资源不足。共享文件映射遵守同一来源与 alias 协议。SysV 的 attachment 修改在实际业务边界进入 CPU0，匿名范围编辑不迁移。设备、网络和命名空间仍在各自串行边界执行。
 
 ```sh

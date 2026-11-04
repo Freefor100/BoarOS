@@ -67,6 +67,16 @@ static inline void arch_mmu_sync_instructions(void)
 static inline void arch_mmu_flush_address(uint64_t address)
 { riscv_mmu_flush_address(address); }
 static inline void arch_mmu_flush_all(void) { riscv_mmu_flush_all(); }
+static inline void arch_mmu_sync_instruction_cpus(uint32_t targets)
+{
+#if BOAROS_MAX_CPUS > 1
+    riscv_smp_sync_instructions(targets);
+#else
+    if (targets & ~UINT32_C(1)) __builtin_trap();
+    riscv_mmu_instruction_publish_barrier();
+    riscv_mmu_sync_instructions();
+#endif
+}
 static inline void arch_mmu_sync_user(uint32_t targets, uint64_t address,
     uint64_t size, int instructions)
 {

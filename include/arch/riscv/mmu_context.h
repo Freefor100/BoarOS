@@ -10,6 +10,8 @@ static inline void riscv_mmu_flush_all(void)
 { __asm__ volatile("sfence.vma zero, zero" ::: "memory"); }
 static inline void riscv_mmu_flush_address(uint64_t address)
 { __asm__ volatile("sfence.vma %0, zero" :: "r"(address) : "memory"); }
+static inline void riscv_mmu_instruction_publish_barrier(void)
+{ __asm__ volatile("fence rw, rw" ::: "memory"); }
 static inline void riscv_mmu_sync_instructions(void)
 { __asm__ volatile("fence.i" ::: "memory"); }
 #endif

@@ -158,6 +158,106 @@ void riscv_smp_sync_user(uint32_t targets, uint64_t address, uint64_t size, int 
     mm_test_fence(size==BOAROS_PAGE_SIZE?address:UINT64_MAX,0);
     if (instructions) mm_test_fence(0,1);
 }
+static unsigned icache_ready, icache_local_done, icache_local_seen;
+static unsigned icache_request, icache_nested_done, icache_allow_ack, icache_ack;
+static unsigned icache_finished, icache_remote_exit, icache_global_calls;
+#if BOAROS_MAX_CPUS == 4
+static unsigned icache_late_entered, icache_late_exit;
+#endif
+void riscv_smp_sync_instructions(uint32_t targets)
+{
+    struct kernel_cpu *cpu=kernel_cpu_current();
+    assert(cpu->preempt_depth && !cpu->raw_locks);
+    mm_test_fence(0,1);
+    if (!(targets & ~(1U<<cpu->logical_id))) return;
+    assert(cpu->logical_id==0 && targets==3);
+    icache_global_calls++;
+    publish(&icache_request);
+    await(&icache_ack);
+    assert(!__atomic_load_n(&icache_finished,__ATOMIC_ACQUIRE));
+}
+static void *icache_remote(void *unused)
+{
+    (void)unused;mm_test_attach(1);kernel_cpu_current()->logical_id=1;
+    assert(!kernel_mm_activate(&mm,kernel_context));
+    unsigned tlb=flushes, instructions=instruction_sync;
+    publish(&icache_ready);await(&icache_local_done);
+    /* LOCAL left this already-active CPU stale; same-root entry must sync I$. */
+    assert(!kernel_mm_activate(&mm,kernel_context));
+    assert(flushes==tlb && instruction_sync==instructions+1);
+    publish(&icache_local_seen);await(&icache_request);
+    /* Publish a later generation while CPU0 waits for its old RFENCE ack. */
+    assert(!kernel_mm_flush_instructions(&mm,1));
+    instructions=instruction_sync;
+    publish(&icache_nested_done);await(&icache_allow_ack);
+    mm_test_fence(0,1);publish(&icache_ack);
+    await(&icache_remote_exit);
+    assert(!kernel_mm_activate(&mm,kernel_context));
+    assert(flushes==tlb && instruction_sync==instructions+1);
+    assert(!kernel_mm_activate(0,kernel_context));return NULL;
+}
+#if BOAROS_MAX_CPUS == 4
+static void *icache_late(void *unused)
+{
+    (void)unused;mm_test_attach(2);kernel_cpu_current()->logical_id=2;
+    await(&icache_nested_done);
+    assert(!kernel_mm_activate(&mm,kernel_context));
+    assert(instruction_sync==1);
+    publish(&icache_late_entered);await(&icache_late_exit);
+    assert(!kernel_mm_activate(0,kernel_context));return NULL;
+}
+#endif
+static void *icache_ack_controller(void *unused)
+{
+    (void)unused;mm_test_attach(3);
+    await(&icache_nested_done);
+#if BOAROS_MAX_CPUS == 4
+    await(&icache_late_entered);
+#endif
+    struct kernel_mm_concurrency_state state;
+    kernel_mm_get_concurrency_state(&mm,&state);
+    assert(state.references==2 && !state.pending_retirement);
+    assert(state.active_cpus==
+#if BOAROS_MAX_CPUS == 4
+        7
+#else
+        3
+#endif
+    );
+    /* Hold acknowledgement long enough to observe the still-running call. */
+    assert(!__atomic_load_n(&icache_finished,__ATOMIC_ACQUIRE));
+    publish(&icache_allow_ack);return NULL;
+}
+static void instruction_publication_cases(void)
+{
+    assert(!kernel_mm_activate(&mm,kernel_context));
+    pthread_t remote,controller;
+    assert(!pthread_create(&remote,0,icache_remote,0));await(&icache_ready);
+    unsigned tlb=flushes,instructions=instruction_sync;
+    assert(!kernel_mm_flush_instructions(&mm,1));
+    assert(flushes==tlb && instruction_sync==instructions+1 && !icache_global_calls);
+    instructions=instruction_sync;
+    assert(!kernel_mm_activate(&mm,kernel_context));
+    assert(flushes==tlb && instruction_sync==instructions);
+    publish(&icache_local_done);await(&icache_local_seen);
+#if BOAROS_MAX_CPUS == 4
+    pthread_t late;assert(!pthread_create(&late,0,icache_late,0));
+#endif
+    assert(!pthread_create(&controller,0,icache_ack_controller,0));
+    assert(!kernel_mm_flush_instructions(&mm,0));publish(&icache_finished);
+    assert(icache_global_calls==1 && flushes==tlb && instruction_sync==instructions+1);
+    /* The original call cannot claim the newer LOCAL generation was seen. */
+    assert(!kernel_mm_activate(&mm,kernel_context));
+    assert(flushes==tlb && instruction_sync==instructions+2);
+    publish(&icache_remote_exit);assert(!pthread_join(remote,0) && !pthread_join(controller,0));
+#if BOAROS_MAX_CPUS == 4
+    publish(&icache_late_exit);assert(!pthread_join(late,0));
+#endif
+    assert(!kernel_mm_activate(0,kernel_context));
+    struct kernel_mm_concurrency_state state;kernel_mm_get_concurrency_state(&mm,&state);
+    assert(state.references==1 && !state.active_cpus && !state.pending_retirement);
+    puts("MM instruction-only LOCAL/deferred entry, held RFENCE acknowledgement, concurrent generation and late CPU entry verified");
+}
 static void *modify(void *unused)
 {
     (void)unused; mm_test_attach(0); mm_test_context = context;
@@ -394,6 +494,7 @@ int main(void)
     sparse=0; fprintf(stderr,"64GiB sparse detach batches=%u\n",walk_calls);
     assert(walk_calls && walk_calls<=256); /* 64GiB空洞不按虚拟页枚举。 */
 #endif
+    instruction_publication_cases();
     mm_test_context = 0; assert(!kernel_mm_release(&mm));
     assert(physical_page_available(&allocator) == baseline && !physical_page_allocator_audit(&allocator));
     puts("MM late entry, same-root reuse, independent instruction publication and leave-before-retirement verified");

@@ -202,6 +202,8 @@ int kernel_socket_set_option(struct kernel_socket *socket,
 int kernel_socket_unix_wait_error(struct kernel_socket *socket);
 int kernel_socket_get_option(struct kernel_socket *socket,
                              enum kernel_socket_option option, int *value);
+/* Preserve a later recvmmsg error after returning its completed prefix. */
+void kernel_socket_save_error(struct kernel_socket *socket, int error);
 void kernel_socket_set_send_timeout(struct kernel_socket *socket, uint64_t nanoseconds);
 uint64_t kernel_socket_send_timeout(const struct kernel_socket *socket);
 void kernel_socket_set_receive_timeout(struct kernel_socket *socket,

@@ -7,5 +7,7 @@ static inline uint64_t riscv_mmu_context_read(void) { return mm_test_context; }
 static inline void riscv_mmu_context_write(uint64_t value) { mm_test_context = value; }
 static inline void riscv_mmu_flush_all(void) { mm_test_fence(UINT64_MAX, 0); }
 static inline void riscv_mmu_flush_address(uint64_t address) { mm_test_fence(address, 0); }
+static inline void riscv_mmu_instruction_publish_barrier(void)
+{ __atomic_thread_fence(__ATOMIC_SEQ_CST); }
 static inline void riscv_mmu_sync_instructions(void) { mm_test_fence(0, 1); }
 #endif

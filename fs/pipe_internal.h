@@ -9,6 +9,7 @@
 #include <kernel/sync.h>
 #include <kernel/raw_lock.h>
 #include <kernel/vfs.h>
+#include "flock.h"
 
 struct kernel_heap;
 struct physical_page_allocator;
@@ -26,6 +27,7 @@ struct kernel_pipe_buffer {
 
 /* Shared pipe endpoint and ring ownership. */
 struct kernel_pipe {
+    struct kernel_flock_identity flock_identity;
     struct kernel_heap *heap;
     uint64_t proc_identity;
     uint32_t mode;
