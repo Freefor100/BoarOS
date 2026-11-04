@@ -980,14 +980,14 @@ static int64_t epoll_deliver(struct kernel_epoll_wait_request *request,
     return delivered;
 }
 
-enum kernel_files_status kernel_files_epoll_pwait(
+static enum kernel_files_status epoll_pwait_deadline(
     struct kernel_files *files,
     struct kernel_mm *mm,
     struct kernel_task *task,
     int64_t epfd,
     uint64_t user_events,
     int32_t maxevents,
-    int32_t timeout,
+    int immediate, uint64_t deadline,
     uint64_t user_sigmask,
     size_t sigsetsize,
     int64_t *linux_result)
@@ -995,12 +995,8 @@ enum kernel_files_status kernel_files_epoll_pwait(
     struct kernel_open_file_description *epoll_file = 0;
     struct kernel_epoll *epoll;
     struct kernel_epoll_wait_request request = {0};
-    int has_timeout = 0;
-    int immediate = 0;
-    uint64_t deadline = 0U;
     uint64_t saved_mask = 0U;
     int mask_modified = 0;
-    int timeout_error;
     int sig_error;
     enum kernel_files_status pin_status;
 
@@ -1027,13 +1023,6 @@ enum kernel_files_status kernel_files_epoll_pwait(
         return KERNEL_FILES_STATUS_OK;
     }
     epoll = epoll_file->epoll;
-
-    timeout_error = epoll_calculate_deadline(timeout, &has_timeout, &immediate, &deadline);
-    if (timeout_error != 0) {
-        (void)kernel_open_file_release(&epoll_file);
-        *linux_result = timeout_error;
-        return KERNEL_FILES_STATUS_OK;
-    }
 
     request = (struct kernel_epoll_wait_request){.task = task, .epoll = epoll, .file = epoll_file};
     if (kernel_task_epoll_register(task, &request, &request.previous) != KERNEL_TASK_STATUS_OK) __builtin_trap();
@@ -1095,4 +1084,47 @@ enum kernel_files_status kernel_files_epoll_pwait(
     }
     epoll_request_finish(&request);
     return KERNEL_FILES_STATUS_OK;
+}
+
+/* Both ABI forms reach the same scan/token/mask owner with one deadline. */
+enum kernel_files_status kernel_files_epoll_pwait(struct kernel_files *files,
+    struct kernel_mm *mm, struct kernel_task *task, int64_t epfd,
+    uint64_t events, int32_t maxevents, int32_t timeout,
+    uint64_t mask, size_t sigsetsize, int64_t *result)
+{
+    int has_timeout=0, immediate=0;uint64_t deadline=0;
+    int error=epoll_calculate_deadline(timeout,&has_timeout,&immediate,&deadline);
+    if(error){*result=error;return KERNEL_FILES_STATUS_OK;}
+    return epoll_pwait_deadline(files,mm,task,epfd,events,maxevents,
+        immediate,deadline,mask,sigsetsize,result);
+}
+
+enum kernel_files_status kernel_files_epoll_pwait2(struct kernel_files *files,
+    struct kernel_mm *mm, struct kernel_task *task, int64_t epfd,
+    uint64_t events, int32_t maxevents, uint64_t user_timeout,
+    uint64_t mask, size_t sigsetsize, int64_t *result)
+{
+    int immediate=0;uint64_t deadline=0;
+    if(user_timeout) {
+        struct {int64_t sec,nsec;} timeout;
+        size_t copied=0;
+        if(kernel_copy_from_user(mm,&timeout,user_timeout,sizeof(timeout),&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=sizeof(timeout)) {
+            *result=-KERNEL_EFAULT;return KERNEL_FILES_STATUS_OK;
+        }
+        if(timeout.sec<0 || timeout.nsec<0 || timeout.nsec>=1000000000) {
+            *result=-KERNEL_EINVAL;return KERNEL_FILES_STATUS_OK;
+        }
+        immediate=!timeout.sec && !timeout.nsec;
+        if(!immediate) {
+            uint64_t duration=(uint64_t)timeout.sec>((uint64_t)INT64_MAX-(uint64_t)timeout.nsec)/1000000000U
+                ? (uint64_t)INT64_MAX : (uint64_t)timeout.sec*1000000000U+(uint64_t)timeout.nsec;
+            uint64_t now=kernel_time_monotonic_ns();
+            uint64_t target=duration>UINT64_MAX-now?UINT64_MAX:now+duration;
+            enum kernel_time_status status=kernel_time_deadline_from_monotonic(target,&deadline);
+            if(status==KERNEL_TIME_STATUS_DEADLINE_PASSED) immediate=1;
+            else if(status!=KERNEL_TIME_STATUS_OK){*result=-KERNEL_EINVAL;return KERNEL_FILES_STATUS_OK;}
+        }
+    }
+    return epoll_pwait_deadline(files,mm,task,epfd,events,maxevents,
+        immediate,deadline,mask,sigsetsize,result);
 }
