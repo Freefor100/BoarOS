@@ -24,10 +24,10 @@ COST_DIAGNOSTICS ?= 0
 LOCK_DEBUG ?= 0
 SMP ?= 0
 SMP_CPUS ?= 2
-ifneq ($(filter $(SMP_CPUS),2 4),$(SMP_CPUS))
-$(error SMP_CPUS must be 2 or 4)
+ifneq ($(filter $(SMP_CPUS),2 4 8),$(SMP_CPUS))
+$(error SMP_CPUS must be 2, 4 or 8)
 endif
-SMP_BUILD_SUFFIX := $(if $(filter 4,$(SMP_CPUS)),4,)
+SMP_BUILD_SUFFIX := $(if $(filter 2,$(SMP_CPUS)),,$(SMP_CPUS))
 USER_SMP ?= 0
 USER_SMP_BUILD ?= build/riscv-user-smp$(SMP_BUILD_SUFFIX)
 USER_SMP_COMPOSITION ?= 0
@@ -2550,17 +2550,17 @@ test-user-smp-host:
 
 .PHONY: test-user-smp-riscv
 USER_SMP_ELF := build/riscv-user-smp$(SMP_BUILD_SUFFIX)/user-smp-rv
-$(USER_SMP_ELF): tests/userland/user_smp.c tests/userland/user_smp_many.h tests/userland/user_smp_probe.S build/riscv/musl-root/.shared-built
+$(USER_SMP_ELF): tests/userland/user_smp.c tests/userland/user_smp_many.h tests/userland/user_smp_probe.S $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
-	build/riscv/musl-root/bin/musl-gcc $(shell build/riscv/musl-root/bin/musl-gcc -fno-link-libatomic -E -x c /dev/null >/dev/null 2>&1 && echo -fno-link-libatomic) -static -O2 -pthread -Wall -Wextra -Werror -o $@ tests/userland/user_smp.c tests/userland/user_smp_probe.S
+	$(MUSL_ROOT)/bin/musl-gcc $(shell $(MUSL_ROOT)/bin/musl-gcc -fno-link-libatomic -E -x c /dev/null >/dev/null 2>&1 && echo -fno-link-libatomic) -static -O2 -pthread -Wall -Wextra -Werror -o $@ tests/userland/user_smp.c tests/userland/user_smp_probe.S
 USER_SMP_DYNAMIC_ELF := build/riscv-user-smp$(SMP_BUILD_SUFFIX)/user-smp-dynamic-rv
 $(USER_SMP_DYNAMIC_ELF): tests/userland/user_smp.c tests/userland/user_smp_many.h tests/userland/user_smp_probe.S $(MUSL_LDSO)
 	@mkdir -p $(dir $@)
-	build/riscv/musl-root/bin/musl-gcc $(shell build/riscv/musl-root/bin/musl-gcc -fno-link-libatomic -E -x c /dev/null >/dev/null 2>&1 && echo -fno-link-libatomic) -DBOAROS_SMP_DYNAMIC=1 -Wl,--dynamic-linker=/lib/ld-musl-riscv64.so.1 -fPIC -pie -O2 -pthread -Wall -Wextra -Werror -o $@ tests/userland/user_smp.c tests/userland/user_smp_probe.S
+	$(MUSL_ROOT)/bin/musl-gcc $(shell $(MUSL_ROOT)/bin/musl-gcc -fno-link-libatomic -E -x c /dev/null >/dev/null 2>&1 && echo -fno-link-libatomic) -DBOAROS_SMP_DYNAMIC=1 -Wl,--dynamic-linker=/lib/ld-musl-riscv64.so.1 -fPIC -pie -O2 -pthread -Wall -Wextra -Werror -o $@ tests/userland/user_smp.c tests/userland/user_smp_probe.S
 test-user-smp-riscv: $(USER_SMP_ELF) $(USER_SMP_DYNAMIC_ELF) $(PTHREAD_TLS_DSO_RV)
 	$(MAKE) kernel-rv-user-smp
-	python3 -B tests/smp/user.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel $(USER_SMP_BUILD)/kernel-rv --program $(USER_SMP_ELF) $(if $(filter 4,$(SMP_CPUS)),--cpus 4 --cpus 2 --cpus 1,) $(TEST_MEMORY_ARGS)
-	python3 -B tests/smp/user.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel $(USER_SMP_BUILD)/kernel-rv $(if $(filter 4,$(SMP_CPUS)),--cpus 4 --cpus 2 --cpus 1,) --program $(USER_SMP_DYNAMIC_ELF) --loader $(MUSL_LDSO) --library $(PTHREAD_TLS_DSO_RV) $(TEST_MEMORY_ARGS)
+	python3 -B tests/smp/user.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel $(USER_SMP_BUILD)/kernel-rv --program $(USER_SMP_ELF) $(if $(filter 8,$(SMP_CPUS)),--cpus 8,$(if $(filter 4,$(SMP_CPUS)),--cpus 4 --cpus 2 --cpus 1,)) $(TEST_MEMORY_ARGS)
+	python3 -B tests/smp/user.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel $(USER_SMP_BUILD)/kernel-rv $(if $(filter 8,$(SMP_CPUS)),--cpus 8,$(if $(filter 4,$(SMP_CPUS)),--cpus 4 --cpus 2 --cpus 1,)) --program $(USER_SMP_DYNAMIC_ELF) --loader $(MUSL_LDSO) --library $(PTHREAD_TLS_DSO_RV) $(TEST_MEMORY_ARGS)
 .PHONY: test-user-smp-runtime-riscv
 .PHONY: test-user-smp-programs-riscv
 .PHONY: test-user-smp-composition-host test-user-smp-composition-riscv test-wait-process-smp-riscv
@@ -2609,10 +2609,10 @@ test-smp-host:
 	build/host/smp-sched4
 test-smp-riscv:
 	$(MAKE) SMP=1 SMP_TEST=1 SMP_TEST_PROFILE=normal COST_DIAGNOSTICS=0 all
-	python3 -B tests/smp/riscv.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel build/riscv-smp$(SMP_BUILD_SUFFIX)-test/kernel-rv $(if $(filter 4,$(SMP_CPUS)),--cpus 4 --cpus 2 --cpus 1,)
+	python3 -B tests/smp/riscv.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel build/riscv-smp$(SMP_BUILD_SUFFIX)-test/kernel-rv $(if $(filter 8,$(SMP_CPUS)),--cpus 8,$(if $(filter 4,$(SMP_CPUS)),--cpus 4 --cpus 2 --cpus 1,))
 	@set -e; for profile in missing-rfence denied-start handshake-timeout guard denied-stop rfence-error; do \
 		$(MAKE) SMP=1 SMP_TEST=1 SMP_TEST_PROFILE=$$profile COST_DIAGNOSTICS=0 all; \
-		python3 -B tests/smp/riscv.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel build/riscv-smp$(SMP_BUILD_SUFFIX)-test/$$profile/kernel-rv --profile $$profile $(if $(filter 4,$(SMP_CPUS)),--cpus 4,) --output build/riscv-smp$(SMP_BUILD_SUFFIX)/runs/$$profile; \
+		python3 -B tests/smp/riscv.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel build/riscv-smp$(SMP_BUILD_SUFFIX)-test/$$profile/kernel-rv --profile $$profile $(if $(filter 4 8,$(SMP_CPUS)),--cpus $(SMP_CPUS),) --output build/riscv-smp$(SMP_BUILD_SUFFIX)/runs/$$profile; \
 	done
 
 .PHONY: test-smp-fpu-setup-riscv

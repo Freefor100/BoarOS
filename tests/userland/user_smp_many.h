@@ -64,7 +64,7 @@ static void *many_cpu_worker(void *argument)
         int fd=open(name,O_CREAT|O_EXCL|O_RDWR,0600);CHECK(fd>=0);
         unsigned char byte=(unsigned char)(33+w->cpu);
         CHECK(pwrite(fd,&byte,1,0)==1 && !ftruncate(fd,4096));
-        /* Keep all four records live until the parent checks their names/data. */
+        /* Keep all online workers' records live for the parent identity check. */
         if(!i) {many_barrier(w->barrier);many_barrier(w->barrier);}
         unsigned char *mapped=mmap(NULL,4096,PROT_READ,MAP_SHARED,fd,0);
         CHECK(mapped!=MAP_FAILED && mapped[0]==byte && !unlink(name));
@@ -86,7 +86,7 @@ static void *many_cpu_worker(void *argument)
 }
 static void many_cpu_consumers(void)
 {
-    unsigned count=(unsigned)__builtin_popcountll(online);CHECK(count && count<=4 && online==((UINT64_C(1)<<count)-1));
+    unsigned count=(unsigned)__builtin_popcountll(online);CHECK(count && count<=USER_SMP_CPU_CAPACITY && online==((UINT64_C(1)<<count)-1));
     const int signals[]={SIGUSR1,SIGUSR2,SIGVTALRM,SIGPROF};struct sigaction old[4];
     struct sigaction action={.sa_handler=many_signal,.sa_flags=SA_NODEFER};sigemptyset(&action.sa_mask);
     for(unsigned i=0;i<4;i++)CHECK(!sigaction(signals[i],&action,&old[i]));
@@ -98,11 +98,11 @@ static void many_cpu_consumers(void)
     pthread_barrier_t gate;CHECK(!pthread_barrier_init(&gate,NULL,count+1));
     unsigned char *shared=mmap(NULL,4096,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
     CHECK(shared!=MAP_FAILED);
-    struct many_cpu_work work[4]={0};pthread_t threads[4];
+    struct many_cpu_work work[USER_SMP_CPU_CAPACITY]={0};pthread_t threads[USER_SMP_CPU_CAPACITY];
     for(unsigned i=0;i<count;i++) {work[i]=(struct many_cpu_work){.cpu=i,.barrier=&gate,.shared=shared};CHECK(!pthread_create(&threads[i],NULL,many_cpu_worker,&work[i]));}
     many_barrier(&gate);
     many_barrier(&gate);many_barrier(&gate);
-    ino_t inodes[4];
+    ino_t inodes[USER_SMP_CPU_CAPACITY];
     for(unsigned i=0;i<count;i++) {
         char name[80];snprintf(name,sizeof(name),"/many-cpu-%u/file-0",i);
         int fd=open(name,O_RDONLY);struct stat st;unsigned char byte=0;
@@ -122,7 +122,7 @@ static void many_cpu_consumers(void)
     CHECK(!pthread_sigmask(SIG_SETMASK,&saved,NULL) && !pthread_barrier_destroy(&gate) && !munmap(shared,4096));
     record("all-cpu-tls-fpu-signals-timers");record("all-cpu-mm-files-orphans");
 
-    pid_t children[4];int ready[2],release[2];CHECK(!pipe(ready) && !pipe(release));
+    pid_t children[USER_SMP_CPU_CAPACITY];int ready[2],release[2];CHECK(!pipe(ready) && !pipe(release));
     for(unsigned i=0;i<count;i++) {
         children[i]=fork();CHECK(children[i]>=0);
         if(!children[i]) {
@@ -135,7 +135,8 @@ static void many_cpu_consumers(void)
     }
     CHECK(!close(ready[1]) && !close(release[0]));
     for(unsigned i=0;i<count;i++){char byte;CHECK(read(ready[0],&byte,1)==1);}
-    CHECK(write(release[1],"gggg",count)==(ssize_t)count && !close(ready[0]) && !close(release[1]));
+    char tokens[USER_SMP_CPU_CAPACITY];memset(tokens,'g',count);
+    CHECK(write(release[1],tokens,count)==(ssize_t)count && !close(ready[0]) && !close(release[1]));
     for(unsigned i=0;i<count;i++){int status;CHECK(waitpid(children[i],&status,0)==children[i] && WIFEXITED(status) && WEXITSTATUS(status)==40+(int)i);}
     record("all-cpu-fork-affinity-exec");pin(0);
 }
@@ -157,7 +158,7 @@ static void many_service_progress(void)
     unsigned count=(unsigned)__builtin_popcountll(online);pin(0);
     if(count>1) {
         pthread_barrier_t gate;CHECK(!pthread_barrier_init(&gate,NULL,count));
-        atomic_uint done=0;pthread_t threads[3];struct many_service work[3];
+        atomic_uint done=0;pthread_t threads[USER_SMP_CPU_CAPACITY-1];struct many_service work[USER_SMP_CPU_CAPACITY-1];
         for(unsigned i=1;i<count;i++) {work[i-1]=(struct many_service){i,&gate,&done};CHECK(!pthread_create(&threads[i-1],NULL,many_service_worker,&work[i-1]));}
         set_policy(SCHED_FIFO,20);
         many_barrier(&gate);struct timespec start,now;CHECK(!clock_gettime(CLOCK_MONOTONIC,&start));

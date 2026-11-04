@@ -1,6 +1,7 @@
 #ifndef BOAROS_ARCH_LOONGARCH_SMP_H
 #define BOAROS_ARCH_LOONGARCH_SMP_H
 #include <kernel/cpu.h>
+#include <arch/loongarch/smp_boot.h>
 #define LA_IPI_SCHEDULE 1U
 #define LA_IPI_DEADLINE 2U
 #define LA_IPI_HANDSHAKE 4U
@@ -18,7 +19,7 @@ void la_smp_sync_user(uint32_t targets,uint64_t address,uint64_t size,int instru
 void la_smp_sync_kernel(uint64_t address,uint64_t size);
 struct kernel_cpu *la_smp_cpu(unsigned logical);
 void la_mmu_secondary_initialize(void);
-extern uint64_t la_secondary_thread;
+extern struct la_smp_boot la_smp_boot[BOAROS_MAX_CPUS];
 static inline uint32_t la_iocsr_read(uint32_t address)
 {uint32_t v;__asm__ volatile("iocsrrd.w %0,%1":"=r"(v):"r"(address):"memory");return v;}
 static inline void la_iocsr_write(uint32_t address,uint32_t value)

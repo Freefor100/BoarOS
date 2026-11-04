@@ -11,7 +11,7 @@
 #endif
 #if BOAROS_MAX_CPUS > 1 && LA_STACK_CASE == 4
 static unsigned guard_ready,guard_entered;
-static uintptr_t guard_sp[2];
+static uintptr_t guard_sp[BOAROS_MAX_CPUS];
 void __real_la_kernel_stack_overflow(uint64_t);
 void __wrap_la_kernel_stack_overflow(uint64_t old_sp)
 {
@@ -19,12 +19,17 @@ void __wrap_la_kernel_stack_overflow(uint64_t old_sp)
     guard_sp[cpu]=arch_current_stack();
     __atomic_fetch_or(&guard_entered,1U<<cpu,__ATOMIC_RELEASE);
     uint64_t end=arch_time_read()+(uint64_t)la_timer_frequency()*5;
-    while(__atomic_load_n(&guard_entered,__ATOMIC_ACQUIRE)!=3)
+    unsigned count=kernel_cpu_get_boot_count(),all=(1U<<count)-1;
+    while(__atomic_load_n(&guard_entered,__ATOMIC_ACQUIRE)!=all)
         if((int64_t)(arch_time_read()-end)>=0)la_virt_fatal("guard rendezvous");
     if(cpu)for(;;)arch_cpu_wait();
-    if((guard_sp[0]>>14)==(guard_sp[1]>>14))la_virt_fatal("shared emergency stack");
-    la_virt_puts("LA SMP emergency stacks distinct PASS cpu0=");la_virt_hex(guard_sp[0]);
-    la_virt_puts(" cpu1=");la_virt_hex(guard_sp[1]);la_virt_puts("\n");
+    for(unsigned i=0;i<count;i++)for(unsigned j=0;j<i;j++)
+        if((guard_sp[i]>>14)==(guard_sp[j]>>14))la_virt_fatal("shared emergency stack");
+    la_virt_puts("LA SMP emergency stacks distinct PASS cpus=");la_virt_hex(count);
+    for(unsigned i=0;i<count;i++) {
+        la_virt_puts(" CPU=");la_virt_hex(i);la_virt_puts(" SP=");la_virt_hex(guard_sp[i]);
+    }
+    la_virt_puts("\n");
     __real_la_kernel_stack_overflow(old_sp);
 }
 #endif
@@ -38,7 +43,7 @@ static void probe(void *unused)
     uintptr_t bottom=task->stack_low-16;
 #if BOAROS_MAX_CPUS > 1 && LA_STACK_CASE == 4
     __atomic_fetch_or(&guard_ready,1U<<kernel_cpu_current()->logical_id,__ATOMIC_RELEASE);
-    while(__atomic_load_n(&guard_ready,__ATOMIC_ACQUIRE)!=3){}
+    while(__atomic_load_n(&guard_ready,__ATOMIC_ACQUIRE)!=((1U<<kernel_cpu_get_boot_count())-1)){}
     uintptr_t exhausted=bottom+128;
     __asm__ volatile("move $sp,%0;break 0"::"r"(exhausted):"memory");
     __builtin_unreachable();
@@ -72,8 +77,8 @@ static void probe(void *unused)
 void __wrap_la_boot_tasks(struct physical_page_allocator *a)
 {
 #if BOAROS_MAX_CPUS > 1 && LA_STACK_CASE == 4
-    static struct kernel_thread_join joins[2];
-    for(unsigned i=0;i<2;i++)if(kernel_thread_create_joinable_mask(probe,a,&joins[i],1U<<i)!=KERNEL_SCHEDULER_STATUS_OK)
+    static struct kernel_thread_join joins[BOAROS_MAX_CPUS];
+    for(unsigned i=0;i<kernel_cpu_get_boot_count();i++)if(kernel_thread_create_joinable_mask(probe,a,&joins[i],1U<<i)!=KERNEL_SCHEDULER_STATUS_OK)
         la_virt_fatal("parallel guard create");
 #else
     if(kernel_thread_create(probe,a)!=KERNEL_SCHEDULER_STATUS_OK)la_virt_fatal("guard create");

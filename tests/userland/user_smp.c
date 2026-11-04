@@ -32,6 +32,7 @@
 
 #define CHECK(x) do { if (!(x)) { dprintf(2,"USER-SMP FAIL line=%d errno=%d\n",__LINE__,errno); exit(1); } } while (0)
 static uint64_t online;
+enum { USER_SMP_CPU_CAPACITY=8 };
 static _Thread_local unsigned tls_value;
 static _Thread_local sigjmp_buf fault_return;
 static _Thread_local int expected_fault;
@@ -43,6 +44,8 @@ static void pin(unsigned cpu)
     uint64_t mask=UINT64_C(1)<<cpu, actual=0;
     CHECK(!syscall(SYS_sched_setaffinity,0,sizeof(mask),&mask));
     CHECK(syscall(SYS_sched_getaffinity,0,sizeof(actual),&actual)==sizeof(actual) && actual==mask);
+    unsigned observed=UINT32_MAX;
+    CHECK(!syscall(SYS_getcpu,&observed,NULL,NULL) && observed==cpu);
 }
 static void wait_flag(atomic_uint *flag, unsigned value)
 { while (atomic_load_explicit(flag,memory_order_acquire)!=value) __asm__ volatile("" ::: "memory"); }
@@ -444,17 +447,32 @@ static void caller_namespace(void)
     record("caller-namespace-identity");pin(0);
 }
 #include "user_smp_many.h"
+static void *cpu_smoke(void *argument)
+{
+    unsigned cpu=(unsigned)(uintptr_t)argument;
+    pin(cpu);tls_value=73;
+    CHECK(!user_smp_register_probe(0) && tls_value==73);
+    return NULL;
+}
 int main(int argc,char **argv)
 {
     if (argc==2 && !strcmp(argv[1],"--exec-child")) return 23;
     if (argc==3 && !strcmp(argv[1],"--many-exec")) {
-        unsigned cpu=(unsigned)atoi(argv[2]);uint64_t mask=0;CHECK(cpu<4);
+        unsigned cpu=(unsigned)atoi(argv[2]);uint64_t mask=0;CHECK(cpu<USER_SMP_CPU_CAPACITY);
         CHECK(syscall(SYS_sched_getaffinity,0,sizeof(mask),&mask)==sizeof(mask) && mask==(UINT64_C(1)<<cpu));
         CHECK(getpid()>0 && !user_smp_register_probe(0));return 40+(int)cpu;
     }
     CHECK(!mkdir("/proc",0555) || errno==EEXIST);
     CHECK(!mount("proc","/proc","proc",0,NULL) || errno==EBUSY);
-    CHECK(syscall(SYS_sched_getaffinity,0,sizeof(online),&online)==sizeof(online) && (online==1 || online==3 || online==7 || online==15));
+    CHECK(syscall(SYS_sched_getaffinity,0,sizeof(online),&online)==sizeof(online));
+    unsigned count=(unsigned)__builtin_popcountll(online);
+    CHECK(count && count<=USER_SMP_CPU_CAPACITY && online==((UINT64_C(1)<<count)-1));
+    if (!access("/smp-smoke",F_OK)) {
+        pthread_t threads[USER_SMP_CPU_CAPACITY];
+        for(unsigned i=0;i<count;i++)CHECK(!pthread_create(&threads[i],NULL,cpu_smoke,(void *)(uintptr_t)i));
+        for(unsigned i=0;i<count;i++)CHECK(!pthread_join(threads[i],NULL));
+        printf("USER-SMP SMOKE cpus=%u PASS\n",count);fflush(stdout);sync();(void)reboot(RB_POWER_OFF);return 42;
+    }
     printf("USER-SMP BEGIN cpus=%u\n",(unsigned)__builtin_popcountll(online)); fflush(stdout);
     pin(0);
     process_overlap(); thread_signal(); mapping_retirement(); cancellation(); nonleader_exec(); group_stop_continue(); realtime_qualification(); remote_service_progress(); caller_namespace(); many_cpu_consumers(); many_service_progress();

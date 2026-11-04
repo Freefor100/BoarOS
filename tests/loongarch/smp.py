@@ -16,12 +16,17 @@ def parse_performance(raw):
             metrics.append({key:(int(value) if value.isdecimal() else value) for key,value in fields.items()})
     return metrics
 
+def parse_cpus(raw):
+    fields=('cpu','traps','returns','ipi','tlb','state')
+    pattern=r'^LA SMP CPU=(0x[0-9a-f]+) traps=(0x[0-9a-f]+) returns=(0x[0-9a-f]+) IPI=(0x[0-9a-f]+) TLB=(0x[0-9a-f]+) state=(0x[0-9a-f]+)$'
+    return [dict(zip(fields,(int(value,16) for value in match.groups()))) for match in re.finditer(pattern,raw,re.MULTILINE)]
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--kernel',type=Path,required=True);p.add_argument('--program',type=Path,required=True)
-    p.add_argument('--output',type=Path,required=True);p.add_argument('--cpus',type=int,choices=(1,2),default=2)
+    p.add_argument('--output',type=Path,required=True);p.add_argument('--cpus',type=int,choices=(1,2,3,4),default=2)
     p.add_argument('--performance',action='store_true');p.add_argument('--host-vcpus');p.add_argument('--host-io',type=int,default=8);p.add_argument('--perf-stat',action='store_true')
-    p.add_argument('--loader',type=Path);p.add_argument('--system',choices=('boaros','linux'),default='boaros');p.add_argument('--expect-failure');p.add_argument('--memory',default='512M');a=p.parse_args()
+    p.add_argument('--loader',type=Path);p.add_argument('--system',choices=('boaros','linux'),default='boaros');p.add_argument('--expect-failure');p.add_argument('--failure-target',type=int);p.add_argument('--expect-protocol',action='store_true');p.add_argument('--memory',default='512M');a=p.parse_args()
     interpreter=None;loader_hash=None
     if a.loader:
         headers=subprocess.run(['readelf','-lW',str(a.program)],check=True,capture_output=True,text=True,env={**os.environ,'LC_ALL':'C'}).stdout
@@ -80,6 +85,7 @@ def main():
                 if perf.poll() is None:perf.send_signal(signal.SIGINT)
                 perf.wait(timeout=10)
     raw=(out/'boot.log').read_text();rows=[line for line in raw.splitlines() if line.startswith('LA-SMP ')]
+    cpu_evidence=parse_cpus(raw)
     passed=code==0 and rows==[f'LA-SMP BEGIN cpus={a.cpus}',*[f'LA-SMP CASE {name} PASS' for name in ('remote-affinity','executors-tls-fpu-simd-signals-accounting','shared-mm-protect-replace-unmap','remote-futex-wait-wake','group-virtual-prof-timers','ext4-parallel-files-mmap-orphans','fork-cow-affinity-exec-exit')],'LA-SMP END 7'] and (profile.root_success(raw,0) if a.system=='boaros' else 'Linux LA root application passed' in raw)
     metrics=parse_performance(raw) if a.performance else []
     if a.performance:
@@ -88,10 +94,20 @@ def main():
         passed=code==0 and tuple(row['name'] for row in metrics)==expected and tuple(row['count'] for row in metrics)==counts and all(row['ns']>0 and row['cpu_ns']>0 for row in metrics) and 'ALTSTACK-PERF END 2' in raw and 'FUTEX-PERF END 3' in raw and 'LA-SMP-PERF END 7' in raw and profile.root_success(raw,0)
         if passed:passed=all(row.get('completed',8)==8 and row.get('cpus',a.cpus)==a.cpus for row in metrics) and metrics[-1]['bytes']==33554432
     if a.expect_failure:
-        passed=code==0 and f'LA SMP failure stage={a.expect_failure} target=0x0000000000000001' in raw and 'LA root owners released' not in raw
+        target=a.failure_target if a.failure_target is not None else a.cpus-1
+        passed=code==0 and f'LA SMP failure stage={a.expect_failure} target=0x{target:016x}' in raw and 'LA root owners released' not in raw
+    elif a.system=='boaros' and a.cpus>1:
+        online=[(int(logical,0),int(hardware,0)) for logical,hardware in re.findall(r'^LA SMP online logical=(0x[0-9a-f]+|[0-9]+) hardware=(0x[0-9a-f]+)$',raw,re.MULTILINE)]
+        passed=passed and online==[(i,i) for i in range(1,a.cpus)] and [row['cpu'] for row in cpu_evidence]==list(range(a.cpus))
+        passed=passed and all(row['traps']>0 and row['returns']>0 and row['ipi']>0 and row['state']==(3 if row['cpu']==0 else 5) for row in cpu_evidence)
+    if a.expect_protocol:
+        passed=passed and all(raw.count(marker)==1 for marker in (
+            'LA SMP reciprocal masked-IRQ TLB acknowledgements PASS',
+            'LA SMP last-target TLB acknowledgement PASS',
+            'LA SMP late-IPI TLB generation reuse PASS'))
     if passed and not a.expect_failure:
         with (out/'fsck.log').open('w') as log:passed=subprocess.run(['e2fsck','-fn',disk],stdout=log,stderr=subprocess.STDOUT).returncode==0
         if passed:disk.unlink()
-    (out/'result.json').write_text(json.dumps({'passed':passed,'metrics':metrics,'affinity':affinity,'host_topology':host_cpu_topology(selection+[a.host_io]) if selection else None,'command':command,'returncode':code,'rows':rows,'expected_failure':a.expect_failure,'kernel_sha256':kernel_hash,'elf_sha256':program_hash,'interpreter':interpreter,'loader_sha256':loader_hash},indent=2)+'\n')
+    (out/'result.json').write_text(json.dumps({'passed':passed,'metrics':metrics,'cpu_evidence':cpu_evidence,'affinity':affinity,'host_topology':host_cpu_topology(selection+[a.host_io]) if selection else None,'command':command,'returncode':code,'rows':rows,'expected_failure':a.expect_failure,'failure_target':a.failure_target,'expected_protocol':a.expect_protocol,'kernel_sha256':kernel_hash,'elf_sha256':program_hash,'interpreter':interpreter,'loader_sha256':loader_hash},indent=2)+'\n')
     print('\n'.join(rows));return 0 if passed else 1
 if __name__=='__main__':raise SystemExit(main())

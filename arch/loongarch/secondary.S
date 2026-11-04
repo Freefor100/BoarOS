@@ -1,4 +1,5 @@
 #include <kernel/cpu_config.h>
+#include <arch/loongarch/smp_boot.h>
 #if BOAROS_MAX_CPUS > 1
     .section .text.boot, "ax", @progbits
     .globl la_secondary_entry
@@ -18,19 +19,14 @@ la_secondary_entry:
     jr $t0
 .Lsecondary_high:
     csrwr $zero, 0x182
-    la.abs $sp, la_secondary_stack_top
-    la.abs $t0, la_secondary_thread
+    /* Firmware consumes MBUF0 as entry; MBUF1 keeps this target's owner. */
+    li.w $t0, 0x1028
+    iocsrrd.d $a0, $t0
     dbar 0
-    ld.d $tp, $t0, 0
+    ld.d $tp, $a0, LA_SMP_BOOT_THREAD
+    ld.d $sp, $a0, LA_SMP_BOOT_STACK_HIGH
     bl la_smp_secondary
 .Lstopped:
     idle 0
     b .Lstopped
-    .section .bss, "aw", @nobits
-    .balign 16384
-    .globl la_secondary_stack
-la_secondary_stack:
-    .skip 16384
-    .globl la_secondary_stack_top
-la_secondary_stack_top:
 #endif

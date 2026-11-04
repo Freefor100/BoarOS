@@ -12,10 +12,10 @@
 #ifndef BOAROS_USER_SMP
 #define BOAROS_USER_SMP 0
 #endif
-#if BOAROS_USER_SMP && BOAROS_MAX_CPUS != 2 && BOAROS_MAX_CPUS != 4
+#if BOAROS_USER_SMP && BOAROS_MAX_CPUS != 2 && BOAROS_MAX_CPUS != 4 && BOAROS_MAX_CPUS != 8
 #error remote user execution requires an SMP build
 #endif
-#if BOAROS_MAX_CPUS != 1 && BOAROS_MAX_CPUS != 2 && BOAROS_MAX_CPUS != 4
+#if BOAROS_MAX_CPUS != 1 && BOAROS_MAX_CPUS != 2 && BOAROS_MAX_CPUS != 4 && BOAROS_MAX_CPUS != 8
 #error unsupported CPU capacity
 #endif
 #endif

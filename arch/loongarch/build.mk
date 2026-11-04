@@ -4,6 +4,10 @@ endif
 LA_CROSS_COMPILE ?= loongarch64-unknown-linux-gnu-
 QEMU_LOONGARCH64 ?= build/qemu-la-rtc/qemu-system-loongarch64
 LA_SMP ?= 0
+LA_SMP_CPUS ?= 2
+ifneq ($(filter $(LA_SMP_CPUS),2 4),$(LA_SMP_CPUS))
+$(error LA_SMP_CPUS must be 2 or 4)
+endif
 LA_SMP_TEST ?= 0
 ifneq ($(filter $(LA_SMP_TEST),0 1 2 3 4 5),$(LA_SMP_TEST))
 $(error LA_SMP_TEST must be 0..5)
@@ -18,12 +22,12 @@ $(error LA_SMP must be 0 or 1)
 endif
 ifeq ($(LA_SMP),1)
 ifeq ($(LA_SMP_TEST),0)
-LA_BUILD ?= build/loongarch-smp2
+LA_BUILD ?= build/loongarch-smp$(LA_SMP_CPUS)
 else
-LA_BUILD ?= build/loongarch-smp2-test$(LA_SMP_TEST)
+LA_BUILD ?= build/loongarch-smp$(LA_SMP_CPUS)-test$(LA_SMP_TEST)
 endif
 KERNEL_LA ?= $(LA_BUILD)/kernel-la
-LA_CPU_CAPACITY := 2
+LA_CPU_CAPACITY := $(LA_SMP_CPUS)
 else
 LA_BUILD ?= build/loongarch
 KERNEL_LA ?= kernel-la
@@ -129,7 +133,7 @@ $(LA_BUILD)/kernel-smp-guard: $(LA_OBJECTS) $(LA_BUILD)/stack-guard-4.o arch/loo
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=la_boot_tasks,--wrap=la_kernel_stack_overflow -o $@ $(LA_OBJECTS) $(LA_BUILD)/stack-guard-4.o -lgcc
 .PHONY: test-smp-guard-loongarch
 test-smp-guard-loongarch: $(LA_BUILD)/kernel-smp-guard prepare-la-tools
-	python3 -B tests/loongarch/stack_guard.py --smp
+	python3 -B tests/loongarch/stack_guard.py --smp $(LA_SMP_CPUS) --kernel $(LA_BUILD)/kernel-smp-guard
 endif
 .PHONY: test-stack-guard-loongarch
 test-stack-guard-loongarch: $(foreach case,0 1 2 3,$(LA_BUILD)/kernel-stack-guard-$(case)) prepare-la-tools

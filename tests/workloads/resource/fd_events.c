@@ -141,8 +141,8 @@ static void *remote(void *argument)
 static void callers(void)
 {
     cpu_set_t set;CPU_ZERO(&set);CHECK(!sched_getaffinity(0,sizeof(set),&set));
-    pthread_t threads[4];unsigned n=0;
-    for(unsigned cpu=0;cpu<4;cpu++)if(CPU_ISSET(cpu,&set))CHECK(!pthread_create(&threads[n++],NULL,remote,(void *)(uintptr_t)cpu));
+    pthread_t threads[8];unsigned n=0;
+    for(unsigned cpu=0;cpu<8;cpu++)if(CPU_ISSET(cpu,&set))CHECK(!pthread_create(&threads[n++],NULL,remote,(void *)(uintptr_t)cpu));
     for(unsigned i=0;i<n;i++)CHECK(!pthread_join(threads[i],NULL));
     CHECK(n>0);
 }
