@@ -17,7 +17,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 
 调用者是 scheduler 当前不透明 task，供依赖任务身份或资源的系统调用取得明确上下文；通用解码层不从 RISC-V `tp` 隐式寻找 current。请求包含系统调用号和六个 64 位参数。结果动作定义在公共头中：
 
-当前分派覆盖RV的217个编号、LA的216个编号；这表示入口已接入，各接口的具体支持范围见对应模块。
+当前分派覆盖RV的218个编号、LA的217个编号；这表示入口已接入，各接口的具体支持范围见对应模块。
 `flock(32)`、`close_range(436)`、`epoll_pwait2(441)`、`fchmodat2(452)`和
 `copy_file_range(285)`见[文件接口](kernel-files.md)，`sendmmsg(269)`／`recvmmsg(243)`
 见[网络接口](kernel-network.md)。RV独有的`riscv_flush_icache(259)`见[MM](kernel-mm.md)；
@@ -52,6 +52,8 @@ LA的259仍返回`ENOSYS`。这些入口的直接消费者可用`python3 tests/a
 
 - `clock_gettime` 编号 113、`clock_getres` 编号 114、`gettimeofday` 编号 169、`clock_nanosleep` 编号 115 与 `nanosleep` 编号 101 构成时间族，语义见[内核时间模块](kernel-time.md)。
 - `sched_yield` 编号 124 把当前任务排到其优先级队尾，再按优先级与实时预算资格重选；只有较低优先级 READY 任务时 FIFO/RR 可继续当前任务，RR 保留剩余时间片。调度失败属于内核不变量破坏，由 Trap 边界 fatal。
+- `sched_getscheduler(120)`、`sched_getparam(121)`、`sched_getaffinity(123)`、`sched_rr_get_interval(127)` 与 `sched_getattr(275)` 在发起 CPU 执行。任务身份、策略、基础优先级及亲和掩码在 scheduler 身份保护下取得完整小快照，释放保护后才复制到用户内存；PI 临时继承的有效优先级不替换查询到的基础值。`sched_setparam(118)`、`sched_setscheduler(119)` 和 `sched_setaffinity(122)` 保持 CPU0 服务执行规则；优先级上下限查询 125/126 与 `getcpu(168)` 也在发起 CPU 执行。
+- `sched_getattr(275)` 在 RV64/LA64 使用相同的 56 字节原生结构，接受 48 字节旧版、48～56 字节间的任意前缀，以及不超过架构基页大小的扩展结构。返回 `size=min(用户长度,56)`；扩展尾部先清零，再写已知前缀，因此尾部 `EFAULT` 不改写结构头。先检查空指针、负 TID 和长度，再查目标，随后检查 flags，最后输出；当前支持 OTHER/FIFO/RR，只有 flags=0 有效。策略与 RESET_ON_FORK 来自任务快照，nice 为实际固定值 0；OTHER 的 runtime 为当前普通调度量子 10ms，与 127 的普通策略间隔一致，FIFO/RR 的 runtime 为 0；deadline、period 与未启用的 util_min/util_max 为 0。Linux fair 类的 runtime 来自其自身调度 slice，具体数值不要求与 BoarOS 普通调度量子相等。
 - `preadv/pwritev` 编号 69/70，复用向量复制和定位 I/O；一次调用固定一份 OFD，保留完成前缀并保持共享当前位置。管道等不可定位对象返回 `ESPIPE`。
 - `exit` 编号 93 产生线程 `EXIT`，`exit_group` 编号 94 产生全组 `EXIT_GROUP`；状态保留参数 0 的低 8 位。组退出等待成员沿原内核调用栈释放在用资源，最后产生一次进程退出通知。
 - `set_tid_address` 编号 96 记录 clear_tid 用户指针并返回调用 TID；线程退出在释放 MM 前清零并唤醒同 key 的一个 futex waiter。坏用户指针不破坏内核状态。
@@ -89,6 +91,8 @@ LA的259仍返回`ENOSYS`。这些入口的直接消费者可用`python3 tests/a
 `make test-core-limit-abi-riscv test-core-limit-abi-loongarch test-capability-abi-riscv test-capability-abi-loongarch test-fsize-abi-riscv test-fsize-abi-loongarch`提供限额与capget的聚焦Linux对照；`make test-resource-limits-smp-riscv QEMU_RISCV_FIRMWARE=/absolute/fw_dynamic.bin`合并这些边界及CPU定时器，验证实际RV两核。
 
 `make test-selected-abi-riscv test-selected-abi-loongarch` 对本节的定位向量、错误顺序、时间输出、信号及嵌套 epoll 等边界运行同 ELF Linux 差分。`make test-syscall-riscv` 验证空指针失败原子性、`exit(93)`、`exit_group(94)`、`set_tid_address(96)`、raw `brk`、匿名/文件 mmap 参数、不可读文件映射的 `EACCES`、fd pin/失败释放、errno、munmap/mprotect 转发、内部 MM 状态升级、clone 参数分类和未知编号。`make test-signal-riscv` 验证信号 syscall、handler frame/sigreturn、默认动作和 syscall restart；`make test-uaccess-riscv` 与 `make test-files-riscv` 验证用户复制、页缓存、pipe 和映射所需的文件生命周期。`make test-mmap-riscv` 让真实 ext4 `/init` ELF 从 U-mode 完成 demand-zero、file-private COW、EOF/SIGBUS、PROT_NONE、fixed replace/noreplace、打洞/重填和释放；`make test-userland-riscv` 继续覆盖真实 musl 的 heap/fork/exec、文件访问模式、signal 和 pipe 生命周期。
+
+`tests/workloads/resource/sched_query.c` 用同一原生 ELF 检查调度查询的结构长度、参数宽度、错误顺序、输出前缀、每个可用 CPU 的亲和性与 `getcpu`、其他 TID 及退出生命周期、RESET_ON_FORK 和 PI 基础优先级。策略竞争中，握手及更新序号确认稳定窗口的完整结果；BoarOS 的每次竞争查询还必须返回同一份任务快照。固定 Linux 的 getter 只以 RCU 保护目标存活，逐字段读取与 setter 没有共用锁，跨越修改的结果允许组合两个输入的字段。线程 join 完成后，以有界等待检查 TID 从身份索引撤销，不能把 clear_child_tid 唤醒直接当作 PID 已消失。固定 Linux 对照的 RV/LA 配置均未启用 UCLAMP_TASK；宿主机可用 `--host-safe` 运行不修改实时策略的部分。
 
 身份和能力接口依据仓库固定的 `references/linux/kernel/sys.c`、`kernel/groups.c`、`kernel/capability.c` 与 `security/commoncap.c`，版本由 `references/sources.tsv` 统一维护。`tests/diff-abi/credentials.c` 的独立子进程记录检查身份转换、组列表、capset/prctl、错误顺序和用户输出前缀；真实 musl/glibc 全线程 setxid 由 `tests/workloads/credentials/threads.c` 检查。
 

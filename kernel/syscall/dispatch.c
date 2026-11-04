@@ -651,7 +651,7 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
         if (syscall_handle_set_robust_list(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-    } else if (request->number == 168U ||
+    } else if (request->number == 168U || request->number == 275U ||
                (request->number >= 118U && request->number <= 123U) ||
                (request->number >= 125U && request->number <= 127U)) {
         if (syscall_handle_sched(caller, request, &decoded) !=

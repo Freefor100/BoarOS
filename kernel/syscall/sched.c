@@ -2,11 +2,23 @@
 #include <kernel/cpu.h>
 #include "private.h"
 #include <kernel/errno.h>
+#include <kernel/page.h>
 #include <kernel/sched_policy.h>
 #include <kernel/task.h>
 #include <kernel/uaccess.h>
 #include <kernel/tick.h>
 #include <stdint.h>
+
+struct linux_sched_attr {
+    uint32_t size, policy;
+    uint64_t flags;
+    int32_t nice;
+    uint32_t priority;
+    uint64_t runtime, deadline, period;
+    uint32_t util_min, util_max;
+};
+_Static_assert(sizeof(struct linux_sched_attr)==56,"native sched_attr size");
+_Static_assert(offsetof(struct linux_sched_attr,util_min)==48,"sched_attr version 0 size");
 
 static int sched_copy(struct kernel_task *caller, uint64_t address,
                       void *buffer, size_t size, int to_user)
@@ -49,14 +61,15 @@ enum kernel_syscall_status syscall_handle_sched(
                 (nr==125 ? 99 : 1) : -KERNEL_EINVAL;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    KERNEL_SERVICE_SCOPE(service);
     if (nr==118 || nr==119) {
+        KERNEL_SERVICE_SCOPE(service);
         uint64_t address=request->arguments[nr==118 ? 1 : 2];
         int priority, policy=nr==118 ? 0 : (int)request->arguments[1];
         if (!address || pid<0 || (nr==119 && policy<0)) result=-KERNEL_EINVAL;
         else if ((result=sched_copy(caller,address,&priority,sizeof(priority),0))==0)
             result=kernel_task_sched_set(caller,pid,policy,priority,nr==118);
     } else if (nr==122) {
+        KERNEL_SERVICE_SCOPE(service);
         unsigned length=(unsigned)request->arguments[1];
         uint64_t mask=0;
         if (length>sizeof(mask)) length=sizeof(mask);
@@ -70,6 +83,34 @@ enum kernel_syscall_status syscall_handle_sched(
             result=kernel_task_affinity_get(caller,pid,&mask);
             if (!result) result=sched_copy(caller,request->arguments[2],&mask,sizeof(mask),1);
             if (!result) result=sizeof(mask);
+        }
+    } else if (nr==275) {
+        uint64_t address=request->arguments[1];
+        unsigned size=(unsigned)request->arguments[2];
+        unsigned flags=(unsigned)request->arguments[3];
+        if (!address || pid<0 || size<48 || size>BOAROS_PAGE_SIZE)
+            result=-KERNEL_EINVAL;
+        else result=kernel_task_sched_get(caller,pid,&state);
+        if (!result && flags) result=-KERNEL_EINVAL;
+        if (!result) {
+            struct linux_sched_attr attr={
+                .size=size<sizeof(attr) ? size : sizeof(attr),
+                .policy=(uint32_t)state.policy,
+                .flags=state.reset_on_fork ? 1 : 0,
+                .priority=(state.policy==KERNEL_SCHED_FIFO || state.policy==KERNEL_SCHED_RR)
+                    ? (uint32_t)state.priority : 0,
+                .runtime=state.policy==KERNEL_SCHED_OTHER
+                    ? UINT64_C(1000000000)/KERNEL_TICKS_PER_SECOND : 0,
+            };
+            /* Linux先清扩展尾部；尾部fault时不写已知字段。任务快照已释放身份锁。 */
+            const uint64_t zeros[8]={0};
+            for (size_t offset=sizeof(attr); offset<size && !result;) {
+                size_t count=size-offset;
+                if (count>sizeof(zeros)) count=sizeof(zeros);
+                result=sched_copy(caller,address+offset,(void *)zeros,count,1);
+                offset+=count;
+            }
+            if (!result) result=sched_copy(caller,address,&attr,attr.size,1);
         }
     } else if (nr==120 || nr==121 || nr==127) {
         if (nr==121 && !request->arguments[1]) result=-KERNEL_EINVAL;
