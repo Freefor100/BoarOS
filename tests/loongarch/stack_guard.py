@@ -10,7 +10,7 @@ from guest import run_guest
 
 ROOT=Path(__file__).resolve().parents[2]
 p=argparse.ArgumentParser(description=__doc__)
-p.add_argument('--smp',type=int,nargs='?',const=2,choices=(2,4));p.add_argument('--kernel',type=Path);p.add_argument('--output',type=Path);args=p.parse_args()
+p.add_argument('--smp',type=int,nargs='?',const=2,choices=(2,4,8));p.add_argument('--kernel',type=Path);p.add_argument('--output',type=Path);args=p.parse_args()
 if args.output:
     work=args.output.resolve();work.mkdir()
 else:

@@ -5,8 +5,8 @@ LA_CROSS_COMPILE ?= loongarch64-unknown-linux-gnu-
 QEMU_LOONGARCH64 ?= build/qemu-la-rtc/qemu-system-loongarch64
 LA_SMP ?= 0
 LA_SMP_CPUS ?= 2
-ifneq ($(filter $(LA_SMP_CPUS),2 4),$(LA_SMP_CPUS))
-$(error LA_SMP_CPUS must be 2 or 4)
+ifneq ($(filter $(LA_SMP_CPUS),2 4 8),$(LA_SMP_CPUS))
+$(error LA_SMP_CPUS must be 2, 4 or 8)
 endif
 LA_SMP_TEST ?= 0
 ifneq ($(filter $(LA_SMP_TEST),0 1 2 3 4 5),$(LA_SMP_TEST))

@@ -1,6 +1,6 @@
 # LoongArch QEMU 启动与根盘
 
-当前平台范围为 QEMU virt、LA464、LA64、16 KiB/三级页表，默认单核，可选最多四核；
+当前平台范围为 QEMU virt、LA464、LA64、16 KiB/三级页表，默认单核，可选最多八核；
 覆盖整数/FPU/LSX/LASX状态与代表性用户程序；更广应用及客体原生开发另行验收。
 入口为 `arch/loongarch/boot.S` 与 `main.c`，平台事实独立放在
 `platform/loongarch_virt.c`。普通 `kernel-la` 从现代 PCI block 启动可配置根盘 PID 1；无根盘时报告启动错误。它不链接契约测试、内嵌用户 ELF 或故障包装函数。独立 `build/loongarch/kernel-contract-la` 保留无盘契约入口；平台存储生命周期在 `platform/loongarch_root.c`。
@@ -9,10 +9,12 @@
 ## 多核执行
 
 `make LA_SMP=1 kernel-la`使用独立的`build/loongarch-smp2/`对象和内核，默认容量为两核。
-`LA_SMP_CPUS=4`选择四核容量及`build/loongarch-smp4/`，可实际启动一至四核。
+`LA_SMP_CPUS=4`或`8`选择对应容量及`build/loongarch-smp4/`或`build/loongarch-smp8/`，
+实际启动数可为一至容量上限之间的任意核数。
 普通`kernel-la`及官方默认参数保留单核。
 DTB的CPU列表在启动其他CPU前校验，启动CPU为逻辑CPU0，其余ID排序；超容量和非法拓扑
-在发布启动数据前拒绝。平台范围仍为QEMU virt；实板另行验收。
+在发布启动数据前拒绝。IOCSR目标CPU ID支持0～1023，容量限制的是实际CPU数量。
+平台范围仍为QEMU virt；实板另行验收。
 
 CPU0顺序启动secondary：通过IOCSR MBUF1发布目标CPU的常驻启动描述符，MBUF0发布物理入口，
 再发送启动IPI。固定QEMU固件在停驻循环中清MBUF0并把它用作跳转入口，因此描述符单独放在MBUF1。
@@ -59,7 +61,7 @@ CPU定时器均由每个实际在线CPU执行。runner核对每核用户trap、�
 检查其余回复不能完成请求；最后复用payload并向非目标CPU送入迟到IPI，检查它们不能代为确认。
 runner的`--expect-protocol`要求这三组结果全部出现。2～5分别向最后一个secondary注入attach、
 握手、TLB及停止确认失败，失败输出实际目标CPU和阶段。
-`make LA_SMP=1 LA_SMP_CPUS=4 test-smp-guard-loongarch`同时触发四核guard错误并核对紧急栈分离。
+`make LA_SMP=1 LA_SMP_CPUS=8 test-smp-guard-loongarch`同时触发八核guard错误并核对紧急栈分离。
 
 `COST_DIAGNOSTICS=1 LA_BUILD=build/cost/loongarch-smp2`可复用共同成本观察器，
 记录服务交接、共享锁及唤醒至运行。rank40为挂载状态，rank45为页缓存状态。

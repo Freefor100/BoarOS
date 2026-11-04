@@ -11,13 +11,13 @@ Linux 是用户可观察语义的参考；内部实现独立维护对象所有�
 
 默认生产平台为单 CPU QEMU virt：**RV64、Sv39／4 KiB 页**和**LA64、LA464、16 KiB／三级页表**。
 两侧共用 MM、调度、VFS、设备和用户程序策略，架构实现在构建期绑定。
-RV支持独立构建的真实1～8核用户执行。匿名缺页、用户复制、ext4读取、文件空间修改及目录操作在发起CPU完成；同挂载不同目录和文件可并行准备私有修改，日志发布、checkpoint与后台写回由CPU0推进。socket与管道收发、poll/pselect、epoll等待及futex也在发起CPU执行，协议和控制操作保留实际CPU0边界。RV/LA默认交付保持单核，LA另有真实1～4核构建；执行位置与对象保护见[RV多核](docs/modules/riscv-smp.md#真实用户态与cpu0业务交接)。
+RV支持独立构建的真实1～8核用户执行。匿名缺页、用户复制、ext4读取、文件空间修改及目录操作在发起CPU完成；同挂载不同目录和文件可并行准备私有修改，日志发布、checkpoint与后台写回由CPU0推进。socket与管道收发、poll/pselect、epoll等待及futex也在发起CPU执行，协议和控制操作保留实际CPU0边界。RV/LA默认交付保持单核，LA另有真实1～8核构建；执行位置与对象保护见[RV多核](docs/modules/riscv-smp.md#真实用户态与cpu0业务交接)。
 
 2026-10-14 的原程序记录包含 2/1 CPU、512 MiB/1 GiB 四个 USER_SMP profile，各 229 项通过；这是当时实现的结果。本轮普通对象并发、调用 CPU 执行位置及 SQLite 独立重启结果记录在对应[模块说明](docs/modules/riscv-smp.md#用户态原程序与压力组合)。
 
 | 范围 | 已验证能力 | 主要边界／模块 |
 |---|---|---|
-| 内存与 CPU | buddy/slab、VMA、按需页、共享映射、COW、mremap、madvise（含共享后备REMOVE）；RV真实1～8核、LA真实1～4核，RV F/D、LA FPU/LSX/LASX | RV V、更广多核应用及扩展内存操作见[开发路线](docs/goals.md)；[MM](docs/modules/kernel-mm.md)、[RV多核](docs/modules/riscv-smp.md)、[LA](docs/modules/loongarch-boot.md) |
+| 内存与 CPU | buddy/slab、VMA、按需页、共享映射、COW、mremap、madvise（含共享后备REMOVE）；RV／LA真实1～8核，RV F/D、LA FPU/LSX/LASX | RV V、更广多核应用及扩展内存操作见[开发路线](docs/goals.md)；[MM](docs/modules/kernel-mm.md)、[RV多核](docs/modules/riscv-smp.md)、[LA](docs/modules/loongarch-boot.md) |
 | ELF 与运行时 | 静态/动态 ELF、PIE、shebang、解释器、execveat／FD执行、musl DSO/TLS；RV glibc 2.44、LA glibc 2.42 的五种形态及线程/取消子集 | 更广 glibc 应用仍须逐个验收；[ELF](docs/modules/user-elf.md)、[exec](docs/modules/kernel-exec.md) |
 | 进程与同步 | fork/vfork/pthread、exec/wait/退出；OTHER/FIFO/RR、deadline；robust及比较重排/复合唤醒futex、SysV信号量及SEM_UNDO、SysV/POSIX消息队列、实时信号队列、备用信号栈、CPU/POSIX定时器 | PI futex、PI条件重排和futex_waitv；[调度](docs/modules/kernel-scheduler.md)、[信号量](docs/modules/sysv-sem.md)、[SysV消息](docs/modules/sysv-msg.md)、[POSIX消息](docs/modules/posix-mqueue.md)、[信号](docs/modules/kernel-signal.md) |
 | 文件与事件 | FD/OFD、向量/定位I/O、pipe/FIFO、poll/select/epoll、eventfd/timerfd/signalfd、记录锁、link/rename；可变身份、DAC、set-ID/filecap、tmpfs/ext4 xattr | 挂载和扩展接口边界见[开发路线](docs/goals.md)；[文件接口](docs/modules/kernel-files.md) |
