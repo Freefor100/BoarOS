@@ -35,6 +35,7 @@ int main(void)
 #ifdef __riscv
         "/icache",
 #endif
+        "/sched_query",
     };
     unsigned count=sizeof(programs)/sizeof(programs[0]);
     for(unsigned i=0;i<count;i++) {

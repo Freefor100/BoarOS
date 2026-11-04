@@ -1,53 +1,65 @@
 # LoongArch QEMU 启动与根盘
 
-当前验收范围为 QEMU virt、LA464、LA64、16 KiB/三级页表，默认单核，可选真实双核；
+当前平台范围为 QEMU virt、LA464、LA64、16 KiB/三级页表，默认单核，可选最多四核；
 覆盖整数/FPU/LSX/LASX状态与代表性用户程序；更广应用及客体原生开发另行验收。
 入口为 `arch/loongarch/boot.S` 与 `main.c`，平台事实独立放在
 `platform/loongarch_virt.c`。普通 `kernel-la` 从现代 PCI block 启动可配置根盘 PID 1；无根盘时报告启动错误。它不链接契约测试、内嵌用户 ELF 或故障包装函数。独立 `build/loongarch/kernel-contract-la` 保留无盘契约入口；平台存储生命周期在 `platform/loongarch_root.c`。
 默认 `all` 和 RV 测试入口保持原路径。
 
-## 双核执行
+## 多核执行
 
-`make LA_SMP=1 kernel-la`使用独立的`build/loongarch-smp2/`对象和内核，容量为两核，
-可实际启动一核或双核。普通`kernel-la`及官方默认参数保留单核。
+`make LA_SMP=1 kernel-la`使用独立的`build/loongarch-smp2/`对象和内核，默认容量为两核。
+`LA_SMP_CPUS=4`选择四核容量及`build/loongarch-smp4/`，可实际启动一至四核。
+普通`kernel-la`及官方默认参数保留单核。
 DTB的CPU列表在启动其他CPU前校验，启动CPU为逻辑CPU0，其余ID排序；超容量和非法拓扑
 在发布启动数据前拒绝。平台范围仍为QEMU virt；实板另行验收。
 
-CPU0通过IOCSR mailbox设置secondary物理入口，再发送启动IPI。secondary不清BSS，先配置
-DMW并进入高地址，取得自己常驻的idle、CPU记录和16KiB启动栈，再设置每核异常、MMU与timer。
-两核共用永久内核栈页表根，各自持有PGDH；timer的周期期限与调度期限归实际CPU。
-CPU1完成本地timer和IPI握手后发布ONLINE，CPU0随后进入根盘与普通用户启动。
+CPU0顺序启动secondary：通过IOCSR MBUF1发布目标CPU的常驻启动描述符，MBUF0发布物理入口，
+再发送启动IPI。固定QEMU固件在停驻循环中清MBUF0并把它用作跳转入口，因此描述符单独放在MBUF1。
+secondary不清BSS，先配置DMW并进入高地址，从描述符取得自己的idle及16KiB启动栈；
+描述符的汇编前缀偏移由C静态断言核对。每个CPU分别设置异常、MMU与timer，
+共用永久内核栈页表根，各自持有PGDH；timer的周期期限与调度期限归实际CPU。
+每个secondary完成本地timer和IPI握手后发布ONLINE，全部CPU在线后CPU0才启动普通用户任务。
 固件入口及IOCSR布局对照固定QEMU的`hw/loongarch/boot.c`和固定Linux的
 `arch/loongarch/kernel/smp.c`，版本统一由`references/sources.tsv`维护。
 
 调度队列、任务唯一执行者、CPU0服务资格沿共同实现。用户执行、信号构帧／恢复、共享MM、
 普通文件、管道及事件对象复用各自已经具备的跨核保护。设备外部中断、网络协议与控制、
-日志和后台写回继续由CPU0推进；CPU1只启用自己的timer和IPI。全局tick、粗粒度时间与
+日志和后台写回继续由CPU0推进；secondary只启用自己的timer和IPI。全局tick、粗粒度时间与
 期限扫描由CPU0推进。共同等待、POSIX timer和timerfd通过`arch/smp.h`选择实际架构的
 CPU0通知，不再直接调用RV接口。
 
-每个发起CPU持有一份同步TLB请求，包含地址、范围、指令同步要求和请求／完成代次。
-发起者禁止本地中断以固定执行CPU，在发布PTE后发送IPI；接收方失效TLB并按需要执行IBAR，
-最后发布完成代次。等待者同时处理已到达的远端请求，即使自己的确认已经先到，也在返回前
-处理对端请求；这覆盖两核均屏蔽中断并相互等待的交错。硬件IPI清除完成后才消费软件事件，
+每个发起CPU持有一份同步TLB请求，包含地址、范围、指令同步要求、代次、目标集合和待确认集合。
+发起者禁止本地中断以固定执行CPU，在发布PTE后一次发布全部目标，再分别发送IPI。
+接收方只借用包含自己待确认位的请求：短保护内取得快照，退出保护后失效TLB并按需要执行IBAR，
+再在短保护内核对代次并清自己的位。非目标CPU不能确认其他CPU的工作；全部待确认位清零前，
+发起者不复用请求存储。迟到IPI只检查当前代次和自己的位，不复用旧的确认含义。
+等待者同时处理远端请求，即使自己的确认已经先到，也在返回前处理对端请求；
+所有CPU同时屏蔽中断发起同步仍能推进。硬件IPI清除完成后才消费软件事件，
 后续通知由新事件或pending中断保留。页和页表沿共同MM退休集合持有，远端确认后才释放。
 内核栈槽的发布／撤销同样同步全部在线CPU。
 
 撤销用户映射时，每次持有 MM 元数据保护的扫描复用已解析的根、中间及叶页表地址；
 父表条目变化后重新解析。每次仍有界扫描，摘下的页表在退出保护并完成 TLB 同步后释放。
 
-停止先检查CPU1已无用户、就绪资格及活动MM，发送STOP后等待它关中断、停timer并发布
+停止先逐核检查secondary已无用户、就绪资格及活动MM，发送STOP后逐核等待关中断、停timer并发布
 STOPPED，再清理根盘对象。停驻循环继续占用镜像常驻的AP栈、idle和CPU记录，不把它们
 当作可复用内存。启动、握手、TLB或停止确认失败输出目标CPU和阶段，并保持可能仍被使用的
-资源。两核各有独立的16KiB紧急故障栈；同时发生guard错误时不共用报错现场。
+资源。每个逻辑CPU各有独立的16KiB紧急故障栈；汇编入口按常驻硬件ID选择紧急栈，
+在调用C前不向已经耗尽的栈写入数据，同时发生guard错误时也不共用报错现场。
 
 短例使用`tests/workloads/smp/loongarch.c`，复用既有整数/FPU/SIMD寄存器探针。
 `tests/loongarch/smp.py`固定内核和ELF快照，覆盖实际CPU、信号、共享MM撤权／替换／解除映射、
-futex、CPU定时器、ext4并发及fork/COW/exec；同一程序可在固定Linux双核运行。
+futex、CPU定时器、ext4并发及fork/COW/exec；整数/FPU/SIMD/TLS、信号、共享MM、文件及
+CPU定时器均由每个实际在线CPU执行。runner核对每核用户trap、返回、IPI及最终停止状态；
+同一程序可在固定Linux上运行。
 动态musl使用既有`dynamic-dp-v2`工具链；`--loader`要求ELF包含实际的musl解释器入口，
 快照解释器并核对盘内文件内容，拒绝把静态程序当作动态验证。
-`LA_SMP_TEST=1`仅在独立测试内核中强制双向TLB交错；2～5分别注入attach、握手、TLB及停止
-确认失败。`make LA_SMP=1 test-smp-guard-loongarch`直接触发两核guard错误并核对紧急栈分离。
+`LA_SMP_TEST=1`仅在独立测试内核中强制全部发起者同时发布TLB请求，随后扣住最后一个目标确认，
+检查其余回复不能完成请求；最后复用payload并向非目标CPU送入迟到IPI，检查它们不能代为确认。
+runner的`--expect-protocol`要求这三组结果全部出现。2～5分别向最后一个secondary注入attach、
+握手、TLB及停止确认失败，失败输出实际目标CPU和阶段。
+`make LA_SMP=1 LA_SMP_CPUS=4 test-smp-guard-loongarch`同时触发四核guard错误并核对紧急栈分离。
 
 `COST_DIAGNOSTICS=1 LA_BUILD=build/cost/loongarch-smp2`可复用共同成本观察器，
 记录服务交接、共享锁及唤醒至运行。rank40为挂载状态，rank45为页缓存状态。

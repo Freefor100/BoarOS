@@ -500,7 +500,7 @@ def run_smp(args):
     if args.only!='boaros':
         linux,linux_identity=harness.linux_build(ROOT/'tests/smp/linux-user.config')
         config=(linux.parents[3]/'.config').read_text()
-        if 'CONFIG_NR_CPUS=4' not in config:raise RuntimeError('four-CPU reference required')
+        if 'CONFIG_NR_CPUS=8' not in config:raise RuntimeError('eight-CPU reference required')
         variants.append(('linux',linux))
     if args.only!='linux':variants.append(('boaros',args.kernel or ROOT/'kernel-rv'))
     originals=variants;variants=[]

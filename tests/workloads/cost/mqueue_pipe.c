@@ -18,7 +18,11 @@
 
 #define CHECK(v) do { if(!(v)) { dprintf(2,"MQPIPE FAIL line=%d errno=%d\n",__LINE__,errno);exit(1); } } while(0)
 enum { PAIRS=4, ACTORS=8, FORMAL_ROUNDS=4096, STREAM_BLOCK=65536, STREAM_BYTES=16*1024*1024 };
-static unsigned cpu_ids[4],cpu_count,smoke,windows;
+static unsigned cpu_ids[8],cpu_count,smoke,windows;
+/* The fixed SMP consumer restores every worker's full selected mask when
+ * unbound; inheriting a coordinator pinned to CPU0 would serialize the work. */
+static unsigned queue_unbound,queue_fixed_actors;
+static const char *queue_result_prefix="MQPIPE";
 static uint64_t all_checks;
 static uint64_t queue_clock(clockid_t id)
 { struct timespec t;CHECK(!clock_gettime(id,&t));return (uint64_t)t.tv_sec*1000000000U+(uint64_t)t.tv_nsec; }
@@ -29,7 +33,9 @@ static int queue_compare(const void *a,const void *b)
 { uint64_t x=*(const uint64_t *)a,y=*(const uint64_t *)b;return (x>y)-(x<y); }
 static void queue_pin(unsigned role)
 {
-    cpu_set_t mask,actual;CPU_ZERO(&mask);CPU_SET(cpu_ids[role%cpu_count],&mask);
+    cpu_set_t mask,actual;CPU_ZERO(&mask);
+    if(queue_unbound) {for(unsigned i=0;i<cpu_count;i++)CPU_SET(cpu_ids[i],&mask);}
+    else CPU_SET(cpu_ids[role%cpu_count],&mask);
     CHECK(!sched_setaffinity(0,sizeof(mask),&mask));CPU_ZERO(&actual);
     CHECK(!sched_getaffinity(0,sizeof(actual),&actual) && !memcmp(&mask,&actual,sizeof(mask)));
 }
@@ -46,8 +52,8 @@ static void metric(const char *name,uint64_t wall,uint64_t cpu,uint64_t *samples
     CHECK(wall && checks);
     if(count)qsort(samples,count,sizeof(*samples),queue_compare);
     struct rusage usage;CHECK(!getrusage(RUSAGE_SELF,&usage));
-    printf("MQPIPE RESULT name=%s wall_ns=%llu cpu_ns=%llu p50_ns=%llu p95_ns=%llu max_ns=%llu work=%llu bytes=%llu checks=%llu rss_kib=%ld samples=%u workers=%u\n",
-        name,(unsigned long long)wall,(unsigned long long)cpu,
+    printf("%s RESULT name=%s wall_ns=%llu cpu_ns=%llu p50_ns=%llu p95_ns=%llu max_ns=%llu work=%llu bytes=%llu checks=%llu rss_kib=%ld samples=%u workers=%u\n",
+        queue_result_prefix,name,(unsigned long long)wall,(unsigned long long)cpu,
         (unsigned long long)(count?samples[count/2]:0),
         (unsigned long long)(count?samples[count*95/100]:0),
         (unsigned long long)(count?samples[count-1]:0),
@@ -71,7 +77,7 @@ static void spans(struct clock_span *s,unsigned count,uint64_t *wall,uint64_t *c
 /* The unregistered-stack getpid/tgkill work is the fixed body from
  * accounting/signal_stack.h, with physical CPUs imported from the allowed set. */
 struct legacy_actor {
-    pthread_barrier_t *gate;unsigned id,getpids,signals;
+    pthread_barrier_t *gate;unsigned id,getpids,signals,delivered;
     struct clock_span spans[2];uint64_t samples[4096];
 };
 static _Thread_local volatile sig_atomic_t received_signals;
@@ -89,7 +95,7 @@ static void *legacy_run(void *opaque)
         a->samples[i]=now()-begin;CHECK((unsigned)received_signals==i+1);
     }
     a->spans[1].end=now();a->spans[1].cpu=queue_clock(CLOCK_THREAD_CPUTIME_ID)-cpu;
-    CHECK((unsigned)received_signals==a->signals);return NULL;
+    a->delivered=(unsigned)received_signals;CHECK(a->delivered==a->signals);return NULL;
 }
 static void legacy_signal_windows(void)
 {
@@ -190,7 +196,8 @@ static void mq_receive_checked(mqd_t fd,unsigned char *buffer,unsigned size,unsi
 }
 static void *mq_run(void *opaque)
 {
-    struct mq_actor *a=opaque;struct mq_pair *p=a->pair;queue_pin(p->id+a->side);
+    struct mq_actor *a=opaque;struct mq_pair *p=a->pair;
+    queue_pin(queue_fixed_actors?p->id*2+a->side:p->id+a->side);
     unsigned char buffer[4096];memcpy(buffer,p->pattern,sizeof(buffer));int ep=-1;unsigned tag=p->id*2+a->side+1;
     if(p->epoll) {ep=epoll_create1(EPOLL_CLOEXEC);CHECK(ep>=0);struct epoll_event event={.events=EPOLLIN,.data.u64=tag};CHECK(!epoll_ctl(ep,EPOLL_CTL_ADD,(int)p->fd[a->side],&event));}
     queue_gate(p->gate);uint64_t cpu=queue_clock(CLOCK_THREAD_CPUTIME_ID);a->span.begin=now();

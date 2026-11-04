@@ -97,7 +97,7 @@ static void socket_protocol_cases(void)
 
 extern void scheduler_user_service_set_locked(struct kernel_task *, int);
 extern void scheduler_user_request_locked(struct kernel_task *);
-static int cancel_stop_on_handoff;
+static int cancel_stop_on_handoff, local_rotation_active;
 void user_signal_cancel_stop(struct kernel_task *);
 void user_signal_retarget_case(struct kernel_task *,struct kernel_task *);
 void user_signal_take_retargeted(struct kernel_task *);
@@ -121,9 +121,17 @@ enum kernel_scheduler_status validate_queues_locked(void) { __builtin_trap(); }
 /* 唯一模拟的是机器换栈：生产select/finish决定owner及两侧资格。 */
 enum kernel_scheduler_status scheduler_switch_claimed(struct kernel_task *old,struct kernel_task *next)
 {
+    if (local_rotation_active) {
+        assert(next!=active->idle && old->wait.on_cpu && !old->ready_node.queued &&
+            !old->ready_cpu && old->wait.ready_flags==SCHED_READY_LOCAL);
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        kernel_wait_switch_finish_locked(old);active->switch_previous=0;
+        assert_ready_owner(old,active);
+        return KERNEL_SCHEDULER_STATUS_OK;
+    }
     assert(next==active->idle && old->wait.on_cpu && !old->ready_node.queued);
     /* 普通服务强制迁移也排在目标核已有工作之后，不能反复插队。 */
-    if (old->scheduling.policy==KERNEL_SCHED_OTHER) assert(!old->wait.ready_head);
+    if (old->scheduling.policy==KERNEL_SCHED_OTHER) assert(!old->wait.ready_flags);
     unsigned other=active->logical_id^1;
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
@@ -195,9 +203,79 @@ static void *late_service_notice(void *unused)
     return 0;
 }
 
+static void reservation_placement_cases(void)
+{
+    reset_two_queues();active=&cpus[1];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      tasks[2]=(struct kernel_task){.accounted=1,.arch.user_mode=1,.cpu_mask=2,
+          .cpu=&cpus[1],.state=KERNEL_THREAD_STATE_RUNNING,.wait.on_cpu=1};
+      tasks[2].scheduling.priority=60;
+      cpus[1].current=&tasks[2];idles[1].wait.on_cpu=0;
+      scheduler_user_service_set_locked(&tasks[2],1);
+      tasks[2].state=KERNEL_THREAD_STATE_READY;tasks[2].wait.ready_pending=1;
+      assert(scheduler_select_next_locked(active,&tasks[2],1)==&idles[1]);
+      kernel_wait_switch_finish_locked(&tasks[2]);active->switch_previous=0;
+      assert(tasks[2].reservation_cpu==&cpus[1] && tasks[2].ready_cpu==&cpus[0]); }
+    active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      tasks[3]=(struct kernel_task){.accounted=1,.cpu=&cpus[0],
+          .state=KERNEL_THREAD_STATE_RUNNING,.wait.on_cpu=1};
+      cpus[0].current=&tasks[3];idles[0].wait.on_cpu=0;
+      kernel_cpu_consume_schedule(&cpus[0]);kernel_cpu_consume_schedule(&cpus[1]);
+      tasks[0]=(struct kernel_task){.accounted=1,.arch.user_mode=1,.cpu_mask=3,
+          .state=KERNEL_THREAD_STATE_READY};
+      tasks[0].scheduling.priority=40;
+      /* CPU1虽idle，其RT60保留阻止RT40执行。 */
+      ready_enqueue_locked(&tasks[0],0);
+      assert_ready_owner(&tasks[0],&cpus[0]);
+      assert(kernel_cpu_schedule_requested(&cpus[0]) && !kernel_cpu_schedule_requested(&cpus[1]));
+      tasks[1]=(struct kernel_task){.accounted=1,.arch.user_mode=1,.cpu_mask=2,
+          .state=KERNEL_THREAD_STATE_READY};
+      tasks[1].scheduling.priority=40;ready_enqueue_locked(&tasks[1],0);
+      assert_ready_owner(&tasks[1],&cpus[1]); }
+    active=&cpus[1];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      assert(!ready_best_locked());
+      kernel_cpu_consume_schedule(&cpus[1]);
+      scheduler_user_reservation_release_locked(&tasks[2]);
+      assert(kernel_cpu_schedule_requested(&cpus[1]) && ready_best_locked()==&tasks[1]);
+      assert(scheduler_select_next_locked(active,active->current,1)==&tasks[1]);
+      kernel_wait_switch_finish_locked(&idles[1]);active->switch_previous=0;
+      assert(tasks[1].wait.on_cpu && !tasks[1].ready_cpu);
+      ready_remove_locked(&tasks[0]);ready_remove_locked(&tasks[2]); }
+    puts("PASS reservation placement: prefer legal executor; fully blocked affinity queues until real reservation release");
+}
+
+static void local_fifo_cases(void)
+{
+    for (unsigned policy=KERNEL_SCHED_FIFO;policy<=KERNEL_SCHED_RR;policy++) {
+        reset_two_queues();active=&cpus[0];
+        { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+          setup_task(0,1,40);setup_task(1,1,40);
+          assert(scheduler_select_next_locked(active,active->current,1)==&tasks[0]);
+          kernel_wait_switch_finish_locked(&idles[0]);active->switch_previous=0; }
+        /* 片尾时另一核完全空闲；旧路径重新放置会把被轮转者移走。 */
+        tasks[0].cpu_mask=3;
+        tasks[0].scheduling.policy=policy;
+        if (policy==KERNEL_SCHED_RR) tasks[0].scheduling.rr_remaining_ns=0;
+        local_rotation_active=1;
+        assert(!scheduler_reschedule(0,policy==KERNEL_SCHED_FIFO,0));
+        local_rotation_active=0;
+        assert(active==&cpus[0] && active->current==&tasks[1] && !cpus[1].runqueue.count);
+        { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+          assert_ready_owner(&tasks[0],&cpus[0]);
+          assert(ready_best_locked()==&tasks[0]); }
+        if (policy==KERNEL_SCHED_RR)
+            assert(tasks[0].scheduling.rr_remaining_ns==KERNEL_SCHED_RR_NS);
+    }
+    puts("PASS FIFO yield and RR expiration: real decision/finish retain local FIFO despite an idle peer");
+}
+
 int main(void)
 {
     assert(!controlled_smp_main());
+    local_fifo_cases();
+    reservation_placement_cases();
     scheduler = (struct kernel_scheduler){0};
     scheduler.rt_configuration.period_ns = 1000000000;
     scheduler.rt_configuration.runtime_ns = 950000000;
@@ -291,7 +369,7 @@ int main(void)
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         assert(ready_best_locked() == &tasks[0]);
-        assert(!tasks[0].eligible_nodes[1].queued && tasks[0].cpu_mask == 2);
+        assert(tasks[0].ready_cpu==&cpus[0] && tasks[0].cpu_mask == 2);
     }
     /* 通知在CPU0消费旧位之后到达；恢复资格不能清掉这个新发布。 */
     { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain); scheduler_user_service_set_locked(&tasks[0],0); }
@@ -360,7 +438,7 @@ int main(void)
       assert(ready_best_locked()==&tasks[1]);
       ready_remove_locked(&tasks[1]); ready_remove_locked(&tasks[3]);
       assert(!cpus[0].user_reservations.first && !cpus[1].user_reservations.first &&
-             !scheduler.rt_services.first && !scheduler.runqueue.first); }
+             !scheduler.rt_services.first && !cpus[0].runqueue.first && !cpus[1].runqueue.first); }
     active=&cpus[0];
     scheduler.initialized=KERNEL_SCHEDULER_INITIALIZED;
     struct kernel_wait_token borrowed_token;

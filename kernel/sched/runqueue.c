@@ -28,12 +28,15 @@ void kernel_sched_enqueue(struct kernel_sched_runqueue *queue,
     if (next) next->previous = node; else queue->last = node;
     if (!queue->heads[priority] || at_head) queue->heads[priority] = node;
     if (!queue->tails[priority] || !at_head) queue->tails[priority] = node;
+    queue->count++;
 }
 
 void kernel_sched_dequeue(struct kernel_sched_runqueue *queue,
                            struct kernel_sched_node *node)
 {
     if (!queue || !node || !node->queued) __builtin_trap();
+    if (!queue->count) __builtin_trap();
+    queue->count--;
     unsigned p = node->priority;
     if (queue->heads[p] == node)
         queue->heads[p] = node->next && node->next->priority == p ? node->next : 0;

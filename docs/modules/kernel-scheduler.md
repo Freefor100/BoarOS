@@ -1,6 +1,6 @@
 # 内核调度、线程组与生命周期
 
-本文记录RV/LA默认单CPU的OTHER/FIFO/RR调度、线程组资源、clone/exec/wait和回收契约；独立RV用户1～4核配置见[执行与服务边界](riscv-smp.md#真实用户态与cpu0业务交接)。背景见[线程组与 futex](../learning/threads-and-futex.md)，信号、文件资源、MM的稳定边界分别见对应模块文档。
+本文记录RV/LA默认单CPU的OTHER/FIFO/RR调度、线程组资源、clone/exec/wait和回收契约；独立RV用户1～8核及LA用户1～4核配置见[执行与服务边界](riscv-smp.md#真实用户态与cpu0业务交接)。背景见[线程组与 futex](../learning/threads-and-futex.md)，信号、文件资源、MM的稳定边界分别见对应模块文档。
 
 ## 实现入口
 
@@ -24,7 +24,7 @@
 | `include/kernel/task_state.h` | 任务存储的共同内部布局 |
 | `kernel/sched/private.h` | 调度器状态、组与队列成员关系 |
 
-USER_SMP保留来源CPU的实时用户资格，并单独索引CPU0实时服务；普通服务与已有worker按OTHER队列轮转，迁移排到目标核队尾。用户`sched_yield`在发起CPU调用共同的`kernel_scheduler_yield_current()`，等待游标和回调借用归还也使用真实内核调度。组停止的最终调度锁段重查执行owner：已被远核接纳的成员取得持久停止通知，尚未执行的成员才可摘队并停车。具体边界及尺寸见[用户两核](riscv-smp.md#真实用户态与cpu0业务交接)。
+USER_SMP保留来源CPU的实时用户资格，并单独索引CPU0实时服务；普通服务与已有worker按OTHER队列轮转，迁移排到目标核队尾。用户`sched_yield`在发起CPU调用共同的`kernel_scheduler_yield_current()`，等待游标和回调借用归还也使用真实内核调度。组停止的最终调度锁段重查执行owner：已被远核接纳的成员取得持久停止通知，尚未执行的成员才可摘队并停车。具体边界及尺寸见[多核用户执行](riscv-smp.md#真实用户态与cpu0业务交接)。
 
 公共 scheduler 头不暴露 Trap Frame；架构 clone 入口由 `include/arch/task.h` 选择，旧 RV 入口保留包装。syscall 通过不透明 task 接口取得 TID/TGID/PPID 和资源，不直接修改调度私有字段。
 
@@ -43,7 +43,7 @@ SMP、锁调试或成本诊断构建直接使用完整 raw 实现，保留持有
 持有链；`test-lwext4-exclusion-host` 检查四种 UP/SMP、debug 组合及真实共享更新。
 
 任务表、身份角色、父子/组成员关系、join及退出队列也使用该调度域；私有准备和资源清理在锁外。
-受控任务可绑定匿名及私有arena tmpfs映射 MM；RV 用户路径中的信号递送、sigreturn 和 ext4 冷读在实际执行 CPU 推进，命名空间修改、日志和挂载管理继续由 CPU0 执行。具体交接见[用户两核](riscv-smp.md#真实用户态与cpu0业务交接)。
+受控任务可绑定匿名及私有arena tmpfs映射 MM；RV 用户路径中的信号递送、sigreturn 和 ext4 冷读在实际执行 CPU 推进，命名空间修改、日志和挂载管理继续由 CPU0 执行。具体交接见[多核用户执行](riscv-smp.md#真实用户态与cpu0业务交接)。
 
 `kernel_wait_prepare`为当前任务建立不回退的全局代次token，登记后复查条件，释放对象保护再调用
 `kernel_wait_park`；`kernel_wait_finish`同步撤销绑定节点。wake/期限/signal第一个完成者决定
@@ -51,7 +51,9 @@ SMP、锁调试或成本诊断构建直接使用完整 raw 实现，保留持有
 代次耗尽返回INVALID_STATE且不发布新登记，重复等待和错误owner属于fatal。
 SMP 的代次、等待阶段和通知原因合在一个原子状态中。对尚未提交阻塞的 token，定向通知可直接完成
 PREPARED 到 NOTIFIED 的转换；park 入口先以原子 load 检查若当前代次已被提前通知（NOTIFIED），直接读取原因返回成功，无需重取全局等待域锁；未被通知时在调度域内竞争提交 COMMITTED，若通知先完成就不切栈。
-已经提交的等待仍在调度域内摘期限、修改任务状态并发布 READY；这样旧栈和运行归属仍由调度器交接。就绪发布维护全掩码 CPU 的 eligible 队列，并定向通知一个目标：优先尚未收到调度请求的空闲核，在请求状态相同时优先任务上一运行核。这样多个任务陆续就绪时可以唤醒多个空闲核，又无需对每个任务广播 IPI。
+已经提交的等待仍在调度域内摘期限、修改任务状态并发布 READY；这样旧栈和运行归属仍由调度器交接。SMP 的每个就绪任务只有一个执行队列 owner 和一个内嵌 `ready_node`，`ready_cpu` 指向实际队列所属 CPU，未入队时为空；`cpu` 保留最后执行者。普通任务进入各 CPU 的分级 FIFO，CPU0 实时服务以同一个节点进入独立服务队列，实时来源保留队列只记录用户运行资格。新任务和 wake 先遵守 affinity、CPU0 服务和实时来源保留，再选空闲执行者或能够抢占的较低优先级执行者，并按实际就绪数与运行者数选择较轻的 CPU；同负载依次优先最后执行 CPU、调用 CPU、较小逻辑 ID。若全部允许的执行者都被其他实时来源资格阻挡，任务仍保留一个实际队列 owner；保留资格释放后的调度请求使它继续前进。只通知实际 owner，已有事件位继续合并 IPI。
+
+正常 yield 与时间片结束留在本核同级 FIFO；抢占保留同级队首，优先级更新只摘除和重排实际 owner 的节点。执行者真正空闲或阻塞时，可从其他 CPU 的队列取得最高优先级且满足本核资格的 off-CPU 任务，同优先级保留本核 FIFO。挑选借用候选，最终 claim 在同一调度域内摘除原队列节点并发布唯一执行 owner；不建立全局重复就绪索引。
 事件队列只由实际等待节点保存，期限、原因和可中断性只由wait record保存。通知先按原期限
 摘除AVL，再发布完成原因；finish收完节点及借用后才清空record，futex requeue直接迁移节点。
 
@@ -136,7 +138,7 @@ IRQ关闭的短入口复用同一次CPU/current定位，借用在切换或可睡
 
 任务的`scheduling.priority`保存实际运行优先级，既有就绪/每核资格/CPU0服务与来源保留队列按这个值排序。继承期间才在任务尾部保存基础优先级；sched查询、RTPRIO授权和fork使用基础值，proc的priority展示实际值、rt_priority展示基础值。优先级变更在调度保护内重新发布相关队列并请求目标CPU调度；实际优先级未变时保留FIFO位置。每核就绪与保留队列记录被提升的成员，存在此类持锁者时解除该核RT带宽节流，使其能释放锁。
 
-sched_setparam/setscheduler/getparam/getscheduler、priority_min/max、rr_get_interval 和 CPU0 affinity 使用真实任务状态；未发布 child 不可被按 TID 查询。BATCH/IDLE/DEADLINE/EXT 的 min/max 查询按固定 Linux 返回 0，设置这些策略仍显式拒绝。RESET_ON_FORK 在子任务清除并将继承的 RT 变为 OTHER；exec 保留执行线程的策略。RV 用户执行支持真实1～4核，亲和性与执行资格见 [RV SMP](riscv-smp.md)；nice 调度、cgroup 配额和 deadline scheduler另行实现。
+sched_setparam/setscheduler/getparam/getscheduler、priority_min/max、rr_get_interval 和 CPU0 affinity 使用真实任务状态；未发布 child 不可被按 TID 查询。BATCH/IDLE/DEADLINE/EXT 的 min/max 查询按固定 Linux 返回 0，设置这些策略仍显式拒绝。RESET_ON_FORK 在子任务清除并将继承的 RT 变为 OTHER；exec 保留执行线程的策略。RV 用户执行支持真实1～8核，亲和性与执行资格见 [RV SMP](riscv-smp.md)；nice 调度、cgroup 配额和 deadline scheduler另行实现。
 
 
 RTPRIO、RTTIME限额属于线程组共享的资源记录，普通fork复制、线程clone共享，exec保留。没有CAP_SYS_NICE时，调度修改先满足同属主规则；进入或切换RT策略要求目标组的RTPRIO软值非零，提升优先级可使用目标软值或保留已经取得的更高RT优先级。降低优先级和退出RT沿Linux规则处理；清除RESET_ON_FORK仍需CAP_SYS_NICE。资源数值不裁成99，实际FIFO/RR优先级范围仍为1～99。
@@ -375,7 +377,7 @@ futex 的直接宿主入口 `make test-futex-host` 运行真实 MM、park、桶�
 
 聚焦入口为 `make test-stack-usage`、`make test-scheduler-cases-riscv`、`make test-scheduler-riscv`、`make test-files-riscv` 和 `make test-signal-riscv`；`make test-userland-riscv` 验证真实 pthread、共享匿名 futex、bitset 绝对 realtime 等待在 stop/continue 后保留掩码和截止时刻。`make test-diff-abi-riscv` 用同一 ELF 对照固定 Linux 的零掩码、超时、错误、按掩码唤醒和 requeue，以及共享文件别名、独立打开、硬链接、偏移隔离、SysV 和共享 robust 退出；`make test-glibc-riscv` 验证 glibc 2.44 的 `pthread_join` 消费路径。阶段收口使用 `make test-riscv`。各次实际通过范围以 README 和提交验证说明为准，不把实现路径存在等同于全部线程负载已验证。
 
-RV普通用户任务、共享匿名/文件MM及ext4文件操作支持真实1～4核，执行位置和后端并发范围见[多核模块](riscv-smp.md)。实时信号队列和sigaltstack已提供；PI条件重排与futex_waitv已接入；NUMA/MPOL等futex2扩展继续后续安排。LoongArch默认单核，`LA_SMP=1`支持QEMU virt上的真实1/2核执行，启动/IPI/TLB与停止规则见[LA模块](loongarch-boot.md#双核执行)；已覆盖整数context、timer抢占、信号、musl TLS/pthread、动态musl/DSO TLS、标量FPU与LSX/LASX。固定语义依据见学习总结的Linux commit与musl归档。
+RV普通用户任务、共享匿名/文件MM及ext4文件操作支持真实1～8核，执行位置和后端并发范围见[多核模块](riscv-smp.md)。实时信号队列和sigaltstack已提供；PI条件重排与futex_waitv已接入；NUMA/MPOL等futex2扩展继续后续安排。LoongArch默认单核，`LA_SMP=1`支持QEMU virt上的真实1～4核执行，启动/IPI/TLB与停止规则见[LA模块](loongarch-boot.md#多核执行)；已覆盖整数context、timer抢占、信号、musl TLS/pthread、动态musl/DSO TLS、标量FPU与LSX/LASX。固定语义依据见学习总结的Linux commit与musl归档。
 
 活动普通文件/TCP I/O 的单页暂存由任务持有并跨调用复用：首次使用时分配，调用期间登记在任务的 `io_buffer`，正常调用完成只解除登记。正常回收与构造失败共用栈上请求清理：先结束 epoll、socket read/write reservation 和 TTY 请求，再解除暂存登记，随后才释放 MM/文件表和任务栈；常驻页在任务最终存储释放时归还。页释放错误遵循物理分配器 fatal 不变量，不进入历史 cleanup 重试链。
 

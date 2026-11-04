@@ -20,6 +20,7 @@
 #include <string.h>
 #include <time.h>
 #define CHECK(x) do {if(!(x)){printf("LA-SMP FAIL line=%d errno=%d\n",__LINE__,errno);fflush(NULL);exit(1);}}while(0)
+#define MAX_CPUS 4
 static unsigned cpus,cases;static size_t page;
 static _Thread_local unsigned tls,handled,expected_fault;
 static _Thread_local sigjmp_buf fault_return;
@@ -61,13 +62,14 @@ static void *execution(void *opaque)
 static void executors(void)
 {
     pthread_barrier_t gate;CHECK(!pthread_barrier_init(&gate,NULL,cpus));atomic_uint entered=0;
-    pthread_t threads[2];struct actor actors[2];
+    pthread_t threads[MAX_CPUS];struct actor actors[MAX_CPUS];
     for(unsigned i=0;i<cpus;i++){actors[i]=(struct actor){i,&gate,&entered,0};CHECK(!pthread_create(&threads[i],NULL,execution,&actors[i]));}
     for(unsigned i=0;i<cpus;i++){CHECK(!pthread_join(threads[i],NULL));}
     CHECK(!pthread_barrier_destroy(&gate));
     record("executors-tls-fpu-simd-signals-accounting");
 }
-struct remote {unsigned char *address;atomic_uint stage;};
+struct remote {unsigned char *address;atomic_uint stage,observed[3];};
+struct mapping_actor {unsigned cpu;struct remote *mapping;};
 static void fault_read(unsigned char *p,unsigned sig)
 {
     expected_fault=sig;
@@ -76,19 +78,23 @@ static void fault_read(unsigned char *p,unsigned sig)
 }
 static void *remote_reader(void *opaque)
 {
-    struct remote *r=opaque;pin(cpus-1);CHECK(r->address[0]==17);atomic_store(&r->stage,1);
-    wait_for(&r->stage,2);fault_read(r->address,SIGSEGV);atomic_store(&r->stage,3);
-    wait_for(&r->stage,4);CHECK(r->address[0]==83);atomic_store(&r->stage,5);
-    wait_for(&r->stage,6);fault_read(r->address,SIGSEGV);atomic_store(&r->stage,7);return NULL;
+    struct mapping_actor *a=opaque;struct remote *r=a->mapping;pin(a->cpu);
+    CHECK(r->address[0]==17);atomic_fetch_or(&r->observed[0],1U<<a->cpu);
+    wait_for(&r->stage,2);fault_read(r->address,SIGSEGV);atomic_fetch_or(&r->observed[1],1U<<a->cpu);
+    wait_for(&r->stage,4);CHECK(r->address[0]==83);atomic_fetch_or(&r->observed[2],1U<<a->cpu);
+    wait_for(&r->stage,6);fault_read(r->address,SIGSEGV);return NULL;
 }
 static void mappings(void)
 {
     struct remote r={.address=mmap(NULL,page,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0)};
-    CHECK(r.address!=MAP_FAILED);r.address[0]=17;pthread_t thread;CHECK(!pthread_create(&thread,NULL,remote_reader,&r));
-    wait_for(&r.stage,1);CHECK(!mprotect(r.address,page,PROT_NONE));atomic_store(&r.stage,2);
-    wait_for(&r.stage,3);CHECK(mmap(r.address,page,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0)==r.address);r.address[0]=83;atomic_store(&r.stage,4);
-    wait_for(&r.stage,5);CHECK(!munmap(r.address,page));atomic_store(&r.stage,6);
-    CHECK(!pthread_join(thread,NULL) && atomic_load(&r.stage)==7);record("shared-mm-protect-replace-unmap");
+    CHECK(r.address!=MAP_FAILED);r.address[0]=17;pthread_t threads[MAX_CPUS];struct mapping_actor actors[MAX_CPUS];
+    for(unsigned i=0;i<cpus;i++){actors[i]=(struct mapping_actor){i,&r};CHECK(!pthread_create(&threads[i],NULL,remote_reader,&actors[i]));}
+    unsigned all=(1U<<cpus)-1;
+    wait_for(&r.observed[0],all);CHECK(!mprotect(r.address,page,PROT_NONE));atomic_store(&r.stage,2);
+    wait_for(&r.observed[1],all);CHECK(mmap(r.address,page,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0)==r.address);r.address[0]=83;atomic_store(&r.stage,4);
+    wait_for(&r.observed[2],all);CHECK(!munmap(r.address,page));atomic_store(&r.stage,6);
+    for(unsigned i=0;i<cpus;i++)CHECK(!pthread_join(threads[i],NULL));
+    record("shared-mm-protect-replace-unmap");
 }
 struct file_actor {unsigned cpu;pthread_barrier_t *gate;};
 static void *files(void *opaque)
@@ -107,16 +113,16 @@ static void *files(void *opaque)
 }
 static void filesystem(void)
 {
-    pthread_barrier_t gate;CHECK(!pthread_barrier_init(&gate,NULL,cpus));pthread_t threads[2];struct file_actor actors[2];
+    pthread_barrier_t gate;CHECK(!pthread_barrier_init(&gate,NULL,cpus));pthread_t threads[MAX_CPUS];struct file_actor actors[MAX_CPUS];
     for(unsigned i=0;i<cpus;i++){actors[i]=(struct file_actor){i,&gate};CHECK(!pthread_create(&threads[i],NULL,files,&actors[i]));}
     for(unsigned i=0;i<cpus;i++){CHECK(!pthread_join(threads[i],NULL));}
     CHECK(!pthread_barrier_destroy(&gate));
     record("ext4-parallel-files-mmap-orphans");
 }
 static atomic_uint turn;
-static void *futex_peer(void *unused)
+static void *futex_peer(void *opaque)
 {
-    (void)unused;pin(cpus-1);
+    pin((unsigned)(uintptr_t)opaque);
     for(unsigned i=0;i<256;i++) {
         for(;;){unsigned value=atomic_load(&turn);if(value==1)break;long r=syscall(SYS_futex,&turn,128,0,NULL,NULL,0);CHECK(!r || errno==EAGAIN || errno==EINTR);}
         atomic_store(&turn,0);CHECK(syscall(SYS_futex,&turn,129,1,NULL,NULL,0)>=0);
@@ -124,17 +130,21 @@ static void *futex_peer(void *unused)
 }
 static void synchronization(void)
 {
-    atomic_store(&turn,0);pthread_t thread;CHECK(!pthread_create(&thread,NULL,futex_peer,NULL));
-    for(unsigned i=0;i<256;i++) {
-        atomic_store(&turn,1);CHECK(syscall(SYS_futex,&turn,129,1,NULL,NULL,0)>=0);
-        for(;;){unsigned value=atomic_load(&turn);if(value==0)break;long r=syscall(SYS_futex,&turn,128,1,NULL,NULL,0);CHECK(!r || errno==EAGAIN || errno==EINTR);}
-    }CHECK(!pthread_join(thread,NULL));record("remote-futex-wait-wake");
+    for(unsigned cpu=0;cpu<cpus;cpu++) {
+        atomic_store(&turn,0);pthread_t thread;CHECK(!pthread_create(&thread,NULL,futex_peer,(void *)(uintptr_t)cpu));
+        for(unsigned i=0;i<256;i++) {
+            atomic_store(&turn,1);CHECK(syscall(SYS_futex,&turn,129,1,NULL,NULL,0)>=0);
+            for(;;){unsigned value=atomic_load(&turn);if(value==0)break;long r=syscall(SYS_futex,&turn,128,1,NULL,NULL,0);CHECK(!r || errno==EAGAIN || errno==EINTR);}
+        }
+        CHECK(!pthread_join(thread,NULL));
+    }
+    record("remote-futex-wait-wake");
 }
-static volatile sig_atomic_t virtual_signals,prof_signals;
-static void timer_signal(int sig){if(sig==SIGVTALRM)virtual_signals++;else {CHECK(sig==SIGPROF);prof_signals++;}}
-static void *timer_worker(void *unused)
+static atomic_uint virtual_signals,prof_signals;
+static void timer_signal(int sig){if(sig==SIGVTALRM)atomic_fetch_add(&virtual_signals,1);else {CHECK(sig==SIGPROF);atomic_fetch_add(&prof_signals,1);}}
+static void *timer_worker(void *opaque)
 {
-    (void)unused;pin(cpus-1);struct rusage use;uint64_t value=1,end=now()+5000000000U;
+    pin((unsigned)(uintptr_t)opaque);struct rusage use;uint64_t value=1,end=now()+5000000000U;
     for(;;){for(unsigned i=0;i<100000;i++){value=(value<<3)^(value>>7)^17;__asm__ volatile("":"+r"(value));}CHECK(!getrusage(RUSAGE_THREAD,&use));if(use.ru_utime.tv_sec*1000000+use.ru_utime.tv_usec>60000)break;CHECK(now()<end);}
     return NULL;
 }
@@ -142,8 +152,10 @@ static void timers(void)
 {
     struct sigaction a={.sa_handler=timer_signal};sigemptyset(&a.sa_mask);CHECK(!sigaction(SIGVTALRM,&a,NULL)&&!sigaction(SIGPROF,&a,NULL));
     struct itimerval tick={.it_value={0,10000},.it_interval={0,10000}},zero={0};
-    CHECK(!setitimer(ITIMER_VIRTUAL,&tick,NULL)&&!setitimer(ITIMER_PROF,&tick,NULL));pthread_t t;CHECK(!pthread_create(&t,NULL,timer_worker,NULL)&&!pthread_join(t,NULL));
-    CHECK(virtual_signals && prof_signals && !setitimer(ITIMER_VIRTUAL,&zero,NULL)&&!setitimer(ITIMER_PROF,&zero,NULL));record("group-virtual-prof-timers");
+    CHECK(!setitimer(ITIMER_VIRTUAL,&tick,NULL)&&!setitimer(ITIMER_PROF,&tick,NULL));pthread_t threads[MAX_CPUS];
+    for(unsigned i=0;i<cpus;i++)CHECK(!pthread_create(&threads[i],NULL,timer_worker,(void *)(uintptr_t)i));
+    for(unsigned i=0;i<cpus;i++)CHECK(!pthread_join(threads[i],NULL));
+    CHECK(atomic_load(&virtual_signals) && atomic_load(&prof_signals) && !setitimer(ITIMER_VIRTUAL,&zero,NULL)&&!setitimer(ITIMER_PROF,&zero,NULL));record("group-virtual-prof-timers");
 }
 int main(int argc,char **argv)
 {
@@ -153,7 +165,7 @@ int main(int argc,char **argv)
         CHECK(!syscall(SYS_getcpu,&actual,NULL,NULL) && actual==expected);return 0;
     }
     page=(size_t)sysconf(_SC_PAGESIZE);CHECK(page==16384);cpu_set_t mask;
-    for(unsigned i=0;i<2;i++){CPU_ZERO(&mask);CPU_SET(i,&mask);if(sched_setaffinity(0,sizeof(mask),&mask)){CHECK(errno==EINVAL);break;}cpus++;}
+    for(unsigned i=0;i<MAX_CPUS;i++){CPU_ZERO(&mask);CPU_SET(i,&mask);if(sched_setaffinity(0,sizeof(mask),&mask)){CHECK(errno==EINVAL);break;}cpus++;}
     CHECK(cpus);pin(0);printf("LA-SMP BEGIN cpus=%u\n",cpus);
     for(unsigned i=0;i<cpus;i++){pin(i);}
     pin(0);record("remote-affinity");

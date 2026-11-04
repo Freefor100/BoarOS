@@ -128,7 +128,6 @@ struct kernel_task {
     struct kernel_sched_policy scheduling;
     struct kernel_sched_node ready_node;
 #if BOAROS_MAX_CPUS > 1
-    struct kernel_sched_node eligible_nodes[BOAROS_MAX_CPUS];
     /* controlled=1为私有准备，2持已发布存储owner，直到最终页归还。 */
     uint32_t cpu_mask, controlled;
     uint64_t bound_mm_context;
@@ -136,7 +135,7 @@ struct kernel_task {
 #if BOAROS_USER_SMP
     /* 调度域保护phase；返回通知区分CPU0业务和执行者本地信号，不复制业务载荷。 */
     uint32_t user_service, user_return_pending;
-    struct kernel_sched_node service_node, reservation_node;
+    struct kernel_sched_node reservation_node;
     struct kernel_cpu *reservation_cpu;
     uint32_t user_slice_expired;
 #if BOAROS_COST_DIAGNOSTICS
@@ -268,6 +267,10 @@ struct kernel_task {
     struct kernel_io_priority_context *io_priority;
     struct kernel_files_change *files_change;
     struct kernel_open_file_description *flock_file;
+#if BOAROS_MAX_CPUS > 1
+    /* 调度域内的唯一执行队列owner；未入队时为空，cpu保留最后执行者。 */
+    struct kernel_cpu *ready_cpu;
+#endif
 } __attribute__((aligned(16)));
 
 #endif

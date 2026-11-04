@@ -185,7 +185,7 @@ def validate_mm_failure(text, profile, contract="mm"):
 
 def main():
     parser = argparse.ArgumentParser(__doc__)
-    parser.add_argument('--cpus',type=int,choices=(1,2,3,4),action='append')
+    parser.add_argument('--cpus',type=int,choices=range(1,9),action='append')
     parser.add_argument('--memory',choices=('512M','1G'),action='append')
     parser.add_argument("--qemu", required=True)
     parser.add_argument("--firmware", default="default")

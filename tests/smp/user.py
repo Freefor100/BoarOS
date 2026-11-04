@@ -90,19 +90,23 @@ def main():
     parser.add_argument('--qemu',default='qemu-system-riscv64')
     parser.add_argument('--firmware',default='default')
     parser.add_argument('--memory',action='append',choices=('512M','1G'))
-    parser.add_argument('--cpus',action='append',type=int,choices=(1,2,3,4))
+    parser.add_argument('--cpus',action='append',type=int,choices=range(1,9))
+    parser.add_argument('--smoke',action='store_true',help='only per-CPU native register/TLS execution')
+    parser.add_argument('--only',choices=('linux','boaros'))
     parser.add_argument('--output',type=Path,help='new or empty explicit run directory')
     args=parser.parse_args()
     if bool(args.loader)!=bool(args.library) or (args.loader and args.manifest):
         parser.error('native dynamic profile requires both loader and library, without ABI manifest')
-    linux,linux_identity=harness.linux_build(Path(__file__).with_name('linux-user.config'))
-    actual_config=linux.parents[3]/'.config'
-    if 'CONFIG_SMP=y' not in actual_config.read_text() or 'CONFIG_NR_CPUS=4' not in actual_config.read_text():
-        raise RuntimeError('reference requires real four-CPU capacity')
+    linux,linux_identity=None,None
+    if args.only!='boaros':
+        linux,linux_identity=harness.linux_build(Path(__file__).with_name('linux-user.config'))
+        actual_config=linux.parents[3]/'.config'
+        if 'CONFIG_SMP=y' not in actual_config.read_text() or 'CONFIG_NR_CPUS=8' not in actual_config.read_text():
+            raise RuntimeError('reference requires real eight-CPU capacity')
     output=create_run_directory(args.output,ROOT/'build/riscv-user-smp'/('abi' if args.manifest else 'runs'))
     # 冻结双方使用的同一个ELF及核；每次启动拥有独立盘，原fixture只作输入。
     snapshots={}
-    for name,path in (('linux',linux),('boaros',args.kernel),('program',args.program)):
+    for name,path in ([('linux',linux)] if linux else [])+[('boaros',args.kernel),('program',args.program)]:
         snapshots[name]=output/name
         shutil.copyfile(path,snapshots[name])
     if args.loader:
@@ -119,6 +123,10 @@ def main():
             for cpus in args.cpus or (2,1):
                 folder=output/f'{memory}-{cpus}cpu';folder.mkdir(exist_ok=True)
                 fixture=harness.fixture(folder,snapshots['program'])
+                if args.smoke:
+                    flag=folder/'smoke';flag.write_text('per-CPU execution\n')
+                    batch=folder/'smoke.debugfs';batch.write_text(f'write "{flag.resolve()}" /smp-smoke\n')
+                    harness.run_logged(['debugfs','-w','-f',str(batch),str(fixture)],folder/'smoke-install.log')
                 if args.loader:
                     commands=['mkdir /lib']
                     for name,destination in (('loader','/lib/ld-musl-riscv64.so.1'),('library','/lib/libboaros-tls.so')):
@@ -128,10 +136,16 @@ def main():
                     harness.run_logged(['debugfs','-w','-f',str(batch),str(fixture)],folder/'dynamic-install.log')
                 reference=None
                 for target in ('linux','boaros'):
+                    if args.only and target!=args.only:continue
                     disk=folder/f'{target}.img';shutil.copyfile(fixture,disk)
                     text,run,logfile=boot_user(args.qemu,args.firmware,snapshots[target],disk,memory,cpus,folder,target=='linux')
                     report['runs'].append(dict(target=target,memory=memory,cpus=cpus,**run))
-                    if expected is None:rows=validate(text,cpus,target=='boaros',dynamic=bool(args.loader))
+                    if args.smoke:
+                        marker=f'USER-SMP SMOKE cpus={cpus} PASS'
+                        if text.replace('\r','').splitlines().count(marker)!=1:raise RuntimeError('incomplete per-CPU smoke')
+                        validate_execution(text,cpus,target=='boaros')
+                        rows=[marker]
+                    elif expected is None:rows=validate(text,cpus,target=='boaros',dynamic=bool(args.loader))
                     else:
                         rows=harness.normalize(text,expected)
                         validate_execution(text,cpus,target=='boaros',require_parallel=args.require_parallel)
@@ -142,9 +156,10 @@ def main():
                             [line+'\n' if not line.endswith('\n') else line for line in rows])
                         (folder/'results.diff').write_text(delta)
                         raise RuntimeError(f'same ELF observation mismatch; {folder}/results.diff')
-                    if target=='boaros':
-                        subprocess.run(['e2fsck','-fn',str(disk)],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,check=True)
+                    harness.run_logged(['e2fsck','-fn',str(disk)],folder/f'{target}-fsck.log')
+                    disk.unlink()
                     print(f'user SMP {target} RAM={memory} cpus={cpus}: native cases/exit validated',flush=True)
+                fixture.unlink()
         report['status']='passed'
     except Exception as error:
         report.update(status='failed',error=str(error));raise

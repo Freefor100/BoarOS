@@ -19,7 +19,7 @@ from reference import archive
 
 SOURCES={'init':'resource/api8.c','fd_events':'resource/fd_events.c',
          'flock':'locks/flock.c','mmsg':'network/mmsg.c','copy_range':'io/copy_range.c',
-         'icache':'resource/icache.c'}
+         'icache':'resource/icache.c','sched_query':'resource/sched_query.c'}
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -85,7 +85,7 @@ def accepted(raw,arch,cpus,target):
     ends=[line for line in raw.replace('\r','').splitlines() if line.startswith('API8 END ')]
     expected=[f'API8 END /{name} status=0' for name in programs]
     markers=['FD-EVENTS PASS','FLOCK-PASS','COPY_RANGE PASS',
-             f'API8 PASS programs={len(programs)}']
+             'SCHED-QUERY END cases=7',f'API8 PASS programs={len(programs)}']
     if arch=='riscv':markers+=[f'ICACHE PASS cpus={cpus}']
     lines=raw.replace('\r','').splitlines()
     success=(f'Linux {"RV" if arch=="riscv" else "LA"} root application passed' in raw
@@ -99,7 +99,7 @@ def main():
     parser.add_argument('--libc',choices=('musl','glibc'),default='musl')
     parser.add_argument('--dynamic',action='store_true')
     parser.add_argument('--kernel',type=Path)
-    parser.add_argument('--cpus',type=int,choices=(1,2,4),default=1)
+    parser.add_argument('--cpus',type=int,choices=range(1,9),default=1)
     parser.add_argument('--memory',default='512M')
     parser.add_argument('--vfat',action='store_true',help='also check copy_file_range on a BoarOS VFAT disk')
     parser.add_argument('--only',choices=('linux','boaros'))

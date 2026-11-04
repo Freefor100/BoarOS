@@ -144,7 +144,7 @@ void scheduler_task_unlink_locked(struct kernel_task *task)
     if (scheduler.retired_pending == UINT64_MAX) __builtin_trap();
     scheduler.retired_pending++;
 #if BOAROS_USER_SMP
-    if (task->reservation_cpu || task->reservation_node.queued || task->service_node.queued)
+    if (task->reservation_cpu || task->reservation_node.queued || task->ready_node.queued)
         __builtin_trap();
 #endif
     task->retirement = 1;

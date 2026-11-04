@@ -21,7 +21,7 @@ struct kernel_wait_record {
 #else
     uint32_t interruptible;
 #endif
-    uint32_t on_cpu, ready_pending, ready_head, borrows;
+    uint32_t on_cpu, ready_pending, ready_flags, borrows;
 };
 #if BOAROS_MAX_CPUS > 1
 #define KERNEL_WAIT_GENERATION_MAX (UINT64_MAX >> 4)
