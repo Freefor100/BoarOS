@@ -19,7 +19,8 @@ static struct kernel_resource_limits limits;
 static struct kernel_credentials credentials;
 static struct kernel_exec_security *security=(void *)(uintptr_t)0x1234;
 static unsigned allocations,service_entries,task_borrows,credential_refs,security_refs;
-static unsigned cleanup_failures,ofd_releases;
+static unsigned service_depth;
+static unsigned cleanup_failures,ofd_releases,fail_allocation;
 static int deny_access,close_source,revoke_after_pin,detach_after_lookup;
 static pthread_mutex_t gate=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t changed=PTHREAD_COND_INITIALIZER;
@@ -36,8 +37,9 @@ void kernel_assert_can_block(void){assert(!cpu.raw_locks && !cpu.preempt_depth);
 void kernel_preempt_disable(void){assert(!cpu.raw_locks);cpu.preempt_depth++;}
 void kernel_preempt_enable(void){assert(!cpu.raw_locks && cpu.preempt_depth);cpu.preempt_depth--;}
 void kernel_service_scope_begin(struct kernel_service_scope *s)
-{ assert(!s->entered);s->entered=1;service_entries++; }
-void kernel_service_scope_end(struct kernel_service_scope *s){s->entered=0;}
+{ assert(!s->entered);s->entered=1;service_entries++;service_depth++; }
+void kernel_service_scope_end(struct kernel_service_scope *s){if(s->entered){assert(service_depth);service_depth--;}s->entered=0;}
+void kernel_assert_service_context(void){assert(service_depth);}
 void scheduler_task_get_locked(struct kernel_task *task)
 {
     assert(task==&subject && cpu.raw_locks);task_borrows++;
@@ -61,7 +63,7 @@ int kernel_credentials_may_access_locked(const struct kernel_task *from,const st
 void kernel_rwlock_init(struct kernel_rwlock *lock,uint32_t rank,uintptr_t key)
 {*lock=(struct kernel_rwlock){.rank=rank,.key=key};}
 enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t count,size_t size,void **out)
-{assert(h==&heap && !cpu.raw_locks);*out=calloc(count,size);assert(*out);__atomic_fetch_add(&allocations,1,__ATOMIC_RELAXED);return KERNEL_HEAP_STATUS_OK;}
+{assert(h==&heap && !cpu.raw_locks);if(fail_allocation && !--fail_allocation)return KERNEL_HEAP_STATUS_EMPTY;*out=calloc(count,size);assert(*out);__atomic_fetch_add(&allocations,1,__ATOMIC_RELAXED);return KERNEL_HEAP_STATUS_OK;}
 void kernel_heap_release(struct kernel_heap *h,void *p)
 {assert(h==&heap && p && !cpu.raw_locks);assert(__atomic_fetch_sub(&allocations,1,__ATOMIC_RELAXED));free(p);}
 enum kernel_open_file_status kernel_open_file_acquire(struct kernel_open_file_description *file)
@@ -178,6 +180,66 @@ static void exit_case(void)
     assert(getfd_result==-KERNEL_ESRCH && !subject.files.record && !task_borrows && !security_refs);
     pin_wait=0;
 }
+static void unshare_case(void)
+{
+    struct kernel_open_file_description *source=subject.files.record->slots[7].description;
+    assert(!kernel_open_file_acquire(source));
+    assert(!kernel_files_install_shared_acquired_at(&caller.files,1,0,&source) && !source);
+    struct kernel_files peer={0};assert(!kernel_files_acquire(&peer,&caller.files));
+    struct kernel_files_record *original=caller.files.record;
+    struct kernel_open_file_description *file=original->slots[1].description;
+    unsigned baseline=allocations,references=file->references;
+    for(unsigned failure=1;failure<=3;failure++) {
+        fail_allocation=failure;
+        assert(kernel_task_close_range(&caller,1,1,2)==-KERNEL_ENOMEM && !fail_allocation);
+        assert(caller.files.record==original && original->references==2 && !caller.files_change);
+        assert(original->slots[1].description==file && file->references==references && allocations==baseline);
+    }
+    assert(!kernel_task_close_range(&caller,1,1,2|4));
+    assert(caller.files.record!=original && !caller.files_change && original->references==1);
+    assert(caller.files.record->slots[1].description==file && file->references==references+1);
+    assert(caller.files.record->slots[1].flags==KERNEL_FILES_FD_CLOEXEC && !original->slots[1].flags);
+    assert(!kernel_task_close_range(&caller,1,UINT32_MAX,0));
+    assert(caller.files.record->statistics.current_open_fds==1 && original->slots[1].description==file && file->references==references);
+    assert(!kernel_files_release(&caller.files));caller.files=(struct kernel_files){0};
+    assert(!kernel_files_move(&caller.files,&peer) && allocations==baseline);
+}
+static void reserved_cloexec_case(void)
+{
+    struct kernel_files *files=&caller.files;
+    struct kernel_open_file_description *source=subject.files.record->slots[7].description;
+    unsigned baseline_cloexec=files->record->statistics.close_on_exec_fds;
+    uint32_t first,second;int error;
+    assert(!kernel_files_find_free_fd(files,&first,&error) && !error && first==1);
+    assert(!kernel_files_close_range(files,first,first,1,&caller));
+    assert(files->record->statistics.close_on_exec_fds==baseline_cloexec);
+    assert(!kernel_open_file_acquire(source));struct kernel_open_file_description *owner=source;
+    assert(!kernel_files_install_shared_acquired_at(files,first,0,&owner) && !owner);
+    assert(files->record->slots[first].flags==KERNEL_FILES_FD_CLOEXEC);
+    assert(files->record->statistics.current_open_fds==2 && files->record->statistics.close_on_exec_fds==baseline_cloexec+1);
+
+    assert(!kernel_files_find_free_fd(files,&first,&error) && !error && first==2);
+    struct kernel_files_fd_reservation cancelled={files,first};
+    assert(!kernel_files_close_range(files,first,first,1,&caller));
+    assert(files->record->statistics.close_on_exec_fds==baseline_cloexec+1);
+    kernel_files_cancel_reservation(&cancelled);
+    assert(!kernel_files_find_free_fd(files,&first,&error) && !error && first==2);
+    assert(files->record->slots[first].flags==KERNEL_FILES_FD_RESERVED);
+    assert(!kernel_files_find_free_fd(files,&second,&error) && !error && second==3);
+    struct kernel_files_fd_reservation a={files,first},b={files,second};
+    assert(!kernel_files_close_range(files,first,second,1,&caller));
+    assert(!kernel_open_file_acquire(source) && !kernel_open_file_acquire(source));
+    struct kernel_open_file_description *left=source,*right=source;
+    assert(!kernel_files_install_pair_reserved(&a,&b,0,&left,&right));
+    assert(!left && !right && !a.files && !b.files);
+    assert(files->record->slots[first].flags==KERNEL_FILES_FD_CLOEXEC &&
+        files->record->slots[second].flags==KERNEL_FILES_FD_CLOEXEC);
+    assert(files->record->statistics.current_open_fds==4 && files->record->statistics.close_on_exec_fds==baseline_cloexec+3);
+    assert(!kernel_files_close_range(files,1,3,1,&caller));
+    assert(files->record->statistics.close_on_exec_fds==baseline_cloexec+3);
+    assert(!kernel_files_close_range(files,1,3,0,&caller));
+    assert(files->record->statistics.current_open_fds==1 && files->record->statistics.close_on_exec_fds==baseline_cloexec);
+}
 int main(int argc,char **argv)
 {
     assert(argc==2);running=&caller;cpu.current=&caller;cpu.logical_id=1;
@@ -236,6 +298,8 @@ int main(int argc,char **argv)
         assert(!subject.files.record->statistics.current_open_fds);
         assert(!kernel_files_drain_file_cleanup(&caller.files) && !caller.files.record->cleanup_files);
     }else if(!strcmp(argv[1],"exit"))exit_case();
+    else if(!strcmp(argv[1],"reserved-cloexec"))reserved_cloexec_case();
+    else if(!strcmp(argv[1],"close-range-unshare"))unshare_case();
     else assert(!"unknown case");
     if(kernel_files_is_live(&subject.files))assert(!kernel_files_release(&subject.files));
     assert(!kernel_files_release(&caller.files));

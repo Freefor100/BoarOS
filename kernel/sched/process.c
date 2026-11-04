@@ -1925,6 +1925,64 @@ static enum kernel_scheduler_status cleanup_user_mm(struct kernel_task *thread)
                : KERNEL_SCHEDULER_STATUS_INVALID_STATE;
 }
 
+struct kernel_files_change {
+    struct kernel_files candidate, retired;
+    struct kernel_heap *heap;
+};
+
+static enum kernel_files_status finish_files_change(struct kernel_task *task)
+{
+    struct kernel_files_change *change=task->files_change;
+    if (!change) return KERNEL_FILES_STATUS_OK;
+    struct kernel_files *owners[]={&change->candidate,&change->retired};
+    for(unsigned i=0;i<2;i++) {
+        if(owners[i]->state!=KERNEL_FILES_LIVE && owners[i]->state!=KERNEL_FILES_CLEANUP) continue;
+        enum kernel_files_status status=kernel_files_release_for_task(owners[i],task);
+        if(status) return status;
+    }
+    struct kernel_heap *heap=change->heap;
+    task->files_change=0;
+    kernel_heap_release(heap,change);
+    return KERNEL_FILES_STATUS_OK;
+}
+
+int64_t kernel_task_close_range(struct kernel_task *task, uint32_t first,
+    uint32_t last, uint32_t flags)
+{
+    if(first>last || (flags&~6U)) return -KERNEL_EINVAL;
+    struct kernel_files *files;
+    if(kernel_task_files_borrow(task,&files)!=KERNEL_TASK_STATUS_OK) return -KERNEL_EBADF;
+    KERNEL_SERVICE_SCOPE_IF(service, (flags&2U) || task->files_change);
+    if(finish_files_change(task)) return -KERNEL_EIO;
+    if((flags&2U) && kernel_files_is_shared(files)) {
+        struct kernel_files_change *change=0;
+        enum kernel_heap_status allocated=kernel_heap_allocate_zeroed(files->heap,1,sizeof(*change),(void **)&change);
+        if(allocated==KERNEL_HEAP_STATUS_EMPTY) return -KERNEL_ENOMEM;
+        if(allocated) __builtin_trap();
+        change->heap=files->heap;
+        task->files_change=change;
+        enum kernel_files_status status=(flags&4U)
+            ? kernel_files_fork(&change->candidate,files)
+            : kernel_files_fork_except(&change->candidate,files,first,last);
+        if(status) {
+            if(finish_files_change(task)!=KERNEL_FILES_STATUS_OK) return -KERNEL_EIO;
+            return status==KERNEL_FILES_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+        }
+        {
+            KERNEL_RAW_SCOPE(access,&task->files_access);
+            change->retired=task->files;
+            task->files=change->candidate;
+            change->candidate=(struct kernel_files){0};
+        }
+        files=&task->files;
+    }
+    enum kernel_files_status status=kernel_files_close_range(files,first,last,!!(flags&4U),task);
+    if(status) __builtin_trap();
+    /* 失败清理owner保留在任务中，退出沿同一路径重试。 */
+    (void)finish_files_change(task);
+    return 0;
+}
+
 static enum kernel_scheduler_status cleanup_user_task_resources(
     struct kernel_task *thread)
 {
@@ -1934,6 +1992,9 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
     enum kernel_fs_context_status fs_status;
 
     cleanup_task_io_requests(thread);
+    files_status=finish_files_change(thread);
+    if(files_status) return files_status==KERNEL_FILES_STATUS_CLEANUP_REQUIRED
+        ? KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP : KERNEL_SCHEDULER_STATUS_INVALID_STATE;
 
     int vfork_waiter;
     {

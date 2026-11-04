@@ -143,6 +143,16 @@ enum kernel_files_status kernel_files_acquire(
 enum kernel_files_status kernel_files_fork(
     struct kernel_files *destination,
     const struct kernel_files *source);
+enum kernel_files_status kernel_files_fork_except(struct kernel_files *,
+    const struct kernel_files *, uint32_t first, uint32_t last);
+enum kernel_files_status kernel_files_close_range(struct kernel_files *,
+    uint32_t first, uint32_t last, int cloexec, struct kernel_task *closing);
+void kernel_files_abort_flock(struct kernel_task *);
+enum kernel_files_status kernel_files_flock(struct kernel_files *,
+    struct kernel_task *, int64_t fd, unsigned operation, int64_t *linux_result);
+enum kernel_files_status kernel_files_copy_range(struct kernel_files *,
+    struct kernel_mm *, int64_t in_fd, uint64_t user_in, int64_t out_fd,
+    uint64_t user_out, uint64_t count, uint32_t flags, int64_t *linux_result);
 
 /* The current owner remains live while this checks table sharing. */
 int kernel_files_is_shared(const struct kernel_files *files);
@@ -168,6 +178,9 @@ enum kernel_files_status kernel_files_fchmodat(
     struct kernel_files *files, const struct kernel_fs_context *fs,
     struct kernel_mm *mm, int64_t dirfd, uint64_t user_path,
     uint32_t mode, int64_t *linux_result);
+enum kernel_files_status kernel_files_fchmodat2(struct kernel_files *,
+    const struct kernel_fs_context *, struct kernel_mm *, int64_t dirfd,
+    uint64_t user_path, uint32_t mode, uint32_t flags, int64_t *linux_result);
 enum kernel_files_status kernel_files_fchown(
     struct kernel_files *files, int64_t fd, uint32_t uid, uint32_t gid,
     int64_t *linux_result);
@@ -589,6 +602,11 @@ enum kernel_files_status kernel_files_epoll_pwait(
     int32_t timeout,
     uint64_t user_sigmask,
     size_t sigsetsize,
+    int64_t *linux_result);
+
+enum kernel_files_status kernel_files_epoll_pwait2(struct kernel_files *,
+    struct kernel_mm *, struct kernel_task *, int64_t epfd, uint64_t user_events,
+    int32_t maxevents, uint64_t user_timeout, uint64_t user_mask, size_t sigsetsize,
     int64_t *linux_result);
 
 struct kernel_files_xattr_request {

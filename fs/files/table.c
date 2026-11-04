@@ -214,9 +214,9 @@ enum kernel_files_status kernel_files_acquire(
     return KERNEL_FILES_STATUS_OK;
 }
 
-enum kernel_files_status kernel_files_fork(
-    struct kernel_files *destination,
-    const struct kernel_files *source)
+static enum kernel_files_status fork_files_range(
+    struct kernel_files *destination, const struct kernel_files *source,
+    int exclude, uint32_t first, uint32_t last)
 {
     kernel_assert_service_context();
     uint32_t index;
@@ -253,6 +253,7 @@ Retry:
          index < source->record->statistics.capacity;
          index++) {
         struct kernel_open_file_description *description =
+            exclude && index >= first && index <= last ? 0 :
             source->record->slots[index].description;
 
         if (description != 0) {
@@ -281,6 +282,14 @@ Retry:
     }
     return status;
 }
+
+enum kernel_files_status kernel_files_fork(struct kernel_files *destination,
+    const struct kernel_files *source)
+{ return fork_files_range(destination, source, 0, 0, 0); }
+
+enum kernel_files_status kernel_files_fork_except(struct kernel_files *destination,
+    const struct kernel_files *source, uint32_t first, uint32_t last)
+{ return fork_files_range(destination, source, 1, first, last); }
 
 enum kernel_files_status kernel_files_move(
     struct kernel_files *destination,
@@ -447,7 +456,8 @@ enum kernel_files_status kernel_files_install_owned_locked(
     }
     slot = &files->record->slots[fd];
     if (files->record->next_fd > files->record->statistics.capacity ||
-        slot->description != 0 || (slot->flags != 0U && slot->flags != KERNEL_FILES_FD_RESERVED) ||
+        slot->description != 0 || (slot->flags != 0U &&
+            (slot->flags & ~KERNEL_FILES_FD_CLOEXEC) != KERNEL_FILES_FD_RESERVED) ||
         files->record->statistics.current_open_fds >=
             files->record->statistics.capacity ||
         files->record->statistics.close_on_exec_fds >
@@ -455,6 +465,9 @@ enum kernel_files_status kernel_files_install_owned_locked(
         return KERNEL_FILES_STATUS_STATE;
     }
 
+    /* close_range(CLOEXEC) can mark a claimed slot while its opener is
+     * still allocating/copying. Installation preserves that published bit. */
+    fd_flags |= slot->flags & KERNEL_FILES_FD_CLOEXEC;
     slot->description = *owner;
     slot->flags = fd_flags;
     files->record->statistics.current_open_fds++;
@@ -511,8 +524,8 @@ enum kernel_files_status kernel_files_install_pair_reserved(
     struct kernel_files *files=first->files;
     KERNEL_FILES_SCOPE(guard, files);
     if (first->fd>=files->record->statistics.capacity || second->fd>=files->record->statistics.capacity ||
-        files->record->slots[first->fd].flags!=KERNEL_FILES_FD_RESERVED ||
-        files->record->slots[second->fd].flags!=KERNEL_FILES_FD_RESERVED) __builtin_trap();
+        (files->record->slots[first->fd].flags & ~KERNEL_FILES_FD_CLOEXEC)!=KERNEL_FILES_FD_RESERVED ||
+        (files->record->slots[second->fd].flags & ~KERNEL_FILES_FD_CLOEXEC)!=KERNEL_FILES_FD_RESERVED) __builtin_trap();
     if (kernel_files_install_owned_locked(files,first->fd,flags,a) ||
         kernel_files_install_owned_locked(files,second->fd,flags,b)) __builtin_trap();
     first->files=second->files=0;
@@ -534,7 +547,8 @@ void kernel_files_cancel_reservation(struct kernel_files_fd_reservation *reserva
     KERNEL_FILES_SCOPE(guard, reservation->files);
     struct kernel_files_record *record = reservation->files->record;
     if (record->slots[reservation->fd].description ||
-        record->slots[reservation->fd].flags != KERNEL_FILES_FD_RESERVED) __builtin_trap();
+        (record->slots[reservation->fd].flags & ~KERNEL_FILES_FD_CLOEXEC) !=
+            KERNEL_FILES_FD_RESERVED) __builtin_trap();
     record->slots[reservation->fd].flags = 0;
     if (reservation->fd < record->next_fd) record->next_fd = reservation->fd;
     reservation->files = 0;
@@ -1080,6 +1094,38 @@ static enum kernel_files_status detach_batch(struct kernel_files *files, uint32_
     for (unsigned i=0; i<count; i++) if (release_detached(files, batch[i], 0, closing)) __builtin_trap();
     return KERNEL_FILES_STATUS_OK;
 }
+enum kernel_files_status kernel_files_close_range(struct kernel_files *files,
+    uint32_t first, uint32_t last, int cloexec, struct kernel_task *closing)
+{
+    uint32_t cursor=first;
+    for (;;) {
+        struct kernel_open_file_description *batch[16]; unsigned count=0;
+        {
+            KERNEL_FILES_SCOPE(guard, files);
+            uint32_t capacity=files->record->statistics.capacity;
+            if (cursor>=capacity || cursor>last) break;
+            uint32_t end=capacity-1;
+            if (end>last) end=last;
+            if (end-cursor>=16) end=cursor+15;
+            for (;cursor<=end;cursor++) {
+                struct kernel_file_slot *slot=&files->record->slots[cursor];
+                if (cloexec) {
+                    if ((slot->description || (slot->flags & KERNEL_FILES_FD_RESERVED)) &&
+                        !(slot->flags & KERNEL_FILES_FD_CLOEXEC)) {
+                        slot->flags|=KERNEL_FILES_FD_CLOEXEC;
+                        if (slot->description) files->record->statistics.close_on_exec_fds++;
+                    }
+                } else if (slot->description) batch[count++]=detach_fd_locked(files,cursor);
+            }
+        }
+        for (unsigned i=0;i<count;i++) {
+            enum kernel_files_status status=release_detached(files,batch[i],0,closing);
+            if (status!=KERNEL_FILES_STATUS_OK) return status;
+        }
+    }
+    return KERNEL_FILES_STATUS_OK;
+}
+
 enum kernel_files_status kernel_files_close_on_exec(struct kernel_files *files)
 {
     if (!kernel_files_is_live(files)) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;

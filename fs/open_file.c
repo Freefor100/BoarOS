@@ -550,7 +550,7 @@ enum kernel_open_file_status kernel_open_file_create_socket(
     file->references = 1U;
     kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
     file->kind = KERNEL_OPEN_FILE_KIND_SOCKET;
-    file->file.mode = KERNEL_VFS_S_IFSOCK | UINT32_C(0000600);
+    file->file.mode = KERNEL_VFS_S_IFSOCK | UINT32_C(0000777);
     file->open_flags = flags;
     file->socket = socket;
     if (socket) kernel_socket_attach_file(socket, file);
@@ -603,7 +603,7 @@ int kernel_open_file_pseudo_stat(
     if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE)
         return kernel_pipe_stat(file->pipe, stat);
     else if (file->kind == KERNEL_OPEN_FILE_KIND_SOCKET)
-        mode = KERNEL_VFS_S_IFSOCK | 0600U;
+        mode = __atomic_load_n(&file->file.mode,__ATOMIC_ACQUIRE);
     else if (file->kind == KERNEL_OPEN_FILE_KIND_PIDFD)
         mode = 0700U; /* pidfs getattr deliberately masks S_IFMT. */
     else if (file->kind == KERNEL_OPEN_FILE_KIND_EPOLL || (file->kind == KERNEL_OPEN_FILE_KIND_EVENTFD || file->kind == KERNEL_OPEN_FILE_KIND_TIMERFD || file->kind == KERNEL_OPEN_FILE_KIND_SIGNALFD))
