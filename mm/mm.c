@@ -3934,6 +3934,35 @@ enum kernel_mm_status kernel_mm_check_files_domain(const struct kernel_mm *mm,
         ? KERNEL_MM_STATUS_OK : KERNEL_MM_STATUS_STATE;
 }
 
+#if !defined(BOAROS_ARCH_LOONGARCH)
+enum kernel_mm_status kernel_mm_flush_instructions(struct kernel_mm *mm, int local_only)
+{
+    struct kernel_mm owner={0};
+    if (!mm) return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    enum kernel_mm_status status=kernel_mm_acquire(&owner,mm);
+    if (status) return status;
+    struct kernel_mm_record *record=owner.record;
+    /* 固定本核身份直到固件确认；快照后的新进入者由activate核对代次。 */
+    kernel_preempt_disable();
+    struct kernel_cpu *cpu=kernel_cpu_current();
+    uint32_t targets;
+    uint64_t generation;
+    {
+        KERNEL_RAW_SCOPE(guard,&record->metadata);
+        if (record->instruction_generation==UINT64_MAX) __builtin_trap();
+        generation=++record->instruction_generation;
+        targets=local_only?0:record->active_cpus;
+    }
+    arch_mmu_sync_instruction_cpus(targets);
+    /* 远端可在等待期间发布更新代次，不能把它冒充为本次已同步。 */
+    if (cpu->active_mm_record==record)
+        cpu->active_mm_instruction_generation=generation;
+    kernel_preempt_enable();
+    if (kernel_mm_release(&owner)) __builtin_trap();
+    return KERNEL_MM_STATUS_OK;
+}
+#endif
+
 enum kernel_mm_status kernel_mm_activate(const struct kernel_mm *next, uint64_t kernel_context)
 {
     /* 在整个本地交接期间不允许被抢占；这里不分配、不进固件、无两个MM锁嵌套。 */

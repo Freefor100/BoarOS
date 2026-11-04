@@ -16,6 +16,7 @@ void riscv_smp_idle(void);
 void riscv_smp_stop(void);
 /* CPU停止及根业务/UART drain完成之后，由可信CPU0输出静态统计。 */
 void riscv_smp_report_user_execution(void);
+void riscv_smp_sync_instructions(uint32_t targets);
 void riscv_smp_sync_kernel(uint64_t address, uint64_t size);
 void riscv_smp_sync_user(uint32_t targets, uint64_t address, uint64_t size,
     int instructions);
