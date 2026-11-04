@@ -3205,6 +3205,12 @@ int kernel_socket_get_option(struct kernel_socket *socket,
     if(socket->domain!=KERNEL_SOCKET_DOMAIN_NETLINK)kernel_socket_protocol_leave(&saved);
     return result;
 }
+void kernel_socket_save_error(struct kernel_socket *socket, int error)
+{
+    SOCKET_STATE(scope);
+    socket->pending_error=error;
+    socket_state_release(&scope);
+}
 void kernel_socket_set_send_timeout(struct kernel_socket *socket, uint64_t nanoseconds)
 {
     SOCKET_STATE(scope);

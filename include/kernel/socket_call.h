@@ -21,6 +21,8 @@ struct kernel_socket_call {
     unsigned fd_reserved;
 };
 int kernel_socket_call_begin(struct kernel_socket_call *, struct kernel_files *, struct kernel_open_file_description **);
+/* Release one message while the enclosing socket call keeps its OFD owner. */
+void kernel_socket_call_message_end(struct kernel_socket_call *);
 void kernel_socket_call_end(struct kernel_socket_call *);
 void kernel_socket_call_abort(struct kernel_socket_call *);
 int kernel_socket_control_copy(struct kernel_socket_call *, struct kernel_mm *, uint64_t, uint64_t);
