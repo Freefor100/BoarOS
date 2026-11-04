@@ -1005,10 +1005,10 @@ static int64_t interface_route_ioctl(struct kernel_mm *mm, uint32_t command,
         route.metric > 1 || route.mtu || route.window || route.irtt)
         return -KERNEL_EOPNOTSUPP;
     if (route.device) {
-        size_t length = 0;
-        enum kernel_uaccess_status status = kernel_copy_string_from_user(
-            mm, name, route.device, sizeof(name), &length);
-        if (status != KERNEL_UACCESS_STATUS_OK) return -KERNEL_EFAULT;
+        copied = 0;
+        if (kernel_copy_from_user(mm, name, route.device, sizeof(name) - 1U, &copied) !=
+                KERNEL_UACCESS_STATUS_OK || copied != sizeof(name) - 1U)
+            return -KERNEL_EFAULT;
     }
     return kernel_socket_default_route(route.device ? name : 0,
                                         route.gateway.address, command == 0x890c);
