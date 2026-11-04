@@ -4,6 +4,7 @@
 #include <kernel/open_file.h>
 #include <kernel/vfs.h>
 #include <kernel/sync.h>
+#include "flock.h"
 
 struct kernel_epoll;
 struct kernel_epoll_item;
@@ -47,7 +48,11 @@ struct kernel_open_file_description {
     unsigned readahead_pages;
     uint8_t read_sequential;
 #endif
+    struct kernel_flock_owner flock_owner;
+    struct kernel_flock_identity flock_identity; /* Pathless private inode. */
 };
+struct kernel_flock_identity *kernel_open_file_flock_identity(
+    struct kernel_open_file_description *);
 /* 已有OFD owner下的私有域验证，不为未映射普通文件分配映射登记状态。 */
 enum kernel_open_file_status kernel_open_file_check_io_domain(
     const struct kernel_open_file_description *,const struct kernel_heap *,

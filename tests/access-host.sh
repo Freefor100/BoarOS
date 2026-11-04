@@ -17,7 +17,7 @@ for shift in ${ACCESS_HOST_SHIFTS:-12 14}; do
         mm/mm.c mm/vma.c mm/uaccess.c arch/riscv/sv39.c \
         fs/files/table.c fs/files/path.c fs/files/metadata.c fs/fs_context.c fs/open_file.c \
         fs/block_file.c fs/loop.c fs/disk_mount.c fs/pipe.c fs/vfs.c fs/tmpfs.c fs/file_mapping.c \
-        fs/record_lock.c fs/page_cache.c fs/ext4_backend.c fs/fat32.c fs/lwext4_port.c \
+        fs/record_lock.c fs/flock.c fs/page_cache.c fs/ext4_backend.c fs/fat32.c fs/lwext4_port.c \
         kernel/block.c third_party/lwext4/src/*.c \
         -Wl,--gc-sections -o "$build_dir/access-$shift"
     timeout 30s "$build_dir/access-$shift"

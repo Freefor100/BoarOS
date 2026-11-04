@@ -39,6 +39,10 @@ int kernel_page_cache_needs_cpu0(const struct kernel_page_cache *cache)
 {(void)cache;return 0;}
 void kernel_block_file_close(struct kernel_open_file_description *file)
 {assert(file->kind==KERNEL_OPEN_FILE_KIND_PIDFD);}
+void kernel_flock_release(struct kernel_flock_owner *owner)
+{assert(!owner->context);}
+void kernel_flock_destroy(struct kernel_flock_identity *identity)
+{assert(!identity->context);}
 void kernel_credentials_put(const struct kernel_credentials *credentials)
 {assert(!credentials);}
 void kernel_heap_release(struct kernel_heap *h,void *pointer)

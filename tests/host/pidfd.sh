@@ -16,17 +16,17 @@ for shift in 12 14; do
     cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 \
         -DBOAROS_PAGE_SHIFT="$shift" -DBOAROS_LOCK_DEBUG=1 -ffunction-sections -fdata-sections \
         -Itests/host/sync -idirafter include -fsanitize=address,undefined \
-        tests/host/pidfd.c kernel/pid.c kernel/raw_lock.c kernel/sched/park.c \
+        tests/host/pidfd.c kernel/pid.c kernel/raw_lock.c kernel/sched/park.c fs/flock.c \
         -Wl,--gc-sections -o "$out/owners-$shift"
     timeout -k 1s 10s "$out/owners-$shift"
     cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 \
         -DBOAROS_USER_SMP=1 -DBOAROS_PAGE_SHIFT="$shift" -DBOAROS_LOCK_DEBUG=1 \
         -ffunction-sections -fdata-sections -Itests/host/sync -idirafter include \
         -fsanitize=address,undefined tests/host/pidfd_files.c fs/files/table.c \
-        kernel/pid.c kernel/raw_lock.c kernel/sched/park.c -Wl,--gc-sections \
+        kernel/pid.c kernel/raw_lock.c kernel/sched/park.c fs/flock.c -Wl,--gc-sections \
         -Wl,--wrap=kernel_files_pin,--wrap=kernel_files_release,--wrap=kernel_raw_lock_acquire \
         -o "$out/files-$shift"
-    for case in getfd-local open-local nofile-open nofile-getfd identity recheck cleanup-owner exit; do
+    for case in getfd-local open-local nofile-open nofile-getfd identity recheck cleanup-owner exit reserved-cloexec close-range-unshare; do
         timeout -k 1s 10s "$out/files-$shift" "$case"
     done
     cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_MAX_CPUS=2 \

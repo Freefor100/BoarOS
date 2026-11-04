@@ -5,6 +5,7 @@
 #include "record_lock.h"
 #include "pipe_internal.h"
 #include "vfs_internal.h"
+#include "vfs_objects.h"
 #include "char_device_internal.h"
 #include "files/epoll_internal.h"
 
@@ -174,6 +175,27 @@ void kernel_open_file_read_progress(struct kernel_open_file_description *file,
 #endif
 
 static uint64_t next_socket_proc_identity = 1U;
+
+/* Linux anon_inode_getfile users share one inode across descriptor kinds.
+ * Sockets, pipes and pidfs/mqueue objects each have their own real inode. */
+struct kernel_flock_identity *kernel_open_file_flock_identity(
+    struct kernel_open_file_description *file)
+{
+    if (file->kind==KERNEL_OPEN_FILE_KIND_MQUEUE)
+        return kernel_mqueue_flock_identity(file);
+    struct kernel_vfs_node *node=kernel_vfs_file_node(&file->file);
+    if (node) return &node->flock_identity;
+    switch (file->kind) {
+    case KERNEL_OPEN_FILE_KIND_PIPE: return &file->pipe->flock_identity;
+    case KERNEL_OPEN_FILE_KIND_EPOLL:
+    case KERNEL_OPEN_FILE_KIND_EVENTFD:
+    case KERNEL_OPEN_FILE_KIND_TIMERFD:
+    case KERNEL_OPEN_FILE_KIND_SIGNALFD: return kernel_flock_anonymous_identity();
+    case KERNEL_OPEN_FILE_KIND_PIDFD: return kernel_pidfd_flock_identity(file);
+    case KERNEL_OPEN_FILE_KIND_CONSOLE: return kernel_flock_bootstrap_console_identity();
+    default: return &file->flock_identity;
+    }
+}
 
 struct kernel_vfs_path *kernel_open_file_path(
     const struct kernel_open_file_description *description)
@@ -800,7 +822,11 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
     enum kernel_pipe_status pipe_status;
     KERNEL_SERVICE_SCOPE_IF(service, !local);
     if (!local) kernel_assert_service_context();
-    if (first) { reset_read_prediction(file); release_record_locks(file); }
+    if (first) {
+        reset_read_prediction(file);release_record_locks(file);
+        kernel_flock_release(&file->flock_owner);
+        kernel_flock_destroy(&file->flock_identity);
+    }
     kernel_block_file_close(file);
     if (file->device_opened) {
         file->device_opened = 0;

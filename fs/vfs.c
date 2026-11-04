@@ -3454,19 +3454,19 @@ int kernel_vfs_node_release(struct kernel_vfs_node **owner)
         if (node->next) node->next->previous = node->previous;
         node->previous = 0; node->next = 0;
         node->instance->node_count--;
-        if (node->unlinked && !node->retired) {
-            node->next = node->instance->cleanup_nodes;
-            node->instance->cleanup_nodes = node;
-            *owner = 0;
-            kernel_task_lock_release(&irq);
-            return 0;
-        }
         if (node->instance->retiring_nodes == SIZE_MAX) __builtin_trap();
         node->instance->retiring_nodes++;
         kernel_task_lock_release(&irq);
         break;
     }
     struct kernel_vfs_instance *instance = node->instance;
+    kernel_flock_destroy(&node->flock_identity);
+    if (node->unlinked && !node->retired) {
+        kernel_vfs_cleanup_node(node);
+        node_retirement_end(instance);
+        *owner = 0;
+        return 0;
+    }
     /* 摘出弱索引后，close 和 heap 释放仍持有实例；卸载必须看到这个 owner。 */
     if (!node->closed) {
         result = node->instance->ops->close_node(node);
