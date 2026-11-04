@@ -17,6 +17,12 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 
 调用者是 scheduler 当前不透明 task，供依赖任务身份或资源的系统调用取得明确上下文；通用解码层不从 RISC-V `tp` 隐式寻找 current。请求包含系统调用号和六个 64 位参数。结果动作定义在公共头中：
 
+当前分派覆盖RV的217个编号、LA的216个编号；这表示入口已接入，各接口的具体支持范围见对应模块。
+`flock(32)`、`close_range(436)`、`epoll_pwait2(441)`、`fchmodat2(452)`和
+`copy_file_range(285)`见[文件接口](kernel-files.md)，`sendmmsg(269)`／`recvmmsg(243)`
+见[网络接口](kernel-network.md)。RV独有的`riscv_flush_icache(259)`见[MM](kernel-mm.md)；
+LA的259仍返回`ENOSYS`。这些入口的直接消费者可用`python3 tests/api8.py`运行同ELF Linux对照。
+
 - `KERNEL_SYSCALL_ACTION_RETURN`：把 `value` 写回用户返回值寄存器后继续执行。
 - `KERNEL_SYSCALL_ACTION_EXIT`：以 `value` 作为退出状态终止当前用户任务。
 - `KERNEL_SYSCALL_ACTION_EXEC`：新映像已经准备完成；不推进旧 `sepc`，由 scheduler 切换 MM 并重建 Trap Frame。

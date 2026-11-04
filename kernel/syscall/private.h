@@ -447,4 +447,9 @@ enum kernel_syscall_status syscall_handle_getrusage(struct kernel_task *,
     const struct kernel_syscall_request *, struct kernel_syscall_result *);
 enum kernel_syscall_status syscall_handle_xattr(struct kernel_task *,
     const struct kernel_syscall_request *,struct kernel_syscall_result *);
+
+enum kernel_syscall_status syscall_handle_flock(struct kernel_task *, const struct kernel_syscall_request *, struct kernel_syscall_result *);
+enum kernel_syscall_status syscall_handle_close_range(struct kernel_task *, const struct kernel_syscall_request *, struct kernel_syscall_result *);
+enum kernel_syscall_status syscall_handle_copy_range(struct kernel_task *, const struct kernel_syscall_request *, struct kernel_syscall_result *);
+enum kernel_syscall_status syscall_handle_socket_mmessage(struct kernel_task *, const struct kernel_syscall_request *, struct kernel_syscall_result *);
 #endif

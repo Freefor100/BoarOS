@@ -20,6 +20,8 @@ IPv4 重组键包括源/目的地址、IP ID、协议号和输入 netif 身份�
 
 输入地址按 Linux 的有符号 32 位长度校验，bind/connect/sendto 拒绝负值及超过 128 字节的声明，并完整复制声明范围后解析。sendmsg 对空 name、负长度及超过 128 字节的输入使用其独立的规范化规则；先完成 name 复制和 iovec 导入，再解释地址，错误路径保留协议状态和报文队列。
 
+sendmmsg(269)/recvmmsg(243) 使用原生64位 mmsghdr（64字节，msg_len位于偏移56），与单消息入口共用收发核心。整批固定原socket OFD；每条才导入自己的header、iovec和控制区，完成后立即释放消息资源，复制和等待仍在发起CPU。sendmmsg将vlen限制为1024，并在部分发送后停止；recvmmsg保留unsigned vlen，MSG_WAITFORONE在首条完成后启用DONTWAIT。已完成条数优先于后续错误和信号重启，接收的后续非EAGAIN错误留给下一次调用或SO_ERROR。msg_len在协议消费和控制FD安装后输出，输出故障保留这些副作用。recvmmsg的timespec在每条完成后检查并更新，阻塞接收仍由SO_RCVTIMEO约束；仅正条数才输出剩余时间，输出故障返回EFAULT。参数顺序与错误规则依据固定[`net/socket.c`](../../references/linux/net/socket.c)。
+
 IPv4 的 connect、UDP connect/sendto 将目的 `0.0.0.0` 按 Linux 本地目的语义转换为 `127.0.0.1`，bind 的 `0.0.0.0` 继续表示通配监听。socket 的 family/type/protocol 分别检查；INET RAW protocol 0 返回 `EPROTONOSUPPORT`。
 
 端点队列、读预约、超时、错误消费、发送额度、socketpair 两端关系和工作链由共同端点短锁保护。同一状态修改中的队列发布、额度查询及更新复用外层保护；嵌套 guard 只记录借用，通知游标仅由实际持锁者初始化和维护。RV 用户的 read/write/readv/writev、sendto/recvfrom/sendmsg/recvmsg 和普通文件到 socket 的 sendfile 在发起 CPU 执行：用户复制、接收预约、发送额度和等待属于原调用者。创建、连接、监听、accept、配置、shutdown、最终销毁以及 lwIP 协议工作继续在 CPU0。就绪查询及等待登记不取得 lwIP mutex，就绪检查和等待登记在同一状态保护内完成，释放状态锁后才 park。通知使用已有等待游标借用，在端点锁外执行回调；最后销毁先关闭等待队列，并等游标与登记实际归还。`kernel_socket_poll` 不访问 PCB、不推进协议、不消费错误；TCP 可写性来自协议 owner 发布的接纳额度，实际发送预约共同扣减它。监听就绪由接纳/失效回调维护，失效 child 的销毁由现有工作集合处理。epoll 真实候选查询在 token 外，prepared 阶段只读刷新提示。
