@@ -471,7 +471,8 @@ netif_do_ip_addr_changed(const ip_addr_t *old_addr, const ip_addr_t *new_addr)
 
 #if LWIP_IPV4
 static int
-netif_do_set_ipaddr(struct netif *netif, const ip4_addr_t *ipaddr, ip_addr_t *old_addr)
+netif_do_set_ipaddr(struct netif *netif, const ip4_addr_t *ipaddr, ip_addr_t *old_addr,
+                    int preserve_pcbs)
 {
   LWIP_ASSERT("invalid pointer", ipaddr != NULL);
   LWIP_ASSERT("invalid pointer", old_addr != NULL);
@@ -485,7 +486,9 @@ netif_do_set_ipaddr(struct netif *netif, const ip4_addr_t *ipaddr, ip_addr_t *ol
     ip_addr_copy(*old_addr, *netif_ip_addr4(netif));
 
     LWIP_DEBUGF(NETIF_DEBUG | LWIP_DBG_STATE, ("netif_set_ipaddr: netif address being changed\n"));
-    netif_do_ip_addr_changed(old_addr, &new_addr);
+    if (!preserve_pcbs) {
+      netif_do_ip_addr_changed(old_addr, &new_addr);
+    }
 
 #if LWIP_ACD
     acd_netif_ip_addr_changed(netif, old_addr, &new_addr);
@@ -517,8 +520,8 @@ netif_do_set_ipaddr(struct netif *netif, const ip4_addr_t *ipaddr, ip_addr_t *ol
  * @note call netif_set_addr() if you also want to change netmask and
  * default gateway
  */
-void
-netif_set_ipaddr(struct netif *netif, const ip4_addr_t *ipaddr)
+static void
+netif_set_ipaddr_mode(struct netif *netif, const ip4_addr_t *ipaddr, int preserve_pcbs)
 {
   ip_addr_t old_addr;
 
@@ -531,13 +534,27 @@ netif_set_ipaddr(struct netif *netif, const ip4_addr_t *ipaddr)
 
   LWIP_ASSERT_CORE_LOCKED();
 
-  if (netif_do_set_ipaddr(netif, ipaddr, &old_addr)) {
+  if (netif_do_set_ipaddr(netif, ipaddr, &old_addr, preserve_pcbs)) {
 #if LWIP_NETIF_EXT_STATUS_CALLBACK
     netif_ext_callback_args_t args;
     args.ipv4_changed.old_address = &old_addr;
     netif_invoke_ext_callback(netif, LWIP_NSC_IPV4_ADDRESS_CHANGED, &args);
 #endif
   }
+}
+
+void
+netif_set_ipaddr(struct netif *netif, const ip4_addr_t *ipaddr)
+{
+  netif_set_ipaddr_mode(netif, ipaddr, 0);
+}
+
+/* Runtime Linux address changes leave existing socket bindings intact.  Device
+ * removal still uses the upstream PCB notification and teardown path. */
+void
+netif_set_ipaddr_preserve_pcbs(struct netif *netif, const ip4_addr_t *ipaddr)
+{
+  netif_set_ipaddr_mode(netif, ipaddr, 1);
 }
 
 static int
@@ -710,7 +727,7 @@ netif_set_addr(struct netif *netif, const ip4_addr_t *ipaddr, const ip4_addr_t *
   if (remove) {
     /* when removing an address, we have to remove it *before* changing netmask/gw
        to ensure that tcp RST segment can be sent correctly */
-    if (netif_do_set_ipaddr(netif, ipaddr, &old_addr)) {
+    if (netif_do_set_ipaddr(netif, ipaddr, &old_addr, 0)) {
 #if LWIP_NETIF_EXT_STATUS_CALLBACK
       change_reason |= LWIP_NSC_IPV4_ADDRESS_CHANGED;
       cb_args.ipv4_changed.old_address = &old_addr;
@@ -731,7 +748,7 @@ netif_set_addr(struct netif *netif, const ip4_addr_t *ipaddr, const ip4_addr_t *
   }
   if (!remove) {
     /* set ipaddr last to ensure netmask/gw have been set when status callback is called */
-    if (netif_do_set_ipaddr(netif, ipaddr, &old_addr)) {
+    if (netif_do_set_ipaddr(netif, ipaddr, &old_addr, 0)) {
 #if LWIP_NETIF_EXT_STATUS_CALLBACK
       change_reason |= LWIP_NSC_IPV4_ADDRESS_CHANGED;
       cb_args.ipv4_changed.old_address = &old_addr;

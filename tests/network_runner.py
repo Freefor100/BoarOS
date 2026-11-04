@@ -556,6 +556,7 @@ def run_smp(args):
                     if queued:expected=[f'QUEUED THREADS mode={mode} cpus={cpus} OK' for mode in range(4)]+['QUEUED COMPETE OK']+(['QUEUED CONTROL callback-source-exit OK','QUEUED CONTROL prepared-leader-exit OK','QUEUED CONTROL prepared-thread-exec OK'] if target=='boaros' and args.observe and cpus>1 else ['QUEUED CONTROL SKIP'])+['QUEUED END failures=0']
                     if futex:lines,expected=futex_lines(raw,cpus)
                     passed=bool(expected) and lines==expected and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
+                    if args.workload=='interface':passed='NETWORK PASS interface' in raw and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if unix_named:passed=unix_named_output(raw,args.performance) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if unix_control:passed=unix_control_output(raw,args.performance,cpus) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if unix_seqpacket:passed=unix_seqpacket_output(raw,args.performance,cpus) and (target=='linux' or unix_seqpacket_owners(raw,'riscv'))
@@ -658,7 +659,8 @@ def main(default_arch="riscv"):
     if args.dynamic and args.libc=='glibc':parser.error('glibc direct consumer uses the static target toolchain')
     if args.performance and args.arch!='riscv':parser.error('--performance requires the RISC-V SMP runner')
     if args.performance and args.workload not in ('unix_named','unix_control','unix_seqpacket'):parser.error('--performance requires --workload unix_named, unix_control or unix_seqpacket')
-    if args.workload in ('unix_named','unix_control','unix_seqpacket','smp','pipe','event','altstack','queued','posix','futex','mremap','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','execveat','chroot','proc_thread_resources','clone_resources','pi','futex_vector') and args.arch=='riscv':return run_smp(args)
+    if (args.workload == 'interface' and args.cpus and max(args.cpus) > 1) or (args.workload in ('unix_named','unix_control','unix_seqpacket','smp','pipe','event','altstack','queued','posix','futex','mremap','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','execveat','chroot','proc_thread_resources','clone_resources','pi','futex_vector') and args.arch=='riscv'):
+        if args.arch == 'riscv': return run_smp(args)
     if args.arch=='riscv' and args.platform_config=='official' and args.memory and args.memory!=['1G']:
         parser.error('official profile requires 1G')
     if args.arch=='loongarch':return run_loongarch(args)

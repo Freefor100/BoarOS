@@ -3588,6 +3588,20 @@ struct kernel_socket_service_result kernel_socket_service_pending(struct kernel_
     return result;
 }
 
+void kernel_socket_network_purge_orphans(void)
+{
+    struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
+    struct tcp_pcb *lists[] = {tcp_active_pcbs, tcp_bound_pcbs, tcp_tw_pcbs};
+    for (unsigned i = 0; i < sizeof(lists) / sizeof(lists[0]); i++) {
+        for (struct tcp_pcb *pcb = lists[i], *next; pcb; pcb = next) {
+            next = pcb->next;
+            /* 最后一个 socket 已摘除回调；停服后不会再由协议定时器归还。 */
+            if (!pcb->callback_arg && !pcb->errf) tcp_abandon(pcb, 0);
+        }
+    }
+    kernel_socket_protocol_leave(&scope);
+}
+
 void kernel_socket_network_failed(uint32_t address)
 {
     struct kernel_socket_protocol_scope saved; kernel_socket_protocol_enter(&saved);
@@ -3623,7 +3637,9 @@ static void interface_snapshot(struct netif *n, struct kernel_socket_interface *
     __builtin_memcpy(s->name, loop ? "lo" : "eth0", loop ? 3 : 5);
     s->index = netif_get_index(n); s->address = netif_ip4_addr(n)->addr;
     /* loopif的0表示不受L2 MTU限制；Linux逻辑MTU容纳完整IPv4长度范围。 */
-    s->netmask = netif_ip4_netmask(n)->addr; s->mtu = loop ? 65536U : n->mtu;
+    s->netmask = netif_ip4_netmask(n)->addr; s->mtu = loop && n->mtu == 0 ? 65536U : n->mtu;
+    s->gateway = netif_ip4_gw(n)->addr;
+    s->default_route = n == netif_default && s->gateway != 0;
     s->hardware_type = loop ? 772 : 1;
     if (netif_is_up(n)) s->flags |= 1;
     if (netif_is_up(n) && netif_is_link_up(n)) s->flags |= 0x40;
@@ -3673,4 +3689,90 @@ int kernel_socket_interface_set_flags(const char name[16], uint16_t flags)
         }
     }
     kernel_socket_protocol_leave(&irq); return -KERNEL_ENODEV;
+}
+int kernel_socket_interface_set_ipv4(const char name[16], uint32_t command, uint32_t value)
+{
+    struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
+    int result = -KERNEL_ENODEV;
+    for (struct netif *n = netif_list; n; n = n->next) {
+        int loop = n->name[0] == 'l' && n->name[1] == 'o';
+        if (__builtin_memcmp(name, loop ? "lo" : "eth0", loop ? 3 : 5)) continue;
+        ip4_addr_t address = {value};
+        uint32_t host = lwip_ntohl(value);
+        result = 0;
+        if (command == 0x8916) {
+            if ((host >> 28) == 14) { result = -KERNEL_EINVAL; break; }
+            if (value != netif_ip4_addr(n)->addr) {
+                uint32_t mask = (host >> 24) == 0 || host == UINT32_MAX ? 0 :
+                    (host >> 31) == 0 ? 0xff000000U :
+                    (host >> 30) == 2 ? 0xffff0000U :
+                    (host >> 29) == 6 ? 0xffffff00U : UINT32_MAX;
+                ip4_addr_t netmask = {lwip_htonl(mask)};
+                netif_set_netmask(n, &netmask);
+                netif_set_ipaddr_preserve_pcbs(n, &address);
+            }
+        } else {
+            uint32_t inverted = ~host;
+            if (netif_ip4_addr(n)->addr == 0) { result = -KERNEL_EADDRNOTAVAIL; break; }
+            if ((inverted & (inverted + 1U)) != 0) { result = -KERNEL_EINVAL; break; }
+            netif_set_netmask(n, &address);
+        }
+        if (netif_default == n && netif_ip4_gw(n)->addr &&
+            (!netif_ip4_addr(n)->addr ||
+             !ip4_addr_net_eq(netif_ip4_gw(n), netif_ip4_addr(n), netif_ip4_netmask(n)))) {
+            ip4_addr_t empty = {0};
+            netif_set_gw(n, &empty);
+            netif_set_default(0);
+        }
+        break;
+    }
+    kernel_socket_protocol_leave(&scope); return result;
+}
+int kernel_socket_interface_set_mtu(const char name[16], int32_t mtu)
+{
+    struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
+    int result = -KERNEL_ENODEV;
+    for (struct netif *n = netif_list; n; n = n->next) {
+        int loop = n->name[0] == 'l' && n->name[1] == 'o';
+        if (__builtin_memcmp(name, loop ? "lo" : "eth0", loop ? 3 : 5)) continue;
+        if (mtu < 68 || mtu > (loop ? 65536 : 1500)) result = -KERNEL_EINVAL;
+        else { n->mtu = mtu == 65536 ? 0 : (uint16_t)mtu; result = 0; }
+        break;
+    }
+    kernel_socket_protocol_leave(&scope); return result;
+}
+int kernel_socket_default_route(const char *name, uint32_t gateway, int remove)
+{
+    struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
+    struct netif *chosen = 0;
+    ip4_addr_t address = {gateway};
+    int result = -KERNEL_ENETUNREACH;
+    if (remove && !name && !gateway) chosen = netif_default;
+    for (struct netif *n = netif_list; n; n = n->next) {
+        if (chosen) break;
+        int loop = n->name[0] == 'l' && n->name[1] == 'o';
+        if (name && __builtin_memcmp(name, loop ? "lo" : "eth0", loop ? 3 : 5)) continue;
+        if (!name && gateway && !ip4_addr_net_eq(&address, netif_ip4_addr(n), netif_ip4_netmask(n)))
+            continue;
+        chosen = n;
+        break;
+    }
+    if (!chosen) result = name ? -KERNEL_ENODEV : -KERNEL_ENETUNREACH;
+    else if (!remove && (!netif_is_up(chosen) || netif_ip4_addr(chosen)->addr == 0 ||
+             !ip4_addr_net_eq(&address, netif_ip4_addr(chosen), netif_ip4_netmask(chosen))))
+        result = -KERNEL_ENETUNREACH;
+    else if (remove) {
+        if (netif_default != chosen || !netif_ip4_gw(chosen)->addr ||
+            (gateway && netif_ip4_gw(chosen)->addr != gateway))
+            result = -KERNEL_ESRCH;
+        else {
+            ip4_addr_t empty = {0}; netif_set_gw(chosen, &empty);
+            netif_set_default(0); result = 0;
+        }
+    } else if (netif_default && netif_ip4_gw(netif_default)->addr != 0)
+        result = -KERNEL_EEXIST;
+    else {
+        netif_set_gw(chosen, &address); netif_set_default(chosen); result = 0;
+    }
+    kernel_socket_protocol_leave(&scope); return result;
 }

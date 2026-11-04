@@ -942,25 +942,76 @@ struct linux_interface_configuration {
     uint64_t buffer;
 };
 
+struct linux_route_entry {
+    uint64_t pad1;
+    struct { uint16_t family, port; uint32_t address; uint8_t zero[8]; } destination, gateway, mask;
+    uint16_t flags, pad2;
+    uint32_t padding;
+    uint64_t pad3, pad4;
+    int16_t metric;
+    uint8_t padding2[6];
+    uint64_t device, mtu, window;
+    uint16_t irtt;
+    uint8_t padding3[6];
+};
+
 _Static_assert(sizeof(struct linux_interface_request) == 40U, "RV64 ifreq");
 _Static_assert(sizeof(struct linux_interface_configuration) == 16U, "RV64 ifconf");
+_Static_assert(sizeof(struct linux_route_entry) == 120U, "LP64 rtentry");
 
 static int interface_ioctl_command(uint32_t command)
 {
     switch (command) {
+    case 0x890b: /* SIOCADDRT */
+    case 0x890c: /* SIOCDELRT */
     case 0x8910: /* SIOCGIFNAME */
     case 0x8912: /* SIOCGIFCONF */
     case 0x8913: /* SIOCGIFFLAGS */
     case 0x8914: /* SIOCSIFFLAGS */
     case 0x8915: /* SIOCGIFADDR */
+    case 0x8916: /* SIOCSIFADDR */
     case 0x891b: /* SIOCGIFNETMASK */
+    case 0x891c: /* SIOCSIFNETMASK */
     case 0x8921: /* SIOCGIFMTU */
+    case 0x8922: /* SIOCSIFMTU */
     case 0x8927: /* SIOCGIFHWADDR */
     case 0x8933: /* SIOCGIFINDEX */
         return 1;
     default:
         return 0;
     }
+}
+
+static int64_t interface_route_ioctl(struct kernel_mm *mm, uint32_t command,
+                                     uint64_t user_route)
+{
+    struct linux_route_entry route;
+    size_t copied = 0;
+    char name[16] = {0};
+    if (kernel_copy_from_user(mm, &route, user_route, sizeof(route), &copied) !=
+            KERNEL_UACCESS_STATUS_OK || copied != sizeof(route))
+        return -KERNEL_EFAULT;
+    if (!kernel_credentials_capable(kernel_credentials_current(), KERNEL_CAP_NET_ADMIN))
+        return -KERNEL_EPERM;
+    if (route.destination.family != KERNEL_SOCKET_AF_INET ||
+        (route.mask.family != 0 && route.mask.family != KERNEL_SOCKET_AF_INET) ||
+        (route.gateway.family != 0 && route.gateway.family != KERNEL_SOCKET_AF_INET))
+        return -KERNEL_EAFNOSUPPORT;
+    if (route.destination.address || route.mask.address ||
+        (route.flags & ~3U) ||
+        (command == 0x890b && (!(route.flags & 2U) || !route.gateway.address ||
+                               route.gateway.family != KERNEL_SOCKET_AF_INET)) ||
+        (route.gateway.address && route.gateway.family != KERNEL_SOCKET_AF_INET) ||
+        route.metric > 1 || route.mtu || route.window || route.irtt)
+        return -KERNEL_EOPNOTSUPP;
+    if (route.device) {
+        size_t length = 0;
+        enum kernel_uaccess_status status = kernel_copy_string_from_user(
+            mm, name, route.device, sizeof(name), &length);
+        if (status != KERNEL_UACCESS_STATUS_OK) return -KERNEL_EFAULT;
+    }
+    return kernel_socket_default_route(route.device ? name : 0,
+                                        route.gateway.address, command == 0x890c);
 }
 
 static int64_t interface_configuration_ioctl(struct kernel_mm *mm,
@@ -1019,7 +1070,13 @@ static int64_t interface_request_ioctl(struct kernel_mm *mm, uint32_t command,
         copied != sizeof(interface))
         return -KERNEL_EFAULT;
     interface.name[sizeof(interface.name) - 1U] = 0;
-    if(command==0x8914 && !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_NET_ADMIN))return -KERNEL_EPERM;
+    if ((command == 0x8914 || command == 0x8916 || command == 0x891c ||
+         command == 0x8922) &&
+        !kernel_credentials_capable(kernel_credentials_current(), KERNEL_CAP_NET_ADMIN))
+        return -KERNEL_EPERM;
+    if ((command == 0x8916 || command == 0x891c) &&
+        interface.data.address.family != KERNEL_SOCKET_AF_INET)
+        return -KERNEL_EINVAL;
     if (command == 0x8910) {
         result = kernel_socket_interface_index((uint32_t)interface.data.value,
                                                &snapshot);
@@ -1045,6 +1102,12 @@ static int64_t interface_request_ioctl(struct kernel_mm *mm, uint32_t command,
     case 0x8914:
         if (alias) return -KERNEL_EADDRNOTAVAIL;
         return kernel_socket_interface_set_flags(name, interface.data.flags);
+    case 0x8916:
+    case 0x891c:
+        if (alias) return -KERNEL_EOPNOTSUPP;
+        return kernel_socket_interface_set_ipv4(name, command, interface.data.address.address);
+    case 0x8922:
+        return kernel_socket_interface_set_mtu(name, interface.data.value);
     case 0x8915:
     case 0x891b:
         if (alias || snapshot.address == 0U) return -KERNEL_EADDRNOTAVAIL;
@@ -1104,6 +1167,10 @@ enum kernel_syscall_status syscall_handle_ioctl(
         if (linux_result == 0) {
             if (kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK) {
                 status = KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+            } else if ((uint32_t)request->arguments[1] == 0x890b ||
+                       (uint32_t)request->arguments[1] == 0x890c) {
+                linux_result = interface_route_ioctl(mm, (uint32_t)request->arguments[1],
+                                                      request->arguments[2]);
             } else if ((uint32_t)request->arguments[1] == 0x8912) {
                 linux_result = interface_configuration_ioctl(mm, request->arguments[2]);
             } else {

@@ -451,6 +451,7 @@ void netif_set_default(struct netif *netif);
 
 #if LWIP_IPV4
 void netif_set_ipaddr(struct netif *netif, const ip4_addr_t *ipaddr);
+void netif_set_ipaddr_preserve_pcbs(struct netif *netif, const ip4_addr_t *ipaddr);
 void netif_set_netmask(struct netif *netif, const ip4_addr_t *netmask);
 void netif_set_gw(struct netif *netif, const ip4_addr_t *gw);
 /** @ingroup netif_ip4 */

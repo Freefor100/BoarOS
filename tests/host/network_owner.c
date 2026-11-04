@@ -298,8 +298,8 @@ struct kernel_fs_paths kernel_fs_context_snapshot(const struct kernel_fs_context
 void kernel_fs_paths_release(struct kernel_fs_paths *paths)
 { CHECK(!paths->root && !paths->cwd); }
 int kernel_vfs_socket_bind_at(struct kernel_vfs_path *start,struct kernel_vfs_path *root,
-    const char *path,uint32_t mode,struct kernel_vfs_path **owner,0)
-{ (void)start;(void)root;(void)path;(void)mode;CHECK(!*owner);return -KERNEL_ENOENT; }
+    const char *path,uint32_t mode,struct kernel_vfs_path **owner,uint32_t umask)
+{ (void)start;(void)root;(void)path;(void)mode;(void)umask;CHECK(!*owner);return -KERNEL_ENOENT; }
 int kernel_vfs_socket_lookup_at(struct kernel_vfs_path *start,struct kernel_vfs_path *root,
     const char *path,struct kernel_vfs_path **owner)
 { (void)start;(void)root;(void)path;CHECK(!*owner);return -KERNEL_ENOENT; }
@@ -506,6 +506,97 @@ static err_t physical_output(struct netif *interface, struct pbuf *packet, const
 }
 static err_t physical_init(struct netif *interface)
 { interface->name[0] = 't'; interface->name[1] = 'e'; interface->mtu = 1500; interface->output = physical_output; return ERR_OK; }
+
+static unsigned char route_frame[128];
+static unsigned route_frame_size;
+static err_t route_link_output(struct netif *interface, struct pbuf *packet)
+{
+    (void)interface;
+    route_frame_size = packet->tot_len < sizeof(route_frame) ? packet->tot_len : sizeof(route_frame);
+    CHECK(pbuf_copy_partial(packet, route_frame, route_frame_size, 0) == route_frame_size);
+    return ERR_OK;
+}
+static err_t route_interface_init(struct netif *interface)
+{
+    interface->name[0] = 'e'; interface->name[1] = 't'; interface->mtu = 1500;
+    interface->hwaddr_len = 6; interface->hwaddr[0] = 2;
+    interface->flags = NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP | NETIF_FLAG_ETHERNET;
+    interface->output = etharp_output; interface->linkoutput = route_link_output;
+    return ERR_OK;
+}
+static void ipv4_route_output(void)
+{
+    kernel_socket_network_initialize();
+    struct netif interface = {0};
+    ip4_addr_t local, mask, empty, gateway, remote;
+    IP4_ADDR(&local, 10, 77, 0, 2); IP4_ADDR(&mask, 255, 255, 255, 0);
+    IP4_ADDR(&gateway, 10, 77, 0, 1); IP4_ADDR(&remote, 192, 0, 2, 1);
+    ip4_addr_set_zero(&empty);
+    CHECK(netif_add(&interface, &local, &mask, &empty, NULL, route_interface_init, ip_input));
+    netif_set_up(&interface); netif_set_link_up(&interface);
+    CHECK(!kernel_socket_default_route("eth0", gateway.addr, 0));
+    CHECK(ip4_route(&remote) == &interface);
+    struct pbuf *packet = pbuf_alloc(PBUF_IP, 20, PBUF_RAM); CHECK(packet);
+    memset(packet->payload, 0, 20); ((unsigned char *)packet->payload)[0] = 0x45;
+    memcpy((unsigned char *)packet->payload + 16, &remote.addr, 4);
+    CHECK(etharp_output(&interface, packet, &remote) == ERR_OK);
+    CHECK(route_frame_size >= 42 && route_frame[12] == 8 && route_frame[13] == 6);
+    CHECK(!memcmp(route_frame + 38, &gateway.addr, 4));
+    const unsigned char gateway_mac[6] = {2, 1, 2, 3, 4, 5};
+    unsigned char reply[42] = {0};
+    memcpy(reply, interface.hwaddr, 6); memcpy(reply + 6, gateway_mac, 6);
+    reply[12] = 8; reply[13] = 6; reply[15] = 1; reply[16] = 8;
+    reply[18] = 6; reply[19] = 4; reply[21] = 2;
+    memcpy(reply + 22, gateway_mac, 6); memcpy(reply + 28, &gateway.addr, 4);
+    memcpy(reply + 32, interface.hwaddr, 6); memcpy(reply + 38, &local.addr, 4);
+    struct pbuf *arp = pbuf_alloc(PBUF_RAW, sizeof(reply), PBUF_RAM); CHECK(arp);
+    CHECK(pbuf_take(arp, reply, sizeof(reply)) == ERR_OK);
+    CHECK(ethernet_input(arp, &interface) == ERR_OK);
+    CHECK(route_frame_size >= 34 && !memcmp(route_frame, gateway_mac, 6));
+    CHECK(route_frame[12] == 8 && route_frame[13] == 0 && !memcmp(route_frame + 30, &remote.addr, 4));
+    CHECK(!kernel_socket_default_route("eth0", gateway.addr, 1));
+    CHECK(etharp_output(&interface, packet, &remote) == ERR_RTE);
+    pbuf_free(packet); etharp_cleanup_netif(&interface); netif_remove(&interface);
+    puts("PASS configured IPv4 gateway determines the ARP target for off-subnet traffic");
+}
+static void ipv4_address_shutdown(void)
+{
+    kernel_socket_network_initialize();
+    struct netif interface = {0};
+    ip4_addr_t local, mask, empty, changed;
+    IP4_ADDR(&local, 10, 77, 0, 2); IP4_ADDR(&mask, 255, 255, 255, 0);
+    IP4_ADDR(&changed, 10, 77, 0, 3); ip4_addr_set_zero(&empty);
+    CHECK(netif_add(&interface, &local, &mask, &empty, NULL, route_interface_init, ip_input));
+    netif_set_up(&interface); netif_set_link_up(&interface);
+    struct kernel_socket *socket = NULL;
+    CHECK(!kernel_socket_create(&test_heap, KERNEL_SOCKET_AF_INET, SOCKET_STREAM, &socket));
+    socket->connected = 1; socket->tcp->state = ESTABLISHED;
+    ip_addr_copy_from_ip4(socket->tcp->local_ip, local);
+    IP_ADDR4(&socket->tcp->remote_ip, 10, 77, 0, 1);
+    socket->tcp->local_port = 22000; socket->tcp->remote_port = 22001;
+    socket->tcp->cwnd = TCP_MSS; socket->tcp->snd_wnd = socket->tcp->snd_wnd_max = TCP_WND;
+    TCP_REG_ACTIVE(socket->tcp);
+    const char name[16] = "eth0";
+    CHECK(!kernel_socket_interface_set_ipv4(name, 0x8916, changed.addr));
+    CHECK(socket->tcp && ip4_addr_eq(ip_2_ip4(&socket->tcp->local_ip), &local));
+    struct kernel_socket *survivor = NULL;
+    CHECK(!kernel_socket_create(&test_heap, KERNEL_SOCKET_AF_INET, SOCKET_STREAM, &survivor));
+    survivor->connected = 1; survivor->tcp->state = ESTABLISHED;
+    ip_addr_copy_from_ip4(survivor->tcp->local_ip, changed);
+    IP_ADDR4(&survivor->tcp->remote_ip, 10, 77, 0, 1);
+    survivor->tcp->local_port = 22002; survivor->tcp->remote_port = 22001;
+    survivor->tcp->cwnd = TCP_MSS; survivor->tcp->snd_wnd = survivor->tcp->snd_wnd_max = TCP_WND;
+    TCP_REG_ACTIVE(survivor->tcp);
+    kernel_socket_destroy(socket);
+    CHECK(tcp_active_pcbs);
+    kernel_socket_network_purge_orphans();
+    CHECK(tcp_active_pcbs == survivor->tcp && survivor->tcp->callback_arg == survivor);
+    kernel_socket_destroy(survivor);
+    kernel_socket_network_purge_orphans();
+    netif_set_down(&interface); netif_remove(&interface);
+    CHECK(!tcp_active_pcbs);
+    puts("PASS address change and device shutdown release prior TCP owners");
+}
 
 static void nodelay_pending(unsigned blocked)
 {
@@ -2462,6 +2553,8 @@ int main(int argc, char **argv)
     CHECK(kernel_pid_allocator_init(&model_pid_numbers,model_pid_bitmap,1024)==KERNEL_PID_STATUS_OK);
     CHECK(kernel_pid_publish(&model_pid_registry,&model_pid)==KERNEL_PID_STATUS_OK);
     if (!strcmp(argv[1], "unix-seq-records")) unix_seqpacket_records();
+    else if (!strcmp(argv[1], "ipv4-route")) ipv4_route_output();
+    else if (!strcmp(argv[1], "ipv4-address-shutdown")) ipv4_address_shutdown();
     else if (!strcmp(argv[1], "unix-seq-control")) unix_seqpacket_control();
     else if (!strcmp(argv[1], "unix-seq-reservation")) unix_seqpacket_reservation();
     else if (!strcmp(argv[1], "unix-seq-pending-control")) unix_seqpacket_pending_control();

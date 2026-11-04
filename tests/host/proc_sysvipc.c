@@ -79,6 +79,10 @@ int main(void)
     directory.inode = PROC_ROOT_INODE;
     assert(proc_dir_entry(&file, 8, &next_position, &inode, &type, name, sizeof(name)) == 1);
     assert(!strcmp(name, "sysvipc") && inode == PROC_SYSVIPC_INODE && type == 4);
+    assert(proc_dir_entry(&file, next_position, &next_position, &inode, &type, name, sizeof(name)) == 1);
+    assert(!strcmp(name, "net") && inode == PROC_NET_INODE && type == 4);
+    assert(!proc_lookup(0, PROC_NET_INODE, "route", 5, &inode, &mode));
+    assert(inode == PROC_NET_ROUTE_INODE && mode == (KERNEL_VFS_S_IFREG | 0444));
     const uint64_t inodes[] = {PROC_SYSVIPC_SHM_INODE, PROC_SYSVIPC_SEM_INODE, PROC_SYSVIPC_MSG_INODE};
     for (unsigned i = 0; i < 3; i++) {
         char *text = 0; size_t length = 0;
