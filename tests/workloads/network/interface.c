@@ -272,6 +272,14 @@ static void default_route(int fd)
     gateway->sin_addr.s_addr = inet_addr("127.0.0.2");
     route.rt_flags = RTF_UP | RTF_GATEWAY;
     route.rt_dev = "lo";
+    long page = sysconf(_SC_PAGESIZE); CHECK(page > 0);
+    char *guard = mmap(NULL, 2 * (size_t)page, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(guard != MAP_FAILED && !mprotect(guard + page, (size_t)page, PROT_NONE));
+    memcpy(guard + page - 3, "lo", 3);
+    route.rt_dev = guard + page - 3;
+    CHECK(ioctl(fd, SIOCADDRT, &route) == -1 && errno == EFAULT);
+    route.rt_dev = "lo"; CHECK(!munmap(guard, 2 * (size_t)page));
     gateway->sin_addr.s_addr = inet_addr("192.0.2.1");
     CHECK(ioctl(fd, SIOCADDRT, &route) == -1 && errno == ENETUNREACH);
     gateway->sin_addr.s_addr = inet_addr("127.0.0.2");
