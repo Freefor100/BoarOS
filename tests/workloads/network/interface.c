@@ -4,6 +4,8 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <net/if.h>
+#include <net/route.h>
+#include <sched.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -11,7 +13,10 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /* Linux LP64 UAPI shared by the native reference and RV64 probe. */
@@ -118,7 +123,7 @@ static void bad_requests(int fd)
     }
     CHECK(ioctl(fd, SIOCGIFNAME, NULL) == -1 && errno == EFAULT);
     CHECK(ioctl(-1, SIOCGIFADDR, NULL) == -1 && errno == EBADF);
-    int regular = open("/dev/null", O_RDONLY); CHECK(regular >= 0);
+    int regular = open("/init", O_RDONLY); CHECK(regular >= 0);
     CHECK(ioctl(regular, SIOCGIFADDR, NULL) == -1 && errno == ENOTTY);
     CHECK(close(regular) == 0);
 
@@ -199,6 +204,144 @@ static void flags(int fd)
     CHECK(ioctl(fd, SIOCGIFFLAGS, &result) == 0 && (result.ifr_flags & IFF_UP));
 }
 
+static void configure_loopback(int fd)
+{
+    int udp = socket(AF_INET, SOCK_DGRAM, 0), listener = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(udp >= 0 && listener >= 0);
+    struct sockaddr_in bound = {.sin_family = AF_INET, .sin_addr.s_addr = inet_addr("127.0.0.1")};
+    CHECK(!bind(udp, (void *)&bound, sizeof(bound)));
+    CHECK(!bind(listener, (void *)&bound, sizeof(bound)) && !listen(listener, 1));
+    socklen_t size = sizeof(bound);
+    CHECK(!getsockname(listener, (void *)&bound, &size));
+    int client = socket(AF_INET, SOCK_STREAM, 0); CHECK(client >= 0);
+    CHECK(!connect(client, (void *)&bound, sizeof(bound)));
+    int accepted = accept(listener, NULL, NULL); CHECK(accepted >= 0);
+    struct ifreq req = named("lo");
+    struct sockaddr_in *address = (void *)&req.ifr_addr;
+    memset(address, 0, sizeof(*address));
+    address->sin_family = AF_INET;
+    address->sin_addr.s_addr = inet_addr("127.0.0.2");
+    CHECK(ioctl(fd, SIOCSIFADDR, &req) == 0);
+    size = sizeof(bound);
+    CHECK(!getsockname(udp, (void *)&bound, &size) && bound.sin_addr.s_addr == inet_addr("127.0.0.1"));
+    size = sizeof(bound);
+    CHECK(!getsockname(listener, (void *)&bound, &size) && bound.sin_addr.s_addr == inet_addr("127.0.0.1"));
+    size = sizeof(bound);
+    CHECK(!getsockname(accepted, (void *)&bound, &size) && bound.sin_addr.s_addr == inet_addr("127.0.0.1"));
+    int socket_error = -1; size = sizeof(socket_error);
+    CHECK(!getsockopt(accepted, SOL_SOCKET, SO_ERROR, &socket_error, &size) && !socket_error);
+    req = named("lo");
+    CHECK(ioctl(fd, SIOCGIFADDR, &req) == 0);
+    CHECK(((struct sockaddr_in *)&req.ifr_addr)->sin_addr.s_addr == inet_addr("127.0.0.2"));
+    address = (void *)&req.ifr_addr;
+    address->sin_addr.s_addr = inet_addr("127.0.0.1");
+    CHECK(ioctl(fd, SIOCSIFADDR, &req) == 0);
+    CHECK(!close(client) && !close(accepted) && !close(udp) && !close(listener));
+
+    req = named("lo"); address = (void *)&req.ifr_netmask;
+    memset(address, 0, sizeof(*address)); address->sin_family = AF_INET;
+    address->sin_addr.s_addr = inet_addr("255.0.0.0");
+    CHECK(ioctl(fd, SIOCSIFNETMASK, &req) == 0);
+    req = named("lo"); req.ifr_mtu = 65536;
+    CHECK(ioctl(fd, SIOCSIFMTU, &req) == 0);
+    req.ifr_mtu = 32768;
+    CHECK(ioctl(fd, SIOCSIFMTU, &req) == 0);
+    req = named("lo"); CHECK(ioctl(fd, SIOCGIFMTU, &req) == 0 && req.ifr_mtu == 32768);
+    req.ifr_mtu = 65536; CHECK(ioctl(fd, SIOCSIFMTU, &req) == 0);
+    req.ifr_mtu = -1; CHECK(ioctl(fd, SIOCSIFMTU, &req) == -1 && errno == EINVAL);
+    req = named("lo"); address = (void *)&req.ifr_netmask;
+    memset(address, 0, sizeof(*address)); address->sin_family = AF_INET;
+    address->sin_addr.s_addr = inet_addr("255.0.255.0");
+    CHECK(ioctl(fd, SIOCSIFNETMASK, &req) == -1 && errno == EINVAL);
+    pid_t child = fork(); CHECK(child >= 0);
+    if (!child) {
+        if (setuid(65534)) _exit(2);
+        req = named("lo"); req.ifr_mtu = 1400;
+        _exit(ioctl(fd, SIOCSIFMTU, &req) == -1 && errno == EPERM ? 0 : 3);
+    }
+    int status; CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
+}
+
+static void default_route(int fd)
+{
+    struct rtentry route = {0};
+    struct sockaddr_in *dst = (void *)&route.rt_dst;
+    struct sockaddr_in *gateway = (void *)&route.rt_gateway;
+    dst->sin_family = AF_INET;
+    gateway->sin_family = AF_INET;
+    gateway->sin_addr.s_addr = inet_addr("127.0.0.2");
+    route.rt_flags = RTF_UP | RTF_GATEWAY;
+    route.rt_dev = "lo";
+    gateway->sin_addr.s_addr = inet_addr("192.0.2.1");
+    CHECK(ioctl(fd, SIOCADDRT, &route) == -1 && errno == ENETUNREACH);
+    gateway->sin_addr.s_addr = inet_addr("127.0.0.2");
+    CHECK(ioctl(fd, SIOCADDRT, &route) == 0);
+    CHECK(ioctl(fd, SIOCADDRT, &route) == -1 && errno == EEXIST);
+    FILE *routes = fopen("/proc/net/route", "r"); CHECK(routes != NULL);
+    char line[256], device[64]; unsigned long destination, gw, mask;
+    unsigned flags; int found = 0;
+    CHECK(fgets(line, sizeof(line), routes) != NULL);
+    while (fgets(line, sizeof(line), routes)) {
+        if (sscanf(line, "%63s %lx %lx %x %*u %*u %*u %lx", device,
+                   &destination, &gw, &flags, &mask) == 5 &&
+            !strcmp(device, "lo") && !destination && gw == inet_addr("127.0.0.2") &&
+            (flags & 3U) == 3U && !mask) found++;
+    }
+    CHECK(!fclose(routes) && found == 1);
+    memset(&route.rt_gateway, 0, sizeof(route.rt_gateway));
+    route.rt_flags = RTF_UP; route.rt_dev = NULL;
+    CHECK(ioctl(fd, SIOCDELRT, &route) == 0);
+}
+
+static void run_busybox(char *const arguments[])
+{
+    pid_t child = fork(); CHECK(child >= 0);
+    if (!child) { execv("/busybox", arguments); _exit(127); }
+    int status; CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
+}
+
+static void busybox_configuration(int fd)
+{
+    char *set[] = {"busybox", "ifconfig", "lo", "127.0.0.2", "netmask", "255.0.0.0", "mtu", "32768", NULL};
+    char *add[] = {"busybox", "route", "add", "default", "gw", "127.0.0.2", "dev", "lo", NULL};
+    char *show[] = {"busybox", "route", "-n", NULL};
+    char *del[] = {"busybox", "route", "del", "default", "gw", "127.0.0.2", "dev", "lo", NULL};
+    char *restore[] = {"busybox", "ifconfig", "lo", "127.0.0.1", "netmask", "255.0.0.0", "mtu", "65536", NULL};
+    run_busybox(set);
+    struct ifreq req = named("lo");
+    CHECK(!ioctl(fd, SIOCGIFADDR, &req) && ((struct sockaddr_in *)&req.ifr_addr)->sin_addr.s_addr == inet_addr("127.0.0.2"));
+    req = named("lo"); CHECK(!ioctl(fd, SIOCGIFMTU, &req) && req.ifr_mtu == 32768);
+    run_busybox(add); run_busybox(show); run_busybox(del); run_busybox(restore);
+    req = named("eth0");
+    if (ioctl(fd, SIOCGIFINDEX, &req) == 0) {
+        char *eth[] = {"busybox", "ifconfig", "eth0", "10.77.0.2", "netmask", "255.255.255.0", "mtu", "1400", NULL};
+        char *eth_add[] = {"busybox", "route", "add", "default", "gw", "10.77.0.1", "dev", "eth0", NULL};
+        char *eth_del[] = {"busybox", "route", "del", "default", "gw", "10.77.0.1", "dev", "eth0", NULL};
+        run_busybox(eth);
+        req = named("eth0");
+        CHECK(!ioctl(fd, SIOCGIFADDR, &req) && ((struct sockaddr_in *)&req.ifr_addr)->sin_addr.s_addr == inet_addr("10.77.0.2"));
+        req = named("eth0"); CHECK(!ioctl(fd, SIOCGIFMTU, &req) && req.ifr_mtu == 1400);
+        run_busybox(eth_add); run_busybox(show); run_busybox(eth_del);
+        puts("NETWORK PASS busybox-eth0");
+    }
+    puts("NETWORK PASS busybox-ipv4");
+}
+
+static void remote_configure(int fd)
+{
+    cpu_set_t previous, remote;
+    CHECK(!sched_getaffinity(0, sizeof(previous), &previous));
+    if (!CPU_ISSET(1, &previous)) return;
+    CPU_ZERO(&remote); CPU_SET(1, &remote);
+    CHECK(!sched_setaffinity(0, sizeof(remote), &remote));
+    struct ifreq req = named("lo"); req.ifr_mtu = 32768;
+    CHECK(!ioctl(fd, SIOCSIFMTU, &req));
+    req = named("lo"); CHECK(!ioctl(fd, SIOCGIFMTU, &req) && req.ifr_mtu == 32768);
+    req.ifr_mtu = 65536; CHECK(!ioctl(fd, SIOCSIFMTU, &req));
+    CHECK(!sched_setaffinity(0, sizeof(previous), &previous));
+    puts("NETWORK PASS remote-ipv4");
+}
+
 int main(int argc, char **argv)
 {
     int set_flags = 0, ethernet_mtu = 0;
@@ -211,7 +354,16 @@ int main(int argc, char **argv)
         } else CHECK(!"usage: interface [--set-flags] [--eth0 ADDRESS NETMASK MTU]");
     }
     setvbuf(stdout, NULL, _IONBF, 0);
+    if (getpid() == 1) {
+        CHECK(mkdir("/proc", 0555) == 0 || errno == EEXIST);
+        CHECK(mount("proc", "/proc", "proc", 0, NULL) == 0 || errno == EBUSY);
+    }
     int fd = socket(AF_INET, SOCK_DGRAM, 0); CHECK(fd >= 0);
+    flags(fd);
+    configure_loopback(fd);
+    default_route(fd);
+    remote_configure(fd);
+    if (access("/busybox", X_OK) == 0) busybox_configuration(fd);
     if (set_flags) flags(fd);
     properties(fd, "lo", "127.0.0.1", "255.0.0.0", 65536, 772);
     if (ethernet_ip) properties(fd, "eth0", ethernet_ip, ethernet_mask, ethernet_mtu, 1);

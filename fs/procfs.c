@@ -46,6 +46,8 @@
 #define PROC_SYSVIPC_SHM_INODE UINT64_C(17)
 #define PROC_SYSVIPC_SEM_INODE UINT64_C(18)
 #define PROC_SYSVIPC_MSG_INODE UINT64_C(19)
+#define PROC_NET_INODE UINT64_C(20)
+#define PROC_NET_ROUTE_INODE UINT64_C(21)
 #define PROC_TASK_DIR_KIND 10U
 #define PROC_TID_DIR_KIND 11U
 #define PROC_TID_STAT_KIND 12U
@@ -213,6 +215,12 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
                        uint64_t *inode, uint32_t *mode)
 {
     (void)instance;
+    if (parent == PROC_NET_INODE) {
+        if (length != 5U || memcmp(name, "route", 5U)) return -KERNEL_ENOENT;
+        *inode = PROC_NET_ROUTE_INODE;
+        *mode = KERNEL_VFS_S_IFREG | 0444U;
+        return 0;
+    }
     if (parent == PROC_SYSVIPC_INODE) {
         if (length != 3U) return -KERNEL_ENOENT;
         if (!memcmp(name, "shm", 3U)) *inode = PROC_SYSVIPC_SHM_INODE;
@@ -341,6 +349,11 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
         *mode = KERNEL_VFS_S_IFDIR | 0555U;
         return 0;
     }
+    if (length == 3U && !memcmp(name, "net", length)) {
+        *inode = PROC_NET_INODE;
+        *mode = KERNEL_VFS_S_IFDIR | 0555U;
+        return 0;
+    }
     if (length == 3U && !memcmp(name, "sys", length)) {
         *inode = PROC_SYS_INODE;
         *mode = KERNEL_VFS_S_IFDIR | 0555U;
@@ -405,6 +418,7 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
          inode != PROC_RT_RUNTIME_INODE && inode != PROC_PID_MAX_INODE &&
          inode != PROC_SYSVIPC_INODE && inode != PROC_SYSVIPC_SHM_INODE &&
          inode != PROC_SYSVIPC_SEM_INODE && inode != PROC_SYSVIPC_MSG_INODE &&
+         inode != PROC_NET_INODE && inode != PROC_NET_ROUTE_INODE &&
 #if BOAROS_COST_DIAGNOSTICS
          inode != PROC_COST_INODE && inode != PROC_COST_CONTROL_INODE &&
          inode != PROC_NETWORK_STATS_INODE && inode != PROC_MEMORY_STATS_INODE &&
@@ -425,7 +439,7 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
           proc_inode_kind(inode) != PROC_PID_MAPS_KIND &&
           proc_inode_kind(inode) != PROC_PID_FDINFO_DIR_KIND &&
           !(inode >= (UINT64_C(1)<<30U) && proc_inode_kind(inode)==PROC_PID_FDINFO_KIND))) ||
-        ((inode == PROC_ROOT_INODE || inode == PROC_SYSVIPC_INODE) &&
+        ((inode == PROC_ROOT_INODE || inode == PROC_SYSVIPC_INODE || inode == PROC_NET_INODE) &&
          (mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) ||
         ((inode == PROC_SELF_INODE || inode == PROC_THREAD_SELF_INODE || inode == PROC_MOUNTS_INODE) &&
          (mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFLNK) ||
@@ -434,7 +448,8 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
             (proc_kind_mode(proc_inode_kind(inode)) & KERNEL_VFS_S_IFMT)) ||
         ((inode == PROC_MEMINFO_INODE || inode == PROC_UPTIME_INODE ||
           inode == PROC_PID_MAX_INODE || inode == PROC_SYSVIPC_SHM_INODE ||
-          inode == PROC_SYSVIPC_SEM_INODE || inode == PROC_SYSVIPC_MSG_INODE) &&
+          inode == PROC_SYSVIPC_SEM_INODE || inode == PROC_SYSVIPC_MSG_INODE ||
+          inode == PROC_NET_ROUTE_INODE) &&
          (mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG))
         return -KERNEL_EINVAL;
     if (inode >= (UINT64_C(1) << 30U)) {
@@ -558,6 +573,17 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
     /* EOF 不推进 cookie；有效项必须以正值返回。 */
     *next_position = position;
     uint64_t directory = kernel_vfs_file_inode(file);
+    if (directory == PROC_NET_INODE) {
+        const char *entries[] = {".", "..", "route"};
+        if (position >= 3U) return 0;
+        size_t length = strlen(entries[position]) + 1U;
+        if (name_size < length) return -KERNEL_ERANGE;
+        memcpy(name, entries[position], length);
+        *next_position = position + 1U;
+        *inode = position == 0 ? directory : position == 1 ? PROC_ROOT_INODE : PROC_NET_ROUTE_INODE;
+        *type = position < 2 ? 4U : 8U;
+        return 1;
+    }
     if (directory == PROC_SYSVIPC_INODE) {
         static const char *const entries[] = {".", "..", "shm", "sem", "msg"};
         if (position >= sizeof(entries) / sizeof(entries[0])) return 0;
@@ -711,25 +737,26 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
     else if (position == 6U) entry_name = "sys";
     else if (position == 7U) entry_name = "thread-self";
     else if (position == 8U) entry_name = "sysvipc";
+    else if (position == 9U) entry_name = "net";
 #if BOAROS_COST_DIAGNOSTICS
-    else if (position == 9U) entry_name = "boaros_cost";
-    else if (position == 10U) entry_name = "boaros_cost_control";
-    else if (position == 11U) entry_name = "boaros_net_stats";
-    else if (position == 12U) entry_name = "boaros_mem_stats";
-    else if (position >= 13U) {
+    else if (position == 10U) entry_name = "boaros_cost";
+    else if (position == 11U) entry_name = "boaros_cost_control";
+    else if (position == 12U) entry_name = "boaros_net_stats";
+    else if (position == 13U) entry_name = "boaros_mem_stats";
+    else if (position >= 14U) {
         position -= 4U;
 #else
-    else if (position >= 9U) {
+    else if (position >= 10U) {
 #endif
         kernel_pid_t pid;
         uint64_t identity;
-        if (position - 9U >= INT32_MAX ||
-            kernel_proc_next_process((kernel_pid_t)(position - 9U),
+        if (position - 10U >= INT32_MAX ||
+            kernel_proc_next_process((kernel_pid_t)(position - 10U),
                                       &pid, &identity)) return 0;
         size_t length = decimal(name, (uint32_t)pid);
         if (name_size <= length) return -KERNEL_ERANGE;
         name[length] = '\0';
-        *next_position = 9U + (uint32_t)pid;
+        *next_position = 10U + (uint32_t)pid;
 #if BOAROS_COST_DIAGNOSTICS
         *next_position += 4U;
 #endif
@@ -748,15 +775,16 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
              position == 6U ? PROC_SYS_INODE :
              position == 7U ? PROC_THREAD_SELF_INODE :
              position == 8U ? PROC_SYSVIPC_INODE :
+             position == 9U ? PROC_NET_INODE :
 #if BOAROS_COST_DIAGNOSTICS
-             position == 9U ? PROC_COST_INODE :
-             position == 10U ? PROC_COST_CONTROL_INODE :
-             position == 11U ? PROC_NETWORK_STATS_INODE :
-             position == 12U ? PROC_MEMORY_STATS_INODE :
+             position == 10U ? PROC_COST_INODE :
+             position == 11U ? PROC_COST_CONTROL_INODE :
+             position == 12U ? PROC_NETWORK_STATS_INODE :
+             position == 13U ? PROC_MEMORY_STATS_INODE :
 #endif
              PROC_ROOT_INODE;
     *type = position == 4U || position == 5U || position == 7U ? 10U :
-            position >= 2U && position != 6U && position != 8U ? 8U : 4U;
+            position >= 2U && position != 6U && position != 8U && position != 9U ? 8U : 4U;
     return 1;
 }
 
@@ -1625,9 +1653,50 @@ static int proc_fdinfo_snapshot(struct kernel_vfs_node *node,struct kernel_heap 
     data[used]=0;*buffer=data;*length=used;return 0;
 }
 
+static size_t proc_route_row(char *out, const struct kernel_socket_interface *s,
+                             uint32_t destination, uint32_t gateway, uint32_t mask)
+{
+    size_t used = strlen(s->name);
+    memcpy(out, s->name, used); out[used++] = '\t';
+    used += proc_hex(out + used, destination, 8); out[used++] = '\t';
+    used += proc_hex(out + used, gateway, 8);
+    const char *flags = gateway ? "\t0003\t0\t0\t0\t" : "\t0001\t0\t0\t0\t";
+    size_t part = strlen(flags); memcpy(out + used, flags, part); used += part;
+    used += proc_hex(out + used, mask, 8);
+    const char suffix[] = "\t0\t0\t0\n";
+    memcpy(out + used, suffix, sizeof(suffix) - 1U);
+    return used + sizeof(suffix) - 1U;
+}
+
+static int proc_route_snapshot(struct kernel_heap *heap, char **buffer, size_t *length)
+{
+    const char header[] = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n";
+    char *data = 0;
+    enum kernel_heap_status status = kernel_heap_allocate(heap, 1024U, (void **)&data);
+    if (status != KERNEL_HEAP_STATUS_OK)
+        return status == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+    size_t used = sizeof(header) - 1U;
+    memcpy(data, header, used);
+    for (uint32_t i = 0;; i++) {
+        struct kernel_socket_interface s;
+        int result = kernel_socket_interface_nth(i, &s);
+        if (result == -KERNEL_ENODEV) break;
+        if (result) { kernel_heap_release(heap, data); return result; }
+        if (!(s.flags & 1U) || !s.address) continue;
+        if (used + 160U >= 1024U) { kernel_heap_release(heap, data); return -KERNEL_ENOSPC; }
+        if (s.default_route) used += proc_route_row(data + used, &s, 0, s.gateway, 0);
+        if (!(s.flags & 8U))
+            used += proc_route_row(data + used, &s, s.address & s.netmask, 0, s.netmask);
+    }
+    data[used] = 0; *buffer = data; *length = used;
+    return 0;
+}
+
 static int proc_snapshot(struct kernel_vfs_node *node, struct kernel_heap *heap,
                          char **buffer, size_t *length)
 {
+    if (node->inode == PROC_NET_ROUTE_INODE)
+        return proc_route_snapshot(heap, buffer, length);
     if(node->inode>=(UINT64_C(1)<<30U) && proc_inode_kind(node->inode)==PROC_PID_FDINFO_KIND)
         return proc_fdinfo_snapshot(node,heap,buffer,length);
     if (node->inode == PROC_SYSVIPC_SHM_INODE || node->inode == PROC_SYSVIPC_SEM_INODE ||

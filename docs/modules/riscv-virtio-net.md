@@ -63,10 +63,17 @@ core stop 遇到 CPU lease、RX loan 或未归还 TX owner 返回 EBUSY，reset 
 由 netif 决定；保留 IPv6 loopback 与双栈监听，不宣称外部 IPv6、公网或 DNS/TLS。
 
 `SIOCGIFFLAGS/SIOCSIFFLAGS` 查询并控制 UP/DOWN；`SIOCGIFADDR/NETMASK/HWADDR/MTU/INDEX/NAME/CONF`
-输出实际接口快照，RV64 ifreq/ifconf 为 40/16 字节。快照不借用 netif 给用户复制；
-copy fault 不延长设备生命。地址、掩码、MTU setter、路由配置及普通 NETLINK_ROUTE
-消息尚未实现；AF_NETLINK 的消息队列通知接收见[网络端点模块](kernel-network.md)。
-loopback 的协议 MTU=0 表示无 L2 限制，其公开逻辑 MTU 为 Linux 的 65536。
+输出实际接口快照，RV64/LA64 ifreq/ifconf 为 40/16 字节。`SIOCSIFADDR`、
+`SIOCSIFNETMASK` 和 `SIOCSIFMTU` 修改实际接口，`SIOCADDRT/SIOCDELRT` 管理一条
+带网关的 IPv4 默认路由，`/proc/net/route` 展示实际接口网段和默认路由。修改需要
+`CAP_NET_ADMIN`，无效掩码、接口或不可达网关在修改前返回错误。以太网 MTU 上限为
+1500，受当前发送设备的帧长度约束；loopback 使用 68～65536。地址变化保留既有
+TCP/UDP 套接字的绑定。网络服务停止并确认 DMA 停止后，归还已无 socket 使用者的
+TCP 连接记录，再移除设备；其他对象沿各自生命周期处理。协议栈实际使用网关进行 ARP；
+跨核调用沿现有协议执行者处理。快照不借用 netif 给用户复制；copy fault 不延长设备生命。
+多地址、非默认静态路由、路由度量及普通 NETLINK_ROUTE 消息仍待实现；
+AF_NETLINK 的消息队列通知接收见[网络端点模块](kernel-network.md)。
+loopback 的协议 MTU=0 表示无 L2 限制，对应公开的 65536；较小设置直接用于协议栈。
 
 ## 验证与固定资料
 

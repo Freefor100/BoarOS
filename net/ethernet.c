@@ -310,6 +310,7 @@ int kernel_network_stop(struct kernel_network **owner)
     rights=kernel_socket_rights_drain();
     if (rights) {arch_interrupt_restore(irq);return rights;}
     if (n->device && virtio_net_quiesce(n->device)) { arch_interrupt_restore(irq); return -KERNEL_EIO; }
+    kernel_socket_network_purge_orphans();
     if (n->attached) {
         struct kernel_socket_protocol_scope core; kernel_socket_protocol_enter(&core);
         ip4_reass_cleanup_netif(&n->interface);
