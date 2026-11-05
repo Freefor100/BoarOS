@@ -28,6 +28,29 @@ USER_SMP保留来源CPU的实时用户资格，并单独索引CPU0实时服务�
 
 公共 scheduler 头不暴露 Trap Frame；架构 clone 入口由 `include/arch/task.h` 选择，旧 RV 入口保留包装。syscall 通过不透明 task 接口取得 TID/TGID/PPID 和资源，不直接修改调度私有字段。
 
+### SMP 的共同调度与业务状态
+
+RV、LA 复用同一调度器：每个 READY 任务只登记在一个 CPU 队列，OTHER 按时间片和同级 FIFO 推进，FIFO/RR、PI 与 CPU0 实时服务保留各自资格。队列选择、执行权、期限和身份等共同状态仍由 rank40 调度控制保护；等待对象的登记、游标及退休后继由各自短锁保护。CPU0 服务迁移的是原任务及其调用现场，借用与返回语义仍属于调用者。
+
+多核可调用、业务可并行、吞吐可扩展分别检查。各模块的主要执行边界如下；具体对象生命周期由相应模块维护。
+
+| 模块与代码 | 调用核执行的部分 | 共同状态及当前串行范围 |
+|---|---|---|
+| `kernel/sched/` | 通用分派、当前身份查询、普通信号构帧、等待 | 调度控制仍共享；进程生命周期、控制及部分跨任务操作使用 CPU0 服务 |
+| `mm/mm.c`、`mm/uaccess.c` | 匿名/COW/ELF缺页、用户复制及临时页借用 | 同MM稳定页访问使用共享短读资格，页表/许可修改与成员变化独占；撤映射及退休仍等实际失效确认 |
+| `fs/vfs.c`、`ext4_backend.c`、`page_cache.c` | ext4读、空间及目录准备、缓存接纳与复制 | inode/目录/块组按对象协调；路径索引、缓存索引/LRU、日志接纳仍有共同状态；挂载、日志及写回在CPU0 |
+| `fs/pipe.c`、`fs/event_fd.c`、`kernel/{mqueue,msg,sem}.c` | 已打开管道、eventfd及IPC对象的数据接纳与等待 | 主要按端点/队列/集合保护；timerfd计数与全局期限索引目前共用timer锁 |
+| `fs/files/{poll,epoll}.c`、`fs/signal_fd.c` | poll/epoll扫描、复制与等待，signalfd读取当前线程pending | epoll实例当前共用状态短锁；控制及关联销毁在CPU0；pending消费仍与信号/调度状态协调 |
+| `net/socket.c` | 收发预约、用户复制、额度与等待 | socket端点当前共用状态短锁；UNIX rights另有引用图资格；INET协议、控制和最终销毁在CPU0 |
+| `fs/files/table.c`、`mm/heap.c`、`kernel/physical_page.c` | FD查找后实际I/O、内核堆及页借还 | 每FD表、heap及物理分配器各有自己的短锁；它们不是同一把调度锁 |
+| `kernel/block.c`、`drivers/virtio/block.c`、`arch/{riscv,loongarch}/` | 调用核提交块请求，本地timer/IPI与架构状态 | 每设备队列与完成状态协调，设备IRQ由CPU0处理；当前单virtqueue，FLUSH/RMW保持实际顺序 |
+
+`tests/smp/system.py` 组合现有计算、信号、futex/MQ、文件、管道、poll/epoll、eventfd/timerfd、INET/UNIX 和新增 MM/进程消费者，共 27 个窗口。固定总工作量及实际 affinity 分别核对；timerfd 周期窗口报告到期迟到、累计次数和 CPU，不把固定期限当作吞吐加速。该覆盖检查共享机制和代表性使用者，具体业务的控制、错误和生命周期仍由各模块短例验证。
+
+同一消息链的先收后发、同一打开文件的位置、PIPE_BUF接纳、同一信号的单次消费，以及页表撤权和持久化顺序存在真实依赖。能够减少的是交接次数、临界段工作、重复状态查询和无关对象之间的排队。独立对象被一把全局业务锁绑定、整个操作迁移CPU0、反复获取同一资格，是实现边界，不是这些接口的必要语义。
+
+不同工作量采用对应指标：独立计算观察同内核加速比；请求—回复观察延迟、每次CPU和独立通道吞吐；定时器观察到期迟到与CPU成本；文件分别观察接纳、含最终同步吞吐及尾延迟。固定线程数量不自动等于相同数量的独立任务，测量同时记录工作者、实际affinity和依赖关系。
+
 `boot_cpu`、`kernel_wait_domain` 和调度器首个 cacheline 按此顺序放在现有 BSS 首页，CPU 本地状态与共享锁各自按 64 字节隔开。对象及其所有权保持独立，普通陷入、身份查询与返回准备因此只需触达一个静态调度控制页。链接布局检查保护同页与隔离要求；它减少必要的 TLB 工作集，不保证任意动态页和链接地址都没有冲突。
 
 身份、期限索引、阻塞提交、运行记账、策略及 READY 发布使用 rank40 调度短锁。等待节点链、游标、退休后继、关闭与借用计数由每个实际队列的 rank45 短锁保护；heap10→physical20、对象内部30→调度40→等待队列45是raw锁序。双队列迁移按地址顺序取得保护，锁内不通知任务。raw不跨架构切换，不允许调度、分配、I/O、用户复制或外部回调。
@@ -376,7 +399,7 @@ futex 的直接宿主入口 `make test-futex-host` 运行真实 MM、park、桶�
 
 聚焦入口为 `make test-stack-usage`、`make test-scheduler-cases-riscv`、`make test-scheduler-riscv`、`make test-files-riscv` 和 `make test-signal-riscv`；`make test-userland-riscv` 验证真实 pthread、共享匿名 futex、bitset 绝对 realtime 等待在 stop/continue 后保留掩码和截止时刻。`make test-diff-abi-riscv` 用同一 ELF 对照固定 Linux 的零掩码、超时、错误、按掩码唤醒和 requeue，以及共享文件别名、独立打开、硬链接、偏移隔离、SysV 和共享 robust 退出；`make test-glibc-riscv` 验证 glibc 2.44 的 `pthread_join` 消费路径。阶段收口使用 `make test-riscv`。各次实际通过范围以 README 和提交验证说明为准，不把实现路径存在等同于全部线程负载已验证。
 
-RV普通用户任务、共享匿名/文件MM及ext4文件操作支持真实1～8核，执行位置和后端并发范围见[多核模块](riscv-smp.md)。实时信号队列和sigaltstack已提供；PI条件重排与futex_waitv已接入；NUMA/MPOL等futex2扩展继续后续安排。LoongArch默认单核，`LA_SMP=1`支持QEMU virt上的真实1～4核执行，启动/IPI/TLB与停止规则见[LA模块](loongarch-boot.md#多核执行)；已覆盖整数context、timer抢占、信号、musl TLS/pthread、动态musl/DSO TLS、标量FPU与LSX/LASX。固定语义依据见学习总结的Linux commit与musl归档。
+RV普通用户任务、共享匿名/文件MM及ext4文件操作支持真实1～8核，执行位置和后端并发范围见[多核模块](riscv-smp.md)。实时信号队列和sigaltstack已提供；PI条件重排与futex_waitv已接入；NUMA/MPOL等futex2扩展继续后续安排。LoongArch默认单核，`LA_SMP=1`支持QEMU virt上的真实1～8核执行，启动/IPI/TLB与停止规则见[LA模块](loongarch-boot.md#多核执行)；已覆盖整数context、timer抢占、信号、musl TLS/pthread、动态musl/DSO TLS、标量FPU与LSX/LASX。固定语义依据见学习总结的Linux commit与musl归档。
 
 活动普通文件/TCP I/O 的单页暂存由任务持有并跨调用复用：首次使用时分配，调用期间登记在任务的 `io_buffer`，正常调用完成只解除登记。正常回收与构造失败共用栈上请求清理：先结束 epoll、socket read/write reservation 和 TTY 请求，再解除暂存登记，随后才释放 MM/文件表和任务栈；常驻页在任务最终存储释放时归还。页释放错误遵循物理分配器 fatal 不变量，不进入历史 cleanup 重试链。
 

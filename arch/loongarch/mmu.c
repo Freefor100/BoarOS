@@ -419,7 +419,7 @@ enum arch_mmu_status arch_mmu_user_detach_range(
         end>ARCH_MMU_USER_LIMIT || ((start|end)&BOAROS_PAGE_MASK)) return ARCH_MMU_STATUS_INVALID;
     const uint64_t leaf_span=UINT64_C(1)<<25, middle_span=UINT64_C(1)<<36;
     if (cursor->phase==3 || start==end) return ARCH_MMU_STATUS_NOT_MAPPED;
-    if (!cursor->phase) { cursor->address=start & ~(leaf_span-1); cursor->phase=1; }
+    if (!cursor->phase) { cursor->address=start; cursor->phase=1; }
     /* MM metadata protection keeps these table pages owned for this call;
      * detached pages are not released until after the caller drops it. */
     uint64_t *root=table(s,s->root_address), *middle=0, *leaves=0;
@@ -428,21 +428,24 @@ enum arch_mmu_status arch_mmu_user_detach_range(
     while (visits<16 && batch->count<=KERNEL_MM_RETIRE_CAPACITY-3) {
         if (cursor->phase==2) {
             unsigned r=cursor->middle_address>>36;
-            if (!root[r]) return ARCH_MMU_STATUS_STATE;
+            /* The previous batch borrowed only a VA position. A disjoint
+             * modifier may have retired or replaced the current parent. */
+            if (!root[r]) { cursor->phase=1; continue; }
             if (middle_physical!=root[r]) {
                 middle_physical=root[r]; middle=table(s,middle_physical);
             }
-            /* 摘叶表后只在本middle段结束时检查一次；扫描同样受16项预算约束。 */
             visits++;
-            if (middle[cursor->scan++]) { cursor->phase=1; cursor->scan=0; continue; }
-            if (cursor->scan==ENTRIES) {
+            /* The final empty check shares qualification with parent
+             * removal; a saved empty prefix cannot authorize retirement. */
+            if (table_empty(middle)) {
                 kernel_mm_retirement_add(batch,root[r],1);
                 __atomic_store_n(&root[r],0,__ATOMIC_RELEASE);
-                s->table_pages--; cursor->phase=1; cursor->scan=0;
+                s->table_pages--;
             }
+            cursor->phase=1;
             continue;
         }
-        if (cursor->address>=end && !(cursor->address & (leaf_span-1))) { cursor->phase=3; return ARCH_MMU_STATUS_NOT_MAPPED; }
+        if (cursor->address>=end) { cursor->phase=3; return ARCH_MMU_STATUS_NOT_MAPPED; }
         uint64_t address=cursor->address;
         unsigned r=address>>36, m=(address>>25)&(ENTRIES-1);
         unsigned l=(address>>BOAROS_PAGE_SHIFT)&(ENTRIES-1);
@@ -477,20 +480,18 @@ enum arch_mmu_status arch_mmu_user_detach_range(
                 kernel_mm_retirement_add(batch,physical,0);
                 if (old&PTE_NONE) s->protected_pages--; else s->leaf_pages--;
                 if (old&PTE_COW) s->cow_pages--;
-            } else if (old) cursor->occupied=1;
+            }
             cursor->address+=BOAROS_PAGE_SIZE;
-            /* 末尾范围外的叶也只检查一次，不能提前结束而误回收部分使用的表。 */
-            if (l+1<ENTRIES) continue;
-            if (!cursor->occupied) {
+            if (l+1<ENTRIES && cursor->address<end) continue;
+            if (table_empty(leaves)) {
                 kernel_mm_retirement_add(batch,middle[m],1);
                 __atomic_store_n(&middle[m],0,__ATOMIC_RELEASE);
                 s->table_pages--;
             }
-            cursor->occupied=0;
         }
         if ((cursor->address>>36)!=r || cursor->address>=end) {
             cursor->middle_address=(uint64_t)r<<36;
-            cursor->phase=2; cursor->scan=0;
+            cursor->phase=2;
         }
     }
     return ARCH_MMU_STATUS_OK;

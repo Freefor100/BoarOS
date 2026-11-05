@@ -26,7 +26,7 @@
 #define CHECK(x) do { if(!(x)){dprintf(2,"EVENT FAIL line=%d %s errno=%d\n",__LINE__,#x,errno);exit(1);} }while(0)
 static void expect(ssize_t value,int error){CHECK(value==-1&&errno==error);}
 static void put(int fd,uint64_t value){CHECK(write(fd,&value,8)==8);}
-static uint64_t get(int fd){uint64_t value;CHECK(read(fd,&value,8)==8);return value;}
+static uint64_t get(int fd){uint64_t value=0;CHECK(read(fd,&value,8)==8);return value;}
 static void event_counter(void)
 {
     int fd=eventfd(3,EFD_NONBLOCK|EFD_CLOEXEC);CHECK(fd>=0);CHECK(fcntl(fd,F_GETFD)==FD_CLOEXEC);
@@ -88,10 +88,17 @@ static void timer_fault(void)
 #ifndef EVENT_SMOKE
 #define EVENT_SMOKE 0
 #endif
-static unsigned cpus;
+static unsigned cpus,cpu_ids[8];
+static const char *self_path;
 static struct composition_control *control;
 static int control_fd=-1;
-static void pin(unsigned cpu){uint64_t mask=UINT64_C(1)<<cpu;CHECK(!syscall(SYS_sched_setaffinity,0,sizeof(mask),&mask));}
+static unsigned pin(unsigned cpu)
+{
+ uint64_t mask=UINT64_C(1)<<cpu_ids[cpu],actual=0;unsigned observed=UINT32_MAX;
+ CHECK(!syscall(SYS_sched_setaffinity,0,sizeof(mask),&mask));
+ CHECK(syscall(SYS_sched_getaffinity,0,sizeof(actual),&actual)>=0&&actual==mask);
+ CHECK(!syscall(SYS_getcpu,&observed,0,0)&&observed==cpu_ids[cpu]);return observed;
+}
 static void gate(pthread_barrier_t *b){int r=pthread_barrier_wait(b);CHECK(!r||r==PTHREAD_BARRIER_SERIAL_THREAD);}
 static void observe(void)
 {
@@ -105,56 +112,58 @@ static int epcreate(int fd)
 {int ep=epoll_create1(0);CHECK(ep>=0);struct epoll_event e={.events=EPOLLIN,.data.u64=42};CHECK(!epoll_ctl(ep,EPOLL_CTL_ADD,fd,&e));return ep;}
 static uint64_t receive(int fd,int ep)
 {if(ep>=0){struct epoll_event e;CHECK(epoll_wait(ep,&e,1,-1)==1&&(e.events&EPOLLIN));}return get(fd);}
-struct channel {int fd[2],ep[2];unsigned id,rounds;pthread_barrier_t *gate;uint64_t start[2],end[2],samples[1024];};
+struct channel {int fd[2],ep[2];unsigned id,rounds,performance,cpu[2];pthread_barrier_t *gate;uint64_t start[2],end[2],cpu_ns[2],samples[1024];};
 struct actor {struct channel *channel;unsigned side;};
 static void *exchange(void *argument)
 {
-    struct actor *a=argument;struct channel *c=a->channel;unsigned side=a->side;pin((c->id+side)%cpus);gate(c->gate);c->start[side]=nsclock(CLOCK_MONOTONIC);
+    struct actor *a=argument;struct channel *c=a->channel;unsigned side=a->side;c->cpu[side]=pin(((c->performance?2*c->id:c->id)+side)%cpus);gate(c->gate);uint64_t cpu=nsclock(CLOCK_THREAD_CPUTIME_ID);c->start[side]=nsclock(CLOCK_MONOTONIC);
     for(unsigned i=0;i<c->rounds;i++) {
         uint64_t n=(uint64_t)i*4+c->id+1,t=nsclock(CLOCK_MONOTONIC);
         if(!side){put(c->fd[0],n);CHECK(receive(c->fd[1],c->ep[1])==n);c->samples[i]=nsclock(CLOCK_MONOTONIC)-t;}
         else {CHECK(receive(c->fd[0],c->ep[0])==n);put(c->fd[1],n);}
     }
-    c->end[side]=nsclock(CLOCK_MONOTONIC);return 0;
+    c->end[side]=nsclock(CLOCK_MONOTONIC);c->cpu_ns[side]=nsclock(CLOCK_THREAD_CPUTIME_ID)-cpu;return 0;
 }
 static int compare(const void *a,const void *b){uint64_t x=*(const uint64_t *)a,y=*(const uint64_t *)b;return(x>y)-(x<y);}
-static uint64_t cpu_us(struct rusage *u);
 static void event_group(int epoll,int perf)
 {
     struct channel *c=calloc(4,sizeof(*c));CHECK(c);pthread_t threads[8];struct actor actors[8];pthread_barrier_t b;CHECK(!pthread_barrier_init(&b,0,8));
-    for(unsigned i=0;i<4;i++){c[i].id=i;c[i].rounds=perf?1024:32;c[i].gate=&b;for(unsigned j=0;j<2;j++){c[i].fd[j]=eventfd(0,0);CHECK(c[i].fd[j]>=0);c[i].ep[j]=epoll?epcreate(c[i].fd[j]):-1;}}
-    struct rusage cpu_start;CHECK(!getrusage(RUSAGE_SELF,&cpu_start));
+    for(unsigned i=0;i<4;i++){c[i].id=i;c[i].performance=(unsigned)perf;c[i].rounds=perf?1024:32;c[i].gate=&b;for(unsigned j=0;j<2;j++){c[i].fd[j]=eventfd(0,0);CHECK(c[i].fd[j]>=0);c[i].ep[j]=epoll?epcreate(c[i].fd[j]):-1;}}
     for(unsigned i=0;i<8;i++){actors[i]=(struct actor){&c[i/2],i%2};CHECK(!pthread_create(&threads[i],0,exchange,&actors[i]));}
     for(unsigned i=0;i<8;i++)CHECK(!pthread_join(threads[i],0));
-    uint64_t begin=UINT64_MAX,end=0,samples[4096];unsigned count=0;
-    for(unsigned i=0;i<4;i++){for(unsigned j=0;j<2;j++){if(c[i].start[j]<begin)begin=c[i].start[j];if(c[i].end[j]>end)end=c[i].end[j];CHECK(!close(c[i].fd[j]));if(c[i].ep[j]>=0)CHECK(!close(c[i].ep[j]));}for(unsigned j=0;j<c[i].rounds;j++)samples[count++]=c[i].samples[j];}
+    uint64_t begin=UINT64_MAX,end=0,cpu=0,samples[4096];unsigned count=0;
+    for(unsigned i=0;i<4;i++){for(unsigned j=0;j<2;j++){if(c[i].start[j]<begin)begin=c[i].start[j];if(c[i].end[j]>end)end=c[i].end[j];cpu+=c[i].cpu_ns[j];if(perf)printf("EVENT-PERF ACTOR name=eventfd-%s actor=%u cpu=%u affinity=%llx cpu_ns=%llu\n",epoll?"epoll":"direct",2*i+j,c[i].cpu[j],(unsigned long long)(UINT64_C(1)<<c[i].cpu[j]),(unsigned long long)c[i].cpu_ns[j]);CHECK(!close(c[i].fd[j]));if(c[i].ep[j]>=0)CHECK(!close(c[i].ep[j]));}for(unsigned j=0;j<c[i].rounds;j++)samples[count++]=c[i].samples[j];}
     qsort(samples,count,sizeof(*samples),compare);struct rusage u;CHECK(!getrusage(RUSAGE_SELF,&u));
-    if(perf)printf("EVENT-PERF name=eventfd-%s count=%u ns=%llu p50=%llu p95=%llu max=%llu ticks=0 cpu_us=%llu rss_kib=%ld\n",epoll?"epoll":"direct",count,(unsigned long long)(end-begin),(unsigned long long)samples[(count-1)/2],(unsigned long long)samples[(count*95-1)/100],(unsigned long long)samples[count-1],(unsigned long long)(cpu_us(&u)-cpu_us(&cpu_start)),u.ru_maxrss);
+    if(perf)printf("EVENT-PERF name=eventfd-%s count=%u ns=%llu p50=%llu p95=%llu max=%llu ticks=0 cpu_us=%llu rss_kib=%ld\n",epoll?"epoll":"direct",count,(unsigned long long)(end-begin),(unsigned long long)samples[(count-1)/2],(unsigned long long)samples[(count*95-1)/100],(unsigned long long)samples[count-1],(unsigned long long)(cpu/1000),u.ru_maxrss);
     else printf("EVENT CASE eventfd-%s OK\n",epoll?"epoll":"direct");
     CHECK(!pthread_barrier_destroy(&b));free(c);
 }
-struct timer_actor {int fd,ep;unsigned id,rounds;pthread_barrier_t *gate;uint64_t begin,end,ticks,samples[128];};
+struct timer_actor {int fd,ep;unsigned id,rounds,cpu;pthread_barrier_t *gate;uint64_t begin,end,ticks,cpu_ns,samples[128];};
 static void *timer_reader(void *argument)
 {
-    struct timer_actor *a=argument;pin(a->id%cpus);gate(a->gate);
+    struct timer_actor *a=argument;a->cpu=pin(a->id%cpus);gate(a->gate);uint64_t cpu=nsclock(CLOCK_THREAD_CPUTIME_ID);
     uint64_t target=nsclock(CLOCK_MONOTONIC)+2000000,seen=0;
     struct itimerspec setting={.it_interval={0,2000000},.it_value={(time_t)(target/1000000000),(long)(target%1000000000)}};
     CHECK(!timerfd_settime(a->fd,TFD_TIMER_ABSTIME,&setting,0));a->begin=nsclock(CLOCK_MONOTONIC);
-    for(unsigned i=0;i<a->rounds;i++){uint64_t n=receive(a->fd,a->ep);CHECK(n);seen+=n;uint64_t now=nsclock(CLOCK_MONOTONIC),due=target+(seen-1)*2000000;CHECK(now>=due);a->samples[i]=now-due;}
-    a->ticks=seen;a->end=nsclock(CLOCK_MONOTONIC);return 0;
+    for(unsigned i=0;i<a->rounds;i++) {
+        /* Keep accumulated expirations visible: lateness starts at the oldest
+         * pending expiration, before this read consumes its returned ticks. */
+        uint64_t due=target+seen*2000000,n=receive(a->fd,a->ep);CHECK(n);seen+=n;
+        uint64_t now=nsclock(CLOCK_MONOTONIC);CHECK(now>=target+(seen-1)*2000000);
+        a->samples[i]=now-due;
+    }
+    a->ticks=seen;a->end=nsclock(CLOCK_MONOTONIC);a->cpu_ns=nsclock(CLOCK_THREAD_CPUTIME_ID)-cpu;return 0;
 }
-static uint64_t cpu_us(struct rusage *u){return(uint64_t)u->ru_utime.tv_sec*1000000+u->ru_utime.tv_usec+(uint64_t)u->ru_stime.tv_sec*1000000+u->ru_stime.tv_usec;}
 static void timer_group(int epoll,int perf)
 {
     struct timer_actor a[4]={0};pthread_t threads[4];pthread_barrier_t b;CHECK(!pthread_barrier_init(&b,0,4));
     for(unsigned i=0;i<4;i++){a[i].fd=timerfd_create(CLOCK_MONOTONIC,0);CHECK(a[i].fd>=0);a[i].ep=epoll?epcreate(a[i].fd):-1;a[i].gate=&b;a[i].id=i;a[i].rounds=perf?128:4;}
-    struct rusage before,after;CHECK(!getrusage(RUSAGE_SELF,&before));
     for(unsigned i=0;i<4;i++)CHECK(!pthread_create(&threads[i],0,timer_reader,&a[i]));
     for(unsigned i=0;i<4;i++)CHECK(!pthread_join(threads[i],0));
-    CHECK(!getrusage(RUSAGE_SELF,&after));uint64_t begin=UINT64_MAX,end=0,ticks=0,samples[512];unsigned count=0;
-    for(unsigned i=0;i<4;i++){if(a[i].begin<begin)begin=a[i].begin;if(a[i].end>end)end=a[i].end;ticks+=a[i].ticks;for(unsigned j=0;j<a[i].rounds;j++)samples[count++]=a[i].samples[j];CHECK(!close(a[i].fd));if(a[i].ep>=0)CHECK(!close(a[i].ep));}
+    struct rusage after;CHECK(!getrusage(RUSAGE_SELF,&after));uint64_t begin=UINT64_MAX,end=0,ticks=0,cpu=0,samples[512];unsigned count=0;
+    for(unsigned i=0;i<4;i++){if(a[i].begin<begin)begin=a[i].begin;if(a[i].end>end)end=a[i].end;ticks+=a[i].ticks;cpu+=a[i].cpu_ns;if(perf)printf("EVENT-PERF ACTOR name=timerfd-%s actor=%u cpu=%u affinity=%llx cpu_ns=%llu\n",epoll?"epoll":"direct",i,a[i].cpu,(unsigned long long)(UINT64_C(1)<<a[i].cpu),(unsigned long long)a[i].cpu_ns);for(unsigned j=0;j<a[i].rounds;j++)samples[count++]=a[i].samples[j];CHECK(!close(a[i].fd));if(a[i].ep>=0)CHECK(!close(a[i].ep));}
     qsort(samples,count,sizeof(*samples),compare);
-    if(perf)printf("EVENT-PERF name=timerfd-%s count=%u ns=%llu p50=%llu p95=%llu max=%llu ticks=%llu cpu_us=%llu rss_kib=%ld\n",epoll?"epoll":"direct",count,(unsigned long long)(end-begin),(unsigned long long)samples[(count-1)/2],(unsigned long long)samples[(count*95-1)/100],(unsigned long long)samples[count-1],(unsigned long long)ticks,(unsigned long long)(cpu_us(&after)-cpu_us(&before)),after.ru_maxrss);
+    if(perf)printf("EVENT-PERF name=timerfd-%s count=%u ns=%llu latency=oldest-pending-lateness p50=%llu p95=%llu max=%llu ticks=%llu cpu_us=%llu rss_kib=%ld\n",epoll?"epoll":"direct",count,(unsigned long long)(end-begin),(unsigned long long)samples[(count-1)/2],(unsigned long long)samples[(count*95-1)/100],(unsigned long long)samples[count-1],(unsigned long long)ticks,(unsigned long long)(cpu/1000),after.ru_maxrss);
     CHECK(!pthread_barrier_destroy(&b));
 }
 struct blocked {int fd,mode;unsigned cpu;uint64_t tid,value;ssize_t result;int error;};
@@ -190,14 +199,17 @@ static void lifecycle(void)
   }
  }
  int fd=eventfd(1,EFD_NONBLOCK),alias=dup(fd);CHECK(fd>=0&&alias>=0&&!fcntl(alias,F_SETFD,FD_CLOEXEC));
- pid_t child=fork();CHECK(child>=0);if(!child){char a[24],b[24];snprintf(a,sizeof(a),"%d",fd);snprintf(b,sizeof(b),"%d",alias);execl("/init","/init","--exec-event",a,b,(char *)0);_exit(2);}int status;CHECK(waitpid(child,&status,0)==child&&WIFEXITED(status)&&!WEXITSTATUS(status));uint64_t value;expect(read(fd,&value,8),EAGAIN);CHECK(!close(fd)&&!close(alias));
+ pid_t child=fork();CHECK(child>=0);if(!child){char a[24],b[24];snprintf(a,sizeof(a),"%d",fd);snprintf(b,sizeof(b),"%d",alias);execl(self_path,self_path,"--exec-event",a,b,(char *)0);_exit(2);}int status;CHECK(waitpid(child,&status,0)==child&&WIFEXITED(status)&&!WEXITSTATUS(status));uint64_t value;expect(read(fd,&value,8),EAGAIN);CHECK(!close(fd)&&!close(alias));
  puts("EVENT CASE lifecycle-close-reuse-signal-exec OK");
 }
 int main(int argc,char **argv)
 {
+ self_path=argv[0];
  if(argc==4&&!strcmp(argv[1],"--exec-event")){CHECK(fcntl(atoi(argv[2]),F_GETFD)==0);expect(fcntl(atoi(argv[3]),F_GETFD),EBADF);CHECK(get(atoi(argv[2]))==1);return 0;}
- setvbuf(stdout,0,_IONBF,0);alarm(30);uint64_t mask=0;CHECK(syscall(SYS_sched_getaffinity,0,sizeof(mask),&mask)>=0);cpus=__builtin_popcountll(mask);CHECK(cpus&&cpus<=4);
- int perf=!access("/event-perf",F_OK);if(!perf){CHECK(!mkdir("/proc",0755)||errno==EEXIST);CHECK(!mount("proc","/proc","proc",0,0)||errno==EBUSY);observe();event_counter();event_vectors();timer_basic();timer_fault();}
+ setvbuf(stdout,0,_IONBF,0);alarm(30);int perf=!access("/event-perf",F_OK);uint64_t mask=0;
+ CHECK(syscall(SYS_sched_getaffinity,0,sizeof(mask),&mask)>=0);cpus=__builtin_popcountll(mask);CHECK(cpus&&cpus<=(perf?8U:4U));
+ unsigned found=0;for(unsigned i=0;i<64;i++)if(mask&(UINT64_C(1)<<i))cpu_ids[found++]=i;
+ if(!perf){CHECK(!mkdir("/proc",0755)||errno==EEXIST);CHECK(!mount("proc","/proc","proc",0,0)||errno==EBUSY);observe();event_counter();event_vectors();timer_basic();timer_fault();}
  event_group(0,perf);event_group(1,perf);timer_group(0,perf);timer_group(1,perf);
  if(!perf){puts("EVENT CASE timerfd-remote OK");lifecycle();}
  pin(0);if(control){uint64_t next=composition_load(&control->request)+1;composition_store(&control->command,COMPOSITION_STOP);composition_store(&control->request,next);while(composition_load(&control->reply)!=next)sched_yield();CHECK(!munmap(control,4096)&&!close(control_fd)&&!unlink("/dev/shm/smp-control"));}

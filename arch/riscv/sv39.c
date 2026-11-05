@@ -1252,6 +1252,13 @@ static enum riscv_sv39_status resolve_existing_user_leaf(
                         : RISCV_SV39_STATUS_OK;
 }
 
+static int runtime_table_empty(const uint64_t *entries)
+{
+    for (unsigned i=0;i<BOAROS_PAGE_SIZE/sizeof(*entries);i++)
+        if (entries[i]) return 0;
+    return 1;
+}
+
 enum riscv_sv39_status riscv_sv39_user_detach_range(
     struct riscv_sv39_user_space *s, uint64_t start, uint64_t end,
     struct kernel_mm_detach_cursor *cursor, struct kernel_mm_retirement *batch,
@@ -1261,7 +1268,7 @@ enum riscv_sv39_status riscv_sv39_user_detach_range(
         end>RISCV_SV39_USER_LIMIT || ((start|end)&BOAROS_PAGE_MASK)) return RISCV_SV39_STATUS_INVALID;
     const uint64_t leaf_span=UINT64_C(1)<<21, middle_span=UINT64_C(1)<<30;
     if (cursor->phase==3 || start==end) return RISCV_SV39_STATUS_NOT_MAPPED;
-    if (!cursor->phase) { cursor->address=start & ~(leaf_span-1); cursor->phase=1; }
+    if (!cursor->phase) { cursor->address=start; cursor->phase=1; }
     unsigned visits=0;
     while (visits<16 && batch->count<=KERNEL_MM_RETIRE_CAPACITY-3) {
         uint64_t *root;
@@ -1269,22 +1276,26 @@ enum riscv_sv39_status riscv_sv39_user_detach_range(
         if (status) return status;
         if (cursor->phase==2) {
             unsigned r=cursor->middle_address>>30;
-            if (!root[r]) return RISCV_SV39_STATUS_STATE;
+            /* Another disjoint range may have retired or replaced this
+             * parent between batches. Only the currently published table
+             * can be inspected, and it need not exist anymore. */
+            if (!root[r]) { cursor->phase=1; continue; }
             if (!valid_nonleaf_entry(root[r])) return RISCV_SV39_STATUS_STATE;
             uint64_t *middle;
             status=resolve_runtime_table(s->allocator,entry_address(root[r]),&middle);
             if (status) return status;
-            /* 摘叶表后只在本middle段结束时检查一次；扫描同样受16项预算约束。 */
             visits++;
-            if (middle[cursor->scan++]) { cursor->phase=1; cursor->scan=0; continue; }
-            if (cursor->scan==512) {
+            /* Empty prefixes are not stable across MM qualification. Check
+             * the actual entire table in the same scope that detaches it. */
+            if (runtime_table_empty(middle)) {
                 kernel_mm_retirement_add(batch,entry_address(root[r]),1);
                 __atomic_store_n(&root[r],0,__ATOMIC_RELEASE);
-                s->table_pages--; cursor->phase=1; cursor->scan=0;
+                s->table_pages--;
             }
+            cursor->phase=1;
             continue;
         }
-        if (cursor->address>=end && !(cursor->address & (leaf_span-1))) { cursor->phase=3; return RISCV_SV39_STATUS_NOT_MAPPED; }
+        if (cursor->address>=end) { cursor->phase=3; return RISCV_SV39_STATUS_NOT_MAPPED; }
         uint64_t address=cursor->address;
         unsigned r=address>>30, m=(address>>21)&(512-1);
         unsigned l=(address>>BOAROS_PAGE_SHIFT)&(512-1);
@@ -1322,20 +1333,18 @@ enum riscv_sv39_status riscv_sv39_user_detach_range(
                 kernel_mm_retirement_add(batch,physical,0);
                 if (present) s->leaf_pages--; else s->protected_pages--;
                 if (cow) s->cow_pages--;
-            } else if (old) cursor->occupied=1;
+            }
             cursor->address+=BOAROS_PAGE_SIZE;
-            /* 末尾范围外的叶也只检查一次，不能提前结束而误回收部分使用的表。 */
-            if (l+1<512) continue;
-            if (!cursor->occupied) {
+            if (l+1<512 && cursor->address<end) continue;
+            if (runtime_table_empty(leaves)) {
                 kernel_mm_retirement_add(batch,entry_address(middle[m]),1);
                 __atomic_store_n(&middle[m],0,__ATOMIC_RELEASE);
                 s->table_pages--;
             }
-            cursor->occupied=0;
         }
         if ((cursor->address>>30)!=r || cursor->address>=end) {
             cursor->middle_address=(uint64_t)r<<30;
-            cursor->phase=2; cursor->scan=0;
+            cursor->phase=2;
         }
     }
     return RISCV_SV39_STATUS_OK;

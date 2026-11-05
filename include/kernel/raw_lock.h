@@ -42,6 +42,49 @@ static inline void kernel_raw_scope_release(struct kernel_raw_guard *guard)
     name.lock = 0; \
     kernel_raw_lock_acquire((object), &name)
 
+/* Short stable views share qualification; writers close admission before
+ * draining readers. Only users of this type pay for reader bookkeeping. */
+struct kernel_raw_rwlock {
+    struct kernel_raw_lock writer;
+#if BOAROS_MAX_CPUS > 1
+    uint32_t readers;
+#endif
+};
+struct kernel_raw_read_guard {
+    struct kernel_raw_guard raw;
+#if BOAROS_MAX_CPUS > 1
+    struct kernel_raw_rwlock *lock;
+#endif
+};
+#if BOAROS_MAX_CPUS > 1
+void kernel_raw_rwlock_init(struct kernel_raw_rwlock *, uint32_t rank);
+void kernel_raw_rwlock_write_acquire(struct kernel_raw_rwlock *, struct kernel_raw_guard *);
+void kernel_raw_rwlock_read_acquire(struct kernel_raw_rwlock *, struct kernel_raw_read_guard *);
+void kernel_raw_rwlock_read_release(struct kernel_raw_read_guard *);
+#else
+/* UP直接复用原raw实现；读写资格不增加运行时转调和读者状态。 */
+static inline void kernel_raw_rwlock_init(struct kernel_raw_rwlock *lock, uint32_t rank)
+{ kernel_raw_lock_init(&lock->writer, rank); }
+static inline void kernel_raw_rwlock_write_acquire(struct kernel_raw_rwlock *lock,
+    struct kernel_raw_guard *guard)
+{ kernel_raw_lock_acquire(&lock->writer, guard); }
+static inline void kernel_raw_rwlock_read_acquire(struct kernel_raw_rwlock *lock,
+    struct kernel_raw_read_guard *guard)
+{ kernel_raw_lock_acquire(&lock->writer, &guard->raw); }
+static inline void kernel_raw_rwlock_read_release(struct kernel_raw_read_guard *guard)
+{ kernel_raw_lock_release(&guard->raw); }
+#endif
+static inline void kernel_raw_read_scope_release(struct kernel_raw_read_guard *guard)
+{ if (guard->raw.lock) kernel_raw_rwlock_read_release(guard); }
+#define KERNEL_RAW_WRITE_SCOPE(name, object) \
+    struct kernel_raw_guard name __attribute__((cleanup(kernel_raw_scope_release))); \
+    name.lock = 0; \
+    kernel_raw_rwlock_write_acquire((object), &name)
+#define KERNEL_RAW_READ_SCOPE(name, object) \
+    struct kernel_raw_read_guard name __attribute__((cleanup(kernel_raw_read_scope_release))); \
+    name.raw.lock = 0; \
+    kernel_raw_rwlock_read_acquire((object), &name)
+
 /* Object state used only by tasks needs no IRQ masking in a UP build.
  * IRQ-shared state also masks local interrupts. Both reject blocking and retain
  * full raw ownership/rank/cost records in SMP or diagnostic configurations. */

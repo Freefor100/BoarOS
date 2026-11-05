@@ -59,7 +59,7 @@ enum kernel_mm_cleanup_stage {
 };
 
 /* 句柄拥有MM记录引用，lookup返回映射快照而不取得物理页pin。
- * 所有映射编辑共用gate，PTE/resident/pin由MM raw发布；驻留pin不取得gate。
+ * 所有映射编辑共用gate，PTE/resident/许可由MM raw写资格发布；驻留pin共享短读资格。
  * 活动CPU失效确认后才回收，实际后端I/O留在CPU0。句柄不能被其他执行者并发move/release。
  * MM引用只保证记录存活，lookup快照不能代替访问片段的实际页引用。 */
 struct kernel_mm {
@@ -81,7 +81,7 @@ struct kernel_mm_mapping {
 };
 
 /* resident片段的实际页owner；caller的LIVE MM句柄须保持到unpin。
- * lookup、权限许可与acquire在同一MM raw内完成，复制在raw外进行。
+ * lookup、权限许可与acquire在同一MM raw读资格内完成，复制在资格外进行。
  * pin不固定映射身份/内容；不能复制token，也不能由另一任务归还。
  * 非resident/COW权限返回NOT_MAPPED/ACCESS，由caller fault后重新pin。
  * token首次使用须零初始化，成功才发布；失败不修改输出。重复pin或非法unpin fatal。

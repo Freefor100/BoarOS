@@ -221,7 +221,12 @@ static void handoff_and_timeout(void)
     kernel_wait_node_init_callback(&poll_node,queue_changed,0);
     kernel_wait_queue_add(&q->waiters,&poll_node);
     struct worker w={.fd=fd};waiting=0;assert(!pthread_create(&thread,0,run_worker,&w));await_waiter();
-    assert(!notifyq(fd,0,36,44));assert(!sendq(fd,"direct",7,1));assert(!pthread_join(thread,0));
+    assert(!notifyq(fd,0,36,44));
+    /* One available allocation must hold a short payload delivered to an
+     * existing receiver; no priority bucket or second payload owner is needed. */
+    allocation_calls=0;fail_at=1;
+    assert(!sendq(fd,"direct",7,1));fail_at=-1;
+    assert(!pthread_join(thread,0));
     assert(w.result==7&&!strcmp(w.text,"direct")&&signal_count==1&&q->notification.owner);
     assert(queue_callbacks==0);
     assert(!sendq(fd,"fill",5,0));assert(signal_count==2&&queue_callbacks==1);

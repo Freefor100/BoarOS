@@ -84,6 +84,76 @@ static void range_detach(void)
     assert(!space.leaf_pages && !space.protected_pages && !space.cow_pages && space.table_pages==1);
     assert(!arch_mmu_user_space_destroy(&child) && !arch_mmu_user_space_destroy(&space));
 }
+static void detach_neighbor_publication(void)
+{
+    struct arch_mmu_user_space space={0};
+    assert(!arch_mmu_user_space_init(&space,&pages,&kernel));
+    uint64_t neighbor=UINT64_C(0x400000), start=neighbor+BOAROS_PAGE_SIZE;
+    uint64_t end=start+17*BOAROS_PAGE_SIZE;
+    for (uint64_t at=start;at<end;at+=BOAROS_PAGE_SIZE)
+        assert(!arch_mmu_user_map_zeroed_page(&space,at,ARCH_MMU_READ|ARCH_MMU_WRITE));
+    struct kernel_mm_detach_cursor cursor={0};
+    struct kernel_mm_retirement batch={0};
+    assert(arch_mmu_user_detach_range(&space,start,end,&cursor,&batch,0,0)==ARCH_MMU_STATUS_OK);
+    assert(batch.count);drain(&batch);
+    /* Another range publishes behind the completed scan prefix. Its PTE and
+     * physical owner must survive the first range's later table retirement. */
+    assert(!arch_mmu_user_map_zeroed_page(&space,neighbor,ARCH_MMU_READ|ARCH_MMU_WRITE));
+    struct arch_mmu_mapping mapping;
+    assert(!arch_mmu_user_lookup(&space,neighbor,&mapping));
+    *(uint64_t *)access(mapping.physical_address)=UINT64_C(0x5317c049);
+    enum arch_mmu_status status;
+    do {
+        batch=(struct kernel_mm_retirement){0};
+        status=arch_mmu_user_detach_range(&space,start,end,&cursor,&batch,0,0);
+        assert(status==ARCH_MMU_STATUS_OK || status==ARCH_MMU_STATUS_NOT_MAPPED);
+        if (batch.count) drain(&batch);
+    } while (status==ARCH_MMU_STATUS_OK);
+    assert(!arch_mmu_user_lookup(&space,neighbor,&mapping));
+    assert(*(uint64_t *)access(mapping.physical_address)==UINT64_C(0x5317c049));
+    assert(space.leaf_pages==1 && space.table_pages==3);
+    detach(&space,neighbor,neighbor+BOAROS_PAGE_SIZE,1);
+    assert(!arch_mmu_user_space_destroy(&space));
+    puts("MM detach preserves a neighbor published behind an earlier scan prefix");
+}
+static void detach_parent_replacement(void)
+{
+    for (unsigned replace=0;replace<2;replace++) {
+        struct arch_mmu_user_space space={0};
+        assert(!arch_mmu_user_space_init(&space,&pages,&kernel));
+        uint64_t end=UINT64_C(0x200000), start=end-14*BOAROS_PAGE_SIZE;
+        for (uint64_t at=start;at<end;at+=BOAROS_PAGE_SIZE)
+            assert(!arch_mmu_user_map_zeroed_page(&space,at,ARCH_MMU_READ|ARCH_MMU_WRITE));
+        struct kernel_mm_detach_cursor cursor={0};
+        enum arch_mmu_status status;
+        do {
+            struct kernel_mm_retirement batch={0};
+            status=arch_mmu_user_detach_range(&space,start,end,&cursor,&batch,0,0);
+            assert(status==ARCH_MMU_STATUS_OK);
+            if (batch.count) drain(&batch);
+        } while (space.leaf_pages);
+        assert(space.table_pages==2);
+        /* A second range finishes the now-empty parent's retirement. The
+         * suspended first cursor owns its VA position, never that old table. */
+        uint64_t neighbor=BOAROS_PAGE_SIZE;
+        detach(&space,neighbor,neighbor+BOAROS_PAGE_SIZE,0);
+        assert(space.table_pages==1);
+        if (replace) assert(!arch_mmu_user_map_zeroed_page(&space,neighbor,ARCH_MMU_READ|ARCH_MMU_WRITE));
+        do {
+            struct kernel_mm_retirement batch={0};
+            status=arch_mmu_user_detach_range(&space,start,end,&cursor,&batch,0,0);
+            assert(status==ARCH_MMU_STATUS_OK || status==ARCH_MMU_STATUS_NOT_MAPPED);
+            if (batch.count) drain(&batch);
+        } while (status==ARCH_MMU_STATUS_OK);
+        if (replace) {
+            struct arch_mmu_mapping mapping;
+            assert(!arch_mmu_user_lookup(&space,neighbor,&mapping));
+            detach(&space,neighbor,neighbor+BOAROS_PAGE_SIZE,1);
+        }
+        assert(space.table_pages==1 && !arch_mmu_user_space_destroy(&space));
+    }
+    puts("MM suspended detach accepts a retired or replaced parent table");
+}
 int main(void)
 {
     mm_test_attach(0);
@@ -123,6 +193,9 @@ int main(void)
     assert(physical_page_available(&pages) == baseline);
 
     range_detach();
+    assert(physical_page_available(&pages) == baseline);
+    detach_parent_replacement();
+    detach_neighbor_publication();
     assert(physical_page_available(&pages) == baseline);
 
     take_zero();

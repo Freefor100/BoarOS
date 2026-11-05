@@ -33,7 +33,11 @@ struct mq_message {
     struct mq_segment *segments;
     uint64_t size;
     uint32_t priority;
+    unsigned char data[];
 };
+/* The first payload belongs to the message allocation. Only overflow needs
+ * separate segments; a short direct delivery has one owner to allocate/free. */
+#define MQ_INLINE_DATA (4096U-sizeof(struct mq_message))
 struct mq_priority {
     struct kernel_avl_node node;
     struct mq_message *head,*tail;
@@ -474,15 +478,21 @@ static int request_wait(struct kernel_mqueue_request *r)
 static int message_import(struct kernel_mqueue_request *r,struct kernel_mm *mm,
     uint64_t address,uint64_t size,uint32_t priority)
 {
-    r->message=mq_allocate(sizeof(*r->message));if(!r->message)return -KERNEL_ENOMEM;
+    size_t first=size>MQ_INLINE_DATA?MQ_INLINE_DATA:(size_t)size;
+    r->message=mq_allocate(sizeof(*r->message)+first);if(!r->message)return -KERNEL_ENOMEM;
     r->message->size=size;r->message->priority=priority;
     struct mq_segment **next=&r->message->segments;
     uint64_t done=0;
+    unsigned char *target=r->message->data;
     while(done<size){
-        size_t n=size-done>MQ_SEGMENT_DATA?MQ_SEGMENT_DATA:(size_t)(size-done);
-        struct mq_segment *s=mq_allocate(sizeof(*s)+n);if(!s)return -KERNEL_ENOMEM;
-        *next=s;next=&s->next;size_t copied;
-        if(kernel_copy_from_user(mm,s->data,address+done,n,&copied))return -KERNEL_EFAULT;
+        size_t n=first;
+        if(done){
+            n=size-done>MQ_SEGMENT_DATA?MQ_SEGMENT_DATA:(size_t)(size-done);
+            struct mq_segment *s=mq_allocate(sizeof(*s)+n);if(!s)return -KERNEL_ENOMEM;
+            *next=s;next=&s->next;target=s->data;
+        }
+        size_t copied;
+        if(kernel_copy_from_user(mm,target,address+done,n,&copied))return -KERNEL_EFAULT;
         done+=n;
     }
     return 0;
@@ -595,10 +605,17 @@ int64_t kernel_mqueue_receive(struct kernel_task *task,struct kernel_mm *mm,int6
     if(!error){
         size_t copied;uint64_t done_bytes=0;
         if(priority && kernel_copy_to_user(mm,priority,&r->message->priority,sizeof(uint32_t),&copied))error=-KERNEL_EFAULT;
-        for(struct mq_segment *s=r->message->segments;s&&!error;s=s->next){
-            size_t n=r->message->size-done_bytes>MQ_SEGMENT_DATA?MQ_SEGMENT_DATA:(size_t)(r->message->size-done_bytes);
-            if(kernel_copy_to_user(mm,data+done_bytes,s->data,n,&copied))error=-KERNEL_EFAULT;
+        const unsigned char *source=r->message->data;
+        struct mq_segment *segment=r->message->segments;
+        while(done_bytes<r->message->size&&!error){
+            size_t capacity=done_bytes?MQ_SEGMENT_DATA:MQ_INLINE_DATA;
+            size_t n=r->message->size-done_bytes>capacity?capacity:(size_t)(r->message->size-done_bytes);
+            if(kernel_copy_to_user(mm,data+done_bytes,source,n,&copied))error=-KERNEL_EFAULT;
             done_bytes+=n;
+            if(done_bytes<r->message->size){
+                if(!segment)__builtin_trap();
+                source=segment->data;segment=segment->next;
+            }
         }
         if(!error){int64_t result=(int64_t)r->message->size;request_finish(r);return result;}
     }

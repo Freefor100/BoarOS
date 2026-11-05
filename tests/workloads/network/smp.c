@@ -29,7 +29,7 @@
 #include "../../smp/composition_protocol.h"
 static struct composition_control *control;
 static int control_fd=-1;
-static unsigned cpus;
+static unsigned cpus,cpu_ids[8];
 static unsigned performance_style;
 static void command(unsigned action,uint64_t tid)
 {
@@ -48,7 +48,13 @@ static void observe_start(void)
     while(!composition_load(&control->observer_ready))sched_yield();
 }
 static uint64_t ns(void) { struct timespec t; CHECK(!clock_gettime(CLOCK_MONOTONIC,&t)); return (uint64_t)t.tv_sec*1000000000U+t.tv_nsec; }
-static void pin(unsigned cpu) { uint64_t mask=UINT64_C(1)<<cpu; CHECK(!syscall(SYS_sched_setaffinity,0,sizeof(mask),&mask)); }
+static unsigned pin(unsigned cpu)
+{
+    uint64_t mask=UINT64_C(1)<<cpu_ids[cpu],actual=0;unsigned observed=UINT32_MAX;
+    CHECK(!syscall(SYS_sched_setaffinity,0,sizeof(mask),&mask));
+    CHECK(syscall(SYS_sched_getaffinity,0,sizeof(actual),&actual)>=0 && actual==mask);
+    CHECK(!syscall(SYS_getcpu,&observed,NULL,NULL) && observed==cpu_ids[cpu]);return observed;
+}
 static void barrier(pthread_barrier_t *b) { int r=pthread_barrier_wait(b); CHECK(!r || r==PTHREAD_BARRIER_SERIAL_THREAD); }
 static void endpoints(int fds[2],int domain,int type)
 {
@@ -93,28 +99,36 @@ static void exact(int fd,void *bytes,size_t size,int writing,unsigned style)
         done+=(size_t)n;
     }
 }
-struct channel { int fd[2],dgram,performance;unsigned id,rounds,pairs;pthread_barrier_t *gate;uint64_t start[2],end[2],samples[1024]; };
+struct channel { int fd[2],dgram,performance;unsigned id,rounds,pairs,cpu[2];pthread_barrier_t *gate;uint64_t start[2],end[2],cpu_ns[2],samples[1024]; };
 struct actor { struct channel *channel;unsigned side; };
 static void *traffic(void *arg)
 {
     struct actor *actor=arg;struct channel *c=actor->channel;unsigned side=actor->side;
-    pin((c->id+side)%cpus);
+    c->cpu[side]=pin(((c->performance?2*c->id:c->id)+side)%cpus);
     size_t block=c->performance && !c->dgram?(performance_style==4?4096:65536):64;
     size_t storage=performance_style==4 && !side?block*2:block;
-    unsigned char *bytes=malloc(storage);CHECK(bytes);memset(bytes,(int)(0x30+c->id),storage);
+    int stream=c->performance&&!c->dgram;
+    unsigned char *bytes=malloc(storage);CHECK(bytes);memset(bytes,stream&&side?0xcc:(int)(0x30+c->id),storage);
     if(performance_style==4 && !side) for(size_t at=64;at<storage;at+=128)memset(bytes+at,0xee,64);
-    barrier(c->gate);c->start[side]=ns();
+    barrier(c->gate);struct timespec usage;CHECK(!clock_gettime(CLOCK_THREAD_CPUTIME_ID,&usage));
+    uint64_t cpu=(uint64_t)usage.tv_sec*1000000000+usage.tv_nsec;c->start[side]=ns();
     for(unsigned i=0;i<c->rounds;i++) {
-        unsigned style=c->performance?performance_style:i%4;uint64_t start=ns();
+        unsigned style=c->performance?performance_style:i%4;uint64_t sequence=((uint64_t)(c->id+1)<<32)|(i+1),start=ns();
+        if(stream&&!side)memcpy(bytes,&sequence,sizeof(sequence));
         if(c->dgram) {
             if(!side) { CHECK(transfer(c->fd[0],bytes,block,1,style)==(ssize_t)block);memset(bytes,0,block);CHECK(transfer(c->fd[0],bytes,block,0,style)==(ssize_t)block); }
             else { memset(bytes,0,block);CHECK(transfer(c->fd[1],bytes,block,0,style)==(ssize_t)block);for(size_t j=0;j<block;j++)CHECK(bytes[j]==0x30+c->id);CHECK(transfer(c->fd[1],bytes,block,1,style)==(ssize_t)block); }
         } else if(!side) exact(c->fd[0],bytes,block,1,style);
         else { exact(c->fd[1],bytes,block,0,style); }
-        if(side || c->dgram) for(size_t j=0;j<block;j++)CHECK(bytes[j]==0x30+c->id);
+        if(side || c->dgram) {
+            size_t first=0;
+            if(stream) {uint64_t actual;memcpy(&actual,bytes,sizeof(actual));CHECK(actual==sequence);first=sizeof(actual);}
+            for(size_t j=first;j<block;j++)CHECK(bytes[j]==0x30+c->id);
+        }
         if((c->dgram && !side) || (!c->dgram && side))c->samples[i]=ns()-start;
     }
-    c->end[side]=ns();free(bytes);return 0;
+    c->end[side]=ns();CHECK(!clock_gettime(CLOCK_THREAD_CPUTIME_ID,&usage));
+    c->cpu_ns[side]=(uint64_t)usage.tv_sec*1000000000+usage.tv_nsec-cpu;free(bytes);return 0;
 }
 static int compare(const void *a,const void *b) { uint64_t x=*(const uint64_t *)a,y=*(const uint64_t *)b;return (x>y)-(x<y); }
 static void group(const char *name,int domain,int type,unsigned pairs,int performance)
@@ -126,11 +140,11 @@ static void group(const char *name,int domain,int type,unsigned pairs,int perfor
     for(unsigned i=0;i<pairs;i++) { struct channel *c=&channels[i];endpoints(c->fd,domain,type);c->id=i;c->dgram=type==SOCK_DGRAM;c->performance=performance;c->pairs=pairs;c->rounds=rounds;c->gate=&gate; }
     for(unsigned i=0;i<pairs*2;i++) { actors[i]=(struct actor){&channels[i/2],i%2};CHECK(!pthread_create(&threads[i],0,traffic,&actors[i])); }
     for(unsigned i=0;i<pairs*2;i++)CHECK(!pthread_join(threads[i],0));
-    uint64_t start=UINT64_MAX,end=0,samples[4096];unsigned count=0;
-    for(unsigned i=0;i<pairs;i++) { struct channel *c=&channels[i];for(unsigned side=0;side<2;side++) { if(c->start[side]<start)start=c->start[side];if(c->end[side]>end)end=c->end[side]; }for(unsigned j=0;j<rounds;j++)samples[count++]=c->samples[j];CHECK(!close(c->fd[0]) && !close(c->fd[1])); }
+    uint64_t start=UINT64_MAX,end=0,cpu=0,samples[4096];unsigned count=0;
+    for(unsigned i=0;i<pairs;i++) { struct channel *c=&channels[i];for(unsigned side=0;side<2;side++) { if(c->start[side]<start)start=c->start[side];if(c->end[side]>end)end=c->end[side];cpu+=c->cpu_ns[side];if(performance)printf("SOCKET-PERF ACTOR name=%s actor=%u cpu=%u affinity=%llx cpu_ns=%llu\n",name,2*i+side,c->cpu[side],(unsigned long long)(UINT64_C(1)<<c->cpu[side]),(unsigned long long)c->cpu_ns[side]); }for(unsigned j=0;j<rounds;j++)samples[count++]=c->samples[j];CHECK(!close(c->fd[0]) && !close(c->fd[1])); }
     CHECK(!pthread_barrier_destroy(&gate));qsort(samples,count,sizeof(*samples),compare);
     struct rusage usage;CHECK(!getrusage(RUSAGE_SELF,&usage));
-    if(performance)printf("SOCKET-PERF name=%s pairs=%u bytes=%u count=%u ns=%llu p50=%llu p95=%llu max=%llu rss_kib=%ld\n",name,pairs,type==SOCK_DGRAM?4096U*64U*2U:16777216U,count,(unsigned long long)(end-start),(unsigned long long)samples[(count-1)/2],(unsigned long long)samples[(count*95-1)/100],(unsigned long long)samples[count-1],usage.ru_maxrss);
+    if(performance)printf("SOCKET-PERF name=%s pairs=%u bytes=%u count=%u ns=%llu cpu_ns=%llu p50=%llu p95=%llu max=%llu rss_kib=%ld\n",name,pairs,type==SOCK_DGRAM?4096U*64U*2U:16777216U,count,(unsigned long long)(end-start),(unsigned long long)cpu,(unsigned long long)samples[(count-1)/2],(unsigned long long)samples[(count*95-1)/100],(unsigned long long)samples[count-1],usage.ru_maxrss);
     else printf("SOCKET-SMP CASE %s OK\n",name);
 }
 struct blocked { int fd,peer;unsigned cpu,mode;uint64_t tid,entered;ssize_t result;int error; };
@@ -272,13 +286,15 @@ static void controlled_lifetimes(void)
 int main(int argc,char **argv)
 {
     setvbuf(stdout,0,_IONBF,0);signal(SIGPIPE,SIG_IGN);
-    uint64_t mask=0;CHECK(syscall(SYS_sched_getaffinity,0,sizeof(mask),&mask)==sizeof(mask));cpus=(unsigned)__builtin_popcountll(mask);CHECK(cpus>=1 && cpus<=4);pin(0);
-    if(getpid()==1) { CHECK(!mkdir("/proc",0555) || errno==EEXIST);CHECK(!mount("proc","/proc","proc",0,0) || errno==EBUSY); }
-    int fd=socket(AF_INET,SOCK_DGRAM,0);CHECK(fd>=0);struct ifreq interface={.ifr_name="lo"};CHECK(!ioctl(fd,SIOCGIFFLAGS,&interface));interface.ifr_flags|=IFF_UP;CHECK(!ioctl(fd,SIOCSIFFLAGS,&interface));CHECK(!close(fd));
-    observe_start();
     int vector_performance=argc>1 && !strcmp(argv[1],"--vector-perf");
     int scatter_performance=argc>1 && !strcmp(argv[1],"--scatter-perf");
     int performance=access("/performance",F_OK)==0;
+    uint64_t mask=0;CHECK(syscall(SYS_sched_getaffinity,0,sizeof(mask),&mask)>=0);cpus=(unsigned)__builtin_popcountll(mask);
+    CHECK(cpus>=1 && cpus<=((performance || vector_performance || scatter_performance)?8U:4U));
+    unsigned found=0;for(unsigned i=0;i<64;i++)if(mask&(UINT64_C(1)<<i))cpu_ids[found++]=i;pin(0);
+    if(getpid()==1) { CHECK(!mkdir("/proc",0555) || errno==EEXIST);CHECK(!mount("proc","/proc","proc",0,0) || errno==EBUSY); }
+    int fd=socket(AF_INET,SOCK_DGRAM,0);CHECK(fd>=0);struct ifreq interface={.ifr_name="lo"};CHECK(!ioctl(fd,SIOCGIFFLAGS,&interface));interface.ifr_flags|=IFF_UP;CHECK(!ioctl(fd,SIOCSIFFLAGS,&interface));CHECK(!close(fd));
+    if(!performance && !vector_performance && !scatter_performance)observe_start();
     if(scatter_performance) {
         performance_style=4;
         group("tcp-scatter-four",AF_INET,SOCK_STREAM,4,1);puts("SOCKET-SCATTER END 1");

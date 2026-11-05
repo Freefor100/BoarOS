@@ -26,11 +26,17 @@
 #ifndef PIPE_SMOKE
 #define PIPE_SMOKE 0
 #endif
-static unsigned cpus;
+static unsigned cpus,cpu_ids[8];
 static struct composition_control *control;
 static int control_fd=-1;
 static uint64_t now(void) { struct timespec t;CHECK(!clock_gettime(CLOCK_MONOTONIC,&t));return (uint64_t)t.tv_sec*1000000000+t.tv_nsec; }
-static void pin(unsigned cpu) { uint64_t mask=UINT64_C(1)<<cpu;CHECK(!syscall(SYS_sched_setaffinity,0,sizeof(mask),&mask)); }
+static unsigned pin(unsigned cpu)
+{
+    uint64_t mask=UINT64_C(1)<<cpu_ids[cpu],actual=0;unsigned observed=UINT32_MAX;
+    CHECK(!syscall(SYS_sched_setaffinity,0,sizeof(mask),&mask));
+    CHECK(syscall(SYS_sched_getaffinity,0,sizeof(actual),&actual)>=0 && actual==mask);
+    CHECK(!syscall(SYS_getcpu,&observed,NULL,NULL) && observed==cpu_ids[cpu]);return observed;
+}
 static void gate(pthread_barrier_t *b) { int r=pthread_barrier_wait(b);CHECK(!r||r==PTHREAD_BARRIER_SERIAL_THREAD); }
 static void observe(void)
 {
@@ -64,23 +70,34 @@ static void exact(int fd,void *bytes,size_t count,int writing,unsigned mode)
         CHECK(n>0&&(size_t)n<=count-done);done+=(size_t)n;
     }
 }
-struct channel { int fds[2][2],ep;unsigned id,mode,rounds;size_t block;pthread_barrier_t *barrier;uint64_t start[2],end[2],samples[4096]; };
+struct channel { int fds[2][2],ep;unsigned id,mode,rounds,performance,cpu[2];size_t block;pthread_barrier_t *barrier;uint64_t start[2],end[2],cpu_ns[2],samples[4096]; };
 struct actor { struct channel *c;unsigned side; };
 static void *transfer(void *argument)
 {
-    struct actor *a=argument;struct channel *c=a->c;unsigned side=a->side;pin((c->id+side)%cpus);
-    unsigned char bytes[4096];memset(bytes,0x30+(int)c->id,c->block);
-    gate(c->barrier);c->start[side]=now();
+    struct actor *a=argument;struct channel *c=a->c;unsigned side=a->side;c->cpu[side]=pin(((c->performance?2*c->id:c->id)+side)%cpus);
+    unsigned char bytes[4096];memset(bytes,c->performance&&side?0xcc:0x30+(int)c->id,c->block);
+    gate(c->barrier);struct timespec usage;CHECK(!clock_gettime(CLOCK_THREAD_CPUTIME_ID,&usage));
+    uint64_t cpu=(uint64_t)usage.tv_sec*1000000000+usage.tv_nsec;c->start[side]=now();
     for(unsigned i=0;i<c->rounds;i++) {
-        uint64_t t=now();
+        uint64_t sequence=((uint64_t)(c->id+1)<<32)|(i+1),t=now();
+        if(c->performance&&!side)memcpy(bytes,&sequence,sizeof(sequence));
         if(c->mode==1||c->mode==2) {
-            if(!side) { exact(c->fds[0][1],bytes,c->block,1,0);exact(c->fds[1][0],bytes,c->block,0,c->mode); }
+            if(!side) {
+                exact(c->fds[0][1],bytes,c->block,1,0);
+                if(c->performance) {uint64_t poison=~sequence;memcpy(bytes,&poison,sizeof(poison));}
+                exact(c->fds[1][0],bytes,c->block,0,c->mode);
+            }
             else { exact(c->fds[0][0],bytes,c->block,0,c->mode);exact(c->fds[1][1],bytes,c->block,1,0); }
         } else exact(c->fds[0][side?0:1],bytes,c->block,!side,side&&c->mode==3?(unsigned)c->ep+3:0);
-        if(side||c->mode==1||c->mode==2)for(size_t j=0;j<c->block;j++)CHECK(bytes[j]==0x30+c->id);
+        if(side||c->mode==1||c->mode==2) {
+            size_t first=0;
+            if(c->performance) {uint64_t actual;memcpy(&actual,bytes,sizeof(actual));CHECK(actual==sequence);first=sizeof(actual);}
+            for(size_t j=first;j<c->block;j++)CHECK(bytes[j]==0x30+c->id);
+        }
         if((side&&c->mode!=1&&c->mode!=2)||(!side&&(c->mode==1||c->mode==2)))c->samples[i]=now()-t;
     }
-    c->end[side]=now();return 0;
+    c->end[side]=now();CHECK(!clock_gettime(CLOCK_THREAD_CPUTIME_ID,&usage));
+    c->cpu_ns[side]=(uint64_t)usage.tv_sec*1000000000+usage.tv_nsec-cpu;return 0;
 }
 static int compare(const void *a,const void *b) { uint64_t x=*(const uint64_t *)a,y=*(const uint64_t *)b;return (x>y)-(x<y); }
 static void group(const char *name,unsigned pairs,unsigned mode,int performance)
@@ -89,22 +106,23 @@ static void group(const char *name,unsigned pairs,unsigned mode,int performance)
     struct actor actors[8];pthread_t threads[8];pthread_barrier_t barrier;CHECK(!pthread_barrier_init(&barrier,0,pairs*2));
     size_t block=mode==1||mode==2?64:4096;unsigned rounds=performance?4096/pairs:32;
     for(unsigned i=0;i<pairs;i++) {
-        struct channel *c=&channels[i];c->id=i;c->mode=mode;c->rounds=rounds;c->block=block;c->barrier=&barrier;CHECK(!pipe(c->fds[0]));
+        struct channel *c=&channels[i];c->id=i;c->mode=mode;c->performance=(unsigned)performance;c->rounds=rounds;c->block=block;c->barrier=&barrier;CHECK(!pipe(c->fds[0]));
         if(mode==1||mode==2)CHECK(!pipe(c->fds[1]));
         if(mode==3) { c->ep=epoll_create1(0);CHECK(c->ep>=0);struct epoll_event e={.events=EPOLLIN,.data.u64=i};CHECK(!epoll_ctl(c->ep,EPOLL_CTL_ADD,c->fds[0][0],&e)); }
     }
     for(unsigned i=0;i<pairs*2;i++) { actors[i]=(struct actor){&channels[i/2],i%2};CHECK(!pthread_create(&threads[i],0,transfer,&actors[i])); }
     for(unsigned i=0;i<pairs*2;i++)CHECK(!pthread_join(threads[i],0));
-    uint64_t begin=UINT64_MAX,end=0,*samples=malloc((size_t)pairs*rounds*sizeof(*samples));CHECK(samples);unsigned count=0;
+    uint64_t begin=UINT64_MAX,end=0,cpu=0,*samples=malloc((size_t)pairs*rounds*sizeof(*samples));CHECK(samples);unsigned count=0;
     for(unsigned i=0;i<pairs;i++) {
-        struct channel *c=&channels[i];for(unsigned side=0;side<2;side++) { if(c->start[side]<begin)begin=c->start[side];if(c->end[side]>end)end=c->end[side]; }
+        struct channel *c=&channels[i];for(unsigned side=0;side<2;side++) { if(c->start[side]<begin)begin=c->start[side];if(c->end[side]>end)end=c->end[side];cpu+=c->cpu_ns[side];
+            if(performance)printf("PIPE-PERF ACTOR name=%s actor=%u cpu=%u affinity=%llx cpu_ns=%llu\n",name,2*i+side,c->cpu[side],(unsigned long long)(UINT64_C(1)<<c->cpu[side]),(unsigned long long)c->cpu_ns[side]); }
         for(unsigned j=0;j<rounds;j++)samples[count++]=c->samples[j];
         CHECK(!close(c->fds[0][0])&&!close(c->fds[0][1]));
         if(mode==1||mode==2)CHECK(!close(c->fds[1][0])&&!close(c->fds[1][1]));
         if(mode==3)CHECK(!close(c->ep));
     }
     CHECK(!pthread_barrier_destroy(&barrier));qsort(samples,count,sizeof(*samples),compare);struct rusage usage;CHECK(!getrusage(RUSAGE_SELF,&usage));
-    if(performance)printf("PIPE-PERF name=%s pairs=%u bytes=%u count=%u ns=%llu p50=%llu p95=%llu max=%llu rss_kib=%ld\n",name,pairs,(unsigned)(count*block*(mode==1||mode==2?2:1)),count,(unsigned long long)(end-begin),(unsigned long long)samples[(count-1)/2],(unsigned long long)samples[(count*95-1)/100],(unsigned long long)samples[count-1],usage.ru_maxrss);
+    if(performance)printf("PIPE-PERF name=%s pairs=%u bytes=%u count=%u ns=%llu cpu_ns=%llu p50=%llu p95=%llu max=%llu rss_kib=%ld\n",name,pairs,(unsigned)(count*block*(mode==1||mode==2?2:1)),count,(unsigned long long)(end-begin),(unsigned long long)cpu,(unsigned long long)samples[(count-1)/2],(unsigned long long)samples[(count*95-1)/100],(unsigned long long)samples[count-1],usage.ru_maxrss);
     else printf("PIPE CASE %s OK\n",name);
     free(samples);free(channels);
 }
@@ -189,11 +207,13 @@ static void epoll_modes(void)
 }
 int main(void)
 {
-    setvbuf(stdout,0,_IONBF,0);uint64_t mask=0;CHECK(syscall(SYS_sched_getaffinity,0,sizeof(mask),&mask)==0||mask);cpus=(unsigned)__builtin_popcountll(mask);CHECK(cpus>=1&&cpus<=4);
+    setvbuf(stdout,0,_IONBF,0);int performance=!access("/pipe-perf",F_OK);uint64_t mask=0;
+    CHECK(syscall(SYS_sched_getaffinity,0,sizeof(mask),&mask)>=0);cpus=(unsigned)__builtin_popcountll(mask);CHECK(cpus>=1&&cpus<=(performance?8U:4U));
+    unsigned found=0;for(unsigned i=0;i<64;i++)if(mask&(UINT64_C(1)<<i))cpu_ids[found++]=i;
     unsigned char reference[128];for(unsigned i=0;i<sizeof(reference);i++)reference[i]=(unsigned char)i;
     int data=open("/pipe-data",O_CREAT|O_EXCL|O_RDWR,0600);CHECK(data>=0&&write(data,reference,sizeof(reference))==sizeof(reference)&&!fsync(data)&&!close(data));
-    CHECK(!mkdir("/proc",0755)||errno==EEXIST);CHECK(!mount("proc","/proc","proc",0,0)||errno==EBUSY);
-    int performance=!access("/pipe-perf",F_OK);if(!performance)observe();
+    if(getpid()==1) { CHECK(!mkdir("/proc",0755)||errno==EEXIST);CHECK(!mount("proc","/proc","proc",0,0)||errno==EBUSY); }
+    if(!performance)observe();
     group("stream-one",1,0,performance);group("stream-four",4,0,performance);group("ppoll-four",4,1,performance);group("pselect-four",4,2,performance);group("epoll-four",4,3,performance);
     if(!performance) { if(!PIPE_SMOKE)lifecycle();boundaries();epoll_modes(); }
     pin(0);CHECK(!unlink("/pipe-data"));
