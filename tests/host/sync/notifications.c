@@ -19,6 +19,10 @@ __attribute__((weak)) void kernel_cpu_flush_notifications(void)
 { assert(!kernel_cpu_current()->outbound); }
 __attribute__((weak)) void kernel_cpu_notify(struct kernel_cpu *cpu, unsigned events)
 { __atomic_fetch_or(&cpu->events, events, __ATOMIC_RELEASE); }
+#if BOAROS_USER_SMP
+__attribute__((weak)) int kernel_wait_backend_lock_local(const struct kernel_wait_token *token,struct kernel_raw_guard *guard)
+{ (void)token;(void)guard;return -1; }
+#endif
 #endif
 
 #include <kernel/posix_timer.h>

@@ -97,7 +97,7 @@ static void socket_protocol_cases(void)
 
 extern void scheduler_user_service_set_locked(struct kernel_task *, int);
 extern void scheduler_user_request_locked(struct kernel_task *);
-static int cancel_stop_on_handoff, local_rotation_active;
+static int cancel_stop_on_handoff, local_rotation_active, local_run_required;
 void user_signal_cancel_stop(struct kernel_task *);
 void user_signal_retarget_case(struct kernel_task *,struct kernel_task *);
 void user_signal_take_retargeted(struct kernel_task *);
@@ -125,15 +125,25 @@ enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t ns,uint64_t
 enum riscv_timer_status riscv_timer_set_scheduler_deadline(uint64_t deadline)
 { (void)deadline; return RISCV_TIMER_STATUS_NOT_STARTED; }
 enum kernel_scheduler_status validate_queues_locked(void) { __builtin_trap(); }
+static int scheduler_finish_local(struct kernel_cpu *cpu)
+{
+    KERNEL_RAW_SCOPE(run,kernel_run_lock(cpu));
+    return scheduler_finish_local_locked(cpu);
+}
 /* 唯一模拟的是机器换栈：生产select/finish决定owner及两侧资格。 */
 enum kernel_scheduler_status scheduler_switch_claimed(struct kernel_task *old,struct kernel_task *next)
 {
     if (local_rotation_active) {
-        assert(next!=active->idle && old->wait.on_cpu && !old->ready_node.queued &&
-            !old->ready_cpu && old->wait.ready_flags==SCHED_READY_LOCAL);
-        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-        kernel_wait_switch_finish_locked(old);active->switch_previous=0;
-        assert_ready_owner(old,active);
+        assert(next!=active->idle && old->wait.on_cpu && !old->ready_node.queued && !old->ready_cpu);
+        if (!old->idle) assert(old->wait.ready_flags==SCHED_READY_LOCAL);
+        if (local_run_required) {
+            assert(scheduler_finish_local(active));
+            local_run_required=0;
+        } else {
+            KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+            kernel_wait_switch_finish_locked(old);active->switch_previous=0;
+        }
+        if (!old->idle) assert_ready_owner(old,active);
         return KERNEL_SCHEDULER_STATUS_OK;
     }
     assert(next==active->idle && old->wait.on_cpu && !old->ready_node.queued);
@@ -179,6 +189,12 @@ static void *end_service_borrow(void *unused)
     return 0;
 }
 static unsigned stop_armed, stop_guard_left, stop_claimed;
+void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *,struct kernel_raw_guard *);
+void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_raw_guard *guard)
+{
+    assert(!local_run_required || lock!=&kernel_wait_domain);
+    __real_kernel_raw_lock_acquire(lock,guard);
+}
 void __real_kernel_raw_lock_release(struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_release(struct kernel_raw_guard *guard)
 {
@@ -278,10 +294,110 @@ static void local_fifo_cases(void)
     puts("PASS FIFO yield and RR expiration: real decision/finish retain local FIFO despite an idle peer");
 }
 
+static void ordinary_local_claim(void)
+{
+    reset_two_queues();active=&cpus[1];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      setup_task(0,2,0);setup_task(1,2,0);
+      assert(scheduler_select_next_locked(active,active->current,1)==&tasks[0]);
+      kernel_wait_switch_finish_locked(&idles[1]);active->switch_previous=0; }
+    local_rotation_active=local_run_required=1;
+    assert(!scheduler_reschedule(0,1,0));
+    local_rotation_active=0;
+    assert(!local_run_required && active->current==&tasks[1]);
+    assert_ready_owner(&tasks[0],active);
+}
+
+static void ordinary_local_wake(void)
+{
+    for (unsigned after=0;after<2;after++) {
+        reset_two_queues();active=&cpus[1];
+        scheduler.initialized=KERNEL_SCHEDULER_INITIALIZED;
+        struct kernel_wait_token token;
+        { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+          setup_task(0,2,0);
+          assert(scheduler_select_next_locked(active,active->idle,1)==&tasks[0]);
+          kernel_wait_switch_finish_locked(&idles[1]);active->switch_previous=0; }
+        assert(!kernel_wait_prepare(0,0,1,&token));
+        { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+          kernel_wait_record_transition(&tasks[0].wait,token.generation,KERNEL_WAIT_COMMITTED,KERNEL_WAIT_WOKEN);
+          kernel_wait_backend_commit(&tasks[0],0,1);
+          assert(scheduler_select_next_locked(active,&tasks[0],1)==active->idle); }
+        local_run_required=1;
+        if (after) assert(scheduler_finish_local(active));
+        active=&cpus[0];
+        assert(!kernel_wait_notify(&token,KERNEL_WAIT_WOKEN));
+        assert(!kernel_wait_notify(&token,KERNEL_WAIT_SIGNALLED));
+        assert(kernel_wait_record_reason(&tasks[0].wait)==KERNEL_WAIT_WOKEN);
+        active=&cpus[1];
+        if (!after) {
+            assert(tasks[0].wait.on_cpu && tasks[0].wait.ready_pending && !tasks[0].ready_node.queued);
+            assert(scheduler_finish_local(active));
+        }
+        local_run_required=0;
+        assert_ready_owner(&tasks[0],active);
+    }
+    puts("PASS ordinary wake and old-stack release use the same CPU owner on both sides of the switch");
+}
+
+static void ordinary_wake_after_affinity_change(void)
+{
+    for (unsigned after=0;after<2;after++) {
+        reset_two_queues();active=&cpus[1];
+        scheduler.initialized=KERNEL_SCHEDULER_INITIALIZED;
+        struct kernel_wait_token token;
+        { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+          setup_task(0,2,0);tasks[0].tid=99;tasks[0].tid_owned=1;tasks[0].arch.user_mode=1;
+          assert(scheduler_select_next_locked(active,active->idle,1)==&tasks[0]);
+          kernel_wait_switch_finish_locked(&idles[1]);active->switch_previous=0; }
+        assert(!kernel_wait_prepare(0,0,1,&token));
+        { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+          kernel_wait_record_transition(&tasks[0].wait,token.generation,KERNEL_WAIT_COMMITTED,KERNEL_WAIT_WOKEN);
+          kernel_wait_backend_commit(&tasks[0],0,1);
+          assert(scheduler_select_next_locked(active,&tasks[0],1)==active->idle); }
+        if (after) assert(scheduler_finish_local(active));
+        active=&cpus[0];
+        assert(!kernel_task_affinity_set(active->current,99,1));
+        assert(!kernel_wait_notify(&token,KERNEL_WAIT_WOKEN));
+        if (!after) {
+            assert(tasks[0].wait.on_cpu && tasks[0].wait.ready_pending && !tasks[0].ready_node.queued);
+            active=&cpus[1];
+            assert(!scheduler_finish_local(active));
+            KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+            KERNEL_RUN_SET(runs);
+            kernel_wait_switch_finish_locked(&tasks[0]);active->switch_previous=0;
+        }
+        assert(!cpus[1].runqueue.count);
+        assert_ready_owner(&tasks[0],&cpus[0]);
+    }
+    puts("PASS ordinary wake after affinity change uses the new queue and respects the old stack");
+}
+
+static void ordinary_pull(void)
+{
+    for (unsigned history=0;history<2;history++) {
+        reset_two_queues();active=&cpus[0];
+        { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+          setup_task(0,3,0);tasks[0].rttime_ticks=history;
+          assert_ready_owner(&tasks[0],&cpus[0]); }
+        active=&cpus[1];
+        local_rotation_active=1;local_run_required=!history;
+        assert(!scheduler_reschedule(0,0,0));
+        local_rotation_active=0;
+        assert(!local_run_required && !cpus[0].runqueue.count && !tasks[0].ready_cpu &&
+               tasks[0].cpu==active && tasks[0].wait.on_cpu && active->current==&tasks[0]);
+    }
+    puts("PASS ordinary steal transfers execution directly under source/destination runqueue locks");
+}
+
 int main(void)
 {
     assert(!controlled_smp_main());
     local_fifo_cases();
+    ordinary_local_claim();
+    ordinary_local_wake();
+    ordinary_wake_after_affinity_change();
+    ordinary_pull();
     reservation_placement_cases();
     scheduler = (struct kernel_scheduler){0};
     scheduler.rt_configuration.period_ns = 1000000000;

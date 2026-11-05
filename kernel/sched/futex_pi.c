@@ -391,9 +391,10 @@ int64_t kernel_futex_pi(struct kernel_task *task,uint64_t address,uint32_t opera
                 if(expired)(void)kernel_wait_notify_locked(&request.token,KERNEL_WAIT_TIMEOUT);
 #if BOAROS_MAX_CPUS > 1
                 struct kernel_task *owner=request.state->owner;
+                struct kernel_cpu *cpu=__atomic_load_n(&owner->cpu,__ATOMIC_ACQUIRE);
                 spin=!expired && request.state->head==&request && owner->wait.on_cpu &&
-                    owner->state==KERNEL_THREAD_STATE_RUNNING && owner->cpu &&
-                    owner->cpu!=kernel_cpu_current() && owner->cpu->current==owner;
+                    owner->state==KERNEL_THREAD_STATE_RUNNING && cpu &&
+                    cpu!=kernel_cpu_current() && __atomic_load_n(&cpu->current,__ATOMIC_ACQUIRE)==owner;
 #endif
             }
         }
@@ -605,6 +606,8 @@ int64_t kernel_futex_cmp_requeue_pi(struct kernel_task *task,uint64_t address,
                     }
                 }
                 KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+                /* Requeue can publish a PI boost while the source node is held. */
+                KERNEL_RUN_SET(runs);
                 int notify=0;
                 {
                 KERNEL_IRQ_LOCK_SCOPE(queue_guard,&buckets[0]->waiters.lock);

@@ -63,6 +63,7 @@ int kernel_cost_control(const char *command, size_t size)
         if (!result) {
             {
                 KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+                KERNEL_RUN_SET(runs);
                 for (struct kernel_cpu *cpu=scheduler.cpus;cpu;cpu=cpu->scheduler_next) {
                     uint64_t irq=kernel_cost_lock();
                     kernel_cost_register_cpu(&cpu->cost);

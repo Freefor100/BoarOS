@@ -10,7 +10,8 @@ enum kernel_raw_rank {
     KERNEL_RAW_RANK_PAGE = 20,
     KERNEL_RAW_RANK_TASK_FILES = 25,
     KERNEL_RAW_RANK_OBJECT = 30, KERNEL_RAW_RANK_FILE_MAPPING = 35,
-    KERNEL_RAW_RANK_SCHEDULER = 40, KERNEL_RAW_RANK_WAIT_QUEUE = 45
+    KERNEL_RAW_RANK_SCHEDULER = 40, KERNEL_RAW_RANK_RUNQUEUE = 42,
+    KERNEL_RAW_RANK_WAIT_QUEUE = 45
 };
 /* 初始化/移动仅允许未发布实例；UP 以中断和抢占嵌套互斥，SMP 使用原子字。
  * CPU 持锁链总是保留；线性递归与等级审计只在 LOCK_DEBUG 中执行。 */
@@ -41,6 +42,18 @@ static inline void kernel_raw_scope_release(struct kernel_raw_guard *guard)
     struct kernel_raw_guard name __attribute__((cleanup(kernel_raw_scope_release))); \
     name.lock = 0; \
     kernel_raw_lock_acquire((object), &name)
+
+#if BOAROS_USER_SMP
+struct kernel_raw_lock *kernel_run_lock(const struct kernel_cpu *);
+struct kernel_run_set { unsigned held; };
+void kernel_run_set_acquire(struct kernel_run_set *);
+void kernel_run_set_release(struct kernel_run_set *);
+#define KERNEL_RUN_SET(name) \
+    struct kernel_run_set name __attribute__((cleanup(kernel_run_set_release)))={0}; \
+    kernel_run_set_acquire(&name)
+#else
+#define KERNEL_RUN_SET(name) ((void)0)
+#endif
 
 /* Short stable views share qualification; writers close admission before
  * draining readers. Only users of this type pay for reader bookkeeping. */

@@ -249,7 +249,11 @@ enum kernel_scheduler_status kernel_wait_prepare(struct kernel_wait_queue *queue
     KERNEL_IRQ_SCOPE(irq);
     return prepare_owner(0,deadline,interruptible,token);
 }
+#if BOAROS_USER_SMP
+static int notify_locked(const struct kernel_wait_token *token,uint32_t reason)
+#else
 int kernel_wait_notify_locked(const struct kernel_wait_token *token,uint32_t reason)
+#endif
 {
     if (!token || !token->task || !token->generation) return 0;
     struct kernel_wait_record *record=kernel_wait_record_of(token->task);
@@ -285,6 +289,16 @@ int kernel_wait_notify_locked(const struct kernel_wait_token *token,uint32_t rea
     kernel_wait_record_transition(record,token->generation,KERNEL_WAIT_NOTIFIED,reason);
     return 1;
 }
+#if BOAROS_USER_SMP
+int kernel_wait_notify_locked(const struct kernel_wait_token *token,uint32_t reason)
+{
+    if (token && token->task && kernel_wait_record_phase(kernel_wait_record_of(token->task))==KERNEL_WAIT_COMMITTED) {
+        KERNEL_RUN_SET(runs);
+        return notify_locked(token,reason);
+    }
+    return notify_locked(token,reason);
+}
+#endif
 static int notify_token(const struct kernel_wait_token *token,uint32_t reason)
 {
 #if BOAROS_MAX_CPUS > 1
@@ -301,9 +315,21 @@ static int notify_token(const struct kernel_wait_token *token,uint32_t reason)
         if ((state>>5)!=token->generation || (state&3U)==KERNEL_WAIT_FINISHED ||
             (state&3U)==KERNEL_WAIT_NOTIFIED) return 0;
     }
+#if BOAROS_USER_SMP
+    struct kernel_raw_guard guard __attribute__((cleanup(kernel_raw_scope_release)))={0};
+    if ((state&3U)==KERNEL_WAIT_COMMITTED) {
+        int result=kernel_wait_backend_lock_local(token,&guard);
+        if (result>0) return notify_locked(token,reason);
+        if (!result) return 0;
+    }
+    kernel_raw_lock_acquire(&kernel_wait_domain,&guard);
+    return kernel_wait_notify_locked(token,reason);
 #endif
+#endif
+#if !BOAROS_USER_SMP
     KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
     return kernel_wait_notify_locked(token,reason);
+#endif
 }
 enum kernel_scheduler_status kernel_wait_notify(const struct kernel_wait_token *token,
     enum kernel_wait_wake_reason reason)
@@ -410,7 +436,11 @@ void kernel_wait_switch_finish_locked(struct kernel_task *task)
 {
     struct kernel_wait_record *record = kernel_wait_record_of(task);
     if (!record->on_cpu) __builtin_trap();
+#if BOAROS_USER_SMP
+    __atomic_store_n(&record->on_cpu,0,__ATOMIC_RELEASE);
+#else
     record->on_cpu = 0;
+#endif
     if (record->ready_pending) {
         record->ready_pending = 0;
         kernel_wait_backend_ready(task);

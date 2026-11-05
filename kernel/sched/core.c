@@ -399,8 +399,13 @@ enum kernel_scheduler_status validate_queues_locked(void)
 
 enum kernel_scheduler_status validate_queues_locked(void)
 {
+#if BOAROS_USER_SMP
+    if (!kernel_raw_lock_owned(&kernel_wait_domain)) __builtin_trap();
+    KERNEL_RUN_SET(runs);
+#else
     struct kernel_cpu *cpu = kernel_cpu_current();
     if (!cpu->raw_locks || cpu->raw_locks->lock != &kernel_wait_domain) __builtin_trap();
+#endif
     COST_ADD(QUEUE_VALIDATIONS, 1);
     enum kernel_scheduler_status status;
 
@@ -468,10 +473,17 @@ void kernel_scheduler_switch_finish(void)
 {
     struct kernel_cpu *cpu = kernel_cpu_current();
     if (!cpu->switch_previous) return;
+#if BOAROS_USER_SMP
+    {
+        KERNEL_RAW_SCOPE(run,kernel_run_lock(cpu));
+        if (scheduler_finish_local_locked(cpu)) return;
+    }
+#endif
     struct kernel_wait_cursor joined;
     int notify = 0;
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        KERNEL_RUN_SET(runs);
         struct kernel_task *previous = cpu->switch_previous;
         cpu->switch_previous = 0;
         if (previous == cpu->current || !cpu->current->wait.on_cpu) __builtin_trap();
@@ -511,10 +523,27 @@ enum kernel_scheduler_status scheduler_switch_current_away_locked(
     struct kernel_cpu *cpu = kernel_cpu_current();
     if (!guard || cpu->raw_locks != guard || guard->lock != &kernel_wait_domain)
         __builtin_trap();
+#if BOAROS_USER_SMP
+    if (!previous->wait.deadline && !previous->scheduling.priority && !previous->user_service &&
+        (previous->state==KERNEL_THREAD_STATE_BLOCKED || previous->state==KERNEL_THREAD_STATE_READY)) {
+        struct kernel_task *next;
+        uint64_t deadline;
+        kernel_raw_lock_release(guard);
+        if (scheduler_select_local(1,0,0,&next,&deadline)) {
+            scheduler_arm_timer(deadline);
+            return next?scheduler_switch_claimed(previous,next):KERNEL_SCHEDULER_STATUS_OK;
+        }
+        kernel_raw_lock_acquire(&kernel_wait_domain,guard);
+    }
+#endif
+    KERNEL_RUN_SET(runs);
     scheduler_account_runtime_locked();
     struct kernel_task *next = scheduler_select_next_locked(cpu, previous, 1);
     uint64_t deadline = scheduler_deadline_locked(cpu);
     /* 先完成执行权选择，再放锁；实际timer操作和切栈均在保护外。 */
+#if BOAROS_USER_SMP
+    kernel_run_set_release(&runs);
+#endif
     kernel_raw_lock_release(guard);
     if (!next) return KERNEL_SCHEDULER_STATUS_OK;
     scheduler_arm_timer(deadline);
@@ -1087,6 +1116,7 @@ enum kernel_scheduler_status kernel_thread_create_joinable(
 int kernel_scheduler_core_quiescent(struct kernel_cpu *cpu)
 {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    KERNEL_RUN_SET(runs);
     return !scheduler.controlled_owners && cpu && cpu->current == cpu->idle &&
         !cpu->switch_previous && !cpu->runqueue.first && !cpu->active_mm_record
 #if BOAROS_USER_SMP
@@ -1143,6 +1173,7 @@ enum kernel_scheduler_status kernel_thread_set_cpu_mask(struct kernel_thread_joi
     kernel_assert_service_context();
     if (!join || !mask || (mask & ~((1U << BOAROS_MAX_CPUS) - 1U))) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    KERNEL_RUN_SET(runs);
     struct kernel_task *task = join->task;
     if (!task || !task->controlled) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     unsigned available = available_cpu_mask_locked();

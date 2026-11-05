@@ -6,7 +6,7 @@
 enum kernel_wait_phase { KERNEL_WAIT_FINISHED, KERNEL_WAIT_PREPARED,
     KERNEL_WAIT_COMMITTED, KERNEL_WAIT_NOTIFIED };
 /* The request owner retains its node list through finish. Each event queue
- * protects links/cursors; only execution and ready state use the scheduler domain. */
+ * protects links/cursors; the execution owner protects READY and stack handoff. */
 struct kernel_wait_record {
 #if BOAROS_MAX_CPUS > 1
     /* Generation, phase and notification reason are one atomic publication. */
@@ -21,7 +21,12 @@ struct kernel_wait_record {
 #else
     uint32_t interruptible;
 #endif
-    uint32_t on_cpu, ready_pending, ready_flags, borrows;
+#if BOAROS_USER_SMP
+    _Atomic uint32_t on_cpu;
+#else
+    uint32_t on_cpu;
+#endif
+    uint32_t ready_pending, ready_flags, borrows;
 };
 static inline uint32_t kernel_wait_record_borrows(const struct kernel_wait_record *record)
 {
@@ -88,10 +93,14 @@ static inline uint64_t kernel_wait_signal_generation(const struct kernel_wait_re
 extern struct kernel_raw_lock kernel_wait_domain;
 void kernel_wait_domain_init(void);
 void kernel_wait_record_init(struct kernel_wait_record *);
-/* Node operations require their queue lock; notify/switch_finish require the
- * scheduler domain. Queue locks must be released before notifying a task. */
+/* Node operations require their queue lock. Release that lock before notifying
+ * a task; completion and switch_finish need the actual execution protection. */
 enum kernel_scheduler_status kernel_wait_node_bind_locked(struct kernel_wait_queue *,struct kernel_wait_node *,const struct kernel_wait_token *);
 int kernel_wait_notify_locked(const struct kernel_wait_token *, uint32_t);
+#if BOAROS_USER_SMP
+/* 1: caller owns the returned run guard, 0: obsolete, -1: common path. */
+int kernel_wait_backend_lock_local(const struct kernel_wait_token *,struct kernel_raw_guard *);
+#endif
 void kernel_wait_node_add_locked(struct kernel_wait_queue *, struct kernel_wait_node *);
 void kernel_wait_node_remove_locked(struct kernel_wait_node *);
 void kernel_wait_switch_finish_locked(struct kernel_task *);

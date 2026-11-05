@@ -322,6 +322,7 @@ static void request_thread_termination_locked(struct kernel_task *task)
         }
     }
     if (task->state == KERNEL_THREAD_STATE_STOPPED) {
+        KERNEL_RUN_SET(runs);
         stopped_unlink_locked(task);
         task->state = KERNEL_THREAD_STATE_READY;
         if (task->wait.on_cpu) task->wait.ready_pending = 1;
@@ -2376,6 +2377,7 @@ static void kernel_thread_finish(
     uint64_t next_deadline;
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        KERNEL_RUN_SET(runs);
         current->state = KERNEL_THREAD_STATE_EXITED;
         exited_append_locked(current);
         /* The cleanup task must be runnable before choosing next. Join
