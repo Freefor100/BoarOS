@@ -53,11 +53,66 @@ static void detach_range_contract(struct physical_page_allocator *allocator,
     if (arch_mmu_user_space_destroy(&space)) la_virt_fatal("range destroy");
     la_virt_puts("LA bounded range detach/protected boundaries passed\n");
 }
+static enum arch_mmu_status detach_step(struct physical_page_allocator *allocator,
+    struct arch_mmu_user_space *space,uint64_t start,uint64_t end,
+    struct kernel_mm_detach_cursor *cursor)
+{
+    struct kernel_mm_retirement batch={0};
+    enum arch_mmu_status status=arch_mmu_user_detach_range(space,start,end,cursor,&batch,0,0);
+    if (status!=ARCH_MMU_STATUS_OK && status!=ARCH_MMU_STATUS_NOT_MAPPED)
+        la_virt_fatal("interleaved detach status");
+    if (batch.count) arch_mmu_sync_user(0,0,UINT64_MAX,0);
+    for (unsigned i=0;i<batch.count;i++)
+        if (physical_page_release(allocator,batch.pages[i])) la_virt_fatal("interleaved detach owner");
+    return status;
+}
+static void detach_interleaving_contract(struct physical_page_allocator *allocator,
+    const struct arch_mmu_page_table *kernel)
+{
+    struct arch_mmu_user_space space={0};
+    uint64_t neighbor=UINT64_C(1)<<25,start=neighbor+BOAROS_PAGE_SIZE,end=start+17*BOAROS_PAGE_SIZE;
+    if (arch_mmu_user_space_init(&space,allocator,kernel)) la_virt_fatal("neighbor space");
+    for (uint64_t at=start;at<end;at+=BOAROS_PAGE_SIZE)
+        if (arch_mmu_user_map_zeroed_page(&space,at,ARCH_MMU_READ|ARCH_MMU_WRITE)) la_virt_fatal("neighbor target");
+    struct kernel_mm_detach_cursor cursor={0};
+    if (detach_step(allocator,&space,start,end,&cursor)!=ARCH_MMU_STATUS_OK ||
+        arch_mmu_user_map_zeroed_page(&space,neighbor,ARCH_MMU_READ|ARCH_MMU_WRITE))
+        la_virt_fatal("neighbor interleave");
+    struct arch_mmu_mapping mapping;
+    if (arch_mmu_user_lookup(&space,neighbor,&mapping)) la_virt_fatal("neighbor lookup");
+    *(uint64_t *)la_virt_page_access(mapping.physical_address)=UINT64_C(0x5317c049);
+    while (detach_step(allocator,&space,start,end,&cursor)==ARCH_MMU_STATUS_OK) {}
+    if (arch_mmu_user_lookup(&space,neighbor,&mapping) || space.leaf_pages!=1 || space.table_pages!=3 ||
+        *(uint64_t *)la_virt_page_access(mapping.physical_address)!=UINT64_C(0x5317c049))
+        la_virt_fatal("neighbor retained");
+    if (arch_mmu_user_space_destroy(&space)) la_virt_fatal("neighbor destroy");
+    for (unsigned replace=0;replace<2;replace++) {
+        space=(struct arch_mmu_user_space){0};cursor=(struct kernel_mm_detach_cursor){0};
+        end=UINT64_C(1)<<25;start=end-14*BOAROS_PAGE_SIZE;
+        if (arch_mmu_user_space_init(&space,allocator,kernel)) la_virt_fatal("parent space");
+        for (uint64_t at=start;at<end;at+=BOAROS_PAGE_SIZE)
+            if (arch_mmu_user_map_zeroed_page(&space,at,ARCH_MMU_READ|ARCH_MMU_WRITE)) la_virt_fatal("parent target");
+        do {
+            if (detach_step(allocator,&space,start,end,&cursor)!=ARCH_MMU_STATUS_OK) la_virt_fatal("parent pending");
+        } while (space.leaf_pages);
+        if (space.table_pages!=2) la_virt_fatal("parent pending owner");
+        struct kernel_mm_detach_cursor other={0};neighbor=BOAROS_PAGE_SIZE;
+        while (detach_step(allocator,&space,neighbor,neighbor+BOAROS_PAGE_SIZE,&other)==ARCH_MMU_STATUS_OK) {}
+        if (space.table_pages!=1 || (replace &&
+            arch_mmu_user_map_zeroed_page(&space,neighbor,ARCH_MMU_READ|ARCH_MMU_WRITE)))
+            la_virt_fatal("parent replacement");
+        while (detach_step(allocator,&space,start,end,&cursor)==ARCH_MMU_STATUS_OK) {}
+        if ((replace && arch_mmu_user_lookup(&space,neighbor,&mapping)) ||
+            arch_mmu_user_space_destroy(&space)) la_virt_fatal("parent current identity");
+    }
+    la_virt_puts("LA detach concurrent neighbor and retired/replaced parent passed\n");
+}
 void la_mmu_contract(struct physical_page_allocator *allocator)
 {
     uint64_t before=physical_page_available(allocator);
     struct arch_mmu_page_table kernel={.allocator=allocator,.state=ARCH_MMU_STATE_ACTIVE};
     detach_range_contract(allocator,&kernel);
+    detach_interleaving_contract(allocator,&kernel);
     struct arch_mmu_user_space parent={0}, child={0};
     struct arch_mmu_mapping map;
     const uint64_t address=0x400000;
