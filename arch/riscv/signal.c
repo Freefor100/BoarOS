@@ -158,7 +158,6 @@ void riscv_signal_prepare_user_return(struct riscv_trap_frame *frame)
 {
     struct kernel_task *task = kernel_task_current();
     struct kernel_signal_delivery delivery;
-    struct kernel_mm *mm;
     enum kernel_signal_restart restart;
     kernel_pid_t tid;
     int has_handler;
@@ -167,9 +166,6 @@ void riscv_signal_prepare_user_return(struct riscv_trap_frame *frame)
     if (frame == 0 || (frame->sstatus & RISCV_SSTATUS_SPP) != 0U ||
         kernel_task_tid(task, &tid) != KERNEL_TASK_STATUS_OK) {
         return;
-    }
-    if (kernel_task_mm_borrow_mutable(task, &mm) != KERNEL_TASK_STATUS_OK) {
-        riscv_signal_bad_frame();
     }
     selection = kernel_signal_select(task, &delivery);
     if (selection == KERNEL_SIGNAL_SELECT_EXIT)
@@ -188,6 +184,10 @@ void riscv_signal_prepare_user_return(struct riscv_trap_frame *frame)
         frame->sepc += 4U;
     }
     if (has_handler) {
+        /* 普通返回和重启没有用户信号帧，只有构帧者需要MM。 */
+        struct kernel_mm *mm;
+        if (kernel_task_mm_borrow_mutable(task, &mm) != KERNEL_TASK_STATUS_OK)
+            riscv_signal_bad_frame();
         riscv_signal_build_frame(task, mm, frame, &delivery);
     }
 }
