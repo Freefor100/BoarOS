@@ -137,7 +137,7 @@ static int unmount(struct kernel_vfs_mount *mount)
 static void initialize_ops(void)
 {
     volatile struct kernel_vfs_backend *o=&mq_ops;
-    o->read_execution=KERNEL_VFS_EXECUTION_CALLER;o->file_metadata_execution=KERNEL_VFS_EXECUTION_CALLER;
+    o->read_execution=KERNEL_VFS_EXECUTION_CALLER;o->file_operation_execution=KERNEL_VFS_EXECUTION_CALLER;
     o->namespace_execution=KERNEL_VFS_EXECUTION_CALLER;
     o->error=error;o->root=root;o->lookup=lookup;o->open=open_inode;o->close_node=close_node;
     o->create=create;o->unlink=unlink_file;o->stat=stat_inode;o->statfs=statfs;o->permission=permission;

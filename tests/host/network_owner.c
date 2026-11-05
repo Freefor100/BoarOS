@@ -55,13 +55,11 @@ static struct {
 static pthread_mutex_t reservation_gate=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t reservation_changed=PTHREAD_COND_INITIALIZER;
 static unsigned reservation_first, reservation_second, reservation_release;
-static struct kernel_socket_write_request *remote_write;
 static pthread_mutex_t remote_gate=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t remote_changed=PTHREAD_COND_INITIALIZER;
-static unsigned remote_work,remote_done,remote_mode,remote_testing;
+static unsigned remote_work,remote_done,remote_mode,remote_testing,remote_parked;
 static unsigned copy_waiting,copy_release,stop_waiting,stop_done,stop_borrows;
 static unsigned batch_waiting,batch_release;
-static unsigned protocol_notified;
 static struct kernel_socket *remote_socket;
 static struct kernel_wait_queue *stop_probe_queue;
 static unsigned stop_probe_notified;
@@ -69,6 +67,10 @@ static unsigned notify_testing,notify_entered,notify_release,notify_stopping;
 static struct kernel_wait_queue notify_queue;
 static struct kernel_wait_queue model_work_queue;
 static _Thread_local struct kernel_task *remote_task;
+static _Thread_local struct remote_waiter {
+    struct kernel_socket_write_request *request;
+    unsigned notified;
+} remote_waiter;
 static void reservation_arrive(void)
 {
     CHECK(!pthread_mutex_lock(&reservation_gate));
@@ -411,20 +413,26 @@ enum kernel_open_file_status kernel_open_file_release(struct kernel_open_file_de
   else {CHECK(allow_ofd_release);--allow_ofd_release;}
   *f=0;return KERNEL_OPEN_FILE_STATUS_OK; }
 enum kernel_task_status kernel_task_socket_write_register(struct kernel_task *t, struct kernel_socket_write_request *r)
-{CHECK(remote_testing && t==remote_task && (!remote_write || remote_write==r));remote_write=r;return KERNEL_TASK_STATUS_OK;}
+{CHECK(remote_testing && t==remote_task && !remote_waiter.request);remote_waiter.request=r;return KERNEL_TASK_STATUS_OK;}
 enum kernel_task_status kernel_task_socket_write_clear(struct kernel_task *t, struct kernel_socket_write_request *r)
-{CHECK(remote_testing && t==remote_task && remote_write==r);remote_write=NULL;return KERNEL_TASK_STATUS_OK;}
+{CHECK(remote_testing && t==remote_task && remote_waiter.request==r);remote_waiter.request=NULL;return KERNEL_TASK_STATUS_OK;}
 enum kernel_task_status kernel_task_socket_read_register(struct kernel_task *t, struct kernel_socket_read_request *r)
 { (void)t;(void)r;CHECK(reservation_actor);reservation_arrive();return KERNEL_TASK_STATUS_OK; }
 enum kernel_task_status kernel_task_socket_read_clear(struct kernel_task *t, struct kernel_socket_read_request *r)
 { (void)t;(void)r;return KERNEL_TASK_STATUS_OK; }
 void kernel_signal_note_syscall_restart(struct kernel_task *t) { (void)t; abort(); }
 enum kernel_scheduler_status kernel_wait_prepare(struct kernel_wait_queue *q,uint64_t d,int i,struct kernel_wait_token *t)
-{ (void)d;(void)i;CHECK(remote_write);if(!q)__atomic_store_n(&protocol_notified,0,__ATOMIC_RELEASE);*t=(struct kernel_wait_token){(void *)remote_write,1};return KERNEL_SCHEDULER_STATUS_OK; }
+{
+    (void)d;(void)i;CHECK(q || remote_waiter.request);
+    remote_waiter.notified=0;*t=(struct kernel_wait_token){(void *)&remote_waiter,1};
+    return KERNEL_SCHEDULER_STATUS_OK;
+}
 enum kernel_scheduler_status kernel_wait_notify(const struct kernel_wait_token *t,enum kernel_wait_wake_reason reason)
 {
-    CHECK(reason==KERNEL_WAIT_WOKEN && remote_write && t==&remote_write->completion && t->generation && !remote_write->queued);
-    __atomic_store_n(&protocol_notified,1,__ATOMIC_RELEASE);
+    struct remote_waiter *waiter=(void *)t->task;
+    CHECK(reason==KERNEL_WAIT_WOKEN && waiter->request && t==&waiter->request->completion &&
+          t->generation && !waiter->request->queued && !waiter->notified);
+    waiter->notified=1;
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *t,enum kernel_wait_wake_reason *r)
@@ -433,8 +441,9 @@ enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *t,
     CHECK(!pthread_mutex_lock(&remote_gate));
     int stopping_actor=!kernel_cpu_current()->logical_id;
     if(stopping_actor) {stop_waiting=1;CHECK(!pthread_cond_broadcast(&remote_changed));}
+    else if(remote_mode==9) {remote_parked++;CHECK(!pthread_cond_broadcast(&remote_changed));}
     for(;;) {
-        int pending;{SOCKET_STATE(state);pending=stopping_actor?remote_socket->active_writes!=NULL:!__atomic_load_n(&protocol_notified,__ATOMIC_ACQUIRE);}
+        int pending;{SOCKET_STATE(state);pending=stopping_actor?remote_socket->active_writes!=NULL:!remote_waiter.notified;}
         if(!pending)break;
         CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
     }
@@ -1586,16 +1595,19 @@ static void remote_work_ready(struct kernel_wait_node *node,uint32_t reason)
     CHECK(!pthread_mutex_lock(&remote_gate));remote_work=1;
     CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));
 }
+struct remote_write_args { struct kernel_socket *socket; const char *data; unsigned size; };
 static void *remote_writer(void *argument)
 {
-    struct kernel_socket *socket=argument;kernel_cpu_current()->logical_id=1;
+    const struct remote_write_args *args=argument;
+    struct kernel_socket *socket=args->socket;kernel_cpu_current()->logical_id=1;
     struct kernel_open_file_description *pin=(void *)socket;
     remote_task=(void *)&test_context;
-    if(!remote_mode || remote_mode==4 || remote_mode==5 || remote_mode==6 || remote_mode==7 || remote_mode==8) {
+    if(!remote_mode || remote_mode>=4) {
         struct kernel_socket_write_request request={0};
         kernel_socket_stream_begin(&request,&pin);
-        CHECK(kernel_socket_stream_reserve(&request,1,0)==1);
-        CHECK(kernel_socket_stream_commit(&request,"r",1,(remote_mode==5 || remote_mode==7)?KERNEL_SOCKET_IO_MORE:0)==(remote_mode==4?-KERNEL_EIO:1));
+        CHECK(kernel_socket_stream_reserve(&request,args->size,0)==(int)args->size);
+        CHECK(kernel_socket_stream_commit(&request,args->data,args->size,
+            (remote_mode==5 || remote_mode==7)?KERNEL_SOCKET_IO_MORE:0)==(remote_mode==4?-KERNEL_EIO:(int)args->size));
         if(remote_mode==5 || remote_mode==7) {
             CHECK(!pthread_mutex_lock(&remote_gate));batch_waiting=1;
             CHECK(!pthread_cond_broadcast(&remote_changed));
@@ -1608,8 +1620,8 @@ static void *remote_writer(void *argument)
         int result=kernel_socket_write_datagram(&pin,(void *)socket,&iov,1,1,0,NULL, NULL);
         CHECK(result==(remote_mode==2?-KERNEL_EFAULT:remote_mode==3?-KERNEL_EIO:1));
     }
-    CHECK(pin==(void *)socket && !remote_write);remote_task=NULL;
-    CHECK(!pthread_mutex_lock(&remote_gate));remote_done=1;
+    CHECK(pin==(void *)socket && !remote_waiter.request);remote_task=NULL;
+    CHECK(!pthread_mutex_lock(&remote_gate));remote_done++;
     CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));
     return NULL;
 }
@@ -1623,7 +1635,7 @@ static void remote_protocol_request(unsigned mode)
 {
     remote_testing=1;remote_mode=mode;
     struct kernel_socket *listener=NULL,*client=NULL,*server=NULL;
-    if(!mode || mode==4 || mode==5 || mode==6 || mode==7 || mode==8)connected_pair(&listener,&client,&server);
+    if(!mode || mode>=4)connected_pair(&listener,&client,&server);
     else {
         struct kernel_socket_address address={.family=KERNEL_SOCKET_AF_INET,.port=24017,.bytes={127,0,0,1}};
         CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,&server));
@@ -1640,21 +1652,39 @@ static void remote_protocol_request(unsigned mode)
     struct kernel_open_file_description *quota_pin=(void *)client;
     struct kernel_socket_write_request quota={0};
     struct kernel_wait_node quota_observer={0};unsigned quota_notifications=0;
-    if(mode==8) {
+    if(mode==8 || mode==9) {
         kernel_socket_stream_begin(&quota,&quota_pin);
         uint32_t capacity;{SOCKET_STATE(state);capacity=tcp_admission_capacity_locked(client);}
-        CHECK(capacity>1 && kernel_socket_stream_reserve(&quota,capacity-1,0)==(int)capacity-1);
+        unsigned send_bytes=mode==9?3:1;
+        CHECK(capacity>send_bytes && kernel_socket_stream_reserve(&quota,capacity-send_bytes,0)==(int)(capacity-send_bytes));
         kernel_wait_node_init_callback(&quota_observer,tcp_quota_wakeup,&quota_notifications);
         kernel_wait_queue_add(&client->wait,&quota_observer);
     }
+    if(mode==9)CHECK(!kernel_socket_set_option(client,KERNEL_SOCKET_NODELAY,1));
     unsigned initial_xmit=lwip_stats.tcp.xmit;
-    pthread_t thread,stopper;unsigned stop_started=0,turns=0;
-    CHECK(!pthread_create(&thread,NULL,remote_writer,client));
+    pthread_t thread,second,stopper;unsigned stop_started=0,turns=0;
+    const struct remote_write_args first_args={client,"r",1}, second_args={client,"st",2};
+    CHECK(!pthread_create(&thread,NULL,remote_writer,(void *)&first_args));
+    if(mode==9) {
+        CHECK(!pthread_mutex_lock(&remote_gate));
+        while(remote_parked!=1)CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
+        CHECK(!pthread_create(&second,NULL,remote_writer,(void *)&second_args));
+        while(remote_parked!=2)CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
+        CHECK(!remote_done && !pthread_mutex_unlock(&remote_gate));
+        struct kernel_socket_service_result service=kernel_socket_service_pending((struct kernel_socket_service_budget){2,0,0});
+        CHECK(service.sockets==2 && lwip_stats.tcp.xmit==initial_xmit+1);
+        CHECK(!quota_notifications && !(kernel_socket_poll(client,NULL)&KERNEL_POLLOUT));
+        CHECK(kernel_wait_node_remove_sync(&quota_observer)==KERNEL_SCHEDULER_STATUS_OK);
+        kernel_socket_stream_finish(&quota);
+        CHECK(!pthread_mutex_lock(&remote_gate));
+        CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));
+        CHECK(!pthread_join(second,NULL));
+    }
     for(;;) {
         CHECK(!pthread_mutex_lock(&remote_gate));
-        while(!remote_work && !remote_done && !(mode==3 && copy_waiting && !stop_started) && !((mode==5 || mode==7) && batch_waiting && !batch_release))
+        while(!remote_work && remote_done<(mode==9?2U:1U) && !(mode==3 && copy_waiting && !stop_started) && !((mode==5 || mode==7) && batch_waiting && !batch_release))
             CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
-        int done=remote_done;
+        int done=remote_done==(mode==9?2U:1U);
         int inspect_batch=(mode==5 || mode==7) && batch_waiting && !batch_release;
         int start_stop=!stop_started && ((mode==3 && copy_waiting) || (mode==4 && remote_work));
         remote_work=0;CHECK(!pthread_mutex_unlock(&remote_gate));
@@ -1689,7 +1719,7 @@ static void remote_protocol_request(unsigned mode)
         CHECK(!pthread_mutex_lock(&remote_gate));
         CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));
     }
-    CHECK(!pthread_join(thread,NULL));remote_write=NULL;
+    CHECK(!pthread_join(thread,NULL));
     if(mode==8) {
         CHECK(!quota_notifications && !(kernel_socket_poll(client,NULL)&KERNEL_POLLOUT));
         kernel_socket_stream_cancel(&quota);
@@ -1700,7 +1730,13 @@ static void remote_protocol_request(unsigned mode)
     }
     if(stop_started) {CHECK(!pthread_join(stopper,NULL));CHECK(stop_done && !stop_borrows);}
     for(unsigned i=0;i<8;i++)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
-    CHECK(server->rx_bytes==((mode>=2 && mode<=4)?0:1) && !client->tx_reserved && !client->writes_head && !client->active_writes);
+    CHECK(server->rx_bytes==(mode==9?3U:(mode>=2 && mode<=4)?0U:1U) &&
+          !client->tx_reserved && !client->writes_head && !client->active_writes);
+    if(mode==9) {
+        char received[3];
+        CHECK(pbuf_copy_partial(server->packets_head->payload,received,sizeof(received),0)==sizeof(received) &&
+              !memcmp(received,"rst",sizeof(received)));
+    }
     struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
     if(client->tcp)tcp_abort(client->tcp);
     if(server->tcp)tcp_abort(server->tcp);
@@ -1708,7 +1744,10 @@ static void remote_protocol_request(unsigned mode)
     kernel_socket_network_hooks(NULL,NULL,NULL,NULL);
     kernel_socket_destroy(client);kernel_socket_destroy(server);if(listener)kernel_socket_destroy(listener);
     for(unsigned i=0;i<8;i++)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
-    printf("PASS remote protocol %u: CPU1 copies/waits, CPU0 executes, request/OFD/payload returned\n",mode);
+    if(mode==9)
+        puts("PASS remote TCP batch: 2 waiting writers, 2 service units, 1 NODELAY packet, 3 FIFO bytes, quota and owners returned");
+    else
+        printf("PASS remote protocol %u: CPU1 copies/waits, CPU0 executes, request/OFD/payload returned\n",mode);
 }
 
 static void held_work_notification(struct kernel_wait_node *node,uint32_t reason)
@@ -2695,6 +2734,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "remote-protocol")) remote_protocol_request(0);
     else if (!strcmp(argv[1], "remote-batch")) remote_protocol_request(5);
     else if (!strcmp(argv[1], "remote-batch-ack")) remote_protocol_request(7);
+    else if (!strcmp(argv[1], "remote-batch-writers")) remote_protocol_request(9);
     else if (!strcmp(argv[1], "remote-turn")) remote_protocol_request(6);
     else if (!strcmp(argv[1], "remote-quota-notify")) remote_protocol_request(8);
     else if (!strcmp(argv[1], "remote-udp")) remote_protocol_request(1);

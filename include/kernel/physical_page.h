@@ -120,6 +120,11 @@ enum physical_page_status physical_page_release(
     struct physical_page_allocator *allocator,
     uint64_t address);
 
+/* count 不超过上限；每项归还一个 order-0 引用，同一页可有多个 owner。 */
+#define PHYSICAL_PAGE_RELEASE_BATCH_MAX 16U
+void physical_page_release_batch(struct physical_page_allocator *allocator,
+    const uint64_t *addresses, unsigned count);
+
 /* Only finalized order-zero allocations may gain shared owners. */
 enum physical_page_status physical_page_acquire(
     struct physical_page_allocator *allocator,

@@ -2448,7 +2448,7 @@ int kernel_vfs_ftruncate_borrowing(struct kernel_vfs_file *file,
         return result;
     }
     if (node->instance->page_cache != NULL) {
-        if (node->instance->ops->file_metadata_execution == KERNEL_VFS_EXECUTION_CPU0)
+        if (node->instance->ops->file_operation_execution == KERNEL_VFS_EXECUTION_CPU0)
             kernel_assert_service_context();
         struct kernel_page_cache *cache = node->instance->page_cache;
         uint64_t old_size = node->size;
@@ -2624,7 +2624,7 @@ int kernel_vfs_namespace_requires_cpu0(const struct kernel_vfs_mount *mount)
 int kernel_vfs_file_metadata_requires_cpu0(const struct kernel_vfs_file *file)
 {
     struct kernel_vfs_node *node = kernel_vfs_file_node(file);
-    return node && node->instance->ops->file_metadata_execution == KERNEL_VFS_EXECUTION_CPU0 &&
+    return node && node->instance->ops->file_operation_execution == KERNEL_VFS_EXECUTION_CPU0 &&
         kernel_page_cache_needs_cpu0(node->instance->page_cache);
 }
 

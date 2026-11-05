@@ -42,7 +42,7 @@ open/pipe/socket 的编号预留保持到安装或取消；成对 fd 在用户�
 ext4 路径查找、目录操作与文件元数据在发起 CPU 执行；VFS 在实际解析出的后端选择执行位置。设备、proc等对象在取得锁和用户页借用前进入所需的CPU0范围，嵌套调用借用同一执行资格。冷读与后端操作共用既有 FIFO，16 项后检查写回并让出；停止取消尚未执行的请求，已经执行的请求须实际结束才能归还。执行位置见[RV 两核](riscv-smp.md#普通文件io的执行位置)。
 
 `make test-file-io-concurrency-host`覆盖4/16KiB、2/4线程的共享offset和独立追加OFD、冷匿名缓冲、精确EFAULT前缀、自持 pin 拒绝及最终引用回收，链接真实MM/VFS/tmpfs/cache/lwext4。
-host模型只提供线程/架构上下文及未开放消费者的abort；task定位与scratch使用生产实现。新增共享read/readv包唯一性、热读不排队、冷读期间同OFD seek在提交前等待，以及伪造guard和自持用户pin拒绝检查。独立 fsync 与范围同步分别停在实际 CPU0 执行入口后，同一 OFD 的热 read 与 SEEK_CUR 仍完成；竞争同步排队后只消费一次已有写回错误，完成时请求及 OFD 引用归还。实际跨核执行见[两核模块](riscv-smp.md#普通文件io的执行位置)。
+host模型只提供线程/架构上下文及未开放消费者的abort；task定位与scratch使用生产实现。新增共享read/readv包唯一性、热读不排队、冷读期间同OFD seek在提交前等待，以及伪造guard和自持用户pin拒绝检查。暂停独立 fsync 或范围同步的调用时，同一 OFD 的热 read 与 SEEK_CUR 仍完成；竞争同步只消费一次已有写回错误，完成时请求及 OFD 引用归还。实际跨核执行见[两核模块](riscv-smp.md#普通文件io的执行位置)。
 宿主另强制交错执行中close/dup复用及worker停止：排队者被取消，执行者仍返回原OFD内容，最后请求/引用归零；调用 CPU 的冷缺页复制经 fork 私有页验证 COW 隔离。真实RV单/两核、双RAM与独立重启以及原静态/pthread组合见[普通文件交接](riscv-smp.md#普通文件io的执行位置)。
 `make test-files-concurrency-host`直接链接真实表/OFD/pipe、allocator、MM 和等待实现，
 在 4/16 KiB 模型核对 2/4 线程扩容/dup 编号唯一性、pin-close 交接、预留冲突、OOM 和引用归还；

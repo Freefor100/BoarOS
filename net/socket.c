@@ -44,6 +44,7 @@
 #define SOCKET_RAW 3
 #define NETLINK_COOKIE_SIZE 32U
 #define UDP_MAX_PAYLOAD 65507U
+#define SOCKET_WRITE_BATCH 4U
 #define SOCKET_WRITE_RETRY_MS 250U
 
 struct socket_packet {
@@ -2892,23 +2893,21 @@ int kernel_socket_stream_reserve(struct kernel_socket_write_request *request,
     socket_state_release(&irq);
     return error ? error : (int)size;
 }
-static void stream_release_reservation(struct kernel_socket_write_request *request, int notify)
+void kernel_socket_stream_cancel(struct kernel_socket_write_request *request)
 {
     if (!request->reserved) return;
     SOCKET_STATE(irq);
     if (request->socket->tx_reserved < request->reserved) __builtin_trap();
     uint32_t previous=tcp_admission_capacity_locked(request->socket);
     request->socket->tx_reserved -= request->reserved; request->reserved = 0;
-    if (notify && tcp_admission_capacity_locked(request->socket)>previous)
+    if (tcp_admission_capacity_locked(request->socket)>previous)
         socket_state_notify(&request->socket->wait);
     socket_state_release(&irq);
 }
-void kernel_socket_stream_cancel(struct kernel_socket_write_request *request)
-{ stream_release_reservation(request, 1); }
 void kernel_socket_stream_finish(struct kernel_socket_write_request *request)
 {
     int deferred=(request->progressed & SOCKET_WRITE_DEFERRED)!=0;
-    stream_release_reservation(request, 1);
+    kernel_socket_stream_cancel(request);
     if(deferred)(void)protocol_request(request,SOCKET_PROTOCOL_FLUSH);
     socket_write_end(request);
     if (*request->pin_owner || !request->pin) __builtin_trap();
@@ -2917,22 +2916,35 @@ void kernel_socket_stream_finish(struct kernel_socket_write_request *request)
     request->socket = 0;
 }
 
-static int stream_commit_owned(struct kernel_socket_write_request *request,
-    const struct kernel_socket_write_segment *segments, unsigned count, uint32_t flags)
+static void complete_protocol_request_locked(struct kernel_socket_write_request *request)
 {
+#if BOAROS_COST_DIAGNOSTICS
+    request->completed_ticks=kernel_cost_clock();
+#endif
+    request->segments=0;
+    request->queued=0;
+    /* 原调用者在同一端点锁下等待结果，定向通知期间请求和栈仍然有效。 */
+    if(kernel_wait_notify(&request->completion,KERNEL_WAIT_WOKEN)!=KERNEL_SCHEDULER_STATUS_OK)
+        __builtin_trap();
+}
+
+static int stream_copy_owned(struct kernel_socket_write_request *request,
+    uint32_t completed_reservations, int *flush)
+{
+    const struct kernel_socket_write_segment *segments=request->segments;
+    unsigned count=request->segment_count;
+    uint32_t flags=request->flags;
     if (!count || !request->reserved) __builtin_trap();
     struct kernel_socket *socket = request->socket;
     uint32_t total = 0, available = 0;
-    int result, flush = 0;
+    int result;
     { SOCKET_STATE(endpoint);
       result = tcp_write_state(socket, flags, !request->progressed, request->task);
-      if (socket->tx_reserved < request->reserved) __builtin_trap();
-      uint32_t others = socket->tx_reserved - request->reserved;
+      if (socket->tx_reserved < (uint64_t)completed_reservations + request->reserved) __builtin_trap();
+      uint32_t others = socket->tx_reserved - completed_reservations - request->reserved;
       uint32_t budget = result ? 0 : tcp_protocol_budget(socket);
       available = budget > others ? budget - others : 0;
     }
-    /* 整份reservation一直覆盖本批已COPY和未COPY的前缀，旧published预算
-     * 因而不会被远端重复接纳；批内不再逐页预扣或发布同一份PCB容量。 */
     for (unsigned i = 0; !result && i < count; i++) {
         uint32_t size = segments[i].size;
         if (!size || size > request->reserved - total) __builtin_trap();
@@ -2940,7 +2952,7 @@ static int stream_commit_owned(struct kernel_socket_write_request *request,
         if (tcp_sndqueuelen(socket->tcp) >= TCP_SND_QUEUELEN) length = 0;
         if (length > size) length = size;
         if (length > UINT16_MAX) length = UINT16_MAX;
-        if (!length) { result = -KERNEL_EAGAIN; flush = 1; break; }
+        if (!length) { result = -KERNEL_EAGAIN; *flush = 1; break; }
         socket_statistics.tcp_write_calls++;
         err_t error = tcp_write(socket->tcp, segments[i].data, (u16_t)length,
             TCP_WRITE_FLAG_COPY | (((flags & KERNEL_SOCKET_IO_MORE) || i + 1 < count) ? TCP_WRITE_FLAG_MORE : 0));
@@ -2953,49 +2965,67 @@ static int stream_commit_owned(struct kernel_socket_write_request *request,
             /* 全局segment/pbuf不足仍隐藏POLLOUT，等待真实归还或协议timer。 */
             write_retry_arm(socket);
             socket_pool_wait(socket);
-            result = -KERNEL_EAGAIN; flush = 1;
+            result = -KERNEL_EAGAIN; *flush = 1;
         } else result = lwip_error(error);
     }
     if (total) result = (int)total;
-    SOCKET_STATE(endpoint);
-    if (socket->tx_reserved < request->reserved) __builtin_trap();
-    uint32_t others = socket->tx_reserved - request->reserved;
-    uint32_t budget = tcp_protocol_budget(socket);
     if (result > 0) {
-        uint32_t remaining = budget > others ? budget - others : 0;
-        request->progressed = SOCKET_WRITE_ACCEPTED |
-            (((flags & KERNEL_SOCKET_IO_MORE) && remaining) ? SOCKET_WRITE_DEFERRED : 0U);
-        if (!(flags & KERNEL_SOCKET_IO_MORE) || !remaining) flush = 1;
+        request->progressed = SOCKET_WRITE_ACCEPTED;
+        if (flags & KERNEL_SOCKET_IO_MORE) {
+            SOCKET_STATE(endpoint);
+            uint32_t others = socket->tx_reserved - completed_reservations - request->reserved;
+            if (tcp_protocol_budget(socket) > others) request->progressed |= SOCKET_WRITE_DEFERRED;
+            else *flush = 1;
+        } else *flush = 1;
     }
     if (result == -KERNEL_EAGAIN) {
-        flush = 1;
+        *flush = 1;
         request->progressed &= (uint8_t)~SOCKET_WRITE_DEFERRED;
+        COST_ADD(STREAM_PROTOCOL_BLOCKED, 1);
     }
-    if (flush) {
-        /* 先产生输出/loopback工作，再公开本批归还的额度；协议调用不能持raw。 */
-        socket_state_release(&endpoint);
-        tcp_flush_output(socket);
-        socket_state_acquire(&endpoint);
-        budget = tcp_protocol_budget(socket);
-    }
-    uint32_t previous=tcp_admission_capacity_locked(socket);
-    socket->tx_budget = budget;
-    stream_release_reservation(request, 0);
-    /* COPY消耗与本批预约归还共同决定真实接纳变化；请求完成本身不唤醒
-     * 其他额度等待者，短前缀释放出的未用额度仍在这里发布。 */
-    if(tcp_admission_capacity_locked(socket)>previous)socket_state_notify(&socket->wait);
-    socket_state_release(&endpoint);
-    if (result == -KERNEL_EAGAIN) COST_ADD(STREAM_PROTOCOL_BLOCKED, 1);
     return result;
+}
+
+static void stream_commit_owned(struct kernel_socket_write_request **requests, unsigned count)
+{
+    COST_SCOPE(execution, NETWORK_PROTOCOL_EXEC_TICKS);
+    struct kernel_socket *socket=requests[0]->socket;
+    uint32_t reserved=0;
+    int flush=0;
+    /* 预约在输出前仍计入远端可接纳额度；CPU0 读实际 PCB 额度时，
+     * 已处理请求的预约不再重复扣减。 */
+    for(unsigned i=0;i<count;i++) {
+        struct kernel_socket_write_request *request=requests[i];
+#if BOAROS_COST_DIAGNOSTICS
+        if(request->queued)request->executing_ticks=kernel_cost_clock();
+#endif
+        request->result=stream_copy_owned(request,reserved,&flush);
+        reserved+=request->reserved;
+    }
+    if(flush)tcp_flush_output(socket);
+    SOCKET_STATE(endpoint);
+    uint32_t previous=tcp_admission_capacity_locked(socket);
+    tcp_publish_capacity_locked(socket);
+    if(socket->tx_reserved<reserved)__builtin_trap();
+    socket->tx_reserved-=reserved;
+    for(unsigned i=0;i<count;i++) {
+        struct kernel_socket_write_request *request=requests[i];
+        request->reserved=0;
+        if(request->queued)complete_protocol_request_locked(request);
+    }
+    /* COPY 消耗与预约归还共同决定额度变化，只有净增加才唤醒额度等待者。 */
+    if(tcp_admission_capacity_locked(socket)>previous)socket_state_notify(&socket->wait);
 }
 
 static int execute_protocol_request(struct kernel_socket_write_request *request)
 {
+    if(request->operation==SOCKET_PROTOCOL_STREAM) {
+        stream_commit_owned(&request,1);
+        return request->result;
+    }
     COST_SCOPE(execution, NETWORK_PROTOCOL_EXEC_TICKS);
     struct kernel_socket *socket=request->socket;
     switch(request->operation) {
-    case SOCKET_PROTOCOL_STREAM:
-        return stream_commit_owned(request,request->segments,request->segment_count,request->flags);
     case SOCKET_PROTOCOL_UDP_PREPARE: {
         int error=request->destination?address_import(socket,request->destination,request->protocol_address,0):0;
         if(error)return error;
@@ -3046,7 +3076,7 @@ static int protocol_request(struct kernel_socket_write_request *request,enum soc
     request->queued=1;
     if(socket->writes_tail)socket->writes_tail->next=request;else socket->writes_head=request;
     /* 入队只发布待服务请求；STREAM/FLUSH 按实际窗口与 IO_MORE 决定输出。 */
-    socket->writes_tail=request;socket_schedule(socket,SOCKET_WORK_REAP);
+    socket->writes_tail=request;socket_schedule(socket,0);
     while(request->queued) {
         COST_ADD(NETWORK_PROTOCOL_PARKS, 1);
         enum kernel_wait_wake_reason reason;
@@ -3453,62 +3483,57 @@ int kernel_socket_work_pending(void)
     return runnable;
 }
 
-static void service_write(struct kernel_socket *socket)
+static unsigned service_ready_socket(unsigned budget)
 {
-    SOCKET_STATE(irq);
-    struct kernel_socket_write_request *request = socket->writes_head;
-    if (!request) { socket_state_release(&irq); return; }
-    socket->writes_head = request->next;
-    if (!socket->writes_head) socket->writes_tail = 0;
-    request->next = 0;
-    socket_state_release(&irq);
-    int result;
-    {SOCKET_STATE(state);result=network_stopping && request->operation<SOCKET_PROTOCOL_DISPOSE?-KERNEL_EIO:0;}
-#if BOAROS_COST_DIAGNOSTICS
-    request->executing_ticks=kernel_cost_clock();
-#endif
-    if(!result)result=execute_protocol_request(request);
-#if BOAROS_COST_DIAGNOSTICS
-    request->completed_ticks=kernel_cost_clock();
-#endif
-    socket_state_acquire(&irq);
-    request->result = result;
-    request->segments = 0;request->queued=0;
-    if (socket->writes_head) socket_schedule(socket, SOCKET_WORK_REAP);
-    /* 原调用者重新取得端点保护前保活请求；在发布结果的同一保护内
-     * 定向通知，ACK/POLLOUT 不再唤醒尚未完成 COPY 的等待者。 */
-    if(kernel_wait_notify(&request->completion,KERNEL_WAIT_WOKEN)!=KERNEL_SCHEDULER_STATUS_OK)__builtin_trap();
-    socket_state_release(&irq);
-}
-
-static int service_ready_socket(void)
-{
+    struct kernel_socket_write_request *requests[SOCKET_WRITE_BATCH];
+    unsigned count=0;
     SOCKET_STATE(irq);
     if (!ready_work.head) { socket_state_release(&irq); return 0; }
     struct kernel_socket *socket = ready_work.head;
     unsigned flags = socket->work_flags; socket->work_flags = 0;
     work_remove(&ready_work, socket);
+    int stopping=network_stopping;
+    while(count<budget && count<SOCKET_WRITE_BATCH && socket->writes_head) {
+        struct kernel_socket_write_request *request=socket->writes_head;
+        if(count && (stopping || request->operation!=SOCKET_PROTOCOL_STREAM ||
+                     (request->flags & KERNEL_SOCKET_IO_MORE)))break;
+        socket->writes_head=request->next;
+        request->next=0;
+        requests[count++]=request;
+        /* IO_MORE 的前缀不随其他请求的正常末批提前输出。 */
+        if(request->operation!=SOCKET_PROTOCOL_STREAM || (request->flags & KERNEL_SOCKET_IO_MORE))break;
+    }
+    /* 就绪链在同一保护内摘除并重新入队，已有的工作通知仍覆盖余项。 */
+    if(socket->writes_head)work_add_locked(&ready_work,socket,0);
+    else socket->writes_tail=0;
     socket_state_release(&irq);
-    retire_received(socket);
+    if (flags & SOCKET_WORK_REAP) retire_received(socket);
     if ((flags & SOCKET_WORK_LISTENER) && socket->listening) purge_dead_pending(socket);
     if ((flags & SOCKET_WORK_RECEIVE) && socket->receive_retry && socket->tcp && socket->tcp->refused_data)
         (void)tcp_process_refused_data(socket->tcp);
-    retire_timewait(socket);
-    if ((flags & SOCKET_WORK_OUTPUT) && socket->tcp && !socket->listening && socket->tcp->unsent) {
-        nic_blocked = 0;
-        err_t error = tcp_output(socket->tcp);
-        if (error == ERR_MEM) {
-            if (nic_blocked) { SOCKET_STATE(state);work_remove(&nic_wait, socket); work_add_locked(&nic_wait, socket, nic_generation); }
-            else socket_pool_wait(socket);
-        }
-    }
+    if (flags) retire_timewait(socket);
     /* 已捕获的OUTPUT属于此前输入/重试；先完成它，再接纳新COPY，
      * 避免旧标记把新请求仍可合批的IO_MORE前缀提前送入协议。 */
-    service_write(socket);
-    SOCKET_STATE(state);
-    uint32_t previous = tcp_admission_capacity_locked(socket);
-    tcp_publish_capacity_locked(socket);
-    if (tcp_admission_capacity_locked(socket) > previous) wake_socket(socket);
+    if ((flags & SOCKET_WORK_OUTPUT) && !socket->listening)tcp_flush_output(socket);
+    if(count && requests[0]->operation==SOCKET_PROTOCOL_STREAM && !stopping) {
+        stream_commit_owned(requests,count);
+        return count;
+    }
+    struct kernel_socket_write_request *request=count?requests[0]:NULL;
+    if(request) {
+#if BOAROS_COST_DIAGNOSTICS
+        request->executing_ticks=kernel_cost_clock();
+#endif
+        request->result=stopping && request->operation<SOCKET_PROTOCOL_DISPOSE?
+            -KERNEL_EIO:execute_protocol_request(request);
+    }
+    if(flags || request) {
+        SOCKET_STATE(state);
+        uint32_t previous=tcp_admission_capacity_locked(socket);
+        tcp_publish_capacity_locked(socket);
+        if(tcp_admission_capacity_locked(socket)>previous)wake_socket(socket);
+        if(request)complete_protocol_request_locked(request);
+    }
     return 1;
 }
 static int service_capacity(void)
@@ -3557,6 +3582,7 @@ struct kernel_socket_service_result kernel_socket_service_owned(const struct ker
 {
     struct kernel_socket_service_result result = {0};
 #if BOAROS_COST_DIAGNOSTICS
+    unsigned visits=0;
     if (polling_snapshot) COST_ADD(NETWORK_POLL_SERVICES, 1);
 #endif
     if (!scope->outer || protocol_owner != kernel_io_context_current() || protocol_depth != 1) __builtin_trap();
@@ -3565,16 +3591,19 @@ struct kernel_socket_service_result kernel_socket_service_owned(const struct ker
     service_loopback(&result, budget.packets);
     /* 容量、到期重试和实际socket工作共用额度，沿原游标轮转。 */
     while (result.sockets < budget.sockets) {
-        int advanced = 0;
+        unsigned advanced = 0;
         for (unsigned i = 0; i < 3; i++) {
             unsigned which = service_cursor;
             service_cursor = (service_cursor + 1) % 3;
-            advanced = which == 0 ? service_ready_socket() :
-                which == 1 ? service_capacity() : service_retry_deadline();
+            if (which == 0) advanced=service_ready_socket(budget.sockets-result.sockets);
+            else advanced=which == 1 ? service_capacity() : service_retry_deadline();
             if (advanced) break;
         }
         if (!advanced) break;
-        result.sockets++;
+        result.sockets+=advanced;
+#if BOAROS_COST_DIAGNOSTICS
+        visits++;
+#endif
     }
     /* 先批量接收旧ACK归还额度；本批COPY/窗口更新产生了新包时，
      * 使用尚未用完的原包预算交付，避免无谓地再等worker一次调度。 */
@@ -3585,7 +3614,7 @@ struct kernel_socket_service_result kernel_socket_service_owned(const struct ker
     socket_timer_running = 0;
     result.runnable = kernel_socket_work_pending();
     result.next_deadline = socket_next_timer_deadline();
-    COST_ADD(NETWORK_SOCKET_VISITS, result.sockets);
+    COST_ADD(NETWORK_SOCKET_VISITS, visits);
     COST_ADD(NETWORK_LOOP_PACKETS, result.packets);
     COST_ADD(NETWORK_TIMER_CALLBACKS, result.timers);
     return result;

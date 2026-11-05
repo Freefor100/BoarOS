@@ -2546,7 +2546,7 @@ static int prepare_space_request(struct kernel_page_cache *cache,struct prepare_
         __builtin_trap();
     for (struct kernel_lock_guard *g=context->locks;g;g=g->previous)
         if (g->lock->rank>15) __builtin_trap();
-    if (request->node->instance->ops->file_metadata_execution == KERNEL_VFS_EXECUTION_CPU0 &&
+    if (request->node->instance->ops->file_operation_execution == KERNEL_VFS_EXECUTION_CPU0 &&
         kernel_page_cache_needs_cpu0(cache)) {
         if (run_request(cache,execute,request,1,NULL)) return -KERNEL_EIO;
     } else execute(request);
@@ -3308,6 +3308,7 @@ int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *cache,
 {
     if (!cache_live(cache) || !node || start>=end) return -KERNEL_EINVAL;
     if (kernel_lock_held(&node->io_lock,0)) __builtin_trap();
+    struct kernel_page_cache_record *r=cache->record;
     uint64_t cursor=start>>BOAROS_PAGE_SHIFT,last=(end-1)>>BOAROS_PAGE_SHIFT;
     struct kernel_page_cache_entry *single=NULL;
     int multiple=0;
@@ -3319,17 +3320,24 @@ int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *cache,
         if (last>tail->page_index) last=tail->page_index;
         struct kernel_page_cache_entry *next=RB_NEXT(kernel_page_cache_dirty_tree,&kernel_vfs_node_dirty_pages(node)->tree,entry);
         multiple=next && next->page_index<=last;
+        request_borrow_locked(r);
     }
     reclaim_window_memory(cache);
     union foreground_workspace *lease=multiple?foreground_workspace_take(cache):NULL;
-    if (multiple && !lease) return -KERNEL_ENOMEM;
+    if (multiple && !lease) {
+        request_return(r);
+        return -KERNEL_ENOMEM;
+    }
     struct writeback_workspace work=multiple?(struct writeback_workspace){
         .prepared=lease->writeback.prepared,.spans=lease->writeback.spans,
         .selected=lease->writeback.selected}:(struct writeback_workspace){0};
     struct foreground_writeback request={.cache=cache,.node=node,.cursor=cursor,.last=last,
         .end=end,.selected=multiple?work.selected:&single,.workspace=multiple?&work:NULL,
         .capacity=multiple?BOAROS_PAGE_CACHE_WRITEBACK_PAGES:1};
-    int dispatch=kernel_page_cache_needs_cpu0(cache);
+    /* 前台批次使用调用者的描述符和稳定版本，可与同一 cache 上另一设备的
+     * 后台写回并行。只在后端要求 CPU0 时借用执行队列。 */
+    int dispatch=node->instance->ops->file_operation_execution==KERNEL_VFS_EXECUTION_CPU0 &&
+        kernel_page_cache_needs_cpu0(cache);
     if (dispatch) {
         if (run_cpu0_until(cache,writeback_window,&request,borrowed,&request.done))
             request.result=-KERNEL_EIO;
@@ -3347,6 +3355,7 @@ int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *cache,
         }
     }
     if (lease) foreground_workspace_put(cache,lease);
+    request_return(r);
     return request.result;
 }
 
