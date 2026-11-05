@@ -569,6 +569,7 @@ static void entry_return(struct kernel_page_cache_entry *entry)
 
 static void readahead_cancel_node(struct kernel_page_cache *cache, struct kernel_vfs_node *node);
 static void group_notify(void *context);
+static void notify_dirty_node(struct kernel_page_cache *,struct kernel_vfs_node *);
 static void pressure_wait(void *context);
 static size_t entry_valid_bytes(const struct kernel_page_cache_entry *entry);
 
@@ -1517,7 +1518,7 @@ void kernel_page_cache_alias_mark_dirty(struct kernel_page_cache_alias *alias)
         if (!end) __builtin_trap();
         dirty_mark(entry,0,end);
     }
-    kernel_page_cache_notify_pressure(cache);
+    notify_dirty_node(cache,entry->node);
 }
 #define CACHE_WRITES_CLOSED (UINT64_C(1)<<63)
 #define CACHE_ENTRY_CLOSED  (UINT64_C(1)<<62)
@@ -2481,17 +2482,14 @@ static enum kernel_page_cache_status prepare_write_entry(struct kernel_page_cach
         void *bytes;
         return allocate_entry(cache,node,index,!whole,candidate,&bytes);
     }
-    size_t valid;
-    enum kernel_page_cache_status status=kernel_page_cache_get(cache,file,index,address,&valid);
+    struct kernel_page_cache_read_page page={0};
+    enum kernel_page_cache_status status=kernel_page_cache_get_batch(cache,file,index,&page,1);
     if (status) return status;
-    {
-        CACHE_SCOPE(guard,cache);
-        status=lookup_entry(cache,file,index,entry);
-        if (!status && (*entry)->physical_address==*address) entry_borrow(*entry);
-        else { *entry=NULL; status=KERNEL_PAGE_CACHE_STATUS_NOT_FOUND; }
-    }
-    if (physical_page_release(cache->allocator,*address)) __builtin_trap();
-    return status;
+    /* 装入器已经交出真实entry借用，直接转给写入现场；不先换成物理
+     * 引用再查询索引取回同一借用。文件写操作门排除同inode的退休。 */
+    if (!page.entry) __builtin_trap();
+    *entry=page.entry;*address=page.physical_address;
+    return KERNEL_PAGE_CACHE_STATUS_OK;
 }
 
 struct prepare_space {
@@ -2759,7 +2757,7 @@ int kernel_page_cache_write_source(struct kernel_page_cache *cache,
     if (kernel_lock_held(&node->io_lock,0)) __builtin_trap();
     int result=write_cached_source(cache,file,offset,source,size,written);
     /* 按实际接纳的范围发布一次脏工作，部分成功后出错也必须通知。 */
-    if (*written) kernel_page_cache_notify_pressure(cache);
+    if (*written) notify_dirty_node(cache,node);
     return result;
 }
 
@@ -3575,11 +3573,9 @@ uint64_t kernel_page_cache_reclaim(struct kernel_page_cache *cache,uint64_t targ
     return released;
 }
 
-static void group_notify(void *context)
+static void group_notify_available(struct page_cache_group *g,uint64_t available)
 {
-    struct page_cache_group *g=context;
-    if (kernel_io_context_current()->background_reclaim) return;
-    uint64_t available=physical_page_available(g->allocator),dirty=group_dirty(g);
+    uint64_t dirty=group_dirty(g);
     KERNEL_RAW_SCOPE(guard,&g->metadata);
     for (struct kernel_page_cache_record *r=g->head;r;r=r->next) {
         if (!r->started || r->stopping || (available>r->low && (g->domains || dirty<background_limit(r->dirty_high)))) continue;
@@ -3593,6 +3589,36 @@ static void group_notify(void *context)
             if (!r->started || r->stopping) continue;
             r->requested=1;cache_wake(&r->work);
         }
+    }
+}
+
+static void group_notify(void *context)
+{
+    struct page_cache_group *g=context;
+    if (kernel_io_context_current()->background_reclaim) return;
+    group_notify_available(g,physical_page_available(g->allocator));
+}
+
+static void notify_dirty_node(struct kernel_page_cache *cache,struct kernel_vfs_node *node)
+{
+    if (kernel_io_context_current()->background_reclaim) return;
+    struct kernel_page_cache_record *r=cache->record;
+    struct page_cache_group *g=r->group;
+    struct kernel_writeback_domain *domain=node->instance->writeback.domain;
+    uint64_t available=physical_page_available(g->allocator);
+    if (!domain || !r->started || available<=r->low) {
+        group_notify_available(g,available);
+        return;
+    }
+    /* 文件引用保活所属domain。此次标脏只增加该后备域；正常水位无需
+     * 取得全组锁或遍历无关挂载。低内存仍由全组共同推进。 */
+    if (!__atomic_load_n(&domain->dirty_bytes,__ATOMIC_RELAXED) ||
+        domain_bytes(domain)<background_limit(domain_limit(domain,0))) return;
+    KERNEL_RAW_SCOPE(guard,&g->metadata);
+    for (struct kernel_writeback_owner *owner=domain->members;owner;owner=owner->next) {
+        struct kernel_page_cache_record *member=owner->cache->record;
+        if (!member->started || member->stopping) continue;
+        member->requested=1;cache_wake(&member->work);
     }
 }
 
