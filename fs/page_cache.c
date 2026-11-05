@@ -270,27 +270,20 @@ _Static_assert(sizeof(union foreground_workspace) <= 2U*BOAROS_PAGE_SIZE,
     "foreground descriptors must fit two physical pages");
 
 /* cache保留一个空闲控制区；借出后由调用现场独占。竞争者取得独立区，
- * 不在inode I/O资格或loading页借用下等待另一批归还。 */
+ * 不在inode I/O资格或loading页借用下等待另一批归还。
+ * 原子指针只转移闲置owner；使用期仍由挂载或请求借用固定cache寿命。 */
 static union foreground_workspace *foreground_workspace_take(struct kernel_page_cache *cache)
 {
-    union foreground_workspace *workspace;
-    {
-        CACHE_SCOPE(guard,cache);
-        workspace=cache->record->foreground_workspace;
-        cache->record->foreground_workspace=NULL;
-    }
+    union foreground_workspace *workspace=__atomic_exchange_n(
+        &cache->record->foreground_workspace,NULL,__ATOMIC_ACQUIRE);
     if (!workspace && kernel_heap_allocate(cache->heap,sizeof(*workspace),(void **)&workspace)) return NULL;
     return workspace;
 }
 static void foreground_workspace_put(struct kernel_page_cache *cache,union foreground_workspace *workspace)
 {
-    {
-        CACHE_SCOPE(guard,cache);
-        if (!cache->record->foreground_workspace) {
-            cache->record->foreground_workspace=workspace;
-            return;
-        }
-    }
+    union foreground_workspace *empty=NULL;
+    if (__atomic_compare_exchange_n(&cache->record->foreground_workspace,&empty,
+        workspace,0,__ATOMIC_RELEASE,__ATOMIC_RELAXED)) return;
     kernel_heap_release(cache->heap,workspace);
 }
 struct read_batch_load {
@@ -1737,10 +1730,13 @@ static enum kernel_page_cache_status allocate_entry(struct kernel_page_cache *ca
     *output=entry;*bytes=page;
     return KERNEL_PAGE_CACHE_STATUS_OK;
 }
-static void publish_entry(struct kernel_page_cache *cache,struct kernel_page_cache_entry *entry,size_t bucket)
+static void publish_entry(struct kernel_page_cache *cache,struct kernel_page_cache_entry *entry,
+    size_t bucket,enum kernel_page_cache_status status)
 {
     struct kernel_page_cache_record *r=cache->record;
-    kernel_wait_queue_init(&entry->ready);__atomic_store_n(&entry->load_status,KERNEL_PAGE_CACHE_STATUS_BUSY,__ATOMIC_RELAXED);entry_borrow(entry);
+    kernel_wait_queue_init(&entry->ready);
+    __atomic_store_n(&entry->load_status,status,__ATOMIC_RELAXED);
+    if (status==KERNEL_PAGE_CACHE_STATUS_BUSY) entry_borrow(entry);
     if (r->buckets[bucket]==PAGE_CACHE_TOMBSTONE) r->tombstones--;
     r->buckets[bucket]=entry;r->occupied++;
     entry->node_next=*kernel_vfs_node_cache_pages(entry->node);
@@ -1944,7 +1940,7 @@ static void readahead_load(struct kernel_page_cache *cache, struct readahead_job
             if (!room || job->cancelled || r->stopping || found) {
                 entry->cleanup_next = discard; discard = entry;
             } else {
-                publish_entry(cache, entry, bucket);
+                publish_entry(cache, entry, bucket,KERNEL_PAGE_CACHE_STATUS_BUSY);
                 entries[count] = entry; spans[count++] = spans[i];
             }
         }
@@ -2139,7 +2135,7 @@ void kernel_page_cache_put_batch(struct kernel_page_cache *cache,
                 if (entry) {
                     entry_return(entry);
                     if (entry->retired && !entry->users) {
-                        remove_entry(cache, entry);
+                        /* truncate/hole已移除索引，只推进退休owner的释放。 */
                         clean = 1;
                     }
                     pages[i].entry = NULL;
@@ -2229,7 +2225,7 @@ static void commit_read_batch(void *argument)
                 } else { entry_borrow(entry);entries[i]=entry; }
                 if (candidate) { candidate->cleanup_next=discard;discard=candidate; }
             } else if (candidate) {
-                publish_entry(cache,candidate,bucket);
+                publish_entry(cache,candidate,bucket,KERNEL_PAGE_CACHE_STATUS_BUSY);
                 loads[ready]=candidate;spans[ready]=spans[i];outputs[ready]=&pages[i];ready++;
             } else {
                 if (!allocation) __builtin_trap();
@@ -2680,28 +2676,33 @@ PrepareTarget:
             }
         }
         kernel_vfs_node_lock(node,&io,1);
-        int admitted=0,loading=0;
+        int admitted=0,published=0;
         if (candidate) {
+            /* 私有页尚无读取者；先填入，再一次发布ready和dirty。
+             * 竞胜页或写资格关闭时，原来源游标仍可重试。 */
+            struct kernel_vfs_write_source copied_source=*source;
+            void *page;
+            if (physical_page_map_owned(cache->allocator,candidate->physical_address,&page)) __builtin_trap();
+            kernel_vfs_write_source_copy_view(&copied_source,(unsigned char *)page+start,&view);
             CACHE_SCOPE(guard,cache);
             int found; size_t bucket=find_bucket(cache->record,node,offset>>BOAROS_PAGE_SHIFT,&found);
             if (found) {
                 struct kernel_page_cache_entry *current=cache->record->buckets[bucket];
-                if (entry_load_status(current) == KERNEL_PAGE_CACHE_STATUS_OK) entry=current;
+                if (entry_load_status(current) == KERNEL_PAGE_CACHE_STATUS_OK) {
+                    entry=current;entry_borrow(entry);address=entry->physical_address;
+                    admitted=resize.entry==entry || writer_begin(entry,&writer);
+                }
             } else if (cache->record->occupied+cache->record->tombstones+1 <=
                 cache->record->capacity-cache->record->capacity/4) {
-                entry=candidate; candidate=NULL;
-                publish_entry(cache,entry,bucket); loading=1;
+                publish_entry(cache,candidate,bucket,KERNEL_PAGE_CACHE_STATUS_OK);
+                dirty_mark(candidate,start,start+count);
+                candidate=NULL;*source=copied_source;admitted=published=1;
             }
-            if (entry) {
-                entry_borrow(entry); address=entry->physical_address;
-            }
-            if (entry) admitted=resize.entry==entry || writer_begin(entry,&writer);
         } else if (entry) {
             admitted=resize.entry==entry || writer_begin(entry,&writer);
         }
         if (candidate) (void)abandon_entry(cache,candidate,KERNEL_PAGE_CACHE_STATUS_OK);
         if (!admitted) {
-            if (loading) __builtin_trap(); /* 新候选尚无其他写入者。 */
             kernel_lock_release(&io);
             kernel_vfs_write_source_finish(source,&view);
             kernel_page_cache_resize_finish(&resize,old_size);
@@ -2711,14 +2712,15 @@ PrepareTarget:
             }
             continue;
         }
-        void *page;
-        if (physical_page_map_owned(cache->allocator,address,&page)) __builtin_trap();
-        kernel_vfs_write_source_copy_view(source,(unsigned char *)page+start,&view);
+        if (!published) {
+            void *page;
+            if (physical_page_map_owned(cache->allocator,address,&page)) __builtin_trap();
+            kernel_vfs_write_source_copy_view(source,(unsigned char *)page+start,&view);
+        }
         resize_apply(&resize,offset>old_size?offset:old_size);
-        {
+        if (!published) {
             CACHE_SCOPE(guard,cache);
             dirty_mark(entry,start,start+count);
-            if (loading) { __atomic_store_n(&entry->load_status,KERNEL_PAGE_CACHE_STATUS_OK,__ATOMIC_RELAXED); entry_return(entry); cache_wake(&entry->ready); }
             if (writer.registration) writer_end_locked(&writer);
             entry_return(entry);
         }
@@ -2849,47 +2851,54 @@ static int prepare_writeback(struct kernel_page_cache *cache,
     for (struct kernel_page_cache_write_borrow *b=kernel_io_context_current()->cache_writes;b;b=b->next)
         if (b->entry==entry) return -KERNEL_EBUSY;
 Retry:
-    for (;;) {
-        struct kernel_wait_token token={0};
-        {
-            CACHE_SCOPE(guard,cache);
-            uint64_t start=entry->page_index<<BOAROS_PAGE_SHIFT;
-            if (entry->retired || !entry->dirty_end || limit<=start || limit-start<=entry->dirty_begin) return 0;
-            if (entry_loading(entry) || !kernel_vfs_node_writeback_allowed(entry->node)) return -KERNEL_EBUSY;
-            if (!entry->writeback && !(__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_WRITES_CLOSED)) {
-                /* 选择批次的借用覆盖准备、等待和完成；版本另按真实读者保活。 */
-                entry->writeback=1; cache->record->writeback_active++; break;
-            }
-            if (background) { entry->retry_blocked=1; return -KERNEL_EBUSY; }
-            if (kernel_wait_prepare(&entry->ready,0,0,&token)) __builtin_trap();
-        }
-        enum kernel_wait_wake_reason reason;
-        if (kernel_wait_park(&token,&reason) || kernel_wait_finish(&token)) __builtin_trap();
-    }
+    /* 选页借用已固定entry；先取得版本，在同一次保护内取得写回资格并关闭
+     * 写者。等待其他owner前归还未使用版本，不把池额度留在等待者手中。 */
     prepared->version=version_take(cache,entry->node);
-    if (!prepared->version) {
-        writeback_unprepare(cache,entry,prepared);
-        if (wait_version && background && cache->record->started &&
-            version_wait(cache)) goto Retry;
-        return -KERNEL_ENOMEM;
-    }
-    int result=0,writing=0;
+    int result=0,writing=0,qualified=0,waiting=0;
+    struct kernel_wait_token wait={0};
     struct kernel_page_cache_alias *aliases=NULL;
     {
         CACHE_SCOPE(guard,cache);
-        if (background) {
-            uint64_t expected=0;
-            entry->retry_blocked=1;
-            if (!__atomic_compare_exchange_n(&entry->writes,&expected,CACHE_WRITES_CLOSED,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))
-                result=-KERNEL_EBUSY;
-            else prepared->closed=1;
+        uint64_t start=entry->page_index<<BOAROS_PAGE_SHIFT;
+        if (entry->retired || !entry->dirty_end || limit<=start || limit-start<=entry->dirty_begin) {
+            /* 选择后已变干净或退休，不再取得写回资格。 */
+        } else if (entry_loading(entry) || !kernel_vfs_node_writeback_allowed(entry->node)) {
+            result=-KERNEL_EBUSY;
+        } else if (entry->writeback || (__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_WRITES_CLOSED)) {
+            if (background) { entry->retry_blocked=1; result=-KERNEL_EBUSY; }
+            else {
+                if (kernel_wait_prepare(&entry->ready,0,0,&wait)) __builtin_trap();
+                waiting=1;
+            }
+        } else if (!prepared->version) {
+            result=-KERNEL_ENOMEM;
         } else {
-            uint64_t previous=__atomic_fetch_or(&entry->writes,CACHE_WRITES_CLOSED,__ATOMIC_ACQ_REL);
-            if (previous&CACHE_WRITES_CLOSED || previous&~CACHE_WRITES_MASK) __builtin_trap();
-            prepared->closed=1;
-            writing=(uint32_t)previous!=0;
+            entry->writeback=qualified=1;cache->record->writeback_active++;
+            if (background) {
+                uint64_t expected=0;
+                entry->retry_blocked=1;
+                if (!__atomic_compare_exchange_n(&entry->writes,&expected,CACHE_WRITES_CLOSED,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))
+                    result=-KERNEL_EBUSY;
+                else prepared->closed=1;
+            } else {
+                uint64_t previous=__atomic_fetch_or(&entry->writes,CACHE_WRITES_CLOSED,__ATOMIC_ACQ_REL);
+                if (previous&CACHE_WRITES_CLOSED || previous&~CACHE_WRITES_MASK) __builtin_trap();
+                prepared->closed=1;writing=(uint32_t)previous!=0;
+            }
+            if (!result) { aliases=entry->aliases; alias_borrow(aliases); }
         }
-        if (!result) { aliases=entry->aliases; alias_borrow(aliases); }
+    }
+    if (!qualified) {
+        if (prepared->version) version_release(prepared->version);
+        prepared->version=NULL;
+        if (waiting) {
+            enum kernel_wait_wake_reason reason;
+            if (kernel_wait_park(&wait,&reason) || kernel_wait_finish(&wait)) __builtin_trap();
+            goto Retry;
+        }
+        if (result==-KERNEL_ENOMEM && wait_version && background && cache->record->started &&
+            version_wait(cache)) goto Retry;
+        return result;
     }
     if (!result) result=rearm_aliases(entry,aliases);
     while (!result && writing) {
@@ -4013,7 +4022,9 @@ enum kernel_page_cache_status kernel_page_cache_destroy(struct kernel_page_cache
     uint64_t released=0;
     if (!drain_entries(cache,&released)) return KERNEL_PAGE_CACHE_STATUS_CLEANUP_REQUIRED;
     if (cache->record->buckets) kernel_heap_release(cache->heap,cache->record->buckets);
-    if (cache->record->foreground_workspace) kernel_heap_release(cache->heap,cache->record->foreground_workspace);
+    union foreground_workspace *workspace=__atomic_exchange_n(
+        &cache->record->foreground_workspace,NULL,__ATOMIC_ACQUIRE);
+    if (workspace) kernel_heap_release(cache->heap,workspace);
     version_pool_close(cache->record->versions);
     kernel_heap_release(cache->heap,cache->record);
     cache->heap=NULL;cache->allocator=NULL;cache->record=NULL;cache->state=KERNEL_PAGE_CACHE_RELEASED;

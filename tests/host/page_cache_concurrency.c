@@ -853,6 +853,32 @@ static void *snapshot_hot_reader(void *file)
     assert(!kernel_vfs_pread(file,0,&byte,1,&done,NULL) && done==1 && byte==0x71);
     return NULL;
 }
+static void read_borrow_retirement(struct kernel_page_cache *cache,const char *path)
+{
+    image_fd=open(path,O_RDWR);assert(image_fd>=0);struct stat st;assert(!fstat(image_fd,&st));
+    struct kernel_block_device disk={.read=image_read,.write=image_write,.flush=image_flush,
+        .capacity_bytes=st.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
+    struct kernel_vfs_mount mount={0};struct kernel_vfs_file file={0};
+    assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,cache,0));current_cache=cache;
+    assert(!kernel_vfs_create(&mount,"/read-borrow-retire",0600,&file));
+    unsigned char bytes[BOAROS_PAGE_SIZE];memset(bytes,0x5d,sizeof(bytes));size_t done;
+    assert(!kernel_vfs_pwrite(&file,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+    struct kernel_page_cache_read_page old={0},grown={0};
+    assert(!kernel_page_cache_get_batch(cache,&file,0,&old,1) && old.entry);
+    assert(!kernel_vfs_ftruncate(&file,0) && !kernel_vfs_ftruncate(&file,BOAROS_PAGE_SIZE));
+    assert(!kernel_page_cache_get_batch(cache,&file,0,&grown,1) && grown.entry);
+    assert(old.physical_address!=grown.physical_address &&
+        !memcmp(access_page(old.physical_address),bytes,sizeof(bytes)));
+    const unsigned char *zero=access_page(grown.physical_address);
+    for(size_t i=0;i<BOAROS_PAGE_SIZE;i++)assert(!zero[i]);
+    kernel_page_cache_put_batch(cache,&old,1);
+    kernel_page_cache_put_batch(cache,&grown,1);
+    struct kernel_page_cache_concurrency_state state;
+    kernel_page_cache_get_concurrency_state(cache,&state);assert(!state.entry_borrows);
+    assert(!kernel_vfs_close(&file) && !kernel_vfs_unmount(&mount));
+    assert(!kernel_page_cache_destroy(cache) && !close(image_fd));current_cache=NULL;
+    puts("PASS retired read borrow: truncate/regrowth keeps old contents alive, last batch put cleans once and returns owners");
+}
 static void snapshot_copy_case(struct kernel_page_cache *cache,const char *path)
 {
     image_fd=open(path,O_RDWR);assert(image_fd>=0);struct stat st;assert(!fstat(image_fd,&st));
@@ -1704,11 +1730,11 @@ static void reset_demand_source(void)
     memset(source_batch_sizes, 0, sizeof(source_batch_sizes));
     capture_reads = 1;
 }
-static void demand_idle(struct kernel_page_cache *cache)
+static void demand_idle(struct kernel_page_cache *cache,size_t borrowed)
 {
     struct kernel_page_cache_concurrency_state state;
     kernel_page_cache_get_concurrency_state(cache, &state);
-    assert(!state.pending && !state.running && !state.entry_borrows &&
+    assert(!state.pending && !state.running && state.entry_borrows==borrowed &&
         state.requests_queued == state.requests_completed);
 }
 static void demand_contents(const struct kernel_page_cache_read_page *page,
@@ -1724,11 +1750,10 @@ static void demand_contents(const struct kernel_page_cache_read_page *page,
 static void demand_release(struct demand_read *read)
 {
     for (size_t i = 0; i < read->count; i++) {
-        if (!read->pages[i].status) {
-            assert(!physical_page_release(current_cache->allocator, read->pages[i].physical_address));
-            read->pages[i].physical_address = 0;
-        } else assert(!read->pages[i].physical_address && !read->pages[i].valid_bytes);
+        if (read->pages[i].status)
+            assert(!read->pages[i].physical_address && !read->pages[i].valid_bytes);
     }
+    kernel_page_cache_put_batch(current_cache,read->pages,read->count);
 }
 struct counted_demand {
     size_t count;
@@ -1794,8 +1819,7 @@ static void demand_operation_cases(struct kernel_page_cache *cache, struct kerne
                 assert(!pthread_join(client, 0));
             } else count_demand_read(&read);
             assert(source_batches == !warm && source_reads == (warm ? 0 : count));
-            assert(read.counts.physical_acquires == count &&
-                read.counts.physical_releases == count);
+            assert(!read.counts.physical_acquires && !read.counts.physical_releases);
             assert(!read.counts.descriptor_allocations);
 #ifndef CACHE_MM_CASES
             if(read.counts.cache_allocations!=(warm ? 0 : count))fprintf(stderr,
@@ -1806,13 +1830,13 @@ static void demand_operation_cases(struct kernel_page_cache *cache, struct kerne
             /* expanded_index已建立足够桶容量；这里检查实际保护次数，
              * 避免热页重新退回逐页借用/完成，或冷页重复进入完成处理。 */
             assert(read.counts.inode_locks == !warm);
-            if (warm) assert(read.counts.metadata_locks==1);
-            else assert(read.counts.metadata_locks<=(count==1?4:6));
+            if (warm) assert(read.counts.metadata_locks==2);
+            else assert(read.counts.metadata_locks<=(count==1?5:7));
             printf("read operation counts: page=%u cpu=%s cache=%s pages=%u metadata=%llu inode=%llu acquire=%llu release=%llu cache_probes=unavailable(COST=0) scope=caller\n",
                 (unsigned)BOAROS_PAGE_SIZE, remote ? "remote" : "native", warm ? "hot" : "cold", count,
                 (unsigned long long)read.counts.metadata_locks, (unsigned long long)read.counts.inode_locks,
                 (unsigned long long)read.counts.physical_acquires, (unsigned long long)read.counts.physical_releases);
-            demand_idle(cache);
+            demand_idle(cache,0);
         }
 }
 static void write_owner_counts(struct kernel_page_cache *cache,struct kernel_vfs_file *source)
@@ -1857,7 +1881,7 @@ static void write_owner_counts(struct kernel_page_cache *cache,struct kernel_vfs
     unsigned char actual[BOAROS_PAGE_SIZE];size_t read;
     assert(!kernel_vfs_pread(&file,0,actual,sizeof(actual),&read, NULL) && read==sizeof(actual) && !memcmp(actual,bytes,sizeof(bytes)));
     assert(!kernel_vfs_close(&file));
-    puts("PASS overwrite/append: three metadata locks, three inode phases, no redundant physical refs; one window admission and one final pressure notification, sync/readback verified");
+    puts("PASS overwrite/append: no redundant physical refs; one window admission and one final pressure notification, sync/readback verified");
 }
 static void demand_cold_warm(struct kernel_page_cache *cache, struct kernel_vfs_file *file)
 {
@@ -1881,12 +1905,12 @@ static void demand_cold_warm(struct kernel_page_cache *cache, struct kernel_vfs_
         uint32_t references;
         assert(warm.pages[i].physical_address == cold.pages[i].physical_address);
         assert(!physical_page_reference_count(cache->allocator, warm.pages[i].physical_address, &references) &&
-            references == 3);
+            references == 1);
     }
     demand_release(&warm);
     demand_release(&cold);
-    demand_idle(cache);
-    puts("PASS demand batch: eight cold pages in one backend call; owned refs and request/allocation-free warm hits");
+    demand_idle(cache,0);
+    puts("PASS demand batch: eight cold pages in one backend call; entry borrows and request/allocation-free warm hits");
 }
 static void demand_hot_resize(struct kernel_page_cache *cache,struct kernel_vfs_file *original,unsigned actors)
 {
@@ -1904,6 +1928,10 @@ static void demand_hot_resize(struct kernel_page_cache *cache,struct kernel_vfs_
     assert(!kernel_vfs_sync(&file,0,&observed));
     struct demand_read held={.count=4,.watch_inode=1};read_demand_batch(&held);
     assert(!held.status && !held.inode_attempts);
+    /* 下文独立保留旧物理页来检查MM式pin寿命；普通读取仍使用entry借用。 */
+    for(size_t i=0;i<held.count;i++)
+        assert(!physical_page_acquire(cache->allocator,held.pages[i].physical_address));
+    kernel_page_cache_put_batch(cache,held.pages,held.count);
     struct demand_read scalar_hot={.cpu=1,.count=1,.watch_inode=1,.scalar=1};pthread_t scalar_reader;
     assert(!pthread_create(&scalar_reader,NULL,read_demand_batch,&scalar_hot) && !pthread_join(scalar_reader,NULL));
     assert(!scalar_hot.status && !scalar_hot.inode_attempts);
@@ -1926,10 +1954,9 @@ static void demand_hot_resize(struct kernel_page_cache *cache,struct kernel_vfs_
         assert(mm_test_parked(0)>parked);
         assert(!__atomic_load_n(&waiting.done,__ATOMIC_ACQUIRE));
         uint32_t references;
-        /* 尾页写资格关闭时，批次仍可持有此前取得的完整热页；
-         * 全文件映射关闭则不能取得新页。两者最终都必须归还实际引用。 */
+        /* 读取借用保活entry及其数据页；等待和批次重查不另借物理引用。 */
         assert(!physical_page_reference_count(cache->allocator,held.pages[0].physical_address,&references) &&
-            references==(closed && !scalar ? 3U : 2U));
+            references==2);
         if(closed) kernel_page_cache_resize_finish(&resize,node->size);
         else kernel_file_mapping_open(node);
         kernel_lock_release(&inode);
@@ -1947,7 +1974,7 @@ static void demand_hot_resize(struct kernel_page_cache *cache,struct kernel_vfs_
     assert(!pthread_create(&mixed_reader,NULL,read_demand_batch,&mixed));
     wait_progress(&mixed.inode_attempts,1);
     uint32_t references;
-    assert(!physical_page_reference_count(cache->allocator,prefix.pages[0].physical_address,&references) && references==3);
+    assert(!physical_page_reference_count(cache->allocator,prefix.pages[0].physical_address,&references) && references==1);
     /* miss尚未取得inode资格；旧hot前缀已拥有页，截断/再增长只影响慢路重查。 */
     assert(!kernel_vfs_ftruncate(&file,0) && !kernel_vfs_ftruncate(&file,4*BOAROS_PAGE_SIZE));
     __atomic_store_n(&mixed.resume_inode,1,__ATOMIC_RELEASE);
@@ -1984,7 +2011,7 @@ static void demand_hot_resize(struct kernel_page_cache *cache,struct kernel_vfs_
     }
     demand_contents(&held.pages[2],0x72,BOAROS_PAGE_SIZE);
     demand_release(&grown);demand_release(&eof);demand_release(&held);
-    demand_idle(cache);
+    demand_idle(cache,0);
     assert(!kernel_page_cache_invalidate_node(cache,node));
     assert(!kernel_vfs_unlink(file.mount,name) && !kernel_vfs_close(&file));
     current_file=original;
@@ -1998,13 +2025,13 @@ static void demand_short_read(struct kernel_page_cache *cache, struct kernel_vfs
     source_short = 1;
     uint64_t address; size_t valid;
     assert(kernel_page_cache_get(cache, file, 0, &address, &valid) == KERNEL_PAGE_CACHE_STATUS_IO);
-    demand_idle(cache);
+    demand_idle(cache,0);
     assert(physical_page_available(cache->allocator) == available);
     struct demand_read failed = {.cpu = 0, .count = 1};
     read_demand_batch(&failed);
     assert(failed.status == KERNEL_PAGE_CACHE_STATUS_IO &&
         !failed.pages[0].physical_address && !failed.pages[0].valid_bytes);
-    demand_idle(cache);
+    demand_idle(cache,0);
     assert(physical_page_available(cache->allocator) == available);
     reset_demand_source();
     struct demand_read retry = {.cpu = 0, .count = 1};
@@ -2012,7 +2039,7 @@ static void demand_short_read(struct kernel_page_cache *cache, struct kernel_vfs
     assert(!retry.status && source_reads == 1);
     demand_contents(&retry.pages[0], 0x30, BOAROS_PAGE_SIZE);
     demand_release(&retry);
-    demand_idle(cache);
+    demand_idle(cache,0);
     puts("PASS short backend read: scalar and one-page batch reject incomplete success; failed entries release and retry");
 }
 static void demand_published_before_drain(struct kernel_page_cache *cache, struct kernel_vfs_file *file)
@@ -2030,7 +2057,7 @@ static void demand_published_before_drain(struct kernel_page_cache *cache, struc
     assert(!physical_page_release(cache->allocator, page));
     __atomic_store_n(&resume_read, 1, __ATOMIC_RELEASE);
     assert(!pthread_join(producer, NULL) && !batch.status);
-    demand_release(&batch); demand_idle(cache);
+    demand_release(&batch); demand_idle(cache,0);
     puts("PASS completed page is visible while its batch owner is still draining");
 }
 
@@ -2056,7 +2083,7 @@ static void demand_completion_before_registration(struct kernel_page_cache *cach
     assert(first.pages[0].physical_address == waiting.pages[0].physical_address);
     demand_contents(&waiting.pages[0], 0x30, BOAROS_PAGE_SIZE);
     observe_load_publication = 0;
-    demand_release(&waiting); demand_release(&first); demand_idle(cache);
+    demand_release(&waiting); demand_release(&first); demand_idle(cache,0);
     puts("PASS load completion before registration: no cache-lock dependency, no lost wake or park, exact owner return");
 }
 
@@ -2098,7 +2125,7 @@ static void demand_overlap(struct kernel_page_cache *cache, struct kernel_vfs_fi
     for (unsigned i = 0; i < 2; i++) assert(!physical_page_release(cache->allocator, hot[i]));
     demand_release(&first);
     demand_release(&overlap);
-    demand_idle(cache);
+    demand_idle(cache,0);
     puts("PASS overlapping demand batches: hot/loading/own misses, publish before wait, one load per cold page");
 }
 static void demand_workspace_oom(struct kernel_page_cache *cache,struct kernel_vfs_file *file)
@@ -2133,7 +2160,7 @@ static void demand_workspace_oom(struct kernel_page_cache *cache,struct kernel_v
     for(unsigned i=0;i<2;i++) demand_contents(&first.pages[i],0x30+i,BOAROS_PAGE_SIZE);
     demand_release(&retry);demand_release(&failed);demand_release(&first);
     assert(!physical_page_release(cache->allocator,hot));
-    demand_idle(cache);
+    demand_idle(cache,0);
     assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(file)));
     kernel_heap_get_statistics(cache->heap,&after);
     assert(after.live_allocations==before.live_allocations);
@@ -2155,7 +2182,7 @@ static void demand_errors(struct kernel_page_cache *cache, struct kernel_vfs_fil
                 !failed.pages[i].physical_address && !failed.pages[i].valid_bytes);
             else demand_contents(&failed.pages[i], 0x30 + i, BOAROS_PAGE_SIZE);
         }
-        demand_idle(cache);
+        demand_idle(cache,failed.count-1);
         reset_demand_source();
         struct demand_read retry = {.cpu = 1, .count = 8};
         assert(!pthread_create(&client, 0, read_demand_batch, &retry) && !pthread_join(client, 0));
@@ -2167,7 +2194,7 @@ static void demand_errors(struct kernel_page_cache *cache, struct kernel_vfs_fil
         }
         demand_release(&retry);
         demand_release(&failed);
-        demand_idle(cache);
+        demand_idle(cache,0);
     }
     puts("PASS demand batch errors: per-page EIO/ENOMEM, preserved successful refs, failed-page-only retry");
 }
@@ -2193,7 +2220,7 @@ static void demand_oom(struct kernel_page_cache *cache, struct kernel_vfs_file *
             } else demand_contents(&failed.pages[i], 0x30 + i, BOAROS_PAGE_SIZE);
         }
         assert(failures);
-        demand_idle(cache);
+        demand_idle(cache,failed.count-failures);
         reset_demand_source();
         struct demand_read retry = {.cpu = 1, .count = 8};
         assert(!pthread_create(&client, 0, read_demand_batch, &retry) && !pthread_join(client, 0));
@@ -2204,7 +2231,7 @@ static void demand_oom(struct kernel_page_cache *cache, struct kernel_vfs_file *
         }
         demand_release(&retry);
         demand_release(&failed);
-        demand_idle(cache);
+        demand_idle(cache,0);
         assert(!kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(file)) &&
             physical_page_available(cache->allocator) == available);
     }
@@ -2235,7 +2262,7 @@ static void demand_worker_stop(struct kernel_page_cache *cache, struct kernel_vf
     demand_contents(&active.pages[0],0x30,BOAROS_PAGE_SIZE);
     demand_release(&active);demand_release(&independent);
     for (unsigned i=0;i<2;i++) assert(!physical_page_release(cache->allocator,hot[i]));
-    demand_idle(cache);
+    demand_idle(cache,0);
     assert(!kernel_page_cache_start_worker(cache));
     puts("PASS caller cold batches survive worker stop: independent cold/hot content and both producer owners returned");
 }
@@ -2306,7 +2333,7 @@ static void demand_truncate(struct kernel_page_cache *cache, struct kernel_vfs_f
     for (size_t i = 0; i < BOAROS_PAGE_SIZE; i++) assert(tail[i] == (i < 37 ? 0x32 : 0));
     for (unsigned i = 3; i < 8; i++) demand_contents(&grown.pages[i], 0, BOAROS_PAGE_SIZE);
     demand_release(&grown);
-    demand_idle(cache);
+    demand_idle(cache,0);
     puts("PASS truncate waits for demand loading: short EOF, retired owners, zero tail and no stale pages after growth");
 }
 static void demand_cases(struct kernel_page_cache *cache, struct kernel_vfs_file *file, unsigned actors)
@@ -3538,6 +3565,7 @@ int main(int argc, char **argv)
     assert(kernel_page_cache_init(&cache, &heap, &pages) ==
         KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT);
     if (argc==3) {
+        if (!strcmp(argv[2],"read-borrow-retire")) {read_borrow_retirement(&cache,argv[1]);goto owners;}
         if (!strcmp(argv[2],"snapshot-copy")) {snapshot_copy_case(&cache,argv[1]);goto owners;}
         if (!strcmp(argv[2],"admission-credit")) {admission_credit_case(&cache,argv[1]);goto owners;}
         if (!strcmp(argv[2],"append-snapshot")) {append_snapshot(&cache,argv[1]);goto owners;}
