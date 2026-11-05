@@ -119,7 +119,7 @@ struct kernel_vfs_rename_result {
 
 struct kernel_open_file_description;
 
-/* 已打开文件的读取、元数据与后台/生命周期分别选择执行位置。 */
+/* 前台后端操作选择执行位置；后台写回仍由缓存 worker 推进。 */
 enum kernel_vfs_execution {
     KERNEL_VFS_EXECUTION_CPU0 = 0,
     KERNEL_VFS_EXECUTION_CALLER,
@@ -128,7 +128,7 @@ enum kernel_vfs_execution {
  * 后端分配的 node 必须位于同一堆对象首部，发布后由通用层回收。 */
 struct kernel_vfs_backend {
     enum kernel_vfs_execution read_execution;
-    enum kernel_vfs_execution file_metadata_execution;
+    enum kernel_vfs_execution file_operation_execution;
     enum kernel_vfs_execution namespace_execution;
     int (*check_domain)(const struct kernel_vfs_node *, const struct kernel_heap *,
         const struct physical_page_allocator *);

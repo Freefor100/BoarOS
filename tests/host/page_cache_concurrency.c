@@ -2601,6 +2601,21 @@ static void executor_range_stop(struct kernel_page_cache *cache,struct kernel_vf
     assert(!kernel_vfs_close(&writer));
     puts("PASS CPU0 range stop: in-flight window ends before stop, continuation cancelled, dirty suffix retained and restart persists it without leaked request owners");
 }
+static void executor_range_checks(struct kernel_page_cache *cache,
+    struct kernel_vfs_mount *mount,unsigned actors,int stop)
+{
+    /* Exercise queued continuations using the real ext4 data path but the
+     * execution policy of a backend that requires CPU0. */
+    struct kernel_vfs_instance *instance=mount->private_data;
+    const struct kernel_vfs_backend *original=instance->ops;
+    struct kernel_vfs_backend cpu0=*original;
+    cpu0.file_operation_execution=KERNEL_VFS_EXECUTION_CPU0;
+    instance->ops=&cpu0;
+    executor_range_fairness(cache,mount,actors,0);
+    executor_range_fairness(cache,mount,actors,1);
+    if (stop) executor_range_stop(cache,mount);
+    instance->ops=original;
+}
 static void executor_range_cases(struct kernel_page_cache *cache,const char *path)
 {
     current_cache=cache;image_fd=open(path,O_RDWR);assert(image_fd>=0);
@@ -2608,9 +2623,7 @@ static void executor_range_cases(struct kernel_page_cache *cache,const char *pat
     struct kernel_block_device disk={.read=image_read,.write=image_write,.flush=image_flush,
         .capacity_bytes=st.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
     struct kernel_vfs_mount mount={0};assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,cache,0));
-    executor_range_fairness(cache,&mount,1,0);
-    executor_range_fairness(cache,&mount,1,1);
-    executor_range_stop(cache,&mount);
+    executor_range_checks(cache,&mount,1,1);
     assert(!kernel_vfs_unmount(&mount) && !close(image_fd) && !kernel_page_cache_destroy(cache));
     current_cache=NULL;
 }
@@ -2726,9 +2739,7 @@ static void cold_case(struct kernel_page_cache *cache, struct kernel_heap *heap,
     foreground_window_truncate(cache,&file);
     dirty_index_case(cache,&mount,&file,actors);
     demand_cases(cache, &file, actors);
-    executor_range_fairness(cache,&mount,actors,0);
-    executor_range_fairness(cache,&mount,actors,1);
-    if (actors==2)executor_range_stop(cache,&mount);
+    executor_range_checks(cache,&mount,actors,actors==2);
     if(actors==4)retain_after_cache_close(cache,&file);
     assert(!kernel_vfs_close(&file));
     assert(!kernel_vfs_unmount(&mount));
@@ -3306,14 +3317,6 @@ static void writeback_start_failure(struct kernel_page_cache *cache,const char *
     assert(!close(storage.fd));
     puts("PASS failed journal-start FLUSH retains mount, cache, physical pressure owner and actual allocated metadata");
 }
-static void *domain_fast_writer(void *argument)
-{
-    cache_test_attach(9);struct kernel_vfs_file *file=argument;size_t done;
-    unsigned char value=0x39;
-    assert(!kernel_vfs_pwrite(file,BOAROS_PAGE_SIZE,&value,1,&done) && done==1);
-    value=0;assert(!kernel_vfs_pread(file,BOAROS_PAGE_SIZE,&value,1,&done, NULL) && done==1 && value==0x39);
-    return NULL;
-}
 static void *domain_quota_writer(void *argument)
 {
     cache_test_attach(10);progress_writeback_caller=1;
@@ -3433,12 +3436,22 @@ static void writeback_domains(struct kernel_page_cache *cache,const char *path)
     size_t pages=(2*stats[1].high_bytes)/BOAROS_PAGE_SIZE+4;
     for (size_t i=0;i<pages;i++)
         assert(!kernel_vfs_pwrite(&files[1],i*BOAROS_PAGE_SIZE,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+    unsigned char value=0x39;
+    for (unsigned i=1;i<=2;i++)
+        assert(!kernel_vfs_pwrite(&files[0],i*BOAROS_PAGE_SIZE,&value,1,&done) && done==1);
     storage[1].armed=1;current_cache=cache;assert(!kernel_page_cache_start_worker(cache));
     wait_progress(&storage[1].entered,1);
-    /* One cache intentionally serves both disks. Its worker is in slow I/O;
-     * a fast-domain write must not join that worker's admission queue. */
-    pthread_t fast_writer;assert(!pthread_create(&fast_writer,NULL,domain_fast_writer,&files[0]));
-    assert(!pthread_join(fast_writer,NULL) && !storage[1].resume);
+    /* One cache serves both disks. Keep its worker in slow I/O until the
+     * unrelated file has been synced and reloaded from its own backend. */
+    struct executor_sync fast_sync={.file=&files[0],.observed=kernel_vfs_error_sequence(&files[0])};
+    pthread_t fast_syncer;assert(!pthread_create(&fast_syncer,NULL,executor_sync_client,&fast_sync));
+    wait_progress(&fast_sync.done,1);
+    assert(!pthread_join(fast_syncer,NULL) && !fast_sync.result && !storage[1].resume);
+    assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&files[0])));
+    for (unsigned i=1;i<=2;i++) {
+        value=0;
+        assert(!kernel_vfs_pread(&files[0],i*BOAROS_PAGE_SIZE,&value,1,&done,NULL) && done==1 && value==0x39);
+    }
     /* A quota-bound writer joins the background round already in progress.
      * It must not insert a competing single-window request behind paused I/O. */
     struct kernel_page_cache_concurrency_state queued_before,queued_after;
@@ -3480,7 +3493,7 @@ static void writeback_domains(struct kernel_page_cache *cache,const char *path)
     assert(!disks[0].references && !kernel_block_unregister(&disks[0]));
     for(unsigned i=0;i<2;i++)assert(!close(storage[i].fd));
     current_cache=NULL;
-    puts("PASS physical writeback domains: shared-cache slow/fast isolation, shared-device quota, stable source single charge, journal ownership and final references");
+    puts("PASS physical writeback domains: fast fsync and readback during slow I/O, shared-device quota, stable source charge and final references");
 }
 
 static void dirty_age_case(struct kernel_page_cache *cache,const char *path)

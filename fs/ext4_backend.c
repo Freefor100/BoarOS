@@ -2943,7 +2943,7 @@ static void initialize_backend(void)
     if (__atomic_load_n(&ext4_backend.pread_batch,__ATOMIC_ACQUIRE)) return;
     volatile struct kernel_vfs_backend *ops = &ext4_backend;
     ops->read_execution = KERNEL_VFS_EXECUTION_CALLER;
-    ops->file_metadata_execution = KERNEL_VFS_EXECUTION_CALLER;
+    ops->file_operation_execution = KERNEL_VFS_EXECUTION_CALLER;
     ops->namespace_execution = KERNEL_VFS_EXECUTION_CALLER;
     ops->error = ext4_backend_error;
     ops->root = ext4_backend_root;
