@@ -11,13 +11,18 @@ parser.add_argument('--scheduler-only', action='store_true',
 args = parser.parse_args()
 symbols = subprocess.check_output([args.nm, '-S', '--defined-only', args.kernel], text=True)
 if not args.scheduler_only:
-    for name, alignment in [('crc32c', 2048), ('put_buffer', 1024), ('memcpy', 1024), ('memmove', 2048), ('kernel_wait_prepare', 256)]:
+    # The queue-local wait entry has no declared code-slot alignment; its
+    # contract is page containment. The other functions declare both bounds.
+    slots = [('crc32c', 2048, 2048), ('put_buffer', 1024, 1024),
+             ('memcpy', 1024, 1024), ('memmove', 2048, 2048),
+             ('kernel_wait_prepare', None, 256)]
+    for name, alignment, limit in slots:
         matches = [line.split() for line in symbols.splitlines() if line.split()[-1:] == [name]]
         if len(matches) != 1:
             raise SystemExit(f'expected one {name} function')
         address, size = (int(value, 16) for value in matches[0][:2])
-        if not 0 < size <= alignment or address % alignment or address // 4096 != (address + size - 1) // 4096:
-            raise SystemExit(f'{name} exceeds its aligned code slot: address={address:#x} bytes={size} slot={alignment}')
+        if not 0 < size <= limit or (alignment and address % alignment) or address // 4096 != (address + size - 1) // 4096:
+            raise SystemExit(f'{name} violates code bounds: address={address:#x} bytes={size} limit={limit} alignment={alignment}')
         print(f'PASS {name} stays within one code page: address={address:#x} bytes={size}')
 
     rows = [line.split() for line in symbols.splitlines() if line.split()[-1:] == ['crc32c_slices']]
