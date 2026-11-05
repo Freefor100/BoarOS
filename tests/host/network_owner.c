@@ -110,6 +110,8 @@ static unsigned heap_live, dma_eligible, nic_full, copy_attempts, copied_packets
 static void (*heap_release_once)(void *);
 static uint64_t clock_ns = 1000000000ULL;
 static unsigned char captured[1536];
+static unsigned fixed_random;
+static uint32_t random_value;
 
 void kernel_assert_can_block(void) {CHECK(!kernel_cpu_current()->raw_locks);}
 #if BOAROS_MAX_CPUS > 1
@@ -330,9 +332,9 @@ void kernel_wait_backend_quiesce(void)
 uint64_t kernel_time_monotonic_ns(void) { return clock_ns; }
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t time, uint64_t *out)
 { *out = time; return KERNEL_TIME_STATUS_OK; }
-int kernel_random_available(void) { return 0; }
+int kernel_random_available(void) { return fixed_random; }
 enum kernel_random_status kernel_random_fill(void *buffer, size_t size)
-{ (void)buffer; (void)size; abort(); }
+{ CHECK(fixed_random && size==sizeof(random_value));memcpy(buffer,&random_value,size);return KERNEL_RANDOM_STATUS_OK; }
 
 int arch_dma_image_address(uint64_t address, uint64_t size, uint64_t *physical)
 { (void)size; *physical = address; return dma_eligible; }
@@ -561,6 +563,55 @@ static void ipv4_route_output(void)
     pbuf_free(packet); etharp_cleanup_netif(&interface); netif_remove(&interface);
     puts("PASS configured IPv4 gateway determines the ARP target for off-subnet traffic");
 }
+static void tcp_ephemeral_ports(void)
+{
+    static const struct {uint32_t seed;uint16_t occupied,want;} cases[]={
+        {0xffff,0,49152},{0xfffe,0,65535},
+        {0xffff,49152,49153},{0xfffe,65535,49152}
+    };
+    kernel_socket_network_initialize();
+    for(unsigned connecting=0;connecting<2;connecting++)for(size_t i=0;i<sizeof(cases)/sizeof(cases[0]);i++) {
+        struct kernel_socket *occupied=NULL,*listener=NULL,*endpoint=NULL,*accepted=NULL;
+        struct kernel_socket_address local={.family=KERNEL_SOCKET_AF_INET,.bytes={127,0,0,1}};
+        struct kernel_socket_address remote=local;remote.port=23000;
+        if(cases[i].occupied) {
+            CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_STREAM,&occupied));
+            local.port=cases[i].occupied;CHECK(!kernel_socket_bind(occupied,&local));local.port=0;
+        }
+        if(connecting) {
+            CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_STREAM,&listener));
+            CHECK(!kernel_socket_bind(listener,&remote) && !kernel_socket_listen(listener,1));
+        }
+        /* Seed the real allocator through LWIP_RAND, including its inclusive
+         * upper endpoint; no private port counter is inspected or replaced. */
+        fixed_random=1;random_value=cases[i].seed;
+        struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+        tcp_init();kernel_socket_protocol_leave(&scope);
+        CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_STREAM,&endpoint));
+        if(connecting) {
+            int result=kernel_socket_connect(endpoint,&remote,0);
+            CHECK(!result || result==-KERNEL_EINPROGRESS);
+            for(unsigned turn=0;turn<4;turn++)
+                (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+            CHECK(endpoint->connected && !kernel_socket_accept(listener,&accepted,NULL));
+        } else CHECK(!kernel_socket_bind(endpoint,&local));
+        struct kernel_socket_address actual={0};CHECK(!kernel_socket_getname(endpoint,&actual));
+        CHECK(actual.port==cases[i].want && (!occupied || actual.port!=cases[i].occupied));
+        fixed_random=0;
+        kernel_socket_protocol_enter(&scope);
+        if(connecting) {tcp_abort(endpoint->tcp);if(accepted->tcp)tcp_abort(accepted->tcp);}
+        kernel_socket_protocol_leave(&scope);
+        kernel_socket_destroy(endpoint);
+        if(accepted)kernel_socket_destroy(accepted);
+        if(listener)kernel_socket_destroy(listener);
+        if(occupied)kernel_socket_destroy(occupied);
+        for(unsigned turn=0;turn<4;turn++)
+            (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+        CHECK(!heap_live && !tcp_bound_pcbs && !tcp_active_pcbs && !tcp_tw_pcbs && !tcp_listen_pcbs.pcbs);
+    }
+    puts("PASS TCP ephemeral ports: first bind/connect at randomized upper endpoint, last port before wrap, occupied-port skip and exact owner return");
+}
+
 static void ipv4_address_shutdown(void)
 {
     kernel_socket_network_initialize();
@@ -2609,7 +2660,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "copy-ineligible")) copy_capacity(0,0);
     else if (!strcmp(argv[1], "timewait-capacity")) timewait_owner(0);
     else if (!strcmp(argv[1], "timewait-timer")) timewait_owner(1);
-    else if (!strcmp(argv[1], "controls")) { timewait_owner(2); raw_owner_control(); }
+    else if (!strcmp(argv[1], "controls")) { tcp_ephemeral_ports(); timewait_owner(2); raw_owner_control(); }
     else return 2;
     CHECK(!test_context.allocation_depth && !protocol_depth);
     CHECK(!heap_live && !tcp_active_pcbs && !tcp_tw_pcbs && !tcp_listen_pcbs.pcbs);

@@ -1023,8 +1023,8 @@ tcp_new_port(void)
   struct tcp_pcb *pcb;
 
 again:
-  tcp_port++;
-  if (tcp_port == TCP_LOCAL_PORT_RANGE_END) {
+  /* The randomized initial port can equal the inclusive range endpoint. */
+  if (tcp_port++ == TCP_LOCAL_PORT_RANGE_END) {
     tcp_port = TCP_LOCAL_PORT_RANGE_START;
   }
   /* Check all PCB lists. */
