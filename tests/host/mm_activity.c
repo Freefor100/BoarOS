@@ -8,6 +8,7 @@
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #if BOAROS_USER_SMP && defined(REMOTE_USER_CASE)
 #include "../../kernel/sched/private.h"
 #include "../../mm/uaccess_internal.h"
@@ -26,6 +27,8 @@ static struct kernel_mm mm;
 static uint64_t context, kernel_context;
 static unsigned sampled, entered, allow_send, pause_exit, exiting, allow_exit, sample_activation;
 static _Thread_local unsigned flushes, instruction_sync;
+static uint64_t reentry_root, reentry_address;
+static unsigned reentry_entered, reentry_release;
 #ifdef REMOTE_USER_CASE
 static unsigned copying, cow_fences;
 static uint64_t cow_old;
@@ -69,7 +72,14 @@ static void await(unsigned *flag)
 { while (!__atomic_load_n(flag, __ATOMIC_ACQUIRE)) sched_yield(); }
 static void publish(unsigned *flag)
 { __atomic_store_n(flag, 1, __ATOMIC_RELEASE); }
-static void *page_access(uint64_t address) { return (void *)(uintptr_t)address; }
+static void *page_access(uint64_t address)
+{
+    if (address == reentry_root && kernel_cpu_current()->hardware_id == 3) {
+        publish(&reentry_entered);
+        await(&reentry_release);
+    }
+    return (void *)(uintptr_t)address;
+}
 static int page_address(const void *pointer, uint64_t *address)
 { *address = (uintptr_t)pointer; return 1; }
 void kernel_console_putc(char c) { fputc(c, stderr); }
@@ -87,6 +97,35 @@ void mm_test_fence(uint64_t address, int instructions)
         assert(!kernel_cpu_current()->raw_locks);
         publish(&exiting); await(&allow_exit);
     }
+}
+static void *hold_reentry_lookup(void *unused)
+{
+    (void)unused;
+    mm_test_attach(3);
+    struct kernel_mm_mapping mapping;
+    assert(!kernel_mm_lookup(&mm, reentry_address, &mapping));
+    return NULL;
+}
+static void same_mm_reentry(uint64_t address)
+{
+    assert(!kernel_mm_activate(&mm, kernel_context));
+    unsigned tlb = flushes, instructions = instruction_sync;
+    reentry_root = (context & ((UINT64_C(1) << 44) - 1)) << 12;
+    reentry_address = address;
+    pthread_t lookup;
+    alarm(10);
+    assert(!pthread_create(&lookup, NULL, hold_reentry_lookup, NULL));
+    await(&reentry_entered);
+    /* 已在活动集合的同MM切换，不等待读者持有的PTE发布锁。 */
+    assert(!kernel_mm_activate(&mm, kernel_context));
+    assert(flushes == tlb && instruction_sync == instructions);
+    publish(&reentry_release);
+    assert(!pthread_join(lookup, NULL));
+    alarm(0);
+    reentry_root = 0;
+    assert(!kernel_mm_activate(NULL, kernel_context));
+    mm_test_context = context;
+    puts("MM same-root reentry progresses while an independent PTE lookup holds metadata");
 }
 #if BOAROS_MAX_CPUS == 4
 static unsigned many_mm_entered, many_mm_release, many_mm_sampled, many_mm_sync;
@@ -413,6 +452,7 @@ int main(void)
         KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED, &address));
     assert(!kernel_copy_to_user(&mm, address, &byte, 1, &copied));
     assert(!kernel_mm_check_task_domain(&mm));
+    same_mm_reentry(address);
 #if BOAROS_MAX_CPUS == 4
     many_mm_activity(address);
 #endif

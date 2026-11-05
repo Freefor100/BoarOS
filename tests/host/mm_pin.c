@@ -9,6 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -23,9 +25,18 @@ void mm_test_fence(uint64_t address, int instructions)
 void mm_test_unavailable(void) { fputs("excluded business path reached\n", stderr); abort(); }
 static uint64_t watched_record;
 static unsigned record_resolutions;
+static uint64_t qualifying_page;
+static unsigned qualifying_entered, qualifying_release;
+static void await(unsigned *value)
+{ while (!__atomic_load_n(value, __ATOMIC_ACQUIRE)) sched_yield(); }
 static void *page_access(uint64_t address)
 {
     if (address == watched_record) record_resolutions++;
+    if (address == qualifying_page && kernel_cpu_current()->hardware_id == 1) {
+        /* 停在PTE资格内、真实页引用取得前；另一读者必须能完成同页pin。 */
+        __atomic_store_n(&qualifying_entered, 1, __ATOMIC_RELEASE);
+        await(&qualifying_release);
+    }
     return (void *)(uintptr_t)address;
 }
 static int page_address(const void *pointer, uint64_t *address)
@@ -33,10 +44,48 @@ static int page_address(const void *pointer, uint64_t *address)
 static unsigned raw_acquisitions, checked_resolutions;
 void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *, struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock, struct kernel_raw_guard *guard)
-{ raw_acquisitions++; __real_kernel_raw_lock_acquire(lock, guard); }
+{ __atomic_fetch_add(&raw_acquisitions, 1, __ATOMIC_RELAXED); __real_kernel_raw_lock_acquire(lock, guard); }
 enum physical_page_status __real_physical_page_resolve(const struct physical_page_allocator *, uint64_t, void **);
 enum physical_page_status __wrap_physical_page_resolve(const struct physical_page_allocator *a, uint64_t address, void **out)
 { checked_resolutions++; return __real_physical_page_resolve(a, address, out); }
+struct parallel_pin_argument { struct kernel_mm *mm; uint64_t address; };
+static void *parallel_pin(void *opaque)
+{
+    struct parallel_pin_argument *argument = opaque;
+    mm_test_attach(1);
+    struct kernel_mm_user_pin pin = {0};
+    assert(!kernel_mm_pin_user_page(argument->mm, argument->address, KERNEL_MM_READ, &pin));
+    assert(pin.physical_address == qualifying_page);
+    kernel_mm_unpin_user_page(&pin);
+    assert(!kernel_cpu_current()->raw_locks && !kernel_io_context_current()->user_pins);
+    return NULL;
+}
+static void parallel_resident_pins(struct kernel_mm *mm, uint64_t address)
+{
+    struct kernel_mm_mapping mapping;
+    assert(!kernel_mm_lookup(mm, address, &mapping));
+    qualifying_page = mapping.physical_address & ~BOAROS_PAGE_MASK;
+    struct parallel_pin_argument argument = {mm, address};
+    pthread_t first;
+    alarm(10);
+    assert(!pthread_create(&first, NULL, parallel_pin, &argument));
+    await(&qualifying_entered);
+    struct kernel_mm_user_pin second = {0};
+    assert(!kernel_mm_pin_user_page(mm, address, KERNEL_MM_WRITE, &second));
+    struct kernel_mm_concurrency_state state;
+    /* snapshot是writer；这里只检查独立物理owner，不等待暂停的读资格。 */
+    uint32_t references;
+    assert(!physical_page_reference_count(mm->allocator, second.physical_address, &references));
+    assert(references == 2);
+    kernel_mm_unpin_user_page(&second);
+    __atomic_store_n(&qualifying_release, 1, __ATOMIC_RELEASE);
+    assert(!pthread_join(first, NULL));
+    alarm(0);
+    qualifying_page = 0;
+    kernel_mm_get_concurrency_state(mm, &state);
+    assert(!state.pins && !state.write_pins);
+    puts("MM concurrent resident pin qualifications overlap before physical acquire");
+}
 static void resident_copy_cost(struct kernel_mm *mm, uint64_t address)
 {
     unsigned char data[4096] = {0};
@@ -49,9 +98,9 @@ static void resident_copy_cost(struct kernel_mm *mm, uint64_t address)
                 kernel_copy_to_user(mm, address, data, sizes[i], &copied) :
                 kernel_copy_from_user(mm, data, address, sizes[i], &copied);
             unsigned locks = raw_acquisitions;
-            printf("resident %s %zu bytes: locks=%u checked_resolutions=%u\n",
+            printf("resident %s %zu bytes: exclusive_locks=%u checked_resolutions=%u\n",
                    write ? "write" : "read", sizes[i], locks, checked_resolutions);
-            assert(!result && copied == sizes[i] && locks == 4 && !checked_resolutions);
+            assert(!result && copied == sizes[i] && !checked_resolutions);
         }
     }
 }
@@ -161,6 +210,7 @@ int main(void)
     assert(!rejected.registration && !rejected.page);
     assert(!kernel_mm_mprotect(&mm, address, BOAROS_PAGE_SIZE, KERNEL_MM_READ | KERNEL_MM_WRITE));
     resident_copy_cost(&mm, address);
+    parallel_resident_pins(&mm, address);
     fatal_pins(&mm, address);
     struct kernel_mm_mapping mapping;
     assert(kernel_mm_lookup(&mm, address, &mapping) == 0);

@@ -160,8 +160,8 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm);
 `riscv_kernel_mm_satp()` 是 RISC-V scheduler 创建任务时使用的架构入口。通用层不暴露 Sv39 对象，也没有运行期 vtable；RISC-V 构建通过 `include/arch/mmu.h` 直接绑定 Sv39 操作；通用策略位于 `mm/mm.c`。LoongArch 构建以后为同一后端契约提供 16 KiB/三级页表实现。这样任务和 syscall 层依赖 MM 语义，而不依赖页表格式，调用热路径也没有间接分派。
 
 
-`kernel_mm_pin_user_page()`只对resident且已许可的基页成功，在rank15元数据保护内
-取得实际物理引用；`NOT_MAPPED/ACCESS`要求调用者fault后重查。输出token零初始化，
+`kernel_mm_pin_user_page()`只对resident且已许可的基页成功，在rank15短读资格内
+完成PTE和权限检查并取得实际物理引用；`NOT_MAPPED/ACCESS`要求调用者fault后重查。输出token零初始化，
 成功才发布；同一I/O owner在复制完成后调用`kernel_mm_unpin_user_page()`。
 调用者保持LIVE MM句柄，末引用释放时仍有pin属于非法生命周期并fatal。
 原`kernel_mm_lookup()`仍只返回快照，不能将其物理指针借用当成pin。
@@ -281,7 +281,7 @@ MM、页表及用户 pin 已持有实际物理页生命周期时，通过 `physi
 
 ## 并发与性能边界
 
-MM 句柄各自持有一个实际引用，引用和 user 计数使用原子操作；句柄本身不能被其他执行者并发 move/release。所有活 MM 的映射编辑共用 rank25 gate，页表、pin、resident 哈希和活动 CPU 共用 rank15 raw，页引用可嵌套 physical rank20。哈希候选在 raw 外分配，重排、发布和摘除在 raw 内完成，旧存储在 raw 外释放。普通驻留匿名页复制只取得 MM pin 及物理引用所需的四次实际锁，不取得 operation gate，也不因同一 MM 存在文件映射而增加额外保护。末次释放要求 pin、活动 CPU 和退休批次归零。
+MM 句柄各自持有一个实际引用，引用和 user 计数使用原子操作；句柄本身不能被其他执行者并发 move/release。每个 MM 的映射编辑使用自身 rank25 操作资格；该 MM 的 rank15 专用 raw 读写资格保护页表、pin 许可、resident 哈希和活动 CPU，页引用取得可嵌套 physical rank20。哈希候选在 raw 外分配，重排、发布和摘除使用写资格，旧存储在 raw 外释放。普通驻留匿名页复制共享短读资格，不取得 operation gate，也不因同一 MM 存在文件映射而增加额外保护。末次释放要求 pin、活动 CPU 和退休批次归零。
 
 ## 验证与限制
 
@@ -320,12 +320,12 @@ private 页内容。范围摘除复用下面的有界遍历，剩余 resident �
 登记与来源借用维持跨等待寿命；PTE 变更在 MM raw 内发布，锁外确认本地及远端
 翻译失效后才归还旧页，尾页可执行内容改变时另推进指令同步。
 
-关联只扫描相关 MM；每个 MM 以动态虚拟页地址哈希查询驻留记录，保留链表负责遍历。哈希碰撞比较完整地址，装载因子不超过 1，按二倍扩容；分配成功后无分配地重建并替换桶，失败保留旧索引。fork 提前准备全部桶，unmap/fixed replace/截断同步摘除索引与链表；最后 MM 释放桶。查找为平均常数成本。munmap/fixed replace 与截断使用有界区间摘除：每次 raw 最多检查 16 个页表项，实际数据/空表 owner 交给同一个 16 项退休批次。每个涉及的叶表只扫描一次；范围外的叶只用于判断表是否仍被使用，缺失子树直接跳过。一个 middle 范围结束后有界检查空表，跨同步仅保存 VA、下标和占用标记，不保存 PTE 指针。后端在清 PTE 前把 VA/物理身份交给 MM，由 MM 解绑 resident 的哈希和活动链；alias 清理和实际页引用释放均在 raw 外完成。mprotect 仍以有结束地址的遍历访问驻留叶，包括 PROT_NONE。mprotect 对仍共享缓存的叶保留写保护，不再先开放写权限后全表 rearm。完整链表用于销毁与 fork；截断先按 VMA 形成 EOF 外的连续区间并复用同一有界摘除；剩余驻留链只处理保留尾页。元数据随驻留规模增长；不在 tick 热路径扫描。
+关联只扫描相关 MM；每个 MM 以动态虚拟页地址哈希查询驻留记录，保留链表负责遍历。哈希碰撞比较完整地址，装载因子不超过 1，按二倍扩容；分配成功后无分配地重建并替换桶，失败保留旧索引。fork 提前准备全部桶，unmap/fixed replace/截断同步摘除索引与链表；最后 MM 释放桶。查找为平均常数成本。munmap/fixed replace 与截断使用有界区间摘除：每次 raw 最多处理 16 个目标页表项，实际数据/空表 owner 交给同一个 16 项退休批次。目标范围只访问相关叶，缺失子树直接跳过；叶表及 middle 表释放前，在同一次写资格内完整检查当前表是否为空（RV 最多 512 项、LA 最多 2048 项）。其他范围可在批次间向已经扫过的位置发布新叶，所以跨同步只保留 VA 与阶段，不保存 PTE 指针、空前缀或占用结论。续扫时重新解析当前父表；其他范围已将其撤销时直接跳过，换表后检查新表，不能据旧表状态回收。后端在清 PTE 前把 VA/物理身份交给 MM，由 MM 解绑 resident 的哈希和活动链；alias 清理和实际页引用释放均在 raw 外完成。mprotect 仍以有结束地址的遍历访问驻留叶，包括 PROT_NONE。mprotect 对仍共享缓存的叶保留写保护，不再先开放写权限后全表 rearm。完整链表用于销毁与 fork；截断先按 VMA 形成 EOF 外的连续区间并复用同一有界摘除；剩余驻留链只处理保留尾页。元数据随驻留规模增长；不在 tick 热路径扫描。
 `test-files-riscv` 扫描准备阶段分配失败与 fork 回滚，并注入缓存命中后的 COW
 物理分配失败；`test-userland-riscv` 与 `test-diff-abi-riscv` 验证真实驻留/COW、
 PROT_NONE、非当前 MM、尾页、关闭 fd、unlink、O_TRUNC 与重新增长。
 
-`riscv_kernel_mm_get_statistics` 提供诊断快照。驻留探测、准备页、pin 获取/等待、退休批次和 fault 重试等纯统计只在 `COST_DIAGNOSTICS=1` 更新；pin 数、页引用、活动 CPU 与 TLB 代次始终参与正确性。测试用链接包装观察实际 pin、锁与解析调用。驻留匿名页的 1、64、4096 字节双向复制均由每次 9 次锁获取、5 次受检查地址解析降为 4 次锁获取、0 次受检查解析；这四次仍保护 MM pin 与物理页引用。`make test-scale-riscv` 在 16/64 MiB 文件全部读驻留后按置换顺序首次写入，验证探测增长不超过 6 倍，并注入前 128 页准备阶段的元数据分配失败。首次写开放权限、写回 rearm、mprotect 和未发布 fork child 使用纯单页 PTE 修改，不在后端执行 SFENCE 或指令同步。已发布 MM 在 raw 内登记翻译/指令代次，raw 外按实际范围统一同步；未发布 child 由首次激活完成同步。单页降权/恢复合计只访问两个相关 resident，不随其他驻留页增长。VMA 权限编辑后以一次读写游标压缩相邻可合并项，被合并的 attachment 引用各归还一次，不再逐次左移后缀。宿主用巨大稀疏范围检查遍历跳过空子树并遵守结束地址。引用与脏代次协议保持不变。
+`riscv_kernel_mm_get_statistics` 提供诊断快照。驻留探测、准备页、pin 获取/等待、退休批次和 fault 重试等纯统计只在 `COST_DIAGNOSTICS=1` 更新；pin 数、页引用、活动 CPU 与 TLB 代次始终参与正确性。测试用链接包装观察实际 pin、锁与解析调用。驻留匿名页的 1、64、4096 字节双向复制均不调用受检查地址解析；MM 读资格覆盖权限许可与物理引用取得，归还物理引用在 MM 资格外完成。`make test-scale-riscv` 在 16/64 MiB 文件全部读驻留后按置换顺序首次写入，验证探测增长不超过 6 倍，并注入前 128 页准备阶段的元数据分配失败。首次写开放权限、写回 rearm、mprotect 和未发布 fork child 使用纯单页 PTE 修改，不在后端执行 SFENCE 或指令同步。已发布 MM 在 raw 内登记翻译/指令代次，raw 外按实际范围统一同步；未发布 child 由首次激活完成同步。单页降权/恢复合计只访问两个相关 resident，不随其他驻留页增长。VMA 权限编辑后以一次读写游标压缩相邻可合并项，被合并的 attachment 引用各归还一次，不再逐次左移后缀。宿主用巨大稀疏范围检查遍历跳过空子树并遵守结束地址。引用与脏代次协议保持不变。
 
 调度器在任务发布及新映像提交时调用 `kernel_mm_add_user`，在退出或旧映像退休前调用 `kernel_mm_remove_user`。活跃使用者与 MM 资源引用分开：清理任务暂存的旧 MM 不影响 CHILD_CLEARTID 条件；fork 创建零使用者的新 MM，acquire/move 不隐式注册任务。计数下溢、溢出属于内核 owner 错误。
 
@@ -353,15 +353,15 @@ VMA 编辑使用写资格，匿名、COW 与共享内存缺页在多 CPU 构建�
 
 `kernel_mm_check_task_domain()` 仅在创建受控内核任务时检查实际消费者、来源和 heap/allocator 关系，不修改 MM 的同步方式，也不关闭系统分配器的压力挂钩。普通用户 MM 无需启用远端或并发资格。受控测试仍可使用自己的资源和交错，匿名、文件 pin 与映射修改使用相同生产协议。
 
-每个复制片段在 MM raw 下完成 PTE/权限检查及真实物理 acquire，复制在锁外；同一 task/I/O owner 归还 pin。pin 固定页存活，不固定映射身份或内容。`munmap` 可先撤销映射，旧片段靠 pin 完成；`mprotect` 关闭新许可并排空旧片段，fork 关闭写许可并排空旧写 pin。已持有需要排空的 pin 时不能等待自己，非法 owner fatal；零长度及无效参数不进入 drain。精确复制前缀保持。
+每个复制片段共享 MM raw 的短读资格，在同一资格内完成 PTE/权限检查、文件写借用与真实物理 acquire，复制在资格外；同一 task/I/O owner 归还 pin。页表、resident 与许可修改取得写资格，先关闭新读者，再排空已取得短资格的读者；不同 pin 的资格取得可以并行，pin 计数由原子加减维护。UP 读资格直接使用原独占 raw，不维护读者数。归还 pin 先在短读资格内减少计数并决定是否唤醒排空者，再在资格外归还已拥有的物理引用。pin 固定页存活，不固定映射身份或内容。`munmap` 可先撤销映射，旧片段靠 pin 完成；`mprotect` 关闭新许可并排空旧片段，fork 关闭写许可并排空旧写 pin。已持有需要排空的 pin 时不能等待自己，非法 owner fatal；零长度及无效参数不进入 drain。精确复制前缀保持。
 
 `kernel_copy_to_user()` 用一个局部 cursor 完成单次复制，结束前归还最后一个 pin；普通文件读在本批已取得的缓存页内保留当前用户页 pin，跨来源页或 iovec 片段不重复解析同一目标页，单页请求也共用这一批次路径。换目标页时先归还再处理缺页，整批结束或出错时归还，下一次存储等待不携带用户 pin。该游标只延长现有片段借用，不缓存映射身份，撤映射、撤权限和共享页写回仍遵守原来的 pin 排空规则。普通与受控读取共用这一复制核心和缺页解析；成本与吞吐分别见 [VFS/ext4](vfs-ext4.md#当前成本边界)。
 
-驻留 pin 在 MM raw 内检查当前 PTE、访问许可并取得实际物理引用。futex 的登记与 pin 顺序见[调度模块](kernel-scheduler.md#等待与-futex)。共享磁盘写 pin 还取得该 entry 的写借用；普通匿名复制不因此普遍增加 gate。缺页或 COW 使用同一个 resolver，成功后重取 pin；没有 resident-only 复制、重试或本地读取专用接口。fork 和降权关闭相应新许可，等待旧写入者归还，pin 结束仅需 raw，不等待 gate。
+futex 的登记与 pin 顺序见[调度模块](kernel-scheduler.md#等待与-futex)。共享磁盘写 pin 还取得该 entry 的写借用；普通匿名复制不因此普遍增加 gate。缺页或 COW 使用同一个 resolver，成功后重取 pin；没有 resident-only 复制、重试或本地读取专用接口。pin 的归还不等待 gate。
 
 文件与 ELF 的来源节点持有实际 OFD/ELF owner；缺页准备期间借用该节点，最后 VMA 消失也不能提前关闭来源。映射登记在 gate 内停止和摘除，gate、inode 与 raw 外排空回调，再释放来源。最终关闭暂时需要 CPU0 或真实 I/O 清理时，同一退休节点继续持有 owner；用户返回准备在 offset、pin 等调用资格已经归还后排空它，不复活已退休来源，也不建立第二组引用。
 
-active CPU 位图与 TLB 代次在 MM raw 内维护。撤映射、降权、COW 和截断先发布翻译变更并固定退休 owner，raw 外完成本地 SFENCE 与同步 SBI RFENCE，确认后才归还数据和表页。新加入者在相同保护下登记；换根由架构入口完成一次全量失效，同根仅在加入或翻译代次变化时补做失效。CPU 记录实际观察到的翻译代次，相同 MM、相同代次的再次激活不清空 TLB。可执行页的填充、COW、执行权限发布及文件尾清零另推进指令代次；首次进入和未观察到该代次的 CPU 执行指令同步，不把普通 PTE 修改一概当作代码变化。离开者在旧翻译停止后清活动位。固件失败保留实际资源并 fatal。
+active CPU 位图与 TLB 代次在 MM raw 写资格内维护，代次以 release 发布。撤映射、降权、COW 和截断先发布翻译变更并固定退休 owner，raw 外完成本地 SFENCE 与同步 SBI RFENCE，确认后才归还数据和表页。新加入者在相同保护下登记；换根由架构入口完成一次全量失效，同根仅在加入或翻译代次变化时补做失效。已登记 CPU 再次激活同一 MM 时，以 acquire 读取翻译与指令代次，不取得 MM 写资格；它仍在活动集合中，并发修改者负责向其同步失效。CPU 只记录本次实际同步的代次，相同代次的再次激活不清空 TLB。可执行页的填充、COW、执行权限发布及文件尾清零另推进指令代次；首次进入和未观察到该代次的 CPU 执行指令同步，不把普通 PTE 修改一概当作代码变化。离开者在旧翻译停止后清活动位。固件失败保留实际资源并 fatal。
 
 RISC-V的riscv_flush_icache(259)复用上述指令代次，按固定[`sys_riscv.c`](../../references/linux/arch/riscv/kernel/sys_riscv.c)忽略start/end，仅接受LOCAL标志。`kernel_mm_flush_instructions`持有独立MM引用，在禁止抢占期间推进指令代次并捕获活动CPU集合，先用数据fence发布代码写入，再执行本地FENCE.I；全MM调用通过同步SBI远端FENCE.I等待已活动CPU确认，整个过程不修改PTE或刷新TLB。LOCAL只同步当前CPU，其他CPU在随后激活该MM时补齐。捕获集合后加入的CPU同样检查代次；调用者只记录本次捕获的代次，远端等待期间并发发布的新代次仍须另行观察。
 

@@ -7,7 +7,7 @@ enum kernel_mm_status kernel_mm_create(struct kernel_mm *, struct arch_mmu_user_
 void kernel_mm_drain_sources(const struct kernel_mm *);
 enum kernel_mm_status kernel_mm_context(const struct kernel_mm *, uint64_t *);
 /* 调度域外调用；next拥有MM引用，旧执行owner覆盖旧record借用。
- * NULL选择稳定kernel_context；并发域即使同SATP也做本地失效/取指同步。 */
+ * NULL选择稳定kernel_context；已登记的同MM激活按实际观察的翻译/指令代次同步。 */
 enum kernel_mm_status kernel_mm_activate(const struct kernel_mm *next, uint64_t kernel_context);
 /* 受控内核任务在创建处检查支持的后备消费者；不切换MM同步模型。 */
 enum kernel_mm_status kernel_mm_check_task_domain(const struct kernel_mm *);
