@@ -36,7 +36,7 @@ TCP 发送先在端点保护内预约额度，连续输入复用任务 scratch �
 
 socket 在最终 OFD 释放时取得协议资格，先摘除弱引用工作链并解除 PCB 回调。跨用户复制和待执行请求持有实际 OFD/pin，因此 worker 借用的对象不会被提前销毁。队列只在从无工作变为有工作时通知 worker；容量、接收归还、loopback 与期限使用各自的原有通知来源。
 
-TCP 的一批 COPY 保持完整发送预约，协议 owner 在批末一次发布实际 PCB 额度并归还预约；批内已复制的字节仍包含在预约中，远端接纳无法重复使用。队列满、ERR_MEM、成功前缀及末批输出分别按实际结果处理；需要输出时，先在锁外执行 tcp_output，再发布容量并归还本批预约。逐页片段不再重复发布相同容量。UNIX 成功发送后的请求摘除不改变就绪状态，通知由消息发布、额度归还、取消及对端变化产生；INET 停止仍等待活动请求摘除并接收对应通知。recvfrom/recvmsg 仅在用户请求源地址时取得临时名称引用，消息长度和截断消费独立处理。
+TCP 的一批 COPY 保持完整发送预约，协议 owner 在批末一次发布实际 PCB 额度并归还预约；批内已复制的字节仍包含在预约中，远端接纳无法重复使用。队列满、ERR_MEM、成功前缀及末批输出分别按实际结果处理；需要输出时，先在锁外执行 tcp_output，再发布容量并归还本批预约。容量发布和预约归还作为同一次端点状态修改，实际可接纳字节增加才通知额度等待者；完整 COPY 通常只是把预约转成协议占用，短前缀和取消则归还未用额度。其他调用者尚未 COPY 的预约耗尽接纳额度时，不安排无助于归还预约的 CPU0 输出；本请求的 deferred 前缀及真实协议阻塞仍推进输出。逐页片段不再重复发布相同容量。成功发送后的请求摘除不改变正常就绪状态，INET 停止仍等待活动请求摘除并接收对应通知。recvfrom/recvmsg 仅在用户请求源地址时取得临时名称引用，消息长度和截断消费独立处理。
 
 `netif_loop_output()` 在成功发布完整回环包队列后调用可选的
 `LWIP_HOOK_NETIF_LOOPBACK_QUEUED`，经端口进入 `protocol_work_ready()`，设置软件
@@ -169,7 +169,7 @@ epoll控制仍在CPU0，等待扫描和事件复制在发起CPU执行，详见[�
 
 `tests/host/socket-accept-allocation.sh` 在真实 OFD 分配处注入 EMPTY，检查连接保留、重试双向通信及 FD、凭据和堆页归还；另覆盖等待失败和地址输出失败的不同副作用。`tests/host/network_owner.py --case unix-space-topology` 检查互连流量不触发空间回调、断连恢复单向订阅及重连唤醒；`unix_named` 用户程序通过实际 epoll 等待与队列空间释放核对跨核通知。
 
-`unix-packet-boundary` 覆盖默认、最小和最大SNDBUF的完整分配大小、向量前缀及计费归还。`unix-write-notify` 直接检查成功发送不产生无状态变化的本端通知，同时检查消息消费和复制取消仍通知发送者。`tcp-batch` 在真实 tcp_write 的 COPY 之间握手，让另一 CPU 预约剩余额度，检查整批接纳期间额度保持保守且最终归还；相同数据分段不会增加端点保护次数。
+`unix-packet-boundary` 覆盖默认、最小和最大SNDBUF的完整分配大小、向量前缀及计费归还。`unix-write-notify` 直接检查成功发送不产生无状态变化的本端通知，同时检查消息消费和复制取消仍通知发送者。`tcp-batch` 在真实 tcp_write 的 COPY 之间握手，让另一 CPU 预约剩余额度，检查整批接纳期间额度保持保守且最终归还；相同数据分段不会增加端点保护次数。`tcp-quota-notify` 和 `remote-quota-notify` 检查两发送者共享预约时不产生空输出或无额度变化的广播，短前缀与取消仍恢复可写通知，CPU0 完成远端请求后交还真实请求和 OFD。
 
 ```sh
 make test-lwip-host test-lwip-reassembly-host test-ethernet-worker-host

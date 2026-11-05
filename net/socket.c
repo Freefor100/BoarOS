@@ -2404,9 +2404,9 @@ static void socket_write_end(struct kernel_socket_write_request *request)
     struct kernel_socket *destination=request->unix_destination;
     request->unix_destination=NULL;
     int release=destination && unix_put_locked(destination);
-    /* UNIX readiness changes at packet publication, credit return or cancel;
-     * the OFD pin keeps final close behind this request's removal. */
-    if(request->socket->domain==KERNEL_SOCKET_DOMAIN_INET)wake_socket(request->socket);
+    /* 请求摘除不改变正常就绪状态；停止网络才等待活动链归还。
+     * OFD pin仍保证最后关闭晚于本请求解除登记。 */
+    if(network_stopping && request->socket->domain==KERNEL_SOCKET_DOMAIN_INET)wake_socket(request->socket);
     socket_state_release(&state);
     if(release)unix_storage_free(destination);
 }
@@ -2880,7 +2880,10 @@ int kernel_socket_stream_reserve(struct kernel_socket_write_request *request,
     if (!error && size) {
         if (size > available) size = available;
         if (!size) {
-            socket_schedule(request->socket, SOCKET_WORK_OUTPUT);
+            /* 其他调用者尚未COPY的预约不属于协议积压，运行CPU0不能归还它。
+             * 已接纳的deferred前缀和真实协议阻塞仍沿原输出路径推进。 */
+            if (!request->socket->tx_budget || (request->progressed & SOCKET_WRITE_DEFERRED))
+                socket_schedule(request->socket, SOCKET_WORK_OUTPUT);
             request->progressed &= (uint8_t)~SOCKET_WRITE_DEFERRED;
             error = -KERNEL_EAGAIN; COST_ADD(STREAM_ADMIT_BLOCKED, 1);
         }
@@ -2894,8 +2897,10 @@ static void stream_release_reservation(struct kernel_socket_write_request *reque
     if (!request->reserved) return;
     SOCKET_STATE(irq);
     if (request->socket->tx_reserved < request->reserved) __builtin_trap();
+    uint32_t previous=tcp_admission_capacity_locked(request->socket);
     request->socket->tx_reserved -= request->reserved; request->reserved = 0;
-    if (notify) wake_socket(request->socket);
+    if (notify && tcp_admission_capacity_locked(request->socket)>previous)
+        socket_state_notify(&request->socket->wait);
     socket_state_release(&irq);
 }
 void kernel_socket_stream_cancel(struct kernel_socket_write_request *request)
@@ -2973,8 +2978,12 @@ static int stream_commit_owned(struct kernel_socket_write_request *request,
         socket_state_acquire(&endpoint);
         budget = tcp_protocol_budget(socket);
     }
+    uint32_t previous=tcp_admission_capacity_locked(socket);
     socket->tx_budget = budget;
     stream_release_reservation(request, 0);
+    /* COPY消耗与本批预约归还共同决定真实接纳变化；请求完成本身不唤醒
+     * 其他额度等待者，短前缀释放出的未用额度仍在这里发布。 */
+    if(tcp_admission_capacity_locked(socket)>previous)socket_state_notify(&socket->wait);
     socket_state_release(&endpoint);
     if (result == -KERNEL_EAGAIN) COST_ADD(STREAM_PROTOCOL_BLOCKED, 1);
     return result;
@@ -3018,8 +3027,6 @@ static int protocol_request(struct kernel_socket_write_request *request,enum soc
         {SOCKET_STATE(state);result=network_stopping && operation<SOCKET_PROTOCOL_DISPOSE?-KERNEL_EIO:0;}
         if(!result)result=execute_protocol_request(request);
         request->segments=0;
-        {SOCKET_STATE(state);
-         if(operation==SOCKET_PROTOCOL_STREAM && tcp_admission_capacity_locked(request->socket))wake_socket(request->socket);}
         if(result>=0 && operation!=SOCKET_PROTOCOL_UDP_PREPARE && operation!=SOCKET_PROTOCOL_DISPOSE &&
             !(request->progressed & SOCKET_WRITE_DEFERRED))service_inline(&protocol);
         kernel_socket_protocol_leave(&protocol);return result;
@@ -3471,7 +3478,6 @@ static void service_write(struct kernel_socket *socket)
     /* 原调用者重新取得端点保护前保活请求；在发布结果的同一保护内
      * 定向通知，ACK/POLLOUT 不再唤醒尚未完成 COPY 的等待者。 */
     if(kernel_wait_notify(&request->completion,KERNEL_WAIT_WOKEN)!=KERNEL_SCHEDULER_STATUS_OK)__builtin_trap();
-    wake_socket(socket);
     socket_state_release(&irq);
 }
 
