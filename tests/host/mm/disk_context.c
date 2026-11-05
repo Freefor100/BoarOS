@@ -107,6 +107,7 @@ void kernel_mm_unpin_user_page(struct kernel_mm_user_pin *pin)
 EXCLUDED(kernel_shm_attachment_close)
 EXCLUDED(kernel_shm_attachment_open)
 EXCLUDED(kernel_shm_attachment_acquire)
+EXCLUDED(kernel_shm_attachment_create)
 struct kernel_shm_attachment;
 void kernel_shm_attachment_release(struct kernel_shm_attachment **owner)
 { if (owner && *owner) excluded(); }

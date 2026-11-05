@@ -64,6 +64,34 @@ int main(void)
     assert(!kernel_vma_set_lookup(set,P,&inherited)&&inherited.flags==KERNEL_VMA_DONTFORK);
     assert(!kernel_vma_set_lookup(set,2*P,&inherited)&&inherited.flags==KERNEL_VMA_WIPEONFORK);
     assert(!kernel_vma_set_destroy(&copy)&&!kernel_vma_set_destroy(&set));
+    assert(!kernel_vma_set_create(&heap,&set));
+    v=(struct kernel_vma){.start=P,.end=5*P,.permissions=3,.maximum_permissions=7,
+        .kind=KERNEL_VMA_KIND_ANONYMOUS,.role=KERNEL_VMA_ROLE_MMAP,
+        .fault_policy=KERNEL_VMA_FAULT_DEMAND_ZERO,.flags=KERNEL_VMA_LOCKED};
+    assert(!kernel_vma_set_insert(set,&v));
+    v.start=5*P;v.end=6*P;assert(!kernel_vma_set_insert(set,&v));
+    usage(set,5,5);assert(kernel_vma_set_count(set)==1&&kernel_vma_set_locked_bytes(set)==5*P);
+    /* 替换跨过旧范围尾部，保留左侧不同分类的片段；插入合并只新增本次字节。 */
+    v.start=2*P;v.end=7*P;v.permissions=1;v.flags=0;
+    assert(!kernel_vma_set_prepare_replace(set,v.start,v.end,&v,&edit)&&
+        !kernel_vma_set_commit_edit(set,&edit));
+    usage(set,6,1);assert(kernel_vma_set_locked_bytes(set)==P);
+    assert(kernel_vma_set_insert(set,&v)==KERNEL_VMA_STATUS_CONFLICT);usage(set,6,1);
+    assert(!kernel_vma_set_trim_end(set,2*P,7*P,4*P));usage(set,3,1);
+    assert(kernel_vma_set_locked_bytes(set)==P);
+    uint64_t gap;
+    assert(!kernel_vma_set_find_topdown_gap(set,0,0,P,P,&gap)&&!gap);
+    assert(kernel_vma_set_find_topdown_gap(set,0,P,2*P,P,&gap)==KERNEL_VMA_STATUS_NOT_FOUND);
+    assert(!kernel_vma_set_find_topdown_gap(set,2*P,P,5*P,P,&gap)&&gap==4*P);
+    assert(!kernel_vma_set_prepare_flags(set,P,4*P,KERNEL_VMA_LOCK_MASK,0,&edit)&&
+        !kernel_vma_set_commit_edit(set,&edit));
+    assert(!kernel_vma_set_locked_bytes(set));usage(set,3,1);
+    assert(!kernel_vma_set_prepare_protect(set,P,4*P,3,&edit)&&
+        !kernel_vma_set_commit_edit(set,&edit));usage(set,3,3);
+    assert(kernel_vma_set_count(set)==1);
+    assert(!kernel_vma_set_trim_end(set,P,4*P,2*P));usage(set,1,1);
+    assert(!kernel_vma_set_trim_end(set,P,2*P,P));usage(set,0,0);
+    assert(!kernel_vma_set_destroy(&set));
     struct kernel_heap_statistics stats;kernel_heap_get_statistics(&heap,&stats);
     assert(!stats.live_allocations&&!stats.current_pages&&physical_page_available(&pages)==baseline);
     assert(!physical_page_allocator_audit(&pages));

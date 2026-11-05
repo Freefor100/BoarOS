@@ -126,6 +126,8 @@ enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue
     tcp_wait_preparing(queue);
 #endif
     enum kernel_scheduler_status status=__real_kernel_wait_prepare(queue,deadline,interruptible,token);
+    if (!status && interruptible && futex_role==1)
+        __atomic_store_n(&futex_registered,1,__ATOMIC_RELEASE);
 #ifdef TCP_IO_CASES
     if (!status) tcp_wait_prepared(queue,deadline);
 #endif
@@ -203,18 +205,23 @@ void __wrap_kernel_mm_unpin_user_page(struct kernel_mm_user_pin *pin)
 #ifdef TCP_IO_CASES
     int batch=tcp_batch_unpinning(pin);
 #endif
-    if(futex_role==1 && kernel_task_current()->futex_request &&
-       kernel_wait_record_phase(&kernel_task_current()->wait)==KERNEL_WAIT_PREPARED) {
-        assert(!kernel_cpu_current()->raw_locks && !kernel_io_context_current()->locks);
-        __atomic_store_n(&futex_registered,1,__ATOMIC_RELEASE);
-        while(!__atomic_load_n(&futex_edit_ready,__ATOMIC_ACQUIRE))sched_yield();
-    }
     __real_kernel_mm_unpin_user_page(pin);
 #ifdef TCP_IO_CASES
     if(batch) tcp_batch_unpinned(pin);
 #endif
-    if (futex_role==1 && __atomic_load_n(&futex_registered,__ATOMIC_ACQUIRE))
+}
+enum kernel_mm_status __real_kernel_mm_try_futex_read(const struct kernel_mm *,uint64_t,uint32_t *);
+enum kernel_mm_status __wrap_kernel_mm_try_futex_read(const struct kernel_mm *mm,uint64_t address,uint32_t *value)
+{
+    enum kernel_mm_status status=__real_kernel_mm_try_futex_read(mm,address,value);
+    if (futex_role==1 && status==KERNEL_MM_STATUS_OK) {
+        assert(*value==1 && !kernel_cpu_current()->raw_locks && !kernel_io_context_current()->user_pins);
+        /* 已读完比较值而尚未登记；桶资格阻止另一任务的WAKE越过登记。
+         * 期间实际撤销写许可，检查PTE变更无需依赖已无用途的物理pin。 */
         __atomic_store_n(&futex_word_read,1,__ATOMIC_RELEASE);
+        while(!__atomic_load_n(&futex_edit_ready,__ATOMIC_ACQUIRE))sched_yield();
+    }
+    return status;
 }
 static void *futex_waiter(void *unused)
 {
@@ -230,7 +237,7 @@ static void *futex_editor(void *unused)
 {
     (void)unused;mm_test_attach(2);mm_test_bind(&mm);mm_test_context=context;
     kernel_cpu_current()->logical_id=1;futex_role=2;
-    while (!__atomic_load_n(&futex_registered,__ATOMIC_ACQUIRE)) sched_yield();
+    while (!__atomic_load_n(&futex_word_read,__ATOMIC_ACQUIRE)) sched_yield();
     assert(!kernel_mm_mprotect(&mm,FUTEX_ADDRESS,BOAROS_PAGE_SIZE,KERNEL_MM_READ));
     futex_role=0;
     uintptr_t irq=arch_interrupt_save();enum kernel_scheduler_status status;
@@ -252,7 +259,7 @@ static void futex_pin_case(void)
     assert(!kernel_mm_munmap(&mm,address,BOAROS_PAGE_SIZE));
     struct kernel_mm_concurrency_state state;kernel_mm_get_concurrency_state(&mm,&state);
     assert(!state.pins && !state.write_pins && !state.pending_retirement);
-    puts("PASS futex registration vs actual mprotect: pin survives final comparison, unpin precedes park, exact wake and final owners");
+    puts("PASS private futex comparison vs actual mprotect: bucket preserves registration/wake order without a page pin, final owners returned");
 }
 unsigned mm_test_parked(unsigned);
 enum robust_futex_mode { ROBUST_FUTEX_OWNER_DIED, ROBUST_FUTEX_PENDING_UNLOCK,

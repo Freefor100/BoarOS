@@ -1497,6 +1497,51 @@ static void pool_release_owner(void)
     puts("PASS protocol pool release: actual pbuf ownership returned and capacity generation published without endpoint contention");
 }
 
+static void tcp_quota_wakeup(struct kernel_wait_node *node,uint32_t reason)
+{ CHECK(reason==KERNEL_WAIT_WOKEN);(*(unsigned *)node->context)++; }
+static void tcp_quota_notifications(void)
+{
+    struct kernel_socket *listener=NULL,*client=NULL,*server=NULL;
+    connected_pair(&listener,&client,&server);
+    for(unsigned i=0;i<8;i++)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+    struct kernel_open_file_description *a=(void *)client,*b=(void *)client;
+    struct kernel_socket_write_request first={0},second={0};
+    kernel_socket_stream_begin(&first,&a);kernel_socket_stream_begin(&second,&b);
+    uint32_t capacity;{SOCKET_STATE(state);capacity=tcp_admission_capacity_locked(client);}
+    CHECK(capacity && kernel_socket_stream_reserve(&first,capacity,0)==(int)capacity);
+    CHECK(kernel_socket_stream_reserve(&second,1,0)==-KERNEL_EAGAIN);
+    /* All protocol capacity is still held by a caller, rather than by TCP.
+     * A competing admission cannot make progress by running the worker. */
+    CHECK(!work_pending_snapshot());
+    unsigned notifications=0;
+    struct kernel_wait_node observer={0};
+    kernel_wait_node_init_callback(&observer,tcp_quota_wakeup,&notifications);
+    kernel_wait_queue_add(&client->wait,&observer);
+    kernel_socket_stream_cancel(&first);
+    CHECK(notifications==1 && (kernel_socket_poll(client,NULL)&KERNEL_POLLOUT));
+    CHECK(kernel_socket_stream_reserve(&second,capacity,0)==(int)capacity);
+    notifications=0;
+    struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    /* Only one byte is prepared: the unused reservation becomes genuinely
+     * admissible again, and must notify competing writers exactly once. */
+    CHECK(kernel_socket_stream_commit(&second,"q",1,KERNEL_SOCKET_IO_MORE)==1);
+    CHECK(notifications==1);
+    notifications=0;
+    kernel_socket_stream_finish(&first);kernel_socket_stream_finish(&second);
+    CHECK(!notifications);
+    kernel_socket_protocol_leave(&scope);
+    CHECK(kernel_wait_node_remove_sync(&observer)==KERNEL_SCHEDULER_STATUS_OK);
+    for(unsigned i=0;i<8;i++)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+    CHECK(server->rx_bytes==1 && !client->tx_reserved && !client->active_writes);
+    kernel_socket_protocol_enter(&scope);
+    if(client->tcp)tcp_abort(client->tcp);
+    if(server->tcp)tcp_abort(server->tcp);
+    kernel_socket_protocol_leave(&scope);
+    kernel_socket_destroy(client);kernel_socket_destroy(server);kernel_socket_destroy(listener);
+    for(unsigned i=0;i<8;i++)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+    puts("PASS TCP quota: caller-held admission does not schedule CPU0; returned capacity notifies once, completed request removal does not notify");
+}
+
 static void minshall_send(void)
 {
     for(unsigned wrap=0;wrap<2;wrap++) {
@@ -1546,7 +1591,7 @@ static void *remote_writer(void *argument)
     struct kernel_socket *socket=argument;kernel_cpu_current()->logical_id=1;
     struct kernel_open_file_description *pin=(void *)socket;
     remote_task=(void *)&test_context;
-    if(!remote_mode || remote_mode==4 || remote_mode==5 || remote_mode==6 || remote_mode==7) {
+    if(!remote_mode || remote_mode==4 || remote_mode==5 || remote_mode==6 || remote_mode==7 || remote_mode==8) {
         struct kernel_socket_write_request request={0};
         kernel_socket_stream_begin(&request,&pin);
         CHECK(kernel_socket_stream_reserve(&request,1,0)==1);
@@ -1578,7 +1623,7 @@ static void remote_protocol_request(unsigned mode)
 {
     remote_testing=1;remote_mode=mode;
     struct kernel_socket *listener=NULL,*client=NULL,*server=NULL;
-    if(!mode || mode==4 || mode==5 || mode==6 || mode==7)connected_pair(&listener,&client,&server);
+    if(!mode || mode==4 || mode==5 || mode==6 || mode==7 || mode==8)connected_pair(&listener,&client,&server);
     else {
         struct kernel_socket_address address={.family=KERNEL_SOCKET_AF_INET,.port=24017,.bytes={127,0,0,1}};
         CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,&server));
@@ -1592,6 +1637,16 @@ static void remote_protocol_request(unsigned mode)
     kernel_wait_queue_init(&model_work_queue);model_work_queue.head=model_work_queue.tail=&work_node;
     kernel_socket_network_hooks(NULL,&model_work_queue,NULL,&remote_work);
     remote_socket=client;
+    struct kernel_open_file_description *quota_pin=(void *)client;
+    struct kernel_socket_write_request quota={0};
+    struct kernel_wait_node quota_observer={0};unsigned quota_notifications=0;
+    if(mode==8) {
+        kernel_socket_stream_begin(&quota,&quota_pin);
+        uint32_t capacity;{SOCKET_STATE(state);capacity=tcp_admission_capacity_locked(client);}
+        CHECK(capacity>1 && kernel_socket_stream_reserve(&quota,capacity-1,0)==(int)capacity-1);
+        kernel_wait_node_init_callback(&quota_observer,tcp_quota_wakeup,&quota_notifications);
+        kernel_wait_queue_add(&client->wait,&quota_observer);
+    }
     unsigned initial_xmit=lwip_stats.tcp.xmit;
     pthread_t thread,stopper;unsigned stop_started=0,turns=0;
     CHECK(!pthread_create(&thread,NULL,remote_writer,client));
@@ -1627,6 +1682,7 @@ static void remote_protocol_request(unsigned mode)
             protocol_input(client->tcp);kernel_socket_protocol_leave(&scope);
         }
         struct kernel_socket_service_result service=kernel_socket_service_pending(
+            mode==8?(struct kernel_socket_service_budget){1,0,0}:
             mode==6?(struct kernel_socket_service_budget){1,8,0}:(struct kernel_socket_service_budget){8,8,1});
         if(mode==6 && !turns) CHECK(service.sockets==1 && service.packets && server->rx_bytes==1);
         turns++;
@@ -1634,6 +1690,14 @@ static void remote_protocol_request(unsigned mode)
         CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));
     }
     CHECK(!pthread_join(thread,NULL));remote_write=NULL;
+    if(mode==8) {
+        CHECK(!quota_notifications && !(kernel_socket_poll(client,NULL)&KERNEL_POLLOUT));
+        kernel_socket_stream_cancel(&quota);
+        CHECK(quota_notifications==1 && (kernel_socket_poll(client,NULL)&KERNEL_POLLOUT));
+        kernel_socket_stream_finish(&quota);
+        CHECK(quota_notifications==1);
+        CHECK(kernel_wait_node_remove_sync(&quota_observer)==KERNEL_SCHEDULER_STATUS_OK);
+    }
     if(stop_started) {CHECK(!pthread_join(stopper,NULL));CHECK(stop_done && !stop_borrows);}
     for(unsigned i=0;i<8;i++)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
     CHECK(server->rx_bytes==((mode>=2 && mode<=4)?0:1) && !client->tx_reserved && !client->writes_head && !client->active_writes);
@@ -2632,6 +2696,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "remote-batch")) remote_protocol_request(5);
     else if (!strcmp(argv[1], "remote-batch-ack")) remote_protocol_request(7);
     else if (!strcmp(argv[1], "remote-turn")) remote_protocol_request(6);
+    else if (!strcmp(argv[1], "remote-quota-notify")) remote_protocol_request(8);
     else if (!strcmp(argv[1], "remote-udp")) remote_protocol_request(1);
     else if (!strcmp(argv[1], "remote-udp-fault")) remote_protocol_request(2);
     else if (!strcmp(argv[1], "remote-udp-stop")) remote_protocol_request(3);
@@ -2652,6 +2717,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "loopback-work")) loopback_work();
     else if (!strcmp(argv[1], "unix-sender")) unix_sender_owner();
     else if (!strcmp(argv[1], "tcp-batch")) copy_capacity(0,1);
+    else if (!strcmp(argv[1], "tcp-quota-notify")) tcp_quota_notifications();
     else if (!strcmp(argv[1], "pool-release-owner")) pool_release_owner();
     else if (!strcmp(argv[1], "tcp-batch-last")) copy_capacity(0,2);
     else if (!strcmp(argv[1], "tcp-batch-abort")) copy_capacity(0,3);

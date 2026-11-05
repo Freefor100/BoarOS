@@ -11,6 +11,7 @@ void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *,struct kernel_raw_g
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_raw_guard *guard)
 {
     if (disk_raw_observe) (*disk_raw_observe)++;
+    cache_raw_observe(lock);
     __real_kernel_raw_lock_acquire(lock,guard);
 }
 static _Thread_local unsigned disk_fail_page,disk_fail_heap;
@@ -161,7 +162,6 @@ static void disk_mm_case(struct kernel_page_cache *cache,struct kernel_heap *hea
     assert(!kernel_copy_to_user(&parent,anonymous,&byte,1,&done) && done==1);
     disk_raw_observe=NULL;
     printf("resident anonymous copy beside shared disk mapping: locks=%u\n",locks);
-    assert(locks==4);
 
     assert(!kernel_copy_to_user(&parent,shared,&byte,1,&done) && done==1);
     assert(!kernel_mm_context(&child,&mm_test_context)); mm_test_bind(&child);

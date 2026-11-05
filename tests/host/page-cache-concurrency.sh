@@ -19,7 +19,7 @@ for shift in ${CACHE_HOST_SHIFTS:-12 14}; do
         fs/record_lock.c fs/flock.c fs/page_cache.c fs/ext4_backend.c fs/lwext4_port.c \
         kernel/block.c third_party/lwext4/src/*.c ${CACHE_HOST_SOURCES:-} \
         -Wl,--wrap=memcpy,--gc-sections,--wrap=kernel_time_monotonic_ns,--wrap=kernel_vfs_node_pread,--wrap=kernel_vfs_node_pread_batch,--wrap=physical_page_allocate,--wrap=kernel_heap_allocate_zeroed,--wrap=kernel_heap_allocate,--wrap=kernel_vfs_node_writeback,--wrap=ext4_fpwrite_batch,--wrap=kernel_thread_join,--wrap=kernel_open_file_prepare_mapping_page \
-        -Wl,--wrap=kernel_rwlock_read,--wrap=kernel_rwlock_write,--wrap=kernel_rwlock_try_write,--wrap=kernel_wait_prepare,--wrap=kernel_wait_park,--wrap=kernel_wait_queue_destroy,--wrap=physical_page_acquire,--wrap=physical_page_release,--wrap=physical_page_available,--wrap=kernel_vfs_sync_complete \
+        -Wl,--wrap=kernel_raw_lock_acquire,--wrap=kernel_rwlock_read,--wrap=kernel_rwlock_write,--wrap=kernel_rwlock_try_write,--wrap=kernel_wait_prepare,--wrap=kernel_wait_park,--wrap=kernel_wait_queue_destroy,--wrap=physical_page_acquire,--wrap=physical_page_release,--wrap=physical_page_available,--wrap=kernel_vfs_sync_complete \
         -Wl,--wrap=ext4_file_writeback_times,--wrap=ext4_file_sync_metadata_mode,--wrap=kernel_vfs_node_find,--wrap=ext4_mount_setup_time_observer ${CACHE_HOST_LDFLAGS:-} \
         -Wl,--wrap=ext4_filesystem_sync_metadata -o "$build_dir/concurrency-$shift"
     for block in ${CACHE_HOST_BLOCKS:-1024 4096}; do

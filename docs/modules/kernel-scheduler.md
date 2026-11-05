@@ -158,7 +158,7 @@ IRQ关闭的短入口复用同一次CPU/current定位，借用在切换或可睡
 缺页服务使用当前执行owner固定的task/MM，不把CPU指针带过睡眠。RV/LA timer
 后端保留已确认的相同事件，避免每次yield重复写硬件，周期IRQ仍自行重装。
 
-任务的`scheduling.priority`保存实际运行优先级，既有就绪/每核资格/CPU0服务与来源保留队列按这个值排序。继承期间才在任务尾部保存基础优先级；sched查询、RTPRIO授权和fork使用基础值，proc的priority展示实际值、rt_priority展示基础值。优先级变更在调度保护内重新发布相关队列并请求目标CPU调度；实际优先级未变时保留FIFO位置。每核就绪与保留队列记录被提升的成员，存在此类持锁者时解除该核RT带宽节流，使其能释放锁。
+任务的`scheduling.priority`保存实际运行优先级，既有就绪/每核资格/CPU0服务与来源保留队列按这个值排序。继承期间才在任务尾部保存基础优先级；sched查询、RTPRIO授权和fork使用基础值，proc的priority展示实际值、rt_priority展示基础值。优先级变更在调度保护内重新发布相关队列，并原子发布实际优先级标量、请求目标CPU调度；实际优先级未变时保留FIFO位置。普通futex与waitv观察到实际优先级为零时，基础优先级也只能为零，直接登记FIFO；RT/PI情况仍在调度保护内读取基础值。MQ按实际优先级的单次快照登记，不读取PI基础字段。每核就绪与保留队列记录被提升的成员，存在此类持锁者时解除该核RT带宽节流，使其能释放锁。
 
 sched_setparam/setscheduler/getparam/getscheduler、priority_min/max、rr_get_interval 和 CPU0 affinity 使用真实任务状态；未发布 child 不可被按 TID 查询。BATCH/IDLE/DEADLINE/EXT 的 min/max 查询按固定 Linux 返回 0，设置这些策略仍显式拒绝。RESET_ON_FORK 在子任务清除并将继承的 RT 变为 OTHER；exec 保留执行线程的策略。RV 用户执行支持真实1～8核，亲和性与执行资格见 [RV SMP](riscv-smp.md)；nice 调度、cgroup 配额和 deadline scheduler另行实现。
 
@@ -301,11 +301,13 @@ RV与LA使用同一事件位发布原语，各自保留硬件确认及IPI发送�
 
 BLOCKED 状态由任务的等待记录维护；事件等待按实际等待队列登记和通知，不另维护全局阻塞任务链。队列 wake-one 取队首，wake-all 唤醒全部；摘除队列成员为 O(1)。deadline 使用原始 time ticks，0 表示无限；带期限任务进入以 (deadline, tid) 为键的有序索引，tick 只弹出已到期者，全部唤醒路径统一摘除索引项。
 
-MM 一次准备至多两个 key 和一个用户字 pin。private key 使用不复用的 MM 身份号与四字节对齐地址，不取得映射编辑 gate；WAKE 和不读字的 REQUEUE 不要求地址仍有映射。private WAIT、CMP_REQUEUE 和 WAKE_OP 沿共同用户 pin 协议，在 metadata raw 内检查当前 PTE、访问许可并取得实际页引用；新许可关闭时先等待开放，缺页或 COW 先调用 resolver，再重新取得 pin。共享 key 需要 operation gate 固定整组映射视图，再由 metadata raw 检查当前 PTE 并取得页许可；所有缺页和 COW 先在没有部分 pin、key 后备引用的状态完成，再重新解析整组地址。共享匿名和 SysV key 使用内存对象与对象内字节偏移，共享文件 key 使用按文件系统实例和 inode 唯一化的活 VFS node 与文件内字节偏移。非 private 操作按实际 PTE 检查身份解析资格：驻留的纯执行叶可用于 WAKE，PROT_NONE 不可；需要读字或写字的命令另需相应许可，未驻留页沿缺页权限检查。等待者持有后备引用直到原等待调用恢复，文件描述符关闭或映射撤销不提前结束它。
+MM 一次准备至多两个 key 和一个用户字 pin。private key 使用不复用的 MM 身份号与四字节对齐地址，不取得映射编辑资格；WAKE 和不读字的 REQUEUE 不要求地址仍有映射。驻留 private WAIT 在桶资格内，通过 MM metadata 短读保护检查 PTE、USER/READ 权限并原子读完 32 位比较值，不把用户指针带出保护，也不登记物理页借用。冷页、撤权及关闭许可需要可睡眠处理时，先释放桶，再沿共同用户页准备处理并重试。CMP_REQUEUE、WAKE_OP及需要跨保护访问的路径继续持有真实 pin。共享 key 由 operation 资格固定整组映射，再由 metadata 检查 PTE；所有缺页和 COW 在归还部分 pin、后备引用之后处理。共享匿名与 SysV key 使用内存对象和对象内偏移，共享文件 key 使用活 VFS inode 和文件内偏移。非 private 操作按实际 PTE 检查身份解析资格：驻留纯执行叶可用于 WAKE，PROT_NONE 不可；读写命令另需相应许可。等待者的后备引用持续到等待调用结束，FD 关闭或映射撤销不提前释放它。
 
 等待键、bitset及消费状态归每个futex等待项，普通WAIT使用栈上单项；任务仅保存当前请求的清理owner。请求及后备引用在token结束、节点借用排空后归还，强制退出沿共同I/O清理在释放旧栈前完成。此后请求由原执行者或独占退出清理者拥有，清空任务请求句柄直接由该owner完成。现有futex/PI/信号量请求字段占用原单地址futex槽位，后续信号、文件和MM热字段偏移保持原值。
 
-每个哈希桶有可睡眠操作 mutex，双地址操作按桶索引递增取得，同桶只取得一次。桶表在 boot CPU 初始化 wait_domain 后、任务和 secondary 发布前一次初始化。每次操作只解析一组桶指针，比较、登记和扫描直接使用这些指针；锁内不再进入 MM 准备或缺页。WAIT 在桶锁内比较已 pin 的用户字，并在等待短保护内直接登记 token；任务、桶和栈token已由该调用取得，无需再次经过公共登记包装的参数检查。通知因此不会插入比较与登记之间；随后释放桶锁、归还 pin，再 park。token 登记后不再等待其他 mutex。WAKE、比较后 requeue 和 WAKE_OP 的原子更新与唤醒也受相应桶锁保护。桶碰撞仍按完整 key 匹配。WAKE 在至多 16 个登记的短链上，只取得一次 wait_domain，完成 key/bitset 匹配和通知；队列只包含任务节点，节点使用始终在保护内，因而无需锁外游标借用。真实WAKE在同一短保护内标记并摘除相应等待项，扫描先保存后继。等待项的消费独立于任务token通知：超时或信号已通知但调用者尚未出队时，真实WAKE仍计数并优先完成该项。长链与 requeue 沿借用游标线性前进，每个节点只短暂持有 wait_domain。requeue 移动前以 task 借用覆盖游标归还，在同一 wait_domain 内发布 key 与节点位置，已经出队的项不再迁移；仅收到超时/信号通知且仍排队的项保留迁移与真实唤醒资格。所有可能成为最后一个的后备引用都在桶锁和用户 pin 之外释放。
+每个哈希桶有可睡眠操作 mutex，双地址按桶索引递增取得，同桶只锁一次。桶表在任务与 secondary 发布前初始化。比较、登记及重排由桶操作资格串行；MM 短读可在桶内完成，可睡眠的缺页准备放在桶外。比较和等待登记之间，普通 WAKE 无法越过同一个桶，因此没有丢失唤醒的间隙。登记后释放桶及实际 pin，再 park；token 登记后不再等待其他 mutex。
+
+等待节点链由各桶的队列短锁维护。WAKE 的至多16项短链在一次队列保护内匹配完整 key/bitset，标记并摘下等待项，同时取得覆盖锁外通知的实际任务借用；PREPARED token 可直接原子通知，COMMITTED token 仍由调度域处理期限、READY 与旧栈交接。长链使用有界游标借用；重排在源、目标队列保护内同时发布新 key 和节点位置，后备引用的最终归还在桶锁和用户 pin 之外。实际等待项的唤醒消费独立于超时/信号通知：调用者尚未出队时，真实 WAKE 仍计数并优先完成该项。
 
 SMP下，WAKE/WAKE_OP及退出唤醒在取得全部桶资格后，借用当前调用栈上的通知批次。READY和目标CPU事件位立即发布；实际IPI目标暂存于该批次，全部桶锁归还后才合并发送，避免发送者在持桶期间等待固件。批次保存并恢复原IRQ及抢占深度，期间保持CPU固定且不允许阻塞；撤销CPU上的栈指针后再发送。原始raw释放路径不增加分支，UP编译为空操作。共享key最终释放与用户pin归还在批次结束后执行。
 

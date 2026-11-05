@@ -11,14 +11,15 @@
 
 #define KERNEL_VMA_INITIAL_CAPACITY 8U
 
+struct vma_usage { uint64_t total, data, locked; };
+
 struct kernel_vma_set {
     struct kernel_heap *heap;
     struct kernel_vma *entries;
     uint32_t count;
     uint32_t capacity;
     uint64_t generation;
-    uint64_t total_bytes;
-    uint64_t data_bytes, locked_bytes;
+    struct vma_usage usage;
 };
 
 static int set_valid(const struct kernel_vma_set *set)
@@ -39,7 +40,7 @@ uint64_t kernel_vma_set_generation(const struct kernel_vma_set *set)
 uint64_t kernel_vma_set_total_bytes(const struct kernel_vma_set *set)
 {
     if (!set_valid(set)) __builtin_trap();
-    return set->total_bytes;
+    return set->usage.total;
 }
 
 static int private_data_mapping(const struct kernel_vma *vma)
@@ -58,29 +59,31 @@ int kernel_vma_is_data(const struct kernel_vma *vma)
 uint64_t kernel_vma_set_data_bytes(const struct kernel_vma_set *set)
 {
     if (!set_valid(set)) __builtin_trap();
-    return set->data_bytes;
+    return set->usage.data;
 }
 
-static void recount_bytes(struct kernel_vma_set *set)
+static void account_bytes(struct vma_usage *usage, const struct kernel_vma *vma,
+    uint64_t bytes, int add)
 {
-    uint64_t total = 0U, data = 0U, locked = 0U;
-    for (uint32_t i = 0U; i < set->count; i++) {
-        COST_ADD(VMA_RECOUNT, 1);
-        uint64_t length = set->entries[i].end - set->entries[i].start;
-        if (length > UINT64_MAX - total) __builtin_trap();
-        total += length;
-        if (set->entries[i].flags & KERNEL_VMA_LOCKED) locked += length;
-        if (kernel_vma_is_data(&set->entries[i])) data += length;
+    int data = kernel_vma_is_data(vma), locked = vma->flags & KERNEL_VMA_LOCKED;
+    if (add) {
+        if (bytes > UINT64_MAX - usage->total) __builtin_trap();
+        usage->total += bytes;
+        if (data) usage->data += bytes;
+        if (locked) usage->locked += bytes;
+    } else {
+        if (bytes > usage->total || (data && bytes > usage->data) ||
+            (locked && bytes > usage->locked)) __builtin_trap();
+        usage->total -= bytes;
+        if (data) usage->data -= bytes;
+        if (locked) usage->locked -= bytes;
     }
-    set->total_bytes = total;
-    set->data_bytes = data;
-    set->locked_bytes = locked;
 }
 
 uint64_t kernel_vma_set_locked_bytes(const struct kernel_vma_set *set)
 {
     if (!set_valid(set)) __builtin_trap();
-    return set->locked_bytes;
+    return set->usage.locked;
 }
 
 uint64_t kernel_vma_set_locked_range(const struct kernel_vma_set *set, uint64_t start, uint64_t end)
@@ -103,7 +106,7 @@ void kernel_vma_set_clear_locks(struct kernel_vma_set *set)
 {
     if (!set_valid(set)) __builtin_trap();
     for (uint32_t i = 0; i < set->count; i++) set->entries[i].flags &= ~KERNEL_VMA_LOCK_MASK;
-    set->locked_bytes = 0;
+    set->usage.locked = 0;
     merge_all(set);
     set->generation++;
 }
@@ -467,9 +470,9 @@ enum kernel_vma_status kernel_vma_set_fork(
             *entry = source->entries[index];
             entry->flags &= ~KERNEL_VMA_LOCK_MASK;
             if (entry->shm_attachment) kernel_shm_attachment_open(entry->shm_attachment);
+            account_bytes(&working->usage, entry, entry->end - entry->start, 1);
         }
         merge_all(working);
-        recount_bytes(working);
         *destination = working;
         return KERNEL_VMA_STATUS_OK;
     }
@@ -493,8 +496,7 @@ enum kernel_vma_status kernel_vma_set_destroy(struct kernel_vma_set **set)
         working->entries = 0;
         working->count = 0U;
         working->capacity = 0U;
-        working->total_bytes = 0U;
-        working->data_bytes = 0U;
+        working->usage = (struct vma_usage){0};
     }
     kernel_heap_release(working->heap, working);
     *set = 0;
@@ -515,7 +517,8 @@ enum kernel_vma_status kernel_vma_set_insert(
     }
     status = insert_entry(set, vma);
     if (status == KERNEL_VMA_STATUS_OK) {
-        recount_bytes(set);
+        /* 相邻合并不改变原用量；成功后只计本次新增区间。 */
+        account_bytes(&set->usage, vma, vma->end - vma->start, 1);
         set->generation++;
     }
     return status;
@@ -585,15 +588,12 @@ enum kernel_vma_status kernel_vma_set_find_topdown_gap(
     }
 
     cursor = upper;
-    index = set->count;
+    index = lower_bound(set, upper);
     while (index > 0U) {
         const struct kernel_vma *entry = &set->entries[index - 1U];
         uint64_t gap_start;
 
         index--;
-        if (entry->start >= upper) {
-            continue;
-        }
         if (entry->end <= lower) {
             break;
         }
@@ -832,7 +832,7 @@ enum kernel_vma_status kernel_vma_set_prepare_mprotect(
     uint32_t index = lower_bound(set, start);
     if (index && set->entries[index - 1].end > start) index--;
     uint32_t first_split = 0;
-    uint64_t data = set->data_bytes;
+    uint64_t data = set->usage.data;
     struct kernel_memory_limits limits;
     int have_limits = 0;
     while (start < end) {
@@ -855,8 +855,8 @@ enum kernel_vma_status kernel_vma_set_prepare_mprotect(
                 }
                 uint64_t limit = limits.data_soft ? limits.data_soft : limits.data_hard;
                 /* 新旧属性都拒绝AS扩张时，Linux仍允许这次权限转换。 */
-                if (set->total_bytes <= limits.address_space &&
-                    bytes <= limits.address_space - set->total_bytes &&
+                if (set->usage.total <= limits.address_space &&
+                    bytes <= limits.address_space - set->usage.total &&
                     (data > limit || bytes > limit - data))
                     return KERNEL_VMA_STATUS_NO_MEMORY;
                 data += bytes;
@@ -937,17 +937,25 @@ enum kernel_vma_status kernel_vma_set_commit_edit(
     }
     first = lower_bound(set, edit->start);
     last = lower_bound(set, edit->end);
+    /* split/merge只改变描述符；用量随本次受影响项计算，整次成功才发布。 */
+    struct vma_usage usage = set->usage;
     if (edit->kind == KERNEL_VMA_EDIT_PROTECT || edit->kind == KERNEL_VMA_EDIT_FLAGS) {
         for (index = first; index < last; index++) {
             COST_ADD(VMA_EDITED, 1);
+            uint64_t bytes = set->entries[index].end - set->entries[index].start;
+            account_bytes(&usage, &set->entries[index], bytes, 0);
             if (edit->kind == KERNEL_VMA_EDIT_PROTECT)
                 set->entries[index].permissions = edit->permissions;
             else set->entries[index].flags = (set->entries[index].flags & ~edit->flags_mask) | edit->flags;
+            account_bytes(&usage, &set->entries[index], bytes, 1);
         }
     } else {
-        for (index = first; index < last; index++)
+        for (index = first; index < last; index++) {
+            account_bytes(&usage, &set->entries[index],
+                set->entries[index].end - set->entries[index].start, 0);
             if (set->entries[index].shm_attachment)
                 kernel_shm_attachment_close(set->entries[index].shm_attachment);
+        }
         move_entries(set,
                      first,
                      last,
@@ -958,10 +966,12 @@ enum kernel_vma_status kernel_vma_set_commit_edit(
             if (status != KERNEL_VMA_STATUS_OK) {
                 return KERNEL_VMA_STATUS_STATE;
             }
+            account_bytes(&usage, &edit->replacement,
+                edit->replacement.end - edit->replacement.start, 1);
         }
     }
     merge_all(set);
-    recount_bytes(set);
+    set->usage = usage;
     set->generation++;
     return KERNEL_VMA_STATUS_OK;
 }
@@ -1006,12 +1016,14 @@ enum kernel_vma_status kernel_vma_set_trim_end(
         set->entries[index].end != old_end) {
         return KERNEL_VMA_STATUS_NOT_FOUND;
     }
+    struct vma_usage usage = set->usage;
+    account_bytes(&usage, &set->entries[index], old_end - new_end, 0);
     if (new_end == start) {
         erase_entry(set, index);
     } else {
         set->entries[index].end = new_end;
     }
-    recount_bytes(set);
+    set->usage = usage;
     set->generation++;
     return KERNEL_VMA_STATUS_OK;
 }

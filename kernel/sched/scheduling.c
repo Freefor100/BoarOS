@@ -928,7 +928,7 @@ void scheduler_pi_priority_locked(struct kernel_task *task,unsigned base,unsigne
 #endif
     }
     task->pi_base_priority=saved;
-    task->scheduling.priority=(int)priority;
+    __atomic_store_n(&task->scheduling.priority,(int)priority,__ATOMIC_RELAXED);
 #if BOAROS_USER_SMP
     if(move && reservation && priority) {
         task->reservation_cpu=reservation;

@@ -37,6 +37,7 @@ enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t target,uint
     *deadline=target;
     return target<=kernel_time_monotonic_ns()?KERNEL_TIME_STATUS_DEADLINE_PASSED:KERNEL_TIME_STATUS_OK;
 }
+static void cache_raw_observe(struct kernel_raw_lock *);
 #ifdef CACHE_MM_CASES
 #include "mm_disk_cases.h"
 #endif
@@ -195,6 +196,7 @@ static unsigned watch_stop, stop_entered, stop_done;
 static struct kernel_vfs_file *current_file;
 struct read_operation_counts {
     uint64_t metadata_locks, inode_locks, physical_acquires, physical_releases;
+    uint64_t group_locks;
     uint64_t pressure_queries;
     uint64_t descriptor_allocations;
 #ifndef CACHE_MM_CASES
@@ -202,10 +204,28 @@ struct read_operation_counts {
 #endif
 };
 static struct kernel_rwlock *cache_metadata_lock;
+static struct kernel_raw_lock *cache_group_lock;
 static _Thread_local unsigned observe_cache_metadata;
+static _Thread_local unsigned observe_cache_group;
 static _Thread_local struct read_operation_counts *read_counts;
 static _Thread_local struct kernel_rwlock *read_inode_lock;
 static _Thread_local struct physical_page_allocator *read_allocator;
+static void cache_raw_observe(struct kernel_raw_lock *lock)
+{
+    if (observe_cache_group && lock->rank==KERNEL_RAW_RANK_OBJECT) {
+        assert(!cache_group_lock || cache_group_lock==lock);
+        cache_group_lock=lock;
+    }
+    if (read_counts && lock==cache_group_lock) read_counts->group_locks++;
+}
+#ifndef CACHE_MM_CASES
+void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *,struct kernel_raw_guard *);
+void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_raw_guard *guard)
+{
+    cache_raw_observe(lock);
+    __real_kernel_raw_lock_acquire(lock,guard);
+}
+#endif
 uint64_t __real_physical_page_available(const struct physical_page_allocator *);
 uint64_t __wrap_physical_page_available(const struct physical_page_allocator *allocator)
 {
@@ -1846,6 +1866,9 @@ static void write_owner_counts(struct kernel_page_cache *cache,struct kernel_vfs
     unsigned char bytes[BOAROS_PAGE_SIZE];memset(bytes,0x6c,sizeof(bytes));
     size_t written;
     assert(!kernel_vfs_pwrite(&file,0,bytes,sizeof(bytes),&written) && written==sizeof(bytes));
+    cache_group_lock=NULL;
+    observe_cache_group=1;kernel_page_cache_notify_pressure(cache);observe_cache_group=0;
+    assert(cache_group_lock);
     struct read_operation_counts counts={0};
     read_inode_lock=&kernel_vfs_file_node(&file)->io_lock;
     read_allocator=cache->allocator;read_counts=&counts;
@@ -1854,18 +1877,21 @@ static void write_owner_counts(struct kernel_page_cache *cache,struct kernel_vfs
     /* 是否归还delalloc预留、是否推进压力写回都会改变锁次数；
      * 记录实际成本，独立检查热页写入没有重复借还物理页。 */
     assert(!counts.physical_acquires && !counts.physical_releases);
-    printf("write operation counts: page=%u mode=overwrite metadata=%llu inode=%llu pressure=%llu\n",
+    assert(!counts.group_locks);
+    printf("write operation counts: page=%u mode=overwrite metadata=%llu inode=%llu pressure=%llu group=%llu\n",
         (unsigned)BOAROS_PAGE_SIZE,(unsigned long long)counts.metadata_locks,
-        (unsigned long long)counts.inode_locks,(unsigned long long)counts.pressure_queries);
+        (unsigned long long)counts.inode_locks,(unsigned long long)counts.pressure_queries,
+        (unsigned long long)counts.group_locks);
     counts=(struct read_operation_counts){0};
     read_inode_lock=&kernel_vfs_file_node(&file)->io_lock;
     read_allocator=cache->allocator;read_counts=&counts;
     assert(!kernel_vfs_pwrite(&file,BOAROS_PAGE_SIZE,bytes,sizeof(bytes),&written) && written==sizeof(bytes));
     read_counts=NULL;read_allocator=NULL;read_inode_lock=NULL;
     assert(!counts.physical_acquires && !counts.physical_releases);
-    printf("write operation counts: page=%u mode=append metadata=%llu inode=%llu pressure=%llu\n",
+    printf("write operation counts: page=%u mode=append metadata=%llu inode=%llu pressure=%llu group=%llu\n",
         (unsigned)BOAROS_PAGE_SIZE,(unsigned long long)counts.metadata_locks,
-        (unsigned long long)counts.inode_locks,(unsigned long long)counts.pressure_queries);
+        (unsigned long long)counts.inode_locks,(unsigned long long)counts.pressure_queries,
+        (unsigned long long)counts.group_locks);
     unsigned char *range=malloc(8U*BOAROS_PAGE_SIZE);assert(range);
     memset(range,0x6c,8U*BOAROS_PAGE_SIZE);
     assert(!kernel_vfs_pwrite(&file,0,range,8U*BOAROS_PAGE_SIZE,&written) && written==8U*BOAROS_PAGE_SIZE);
@@ -1880,8 +1906,24 @@ static void write_owner_counts(struct kernel_page_cache *cache,struct kernel_vfs
     assert(!kernel_vfs_sync(&file,0,&error));
     unsigned char actual[BOAROS_PAGE_SIZE];size_t read;
     assert(!kernel_vfs_pread(&file,0,actual,sizeof(actual),&read, NULL) && read==sizeof(actual) && !memcmp(actual,bytes,sizeof(bytes)));
+    assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&file)));
+    counts=(struct read_operation_counts){0};
+    read_inode_lock=&kernel_vfs_file_node(&file)->io_lock;
+    read_allocator=cache->allocator;read_counts=&counts;
+    unsigned char changed=0x5a;
+    assert(!kernel_vfs_pwrite(&file,17,&changed,1,&written) && written==1);
+    read_counts=NULL;read_allocator=NULL;read_inode_lock=NULL;
+    assert(!counts.physical_acquires && !counts.physical_releases);
+    printf("write operation counts: page=%u mode=cold-partial metadata=%llu inode=%llu acquire=%llu release=%llu group=%llu\n",
+        (unsigned)BOAROS_PAGE_SIZE,(unsigned long long)counts.metadata_locks,
+        (unsigned long long)counts.inode_locks,(unsigned long long)counts.physical_acquires,
+        (unsigned long long)counts.physical_releases,(unsigned long long)counts.group_locks);
+    bytes[17]=changed;
+    assert(!kernel_vfs_sync(&file,0,&error));
+    assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&file)));
+    assert(!kernel_vfs_pread(&file,0,actual,sizeof(actual),&read,NULL) && read==sizeof(actual) && !memcmp(actual,bytes,sizeof(bytes)));
     assert(!kernel_vfs_close(&file));
-    puts("PASS overwrite/append: no redundant physical refs; one window admission and one final pressure notification, sync/readback verified");
+    puts("PASS overwrite/append/cold partial: entry owners avoid physical ref conversion; normal-watermark dirty publication avoids group lock; sync/readback verified");
 }
 static void demand_cold_warm(struct kernel_page_cache *cache, struct kernel_vfs_file *file)
 {
@@ -2595,6 +2637,7 @@ static void cold_case(struct kernel_page_cache *cache, struct kernel_heap *heap,
         expanded_index_case(cache,&file,pages);
         assert(!kernel_page_cache_start_worker(cache));
         demand_operation_cases(cache,&file);
+        write_owner_counts(cache,&file);
         kernel_page_cache_stop_worker(cache);
         demand_cases(cache,&file,actors);
         assert(!kernel_vfs_close(&file) && !kernel_vfs_unmount(&mount) && !close(image_fd));

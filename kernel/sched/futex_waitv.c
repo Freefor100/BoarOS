@@ -59,8 +59,7 @@ int64_t kernel_futex_waitv(struct kernel_task *task,uint64_t address,unsigned co
             if(result || *status)goto out;
         }
         if(kernel_wait_prepare(0,deadline,1,&request.token))__builtin_trap();
-        unsigned priority;
-        {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);priority=scheduler_base_priority(task);}
+        unsigned priority=futex_wait_priority(task);
         unsigned retry=count;struct futex_bucket *busy=0;
         for(unsigned i=0;i<count;i++) {
             struct kernel_futex_entry *entry=&request.entries[i];

@@ -41,6 +41,15 @@ struct futex_bucket {
 };
 extern struct futex_bucket futex_buckets[FUTEX_BUCKETS];
 
+static inline unsigned futex_wait_priority(const struct kernel_task *task)
+{
+    /* 实际优先级为零时，基础优先级也只能为零；PI只会提升它。
+     * RT/PI的两个字段仍在调度保护内一起读取。 */
+    if (!__atomic_load_n(&task->scheduling.priority, __ATOMIC_RELAXED)) return 0;
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    return scheduler_base_priority(task);
+}
+
 static inline void futex_key_release(struct kernel_futex_key *key)
 {
     if (key->kind == KERNEL_FUTEX_KEY_SHARED_MEMORY)
