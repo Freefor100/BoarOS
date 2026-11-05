@@ -1,0 +1,111 @@
+#!/bin/sh
+
+set -eu
+
+project_root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
+kernel=${BLOCK_TEST_KERNEL_RV:-"$project_root/build/riscv/tests/kernel-block-rv"}
+qemu=${QEMU_RISCV64:-qemu-system-riscv64}
+output_dir=$(mktemp -d)
+output="$output_dir/block.log"
+disk="$output_dir/block.img"
+
+trap 'rm -rf "$output_dir"' EXIT HUP INT TERM
+
+show_output()
+{
+    tail -n 100 "$output" >&2
+}
+
+if [ ! -f "$kernel" ]; then
+    echo "missing VirtIO block test kernel: $kernel" >&2
+    exit 1
+fi
+
+create_disks()
+{
+    mode=$1
+    disk_rw="$output_dir/block-rw-$mode.img"
+    disk_ro="$output_dir/block-ro-$mode.img"
+
+    dd if=/dev/zero of="$disk_rw" bs=1M count=1 status=none
+    printf '%s' 'BoarOS-direct-sector-one' |
+        dd of="$disk_rw" bs=512 seek=1 conv=notrunc status=none
+    printf '%s' 'BoarOS-bounce-window' |
+        dd of="$disk_rw" bs=1 seek=1543 conv=notrunc status=none
+
+    dd if=/dev/zero of="$disk_ro" bs=1M count=1 status=none
+    printf '%s' 'BoarOS-direct-sector-one' |
+        dd of="$disk_ro" bs=512 seek=1 conv=notrunc status=none
+    printf '%s' 'BoarOS-bounce-window' |
+        dd of="$disk_ro" bs=1 seek=1543 conv=notrunc status=none
+}
+
+run_case()
+{
+    mode=$1
+    cache=$2
+    create_disks "$mode"
+    output="$output_dir/block-$mode.log"
+    set -- "$qemu" \
+        -machine virt \
+        -bios default \
+        -kernel "$kernel" \
+        -m 512M \
+        -smp 1 \
+        -nographic \
+        -no-reboot
+    if [ "$mode" = modern ]; then
+        set -- "$@" -global virtio-mmio.force-legacy=false
+    fi
+    set -- "$@" \
+        -drive file="$disk_rw",if=none,format=raw,readonly=off,cache="$cache",id=x0 \
+        -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0,config-wce=off \
+        -drive file="$disk_ro",if=none,format=raw,readonly=on,id=x1 \
+        -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
+    if ! timeout -k 2s 10s "$@" </dev/null >"$output" 2>&1; then
+        show_output
+        echo "QEMU failed during $mode VirtIO block test" >&2
+        exit 1
+    fi
+    if [ "$(grep -cxF 'BoarOS: VirtIO block tests passed' "$output" || true)" -ne 1 ]; then
+        show_output
+        echo "$mode VirtIO block test kernel did not report success" >&2
+        exit 1
+    fi
+    if [ "$(grep -cxF 'BoarOS: block 128KiB discrete SG read/write passed' "$output" || true)" -ne 1 ]; then
+        show_output
+        echo "$mode VirtIO block test did not verify the 128KiB discrete SG payload" >&2
+        exit 1
+    fi
+    if ! grep -qxF 'BoarOS: MBR primary partition I/O and owners passed' "$output"; then
+        show_output
+        echo "missing primary partition contract result" >&2
+        exit 1
+    fi
+    if grep -qF 'BoarOS: block test failed' "$output"; then
+        show_output
+        echo "$mode VirtIO block test kernel reported a failed case" >&2
+        exit 1
+    fi
+    if ! grep -qxF "BoarOS: block cache $cache" "$output"; then
+        show_output
+        echo "incorrect negotiated cache mode: $mode $cache" >&2
+        exit 1
+    fi
+}
+
+case ${BLOCK_TEST_TRANSPORT:-all} in
+    all) transports='legacy modern' ;;
+    legacy|modern) transports=$BLOCK_TEST_TRANSPORT ;;
+    *) echo 'invalid BLOCK_TEST_TRANSPORT' >&2; exit 2 ;;
+esac
+case ${BLOCK_TEST_CACHE:-all} in
+    all) caches='writeback writethrough' ;;
+    writeback|writethrough) caches=$BLOCK_TEST_CACHE ;;
+    *) echo 'invalid BLOCK_TEST_CACHE' >&2; exit 2 ;;
+esac
+for transport in $transports; do
+    for cache in $caches; do run_case "$transport" "$cache"; done
+done
+
+echo "RISC-V VirtIO block tests passed"

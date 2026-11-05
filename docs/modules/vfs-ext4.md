@@ -80,7 +80,7 @@ tmpfs在发布前准备属性，inode直接持有访问ACL与默认ACL各自的�
 已准备目标架构静态 BusyBox、上述库构建目录及启用 `CONFIG_EXT4_FS_POSIX_ACL` 的参考 Linux 后，运行：
 
 ```sh
-python3 tests/acl-lib-consumer.py --arch riscv \
+python3 tests/userland/acl-lib-consumer.py --arch riscv \
   --libacl-build ACL构建目录 --libattr-build ATTR构建目录 \
   --acl1-source references/xattr-tools/ltp-acl1-20240524.c \
   --busybox 目标架构静态BusyBox --linux-kernel 参考Linux镜像 \
@@ -104,8 +104,8 @@ link/rename 沿用相同身份，不把目录链拼回绝对路径后重新查�
 32 位，通用 inode 标识为 64 位；ext4 适配层拒绝越界标识。
 
 `make test-namespace-parallel-host` 保留独立 FD 回归，并运行 VFS 目录直接交错及真实
-ext4 目录并行检查。`tests/namespace-parallel-host.sh` 检查共享身份发布、同名创建、
-目录内创建与 rmdir/rename、hardlink 别名和覆盖退休。`tests/ext4-namespace-parallel-host.sh`
+ext4 目录并行检查。`tests/host/namespace-parallel.sh` 检查共享身份发布、同名创建、
+目录内创建与 rmdir/rename、hardlink 别名和覆盖退休。`tests/host/ext4-namespace-parallel.sh`
 检查不同目录的私有修改重叠、同块组分配排队、同一 inode/GDT 物理块的记录合并、
 单方 abort，以及 CPU0 checkpoint 期间 CPU1 查找和其他私有操作继续执行。固定多轮
 创建／删除检查跨 checkpoint 的位图复用；共享外部 EA 的 chown/COW 和最后 unlink
@@ -120,13 +120,13 @@ ext4 转 RO 前排空至 checkpoint，再独占 journal 服务资格，暂停存
 
 `NOEXEC/NODEV` 在新 mount 发布前设置，或在 remount 成功后更新。VFS 以符号链接、proc FD 链接和子挂载解析后的实际 mount 判断资格：NOEXEC 使主程序、脚本与 ELF 解释器的执行打开返回 `EACCES`；NODEV 使字符/块设备普通打开返回 `EACCES`，也拒绝把该挂载内的块设备节点作为磁盘挂载源。普通数据读写、目录搜索、stat、具备权限的 mknod 和 O_PATH 不受这两项限制。旧 FD 和相对 dirfd 保持原路径身份；覆盖挂载不会改写它们的 mount。已有 PTY 主端的 `TIOCGPTPEER` 以该 FD 当前挂载连接选择同实例的 slave：整棵 devpts 的 bind 直接使用该视图；单文件 ptmx bind 仍连接父树时按父目录中的 pts 查找，摘树后使用所持实例。内部节点选择不重新检查路径 DAC，实际从端身份与主端引用共同保持。文件映射的执行限制见[MM 模块](kernel-mm.md#匿名与文件映射)，access 的 X_OK 规则见[文件资源模块](kernel-files.md)。
 `umount2` 接受 flags=0、`MNT_DETACH` 及可组合的 `UMOUNT_NOFOLLOW`，flags 按 Linux 的 32 位参数解释。`UMOUNT_NOFOLLOW` 仅停止跟随无尾斜线的最终符号链接，此时非挂载根返回 `EINVAL`；中间符号链接和带尾斜线的目录查找仍按实际解析规则跟随。普通卸载排除目标视图上的子挂载、打开文件和路径使用者；其他 bind 视图不使它忙。`MNT_DETACH` 一次移除目标及全部子挂载的命名空间连接，各子视图独立保留已有 FD、cwd 和映射的 owner；新路径查找看到原来被遮蔽的对象，旧 owner 继续访问其文件系统；已摘树视图不能作为新挂载的目标。目标首先必须是其实际挂载的根目录项；chroot 到普通子目录后，对该子目录卸载返回 `EINVAL`。未指定 `MNT_DETACH` 且目标挂载正是进程根所属挂载时尝试转为 RO，包括仍连接在父树的根挂载；`MNT_DETACH` 可摘除仍连接的进程根挂载，没有父连接的全局根仍返回 `EINVAL`；保留其余挂载属性和挂载树，仍受写入者及脏数据同步检查约束。
-普通卸载只有在目标是实例最后一个视图时才标记 quiescing，阻止新操作并排空页缓存和在途 I/O；卸载共享实例中的一个视图不会停止后台线程。遗留的持久 orphan 意图在 journal worker 仍存活时恢复；恢复可能接受新日志组，因此先完成最终 checkpoint drain，再停止 journal worker 和卸载 lwext4。失败时挂载树、设备 claim 和错误 owner 保持可达；可重试卸载。准备成功后才摘树。懒卸载不设置实例 quiescing；最后实际使用者归还视图时只发布实例清理 owner，返回用户或任务退出归还所有 VFS/MM 资格后，在 CPU0 排空该清理队列。清理失败保留实例、设备、缓存和所属存储，由显式清理或关机路径重试，不在每次用户返回时重复失败的 I/O。`FALLOCATE_SYNC_RESIDUAL=1 sh tests/fallocate-sync-host.sh` 检查已关闭外层截断留下的恢复工作、worker 生命周期、重挂载内容与块归还。
+普通卸载只有在目标是实例最后一个视图时才标记 quiescing，阻止新操作并排空页缓存和在途 I/O；卸载共享实例中的一个视图不会停止后台线程。遗留的持久 orphan 意图在 journal worker 仍存活时恢复；恢复可能接受新日志组，因此先完成最终 checkpoint drain，再停止 journal worker 和卸载 lwext4。失败时挂载树、设备 claim 和错误 owner 保持可达；可重试卸载。准备成功后才摘树。懒卸载不设置实例 quiescing；最后实际使用者归还视图时只发布实例清理 owner，返回用户或任务退出归还所有 VFS/MM 资格后，在 CPU0 排空该清理队列。清理失败保留实例、设备、缓存和所属存储，由显式清理或关机路径重试，不在每次用户返回时重复失败的 I/O。`FALLOCATE_SYNC_RESIDUAL=1 sh tests/host/fallocate-sync.sh` 检查已关闭外层截断留下的恢复工作、worker 生命周期、重挂载内容与块归还。
 
 `sync()` 按活文件系统实例登记表各同步一次，以有引用的实际视图覆盖数据写回和元数据目标等待；已摘树但仍有 FD、cwd 或映射的实例同样参与。视图数组分配失败或构造者在分配期间发布导致容量不足时，按本次实例 id 上界逐个取得视图引用，跨等待不保存登记表裸指针。
 
-`sh tests/mount-attributes-host.sh` 包含移动子树、目标分配失败回滚、覆盖目标重新选择、已有路径/文件及 rbind 副本独立存活、文件绑定、别名改名、rbind 子挂载、分配失败回滚、原视图先卸载、旧 owner 懒卸载存活及最终清理 EIO；`tests/network_runner.py --workload mount_bind` 覆盖绑定用户语义及 mmap；`--workload mount_move` 覆盖移动、NOFOLLOW、权限和明确握手的移动/懒卸载旧 owner。
+`sh tests/host/mount-attributes.sh` 包含移动子树、目标分配失败回滚、覆盖目标重新选择、已有路径/文件及 rbind 副本独立存活、文件绑定、别名改名、rbind 子挂载、分配失败回滚、原视图先卸载、旧 owner 懒卸载存活及最终清理 EIO；`tests/userland/run.py --workload mount_bind` 覆盖绑定用户语义及 mmap；`--workload mount_move` 覆盖移动、NOFOLLOW、权限和明确握手的移动/懒卸载旧 owner。
 
-`make test-remount-host` 在 4/16 KiB 页下检查真实 tmpfs、ext4、FAT 转换、新写入者和挂载同步交错、初始 RO、线程分配失败重试、RO 特性拒绝、真实 flush EIO 及保留资源；正常磁盘镜像随后由对应 fsck 检查。`tests/network_runner.py --workload remount` 用同一原生 ELF 检查用户态属性、共享映射与 fork 后的最终 OFD、已删除读者和根挂载转换，支持 RV/LA 的 BoarOS 与固定 Linux 对照。
+`make test-remount-host` 在 4/16 KiB 页下检查真实 tmpfs、ext4、FAT 转换、新写入者和挂载同步交错、初始 RO、线程分配失败重试、RO 特性拒绝、真实 flush EIO 及保留资源；正常磁盘镜像随后由对应 fsck 检查。`tests/userland/run.py --workload remount` 用同一原生 ELF 检查用户态属性、共享映射与 fork 后的最终 OFD、已删除读者和根挂载转换，支持 RV/LA 的 BoarOS 与固定 Linux 对照。
 
 `kernel_vfs_mount_root()` 根据传入块设备是否提供 `write` 回调决定只读还是读写挂载。读写 journal 挂载先 replay、校验 orphan 记录、启动日志并回收遗留 orphan，完成后才发布根路径。只读介质不能完成恢复时明确拒绝；未知必需特性、损坏日志或元数据也不能作为干净镜像继续访问。
 
@@ -159,7 +159,7 @@ Castagnoli参考覆盖CRC32C的种子、对齐、分段与守卫页边界，并�
 extent 树在读取节点时校验当前字节；实际修改通过 `ext4_ext_dirty()` 同步更新
 该节点的 checksum，新建分裂节点使用同一入口。路径释放只归还引用：缓冲的
 `BC_DIRTY` 表示仍待日志／落盘，不能据此给一次只读查询重复重写 checksum。
-`sh tests/lwext4-metadata-host.sh extent-lookup` 检查脏节点的只读查找成本、
+`sh tests/host/lwext4-metadata.sh extent-lookup` 检查脏节点的只读查找成本、
 缓存字节损坏仍返回 EUCLEAN，以及恢复后的映射、资源与磁盘一致性。
 
 `kernel_vfs_file_set_mode()` 通过持有的 inode handle 事务修改低 12 个权限位，
@@ -229,9 +229,9 @@ legacy 间接指针格式没有 unwritten 状态，新分配块先清零。若�
 
 共享映射写缺页在授予可写 PTE 前调用同一空间准备，预留借用持续到真实标脏和 PTE 发布；VMA／映射代次变化、页写资格冲突等路径先释放 MM 与 inode 资格，再取消尚未接纳的准备。整页中所有有效 EOF 字节均有已分配空间或实际预留；16 KiB 页只准备出部分 1/4 KiB 块时返回 BUS fault，不能开放其余 hole。等待期间释放 MM gate 和 inode 读资格，返回后先重新检查 VMA 代次、映射代次与 EOF，再解释后端错误并核对驻留页；若地址已被 MAP_FIXED 替换，重试新映射，不把旧文件的 ENOSPC 施加到新地址。private COW 不需要后端存储，仍可在磁盘满时生成私有副本。
 
-`FALLOCATE_HOST_CASES='admission-full admission-legacy admission-prefix admission-prefix-legacy admission-fault admission-mmap' FALLOCATE_HOST_IMAGE_SIZE=8M sh tests/fallocate-host.sh` 检查磁盘满前的接纳与准确短写、fsync 和失效后读回、来源 EFAULT、legacy 清理失败后的 truncate／unlink／仅关闭及卸载重试、真实写回错误，以及共享映射和 private COW。默认组合为 4/16 KiB 页、1/4 KiB 文件系统块和有／无 journal，共 48 个场景，每个场景检查资源归还及 e2fsck。
+`FALLOCATE_HOST_CASES='admission-full admission-legacy admission-prefix admission-prefix-legacy admission-fault admission-mmap' FALLOCATE_HOST_IMAGE_SIZE=8M sh tests/host/fallocate.sh` 检查磁盘满前的接纳与准确短写、fsync 和失效后读回、来源 EFAULT、legacy 清理失败后的 truncate／unlink／仅关闭及卸载重试、真实写回错误，以及共享映射和 private COW。默认组合为 4/16 KiB 页、1/4 KiB 文件系统块和有／无 journal，共 48 个场景，每个场景检查资源归还及 e2fsck。
 
-`FALLOCATE_HOST_CASE=delalloc FALLOCATE_HOST_JOURNALS=journal sh tests/fallocate-host.sh` 检查缓存可见而磁盘仍为空、重复覆盖计费、跨节点部分接纳、批量转换、分配后 abort、映射准备后注入 ENOSPC 时事务回滚并保留数据与预留、随后同步重试，以及截断归还。
+`FALLOCATE_HOST_CASE=delalloc FALLOCATE_HOST_JOURNALS=journal sh tests/host/fallocate.sh` 检查缓存可见而磁盘仍为空、重复覆盖计费、跨节点部分接纳、批量转换、分配后 abort、映射准备后注入 ENOSPC 时事务回滚并保留数据与预留、随后同步重试，以及截断归还。
 
 截断只写回新 EOF 之前的脏范围，再调用后端；成功后按实际结果更新逻辑长度、通知 MM、丢弃越界页并清零尾页。后端失败且磁盘 size 未变时保留原逻辑长度与脏 owner，截零不需要保存待丢弃数据。删除仍打开的文件保留缓存；只有 orphan 最后一个打开/执行 owner 退出时，才丢弃已不再可观察的缓存并回收 inode。
 
@@ -241,7 +241,7 @@ legacy 间接指针格式没有 unwritten 状态，新分配块先清零。若�
 
 miss 路径私有分配未清零页，通过 node 的无 offset 副作用批量 `pread` 初始化有效内容；稀疏区由后端合成零，成功后只清 EOF 尾部。有效字节数按 node 的逻辑大小计算。读取整个越过 EOF 的页返回 `OUT_OF_RANGE`，尾页剩余字节保持为零。物理页分配器的压力入口由多缓存共同 owner 注册，按实例轮转；分配首次耗尽时沿LRU续扫位置回收引用数为1的未固定干净页，每个缓存锁窗口最多检查64项；删除与LRU移动同步调整续扫位置，一次分配回收仍可完成有限的完整轮次，安全的普通任务可等待后台一轮后重试一次。物理引用数为 1 仍可能有等待回写的 entry 借用；后台完成 I/O 后，在缓存索引保护内归还本批借用，重新检查其他借用、loading、writeback、脏范围和映射，再决定退休。批量选择与干净页退休共用该保护，实际 I/O 和资源释放放在保护外。映射/请求固定页不驱逐；lwext4、堆与 IRQ 不等待后台写回，防止重入共享 handle、后端锁和 bcache 分配。阈值 worker 的生命周期见下文。
 
-普通写入还在接纳边界处理脏页压力：每个最多128 KiB的接纳窗口，在取得 inode 数据锁和用户页 pin 之前检查一次水位；所属物理后备域的活动占用达到高水位或可用页低于保留水位时，推进同一后备域的一批已有脏页，再回收可释放的干净页。整次 write 的 OFD 位置与文件写操作互斥保持不变。若写入正在缓存执行者内运行，就地使用其独占工作区推进，不能排队等待自己的后台线程；其他调用者只提交这批写回，执行者不取得原调用者的 OFD／写操作锁，也不为回收内存另分配前景工作区。写回错误记录在实际 inode；无关文件的 ENOSPC／EIO 不归给当前覆盖写，失败队首保留脏数据并让出后续可回收工作。分配器内的重入、锁和 I/O 限制保持不变，真实 ENOSPC、EIO、ENOMEM 继续返回；已有成功前缀仍按 Linux 短写规则交给调用者。`sh tests/page-cache-concurrency-host.sh pressure` 在生产分组日志与 16 MiB 页池内检查大于内存的完整写入、磁盘满、写回 EIO、真实无空闲页，以及另一 inode 失败后的独立覆盖写，覆盖 4/16 KiB 页与 1/4 KiB 文件系统块，并检查读回、资源归还和 e2fsck。
+普通写入还在接纳边界处理脏页压力：每个最多128 KiB的接纳窗口，在取得 inode 数据锁和用户页 pin 之前检查一次水位；所属物理后备域的活动占用达到高水位或可用页低于保留水位时，推进同一后备域的一批已有脏页，再回收可释放的干净页。整次 write 的 OFD 位置与文件写操作互斥保持不变。若写入正在缓存执行者内运行，就地使用其独占工作区推进，不能排队等待自己的后台线程；其他调用者只提交这批写回，执行者不取得原调用者的 OFD／写操作锁，也不为回收内存另分配前景工作区。写回错误记录在实际 inode；无关文件的 ENOSPC／EIO 不归给当前覆盖写，失败队首保留脏数据并让出后续可回收工作。分配器内的重入、锁和 I/O 限制保持不变，真实 ENOSPC、EIO、ENOMEM 继续返回；已有成功前缀仍按 Linux 短写规则交给调用者。`sh tests/host/page-cache-concurrency.sh pressure` 在生产分组日志与 16 MiB 页池内检查大于内存的完整写入、磁盘满、写回 EIO、真实无空闲页，以及另一 inode 失败后的独立覆盖写，覆盖 4/16 KiB 页与 1/4 KiB 文件系统块，并检查读回、资源归还和 e2fsck。
 
 缓存销毁和 mount 卸载有严格顺序：先释放所有进程 MM 和临时读者，停止并 join 页缓存 worker，再写回并 purge 该 mount 的缓存项、关闭最后的 node；日志 worker 继续服务这些交接，排空到 checkpoint 后才停止并 join，之后允许 lwext4 unmount 与设备 flush；缓存最后注销 reclaimer 并释放哈希表。物理页和堆对象的合法释放完成即返回，分配器不变量错误进入 fatal；只有真实 ext4/block I/O 清理错误保留 mount owner。
 
@@ -306,11 +306,11 @@ checkpoint，并从整个操作起点重做。新事务建立失败也保留实�
 无 journal 时没有上述回滚重做；各操作保留原边界，原本依赖显式 journal 事务的
 create、mkdir、mknod 仍返回 EOPNOTSUPP。
 
-`FALLOCATE_HOST_CASE=namespace-budget FALLOCATE_HOST_JOURNALS=journal sh tests/fallocate-host.sh`
+`FALLOCATE_HOST_CASE=namespace-budget FALLOCATE_HOST_JOURNALS=journal sh tests/host/fallocate.sh`
 在 4/16 KiB 页和 1/4 KiB 块上让上述操作实际遭遇硬预算，检查 checkpoint 后成功、
 mode/身份/链接与已打开 orphan 内容、chown capability 和同步依赖；另检查单操作
 超预算、显式外层嵌套、真实物理 OOM 和设备读 EIO 的错误与回滚、旧内容、资源归还
-及 e2fsck。`sh tests/lwext4-metadata-host.sh ownership` 另覆盖共享 EA、所有权更改的
+及 e2fsck。`sh tests/host/lwext4-metadata.sh ownership` 另覆盖共享 EA、所有权更改的
 分配失败和持久化错误。
 
 `ext4_journal_group_enable/commit/checkpoint/drain` 由可写 journal mount 的两个 joinable 线程驱动：
@@ -339,7 +339,7 @@ lazy 块组的查询只读取和校验；数据分配按需初始化块位图，
 也准备该组的块位图，与固定 Linux `fs/ext4/ialloc.c` 的组元数据规则一致。
 未使用的 inode table 尾部保持 lazy，`ITABLE_ZEROED` 不被提前置位；不会把整张表的
 清零加入一个私有事务。大型块组的表本身即可超过 journal 预算，等待旧组 checkpoint
-不能使这种操作变得可接纳。`sh tests/lwext4-lazy-groups-host.sh` 用显式关闭 discard 的
+不能使这种操作变得可接纳。`sh tests/host/lwext4-lazy-groups.sh` 用显式关闭 discard 的
 384 MiB lazy 镜像检查跨组分配、预留块写入、新 inode 清零、abort/OOM、正常卸载和
 e2fsck；`LAZY_HOST_CUTS=1` 另检查 inode 创建的逐 write/flush 边界断电恢复。
 
@@ -358,7 +358,7 @@ checkpoint 积累到四组、活动内存超过预算一半，或实际空间等
 双向注入另一路写入或 flush 失败，检查两个 owner 均保留，并逐边界断电、两次恢复及 fsck。
 checkpoint 合并另检查 1–3 组不产生 I/O、第四组合并同一 home 版本，十组请求按 8+2 保留目标，
 实际来源内存越过阈值时优先回收旧前缀，以及后台首个期限不被后来的组延长。
-命名空间回归暂扣提交进度，核对正常容量下的 truncate、空文件/数据文件删除、仍打开的无链接文件及 inode 复用隔离。`sh tests/lwext4-reclaim-host.sh` 在同组回收与意图先 durable、checkpoint 暂未执行的跨组回收上，逐实际 I/O 边界检查丢失/重排、两次恢复和文件系统一致性。默认同步路径的 metadata/几何/错误原子性回归继续由 `make test-lwext4-metadata-host` 保护。
+命名空间回归暂扣提交进度，核对正常容量下的 truncate、空文件/数据文件删除、仍打开的无链接文件及 inode 复用隔离。`sh tests/host/lwext4-reclaim.sh` 在同组回收与意图先 durable、checkpoint 暂未执行的跨组回收上，逐实际 I/O 边界检查丢失/重排、两次恢复和文件系统一致性。默认同步路径的 metadata/几何/错误原子性回归继续由 `make test-lwext4-metadata-host` 保护。
 
 同一提交阶段使用稳定数据、元数据 owner 内嵌节点和提交者的局部控制节点，组成 `ext4_blocks_set_phase()` 输入；不再每 32 个区间等待整批完成。块层先检查整个只读范围游标，再用预留的 32 项工作区持续补充空出的成员，直到整个阶段结束。磁盘相邻、内存分散的区间沿 SG 路径提交；没有 phase 设备接口时按范围顺序写入。journal 的物理块索引保证同一阶段范围不重叠，公共 write_batch 仍保留原有重叠检查和部分扇区语义。一个 descriptor 及其普通 payload 保持批量提交；需要下一个 descriptor 或转义块时，先完成当前请求对工作块的实际借用，再覆盖工作块。转义复制完整块并清 magic，稳定输入保持原值。全部正文写完才执行提交前 FLUSH，再写 commit 和提交后 FLUSH；逐段编码不增加 descriptor 间的 FLUSH。数据来源一直保留到实际设备使用结束，失败挂载还会保留读取当前文件内容所需的版本。
 
@@ -368,7 +368,7 @@ checkpoint 合并另检查 1–3 组不产生 I/O、第四组合并同一 home �
 
 操作在修改前准备成员变化记录和索引容量，记录原成员状态及最终期望状态。接纳在挂载状态保护下更新这些 inode 对应的索引、链和槽位；abort 只丢弃本操作的变化及容量预留。同一操作先归还全部原槽位置，再扣除最终成员的槽占用；接纳也先撤去旧位置、再发布最终成员，使删除后复用的槽只有一个最终 owner。其他操作已接纳的成员保持可见，hash 扩容的分配与旧表释放在状态保护外完成。ORPHAN_PRESENT 按最新已接纳成员数加本操作净变化计算；成员变化预先保留 superblock 日志记录，即使准备时标志未改变，也能在接纳时合并其他操作的变化。显式 validate 重新完整校验，活动私有变化结束后才可替换索引。
 
-unlink 将最后一个链接摘除与持久 orphan 记录放在同一事务；缩小文件先在操作中登记最终 size 与 orphan，再由 `ext4_truncate.c` 每事务最多释放 32 个尾部数据块及已空的索引路径。意图与回收可以合入同一运行组，也可以按 journal FIFO 跨组提交；普通 truncate/unlink 按真实预算、日志空间或复用压力选择归还资源的提交或 checkpoint，释放范围继续由 quarantine 保留。无 orphan 的新建、同尺寸截断和扩展不启动回收事务。恢复根据实际映射查找尾部，支持稀疏 extent 和三级间接块；最后删除 orphan 记录与释放无链接 inode 在同一事务完成。正常运行时仍打开的无链接 inode 保持内容，重启后回收。`sh tests/lwext4-orphan-host.sh` 包含不同 orphan_file 块的两个真实调用上下文交错、另一操作接纳后本操作 abort、传统链及满文件回退、损坏与日志错误恢复；`sh tests/lwext4-operation-host.sh` 检查调用者上下文、计数增量及父组分配。
+unlink 将最后一个链接摘除与持久 orphan 记录放在同一事务；缩小文件先在操作中登记最终 size 与 orphan，再由 `ext4_truncate.c` 每事务最多释放 32 个尾部数据块及已空的索引路径。意图与回收可以合入同一运行组，也可以按 journal FIFO 跨组提交；普通 truncate/unlink 按真实预算、日志空间或复用压力选择归还资源的提交或 checkpoint，释放范围继续由 quarantine 保留。无 orphan 的新建、同尺寸截断和扩展不启动回收事务。恢复根据实际映射查找尾部，支持稀疏 extent 和三级间接块；最后删除 orphan 记录与释放无链接 inode 在同一事务完成。正常运行时仍打开的无链接 inode 保持内容，重启后回收。`sh tests/host/lwext4-orphan.sh` 包含不同 orphan_file 块的两个真实调用上下文交错、另一操作接纳后本操作 abort、传统链及满文件回退、损坏与日志错误恢复；`sh tests/host/lwext4-operation.sh` 检查调用者上下文、计数增量及父组分配。
 
 支持有界的 JBD2 checksum v2/v3、32/64-bit revoke；异步 commit、未知必需特性和旧 CRC32 journal 格式明确拒绝。已提交事务的损坏不能当作未提交尾部丢弃。只读脏日志、恢复 I/O 错误或损坏均拒绝开放用户访问。失败的日志/挂载 owner 保留到重启；普通合法内存释放不建立重试链。挂载准备阶段的 ENOMEM/ENOSPC 与关键 I/O 错误分开：资源不足保留可恢复的准备状态，后续 cleanup 可继续恢复并卸载，不能永久锁住 heap binding。
 已有路径先逐分量取得目录项和 inode 身份，再用 ext4_fopen_inode 按 inode 打开，并把本次已读 inode 的权限和时间属性返回适配层。新建由 ext4_create_child 接收已解析的父 inode、名称、模式及最终 UID/GID，在同一操作内完成目录链接与初始属性；不先创建 root 文件再补 chown。新 inode 的实际引用用于设备/链接初始化及 handle 填充，最终归还时生成校验和。新建空文件满足 O_TRUNC，已有文件走正常截断。
@@ -378,7 +378,7 @@ unlink 将最后一个链接摘除与持久 orphan 记录放在同一事务；�
 
 新分配的数据块在 caller data 写入前整块初始化；初始化失败只撤销该 exact logical block 的 mapping，不回滚此前已经完成的块。unwritten extent 的初始化和 caller 写入版本规则见[文件空间预留与打洞](#文件空间预留与打洞)。lwext4 在写入或截断所有可能改变状态的返回路径上，让 handle 的 `fsize` 保持为当前 inode 中可知的最新 size；VFS 在 truncate 后据此同步 node/file size 并失效缓存；writeback 期间逻辑长度仍由缓存接收进度决定。部分写返回依据固定 Linux `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `mm/filemap.c::generic_perform_write()` 与 `fs/read_write.c::new_sync_write()`：正进度覆盖后续错误并只推进相同字节数的文件位置。
 
-extent 向左合并相邻新分配区间时，`ext4_ext_insert_leaf()` 同时移动逻辑起点与物理起点，扩大长度，并通过 `ext4_ext_correct_indexes()` 更新首叶对应的祖先分隔键。只移动逻辑起点会使原右侧数据映射错位，新分配的左块失去引用，右端还可能指向其他 extent 的物理块；随后截断会重复释放该块，由 journal quarantine 返回 `EUCLEAN`。物理起点更新与固定 Linux 的 `fs/ext4/extents.c::ext4_ext_insert_extent()` 一致。`sh tests/lwext4-metadata-host.sh prepend` 验证 inode 内及外置叶的内容、同步及组提交截断、正常卸载和 `e2fsck -fn`。
+extent 向左合并相邻新分配区间时，`ext4_ext_insert_leaf()` 同时移动逻辑起点与物理起点，扩大长度，并通过 `ext4_ext_correct_indexes()` 更新首叶对应的祖先分隔键。只移动逻辑起点会使原右侧数据映射错位，新分配的左块失去引用，右端还可能指向其他 extent 的物理块；随后截断会重复释放该块，由 journal quarantine 返回 `EUCLEAN`。物理起点更新与固定 Linux 的 `fs/ext4/extents.c::ext4_ext_insert_extent()` 一致。`sh tests/host/lwext4-metadata.sh prepend` 验证 inode 内及外置叶的内容、同步及组提交截断、正常卸载和 `e2fsck -fn`。
 
 执行文件持有 exec lease 后，在同一 inode 资格内取得 mode/owner、挂载 nosuid 和可读性，filecap 通过已打开 inode 的 security.capability 读取，支持内部/外部 EA。主 ELF 的属性参与执行凭据计算，PT_INTERP 仅检查可读性；nosuid 挂载跳过 filecap 读取。读取返回真实 EA 错误；属性超过 24 字节读取缓冲时返回 ERANGE，已读入但长度不符合对应 revision 的记录由执行凭据解析返回 EINVAL。
 
@@ -426,9 +426,9 @@ cookie 可以交给 `lseek`/`telldir`/`seekdir` 恢复。OFD 持有位置，所�
 处理越界页、尾页脏范围和 owner。该优化不改变私有 COW 副本，哈希探测与尾页
 实际别名工作单独计量。`make test-cache-growth-riscv` 在 COST 构建检查
 1/4/16/64 MiB × 1/4/64 KiB 写入的增长访问界及全文件内容，见[规模成本](../learning/single-hart-scale.md)。
-`sh tests/page-cache-concurrency-host.sh append-snapshot` 检查同页 mmap 写借用期间的连续追加及覆盖越过 EOF、保留旧稳定版本、新尺寸、再次同步后的内容和最终资源归还。
+`sh tests/host/page-cache-concurrency.sh append-snapshot` 检查同页 mmap 写借用期间的连续追加及覆盖越过 EOF、保留旧稳定版本、新尺寸、再次同步后的内容和最终资源归还。
 
-截断后端修改映射后，VFS 保持同一次 inode 写保护，发布实际 EOF、退休越界缓存页并完成尾页处理；不能先解锁再更新缓存，否则排队的写回仍会按旧 EOF 重建已删除的映射，扩展时读出旧内容。后端部分修改后报错时，也先发布实际尺寸与退休整页，再释放保护重取对应尾页资格；无变化失败保留原脏数据。`sh tests/page-cache-concurrency-host.sh truncate` 用明确握手让旧尾页写回排在后端截断之后，检查截零、部分截断及部分修改后 EIO 的前缀保留、扩展补零、资源归还和 `e2fsck -fn`，覆盖 4/16 KiB 页和 1/4 KiB 文件系统块。
+截断后端修改映射后，VFS 保持同一次 inode 写保护，发布实际 EOF、退休越界缓存页并完成尾页处理；不能先解锁再更新缓存，否则排队的写回仍会按旧 EOF 重建已删除的映射，扩展时读出旧内容。后端部分修改后报错时，也先发布实际尺寸与退休整页，再释放保护重取对应尾页资格；无变化失败保留原脏数据。`sh tests/host/page-cache-concurrency.sh truncate` 用明确握手让旧尾页写回排在后端截断之后，检查截零、部分截断及部分修改后 EIO 的前缀保留、扩展补零、资源归还和 `e2fsck -fn`，覆盖 4/16 KiB 页和 1/4 KiB 文件系统块。
 
 普通文件的当前内容由 VFS 页缓存持有。`ext4_fpread` 和 `ext4_fpread_batch`
 先查私有操作、运行组、已封口组和提交中的最新数据版本；命中时从该版本读取。
@@ -486,7 +486,7 @@ worker 启动时仍只准备一个实际回写窗口，内存压力先释放窗�
 组成一条 SG 链；不相接的请求一起发布后只通知队列一次，详见
 [VirtIO 块设备](riscv-virtio-block.md#请求和-dma)。
 
-`python3 -B tests/writeback-batch-riscv.py` 检查 1/2/4/8/32 页与 1/4 KiB ext4，
+`python3 -B tests/riscv/writeback-batch.py` 检查 1/2/4/8/32 页与 1/4 KiB ext4，
 覆盖部分首尾、范围裁剪、干净间隙、无需连续大块分配、OOM、并发重脏、旧版本稳定、
 短写/EIO 脏页保留、读回及 e2fsck。`make test-lwext4-group-host` 另外检查外部稳定页
 在接纳、替换、abort 和 commit 时的实际引用归还，以及冷读没有第二份文件数据缓存。
@@ -501,7 +501,7 @@ cache 宿主测试另检查版本对象/物理页零分配复用、保留旧内�
 持有 cursor，不按单页请求增加模式分支。QEMU 11.1.2、512 MiB、单 hart、modern VirtIO、
 writeback，关闭诊断和预读；父进程与 QEMU 线程允许运行在宿主 CPU0/2。
 每个客户机磁盘先完整写入独立、非稀疏文件并同步，准备不计时。冷读为新启动后的客户机
-首次读取，宿主缓存未清空；热读先完整读取文件。复用 `tests/io-budget-experiment.py` 的
+首次读取，宿主缓存未清空；热读先完整读取文件。复用 `tests/cost/io-budget-experiment.py` 的
 内容、完成条件及资源退出检查，轮换全部六种版本顺序，一次只运行一个客户机，
 计时期间没有构建或其他测试。162 次启动全部通过；两种 4 KiB 热读窗口每版十二次，
 其余每版六次。下表为中位吞吐，单位 MiB/s。默认单 hart 与 `USER_SMP` 本地执行的区别见
@@ -632,8 +632,8 @@ Children 中位数为 80955.28 与 124837.63 KiB/s。此前单次 Parent 下降�
 只增加文件长度或 `fallocate` 留下的 unwritten extent 仍可能把初始化转换带入后续 flush。
 本地兼容分支运行器采用 `cp --reflink=never --sparse=never` 后 `fsync`，原盘内容和
 guest 测试不变。每份 4 GiB 工作镜像因此实际占用约 4 GiB，空间与准备时间计在运行前。
-结果解析由 `tests/cost_consumer.py` 保留原值、完整子进程传输量与可推导区间，
-`tests/test-cost-report.py` 覆盖提前停止、完整读取、零进度、缺失明细和打印舍入。
+结果解析由 `tests/cost/cost_consumer.py` 保留原值、完整子进程传输量与可推导区间，
+`tests/cost/test-cost-report.py` 覆盖提前停止、完整读取、零进度、缺失明细和打印舍入。
 
 
 完整冷覆盖及EOF后的新页先取得输入访问资格，在私有最终数据页完成复制，再于一次索引保护内发布ready+dirty；不建立无人需要等待的loading producer。来源游标只在成功接纳时推进，竞胜或暂不能接纳时保留原游标重试；已有页继续使用writer/mmap协议。部分页保留
@@ -756,7 +756,7 @@ ordered data 版本，允许调用者随后在同一事务内用稳定写入版�
 提前分给新的 unwritten 范围，否则直接清零会破坏回滚后的原内容。
 此操作不承诺无日志文件系统的断电原子性。
 
-`sh tests/fallocate-host.sh` 使用 1/4 KiB ext4 块与 4/16 KiB 页检查预留及空闲计数、
+`sh tests/host/fallocate.sh` 使用 1/4 KiB ext4 块与 4/16 KiB 页检查预留及空闲计数、
 混合 extent、部分块、缓存重读、真实共享 mmap/私有 COW、握手控制的活动写回、范围
 中途失败回滚、无 journal 的部分失败和所有者归还；每个镜像卸载后运行 `e2fsck -fn`。
 同一入口的 `FALLOCATE_HOST_CASE=reserved-full` 检查磁盘满时的已预留写入；
@@ -849,7 +849,7 @@ worker 停止拒绝新排队请求并结束实际在途窗口；CALLER 读取由
 旧写入借用、快照后新代次、真实前缀短写/EIO、稀疏后台脏页选择、等待期间新增/删除脏 inode、墓碑反复插入删除的容量稳定及最终资源。
 热读与截断通过明确握手覆盖 batch/scalar 的 closing/CLOSED 等待、mixed hit/miss 交接前截断再增长、
 旧页 pin 存活、新 EOF 和重新增长后的页面身份；客户机证据另见[两核模块](riscv-smp.md)。
-`sh tests/page-cache-concurrency-host.sh read-batch` 单独运行读取相关交错、错误与资源归还，覆盖单页、八页及完整128 KiB窗口；复用同一组内容和引用检查，避免为读取修改重复运行整份写回流程。
+`sh tests/host/page-cache-concurrency.sh read-batch` 单独运行读取相关交错、错误与资源归还，覆盖单页、八页及完整128 KiB窗口；复用同一组内容和引用检查，避免为读取修改重复运行整份写回流程。
 
 `snapshot-copy` 在第二页真实复制暂停时检查其他 inode 热读继续、同批第一页 mmap 写资格仍关闭；`admission-credit` 以真实借用版本和日志分配覆盖归还先于等待登记／park，以及在途 I/O 尚未结束时停止接纳等待。
 
@@ -882,7 +882,7 @@ make test-mm-disk-smp-userland-riscv INIT_CONFIG=config/init.json \
 
 后台写回、前景 fsync/legacy 完成和写入接纳共用批次前后的干净回收：固定稳定版本及取得 inode 前先回收，归还本批 entry 借用后再次恢复原高水位余量。前景工作区申请亦在此前回收，不让连续批次积累分配压力后才在后端内部失败。水位未改变；不能回收的页面和真实内存耗尽仍返回 ENOMEM。启动时预留写回窗口内的稳定页与控制工作区，其借用和归还见[当前成本边界](#当前成本边界)。连续页分配按真实回收进展重试的规则见[物理页](physical-pages.md)。
 
-`FALLOCATE_HOST_CASES='namespace-reclaim namespace-pressure' FALLOCATE_HOST_IMAGE_SIZE=256M FALLOCATE_HOST_TIMEOUT=60 sh tests/fallocate-host.sh` 使用同一个 16 MiB 物理池承载页缓存、VFS 堆、块缓存和 journal；长场景创建 48 个 4 MiB 文件，各自 fsync、重开并完整读回。握手场景在真实后端锁内耗尽空闲页，检查 cache 元数据资格忙时等待并取得干净页，同锁或更高资格重入时跳过，随后无干净页时返回 EMPTY；设备入口断言禁止该线程递归 I/O。两种页大小、两种文件系统块大小及有／无 journal 共 16 个组合，最终检查堆、物理页及 e2fsck。真实写回 EIO、ENOSPC 和不可回收页耗尽仍由前述 pressure 场景保护。
+`FALLOCATE_HOST_CASES='namespace-reclaim namespace-pressure' FALLOCATE_HOST_IMAGE_SIZE=256M FALLOCATE_HOST_TIMEOUT=60 sh tests/host/fallocate.sh` 使用同一个 16 MiB 物理池承载页缓存、VFS 堆、块缓存和 journal；长场景创建 48 个 4 MiB 文件，各自 fsync、重开并完整读回。握手场景在真实后端锁内耗尽空闲页，检查 cache 元数据资格忙时等待并取得干净页，同锁或更高资格重入时跳过，随后无干净页时返回 EMPTY；设备入口断言禁止该线程递归 I/O。两种页大小、两种文件系统块大小及有／无 journal 共 16 个组合，最终检查堆、物理页及 e2fsck。真实写回 EIO、ENOSPC 和不可回收页耗尽仍由前述 pressure 场景保护。
 后端元数据仍可能分配失败。映射重新设保护与 generation 协议保持不变，旧完成不能
 清除新修改。写回错误留在 inode/mount，当前失败页在成功前不计入 MemAvailable；
 同一轮继续处理其他对象。后台完成不替代 fsync/fdatasync 的错误观察与 flush。
@@ -924,7 +924,7 @@ worker 只在全部设备引用与在途请求归还后同步并释放后备 OFD
 和错误，不报告为空闲。正常退出交错卸载可卸的叶挂载与清理无人使用的 loop，
 让后备所在挂载在依赖者之后释放，最后停止根缓存并卸载根盘。
 
-`sh tests/loop-host.sh` 使用真实 journal ext4 后备与两层文件系统，覆盖绑定／unlink、
+`sh tests/host/loop.sh` 使用真实 journal ext4 后备与两层文件系统，覆盖绑定／unlink、
 原生结构布局、配置、只读、rundown、占用、循环拒绝、持久化读回和退出释放；
 保存实际两层后备镜像以 e2fsck 检查。4 KiB 文件系统可另设
 `BOAROS_LOOP_SECTOR=4096 LOOP_HOST_BLOCKS=4096` 检查非默认逻辑扇区。
@@ -987,7 +987,7 @@ rank15整次操作锁、inode锁、缓存写回、尾页清零和跨MM失效沿�
 
 ## 元数据成本复建
 
-`tests/cost-riscv.py --case metadata`复用既有统计，提供固定4096次stat/fstat/
+`tests/cost/cost-riscv.py --case metadata`复用既有统计，提供固定4096次stat/fstat/
 open窗口、2048次空文件创建删除，以及原lmbench的三种文件syscall和lat_fs、
 原iozone四进程(0,1)。open窗口逐次fstat校验身份，故包含校验成本；纯open/close
 成本由原lmbench对应项给出。路径持有与未持有分别测量，fstat本身必须持有fd。
@@ -1105,7 +1105,7 @@ loading 并允许重试；不能把清零的未读尾部交付为成功数据。
 下面记录 `b6ab571` 的 4 KiB 读取准备开销检查，早于 128 KiB 窗口改造。
 需求合批前的 `2e3f728`、修改前的 `7cfcce5` 与 `b6ab571` 使用相同的
 [`data-path` 程序](../../tests/workloads/io/data-path.c)，复用
-[`io-budget-experiment.py`](../../tests/io-budget-experiment.py) 的预置镜像、启动及
+[`io-budget-experiment.py`](../../tests/cost/io-budget-experiment.py) 的预置镜像、启动及
 内容、完成与退出检查。QEMU 11.1.2、512 MiB、单 hart、modern VirtIO、writeback、
 RA0/WB8，关闭诊断，计时期间不编译或运行其他测试。各项三个版本轮换顺序，
 每版六次；90 次启动全部通过。热读先完整读过一次，冷读为新启动后首次读取目标
@@ -1178,7 +1178,7 @@ inode read gate，复用 demand/full-overwrite 的 loading 页准备；已存在
 `make test-readahead-riscv` 覆盖配置窗口及 1/4 KiB ext4，验证实际缓存内容、窗口上限、
 seek/非顺序/关闭、冷不连续读、单页错误隔离、低水位、截断、unlink 和回收。
 `make test-readahead-host` 在 4/16 KiB 页上检查未对齐顺序流、窗口推进、微小读取、需求大批读取、EOF/EIO 前缀及取消后的引用归还。
-`python3 -B tests/readahead-riscv.py --pages 1 8 --block-size 4096 --held --transport legacy`
+`python3 -B tests/riscv/readahead.py --pages 1 8 --block-size 4096 --held --transport legacy`
 及 modern 模式使用 NBD 暂扣所有窗口 READ，再保留最后一个；需求读取者和 stop/join
 调用者均须保持等待，响应后才归还 owner。`--pages 16` 额外检查 16→32→64 KiB 的实际装入、完整归还后的推进和热范围跳过排队。
 
@@ -1206,7 +1206,7 @@ ASan/UBSan保护实际lwext4/JBD/块模型；宿主证明不替代DMA。LA真实
 
 LA 同一原 SQLite3.53.4 archive 编译 LP64D 静态 workload、原 shell.c 静态/动态
 CLI（16KiB ELF对齐），共享原 musl1.2.5解释器。上游 amalgamation/shell 不修改。
-`tests/sqlite-rollback.py --arch loongarch` 与 `tests/sqlite-wal-riscv.py --arch loongarch`
+`tests/userland/sqlite-rollback.py --arch loongarch` 与 `tests/riscv/sqlite-wal.py --arch loongarch`
 使用同一ELF先固定Linux后BoarOS，各在512MiB和1GiB运行。两内核冻结、archive和
 runtime身份检查，不能以不同二进制或不同SQL来接受架构差异。
 

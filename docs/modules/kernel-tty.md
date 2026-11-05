@@ -88,8 +88,8 @@ IN/OUT/HUP 使用统一事件队列；canonical IN 需要完整 line/EOF，raw p
 make test-tty-host
 make all
 build/riscv/musl-root/bin/musl-gcc -fno-link-libatomic -static -pthread -O2 \
-  -Wall -Wextra -Werror tests/tty/probe.c -o build/tty/probe-rv
-python3 -B tests/tty/riscv.py --only both --kernel kernel-rv --probe build/tty/probe-rv
+  -Wall -Wextra -Werror tests/workloads/tty/probe.c -o build/tty/probe-rv
+python3 -B tests/userland/tty/riscv.py --only both --kernel kernel-rv --probe build/tty/probe-rv
 ```
 
 宿主测试执行真实 core，覆盖软件 flags、限长/原子 echo、deadline/continuation、fault

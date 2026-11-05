@@ -12,7 +12,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include "../cost/common.h"
+#include "../../cost/workloads/common.h"
 
 /* AF_UNIX charge belongs to the sender; receiver buffer settings do not grant it. */
 static void blocked(pid_t pid)

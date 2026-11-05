@@ -20,7 +20,7 @@ def fixture(work,program,busybox,apps):
     tree=work/'tree';tree.mkdir()
     for name in ('dev','bin','proc','tmp'):(tree/name).mkdir()
     shutil.copy2(program,tree/'init');shutil.copy2(busybox,tree/'busybox')
-    if apps:shutil.copy2(ROOT/'tests/program-inventory/environment-check.sh',tree/'environment-check')
+    if apps:shutil.copy2(ROOT/'tests/userland/inventory/environment-check.sh',tree/'environment-check')
     for name in ('sh','dmesg','grep','hwclock','stat','df','awk','test'):(tree/'bin'/name).symlink_to('/busybox')
     disk=work/'fixture.img'
     with disk.open('wb') as stream:stream.truncate(32*1024*1024)
@@ -57,7 +57,7 @@ def main():
         linux,_=harness.fixed_linux_image(args.linux_kernel)
     qemu=args.qemu or profile.qemu
     identity={'arch':args.arch,'cases':{name:{'program':value['program_sha256'],'fixture':sha(value['fixture'])} for name,value in cases.items()},
-        'busybox':sha(busybox),'script':sha(ROOT/'tests/program-inventory/environment-check.sh'),
+        'busybox':sha(busybox),'script':sha(ROOT/'tests/userland/inventory/environment-check.sh'),
         'rtc':args.rtc,'qemu_sha256':sha(shutil.which(qemu) or qemu),'runs':[],'status':'prepared'}
     kernels={}
     for name,kernel in [('linux',linux),('boaros',args.kernel or ROOT/profile.kernel)]:

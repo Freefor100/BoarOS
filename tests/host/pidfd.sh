@@ -3,9 +3,9 @@ set -eu
 cd "$(dirname "$0")/../.."
 out=${1:-build/host/pidfd}
 mkdir -p "$out"
-cc -std=c11 -O2 -Wall -Wextra -Werror -Iinclude tests/pid-detached-host.c kernel/pid.c -o "$out/detached"
+cc -std=c11 -O2 -Wall -Wextra -Werror -Iinclude tests/host/pid-detached.c kernel/pid.c -o "$out/detached"
 "$out/detached"
-cc -std=c11 -O2 -Wall -Wextra -Werror -Iinclude tests/pid-object-host.c kernel/pid.c -o "$out/objects"
+cc -std=c11 -O2 -Wall -Wextra -Werror -Iinclude tests/host/pid-object.c kernel/pid.c -o "$out/objects"
 "$out/objects"
 for shift in 12 14; do
     cc -std=gnu11 -O2 -Wall -Wextra -Werror -DBOAROS_MAX_CPUS=2 -DBOAROS_PAGE_SHIFT="$shift" \

@@ -86,7 +86,7 @@ raw PCB 和已经销毁的 socket，不用无 owner 的 raw PCB 代替主要所�
 
 通知准备在消息队列锁外取得真实 socket OFD，分配最终 packet，并按 packet 及载荷大小预约接收端内存。尚未触发的 cookie 与已入队报文共享 SO_RCVBUF 额度；首条允许超过当前额度，其余超额准备通过已有 task 请求和等待 token 等待。唤醒后重新查 FD，关闭或复用能改变此次查找结果。注册成功后 cookie 独立持有端点存储，OFD 临时引用随准备结束归还；消息队列移出通知状态后在锁外发送或取消 cookie。接收完成或失败消费报文时归还实际接收额度；PEEK 保留它。取消注册失败时直接取消预约，不投递报文。
 
-socket 最后关闭立即撤下接收队列并关闭等待对象，尚未触发的 cookie 只保留已关闭端点的存储；其后发送会释放该 cookie，最后一个实际使用者归还 heap。通知不新增 worker，也不进入 lwIP。`sh tests/netlink-notify-host.sh` 用真实 FD/OFD、MM、heap 与 socket 检查两种类型的 cookie 内容、源地址、PEEK/read/readv、复制故障及关闭后的资源归还，并以明确握手检查满额度等待、接收归还额度和等待期间 FD 关闭。固定依据是 `references/linux/ipc/mqueue.c`、`net/netlink/af_netlink.c` 和 `include/uapi/linux/mqueue.h`，libc 消费方式来自固定 musl 1.2.5、glibc 2.44 源码归档。
+socket 最后关闭立即撤下接收队列并关闭等待对象，尚未触发的 cookie 只保留已关闭端点的存储；其后发送会释放该 cookie，最后一个实际使用者归还 heap。通知不新增 worker，也不进入 lwIP。`sh tests/host/netlink-notify.sh` 用真实 FD/OFD、MM、heap 与 socket 检查两种类型的 cookie 内容、源地址、PEEK/read/readv、复制故障及关闭后的资源归还，并以明确握手检查满额度等待、接收归还额度和等待期间 FD 关闭。固定依据是 `references/linux/ipc/mqueue.c`、`net/netlink/af_netlink.c` 和 `include/uapi/linux/mqueue.h`，libc 消费方式来自固定 musl 1.2.5、glibc 2.44 源码归档。
 
 `AF_UNIX` 提供 STREAM/DGRAM/SEQPACKET 的普通 socket、socketpair、文件路径名和抽象名称。创建、绑定、连接、监听、accept/accept4、配置及最后关闭由 CPU0 执行；载荷复制、接纳、读预约和等待保留在发起 CPU。socketpair 的双 OFD/FD 原子发布，失败归还未发布对象。
 
@@ -165,9 +165,9 @@ epoll控制仍在CPU0，等待扫描和事件复制在发起CPU执行，详见[�
 
 ## 验证
 
-静态/动态 musl 的原生并发短例复用 `tests/network_runner.py --workload smp`。私有 `USER_SMP_COMPOSITION=1` 内核配合 `--observe` 检查每个发起 CPU 的预约、复制、pin 与等待；三项握手分别暂停真实接收预约、发送页 pin 和 epoll 通知借用，核对追加/最后关闭、mprotect 和 DEL 的实际等待及资源归还。正式性能内核关闭这些观察。
+静态/动态 musl 的原生并发短例复用 `tests/userland/run.py --workload smp`。私有 `USER_SMP_COMPOSITION=1` 内核配合 `--observe` 检查每个发起 CPU 的预约、复制、pin 与等待；三项握手分别暂停真实接收预约、发送页 pin 和 epoll 通知借用，核对追加/最后关闭、mprotect 和 DEL 的实际等待及资源归还。正式性能内核关闭这些观察。
 
-`tests/socket-accept-allocation-host.sh` 在真实 OFD 分配处注入 EMPTY，检查连接保留、重试双向通信及 FD、凭据和堆页归还；另覆盖等待失败和地址输出失败的不同副作用。`tests/host/network_owner.py --case unix-space-topology` 检查互连流量不触发空间回调、断连恢复单向订阅及重连唤醒；`unix_named` 用户程序通过实际 epoll 等待与队列空间释放核对跨核通知。
+`tests/host/socket-accept-allocation.sh` 在真实 OFD 分配处注入 EMPTY，检查连接保留、重试双向通信及 FD、凭据和堆页归还；另覆盖等待失败和地址输出失败的不同副作用。`tests/host/network_owner.py --case unix-space-topology` 检查互连流量不触发空间回调、断连恢复单向订阅及重连唤醒；`unix_named` 用户程序通过实际 epoll 等待与队列空间释放核对跨核通知。
 
 `unix-packet-boundary` 覆盖默认、最小和最大SNDBUF的完整分配大小、向量前缀及计费归还。`unix-write-notify` 直接检查成功发送不产生无状态变化的本端通知，同时检查消息消费和复制取消仍通知发送者。`tcp-batch` 在真实 tcp_write 的 COPY 之间握手，让另一 CPU 预约剩余额度，检查整批接纳期间额度保持保守且最终归还；相同数据分段不会增加端点保护次数。
 
@@ -176,12 +176,12 @@ make test-lwip-host test-lwip-reassembly-host test-ethernet-worker-host
 make test-network-riscv         # IPv6 UDP/TCP、双栈 accept，同一 ELF 对照 Linux
 make test-scale-riscv
 make test-syscall-riscv test-userland-riscv test-diff-abi-riscv test-stack-usage
-python3 tests/program-inventory/run.py --suite libc \
+python3 tests/userland/inventory/run.py --suite libc \
   --case libc.static.socket --case libc.dynamic.socket \
   --require-pass --output build/socket-program-check
 ```
 
-`tests/network-riscv.py --memory 512M --memory 1G`分别启动同一ELF的两种RAM，
+`tests/userland/run.py --memory 512M --memory 1G`分别启动同一ELF的两种RAM，
 每个配置的镜像/日志独立；result记录实际启动参数。RV official profile固定1GiB，
 冲突的显式RAM参数返回错误，不能忽略参数后给启动贴错标签。
 
@@ -238,9 +238,9 @@ UDP 排队同时受每 socket 配额与共享协议堆约束。队列不能耗�
 64 KiB，未扩大池或伪造 POLLOUT。pthread 压力回归现在保护 UDP 过载时 TCP 控制
 仍能传输；raw TCP segment ERR_MEM 的重试契约继续由 host fixture 验证。
 
-窄验证：`python3 -B tests/network-riscv.py` 同 ELF 对照 Linux；固定内容用
+窄验证：`python3 -B tests/userland/run.py` 同 ELF 对照 Linux；固定内容用
 `--workload content`，包括 16 MiB、五连接各 8 MiB、IPv6 UDP 一万次 64 字节
-请求响应。原 ELF 执行入口为 `tests/network-consumers.py`，按原客户端参数、真实
+请求响应。原 ELF 执行入口为 `tests/userland/network-consumers.py`，按原客户端参数、真实
 服务端 ready、逐项有效时间/接收量及 wait status 判定；原脚本退出零不替代传输。
 
 
@@ -252,11 +252,11 @@ argv、工作目录、接收端结果、wait status、时间及机器输入身�
 分开验收，listener ready 使用实际输出握手，客户端参数保持原值。
 
 ```sh
-python3 -B tests/network-consumers.py --libc both --suite both --case all
-python3 -B tests/network-consumers.py --only boaros --libc both --suite both --case script
-python3 -B tests/network-consumers.py --only boaros --libc both --suite both --case representative --repeat 3
+python3 -B tests/userland/network-consumers.py --libc both --suite both --case all
+python3 -B tests/userland/network-consumers.py --only boaros --libc both --suite both --case script
+python3 -B tests/userland/network-consumers.py --only boaros --libc both --suite both --case representative --repeat 3
 make COST_DIAGNOSTICS=1 all
-python3 -B tests/network-consumers.py --only boaros --libc both --suite both --case representative --kernel build/cost/kernel-rv --observe
+python3 -B tests/userland/network-consumers.py --only boaros --libc both --suite both --case representative --kernel build/cost/kernel-rv --observe
 ```
 
 只有 COST 构建提供只读 `/proc/boaros_net_stats`，复用现有协议统计，不保存对象
@@ -287,8 +287,8 @@ UNIX DGRAM自身SHUT_RD后，即使空队列也有IN/RDNORM和RDHUP；双向关�
 收到EAGAIN后的非阻塞调用不能因poll可读而重新循环。固定Linux和BoarOS现均通过；
 依据为固定Linux的`net/unix/af_unix.c`和`net/core/datagram.c`。
 
-发送者预算入口：`python3 -B tests/network-riscv.py --workload budget`与
-`tests/network-loongarch.py --workload budget`，现在均对照Linux。测试先填满实际
+发送者预算入口：`python3 -B tests/userland/run.py --workload budget`与
+`tests/userland/run.py --workload budget`，现在均对照Linux。测试先填满实际
 sender并从proc确认子任务已阻塞，检查接收缓存变更不解锁、发送缓存缩小/增大、
 peer关闭的类型对应错误、SIGKILL和内容守恒。相同ELF双侧运行，不按具体packet
 个数推断内核布局；旧接收配额成本契约由用户明确选择的Linux发送者模型替换。
@@ -356,7 +356,7 @@ INET stream 的 write/writev/send/sendmsg 使用任务登记的 `kernel_socket_w
 多 iovec 的直接路径复用任务工作区保存页引用及片段描述，阻塞后按已接纳位置继续准备。
 两种输入都由 `tcp_write(COPY)` 持有 ACK 前的版本，非阻塞返回已接受前缀，
 未接受用户内容不跨系统调用持有。
-`FILE_IO_HOST_TCP=1 sh tests/file-io-concurrency-host.sh` 将生产 TCP/lwIP、MM 和 syscall I/O
+`FILE_IO_HOST_TCP=1 sh tests/host/file-io-concurrency.sh` 将生产 TCP/lwIP、MM 和 syscall I/O
 连接起来，以真实协议内存耗尽制造 ERR_MEM，等待时撤权并替换来源映射，检查新内容
 恰好接纳一次、跨页 fault 前缀及页引用归还。
 
@@ -373,7 +373,7 @@ scale 保护竞争 reservation、abort 归还及零容量下零页解析/零 str
 真实调度的 io-sleep 包装用户复制边界，覆盖保留 reservation 时关闭并复用 fd、并发 shutdown、
 用户页撤销后的 fault 和预算重取。它模型化可睡眠复制的交错，不宣称复现硬件缺页的具体时序。
 
-`python3 -B tests/network-owner-riscv.py --kernel kernel-rv` 在 legacy/modern
+`python3 -B tests/riscv/network-owner.py --kernel kernel-rv` 在 legacy/modern
 两种 VirtIO 传输下关闭 indirect 特性，以真实 TAP 的双向 bulk/control 内容检查
 验证复制路径，并要求 driver 的 `tx-copy>0`、`tx-sg=0`、`errors=0`。该入口只运行
 功能 smoke；它与冻结资源边界的 host 用例共同验证，不单靠最终传输成功证明
@@ -384,9 +384,9 @@ TCP 的 27 组窗口/池/堆候选由 `BOAROS_LWIP_WINDOW_MSS`、`BOAROS_LWIP_PO
 控制流 tail 与固定输入约束见[预算实验](../learning/data-path-budget-experiments.md)，
 可运行候选不等于吞吐已经验收，默认值须依据匹配结果由人选择。
 
-`python3 -B tests/network-budget-config.py` 独立验证无覆盖宏的生产默认 8/4/2，
+`python3 -B tests/cost/network-budget-config.py` 独立验证无覆盖宏的生产默认 8/4/2，
 并显式覆盖全部 27 个候选，保留非法配置与统计计数宽度检查。
-`tests/network-budget-selftest.py` 用临时头文件默认值漂移验证门禁会失败。
+`tests/cost/network-budget-selftest.py` 用临时头文件默认值漂移验证门禁会失败。
 
 阶段七已完成 TCP 27 组预算的发布筛选、30 项组合扩展与独立 COST 诊断；当时默认为 8/1/1。用户依据近池与 1/10 ms 结果批准改为 8/4/2，保留 8 MSS 和 32 PCB。历史默认的吞吐回退、全局池/堆饱和和 8/4/2 的有限负载收益保留在[实验报告](../learning/data-path-budget-experiments.md#正式匹配结果2026-10-06)，不重跑完整矩阵，也不将预算调整宣称为单连接吞吐保证。
 

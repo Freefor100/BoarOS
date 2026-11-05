@@ -51,8 +51,8 @@ python3 -B tests/host/virtio_rng.py
 make all
 build/riscv/musl-root/bin/musl-gcc -fno-link-libatomic -static -O2 \
   -Wall -Wextra -Werror tests/userland/rng.c -o build/riscv/tests/user/rng-rv
-python3 -B tests/rng-riscv.py
-python3 -B tests/rng-riscv.py --memory 512M --memory 1G
+python3 -B tests/userland/rng.py
+python3 -B tests/userland/rng.py --memory 512M --memory 1G
 make test-rng-loongarch test-rng-failures-loongarch
 ```
 
@@ -67,7 +67,7 @@ IRQ仍保留，随后确认成功才归还资源；同一实例可再次启动�
 边界模型，不声称固定QEMU真的拒绝reset。LA的DMA/任务页/栈页OOM及IRQ登记失败
 另有真实PCI注入，两种RAM均核对根页/堆/任务栈/BAR基线与未就绪等待的信号中断。
 
-`tests/arch_profiles.py`提供双架构硬件事实，`rng_runner.py`共用案例、EGD握手、
+`tests/arch_profiles.py`提供双架构硬件事实，`tests/userland/rng.py`共用案例、EGD握手、
 退出/owner分类及输入身份。RV默认仍为两种MMIO、512MiB、BoarOS八例；LA为固定
 Linux先行、BoarOS随后、两种RAM、四种模式共16例。同一原探针ELF逐次校验，
 stdout、退出、输入身份与EGD请求保留在临时`rng-run.*`，成功后的镜像立即删除。

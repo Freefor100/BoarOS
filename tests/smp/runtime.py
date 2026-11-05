@@ -38,7 +38,7 @@ def main():
                     PTHREAD_TLS_DSO_RV=str(snapshots['tls']),MUSL_LDSO=str(snapshots['loader']),
                     QEMU_MEMORY=memory,USERLAND_TIMEOUT='185s')
                 with (folder/'consumer.log').open('w') as stream:
-                    subprocess.run(['sh',str(ROOT/'tests/userland-riscv.sh')],env=env,stdout=stream,stderr=subprocess.STDOUT,check=True)
+                    subprocess.run(['sh',str(ROOT/'tests/riscv/userland.sh')],env=env,stdout=stream,stderr=subprocess.STDOUT,check=True)
                 for name in ('static-root','pthread-root'):
                     validate_execution((folder/f'{name}.log').read_text(errors='replace'),cpus,True)
                     report['musl'].append(dict(memory=memory,cpus=cpus,**json.loads((folder/f'{name}.json').read_text())))

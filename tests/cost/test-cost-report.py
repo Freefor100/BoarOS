@@ -1,0 +1,711 @@
+import sys
+from pathlib import Path
+sys.path[:0] = [str(Path(__file__).resolve().parent), str(Path(__file__).resolve().parents[1])]
+import unittest
+from cost.cost_report import parse, schema, percentile, validate_expected, validate_replicas, validate_locking, validate_scheduler, validate_resume_selection
+
+class CostConsumerThroughputTest(unittest.TestCase):
+    @staticmethod
+    def method_output(method='readers', children=None, parent='20480.00',
+                      summed='69632.00', minimum='8192.00', maximum='32768.00',
+                      average='17408.00', min_xfer='256.00'):
+        raw=(f'Children see throughput for 4 {method} = {summed} kB/sec\n'
+             f'Parent sees throughput for 4 {method} = {parent} kB/sec\n'
+             f'Min throughput per process = {minimum} kB/sec\n'
+             f'Max throughput per process = {maximum} kB/sec\n'
+             f'Avg throughput per process = {average} kB/sec\n'
+             f'Min xfer = {min_xfer} kB\n')
+        for child, actual, rate in children or ():
+            raw += f'Child[{child}] xfer count = {actual} kB, Throughput = {rate} kB/sec\n'
+        return raw
+
+    def test_stonewall_counts_only_the_reported_child_transfers(self):
+        from cost.cost_consumer import parse_throughput_methods
+        raw=self.method_output(children=((0,'1024.00','32768.00'),(1,'512.00','16384.00'),
+                                         (2,'768.00','12288.00'),(3,'256.00','8192.00')))
+        result=parse_throughput_methods(raw)[0]
+        self.assertEqual(result['method'],'readers')
+        self.assertEqual(result['counted_kib'],2560)
+        self.assertEqual(result['parent_kib_s'],20480)
+        self.assertEqual(result['children_sum_kib_s'],69632)
+        self.assertEqual(result['parent_interval_seconds'],0.125)
+        self.assertEqual([c['interval_seconds'] for c in result['children']],
+                         [0.03125,0.03125,0.0625,0.03125])
+
+    def test_complete_four_files_and_multiple_methods_keep_separate_intervals(self):
+        from cost.cost_consumer import parse_throughput_methods
+        full=self.method_output(method='re-readers',parent='65536.00',summed='122880.00',
+            minimum='8192.00',maximum='65536.00',average='30720.00',min_xfer='1024.00',
+            children=((0,'1024.00','16384.00'),(1,'1024.00','32768.00'),
+                      (2,'1024.00','8192.00'),(3,'1024.00','65536.00')))
+        methods=parse_throughput_methods(self.method_output()+full)
+        self.assertEqual([m['method'] for m in methods],['readers','re-readers'])
+        result=methods[1]
+        self.assertEqual(result['counted_kib'],4096)
+        self.assertEqual(result['parent_interval_seconds'],0.0625)
+        self.assertEqual([c['interval_seconds'] for c in result['children']],
+                         [0.0625,0.03125,0.125,0.015625])
+
+    def test_missing_or_partial_child_details_leave_total_and_parent_interval_unknown(self):
+        from cost.cost_consumer import parse_throughput_methods
+        for children in (None,((0,'1024.00','32768.00'),)):
+            result=parse_throughput_methods(self.method_output(children=children))[0]
+            self.assertEqual(result['child_count'],4)
+            self.assertEqual(result['min_kib_s'],8192)
+            self.assertEqual(result['max_kib_s'],32768)
+            self.assertEqual(result['avg_kib_s'],17408)
+            self.assertEqual(result['min_xfer_kib'],256)
+            self.assertIsNone(result['counted_kib'])
+            self.assertIsNone(result['parent_interval_seconds'])
+            self.assertEqual(result['children'],None if children is None else [
+                dict(child=0,actual_kib=1024.0,rate_kib_s=32768.0,interval_seconds=0.03125)])
+        partial=parse_throughput_methods('Children see throughput for 4 readers = 40.00 kB/sec\n')[0]
+        self.assertIsNone(partial['parent_kib_s'])
+        self.assertIsNone(partial['min_xfer_kib'])
+        self.assertEqual(parse_throughput_methods('iozone test complete.\n'),[])
+
+    def test_independently_rounded_header_and_child_rates_are_accepted(self):
+        from cost.cost_consumer import parse_throughput_methods
+        raw=self.method_output(parent='100.00',summed='133.34',minimum='33.34',
+            maximum='33.34',average='33.34',min_xfer='256.00',
+            children=tuple((i,'256.00','33.34') for i in range(4)))
+        result=parse_throughput_methods(raw)[0]
+        self.assertEqual(result['counted_kib'],1024)
+        self.assertEqual(result['parent_interval_seconds'],10.24)
+        with self.assertRaises(ValueError):parse_throughput_methods(raw.replace('133.34','133.30'))
+
+    def test_zero_progress_remains_a_reported_stonewall_result(self):
+        from cost.cost_consumer import parse_throughput_methods
+        raw=self.method_output(parent='0.00',summed='0.00',minimum='0.00',maximum='0.00',
+            average='0.00',min_xfer='0.00',children=tuple((i,'0.00','0.00') for i in range(4)))
+        result=parse_throughput_methods(raw)[0]
+        self.assertEqual(result['counted_kib'],0)
+        self.assertIsNone(result['parent_interval_seconds'])
+        self.assertEqual([c['interval_seconds'] for c in result['children']],[None]*4)
+        # The original minimum uses zero as its sentinel. Preserve its output;
+        # do not reject a zero child because the printed minimum is nonzero.
+        raw=self.method_output(parent='10000.00',summed='57344.00',minimum='8192.00',maximum='32768.00',
+            average='14336.00',min_xfer='256.00',
+            children=((0,'0.00','0.00'),(1,'1024.00','32768.00'),(2,'256.00','8192.00'),(3,'512.00','16384.00')))
+        result=parse_throughput_methods(raw)[0]
+        self.assertIsNone(result['children'][0]['interval_seconds'])
+        self.assertEqual(result['min_xfer_kib'],256)
+        self.assertEqual(result['children'][1]['interval_seconds'],0.03125)
+        self.assertEqual(result['counted_kib'],1792)
+        self.assertEqual(result['parent_interval_seconds'],0.1792)
+
+    def test_nonfinite_negative_duplicate_and_inconsistent_results_are_rejected(self):
+        from cost.cost_consumer import parse_throughput_methods
+        raw=self.method_output(children=((0,'1024.00','32768.00'),(1,'512.00','16384.00'),
+                                         (2,'768.00','12288.00'),(3,'256.00','8192.00')))
+        for field in ('parent','summed','minimum','maximum','average','min_xfer'):
+            for value in ('-1','nan','inf'):
+                with self.subTest(field=field,value=value),self.assertRaises(ValueError):
+                    parse_throughput_methods(self.method_output(**{field:value}))
+        for bad in (raw.replace('xfer count = 1024.00','xfer count = nan'),
+                    raw.replace('Throughput = 32768.00','Throughput = -1'),
+                    raw.replace('Child[3]','Child[0]'),raw.replace('Child[3]','Child[4]'),
+                    raw.replace('Parent sees throughput for 4','Parent sees throughput for 3'),
+                    raw+raw):
+            with self.subTest(raw=bad),self.assertRaises(ValueError):parse_throughput_methods(bad)
+
+    def test_commands_preserve_metrics_and_new_fields_are_optional_in_old_records(self):
+        from cost.cost_consumer import commands,validate_record
+        from copy import deepcopy
+        name='consumer-musl-1'
+        raw=self.method_output()+'iozone test complete.\n'
+        output=f'COST COMMAND BEGIN {name}\n{raw}COST RESULT {name} 123\nCOST COMMAND RESULT {name} 0 0\n'
+        command=commands(output,expected_names={name})[0]
+        self.assertEqual(command['throughput_methods'][0]['parent_kib_s'],20480)
+        self.assertIsNone(command['throughput_methods'][0]['counted_kib'])
+        row=CostReportTest().consumer_record()
+        for c in row['commands']:c.pop('throughput_methods',None)
+        validate_record(row,True)
+        new=deepcopy(row)
+        new['commands'][1]['throughput_methods']=[]
+        with self.assertRaises(ValueError):validate_record(new,True)
+
+class CostFixtureTest(unittest.TestCase):
+    def test_resume_cannot_omit_or_add_frozen_mode(self):
+        from cost.cost_fixture import validate_resume_fixture
+        validate_resume_fixture({},None)
+        validate_resume_fixture({'fixture_mode':'frozen','fixture_sha256':'f','fixture_input_sha256':'f'},'f')
+        for record,requested in (({'fixture_mode':'frozen','fixture_sha256':'f','fixture_input_sha256':'f'},None),
+                ({},'f'),({'fixture_mode':'frozen','fixture_sha256':'f','fixture_input_sha256':'other'},'f')):
+            with self.assertRaises(ValueError):validate_resume_fixture(record,requested)
+
+    def test_frozen_replicas_require_equal_bytes_and_distinct_writable_paths(self):
+        rows=[dict(case='locking',cost_diagnostics=0,transport='modern',cache='writeback',
+                   replica=i,replicas=3,acceptance=True,kernel_sha256='k',elf_sha256='e',
+                   source_sha256='s',fixture_sha256='f',fixture_input_sha256='f',fixture_mode='frozen',
+                   argv=['qemu','-drive',f'file=/boot/{i}/root.img,if=none,format=raw,id=root,cache=writeback'],
+                   snapshots=[],timings_ns={'small':1}) for i in range(3)]
+        validate_replicas(rows)
+        from copy import deepcopy
+        for field,value in (('fixture_mode','fresh'),('fixture_input_sha256','changed'),
+                            ('argv',rows[0]['argv']),('fixture_sha256','changed')):
+            bad=deepcopy(rows);bad[1][field]=value
+            with self.assertRaises(ValueError):validate_replicas(bad)
+
+    def test_frozen_preboot_bytes_are_reused_and_sealed(self):
+        from cost.cost_fixture import FrozenFixture
+        from pathlib import Path
+        import tempfile
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary); source=root/'root.img'; source.write_bytes(b'preboot')
+            cache=FrozenFixture(root/'cache','locking','elf')
+            self.assertIsNone(cache.load())
+            cache.publish(source)
+            source.write_bytes(b'after boot')
+            self.assertEqual(cache.load().read_bytes(),b'preboot')
+            with self.assertRaises(ValueError):cache.publish(source)
+
+    def test_changed_elf_and_damaged_cache_are_not_repaired_silently(self):
+        from cost.cost_fixture import FrozenFixture
+        from pathlib import Path
+        import tempfile
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary); source=root/'root.img'; source.write_bytes(b'preboot')
+            cache=FrozenFixture(root/'cache','allocator','elf');cache.publish(source)
+            with self.assertRaises(ValueError):FrozenFixture(root/'cache','allocator','other-elf').load()
+            image=cache.load(); image.chmod(0o600); image.write_bytes(b'damaged')
+            with self.assertRaises(ValueError):cache.load()
+
+    def test_partial_publication_is_rejected(self):
+        from cost.cost_fixture import FrozenFixture
+        from pathlib import Path
+        import tempfile
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);(root/'cache/latency').mkdir(parents=True)
+            with self.assertRaises(ValueError):FrozenFixture(root/'cache','latency','elf').load()
+
+    def test_ipc_fixture_keeps_configuration_identity(self):
+        from cost.cost_fixture import FrozenFixture
+        from pathlib import Path
+        import tempfile
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);source=root/'root.img';source.write_bytes(b'fixed IPC workload')
+            config={'arch':'riscv','cpus':4,'memory':'512M','mode':'all','profile':'formal'}
+            cache=FrozenFixture(root/'cache','ipc-fds','elf',configuration=config)
+            cache.publish(source)
+            self.assertEqual(cache.load().read_bytes(),b'fixed IPC workload')
+            for field,value in [('arch','loongarch'),('cpus',1),('memory','1G'),('mode','legacy'),('profile','smoke')]:
+                with self.assertRaises(ValueError):
+                    FrozenFixture(root/'cache','ipc-fds','elf',configuration={**config,field:value}).load()
+            self.assertEqual(source.read_bytes(),b'fixed IPC workload')
+
+class CostSeedTest(unittest.TestCase):
+    def test_replica_inputs_pair_across_kernel_and_observation_modes(self):
+        from cost_seed import replica_seed, seed_arguments
+        expected = [123, 124, 125]
+        for _ in ('baseline-off', 'candidate-off', 'return-off', 'baseline-on', 'candidate-on', 'return-on'):
+            self.assertEqual([replica_seed(123, i) for i in range(3)], expected)
+        self.assertEqual(seed_arguments(123), ['-seed', '123'])
+        self.assertEqual(seed_arguments(None), [])
+
+    def test_seed_range_and_span_are_checked_before_launch(self):
+        from cost_seed import replica_seed
+        maximum = (1 << 64) - 1
+        self.assertEqual(replica_seed(maximum, 0), maximum)
+        self.assertIsNone(replica_seed(None, 0))
+        for seed, replica in ((maximum, 1), (-1, 0), (True, 0), (1, -1), (1, True)):
+            with self.assertRaises(ValueError): replica_seed(seed, replica)
+
+    def test_resume_checks_seed_and_actual_argument(self):
+        from cost_seed import validate_resume_seed
+        validate_resume_seed({'argv': ['qemu']}, None)
+        validate_resume_seed({'qemu_seed': 123, 'argv': ['qemu', '-seed', '123']}, 123)
+        for record, requested in (({'argv': ['qemu']}, 123),
+                ({'qemu_seed': 124, 'argv': ['qemu', '-seed', '124']}, 123),
+                ({'qemu_seed': 123, 'argv': ['qemu', '-seed', '124']}, 123),
+                ({'qemu_seed': 123, 'argv': ['qemu', '-seed']}, 123),
+                ({'qemu_seed': 123, 'argv': ['qemu', '-seed', '123', '-seed', '123']}, 123)):
+            with self.assertRaises(ValueError): validate_resume_seed(record, requested)
+
+class CostReportTest(unittest.TestCase):
+    def test_precommit_body_names_are_current_and_history_keeps_its_registry(self):
+        from cost.cost_report import supported_schemas
+        current=schema()
+        names={name for name,_,_ in current}
+        for device in ('device0','device1','device_other'):
+            self.assertIn(device+'_precommit_body',names)
+            self.assertNotIn(device+'_journal_write',names)
+        historical=[registry for registry in supported_schemas()
+                    if len(registry)==len(current) and any(name=='device0_journal_write' for name,_,_ in registry)]
+        self.assertEqual(len(historical),1)
+        self.assertNotEqual(historical[0],current)
+
+    def test_scheduler_requires_completed_windows_and_peer_content(self):
+        work = {'scheduler-yield': (8192, 8192), 'scheduler-wake': (8192, 8192 * ord('p')),
+                'scheduler-create': (1024, 1024)}
+        timings = {name: 100 for name in work}
+        output = ''.join(f'COST SCHED WORK {name} {n} {v}\n' for name, (n, v) in work.items())
+        validate_scheduler(timings, [], output, False)
+        for bad in (0, -1):
+            with self.assertRaisesRegex(ValueError, 'time'):
+                validate_scheduler({name: bad for name in work}, [], output, False)
+        for bad in ('', output + output.splitlines()[0] + '\n', output.replace('917504', '0')):
+            with self.assertRaisesRegex(ValueError, 'work|progress'):
+                validate_scheduler(timings, [], bad, False)
+        with self.assertRaisesRegex(ValueError, 'coverage'):
+            validate_scheduler(timings, [], output, True)
+        snapshots = [{'name': name, 'values': {
+            'foreground.irq_off_ticks.samples': 1,
+            'foreground.raw_wait_ticks.samples': 1,
+            'foreground.raw_hold_ticks.samples': 1}} for name in work]
+        validate_scheduler(timings, snapshots, output, True)
+        for metric in snapshots[0]['values']:
+            bad = [{**s, 'values': {**s['values'], metric: 0}} for s in snapshots]
+            with self.assertRaisesRegex(ValueError, 'not measured'):
+                validate_scheduler(timings, bad, output, True)
+
+    def test_resume_selection_only_applies_to_consumer_manifests(self):
+        for case in ('allocator','latency','locking'):
+            validate_resume_selection(case, {}, ['consumer-musl-0'])
+        validate_resume_selection('consumer', {'consumer_command_names':['consumer-musl-0']}, ['consumer-musl-0'])
+        with self.assertRaisesRegex(ValueError,'selection'):
+            validate_resume_selection('consumer', {}, ['consumer-musl-0'])
+        with self.assertRaisesRegex(ValueError,'selection'):
+            validate_resume_selection('metadata', {'consumer_command_names':['consumer-musl-0']}, ['consumer-musl-0'])
+
+    def test_locking_checks_the_synchronous_contention_windows(self):
+        names = {f'locking-{r}-0-{n}' for r in range(3) for n in (1,8,32)}
+        names.update(f'locking-1-{op}-8' for op in (1,2,3,4))
+        timings = {name: 100 for name in names}
+        snapshots = [{'name':name,'values':{'foreground.lock15_acquired.value':1,
+                     'foreground.lock15_blocks.value':int(name in ('locking-1-2-8','locking-1-4-8'))}}
+                     for name in names]
+        validate_locking(timings, snapshots, True)
+        for name in ('locking-1-2-8','locking-1-4-8'):
+            bad = [{**snap,'values':{**snap['values'],'foreground.lock15_blocks.value':0}}
+                   if snap['name']==name else snap for snap in snapshots]
+            with self.assertRaisesRegex(ValueError,'contention'):
+                validate_locking(timings,bad,True)
+        with self.assertRaisesRegex(ValueError,'coverage'):
+            validate_locking(timings,snapshots[:-1],True)
+        bad=[{**snap,'values':{**snap['values'],'foreground.lock15_acquired.value':0}}
+             for snap in snapshots]
+        with self.assertRaisesRegex(ValueError,'operation lock'):
+            validate_locking(timings,bad,True)
+        validate_locking(timings,[],False)
+
+    def consumer_record(self):
+        from cost.cost_consumer import commands,ELFS,SCRIPTS,ORIGINAL_SHA,DEPENDENCIES
+        lines=[]
+        for libc in ELFS:
+            for i in range(8):
+                name=f'consumer-{libc}-{i}'
+                lines += [f'COST COMMAND BEGIN {name}',
+                          'Selected test not available on the version.' if i==7 else '',
+                          self.consumer_method_output(i),f'COST RESULT {name} 123',f'COST COMMAND RESULT {name} 0 0']
+        return dict(original_sha256=ORIGINAL_SHA,consumer_elf_sha256=ELFS,consumer_script_sha256=SCRIPTS,
+                    consumer_dependencies=DEPENDENCIES,commands=commands('\n'.join(lines)+'\n'))
+
+    def comparison_records(self):
+        from copy import deepcopy
+        import hashlib,json
+        rows=[]
+        # 比较输入的检错只需一个有效窗口，不依赖历史吞吐数据。
+        for platform,on in (('boaros',0),('boaros',1),('linux',0)):
+            for replica in range(3):
+                row=deepcopy(self.consumer_record())
+                row['commands']=row['commands'][:1]
+                name=row['commands'][0]['name']
+                row.update(case='consumer',platform=platform,cost_diagnostics=on,
+                    transport='modern',cache='writeback',replica=replica,replicas=3,acceptance=True,
+                    consumer_command_names=[name],consumer_timeout_ms=180000,
+                    kernel_sha256=f'{platform}-{on}',elf_sha256='coordinator',source_sha256=platform,
+                    fixture_sha256=f'{platform}-{on}-{replica}',firmware_sha256='firmware',
+                    qemu_sha256='qemu',dtb_sha256='dtb',timebase_hz=10000000,
+                    uname=dict(machine='riscv64',release='4.15.0'),snapshots=[],timings_ns={name:123})
+                if on:
+                    fields=self.valid();fields['epoch']='1'
+                    row['snapshots']=[dict(name=name,values=parse(self.render(fields),1))]
+                if platform=='linux':
+                    row['linux_reference']=dict(inputs=dict(source=['linux','f4cdf7ca9a1fdcca413157df19753f388a5a224e']))
+                row['input_keys']=['kernel_sha256','elf_sha256','source_sha256','fixture_sha256',
+                                   'firmware_sha256','qemu_sha256','dtb_sha256','timebase_hz','consumer_timeout_ms']
+                frozen={k:row[k] for k in row['input_keys']}
+                row['input_sha256']=hashlib.sha256((json.dumps(frozen,sort_keys=True,separators=(',',':'))+'\n').encode()).hexdigest()
+                rows.append(row)
+        return rows
+
+    def test_original_consumer_closure_rejects_startup_failure_and_censoring(self):
+        from cost.cost_consumer import validate_record,classify
+        from copy import deepcopy
+        row=self.consumer_record()
+        validate_record(row,True)
+        for raw,timeout,status in [('iozone test complete.',1,9),('FATAL: kernel too old',0,32512),
+                                   ('still running',0,0)]:
+            broken=deepcopy(row);c=broken['commands'][0]
+            c.update(raw_output=raw,timeout=timeout,wait_status=status,**classify(raw,timeout,status))
+            c.pop('throughput_methods',None)  # Historical records have no parsed metrics.
+            validate_record(broken,False)
+            with self.assertRaises(ValueError):validate_record(broken,True)
+        for field,value in [('timeout',1),('wait_status',32512),('raw_output','FATAL: kernel too old'),
+                            ('command_timeout_ms',600000),('argv',['./iozone','--different-workload']),
+                            ('outcome','blocked')]:
+            broken=deepcopy(row);broken['commands'][0][field]=value
+            with self.assertRaises(ValueError):validate_record(broken,True)
+        broken=deepcopy(row);broken['consumer_dependencies']['/glibc/lib/libc.so.6']='wrong'
+        with self.assertRaises(ValueError):validate_record(broken,True)
+
+    @staticmethod
+    def consumer_method_output(index):
+        # Actual original report fields; completion alone is insufficient.
+        methods=((),('initial writers','rewriters','readers','re-readers'),
+                 ('initial writers','rewriters','random readers','random writers'),
+                 ('initial writers','rewriters','reverse readers'),
+                 ('initial writers','rewriters','stride readers'),
+                 ('fwriters','freaders'),('pwrite writers','pread readers'),())
+        data='4096 1 '+ ' '.join(['10']*13)+'\n' if index==0 else ''.join(
+            'Children see throughput for 4 '+m+' = 40.00 kB/sec\n'
+            'Max throughput per process = 10.00 kB/sec\n' for m in methods[index])
+        return data+'iozone test complete.\n'
+
+    def test_closure_requires_actual_requested_method_results(self):
+        from cost.cost_consumer import validate_record,classify
+        from copy import deepcopy
+        row=self.consumer_record()
+        validate_record(row,True)
+        for index in range(7):
+            actual=row['commands'][index]['raw_output']
+            missing=actual.replace('Max throughput per process','discarded throughput per process',1)
+            if index==0:missing='iozone test complete.\n'
+            valid=self.consumer_method_output(index)
+            for raw in ('iozone test complete.\n',missing,valid+valid,
+                        valid.replace('10','0'),valid.replace('10','nan'),valid.replace('10','inf')):
+                broken=deepcopy(row);c=broken['commands'][index]
+                c.update(raw_output=raw,reported_sections=[],**classify(raw,0,0))
+                c.pop('throughput_methods',None)
+                validate_record(broken,False)
+                with self.assertRaises(ValueError):validate_record(broken,True)
+        wrong=deepcopy(row);c=wrong['commands'][1]
+        raw=self.consumer_method_output(2)
+        c.update(raw_output=raw,**classify(raw,0,0))
+        with self.assertRaises(ValueError):validate_record(wrong,True)
+
+
+    def test_consumer_budget_is_measured_policy_not_a_success_proxy(self):
+        from cost.cost_consumer import commands
+        lines=['COST CONSUMER BUDGET 600000']
+        for libc in ('musl','glibc'):
+            for i in range(8):
+                name=f'consumer-{libc}-{i}'
+                lines += [f'COST COMMAND BEGIN {name}', 'iozone test complete.',
+                          f'COST RESULT {name} 123', f'COST COMMAND RESULT {name} 1 9']
+        output='\n'.join(lines)+'\n'
+        rows=commands(output,expected_budget_ms=600000)
+        self.assertEqual({r['command_timeout_ms'] for r in rows},{600000})
+        self.assertTrue(all(r['reason']=='timeout' for r in rows))
+        for invalid in (output.replace('600000','180000',1),
+                        output.replace('600000','0',1),
+                        output+'COST CONSUMER BUDGET 600000\n',
+                        output.replace(lines[0]+'\n','')):
+            with self.assertRaises(ValueError): commands(invalid,expected_budget_ms=600000)
+
+
+
+    def test_consumer_per_command_completion(self):
+        from cost.cost_consumer import commands
+        lines=[]
+        for libc in ('musl','glibc'):
+            for i in range(8):
+                n=f'consumer-{libc}-{i}'
+                lines.extend((f'COST COMMAND BEGIN {n}', 'iozone test complete.' if i==0 else 'failed before completion',f'COST RESULT {n} 1',f'COST COMMAND RESULT {n} 0 0'))
+        text='\n'.join(lines)+'\n'
+        rows=commands(text)
+        self.assertEqual(sum(r['outcome']=='completed' for r in rows),2)
+        for broken in (text.replace('COST COMMAND BEGIN consumer-musl-0\n',''),text+'COST COMMAND RESULT consumer-glibc-0 0 0\n'):
+            with self.assertRaises(ValueError): commands(broken)
+
+    def test_partial_consumer_output_keeps_timing_marker(self):
+        from cost.cost_consumer import framed_line
+        marker='COST RESULT consumer-musl-0 180051153900'
+        self.assertEqual(framed_line('            4096       1'+marker),marker)
+        self.assertEqual(framed_line(marker),marker)
+        self.assertEqual(framed_line('iozone ordinary output'),'iozone ordinary output')
+
+    def test_unavailable_selected_test_is_not_acceptance(self):
+        from cost.cost_consumer import classify
+        result=classify('Selected test not available on the version.\niozone test complete.\n',0,0)
+        self.assertTrue(result['process_completed'])
+        self.assertFalse(result['requested_tests_available'])
+        self.assertEqual(result['outcome'],'blocked')
+        self.assertEqual(result['reason'],'selected_tests_unavailable')
+
+    def valid(self):
+        fields = dict(irq_user_prefix_instructions='7',irq_supervisor_prefix_instructions='6',irq_sret_suffix_instructions='11',irq_c_enable_suffix_min_instructions='9',version='1', epoch='3', state='complete', mode='user', owner='2',
+            timebase_hz='10000000', resolution_ns_numerator='1000000000',
+            resolution_ns_denominator='10000000', start_ticks='100', end_ticks='200',
+            storage_bytes='4096', task_bytes='40', overflow='0', inflight='0')
+        for lane in ('foreground', 'background', 'observer'):
+            for name, unit, hist in schema():
+                prefix = lane + '.' + name + '.'
+                fields.update({prefix+'unit':unit, prefix+'value':'0', prefix+'samples':'0', prefix+'max':'0'})
+                if hist:
+                    fields.update({prefix+'bucket.'+str(i):'0' for i in range(65)})
+        return fields
+    def render(self, fields): return ''.join(k+'='+v+'\n' for k,v in fields.items())
+
+    def test_frozen_pre_allocator_schema_is_complete_without_zero_fill(self):
+        current = schema()
+        old = current[:next(i for i, metric in enumerate(current)
+                            if metric[0] == 'page_meta_checked')]
+        fields = self.valid()
+        for lane in ('foreground', 'background', 'observer'):
+            for name, _, _ in current[len(old):]:
+                for key in list(fields):
+                    if key.startswith(lane+'.'+name+'.'):
+                        del fields[key]
+        text = self.render(fields)
+        parsed = parse(text, 3, old)
+        self.assertNotIn('foreground.page_meta_checked.value', parsed)
+        with self.assertRaises(ValueError): parse(text, 3)
+        with self.assertRaises(ValueError): parse(text, 3, old[:-1])
+        del fields['foreground.irq_off_ticks.max']
+        with self.assertRaises(ValueError): parse(self.render(fields), 3, old)
+
+    def test_frozen_pre_raw_schema_is_complete_without_zero_fill(self):
+        current = schema()
+        self.assertIn('raw_wait_ticks', {name for name, _, _ in current})
+        old = current[:next(i for i, metric in enumerate(current) if metric[0] == 'raw_wait_ticks')]
+        fields = self.valid()
+        for lane in ('foreground', 'background', 'observer'):
+            for name, _, _ in current[len(old):]:
+                for key in list(fields):
+                    if key.startswith(lane+'.'+name+'.'): del fields[key]
+        parsed = parse(self.render(fields), 3, old)
+        self.assertNotIn('foreground.raw_wait_ticks.value', parsed)
+        with self.assertRaises(ValueError): parse(self.render(fields), 3)
+        with self.assertRaises(ValueError): parse(self.render(fields), 3, old[:-1])
+
+    def test_frozen_smp_schema_before_retry_counters_remains_complete(self):
+        current=schema()
+        old=current[:next(i for i,metric in enumerate(current) if metric[0]=='journal_resource_retries')]
+        fields=self.valid()
+        for lane in ('foreground','background','observer'):
+            for name,_,_ in current[len(old):]:
+                for key in list(fields):
+                    if key.startswith(lane+'.'+name+'.'):del fields[key]
+        parsed=parse(self.render(fields),3,old)
+        self.assertNotIn('foreground.journal_resource_retries.value',parsed)
+        with self.assertRaises(ValueError):parse(self.render(fields),3)
+        with self.assertRaises(ValueError):parse(self.render(fields),3,old[:-1])
+
+    def test_frozen_pre_smp_registry_keeps_journal_stages_and_retries(self):
+        current=schema()
+        ranks=('lock21_','lock31_','lock32_','lock35_')
+        old=[metric for metric in current if not metric[0].startswith(ranks)]
+        self.assertIn('journal_prepare_ticks',{metric[0] for metric in old})
+        self.assertIn('journal_log_retries',{metric[0] for metric in old})
+        fields=self.valid()
+        for lane in ('foreground','background','observer'):
+            for key in list(fields):
+                if any(key.startswith(lane+'.'+rank) for rank in ranks):del fields[key]
+        parsed=parse(self.render(fields),3,old)
+        self.assertIn('foreground.journal_log_retries.value',parsed)
+        with self.assertRaises(ValueError):parse(self.render(fields),3)
+        with self.assertRaises(ValueError):parse(self.render(fields),3,old[:-1])
+        with self.assertRaises(ValueError):parse(self.render(fields),3,old[::-1])
+
+    def test_replicas_use_the_frozen_kernel_registry(self):
+        from copy import deepcopy
+        current=schema()
+        old=[list(metric) for metric in current[:next(i for i,metric in enumerate(current)
+                                                   if metric[0]=='page_meta_checked')]]
+        rows=self.comparison_records()
+        for row in rows:
+            if not row['cost_diagnostics']:continue
+            row['kernel_build_identity']={'kernel_sha256':row['kernel_sha256'],'metric_schema':old}
+            for snapshot in row['snapshots']:
+                for key in list(snapshot['values']):
+                    if any('.'+metric+'.' in key for metric, _, _ in current[len(old):]):
+                        del snapshot['values'][key]
+        self.assertEqual(len(validate_replicas(rows)),3)
+        bad=deepcopy(rows)
+        target=next(row for row in bad if row['cost_diagnostics'])
+        target['metric_schema']=[list(metric) for metric in current]
+        with self.assertRaises(ValueError):validate_replicas(bad)
+        target['metric_schema']=old
+        target['kernel_build_identity']['kernel_sha256']='wrong'
+        with self.assertRaises(ValueError):validate_replicas(bad)
+        for row in rows:
+            if row['cost_diagnostics']:
+                row['metric_schema']=row['kernel_build_identity'].pop('metric_schema')
+        self.assertEqual(len(validate_replicas(rows)),3)
+
+    def test_allocator_requires_fixed_work_and_preserves_unavailable_metrics(self):
+        from copy import deepcopy
+        from cost.cost_report import validate_allocator
+        timings = {}; snapshots = []; lines = []
+        for epoch, (pages, iterations) in enumerate(((1,1024),(64,64),(4096,4)), 1):
+            name=f'allocator-{pages}-{iterations}'
+            timings[name]=100
+            lines.append(f'COST ALLOCATOR WORK {name} {pages} {iterations} {pages*iterations*90}')
+            lines.append(f'COST CLOSING {name} 5 0')
+            fields=self.valid(); fields['epoch']=str(epoch)
+            for metric, value in [('page_accepted',pages*iterations),('irq_off_ticks',1),
+                                  ('page_meta_checked',1),('page_meta_written',1),('allocator_meta_ticks',1)]:
+                prefix='foreground.'+metric+'.'
+                fields.update({prefix+'value':str(value),prefix+'max':str(value),prefix+'samples':'1'})
+            fields['foreground.irq_off_ticks.bucket.1']='1'
+            snapshots.append({'name':name,'values':parse(self.render(fields),epoch)})
+        raw='\n'.join(lines)+'\n'
+        self.assertTrue(validate_allocator(timings,snapshots,raw,True)['metadata_available'])
+        for broken in (raw+lines[0]+'\n',raw.replace('92160','0'),raw.replace(lines[1]+'\n','')):
+            with self.assertRaises(ValueError): validate_allocator(timings,snapshots,broken,True)
+        old=deepcopy(snapshots)
+        for snapshot in old:
+            for key in list(snapshot['values']):
+                if any('.'+metric+'.' in key for metric in
+                       ('page_meta_checked','page_meta_written','allocator_meta_ticks')):
+                    del snapshot['values'][key]
+        self.assertFalse(validate_allocator(timings,old,raw,True)['metadata_available'])
+        broken=deepcopy(snapshots)
+        broken[0]['values']['foreground.page_meta_checked.value']=0
+        with self.assertRaises(ValueError): validate_allocator(timings,broken,raw,True)
+        with self.assertRaises(ValueError): validate_allocator(timings,snapshots[:-1],raw,True)
+        off='\n'.join(line for line in lines if not line.startswith('COST CLOSING '))+'\n'
+        self.assertFalse(validate_allocator(timings,[],off,False)['metadata_available'])
+    def test_frozen_pre_resize_schema(self):
+        current=schema()
+        old=current[:next(i for i,metric in enumerate(current) if metric[0]=='resize_visits')]
+        self.assertFalse(any(name.startswith('resize_') for name,_,_ in old))
+        fields=self.valid()
+        added={name for name,_,_ in schema()[len(old):]}
+        self.assertTrue({'resize_visits','resize_tail_pages','resize_alias_rearms'} <= added)
+        fields={key:value for key,value in fields.items()
+                if not any(key.startswith(lane+'.'+name+'.')
+                    for lane in ('foreground','background','observer') for name in added)}
+        self.assertEqual(parse(self.render(fields),3,old)['epoch'],3)
+        with self.assertRaises(ValueError):parse(self.render(fields),3)
+
+    def test_frozen_pre_memory_schema(self):
+        current=schema()
+        old=current[:next(i for i,metric in enumerate(current) if metric[0]=='heap_zero_bytes')]
+        self.assertEqual(len(old),203)
+        fields=self.valid()
+        added={name for name,_,_ in schema()[len(old):]}
+        fields={key:value for key,value in fields.items()
+                if not any(key.startswith(lane+'.'+name+'.')
+                    for lane in ('foreground','background','observer') for name in added)}
+        self.assertEqual(parse(self.render(fields),3,old)['epoch'],3)
+        with self.assertRaises(ValueError):parse(self.render(fields),3)
+
+    def test_valid(self): self.assertEqual(parse(self.render(self.valid()), 3)['epoch'], 3)
+    def test_reject_corrupt(self):
+        for key, value in [('version','2'), ('epoch','2'), ('state','incomplete'),
+            ('overflow','1'), ('inflight','1'), ('task_bytes','161'), ('storage_bytes','98305'),
+            ('foreground.operations.unit','bytes'), ('foreground.operations.value','-1'),
+            ('foreground.operation_ticks.samples','1')]:
+            with self.subTest(key=key):
+                fields=self.valid(); fields[key]=value
+                with self.assertRaises(ValueError): parse(self.render(fields), 3)
+    def test_missing_duplicate_unknown(self):
+        text=self.render(self.valid())
+        for broken in (text.replace('epoch=3\n',''),text+'epoch=3\n',text+'madeup=0\n'):
+            with self.assertRaises(ValueError): parse(broken,3)
+    def test_independent_expected(self):
+        snapshot=parse(self.render(self.valid()),3)
+        for expected in ({'foreground.operations.value':128}, {'foreground.run_ticks.value':99}, {'foreground.mprotect_resident_visits.value':8192}, {'foreground.mprotect_pte_visits.value':6}):
+            with self.assertRaises(ValueError): validate_expected(snapshot, expected)
+        snapshot['background.operations.value']=128
+        with self.assertRaises(ValueError): validate_expected(snapshot, {'foreground.operations.value':128})
+    def test_replica_completeness(self):
+        def row(i): return dict(case='write',cost_diagnostics=0,transport='modern',cache='writeback',
+            replica=i,replicas=3,acceptance=True,kernel_sha256='k',elf_sha256='e',
+            source_sha256='s',fixture_sha256=str(i),snapshots=[],timings_ns={'small':1})
+        validate_replicas([row(i) for i in range(3)])
+        for rows in ([row(0)], [row(0),row(0),row(2)], [row(0),row(1),row(2),row(3)]):
+            with self.assertRaises(ValueError): validate_replicas(rows)
+        rows=[row(i) for i in range(3)]; rows[2]['elf_sha256']='changed'
+        with self.assertRaises(ValueError): validate_replicas(rows)
+    def test_impossible_max_and_reused_epoch(self):
+        fields=self.valid();p='foreground.irq_off_ticks.'
+        fields.update({p+'samples':'2',p+'value':'11',p+'max':'3',p+'bucket.2':'1',p+'bucket.4':'1'})
+        with self.assertRaises(ValueError):parse(self.render(fields),3)
+        fields=self.valid();p='foreground.irq_off_ticks.';fields.update({p+'samples':'2',p+'value':'15',p+'max':'8',p+'bucket.2':'1',p+'bucket.4':'1'})
+        with self.assertRaises(ValueError):parse(self.render(fields),3)
+        fields=self.valid();p='foreground.operations.';fields.update({p+'samples':'1',p+'value':'100',p+'max':'1'})
+        with self.assertRaises(ValueError):parse(self.render(fields),3)
+        snap=parse(self.render(self.valid()),3)
+        rows=[dict(case='test',cost_diagnostics=1,transport='modern',cache='writeback',replica=i,replicas=3,acceptance=True,kernel_sha256='k',elf_sha256='e',source_sha256='s',fixture_sha256=str(i),snapshots=[dict(name='first',values=snap),dict(name='second',values=snap)],timings_ns={'first':1,'second':1}) for i in range(3)]
+        with self.assertRaises(ValueError):validate_replicas(rows)
+    def test_deadline_work_tracks_expirations(self):
+        from cost.cost_report import validate_deadline
+        snap=parse(self.render(self.valid()),3)
+        # 到期扫描的工作量必须与到期数一致，不再随无期限阻塞成员增长。
+        for visits,expired in ((0,0),(4,0),(131,4),(4,136)):
+            snap['foreground.deadline_visits.samples']=1 if (visits or expired) else 0
+            snap['foreground.deadline_visits.value']=visits
+            snap['foreground.deadline_visits.max']=visits
+            snap['foreground.deadline_expired.value']=expired
+            with self.assertRaises(ValueError):validate_deadline('deadline-128-0-0',snap)
+        snap['foreground.deadline_visits.value']=136
+        snap['foreground.deadline_expired.value']=136
+        snap['foreground.deadline_visits.max']=136
+        validate_deadline('deadline-128-0-0',snap)
+
+    def test_bucket_intervals(self):
+        bins=[0]*65; bins[0]=1; bins[5]=2; bins[64]=1
+        self.assertEqual(percentile(bins, .5),(16,31))
+        self.assertEqual(percentile(bins,1),(1<<63,(1<<64)-1))
+        self.assertEqual(percentile([0]*65,.5),None)
+
+class FixedMetadataTest(unittest.TestCase):
+    def fixture(self):
+        from cost.cost_report import METADATA_FIXED_WORK
+        rows=['COST METADATA CPUS 2']
+        for name,count in METADATA_FIXED_WORK.items():
+            rows += [f'COST METADATA WORK {name} {count}',
+                     f'COST METADATA LATENCY {name} 10 20 30',
+                     f'COST METADATA RSS {name} 128 256']
+        return '\n'.join(rows), {name:100 for name in METADATA_FIXED_WORK}
+    def test_fixed_work_and_resource_coverage(self):
+        from cost.cost_report import validate_metadata_fixed
+        output,timings=self.fixture()
+        rows=validate_metadata_fixed(output,timings,2)
+        self.assertEqual(rows['metadata-create']['operations'],2048)
+        self.assertEqual(rows['metadata-create']['children_maxrss_kib'],256)
+        validate_resume_selection('metadata',{'metadata_fixed_only':True},None)
+    def test_parallel_work_requires_the_new_fixed_windows(self):
+        from cost.cost_report import validate_metadata_fixed
+        output,timings=self.fixture()
+        with self.assertRaises(ValueError):
+            validate_metadata_fixed(output,timings,2,parallel=True)
+        extra={'metadata-paired-stat':4096,'metadata-paired-open':4096,
+               'metadata-paired-rename':2048,'metadata-paired-append':4096}
+        for name,count in extra.items():
+            output += (f'\nCOST METADATA WORK {name} {count}'
+                       f'\nCOST METADATA LATENCY {name} 10 20 30'
+                       f'\nCOST METADATA RSS {name} 128 256')
+            timings[name]=100
+        rows=validate_metadata_fixed(output,timings,2,parallel=True)
+        self.assertEqual(rows['metadata-paired-append']['operations'],4096)
+        with self.assertRaises(ValueError):
+            validate_metadata_fixed(output,timings,2)
+
+    def test_duplicate_missing_wrong_cpu_and_bad_latency_are_errors(self):
+        from cost.cost_report import validate_metadata_fixed
+        output,timings=self.fixture()
+        for bad in (output+'\nCOST METADATA WORK metadata-create 2048',
+                    output.replace('COST METADATA WORK metadata-create 2048',''),
+                    output.replace('CPUS 2','CPUS 1'),output.replace(' 10 20 30',' 20 10 30'),
+                    output.replace('COST METADATA RSS metadata-create 128 256','')):
+            with self.subTest(output=bad),self.assertRaises(ValueError):
+                validate_metadata_fixed(bad,timings,2)
+        with self.assertRaises(ValueError):validate_metadata_fixed(output,{**timings,'metadata-create':0},2)
+        with self.assertRaises(ValueError):validate_resume_selection('metadata',{'metadata_fixed_only':True,'consumer_command_names':['consumer-musl-1']},None)
+
+    def test_malformed_extra_metadata_record_is_rejected(self):
+        from cost.cost_report import validate_metadata_fixed
+        output,timings=self.fixture()
+        for line in ('COST METADATA WORK metadata-create 2048 junk',
+                     'COST METADATA CPUS 2 junk',
+                     'COST METADATA LATENCY metadata-create 10 20 30 junk',
+                     'COST METADATA RSS metadata-create 128 256 junk'):
+            with self.subTest(line=line),self.assertRaises(ValueError):
+                validate_metadata_fixed(output+'\n'+line,timings,2)
+
+if __name__ == '__main__': unittest.main()

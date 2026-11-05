@@ -40,7 +40,7 @@ jobs:
         run: |
           if [ "$TARGET_ARCH" = riscv ]; then
             make INIT_CONFIG=config/init.json prepare-program-environment
-            python3 -B tests/program-inventory/environment.py --busybox
+            python3 -B tests/userland/inventory/environment.py --busybox
           fi
       - name: Run the declared platform contracts
         if: ${{ !cancelled() && inputs.suite == 'core' && steps.platform.outcome == 'success' }}

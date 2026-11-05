@@ -44,7 +44,7 @@ IPC_INFO 输出当前配置，SHM_INFO 输出真实活跃段数、按客机页�
 
 IPC_STAT 按完整ID检查槽和代次；SHM_STAT/SHM_STAT_ANY按槽索引取得当前对象，返回带当前代次的完整ID。STAT执行访问位与CAP_IPC_OWNER检查，STAT_ANY按Linux提供与`/proc/sysvipc/shm`相同的枚举可见性。段表在既有CPU0控制位置受保护，查询先取得有界结构快照，用户复制在保护外完成；复制期间原段删除不会改变这次快照，短复制保留实际输出并返回EFAULT。
 
-SHM_LOCK/UNLOCK的真实UID账户、MEMLOCK和延迟归还见[MM模块](kernel-mm.md#madvise-与共享段锁定)。查询直接消费者为`tests/workloads/resource/shm_query.c`，宿主4/16 KiB页检查与锁定回归共用`tests/shm-lock-host.sh`。
+SHM_LOCK/UNLOCK的真实UID账户、MEMLOCK和延迟归还见[MM模块](kernel-mm.md#madvise-与共享段锁定)。查询直接消费者为`tests/workloads/resource/shm_query.c`，宿主4/16 KiB页检查与锁定回归共用`tests/host/shm-lock.sh`。
 
 ## VMA 与架构集成
 

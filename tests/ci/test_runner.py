@@ -144,10 +144,10 @@ class ArchitectureCoverage(unittest.TestCase):
             '--arch', 'loongarch', '--suite', 'smp', '--list'], capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
 
-    def test_host_runs_matched_measurement_contracts_without_privileged_campaign(self):
+    def test_host_checks_cost_tools_without_booting_guest(self):
         commands = [arg for case in self.plan('host', 'host') for arg in case['argv']]
-        self.assertIn('test-cost-match-host', commands)
-        self.assertNotIn('test-cost-match-riscv', commands)
+        self.assertIn('test-cost-tools-host', commands)
+        self.assertNotIn('test-cost-riscv', commands)
 
     def test_user_smp_has_an_independent_result_suite(self):
         commands=[argument for case in self.plan('riscv','user-smp') for argument in case['argv']]

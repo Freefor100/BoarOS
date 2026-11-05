@@ -23,7 +23,7 @@ def digest(path):
 def probe(binary):
     environment = os.environ.copy()
     environment['BOAROS_UNSHARE'] = str(binary)
-    command = [sys.executable, '-B', str(ROOT / 'tests/network-external.py'), '--host-probe']
+    command = [sys.executable, '-B', str(ROOT / 'tests/userland/network-external.py'), '--host-probe']
     with subprocess.Popen(command, cwd=ROOT, env=environment, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, text=True, start_new_session=True) as process:
         try:

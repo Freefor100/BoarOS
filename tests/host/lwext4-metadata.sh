@@ -1,0 +1,139 @@
+#!/bin/sh
+set -eu
+case "${1:-all}" in all|ownership|truncate|extent|prepend|extent-lookup) ;; *) echo 'usage: lwext4-metadata.sh [all|ownership|truncate|extent|prepend|extent-lookup]' >&2; exit 2;; esac
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT HUP INT TERM
+check_fs() {
+    e2fsck -fn "$1" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log"; exit 1; }
+}
+${HOST_CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror \
+    -Wno-unused-but-set-variable -Wno-stringop-truncation \
+    -DBOAROS_MAX_CPUS=2 -DCONFIG_USE_DEFAULT_CFG=1 -DCONFIG_USE_USER_MALLOC=1 -DCONFIG_DEBUG_ASSERT=0 \
+    -DTEST_RANGE_WORK_COUNTERS=1 -Wl,--wrap=ext4_crc32c -Wl,--wrap=ext4_fs_get_inode_dblk_range -Wl,--wrap=ext4_trans_block_get \
+    -include "$root/tests/host/lwext4_memory.h" \
+    -I"$root/third_party/lwext4/include" -idirafter "$root/include" \
+    "$root"/third_party/lwext4/src/*.c "$root/tests/host/lwext4_metadata.c" \
+    "$root/tests/host/block_fault.c" "$root/kernel/block.c" "$root/tests/host/block_runtime.c" "$root/kernel/raw_lock.c" "$root/tests/host/sync/notifications.c" -I"$root/tests/host/block_model" -pthread -o "$work/probe"
+for block in 1024 4096; do
+    for inode in 128 256; do
+        truncate -s 32M "$work/base.img"
+        mkfs.ext4 -q -F -b "$block" -I "$inode" "$work/base.img"
+        overhead=$(dumpe2fs -h "$work/base.img" 2>/dev/null | sed -n 's/^Overhead clusters:[[:space:]]*//p')
+        "$work/probe" "$work/base.img" seed
+        if [ "${1:-all}" = all ] || [ "${1:-all}" = extent ] || [ "${1:-all}" = extent-lookup ]; then
+            cp "$work/base.img" "$work/test.img"
+            "$work/probe" "$work/test.img" extent-lookup
+            check_fs "$work/test.img"
+        fi
+        if [ "${1:-all}" = extent-lookup ]; then continue; fi
+        if [ "${1:-all}" = all ] || [ "${1:-all}" = extent ] || [ "${1:-all}" = prepend ]; then
+            for mode in extent-prepend extent-prepend-group extent-prepend-tree extent-prepend-tree-group; do
+                cp "$work/base.img" "$work/test.img"
+                "$work/probe" "$work/test.img" "$mode"
+                check_fs "$work/test.img"
+            done
+            printf 'PASS: extent prepend block=%s inode=%s; inline/tree mappings, grouped/sync truncate and e2fsck\n' "$block" "$inode"
+        fi
+        if [ "${1:-all}" = prepend ]; then continue; fi
+        if [ "${1:-all}" = all ] || [ "${1:-all}" = extent ]; then
+            cp "$work/base.img" "$work/test.img"
+            "$work/probe" "$work/test.img" extent-range
+            check_fs "$work/test.img"
+            cp "$work/base.img" "$work/test.img"
+            attempts=$("$work/probe" "$work/test.img" extent-read-oom)
+            point=1
+            while [ "$point" -le "$attempts" ]; do
+                cp "$work/base.img" "$work/test.img"
+                "$work/probe" "$work/test.img" extent-read-oom "$point" > /dev/null
+                check_fs "$work/test.img"
+                point=$((point+1))
+            done
+            cp "$work/base.img" "$work/test.img"
+            "$work/probe" "$work/test.img" extent-read-error > /dev/null
+            check_fs "$work/test.img"
+            printf 'PASS: extent read block=%s inode=%s allocations=%s; OOM/read errors and owners\n' "$block" "$inode" "$attempts"
+        fi
+        if [ "${1:-all}" = extent ]; then continue; fi
+        modes="owner owner-ro owner-shared owner-shared-unlink truncate-shared"
+        if [ "${1:-all}" = truncate ]; then modes="truncate-shared"; fi
+        for mode in $modes; do
+            cp "$work/base.img" "$work/test.img"
+            "$work/probe" "$work/test.img" "$mode" "$overhead"
+            check_fs "$work/test.img"
+            if [ "$mode" = truncate-shared ]; then "$work/probe" "$work/test.img" verify-truncate-shared; fi
+            if [ "$mode" = owner ]; then "$work/probe" "$work/test.img" verify-owner; fi
+        done
+        if [ "${1:-all}" = truncate ]; then continue; fi
+        cp "$work/base.img" "$work/test.img"
+        attempts=$("$work/probe" "$work/test.img" oom-owner "$overhead")
+        point=1
+        while [ "$point" -le "$attempts" ]; do
+            cp "$work/base.img" "$work/test.img"
+            "$work/probe" "$work/test.img" oom-owner "$overhead" "$point" > /dev/null
+            check_fs "$work/test.img"
+            point=$((point+1))
+        done
+        printf 'PASS: owner block=%s inode=%s allocations=%s\n' "$block" "$inode" "$attempts"
+        for mode in write-owner flush-owner; do
+            cp "$work/base.img" "$work/test.img"
+            "$work/probe" "$work/test.img" "$mode" "$overhead"
+            "$work/probe" "$work/test.img" verify-owner-error
+            "$work/probe" "$work/test.img" verify-owner-error
+            check_fs "$work/test.img"
+        done
+        if [ "${1:-all}" = ownership ]; then continue; fi
+        for mode in times readonly stats stats-ro unrelated read-stats; do
+            cp "$work/base.img" "$work/test.img"
+            "$work/probe" "$work/test.img" "$mode" "$overhead"
+            check_fs "$work/test.img"
+        done
+        for mode in write-times flush-times; do
+            cp "$work/base.img" "$work/test.img"
+            "$work/probe" "$work/test.img" "$mode" "$overhead"
+            "$work/probe" "$work/test.img" verify-times
+            "$work/probe" "$work/test.img" verify-times
+            check_fs "$work/test.img"
+        done
+        for damage in geometry free journal location checksum; do
+            cp "$work/base.img" "$work/test.img"
+            "$work/probe" "$work/test.img" corrupt "$damage"
+        done
+        for mode in oom-times oom-stats; do
+            cp "$work/base.img" "$work/test.img"
+            attempts=$("$work/probe" "$work/test.img" "$mode" "$overhead")
+            point=1
+            while [ "$point" -le "$attempts" ]; do
+                cp "$work/base.img" "$work/test.img"
+                "$work/probe" "$work/test.img" "$mode" "$overhead" "$point" > /dev/null
+                check_fs "$work/test.img"
+                point=$((point+1))
+            done
+            printf 'PASS: %s block=%s inode=%s allocations=%s\n' "$mode" "$block" "$inode" "$attempts"
+        done
+        printf 'PASS: metadata block=%s inode=%s\n' "$block" "$inode"
+    done
+done
+if [ "${1:-all}" != all ]; then exit 0; fi
+truncate -s 8193K "$work/base.img"
+mkfs.ext4 -q -F -b 1024 -O '^has_journal' "$work/base.img"
+overhead=$(dumpe2fs -h "$work/base.img" 2>/dev/null | sed -n 's/^Overhead clusters:[[:space:]]*//p')
+# mke2fs rounds this size down; adding one block fills group 0 exactly after
+# first_data_block. It must not manufacture an empty second descriptor group.
+resize2fs -f "$work/base.img" 8193 > "$work/resize.log" 2>&1
+"$work/probe" "$work/base.img" seed
+"$work/probe" "$work/base.img" stats "$overhead"
+check_fs "$work/base.img"
+printf 'PASS: geometry first_data_block at exact group boundary\n'
+for features in 'meta_bg,^resize_inode' 'sparse_super2' '^metadata_csum,uninit_bg' '^has_journal'; do
+    truncate -s 64M "$work/base.img"
+    mkfs.ext4 -q -F -b 1024 -g 1024 -O "$features" "$work/base.img"
+    overhead=$(dumpe2fs -h "$work/base.img" 2>/dev/null | sed -n 's/^Overhead clusters:[[:space:]]*//p')
+    "$work/probe" "$work/base.img" seed
+    for mode in stats stats-ro; do
+        cp "$work/base.img" "$work/test.img"
+        "$work/probe" "$work/test.img" "$mode" "$overhead"
+        check_fs "$work/test.img"
+    done
+    printf 'PASS: geometry %s\n' "$features"
+done

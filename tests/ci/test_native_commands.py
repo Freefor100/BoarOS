@@ -83,7 +83,7 @@ class NativeCommands(unittest.TestCase):
             result = subprocess.run([*command, 'test-sqlite-rollback-riscv'],
                 cwd=ROOT, capture_output=True, text=True, check=True)
             lines = result.stdout.replace('\\\n', '').splitlines()
-            recipe = next(line for line in lines if './tests/sqlite-rollback-riscv.sh' in line)
+            recipe = next(line for line in lines if './tests/riscv/sqlite-rollback.sh' in line)
             env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'], HOST_PYTHON=sys.executable)
             observed = subprocess.run(['sh', '-c', recipe], cwd=ROOT, env=env,
                                       capture_output=True, text=True, check=True)

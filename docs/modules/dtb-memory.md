@@ -15,7 +15,7 @@
 | `kernel/main.c` | 加入内核与 DTB 占用，输出启动布局诊断 |
 | `tests/riscv/dtb_main.c` | 用合成 DTB 验证格式、状态和输出契约 |
 | `tests/riscv/boot_memory_cases.c` | 验证区间裁剪、排序、合并与相减 |
-| `tests/dtb-riscv.sh`、`tests/boot-riscv.sh` | 运行聚焦测试和真实 QEMU 启动测试 |
+| `tests/riscv/dtb.sh`、`tests/riscv/boot.sh` | 运行聚焦测试和真实 QEMU 启动测试 |
 
 `dtb_read_boot_info` 成功时写出第一段非空 RAM、header 的 `total_size`、根节点直属 `/cpus/timebase-frequency`、`/chosen/rng-seed` 的前 32 字节（若存在且长度至少 32），以及 memory reservation block 和静态 `/reserved-memory/*/reg` 中的非空区间。两种保留区来源合计最多 16 项；超限返回 `DTB_STATUS_UNSUPPORTED`。缺少 `rng-seed` 不影响 DTB 成功，调用者据 `rng_seed_size == 0` 选择安全降级；长度不足返回 `DTB_STATUS_UNSUPPORTED`，重复属性返回 `DTB_STATUS_INVALID`。任何失败都不修改输出。
 

@@ -1,6 +1,6 @@
 # 用户程序构建环境
 
-`tests/program-inventory/environment.py` 为完整上游程序准备 RISC-V Linux
+`tests/userland/inventory/environment.py` 为完整上游程序准备 RISC-V Linux
 UAPI 与现有 musl 1.2.5 工具链。它不修改 BusyBox 源码或关闭 applet，
 也不把宿主 glibc 头加入交叉编译器搜索路径。
 
@@ -115,7 +115,7 @@ runner 从同一稀疏 ext4 fixture 建立 Linux 与 BoarOS 的独立原始镜�
 原版 libc-test `functional/socket.c` 的静态和动态 entry 可单独验收：
 
 ```sh
-python3 tests/program-inventory/run.py --suite libc \
+python3 tests/userland/inventory/run.py --suite libc \
   --case libc.static.socket --case libc.dynamic.socket \
   --require-pass --output build/socket-program-check
 ```
@@ -171,7 +171,7 @@ RV2.44与LA2.42版本差异不参与跨架构数值比较，probe版本断言由
 `libc_build.py` 的固定 libc-test，再经 `suites.run_suite()` 逐例启动两侧 QEMU。
 `--reuse-builds` 显式复用已核验的 revision 和 ELF/DSO 校验值；默认重新构建。
 `--case`、`--suite` 缩小运行集合；`--require-pass` 对本次所选集合要求每项完成且通过，未选项保持历史结果或 `not-run`。未指定 `--case` 时全量 228 项均需完成且通过。执行状态保存本次 `selection`，恢复运行可改变集合而不把未选项伪装成通过；runner 中断、环境错误、参考侧失败与未知案例仍为失败。
-`--output` 指定本次核对目录，默认 `build/program-inventory-full`。运行期间默认在每个案例结果、日志、输出及其目录完成 `fsync` 后删除已通过案例的三份可重建磁盘；失败案例磁盘和 suite 基础 fixture 暂存，以便当轮诊断。诊断时可用 `--keep-pass-images` 保留新执行案例的全部磁盘。核对后用 `python3 tests/prune-build.py` 预览、`make prune-build` 清理整个一次性运行目录和旧缓存。
+`--output` 指定本次核对目录，默认 `build/program-inventory-full`。运行期间默认在每个案例结果、日志、输出及其目录完成 `fsync` 后删除已通过案例的三份可重建磁盘；失败案例磁盘和 suite 基础 fixture 暂存，以便当轮诊断。诊断时可用 `--keep-pass-images` 保留新执行案例的全部磁盘。核对后用 `python3 tests/tools/prune-build.py` 预览、`make prune-build` 清理整个一次性运行目录和旧缓存。
 
 suite identity 包含程序/驱动/内核/执行器/校验器身份、QEMU 与磁盘工具身份和超时配置。
 镜像由同一 fixture 独立复制；每例持久化结果后才继续。中断留下显式未运行项；恢复前核对完整
@@ -197,7 +197,7 @@ contract和wait status比较，保留原输出及raw_output_equal；日期、内
 ## 原版 Lua 工程
 
 固定Lua5.4.3（MIT）与GNU make4.4.1-r3，GCC14.2.0-r6及Alpine依赖保持原包。
-`tests/offline-c-riscv.py --project lua`使用原Lua构建规则和默认FIFO jobserver；
+`tests/userland/offline-c.py --project lua`使用原Lua构建规则和默认FIFO jobserver；
 `make test-offline-project-riscv`执行干净-j1、无变化、单源增量、clean重建、语法错误与
 恢复、-j2及产物运行。Lua/luac、静态库嵌入及C共享模块由客体原GCC生成和实际执行。
 递归jobserver另用共享计数核对两份资格和令牌归还，中断后检查子进程与临时FIFO清理。
@@ -211,7 +211,7 @@ contract和wait status比较，保留原输出及raw_output_equal；日期、内
 
 ## LA 与 RV 共用真实程序清单
 
-`tests/program-inventory/{libc_build,run,suites}.py --arch loongarch` 使用同一固定
+`tests/userland/inventory/{libc_build,run,suites}.py --arch loongarch` 使用同一固定
 BusyBox/libc-test 案例、原包装脚本、输出校验和失败分类。LA BusyBox 保留原398个
 applets/配置，用整数静态 musl；libc-test 用原 LP64D musl 1.2.5 构建全部
 107 静态、110 动态 entry 和两个原包装器，链接页对齐16KiB、解释器为
@@ -226,8 +226,8 @@ applets/配置，用整数静态 musl；libc-test 用原 LP64D musl 1.2.5 构建
 
 ```sh
 make prepare-la-tools prepare-la-linux-platform prepare-la-userland prepare-la-dynamic
-python3 -B tests/program-inventory/libc_build.py --arch loongarch --jobs 8 --uapi-include build/loongarch/uapi/include
-python3 -B tests/program-inventory/run.py --arch loongarch --reuse-builds --require-pass --output build/loongarch/inventory-check
+python3 -B tests/userland/inventory/libc_build.py --arch loongarch --jobs 8 --uapi-include build/loongarch/uapi/include
+python3 -B tests/userland/inventory/run.py --arch loongarch --reuse-builds --require-pass --output build/loongarch/inventory-check
 ```
 
 运行期间冻结工具缓存，避免重链接导致短暂不可执行。runner-error 不是用户程序
@@ -237,4 +237,4 @@ python3 -B tests/program-inventory/run.py --arch loongarch --reuse-builds --requ
 LA完整inventory/ABI/SQLite/RTC运行目录由既有 `make prune-build` 统一清理；LA
 program-libc源码/ELF、LP64D运行时、GNU程序、Linux及原版/派生QEMU缓存保留。
 GNU临时run目录、磁盘和构建日志清理，不以被忽略的运行目录作为永久档案。
-`python3 -B tests/test-prune-build.py` 独立保护这项缓存/运行产物选择契约。
+`python3 -B tests/tools/test-prune-build.py` 独立保护这项缓存/运行产物选择契约。

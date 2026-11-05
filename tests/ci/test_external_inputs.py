@@ -22,7 +22,7 @@ class NamespaceSetup(unittest.TestCase):
              os.fdopen(ready_write, 'wb', buffering=0) as publish, \
              tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            script = root / 'tests/network-external.py'
+            script = root / 'tests/userland/network-external.py'
             script.parent.mkdir()
             script.write_text('import os,time\nchild=os.fork()\nif child==0:\n time.sleep(30)\n os._exit(0)\n'
                               'os.write(int(os.environ["READY_FD"]),str(child).encode()+b"\\n")\ntime.sleep(30)\n')

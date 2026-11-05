@@ -12,8 +12,8 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'tests'))
-import network_runner
-import rng_runner
+from userland import run as network_runner
+from userland import rng as rng_runner
 
 
 class MemoryProfiles(unittest.TestCase):
@@ -63,7 +63,7 @@ class MemoryProfiles(unittest.TestCase):
             self.assertEqual(len(rows), 16)
 
     def test_environment_rejects_invalid_memory_before_preparation(self):
-        result = subprocess.run(['sh', str(ROOT / 'tests/environment-riscv.sh')],
+        result = subprocess.run(['sh', str(ROOT / 'tests/riscv/environment.sh')],
                                 env={**os.environ, 'QEMU_MEMORY': 'invalid'}, capture_output=True, text=True)
         self.assertEqual(result.returncode, 2)
         self.assertIn('QEMU_MEMORY must be', result.stderr)

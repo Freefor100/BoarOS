@@ -29,14 +29,14 @@ jobs:
         run: python3 -B tests/ci/firmware.py --github-env
       - name: Prepare unchanged programs and user SMP kernel
         run: |
-          python3 -B tests/program-inventory/run.py --arch riscv --build-only
+          python3 -B tests/userland/inventory/run.py --arch riscv --build-only
           make INIT_CONFIG=config/init.json kernel-rv-user-smp
       - name: Run one independent strict profile
         env:
           TEST_CPUS: ${{ matrix.cpus }}
           TEST_MEMORY: ${{ matrix.memory }}
         run: |
-          python3 -B tests/program-inventory/run.py --execution-profile rv-user-smp \
+          python3 -B tests/userland/inventory/run.py --execution-profile rv-user-smp \
             --cpus "$TEST_CPUS" --memory "$TEST_MEMORY" --reuse-builds --require-pass \
             --firmware "$QEMU_RISCV_FIRMWARE" --output build/riscv-user-smp/programs-ci
       - name: Preserve complete per-case observations
@@ -79,7 +79,7 @@ jobs:
             make INIT_CONFIG=config/init.json prepare-program-environment
             python3 -B tests/network_inputs.py
           fi
-          python3 -B tests/program-inventory/run.py --arch "$TARGET_ARCH" --build-only
+          python3 -B tests/userland/inventory/run.py --arch "$TARGET_ARCH" --build-only
           python3 -B tests/ci/netns.py --configure-apparmor --github-env
       - name: Build the general fixture kernel
         env:
