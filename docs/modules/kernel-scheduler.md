@@ -45,7 +45,7 @@ RV、LA 复用同一调度器：每个 READY 任务只登记在一个 CPU 队列
 | `fs/files/table.c`、`mm/heap.c`、`kernel/physical_page.c` | FD查找后实际I/O、内核堆及页借还 | 每FD表、heap及物理分配器各有自己的短锁；它们不是同一把调度锁 |
 | `kernel/block.c`、`drivers/virtio/block.c`、`arch/{riscv,loongarch}/` | 调用核提交块请求，本地timer/IPI与架构状态 | 每设备队列与完成状态协调，设备IRQ由CPU0处理；当前单virtqueue，FLUSH/RMW保持实际顺序 |
 
-`tests/smp/system.py` 组合现有计算、信号、futex/MQ、文件、管道、poll/epoll、eventfd/timerfd、INET/UNIX 和新增 MM/进程消费者，共 27 个窗口。固定总工作量及实际 affinity 分别核对；timerfd 周期窗口报告到期迟到、累计次数和 CPU，不把固定期限当作吞吐加速。该覆盖检查共享机制和代表性使用者，具体业务的控制、错误和生命周期仍由各模块短例验证。
+真实多核用户执行由 `tests/smp/user.py`、`tests/loongarch/smp.py` 检查；共同固定工作量程序位于 `tests/cost/workloads/smp_scale.c`，管道、事件和网络消费者保留各自性能入口。按当前问题选择组合，核对总工作量、实际 affinity 和资源归还；周期定时器按迟到、累计次数和 CPU 评价。
 
 同一消息链的先收后发、同一打开文件的位置、PIPE_BUF接纳、同一信号的单次消费，以及页表撤权和持久化顺序存在真实依赖。能够减少的是交接次数、临界段工作、重复状态查询和无关对象之间的排队。独立对象被一把全局业务锁绑定、整个操作迁移CPU0、反复获取同一资格，是实现边界，不是这些接口的必要语义。
 
@@ -171,7 +171,7 @@ RTTIME对每线程连续RT执行计量。各CPU的timer tick仅在当前用户�
 
 `make test-sched-concurrency-host`直接执行生产策略/选择/等待交接，在2/4线程握手中验证唯一执行owner、旧栈交接及IRQ恢复；保护CPU独立记账和公开策略入口的同域修改。该证据不替代客户机多核。
 
-确定性 host 测试 `tests/host/sched_{policy,runqueue,syscall}_test.c` 覆盖预算、排队、ABI 和随机队列模型。`tests/diff-abi/sched_policy.c` 的 23 条同 ELF Linux 对照覆盖参数及真实 FIFO/yield/更高优先级抢占/RR轮转；`sched_stat.c` 另有5条策略stat和STOPPED/zombie wchan对照。`tests/sched-bandwidth-riscv.sh` 使用真实 FIFO 忙循环验证耗尽、OTHER 进展、周期恢复、同值写不补预算和 -1 切换保留消费；500us/250us 场景先等待新 coarse tick，再检查8ms以内被抢占并报告实际超出量。RR 在高优先级任务运行60ms后仍只剩约40ms，能检出错误重装100ms的实现。两个先阻塞后赋RR策略的子进程由同一pipe write唤醒，在100ms quota/300ms period下验证同时到期仍把CPU交给同级peer；旧队首重排已由该测试复现失败。该测试直接调用 SYS_sched_setscheduler，固定 musl 的同名包装函数是 ENOSYS 存根。测试用 guest monotonic 计时，不由 QEMU 墙钟速度推断调度正确性。
+确定性 host 测试 `tests/host/sched_{policy,runqueue,syscall}_test.c` 覆盖预算、排队、ABI 和随机队列模型。`tests/diff-abi/sched_policy.c` 的 23 条同 ELF Linux 对照覆盖参数及真实 FIFO/yield/更高优先级抢占/RR轮转；`sched_stat.c` 另有5条策略stat和STOPPED/zombie wchan对照。`tests/riscv/sched-bandwidth.sh` 使用真实 FIFO 忙循环验证耗尽、OTHER 进展、周期恢复、同值写不补预算和 -1 切换保留消费；500us/250us 场景先等待新 coarse tick，再检查8ms以内被抢占并报告实际超出量。RR 在高优先级任务运行60ms后仍只剩约40ms，能检出错误重装100ms的实现。两个先阻塞后赋RR策略的子进程由同一pipe write唤醒，在100ms quota/300ms period下验证同时到期仍把CPU交给同级peer；旧队首重排已由该测试复现失败。该测试直接调用 SYS_sched_setscheduler，固定 musl 的同名包装函数是 ENOSYS 存根。测试用 guest monotonic 计时，不由 QEMU 墙钟速度推断调度正确性。
 
 `getcpu(168)` 在调用者执行位置返回实际逻辑 CPU，单 NUMA 节点编号为0；两个可选输出独立复制，后一个 fault 保留已完成前缀，第三个缓存参数按 Linux 忽略。
 
@@ -343,7 +343,7 @@ RV/LA 的 futex(98) 接受 LOCK_PI、TRYLOCK_PI、UNLOCK_PI 和 LOCK_PI2。未�
 
 `kernel_wait_prepare` 在实际队列保护内登记；无事件队列时只处理调用者的 token。桶操作先完成比较，再沿同一登记函数发布，不保留依赖共同调度锁的另一份 prepare 入口。首次 CPU 记账初始化单独保留为冷函数，常规 trap 与用户返回只处理已绑定的执行片段。
 
-`make test-pi-priority-host` 检查 4/16 KiB 下实际队列、CPU0 服务资格、RT 节流及链式传播；`tests/workloads/futex/pi.c` 检查原始字、libc robust mutex、超时／信号、优先级倒置、环、共享别名及退出修复故障。`tests/network_runner.py --workload pi` 复用两架构 Linux 对照，`--libc glibc` 使用现有目标静态工具链。
+`make test-pi-priority-host` 检查 4/16 KiB 下实际队列、CPU0 服务资格、RT 节流及链式传播；`tests/workloads/futex/pi.c` 检查原始字、libc robust mutex、超时／信号、优先级倒置、环、共享别名及退出修复故障。`tests/userland/run.py --workload pi` 复用两架构 Linux 对照，`--libc glibc` 使用现有目标静态工具链。
 
 ## 退出与 exec
 
@@ -354,7 +354,7 @@ BoarOS 的 PID 1 最终退出启动整机收口：cleanup worker 保存它的完
 再停止网络与存储 worker、卸载根盘及检查内存基线。内核 worker 在用户 I/O owner
 释放之前继续服务；不强制卸载活引用，也不按 daemon 名称清理。只在关机阶段枚举
 现有任务表，等待仍复用 cleanup 队列，不轮询忙等。实际子进程、STOPPED、组长先
-退出与关机中 fork 的回归为 `python3 -B tests/root-shutdown-riscv.py`；先用通用
+退出与关机中 fork 的回归为 `python3 -B tests/riscv/root-shutdown.py`；先用通用
 `INIT_CONFIG=config/init.json` 构建。根因与旧基线反例见[收口记录](../learning/threads-and-futex.md#pid-1-关机与存活后台-owner2026-10-06)。
 
 组长先退出进入 GROUP_DEAD，保留进程容器；普通成员资源清理成功后从组环移除并回卷时间。最后一个成员结束后，组长才成为唯一进程退出对象，向父进程产生一次 zombie/SIGCHLD。SIGCHLD 显式忽略或 NOCLDWAIT 的自动回收仍遵循信号模块契约。
@@ -393,7 +393,7 @@ LA生产任务也沿现有内核栈窗口接口运行：PGDH共享骨架持有�
 按SP下方字节定位槽位。用户PGDL切换不改PGDH，回收先撤叶/TLB同步再归还栈。
 该硬件保护和映射失败/骨架OOM回滚由`test-stack-guard-loongarch`验证。
 
-`make test-stack-usage` 强制重建隔离的生产对象，编译器 `-fstack-usage` 产出逐函数记录；host probe 从实际栈配置和 Trap Frame 头计算容量、guard、汇编 Frame 与余量预算，避免测试大栈或旧报告污染门禁。`tests/stack-usage.py` 拒绝超出“栈容量减 16 字节、288 字节汇编 Trap Frame、1024 字节余量”的单帧及无界动态栈；该检查不能证明完整调用链。真实 root-init、静态 musl 与动态 pthread 测试另要求已退出任务的最小实测余量至少 1024 字节，不足时必须扩大栈后重新运行。Canary 用于发现破坏，填充测量用于观察高水位；生产栈的未映射 guard 只对经窗口 VA 的 SP 式越界生效，direct-map 别名仍可达同一批物理页，且二者都不证明未执行分支的栈界。idle/boot 栈仍在 .bss 高半区别名内，没有 guard。ASID 0 的切换刷新成本、OTHER 的 100 Hz tick 与线性 wait4 仍存在。
+`make test-stack-usage` 强制重建隔离的生产对象，编译器 `-fstack-usage` 产出逐函数记录；host probe 从实际栈配置和 Trap Frame 头计算容量、guard、汇编 Frame 与余量预算，避免测试大栈或旧报告污染门禁。`tests/tools/stack-usage.py` 拒绝超出“栈容量减 16 字节、288 字节汇编 Trap Frame、1024 字节余量”的单帧及无界动态栈；该检查不能证明完整调用链。真实 root-init、静态 musl 与动态 pthread 测试另要求已退出任务的最小实测余量至少 1024 字节，不足时必须扩大栈后重新运行。Canary 用于发现破坏，填充测量用于观察高水位；生产栈的未映射 guard 只对经窗口 VA 的 SP 式越界生效，direct-map 别名仍可达同一批物理页，且二者都不证明未执行分支的栈界。idle/boot 栈仍在 .bss 高半区别名内，没有 guard。ASID 0 的切换刷新成本、OTHER 的 100 Hz tick 与线性 wait4 仍存在。
 
 futex 的直接宿主入口 `make test-futex-host` 运行真实 MM、park、桶锁和原子操作，覆盖 4/16 KiB pin、MM gate 被另一执行者持有时 private 操作继续完成、关闭新许可后的等待与撤权、冷页和 COW、同桶/跨桶与同 key requeue、六种有符号比较、bitset、短链单次调度锁通知、同桶碰撞与 17 节点游标续批、PREPARED/COMMITTED 通知及 owner 归还；`tests/workloads/futex/caller.c` 可在 Linux 与两种架构上运行相同用户探针。
 
@@ -429,7 +429,7 @@ RV普通用户任务、共享匿名/文件MM及ext4文件操作支持真实1～8
 
 `test-scheduler-cases-riscv` 验证任务数、活动负载、空闲等待衰减及不可中断等待增长，末引用释放回到页基线；`test-io-sleep-riscv` 覆盖 worker 构造 OOM 与退出清理。
 
-身份对象独立契约验证：`cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude tests/pid-object-host.c kernel/pid.c -o /tmp/boaros-pid-object-test && /tmp/boaros-pid-object-test`；覆盖角色转移、最后成员与 pin 分离、编号复用后的新代次、容量与代次耗尽回滚。调度组合验证沿用 `make test-scheduler-cases-riscv test-scheduler-riscv` 与 `make test-userland-riscv`。
+身份对象独立契约验证：`cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude tests/host/pid-object.c kernel/pid.c -o /tmp/boaros-pid-object-test && /tmp/boaros-pid-object-test`；覆盖角色转移、最后成员与 pin 分离、编号复用后的新代次、容量与代次耗尽回滚。调度组合验证沿用 `make test-scheduler-cases-riscv test-scheduler-riscv` 与 `make test-userland-riscv`。
 
 真实消费者的独立调用链诊断见 [session-consumers](../learning/session-consumers.md)：
 固定 BusyBox setsid/chrt/taskset、musl daemon 和原 iperf3/cyclictest，

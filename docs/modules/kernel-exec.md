@@ -94,9 +94,9 @@ make test-riscv
 
 动态 ET_DYN/解释器的生产构造已经接入；真实 userland runner 已验证动态 musl PIE、解释器、额外 DSO、初始 TLS 和运行中 dlopen TLS。固定 glibc 2.44 的静态、动态、PIE、静态 PIE 与 pthread/TLS/信号组合另由 `test-glibc-riscv` 双侧验证。更广重定位矩阵留待后续；LA原版动态musl/初始及late DSO TLS已双侧验证。有效参数的指针表及 auxv 也计入 128 KiB 序列化限制，超限返回 E2BIG，构造不发布新 MM、也不执行 CLOEXEC；`test-elf-boundary-riscv/loongarch` 对照失败后 PID、数据及 CLOEXEC owner 保持。128 KiB 是当前序列化初始栈镜像限制，不是完整 Linux `ARG_MAX` 策略。
 
-`python3 tests/network_runner.py --workload execveat --arch riscv --cpus 1 --memory 512M --kernel <kernel> --output <目录>` 运行原版 musl ELF 的 Linux/BoarOS 对照；`--arch loongarch` 使用 LA 后端。用例检查路径与 fd 身份、错误先后、argv/envp/auxv、CLOEXEC、解释器、当前权限、noexec、写入排斥、非组长 exec、set-ID/filecap、NNP、nosuid 和 unsafe CLONE_FS。
+`python3 tests/userland/run.py --workload execveat --arch riscv --cpus 1 --memory 512M --kernel <kernel> --output <目录>` 运行原版 musl ELF 的 Linux/BoarOS 对照；`--arch loongarch` 使用 LA 后端。用例检查路径与 fd 身份、错误先后、argv/envp/auxv、CLOEXEC、解释器、当前权限、noexec、写入排斥、非组长 exec、set-ID/filecap、NNP、nosuid 和 unsafe CLONE_FS。
 
-凭据规则的宿主直接反例使用 `sh tests/credentials-host.sh`，覆盖 4/16 KiB 页配置和候选／账户归还。`tests/workloads/credentials/exec.c` 用同一真实 ELF 检查 set-ID、filecap、auxv、安全加载、失败 exec、非组长 exec、CLONE_FS、CLOEXEC 与权限清除；`tests/credentials-fixture.py` 向独立 ext4 测试盘写入数字 UID/GID 和固定 EA 样本，并读回校验。固定 Linux 对照须启用 `CONFIG_EXT4_FS_SECURITY`，否则 ext4 不提供文件 capability 属性。
+凭据规则的宿主直接反例使用 `sh tests/host/credentials.sh`，覆盖 4/16 KiB 页配置和候选／账户归还。`tests/workloads/credentials/exec.c` 用同一真实 ELF 检查 set-ID、filecap、auxv、安全加载、失败 exec、非组长 exec、CLONE_FS、CLOEXEC 与权限清除；`tests/userland/credentials-fixture.py` 向独立 ext4 测试盘写入数字 UID/GID 和固定 EA 样本，并读回校验。固定 Linux 对照须启用 `CONFIG_EXT4_FS_SECURITY`，否则 ext4 不提供文件 capability 属性。
 
 ## 脚本执行
 

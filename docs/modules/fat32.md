@@ -57,7 +57,7 @@ I/O、共享偏移、名称／dirfd、打开后删除、共享映射与 private 
 重挂载。LA 可使用已编译的静态 ELF：
 
 ```sh
-python3 -B tests/fat32-user.py --arch loongarch --program <ELF> --kernel kernel-la \
+python3 -B tests/userland/fat32-user.py --arch loongarch --program <ELF> --kernel kernel-la \
   --qemu <QEMU> --output build/fat32-user-la
 ```
 

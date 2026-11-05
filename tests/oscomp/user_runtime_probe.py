@@ -190,11 +190,11 @@ def main():
             'architectures':{},'complete':False}
     report['diagnostic_sources']={str(path.relative_to(ROOT)):digest(path) for path in
         [Path(__file__),HERE/'sched_compat.c',HERE/'sched_compat_probe.c',HERE/'user_runtime_driver.c',
-         ROOT/'tests/workloads/diagnostics/brk-return-plugin.c',ROOT/'tests/loongarch/root_linux_init.c']}
+         ROOT/'tests/cost/brk-return-plugin.c',ROOT/'tests/loongarch/root_linux_init.c']}
     (directory/'report.json').write_text(json.dumps(report,indent=2)+'\n')
     pkg=subprocess.check_output(['pkg-config','--cflags','--libs','glib-2.0'],text=True).split()
     plugin=directory/'brk-observer.so'
-    run(['cc','-shared','-fPIC','-O2','-Wall','-Wextra','-Werror',ROOT/'tests/workloads/diagnostics/brk-return-plugin.c','-o',plugin,*pkg])
+    run(['cc','-shared','-fPIC','-O2','-Wall','-Wextra','-Werror',ROOT/'tests/cost/brk-return-plugin.c','-o',plugin,*pkg])
     config=json.loads((scoring.REF/'kernel/judge/config.json').read_text())
     try:
         for name in names:

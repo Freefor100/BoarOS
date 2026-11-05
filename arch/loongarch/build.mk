@@ -130,7 +130,7 @@ $(LA_BUILD)/kernel-boot-random: $(LA_TEST_OBJECTS) $(LA_BUILD)/tests/loongarch/b
 test-boot-random-loongarch: $(LA_BUILD)/kernel-boot-random prepare-la-tools
 	python3 -B tests/loongarch/run.py --kernel $(LA_BUILD)/kernel-boot-random --marker 'LA untrusted DTB random material passed'
 test-stack-usage-la: kernel-la
-	python3 -B tests/stack-usage.py $(LA_BUILD) --stack-bytes 32768 --trap-frame-bytes 304
+	python3 -B tests/tools/stack-usage.py $(LA_BUILD) --stack-bytes 32768 --trap-frame-bytes 304
 
 $(LA_BUILD)/stack-guard-%.o: tests/loongarch/stack_guard.c $(LA_BUILD)/generated/lock-config.h
 	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DLA_STACK_CASE=$* -c $< -o $@
@@ -213,14 +213,14 @@ test-root-io-loongarch: $(KERNEL_LA) $(LA_BUILD)/root-probe build/host/nbd-fault
 $(LA_BUILD)/rng-probe: tests/userland/rng.c prepare-la-userland
 	REALGCC=$(abspath $(LA_USER_CC)) $(LA_MUSL_CC) $(LA_FLAGS) -O2 -static -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 -o $@ $<
 test-rng-loongarch: kernel-la $(LA_BUILD)/rng-probe prepare-la-tools prepare-la-linux-platform
-	python3 -B tests/rng_runner.py --arch loongarch $(TEST_MEMORY_ARGS)
+	python3 -B tests/userland/rng.py --arch loongarch $(TEST_MEMORY_ARGS)
 $(LA_BUILD)/rng-fail-%.o: tests/loongarch/rng_failures.c arch/loongarch/build.mk $(LA_BUILD)/generated/lock-config.h
 	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DRNG_FAIL_AFTER=$* -c $< -o $@
 $(LA_BUILD)/kernel-rng-fail-%: $(LA_TEST_OBJECTS) $(LA_BUILD)/rng-fail-%.o arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=virtio_rng_start -o $@ $(LA_TEST_OBJECTS) $(LA_BUILD)/rng-fail-$*.o -lgcc
 .PHONY: test-rng-failures-loongarch
 test-rng-failures-loongarch: $(foreach case,0 1 2 3,$(LA_BUILD)/kernel-rng-fail-$(case)) $(LA_BUILD)/rng-probe prepare-la-tools prepare-la-linux-platform
-	@for case in 0 1 2 3; do python3 -B tests/rng_runner.py --arch loongarch --platform BoarOS --mode a --force-device --kernel $(LA_BUILD)/kernel-rng-fail-$$case --marker 'LA RNG construction DMA/task/stack/IRQ rollback passed' || exit; done
+	@for case in 0 1 2 3; do python3 -B tests/userland/rng.py --arch loongarch --platform BoarOS --mode a --force-device --kernel $(LA_BUILD)/kernel-rng-fail-$$case --marker 'LA RNG construction DMA/task/stack/IRQ rollback passed' || exit; done
 test-la-userland-host: prepare-la-userland
 	python3 -B tests/host/la_userland_cache.py
 
@@ -314,13 +314,13 @@ $(LA_BUILD)/net/ethernet.o: LA_CPPFLAGS += -I$(LA_BUILD)/generated
 
 .PHONY: test-network-loongarch
 test-network-loongarch: kernel-la prepare-la-userland prepare-la-linux-platform prepare-la-tools
-	python3 -B tests/network-loongarch.py --workload contract $(TEST_MEMORY_ARGS)
-	python3 -B tests/network-loongarch.py --workload content $(TEST_MEMORY_ARGS)
-	python3 -B tests/network-loongarch.py --workload timer $(TEST_MEMORY_ARGS)
-	python3 -B tests/network-loongarch.py --workload admission $(TEST_MEMORY_ARGS)
-	python3 -B tests/network-loongarch.py --workload sendfile $(TEST_MEMORY_ARGS)
-	python3 -B tests/network-loongarch.py --workload budget $(TEST_MEMORY_ARGS)
-	python3 -B tests/network-loongarch.py --workload unix_sender $(TEST_MEMORY_ARGS)
+	python3 -B tests/userland/run.py --arch loongarch --workload contract $(TEST_MEMORY_ARGS)
+	python3 -B tests/userland/run.py --arch loongarch --workload content $(TEST_MEMORY_ARGS)
+	python3 -B tests/userland/run.py --arch loongarch --workload timer $(TEST_MEMORY_ARGS)
+	python3 -B tests/userland/run.py --arch loongarch --workload admission $(TEST_MEMORY_ARGS)
+	python3 -B tests/userland/run.py --arch loongarch --workload sendfile $(TEST_MEMORY_ARGS)
+	python3 -B tests/userland/run.py --arch loongarch --workload budget $(TEST_MEMORY_ARGS)
+	python3 -B tests/userland/run.py --arch loongarch --workload unix_sender $(TEST_MEMORY_ARGS)
 $(LA_BUILD)/net-failure-%.o: tests/loongarch/net_failures.c $(LA_BUILD)/generated/lock-config.h
 	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DNET_FAIL_CASE=$* -c $< -o $@
 $(LA_BUILD)/kernel-net-failure-%: $(LA_TEST_OBJECTS) $(LA_BUILD)/net-failure-%.o arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config
@@ -331,33 +331,33 @@ $(LA_BUILD)/network-contract: tests/workloads/network/contract.c prepare-la-user
 test-net-failures-loongarch: $(foreach case,0 1 2 3 4 5 6 7 8,$(LA_BUILD)/kernel-net-failure-$(case)) $(LA_BUILD)/network-contract prepare-la-tools
 	python3 -B tests/loongarch/net_failures.py
 test-network-external-loongarch: kernel-la prepare-la-userland prepare-la-linux-platform prepare-la-tools
-	python3 -B tests/network-external.py --arch loongarch
+	python3 -B tests/userland/network-external.py --arch loongarch
 
 $(LA_BUILD)/uart-failure-%.o: tests/loongarch/uart_failures.c $(LA_BUILD)/generated/lock-config.h
 	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DUART_FAIL_CASE=$* -c $< -o $@
 $(LA_BUILD)/kernel-uart-failure-%: $(LA_TEST_OBJECTS) $(LA_BUILD)/uart-failure-%.o arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=ns16550_start,--wrap=kernel_heap_allocate_zeroed,--wrap=kernel_thread_create_joinable -o $@ $(LA_TEST_OBJECTS) $(LA_BUILD)/uart-failure-$*.o -lgcc
-$(LA_BUILD)/tty-probe: tests/tty/probe.c $(LA_BUILD)/musl-root/bin/musl-gcc
+$(LA_BUILD)/tty-probe: tests/workloads/tty/probe.c $(LA_BUILD)/musl-root/bin/musl-gcc
 	REALGCC=$(CURDIR)/$(LA_BUILD)/gcc-sf/root/bin/loongarch64-unknown-linux-gnusf-gcc $(LA_BUILD)/musl-root/bin/musl-gcc -static -O2 -Wall -Wextra -Werror $< -o $@
-$(LA_BUILD)/tty-jobctrl: tests/tty/jobctrl_probe.c $(LA_BUILD)/musl-root/bin/musl-gcc
+$(LA_BUILD)/tty-jobctrl: tests/workloads/tty/jobctrl_probe.c $(LA_BUILD)/musl-root/bin/musl-gcc
 	REALGCC=$(CURDIR)/$(LA_BUILD)/gcc-sf/root/bin/loongarch64-unknown-linux-gnusf-gcc $(LA_BUILD)/musl-root/bin/musl-gcc -static -O2 -Wall -Wextra -Werror $< -o $@
-$(LA_BUILD)/tty-termios2-probe: tests/tty/termios2_probe.c $(LA_BUILD)/musl-root/bin/musl-gcc
+$(LA_BUILD)/tty-termios2-probe: tests/workloads/tty/termios2_probe.c $(LA_BUILD)/musl-root/bin/musl-gcc
 	REALGCC=$(CURDIR)/$(LA_BUILD)/gcc-sf/root/bin/loongarch64-unknown-linux-gnusf-gcc $(LA_BUILD)/musl-root/bin/musl-gcc -static -O2 -Wall -Wextra -Werror $< -o $@
 .PHONY: test-uart-failures-loongarch test-tty-loongarch test-tty-diff-loongarch test-tty-termios2-loongarch test-pty-loongarch test-pty-apps-loongarch
 test-uart-failures-loongarch: $(foreach case,0 1 2 3 4 5,$(LA_BUILD)/kernel-uart-failure-$(case)) $(LA_BUILD)/network-contract
 	python3 -B tests/loongarch/uart_failures.py
 test-tty-loongarch: kernel-la
-	python3 -B tests/tty/riscv.py --arch loongarch $(TEST_MEMORY_ARGS)
+	python3 -B tests/userland/tty/riscv.py --arch loongarch $(TEST_MEMORY_ARGS)
 test-tty-diff-loongarch: kernel-la $(LA_BUILD)/tty-probe $(LA_BUILD)/tty-jobctrl
-	python3 -B tests/tty/riscv.py --arch loongarch --probe $(LA_BUILD)/tty-probe $(TEST_MEMORY_ARGS)
-	python3 -B tests/tty/riscv.py --arch loongarch --probe $(LA_BUILD)/tty-jobctrl --no-ctty $(TEST_MEMORY_ARGS)
+	python3 -B tests/userland/tty/riscv.py --arch loongarch --probe $(LA_BUILD)/tty-probe $(TEST_MEMORY_ARGS)
+	python3 -B tests/userland/tty/riscv.py --arch loongarch --probe $(LA_BUILD)/tty-jobctrl --no-ctty $(TEST_MEMORY_ARGS)
 test-tty-termios2-loongarch: kernel-la $(LA_BUILD)/tty-termios2-probe
-	python3 -B tests/tty/riscv.py --arch loongarch --probe $(LA_BUILD)/tty-termios2-probe $(TEST_MEMORY_ARGS)
+	python3 -B tests/userland/tty/riscv.py --arch loongarch --probe $(LA_BUILD)/tty-termios2-probe $(TEST_MEMORY_ARGS)
 test-pty-loongarch: kernel-la
-	python3 -B tests/tty/pty_riscv.py --arch loongarch --case core $(TEST_MEMORY_ARGS)
+	python3 -B tests/userland/tty/pty_riscv.py --arch loongarch --case core $(TEST_MEMORY_ARGS)
 test-pty-apps-loongarch: kernel-la
-	python3 -B tests/tty/pty_riscv.py --arch loongarch --case libc $(TEST_MEMORY_ARGS)
-	python3 -B tests/tty/pty_riscv.py --arch loongarch --case script $(TEST_MEMORY_ARGS)
+	python3 -B tests/userland/tty/pty_riscv.py --arch loongarch --case libc $(TEST_MEMORY_ARGS)
+	python3 -B tests/userland/tty/pty_riscv.py --arch loongarch --case script $(TEST_MEMORY_ARGS)
 
 .PHONY: test-rtc-loongarch-host
 test-rtc-loongarch-host:
@@ -395,37 +395,37 @@ $(LA_BUILD)/sqlite-cli-init: tests/workloads/sqlite/cli_init.c $(LA_SQLITE_CC)
 	$(LA_SQLITE_CC) $(LA_SQLITE_FLAGS) -static -O2 -Wall -Wextra -Werror -o $@ $<
 .PHONY: test-sqlite-wal-loongarch
 test-sqlite-wal-loongarch: $(LA_BUILD)/sqlite-wal kernel-la
-	python3 -B tests/sqlite-wal-riscv.py --arch loongarch --kernel kernel-la --program $(LA_BUILD)/sqlite-wal $(TEST_MEMORY_ARGS)
+	python3 -B tests/riscv/sqlite-wal.py --arch loongarch --kernel kernel-la --program $(LA_BUILD)/sqlite-wal $(TEST_MEMORY_ARGS)
 .PHONY: test-sqlite-rollback-loongarch
 test-sqlite-rollback-loongarch: $(LA_BUILD)/sqlite-rollback $(LA_BUILD)/sqlite3-static $(LA_BUILD)/sqlite3-dynamic $(LA_BUILD)/sqlite-cli-init kernel-la
-	python3 -B tests/sqlite-rollback.py --arch loongarch $(TEST_MEMORY_ARGS)
+	python3 -B tests/userland/sqlite-rollback.py --arch loongarch $(TEST_MEMORY_ARGS)
 
-$(LA_BUILD)/sync-%.o: tests/sync/native.c $(LA_BUILD)/generated/lock-config.h
+$(LA_BUILD)/sync-%.o: tests/common/sync.c $(LA_BUILD)/generated/lock-config.h
 	@mkdir -p $(dir $@)
 	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DBOAROS_SYNC_CASE=$* -c $< -o $@
 $(LA_BUILD)/sync-%: $(LA_TEST_OBJECTS) $(LA_BUILD)/sync-%.o arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_boot_tasks -o $@ $(LA_TEST_OBJECTS) $(LA_BUILD)/sync-$*.o -lgcc
 .PHONY: test-sync-loongarch
 test-sync-loongarch: $(foreach case,0 1 2 3 4,$(LA_BUILD)/sync-$(case)) prepare-la-tools
-	python3 -B tests/sync/native.py --arch loongarch --qemu $(QEMU_LOONGARCH64) --kernel-dir $(LA_BUILD)
+	python3 -B tests/common/sync.py --arch loongarch --qemu $(QEMU_LOONGARCH64) --kernel-dir $(LA_BUILD)
 
-$(LA_BUILD)/wait-native.o: tests/wait/native.c $(LA_BUILD)/generated/lock-config.h
+$(LA_BUILD)/wait-native.o: tests/common/wait.c $(LA_BUILD)/generated/lock-config.h
 	@mkdir -p $(dir $@)
 	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -c $< -o $@
 $(LA_BUILD)/wait-native: $(LA_TEST_OBJECTS) $(LA_BUILD)/wait-native.o arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_boot_tasks,--wrap=kernel_wait_backend_switch,--wrap=kernel_wait_backend_switch_locked -o $@ $(LA_TEST_OBJECTS) $(LA_BUILD)/wait-native.o -lgcc
 .PHONY: test-wait-loongarch
 test-wait-loongarch: $(LA_BUILD)/wait-native prepare-la-tools
-	python3 -B tests/wait/native.py --arch loongarch --qemu $(QEMU_LOONGARCH64) --kernel-dir $(LA_BUILD)
+	python3 -B tests/common/wait.py --arch loongarch --qemu $(QEMU_LOONGARCH64) --kernel-dir $(LA_BUILD)
 
-$(LA_BUILD)/sched-lifecycle-native.o: tests/wait/native.c Makefile $(LA_BUILD)/generated/lock-config.h
+$(LA_BUILD)/sched-lifecycle-native.o: tests/common/wait.c Makefile $(LA_BUILD)/generated/lock-config.h
 	@mkdir -p $(dir $@)
 	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DBOAROS_SCHED_LIFECYCLE=1 -c $< -o $@
 $(LA_BUILD)/sched-lifecycle-native: $(LA_TEST_OBJECTS) $(LA_BUILD)/sched-lifecycle-native.o arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_boot_tasks,--wrap=kernel_wait_backend_switch,--wrap=kernel_wait_backend_switch_locked -o $@ $(LA_TEST_OBJECTS) $(LA_BUILD)/sched-lifecycle-native.o -lgcc
 .PHONY: test-sched-lifecycle-loongarch
 test-sched-lifecycle-loongarch: $(LA_BUILD)/sched-lifecycle-native prepare-la-tools
-	python3 -B tests/wait/native.py --arch loongarch --qemu $(QEMU_LOONGARCH64) --kernel-dir $(LA_BUILD) --case sched-lifecycle
+	python3 -B tests/common/wait.py --arch loongarch --qemu $(QEMU_LOONGARCH64) --kernel-dir $(LA_BUILD) --case sched-lifecycle
 -include $(LA_BUILD)/sched-lifecycle-native.d
 
 # Capture globals before target-specific include paths are inherited by prerequisites.

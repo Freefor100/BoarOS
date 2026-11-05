@@ -105,7 +105,7 @@ GNU profile，安装位置可以迁移，二进制身份与库版本不变。
 该输入只服务原网络消费者，
 不把main构建改成比赛启动环境。
 
-`tests/program-inventory/inputs.json` 是执行 profile：BusyBox 源码和配置取自
+`tests/userland/inventory/inputs.json` 是执行 profile：BusyBox 源码和配置取自
 清单的 `b5ec6ef8497e1818cbdec3b54bb722f036e57972`，libc-test 和比赛脚本取自
 同一个完整 object store 的附加 commit
 `8b58dd16d26d30f7c74d48d5832d870d3051b703`（选择时分支名为 `pre-2025`）。

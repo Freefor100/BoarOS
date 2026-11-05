@@ -25,7 +25,7 @@ CACHE_INPUTS = ['references/sources.tsv', 'tests/ci/tools.py', '.github/actions/
     'tests/userland/glibc/inputs.json', 'tests/userland/glibc/inputs-loongarch.json',
     'tests/loongarch/prepare.py', 'tests/loongarch/prepare_userland.py',
     'tests/loongarch/prepare_dynamic.py', 'tests/loongarch/qemu_rtc.py',
-    'tests/loongarch/qemu-ls7a-rtc.patch', 'tests/program-inventory/inputs.json',
+    'tests/loongarch/qemu-ls7a-rtc.patch', 'tests/userland/inventory/inputs.json',
     'tests/diff-abi/harness.py', 'tests/diff-abi/linux.config', 'tests/smp/linux-user.config']
 
 

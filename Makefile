@@ -850,96 +850,96 @@ $(BUILD_DIR)/arch/riscv/root_boot.o: $(BUILD_DIR)/generated/init-config.h
 $(BUILD_DIR)/arch/riscv/root_boot.o: CPPFLAGS += -I$(BUILD_DIR)/generated
 
 test-init-config-riscv:
-	python3 tests/init-config-riscv.py
+	python3 tests/riscv/init-config.py
 
 references:
 	./references/fetch.sh
 
 test-references:
-	./tests/references.sh
+	./tests/tools/references.sh
 
 test-lwext4-host:
-	./tests/lwext4-host.sh
+	./tests/host/lwext4.sh
 
 .PHONY: test-lwext4-instances-host
 test-lwext4-instances-host:
-	sh tests/lwext4-instances-host.sh
+	sh tests/host/lwext4-instances.sh
 
 test-lwext4-rename-host:
-	sh tests/lwext4-rename-host.sh
+	sh tests/host/lwext4-rename.sh
 
 .PHONY: test-lwext4-metadata-host
 test-lwext4-metadata-host:
-	sh tests/lwext4-metadata-host.sh
+	sh tests/host/lwext4-metadata.sh
 
 .PHONY: test-lwext4-extent-host
 test-lwext4-extent-host:
-	sh tests/lwext4-metadata-host.sh extent
+	sh tests/host/lwext4-metadata.sh extent
 
 .PHONY: test-lwext4-cost-host
 test-lwext4-cost-host:
-	sh tests/lwext4-cost-host.sh
+	sh tests/host/lwext4-cost.sh
 
 .PHONY: test-lwext4-checksum-host
 test-lwext4-checksum-host:
 	@mkdir -p build/host
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -DCONFIG_USE_DEFAULT_CFG=1 -Ithird_party/lwext4/include tests/host/lwext4_checksum.c third_party/lwext4/src/ext4_crc32.c -o build/host/lwext4-checksum
 	build/host/lwext4-checksum
-	python3 -B tests/lwext4-checksum-read-host.py
+	python3 -B tests/userland/lwext4-checksum-read-host.py
 
 .PHONY: test-lwext4-crc-layout-riscv
 test-lwext4-crc-layout-riscv: $(KERNEL_RV)
-	python3 -B tests/lwext4-crc-layout.py --nm $(NM) $(KERNEL_RV)
+	python3 -B tests/tools/lwext4-crc-layout.py --nm $(NM) $(KERNEL_RV)
 
 .PHONY: test-string-host
 test-string-host:
-	sh tests/string-host.sh
+	sh tests/host/string.sh
 
 .PHONY: test-lwext4-cache-host
 .PHONY: test-lwext4-deep-truncate-host
 test-lwext4-deep-truncate-host:
-	sh tests/lwext4-deep-truncate-host.sh
+	sh tests/host/lwext4-deep-truncate.sh
 
 .PHONY: test-lwext4-batch-read-host
 test-lwext4-batch-read-host:
-	sh tests/lwext4-batch-read-host.sh
+	sh tests/host/lwext4-batch-read.sh
 
 .PHONY: test-lwext4-exclusion-host
 test-lwext4-exclusion-host:
-	sh tests/lwext4-exclusion-host.sh
+	sh tests/host/lwext4-exclusion.sh
 
 .PHONY: test-lwext4-payload-host test-lwext4-memory-owner-host
 test-lwext4-payload-host:
-	sh tests/lwext4-payload-host.sh
+	sh tests/host/lwext4-payload.sh
 
 test-lwext4-memory-owner-host:
-	sh tests/lwext4-memory-owner-host.sh
+	sh tests/host/lwext4-memory-owner.sh
 
 test-lwext4-cache-host: test-lwext4-exclusion-host test-lwext4-payload-host test-lwext4-memory-owner-host
-	sh tests/lwext4-cache-host.sh
+	sh tests/host/lwext4-cache.sh
 
 .PHONY: test-lwext4-group-host
 test-lwext4-group-host:
-	sh tests/lwext4-group-host.sh
+	sh tests/host/lwext4-group.sh
 
 .PHONY: test-lwext4-operation-host test-lwext4-port-host test-lwext4-parallel-host test-ext4-backend-parallel-host
 test-lwext4-operation-host:
-	sh tests/lwext4-operation-host.sh
+	sh tests/host/lwext4-operation.sh
 
 test-lwext4-port-host:
-	sh tests/lwext4-port-host.sh
+	sh tests/host/lwext4-port.sh
 
 test-lwext4-parallel-host: test-lwext4-operation-host test-lwext4-port-host
-	sh tests/lwext4-parallel-host.sh
+	sh tests/host/lwext4-parallel.sh
 
 test-ext4-backend-parallel-host:
-	sh tests/ext4-backend-parallel-host.sh
-	sh tests/namespace-parallel-host.sh
-	sh tests/ext4-namespace-parallel-host.sh
+	sh tests/host/ext4-backend-parallel.sh
+	sh tests/host/namespace-parallel.sh
+	sh tests/host/ext4-namespace-parallel.sh
 
 .PHONY: test-ext4-timestamps-host
 test-ext4-timestamps-host:
-	sh tests/ext4-timestamps-host.sh
+	sh tests/host/ext4-timestamps.sh
 
 JOURNAL_GROUP_KERNEL := $(BUILD_DIR)/tests/kernel-journal-group-rv
 JOURNAL_GROUP_RUNTIME_OBJECTS := $(filter-out $(BUILD_DIR)/fs/ext4_backend.o,$(TEST_RUNTIME_OBJECTS)) $(BUILD_DIR)/tests/riscv/journal_group_backend.o
@@ -954,17 +954,17 @@ $(JOURNAL_GROUP_KERNEL): $(JOURNAL_GROUP_RUNTIME_OBJECTS) $(BUILD_DIR)/kernel/dt
 	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_wait_prepare -o $@ $(JOURNAL_GROUP_RUNTIME_OBJECTS) $(BUILD_DIR)/kernel/dtb.o $(BUILD_DIR)/tests/riscv/journal_group_main.o
 .PHONY: test-journal-group-riscv
 test-journal-group-riscv: $(JOURNAL_GROUP_KERNEL)
-	python3 -B tests/journal-group-riscv.py --kernel $< --qemu $(QEMU_RISCV64)
-	python3 -B tests/journal-group-riscv.py --kernel $< --qemu $(QEMU_RISCV64) --nojournal
+	python3 -B tests/riscv/journal-group.py --kernel $< --qemu $(QEMU_RISCV64)
+	python3 -B tests/riscv/journal-group.py --kernel $< --qemu $(QEMU_RISCV64) --nojournal
 
 # Real volatile-storage power cuts, separate from normal QEMU shutdown tests.
 test-lwext4-recovery-host:
-	sh tests/lwext4-journal-host.sh
-	sh tests/lwext4-ordered-host.sh
-	sh tests/lwext4-orphan-host.sh
-	sh tests/lwext4-truncate-host.sh
-	sh tests/lwext4-recovery-host.sh
-	sh tests/lwext4-reclaim-host.sh
+	sh tests/host/lwext4-journal.sh
+	sh tests/host/lwext4-ordered.sh
+	sh tests/host/lwext4-orphan.sh
+	sh tests/host/lwext4-truncate.sh
+	sh tests/host/lwext4-recovery.sh
+	sh tests/host/lwext4-reclaim.sh
 
 $(KERNEL_RV): $(OBJECTS) arch/riscv/linker.ld $(BUILD_DIR)/generated/link-config
 	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/kernel-rv.map \
@@ -1342,60 +1342,60 @@ test-riscv: test-dtb-riscv test-page-riscv test-heap-riscv \
 
 test-dtb-riscv: $(DTB_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) DTB_TEST_KERNEL_RV=$< \
-		./tests/dtb-riscv.sh
+		./tests/riscv/dtb.sh
 
 test-page-riscv: $(PAGE_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) PAGE_TEST_KERNEL_RV=$< \
-		./tests/page-riscv.sh
+		./tests/riscv/page.sh
 
 test-heap-riscv: $(HEAP_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) HEAP_TEST_KERNEL_RV=$< \
-		./tests/heap-riscv.sh
+		./tests/riscv/heap.sh
 
 test-block-riscv: $(BLOCK_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) BLOCK_TEST_KERNEL_RV=$< \
-		./tests/block-riscv.sh
+		./tests/riscv/block.sh
 
 test-vfs-riscv: $(VFS_TEST_KERNEL_RV) $(VFS_RECOVERY_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) \
 		VFS_TEST_KERNEL_RV=$(VFS_TEST_KERNEL_RV) \
 		VFS_RECOVERY_TEST_KERNEL_RV=$(VFS_RECOVERY_TEST_KERNEL_RV) \
-		./tests/vfs-riscv.sh
+		./tests/riscv/vfs.sh
 
 test-files-riscv: $(FILES_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) FILES_TEST_KERNEL_RV=$< \
-		./tests/files-riscv.sh
+		./tests/riscv/files.sh
 
 test-files-partial-write-riscv: $(FILES_PARTIAL_WRITE_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) \
 		FILES_TEST_KERNEL_RV=$< FILES_TEST_READONLY=off \
 		FILES_TEST_EXPECT_CONSOLE_WRITES=0 \
 		FILES_TEST_SUCCESS_MARKER='BoarOS: process files partial write tests passed' \
-		./tests/files-riscv.sh
+		./tests/riscv/files.sh
 
 test-context-riscv: $(CONTEXT_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) OBJDUMP_RV=$(OBJDUMP) \
 		CONTEXT_TEST_KERNEL_RV=$< \
 		CONTEXT_OBJECT_RV=$(BUILD_DIR)/arch/riscv/context_switch.o \
-		./tests/context-riscv.sh
+		./tests/riscv/context.sh
 
 test-scheduler-cases-riscv: $(SCHEDULER_CASES_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) SCHEDULER_CASES_TEST_KERNEL_RV=$< \
-		./tests/scheduler-cases-riscv.sh
+		./tests/riscv/scheduler-cases.sh
 
 test-scheduler-riscv: $(SCHEDULER_BOOT_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) OBJDUMP_RV=$(OBJDUMP) \
 		SCHEDULER_BOOT_TEST_KERNEL_RV=$< \
 		SCHEDULER_OBJECT_RV=$(BUILD_DIR)/kernel/sched/core.o \
-		./tests/scheduler-riscv.sh
+		./tests/riscv/scheduler.sh
 
 test-syscall-riscv: $(SYSCALL_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) SYSCALL_TEST_KERNEL_RV=$< \
-		./tests/syscall-riscv.sh
+		./tests/riscv/syscall.sh
 
 test-signal-riscv: $(SIGNAL_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) SIGNAL_TEST_KERNEL_RV=$< \
-		./tests/signal-riscv.sh
+		./tests/riscv/signal.sh
 
 MUSL_TARBALL := references/musl/musl-1.2.5.tar.gz
 MUSL_ROOT := $(BUILD_DIR)/musl-root
@@ -1450,7 +1450,7 @@ $(SQLITE_WAL_RV): tests/workloads/sqlite/wal.c $(SQLITE_SOURCE) $(MUSL_STAMP)
 
 .PHONY: test-sqlite-wal-riscv
 test-sqlite-wal-riscv: $(SQLITE_WAL_RV) $(KERNEL_RV)
-	PYTHONDONTWRITEBYTECODE=1 python3 tests/sqlite-wal-riscv.py \
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/riscv/sqlite-wal.py \
 		--kernel $(KERNEL_RV) --program $(SQLITE_WAL_RV) \
 		--qemu $(QEMU_RISCV64) $(TEST_MEMORY_ARGS)
 
@@ -1467,13 +1467,13 @@ prepare-offline-c-toolchain:
 	python3 tests/workloads/toolchain/prepare_alpine.py
 
 test-offline-c-baseline-riscv: $(OFFLINE_C_RV) $(KERNEL_RV)
-	PYTHONDONTWRITEBYTECODE=1 python3 tests/offline-c-riscv.py \
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/userland/offline-c.py \
 		--kernel $(KERNEL_RV) --program $(OFFLINE_C_RV) \
 		$(if $(OFFLINE_C_LINUX_KERNEL),--linux-kernel $(OFFLINE_C_LINUX_KERNEL)) \
 		--qemu $(QEMU_RISCV64) --expect-first-failure preprocess:exec:2
 
 test-offline-c-riscv: $(OFFLINE_C_RV) $(KERNEL_RV) prepare-offline-c-toolchain
-	PYTHONDONTWRITEBYTECODE=1 python3 tests/offline-c-riscv.py \
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/userland/offline-c.py \
 		--kernel $(KERNEL_RV) --program $(OFFLINE_C_RV) \
 		$(if $(OFFLINE_C_LINUX_KERNEL),--linux-kernel $(OFFLINE_C_LINUX_KERNEL)) \
 		--qemu $(QEMU_RISCV64) \
@@ -1481,7 +1481,7 @@ test-offline-c-riscv: $(OFFLINE_C_RV) $(KERNEL_RV) prepare-offline-c-toolchain
 
 .PHONY: test-offline-c-tmpfs-riscv
 test-offline-c-tmpfs-riscv: $(OFFLINE_C_RV) $(KERNEL_RV) prepare-offline-c-toolchain
-	PYTHONDONTWRITEBYTECODE=1 python3 tests/offline-c-riscv.py \
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/userland/offline-c.py \
 		--kernel $(KERNEL_RV) --program $(OFFLINE_C_RV) --tmpfs \
 		$(if $(OFFLINE_C_LINUX_KERNEL),--linux-kernel $(OFFLINE_C_LINUX_KERNEL)) \
 		--qemu $(QEMU_RISCV64) \
@@ -1494,7 +1494,7 @@ test-sqlite-rollback-riscv: $(SQLITE_ROLLBACK_RV) $(SQLITE_CLI_STATIC_RV) $(SQLI
 	SQLITE_CLI_DYNAMIC_RV=$(SQLITE_CLI_DYNAMIC_RV) \
 	SQLITE_CLI_INIT_RV=$(SQLITE_CLI_INIT_RV) MUSL_LDSO=$(MUSL_LDSO) \
 	SQLITE_SUPERVISOR_CC=$(CC) QEMU_RISCV64=$(QEMU_RISCV64) \
-		./tests/sqlite-rollback-riscv.sh $(TEST_MEMORY_ARGS)
+		./tests/riscv/sqlite-rollback.sh $(TEST_MEMORY_ARGS)
 REAL_USERLAND_RV := $(BUILD_DIR)/tests/user/real-userland-rv
 PTHREAD_USERLAND_RV := $(BUILD_DIR)/tests/user/pthread-userland-rv
 PTHREAD_TLS_DSO_RV := $(BUILD_DIR)/tests/user/libboaros-tls.so
@@ -1540,7 +1540,7 @@ test-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) \
 	QEMU_RISCV64=$(QEMU_RISCV64) REAL_USERLAND_RV=$(REAL_USERLAND_RV) \
 		PTHREAD_USERLAND_RV=$(PTHREAD_USERLAND_RV) \
 		PTHREAD_TLS_DSO_RV=$(PTHREAD_TLS_DSO_RV) MUSL_LDSO=$(MUSL_LDSO) \
-		./tests/userland-riscv.sh
+		./tests/riscv/userland.sh
 
 .PHONY: test-glibc-riscv
 test-glibc-riscv: $(KERNEL_RV)
@@ -1556,7 +1556,7 @@ test-mmap-riscv: test-sv39-riscv test-vma-riscv \
 
 test-elf64-riscv: $(ELF64_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) ELF64_TEST_KERNEL_RV=$< \
-		./tests/elf64-riscv.sh
+		./tests/riscv/elf64.sh
 
 test-root-init-riscv: $(KERNEL_RV) $(ROOT_INIT_PROGRAM_RV) \
 		$(ROOT_EXEC_STAGE2_RV) $(ROOT_EXEC_STAGE3_RV)
@@ -1565,14 +1565,14 @@ test-root-init-riscv: $(KERNEL_RV) $(ROOT_INIT_PROGRAM_RV) \
 		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
 		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
 		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
-		./tests/root-init-riscv.sh
+		./tests/riscv/root-init.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$(QEMU_MEMORY) \
 		VIRTIO_MMIO_FORCE_LEGACY=false \
 		KERNEL_RV=$(KERNEL_RV) \
 		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
 		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
 		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
-		./tests/root-init-riscv.sh
+		./tests/riscv/root-init.sh
 
 MULTI_MOUNT_RV := $(BUILD_DIR)/tests/user/multi-mount-rv
 MULTI_MOUNT_READONLY_RV := $(BUILD_DIR)/tests/user/multi-mount-readonly-rv
@@ -1590,7 +1590,7 @@ test-root-multi-block-riscv: $(KERNEL_RV) $(MULTI_MOUNT_RV) $(MULTI_MOUNT_READON
 	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$(QEMU_MEMORY) \
 		KERNEL_RV=$(KERNEL_RV) MULTI_MOUNT_RV=$(MULTI_MOUNT_RV) \
 		MULTI_MOUNT_READONLY_RV=$(MULTI_MOUNT_READONLY_RV) \
-		./tests/root-multi-block-riscv.sh
+		./tests/riscv/root-multi-block.sh
 
 .PHONY: test-root-orphan-riscv
 test-root-orphan-riscv: $(KERNEL_RV) $(ROOT_ORPHAN_PROGRAM_RV) \
@@ -1600,7 +1600,7 @@ test-root-orphan-riscv: $(KERNEL_RV) $(ROOT_ORPHAN_PROGRAM_RV) \
 		ROOT_INIT_PROGRAM_RV=$(ROOT_ORPHAN_PROGRAM_RV) \
 		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
 		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
-		./tests/root-init-riscv.sh
+		./tests/riscv/root-init.sh
 
 test-uaccess-oom-riscv: $(KERNEL_RV) $(UACCESS_OOM_PROGRAM_RV) \
 		$(ROOT_EXEC_STAGE2_RV) $(ROOT_EXEC_STAGE3_RV)
@@ -1610,12 +1610,12 @@ test-uaccess-oom-riscv: $(KERNEL_RV) $(UACCESS_OOM_PROGRAM_RV) \
 		ROOT_INIT_PROGRAM_RV=$(UACCESS_OOM_PROGRAM_RV) \
 		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
 		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
-		./tests/uaccess-oom-riscv.sh
+		./tests/riscv/uaccess-oom.sh
 
 test-icache-riscv: $(KERNEL_RV)
 	OBJDUMP_RV=$(OBJDUMP) MM_OBJECT_RV=$(abspath $(BUILD_DIR)/mm/mm.o) \
 		ELF_IMAGE_OBJECT_RV=$(abspath $(BUILD_DIR)/kernel/elf_image.o) \
-		SV39_OBJECT_RV=$(abspath $(BUILD_DIR)/arch/riscv/sv39.o) ./tests/icache-riscv.sh
+		SV39_OBJECT_RV=$(abspath $(BUILD_DIR)/arch/riscv/sv39.o) ./tests/riscv/icache.sh
 
 test-demand-page-riscv: test-root-init-riscv \
 		$(DEMAND_PAGE_OOM_TEST_KERNEL_RV) $(ROOT_INIT_PROGRAM_RV) \
@@ -1626,7 +1626,7 @@ test-demand-page-riscv: test-root-init-riscv \
 		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
 		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
 		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_OOM_RV) \
-		./tests/root-init-riscv.sh
+		./tests/riscv/root-init.sh
 
 test-exec-riscv: test-root-init-riscv
 
@@ -1639,42 +1639,42 @@ test-root-boot-cleanup-riscv: $(ROOT_BOOT_CLEANUP_TEST_KERNEL_RV) \
 		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
 		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
 		ROOT_BOOT_ERROR_STATUS=0xb \
-		./tests/root-init-riscv.sh
+		./tests/riscv/root-init.sh
 
 test-user-riscv: $(USER_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) USER_TEST_KERNEL_RV=$< \
-		./tests/user-riscv.sh
+		./tests/riscv/user.sh
 
 test-user-fatal-riscv: $(USER_FATAL_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) USER_FATAL_TEST_KERNEL_RV=$< \
-		./tests/user-fatal-riscv.sh
+		./tests/riscv/user-fatal.sh
 
 test-mm-riscv: $(MM_TEST_KERNEL_RV) $(MM_FATAL_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) MM_TEST_KERNEL_RV=$< \
-		./tests/mm-riscv.sh
+		./tests/riscv/mm.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) \
 		MM_FATAL_TEST_KERNEL_RV=$(MM_FATAL_TEST_KERNEL_RV) \
-		./tests/mm-fatal-riscv.sh
+		./tests/riscv/mm-fatal.sh
 
 test-vma-riscv: $(VMA_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) VMA_TEST_KERNEL_RV=$< \
-		./tests/vma-riscv.sh
+		./tests/riscv/vma.sh
 
 test-uaccess-riscv: $(UACCESS_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) UACCESS_TEST_KERNEL_RV=$< \
-		./tests/uaccess-riscv.sh
+		./tests/riscv/uaccess.sh
 
 test-sv39-riscv: $(SV39_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) SV39_TEST_KERNEL_RV=$< \
-		./tests/sv39-riscv.sh
+		./tests/riscv/sv39.sh
 
 test-sv39-fault-riscv: $(SV39_FAULT_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) SV39_FAULT_TEST_KERNEL_RV=$< \
-		./tests/sv39-fault-riscv.sh
+		./tests/riscv/sv39-fault.sh
 
 test-stack-guard-riscv: $(STACK_GUARD_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) STACK_GUARD_TEST_KERNEL_RV=$< \
-		./tests/stack-guard-riscv.sh
+		./tests/riscv/stack-guard.sh
 
 .PHONY: test-riscv-timer-host
 test-riscv-timer-host:
@@ -1684,39 +1684,39 @@ test-timer-riscv: $(TIMER_CASES_TEST_KERNEL_RV) \
 		$(TIMER_BOOT_TEST_KERNEL_RV) test-riscv-timer-host
 	QEMU_RISCV64=$(QEMU_RISCV64) TIMER_CASES_TEST_KERNEL_RV=$< \
 		TIMER_BOOT_TEST_KERNEL_RV=$(TIMER_BOOT_TEST_KERNEL_RV) \
-		./tests/timer-riscv.sh
+		./tests/riscv/timer.sh
 
 test-boot-riscv: $(TIMER_BOOT_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) NM_RV=$(NM) READELF_RV=$(READELF) \
-		BOOT_TEST_KERNEL_RV=$< ./tests/boot-riscv.sh
+		BOOT_TEST_KERNEL_RV=$< ./tests/riscv/boot.sh
 
 test-idle-riscv: $(KERNEL_RV)
-	QEMU_RISCV64=$(QEMU_RISCV64) KERNEL_RV=$< ./tests/idle-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) KERNEL_RV=$< ./tests/riscv/idle.sh
 
 test-trap-riscv: $(TRAP_TEST_KERNEL_RV)
-	QEMU_RISCV64=$(QEMU_RISCV64) KERNEL_RV=$< ./tests/trap-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) KERNEL_RV=$< ./tests/riscv/trap.sh
 
 test-trap-return-riscv: $(TRAP_RETURN_TEST_KERNEL_RV) \
 		$(TRAP_RETURN_SIE_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) TRAP_RETURN_TEST_KERNEL_RV=$< \
 		TRAP_RETURN_SIE_TEST_KERNEL_RV=$(TRAP_RETURN_SIE_TEST_KERNEL_RV) \
 		OBJDUMP_RV=$(OBJDUMP) \
-		./tests/trap-return-riscv.sh
+		./tests/riscv/trap-return.sh
 
 test-high-half-trap-riscv: $(HIGH_HALF_TRAP_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) NM_RV=$(NM) \
-		HIGH_HALF_TRAP_TEST_KERNEL_RV=$< ./tests/high-half-trap-riscv.sh
+		HIGH_HALF_TRAP_TEST_KERNEL_RV=$< ./tests/riscv/high-half-trap.sh
 
 test-no-identity-riscv: $(NO_IDENTITY_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) NO_IDENTITY_TEST_KERNEL_RV=$< \
-		./tests/no-identity-riscv.sh
+		./tests/riscv/no-identity.sh
 
 clean:
 	$(RM) -r -- $(BUILD_DIR) $(KERNEL_RV)
 
 .PHONY: prune-build
 prune-build:
-	python3 tests/prune-build.py --apply $(foreach path,$(PRUNE_BUILD_KEEP),--keep $(path))
+	python3 tests/tools/prune-build.py --apply $(foreach path,$(PRUNE_BUILD_KEEP),--keep $(path))
 
 -include $(DEPS)
 
@@ -1759,15 +1759,15 @@ include tests/diff-abi/Makefile.inc
 
 .PHONY: test-fat32-host
 test-fat32-host:
-	sh tests/fat32-host.sh
+	sh tests/host/fat32.sh
 
 .PHONY: test-remount-host
 test-remount-host:
-	sh tests/remount-host.sh
+	sh tests/host/remount.sh
 
 .PHONY: test-madvise-remove-host
 test-madvise-remove-host:
-	sh tests/madvise-remove-host.sh
+	sh tests/host/madvise-remove.sh
 
 FAT32_USER_RV := $(BUILD_DIR)/tests/user/fat32-rv
 $(FAT32_USER_RV): tests/userland/fat32.c $(MUSL_STAMP)
@@ -1775,7 +1775,7 @@ $(FAT32_USER_RV): tests/userland/fat32.c $(MUSL_STAMP)
 	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -Wall -Wextra -Werror -o $@ $<
 .PHONY: test-fat32-user-riscv
 test-fat32-user-riscv: $(KERNEL_RV) $(FAT32_USER_RV)
-	python3 -B tests/fat32-user.py --arch riscv --kernel $(KERNEL_RV) \
+	python3 -B tests/userland/fat32-user.py --arch riscv --kernel $(KERNEL_RV) \
 		--program $(FAT32_USER_RV) --qemu $(QEMU_RISCV64)
 
 .PHONY: test-block-host
@@ -1812,34 +1812,34 @@ test-nbd-host: build/host/nbd-fault
 test-sqlite-nbd-riscv: $(SQLITE_ROLLBACK_RV) $(KERNEL_RV) build/host/nbd-fault
 	SQLITE_ROLLBACK_RV=$(SQLITE_ROLLBACK_RV) KERNEL_RV=$(KERNEL_RV) \
 	NBD_FAULT_SERVER=build/host/nbd-fault QEMU_RISCV64=$(QEMU_RISCV64) \
-		./tests/sqlite-nbd-riscv.sh
+		./tests/riscv/sqlite-nbd.sh
 
 .PHONY: test-sqlite-recovery-riscv
 test-sqlite-recovery-riscv: $(SQLITE_RECOVERY_RV) $(KERNEL_RV) build/host/nbd-fault
-	PYTHONDONTWRITEBYTECODE=1 python3 tests/sqlite-recovery-riscv.py \
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/riscv/sqlite-recovery.py \
 		--kernel $(KERNEL_RV) --program $(SQLITE_RECOVERY_RV) \
 		--server build/host/nbd-fault --qemu $(QEMU_RISCV64) --linux
 
 .PHONY: test-record-lock-riscv
 test-record-lock-riscv: $(LOCK_LIFECYCLE_RV) $(KERNEL_RV)
-	PYTHONDONTWRITEBYTECODE=1 python3 tests/record-lock-riscv.py \
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/riscv/record-lock.py \
 		--kernel $(KERNEL_RV) --program $(LOCK_LIFECYCLE_RV) \
 		--qemu $(QEMU_RISCV64)
 
 .PHONY: test-sqlite-recovery-matrix-riscv
 test-sqlite-recovery-matrix-riscv: $(SQLITE_RECOVERY_RV) $(KERNEL_RV) build/host/nbd-fault
-	PYTHONDONTWRITEBYTECODE=1 python3 tests/sqlite-recovery-riscv.py \
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/riscv/sqlite-recovery.py \
 		--kernel $(KERNEL_RV) --program $(SQLITE_RECOVERY_RV) \
 		--server build/host/nbd-fault --qemu $(QEMU_RISCV64) --matrix full
 
 .PHONY: test-sqlite-wal-recovery-riscv test-sqlite-wal-recovery-matrix-riscv
 test-sqlite-wal-recovery-riscv: $(SQLITE_RECOVERY_RV) $(KERNEL_RV) build/host/nbd-fault
-	PYTHONDONTWRITEBYTECODE=1 python3 tests/sqlite-recovery-riscv.py \
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/riscv/sqlite-recovery.py \
 		--kernel $(KERNEL_RV) --program $(SQLITE_RECOVERY_RV) \
 		--server build/host/nbd-fault --qemu $(QEMU_RISCV64) --linux --journal wal
 
 test-sqlite-wal-recovery-matrix-riscv: $(SQLITE_RECOVERY_RV) $(KERNEL_RV) build/host/nbd-fault
-	PYTHONDONTWRITEBYTECODE=1 python3 tests/sqlite-recovery-riscv.py \
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/riscv/sqlite-recovery.py \
 		--kernel $(KERNEL_RV) --program $(SQLITE_RECOVERY_RV) \
 		--server build/host/nbd-fault --qemu $(QEMU_RISCV64) --journal wal --matrix full
 
@@ -1849,25 +1849,25 @@ test-sqlite-wal-recovery-matrix-riscv: $(SQLITE_RECOVERY_RV) $(KERNEL_RV) build/
 test-stack-usage:
 	mkdir -p build/stack-usage
 	$(MAKE) -B BUILD_DIR=build/stack-usage KERNEL_RV=build/stack-usage/kernel-rv all >build/stack-usage/build.log 2>&1
-	cc $(CPPFLAGS) -std=c11 -Wall -Wextra -Werror tests/stack-budget.c -o build/stack-usage/stack-budget
-	python3 tests/test-stack-usage.py
-	python3 tests/stack-usage.py build/stack-usage $$(build/stack-usage/stack-budget) >build/stack-usage/report.log
+	cc $(CPPFLAGS) -std=c11 -Wall -Wextra -Werror tests/tools/stack-budget.c -o build/stack-usage/stack-budget
+	python3 tests/tools/test-stack-usage.py
+	python3 tests/tools/stack-usage.py build/stack-usage $$(build/stack-usage/stack-budget) >build/stack-usage/report.log
 	cat build/stack-usage/report.log
 
 .PHONY: inventory-userland-riscv test-program-inventory-host
 test-program-inventory-host:
-	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/program-inventory -p 'test_*.py'
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/userland/inventory -p 'test_*.py'
 
 # Program incompatibilities remain inventory records unless --require-pass
 # is requested; build and runner errors always fail.
 inventory-userland-riscv: $(KERNEL_RV) $(MUSL_STAMP) test-program-inventory-host
-	python3 tests/program-inventory/run.py
+	python3 tests/userland/inventory/run.py
 
-include tests/program-inventory/Makefile.inc
+include tests/userland/inventory/Makefile.inc
 
 .PHONY: test-elf-tail-riscv
 test-elf-tail-riscv: $(KERNEL_RV) $(MUSL_STAMP)
-	python3 tests/elf-tail-riscv.py
+	python3 tests/riscv/elf-tail.py
 
 $(ELF_RWX_PROGRAM_RV): tests/riscv/elf_rwx_main.c
 	@mkdir -p $(dir $@)
@@ -1877,7 +1877,7 @@ $(ELF_RWX_PROGRAM_RV): tests/riscv/elf_rwx_main.c
 .PHONY: test-elf-rwx-riscv
 test-elf-rwx-riscv: $(KERNEL_RV) $(ELF_RWX_PROGRAM_RV)
 	KERNEL_RV=$(KERNEL_RV) ELF_RWX_PROGRAM_RV=$(ELF_RWX_PROGRAM_RV) \
-		QEMU_RISCV64=$(QEMU_RISCV64) ./tests/elf-rwx-riscv.sh
+		QEMU_RISCV64=$(QEMU_RISCV64) ./tests/riscv/elf-rwx.sh
 
 SCALE_OBJECTS := $(TEST_RUNTIME_OBJECTS) \
     $(patsubst %.c,$(BUILD_DIR)/%.o,$(VFS_TEST_SUPPORT_C_SOURCES)) \
@@ -1894,7 +1894,7 @@ $(BUILD_DIR)/tests/kernel-scale-rv: $(SCALE_OBJECTS) arch/riscv/linker.ld
 		-o $@ $(SCALE_OBJECTS)
 .PHONY: test-scale-riscv
 test-scale-riscv: $(BUILD_DIR)/tests/kernel-scale-rv
-	python3 tests/scale-riscv.py --kernel $< --qemu $(QEMU_RISCV64)
+	python3 tests/riscv/scale.py --kernel $< --qemu $(QEMU_RISCV64)
 
 IO_SLEEP_OBJECTS := $(TEST_RUNTIME_OBJECTS) $(BUILD_DIR)/kernel/dtb.o $(BUILD_DIR)/tests/riscv/io_sleep_main.o
 -include $(BUILD_DIR)/tests/riscv/io_sleep_main.d
@@ -1903,7 +1903,7 @@ $(BUILD_DIR)/tests/kernel-io-sleep-rv: $(IO_SLEEP_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_vfs_node_pread_batch -Wl,--wrap=kernel_vfs_node_writeback,--wrap=ext4_fpwrite_batch -Wl,--wrap=kernel_open_file_sync_range -Wl,--wrap=kernel_open_file_release -Wl,--wrap=kernel_copy_from_user -Wl,--wrap=kernel_uaccess_write_cursor_copy -Wl,--wrap=kernel_uaccess_pin_user_page -o $@ $(IO_SLEEP_OBJECTS)
 .PHONY: test-io-sleep-riscv
 test-io-sleep-riscv: $(BUILD_DIR)/tests/kernel-io-sleep-rv build/host/nbd-fault
-	python3 tests/io-sleep-riscv.py --kernel $< --qemu $(QEMU_RISCV64)
+	python3 tests/riscv/io-sleep.py --kernel $< --qemu $(QEMU_RISCV64)
 
 SQLITE_SECOND_DISK_RV := $(BUILD_DIR)/tests/user/sqlite-second-disk-rv
 $(SQLITE_SECOND_DISK_RV): tests/workloads/sqlite/wal.c $(SQLITE_SOURCE) $(MUSL_STAMP)
@@ -1912,7 +1912,7 @@ $(SQLITE_SECOND_DISK_RV): tests/workloads/sqlite/wal.c $(SQLITE_SOURCE) $(MUSL_S
 		-DSQLITE_SECOND_DISK -I$(dir $(SQLITE_SOURCE)) -o $@ $< $(SQLITE_SOURCE) -ldl
 .PHONY: test-sqlite-second-disk-riscv
 test-sqlite-second-disk-riscv: $(SQLITE_SECOND_DISK_RV) $(KERNEL_RV)
-	PYTHONDONTWRITEBYTECODE=1 python3 tests/sqlite-wal-riscv.py \
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/riscv/sqlite-wal.py \
 		--kernel $(KERNEL_RV) --program $(SQLITE_SECOND_DISK_RV) \
 		--qemu $(QEMU_RISCV64) --second-disk
 
@@ -1922,7 +1922,7 @@ $(MULTI_DISK_IO_RV): tests/userland/multi_disk_io.c $(MUSL_STAMP)
 	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -o $@ $<
 .PHONY: test-multi-disk-io-riscv
 test-multi-disk-io-riscv: $(KERNEL_RV) $(MULTI_DISK_IO_RV) build/host/nbd-fault
-	PYTHONDONTWRITEBYTECODE=1 python3 tests/multi-disk-io-riscv.py \
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/riscv/multi-disk-io.py \
 		--kernel $(KERNEL_RV) --program $(MULTI_DISK_IO_RV) --qemu $(QEMU_RISCV64)
 
 .PHONY: test-pid-object-host test-pidfd-host test-ioprio-host test-random-host
@@ -1934,7 +1934,7 @@ test-ioprio-host:
 
 test-pid-object-host:
 	@mkdir -p build/host
-	cc -std=c11 -Wall -Wextra -Werror -Iinclude tests/pid-object-host.c kernel/pid.c -o build/host/pid-object-test
+	cc -std=c11 -Wall -Wextra -Werror -Iinclude tests/host/pid-object.c kernel/pid.c -o build/host/pid-object-test
 	build/host/pid-object-test
 	@set -e; for shift in 12 14; do \
 	cc -std=c11 -O2 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=$$shift \
@@ -1954,7 +1954,7 @@ $(RNG_USER_RV): tests/userland/rng.c $(MUSL_STAMP)
 
 .PHONY: test-rng-riscv test-virtio-rng-host
 test-rng-riscv: $(KERNEL_RV) $(RNG_USER_RV)
-	python3 -B tests/rng-riscv.py --kernel $(KERNEL_RV) --program $(RNG_USER_RV) --qemu $(QEMU_RISCV64) $(TEST_MEMORY_ARGS)
+	python3 -B tests/userland/rng.py --kernel $(KERNEL_RV) --program $(RNG_USER_RV) --qemu $(QEMU_RISCV64) $(TEST_MEMORY_ARGS)
 
 test-virtio-rng-host:
 	@mkdir -p build/host
@@ -1984,15 +1984,15 @@ test-sched-policy-host:
 
 .PHONY: test-multi-disk-rt-riscv
 test-multi-disk-rt-riscv: $(KERNEL_RV) $(MULTI_DISK_IO_RV) build/host/nbd-fault
-	PYTHONDONTWRITEBYTECODE=1 python3 tests/multi-disk-io-riscv.py \
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/riscv/multi-disk-io.py \
 		--kernel $(KERNEL_RV) --program $(MULTI_DISK_IO_RV) --qemu $(QEMU_RISCV64) --rt-load
 
 .PHONY: test-sched-bandwidth-riscv
 test-sched-bandwidth-riscv: $(KERNEL_RV) $(MUSL_STAMP)
-	KERNEL_RV=$(KERNEL_RV) QEMU_RISCV64=$(QEMU_RISCV64) sh tests/sched-bandwidth-riscv.sh
+	KERNEL_RV=$(KERNEL_RV) QEMU_RISCV64=$(QEMU_RISCV64) sh tests/riscv/sched-bandwidth.sh
 
 # Cost variants never reuse objects compiled with a different observation flag.
-.PHONY: force-cost-config test-cost-riscv test-cost-host test-cost-match-host test-cost-match-riscv test-cost-diagnostic-host test-cost-diagnostic-plugin-host
+.PHONY: force-cost-config test-cost-riscv test-cost-host test-cost-tools-host
 force-cost-config:
 # Shared prerequisite content must not depend on whichever target reaches it first.
 build-quote = '$(subst ','"'"',$(1))'
@@ -2010,23 +2010,10 @@ $(BUILD_DIR)/generated/link-config: force-cost-config Makefile
 	@printf '%s\n' $(call build-quote,$(BUILD_CONFIG_CC)) $(call build-quote,$(BUILD_CONFIG_LINK)) > $@.tmp
 	@cmp -s $@ $@.tmp && rm $@.tmp || mv $@.tmp $@
 COST_CASE ?= all
-test-cost-match-host:
-	python3 -B tests/test-cost-match-report.py
-	python3 -B tests/test-cost-policy.py
-	python3 -B tests/test-cost-policy-guard.py
-	python3 -B tests/test-cost-measurement.py
-	python3 -B tests/test-cost-match.py
-test-cost-diagnostic-host:
-	python3 -B tests/test-cost-diagnostic.py
-# The optional observer requires QEMU API headers and GLib development files;
-# ordinary host COST/CI gates keep their existing dependency footprint.
-test-cost-diagnostic-plugin-host:
-	@mkdir -p build/cost/diagnostic
-	cc -std=c11 -O2 -ffunction-sections -fdata-sections -Wl,--gc-sections -Wall -Wextra -Werror $$(pkg-config --cflags glib-2.0) tests/cost/diagnostic_plugin_test.c $$(pkg-config --libs glib-2.0) -o build/cost/diagnostic/collector-test
-	build/cost/diagnostic/collector-test
-COST_MATCH_OUTPUT ?= build/cost-match-riscv
-test-cost-match-riscv: test-cost-match-host
-	python3 -B tests/cost-match-riscv.py --output $(COST_MATCH_OUTPUT)
+test-cost-tools-host:
+	python3 -B tests/cost/test-cost-report.py
+	python3 -B tests/cost/test-cost-measurement.py
+	python3 -B tests/cost/test-cost-qmp.py
 # Force only this fixture's aggregate atomics through their ordinary ABI so
 # the test can handshake at the actual locked poll, without production hooks.
 .PHONY: test-cost-boundary-host
@@ -2038,7 +2025,7 @@ test-cost-boundary-host:
 	cc -std=gnu11 -O2 -g -ffunction-sections -fdata-sections -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 -DBOAROS_USER_SMP=1 -DBOAROS_TEST_IRQ_RESTORE=1 -Itests/host/sync -Ikernel/sched -idirafter include tests/cost/lock_boundary_test.c kernel/cost.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/sync.c kernel/time.c -Wl,--gc-sections,--wrap=kernel_raw_lock_release,--wrap=kernel_raw_lock_acquire,--wrap=kernel_cost_add -o build/cost/host/lock-boundary-test
 	for scenario in 1 2 3 4 5; do timeout 10s build/cost/host/lock-boundary-test $$scenario || exit $$?; done
 
-test-cost-host: test-cost-match-host test-cost-diagnostic-host test-cost-boundary-host
+test-cost-host: test-cost-tools-host test-cost-boundary-host
 	@mkdir -p build/cost/host
 	cc -std=c11 -Wall -Wextra -Werror -idirafter include -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/core_test.c kernel/cost.c -o build/cost/host/core-test
 	build/cost/host/core-test
@@ -2054,13 +2041,11 @@ test-cost-host: test-cost-match-host test-cost-diagnostic-host test-cost-boundar
 	build/cost/host/raw-test
 	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/page_test.c kernel/cost.c kernel/physical_page.c $(HOST_CPU_SOURCES) -o build/cost/host/page-test
 	build/cost/host/page-test
-	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/memory/cost_test.c kernel/cost.c kernel/physical_page.c $(HOST_CPU_SOURCES) mm/heap.c mm/uaccess.c -o build/cost/host/memory-test
+	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/memory_test.c kernel/cost.c kernel/physical_page.c $(HOST_CPU_SOURCES) mm/heap.c mm/uaccess.c -o build/cost/host/memory-test
 	build/cost/host/memory-test
-	python3 -B tests/test-cost-report.py
-	python3 -B tests/test-cost-qmp.py
 test-cost-riscv: test-cost-host
 	$(MAKE) COST_DIAGNOSTICS=1 all
-	python3 -B tests/cost-riscv.py --kernel build/cost/kernel-rv --qemu $(QEMU_RISCV64) --case $(COST_CASE)
+	python3 -B tests/cost/cost-riscv.py --kernel build/cost/kernel-rv --qemu $(QEMU_RISCV64) --case $(COST_CASE)
 
 .PHONY: test-log-host
 test-log-host:
@@ -2072,10 +2057,10 @@ test-log-host:
 test-environment-riscv: $(KERNEL_RV)
 	@if [ -n '$(TEST_MEMORIES)' ]; then \
 		for memory in $(TEST_MEMORIES); do \
-			KERNEL_RV=$(KERNEL_RV) QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$$memory sh tests/environment-riscv.sh || exit; \
+			KERNEL_RV=$(KERNEL_RV) QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$$memory sh tests/riscv/environment.sh || exit; \
 		done; \
 	else \
-		KERNEL_RV=$(KERNEL_RV) QEMU_RISCV64=$(QEMU_RISCV64) sh tests/environment-riscv.sh; \
+		KERNEL_RV=$(KERNEL_RV) QEMU_RISCV64=$(QEMU_RISCV64) sh tests/riscv/environment.sh; \
 	fi
 
 .PHONY: test-platform-profile-host
@@ -2091,7 +2076,7 @@ test-rtc-host:
 
 .PHONY: test-network-riscv
 test-network-riscv: kernel-rv
-	python3 -B tests/network-riscv.py $(TEST_MEMORY_ARGS)
+	python3 -B tests/userland/run.py $(TEST_MEMORY_ARGS)
 
 .PHONY: test-virtio-net-host test-lwip-reassembly-host test-ethernet-worker-host test-network-external-riscv force-net-config
 NET_IPV4 ?= 0x0a4d0002
@@ -2111,7 +2096,7 @@ test-lwip-reassembly-host:
 test-ethernet-worker-host:
 	python3 -B tests/host/ethernet_worker.py
 test-network-external-riscv: $(KERNEL_RV)
-	python3 -B tests/network-external.py --kernel $(KERNEL_RV) --transport both
+	python3 -B tests/userland/network-external.py --kernel $(KERNEL_RV) --transport both
 
 .PHONY: test-allocator-preemption-host
 test-allocator-preemption-host:
@@ -2123,7 +2108,7 @@ test-allocator-preemption-host:
 
 .PHONY: test-fifo-riscv
 test-fifo-riscv: $(KERNEL_RV)
-	python3 -B tests/fifo-riscv.py --kernel $(KERNEL_RV)
+	python3 -B tests/riscv/fifo.py --kernel $(KERNEL_RV)
 
 OFFLINE_PROJECT_RV := $(BUILD_DIR)/tests/user/offline-project-rv
 $(OFFLINE_PROJECT_RV): tests/workloads/toolchain/project.c $(MUSL_STAMP)
@@ -2132,66 +2117,66 @@ $(OFFLINE_PROJECT_RV): tests/workloads/toolchain/project.c $(MUSL_STAMP)
 
 .PHONY: test-offline-project-riscv test-offline-project-tmpfs-riscv
 test-offline-project-riscv: $(OFFLINE_PROJECT_RV) $(KERNEL_RV) prepare-offline-c-toolchain
-	python3 -B tests/offline-c-riscv.py --project lua --kernel $(KERNEL_RV) --program $(OFFLINE_PROJECT_RV) --toolchain-tree build/offline-c/alpine-tree --timeout 900
+	python3 -B tests/userland/offline-c.py --project lua --kernel $(KERNEL_RV) --program $(OFFLINE_PROJECT_RV) --toolchain-tree build/offline-c/alpine-tree --timeout 900
 
 test-offline-project-tmpfs-riscv: $(OFFLINE_PROJECT_RV) $(KERNEL_RV) prepare-offline-c-toolchain
-	python3 -B tests/offline-c-riscv.py --project lua --kernel $(KERNEL_RV) --program $(OFFLINE_PROJECT_RV) --toolchain-tree build/offline-c/alpine-tree --timeout 900 --tmpfs --performance
+	python3 -B tests/userland/offline-c.py --project lua --kernel $(KERNEL_RV) --program $(OFFLINE_PROJECT_RV) --toolchain-tree build/offline-c/alpine-tree --timeout 900 --tmpfs --performance
 
 .PHONY: test-uart-host
 test-uart-host:
 	python3 -B tests/host/dtb_uart_test.py
-	./tests/uart-host.sh
+	./tests/host/uart.sh
 
 .PHONY: test-tty-host
 test-tty-host:
 	@mkdir -p build/host/tty
-	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -idirafter include -fsanitize=address,undefined tests/tty/core_host.c fs/tty.c -o build/host/tty/core
+	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -idirafter include -fsanitize=address,undefined tests/host/tty/core.c fs/tty.c -o build/host/tty/core
 	build/host/tty/core
-	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -idirafter include -fsanitize=address,undefined tests/tty/endpoints_host.c fs/tty.c -o build/host/tty/endpoints
+	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -idirafter include -fsanitize=address,undefined tests/host/tty/endpoints.c fs/tty.c -o build/host/tty/endpoints
 	build/host/tty/endpoints
-	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -idirafter include -fsanitize=address,undefined tests/tty/flags_host.c fs/tty.c -o build/host/tty/flags
+	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -idirafter include -fsanitize=address,undefined tests/host/tty/flags.c fs/tty.c -o build/host/tty/flags
 	build/host/tty/flags
-	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include -ffunction-sections -fdata-sections -Wl,--gc-sections -fsanitize=address,undefined tests/tty/group_host.c kernel/sched/tty.c kernel/pid.c kernel/cpu.c kernel/raw_lock.c -o build/host/tty/group
+	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include -ffunction-sections -fdata-sections -Wl,--gc-sections -fsanitize=address,undefined tests/host/tty/group.c kernel/sched/tty.c kernel/pid.c kernel/cpu.c kernel/raw_lock.c -o build/host/tty/group
 	build/host/tty/group
 
 TTY_PROBE_RV := $(BUILD_DIR)/tests/user/tty-probe-rv
 TTY_JOBCTRL_RV := $(BUILD_DIR)/tests/user/tty-jobctrl-rv
 TTY_TERMIOS2_RV := $(BUILD_DIR)/tests/user/tty-termios2-probe-rv
-$(TTY_PROBE_RV): tests/tty/probe.c $(MUSL_STAMP)
+$(TTY_PROBE_RV): tests/workloads/tty/probe.c $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
 	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -pthread -O2 -Wall -Wextra -Werror $< -o $@
-$(TTY_JOBCTRL_RV): tests/tty/jobctrl_probe.c $(MUSL_STAMP)
+$(TTY_JOBCTRL_RV): tests/workloads/tty/jobctrl_probe.c $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
 	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -Wall -Wextra -Werror $< -o $@
-$(TTY_TERMIOS2_RV): tests/tty/termios2_probe.c $(MUSL_STAMP)
+$(TTY_TERMIOS2_RV): tests/workloads/tty/termios2_probe.c $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
 	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -Wall -Wextra -Werror $< -o $@
 
 .PHONY: test-tty-riscv test-tty-diff-riscv
 test-tty-riscv: $(KERNEL_RV) $(MUSL_STAMP)
-	python3 -B tests/tty/riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) $(TEST_MEMORY_ARGS)
+	python3 -B tests/userland/tty/riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) $(TEST_MEMORY_ARGS)
 test-tty-diff-riscv: $(KERNEL_RV) $(TTY_PROBE_RV) $(TTY_JOBCTRL_RV)
-	python3 -B tests/tty/riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) --probe $(TTY_PROBE_RV) $(TEST_MEMORY_ARGS)
-	python3 -B tests/tty/riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) --probe $(TTY_JOBCTRL_RV) --no-ctty $(TEST_MEMORY_ARGS)
+	python3 -B tests/userland/tty/riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) --probe $(TTY_PROBE_RV) $(TEST_MEMORY_ARGS)
+	python3 -B tests/userland/tty/riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) --probe $(TTY_JOBCTRL_RV) --no-ctty $(TEST_MEMORY_ARGS)
 
 .PHONY: test-pty-host
 test-pty-host:
 	@mkdir -p build/host/tty
 	cc -std=c11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -idirafter include -fsanitize=address,undefined tests/host/devpts_test.c -o build/host/tty/devpts
 	build/host/tty/devpts
-	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -idirafter include -fsanitize=address,undefined tests/pty/transport_host.c fs/tty.c fs/pty.c -o build/host/tty/pty-transport
+	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -idirafter include -fsanitize=address,undefined tests/host/tty/transport.c fs/tty.c fs/pty.c -o build/host/tty/pty-transport
 	build/host/tty/pty-transport
 
 .PHONY: test-tty-termios2-riscv
 test-tty-termios2-riscv: $(KERNEL_RV) $(TTY_TERMIOS2_RV)
-	python3 -B tests/tty/riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) --probe $(TTY_TERMIOS2_RV) $(TEST_MEMORY_ARGS)
+	python3 -B tests/userland/tty/riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) --probe $(TTY_TERMIOS2_RV) $(TEST_MEMORY_ARGS)
 
 .PHONY: test-pty-riscv test-pty-apps-riscv
 test-pty-riscv: $(KERNEL_RV) $(MUSL_STAMP)
-	python3 -B tests/tty/pty_riscv.py --case core --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) $(TEST_MEMORY_ARGS)
+	python3 -B tests/userland/tty/pty_riscv.py --case core --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) $(TEST_MEMORY_ARGS)
 test-pty-apps-riscv: $(KERNEL_RV) $(MUSL_STAMP)
-	python3 -B tests/tty/pty_riscv.py --case libc --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) $(TEST_MEMORY_ARGS)
-	python3 -B tests/tty/pty_riscv.py --case script --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) $(TEST_MEMORY_ARGS)
+	python3 -B tests/userland/tty/pty_riscv.py --case libc --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) $(TEST_MEMORY_ARGS)
+	python3 -B tests/userland/tty/pty_riscv.py --case script --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) $(TEST_MEMORY_ARGS)
 
 .PHONY: test-poll-host
 test-poll-host:
@@ -2212,7 +2197,7 @@ test-epoll-host:
 		tests/host/epoll_delivery.c kernel/raw_lock.c tests/host/cpu_context.c -Wl,--wrap=kernel_raw_lock_acquire -o build/host/epoll-delivery
 	build/host/epoll-delivery
 test-epoll-riscv: $(KERNEL_RV) $(MUSL_STAMP)
-	python3 -B tests/epoll-riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64)
+	python3 -B tests/riscv/epoll.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64)
 
 .PHONY: test-cache-growth-riscv
 test-cache-growth-riscv:
@@ -2222,15 +2207,15 @@ $(BUILD_DIR)/tests/riscv/scale_main.o: CPPFLAGS += $(LWIP_CPPFLAGS)
 
 .PHONY: test-writeback-batch-riscv
 test-writeback-batch-riscv:
-	python3 -B tests/writeback-batch-riscv.py
+	python3 -B tests/riscv/writeback-batch.py
 
 .PHONY: test-readahead-riscv
 test-readahead-riscv:
-	python3 -B tests/readahead-riscv.py
+	python3 -B tests/riscv/readahead.py
 
 .PHONY: test-demand-read-riscv
 test-demand-read-riscv:
-	python3 -B tests/demand-read-riscv.py --qemu $(QEMU_RISCV64)
+	python3 -B tests/riscv/demand-read.py --qemu $(QEMU_RISCV64)
 
 include arch/loongarch/build.mk
 
@@ -2238,7 +2223,7 @@ include arch/loongarch/build.mk
 test-build-config-host:
 	python3 -B tests/host/build_config.py
 test-elf-layout-host:
-	sh tests/elf-layout-host.sh
+	sh tests/host/elf-layout.sh
 
 .PHONY: test-ci-host
 test-ci-host: test-build-config-host
@@ -2258,7 +2243,7 @@ test-virtio-block-host:
 
 .PHONY: test-lwext4-dir-empty-host
 test-lwext4-dir-empty-host:
-	python3 -B tests/lwext4-dir-empty-host.py --sanitize
+	python3 -B tests/userland/lwext4-dir-empty-host.py --sanitize
 
 .PHONY: test-oscomp-host test-oscomp-riscv test-oscomp-loongarch test-oscomp-compat test-oscomp-official test-oscomp-supervisor-riscv test-oscomp-supervisor-loongarch
 
@@ -2303,7 +2288,7 @@ test-sync-host:
 		-Itests/host/sync -idirafter include tests/host/sync.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c -o build/host/sync-$$cpus-$$debug; \
 		build/host/sync-$$cpus-$$debug; \
 	done; done
-	python3 -B tests/sync/test_native.py
+	python3 -B tests/common/test_sync.py
 
 .PHONY: test-mm-pin-host test-memory-object-concurrency-host test-mm-shared-concurrency-host test-file-mapping-concurrency-host
 test-file-mapping-concurrency-host:
@@ -2380,11 +2365,11 @@ test-mm-concurrency-host:
 
 .PHONY: test-futex-host
 test-futex-host:
-	sh tests/futex-host.sh
+	sh tests/host/futex.sh
 
 .PHONY: test-mm-remap-host
 test-mm-remap-host:
-	sh tests/mm-remap-host.sh
+	sh tests/host/mm-remap.sh
 
 test-mm-shared-concurrency-host:
 	@mkdir -p build/host/mm
@@ -2400,11 +2385,11 @@ test-mm-shared-concurrency-host:
 .PHONY: test-mm-file-concurrency-host
 .PHONY: test-page-cache-concurrency-host
 test-page-cache-concurrency-host:
-	sh tests/page-cache-concurrency-host.sh
+	sh tests/host/page-cache-concurrency.sh
 
 .PHONY: test-tmpfs-host
 test-tmpfs-host:
-	sh tests/tmpfs-host.sh
+	sh tests/host/tmpfs.sh
 
 test-mm-file-concurrency-host:
 	@mkdir -p build/host/mm
@@ -2437,14 +2422,14 @@ test-allocator-concurrency-host:
 		build/host/allocator-concurrency-$$shift || exit; \
 	done
 
-$(BUILD_DIR)/sync-%.o: tests/sync/native.c Makefile
+$(BUILD_DIR)/sync-%.o: tests/common/sync.c Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -DBOAROS_SYNC_CASE=$* -c $< -o $@
 $(BUILD_DIR)/sync-%: $(OBJECTS) $(BUILD_DIR)/sync-%.o arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_main -o $@ $(OBJECTS) $(BUILD_DIR)/sync-$*.o
 .PHONY: test-sync-riscv
 test-sync-riscv: $(foreach case,0 1 2 3 4,$(BUILD_DIR)/sync-$(case))
-	python3 -B tests/sync/native.py --arch riscv --qemu $(QEMU_RISCV64) --kernel-dir $(BUILD_DIR)
+	python3 -B tests/common/sync.py --arch riscv --qemu $(QEMU_RISCV64) --kernel-dir $(BUILD_DIR)
 test-riscv: test-sync-riscv
 
 .PHONY: test-wait-host
@@ -2453,23 +2438,23 @@ test-wait-host:
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/wait.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/runqueue.c -Wl,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release -o build/host/wait
 	build/host/wait
 
-$(BUILD_DIR)/wait-native.o: tests/wait/native.c Makefile
+$(BUILD_DIR)/wait-native.o: tests/common/wait.c Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 $(BUILD_DIR)/wait-native: $(OBJECTS) $(BUILD_DIR)/wait-native.o arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_scheduler_init,--wrap=kernel_wait_backend_switch,--wrap=kernel_wait_backend_switch_locked -o $@ $(OBJECTS) $(BUILD_DIR)/wait-native.o
 .PHONY: test-wait-riscv
 test-wait-riscv: $(BUILD_DIR)/wait-native
-	python3 -B tests/wait/native.py --arch riscv --qemu $(QEMU_RISCV64) --kernel-dir $(BUILD_DIR)
+	python3 -B tests/common/wait.py --arch riscv --qemu $(QEMU_RISCV64) --kernel-dir $(BUILD_DIR)
 
-$(BUILD_DIR)/sched-lifecycle-native.o: tests/wait/native.c Makefile
+$(BUILD_DIR)/sched-lifecycle-native.o: tests/common/wait.c Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -DBOAROS_SCHED_LIFECYCLE=1 -c $< -o $@
 $(BUILD_DIR)/sched-lifecycle-native: $(OBJECTS) $(BUILD_DIR)/sched-lifecycle-native.o arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_scheduler_init,--wrap=kernel_wait_backend_switch,--wrap=kernel_wait_backend_switch_locked -o $@ $(OBJECTS) $(BUILD_DIR)/sched-lifecycle-native.o
 .PHONY: test-sched-lifecycle-riscv
 test-sched-lifecycle-riscv: $(BUILD_DIR)/sched-lifecycle-native
-	python3 -B tests/wait/native.py --arch riscv --qemu $(QEMU_RISCV64) --kernel-dir $(BUILD_DIR) --case sched-lifecycle
+	python3 -B tests/common/wait.py --arch riscv --qemu $(QEMU_RISCV64) --kernel-dir $(BUILD_DIR) --case sched-lifecycle
 -include $(BUILD_DIR)/sched-lifecycle-native.d
 test-riscv: test-sched-lifecycle-riscv
 
@@ -2487,30 +2472,30 @@ $(BUILD_DIR)/sync-%.d: ;
 .PHONY: test-files-concurrency-host
 .PHONY: test-file-io-concurrency-host
 test-file-io-concurrency-host:
-	sh tests/file-io-concurrency-host.sh
+	sh tests/host/file-io-concurrency.sh
 
 .PHONY: test-write-target-host test-readahead-host
 test-write-target-host:
-	sh tests/write-target-host.sh
+	sh tests/host/write-target.sh
 
 test-readahead-host:
-	sh tests/readahead-host.sh
+	sh tests/host/readahead.sh
 
 .PHONY: test-ext4-node-resource-host
 test-ext4-node-resource-host:
 	FILE_IO_HOST_BUILD=$${FILE_IO_HOST_BUILD:-build/host/ext4-node-resource} \
 	FILE_IO_HOST_TEST_SOURCE=tests/host/ext4_node_resource.c FILE_IO_HOST_TCP=0 \
 	FILE_IO_HOST_LDFLAGS='-Wl,--wrap=kernel_heap_allocate_zeroed,--wrap=kernel_heap_release,--wrap=kernel_rwlock_init,--wrap=jbd_trans_set_block_dirty_range,--wrap=boaros_lwext4_inode_get,--wrap=ext4_metadata_execute,--wrap=ext4_fclose' \
-	sh tests/file-io-concurrency-host.sh
+	sh tests/host/file-io-concurrency.sh
 
 .PHONY: test-ext4-acl-xattr-host
 test-ext4-acl-xattr-host:
 	FILE_IO_HOST_BUILD=$${FILE_IO_HOST_BUILD:-build/host/ext4-acl-xattr} \
 	FILE_IO_HOST_TEST_SOURCE=tests/host/ext4_acl_xattr.c FILE_IO_HOST_TCP=0 \
 	FILE_IO_HOST_LDFLAGS='-Wl,--wrap=ext4_balloc_alloc_block,--wrap=ext4_trans_block_get' \
-	sh tests/file-io-concurrency-host.sh
+	sh tests/host/file-io-concurrency.sh
 	FILE_IO_HOST_BUILD=$${FILE_IO_HOST_BUILD:-build/host/ext4-acl-xattr} \
-	sh tests/ext4-acl-nojournal-host.sh
+	sh tests/host/ext4-acl-nojournal.sh
 
 .PHONY: test-posix-acl-host
 test-posix-acl-host:
@@ -2519,18 +2504,18 @@ test-posix-acl-host:
 	build/host/posix-acl
 
 test-files-concurrency-host:
-	sh tests/files-concurrency-host.sh
+	sh tests/host/files-concurrency.sh
 
 .PHONY: test-mqueue-host test-netlink-notify-host
 test-mqueue-host:
 	sh tests/host/mqueue.sh
 
 test-netlink-notify-host:
-	sh tests/netlink-notify-host.sh
+	sh tests/host/netlink-notify.sh
 
 .PHONY: test-pipe-concurrency-host
 test-pipe-concurrency-host:
-	sh tests/pipe-concurrency-host.sh
+	sh tests/host/pipe-concurrency.sh
 
 .PHONY: test-scheduler-stack-slots-host
 test-scheduler-stack-slots-host:
@@ -2598,26 +2583,6 @@ test-proc-index-host:
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -DBOAROS_LOCK_DEBUG=1 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/sync -idirafter include tests/host/proc_index.c kernel/credentials.c kernel/sched/identity.c kernel/pid.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c -Wl,--gc-sections -o build/host/proc-index-$$shift; \
 	build/host/proc-index-$$shift; build/host/proc-index-$$shift snapshot; done
 
-build/riscv/io-proc-cost: tests/workloads/cost/io-proc.c $(MUSL_STAMP)
-	@mkdir -p $(@D)
-	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread -Wall -Wextra -Werror $< -o $@
-
-build/riscv/credential-cost: tests/workloads/cost/credentials.c tests/accounting/posix.c tests/accounting/signal_stack.h tests/accounting/futex.h tests/workloads/signal/queued_threads.h $(MUSL_STAMP)
-	@mkdir -p $(@D)
-	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread -Wall -Wextra -Werror $< -o $@
-
-build/riscv/signal-futex-cost: tests/workloads/cost/signal-futex.c tests/accounting/posix.c tests/accounting/signal_stack.h tests/accounting/futex.h tests/workloads/signal/queued_threads.h $(MUSL_STAMP)
-	@mkdir -p $(@D)
-	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread -Wall -Wextra -Werror $< -o $@
-
-build/riscv/mm-msg-cost: tests/workloads/cost/mm-msg.c tests/accounting/posix.c tests/accounting/signal_stack.h tests/accounting/futex.h tests/workloads/signal/queued_threads.h $(MUSL_STAMP)
-	@mkdir -p $(@D)
-	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread -Wall -Wextra -Werror $< -o $@
-
-build/riscv/rlimits-pidfd-cost: tests/workloads/cost/rlimits-pidfd.c tests/workloads/cost/mm-msg.c tests/accounting/posix.c tests/accounting/signal_stack.h tests/accounting/futex.h tests/workloads/signal/queued_threads.h $(MUSL_STAMP)
-	@mkdir -p $(@D)
-	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread -Wall -Wextra -Werror $< -o $@
-
 test-sched-concurrency-host:
 	@mkdir -p build/host
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sched_concurrency.c tests/host/signal_owner.c kernel/signal_pending.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/sched/process.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_sched_policy_charge,--wrap=kernel_sched_policy_set,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release -o build/host/sched-concurrency
@@ -2677,7 +2642,7 @@ test-wait-process-smp-riscv: $(COMPOSITION_ELF) test-user-smp-composition-host
 	python3 -B tests/smp/composition.py --scene wait --firmware $(QEMU_RISCV_FIRMWARE) --qemu $(QEMU_RISCV64) --program $(COMPOSITION_ELF) $(TEST_MEMORY_ARGS)
 test-user-smp-programs-riscv: test-program-inventory-host
 	$(MAKE) kernel-rv-user-smp
-	python3 -B tests/program-inventory/run.py --execution-profile rv-user-smp --firmware $(QEMU_RISCV_FIRMWARE) --qemu $(QEMU_RISCV64) --reuse-builds $(TEST_MEMORY_ARGS)
+	python3 -B tests/userland/inventory/run.py --execution-profile rv-user-smp --firmware $(QEMU_RISCV_FIRMWARE) --qemu $(QEMU_RISCV64) --reuse-builds $(TEST_MEMORY_ARGS)
 test-user-smp-runtime-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PTHREAD_TLS_DSO_RV) $(MUSL_LDSO) $(DIFF_ABI_RV)
 	$(MAKE) kernel-rv-user-smp
 	python3 -B tests/smp/user.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel $(USER_SMP_BUILD)/kernel-rv --program $(DIFF_ABI_RV) --manifest tests/diff-abi/cases.txt $(TEST_MEMORY_ARGS)
@@ -2731,7 +2696,7 @@ test-mm-smp-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PTHREAD
 		QEMU_RISCV64=$(CURDIR)/tests/smp/qemu.py KERNEL_RV=$(CURDIR)/build/riscv-mm-smp-test$(SMP_BUILD_SUFFIX)/kernel-rv \
 		REAL_USERLAND_RV=$(REAL_USERLAND_RV) PTHREAD_USERLAND_RV=$(PTHREAD_USERLAND_RV) \
 		PTHREAD_TLS_DSO_RV=$(PTHREAD_TLS_DSO_RV) MUSL_LDSO=$(MUSL_LDSO) \
-		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/userland-riscv.sh; \
+		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/riscv/userland.sh; \
 	done
 test-smp-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PTHREAD_TLS_DSO_RV) $(MUSL_LDSO)
 	$(MAKE) SMP=1 SMP_TEST=1 SMP_TEST_PROFILE=normal COST_DIAGNOSTICS=0 all
@@ -2741,7 +2706,7 @@ test-smp-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PTHREAD_TL
 		QEMU_RISCV64=$(CURDIR)/tests/smp/qemu.py KERNEL_RV=$(CURDIR)/build/riscv-smp$(SMP_BUILD_SUFFIX)-test/kernel-rv \
 		REAL_USERLAND_RV=$(REAL_USERLAND_RV) PTHREAD_USERLAND_RV=$(PTHREAD_USERLAND_RV) \
 		PTHREAD_TLS_DSO_RV=$(PTHREAD_TLS_DSO_RV) MUSL_LDSO=$(MUSL_LDSO) \
-		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/userland-riscv.sh; \
+		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/riscv/userland.sh; \
 	done
 
 .PHONY: test-mm-shared-smp-riscv test-mm-shared-smp-userland-riscv
@@ -2759,7 +2724,7 @@ test-mm-shared-smp-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(
 		QEMU_RISCV64=$(CURDIR)/tests/smp/qemu.py KERNEL_RV=$(CURDIR)/build/riscv-mm-shared-smp-test$(SMP_BUILD_SUFFIX)/kernel-rv \
 		REAL_USERLAND_RV=$(REAL_USERLAND_RV) PTHREAD_USERLAND_RV=$(PTHREAD_USERLAND_RV) \
 		PTHREAD_TLS_DSO_RV=$(PTHREAD_TLS_DSO_RV) MUSL_LDSO=$(MUSL_LDSO) \
-		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/userland-riscv.sh; \
+		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/riscv/userland.sh; \
 	done
 
 
@@ -2778,12 +2743,12 @@ test-mm-file-smp-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PT
 		QEMU_RISCV64=$(CURDIR)/tests/smp/qemu.py KERNEL_RV=$(CURDIR)/build/riscv-mm-file-smp-test$(SMP_BUILD_SUFFIX)/kernel-rv \
 		REAL_USERLAND_RV=$(REAL_USERLAND_RV) PTHREAD_USERLAND_RV=$(PTHREAD_USERLAND_RV) \
 		PTHREAD_TLS_DSO_RV=$(PTHREAD_TLS_DSO_RV) MUSL_LDSO=$(MUSL_LDSO) \
-		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/userland-riscv.sh; \
+		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/riscv/userland.sh; \
 	done
 
 .PHONY: test-mm-disk-concurrency-host test-mm-disk-smp-riscv test-mm-disk-smp-userland-riscv
 test-mm-disk-concurrency-host:
-	sh tests/mm-disk-concurrency-host.sh
+	sh tests/host/mm-disk-concurrency.sh
 
 test-mm-disk-smp-riscv:
 	$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 MM_SHARED_SMP_TEST=1 MM_FILE_SMP_TEST=1 MM_DISK_SMP_TEST=1 COST_DIAGNOSTICS=0 all
@@ -2800,7 +2765,7 @@ test-mm-disk-smp-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PT
 		QEMU_RISCV64=$(CURDIR)/tests/smp/qemu.py KERNEL_RV=$(CURDIR)/build/riscv-mm-disk-smp-test$(SMP_BUILD_SUFFIX)/kernel-rv \
 		REAL_USERLAND_RV=$(REAL_USERLAND_RV) PTHREAD_USERLAND_RV=$(PTHREAD_USERLAND_RV) \
 		PTHREAD_TLS_DSO_RV=$(PTHREAD_TLS_DSO_RV) MUSL_LDSO=$(MUSL_LDSO) \
-		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/userland-riscv.sh; \
+		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/riscv/userland.sh; \
 	done
 
 .PHONY: test-file-io-smp-riscv test-file-io-smp-userland-riscv
@@ -2817,7 +2782,7 @@ test-file-io-smp-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PT
 		QEMU_RISCV64=$(CURDIR)/tests/smp/qemu.py KERNEL_RV=$(abspath $(FILE_IO_SMP_BUILD))/kernel-rv \
 		REAL_USERLAND_RV=$(REAL_USERLAND_RV) PTHREAD_USERLAND_RV=$(PTHREAD_USERLAND_RV) \
 		PTHREAD_TLS_DSO_RV=$(PTHREAD_TLS_DSO_RV) MUSL_LDSO=$(MUSL_LDSO) \
-		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/userland-riscv.sh; \
+		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/riscv/userland.sh; \
 	done
 
 .PHONY: test-files-smp-riscv test-files-smp-userland-riscv
@@ -2834,25 +2799,25 @@ test-files-smp-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PTHR
 		QEMU_RISCV64=$(CURDIR)/tests/smp/qemu.py KERNEL_RV=$(abspath $(FILES_SMP_BUILD))/kernel-rv \
 		REAL_USERLAND_RV=$(REAL_USERLAND_RV) PTHREAD_USERLAND_RV=$(PTHREAD_USERLAND_RV) \
 		PTHREAD_TLS_DSO_RV=$(PTHREAD_TLS_DSO_RV) MUSL_LDSO=$(MUSL_LDSO) \
-		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/userland-riscv.sh; \
+		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/riscv/userland.sh; \
 	done
 
 .PHONY: test-instruction-sync-host
 test-instruction-sync-host:
-	python3 -B tests/test-instruction-sync.py
+	python3 -B tests/userland/test-instruction-sync.py
 
 # Fixed CPU-accounting cost workloads; supply saved baseline kernels to cost.py.
 .PHONY: build-accounting-cost
 build-accounting-cost: $(BUILD_DIR)/tests/user/cpu-account-cost-rv $(LA_BUILD)/cpu-account-cost $(SQLITE_CLI_STATIC_RV) $(LA_BUILD)/sqlite3-static
-$(BUILD_DIR)/tests/user/cpu-account-cost-rv: tests/accounting/cost.c $(MUSL_STAMP)
+$(BUILD_DIR)/tests/user/cpu-account-cost-rv: tests/cost/accounting/cost.c $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
 	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -pthread -O2 -Wall -Wextra -Werror $< -o $@
-$(LA_BUILD)/cpu-account-cost: tests/accounting/cost.c $(LA_SQLITE_CC)
+$(LA_BUILD)/cpu-account-cost: tests/cost/accounting/cost.c $(LA_SQLITE_CC)
 	REALGCC=$(LA_CC) $(LA_SQLITE_CC) $(LA_SQLITE_FLAGS) -static -pthread -O2 -Wall -Wextra -Werror $< -o $@
 
 .PHONY: test-accounting-cost-host
 test-accounting-cost-host:
-	python3 -B tests/accounting/cost_test.py
+	python3 -B tests/cost/accounting/cost_test.py
 
 .PHONY: test-service-scope-host
 test-service-scope-host:
@@ -2875,12 +2840,12 @@ test-event-fd-host:
 
 .PHONY: test-rt-limits-host
 test-rt-limits-host:
-	sh tests/rt-limits-host.sh
+	sh tests/host/rt-limits.sh
 
 .PHONY: test-pi-priority-host
 test-pi-priority-host:
-	sh tests/pi-priority-host.sh
+	sh tests/host/pi-priority.sh
 
 .PHONY: test-pi-exit-host
 test-pi-exit-host:
-	sh tests/pi-exit-host.sh
+	sh tests/host/pi-exit.sh

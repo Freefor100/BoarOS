@@ -82,7 +82,7 @@ make test-stack-usage test-stack-usage-la
 通用根盘 fixture 使用 `INIT_CONFIG=config/init.json`，验证后用 `make all` 恢复兼容默认。`make run-riscv` 不附根盘，停留 timer-idle；
 `make debug-riscv` 以 `-S -s` 等待 GDB。LA 启动参数见[LA 模块](docs/modules/loongarch-boot.md)。
 
-`build/` 仅长期保留可复用构建缓存。`python3 -B tests/prune-build.py` 预览、`make prune-build` 清理已核对的运行目录、
+`build/` 仅长期保留可复用构建缓存。`python3 -B tests/tools/prune-build.py` 预览、`make prune-build` 清理已核对的运行目录、
 日志和镜像；需要保留现场时使用 `PRUNE_BUILD_KEEP`。`make clean` 会同时删除可复用内核构建产物。
 
 ## 开发方向与文档
@@ -115,3 +115,5 @@ main 默认构建不发布或预加载它。原盘程序、libc 和 judge 保持
 - [文档导航](docs/README.md)：模块、学习材料和当前基线。
 - [工程原则](docs/design.md)、[贡献说明](CONTRIBUTING.md)：设计、验证和提交规则。
 - [固定资料](references/README.md)、[第三方代码](docs/third-party.md)：版本、来源与许可。
+
+测试入口与目录职责见 [测试目录](tests/README.md)。

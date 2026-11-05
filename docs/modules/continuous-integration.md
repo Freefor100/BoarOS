@@ -138,7 +138,7 @@ AppArmor userns限制时，对专用`unshare`副本加载带userns许可的profi
 ```sh
 make prepare-program-environment
 python3 -B tests/network_inputs.py
-python3 -B tests/program-inventory/run.py --arch riscv --build-only
+python3 -B tests/userland/inventory/run.py --arch riscv --build-only
 python3 -B tests/ci/netns.py
 python3 -B tests/ci/run.py --arch riscv --suite extended
 ```

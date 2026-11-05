@@ -29,8 +29,8 @@ binutils 2.45.1，工具前缀与 Desktop 不同。Makefile 默认优先选择 D
 `riscv64-elf-`；显式传入 `CROSS_COMPILE` 会覆盖自动选择。
 
 Laptop 已用不带 `CROSS_COMPILE` 覆盖的 `make all` 和 `make test-riscv`
-验证默认构建与 512 MiB、1 GiB 两种 guest RAM 启动。运行
-`./tests/toolchain-prefix.sh` 可以单独验证两种前缀与优先级。
+验证默认构建与 512 MiB、1 GiB 两种 guest RAM 启动。当前前缀由 Makefile
+自动选择，也可通过 `CROSS_COMPILE` 显式指定。
 
 ## Desktop Freestanding 证据
 

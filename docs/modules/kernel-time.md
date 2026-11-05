@@ -72,7 +72,7 @@ Goldfish的真实墙钟另由10:135 RTC字符后端提供只读RTC_RD_TIME；UTC
 因此旧值输出 EFAULT 不回滚新 alarm；NULL 新值按固定 Linux 取消。时间取整与
 100 Hz timer delivery 的界限如上，不宣称高精度到期交付。
 
-未知 which 返回EINVAL。重建 `python3 -B tests/network-riscv.py --workload timer`：同 ELF 对照
+未知 which 返回EINVAL。重建 `python3 -B tests/userland/run.py --workload timer`：同 ELF 对照
 Linux，核对阻塞 read 的 EINTR、周期、坏参数/指针、fork、线程组长退出及非组长
 exec 后的交付和最终物理页/堆回收。
 
@@ -90,7 +90,7 @@ CPU0在既有timer路径只遍历具有活动CPU期限或有限CPU限额的目�
 
 `RLIMIT_CPU` 默认软、硬限额均无限，按全组累计用户加内核时间（PROF）执行。组内共享，fork 复制限额但从子进程自己的 CPU 用量开始，exec 保留；非组长 exec 随组身份转移。软限额到达时递送 SIGXCPU，并将软值提高一秒；硬限额先于软限额判断，到达后以 SIGKILL 终止全组。下调限额保留已用时间，在下一次 CPU 检查时处理。
 
-有限软值加入现有进程 CPU 活动索引，与 itimer、POSIX timer 共用一次组用量采样。停用所有 CPU 期限且限额恢复无限后摘除；普通 syscall 进出不增加限额采样。实际递送精度受原 timer 周期、IRQ 延迟和执行调度影响。`tests/network_runner.py --workload cpu` 用同 ELF 对照 Linux，覆盖限额、线程/exec、CPU 睡眠及 getcpu。
+有限软值加入现有进程 CPU 活动索引，与 itimer、POSIX timer 共用一次组用量采样。停用所有 CPU 期限且限额恢复无限后摘除；普通 syscall 进出不增加限额采样。实际递送精度受原 timer 周期、IRQ 延迟和执行调度影响。`tests/userland/run.py --workload cpu` 用同 ELF 对照 Linux，覆盖限额、线程/exec、CPU 睡眠及 getcpu。
 
 ## LA LS7A RTC
 
@@ -131,4 +131,4 @@ REALTIME/MONOTONIC使用共享AVL算法和各自对象保护，调度器只读�
 
 SIG_IGN的周期事件停放并保留相位，恢复disposition时移回待决队列；单独屏蔽不会重新投递已经停放的事件。SIGEV_NONE只按查询推进，停用后的旧单次期限仍可能返回剩余量，沿固定Linux的common_timer_get行为。timer_settime只解释TIMER_ABSTIME位，其余位按参考Linux忽略；NULL新值返回EINVAL，旧值输出EFAULT保留新设置。exec清除原生及用户提供的SI_TIMER记录，保留其他排队消息的顺序。
 
-`make test-posix-timer-host`以4/16KiB页检查真实通知记录、额度、借用、代次及CPU阈值；`tests/network_runner.py --workload posix`提供两架构与固定Linux的原生ABI、真实handler/libc回调和生命周期检查。四核观察构建复用composition观察点核对调用CPU与CPU0到期位置。相同短例还以官方静态glibc在两架构的Linux/BoarOS运行，核对libc真实SIGEV_THREAD回调、输出EFAULT后的通知消费及输入输出别名。CPU时钟反例按被测时钟推进工作量，VIRT使用用户时间，PROF/SCHED使用合计时间。
+`make test-posix-timer-host`以4/16KiB页检查真实通知记录、额度、借用、代次及CPU阈值；`tests/userland/run.py --workload posix`提供两架构与固定Linux的原生ABI、真实handler/libc回调和生命周期检查。四核观察构建复用composition观察点核对调用CPU与CPU0到期位置。相同短例还以官方静态glibc在两架构的Linux/BoarOS运行，核对libc真实SIGEV_THREAD回调、输出EFAULT后的通知消费及输入输出别名。CPU时钟反例按被测时钟推进工作量，VIRT使用用户时间，PROF/SCHED使用合计时间。

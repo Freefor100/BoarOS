@@ -87,9 +87,9 @@ release、copy 与 abandon，实际进展仍由 worker/NIC-only 契约单独验�
 
 ```sh
 make test-virtio-net-host test-lwip-reassembly-host test-ethernet-worker-host
-python3 -B tests/network-riscv.py --only boaros --workload interface
-python3 -B tests/network-external.py --transport both
-python3 -B tests/network-external.py --only linux --transport modern
+python3 -B tests/userland/run.py --only boaros --workload interface
+python3 -B tests/userland/network-external.py --transport both
+python3 -B tests/userland/network-external.py --only linux --transport modern
 ```
 
 宿主模型独立解码寄存器银行与 split-ring 字节，63 项覆盖两种传输、头部、64 位
@@ -113,12 +113,12 @@ python3 -B tests/network-external.py --only linux --transport modern
 python3 -B tests/host/virtio_net.py --sanitize
 python3 -B tests/host/network_owner.py --sanitize
 make test-net-failures-loongarch
-python3 -B tests/network-loongarch.py --workload contract
-python3 -B tests/network-loongarch.py --workload content
-python3 -B tests/network-loongarch.py --workload timer
-python3 -B tests/network-loongarch.py --workload admission
-python3 -B tests/network-external.py --arch loongarch
-python3 -B tests/network-external.py --transport both
+python3 -B tests/userland/run.py --workload contract
+python3 -B tests/userland/run.py --workload content
+python3 -B tests/userland/run.py --workload timer
+python3 -B tests/userland/run.py --workload admission
+python3 -B tests/userland/network-external.py --arch loongarch
+python3 -B tests/userland/network-external.py --transport both
 ```
 
 原宿主寄存器/ring模型在4KiB/16KiB、诊断开/关下运行实际共用核心，ASan/UBSan

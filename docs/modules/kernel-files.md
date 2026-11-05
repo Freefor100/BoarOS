@@ -93,7 +93,7 @@ OFD pin 覆盖可能缺页睡眠的复制。`make test-record-lock-riscv` 用同
 
 `fs/flock.c` 为普通 backing inode 按需分配锁上下文，仅保存读者数、独占标记与等待队列；每个 OFD 内嵌 owner。VFS 别名共享节点，匿名 pipe 两端共享管道 inode，socket 各自独立，pidfd 按目标 PID 共享，mqueue 按队列共享。eventfd、timerfd、signalfd 与 epoll 对照 `references/linux/fs/anon_inodes.c` 使用共同匿名 inode；永久匿名 inode 与启动 console 使用静态上下文，其他上下文随真实 backing 对象结束释放。状态检查与等待登记由对象 raw 保护，分配、通知和 park 在保护外，由实际调用 CPU 执行；任务的 `flock_file` 持有等待期间的 OFD pin，正常返回和强制退出都通过同一释放入口归还它，信号沿 `ERESTARTSYS` 返回。
 
-`sh tests/flock-host.sh` 通过实际 raw/park 实现检查转换、已提交等待、信号取消、并发首次分配及资源归还；`tests/workloads/locks/flock.c` 检查 syscall、inode 身份及 dup/fork/SCM_RIGHTS 生命周期。
+`sh tests/host/flock.sh` 通过实际 raw/park 实现检查转换、已提交等待、信号取消、并发首次分配及资源归还；`tests/workloads/locks/flock.c` 检查 syscall、inode 身份及 dup/fork/SCM_RIGHTS 生命周期。
 
 ## `openat` 与路径边界
 
@@ -193,7 +193,7 @@ pipe 的内核来源片段不允许后继普通写并尾，普通 write/writev �
 不会借用可被普通写修改的文件页。这保护容量和等待语义，不能只检查内容复制成功。
 
 ```sh
-python3 -B tests/network-riscv.py --workload sendfile
+python3 -B tests/userland/run.py --workload sendfile
 make test-files-partial-write-riscv
 ```
 
@@ -366,8 +366,8 @@ filecap设置接受revision 2／3，revision 3的rootid=0查询为revision 2，�
 不把空值当成删除。tmpfs和ext4均把成功设置的原始属性交给exec；普通写入和chown等
 继续按原接口规则清除特权。实际存储与事务、缓存失效见[VFS与ext4](vfs-ext4.md)。
 
-短例入口为`sh tests/xattr-host.sh`、`make test-posix-acl-host`、
-`make test-ext4-acl-xattr-host`和`python3 tests/network_runner.py --workload acl`；
+短例入口为`sh tests/host/xattr.sh`、`make test-posix-acl-host`、
+`make test-ext4-acl-xattr-host`和`python3 tests/userland/run.py --workload acl`；
 客机程序使用同一ELF对照固定Linux。
 
 
@@ -376,7 +376,7 @@ filecap设置接受revision 2／3，revision 3的rootid=0查询为revision 2，�
 `statfs/fstatfs` 输出 RV64 asm-generic 的 120 字节布局，输出前取得真实 mount 统计；路径/fd 错误优先于输出指针 fault。fd 直接使用其持有的 mount，unlink 后仍可查询；没有文件系统 mount 的 pipe/匿名 epoll/初始 console 返回 `ENOTSUP`，不伪装成根盘。统计不触发文件数据写回，空闲块只计实际磁盘分配；容量扣除真实 ext4 元数据及内部 journal 开销，bavail 扣除 superblock 保留块。BoarOS 没有 Linux 的紧急 extent 保留池，因此不额外扣除不存在的池。只读和 relatime 标志来自实际挂载契约。
 
 固定依据为 `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `fs/utimes.c`、`fs/statfs.c`、`fs/ext4/super.c`、`fs/inode.c` 与 `include/uapi/asm-generic/statfs.h`。测试入口为 `make test-files-riscv test-lwext4-metadata-host test-userland-riscv test-diff-abi-riscv`。
-所有权窄宿主回归用`./tests/lwext4-metadata-host.sh ownership`，覆盖大ID、
+所有权窄宿主回归用`./tests/host/lwext4-metadata.sh ownership`，覆盖大ID、
 内联/外部/共享属性块、嵌套abort、逐分配点OOM、WRITE/FLUSH错误、重开与独立e2fsck；
 `tests/diff-abi/ownership.c`用同ELF比较ext4/tmpfs、pipe、符号链接、只读与错误顺序。
 
@@ -507,7 +507,7 @@ RV64 `truncate(45)`复制完整pathname后取得稳定path；相对cwd、绝对�
 末端符号链接沿共同解析器，长度与错误顺序由`path_only.c`核对。
 `ftruncate/O_TRUNC/truncate`共用后端大小、时间、capability清理与映射失效；
 `make test-lwext4-metadata-host`包含共享EA、操作abort和持久化格式核对，
-`sh tests/lwext4-metadata-host.sh truncate`可只检查新增属性边界。
+`sh tests/host/lwext4-metadata.sh truncate`可只检查新增属性边界。
 
 RV64 `sync(81)`同步当前单一挂载树；`syncfs(267)`同步fd实际所属挂载，O_PATH返回
 EBADF，字符节点及命名FIFO不改变所属挂载。匿名pipe/socket/epoll与无路径console没有
@@ -562,4 +562,4 @@ LA musl1.2.5 不提供旧 `fstat/newfstatat` syscall，而通过 statx 实现 li
 
 读写和就绪查询在发起CPU执行，epoll复用现有控制与关闭关联协议。无epoll观察者的末次关闭本地完成，有关联时由现有CPU0路径先拆除。匿名对象通过fstat及`/proc/<pid>/fd`显示身份；pread/pwrite返回ESPIPE，lseek保留Linux的noop行为。
 
-匿名事件的阻塞读写沿共同可重启调用协议返回ERESTARTSYS，由实际线程的handler设置决定EINTR或重执行。向量写已完成前缀时直接返回前缀，保留已接纳计数。timerfd行为见[时间模块](kernel-time.md#timerfd期限)。`tests/workloads/event/boundary.c`保留定位I/O、原始地址范围、定向ET、空向量及写入错误优先级的直接反例；`tests/network_runner.py --workload event`复用共同Linux/客户机对照入口，观察构建另核对实际载荷pin和执行CPU。
+匿名事件的阻塞读写沿共同可重启调用协议返回ERESTARTSYS，由实际线程的handler设置决定EINTR或重执行。向量写已完成前缀时直接返回前缀，保留已接纳计数。timerfd行为见[时间模块](kernel-time.md#timerfd期限)。`tests/workloads/event/boundary.c`保留定位I/O、原始地址范围、定向ET、空向量及写入错误优先级的直接反例；`tests/userland/run.py --workload event`复用共同Linux/客户机对照入口，观察构建另核对实际载荷pin和执行CPU。

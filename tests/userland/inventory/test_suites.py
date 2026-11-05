@@ -1,0 +1,395 @@
+"""Observation integrity for isolated real-program guests."""
+import sys
+from pathlib import Path
+sys.path[:0] = [str(Path(__file__).resolve().parent), str(Path(__file__).resolve().parents[2])]
+import importlib.util
+import json
+import os
+import unittest
+import subprocess
+import tempfile
+from unittest.mock import patch
+
+spec = importlib.util.spec_from_file_location('suites', Path(__file__).with_name('suites.py'))
+suites = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(suites)
+
+
+def stream(status=0, timed_out=0, out='68690a', err=''):
+    return (f'SUITE BEGIN 1 sample\nSUITE ENV proc 0 0\nSUITE ENV sysfs 0 0\n'
+            f'SUITE DATA O {out}.\nSUITE DATA E {err}.\n'
+            f'SUITE WAIT {status}\nSUITE TIMEOUT {timed_out}\nSUITE END sample\n')
+
+
+class ObservationTests(unittest.TestCase):
+    def test_smp_reference_preserves_original_program_facilities(self):
+        here=Path(__file__).parent
+        required={line for line in (here/'linux.config').read_text().splitlines()
+                  if line.startswith('CONFIG_') and line.endswith('=y')}
+        actual=set((here.parent/'smp/linux-user.config').read_text().splitlines())
+        self.assertFalse(required-actual, sorted(required-actual))
+    def test_execution_profile_does_not_change_default_architecture_facts(self):
+        original = suites.PROFILES['riscv'].boot('qemu', 'kernel', '512M')
+        configuration = suites.execution_configuration('rv-user-smp', 'riscv', 2, '/firmware')
+        command = suites.execution_command(original, configuration)
+        self.assertEqual(command[command.index('-smp') + 1], '2')
+        self.assertEqual(command[command.index('-bios') + 1], '/firmware')
+        self.assertIn('tcg,thread=multi', command)
+        self.assertNotIn('-icount', command)
+        self.assertEqual(original[original.index('-smp') + 1], '1')
+        self.assertEqual(suites.execution_command(original,
+            suites.execution_configuration('single', 'riscv', 1, 'default')), original)
+
+    def test_invalid_execution_profile_rejected_before_guest_preparation(self):
+        for profile, arch, cpus, firmware in (
+                ('rv-user-smp', 'loongarch', 2, '/firmware'),
+                ('single', 'riscv', 2, 'default'),
+                ('rv-user-smp', 'riscv', 3, '/firmware'),
+                ('rv-user-smp', 'riscv', 2, 'default'),
+                ('unknown', 'riscv', 1, 'default')):
+            with self.subTest(profile=profile, arch=arch, cpus=cpus), self.assertRaises(ValueError):
+                suites.execution_configuration(profile, arch, cpus, firmware)
+
+    def test_user_profile_requires_smp_reference_and_user_kernel(self):
+        with tempfile.TemporaryDirectory() as output:
+            folder = Path(output)
+            kernel = folder / 'kernel'; config = folder / '.config'
+            kernel.write_bytes(b'ordinary single CPU kernel')
+            config.write_text('CONFIG_SMP=n\n')
+            with self.assertRaisesRegex(ValueError, 'SMP reference'):
+                suites.validate_execution_inputs('rv-user-smp', kernel, config)
+            config.write_text('CONFIG_SMP=y\nCONFIG_NR_CPUS=2\n')
+            with self.assertRaisesRegex(ValueError, 'user SMP kernel'):
+                suites.validate_execution_inputs('rv-user-smp', kernel, config)
+
+    def test_strict_result_uses_only_selected_cases(self):
+        state = {'status': 'partial', 'results': {
+            'selected': {'status': 'pass', 'completed': True},
+            'other': {'status': 'not-run'}}}
+        self.assertTrue(suites.strict_result_passes(state, ['selected']))
+        self.assertFalse(suites.strict_result_passes(state, None))
+        state['results']['other'] = {'status': 'nonzero-exit',
+                                     'completed': True}
+        self.assertTrue(suites.strict_result_passes(state, ['selected']))
+        self.assertFalse(suites.strict_result_passes(state,
+                                                    ['selected', 'other']))
+        self.assertFalse(suites.strict_result_passes(state, ['unknown']))
+        for status in ('output-mismatch', 'reference-not-pass', 'timeout',
+                       'runner-error', 'not-run'):
+            state['results']['selected'] = {'status': status,
+                                            'completed': status != 'not-run'}
+            self.assertFalse(suites.strict_result_passes(state, ['selected']))
+        state['results']['selected'] = {'status': 'pass', 'completed': True}
+        state['status'] = 'interrupted'
+        self.assertFalse(suites.strict_result_passes(state, ['selected']))
+
+    def test_unknown_selection_is_rejected_before_guest_setup(self):
+        with tempfile.TemporaryDirectory() as output:
+            with self.assertRaisesRegex(ValueError, 'unknown requested case id'):
+                suites.run_suite({'cases': [{'id': 'known', 'argv': ['/true']}]},
+                                 output, '/tmp/driver', '/tmp/linux',
+                                 '/tmp/boaros', case_ids=['unknown'])
+
+    def test_reference_environment_requires_all_facilities(self):
+        mounts = ('proc', 'sysfs', 'shm', 'mqueue', 'devpts')
+        names = mounts + ('shm-dir', 'mqueue-dir', 'pts-dir', 'lo')
+        value = {'environment': {name: {'result': 0, 'errno': 0} for name in names}}
+        self.assertTrue(suites.reference_environment_ready(value))
+        for name in names:
+            value['environment'][name] = {'result': -1, 'errno': 16}
+            self.assertEqual(suites.reference_environment_ready(value), name in mounts)
+            value['environment'][name] = {'result': 0, 'errno': 0}
+        del value['environment']['lo']
+        self.assertFalse(suites.reference_environment_ready(value))
+
+    def test_distinct_binary_streams_and_wait_status(self):
+        value = suites.parse_observation(stream(status=256, out='00ff', err='657272'), 'sample')
+        self.assertEqual(value['stdout_hex'], '00ff')
+        self.assertEqual(value['stderr_hex'], '657272')
+        self.assertEqual(value['wait_status'], 256)
+        self.assertEqual(value['exit_code'], 1)
+        self.assertIsNone(value['signal'])
+
+    def test_truncation_missing_and_duplicate_records_never_complete(self):
+        for raw in (stream().replace('SUITE END sample\n', ''),
+                    stream() + 'SUITE END sample\n',
+                    stream().replace('SUITE WAIT 0', 'SUITE WAIT 0\nSUITE WAIT 0'),
+                    stream().replace('SUITE DATA O 68690a.', 'SUITE DATA O ffz.'),
+                    stream().replace('SUITE WAIT 0', 'SUITE TRUNCATED O\nSUITE WAIT 0')):
+            with self.subTest(raw=raw):
+                self.assertFalse(suites.parse_observation(raw, 'sample')['complete'])
+
+    def test_timeout_and_signals_are_preserved(self):
+        value = suites.parse_observation(stream(status=9, timed_out=1), 'sample')
+        self.assertEqual(value['signal'], 9)
+        self.assertTrue(value['timed_out'])
+        self.assertEqual(suites.observation_status(value, 0), 'timeout')
+
+    def test_exec_errno_is_preserved(self):
+        raw = stream(status=127 << 8).replace('SUITE WAIT', 'SUITE EXEC 38\nSUITE WAIT')
+        value = suites.parse_observation(raw, 'sample')
+        self.assertEqual(value['exec_errno'], 38)
+        self.assertEqual(suites.observation_status(value, 0), 'exec-error')
+
+    def test_reference_failure_cannot_produce_boaros_pass(self):
+        good = suites.parse_observation(stream(), 'sample')
+        failed = suites.parse_observation(stream(status=256), 'sample')
+        result = suites.compare_observations(failed, good, 0)
+        self.assertEqual(result['status'], 'reference-not-pass')
+        self.assertEqual(result['boaros_status'], 'pass')
+        result = suites.compare_observations(good, good, 0)
+        self.assertEqual(result['status'], 'pass')
+        different = suites.parse_observation(stream(out='62'), 'sample')
+        self.assertEqual(suites.compare_observations(good, different, 0)['status'], 'output-mismatch')
+
+
+class ImageRetentionTests(unittest.TestCase):
+    def test_completed_pass_prunes_only_case_images_after_evidence_is_saved(self):
+        with tempfile.TemporaryDirectory() as output:
+            suite_dir = Path(output) / 'runs'
+            case_dir = suite_dir / 'cases' / 'sample'
+            case_dir.mkdir(parents=True)
+            row = {'case': {'id': 'sample'}, 'status': 'pass', 'completed': True}
+            (case_dir / 'result.json').write_text(json.dumps(row))
+            (suite_dir / 'suite.json').write_text(json.dumps({'results': {'sample': row}}))
+            for name in ('case.json', 'case', 'case.debugfs',
+                         'fixture.log', 'linux.log', 'boaros.log',
+                         'linux.stdout', 'linux.stderr',
+                         'boaros.stdout', 'boaros.stderr'):
+                (case_dir / name).write_text('evidence')
+            for name in ('fixture.img', 'linux.img', 'boaros.img'):
+                (case_dir / name).write_bytes(b'image')
+            self.assertGreater(suites.prune_pass_images(case_dir, row, dry_run=True), 0)
+            self.assertTrue((case_dir / 'fixture.img').exists())
+            self.assertGreater(suites.prune_pass_images(case_dir, row), 0)
+            self.assertTrue((case_dir / 'result.json').exists())
+            self.assertTrue((case_dir / 'linux.log').exists())
+            self.assertFalse((case_dir / 'fixture.img').exists())
+            self.assertFalse((case_dir / 'linux.img').exists())
+            self.assertFalse((case_dir / 'boaros.img').exists())
+            self.assertEqual(suites.prune_pass_images(case_dir, row), 0)
+
+    def test_failure_or_missing_evidence_keeps_images(self):
+        with tempfile.TemporaryDirectory() as output:
+            suite_dir = Path(output) / 'runs'
+            case_dir = suite_dir / 'cases' / 'sample'
+            case_dir.mkdir(parents=True)
+            image = case_dir / 'fixture.img'
+            image.write_bytes(b'image')
+            row = {'case': {'id': 'sample'}, 'status': 'nonzero-exit',
+                   'completed': True}
+            self.assertEqual(suites.prune_pass_images(case_dir, row), 0)
+            self.assertTrue(image.exists())
+            row['status'] = 'pass'
+            (case_dir / 'result.json').write_text(json.dumps(row))
+            (suite_dir / 'suite.json').write_text(json.dumps({'results': {'sample': row}}))
+            with self.assertRaisesRegex(ValueError, 'evidence'):
+                suites.prune_pass_images(case_dir, row)
+            self.assertTrue(image.exists())
+
+    def test_rejects_dotdot_and_symlinked_cases_parent(self):
+        with tempfile.TemporaryDirectory() as output:
+            root = Path(output)
+            suite_dir = root / 'runs'
+            suite_dir.mkdir()
+            (suite_dir / 'cases').symlink_to(root / 'external', target_is_directory=True)
+            row = {'case': {'id': 'sample'}, 'status': 'pass', 'completed': True}
+            with self.assertRaisesRegex(ValueError, 'unsafe'):
+                suites.prune_pass_images(suite_dir / 'cases' / 'sample', row)
+            row['case']['id'] = '..'
+            with self.assertRaisesRegex(ValueError, 'unsafe'):
+                suites.prune_pass_images(suite_dir / 'cases' / '..', row)
+
+    def test_sync_failure_preserves_pass_images(self):
+        with tempfile.TemporaryDirectory() as output:
+            suite_dir = Path(output) / 'runs'
+            case_dir = suite_dir / 'cases' / 'sample'
+            case_dir.mkdir(parents=True)
+            row = {'case': {'id': 'sample'}, 'status': 'pass', 'completed': True}
+            (case_dir / 'result.json').write_text(json.dumps(row))
+            (suite_dir / 'suite.json').write_text(json.dumps({'results': {'sample': row}}))
+            for name in ('case.json', 'case', 'case.debugfs',
+                         'fixture.log', 'linux.log', 'boaros.log',
+                         'linux.stdout', 'linux.stderr',
+                         'boaros.stdout', 'boaros.stderr'):
+                (case_dir / name).write_text('evidence')
+            image = case_dir / 'fixture.img'
+            image.write_bytes(b'image')
+            with patch.object(suites.os, 'fsync', side_effect=OSError('sync failed')):
+                with self.assertRaisesRegex(OSError, 'sync failed'):
+                    suites.prune_pass_images(case_dir, row)
+            self.assertTrue(image.exists())
+
+
+class DriverTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.workspace = tempfile.TemporaryDirectory(prefix='boaros-suite-driver-')
+        cls.directory = Path(cls.workspace.name)
+        cls.binary = cls.directory / 'driver'
+        subprocess.run(['cc', '-O2', '-std=c11', '-Wall', '-Wextra', '-Werror', '-D_FORTIFY_SOURCE=2',
+                        '-DSUITE_DRIVER_HOST_TEST', str(Path(__file__).with_name('suite_driver.c')),
+                        '-o', str(cls.binary)], check=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.workspace.cleanup()
+
+    def execute(self, case, binary=None):
+        # 真实guest默认库路径不能用于宿主fixture；显式case环境仍有最高优先级。
+        host = {'env': {'PATH': os.defpath, 'LD_LIBRARY_PATH': ''}}
+        encoded, _ = suites.case_configuration(case, host, 1)
+        config = self.directory / 'case'
+        config.write_bytes(encoded)
+        process = subprocess.run([str(binary or self.binary), str(config)], capture_output=True,
+                                 text=True, timeout=5)
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        return suites.parse_observation(process.stdout, case['id'])
+
+    def test_host_execution_does_not_inherit_guest_library_directory(self):
+        poisoned = self.directory / 'guest-libraries'
+        poisoned.mkdir(exist_ok=True)
+        (poisoned / 'libc.so.6').write_bytes(b'not a host ELF')
+        case = {'id': 'host-loader', 'argv': ['/bin/true']}
+        with patch.dict(suites.DEFAULT_ENV, {'LD_LIBRARY_PATH': str(poisoned)}):
+            result = self.execute(case)
+            self.assertEqual(result['wait_status'], 0, result)
+            guest, _ = suites.case_configuration(case, {})
+            self.assertIn(('LD_LIBRARY_PATH=' + str(poisoned)).encode(), guest)
+            explicit = self.execute({**case, 'env': {'LD_LIBRARY_PATH': str(poisoned)}})
+            self.assertNotEqual(explicit['wait_status'], 0)
+
+    def test_guest_configuration_retains_its_library_path(self):
+        encoded, _ = suites.case_configuration({'id': 'guest-env', 'argv': ['/true']}, {})
+        self.assertIn(b'LD_LIBRARY_PATH=/lib:/\0', encoded)
+
+    def test_guest_environment_setup_and_unsupported_diagnostics(self):
+        wrapper = self.directory / 'environment.c'
+        wrapper.write_text(r'''#define _GNU_SOURCE
+#include <assert.h>
+#include <errno.h>
+#include <net/if.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <unistd.h>
+static int directories;
+static int unsupported(void) { if (getenv("SUITE_UNSUPPORTED")) { errno=ENOSYS; return 1; } return 0; }
+int __wrap_mkdir(const char *path, mode_t mode) {
+    assert(mode == 01777);
+    if (unsupported()) return -1;
+    if (!strcmp(path,"/dev/shm")) directories |= 1;
+    else if (!strcmp(path,"/dev/mqueue")) directories |= 2;
+    else { assert(!strcmp(path,"/dev/pts")); directories |= 4; }
+    errno=EEXIST; return -1;
+}
+int __wrap_mount(const char *source, const char *target, const char *type, unsigned long flags, const void *data) {
+    (void)source; (void)flags;
+    if (unsupported()) return -1;
+    if (!strcmp(target,"/dev/shm")) { assert(directories & 1); assert(!strcmp(type,"tmpfs")); assert(data && !strcmp(data,"mode=1777")); }
+    else if (!strcmp(target,"/dev/mqueue")) { assert(directories & 2); assert(!strcmp(type,"mqueue")); }
+    else if (!strcmp(target,"/dev/pts")) { assert(directories & 4); assert(!strcmp(type,"devpts")); assert(data && !strcmp(data,"mode=0620,gid=0,ptmxmode=0666")); }
+    else assert(!strcmp(target,"/proc") || !strcmp(target,"/sys"));
+    return 0;
+}
+int __wrap_socket(int domain, int type, int protocol) {
+    assert(domain == AF_INET && (type & SOCK_DGRAM) && protocol == 0);
+    if (unsupported()) return -1;
+    return dup(STDIN_FILENO);
+}
+int __wrap_ioctl(int fd, unsigned long request, ...) {
+    (void)fd; va_list args; va_start(args,request); struct ifreq *interface=va_arg(args,struct ifreq *); va_end(args);
+    assert(!strcmp(interface->ifr_name,"lo"));
+    const char *failure=getenv("SUITE_IOCTL_FAILURE");
+    if (failure && ((!strcmp(failure,"get") && request == SIOCGIFFLAGS) ||
+                    (!strcmp(failure,"set") && request == SIOCSIFFLAGS))) {
+        errno=EPERM; return -1;
+    }
+    if (request == SIOCGIFFLAGS) interface->ifr_flags=IFF_LOOPBACK;
+    else { assert(request == SIOCSIFFLAGS); assert(interface->ifr_flags == (IFF_LOOPBACK | IFF_UP)); }
+    return 0;
+}
+''')
+        binary = self.directory / 'driver-environment'
+        subprocess.run(['cc', '-O2', '-std=c11', '-Wall', '-Wextra', '-Werror',
+                        '-DSUITE_DRIVER_HOST_TEST', '-DSUITE_DRIVER_ENV_TEST',
+                        str(Path(__file__).with_name('suite_driver.c')), str(wrapper),
+                        '-Wl,--wrap=mount,--wrap=mkdir,--wrap=socket,--wrap=ioctl',
+                        '-o', str(binary)], check=True)
+        case = {'id': 'environment', 'argv': ['/bin/true']}
+        result = self.execute(case, binary)
+        self.assertEqual(result['exit_code'], 0)
+        self.assertTrue(suites.reference_environment_ready(result))
+        import os
+        from unittest.mock import patch
+        for stage in ('get', 'set'):
+            with patch.dict(os.environ, {'SUITE_IOCTL_FAILURE': stage}):
+                failed = self.execute(case, binary)
+            self.assertEqual(failed['exit_code'], 0)
+            self.assertEqual(failed['environment']['lo'], {'result': -1, 'errno': 1})
+            self.assertFalse(suites.reference_environment_ready(failed))
+        with patch.dict(os.environ, {'SUITE_UNSUPPORTED': '1'}):
+            result = self.execute(case, binary)
+        self.assertEqual(result['exit_code'], 0)
+        self.assertTrue(result['complete'])
+        self.assertFalse(suites.reference_environment_ready(result))
+        for name in ('proc', 'sysfs', 'shm-dir', 'shm', 'mqueue-dir', 'mqueue', 'pts-dir', 'devpts', 'lo'):
+            self.assertEqual(result['environment'][name]['errno'], 38)
+
+    def test_root_cwd_needs_no_chdir_but_other_cwd_reports_setup_errno(self):
+        wrapper = self.directory / 'chdir-unavailable.c'
+        wrapper.write_text('#include <errno.h>\nint __wrap_chdir(const char *path) { (void)path; errno=ENOSYS; return -1; }\n')
+        binary = self.directory / 'driver-no-chdir'
+        subprocess.run(['cc', '-O2', '-std=c11', '-Wall', '-Wextra', '-Werror',
+                        '-DSUITE_DRIVER_HOST_TEST', str(Path(__file__).with_name('suite_driver.c')),
+                        str(wrapper), '-Wl,--wrap=chdir', '-o', str(binary)], check=True)
+        root = self.execute({'id': 'root', 'argv': ['/bin/true'], 'cwd': '/'}, binary)
+        self.assertEqual(root['exit_code'], 0)
+        other = self.execute({'id': 'other', 'argv': ['/bin/true'], 'cwd': '/tmp'}, binary)
+        self.assertEqual(other['setup_errno'], 38)
+        self.assertIsNone(other['exec_errno'])
+
+    def test_real_child_output_is_unforgeable_and_separate(self):
+        result = self.execute({'id': 'child', 'argv': ['/bin/sh', '-c',
+            'printf "SUITE END child\\n"; printf "error\\n" >&2; exit 3']})
+        self.assertTrue(result['complete'])
+        self.assertEqual(bytes.fromhex(result['stdout_hex']), b'SUITE END child\n')
+        self.assertEqual(bytes.fromhex(result['stderr_hex']), b'error\n')
+        self.assertEqual(result['exit_code'], 3)
+
+    def test_actual_exec_failure_records_errno(self):
+        result = self.execute({'id': 'missing', 'argv': ['/definitely-missing-boaros-suite']})
+        self.assertEqual(result['exec_errno'], 2)
+        self.assertEqual(result['exit_code'], 127)
+
+    def test_interrupted_exec_error_report_preserves_original_errno(self):
+        wrapper = self.directory / 'write-interrupted.c'
+        wrapper.write_text('''#include <errno.h>
+#include <unistd.h>
+ssize_t __real_write(int, const void *, size_t);
+ssize_t __wrap_write(int fd, const void *data, size_t size) {
+    static int interrupted;
+    if (size == 2*sizeof(int) && !interrupted++) { errno=EINTR; return -1; }
+    return __real_write(fd,data,size);
+}
+''')
+        binary = self.directory / 'driver-interrupted'
+        subprocess.run(['cc', '-O2', '-std=c11', '-Wall', '-Wextra', '-Werror',
+                        '-DSUITE_DRIVER_HOST_TEST', str(Path(__file__).with_name('suite_driver.c')),
+                        str(wrapper), '-Wl,--wrap=write', '-o', str(binary)], check=True)
+        result = self.execute({'id':'missing-interrupted','argv':['/definitely-missing-boaros-suite']},binary)
+        self.assertEqual(result['exec_errno'], 2)
+        self.assertEqual(result['exit_code'], 127)
+
+    def test_monotonic_child_timeout_kills_and_reaps(self):
+        result = self.execute({'id': 'timeout', 'argv': ['/bin/sleep', '5'], 'timeout': .1})
+        self.assertTrue(result['complete'])
+        self.assertTrue(result['timed_out'])
+        self.assertEqual(result['signal'], 9)
+
+
+if __name__ == '__main__':
+    unittest.main()

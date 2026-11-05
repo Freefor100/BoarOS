@@ -75,8 +75,8 @@ mapping 由 root/platform 持有至 stop 成功。LA root 在创建标准 OFD �
 正常 LA 内核日志进入同一 klog 环并遵守 console level；早期/退出后的 console 用轮询，
 fatal 先关中断并绕过日志级别与拥塞队列。
 
-`tests/tty/riscv.py --arch loongarch` 共用原始串口字节通道、输入和结果解析。
-`tests/tty/pty_riscv.py --arch loongarch` 共用 PTY 案例、原版 BusyBox、
+`tests/userland/tty/riscv.py --arch loongarch` 共用原始串口字节通道、输入和结果解析。
+`tests/userland/tty/pty_riscv.py --arch loongarch` 共用 PTY 案例、原版 BusyBox、
 原版 glibc API 和磁盘真实重启检查。每架构内固定同一 ELF/fixture，
 Linux 先运行、BoarOS 后运行；LA 默认分别执行512 MiB/1 GiB。
 Linux PTY coordinator 作为真实 PID1 验证原 script 的收养/reap，退出42由 Linux panic

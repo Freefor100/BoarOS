@@ -13,9 +13,9 @@
 | `arch/riscv/virt_rtc.c`、`include/arch/riscv/virt_rtc.h` | goldfish RTC 墙钟读取，供内核时间子系统捕获启动时刻 |
 | `kernel/tick.c`、`include/kernel/tick.h` | 维护 100 Hz 策略使用的 64 位累计 tick |
 | `kernel/main.c` | 在最终 Sv39/direct map 后初始化时间子系统，再初始化 scheduler、启动 timer 并进入 `wfi` idle |
-| `tests/riscv/timer_cases.c`、`tests/timer-riscv.sh` | 验证状态、deadline 数学、SBI 错误与真实 QEMU timer trap |
+| `tests/riscv/timer_cases.c`、`tests/riscv/timer.sh` | 验证状态、deadline 数学、SBI 错误与真实 QEMU timer trap |
 | `tests/riscv/timer_boot.c` | 只在测试 ELF 中累计真实中断并于有限 tick 后关机 |
-| `tests/idle-riscv.sh` | 验证正常内核启动 timer 后持续 idle |
+| `tests/riscv/idle.sh` | 验证正常内核启动 timer 后持续 idle |
 
 通用 tick 接口为：
 

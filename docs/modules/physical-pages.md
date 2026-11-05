@@ -9,7 +9,7 @@
 | `include/kernel/page.h` | 从构建目标导出页大小和掩码 |
 | `include/kernel/physical_page.h`、`kernel/physical_page.c` | 管理显式分配器对象、bootstrap→buddy 状态迁移、单页共享引用、连续页所有权、压力回收入口和计数 |
 | `tests/riscv/physical_page_cases.c` | 验证 bootstrap 兼容、buddy split/coalesce、所有权状态和耗尽语义 |
-| `tests/riscv/physical_page_main.c`、`tests/page-riscv.sh` | 构建并运行独立的 QEMU 聚焦测试内核 |
+| `tests/riscv/physical_page_main.c`、`tests/riscv/page.sh` | 构建并运行独立的 QEMU 聚焦测试内核 |
 | `tests/host/allocator_release.c` | 独立子进程验证非法释放 fatal 和各 guard 的失败诊断 |
 
 共用实现按构建目标使用RV64的 `BOAROS_PAGE_SHIFT=12` 或LA64的14。

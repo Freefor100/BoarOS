@@ -10,7 +10,7 @@
 #define kernel_wait_queue_wake_all fixture_core_wake
 #define kernel_heap_allocate_zeroed fixture_core_allocate
 #define HOST_WAIT_CORE_EMBEDDED 1
-#include "../tty/core_host.c"
+#include "tty/core.c"
 #undef HOST_WAIT_CORE_EMBEDDED
 #undef kernel_heap_allocate_zeroed
 #undef kernel_wait_queue_wake_all

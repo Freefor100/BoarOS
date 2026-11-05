@@ -116,7 +116,7 @@ python3 -B tests/host/virtio_block_diagnostics.py
 make test-io-sleep-riscv
 # 聚焦一个代表配置；不替代默认四组合验收。
 BLOCK_TEST_TRANSPORT=modern BLOCK_TEST_CACHE=writeback make test-block-riscv
-python3 -B tests/io-sleep-riscv.py --kernel build/riscv/tests/kernel-io-sleep-rv --transport modern
+python3 -B tests/riscv/io-sleep.py --kernel build/riscv/tests/kernel-io-sleep-rv --transport modern
 ```
 
 测试使用真实 QEMU raw disk，分别以默认 legacy 和显式 modern 配置覆盖 feature/status negotiation、批量 direct DMA、非对齐 bounce、容量边界、超时/错误统计和队列页回收。默认无块设备的生产内核仍可进入 timer idle；挂入两种 transport 的根盘时由根启动测试继续消费本模块。
@@ -140,7 +140,7 @@ writethrough 的响应波次依据固定 QEMU v11.1.0（`references/qemu`，comm
 
 错误用例使第二个已发布 batch 写先失败，保留另一个 DMA，验证取消仍不能提前返回，再释放该 DMA 并回读确认未发布项未写入；正常单写与 batch 混合的八槽超时由 reset 结束，队列页和任务栈最终回收。等待前有限收割 used，没有完成时仍阻塞等待。
 
-RT 组合进展由 `make test-multi-disk-rt-riscv`（调用 `tests/multi-disk-io-riscv.py --rt-load`）单独验证：默认全局 RT 预算下，持续 FIFO/RR 子任务存在时，普通父任务与两台真实 NBD 的 READ/WRITE/FLUSH 均可完成，随后检查子任务、动态挂载、根页/堆/栈回收和两盘持久字节。该模式使用同一个 `tests/userland/multi_disk_io.c` 的显式 `/rt-load` fixture 分支，原错误隔离模式不变；详见[可睡眠存储](../learning/sleepable-storage.md#默认-rt-带宽下的存储进展)。
+RT 组合进展由 `make test-multi-disk-rt-riscv`（调用 `tests/riscv/multi-disk-io.py --rt-load`）单独验证：默认全局 RT 预算下，持续 FIFO/RR 子任务存在时，普通父任务与两台真实 NBD 的 READ/WRITE/FLUSH 均可完成，随后检查子任务、动态挂载、根页/堆/栈回收和两盘持久字节。该模式使用同一个 `tests/userland/multi_disk_io.c` 的显式 `/rt-load` fixture 分支，原错误隔离模式不变；详见[可睡眠存储](../learning/sleepable-storage.md#默认-rt-带宽下的存储进展)。
 
 双盘故障 runner 在确认隔离检查点后，通过 NBD `cut` 收到两盘的明确回执，再终止
 QEMU，避免直接 kill 截断健康盘的响应。诱导断线后的原始日志保留；进展和内核错误

@@ -25,7 +25,7 @@ class CacheContract(unittest.TestCase):
             shutil.copytree(subject.BASE/name,cls.tree/name,symlinks=True)
         for original in ('busybox-source/busybox/busybox','busybox-source/busybox/.config'):
             target=cls.tree/original;target.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(subject.BASE/original,target)
-        profile=json.loads((ROOT/'tests/program-inventory/inputs.json').read_text())['busybox']
+        profile=json.loads((ROOT/'tests/userland/inventory/inputs.json').read_text())['busybox']
         original_config=subject.BASE/'busybox-source'/profile['config']
         target=cls.tree/original_config.relative_to(subject.BASE);target.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(original_config,target)
     @classmethod
@@ -40,8 +40,8 @@ class CacheContract(unittest.TestCase):
         for name in ('gcc/gcc-15.1.0.tar.xz','musl/musl-1.2.5.tar.gz','linux-uapi/linux-6.6.tar.xz'):
             target=refs/name;target.parent.mkdir(exist_ok=True);target.symlink_to(ROOT/'references'/name)
         (refs/'oscomp-testsuits').symlink_to(ROOT/'references/oscomp-testsuits',target_is_directory=True)
-        inputs=subject.ROOT/'tests/program-inventory';inputs.mkdir(parents=True)
-        shutil.copy2(ROOT/'tests/program-inventory/inputs.json',inputs/'inputs.json')
+        inputs=subject.ROOT/'tests/userland/inventory';inputs.mkdir(parents=True)
+        shutil.copy2(ROOT/'tests/userland/inventory/inputs.json',inputs/'inputs.json')
         stamp=json.loads(json.dumps(self.old))
         if not hasattr(subject,'cache_inputs'):
             stamp['products']={str(self.base/Path(p).relative_to(self.original_base)):h for p,h in stamp['products'].items()}
@@ -59,9 +59,9 @@ class CacheContract(unittest.TestCase):
     def rejected(self):
         with self.assertRaisesRegex(SystemExit,'identity|changed|missing|checksum'): self.call()
     def test_busybox_revision_change(self):
-        path=subject.ROOT/'tests/program-inventory/inputs.json';data=json.loads(path.read_text());data['busybox']['revision']='0'*40;path.write_text(json.dumps(data));self.rejected()
+        path=subject.ROOT/'tests/userland/inventory/inputs.json';data=json.loads(path.read_text());data['busybox']['revision']='0'*40;path.write_text(json.dumps(data));self.rejected()
     def test_busybox_configuration_selection_change(self):
-        path=subject.ROOT/'tests/program-inventory/inputs.json';data=json.loads(path.read_text());data['busybox']['config']='config/another-config';path.write_text(json.dumps(data));self.rejected()
+        path=subject.ROOT/'tests/userland/inventory/inputs.json';data=json.loads(path.read_text());data['busybox']['config']='config/another-config';path.write_text(json.dumps(data));self.rejected()
     def test_uapi_archive_identity_change(self):
         path=subject.ROOT/'references/sources.tsv';text=path.read_text();rows=text.splitlines();rows=[line.rsplit('\t',1)[0]+'\t'+'0'*64 if '\tlinux-uapi/linux-6.6.tar.xz\t' in line else line for line in rows];path.write_text('\n'.join(rows)+'\n');self.rejected()
     def test_missing_cc1(self):

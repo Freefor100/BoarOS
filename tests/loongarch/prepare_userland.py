@@ -41,7 +41,7 @@ def extract(path, directory):
 def cache_inputs(args):
     gcc_tar=archive('gcc/gcc-15.1.0.tar.xz'); musl_tar=archive('musl/musl-1.2.5.tar.gz')
     uapi_tar=archive('linux-uapi/linux-6.6.tar.xz')
-    inputs=json.loads((ROOT/'tests/program-inventory/inputs.json').read_text())['busybox']
+    inputs=json.loads((ROOT/'tests/userland/inventory/inputs.json').read_text())['busybox']
     tests_source,_=fixed_repository('oscomp-testsuits')
     try:
         configuration=subprocess.check_output(['git','-C',tests_source,'show',inputs['revision']+':'+inputs['config']],stderr=subprocess.DEVNULL)
@@ -95,7 +95,7 @@ def installed_tree_manifest(base,roots):
     return result
 
 def installed_manifest(base):
-    configuration=json.loads((ROOT/'tests/program-inventory/inputs.json').read_text())['busybox']['config']
+    configuration=json.loads((ROOT/'tests/userland/inventory/inputs.json').read_text())['busybox']['config']
     return installed_tree_manifest(base,['gcc-sf/root','musl-root','uapi',
         *('busybox-source/'+name for name in ('busybox/busybox','busybox/.config',configuration))])
 

@@ -12,10 +12,10 @@
 | `arch/riscv/trap.c` | 提供生产 dispatcher、用户页故障决策、timer/scheduler fatal 和非法返回诊断 |
 | `kernel/sched/signal.c`、`arch/riscv/fpu.S` | 在公共用户返回尾处理 signal frame/restart，并维护独立的 per-task F/D 状态 |
 | `tests/riscv/trap_return_main.c`、`trap_return_sie_main.c`、`trap_return_trigger.S` | 提供只在测试 ELF 中生效的同步与异步返回 handler、独立非法状态探针和寄存器探针 |
-| `tests/trap-return-riscv.sh` | 在 QEMU 中验证低地址恢复、返回状态和拒绝路径 |
-| `tests/riscv/high_half_trap.c`、`tests/high-half-trap-riscv.sh` | 在最终 Sv39 地址空间验证高半区恢复及 fatal 回归 |
-| `tests/riscv/timer_boot.c`、`tests/timer-riscv.sh` | 通过真实 supervisor timer interrupt 验证生产 dispatcher 返回 |
-| `tests/riscv/user_boot.c`、`user_payload.S`、`tests/user-riscv.sh` | 验证真实 U-mode 换栈、抢占恢复、ecall、用户故障和资源回收 |
+| `tests/riscv/trap-return.sh` | 在 QEMU 中验证低地址恢复、返回状态和拒绝路径 |
+| `tests/riscv/high_half_trap.c`、`tests/riscv/high-half-trap.sh` | 在最终 Sv39 地址空间验证高半区恢复及 fatal 回归 |
+| `tests/riscv/timer_boot.c`、`tests/riscv/timer.sh` | 通过真实 supervisor timer interrupt 验证生产 dispatcher 返回 |
+| `tests/riscv/user_boot.c`、`user_payload.S`、`tests/riscv/user.sh` | 验证真实 U-mode 换栈、抢占恢复、ecall、用户故障和资源回收 |
 
 ## Trap Frame ABI
 

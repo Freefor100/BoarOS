@@ -68,7 +68,7 @@ def main():
     flags=subprocess.check_output(['pkg-config','--cflags','--libs','glib-2.0'],text=True).split()
     plugin=directory/'observer.so'
     run(['cc','-shared','-fPIC','-O2','-Wall','-Wextra','-Werror',*(f'-D{k}={v}' for k,v in POINTS.items()),
-         ROOT/'tests/workloads/diagnostics/libc-errno-plugin.c','-o',plugin,*flags])
+         ROOT/'tests/cost/libc-errno-plugin.c','-o',plugin,*flags])
     raw=[arch.compiler,*arch.raw_flags,'-O2','-ffreestanding','-fno-builtin','-fno-stack-protector','-nostdlib','-static','-no-pie',
          '-Wl,--build-id=none','-Wl,-T,'+str(ROOT/'tests/riscv/user_elf.ld')]
     for name,defines in [('driver',[]),('driver-ready',['-DREQUIRE_RANDOM_READY']),('linux-init',['-DROOT_DIRECT_FILESYSTEM','-DROOT_CREATE_SESSION'])]:
@@ -91,7 +91,7 @@ def main():
         'driver_sha256':digest(directory/'driver'),'ready_driver_sha256':digest(directory/'driver-ready'),'linux_init_sha256':digest(directory/'linux-init'),
         'plugin_sha256':digest(plugin),'source_commit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
         'source_dirty':subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True),
-        'sources':{str(path.relative_to(ROOT)):digest(path) for path in [Path(__file__).resolve(),ROOT/'tests/oscomp/clock_errno_driver.c',ROOT/'tests/workloads/diagnostics/libc-errno-plugin.c',ROOT/'tests/common/user_start.S',ROOT/'tests/loongarch/root_linux_init.c']},'runs':{}}
+        'sources':{str(path.relative_to(ROOT)):digest(path) for path in [Path(__file__).resolve(),ROOT/'tests/oscomp/clock_errno_driver.c',ROOT/'tests/cost/libc-errno-plugin.c',ROOT/'tests/common/user_start.S',ROOT/'tests/loongarch/root_linux_init.c']},'runs':{}}
     (directory/'identity.json').write_text(json.dumps(metadata,indent=2)+'\n')
     for memory in ('512M','1G'):
         for system,mode in [('boaros','missing'),('boaros','ready'),('linux','normal'),('linux','getrandom-error')]:

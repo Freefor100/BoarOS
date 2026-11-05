@@ -375,7 +375,7 @@ static void test_phase_write_window_protocol(void)
         printf("   [DEFECT DETECTED] write_phase_windows acquires transfer_lock in shared READ mode!\n");
         printf("   This violates raw_phase_fairness (tests/host/block_file_cases.h:166) expectation that\n");
         printf("   readers queue on transfer_lock.pending_head during active windows, causing the\n");
-        printf("   infinite spin loop and 30s timeout in tests/file-io-concurrency-host.sh!\n");
+        printf("   infinite spin loop and 30s timeout in tests/host/file-io-concurrency.sh!\n");
     } else {
         printf("   Reader correctly waited for window to complete.\n");
     }

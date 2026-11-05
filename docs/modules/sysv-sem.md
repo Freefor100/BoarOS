@@ -29,9 +29,9 @@ SETVAL清除所有组对该项的调整，SETALL清除该集合全部调整；RM
 
 ```sh
 sh tests/host/sem.sh
-python3 tests/network_runner.py --workload sysv_sem --only boaros --cpus 4 --memory 512M --kernel build/riscv-user-smp4/kernel-rv --output build/sem-rv4
-python3 tests/sysv-log.py --arch riscv --output build/sem-log-rv
-python3 tests/sysv-log.py --arch loongarch --output build/sem-log-la
+python3 tests/userland/run.py --workload sysv_sem --only boaros --cpus 4 --memory 512M --kernel build/riscv-user-smp4/kernel-rv --output build/sem-rv4
+python3 tests/userland/sysv-log.py --arch riscv --output build/sem-log-rv
+python3 tests/userland/sysv-log.py --arch loongarch --output build/sem-log-la
 ```
 
 宿主用真实集合、raw和等待代码，在4/16KiB页配置检查原子回滚、配额、ENOMEM、通知、弃栈及RMID/退出的明确交错。用户消费者检查Linux ABI、两种libc、线程和进程共享、fork/exec/退出，以及每个实际客核的修改、等待和补偿；FD和集合数量必须归还。

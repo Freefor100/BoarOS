@@ -21,7 +21,7 @@
 
 mincore 每页输出最低位的驻留状态，查询本身不装入页面。MM raw 内查询已有页面归属，包含 PROT_NONE 页面；没有 PTE 时查询内存对象或已完成装入的文件缓存。一次最多处理 16 页，任务 I/O 工作区保存结果，用户输出在 MM 保护外完成。文件来源借用覆盖锁外权限和缓存查询，恢复 MM 资格后核对 VMA 代次；截断、解除映射和最终关闭沿原来源退休协议等待借用结束。文件所有者、CAP_FOWNER 或有当前写权限的调用者可见真实状态，其余调用者按 Linux 获得全 1；匿名映射直接返回真实状态。VMA 空洞返回 ENOMEM，之前完整输出的前缀保留。
 
-直接检查使用 `tests/workloads/resource/memlock.c` 和 `tests/mm-resource-limits-host.sh`；前者与固定 Linux 运行相同 ELF，后者检查映射接纳、计数、部分修改和物理分配失败。通用 MAP_GROWSDOWN 仍在后续范围。
+直接检查使用 `tests/workloads/resource/memlock.c` 和 `tests/host/mm-resource-limits.sh`；前者与固定 Linux 运行相同 ELF，后者检查映射接纳、计数、部分修改和物理分配失败。通用 MAP_GROWSDOWN 仍在后续范围。
 
 
 ## madvise 与共享段锁定
@@ -50,7 +50,7 @@ SHM_LOCK/UNLOCK 在既有CPU0共享内存控制路径执行。段保存首次LOC
 
 LOCK保留按需装页，当前memory_object已经持有已驻留页。UID或owner改变后，UNLOCK或RMID后的最后attachment销毁向原账户归还。共享段的UID额度与普通mlock的MM虚拟字节、VmLck分别统计。
 
-共享内存查询与槽/代次规则见[SysV SHM](sysv-shm.md)。直接消费者为`tests/workloads/resource/madvise.c`、`vdso_dontneed.c`、`shm_lock.c`，可通过 `tests/network_runner.py --workload madvise` 或 `--workload vdso_dontneed` 选择；宿主入口为`tests/mm-resource-limits-host.sh`、`tests/madvise-remove-host.sh`、`tests/shm-lock-host.sh`和文件I/O并发检查。RV固定Linux参考关闭swap；madvise的LA对照使用独立的无swap参考缓存，与BoarOS保持相同条件：
+共享内存查询与槽/代次规则见[SysV SHM](sysv-shm.md)。直接消费者为`tests/workloads/resource/madvise.c`、`vdso_dontneed.c`、`shm_lock.c`，可通过 `tests/userland/run.py --workload madvise` 或 `--workload vdso_dontneed` 选择；宿主入口为`tests/host/mm-resource-limits.sh`、`tests/host/madvise-remove.sh`、`tests/host/shm-lock.sh`和文件I/O并发检查。RV固定Linux参考关闭swap；madvise的LA对照使用独立的无swap参考缓存，与BoarOS保持相同条件：
 
 ```sh
 python3 tests/loongarch/prepare.py --component linux --profile platform-noswap
@@ -66,8 +66,8 @@ python3 tests/loongarch/prepare.py --component linux --profile platform-noswap
 | `mm/mm.c`、`include/kernel/mm_backend.h` | MM 引用、VMA、后备来源、缺页与驻留策略；记录页拥有构建期选定的页表后端 |
 | `include/arch/mmu.h`、`arch/riscv/mm.c` | 构建期 MMU 操作绑定与既有 RV 创建/统计接口的薄适配 |
 | `arch/loongarch/mmu.c`、`tlb_refill.S` | 16 KiB/三级用户页表、COW 所有权、INVTLB 与软件 refill；LA 验收见[首阶段](loongarch-boot.md) |
-| `tests/riscv/mm_cases.c`、`tests/mm-riscv.sh`、`tests/mm-fatal-riscv.sh` | 验证创建、共享引用、移动、查询、页表回收和 resolution invariant fatal |
-| `tests/riscv/vma_cases.c`、`tests/vma-riscv.sh` | 验证 VMA 集成后的 fork、缺页解析、OOM 与所有权回收 |
+| `tests/riscv/mm_cases.c`、`tests/riscv/mm.sh`、`tests/riscv/mm-fatal.sh` | 验证创建、共享引用、移动、查询、页表回收和 resolution invariant fatal |
+| `tests/riscv/vma_cases.c`、`tests/riscv/vma.sh` | 验证 VMA 集成后的 fork、缺页解析、OOM 与所有权回收 |
 
 稳定接口为：
 
@@ -240,7 +240,7 @@ VMA 保留后备对象、文件权限上限和源子范围偏移。共享匿名�
 
 参数校验顺序依据固定的 [`mm/mremap.c`](../../references/linux/mm/mremap.c)。固定目标先撤销，随后页表准备失败不会恢复该目标；固定缩小也可先撤源尾部，接口不承诺整次失败无副作用。特殊映射搬移，以及跨多个连续 VMA 的等长固定搬移返回 `EOPNOTSUPP`；私有映射零旧长度、缺失 MAYMOVE、重叠固定区间等仍先返回对应参数错误。跨 VMA 扩大及包含洞的跨 VMA 搬移返回 `EFAULT`。
 
-`sh tests/mm-remap-host.sh` 检查物理身份、COW/保护页、子范围、共享对象、文件偏移/EOF、准备 OOM、pin 排空及延迟 TLB 确认后的 owner 归还；文件截断用明确握手覆盖回调等待期间的再次搬移和旧 VA 复用。`CACHE_HOST_BLOCKS=4096 sh tests/mm-disk-concurrency-host.sh mremap` 使用真实 ext4 与页缓存检查搬移前借出的 alias 回调、搬移后写入和同步，以及资源归还。宿主 MM 用 RV64/4 KiB 后端；LA64/16 KiB 使用真实用户差分验证，不能由修改宿主页大小宏替代。
+`sh tests/host/mm-remap.sh` 检查物理身份、COW/保护页、子范围、共享对象、文件偏移/EOF、准备 OOM、pin 排空及延迟 TLB 确认后的 owner 归还；文件截断用明确握手覆盖回调等待期间的再次搬移和旧 VA 复用。`CACHE_HOST_BLOCKS=4096 sh tests/host/mm-disk-concurrency.sh mremap` 使用真实 ext4 与页缓存检查搬移前借出的 alias 回调、搬移后写入和同步，以及资源归还。宿主 MM 用 RV64/4 KiB 后端；LA64/16 KiB 使用真实用户差分验证，不能由修改宿主页大小宏替代。
 
 ## 硬件用户缺页解析
 

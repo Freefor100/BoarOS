@@ -30,7 +30,7 @@ ID 和 key 分别通过 AVL 索引查找。命名空间保护只负责发现、�
 
 ```sh
 sh tests/host/msg.sh
-python3 tests/network_runner.py --workload sysv_msg --only boaros --cpus 4 --memory 512M --kernel /path/to/kernel-rv --output build/msg-rv4
+python3 tests/userland/run.py --workload sysv_msg --only boaros --cpus 4 --memory 512M --kernel /path/to/kernel-rv --output build/msg-rv4
 ```
 
 宿主用真实消息队列、raw lock 和等待代码，在 4/16KiB 页配置下运行 ASan/UBSan。明确的线程握手检查容量等待、两个接收者之间的 `E2BIG` 继续交付、权限变化、删除、通知、消息导入快照、强制弃栈，以及输出期间删除时的消息引用；还检查完成早于 park、发送容量通知后删除及完成通知期间远端 abort 的请求归属。分配失败检查请求和正文归还，配额检查全部 32000 个队列。每组结束检查消息数、字节数、队列数、任务请求、等待借用、PID 引用和分配数全部归还。
