@@ -23,6 +23,8 @@ static uint64_t context, address;
 static unsigned done[4];
 static unsigned park_before[4];
 static unsigned hold_fence, fence_entered, fence_release;
+static unsigned retirement_observe, retirement_fences, retirement_guards;
+enum { RETIREMENT_TEST_PAGES = 3 };
 static struct kernel_mm child;
 static uint64_t child_context;
 static pthread_barrier_t writers;
@@ -37,6 +39,14 @@ static uint64_t batch_test_start;
 static unsigned batch_test_mode, batch_test_prefix, batch_test_syncs, batch_test_full, batch_test_local, batch_test_instructions, batch_test_neighbors;
 static void *batch_visible_fault(void *unused);
 static enum kernel_uaccess_status race_status[4];
+void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *, struct kernel_raw_guard *);
+void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock, struct kernel_raw_guard *guard)
+{
+    if (lock == &allocator.lock && kernel_cpu_current()->hardware_id == 1 &&
+        retirement_observe && retirement_fences)
+        retirement_guards++;
+    __real_kernel_raw_lock_acquire(lock, guard);
+}
 enum physical_page_status __real_physical_page_allocate(struct physical_page_allocator *, uint64_t *);
 enum physical_page_status __wrap_physical_page_allocate(struct physical_page_allocator *pages, uint64_t *physical)
 {
@@ -106,6 +116,7 @@ void mm_test_fence(uint64_t v, int instructions)
     if (!instructions && kernel_cpu_current()->hardware_id == 1 &&
         __atomic_load_n(&hold_fence, __ATOMIC_ACQUIRE)) {
         assert(!kernel_cpu_current()->raw_locks);
+        if (retirement_observe) retirement_fences++;
         __atomic_store_n(&fence_entered, 1, __ATOMIC_RELEASE);
         while (!__atomic_load_n(&fence_release, __ATOMIC_ACQUIRE)) sched_yield();
     }
@@ -178,38 +189,59 @@ static void await_registration(unsigned id)
 static void *unmap(void *unused)
 {
     (void)unused; mm_test_attach(1); mm_test_context = context;
-    assert(!kernel_mm_munmap(&mm[1], address, BOAROS_PAGE_SIZE));
+    assert(!kernel_mm_munmap(&mm[1], address, RETIREMENT_TEST_PAGES * BOAROS_PAGE_SIZE));
     __atomic_store_n(&done[1], 1, __ATOMIC_RELEASE);
     return 0;
 }
 static void retirement(void)
 {
+    uint64_t mapped, physical[RETIREMENT_TEST_PAGES];
+    assert(!kernel_mm_mmap_anonymous(&mm[0], address + BOAROS_PAGE_SIZE,
+        (RETIREMENT_TEST_PAGES - 1) * BOAROS_PAGE_SIZE, KERNEL_MM_READ | KERNEL_MM_WRITE,
+        KERNEL_MM_MAP_FIXED, &mapped));
+    for (unsigned i = 1; i < RETIREMENT_TEST_PAGES; i++)
+        assert(!kernel_mm_resolve_user_fault(&mm[0], address + i * BOAROS_PAGE_SIZE, KERNEL_MM_WRITE));
+    struct kernel_mm_mapping mapping;
+    for (unsigned i = 0; i < RETIREMENT_TEST_PAGES; i++) {
+        assert(!kernel_mm_lookup(&mm[0], address + i * BOAROS_PAGE_SIZE, &mapping));
+        physical[i] = mapping.physical_address;
+    }
     struct kernel_mm_user_pin old = {0};
     assert(!kernel_mm_pin_user_page(&mm[0], address, KERNEL_MM_READ, &old));
     uint64_t before = physical_page_available(&allocator);
     hold_fence = 1; fence_entered = fence_release = done[1] = 0;
+    retirement_observe = 1;
     pthread_t worker; assert(!pthread_create(&worker, 0, unmap, 0));
     while (!__atomic_load_n(&fence_entered, __ATOMIC_ACQUIRE)) sched_yield();
     assert(!__atomic_load_n(&done[1], __ATOMIC_ACQUIRE));
-    struct kernel_mm_mapping mapping;
-    assert(kernel_mm_lookup(&mm[0], address, &mapping) == KERNEL_MM_STATUS_NOT_MAPPED);
-    /* 第一批数据叶已摘，PTE转移的owner仍等待确认；空表由后续有界扫描回收。 */
+    for (unsigned i = 0; i < RETIREMENT_TEST_PAGES; i++)
+        assert(kernel_mm_lookup(&mm[0], address + i * BOAROS_PAGE_SIZE, &mapping) == KERNEL_MM_STATUS_NOT_MAPPED);
+    /* 数据叶已摘，但确认前任何PTE转移的owner都不能重新分配。 */
     assert(physical_page_available(&allocator) == before);
     uint32_t references;
     assert(!physical_page_reference_count(&allocator, old.physical_address, &references));
     assert(references == 2 && ((unsigned char *)old.page)[0] == 49);
     uint64_t pressure[4096]; unsigned used = 0;
     while (used < 4096 && !physical_page_allocate(&allocator, &pressure[used])) {
-        assert(pressure[used] != old.physical_address);
+        for (unsigned i = 0; i < RETIREMENT_TEST_PAGES; i++)
+            assert(pressure[used] != physical[i]);
         used++;
     }
     assert(!physical_page_available(&allocator));
     __atomic_store_n(&fence_release, 1, __ATOMIC_RELEASE);
     assert(!pthread_join(worker, 0)); hold_fence = 0;
+    retirement_observe = 0;
     assert(!physical_page_reference_count(&allocator, old.physical_address, &references));
     assert(references == 1); /* 同步完成后仅访问片段pin继续存活。 */
+    for (unsigned i = 1; i < RETIREMENT_TEST_PAGES; i++) {
+        void *pointer;
+        assert(physical_page_resolve(&allocator, physical[i], &pointer) == PHYSICAL_PAGE_STATUS_INVALID);
+    }
     kernel_mm_unpin_user_page(&old);
     for (unsigned i = 0; i < used; i++) assert(!physical_page_release(&allocator, pressure[i]));
+    printf("MM retirement: %u leaves, %u fences, %u allocator guards\n",
+        RETIREMENT_TEST_PAGES, retirement_fences, retirement_guards);
+    assert(retirement_fences && retirement_guards == retirement_fences);
 }
 static void *fork_mm(void *unused)
 {

@@ -1962,10 +1962,10 @@ static void finish_tlb_change(struct kernel_mm_record *record,
         COST_SCOPE(sync_cost, MM_SYNC_TICKS);
         arch_mmu_sync_user(targets, address, size, instructions);
     }
-    for (unsigned i = 0; i < batch->count; i++)
-        if (physical_page_release(record->space.allocator, batch->pages[i]) !=
-            PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
     if (batch->count) {
+        _Static_assert(KERNEL_MM_RETIRE_CAPACITY <= PHYSICAL_PAGE_RELEASE_BATCH_MAX,
+                       "one allocator guard per retirement batch");
+        physical_page_release_batch(record->space.allocator, batch->pages, batch->count);
         KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
         if (!record->pending_retirement) __builtin_trap();
         record->pending_retirement--;
