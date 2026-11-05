@@ -67,6 +67,8 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
         uint64_t enabled;__asm__ volatile("csrrd %0, 4":"=r"(enabled));
         /* ESTAT 包含被 mask 的外设；timer trap 不能顺便分发未启用的来源。 */
         pending=frame->estat&enabled&0x1fff;
+        /* 中断线可在保存状态前撤回；没有有效来源时无需分发，也不是同步异常。 */
+        if (!pending) return;
     }
 #if BOAROS_MAX_CPUS > 1
     if(!code && (pending&(1U<<12)))la_smp_handle_ipi();
@@ -186,6 +188,10 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
     /* 故障PC可能是合并的fatal分支；RA定位实际违反契约的调用点。 */
     la_virt_puts(" ra=");la_virt_hex(frame->regs[1]);
     la_virt_puts(" tp=");la_virt_hex(frame->regs[2]);la_virt_puts("\n");
+#if BOAROS_MAX_CPUS > 1
+    la_virt_puts(" irq-estat=");la_virt_hex(frame->estat);
+    la_virt_puts(" irq-pending=");la_virt_hex(pending);la_virt_puts("\n");
+#endif
     la_virt_fatal("kernel trap");
 }
 void la_trap_return_prepare(struct arch_trap_frame *frame)

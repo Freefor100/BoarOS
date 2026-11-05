@@ -435,3 +435,12 @@ $(LA_BUILD)/generated/link-config: force-cost-config Makefile arch/loongarch/bui
 	@{ printf '%s\n' $(call build-quote,$(LA_CONFIG_CC)) $(call build-quote,$(LA_CONFIG_FLAGS)) $(call build-quote,$(LA_CONFIG_OBJECTS)); \
 	  sha256sum Makefile arch/loongarch/build.mk; } > $@.tmp
 	@cmp -s $@ $@.tmp && rm $@.tmp || mv $@.tmp $@
+
+# Exercise the real exception dispatcher without introducing a device source.
+$(LA_BUILD)/kernel-irq-empty: $(LA_OBJECTS) $(LA_BUILD)/tests/loongarch/irq_empty.o arch/loongarch/linker.ld
+	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=la_boot_tasks -o $@ $(LA_OBJECTS) $(LA_BUILD)/tests/loongarch/irq_empty.o -lgcc
+.PHONY: test-irq-empty-loongarch
+test-irq-empty-loongarch: $(LA_BUILD)/kernel-irq-empty prepare-la-tools
+	timeout 15s $(QEMU_LOONGARCH64) -machine virt -cpu la464 -smp 1 -m 512M -kernel $< -nographic -no-reboot > $(LA_BUILD)/irq-empty.log 2>&1
+	@cat $(LA_BUILD)/irq-empty.log
+	@rg -Fx 'LA empty and masked interrupt snapshots preserve owner PASS' $(LA_BUILD)/irq-empty.log
