@@ -23,7 +23,11 @@ void scheduler_task_publish_locked(struct kernel_task *task) { (void)task; asser
 #endif
 void kernel_cpu_notify(struct kernel_cpu *target, unsigned events)
 {
-    assert(active->raw_locks && active->raw_locks->lock == &kernel_wait_domain);
+    assert(active->raw_locks && (kernel_raw_lock_owned(&kernel_wait_domain)
+#if BOAROS_USER_SMP
+        || active->raw_locks->lock->rank==KERNEL_RAW_RANK_RUNQUEUE
+#endif
+        ));
     __atomic_fetch_or(&target->events, events, __ATOMIC_RELEASE);
     if (target != active) active->outbound |= 1U << target->logical_id;
 }

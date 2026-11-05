@@ -1,6 +1,37 @@
 #include <kernel/cpu.h>
 #include <kernel/raw_lock.h>
 
+#if BOAROS_USER_SMP
+#include <kernel/wait_internal.h>
+
+static struct run_lock_slot { struct kernel_raw_lock lock; } __attribute__((aligned(64)))
+    run_locks[BOAROS_MAX_CPUS] = { [0 ... BOAROS_MAX_CPUS-1] = {
+        .lock={.rank=KERNEL_RAW_RANK_RUNQUEUE,.initialized=KERNEL_RAW_INITIALIZED} } };
+
+/* 只由持共同控制锁的慢路径使用；guard存储不会跨越切栈。 */
+static struct kernel_raw_guard run_guards[BOAROS_MAX_CPUS];
+
+struct kernel_raw_lock *kernel_run_lock(const struct kernel_cpu *cpu)
+{ return &run_locks[cpu->logical_id].lock; }
+
+void kernel_run_set_acquire(struct kernel_run_set *set)
+{
+    if (!kernel_raw_lock_owned(&kernel_wait_domain)) __builtin_trap();
+    if (run_guards[0].lock) return;
+    for (unsigned i=0;i<BOAROS_MAX_CPUS;i++)
+        kernel_raw_lock_acquire(&run_locks[i].lock,&run_guards[i]);
+    set->held=1;
+}
+
+void kernel_run_set_release(struct kernel_run_set *set)
+{
+    if (!set->held) return;
+    for (unsigned i=BOAROS_MAX_CPUS;i;)
+        kernel_raw_lock_release(&run_guards[--i]);
+    set->held=0;
+}
+#endif
+
 #if BOAROS_MAX_CPUS > 1
 static unsigned boot_count;
 #endif

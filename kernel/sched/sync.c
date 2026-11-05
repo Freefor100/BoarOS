@@ -52,7 +52,7 @@ static uint64_t queued_spin_budget(struct kernel_rwlock *lock,struct kernel_lock
     for(struct kernel_cpu *cpu=scheduler.cpus;cpu;cpu=cpu->scheduler_next) {
         if(!kernel_cpu_online(cpu))continue;
         online++;
-        struct kernel_task *task=cpu->current;
+        struct kernel_task *task=__atomic_load_n(&cpu->current,__ATOMIC_ACQUIRE);
         if(lock->pending_head==waiter && lock->writer && cpu->logical_id!=local &&
            task && task->state==KERNEL_THREAD_STATE_RUNNING && task->wait.on_cpu &&
            &task->io_context==lock->writer)running_writer=1;

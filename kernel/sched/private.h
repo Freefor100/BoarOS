@@ -65,6 +65,9 @@ struct kernel_scheduler {
     struct kernel_task *exited_head;
     struct kernel_task *exited_tail;
     struct kernel_task *deadline_root;
+#if BOAROS_USER_SMP
+    uint64_t wait_deadline;
+#endif
     struct kernel_task *stopped_head;
     struct kernel_task *stopped_tail;
     struct kernel_task *init_task;
@@ -194,6 +197,23 @@ void scheduler_arm_timer(uint64_t deadline);
 void scheduler_rearm_timer(void);
 /* IRQ关闭；CPU/current借用只覆盖决策，架构切换后不得继续使用缓存值。 */
 enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntary, int check_queues);
+#if BOAROS_USER_SMP
+int scheduler_local_task(const struct kernel_task *, const struct kernel_cpu *);
+void scheduler_ready_local_locked(struct kernel_task *, struct kernel_cpu *);
+int scheduler_select_local(int, int, int, struct kernel_task **, uint64_t *);
+/* 运行在已恢复的新栈上；复用外层guard，不能再为交接叠一层深栈。 */
+static inline __attribute__((always_inline)) int scheduler_finish_local_locked(struct kernel_cpu *cpu)
+{
+    struct kernel_task *previous=cpu->switch_previous;
+    if (!previous || previous==cpu->current || !cpu->current->wait.on_cpu) __builtin_trap();
+    unsigned state=__atomic_load_n(&previous->state,__ATOMIC_RELAXED);
+    if (!previous->idle && (!scheduler_local_task(previous,cpu) ||
+        (state!=KERNEL_THREAD_STATE_READY && state!=KERNEL_THREAD_STATE_BLOCKED))) return 0;
+    cpu->switch_previous=0;
+    kernel_wait_switch_finish_locked(previous);
+    return 1;
+}
+#endif
 void ready_append(struct kernel_task *thread);
 int scheduler_forget_task_locked(struct kernel_task *, struct kernel_wait_cursor *);
 void scheduler_forget_task(struct kernel_task *thread);

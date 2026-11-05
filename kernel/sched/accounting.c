@@ -64,8 +64,13 @@ static __attribute__((noinline)) int accounting_initialize(struct kernel_cpu *cp
 }
 void scheduler_cpu_time_switch(struct kernel_task *previous,struct kernel_task *next)
 {
+#if BOAROS_USER_SMP
+    struct kernel_cpu *cpu=kernel_cpu_current();
+    KERNEL_RAW_SCOPE(guard,kernel_run_lock(cpu));
+#else
     KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
     struct kernel_cpu *cpu=kernel_cpu_current();
+#endif
     uint64_t now=accounting_counter();
     if (!cpu->accounting_owner) {
         cpu->accounting_owner=previous;
@@ -90,6 +95,7 @@ void scheduler_cpu_time_switch(struct kernel_task *previous,struct kernel_task *
 }
 void scheduler_task_cpu_time_locked(const struct kernel_task *task,uint64_t *user,uint64_t *system)
 {
+    KERNEL_RUN_SET(runs);
     for (struct kernel_cpu *cpu=scheduler.cpus;cpu;cpu=cpu->scheduler_next) {
         if (cpu->accounting_owner!=task || task->idle || task==cpu->idle) continue;
         for (;;) {
@@ -162,6 +168,7 @@ void scheduler_usage_add(struct kernel_task_usage *to, const struct kernel_task_
 
 void scheduler_usage_thread_locked(const struct kernel_task *task, struct kernel_task_usage *usage)
 {
+    KERNEL_RUN_SET(runs);
     *usage = (struct kernel_task_usage){
         .minor_faults = __atomic_load_n(&task->usage.minor_faults, __ATOMIC_RELAXED),
         .major_faults = __atomic_load_n(&task->usage.major_faults, __ATOMIC_RELAXED),

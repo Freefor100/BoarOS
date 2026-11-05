@@ -986,6 +986,7 @@ static void signal_resume_stopped(struct kernel_task *task)
 {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     if (task->state != KERNEL_THREAD_STATE_STOPPED) return;
+    KERNEL_RUN_SET(runs);
     stopped_unlink_locked(task);
     task->state = KERNEL_THREAD_STATE_READY;
 #if BOAROS_USER_SMP
@@ -1436,6 +1437,7 @@ enum kernel_signal_status signal_send_kernel_group(struct kernel_task *target, u
 
 unsigned signal_cpu_timer_check_locked(struct kernel_task *leader,const struct kernel_task_usage *usage)
 {
+    KERNEL_RUN_SET(runs);
     /* Sleep does not turn a periodic timer's old CPU debt into wall-clock work. */
     int running=0;
     for(struct kernel_cpu *cpu=scheduler.cpus;cpu;cpu=cpu->scheduler_next) {
@@ -1716,6 +1718,7 @@ static void signal_stop_member(struct kernel_task *task, uint32_t sig)
     KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
     if (!signal_dispatchable_locked(task) || task->state==KERNEL_THREAD_STATE_STOPPED)
         return;
+    KERNEL_RUN_SET(runs);
 #if BOAROS_USER_SMP
     if (task!=kernel_cpu_current()->current && task->wait.on_cpu) {
         /* 最终提交点复查执行owner：READY可在锁外被CPU1接纳，

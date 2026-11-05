@@ -150,7 +150,11 @@ struct kernel_task {
     struct kernel_task *last_child;
     struct kernel_task *previous_sibling;
     struct kernel_task *next_sibling;
+#if BOAROS_USER_SMP
+    _Atomic uint32_t state;
+#else
     uint32_t state;
+#endif
     uint32_t idle;
     kernel_pid_t tid;
     struct kernel_pid_member identities[KERNEL_PID_ROLES];

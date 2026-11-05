@@ -133,6 +133,10 @@ void deadline_index_insert(struct kernel_task *task)
     task->deadline_indexed = 1U;
     scheduler.deadline_root =
         deadline_insert_node(scheduler.deadline_root, task);
+#if BOAROS_USER_SMP
+    if (!scheduler.wait_deadline || task->wait.deadline<scheduler.wait_deadline)
+        __atomic_store_n(&scheduler.wait_deadline,task->wait.deadline,__ATOMIC_RELEASE);
+#endif
 }
 
 void deadline_index_remove(struct kernel_task *task)
@@ -140,6 +144,12 @@ void deadline_index_remove(struct kernel_task *task)
     if (task == 0 || !task->deadline_indexed) return;
     scheduler.deadline_root =
         deadline_remove_node(scheduler.deadline_root, task);
+#if BOAROS_USER_SMP
+    if (task->wait.deadline==scheduler.wait_deadline) {
+        struct kernel_task *first=deadline_index_first();
+        __atomic_store_n(&scheduler.wait_deadline,first?first->wait.deadline:0,__ATOMIC_RELEASE);
+    }
+#endif
     task->deadline_left = 0;
     task->deadline_right = 0;
     task->deadline_height = 0;
@@ -202,6 +212,7 @@ void kernel_wait_backend_commit(struct kernel_task *task, uint64_t deadline, int
 {
 #if BOAROS_USER_SMP
     scheduler_user_reservation_release_locked(task);
+    KERNEL_RAW_SCOPE(run,kernel_run_lock(kernel_cpu_current()));
 #endif
     task->wait.ready_flags = 0;
     if (task->wait.deadline != deadline || task->wait.interruptible != (uint32_t)interruptible) __builtin_trap();
@@ -215,7 +226,11 @@ void kernel_wait_backend_commit(struct kernel_task *task, uint64_t deadline, int
 #if BOAROS_COST_DIAGNOSTICS
     kernel_cost_block(&task->cost);
 #endif
+#if BOAROS_USER_SMP
+    __atomic_store_n(&task->state,KERNEL_THREAD_STATE_BLOCKED,__ATOMIC_RELAXED);
+#else
     task->state = KERNEL_THREAD_STATE_BLOCKED;
+#endif
 }
 void kernel_wait_backend_notify(struct kernel_task *task, uint32_t reason)
 {
@@ -227,9 +242,42 @@ void kernel_wait_backend_notify(struct kernel_task *task, uint32_t reason)
     deadline_index_remove(task);
     kernel_wait_queue_remove(&task->default_wait_node);
     (void)reason; /* 通知者在摘除期限索引后发布record.reason/phase。 */
+#if BOAROS_USER_SMP
+    __atomic_store_n(&task->state,KERNEL_THREAD_STATE_READY,__ATOMIC_RELAXED);
+#else
     task->state = KERNEL_THREAD_STATE_READY;
+#endif
 }
-void kernel_wait_backend_ready(struct kernel_task *task) { ready_enqueue_locked(task, task->wait.ready_flags); }
+void kernel_wait_backend_ready(struct kernel_task *task)
+{
+#if BOAROS_USER_SMP
+    if (!kernel_raw_lock_owned(&kernel_wait_domain)) {
+        scheduler_ready_local_locked(task,task->cpu);
+        return;
+    }
+#endif
+    ready_enqueue_locked(task, task->wait.ready_flags);
+}
+#if BOAROS_USER_SMP
+int kernel_wait_backend_lock_local(const struct kernel_wait_token *token,struct kernel_raw_guard *run)
+{
+    struct kernel_task *task=token->task;
+    struct kernel_cpu *cpu=__atomic_load_n(&task->cpu,__ATOMIC_ACQUIRE);
+    if (!cpu) return -1;
+    kernel_raw_lock_acquire(kernel_run_lock(cpu),run);
+    /* 改归属后不能用原核的队列锁保护；慢路径重查代次和实际资格。 */
+    int result=-1;
+    if (__atomic_load_n(&task->cpu,__ATOMIC_RELAXED)==cpu) {
+        uint64_t state=kernel_wait_record_load(&task->wait);
+        unsigned phase=(unsigned)(state&3U);
+        if ((state>>5)!=token->generation || phase==KERNEL_WAIT_FINISHED || phase==KERNEL_WAIT_NOTIFIED) result=0;
+        else if (phase==KERNEL_WAIT_COMMITTED && task->state==KERNEL_THREAD_STATE_BLOCKED &&
+            !task->wait.deadline && scheduler_local_task(task,cpu)) return 1;
+    }
+    kernel_raw_lock_release(run);
+    return result;
+}
+#endif
 enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *task)
 { return scheduler_switch_current_away(task); }
 #if BOAROS_MAX_CPUS > 1
