@@ -145,3 +145,5 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:$PWD" -w "$PWD" \
   --build-root build/riscv-user-smp-composition/ubuntu2404 \
   --output build/user-smp-composition-container-run
 ```
+
+当前匿名/COW/ELF缺页及ext4冷装入在调用CPU执行，共同MM资格与当前执行边界见[调度模块](../modules/kernel-scheduler.md#smp-的共同调度与业务状态)和[MM模块](../modules/kernel-mm.md)。
