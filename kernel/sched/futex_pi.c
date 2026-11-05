@@ -112,7 +112,7 @@ static int normal_waiter(struct futex_bucket *bucket,const struct kernel_futex_k
     kernel_wait_cursor_begin(&bucket->waiters,&cursor);
     while(cursor.node) {
         {
-            KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+            KERNEL_IRQ_LOCK_SCOPE(g,&bucket->waiters.lock);
             struct kernel_wait_node *node=cursor.node;
             if(node->queue==&bucket->waiters && node->task &&
                !futex_entry(node)->woken && futex_key_equal(&futex_entry(node)->key,key))found=1;
@@ -229,7 +229,7 @@ static int wait_exiting_owner(struct kernel_futex_pi_request *request)
         {
             KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
             if(owner->futex_exit_state!=1 && (!owner->proc_exiting || owner->futex_exit_state==2))break;
-            if(kernel_wait_prepare_locked(&owner->group_wait_queue,0,0,&token))__builtin_trap();
+            if(kernel_wait_prepare(&owner->group_wait_queue,0,0,&token))__builtin_trap();
         }
         enum kernel_wait_wake_reason reason;
         if(kernel_wait_park(&token,&reason) || kernel_wait_finish(&token))__builtin_trap();
@@ -386,7 +386,7 @@ int64_t kernel_futex_pi(struct kernel_task *task,uint64_t address,uint32_t opera
             if(action==WAITING) {
                 if(waiter_order==UINT64_MAX)__builtin_trap();
                 request.order=++waiter_order;
-                if(kernel_wait_prepare_locked(0,deadline,1,&request.token))__builtin_trap();
+                if(kernel_wait_prepare(0,deadline,1,&request.token))__builtin_trap();
                 waiter_insert(&request);kernel_futex_pi_recalculate_locked(request.state->owner,-1);
                 if(expired)(void)kernel_wait_notify_locked(&request.token,KERNEL_WAIT_TIMEOUT);
 #if BOAROS_MAX_CPUS > 1
@@ -477,8 +477,10 @@ int64_t kernel_futex_wait_requeue_pi(struct kernel_task *task,uint64_t address,
         uint32_t *word=(void *)((unsigned char *)pi_request.source_pin.page+(address&BOAROS_PAGE_MASK));
         if(__atomic_load_n(word,__ATOMIC_ACQUIRE)!=value){result=-KERNEL_EAGAIN;goto out;}
         KERNEL_RAW_SCOPE(raw,&kernel_wait_domain);
-        if(kernel_wait_prepare_locked(0,deadline,1,&pi_request.token))__builtin_trap();
-        futex_bind_entry_locked(&bucket->waiters,&entry,&pi_request.token);
+        if(kernel_wait_prepare(0,deadline,1,&pi_request.token))__builtin_trap();
+        entry.priority=scheduler_base_priority(task);
+        { KERNEL_IRQ_LOCK_SCOPE(queue_guard,&bucket->waiters.lock);
+          futex_bind_entry_locked(&bucket->waiters,&entry,&pi_request.token); }
         if(expired)(void)kernel_wait_notify_locked(&pi_request.token,KERNEL_WAIT_TIMEOUT);
     }
     kernel_mm_unpin_user_page(&pi_request.source_pin);
@@ -488,7 +490,7 @@ int64_t kernel_futex_wait_requeue_pi(struct kernel_task *task,uint64_t address,
     {
         KERNEL_RAW_SCOPE(raw,&kernel_wait_domain);
         stage=pi_request.requeue_stage;pi_request.requeue_stage=3;
-        kernel_wait_node_remove_locked(&entry.node);
+        kernel_wait_queue_remove(&entry.node);
         if(pi_request.queued) {
             waiter_remove(&pi_request);
             kernel_futex_pi_recalculate_locked(pi_request.state->owner,-1);
@@ -582,6 +584,7 @@ int64_t kernel_futex_cmp_requeue_pi(struct kernel_task *task,uint64_t address,
             int selected=0;
             {
                 KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+                KERNEL_IRQ_LOCK_SCOPE(queue_guard,&buckets[0]->waiters.lock);
                 if(node->queue==&buckets[0]->waiters && futex_key_equal(&entry->key,&keys[0])) {
                     if(entry->kind!=FUTEX_ENTRY_REQUEUE_PI || !entry->pi ||
                        !futex_key_equal(&entry->pi->key,&keys[1]))result=-KERNEL_EINVAL;
@@ -602,6 +605,9 @@ int64_t kernel_futex_cmp_requeue_pi(struct kernel_task *task,uint64_t address,
                     }
                 }
                 KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+                int notify=0;
+                {
+                KERNEL_IRQ_LOCK_SCOPE(queue_guard,&buckets[0]->waiters.lock);
                 /* 游标保活source entry；超时线程可能已摘队，发布前复核。 */
                 if(node->queue==&buckets[0]->waiters && entry->pi->requeue_stage==1) {
                     struct kernel_futex_pi_request *request=entry->pi;
@@ -624,10 +630,12 @@ int64_t kernel_futex_cmp_requeue_pi(struct kernel_task *task,uint64_t address,
                         waiter_insert(request);kernel_futex_pi_recalculate_locked(request->state->owner,-1);
                     } else {
                         __atomic_store_n(&request->granted,1,__ATOMIC_RELEASE);
-                        (void)kernel_wait_notify_locked(&request->token,KERNEL_WAIT_WOKEN);
+                        notify=1;
                     }
                     moved++;
                 }
+                }
+                if(notify)(void)kernel_wait_notify_locked(&entry->pi->token,KERNEL_WAIT_WOKEN);
             }
             kernel_wait_cursor_advance(&cursor);
         }

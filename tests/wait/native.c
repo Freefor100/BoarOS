@@ -18,6 +18,28 @@ static unsigned started, ended, early_switch;
 static uint64_t deadline;
 #define check(valid) do { if (!(valid)) { say("WAIT failed line="); hex(__LINE__); say("\n"); __builtin_trap(); } } while (0)
 static void empty(void *argument) { (void)argument; check(!kernel_cpu_current()->switch_previous); }
+#if BOAROS_MAX_CPUS > 1
+enum kernel_scheduler_status __real_kernel_wait_backend_switch_locked(
+    struct kernel_task *,struct kernel_raw_guard *);
+enum kernel_scheduler_status __wrap_kernel_wait_backend_switch_locked(
+    struct kernel_task *task,struct kernel_raw_guard *guard)
+{
+    if (early_switch) {
+        early_switch=0;
+        check(guard && guard->lock);
+        check(task->wait.on_cpu && task->state==KERNEL_THREAD_STATE_BLOCKED);
+        struct kernel_wait_token token={task,kernel_wait_record_generation(&task->wait)};
+        /* The notifier runs after commit protection ends, while the old
+         * stack still owns execution. It must acquire its own control lock. */
+        struct kernel_raw_lock *commit_lock=guard->lock;
+        kernel_raw_lock_release(guard);
+        check(kernel_wait_notify(&token,KERNEL_WAIT_WOKEN)==KERNEL_SCHEDULER_STATUS_OK);
+        check(task->wait.ready_pending && !task->ready_node.queued);
+        kernel_raw_lock_acquire(commit_lock,guard);
+    }
+    return __real_kernel_wait_backend_switch_locked(task,guard);
+}
+#else
 enum kernel_scheduler_status __real_kernel_wait_backend_switch(struct kernel_task *task);
 enum kernel_scheduler_status __wrap_kernel_wait_backend_switch(struct kernel_task *task)
 {
@@ -29,6 +51,7 @@ enum kernel_scheduler_status __wrap_kernel_wait_backend_switch(struct kernel_tas
     }
     return __real_kernel_wait_backend_switch(task);
 }
+#endif
 static void worker(void *argument)
 {
     uintptr_t irq = arch_interrupt_save();

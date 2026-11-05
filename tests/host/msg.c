@@ -258,6 +258,7 @@ void kernel_wait_backend_quiesce(void)
 }
 enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *t)
 {
+
     if (block_handshake) {
         unsigned bit = 1U << (unsigned)(t - task);
         assert(!pthread_mutex_lock(&handshake_lock));
@@ -896,3 +897,13 @@ int main(void)
     puts("MSG CORE HOST PASS");
     return 0;
 }
+
+#if BOAROS_MAX_CPUS > 1
+enum kernel_scheduler_status kernel_wait_backend_switch_locked(struct kernel_task *task,
+    struct kernel_raw_guard *handoff)
+{
+    assert(handoff && handoff->lock == &kernel_wait_domain);
+    kernel_raw_lock_release(handoff);
+    return kernel_wait_backend_switch(task);
+}
+#endif

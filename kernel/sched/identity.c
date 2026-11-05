@@ -4,8 +4,7 @@
 
 static void identity_domain_owned(void)
 {
-    struct kernel_raw_guard *guard = kernel_cpu_current()->raw_locks;
-    if (!guard || guard->lock != &kernel_wait_domain) __builtin_trap();
+    if (!kernel_raw_lock_owned(&kernel_wait_domain)) __builtin_trap();
 }
 
 /* Disposal consumes a retired owner only after releasing the scheduler domain.
@@ -44,8 +43,7 @@ uint64_t process_identity_generation(const struct kernel_task *task)
 
 struct kernel_task *process_find_identity(kernel_pid_t number, enum kernel_pid_role role)
 {
-    struct kernel_raw_guard *guard = kernel_cpu_current()->raw_locks;
-    if (!guard || guard->lock != &kernel_wait_domain) __builtin_trap();
+    if (!kernel_raw_lock_owned(&kernel_wait_domain)) __builtin_trap();
     struct kernel_pid *id = kernel_pid_find(&scheduler.identities, number);
     return id && id->members[role] ? id->members[role]->task : 0;
 }

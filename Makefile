@@ -2457,7 +2457,7 @@ $(BUILD_DIR)/wait-native.o: tests/wait/native.c Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 $(BUILD_DIR)/wait-native: $(OBJECTS) $(BUILD_DIR)/wait-native.o arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_scheduler_init,--wrap=kernel_wait_backend_switch -o $@ $(OBJECTS) $(BUILD_DIR)/wait-native.o
+	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_scheduler_init,--wrap=kernel_wait_backend_switch,--wrap=kernel_wait_backend_switch_locked -o $@ $(OBJECTS) $(BUILD_DIR)/wait-native.o
 .PHONY: test-wait-riscv
 test-wait-riscv: $(BUILD_DIR)/wait-native
 	python3 -B tests/wait/native.py --arch riscv --qemu $(QEMU_RISCV64) --kernel-dir $(BUILD_DIR)
@@ -2466,7 +2466,7 @@ $(BUILD_DIR)/sched-lifecycle-native.o: tests/wait/native.c Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -DBOAROS_SCHED_LIFECYCLE=1 -c $< -o $@
 $(BUILD_DIR)/sched-lifecycle-native: $(OBJECTS) $(BUILD_DIR)/sched-lifecycle-native.o arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_scheduler_init,--wrap=kernel_wait_backend_switch -o $@ $(OBJECTS) $(BUILD_DIR)/sched-lifecycle-native.o
+	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_scheduler_init,--wrap=kernel_wait_backend_switch,--wrap=kernel_wait_backend_switch_locked -o $@ $(OBJECTS) $(BUILD_DIR)/sched-lifecycle-native.o
 .PHONY: test-sched-lifecycle-riscv
 test-sched-lifecycle-riscv: $(BUILD_DIR)/sched-lifecycle-native
 	python3 -B tests/wait/native.py --arch riscv --qemu $(QEMU_RISCV64) --kernel-dir $(BUILD_DIR) --case sched-lifecycle
@@ -2544,7 +2544,7 @@ test-scheduler-stack-slots-host:
 test-scheduler-handoff-host: test-scheduler-stack-slots-host
 	@mkdir -p build/host
 	@set -e; for shift in 12 14; do \
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/sync -idirafter include tests/host/sched_handoff.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/core.c kernel/sched/process.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=scheduler_switch_claimed,--wrap=kernel_raw_lock_acquire -o build/host/scheduler-handoff-$$shift; \
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/sync -idirafter include tests/host/sched_handoff.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/core.c kernel/sched/process.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=scheduler_switch_claimed,--wrap=kernel_raw_lock_acquire,--wrap=kernel_wait_backend_quiesce -o build/host/scheduler-handoff-$$shift; \
 		build/host/scheduler-handoff-$$shift; \
 	done
 

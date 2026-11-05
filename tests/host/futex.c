@@ -25,7 +25,7 @@ static unsigned opposite_arm, bucket_entered, bucket_waiter;
 static unsigned remap_arm, fault_entered, fault_resume;
 static unsigned gate_arm, gate_entered, gate_resume, gate_attempted;
 static unsigned admission_arm, admission_waited;
-static unsigned measure_domain, domain_takes, fast_notification;
+static unsigned measure_domain, domain_takes, queue_takes, fast_notification;
 static struct kernel_wait_queue *futex_queue;
 void futex_test_notifications_init(void);
 struct kernel_cpu *futex_test_notification_target(unsigned);
@@ -47,8 +47,10 @@ long futex_test_send_ipi(uint64_t hart)
 void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *, struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock, struct kernel_raw_guard *guard)
 {
-    if (lock == &kernel_wait_domain && kernel_cpu_current()->hardware_id == 0 && measure_domain)
-        domain_takes++;
+    if (kernel_cpu_current()->hardware_id == 0 && measure_domain) {
+        if(lock==&kernel_wait_domain)domain_takes++;
+        if(lock->rank==KERNEL_RAW_RANK_WAIT_QUEUE)queue_takes++;
+    }
     __real_kernel_raw_lock_acquire(lock, guard);
 }
 void __real_kernel_wait_backend_notify(struct kernel_task *, uint32_t);
@@ -56,10 +58,14 @@ void __wrap_kernel_wait_backend_notify(struct kernel_task *task, uint32_t reason
 {
     if (fast_notification) {
         assert(kernel_wait_record_phase(&task->wait) == KERNEL_WAIT_COMMITTED);
-        assert(!task->default_wait_node.references && !task->wait.borrows);
+        assert(!kernel_wait_node_references(&task->default_wait_node) &&
+            kernel_wait_record_borrows(&task->wait));
+        struct kernel_raw_guard *held=kernel_cpu_current()->raw_locks;
+        assert(held && held->lock==&kernel_wait_domain);
+        for(;held;held=held->previous)assert(held->lock->rank!=KERNEL_RAW_RANK_WAIT_QUEUE);
     }
     /* Production notification removes the default node before ready publication. */
-    kernel_wait_node_remove_locked(&task->default_wait_node);
+    kernel_wait_queue_remove(&task->default_wait_node);
     __real_kernel_wait_backend_notify(task, reason);
     if (notification_probe && kernel_cpu_current()->hardware_id == 0) {
         struct kernel_cpu *remote = futex_test_notification_target(1);
@@ -117,6 +123,7 @@ enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue
     uint64_t deadline, int interruptible, struct kernel_wait_token *token)
 {
     enum kernel_scheduler_status result = __real_kernel_wait_prepare(queue, deadline, interruptible, token);
+    if(interruptible)futex_queue=queue;
     if (kernel_cpu_current()->hardware_id == 1 && !interruptible &&
         __atomic_load_n(&admission_arm, __ATOMIC_ACQUIRE)) {
         assert(!kernel_io_context_current()->locks && !kernel_io_context_current()->user_pins);
@@ -127,13 +134,6 @@ enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue
         assert(result == KERNEL_SCHEDULER_STATUS_OK && queue->registrations && token->generation);
         __atomic_store_n(&bucket_waiter, 1, __ATOMIC_RELEASE);
     }
-    return result;
-}
-enum kernel_scheduler_status __real_kernel_wait_prepare_locked(struct kernel_wait_queue *,uint64_t,int,struct kernel_wait_token *);
-enum kernel_scheduler_status __wrap_kernel_wait_prepare_locked(struct kernel_wait_queue *queue,uint64_t deadline,int interruptible,struct kernel_wait_token *token)
-{
-    enum kernel_scheduler_status result=__real_kernel_wait_prepare_locked(queue,deadline,interruptible,token);
-    if(interruptible)futex_queue=queue;
     return result;
 }
 enum kernel_scheduler_status __real_kernel_wait_node_bind_locked(struct kernel_wait_queue *,struct kernel_wait_node *,const struct kernel_wait_token *);
@@ -190,7 +190,7 @@ static void attach(unsigned id)
 static void detach(void)
 {
     struct kernel_task *task = kernel_wait_current_task();
-    assert(!task->wait.borrows && !task->wait.nodes && !task->futex_request);
+    assert(!kernel_wait_record_borrows(&task->wait) && !task->wait.nodes && !task->futex_request);
     assert(!kernel_io_context_current()->locks && !kernel_io_context_current()->user_pins);
     assert(!kernel_mm_release(&task->mm));
     mm_test_bind(0);
@@ -225,7 +225,7 @@ static void queued(unsigned id, unsigned previous)
 
 static int64_t measured_wake(uint64_t address, unsigned bitset)
 {
-    domain_takes = 0; measure_domain = 1;
+    domain_takes=queue_takes=0;measure_domain=1;
     int64_t result = call(address, 10 | 128, INT32_MAX, 0, 0, bitset);
     measure_domain = 0;
     return result;
@@ -272,7 +272,7 @@ static struct kernel_task synthetic[17];
 static struct kernel_futex_entry synthetic_entries[17];
 static void synthetic_add(unsigned count, const struct kernel_futex_key *key)
 {
-    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    KERNEL_RAW_SCOPE(guard,&futex_queue->lock);
     for (unsigned i = 0; i < count; i++) {
         struct kernel_task *task = &synthetic[i];
         *task = (struct kernel_task){0};
@@ -287,11 +287,11 @@ static void synthetic_add(unsigned count, const struct kernel_futex_key *key)
 }
 static void synthetic_remove(unsigned count)
 {
-    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    KERNEL_RAW_SCOPE(guard,&futex_queue->lock);
     for (unsigned i = 0; i < count; i++) {
         struct kernel_task *task = &synthetic[i];
         kernel_wait_node_remove_locked(&synthetic_entries[i].node);
-        assert(!task->wait.borrows && !synthetic_entries[i].node.references &&
+        assert(!kernel_wait_record_borrows(&task->wait) && !kernel_wait_node_references(&synthetic_entries[i].node) &&
             !synthetic_entries[i].node.borrow_owner);
         *task = (struct kernel_task){0};
     }
@@ -299,7 +299,7 @@ static void synthetic_remove(unsigned count)
 }
 static void wake_batches(void)
 {
-    assert(measured_wake(source, 1) == 0 && domain_takes == 1);
+    assert(measured_wake(source,1)==0 && !domain_takes && queue_takes==1);
     put(source, 0);
     struct waiter w = {1, 1, source, -99, 0, 0};
     unsigned before = mm_test_parked(1); pthread_t worker;
@@ -308,14 +308,14 @@ static void wake_batches(void)
     assert(!kernel_mm_prepare_futex(&mm, &source, 1, 0, 0, 0, &key, 0));
     assert(futex_queue && futex_queue->registrations == 1);
     synthetic_add(3, &key);
-    /* One collision and one masked waiter remain PREPARED; the matched real
-     * COMMITTED node is removed in notify, so iteration must save its successor. */
+    /* Only the real COMMITTED waiter needs the scheduler domain; collision
+     * and mask filtering stay in the queue, and PREPARED notification uses CAS. */
     synthetic_entries[0].key.offset += 1024;
     synthetic_entries[1].bitset = 2;
     fast_notification = 1;
     notification_probe = 1; notification_sends = notification_seen = 0;
     futex_test_notification_target(1)->events = 0;
-    assert(measured_wake(source, 1) == 2 && domain_takes == 1);
+    assert(measured_wake(source,1)==2 && domain_takes==1 && queue_takes==1);
     assert(notification_sends == 1 && notification_seen == 2 &&
         !kernel_cpu_current()->notification_batch && !kernel_cpu_current()->outbound &&
         !kernel_cpu_current()->preempt_depth);
@@ -325,13 +325,13 @@ static void wake_batches(void)
         kernel_wait_record_phase(&synthetic[1].wait) == KERNEL_WAIT_PREPARED &&
         kernel_wait_record_phase(&synthetic[2].wait) == KERNEL_WAIT_NOTIFIED);
     assert(!pthread_join(worker, 0) && w.result == 0);
-    assert(measured_wake(source + 1024, 1) == 1 && domain_takes == 1);
-    assert(measured_wake(source, 2) == 1 && domain_takes == 1);
-    assert(measured_wake(source, 3) == 0 && domain_takes == 1);
+    assert(measured_wake(source+1024,1)==1 && !domain_takes && queue_takes==1);
+    assert(measured_wake(source,2)==1 && !domain_takes && queue_takes==1);
+    assert(measured_wake(source,3)==0 && !domain_takes && queue_takes==1);
     synthetic_remove(3);
     /* More than sixteen registrations retain the borrowed cursor path. */
     synthetic_add(17, &key);
-    assert(measured_wake(source, 1) == 17 && domain_takes > 1);
+    assert(measured_wake(source,1)==17 && !domain_takes && queue_takes>1);
     for (unsigned i = 0; i < 17; i++)
         assert(kernel_wait_record_phase(&synthetic[i].wait) == KERNEL_WAIT_NOTIFIED);
     synthetic_remove(17);
@@ -709,7 +709,7 @@ int main(void)
     detach(); mm_test_context = 0;
     assert(!kernel_mm_release(&mm));
     assert(physical_page_available(&allocator) == baseline && !physical_page_allocator_audit(&allocator));
-    puts("futex native operations, gate-independent private keys/pins, bounded one-lock wake/collisions, post-bucket IPI/IRQ ownership, admission/COW, requeue/bitset, coherent remap and owners PASS");
+    puts("futex native operations, gate-independent private keys/pins, queue/domain wake ownership and batches, post-bucket IPI/IRQ ownership, admission/COW, requeue/bitset, coherent remap and owners PASS");
 }
 
 /* 此fixture验证普通等待键、重排与MM交接；PI对象由独立优先级及客机用例验证。 */

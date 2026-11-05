@@ -52,8 +52,8 @@ static __attribute__((always_inline)) inline void account_time(struct kernel_cpu
     }
     __atomic_store_n(&cpu->accounting_started_ticks,now,__ATOMIC_RELAXED);
 }
-/* 冷启动首次绑定也沿调度域发布owner；常规trap无需重复取全局锁。 */
-static int accounting_initialize(struct kernel_cpu *cpu)
+/* 首次绑定有独立的控制资格和失败分支，保持在常规trap及用户返回的记账路径之外。 */
+static __attribute__((noinline)) int accounting_initialize(struct kernel_cpu *cpu)
 {
     if (scheduler.initialized!=KERNEL_SCHEDULER_INITIALIZED || !kernel_time_is_initialized()) return 0;
     KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);

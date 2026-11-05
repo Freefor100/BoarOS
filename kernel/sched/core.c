@@ -477,7 +477,7 @@ void kernel_scheduler_switch_finish(void)
         if (previous == cpu->current || !cpu->current->wait.on_cpu) __builtin_trap();
         kernel_wait_switch_finish_locked(previous);
         if (previous->state == KERNEL_THREAD_STATE_EXITED && previous->join)
-            notify = kernel_wait_cursor_prepare_locked(&previous->join->waiters, &joined, 1);
+            notify = kernel_wait_cursor_prepare(&previous->join->waiters, &joined);
     }
     if (notify) kernel_wait_cursor_wake(&joined, 1);
 }
@@ -485,6 +485,10 @@ void kernel_scheduler_switch_finish(void)
 enum kernel_scheduler_status scheduler_switch_current_away(struct kernel_task *previous)
 {
     kernel_assert_can_block();
+#if BOAROS_MAX_CPUS > 1
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    return scheduler_switch_current_away_locked(previous, &guard);
+#else
     struct kernel_cpu *cpu = kernel_cpu_current();
     struct kernel_task *next;
     uint64_t deadline;
@@ -497,7 +501,26 @@ enum kernel_scheduler_status scheduler_switch_current_away(struct kernel_task *p
     if (!next) return KERNEL_SCHEDULER_STATUS_OK;
     scheduler_arm_timer(deadline);
     return scheduler_switch_claimed(previous, next);
+#endif
 }
+
+#if BOAROS_MAX_CPUS > 1
+enum kernel_scheduler_status scheduler_switch_current_away_locked(
+    struct kernel_task *previous, struct kernel_raw_guard *guard)
+{
+    struct kernel_cpu *cpu = kernel_cpu_current();
+    if (!guard || cpu->raw_locks != guard || guard->lock != &kernel_wait_domain)
+        __builtin_trap();
+    scheduler_account_runtime_locked();
+    struct kernel_task *next = scheduler_select_next_locked(cpu, previous, 1);
+    uint64_t deadline = scheduler_deadline_locked(cpu);
+    /* 先完成执行权选择，再放锁；实际timer操作和切栈均在保护外。 */
+    kernel_raw_lock_release(guard);
+    if (!next) return KERNEL_SCHEDULER_STATUS_OK;
+    scheduler_arm_timer(deadline);
+    return scheduler_switch_claimed(previous, next);
+}
+#endif
 
 enum kernel_scheduler_status scheduler_switch_claimed(
     struct kernel_task *previous, struct kernel_task *next)
@@ -709,7 +732,7 @@ enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task)
 enum kernel_scheduler_status release_task_stack(struct kernel_task *thread)
 {
     kernel_assert_service_context();
-    if (thread && (thread->wait.on_cpu || thread->wait.borrows || thread->wait.nodes ||
+    if (thread && (thread->wait.on_cpu || kernel_wait_record_borrows(&thread->wait) || thread->wait.nodes ||
         kernel_wait_record_phase(&thread->wait) != KERNEL_WAIT_FINISHED)) __builtin_trap();
     if (thread && thread->io_context.user_pins) __builtin_trap();
 #if BOAROS_MAX_CPUS > 1
@@ -793,7 +816,7 @@ enum kernel_scheduler_status release_task_stack(struct kernel_task *thread)
 enum kernel_scheduler_status release_task_storage(
     struct kernel_task *thread, enum kernel_scheduler_status original_status)
 {
-    if (thread->wait.on_cpu || thread->wait.borrows || thread->wait.nodes ||
+    if (thread->wait.on_cpu || kernel_wait_record_borrows(&thread->wait) || thread->wait.nodes ||
         kernel_wait_record_phase(&thread->wait) != KERNEL_WAIT_FINISHED) __builtin_trap();
     if (thread->io_context.user_pins || thread->sem_request || thread->sem_undo ||
         thread->msg_request || thread->mqueue_request) __builtin_trap();
@@ -1358,7 +1381,7 @@ int scheduler_forget_task_locked(struct kernel_task *thread, struct kernel_wait_
     struct kernel_thread_join *join = thread->join;
     int notify = 0;
     if (join) {
-        notify = kernel_wait_cursor_prepare_locked(&join->waiters, cursor, 1);
+        notify = kernel_wait_cursor_prepare(&join->waiters, cursor);
         join->task = 0;
         thread->join = 0;
     }
@@ -1407,7 +1430,7 @@ static enum kernel_scheduler_status scheduler_sample_load(uint64_t elapsed)
             struct kernel_task *task = cursor.task;
             if (task->accounted && (task->state == KERNEL_THREAD_STATE_READY ||
                 task->state == KERNEL_THREAD_STATE_RUNNING ||
-                (task->state == KERNEL_THREAD_STATE_BLOCKED && !task->wait.interruptible))) active++;
+                (task->state == KERNEL_THREAD_STATE_BLOCKED && !kernel_wait_record_interruptible(&task->wait)))) active++;
         }
         scheduler_task_cursor_next(&cursor);
     }

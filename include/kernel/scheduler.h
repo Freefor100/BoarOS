@@ -7,6 +7,7 @@
 
 #include <stdint.h>
 #include <kernel/cpu_config.h>
+#include <kernel/raw_lock.h>
 
 struct kernel_files;
 struct kernel_fs_context;
@@ -185,7 +186,7 @@ struct kernel_wait_node {
     struct kernel_wait_queue *borrow_owner;
     uint64_t generation, sequence;
     uint32_t references;
-    /* Optional source interest, protected by wait domain. The registration
+    /* Optional source interest, protected by its queue. The registration
      * owner keeps this mask storage alive through all cursor borrows. */
     const uint64_t *event_mask;
 };
@@ -198,10 +199,24 @@ struct kernel_wait_queue {
     struct kernel_wait_node *tail;
     uint64_t sequence;
     uint32_t closed;
-    /* wait-domain内修改并release发布；通知方可acquire读零跳过空队列。 */
+    /* 队列保护内修改并release发布；空通知可直接跳过。 */
     uint32_t registrations;
     uint32_t borrows;
+    struct kernel_raw_lock lock;
 };
+#define KERNEL_WAIT_QUEUE_STATIC_INITIALIZER { .initialized=KERNEL_WAIT_QUEUE_INITIALIZED, \
+    .lock={.rank=KERNEL_RAW_RANK_WAIT_QUEUE,.initialized=KERNEL_RAW_INITIALIZED} }
+
+static inline uint32_t kernel_wait_node_references(const struct kernel_wait_node *node)
+{
+#if BOAROS_MAX_CPUS > 1
+    return __atomic_load_n(&node->references,__ATOMIC_ACQUIRE);
+#else
+    return node->references;
+#endif
+}
+static inline uint32_t kernel_wait_queue_registrations(const struct kernel_wait_queue *queue)
+{ return __atomic_load_n(&queue->registrations,__ATOMIC_ACQUIRE); }
 
 void kernel_wait_node_init(struct kernel_wait_node *node,
                            struct kernel_task *task);

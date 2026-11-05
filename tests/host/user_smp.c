@@ -110,6 +110,13 @@ void process_identity_commit_locked(struct kernel_task *task)
 struct kernel_cpu *riscv_smp_cpu(unsigned id) { assert(id<2);return &cpus[id]; }
 enum kernel_scheduler_status scheduler_switch_current_away(struct kernel_task *task)
 { (void)task;assert(!"unexpected wait in the host signal transition");return KERNEL_SCHEDULER_STATUS_INVALID_STATE; }
+enum kernel_scheduler_status scheduler_switch_current_away_locked(struct kernel_task *task,
+    struct kernel_raw_guard *handoff)
+{
+    assert(handoff && handoff->lock==&kernel_wait_domain);
+    kernel_raw_lock_release(handoff);
+    return scheduler_switch_current_away(task);
+}
 uint32_t kernel_time_is_initialized(void) { return 0; }
 uint64_t kernel_time_ticks_to_ns(uint64_t ticks) { (void)ticks;assert(!kernel_time_is_initialized());return 0; }
 uint64_t riscv_time_read(void) { return 1; }

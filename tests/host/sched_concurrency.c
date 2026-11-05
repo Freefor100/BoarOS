@@ -28,15 +28,22 @@ void signal_owner_cases(unsigned *lock_calls);
 void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *, struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock, struct kernel_raw_guard *guard)
 {
-    group_lock_calls++;
+    if(lock==&kernel_wait_domain) group_lock_calls++;
     if (__atomic_load_n(&accounting_progress_check,__ATOMIC_ACQUIRE) &&
         active_cpu==&cpus[1] && lock==&kernel_wait_domain)
         __atomic_store_n(&accounting_lock_attempt,1,__ATOMIC_RELEASE);
-    if (complete_disposal_at && ++cleanup_domain_entry == complete_disposal_at) {
-        assert(lock == &kernel_wait_domain && !active_cpu->raw_locks);
-        assert(scheduler.cleanup_queue.registrations == (complete_disposal_at > 2));
-        complete_disposal_at = 0;
-        complete_held_disposal();
+    if (complete_disposal_at) {
+        int registered=kernel_wait_queue_registrations(&scheduler.cleanup_queue)!=0;
+        int complete=(complete_disposal_at==1 && lock==&kernel_wait_domain) ||
+            (complete_disposal_at==2 && lock==&scheduler.cleanup_queue.lock);
+        if (registered && lock==&kernel_wait_domain)
+            complete=++cleanup_domain_entry==complete_disposal_at-2;
+        if(complete) {
+            assert(!active_cpu->raw_locks);
+            assert(registered == (complete_disposal_at>2));
+            complete_disposal_at=0;
+            complete_held_disposal();
+        }
     }
     __real_kernel_raw_lock_acquire(lock, guard);
 }
@@ -93,6 +100,7 @@ void kernel_wait_backend_commit(struct kernel_task *task, uint64_t deadline, int
 }
 enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *task)
 {
+
     /* The real prepare/commit/finish path is linked here. Actual old/new stack
      * handoff has its separate host and guest tests; this shim supplies a wake. */
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
@@ -349,11 +357,11 @@ static void event_claim_handoff(void)
     struct kernel_wait_token parent_wait, cleanup_wait;
     assert(kernel_wait_prepare(&tasks[0].child_exit_queue, 0, 0, &parent_wait) == KERNEL_SCHEDULER_STATUS_OK);
     assert(kernel_wait_record_phase(&waiter->wait) == KERNEL_WAIT_PREPARED && tasks[0].child_exit_queue.registrations == 1);
-    /* Empty and direct task notification stay within their protecting domain;
-     * they must not create a cursor/storage borrow that survives the unlock. */
+    /* A queue cursor may outlive the identity-domain section; its real parent
+     * borrow must end after notification and before the caller returns. */
     group_lock_calls = 0;
     wake_waiting_parent(child);
-    assert(group_lock_calls <= 1 && kernel_wait_record_phase(&waiter->wait) == KERNEL_WAIT_NOTIFIED);
+    assert(kernel_wait_record_phase(&waiter->wait) == KERNEL_WAIT_NOTIFIED);
     assert(!tasks[0].storage_borrows && !tasks[0].child_exit_queue.borrows);
     assert(kernel_wait_finish(&parent_wait) == KERNEL_SCHEDULER_STATUS_OK);
     group_lock_calls = 0;
@@ -953,3 +961,13 @@ int main(void)
     puts("scheduler 2-CPU execution claims and 2/4-actor metadata lifetime passed");
     return 0;
 }
+
+#if BOAROS_MAX_CPUS > 1
+enum kernel_scheduler_status kernel_wait_backend_switch_locked(struct kernel_task *task,
+    struct kernel_raw_guard *handoff)
+{
+    assert(handoff && handoff->lock == &kernel_wait_domain);
+    kernel_raw_lock_release(handoff);
+    return kernel_wait_backend_switch(task);
+}
+#endif

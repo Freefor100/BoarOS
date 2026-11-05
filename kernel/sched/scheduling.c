@@ -103,8 +103,7 @@ static uint32_t online_user_mask_locked(void)
 void scheduler_user_reservation_release_locked(struct kernel_task *task)
 {
 #if BOAROS_USER_SMP
-    struct kernel_cpu *caller=kernel_cpu_current();
-    if (!caller->raw_locks || caller->raw_locks->lock!=&kernel_wait_domain || !task)
+    if (!kernel_raw_lock_owned(&kernel_wait_domain) || !task)
         __builtin_trap();
     if (!task->reservation_node.queued) {
         if (task->reservation_cpu) __builtin_trap();
@@ -122,8 +121,7 @@ void scheduler_user_reservation_release_locked(struct kernel_task *task)
 void scheduler_user_service_set_locked(struct kernel_task *task, int service)
 {
 #if BOAROS_USER_SMP
-    struct kernel_cpu *cpu = kernel_cpu_current();
-    if (!cpu->raw_locks || cpu->raw_locks->lock != &kernel_wait_domain ||
+    if (!kernel_raw_lock_owned(&kernel_wait_domain) ||
         !task || !task->arch.user_mode) __builtin_trap();
     if (service && !task->user_service && task->wait.on_cpu)
         reserve_user_locked(task,task->cpu);
@@ -139,8 +137,7 @@ void scheduler_user_service_set_locked(struct kernel_task *task, int service)
 void scheduler_user_request_locked(struct kernel_task *task)
 {
 #if BOAROS_USER_SMP
-    struct kernel_cpu *cpu = kernel_cpu_current();
-    if (!cpu->raw_locks || cpu->raw_locks->lock != &kernel_wait_domain) __builtin_trap();
+    if (!kernel_raw_lock_owned(&kernel_wait_domain)) __builtin_trap();
     if (!task || !task->arch.user_mode || task->retirement) return;
     __atomic_fetch_or(&task->user_return_pending, KERNEL_USER_RETURN_CPU0, __ATOMIC_RELEASE);
     if (task->wait.on_cpu) kernel_cpu_request_schedule(task->cpu);
@@ -153,7 +150,7 @@ void scheduler_signal_request_locked(struct kernel_task *task)
 {
 #if BOAROS_USER_SMP
     struct kernel_cpu *cpu=kernel_cpu_current();
-    if (!cpu->raw_locks || cpu->raw_locks->lock!=&kernel_wait_domain) __builtin_trap();
+    if (!kernel_raw_lock_owned(&kernel_wait_domain)) __builtin_trap();
     if (!task || !task->arch.user_mode || task->retirement) return;
     __atomic_fetch_or(&task->user_return_pending, KERNEL_USER_RETURN_SIGNAL, __ATOMIC_RELEASE);
     if (task!=cpu->current && task->wait.on_cpu) kernel_cpu_request_schedule(task->cpu);
@@ -437,11 +434,16 @@ static struct kernel_cpu *ready_place_locked(struct kernel_task *task, int flags
     /* yield/片尾在实际换栈后回到原队列；资格改变时才重新放置。 */
     if ((flags&SCHED_READY_LOCAL) && task->cpu &&
         (mask&(1U<<task->cpu->logical_id))) return task->cpu;
+    /* 唯一合法目标没有负载选择；沿最后执行者直接定位，仍保留RT排队规则。 */
+    if (task->cpu && mask==(1U<<task->cpu->logical_id)) return task->cpu;
+    struct kernel_cpu *caller=kernel_cpu_current();
+    if (mask==(1U<<caller->logical_id)) return caller;
     struct kernel_cpu *best=0;
     unsigned best_load=0;
     int best_class=0;
     for (struct kernel_cpu *cpu=scheduler.cpus;cpu;cpu=cpu->scheduler_next) {
         if (!(mask&(1U<<cpu->logical_id))) continue;
+        if (!(mask&(mask-1U))) return cpu;
         unsigned load=ready_load(cpu);
         int kind=placement_class(task,cpu,load);
         if (!best || kind<best_class || (kind==best_class &&
@@ -467,7 +469,7 @@ static struct kernel_task *ready_pull_locked(struct kernel_cpu *cpu)
 {
     struct kernel_task *best=0;
     for (struct kernel_cpu *other=scheduler.cpus;other;other=other->scheduler_next) {
-        if (other==cpu) continue;
+        if (other==cpu || !other->pullable_ready) continue;
         for (struct kernel_sched_node *node=other->runqueue.first;node;node=node->next) {
             if (best && node->priority<=(unsigned)best->scheduling.priority) break;
             struct kernel_task *task=node->owner;
@@ -520,7 +522,14 @@ void ready_remove_locked(struct kernel_task *task)
 {
 #if BOAROS_MAX_CPUS > 1
     if (!task->ready_cpu || !task->ready_node.queued) __builtin_trap();
-    dequeue_task(ready_queue(task,task->ready_cpu),&task->ready_node);
+    struct kernel_cpu *owner=task->ready_cpu;
+    struct kernel_sched_runqueue *queue=ready_queue(task,owner);
+    if (queue==&owner->runqueue &&
+        ((task->cpu_mask ? task->cpu_mask : 1U)&~(1U<<owner->logical_id))) {
+        if (!owner->pullable_ready) __builtin_trap();
+        owner->pullable_ready--;
+    }
+    dequeue_task(queue,&task->ready_node);
     task->ready_cpu=0;
 #else
     dequeue_task(&scheduler.runqueue,&task->ready_node);
@@ -543,7 +552,15 @@ static void ready_enqueue_at_locked(struct kernel_task *task, int flags
     if (task->ready_cpu) __builtin_trap();
     if (!target) target=ready_place_locked(task,flags);
     task->ready_cpu=target;
-    enqueue_task(ready_queue(task,target),&task->ready_node,task,flags&SCHED_READY_HEAD);
+    struct kernel_sched_runqueue *queue=ready_queue(task,target);
+    enqueue_task(queue,&task->ready_node,task,flags&SCHED_READY_HEAD);
+    /* Requested masks change only after dequeue. Unlike effective affinity,
+     * these do not change when an outstanding RT reservation is released. */
+    if (queue==&target->runqueue &&
+        ((task->cpu_mask ? task->cpu_mask : 1U)&~(1U<<target->logical_id))) {
+        if (target->pullable_ready==UINT32_MAX) __builtin_trap();
+        target->pullable_ready++;
+    }
 #else
     struct kernel_cpu *target=task->cpu?task->cpu:kernel_cpu_current();
     enqueue_task(&scheduler.runqueue,&task->ready_node,task,flags&SCHED_READY_HEAD);
@@ -876,7 +893,7 @@ static void boost_count_change(struct kernel_sched_runqueue *queue,int add)
 void scheduler_pi_priority_locked(struct kernel_task *task,unsigned base,unsigned inherited)
 {
     struct kernel_cpu *caller=kernel_cpu_current();
-    if(!caller->raw_locks || caller->raw_locks->lock!=&kernel_wait_domain ||
+    if(!kernel_raw_lock_owned(&kernel_wait_domain) ||
        !task || base>99 || inherited>99)__builtin_trap();
     unsigned priority=base>inherited?base:inherited;
     unsigned saved=priority>base?base+1U:0;

@@ -58,8 +58,9 @@ int64_t kernel_futex_waitv(struct kernel_task *task,uint64_t address,unsigned co
             result=futex_prepare(task,&entry->address,1,entry->operation,0,0,&entry->key,0,status);
             if(result || *status)goto out;
         }
-        {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
-         if(kernel_wait_prepare_locked(0,deadline,1,&request.token))__builtin_trap();}
+        if(kernel_wait_prepare(0,deadline,1,&request.token))__builtin_trap();
+        unsigned priority;
+        {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);priority=scheduler_base_priority(task);}
         unsigned retry=count;struct futex_bucket *busy=0;
         for(unsigned i=0;i<count;i++) {
             struct kernel_futex_entry *entry=&request.entries[i];
@@ -75,7 +76,8 @@ int64_t kernel_futex_waitv(struct kernel_task *task,uint64_t address,unsigned co
             uint32_t *word=(void *)((unsigned char *)pin.page+(entry->address&BOAROS_PAGE_MASK));
             if(__atomic_load_n(word,__ATOMIC_ACQUIRE)!=entry->expected)result=-KERNEL_EAGAIN;
             else {
-                KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+                entry->priority=priority;
+                KERNEL_IRQ_LOCK_SCOPE(g,&bucket->waiters.lock);
                 futex_bind_entry_locked(&bucket->waiters,entry,&request.token);
             }
             kernel_lock_release(&guard);kernel_mm_unpin_user_page(&pin);

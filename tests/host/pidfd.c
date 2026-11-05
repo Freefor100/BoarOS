@@ -82,7 +82,8 @@ void kernel_wait_backend_commit(struct kernel_task *task,uint64_t deadline,int i
 void kernel_wait_backend_notify(struct kernel_task *task,uint32_t reason){(void)task;(void)reason;}
 void kernel_wait_backend_ready(struct kernel_task *task){(void)task;}
 enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *task)
-{(void)task;assert(!"early notification must prevent switch");return KERNEL_SCHEDULER_STATUS_OK;}
+{
+(void)task;assert(!"early notification must prevent switch");return KERNEL_SCHEDULER_STATUS_OK;}
 void kernel_wait_backend_quiesce(void){sched_yield();}
 static void barrier(pthread_barrier_t *b)
 {int result=pthread_barrier_wait(b);assert(!result || result==PTHREAD_BARRIER_SERIAL_THREAD);}
@@ -147,3 +148,13 @@ int main(void)
     assert(kernel_pid_take_retired(&registry)==&replacement && !numbers.allocated);
     puts("PASS pidfd protected getfd pin/recheck, last-thread/readiness, early notification, detached reuse, close during callback and final observer/queue/PID owners");
 }
+
+#if BOAROS_MAX_CPUS > 1
+enum kernel_scheduler_status kernel_wait_backend_switch_locked(struct kernel_task *task,
+    struct kernel_raw_guard *handoff)
+{
+    assert(handoff && handoff->lock == &kernel_wait_domain);
+    kernel_raw_lock_release(handoff);
+    return kernel_wait_backend_switch(task);
+}
+#endif

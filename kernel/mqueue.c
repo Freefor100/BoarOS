@@ -446,11 +446,9 @@ static int request_prepare(struct kernel_mqueue_request *r)
     if(r->deadline==UINT64_MAX)return -KERNEL_ETIMEDOUT;
     if(r->deadline && (int64_t)(kernel_wait_backend_time()-r->deadline)>=0)return -KERNEL_ETIMEDOUT;
     if(kernel_signal_has_pending(r->task)||kernel_signal_termination_requested(r->task))return -KERNEL_ERESTARTSYS;
-    {
-        KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
-        if(kernel_wait_prepare_locked(0,r->deadline,1,&r->token))__builtin_trap();
-        r->wait_priority=r->task->scheduling.priority;
-    }
+    if(kernel_wait_prepare(0,r->deadline,1,&r->token))__builtin_trap();
+    { KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+      r->wait_priority=r->task->scheduling.priority; }
     struct kernel_mqueue *q=r->queue;
     struct kernel_mqueue_request **head=r->sending?&q->send_head:&q->recv_head;
     struct kernel_mqueue_request **tail=r->sending?&q->send_tail:&q->recv_tail;

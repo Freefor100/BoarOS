@@ -63,6 +63,9 @@ struct kernel_cpu {
     uint32_t logical_id, state, events, outbound;
     struct { uint64_t period, next_deadline; int armed; } timer;
     struct kernel_sched_runqueue runqueue;
+    /* Requested affinity may permit a different CPU; service/reservation can
+     * narrow it further, so a positive count still requires the real check. */
+    uint32_t pullable_ready;
     uint64_t ipi_sent, ipi_received, rfence_requests;
 #if BOAROS_USER_SMP
     /* 借用任务执行/就绪owner，保留服务往返期间的实时用户资格。 */

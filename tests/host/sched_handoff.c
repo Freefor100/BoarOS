@@ -1,5 +1,7 @@
 #include "../../kernel/sched/private.h"
 #include <arch/timer.h>
+#include <kernel/mm_backend.h>
+#include <kernel/signal.h>
 #include <kernel/time.h>
 #include <assert.h>
 #include <stdio.h>
@@ -14,16 +16,32 @@ static unsigned char peer_stack[KERNEL_STACK_BYTES] __attribute__((aligned(KERNE
 static unsigned char running_stack[KERNEL_STACK_BYTES] __attribute__((aligned(KERNEL_STACK_BYTES)));
 static unsigned lock_calls, cpu_queries;
 static uint64_t timer_request;
+static struct kernel_wait_cursor join_cursor;
+static struct kernel_wait_queue *join_borrow_queue;
+static unsigned join_borrow_returned;
 /* This scheduler-only fixture creates neither event FDs nor dispositions. */
 uint64_t kernel_timer_fd_next;
+int kernel_signal_has_pending(const struct kernel_task *task)
+{ (void)task;__builtin_trap(); /* These kernel actors have no signal state. */ }
 enum kernel_signal_status kernel_signal_release_table(struct kernel_task *task)
 { (void)task;__builtin_trap(); }
-
 void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *, struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock, struct kernel_raw_guard *guard)
 {
     lock_calls++;
     __real_kernel_raw_lock_acquire(lock, guard);
+}
+void __wrap_kernel_wait_backend_quiesce(void)
+{
+    struct kernel_wait_queue *queue=join_borrow_queue;
+    assert(queue && queue->borrows==1 && join_cursor.queue==queue && !join_cursor.node);
+    assert(!cpu.raw_locks && !cpu.preempt_depth);
+    join_borrow_queue=0;
+    /* The machine scheduling seam lets the remote cursor finish; join must
+     * retain its queue owner until this real borrow has been returned. */
+    kernel_wait_cursor_end(&join_cursor);
+    assert(!queue->borrows && !join_cursor.queue);
+    join_borrow_returned++;
 }
 uint64_t riscv_sv39_current_satp(void) { return 0; }
 static unsigned stack_releases, metadata_owned, stack_owned;
@@ -70,7 +88,7 @@ enum physical_page_status physical_page_release_order(
     return PHYSICAL_PAGE_STATUS_OK;
 }
 
-static unsigned switches;
+static unsigned switches, park_handoff;
 static struct kernel_task *selected;
 void *sync_test_cpu(void) { cpu_queries++; return &cpu; }
 void *sync_test_current_task(void) { return cpu.current; }
@@ -93,7 +111,34 @@ enum kernel_scheduler_status __wrap_scheduler_switch_claimed(struct kernel_task 
            !cpu.raw_locks && !cpu.preempt_depth);
     switches++;
     selected = next;
+    if (park_handoff) {
+        assert(previous==&running && next==&peer);
+        assert(running.state==KERNEL_THREAD_STATE_BLOCKED && running.wait.on_cpu);
+        struct kernel_wait_token token={&running,kernel_wait_record_generation(&running.wait)};
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        assert(kernel_wait_notify_locked(&token,KERNEL_WAIT_WOKEN));
+        assert(running.wait.ready_pending && !running.ready_node.queued);
+        kernel_wait_switch_finish_locked(&running);cpu.switch_previous=0;
+        peer.state=KERNEL_THREAD_STATE_BLOCKED;
+        assert(scheduler_select_next_locked(&cpu,&peer,1)==&running);
+        kernel_wait_switch_finish_locked(&peer);cpu.switch_previous=0;
+        assert(running.wait.on_cpu && !running.ready_node.queued);
+    }
     return KERNEL_SCHEDULER_STATUS_OK;
+}
+enum kernel_mm_status kernel_mm_activate(const struct kernel_mm *mm,uint64_t context)
+{ (void)mm;(void)context;assert(park_handoff && !cpu.raw_locks);return KERNEL_MM_STATUS_OK; }
+void riscv_fpu_switch(struct riscv_fpu_state *previous,struct riscv_fpu_state *next)
+{
+    assert(park_handoff && previous==&running.fpu && next==&peer.fpu);
+}
+void riscv_context_switch(struct riscv_switch_context *previous,
+    const struct riscv_switch_context *next)
+{
+    assert(previous==&running.context && next==&peer.context);
+    /* Runtime accounting has its own real domain hold after the MM/FPU seam. */
+    assert(lock_calls==3);
+    assert(!__wrap_scheduler_switch_claimed(&running,&peer));
 }
 static void setup(int policy, int priority, int next_priority)
 {
@@ -202,8 +247,32 @@ static void stack_prefix_case(unsigned prefix, int canary_bad)
     assert(scheduler.stack_statistics.minimum_free_bytes == prefix);
     assert(peer.stack_physical_address == KERNEL_THREAD_NO_PAGE && !peer.stack_low);
 }
+static void join_cursor_lifetime_case(void)
+{
+    setup(KERNEL_SCHED_FIFO,50,10);
+    struct kernel_thread_join join={0};
+    kernel_wait_queue_init(&join.waiters);
+    kernel_wait_cursor_begin(&join.waiters,&join_cursor);
+    assert(!join.task && !join_cursor.node && join.waiters.borrows==1);
+    join_borrow_returned=0;
+    join_borrow_queue=&join.waiters;
+    kernel_thread_join(&join);
+    assert(join_borrow_returned==1 && !join_borrow_queue && !join_cursor.queue);
+    assert(!join.waiters.borrows && !switches && !cpu.raw_locks && !cpu.preempt_depth);
+    assert(!kernel_wait_queue_close(&join.waiters) && !kernel_wait_queue_destroy(&join.waiters));
+    puts("scheduler handoff: join waits for the detached remote cursor before returning its queue owner");
+}
 int main(void)
 {
+    setup(KERNEL_SCHED_OTHER,0,0);
+    struct kernel_wait_token token;
+    enum kernel_wait_wake_reason reason;
+    assert(!kernel_wait_prepare(0,0,0,&token));
+    lock_calls=0;park_handoff=1;
+    assert(!kernel_wait_park(&token,&reason) && reason==KERNEL_WAIT_WOKEN);
+    park_handoff=0;
+    assert(!kernel_wait_finish(&token));
+    puts("UP park preserves commit/select/accounting; early wake waits for actual old-stack handoff");
     for (int policy = KERNEL_SCHED_FIFO; policy <= KERNEL_SCHED_RR; policy++) {
         rotate_case(policy, 10, 0);
         rotate_case(policy, 50, 1);
@@ -267,6 +336,7 @@ int main(void)
     }
     clear_owned_page_case();
     private_storage_case();
+    join_cursor_lifetime_case();
     const unsigned bytes = KERNEL_STACK_BYTES - KERNEL_STACK_GUARD_BYTES;
     for (unsigned prefix = 0; prefix <= bytes; prefix++) stack_prefix_case(prefix, 0);
     stack_prefix_case(0, 1); stack_prefix_case(bytes, 1);

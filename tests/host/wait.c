@@ -34,6 +34,7 @@ static _Thread_local unsigned finish_remaining;
 static _Thread_local int segment_parking;
 static pthread_barrier_t segment_committed, segment_woken;
 static struct kernel_task *segment_tasks;
+static struct kernel_wait_queue *segment_queue;
 static unsigned segment_count, segment_notified;
 static _Thread_local unsigned forbid_wait_lock;
 static _Thread_local int observe_prepared_notify;
@@ -43,8 +44,12 @@ static struct kernel_wait_token prepared_notify_token;
 static _Thread_local int prepared_during_signal_check;
 static unsigned prepared_signal_progress;
 static _Thread_local unsigned pause_retired;
-static struct kernel_wait_node *retired_first;
+static struct kernel_wait_queue *retired_queue;
+static struct kernel_wait_node *retired_entries;
+static unsigned retired_returned;
 static pthread_barrier_t retired_paused, retired_resume;
+static _Thread_local unsigned pause_finish_borrow;
+static pthread_barrier_t finish_borrow_paused, finish_borrow_resume;
 void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *,struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_raw_guard *guard)
 {
@@ -56,21 +61,27 @@ void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_r
 void __real_kernel_raw_lock_release(struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_release(struct kernel_raw_guard *guard)
 {
-    if (segment_tasks && guard->lock == &kernel_wait_domain) {
+    if (segment_tasks && guard->lock == &segment_queue->lock) {
         unsigned count = 0;
         for (unsigned i = 0; i < segment_count; i++) count += kernel_wait_record_phase(&segment_tasks[i].wait) == KERNEL_WAIT_NOTIFIED;
         assert(count >= segment_notified && count - segment_notified <= 16);
         segment_notified = count;
     }
-    int pause = pause_close && guard->lock == &kernel_wait_domain && closing.closed;
+    int pause = pause_close && guard->lock == &closing.lock && closing.closed;
     if (pause) pause_close = 0;
-    int pause_batch = pause_retired && guard->lock == &kernel_wait_domain &&
-        retired_first && !retired_first->references;
+    int pause_batch = 0;
+    if (retired_entries && guard->lock == &retired_queue->lock) {
+        unsigned returned = 0;
+        for (unsigned i = 0; i < 64; i++) returned += !kernel_wait_node_references(&retired_entries[i]);
+        assert(returned >= retired_returned && returned - retired_returned <= 16);
+        pause_batch = pause_retired && returned > retired_returned;
+        retired_returned = returned;
+    }
     if (pause_batch) pause_retired = 0;
-    if (finish_queues && guard->lock == &kernel_wait_domain) {
+    if (finish_queues && guard->lock->rank == KERNEL_RAW_RANK_WAIT_QUEUE) {
         unsigned remaining = 0;
         for (unsigned i = 0; i < 33; i++) remaining += finish_queues[i].registrations;
-        assert(remaining <= finish_remaining && finish_remaining - remaining <= 16);
+        assert(remaining <= finish_remaining && finish_remaining - remaining <= 1);
         finish_remaining = remaining;
     }
     __real_kernel_raw_lock_release(guard);
@@ -126,7 +137,7 @@ void kernel_wait_backend_notify(struct kernel_task *t, uint32_t reason)
     t->blocked = 0;
     t->completions++;
     /* COMMITTED通知与生产backend一样摘除默认登记，next也随之清空。 */
-    kernel_wait_node_remove_locked(&t->node);
+    kernel_wait_queue_remove(&t->node);
 }
 void kernel_wait_backend_ready(struct kernel_task *t)
 { assert(!t->ready_node.queued && !t->wait.on_cpu); kernel_sched_enqueue(&runnable, &t->ready_node, t, 0, 0); }
@@ -159,12 +170,20 @@ enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *t)
     assert(t->ready_node.queued && !t->wait.on_cpu);
     kernel_sched_dequeue(&runnable, &t->ready_node);
     t->wait.on_cpu = 1;
-    /* The resumed owner already has the completed result; only finish needs
-     * to return to the shared domain to detach its remaining registrations. */
+    /* The resumed owner reads the stable result and finishes its registrations
+     * without returning to the shared scheduler domain. */
     forbid_wait_lock = 1;
     return KERNEL_SCHEDULER_STATUS_OK;
 }
-void kernel_wait_backend_quiesce(void) { sched_yield(); }
+void kernel_wait_backend_quiesce(void)
+{
+    if (pause_finish_borrow) {
+        pause_finish_borrow = 0;
+        barrier(&finish_borrow_paused);
+        barrier(&finish_borrow_resume);
+    }
+    sched_yield();
+}
 static void *notify_worker(void *argument)
 {
     initialize(10 + (unsigned)(uintptr_t)argument);
@@ -321,7 +340,7 @@ static void callback_lifetime(void)
     assert(!pthread_join(worker, 0));
     for (unsigned i = 0; i < 64; i++) {
         assert(kernel_wait_node_remove_sync(&nodes[i]) == KERNEL_SCHEDULER_STATUS_OK);
-        assert(!nodes[i].borrow_owner && !nodes[i].references && !nodes[i].retired_next);
+        assert(!nodes[i].borrow_owner && !kernel_wait_node_references(&nodes[i]) && !nodes[i].retired_next);
     }
     assert(callback_calls == 1 && !callbacks.borrows && !callbacks.registrations);
     assert(kernel_wait_queue_destroy(&callbacks) == KERNEL_SCHEDULER_STATUS_OK);
@@ -355,25 +374,28 @@ static void retired_cursor_batches(void)
         if (!advance) kernel_wait_cursor_begin(&queue,&test.cursor);
         for (unsigned i=0;i<64;i++) kernel_wait_queue_remove(&entries[i]);
         assert(!kernel_wait_queue_close(&queue));
-        retired_first=&entries[0];
+        retired_queue=&queue;retired_entries=entries;retired_returned=0;
         assert(!pthread_barrier_init(&retired_paused,0,2));
         assert(!pthread_barrier_init(&retired_resume,0,2));
         pthread_t worker;assert(!pthread_create(&worker,0,finish_retired_cursor,&test));
         barrier(&retired_paused);
         assert(kernel_wait_queue_destroy(&queue)==KERNEL_SCHEDULER_STATUS_BUSY);
-        { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-          assert(queue.borrows==49 && !queue.registrations);
+        { KERNEL_RAW_SCOPE(guard,&queue.lock);
+          assert(retired_returned && retired_returned<=16);
+          assert(queue.borrows==65-retired_returned && !kernel_wait_queue_registrations(&queue));
           for (unsigned i=0;i<64;i++) {
-              assert(entries[i].references==(i>=16));
-              assert(owners[i].wait.borrows==(i>=16));
+              assert(kernel_wait_node_references(&entries[i])==(i>=retired_returned));
+              assert(kernel_wait_record_borrows(&owners[i].wait)==(i>=retired_returned));
           }
           if (advance) assert(!test.cursor.node); }
         barrier(&retired_resume);assert(!pthread_join(worker,0));
         for (unsigned i=0;i<64;i++)
-            assert(!entries[i].borrow_owner && !entries[i].references && !owners[i].wait.borrows);
+            assert(!entries[i].borrow_owner && !kernel_wait_node_references(&entries[i]) &&
+                   !kernel_wait_record_borrows(&owners[i].wait));
+        assert(retired_returned==64);
         assert(!queue.borrows && !kernel_wait_queue_destroy(&queue));
         assert(!pthread_barrier_destroy(&retired_paused) && !pthread_barrier_destroy(&retired_resume));
-        retired_first=0;
+        retired_entries=0;retired_queue=0;
     }
     puts("wait: retired cursor end and sequence boundary retain queue and task owners across bounded batches");
 }
@@ -439,9 +461,10 @@ static void published_notifications(void)
             barrier(&publish_entered);barrier(&publish_completed);
         } else {
             barrier(&publish_entered);
-            assert(__atomic_load_n(&published_queue.registrations,__ATOMIC_ACQUIRE)==1);
+            assert(kernel_wait_queue_registrations(&published_queue)==1);
             struct kernel_wait_cursor cursor={0};
-            assert(!kernel_wait_cursor_prepare(&published_queue,&cursor) && !cursor.queue);
+            assert(kernel_wait_cursor_prepare(&published_queue,&cursor) && cursor.queue==&published_queue);
+            kernel_wait_cursor_wake(&cursor,1);
             barrier(&publish_completed);
         }
         assert(!pthread_join(worker,0));
@@ -482,7 +505,8 @@ static void early_and_multi(void)
     kernel_wait_cursor_advance(&cursor);
     assert(!cursor.node);
     kernel_wait_cursor_end(&cursor);
-    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    { KERNEL_RAW_SCOPE(source_guard,&queues[0].lock);
+      KERNEL_RAW_SCOPE(target_guard,&queues[1].lock);
       assert(kernel_wait_node_move_locked(&task.node, &queues[1]) == KERNEL_SCHEDULER_STATUS_OK); }
     assert(task.node.queue == &queues[1]);
     kernel_wait_task_unpin(&task);
@@ -519,7 +543,7 @@ static void finish_many(void)
     finish_queues = queues;
     finish_remaining = 33;
     assert(kernel_wait_finish(&token) == KERNEL_SCHEDULER_STATUS_OK);
-    assert(!finish_remaining && !task.wait.nodes && !task.wait.borrows);
+    assert(!finish_remaining && !task.wait.nodes && !kernel_wait_record_borrows(&task.wait));
     finish_queues = 0;
     for (unsigned i = 0; i < 33; i++) {
         assert(kernel_wait_queue_close(&queues[i]) == KERNEL_SCHEDULER_STATUS_OK);
@@ -571,7 +595,7 @@ static void *segment_worker(void *argument)
     enum kernel_wait_wake_reason reason;
     assert(kernel_wait_park(&token, &reason) == KERNEL_SCHEDULER_STATUS_OK && reason == KERNEL_WAIT_WOKEN);
     assert(kernel_wait_finish(&token) == KERNEL_SCHEDULER_STATUS_OK);
-    assert(!task.node.references && !task.wait.borrows);
+    assert(!kernel_wait_node_references(&task.node) && !kernel_wait_record_borrows(&task.wait));
     segment_parking = 0;
     return 0;
 }
@@ -651,6 +675,7 @@ static void task_segments(void)
             }
             selected_task = 0;
             segment_tasks = actors;
+            segment_queue = &queue;
             segment_count = count;
             segment_notified = 0;
             if (!mixed) {
@@ -660,6 +685,7 @@ static void task_segments(void)
             }
             assert(kernel_wait_queue_wake_all(&queue) == KERNEL_SCHEDULER_STATUS_OK);
             segment_tasks = 0;
+            segment_queue = 0;
             assert(context.calls == mixed);
             if (mixed) {
                 assert(!context.extra_calls);
@@ -672,7 +698,7 @@ static void task_segments(void)
                 selected_task = &actors[i];
                 assert(kernel_wait_record_phase(&actors[i].wait) == KERNEL_WAIT_NOTIFIED);
                 assert(kernel_wait_finish(&tokens[i]) == KERNEL_SCHEDULER_STATUS_OK);
-                assert(!actors[i].wait.borrows && !actors[i].node.references);
+                assert(!kernel_wait_record_borrows(&actors[i].wait) && !kernel_wait_node_references(&actors[i].node));
             }
             selected_task = 0;
             assert(!queue.registrations && !queue.borrows);
@@ -747,7 +773,7 @@ static void pollfree_lifetime(void)
     barrier(&retiring_leave);assert(!pthread_join(worker,0));
     assert(kernel_wait_queue_destroy(&retiring)==KERNEL_SCHEDULER_STATUS_BUSY);
     kernel_wait_cursor_wake(&prior,1);
-    assert(!retiring.borrows && !retiring_node.references && !kernel_wait_queue_destroy(&retiring));
+    assert(!retiring.borrows && !kernel_wait_node_references(&retiring_node) && !kernel_wait_queue_destroy(&retiring));
     assert(!pthread_barrier_destroy(&retiring_entered)&&!pthread_barrier_destroy(&retiring_leave));
     puts("wait: POLLFREE detaches callbacks and retains source through prior cursors passed");
 }
@@ -765,11 +791,11 @@ static void event_filtering(void)
     selected_task=0;struct kernel_wait_node callbacks[2];
     for(unsigned i=0;i<2;i++){kernel_wait_node_init_callback(&callbacks[i],event_callback,&event_calls[i]);callbacks[i].event_mask=&masks[i];kernel_wait_queue_add(&queue,&callbacks[i]);}
     struct kernel_wait_cursor cursor={0};
-    {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);assert(kernel_wait_cursor_prepare_event_locked(&queue,&cursor,1,&actors[0]));}
+    assert(kernel_wait_cursor_prepare_event(&queue,&cursor,1,&actors[0]));
     kernel_wait_cursor_wake(&cursor,1);
     assert(kernel_wait_record_phase(&actors[0].wait)==KERNEL_WAIT_NOTIFIED && kernel_wait_record_phase(&actors[1].wait)==KERNEL_WAIT_PREPARED && kernel_wait_record_phase(&actors[2].wait)==KERNEL_WAIT_PREPARED);
     assert(event_calls[0]==1&&!event_calls[1]);
-    {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);assert(kernel_wait_cursor_prepare_event_locked(&queue,&cursor,1,0));}
+    assert(kernel_wait_cursor_prepare_event(&queue,&cursor,1,0));
     kernel_wait_cursor_wake(&cursor,1);assert(kernel_wait_record_phase(&actors[2].wait)==KERNEL_WAIT_NOTIFIED&&kernel_wait_record_phase(&actors[1].wait)==KERNEL_WAIT_PREPARED);
     /* A mask replacement wakes the whole source, independent of old interest. */
     masks[0]=masks[1]=0;assert(!kernel_wait_queue_wake_all(&queue));assert(kernel_wait_record_phase(&actors[1].wait)==KERNEL_WAIT_NOTIFIED);
@@ -778,32 +804,261 @@ static void event_filtering(void)
     assert(!kernel_wait_queue_close(&queue)&&!kernel_wait_queue_destroy(&queue));
     puts("wait: directed event filters, shared callbacks and mask-change broadcast passed");
 }
+static void independent_wait_registration(void)
+{
+    struct kernel_wait_queue queue;
+    struct kernel_wait_token token;
+    kernel_wait_queue_init(&queue);
+    /* 独立队列的登记、提前完成和撤销不应进入全机调度保护；
+     * 拦截该锁取得，避免把缺少独立性的反例变成无限等待。 */
+    forbid_wait_lock=1;
+    assert(kernel_wait_prepare(&queue,0,1,&token)==KERNEL_SCHEDULER_STATUS_OK);
+    assert(kernel_wait_notify(&token,KERNEL_WAIT_WOKEN)==KERNEL_SCHEDULER_STATUS_OK);
+    assert(kernel_wait_finish(&token)==KERNEL_SCHEDULER_STATUS_OK);
+    forbid_wait_lock=0;
+    assert(!queue.registrations && !queue.borrows && !queue.head && !queue.tail);
+    assert(kernel_wait_record_phase(&task.wait)==KERNEL_WAIT_FINISHED);
+    assert(kernel_wait_queue_close(&queue)==KERNEL_SCHEDULER_STATUS_OK);
+    assert(kernel_wait_queue_destroy(&queue)==KERNEL_SCHEDULER_STATUS_OK);
+}
+
+static void independent_registration(void)
+{
+    struct kernel_wait_queue queue;
+    struct kernel_wait_token token;
+    struct kernel_wait_node extra;
+    kernel_wait_queue_init(&queue);
+    kernel_wait_node_init(&extra, &task);
+    /* Independent event registration and cleanup must not acquire the shared
+     * task/ready-state lock. The original implementation fails at prepare. */
+    forbid_wait_lock=1;
+    assert(!kernel_wait_prepare(0,0,0,&token));
+    assert(!kernel_wait_node_bind(&queue,&extra,&token));
+    if (BOAROS_MAX_CPUS==1) forbid_wait_lock=0;
+    assert(!kernel_wait_notify(&token,KERNEL_WAIT_WOKEN));
+    forbid_wait_lock=1;
+    assert(!kernel_wait_finish(&token));
+    assert(!kernel_wait_queue_close(&queue));
+    assert(!kernel_wait_queue_destroy(&queue));
+    forbid_wait_lock=0;
+}
+static pthread_barrier_t registration_started,registration_completed;
+static void *registration_worker(void *unused)
+{
+    (void)unused;initialize(40);
+    barrier(&registration_started);
+    independent_registration();
+    barrier(&registration_completed);
+    return 0;
+}
+static void registration_while_unrelated_locks_busy(void)
+{
+    struct kernel_wait_queue unrelated;
+    kernel_wait_queue_init(&unrelated);
+    assert(!pthread_barrier_init(&registration_started,0,2));
+    assert(!pthread_barrier_init(&registration_completed,0,2));
+    pthread_t worker;assert(!pthread_create(&worker,0,registration_worker,0));
+    {
+        KERNEL_RAW_SCOPE(domain_guard,&kernel_wait_domain);
+        KERNEL_RAW_SCOPE(queue_guard,&unrelated.lock);
+        barrier(&registration_started);
+        /* The peer must finish prepare/bind/notify/cleanup while both unrelated
+         * locks remain held; its acquire seam rejects any domain attempt. */
+        barrier(&registration_completed);
+    }
+    assert(!pthread_join(worker,0));
+    assert(!kernel_wait_queue_close(&unrelated) && !kernel_wait_queue_destroy(&unrelated));
+    assert(!pthread_barrier_destroy(&registration_started) && !pthread_barrier_destroy(&registration_completed));
+    puts("wait: independent registration and cleanup finish while unrelated queue and scheduler locks are held");
+}
+static struct kernel_wait_queue finish_borrow_queue;
+static struct kernel_task *finish_borrow_task;
+static struct kernel_wait_token finish_borrow_old;
+static pthread_barrier_t finish_borrow_step;
+static void *finish_borrow_worker(void *unused)
+{
+    (void)unused;initialize(41);
+    struct kernel_wait_token token;
+    assert(!kernel_wait_prepare(&finish_borrow_queue,0,0,&token));
+    finish_borrow_task=&task;finish_borrow_old=token;
+    barrier(&finish_borrow_step);
+    barrier(&finish_borrow_step);
+    pause_finish_borrow=1;
+    assert(!kernel_wait_finish(&token));
+    assert(!task.wait.nodes && !kernel_wait_record_borrows(&task.wait));
+    /* Finish must return all cursor borrows before this storage can become a
+     * new task owner with a new token generation. */
+    kernel_wait_record_init(&task.wait);task.wait.on_cpu=1;
+    assert(!kernel_wait_prepare(&finish_borrow_queue,0,0,&token));
+    barrier(&finish_borrow_step);
+    barrier(&finish_borrow_step);
+    assert(kernel_wait_record_phase(&task.wait)==KERNEL_WAIT_PREPARED);
+    assert(!kernel_wait_finish(&token));
+    return 0;
+}
+static void finish_waits_for_cursor_before_storage_reuse(void)
+{
+    kernel_wait_queue_init(&finish_borrow_queue);
+    assert(!pthread_barrier_init(&finish_borrow_step,0,2));
+    assert(!pthread_barrier_init(&finish_borrow_paused,0,2));
+    assert(!pthread_barrier_init(&finish_borrow_resume,0,2));
+    pthread_t worker;assert(!pthread_create(&worker,0,finish_borrow_worker,0));
+    barrier(&finish_borrow_step);
+    struct kernel_wait_cursor cursor;
+    kernel_wait_cursor_begin(&finish_borrow_queue,&cursor);
+    assert(cursor.node==&finish_borrow_task->node);
+    barrier(&finish_borrow_step);
+    barrier(&finish_borrow_paused);
+    assert(!kernel_wait_queue_registrations(&finish_borrow_queue));
+    assert(finish_borrow_task->wait.nodes==&finish_borrow_task->node &&
+           kernel_wait_node_references(&finish_borrow_task->node)==1 &&
+           kernel_wait_record_borrows(&finish_borrow_task->wait)==1);
+    assert(kernel_wait_record_generation(&finish_borrow_task->wait)==finish_borrow_old.generation);
+    kernel_wait_cursor_end(&cursor);
+    barrier(&finish_borrow_resume);
+    barrier(&finish_borrow_step);
+    assert(kernel_wait_record_generation(&finish_borrow_task->wait)!=finish_borrow_old.generation);
+    assert(!kernel_wait_notify(&finish_borrow_old,KERNEL_WAIT_SIGNALLED));
+    assert(kernel_wait_record_phase(&finish_borrow_task->wait)==KERNEL_WAIT_PREPARED);
+    barrier(&finish_borrow_step);
+    assert(!pthread_join(worker,0));
+    finish_borrow_task=0;
+    assert(!finish_borrow_queue.borrows && !kernel_wait_queue_registrations(&finish_borrow_queue));
+    assert(!kernel_wait_queue_close(&finish_borrow_queue) && !kernel_wait_queue_destroy(&finish_borrow_queue));
+    assert(!pthread_barrier_destroy(&finish_borrow_step) &&
+           !pthread_barrier_destroy(&finish_borrow_paused) && !pthread_barrier_destroy(&finish_borrow_resume));
+    puts("wait: finish retains borrowed task storage until cursor release; old token cannot wake the reused owner");
+}
+static void stale_signal_generation(void)
+{
+    struct kernel_wait_token token;
+    assert(!kernel_wait_prepare(0,0,1,&token));
+    struct kernel_wait_token old_signal={&task,kernel_wait_signal_generation(&task.wait)};
+    assert(old_signal.generation==token.generation);
+    assert(!kernel_wait_finish(&token));
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        assert(!kernel_wait_notify_locked(&old_signal,KERNEL_WAIT_SIGNALLED));
+        assert(kernel_wait_record_phase(&task.wait)==KERNEL_WAIT_FINISHED);
+        assert(!kernel_wait_signal_generation(&task.wait));
+    }
+    assert(!kernel_wait_prepare(0,0,0,&token));
+    assert(token.generation!=old_signal.generation && !kernel_wait_signal_generation(&task.wait));
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        assert(!kernel_wait_notify_locked(&old_signal,KERNEL_WAIT_SIGNALLED));
+    }
+    assert(!kernel_wait_notify(&old_signal,KERNEL_WAIT_SIGNALLED));
+    assert(kernel_wait_record_phase(&task.wait)==KERNEL_WAIT_PREPARED &&
+           kernel_wait_record_reason(&task.wait)==KERNEL_WAIT_WOKEN &&
+           !kernel_wait_record_interruptible(&task.wait));
+    assert(!kernel_wait_finish(&token));
+    puts("wait: stale signal generation preserves finished and later noninterruptible waits");
+}
+static pthread_barrier_t signal_generation_step;
+static struct kernel_task *signal_generation_task;
+static void *signal_generation_worker(void *unused)
+{
+    (void)unused;initialize(42);
+    struct kernel_wait_token token;
+    forbid_wait_lock=1;
+    barrier(&signal_generation_step);
+    assert(!kernel_wait_prepare(0,0,1,&token));
+    signal_generation_task=&task;
+    barrier(&signal_generation_step);
+    barrier(&signal_generation_step);
+    assert(!kernel_wait_finish(&token));
+    barrier(&signal_generation_step);
+    barrier(&signal_generation_step);
+    assert(!kernel_wait_prepare(0,0,0,&token));
+    barrier(&signal_generation_step);
+    barrier(&signal_generation_step);
+    assert(kernel_wait_record_phase(&task.wait)==KERNEL_WAIT_PREPARED &&
+           kernel_wait_record_reason(&task.wait)==KERNEL_WAIT_WOKEN);
+    assert(!kernel_wait_finish(&token));
+    forbid_wait_lock=0;
+    return 0;
+}
+static void stale_signal_while_domain_busy(void)
+{
+    assert(!pthread_barrier_init(&signal_generation_step,0,2));
+    pthread_t worker;assert(!pthread_create(&worker,0,signal_generation_worker,0));
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        barrier(&signal_generation_step);
+        barrier(&signal_generation_step);
+        struct kernel_wait_record *record=&signal_generation_task->wait;
+        struct kernel_wait_token old_signal={signal_generation_task,kernel_wait_signal_generation(record)};
+        assert(old_signal.generation && old_signal.generation==kernel_wait_record_generation(record));
+        /* The owner finishes the sampled interruptible wait while this CPU
+         * retains the domain and its old signal token. */
+        barrier(&signal_generation_step);
+        barrier(&signal_generation_step);
+        assert(!kernel_wait_notify_locked(&old_signal,KERNEL_WAIT_SIGNALLED));
+        assert(kernel_wait_record_phase(record)==KERNEL_WAIT_FINISHED && !kernel_wait_signal_generation(record));
+        barrier(&signal_generation_step);
+        barrier(&signal_generation_step);
+        uint64_t next_generation=kernel_wait_record_generation(record);
+        assert(next_generation!=old_signal.generation && !kernel_wait_signal_generation(record));
+        assert(!kernel_wait_notify_locked(&old_signal,KERNEL_WAIT_SIGNALLED));
+        assert(!kernel_wait_notify(&old_signal,KERNEL_WAIT_SIGNALLED));
+        assert(kernel_wait_record_generation(record)==next_generation &&
+               kernel_wait_record_phase(record)==KERNEL_WAIT_PREPARED &&
+               kernel_wait_record_reason(record)==KERNEL_WAIT_WOKEN &&
+               !kernel_wait_record_interruptible(record));
+        barrier(&signal_generation_step);
+    }
+    assert(!pthread_join(worker,0));
+    signal_generation_task=0;
+    assert(!pthread_barrier_destroy(&signal_generation_step));
+    puts("wait: domain holder cannot revive its sampled signal token after owner finish and next prepare");
+}
 int main(void)
 {
     struct rlimit limit = {0}; assert(!setrlimit(RLIMIT_CORE, &limit));
     initialize(0);
     kernel_wait_domain_init();
-    prepared_notify_while_domain_busy();
-    prepared_notify_during_park_check();
-    published_notifications();
+    independent_wait_registration();
+    independent_registration();
+    stale_signal_generation();
+    if (BOAROS_MAX_CPUS>1) {
+        stale_signal_while_domain_busy();
+        registration_while_unrelated_locks_busy();
+        prepared_notify_while_domain_busy();
+        prepared_notify_during_park_check();
+        published_notifications();
+    }
     owner_failures();
     early_and_multi();
     finish_many();
-    sync_test_irq = 1;
-    arbitration(2);
-    assert(sync_test_irq == 1);
-    sync_test_irq = 0;
-    arbitration(4);
-    wake_after_switch = 1;
-    arbitration(2);
-    arbitration(4);
+    if (BOAROS_MAX_CPUS>1) {
+        sync_test_irq = 1;
+        arbitration(2);
+        assert(sync_test_irq == 1);
+        sync_test_irq = 0;
+        arbitration(4);
+        wake_after_switch = 1;
+        arbitration(2);
+        arbitration(4);
+    }
     callback_lifetime();
     retired_cursor_batches();
     close_lifetime();
     pollfree_lifetime();
     event_filtering();
-    committed_segments();
+    finish_waits_for_cursor_before_storage_reuse();
+    if (BOAROS_MAX_CPUS>1) committed_segments();
     task_segments();
     notification_sequences();
-    puts("wait: early wake, 2/4-thread first-winner arbitration, stale tokens, multi-queue, borrowed retired cursors and callback lifetime passed");
+    puts("wait: early wake, stale tokens, multi-queue, borrowed retired cursors and callback lifetime passed");
 }
+
+#if BOAROS_MAX_CPUS > 1
+enum kernel_scheduler_status kernel_wait_backend_switch_locked(struct kernel_task *task,
+    struct kernel_raw_guard *handoff)
+{
+    assert(handoff && handoff->lock == &kernel_wait_domain);
+    kernel_raw_lock_release(handoff);
+    return kernel_wait_backend_switch(task);
+}
+#endif

@@ -202,6 +202,8 @@ void deadline_index_remove(struct kernel_task *task);
 struct kernel_task *deadline_index_first(void);
 enum kernel_scheduler_status scheduler_switch_current_away(
     struct kernel_task *previous);
+enum kernel_scheduler_status scheduler_switch_current_away_locked(
+    struct kernel_task *, struct kernel_raw_guard *);
 void process_complete_vfork(struct kernel_task *thread);
 enum kernel_scheduler_status activate_thread_address_space(
     const struct kernel_task *thread);

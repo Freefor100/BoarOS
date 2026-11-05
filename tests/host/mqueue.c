@@ -132,6 +132,7 @@ void kernel_wait_backend_quiesce(void){sched_yield();}
 enum kernel_scheduler_status kernel_scheduler_yield_current(void){sched_yield();return 0;}
 enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *t)
 {
+
     __atomic_fetch_or(&waiting,1U<<(unsigned)(t-tasks),__ATOMIC_RELEASE);
     if(abandon_wait){
         struct kernel_wait_token token={t,kernel_wait_record_generation(&t->wait)};
@@ -311,3 +312,13 @@ int main(void)
     for(unsigned i=0;i<3;i++)assert(identities[i].references==1&&!tasks[i].mqueue_request);
     puts("mqueue core: priority/FIFO, segmented payload, quota/name/OFD lifetime, notify, direct handoff, timeout/signal/fault, abandoned import/cookie/wait, allocation cleanup, shutdown PASS");return 0;
 }
+
+#if BOAROS_MAX_CPUS > 1
+enum kernel_scheduler_status kernel_wait_backend_switch_locked(struct kernel_task *task,
+    struct kernel_raw_guard *handoff)
+{
+    assert(handoff && handoff->lock == &kernel_wait_domain);
+    kernel_raw_lock_release(handoff);
+    return kernel_wait_backend_switch(task);
+}
+#endif

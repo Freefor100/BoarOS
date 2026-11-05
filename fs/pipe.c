@@ -271,10 +271,11 @@ int kernel_pipe_check_task_domain(struct kernel_pipe *pipe)
 {
     PIPE_META(guard, pipe);
     if (pipe->fifo_node || !pipe->owners) return -KERNEL_EBUSY;
-    KERNEL_RAW_SCOPE(wait_guard, &kernel_wait_domain);
     struct kernel_wait_queue *queues[] = {&pipe->read_queue, &pipe->write_queue, &pipe->both_queue};
-    for (unsigned i = 0; i < 3; i++)
+    for (unsigned i = 0; i < 3; i++) {
+        KERNEL_IRQ_LOCK_SCOPE(wait_guard, &queues[i]->lock);
         if (queues[i]->registrations || queues[i]->borrows || queues[i]->closed) return -KERNEL_EBUSY;
+    }
     return 0;
 }
 

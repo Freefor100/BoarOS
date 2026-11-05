@@ -167,6 +167,7 @@ void kernel_wait_backend_ready(struct kernel_task *task)
 }
 enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *task)
 {
+
     { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); kernel_wait_switch_finish_locked(task); }
     while (!__atomic_load_n(&actor.dispatched, __ATOMIC_ACQUIRE)) sched_yield();
     { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); task->wait.on_cpu = 1;
@@ -220,3 +221,13 @@ __attribute__((weak)) int kernel_mqueue_statfs(struct kernel_open_file_descripti
 
 __attribute__((weak)) int kernel_mqueue_set_times(struct kernel_open_file_description *f,const struct kernel_vfs_timespec *t)
 { (void)f;(void)t;__builtin_trap(); }
+
+#if BOAROS_MAX_CPUS > 1
+enum kernel_scheduler_status kernel_wait_backend_switch_locked(struct kernel_task *task,
+    struct kernel_raw_guard *handoff)
+{
+    assert(handoff && handoff->lock == &kernel_wait_domain);
+    kernel_raw_lock_release(handoff);
+    return kernel_wait_backend_switch(task);
+}
+#endif

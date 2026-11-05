@@ -787,12 +787,13 @@ int kernel_signal_fd_take(struct kernel_task *task,const uint64_t *mask,
         struct kernel_task *rearm=0;struct kernel_wait_token token={0};uint32_t sig;
         {
             KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-            sig=signal_take_locked(task,*mask,info,&p,&rearm);
+            sig=signal_take_locked(task,__atomic_load_n(mask,__ATOMIC_ACQUIRE),info,&p,&rearm);
             if (!sig) {
                 if (nonblock) return -KERNEL_EAGAIN;
                 COST_ADD(SIGNAL_FD_PARKS,1);
-                if (kernel_wait_prepare_locked(queue,0,1,&token)) __builtin_trap();
-                kernel_wait_default_node(task)->event_mask=mask;
+                if (kernel_wait_prepare(queue,0,1,&token)) __builtin_trap();
+                { KERNEL_IRQ_LOCK_SCOPE(queue_guard,&queue->lock);
+                  kernel_wait_default_node(task)->event_mask=mask; }
             }
         }
         signal_pending_finish(&p);
@@ -1258,7 +1259,7 @@ static enum kernel_signal_status signal_send_one(
             if(posted<0)return KERNEL_SIGNAL_STATUS_QUEUE_FULL;
             if(posted>0)return KERNEL_SIGNAL_STATUS_OK;
             struct kernel_signal_table *table=signal_table_of(actual);
-            if(table)(void)kernel_wait_cursor_prepare_event_locked(&table->signalfd_waiters,&fd_cursor,signal_mask(sig),process_directed?0:actual);
+            if(table)(void)kernel_wait_cursor_prepare_event(&table->signalfd_waiters,&fd_cursor,signal_mask(sig),process_directed?0:actual);
 #if BOAROS_USER_SMP
             scheduler_signal_request_locked(wake_target);
 #endif
@@ -1334,7 +1335,7 @@ void kernel_signal_mqueue_notify(struct kernel_pid *identity,struct kernel_exec_
             int posted=signal_pending_post_locked(group,1,actual,&info,1,&p);
             if(posted)return;
             struct kernel_signal_table *table=signal_table_of(actual);
-            if(table)(void)kernel_wait_cursor_prepare_event_locked(&table->signalfd_waiters,&cursor,signal_mask(sig),0);
+            if(table)(void)kernel_wait_cursor_prepare_event(&table->signalfd_waiters,&cursor,signal_mask(sig),0);
             if(candidate) {
                 scheduler_task_get_locked(candidate);wake=candidate;
 #if BOAROS_USER_SMP
@@ -1374,7 +1375,7 @@ int signal_timer_post_locked(struct kernel_pid *id,int thread,struct signal_queu
     struct kernel_task *pending=thread?actual:actual->group_leader;
     signal_pending_post_timer_locked(pending,!thread,record);
     struct kernel_signal_table *table=signal_table_of(actual);
-    if(table)(void)kernel_wait_cursor_prepare_event_locked(&table->signalfd_waiters,cursor,signal_mask(record->info.signal),thread?actual:0);
+    if(table)(void)kernel_wait_cursor_prepare_event(&table->signalfd_waiters,cursor,signal_mask(record->info.signal),thread?actual:0);
     if(*wake){scheduler_task_get_locked(*wake);
 #if BOAROS_USER_SMP
         scheduler_signal_request_locked(*wake);

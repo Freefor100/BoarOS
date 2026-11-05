@@ -10,7 +10,7 @@ enum kernel_raw_rank {
     KERNEL_RAW_RANK_PAGE = 20,
     KERNEL_RAW_RANK_TASK_FILES = 25,
     KERNEL_RAW_RANK_OBJECT = 30, KERNEL_RAW_RANK_FILE_MAPPING = 35,
-    KERNEL_RAW_RANK_SCHEDULER = 40
+    KERNEL_RAW_RANK_SCHEDULER = 40, KERNEL_RAW_RANK_WAIT_QUEUE = 45
 };
 /* 初始化/移动仅允许未发布实例；UP 以中断和抢占嵌套互斥，SMP 使用原子字。
  * CPU 持锁链总是保留；线性递归与等级审计只在 LOCK_DEBUG 中执行。 */
@@ -26,6 +26,12 @@ struct kernel_raw_guard {
     uint64_t wait_ticks, hold_start;
 #endif
 };
+static inline int kernel_raw_lock_owned(const struct kernel_raw_lock *lock)
+{
+    for (struct kernel_raw_guard *g=kernel_cpu_current()->raw_locks;g;g=g->previous)
+        if (g->lock==lock) return 1;
+    return 0;
+}
 void kernel_raw_lock_init(struct kernel_raw_lock *, uint32_t rank);
 void kernel_raw_lock_acquire(struct kernel_raw_lock *, struct kernel_raw_guard *);
 void kernel_raw_lock_release(struct kernel_raw_guard *);

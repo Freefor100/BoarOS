@@ -233,8 +233,9 @@ static enum kernel_files_status epoll_item_unlink_and_destroy(
     struct kernel_epoll *epoll = item->epoll;
     struct kernel_open_file_description *target_file = item->target_file;
 
-    /* 停止新业务通知，再摘登记；在途callback仍借用item/context。 */
+    /* 与POLLFREE自摘共用状态保护；登记撤销后不再访问可能已释放的source。 */
     item->linked = 0;
+    kernel_wait_queue_remove(&item->wait_node);
     epoll_state_release(&irq);
     if (kernel_wait_node_remove_sync(&item->wait_node) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
     epoll_state_acquire(&irq);
