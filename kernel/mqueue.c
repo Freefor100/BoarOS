@@ -451,8 +451,8 @@ static int request_prepare(struct kernel_mqueue_request *r)
     if(r->deadline && (int64_t)(kernel_wait_backend_time()-r->deadline)>=0)return -KERNEL_ETIMEDOUT;
     if(kernel_signal_has_pending(r->task)||kernel_signal_termination_requested(r->task))return -KERNEL_ERESTARTSYS;
     if(kernel_wait_prepare(0,r->deadline,1,&r->token))__builtin_trap();
-    { KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
-      r->wait_priority=r->task->scheduling.priority; }
+    /* 只需登记时的实际优先级标量；PI/策略更新按同一原子字段发布。 */
+    r->wait_priority=__atomic_load_n(&r->task->scheduling.priority,__ATOMIC_RELAXED);
     struct kernel_mqueue *q=r->queue;
     struct kernel_mqueue_request **head=r->sending?&q->send_head:&q->recv_head;
     struct kernel_mqueue_request **tail=r->sending?&q->send_tail:&q->recv_tail;

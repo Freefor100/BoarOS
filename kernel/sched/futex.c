@@ -235,15 +235,37 @@ static int64_t futex_wait_until(struct kernel_task *task, uint64_t address,
             return 0;
         }
     }
+    int private = (operation & FUTEX_PRIVATE) != 0;
     int64_t result = futex_prepare(task, &address, 1, operation, 0,
-                                    KERNEL_MM_READ, &key, &pin, status);
+                                    private ? 0 : KERNEL_MM_READ, &key, &pin, status);
     if (*status != KERNEL_SCHEDULER_STATUS_OK || result) return result;
-    futex_lock_buckets(&key, 1, resolved, guards);
-    uint32_t *word = (uint32_t *)((unsigned char *)pin.page + (address & BOAROS_PAGE_MASK));
-    uint32_t actual = __atomic_load_n(word, __ATOMIC_ACQUIRE);
+    uint32_t actual;
+    for (;;) {
+        futex_lock_buckets(&key, 1, resolved, guards);
+        if (!private) {
+            uint32_t *word = (uint32_t *)((unsigned char *)pin.page + (address & BOAROS_PAGE_MASK));
+            actual = __atomic_load_n(word, __ATOMIC_ACQUIRE);
+            break;
+        }
+        /* 私有key不借用后备对象；MM短读内完成比较值的导入，桶资格
+         * 保持到登记结束。没有逃逸的用户指针，也就无需另持物理页pin。 */
+        enum kernel_mm_status read = kernel_mm_try_futex_read(&task->mm, address, &actual);
+        if (read == KERNEL_MM_STATUS_OK) break;
+        futex_unlock_buckets(guards);
+        if (read != KERNEL_MM_STATUS_CONFLICT) {
+            futex_key_release(&key);
+            *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+            return 0;
+        }
+        /* 缺页、权限/COW和关闭许可沿既有可睡眠准备，在桶外处理。 */
+        result = futex_prepare(task, &address, 1, operation, 0, KERNEL_MM_READ,
+                               &key, &pin, status);
+        if (*status != KERNEL_SCHEDULER_STATUS_OK || result) return result;
+        kernel_mm_unpin_user_page(&pin);
+    }
     if (actual != value || expired) {
         futex_unlock_buckets(guards);
-        kernel_mm_unpin_user_page(&pin);
+        if (pin.registration) kernel_mm_unpin_user_page(&pin);
         futex_key_release(&key);
         return actual != value ? -KERNEL_EAGAIN : -KERNEL_ETIMEDOUT;
     }
@@ -253,17 +275,13 @@ static int64_t futex_wait_until(struct kernel_task *task, uint64_t address,
     task->futex_request=&request;
     *status=kernel_wait_prepare(0,deadline,1,&request.token);
     if(!*status) {
-        /* 调度优先级仅在域内取快照；登记只占实际桶队列。 */
-        {
-            KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-            entry.priority=scheduler_base_priority(task);
-        }
+        entry.priority=futex_wait_priority(task);
         KERNEL_IRQ_LOCK_SCOPE(guard,&resolved[0]->waiters.lock);
         futex_bind_entry_locked(&resolved[0]->waiters,&entry,&request.token);
     }
     /* token登记后不再取得任何可睡眠锁；先放桶锁再归还pin，MM编辑可排空它。 */
     futex_unlock_buckets(guards);
-    kernel_mm_unpin_user_page(&pin);
+    if (pin.registration) kernel_mm_unpin_user_page(&pin);
     if (*status != KERNEL_SCHEDULER_STATUS_OK) {
         kernel_futex_request_release(&request);
         return 0;

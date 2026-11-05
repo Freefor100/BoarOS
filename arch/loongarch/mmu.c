@@ -571,7 +571,17 @@ enum arch_mmu_status arch_mmu_user_space_populate(struct arch_mmu_user_space *s,
     arch_mmu_sync_instructions(); return ARCH_MMU_STATUS_OK;
 }
 enum arch_mmu_status arch_mmu_user_space_context(const struct arch_mmu_user_space *s,uint64_t *root)
-{ if (!live(s)||!root) return ARCH_MMU_STATUS_INVALID; *root=s->root_address; return ARCH_MMU_STATUS_OK; }
+{
+#if BOAROS_MAX_CPUS > 1
+    /* MM owner固定root寿命；切换不读取并行PTE编辑维护的表页计数。 */
+    if (!s || s->state!=ARCH_MMU_USER_SPACE_LIVE || !s->allocator ||
+        !s->root_address || !root) return ARCH_MMU_STATUS_INVALID;
+#else
+    if (!live(s)||!root) return ARCH_MMU_STATUS_INVALID;
+#endif
+    *root=s->root_address;
+    return ARCH_MMU_STATUS_OK;
+}
 enum arch_mmu_status arch_mmu_user_space_move(struct arch_mmu_user_space *to,struct arch_mmu_user_space *from)
 {
     if (!to || to==from || !live(from)) return ARCH_MMU_STATUS_INVALID;

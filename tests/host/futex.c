@@ -30,6 +30,7 @@ static struct kernel_wait_queue *futex_queue;
 void futex_test_notifications_init(void);
 struct kernel_cpu *futex_test_notification_target(unsigned);
 static unsigned notification_probe, notification_sends, notification_seen;
+static unsigned private_pin_probe, private_pin_returns;
 long futex_test_send_ipi(uint64_t hart)
 {
     assert(notification_probe && hart > 0 && hart < 4);
@@ -79,6 +80,8 @@ static unsigned vector_pause,vector_paused,vector_resume,vector_fail_alloc;
 void __real_kernel_mm_unpin_user_page(struct kernel_mm_user_pin *);
 void __wrap_kernel_mm_unpin_user_page(struct kernel_mm_user_pin *pin)
 {
+    if (kernel_cpu_current()->hardware_id==1 && private_pin_probe)
+        __atomic_fetch_add(&private_pin_returns,1,__ATOMIC_RELAXED);
     __real_kernel_mm_unpin_user_page(pin);
     struct kernel_task *task=kernel_task_current();
     if(kernel_cpu_current()->hardware_id==1 && task->futex_request &&
@@ -297,6 +300,22 @@ static void synthetic_remove(unsigned count)
     }
     assert(!futex_queue->head && !futex_queue->registrations && !futex_queue->borrows);
 }
+static void wait_priority_snapshot(void)
+{
+    struct kernel_task *task=kernel_wait_current_task();
+    measure_domain=1;domain_takes=0;
+    assert(!futex_wait_priority(task) && !domain_takes);
+    task->scheduling.priority=30;
+    assert(futex_wait_priority(task)==30 && domain_takes==1);
+    /* PI提升改变实际优先级，普通futex的登记仍使用基础优先级。 */
+    task->pi_base_priority=1;
+    assert(!futex_wait_priority(task) && domain_takes==2);
+    task->pi_base_priority=11;
+    assert(futex_wait_priority(task)==10 && domain_takes==3);
+    task->pi_base_priority=0;task->scheduling.priority=0;
+    measure_domain=0;
+}
+
 static void wake_batches(void)
 {
     assert(measured_wake(source,1)==0 && !domain_takes && queue_takes==1);
@@ -395,9 +414,11 @@ static void private_with_mm_gate_busy(void)
     assert(call(source, 0 | 128, 1, 0, 0, 0) == -KERNEL_EAGAIN);
     struct waiter w = {1, 1, source, -99, 0, 0};
     unsigned before = mm_test_parked(1);
+    private_pin_probe=1;private_pin_returns=0;
     assert(!pthread_create(&waiting, 0, waiter, &w)); queued(1, before);
     assert(call(source, 1 | 128, 1, 0, 0, 0) == 1);
     assert(!pthread_join(waiting, 0) && w.result == 0);
+    private_pin_probe=0;assert(!private_pin_returns);
     assert(!gate_attempted && !gate_resume);
     __atomic_store_n(&gate_resume, 1, __ATOMIC_RELEASE);
     assert(!pthread_join(holder, 0)); gate_entered = 0;
@@ -701,6 +722,7 @@ int main(void)
     assert(!kernel_mm_mmap_anonymous(&mm, source, 2 * BOAROS_PAGE_SIZE, KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED, &out));
     test_heap=&heap;
     attach(0);
+    wait_priority_snapshot();
     waitv_cases();
     notification_batch();
     wake_batches(); operations(); private_with_mm_gate_busy(); private_access(); private_admission();

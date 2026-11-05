@@ -125,13 +125,12 @@ struct kernel_mm_record {
     uint32_t references;
     uint32_t users;
     struct kernel_raw_rwlock metadata;
-    uint32_t access_pins, write_pins;
+    uint64_t access_pins, write_pins;
     struct kernel_rwlock operations;
     struct kernel_rwlock vma_lock;
     struct kernel_wait_queue range_changed;
     struct kernel_mm_range_claim *range_claims;
     struct kernel_wait_queue pins_changed;
-    uint32_t access_closed;
     uint32_t active_cpus, pending_retirement;
     uint64_t tlb_generation, instruction_generation;
     uint64_t pin_acquisitions, prepared_pages, fault_retries;
@@ -175,22 +174,65 @@ struct kernel_mm_record {
     uint64_t lazy_seen_round, lazy_birth;
 };
 
-/* Short readers share the PTE view, but each caller publishes its own pin.
- * Exclusive metadata qualification still owns admission and drain decisions. */
-static inline uint32_t pin_count_add(uint32_t *count)
+/* 关闭位与归还计数共用原子字：最后归还者不需要跨变量猜测是否有人排空。
+ * 低32位保持原计数上限；只有metadata writer修改关闭位。 */
+#define MM_PIN_CLOSED (UINT64_C(1) << 63)
+#if BOAROS_MAX_CPUS > 1
+_Static_assert(__atomic_always_lock_free(sizeof(uint64_t), 0),
+    "MM pin states require inline 64-bit atomics");
+#endif
+static inline uint64_t pin_state_read(const uint64_t *state)
 {
 #if BOAROS_MAX_CPUS > 1
-    return __atomic_fetch_add(count, 1U, __ATOMIC_RELAXED);
+    return __atomic_load_n(state, __ATOMIC_ACQUIRE);
 #else
-    return (*count)++;
+    return *state;
 #endif
 }
-static inline uint32_t pin_count_sub(uint32_t *count)
+static inline uint32_t pin_count_add(uint64_t *count)
 {
 #if BOAROS_MAX_CPUS > 1
-    return __atomic_fetch_sub(count, 1U, __ATOMIC_RELAXED);
+    return (uint32_t)__atomic_fetch_add(count, 1U, __ATOMIC_RELAXED);
+#else
+    return (uint32_t)(*count)++;
+#endif
+}
+static inline uint64_t pin_count_sub(uint64_t *count)
+{
+#if BOAROS_MAX_CPUS > 1
+    return __atomic_fetch_sub(count, 1U, __ATOMIC_RELEASE);
 #else
     return (*count)--;
+#endif
+}
+static int pin_admission_closed(const struct kernel_mm_record *record)
+{
+#if BOAROS_MAX_CPUS > 1
+    /* 许可检查已有metadata资格；这里只取关闭位，不承担访问完成的acquire。 */
+    if (__atomic_load_n(&record->access_pins, __ATOMIC_RELAXED) & MM_PIN_CLOSED) return 1;
+    return __atomic_load_n(&record->write_pins, __ATOMIC_RELAXED) & MM_PIN_CLOSED ? 2 : 0;
+#else
+    if (record->access_pins & MM_PIN_CLOSED) return 1;
+    return record->write_pins & MM_PIN_CLOSED ? 2 : 0;
+#endif
+}
+static void pin_admission_close(struct kernel_mm_record *record, int writers_only)
+{
+    uint64_t *state = writers_only ? &record->write_pins : &record->access_pins;
+#if BOAROS_MAX_CPUS > 1
+    __atomic_fetch_or(state, MM_PIN_CLOSED, __ATOMIC_ACQ_REL);
+#else
+    *state |= MM_PIN_CLOSED;
+#endif
+}
+static void pin_admission_open(struct kernel_mm_record *record)
+{
+#if BOAROS_MAX_CPUS > 1
+    __atomic_fetch_and(&record->access_pins, ~MM_PIN_CLOSED, __ATOMIC_RELEASE);
+    __atomic_fetch_and(&record->write_pins, ~MM_PIN_CLOSED, __ATOMIC_RELEASE);
+#else
+    record->access_pins &= ~MM_PIN_CLOSED;
+    record->write_pins &= ~MM_PIN_CLOSED;
 #endif
 }
 static inline uint64_t mm_generation_read(const uint64_t *generation)
@@ -211,6 +253,25 @@ static uint64_t mm_generation_advance(uint64_t *generation)
     *generation = next;
 #endif
     return next;
+}
+static inline uint32_t mm_active_cpus(const struct kernel_mm_record *record)
+{
+#if BOAROS_MAX_CPUS > 1
+    return __atomic_load_n(&record->active_cpus, __ATOMIC_ACQUIRE);
+#else
+    return record->active_cpus;
+#endif
+}
+static inline uint32_t mm_sync_targets(const struct kernel_mm_record *record)
+{
+#if BOAROS_MAX_CPUS > 1
+    /* PTE/代次先于目标采样可见；与加入者的SC置位形成两种交接：采到它
+     * 就等待远端确认，没采到则其置位后的本地全量失效覆盖这些写入。 */
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    return __atomic_load_n(&record->active_cpus, __ATOMIC_SEQ_CST);
+#else
+    return record->active_cpus;
+#endif
 }
 
 static uint32_t backend_permissions_from_mm(uint32_t permissions);
@@ -888,7 +949,7 @@ static void truncate_file_residents(void *owner, struct kernel_vfs_node *node,
         uint32_t targets;
         { KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
           mm_generation_advance(&record->instruction_generation);
-          targets = record->active_cpus; }
+          targets = mm_sync_targets(record); }
         arch_mmu_sync_user(targets, 0, UINT64_MAX, 1);
     }
     struct mm_file_resident *retired=record->retired_file_residents;
@@ -1891,7 +1952,7 @@ static uint32_t note_tlb_change_locked(struct kernel_mm_record *record,
         record->retired_pages += batch->count;
 #endif
     }
-    return record->active_cpus;
+    return mm_sync_targets(record);
 }
 static void finish_tlb_change(struct kernel_mm_record *record,
     struct kernel_mm_retirement *batch, uint32_t targets, uint64_t address,
@@ -1944,9 +2005,9 @@ static void mm_operation_end(struct mm_operation *operation)
     }
     if (operation->guard.lock) {
         struct kernel_mm_record *record = operation->record;
-        if (operation->pins_closed || (operation->guard.write && record->access_closed)) {
+        if (operation->pins_closed || (operation->guard.write && pin_admission_closed(record))) {
             KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
-            record->access_closed = 0;
+            pin_admission_open(record);
             kernel_raw_lock_release(&guard);
             wake_pin_waiters(record);
             operation->pins_closed = 0;
@@ -2041,7 +2102,7 @@ static enum kernel_mm_status mm_fault_operation_begin(const struct kernel_mm *mm
     return mm_operation_begin(mm, operation);
 #endif
 }
-/* 在MM raw内登记并复查，解锁后park；pin归还/开放许可都在锁外wake。
+/* 在MM raw内登记并复查，解锁后park；末次pin归还也以该锁同步登记后wake。
  * 注册owner由局部token持有，退出函数前finish，不携带裸队列游标。 */
 static void wait_pin_condition(struct kernel_mm_record *record, int drain)
 {
@@ -2049,8 +2110,9 @@ static void wait_pin_condition(struct kernel_mm_record *record, int drain)
         struct kernel_wait_token token = {0};
         {
             KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
-            int blocked = drain ? (record->access_closed == 2 ? record->write_pins :
-                record->access_pins) != 0 : record->access_closed != 0;
+            int closed = pin_admission_closed(record);
+            int blocked = drain ? (uint32_t)pin_state_read(closed == 2 ?
+                &record->write_pins : &record->access_pins) != 0 : closed != 0;
             if (!blocked) return;
 #if BOAROS_COST_DIAGNOSTICS
             record->pin_waits++;
@@ -2075,8 +2137,8 @@ static void close_record_pins(struct kernel_mm_record *record,int writers_only)
         struct kernel_wait_token token = {0};
         {
             KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
-            if (!record->access_closed) {
-                record->access_closed = writers_only ? 2 : 1;
+            if (!pin_admission_closed(record)) {
+                pin_admission_close(record, writers_only);
                 break;
             }
             if (kernel_wait_prepare(&record->pins_changed, 0, 0, &token) !=
@@ -2119,7 +2181,7 @@ static void invalidate_object_residents(void *owner,struct kernel_memory_object 
     if (record->stage!=KERNEL_MM_RECORD_LIVE) return;
     close_record_pins(record,0);
     unmap_object_ranges(record,object,start,end);
-    { KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);record->access_closed=0; }
+    { KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);pin_admission_open(record); }
     wake_pin_waiters(record);
 }
 
@@ -2137,6 +2199,15 @@ enum kernel_mm_status kernel_mm_lookup(const struct kernel_mm *mm,
     return lookup_record(record, address, mapping);
 }
 
+static inline enum kernel_mm_status lookup_user_mapping(const struct kernel_mm_record *record,
+    uint64_t address, uint32_t access, struct kernel_mm_mapping *mapping)
+{
+    enum kernel_mm_status status = lookup_record(record, address, mapping);
+    if (status) return status;
+    return (mapping->permissions & (access | KERNEL_MM_USER)) ==
+        (access | KERNEL_MM_USER) ? KERNEL_MM_STATUS_OK : KERNEL_MM_STATUS_ACCESS;
+}
+
 /* PTE、resident索引与权限许可由同一短读资格固定；实际页acquire不能移出。 */
 static __attribute__((always_inline)) inline enum kernel_mm_status pin_mapping(const struct kernel_mm *mm,
     struct kernel_mm_record *record, uint64_t address, uint32_t access,
@@ -2144,10 +2215,8 @@ static __attribute__((always_inline)) inline enum kernel_mm_status pin_mapping(c
 {
     struct kernel_mm_mapping mapping;
     void *pointer;
-    enum kernel_mm_status status = lookup_record(record, address, &mapping);
+    enum kernel_mm_status status = lookup_user_mapping(record, address, access, &mapping);
     if (status != KERNEL_MM_STATUS_OK) return status;
-    if ((mapping.permissions & (access | KERNEL_MM_USER)) !=
-        (access | KERNEL_MM_USER)) return KERNEL_MM_STATUS_ACCESS;
     uint64_t physical = mapping.physical_address & ~BOAROS_PAGE_MASK;
     /* permission许可和取得实际页引用不能被撤映射插入。 */
     if (physical_page_map_owned(mm->allocator, physical, &pointer) !=
@@ -2190,8 +2259,8 @@ enum kernel_mm_status kernel_mm_pin_user_page(const struct kernel_mm *mm,
     if (status != KERNEL_MM_STATUS_OK) return status;
 retry:
     KERNEL_RAW_READ_SCOPE(guard, &record->metadata);
-    if (record->access_closed == 1 ||
-        (record->access_closed == 2 && (access & KERNEL_MM_WRITE))) {
+    int closed = pin_admission_closed(record);
+    if (closed == 1 || (closed == 2 && (access & KERNEL_MM_WRITE))) {
         if (current_pins(mm)) return KERNEL_MM_STATUS_CONFLICT;
         kernel_raw_rwlock_read_release(&guard);
         wait_pin_condition(record, 0);
@@ -2208,18 +2277,29 @@ void kernel_mm_unpin_user_page(struct kernel_mm_user_pin *pin)
         pin->mm->state != KERNEL_MM_LIVE || !pin->record ||
         !pin->owner_previous || *pin->owner_previous != pin)
         __builtin_trap();
-    /* 页借用已由存活MM持有；归还同一记录，不重新解析整个地址空间。 */
+    /* caller保留LIVE句柄直到本函数返回；计数归零后record仍有实际MM owner。 */
     struct kernel_mm_record *record=pin->record;
-    KERNEL_RAW_READ_SCOPE(guard, &record->metadata);
-    *pin->owner_previous = pin->owner_next;
-    if (pin->owner_next) pin->owner_next->owner_previous=pin->owner_previous;
-    uint32_t last_access = pin_count_sub(&record->access_pins);
-    uint32_t last_write = 0;
-    if (pin->access & KERNEL_MM_WRITE) last_write = pin_count_sub(&record->write_pins);
-    if (!last_access || ((pin->access & KERNEL_MM_WRITE) && !last_write)) __builtin_trap();
-    int wake = record->access_closed == 2 ? last_write == 1U :
-        record->access_closed == 1 && last_access == 1U;
-    kernel_raw_rwlock_read_release(&guard);
+    int wake;
+    {
+#if BOAROS_MAX_CPUS == 1
+        /* UP没有并行归还；仅此无调用片段禁止中断抢占，计数无需原子RMW。 */
+        KERNEL_IRQ_SCOPE(irq);
+#endif
+        *pin->owner_previous = pin->owner_next;
+        if (pin->owner_next) pin->owner_next->owner_previous=pin->owner_previous;
+        uint64_t last_write = 0;
+        if (pin->access & KERNEL_MM_WRITE) last_write = pin_count_sub(&record->write_pins);
+        /* 全部access归零也必须意味着该writer的write计数已归还。 */
+        uint64_t last_access = pin_count_sub(&record->access_pins);
+        if (!(uint32_t)last_access ||
+            ((pin->access & KERNEL_MM_WRITE) && !(uint32_t)last_write)) __builtin_trap();
+        wake = last_access == (MM_PIN_CLOSED | 1U) || last_write == (MM_PIN_CLOSED | 1U);
+    }
+    if (wake) {
+        /* 若drainer先看见旧计数，它必在此资格前完成wait_prepare；若先看见
+         * 归零则不等待。关闭和末次归还作用于同一原子字，不丢掉通知责任。 */
+        KERNEL_RAW_READ_SCOPE(guard, &record->metadata);
+    }
     /* The pin owns this reference independently of the current PTE. Drain
      * waits for completed access; allocator return needs no MM qualification. */
     if (physical_page_release(pin->mm->allocator, pin->physical_address) !=
@@ -2869,10 +2949,10 @@ restart_round:
             int closed=0,more=0;
             {
                 KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
-                if (record->stage==KERNEL_MM_RECORD_LIVE && !record->access_closed) {
+                if (record->stage==KERNEL_MM_RECORD_LIVE && !pin_admission_closed(record)) {
                     /* FREE 排空旧写 pin 并撤可写权限；之后写 pin 必须先
                      * 取消候选。已有读 pin 自持物理引用，可跨撤映射存活。 */
-                    record->access_closed=1;
+                    pin_admission_close(record, 0);
                     closed=1;
                     if (!registered) {
                         if (record->lazy_scan_cursor) __builtin_trap();
@@ -2904,7 +2984,7 @@ restart_round:
                 }
                 {
                     KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
-                    record->access_closed=0;
+                    pin_admission_open(record);
                     more=cursor.next!=NULL;
                 }
             }
@@ -3983,7 +4063,7 @@ enum kernel_mm_status kernel_mm_flush_instructions(struct kernel_mm *mm, int loc
     {
         KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
         generation=mm_generation_advance(&record->instruction_generation);
-        targets=local_only?0:record->active_cpus;
+        targets=local_only?0:mm_sync_targets(record);
     }
     arch_mmu_sync_instruction_cpus(targets);
     /* 远端可在等待期间发布更新代次，不能把它冒充为本次已同步。 */
@@ -4011,22 +4091,30 @@ enum kernel_mm_status kernel_mm_activate(const struct kernel_mm *next, uint64_t 
         if (next->state != KERNEL_MM_LIVE) status = KERNEL_MM_STATUS_STATE;
         else status = resolve_record_storage(next, &record);
         if (status != KERNEL_MM_STATUS_OK) goto out;
-        struct kernel_raw_guard guard __attribute__((cleanup(kernel_raw_scope_release))) = {0};
         int joining = record != previous;
-        /* An already registered CPU remains in every publisher's target set.
-         * Only membership changes need writer qualification; the root itself
-         * is immutable while next owns its MM reference. */
+#if BOAROS_MAX_CPUS == 1
+        struct kernel_raw_guard guard __attribute__((cleanup(kernel_raw_scope_release))) = {0};
         if (joining) kernel_raw_rwlock_write_acquire(&record->metadata, &guard);
+#endif
+        /* next的实际MM引用固定root；活动成员只发布本CPU的进入/离开。 */
         uint64_t context;
         if (arch_mmu_user_space_context(&record->space, &context) != ARCH_MMU_STATUS_OK) {
             status = KERNEL_MM_STATUS_ADDRESS_SPACE; goto out;
         }
+#if BOAROS_MAX_CPUS > 1
+        if (joining && (__atomic_fetch_or(&record->active_cpus, 1U << logical,
+            __ATOMIC_SEQ_CST) & (1U << logical))) __builtin_trap();
+#endif
+        /* 置位后捕获待同步代次，再切root/本地失效；不能在flush后记录
+         * 并发LOCAL指令发布的新代次，否则该CPU会漏掉下次FENCE.I。 */
         uint64_t generation = mm_generation_read(&record->tlb_generation);
         uint64_t instructions = mm_generation_read(&record->instruction_generation);
+#if BOAROS_MAX_CPUS == 1
         if (joining) {
             if (record->active_cpus & (1U << logical)) __builtin_trap();
             record->active_cpus |= 1U << logical;
         }
+#endif
         int changed = arch_mmu_current_context() != context;
         if (arch_mmu_switch_context(context) != ARCH_MMU_STATUS_OK) __builtin_trap();
         /* A root switch already flushed translations. Record only captured
@@ -4045,9 +4133,15 @@ enum kernel_mm_status kernel_mm_activate(const struct kernel_mm *next, uint64_t 
         cpu->active_mm_instruction_generation = 0;
     }
     if (previous && previous != record) {
+#if BOAROS_MAX_CPUS > 1
+        /* 旧root已停止使用并全量失效；先前采到本CPU的修改者仍须等其确认。 */
+        if (!(__atomic_fetch_and(&previous->active_cpus, ~(1U << logical),
+            __ATOMIC_SEQ_CST) & (1U << logical))) __builtin_trap();
+#else
         KERNEL_RAW_WRITE_SCOPE(guard, &previous->metadata);
         if (!(previous->active_cpus & (1U << logical))) __builtin_trap();
         previous->active_cpus &= ~(1U << logical);
+#endif
     }
 out:
     arch_interrupt_restore(irq);
@@ -4092,7 +4186,7 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
         lazy_unregister(record);
         KERNEL_LOCK_SCOPE(retire);
         kernel_rwlock_write(&record->operations,&retire);
-        if (record->access_pins || record->write_pins || record->active_cpus ||
+        if (pin_state_read(&record->access_pins) || pin_state_read(&record->write_pins) || mm_active_cpus(record) ||
             record->pending_retirement || record->retired_file_mappings || record->retired_shared_anon) __builtin_trap();
         if (record->vmas == 0 && record->shared_anon == 0 &&
             record->file_sources == 0 &&
@@ -4224,8 +4318,9 @@ void kernel_mm_get_concurrency_state(const struct kernel_mm *mm,
     *state = (struct kernel_mm_concurrency_state){
         .references = __atomic_load_n(&record->references, __ATOMIC_ACQUIRE),
         .users = __atomic_load_n(&record->users, __ATOMIC_ACQUIRE),
-        .pins = record->access_pins, .write_pins = record->write_pins,
-        .active_cpus = record->active_cpus, .pending_retirement = record->pending_retirement,
+        .pins = (uint32_t)pin_state_read(&record->access_pins),
+        .write_pins = (uint32_t)pin_state_read(&record->write_pins),
+        .active_cpus = mm_active_cpus(record), .pending_retirement = record->pending_retirement,
         .record_bytes = sizeof(*record), .pin_bytes = sizeof(struct kernel_mm_user_pin),
         .generation = record->tlb_generation, .pin_acquisitions = record->pin_acquisitions,
         .prepared_pages = record->prepared_pages, .fault_retries = record->fault_retries,
@@ -5622,6 +5717,31 @@ static enum kernel_mm_status resolve_user_fault(struct kernel_mm *mm,
     }
 }
 
+enum kernel_mm_status kernel_mm_try_futex_read(struct kernel_mm *mm, uint64_t address,
+    uint32_t *value)
+{
+    if (!mm || !value || (address & 3U)) return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    if (mm->state != KERNEL_MM_LIVE) return KERNEL_MM_STATUS_STATE;
+    struct kernel_mm_record *record;
+    enum kernel_mm_status status = resolve_record(mm, &record);
+    if (status) return status;
+    KERNEL_RAW_READ_SCOPE(raw, &record->metadata);
+    if (pin_admission_closed(record) == 1) return KERNEL_MM_STATUS_CONFLICT;
+    struct kernel_mm_mapping mapping;
+    status = lookup_user_mapping(record, address, KERNEL_MM_READ, &mapping);
+    if (status == KERNEL_MM_STATUS_NOT_MAPPED || status == KERNEL_MM_STATUS_ACCESS)
+        return KERNEL_MM_STATUS_CONFLICT;
+    if (status) return status;
+    void *page;
+    if (physical_page_map_owned(mm->allocator, mapping.physical_address & ~BOAROS_PAGE_MASK,
+        &page) != PHYSICAL_PAGE_STATUS_OK) return KERNEL_MM_STATUS_PAGE_ACCESS;
+    /* 整次读在PTE稳定资格内完成；PTE的物理owner覆盖它，不借出指针或pin。
+     * 调用者的桶操作继续串行比较值与登记，private key只依赖MM和VA。 */
+    *value = __atomic_load_n((const uint32_t *)((const unsigned char *)page +
+        (address & BOAROS_PAGE_MASK)), __ATOMIC_ACQUIRE);
+    return KERNEL_MM_STATUS_OK;
+}
+
 enum kernel_mm_status kernel_mm_try_futex_pin(struct kernel_mm *mm,uint64_t address,
     int shared,uint32_t access,const struct kernel_futex_key *key,struct kernel_mm_user_pin *pin)
 {
@@ -5648,7 +5768,8 @@ enum kernel_mm_status kernel_mm_try_futex_pin(struct kernel_mm *mm,uint64_t addr
         kernel_lock_release(&vma_guard);
     }
     KERNEL_RAW_READ_SCOPE(raw, &record->metadata);
-    if(record->access_closed==1 || (record->access_closed==2 && (access&KERNEL_MM_WRITE)))
+    int closed = pin_admission_closed(record);
+    if(closed==1 || (closed==2 && (access&KERNEL_MM_WRITE)))
         return KERNEL_MM_STATUS_CONFLICT;
     status=pin_mapping(mm,record,address,access,pin,access==KERNEL_MM_WRITE);
     return status==KERNEL_MM_STATUS_NOT_MAPPED || status==KERNEL_MM_STATUS_ACCESS ?
@@ -5718,7 +5839,7 @@ enum kernel_mm_status kernel_mm_prepare_futex(struct kernel_mm *mm,
         if (fault_index == count && access) {
             enum kernel_mm_status status;
             { KERNEL_RAW_READ_SCOPE(guard, &record->metadata);
-              if (record->access_closed) __builtin_trap();
+              if (pin_admission_closed(record)) __builtin_trap();
               status = pin_mapping(mm, record, addresses[pin_index], access,
                                    pin, access == KERNEL_MM_WRITE); }
             if (status == KERNEL_MM_STATUS_NOT_MAPPED || status == KERNEL_MM_STATUS_ACCESS) {
@@ -6168,7 +6289,7 @@ static int advise_free(struct mm_operation *operation,const struct kernel_vma *v
         uint64_t finish=address+run->end-offset;
         if (*end>finish) *end=finish;
     } else if (vma->kind!=KERNEL_VMA_KIND_ANONYMOUS) return -KERNEL_EINVAL;
-    if (!record->access_closed) close_pins(operation,1);
+    if (!pin_admission_closed(record)) close_pins(operation,1);
     uint64_t cursor=address,leaf;
     enum arch_mmu_status status;
     int error=0,changed=0;

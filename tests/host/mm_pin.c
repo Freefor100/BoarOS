@@ -27,11 +27,18 @@ static uint64_t watched_record;
 static unsigned record_resolutions;
 static uint64_t qualifying_page;
 static unsigned qualifying_entered, qualifying_release;
+static unsigned hold_metadata, metadata_entered, metadata_release;
 static void await(unsigned *value)
 { while (!__atomic_load_n(value, __ATOMIC_ACQUIRE)) sched_yield(); }
 static void *page_access(uint64_t address)
 {
     if (address == watched_record) record_resolutions++;
+    if (__atomic_load_n(&hold_metadata, __ATOMIC_ACQUIRE) &&
+        kernel_cpu_current()->hardware_id == 1 && kernel_cpu_current()->raw_locks &&
+        kernel_cpu_current()->raw_locks->lock->rank == KERNEL_RAW_RANK_MM) {
+        __atomic_store_n(&metadata_entered, 1, __ATOMIC_RELEASE);
+        await(&metadata_release);
+    }
     if (address == qualifying_page && kernel_cpu_current()->hardware_id == 1) {
         /* 停在PTE资格内、真实页引用取得前；另一读者必须能完成同页pin。 */
         __atomic_store_n(&qualifying_entered, 1, __ATOMIC_RELEASE);
@@ -49,6 +56,36 @@ enum physical_page_status __real_physical_page_resolve(const struct physical_pag
 enum physical_page_status __wrap_physical_page_resolve(const struct physical_page_allocator *a, uint64_t address, void **out)
 { checked_resolutions++; return __real_physical_page_resolve(a, address, out); }
 struct parallel_pin_argument { struct kernel_mm *mm; uint64_t address; };
+static void *paused_lookup(void *opaque)
+{
+    struct parallel_pin_argument *argument = opaque;
+    mm_test_attach(1);
+    struct kernel_mm_mapping mapping;
+    assert(!kernel_mm_lookup(argument->mm, argument->address, &mapping));
+    return NULL;
+}
+static void return_while_metadata_busy(struct kernel_mm *mm, uint64_t address)
+{
+    struct kernel_mm_user_pin pin = {0};
+    assert(!kernel_mm_pin_user_page(mm, address, KERNEL_MM_WRITE, &pin));
+    struct parallel_pin_argument argument = {mm, address};
+    pthread_t writer;
+    __atomic_store_n(&hold_metadata, 1, __ATOMIC_RELEASE);
+    alarm(10);
+    assert(!pthread_create(&writer, NULL, paused_lookup, &argument));
+    await(&metadata_entered);
+    /* writer停在真实页表查询内；已完成复制的owner无需等该MM资格。 */
+    kernel_mm_unpin_user_page(&pin);
+    assert(!pin.registration && !kernel_io_context_current()->user_pins);
+    __atomic_store_n(&metadata_release, 1, __ATOMIC_RELEASE);
+    assert(!pthread_join(writer, NULL));
+    alarm(0);
+    __atomic_store_n(&hold_metadata, 0, __ATOMIC_RELEASE);
+    struct kernel_mm_concurrency_state state;
+    kernel_mm_get_concurrency_state(mm, &state);
+    assert(!state.pins && !state.write_pins);
+    printf("MM ordinary pin return bypasses busy metadata; record_bytes=%u\n", state.record_bytes);
+}
 static void *parallel_pin(void *opaque)
 {
     struct parallel_pin_argument *argument = opaque;
@@ -211,6 +248,7 @@ int main(void)
     assert(!kernel_mm_mprotect(&mm, address, BOAROS_PAGE_SIZE, KERNEL_MM_READ | KERNEL_MM_WRITE));
     resident_copy_cost(&mm, address);
     parallel_resident_pins(&mm, address);
+    return_while_metadata_busy(&mm, address);
     fatal_pins(&mm, address);
     struct kernel_mm_mapping mapping;
     assert(kernel_mm_lookup(&mm, address, &mapping) == 0);

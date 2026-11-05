@@ -29,6 +29,10 @@ static unsigned sampled, entered, allow_send, pause_exit, exiting, allow_exit, s
 static _Thread_local unsigned flushes, instruction_sync;
 static uint64_t reentry_root, reentry_address;
 static unsigned reentry_entered, reentry_release;
+static unsigned membership_pause, membership_entered, membership_flush;
+static unsigned membership_joined, membership_leave, membership_left;
+static unsigned membership_sync, membership_sampled, membership_ack, membership_done;
+static uint64_t membership_address;
 #ifdef REMOTE_USER_CASE
 static unsigned copying, cow_fences;
 static uint64_t cow_old;
@@ -90,6 +94,11 @@ void kernel_cpu_notify(struct kernel_cpu *cpu, unsigned events) { (void)cpu; (vo
 void mm_test_fence(uint64_t address, int instructions)
 {
     (void)address;
+    if (!instructions && kernel_cpu_current()->logical_id == 1 &&
+        mm_test_context == context && __atomic_exchange_n(&membership_pause, 0, __ATOMIC_ACQ_REL)) {
+        /* 活动bit已发布，切root后的本地失效尚未完成。 */
+        publish(&membership_entered); await(&membership_flush);
+    }
     if (instructions) instruction_sync++; else flushes++;
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     if (kernel_cpu_current()->logical_id == 1 && mm_test_context == kernel_context &&
@@ -119,13 +128,77 @@ static void same_mm_reentry(uint64_t address)
     /* 已在活动集合的同MM切换，不等待读者持有的PTE发布锁。 */
     assert(!kernel_mm_activate(&mm, kernel_context));
     assert(flushes == tlb && instruction_sync == instructions);
+    /* 同一稳定MM的离开与再次进入也无需等无关PTE查询结束。 */
+    assert(!kernel_mm_activate(NULL, kernel_context));
+    assert(!kernel_mm_activate(&mm, kernel_context));
+    assert(flushes == tlb + 2 && instruction_sync == instructions + 1);
     publish(&reentry_release);
     assert(!pthread_join(lookup, NULL));
     alarm(0);
     reentry_root = 0;
     assert(!kernel_mm_activate(NULL, kernel_context));
     mm_test_context = context;
-    puts("MM same-root reentry progresses while an independent PTE lookup holds metadata");
+    puts("MM same-root reuse and leave/rejoin progress during an independent PTE lookup");
+}
+static void *joining_during_unmap(void *unused)
+{
+    (void)unused; mm_test_attach(1); kernel_cpu_current()->logical_id = 1;
+    assert(!kernel_mm_activate(&mm, kernel_context));
+    assert(flushes == 1 && instruction_sync == 1);
+    struct kernel_mm_mapping mapping;
+    assert(kernel_mm_lookup(&mm, membership_address, &mapping) == KERNEL_MM_STATUS_NOT_MAPPED);
+    /* 停顿期间发布了新代次；首次进入只记录失效前捕获的旧代次。 */
+    assert(!kernel_mm_activate(&mm, kernel_context));
+    assert(flushes == 2 && instruction_sync == 1);
+    publish(&membership_joined); await(&membership_leave);
+    assert(!kernel_mm_activate(NULL, kernel_context));
+    publish(&membership_left);
+    return NULL;
+}
+static void *unmap_joining_cpu(void *unused)
+{
+    (void)unused; mm_test_attach(0); mm_test_context = context;
+    assert(!kernel_mm_munmap(&mm, membership_address, BOAROS_PAGE_SIZE));
+    publish(&membership_done);
+    return NULL;
+}
+static void membership_before_publication(uint64_t address)
+{
+    membership_address = address;
+    struct kernel_mm_mapping mapping;
+    assert(!kernel_mm_lookup(&mm, address, &mapping));
+    uint64_t physical = mapping.physical_address;
+    uint64_t available = physical_page_available(&allocator);
+    pthread_t visitor, modifier;
+    membership_pause = membership_sync = 1;
+    alarm(10);
+    assert(!pthread_create(&visitor, NULL, joining_during_unmap, NULL));
+    await(&membership_entered);
+    assert(!pthread_create(&modifier, NULL, unmap_joining_cpu, NULL));
+    await(&membership_sampled);
+    struct kernel_mm_concurrency_state state;
+    kernel_mm_get_concurrency_state(&mm, &state);
+    assert(state.active_cpus == 2 && state.pending_retirement);
+    publish(&membership_flush); await(&membership_joined);
+    assert(!__atomic_load_n(&membership_done, __ATOMIC_ACQUIRE));
+    publish(&membership_leave); await(&membership_left);
+    kernel_mm_get_concurrency_state(&mm, &state);
+    uint32_t references;
+    assert(!state.active_cpus && state.pending_retirement);
+    assert(!physical_page_reference_count(&allocator, physical, &references) && references == 1);
+    assert(!__atomic_load_n(&membership_done, __ATOMIC_ACQUIRE));
+    /* 清除活动bit不能替代已经采样的最后目标确认。 */
+    publish(&membership_ack);
+    assert(!pthread_join(visitor, NULL) && !pthread_join(modifier, NULL));
+    alarm(0); membership_sync = 0;
+    kernel_mm_get_concurrency_state(&mm, &state);
+    assert(!state.active_cpus && !state.pending_retirement && membership_done);
+    assert(physical_page_available(&allocator) > available);
+    uint64_t placed; unsigned char byte = 19; size_t copied;
+    assert(!kernel_mm_mmap_anonymous(&mm, address, BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED, &placed));
+    assert(!kernel_copy_to_user(&mm, address, &byte, 1, &copied) && copied == 1);
+    puts("MM join before PTE withdrawal, leave during held last-target acknowledgement and retired owners verified");
 }
 #if BOAROS_MAX_CPUS == 4
 static unsigned many_mm_entered, many_mm_release, many_mm_sampled, many_mm_sync;
@@ -164,6 +237,14 @@ void riscv_smp_sync_user(uint32_t targets, uint64_t address, uint64_t size, int 
 {
     (void)address; (void)size; (void)instructions;
     assert(!kernel_cpu_current()->raw_locks);
+    if (membership_sync) {
+        /* 最后一个叶被移除也会退休空非叶，实际同步覆盖完整翻译。 */
+        assert(targets == 2 && !address && size == UINT64_MAX && !instructions);
+        publish(&membership_sampled); await(&membership_ack);
+        assert(!__atomic_load_n(&membership_done, __ATOMIC_ACQUIRE));
+        mm_test_fence(address, 0);
+        return;
+    }
 #if BOAROS_MAX_CPUS == 4
     if(many_mm_sync) {
         if(many_mm_sync==2) {
@@ -453,6 +534,7 @@ int main(void)
     assert(!kernel_copy_to_user(&mm, address, &byte, 1, &copied));
     assert(!kernel_mm_check_task_domain(&mm));
     same_mm_reentry(address);
+    membership_before_publication(address);
 #if BOAROS_MAX_CPUS == 4
     many_mm_activity(address);
 #endif

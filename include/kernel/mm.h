@@ -83,6 +83,7 @@ struct kernel_mm_mapping {
 /* resident片段的实际页owner；caller的LIVE MM句柄须保持到unpin。
  * lookup、权限许可与acquire在同一MM raw读资格内完成，复制在资格外进行。
  * pin不固定映射身份/内容；不能复制token，也不能由另一任务归还。
+ * 普通归还不取MM raw；关闭期间最后一次归还与等待登记同步后唤醒排空者。
  * 非resident/COW权限返回NOT_MAPPED/ACCESS，由caller fault后重新pin。
  * token首次使用须零初始化，成功才发布；失败不修改输出。重复pin或非法unpin fatal。
  * 自持同一MM pin时，需gate的操作只尝试取得，忙时返回CONFLICT；新pin许可
@@ -211,6 +212,11 @@ enum kernel_mm_status kernel_mm_prepare_futex(
 /* 已保留key的登记阶段只尝试当前映射/pin；CONFLICT要求先结束token再准备。 */
 enum kernel_mm_status kernel_mm_try_futex_pin(struct kernel_mm *,uint64_t,int,uint32_t,
     const struct kernel_futex_key *,struct kernel_mm_user_pin *);
+
+/* private WAIT在桶操作内读取已对齐用户字；metadata短读覆盖整个原子读，
+ * 不fault/分配或借出页指针。冷页、撤读权限或全pin关闭返回CONFLICT，
+ * caller先结束桶操作，再沿prepare_futex准备并重试；失败不修改value。 */
+enum kernel_mm_status kernel_mm_try_futex_read(struct kernel_mm *, uint64_t, uint32_t *);
 
 /* Unique for the lifetime of the kernel, including after MM page reuse. */
 enum kernel_mm_status kernel_mm_futex_id(
