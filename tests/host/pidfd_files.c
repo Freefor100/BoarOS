@@ -102,7 +102,8 @@ void kernel_wait_backend_commit(struct kernel_task *task,uint64_t deadline,int i
 void kernel_wait_backend_notify(struct kernel_task *task,uint32_t reason){(void)task;(void)reason;}
 void kernel_wait_backend_ready(struct kernel_task *task){(void)task;}
 enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *task)
-{(void)task;assert(!"unexpected park");return KERNEL_SCHEDULER_STATUS_OK;}
+{
+(void)task;assert(!"unexpected park");return KERNEL_SCHEDULER_STATUS_OK;}
 void kernel_wait_backend_quiesce(void){sched_yield();}
 
 static void signal_exit_reached(void)
@@ -309,3 +310,13 @@ int main(int argc,char **argv)
     assert(kernel_pid_take_retired(&scheduler.identities)==&identity && !numbers.allocated);
     printf("PASS pidfd real files %s: OFD/table/PID/security owners returned\n",argv[1]);
 }
+
+#if BOAROS_MAX_CPUS > 1
+enum kernel_scheduler_status kernel_wait_backend_switch_locked(struct kernel_task *task,
+    struct kernel_raw_guard *handoff)
+{
+    assert(handoff && handoff->lock == &kernel_wait_domain);
+    kernel_raw_lock_release(handoff);
+    return kernel_wait_backend_switch(task);
+}
+#endif

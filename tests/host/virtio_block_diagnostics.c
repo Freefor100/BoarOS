@@ -316,7 +316,7 @@ enum kernel_scheduler_status kernel_wait_node_bind(struct kernel_wait_queue *que
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 void kernel_wait_queue_init(struct kernel_wait_queue *queue)
-{ memset(queue, 0, sizeof(*queue)); }
+{ memset(queue, 0, sizeof(*queue));kernel_raw_lock_init(&queue->lock,KERNEL_RAW_RANK_WAIT_QUEUE); }
 enum kernel_scheduler_status kernel_wait_queue_wake_all(struct kernel_wait_queue *queue)
 {
     if (probe_wake && block_cpu.logical_id==0 && queue==late_wait_queue) {
@@ -333,6 +333,7 @@ enum kernel_scheduler_status kernel_wait_queue_wake_all(struct kernel_wait_queue
     if (queue==late_wait_queue) {
         assert(queue->head==&late_waiter && queue->tail==&late_waiter && late_waiter.queue==queue);
         queue->head=queue->tail=NULL; late_waiter.queue=NULL; late_wakes++;
+        __atomic_store_n(&queue->registrations,0,__ATOMIC_RELEASE);
     } else assert(queue->head == NULL);
     return KERNEL_SCHEDULER_STATUS_OK;
 }
@@ -488,6 +489,7 @@ static void terminal_waiter(void)
     late_wait_queue = &request_at(terminal_wait_device, 0)->done;
     late_waiter = (struct kernel_wait_node){.queue = late_wait_queue};
     late_wait_queue->head = late_wait_queue->tail = &late_waiter;
+    __atomic_store_n(&late_wait_queue->registrations,1,__ATOMIC_RELEASE);
 }
 
 static void run_case(unsigned version, enum fault_kind kind)
@@ -998,6 +1000,7 @@ static void late_harvest_case(unsigned version)
     late_waiter=(struct kernel_wait_node){.queue=&done};
     late_wait_queue=&done;
     done.head=done.tail=&late_waiter;
+    __atomic_store_n(&done.registrations,1,__ATOMIC_RELEASE);
     assert(device.queue.used->index==device.queue.last_used);
     /* This hook runs only on entry to the real queue take, after harvest's
      * initial used-index snapshot. Eight completions become visible then. */
@@ -1264,6 +1267,7 @@ static void cross_cpu_notification_case(unsigned version)
     late_wait_queue=&request->done;
     late_waiter=(struct kernel_wait_node){.queue=late_wait_queue};
     late_wait_queue->head=late_wait_queue->tail=&late_waiter;late_wakes=0;
+    __atomic_store_n(&late_wait_queue->registrations,1,__ATOMIC_RELEASE);
     wake_paused=wake_release=acquire_attempted=waiter_finished=early_finish=0;probe_wake=1;
     pthread_t irq,observer;
     assert(!pthread_create(&observer,NULL,release_notification_actor,NULL));

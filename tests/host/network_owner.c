@@ -119,6 +119,7 @@ void kernel_cpu_flush_notifications(void) {CHECK(!kernel_cpu_current()->outbound
 int kernel_wait_cursor_prepare(struct kernel_wait_queue *queue,struct kernel_wait_cursor *cursor)
 {
     CHECK(queue->initialized);
+    KERNEL_RAW_SCOPE(guard,&queue->lock);
     if(queue->head) {queue->borrows++;queue->head->references++;*cursor=(struct kernel_wait_cursor){.queue=queue,.node=queue->head};return 1;}
     return 0;
 }
@@ -140,9 +141,10 @@ void kernel_wait_cursor_wake(struct kernel_wait_cursor *cursor,int all)
     }
     if(cursor->queue==stop_probe_queue) {CHECK(cursor->node->references);cursor->node->references--;}
     if(notify_testing && cursor->queue==&notify_queue) {
-        CHECK(!pthread_mutex_lock(&remote_gate));cursor->queue->borrows--;
+        CHECK(!pthread_mutex_lock(&remote_gate));
+        {KERNEL_RAW_SCOPE(guard,&cursor->queue->lock);cursor->queue->borrows--;}
         CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));
-    } else cursor->queue->borrows--;
+    } else {KERNEL_RAW_SCOPE(guard,&cursor->queue->lock);cursor->queue->borrows--;}
     *cursor=(struct kernel_wait_cursor){0};
 }
 void kernel_rwlock_init(struct kernel_rwlock *lock, uint32_t rank, uintptr_t key)
@@ -310,7 +312,7 @@ uint64_t kernel_vfs_path_inode(const struct kernel_vfs_path *path)
 int kernel_vfs_path_release(struct kernel_vfs_path **owner)
 { CHECK(!*owner);return 0; }
 void kernel_wait_queue_init(struct kernel_wait_queue *queue)
-{ *queue = (struct kernel_wait_queue){.initialized = 1}; }
+{ *queue = (struct kernel_wait_queue){.initialized = 1};kernel_raw_lock_init(&queue->lock,KERNEL_RAW_RANK_WAIT_QUEUE); }
 enum kernel_scheduler_status kernel_wait_queue_wake_all(struct kernel_wait_queue *queue)
 { CHECK(queue->initialized && !queue->head && !arch_interrupt_is_enabled()); return KERNEL_SCHEDULER_STATUS_OK; }
 enum kernel_scheduler_status kernel_wait_queue_close(struct kernel_wait_queue *q)

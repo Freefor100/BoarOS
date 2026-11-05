@@ -425,7 +425,7 @@ void boaros_lwext4_wake(void *key)
 {
     /* Caller holds the buffer-cache metadata lock and a producer reference. */
     struct kernel_wait_queue *queue=channel(key);
-    if (__atomic_load_n(&queue->head,__ATOMIC_RELAXED)) {
+    if (kernel_wait_queue_registrations(queue)) {
         KERNEL_IRQ_SCOPE(irq);
         if (kernel_wait_queue_wake_all(queue)!=KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
     }

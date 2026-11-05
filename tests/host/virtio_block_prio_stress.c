@@ -29,7 +29,7 @@ void riscv_plic_unregister(uint32_t source, void *owner)
 { (void)source; (void)owner; }
 
 void kernel_wait_queue_init(struct kernel_wait_queue *queue)
-{ memset(queue, 0, sizeof(*queue)); }
+{ memset(queue, 0, sizeof(*queue));kernel_raw_lock_init(&queue->lock,KERNEL_RAW_RANK_WAIT_QUEUE); }
 
 enum kernel_scheduler_status kernel_wait_node_bind(struct kernel_wait_queue *queue,
     struct kernel_wait_node *node, const struct kernel_wait_token *token)
@@ -265,20 +265,22 @@ static void test_quota_and_anti_starvation(unsigned version)
     low_reqs[3] = NULL;
     assert(low_slots_under_cap(&device));
 
-    /* With slots.head != NULL (high priority reader waiting), low priority must yield */
+    /* A registered high priority reader makes low priority yield. */
     struct kernel_wait_node reader_waiter = {0};
     device.slots.head = &reader_waiter;
+    __atomic_store_n(&device.slots.registrations,1,__ATOMIC_RELEASE);
     assert(try_reserve_request(&device, KERNEL_BLOCK_PRIO_LOW) == NULL);
 
     /* High priority request CAN allocate */
     struct block_request *high_extra = try_reserve_request(&device, KERNEL_BLOCK_PRIO_HIGH);
     assert(high_extra != NULL);
     device.slots.head = NULL;
+    __atomic_store_n(&device.slots.registrations,0,__ATOMIC_RELEASE);
 
     /* Release high_extra */
     release_request_owner(&device, high_extra);
 
-    /* Now with slots.head == NULL, low priority request CAN allocate */
+    /* Without a registered reader, low priority can allocate. */
     low_reqs[3] = try_reserve_request(&device, KERNEL_BLOCK_PRIO_LOW);
     assert(low_reqs[3] != NULL);
 
@@ -329,9 +331,11 @@ static void test_wait_queue_isolation(unsigned version)
     struct kernel_wait_node sentinel_high = {0};
     struct kernel_wait_node sentinel_low = {0};
 
-    /* Scenario A: slots.head != NULL -> release_request must wake slots but NOT slots_low */
+    /* A registered reader receives the wake before low priority waiters. */
     device.slots.head = &sentinel_high;
     device.slots_low.head = &sentinel_low;
+    __atomic_store_n(&device.slots.registrations,1,__ATOMIC_RELEASE);
+    __atomic_store_n(&device.slots_low.registrations,1,__ATOMIC_RELEASE);
     mock_slots_wakes = 0;
     mock_slots_low_wakes = 0;
 
@@ -339,20 +343,22 @@ static void test_wait_queue_isolation(unsigned version)
     assert(mock_slots_wakes == 1);
     assert(mock_slots_low_wakes == 0); /* slots_low NOT woken because readers are queued */
 
-    /* Scenario B: slots.head == NULL -> release_request wakes BOTH slots and slots_low */
+    /* With no registered reader, release also notifies low priority waiters. */
     device.slots.head = NULL;
+    __atomic_store_n(&device.slots.registrations,0,__ATOMIC_RELEASE);
     struct block_request *r2 = try_reserve_request(&device, KERNEL_BLOCK_PRIO_LOW);
     assert(r2 != NULL);
 
     mock_slots_wakes = 0;
     mock_slots_low_wakes = 0;
     release_request(&device, r2);
-    assert(mock_slots_wakes == 0); /* slots.head was NULL, so wake() skipped it */
+    assert(mock_slots_wakes == 0);
     assert(mock_slots_low_wakes == 1); /* slots_low WAS woken */
 
-    /* Reset heads */
+    /* End the modeled registrations before device release. */
     device.slots.head = NULL;
     device.slots_low.head = NULL;
+    __atomic_store_n(&device.slots_low.registrations,0,__ATOMIC_RELEASE);
     g_test_device = NULL;
 
     end_call(&device, 0);

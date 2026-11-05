@@ -8,12 +8,14 @@
 #define __wrap_kernel_raw_lock_acquire inherited_raw_acquire
 #define __wrap_kernel_raw_lock_release inherited_raw_release
 #define kernel_wait_backend_switch inherited_backend_switch
+#define kernel_wait_backend_switch_locked inherited_backend_switch_locked
 #include "../host/sleep_lock.c"
 #pragma GCC diagnostic pop
 #undef main
 #undef __wrap_kernel_raw_lock_acquire
 #undef __wrap_kernel_raw_lock_release
 #undef kernel_wait_backend_switch
+#undef kernel_wait_backend_switch_locked
 static uint64_t clock_ticks=100;
 static unsigned mode,attempt_seen,attempt_go,grant_seen,grant_go,watch_cost,cost_waiting;
 static unsigned resumed_seen,resume_go,acquired,release_go,release_seen,release_publish_go;
@@ -122,3 +124,13 @@ int main(int argc,char **argv)
     publish(&quit_worker);assert(!pthread_join(thread,NULL));
     puts("PASS actual resource grant/revoke boundaries: delayed observer publication, FIFO token and scope owners returned");
 }
+
+#if BOAROS_MAX_CPUS > 1
+enum kernel_scheduler_status kernel_wait_backend_switch_locked(struct kernel_task *task,
+    struct kernel_raw_guard *handoff)
+{
+    assert(handoff && handoff->lock == &kernel_wait_domain);
+    kernel_raw_lock_release(handoff);
+    return kernel_wait_backend_switch(task);
+}
+#endif

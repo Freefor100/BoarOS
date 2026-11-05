@@ -136,6 +136,7 @@ static void barrier(pthread_barrier_t *b)
 }
 enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *t)
 {
+
     if (block_handshake) {
         barrier(&parked);
         barrier(&proceed);
@@ -526,3 +527,13 @@ int main(void)
     puts("SEM CORE HOST PASS");
     return 0;
 }
+
+#if BOAROS_MAX_CPUS > 1
+enum kernel_scheduler_status kernel_wait_backend_switch_locked(struct kernel_task *task,
+    struct kernel_raw_guard *handoff)
+{
+    assert(handoff && handoff->lock == &kernel_wait_domain);
+    kernel_raw_lock_release(handoff);
+    return kernel_wait_backend_switch(task);
+}
+#endif

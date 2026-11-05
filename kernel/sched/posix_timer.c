@@ -597,7 +597,7 @@ int kernel_posix_cpu_sleep(struct kernel_task *caller,int32_t clock,int absolute
         if(!cpu_target_locked(&target))error=-KERNEL_ESRCH;
         else {
             if(caller->cpu_sleep)__builtin_trap();
-            if(kernel_wait_prepare_locked(0,0,1,&sleep->token))__builtin_trap();
+            if(kernel_wait_prepare(0,0,1,&sleep->token))__builtin_trap();
             caller->cpu_sleep=sleep;arm_locked(&sleep->timer);
         }
     }

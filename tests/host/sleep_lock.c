@@ -88,6 +88,7 @@ void kernel_wait_backend_ready(struct kernel_task *task)
 { __atomic_store_n(&granted[host_of(task)->id - 1], 1, __ATOMIC_RELEASE); __atomic_store_n(host_of(task)->dispatch, 1, __ATOMIC_RELEASE); }
 enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *task)
 {
+
     { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); kernel_wait_switch_finish_locked(task); }
     while (!__atomic_load_n(&ready, __ATOMIC_ACQUIRE)) sched_yield();
     { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); task->wait.on_cpu = 1; ready = 0; }
@@ -465,3 +466,13 @@ int main(void)
     puts("sleep lock: queued grant avoids park/MM switch; 50us expiry and real single-CPU inventory retain sleeping path; IRQ, final notifier borrow and owners preserved");
     puts("sleep lock: deterministic FIFO writer boundary, reserved grants and 1/8/32 waiters passed");
 }
+
+#if BOAROS_MAX_CPUS > 1
+enum kernel_scheduler_status kernel_wait_backend_switch_locked(struct kernel_task *task,
+    struct kernel_raw_guard *handoff)
+{
+    assert(handoff && handoff->lock == &kernel_wait_domain);
+    kernel_raw_lock_release(handoff);
+    return kernel_wait_backend_switch(task);
+}
+#endif

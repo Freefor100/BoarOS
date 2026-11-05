@@ -74,7 +74,7 @@ int signal_timer_post_locked(struct kernel_pid *p,int thread,struct signal_queue
 void kernel_wait_cursor_wake(struct kernel_wait_cursor *cursor,int all){(void)cursor;(void)all;abort();}
 enum kernel_scheduler_status kernel_scheduler_wake_signal(struct kernel_task *t){(void)t;abort();}
 static unsigned sleep_mode,sleep_notified;
-enum kernel_scheduler_status kernel_wait_prepare_locked(struct kernel_wait_queue *q,uint64_t deadline,int interruptible,struct kernel_wait_token *token)
+enum kernel_scheduler_status kernel_wait_prepare(struct kernel_wait_queue *q,uint64_t deadline,int interruptible,struct kernel_wait_token *token)
 {assert(!q&&!deadline&&interruptible&&kernel_cpu_current()->raw_locks);*token=(struct kernel_wait_token){&task,1};return 0;}
 int kernel_wait_notify_locked(const struct kernel_wait_token *token,uint32_t reason)
 {assert(token->task==&task&&reason==KERNEL_WAIT_WOKEN&&kernel_cpu_current()->raw_locks);sleep_notified++;return 1;}

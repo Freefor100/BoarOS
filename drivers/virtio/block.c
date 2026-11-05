@@ -300,7 +300,7 @@ static uint64_t read_capacity(struct virtio_block_device *device)
 static void wake(struct kernel_wait_queue *queue)
 {
     /* 这些私有队列只在设备保护内登记；锁外finish只能移除节点。 */
-    if (__atomic_load_n(&queue->head,__ATOMIC_RELAXED) &&
+    if (kernel_wait_queue_registrations(queue) &&
         kernel_wait_queue_wake_all(queue) != KERNEL_SCHEDULER_STATUS_OK)
         __builtin_trap();
 }
@@ -336,7 +336,7 @@ static void fail_device(struct virtio_block_device *device, enum kernel_block_st
         }
         /* 本轮收割中先完成的owner也必须收到通知，不能被后面的坏used项截断。 */
         if (r->state == 3) {
-            if (r->completion->head) device->statistics.wakes++;
+            if (kernel_wait_queue_registrations(r->completion)) device->statistics.wakes++;
             wake(r->completion);
         }
     }
@@ -455,7 +455,7 @@ static void harvest_used(struct virtio_block_device *device, uint32_t pending)
         r->state = 3;
 #if BOAROS_COST_DIAGNOSTICS
         r->cost_completed = kernel_cost_clock();
-        r->cost_woken = r->completion->head != NULL;
+        r->cost_woken = kernel_wait_queue_registrations(r->completion) != 0;
         enum kernel_cost_metric metric = (enum kernel_cost_metric)(COST_DEVICE0_REQUESTS + r->cost_device * 8);
         kernel_cost_add_tag(r->cost_tag, (enum kernel_cost_metric)(metric + 1), 1);
         if (r->result != KERNEL_BLOCK_STATUS_OK) kernel_cost_add_tag(r->cost_tag, (enum kernel_cost_metric)(metric + 2), 1);
@@ -472,7 +472,7 @@ static void harvest_used(struct virtio_block_device *device, uint32_t pending)
         }
         completed |= UINT32_C(1) << (offset / REQUEST_STRIDE);
         if (first) {
-            if (r->completion->head) device->statistics.wakes++;
+            if (kernel_wait_queue_registrations(r->completion)) device->statistics.wakes++;
             wake(r->completion);
         }
 #if BOAROS_COST_DIAGNOSTICS
@@ -580,7 +580,8 @@ static void end_call(struct virtio_block_device *device, int barrier)
 }
 static int low_slots_can_progress(const struct virtio_block_device *device)
 {
-    if (device->slots.head != NULL || device->descriptors.head != NULL) return 0;
+    if (kernel_wait_queue_registrations(&device->slots) ||
+        kernel_wait_queue_registrations(&device->descriptors)) return 0;
     unsigned total = slot_count(device);
     unsigned reserve = total > 8 ? 4 : (total > 4 ? 2 : 1);
     unsigned free_count = 0;
@@ -611,7 +612,8 @@ static struct block_request *try_reserve_request(struct virtio_block_device *dev
     if (prio == KERNEL_BLOCK_PRIO_LOW) {
         /* Anti-starvation: if any high/normal priority request is waiting on
          * slots or descriptors, low priority must yield immediately. */
-        if (device->slots.head != NULL || device->descriptors.head != NULL) return 0;
+        if (kernel_wait_queue_registrations(&device->slots) ||
+            kernel_wait_queue_registrations(&device->descriptors)) return 0;
         /* Reserve safety slots for incoming foreground/high-priority requests */
         if (free_count <= reserve) return 0;
     }
@@ -641,8 +643,12 @@ static struct block_request *reserve_request(struct virtio_block_device *device)
 }
 static void release_request_owner(struct virtio_block_device *device, struct block_request *r)
 {
-    if (r->state != 1 || r->owner != kernel_io_context_current() || !device->active || r->done.head)
+    if (r->state != 1 || r->owner != kernel_io_context_current() || !device->active)
         __builtin_trap();
+    {
+        KERNEL_RAW_SCOPE(wait_guard,&r->done.lock);
+        if (r->done.head || r->done.borrows) __builtin_trap();
+    }
     r->state = 0; r->priority = 0; r->owner = 0; r->completion = 0;
 }
 static void release_request(struct virtio_block_device *device, struct block_request *r)
@@ -650,7 +656,7 @@ static void release_request(struct virtio_block_device *device, struct block_req
     KERNEL_IRQ_LOCK_SCOPE(guard,&device->metadata);
     release_request_owner(device, r);
     wake(&device->slots);
-    if (device->slots.head == NULL && low_slots_can_progress(device)) {
+    if (!kernel_wait_queue_registrations(&device->slots) && low_slots_can_progress(device)) {
         wake(&device->slots_low);
     }
 }
@@ -1185,7 +1191,7 @@ static enum kernel_block_status transfer_batch_parts(struct virtio_block_device 
         }
         if (released) {
             wake(&device->slots);
-            if (device->slots.head == NULL && low_slots_can_progress(device)) wake(&device->slots_low);
+            if (!kernel_wait_queue_registrations(&device->slots) && low_slots_can_progress(device)) wake(&device->slots_low);
         }
         released = 0;
         if (writing && !device_live(device) && result == KERNEL_BLOCK_STATUS_OK) result = KERNEL_BLOCK_STATUS_IO;
@@ -1257,7 +1263,7 @@ static enum kernel_block_status transfer_batch_parts(struct virtio_block_device 
             }
             if (released) {
                 wake(&device->slots);
-                if (device->slots.head == NULL && low_slots_can_progress(device)) wake(&device->slots_low);
+                if (!kernel_wait_queue_registrations(&device->slots) && low_slots_can_progress(device)) wake(&device->slots_low);
             }
         }
         /* 通知可以同步触发设备完成；先收割并消费它，不能为已完成DMA登记睡眠。 */
@@ -1513,9 +1519,14 @@ enum virtio_block_status virtio_block_destroy(
         KERNEL_IRQ_LOCK_SCOPE(guard,&device->metadata);
         if (device->state != VIRTIO_BLOCK_STATE_LIVE && device->state != VIRTIO_BLOCK_STATE_FAILED)
             return VIRTIO_BLOCK_DRIVER_STATUS_STATE;
-        if (device->active || device->admission.head || device->idle.head || device->slots.head ||
-            device->slots_low.head || device->descriptors.head || device->workspaces.head || device->batch_claimed)
+        if (device->active || device->batch_claimed)
             return VIRTIO_BLOCK_DRIVER_STATUS_STATE;
+        struct kernel_wait_queue *queues[] = {&device->admission,&device->idle,&device->slots,
+            &device->slots_low,&device->descriptors,&device->workspaces};
+        for (unsigned i=0;i<sizeof(queues)/sizeof(queues[0]);i++) {
+            KERNEL_IRQ_LOCK_SCOPE(wait_guard,&queues[i]->lock);
+            if (queues[i]->head || queues[i]->borrows) return VIRTIO_BLOCK_DRIVER_STATUS_STATE;
+        }
         /* 停止新调用后才复位和释放；配置/IRQ注销仍在CPU0完成。 */
         __atomic_store_n(&device->state,VIRTIO_BLOCK_STATE_DESTROYED,__ATOMIC_RELAXED);
     }

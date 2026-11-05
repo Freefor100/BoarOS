@@ -5,8 +5,8 @@
 
 enum kernel_wait_phase { KERNEL_WAIT_FINISHED, KERNEL_WAIT_PREPARED,
     KERNEL_WAIT_COMMITTED, KERNEL_WAIT_NOTIFIED };
-/* The wait owner retains bound nodes through finish. Queue links, borrows and
- * scheduler ownership remain protected by the scheduler domain. */
+/* The request owner retains its node list through finish. Each event queue
+ * protects links/cursors; only execution and ready state use the scheduler domain. */
 struct kernel_wait_record {
 #if BOAROS_MAX_CPUS > 1
     /* Generation, phase and notification reason are one atomic publication. */
@@ -23,21 +23,30 @@ struct kernel_wait_record {
 #endif
     uint32_t on_cpu, ready_pending, ready_flags, borrows;
 };
+static inline uint32_t kernel_wait_record_borrows(const struct kernel_wait_record *record)
+{
 #if BOAROS_MAX_CPUS > 1
-#define KERNEL_WAIT_GENERATION_MAX (UINT64_MAX >> 4)
+    return __atomic_load_n(&record->borrows,__ATOMIC_ACQUIRE);
+#else
+    return record->borrows;
+#endif
+}
+#if BOAROS_MAX_CPUS > 1
+#define KERNEL_WAIT_GENERATION_MAX (UINT64_MAX >> 5)
 static inline uint64_t kernel_wait_state(uint64_t generation, unsigned phase, unsigned reason)
-{ return (generation << 4) | ((uint64_t)reason << 2) | phase; }
+{ return (generation << 5) | ((uint64_t)reason << 2) | phase; }
 static inline uint64_t kernel_wait_record_load(const struct kernel_wait_record *record)
 { return __atomic_load_n(&record->state, __ATOMIC_ACQUIRE); }
 static inline uint64_t kernel_wait_record_generation(const struct kernel_wait_record *record)
-{ return kernel_wait_record_load(record) >> 4; }
+{ return kernel_wait_record_load(record) >> 5; }
 static inline unsigned kernel_wait_record_phase(const struct kernel_wait_record *record)
 { return (unsigned)(kernel_wait_record_load(record) & 3U); }
 static inline unsigned kernel_wait_record_reason(const struct kernel_wait_record *record)
 { return (unsigned)((kernel_wait_record_load(record) >> 2) & 3U); }
 static inline void kernel_wait_record_store(struct kernel_wait_record *record,
     uint64_t generation, unsigned phase, unsigned reason)
-{ __atomic_store_n(&record->state, kernel_wait_state(generation,phase,reason), __ATOMIC_RELEASE); }
+{ __atomic_store_n(&record->state, kernel_wait_state(generation,phase,reason) |
+        ((uint64_t)record->interruptible<<4), __ATOMIC_RELEASE); }
 static inline void kernel_wait_record_transition(struct kernel_wait_record *record,
     uint64_t generation, unsigned phase, unsigned reason)
 { kernel_wait_record_store(record,generation,phase,reason); }
@@ -56,11 +65,31 @@ static inline void kernel_wait_record_transition(struct kernel_wait_record *reco
     uint64_t generation, unsigned phase, unsigned reason)
 { (void)generation; record->reason=reason; record->phase=phase; }
 #endif
+static inline int kernel_wait_record_interruptible(const struct kernel_wait_record *record)
+{
+#if BOAROS_MAX_CPUS > 1
+    return !!(kernel_wait_record_load(record)&16U);
+#else
+    return record->interruptible;
+#endif
+}
+static inline uint64_t kernel_wait_signal_generation(const struct kernel_wait_record *record)
+{
+#if BOAROS_MAX_CPUS > 1
+    uint64_t state=kernel_wait_record_load(record);
+    unsigned phase=(unsigned)(state&3U);
+    return (state&16U) && (phase==KERNEL_WAIT_PREPARED || phase==KERNEL_WAIT_COMMITTED)
+        ? state>>5 : 0;
+#else
+    return record->interruptible && (record->phase==KERNEL_WAIT_PREPARED ||
+        record->phase==KERNEL_WAIT_COMMITTED) ? record->generation : 0;
+#endif
+}
 extern struct kernel_raw_lock kernel_wait_domain;
 void kernel_wait_domain_init(void);
 void kernel_wait_record_init(struct kernel_wait_record *);
-/* Initialized backend, valid queue/token, caller owns wait domain. */
-enum kernel_scheduler_status kernel_wait_prepare_locked(struct kernel_wait_queue *,uint64_t,int,struct kernel_wait_token *);
+/* Node operations require their queue lock; notify/switch_finish require the
+ * scheduler domain. Queue locks must be released before notifying a task. */
 enum kernel_scheduler_status kernel_wait_node_bind_locked(struct kernel_wait_queue *,struct kernel_wait_node *,const struct kernel_wait_token *);
 int kernel_wait_notify_locked(const struct kernel_wait_token *, uint32_t);
 void kernel_wait_node_add_locked(struct kernel_wait_queue *, struct kernel_wait_node *);
@@ -73,8 +102,7 @@ struct kernel_wait_cursor {
     uint64_t event;
     struct kernel_task *recipient;
 };
-int kernel_wait_cursor_prepare_event_locked(struct kernel_wait_queue *,struct kernel_wait_cursor *,uint64_t,struct kernel_task *);
-int kernel_wait_cursor_prepare_locked(struct kernel_wait_queue *, struct kernel_wait_cursor *, int);
+int kernel_wait_cursor_prepare_event(struct kernel_wait_queue *,struct kernel_wait_cursor *,uint64_t,struct kernel_task *);
 void kernel_wait_cursor_wake(struct kernel_wait_cursor *, int);
 /* Caller keeps the queue alive and holds the condition lock. Waiters register
  * under that lock, or recheck the condition under it after binding. */
@@ -84,7 +112,7 @@ void kernel_wait_cursor_advance(struct kernel_wait_cursor *);
 void kernel_wait_cursor_end(struct kernel_wait_cursor *);
 void kernel_wait_task_pin(struct kernel_task *);
 void kernel_wait_task_unpin(struct kernel_task *);
-/* wait_domain held; node borrows ended, task borrow protects revalidation/move. */
+/* Both queues held in address order; node borrows ended, task borrow protects move. */
 enum kernel_scheduler_status kernel_wait_node_move_locked(struct kernel_wait_node *, struct kernel_wait_queue *);
 
 /* 构建期绑定：真实任务、期限索引和切换在 wait.c；宿主仅替换机器边界。 */
@@ -97,8 +125,12 @@ uint64_t kernel_wait_backend_time(void);
 void kernel_wait_backend_commit(struct kernel_task *, uint64_t, int);
 void kernel_wait_backend_notify(struct kernel_task *, uint32_t);
 void kernel_wait_backend_ready(struct kernel_task *);
-/* Success returns on this task's CPU after notification and scheduler handoff.
- * Its NOTIFIED reason is stable until the current owner finishes the token. */
+/* Success resumes this owner with a stable NOTIFIED result until finish. */
 enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *);
+#if BOAROS_MAX_CPUS > 1
+/* SMP consumes the commit guard before the physical stack switch. */
+struct kernel_raw_guard;
+enum kernel_scheduler_status kernel_wait_backend_switch_locked(struct kernel_task *, struct kernel_raw_guard *);
+#endif
 void kernel_wait_backend_quiesce(void);
 #endif

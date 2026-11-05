@@ -316,7 +316,7 @@ static void request_thread_termination_locked(struct kernel_task *task)
         task->vfork_wait_child->vfork_child = 0;
         task->vfork_wait_child = 0;
         task->vfork_waiting = 0;
-        if (task->state == KERNEL_THREAD_STATE_BLOCKED && task->default_wait_node.queue == &task->vfork_done_queue) {
+        if (task->state == KERNEL_THREAD_STATE_BLOCKED && __atomic_load_n(&task->default_wait_node.queue,__ATOMIC_ACQUIRE) == &task->vfork_done_queue) {
             struct kernel_wait_token token = {task, kernel_wait_record_generation(&task->wait)};
             (void)kernel_wait_notify_locked(&token, KERNEL_WAIT_SIGNALLED);
         }
@@ -327,8 +327,9 @@ static void request_thread_termination_locked(struct kernel_task *task)
         if (task->wait.on_cpu) task->wait.ready_pending = 1;
         else ready_enqueue_locked(task, 0);
     }
-    if (task->wait.interruptible) {
-        struct kernel_wait_token token = {task, kernel_wait_record_generation(&task->wait)};
+    uint64_t generation=kernel_wait_signal_generation(&task->wait);
+    if (generation) {
+        struct kernel_wait_token token = {task,generation};
         (void)kernel_wait_notify_locked(&token, KERNEL_WAIT_SIGNALLED);
     }
 }
@@ -369,7 +370,7 @@ void process_group_request_exit(struct kernel_task *task,
         if (single) {
             if (leader != task || leader->group_next != leader || leader->group_previous != leader) __builtin_trap();
             request_thread_termination_locked(leader);
-            notify = kernel_wait_cursor_prepare_locked(&leader->group_wait_queue, &cursor, 1);
+            notify = kernel_wait_cursor_prepare(&leader->group_wait_queue, &cursor);
             if (notify) scheduler_task_get_locked(leader);
         } else scheduler_task_get_locked(leader);
     }
@@ -509,7 +510,7 @@ void wake_waiting_parent(struct kernel_task *child)
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         struct kernel_task *target = child->parent;
         if (target) {
-            notify = kernel_wait_cursor_prepare_locked(&target->child_exit_queue, &cursor, 1);
+            notify = kernel_wait_cursor_prepare(&target->child_exit_queue, &cursor);
             /* 空队列/单任务通知已在域内结束；只有跨解锁的游标才需固定容器。 */
             if (notify) { scheduler_task_get_locked(target); parent = target; }
         }
@@ -1580,15 +1581,30 @@ void kernel_scheduler_wait_cleanup(uint64_t retry_deadline)
     }
 }
 
+static void join_notifications_finish(struct kernel_thread_join *join)
+{
+    if (!join->waiters.initialized) return;
+    for (;;) {
+        {
+            KERNEL_IRQ_LOCK_SCOPE(guard,&join->waiters.lock);
+            if (!join->waiters.borrows) return;
+        }
+        /* The task link is gone, but a remote switch-finish cursor may still
+         * unlock this stack/worker-owned queue after its last node release. */
+        kernel_wait_backend_quiesce();
+    }
+}
 void kernel_thread_join(struct kernel_thread_join *join)
 {
     kernel_assert_service_context();
     KERNEL_IRQ_SCOPE(join_irq);
     if (!join) __builtin_trap();
+    int empty;
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        if (!join->task) return;
+        empty=!join->task;
     }
+    if (empty) {join_notifications_finish(join);return;}
     for (;;) {
         struct kernel_wait_token token;
         enum kernel_wait_wake_reason reason;
@@ -1610,6 +1626,7 @@ void kernel_thread_join(struct kernel_thread_join *join)
         if (!pending) {
             if (task && release_task_storage(task, KERNEL_SCHEDULER_STATUS_OK) !=
                         KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+            join_notifications_finish(join);
             return;
         }
     }
@@ -2297,7 +2314,7 @@ static void process_begin_exit(struct kernel_task *current,
 {
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        if (kernel_wait_record_phase(&current->wait) != KERNEL_WAIT_FINISHED || current->wait.nodes || current->wait.borrows)
+        if (kernel_wait_record_phase(&current->wait) != KERNEL_WAIT_FINISHED || current->wait.nodes || kernel_wait_record_borrows(&current->wait))
             __builtin_trap();
         current->proc_exiting = 1;
         if (!current->group_exiting) current->completion = *completion;
@@ -2363,7 +2380,7 @@ static void kernel_thread_finish(
         exited_append_locked(current);
         /* The cleanup task must be runnable before choosing next. Join
          * notification waits for switch_finish to release the old stack. */
-        notify_cleanup = kernel_wait_cursor_prepare_locked(&scheduler.cleanup_queue, &cleanup_cursor, 1);
+        notify_cleanup = kernel_wait_cursor_prepare(&scheduler.cleanup_queue, &cleanup_cursor);
         scheduler_account_runtime_locked();
         next = scheduler_select_next_locked(cpu, current, scheduler.cleanup_task != 0);
         if (!next) __builtin_trap();

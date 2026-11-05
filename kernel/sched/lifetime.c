@@ -3,8 +3,7 @@
 
 static void domain_owned(void)
 {
-    struct kernel_raw_guard *guard = kernel_cpu_current()->raw_locks;
-    if (!guard || guard->lock != &kernel_wait_domain) __builtin_trap();
+    if (!kernel_raw_lock_owned(&kernel_wait_domain)) __builtin_trap();
 }
 
 void scheduler_task_get_locked(struct kernel_task *task)
@@ -54,7 +53,7 @@ struct kernel_task *kernel_task_find_by_tid(kernel_pid_t tid)
 static void queue_disposal_locked(struct kernel_task *task)
 {
     if (task->retirement != 2 || task->storage_borrows) return;
-    if (task->wait.on_cpu || task->wait.borrows || task->wait.nodes ||
+    if (task->wait.on_cpu || kernel_wait_record_borrows(&task->wait) || task->wait.nodes ||
         kernel_wait_record_phase(&task->wait) != KERNEL_WAIT_FINISHED) __builtin_trap();
     task->retirement = 3;
     task->retired_next = scheduler.retired_tasks;
@@ -156,7 +155,7 @@ void scheduler_task_retire_locked(struct kernel_task *task)
     domain_owned();
     if (task->retirement != 1 || !scheduler.retired_pending ||
         task->stack_physical_address != KERNEL_THREAD_NO_PAGE ||
-        task->wait.on_cpu || task->wait.borrows || task->wait.nodes || kernel_wait_record_phase(&task->wait) != KERNEL_WAIT_FINISHED)
+        task->wait.on_cpu || kernel_wait_record_borrows(&task->wait) || task->wait.nodes || kernel_wait_record_phase(&task->wait) != KERNEL_WAIT_FINISHED)
         __builtin_trap();
     task->retirement = 2;
     queue_disposal_locked(task);
@@ -284,7 +283,7 @@ enum kernel_scheduler_status scheduler_task_claim_exit_locked(struct kernel_task
     domain_owned();
     if (!task || task->state != KERNEL_THREAD_STATE_EXITED || !task->exit_queued)
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-    if (task->wait.on_cpu || task->wait.borrows || task->reaping)
+    if (task->wait.on_cpu || kernel_wait_record_borrows(&task->wait) || task->reaping)
         return KERNEL_SCHEDULER_STATUS_BUSY;
     task->reaping = 1;
     return KERNEL_SCHEDULER_STATUS_OK;
@@ -348,7 +347,7 @@ int scheduler_cleanup_ready_locked(void)
     /* Borrowed retirement is pending ownership, not executable work. A
      * temporary event/old-stack owner must run before this head can be reaped. */
     return scheduler.retired_tasks || (task && !task->reaping &&
-        !task->wait.on_cpu && !task->wait.borrows);
+        !task->wait.on_cpu && !kernel_wait_record_borrows(&task->wait));
 }
 
 void scheduler_task_wait_claim_release(struct kernel_task *task)
@@ -361,11 +360,11 @@ void scheduler_task_wait_claim_release(struct kernel_task *task)
         scheduler_task_claim_release_locked(task);
         if (task->parent) {
             parent = task->parent;
-            wake_parent = kernel_wait_cursor_prepare_locked(&parent->child_exit_queue, &parent_cursor, 1);
+            wake_parent = kernel_wait_cursor_prepare(&parent->child_exit_queue, &parent_cursor);
             if (wake_parent) scheduler_task_get_locked(parent);
         }
         if (task->exit_queued)
-            wake_cleanup = kernel_wait_cursor_prepare_locked(&scheduler.cleanup_queue, &cleanup_cursor, 1);
+            wake_cleanup = kernel_wait_cursor_prepare(&scheduler.cleanup_queue, &cleanup_cursor);
     }
     /* Failed user copies leave the event selectable. Queue/cursor ownership
      * spans notification; callbacks and the parent's final put stay outside. */

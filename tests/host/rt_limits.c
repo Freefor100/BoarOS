@@ -100,7 +100,7 @@ static void departures(void)
         setup();CHECK(!kernel_sched_policy_set(&task.scheduling,1,10,0));task.rttime_ticks=7;task.rttime_stamp=50;
         task.resource_flags=KERNEL_RESOURCE_NPROC_CHARGED|KERNEL_RESOURCE_RTTIME_DUE;
         struct kernel_wait_token token;
-        {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);CHECK(!kernel_wait_prepare_locked(0,0,1,&token));}
+        {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);CHECK(!kernel_wait_prepare(0,0,1,&token));}
         if(state==0){CHECK(!kernel_wait_notify(&token,KERNEL_WAIT_WOKEN));CHECK(task.rttime_ticks==7);}
         else if(state<3){KERNEL_RAW_SCOPE(g,&kernel_wait_domain);kernel_wait_record_store(&task.wait,token.generation,KERNEL_WAIT_COMMITTED,KERNEL_WAIT_WOKEN);task.state=KERNEL_THREAD_STATE_BLOCKED;if(state==1)CHECK(kernel_wait_notify_locked(&token,KERNEL_WAIT_WOKEN));}
         else {

@@ -16,7 +16,7 @@ struct kernel_flock_context {
 /* These two real backing inodes are permanent, so their contexts need no heap
  * lifetime. All other inode contexts are allocated only on first flock. */
 #define PERMANENT_CONTEXT { .lock={.rank=KERNEL_RAW_RANK_OBJECT, .initialized=KERNEL_RAW_INITIALIZED}, \
-    .waiters={.initialized=KERNEL_WAIT_QUEUE_INITIALIZED} }
+    .waiters=KERNEL_WAIT_QUEUE_STATIC_INITIALIZER }
 static struct kernel_flock_context anonymous_context=PERMANENT_CONTEXT;
 static struct kernel_flock_context console_context=PERMANENT_CONTEXT;
 static struct kernel_flock_identity anonymous_identity={.context=&anonymous_context};

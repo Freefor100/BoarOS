@@ -2458,7 +2458,7 @@ static void netlink_cookie_finish(struct kernel_netlink_cookie **owner,unsigned 
              * reaper must not finish a token belonging to another task. */
             KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
             struct kernel_wait_record *record=kernel_wait_record_of(cookie->token.task);
-            if(kernel_wait_record_phase(record)!=KERNEL_WAIT_FINISHED || record->nodes || record->borrows)__builtin_trap();
+            if(kernel_wait_record_phase(record)!=KERNEL_WAIT_FINISHED || record->nodes || kernel_wait_record_borrows(record))__builtin_trap();
             cookie->token=(struct kernel_wait_token){0};
         }
     }
@@ -3415,7 +3415,7 @@ void kernel_socket_network_hooks(void (*timer_wake)(void *),struct kernel_wait_q
     kernel_socket_protocol_leave(&protocol);
     if (!work_queue && old_queue) for (;;) {
         int borrowed;
-        {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);borrowed=old_queue->borrows!=0;}
+        {KERNEL_IRQ_LOCK_SCOPE(guard,&old_queue->lock);borrowed=old_queue->borrows!=0;}
         if(!borrowed)break;
         /* Hooks no longer admit cursors; their real queue borrows cover lock-free delivery. */
         kernel_wait_backend_quiesce();

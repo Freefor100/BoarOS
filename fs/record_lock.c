@@ -220,7 +220,7 @@ void kernel_record_lock_state_init(struct kernel_record_lock_state *state)
 
 int kernel_record_lock_state_empty(const struct kernel_record_lock_state *state)
 {
-    return state->root == 0 && state->waiters.head == 0;
+    return state->root == 0 && !kernel_wait_queue_registrations(&state->waiters);
 }
 
 int kernel_record_lock_get(struct kernel_record_lock_state *state,

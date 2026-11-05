@@ -225,13 +225,18 @@ void kernel_wait_backend_notify(struct kernel_task *task, uint32_t reason)
         kernel_cost_timeout(&task->cost, task->wait.deadline);
 #endif
     deadline_index_remove(task);
-    kernel_wait_node_remove_locked(&task->default_wait_node);
+    kernel_wait_queue_remove(&task->default_wait_node);
     (void)reason; /* 通知者在摘除期限索引后发布record.reason/phase。 */
     task->state = KERNEL_THREAD_STATE_READY;
 }
 void kernel_wait_backend_ready(struct kernel_task *task) { ready_enqueue_locked(task, task->wait.ready_flags); }
 enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *task)
 { return scheduler_switch_current_away(task); }
+#if BOAROS_MAX_CPUS > 1
+enum kernel_scheduler_status kernel_wait_backend_switch_locked(struct kernel_task *task,
+    struct kernel_raw_guard *guard)
+{ return scheduler_switch_current_away_locked(task, guard); }
+#endif
 void kernel_wait_backend_quiesce(void)
 {
     uintptr_t irq = arch_interrupt_save();
@@ -291,8 +296,9 @@ enum kernel_scheduler_status kernel_scheduler_wake_signal(struct kernel_task *ta
     if (!kernel_wait_backend_initialized()) return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
     if (!task) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-    if (task->wait.interruptible) {
-        struct kernel_wait_token token = {task, kernel_wait_record_generation(&task->wait)};
+    uint64_t generation=kernel_wait_signal_generation(&task->wait);
+    if (generation) {
+        struct kernel_wait_token token = {task,generation};
         kernel_wait_notify_locked(&token, KERNEL_WAIT_SIGNALLED);
     }
     return KERNEL_SCHEDULER_STATUS_OK;

@@ -12,7 +12,7 @@
 
 struct kernel_signal_fd {
     struct kernel_open_file_description file;
-    /* The wait domain protects this shared OFD mask and pending publication. */
+    /* 一个OFD可被多条source队列订阅，筛选值独立于各自队列锁发布。 */
     uint64_t mask;
 };
 struct signal_fd_info {
@@ -59,8 +59,8 @@ enum kernel_files_status kernel_files_signalfd(struct kernel_files *files,struct
         struct kernel_wait_cursor cursor={0};
         {
             KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-            ((struct kernel_signal_fd *)file)->mask=mask;
-            (void)kernel_wait_cursor_prepare_locked(source,&cursor,1);
+            __atomic_store_n(&((struct kernel_signal_fd *)file)->mask,mask,__ATOMIC_RELEASE);
+            (void)kernel_wait_cursor_prepare(source,&cursor);
         }
         if(cursor.queue)kernel_wait_cursor_wake(&cursor,1);
         *result=fd;return 0;
@@ -92,7 +92,7 @@ uint32_t kernel_signal_fd_poll(struct kernel_open_file_description *file,struct 
     if(!source)return KERNEL_POLLERR;
     KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
     if(queue)*queue=source;
-    return kernel_signal_fd_pending_locked(task,((struct kernel_signal_fd *)file)->mask)?KERNEL_POLLIN:0;
+    return kernel_signal_fd_pending_locked(task,__atomic_load_n(&((struct kernel_signal_fd *)file)->mask,__ATOMIC_ACQUIRE))?KERNEL_POLLIN:0;
 }
 int64_t kernel_signal_fd_read(struct kernel_open_file_description *file,struct kernel_mm *mm,
     const struct kernel_uaccess_iovec *iov,size_t count,uint64_t length)

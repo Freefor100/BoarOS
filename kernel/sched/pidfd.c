@@ -66,7 +66,7 @@ static void notify_identity(struct kernel_pid *id)
         if(!o)return;
         if(o->references==UINT32_MAX)__builtin_trap();
         o->references++;
-        (void)kernel_wait_cursor_prepare_locked(&o->changed,&cursor,1);
+        (void)kernel_wait_cursor_prepare(&o->changed,&cursor);
     }
     if(cursor.queue)kernel_wait_cursor_wake(&cursor,1);
     observer_put(o);

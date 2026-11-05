@@ -71,6 +71,7 @@ static void cancel_at_protocol_entry(void)
 { CHECK(!scopes[actor]);protocol_cancel=0;CHECK(registered && registered->previous);kernel_epoll_abort_wait(registered);longjmp(cancelled,1); }
 static unsigned notification_depth;
 static uint64_t notification_sequence, callbacks;
+static void (*remove_sync_interleave)(struct kernel_wait_node *);
 uint64_t kernel_wait_notification_sequence(void)
 { return notification_depth ? notification_sequence : 0; }
 
@@ -110,10 +111,19 @@ void kernel_wait_node_init_callback(struct kernel_wait_node *n,kernel_wait_callb
 void kernel_wait_queue_add(struct kernel_wait_queue *q,struct kernel_wait_node *n)
 { CHECK(!n->queue); n->queue=q; n->previous=q->tail; if(q->tail)q->tail->next=n;else q->head=n;q->tail=n; }
 void kernel_wait_queue_remove(struct kernel_wait_node *n)
-{ struct kernel_wait_queue *q=n->queue; CHECK(q); if(n->previous)n->previous->next=n->next;else q->head=n->next;
+{ struct kernel_wait_queue *q=n->queue; if(!q)return;CHECK(q->initialized); if(n->previous)n->previous->next=n->next;else q->head=n->next;
   if(n->next)n->next->previous=n->previous;else q->tail=n->previous;n->queue=NULL;n->next=n->previous=NULL; }
 enum kernel_scheduler_status kernel_wait_node_remove_sync(struct kernel_wait_node *node)
-{ if (node->queue) kernel_wait_queue_remove(node); return KERNEL_SCHEDULER_STATUS_OK; }
+{
+    struct kernel_wait_queue *queue=node->queue;
+    if(remove_sync_interleave) {
+        void (*run)(struct kernel_wait_node *)=remove_sync_interleave;remove_sync_interleave=NULL;run(node);
+    }
+    /* Model the source lock acquisition after a queue pointer snapshot. */
+    if(queue) {CHECK(queue->initialized);kernel_wait_queue_remove(node);}
+    CHECK(!kernel_wait_node_references(node));
+    return KERNEL_SCHEDULER_STATUS_OK;
+}
 enum kernel_scheduler_status kernel_wait_queue_wake_all(struct kernel_wait_queue *q)
 {
     if (!notification_depth++) notification_sequence++;
@@ -502,9 +512,33 @@ static void retiring_target(void)
     }
     puts("PASS epoll target retirement: zero-ref linked target is never revived or queried by wait/poll");
 }
+static void complete_pollfree(struct kernel_wait_node *node)
+{
+    struct kernel_wait_queue *source=&target_wait[0];
+    CHECK(node->references==1 && source->borrows==1);
+    node->callback(node,KERNEL_WAIT_POLL_FREE);
+    CHECK(!source->head && !node->queue);
+    node->references--;source->borrows--;source->closed=1;
+    CHECK(!kernel_wait_queue_destroy(source));
+}
+static void pollfree_during_delete(void)
+{
+    setup(0);
+    struct kernel_wait_node *node=target_wait[0].head;
+    CHECK(node);
+    /* A captured POLLFREE callback can finish and release its source while
+     * DEL drains its node. DEL must have detached under epoll state first. */
+    node->references=1;target_wait[0].borrows=1;
+    remove_sync_interleave=complete_pollfree;
+    control(KERNEL_EPOLL_CTL_DEL,0,0);
+    CHECK(!remove_sync_interleave && !target_wait[0].initialized && !epfile.epoll->items_root);
+    teardown();
+    puts("PASS epoll DEL detaches before a POLLFREE cursor releases its source");
+}
 
 int main(int argc, char **argv)
 {
+    pollfree_during_delete();
     retiring_target();
     setup(0);struct linux_epoll_event local_event;unsigned services=service_entries;
     CHECK(wait_events(&local_event,1)==1 && service_entries==services);
