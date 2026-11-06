@@ -40,27 +40,48 @@
 #define LINUX_O_SYNC UINT64_C(04010000)
 #define LINUX_O_PATH UINT64_C(010000000)
 #define LINUX_O_TMPFILE UINT64_C(020200000)
+#define LINUX_O_EMPTYPATH (UINT64_C(1) << 26)
+#define LINUX_OPENAT2_REGULAR (UINT64_C(1) << 32)
 
-static int validate_open_flags(uint64_t flags, uint32_t *fd_flags)
+static int validate_open_flags(uint64_t flags, uint64_t mode, uint64_t resolve,
+                               int strict, uint32_t *fd_flags)
 {
     const uint64_t write_flags = LINUX_O_CREAT | LINUX_O_TRUNC |
                                  LINUX_O_APPEND | LINUX_O_EXCL;
-    const uint64_t unsupported_flags =
+    uint64_t unsupported_flags =
         LINUX_O_DIRECT |
         LINUX_O_NOATIME |
         (LINUX_O_TMPFILE & ~LINUX_O_DIRECTORY);
-    const uint64_t known_flags = LINUX_O_ACCMODE | write_flags | LINUX_O_NOCTTY |
+    uint64_t known_flags = LINUX_O_ACCMODE | write_flags | LINUX_O_NOCTTY |
         unsupported_flags | LINUX_O_NONBLOCK | LINUX_O_DIRECTORY |
         LINUX_O_NOFOLLOW |
         LINUX_O_LARGEFILE | LINUX_O_CLOEXEC | LINUX_O_SYNC | LINUX_O_PATH;
     uint64_t access_mode = flags & LINUX_O_ACCMODE;
 
-    if (access_mode == 3U || (flags & ~known_flags) != 0U) {
+    if (strict) {
+        uint64_t tmpfile = flags & (LINUX_O_TMPFILE & ~LINUX_O_DIRECTORY);
+        int create = !!(flags & LINUX_O_CREAT) || tmpfile;
+        const uint64_t path_flags = LINUX_O_PATH | LINUX_O_DIRECTORY |
+            LINUX_O_NOFOLLOW | LINUX_O_CLOEXEC | LINUX_O_EMPTYPATH;
+        known_flags |= LINUX_OPENAT2_REGULAR | LINUX_O_EMPTYPATH;
+        unsupported_flags |= LINUX_O_EMPTYPATH;
+        if ((resolve & ~UINT64_C(0x3f)) ||
+            (resolve & KERNEL_VFS_RESOLVE_SCOPED) == KERNEL_VFS_RESOLVE_SCOPED ||
+            (mode & ~(create ? UINT64_C(07777) : UINT64_C(0))) ||
+            (tmpfile && (!(flags & LINUX_O_DIRECTORY) || access_mode == 0)) ||
+            ((flags & LINUX_OPENAT2_REGULAR) && (flags & LINUX_O_DIRECTORY)) ||
+            ((flags & LINUX_O_PATH) && (flags & ~path_flags)))
+            return -KERNEL_EINVAL;
+    }
+    if ((!strict && access_mode == 3U) || (flags & ~known_flags) != 0U) {
         return -KERNEL_EINVAL;
     }
     if ((flags & LINUX_O_DIRECTORY) != 0U && (flags & LINUX_O_CREAT) != 0U) {
         return -KERNEL_EINVAL;
     }
+    if (strict && (resolve & KERNEL_VFS_RESOLVE_CACHED) &&
+        (flags & (LINUX_O_CREAT | LINUX_O_TRUNC | (LINUX_O_TMPFILE & ~LINUX_O_DIRECTORY))))
+        return -KERNEL_EAGAIN;
     if ((flags & unsupported_flags) != 0U) {
         return -KERNEL_ENOTSUP;
     }
@@ -78,7 +99,7 @@ int kernel_files_open_pty_peer(struct kernel_files *files, struct kernel_task *c
     (void)caller;
     uint32_t fd_flags = 0, fd;
     if (flags & LINUX_O_PATH) flags &= LINUX_O_PATH | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW | LINUX_O_CLOEXEC;
-    int error = validate_open_flags(flags, &fd_flags);
+    int error = validate_open_flags(flags, 0, 0, 0, &fd_flags);
     if (error) return error;
     if (kernel_files_find_free_fd(files, &fd, &error) != KERNEL_FILES_STATUS_OK) __builtin_trap();
     if (error) return error;
@@ -142,11 +163,9 @@ int kernel_files_path_start(struct kernel_files *files,
     return *start ? kernel_vfs_path_acquire(*start) : -KERNEL_EIO;
 }
 
-static enum kernel_fs_context_status copy_path_start(
-    struct kernel_files *files, const struct kernel_fs_paths *snapshot,
-    struct kernel_mm *mm, int64_t dirfd, uint64_t user_path,
-    char *buffer, size_t capacity, struct kernel_vfs_path **start,
-    struct kernel_vfs_mount **mount, int *result)
+static enum kernel_fs_context_status copy_path(
+    struct kernel_mm *mm, uint64_t user_path, char *buffer, size_t capacity,
+    int *result)
 {
     size_t length;
     enum kernel_uaccess_status status = kernel_copy_string_from_user(mm,
@@ -154,27 +173,37 @@ static enum kernel_fs_context_status copy_path_start(
     if (status == KERNEL_UACCESS_STATUS_FAULT) *result = -KERNEL_EFAULT;
     else if (status == KERNEL_UACCESS_STATUS_TOO_LONG) *result = -KERNEL_ENAMETOOLONG;
     else if (status != KERNEL_UACCESS_STATUS_OK) return KERNEL_FS_CONTEXT_STATUS_STATE;
-    else {
-        *result = kernel_files_path_start(files, snapshot, dirfd, buffer, start);
-        if (!*result) *mount = kernel_vfs_path_mount(*start);
-    }
+    else *result=0;
     return KERNEL_FS_CONTEXT_STATUS_OK;
 }
 
-enum kernel_files_status kernel_files_openat(
+static enum kernel_fs_context_status copy_path_start(
+    struct kernel_files *files, const struct kernel_fs_paths *snapshot,
+    struct kernel_mm *mm, int64_t dirfd, uint64_t user_path,
+    char *buffer, size_t capacity, struct kernel_vfs_path **start,
+    struct kernel_vfs_mount **mount, int *result)
+{
+    enum kernel_fs_context_status status=copy_path(mm,user_path,buffer,capacity,result);
+    if (status==KERNEL_FS_CONTEXT_STATUS_OK && !*result) {
+        *result = kernel_files_path_start(files, snapshot, dirfd, buffer, start);
+        if (!*result) *mount = kernel_vfs_path_mount(*start);
+    }
+    return status;
+}
+
+static enum kernel_files_status files_open(
     struct kernel_files *files,
     const struct kernel_fs_context *fs,
     struct kernel_mm *mm,
     int64_t dirfd,
     uint64_t user_path,
     uint64_t flags,
-    uint64_t mode,
+    uint64_t mode, uint64_t resolve, int strict,
     int64_t *linux_result)
 {
     KERNEL_SERVICE_SCOPE_IF(service, 0);
     KERNEL_FS_PATHS(fs_paths, fs);
     struct kernel_open_file_description *description = 0;
-    struct kernel_vfs_mount *mount;
     KERNEL_FILES_PATH_SCOPE(start);
     char *path;
     uint32_t fd;
@@ -193,9 +222,9 @@ enum kernel_files_status kernel_files_openat(
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
     KERNEL_FILES_NOTE(files, open_calls, 1);
-    if (flags & LINUX_O_PATH)
+    if (!strict && (flags & LINUX_O_PATH))
         flags &= LINUX_O_PATH | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW | LINUX_O_CLOEXEC;
-    result = validate_open_flags(flags, &fd_flags);
+    result = validate_open_flags(flags, mode, resolve, strict, &fd_flags);
     if (result != 0) {
         KERNEL_FILES_NOTE(files, open_failures, 1);
         *linux_result = result;
@@ -222,14 +251,18 @@ enum kernel_files_status kernel_files_openat(
     if (heap_status != KERNEL_HEAP_STATUS_OK) {
         return KERNEL_FILES_STATUS_STATE;
     }
-    fs_status = copy_path_start(files, &fs_paths,
-                                                    mm,
-                                                    dirfd,
-                                                    user_path,
-                                                    path,
-                                                    KERNEL_FS_PATH_MAX,
-                                                    &start, &mount,
-                                                    &result);
+    fs_status = copy_path(mm,user_path,path,KERNEL_FS_PATH_MAX,&result);
+    if (fs_status==KERNEL_FS_CONTEXT_STATUS_OK && !result) {
+        if (path[0]=='/' && (resolve & KERNEL_VFS_RESOLVE_BENEATH)) result=-KERNEL_EXDEV;
+        else {
+            const char *selection=path;
+            if (path[0]=='/' && (resolve & KERNEL_VFS_RESOLVE_IN_ROOT)) selection=".";
+            result=kernel_files_path_start(files,&fs_paths,dirfd,selection,&start);
+        }
+        /* Normal lookup revalidates names through the backend even on a dentry
+         * hit. There is no cache-only backend walk to fall back to. */
+        if (!result && (resolve & KERNEL_VFS_RESOLVE_CACHED)) result=-KERNEL_EAGAIN;
+    }
     if (fs_status != KERNEL_FS_CONTEXT_STATUS_OK) {
         kernel_files_release_allocation(files, path);
         return KERNEL_FILES_STATUS_STATE;
@@ -240,8 +273,13 @@ enum kernel_files_status kernel_files_openat(
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
+    struct kernel_vfs_path *root=(resolve & KERNEL_VFS_RESOLVE_SCOPED) ? start : fs_paths.root;
     struct kernel_vfs_open_request request={.flags=KERNEL_VFS_OPEN_FOLLOW,
-        .mode=(uint32_t)mode,.umask=fs_paths.umask};
+        .mode=(uint32_t)mode,.umask=fs_paths.umask,.resolve=(unsigned)resolve};
+    if (flags & LINUX_OPENAT2_REGULAR) {
+        request.flags |= KERNEL_VFS_OPEN_REGULAR;
+        flags &= ~LINUX_OPENAT2_REGULAR;
+    }
     if (!(flags & LINUX_O_PATH)) {
         request.access=(flags & 3U)==0 ? 4U : (flags & 3U)==1 ? 2U : 6U;
         if (flags & LINUX_O_TRUNC) request.access |= 2U;
@@ -256,11 +294,11 @@ enum kernel_files_status kernel_files_openat(
             request.flags &= ~KERNEL_VFS_OPEN_FOLLOW;
         }
     }
-    open_status=kernel_open_file_create_at(files->heap,start,fs_paths.root,path,
+    open_status=kernel_open_file_create_at(files->heap,start,root,path,
                         &request,&description,&created,&result);
-    if (open_status==KERNEL_OPEN_FILE_STATUS_OK && result==-KERNEL_ENOENT &&
+    if (open_status==KERNEL_OPEN_FILE_STATUS_OK && result==-KERNEL_ENOENT && !resolve &&
         (request.flags & KERNEL_VFS_OPEN_FOLLOW) &&
-        !(request.flags & KERNEL_VFS_OPEN_EXCLUSIVE)) {
+        !(request.flags & (KERNEL_VFS_OPEN_EXCLUSIVE | KERNEL_VFS_OPEN_REGULAR))) {
         int link_result=kernel_vfs_reopen_link_at(start,fs_paths.root,path,files->heap,
                                                 (uint32_t)flags,&description);
         if (link_result!=-KERNEL_ENOTSUP) {
@@ -408,6 +446,22 @@ Finish_open:
     reservation.files=0;
     *linux_result = fd;
     return KERNEL_FILES_STATUS_OK;
+}
+
+enum kernel_files_status kernel_files_openat(
+    struct kernel_files *files, const struct kernel_fs_context *fs,
+    struct kernel_mm *mm, int64_t dirfd, uint64_t user_path, uint64_t flags,
+    uint64_t mode, int64_t *linux_result)
+{
+    return files_open(files,fs,mm,dirfd,user_path,flags,mode,0,0,linux_result);
+}
+
+enum kernel_files_status kernel_files_openat2(
+    struct kernel_files *files, const struct kernel_fs_context *fs,
+    struct kernel_mm *mm, int32_t dirfd, uint64_t user_path, uint64_t flags,
+    uint64_t mode, uint64_t resolve, int64_t *linux_result)
+{
+    return files_open(files,fs,mm,dirfd,user_path,flags,mode,resolve,1,linux_result);
 }
 
 enum kernel_files_status kernel_files_symlinkat(

@@ -88,7 +88,7 @@ enum kernel_syscall_status syscall_handle_renameat(
 enum kernel_syscall_status syscall_handle_openat(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,
-    struct kernel_syscall_result *decoded);
+    struct kernel_syscall_result *decoded, int strict);
 
 enum kernel_syscall_status syscall_handle_umask(
     struct kernel_task *caller,

@@ -230,6 +230,11 @@ enum kernel_files_status kernel_files_openat(
     uint64_t mode,
     int64_t *linux_result);
 
+enum kernel_files_status kernel_files_openat2(
+    struct kernel_files *files, const struct kernel_fs_context *fs,
+    struct kernel_mm *mm, int32_t dirfd, uint64_t user_path, uint64_t flags,
+    uint64_t mode, uint64_t resolve, int64_t *linux_result);
+
 enum kernel_files_status kernel_files_symlinkat(
     struct kernel_files *files,
     const struct kernel_fs_context *fs,

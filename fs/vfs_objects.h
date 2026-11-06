@@ -141,7 +141,7 @@ struct kernel_vfs_backend {
     int (*entry_name)(struct kernel_vfs_instance *, uint64_t inode, char *, size_t);
     int (*readlink)(struct kernel_vfs_node *node, char *buffer, size_t size, size_t *count);
     /* Object links resolve to a pinned path without a pathname relookup. */
-    int (*follow_link)(struct kernel_vfs_node *node,
+    int (*follow_link)(struct kernel_vfs_node *node, unsigned resolve,
                        struct kernel_vfs_path **owner);
     /* A pseudo-object link may open a new description without a VFS path. */
     int (*reopen_link)(struct kernel_vfs_node *node, struct kernel_heap *heap,

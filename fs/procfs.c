@@ -923,7 +923,7 @@ Finish:
     return result;
 }
 
-static int proc_follow_link(struct kernel_vfs_node *node,
+static int proc_follow_link(struct kernel_vfs_node *node, unsigned resolve,
                             struct kernel_vfs_path **owner)
 {
     if (node->inode == PROC_SELF_INODE || node->inode == PROC_THREAD_SELF_INODE ||
@@ -933,22 +933,32 @@ static int proc_follow_link(struct kernel_vfs_node *node,
         ? KERNEL_PROC_PATH_EXE : kind == PROC_PID_CWD_KIND
         ? KERNEL_PROC_PATH_CWD : kind == PROC_PID_ROOT_KIND
         ? KERNEL_PROC_PATH_ROOT : 0;
+    int result;
+    int pathless=0;
     if (kind == PROC_PID_FD_LINK_KIND) {
-        int result = kernel_proc_fd_path_acquire(proc_inode_pid(node->inode),
-            proc_resource_identity(node->inode), proc_inode_fd(node->inode), owner);
-        if (!result) return 0;
-        struct kernel_proc_fd_pseudo pseudo = {0};
-        result = kernel_proc_fd_pseudo_snapshot(proc_inode_pid(node->inode),
-            proc_resource_identity(node->inode), proc_inode_fd(node->inode),
-            &pseudo);
+        result=kernel_proc_fd_path_acquire(proc_inode_pid(node->inode),
+            proc_resource_identity(node->inode),proc_inode_fd(node->inode),owner);
+        if (result) {
+            struct kernel_proc_fd_pseudo pseudo={0};
+            result=kernel_proc_fd_pseudo_snapshot(proc_inode_pid(node->inode),
+                proc_resource_identity(node->inode),proc_inode_fd(node->inode),&pseudo);
+            if (result) return result;
+            /* Pathless pseudo-objects live outside this proc mount. The old
+             * unscoped caller may reopen a pipe or mqueue through its OFD. */
+            pathless=pseudo.kind==KERNEL_OPEN_FILE_KIND_PIPE ||
+                pseudo.kind==KERNEL_OPEN_FILE_KIND_MQUEUE ? -KERNEL_ENOENT : -KERNEL_ENXIO;
+        }
+    } else if (path_kind) {
+        result=kernel_proc_process_path_acquire(proc_inode_pid(node->inode),
+            proc_resource_identity(node->inode),path_kind,0,owner);
         if (result) return result;
-        /* 无路径的管道由OFD重新打开；其展示文本不参与路径创建。 */
-        return pseudo.kind == KERNEL_OPEN_FILE_KIND_PIPE || pseudo.kind==KERNEL_OPEN_FILE_KIND_MQUEUE
-            ? -KERNEL_ENOENT : -KERNEL_ENXIO;
-    }
-    if (!path_kind) return -KERNEL_ENOTSUP;
-    return kernel_proc_process_path_acquire(proc_inode_pid(node->inode),
-        proc_resource_identity(node->inode), path_kind, 0, owner);
+    } else return -KERNEL_ENOTSUP;
+    if (resolve & KERNEL_VFS_RESOLVE_NO_MAGICLINKS) result=-KERNEL_ELOOP;
+    else if ((resolve & KERNEL_VFS_RESOLVE_SCOPED) ||
+             (pathless && (resolve & KERNEL_VFS_RESOLVE_NO_XDEV))) result=-KERNEL_EXDEV;
+    else return pathless;
+    if (*owner && kernel_vfs_path_release(owner)) __builtin_trap();
+    return result;
 }
 
 static int proc_reopen_link(struct kernel_vfs_node *node,

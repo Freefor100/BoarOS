@@ -114,6 +114,10 @@ OFD pin 覆盖可能缺页睡眠的复制。`make test-record-lock-riscv` 用同
 
 `chroot` 按最终目录检查类型、搜索权限和 `CAP_SYS_CHROOT`，在共同短保护内替换 root 引用，保留 cwd。fork复制记录，CLONE_FS共享记录中的 root/cwd；已有 dirfd 和 OFD 保持原对象及已打开权利，绝对路径与后续解释器从新root开始解析。
 
+`openat2(437)` 导入 24 字节的 `open_how`，接受全零的扩展尾部，单独校验 flags、mode 和 resolve。它与 `openat` 共用打开及创建路径。解析器在跨越挂载点（包括 bind）、跟随符号链接或 proc 对象链接时检查对应限制；`RESOLVE_BENEATH` 拒绝逃出起点，`RESOLVE_IN_ROOT` 将绝对路径、绝对链接和根处的 `..` 限制在起点。发生挂载拓扑或目录父链变化时，受限查找可返回 `EAGAIN`，调用方可用相同约束重试。`OPENAT2_REGULAR` 在打开设备或 FIFO 之前要求最终对象为普通文件。
+
+现有路径索引命中后仍需后端复核，`RESOLVE_CACHED` 返回 `EAGAIN`，应用可去掉该位重试并保留其他解析限制。`O_TMPFILE`、`O_DIRECT`、`O_NOATIME` 和 `O_EMPTYPATH` 仍返回 `EOPNOTSUPP`。`tests/userland/openat2.c` 检查参数、受限创建、bind 挂载和 proc 链接。
+
 `getcwd` 返回包含 NUL 的字节数；用户缓冲不足为 `ERANGE`，已断开的 cwd 为 `ENOENT`。仍连接在命名空间但位于新root之外的cwd，raw syscall返回`(unreachable)`前缀及命名空间绝对路径；libc据此处理ENOENT。proc cwd/exe/fd/maps的展示保留根外及摘树对象的绝对名称和删除后缀，实际对象链接跟随仍持有真实路径，不依赖这些展示文本。删除目录后，其持有者仍可对 `.` 打开/统计、经 `..` 访问父目录、通过 `fchdir` 切回；不能在已删除目录中新建名字。改名会更新所有持有同一目录项的 cwd/OFD 所观察到的父链。fork 独立复制 fs record，进程形式和线程形式的 `CLONE_FS` 都共享它；切换 cwd 先取得新引用再替换，失败不改变原目录。
 
 `renameat2` 支持 flags 0 和 `RENAME_NOREPLACE`；未知或互斥组合返回 `EINVAL`，EXCHANGE/WHITEOUT 返回 `ENOTSUP`。保留 `renameat(38)` 兼容入口；固定 RV64 Linux 与 musl 使用 `renameat2(276)` 完成普通 rename，因此差分也使用该原生入口。后端操作事务成功接受后发布内存目录项变化，异步 journal mount 的持久化由组提交及目录同步保证；覆盖目标的 OFD 保留原 inode 和内容。目录 `..`、两侧链接数和持久 orphan 由同一事务处理。
@@ -322,7 +326,7 @@ linkat和readlinkat使用原身份，NOFOLLOW可持有链接自身。数据、se
 直接fd改权/所有权/时间与同步入口先返回EBADF；网络ioctl/socket入口同样先检查资格。
 poll显示POLLNVAL；select按固定Linux的POLLIN/OUT/EX_SET将它映射到所请求的集合，
 不把有效路径fd误当成已经关闭的fd。
-unlink/rename及同名重建不会替换句柄身份。execveat以实际OFD/path重新检查执行权限，复用现有exec事务，见[执行模块](kernel-exec.md)；openat2仍未交付。
+unlink/rename及同名重建不会替换句柄身份。execveat以实际OFD/path重新检查执行权限，复用现有exec事务，见[执行模块](kernel-exec.md)。
 `make build/diff-abi/path-rv`配`tests/diff-abi/path-cases.txt`可聚焦差分；完整ABI仍包含同一记录。
 `O_NOCTTY` 是合法open flag，其控制终端语义见[TTY模块](kernel-tty.md)。
 固定 Linux

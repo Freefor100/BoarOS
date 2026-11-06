@@ -70,6 +70,7 @@
 #define KERNEL_EIDRM 43
 #define KERNEL_ETIMEDOUT 110
 #define KERNEL_EUCLEAN 117
+#define KERNEL_EFTYPE 134
 
 /* Internal scheduler result; never exposed as a Linux errno. */
 #define KERNEL_ERESTARTSYS 512
