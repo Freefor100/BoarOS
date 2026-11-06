@@ -853,6 +853,74 @@ static void ext4_ext_binsearch(struct ext4_extent_path *path, ext4_lblk_t block)
 	path->extent = l - 1;
 }
 
+/* The inode owns the root bytes; no block or mutable path is needed to query it. */
+static int ext4_ext_check_root(struct ext4_inode_ref *inode_ref)
+{
+    struct ext4_extent_header *eh=ext_inode_hdr(inode_ref->inode);
+    unsigned depth=ext_depth(inode_ref->inode);
+	if (to_le16(eh->magic) != EXT4_EXTENT_MAGIC || depth > 5 ||
+	    to_le16(eh->max_entries_count) >
+	      (sizeof(inode_ref->inode->blocks) - sizeof(*eh)) /
+		 sizeof(struct ext4_extent) ||
+	    !to_le16(eh->max_entries_count) ||
+	    to_le16(eh->entries_count) > to_le16(eh->max_entries_count) ||
+	    (depth && !to_le16(eh->entries_count)))
+		return EUCLEAN;
+    return EOK;
+}
+
+/* Query borrows only the current tree block. Keep the next sibling's logical
+ * boundary as a value before returning its parent; holes need no ancestor path.
+ * The caller's inode qualification stabilizes topology across these borrows. */
+static int extent_lookup_range(struct ext4_inode_ref *ref,ext4_lblk_t logical,
+    uint32_t maximum,struct ext4_inode_block_range *range)
+{
+    struct ext4_extent_path at={.header=ext_inode_hdr(ref->inode)};
+    struct ext4_block held=EXT4_BLOCK_ZERO();
+    unsigned depth=ext_depth(ref->inode);
+    ext4_lblk_t next=EXT_MAX_BLOCKS;
+    int result=ext4_ext_check_root(ref);
+    if (result) return result;
+    while (depth) {
+        if (!at.header->entries_count) {result=EIO;goto Out;}
+        ext4_ext_binsearch_idx(&at,logical);
+        if (at.index!=EXT_LAST_INDEX(at.header)) next=to_le32(at.index[1].first_block);
+        ext4_fsblk_t block=ext4_idx_pblock(at.index);
+        if (!block) {result=EUCLEAN;goto Out;}
+        if (held.lb_id) {
+            result=ext4_block_set(ref->fs->bdev,&held);
+            if (result) return result;
+        }
+        held=(struct ext4_block)EXT4_BLOCK_ZERO();
+        result=ext4_block_get(ref->fs->bdev,&held,block);
+        if (result) return result;
+        at.header=ext_block_hdr(&held);
+        result=ext4_ext_check(ref,at.header,--depth,block);
+        if (result) goto Out;
+    }
+    ext4_ext_binsearch(&at,logical);
+    if (at.extent) {
+        uint32_t first=to_le32(at.extent->first_block);
+        uint32_t length=ext4_ext_get_actual_len(at.extent);
+        if (IN_RANGE(logical,first,length)) {
+            range->block=ext4_ext_pblock(at.extent)+logical-first;
+            range->count=length-(logical-first);
+            range->unwritten=ext4_ext_is_unwritten(at.extent);
+            if (range->count>maximum) range->count=maximum;
+            goto Out;
+        }
+        if (logical<first) next=first;
+        else if (at.extent!=EXT_LAST_EXTENT(at.header)) next=to_le32(at.extent[1].first_block);
+    }
+    range->count=next>logical && next-logical<maximum ? next-logical : maximum;
+Out:
+    if (held.lb_id) {
+        int cleanup=ext4_block_set(ref->fs->bdev,&held);
+        if (!result) result=cleanup;
+    }
+    return result;
+}
+
 static int ext4_find_extent(struct ext4_inode_ref *inode_ref, ext4_lblk_t block,
 			    struct ext4_extent_path **orig_path, uint32_t flags)
 {
@@ -866,14 +934,8 @@ static int ext4_find_extent(struct ext4_inode_ref *inode_ref, ext4_lblk_t block,
 
 	eh = ext_inode_hdr(inode_ref->inode);
 	depth = ext_depth(inode_ref->inode);
-	if (to_le16(eh->magic) != EXT4_EXTENT_MAGIC || depth > 5 ||
-	    to_le16(eh->max_entries_count) >
-	      (sizeof(inode_ref->inode->blocks) - sizeof(*eh)) /
-		 sizeof(struct ext4_extent) ||
-	    !to_le16(eh->max_entries_count) ||
-	    to_le16(eh->entries_count) > to_le16(eh->max_entries_count) ||
-	    (depth && !to_le16(eh->entries_count)))
-		return EUCLEAN;
+	ret = ext4_ext_check_root(inode_ref);
+	if (ret) return ret;
 
 	if (path) {
 		ext4_ext_drop_refs(inode_ref, path, 0);
@@ -2169,7 +2231,11 @@ static int extent_get_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock
         max_blocks = EXT_MAX_BLOCKS - iblock;
     }
 
-	/* find extent for this block */
+    err = extent_lookup_range(inode_ref,iblock,max_blocks,range);
+    if (err || !create || (range->block && (!range->unwritten || reserve))) return err;
+    *range = (struct ext4_inode_block_range){0};
+
+	/* Only allocation or unwritten conversion needs a mutable ancestor path. */
 	err = ext4_find_extent(inode_ref, iblock, &path, 0);
 	if (err != EOK) {
 		path = NULL;

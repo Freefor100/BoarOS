@@ -227,6 +227,7 @@ enum kernel_block_status kernel_block_write_batch_prio(
     }
     const uint64_t limit = capacity(device);
     int nonempty = 0;
+    uint64_t first=UINT64_MAX,last=0;
     for (size_t i = 0; i < count; i++) {
         const struct kernel_block_span *span = &spans[i];
         if (span->offset > limit ||
@@ -235,12 +236,16 @@ enum kernel_block_status kernel_block_write_batch_prio(
         if (!span->size) continue;
         if (!span->buffer || span->size - 1 > UINTPTR_MAX - (uintptr_t)span->buffer)
             return KERNEL_BLOCK_STATUS_INVALID;
+        uint64_t end=span->offset+span->size;
+        /* 顺序窗口在已见区间之外；落入间隙的乱序窗口才核对各段。 */
+        if (nonempty && span->offset<last && end>first)
+            for (size_t j = 0; j < i; j++)
+                if (spans[j].size && span->offset < spans[j].offset + spans[j].size &&
+                    spans[j].offset < end)
+                    return KERNEL_BLOCK_STATUS_INVALID;
+        if (span->offset<first) first=span->offset;
+        if (end>last) last=end;
         nonempty = 1;
-        for (size_t j = 0; j < i; j++) {
-            if (spans[j].size && span->offset < spans[j].offset + spans[j].size &&
-                spans[j].offset < span->offset + span->size)
-                return KERNEL_BLOCK_STATUS_INVALID;
-        }
     }
     if (!nonempty) return KERNEL_BLOCK_STATUS_OK;
     if (kernel_block_read_only(device)) return KERNEL_BLOCK_STATUS_READ_ONLY;
@@ -415,7 +420,7 @@ enum kernel_block_status kernel_block_read_batch(struct kernel_block_device *dev
     for (size_t i = 0; i < count; i++) {
         spans[i].completed = 0; spans[i].status = KERNEL_BLOCK_STATUS_NOT_SUBMITTED;
     }
-    int nonempty = 0;
+    uint64_t submitted=0;
     uintptr_t first = UINTPTR_MAX, last = 0;
     for (size_t i = 0; i < count; i++) {
         struct block_read_span *span = &spans[i];
@@ -428,16 +433,18 @@ enum kernel_block_status kernel_block_read_batch(struct kernel_block_device *dev
             return span->status = KERNEL_BLOCK_STATUS_INVALID;
         uintptr_t end = buffer + span->size - 1;
         /* 单调排列的 SG 目标不与已见范围相交；落入间隙时才逐项检查。 */
-        if (nonempty && buffer <= last && end >= first)
+        if (submitted && buffer <= last && end >= first)
             for (size_t j = 0; j < i; j++)
                 if (memory_overlaps(buffer, span->size, (uintptr_t)spans[j].buffer, spans[j].size))
                     return span->status = KERNEL_BLOCK_STATUS_INVALID;
         if (buffer < first) first = buffer;
         if (end > last) last = end;
-        nonempty = 1;
+        submitted+=span->size;
     }
-    if (!nonempty) return KERNEL_BLOCK_STATUS_OK;
-    for (size_t i = 0; i < count; i++) kernel_task_account_read(spans[i].size);
+    if (!submitted) return KERNEL_BLOCK_STATUS_OK;
+    /* The validated nonoverlapping destinations fit one address space.
+     * Account the complete submission with one task lookup and update. */
+    kernel_task_account_read(submitted);
     if (disk->read_batch)
         return device->parent ? partition_read_batch(device, spans, count, completion) :
             disk->read_batch(disk->context, spans, count, completion);

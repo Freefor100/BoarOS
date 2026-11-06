@@ -2183,12 +2183,14 @@ static void extent_lookup_checksums(struct ext4_blockdev *dev)
 #ifdef TEST_RANGE_WORK_COUNTERS
     watched_extent_bytes=block-4;extent_crc_calls=0;
 #endif
+    unsigned lookup_allocations=allocations;
     for (unsigned i=0;i<32;i++) {
         CHECK(ext4_fs_get_inode_dblk_range(&ref,0,1,false,&range)==EOK);
         CHECK(range.block && range.count==1 && range.unwritten);
         if (!i) physical=range.block;
         CHECK(range.block==physical);
     }
+    CHECK(allocations==lookup_allocations); /* An already resident query owns no path allocation. */
 #ifdef TEST_RANGE_WORK_COUNTERS
     printf("extent read checksums: lookups=32 CRC=%u\n",extent_crc_calls);
     CHECK(extent_crc_calls<=32);
@@ -2196,6 +2198,19 @@ static void extent_lookup_checksums(struct ext4_blockdev *dev)
 #endif
     CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
     CHECK(ext4_transaction_end("/")==EOK);
+    /* A new operation only looking up mappings must not create private tree
+     * versions. It also sees the same holes and unwritten physical ownership. */
+    CHECK(ext4_transaction_begin("/")==EOK);
+    CHECK(ext4_fs_get_inode_ref_read(dev->fs,file.inode,&ref)==EOK);
+    CHECK(TAILQ_EMPTY(&ext4_current_trans(dev->fs)->buf_queue));
+    lookup_allocations=allocations;
+    for (unsigned i=0;i<12;i++) {
+        CHECK(ext4_fs_get_inode_dblk_range(&ref,i,32,false,&range)==EOK);
+        if (!(i&1)) CHECK(range.block && range.unwritten && range.count==1);
+        else CHECK(!range.block && range.count==(i==11?32:1));
+    }
+    CHECK(allocations==lookup_allocations && TAILQ_EMPTY(&ext4_current_trans(dev->fs)->buf_queue));
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK && ext4_transaction_end("/")==EOK);
     /* Corrupt only the held cache copy, then restore it before releasing it. */
     CHECK(ext4_fs_get_inode_ref(dev->fs,file.inode,&ref)==EOK);
     const unsigned char *root=(const unsigned char *)ref.inode->blocks;
@@ -2210,6 +2225,13 @@ static void extent_lookup_checksums(struct ext4_blockdev *dev)
     cached.data[block-1]^=1;
     CHECK(ext4_fs_get_inode_dblk_range(&ref,0,1,false,&range)==EOK && range.block==physical);
     CHECK(ext4_block_set(dev,&cached)==EOK);
+    /* A corrupt child address can load block zero before header validation.
+     * Rejection must return that real buffer reference as well. */
+    unsigned held=dev->bc->ref_blocks;
+    memset((unsigned char *)root+16,0,6);
+    int bad=ext4_fs_get_inode_dblk_range(&ref,0,1,false,&range);
+    memcpy((unsigned char *)root+16,&low,4);memcpy((unsigned char *)root+20,&high,2);
+    CHECK((bad==EIO || bad==EUCLEAN) && dev->bc->ref_blocks==held);
     CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
     CHECK(ext4_fclose(&file)==EOK);
 }
@@ -2612,7 +2634,8 @@ static void range_abort(struct ext4_blockdev *dev)
         CHECK(r==EOK || r==ENOMEM);
         if(r==EOK) {
             CHECK(range.allocated && range.count==32);
-            CHECK(ext4_sb_get_free_blocks_cnt(&dev->fs->sb)==free_before-32);
+            CHECK(ext4_fs_available_blocks(dev->fs)==free_before-32);
+            CHECK(ext4_sb_get_free_blocks_cnt(&dev->fs->sb)==free_before);
         } else failures++;
         int put=ext4_fs_put_inode_ref(&ref);CHECK(put==EOK || put==ENOMEM);
         CHECK(ext4_transaction_abort("/",r?r:ECANCELED)==(r?r:ECANCELED));

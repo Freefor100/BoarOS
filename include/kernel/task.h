@@ -66,7 +66,7 @@ enum kernel_task_status kernel_task_io_buffer_acquire(
     struct kernel_task_io_buffer *buffer, struct physical_page_allocator *allocator);
 /* 接管调用者已有的物理页引用，不额外hold；成功后由release或任务退出归还。 */
 void kernel_task_io_buffer_take_page(struct kernel_task_io_buffer *buffer,
-    struct physical_page_allocator *allocator, uint64_t physical_address);
+    struct physical_page_allocator *allocator, uint64_t physical_address,const void *mapped);
 void kernel_task_io_buffer_release(struct kernel_task_io_buffer *buffer);
 
 /* 非零表示本次返回需要选择信号；USER_SMP在这里消费本批本地通知。 */

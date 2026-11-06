@@ -3923,6 +3923,8 @@ static int ext4_ftruncate_no_lock(ext4_file *file, uint64_t size, uint32_t privi
 
 	old_size = ext4_inode_get_size(sb, ref.inode);
 	file->fsize = old_size;
+	if (file->delalloc && size <= old_size)
+		file->delalloc->mapped_end = 0;
 	/* 外部 capability 的修改会取得组资格；缩短意图先选定 orphan 记录，
 	 * 仍与 capability、EOF 修改共享同一个失败回滚边界。 */
 	if (old_size >= size && file->mp->fs.jbd_journal) {
@@ -4065,16 +4067,22 @@ int ext4_file_reserve_write(ext4_file *file,uint64_t offset,size_t length,size_t
     bool have_ref=false;
     /* 私有事务看到的空洞可能随 abort 消失，不能作为后续写入的依据。 */
     bool stable_mapping=!ext4_current_operation(fs);
+    struct ext4_delalloc *da=file->delalloc;
     int r=EOK;
     size_t block=fs->bdev->lg_bsize;
     while (!r && *ready<length) {
         uint64_t position=offset+*ready,logical=position/block;
-        uint32_t key=logical>>6;unsigned bit=logical&63;
         size_t rest=length-*ready;
+        if (stable_mapping && logical>=da->mapped_first && logical<da->mapped_end) {
+            uint64_t bytes=da->mapped_end*block-position;
+            *ready+=bytes<rest?(size_t)bytes:rest;
+            continue;
+        }
+        uint32_t key=logical>>6;unsigned bit=logical&63;
         uint64_t needed=(rest-1+position%block)/block+1;
         unsigned maximum=needed<64-bit?needed:64-bit;
         /* inode I/O 写资格排除本 inode 的映射修改和预留回收。 */
-        struct ext4_delalloc_chunk *existing=delalloc_find(file->delalloc,key);
+        struct ext4_delalloc_chunk *existing=delalloc_find(da,key);
         bool missing_chunk=!existing;
         uint64_t known=existing?(existing->mask|(stable_mapping?existing->known_holes:0))>>bit:0;
         uint64_t holes=0;
@@ -4087,14 +4095,35 @@ int ext4_file_reserve_write(ext4_file *file,uint64_t offset,size_t length,size_t
                 have_ref=true;
                 if (!ext4_inode_has_flag(ref.inode,EXT4_INODE_FLAG_EXTENTS)) {r=ENOTSUP;break;}
             }
-            unsigned query=64-bit;
+            unsigned query=maximum;
             if (stable_mapping) {
                 uint64_t last=file->fmax/block+(file->fmax%block!=0);
-                if (query>last-logical)query=last-logical;
-            } else query=maximum;
+                uint64_t available=last-logical;
+                query=available>UINT32_MAX?UINT32_MAX:(unsigned)available;
+            }
             r=ext4_extent_get_range(&ref,logical,query,false,&range);
             if (!r && range.count>query)__builtin_trap();
-            if (!r && stable_mapping && !range.block && range.count)holes=delalloc_mask(bit,range.count);
+            if (!r && stable_mapping && range.count) {
+                if (!range.block) {
+                    unsigned known=range.count<64-bit?range.count:64-bit;
+                    holes=delalloc_mask(bit,known);
+                } else {
+                    /* Orphan recovery may reclaim preallocation beyond i_size.
+                     * Remember only whole blocks that survive that cleanup. */
+                    uint64_t last=ext4_inode_get_size(ext4_fs_super(fs),ref.inode)/block;
+                    uint64_t end=logical+range.count;
+                    if (end>last)end=last;
+                    if (end>logical) {
+                        if (!da->mapped_end || da->mapped_end<logical || da->mapped_first>end) {
+                            da->mapped_first=logical;
+                            da->mapped_end=end;
+                        } else {
+                            if (logical<da->mapped_first)da->mapped_first=logical;
+                            if (end>da->mapped_end)da->mapped_end=end;
+                        }
+                    }
+                }
+            }
         }
         if (r)break;
         if (!range.count) {r=EIO;break;}
@@ -4368,6 +4397,7 @@ int ext4_fallocate(ext4_file *file, unsigned mode, uint64_t offset,
     EXT4_MP_LOCK(file->mp);
     struct ext4_fs *fs=&file->mp->fs;
     if (file->delalloc && fs->jbd_journal) {
+        if (mode&EXT4_FALLOC_PUNCH_HOLE) file->delalloc->mapped_end=0;
         size_t block=fs->bdev->lg_bsize;
         EXT4_STATE_SCOPE(state,fs);
         (void)delalloc_range(file->delalloc,offset/block,(end-1)/block+1,false);
@@ -4534,7 +4564,7 @@ static int ext4_fread_body(ext4_file *file, void *buf, size_t size, size_t *rcnt
 	if (rcnt)
 		*rcnt = 0;
 
-	r = ext4_fs_get_inode_ref(fs, file->inode, &ref);
+	r = ext4_fs_get_inode_ref_read(fs, file->inode, &ref);
 	if (r != EOK) {
 		return r;
 	}
@@ -4809,7 +4839,7 @@ int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsig
     if (file->flags & O_WRONLY) { result = EPERM; goto Failed; }
     struct ext4_fs *fs = &file->mp->fs;
     struct ext4_inode_ref ref;
-    result = ext4_fs_get_inode_ref(fs, file->inode, &ref);
+    result = ext4_fs_get_inode_ref_read(fs, file->inode, &ref);
     if (result) goto Failed;
     uint64_t size = ext4_inode_get_size(ext4_fs_super(fs), ref.inode);
     if (size > file->fmax) { result = EFBIG; goto Put; }
@@ -5111,6 +5141,7 @@ Retry:
     }
     struct ext4_inode_block_range range = {0};
     ext4_lblk_t range_next = 0;
+    uint64_t mapping_end = 0;
 	for (unsigned i = 0; i < count && !r; i++) {
 		struct file_write_span *span = &spans[i];
 		if (!span->size) continue;
@@ -5146,15 +5177,17 @@ Retry:
 			ext4_lblk_t logical_block = file->fpos / block_size;
             ext4_assert(!range.count || range_next == logical_block);
 			if (!range.count) {
-                uint64_t end = span->offset + span->size;
-                /* Stop at gaps and partial block boundaries. In particular a
-                 * later span revisiting this block must see initialized data. */
-                for (unsigned j = i + 1; j < count && !(end % block_size); j++) {
-                    if (!spans[j].size) continue;
-                    if (spans[j].offset != end) break;
-                    end += spans[j].size;
+                /* Form each contiguous request run once. A fragmented physical
+                 * map may need several queries without rescanning later spans. */
+                if (file->fpos >= mapping_end) {
+                    mapping_end = span->offset + span->size;
+                    for (unsigned j = i + 1; j < count && !(mapping_end % block_size); j++) {
+                        if (!spans[j].size) continue;
+                        if (spans[j].offset != mapping_end) break;
+                        mapping_end += spans[j].size;
+                    }
                 }
-                uint64_t needed = (end - 1) / block_size - logical_block + 1;
+                uint64_t needed = (mapping_end - 1) / block_size - logical_block + 1;
                 uint32_t maximum = (131072 - (direct ? direct->bytes : 0)) / block_size;
                 if (needed < maximum) maximum = needed;
                 r = ext4_fs_get_inode_dblk_range(&ref, logical_block, maximum, true, &range);

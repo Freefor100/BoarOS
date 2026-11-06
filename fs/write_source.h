@@ -4,6 +4,7 @@
 #include "uaccess_iov_internal.h"
 #include "../mm/uaccess_internal.h"
 #include <kernel/cost.h>
+#include <kernel/page_cache.h>
 #include <string.h>
 
 struct kernel_page_cache;
@@ -16,6 +17,8 @@ struct kernel_vfs_write_source {
     struct kernel_uaccess_iov_cursor user;
     enum kernel_uaccess_status access;
     size_t chunks;
+    const struct kernel_page_cache_read_page *cached;
+    size_t cached_offset;
 };
 
 static inline size_t kernel_vfs_write_source_span(
@@ -31,17 +34,6 @@ static inline void kernel_vfs_write_source_use_pin(
 {
     uint64_t address=source->user.iov[source->user.index].base+source->user.offset;
     source->data=(const unsigned char *)pin->page+(address&BOAROS_PAGE_MASK);
-}
-
-static inline int kernel_vfs_write_source_pin(
-    struct kernel_vfs_write_source *source, struct kernel_mm_user_pin *pin)
-{
-    if (!source->mm) return 1;
-    uint64_t address = source->user.iov[source->user.index].base + source->user.offset;
-    source->access = kernel_uaccess_pin_user_page(source->mm, address, KERNEL_MM_READ, pin);
-    if (source->access) return 0;
-    kernel_vfs_write_source_use_pin(source,pin);
-    return 1;
 }
 
 static inline void kernel_vfs_write_source_copy(
@@ -85,12 +77,27 @@ static inline int kernel_vfs_write_source_prepare(struct kernel_vfs_write_source
     view->size=0;view->first=kernel_vfs_write_source_span(source,limit);
     if (!view->first) { source->access=KERNEL_UACCESS_STATUS_STATE;return 0; }
     if (!source->mm) { view->size=limit;return 1; }
-    if (!kernel_vfs_write_source_pin(source,&view->pins[0])) return 0;
     uint64_t address=source->user.iov[source->user.index].base+source->user.offset;
-    view->pages[0]=address&~BOAROS_PAGE_MASK;view->count=1;view->size=view->first;
-    if (view->size==limit) return 1;
+    view->pages[0]=address&~BOAROS_PAGE_MASK;
+    view->size=view->first;
     struct kernel_uaccess_iov_cursor cursor=source->user;
     cursor.offset+=view->first;
+    uint64_t next=0;
+    size_t part=view->size<limit?kernel_uaccess_iov_span(&cursor,limit-view->size,&next):0;
+    if (part && (next&~BOAROS_PAGE_MASK)!=view->pages[0]) {
+        source->access=kernel_uaccess_pin_user_pair(source->mm,address,next,KERNEL_MM_READ,
+            view->pins,&view->count);
+        if (source->access) return 0;
+        kernel_vfs_write_source_use_pin(source,&view->pins[0]);
+        if (view->count==1) return 1;
+        view->pages[1]=next&~BOAROS_PAGE_MASK;
+        view->size+=part;cursor.offset+=part;
+    } else {
+        source->access=kernel_uaccess_pin_user_page(source->mm,address,KERNEL_MM_READ,&view->pins[0]);
+        if (source->access) return 0;
+        kernel_vfs_write_source_use_pin(source,&view->pins[0]);
+        view->count=1;
+    }
     while (view->size<limit) {
         size_t part=kernel_uaccess_iov_span(&cursor,limit-view->size,&address);
         if (!part) __builtin_trap();
@@ -115,9 +122,14 @@ static inline int kernel_vfs_write_source_prepare(struct kernel_vfs_write_source
     return 1;
 }
 
+void kernel_vfs_write_source_copy_cached(struct kernel_vfs_write_source *,void *destination,size_t);
 static inline void kernel_vfs_write_source_copy_view(struct kernel_vfs_write_source *source,
     void *destination,const struct kernel_vfs_write_view *view)
 {
+    if (source->cached) {
+        kernel_vfs_write_source_copy_cached(source,destination,view->size);
+        return;
+    }
     kernel_vfs_write_source_copy(source,destination,view->first);
     kernel_vfs_write_source_advance(source,view->first);
     for (size_t copied=view->first;copied<view->size;) {
@@ -136,11 +148,17 @@ static inline void kernel_vfs_write_source_copy_view(struct kernel_vfs_write_sou
 static inline void kernel_vfs_write_source_finish(struct kernel_vfs_write_source *source,
     struct kernel_vfs_write_view *view)
 {
-    while (view->count) kernel_mm_unpin_user_page(&view->pins[--view->count]);
+    if (view->count==2) kernel_mm_unpin_user_pair(view->pins);
+    else if (view->count) kernel_mm_unpin_user_page(view->pins);
+    view->count=0;
     if (source->mm) source->data=NULL;
 }
 
 int kernel_page_cache_write_source(struct kernel_page_cache *, struct kernel_vfs_file *,
     uint64_t offset, struct kernel_vfs_write_source *, size_t size, size_t *written);
+/* The file-copy caller holds the successful, contiguous source prefix alive
+ * until this returns. Source and destination must be different inodes. */
+int kernel_vfs_pwrite_cached(struct kernel_vfs_file *,uint64_t offset,
+    const struct kernel_page_cache_read_page *,size_t source_offset,size_t size,size_t *written);
 
 #endif

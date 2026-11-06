@@ -47,6 +47,7 @@ struct kernel_page_cache_entry {
     struct kernel_vfs_node *node;
     uint64_t page_index;
     uint64_t physical_address;
+    unsigned char *data; /* Fixed direct mapping for the owned physical page. */
     size_t dirty_begin;
     size_t dirty_end;
     uint64_t generation;
@@ -439,9 +440,33 @@ static void version_retain(void *owner)
     unsigned old=__atomic_fetch_add(&version->references,1,__ATOMIC_ACQ_REL);
     if (!old || old==UINT32_MAX) __builtin_trap();
 }
-static int version_return(void *owner,int notify)
+/* A detached list still owns one pool reference per version. Keep a bounded
+ * prefix in the pool; freeing the rest may enter the allocator. */
+static void version_idle_return(struct version_pool *pool,struct cache_version *list)
 {
-    struct cache_version *version=owner;
+    if (!list) return;
+    {
+        KERNEL_RAW_SCOPE(guard,&pool->lock);
+        if (!pool->closed && pool->idle_count<pool->idle_limit) {
+            struct cache_version *first=list,*tail=list;
+            size_t count=1,available=pool->idle_limit-pool->idle_count;
+            while (tail->next && count<available) {
+                tail=tail->next;count++;
+            }
+            list=tail->next;
+            tail->next=pool->idle;pool->idle=first;pool->idle_count+=count;
+            cache_wake(&pool->ready);
+        }
+    }
+    while (list) {
+        struct cache_version *version=list;
+        list=version->next;
+        version_dispose(version);
+    }
+}
+
+static int version_drop(struct cache_version *version,int notify,struct cache_version **idle)
+{
     unsigned old=__atomic_fetch_sub(&version->references,1,__ATOMIC_ACQ_REL);
     if (!old) __builtin_trap();
     if (old!=1) return 0;
@@ -452,19 +477,17 @@ static int version_return(void *owner,int notify)
         if (notify) group_returned(domain->group);
         kernel_writeback_domain_put(domain);
     }
-    struct version_pool *pool=version->pool;
-    {
-        KERNEL_RAW_SCOPE(guard,&pool->lock);
-        if (!pool->closed && pool->idle_count<pool->idle_limit) {
-            version->next=pool->idle; pool->idle=version; pool->idle_count++;
-            cache_wake(&pool->ready);
-            return returned;
-        }
-    }
-    version_dispose(version);
+    version->next=*idle;
+    *idle=version;
     return returned;
 }
-static void version_release(void *owner) { (void)version_return(owner,1); }
+static void version_release(void *owner)
+{
+    struct cache_version *version=owner,*idle=NULL;
+    struct version_pool *pool=version->pool;
+    (void)version_drop(version,1,&idle);
+    version_idle_return(pool,idle);
+}
 /* Detach only idle owners under the raw lock. Physical/heap releases can take
  * lower-ranked allocator locks and therefore always happen after unlocking. */
 static uint64_t version_pool_reclaim(struct version_pool *pool,uint64_t target)
@@ -504,25 +527,31 @@ static void version_pool_close(struct version_pool *pool)
     (void)version_pool_reclaim(pool,UINT64_MAX);
     version_pool_put(pool);
 }
-static struct cache_version *version_take_page(struct kernel_page_cache *cache)
+/* One lock acquisition per available batch. Detached entries are exclusively
+ * owned here, including through activation and later allocation failures. */
+static struct cache_version *version_idle_take(struct version_pool *pool,size_t maximum)
 {
-    struct version_pool *pool=cache->record->versions;
-    {
-        KERNEL_RAW_SCOPE(guard,&pool->lock);
-        if (pool->closed) __builtin_trap();
-        struct cache_version *version=pool->idle;
-        if (version) {
-            pool->idle=version->next;pool->idle_count--;
-            version->next=NULL;
-            if (__atomic_exchange_n(&version->references,1,__ATOMIC_ACQ_REL)) __builtin_trap();
-            return version;
-        }
+    if (!maximum) return NULL;
+    KERNEL_RAW_SCOPE(guard,&pool->lock);
+    if (pool->closed) __builtin_trap();
+    struct cache_version *head=pool->idle,*tail=head;
+    if (!tail) return NULL;
+    size_t count=1;
+    while (tail->next && count<maximum) {
+        tail=tail->next;count++;
     }
-    return version_new(pool);
+    pool->idle=tail->next;tail->next=NULL;pool->idle_count-=count;
+    return head;
 }
-static struct cache_version *version_take(struct kernel_page_cache *cache,struct kernel_vfs_node *node)
+static struct cache_version *version_take_from(struct version_pool *pool,
+    struct cache_version **idle,struct kernel_vfs_node *node)
 {
-    struct cache_version *version=version_take_page(cache);
+    struct cache_version *version=*idle;
+    if (version) {
+        *idle=version->next;
+        version->next=NULL;
+        if (__atomic_exchange_n(&version->references,1,__ATOMIC_ACQ_REL)) __builtin_trap();
+    } else version=version_new(pool);
     if (version) {
         if (version->domain) __builtin_trap();
         struct kernel_writeback_domain *domain=node->instance->writeback.domain;
@@ -532,6 +561,12 @@ static struct cache_version *version_take(struct kernel_page_cache *cache,struct
         }
     }
     return version;
+}
+static struct cache_version *version_take(struct kernel_page_cache *cache,struct kernel_vfs_node *node)
+{
+    struct version_pool *pool=cache->record->versions;
+    struct cache_version *idle=version_idle_take(pool,1);
+    return version_take_from(pool,&idle,node);
 }
 /* No entry writeback qualification or prepared versions may be held here:
  * a foreground borrower may need those entries before returning its version. */
@@ -737,6 +772,7 @@ static int cleanup_entry(struct kernel_page_cache *cache,
         (*pages_released)++;
     }
     entry->physical_address = 0U;
+    entry->data = NULL;
     if (entry->node != 0 &&
         kernel_vfs_node_release(&entry->node) != 0) {
         return 0;
@@ -1703,7 +1739,7 @@ enum kernel_page_cache_status kernel_page_cache_lookup(
 /* 未发布的候选持有自己的node/page；分配完成后才在cache保护内竞争发布。 */
 static enum kernel_page_cache_status allocate_entry(struct kernel_page_cache *cache,
     struct kernel_vfs_node *node,uint64_t index,int clear,
-    struct kernel_page_cache_entry **output,void **bytes)
+    struct kernel_page_cache_entry **output)
 {
     struct kernel_page_cache_entry *entry;
     if (kernel_heap_allocate_zeroed(cache->heap,1,sizeof(*entry),(void **)&entry))
@@ -1716,10 +1752,11 @@ static enum kernel_page_cache_status allocate_entry(struct kernel_page_cache *ca
     void *page;
     if (physical_page_map_owned(cache->allocator,entry->physical_address,&page))
         return abandon_entry(cache,entry,KERNEL_PAGE_CACHE_STATUS_STATE);
+    entry->data=page;
     if (clear) memset(page,0,BOAROS_PAGE_SIZE);
     if (kernel_vfs_node_acquire(node)) return abandon_entry(cache,entry,KERNEL_PAGE_CACHE_STATUS_STATE);
     entry->cache=cache;entry->node=node;entry->page_index=index;
-    *output=entry;*bytes=page;
+    *output=entry;
     return KERNEL_PAGE_CACHE_STATUS_OK;
 }
 static void publish_entry(struct kernel_page_cache *cache,struct kernel_page_cache_entry *entry,
@@ -1917,10 +1954,9 @@ static void readahead_load(struct kernel_page_cache *cache, struct readahead_job
         { CACHE_SCOPE(lookup, cache); found=index_find(plan->node,index)!=NULL; }
         if (found) continue;
         struct kernel_page_cache_entry *entry;
-        void *page;
-        if (allocate_entry(cache, plan->node, index, 0, &entry, &page)) break;
+        if (allocate_entry(cache, plan->node, index, 0, &entry)) break;
         entries[candidates] = entry;
-        spans[candidates++] = (struct file_read_span){index << BOAROS_PAGE_SHIFT, page, BOAROS_PAGE_SIZE, 0, 0};
+        spans[candidates++] = (struct file_read_span){index << BOAROS_PAGE_SHIFT, entry->data, BOAROS_PAGE_SIZE, 0, 0};
     }
     struct kernel_page_cache_entry *discard = NULL;
     {
@@ -2153,6 +2189,12 @@ void kernel_page_cache_put_batch(struct kernel_page_cache *cache,
     }
 }
 
+const void *kernel_page_cache_read_data(const struct kernel_page_cache_read_page *page)
+{
+    const struct kernel_page_cache_entry *entry=page->entry;
+    return entry->data;
+}
+
 enum kernel_page_cache_status kernel_page_cache_get(
     struct kernel_page_cache *cache, const struct kernel_vfs_file *file,
     uint64_t page_index, uint64_t *physical_address, size_t *valid_bytes)
@@ -2247,10 +2289,9 @@ static void __attribute__((noinline)) read_batch_local(struct kernel_page_cache 
     /* 容量按批次准备；候选未发布，整批分配不制造尚未提交的loading依赖。 */
     for (size_t i=0;!allocation && i<count;i++) {
         if (pages[i].status!=KERNEL_PAGE_CACHE_STATUS_NOT_FOUND || entries[i]) continue;
-        void *data;
-        allocation=allocate_entry(cache,node,first+i,0,&loads[i],&data);
+        allocation=allocate_entry(cache,node,first+i,0,&loads[i]);
         if (allocation) break;
-        spans[i]=(struct file_read_span){(first+i)<<BOAROS_PAGE_SHIFT,data,BOAROS_PAGE_SIZE,0,0};
+        spans[i]=(struct file_read_span){(first+i)<<BOAROS_PAGE_SHIFT,loads[i]->data,BOAROS_PAGE_SIZE,0,0};
         candidates++;
     }
     if (candidates) {
@@ -2280,6 +2321,7 @@ static void __attribute__((noinline)) read_batch_local(struct kernel_page_cache 
 struct cache_read_batch_request {
     struct kernel_page_cache *cache;
     const struct kernel_vfs_file *file;
+    struct kernel_vfs_node *node;
     uint64_t first;
     struct kernel_page_cache_read_page *pages;
     size_t count;
@@ -2288,7 +2330,7 @@ struct cache_read_batch_request {
 static int read_cached_batch(struct cache_read_batch_request *request)
 {
     struct kernel_page_cache *cache=request->cache;
-    struct kernel_vfs_node *node=kernel_vfs_file_node(request->file);
+    struct kernel_vfs_node *node=request->node;
     int pending=0,retry=0,remote=-1;
     {
 #if BOAROS_MAX_CPUS > 1
@@ -2303,9 +2345,8 @@ static int read_cached_batch(struct cache_read_batch_request *request)
             struct kernel_page_cache_read_page *page=&request->pages[i];
             uint64_t offset=(request->first+i)<<BOAROS_PAGE_SHIFT;
             if (offset>=size) { page->status=KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE; continue; }
-            struct kernel_page_cache_entry *entry;
-            enum kernel_page_cache_status status=lookup_entry(cache,request->file,request->first+i,&entry);
-            if (status==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND) {
+            struct kernel_page_cache_entry *entry=index_find(node,request->first+i);
+            if (!entry) {
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
                 page->cache_miss=1;
 #endif
@@ -2314,7 +2355,6 @@ static int read_cached_batch(struct cache_read_batch_request *request)
                 if (!remote) break;
                 continue;
             }
-            if (status) __builtin_trap();
             if (!read_entry_ready(entry)) {
                 if ((__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_ENTRY_CLOSED)) { retry=1; break; }
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
@@ -2351,7 +2391,7 @@ static void __attribute__((noinline)) prepare_read_batch(void *argument)
 {
     struct cache_read_batch_request *request = argument;
     struct kernel_page_cache *cache = request->cache;
-    struct kernel_vfs_node *node = kernel_vfs_file_node(request->file);
+    struct kernel_vfs_node *node=request->node;
     union foreground_workspace *lease=request->count>1?foreground_workspace_take(cache):NULL;
     if (request->count>1 && !lease) {
         for (size_t i=0;i<request->count;i++)
@@ -2381,9 +2421,8 @@ static void __attribute__((noinline)) prepare_read_batch(void *argument)
                 page->status = KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE;
                 continue;
             }
-            struct kernel_page_cache_entry *entry;
-            enum kernel_page_cache_status status = lookup_entry(cache, request->file, request->first + i, &entry);
-            if (!status) {
+            struct kernel_page_cache_entry *entry=index_find(node,request->first+i);
+            if (entry) {
                 if (read_entry_ready(entry)) {
                     size_t valid = size - offset < BOAROS_PAGE_SIZE ? size - offset : BOAROS_PAGE_SIZE;
                     take_read_page_borrow(cache, entry, &page->physical_address, &page->valid_bytes, &page->entry, valid);
@@ -2391,9 +2430,6 @@ static void __attribute__((noinline)) prepare_read_batch(void *argument)
                     continue;
                 }
                 entry_borrow(entry); entries[i] = entry;
-            } else if (status != KERNEL_PAGE_CACHE_STATUS_NOT_FOUND) {
-                page->status = status;
-                continue;
             }
             pending = 1;
         }
@@ -2408,7 +2444,8 @@ enum kernel_page_cache_status kernel_page_cache_get_batch(
     struct kernel_page_cache *cache, const struct kernel_vfs_file *file, uint64_t first,
     struct kernel_page_cache_read_page *pages, size_t count)
 {
-    if (!cache_live(cache) || !kernel_vfs_file_node(file) || count > KERNEL_PAGE_CACHE_READ_BATCH_MAX ||
+    struct kernel_vfs_node *node=kernel_vfs_file_node(file);
+    if (!cache_live(cache) || !node || count > KERNEL_PAGE_CACHE_READ_BATCH_MAX ||
         (count && (!pages || first > UINT64_MAX >> BOAROS_PAGE_SHIFT ||
             count - 1 > (UINT64_MAX >> BOAROS_PAGE_SHIFT) - first)))
         return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
@@ -2419,7 +2456,7 @@ enum kernel_page_cache_status kernel_page_cache_get_batch(
 #endif
     }
     if (!count) return KERNEL_PAGE_CACHE_STATUS_OK;
-    struct cache_read_batch_request request = {cache, file, first, pages, count};
+    struct cache_read_batch_request request = {cache, file, node, first, pages, count};
     /* local首个缺页后交给inode资格下的重查，不重复预扫整批。remote须先
      * 取出全部热页：尚未执行的CPU0请求被取消时，后部成功项也继续有效。 */
     if (read_cached_batch(&request)) {
@@ -2459,8 +2496,7 @@ static enum kernel_page_cache_status prepare_write_entry(struct kernel_page_cach
         if (status && !missing) return status;
     }
     if (missing && (whole || (index<<BOAROS_PAGE_SHIFT)>=kernel_vfs_node_size(node))) {
-        void *bytes;
-        return allocate_entry(cache,node,index,!whole,candidate,&bytes);
+        return allocate_entry(cache,node,index,!whole,candidate);
     }
     struct kernel_page_cache_read_page page={0};
     enum kernel_page_cache_status status=kernel_page_cache_get_batch(cache,file,index,&page,1);
@@ -2603,16 +2639,13 @@ static int copy_cached_source(struct kernel_page_cache *cache,struct kernel_vfs_
         int whole=!start && count==BOAROS_PAGE_SIZE;
         enum kernel_page_cache_status status;
 PrepareTarget:
-#if BOAROS_MAX_CPUS > 1
         if (whole && offset==old_size) {
             /* 新的完整 EOF 页不需要旧内容。先填私有页，发布时再查
              * 索引和容量，避免每页为同一个未命中先取得一次缓存锁。 */
-            void *bytes;
-            status=allocate_entry(cache,node,offset>>BOAROS_PAGE_SHIFT,0,&candidate,&bytes);
+            status=allocate_entry(cache,node,offset>>BOAROS_PAGE_SHIFT,0,&candidate);
         } else
-#endif
-        status=prepare_write_entry(cache,file,offset>>BOAROS_PAGE_SHIFT,
-            whole,&entry,&candidate,&address);
+            status=prepare_write_entry(cache,file,offset>>BOAROS_PAGE_SHIFT,
+                whole,&entry,&candidate,&address);
         if (status) {
             kernel_page_cache_resize_finish(&resize,old_size);
             if (status==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND) continue;
@@ -2670,9 +2703,7 @@ PrepareTarget:
             /* 私有页尚无读取者；先填入，再一次发布ready和dirty。
              * 竞胜页或写资格关闭时，原来源游标仍可重试。 */
             struct kernel_vfs_write_source copied_source=*source;
-            void *page;
-            if (physical_page_map_owned(cache->allocator,candidate->physical_address,&page)) __builtin_trap();
-            kernel_vfs_write_source_copy_view(&copied_source,(unsigned char *)page+start,&view);
+            kernel_vfs_write_source_copy_view(&copied_source,candidate->data+start,&view);
             CACHE_SCOPE(guard,cache);
             struct kernel_page_cache_entry *current=index_find(node,offset>>BOAROS_PAGE_SHIFT);
             if (current) {
@@ -2700,9 +2731,7 @@ PrepareTarget:
             continue;
         }
         if (!published) {
-            void *page;
-            if (physical_page_map_owned(cache->allocator,address,&page)) __builtin_trap();
-            kernel_vfs_write_source_copy_view(source,(unsigned char *)page+start,&view);
+            kernel_vfs_write_source_copy_view(source,entry->data+start,&view);
         }
         resize_apply(&resize,offset>old_size?offset:old_size);
         if (!published) {
@@ -2930,19 +2959,35 @@ Retry:
     return 0;
 }
 
+static void return_prepared_versions(struct kernel_page_cache *cache,
+    struct prepared_writeback *prepared,size_t count,int unused_only)
+{
+    struct cache_version *idle=NULL;
+    int returned=0;
+    while (count) {
+        struct prepared_writeback *p=&prepared[--count];
+        if (!p->version || (unused_only && p->closed)) continue;
+        returned|=version_drop(p->version,0,&idle);
+        p->version=NULL;
+    }
+    version_idle_return(cache->record->versions,idle);
+    if (returned) group_returned(cache->record->group);
+}
+
 /* Versions belong to this caller before qualification; never close a later
  * writer gate or keep its unused version while resolving this boundary. */
 static int prepare_writeback_prefix(struct kernel_page_cache *cache,
     struct kernel_page_cache_entry **entries,size_t count,uint64_t limit,
     int background,struct prepared_writeback *prepared,size_t *done)
 {
-    size_t candidates=0;
-    int own_input=0;
-    while (candidates<count) {
+    size_t available=0,candidates=0;
+    while (available<count && !owns_writeback_input(entries[available])) available++;
+    struct version_pool *pool=cache->record->versions;
+    struct cache_version *idle=version_idle_take(pool,available);
+    while (candidates<available) {
         struct kernel_page_cache_entry *entry=entries[candidates];
-        if (owns_writeback_input(entry)) { own_input=1; break; }
         struct prepared_writeback *p=&prepared[candidates++];
-        p->version=version_take(cache,entry->node);
+        p->version=version_take_from(pool,&idle,entry->node);
         if (!p->version) break;
     }
     int result=0;
@@ -2954,14 +2999,8 @@ static int prepare_writeback_prefix(struct kernel_page_cache *cache,
             if (result) break;
         }
     }
-    int returned=0;
-    for (size_t i=0;i<candidates;i++) {
-        if (prepared[i].closed || !prepared[i].version) continue;
-        returned|=version_return(prepared[i].version,0);
-        prepared[i].version=NULL;
-    }
-    if (returned) group_returned(cache->record->group);
-    return result?result:own_input?-KERNEL_EBUSY:0;
+    return_prepared_versions(cache,prepared,candidates,1);
+    return result?result:available<count && candidates==available?-KERNEL_EBUSY:0;
 }
 
 static int prepare_writeback_batch(struct kernel_page_cache *cache,
@@ -3070,8 +3109,6 @@ static void capture_writeback(struct kernel_page_cache *cache,
         struct prepared_writeback *p=&prepared[i];
         if (!p->version) continue;
         struct kernel_page_cache_entry *entry=entries[i];
-        void *page;
-        if (physical_page_map_owned(cache->allocator,entry->physical_address,&page)) __builtin_trap();
         size_t cursor=p->begin,begin,end;
         size_t copy_block=writeback_block_size(entry);
         unsigned char *stable=version_data(p->version);
@@ -3079,7 +3116,7 @@ static void capture_writeback(struct kernel_page_cache *cache,
             size_t first=begin&~(copy_block-1),last=(end+copy_block-1)&~(copy_block-1);
             size_t copy_end=last<p->valid?last:p->valid;
             COST_ADD(SNAPSHOT_COPY,copy_end-first);COST_ADD(WRITEBACK_REQUESTED,end-begin);
-            memcpy(stable+first,(unsigned char *)page+first,copy_end-first);
+            memcpy(stable+first,entry->data+first,copy_end-first);
             memset(stable+copy_end,0,last-copy_end);
         }
         p->written=0;
@@ -3185,10 +3222,7 @@ static int writeback_run(struct kernel_page_cache *cache,
             }
         }
         /* 完成状态和entry借用按批发布；稳定版本的实际归还仍在保护外。 */
-        int returned=0;
-        for (size_t i=done;i>0;i--)
-            if (prepared[i-1].version) returned|=version_return(prepared[i-1].version,0);
-        if (returned) group_returned(cache->record->group);
+        return_prepared_versions(cache,prepared,done,0);
         /* Publish a prepared prefix before waiting for another stable owner.
          * This ends its entry qualifications, allowing a foreground writer
          * that borrowed the last version to finish and return that version. */
@@ -3531,12 +3565,10 @@ static void resize_apply(struct kernel_page_cache_resize *token,uint64_t actual)
     struct kernel_page_cache *cache=entry->cache;
     uint64_t boundary=token->old_size<actual?token->old_size:actual;
     if (actual!=token->old_size && entry->page_index==(boundary>>BOAROS_PAGE_SHIFT)) {
-        void *page;
-        if (physical_page_map_owned(cache->allocator,entry->physical_address,&page)) __builtin_trap();
         size_t begin=boundary&BOAROS_PAGE_MASK;
         size_t end=actual<token->old_size?BOAROS_PAGE_SIZE:
             actual-boundary<BOAROS_PAGE_SIZE-begin?begin+(size_t)(actual-boundary):BOAROS_PAGE_SIZE;
-        memset((unsigned char *)page+begin,0,end-begin);
+        memset(entry->data+begin,0,end-begin);
         CACHE_SCOPE(guard,cache);
         if (actual<token->old_size && entry->dirty_end>begin) entry->dirty_end=begin;
         if (entry->dirty_end && entry->dirty_begin>=entry->dirty_end) dirty_clear(entry);
@@ -3661,7 +3693,8 @@ uint64_t kernel_page_cache_reclaim(struct kernel_page_cache *cache,uint64_t targ
             CACHE_SCOPE(guard,cache);
             while (retired) {
                 struct kernel_page_cache_entry *entry=retired;retired=entry->reclaim_next;
-                entry->physical_address=0;entry->page_references_owned=0;entry->reclaim_next=NULL;
+                entry->physical_address=0;entry->data=NULL;
+                entry->page_references_owned=0;entry->reclaim_next=NULL;
                 entry_return(entry);
             }
         }

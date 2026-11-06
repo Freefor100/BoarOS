@@ -137,6 +137,9 @@ struct ext4_delalloc {
     struct ext4_delalloc_tree tree;
     struct ext4_delalloc_chunk *retired;
     uint64_t blocks;
+    /* One confirmed allocated interval below the accepted inode size.
+     * The inode writer owns it, as it owns the reservation tree. */
+    uint64_t mapped_first, mapped_end;
 };
 
 /**@brief   File descriptor. */

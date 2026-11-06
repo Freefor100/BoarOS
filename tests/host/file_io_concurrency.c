@@ -965,6 +965,12 @@ static void *read_and_write(void *unused)
     assert(!kernel_files_pwrite(&files,&mm,0,0x100000+BOAROS_PAGE_SIZE-4,8,64,&result) && result==4);
     assert(!kernel_mm_mprotect(&mm,0x100000+BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE));
     assert(!kernel_copy_from_user(&mm,&sentinel,0x100000+BOAROS_PAGE_SIZE,1,&copied) && copied==1 && sentinel==0xa5);
+    uint64_t across=0x100000+BOAROS_PAGE_SIZE-4;
+    assert(!kernel_files_pread(&files,&mm,0,across,8,32,&result) && result==8);
+    assert(!kernel_files_pwrite(&files,&mm,0,across,8,56,&result) && result==8);
+    assert(!kernel_open_file_pread(control,56,bytes,8,&copied) && copied==8 &&
+        !memcmp(bytes,"original",8));
+    assert(!kernel_io_context_current()->user_pins);
     mapped_source_write();
     assert(!kernel_files_dup(&files,0,&result) && result==1);
     assert(!kernel_files_close(&files,0,&result) && !result);
@@ -1231,6 +1237,35 @@ static void sendfile_pipe_case(struct kernel_heap *heap,struct kernel_vfs_mount 
     puts("PASS sendfile source-page borrow: unaligned cross-page pipe content, sparse zero bytes and explicit offset");
 }
 
+static void cached_copy_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
+{
+    struct kernel_files local={0};
+    struct kernel_open_file_description *in=NULL,*out=NULL;
+    unsigned char data[3*BOAROS_PAGE_SIZE+37],actual[sizeof(data)];
+    int error;int64_t result;size_t done;
+    for (size_t i=0;i<sizeof(data);i++) data[i]=(unsigned char)(i^(i>>8));
+    assert(!kernel_files_create(&local,heap));
+    assert(!kernel_open_file_create_mode(heap,mount,"/cached-copy-src",0600,&in,&error) && !error);
+    assert(!kernel_open_file_create_mode(heap,mount,"/cached-copy-dst",0600,&out,&error) && !error);
+    in->open_flags=out->open_flags=2;
+    assert(!kernel_vfs_file_acquire_write(&in->file) && !kernel_vfs_file_acquire_write(&out->file));
+    assert(!kernel_vfs_pwrite(&in->file,0,data,sizeof(data),&done) && done==sizeof(data));
+    in->offset=19;out->offset=37;
+    struct kernel_open_file_description *src=in,*dst=out;
+    assert(!kernel_files_install_new_owned_at(&local,0,0,&in));
+    assert(!kernel_files_install_new_owned_at(&local,1,0,&out));
+    watch_memory_staging=1;memory_staging_calls=0;
+    assert(!kernel_files_copy_range(&local,&mm,0,0,1,0,sizeof(data),0,&result) &&
+        result==sizeof(data)-19);
+    watch_memory_staging=0;
+    assert(src->offset==sizeof(data) && dst->offset==sizeof(data)+18);
+    assert(!kernel_vfs_pread(&dst->file,37,actual,sizeof(data)-19,&done,NULL) &&
+        done==sizeof(data)-19 && !memcmp(actual,data+19,done));
+    assert(!memory_staging_calls && "cached file copy must not stage the payload");
+    assert(!kernel_files_release(&local));
+    puts("PASS cached file copy: cross-page data, EOF and offsets without payload staging");
+}
+
 static void vector_boundaries(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
 {
     struct kernel_files local={0};
@@ -1450,7 +1485,7 @@ static void borrowed_page_case(struct physical_page_allocator *pages)
     kernel_task_io_buffer_release(&scratch);
     uint64_t before=physical_page_available(pages),physical;
     assert(!physical_page_allocate(pages,&physical));
-    kernel_task_io_buffer_take_page(&borrowed,pages,physical);
+    kernel_task_io_buffer_take_page(&borrowed,pages,physical,NULL);
     assert(borrowed.physical_address==physical && !borrowed.retained_scratch);
     kernel_task_io_buffer_release(&borrowed);
     assert(physical_page_available(pages)==before);
@@ -1530,6 +1565,7 @@ int main(int argc,char **argv)
     assert(!kernel_block_register(&disk,KERNEL_BLOCK_DEVICE_NUMBER(101)));
     struct kernel_vfs_mount mount={0}; assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,&cache,0));
     assert(!kernel_vfs_start_journal_worker(&mount));
+    cached_copy_case(&heap,&mount);
     namespace_retirement_case(&heap,&mount);
     namespace_snapshot_case(&heap,&mount);
     namespace_parent_snapshot_case(&heap,&mount);

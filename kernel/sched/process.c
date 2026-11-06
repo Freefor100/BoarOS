@@ -2107,7 +2107,7 @@ enum kernel_task_status kernel_task_io_buffer_acquire(
         if (status == PHYSICAL_PAGE_STATUS_EMPTY)
             return KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE;
         if (status != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
-        if (physical_page_resolve(allocator, physical, &data) !=
+        if (physical_page_map_owned(allocator, physical, &data) !=
             PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
         if (task != 0) {
             task->io_scratch_allocator = allocator;
@@ -2122,13 +2122,13 @@ enum kernel_task_status kernel_task_io_buffer_acquire(
 }
 
 void kernel_task_io_buffer_take_page(struct kernel_task_io_buffer *buffer,
-    struct physical_page_allocator *allocator, uint64_t physical_address)
+    struct physical_page_allocator *allocator, uint64_t physical_address,const void *mapped)
 {
     struct kernel_task *task = kernel_task_current();
     if (!buffer || buffer->allocator || !allocator || (task && task->io_buffer))
         __builtin_trap();
-    void *data;
-    if (physical_page_resolve(allocator, physical_address, &data)) __builtin_trap();
+    void *data=(void *)mapped;
+    if (!data && physical_page_map_owned(allocator, physical_address, &data)) __builtin_trap();
     *buffer = (struct kernel_task_io_buffer){.task=task, .allocator=allocator,
         .physical_address=physical_address, .data=data};
     if (task) task->io_buffer=buffer;
