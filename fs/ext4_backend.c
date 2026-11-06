@@ -5,6 +5,7 @@
 #include "record_lock.h"
 
 #include <kernel/cost.h>
+#include <kernel/cpu.h>
 #include <kernel/block.h>
 #include <kernel/errno.h>
 #include <kernel/file_mapping.h>
@@ -1359,12 +1360,35 @@ static int start_journal_workers(struct kernel_vfs_mount *mount)
         if (result != EOK) return lwext4_error(result);
     }
     enum kernel_scheduler_status status = KERNEL_SCHEDULER_STATUS_OK;
+#if BOAROS_USER_SMP
+    unsigned checkpoint_cpu = 0, commit_cpu = 0;
+    unsigned cpus = kernel_cpu_get_boot_count();
+    if (adapter->device.fs->jbd_journal && cpus > 1) {
+        /* Keep checkpoint off the device IRQ CPU. Spread mounts over the
+         * secondary CPUs and separate commit and checkpoint when possible. */
+        checkpoint_cpu = 1 + (mount->id - 1) % (cpus - 1);
+        if (cpus > 2) commit_cpu = 1 + checkpoint_cpu % (cpus - 1);
+    }
+#endif
     if (!adapter->journal_started && adapter->device.fs->jbd_journal) {
+#if BOAROS_USER_SMP
+        if (checkpoint_cpu)
+            status = kernel_thread_create_joinable_worker(journal_checkpoint_worker,
+                adapter, &adapter->checkpoint_worker, checkpoint_cpu);
+        else
+#endif
         status = kernel_thread_create_joinable(journal_checkpoint_worker, adapter, &adapter->checkpoint_worker);
         if (status == KERNEL_SCHEDULER_STATUS_OK) adapter->checkpoint_started = 1;
     }
-    if (!adapter->journal_started && status == KERNEL_SCHEDULER_STATUS_OK)
+    if (!adapter->journal_started && status == KERNEL_SCHEDULER_STATUS_OK) {
+#if BOAROS_USER_SMP
+        if (commit_cpu)
+            status = kernel_thread_create_joinable_worker(journal_worker,
+                adapter, &adapter->journal_worker, commit_cpu);
+        else
+#endif
         status = kernel_thread_create_joinable(journal_worker, adapter, &adapter->journal_worker);
+    }
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         if (adapter->checkpoint_started) {
             journal_stop_workers(adapter);
@@ -2225,12 +2249,18 @@ static void ext4_backend_accessed(struct kernel_vfs_file *file)
     }
     struct lwext4_node *node = (struct lwext4_node *)base;
     if (node->noatime) return;
-    struct ext4_timestamp now;
-    if (!ext4_file_read_clock(lwext4_node_file(base), &now)) return;
+    struct ext4_timestamp now, atime;
+    int modified;
     {
         TIMESTAMP_SCOPE(times, adapter);
-        if (!time_access_needed(node, now)) return;
+        atime = node->times[0];
+        modified = time_compare(node->times[1], atime) >= 0 ||
+            time_compare(node->times[2], atime) >= 0;
     }
+    /* 写后的relatime已由时间顺序决定；仅年龄判断需要提前采样。
+     * 快照只用于跳过更新，发布仍在remount资格内重查当前时间。 */
+    if (!modified && (!ext4_file_read_clock(lwext4_node_file(base), &now) ||
+        now.seconds - atime.seconds < 86400)) return;
     /* Suppressed relatime reads do not mutate the mount. Recheck after taking
      * remount qualification: another reader may already have published atime. */
     KERNEL_LOCK_SCOPE(mutation);
@@ -2814,16 +2844,16 @@ static int ext4_backend_prepare_write(struct kernel_vfs_node *node,uint64_t offs
     return lwext4_error(result);
 }
 static int ext4_backend_reserve_write(struct kernel_vfs_node *node,uint64_t offset,
-    size_t length,size_t *ready,int *complete,void **ticket)
+    size_t length,size_t *ready,int *complete,struct file_write_reservation *ticket)
 {
     *complete=0;
     int result=ext4_file_reserve_write(lwext4_node_file(node),offset,length,ready,ticket);
     if (result==ENOTSUP)return ext4_backend_prepare_write(node,offset,length,ready,complete);
     return lwext4_error(result);
 }
-static void ext4_backend_accept_reservation(struct kernel_vfs_node *node,void *ticket,uint64_t start,uint64_t end)
+static void ext4_backend_accept_reservation(struct kernel_vfs_node *node,struct file_write_reservation *ticket,uint64_t start,uint64_t end)
 { ext4_file_accept_reservation(lwext4_node_file(node),ticket,start,end); }
-static void ext4_backend_finish_reservation(struct kernel_vfs_node *node,void *ticket,uint64_t start,uint64_t end)
+static void ext4_backend_finish_reservation(struct kernel_vfs_node *node,struct file_write_reservation *ticket,uint64_t start,uint64_t end)
 { ext4_file_finish_reservation(lwext4_node_file(node),ticket,start,end); }
 static int ext4_backend_complete_write(struct kernel_vfs_node *node)
 {

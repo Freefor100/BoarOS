@@ -114,9 +114,21 @@ OFD pin 覆盖可能缺页睡眠的复制。`make test-record-lock-riscv` 用同
 
 `chroot` 按最终目录检查类型、搜索权限和 `CAP_SYS_CHROOT`，在共同短保护内替换 root 引用，保留 cwd。fork复制记录，CLONE_FS共享记录中的 root/cwd；已有 dirfd 和 OFD 保持原对象及已打开权利，绝对路径与后续解释器从新root开始解析。
 
+`openat2(437)` 导入 24 字节的 `open_how`，接受全零的扩展尾部，单独校验 flags、mode 和 resolve。它与 `openat` 共用打开及创建路径。解析器在跨越挂载点（包括 bind）、跟随符号链接或 proc 对象链接时检查对应限制；`RESOLVE_BENEATH` 拒绝逃出起点，`RESOLVE_IN_ROOT` 将绝对路径、绝对链接和根处的 `..` 限制在起点。发生挂载拓扑或目录父链变化时，受限查找可返回 `EAGAIN`，调用方可用相同约束重试。`OPENAT2_REGULAR` 在打开设备或 FIFO 之前要求最终对象为普通文件。
+
+现有路径索引命中后仍需后端复核，`RESOLVE_CACHED` 返回 `EAGAIN`，应用可去掉该位重试并保留其他解析限制。`O_TMPFILE`、`O_DIRECT`、`O_NOATIME` 和 `O_EMPTYPATH` 仍返回 `EOPNOTSUPP`。`tests/userland/openat2.c` 检查参数、受限创建、bind 挂载和 proc 链接。
+
 `getcwd` 返回包含 NUL 的字节数；用户缓冲不足为 `ERANGE`，已断开的 cwd 为 `ENOENT`。仍连接在命名空间但位于新root之外的cwd，raw syscall返回`(unreachable)`前缀及命名空间绝对路径；libc据此处理ENOENT。proc cwd/exe/fd/maps的展示保留根外及摘树对象的绝对名称和删除后缀，实际对象链接跟随仍持有真实路径，不依赖这些展示文本。删除目录后，其持有者仍可对 `.` 打开/统计、经 `..` 访问父目录、通过 `fchdir` 切回；不能在已删除目录中新建名字。改名会更新所有持有同一目录项的 cwd/OFD 所观察到的父链。fork 独立复制 fs record，进程形式和线程形式的 `CLONE_FS` 都共享它；切换 cwd 先取得新引用再替换，失败不改变原目录。
 
 `renameat2` 支持 flags 0 和 `RENAME_NOREPLACE`；未知或互斥组合返回 `EINVAL`，EXCHANGE/WHITEOUT 返回 `ENOTSUP`。保留 `renameat(38)` 兼容入口；固定 RV64 Linux 与 musl 使用 `renameat2(276)` 完成普通 rename，因此差分也使用该原生入口。后端操作事务成功接受后发布内存目录项变化，异步 journal mount 的持久化由组提交及目录同步保证；覆盖目标的 OFD 保留原 inode 和内容。目录 `..`、两侧链接数和持久 orphan 由同一事务处理。
+
+## `memfd_create` 与文件封印
+
+`memfd_create(279)` 返回可读写的匿名 tmpfs 文件；名称只用于 `/proc/<pid>/fd` 等展示。文件没有目录项，可通过 dup、fork 或 UNIX socket 传递 FD，也可经 proc FD 链接重新打开。FD 与映射共同维持同一 inode 和内存后备的寿命。支持 `MFD_CLOEXEC`、`MFD_ALLOW_SEALING`、`MFD_EXEC` 和 `MFD_NOEXEC_SEAL`；`MFD_HUGETLB` 返回 `EOPNOTSUPP`。
+
+`F_GET_SEALS` 查询 inode 上的封印，`F_ADD_SEALS` 通过可写 FD 增加封印。SHRINK、GROW 和 WRITE 约束对应的文件修改；已有共享映射仍有写权限或可升级为写时，添加 WRITE 返回 `EBUSY`。FUTURE_WRITE 禁止新的写入和新的共享可写映射，保留原有映射的权限；后续建立的共享只读映射不能用 `mprotect` 加写权限。EXEC 锁定执行位，给已可执行的文件增加该封印时也封住写入和尺寸变更；SEAL 禁止继续增加封印。映射拆分、搬移和 fork 维护原 inode 的写资格，撤映射在旧 PTE 失效后归还。
+
+`tests/userland/memfd.c` 检查 FD 传递、共享映射、proc 重开、封印和尺寸变更。
 
 ## `pipe2` 与 FIFO endpoint
 
@@ -322,7 +334,7 @@ linkat和readlinkat使用原身份，NOFOLLOW可持有链接自身。数据、se
 直接fd改权/所有权/时间与同步入口先返回EBADF；网络ioctl/socket入口同样先检查资格。
 poll显示POLLNVAL；select按固定Linux的POLLIN/OUT/EX_SET将它映射到所请求的集合，
 不把有效路径fd误当成已经关闭的fd。
-unlink/rename及同名重建不会替换句柄身份。execveat以实际OFD/path重新检查执行权限，复用现有exec事务，见[执行模块](kernel-exec.md)；openat2仍未交付。
+unlink/rename及同名重建不会替换句柄身份。execveat以实际OFD/path重新检查执行权限，复用现有exec事务，见[执行模块](kernel-exec.md)。
 `make build/diff-abi/path-rv`配`tests/diff-abi/path-cases.txt`可聚焦差分；完整ABI仍包含同一记录。
 `O_NOCTTY` 是合法open flag，其控制终端语义见[TTY模块](kernel-tty.md)。
 固定 Linux
@@ -384,7 +396,7 @@ filecap设置接受revision 2／3，revision 3的rootid=0查询为revision 2，�
 
 普通文件写入以目标页组织接纳，直接填入最终页；来源用户页和 iovec 边界只决定复制片段。tmpfs 与磁盘页缓存共用至多两个来源页的有界借用，连续且可读的跨页来源可以一次覆盖整个目标页，冷完整覆盖无需先读旧数据。来源缺页在 inode 数据锁和目标写借用之外处理；持有首个 pin 后只尝试取得已驻留的后续页，遇到缺页或 MM 编辑先接纳可用前缀，归还 pin 后再处理。冷完整覆盖候选若缩为前缀，先放弃候选并按部分覆盖准备旧尾，随后重新取得来源。散布 iovec 超过两个不同来源页时分批处理，不暂存载荷；同物理页的重叠片段按原次序使用 `memmove`，旧 EOF 后的空隙在来源复制后清零。tmpfs 后端只提交尺寸和时间元数据。
 
-TCP 标量和向量写入共用有界用户页批次：取得接纳容量后，在协议保护外准备至多四个页pin和四个片段，直接交给 `tcp_write(COPY)`。同一用户页跨iovec复用pin，相邻片段在页内合并；已有pin时，后续缺页或MM编辑冲突先提交可用前缀，再归还pin处理下一页。临时游标仅用于准备，实际接纳量决定正式游标推进；未接纳部分在等待后重新解析。一页输入若包含超过四段不连续地址，则复用同一工作区合并成一个载荷批次，避免小片段逐批往返CPU0。该分支保留已复制但尚未接纳的尾部，直至实际接纳或调用结束；连续输入的工作区只保存页引用和片段描述。末批、窗口满或阻塞前输出协议队列；提前返回和退出也发送已接纳前缀。请求页不借给 TCP，协议仍 COPY 并自行持有 ACK 前的版本。socket 接收直接从保活的 packet/pbuf 跨 iovec 复制到用户，AF_UNIX STREAM 直接填写最终队列块，INET UDP 直接填写最终 pbuf；datagram 保持整包 owner。pipe 保持自己的 ring 协议，console 保持小块暂存。普通文件的 offset、O_APPEND、定位写与同步错误观察规则不变；socket owner 细节见[网络模块](kernel-network.md)。
+TCP 标量和向量写入共用有界用户页批次。取得接纳额度后，通常在协议保护外准备至多四个页引用和片段；RV 已迁入分片的连接最多准备九项，以覆盖未对齐的 32 KiB 回环窗口。同一用户页跨 iovec 复用引用，相邻片段在页内合并；已有引用时，后续缺页或 MM 编辑冲突先交付可用前缀，再归还页引用处理下一页。大批发送先把内容复制到最终 TCP 段，归还用户页后才取得分片接纳资格。小写入仍可填充已有 TCP 段的尾部。临时游标仅用于准备，实际接纳量决定正式游标推进；未接纳部分在等待后重新解析。一页输入的非连续片段超过批次上限时，复用同一工作区合并载荷；这条路径保留已复制但尚未接纳的尾部，直至实际接纳或调用结束。末批、窗口满或阻塞前推动出包；提前返回和退出也发送已接纳前缀。请求页不借给 TCP，协议保留 ACK 前的 COPY 版本。socket 接收直接从保活的 packet/pbuf 跨 iovec 复制到用户，AF_UNIX STREAM 直接填写最终队列块，INET UDP 直接填写最终 pbuf；datagram 保持整包 owner。pipe 保持自己的 ring 协议，console 保持小块暂存。普通文件的 offset、O_APPEND、定位写与同步错误观察规则不变；socket owner 细节见[网络模块](kernel-network.md)。
 
 `kernel_files_statistics.write_chunks` 记录普通文件的实际用户复制片段及 TCP/UNIX STREAM 的接纳批次，`read_chunks` 的 socket 项记录实际 packet 读取，不代表中转复制。`make test-scale-riscv` 用真实 VFS/MM/uaccess 验证对齐 1 MiB 文件写入的内容、部分失败和页解析；当前为 256 个片段、256 次用户页解析、1 MiB 用户复制、0 字节页缓存额外复制。页解析使用已有 COST 指标，普通构建不再更新独立的全局原子计数。这些数值描述复制量与工作次数，不代表吞吐倍数。
 

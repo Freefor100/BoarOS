@@ -688,7 +688,7 @@ void netif_invoke_ext_callback(struct netif* netif, netif_nsc_reason_t reason, c
 #define netif_invoke_ext_callback(netif, reason, args)
 #endif
 
-#if LWIP_TESTMODE && LWIP_HAVE_LOOPIF
+#if LWIP_HAVE_LOOPIF && (LWIP_TESTMODE || defined(BOAROS_LWIP_LOOPBACK_MSS))
 struct netif* netif_get_loopif(void);
 #endif
 

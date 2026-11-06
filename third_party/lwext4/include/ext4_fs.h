@@ -52,6 +52,7 @@ extern "C" {
 #include <ext4_operation.h>
 #include <ext4.h>
 #include <kernel/io_context.h>
+#include <kernel/raw_lock.h>
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -76,6 +77,7 @@ struct ext4_fs {
 	struct ext4_orphan_index *orphan_index;
 	uint32_t active_operations;
 	const struct ext4_lock *os_locks;
+    struct kernel_raw_lock block_space;
     uint64_t reserved_blocks;
     uint64_t delayed_blocks;
     uint32_t reserved_inodes;
@@ -144,6 +146,7 @@ void ext4_operation_discard_inode_goals(struct ext4_operation *operation);
 void ext4_fs_retire_inode_goals(struct ext4_fs *fs, uint64_t durable);
 int ext4_operation_prepare_super(struct ext4_operation *operation, struct ext4_sblock *merged);
 int ext4_operation_require_resource(struct ext4_fs *fs, enum ext4_resource_kind kind, uint32_t key);
+int ext4_operation_require_shared_block_group(struct ext4_fs *fs, uint32_t key, bool *shared);
 int ext4_operation_claim_inode(struct ext4_fs *fs, uint32_t inode);
 void ext4_operation_release_resources(struct ext4_fs *fs);
 bool ext4_operation_resource_retry(struct ext4_fs *fs);
@@ -241,6 +244,11 @@ int ext4_fs_get_block_group_ref(struct ext4_fs *fs, uint32_t bgid,
 				struct ext4_block_group_ref *ref);
 int ext4_fs_get_block_group_ref_write(struct ext4_fs *fs, uint32_t bgid,
                                     struct ext4_block_group_ref *ref);
+/* A claim caller already owns the group's shared allocation qualification. */
+int ext4_fs_get_block_group_ref_claim(struct ext4_fs *, uint32_t,
+                                    struct ext4_block_group_ref *);
+bool ext4_fs_verify_bg_csum(struct ext4_sblock *, uint32_t, struct ext4_bgroup *);
+void ext4_fs_update_bg_csum(struct ext4_sblock *, uint32_t, struct ext4_bgroup *);
 /* Allocation prepares the block bitmap; inode allocation also prepares its
  * inode bitmap. New inode slots are initialized by ext4_fs_alloc_inode. */
 int ext4_fs_get_block_group_ref_alloc(struct ext4_fs *fs, uint32_t bgid,

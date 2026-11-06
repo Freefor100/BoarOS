@@ -524,7 +524,7 @@ enum kernel_scheduler_status scheduler_switch_current_away_locked(
     if (!guard || cpu->raw_locks != guard || guard->lock != &kernel_wait_domain)
         __builtin_trap();
 #if BOAROS_USER_SMP
-    if (!previous->wait.deadline && !previous->scheduling.priority && !previous->user_service &&
+    if (!previous->scheduling.priority && !previous->user_service &&
         (previous->state==KERNEL_THREAD_STATE_BLOCKED || previous->state==KERNEL_THREAD_STATE_READY)) {
         struct kernel_task *next;
         uint64_t deadline;
@@ -987,7 +987,8 @@ static unsigned available_cpu_mask_locked(void)
 
 static enum kernel_scheduler_status create_kernel_thread(
     void (*entry)(void *), void *argument, struct kernel_thread_join *join,
-    uint32_t cpu_mask, struct kernel_mm *bound_mm, struct kernel_files *bound_files)
+    uint32_t cpu_mask, int controlled,
+    struct kernel_mm *bound_mm, struct kernel_files *bound_files)
 {
     struct kernel_task *thread;
     uintptr_t old_status;
@@ -1026,9 +1027,10 @@ static enum kernel_scheduler_status create_kernel_thread(
     thread->arch.user_sp = 0U;
 #if BOAROS_MAX_CPUS > 1
     thread->cpu_mask = cpu_mask ? cpu_mask : 1;
-    thread->controlled = cpu_mask != 0;
+    thread->controlled = controlled;
 #else
     (void)cpu_mask;
+    (void)controlled;
 #endif
     thread->arch.user_mode = 0U;
     arch_thread_set_mm(&thread->arch, bound_mm ? bound_context : scheduler.kernel_context);
@@ -1068,9 +1070,8 @@ static enum kernel_scheduler_status create_kernel_thread(
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
 #if BOAROS_MAX_CPUS > 1
-        /* 私有准备可能睡眠；只有最终接纳点的在线资格有效。停止者在CPU0
-         * 禁抢占，成功接纳先取得controlled owner再发布runnable。 */
-        if (thread->controlled && (thread->cpu_mask & ~available_cpu_mask_locked()))
+        /* Allocation can sleep; check the execution CPUs again before publication. */
+        if (cpu_mask && (cpu_mask & ~available_cpu_mask_locked()))
             status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
 #endif
         if (status == KERNEL_SCHEDULER_STATUS_OK) {
@@ -1110,9 +1111,17 @@ restore_interrupts:
 
 enum kernel_scheduler_status kernel_thread_create_joinable(
     void (*entry)(void *), void *argument, struct kernel_thread_join *join)
-{ return create_kernel_thread(entry, argument, join, 0, 0, 0); }
+{ return create_kernel_thread(entry, argument, join, 0, 0, 0, 0); }
 
 #if BOAROS_MAX_CPUS > 1
+enum kernel_scheduler_status kernel_thread_create_joinable_worker(
+    void (*entry)(void *), void *argument, struct kernel_thread_join *join, unsigned cpu)
+{
+    kernel_assert_service_context();
+    if (!join || cpu >= BOAROS_MAX_CPUS) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
+    return create_kernel_thread(entry, argument, join, 1U << cpu, 0, 0, 0);
+}
+
 int kernel_scheduler_core_quiescent(struct kernel_cpu *cpu)
 {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
@@ -1132,7 +1141,7 @@ enum kernel_scheduler_status kernel_thread_create_joinable_mask(
     { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
       available = available_cpu_mask_locked(); }
     if (mask & ~available) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
-    return create_kernel_thread(entry, argument, join, mask, 0, 0);
+    return create_kernel_thread(entry, argument, join, mask, 1, 0, 0);
 }
 enum kernel_scheduler_status kernel_thread_create_joinable_mm(
     void (*entry)(void *), void *argument, struct kernel_thread_join *join,
@@ -1143,7 +1152,7 @@ enum kernel_scheduler_status kernel_thread_create_joinable_mm(
     unsigned available;
     { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); available = available_cpu_mask_locked(); }
     if (mask & ~available) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
-    return create_kernel_thread(entry, argument, join, mask, mm, 0);
+    return create_kernel_thread(entry, argument, join, mask, 1, mm, 0);
 }
 
 enum kernel_scheduler_status kernel_thread_create_joinable_files(
@@ -1161,7 +1170,7 @@ enum kernel_scheduler_status kernel_thread_create_joinable_files(
         ? KERNEL_SCHEDULER_STATUS_NO_MEMORY : KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
     enum kernel_scheduler_status status;
     if (kernel_files_acquire(&files_owner,files)) status=KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-    else status=create_kernel_thread(entry,argument,join,mask,&mm_owner,&files_owner);
+    else status=create_kernel_thread(entry,argument,join,mask,1,&mm_owner,&files_owner);
     if (files_owner.state==KERNEL_FILES_LIVE && kernel_files_release(&files_owner)) __builtin_trap();
     if (mm_owner.state==KERNEL_MM_LIVE && kernel_mm_release(&mm_owner)) __builtin_trap();
     return status;

@@ -2,13 +2,26 @@
 #define BOAROS_LWIPOPTS_H
 
 #include "boaros_lwip.h"
-#define LWIP_HOOK_TCP_INPACKET_PCB(pcb, hdr, optlen, opt1len, opt2, p) boaros_lwip_tcp_input(pcb)
+#define LWIP_HOOK_TCP_OUTPUT_PENDING(pcb) boaros_lwip_tcp_output(pcb)
 #define LWIP_HOOK_NETIF_LOOPBACK_QUEUED(netif) boaros_lwip_work_ready()
+#if BOAROS_USER_SMP
+#define LWIP_HOOK_NETIF_LOOPBACK_PUBLISH(netif) do { \
+    if (boaros_lwip_parallel_enabled()) boaros_lwip_loopback_publish(netif); \
+} while(0)
+#endif
 #define LWIP_HOOK_MEMP_RELEASED(type) boaros_lwip_capacity_available(type)
 #define LWIP_HOOK_MEM_AVAILABLE() boaros_lwip_capacity_available(-1)
 
 #define NO_SYS 1
+#if BOAROS_MAX_CPUS != 1
+#define BOAROS_LWIP_TCP_CONTEXT 1
+#define BOAROS_LWIP_SHARED_MEMORY 1
+#endif
+#ifdef BOAROS_LWIP_SHARED_MEMORY
+#define SYS_LIGHTWEIGHT_PROT 1
+#else
 #define SYS_LIGHTWEIGHT_PROT 0
+#endif
 #define LWIP_TIMERS 1
 #define LWIP_IPV4 1
 #define LWIP_IPV6 1
@@ -17,6 +30,7 @@
 #define LWIP_IPV6_REASS 0
 #define LWIP_IPV6_FRAG 0
 #define LWIP_TCP 1
+#define BOAROS_LWIP_TCP_WRITEV 1
 #define SO_REUSE 1
 #define TCP_LISTEN_BACKLOG 1
 #define LWIP_TCP_KEEPALIVE 1
@@ -38,6 +52,10 @@
 #define LWIP_NETIF_LOOPBACK 1
 #define LWIP_HAVE_LOOPIF 1
 #define LWIP_NETIF_LOOPBACK_MULTITHREADING 0
+/* Built-in lo keeps TCP packets in kernel memory; wire interfaces keep all checks. */
+#define LWIP_CHECKSUM_CTRL_PER_NETIF 1
+#define BOAROS_LWIP_LOOPBACK_CHECKSUM_FLAGS \
+    (NETIF_CHECKSUM_ENABLE_ALL & ~(NETIF_CHECKSUM_GEN_TCP | NETIF_CHECKSUM_CHECK_TCP))
 
 /* Protocol and packet storage is bounded static memory, not kernel_heap. */
 /* 独立构建目录中的实验覆盖；不传宏时保留生产预算。 */
@@ -73,9 +91,12 @@
 #define TCP_MSS 1460
 #define TCP_WND (BOAROS_LWIP_WINDOW_MSS * TCP_MSS)
 #define TCP_SND_BUF (BOAROS_LWIP_WINDOW_MSS * TCP_MSS)
+/* Only connections routed over lo may use the larger segment and window. */
+#define BOAROS_LWIP_LOOPBACK_MSS 8192U
+#define BOAROS_LWIP_LOOPBACK_WINDOW 32768U
 
 #define LWIP_STATS 1
-#if BOAROS_COST_DIAGNOSTICS
+#if BOAROS_COST_DIAGNOSTICS || defined(BOAROS_LWIP_SHARED_MEMORY)
 /* 诊断长窗口避免 16 位包计数反复回绕；release 仍用上游默认宽度。 */
 #define LWIP_STATS_LARGE 1
 #endif

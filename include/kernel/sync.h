@@ -45,6 +45,8 @@ struct boaros_lwext4_resource_request {
     struct boaros_lwext4_resource *resource;
     struct kernel_lock_guard guard;
     unsigned private_inode;
+    /* Requested mode survives abort/replay; guard records the held mode. */
+    unsigned shared;
 };
 struct boaros_lwext4_resource_set {
     struct ext4_operation *operation;
@@ -77,6 +79,9 @@ struct kernel_io_context {
     struct kernel_lock_guard backend_state_guard;
     /* 操作请求随 owner 保留；共享 mutex 仍由最后一个请求归还，不缓存 inode。 */
     struct boaros_lwext4_resource_set backend_resources;
+#if BOAROS_USER_SMP
+    struct socket_tcp_owner *socket_tcp_owner;
+#endif
 };
 struct kernel_mutex { struct kernel_rwlock lock; };
 

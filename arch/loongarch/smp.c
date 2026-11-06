@@ -28,9 +28,14 @@ static struct tlb_request {
     uint64_t generation,address,size;
     unsigned instructions,targets,pending;
 } fences[BOAROS_MAX_CPUS];
+/* Publish a sender bit to the actual receiver before requesting its IPI.
+ * The bit selects an existing payload; its pending bit still owns lifetime. */
+static struct tlb_inbox {
+    unsigned sources;
+} __attribute__((aligned(64))) incoming_fences[BOAROS_MAX_CPUS];
 #if BOAROS_LA_SMP_TEST == 1
 static unsigned test_phase,reciprocal_entered,reciprocal_done;
-static unsigned held_target,release_target,non_target_seen;
+static unsigned held_target,release_target,late_ipi_ready,non_target_seen,ordinary_ipi_seen;
 #endif
 
 static uint32_t online_mask(void)
@@ -98,22 +103,22 @@ void kernel_cpu_flush_notifications(void)
 }
 static void consume_fences(struct kernel_cpu *cpu)
 {
-    unsigned bit=1U<<cpu->logical_id;
-    for(unsigned i=0;i<topology.count;i++) {
-        if(i==cpu->logical_id)continue;
+    unsigned logical=cpu->logical_id,bit=1U<<logical;
+    struct tlb_inbox *inbox=&incoming_fences[logical];
+    if(!__atomic_load_n(&inbox->sources,__ATOMIC_RELAXED))return;
+    unsigned sources=__atomic_exchange_n(&inbox->sources,0,__ATOMIC_ACQUIRE);
+    while(sources) {
+        unsigned i=__builtin_ctz(sources);
+        sources&=sources-1;
+#if BOAROS_LA_SMP_TEST == 1
+        if(__atomic_load_n(&test_phase,__ATOMIC_RELAXED)==4)
+            failure("ordinary IPI scanned fence",cpu->hardware_id);
+#endif
         struct tlb_request *r=&fences[i];
         uint64_t generation,address,size;unsigned instructions;
         {
             KERNEL_RAW_SCOPE(guard,&r->lock);
-            if(!(__atomic_load_n(&r->pending,__ATOMIC_RELAXED)&bit)) {
-#if BOAROS_LA_SMP_TEST == 1
-                if(i==0 && cpu->logical_id && !(r->targets&bit) && r->targets==(1U<<(topology.count-1)) &&
-                    __atomic_load_n(&test_phase,__ATOMIC_ACQUIRE)==3)
-                    __atomic_fetch_or(&non_target_seen,bit,__ATOMIC_RELEASE);
-#endif
-                continue;
-            }
-            if(!(r->targets&bit))__builtin_trap();
+            if(!(__atomic_load_n(&r->pending,__ATOMIC_RELAXED)&bit) || !(r->targets&bit))__builtin_trap();
             generation=r->generation;address=r->address;size=r->size;instructions=r->instructions;
         }
         if(size==BOAROS_PAGE_SIZE)arch_mmu_flush_address(address);else arch_mmu_flush_all();
@@ -125,6 +130,7 @@ static void consume_fences(struct kernel_cpu *cpu)
         unsigned phase=__atomic_load_n(&test_phase,__ATOMIC_ACQUIRE);
         if(i==0 && cpu->logical_id==topology.count-1 && (phase==2 || phase==3) &&
             !__atomic_load_n(&release_target,__ATOMIC_ACQUIRE)) {
+            __atomic_fetch_or(&inbox->sources,1U<<i,__ATOMIC_RELEASE);
             __atomic_store_n(&held_target,1,__ATOMIC_RELEASE);
             continue;
         }
@@ -150,6 +156,15 @@ static void consume(int interrupt)
     /* IRQ-masked senders also consume requests, so reciprocal waits progress. */
     consume_fences(cpu);
     if(events&LA_IPI_SCHEDULE)kernel_cpu_request_schedule(cpu);
+#if BOAROS_LA_SMP_TEST == 1
+    unsigned phase=__atomic_load_n(&test_phase,__ATOMIC_ACQUIRE);
+    /* Phase 3 sends raw IPIs to non-targets after publishing a reused payload. */
+    if(status && cpu->logical_id && cpu->logical_id!=topology.count-1 && phase==3 &&
+        __atomic_load_n(&late_ipi_ready,__ATOMIC_ACQUIRE))
+        __atomic_fetch_or(&non_target_seen,1U<<cpu->logical_id,__ATOMIC_RELEASE);
+    if((events&LA_IPI_SCHEDULE) && cpu->logical_id && phase==4)
+        __atomic_fetch_or(&ordinary_ipi_seen,1U<<cpu->logical_id,__ATOMIC_RELEASE);
+#endif
     if(events&LA_IPI_DEADLINE)kernel_scheduler_deadline_changed();
 #if BOAROS_LA_SMP_TEST == 3
     if((events&LA_IPI_HANDSHAKE) && cpu->logical_id!=topology.count-1)
@@ -271,6 +286,15 @@ void la_smp_start(uint32_t hz)
             !__atomic_load_n(&release_target,__ATOMIC_ACQUIRE))
             failure("late-IPI premature completion",topology.hart_ids[topology.count-1]);
         la_virt_puts("LA SMP late-IPI TLB generation reuse PASS\n");
+        __atomic_store_n(&test_phase,4,__ATOMIC_RELEASE);
+        end=arch_time_read()+(uint64_t)hz*5;
+        for(unsigned i=1;i<topology.count;i++) {
+            kernel_cpu_notify(cpus[i],LA_IPI_SCHEDULE);
+            while(!(__atomic_load_n(&ordinary_ipi_seen,__ATOMIC_ACQUIRE)&(1U<<i))) {
+                if((int64_t)(arch_time_read()-end)>=0)failure("ordinary IPI delivery",topology.hart_ids[i]);
+            }
+        }
+        la_virt_puts("LA SMP ordinary IPI does not scan fences PASS\n");
         __atomic_store_n(&test_phase,0,__ATOMIC_RELEASE);
     }
 #endif
@@ -294,6 +318,9 @@ void la_smp_sync_user(uint32_t targets,uint64_t address,uint64_t size,int instru
             r->address=address;r->size=size;r->instructions=instructions;r->targets=remote;r->generation++;
             __atomic_store_n(&r->pending,remote,__ATOMIC_RELEASE);
         }
+        /* IRQ-masked peers can service the request even before its IPI is sent. */
+        for(unsigned i=0;i<topology.count;i++)if(remote&(1U<<i))
+            __atomic_fetch_or(&incoming_fences[i].sources,1U<<cpu->logical_id,__ATOMIC_RELEASE);
 #if BOAROS_LA_SMP_TEST == 1
         unsigned phase=__atomic_load_n(&test_phase,__ATOMIC_ACQUIRE);
         if(phase==1) {
@@ -304,7 +331,10 @@ void la_smp_sync_user(uint32_t targets,uint64_t address,uint64_t size,int instru
         }
         /* Deliver old/spurious hardware IPIs after source 0 has reused its
          * payload with a different target set; these CPUs must not ack it. */
-        if(phase==3 && !cpu->logical_id)for(unsigned i=1;i+1<topology.count;i++)send(cpus[i]);
+        if(phase==3 && !cpu->logical_id) {
+            __atomic_store_n(&late_ipi_ready,1,__ATOMIC_RELEASE);
+            for(unsigned i=1;i+1<topology.count;i++)send(cpus[i]);
+        }
 #endif
         for(unsigned i=0;i<topology.count;i++)if(remote&(1U<<i)) {
             kernel_cpu_notify(cpus[i],LA_IPI_TLB);cpu->rfence_requests++;

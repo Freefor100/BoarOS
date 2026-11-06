@@ -30,7 +30,7 @@ static int loop_phase_span(const void *end,const void **cursor,struct kernel_blo
 static void loop_batch_case(void)
 {
     struct kernel_block_device *device=kernel_block_get(KERNEL_LOOP_DEVICE_NUMBER(0));
-    assert(device && device->read_batch && device->write_batch && device->write_phase);
+    assert(device && device->read_batch && device->write_batch);
     unsigned char source[2048],actual[2048];
     for (size_t i=0;i<sizeof(source);i++) source[i]=(unsigned char)(i*13+29);
     struct kernel_block_span spans[]={

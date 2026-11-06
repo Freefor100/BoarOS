@@ -10,8 +10,211 @@ uint64_t kernel_timer_fd_next;
 
 #ifdef SOCKET_PROTOCOL_CASES
 #include "../../net/socket.c"
+unsigned boaros_lwip_parallel;
+void boaros_lwip_ip_init(unsigned cpus) { assert(cpus==1); }
+void boaros_lwip_ip_lock_shared(struct kernel_lock_guard *guard)
+{ (void)guard; assert(!"COPY must not acquire IP qualification"); }
+void boaros_lwip_ip_unlock(struct kernel_lock_guard *guard)
+{ (void)guard; assert(!"unexpected IP qualification"); }
+/* Unrelated protocol branches are linked through the same dispatcher. */
+#define UNUSED_SOCKET_API(result, name, ...) result name(__VA_ARGS__) { __builtin_trap(); }
+UNUSED_SOCKET_API(struct kernel_vfs_mount *, kernel_vfs_path_mount, const struct kernel_vfs_path *)
+UNUSED_SOCKET_API(uint64_t, kernel_vfs_path_inode, const struct kernel_vfs_path *)
+UNUSED_SOCKET_API(int, kernel_vfs_path_release, struct kernel_vfs_path **)
+UNUSED_SOCKET_API(struct kernel_socket *, kernel_open_file_socket, struct kernel_open_file_description *)
+UNUSED_SOCKET_API(enum kernel_open_file_status, kernel_open_file_release, struct kernel_open_file_description **)
+UNUSED_SOCKET_API(void, tcp_recved, struct tcp_pcb *, u16_t)
+UNUSED_SOCKET_API(void, tcp_set_receive_limit, struct tcp_pcb *, u32_t)
+UNUSED_SOCKET_API(err_t, boaros_lwip_tcp_preparev, const struct kernel_socket_write_segment *,
+    unsigned, u16_t, u16_t, struct tcp_seg **)
+UNUSED_SOCKET_API(err_t, boaros_lwip_tcp_publishv, struct tcp_pcb *, struct tcp_seg **,
+    u16_t, u8_t, u16_t *)
+UNUSED_SOCKET_API(void, tcp_segs_free, struct tcp_seg *)
+UNUSED_SOCKET_API(err_t, tcp_process_refused_data, struct tcp_pcb *)
+UNUSED_SOCKET_API(void, tcp_abort, struct tcp_pcb *)
+UNUSED_SOCKET_API(err_t, tcp_close, struct tcp_pcb *)
+UNUSED_SOCKET_API(void, tcp_arg, struct tcp_pcb *, void *)
+UNUSED_SOCKET_API(void, tcp_accept, struct tcp_pcb *, tcp_accept_fn)
+UNUSED_SOCKET_API(void, tcp_err, struct tcp_pcb *, tcp_err_fn)
+UNUSED_SOCKET_API(void, tcp_recv, struct tcp_pcb *, tcp_recv_fn)
+UNUSED_SOCKET_API(void, tcp_sent, struct tcp_pcb *, tcp_sent_fn)
+UNUSED_SOCKET_API(void, tcp_poll, struct tcp_pcb *, tcp_poll_fn, u8_t)
+UNUSED_SOCKET_API(void, udp_remove, struct udp_pcb *)
+UNUSED_SOCKET_API(err_t, udp_send, struct udp_pcb *, struct pbuf *)
+UNUSED_SOCKET_API(err_t, udp_sendto, struct udp_pcb *, struct pbuf *, const ip_addr_t *, u16_t)
+UNUSED_SOCKET_API(struct pbuf *, pbuf_alloc, pbuf_layer, u16_t, pbuf_type)
+UNUSED_SOCKET_API(u8_t, pbuf_free, struct pbuf *)
+UNUSED_SOCKET_API(u32_t, sys_now, void)
+UNUSED_SOCKET_API(u32_t, sys_timeouts_sleeptime, void)
+UNUSED_SOCKET_API(unsigned, sys_check_timeouts_budget, unsigned)
+UNUSED_SOCKET_API(unsigned, netif_poll_budget, struct netif *, unsigned)
+#undef UNUSED_SOCKET_API
+struct netif *netif_list;
 void kernel_assert_service_context(void)
 { assert(!active->logical_id && (!active->current || !active->current->controlled)); }
+static struct kernel_socket_protocol_scope shard_worker_scope;
+static struct kernel_socket_write_request *shard_queued_writer;
+static unsigned shard_copy_cpu, shard_copies, shard_drains, shard_outputs;
+static char shard_order[4];
+static struct tcp_seg shard_unsent;
+static struct pbuf *shard_loop_source;
+static struct pbuf shard_loop_clone;
+static unsigned shard_forbid_route;
+u16_t boaros_lwip_tcp_detached_mss(const struct tcp_pcb *pcb) { return pcb->mss; }
+u16_t lwip_htons(u16_t x) { return (u16_t)((x<<8)|(x>>8)); }
+struct pbuf *pbuf_clone_shared(pbuf_layer layer, struct pbuf *p, u16_t head)
+{
+    assert(layer==PBUF_RAW && p==shard_loop_source && head==TCP_HLEN && !active->raw_locks);
+    return &shard_loop_clone;
+}
+
+err_t boaros_lwip_tcp_writev(struct tcp_pcb *pcb, const struct kernel_socket_write_segment *segments,
+    unsigned count, u16_t length, u8_t flags, u16_t *accepted)
+{
+    assert(active->logical_id==shard_copy_cpu && current_tcp_owner()==tcp_owner_at(1));
+    assert(!protocol_current_owner() && !active->raw_locks && !tasks[0].user_service);
+    assert(count==1 && segments[0].size==1 && length==1 && (flags&TCP_WRITE_FLAG_COPY));
+    assert(shard_copies<sizeof(shard_order) && pcb->snd_buf);
+    shard_order[shard_copies++]=*(const char *)segments[0].data;
+    pcb->snd_buf--; pcb->unsent=&shard_unsent; *accepted=length;
+    return ERR_OK;
+}
+err_t tcp_output(struct tcp_pcb *pcb)
+{
+    assert(active==&cpus[1] && current_tcp_owner()==tcp_owner_at(1));
+    assert(!active->raw_locks && pcb->unsent==&shard_unsent);
+    pcb->unsent=0; shard_outputs++;
+    return ERR_OK;
+}
+
+static void shard_drain_queued_writer(void)
+{
+    struct kernel_socket_write_request *writer=shard_queued_writer;
+    struct socket_tcp_owner *owner=tcp_owner_at(1);
+    int held=shard_worker_scope.outer;
+    uintptr_t irq=sync_test_irq;
+    shard_queued_writer=0;
+    assert(active==&cpus[0] && active->current==&tasks[0]);
+    assert(!active->raw_locks && !current_tcp_owner() && !tasks[0].io_context.locks);
+    assert(kernel_wait_record_phase(&tasks[0].wait)==KERNEL_WAIT_PREPARED);
+    /* Release the endpoint guard before letting the delayed shard owner run. */
+    active=&cpus[1]; sync_test_irq=1; shard_copy_cpu=1;
+    if (!held) assert(tcp_owner_lock(&shard_worker_scope,owner,1));
+    assert(service_ready_socket(2,&owner->ready,&shard_worker_scope)==(held?1U:2U));
+    assert(!writer->queued);
+    kernel_socket_protocol_leave(&shard_worker_scope);
+    shard_worker_scope.outer=0;
+    assert(!current_tcp_owner() && !active->raw_locks);
+    active=&cpus[0]; sync_test_irq=irq;
+    shard_drains++;
+}
+
+static void socket_shard_copy_cases(void)
+{
+    tasks[0].cpu_mask=1;
+    assert(!kernel_scheduler_yield_current() && active==&cpus[0]);
+    assert(cpus[1].current==&idles[1]);
+    scheduler.initialized=KERNEL_SCHEDULER_INITIALIZED;
+    struct socket_tcp_owner *owner=tcp_owner_at(1);
+    owner->index=1;
+    kernel_mutex_init(&owner->mutex,26,(uintptr_t)&owner->mutex);
+    kernel_wait_queue_init(&owner->work);
+    tcp_owner_count=1; boaros_lwip_parallel=1;
+    struct kernel_wait_queue work;
+    kernel_wait_queue_init(&work); network_work_queue=&work;
+    struct tcp_pcb pcb={.state=ESTABLISHED,.snd_buf=TCP_SND_BUF};
+    struct kernel_socket socket={.tcp=&pcb,.domain=KERNEL_SOCKET_DOMAIN_INET,.type=SOCKET_STREAM,
+        .connected=1,.tx_limit=TCP_SND_BUF,.tx_budget=TCP_SND_BUF,.tcp_cpu=1};
+    kernel_wait_queue_init(&socket.wait);
+    struct kernel_open_file_description *pin=(void *)&socket;
+    for (unsigned mode=0; mode<3; mode++) {
+        struct kernel_socket_write_request writer={.socket=&socket,.pin=pin,.reserved=1};
+        struct kernel_socket_write_segment segment={"c",1};
+        struct kernel_socket_write_request older={.socket=&socket,.pin=pin,.reserved=1,
+            .segments=&segment,.segment_count=1,.operation=SOCKET_PROTOCOL_STREAM,.queued=1};
+        socket.tx_reserved=1;
+        if (mode) {
+            uintptr_t irq=sync_test_irq;
+            active=&cpus[1]; sync_test_irq=1;
+            if (mode==1) assert(tcp_owner_lock(&shard_worker_scope,owner,1));
+            else {
+                tasks[1]=(struct kernel_task){.cpu=active,.state=KERNEL_THREAD_STATE_RUNNING,.wait.on_cpu=1};
+                active->current=&tasks[1];
+                assert(!kernel_wait_prepare(0,0,0,&older.completion));
+                active->current=&idles[1];
+            }
+            active=&cpus[0]; sync_test_irq=irq;
+            if (mode==2) {
+                SOCKET_STATE(state);
+                socket.tx_reserved++;
+                socket.writes_head=socket.writes_tail=&older;
+                work_add_locked(&owner->ready,&socket,0);
+            }
+            shard_queued_writer=&writer;
+        }
+        shard_copy_cpu=0;
+        assert(kernel_socket_stream_commit(&writer,"abd"+mode,1,0)==1);
+        assert(shard_drains==mode && !shard_queued_writer && !writer.queued && !writer.segments &&
+            !writer.reserved && !writer.completion.task && !socket.tx_reserved && !socket.writes_head &&
+            !socket.writes_tail && !current_tcp_owner() && !tasks[0].io_context.locks);
+        assert(shard_outputs==mode);
+        if (!mode) {
+            assert(owner->ready.head==&socket && socket.work_flags==SOCKET_WORK_OUTPUT);
+            { SOCKET_STATE(state); work_remove(&owner->ready,&socket); socket.work_flags=0; }
+        } else assert(!owner->ready.head && !socket.work_flags);
+        if (mode==2) {
+            uintptr_t irq=sync_test_irq;
+            active=&cpus[1]; sync_test_irq=1; active->current=&tasks[1];
+            assert(!older.queued && !older.reserved && !older.segments && older.result==1);
+            assert(!kernel_wait_finish(&older.completion));
+            active->current=&idles[1]; active=&cpus[0]; sync_test_irq=irq;
+        }
+    }
+    assert(shard_copies==sizeof(shard_order));
+    for (unsigned i=0;i<shard_copies;i++) assert(shard_order[i]=="abcd"[i]);
+    assert(socket.tx_budget==TCP_SND_BUF-4 && pcb.snd_buf==TCP_SND_BUF-4);
+    network_work_queue=0;
+    puts("PASS TCP shard COPY: CPU0 copies under CPU1 owner without IP/output; busy and FIFO fallback complete on CPU1");
+}
+
+static void socket_shard_loopback_case(void)
+{
+    struct socket_tcp_owner *owner=tcp_owner_at(1);
+    struct kernel_socket_protocol_scope scope;
+    assert(tcp_owner_lock(&scope,owner,1));
+    struct tcp_pcb tx={.boaros_loopback=1,.boaros_owner=1,.local_port=11,.remote_port=22};
+    struct tcp_pcb rx={.boaros_loopback=1,.boaros_owner=1,.local_port=22,.remote_port=11};
+    ip_addr_set_ip4_u32(&tx.local_ip,PP_HTONL(UINT32_C(0x7f000001)));
+    ip_addr_copy(tx.remote_ip,tx.local_ip);
+    ip_addr_copy(rx.remote_ip,tx.local_ip);
+    ip_addr_copy(rx.local_ip,tx.remote_ip);
+    unsigned bucket=tcp_route_bucket(&tx);
+    { KERNEL_RAW_SCOPE(route,&tcp_route_lock);
+      tcp_routes[bucket]=&rx;
+      tcp_link_loopback_peer(&tx,bucket);
+      tx.boaros_route_next=&rx;
+      tcp_routes[bucket]=&tx; }
+    assert(tx.boaros_loopback_peer==&rx && rx.boaros_loopback_peer==&tx);
+    struct netif loop={0};fast_loopback=&loop;fast_loopback_available=1;
+    struct tcp_hdr header={.src=lwip_htons(11),.dest=lwip_htons(22)};
+    TCPH_HDRLEN_FLAGS_SET(&header,5,TCP_ACK);
+    struct pbuf packet={.payload=&header,.len=TCP_HLEN};
+    shard_loop_source=&packet;shard_forbid_route=1;
+    int result;
+    assert(tcp_local_output(&tx,&packet,&loop,&tx.local_ip,&tx.remote_ip,&result) && result==ERR_OK);
+    struct socket_tcp_input queued;
+    assert(tcp_owner_take_input(owner,&queued) && queued.packet==&shard_loop_clone && queued.interface==&loop);
+    shard_forbid_route=0;
+    tcp_pcb_forget(&rx);
+    assert(!tx.boaros_loopback_peer && !rx.boaros_loopback_peer && !rx.boaros_owner);
+    assert(!tcp_local_output(&tx,&packet,&loop,&tx.local_ip,&tx.remote_ip,&result));
+    tcp_pcb_forget(&tx);
+    assert(!tcp_routes[bucket]);
+    fast_loopback=0;fast_loopback_available=0;shard_loop_source=0;
+    kernel_socket_protocol_leave(&scope);
+    puts("PASS TCP paired loopback: direct packet without route lookup; peer retirement invalidates the pair");
+}
+
 static int protocol_preempt,protocol_try_failure;
 int __real_kernel_rwlock_try_write(struct kernel_rwlock *,struct kernel_lock_guard *);
 int __wrap_kernel_rwlock_try_write(struct kernel_rwlock *lock,struct kernel_lock_guard *guard)
@@ -97,7 +300,7 @@ static void socket_protocol_cases(void)
 
 extern void scheduler_user_service_set_locked(struct kernel_task *, int);
 extern void scheduler_user_request_locked(struct kernel_task *);
-static int cancel_stop_on_handoff, local_rotation_active, local_run_required;
+static int cancel_stop_on_handoff, local_rotation_active, local_run_required, forbid_cpu0_run;
 void user_signal_cancel_stop(struct kernel_task *);
 void user_signal_retarget_case(struct kernel_task *,struct kernel_task *);
 void user_signal_take_retargeted(struct kernel_task *);
@@ -192,15 +395,26 @@ static unsigned stop_armed, stop_guard_left, stop_claimed;
 void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *,struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_raw_guard *guard)
 {
+#ifdef SOCKET_PROTOCOL_CASES
+    assert(!shard_forbid_route || lock!=&tcp_route_lock);
+#endif
     assert(!local_run_required || lock!=&kernel_wait_domain);
+    assert(!forbid_cpu0_run || lock!=kernel_run_lock(&cpus[0]));
     __real_kernel_raw_lock_acquire(lock,guard);
 }
 void __real_kernel_raw_lock_release(struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_release(struct kernel_raw_guard *guard)
 {
     int pause=stop_armed && guard->lock==&kernel_wait_domain;
+#ifdef SOCKET_PROTOCOL_CASES
+    int drain=shard_queued_writer && guard->lock==&socket_state_lock &&
+        shard_queued_writer->completion.task;
+#endif
     if (pause) stop_armed=0;
     __real_kernel_raw_lock_release(guard);
+#ifdef SOCKET_PROTOCOL_CASES
+    if (drain) shard_drain_queued_writer();
+#endif
     if (pause) {
         __atomic_store_n(&stop_guard_left,1,__ATOMIC_RELEASE);
         while (!__atomic_load_n(&stop_claimed,__ATOMIC_ACQUIRE)) {}
@@ -310,7 +524,9 @@ static void ordinary_local_claim(void)
 
 static void ordinary_local_wake(void)
 {
-    for (unsigned after=0;after<2;after++) {
+    for (unsigned scenario=0;scenario<4;scenario++) {
+        unsigned timed=scenario/2, after=scenario%2;
+        uint64_t deadline=timed?1000:0;
         reset_two_queues();active=&cpus[1];
         scheduler.initialized=KERNEL_SCHEDULER_INITIALIZED;
         struct kernel_wait_token token;
@@ -318,17 +534,20 @@ static void ordinary_local_wake(void)
           setup_task(0,2,0);
           assert(scheduler_select_next_locked(active,active->idle,1)==&tasks[0]);
           kernel_wait_switch_finish_locked(&idles[1]);active->switch_previous=0; }
-        assert(!kernel_wait_prepare(0,0,1,&token));
+        assert(!kernel_wait_prepare(0,deadline,1,&token));
         { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
           kernel_wait_record_transition(&tasks[0].wait,token.generation,KERNEL_WAIT_COMMITTED,KERNEL_WAIT_WOKEN);
-          kernel_wait_backend_commit(&tasks[0],0,1);
+          kernel_wait_backend_commit(&tasks[0],deadline,1);
           assert(scheduler_select_next_locked(active,&tasks[0],1)==active->idle); }
-        local_run_required=1;
+        local_run_required=!timed;
         if (after) assert(scheduler_finish_local(active));
         active=&cpus[0];
-        assert(!kernel_wait_notify(&token,KERNEL_WAIT_WOKEN));
+        forbid_cpu0_run=1;
+        assert(!kernel_wait_notify(&token,timed?KERNEL_WAIT_TIMEOUT:KERNEL_WAIT_WOKEN));
+        forbid_cpu0_run=0;
         assert(!kernel_wait_notify(&token,KERNEL_WAIT_SIGNALLED));
-        assert(kernel_wait_record_reason(&tasks[0].wait)==KERNEL_WAIT_WOKEN);
+        assert(kernel_wait_record_reason(&tasks[0].wait)==(timed?KERNEL_WAIT_TIMEOUT:KERNEL_WAIT_WOKEN));
+        assert(!tasks[0].deadline_indexed && !scheduler.deadline_root);
         active=&cpus[1];
         if (!after) {
             assert(tasks[0].wait.on_cpu && tasks[0].wait.ready_pending && !tasks[0].ready_node.queued);
@@ -337,7 +556,7 @@ static void ordinary_local_wake(void)
         local_run_required=0;
         assert_ready_owner(&tasks[0],active);
     }
-    puts("PASS ordinary wake and old-stack release use the same CPU owner on both sides of the switch");
+    puts("PASS ordinary wakes (including timeout) and old-stack release use only the destination queue");
 }
 
 static void ordinary_wake_after_affinity_change(void)
@@ -390,6 +609,28 @@ static void ordinary_pull(void)
     puts("PASS ordinary steal transfers execution directly under source/destination runqueue locks");
 }
 
+static void remote_rt_precedence(void)
+{
+    reset_two_queues();active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      for (unsigned i=0;i<2;i++) {
+          tasks[i]=(struct kernel_task){.accounted=1,.cpu_mask=3,.cpu=&cpus[0],
+              .state=KERNEL_THREAD_STATE_READY};
+          tasks[i].scheduling.priority=40;
+          ready_enqueue_locked(&tasks[i],SCHED_READY_LOCAL);
+      } }
+    active=&cpus[1];
+    struct kernel_task *selected=0;
+    uint64_t deadline=0;
+    assert(!scheduler_select_local(0,0,0,&selected,&deadline));
+    for (unsigned i=0;i<2;i++) {
+        { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);ready_remove_locked(&tasks[i]); }
+        assert(scheduler_select_local(0,0,0,&selected,&deadline)==(i==1));
+        assert(!selected);
+    }
+    puts("PASS remote RT work defers ordinary selection until the last eligible task leaves");
+}
+
 int main(void)
 {
     assert(!controlled_smp_main());
@@ -398,6 +639,7 @@ int main(void)
     ordinary_local_wake();
     ordinary_wake_after_affinity_change();
     ordinary_pull();
+    remote_rt_precedence();
     reservation_placement_cases();
     scheduler = (struct kernel_scheduler){0};
     scheduler.rt_configuration.period_ns = 1000000000;
@@ -414,7 +656,8 @@ int main(void)
     }
     active = &cpus[0];
 #ifdef SOCKET_PROTOCOL_CASES
-    socket_protocol_cases();return 0;
+    kernel_cpu_set_boot_count(1);
+    socket_protocol_cases();socket_shard_copy_cases();socket_shard_loopback_case();return 0;
 #endif
     {
         struct kernel_task worker={.accounted=1,.cpu_mask=1,.state=KERNEL_THREAD_STATE_READY};

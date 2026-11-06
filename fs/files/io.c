@@ -1603,16 +1603,23 @@ static enum kernel_files_status unix_write_request(struct kernel_files *files, s
 }
 
 /* The existing task scratch holds page references, not another payload copy. */
+enum { TCP_USER_PINS_INLINE=4,
+#if BOAROS_USER_SMP && BOAROS_PAGE_SHIFT == 12
+       TCP_USER_PINS_MAX=9 /* Unaligned 32 KiB send window. */
+#else
+       TCP_USER_PINS_MAX=TCP_USER_PINS_INLINE
+#endif
+};
 struct tcp_user_batch {
-    struct kernel_mm_user_pin pins[4];
-    uint64_t pages[4];
-    struct kernel_socket_write_segment segments[4];
+    struct kernel_mm_user_pin pins[TCP_USER_PINS_MAX];
+    uint64_t pages[TCP_USER_PINS_MAX];
+    struct kernel_socket_write_segment segments[TCP_USER_PINS_MAX];
 };
 _Static_assert(sizeof(struct tcp_user_batch) <= BOAROS_PAGE_SIZE, "TCP pin workspace");
 
 static int tcp_write_user_batch(struct kernel_mm *mm,
     struct kernel_socket_write_request *request, struct kernel_task_io_buffer *workspace,
-    struct kernel_uaccess_iov_cursor *cursor,uint32_t size,uint32_t flags,int *fault)
+    struct kernel_uaccess_iov_cursor *cursor,uint32_t size,uint32_t flags,int *fault,unsigned limit)
 {
     if (!workspace->allocator && kernel_task_io_buffer_acquire(workspace,mm->allocator)!=KERNEL_TASK_STATUS_OK)
         return -KERNEL_ENOMEM;
@@ -1629,7 +1636,7 @@ static int tcp_write_user_batch(struct kernel_mm *mm,
         unsigned index=0;
         while (index<pins && batch->pages[index]!=page) index++;
         if (index==pins) {
-            if (pins==4 || segments==4) break;
+            if (pins==limit || segments==limit) break;
             struct kernel_mm_user_pin *pin=&batch->pins[pins];
             *pin=(struct kernel_mm_user_pin){0};
             enum kernel_uaccess_status access;
@@ -1659,14 +1666,25 @@ static int tcp_write_user_batch(struct kernel_mm *mm,
             (uintptr_t)last->data-page_address<BOAROS_PAGE_SIZE &&
             (const unsigned char *)last->data+last->size==data) last->size+=(uint32_t)length;
         else {
-            if (segments==4) break;
+            if (segments==limit) break;
             batch->segments[segments++]=(struct kernel_socket_write_segment){data,(uint32_t)length};
         }
         prepared+=(uint32_t)length;gather.offset+=length;
     }
-    if (prepared) result=kernel_socket_stream_commitv(request,batch->segments,segments,
-        flags|((!*fault && prepared<size)?KERNEL_SOCKET_IO_MORE:0));
+    flags|=(!*fault && prepared<size)?KERNEL_SOCKET_IO_MORE:0;
+#if BOAROS_USER_SMP
+    int detached=prepared && kernel_socket_stream_preparev(request,batch->segments,segments,prepared);
+    if (prepared && !detached)
+#else
+    if (prepared)
+#endif
+        result=kernel_socket_stream_commitv(request,batch->segments,segments,flags);
     while (pins) kernel_mm_unpin_user_page(&batch->pins[--pins]);
+#if BOAROS_USER_SMP
+    /* The request now owns the final payload; even a busy shard no longer
+     * makes the address-space editor wait for this send's user pins. */
+    if (detached) result=kernel_socket_stream_publish(request,flags);
+#endif
     /* The protocol may accept only part of the prepared vector. Descriptor
      * preparation never advances the caller's completed prefix. */
     if (result>0) {
@@ -1683,15 +1701,15 @@ static int tcp_write_user_batch(struct kernel_mm *mm,
 
 /* Coalesce only when one page would need more protocol fragments than the
  * direct workspace can retain. A contiguous vector keeps the pinned path. */
-static int tcp_fragmented_prefix(struct kernel_uaccess_iov_cursor cursor,uint64_t remaining)
+static int tcp_fragmented_prefix(struct kernel_uaccess_iov_cursor cursor,uint64_t remaining,unsigned fragments)
 {
-    if (cursor.count-cursor.index<=4) return 0;
+    if (cursor.count-cursor.index<=fragments) return 0;
     size_t limit=remaining<BOAROS_PAGE_SIZE?(size_t)remaining:BOAROS_PAGE_SIZE;
     uint64_t end=0;unsigned runs=0;
     while (limit) {
         uint64_t address;size_t length=kernel_uaccess_iov_span(&cursor,limit,&address);
         if (!length) __builtin_trap();
-        if ((!runs || address!=end) && ++runs>4) return 1;
+        if ((!runs || address!=end) && ++runs>fragments) return 1;
         end=address+length;cursor.offset+=length;limit-=length;
     }
     return 0;
@@ -1712,18 +1730,22 @@ static __attribute__((noinline)) enum kernel_files_status tcp_write_request(
     uint64_t total=0,target=0,timeout=(flags&KERNEL_SOCKET_MSG_DONTWAIT)?0:kernel_socket_send_timeout(socket);
     int fault=0;
     size_t staged=0,consumed=0;
+    unsigned pins=TCP_USER_PINS_INLINE;
+#if BOAROS_USER_SMP && BOAROS_PAGE_SHIFT == 12
+    if (kernel_socket_stream_has_shard(socket)) pins=TCP_USER_PINS_MAX;
+#endif
     if (timeout) {
         uint64_t now=kernel_time_monotonic_ns();
         target=UINT64_MAX-now<timeout?UINT64_MAX:now+timeout;
     }
     kernel_socket_stream_begin(&request,&description);
     do {
-        int compact=staged>consumed || tcp_fragmented_prefix(cursor,count-total);
+        int compact=staged>consumed || tcp_fragmented_prefix(cursor,count-total,pins);
         size_t chunk=staged-consumed;
         if (!chunk && count) {
             uint64_t address;
             if (!kernel_uaccess_iov_span(&cursor,1,&address)) __builtin_trap();
-            size_t limit=compact?BOAROS_PAGE_SIZE:4*BOAROS_PAGE_SIZE-(address&BOAROS_PAGE_MASK);
+            size_t limit=compact?BOAROS_PAGE_SIZE:pins*BOAROS_PAGE_SIZE-(address&BOAROS_PAGE_MASK);
             chunk=count-total<limit?(size_t)(count-total):limit;
         }
         int result=kernel_socket_stream_reserve(&request,(uint32_t)chunk,flags);
@@ -1732,7 +1754,7 @@ static __attribute__((noinline)) enum kernel_files_status tcp_write_request(
             if (!result || (size_t)result>chunk) { status=KERNEL_FILES_STATUS_STATE;break; }
             chunk=(size_t)result;
             if (!compact) result=tcp_write_user_batch(mm,&request,&buffer,&cursor,(uint32_t)chunk,
-                flags|((total+chunk<count)?KERNEL_SOCKET_IO_MORE:0),&fault);
+                flags|((total+chunk<count)?KERNEL_SOCKET_IO_MORE:0),&fault,pins);
             else {
                 if (staged==consumed) {
                     if (!buffer.allocator && kernel_task_io_buffer_acquire(&buffer,mm->allocator)!=KERNEL_TASK_STATUS_OK) {

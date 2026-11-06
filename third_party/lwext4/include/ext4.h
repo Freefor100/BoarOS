@@ -76,8 +76,10 @@ struct ext4_lock {
 	 * without shared qualification keeps using its exclusive state_lock. */
 	void (*state_read_lock)(void *context);
 	void (*state_unlock)(void *context);
+	/* NULL requests exclusive ownership. A non-NULL group request asks for
+	 * shared ownership and receives the actual mode retained across replay. */
 	int (*resource_acquire)(void *context, struct ext4_operation *operation,
-	                        enum ext4_resource_kind kind, uint32_t key);
+	                        enum ext4_resource_kind kind, uint32_t key, bool *shared);
 	int (*resource_claim_inode)(void *context, struct ext4_operation *operation,
 	                            uint32_t inode);
 	void (*resource_release)(void *context);
@@ -130,7 +132,6 @@ int ext4_journal_group_progress(const char *mount_point, struct ext4_journal_pro
 /********************************FILE DESCRIPTOR*****************************/
 
 struct ext4_delalloc_chunk;
-struct ext4_delalloc_change;
 RB_HEAD(ext4_delalloc_tree, ext4_delalloc_chunk);
 struct ext4_delalloc {
     struct ext4_delalloc_tree tree;
@@ -560,12 +561,12 @@ int ext4_fallocate(ext4_file *file, unsigned mode, uint64_t offset,
 int ext4_file_prepare_write(ext4_file *file, uint64_t offset, size_t length,
                             size_t *ready, bool *complete);
 int ext4_file_complete_write(ext4_file *file);
-/* Adapter owns the live inode I/O writer; global accounting still uses STATE. */
-int ext4_file_reserve_write(ext4_file *, uint64_t, size_t, size_t *, void **ticket);
-void ext4_file_accept_reservation(ext4_file *, void *ticket, uint64_t start, uint64_t accepted_end);
+/* Adapter owns the live inode I/O writer and supplies a zeroed first record. */
+int ext4_file_reserve_write(ext4_file *, uint64_t, size_t, size_t *, struct file_write_reservation *);
+void ext4_file_accept_reservation(ext4_file *, struct file_write_reservation *, uint64_t start, uint64_t accepted_end);
 /* Finishing holds the adapter inode I/O writer, excluding concurrent mapping
  * acceptance, truncation and writeback of the same reservation tree. */
-void ext4_file_finish_reservation(ext4_file *, void *ticket, uint64_t start, uint64_t accepted_end);
+void ext4_file_finish_reservation(ext4_file *, struct file_write_reservation *, uint64_t start, uint64_t accepted_end);
 void ext4_file_release_reservations(ext4_file *, uint64_t size);
 void ext4_file_drain_reservations(ext4_file *);
 

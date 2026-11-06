@@ -16,6 +16,7 @@
 #include <kernel/physical_page.h>
 #include <kernel/random.h>
 #include <kernel/scheduler.h>
+#include <kernel/socket.h>
 #include <kernel/tick.h>
 #include <kernel/time.h>
 
@@ -708,7 +709,6 @@ static void storage_cleanup_worker(void *argument)
 #if BOAROS_SMP_TEST
             riscv_smp_test_root_finish();
 #endif
-            riscv_smp_stop();
 #endif
             struct kernel_heap_statistics heap_statistics;
             uint64_t available_pages;
@@ -742,6 +742,10 @@ static void storage_cleanup_worker(void *argument)
                 }
                 shutdown_for_root_boot_error(root_status);
             }
+#if BOAROS_MAX_CPUS > 1
+            /* Root teardown still needs journal and other I/O workers. */
+            riscv_smp_stop();
+#endif
 #if BOAROS_USER_SMP
             /* UART worker已排空/停止，避免延后用户stdout插入统计记录。 */
 #if BOAROS_USER_SMP_COMPOSITION
@@ -903,8 +907,10 @@ static void kernel_main_high(void)
         root_started = 1;
         if (kernel_page_cache_start_worker(&root_boot.page_cache) != 0)
             shutdown_for_root_boot_error(RISCV_ROOT_BOOT_STATUS_RESOURCES);
+#if !BOAROS_USER_SMP
         if (kernel_vfs_start_journal_worker(&root_boot.mount) != 0)
             shutdown_for_root_boot_error(RISCV_ROOT_BOOT_STATUS_RESOURCES);
+#endif
         for (uint32_t disk = 0U; disk < root_boot.device_count; disk++) {
             struct riscv_virtio_mmio_block *device =
                 riscv_root_boot_device(&root_boot, disk);
@@ -1018,6 +1024,14 @@ static void kernel_main_high(void)
     riscv_smp_start(&boot_cpus, (UINT64_C(8) << 60) |
                     (transition_page_table.root_address >> 12),
                     riscv_sv39_current_satp(), boot_info.timebase_frequency);
+#if BOAROS_USER_SMP
+    if (root_started && root_boot.network && kernel_socket_start_tcp_owners()!=0)
+        shutdown_for_root_boot_error(RISCV_ROOT_BOOT_STATUS_RESOURCES);
+    /* Publish journal workers only after their execution CPUs are online.
+     * PID 1 remains queued on CPU0 until boot enables scheduling there. */
+    if (root_started && kernel_vfs_start_journal_worker(&root_boot.mount) != 0)
+        shutdown_for_root_boot_error(RISCV_ROOT_BOOT_STATUS_RESOURCES);
+#endif
 #if BOAROS_USER_SMP_COMPOSITION
     if (!root_started) __builtin_trap();
     riscv_user_composition_start(&root_boot,&page_allocator);

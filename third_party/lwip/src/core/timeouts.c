@@ -167,6 +167,13 @@ tcp_timer_needed(void)
 {
   LWIP_ASSERT_CORE_LOCKED();
 
+#ifdef BOAROS_LWIP_TCP_CONTEXT
+  struct boaros_lwip_tcp_context *ctx = boaros_lwip_tcp_context_current();
+  if (ctx != &boaros_lwip_tcp_default_context) {
+    boaros_lwip_tcp_timer_arm(ctx, sys_now());
+    return;
+  }
+#endif
   /* timer is off but needed again? */
   if (!tcpip_tcp_timer_active && (tcp_active_pcbs || tcp_tw_pcbs)) {
     /* enable and start timer */

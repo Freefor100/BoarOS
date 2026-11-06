@@ -8,6 +8,8 @@
 struct jbd_journal;
 struct jbd_memory;
 struct jbd_image;
+struct jbd_source;
+struct file_data_source;
 struct ext4_buf;
 /* Allocation accounting is independent of the journal's retention quota.
  * The callback is bounded/nonblocking; its retained owner can outlive stop. */
@@ -44,8 +46,13 @@ unsigned jbd_memory_cached_images(const struct jbd_journal *);
 /* A retained external allocation consumes journal quota, but its original
  * owner accounts its storage. Used includes this borrowed quota and idle cache;
  * allocation callbacks report only locally owned active storage. */
-bool jbd_memory_borrow(struct jbd_journal *, size_t);
-void jbd_memory_release_borrow(struct jbd_memory *, size_t);
+/* Index and charge live external owners together; the last reader may put
+ * after the journal itself has stopped. */
+int jbd_source_borrow(struct jbd_journal *,const struct file_data_source *,struct jbd_source **);
+void jbd_source_get(struct jbd_source *);
+void jbd_source_put(struct jbd_source *);
+bool jbd_source_estimate(struct jbd_journal *,const struct file_data_source *const *,
+    unsigned,size_t *);
 void jbd_memory_owner_uncharge(struct jbd_memory *, size_t);
 bool jbd_memory_pin_home(struct jbd_journal *, struct ext4_buf *);
 void jbd_memory_unpin_home(struct jbd_journal *, struct ext4_buf *);

@@ -17,6 +17,7 @@
 #include <kernel/physical_page.h>
 #include <kernel/posix_acl.h>
 #include <kernel/scheduler.h>
+#include <kernel/tmpfs.h>
 #include <kernel/vfs.h>
 
 #include <string.h>
@@ -29,6 +30,14 @@
 struct kernel_raw_lock kernel_vfs_state_lock = {
     .rank = KERNEL_RAW_RANK_OBJECT, .initialized = KERNEL_RAW_INITIALIZED
 };
+
+/* Parent links and mount edges publish under kernel_vfs_state_lock. A
+ * scoped walk retries instead of using a topology observed across changes. */
+static uint64_t path_topology_generation;
+static void path_topology_changed(void)
+{
+    if (++path_topology_generation==0) __builtin_trap();
+}
 
 #define VFS_MUTATION_SCOPE(name, mount) KERNEL_LOCK_SCOPE(name); kernel_vfs_mutation_lock(mount,&name)
 #define VFS_FILE_MUTATION_SCOPE(name, file) KERNEL_LOCK_SCOPE(name); \
@@ -336,7 +345,8 @@ struct vfs_path_walk {
     struct kernel_lock_guard guard, mutation;
     struct kernel_service_scope service;
     struct kernel_vfs_node *directory;
-    unsigned final_write;
+    unsigned final_write, resolve;
+    uint64_t topology_generation;
 };
 static void path_walk_release(struct vfs_path_walk *walk)
 {
@@ -679,6 +689,7 @@ int kernel_vfs_mount_attach(struct kernel_vfs_mount *mount,
     if (parent->first_child) parent->first_child->previous_sibling = mount;
     parent->first_child = mount;
     covered->mounted_here = mount;covered->dentry->mountpoints++;
+    path_topology_changed();
     kernel_task_lock_release(&irq);
     return 0;
 }
@@ -725,6 +736,7 @@ static int unlink_mount_edge(struct kernel_vfs_mount *mount,int lazy,const struc
         covered->dentry->mountpoints--;covered->mounted_here=NULL;parent->child_mounts--;
         mount->parent=NULL;mount->next_sibling=mount->previous_sibling=NULL;
         mount->root_path=mount->covered_path=NULL;
+        path_topology_changed();
     }
     kernel_lock_scope_release(&namespace_guard);
     if (kernel_vfs_path_release(&root) || kernel_vfs_path_release(&covered)) __builtin_trap();
@@ -835,7 +847,7 @@ int kernel_vfs_umount(struct kernel_vfs_path *root,unsigned flags)
     return result;
 }
 
-static int enter_mounts(struct kernel_vfs_path **owner)
+static int enter_mounts(struct kernel_vfs_path **owner,unsigned resolve)
 {
     struct kernel_vfs_path *current = *owner;
     for (;;) {
@@ -847,6 +859,10 @@ static int enter_mounts(struct kernel_vfs_path **owner)
             kernel_task_lock_release(&irq);
             *owner = current;
             return 0;
+        }
+        if (resolve & KERNEL_VFS_RESOLVE_NO_XDEV) {
+            kernel_task_lock_release(&irq);
+            return -KERNEL_EXDEV;
         }
         next = child->root_path;
         if (((struct kernel_vfs_instance *)child->private_data)->quiescing ||
@@ -873,7 +889,7 @@ int kernel_vfs_move_mount(struct kernel_vfs_path *source,struct kernel_vfs_path 
     struct kernel_vfs_path *covered __attribute__((cleanup(release_path_pin)))=target;
     int result=kernel_vfs_path_acquire(covered);
     if (result) {covered=NULL;return result;}
-    result=enter_mounts(&covered);if (result) return result;
+    result=enter_mounts(&covered,0);if (result) return result;
     struct kernel_vfs_mount *parent=covered->file.mount;
     KERNEL_LOCK_SCOPE(namespace_guard);kernel_vfs_namespace_lock(parent,&namespace_guard);
     struct kernel_vfs_path *container __attribute__((cleanup(release_path_pin)))=NULL;
@@ -911,6 +927,7 @@ int kernel_vfs_move_mount(struct kernel_vfs_path *source,struct kernel_vfs_path 
         if (parent->first_child) parent->first_child->previous_sibling=mount;
         parent->first_child=mount;parent->child_mounts++;
         mount->covered_path->mounted_here=mount;mount->covered_path->dentry->mountpoints++;
+        path_topology_changed();
     }
     kernel_lock_scope_release(&directory_guard);
     kernel_lock_scope_release(&namespace_guard);
@@ -1134,7 +1151,8 @@ int kernel_vfs_path_stat(const struct kernel_vfs_path *path,
 }
 
 static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
-    const char *name,size_t name_length,struct kernel_vfs_path **owner,int search)
+    const char *name,size_t name_length,struct kernel_vfs_path **owner,int search,
+    const struct vfs_path_walk *walk)
 {
     if (!parent || !parent->references || !name || !name_length || !owner || *owner) return -KERNEL_EINVAL;
     if (name_length>255U) return -KERNEL_ENAMETOOLONG;
@@ -1149,10 +1167,19 @@ static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
         struct kernel_vfs_dentry *ancestor=parent->dentry;
         {
             KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+            int scoped=walk && (walk->resolve & KERNEL_VFS_RESOLVE_SCOPED);
+            if (scoped && walk->topology_generation!=path_topology_generation)
+                return -KERNEL_EAGAIN;
             while (ancestor==mount->root_dentry && mount->covered_path) {
+                if (walk && (walk->resolve & KERNEL_VFS_RESOLVE_NO_XDEV))
+                    return -KERNEL_EXDEV;
                 ancestor=mount->covered_path->dentry;mount=mount->parent;
+                if (scoped && mount==walk->root->file.mount && ancestor==walk->root->dentry)
+                    break;
             }
-            if (ancestor!=mount->root_dentry && ancestor->parent) ancestor=ancestor->parent;
+            if (scoped && mount==walk->root->file.mount && ancestor==walk->root->dentry) {
+                if (walk->resolve & KERNEL_VFS_RESOLVE_BENEATH) return -KERNEL_EXDEV;
+            } else if (ancestor!=mount->root_dentry && ancestor->parent) ancestor=ancestor->parent;
             if (dentry_acquire(ancestor)) __builtin_trap();
         }
         result=path_wrap(mount,ancestor,owner);dentry_release(&ancestor);return result;
@@ -1188,19 +1215,19 @@ static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
         result=register_path(&entry);if (result) return result;
     }
     result=path_wrap(mount,entry,owner);dentry_release(&entry);
-    if (!result) {result=enter_mounts(owner);if (result) (void)kernel_vfs_path_release(owner);}
+    if (!result) {result=enter_mounts(owner,walk ? walk->resolve : 0);if (result) (void)kernel_vfs_path_release(owner);}
     return result;
 }
 
 static int path_lookup_locked(struct kernel_vfs_path *parent,const char *name,size_t length,struct kernel_vfs_path **owner)
-{ return path_lookup_locked_mode(parent,name,length,owner,1); }
+{ return path_lookup_locked_mode(parent,name,length,owner,1,NULL); }
 int kernel_vfs_path_lookup_object(struct kernel_vfs_path *parent,const char *name,size_t length,struct kernel_vfs_path **owner)
 {
     KERNEL_SERVICE_SCOPE_IF(service,parent && kernel_vfs_namespace_requires_cpu0(parent->file.mount));
     if (!parent || !parent->file.mount || !parent->file.mount->private_data) return -KERNEL_EINVAL;
     KERNEL_LOCK_SCOPE(guard);namespace_node_lock(parent->file.private_data,&guard,0);
     if (((struct kernel_vfs_instance *)parent->file.mount->private_data)->quiescing) return -KERNEL_EIO;
-    return path_lookup_locked_mode(parent,name,length,owner,0);
+    return path_lookup_locked_mode(parent,name,length,owner,0,NULL);
 }
 
 int kernel_vfs_path_lookup(struct kernel_vfs_path *parent,
@@ -1212,6 +1239,25 @@ int kernel_vfs_path_lookup(struct kernel_vfs_path *parent,
     namespace_node_lock(parent->file.private_data,&guard,0);
     if (((struct kernel_vfs_instance *)parent->file.mount->private_data)->quiescing) return -KERNEL_EIO;
     return path_lookup_locked(parent,name,length,owner);
+}
+
+static int scoped_path_check(const struct vfs_path_walk *walk,
+                             const struct kernel_vfs_path *path)
+{
+    KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+    if (walk->topology_generation!=path_topology_generation) return -KERNEL_EAGAIN;
+    const struct kernel_vfs_mount *mount=path->file.mount;
+    const struct kernel_vfs_dentry *entry=path->dentry;
+    for (;;) {
+        if (mount==walk->root->file.mount && entry==walk->root->dentry) return 0;
+        if (entry!=mount->root_dentry) {
+            if (!entry->parent) return -KERNEL_EXDEV;
+            entry=entry->parent;
+        } else if (mount->covered_path) {
+            entry=mount->covered_path->dentry;
+            mount=mount->parent;
+        } else return -KERNEL_EXDEV;
+    }
 }
 
 static int resolve_object(struct kernel_vfs_path *start,
@@ -1238,6 +1284,12 @@ static int resolve_object(struct kernel_vfs_path *start,
         start->file.mount->private_data == 0)
         return -KERNEL_EINVAL;
     if (!length) return -KERNEL_ENOENT;
+    if (walk->resolve & KERNEL_VFS_RESOLVE_SCOPED) {
+        if (path[0]=='/' && (walk->resolve & KERNEL_VFS_RESOLVE_BENEATH))
+            return -KERNEL_EXDEV;
+        KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+        walk->topology_generation=path_topology_generation;
+    }
     adapter = start->file.mount->private_data;
     if (length >= KERNEL_FS_PATH_MAX) return -KERNEL_ENAMETOOLONG;
     current = pending[0] == '/' ? root : start;
@@ -1279,11 +1331,12 @@ static int resolve_object(struct kernel_vfs_path *start,
         if (current == root && component_length == 2U &&
             pending[begin] == '.' && pending[begin + 1U] == '.') {
             result = inode_permission(current->file.private_data, KERNEL_VFS_MAY_EXEC);
+            if (!result && (walk->resolve & KERNEL_VFS_RESOLVE_BENEATH))
+                result=-KERNEL_EXDEV;
             if (!result) result = kernel_vfs_path_acquire(root);
             if (!result) next = root;
         } else {
-            result = path_lookup_locked(current, pending + begin,
-                                            component_length, &next);
+            result = path_lookup_locked_mode(current,pending+begin,component_length,&next,1,walk);
         }
         if (result == -KERNEL_ENOENT && allow_missing_final &&
             (!suffix || (allow_missing_trailing && trailing_only)) &&
@@ -1313,7 +1366,8 @@ static int resolve_object(struct kernel_vfs_path *start,
             size_t target_length = 0U;
             size_t remainder = length-end;
             int backend;
-            if (++follows > VFS_SYMLINK_MAX_FOLLOWS) {
+            if ((walk->resolve & KERNEL_VFS_RESOLVE_NO_SYMLINKS) ||
+                ++follows > VFS_SYMLINK_MAX_FOLLOWS) {
                 result = -KERNEL_ELOOP;
                 (void)kernel_vfs_path_release(&next);
                 goto Finish;
@@ -1328,8 +1382,15 @@ static int resolve_object(struct kernel_vfs_path *start,
             if (target_instance->ops->follow_link) {
                 struct kernel_vfs_path *linked = 0;
                 backend = target_instance->ops->follow_link(
-                    next->file.private_data, &linked);
+                    next->file.private_data, walk->resolve, &linked);
                 if (backend == 0) {
+                    if (linked && (walk->resolve & KERNEL_VFS_RESOLVE_NO_XDEV) &&
+                        linked->file.mount!=current->file.mount) {
+                        if (kernel_vfs_path_release(&linked)) __builtin_trap();
+                        if (kernel_vfs_path_release(&next)) __builtin_trap();
+                        result=-KERNEL_EXDEV;
+                        goto Finish;
+                    }
                     (void)kernel_vfs_path_release(&next);
                     (void)kernel_vfs_path_release(&current);
                     current = linked;
@@ -1372,6 +1433,12 @@ static int resolve_object(struct kernel_vfs_path *start,
             work[length]=0;
             pending=work;
             if (target[0] == '/') {
+                if ((walk->resolve & KERNEL_VFS_RESOLVE_BENEATH) ||
+                    ((walk->resolve & KERNEL_VFS_RESOLVE_NO_XDEV) &&
+                     current->file.mount!=root->file.mount)) {
+                    result=-KERNEL_EXDEV;
+                    goto Finish;
+                }
                 (void)kernel_vfs_path_release(&current);
                 current = root;
                 result = kernel_vfs_path_acquire(current);
@@ -1398,6 +1465,12 @@ static int resolve_object(struct kernel_vfs_path *start,
 Finish:
     if (!result && *owner && (walk->mount!=(*owner)->file.mount || !walk->guard.lock)) {
         result=path_walk_select(walk,*owner);
+        if (result && kernel_vfs_path_release(owner)) __builtin_trap();
+    }
+    if (!result && *owner && (walk->resolve & KERNEL_VFS_RESOLVE_SCOPED)) {
+        /* This is the open's lookup linearization point. No target has been
+         * opened or created if the authorized ancestry cannot be established. */
+        result=scoped_path_check(walk,*owner);
         if (result && kernel_vfs_path_release(owner)) __builtin_trap();
     }
     if (current != 0) (void)kernel_vfs_path_release(&current);
@@ -1512,7 +1585,9 @@ static void dentry_release(struct kernel_vfs_dentry **owner)
             KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
             if (!entry->references) __builtin_trap();
             if (__atomic_fetch_sub(&entry->references,1,__ATOMIC_ACQ_REL)!=1) return;
-            unregister_path(entry);
+            /* Anonymous dentries are owned by their paths but have no name index. */
+            if (entry->previous) unregister_path(entry);
+            else if (!entry->detached || entry->parent) __builtin_trap();
         }
         struct kernel_vfs_dentry *parent=entry->parent;
         if (kernel_vfs_close(&entry->file)) __builtin_trap();
@@ -1548,6 +1623,40 @@ static int path_wrap(struct kernel_vfs_mount *mount,struct kernel_vfs_dentry *en
     }
     if (existing) kernel_heap_release(instance->heap,path);
     if (!result) *owner=existing ? existing : path;
+    return result;
+}
+
+int kernel_vfs_attach_unnamed_path(struct kernel_vfs_file *file,const char *name)
+{
+    struct kernel_vfs_node *node=kernel_vfs_file_node(file);
+    if (!node || !node->unlinked || file->path) return -KERNEL_EINVAL;
+    struct kernel_vfs_instance *instance=node->instance;
+    size_t length=strlen(name)+1;
+    struct kernel_vfs_dentry *entry;
+    enum kernel_heap_status allocation=kernel_heap_allocate_zeroed(instance->heap,1,
+        sizeof(*entry)+length,(void **)&entry);
+    if (allocation) return allocation==KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+    entry->heap=instance->heap;
+    entry->references=1;
+    entry->detached=1;
+    entry->name=entry->initial_name;
+    memcpy(entry->name,name,length);
+    {
+        KERNEL_LOCK_SCOPE(io);
+        kernel_vfs_node_lock(node,&io,1);
+        if (node->open_files==UINT32_MAX || kernel_vfs_node_acquire(node)) {
+            kernel_heap_release(entry->heap,entry);
+            return -KERNEL_EOVERFLOW;
+        }
+        node->open_files++;
+        if (__atomic_fetch_add(&instance->external_files,1,__ATOMIC_RELAXED)==UINT32_MAX)
+            __builtin_trap();
+        entry->file=*file;
+        entry->file.mount=&instance->backend_mount;
+        entry->file.location_owner=0;
+    }
+    int result=path_wrap(file->mount,entry,&file->path);
+    dentry_release(&entry);
     return result;
 }
 
@@ -1659,6 +1768,16 @@ static int path_string(const struct kernel_vfs_path *path,const struct kernel_vf
     const struct kernel_vfs_dentry *entry=path->dentry;
     struct kernel_vfs_mount *mount=path->file.mount;
     size_t position=capacity-1;int deleted=0,result=0,unreachable=0;buffer[position]=0;
+    if (entry->detached && !entry->parent) {
+        static const char suffix[]=" (deleted)";
+        size_t length=strlen(entry->name);
+        if (!display) return -KERNEL_ENOENT;
+        if (capacity<1+length+sizeof(suffix)) return -KERNEL_ERANGE;
+        buffer[0]='/';
+        memcpy(buffer+1,entry->name,length);
+        memcpy(buffer+1+length,suffix,sizeof(suffix));
+        return 0;
+    }
     if (entry->detached || ((struct kernel_vfs_node *)entry->file.private_data)->unlinked) {
         if (cwd) return -KERNEL_ENOENT;
         if (display) deleted=1;
@@ -1827,6 +1946,7 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
     {
         VFS_PATH_WALK(walk,start,root);
         walk.final_write=create;
+        walk.resolve=request->resolve;
         struct kernel_vfs_path *resolved=NULL;
         char missing[256];
         missing[0]=0;
@@ -1838,6 +1958,10 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
         else if (!missing[0]) {
             if (create && path[strlen(path)-1U]=='/') result=-KERNEL_EISDIR;
             else if (exclusive) result=-KERNEL_EEXIST;
+            else if (create && (resolved->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR)
+                result=-KERNEL_EISDIR;
+            else if ((flags & KERNEL_VFS_OPEN_REGULAR) &&
+                (resolved->file.mode & KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFREG) result=-KERNEL_EFTYPE;
             else if ((flags & KERNEL_VFS_OPEN_DIRECTORY) &&
                 (resolved->file.mode & KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFDIR) result=-KERNEL_ENOTDIR;
             else if (flags & KERNEL_VFS_OPEN_PATH_ONLY) {
@@ -1845,8 +1969,6 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
                 file->mount=file->path->file.mount;file->mode=file->path->file.mode;
             } else if ((resolved->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFLNK)
                 result=-KERNEL_ELOOP;
-            else if (create && (resolved->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR)
-                result=-KERNEL_EISDIR;
             else if ((request->access & 2U) &&
                 (resolved->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR) result=-KERNEL_EISDIR;
             else if (flags & KERNEL_VFS_OPEN_EXECUTABLE) result=path_open_executable_locked(resolved,file,request->access);
@@ -2155,6 +2277,8 @@ static int memory_write_source(struct kernel_vfs_node *node,uint64_t offset,
         if (count>size-*written) count=size-*written;
         KERNEL_LOCK_SCOPE(io);
         kernel_vfs_node_lock(node,&io,1);
+        if ((node->file_seals&KERNEL_SEAL_GROW) &&
+            (offset>node->size || count>node->size-offset)) return -KERNEL_EPERM;
         uint64_t address,index=offset>>BOAROS_PAGE_SHIFT; int created;
         enum kernel_memory_object_status status=kernel_memory_object_prepare_page(
             node->memory,index,&address,&created);
@@ -2233,6 +2357,7 @@ static int vfs_write_source_locked(struct kernel_vfs_file *file,uint64_t offset,
         result = kernel_vfs_file_modified(file, offset, 0);
         if (result) return result;
     }
+    if (node->file_seals&KERNEL_SEAL_WRITES) return -KERNEL_EPERM;
     kernel_lock_release(&node_guard);
     result = node->memory
         ? memory_write_source(node,offset,source,size,&written)
@@ -2347,6 +2472,9 @@ int kernel_vfs_fallocate_borrowing(struct kernel_vfs_file *file, unsigned mode,
         limit->exceeded = 1;
         return -KERNEL_EFBIG;
     }
+    if (mode & KERNEL_VFS_FALLOC_PUNCH_HOLE) {
+        if (node->file_seals&KERNEL_SEAL_WRITES) return -KERNEL_EPERM;
+    } else if ((node->file_seals&KERNEL_SEAL_GROW) && end>old_size) return -KERNEL_EPERM;
     struct kernel_page_cache *cache = node->instance->page_cache;
     int result = kernel_file_mapping_prepare(node);
     if (result) return result;
@@ -2423,6 +2551,8 @@ int kernel_vfs_ftruncate_borrowing(struct kernel_vfs_file *file,
     /* Even a same-size ftruncate updates mtime/ctime. Reconciliation also
      * preserves visible inode mutations when the backend reports an error. */
     if (size > node->max_size) return -KERNEL_EFBIG;
+    if ((size<node->size && (node->file_seals&KERNEL_SEAL_SHRINK)) ||
+        (size>node->size && (node->file_seals&KERNEL_SEAL_GROW))) return -KERNEL_EPERM;
     if (node->memory) {
         /* 关闭旧候选的发布，释放inode锁后才逐MM撤销。登记/OFD覆盖回调
          * 寿命；缺页最终校验取得IO读锁，因此关闭与提交有唯一先后关系。 */
@@ -3226,6 +3356,7 @@ LookupNames:
     }
     adapter->path_index = path_index_remove(adapter->path_index, source->dentry);
     source->dentry->parent = new_parent->dentry;
+    if (old_parent!=new_parent->dentry) path_topology_changed();
     if (dentry_acquire(new_parent->dentry)) __builtin_trap();
     source->dentry->name = new_name;
     adapter->path_index = path_index_insert(adapter->path_index, source->dentry);
@@ -3443,7 +3574,8 @@ int kernel_vfs_node_release(struct kernel_vfs_node **owner)
         kernel_task_lock_acquire(&kernel_vfs_state_lock, &irq);
         if (!__atomic_compare_exchange_n(&node->references, &references, 0, 0,
             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) { kernel_task_lock_release(&irq); continue; }
-        if (!kernel_file_mapping_empty(node) || node->fifo_pipe || node->cache_pages ||
+        if (!kernel_file_mapping_empty(node) || node->fifo_pipe || node->cache_pages.rbh_root ||
+            __atomic_load_n(&node->shared_write_bytes,__ATOMIC_ACQUIRE) ||
             node->dirty_cache_pages.tree.rbh_root || node->dirty_cache_pages.count ||
             node->dirty_cache_pages.queue_next || node->dirty_cache_pages.queue_previous ||
             !kernel_record_lock_state_empty(&node->record_locks)) __builtin_trap();
@@ -3490,11 +3622,6 @@ uint64_t kernel_vfs_node_size(const struct kernel_vfs_node *node)
     return __atomic_load_n(&node->size,__ATOMIC_ACQUIRE);
 }
 
-struct kernel_page_cache_entry **kernel_vfs_node_cache_pages(
-    struct kernel_vfs_node *node)
-{
-    return &node->cache_pages;
-}
 
 struct kernel_page_cache_dirty *kernel_vfs_node_dirty_pages(struct kernel_vfs_node *node)
 { return &node->dirty_cache_pages; }
@@ -4227,6 +4354,9 @@ int kernel_vfs_publish_node(struct kernel_vfs_mount *mount,
     kernel_mutex_init(&node->write_operation, 15, (uintptr_t)node);
     kernel_rwlock_init(&node->namespace_lock, 21, (uintptr_t)node->inode);
     kernel_rwlock_init(&node->io_lock, 30, (uintptr_t)node);
+#if BOAROS_MAX_CPUS > 1
+    kernel_raw_lock_init(&node->cache_index_lock, KERNEL_RAW_RANK_CACHE_INDEX);
+#endif
     kernel_file_mapping_init(node);
     kernel_record_lock_state_init(&node->record_locks);
     kernel_task_lock_guard irq = {0};
@@ -4278,6 +4408,12 @@ int kernel_vfs_publish_node(struct kernel_vfs_mount *mount,
     __atomic_fetch_add(&instance->external_files, 1, __ATOMIC_RELAXED);
     file_location_acquire(file);
     return 0;
+}
+
+uint64_t *kernel_vfs_node_shared_write_counter(struct kernel_vfs_node *node,int *sealed)
+{
+    *sealed=!!(node->file_seals&KERNEL_SEAL_WRITES);
+    return node->memfd ? &node->shared_write_bytes : NULL;
 }
 
 struct kernel_memory_object *kernel_vfs_file_memory(const struct kernel_vfs_file *file)

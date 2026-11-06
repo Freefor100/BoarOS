@@ -80,6 +80,16 @@ static void account_bytes(struct vma_usage *usage, const struct kernel_vma *vma,
     }
 }
 
+static void account_shared_write(const struct kernel_vma *vma,uint64_t bytes,int add)
+{
+    uint64_t *counter=vma->shared_write_bytes;
+    if (!counter) return;
+    if (add) {
+        if (__atomic_fetch_add(counter,bytes,__ATOMIC_RELAXED)>UINT64_MAX-bytes)
+            __builtin_trap();
+    } else if (__atomic_fetch_sub(counter,bytes,__ATOMIC_RELEASE)<bytes) __builtin_trap();
+}
+
 uint64_t kernel_vma_set_locked_bytes(const struct kernel_vma_set *set)
 {
     if (!set_valid(set)) __builtin_trap();
@@ -179,6 +189,7 @@ static int can_merge(const struct kernel_vma *left,
         left->flags != right->flags ||
         left->backing != right->backing ||
         left->shm_attachment != right->shm_attachment ||
+        left->shared_write_bytes != right->shared_write_bytes ||
         left->maximum_permissions != right->maximum_permissions) {
         return 0;
     }
@@ -471,6 +482,7 @@ enum kernel_vma_status kernel_vma_set_fork(
             entry->flags &= ~KERNEL_VMA_LOCK_MASK;
             if (entry->shm_attachment) kernel_shm_attachment_open(entry->shm_attachment);
             account_bytes(&working->usage, entry, entry->end - entry->start, 1);
+            account_shared_write(entry,entry->end-entry->start,1);
         }
         merge_all(working);
         *destination = working;
@@ -489,9 +501,11 @@ enum kernel_vma_status kernel_vma_set_destroy(struct kernel_vma_set **set)
     }
     working = *set;
     if (working->entries != 0) {
-        for (uint32_t i = 0; i < working->count; i++)
-            if (working->entries[i].shm_attachment)
-                kernel_shm_attachment_close(working->entries[i].shm_attachment);
+        for (uint32_t i = 0; i < working->count; i++) {
+            const struct kernel_vma *entry=&working->entries[i];
+            account_shared_write(entry,entry->end-entry->start,0);
+            if (entry->shm_attachment) kernel_shm_attachment_close(entry->shm_attachment);
+        }
         kernel_heap_release(working->heap, working->entries);
         working->entries = 0;
         working->count = 0U;
@@ -519,6 +533,7 @@ enum kernel_vma_status kernel_vma_set_insert(
     if (status == KERNEL_VMA_STATUS_OK) {
         /* 相邻合并不改变原用量；成功后只计本次新增区间。 */
         account_bytes(&set->usage, vma, vma->end - vma->start, 1);
+        account_shared_write(vma,vma->end-vma->start,1);
         set->generation++;
     }
     return status;
@@ -773,9 +788,14 @@ enum kernel_vma_status kernel_vma_set_commit_remap(struct kernel_vma_set *set,
         return KERNEL_VMA_STATUS_OK;
     }
     struct kernel_vma_edit removal;
+    uint64_t bytes=edit->replacement.end-edit->replacement.start;
+    /* A move cannot expose zero eligibility between removing and inserting
+     * the same writable mapping: a concurrent WRITE seal would be irreversible. */
+    account_shared_write(&edit->replacement,bytes,1);
     if (kernel_vma_set_prepare_replace(set, edit->start, edit->end, 0, &removal) ||
         kernel_vma_set_commit_edit(set, &removal) ||
         kernel_vma_set_insert(set, &edit->replacement)) __builtin_trap();
+    account_shared_write(&edit->replacement,bytes,0);
     return KERNEL_VMA_STATUS_OK;
 }
 
@@ -950,9 +970,15 @@ enum kernel_vma_status kernel_vma_set_commit_edit(
             account_bytes(&usage, &set->entries[index], bytes, 1);
         }
     } else {
+        /* mmap holds inode admission until publication. On replacement the
+         * new charge precedes retirement; the old PTEs are already revoked. */
+        if (edit->kind==KERNEL_VMA_EDIT_REPLACE)
+            account_shared_write(&edit->replacement,edit->end-edit->start,1);
         for (index = first; index < last; index++) {
-            account_bytes(&usage, &set->entries[index],
-                set->entries[index].end - set->entries[index].start, 0);
+            const struct kernel_vma *entry=&set->entries[index];
+            uint64_t bytes=entry->end-entry->start;
+            account_bytes(&usage,entry,bytes,0);
+            account_shared_write(entry,bytes,0);
             if (set->entries[index].shm_attachment)
                 kernel_shm_attachment_close(set->entries[index].shm_attachment);
         }
@@ -964,6 +990,7 @@ enum kernel_vma_status kernel_vma_set_commit_edit(
         if (edit->kind == KERNEL_VMA_EDIT_REPLACE) {
             status = insert_entry(set, &edit->replacement);
             if (status != KERNEL_VMA_STATUS_OK) {
+                account_shared_write(&edit->replacement,edit->end-edit->start,0);
                 return KERNEL_VMA_STATUS_STATE;
             }
             account_bytes(&usage, &edit->replacement,
@@ -1018,6 +1045,7 @@ enum kernel_vma_status kernel_vma_set_trim_end(
     }
     struct vma_usage usage = set->usage;
     account_bytes(&usage, &set->entries[index], old_end - new_end, 0);
+    account_shared_write(&set->entries[index],old_end-new_end,0);
     if (new_end == start) {
         erase_entry(set, index);
     } else {

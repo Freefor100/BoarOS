@@ -23,6 +23,7 @@
 #include <kernel/virtio_pci_rng.h>
 #include <kernel/virtio_pci_net.h>
 #include <kernel/network.h>
+#include <kernel/socket.h>
 #include <kernel/ns16550.h>
 
 #define ROOT_DEVICES 8
@@ -165,12 +166,15 @@ static void cleanup_worker(void *unused)
     (void)unused; (void)arch_interrupt_save(); kernel_scheduler_register_cleanup();
     int boot_error=start_root();
     if(boot_error) {
-#if BOAROS_MAX_CPUS > 1
-        la_smp_stop();
-#endif
         la_virt_puts("LA root boot errno=");la_virt_hex((uint64_t)(int64_t)boot_error);la_virt_puts("\n");
         for(unsigned attempt=0;attempt<3;attempt++) {
-            int cleanup=release_root();if(!cleanup) la_virt_shutdown();
+            int cleanup=release_root();
+            if(!cleanup) {
+#if BOAROS_MAX_CPUS > 1
+                la_smp_stop();
+#endif
+                la_virt_shutdown();
+            }
             la_virt_puts("LA root cleanup errno=");la_virt_hex((uint64_t)(int64_t)cleanup);la_virt_puts("\n");
             if(attempt<2) kernel_scheduler_wait_cleanup(arch_time_read()+la_timer_frequency()/100);
         }
@@ -189,11 +193,12 @@ static void cleanup_worker(void *unused)
         int pending=reaped && kernel_scheduler_stop_users();
         arch_interrupt_restore(irq);
         if(reaped && !pending) {
-#if BOAROS_MAX_CPUS > 1
-            la_smp_stop();
-#endif
             int error=release_root();
             if(!error) {
+#if BOAROS_MAX_CPUS > 1
+                /* Unmount drains and joins the journal workers first. */
+                la_smp_stop();
+#endif
                 la_virt_puts("LA PID 1 exited reason=");la_virt_hex(init.reason);
                 la_virt_puts(" status=");la_virt_hex(init.status);la_virt_puts("\n");
 #if BOAROS_MAX_CPUS > 1
@@ -280,12 +285,16 @@ static int start_root(void)
     if(!error) error=la_virt_uart_start(&root.uart,&root.heap,la_timer_frequency());
     if(!error) error=start_rng(allocator,host);
     if(!error) error=start_network(allocator,host);
+#if BOAROS_USER_SMP
+    if(!error) error=kernel_socket_start_tcp_owners();
+#endif
     if(!error) error=prepare_init();
     if(!error) error=kernel_page_cache_start_worker(&root.cache);
-    if(!error) error=kernel_vfs_start_journal_worker(&root.mount);
     if(error) return error;
     for(unsigned i=0;i<root.count;i++)
         if(!virtio_block_enable_irq(&root.devices[i].device,root.devices[i].pci.irq)) return -KERNEL_EIO;
+    error=kernel_vfs_start_journal_worker(&root.mount);
+    if(error) return error;
     /* 后台 I/O owner 就绪后才原子发布 PID 1，启动 OOM 从未留下半成品用户任务。 */
     enum kernel_scheduler_status created=kernel_user_thread_create(&root.image.mm,&root.files,&root.fs,
         root.image.entry,root.image.stack_pointer,root.image.thread_pointer);

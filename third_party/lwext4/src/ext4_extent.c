@@ -2262,10 +2262,13 @@ static int extent_get_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock
     if (reserve) ext4_ext_mark_unwritten(&newex);
 	err = ext4_ext_insert_extent(inode_ref, &path, &newex, 0);
 	if (err != EOK) {
-		/* free data blocks we just allocated */
-		int cleanup = ext4_ext_free_blocks(inode_ref, ext4_ext_pblock(&newex),
-                     ext4_ext_get_actual_len(&newex), 0);
-        if (cleanup) err = cleanup;
+		/* Private journal mappings and allocation claims are discarded on
+		 * abort. An exclusive free here could obscure the original failure. */
+		if (!ext4_current_trans(inode_ref->fs)) {
+			int cleanup = ext4_ext_free_blocks(inode_ref, ext4_ext_pblock(&newex),
+					 ext4_ext_get_actual_len(&newex), 0);
+			if (cleanup) err = cleanup;
+		}
 		goto out2;
 	}
 

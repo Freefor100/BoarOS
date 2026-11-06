@@ -24,9 +24,11 @@ root = Path(__file__).resolve().parents[2]
 with tempfile.TemporaryDirectory(prefix="boaros-virtio-net-") as work:
     exe = Path(work) / "net"
     for page_shift, observe in ((12, 0), (12, 1), (14, 0), (14, 1)):
-        command=["cc", "-std=c11", "-DBOAROS_HOST_IRQ_STATE", "-Wall", "-Wextra", "-Werror",
+        command=["cc", "-std=c11", "-pthread", "-DBOAROS_HOST_IRQ_STATE", "-DBOAROS_MAX_CPUS=2",
+             "-Wall", "-Wextra", "-Werror",
              f"-DBOAROS_COST_DIAGNOSTICS={observe}", f"-DBOAROS_PAGE_SHIFT={page_shift}",
              "-Itests/host/random", "-Iinclude", "tests/host/virtio_net_test.c",
+             "tests/host/cpu_context.c", "kernel/raw_lock.c",
              "arch/riscv/virtio_mmio_net.c", "drivers/virtio/net.c", "drivers/virtio/transport.c",
              "drivers/virtio/split_queue.c", "drivers/virtio/mmio.c", "-o", str(exe)]
         if args.sanitize:command += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]

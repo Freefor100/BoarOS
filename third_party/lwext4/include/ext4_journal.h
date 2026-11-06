@@ -94,6 +94,7 @@ struct jbd_data {
 	struct ext4_block block;
 	struct jbd_image *image;
 	struct jbd_source *source;
+	uint8_t metadata_check;
 	struct ext4_block_write io;
 	RB_ENTRY(jbd_data) index_node;
 	TAILQ_ENTRY(jbd_data) node;
@@ -118,12 +119,14 @@ struct jbd_quarantine {
 	ext4_fsblk_t first;
 	uint32_t count;
 	bool inode;
+	bool allocation;
 	RB_ENTRY(jbd_quarantine) index_node;
 	LIST_ENTRY(jbd_quarantine) node;
 	struct jbd_trans *owner;
 };
 
 struct ext4_orphan_undo;
+struct jbd_allocation_group;
 
 struct jbd_trans {
 	struct ext4_operation operation;
@@ -150,6 +153,7 @@ struct jbd_trans {
 	TAILQ_HEAD(jbd_trans_data, jbd_data) data_queue;
 	RB_HEAD(jbd_data_tree, jbd_data) data_root;
 	LIST_HEAD(jbd_quarantine_list, jbd_quarantine) quarantine;
+	struct jbd_allocation_group *allocation_groups;
 	RB_HEAD(jbd_revoke_tree, jbd_revoke_rec) revoke_root;
 	LIST_HEAD(jbd_trans_block_rec, jbd_block_rec) tbrec_list;
 	TAILQ_ENTRY(jbd_trans) trans_node;
@@ -173,7 +177,6 @@ struct jbd_journal {
 	RB_HEAD(jbd_quarantine_tree, jbd_quarantine) quarantine_index[2];
 	uint64_t quarantined_blocks, quarantined_inodes;
 	struct jbd_memory *memory;
-	RB_HEAD(jbd_source_tree, jbd_source) sources;
 	uint64_t accepted_sequence, sealed_sequence, durable_sequence, checkpoint_sequence;
 	uint64_t seal_target;
 	ext4_fsblk_t *log_map;
@@ -325,6 +328,9 @@ int jbd_trans_quarantine(struct ext4_fs *fs, ext4_fsblk_t first,
 int jbd_journal_find_reusable(struct ext4_fs *fs, const void *bitmap,
     ext4_fsblk_t base, uint32_t start, uint32_t end, uint32_t maximum,
     bool inode, uint32_t *found, uint32_t *length);
+int jbd_trans_claim_blocks(struct ext4_block_group_ref *, struct ext4_block *,
+    uint32_t start, uint32_t end, uint32_t maximum, uint32_t *found,
+    uint32_t *length, bool *contended);
 
 #ifdef __cplusplus
 }

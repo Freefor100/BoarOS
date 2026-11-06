@@ -18,17 +18,14 @@
 #define LOOP_MAX_NUMBER ((1U<<20)-1)
 enum loop_state { LOOP_UNBOUND, LOOP_BOUND, LOOP_RUNDOWN, LOOP_DETACHING, LOOP_FAILED };
 enum loop_operation { LOOP_READ, LOOP_WRITE, LOOP_FLUSH, LOOP_READ_BATCH,
-    LOOP_WRITE_BATCH, LOOP_WRITE_PHASE };
+    LOOP_WRITE_BATCH };
 struct loop_request {
     struct loop_request *next;
     enum loop_operation operation;
     uint64_t offset;
     void *buffer;
     size_t size;
-    union {
-        struct { struct block_read_span *reads; const struct kernel_block_span *writes; size_t count; } batch;
-        struct { kernel_block_phase_next_fn next; const void *context, *first; } phase;
-    };
+    struct { struct block_read_span *reads; const struct kernel_block_span *writes; size_t count; } batch;
     int result, done;
     struct kernel_wait_queue changed;
 };
@@ -149,14 +146,7 @@ static int backing_io(struct loop_device *loop,struct loop_request *request)
             if (span->size) result=backing_transfer(loop,1,span->offset,
                 (void *)span->buffer,span->size,&done);
         }
-    } else {
-        if (request->operation!=LOOP_WRITE_PHASE) __builtin_trap();
-        const void *cursor=request->phase.first;
-        struct kernel_block_span span;
-        while (!result && request->phase.next(request->phase.context,&cursor,&span))
-            if (span.size) result=backing_transfer(loop,1,span.offset,
-                (void *)span.buffer,span.size,&done);
-    }
+    } else __builtin_trap();
     return result;
 }
 static int detach_backing(struct loop_device *loop)
@@ -233,8 +223,7 @@ static void loop_worker(void *argument)
         /* Admission may bypass its own upstream debt; completion must still
          * wake the backing worker when a raw loop writer crosses its share. */
         if (loop->backing->kind==KERNEL_OPEN_FILE_KIND_REGULAR &&
-            (request->operation==LOOP_WRITE || request->operation==LOOP_WRITE_BATCH ||
-             request->operation==LOOP_WRITE_PHASE))
+            (request->operation==LOOP_WRITE || request->operation==LOOP_WRITE_BATCH))
             kernel_page_cache_notify_pressure(kernel_open_file_page_cache(loop->backing));
         {
             KERNEL_RAW_SCOPE(guard,&loop->metadata);
@@ -297,12 +286,6 @@ static enum kernel_block_status write_loop_batch(void *context,const struct kern
     struct loop_request request={.operation=LOOP_WRITE_BATCH,.batch={.writes=spans,.count=count}};
     return block_status(submit_request(context,&request));
 }
-static enum kernel_block_status write_loop_phase(void *context,kernel_block_phase_next_fn next,
-    const void *next_context,const void *first)
-{
-    struct loop_request request={.operation=LOOP_WRITE_PHASE,.phase={next,next_context,first}};
-    return block_status(submit_request(context,&request));
-}
 static int open_loop(struct kernel_block_device *device,uint32_t flags)
 {
     (void)flags;struct loop_device *loop=device->context;
@@ -328,7 +311,7 @@ static void setup_loop(struct loop_device *loop,uint32_t number,struct kernel_he
     kernel_raw_lock_init(&loop->metadata,KERNEL_RAW_RANK_OBJECT);
     kernel_wait_queue_init(&loop->work);kernel_wait_queue_init(&loop->changed);
     loop->block=(struct kernel_block_device){.context=loop,.read=read_loop,.write=write_loop,
-        .read_batch=read_loop_batch,.write_batch=write_loop_batch,.write_phase=write_loop_phase,
+        .read_batch=read_loop_batch,.write_batch=write_loop_batch,
         .flush=flush_loop,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK,
         .open=open_loop,.owners_changed=owners_changed,.ioctl=loop_ioctl,.virtual_backing=1};
 }

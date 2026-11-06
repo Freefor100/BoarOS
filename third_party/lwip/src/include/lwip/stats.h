@@ -309,6 +309,23 @@ extern struct stats_ lwip_stats;
 /** Init statistics */
 void stats_init(void);
 
+#ifdef BOAROS_LWIP_SHARED_MEMORY
+/* The allocator serializes writers; snapshots need only individual values. */
+#define STATS_GET(x) __atomic_load_n(&lwip_stats.x, __ATOMIC_RELAXED)
+#define STATS_STORE(x, value) __atomic_store_n(&lwip_stats.x, value, __ATOMIC_RELAXED)
+#define STATS_INC(x) do { if (boaros_lwip_parallel_enabled()) \
+                           (void)__atomic_fetch_add(&lwip_stats.x, 1, __ATOMIC_RELAXED); \
+                         else STATS_STORE(x, STATS_GET(x) + 1U); \
+                       } while(0)
+#define STATS_DEC(x) do { if (boaros_lwip_parallel_enabled()) \
+                           (void)__atomic_fetch_sub(&lwip_stats.x, 1, __ATOMIC_RELAXED); \
+                         else STATS_STORE(x, STATS_GET(x) - 1U); \
+                       } while(0)
+#define STATS_INC_USED(x, y, type) do { type used = (type)(STATS_GET(x.used) + (y)); \
+                                STATS_STORE(x.used, used); \
+                                if (STATS_GET(x.max) < used) STATS_STORE(x.max, used); \
+                             } while(0)
+#else
 #define STATS_INC(x) ++lwip_stats.x
 #define STATS_DEC(x) --lwip_stats.x
 #define STATS_INC_USED(x, y, type) do { lwip_stats.x.used = (type)(lwip_stats.x.used + y); \
@@ -317,6 +334,8 @@ void stats_init(void);
                                 } \
                              } while(0)
 #define STATS_GET(x) lwip_stats.x
+#define STATS_STORE(x, value) (lwip_stats.x = (value))
+#endif
 #else /* LWIP_STATS */
 #define stats_init()
 #define STATS_INC(x)
@@ -392,7 +411,7 @@ void stats_init(void);
 #define MEM_STATS_AVAIL(x, y) lwip_stats.mem.x = y
 #define MEM_STATS_INC(x) STATS_INC(mem.x)
 #define MEM_STATS_INC_USED(x, y) STATS_INC_USED(mem, y, mem_size_t)
-#define MEM_STATS_DEC_USED(x, y) lwip_stats.mem.x = (mem_size_t)((lwip_stats.mem.x) - (y))
+#define MEM_STATS_DEC_USED(x, y) STATS_STORE(mem.x, (mem_size_t)(STATS_GET(mem.x) - (y)))
 #define MEM_STATS_DISPLAY() stats_display_mem(&lwip_stats.mem, "HEAP")
 #else
 #define MEM_STATS_AVAIL(x, y)

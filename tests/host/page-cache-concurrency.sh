@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-case "${1:-all}" in all|read-borrow-retire|snapshot-copy|admission-credit|read-batch|truncate|append-snapshot|indexed-reclaim|pressure-domains|dirty-age|progress-owners|version-pool|pressure|pressure-errors|fallocate|durable-progress|datasync-times|durable-fixed-target|caller-metadata-owners|shared-mmap|mremap) ;; *) echo 'usage: page-cache-concurrency.sh [all|read-borrow-retire|snapshot-copy|admission-credit|read-batch|truncate|append-snapshot|indexed-reclaim|pressure-domains|dirty-age|progress-owners|version-pool|pressure|pressure-errors|fallocate|durable-progress|datasync-times|durable-fixed-target|caller-metadata-owners|shared-mmap|mremap]' >&2; exit 2;; esac
+case "${1:-all}" in all|writeback-wake|read-borrow-retire|snapshot-copy|admission-credit|read-batch|allocation-claims|truncate|append-snapshot|indexed-reclaim|pressure-domains|dirty-age|progress-owners|version-pool|pressure|pressure-errors|fallocate|durable-progress|datasync-times|durable-fixed-target|caller-metadata-owners|shared-mmap|mremap) ;; *) echo 'usage: page-cache-concurrency.sh [all|writeback-wake|read-borrow-retire|snapshot-copy|admission-credit|read-batch|allocation-claims|truncate|append-snapshot|indexed-reclaim|pressure-domains|dirty-age|progress-owners|version-pool|pressure|pressure-errors|fallocate|durable-progress|datasync-times|durable-fixed-target|caller-metadata-owners|shared-mmap|mremap]' >&2; exit 2;; esac
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$root"
 build_dir=${CACHE_HOST_BUILD:-build/host/cache}
@@ -18,10 +18,14 @@ for shift in ${CACHE_HOST_SHIFTS:-12 14}; do
         mm/heap.c mm/memory_object.c fs/vfs.c fs/tmpfs.c fs/file_mapping.c \
         fs/record_lock.c fs/flock.c fs/page_cache.c fs/ext4_backend.c fs/lwext4_port.c \
         kernel/block.c third_party/lwext4/src/*.c ${CACHE_HOST_SOURCES:-} \
-        -Wl,--wrap=memcpy,--gc-sections,--wrap=kernel_time_monotonic_ns,--wrap=kernel_vfs_node_pread,--wrap=kernel_vfs_node_pread_batch,--wrap=physical_page_allocate,--wrap=kernel_heap_allocate_zeroed,--wrap=kernel_heap_allocate,--wrap=kernel_vfs_node_writeback,--wrap=ext4_fpwrite_batch,--wrap=kernel_thread_join,--wrap=kernel_open_file_prepare_mapping_page \
+        -Wl,--wrap=memcpy,--gc-sections,--wrap=kernel_time_monotonic_ns,--wrap=kernel_vfs_node_pread,--wrap=kernel_vfs_node_pread_batch,--wrap=physical_page_allocate,--wrap=kernel_heap_allocate_zeroed,--wrap=kernel_heap_allocate,--wrap=kernel_vfs_node_writeback,--wrap=ext4_fpwrite_batch,--wrap=ext4_trans_write_data,--wrap=ext4_balloc_verify_bitmap_csum,--wrap=kernel_thread_join,--wrap=kernel_open_file_prepare_mapping_page \
         -Wl,--wrap=kernel_raw_lock_acquire,--wrap=kernel_rwlock_read,--wrap=kernel_rwlock_write,--wrap=kernel_rwlock_try_write,--wrap=kernel_wait_prepare,--wrap=kernel_wait_park,--wrap=kernel_wait_queue_destroy,--wrap=physical_page_acquire,--wrap=physical_page_release,--wrap=physical_page_available,--wrap=kernel_vfs_sync_complete \
         -Wl,--wrap=ext4_file_writeback_times,--wrap=ext4_file_sync_metadata_mode,--wrap=kernel_vfs_node_find,--wrap=ext4_mount_setup_time_observer ${CACHE_HOST_LDFLAGS:-} \
         -Wl,--wrap=ext4_filesystem_sync_metadata -o "$build_dir/concurrency-$shift"
+    if [ "${1:-all}" = all ] || [ "${1:-all}" = writeback-wake ]; then
+        timeout 15s "$build_dir/concurrency-$shift" - writeback-wake
+        if [ "${1:-all}" = writeback-wake ]; then continue; fi
+    fi
     for block in ${CACHE_HOST_BLOCKS:-1024 4096}; do
         if [ "${1:-all}" = all ]; then
             image="$build_dir/read-borrow-retire-$shift-$block.img"
@@ -36,7 +40,7 @@ for shift in ${CACHE_HOST_SHIFTS:-12 14}; do
             e2fsck -fn "$image" > "$build_dir/fsck-indexed-reclaim-$shift-$block.log" 2>&1
             continue
         fi
-        if [ "${1:-all}" = read-borrow-retire ] || [ "${1:-all}" = snapshot-copy ] || [ "${1:-all}" = admission-credit ] || [ "${1:-all}" = read-batch ] || [ "${1:-all}" = dirty-age ] || [ "${1:-all}" = progress-owners ] || [ "${1:-all}" = version-pool ] || [ "${1:-all}" = append-snapshot ]; then
+        if [ "${1:-all}" = read-borrow-retire ] || [ "${1:-all}" = snapshot-copy ] || [ "${1:-all}" = admission-credit ] || [ "${1:-all}" = read-batch ] || [ "${1:-all}" = allocation-claims ] || [ "${1:-all}" = dirty-age ] || [ "${1:-all}" = progress-owners ] || [ "${1:-all}" = version-pool ] || [ "${1:-all}" = append-snapshot ]; then
             image="$build_dir/$1-$shift-$block.img"
             truncate -s 32M "$image"; mkfs.ext4 -q -F -b "$block" "$image"
             timeout 20s "$build_dir/concurrency-$shift" "$image" "$1"

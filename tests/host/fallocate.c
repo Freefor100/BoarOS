@@ -39,6 +39,13 @@ int __wrap_ext4_xattr_remove(struct ext4_inode_ref *ref,uint8_t index,const char
     return __real_ext4_xattr_remove(ref,index,name,length);
 }
 static unsigned fail_delayed_allocation;
+static unsigned fail_reservation_allocation;
+void *__real_ext4_user_calloc(size_t,size_t);
+void *__wrap_ext4_user_calloc(size_t count,size_t size)
+{
+    if (fail_reservation_allocation) { fail_reservation_allocation=0;return NULL; }
+    return __real_ext4_user_calloc(count,size);
+}
 int __real_ext4_fs_get_inode_dblk_range(struct ext4_inode_ref *,ext4_lblk_t,uint32_t,bool,struct ext4_inode_block_range *);
 int __wrap_ext4_fs_get_inode_dblk_range(struct ext4_inode_ref *ref,ext4_lblk_t first,uint32_t count,bool create,struct ext4_inode_block_range *range)
 {
@@ -409,48 +416,80 @@ static void delayed_allocation(struct kernel_page_cache *cache, struct kernel_vf
     {
         KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(kernel_vfs_file_node(&file),&io,1);
         ext4_file *raw=lwext4_node_file(kernel_vfs_file_node(&file));
-        void *a=NULL,*b=NULL;size_t ready;
+        struct file_write_reservation a={0},b={0};size_t ready;
         assert(!ext4_file_reserve_write(raw,0,2*block,&ready,&a) && ready==2*block);
-        assert(!ext4_file_reserve_write(raw,block,block,&ready,&b) && ready==block && b);
-        ext4_file_finish_reservation(raw,b,block,2*block);
-        ext4_file_finish_reservation(raw,a,0,0);
-        assert(fs->delayed_blocks==baseline+1);
-        ext4_file_release_reservations(raw,0);
-        assert(fs->delayed_blocks==baseline);
-        assert(!ext4_file_reserve_write(raw,0,block,&ready,&a));
         struct lwext4_mount_adapter *adapter=lwext4_instance(mount->private_data);
         reservation_state_lock=adapter->locks.state_lock;reservation_state_calls=0;
         adapter->locks.state_lock=count_reservation_state_lock;
-        ext4_file_finish_reservation(raw,a,0,block);
+        /* Borrowing a block already in the tree requires neither a new chunk
+         * nor any backend allocation for the first request record. */
+        fail_reservation_allocation=1;
+        assert(!ext4_file_reserve_write(raw,block,block,&ready,&b) && ready==block && b.owner);
+        assert(fail_reservation_allocation==1);
+        fail_reservation_allocation=0;
+        adapter->locks.state_lock=reservation_state_lock;
+        assert(!reservation_state_calls);
+        ext4_file_finish_reservation(raw,&b,block,2*block);
+        ext4_file_finish_reservation(raw,&a,0,0);
+        assert(fs->delayed_blocks==baseline+1);
+        if (adapter->locks.resource_acquire) {
+            /* Charge an unreserved known hole next to the retained block.
+             * Neither admission nor cancellation needs the journal state. */
+            reservation_state_calls=0;
+            adapter->locks.state_lock=count_reservation_state_lock;
+            assert(!ext4_file_reserve_write(raw,2*block,block,&ready,&a) && ready==block && a.owner);
+            assert(fs->delayed_blocks==baseline+2);
+            ext4_file_finish_reservation(raw,&a,2*block,2*block);
+            adapter->locks.state_lock=reservation_state_lock;
+            assert(!reservation_state_calls && fs->delayed_blocks==baseline+1);
+        }
+        ext4_file_release_reservations(raw,0);
+        assert(fs->delayed_blocks==baseline);
+        assert(!ext4_file_reserve_write(raw,0,block,&ready,&a));
+        reservation_state_lock=adapter->locks.state_lock;reservation_state_calls=0;
+        adapter->locks.state_lock=count_reservation_state_lock;
+        ext4_file_finish_reservation(raw,&a,0,block);
         adapter->locks.state_lock=reservation_state_lock;
         assert(!reservation_state_calls && fs->delayed_blocks==baseline+1);
         ext4_file_release_reservations(raw,0);
         assert(fs->delayed_blocks==baseline);
         assert(!ext4_file_reserve_write(raw,0,2*block,&ready,&a));
         assert(!ext4_file_reserve_write(raw,0,2*block,&ready,&b));
-        ext4_file_finish_reservation(raw,a,0,0);
+        ext4_file_finish_reservation(raw,&a,0,0);
         assert(fs->delayed_blocks==baseline+2);
-        ext4_file_finish_reservation(raw,b,0,0);
+        ext4_file_finish_reservation(raw,&b,0,0);
         assert(fs->delayed_blocks==baseline);
         assert(!ext4_file_reserve_write(raw,0,block,&ready,&a));
-        ext4_file_accept_reservation(raw,a,0,block);
+        ext4_file_accept_reservation(raw,&a,0,block);
         ext4_file_release_reservations(raw,0);
         assert(!ext4_file_reserve_write(raw,0,block,&ready,&b));
-        ext4_file_finish_reservation(raw,a,0,block);
-        ext4_file_finish_reservation(raw,b,0,0);
+        ext4_file_finish_reservation(raw,&a,0,block);
+        ext4_file_finish_reservation(raw,&b,0,0);
         assert(fs->delayed_blocks==baseline);
         /* 非对齐请求跨两个预留节点；空前缀不能接纳首块，部分前缀只保留覆盖块。 */
         uint64_t start=63*block+block/2;
-        void *cross=NULL;
+        struct file_write_reservation cross={0};
         assert(!ext4_file_reserve_write(raw,start,2*block,&ready,&cross) && ready==2*block);
         assert(fs->delayed_blocks==baseline+3);
-        ext4_file_finish_reservation(raw,cross,start,start);
+        ext4_file_finish_reservation(raw,&cross,start,start);
         assert(fs->delayed_blocks==baseline);
         assert(!ext4_file_reserve_write(raw,start,2*block,&ready,&cross) && ready==2*block);
-        ext4_file_accept_reservation(raw,cross,start,start+block);
-        ext4_file_finish_reservation(raw,cross,start,start);
+        ext4_file_accept_reservation(raw,&cross,start,start+block);
+        ext4_file_finish_reservation(raw,&cross,start,start);
         assert(fs->delayed_blocks==baseline+2);
         ext4_file_release_reservations(raw,0);
+        assert(fs->delayed_blocks==baseline);
+        /* Exhaust storage for the second ticket record, not for the chunks.
+         * The inline first prefix remains valid and can be rolled back. */
+        assert(!ext4_file_reserve_write(raw,start,block/2,&ready,&a) && ready==block/2);
+        assert(!ext4_file_reserve_write(raw,64*block,block,&ready,&b) && ready==block);
+        fail_reservation_allocation=1;
+        assert(ext4_file_reserve_write(raw,start,2*block,&ready,&cross)==ENOMEM &&
+            ready==block/2 && cross.owner && !cross.next && !fail_reservation_allocation);
+        ext4_file_finish_reservation(raw,&cross,start,start);
+        assert(!cross.owner && !cross.next && fs->delayed_blocks==baseline+2);
+        ext4_file_finish_reservation(raw,&a,start,start);
+        ext4_file_finish_reservation(raw,&b,64*block,64*block);
         assert(fs->delayed_blocks==baseline);
     }
     unsigned char bytes[16*1024];memset(bytes,0x53,sizeof(bytes));size_t done;
@@ -493,6 +532,34 @@ static void delayed_allocation(struct kernel_page_cache *cache, struct kernel_vf
     assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&file)));
     expect_bytes(&file,bytes,sizeof(bytes));
     assert(!kernel_vfs_ftruncate(&file,0));
+    /* The old preparation stays alive while fallocate turns a nearby hole
+     * into an unwritten mapping. Covering that mapping must work at zero quota. */
+    struct kernel_vfs_file filler={0};
+    assert(!create_file(mount,"/delalloc-full-quota",0600,&filler));
+    struct file_write_reservation held={0},full={0};
+    {
+        KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(kernel_vfs_file_node(&file),&io,1);
+        assert(!ext4_file_reserve_write(lwext4_node_file(kernel_vfs_file_node(&file)),
+            0,block,&done,&held) && done==block && held.owner);
+    }
+    assert(!kernel_vfs_fallocate(&file,KERNEL_VFS_FALLOC_KEEP_SIZE,block,block));
+    {
+        KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(kernel_vfs_file_node(&filler),&io,1);
+        size_t length=ext4_fs_available_blocks(fs)*block;
+        assert(length && !ext4_file_reserve_write(lwext4_node_file(kernel_vfs_file_node(&filler)),
+            0,length,&done,&full) && done==length && full.owner);
+    }
+    assert(!ext4_fs_available_blocks(fs));
+    assert(!kernel_vfs_pwrite(&file,block,bytes,block,&done) && done==block);
+    {
+        KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(kernel_vfs_file_node(&filler),&io,1);
+        ext4_file_finish_reservation(lwext4_node_file(kernel_vfs_file_node(&filler)),&full,0,0);
+    }
+    {
+        KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(kernel_vfs_file_node(&file),&io,1);
+        ext4_file_finish_reservation(lwext4_node_file(kernel_vfs_file_node(&file)),&held,0,0);
+    }
+    assert(fs->delayed_blocks==baseline && !kernel_vfs_close(&filler));
     assert(!kernel_vfs_sync(&file,0,&observed) && !kernel_vfs_close(&file));
     puts("PASS delayed allocation: cache visibility, failed writeback ownership, retry, batched conversion and truncate");
 }
@@ -1543,7 +1610,8 @@ mounted_done:
     assert(!kernel_vfs_create(memory,"/unsupported",0600,&unsupported));
     assert(kernel_vfs_fallocate(&unsupported,0,0,4096)==-KERNEL_EOPNOTSUPP);
     assert(kernel_vfs_fallocate(&unsupported,1,0,4096)==-KERNEL_EOPNOTSUPP);
-    assert(kernel_vfs_fallocate(&unsupported,3,0,4096)==-KERNEL_EOPNOTSUPP);
+    assert(!kernel_vfs_fallocate(&unsupported,KERNEL_VFS_FALLOC_KEEP_SIZE |
+        KERNEL_VFS_FALLOC_PUNCH_HOLE,0,4096));
     assert(!kernel_vfs_file_block_device(&unsupported));
     assert(!kernel_vfs_close(&unsupported) && !kernel_vfs_unmount(memory));
     assert(!physical_page_allocator_audit(&pages) && physical_page_available(&pages)==baseline);

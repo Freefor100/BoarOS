@@ -1721,7 +1721,7 @@ prune-build:
 -include $(DEPS)
 
 .PHONY: test-allocator-release-host
-build/host/lwip-port: tests/host/lwip_port_test.c \
+build/host/lwip-port: tests/host/lwip_port_test.c tests/host/lwip_shared_payload.h tests/host/lwip_receive_policy.h \
 		net/lwip_port/port.c $(filter third_party/lwip/%,$(LWIP_SOURCES))
 	@mkdir -p $(dir $@)
 	cc -std=c11 -Wall -Wextra -Werror -Inet/lwip_port/include \

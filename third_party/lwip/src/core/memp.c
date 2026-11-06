@@ -280,17 +280,30 @@ do_memp_malloc_pool_fn(const struct memp_desc *desc, const char *file, const int
     LWIP_ASSERT("memp_malloc: memp properly aligned",
                 ((mem_ptr_t)memp % MEM_ALIGNMENT) == 0);
 #if MEMP_STATS
+#ifdef BOAROS_LWIP_SHARED_MEMORY
+    mem_size_t used = (mem_size_t)(__atomic_load_n(&desc->stats->used, __ATOMIC_RELAXED) + 1U);
+    __atomic_store_n(&desc->stats->used, used, __ATOMIC_RELAXED);
+    if (used > __atomic_load_n(&desc->stats->max, __ATOMIC_RELAXED)) {
+      __atomic_store_n(&desc->stats->max, used, __ATOMIC_RELAXED);
+    }
+#else
     desc->stats->used++;
     if (desc->stats->used > desc->stats->max) {
       desc->stats->max = desc->stats->used;
     }
+#endif
 #endif
     SYS_ARCH_UNPROTECT(old_level);
     /* cast through u8_t* to get rid of alignment warnings */
     return ((u8_t *)memp + MEMP_SIZE);
   } else {
 #if MEMP_STATS
+#ifdef BOAROS_LWIP_SHARED_MEMORY
+    __atomic_store_n(&desc->stats->err,
+                    __atomic_load_n(&desc->stats->err, __ATOMIC_RELAXED) + 1U, __ATOMIC_RELAXED);
+#else
     desc->stats->err++;
+#endif
 #endif
     SYS_ARCH_UNPROTECT(old_level);
     LWIP_DEBUGF(MEMP_DEBUG | LWIP_DBG_LEVEL_SERIOUS, ("memp_malloc: out of memory in pool %s\n", desc->desc));
@@ -374,7 +387,12 @@ do_memp_free_pool(const struct memp_desc *desc, void *mem)
 #endif /* MEMP_OVERFLOW_CHECK */
 
 #if MEMP_STATS
+#ifdef BOAROS_LWIP_SHARED_MEMORY
+  __atomic_store_n(&desc->stats->used,
+                  __atomic_load_n(&desc->stats->used, __ATOMIC_RELAXED) - 1U, __ATOMIC_RELAXED);
+#else
   desc->stats->used--;
+#endif
 #endif
 
 #if MEMP_MEM_MALLOC

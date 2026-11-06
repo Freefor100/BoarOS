@@ -98,8 +98,9 @@ void kernel_wait_record_init(struct kernel_wait_record *);
 enum kernel_scheduler_status kernel_wait_node_bind_locked(struct kernel_wait_queue *,struct kernel_wait_node *,const struct kernel_wait_token *);
 int kernel_wait_notify_locked(const struct kernel_wait_token *, uint32_t);
 #if BOAROS_USER_SMP
-/* 1: caller owns the returned run guard, 0: obsolete, -1: common path. */
-int kernel_wait_backend_lock_local(const struct kernel_wait_token *,struct kernel_raw_guard *);
+/* 1: target queue protected, 0: obsolete, -1: common placement needed.
+ * Only a caller with the wait domain may retire a deadline from the index. */
+int kernel_wait_backend_lock_local(const struct kernel_wait_token *,struct kernel_raw_guard *,int domain);
 #endif
 void kernel_wait_node_add_locked(struct kernel_wait_queue *, struct kernel_wait_node *);
 void kernel_wait_node_remove_locked(struct kernel_wait_node *);

@@ -7,11 +7,13 @@
 #include <kernel/random.h>
 #include <kernel/raw_lock.h>
 #include <kernel/wait_internal.h>
+#include "lwip/inet_chksum.h"
 #include "lwip/tcp.h"
-static err_t copy_capacity_tcp_write(struct tcp_pcb *,const void *,u16_t,u8_t);
-#define tcp_write copy_capacity_tcp_write
+static err_t copy_capacity_tcp_writev(struct tcp_pcb *,
+    const struct kernel_socket_write_segment *,unsigned,u16_t,u8_t,u16_t *);
+#define boaros_lwip_tcp_writev copy_capacity_tcp_writev
 #include "../../net/socket.c"
-#undef tcp_write
+#undef boaros_lwip_tcp_writev
 #include "../../net/ethernet.c"
 #include "../../kernel/pid.c"
 
@@ -46,6 +48,8 @@ static size_t heap_last_allocation_size;
 static unsigned space_callbacks;
 static _Thread_local unsigned reservation_actor,state_acquires;
 static struct kernel_socket *lookup_close_target;
+static struct kernel_socket *reset_retry_socket;
+static unsigned reset_retry_observations;
 static unsigned lookup_close_done;
 static struct {
     struct kernel_socket *target,*peer;
@@ -94,6 +98,11 @@ void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_r
     }
     if(reservation_actor==2)reservation_arrive();
     __real_kernel_raw_lock_acquire(lock,guard);
+    if(lock==&socket_state_lock && reset_retry_socket &&
+       reset_retry_socket->work_links[receive_wait.slot].queued) {
+        CHECK(reset_retry_socket->receive_retry);
+        reset_retry_observations++;
+    }
 }
 uint64_t kernel_cost_clock(void) {return 0;}
 struct kernel_cost_tag kernel_cost_capture(void) {return (struct kernel_cost_tag){0};}
@@ -438,6 +447,7 @@ enum kernel_scheduler_status kernel_wait_notify(const struct kernel_wait_token *
 enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *t,enum kernel_wait_wake_reason *r)
 {
     (void)t;CHECK(remote_testing && !kernel_cpu_current()->raw_locks);
+    CHECK(remote_mode!=10);
     CHECK(!pthread_mutex_lock(&remote_gate));
     int stopping_actor=!kernel_cpu_current()->logical_id;
     if(stopping_actor) {stop_waiting=1;CHECK(!pthread_cond_broadcast(&remote_changed));}
@@ -687,7 +697,23 @@ static void nodelay_pending(unsigned blocked)
     CHECK(!kernel_socket_set_option(socket, KERNEL_SOCKET_NODELAY, 0));
     CHECK(copied_packets == 1 && socket->tcp->unsent);
     nic_full = blocked;
-    CHECK(!kernel_socket_set_option(socket, KERNEL_SOCKET_NODELAY, 1));
+    if (blocked==2) {
+        struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
+        struct tcp_pcb *pcb=socket->tcp;
+        struct pbuf *packet=pbuf_alloc(PBUF_RAW,TCP_HLEN,PBUF_RAM);CHECK(packet);
+        struct tcp_hdr *hdr=packet->payload;
+        *hdr=(struct tcp_hdr){.src=lwip_htons(pcb->remote_port),.dest=lwip_htons(pcb->local_port),
+            .seqno=lwip_htonl(pcb->rcv_nxt),.ackno=lwip_htonl(pcb->snd_nxt),.wnd=lwip_htons(TCP_WND)};
+        TCPH_HDRLEN_FLAGS_SET(hdr,5,TCP_ACK);
+        hdr->chksum=ip_chksum_pseudo(packet,IP_PROTO_TCP,TCP_HLEN,&pcb->remote_ip,&pcb->local_ip);
+        struct ip_globals saved=ip_data;
+        ip_data.current_iphdr_src=pcb->remote_ip;ip_data.current_iphdr_dest=pcb->local_ip;
+        ip_data.current_netif=ip_data.current_input_netif=&network.interface;
+        tcp_input(packet,&network.interface);
+        ip_data=saved;
+        CHECK(!pcb->unacked && !socket->work_links[ready_work.slot].queued);
+        kernel_socket_protocol_leave(&scope);
+    } else CHECK(!kernel_socket_set_option(socket, KERNEL_SOCKET_NODELAY, 1));
     if (blocked) {
         CHECK(copied_packets == 1 && socket->tcp->unsent);
         CHECK(socket->work_links[nic_wait.slot].queued);
@@ -701,7 +727,8 @@ static void nodelay_pending(unsigned blocked)
     tcp_abort(socket->tcp); kernel_socket_destroy(socket);
     netif_remove(&network.interface);
     kernel_socket_protocol_leave(&irq);
-    printf("PASS NODELAY pending output and %s without ACK or timer progress\n", blocked ? "NIC capacity retry" : "immediate transmission");
+    if (blocked==2) puts("PASS input output: NIC retry follows real failure without a speculative ready job or timer");
+    else printf("PASS NODELAY pending output and %s without ACK or timer progress\n", blocked ? "NIC capacity retry" : "immediate transmission");
 }
 
 static struct {
@@ -713,23 +740,31 @@ static struct {
     uint32_t available;
 } copy_capacity_interleave={.lock=PTHREAD_MUTEX_INITIALIZER,.changed=PTHREAD_COND_INITIALIZER};
 
-/* The observer forwards to real lwIP, then lets another CPU reserve while the
- * accepted prefix is already in the PCB and the complete batch is still held. */
-static err_t copy_capacity_tcp_write(struct tcp_pcb *pcb,const void *bytes,u16_t size,u8_t flags)
+static void copy_capacity_pause(unsigned stage)
+{
+    CHECK(!pthread_mutex_lock(&copy_capacity_interleave.lock));
+    copy_capacity_interleave.stage=stage;
+    CHECK(!pthread_cond_broadcast(&copy_capacity_interleave.changed));
+    while(copy_capacity_interleave.returned!=stage)
+        CHECK(!pthread_cond_wait(&copy_capacity_interleave.changed,&copy_capacity_interleave.lock));
+    CHECK(!pthread_mutex_unlock(&copy_capacity_interleave.lock));
+}
+/* Another CPU can reserve both before COPY and after the prefix is in the
+ * PCB but before the owner publishes its new budget. */
+static err_t copy_capacity_tcp_writev(struct tcp_pcb *pcb,
+    const struct kernel_socket_write_segment *segments,unsigned count,u16_t size,u8_t flags,u16_t *written)
 {
     CHECK(!kernel_cpu_current()->raw_locks && caller_owns_protocol());
-    err_t result=tcp_write(pcb,bytes,size,flags);
-    if(copy_capacity_interleave.socket && pcb==copy_capacity_interleave.socket->tcp && result==ERR_OK) {
-        CHECK(copy_capacity_interleave.request->reserved==3);
-        unsigned written=++copy_capacity_interleave.writes;
-        if(written==1 || written==3) {
-            CHECK(!pthread_mutex_lock(&copy_capacity_interleave.lock));
-            unsigned stage=written==1?1:2;copy_capacity_interleave.stage=stage;
-            CHECK(!pthread_cond_broadcast(&copy_capacity_interleave.changed));
-            while(copy_capacity_interleave.returned!=stage)
-                CHECK(!pthread_cond_wait(&copy_capacity_interleave.changed,&copy_capacity_interleave.lock));
-            CHECK(!pthread_mutex_unlock(&copy_capacity_interleave.lock));
-        }
+    int observe=copy_capacity_interleave.socket && pcb==copy_capacity_interleave.socket->tcp;
+    if(observe) {
+        CHECK(copy_capacity_interleave.request->reserved==3 && count==3);
+        copy_capacity_interleave.writes++;
+        copy_capacity_pause(1);
+    }
+    err_t result=boaros_lwip_tcp_writev(pcb,segments,count,size,flags,written);
+    if(observe) {
+        CHECK(result==ERR_OK && *written==3 && copy_capacity_interleave.request->reserved==3);
+        copy_capacity_pause(2);
     }
     return result;
 }
@@ -769,7 +804,12 @@ static void copy_capacity_batch(struct kernel_socket_write_request *request)
     unsigned single=state_acquires-before;
     const struct kernel_socket_write_segment segments[]={{"b",1},{"c",1},{"d",1}};
     CHECK(kernel_socket_stream_reserve(request,3,0)==3);before=state_acquires;
+    struct kernel_socket_statistics stats_before, stats_after;
+    kernel_socket_get_statistics(&stats_before);
     CHECK(kernel_socket_stream_commitv(request,segments,3,KERNEL_SOCKET_IO_MORE)==3);
+    kernel_socket_get_statistics(&stats_after);
+    CHECK(stats_after.tcp_write_calls-stats_before.tcp_write_calls==1);
+    CHECK(stats_after.tcp_written_bytes-stats_before.tcp_written_bytes==3);
     printf("TCP capacity locks: single=%u split=%u\n",single,state_acquires-before);
     CHECK(state_acquires-before==single);
 
@@ -784,7 +824,7 @@ static void copy_capacity_batch(struct kernel_socket_write_request *request)
     pthread_t thread;CHECK(!pthread_create(&thread,NULL,copy_capacity_reserver,NULL));
     CHECK(kernel_socket_stream_commitv(request,segments,3,KERNEL_SOCKET_IO_MORE)==3);
     CHECK(!pthread_join(thread,NULL));
-    CHECK(copy_capacity_interleave.writes==3 && request->socket->tx_reserved==1);
+    CHECK(copy_capacity_interleave.writes==1 && request->socket->tx_reserved==1);
     CHECK(request->socket->tx_budget==budget-3 && !request->reserved);
     copy_capacity_interleave.socket=NULL;copy_capacity_interleave.request=NULL;
     kernel_socket_stream_finish(&held);CHECK(held_owner==(void *)request->socket && !request->socket->tx_reserved);
@@ -1007,16 +1047,169 @@ static void connected_pair(struct kernel_socket **listener, struct kernel_socket
     CHECK((*client)->connected && kernel_socket_accept(*listener, server, NULL) == 0);
 }
 
+static void tcp_detached_copy(void)
+{
+    struct kernel_socket *listener=NULL,*client=NULL,*server=NULL;
+    connected_pair(&listener,&client,&server);
+    struct kernel_socket_protocol_scope scope;
+    kernel_socket_protocol_enter(&scope);
+    struct tcp_pcb *pcb=client->tcp;
+    u16_t mss=boaros_lwip_tcp_detached_mss(pcb);
+    u32_t sequence=pcb->snd_lbb;
+    tcpwnd_size_t room=pcb->snd_buf;
+    CHECK(!pcb->unsent && !pcb->snd_queuelen && mss>16 && 2U*mss+7<=room);
+    kernel_socket_protocol_leave(&scope);
+    static unsigned char source[32768], output[32768];
+    unsigned length=2U*mss+7;
+    CHECK(length<=sizeof(source));
+    for (unsigned i=0;i<length;i++) source[i]=(unsigned char)(31*i+3);
+    const struct kernel_socket_write_segment vector[]={{source,17},{source+17,length-17}};
+    unsigned pool=MEMP_STATS_GET(used,MEMP_TCP_SEG);
+    struct tcp_seg *prepared=NULL;
+    CHECK(boaros_lwip_tcp_preparev(vector,2,(u16_t)length,mss,&prepared)==ERR_OK);
+    CHECK(prepared && prepared->next && prepared->next->next && !prepared->next->next->next);
+    CHECK(MEMP_STATS_GET(used,MEMP_TCP_SEG)==pool+3);
+    memset(source,0,length);
+
+    kernel_socket_protocol_enter(&scope);
+    u16_t written;
+    CHECK(!pcb->unsent && pcb->snd_lbb==sequence && pcb->snd_buf==room);
+    struct tcp_seg *first=prepared, *suffix=first->next;
+    CHECK(boaros_lwip_tcp_publishv(pcb,&prepared,mss-1,0,&written)==ERR_WOULDBLOCK);
+    CHECK(!written && prepared==first && !pcb->unsent && pcb->snd_lbb==sequence);
+    CHECK(boaros_lwip_tcp_publishv(pcb,&prepared,mss,0,&written)==ERR_OK && written==mss);
+    CHECK(prepared==suffix && pcb->unsent==first && !first->next && pcb->snd_queuelen==1);
+    CHECK(pcb->snd_lbb==sequence+mss && pcb->snd_buf==room-mss);
+    CHECK(!(TCPH_FLAGS(first->tcphdr)&TCP_PSH) && tcp_output(pcb)==ERR_OK);
+    kernel_socket_protocol_leave(&scope);
+    tcp_segs_free(prepared); prepared=NULL;
+    for (unsigned i=0;i<8 && !server->rx_bytes;i++)
+        (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+    struct kernel_open_file_description *pin=(void *)server;
+    struct kernel_socket_read_request read={0};
+    CHECK(kernel_socket_reserve_read(server,0,&read,&pin,mss,0,NULL)==mss);
+    kernel_socket_copy_read(&read,0,output,mss);
+    CHECK(kernel_socket_finish_read(&read,0)==mss && pin==(void *)server);
+    for (unsigned i=0;i<mss;i++) CHECK(output[i]==(unsigned char)(31*i+3));
+
+    /* Exhaust only the segment pool. A prepared prefix survives the second
+     * allocation failure; both the unused pbuf and the prefix are returned. */
+    void *held[MEMP_NUM_TCP_SEG]; unsigned count=0;
+    while (count<MEMP_NUM_TCP_SEG && (held[count]=memp_malloc(MEMP_TCP_SEG))) count++;
+    CHECK(count>1); memp_free(MEMP_TCP_SEG,held[--count]);
+    mem_size_t heap=STATS_GET(mem.used);
+    CHECK(boaros_lwip_tcp_preparev(vector,2,(u16_t)length,mss,&prepared)==ERR_MEM);
+    CHECK(prepared && prepared->len==mss && !prepared->next);
+    tcp_segs_free(prepared);
+    CHECK(STATS_GET(mem.used)==heap);
+    while (count) memp_free(MEMP_TCP_SEG,held[--count]);
+    kernel_socket_protocol_enter(&scope);
+    if (client->tcp) tcp_abort(client->tcp);
+    if (server->tcp) tcp_abort(server->tcp);
+    kernel_socket_protocol_leave(&scope);
+    kernel_socket_destroy(server);kernel_socket_destroy(client);kernel_socket_destroy(listener);
+    for (unsigned i=0;i<8;i++) (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+    CHECK(MEMP_STATS_GET(used,MEMP_TCP_SEG)==pool && !heap_live);
+    puts("PASS detached TCP COPY: immutable final pbuf, live prefix publication, untouched suffix and allocation rollback");
+}
+
+static void tcp_reset_receive_retry(void)
+{
+    struct kernel_socket *listener=NULL,*client=NULL,*server=NULL;
+    connected_pair(&listener,&client,&server);
+    struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    tcp_nagle_disable(client->tcp);
+    CHECK(write_buffer(client,"kept",4,0)==4);
+    netif_poll_all();
+    struct kernel_open_file_description *pin=(void *)server;
+    struct kernel_socket_read_request read={0};
+    CHECK(kernel_socket_reserve_read(server,0,&read,&pin,4,0,NULL)==4);
+    heap_fail_after=1;
+    CHECK(write_buffer(client,"x",1,0)==1);
+    netif_poll_all();
+    CHECK(!heap_fail_after && server->receive_retry && server->tcp->refused_data &&
+          server->work_links[receive_wait.slot].queued);
+    reset_retry_socket=server;
+    tcp_abort(server->tcp);
+    reset_retry_socket=NULL;
+    CHECK(reset_retry_observations && !server->tcp && !server->receive_retry &&
+          !server->work_links[receive_wait.slot].queued && server->pending_error==-KERNEL_ECONNABORTED);
+    kernel_socket_protocol_leave(&scope);
+    char bytes[4];kernel_socket_copy_read(&read,0,bytes,sizeof(bytes));
+    CHECK(kernel_socket_finish_read(&read,0)==4 && !memcmp(bytes,"kept",4) && pin==(void *)server);
+    kernel_socket_protocol_enter(&scope);
+    if (client->tcp) tcp_abort(client->tcp);
+    kernel_socket_protocol_leave(&scope);
+    kernel_socket_destroy(server);kernel_socket_destroy(client);kernel_socket_destroy(listener);
+    (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+    CHECK(!heap_live && !receive_wait.head);
+    puts("PASS TCP abort: retry state and list end together, reserved receive prefix survives, resources returned");
+}
+
+static void tcp_loopback_checksum(void)
+{
+    struct kernel_socket *listener=NULL,*client=NULL,*server=NULL;
+    connected_pair(&listener,&client,&server);
+    struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    struct netif *loop=loopback_netif();
+    struct netif ethernet={0};
+    ip4_addr_t local,mask,empty;
+    IP4_ADDR(&local,10,77,0,2);IP4_ADDR(&mask,255,255,255,0);ip4_addr_set_zero(&empty);
+    CHECK(loop && netif_add(&ethernet,&local,&mask,&empty,NULL,route_interface_init,ip_input));
+#if LWIP_CHECKSUM_CTRL_PER_NETIF
+    CHECK(ethernet.chksum_flags==NETIF_CHECKSUM_ENABLE_ALL &&
+          loop->chksum_flags==(NETIF_CHECKSUM_ENABLE_ALL &
+              ~(NETIF_CHECKSUM_GEN_TCP|NETIF_CHECKSUM_CHECK_TCP)));
+#endif
+    const struct ip_globals saved=ip_data;
+    ip_data.current_netif=loop;
+    ip_addr_copy(ip_data.current_iphdr_src,server->tcp->remote_ip);
+    ip_addr_copy(ip_data.current_iphdr_dest,server->tcp->local_ip);
+    struct pbuf *wire=pbuf_alloc(PBUF_RAW,TCP_HLEN+1,PBUF_RAM);CHECK(wire);
+    struct tcp_hdr *header=wire->payload;
+    memset(header,0,TCP_HLEN);
+    header->src=lwip_htons(server->tcp->remote_port);
+    header->dest=lwip_htons(server->tcp->local_port);
+    header->seqno=lwip_htonl(server->tcp->rcv_nxt);
+    header->ackno=lwip_htonl(server->tcp->lastack);
+    header->wnd=lwip_htons(8192);
+    TCPH_HDRLEN_FLAGS_SET(header,5,TCP_ACK);
+    ((char *)header)[TCP_HLEN]='x';
+    header->chksum=ip_chksum_pseudo(wire,IP_PROTO_TCP,wire->tot_len,
+        ip_current_src_addr(),ip_current_dest_addr())^lwip_htons(1);
+    CHECK(ip_chksum_pseudo(wire,IP_PROTO_TCP,wire->tot_len,ip_current_src_addr(),ip_current_dest_addr()));
+    struct pbuf *local_packet=pbuf_clone(PBUF_RAW,PBUF_RAM,wire);CHECK(local_packet);
+    unsigned errors=STATS_GET(tcp.chkerr);
+    /* The destination interface is lo in both calls; ingress is what matters. */
+    ip_data.current_input_netif=&ethernet;
+    tcp_input(wire,&ethernet);
+    CHECK(STATS_GET(tcp.chkerr)==errors+1 && !server->rx_bytes);
+    ip_data.current_input_netif=loop;
+    tcp_input(local_packet,loop);
+    char received=0;
+    CHECK(STATS_GET(tcp.chkerr)==errors+1 && server->rx_bytes==1 &&
+          pbuf_copy_partial(server->packets_head->payload,&received,1,0)==1 && received=='x');
+    ip_data=saved;
+    netif_remove(&ethernet);
+    if(client->tcp)tcp_abandon(client->tcp,0);
+    if(server->tcp)tcp_abandon(server->tcp,0);
+    kernel_socket_protocol_leave(&scope);
+    kernel_socket_destroy(server);kernel_socket_destroy(client);kernel_socket_destroy(listener);
+    (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,0});
+    puts("PASS TCP checksum: the same bad checksum is rejected on Ethernet ingress and ignored on internal lo");
+}
+
 static struct tcp_pcb *close_to_timewait(struct kernel_socket *client, struct kernel_socket *server)
 {
     /* Only protocol packets advance. No budget is given to deferred socket work. */
+    struct tcp_pcb *pcb=client->tcp;
     CHECK(kernel_socket_shutdown(client, 1) == 0);
     netif_poll_all();
     CHECK(kernel_socket_shutdown(server, 1) == 0);
     netif_poll_all();
-    CHECK(client->tcp && client->tcp->state == TIME_WAIT && client->work_links[ready_work.slot].queued);
-    CHECK(!server->tcp && client->peer_closed);
-    return client->tcp;
+    CHECK(pcb->state==TIME_WAIT && !pcb->callback_arg && !pcb->errf);
+    CHECK(!client->tcp && !server->tcp && client->peer_closed);
+    return pcb;
 }
 
 static void timewait_owner(unsigned mode)
@@ -1664,7 +1857,17 @@ static void remote_protocol_request(unsigned mode)
     unsigned initial_xmit=lwip_stats.tcp.xmit;
     pthread_t thread,second,stopper;unsigned stop_started=0,turns=0;
     const struct remote_write_args first_args={client,"r",1}, second_args={client,"st",2};
+    struct kernel_socket_protocol_scope held;
+    int force_queue=!mode || (mode>=4 && mode<10);
+    if(force_queue)kernel_socket_protocol_enter(&held);
     CHECK(!pthread_create(&thread,NULL,remote_writer,(void *)&first_args));
+    if(force_queue || mode==10) {
+        CHECK(!pthread_mutex_lock(&remote_gate));
+        while(force_queue?!remote_work:!remote_done)CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
+        if(mode==10)CHECK(client->tcp->unsent && !server->rx_bytes && remote_work);
+        CHECK(!pthread_mutex_unlock(&remote_gate));
+        if(force_queue)kernel_socket_protocol_leave(&held);
+    }
     if(mode==9) {
         CHECK(!pthread_mutex_lock(&remote_gate));
         while(remote_parked!=1)CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
@@ -1707,9 +1910,9 @@ static void remote_protocol_request(unsigned mode)
             copy_release=1;CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));
         }
         if(mode==7 && !turns) {
-            /* 旧输入回调的OUTPUT早于当前排队COPY，本次IO_MORE仍须合批。 */
-            struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
-            protocol_input(client->tcp);kernel_socket_protocol_leave(&scope);
+            /* A deferred OUTPUT preceding the queued COPY must not flush its
+             * new IO_MORE prefix. Actual output work, not every input, does this. */
+            socket_schedule(client,SOCKET_WORK_OUTPUT);
         }
         struct kernel_socket_service_result service=kernel_socket_service_pending(
             mode==8?(struct kernel_socket_service_budget){1,0,0}:
@@ -1732,10 +1935,11 @@ static void remote_protocol_request(unsigned mode)
     for(unsigned i=0;i<8;i++)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
     CHECK(server->rx_bytes==(mode==9?3U:(mode>=2 && mode<=4)?0U:1U) &&
           !client->tx_reserved && !client->writes_head && !client->active_writes);
-    if(mode==9) {
+    if(mode==9 || mode==10) {
         char received[3];
-        CHECK(pbuf_copy_partial(server->packets_head->payload,received,sizeof(received),0)==sizeof(received) &&
-              !memcmp(received,"rst",sizeof(received)));
+        unsigned size=mode==9?sizeof(received):1;
+        CHECK(pbuf_copy_partial(server->packets_head->payload,received,size,0)==size &&
+              !memcmp(received,"rst",size));
     }
     struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
     if(client->tcp)tcp_abort(client->tcp);
@@ -1746,6 +1950,8 @@ static void remote_protocol_request(unsigned mode)
     for(unsigned i=0;i<8;i++)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
     if(mode==9)
         puts("PASS remote TCP batch: 2 waiting writers, 2 service units, 1 NODELAY packet, 3 FIFO bytes, quota and owners returned");
+    else if(mode==10)
+        puts("PASS remote TCP direct: CPU1 accepts COPY before worker runs; CPU0 outputs, receiver verifies and owners return");
     else
         printf("PASS remote protocol %u: CPU1 copies/waits, CPU0 executes, request/OFD/payload returned\n",mode);
 }
@@ -2710,6 +2916,9 @@ int main(int argc, char **argv)
     CHECK(kernel_pid_publish(&model_pid_registry,&model_pid)==KERNEL_PID_STATUS_OK);
     if (!strcmp(argv[1], "unix-seq-records")) unix_seqpacket_records();
     else if (!strcmp(argv[1], "ipv4-route")) ipv4_route_output();
+    else if (!strcmp(argv[1], "tcp-loopback-checksum")) tcp_loopback_checksum();
+    else if (!strcmp(argv[1], "tcp-detached")) tcp_detached_copy();
+    else if (!strcmp(argv[1], "tcp-reset-receive-retry")) tcp_reset_receive_retry();
     else if (!strcmp(argv[1], "ipv4-address-shutdown")) ipv4_address_shutdown();
     else if (!strcmp(argv[1], "unix-seq-control")) unix_seqpacket_control();
     else if (!strcmp(argv[1], "unix-seq-reservation")) unix_seqpacket_reservation();
@@ -2732,6 +2941,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "notify-stop")) notification_stop_lifetime();
     else if (!strcmp(argv[1], "stop-wait")) stopped_wait_notification();
     else if (!strcmp(argv[1], "remote-protocol")) remote_protocol_request(0);
+    else if (!strcmp(argv[1], "remote-direct")) remote_protocol_request(10);
     else if (!strcmp(argv[1], "remote-batch")) remote_protocol_request(5);
     else if (!strcmp(argv[1], "remote-batch-ack")) remote_protocol_request(7);
     else if (!strcmp(argv[1], "remote-batch-writers")) remote_protocol_request(9);
@@ -2750,6 +2960,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "nodelay")) nodelay_pending(0);
     else if (!strcmp(argv[1], "minshall")) minshall_send();
     else if (!strcmp(argv[1], "nodelay-capacity")) nodelay_pending(1);
+    else if (!strcmp(argv[1], "tcp-input-output")) nodelay_pending(2);
     else if (!strcmp(argv[1], "unix-payload")) unix_final_payload();
     else if (!strcmp(argv[1], "unix-packet-boundary")) unix_stream_packet_boundary();
     else if (!strcmp(argv[1], "receive-payload")) receive_payload();

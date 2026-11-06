@@ -963,8 +963,9 @@ static void large_phase_case(unsigned version)
     for (unsigned i=0;i<512*1024;i++) bytes[i]=(unsigned char)(i*13+i/512);
     struct phase_entry entry={{0,bytes,512*1024},NULL};
     assert(kernel_block_write_phase(&device.block,phase_next,0,&entry)==KERNEL_BLOCK_STATUS_OK);
-    assert(sg_max_bytes==128*1024 && device.statistics.requests==4 && first_notify_heads==1);
-    assert(device.statistics.max_inflight==1 && !memcmp(bytes,sg_disk,512*1024));
+    assert(sg_max_bytes==128*1024 && device.statistics.requests==4 && first_notify_heads==4);
+    assert(device.statistics.max_inflight==4 && !memcmp(bytes,sg_disk,512*1024));
+    device.statistics.max_inflight=0;
     struct kernel_block_span public_span={0,bytes,512*1024};
     assert(kernel_block_write_batch(&device.block,&public_span,1)==KERNEL_BLOCK_STATUS_OK);
     assert(device.statistics.requests==8 && sg_max_bytes==128*1024 && device.statistics.max_inflight==1);
@@ -975,7 +976,7 @@ static void large_phase_case(unsigned version)
     assert(ack_calls==before+1); /* A real IRQ is acknowledged even with no used entry. */
     assert(!device.active && !device.queue.inflight && !device.queue.claimed && !device.batch_claimed);
     device.irq_source=0; wait_irq_device=NULL;
-    printf("PASS large journal phase transport=%u: one 512KiB phase owner, four drained128KiB windows; single public span retains its request, quiet poll and IRQ ack\n",version);
+    printf("PASS large journal phase transport=%u: one 512KiB phase owner, four concurrent128KiB requests; single public span retains its request, quiet poll and IRQ ack\n",version);
     assert(destroy_model(&device)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations==releases);
 }
 static void late_harvest_case(unsigned version)

@@ -3443,6 +3443,16 @@ static enum kernel_mm_status commit_file_mapping(
                         flags & KERNEL_MM_MAP_SHARED, flags & KERNEL_MM_MAP_FIXED)) return KERNEL_MM_STATUS_NO_MEMORY;
     status = admit_mapping_lock(record, plan.start, plan.end, flags);
     if (status) return status;
+    int may_write=kernel_open_file_writable(*file),sealed=0;
+    uint64_t *write_bytes=NULL;
+    if ((flags&KERNEL_MM_MAP_SHARED) && may_write) {
+        write_bytes=kernel_vfs_node_shared_write_counter(kernel_open_file_node(*file),&sealed);
+        if (sealed) {
+            if (plan.permissions&KERNEL_MM_WRITE) return KERNEL_MM_STATUS_SEALED;
+            may_write=0;
+            write_bytes=NULL;
+        }
+    }
     existing = find_file_source(record, *file);
     if (existing == 0) {
         heap_status = kernel_heap_allocate_zeroed(record->vma_heap,
@@ -3474,8 +3484,9 @@ static enum kernel_mm_status commit_file_mapping(
                             ? KERNEL_VMA_FAULT_FILE_SHARED
                             : KERNEL_VMA_FAULT_FILE_PRIVATE,
         .backing = *file,
+        .shared_write_bytes=write_bytes,
         .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS &
-            (((flags & KERNEL_MM_MAP_SHARED) == 0U || kernel_open_file_writable(*file))
+            (((flags & KERNEL_MM_MAP_SHARED) == 0U || may_write)
                  ? KERNEL_VMA_ALL_PERMISSIONS : ~KERNEL_MM_WRITE) &
             (kernel_open_file_vfs_borrow(*file)->mount->noexec ? ~KERNEL_MM_EXECUTE : KERNEL_VMA_ALL_PERMISSIONS),
     };
@@ -5066,7 +5077,7 @@ static enum kernel_mm_status cached_write_fault(struct mm_operation *operation,
     kernel_page_cache_write_end(&permit);
     status=KERNEL_MM_STATUS_OK;
 finish:
-    if (reservation.ticket) {
+    if (reservation.ticket.owner) {
         if (inode->lock) kernel_lock_release(inode);
         if (operation->guard.lock) mm_operation_release(operation);
         kernel_page_cache_finish_mapping_write(cache,node,&reservation,status==KERNEL_MM_STATUS_OK);

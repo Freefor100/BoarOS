@@ -549,9 +549,11 @@ void ready_remove_locked(struct kernel_task *task)
         ((task->cpu_mask ? task->cpu_mask : 1U)&~(1U<<owner->logical_id))) {
         if (!owner->pullable_ready) __builtin_trap();
 #if BOAROS_USER_SMP
-        if (task->ready_node.priority) __atomic_store_n(&owner->pullable_rt,owner->pullable_rt-1U,__ATOMIC_RELAXED);
-#endif
-#if BOAROS_USER_SMP
+        if (task->ready_node.priority) {
+            if (!owner->pullable_rt) __builtin_trap();
+            if (!--owner->pullable_rt)
+                __atomic_fetch_and(&scheduler.pullable_rt_cpus,~(1U<<owner->logical_id),__ATOMIC_RELAXED);
+        }
         __atomic_store_n(&owner->pullable_ready,owner->pullable_ready-1U,__ATOMIC_RELAXED);
 #else
         owner->pullable_ready--;
@@ -593,7 +595,8 @@ static void ready_enqueue_at_locked(struct kernel_task *task, int flags
         if (target->pullable_ready==UINT32_MAX) __builtin_trap();
 #if BOAROS_USER_SMP
         __atomic_store_n(&target->pullable_ready,target->pullable_ready+1U,__ATOMIC_RELAXED);
-        if (task->ready_node.priority) __atomic_store_n(&target->pullable_rt,target->pullable_rt+1U,__ATOMIC_RELAXED);
+        if (task->ready_node.priority && !target->pullable_rt++)
+            __atomic_fetch_or(&scheduler.pullable_rt_cpus,1U<<target->logical_id,__ATOMIC_RELAXED);
 #else
         target->pullable_ready++;
 #endif
@@ -813,10 +816,7 @@ static int remote_rt_ready(const struct kernel_cpu *cpu)
 {
     /* 调用者持目标核锁。RT入队和资格更新持共同控制及所有队列锁，
      * 因此在本次领取前不会悄悄出现可迁移的更高优先级任务。 */
-    for (struct kernel_cpu *other=__atomic_load_n(&scheduler.cpus,__ATOMIC_ACQUIRE);other;
-         other=other->scheduler_next)
-        if (other!=cpu && __atomic_load_n(&other->pullable_rt,__ATOMIC_RELAXED)) return 1;
-    return 0;
+    return (__atomic_load_n(&scheduler.pullable_rt_cpus,__ATOMIC_RELAXED)&~(1U<<cpu->logical_id))!=0;
 }
 
 /* 空闲核只借实际来源和目标两把队列锁。来源选中前旧栈必已归还；
@@ -867,16 +867,8 @@ int scheduler_select_local(int blocked,int rotate,int voluntary,struct kernel_ta
     *selected=0;
     if (cpu->preempt_depth) return 0;
     if (blocked || current->idle) {
-        int available=0;
-        for (struct kernel_cpu *other=__atomic_load_n(&scheduler.cpus,__ATOMIC_ACQUIRE);other;
-             other=other->scheduler_next) {
-            if (other==cpu) continue;
-            available |= __atomic_load_n(&other->pullable_ready,__ATOMIC_RELAXED)!=0;
-        }
-        if (available) {
-            int pulled=try_pull_ordinary(cpu,current,blocked,selected,deadline);
-            if (pulled) return pulled>0;
-        }
+        int pulled=try_pull_ordinary(cpu,current,blocked,selected,deadline);
+        if (pulled) return pulled>0;
     }
     {
         KERNEL_RAW_SCOPE(guard,kernel_run_lock(cpu));

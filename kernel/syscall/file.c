@@ -7,6 +7,7 @@
 #include <kernel/open_file.h>
 #include <kernel/scheduler.h>
 #include <kernel/task.h>
+#include <kernel/tmpfs.h>
 #include <kernel/socket.h>
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
@@ -15,6 +16,32 @@
 #include <stdint.h>
 
 
+
+enum kernel_syscall_status syscall_handle_memfd_create(struct kernel_task *caller,
+    const struct kernel_syscall_request *request,struct kernel_syscall_result *decoded)
+{
+    uint32_t flags=(uint32_t)request->arguments[1];
+    uint32_t known=KERNEL_MFD_CLOEXEC | KERNEL_MFD_ALLOW_SEALING |
+        KERNEL_MFD_HUGETLB | KERNEL_MFD_NOEXEC_SEAL | KERNEL_MFD_EXEC;
+    if (flags&KERNEL_MFD_HUGETLB) known|=UINT32_C(0xfc000000);
+    decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+    if ((flags&~known) || (flags&KERNEL_MFD_EXEC && flags&KERNEL_MFD_NOEXEC_SEAL)) {
+        decoded->value=-KERNEL_EINVAL;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    struct kernel_mm *mm;
+    struct kernel_files *files;
+    if (kernel_task_mm_borrow_mutable(caller,&mm) || kernel_task_files_borrow(caller,&files))
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    char name[6+KERNEL_MEMFD_NAME_MAX+1]={'m','e','m','f','d',':'};
+    size_t length;
+    enum kernel_uaccess_status copied=kernel_copy_string_from_user(mm,name+6,
+        request->arguments[0],KERNEL_MEMFD_NAME_MAX+1,&length);
+    if (copied) decoded->value=copied==KERNEL_UACCESS_STATUS_TOO_LONG ? -KERNEL_EINVAL : -KERNEL_EFAULT;
+    else if (flags&KERNEL_MFD_HUGETLB) decoded->value=-KERNEL_EOPNOTSUPP;
+    else if (kernel_files_memfd(files,name,flags,&decoded->value)) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
 
 enum kernel_syscall_status syscall_handle_umask(
     struct kernel_task *caller,
@@ -102,40 +129,59 @@ enum kernel_syscall_status syscall_handle_chown(
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
+static int copy_open_how(struct kernel_mm *mm,uint64_t user,uint64_t size,
+                         uint64_t how[3])
+{
+    if (size < 3U * sizeof(*how)) return -KERNEL_EINVAL;
+    if (size > BOAROS_PAGE_SIZE) return -KERNEL_E2BIG;
+    if (user > UINT64_MAX-size) return -KERNEL_EFAULT;
+    /* Linux's copy_struct_from_user checks future extension bytes first. */
+    for (uint64_t offset=3U*sizeof(*how); offset<size;) {
+        unsigned char tail[64];
+        size_t count=size-offset<sizeof(tail) ? (size_t)(size-offset) : sizeof(tail);
+        size_t page_left=BOAROS_PAGE_SIZE-((user+offset)&BOAROS_PAGE_MASK);
+        if (count>page_left) count=page_left;
+        size_t copied;
+        if (kernel_copy_from_user(mm,tail,user+offset,count,&copied)!=KERNEL_UACCESS_STATUS_OK)
+            return -KERNEL_EFAULT;
+        for (size_t i=0;i<count;i++) if (tail[i]) return -KERNEL_E2BIG;
+        offset+=count;
+    }
+    size_t copied;
+    return kernel_copy_from_user(mm,how,user,3U*sizeof(*how),&copied)==KERNEL_UACCESS_STATUS_OK
+        ? 0 : -KERNEL_EFAULT;
+}
+
 enum kernel_syscall_status syscall_handle_openat(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,
-    struct kernel_syscall_result *decoded)
+    struct kernel_syscall_result *decoded, int strict)
 {
     struct kernel_files *files;
     const struct kernel_fs_context *fs;
     struct kernel_mm *mm;
     int64_t linux_result;
-    enum kernel_task_status task_status;
-
-    task_status = kernel_task_files_borrow(caller, &files);
+    enum kernel_task_status task_status=kernel_task_files_borrow(caller,&files);
     if (task_status == KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) {
-        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
-        decoded->value = -KERNEL_ENODEV;
+        decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value=-KERNEL_ENODEV;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    if (task_status != KERNEL_TASK_STATUS_OK ||
-        kernel_task_fs_context_borrow(caller, &fs) !=
-            KERNEL_TASK_STATUS_OK ||
-        kernel_task_mm_borrow_mutable(caller, &mm) !=
-            KERNEL_TASK_STATUS_OK ||
-        kernel_files_openat(files,
-                            fs,
-                            mm,
-                            (int64_t)request->arguments[0],
-                            request->arguments[1],
-                            request->arguments[2],
-                            request->arguments[3],
-                            &linux_result) != KERNEL_FILES_STATUS_OK) {
+    if (task_status!=KERNEL_TASK_STATUS_OK ||
+        kernel_task_fs_context_borrow(caller,&fs)!=KERNEL_TASK_STATUS_OK ||
+        kernel_task_mm_borrow_mutable(caller,&mm)!=KERNEL_TASK_STATUS_OK)
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-    }
-    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
-    decoded->value = linux_result;
+    enum kernel_files_status status=KERNEL_FILES_STATUS_OK;
+    if (strict) {
+        uint64_t how[3];
+        linux_result=copy_open_how(mm,request->arguments[2],request->arguments[3],how);
+        if (!linux_result) status=kernel_files_openat2(files,fs,mm,(int32_t)request->arguments[0],
+            request->arguments[1],how[0],how[1],how[2],&linux_result);
+    } else status=kernel_files_openat(files,fs,mm,(int64_t)request->arguments[0],
+        request->arguments[1],request->arguments[2],request->arguments[3],&linux_result);
+    if (status!=KERNEL_FILES_STATUS_OK) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value=linux_result;
     return KERNEL_SYSCALL_STATUS_OK;
 }
 

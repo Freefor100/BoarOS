@@ -8,7 +8,7 @@ RV/LA默认交付均为单CPU；LA另有[真实多核构建](loongarch-boot.md#�
 
 `SMP=1 USER_SMP=1` 使用独立 `build/riscv-user-smp/`；增加 `SMP_CPUS=4/8` 后分别使用 `build/riscv-user-smp4/`、`build/riscv-user-smp8/`，受控调度、MM 和成本构建也使用对应容量的目录。默认单核与两核缓存不混用。用户资格与CPU0服务资格分开：请求affinity按在线逻辑CPU取得、clone/fork继承、exec保留；临时服务状态不改变`getaffinity`。PID1在secondary上线前构造，因此默认集合在首次恢复准备时固定，不能把构造时的CPU0快照当成最终集合。
 
-通用 syscall 分派、匿名缺页及驻留用户复制在发起 CPU 执行，不再按 syscall 编号先尝试驻留 read 或整次迁移。普通文件缓存与用户复制沿完整共同路径运行，ext4 冷装入、映射解析、空间准备、ftruncate/fallocate、同步准备和相关块请求提交也在发起 CPU 执行；后端表保留 CPU0/CALLER 选择，其他磁盘后端沿现有 worker。全局 sync 在 VFS 挂载枚举与同步入口进入 CPU0，不能从本地通用分派直接触达 lwext4。挂载管理、其他后端命名空间、进程生命周期、设备、socket 控制与协议、epoll 控制等业务在实际操作入口使用 CPU0 服务范围；嵌套调用只在最外层进入和退出，exec/exit 的执行所有权覆盖真正的提交位置。
+通用 syscall 分派、匿名缺页及驻留用户复制在发起 CPU 执行，不再按 syscall 编号先尝试驻留 read 或整次迁移。普通文件缓存与用户复制沿完整共同路径运行，ext4 冷装入、映射解析、空间准备、ftruncate/fallocate、同步准备和相关块请求提交也在发起 CPU 执行；后端表保留 CPU0/CALLER 选择，其他磁盘后端沿现有 worker。全局 sync 在 VFS 挂载枚举与同步入口进入 CPU0，不能从本地通用分派直接触达 lwext4。挂载管理、其他后端命名空间、进程生命周期、设备、socket 控制、epoll 控制等业务在实际操作入口使用 CPU0 服务范围；嵌套调用只在最外层进入和退出，exec/exit 的执行所有权覆盖真正的提交位置。
 
 `kernel_scheduler_enter_user_service()` 在这些范围迁移实际任务的内核栈和调用现场。资格在 rank40 提交，旧执行 owner 由 `switch_finish` 结束后 CPU0 才可接纳。返回通知字区分CPU0业务与本地信号，两类消费者分别取走自己的位，业务范围的进入不提前消费通知。普通信号在执行CPU内完成共享状态选择、构帧与sigreturn；组停止/退出及REAL定时器重装进入其CPU0范围。共享action快照、mask和并发通知协议见[信号模块](kernel-signal.md#smp上的状态和执行位置)。无通知的本地返回无需 CPU0 交接；新通知到达则重新处理。CPU1 的 syscall 计数记录实际本地分派，不再要求为零。
 
@@ -58,7 +58,7 @@ make test-user-smp-composition-riscv QEMU_RISCV_FIRMWARE=/absolute/fw_dynamic.bi
 
 普通用户的驻留复制复用任务已持有的 MM/files 句柄、实际 OFD 引用与 MM raw pin 协议，不为每次复制建立第二组业务owner。来源退休节点保留原有OFD/ELF引用，放开MM gate并排空登记回调后才执行真实关闭。
 
-COST_DIAGNOSTICS配置才保存CPU1→CPU0交接等待ticks、含阻塞的服务elapsed ticks、按实际执行owner结算的running ns；整数时钟单位与运行耗时不同。普通构建不持有这些服务计时字段，调度资格由实际CPU/current与服务状态维护，不依赖迁移计数。ext4 前台文件与目录元数据在发起 CPU 执行；日志、设备配置、网络协议和其他文件系统命名空间沿各自 CPU0 范围执行。分配器通知和同步干净回收可就地执行。LA的真实多核沿用共同保护与执行策略，架构边界见[LA多核](loongarch-boot.md#多核执行)。
+COST_DIAGNOSTICS配置才保存CPU1→CPU0交接等待ticks、含阻塞的服务elapsed ticks、按实际执行owner结算的running ns；整数时钟单位与运行耗时不同。普通构建不持有这些服务计时字段，调度资格由实际CPU/current与服务状态维护，不依赖迁移计数。ext4 前台文件与目录元数据在发起 CPU 执行，日志线程的选核见 [VFS 与 ext4](vfs-ext4.md)。设备配置、网络控制和其他文件系统命名空间沿各自 CPU0 范围执行；TCP 发送接纳的本地条件见[网络](kernel-network.md)。分配器通知和同步干净回收可就地执行。LA的真实多核沿用共同保护与执行策略，架构边界见[LA多核](loongarch-boot.md#多核执行)。
 
 futex 的等待、唤醒、比较重排与复合唤醒在发起 CPU 执行。MM 准备统一取得等待键与用户字 pin，桶操作锁序列化比较、登记和迁移，实际等待队列短锁维护节点；COMMITTED唤醒、READY与旧栈交接继续由共同调度保护协调，退出清理与远端唤醒沿同一协议。具体行为见[调度模块](kernel-scheduler.md#等待与-futex)。
 
@@ -258,7 +258,7 @@ make test-files-smp-userland-riscv INIT_CONFIG=config/init.json
 
 ## 普通文件IO的执行位置
 
-ext4 的路径查找、open、stat、目录枚举、创建、删除和改名按 `namespace_execution=CALLER` 在发起 CPU 执行。共享 root/cwd 采用带引用的快照；路径和 inode 的弱索引、末引用摘除、挂载连接发布共用任务短保护。实际启动多个 CPU 的可写 journal 挂载，其路径操作按实际目录取得共享或独占资格，rename 另由挂载拓扑互斥协调；已打开文件操作按实际 inode／块组取得资格。不同对象的私有修改可同时准备，接纳时合并版本和计数。实际单 CPU、只读、无 journal 挂载及其他后端保留原串行策略。journal/checkpoint 与后台数据写回由 CPU0 推进，启动交接与对象资格见 [VFS 与 ext4](vfs-ext4.md)。非 ext4 后端及特殊设备操作在取得对象锁和用户页借用之前选择 CPU0。
+ext4 的路径查找、open、stat、目录枚举、创建、删除和改名按 `namespace_execution=CALLER` 在发起 CPU 执行。共享 root/cwd 采用带引用的快照；路径和 inode 的弱索引、末引用摘除、挂载连接发布共用任务短保护。实际启动多个 CPU 的可写 journal 挂载，其路径操作按实际目录取得共享或独占资格，rename 另由挂载拓扑互斥协调；已打开文件操作按实际 inode／块组取得资格。不同对象的私有修改可同时准备，接纳时合并版本和计数。实际单 CPU、只读、无 journal 挂载及其他后端保留原串行策略。journal/checkpoint 与页缓存后台写回分别由各自线程推进，选核、启动交接与对象资格见 [VFS 与 ext4](vfs-ext4.md)。非 ext4 后端及特殊设备操作在取得对象锁和用户页借用之前选择 CPU0。
 
 普通用户和受控内核任务的 read/pread/readv、write/pwrite/writev 使用同一实现。FD raw 查槽并取得 OFD 引用，offset mutex 覆盖整次共享位置操作，缓存 metadata mutex 保护索引、LRU、脏链和借用状态。缓存不再叠加 CPU0 IRQ 排他。热读无需 CPU0；匿名目标缺页或 COW 在调用 CPU 解决，ext4 冷文件数据由同一任务发布缺失页、解析映射并提交块请求；其他后端沿 CPU0 策略。
 
@@ -272,7 +272,7 @@ SEEK_DATA/HOLE 和最终缓存 OFD 释放仍复用该执行队列。需要共享
 
 ### 受控文件任务
 
-受控任务创建时仍检查支持的实际消费者、MM 与 heap/allocator 关系，但不封存 FD/OFD，不改变保护方式，也不要求通过额外控制引用避免末次释放。测试可保留独立 arena、挂载和确定性交错；普通用户路径使用真实系统分配器和压力挂钩。普通用户的管道/FIFO数据读写、poll/pselect与epoll等待在发起CPU执行；非ext4命名空间、FIFO打开和关联清理、socket控制/协议、epoll控制、记录锁及设备业务在实际入口进入CPU0范围。未启用 USER_SMP 的服务范围直接消去执行位置判定。默认单核的路径引用由禁止任务抢占的短保护维护；SMP、锁调试和成本诊断构建保留跨核原子引用，USER_SMP 另保留实际执行位置判定。
+受控任务创建时仍检查支持的实际消费者、MM 与 heap/allocator 关系，但不封存 FD/OFD，不改变保护方式，也不要求通过额外控制引用避免末次释放。测试可保留独立 arena、挂载和确定性交错；普通用户路径使用真实系统分配器和压力挂钩。普通用户的管道/FIFO数据读写、poll/pselect与epoll等待在发起CPU执行；非ext4命名空间、FIFO打开和关联清理、socket控制、epoll控制、记录锁及设备业务在实际入口进入CPU0范围。未启用 USER_SMP 的服务范围直接消去执行位置判定。默认单核的路径引用由禁止任务抢占的短保护维护；SMP、锁调试和成本诊断构建保留跨核原子引用，USER_SMP 另保留实际执行位置判定。
 
 ```sh
 make test-file-io-concurrency-host

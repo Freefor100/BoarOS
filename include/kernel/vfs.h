@@ -189,8 +189,18 @@ enum kernel_vfs_open_flags {
     KERNEL_VFS_OPEN_EXECUTABLE = 1U << 3,
     KERNEL_VFS_OPEN_PATH_ONLY = 1U << 4,
     KERNEL_VFS_OPEN_DIRECTORY = 1U << 5,
+    KERNEL_VFS_OPEN_REGULAR = 1U << 6,
 };
-struct kernel_vfs_open_request { unsigned flags; uint32_t mode, umask; unsigned access; };
+enum kernel_vfs_resolve_flags {
+    KERNEL_VFS_RESOLVE_NO_XDEV = 1U << 0,
+    KERNEL_VFS_RESOLVE_NO_MAGICLINKS = 1U << 1,
+    KERNEL_VFS_RESOLVE_NO_SYMLINKS = 1U << 2,
+    KERNEL_VFS_RESOLVE_BENEATH = 1U << 3,
+    KERNEL_VFS_RESOLVE_IN_ROOT = 1U << 4,
+    KERNEL_VFS_RESOLVE_CACHED = 1U << 5,
+};
+#define KERNEL_VFS_RESOLVE_SCOPED (KERNEL_VFS_RESOLVE_BENEATH | KERNEL_VFS_RESOLVE_IN_ROOT)
+struct kernel_vfs_open_request { unsigned flags; uint32_t mode, umask; unsigned access, resolve; };
 #define KERNEL_VFS_MAY_EXEC 1U
 #define KERNEL_VFS_MAY_WRITE 2U
 #define KERNEL_VFS_MAY_READ 4U
@@ -443,6 +453,8 @@ int kernel_vfs_files_share_node(const struct kernel_vfs_file *left,
 /* 已持有 node 的调用者可取得独立引用，跨关闭或撤映射保持 inode 身份。 */
 int kernel_vfs_node_acquire(struct kernel_vfs_node *node);
 int kernel_vfs_node_release(struct kernel_vfs_node **owner);
+/* Call under inode I/O qualification; the OFD covers the returned counter. */
+uint64_t *kernel_vfs_node_shared_write_counter(struct kernel_vfs_node *, int *sealed);
 
 int kernel_vfs_file_xattr(struct kernel_vfs_file *, enum kernel_xattr_operation,
     const char *, void *, size_t, uint32_t);

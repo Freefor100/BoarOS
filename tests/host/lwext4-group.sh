@@ -84,6 +84,12 @@ for block in 1024 4096; do
     cp "$work/base.img" "$work/owner.img"
     "$work/probe" "$work/owner.img" group-data-owner
     e2fsck -fn "$work/owner.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
+    for mode in group-ordered-retire group-ordered-retire-error; do
+        cp "$work/base.img" "$work/owner.img"
+        "$work/probe" "$work/owner.img" "$mode"
+        "$work/probe" "$work/owner.img" group-ordered-retire-recover
+        e2fsck -fn "$work/owner.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
+    done
     cp "$work/base.img" "$work/owner.img"
     "$work/probe" "$work/owner.img" group-data-batch
     e2fsck -fn "$work/owner.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }

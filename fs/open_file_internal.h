@@ -64,6 +64,8 @@ int kernel_open_file_io_requires_cpu0(const struct kernel_open_file_description 
 int kernel_open_file_generate(struct kernel_open_file_description *file);
 void kernel_open_file_reset_generated(struct kernel_open_file_description *file);
 
+int kernel_open_file_create_memfd(struct kernel_heap *, const char *, uint32_t,
+    struct kernel_open_file_description **);
 enum kernel_open_file_status kernel_open_file_create_pipe(
     struct kernel_heap *heap,
     struct kernel_pipe *pipe,

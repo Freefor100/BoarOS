@@ -2,6 +2,7 @@
 #include <kernel/tmpfs.h>
 #include <kernel/credentials.h>
 #include <kernel/posix_acl.h>
+#include <kernel/scheduler.h>
 #include <kernel/memory_object.h>
 #include <kernel/physical_page.h>
 #include <kernel/page.h>
@@ -29,6 +30,7 @@ struct tmp_inode {
     uint32_t mode, links, handles, uid, gid;
     struct kernel_memory_object *memory;
     char *target;
+    uint8_t memfd, initial_seals;
     struct kernel_vfs_timespec atime, mtime, ctime;
     struct tmp_xattr *xattrs, *capability, *access_acl, *default_acl;
 };
@@ -62,7 +64,7 @@ static int cookie_compare(const struct tmp_entry *a, const struct tmp_entry *b)
 RB_GENERATE_INTERNAL(tmp_inode_tree, tmp_inode, index, inode_compare, static inline)
 RB_GENERATE_INTERNAL(tmp_name_tree, tmp_entry, name_index, entry_name_compare, static inline)
 RB_GENERATE_INTERNAL(tmp_cookie_tree, tmp_entry, cookie_index, cookie_compare, static inline)
-static struct kernel_vfs_backend tmp_ops;
+static const struct kernel_vfs_backend tmp_ops;
 int kernel_tmpfs_is_mount(const struct kernel_vfs_mount *mount)
 {
     const struct kernel_vfs_instance *instance = mount ? mount->private_data : 0;
@@ -158,6 +160,7 @@ static int xattr_inode(struct kernel_vfs_node *n,enum kernel_xattr_operation op,
         if (access_acl) {
             int allowed=kernel_vfs_chmod_allowed(n->uid,n->gid,&mode);
             if (allowed) return allowed;
+            if ((n->file_seals&KERNEL_SEAL_EXEC) && ((mode^i->mode)&0111U)) return -KERNEL_EPERM;
         }
         if (!extended) {
             if (a) remove_attribute(m,i,a);
@@ -378,6 +381,8 @@ static int open_inode(struct kernel_vfs_mount *mount, const char *path, uint64_t
     r = allocate(m, sizeof(*n), (void **)&n); if (r) return r;
     n->inode = i->number; n->mode = i->mode; n->uid=i->uid; n->gid=i->gid; n->size = i->size; n->max_size = INT64_MAX;
     n->backend_data = i; n->memory = i->memory; i->handles++;
+    n->memfd=i->memfd; n->unlinked=i->memfd;
+    n->file_seals=i->memfd ? i->initial_seals : KERNEL_SEAL_SEAL;
     return kernel_vfs_publish_node(mount, n, file, 0);
 }
 static int close_node(struct kernel_vfs_node *n)
@@ -628,6 +633,7 @@ static int set_mode(struct kernel_vfs_file *f,uint32_t mode)
     if (n->instance->read_only) return -KERNEL_EROFS;
     int allowed=kernel_vfs_chmod_allowed(n->uid,n->gid,&mode); if (allowed) return allowed;
     struct tmp_inode *i = ti(n);
+    if ((n->file_seals&KERNEL_SEAL_EXEC) && ((mode^i->mode)&0111U)) return -KERNEL_EPERM;
     if (i->access_acl) {
         struct tmp_xattr *a=i->access_acl;
         int result=kernel_acl_chmod(a->bytes+a->name_size,a->value_size,mode);
@@ -737,20 +743,109 @@ static int unmount(struct kernel_vfs_mount *mount)
     kernel_heap_release(heap,m);
     return 0;
 }
-static void initialize_ops(void)
+static const struct kernel_vfs_backend tmp_ops = {
+    .check_domain=kernel_tmpfs_check_domain,
+    .error=error, .root=root, .lookup=lookup, .open=open_inode, .close_node=close_node,
+    .create=create, .mkdir=mkdir, .symlink=symlink, .mknod=mknod_node, .readlink=readlink,
+    .unlink=unlink_file, .rmdir=rmdir, .release_unlinked=release_unlinked, .link=link_inode,
+    .rename=rename_inode, .stat=stat_inode, .statfs=statfs, .dir_entry=dir_entry,
+    .truncate=truncate_inode, .fallocate=punch_inode, .pread=pread_inode,
+    .memory_written=memory_written, .set_times=set_times, .set_mode=set_mode, .set_owner=set_owner,
+    .accessed=accessed, .modified=modified, .killpriv=killpriv, .writeback_allowed=no_writeback,
+    .flush=error, .unmount=unmount, .xattr=xattr_inode, .exec_metadata=exec_metadata,
+    .acl_permission=permission,
+};
+
+/* Internal shmem has no reachable root, mount entry or memory quota.
+ * Only the inodes, data and disconnected paths allocate from the heap. */
+static struct tmp_mount memfd_mount;
+static int memfd_mount_prepare(struct kernel_heap *heap)
 {
-    volatile struct kernel_vfs_backend *o=&tmp_ops;
-    o->check_domain=kernel_tmpfs_check_domain;
-    o->error=error; o->root=root; o->lookup=lookup; o->open=open_inode; o->close_node=close_node;
-    o->create=create; o->mkdir=mkdir; o->symlink=symlink; o->mknod=mknod_node; o->readlink=readlink; o->unlink=unlink_file;
-    o->rmdir=rmdir; o->release_unlinked=release_unlinked; o->link=link_inode; o->rename=rename_inode;
-    o->stat=stat_inode; o->statfs=statfs; o->dir_entry=dir_entry; o->truncate=truncate_inode;
-    o->fallocate=punch_inode;
-    o->pread=pread_inode; o->memory_written=memory_written; o->set_times=set_times; o->set_mode=set_mode; o->set_owner=set_owner;
-    o->accessed=accessed; o->modified=modified; o->killpriv=killpriv; o->writeback_allowed=no_writeback;
-    o->flush=error; o->unmount=unmount; o->xattr=xattr_inode; o->exec_metadata=exec_metadata;
-    o->acl_permission=permission;
+    struct tmp_mount *m=&memfd_mount;
+    struct kernel_vfs_instance *instance=&m->instance;
+    if (!__atomic_load_n(&instance->heap,__ATOMIC_ACQUIRE)) {
+        uint64_t id=kernel_vfs_allocate_mount_id();
+        KERNEL_TASK_LOCK_SCOPE(guard,&kernel_vfs_state_lock);
+        if (!instance->heap) {
+            instance->backend_data=m;
+            instance->ops=&tmp_ops;
+            m->next_inode=2;
+            kernel_rwlock_init(&instance->reconfiguration,19,(uintptr_t)instance);
+            kernel_mutex_init(&instance->namespace_lock,20,(uintptr_t)instance);
+            kernel_raw_lock_init(&instance->error_lock,KERNEL_RAW_RANK_OBJECT);
+            m->mount=(struct kernel_vfs_mount){.private_data=instance,.id=id,
+                .state=VFS_MOUNT_STATE_LIVE,.references=1};
+            instance->backend_mount=(struct kernel_vfs_mount){.private_data=instance,.id=id,
+                .state=VFS_MOUNT_STATE_LIVE,.backend_owner=1};
+            __atomic_store_n(&instance->heap,heap,__ATOMIC_RELEASE);
+        }
+    }
+    return instance->heap==heap ? 0 : -KERNEL_EINVAL;
 }
+
+int kernel_tmpfs_memfd(struct kernel_heap *heap,const char *name,uint32_t flags,struct kernel_vfs_file *file)
+{
+    int result=memfd_mount_prepare(heap);
+    if (result) return result;
+    struct tmp_mount *m=&memfd_mount;
+    struct tmp_inode *i=NULL;
+    result=allocate(m,sizeof(*i),(void **)&i);
+    if (result) return result;
+    if (kernel_memory_object_create(heap,heap->page_allocator,&i->memory)) {
+        dispose(m,i);
+        return -KERNEL_ENOMEM;
+    }
+    kernel_memory_object_set_budget(i->memory,&m->pages);
+    i->mode=KERNEL_VFS_S_IFREG | ((flags&KERNEL_MFD_NOEXEC_SEAL) ? 0666U : 0777U);
+    const struct kernel_credentials *cred=kernel_credentials_current();
+    i->uid=cred->fsuid;i->gid=cred->fsgid;
+    i->atime=i->mtime=i->ctime=now();
+    i->memfd=1;
+    i->initial_seals=(flags&KERNEL_MFD_NOEXEC_SEAL) ? KERNEL_SEAL_EXEC :
+        (flags&KERNEL_MFD_ALLOW_SEALING) ? 0 : KERNEL_SEAL_SEAL;
+    KERNEL_SERVICE_SCOPE(service);
+    {
+        KERNEL_LOCK_SCOPE(namespace);
+        kernel_vfs_namespace_lock(&m->mount,&namespace);
+        if (m->next_inode==UINT64_MAX) {
+            kernel_memory_object_release(&i->memory);
+            dispose(m,i);
+            return -KERNEL_EOVERFLOW;
+        }
+        i->number=m->next_inode++;
+        /* open_inode can fail before consuming the candidate. A temporary
+         * handle keeps it live through both the open and its rollback. */
+        i->handles=1;
+        if (RB_INSERT(tmp_inode_tree,&m->inodes,i)) __builtin_trap();
+        m->inode_count++;
+        result=open_inode(&m->mount,NULL,i->number,i->mode,file);
+        if (!--i->handles) collect_inode(m,i);
+    }
+    if (result) return result;
+    result=kernel_vfs_attach_unnamed_path(file,name);
+    if (result && kernel_vfs_close(file)) __builtin_trap();
+    return result;
+}
+
+int kernel_tmpfs_file_seals(struct kernel_vfs_file *file,int add,uint32_t seals)
+{
+    struct kernel_vfs_node *node=kernel_vfs_file_node(file);
+    if (!node || node->instance->ops!=&tmp_ops ||
+        (node->mode&KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFREG) return -KERNEL_EINVAL;
+    KERNEL_LOCK_SCOPE(operation);
+    if (add) kernel_vfs_file_write_lock(file,&operation);
+    KERNEL_LOCK_SCOPE(io);
+    kernel_vfs_node_lock(node,&io,add);
+    if (!add) return node->file_seals;
+    if (node->file_seals&KERNEL_SEAL_SEAL) return -KERNEL_EPERM;
+    if ((seals&KERNEL_SEAL_EXEC) && (node->mode&0111U))
+        seals|=KERNEL_SEAL_SHRINK | KERNEL_SEAL_GROW | KERNEL_SEAL_WRITES;
+    if ((seals&KERNEL_SEAL_WRITE) && __atomic_load_n(&node->shared_write_bytes,__ATOMIC_ACQUIRE))
+        return -KERNEL_EBUSY;
+    node->file_seals|=(uint8_t)seals;
+    return 0;
+}
+
 static int number(const char *p,size_t n,unsigned base,uint64_t *value)
 {
     if(!n) return -KERNEL_EINVAL;
@@ -841,7 +936,7 @@ int kernel_tmpfs_create(struct kernel_heap *heap,uint64_t flags,const char *opti
     i->atime=i->mtime=i->ctime=now();
     if (RB_INSERT(tmp_inode_tree, &m->inodes, i)) __builtin_trap();
     m->inode_count=1; m->next_inode=2; m->next_cookie=2;
-    initialize_ops(); m->instance.ops=&tmp_ops; m->instance.read_only=(flags & 1)!=0;
+    m->instance.ops=&tmp_ops; m->instance.read_only=(flags & 1)!=0;
     kernel_rwlock_init(&m->instance.reconfiguration, 19, (uintptr_t)&m->instance);
     kernel_mutex_init(&m->instance.namespace_lock,20,(uintptr_t)&m->instance);
     kernel_raw_lock_init(&m->instance.error_lock, KERNEL_RAW_RANK_OBJECT);

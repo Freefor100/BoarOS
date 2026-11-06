@@ -321,26 +321,62 @@ struct tcp_seg {
 #define TCPWND_MIN16(x)    x
 #endif /* LWIP_WND_SCALE */
 
-/* Global variables: */
-extern struct tcp_pcb *tcp_input_pcb;
-extern u32_t tcp_ticks;
-extern u8_t tcp_active_pcbs_changed;
-
 /* The TCP PCB lists. */
 union tcp_listen_pcbs_t { /* List of all TCP PCBs in LISTEN state. */
   struct tcp_pcb_listen *listen_pcbs;
   struct tcp_pcb *pcbs;
 };
-extern struct tcp_pcb *tcp_bound_pcbs;
-extern union tcp_listen_pcbs_t tcp_listen_pcbs;
-extern struct tcp_pcb *tcp_active_pcbs;  /* List of all TCP PCBs that are in a
-              state in which they accept or send
-              data. */
-extern struct tcp_pcb *tcp_tw_pcbs;      /* List of all TCP PCBs in TIME-WAIT. */
-
 #define NUM_TCP_PCB_LISTS_NO_TIME_WAIT  3
 #define NUM_TCP_PCB_LISTS               4
+#ifdef BOAROS_LWIP_TCP_CONTEXT
+struct boaros_lwip_tcp_context {
+  union tcp_listen_pcbs_t listening;
+  struct tcp_pcb *bound, *active, *timewait, *input;
+  struct tcp_pcb **lists[NUM_TCP_PCB_LISTS];
+  u32_t ticks, timer_deadline, initial_sequence, ooseq_seen;
+  u16_t local_port;
+  u8_t active_changed, timer, timer_ctr, timer_armed;
+  u8_t *input_flags;
+};
+
+extern struct boaros_lwip_tcp_context boaros_lwip_tcp_default_context;
+static inline struct boaros_lwip_tcp_context *
+boaros_lwip_tcp_context_current(void)
+{
+  if (boaros_lwip_parallel_enabled()) {
+    struct boaros_lwip_tcp_context *ctx = boaros_lwip_tcp_context_lookup();
+    if (ctx) return ctx;
+  }
+  return &boaros_lwip_tcp_default_context;
+}
+void boaros_lwip_tcp_context_init(struct boaros_lwip_tcp_context *ctx);
+/* Call after input completes and after accept has returned backlog credit.
+ * The caller owns both contexts and publishes the new tuple owner. */
+int boaros_lwip_tcp_context_move_active(struct boaros_lwip_tcp_context *from,
+    struct boaros_lwip_tcp_context *to, struct tcp_pcb *pcb);
+unsigned boaros_lwip_tcp_timers_due(u32_t now);
+u32_t boaros_lwip_tcp_timers_delay(u32_t now);
+void boaros_lwip_tcp_timer_arm(struct boaros_lwip_tcp_context *ctx, u32_t now);
+void boaros_lwip_tcp_input_packet(struct pbuf *p, struct netif *inp,
+    const ip_addr_t *src, const ip_addr_t *dst);
+#define tcp_input_pcb             (boaros_lwip_tcp_context_current()->input)
+#define tcp_ticks                 (boaros_lwip_tcp_context_current()->ticks)
+#define tcp_active_pcbs_changed  (boaros_lwip_tcp_context_current()->active_changed)
+#define tcp_bound_pcbs           (boaros_lwip_tcp_context_current()->bound)
+#define tcp_listen_pcbs          (boaros_lwip_tcp_context_current()->listening)
+#define tcp_active_pcbs          (boaros_lwip_tcp_context_current()->active)
+#define tcp_tw_pcbs              (boaros_lwip_tcp_context_current()->timewait)
+#define tcp_pcb_lists            (boaros_lwip_tcp_context_current()->lists)
+#else
+extern struct tcp_pcb *tcp_input_pcb;
+extern u32_t tcp_ticks;
+extern u8_t tcp_active_pcbs_changed;
+extern struct tcp_pcb *tcp_bound_pcbs;
+extern union tcp_listen_pcbs_t tcp_listen_pcbs;
+extern struct tcp_pcb *tcp_active_pcbs;
+extern struct tcp_pcb *tcp_tw_pcbs;
 extern struct tcp_pcb ** const tcp_pcb_lists[NUM_TCP_PCB_LISTS];
+#endif
 
 /* Axioms about the above lists:
    1) Every TCP PCB that is not CLOSED is in one of the lists.
@@ -483,6 +519,9 @@ u16_t tcp_eff_send_mss_netif(u16_t sendmss, struct netif *outif,
 #define tcp_eff_send_mss(sendmss, src, dest) \
     tcp_eff_send_mss_netif(sendmss, ip_route(src, dest), dest)
 #endif /* TCP_CALCULATE_EFF_SEND_MSS */
+#ifdef BOAROS_LWIP_LOOPBACK_MSS
+void tcp_set_connection_limits(struct tcp_pcb *pcb, struct netif *netif);
+#endif
 
 #if LWIP_CALLBACK_API
 err_t tcp_recv_null(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err);

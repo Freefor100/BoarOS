@@ -821,10 +821,10 @@ struct namespace_link_close {
     unsigned callbacks;
 };
 static struct namespace_link_close *namespace_link_closing;
-static int namespace_follow_last_pin(struct kernel_vfs_node *node,
+static int namespace_follow_last_pin(struct kernel_vfs_node *node, unsigned resolve,
                                      struct kernel_vfs_path **owner)
 {
-    (void)node;
+    (void)node;(void)resolve;
     struct namespace_link_close *race=namespace_link_closing;
     struct kernel_open_file_description *pin=race->file;
     assert(kernel_open_file_acquire(pin)==KERNEL_OPEN_FILE_STATUS_OK);
@@ -841,7 +841,7 @@ static int namespace_readlink_last_pin(struct kernel_vfs_node *node,
                                        char *buffer,size_t size,size_t *count)
 {
     struct kernel_vfs_path *target=NULL;
-    int result=namespace_follow_last_pin(node,&target);
+    int result=namespace_follow_last_pin(node,0,&target);
     if (result) return result;
     assert(!kernel_vfs_path_release(&target) && size);
     buffer[0]='T';*count=1;return 0;

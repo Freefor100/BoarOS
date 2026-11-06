@@ -225,11 +225,19 @@ extern struct ip_globals ip_data;
 #define ip_current_dest_addr()   (&ip_data.current_iphdr_dest)
 
 /** Gets an IP pcb option (SOF_* flags) */
+#ifdef BOAROS_LWIP_SHARED_MEMORY
+/* The protocol owner serializes changes; the tuple index also reads options
+ * from other owners' published PCBs. */
+#define ip_get_option(pcb, opt)   (__atomic_load_n(&(pcb)->so_options, __ATOMIC_RELAXED) & (opt))
+#define ip_set_option(pcb, opt)   __atomic_store_n(&(pcb)->so_options, (u8_t)(ip_get_option(pcb, 0xffU) | (opt)), __ATOMIC_RELAXED)
+#define ip_reset_option(pcb, opt) __atomic_store_n(&(pcb)->so_options, (u8_t)(ip_get_option(pcb, 0xffU) & ~(opt)), __ATOMIC_RELAXED)
+#else
 #define ip_get_option(pcb, opt)   ((pcb)->so_options & (opt))
 /** Sets an IP pcb option (SOF_* flags) */
 #define ip_set_option(pcb, opt)   ((pcb)->so_options = (u8_t)((pcb)->so_options | (opt)))
 /** Resets an IP pcb option (SOF_* flags) */
 #define ip_reset_option(pcb, opt) ((pcb)->so_options = (u8_t)((pcb)->so_options & ~(opt)))
+#endif
 
 #if LWIP_IPV4 && LWIP_IPV6
 /**

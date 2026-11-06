@@ -1,6 +1,7 @@
 #ifndef BOAROS_KERNEL_VIRTIO_NET_H
 #define BOAROS_KERNEL_VIRTIO_NET_H
 #include <kernel/physical_page.h>
+#include <kernel/raw_lock.h>
 #include <kernel/scheduler.h>
 #include <kernel/virtio_split_queue.h>
 #include <stdint.h>
@@ -13,6 +14,11 @@
 
 struct virtio_net_frame { void *data; uint32_t size, buffer; };
 struct virtio_net_tx_segment { uint64_t physical_address; uint32_t length; };
+struct virtio_net_progress {
+    uint64_t tx_capacity_generation;
+    uint16_t tx_done_count, ready_count, loaned;
+    uint8_t configured, link_up, stopping, failed, rx_refill_pending;
+};
 struct virtio_net_statistics {
     uint64_t rx_packets, rx_bytes, tx_packets, tx_bytes, drops, errors, interrupts;
     uint64_t loan_packets, loan_bytes, loan_peak, copied_packets, copied_bytes;
@@ -53,6 +59,9 @@ struct virtio_net_device {
     uint16_t tx_table[VIRTIO_NET_BUFFERS];
     uint16_t tx_done[VIRTIO_NET_BUFFERS];
     uint16_t tx_done_head, tx_done_count;
+    struct kernel_raw_lock state;
+    const char *failure_reason;
+    uint32_t failure_queue, failure_id, failure_length;
 };
 /* init要求新的零初始化对象；stop归还全部owner后，调用方可清零再复用存储。 */
 int virtio_net_init(struct virtio_net_device *device,
@@ -62,6 +71,8 @@ int virtio_net_init(struct virtio_net_device *device,
  * TX owners after quiesce, then platform stops device and destroys transport. */
 int virtio_net_quiesce(struct virtio_net_device *device);
 int virtio_net_stop(struct virtio_net_device *device);
+void virtio_net_begin_stop(struct virtio_net_device *device);
+struct virtio_net_progress virtio_net_get_progress(struct virtio_net_device *device);
 int virtio_net_service(struct virtio_net_device *device);
 int virtio_net_receive(struct virtio_net_device *device, struct virtio_net_frame *frame);
 int virtio_net_lend(struct virtio_net_device *device, unsigned buffer);

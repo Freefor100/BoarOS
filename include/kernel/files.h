@@ -74,6 +74,8 @@ struct kernel_files_statistics {
 #define KERNEL_FILES_F_OFD_SETLK UINT64_C(37)
 #define KERNEL_FILES_F_OFD_SETLKW UINT64_C(38)
 #define KERNEL_FILES_F_DUPFD_CLOEXEC UINT64_C(1030)
+#define KERNEL_FILES_F_ADD_SEALS UINT64_C(1033)
+#define KERNEL_FILES_F_GET_SEALS UINT64_C(1034)
 #define KERNEL_FILES_O_APPEND UINT64_C(00002000)
 #define KERNEL_FILES_O_DSYNC UINT64_C(00010000)
 #define KERNEL_FILES_O_SYNC UINT64_C(04010000)
@@ -229,6 +231,11 @@ enum kernel_files_status kernel_files_openat(
     uint64_t flags,
     uint64_t mode,
     int64_t *linux_result);
+
+enum kernel_files_status kernel_files_openat2(
+    struct kernel_files *files, const struct kernel_fs_context *fs,
+    struct kernel_mm *mm, int32_t dirfd, uint64_t user_path, uint64_t flags,
+    uint64_t mode, uint64_t resolve, int64_t *linux_result);
 
 enum kernel_files_status kernel_files_symlinkat(
     struct kernel_files *files,
@@ -467,6 +474,8 @@ enum kernel_files_status kernel_files_dup2(
     int64_t newfd,
     int64_t *linux_result);
 
+enum kernel_files_status kernel_files_memfd(struct kernel_files *, const char *,
+    uint32_t flags, int64_t *result);
 enum kernel_files_status kernel_files_fcntl(
     struct kernel_files *files,
     int64_t fd,

@@ -53,7 +53,7 @@ struct kernel_vfs_node {
     struct kernel_vfs_node *next, **previous;
     struct kernel_vfs_node *index_left, *index_right;
     uint8_t index_height;
-    struct kernel_page_cache_entry *cache_pages;
+    struct kernel_page_cache_tree cache_pages;
     struct kernel_page_cache_dirty dirty_cache_pages;
     struct kernel_memory_object *memory;
     struct kernel_file_mapping_state *mapping_state;
@@ -85,6 +85,13 @@ struct kernel_vfs_node {
     struct kernel_rwlock namespace_lock;
     uint32_t uid, gid;
     uint8_t metadata_immutable; /* Immutable/append-only inode flags, read with DAC fields. */
+    uint8_t file_seals; /* tmpfs seals, protected by the inode I/O qualification. */
+    uint8_t memfd;
+    uint64_t shared_write_bytes; /* Committed MAYWRITE VMA bytes, including read-only mappings. */
+#if BOAROS_MAX_CPUS > 1
+    struct kernel_raw_lock cache_index_lock;
+    uint8_t cache_index_closed;
+#endif
 };
 
 /* A dentry owns its inode and canonical parent; mount aliases share mutations. */
@@ -141,7 +148,7 @@ struct kernel_vfs_backend {
     int (*entry_name)(struct kernel_vfs_instance *, uint64_t inode, char *, size_t);
     int (*readlink)(struct kernel_vfs_node *node, char *buffer, size_t size, size_t *count);
     /* Object links resolve to a pinned path without a pathname relookup. */
-    int (*follow_link)(struct kernel_vfs_node *node,
+    int (*follow_link)(struct kernel_vfs_node *node, unsigned resolve,
                        struct kernel_vfs_path **owner);
     /* A pseudo-object link may open a new description without a VFS path. */
     int (*reopen_link)(struct kernel_vfs_node *node, struct kernel_heap *heap,
@@ -167,10 +174,10 @@ struct kernel_vfs_backend {
     int (*complete_write)(struct kernel_vfs_node *node);
     /* Delayed admission borrows prepared blocks until the actual copied
      * prefix is known; overlapping sources share acceptance and lifetime. */
-    int (*reserve_write)(struct kernel_vfs_node *, uint64_t, size_t, size_t *, int *, void **);
-    void (*finish_reservation)(struct kernel_vfs_node *, void *, uint64_t start, uint64_t accepted_end);
+    int (*reserve_write)(struct kernel_vfs_node *, uint64_t, size_t, size_t *, int *, struct file_write_reservation *);
+    void (*finish_reservation)(struct kernel_vfs_node *, struct file_write_reservation *, uint64_t start, uint64_t accepted_end);
     /* Accept while inode qualification still protects this mapping generation. */
-    void (*accept_reservation)(struct kernel_vfs_node *, void *, uint64_t start, uint64_t accepted_end);
+    void (*accept_reservation)(struct kernel_vfs_node *, struct file_write_reservation *, uint64_t start, uint64_t accepted_end);
 
     struct kernel_block_device *(*block_device)(struct kernel_vfs_instance *instance);
     int (*close_node)(struct kernel_vfs_node *node);
@@ -270,6 +277,7 @@ int kernel_vfs_inode_times_allowed(struct kernel_vfs_node *, const struct kernel
 void kernel_vfs_creation_identity(uint32_t parent_mode, uint32_t parent_gid,
     uint32_t *mode, uint32_t *uid, uint32_t *gid);
 void kernel_vfs_record_writeback_error(struct kernel_vfs_node *node, int error);
+int kernel_vfs_attach_unnamed_path(struct kernel_vfs_file *, const char *name);
 int kernel_vfs_publish_node(struct kernel_vfs_mount *mount, struct kernel_vfs_node *node,
     struct kernel_vfs_file *file, int creating);
 #endif

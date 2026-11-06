@@ -82,6 +82,9 @@ struct kernel_vma {
     uint32_t flags;
     void *backing;
     struct kernel_shm_attachment *shm_attachment;
+    /* Only sealable file VM_SHARED|VM_MAYWRITE mappings charge this inode.
+     * The MM's backing OFD owns it until all corresponding VMAs are gone. */
+    uint64_t *shared_write_bytes;
 };
 
 /*
