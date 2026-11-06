@@ -4,7 +4,9 @@
 
 `kernel/syscall/socket.c` 导入 RV64/LA64 Linux socket 参数和用户指针，`fs/files/socket.c` 把 socket 作为普通 fd/OFD 安装并在失败时回滚，`net/socket.c` 持有 endpoint、数据包、待 accept 队列及等待队列。`fs/open_file.c` 在最后一个真实 OFD 引用消失时销毁 socket；dup、fork 和 syscall 期间的 pin 共享同一 endpoint，close/exec/退出均沿既有 fd 生命周期回收。`fs/files/io.c` 把普通 read/write/readv/writev 接到 socket 队列，pread/pwrite/lseek 返回 `ESPIPE`，`fstat` 标识 `S_IFSOCK`，poll/select/epoll 读取 socket 就绪和等待队列。
 
-协议实现来自官方 lwIP `STABLE-2_2_1_RELEASE` raw API，位于 `third_party/lwip/`；固定资料和许可证见 `references/README.md`、`references/sources.tsv` 与 `third_party/lwip/COPYING`。IPv4 重组有本地所有权和边界修补，具体范围见[第三方组件](../third-party.md)。本地移植层是 `net/lwip_port/`，使用 `NO_SYS=1`；loopback 与物理接口共用协议池。生产预算为 8 MSS/池 4 倍/堆 2 倍：UDP PCB 16、TCP active 32、listen 16、segment 512、pbuf header/pool 各 256、协议堆 512 KiB。BoarOS socket、接收/accept 队列节点及 OFD 使用 kernel_heap。PCB 池耗尽映射 `ENOMEM`，创建失败不留下 OFD；分配器 `STATE` 和错误释放是 fatal 不变量。
+协议实现来自官方 lwIP `STABLE-2_2_1_RELEASE` raw API，位于 `third_party/lwip/`；固定资料和许可证见 `references/README.md`、`references/sources.tsv` 与 `third_party/lwip/COPYING`。IPv4 重组有本地所有权和边界修补，具体范围见[第三方组件](../third-party.md)。本地移植层是 `net/lwip_port/`，使用 `NO_SYS=1`；回环与物理接口共用协议池。UDP PCB 16、TCP active 32、listen 16、segment 512、pbuf header/pool 各 256、协议堆 512 KiB。协议堆按实际分配块计费，回环共享的载荷只计一次，最后一个引用归还后才释放。TCP 批量数据分配保留少量堆空间给 ACK 和接收描述；遇到内存压力沿原等待链，实际归还后重试。BoarOS socket、接收/accept 队列节点及 OFD 使用 kernel_heap。PCB 池耗尽映射 `ENOMEM`，创建失败不留下 OFD；分配器 `STATE` 和错误释放是 fatal 不变量。
+
+实际从内置回环接口建连、且双方都是回环地址的 TCP 连接，使用 8 KiB MSS 上限和 32 KiB 的通告窗口及发送载荷额度。外部连接仍以 1460 字节为 MSS 上限，按路径 MTU 和对端通告收紧，保留原来的 11,680 字节额度。只在内置回环接口跳过 TCP 校验和生成及验证，物理接口保持完整检查。显式设置 `SO_RCVBUF` 后，TCP 用它限制此后的接收通告；监听端的设置在 SYN-ACK 前由子连接继承。运行中降低上限时，已经向对端通告的字节仍可接收，应用消费后才逐步收紧。socket 不再在 TCP 之后重复按同一额度拒绝报文；实际分配失败仍走接收重试。
 
 IPv4 重组键包括源/目的地址、IP ID、协议号和输入 netif 身份。已完整覆盖的重复范围只丢弃新输入；部分重叠、冲突终点或越过已知终点丢弃整个对象。判重与边界校验先于资源淘汰，重复输入不能挤掉正在重组的有效数据。对象借用 netif 身份，不延长设备生命；移除接口前调用 `ip4_reass_cleanup_netif()`，释放该接口的所有重组引用。最后一个 pbuf 引用释放后，custom 回调才归还 DMA 缓冲。IPv4 头选项仍不支持。宿主反例和所有权检查由 `make test-lwip-reassembly-host` 重建，包含普通/乱序、重复/部分重叠、协议/接口隔离、终点冲突、预算、年龄和实际 fragmenter 的最大 UDP 内容；宿主结果不代替真实网卡验收。
 
@@ -24,19 +26,29 @@ sendmmsg(269)/recvmmsg(243) 使用原生64位 mmsghdr（64字节，msg_len位于
 
 IPv4 的 connect、UDP connect/sendto 将目的 `0.0.0.0` 按 Linux 本地目的语义转换为 `127.0.0.1`，bind 的 `0.0.0.0` 继续表示通配监听。socket 的 family/type/protocol 分别检查；INET RAW protocol 0 返回 `EPROTONOSUPPORT`。
 
-端点队列、读预约、超时、错误消费、发送额度、socketpair 两端关系和工作链由共同端点短锁保护。同一状态修改中的队列发布、额度查询及更新复用外层保护；嵌套 guard 只记录借用，通知游标仅由实际持锁者初始化和维护。RV 用户的 read/write/readv/writev、sendto/recvfrom/sendmsg/recvmsg 和普通文件到 socket 的 sendfile 在发起 CPU 执行：用户复制、接收预约、发送额度和等待属于原调用者。创建、连接、监听、accept、配置、shutdown、最终销毁及网络输入、输出和定时器在 CPU0。TCP 有条件地在发起核向协议发送队列复制数据。就绪查询及等待登记不取得 lwIP mutex，就绪检查和等待登记在同一状态保护内完成，释放状态锁后才 park。通知使用已有等待游标借用，在端点锁外执行回调；最后销毁先关闭等待队列，并等游标与登记实际归还。`kernel_socket_poll` 不访问 PCB、不推进协议、不消费错误；TCP 可写性来自协议 owner 发布的接纳额度，实际发送预约共同扣减它。监听就绪由接纳/失效回调维护，失效 child 的销毁由现有工作集合处理。epoll 真实候选查询在 token 外，prepared 阶段只读刷新提示。
+端点队列、读预约、超时、错误消费、发送额度、socketpair 两端关系和工作链由共同端点短锁保护。同一状态修改中的队列发布、额度查询及更新复用外层保护；嵌套 guard 只记录借用，通知游标仅由实际持锁者初始化和维护。RV 用户的 read/write/readv/writev、sendto/recvfrom/sendmsg/recvmsg 和普通文件到 socket 的 sendfile 在发起 CPU 执行：用户复制、接收预约、发送额度和等待属于原调用者。创建、监听、端口分配、初始握手和网络配置仍在 CPU0。建立的 TCP 连接有固定协议归属核；状态查询及控制操作取得该连接的协议保护。就绪查询及等待登记不取得 lwIP mutex，就绪检查和等待登记在同一状态保护内完成，释放状态锁后才 park。通知使用已有等待游标借用，在端点锁外执行回调；最后销毁先关闭等待队列，并等游标与登记实际归还。`kernel_socket_poll` 不访问 PCB、不推进协议、不消费错误；TCP 可写性来自协议 owner 发布的接纳额度，实际发送预约共同扣减它。监听就绪由接纳/失效回调维护，失效 child 的销毁由现有工作集合处理。epoll 真实候选查询在 token 外，prepared 阶段只读刷新提示。
 
 短 syscall 在完整 raw 调用退出后可执行有界服务；网络 worker 与无 NIC worker 在自己的外层 scope 中调用 `kernel_socket_service_owned`，沿同一资格登记等待；独立调用者使用 `kernel_socket_service_pending` 取得资格。每批分别限制 RX 八帧、loopback 八包、socket 八个工作单元及一个 timer 回调。socket 单元包含容量转交、到期重试、实际对象工作，三类轮转；协议池、NIC、接收堆等待集合也轮转。零预算不消费对应工作，返回值报告处理量、是否可立即继续及下一期限。unsent 等待远端窗口或 ACK 不会自行重新入队。服务先按包预算消费旧输入，再处理 socket 工作；后者产生的新回环包使用本批尚余的包预算交付，预算总量保持原值。预算耗尽且仍有工作时开放中断并让出，睡前再次查软件工作与设备完成。
 
-`kernel_socket_protocol_enter/leave` 用栈上 scope 保存 CPU0 服务资格、IRQ 状态与 mutex guard。需要网卡或完整协议服务的入口先取得 CPU0 服务资格，再取得任务 mutex 并开放 IRQ；持有或等待 mutex 时允许抢占，恢复仍限于 CPU0。单独接纳 TCP COPY 的入口直接在发起核尝试同一 mutex，不借用 CPU0 服务资格。同一 owner 的同步回调只增加嵌套深度，借用外层资格。请求的本地进入失败时沿原工作队列执行，不依赖此前观察到的 CPU；普通强制协议入口仍可在没有业务锁和用户 pin 时沿既有服务入口迁移。CPU0 本地取得资格不迁移、不调度等待，因此已有 TCP pin 批次继续 inline，归还协议 owner 和 mutex 后才结束本 scope 实际取得的服务资格；try-lock 失败也归还它，借来的资格仍由原 owner 结束。UP 编译不增加服务字段和资格操作。lwIP 的 PCB、协议池、接口、重试链与 loopback 由该 owner 串行；用户复制、端点查询和设备等待不占用它。协议池归还代次和 pool 等待链归持有协议 mutex 的任务维护，每次真实资源归还推进代次；存在等待者时才取得端点保护并通知 worker，普通 pbuf 归还直接处理 owner 私有状态。持有期间的 allocation_depth 禁止堆回收进入 I/O。NIC IRQ 只收割并通知，timer IRQ 只请求已有 worker 工作。
+CPU0 保有监听、未接纳连接和 UDP；RV／LA 实际启动多核时，各副核有一份 TCP 状态和执行线程。主动连接在握手的输入处理完成后迁移，被动连接在 accept 归还监听 backlog 额度后迁移。同一监听 socket 接纳的连接按四元组分配；回环连接的两端用对称散列选择同一核。迁移同时交接活 PCB、定时起点、就绪请求和收包索引；TIME_WAIT 仍由原归属核处理，PCB 释放前撤销索引。单核保留原协议线程。
+
+网卡输入先在共享 IP 层做地址检查和分片处理，随后按 TCP 四元组把报文引用交给归属核。其收包队列携带源／目的地址及输入接口，TCP 校验、序号、ACK、窗口更新、重传及定时器都由这份状态推进。脱离 IP 的 TCP 输入只查自己的活连接和 TIME_WAIT；旧连接已退出时丢弃队列里的旧报文。内置回环的两个方向落到同一归属核。第二端迁入时在该归属锁下关联反向 PCB，任一端退出路由索引时先清掉双向关联；普通数据和 ACK 复用这一关联，免去逐包查全局四元组表。尚未配对、旧回环队列未交付完或接口条件变化时，沿原 IP 路径处理。
+
+回环直接交付先在端点保护内预留一个输入槽，在共享 IP 锁及端点锁外准备接收端自己的协议头和 pbuf 链，只借用已复制到协议堆的不可变载荷。重新核对接口代次和停止状态后才发布，失败归还接收引用和槽位；同一流的新包不会越过尚未发布的报文。接收修剪不改变发送描述；发送端的 ACK 或重传只操作自己的描述和引用，接收者读完前载荷不会释放。原回环队列也复用载荷；外部引用和 DMA 缓冲仍按原复制规则处理。共享 IP 路由、邻居状态和设备仍各自串行保护；协议池只在分配或归还时加短锁。不同归属核使用独立 TCP 执行锁；分到同一核的连接共用该核的锁。
+
+协议 scope 保存实际执行资格和 IRQ 状态。同一 owner 的同步回调借用外层 scope。持有连接资格需要共享 IP 时按 TCP → IP 顺序取得；CPU0 迁移或关闭远端连接前先归还 IP 资格。设备 IRQ 收割 DMA 完成并通知执行线程；RX loan 持续到最后一个 pbuf 引用归还。停止时关闭新接纳、排空实际读写与通知借用，归还各归属核报文、连接和设备引用后才撤下接口。
 
 读预约持有 OFD 和固定队列前缀，用户复制在保护外完成。finish 在 IRQ 开启时找到消费边界，短临界区一次摘下前缀，并把原 packet 与接收窗口额度转交已有 worker。worker 在协议保护内归还 pbuf 和 `tcp_recved`；最后关闭也排空这些实际引用。RX loan 因此一直保留到 pbuf 最后归还，不能在用户复制完成前复用 DMA 缓冲。AF_UNIX 载荷在端点临界区外释放；关闭清理结束后才把发送者的末次释放权交给剩余 packet。
 
-TCP 发送先在端点保护内预约额度，连续输入复用任务 scratch 保存最多四页的 pin 与片段描述。若一页输入含超过四段不连续地址，复用该页合并载荷，减少远端协议请求；部分接纳时保留尚未提交的暂存前缀。首个页可缺页；后续只接纳已驻留页，遇到缺页、撤权或关闭许可就提交已固定前缀，归还全部 pin 后继续。一次协议资格处理整个批次。远端调用取得空闲的协议 mutex，且当前 socket 没有已排队的写请求时，直接执行 `tcp_write(COPY)` 并归还 pin；需要输出时把 socket 加入现有工作集合，由 CPU0 执行 `tcp_output`。协议忙或同一 socket 已有排队请求时，调用者将栈上请求交给 worker，等到实际接纳或错误完成后归还 pin。没有每页一次的 FIFO mutex 交接，也没有新增执行线程。发送预约在 COPY 完成前保留，其他发送者不能重复占用同一额度；worker 将异步错误和 SIGPIPE 交付给原调用者。同一请求队列还承载 UDP 的真实 pbuf 准备、发送、归还及 TCP 延迟输出；载荷由调用者直接填入最终对象。实际写请求在端点活动链中保持到全部协议阶段完成，停止时先拒绝新接纳，向包括空队列读者在内的 INET 等待者发布 EIO 并通知，借用实际 OFD 等待活动读写归还。worker 通知在端点锁内取得真实 progress 队列游标，锁外只投递该游标；撤下通知入口后排空已捕获的队列借用，再停止原 worker，通知不再保存网络对象的裸 context。设备在途 DMA 仍由原 quiesce／loan 协议确认。
+TCP 发送先在端点保护内预约额度，随后在调用者上下文取得有界的输入页引用。已迁入 TCP 分片的连接，一批至少有两个 MSS 的载荷时，调用者用预约时的 MSS 将数据直接复制到最终 pbuf 和 TCP 段；分配与复制均在分片锁外。请求持有这些段，并在争用分片锁前归还用户页。持有分片锁的执行者核对连接状态、顺序、当前 MSS、字节额度和段队列余量，设置序列号并接入实际可接纳的完整段前缀。未接纳的段由原请求在锁外释放。小写入留在原合并路径，可以填充已有段的尾部；单核及尚未迁移的连接沿用原路径。
 
-socket 在最终 OFD 释放时取得协议资格，先摘除弱引用工作链并解除 PCB 回调。跨用户复制和待执行请求持有实际 OFD/pin，因此 worker 借用的对象不会被提前销毁。队列只在从无工作变为有工作时通知 worker；容量、接收归还、loopback 与期限使用各自的原有通知来源。
+调用者可以尝试取得连接归属核的协议锁并直接完成接纳，只把出包交给归属核。锁繁忙或已有旧请求时，保留原 FIFO 和同步完成机制；已准备好的大批在此交接时不再持有用户页。发送预约持续到接纳结束，其他发送者不能重复占用同一额度；worker 将异步错误和 SIGPIPE 交付给原调用者。同一请求队列还承载 UDP 的真实 pbuf 准备、发送、归还及 TCP 延迟输出；载荷由调用者直接填入最终对象。实际写请求在端点活动链中保持到全部协议阶段完成，停止时先拒绝新接纳，向包括空队列读者在内的 INET 等待者发布 EIO 并通知，借用实际 OFD 等待活动读写归还。worker 通知在端点锁内取得真实 progress 队列游标，锁外只投递该游标；撤下通知入口后排空已捕获的队列借用，再停止原 worker，通知不再保存网络对象的裸 context。设备在途 DMA 仍由原 quiesce／loan 协议确认。
 
-TCP COPY 在本批提交前保留整批发送预约，远端接纳不能重复使用已复制的额度；协议 owner 计算实际 PCB 额度时排除已经处理的预约，避免再次扣减。CPU0 在端点锁外执行本批需要的 `tcp_output`，随后在同一次端点状态修改中发布容量、归还预约、交付各请求的成功前缀或错误；远端 COPY 则在该次端点状态修改内安排所需输出。实际可接纳字节增加才通知额度等待者；完整 COPY 通常只是把预约转成协议占用，短前缀和取消则归还未用额度。其他调用者尚未 COPY 的预约耗尽接纳额度时，不安排无助于归还预约的 CPU0 输出；本请求的 deferred 前缀及真实协议阻塞仍推进输出。成功发送后的请求摘除不改变正常就绪状态，INET 停止仍等待活动请求摘除并接收对应通知。recvfrom/recvmsg 仅在用户请求源地址时取得临时名称引用，消息长度和截断消费独立处理。
+socket 在最终 OFD 释放时取得协议资格，先摘除弱引用工作链并解除 PCB 回调。跨用户复制和待执行请求持有实际 OFD/pin，因此 worker 借用的对象不会被提前销毁。TCP 分片的 worker 在端点锁内同时检查收包和就绪队列、登记等待；发布新工作时，生产者在同一保护内取得本次等待的通知资格，锁外完成通知。已在运行或已经有人通知时不再创建游标。关闭等待队列仍通知尚未结束的等待，其他容量、接收归还、回环及期限事件使用各自的原有通知来源。
+
+TCP COPY 在本批提交前保留整批发送预约，远端接纳不能重复使用已复制的额度；协议 owner 计算实际 PCB 额度时排除已经处理的预约，避免再次扣减。连接归属核在端点锁外执行本批需要的 `tcp_output`，随后在同一次端点状态修改中发布容量、归还预约、交付各请求的成功前缀或错误。实际可接纳字节增加才通知额度等待者；完整 COPY 通常只是把预约转成协议占用，短前缀和取消则归还未用额度。其他调用者尚未 COPY 的预约耗尽接纳额度时，不安排无助于归还预约的 CPU0 输出；本请求的 deferred 前缀及真实协议阻塞仍推进输出。成功发送后的请求摘除不改变正常就绪状态，INET 停止仍等待活动请求摘除并接收对应通知。recvfrom/recvmsg 仅在用户请求源地址时取得临时名称引用，消息长度和截断消费独立处理。
+
+TCP 输入和接收窗口更新按 lwIP 的实际决定尝试输出。输入前不再先挂一份输出和回收工作。实际输出遇到 `ERR_MEM` 时，根据当次网卡额度标记登记设备或协议池重试；无载荷但待发的 ACK 也可重试，ACK 分配失败继续由 TCP 期限处理。ACK 回调在端点锁内归还发送额度并发布一次新状态；入站载荷只发布接收队列，读取消和窥视没有消费数据时不排回收工作。
 
 `netif_loop_output()` 在成功发布完整回环包队列后调用可选的
 `LWIP_HOOK_NETIF_LOOPBACK_QUEUED`，经端口进入 `protocol_work_ready()`，设置软件
@@ -49,7 +61,7 @@ TCP COPY 在本批提交前保留整批发送预约，远端接纳不能重复�
 
 普通 socket read/readv 使用“预留当前队列前缀→锁外复制→一次提交/取消”。STREAM 预留把当前可读 packet 的总字节数截到用户容量，队首借用与固定字节数限定本次稳定版本；成功提交后本次读调用返回该前缀，后来追加的数据与排在前缀之后的协议错误留给下次调用。请求直接遍历 packet/pbuf 链写入用户 iovec，复用现有用户页写游标，换页及退出前归还 pin，不增加接收中转页。预留与提交只修改端点状态，不取得协议资格；取消仍由请求归还 OFD pin。跨包复制故障只提交此前完整复制成功的 packet 前缀并返回短读，故障 packet 保留；UDP 仍只预留一个数据报、按用户容量截断，复制故障仍丢弃该数据报。零长度数据报也完成 reservation，TCP EOF 没有 reservation。
 
-TCP标量和向量发送均在容量接纳后准备有界页引用与片段，输入组织及部分接纳规则统一见[文件I/O](kernel-files.md#请求暂存与成本)。协议继续持有ACK前的COPY版本，ERR_MEM后先归还pin再等待。描述符scratch页由任务持有并在调用间复用，分配失败返回 ENOMEM；正常返回解除请求登记，页保留至任务最终存储释放，强制退出先取消实际请求／释放其 OFD pin，再解除登记，最后释放任务文件表和栈。没有用户任务的模块测试按调用分配并沿正常返回路径释放。请求末批、容量阻塞点和退出时集中推动 tcp_output，每次接纳批次只在一个边界执行有界协议服务。已接纳前缀后的异步错误留给下一次调用观察。`kernel_socket_get_statistics` 提供单 hart 累计 tcp_write 调用及成功复制字节数；用户页解析尝试由诊断构建的 `COST_USER_RESOLUTIONS` 记录，普通构建不为此维护全局原子计数。直接 pin 的 TCP 数据不经过 uaccess 复制函数，搬运字节由 `copy_from_user` 和 `stream_copy` 记录；`uaccess_copy_ticks/bytes` 仍只覆盖显式复制路径。计数没有新增用户 ABI。
+TCP标量和向量发送均在容量接纳后准备有界页引用与片段，输入组织及部分接纳规则统一见[文件I/O](kernel-files.md#请求暂存与成本)。协议继续持有ACK前的COPY版本，ERR_MEM后先归还pin再等待。描述符scratch页由任务持有并在调用间复用，分配失败返回 ENOMEM；正常返回解除请求登记，页保留至任务最终存储释放，强制退出先取消实际请求／释放其 OFD pin，再解除登记，最后释放任务文件表和栈。没有用户任务的模块测试按调用分配并沿正常返回路径释放。请求末批、容量阻塞点和退出时集中推动 tcp_output，每次接纳批次只在一个边界执行有界协议服务。已接纳前缀后的异步错误留给下一次调用观察。`kernel_socket_get_statistics` 提供累计 tcp_write 调用及成功复制字节数；用户页解析尝试由诊断构建的 `COST_USER_RESOLUTIONS` 记录，普通构建不为此维护全局原子计数。直接 pin 的 TCP 数据不经过 uaccess 复制函数，搬运字节由 `copy_from_user` 和 `stream_copy` 记录；`uaccess_copy_ticks/bytes` 仍只覆盖显式复制路径。计数没有新增用户 ABI。
 
 INET UDP 发送请求直接持有最终 PBUF_RAM，用户 iovec 填入该载荷后交给协议发送，不再分配临时 socket_packet 和第二份数据区。用户复制在协议临界区外执行；复制失败、正常完成或强制退出都由同一请求释放尚未转交的 pbuf。
 
@@ -63,12 +75,12 @@ TCP `POLLOUT` 同时要求发送缓冲、队列空间及未被真实 `ERR_MEM` �
 
 关闭活动 TCP 连接先解绑全部指向 BoarOS socket 的回调，再 `tcp_close`；协议 FIN/TIME_WAIT 可能暂占静态 PCB/segment 池，随后由定时器回收。这与内核堆对象生命周期分开。
 
-`socket->tcp` 是对 lwIP PCB 的借用，不延长协议对象寿命。普通工作批次可提前
-解绑 TIME_WAIT，但预算不足时不能把生命周期责任留到下一批。固定 lwIP 的
+`socket->tcp` 是对 lwIP PCB 的借用，不延长协议对象寿命。输入处理进入 TIME_WAIT 后，
+在当次协议输出结束时清除 socket 借用和回调；TIME_WAIT PCB 仍由原协议索引和定时器管理。固定 lwIP 的
 `tcp_alloc()` 会在 PCB 池满时通过 `tcp_kill_timewait()` / `tcp_abort()` 回收
 TIME_WAIT；该分支不执行普通错误回调，并且 `tcp_pcb_remove()` 会把状态改为
-CLOSED。当前在该分支 remove 之前，以及慢定时器从 TIME_WAIT 链摘除对象后、
-free 之前调用本地可选 `LWIP_HOOK_TCP_TIMEWAIT_FREE`。socket 层仅接受
+CLOSED。回收分支在 remove 之前，以及慢定时器从 TIME_WAIT 链摘除对象后、
+free 之前仍调用本地可选 `LWIP_HOOK_TCP_TIMEWAIT_FREE`。socket 层仅接受
 `callback_arg` 与自身错误回调配对的 PCB，验证借用身份后清空借用及回调、撤销
 容量/重试等待并唤醒。hook 不分配、不睡眠、不重新调用 raw API、不销毁堆
 socket，也不遍历全局 socket registry。OFD 销毁仍先清回调，再释放 socket，
@@ -155,7 +167,7 @@ CPU0已有网络执行者推进收集和退休清理。最后关闭暂时失败�
 
 ## 发起 CPU 与等待寿命
 
-TCP 请求由 syscall 栈持有，OFD 与最多四页 pin 覆盖实际 COPY 接纳。排队请求使用自己的等待 token，端点锁内登记、发布结果并定向通知；锁外 park/finish。ACK 和发送额度变化只通知 socket 就绪等待者。CPU0 一次从同一 socket 取出至多四个已排队的连续普通 COPY 请求，共用一次输出；每个请求仍占一个服务单元，剩余工作放回队尾。带 IO_MORE 的请求单独处理；先完成此前捕获的 OUTPUT，再接纳新前缀，以免提前发送仍可合并的字节。发送请求本身不安排接收资源和 TIME_WAIT 回收，真实输入和关闭仍负责安排回收。UDP 分两次交接：CPU0 分配真实 pbuf，调用者直接填入载荷，CPU0 发送并释放；用户复制失败也通过同一个请求归还 pbuf。UNIX 调用者准备最终 packet，发布前在端点锁内重新核对对端。调用者只在完成状态发布之后归还请求、pin 和 OFD。单核及 CPU0 空闲协议资格保留直接调用；远端直接接纳仅执行 TCP COPY。
+TCP 请求由 syscall 栈持有，OFD 覆盖整个接纳过程；用户页只借到实际 COPY 完成。排队请求使用自己的等待 token，端点锁内登记、发布结果并定向通知，锁外休眠和结束等待。ACK 和发送额度变化只通知 socket 就绪等待者。归属核的执行者一次从同一 socket 取出至多四个已排队的连续普通发送请求，共用一次输出；每个请求仍占一个服务单元，剩余工作放回队尾。带 IO_MORE 的请求单独处理；先完成此前捕获的 OUTPUT，再接纳新前缀，以免提前发送仍可合并的字节。发送请求本身不安排接收资源和 TIME_WAIT 回收，真实输入和关闭仍负责安排回收。UDP 分两次交接：CPU0 分配真实 pbuf，调用者直接填入载荷，CPU0 发送并释放；用户复制失败也通过同一个请求归还 pbuf。UNIX 调用者准备最终 packet，发布前在端点锁内重新核对对端。请求和 OFD 借用一直保留到完成状态发布。
 
 普通 I/O 与 socket syscall 共用 `kernel_socket_wait_ready`。调用者传入一次捕获的绝对超时，端点锁内检查条件并登记，锁外 park/finish；就绪先于超时判断。接收预约限制读取的原有字节前缀，复制到该前缀末端即停止，锁外复制不读取并发追加修改的尾链接。
 
@@ -354,7 +366,7 @@ INET stream 的 write/writev/send/sendmsg 使用任务登记的 `kernel_socket_w
 最后才解析用户 payload；预先无容量不解析用户页。标量及向量pin有界来源页并直接 COPY 到协议，
 一个页大小前缀内不超过四段不连续来源时，载荷直接进入协议；提交返回后归还 pin，等待后重新取得未接纳输入。超过四段时使用已有 scratch 合并这个前缀，避免将小片段拆成多次 CPU0 请求；部分接纳后保留尚未提交的 scratch 尾部，继续按原预算机制提交。
 多 iovec 的直接路径复用任务工作区保存页引用及片段描述，阻塞后按已接纳位置继续准备。
-两种输入都由 `tcp_write(COPY)` 持有 ACK 前的版本，非阻塞返回已接受前缀，
+两种输入都复制到 TCP 持有的缓冲，发送端保留至 ACK，非阻塞返回已接受前缀，
 未接受用户内容不跨系统调用持有。
 `FILE_IO_HOST_TCP=1 sh tests/host/file-io-concurrency.sh` 将生产 TCP/lwIP、MM 和 syscall I/O
 连接起来，以真实协议内存耗尽制造 ERR_MEM，等待时撤权并替换来源映射，检查新内容

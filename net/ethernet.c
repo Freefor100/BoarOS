@@ -102,23 +102,28 @@ static err_t interface_init(struct netif *interface)
     return ERR_OK;
 }
 static unsigned pool_used(void)
-{ return lwip_stats.memp[MEMP_PBUF_POOL] ? lwip_stats.memp[MEMP_PBUF_POOL]->used : 0; }
-static int udp_capacity_after(struct kernel_network *n, unsigned loans, unsigned pbufs)
+{ return lwip_stats.memp[MEMP_PBUF_POOL] ? MEMP_STATS_GET(used, MEMP_PBUF_POOL) : 0; }
+static int udp_capacity_after(unsigned loaned, unsigned loans, unsigned pbufs)
 {
     unsigned used = pool_used() + pbufs;
-    uint64_t owned = lwip_stats.mem.used + ((uint64_t)n->device->loaned + loans) * 2048 +
+    uint64_t owned = STATS_GET(mem.used) + ((uint64_t)loaned + loans) * 2048 +
         (uint64_t)used * PBUF_POOL_BUFSIZE;
     return used <= PBUF_POOL_SIZE - 16 && owned <= MEM_SIZE - (65536U + 4096U);
 }
-static int udp_capacity(void *context) { return udp_capacity_after(context, 0, 0); }
+static int udp_capacity(void *context)
+{
+    struct kernel_network *n = context;
+    return udp_capacity_after(virtio_net_get_progress(n->device).loaned, 0, 0);
+}
 static struct kernel_wait_queue *progress(struct kernel_network *n)
 { return n->device ? &n->device->progress : &n->progress; }
 static void release_completed(struct kernel_network *network)
 {
     struct virtio_net_device *device = network->device;
     virtio_net_tx_release(device, release_owner, 0);
-    if (network->capacity_generation != device->tx_capacity_generation) {
-        network->capacity_generation = device->tx_capacity_generation;
+    uint64_t generation = virtio_net_get_progress(device).tx_capacity_generation;
+    if (network->capacity_generation != generation) {
+        network->capacity_generation = generation;
         kernel_socket_network_capacity();
     }
 }
@@ -130,14 +135,20 @@ static void timer_wake(void *context)
         (void)kernel_wait_queue_wake_all(progress(n));
     arch_interrupt_restore(irq);
 }
+static int device_work_pending(struct kernel_network *n, uint64_t generation)
+{
+    if (!n->device) return 0;
+    struct virtio_net_progress state = virtio_net_get_progress(n->device);
+    return generation != state.tx_capacity_generation || state.tx_done_count ||
+        state.rx_refill_pending || (state.failed ? !n->failure_delivered :
+            state.ready_count || state.link_up != netif_is_link_up(&n->interface));
+}
 /* 本批服务的outer owner直接覆盖等待登记，避免向FIFO交接后立刻再次排队。 */
 static void wait_progress(struct kernel_network *n, struct kernel_socket_protocol_scope *scope,
     struct kernel_socket_service_result service, uint64_t generation)
 {
     (void)arch_interrupt_save();
-    struct virtio_net_device *d = n->device;
-    int runnable = kernel_socket_work_pending() ||
-        (d && (generation != d->tx_capacity_generation || d->tx_done_count || (!d->failed && d->ready_count)));
+    int runnable = kernel_socket_work_pending() || device_work_pending(n, generation);
     if (n->stopping || runnable) {
         kernel_socket_protocol_leave(scope);
         if (!n->stopping && kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
@@ -149,9 +160,8 @@ static void wait_progress(struct kernel_network *n, struct kernel_socket_protoco
     struct kernel_wait_token token = {0};
     enum kernel_wait_wake_reason reason;
     if (kernel_wait_prepare(progress(n), n->deadline, 0, &token) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
-    int sleep = !n->stopping && !kernel_socket_work_pending() &&
-        (!d || (generation == d->tx_capacity_generation && !d->tx_done_count && (d->failed || !d->ready_count)));
-    /* 保持IRQ关闭直到park/finish，避免唤醒登记间隙。 */
+    int sleep = !n->stopping && !kernel_socket_work_pending() && !device_work_pending(n, generation);
+    /* 远端归还RX借用或报告故障也能在登记前发生；重查实际状态后才休眠。 */
     kernel_socket_protocol_leave(scope);
     if (sleep && kernel_wait_park(&token, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
     if (kernel_wait_finish(&token) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
@@ -185,9 +195,10 @@ static void input_frame(struct kernel_network *n, struct virtio_net_frame *frame
     int address_ok = frame->size >= 14 &&
         ((!memcmp(data, n->device->mac, 6)) || (data[0] & 1));
     /* 预算检查包含即将持有的版本，不能先吃掉控制余量再等待完整重组。 */
-    unsigned loans = n->device->loaned < 32 ? 1 : 0;
+    unsigned loaned = virtio_net_get_progress(n->device).loaned;
+    unsigned loans = loaned < 32 ? 1 : 0;
     unsigned pool = loans ? 0 : (frame->size + PBUF_POOL_BUFSIZE - 1) / PBUF_POOL_BUFSIZE;
-    if (!address_ok || (udp && !udp_capacity_after(n, loans, pool))) goto dropped;
+    if (!address_ok || (udp && !udp_capacity_after(loaned, loans, pool))) goto dropped;
     struct pbuf *p;
     if (!virtio_net_lend(n->device, frame->buffer)) {
         struct network_rx *rx = &n->rx[frame->buffer];
@@ -234,14 +245,14 @@ static void worker(void *context)
         int failed = virtio_net_service(d);
         release_completed(n);
         uintptr_t irq = arch_interrupt_save();
-        uint64_t capacity_generation = d->tx_capacity_generation;
         struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
-        if (failed) {
+        struct virtio_net_progress state = virtio_net_get_progress(d);
+        if (failed || state.failed) {
             device_failed(n);
         } else {
-            if (d->link_up) netif_set_link_up(&n->interface); else netif_set_link_down(&n->interface);
+            if (state.link_up) netif_set_link_up(&n->interface); else netif_set_link_down(&n->interface);
             struct virtio_net_frame frame;
-            while (!d->failed && handled < 8 && virtio_net_receive(d, &frame)) {
+            while (handled < 8 && virtio_net_receive(d, &frame)) {
                 input_frame(n, &frame); handled++;
             }
         }
@@ -249,7 +260,7 @@ static void worker(void *context)
             (struct kernel_socket_service_budget){8, 8, 1});
         if (virtio_net_service(d)) device_failed(n);
         /* 新TX_DONE由下轮开头在owner外归还；当前条件保证不会睡过完成。 */
-        wait_progress(n, &scope, service, capacity_generation);
+        wait_progress(n, &scope, service, n->capacity_generation);
         arch_interrupt_restore(irq);
     }
 }
@@ -257,8 +268,11 @@ static void worker(void *context)
 int kernel_network_start(struct kernel_network **owner, struct kernel_heap *heap,
     struct virtio_net_device *device, uint64_t frequency)
 {
-    if (!owner || *owner || !heap || !frequency || frequency > UINT64_MAX / 5 ||
-        (device && (!device->configured || device->stopping || device->failed))) return -KERNEL_EINVAL;
+    if (!owner || *owner || !heap || !frequency || frequency > UINT64_MAX / 5) return -KERNEL_EINVAL;
+    if (device) {
+        struct virtio_net_progress state = virtio_net_get_progress(device);
+        if (!state.configured || state.stopping || state.failed) return -KERNEL_EINVAL;
+    }
     struct kernel_network *n = 0;
     enum kernel_heap_status allocation = kernel_heap_allocate_zeroed(heap, 1, sizeof(*n), (void **)&n);
     if (allocation == KERNEL_HEAP_STATUS_EMPTY) return -KERNEL_ENOMEM;
@@ -273,7 +287,8 @@ int kernel_network_start(struct kernel_network **owner, struct kernel_heap *heap
             kernel_socket_protocol_leave(&saved); (void)kernel_network_stop(owner); return -KERNEL_ENOMEM;
         }
         n->attached = 1;
-        netif_set_up(&n->interface); if (device->link_up) netif_set_link_up(&n->interface);
+        netif_set_up(&n->interface);
+        if (virtio_net_get_progress(device).link_up) netif_set_link_up(&n->interface);
         netif_set_default(&n->interface);
     }
     if (kernel_thread_create_joinable(device ? worker : timer_worker, n, &n->worker) != KERNEL_SCHEDULER_STATUS_OK) {
@@ -297,7 +312,7 @@ int kernel_network_stop(struct kernel_network **owner)
     if (rights) return rights;
     uintptr_t irq = arch_interrupt_save();
     int first_stop = !n->stopping;
-    if (n->device) n->device->stopping = 1;
+    if (n->device) virtio_net_begin_stop(n->device);
     (void)kernel_wait_queue_wake_all(progress(n));
     kernel_assert_can_block();
     arch_interrupt_restore(ARCH_INTERRUPT_ENABLE_MASK);
@@ -307,6 +322,9 @@ int kernel_network_stop(struct kernel_network **owner)
     n->stopping=1;(void)kernel_wait_queue_wake_all(progress(n));
     arch_interrupt_restore(stopped_irq);
     if (n->worker.task) kernel_thread_join(&n->worker);
+#if BOAROS_USER_SMP
+    kernel_socket_stop_tcp_owners();
+#endif
     rights=kernel_socket_rights_drain();
     if (rights) {arch_interrupt_restore(irq);return rights;}
     if (n->device && virtio_net_quiesce(n->device)) { arch_interrupt_restore(irq); return -KERNEL_EIO; }
@@ -321,7 +339,7 @@ int kernel_network_stop(struct kernel_network **owner)
     /* reset已确认DMA停止；worker已join，归还剩余TX owner。 */
     if (n->device) {
         virtio_net_tx_release(n->device, release_owner, 1);
-        if (n->device->loaned) { arch_interrupt_restore(irq); return -KERNEL_EBUSY; }
+        if (virtio_net_get_progress(n->device).loaned) { arch_interrupt_restore(irq); return -KERNEL_EBUSY; }
     }
     if (n->device) {
         print_text("BoarOS: network final rx="); print_u64(n->device->statistics.rx_packets);

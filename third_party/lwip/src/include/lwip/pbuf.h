@@ -217,6 +217,9 @@ struct pbuf {
    */
   LWIP_PBUF_REF_T ref;
 
+  /** Allocation owner plus immutable payload views; independent of TCP ref. */
+  u16_t storage_refs;
+
   /** For incoming packets, this contains the input netif's index */
   u8_t if_idx;
 
@@ -255,6 +258,10 @@ struct pbuf_custom {
 #define PBUF_POOL_FREE_OOSEQ 1
 #endif /* PBUF_POOL_FREE_OOSEQ */
 #if LWIP_TCP && TCP_QUEUE_OOSEQ && NO_SYS && PBUF_POOL_FREE_OOSEQ
+#ifdef BOAROS_LWIP_SHARED_MEMORY
+void boaros_lwip_pbuf_check_ooseq(void);
+#define PBUF_CHECK_FREE_OOSEQ() boaros_lwip_pbuf_check_ooseq()
+#else
 extern volatile u8_t pbuf_free_ooseq_pending;
 void pbuf_free_ooseq(void);
 /** When not using sys_check_timeouts(), call PBUF_CHECK_FREE_OOSEQ()
@@ -264,6 +271,7 @@ void pbuf_free_ooseq(void);
   /* pbuf_alloc() reported PBUF_POOL to be empty -> try to free some \
      ooseq queued pbufs now */ \
   pbuf_free_ooseq(); }}while(0)
+#endif
 #else /* LWIP_TCP && TCP_QUEUE_OOSEQ && NO_SYS && PBUF_POOL_FREE_OOSEQ */
   /* Otherwise declare an empty PBUF_CHECK_FREE_OOSEQ */
   #define PBUF_CHECK_FREE_OOSEQ()
@@ -273,6 +281,9 @@ void pbuf_free_ooseq(void);
 #define pbuf_init()
 
 struct pbuf *pbuf_alloc(pbuf_layer l, u16_t length, pbuf_type type);
+#if BOAROS_LWIP_TCP_WRITEV
+struct pbuf *boaros_lwip_pbuf_alloc_tcp_data(pbuf_layer layer, u16_t length);
+#endif
 struct pbuf *pbuf_alloc_reference(void *payload, u16_t length, pbuf_type type);
 #if LWIP_SUPPORT_CUSTOM_PBUF
 struct pbuf *pbuf_alloced_custom(pbuf_layer l, u16_t length, pbuf_type type,
@@ -304,6 +315,9 @@ err_t pbuf_take_at(struct pbuf *buf, const void *dataptr, u16_t len, u16_t offse
 struct pbuf *pbuf_skip(struct pbuf* in, u16_t in_offset, u16_t* out_offset);
 struct pbuf *pbuf_coalesce(struct pbuf *p, pbuf_layer layer);
 struct pbuf *pbuf_clone(pbuf_layer l, pbuf_type type, struct pbuf *p);
+/* Copy the mutable header, share only owned RAM payload. Other storage is
+ * copied. Caller keeps the source chain live and its accepted bytes immutable. */
+struct pbuf *pbuf_clone_shared(pbuf_layer l, struct pbuf *p, u16_t private_length);
 #if LWIP_CHECKSUM_ON_COPY
 err_t pbuf_fill_chksum(struct pbuf *p, u16_t start_offset, const void *dataptr,
                        u16_t len, u16_t *chksum);

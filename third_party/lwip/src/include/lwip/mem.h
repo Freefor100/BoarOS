@@ -72,6 +72,10 @@ typedef u16_t mem_size_t;
 void  mem_init(void);
 void *mem_trim(void *mem, mem_size_t size);
 void *mem_malloc(mem_size_t size);
+#if BOAROS_LWIP_TCP_WRITEV
+/* New TCP COPY data must leave memory for protocol progress. */
+void *boaros_lwip_mem_malloc_tcp_data(mem_size_t size);
+#endif
 void *mem_calloc(mem_size_t count, mem_size_t size);
 void  mem_free(void *mem);
 

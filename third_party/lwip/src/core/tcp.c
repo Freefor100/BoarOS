@@ -106,6 +106,14 @@
 #include "lwip/memp.h"
 #include "lwip/tcp.h"
 #include "lwip/priv/tcp_priv.h"
+#include "lwip/sys.h"
+#ifdef BOAROS_LWIP_TCP_CONTEXT
+#if BOAROS_USER_SMP
+#include <kernel/sync.h>
+#endif
+#else
+#define BOAROS_LWIP_IP_SCOPE(name) (void)0
+#endif
 #include "lwip/debug.h"
 #include "lwip/stats.h"
 #include "lwip/ip6.h"
@@ -155,16 +163,20 @@ static const char *const tcp_state_str[] = {
   "TIME_WAIT"
 };
 
-/* last local TCP port */
-static u16_t tcp_port = TCP_LOCAL_PORT_RANGE_START;
-
-/* Incremented every coarse grained timer shot (typically every 500 ms). */
-u32_t tcp_ticks;
 static const u8_t tcp_backoff[13] =
 { 1, 2, 3, 4, 5, 6, 7, 7, 7, 7, 7, 7, 7};
 /* Times per slowtmr hits */
 static const u8_t tcp_persist_backoff[7] = { 3, 6, 12, 24, 48, 96, 120 };
 
+#ifdef BOAROS_LWIP_TCP_CONTEXT
+struct boaros_lwip_tcp_context boaros_lwip_tcp_default_context;
+#define tcp_port      (boaros_lwip_tcp_context_current()->local_port)
+#define tcp_timer     (boaros_lwip_tcp_context_current()->timer)
+#define tcp_timer_ctr (boaros_lwip_tcp_context_current()->timer_ctr)
+#else
+/* Last local TCP port and coarse-grained timer tick. */
+static u16_t tcp_port = TCP_LOCAL_PORT_RANGE_START;
+u32_t tcp_ticks;
 /* The TCP PCB lists. */
 
 /** List of all TCP PCBs bound but not yet (connected || listening) */
@@ -187,6 +199,7 @@ u8_t tcp_active_pcbs_changed;
 /** Timer counter to handle calling slow-timer from tcp_tmr() */
 static u8_t tcp_timer;
 static u8_t tcp_timer_ctr;
+#endif
 static u16_t tcp_new_port(void);
 
 static err_t tcp_close_shutdown_fin(struct tcp_pcb *pcb);
@@ -200,16 +213,99 @@ static void tcp_ext_arg_invoke_callbacks_destroyed(struct tcp_pcb_ext_args *ext_
 void
 tcp_init(void)
 {
+#ifdef BOAROS_LWIP_TCP_CONTEXT
+  boaros_lwip_tcp_context_init(&boaros_lwip_tcp_default_context);
+#else
 #ifdef LWIP_RAND
   tcp_port = TCP_ENSURE_LOCAL_PORT_RANGE(LWIP_RAND());
 #endif /* LWIP_RAND */
+#endif
 }
+
+#ifdef BOAROS_LWIP_TCP_CONTEXT
+void
+boaros_lwip_tcp_context_init(struct boaros_lwip_tcp_context *ctx)
+{
+  *ctx = (struct boaros_lwip_tcp_context){
+    .lists = {&ctx->listening.pcbs, &ctx->bound, &ctx->active, &ctx->timewait},
+    .initial_sequence = 6510,
+    .local_port = TCP_LOCAL_PORT_RANGE_START
+  };
+#ifdef LWIP_RAND
+  ctx->local_port = TCP_ENSURE_LOCAL_PORT_RANGE(LWIP_RAND());
+#endif
+}
+
+void
+boaros_lwip_tcp_timer_arm(struct boaros_lwip_tcp_context *ctx, u32_t now)
+{
+  if (!ctx->timer_armed) {
+    ctx->timer_armed = 1;
+    ctx->timer_deadline = now + TCP_TMR_INTERVAL;
+  }
+}
+
+u32_t
+boaros_lwip_tcp_timers_delay(u32_t now)
+{
+  struct boaros_lwip_tcp_context *ctx = boaros_lwip_tcp_context_current();
+  if (!ctx->timer_armed) return UINT32_MAX;
+  s32_t delay = (s32_t)(ctx->timer_deadline - now);
+  return delay > 0 ? (u32_t)delay : 0;
+}
+
+unsigned
+boaros_lwip_tcp_timers_due(u32_t now)
+{
+  struct boaros_lwip_tcp_context *ctx = boaros_lwip_tcp_context_current();
+  if (!ctx->timer_armed || (s32_t)(ctx->timer_deadline - now) > 0) return 0;
+  PBUF_CHECK_FREE_OOSEQ();
+  tcp_tmr();
+  ctx->timer_armed = ctx->active || ctx->timewait;
+  ctx->timer_deadline = sys_now() + TCP_TMR_INTERVAL;
+  return 1;
+}
+
+int
+boaros_lwip_tcp_context_move_active(struct boaros_lwip_tcp_context *from,
+    struct boaros_lwip_tcp_context *to, struct tcp_pcb *pcb)
+{
+  if (from == to || from->input || to->input ||
+      (pcb->state != ESTABLISHED && pcb->state != CLOSE_WAIT)) return 0;
+#if TCP_LISTEN_BACKLOG
+  if (pcb->flags & TF_BACKLOGPEND) return 0;
+#endif
+  struct tcp_pcb **link = &from->active;
+  while (*link && *link != pcb) link = &(*link)->next;
+  LWIP_ASSERT("migrating PCB is absent from its owner", *link == pcb);
+  *link = pcb->next;
+  from->active_changed = 1;
+#if LWIP_CALLBACK_API || TCP_LISTEN_BACKLOG
+  /* Handshake and backlog credit no longer use the listener. */
+  pcb->listener = NULL;
+#endif
+  pcb->tmr += to->ticks - from->ticks;
+  if (pcb->rttest) {
+    pcb->rttest += to->ticks - from->ticks;
+    if (!pcb->rttest) pcb->rttest = 1;
+  }
+  pcb->last_timer = to->timer_ctr;
+  pcb->next = to->active;
+  to->active = pcb;
+  to->active_changed = 1;
+  boaros_lwip_tcp_timer_arm(to, sys_now());
+  return 1;
+}
+#endif
 
 /** Free a tcp pcb */
 void
 tcp_free(struct tcp_pcb *pcb)
 {
   LWIP_ASSERT("tcp_free: LISTEN", pcb->state != LISTEN);
+#ifdef BOAROS_LWIP_TCP_CONTEXT
+  if (pcb->boaros_owner) boaros_lwip_tcp_pcb_forget(pcb);
+#endif
 #if LWIP_TCP_PCB_NUM_EXT_ARGS
   tcp_ext_arg_invoke_callbacks_destroyed(pcb->ext_args);
 #endif
@@ -417,21 +513,21 @@ tcp_close_shutdown_fin(struct tcp_pcb *pcb)
       if (err == ERR_OK) {
         tcp_backlog_accepted(pcb);
         MIB2_STATS_INC(mib2.tcpattemptfails);
-        pcb->state = FIN_WAIT_1;
+        tcp_set_state(pcb, FIN_WAIT_1);
       }
       break;
     case ESTABLISHED:
       err = tcp_send_fin(pcb);
       if (err == ERR_OK) {
         MIB2_STATS_INC(mib2.tcpestabresets);
-        pcb->state = FIN_WAIT_1;
+        tcp_set_state(pcb, FIN_WAIT_1);
       }
       break;
     case CLOSE_WAIT:
       err = tcp_send_fin(pcb);
       if (err == ERR_OK) {
         MIB2_STATS_INC(mib2.tcpestabresets);
-        pcb->state = LAST_ACK;
+        tcp_set_state(pcb, LAST_ACK);
       }
       break;
     default:
@@ -717,6 +813,10 @@ tcp_bind(struct tcp_pcb *pcb, const ip_addr_t *ipaddr, u16_t port)
     }
   } else {
     /* Check if the address already is in use (on all lists) */
+#ifdef BOAROS_LWIP_TCP_CONTEXT
+    if (boaros_lwip_parallel_enabled() &&
+        boaros_lwip_tcp_conflict(pcb, ipaddr, port, NULL, 0)) return ERR_USE;
+#endif
     for (i = 0; i < max_pcb_list; i++) {
       for (cpcb = *tcp_pcb_lists[i]; cpcb != NULL; cpcb = cpcb->next) {
         if (cpcb->local_port == port) {
@@ -891,7 +991,10 @@ tcp_listen_with_backlog_and_err(struct tcp_pcb *pcb, u8_t backlog, err_t *err)
   }
   lpcb->callback_arg = pcb->callback_arg;
   lpcb->local_port = pcb->local_port;
-  lpcb->state = LISTEN;
+#ifdef BOAROS_LWIP_LOOPBACK_MSS
+  lpcb->boaros_rcv_limit = pcb->boaros_rcv_limit;
+#endif
+  tcp_set_state(lpcb, LISTEN);
   lpcb->prio = pcb->prio;
   lpcb->so_options = pcb->so_options;
   lpcb->netif_idx = pcb->netif_idx;
@@ -934,15 +1037,65 @@ done:
  * Returns how much extra window would be advertised if we sent an
  * update now.
  */
+#ifdef BOAROS_LWIP_LOOPBACK_MSS
+static tcpwnd_size_t
+tcp_receive_target(const struct tcp_pcb *pcb)
+{
+  return (tcpwnd_size_t)(pcb->boaros_rcv_limit ? pcb->boaros_rcv_limit :
+                         tcp_default_rcv_wnd_limit(pcb));
+}
+
+static void
+tcp_receive_capacity(struct tcp_pcb *pcb)
+{
+  u32_t consumed, promised, capacity, target = tcp_receive_target(pcb);
+  LWIP_ASSERT("receive credit within capacity", pcb->rcv_wnd <= pcb->boaros_rcv_capacity);
+  if (pcb->boaros_rcv_capacity == target) return;
+  /* TCP consumes credit before application delivery, including refused_data.
+   * A smaller policy cannot retract the right edge already sent to the peer. */
+  consumed = pcb->boaros_rcv_capacity - pcb->rcv_wnd;
+  promised = TCP_SEQ_GT(pcb->rcv_ann_right_edge, pcb->rcv_nxt) ?
+             pcb->rcv_ann_right_edge - pcb->rcv_nxt : 0;
+  capacity = LWIP_MAX(target, consumed + promised);
+  LWIP_ASSERT("bounded receive capacity", capacity <= 0xffff);
+  pcb->boaros_rcv_capacity = (tcpwnd_size_t)capacity;
+  pcb->rcv_wnd = (tcpwnd_size_t)(capacity - consumed);
+}
+
+void
+tcp_set_receive_limit(struct tcp_pcb *pcb, u32_t bytes)
+{
+  LWIP_ASSERT_CORE_LOCKED();
+  LWIP_ASSERT("receive policy pcb", pcb != NULL);
+  pcb->boaros_rcv_limit = LWIP_MIN(bytes, 0xffffU);
+  if (pcb->state == LISTEN || pcb->state == CLOSED) return;
+  tcp_receive_capacity(pcb);
+  if (TCP_SEQ_GT(pcb->rcv_nxt + pcb->rcv_wnd, pcb->rcv_ann_right_edge)) {
+    /* A requested increase is visible immediately, even below the ordinary
+     * delayed-window threshold. Failed ACKs retain the existing timer retry. */
+    pcb->rcv_ann_wnd = pcb->rcv_wnd;
+    if (pcb->state >= ESTABLISHED && pcb->state < TIME_WAIT) {
+      tcp_ack_now(pcb);
+      (void)tcp_output(pcb);
+    }
+  } else {
+    (void)tcp_update_rcv_ann_wnd(pcb);
+  }
+}
+#endif
+
 u32_t
 tcp_update_rcv_ann_wnd(struct tcp_pcb *pcb)
 {
   u32_t new_right_edge;
 
   LWIP_ASSERT("tcp_update_rcv_ann_wnd: invalid pcb", pcb != NULL);
+#ifdef BOAROS_LWIP_LOOPBACK_MSS
+  tcp_receive_capacity(pcb);
+#endif
   new_right_edge = pcb->rcv_nxt + pcb->rcv_wnd;
 
-  if (TCP_SEQ_GEQ(new_right_edge, pcb->rcv_ann_right_edge + LWIP_MIN((TCP_WND / 2), pcb->mss))) {
+  if (TCP_SEQ_GEQ(new_right_edge, pcb->rcv_ann_right_edge + LWIP_MIN((tcp_rcv_wnd_limit(pcb) / 2), pcb->mss))) {
     /* we can advertise more window */
     pcb->rcv_ann_wnd = pcb->rcv_wnd;
     return new_right_edge - pcb->rcv_ann_right_edge;
@@ -1001,9 +1154,20 @@ tcp_recved(struct tcp_pcb *pcb, u16_t len)
    * watermark is TCP_WND/4), then send an explicit update now.
    * Otherwise wait for a packet to be sent in the normal course of
    * events (or more window to be available later) */
-  if (wnd_inflation >= TCP_WND_UPDATE_THRESHOLD) {
+  u32_t update_threshold = TCP_WND_UPDATE_THRESHOLD;
+#ifdef BOAROS_LWIP_LOOPBACK_MSS
+  if (pcb->boaros_loopback) {
+    update_threshold = LWIP_MIN(tcp_rcv_wnd_limit(pcb) / 4, pcb->mss * 4U);
+  }
+  update_threshold = LWIP_MAX(1U, LWIP_MIN(update_threshold, tcp_rcv_wnd_limit(pcb) / 4));
+#endif
+  if (wnd_inflation >= update_threshold) {
     tcp_ack_now(pcb);
+#ifdef LWIP_HOOK_TCP_OUTPUT_PENDING
+    LWIP_HOOK_TCP_OUTPUT_PENDING(pcb);
+#else
     tcp_output(pcb);
+#endif
   }
 
   LWIP_DEBUGF(TCP_DEBUG, ("tcp_recved: received %"U16_F" bytes, wnd %"TCPWNDSIZE_F" (%"TCPWNDSIZE_F").\n",
@@ -1027,6 +1191,13 @@ again:
   if (tcp_port++ == TCP_LOCAL_PORT_RANGE_END) {
     tcp_port = TCP_LOCAL_PORT_RANGE_START;
   }
+#ifdef BOAROS_LWIP_TCP_CONTEXT
+  if (boaros_lwip_parallel_enabled() &&
+      boaros_lwip_tcp_conflict(NULL, NULL, tcp_port, NULL, 0)) {
+    if (++n > (TCP_LOCAL_PORT_RANGE_END - TCP_LOCAL_PORT_RANGE_START)) return 0;
+    goto again;
+  }
+#endif
   /* Check all PCB lists. */
   for (i = 0; i < NUM_TCP_PCB_LISTS; i++) {
     for (pcb = *tcp_pcb_lists[i]; pcb != NULL; pcb = pcb->next) {
@@ -1129,6 +1300,10 @@ tcp_connect(struct tcp_pcb *pcb, const ip_addr_t *ipaddr, u16_t port,
   } else {
 #if SO_REUSE
     if (ip_get_option(pcb, SOF_REUSEADDR)) {
+#ifdef BOAROS_LWIP_TCP_CONTEXT
+      if (boaros_lwip_parallel_enabled() &&
+          boaros_lwip_tcp_conflict(pcb, &pcb->local_ip, pcb->local_port, ipaddr, port)) return ERR_USE;
+#endif
       /* Since SOF_REUSEADDR allows reusing a local address, we have to make sure
          now that the 5-tuple is unique. */
       struct tcp_pcb *cpcb;
@@ -1158,9 +1333,13 @@ tcp_connect(struct tcp_pcb *pcb, const ip_addr_t *ipaddr, u16_t port,
   pcb->snd_lbb = iss - 1;
   /* Start with a window that does not need scaling. When window scaling is
      enabled and used, the window is enlarged when both sides agree on scaling. */
+#ifdef BOAROS_LWIP_LOOPBACK_MSS
+  tcp_set_connection_limits(pcb, netif);
+#else
   pcb->rcv_wnd = pcb->rcv_ann_wnd = TCPWND_MIN16(TCP_WND);
+#endif
   pcb->rcv_ann_right_edge = pcb->rcv_nxt;
-  pcb->snd_wnd = TCP_WND;
+  pcb->snd_wnd = tcp_rcv_wnd_limit(pcb);
   /* As initial send MSS, we use TCP_MSS but limit it to 536.
      The send MSS is updated when an MSS option is received. */
   pcb->mss = INITIAL_MSS;
@@ -1178,7 +1357,7 @@ tcp_connect(struct tcp_pcb *pcb, const ip_addr_t *ipaddr, u16_t port,
   ret = tcp_enqueue_flags(pcb, TCP_SYN);
   if (ret == ERR_OK) {
     /* SYN segment was enqueued, changed the pcbs state now */
-    pcb->state = SYN_SENT;
+    tcp_set_state(pcb, SYN_SENT);
     if (old_local_port != 0) {
       TCP_RMV(&tcp_bound_pcbs, pcb);
     }
@@ -1505,8 +1684,8 @@ tcp_fasttmr_start:
       if (pcb->flags & TF_ACK_DELAY) {
         LWIP_DEBUGF(TCP_DEBUG, ("tcp_fasttmr: delayed ACK\n"));
         tcp_ack_now(pcb);
-        tcp_output(pcb);
-        tcp_clear_flags(pcb, TF_ACK_DELAY | TF_ACK_NOW);
+        if (tcp_output(pcb) == ERR_OK)
+          tcp_clear_flags(pcb, TF_ACK_DELAY | TF_ACK_NOW);
       }
       /* send pending FIN */
       if (pcb->flags & TF_CLOSEPEND) {
@@ -1902,6 +2081,9 @@ tcp_alloc(u8_t prio)
     memset(pcb, 0, sizeof(struct tcp_pcb));
     pcb->prio = prio;
     pcb->snd_buf = TCP_SND_BUF;
+#ifdef BOAROS_LWIP_LOOPBACK_MSS
+    pcb->boaros_rcv_capacity = TCPWND_MIN16(TCP_WND);
+#endif
     /* Start with a window that does not need scaling. When window scaling is
        enabled and used, the window is enlarged when both sides agree on scaling. */
     pcb->rcv_wnd = pcb->rcv_ann_wnd = TCPWND_MIN16(TCP_WND);
@@ -2197,6 +2379,11 @@ tcp_pcb_remove(struct tcp_pcb **pcblist, struct tcp_pcb *pcb)
   LWIP_ASSERT("tcp_pcb_remove: invalid pcb", pcb != NULL);
   LWIP_ASSERT("tcp_pcb_remove: invalid pcblist", pcblist != NULL);
 
+#ifdef BOAROS_LWIP_TCP_CONTEXT
+  /* The tuple is still intact here. tcp_free() also handles the removal
+   * paths which unlink directly, without clearing the local port first. */
+  if (pcb->state != LISTEN && pcb->boaros_owner) boaros_lwip_tcp_pcb_forget(pcb);
+#endif
   TCP_RMV(pcblist, pcb);
 
   tcp_pcb_purge(pcb);
@@ -2217,7 +2404,7 @@ tcp_pcb_remove(struct tcp_pcb **pcblist, struct tcp_pcb *pcb)
 #endif /* TCP_QUEUE_OOSEQ */
   }
 
-  pcb->state = CLOSED;
+  tcp_set_state(pcb, CLOSED);
   /* reset the local port to prevent the pcb from being 'bound' */
   pcb->local_port = 0;
 
@@ -2236,6 +2423,13 @@ tcp_next_iss(struct tcp_pcb *pcb)
   LWIP_ASSERT("tcp_next_iss: invalid pcb", pcb != NULL);
   return LWIP_HOOK_TCP_ISN(&pcb->local_ip, pcb->local_port, &pcb->remote_ip, pcb->remote_port);
 #else /* LWIP_HOOK_TCP_ISN */
+#ifdef BOAROS_LWIP_TCP_CONTEXT
+  struct boaros_lwip_tcp_context *ctx = boaros_lwip_tcp_context_current();
+  LWIP_ASSERT("tcp_next_iss: invalid pcb", pcb != NULL);
+  LWIP_UNUSED_ARG(pcb);
+  ctx->initial_sequence += ctx->ticks;
+  return ctx->initial_sequence;
+#else
   static u32_t iss = 6510;
 
   LWIP_ASSERT("tcp_next_iss: invalid pcb", pcb != NULL);
@@ -2243,8 +2437,23 @@ tcp_next_iss(struct tcp_pcb *pcb)
 
   iss += tcp_ticks;       /* XXX */
   return iss;
+#endif
 #endif /* LWIP_HOOK_TCP_ISN */
 }
+
+#ifdef BOAROS_LWIP_LOOPBACK_MSS
+void
+tcp_set_connection_limits(struct tcp_pcb *pcb, struct netif *netif)
+{
+  /* A local Ethernet address alone must not change the wire TCP limits. */
+  pcb->boaros_loopback = netif == netif_get_loopif() &&
+                       ip_addr_isloopback(&pcb->local_ip) &&
+                       ip_addr_isloopback(&pcb->remote_ip);
+  pcb->boaros_rcv_capacity = TCPWND_MIN16(tcp_receive_target(pcb));
+  pcb->rcv_wnd = pcb->rcv_ann_wnd = pcb->boaros_rcv_capacity;
+  pcb->snd_buf = pcb->ssthresh = tcp_sndbuf_limit(pcb);
+}
+#endif
 
 #if TCP_CALCULATE_EFF_SEND_MSS
 /**
@@ -2258,6 +2467,7 @@ tcp_eff_send_mss_netif(u16_t sendmss, struct netif *outif, const ip_addr_t *dest
   u16_t mss_s;
   u16_t mtu;
 
+  BOAROS_LWIP_IP_SCOPE(ip);
   LWIP_UNUSED_ARG(dest); /* in case IPv6 is disabled */
 
   LWIP_ASSERT("tcp_eff_send_mss_netif: invalid dst_ip", dest != NULL);

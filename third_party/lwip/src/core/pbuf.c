@@ -110,7 +110,12 @@ pbuf_skip_const(const struct pbuf *in, u16_t in_offset, u16_t *out_offset);
 #endif /* PBUF_POOL_FREE_OOSEQ_QUEUE_CALL */
 #endif /* !NO_SYS */
 
+#ifdef BOAROS_LWIP_SHARED_MEMORY
+/* Each owner may reclaim only its own out-of-order segments. */
+static u32_t pbuf_ooseq_generation;
+#else
 volatile u8_t pbuf_free_ooseq_pending;
+#endif
 #define PBUF_POOL_IS_EMPTY() pbuf_pool_is_empty()
 
 /**
@@ -128,7 +133,9 @@ void
 pbuf_free_ooseq(void)
 {
   struct tcp_pcb *pcb;
+#ifndef BOAROS_LWIP_SHARED_MEMORY
   SYS_ARCH_SET(pbuf_free_ooseq_pending, 0);
+#endif
 
   for (pcb = tcp_active_pcbs; NULL != pcb; pcb = pcb->next) {
     if (pcb->ooseq != NULL) {
@@ -139,6 +146,18 @@ pbuf_free_ooseq(void)
     }
   }
 }
+
+#ifdef BOAROS_LWIP_SHARED_MEMORY
+void
+boaros_lwip_pbuf_check_ooseq(void)
+{
+  struct boaros_lwip_tcp_context *ctx = boaros_lwip_tcp_context_current();
+  u32_t generation = __atomic_load_n(&pbuf_ooseq_generation, __ATOMIC_RELAXED);
+  if (generation == ctx->ooseq_seen) return;
+  ctx->ooseq_seen = generation;
+  pbuf_free_ooseq();
+}
+#endif
 
 #if !NO_SYS
 /**
@@ -156,7 +175,9 @@ pbuf_free_ooseq_callback(void *arg)
 static void
 pbuf_pool_is_empty(void)
 {
-#ifndef PBUF_POOL_FREE_OOSEQ_QUEUE_CALL
+#ifdef BOAROS_LWIP_SHARED_MEMORY
+  (void)__atomic_fetch_add(&pbuf_ooseq_generation, 1U, __ATOMIC_RELAXED);
+#elif !defined(PBUF_POOL_FREE_OOSEQ_QUEUE_CALL)
   SYS_ARCH_SET(pbuf_free_ooseq_pending, 1);
 #else /* PBUF_POOL_FREE_OOSEQ_QUEUE_CALL */
   u8_t queued;
@@ -185,10 +206,44 @@ pbuf_init_alloced_pbuf(struct pbuf *p, void *payload, u16_t tot_len, u16_t len, 
   p->type_internal = (u8_t)type;
   p->flags = flags;
   p->ref = 1;
+  p->storage_refs = 1;
   p->if_idx = NETIF_NO_INDEX;
 
   LWIP_PBUF_CUSTOM_DATA_INIT(p);
 }
+
+static inline struct pbuf *
+pbuf_alloc_ram(pbuf_layer layer, u16_t length, int tcp_data)
+{
+  const u16_t offset = (u16_t)layer;
+  const mem_size_t payload_len = (mem_size_t)(LWIP_MEM_ALIGN_SIZE(offset) + LWIP_MEM_ALIGN_SIZE(length));
+  const mem_size_t alloc_len = (mem_size_t)(LWIP_MEM_ALIGN_SIZE(SIZEOF_STRUCT_PBUF) + payload_len);
+  struct pbuf *p;
+  if ((payload_len < LWIP_MEM_ALIGN_SIZE(length)) || (alloc_len < LWIP_MEM_ALIGN_SIZE(length))) {
+    return NULL;
+  }
+#if BOAROS_LWIP_TCP_WRITEV
+  p = tcp_data ? boaros_lwip_mem_malloc_tcp_data(alloc_len) : mem_malloc(alloc_len);
+#else
+  LWIP_UNUSED_ARG(tcp_data);
+  p = mem_malloc(alloc_len);
+#endif
+  if (p != NULL) {
+    pbuf_init_alloced_pbuf(p, LWIP_MEM_ALIGN((void *)((u8_t *)p + SIZEOF_STRUCT_PBUF + offset)),
+                           length, length, PBUF_RAM, 0);
+    LWIP_ASSERT("pbuf_alloc: pbuf->payload properly aligned",
+                ((mem_ptr_t)p->payload % MEM_ALIGNMENT) == 0);
+  }
+  return p;
+}
+
+#if BOAROS_LWIP_TCP_WRITEV
+struct pbuf *
+boaros_lwip_pbuf_alloc_tcp_data(pbuf_layer layer, u16_t length)
+{
+  return pbuf_alloc_ram(layer, length, 1);
+}
+#endif
 
 /**
  * @ingroup pbuf
@@ -272,27 +327,9 @@ pbuf_alloc(pbuf_layer layer, u16_t length, pbuf_type type)
       } while (rem_len > 0);
       break;
     }
-    case PBUF_RAM: {
-      mem_size_t payload_len = (mem_size_t)(LWIP_MEM_ALIGN_SIZE(offset) + LWIP_MEM_ALIGN_SIZE(length));
-      mem_size_t alloc_len = (mem_size_t)(LWIP_MEM_ALIGN_SIZE(SIZEOF_STRUCT_PBUF) + payload_len);
-
-      /* bug #50040: Check for integer overflow when calculating alloc_len */
-      if ((payload_len < LWIP_MEM_ALIGN_SIZE(length)) ||
-          (alloc_len < LWIP_MEM_ALIGN_SIZE(length))) {
-        return NULL;
-      }
-
-      /* If pbuf is to be allocated in RAM, allocate memory for it. */
-      p = (struct pbuf *)mem_malloc(alloc_len);
-      if (p == NULL) {
-        return NULL;
-      }
-      pbuf_init_alloced_pbuf(p, LWIP_MEM_ALIGN((void *)((u8_t *)p + SIZEOF_STRUCT_PBUF + offset)),
-                             length, length, type, 0);
-      LWIP_ASSERT("pbuf_alloc: pbuf->payload properly aligned",
-                  ((mem_ptr_t)p->payload % MEM_ALIGNMENT) == 0);
+    case PBUF_RAM:
+      p = pbuf_alloc_ram(layer, length, 0);
       break;
-    }
     default:
       LWIP_ASSERT("pbuf_alloc: erroneous type", 0);
       return NULL;
@@ -440,6 +477,7 @@ pbuf_realloc(struct pbuf *p, u16_t new_len)
   if (pbuf_match_allocsrc(q, PBUF_TYPE_ALLOC_SRC_MASK_STD_HEAP) && (rem_len != q->len)
 #if LWIP_SUPPORT_CUSTOM_PBUF
       && ((q->flags & PBUF_FLAG_IS_CUSTOM) == 0)
+      && __atomic_load_n(&q->storage_refs, __ATOMIC_ACQUIRE) == 1
 #endif /* LWIP_SUPPORT_CUSTOM_PBUF */
      ) {
     /* reallocate and adjust the length of the pbuf that will be split */
@@ -692,6 +730,32 @@ pbuf_free_header(struct pbuf *q, u16_t size)
   return p;
 }
 
+/* Storage references retain only the allocation, never TCP queue ownership.
+ * A receive view may outlive ACK and has independent pbuf offsets/links. */
+static void
+pbuf_deallocate(struct pbuf *p)
+{
+  u8_t alloc_src = pbuf_get_allocsrc(p);
+#if LWIP_SUPPORT_CUSTOM_PBUF
+  if ((p->flags & PBUF_FLAG_IS_CUSTOM) != 0) {
+    struct pbuf_custom *pc = (struct pbuf_custom *)p;
+    LWIP_ASSERT("pc->custom_free_function != NULL", pc->custom_free_function != NULL);
+    pc->custom_free_function(p);
+  } else
+#endif /* LWIP_SUPPORT_CUSTOM_PBUF */
+  {
+    if (alloc_src == PBUF_TYPE_ALLOC_SRC_MASK_STD_MEMP_PBUF_POOL) {
+      memp_free(MEMP_PBUF_POOL, p);
+    } else if (alloc_src == PBUF_TYPE_ALLOC_SRC_MASK_STD_MEMP_PBUF) {
+      memp_free(MEMP_PBUF, p);
+    } else if (alloc_src == PBUF_TYPE_ALLOC_SRC_MASK_STD_HEAP) {
+      mem_free(p);
+    } else {
+      LWIP_ASSERT("invalid pbuf type", 0);
+    }
+  }
+}
+
 /**
  * @ingroup pbuf
  * Dereference a pbuf chain or queue and deallocate any no-longer-used
@@ -728,7 +792,6 @@ pbuf_free_header(struct pbuf *q, u16_t size)
 u8_t
 pbuf_free(struct pbuf *p)
 {
-  u8_t alloc_src;
   struct pbuf *q;
   u8_t count;
 
@@ -748,6 +811,7 @@ pbuf_free(struct pbuf *p)
    * obtain a zero reference count after decrementing*/
   while (p != NULL) {
     LWIP_PBUF_REF_T ref;
+    u16_t storage_refs = 1;
     SYS_ARCH_DECL_PROTECT(old_level);
     /* Since decrementing ref cannot be guaranteed to be a single machine operation
      * we must protect it. We put the new ref into a local variable to prevent
@@ -756,37 +820,24 @@ pbuf_free(struct pbuf *p)
     /* all pbufs in a chain are referenced at least once */
     LWIP_ASSERT("pbuf_free: p->ref > 0", p->ref > 0);
     /* decrease reference count (number of pointers to pbuf) */
+#ifdef BOAROS_LWIP_SHARED_MEMORY
+    ref = (LWIP_PBUF_REF_T)(p->ref - 1U);
+    __atomic_store_n(&p->ref, ref, __ATOMIC_RELEASE);
+#else
     ref = --(p->ref);
+#endif
+    if (!ref) {
+      /* Capture the chain before the last view can free the allocation. */
+      q = p->next;
+      LWIP_ASSERT("live pbuf storage", p->storage_refs != 0);
+      storage_refs = (u16_t)(p->storage_refs - 1);
+      __atomic_store_n(&p->storage_refs, storage_refs, __ATOMIC_RELEASE);
+    }
     SYS_ARCH_UNPROTECT(old_level);
     /* this pbuf is no longer referenced to? */
     if (ref == 0) {
-      /* remember next pbuf in chain for next iteration */
-      q = p->next;
       LWIP_DEBUGF( PBUF_DEBUG | LWIP_DBG_TRACE, ("pbuf_free: deallocating %p\n", (void *)p));
-      alloc_src = pbuf_get_allocsrc(p);
-#if LWIP_SUPPORT_CUSTOM_PBUF
-      /* is this a custom pbuf? */
-      if ((p->flags & PBUF_FLAG_IS_CUSTOM) != 0) {
-        struct pbuf_custom *pc = (struct pbuf_custom *)p;
-        LWIP_ASSERT("pc->custom_free_function != NULL", pc->custom_free_function != NULL);
-        pc->custom_free_function(p);
-      } else
-#endif /* LWIP_SUPPORT_CUSTOM_PBUF */
-      {
-        /* is this a pbuf from the pool? */
-        if (alloc_src == PBUF_TYPE_ALLOC_SRC_MASK_STD_MEMP_PBUF_POOL) {
-          memp_free(MEMP_PBUF_POOL, p);
-          /* is this a ROM or RAM referencing pbuf? */
-        } else if (alloc_src == PBUF_TYPE_ALLOC_SRC_MASK_STD_MEMP_PBUF) {
-          memp_free(MEMP_PBUF, p);
-          /* type == PBUF_RAM */
-        } else if (alloc_src == PBUF_TYPE_ALLOC_SRC_MASK_STD_HEAP) {
-          mem_free(p);
-        } else {
-          /* @todo: support freeing other types */
-          LWIP_ASSERT("invalid pbuf type", 0);
-        }
-      }
+      if (!storage_refs) pbuf_deallocate(p);
       count++;
       /* proceed to next pbuf */
       p = q;
@@ -834,8 +885,17 @@ pbuf_ref(struct pbuf *p)
 {
   /* pbuf given? */
   if (p != NULL) {
+#ifdef BOAROS_LWIP_SHARED_MEMORY
+    SYS_ARCH_DECL_PROTECT(level);
+    SYS_ARCH_PROTECT(level);
+    LWIP_PBUF_REF_T ref = (LWIP_PBUF_REF_T)(p->ref + 1U);
+    LWIP_ASSERT("pbuf ref overflow", ref > 0);
+    __atomic_store_n(&p->ref, ref, __ATOMIC_RELAXED);
+    SYS_ARCH_UNPROTECT(level);
+#else
     SYS_ARCH_SET(p->ref, (LWIP_PBUF_REF_T)(p->ref + 1));
     LWIP_ASSERT("pbuf ref overflow", p->ref > 0);
+#endif
   }
 }
 
@@ -1355,6 +1415,119 @@ pbuf_clone(pbuf_layer layer, pbuf_type type, struct pbuf *p)
   LWIP_UNUSED_ARG(err); /* in case of LWIP_NOASSERT */
   LWIP_ASSERT("pbuf_copy failed", err == ERR_OK);
   return q;
+}
+
+#if LWIP_SUPPORT_CUSTOM_PBUF
+struct pbuf_storage_view {
+  struct pbuf_custom custom;
+  struct pbuf *storage;
+  struct pbuf *group;
+};
+
+static void
+pbuf_storage_view_free(struct pbuf *p)
+{
+  struct pbuf_storage_view *view = (struct pbuf_storage_view *)p;
+  struct pbuf *storage = view->storage, *group = view->group;
+  u16_t storage_refs, group_refs;
+  SYS_ARCH_DECL_PROTECT(level);
+  /* Both lifetimes end at this descriptor; return them in one metadata visit. */
+  SYS_ARCH_PROTECT(level);
+  LWIP_ASSERT("live source and group", storage->storage_refs && group->storage_refs);
+  storage_refs = (u16_t)(storage->storage_refs - 1);
+  group_refs = (u16_t)(group->storage_refs - 1);
+  __atomic_store_n(&storage->storage_refs, storage_refs, __ATOMIC_RELEASE);
+  __atomic_store_n(&group->storage_refs, group_refs, __ATOMIC_RELEASE);
+  SYS_ARCH_UNPROTECT(level);
+  if (!storage_refs) pbuf_deallocate(storage);
+  if (!group_refs) pbuf_deallocate(group);
+}
+#endif
+
+struct pbuf *
+pbuf_clone_shared(pbuf_layer layer, struct pbuf *p, u16_t private_length)
+{
+#if LWIP_SUPPORT_CUSTOM_PBUF
+  struct pbuf *source, *head, *tail;
+  struct pbuf_storage_view *views;
+  u16_t skip, remaining;
+  unsigned count = 0, index = 0;
+  size_t payload_offset, views_offset, allocation;
+  if (!p || private_length > p->tot_len) return NULL;
+  /* Only copied, owned RAM has the lifetime and immutability contract. A ROM,
+   * custom DMA or caller REF buffer must still be copied before asynchronous RX. */
+  skip = private_length;
+  remaining = (u16_t)(p->tot_len - private_length);
+  for (source = p; source; source = source->next) {
+    if (!pbuf_match_allocsrc(source, PBUF_TYPE_ALLOC_SRC_MASK_STD_HEAP) ||
+        (source->flags & PBUF_FLAG_IS_CUSTOM))
+      return pbuf_clone(layer, PBUF_RAM, p);
+    if (skip >= source->len) skip = (u16_t)(skip - source->len);
+    else if (remaining) {
+      remaining = (u16_t)(remaining - LWIP_MIN(remaining, (u16_t)(source->len - skip)));
+      count++;
+      skip = 0;
+    }
+    if (source->tot_len == source->len) break;
+  }
+  LWIP_ASSERT("complete source chain", !remaining);
+  if (count >= 0xffff) return NULL;
+  payload_offset = SIZEOF_STRUCT_PBUF + LWIP_MEM_ALIGN_SIZE((u16_t)layer);
+  views_offset = payload_offset + LWIP_MEM_ALIGN_SIZE(private_length);
+  allocation = views_offset + count * sizeof(*views);
+  if ((mem_size_t)allocation != allocation) return NULL;
+  head = (struct pbuf *)mem_malloc((mem_size_t)allocation);
+  if (!head) return NULL;
+  pbuf_init_alloced_pbuf(head, (u8_t *)head + payload_offset,
+                        p->tot_len, private_length, PBUF_RAM, 0);
+  views = (struct pbuf_storage_view *)((u8_t *)head + views_offset);
+  if (pbuf_copy_partial(p, head->payload, private_length, 0) != private_length) {
+    pbuf_free(head);
+    return NULL;
+  }
+  tail = head;
+  skip = private_length;
+  remaining = (u16_t)(p->tot_len - private_length);
+  for (source = p; remaining && source; source = source->next) {
+    struct pbuf_storage_view *view;
+    u16_t length;
+    SYS_ARCH_DECL_PROTECT(level);
+    if (skip >= source->len) {
+      skip = (u16_t)(skip - source->len);
+      continue;
+    }
+    length = LWIP_MIN(remaining, (u16_t)(source->len - skip));
+    view = &views[index++];
+    view->custom.custom_free_function = pbuf_storage_view_free;
+    pbuf_init_alloced_pbuf(&view->custom.pbuf, (u8_t *)source->payload + skip,
+                          remaining, length, PBUF_ROM, PBUF_FLAG_IS_CUSTOM);
+    SYS_ARCH_PROTECT(level);
+    LWIP_ASSERT("shared source remains owned", source->ref && source->storage_refs);
+    if (source->storage_refs == 0xffff) {
+      SYS_ARCH_UNPROTECT(level);
+      goto failed;
+    }
+    __atomic_store_n(&source->storage_refs, (u16_t)(source->storage_refs + 1), __ATOMIC_RELEASE);
+    SYS_ARCH_UNPROTECT(level);
+    view->storage = source;
+    view->group = head;
+    /* RX may drop the header before any payload descriptor. Each embedded
+     * descriptor keeps this allocation alive independently of the header ref. */
+    head->storage_refs++;
+    tail->next = &view->custom.pbuf;
+    tail = tail->next;
+    remaining = (u16_t)(remaining - length);
+    skip = 0;
+  }
+  LWIP_ASSERT("complete shared payload", !remaining);
+  return head;
+failed:
+  pbuf_free(head);
+  return NULL;
+#else
+  LWIP_UNUSED_ARG(private_length);
+  return pbuf_clone(layer, PBUF_RAM, p);
+#endif
 }
 
 #if LWIP_CHECKSUM_ON_COPY

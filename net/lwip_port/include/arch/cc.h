@@ -1,7 +1,11 @@
 #ifndef BOAROS_LWIP_ARCH_CC_H
 #define BOAROS_LWIP_ARCH_CC_H
 
-/* The raw API runs in one S-mode execution context on RV64. */
+#include <stdint.h>
+
+#ifdef BOAROS_LWIP_SHARED_MEMORY
+typedef uintptr_t sys_prot_t;
+#endif
 #define BYTE_ORDER LITTLE_ENDIAN
 #define LWIP_NO_CTYPE_H 1
 #define LWIP_NO_LIMITS_H 1

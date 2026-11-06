@@ -50,6 +50,9 @@
 #include "lwip/err.h"
 #include "lwip/ip6.h"
 #include "lwip/ip6_addr.h"
+#ifdef BOAROS_LWIP_TCP_WRITEV
+#include <common/tcp_write_segment.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -133,16 +136,26 @@ typedef void  (*tcp_err_fn)(void *arg, err_t err);
  */
 typedef err_t (*tcp_connected_fn)(void *arg, struct tcp_pcb *tpcb, err_t err);
 
+#ifdef BOAROS_LWIP_LOOPBACK_MSS
+#define tcp_mss_limit(pcb) ((pcb)->boaros_loopback ? BOAROS_LWIP_LOOPBACK_MSS : TCP_MSS)
+#define tcp_default_rcv_wnd_limit(pcb) ((pcb)->boaros_loopback ? BOAROS_LWIP_LOOPBACK_WINDOW : TCP_WND)
+#define tcp_rcv_wnd_limit(pcb) ((pcb)->boaros_rcv_capacity)
+#define tcp_sndbuf_limit(pcb) ((pcb)->boaros_loopback ? BOAROS_LWIP_LOOPBACK_WINDOW : TCP_SND_BUF)
+#else
+#define tcp_mss_limit(pcb) TCP_MSS
+#define tcp_rcv_wnd_limit(pcb) TCP_WND
+#define tcp_sndbuf_limit(pcb) TCP_SND_BUF
+#endif
 #if LWIP_WND_SCALE
 #define RCV_WND_SCALE(pcb, wnd) (((wnd) >> (pcb)->rcv_scale))
 #define SND_WND_SCALE(pcb, wnd) (((wnd) << (pcb)->snd_scale))
 #define TCPWND16(x)             ((u16_t)LWIP_MIN((x), 0xFFFF))
-#define TCP_WND_MAX(pcb)        ((tcpwnd_size_t)(((pcb)->flags & TF_WND_SCALE) ? TCP_WND : TCPWND16(TCP_WND)))
+#define TCP_WND_MAX(pcb)        ((tcpwnd_size_t)(((pcb)->flags & TF_WND_SCALE) ? tcp_rcv_wnd_limit(pcb) : TCPWND16(tcp_rcv_wnd_limit(pcb))))
 #else
 #define RCV_WND_SCALE(pcb, wnd) (wnd)
 #define SND_WND_SCALE(pcb, wnd) (wnd)
 #define TCPWND16(x)             (x)
-#define TCP_WND_MAX(pcb)        TCP_WND
+#define TCP_WND_MAX(pcb)        tcp_rcv_wnd_limit(pcb)
 #endif
 /* Increments a tcpwnd_size_t and holds at max value rather than rollover */
 #define TCP_WND_INC(wnd, inc)   do { \
@@ -206,6 +219,12 @@ struct tcp_pcb_ext_args {
 typedef u16_t tcpflags_t;
 #define TCP_ALLFLAGS 0xffffU
 
+#ifdef BOAROS_LWIP_LOOPBACK_MSS
+#define TCP_PCB_RCV_POLICY u32_t boaros_rcv_limit;
+#else
+#define TCP_PCB_RCV_POLICY
+#endif
+
 /**
  * members common to struct tcp_pcb and struct tcp_listen_pcb
  */
@@ -215,6 +234,7 @@ typedef u16_t tcpflags_t;
   TCP_PCB_EXTARGS \
   enum tcp_state state; /* TCP state */ \
   u8_t prio; \
+  TCP_PCB_RCV_POLICY \
   /* ports are in host byte order */ \
   u16_t local_port
 
@@ -284,6 +304,10 @@ struct tcp_pcb {
   tcpwnd_size_t rcv_wnd;   /* receiver window available */
   tcpwnd_size_t rcv_ann_wnd; /* receiver window to announce */
   u32_t rcv_ann_right_edge; /* announced right edge of window */
+#ifdef BOAROS_LWIP_LOOPBACK_MSS
+  /* Applied capacity retains credit promised before a policy reduction. */
+  tcpwnd_size_t boaros_rcv_capacity;
+#endif
 
 #if LWIP_TCP_SACK_OUT
   /* SACK ranges to include in ACK packets (entry is invalid if left==right) */
@@ -381,6 +405,9 @@ struct tcp_pcb {
 
   /* KEEPALIVE counter */
   u8_t keep_cnt_sent;
+#ifdef BOAROS_LWIP_LOOPBACK_MSS
+  u8_t boaros_loopback; /* Both endpoints established through the loopback netif. */
+#endif
 
 #if LWIP_WND_SCALE
   u8_t snd_scale;
@@ -388,7 +415,21 @@ struct tcp_pcb {
 #endif
   /* End sequence of the last newly transmitted sub-MSS data segment. */
   u32_t snd_sml;
+#ifdef BOAROS_LWIP_TCP_CONTEXT
+  struct tcp_pcb *boaros_route_next;
+  struct tcp_pcb *boaros_loopback_peer;
+  unsigned char boaros_owner;
+#endif
 };
+
+#ifdef BOAROS_LWIP_SHARED_MEMORY
+/* The routing index may sample TIME_WAIT without taking a TCP owner lock. */
+#define tcp_get_state(pcb) __atomic_load_n(&(pcb)->state, __ATOMIC_RELAXED)
+#define tcp_set_state(pcb, new_state) __atomic_store_n(&(pcb)->state, new_state, __ATOMIC_RELAXED)
+#else
+#define tcp_get_state(pcb) ((pcb)->state)
+#define tcp_set_state(pcb, new_state) ((pcb)->state = (new_state))
+#endif
 
 #if LWIP_EVENT_API
 
@@ -457,6 +498,10 @@ void             tcp_backlog_accepted(struct tcp_pcb* pcb);
 #define          tcp_accepted(pcb) do { LWIP_UNUSED_ARG(pcb); } while(0) /* compatibility define, not needed any more */
 
 void             tcp_recved  (struct tcp_pcb *pcb, u16_t len);
+#ifdef BOAROS_LWIP_LOOPBACK_MSS
+/* Protocol owner only; zero selects route defaults. May send a window ACK. */
+void             tcp_set_receive_limit(struct tcp_pcb *pcb, u32_t bytes);
+#endif
 err_t            tcp_bind    (struct tcp_pcb *pcb, const ip_addr_t *ipaddr,
                               u16_t port);
 void             tcp_bind_netif(struct tcp_pcb *pcb, const struct netif *netif);
@@ -474,6 +519,22 @@ err_t            tcp_shutdown(struct tcp_pcb *pcb, int shut_rx, int shut_tx);
 
 err_t            tcp_write   (struct tcp_pcb *pcb, const void *dataptr, u16_t len,
                               u8_t apiflags);
+#ifdef BOAROS_LWIP_TCP_WRITEV
+/* COPY a bounded prefix covered by the supplied nonempty source segments.
+ * A nonzero *written is accepted even when the next preparation returned ERR_MEM. */
+err_t            boaros_lwip_tcp_writev(struct tcp_pcb *pcb,
+    const struct kernel_socket_write_segment *segments, unsigned count,
+    u16_t len, u8_t apiflags, u16_t *written);
+#ifdef BOAROS_LWIP_TCP_CONTEXT
+/* Preparation owns only detached pbufs, not a PCB. Publication consumes a
+ * complete segment prefix, leaving the unused suffix with the caller. */
+u16_t            boaros_lwip_tcp_detached_mss(const struct tcp_pcb *pcb);
+err_t            boaros_lwip_tcp_preparev(const struct kernel_socket_write_segment *segments,
+    unsigned count, u16_t len, u16_t mss, struct tcp_seg **owner);
+err_t            boaros_lwip_tcp_publishv(struct tcp_pcb *pcb, struct tcp_seg **owner,
+    u16_t limit, u8_t apiflags, u16_t *written);
+#endif
+#endif
 
 void             tcp_setprio (struct tcp_pcb *pcb, u8_t prio);
 

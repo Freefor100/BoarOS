@@ -23,6 +23,7 @@
 #include <kernel/virtio_pci_rng.h>
 #include <kernel/virtio_pci_net.h>
 #include <kernel/network.h>
+#include <kernel/socket.h>
 #include <kernel/ns16550.h>
 
 #define ROOT_DEVICES 8
@@ -284,6 +285,9 @@ static int start_root(void)
     if(!error) error=la_virt_uart_start(&root.uart,&root.heap,la_timer_frequency());
     if(!error) error=start_rng(allocator,host);
     if(!error) error=start_network(allocator,host);
+#if BOAROS_USER_SMP
+    if(!error) error=kernel_socket_start_tcp_owners();
+#endif
     if(!error) error=prepare_init();
     if(!error) error=kernel_page_cache_start_worker(&root.cache);
     if(error) return error;

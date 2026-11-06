@@ -143,7 +143,7 @@ static err_t netif_loop_output_ipv6(struct netif *netif, struct pbuf *p, const i
 
 static struct netif loop_netif;
 
-#if LWIP_TESTMODE
+#if LWIP_TESTMODE || defined(BOAROS_LWIP_LOOPBACK_MSS)
 struct netif* netif_get_loopif(void)
 {
   return &loop_netif;
@@ -179,7 +179,11 @@ netif_loopif_init(struct netif *netif)
 #if LWIP_LOOPIF_MULTICAST
   netif_set_flags(netif, NETIF_FLAG_IGMP);
 #endif
+#ifdef BOAROS_LWIP_LOOPBACK_CHECKSUM_FLAGS
+  NETIF_SET_CHECKSUM_CTRL(netif, BOAROS_LWIP_LOOPBACK_CHECKSUM_FLAGS);
+#else
   NETIF_SET_CHECKSUM_CTRL(netif, NETIF_CHECKSUM_DISABLE_ALL);
+#endif
   return ERR_OK;
 }
 #endif /* LWIP_HAVE_LOOPIF */
@@ -1134,11 +1138,36 @@ netif_set_link_callback(struct netif *netif, netif_status_callback_fn link_callb
  * @return ERR_OK if the packet has been sent
  *         ERR_MEM if the pbuf used to copy the packet couldn't be allocated
  */
+static struct pbuf *
+loopback_clone(struct netif *netif, struct pbuf *p)
+{
+#if LWIP_HAVE_LOOPIF && LWIP_TCP
+  if (netif == &loop_netif && p->tot_len >= 40) {
+    unsigned version = pbuf_get_at(p, 0) >> 4;
+    unsigned ip_length = 0;
+    if (version == 4 && pbuf_get_at(p, 9) == IP_PROTO_TCP &&
+        !(pbuf_get_at(p, 6) & 0x3f) && !pbuf_get_at(p, 7)) {
+      ip_length = (pbuf_get_at(p, 0) & 0xf) * 4;
+      if (ip_length < 20) ip_length = 0;
+    } else if (version == 6 && pbuf_get_at(p, 6) == IP6_NEXTH_TCP) {
+      ip_length = 40;
+    }
+    if (ip_length && ip_length + 20 <= p->tot_len) {
+      unsigned tcp_length = (pbuf_get_at(p, (u16_t)(ip_length + 12)) >> 4) * 4;
+      if (tcp_length >= 20 && ip_length + tcp_length <= p->tot_len)
+        return pbuf_clone_shared(PBUF_LINK, p, (u16_t)(ip_length + tcp_length));
+    }
+  }
+#else
+  LWIP_UNUSED_ARG(netif);
+#endif
+  return pbuf_clone(PBUF_LINK, PBUF_RAM, p);
+}
+
 err_t
 netif_loop_output(struct netif *netif, struct pbuf *p)
 {
   struct pbuf *r;
-  err_t err;
   struct pbuf *last;
 #if LWIP_LOOPBACK_MAX_PBUFS
   u16_t clen = 0;
@@ -1160,8 +1189,8 @@ netif_loop_output(struct netif *netif, struct pbuf *p)
   LWIP_ASSERT("netif_loop_output: invalid netif", netif != NULL);
   LWIP_ASSERT("netif_loop_output: invalid pbuf", p != NULL);
 
-  /* Allocate a new pbuf */
-  r = pbuf_alloc(PBUF_LINK, p->tot_len, PBUF_RAM);
+  /* TCP RX owns its headers and descriptors; immutable TX payload may outlive ACK. */
+  r = loopback_clone(netif, p);
   if (r == NULL) {
     LINK_STATS_INC(link.memerr);
     LINK_STATS_INC(link.drop);
@@ -1182,15 +1211,6 @@ netif_loop_output(struct netif *netif, struct pbuf *p)
   netif->loop_cnt_current = (u16_t)(netif->loop_cnt_current + clen);
 #endif /* LWIP_LOOPBACK_MAX_PBUFS */
 
-  /* Copy the whole pbuf queue p into the single pbuf r */
-  if ((err = pbuf_copy(r, p)) != ERR_OK) {
-    pbuf_free(r);
-    LINK_STATS_INC(link.memerr);
-    LINK_STATS_INC(link.drop);
-    MIB2_STATS_NETIF_INC(stats_if, ifoutdiscards);
-    return err;
-  }
-
   /* Put the packet on a linked list which gets emptied through calling
      netif_poll(). */
 
@@ -1199,6 +1219,9 @@ netif_loop_output(struct netif *netif, struct pbuf *p)
     /* nothing to do here, just get to the last pbuf */
   }
 
+#ifdef LWIP_HOOK_NETIF_LOOPBACK_PUBLISH
+  LWIP_HOOK_NETIF_LOOPBACK_PUBLISH(netif);
+#endif
   SYS_ARCH_PROTECT(lev);
   if (netif->loop_first != NULL) {
     LWIP_ASSERT("if first != NULL, last must also be != NULL", netif->loop_last != NULL);

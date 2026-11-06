@@ -8,6 +8,7 @@ _Thread_local uintptr_t network_host_irq = RISCV_SSTATUS_SIE;
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 extern void *calloc(size_t, size_t);
 extern void free(void *);
@@ -231,9 +232,20 @@ void virtio_mmio_write32(volatile void *context, unsigned offset, uint32_t value
     }
 }
 uint64_t riscv_time_read(void) { return now; }
+void kernel_cpu_flush_notifications(void) { assert(!kernel_cpu_current()->outbound); }
+#if BOAROS_COST_DIAGNOSTICS
+uint64_t kernel_cost_clock(void) { return now; }
+struct kernel_cost_tag kernel_cost_capture(void) { return (struct kernel_cost_tag){0}; }
+void kernel_cost_raw_lock(struct kernel_cost_tag tag, unsigned rank, uint64_t wait, uint64_t hold)
+{ (void)tag; (void)rank; (void)wait; (void)hold; }
+#endif
 void kernel_wait_queue_init(struct kernel_wait_queue *q) { memset(q, 0, sizeof(*q)); }
 enum kernel_scheduler_status kernel_wait_queue_wake_all(struct kernel_wait_queue *q)
-{ (void)q; return KERNEL_SCHEDULER_STATUS_OK; }
+{
+    (void)q;
+    assert(!kernel_cpu_current()->raw_locks && !arch_interrupt_is_enabled());
+    return KERNEL_SCHEDULER_STATUS_OK;
+}
 int riscv_plic_register(uint32_t source, void (*fn)(void *), void *owner)
 {
     assert(source == 7 && !interrupt_fn);
@@ -829,11 +841,81 @@ static void test_batch_notify(unsigned version)
     printf("PASS: VirtIO-net v%u RX/TX batch notifies once, partial full batch publishes, empty batch silent\n",version);
 }
 
+struct paused_copy {
+    struct virtio_net_device *device;
+    pthread_mutex_t mutex;
+    pthread_cond_t changed;
+    int entered, resume, result;
+};
+static int hold_tx_copy(const void *context, void *destination, uint32_t size)
+{
+    struct paused_copy *copy = (void *)context;
+    assert(!pthread_mutex_lock(&copy->mutex));
+    copy->entered = 1;
+    assert(!pthread_cond_signal(&copy->changed));
+    while (!copy->resume) assert(!pthread_cond_wait(&copy->changed, &copy->mutex));
+    assert(!pthread_mutex_unlock(&copy->mutex));
+    assert(size == 4);
+    memcpy(destination, "held", size);
+    return 1;
+}
+static void *paused_send(void *context)
+{
+    struct paused_copy *copy = context;
+    copy->result = virtio_net_send_copy(copy->device, 4, hold_tx_copy, copy);
+    return 0;
+}
+static void test_concurrent_copy(unsigned version, int stop_during_copy)
+{
+    struct virtio_net_device d; start(version, &d);
+    struct paused_copy copy = { .device = &d, .mutex = PTHREAD_MUTEX_INITIALIZER,
+                                .changed = PTHREAD_COND_INITIALIZER };
+    pthread_t sender;
+    assert(!pthread_create(&sender, 0, paused_send, &copy));
+    assert(!pthread_mutex_lock(&copy.mutex));
+    while (!copy.entered) assert(!pthread_cond_wait(&copy.changed, &copy.mutex));
+    assert(!pthread_mutex_unlock(&copy.mutex));
+    if (stop_during_copy) {
+        assert(virtio_net_stop(&d) == -KERNEL_EBUSY && live == 3 && !interrupt_fn);
+    } else {
+        assert(virtio_net_send(&d, "peer", 4) == 4);
+        receive("rx", 2);
+        struct virtio_net_frame frame;
+        assert(virtio_net_receive(&d, &frame) && !virtio_net_lend(&d, frame.buffer));
+        assert(frame.size == 2 && !memcmp(frame.data, "rx", 2));
+        virtio_net_release(&d, frame.buffer);
+    }
+    assert(!pthread_mutex_lock(&copy.mutex));
+    copy.resume = 1;
+    assert(!pthread_cond_signal(&copy.changed));
+    assert(!pthread_mutex_unlock(&copy.mutex));
+    assert(!pthread_join(sender, 0));
+    assert(!pthread_cond_destroy(&copy.changed) && !pthread_mutex_destroy(&copy.mutex));
+    if (stop_during_copy) {
+        assert(copy.result == -KERNEL_ENETDOWN);
+    } else {
+        assert(copy.result == 4 && queues[1].pending_count == 2);
+        struct wire_descriptor peer = descriptor(1, queues[1].pending[0]);
+        struct wire_descriptor held = descriptor(1, queues[1].pending[1]);
+        unsigned header = version == 1 ? 10 : 12;
+        assert(peer.address != held.address);
+        assert(!memcmp((char *)resolve(peer.address) + header, "peer", 4));
+        assert(!memcmp((char *)resolve(held.address) + header, "held", 4));
+        complete(1, next_head(1), 0, 1);
+        complete(1, next_head(1), 0, 1);
+        assert(d.tx_capacity_generation == 2 && !d.loaned);
+    }
+    stop(&d);
+    printf("PASS: VirtIO-net v%u copying TX slot survives %s\n", version,
+           stop_during_copy ? "quiesce" : "concurrent TX and IRQ harvest");
+}
+
 int main(void)
 {
     test_batch_notify(1); test_batch_notify(2);
     setvbuf(stdout, 0, _IONBF, 0); unsigned errors = 0;
     for (unsigned version = 1; version <= 2; version++) {
+        test_concurrent_copy(version, 0); test_concurrent_copy(version, 1);
         test_loan_budget(version); test_tx_copy_budget(version); test_failure_slot_dump(version);
         test_tx_segments(version);
         test_tx_segments_unsupported(version); test_index_wrap(version);

@@ -16,6 +16,7 @@
 #include <kernel/physical_page.h>
 #include <kernel/random.h>
 #include <kernel/scheduler.h>
+#include <kernel/socket.h>
 #include <kernel/tick.h>
 #include <kernel/time.h>
 
@@ -1024,6 +1025,8 @@ static void kernel_main_high(void)
                     (transition_page_table.root_address >> 12),
                     riscv_sv39_current_satp(), boot_info.timebase_frequency);
 #if BOAROS_USER_SMP
+    if (root_started && root_boot.network && kernel_socket_start_tcp_owners()!=0)
+        shutdown_for_root_boot_error(RISCV_ROOT_BOOT_STATUS_RESOURCES);
     /* Publish journal workers only after their execution CPUs are online.
      * PID 1 remains queued on CPU0 until boot enables scheduling there. */
     if (root_started && kernel_vfs_start_journal_worker(&root_boot.mount) != 0)

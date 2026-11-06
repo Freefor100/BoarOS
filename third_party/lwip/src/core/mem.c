@@ -377,7 +377,18 @@ static struct mem *ram_end;
 static sys_mutex_t mem_mutex;
 #endif
 
-#if LWIP_ALLOW_MEM_FREE_FROM_OTHER_CONTEXT
+#if defined(BOAROS_LWIP_SHARED_MEMORY)
+/* All NO_SYS TCP owners share this heap; keep the free-list scan and edits
+ * under one lock. The upstream interrupt-only mode permits only free/trim
+ * during its scans, so it is not suitable for concurrent malloc. */
+#define LWIP_MEM_FREE_DECL_PROTECT() SYS_ARCH_DECL_PROTECT(lev_free)
+#define LWIP_MEM_FREE_PROTECT() SYS_ARCH_PROTECT(lev_free)
+#define LWIP_MEM_FREE_UNPROTECT() SYS_ARCH_UNPROTECT(lev_free)
+#define LWIP_MEM_ALLOC_DECL_PROTECT() SYS_ARCH_DECL_PROTECT(lev_alloc)
+#define LWIP_MEM_ALLOC_PROTECT() SYS_ARCH_PROTECT(lev_alloc)
+#define LWIP_MEM_ALLOC_UNPROTECT() SYS_ARCH_UNPROTECT(lev_alloc)
+#define LWIP_MEM_LFREE_VOLATILE
+#elif LWIP_ALLOW_MEM_FREE_FROM_OTHER_CONTEXT
 
 static volatile u8_t mem_free_count;
 
@@ -726,19 +737,19 @@ mem_trim(void *rmem, mem_size_t new_size)
   /* ... and its offset pointer */
   ptr = mem_to_ptr(mem);
 
+  LWIP_MEM_FREE_PROTECT();
   size = (mem_size_t)((mem_size_t)(mem->next - ptr) - (SIZEOF_STRUCT_MEM + MEM_SANITY_OVERHEAD));
   LWIP_ASSERT("mem_trim can only shrink memory", newsize <= size);
   if (newsize > size) {
     /* not supported */
+    LWIP_MEM_FREE_UNPROTECT();
     return NULL;
   }
   if (newsize == size) {
     /* No change in size, simply return */
+    LWIP_MEM_FREE_UNPROTECT();
     return rmem;
   }
-
-  /* protect the heap from concurrent access */
-  LWIP_MEM_FREE_PROTECT();
 
   mem2 = ptr_to_mem(mem->next);
   if (mem2->used == 0) {
@@ -817,11 +828,25 @@ mem_trim(void *rmem, mem_size_t new_size)
  *
  * Note that the returned value will always be aligned (as defined by MEM_ALIGNMENT).
  */
+#if BOAROS_LWIP_TCP_WRITEV
+#if !MEM_STATS
+#error "TCP data admission requires the heap's charged block counter"
+#endif
+/* Budget 256 bytes per active PCB for ACK/control and receive metadata. */
+#define BOAROS_TCP_PROGRESS_RESERVE (MEMP_NUM_TCP_PCB * 256U)
+_Static_assert(BOAROS_TCP_PROGRESS_RESERVE < MEM_SIZE_ALIGNED, "TCP heap reserve must fit");
+static void *
+mem_malloc_admitted(mem_size_t size_in, mem_size_t reserve)
+#else
 void *
 mem_malloc(mem_size_t size_in)
+#endif
 {
   mem_size_t ptr, ptr2, size;
   struct mem *mem, *mem2;
+#if BOAROS_LWIP_TCP_WRITEV
+  mem_size_t budget = MEM_SIZE_ALIGNED;
+#endif
 #if LWIP_ALLOW_MEM_FREE_FROM_OTHER_CONTEXT
   u8_t local_mem_free_count = 0;
 #endif /* LWIP_ALLOW_MEM_FREE_FROM_OTHER_CONTEXT */
@@ -848,6 +873,14 @@ mem_malloc(mem_size_t size_in)
   /* protect the heap from concurrent access */
   sys_mutex_lock(&mem_mutex);
   LWIP_MEM_ALLOC_PROTECT();
+#if BOAROS_LWIP_TCP_WRITEV
+  if (reserve) {
+    const mem_size_t used = STATS_GET(mem.used);
+    const mem_size_t limit = MEM_SIZE_ALIGNED - reserve;
+    budget = used < limit ? limit - used : 0;
+    if (budget < size + SIZEOF_STRUCT_MEM) goto exhausted;
+  }
+#endif
 #if LWIP_ALLOW_MEM_FREE_FROM_OTHER_CONTEXT
   /* run as long as a mem_free disturbed mem_malloc or mem_trim */
   do {
@@ -878,7 +911,16 @@ mem_malloc(mem_size_t size_in)
         /* mem is not used and at least perfect fit is possible:
          * mem->next - (ptr + SIZEOF_STRUCT_MEM) gives us the 'user data size' of mem */
 
-        if (mem->next - (ptr + SIZEOF_STRUCT_MEM) >= (size + SIZEOF_STRUCT_MEM + MIN_SIZE_ALIGNED)) {
+        const mem_size_t whole = mem->next - ptr;
+        const int split = whole >= size + 2U * SIZEOF_STRUCT_MEM + MIN_SIZE_ALIGNED;
+        const mem_size_t charge = split ? size + SIZEOF_STRUCT_MEM : whole;
+        LWIP_UNUSED_ARG(charge); /* Upstream builds can omit heap statistics. */
+#if BOAROS_LWIP_TCP_WRITEV
+        /* Near fits consume the whole block. Check the actual charge and
+         * keep looking if a later split would fit the same budget. */
+        if (charge > budget) continue;
+#endif
+        if (split) {
           /* (in addition to the above, we test if another struct mem (SIZEOF_STRUCT_MEM) containing
            * at least MIN_SIZE_ALIGNED of data also fits in the 'user data space' of 'mem')
            * -> split large block, create empty remainder,
@@ -903,7 +945,6 @@ mem_malloc(mem_size_t size_in)
           if (mem2->next != MEM_SIZE_ALIGNED) {
             ptr_to_mem(mem2->next)->prev = ptr2;
           }
-          MEM_STATS_INC_USED(used, (size + SIZEOF_STRUCT_MEM));
         } else {
           /* (a mem2 struct does no fit into the user data space of mem and mem->next will always
            * be used at this point: if not we have 2 unused structs in a row, plug_holes should have
@@ -913,8 +954,8 @@ mem_malloc(mem_size_t size_in)
            * will always be used at this point!
            */
           mem->used = 1;
-          MEM_STATS_INC_USED(used, mem->next - mem_to_ptr(mem));
         }
+        MEM_STATS_INC_USED(used, charge);
 #if LWIP_ALLOW_MEM_FREE_FROM_OTHER_CONTEXT
 mem_malloc_adjust_lfree:
 #endif /* LWIP_ALLOW_MEM_FREE_FROM_OTHER_CONTEXT */
@@ -958,12 +999,29 @@ mem_malloc_adjust_lfree:
     /* if we got interrupted by a mem_free, try again */
   } while (local_mem_free_count != 0);
 #endif /* LWIP_ALLOW_MEM_FREE_FROM_OTHER_CONTEXT */
+#if BOAROS_LWIP_TCP_WRITEV
+exhausted:
+#endif
   MEM_STATS_INC(err);
   LWIP_MEM_ALLOC_UNPROTECT();
   sys_mutex_unlock(&mem_mutex);
   LWIP_DEBUGF(MEM_DEBUG | LWIP_DBG_LEVEL_SERIOUS, ("mem_malloc: could not allocate %"S16_F" bytes\n", (s16_t)size));
   return NULL;
 }
+
+#if BOAROS_LWIP_TCP_WRITEV
+void *
+mem_malloc(mem_size_t size)
+{
+  return mem_malloc_admitted(size, 0);
+}
+
+void *
+boaros_lwip_mem_malloc_tcp_data(mem_size_t size)
+{
+  return mem_malloc_admitted(size, BOAROS_TCP_PROGRESS_RESERVE);
+}
+#endif
 
 #endif /* MEM_USE_POOLS */
 

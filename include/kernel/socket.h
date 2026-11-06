@@ -1,6 +1,7 @@
 #ifndef BOAROS_KERNEL_SOCKET_H
 #define BOAROS_KERNEL_SOCKET_H
 
+#include <common/tcp_write_segment.h>
 #include <kernel/sync.h>
 
 #include <stdint.h>
@@ -43,7 +44,6 @@ struct kernel_socket_read_request {
     struct kernel_open_file_description **pin_owner;
 };
 
-struct kernel_socket_write_segment;
 struct kernel_socket_write_request {
     struct kernel_socket_write_request *next;
     const struct kernel_socket_write_segment *segments;
@@ -52,6 +52,11 @@ struct kernel_socket_write_request {
     int result;
     uint32_t reserved;
     uint8_t progressed;
+#if BOAROS_USER_SMP
+    uint8_t tcp_prepare_failed;
+    uint16_t tcp_prepare_mss, tcp_prepare_size;
+    struct tcp_seg *tcp_prepared;
+#endif
     void *protocol_payload;
     /* Automatic PASSCRED follows the registered request across user faults. */
     struct kernel_socket_control *automatic_control;
@@ -94,9 +99,15 @@ void kernel_socket_stream_begin(struct kernel_socket_write_request *request,
     struct kernel_open_file_description **pin_owner);
 int kernel_socket_stream_reserve(struct kernel_socket_write_request *request,
     uint32_t size, uint32_t flags);
-struct kernel_socket_write_segment { const void *data; uint32_t size; };
 int kernel_socket_stream_commitv(struct kernel_socket_write_request *request,
     const struct kernel_socket_write_segment *segments, unsigned count, uint32_t flags);
+#if BOAROS_USER_SMP
+/* A successful preparation no longer needs the source pages. */
+int kernel_socket_stream_has_shard(const struct kernel_socket *socket);
+int kernel_socket_stream_preparev(struct kernel_socket_write_request *request,
+    const struct kernel_socket_write_segment *segments, unsigned count, uint32_t size);
+int kernel_socket_stream_publish(struct kernel_socket_write_request *request, uint32_t flags);
+#endif
 int kernel_socket_stream_commit(struct kernel_socket_write_request *request,
     const void *buffer, uint32_t size, uint32_t flags);
 void kernel_socket_stream_cancel(struct kernel_socket_write_request *request);
@@ -241,6 +252,8 @@ struct kernel_socket_service_result {
 struct kernel_socket_protocol_scope {
 #if BOAROS_USER_SMP
     struct kernel_service_scope service;
+    struct socket_tcp_owner *tcp_owner;
+    struct kernel_lock_guard ip_guard;
 #endif
     uintptr_t interrupts;
     struct kernel_lock_guard guard;
@@ -248,8 +261,12 @@ struct kernel_socket_protocol_scope {
 };
 void kernel_socket_protocol_enter(struct kernel_socket_protocol_scope *scope);
 void kernel_socket_protocol_leave(struct kernel_socket_protocol_scope *scope);
+#if BOAROS_USER_SMP
+int kernel_socket_start_tcp_owners(void);
+void kernel_socket_stop_tcp_owners(void);
+#endif
 /* 外层scope的raw调用已返回；供worker将服务与等待登记置于同一owner内。 */
-struct kernel_socket_service_result kernel_socket_service_owned(const struct kernel_socket_protocol_scope *scope,
+struct kernel_socket_service_result kernel_socket_service_owned(struct kernel_socket_protocol_scope *scope,
     struct kernel_socket_service_budget budget);
 struct kernel_socket_service_result kernel_socket_service_pending(struct kernel_socket_service_budget budget);
 int kernel_socket_work_pending(void);

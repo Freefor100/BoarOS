@@ -62,6 +62,20 @@ static void addresses(void)
         CHECK(write(client, "stream", 6)==6);
         CHECK(recv(accepted,data,2,MSG_PEEK)==2 && !memcmp(data,"st",2));
         CHECK(read(accepted, data, sizeof(data))==6 && !memcmp(data,"stream",6));
+        /* A whole inbound segment may be larger than SO_RCVBUF. It must
+         * become readable once the receiver has drained its prior data. */
+        static _Alignas(4096) char sent[8192], got[8192];
+        int small=1;
+        CHECK(!setsockopt(accepted,SOL_SOCKET,SO_RCVBUF,&small,sizeof(small)));
+        memset(sent, 'k', sizeof(sent));
+        CHECK(write(client, sent, sizeof(sent)) == sizeof(sent));
+        for(size_t done=0;done<sizeof(got);) {
+            ready=(struct pollfd){.fd=accepted,.events=POLLIN};
+            CHECK(poll(&ready,1,2000)==1 && (ready.revents&POLLIN));
+            ssize_t n=read(accepted,got+done,sizeof(got)-done);
+            CHECK(n>0);done+=(size_t)n;
+        }
+        CHECK(!memcmp(sent,got,sizeof(sent)));
         CHECK(close(client)==0 && close(accepted)==0 && close(listener)==0);
     }
     puts("NETWORK PASS addresses: IPv6 UDP/TCP and mapped IPv4 dual-stack accept");
