@@ -187,6 +187,8 @@ void kernel_page_cache_put_batch(
     struct kernel_page_cache *cache,
     struct kernel_page_cache_read_page *pages,
     size_t count);
+/* The successful batch entry keeps the mapped payload alive until put. */
+const void *kernel_page_cache_read_data(const struct kernel_page_cache_read_page *);
 
 /* A successful lookup also returns an owned physical-page reference. */
 /* 只借用当前已完成页；装入、resize或截断中的条目返回BUSY。 */

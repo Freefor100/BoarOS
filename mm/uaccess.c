@@ -26,31 +26,60 @@ enum kernel_uaccess_status kernel_user_range_check(
     return KERNEL_UACCESS_STATUS_OK;
 }
 
-/* 每个基页片段持有实际物理owner；fault可能睡眠，成功后重新pin。 */
-enum kernel_uaccess_status kernel_uaccess_pin_user_page(
-    struct kernel_mm *mm, uint64_t address, uint32_t access,
-    struct kernel_mm_user_pin *pin)
+/* The same fault/retry rule applies to a single page and a bounded prefix.
+ * Only the first page may fault; a second page is borrowed if already ready. */
+static inline enum kernel_uaccess_status pin_user_prefix(
+    struct kernel_mm *mm,uint64_t address,uint64_t second,uint32_t access,
+    struct kernel_mm_user_pin *pin,unsigned *count)
 {
     COST_ADD(USER_RESOLUTIONS, 1); COST_IO_ADD(4, 1);
-    enum kernel_mm_status status = kernel_mm_pin_user_page(mm, address, access, pin);
-    while (status == KERNEL_MM_STATUS_NOT_MAPPED || status == KERNEL_MM_STATUS_ACCESS) {
+    enum kernel_mm_status status;
+    for (;;) {
+        status=count?kernel_mm_pin_user_pair(mm,address,second,access,pin,count):
+            kernel_mm_pin_user_page(mm,address,access,pin);
+        if (status!=KERNEL_MM_STATUS_NOT_MAPPED && status!=KERNEL_MM_STATUS_ACCESS) break;
         status = kernel_mm_resolve_user_fault(mm, address, access);
         if (status != KERNEL_MM_STATUS_OK) break;
         /* fault归还临时写许可后，快照可再次撤W。最终pin才接纳复制；
          * 重做fault会复查真实VMA/EOF，CONFLICT与真实撤权都不忙等。 */
-        status = kernel_mm_pin_user_page(mm, address, access, pin);
     }
-    if (status == KERNEL_MM_STATUS_OK) return KERNEL_UACCESS_STATUS_OK;
+    if (status == KERNEL_MM_STATUS_OK) {
+        if (count) { COST_ADD(USER_RESOLUTIONS,1); COST_IO_ADD(4,1); }
+        return KERNEL_UACCESS_STATUS_OK;
+    }
     if (status == KERNEL_MM_STATUS_NOT_MAPPED || status == KERNEL_MM_STATUS_ACCESS ||
         status == KERNEL_MM_STATUS_ADDRESS_SPACE || status == KERNEL_MM_STATUS_BUS_FAULT ||
         status == KERNEL_MM_STATUS_NO_MEMORY) return KERNEL_UACCESS_STATUS_FAULT;
     return KERNEL_UACCESS_STATUS_STATE;
 }
 
+enum kernel_uaccess_status kernel_uaccess_pin_user_page(
+    struct kernel_mm *mm,uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin)
+{ return pin_user_prefix(mm,address,0,access,pin,NULL); }
+
+enum kernel_uaccess_status kernel_uaccess_pin_user_pair(
+    struct kernel_mm *mm,uint64_t first,uint64_t second,uint32_t access,
+    struct kernel_mm_user_pin pins[2],unsigned *count)
+{ return pin_user_prefix(mm,first,second,access,pins,count); }
+
 
 void kernel_uaccess_write_cursor_finish(struct kernel_uaccess_write_cursor *cursor)
 {
     if (cursor->pin.registration) kernel_mm_unpin_user_page(&cursor->pin);
+}
+
+static inline void copy_to_pinned_page(void *destination,const void *source,size_t size)
+{
+#if BOAROS_COST_DIAGNOSTICS
+    struct kernel_cost_tag tag=kernel_cost_capture();
+    uint64_t start=kernel_cost_clock();
+#endif
+    memcpy(destination,source,size);
+#if BOAROS_COST_DIAGNOSTICS
+    kernel_cost_add_tag(tag,COST_UACCESS_COPY_TICKS,kernel_cost_clock()-start);
+    kernel_cost_add_tag(tag,COST_UACCESS_COPY_BYTES,size);
+#endif
+    COST_ADD(COPY_TO_USER,size);
 }
 
 enum kernel_uaccess_status kernel_uaccess_write_cursor_copy(
@@ -101,18 +130,8 @@ enum kernel_uaccess_status kernel_uaccess_write_cursor_copy(
             }
             cursor->virtual_page = virtual_page;
         }
-#if BOAROS_COST_DIAGNOSTICS
-        struct kernel_cost_tag memory_tag = kernel_cost_capture();
-        uint64_t memory_start = kernel_cost_clock();
-#endif
         page = cursor->pin.page;
-        memcpy(page + offset, source + copied, chunk);
-#if BOAROS_COST_DIAGNOSTICS
-        uint64_t memory_elapsed = kernel_cost_clock() - memory_start;
-        kernel_cost_add_tag(memory_tag, COST_UACCESS_COPY_TICKS, memory_elapsed);
-        kernel_cost_add_tag(memory_tag, COST_UACCESS_COPY_BYTES, chunk);
-#endif
-        COST_ADD(COPY_TO_USER, chunk);
+        copy_to_pinned_page(page+offset,source+copied,chunk);
         copied += chunk;
     }
 
@@ -120,15 +139,49 @@ enum kernel_uaccess_status kernel_uaccess_write_cursor_copy(
     return KERNEL_UACCESS_STATUS_OK;
 }
 
-enum kernel_uaccess_status kernel_copy_to_user(
+static inline enum kernel_uaccess_status copy_to_user_cursor(
     struct kernel_mm *mm, uint64_t user_destination, const void *kernel_source,
     size_t size, size_t *bytes_copied)
 {
     struct kernel_uaccess_write_cursor cursor = {0};
-    enum kernel_uaccess_status status = kernel_uaccess_write_cursor_copy(
-        mm, &cursor, user_destination, kernel_source, size, bytes_copied);
+    enum kernel_uaccess_status status=kernel_uaccess_write_cursor_copy(
+        mm,&cursor,user_destination,kernel_source,size,bytes_copied);
     kernel_uaccess_write_cursor_finish(&cursor);
     return status;
+}
+
+static __attribute__((noinline)) enum kernel_uaccess_status copy_to_user_pair(
+    struct kernel_mm *mm,uint64_t destination,const unsigned char *source,
+    size_t size,size_t first,size_t *copied)
+{
+    struct kernel_mm_user_pin pins[2]={{0}};
+    unsigned count;
+    *copied=0;
+    enum kernel_uaccess_status access=kernel_uaccess_pin_user_pair(mm,destination,
+        destination+first,KERNEL_MM_WRITE,pins,&count);
+    if (access) return access;
+    copy_to_pinned_page((unsigned char *)pins[0].page+(destination&BOAROS_PAGE_MASK),source,first);
+    if (count==2) {
+        copy_to_pinned_page(pins[1].page,source+first,size-first);
+        kernel_mm_unpin_user_pair(pins);
+        *copied=size;
+        return KERNEL_UACCESS_STATUS_OK;
+    }
+    kernel_mm_unpin_user_page(pins);
+    access=copy_to_user_cursor(mm,destination+first,source+first,size-first,copied);
+    *copied+=first;
+    return access;
+}
+
+enum kernel_uaccess_status kernel_copy_to_user(
+    struct kernel_mm *mm, uint64_t user_destination, const void *kernel_source,
+    size_t size, size_t *bytes_copied)
+{
+    size_t first=BOAROS_PAGE_SIZE-(user_destination&BOAROS_PAGE_MASK);
+    if (size>first && size-first<=BOAROS_PAGE_SIZE && mm && kernel_source &&
+        bytes_copied && !kernel_user_range_check(user_destination,size))
+        return copy_to_user_pair(mm,user_destination,kernel_source,size,first,bytes_copied);
+    return copy_to_user_cursor(mm,user_destination,kernel_source,size,bytes_copied);
 }
 
 enum kernel_uaccess_status kernel_copy_from_user(

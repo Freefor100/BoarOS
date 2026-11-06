@@ -2196,22 +2196,26 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
         return -KERNEL_EINVAL;
     }
     struct kernel_vfs_node *node = file->private_data;
-    KERNEL_LOCK_SCOPE(node_guard);
-    kernel_vfs_node_lock(node, &node_guard, 0);
     struct kernel_page_cache *cache = node->instance->page_cache;
     *bytes_read = 0;
     if (cache_miss) *cache_miss=0;
     if (offset > INT64_MAX) return -KERNEL_EOVERFLOW;
-    if (node->memory) return node->instance->ops->pread(node, offset, buffer, size, bytes_read);
-    if (node_guard.lock) kernel_lock_release(&node_guard);
+    if (node->memory) {
+        KERNEL_LOCK_SCOPE(node_guard);
+        kernel_vfs_node_lock(node, &node_guard, 0);
+        return node->instance->ops->pread(node, offset, buffer, size, bytes_read);
+    }
     struct kernel_page_cache_read_page single, *pages = &single;
     size_t capacity = 1;
     int result = 0, done = 0;
-    while (*bytes_read < size && offset < node->size && !done) {
+    while (*bytes_read < size && !done) {
+        /* Sizing only plans the batch; the page cache checks current EOF again. */
+        uint64_t end=kernel_vfs_node_size(node);
+        if (offset>=end) break;
         size_t start = offset & BOAROS_PAGE_MASK;
         size_t window = BOAROS_PAGE_SIZE * KERNEL_PAGE_CACHE_READ_BATCH_MAX - start;
         if (window > size - *bytes_read) window = size - *bytes_read;
-        if (window > node->size - offset) window = node->size - offset;
+        if (window > end - offset) window = end - offset;
         size_t count = (start + window + BOAROS_PAGE_MASK) >> BOAROS_PAGE_SHIFT;
         if (count > capacity) {
             struct kernel_page_cache_read_page *larger;
@@ -2232,14 +2236,12 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
                 error = pages[i].status == KERNEL_PAGE_CACHE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
                 break;
             }
-            void *page;
             size_t valid = pages[i].valid_bytes;
             if (valid <= start) { done=1; break; }
-            if (physical_page_map_owned(cache->allocator, pages[i].physical_address, &page))
-                __builtin_trap();
+            const unsigned char *page=kernel_page_cache_read_data(&pages[i]);
             size_t copied = valid - start;
             if (copied > size - *bytes_read) copied = size - *bytes_read;
-            memcpy((unsigned char *)buffer + *bytes_read, (unsigned char *)page + start, copied);
+            memcpy((unsigned char *)buffer + *bytes_read, page + start, copied);
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
             if (copied && cache_miss && pages[i].cache_miss) *cache_miss=1;
 #endif
@@ -2293,7 +2295,7 @@ static int memory_write_source(struct kernel_vfs_node *node,uint64_t offset,
         count=view.size;
         kernel_vfs_node_lock(node,&io,1);
         void *page;
-        if (physical_page_resolve(allocator,address,&page)) __builtin_trap();
+        if (physical_page_map_owned(allocator,address,&page)) __builtin_trap();
         kernel_vfs_write_source_copy_view(source,(unsigned char *)page+start,&view);
         node->instance->ops->memory_written(node,offset+count);
         kernel_lock_release(&io);
@@ -2370,10 +2372,32 @@ static int vfs_write_source_locked(struct kernel_vfs_file *file,uint64_t offset,
     return result;
 }
 
-int kernel_vfs_pwrite(struct kernel_vfs_file *file,uint64_t offset,
-    const void *buffer,size_t size,size_t *bytes_written)
+void kernel_vfs_write_source_copy_cached(struct kernel_vfs_write_source *source,
+    void *destination,size_t size)
 {
-    if ((!buffer && size) || !bytes_written) return -KERNEL_EINVAL;
+    unsigned char *out=destination;
+    size_t remaining=size;
+    while (remaining) {
+        const struct kernel_page_cache_read_page *page=source->cached;
+        size_t offset=source->cached_offset;
+        if (page->status || offset>=page->valid_bytes) __builtin_trap();
+        size_t n=page->valid_bytes-offset;
+        if (n>remaining) n=remaining;
+        const unsigned char *data=kernel_page_cache_read_data(page);
+        memcpy(out,data+offset,n);
+        out+=n;remaining-=n;
+        if (offset+n==page->valid_bytes) {
+            source->cached++;
+            source->cached_offset=0;
+        } else source->cached_offset=offset+n;
+    }
+    COST_ADD(CACHE_COPY,size);
+}
+
+static int pwrite_source(struct kernel_vfs_file *file,uint64_t offset,
+    struct kernel_vfs_write_source *source,size_t size,size_t *bytes_written)
+{
+    if (!bytes_written) return -KERNEL_EINVAL;
     *bytes_written=0;
     if (!file || file->state!=VFS_FILE_STATE_LIVE || !file->private_data)
         return -KERNEL_EINVAL;
@@ -2381,11 +2405,25 @@ int kernel_vfs_pwrite(struct kernel_vfs_file *file,uint64_t offset,
     kernel_vfs_file_write_lock(file,&operation);
     if ((file->mode&KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFREG) return -KERNEL_EINVAL;
     VFS_TEMPORARY_WRITER(writer,file);
-    struct kernel_vfs_write_source source={.data=buffer};
     size_t written=0;
-    int error=vfs_write_source_locked(file,offset,&source,size,NULL,&written);
+    int error=vfs_write_source_locked(file,offset,source,size,NULL,&written);
     *bytes_written=written;
     return written?0:error;
+}
+
+int kernel_vfs_pwrite(struct kernel_vfs_file *file,uint64_t offset,
+    const void *buffer,size_t size,size_t *bytes_written)
+{
+    if (!buffer && size) return -KERNEL_EINVAL;
+    struct kernel_vfs_write_source source={.data=buffer};
+    return pwrite_source(file,offset,&source,size,bytes_written);
+}
+
+int kernel_vfs_pwrite_cached(struct kernel_vfs_file *file,uint64_t offset,
+    const struct kernel_page_cache_read_page *pages,size_t source_offset,size_t size,size_t *written)
+{
+    struct kernel_vfs_write_source source={.cached=pages,.cached_offset=source_offset};
+    return pwrite_source(file,offset,&source,size,written);
 }
 
 int kernel_vfs_write_user(struct kernel_vfs_file *file,struct kernel_mm *mm,

@@ -966,7 +966,7 @@ static void borrowed_io_page_worker(void *argument)
     uint64_t physical;
     if (physical_page_allocate(test_page_allocator, &physical)) __builtin_trap();
     struct kernel_task_io_buffer borrowed = {0};
-    kernel_task_io_buffer_take_page(&borrowed, test_page_allocator, physical);
+    kernel_task_io_buffer_take_page(&borrowed, test_page_allocator, physical, NULL);
     /* 不返回到调用者，保留仍存活的登记；reap先归还borrow，再释放这个栈。 */
     (void)riscv_interrupt_save();
     kernel_thread_exit();

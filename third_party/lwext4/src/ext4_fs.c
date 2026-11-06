@@ -1578,7 +1578,8 @@ static int ext4_fs_indirect_range(struct ext4_inode_ref *ref,
                 memset(path[at].data, 0, fs->bdev->lg_bsize);
             } else {
                 addresses[at] = block;
-                r = ext4_trans_block_get(fs->bdev, &path[at], block);
+                r = create ? ext4_trans_block_get(fs->bdev, &path[at], block) :
+                    ext4_block_get(fs->bdev, &path[at], block);
                 if (r) goto out;
                 held++;
             }

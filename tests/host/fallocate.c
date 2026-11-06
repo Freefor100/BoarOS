@@ -40,6 +40,13 @@ int __wrap_ext4_xattr_remove(struct ext4_inode_ref *ref,uint8_t index,const char
 }
 static unsigned fail_delayed_allocation;
 static unsigned fail_reservation_allocation;
+static unsigned reservation_extent_queries;
+int __real_ext4_extent_get_range(struct ext4_inode_ref *,ext4_lblk_t,uint32_t,bool,struct ext4_inode_block_range *);
+int __wrap_ext4_extent_get_range(struct ext4_inode_ref *ref,ext4_lblk_t first,uint32_t count,bool create,struct ext4_inode_block_range *range)
+{
+    __atomic_fetch_add(&reservation_extent_queries,1,__ATOMIC_RELAXED);
+    return __real_ext4_extent_get_range(ref,first,count,create,range);
+}
 void *__real_ext4_user_calloc(size_t,size_t);
 void *__wrap_ext4_user_calloc(size_t count,size_t size)
 {
@@ -517,6 +524,27 @@ static void delayed_allocation(struct kernel_page_cache *cache, struct kernel_vf
     assert(!reservation_state_calls && "empty reservation cleanup must not enter mount state");
     assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&file)));
     expect_bytes(&file,bytes,sizeof(bytes));
+    {
+        KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(kernel_vfs_file_node(&file),&io,1);
+        ext4_file *raw=lwext4_node_file(kernel_vfs_file_node(&file));
+        struct file_write_reservation ticket={0};
+        unsigned queries=__atomic_load_n(&reservation_extent_queries,__ATOMIC_RELAXED);
+        assert(!ext4_file_reserve_write(raw,0,1,&done,&ticket) && done==1 && !ticket.owner);
+        assert(__atomic_load_n(&reservation_extent_queries,__ATOMIC_RELAXED)==queries+1);
+        assert(!ext4_file_reserve_write(raw,block/2,1,&done,&ticket) && done==1 && !ticket.owner);
+        assert(__atomic_load_n(&reservation_extent_queries,__ATOMIC_RELAXED)==queries+1 &&
+            fs->delayed_blocks==baseline);
+    }
+    assert(!kernel_vfs_fallocate(&file,KERNEL_VFS_FALLOC_PUNCH_HOLE|KERNEL_VFS_FALLOC_KEEP_SIZE,0,block));
+    {
+        KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(kernel_vfs_file_node(&file),&io,1);
+        ext4_file *raw=lwext4_node_file(kernel_vfs_file_node(&file));
+        struct file_write_reservation ticket={0};
+        assert(!ext4_file_reserve_write(raw,0,1,&done,&ticket) && done==1 && ticket.owner);
+        assert(fs->delayed_blocks==baseline+1);
+        ext4_file_finish_reservation(raw,&ticket,0,0);
+        assert(fs->delayed_blocks==baseline);
+    }
     assert(!kernel_vfs_ftruncate(&file,0));
     assert(!kernel_vfs_pwrite(&file,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
     assert(!kernel_vfs_ftruncate(&file,0));

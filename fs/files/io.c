@@ -6,6 +6,7 @@
 #include "../uaccess_iov_internal.h"
 #include "../../mm/uaccess_internal.h"
 #include "../vfs_internal.h"
+#include "../write_source.h"
 
 #include <kernel/cost.h>
 #include <kernel/credentials.h>
@@ -354,7 +355,7 @@ static enum kernel_files_status disk_read(
     uint64_t position, int advance, int64_t *linux_result
     )
 {
-    struct physical_page_allocator *data_allocator=kernel_open_file_page_cache(description)->allocator;
+    struct kernel_page_cache *cache=kernel_open_file_page_cache(description);
     uint64_t total = 0;
     int error = 0, done = 0;
     enum kernel_files_status status = KERNEL_FILES_STATUS_OK;
@@ -367,7 +368,7 @@ static enum kernel_files_status disk_read(
         struct kernel_page_cache_read_page pages[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
         enum kernel_page_cache_status loaded;
         loaded = kernel_page_cache_get_batch(
-            kernel_open_file_page_cache(description), &description->file,
+            cache, &description->file,
             position >> BOAROS_PAGE_SHIFT, pages, count);
         if (loaded == KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT)
             return KERNEL_FILES_STATUS_STATE;
@@ -381,14 +382,14 @@ static enum kernel_files_status disk_read(
                 error = part->status == KERNEL_PAGE_CACHE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
                 done = 1; break;
             }
-            void *page;
-            if (physical_page_map_owned(data_allocator, part->physical_address, &page)) {
-                status = KERNEL_FILES_STATUS_STATE; done = 1; break;
-            }
+            const unsigned char *page=kernel_page_cache_read_data(part);
             size_t chunk = part->valid_bytes - start, copied = 0;
             if (chunk > request - total) chunk = request - total;
-            enum kernel_uaccess_status access = kernel_copy_to_user_iov_cursor(mm, cursor,&user_copy,
-                (unsigned char *)page + start, chunk, &copied);
+            /* One scalar span has no later page/iovec within this window
+             * that could reuse a retained destination pin. */
+            enum kernel_uaccess_status access = count==1 && cursor->count==1 ?
+                kernel_copy_to_user_iov(mm,cursor,page+start,chunk,&copied) :
+                kernel_copy_to_user_iov_cursor(mm,cursor,&user_copy,page+start,chunk,&copied);
             if (copied > chunk || (advance && kernel_open_file_advance(description, copied))) {
                 status = KERNEL_FILES_STATUS_STATE; done = 1; break;
             }
@@ -409,7 +410,7 @@ static enum kernel_files_status disk_read(
         kernel_open_file_read_progress(description,batch_start,(size_t)(position-batch_start),cache_miss);
         /* 包括错误或user fault之后未消费的成功页；不能靠下一次请求归还。 */
         kernel_uaccess_write_cursor_finish(&user_copy);
-        kernel_page_cache_put_batch(kernel_open_file_page_cache(description), pages, count);
+        kernel_page_cache_put_batch(cache, pages, count);
     }
     if (error) KERNEL_FILES_NOTE(files, read_failures, 1);
     KERNEL_FILES_NOTE(files, bytes_read, total);
@@ -986,8 +987,7 @@ static int description_writable(
 
 static int64_t sendfile_output(struct kernel_open_file_description **output_owner,
                                const void *buffer, size_t size,
-                               uint64_t position, uint64_t deadline, uint32_t socket_flags,
-                               struct kernel_vfs_size_limit *limit, int first)
+                               uint64_t deadline, uint32_t socket_flags)
 {
     struct kernel_open_file_description *output = *output_owner;
     enum kernel_open_file_kind kind = kernel_open_file_kind(output);
@@ -1029,40 +1029,112 @@ static int64_t sendfile_output(struct kernel_open_file_description **output_owne
 
     size_t written = 0;
     int error = 0;
-    if (kind == KERNEL_OPEN_FILE_KIND_REGULAR) {
-        size_t total = 0;
-        /* splice会继续提交未完成的buffer；限额前缀成功后，剩余范围拒绝并产生SIGXFSZ。 */
-        while (total < size) {
-            size_t allowed = size - total;
-            error = kernel_vfs_check_write_limit(limit, position + total, &allowed);
-            if (error) break;
-            if (first && !total) {
-                error = kernel_vfs_file_modified(&output->file, position, 0);
-                if (error) break;
-            }
-            /* 跨输入读取不持目标门闩；pwrite每批自取rank15。 */
-            error = kernel_vfs_pwrite(&output->file, position + total,
-                (const unsigned char *)buffer + total, allowed, &written);
-            if (written > allowed) __builtin_trap();
-            total += written;
-            if (error || written < allowed) break;
-        }
-        return total ? (int64_t)total : error;
-    } else if (output->device && output->device->write) {
+    if (output->device && output->device->write) {
         error = output->device->write(output->device_instance, kernel_task_current(), kernel_open_file_flags(output), buffer, size, &written);
     } else return -KERNEL_EINVAL;
     if (written > size) __builtin_trap();
     return written != 0U ? (int64_t)written : error;
 }
 
-/* 两次后端调用之间不借用源页或目标锁，暂存页只属于当前任务。 */
+static int64_t regular_copy_output(struct kernel_open_file_description *out,
+    const void *buffer,const struct kernel_page_cache_read_page *pages,size_t source_offset,
+    size_t size,uint64_t position,struct kernel_vfs_size_limit *limit,int first)
+{
+    size_t allowed=size,written=0;
+    int error=kernel_vfs_check_write_limit(limit,position,&allowed);
+    if (error) return error;
+    if (first) {
+        error=kernel_vfs_file_modified(&out->file,position,0);
+        if (error) return error;
+    }
+    error=pages?kernel_vfs_pwrite_cached(&out->file,position,pages,source_offset,allowed,&written):
+        kernel_vfs_pwrite(&out->file,position,buffer,allowed,&written);
+    if (written>allowed) __builtin_trap();
+    /* sendfile still attempts the suffix at the size limit after accepting
+     * the permitted prefix; copy_file_range already capped its input. */
+    if (!error && written==allowed && allowed<size) {
+        size_t suffix=size-allowed;
+        (void)kernel_vfs_check_write_limit(limit,position+written,&suffix);
+    }
+    return written?(int64_t)written:error;
+}
+
+/* A source entry borrow pins bytes across the destination write. Neither its
+ * index nor its inode is locked while allocating or waiting on the target. */
+static __attribute__((noinline)) int64_t regular_cached_copy(
+    struct kernel_open_file_description *input,struct kernel_open_file_description *output,
+    struct kernel_page_cache *cache,uint64_t start,uint64_t out_start,uint64_t count,
+    struct kernel_vfs_size_limit *limit)
+{
+    enum { COPY_WINDOW_PAGES=8 };
+    struct kernel_page_cache_read_page pages[COPY_WINDOW_PAGES];
+    uint64_t total=0;
+    int error=0;
+    size_t capacity=COPY_WINDOW_PAGES;
+    while (total<count) {
+        uint64_t position=start+total;
+        size_t offset=position&BOAROS_PAGE_MASK;
+        size_t wanted=capacity*BOAROS_PAGE_SIZE-offset;
+        if (wanted>count-total) wanted=count-total;
+        size_t nr=(offset+wanted+BOAROS_PAGE_MASK)>>BOAROS_PAGE_SHIFT;
+        kernel_open_file_read_begin(input,position);
+        if (kernel_page_cache_get_batch(cache,&input->file,position>>BOAROS_PAGE_SHIFT,pages,nr)
+            ==KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT) __builtin_trap();
+        size_t available=0,within=offset;
+        int miss=0;
+        error=0;
+        for (size_t i=0;i<nr;i++) {
+            const struct kernel_page_cache_read_page *page=&pages[i];
+            if (page->status==KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE) break;
+            if (page->status) {
+                error=page->status==KERNEL_PAGE_CACHE_STATUS_NO_MEMORY?-KERNEL_ENOMEM:-KERNEL_EIO;
+                break;
+            }
+            if (within>=page->valid_bytes) break;
+            size_t n=page->valid_bytes-within;
+            if (n>wanted-available) n=wanted-available;
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+            miss|=page->cache_miss;
+#endif
+            available+=n;within=0;
+            if (available==wanted || page->valid_bytes<BOAROS_PAGE_SIZE) break;
+        }
+        kernel_open_file_read_progress(input,position,available,miss);
+        int64_t sent=available?regular_copy_output(output,NULL,pages,offset,available,
+            out_start+total,limit,total==0):0;
+        kernel_page_cache_put_batch(cache,pages,nr);
+        if (sent<0) { error=(int)sent;break; }
+        total+=(uint64_t)sent;
+        if ((size_t)sent<available) break;
+        /* Only a multi-page read can need the shared batch workspace.
+         * Retry its unread suffix without that allocation under pressure. */
+        if (error==-KERNEL_ENOMEM && nr>1) { capacity=1;continue; }
+        if (available<wanted || error) break;
+    }
+    return total?(int64_t)total:error;
+}
+
+/* Same-inode copies use the established staging semantics; in particular a
+ * sendfile destination may overwrite bytes in its current source page. */
 static int64_t regular_file_copy(struct kernel_mm *mm,
     struct kernel_open_file_description *input,
-    struct kernel_open_file_description **output_owner,
+    struct kernel_open_file_description *output,
     uint64_t start, uint64_t out_start, uint64_t count,
     struct kernel_vfs_size_limit *limit, int sync_each)
 {
-    struct kernel_open_file_description *output = *output_owner;
+    unsigned flags=kernel_open_file_flags(output);
+    int synchronous=!!(flags&KERNEL_FILES_O_DSYNC);
+    int datasync=(flags&KERNEL_FILES_O_SYNC)!=KERNEL_FILES_O_SYNC;
+    struct kernel_page_cache *cache=kernel_open_file_page_cache(input);
+    if (cache && !kernel_open_file_memory_backed(input) &&
+        !kernel_vfs_files_share_node(&input->file,&output->file) && !(sync_each && synchronous)) {
+        int64_t copied=regular_cached_copy(input,output,cache,start,out_start,count,limit);
+        if (copied>0 && synchronous) {
+            int synced=kernel_vfs_sync(&output->file,datasync,&output->observed_writeback_error);
+            if (synced) return synced;
+        }
+        return copied;
+    }
     struct kernel_task_io_buffer buffer = {0};
     uint64_t total = 0;
     int error = 0;
@@ -1073,12 +1145,10 @@ static int64_t regular_file_copy(struct kernel_mm *mm,
         error = kernel_open_file_pread(input, start + total, buffer.data, wanted, &available);
         if (available > wanted) __builtin_trap();
         if (!available) break;
-        int64_t sent = sendfile_output(output_owner, buffer.data, available,
-            out_start + total, 0, 0, limit, total == 0);
+        int64_t sent=regular_copy_output(output,buffer.data,NULL,0,available,out_start+total,limit,total==0);
         if (sent < 0) { error = (int)sent; break; }
         if ((uint64_t)sent > available) __builtin_trap();
-        if (sent && sync_each && (kernel_open_file_flags(output) & KERNEL_FILES_O_DSYNC)) {
-            int datasync = (kernel_open_file_flags(output) & KERNEL_FILES_O_SYNC) != KERNEL_FILES_O_SYNC;
+        if (sent && sync_each && synchronous) {
             int synced = kernel_vfs_sync(&output->file, datasync, &output->observed_writeback_error);
             if (synced) { error = synced; break; }
         }
@@ -1086,8 +1156,7 @@ static int64_t regular_file_copy(struct kernel_mm *mm,
         if ((size_t)sent < available || error) break;
     }
     kernel_task_io_buffer_release(&buffer);
-    if (total && !sync_each && (kernel_open_file_flags(output) & KERNEL_FILES_O_DSYNC)) {
-        int datasync = (kernel_open_file_flags(output) & KERNEL_FILES_O_SYNC) != KERNEL_FILES_O_SYNC;
+    if (total && !sync_each && synchronous) {
         int synced = kernel_vfs_sync(&output->file, datasync, &output->observed_writeback_error);
         if (synced) return synced;
     }
@@ -1138,7 +1207,7 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
     kernel_vfs_file_accessed(&input->file);
     if (count == 0U || start >= kernel_open_file_size(input)) return 0;
     if (output->kind == KERNEL_OPEN_FILE_KIND_REGULAR) {
-        int64_t result = regular_file_copy(mm, input, output_owner, start, out_start, count, &size_limit, 1);
+        int64_t result = regular_file_copy(mm, input, output, start, out_start, count, &size_limit, 1);
         kernel_files_size_limit_notify(&size_limit);
         if (result > 0) {
             if (explicit_offset || output != input) output->offset = out_start + (uint64_t)result;
@@ -1179,6 +1248,7 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
             ? capacity : (size_t)(count - total), available = 0;
         if (direct) {
             uint64_t position=start+total,physical;
+            const void *mapped=NULL;
             size_t offset=position&BOAROS_PAGE_MASK,valid;
             kernel_open_file_read_begin(input,position);
             int memory=kernel_open_file_memory_backed(input);
@@ -1187,12 +1257,14 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
             if (!memory) {
                 struct kernel_page_cache_read_page page = {0};
-                loaded=kernel_page_cache_get_batch(kernel_open_file_page_cache(input),&input->file,
+                struct kernel_page_cache *cache=kernel_open_file_page_cache(input);
+                loaded=kernel_page_cache_get_batch(cache,&input->file,
                     position>>BOAROS_PAGE_SHIFT,&page,1);
                 if (!loaded) {
                     physical=page.physical_address;valid=page.valid_bytes;cache_miss=page.cache_miss;
-                    if (physical_page_acquire(kernel_open_file_page_cache(input)->allocator, physical)) __builtin_trap();
-                    kernel_page_cache_put_batch(kernel_open_file_page_cache(input), &page, 1);
+                    mapped=kernel_page_cache_read_data(&page);
+                    if (physical_page_acquire(cache->allocator, physical)) __builtin_trap();
+                    kernel_page_cache_put_batch(cache, &page, 1);
                 }
             } else
 #endif
@@ -1212,7 +1284,7 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
                 memset(staging,0,available);
             } else if (loaded==KERNEL_PAGE_CACHE_STATUS_OK) {
                 /* 页引用跨目标等待保活；TCP仍COPY进ACK前自有的协议版本。 */
-                kernel_task_io_buffer_take_page(&source_buffer,files->heap->page_allocator,physical);
+                kernel_task_io_buffer_take_page(&source_buffer,files->heap->page_allocator,physical,mapped);
                 if (offset<valid) {
                     available=valid-offset;
                     if (available>wanted) available=wanted;
@@ -1232,8 +1304,7 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
             if (direct && source_buffer.allocator) kernel_task_io_buffer_release(&source_buffer);
             break;
         }
-        int64_t sent = sendfile_output(output_owner, staging, available,
-                                       out_start + total, deadline, socket_flags, &size_limit, total == 0);
+        int64_t sent=sendfile_output(output_owner,staging,available,deadline,socket_flags);
         if (direct) kernel_task_io_buffer_release(&source_buffer);
         if (sent < 0) { error = (int)sent; break; }
         if ((uint64_t)sent > available) __builtin_trap();
@@ -1359,7 +1430,7 @@ static int64_t copy_range_pinned(struct kernel_mm *mm,
     if (count > KERNEL_FILES_MAX_RW_COUNT) count = KERNEL_FILES_MAX_RW_COUNT;
     kernel_open_file_read_begin(input, start);
     kernel_vfs_file_accessed(&input->file);
-    int64_t result = regular_file_copy(mm, input, output_owner, start, out_start, count, &limit, 0);
+    int64_t result = regular_file_copy(mm, input, output, start, out_start, count, &limit, 0);
     kernel_files_size_limit_notify(&limit);
     if (result > 0) {
         position_in = (int64_t)(start + (uint64_t)result);

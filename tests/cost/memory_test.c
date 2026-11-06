@@ -54,6 +54,20 @@ void kernel_mm_unpin_user_page(struct kernel_mm_user_pin *pin)
     assert(!physical_page_release(pin->mm->allocator, pin->physical_address));
     *pin = (struct kernel_mm_user_pin){0};
 }
+enum kernel_mm_status kernel_mm_pin_user_pair(const struct kernel_mm *mm,
+    uint64_t first,uint64_t second,uint32_t access,struct kernel_mm_user_pin pins[2],unsigned *count)
+{
+    *count=0;
+    enum kernel_mm_status status=kernel_mm_pin_user_page(mm,first,access,pins);
+    if (status) return status;
+    *count=kernel_mm_pin_user_page(mm,second,access,pins+1)?1:2;
+    return KERNEL_MM_STATUS_OK;
+}
+void kernel_mm_unpin_user_pair(struct kernel_mm_user_pin pins[2])
+{
+    kernel_mm_unpin_user_page(pins+1);
+    kernel_mm_unpin_user_page(pins);
+}
 static char snapshot[1048576];
 static void expect(const char *name,unsigned value,unsigned samples,unsigned maximum)
 {

@@ -102,6 +102,14 @@ enum kernel_mm_status kernel_mm_pin_user_page(const struct kernel_mm *mm,
 { (void)mm; (void)address; (void)access; (void)pin; excluded(); return KERNEL_MM_STATUS_STATE; }
 void kernel_mm_unpin_user_page(struct kernel_mm_user_pin *pin)
 { (void)pin; excluded(); }
+enum kernel_uaccess_status kernel_uaccess_pin_user_pair(struct kernel_mm *mm,
+    uint64_t first,uint64_t second,uint32_t access,struct kernel_mm_user_pin pins[2],unsigned *count)
+{ (void)mm; (void)first; (void)second; (void)access; (void)pins; (void)count; excluded(); return KERNEL_UACCESS_STATUS_STATE; }
+enum kernel_mm_status kernel_mm_pin_user_pair(const struct kernel_mm *mm,
+    uint64_t first,uint64_t second,uint32_t access,struct kernel_mm_user_pin pins[2],unsigned *count)
+{ (void)mm; (void)first; (void)second; (void)access; (void)pins; (void)count; excluded(); return KERNEL_MM_STATUS_STATE; }
+void kernel_mm_unpin_user_pair(struct kernel_mm_user_pin pins[2])
+{ (void)pins; excluded(); }
 #endif
 #ifndef MADVISE_REMOVE_CASES
 EXCLUDED(kernel_shm_attachment_close)

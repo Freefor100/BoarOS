@@ -9,6 +9,9 @@
 enum kernel_uaccess_status kernel_uaccess_pin_user_page(
     struct kernel_mm *, uint64_t address, uint32_t access,
     struct kernel_mm_user_pin *);
+enum kernel_uaccess_status kernel_uaccess_pin_user_pair(
+    struct kernel_mm *, uint64_t first,uint64_t second,uint32_t access,
+    struct kernel_mm_user_pin pins[2],unsigned *count);
 
 /* 同一批已取得的数据片段共用当前用户页；换页前先归还，fault不持旧pin。
  * cursor不可复制，调用者必须在下一次存储等待和退出前finish。 */

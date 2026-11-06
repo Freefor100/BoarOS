@@ -18,6 +18,11 @@ enum kernel_uaccess_status kernel_uaccess_pin_user_page(struct kernel_mm *mm,
 { (void)mm; (void)address; (void)access; (void)pin; __builtin_trap(); }
 void kernel_mm_unpin_user_page(struct kernel_mm_user_pin *pin)
 { (void)pin; __builtin_trap(); }
+enum kernel_uaccess_status kernel_uaccess_pin_user_pair(struct kernel_mm *mm,
+    uint64_t first,uint64_t second,uint32_t access,struct kernel_mm_user_pin pins[2],unsigned *count)
+{ (void)mm; (void)first; (void)second; (void)access; (void)pins; (void)count; __builtin_trap(); }
+void kernel_mm_unpin_user_pair(struct kernel_mm_user_pin pins[2])
+{ (void)pins; __builtin_trap(); }
 static unsigned char pool[16*1024*1024] __attribute__((aligned(16384)));
 static struct physical_page_allocator pages;
 static struct kernel_heap heap;

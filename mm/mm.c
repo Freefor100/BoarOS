@@ -197,12 +197,14 @@ static inline uint32_t pin_count_add(uint64_t *count)
     return (uint32_t)(*count)++;
 #endif
 }
-static inline uint64_t pin_count_sub(uint64_t *count)
+static inline uint64_t pin_count_sub(uint64_t *count,unsigned amount)
 {
 #if BOAROS_MAX_CPUS > 1
-    return __atomic_fetch_sub(count, 1U, __ATOMIC_RELEASE);
+    return __atomic_fetch_sub(count, amount, __ATOMIC_RELEASE);
 #else
-    return (*count)--;
+    uint64_t previous=*count;
+    *count-=amount;
+    return previous;
 #endif
 }
 static int pin_admission_closed(const struct kernel_mm_record *record)
@@ -2246,14 +2248,19 @@ static __attribute__((always_inline)) inline enum kernel_mm_status pin_mapping(c
     return KERNEL_MM_STATUS_OK;
 }
 
-enum kernel_mm_status kernel_mm_pin_user_page(const struct kernel_mm *mm,
-    uint64_t address, uint32_t access, struct kernel_mm_user_pin *pin)
+static inline enum kernel_mm_status pin_user_prefix(const struct kernel_mm *mm,
+    uint64_t address,uint64_t second,uint32_t access,struct kernel_mm_user_pin *pin,
+    unsigned *count)
 {
     struct kernel_mm_record *record;
     if (!mm || !pin || !access ||
         (access & ~(KERNEL_MM_READ | KERNEL_MM_WRITE | KERNEL_MM_EXECUTE)))
         return KERNEL_MM_STATUS_INVALID_ARGUMENT;
     if (pin->registration) __builtin_trap();
+    if (count) {
+        if (pin[1].registration) __builtin_trap();
+        *count=0;
+    }
     if (mm->state != KERNEL_MM_LIVE) return KERNEL_MM_STATUS_STATE;
     enum kernel_mm_status status = resolve_record(mm, &record);
     if (status != KERNEL_MM_STATUS_OK) return status;
@@ -2266,34 +2273,60 @@ retry:
         wait_pin_condition(record, 0);
         goto retry;
     }
-    return pin_mapping(mm,record,address,access,pin,(access & KERNEL_MM_WRITE)!=0);
+    status=pin_mapping(mm,record,address,access,pin,(access & KERNEL_MM_WRITE)!=0);
+    if (status || !count) return status;
+    *count=1;
+    /* The metadata qualification still fixes both mappings. The first pin
+     * is live, so resolving or waiting for the second would deadlock an editor. */
+    status=pin_mapping(mm,record,second,access,&pin[1],(access & KERNEL_MM_WRITE)!=0);
+    if (!status) *count=2;
+    else if (status!=KERNEL_MM_STATUS_NOT_MAPPED && status!=KERNEL_MM_STATUS_ACCESS &&
+             status!=KERNEL_MM_STATUS_ADDRESS_SPACE) __builtin_trap();
+    return KERNEL_MM_STATUS_OK;
 }
 
+enum kernel_mm_status kernel_mm_pin_user_page(const struct kernel_mm *mm,
+    uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin)
+{ return pin_user_prefix(mm,address,0,access,pin,NULL); }
 
-void kernel_mm_unpin_user_page(struct kernel_mm_user_pin *pin)
+enum kernel_mm_status kernel_mm_pin_user_pair(const struct kernel_mm *mm,
+    uint64_t first,uint64_t second,uint32_t access,struct kernel_mm_user_pin pins[2],unsigned *count)
 {
-    if (!pin || pin->registration != pin ||
-        pin->owner != kernel_io_context_current() || !pin->mm ||
-        pin->mm->state != KERNEL_MM_LIVE || !pin->record ||
-        !pin->owner_previous || *pin->owner_previous != pin)
+    if (!count || (first>>BOAROS_PAGE_SHIFT)==(second>>BOAROS_PAGE_SHIFT))
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    return pin_user_prefix(mm,first,second,access,pins,count);
+}
+
+static inline void unpin_user_pages(struct kernel_mm_user_pin *pins,unsigned count)
+{
+    if (!pins || !pins[0].mm || pins[0].mm->state!=KERNEL_MM_LIVE || !pins[0].record)
         __builtin_trap();
+    const struct kernel_mm *mm=pins[0].mm;
+    struct kernel_io_context *owner=kernel_io_context_current();
     /* caller保留LIVE句柄直到本函数返回；计数归零后record仍有实际MM owner。 */
-    struct kernel_mm_record *record=pin->record;
+    struct kernel_mm_record *record=pins[0].record;
     int wake;
     {
 #if BOAROS_MAX_CPUS == 1
         /* UP没有并行归还；仅此无调用片段禁止中断抢占，计数无需原子RMW。 */
         KERNEL_IRQ_SCOPE(irq);
 #endif
-        *pin->owner_previous = pin->owner_next;
-        if (pin->owner_next) pin->owner_next->owner_previous=pin->owner_previous;
+        unsigned writes=0;
+        for (unsigned i=count;i>0;) {
+            struct kernel_mm_user_pin *pin=&pins[--i];
+            if (pin->registration!=pin || pin->owner!=owner || pin->mm!=mm ||
+                pin->record!=record || !pin->owner_previous || *pin->owner_previous!=pin)
+                __builtin_trap();
+            *pin->owner_previous=pin->owner_next;
+            if (pin->owner_next) pin->owner_next->owner_previous=pin->owner_previous;
+            writes+=!!(pin->access&KERNEL_MM_WRITE);
+        }
         uint64_t last_write = 0;
-        if (pin->access & KERNEL_MM_WRITE) last_write = pin_count_sub(&record->write_pins);
+        if (writes) last_write=pin_count_sub(&record->write_pins,writes);
         /* 全部access归零也必须意味着该writer的write计数已归还。 */
-        uint64_t last_access = pin_count_sub(&record->access_pins);
-        if (!(uint32_t)last_access ||
-            ((pin->access & KERNEL_MM_WRITE) && !(uint32_t)last_write)) __builtin_trap();
-        wake = last_access == (MM_PIN_CLOSED | 1U) || last_write == (MM_PIN_CLOSED | 1U);
+        uint64_t last_access=pin_count_sub(&record->access_pins,count);
+        if ((uint32_t)last_access<count || (uint32_t)last_write<writes) __builtin_trap();
+        wake=last_access==(MM_PIN_CLOSED|count) || (writes && last_write==(MM_PIN_CLOSED|writes));
     }
     if (wake) {
         /* 若drainer先看见旧计数，它必在此资格前完成wait_prepare；若先看见
@@ -2302,12 +2335,24 @@ void kernel_mm_unpin_user_page(struct kernel_mm_user_pin *pin)
     }
     /* The pin owns this reference independently of the current PTE. Drain
      * waits for completed access; allocator return needs no MM qualification. */
-    if (physical_page_release(pin->mm->allocator, pin->physical_address) !=
-        PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
-    if (pin->cache_write.entry) kernel_page_cache_write_end(&pin->cache_write);
-    *pin=(struct kernel_mm_user_pin){0};
+    if (count==1) {
+        if (physical_page_release(mm->allocator,pins[0].physical_address)) __builtin_trap();
+    } else {
+        const uint64_t physical[]={pins[0].physical_address,pins[1].physical_address};
+        physical_page_release_batch(mm->allocator,physical,2);
+    }
+    for (unsigned i=count;i>0;) {
+        struct kernel_mm_user_pin *pin=&pins[--i];
+        if (pin->cache_write.entry) kernel_page_cache_write_end(&pin->cache_write);
+        *pin=(struct kernel_mm_user_pin){0};
+    }
     if (wake) wake_pin_waiters(record);
 }
+
+void kernel_mm_unpin_user_page(struct kernel_mm_user_pin *pin)
+{ unpin_user_pages(pin,1); }
+void kernel_mm_unpin_user_pair(struct kernel_mm_user_pin pins[2])
+{ unpin_user_pages(pins,2); }
 
 enum kernel_mm_status kernel_mm_vma_enable(
     struct kernel_mm *mm,
