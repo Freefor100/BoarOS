@@ -296,6 +296,9 @@ struct kernel_thread_join {
 enum kernel_scheduler_status kernel_thread_create_joinable(
     void (*entry)(void *), void *argument, struct kernel_thread_join *join);
 #if BOAROS_MAX_CPUS > 1
+/* CPU0 owns creation and join; a regular worker runs on the selected CPU. */
+enum kernel_scheduler_status kernel_thread_create_joinable_worker(
+    void (*entry)(void *), void *argument, struct kernel_thread_join *join, unsigned cpu);
 /* CPU0创建并持有join；仅显式受控任务可改变mask，且必须已阻塞/off_cpu。 */
 enum kernel_scheduler_status kernel_thread_create_joinable_mask(
     void (*entry)(void *), void *argument, struct kernel_thread_join *join, uint32_t mask);

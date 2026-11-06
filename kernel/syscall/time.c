@@ -348,7 +348,6 @@ enum kernel_syscall_status syscall_handle_restart_syscall(
         if(decoded->value!=-KERNEL_ERESTARTSYS)kernel_signal_clear_syscall_restart(caller);
         return status;
     }
-    KERNEL_SERVICE_SCOPE(service);
     if (deadline == 0U ||
         (int64_t)(arch_time_read() - deadline) >= 0) {
         kernel_signal_clear_syscall_restart(caller);
@@ -410,8 +409,9 @@ enum kernel_syscall_status syscall_handle_restart_syscall(
 /*
  * Shared core of nanosleep(101) and clock_nanosleep(115).  The requested
  * point is normalized to the monotonic domain, the sleep blocks on the
- * timer deadline, and a signal wake records an internal restart until the
- * common user-return path selects handler EINTR or no-handler restart.
+ * timer deadline on the calling CPU, and a signal wake records an internal
+ * restart until the common user-return path selects handler EINTR or
+ * no-handler restart. Deadline publication notifies CPU0 to rearm its timer.
  */
 enum kernel_syscall_status syscall_handle_sleep_for(
     struct kernel_task *caller,
@@ -422,7 +422,6 @@ enum kernel_syscall_status syscall_handle_sleep_for(
     struct kernel_syscall_result *decoded)
 {
     int cpu_clock=clock_id==2U||(int32_t)clock_id<0;
-    KERNEL_SERVICE_SCOPE_IF(service,!cpu_clock);
     struct kernel_mm *mm;
     struct linux_timespec request_spec;
     enum kernel_task_status task_status;

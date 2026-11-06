@@ -60,6 +60,7 @@ struct kernel_scheduler {
 #endif
 #if BOAROS_USER_SMP
     struct kernel_sched_runqueue rt_services;
+    uint32_t pullable_rt_cpus;
 #endif
     struct kernel_rt_configuration rt_configuration;
     struct kernel_task *exited_head;

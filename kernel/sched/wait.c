@@ -251,20 +251,22 @@ void kernel_wait_backend_notify(struct kernel_task *task, uint32_t reason)
 void kernel_wait_backend_ready(struct kernel_task *task)
 {
 #if BOAROS_USER_SMP
-    if (!kernel_raw_lock_owned(&kernel_wait_domain)) {
-        scheduler_ready_local_locked(task,task->cpu);
+    struct kernel_cpu *cpu=task->cpu;
+    if (cpu && kernel_raw_lock_owned(kernel_run_lock(cpu)) && scheduler_local_task(task,cpu)) {
+        scheduler_ready_local_locked(task,cpu);
         return;
     }
 #endif
     ready_enqueue_locked(task, task->wait.ready_flags);
 }
 #if BOAROS_USER_SMP
-int kernel_wait_backend_lock_local(const struct kernel_wait_token *token,struct kernel_raw_guard *run)
+int kernel_wait_backend_lock_local(const struct kernel_wait_token *token,struct kernel_raw_guard *run,int domain)
 {
     struct kernel_task *task=token->task;
     struct kernel_cpu *cpu=__atomic_load_n(&task->cpu,__ATOMIC_ACQUIRE);
     if (!cpu) return -1;
-    kernel_raw_lock_acquire(kernel_run_lock(cpu),run);
+    struct kernel_raw_lock *lock=kernel_run_lock(cpu);
+    if (!domain || !kernel_raw_lock_owned(lock)) kernel_raw_lock_acquire(lock,run);
     /* 改归属后不能用原核的队列锁保护；慢路径重查代次和实际资格。 */
     int result=-1;
     if (__atomic_load_n(&task->cpu,__ATOMIC_RELAXED)==cpu) {
@@ -272,9 +274,9 @@ int kernel_wait_backend_lock_local(const struct kernel_wait_token *token,struct 
         unsigned phase=(unsigned)(state&3U);
         if ((state>>5)!=token->generation || phase==KERNEL_WAIT_FINISHED || phase==KERNEL_WAIT_NOTIFIED) result=0;
         else if (phase==KERNEL_WAIT_COMMITTED && task->state==KERNEL_THREAD_STATE_BLOCKED &&
-            !task->wait.deadline && scheduler_local_task(task,cpu)) return 1;
+            (domain || !task->wait.deadline) && scheduler_local_task(task,cpu)) return 1;
     }
-    kernel_raw_lock_release(run);
+    if (run->lock) kernel_raw_lock_release(run);
     return result;
 }
 #endif

@@ -255,6 +255,44 @@ static struct kernel_io_context *protocol_owner;
 static struct kernel_mutex protocol_mutex;
 static unsigned protocol_mutex_initialized;
 
+static struct kernel_io_context *protocol_current_owner(void)
+{
+    return __atomic_load_n(&protocol_owner, __ATOMIC_RELAXED);
+}
+
+static inline int protocol_lock(struct kernel_socket_protocol_scope *scope, int try_only)
+{
+    struct kernel_io_context *owner = kernel_io_context_current();
+    if (protocol_current_owner() == owner) {
+        if (!protocol_depth || protocol_depth == UINT32_MAX) __builtin_trap();
+        /* 外层mutex随任务保活；抢占者不能改变深度，嵌套借用保留当前IRQ状态。 */
+        scope->outer = 0;
+        protocol_depth++;
+        return 1;
+    }
+    scope->interrupts=arch_interrupt_save();
+    scope->guard=(struct kernel_lock_guard){0};
+    if (!__atomic_load_n(&protocol_mutex_initialized, __ATOMIC_RELAXED)) {
+        /* 首次入口在 CPU0；远端只在看见发布后进入。 */
+        kernel_mutex_init(&protocol_mutex, 25, (uintptr_t)&protocol_mutex);
+        __atomic_store_n(&protocol_mutex_initialized, 1, __ATOMIC_RELEASE);
+    }
+    /* 竞争者的 guard 留在自己的调用栈；mutex 可调度等待其他协议 owner。 */
+    if (try_only) {
+        if (!kernel_mutex_try_lock(&protocol_mutex, &scope->guard)) return 0;
+    } else kernel_mutex_lock(&protocol_mutex, &scope->guard);
+    if (protocol_depth || protocol_current_owner()) __builtin_trap();
+    scope->outer = 1;
+    __atomic_store_n(&protocol_owner, owner, __ATOMIC_RELAXED);
+    if (owner->allocation_depth == UINT32_MAX) __builtin_trap();
+    owner->allocation_depth++;
+    protocol_depth = 1;
+    /* 协议内部允许定时器抢占；任何 raw 临界区都不能越过这个入口。 */
+    kernel_assert_can_block();
+    arch_interrupt_restore(ARCH_INTERRUPT_ENABLE_MASK);
+    return 1;
+}
+
 static int protocol_enter(struct kernel_socket_protocol_scope *scope, int try_only, int local_only)
 {
 #if BOAROS_USER_SMP
@@ -271,56 +309,31 @@ static int protocol_enter(struct kernel_socket_protocol_scope *scope, int try_on
 #endif
 #endif
     kernel_assert_service_context();
-    struct kernel_io_context *owner = kernel_io_context_current();
-    if (protocol_owner == owner) {
-        if (!protocol_depth || protocol_depth == UINT32_MAX) __builtin_trap();
-        /* 外层mutex随任务保活；抢占者不能改变深度，嵌套借用保留当前IRQ状态。 */
-        scope->outer = 0;
-        protocol_depth++;
-        return 1;
-    }
-    scope->interrupts=arch_interrupt_save();
-    scope->guard=(struct kernel_lock_guard){0};
-    if (!protocol_mutex_initialized) {
-        kernel_mutex_init(&protocol_mutex, 25, (uintptr_t)&protocol_mutex);
-        protocol_mutex_initialized = 1;
-    }
-    /* 竞争者的 guard 留在自己的调用栈；mutex 可调度等待其他协议 owner。 */
-    if (try_only) {
-        if (!kernel_mutex_try_lock(&protocol_mutex, &scope->guard)) {
+    int entered=protocol_lock(scope,try_only);
+    if (!entered) {
 #if BOAROS_USER_SMP
-            kernel_service_scope_end(&scope->service);
+        kernel_service_scope_end(&scope->service);
 #endif
-            arch_interrupt_restore(scope->interrupts);
-            return 0;
-        }
-    } else kernel_mutex_lock(&protocol_mutex, &scope->guard);
-    if (protocol_depth || protocol_owner) __builtin_trap();
-    scope->outer = 1;
-    protocol_owner = owner;
-    if (owner->allocation_depth == UINT32_MAX) __builtin_trap();
-    owner->allocation_depth++;
-    protocol_depth = 1;
-    /* 协议内部允许定时器抢占；任何 raw 临界区都不能越过这个入口。 */
-    kernel_assert_can_block();
-    arch_interrupt_restore(ARCH_INTERRUPT_ENABLE_MASK);
-    return 1;
+        arch_interrupt_restore(scope->interrupts);
+    }
+    return entered;
 }
 void kernel_socket_protocol_enter(struct kernel_socket_protocol_scope *scope)
 { (void)protocol_enter(scope, 0, 0); }
 void kernel_socket_protocol_leave(struct kernel_socket_protocol_scope *scope)
 {
     if (!scope->outer) {
-        if (protocol_depth <= 1 || protocol_owner != kernel_io_context_current()) __builtin_trap();
+        if (protocol_depth <= 1 || protocol_current_owner() != kernel_io_context_current()) __builtin_trap();
         protocol_depth--;
         return;
     }
     (void)arch_interrupt_save();
-    if (protocol_depth != 1 || protocol_owner != kernel_io_context_current() ||
-        !protocol_owner->allocation_depth) __builtin_trap();
+    struct kernel_io_context *owner=protocol_current_owner();
+    if (protocol_depth != 1 || owner != kernel_io_context_current() ||
+        !owner->allocation_depth) __builtin_trap();
     protocol_depth = 0;
-    protocol_owner->allocation_depth--;
-    protocol_owner = 0;
+    owner->allocation_depth--;
+    __atomic_store_n(&protocol_owner, 0, __ATOMIC_RELAXED);
     kernel_lock_release(&scope->guard);
 #if BOAROS_USER_SMP
     /* 先归还协议owner，再允许恢复用户CPU资格；不能带mutex等待迁移。 */
@@ -344,10 +357,7 @@ static void socket_work_ready_locked(void)
 }
 static int caller_owns_protocol(void)
 {
-#if BOAROS_MAX_CPUS > 1
-    if(kernel_cpu_current()->logical_id)return 0;
-#endif
-    return protocol_owner==kernel_io_context_current() && protocol_depth;
+    return protocol_current_owner()==kernel_io_context_current() && protocol_depth;
 }
 
 static void work_remove(struct socket_work_queue *queue, struct kernel_socket *socket)
@@ -373,15 +383,18 @@ static void work_add_locked(struct socket_work_queue *queue, struct kernel_socke
     else queue->head = socket;
     queue->tail = socket;
 }
-static void socket_schedule(struct kernel_socket *socket, unsigned flags)
+static void socket_schedule_locked(struct kernel_socket *socket, unsigned flags)
 {
-    SOCKET_STATE(irq);
-    if (socket->destroying || socket->domain != KERNEL_SOCKET_DOMAIN_INET) { socket_state_release(&irq); return; }
+    if (socket->destroying || socket->domain != KERNEL_SOCKET_DOMAIN_INET) return;
     socket->work_flags |= flags;
     unsigned queued = socket->work_links[ready_work.slot].queued;
     work_add_locked(&ready_work, socket, 0);
     if (!queued) socket_work_ready_locked();
-    socket_state_release(&irq);
+}
+static void socket_schedule(struct kernel_socket *socket, unsigned flags)
+{
+    SOCKET_STATE(state);
+    socket_schedule_locked(socket, flags);
 }
 static void socket_pool_wait(struct kernel_socket *socket)
 {
@@ -406,7 +419,7 @@ static void protocol_work_ready(void)
 static void protocol_capacity(int pool)
 {
     if (pool != -1 && pool != MEMP_TCP_SEG && pool != MEMP_PBUF && pool != MEMP_PBUF_POOL) return;
-    /* 协议池及其等待链归CPU0协议owner；只在实际有等待者时触碰
+    /* 协议池及其等待链归协议 owner；只在实际有等待者时触碰
      * 跨核端点状态与worker通知存储，真实归还仍逐次推进代次。 */
     pool_generation++;
     if(pool_wait.head) {SOCKET_STATE(state);socket_work_ready_locked();}
@@ -2986,13 +2999,13 @@ static int stream_copy_owned(struct kernel_socket_write_request *request,
     return result;
 }
 
-static void stream_commit_owned(struct kernel_socket_write_request **requests, unsigned count)
+static void stream_commit_owned(struct kernel_socket_write_request **requests, unsigned count, int defer_output)
 {
     COST_SCOPE(execution, NETWORK_PROTOCOL_EXEC_TICKS);
     struct kernel_socket *socket=requests[0]->socket;
     uint32_t reserved=0;
     int flush=0;
-    /* 预约在输出前仍计入远端可接纳额度；CPU0 读实际 PCB 额度时，
+    /* 预约在输出前仍计入远端可接纳额度；协议 owner 读实际 PCB 额度时，
      * 已处理请求的预约不再重复扣减。 */
     for(unsigned i=0;i<count;i++) {
         struct kernel_socket_write_request *request=requests[i];
@@ -3002,7 +3015,7 @@ static void stream_commit_owned(struct kernel_socket_write_request **requests, u
         request->result=stream_copy_owned(request,reserved,&flush);
         reserved+=request->reserved;
     }
-    if(flush)tcp_flush_output(socket);
+    if(flush && !defer_output)tcp_flush_output(socket);
     SOCKET_STATE(endpoint);
     uint32_t previous=tcp_admission_capacity_locked(socket);
     tcp_publish_capacity_locked(socket);
@@ -3015,12 +3028,13 @@ static void stream_commit_owned(struct kernel_socket_write_request **requests, u
     }
     /* COPY 消耗与预约归还共同决定额度变化，只有净增加才唤醒额度等待者。 */
     if(tcp_admission_capacity_locked(socket)>previous)socket_state_notify(&socket->wait);
+    if(flush && defer_output)socket_schedule_locked(socket,SOCKET_WORK_OUTPUT);
 }
 
 static int execute_protocol_request(struct kernel_socket_write_request *request)
 {
     if(request->operation==SOCKET_PROTOCOL_STREAM) {
-        stream_commit_owned(&request,1);
+        stream_commit_owned(&request,1,0);
         return request->result;
     }
     COST_SCOPE(execution, NETWORK_PROTOCOL_EXEC_TICKS);
@@ -3052,6 +3066,27 @@ static int protocol_request(struct kernel_socket_write_request *request,enum soc
 {
     request->operation=operation;
     struct kernel_socket_protocol_scope protocol;
+#if BOAROS_MAX_CPUS > 1
+    if (operation==SOCKET_PROTOCOL_STREAM && kernel_cpu_current()->logical_id &&
+        __atomic_load_n(&protocol_mutex_initialized,__ATOMIC_ACQUIRE)) {
+#if BOAROS_USER_SMP
+        protocol.service=(struct kernel_service_scope){0};
+#endif
+        if (protocol_lock(&protocol,1)) {
+            int admit;
+            /* 已排队的同流写入不能被越过。COPY 不进入网卡或输入路径；
+             * 仅把需要的输出交给原 worker，发送者无须等它返还源码页。 */
+            { SOCKET_STATE(state);admit=network_work_queue && !network_stopping &&
+                                        !request->socket->writes_head; }
+            if (admit) {
+                stream_commit_owned(&request,1,1);
+                request->segments=0;
+            }
+            kernel_socket_protocol_leave(&protocol);
+            if (admit) return request->result;
+        } else arch_interrupt_restore(protocol.interrupts);
+    }
+#endif
     if(protocol_enter(&protocol,network_work_queue!=0,1)) {
         int result;
         {SOCKET_STATE(state);result=network_stopping && operation<SOCKET_PROTOCOL_DISPOSE?-KERNEL_EIO:0;}
@@ -3472,7 +3507,7 @@ static int capacity_ready(const struct socket_work_queue *queue, uint64_t genera
 
 int kernel_socket_work_pending(void)
 {
-    if (protocol_owner != kernel_io_context_current() || !protocol_depth) __builtin_trap();
+    if (protocol_current_owner() != kernel_io_context_current() || !protocol_depth) __builtin_trap();
     if (!socket_initialized) return 0;
     int timer_ready=sys_timeouts_sleeptime()==0;
     SOCKET_STATE(state);
@@ -3516,7 +3551,7 @@ static unsigned service_ready_socket(unsigned budget)
      * 避免旧标记把新请求仍可合批的IO_MORE前缀提前送入协议。 */
     if ((flags & SOCKET_WORK_OUTPUT) && !socket->listening)tcp_flush_output(socket);
     if(count && requests[0]->operation==SOCKET_PROTOCOL_STREAM && !stopping) {
-        stream_commit_owned(requests,count);
+        stream_commit_owned(requests,count,0);
         return count;
     }
     struct kernel_socket_write_request *request=count?requests[0]:NULL;
@@ -3585,7 +3620,7 @@ struct kernel_socket_service_result kernel_socket_service_owned(const struct ker
     unsigned visits=0;
     if (polling_snapshot) COST_ADD(NETWORK_POLL_SERVICES, 1);
 #endif
-    if (!scope->outer || protocol_owner != kernel_io_context_current() || protocol_depth != 1) __builtin_trap();
+    if (!scope->outer || protocol_current_owner() != kernel_io_context_current() || protocol_depth != 1) __builtin_trap();
     if (!socket_initialized) return result;
     COST_ADD(NETWORK_SERVICE_CALLS, 1);
     service_loopback(&result, budget.packets);
@@ -3622,7 +3657,7 @@ struct kernel_socket_service_result kernel_socket_service_owned(const struct ker
 
 struct kernel_socket_service_result kernel_socket_service_pending(struct kernel_socket_service_budget budget)
 {
-    if (protocol_owner == kernel_io_context_current()) return (struct kernel_socket_service_result){0};
+    if (protocol_current_owner() == kernel_io_context_current()) return (struct kernel_socket_service_result){0};
     struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
     struct kernel_socket_service_result result = kernel_socket_service_owned(&scope, budget);
     kernel_socket_protocol_leave(&scope);

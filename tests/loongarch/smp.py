@@ -104,7 +104,8 @@ def main():
         passed=passed and all(raw.count(marker)==1 for marker in (
             'LA SMP reciprocal masked-IRQ TLB acknowledgements PASS',
             'LA SMP last-target TLB acknowledgement PASS',
-            'LA SMP late-IPI TLB generation reuse PASS'))
+            'LA SMP late-IPI TLB generation reuse PASS',
+            'LA SMP ordinary IPI does not scan fences PASS'))
     if passed and not a.expect_failure:
         with (out/'fsck.log').open('w') as log:passed=subprocess.run(['e2fsck','-fn',disk],stdout=log,stderr=subprocess.STDOUT).returncode==0
         if passed:disk.unlink()

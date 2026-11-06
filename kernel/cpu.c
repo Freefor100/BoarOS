@@ -1,6 +1,10 @@
 #include <kernel/cpu.h>
 #include <kernel/raw_lock.h>
 
+#if BOAROS_MAX_CPUS > 1
+static unsigned boot_count;
+#endif
+
 #if BOAROS_USER_SMP
 #include <kernel/wait_internal.h>
 
@@ -18,23 +22,23 @@ void kernel_run_set_acquire(struct kernel_run_set *set)
 {
     if (!kernel_raw_lock_owned(&kernel_wait_domain)) __builtin_trap();
     if (run_guards[0].lock) return;
-    for (unsigned i=0;i<BOAROS_MAX_CPUS;i++)
+    unsigned count=__atomic_load_n(&boot_count,__ATOMIC_ACQUIRE);
+    /* Before topology publication the bootstrap/model may still use all slots. */
+    if (!count) count=BOAROS_MAX_CPUS;
+    for (unsigned i=0;i<count;i++)
         kernel_raw_lock_acquire(&run_locks[i].lock,&run_guards[i]);
-    set->held=1;
+    set->held=count;
 }
 
 void kernel_run_set_release(struct kernel_run_set *set)
 {
     if (!set->held) return;
-    for (unsigned i=BOAROS_MAX_CPUS;i;)
+    for (unsigned i=set->held;i;)
         kernel_raw_lock_release(&run_guards[--i]);
     set->held=0;
 }
 #endif
 
-#if BOAROS_MAX_CPUS > 1
-static unsigned boot_count;
-#endif
 void kernel_cpu_set_boot_count(unsigned count)
 {
     if (!count || count > BOAROS_MAX_CPUS) __builtin_trap();

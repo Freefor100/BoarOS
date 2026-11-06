@@ -293,6 +293,9 @@ int kernel_wait_notify_locked(const struct kernel_wait_token *token,uint32_t rea
 int kernel_wait_notify_locked(const struct kernel_wait_token *token,uint32_t reason)
 {
     if (token && token->task && kernel_wait_record_phase(kernel_wait_record_of(token->task))==KERNEL_WAIT_COMMITTED) {
+        struct kernel_raw_guard run __attribute__((cleanup(kernel_raw_scope_release)))={0};
+        int local=kernel_wait_backend_lock_local(token,&run,1);
+        if (local>=0) return local ? notify_locked(token,reason) : 0;
         KERNEL_RUN_SET(runs);
         return notify_locked(token,reason);
     }
@@ -318,7 +321,7 @@ static int notify_token(const struct kernel_wait_token *token,uint32_t reason)
 #if BOAROS_USER_SMP
     struct kernel_raw_guard guard __attribute__((cleanup(kernel_raw_scope_release)))={0};
     if ((state&3U)==KERNEL_WAIT_COMMITTED) {
-        int result=kernel_wait_backend_lock_local(token,&guard);
+        int result=kernel_wait_backend_lock_local(token,&guard,0);
         if (result>0) return notify_locked(token,reason);
         if (!result) return 0;
     }

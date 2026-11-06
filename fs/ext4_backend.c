@@ -5,6 +5,7 @@
 #include "record_lock.h"
 
 #include <kernel/cost.h>
+#include <kernel/cpu.h>
 #include <kernel/block.h>
 #include <kernel/errno.h>
 #include <kernel/file_mapping.h>
@@ -1359,12 +1360,35 @@ static int start_journal_workers(struct kernel_vfs_mount *mount)
         if (result != EOK) return lwext4_error(result);
     }
     enum kernel_scheduler_status status = KERNEL_SCHEDULER_STATUS_OK;
+#if BOAROS_USER_SMP
+    unsigned checkpoint_cpu = 0, commit_cpu = 0;
+    unsigned cpus = kernel_cpu_get_boot_count();
+    if (adapter->device.fs->jbd_journal && cpus > 1) {
+        /* Keep checkpoint off the device IRQ CPU. Spread mounts over the
+         * secondary CPUs and separate commit and checkpoint when possible. */
+        checkpoint_cpu = 1 + (mount->id - 1) % (cpus - 1);
+        if (cpus > 2) commit_cpu = 1 + checkpoint_cpu % (cpus - 1);
+    }
+#endif
     if (!adapter->journal_started && adapter->device.fs->jbd_journal) {
+#if BOAROS_USER_SMP
+        if (checkpoint_cpu)
+            status = kernel_thread_create_joinable_worker(journal_checkpoint_worker,
+                adapter, &adapter->checkpoint_worker, checkpoint_cpu);
+        else
+#endif
         status = kernel_thread_create_joinable(journal_checkpoint_worker, adapter, &adapter->checkpoint_worker);
         if (status == KERNEL_SCHEDULER_STATUS_OK) adapter->checkpoint_started = 1;
     }
-    if (!adapter->journal_started && status == KERNEL_SCHEDULER_STATUS_OK)
+    if (!adapter->journal_started && status == KERNEL_SCHEDULER_STATUS_OK) {
+#if BOAROS_USER_SMP
+        if (commit_cpu)
+            status = kernel_thread_create_joinable_worker(journal_worker,
+                adapter, &adapter->journal_worker, commit_cpu);
+        else
+#endif
         status = kernel_thread_create_joinable(journal_worker, adapter, &adapter->journal_worker);
+    }
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         if (adapter->checkpoint_started) {
             journal_stop_workers(adapter);

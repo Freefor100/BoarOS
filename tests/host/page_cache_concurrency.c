@@ -66,6 +66,7 @@ static _Thread_local unsigned admission_client;
 static struct { unsigned before_registration, entered, resume, parked, done; int result; } admission_credit;
 static _Thread_local unsigned progress_writeback_caller;
 static unsigned progress_writeback_waiting;
+static struct { unsigned observing, registered, armed, entered, resume, done; } writeback_wake;
 static uint64_t age_clock_offset,age_deadlines[2];
 static struct kernel_wait_token age_tokens[2];
 uint64_t __real_kernel_time_monotonic_ns(void);
@@ -369,7 +370,15 @@ enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue
         __atomic_store_n(&load_registration_entered, 1, __ATOMIC_RELEASE);
         while (!__atomic_load_n(&load_registration_resume, __ATOMIC_ACQUIRE)) sched_yield();
     }
+    int writeback_wait = __atomic_load_n(&writeback_wake.observing,__ATOMIC_ACQUIRE) &&
+        kernel_page_cache_is_executor(current_cache);
+    if (writeback_wait && __atomic_exchange_n(&writeback_wake.armed,0,__ATOMIC_ACQ_REL)) {
+        assert(!kernel_cpu_current()->raw_locks);
+        __atomic_store_n(&writeback_wake.entered,1,__ATOMIC_RELEASE);
+        wait_progress(&writeback_wake.resume,1);
+    }
     enum kernel_scheduler_status status=__real_kernel_wait_prepare(queue,deadline,interruptible,token);
+    if (!status && writeback_wait) __atomic_store_n(&writeback_wake.registered,1,__ATOMIC_RELEASE);
     if (!status && fixed_target_client && journal_wait_owner && queue==&journal_wait_owner->journal_progress)
         __atomic_store_n(&fixed_target_waiting,1,__ATOMIC_RELEASE);
     if (!status && progress_writeback_caller && queue) __atomic_store_n(&progress_writeback_waiting,1,__ATOMIC_RELEASE);
@@ -1169,6 +1178,42 @@ static void wait_writeback_round(struct kernel_page_cache *cache, uint64_t befor
         assert(!clock_gettime(CLOCK_MONOTONIC,&now) && now.tv_sec-start.tv_sec<5);
         sched_yield();
     }
+}
+
+static void *writeback_pressure_wait(void *argument)
+{
+    struct kernel_page_cache *cache=argument;
+    cache_test_attach(10);
+    progress_writeback_caller=1;
+    cache->allocator->reclaim_hooks.wait(cache->allocator->reclaim_hooks.context);
+    progress_writeback_caller=0;
+    __atomic_store_n(&writeback_wake.done,1,__ATOMIC_RELEASE);
+    return NULL;
+}
+
+static void writeback_registration_wake(struct kernel_page_cache *cache)
+{
+    current_cache=cache;
+    __atomic_store_n(&writeback_wake.observing,1,__ATOMIC_RELEASE);
+    assert(!kernel_page_cache_start_worker(cache));
+    wait_progress(&writeback_wake.registered,1);
+    __atomic_store_n(&writeback_wake.armed,1,__ATOMIC_RELEASE);
+    assert(!kernel_page_cache_request_writeback(cache));
+    wait_progress(&writeback_wake.entered,1);
+    /* The worker saw no work but has not registered its wait. Pressure now
+     * publishes a new round and enters its own wait on that worker. */
+    pthread_t publisher;
+    assert(!pthread_create(&publisher,NULL,writeback_pressure_wait,cache));
+    wait_progress(&progress_writeback_waiting,1);
+    assert(!__atomic_load_n(&writeback_wake.done,__ATOMIC_ACQUIRE));
+    __atomic_store_n(&writeback_wake.resume,1,__ATOMIC_RELEASE);
+    wait_progress(&writeback_wake.done,1);
+    assert(!pthread_join(publisher,NULL));
+    __atomic_store_n(&writeback_wake.observing,0,__ATOMIC_RELEASE);
+    kernel_page_cache_stop_worker(cache);
+    assert(!kernel_page_cache_destroy(cache));
+    current_cache=NULL;
+    puts("PASS writeback request published before worker registration completes pressure round");
 }
 
 static void writeback_error_publication(struct kernel_page_cache *cache,
@@ -3647,6 +3692,7 @@ int main(int argc, char **argv)
     assert(kernel_page_cache_init(&cache, &heap, &pages) ==
         KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT);
     if (argc==3) {
+        if (!strcmp(argv[2],"writeback-wake")) {writeback_registration_wake(&cache);goto owners;}
         if (!strcmp(argv[2],"read-borrow-retire")) {read_borrow_retirement(&cache,argv[1]);goto owners;}
         if (!strcmp(argv[2],"snapshot-copy")) {snapshot_copy_case(&cache,argv[1]);goto owners;}
         if (!strcmp(argv[2],"admission-credit")) {admission_credit_case(&cache,argv[1]);goto owners;}

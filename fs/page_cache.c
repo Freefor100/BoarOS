@@ -3870,7 +3870,7 @@ static void page_cache_worker(void *argument)
     for (;;) {
         struct cache_request *request = 0;
         struct kernel_wait_token token = {0};
-        int cleanup = 0, stopping=0;
+        int cleanup = 0, stopping=0, park=1;
         {
             CACHE_SCOPE(check, cache);
             stopping=r->stopping;
@@ -3899,6 +3899,13 @@ static void page_cache_worker(void *argument)
                 }
 #endif
                 if (kernel_wait_prepare(&r->work,deadline,0,&token)) __builtin_trap();
+                /* Pressure publishers do not take the cache mutex. With the
+                 * group lock, either we see their request or they see the
+                 * registration before testing for an empty wait queue. */
+#if BOAROS_MAX_CPUS > 1
+                KERNEL_RAW_SCOPE(group,&r->group->metadata);
+#endif
+                park=!r->requested;
             }
         }
         if (!request) {
@@ -3911,7 +3918,7 @@ static void page_cache_worker(void *argument)
                 continue;
             }
             enum kernel_wait_wake_reason reason;
-            if (kernel_wait_park(&token, &reason) || kernel_wait_finish(&token)) __builtin_trap();
+            if ((park && kernel_wait_park(&token, &reason)) || kernel_wait_finish(&token)) __builtin_trap();
             continue;
         }
         enum kernel_page_cache_status result = KERNEL_PAGE_CACHE_STATUS_STATE;
