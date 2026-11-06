@@ -59,7 +59,9 @@ typedef enum kernel_block_status (*kernel_block_write_batch_prio_fn)(
 
 /* Restartable immutable producer for one journal I/O phase. context is stable
  * across independent cursor traversals. The owner has
- * already established disjoint disk ranges. Each span is sector aligned. */
+ * already established disjoint disk ranges. Each yielded span is nonempty and sector aligned.
+ * The driver may advance it under its request lock: each step only reads
+ * stable descriptor memory, without allocation, waiting or side effects. */
 typedef int (*kernel_block_phase_next_fn)(const void *context, const void **cursor,
     struct kernel_block_span *span);
 typedef enum kernel_block_status (*kernel_block_write_phase_fn)(void *context,
@@ -187,8 +189,9 @@ enum kernel_block_status kernel_block_write_batch_prio(
 
 /* Internal journal phase: preflight the entire restartable producer before
  * publishing I/O. Payloads and producer nodes remain stable until return,
- * including on errors. Transfer ownership is returned between drained windows
- * of at most 32 spans/128 KiB; flush/configuration wait for the entire call.
+ * including on errors. Streaming drivers consume the full producer under shared
+ * transfer ownership; synchronous backends receive drained windows of at most
+ * 32 spans/128 KiB. Flush/configuration wait for the entire call.
  * Unlike write_batch, disjointness is established by the
  * journal's block ownership/indexes; this interface validates alignment,
  * capacity and RAM bounds. A missing callback writes in producer order. */

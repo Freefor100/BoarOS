@@ -42,6 +42,8 @@
 #include <ext4_debug.h>
 
 #include <ext4_fs.h>
+#include <ext4_balloc.h>
+#include <ext4_block_group.h>
 #include <ext4_orphan.h>
 #include <ext4_super.h>
 #include <ext4_journal.h>
@@ -73,6 +75,15 @@ static void jbd_state_leave(struct jbd_state_guard *guard)
     struct jbd_state_guard state_guard __attribute__((cleanup(jbd_state_leave))) = jbd_state_enter(journal)
 #define JBD_STATE_READ_SCOPE(journal) \
     struct jbd_state_guard state_guard __attribute__((cleanup(jbd_state_leave))) = jbd_state_read_enter(journal)
+
+/* Private physical claims exclude allocators through the same interval index
+ * as checkpoint quarantine. They never become part of a durable group. */
+struct jbd_allocation_group {
+    struct jbd_allocation_group *next;
+    struct jbd_buf *descriptor, *bitmap;
+    struct jbd_quarantine_list ranges;
+    uint32_t group, descriptor_offset, count;
+};
 
 /* A version owns both its image and the shared home-buffer budget pin. */
 static struct jbd_image *jbd_version(struct jbd_journal *journal, struct ext4_buf *buf)
@@ -1568,7 +1579,6 @@ int jbd_journal_start(struct jbd_fs *jbd_fs,
 
 	TAILQ_INIT(&journal->cp_queue);
 	RB_INIT(&journal->block_rec_root);
-	RB_INIT(&journal->sources);
 	journal->jbd_fs = jbd_fs;
     TAILQ_INIT(&journal->sealed_queue);
     r = jbd_prepare_session_storage(journal);
@@ -1869,14 +1879,6 @@ static struct jbd_data *jbd_trans_find_data(struct jbd_trans *trans, ext4_fsblk_
 	return RB_FIND(jbd_data_tree, &trans->data_root, &key);
 }
 
-struct jbd_source {
-    struct file_data_source owner;
-    struct jbd_memory *memory;
-    size_t blocks;
-    uint32_t references;
-    RB_ENTRY(jbd_source) node;
-};
-
 bool jbd_journal_borrow_data(struct ext4_fs *fs, ext4_fsblk_t lba,
     struct jbd_data_borrow *borrow)
 {
@@ -1902,17 +1904,10 @@ bool jbd_journal_borrow_data(struct ext4_fs *fs, ext4_fsblk_t lba,
         ext4_block_payload_get(borrow->payload);
     } else {
         borrow->source = data->source;
-        if (!borrow->source || __atomic_fetch_add(&borrow->source->references, 1, __ATOMIC_ACQ_REL) == UINT32_MAX)
-            __builtin_trap();
+        if (!borrow->source) __builtin_trap();
+        jbd_source_get(borrow->source);
     }
     return true;
-}
-static void jbd_source_put(struct jbd_source *source)
-{
-    if (__atomic_sub_fetch(&source->references, 1, __ATOMIC_ACQ_REL)) return;
-    source->owner.release(source->owner.context);
-    jbd_memory_release_borrow(source->memory, source->owner.bytes);
-    jbd_free(source);
 }
 void jbd_journal_release_borrow(struct jbd_data_borrow *borrow)
 {
@@ -1921,61 +1916,21 @@ void jbd_journal_release_borrow(struct jbd_data_borrow *borrow)
     *borrow = (struct jbd_data_borrow){0};
 }
 
-static int jbd_source_cmp(struct jbd_source *a, struct jbd_source *b)
+static void jbd_data_release_source(struct jbd_data *data)
 {
-	uintptr_t first = (uintptr_t)a->owner.context, second = (uintptr_t)b->owner.context;
-	return first < second ? -1 : first > second;
-}
-RB_GENERATE_INTERNAL(jbd_source_tree, jbd_source, node, jbd_source_cmp, static inline)
-
-static int jbd_source_borrow(struct jbd_journal *journal,
-	const struct file_data_source *owner, struct jbd_source **out)
-{
-    JBD_STATE_SCOPE(journal);
-	struct jbd_source key = { .owner.context = owner->context };
-	struct jbd_source *source = RB_FIND(jbd_source_tree, &journal->sources, &key);
-	if (source) {
-		if (source->owner.retain != owner->retain || source->owner.release != owner->release ||
-		    source->owner.bytes != owner->bytes) return EINVAL;
-		if (!source->blocks || source->blocks == SIZE_MAX) __builtin_trap();
-		source->blocks++;
-        if (__atomic_fetch_add(&source->references, 1, __ATOMIC_ACQ_REL) == UINT32_MAX) __builtin_trap();
-	} else {
-		size_t control = jbd_allocation_charge(sizeof(*source));
-        if (owner->bytes > SIZE_MAX - control || !jbd_memory_borrow(journal, owner->bytes)) return ENOMEM;
-        source = jbd_alloc(journal, sizeof(*source));
-        if (!source) { jbd_memory_release_borrow(journal->memory, owner->bytes); return ENOMEM; }
-		source->owner = *owner;
-        source->blocks = 1;
-        source->references = 1;
-        source->memory = journal->memory;
-        owner->retain(owner->context);
-		if (RB_INSERT(jbd_source_tree, &journal->sources, source)) __builtin_trap();
-	}
-	*out = source;
-	return EOK;
+    struct jbd_source *source=data->source;
+    data->source=NULL;
+    if (source) jbd_source_put(source);
 }
 
-static void jbd_data_release_source(struct jbd_journal *journal, struct jbd_data *data)
+static void jbd_data_free(struct jbd_data *data)
 {
-    struct jbd_source *source;
-    {
-        JBD_STATE_SCOPE(journal);
-        source = data->source;
-        if (!source) return;
-        data->source = NULL;
-        if (!source->blocks) __builtin_trap();
-        if (!--source->blocks) RB_REMOVE(jbd_source_tree, &journal->sources, source);
-    }
-    jbd_source_put(source);
+    jbd_data_release_source(data);
+    jbd_image_free(data->image);
+    jbd_free(data);
 }
 
-static void jbd_data_free(struct jbd_journal *journal, struct jbd_data *data)
-{
-	jbd_data_release_source(journal, data);
-	jbd_image_free(data->image);
-	jbd_free(data);
-}
+enum { JBD_METADATA_NONE, JBD_METADATA_CHECK, JBD_METADATA_FLUSH };
 
 int jbd_trans_write_data(struct jbd_trans *trans, ext4_fsblk_t lba,
 	uint32_t offset, const void *input, uint32_t length, bool initialize,
@@ -1990,34 +1945,45 @@ int jbd_trans_write_data(struct jbd_trans *trans, ext4_fsblk_t lba,
 	if (offset > journal->block_size || length > journal->block_size - offset)
 		return EINVAL;
 	if (!length) return EOK;
+	bool whole=!offset && length==journal->block_size;
+	bool stable=whole && input && source && source->retain && source->release;
+	if (stable && source->bytes<length) return EINVAL;
 	struct jbd_data *data = jbd_trans_find_data(trans, lba);
 	bool fresh = !data;
 	if (fresh) {
 		data = jbd_alloc(journal, sizeof(*data));
 		if (!data) return ENOMEM;
 		data->block.lb_id = lba;
-		/* Reusing a metadata block must first finish its older checkpoint;
-		 * replay of that incarnation is excluded by this operation's revoke. */
-		int r = EOK;
-        bool prior_metadata;
-        {
-            JBD_STATE_SCOPE(journal);
-            struct jbd_block_rec *rec = jbd_trans_block_rec_lookup(journal, lba);
-            prior_metadata = rec && rec->trans;
-            if (prior_metadata) r = rec->trans == trans ? EINVAL : jbd_trans_revoke_block(trans, lba);
-        }
-        if (!r && prior_metadata) r = ext4_block_flush_lba(bdev, lba);
-		if (r) { jbd_free(data); return r; }
+		if (journal->grouped && stable) {
+			/* No home read or write is needed for this private payload.
+			 * Check old metadata ownership once per operation at prepare. */
+			data->metadata_check=JBD_METADATA_CHECK;
+		} else {
+			/* An old metadata incarnation must finish its checkpoint
+			 * before this path can assemble data from the home block. */
+			int r=EOK;
+			bool prior_metadata;
+			{
+				JBD_STATE_SCOPE(journal);
+				struct jbd_block_rec *rec=jbd_trans_block_rec_lookup(journal,lba);
+				prior_metadata=rec && rec->trans;
+				if (prior_metadata) r=rec->trans==trans?EINVAL:jbd_trans_revoke_block(trans,lba);
+			}
+			if (!r && prior_metadata) r=ext4_block_flush_lba(bdev,lba);
+			if (r) {jbd_free(data);return r;}
+		}
 	}
 	int r = EOK;
-	bool whole = !offset && length == journal->block_size;
-	if (whole && input && source && source->retain && source->release) {
-		if (source->bytes < length) { r = EINVAL; goto Failed; }
+	if (stable) {
 		struct jbd_source *borrow;
 		r = jbd_source_borrow(journal, source, &borrow);
 		if (r != EOK) goto Failed;
-		jbd_data_release_source(journal, data);
-		jbd_image_free(data->image); data->image = NULL;
+		/* A fresh zeroed record owns no old source or image. Do not
+		 * re-enter journal STATE for each newly ordered data block. */
+		if (!fresh) {
+			jbd_data_release_source(data);
+			jbd_image_free(data->image); data->image = NULL;
+		}
 		data->source = borrow;
 		data->block.data = (void *)input;
 	} else {
@@ -2035,7 +2001,7 @@ int jbd_trans_write_data(struct jbd_trans *trans, ext4_fsblk_t lba,
 		}
 		if (input) memcpy((uint8_t *)image->data + offset, input, length);
 		else memset((uint8_t *)image->data + offset, 0, length);
-		jbd_data_release_source(journal, data);
+		if (!fresh) jbd_data_release_source(data);
 		data->image = image;
 		data->block.data = image->data;
 	}
@@ -2050,16 +2016,32 @@ Failed:
 	return r;
 }
 
-static void jbd_trans_release_data(struct jbd_trans *trans, bool abort __unused)
+static struct jbd_data *jbd_trans_detach_data(struct jbd_trans *trans)
 {
-	struct jbd_data *data;
-	while ((data = TAILQ_FIRST(&trans->data_queue))) {
-		TAILQ_REMOVE(&trans->data_queue, data, node);
-		RB_REMOVE(jbd_data_tree, &trans->data_root, data);
-		if (!trans->ordered_count) __builtin_trap();
-		trans->ordered_count--;
-		jbd_data_free(trans->journal, data);
-	}
+    struct jbd_data *first=TAILQ_FIRST(&trans->data_queue);
+    if (!!first!=!!trans->ordered_count || !!first!=!RB_EMPTY(&trans->data_root)) __builtin_trap();
+    TAILQ_INIT(&trans->data_queue);
+    RB_INIT(&trans->data_root);
+    return first;
+}
+
+static void jbd_release_detached_data(struct jbd_data *data,unsigned count)
+{
+    while (data) {
+        struct jbd_data *next=TAILQ_NEXT(data,node);
+        if (!count--) __builtin_trap();
+        jbd_data_free(data);
+        data=next;
+    }
+    if (count) __builtin_trap();
+}
+
+static void jbd_trans_release_data(struct jbd_trans *trans)
+{
+    struct jbd_data *data=jbd_trans_detach_data(trans);
+    unsigned count=trans->ordered_count;
+    trans->ordered_count=0;
+    jbd_release_detached_data(data,count);
 }
 
 static int jbd_trans_write_ordered(struct jbd_trans *trans)
@@ -2321,6 +2303,58 @@ int jbd_trans_get_write_access_range(struct jbd_trans *trans,
 int jbd_trans_get_write_access(struct jbd_trans *trans, struct ext4_block *block)
 { return jbd_trans_get_write_access_range(trans, block, 0, trans->journal->block_size); }
 
+static void jbd_discard_allocation_claims(struct jbd_trans *trans)
+{
+    struct jbd_allocation_group *group;
+    while ((group=trans->allocation_groups)) {
+        struct jbd_quarantine *range;
+        while ((range=LIST_FIRST(&group->ranges))) {
+            if (!range->allocation || range->owner!=trans) __builtin_trap();
+            LIST_REMOVE(range,node);
+            RB_REMOVE(jbd_quarantine_tree,&trans->journal->quarantine_index[0],range);
+            jbd_free(range);
+        }
+        trans->allocation_groups=group->next;
+        jbd_free(group);
+    }
+}
+
+static int jbd_claim_versions(struct jbd_trans *trans,bool apply)
+{
+    struct ext4_fs *fs=trans->operation.fs;
+    struct ext4_sblock *sb=ext4_fs_super(fs);
+    uint32_t size=ext4_sb_get_desc_size(sb);
+    for (struct jbd_allocation_group *group=trans->allocation_groups;group;group=group->next) {
+        struct jbd_buf *descriptor=group->descriptor,*bitmap=group->bitmap;
+        uint8_t *slice=(uint8_t *)descriptor->after->data+group->descriptor_offset;
+        struct ext4_bgroup *bg=(void *)slice;
+        if (!descriptor->modified || !bitmap->modified) __builtin_trap();
+        if (!apply) {
+            /* Rebase exactly the typed records; generic edits to a different
+             * descriptor in the same GDT block still get conflict checking. */
+            memcpy(slice,descriptor->block.buf->data+group->descriptor_offset,size);
+            memcpy(bitmap->after->data,bitmap->block.buf->data,trans->journal->block_size);
+            continue;
+        }
+        uint32_t free=ext4_bg_get_free_blocks_count(bg,sb);
+        if (free<group->count || ext4_bg_has_flag(bg,EXT4_BLOCK_GROUP_BLOCK_UNINIT))
+            return EUCLEAN;
+        void *bytes=bitmap->after->data;
+        struct jbd_quarantine *range;
+        LIST_FOREACH(range,&group->ranges,node) {
+            uint32_t bit=ext4_fs_addr_to_idx_bg(sb,range->first);
+            for (uint32_t i=0;i<range->count;i++) {
+                if (!ext4_bmap_is_bit_clr(bytes,bit+i)) return EUCLEAN;
+                ext4_bmap_bit_set(bytes,bit+i);
+            }
+        }
+        ext4_bg_set_free_blocks_count(bg,sb,free-group->count);
+        ext4_balloc_set_bitmap_csum(sb,bg,bytes);
+        ext4_fs_update_bg_csum(sb,group->group,bg);
+    }
+    return EOK;
+}
+
 /* All records and credits were reserved before publication. Validate the full
  * operation before publishing any home block; unrelated accepted bytes are
  * retained when separate records share one physical block. */
@@ -2340,6 +2374,7 @@ static int jbd_publish_private(struct jbd_trans *trans)
         size_t offset = EXT4_SUPERBLOCK_OFFSET % journal->block_size;
         memcpy((uint8_t *)super->after->data + offset, &merged, sizeof(merged));
     }
+    if (trans->allocation_groups) (void)jbd_claim_versions(trans,false);
     TAILQ_FOREACH(jb, &trans->buf_queue, buf_node) {
         if (!jb->private_access || !jb->modified) continue;
         const uint8_t *base = jbd_before_data(jb), *next = jb->after->data;
@@ -2371,6 +2406,10 @@ static int jbd_publish_private(struct jbd_trans *trans)
                 if (current[i] != base[i] && current[i] != next[i]) return EAGAIN;
         }
     }
+    if (trans->allocation_groups) {
+        int result=jbd_claim_versions(trans,true);
+        if (result) return result;
+    }
     TAILQ_FOREACH(jb, &trans->buf_queue, buf_node) {
         if (!jb->private_access || !jb->modified) continue;
         struct ext4_block_payload *current = jb->block.buf->current_payload;
@@ -2384,8 +2423,10 @@ static int jbd_publish_private(struct jbd_trans *trans)
                 current->data + first * 32U, (unit - first) * 32U);
         }
         jbd_image_free(jb->before); jb->before = NULL;
-        struct jbd_block_rec *rec = jbd_trans_block_rec_lookup(journal, jb->block.lb_id);
-        if (jb->block_rec && jb->block_rec != rec) __builtin_trap();
+        /* The prepare borrow prevents removal. Only an unindexed candidate
+         * needs to check whether another operation published first. */
+        struct jbd_block_rec *rec=jb->block_rec;
+        if (!rec) rec=jbd_trans_block_rec_lookup(journal,jb->block.lb_id);
         if (rec) { jbd_free(jb->reserved_rec); jbd_trans_change_ownership(rec, trans); }
         else {
             rec = jb->reserved_rec;
@@ -2408,6 +2449,7 @@ static int jbd_publish_private(struct jbd_trans *trans)
         jb->private_access = false;
         ext4_bcache_set_dirty(jb->block.buf);
     }
+    jbd_discard_allocation_claims(trans);
     return EOK;
 }
 
@@ -2481,7 +2523,7 @@ void jbd_journal_free_trans_state_held(struct jbd_journal *journal,
 	struct jbd_block_rec *block_rec, *tmp3;
 	struct ext4_fs *fs = journal->jbd_fs->inode_ref.fs;
 	jbd_release_prepared(trans);
-	jbd_trans_release_data(trans, abort);
+	jbd_trans_release_data(trans);
 	TAILQ_FOREACH_SAFE(jbd_buf, &trans->buf_queue, buf_node,
 			  tmp) {
         if (jbd_buf->private_access) {
@@ -2518,6 +2560,7 @@ void jbd_journal_free_trans_state_held(struct jbd_journal *journal,
 		jbd_trans_remove_block_rec(journal, block_rec, trans);
 	}
 
+	jbd_discard_allocation_claims(trans);
 	struct jbd_quarantine *q;
 	while ((q = LIST_FIRST(&trans->quarantine))) {
 		if (q->owner != trans) __builtin_trap();
@@ -2848,7 +2891,7 @@ static int __jbd_journal_commit_trans(struct jbd_journal *journal,
 	}
 
 	TAILQ_INSERT_TAIL(&journal->cp_queue, trans, trans_node);
-	jbd_trans_release_data(trans, false);
+	jbd_trans_release_data(trans);
 	jbd_journal_cp_trans(journal, trans);
 	return jbd_journal_error(journal);
 Finish:
@@ -2901,15 +2944,47 @@ int jbd_trans_prepare_operation(struct jbd_trans *trans)
         RB_EMPTY(&trans->revoke_root)) return EOK;
     bool serial_writer = ext4_fs_serial_writer(journal->jbd_fs->inode_ref.fs);
     struct jbd_buf *jb;
-    int result;
+    struct jbd_data *data;
+    int result=EOK;
+    bool checked_ordered=false;
     for (;;) {
-        uint32_t start;
+        uint32_t start=0;
+        bool flush=false;
+        result=EOK;
         {
             JBD_STATE_SCOPE(journal);
-            TAILQ_FOREACH(jb, &trans->buf_queue, buf_node)
-                if (!jb->block_rec) jb->block_rec = jbd_borrow_block_rec(journal, jb->block.lb_id);
-            result = jbd_reserve_logs(trans, serial_writer);
-            start = journal->start;
+            if (!checked_ordered) {
+                TAILQ_FOREACH(data,&trans->data_queue,node) {
+                    if (data->metadata_check!=JBD_METADATA_CHECK) continue;
+                    struct jbd_block_rec *rec=jbd_trans_block_rec_lookup(journal,data->block.lb_id);
+                    if (rec && rec->trans) {
+                        if (rec->trans==trans) {result=EINVAL;break;}
+                        data->metadata_check=JBD_METADATA_FLUSH;
+                        flush=true;
+                    } else data->metadata_check=JBD_METADATA_NONE;
+                }
+                checked_ordered=true;
+            }
+            if (!result && !flush) {
+                TAILQ_FOREACH(jb,&trans->buf_queue,buf_node)
+                    if (!jb->block_rec) jb->block_rec=jbd_borrow_block_rec(journal,jb->block.lb_id);
+                result=jbd_reserve_logs(trans,serial_writer);
+                start=journal->start;
+            }
+        }
+        if (result && result!=ENOSPC) break;
+        if (flush) {
+            TAILQ_FOREACH(data,&trans->data_queue,node) {
+                if (data->metadata_check!=JBD_METADATA_FLUSH) continue;
+                /* Only LBA survives unlock. Reserve log space after adding
+                 * the revoke, and finish the old home write before accept. */
+                result=jbd_trans_revoke_block(trans,data->block.lb_id);
+                if (!result) result=ext4_block_flush_lba(journal->jbd_fs->bdev,data->block.lb_id);
+                if (result) break;
+                data->metadata_check=JBD_METADATA_NONE;
+            }
+            if (result) break;
+            continue;
         }
         if (result != ENOSPC || journal->grouped || TAILQ_EMPTY(&journal->cp_queue)) break;
         /* Immediate writers previously reclaimed a full ring while encoding.
@@ -2968,7 +3043,7 @@ static void jbd_quarantine_accept(struct jbd_journal *journal,
         struct jbd_quarantine *after = RB_NEXT(jbd_quarantine_tree, index, q);
         RB_REMOVE(jbd_quarantine_tree, index, q);
         q->owner = group;
-        while (before && before->owner == group &&
+        while (before && !before->allocation && before->owner == group &&
             before->first + before->count == q->first &&
             before->count <= UINT32_MAX - q->count) {
             struct jbd_quarantine *old = before;
@@ -2977,7 +3052,7 @@ static void jbd_quarantine_accept(struct jbd_journal *journal,
             RB_REMOVE(jbd_quarantine_tree, index, old);
             LIST_REMOVE(old, node); jbd_free(old);
         }
-        while (after && after->owner == group &&
+        while (after && !after->allocation && after->owner == group &&
             q->first + q->count == after->first &&
             after->count <= UINT32_MAX - q->count) {
             struct jbd_quarantine *old = after;
@@ -3072,7 +3147,7 @@ int jbd_journal_accept_state_held(struct jbd_journal *journal, struct jbd_trans 
 			if (old) {
 				TAILQ_REMOVE(&running->data_queue, old, node);
 				RB_REMOVE(jbd_data_tree, &running->data_root, old);
-				jbd_data_free(journal, old);
+				jbd_data_free(old);
 			} else running->ordered_count++;
 			RB_INSERT(jbd_data_tree, &running->data_root, data);
 			TAILQ_INSERT_TAIL(&running->data_queue, data, node);
@@ -3245,7 +3320,7 @@ int jbd_journal_checkpoint(struct jbd_journal *journal)
 
 static void jbd_group_release(struct jbd_journal *journal, struct jbd_trans *trans)
 {
-	jbd_trans_release_data(trans, false);
+	if (trans->ordered_count) __builtin_trap();
 	struct jbd_buf *jb;
 	while ((jb = TAILQ_FIRST(&trans->buf_queue))) {
 		struct ext4_buf *buf = jb->block.buf;
@@ -3266,55 +3341,71 @@ static void jbd_group_release(struct jbd_journal *journal, struct jbd_trans *tra
 	jbd_journal_free_trans_state_held(journal, trans, false);
 }
 
-int jbd_journal_retire_stage(struct jbd_journal *journal,
-	enum jbd_journal_stage stage, int error)
+static void jbd_checkpoint_retire_state_held(struct jbd_journal *journal)
 {
-    JBD_STATE_SCOPE(journal);
-	struct jbd_trans *trans = stage == JBD_JOURNAL_COMMIT ? journal->committing : journal->checkpointing;
-	if (!trans) return error;
-	if (error) {
-		if (!jbd_journal_error(journal)) {
-			journal->failed_trans = trans;
-			__atomic_store_n(&journal->error,error,__ATOMIC_RELEASE);
-		}
-		/* DMA has stopped, but live readers still own the accepted file
-		 * contents. The failed mount keeps these versions and later groups. */
-		return jbd_journal_error(journal);
-	}
-	/* A failure in the other consumer leaves this completed owner's recovery
-	 * and live-read references intact as well. No lane can recycle the log. */
-	if (jbd_journal_error(journal)) return jbd_journal_error(journal);
-	if (stage == JBD_JOURNAL_COMMIT) {
-		/* commit 屏障成功即形成恢复依据；home owner 继续归 checkpoint 队列。 */
-		journal->committed_id = trans->trans_id;
-		journal->durable_sequence = trans->sequence;
-		ext4_fs_retire_inode_goals(journal->jbd_fs->inode_ref.fs, journal->durable_sequence);
-		journal->committing = NULL;
-		jbd_release_prepared(trans);
-		/* ordered data 已到 home 持久边界，checkpoint 只再写 metadata。 */
-		jbd_trans_release_data(trans, false);
-		TAILQ_INSERT_TAIL(&journal->cp_queue, trans, trans_node);
-		journal->checkpoint_count++;
-		return EOK;
-	}
-	struct jbd_trans *last = journal->checkpoint_last;
-	journal->checkpoint_sequence = last->sequence;
-	journal->start = last->start_iblock + last->alloc_blocks;
-	wrap(&journal->jbd_fs->sb, journal->start);
-	journal->trans_id = last->trans_id + 1;
-	jbd_journal_write_sb(journal);
-	journal->jbd_fs->dirty = false;
-	for (;;) {
-		trans = TAILQ_FIRST(&journal->cp_queue);
-		bool done = trans == last;
-		TAILQ_REMOVE(&journal->cp_queue, trans, trans_node);
-		journal->checkpoint_count--;
-		jbd_group_release(journal, trans);
-		if (done) break;
-	}
-	journal->checkpoint_io = NULL;
-	journal->checkpointing = journal->checkpoint_last = NULL;
-	return EOK;
+    struct jbd_trans *last=journal->checkpoint_last;
+    journal->checkpoint_sequence=last->sequence;
+    journal->start=last->start_iblock+last->alloc_blocks;
+    wrap(&journal->jbd_fs->sb,journal->start);
+    journal->trans_id=last->trans_id+1;
+    jbd_journal_write_sb(journal);
+    journal->jbd_fs->dirty=false;
+    for (;;) {
+        struct jbd_trans *trans=TAILQ_FIRST(&journal->cp_queue);
+        bool done=trans==last;
+        TAILQ_REMOVE(&journal->cp_queue,trans,trans_node);
+        journal->checkpoint_count--;
+        jbd_group_release(journal,trans);
+        if (done) break;
+    }
+    journal->checkpoint_io=NULL;
+    journal->checkpointing=journal->checkpoint_last=NULL;
+}
+
+int jbd_journal_retire_stage(struct jbd_journal *journal,
+    enum jbd_journal_stage stage,int error)
+{
+    struct jbd_trans *trans;
+    struct jbd_data *detached;
+    unsigned count;
+    {
+        JBD_STATE_SCOPE(journal);
+        trans=stage==JBD_JOURNAL_COMMIT?journal->committing:journal->checkpointing;
+        if (!trans) return error;
+        if (error && !jbd_journal_error(journal)) {
+            journal->failed_trans=trans;
+            __atomic_store_n(&journal->error,error,__ATOMIC_RELEASE);
+        }
+        /* An uncertain device completion retains its data and recovery
+         * owners. Neither stage advances on the other stage's error. */
+        if (jbd_journal_error(journal)) return jbd_journal_error(journal);
+        if (stage!=JBD_JOURNAL_COMMIT) {
+            jbd_checkpoint_retire_state_held(journal);
+            return EOK;
+        }
+        /* Ordered bytes already passed their home barrier. Stop publishing
+         * them in the read index, but keep the commit owner and count visible
+         * until its detached loans really return. Older checkpoints can run. */
+        detached=jbd_trans_detach_data(trans);
+        count=trans->ordered_count;
+    }
+    jbd_release_detached_data(detached,count);
+    {
+        JBD_STATE_SCOPE(journal);
+        if (journal->committing!=trans || trans->ordered_count!=count) __builtin_trap();
+        trans->ordered_count=0;
+        /* An older checkpoint may have failed while sources were being
+         * released. The completed commit still owns recovery metadata. */
+        if (jbd_journal_error(journal)) return jbd_journal_error(journal);
+        journal->committed_id=trans->trans_id;
+        journal->durable_sequence=trans->sequence;
+        ext4_fs_retire_inode_goals(journal->jbd_fs->inode_ref.fs,journal->durable_sequence);
+        journal->committing=NULL;
+        jbd_release_prepared(trans);
+        TAILQ_INSERT_TAIL(&journal->cp_queue,trans,trans_node);
+        journal->checkpoint_count++;
+    }
+    return EOK;
 }
 
 int jbd_journal_retire(struct jbd_journal *journal, int error)
@@ -3388,17 +3479,7 @@ unsigned jbd_journal_operation_resources(struct jbd_journal *journal, const stru
 	size_t record = jbd_allocation_charge(sizeof(struct jbd_data));
 	if (payloads > (SIZE_MAX - minimum) / record) return JBD_JOURNAL_MEMORY;
 	minimum += payloads * record;
-	for (unsigned i = 0; i < count; i++) {
-		struct jbd_source key = { .owner.context = sources[i]->context };
-		if (RB_FIND(jbd_source_tree, &journal->sources, &key)) continue;
-		unsigned previous = 0;
-		while (previous < i && sources[previous]->context != sources[i]->context) previous++;
-		if (previous != i) continue;
-		size_t control = jbd_allocation_charge(sizeof(struct jbd_source));
-		if (sources[i]->bytes > SIZE_MAX - control ||
-		    sources[i]->bytes + control > SIZE_MAX - minimum) return JBD_JOURNAL_MEMORY;
-		minimum += sources[i]->bytes + control;
-	}
+    if (!jbd_source_estimate(journal,sources,count,&minimum)) return JBD_JOURNAL_MEMORY;
 	unsigned logs = 1 + jbd_log_images_needed(journal, 1, 0, true);
     unsigned missing = jbd_budget_room(journal, minimum) ? 0 : JBD_JOURNAL_MEMORY;
     unsigned available = jbd_log_free_blocks(journal);
@@ -3437,53 +3518,154 @@ int jbd_trans_quarantine(struct ext4_fs *fs, ext4_fsblk_t first,
     return EOK;
 }
 
-int jbd_journal_find_reusable(struct ext4_fs *fs, const void *bitmap,
-    ext4_fsblk_t base, uint32_t start, uint32_t end, uint32_t maximum,
-    bool inode, uint32_t *found, uint32_t *length)
+/* The caller has already found a clear bit; walk both kinds of excluded
+ * intervals using one stable STATE view, without revisiting their tree root. */
+static int jbd_find_reusable_state_held(struct jbd_quarantine_tree *index,const void *bitmap,
+    ext4_fsblk_t base,uint32_t bit,uint32_t end,uint32_t maximum,uint32_t *found,
+    uint32_t *length,bool *contended)
 {
-    if (!maximum || start > end || base > UINT64_MAX-end) __builtin_trap();
-    *length=0;
-    uint32_t bit;
-    int result=ext4_bmap_bit_find_clr(bitmap,start,end,&bit);
-    if (result) return result;
-    struct jbd_journal *journal=fs->jbd_journal;
-    struct jbd_quarantine_tree *index=NULL;
     struct jbd_quarantine *range=NULL;
-    if (journal) {
-        ext4_fs_state_read_lock(fs);
-        index=&journal->quarantine_index[inode];
+    if (index) {
         struct jbd_quarantine key={.first=base+bit};
         range=RB_NFIND(jbd_quarantine_tree,index,&key);
-        struct jbd_quarantine *previous=range ?
-            RB_PREV(jbd_quarantine_tree,index,range) : RB_MAX(jbd_quarantine_tree,index);
+        struct jbd_quarantine *previous=range?
+            RB_PREV(jbd_quarantine_tree,index,range):RB_MAX(jbd_quarantine_tree,index);
         if (previous && base+bit-previous->first<previous->count) range=previous;
     }
-    /* Keep the bitmap's real pin and group qualification. One state scope
-     * covers the ordered walk; checkpoint may retire entries only afterwards.
-     * Restarting the tree and its sleeping lock at every released inode turns
-     * one allocation into hundreds of cross-CPU handoffs. */
     for (;;) {
         ext4_fsblk_t address=base+bit;
         while (range && range->first+range->count<=address)
             range=RB_NEXT(jbd_quarantine_tree,index,range);
         if (range && range->first<=address) {
             ext4_fsblk_t boundary=range->first+range->count;
+            if (contended && range->allocation) *contended=true;
             while ((range=RB_NEXT(jbd_quarantine_tree,index,range)) &&
-                range->first==boundary) boundary+=range->count;
+                range->first==boundary) {
+                if (contended && range->allocation) *contended=true;
+                boundary+=range->count;
+            }
             uint64_t next=boundary-base;
-            if (next>=end) { result=ENOSPC; break; }
-            result=ext4_bmap_bit_find_clr(bitmap,(uint32_t)next,end,&bit);
-            if (result) break;
+            if (next>=end) return ENOSPC;
+            int result=ext4_bmap_bit_find_clr(bitmap,(uint32_t)next,end,&bit);
+            if (result) return result;
             continue;
         }
-        uint64_t available=range ? range->first-address : end-bit;
+        uint64_t available=range?range->first-address:end-bit;
         uint32_t count=1;
         while (count<maximum && count<end-bit && count<available &&
             ext4_bmap_is_bit_clr(bitmap,bit+count)) count++;
         *found=bit; *length=count;
-        break;
+        return EOK;
     }
-    if (journal) ext4_fs_state_unlock(fs);
+}
+
+int jbd_journal_find_reusable(struct ext4_fs *fs,const void *bitmap,
+    ext4_fsblk_t base,uint32_t start,uint32_t end,uint32_t maximum,
+    bool inode,uint32_t *found,uint32_t *length)
+{
+    if (!maximum || start>end || base>UINT64_MAX-end) __builtin_trap();
+    *length=0;
+    uint32_t bit;
+    int result=ext4_bmap_bit_find_clr(bitmap,start,end,&bit);
+    if (result) return result;
+    struct jbd_journal *journal=fs->jbd_journal;
+    if (!journal) return jbd_find_reusable_state_held(NULL,bitmap,base,bit,end,
+        maximum,found,length,NULL);
+    JBD_STATE_READ_SCOPE(journal);
+    return jbd_find_reusable_state_held(&journal->quarantine_index[inode],bitmap,
+        base,bit,end,maximum,found,length,NULL);
+}
+
+int jbd_trans_claim_blocks(struct ext4_block_group_ref *bg,struct ext4_block *block,
+    uint32_t start,uint32_t end,uint32_t maximum,uint32_t *found,uint32_t *length,bool *contended)
+{
+    struct ext4_fs *fs=bg->fs;
+    struct ext4_sblock *sb=ext4_fs_super(fs);
+    struct jbd_journal *journal=fs->jbd_journal;
+    struct jbd_trans *trans=ext4_current_trans(fs);
+    if (!trans || !journal->grouped || !maximum || start>end) __builtin_trap();
+    ext4_fsblk_t base=ext4_fs_bg_idx_to_addr(sb,0,bg->index);
+    uint32_t offset=(uint8_t *)bg->block_group-bg->block.data;
+    struct jbd_buf *descriptor=jbd_trans_find_buf(trans,bg->block.lb_id);
+    struct jbd_buf *bitmap=jbd_trans_find_buf(trans,block->lb_id);
+    if (!descriptor || !bitmap || descriptor==bitmap || !descriptor->private_access ||
+        !bitmap->private_access) __builtin_trap();
+    struct jbd_allocation_group *group=trans->allocation_groups;
+    while (group && group->group!=bg->index) group=group->next;
+    bool fresh=!group;
+    if (fresh) {
+        group=jbd_alloc(journal,sizeof(*group));
+        if (!group) return ENOMEM;
+        group->group=bg->index;group->descriptor=descriptor;group->bitmap=bitmap;
+        group->descriptor_offset=offset;
+    } else if (group->descriptor!=descriptor || group->bitmap!=bitmap ||
+        group->descriptor_offset!=offset) __builtin_trap();
+    struct jbd_quarantine *range=jbd_alloc(journal,sizeof(*range));
+    if (!range) { if (fresh) jbd_free(group);return ENOMEM; }
+    *length=0; *contended=false;
+    int result;
+    for (;;) {
+        struct ext4_block_payload *desc_snapshot,*bitmap_snapshot;
+        {
+            JBD_STATE_READ_SCOPE(journal);
+            desc_snapshot=descriptor->block.buf->current_payload;
+            bitmap_snapshot=bitmap->block.buf->current_payload;
+            ext4_block_payload_get(desc_snapshot);
+            ext4_block_payload_get(bitmap_snapshot);
+        }
+        /* Checksum work does not hold STATE. If another operation publishes
+         * before this candidate is claimed, retry against its new pair. */
+        struct ext4_bgroup *accepted=(void *)((uint8_t *)desc_snapshot->data+offset);
+        void *bytes=bitmap_snapshot->data;
+        bool valid=ext4_fs_verify_bg_csum(sb,bg->index,accepted) &&
+            ext4_balloc_verify_bitmap_csum(sb,accepted,bytes) &&
+            ext4_bg_get_block_bitmap(accepted,sb)==block->lb_id &&
+            !ext4_bg_has_flag(accepted,EXT4_BLOCK_GROUP_BLOCK_UNINIT);
+        bool changed;
+        {
+            JBD_STATE_SCOPE(journal);
+            changed=descriptor->block.buf->current_payload!=desc_snapshot ||
+                bitmap->block.buf->current_payload!=bitmap_snapshot;
+            if (!changed) {
+                result=jbd_journal_error(journal);
+                if (!result && !valid) result=EUCLEAN;
+                if (!result && ext4_bg_get_free_blocks_count(accepted,sb)) {
+                    for (unsigned pass=0;pass<(start?2U:1U);pass++) {
+                        uint32_t bit,limit=pass?start:end;
+                        if (!ext4_bmap_bit_find_clr(bytes,pass?0:start,limit,&bit) &&
+                            !jbd_find_reusable_state_held(&journal->quarantine_index[0],
+                                bytes,base,bit,limit,maximum,found,length,contended))
+                            break;
+                    }
+                    if (*length) {
+                        *length=ext4_fs_reserve_block_range(fs,*length);
+                        if (!*length) result=ENOSPC;
+                        else {
+                            range->allocation=true;range->owner=trans;
+                            range->first=base+*found;range->count=*length;
+                            if (RB_INSERT(jbd_quarantine_tree,&journal->quarantine_index[0],range))
+                                __builtin_trap();
+                            LIST_INSERT_HEAD(&group->ranges,range,node);
+                            if (group->count>UINT32_MAX-*length) __builtin_trap();
+                            group->count+=*length;
+                            if (fresh) {
+                                group->next=trans->allocation_groups;
+                                trans->allocation_groups=group;
+                            }
+                            range=NULL;
+                        }
+                    }
+                }
+            }
+        }
+        ext4_block_payload_put(bitmap_snapshot);
+        ext4_block_payload_put(desc_snapshot);
+        if (!changed) break;
+    }
+    if (range) {
+        jbd_free(range);
+        if (fresh) jbd_free(group);
+    }
     return result;
 }
 
@@ -3501,7 +3683,7 @@ void jbd_journal_group_fini(struct jbd_journal *journal)
 {
 	if (journal->running || journal->committing || journal->checkpointing ||
 	    !TAILQ_EMPTY(&journal->sealed_queue) || !TAILQ_EMPTY(&journal->cp_queue) ||
-	    !RB_EMPTY(&journal->sources) || journal->log_reserved || jbd_journal_error(journal) ||
+	    journal->log_reserved || jbd_journal_error(journal) ||
         !RB_EMPTY(&journal->quarantine_index[0]) || !RB_EMPTY(&journal->quarantine_index[1]) ||
         journal->quarantined_blocks || journal->quarantined_inodes) __builtin_trap();
 	journal->grouped = false;

@@ -3574,7 +3574,7 @@ int kernel_vfs_node_release(struct kernel_vfs_node **owner)
         kernel_task_lock_acquire(&kernel_vfs_state_lock, &irq);
         if (!__atomic_compare_exchange_n(&node->references, &references, 0, 0,
             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) { kernel_task_lock_release(&irq); continue; }
-        if (!kernel_file_mapping_empty(node) || node->fifo_pipe || node->cache_pages ||
+        if (!kernel_file_mapping_empty(node) || node->fifo_pipe || node->cache_pages.rbh_root ||
             __atomic_load_n(&node->shared_write_bytes,__ATOMIC_ACQUIRE) ||
             node->dirty_cache_pages.tree.rbh_root || node->dirty_cache_pages.count ||
             node->dirty_cache_pages.queue_next || node->dirty_cache_pages.queue_previous ||
@@ -3622,11 +3622,6 @@ uint64_t kernel_vfs_node_size(const struct kernel_vfs_node *node)
     return __atomic_load_n(&node->size,__ATOMIC_ACQUIRE);
 }
 
-struct kernel_page_cache_entry **kernel_vfs_node_cache_pages(
-    struct kernel_vfs_node *node)
-{
-    return &node->cache_pages;
-}
 
 struct kernel_page_cache_dirty *kernel_vfs_node_dirty_pages(struct kernel_vfs_node *node)
 { return &node->dirty_cache_pages; }
@@ -4359,6 +4354,9 @@ int kernel_vfs_publish_node(struct kernel_vfs_mount *mount,
     kernel_mutex_init(&node->write_operation, 15, (uintptr_t)node);
     kernel_rwlock_init(&node->namespace_lock, 21, (uintptr_t)node->inode);
     kernel_rwlock_init(&node->io_lock, 30, (uintptr_t)node);
+#if BOAROS_MAX_CPUS > 1
+    kernel_raw_lock_init(&node->cache_index_lock, KERNEL_RAW_RANK_CACHE_INDEX);
+#endif
     kernel_file_mapping_init(node);
     kernel_record_lock_state_init(&node->record_locks);
     kernel_task_lock_guard irq = {0};

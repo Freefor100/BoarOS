@@ -6,8 +6,12 @@
 static struct ext4_timestamp timestamp_now;
 static unsigned timestamp_sampling, timestamp_continue;
 static _Thread_local unsigned timestamp_pause;
+static _Thread_local unsigned timestamp_samples;
+static _Thread_local unsigned timestamp_fail;
 static bool timestamp_clock(struct ext4_timestamp *now)
 {
+    timestamp_samples++;
+    if (timestamp_fail) return false;
     *now = timestamp_now;
     if (timestamp_pause) {
         timestamp_pause = 0;
@@ -21,6 +25,19 @@ static void *access_during_remount(void *argument)
     mm_test_attach(1); mm_test_activate_task();
     timestamp_pause = 1;
     kernel_vfs_file_accessed(argument);
+    mm_test_finish();
+    return NULL;
+}
+struct timestamp_remount {
+    struct kernel_vfs_path *root;
+    unsigned completed;
+};
+static void *remount_during_access(void *argument)
+{
+    struct timestamp_remount *test = argument;
+    mm_test_attach(2); mm_test_activate_task();
+    assert(!kernel_vfs_remount(test->root, 1, NULL));
+    __atomic_store_n(&test->completed, 1, __ATOMIC_RELEASE);
     mm_test_finish();
     return NULL;
 }
@@ -85,6 +102,23 @@ int main(int argc, char **argv)
     if (after.mtime.nanoseconds != 200 || after.ctime.nanoseconds != 200) {
         puts("FAIL writes: same-second mtime and ctime must follow the sampled clock"); failures++;
     } else puts("PASS writes: same-second mtime and ctime update");
+    timestamp_fail = 1;
+    kernel_vfs_file_accessed(&file);
+    timestamp_fail = 0;
+    assert(!kernel_vfs_fstat(&file, &after));
+    assert(after.atime.seconds == expected_atime.seconds &&
+           after.atime.nanoseconds == expected_atime.nanoseconds);
+    puts("PASS failed clock leaves post-write atime unchanged");
+    timestamp_now.nanoseconds = 300;
+    timestamp_samples = 0;
+    kernel_vfs_file_accessed(&file);
+    assert(!kernel_vfs_fstat(&file, &after));
+    assert(after.atime.seconds == timestamp_now.seconds && after.atime.nanoseconds == 300);
+    expected_atime = after.atime;
+    if (timestamp_samples != 1) {
+        printf("FAIL post-write relatime: expected one clock sample, got %u\n", timestamp_samples);
+        failures++;
+    } else puts("PASS post-write relatime: one clock sample updates atime");
     assert(!kernel_vfs_sync(&file, 0, &observed_error));
     assert(!kernel_vfs_close(&file));
     assert(!kernel_vfs_open_at(root, root, "timestamp", &request, &file, NULL));
@@ -96,9 +130,32 @@ int main(int argc, char **argv)
            before.atime.seconds == expected_atime.seconds &&
            before.atime.nanoseconds == expected_atime.nanoseconds);
     if (argc == 3) {
-        /* Sampling does not publish a mutation. Finish RO remount before the
-         * paused reader proceeds, then check it cannot dirty the RO fs. */
-        pthread_t reader;
+        /* 更新必需时，采样已持有mutation资格；真实remount须等待读取者发布。 */
+        timestamp_now.nanoseconds = 400;
+        assert(!kernel_vfs_file_modified(&file, 0, 0));
+        timestamp_now.nanoseconds = 500;
+        pthread_t reader, remounter;
+        assert(!pthread_create(&reader, NULL, access_during_remount, &file));
+        while (!__atomic_load_n(&timestamp_sampling, __ATOMIC_ACQUIRE)) sched_yield();
+        struct timestamp_remount remount = {.root = root};
+        unsigned parked = mm_test_parked(2);
+        assert(!pthread_create(&remounter, NULL, remount_during_access, &remount));
+        while (mm_test_parked(2) == parked) sched_yield();
+        assert(!__atomic_load_n(&remount.completed, __ATOMIC_ACQUIRE) &&
+               !kernel_vfs_mount_is_readonly(&mount));
+        __atomic_store_n(&timestamp_continue, 1, __ATOMIC_RELEASE);
+        assert(!pthread_join(reader, NULL) && !pthread_join(remounter, NULL));
+        assert(kernel_vfs_mount_is_readonly(&mount) && !kernel_vfs_fstat(&file, &after));
+        assert(after.atime.seconds == timestamp_now.seconds && after.atime.nanoseconds == 500);
+        puts("PASS remount waits for post-write atime sample and publication");
+        assert(!kernel_vfs_remount(root, 0, NULL));
+
+        /* 年龄检查尚未取得mutation资格。RO完成后，迟到的采样不得发布。 */
+        const struct kernel_vfs_timespec newer_atime[2] = {
+            {timestamp_now.seconds + 100, 10}, {timestamp_now.seconds - 100, 20}};
+        assert(!kernel_vfs_file_set_times(&file, newer_atime) && !kernel_vfs_fstat(&file, &before));
+        timestamp_now.seconds = newer_atime[0].seconds + 86400;
+        timestamp_sampling = timestamp_continue = 0;
         assert(!pthread_create(&reader, NULL, access_during_remount, &file));
         while (!__atomic_load_n(&timestamp_sampling, __ATOMIC_ACQUIRE)) sched_yield();
         assert(!kernel_vfs_remount(root, 1, NULL) && kernel_vfs_mount_is_readonly(&mount));

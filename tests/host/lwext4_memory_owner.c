@@ -10,7 +10,7 @@
 #include <string.h>
 
 static unsigned live, calls;
-static bool fail_calloc, fail_malloc, block_calloc;
+static bool fail_calloc, fail_malloc, block_calloc, fail_blocked_calloc;
 static pthread_mutex_t gate=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t changed=PTHREAD_COND_INITIALIZER;
 static unsigned gate_state;
@@ -29,9 +29,11 @@ void *ext4_user_calloc(size_t count,size_t bytes)
     if(fail_calloc){fail_calloc=false;return NULL;}
     if(block_calloc) {
         assert(!pthread_mutex_lock(&gate));block_calloc=false;gate_state=1;
+        bool fail=fail_blocked_calloc;fail_blocked_calloc=false;
         assert(!pthread_cond_broadcast(&changed));
         while(gate_state!=2)assert(!pthread_cond_wait(&changed,&gate));
         assert(!pthread_mutex_unlock(&gate));
+        if(fail)return NULL;
     }
     void *p=calloc(count,bytes);if(p)__atomic_fetch_add(&live,1,__ATOMIC_RELAXED);return p;
 }
@@ -148,6 +150,36 @@ static void account_change(void *context,size_t bytes,bool acquiring)
     if (acquiring) {assert(a->active<=SIZE_MAX-bytes);a->active+=bytes;}
     else {assert(a->active>=bytes);a->active-=bytes;}
 }
+struct external_source {
+    struct external_account *account;
+    void *bytes;
+    size_t size;
+    unsigned references;
+};
+static void source_retain(void *context)
+{
+    assert(!kernel_cpu_current()->raw_locks);
+    struct external_source *source=context;
+    assert(__atomic_fetch_add(&source->references,1,__ATOMIC_RELAXED));
+}
+static void source_release(void *context)
+{
+    assert(!kernel_cpu_current()->raw_locks);
+    struct external_source *source=context;
+    unsigned refs=__atomic_fetch_sub(&source->references,1,__ATOMIC_ACQ_REL);assert(refs);
+    if(refs==1) {
+        ext4_user_free(source->bytes);source->bytes=NULL;
+        if(source->account)account_change(source->account,source->size,false);
+    }
+}
+static struct file_data_source source_start(struct external_source *source,
+    struct external_account *account,size_t size)
+{
+    *source=(struct external_source){.account=account,.size=size,.references=1};
+    source->bytes=ext4_user_malloc(size);assert(source->bytes);memset(source->bytes,0x53,size);
+    if(account)account_change(account,size,true);
+    return (struct file_data_source){source,source_retain,source_release,size};
+}
 static void borrowed_source_outlives_stop(unsigned size)
 {
     struct jbd_journal journal;start(&journal,size,1024*1024);
@@ -164,19 +196,71 @@ static void borrowed_source_outlives_stop(unsigned size)
     ext4_block_payload_put(reader);assert(!account.active && jbd_memory_cached(&journal)==image_bytes);
     jbd_trim_cache(&journal,0);assert(!account.active && !jbd_memory_used(&journal));
     struct jbd_memory *owner=journal.memory;jbd_memory_get(owner);
-    void *control=jbd_alloc(&journal,32),*source=ext4_user_malloc(size);assert(control && source);
-    /* The external payload already has an allocation owner. Journal retention
-     * counts against its quota but must not charge that allocation twice. */
-    account_change(&account,size,true);size_t held=account.active;
-    assert(jbd_memory_borrow(&journal,size));
-    assert(account.active==held && account.references==2);
-    jbd_memory_stop(&journal);struct jbd_memory_stats stats;jbd_memory_snapshot(owner,&stats);
-    assert(stats.used==held && stats.borrowed==size && held>size && account.active==held);
-    ext4_user_free(source);account_change(&account,size,false);jbd_memory_release_borrow(owner,size);
-    assert(account.active==held-size);
-    jbd_free(control);jbd_memory_snapshot(owner,&stats);
+    jbd_memory_set_cache_disabled(&journal,true);
+    struct external_source storage;
+    struct file_data_source source=source_start(&storage,&account,16384);
+    struct jbd_source *blocks[16],*source_reader,*again;
+    assert(jbd_source_borrow(&journal,&source,&blocks[0])==EOK);
+    size_t held=jbd_memory_used(&journal);assert(held>source.bytes && account.active==held);
+    jbd_memory_set_limit(&journal,held);
+    unsigned warmed=calls;
+    /* One retained page supplies several filesystem blocks, potentially in
+     * different operations; only its allocation, not each block, is charged. */
+    unsigned count=16384/size;
+    for(unsigned i=1;i<count;i++) {
+        assert(jbd_source_borrow(&journal,&source,&blocks[i])==EOK);
+        assert(blocks[i]==blocks[0]);
+    }
+    source_reader=blocks[0];jbd_source_get(source_reader);
+    for(unsigned i=0;i<count;i++)jbd_source_put(blocks[i]);
+    assert(jbd_source_borrow(&journal,&source,&again)==EOK && again==source_reader);
+    assert(calls==warmed && storage.references==2 && account.active==held);
+    jbd_source_put(again);source_release(&storage);
+    assert(storage.references==1 && jbd_memory_used(&journal)==held);
+    jbd_memory_stop(&journal);memset(&journal,0xa5,sizeof(journal));
+    struct jbd_memory_stats stats;jbd_memory_snapshot(owner,&stats);
+    assert(stats.used==held && stats.borrowed==16384 && !stats.reserved && !stats.cached);
+    for(unsigned i=0;i<16384;i++)assert(((unsigned char *)storage.bytes)[i]==0x53);
+    jbd_source_put(source_reader);jbd_memory_snapshot(owner,&stats);
     assert(!stats.used && !stats.reserved && !stats.borrowed && !account.active);
+    assert(!storage.references && !storage.bytes);
     jbd_memory_put(owner);assert(!live && account.references==1);
+}
+struct borrowing_task {
+    struct jbd_journal *journal;
+    const struct file_data_source *owner;
+    struct jbd_source *source;
+    int result;
+};
+static void *borrow_one(void *argument)
+{
+    struct borrowing_task *task=argument;
+    task->result=jbd_source_borrow(task->journal,task->owner,&task->source);return NULL;
+}
+static void source_candidate_race(unsigned size,bool fail)
+{
+    struct jbd_journal journal;start(&journal,size,1024*1024);
+    jbd_memory_set_cache_disabled(&journal,true);
+    struct external_source storage;
+    struct file_data_source owner=source_start(&storage,NULL,16384);
+    struct borrowing_task task={.journal=&journal,.owner=&owner};pthread_t worker;
+    gate_state=0;block_calloc=true;fail_blocked_calloc=fail;
+    assert(!pthread_create(&worker,NULL,borrow_one,&task));
+    assert(!pthread_mutex_lock(&gate));
+    while(gate_state!=1)assert(!pthread_cond_wait(&changed,&gate));
+    assert(!pthread_mutex_unlock(&gate));
+    struct jbd_source *winner;
+    assert(jbd_source_borrow(&journal,&owner,&winner)==EOK);
+    size_t held=jbd_memory_used(&journal);
+    assert(!pthread_mutex_lock(&gate));gate_state=2;assert(!pthread_cond_broadcast(&changed));
+    assert(!pthread_mutex_unlock(&gate));assert(!pthread_join(worker,NULL));
+    assert(task.result==EOK && task.source==winner && storage.references==2);
+    struct jbd_memory_stats stats;jbd_memory_snapshot(journal.memory,&stats);
+    assert(stats.used==held && stats.borrowed==16384 && !stats.reserved && !stats.cached);
+    source_release(&storage);jbd_source_put(winner);
+    assert(storage.references==1 && jbd_memory_used(&journal)==held);
+    jbd_memory_stop(&journal);memset(&journal,0xa5,sizeof(journal));
+    jbd_source_put(task.source);assert(!storage.references && !storage.bytes && !live);
 }
 struct pooled_task { struct jbd_journal *journal;pthread_barrier_t *start; };
 static void meet(pthread_barrier_t *barrier)
@@ -249,7 +333,8 @@ int main(int argc,char **argv)
     assert(argc==2);unsigned size=(unsigned)strtoul(argv[1],NULL,10);assert(size==1024 || size==4096);
     payload_outlives_record_and_stop(size);pools_and_failed_allocations(size);transaction_controls_reuse(size);
     concurrent_reservation(size);borrowed_source_outlives_stop(size);
+    source_candidate_race(size,false);source_candidate_race(size,true);
     concurrent_pools(size);shared_home_charge(size);
-    printf("PASS journal budget payload/stop/pool/transaction-control/OOM/concurrent-reservation/source/shared-home block=%u\n",size);
+    printf("PASS journal budget payload/stop/pool/transaction-control/OOM/concurrent-reservation/source-reader-reuse/source-candidate-race/shared-home block=%u\n",size);
     return 0;
 }

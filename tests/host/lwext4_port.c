@@ -23,7 +23,7 @@ static int page_address(const void *page,uint64_t *address) { *address=(uintptr_
 static int allocation_fail=-1;
 static _Thread_local unsigned allocation_actor,allocation_count,allocation_pause;
 static _Thread_local unsigned allocation_calls;
-static unsigned candidates[2],candidate_resume,resources[2],resource_resume;
+static unsigned candidates[3],candidate_resume,resources[3],resource_resume;
 static void *last_release_target;
 static unsigned last_release_pause,last_release_entered,last_release_resume;
 void __real_kernel_heap_release(struct kernel_heap *,void *);
@@ -64,35 +64,35 @@ static void resources_case(struct kernel_heap *heap)
     assert(callbacks.serial_writer && !callbacks.serial_writer(&domain));
     assert(!kernel_lock_held(&domain.serial,0));
     allocation_fail=0;
-    assert(callbacks.resource_acquire(&domain,&operations[0],EXT4_RESOURCE_BLOCK_GROUP,8)==ENOMEM);
+    assert(callbacks.resource_acquire(&domain,&operations[0],EXT4_RESOURCE_BLOCK_GROUP,8,NULL)==ENOMEM);
     allocation_fail=-1;
-    assert(!callbacks.resource_acquire(&domain,&operations[0],EXT4_RESOURCE_BLOCK_GROUP,8));
+    assert(!callbacks.resource_acquire(&domain,&operations[0],EXT4_RESOURCE_BLOCK_GROUP,8,NULL));
     struct kernel_lock_guard *held=kernel_io_context_current()->locks;
     assert(held && held->lock->rank==35 && held->lock->key==8);
     allocation_fail=0;
-    assert(callbacks.resource_acquire(&domain,&operations[0],EXT4_RESOURCE_BLOCK_GROUP,9)==ENOMEM);
+    assert(callbacks.resource_acquire(&domain,&operations[0],EXT4_RESOURCE_BLOCK_GROUP,9,NULL)==ENOMEM);
     allocation_fail=-1;
     assert(kernel_io_context_current()->locks==held);
-    assert(callbacks.resource_acquire(&domain,&operations[0],EXT4_RESOURCE_ORPHAN,1)==EAGAIN);
+    assert(callbacks.resource_acquire(&domain,&operations[0],EXT4_RESOURCE_ORPHAN,1,NULL)==EAGAIN);
     callbacks.resource_release(&domain);
     assert(!kernel_io_context_current()->locks && callbacks.resource_retry(&domain) &&
            !callbacks.resource_retry(&domain));
-    assert(!callbacks.resource_acquire(&domain,&operations[1],EXT4_RESOURCE_BLOCK_GROUP,8));
+    assert(!callbacks.resource_acquire(&domain,&operations[1],EXT4_RESOURCE_BLOCK_GROUP,8,NULL));
     held=kernel_io_context_current()->locks;
     assert(held->lock->rank==35 && held->lock->key==8 && held->previous &&
            held->previous->lock->rank==32 && held->previous->lock->key==1);
-    assert(!callbacks.resource_acquire(&domain,&operations[1],EXT4_RESOURCE_ORPHAN,1));
-    assert(callbacks.resource_acquire(&domain,&operations[1],EXT4_RESOURCE_BLOCK_GROUP,2)==EAGAIN);
+    assert(!callbacks.resource_acquire(&domain,&operations[1],EXT4_RESOURCE_ORPHAN,1,NULL));
+    assert(callbacks.resource_acquire(&domain,&operations[1],EXT4_RESOURCE_BLOCK_GROUP,2,NULL)==EAGAIN);
     callbacks.resource_release(&domain);
     assert(callbacks.resource_retry(&domain));
-    assert(!callbacks.resource_acquire(&domain,&operations[2],EXT4_RESOURCE_BLOCK_GROUP,8));
+    assert(!callbacks.resource_acquire(&domain,&operations[2],EXT4_RESOURCE_BLOCK_GROUP,8,NULL));
     held=kernel_io_context_current()->locks;
     assert(held->lock->key==8 && held->previous->lock->key==2 &&
            held->previous->previous->lock->rank==32);
-    assert(callbacks.resource_acquire(&domain,&operations[2],EXT4_RESOURCE_INODE,17)==EAGAIN);
+    assert(callbacks.resource_acquire(&domain,&operations[2],EXT4_RESOURCE_INODE,17,NULL)==EAGAIN);
     callbacks.resource_release(&domain);
     assert(callbacks.resource_retry(&domain));
-    assert(!callbacks.resource_acquire(&domain,&operations[3],EXT4_RESOURCE_BLOCK_GROUP,8));
+    assert(!callbacks.resource_acquire(&domain,&operations[3],EXT4_RESOURCE_BLOCK_GROUP,8,NULL));
     held=kernel_io_context_current()->locks;
     assert(held->previous->previous->previous->lock->rank==31 &&
            held->previous->previous->previous->lock->key==17);
@@ -107,16 +107,16 @@ static void resources_case(struct kernel_heap *heap)
            kernel_io_context_current()->locks==held);
     allocation_fail=-1;
     assert(!callbacks.resource_claim_inode(&domain,&operations[3],777) &&
-           !callbacks.resource_acquire(&domain,&operations[3],EXT4_RESOURCE_INODE,777) &&
+           !callbacks.resource_acquire(&domain,&operations[3],EXT4_RESOURCE_INODE,777,NULL) &&
            kernel_io_context_current()->locks==held);
-    assert(callbacks.resource_acquire(&domain,&operations[3],EXT4_RESOURCE_BLOCK_GROUP,1)==EAGAIN);
+    assert(callbacks.resource_acquire(&domain,&operations[3],EXT4_RESOURCE_BLOCK_GROUP,1,NULL)==EAGAIN);
     callbacks.resource_release(&domain);
     assert(callbacks.resource_retry(&domain) &&
-           !callbacks.resource_acquire(&domain,&operations[4],EXT4_RESOURCE_BLOCK_GROUP,8));
+           !callbacks.resource_acquire(&domain,&operations[4],EXT4_RESOURCE_BLOCK_GROUP,8,NULL));
     unsigned claimed_locked=0;
     for(struct kernel_lock_guard *guard=kernel_io_context_current()->locks;guard;guard=guard->previous)
         if(guard->lock->rank==31 && guard->lock->key==777)claimed_locked++;
-    assert(claimed_locked==1 && !callbacks.resource_acquire(&domain,&operations[4],EXT4_RESOURCE_INODE,777));
+    assert(claimed_locked==1 && !callbacks.resource_acquire(&domain,&operations[4],EXT4_RESOURCE_INODE,777,NULL));
     callbacks.resource_release(&domain);
     assert(!callbacks.resource_retry(&domain));
     callbacks.unlock(&domain);
@@ -139,8 +139,8 @@ static void resource_reclamation_case(struct kernel_heap *heap)
     unsigned calls=allocation_calls;
     for(unsigned i=0;i<2048;i++) {
         struct ext4_operation operation={.fs=&fs};callbacks.lock(&domain);
-        assert(!callbacks.resource_acquire(&domain,&operation,EXT4_RESOURCE_INODE,0x100000U+i) &&
-               !callbacks.resource_acquire(&domain,&operation,EXT4_RESOURCE_BLOCK_GROUP,i%16) &&
+        assert(!callbacks.resource_acquire(&domain,&operation,EXT4_RESOURCE_INODE,0x100000U+i,NULL) &&
+               !callbacks.resource_acquire(&domain,&operation,EXT4_RESOURCE_BLOCK_GROUP,i%16,NULL) &&
                !callbacks.resource_claim_inode(&domain,&operation,0x80000000U+i));
         kernel_heap_get_statistics(heap,&active);
         if(active.current_pages-before.current_pages>peak_pages)peak_pages=active.current_pages-before.current_pages;
@@ -158,6 +158,46 @@ static void resource_reclamation_case(struct kernel_heap *heap)
     printf("PASS 2048 distinct high inode keys: no request heap allocation; each operation returns registry/heap/pages; active peak=%llu allocations/%llu pages\n",
         (unsigned long long)peak_allocations,(unsigned long long)peak_pages);
 }
+static void shared_group_retry_case(struct kernel_heap *heap)
+{
+    struct kernel_heap_statistics before,after;
+    kernel_heap_get_statistics(heap,&before);
+    struct ext4_lock callbacks={0};struct boaros_lwext4_domain domain={0};
+    struct jbd_journal journal={.grouped=true};struct ext4_fs fs={.jbd_journal=&journal};
+    fs.orphan_index=(struct ext4_orphan_index *)&fs;
+    struct ext4_operation operations[4]={{.fs=&fs},{.fs=&fs},{.fs=&fs},{.fs=&fs}};
+    boaros_lwext4_lock_init(&callbacks,&domain,heap);
+    boaros_lwext4_enable_parallel(&domain,&fs);callbacks.lock(&domain);
+    bool shared=false;
+    assert(!callbacks.resource_acquire(&domain,&operations[0],EXT4_RESOURCE_BLOCK_GROUP,8,&shared) && shared);
+    struct kernel_lock_guard *held=kernel_io_context_current()->locks;
+    assert(!held->write && held->lock->rank==35 && held->lock->key==8);
+    assert(callbacks.resource_acquire(&domain,&operations[0],EXT4_RESOURCE_BLOCK_GROUP,8,NULL)==EAGAIN);
+    assert(kernel_io_context_current()->locks==held && !held->write);
+    callbacks.resource_release(&domain);
+    assert(!kernel_io_context_current()->locks && callbacks.resource_retry(&domain));
+    shared=true;
+    assert(!callbacks.resource_acquire(&domain,&operations[1],EXT4_RESOURCE_BLOCK_GROUP,8,&shared) && !shared);
+    held=kernel_io_context_current()->locks;
+    assert(held->write && held->lock->key==8);
+    assert(!callbacks.resource_acquire(&domain,&operations[1],EXT4_RESOURCE_BLOCK_GROUP,8,NULL));
+    callbacks.resource_release(&domain);
+    assert(!callbacks.resource_retry(&domain));
+
+    assert(!callbacks.resource_acquire(&domain,&operations[2],EXT4_RESOURCE_BLOCK_GROUP,8,&shared) && shared);
+    assert(callbacks.resource_acquire(&domain,&operations[2],EXT4_RESOURCE_BLOCK_GROUP,2,&shared)==EAGAIN);
+    callbacks.resource_release(&domain);assert(callbacks.resource_retry(&domain));
+    assert(!callbacks.resource_acquire(&domain,&operations[3],EXT4_RESOURCE_BLOCK_GROUP,8,&shared) && shared);
+    held=kernel_io_context_current()->locks;
+    assert(!held->write && held->lock->key==8 && held->previous &&
+           !held->previous->write && held->previous->lock->key==2);
+    callbacks.resource_release(&domain);callbacks.unlock(&domain);
+    assert(!domain.resources.rbh_root && !kernel_io_context_current()->backend_resources.request_count);
+    boaros_lwext4_lock_fini(&domain);
+    kernel_heap_get_statistics(heap,&after);
+    assert(after.live_allocations==before.live_allocations && after.current_pages==before.current_pages);
+    puts("PASS shared group upgrade aborts before waiting; replay retains stronger mode and sorted shared keys");
+}
 struct last_resource_actor {
     struct ext4_lock *callbacks;
     struct ext4_fs *fs;
@@ -169,7 +209,7 @@ static void *last_resource_owner(void *argument)
     struct last_resource_actor *actor=argument;mm_test_attach(actor->actor+1);
     struct ext4_operation operation={.fs=actor->fs};
     actor->callbacks->lock(actor->callbacks->context);
-    assert(!actor->callbacks->resource_acquire(actor->callbacks->context,&operation,EXT4_RESOURCE_INODE,777));
+    assert(!actor->callbacks->resource_acquire(actor->callbacks->context,&operation,EXT4_RESOURCE_INODE,777,NULL));
     actor->lock=kernel_io_context_current()->locks->lock;
     __atomic_store_n(&actor->entered,1,__ATOMIC_RELEASE);
     while(!__atomic_load_n(&actor->resume,__ATOMIC_ACQUIRE))sched_yield();
@@ -217,7 +257,7 @@ static void inode_lifetime_case(struct kernel_heap *heap)
     for(unsigned i=0;i<8;i++) {
         struct ext4_operation operation={.fs=&fs};
         callbacks.lock(&domain);
-        assert(!callbacks.resource_acquire(&domain,&operation,EXT4_RESOURCE_INODE,777));
+        assert(!callbacks.resource_acquire(&domain,&operation,EXT4_RESOURCE_INODE,777,NULL));
         assert(kernel_io_context_current()->locks->lock->rank==31);
         callbacks.resource_release(&domain);callbacks.unlock(&domain);
     }
@@ -302,6 +342,7 @@ struct resource_actor {
     struct ext4_fs *fs;
     unsigned actor;
     uint32_t key;
+    unsigned reader;
     struct kernel_rwlock *lock;
 };
 static void *acquire_resource(void *argument)
@@ -312,7 +353,10 @@ static void *acquire_resource(void *argument)
     struct ext4_operation operation={.fs=actor->fs};
     struct ext4_lock *callbacks=actor->callbacks;
     callbacks->lock(callbacks->context);
-    assert(!callbacks->resource_acquire(callbacks->context,&operation,EXT4_RESOURCE_BLOCK_GROUP,actor->key));
+    bool granted=false;
+    assert(!callbacks->resource_acquire(callbacks->context,&operation,EXT4_RESOURCE_BLOCK_GROUP,
+        actor->key,actor->reader?&granted:NULL));
+    assert(granted==!!actor->reader);
     actor->lock=kernel_io_context_current()->locks->lock;
     __atomic_store_n(&resources[actor->actor],1,__ATOMIC_RELEASE);
     while (!__atomic_load_n(&resource_resume,__ATOMIC_ACQUIRE)) sched_yield();
@@ -332,17 +376,30 @@ static void shared_resource_case(struct kernel_heap *heap,int shared)
     boaros_lwext4_lock_init(&callbacks,&domain,heap);boaros_lwext4_enable_parallel(&domain,&fs);
     memset(candidates,0,sizeof(candidates));memset(resources,0,sizeof(resources));
     candidate_resume=resource_resume=0;
-    struct resource_actor actors[2]={{.callbacks=&callbacks,.fs=&fs,.actor=0,.key=7},
-                                    {.callbacks=&callbacks,.fs=&fs,.actor=1,.key=shared?7:8}};
-    pthread_t threads[2];
+    struct resource_actor actors[3]={{.callbacks=&callbacks,.fs=&fs,.actor=0,.key=7,.reader=shared==2},
+                                    {.callbacks=&callbacks,.fs=&fs,.actor=1,.key=shared?7:8,.reader=shared==2},
+                                    {.callbacks=&callbacks,.fs=&fs,.actor=2,.key=7}};
+    pthread_t threads[3];
     for(unsigned i=0;i<2;i++)assert(!pthread_create(&threads[i],NULL,acquire_resource,&actors[i]));
     while (!__atomic_load_n(&candidates[0],__ATOMIC_ACQUIRE) ||
            !__atomic_load_n(&candidates[1],__ATOMIC_ACQUIRE)) sched_yield();
     __atomic_store_n(&candidate_resume,1,__ATOMIC_RELEASE);
     unsigned first=0;
-    if (!shared) {
+    if (shared!=1) {
         while (!__atomic_load_n(&resources[0],__ATOMIC_ACQUIRE) ||
                !__atomic_load_n(&resources[1],__ATOMIC_ACQUIRE)) sched_yield();
+        if (shared==2) {
+            assert(actors[0].lock==actors[1].lock);
+            assert(!pthread_create(&threads[2],NULL,acquire_resource,&actors[2]));
+            for (;;) {
+                unsigned waiting;
+                { KERNEL_RAW_SCOPE(guard,&actors[0].lock->metadata);
+                  waiting=actors[0].lock->pending_head!=NULL; }
+                if (waiting) break;
+                sched_yield();
+            }
+            assert(!__atomic_load_n(&resources[2],__ATOMIC_ACQUIRE));
+        }
     } else {
     for (;;) {
         if (__atomic_load_n(&resources[0],__ATOMIC_ACQUIRE)) { first=0;break; }
@@ -359,12 +416,13 @@ static void shared_resource_case(struct kernel_heap *heap,int shared)
     assert(!__atomic_load_n(&resources[!first],__ATOMIC_ACQUIRE));
     }
     __atomic_store_n(&resource_resume,1,__ATOMIC_RELEASE);
-    for(unsigned i=0;i<2;i++)assert(!pthread_join(threads[i],NULL));
+    for(unsigned i=0;i<(shared==2?3U:2U);i++)assert(!pthread_join(threads[i],NULL));
     assert((actors[0].lock==actors[1].lock)==!!shared);
     boaros_lwext4_lock_fini(&domain);
     kernel_heap_get_statistics(heap,&after);
     assert(after.live_allocations==before.live_allocations && after.current_pages==before.current_pages);
-    puts(shared?
+    puts(shared==2?
+        "PASS two shared group owners overlap while an exclusive owner waits; all resources return":shared?
         "PASS competing resource candidates publish one mutex; second operation waits and all candidate/request storage returns":
         "PASS independent group operations hold different qualifications simultaneously and return all resources");
 }
@@ -501,6 +559,7 @@ int main(void)
            !physical_page_allocator_finalize(&pages) && !kernel_heap_init(&heap,&pages,page_address));
     uint64_t available=physical_page_available(&pages);
     resources_case(&heap);shared_resource_case(&heap,1);shared_resource_case(&heap,0);transition_case(&heap);
+    shared_resource_case(&heap,2);shared_group_retry_case(&heap);
     resource_reclamation_case(&heap);last_resource_case(&heap);inode_lifetime_case(&heap);state_readers_case(&heap);
     for(unsigned failure=0;failure<5;failure++)state_rejected_case(&heap,failure);
     puts("PASS state read qualification rejects upgrade, wrong domain/owner and premature backend release");

@@ -45,6 +45,8 @@ struct boaros_lwext4_resource_request {
     struct boaros_lwext4_resource *resource;
     struct kernel_lock_guard guard;
     unsigned private_inode;
+    /* Requested mode survives abort/replay; guard records the held mode. */
+    unsigned shared;
 };
 struct boaros_lwext4_resource_set {
     struct ext4_operation *operation;

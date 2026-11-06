@@ -12,7 +12,7 @@ static struct kernel_block_device *physical(struct kernel_block_device *device)
 static int write_needs_rmw(struct kernel_block_device *device,uint64_t offset,size_t size)
 {
     uint32_t sector=physical(device)->logical_block_size;
-    /* 调用者持有 transfer 资格，保护 loop 可配置的物理扇区大小。
+    /* 调用者持有 transfer 或 phase 资格，保护 loop 可配置的物理扇区大小。
      * 驱动按物理盘扇区做 RMW；分区自身的对齐不能代替平移后的对齐。
      * 分开取余也让尚未通过范围检查的 offset 不会在相加时溢出。 */
     return size && ((device->start_bytes%sector+offset%sector)%sector || size%sector);
@@ -278,18 +278,22 @@ struct phase_window {
     struct kernel_block_span spans[KERNEL_BLOCK_BATCH_MAX];
     size_t count;
 };
-static int window_next(const void *context, const void **cursor, struct kernel_block_span *span)
+struct translated_phase {
+    kernel_block_phase_next_fn next;
+    const void *context;
+    uint64_t offset;
+};
+static int translated_phase_next(const void *context, const void **cursor,
+    struct kernel_block_span *span)
 {
-    const struct phase_window *window = context;
-    const struct kernel_block_span *at = *cursor;
-    if (at == window->spans + window->count) return 0;
-    *span = *at;
-    *cursor = at + 1;
+    const struct translated_phase *phase = context;
+    if (!phase->next(phase->context, cursor, span)) return 0;
+    span->offset += phase->offset;
     return 1;
 }
 
-/* The producer and full-call barrier remain borrowed across all windows. Only
- * the transfer qualifier is returned, after the driver's DMA has drained. */
+/* Synchronous backends have no pending pipeline. Return their transfer
+ * qualification between bounded windows after all writes have completed. */
 static __attribute__((noinline)) enum kernel_block_status write_phase_windows(
     struct kernel_block_device *device,kernel_block_phase_next_fn next,const void *context,const void *cursor)
 {
@@ -315,9 +319,11 @@ static __attribute__((noinline)) enum kernel_block_status write_phase_windows(
             pending.size-=length;bytes+=length;
         }
         if (!window.count) break;
-        KERNEL_LOCK_SCOPE(transfer);kernel_rwlock_write(&disk->transfer_lock,&transfer);
-        if (disk->write_phase) {
-            enum kernel_block_status result=disk->write_phase(disk->context,window_next,&window,window.spans);
+        /* Preflight proved sector alignment. Only RMW needs exclusivity;
+         * the phase barrier independently keeps FLUSH behind all windows. */
+        KERNEL_LOCK_SCOPE(transfer);kernel_rwlock_read(&disk->transfer_lock,&transfer);
+        if (disk->write_batch) {
+            enum kernel_block_status result=disk->write_batch(disk->context,window.spans,window.count);
             if (result) return result;
         } else for (size_t i=0;i<window.count;i++) {
             const struct kernel_block_span *span=&window.spans[i];
@@ -332,7 +338,7 @@ enum kernel_block_status kernel_block_write_phase(struct kernel_block_device *de
     kernel_block_phase_next_fn next, const void *next_context, const void *first)
 {
     if (!device || !device->logical_block_size || !next) return KERNEL_BLOCK_STATUS_INVALID;
-    if (!physical(device)->write && !physical(device)->write_phase) return KERNEL_BLOCK_STATUS_UNSUPPORTED;
+    if (!physical(device)->write && !physical(device)->write_batch && !physical(device)->write_phase) return KERNEL_BLOCK_STATUS_UNSUPPORTED;
     BLOCK_REQUEST(device);
     struct kernel_block_device *disk = physical(device);
     KERNEL_LOCK_SCOPE(io); kernel_rwlock_read(&disk->phase_barrier, &io);
@@ -343,14 +349,25 @@ enum kernel_block_status kernel_block_write_phase(struct kernel_block_device *de
     while (next(next_context, &cursor, &span)) {
         if (span.offset > limit || span.size > limit - span.offset)
             return KERNEL_BLOCK_STATUS_OUT_OF_RANGE;
-        if (!span.size) continue;
+        if (!span.size) return KERNEL_BLOCK_STATUS_INVALID;
         if (!span.buffer || span.size - 1 > UINTPTR_MAX - (uintptr_t)span.buffer ||
-            span.offset % device->logical_block_size || span.size % device->logical_block_size)
+            span.offset % device->logical_block_size || span.size % device->logical_block_size ||
+            write_needs_rmw(device,span.offset,span.size))
             return KERNEL_BLOCK_STATUS_INVALID;
         nonempty = 1;
     }
     if (!nonempty) return KERNEL_BLOCK_STATUS_OK;
     if (kernel_block_read_only(device)) return KERNEL_BLOCK_STATUS_READ_ONLY;
+    if (disk->write_phase) {
+        /* Keep the immutable producer live until every DMA completes. The
+         * driver refills free request slots without draining artificial windows.
+         * Aligned peers remain concurrent; RMW waits for this finite phase. */
+        KERNEL_LOCK_SCOPE(transfer); kernel_rwlock_read(&disk->transfer_lock, &transfer);
+        if (!device->start_bytes)
+            return disk->write_phase(disk->context, next, next_context, first);
+        const struct translated_phase phase = { next, next_context, device->start_bytes };
+        return disk->write_phase(disk->context, translated_phase_next, &phase, first);
+    }
     return write_phase_windows(device,next,next_context,first);
 }
 

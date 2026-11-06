@@ -13,6 +13,20 @@
 /* Control allocator classes share the existing bounded pool. */
 enum { JBD_ALLOCATION_CACHE_BUCKETS = 9 };
 
+struct jbd_source {
+    struct file_data_source owner;
+    struct jbd_memory *memory;
+    uint32_t references;
+    RB_ENTRY(jbd_source) node;
+};
+static int source_compare(struct jbd_source *a,struct jbd_source *b)
+{
+    uintptr_t first=(uintptr_t)a->owner.context,second=(uintptr_t)b->owner.context;
+    return first<second?-1:first>second;
+}
+RB_HEAD(jbd_source_tree,jbd_source);
+RB_GENERATE_INTERNAL(jbd_source_tree,jbd_source,node,source_compare,static inline)
+
 struct jbd_memory {
     /* Home pinning acquires cache metadata (rank 30) before this short lock. */
     struct kernel_raw_lock metadata;
@@ -22,6 +36,7 @@ struct jbd_memory {
     uint64_t budget_failures;
     struct jbd_image *image_cache;
     void *allocation_cache[JBD_ALLOCATION_CACHE_BUCKETS];
+    struct jbd_source_tree sources;
     bool grouped, cache_disabled, closing;
 };
 union jbd_allocation {
@@ -58,7 +73,8 @@ static bool dereference_locked(struct jbd_memory *memory)
 {
     if (!memory->references) __builtin_trap();
     if (--memory->references) return false;
-    if (memory->used || memory->reserved || memory->cached || memory->borrowed || memory->image_cache) __builtin_trap();
+    if (memory->used || memory->reserved || memory->cached || memory->borrowed ||
+        memory->image_cache || !RB_EMPTY(&memory->sources)) __builtin_trap();
     for (unsigned i=0;i<JBD_ALLOCATION_CACHE_BUCKETS;i++) if (memory->allocation_cache[i]) __builtin_trap();
     return true;
 }
@@ -170,7 +186,7 @@ static void uncharge(struct jbd_memory *memory,size_t bytes,bool idle)
 }
 void jbd_memory_owner_uncharge(struct jbd_memory *memory,size_t bytes)
 { uncharge(memory,bytes,false); }
-void jbd_memory_release_borrow(struct jbd_memory *memory,size_t bytes)
+static void release_borrow(struct jbd_memory *memory,size_t bytes)
 {
     KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);
     if (memory->used<bytes || memory->borrowed<bytes) __builtin_trap();
@@ -241,22 +257,110 @@ bool jbd_budget_room(struct jbd_journal *journal,size_t bytes)
     }
     budget_failure(journal);return false;
 }
-bool jbd_memory_borrow(struct jbd_journal *journal,size_t bytes)
+void jbd_source_get(struct jbd_source *source)
+{
+    uint32_t references=__atomic_fetch_add(&source->references,1,__ATOMIC_RELAXED);
+    if (!references || references==UINT32_MAX) __builtin_trap();
+}
+
+void jbd_source_put(struct jbd_source *source)
+{
+    uint32_t references=__atomic_load_n(&source->references,__ATOMIC_RELAXED);
+    while (references>1) {
+        if (__atomic_compare_exchange_n(&source->references,&references,references-1,
+            true,__ATOMIC_ACQ_REL,__ATOMIC_RELAXED)) return;
+    }
+    struct jbd_memory *memory=source->memory;
+    {
+        KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);
+        references=__atomic_fetch_sub(&source->references,1,__ATOMIC_ACQ_REL);
+        if (!references) __builtin_trap();
+        if (references>1) return;
+        /* Lookup and final retirement share the short lock. A reader-only
+         * source remains discoverable, and zero references cannot resurrect. */
+        RB_REMOVE(jbd_source_tree,&memory->sources,source);
+    }
+    source->owner.release(source->owner.context);
+    release_borrow(memory,source->owner.bytes);
+    jbd_free(source);
+}
+
+static int source_get_existing(struct jbd_source *source,const struct file_data_source *owner,
+    struct jbd_source **out)
+{
+    if (source->owner.retain!=owner->retain || source->owner.release!=owner->release ||
+        source->owner.bytes!=owner->bytes) return EINVAL;
+    jbd_source_get(source);
+    *out=source;
+    return EOK;
+}
+
+int jbd_source_borrow(struct jbd_journal *journal,const struct file_data_source *owner,
+    struct jbd_source **out)
 {
     struct jbd_memory *memory=journal->memory;
-    for (unsigned attempt=0;attempt<2;attempt++) {
+    struct jbd_source key={.owner.context=owner->context};
+    {
+        KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);
+        struct jbd_source *source=RB_FIND(jbd_source_tree,&memory->sources,&key);
+        if (source) return source_get_existing(source,owner,out);
+    }
+    struct jbd_source *candidate=jbd_alloc(journal,sizeof(*candidate));
+    if (candidate) {
+        candidate->owner=*owner;
+        candidate->memory=memory;
+        candidate->references=1;
+    }
+    int result=ENOMEM;
+    bool published=false;
+    for (unsigned attempt=0;;attempt++) {
         {
             KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);
-            if (!memory->closing && room_locked(memory,bytes)) {
-                memory->used+=bytes;memory->borrowed+=bytes;
+            struct jbd_source *source=RB_FIND(jbd_source_tree,&memory->sources,&key);
+            if (source) {result=source_get_existing(source,owner,out);break;}
+            if (!candidate) return ENOMEM;
+            if (!memory->closing && room_locked(memory,owner->bytes)) {
+                memory->used+=owner->bytes;memory->borrowed+=owner->bytes;
                 if (memory->peak<memory->used) memory->peak=memory->used;
-                return true;
+                if (RB_INSERT(jbd_source_tree,&memory->sources,candidate)) __builtin_trap();
+                *out=candidate;
+                published=true;
+                break;
             }
         }
-        if (!attempt) trim_owner(memory,0);
+        if (attempt) {budget_failure(journal);break;}
+        trim_owner(memory,0);
     }
-    budget_failure(journal);return false;
+    if (published) {
+        /* The creating call still holds the input payload and owns the
+         * first reference. No borrower can retire it before this retain. */
+        owner->retain(owner->context);
+        return EOK;
+    }
+    jbd_free(candidate);
+    return result;
 }
+
+bool jbd_source_estimate(struct jbd_journal *journal,const struct file_data_source *const *sources,
+    unsigned count,size_t *minimum)
+{
+    if (!count) return true;
+    struct jbd_memory *memory=journal->memory;
+    size_t control=jbd_allocation_charge(sizeof(struct jbd_source));
+    KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);
+    for (unsigned i=0;i<count;i++) {
+        struct jbd_source key={.owner.context=sources[i]->context};
+        if (RB_FIND(jbd_source_tree,&memory->sources,&key)) continue;
+        unsigned previous=0;
+        while (previous<i && sources[previous]->context!=sources[i]->context) previous++;
+        if (previous!=i) continue;
+        if (sources[i]->bytes>SIZE_MAX-control || sources[i]->bytes+control>SIZE_MAX-*minimum)
+            return false;
+        *minimum+=sources[i]->bytes+control;
+    }
+    return true;
+}
+
 static void *allocate_extra(struct jbd_journal *journal,size_t bytes,size_t extra)
 {
     /* Rounding already identifies the control pool's class. Keep both results

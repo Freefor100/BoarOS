@@ -56,6 +56,8 @@ static void resource_callbacks_absent(struct kernel_heap *heap)
      * operation lookup or per-resource owner, including before journal use. */
     for(unsigned journaled=0;journaled<2;journaled++) {
         fs.jbd_journal=journaled?&journal:NULL;
+        bool shared=true;
+        assert(!ext4_operation_require_shared_block_group(&fs,2,&shared) && !shared);
         assert(!ext4_operation_require_resource(&fs,EXT4_RESOURCE_INODE,17) &&
                !ext4_operation_require_resource(&fs,EXT4_RESOURCE_BLOCK_GROUP,2) &&
                !ext4_operation_claim_inode(&fs,18));

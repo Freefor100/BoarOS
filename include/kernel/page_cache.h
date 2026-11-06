@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <common/file_io.h>
 #include <kernel/page.h>
 
 #ifndef BOAROS_PAGE_CACHE_WRITEBACK_PAGES
@@ -137,7 +138,7 @@ struct kernel_page_cache_concurrency_state {
     uint32_t pending, running;
     size_t entry_bytes, record_bytes, request_bytes;
     size_t execution_request_bytes;
-    size_t index_capacity, index_live, index_tombstones;
+    size_t index_live;
     uint64_t executions_queued, executions_completed;
     uint64_t queue_ns, execute_ns, max_queue_ns, max_execute_ns;
 };
@@ -225,7 +226,7 @@ void kernel_page_cache_alias_drain(struct kernel_page_cache_alias *alias);
 void kernel_page_cache_alias_mark_dirty(struct kernel_page_cache_alias *alias);
 /* Shared write faults reserve every valid EOF block before writable PTE
  * publication. An incomplete reservation is returned without granting writes. */
-struct kernel_page_cache_reservation { void *ticket;uint64_t offset,end; };
+struct kernel_page_cache_reservation { struct file_write_reservation ticket;uint64_t offset,end; };
 int kernel_page_cache_prepare_mapping_write(struct kernel_page_cache *,struct kernel_vfs_node *,
     uint64_t page_index,struct kernel_page_cache_reservation *);
 /* Actual dirty publication holds the inode qualification; accept only marks

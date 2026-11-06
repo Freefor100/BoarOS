@@ -46,6 +46,15 @@ struct file_data_source {
     size_t bytes;
 };
 
+/* Storage preparation borrows the first record from the active request. The
+ * backend owns the range and any further records until it finishes the ticket. */
+struct file_write_reservation {
+    struct file_write_reservation *next;
+    void *owner;
+    uint64_t mask;
+    uint8_t committed;
+};
+
 /* The synchronous caller owns these descriptors; a backend may retain source
  * storage beyond return. Surrounding initialized bytes provide block padding;
  * only offset/size advance file size and written reports logical completion. */

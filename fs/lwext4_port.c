@@ -18,7 +18,7 @@ static unsigned heap_users;
 static struct kernel_wait_queue channels[64];
 struct boaros_lwext4_resource {
     RB_ENTRY(boaros_lwext4_resource) index;
-    struct kernel_mutex mutex;
+    struct kernel_rwlock lock;
     enum ext4_resource_kind kind;
     uint32_t key;
     /* Requests retain queued, active and replay-only qualifications. */
@@ -55,7 +55,7 @@ static struct boaros_lwext4_resource *resource_find(struct boaros_lwext4_domain 
     struct boaros_lwext4_resource *candidate=resource_allocate(domain,sizeof(*candidate));
     if (!candidate) return NULL;
     candidate->kind=kind;candidate->key=key;candidate->references=1;
-    kernel_mutex_init(&candidate->mutex,kind==EXT4_RESOURCE_INODE?31:
+    kernel_rwlock_init(&candidate->lock,kind==EXT4_RESOURCE_INODE?31:
         kind==EXT4_RESOURCE_ORPHAN?32:35,key);
     {
         KERNEL_TASK_LOCK_SCOPE(guard,&domain->resource_index);
@@ -80,8 +80,8 @@ static void resource_put(struct boaros_lwext4_domain *domain,struct boaros_lwext
         last=!--resource->references;
         if(last) {
             /* Find+borrow and final removal use the same index protection. */
-            if(resource->mutex.lock.writer || resource->mutex.lock.readers ||
-               resource->mutex.lock.pending_head || resource->mutex.lock.handoff_owner)__builtin_trap();
+            if(resource->lock.writer || resource->lock.readers ||
+               resource->lock.pending_head || resource->lock.handoff_owner)__builtin_trap();
             RB_REMOVE(boaros_lwext4_resource_tree,&domain->resources,resource);
         }
     }
@@ -137,7 +137,8 @@ static int resource_begin(struct boaros_lwext4_domain *domain,struct ext4_operat
         set->operation=operation;
         /* Complete abort keeps keys, not guards or private metadata. */
         for (struct boaros_lwext4_resource_request *request=set->head;request;request=request->next) {
-            kernel_mutex_lock(&request->resource->mutex,&request->guard);
+            if (request->shared) kernel_rwlock_read(&request->resource->lock,&request->guard);
+            else kernel_rwlock_write(&request->resource->lock,&request->guard);
             set->held_last=request;
         }
     }
@@ -169,12 +170,14 @@ static int resource_request_get(struct boaros_lwext4_domain *domain,
     *owner=request;*created=1;return EOK;
 }
 static int resource_acquire(void *opaque,struct ext4_operation *operation,
-    enum ext4_resource_kind kind,uint32_t key)
+    enum ext4_resource_kind kind,uint32_t key,bool *shared)
 {
     struct boaros_lwext4_domain *domain=opaque;
+    if (shared) *shared=false;
     if (!__atomic_load_n(&domain->parallel,__ATOMIC_ACQUIRE)) return EOK;
     if(kind!=EXT4_RESOURCE_INODE && kind!=EXT4_RESOURCE_ORPHAN && kind!=EXT4_RESOURCE_BLOCK_GROUP)
         __builtin_trap();
+    if (shared && kind!=EXT4_RESOURCE_BLOCK_GROUP) __builtin_trap();
     struct boaros_lwext4_resource_set *set;
     int result=resource_begin(domain,operation,&set),created;
     if(result)return result;
@@ -183,14 +186,25 @@ static int resource_acquire(void *opaque,struct ext4_operation *operation,
     if(result)return result;
     if(!created) {
         if(!request->guard.lock && !request->private_inode)__builtin_trap();
+        if (!shared && request->shared) {
+            /* 只提升下一次重放的意图；本次读资格留到完整abort后释放，
+             * 不在持有自己的reader时等待writer。 */
+            request->shared=0;
+            set->retry=1;
+            return EAGAIN;
+        }
+        if (shared) *shared=request->shared!=0;
         return EOK;
     }
+    request->shared=shared!=NULL;
     if (set->held_last && resource_order(request->resource,set->held_last->resource)<0) {
         set->retry=1;
         return EAGAIN;
     }
-    kernel_mutex_lock(&request->resource->mutex,&request->guard);
+    if (request->shared) kernel_rwlock_read(&request->resource->lock,&request->guard);
+    else kernel_rwlock_write(&request->resource->lock,&request->guard);
     set->held_last=request;
+    if (shared) *shared=request->shared!=0;
     return EOK;
 }
 static int resource_claim_inode(void *opaque,struct ext4_operation *operation,uint32_t inode)

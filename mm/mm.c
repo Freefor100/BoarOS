@@ -5077,7 +5077,7 @@ static enum kernel_mm_status cached_write_fault(struct mm_operation *operation,
     kernel_page_cache_write_end(&permit);
     status=KERNEL_MM_STATUS_OK;
 finish:
-    if (reservation.ticket) {
+    if (reservation.ticket.owner) {
         if (inode->lock) kernel_lock_release(inode);
         if (operation->guard.lock) mm_operation_release(operation);
         kernel_page_cache_finish_mapping_write(cache,node,&reservation,status==KERNEL_MM_STATUS_OK);

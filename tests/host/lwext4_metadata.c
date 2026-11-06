@@ -858,6 +858,20 @@ static void group_fault(struct ext4_fs *fs, const char *kind, unsigned point)
     CHECK(fault_block_crash(&disk)==0);
 }
 struct owned_file_page { unsigned references, retains, releases; unsigned char *bytes; };
+static void owned_page_init(struct owned_file_page *,size_t,unsigned char);
+static unsigned ordered_retire_state_depth;
+static struct {
+    struct jbd_journal *journal;
+    struct owned_file_page *first,*second;
+    uint64_t durable;
+    bool fail,seen;
+} ordered_retire_probe;
+static void ordered_retire_state_lock(void *context)
+{ (void)context;ordered_retire_state_depth++; }
+static void ordered_retire_state_unlock(void *context)
+{ (void)context;CHECK(ordered_retire_state_depth);ordered_retire_state_depth--; }
+static void ordered_retire_mount(void *context)
+{ (void)context; }
 static void owned_page_retain(void *context)
 {
     struct owned_file_page *page=context;
@@ -869,8 +883,78 @@ static void owned_page_release(void *context)
 {
     struct owned_file_page *page=context;
     CHECK(page->references);
+    if (page==ordered_retire_probe.first && page->references==1 && !ordered_retire_probe.seen) {
+        struct jbd_journal *journal=ordered_retire_probe.journal;
+        CHECK(!ordered_retire_state_depth && ordered_retire_probe.second->references==1);
+        CHECK(journal->committing && journal->committing->ordered_count==2 &&
+            journal->durable_sequence==ordered_retire_probe.durable);
+        struct jbd_journal_reclaim goal;
+        CHECK(jbd_journal_reclaim_goal(journal,JBD_JOURNAL_MEMORY,&goal) &&
+            goal.stage==JBD_JOURNAL_COMMIT && goal.sequence==journal->committing->sequence);
+        ordered_retire_probe.seen=true;
+        if (ordered_retire_probe.fail) disk.fail_write=disk.writes+1;
+        CHECK(ext4_journal_group_checkpoint("/")==(ordered_retire_probe.fail?EIO:EOK));
+        CHECK(journal->committing && journal->durable_sequence==ordered_retire_probe.durable);
+        if (!ordered_retire_probe.fail) CHECK(journal->checkpoint_sequence==ordered_retire_probe.durable);
+    }
     page->releases++;
     if (!--page->references) { free(page->bytes); page->bytes=NULL; }
+}
+
+static void group_ordered_retire(struct ext4_fs *fs,bool fail)
+{
+    static const struct ext4_lock locks={.lock=ordered_retire_mount,.unlock=ordered_retire_mount,
+        .state_lock=ordered_retire_state_lock,
+        .state_unlock=ordered_retire_state_unlock};
+    CHECK(ext4_mount_setup_locks("/",&locks)==EOK);
+    struct ext4_journal_runtime runtime={.now_ns=group_clock};
+    CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
+    struct jbd_journal *journal=fs->jbd_journal;
+    ext4_file file;
+    CHECK(ext4_fopen(&file,"/file","r+")==EOK);
+    struct ext4_timestamp times[3]={{8246,17},{0,0},{0,0}};
+    CHECK(ext4_file_set_times(&file,1,times)==EOK && ext4_journal_group_commit("/",true)==EOK);
+    CHECK(journal->checkpoint_count==1 && journal->durable_sequence>journal->checkpoint_sequence);
+    struct owned_file_page pages[2];
+    struct file_write_span spans[2];
+    unsigned block=fs->bdev->lg_bsize;
+    for (unsigned i=0;i<2;i++) {
+        owned_page_init(&pages[i],block,0x85+i);
+        spans[i]=(struct file_write_span){.offset=i*block,.buffer=pages[i].bytes,.size=block,
+            .source={&pages[i],owned_page_retain,owned_page_release,block}};
+    }
+    CHECK(ext4_fpwrite_batch(&file,spans,2)==EOK && spans[0].written==block && spans[1].written==block);
+    for (unsigned i=0;i<2;i++) owned_page_release(&pages[i]);
+    ordered_retire_probe=(__typeof__(ordered_retire_probe)){journal,&pages[0],&pages[1],
+        journal->durable_sequence,fail,false};
+    CHECK(ext4_journal_group_commit("/",true)==(fail?EIO:EOK));
+    CHECK(ordered_retire_probe.seen && !ordered_retire_state_depth && !pages[0].references && !pages[1].references);
+    if (fail) {
+        CHECK(journal->committing && journal->failed_trans==journal->checkpointing &&
+            !journal->committing->ordered_count && journal->durable_sequence==ordered_retire_probe.durable);
+        CHECK(fault_block_crash(&disk)==0);
+    } else {
+        CHECK(!journal->committing && journal->durable_sequence>ordered_retire_probe.durable);
+        CHECK(ext4_journal_group_drain("/")==EOK && ext4_fclose(&file)==EOK);
+    }
+    ordered_retire_probe=(__typeof__(ordered_retire_probe)){0};
+    printf("PASS ordered retire: unlocked source release, older checkpoint %s, exact release and progress\n",
+        fail?"error":"completes");
+}
+
+static void group_ordered_retire_recover(struct ext4_fs *fs)
+{
+    ext4_file file;
+    struct ext4_inode inode;
+    unsigned block=fs->bdev->lg_bsize;
+    unsigned char *bytes=malloc(2*block);
+    size_t count;
+    CHECK(bytes && ext4_fopen(&file,"/file","r")==EOK && ext4_fraw_inode_fill(&file,&inode)==EOK);
+    CHECK(to_le32(inode.access_time)==8246 && !fs->jbd_journal->error);
+    CHECK(ext4_fpread(&file,0,bytes,2*block,&count)==EOK && count==2*block);
+    for (unsigned i=0;i<count;i++) CHECK(bytes[i]==(i<block?0x85:0x86));
+    CHECK(ext4_fclose(&file)==EOK);
+    free(bytes);
 }
 static void owned_page_init(struct owned_file_page *page,size_t size,unsigned char value)
 {
@@ -1848,8 +1932,8 @@ static void owner_shared_test(struct ext4_fs *fs, bool unlink_shared, bool trunc
     ext4_file first, second;struct ext4_inode initial, other, changed;
     CHECK(ext4_fopen(&first,"/file",truncating?"r+":"r")==EOK);
     if (truncating) CHECK(ext4_file_set_mode(&first,06755)==EOK);
-    CHECK(ext4_setxattr("/file","user.padding",12,padding,sizeof(padding))==EOK);
-    CHECK(ext4_setxattr("/file","security.capability",19,cap,sizeof(cap))==EOK);
+    CHECK(ext4_file_setxattr(&first,"user.padding",12,padding,sizeof(padding),0)==EOK);
+    CHECK(ext4_file_setxattr(&first,"security.capability",19,cap,sizeof(cap),0)==EOK);
     CHECK(ext4_fraw_inode_fill(&first,&initial)==EOK);
     uint64_t shared=ext4_inode_get_file_acl(&initial,&fs->sb);CHECK(shared);
     CHECK(ext4_fopen(&second,"/owner-other","w+")==EOK);
@@ -1872,10 +1956,10 @@ static void owner_shared_test(struct ext4_fs *fs, bool unlink_shared, bool trunc
     CHECK(ext4_fraw_inode_fill(&second,&other)==EOK);
     if (setting) {
         uint32_t replacement[5]={0x02000000,4,0,0,0},value[5];
-        CHECK(ext4_setxattr("/file","security.capability",19,replacement,sizeof(replacement))==EOK);
-        CHECK(ext4_getxattr("/file","security.capability",19,value,sizeof(value),&length)==EOK &&
+        CHECK(ext4_file_setxattr(&first,"security.capability",19,replacement,sizeof(replacement),0)==EOK);
+        CHECK(ext4_file_getxattr(&first,"security.capability",19,value,sizeof(value),&length)==EOK &&
               length==sizeof(value) && !memcmp(value,replacement,sizeof(value)));
-        CHECK(ext4_getxattr("/owner-other","security.capability",19,value,sizeof(value),&length)==EOK &&
+        CHECK(ext4_file_getxattr(&second,"security.capability",19,value,sizeof(value),&length)==EOK &&
               length==sizeof(value) && !memcmp(value,cap,sizeof(value)));
         CHECK(ext4_fraw_inode_fill(&first,&changed)==EOK && ext4_inode_get_file_acl(&changed,&fs->sb)!=shared);
         CHECK(ext4_fraw_inode_fill(&second,&changed)==EOK && !memcmp(&changed,&other,sizeof(other)));
@@ -1885,7 +1969,7 @@ static void owner_shared_test(struct ext4_fs *fs, bool unlink_shared, bool trunc
     }
     if(unlink_shared) {
         CHECK(ext4_fclose(&first)==EOK && ext4_fremove("/file")==EOK);
-        CHECK(ext4_getxattr("/owner-other","security.capability",19,padding,sizeof(padding),&length)==EOK && length==sizeof(cap) && !memcmp(padding,cap,sizeof(cap)));
+        CHECK(ext4_file_getxattr(&second,"security.capability",19,padding,sizeof(padding),&length)==EOK && length==sizeof(cap) && !memcmp(padding,cap,sizeof(cap)));
         CHECK(ext4_block_get(fs->bdev,&block,shared)==EOK);
         memcpy(&header,block.data,sizeof(header));
         CHECK(to_le32(header.refcount)==1 && ext4_block_set(fs->bdev,&block)==EOK);
@@ -1903,8 +1987,8 @@ static void owner_shared_test(struct ext4_fs *fs, bool unlink_shared, bool trunc
     CHECK(ext4_inode_get_blocks_count(&fs->sb,&changed)==expected);
     CHECK(ext4_fraw_inode_fill(&second,&changed)==EOK && !memcmp(&changed,&other,sizeof(other)));
     uint32_t value[5];
-    CHECK(ext4_getxattr("/file","security.capability",19,value,sizeof(value),&length)==ENODATA);
-    CHECK(ext4_getxattr("/owner-other","security.capability",19,value,sizeof(value),&length)==EOK && length==sizeof(cap) && !memcmp(value,cap,sizeof(cap)));
+    CHECK(ext4_file_getxattr(&first,"security.capability",19,value,sizeof(value),&length)==ENODATA);
+    CHECK(ext4_file_getxattr(&second,"security.capability",19,value,sizeof(value),&length)==EOK && length==sizeof(cap) && !memcmp(value,cap,sizeof(cap)));
     CHECK(ext4_file_sync_metadata(&first)==EOK && ext4_fclose(&first)==EOK && ext4_fclose(&second)==EOK);
 }
 
@@ -1921,21 +2005,21 @@ static void owner_test(struct ext4_fs *fs, bool readonly)
     }
     uint32_t cap[5]={0x02000000,1,0,0,0}; size_t length;
     CHECK(ext4_file_set_mode(&f,06755)==EOK);
-    CHECK(ext4_setxattr("/file","security.capability",19,cap,sizeof(cap))==EOK);
+    CHECK(ext4_file_setxattr(&f,"security.capability",19,cap,sizeof(cap),0)==EOK);
     uint32_t value[5];
     CHECK(ext4_fraw_inode_fill(&f,&before)==EOK);
     CHECK(ext4_transaction_begin("/")==EOK);
     CHECK(ext4_file_set_owner(&f,70001,80002, UINT32_MAX)==EOK);
     CHECK(ext4_transaction_abort("/",ECANCELED)==ECANCELED);
     CHECK(ext4_fraw_inode_fill(&f,&after)==EOK && !memcmp(&before,&after,sizeof(before)));
-    int restored_capability=ext4_getxattr("/file","security.capability",19,value,sizeof(value),&length);
+    int restored_capability=ext4_file_getxattr(&f,"security.capability",19,value,sizeof(value),&length);
     if (restored_capability || length!=sizeof(cap) || memcmp(value,cap,sizeof(cap)))
         fprintf(stderr,"capability after abort: error=%d length=%zu value=%x,%x,%x,%x,%x\n",restored_capability,length,value[0],value[1],value[2],value[3],value[4]);
     CHECK(restored_capability==EOK && length==sizeof(cap) && !memcmp(value,cap,sizeof(cap)));
     CHECK(ext4_file_set_owner(&f,70001,80002, UINT32_MAX)==EOK);
     CHECK(ext4_fraw_inode_fill(&f,&after)==EOK);
     CHECK(ext4_fraw_inode_fill(&f,&after)==EOK && ext4_inode_get_uid(&after)==70001 && ext4_inode_get_gid(&after)==80002 && (ext4_inode_get_mode(&fs->sb,&after)&07777)==0755);
-    CHECK(ext4_getxattr("/file","security.capability",19,value,sizeof(value),&length)==ENODATA);
+    CHECK(ext4_file_getxattr(&f,"security.capability",19,value,sizeof(value),&length)==ENODATA);
     CHECK(ext4_file_set_mode(&f,06640)==EOK);
     CHECK(ext4_file_set_owner(&f,UINT32_MAX,UINT32_MAX, UINT32_MAX)==EOK);
     CHECK(ext4_fraw_inode_fill(&f,&after)==EOK && ext4_inode_get_uid(&after)==70001 && ext4_inode_get_gid(&after)==80002 && (ext4_inode_get_mode(&fs->sb,&after)&07777)==02640);
@@ -2013,7 +2097,7 @@ static void failure_test(struct ext4_fs *fs,const char *mode,uint64_t expected,u
     if(owner_op) {
         uint32_t cap[5]={0x02000000,1,0,0,0};
         CHECK(ext4_file_set_mode(&f,06755)==EOK);
-        CHECK(ext4_setxattr("/file","security.capability",19,cap,sizeof(cap))==EOK);
+        CHECK(ext4_file_setxattr(&f,"security.capability",19,cap,sizeof(cap),0)==EOK);
         CHECK(ext4_fraw_inode_fill(&f,&before)==EOK);
     }
     uint32_t tid=fs->jbd_journal?fs->jbd_journal->committed_id:0;
@@ -2038,7 +2122,7 @@ static void failure_test(struct ext4_fs *fs,const char *mode,uint64_t expected,u
         } else CHECK(oom && !point);
         if(stats_op)CHECK(ext4_mount_point_stats("/",&stats)==EOK && stats.overhead_blocks==expected);
         else if(owner_op) {
-            if(r!=EOK) { uint32_t cap[5];size_t length;CHECK(ext4_getxattr("/file","security.capability",19,cap,sizeof(cap),&length)==EOK && length==sizeof(cap)); }
+            if(r!=EOK) { uint32_t cap[5];size_t length;CHECK(ext4_file_getxattr(&f,"security.capability",19,cap,sizeof(cap),&length)==EOK && length==sizeof(cap)); }
             CHECK(ext4_file_set_owner(&f,70001,80002, UINT32_MAX)==EOK);
             CHECK(ext4_fraw_inode_fill(&f,&after)==EOK && ext4_inode_get_uid(&after)==70001 && ext4_inode_get_gid(&after)==80002);
         }
@@ -3046,6 +3130,11 @@ int main(int argc,char **argv)
         bool failed=!strcmp(argv[2],"group-partial-error");group_partial_owner(dev.fs,failed);if(failed)return 0;
     }
     else if(!strcmp(argv[2],"group-data-owner"))group_data_owner(dev.fs);
+    else if(!strcmp(argv[2],"group-ordered-retire") || !strcmp(argv[2],"group-ordered-retire-error")) {
+        bool fail=!strcmp(argv[2],"group-ordered-retire-error");
+        group_ordered_retire(dev.fs,fail);if(fail)return 0;
+    }
+    else if(!strcmp(argv[2],"group-ordered-retire-recover"))group_ordered_retire_recover(dev.fs);
     else if(!strcmp(argv[2],"group-data-batch"))group_data_batch(dev.fs);
     else if(!strcmp(argv[2],"group-borrow-admission"))group_borrow_admission(dev.fs);
     else if(!strcmp(argv[2],"group-source-budget") || !strcmp(argv[2],"group-source-error")) {
@@ -3057,12 +3146,13 @@ int main(int argc,char **argv)
     else if(!strcmp(argv[2],"owner-shared") || !strcmp(argv[2],"owner-shared-unlink") || !strcmp(argv[2],"truncate-shared") || !strcmp(argv[2],"owner-shared-set"))
         owner_shared_test(dev.fs,!strcmp(argv[2],"owner-shared-unlink"),!strcmp(argv[2],"truncate-shared"),!strcmp(argv[2],"owner-shared-set"));
     else if(!strcmp(argv[2],"verify-truncate-shared")) {
-        ext4_file f;struct ext4_inode ino;uint32_t value[5];size_t length;
+        ext4_file f,other;struct ext4_inode ino;uint32_t value[5];size_t length;
         CHECK(ext4_fopen(&f,"/file","r")==EOK && ext4_fraw_inode_fill(&f,&ino)==EOK);
         CHECK((ext4_inode_get_mode(&dev.fs->sb,&ino)&07777)==06755);
-        CHECK(ext4_getxattr("/file","security.capability",19,value,sizeof(value),&length)==ENODATA);
-        CHECK(ext4_getxattr("/owner-other","security.capability",19,value,sizeof(value),&length)==EOK && length==sizeof(value));
-        CHECK(ext4_fclose(&f)==EOK);
+        CHECK(ext4_file_getxattr(&f,"security.capability",19,value,sizeof(value),&length)==ENODATA);
+        CHECK(ext4_fopen(&other,"/owner-other","r")==EOK);
+        CHECK(ext4_file_getxattr(&other,"security.capability",19,value,sizeof(value),&length)==EOK && length==sizeof(value));
+        CHECK(ext4_fclose(&other)==EOK && ext4_fclose(&f)==EOK);
     }
     else if(!strcmp(argv[2],"owner") || !strcmp(argv[2],"owner-ro"))owner_test(dev.fs,readonly);
     else if(!strcmp(argv[2],"verify-owner")) {
@@ -3077,7 +3167,7 @@ int main(int argc,char **argv)
         bool committed=ext4_inode_get_uid(&ino)==70001;
         CHECK(ext4_inode_get_uid(&ino)==(committed?70001:0) && ext4_inode_get_gid(&ino)==(committed?80002:0));
         CHECK((ext4_inode_get_mode(&dev.fs->sb,&ino)&07777)==(committed?0755:06755));
-        int r=ext4_getxattr("/file","security.capability",19,cap,sizeof(cap),&length);
+        int r=ext4_file_getxattr(&f,"security.capability",19,cap,sizeof(cap),&length);
         CHECK(committed?r==ENODATA:r==EOK && length==sizeof(cap));
         CHECK(ext4_fclose(&f)==EOK);
     }

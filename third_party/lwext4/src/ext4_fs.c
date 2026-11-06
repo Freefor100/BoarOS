@@ -78,6 +78,7 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 
 	fs->bdev = bdev;
 	fs->active_operations = 0;
+	kernel_raw_lock_init(&fs->block_space,KERNEL_RAW_RANK_OBJECT);
 	fs->reserved_blocks = 0;
     fs->delayed_blocks = 0;
 	fs->reserved_inodes = 0;
@@ -554,19 +555,23 @@ static uint16_t ext4_fs_bg_checksum(struct ext4_sblock *sb, uint32_t bgid,
 	return crc;
 }
 
-#if CONFIG_META_CSUM_ENABLE
-static bool ext4_fs_verify_bg_csum(struct ext4_sblock *sb,
+bool ext4_fs_verify_bg_csum(struct ext4_sblock *sb,
 				   uint32_t bgid,
 				   struct ext4_bgroup *bg)
 {
+#if CONFIG_META_CSUM_ENABLE
 	if (!ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM))
 		return true;
 
 	return ext4_fs_bg_checksum(sb, bgid, bg) == to_le16(bg->checksum);
-}
 #else
-#define ext4_fs_verify_bg_csum(...) true
+    (void)sb; (void)bgid; (void)bg;
+    return true;
 #endif
+}
+
+void ext4_fs_update_bg_csum(struct ext4_sblock *sb,uint32_t bgid,struct ext4_bgroup *bg)
+{ bg->checksum=to_le16(ext4_fs_bg_checksum(sb,bgid,bg)); }
 
 static int ext4_fs_get_block_group_ref_mode(struct ext4_fs *fs, uint32_t bgid,
     struct ext4_block_group_ref *ref, bool write)
@@ -617,6 +622,10 @@ int ext4_fs_get_block_group_ref_write(struct ext4_fs *fs, uint32_t bgid,
     int result = ext4_operation_require_resource(fs, EXT4_RESOURCE_BLOCK_GROUP, bgid);
     return result ? result : ext4_fs_get_block_group_ref_mode(fs, bgid, ref, true);
 }
+
+int ext4_fs_get_block_group_ref_claim(struct ext4_fs *fs,uint32_t bgid,
+                                     struct ext4_block_group_ref *ref)
+{ return ext4_fs_get_block_group_ref_mode(fs,bgid,ref,true); }
 
 int ext4_fs_calculate_overhead(struct ext4_fs *fs, uint64_t *blocks)
 {
@@ -1624,7 +1633,7 @@ out:
         int cleanup = ext4_block_set(fs->bdev, &path[--held]);
         if (!r) r = cleanup;
     }
-    if (!published) {
+    if (!published && !ext4_current_trans(fs)) {
         if (data_owned) {
             int cleanup = ext4_balloc_free_blocks(ref, range->block, range->count);
             if (cleanup) r = cleanup;
