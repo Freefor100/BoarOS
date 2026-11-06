@@ -49,6 +49,7 @@
 #define LINUX_SYSCALL_FALLOCATE 47U
 #define LINUX_SYSCALL_OPENAT 56U
 #define LINUX_SYSCALL_OPENAT2 437U
+#define LINUX_SYSCALL_MEMFD_CREATE 279U
 #define LINUX_SYSCALL_CLOSE 57U
 #define LINUX_SYSCALL_PIPE2 59U
 #define LINUX_SYSCALL_GETDENTS64 61U
@@ -512,6 +513,9 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
+    } else if (request->number == LINUX_SYSCALL_MEMFD_CREATE) {
+        if (syscall_handle_memfd_create(caller,request,&decoded) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_CLOSE) {
         if (syscall_handle_close(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {

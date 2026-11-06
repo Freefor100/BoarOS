@@ -4,6 +4,7 @@
 #include "../pipe_internal.h"
 #include "../record_lock.h"
 #include <kernel/mqueue.h>
+#include <kernel/tmpfs.h>
 #include <kernel/task.h>
 #include "../vfs_internal.h"
 #include "../char_device_internal.h"
@@ -1008,6 +1009,28 @@ enum kernel_files_status kernel_files_dup2(
     }
     return kernel_files_dup3(files, oldfd, newfd, 0, result);
 }
+enum kernel_files_status kernel_files_memfd(struct kernel_files *files,const char *name,
+    uint32_t flags,int64_t *result)
+{
+    uint32_t fd; int error;
+    enum kernel_files_status status=kernel_files_find_free_fd(files,&fd,&error);
+    if (status || error) { *result=error; return status; }
+    KERNEL_FILES_RESERVATION_SCOPE(reservation);
+    reservation.files=files;reservation.fd=fd;
+    struct kernel_open_file_description *file=NULL;
+    error=kernel_open_file_create_memfd(files->heap,name,flags,&file);
+    if (error) { *result=error; return KERNEL_FILES_STATUS_OK; }
+    status=kernel_files_install_new_owned_at(files,fd,
+        (flags&KERNEL_MFD_CLOEXEC) ? KERNEL_FILES_FD_CLOEXEC : 0,&file);
+    if (status) {
+        if (kernel_open_file_release(&file)) __builtin_trap();
+        return status;
+    }
+    reservation.files=NULL;
+    *result=fd;
+    return KERNEL_FILES_STATUS_OK;
+}
+
 enum kernel_files_status kernel_files_fcntl(
     struct kernel_files *files, int64_t fd, uint64_t command, uint64_t argument, int64_t *result)
 {
@@ -1018,6 +1041,17 @@ enum kernel_files_status kernel_files_fcntl(
         }
         return dup_from(files, fd, (uint32_t)argument,
             command==KERNEL_FILES_F_DUPFD_CLOEXEC ? KERNEL_FILES_FD_CLOEXEC : 0, result);
+    }
+    if (command==KERNEL_FILES_F_ADD_SEALS || command==KERNEL_FILES_F_GET_SEALS) {
+        KERNEL_FILES_PIN_SCOPE(pin);
+        struct kernel_open_file_description *file=kernel_files_hold_fd(files,fd,&pin);
+        int add=command==KERNEL_FILES_F_ADD_SEALS;
+        uint32_t seals=(uint32_t)argument;
+        if (!file || file->kind==KERNEL_OPEN_FILE_KIND_PATH) *result=-KERNEL_EBADF;
+        else if (add && !kernel_open_file_writable(file)) *result=-KERNEL_EPERM;
+        else if (add && (seals&~KERNEL_SEAL_ALL)) *result=-KERNEL_EINVAL;
+        else *result=kernel_tmpfs_file_seals(&file->file,add,seals);
+        return KERNEL_FILES_STATUS_OK;
     }
     if(command==1031U || command==1032U) {
         KERNEL_FILES_PIN_SCOPE(pin);

@@ -40,6 +40,7 @@ enum kernel_mm_status {
     KERNEL_MM_STATUS_ACCESS,
     KERNEL_MM_STATUS_LOCK_LIMIT,
     KERNEL_MM_STATUS_LOCK_PERMISSION,
+    KERNEL_MM_STATUS_SEALED,
 };
 
 enum kernel_mm_state {

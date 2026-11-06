@@ -1,4 +1,5 @@
 #include <kernel/credentials.h>
+#include <kernel/tmpfs.h>
 #include <kernel/pidfd.h>
 #include "open_file_internal.h"
 #include "block_file_internal.h"
@@ -266,6 +267,26 @@ static enum kernel_open_file_status create_open_file(
     *owner = file;
     *linux_result = 0;
     return KERNEL_OPEN_FILE_STATUS_OK;
+}
+
+int kernel_open_file_create_memfd(struct kernel_heap *heap,const char *name,uint32_t flags,
+    struct kernel_open_file_description **owner)
+{
+    struct kernel_open_file_description *file;
+    enum kernel_heap_status status=kernel_heap_allocate_zeroed(heap,1,sizeof(*file),(void **)&file);
+    if (status) return status==KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+    int result=kernel_tmpfs_memfd(heap,name,flags,&file->file);
+    if (result) {
+        kernel_heap_release(heap,file);
+        return result;
+    }
+    /* Like Linux alloc_file_pseudo(), the original descriptor is writable
+     * without a persistent writer lease; execveat can use that same FD. */
+    initialize_path_description(file,heap);
+    file->kind=KERNEL_OPEN_FILE_KIND_REGULAR;
+    file->open_flags=0100002U; /* O_RDWR | O_LARGEFILE */
+    *owner=file;
+    return 0;
 }
 
 enum kernel_open_file_status kernel_open_file_create_at(

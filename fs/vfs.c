@@ -17,6 +17,7 @@
 #include <kernel/physical_page.h>
 #include <kernel/posix_acl.h>
 #include <kernel/scheduler.h>
+#include <kernel/tmpfs.h>
 #include <kernel/vfs.h>
 
 #include <string.h>
@@ -1584,7 +1585,9 @@ static void dentry_release(struct kernel_vfs_dentry **owner)
             KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
             if (!entry->references) __builtin_trap();
             if (__atomic_fetch_sub(&entry->references,1,__ATOMIC_ACQ_REL)!=1) return;
-            unregister_path(entry);
+            /* Anonymous dentries are owned by their paths but have no name index. */
+            if (entry->previous) unregister_path(entry);
+            else if (!entry->detached || entry->parent) __builtin_trap();
         }
         struct kernel_vfs_dentry *parent=entry->parent;
         if (kernel_vfs_close(&entry->file)) __builtin_trap();
@@ -1620,6 +1623,40 @@ static int path_wrap(struct kernel_vfs_mount *mount,struct kernel_vfs_dentry *en
     }
     if (existing) kernel_heap_release(instance->heap,path);
     if (!result) *owner=existing ? existing : path;
+    return result;
+}
+
+int kernel_vfs_attach_unnamed_path(struct kernel_vfs_file *file,const char *name)
+{
+    struct kernel_vfs_node *node=kernel_vfs_file_node(file);
+    if (!node || !node->unlinked || file->path) return -KERNEL_EINVAL;
+    struct kernel_vfs_instance *instance=node->instance;
+    size_t length=strlen(name)+1;
+    struct kernel_vfs_dentry *entry;
+    enum kernel_heap_status allocation=kernel_heap_allocate_zeroed(instance->heap,1,
+        sizeof(*entry)+length,(void **)&entry);
+    if (allocation) return allocation==KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+    entry->heap=instance->heap;
+    entry->references=1;
+    entry->detached=1;
+    entry->name=entry->initial_name;
+    memcpy(entry->name,name,length);
+    {
+        KERNEL_LOCK_SCOPE(io);
+        kernel_vfs_node_lock(node,&io,1);
+        if (node->open_files==UINT32_MAX || kernel_vfs_node_acquire(node)) {
+            kernel_heap_release(entry->heap,entry);
+            return -KERNEL_EOVERFLOW;
+        }
+        node->open_files++;
+        if (__atomic_fetch_add(&instance->external_files,1,__ATOMIC_RELAXED)==UINT32_MAX)
+            __builtin_trap();
+        entry->file=*file;
+        entry->file.mount=&instance->backend_mount;
+        entry->file.location_owner=0;
+    }
+    int result=path_wrap(file->mount,entry,&file->path);
+    dentry_release(&entry);
     return result;
 }
 
@@ -1731,6 +1768,16 @@ static int path_string(const struct kernel_vfs_path *path,const struct kernel_vf
     const struct kernel_vfs_dentry *entry=path->dentry;
     struct kernel_vfs_mount *mount=path->file.mount;
     size_t position=capacity-1;int deleted=0,result=0,unreachable=0;buffer[position]=0;
+    if (entry->detached && !entry->parent) {
+        static const char suffix[]=" (deleted)";
+        size_t length=strlen(entry->name);
+        if (!display) return -KERNEL_ENOENT;
+        if (capacity<1+length+sizeof(suffix)) return -KERNEL_ERANGE;
+        buffer[0]='/';
+        memcpy(buffer+1,entry->name,length);
+        memcpy(buffer+1+length,suffix,sizeof(suffix));
+        return 0;
+    }
     if (entry->detached || ((struct kernel_vfs_node *)entry->file.private_data)->unlinked) {
         if (cwd) return -KERNEL_ENOENT;
         if (display) deleted=1;
@@ -2230,6 +2277,8 @@ static int memory_write_source(struct kernel_vfs_node *node,uint64_t offset,
         if (count>size-*written) count=size-*written;
         KERNEL_LOCK_SCOPE(io);
         kernel_vfs_node_lock(node,&io,1);
+        if ((node->file_seals&KERNEL_SEAL_GROW) &&
+            (offset>node->size || count>node->size-offset)) return -KERNEL_EPERM;
         uint64_t address,index=offset>>BOAROS_PAGE_SHIFT; int created;
         enum kernel_memory_object_status status=kernel_memory_object_prepare_page(
             node->memory,index,&address,&created);
@@ -2308,6 +2357,7 @@ static int vfs_write_source_locked(struct kernel_vfs_file *file,uint64_t offset,
         result = kernel_vfs_file_modified(file, offset, 0);
         if (result) return result;
     }
+    if (node->file_seals&KERNEL_SEAL_WRITES) return -KERNEL_EPERM;
     kernel_lock_release(&node_guard);
     result = node->memory
         ? memory_write_source(node,offset,source,size,&written)
@@ -2422,6 +2472,9 @@ int kernel_vfs_fallocate_borrowing(struct kernel_vfs_file *file, unsigned mode,
         limit->exceeded = 1;
         return -KERNEL_EFBIG;
     }
+    if (mode & KERNEL_VFS_FALLOC_PUNCH_HOLE) {
+        if (node->file_seals&KERNEL_SEAL_WRITES) return -KERNEL_EPERM;
+    } else if ((node->file_seals&KERNEL_SEAL_GROW) && end>old_size) return -KERNEL_EPERM;
     struct kernel_page_cache *cache = node->instance->page_cache;
     int result = kernel_file_mapping_prepare(node);
     if (result) return result;
@@ -2498,6 +2551,8 @@ int kernel_vfs_ftruncate_borrowing(struct kernel_vfs_file *file,
     /* Even a same-size ftruncate updates mtime/ctime. Reconciliation also
      * preserves visible inode mutations when the backend reports an error. */
     if (size > node->max_size) return -KERNEL_EFBIG;
+    if ((size<node->size && (node->file_seals&KERNEL_SEAL_SHRINK)) ||
+        (size>node->size && (node->file_seals&KERNEL_SEAL_GROW))) return -KERNEL_EPERM;
     if (node->memory) {
         /* 关闭旧候选的发布，释放inode锁后才逐MM撤销。登记/OFD覆盖回调
          * 寿命；缺页最终校验取得IO读锁，因此关闭与提交有唯一先后关系。 */
@@ -3520,6 +3575,7 @@ int kernel_vfs_node_release(struct kernel_vfs_node **owner)
         if (!__atomic_compare_exchange_n(&node->references, &references, 0, 0,
             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) { kernel_task_lock_release(&irq); continue; }
         if (!kernel_file_mapping_empty(node) || node->fifo_pipe || node->cache_pages ||
+            __atomic_load_n(&node->shared_write_bytes,__ATOMIC_ACQUIRE) ||
             node->dirty_cache_pages.tree.rbh_root || node->dirty_cache_pages.count ||
             node->dirty_cache_pages.queue_next || node->dirty_cache_pages.queue_previous ||
             !kernel_record_lock_state_empty(&node->record_locks)) __builtin_trap();
@@ -4354,6 +4410,12 @@ int kernel_vfs_publish_node(struct kernel_vfs_mount *mount,
     __atomic_fetch_add(&instance->external_files, 1, __ATOMIC_RELAXED);
     file_location_acquire(file);
     return 0;
+}
+
+uint64_t *kernel_vfs_node_shared_write_counter(struct kernel_vfs_node *node,int *sealed)
+{
+    *sealed=!!(node->file_seals&KERNEL_SEAL_WRITES);
+    return node->memfd ? &node->shared_write_bytes : NULL;
 }
 
 struct kernel_memory_object *kernel_vfs_file_memory(const struct kernel_vfs_file *file)

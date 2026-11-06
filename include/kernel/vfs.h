@@ -453,6 +453,8 @@ int kernel_vfs_files_share_node(const struct kernel_vfs_file *left,
 /* 已持有 node 的调用者可取得独立引用，跨关闭或撤映射保持 inode 身份。 */
 int kernel_vfs_node_acquire(struct kernel_vfs_node *node);
 int kernel_vfs_node_release(struct kernel_vfs_node **owner);
+/* Call under inode I/O qualification; the OFD covers the returned counter. */
+uint64_t *kernel_vfs_node_shared_write_counter(struct kernel_vfs_node *, int *sealed);
 
 int kernel_vfs_file_xattr(struct kernel_vfs_file *, enum kernel_xattr_operation,
     const char *, void *, size_t, uint32_t);

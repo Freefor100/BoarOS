@@ -122,6 +122,14 @@ OFD pin 覆盖可能缺页睡眠的复制。`make test-record-lock-riscv` 用同
 
 `renameat2` 支持 flags 0 和 `RENAME_NOREPLACE`；未知或互斥组合返回 `EINVAL`，EXCHANGE/WHITEOUT 返回 `ENOTSUP`。保留 `renameat(38)` 兼容入口；固定 RV64 Linux 与 musl 使用 `renameat2(276)` 完成普通 rename，因此差分也使用该原生入口。后端操作事务成功接受后发布内存目录项变化，异步 journal mount 的持久化由组提交及目录同步保证；覆盖目标的 OFD 保留原 inode 和内容。目录 `..`、两侧链接数和持久 orphan 由同一事务处理。
 
+## `memfd_create` 与文件封印
+
+`memfd_create(279)` 返回可读写的匿名 tmpfs 文件；名称只用于 `/proc/<pid>/fd` 等展示。文件没有目录项，可通过 dup、fork 或 UNIX socket 传递 FD，也可经 proc FD 链接重新打开。FD 与映射共同维持同一 inode 和内存后备的寿命。支持 `MFD_CLOEXEC`、`MFD_ALLOW_SEALING`、`MFD_EXEC` 和 `MFD_NOEXEC_SEAL`；`MFD_HUGETLB` 返回 `EOPNOTSUPP`。
+
+`F_GET_SEALS` 查询 inode 上的封印，`F_ADD_SEALS` 通过可写 FD 增加封印。SHRINK、GROW 和 WRITE 约束对应的文件修改；已有共享映射仍有写权限或可升级为写时，添加 WRITE 返回 `EBUSY`。FUTURE_WRITE 禁止新的写入和新的共享可写映射，保留原有映射的权限；后续建立的共享只读映射不能用 `mprotect` 加写权限。EXEC 锁定执行位，给已可执行的文件增加该封印时也封住写入和尺寸变更；SEAL 禁止继续增加封印。映射拆分、搬移和 fork 维护原 inode 的写资格，撤映射在旧 PTE 失效后归还。
+
+`tests/userland/memfd.c` 检查 FD 传递、共享映射、proc 重开、封印和尺寸变更。
+
 ## `pipe2` 与 FIFO endpoint
 
 普通用户的匿名管道、已打开FIFO读写及普通文件到管道的sendfile在发起CPU执行，复用下述片段、读写资格和端点短保护。没有附加观察者的匿名管道末OFD在调用者结束端点并通知；存在epoll登记或FIFO inode时仍沿CPU0完成关联清理。pipe2创建和FIFO路径打开沿原CPU0执行位置。

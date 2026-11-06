@@ -85,6 +85,9 @@ struct kernel_vfs_node {
     struct kernel_rwlock namespace_lock;
     uint32_t uid, gid;
     uint8_t metadata_immutable; /* Immutable/append-only inode flags, read with DAC fields. */
+    uint8_t file_seals; /* tmpfs seals, protected by the inode I/O qualification. */
+    uint8_t memfd;
+    uint64_t shared_write_bytes; /* Committed MAYWRITE VMA bytes, including read-only mappings. */
 };
 
 /* A dentry owns its inode and canonical parent; mount aliases share mutations. */
@@ -270,6 +273,7 @@ int kernel_vfs_inode_times_allowed(struct kernel_vfs_node *, const struct kernel
 void kernel_vfs_creation_identity(uint32_t parent_mode, uint32_t parent_gid,
     uint32_t *mode, uint32_t *uid, uint32_t *gid);
 void kernel_vfs_record_writeback_error(struct kernel_vfs_node *node, int error);
+int kernel_vfs_attach_unnamed_path(struct kernel_vfs_file *, const char *name);
 int kernel_vfs_publish_node(struct kernel_vfs_mount *mount, struct kernel_vfs_node *node,
     struct kernel_vfs_file *file, int creating);
 #endif

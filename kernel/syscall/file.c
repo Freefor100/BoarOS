@@ -7,6 +7,7 @@
 #include <kernel/open_file.h>
 #include <kernel/scheduler.h>
 #include <kernel/task.h>
+#include <kernel/tmpfs.h>
 #include <kernel/socket.h>
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
@@ -15,6 +16,32 @@
 #include <stdint.h>
 
 
+
+enum kernel_syscall_status syscall_handle_memfd_create(struct kernel_task *caller,
+    const struct kernel_syscall_request *request,struct kernel_syscall_result *decoded)
+{
+    uint32_t flags=(uint32_t)request->arguments[1];
+    uint32_t known=KERNEL_MFD_CLOEXEC | KERNEL_MFD_ALLOW_SEALING |
+        KERNEL_MFD_HUGETLB | KERNEL_MFD_NOEXEC_SEAL | KERNEL_MFD_EXEC;
+    if (flags&KERNEL_MFD_HUGETLB) known|=UINT32_C(0xfc000000);
+    decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+    if ((flags&~known) || (flags&KERNEL_MFD_EXEC && flags&KERNEL_MFD_NOEXEC_SEAL)) {
+        decoded->value=-KERNEL_EINVAL;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    struct kernel_mm *mm;
+    struct kernel_files *files;
+    if (kernel_task_mm_borrow_mutable(caller,&mm) || kernel_task_files_borrow(caller,&files))
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    char name[6+KERNEL_MEMFD_NAME_MAX+1]={'m','e','m','f','d',':'};
+    size_t length;
+    enum kernel_uaccess_status copied=kernel_copy_string_from_user(mm,name+6,
+        request->arguments[0],KERNEL_MEMFD_NAME_MAX+1,&length);
+    if (copied) decoded->value=copied==KERNEL_UACCESS_STATUS_TOO_LONG ? -KERNEL_EINVAL : -KERNEL_EFAULT;
+    else if (flags&KERNEL_MFD_HUGETLB) decoded->value=-KERNEL_EOPNOTSUPP;
+    else if (kernel_files_memfd(files,name,flags,&decoded->value)) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
 
 enum kernel_syscall_status syscall_handle_umask(
     struct kernel_task *caller,
