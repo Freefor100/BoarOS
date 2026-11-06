@@ -493,6 +493,34 @@ static void delayed_allocation(struct kernel_page_cache *cache, struct kernel_vf
     assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&file)));
     expect_bytes(&file,bytes,sizeof(bytes));
     assert(!kernel_vfs_ftruncate(&file,0));
+    /* The old preparation stays alive while fallocate turns a nearby hole
+     * into an unwritten mapping. Covering that mapping must work at zero quota. */
+    struct kernel_vfs_file filler={0};
+    assert(!create_file(mount,"/delalloc-full-quota",0600,&filler));
+    void *held=NULL,*full=NULL;
+    {
+        KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(kernel_vfs_file_node(&file),&io,1);
+        assert(!ext4_file_reserve_write(lwext4_node_file(kernel_vfs_file_node(&file)),
+            0,block,&done,&held) && done==block && held);
+    }
+    assert(!kernel_vfs_fallocate(&file,KERNEL_VFS_FALLOC_KEEP_SIZE,block,block));
+    {
+        KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(kernel_vfs_file_node(&filler),&io,1);
+        size_t length=ext4_fs_available_blocks(fs)*block;
+        assert(length && !ext4_file_reserve_write(lwext4_node_file(kernel_vfs_file_node(&filler)),
+            0,length,&done,&full) && done==length && full);
+    }
+    assert(!ext4_fs_available_blocks(fs));
+    assert(!kernel_vfs_pwrite(&file,block,bytes,block,&done) && done==block);
+    {
+        KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(kernel_vfs_file_node(&filler),&io,1);
+        ext4_file_finish_reservation(lwext4_node_file(kernel_vfs_file_node(&filler)),full,0,0);
+    }
+    {
+        KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(kernel_vfs_file_node(&file),&io,1);
+        ext4_file_finish_reservation(lwext4_node_file(kernel_vfs_file_node(&file)),held,0,0);
+    }
+    assert(fs->delayed_blocks==baseline && !kernel_vfs_close(&filler));
     assert(!kernel_vfs_sync(&file,0,&observed) && !kernel_vfs_close(&file));
     puts("PASS delayed allocation: cache visibility, failed writeback ownership, retry, batched conversion and truncate");
 }
@@ -1543,7 +1571,8 @@ mounted_done:
     assert(!kernel_vfs_create(memory,"/unsupported",0600,&unsupported));
     assert(kernel_vfs_fallocate(&unsupported,0,0,4096)==-KERNEL_EOPNOTSUPP);
     assert(kernel_vfs_fallocate(&unsupported,1,0,4096)==-KERNEL_EOPNOTSUPP);
-    assert(kernel_vfs_fallocate(&unsupported,3,0,4096)==-KERNEL_EOPNOTSUPP);
+    assert(!kernel_vfs_fallocate(&unsupported,KERNEL_VFS_FALLOC_KEEP_SIZE |
+        KERNEL_VFS_FALLOC_PUNCH_HOLE,0,4096));
     assert(!kernel_vfs_file_block_device(&unsupported));
     assert(!kernel_vfs_close(&unsupported) && !kernel_vfs_unmount(memory));
     assert(!physical_page_allocator_audit(&pages) && physical_page_available(&pages)==baseline);

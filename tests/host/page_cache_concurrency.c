@@ -3317,12 +3317,18 @@ static void writeback_start_failure(struct kernel_page_cache *cache,const char *
     assert(!close(storage.fd));
     puts("PASS failed journal-start FLUSH retains mount, cache, physical pressure owner and actual allocated metadata");
 }
+struct domain_quota_request {
+    struct kernel_vfs_file *file;
+    unsigned done;
+};
+
 static void *domain_quota_writer(void *argument)
 {
     cache_test_attach(10);progress_writeback_caller=1;
-    struct kernel_vfs_file *file=argument;size_t done;
-    assert(!kernel_vfs_pwrite(file,0,"quota",5,&done) && done==5);
-    progress_writeback_caller=0;return NULL;
+    struct domain_quota_request *request=argument;size_t done;
+    assert(!kernel_vfs_pwrite(request->file,0,"quota",5,&done) && done==5);
+    progress_writeback_caller=0;
+    __atomic_store_n(&request->done,1,__ATOMIC_RELEASE);return NULL;
 }
 static void *admission_credit_writer(void *file)
 {
@@ -3439,8 +3445,24 @@ static void writeback_domains(struct kernel_page_cache *cache,const char *path)
     unsigned char value=0x39;
     for (unsigned i=1;i<=2;i++)
         assert(!kernel_vfs_pwrite(&files[0],i*BOAROS_PAGE_SIZE,&value,1,&done) && done==1);
+    /* Reach this device's own limit before starting the worker. The last seed
+     * write reaches the limit without waiting. */
+    for (size_t i=0;;i++) {
+        kernel_writeback_domain_snapshot(&fast->writeback,&stats[0]);
+        if (stats[0].dirty_bytes+stats[0].version_bytes+stats[0].metadata_bytes>=stats[0].high_bytes) break;
+        assert(i<=stats[0].high_bytes/BOAROS_PAGE_SIZE);
+        assert(!kernel_vfs_pwrite(&files[0],(i+3)*BOAROS_PAGE_SIZE,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+    }
+    assert(stats[0].dirty_bytes && physical_page_available(pages_for_domains)>
+        physical_page_total(pages_for_domains)/25);
     storage[1].armed=1;current_cache=cache;assert(!kernel_page_cache_start_worker(cache));
     wait_progress(&storage[1].entered,1);
+    struct domain_quota_request fast_write={.file=&files[0]};
+    pthread_t fast_writer;assert(!pthread_create(&fast_writer,NULL,domain_quota_writer,&fast_write));
+    wait_progress(&fast_write.done,1);
+    assert(!pthread_join(fast_writer,NULL) && !__atomic_load_n(&storage[1].resume,__ATOMIC_ACQUIRE));
+    kernel_writeback_domain_snapshot(&fast->writeback,&before);
+    assert(before.dirty_bytes<stats[0].dirty_bytes);
     /* One cache serves both disks. Keep its worker in slow I/O until the
      * unrelated file has been synced and reloaded from its own backend. */
     struct executor_sync fast_sync={.file=&files[0],.observed=kernel_vfs_error_sequence(&files[0])};
@@ -3452,12 +3474,16 @@ static void writeback_domains(struct kernel_page_cache *cache,const char *path)
         value=0;
         assert(!kernel_vfs_pread(&files[0],i*BOAROS_PAGE_SIZE,&value,1,&done,NULL) && done==1 && value==0x39);
     }
-    /* A quota-bound writer joins the background round already in progress.
-     * It must not insert a competing single-window request behind paused I/O. */
+    char persisted[5];
+    assert(!kernel_vfs_pread(&files[0],0,persisted,sizeof(persisted),&done,NULL) &&
+        done==sizeof(persisted) && !memcmp(persisted,"quota",sizeof(persisted)));
+    /* A writer on the paused device still depends on its own I/O. It does
+     * not insert a second request into the shared cache executor queue. */
     struct kernel_page_cache_concurrency_state queued_before,queued_after;
     kernel_page_cache_get_concurrency_state(cache,&queued_before);
     progress_writeback_waiting=0;pthread_t quota_writer;
-    assert(!pthread_create(&quota_writer,NULL,domain_quota_writer,&quota_file));
+    struct domain_quota_request slow_write={.file=&quota_file};
+    assert(!pthread_create(&quota_writer,NULL,domain_quota_writer,&slow_write));
     wait_progress(&progress_writeback_waiting,1);
     kernel_page_cache_get_concurrency_state(cache,&queued_after);
     assert(queued_before.executions_queued==queued_after.executions_queued);
@@ -3493,7 +3519,7 @@ static void writeback_domains(struct kernel_page_cache *cache,const char *path)
     assert(!disks[0].references && !kernel_block_unregister(&disks[0]));
     for(unsigned i=0;i<2;i++)assert(!close(storage[i].fd));
     current_cache=NULL;
-    puts("PASS physical writeback domains: fast fsync and readback during slow I/O, shared-device quota, stable source charge and final references");
+    puts("PASS physical writeback domains: fast write, fsync and readback during slow I/O, shared-device quota, stable source charge and final references");
 }
 
 static void dirty_age_case(struct kernel_page_cache *cache,const char *path)
