@@ -40,7 +40,7 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
-
+.ruff_cache
 # Local secrets and machine-specific configuration.
 .env
 .env.*
@@ -53,6 +53,8 @@ local.mk
 .zcode/
 .superpowers
 .agents
+.codex
+.aws
 # Python runner caches are rebuildable local artifacts.
 __pycache__/
 *.py[cod]
