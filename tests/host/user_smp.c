@@ -43,7 +43,6 @@ UNUSED_SOCKET_API(void, udp_remove, struct udp_pcb *)
 UNUSED_SOCKET_API(err_t, udp_send, struct udp_pcb *, struct pbuf *)
 UNUSED_SOCKET_API(err_t, udp_sendto, struct udp_pcb *, struct pbuf *, const ip_addr_t *, u16_t)
 UNUSED_SOCKET_API(struct pbuf *, pbuf_alloc, pbuf_layer, u16_t, pbuf_type)
-UNUSED_SOCKET_API(u8_t, pbuf_free, struct pbuf *)
 UNUSED_SOCKET_API(u32_t, sys_now, void)
 UNUSED_SOCKET_API(u32_t, sys_timeouts_sleeptime, void)
 UNUSED_SOCKET_API(unsigned, sys_check_timeouts_budget, unsigned)
@@ -59,12 +58,24 @@ static char shard_order[4];
 static struct tcp_seg shard_unsent;
 static struct pbuf *shard_loop_source;
 static struct pbuf shard_loop_clone;
-static unsigned shard_forbid_route;
+static unsigned shard_forbid_route, shard_revoke_loop, shard_clone_freed;
 u16_t boaros_lwip_tcp_detached_mss(const struct tcp_pcb *pcb) { return pcb->mss; }
 u16_t lwip_htons(u16_t x) { return (u16_t)((x<<8)|(x>>8)); }
+u8_t pbuf_free(struct pbuf *p)
+{
+    assert(p==&shard_loop_clone && shard_revoke_loop && !active->raw_locks);
+    shard_clone_freed++;
+    return 1;
+}
 struct pbuf *pbuf_clone_shared(pbuf_layer layer, struct pbuf *p, u16_t head)
 {
     assert(layer==PBUF_RAW && p==shard_loop_source && head==TCP_HLEN && !active->raw_locks);
+    if (shard_revoke_loop) {
+        struct kernel_cpu *source=active;
+        active=&cpus[0];
+        fast_loopback_revoke(fast_loopback);
+        active=source;
+    }
     return &shard_loop_clone;
 }
 
@@ -117,6 +128,7 @@ static void socket_shard_copy_cases(void)
     scheduler.initialized=KERNEL_SCHEDULER_INITIALIZED;
     struct socket_tcp_owner *owner=tcp_owner_at(1);
     owner->index=1;
+    kernel_raw_lock_init(&owner->ingress,KERNEL_RAW_RANK_OBJECT+1);
     kernel_mutex_init(&owner->mutex,26,(uintptr_t)&owner->mutex);
     kernel_wait_queue_init(&owner->work);
     tcp_owner_count=1; boaros_lwip_parallel=1;
@@ -195,7 +207,7 @@ static void socket_shard_loopback_case(void)
       tx.boaros_route_next=&rx;
       tcp_routes[bucket]=&tx; }
     assert(tx.boaros_loopback_peer==&rx && rx.boaros_loopback_peer==&tx);
-    struct netif loop={0};fast_loopback=&loop;fast_loopback_available=1;
+    struct netif loop={0};fast_loopback=&loop;fast_loopback_state=LOOPBACK_AVAILABLE;
     struct tcp_hdr header={.src=lwip_htons(11),.dest=lwip_htons(22)};
     TCPH_HDRLEN_FLAGS_SET(&header,5,TCP_ACK);
     struct pbuf packet={.payload=&header,.len=TCP_HLEN};
@@ -204,15 +216,20 @@ static void socket_shard_loopback_case(void)
     assert(tcp_local_output(&tx,&packet,&loop,&tx.local_ip,&tx.remote_ip,&result) && result==ERR_OK);
     struct socket_tcp_input queued;
     assert(tcp_owner_take_input(owner,&queued) && queued.packet==&shard_loop_clone && queued.interface==&loop);
+    shard_revoke_loop=1;
+    assert(tcp_local_output(&tx,&packet,&loop,&tx.local_ip,&tx.remote_ip,&result) && result==ERR_RTE);
+    assert(!owner->output_reserved && shard_clone_freed==1 && !tcp_owner_take_input(owner,&queued));
+    shard_revoke_loop=0;
+    fast_loopback_state|=LOOPBACK_AVAILABLE;
     shard_forbid_route=0;
     tcp_pcb_forget(&rx);
     assert(!tx.boaros_loopback_peer && !rx.boaros_loopback_peer && !rx.boaros_owner);
     assert(!tcp_local_output(&tx,&packet,&loop,&tx.local_ip,&tx.remote_ip,&result));
     tcp_pcb_forget(&tx);
     assert(!tcp_routes[bucket]);
-    fast_loopback=0;fast_loopback_available=0;shard_loop_source=0;
+    fast_loopback=0;fast_loopback_state=0;shard_loop_source=0;
     kernel_socket_protocol_leave(&scope);
-    puts("PASS TCP paired loopback: direct packet without route lookup; peer retirement invalidates the pair");
+    puts("PASS TCP paired loopback: independent ingress, reservation rollback after interface revoke, peer retirement");
 }
 
 static int protocol_preempt,protocol_try_failure;
@@ -435,7 +452,7 @@ void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *,struct kernel_raw_g
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_raw_guard *guard)
 {
 #ifdef SOCKET_PROTOCOL_CASES
-    assert(!shard_forbid_route || lock!=&tcp_route_lock);
+    assert(!shard_forbid_route || (lock!=&tcp_route_lock && lock!=&socket_state_lock));
 #endif
     assert(!local_run_required || lock!=&kernel_wait_domain);
     if (local_park_token && active==&cpus[1]) {

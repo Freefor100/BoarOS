@@ -144,6 +144,7 @@ struct kernel_socket {
 #if BOAROS_USER_SMP
     unsigned tcp_cpu;
     uint16_t tcp_prepare_mss;
+    struct kernel_raw_lock active_write_lock;
 #endif
 };
 
@@ -282,6 +283,9 @@ struct socket_tcp_owner {
     struct kernel_thread_join worker;
     struct kernel_wait_queue work;
     struct socket_work_queue ready;
+    /* Producers and the consumer of this ring do not share the endpoint
+     * lock. The worker joins both locks only when it prepares to sleep. */
+    struct kernel_raw_lock ingress;
     struct socket_tcp_input ring[TCP_RX_RING];
     unsigned index, head, count, depth, nic_blocked;
     uint8_t timer_running, stopping, output_reserved, waiting;
@@ -291,8 +295,8 @@ static unsigned tcp_owner_count;
 /* lwIP owns the built-in lo for the entire boot. Its mutable eligibility and
  * the legacy queue's publication are serialized with direct ring admission. */
 static struct netif *fast_loopback;
-static uint64_t fast_loopback_generation;
-static unsigned fast_loopback_available, fast_loopback_legacy_pending;
+enum { LOOPBACK_AVAILABLE=1, LOOPBACK_LEGACY=2, LOOPBACK_GENERATION=4 };
+static uint64_t fast_loopback_state;
 static struct tcp_pcb *tcp_routes[TCP_ROUTE_BUCKETS];
 static struct kernel_raw_lock tcp_route_lock = {
     .rank=KERNEL_RAW_RANK_OBJECT, .initialized=KERNEL_RAW_INITIALIZED
@@ -314,13 +318,15 @@ static unsigned tcp_socket_cpu(const struct kernel_socket *socket)
     return __atomic_load_n(&socket->tcp_cpu,__ATOMIC_RELAXED);
 }
 
-static void tcp_owner_notify_locked(struct socket_tcp_owner *owner)
+static int tcp_owner_take_waiting(struct socket_tcp_owner *owner)
 {
-    /* Work and the single worker's registration share endpoint protection. */
-    if (!owner->waiting) return;
-    owner->waiting=0;
-    socket_state_notify(&owner->work);
+    /* Both producers synchronize with sleep registration, each under its own
+     * lock. Exactly one consumes the shared notification hint. */
+    return __atomic_load_n(&owner->waiting,__ATOMIC_RELAXED) &&
+        __atomic_exchange_n(&owner->waiting,0,__ATOMIC_RELAXED);
 }
+static int tcp_owner_stopping(const struct socket_tcp_owner *owner)
+{ return __atomic_load_n(&owner->stopping,__ATOMIC_RELAXED); }
 
 static int tcp_owner_lock(struct kernel_socket_protocol_scope *scope,
                           struct socket_tcp_owner *owner,int try_only)
@@ -566,7 +572,7 @@ static void socket_schedule_locked(struct kernel_socket *socket, unsigned flags)
     if (socket->destroying || socket->domain != KERNEL_SOCKET_DOMAIN_INET) return;
 #if BOAROS_USER_SMP
     unsigned cpu=tcp_socket_cpu(socket);
-    if (cpu && tcp_owner_at(cpu)->stopping) return;
+    if (cpu && tcp_owner_stopping(tcp_owner_at(cpu))) return;
 #endif
     socket->work_flags |= flags;
     struct socket_work_queue *queue=socket_ready_queue(socket);
@@ -576,7 +582,7 @@ static void socket_schedule_locked(struct kernel_socket *socket, unsigned flags)
 #if BOAROS_USER_SMP
         if (cpu) {
             struct socket_tcp_owner *owner=tcp_owner_at(cpu);
-            tcp_owner_notify_locked(owner);
+            if (tcp_owner_take_waiting(owner)) socket_state_notify(&owner->work);
             return;
         }
 #endif
@@ -1368,21 +1374,23 @@ static unsigned tcp_packet_cpu(struct pbuf *p,const struct netif *input,
 }
 
 static int tcp_queue_input_locked(struct socket_tcp_owner *owner,struct pbuf *p,struct netif *input,
-                                  const ip_addr_t *src,const ip_addr_t *dst)
+                                  const ip_addr_t *src,const ip_addr_t *dst,struct kernel_wait_cursor *wake)
 {
-    if (owner->stopping || owner->count+owner->output_reserved>=TCP_RX_RING) return 0;
+    if (tcp_owner_stopping(owner) || owner->count+owner->output_reserved>=TCP_RX_RING) return 0;
     unsigned slot=(owner->head+owner->count)%TCP_RX_RING;
     owner->ring[slot]=(struct socket_tcp_input){p,input,*src,*dst};
-    if (!owner->count++) tcp_owner_notify_locked(owner);
+    if (!owner->count++ && tcp_owner_take_waiting(owner))
+        (void)kernel_wait_cursor_prepare(&owner->work,wake);
     return 1;
 }
 
 static void tcp_mark_legacy_loopback(struct netif *netif)
 {
-    if (netif!=fast_loopback || fast_loopback_legacy_pending) return;
+    if (netif!=fast_loopback) return;
     /* The IP guard excludes the drain. Mark before lwIP links this packet. */
-    SOCKET_STATE(state);
-    fast_loopback_legacy_pending=1;
+    uint64_t state=__atomic_load_n(&fast_loopback_state,__ATOMIC_RELAXED);
+    if (!(state&LOOPBACK_LEGACY))
+        __atomic_store_n(&fast_loopback_state,state|LOOPBACK_LEGACY,__ATOMIC_RELEASE);
 }
 
 static int tcp_dispatch(struct pbuf *p,struct netif *input,const ip_addr_t *src,const ip_addr_t *dst)
@@ -1391,7 +1399,10 @@ static int tcp_dispatch(struct pbuf *p,struct netif *input,const ip_addr_t *src,
     unsigned cpu=tcp_packet_cpu(p,input,src,dst);
     if (!cpu) return 0;
     int queued;
-    { SOCKET_STATE(state); queued=tcp_queue_input_locked(tcp_owner_at(cpu),p,input,src,dst); }
+    struct kernel_wait_cursor wake={0};
+    struct socket_tcp_owner *owner=tcp_owner_at(cpu);
+    { KERNEL_RAW_SCOPE(ingress,&owner->ingress); queued=tcp_queue_input_locked(owner,p,input,src,dst,&wake); }
+    if (wake.queue) kernel_wait_cursor_wake(&wake,1);
     if (!queued) pbuf_free(p);
     return 1;
 }
@@ -1410,13 +1421,14 @@ static int tcp_local_output(const struct tcp_pcb *pcb,struct pbuf *p,struct neti
         (peer->netif_idx!=NETIF_NO_INDEX && peer->netif_idx!=netif_get_index(netif))) return 0;
     const struct tcp_hdr *tcp=p->payload;
     if (tcp->src!=lwip_htons(pcb->local_port) || tcp->dest!=lwip_htons(pcb->remote_port)) return 0;
-    uint64_t generation;
+    uint64_t state;
     {
-        SOCKET_STATE(state);
-        if (!fast_loopback_available || fast_loopback_legacy_pending ||
-            owner->stopping || network_stopping || owner->count==TCP_RX_RING) return 0;
+        KERNEL_RAW_SCOPE(ingress,&owner->ingress);
+        state=__atomic_load_n(&fast_loopback_state,__ATOMIC_ACQUIRE);
+        if ((state&(LOOPBACK_AVAILABLE|LOOPBACK_LEGACY))!=LOOPBACK_AVAILABLE ||
+            tcp_owner_stopping(owner) || __atomic_load_n(&network_stopping,__ATOMIC_RELAXED) ||
+            owner->count==TCP_RX_RING) return 0;
         if (owner->output_reserved) __builtin_trap();
-        generation=fast_loopback_generation;
         owner->output_reserved=1;
     }
     /* The peer shares this owner, so newer legacy output cannot pass the
@@ -1426,17 +1438,20 @@ static int tcp_local_output(const struct tcp_pcb *pcb,struct pbuf *p,struct neti
     struct pbuf *input=pbuf_clone_shared(PBUF_RAW,p,header);
     err_t error=input?ERR_OK:ERR_MEM;
     if (input) input->if_idx=netif_get_index(netif);
+    struct kernel_wait_cursor wake={0};
     {
-        SOCKET_STATE(state);
+        KERNEL_RAW_SCOPE(ingress,&owner->ingress);
         if (!owner->output_reserved) __builtin_trap();
         owner->output_reserved=0;
         if (error==ERR_OK) {
-            if (owner->stopping || network_stopping) error=ERR_IF;
-            else if (!fast_loopback_available || generation!=fast_loopback_generation) error=ERR_RTE;
-            else if (!tcp_queue_input_locked(owner,input,netif,src,dst)) __builtin_trap();
+            uint64_t current=__atomic_load_n(&fast_loopback_state,__ATOMIC_ACQUIRE);
+            if (tcp_owner_stopping(owner) || __atomic_load_n(&network_stopping,__ATOMIC_RELAXED)) error=ERR_IF;
+            else if ((current&~UINT64_C(2))!=(state&~UINT64_C(2))) error=ERR_RTE;
+            else if (!tcp_queue_input_locked(owner,input,netif,src,dst,&wake)) __builtin_trap();
             else input=0;
         }
     }
+    if (wake.queue) kernel_wait_cursor_wake(&wake,1);
     if (input) pbuf_free(input);
     *result=error;
     return 1;
@@ -1538,7 +1553,7 @@ static int tcp_promote(struct kernel_socket *socket,struct kernel_socket_protoco
         socket->tcp_prepare_mss=boaros_lwip_tcp_detached_mss(pcb);
         __atomic_store_n(&socket->tcp_cpu,cpu,__ATOMIC_RELEASE);
         if (queued) socket_schedule_locked(socket,0);
-        else tcp_owner_notify_locked(owner);
+        else if (tcp_owner_take_waiting(owner)) socket_state_notify(&owner->work);
     }
     kernel_lock_release(&guard);
     boaros_lwip_ip_lock(&scope->ip_guard);
@@ -1785,6 +1800,9 @@ static err_t socket_tcp_accepted(void *context, struct tcp_pcb *pcb,
     address_export(child, &pcb->local_ip, pcb->local_port, &child->saved_local);
     address_export(child, &pcb->remote_ip, pcb->remote_port, &child->saved_peer);
     kernel_wait_queue_init(&child->wait);
+#if BOAROS_USER_SMP
+    kernel_raw_lock_init(&child->active_write_lock,KERNEL_RAW_RANK_OBJECT+1);
+#endif
     tcp_arg(pcb, child);
     tcp_err(pcb, tcp_failed);
     tcp_recv(pcb, tcp_data_received);
@@ -1872,6 +1890,9 @@ int kernel_socket_create(struct kernel_heap *heap, int family, int type,
     socket->rx_limit = 65536U;
     socket->tx_limit = 65536U;
     kernel_wait_queue_init(&socket->wait);
+#if BOAROS_USER_SMP
+    kernel_raw_lock_init(&socket->active_write_lock,KERNEL_RAW_RANK_OBJECT+1);
+#endif
     if (type == SOCKET_DGRAM) {
         socket->udp = udp_new_ip_type(family == KERNEL_SOCKET_AF_INET ?
                                       IPADDR_TYPE_V4 : IPADDR_TYPE_ANY);
@@ -2863,6 +2884,14 @@ enum socket_protocol_operation { SOCKET_PROTOCOL_STREAM, SOCKET_PROTOCOL_UDP_PRE
     SOCKET_PROTOCOL_UDP_SEND, SOCKET_PROTOCOL_DISPOSE, SOCKET_PROTOCOL_FLUSH };
 static int protocol_request(struct kernel_socket_write_request *,enum socket_protocol_operation);
 
+static void socket_link_active_write(struct kernel_socket_write_request *request)
+{
+    struct kernel_socket *socket=request->socket;
+    request->active_next=socket->active_writes;request->active_previous=&socket->active_writes;
+    if(request->active_next)request->active_next->active_previous=&request->active_next;
+    socket->active_writes=request;
+}
+
 static void socket_write_begin(struct kernel_socket_write_request *request,
     struct kernel_open_file_description **pin_owner,int hold_unix_peer)
 {
@@ -2870,25 +2899,49 @@ static void socket_write_begin(struct kernel_socket_write_request *request,
         .task=kernel_task_current(),.pin=*pin_owner,.pin_owner=pin_owner};
     *pin_owner=0;
     if(request->task && kernel_task_socket_write_register(request->task,request)!=KERNEL_TASK_STATUS_OK)__builtin_trap();
-    SOCKET_STATE(state);
     struct kernel_socket *socket=request->socket;
-    request->active_next=socket->active_writes;request->active_previous=&socket->active_writes;
-    if(request->active_next)request->active_next->active_previous=&request->active_next;
-    socket->active_writes=request;
+#if BOAROS_USER_SMP
+    if (socket->domain==KERNEL_SOCKET_DOMAIN_INET) {
+        KERNEL_RAW_SCOPE(active,&socket->active_write_lock);
+        socket_link_active_write(request);
+        return;
+    }
+#endif
+    SOCKET_STATE(state);
+    socket_link_active_write(request);
     /* Close can detach the peer edge; borrow its storage in this same publication lock. */
     if(hold_unix_peer && socket->peer) {
         request->unix_destination=socket->peer;
         unix_get_locked(request->unix_destination);
     }
 }
-static void socket_write_end(struct kernel_socket_write_request *request)
+static void socket_unlink_active_write(struct kernel_socket_write_request *request)
 {
-    SOCKET_STATE(state);
     if(request->queued || !request->active_previous || *request->active_previous!=request)__builtin_trap();
     *request->active_previous=request->active_next;
     if(request->active_next)request->active_next->active_previous=request->active_previous;
     request->active_next=0;request->active_previous=0;
     if(request->task && kernel_task_socket_write_clear(request->task,request)!=KERNEL_TASK_STATUS_OK)__builtin_trap();
+}
+static void socket_write_end(struct kernel_socket_write_request *request)
+{
+#if BOAROS_USER_SMP
+    struct kernel_socket *socket=request->socket;
+    if (socket->domain==KERNEL_SOCKET_DOMAIN_INET) {
+        int stopping;
+        {
+            KERNEL_RAW_SCOPE(active,&socket->active_write_lock);
+            socket_unlink_active_write(request);
+            stopping=__atomic_load_n(&network_stopping,__ATOMIC_RELAXED);
+        }
+        /* Stop samples the list and registers with this same socket lock.
+         * The request's OFD still owns the socket through the notification. */
+        if (stopping) { SOCKET_STATE(state); wake_socket(socket); }
+        return;
+    }
+#endif
+    SOCKET_STATE(state);
+    socket_unlink_active_write(request);
     struct kernel_socket *destination=request->unix_destination;
     request->unix_destination=NULL;
     int release=destination && unix_put_locked(destination);
@@ -3614,7 +3667,7 @@ static int protocol_request(struct kernel_socket_write_request *request,enum soc
             tcp_owner_lock(&protocol,owner,1)) {
             int admit;
             { SOCKET_STATE(state);admit=network_work_queue && !network_stopping &&
-                !owner->stopping && tcp_socket_cpu(request->socket)==cpu &&
+                !tcp_owner_stopping(owner) && tcp_socket_cpu(request->socket)==cpu &&
                 !request->socket->writes_head; }
             if (admit) {
                 int result;
@@ -4026,9 +4079,15 @@ static struct netif *loopback_netif(void)
 static void fast_loopback_revoke(struct netif *netif)
 {
     if (netif!=fast_loopback) return;
-    SOCKET_STATE(state);
-    fast_loopback_available=0;
-    if (!++fast_loopback_generation) __builtin_trap();
+    uint64_t state=__atomic_load_n(&fast_loopback_state,__ATOMIC_RELAXED);
+    if (state>UINT64_MAX-LOOPBACK_GENERATION) __builtin_trap();
+    __atomic_store_n(&fast_loopback_state,(state+LOOPBACK_GENERATION)&~UINT64_C(1),__ATOMIC_RELEASE);
+    /* A direct publisher may already have sampled the old configuration.
+     * Drain its publication before changing the interface outside this lock. */
+    unsigned count=__atomic_load_n(&tcp_owner_count,__ATOMIC_ACQUIRE);
+    for (unsigned cpu=1;cpu<=count;cpu++) {
+        KERNEL_RAW_SCOPE(ingress,&tcp_owner_at(cpu)->ingress);
+    }
 }
 
 static void fast_loopback_refresh(struct netif *netif)
@@ -4038,8 +4097,8 @@ static void fast_loopback_refresh(struct netif *netif)
         netif_ip4_addr(netif)->addr==lwip_htonl(UINT32_C(0x7f000001)) &&
         netif_ip4_netmask(netif)->addr==lwip_htonl(UINT32_C(0xff000000)) &&
         ip6_addr_isloopback(netif_ip6_addr(netif,0)) && ip6_addr_isvalid(netif_ip6_addr_state(netif,0));
-    SOCKET_STATE(state);
-    fast_loopback_available=available;
+    uint64_t state=__atomic_load_n(&fast_loopback_state,__ATOMIC_RELAXED);
+    __atomic_store_n(&fast_loopback_state,(state&~UINT64_C(1))|available,__ATOMIC_RELEASE);
 }
 #endif
 
@@ -4110,7 +4169,7 @@ void kernel_socket_network_hooks(void (*timer_wake)(void *),struct kernel_wait_q
     int (*udp_capacity)(void *),void *context)
 {
     struct kernel_socket_protocol_scope protocol;kernel_socket_protocol_enter(&protocol);
-    {SOCKET_STATE(state);network_stopping=work_queue==0;}
+    {SOCKET_STATE(state);__atomic_store_n(&network_stopping,work_queue==0,__ATOMIC_RELAXED);}
     if (!work_queue) for (struct kernel_socket *socket=inet_sockets; socket; socket=socket->inet_next) {
         SOCKET_STATE(state);
         /* Empty readers and control waiters have no active payload request to drain. */
@@ -4131,11 +4190,16 @@ void kernel_socket_network_hooks(void (*timer_wake)(void *),struct kernel_wait_q
             if (cpu) tcp_control_leave(&protocol,&remote);
 #endif
             SOCKET_STATE(state);
-            if(socket->active_writes)pin=socket->active_writes->pin;
-            else if(socket->read_request)pin=socket->read_request->pin;
-            if(!pin)continue;
-            if(!protocol.outer || kernel_open_file_acquire(pin)!=KERNEL_OPEN_FILE_STATUS_OK)__builtin_trap();
-            if(kernel_wait_prepare(&socket->wait,0,0,&token)!=KERNEL_SCHEDULER_STATUS_OK)__builtin_trap();
+            {
+#if BOAROS_USER_SMP
+                KERNEL_RAW_SCOPE(active,&socket->active_write_lock);
+#endif
+                if(socket->active_writes)pin=socket->active_writes->pin;
+                else if(socket->read_request)pin=socket->read_request->pin;
+                if(!pin)continue;
+                if(!protocol.outer || kernel_open_file_acquire(pin)!=KERNEL_OPEN_FILE_STATUS_OK)__builtin_trap();
+                if(kernel_wait_prepare(&socket->wait,0,0,&token)!=KERNEL_SCHEDULER_STATUS_OK)__builtin_trap();
+            }
             interrupts=socket_state_unlock_wait(&state);break;
         }
         if(!pin)break;
@@ -4267,7 +4331,7 @@ static unsigned service_ready_socket(unsigned budget,struct socket_work_queue *q
 #if BOAROS_USER_SMP
 static int tcp_owner_take_input(struct socket_tcp_owner *owner,struct socket_tcp_input *input)
 {
-    SOCKET_STATE(state);
+    KERNEL_RAW_SCOPE(ingress,&owner->ingress);
     if (!owner->count) return 0;
     *input=owner->ring[owner->head];
     owner->head=(owner->head+1)%TCP_RX_RING;
@@ -4295,7 +4359,8 @@ static void tcp_owner_worker(void *arg)
         struct kernel_socket_protocol_scope scope;
         (void)tcp_owner_lock(&scope,owner,0);
         int stopping;
-        { SOCKET_STATE(state); owner->waiting=0; stopping=owner->stopping; }
+        __atomic_store_n(&owner->waiting,0,__ATOMIC_RELAXED);
+        stopping=tcp_owner_stopping(owner);
         struct socket_tcp_input input;
         for (unsigned i=0;i<16 && tcp_owner_take_input(owner,&input);i++) {
             if (!stopping)
@@ -4313,11 +4378,12 @@ static void tcp_owner_worker(void *arg)
         int done=0;
         {
             SOCKET_STATE(state);
+            KERNEL_RAW_SCOPE(ingress,&owner->ingress);
             if (!owner->count && !owner->ready.head) {
-                done=owner->stopping;
+                done=tcp_owner_stopping(owner);
                 if (!done) {
                     if (kernel_wait_prepare(&owner->work,deadline,0,&token)) __builtin_trap();
-                    owner->waiting=1;
+                    __atomic_store_n(&owner->waiting,1,__ATOMIC_RELAXED);
                 }
             }
         }
@@ -4334,9 +4400,16 @@ static void tcp_owner_worker(void *arg)
     }
 }
 
+static void tcp_owner_close_admission(struct socket_tcp_owner *owner)
+{
+    /* Queue stop and ready-list admission must still be ordered together. */
+    SOCKET_STATE(state);
+    KERNEL_RAW_SCOPE(ingress,&owner->ingress);
+    __atomic_store_n(&owner->stopping,1,__ATOMIC_RELAXED);
+}
+
 static void tcp_owner_stop(struct socket_tcp_owner *owner)
 {
-    { SOCKET_STATE(state); owner->stopping=1; }
     if (kernel_wait_queue_close(&owner->work)) __builtin_trap();
     kernel_thread_join(&owner->worker);
     for (;;) {
@@ -4355,12 +4428,17 @@ int kernel_socket_start_tcp_owners(void)
     for (unsigned cpu=1;cpu<cpus;cpu++) {
         struct socket_tcp_owner *owner=tcp_owner_at(cpu);
         owner->index=cpu;
+        kernel_raw_lock_init(&owner->ingress,KERNEL_RAW_RANK_OBJECT+1);
         kernel_wait_queue_init(&owner->work);
         kernel_mutex_init(&owner->mutex,26,(uintptr_t)&owner->mutex);
         boaros_lwip_tcp_context_init(&owner->context);
         if (kernel_thread_create_joinable_worker(tcp_owner_worker,owner,&owner->worker,cpu)) {
             if (kernel_wait_queue_close(&owner->work) || kernel_wait_queue_destroy(&owner->work)) __builtin_trap();
-            for (unsigned i=1;i<cpu;i++) tcp_owner_stop(tcp_owner_at(i));
+            for (unsigned i=1;i<cpu;i++) {
+                struct socket_tcp_owner *started=tcp_owner_at(i);
+                tcp_owner_close_admission(started);
+                tcp_owner_stop(started);
+            }
             return -KERNEL_ENOMEM;
         }
     }
@@ -4371,8 +4449,7 @@ int kernel_socket_start_tcp_owners(void)
 void kernel_socket_stop_tcp_owners(void)
 {
     unsigned count=__atomic_exchange_n(&tcp_owner_count,0,__ATOMIC_ACQ_REL);
-    { SOCKET_STATE(state);
-      for (unsigned i=1;i<=count;i++) tcp_owner_at(i)->stopping=1; }
+    for (unsigned i=1;i<=count;i++) tcp_owner_close_admission(tcp_owner_at(i));
     for (unsigned i=1;i<=count;i++) {
         struct socket_tcp_owner *owner=tcp_owner_at(i);
         tcp_owner_stop(owner);
@@ -4430,10 +4507,9 @@ static void service_loopback(struct kernel_socket_service_result *result, unsign
         if (netif->loop_first) loopback_pending = 1;
 #if BOAROS_USER_SMP
     /* All legacy entries have been delivered to their owners before clearing. */
-    if (fast_loopback_legacy_pending && !fast_loopback->loop_first) {
-        SOCKET_STATE(state);
-        fast_loopback_legacy_pending=0;
-    }
+    uint64_t state=__atomic_load_n(&fast_loopback_state,__ATOMIC_RELAXED);
+    if ((state&LOOPBACK_LEGACY) && !fast_loopback->loop_first)
+        __atomic_store_n(&fast_loopback_state,state&~UINT64_C(2),__ATOMIC_RELEASE);
 #endif
 }
 
