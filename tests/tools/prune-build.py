@@ -5,13 +5,40 @@ from pathlib import Path
 sys.path[:0] = [str(Path(__file__).resolve().parent), str(Path(__file__).resolve().parents[1])]
 
 import argparse
+import os
 import shutil
+import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[2]
 BUILD = ROOT / 'build'
-KEEP_TOP = {'data-path-baselines', 'network-budget', 'io-budget', 'cost', 'riscv', 'riscv-smp', 'riscv-user-smp', 'riscv-user-smp-composition', 'riscv-smp-test', 'riscv-mm-smp-test', 'riscv-mm-shared-smp-test', 'riscv-mm-file-smp-test', 'riscv-mm-disk-smp-test', 'riscv-files-smp-test', 'riscv-file-io-smp-test', 'loongarch', 'qemu-la', 'qemu-la-rtc', 'linux-la', 'linux-la-platform', 'diff-abi', 'program-environment', 'program-libc', 'host', 'tools', 'offline-c'}
+KEEP_TOP = {'data-path-baselines', 'cost', 'riscv', 'riscv-smp', 'riscv-user-smp', 'riscv-user-smp-composition', 'riscv-smp-test', 'riscv-mm-smp-test', 'riscv-mm-shared-smp-test', 'riscv-mm-file-smp-test', 'riscv-mm-disk-smp-test', 'riscv-files-smp-test', 'riscv-file-io-smp-test', 'loongarch', 'qemu-la', 'qemu-la-rtc', 'linux-la', 'linux-la-platform', 'diff-abi', 'program-environment', 'program-libc', 'tools', 'offline-c'}
 KEEP_ROOT_FILES = {'elf-tail-rv', 'elf-tail-dynamic-rv', 'elf-tail-norelro-rv'}
+KEEP_TOP.update({'local-keep', 'linux-la-platform-noswap', 'loongarch-smp2',
+                 'loongarch-smp4', 'loongarch-smp8', 'riscv-user-smp4', 'riscv-user-smp8'})
+
+
+def protected_paths():
+    """Build can contain a live Git worktree, including uncommitted changes."""
+    listing = subprocess.check_output(['git', 'worktree', 'list', '--porcelain', '-z'], cwd=ROOT)
+    paths = [Path(os.fsdecode(item[len(b'worktree '):])).resolve()
+             for item in listing.split(b'\0') if item.startswith(b'worktree ')]
+    tracked = subprocess.check_output(['git', 'ls-files', '-z', '--', 'build'], cwd=ROOT)
+    paths.extend(ROOT / os.fsdecode(item) for item in tracked.split(b'\0') if item)
+    return [path for path in paths if path.is_relative_to(BUILD.resolve())]
+
+
+def deletion_paths(paths, protected):
+    root = BUILD.resolve()
+    result = []
+    for path in paths:
+        # Resolve the parent, not the leaf: an eligible symlink is only unlinked.
+        entry = path.parent.resolve() / path.name
+        if entry.is_relative_to(root) and entry != root and not any(
+            item.is_relative_to(entry) or entry.is_relative_to(item) for item in protected
+        ):
+            result.append(path)
+    return result
 
 
 def current_linux_keys():
@@ -35,14 +62,15 @@ def candidates():
             continue
         result.append(path)
 
-    # Matched-kernel builds and their identities are reusable; runs/images are not.
-    for family in ('network-budget', 'io-budget'):
-        directory = BUILD / family
-        if directory.is_dir():
-            result.extend(path for path in directory.iterdir() if path.name != 'kernels')
-            kernels = directory / 'kernels'
-            if kernels.is_dir():
-                result.extend(path for path in kernels.glob('*/build.log'))
+    cost = BUILD / 'cost'
+    if cost.is_dir():
+        result.extend(path for path in cost.iterdir()
+                      if path.name not in {'riscv', 'host', 'kernel-rv', 'measurement.lock'})
+
+    # These runners restore their pinned images from references/ on demand.
+    tools = BUILD / 'tools'
+    result.extend(path for path in (tools / 'network-rv', tools / 'oscomp')
+                  if path.exists() or path.is_symlink())
 
     for family in ('riscv-mm-smp-test', 'riscv-mm-shared-smp-test', 'riscv-mm-file-smp-test', 'riscv-mm-disk-smp-test', 'riscv-files-smp-test', 'riscv-file-io-smp-test'):
         directory = BUILD / family
@@ -52,17 +80,11 @@ def candidates():
                 # 自定义CI构建保留编译缓存，嵌套运行镜像仍按同一规则清理。
                 result.extend(p for p in directory.glob('*/runs') if p.is_dir())
 
-    # 保留可复用宿主consumer，镜像/日志/临时诊断源码及内核均是运行现场。
-    for family in ('cache', 'mm-disk','file-io'):
-        directory = BUILD / 'host' / family
-        if directory.is_dir():
-            result.extend(p for p in directory.iterdir()
-                          if p.name not in {'concurrency-12', 'concurrency-14','process-12.o','process-14.o'})
-
-    user_smp = BUILD / 'riscv-user-smp'
-    if user_smp.is_dir():
-        result.extend(path for path in user_smp.iterdir()
-                      if path.name not in {'riscv','kernel-rv','user-smp-rv','user-smp-dynamic-rv'})
+    for family in ('riscv-user-smp', 'riscv-user-smp4', 'riscv-user-smp8'):
+        user_smp = BUILD / family
+        if user_smp.is_dir():
+            result.extend(path for path in user_smp.iterdir()
+                          if path.name not in {'riscv','kernel-rv','user-smp-rv','user-smp-dynamic-rv'})
 
     composition = BUILD / 'riscv-user-smp-composition'
     if composition.is_dir():
@@ -161,19 +183,26 @@ def main():
     kept = [path.resolve() for path in args.keep]
     if any(not path.is_relative_to(BUILD.resolve()) for path in kept):
         parser.error('--keep paths must be inside build/')
-    paths = candidates()
-    paths = [path for path in paths if not any(
-        path.resolve() == item or item.is_relative_to(path.resolve())
-        or path.resolve().is_relative_to(item) for item in kept)]
+    paths = deletion_paths(candidates(), protected_paths() + kept)
+    removed = failed = 0
     for path in paths:
         print(path.relative_to(ROOT))
         if args.apply:
-            if path.is_dir() and not path.is_symlink():
-                shutil.rmtree(path)
-            else:
-                path.unlink()
-    print(f'{"Removed" if args.apply else "Would remove"}: {len(paths)} paths')
+            try:
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+                removed += 1
+            except OSError as error:
+                failed += 1
+                print(f'Could not remove {path.relative_to(ROOT)}: {error}', file=sys.stderr)
+    if args.apply:
+        print(f'Removed: {removed} paths; failed: {failed}')
+    else:
+        print(f'Would remove: {len(paths)} paths')
+    return int(failed != 0)
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

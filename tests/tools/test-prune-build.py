@@ -26,12 +26,12 @@ class CleanupContract(unittest.TestCase):
                 'riscv-mm-disk-smp-test/riscv/mm/mm.o', 'riscv-mm-disk-smp-test/rfence-error/kernel-rv',
                 'riscv-file-io-smp-test/riscv/fs/files/io.o',
                 'riscv-file-io-smp-test/ci-unknown-elf/kernel-rv',
-                'host/cache/concurrency-12','host/mm-disk/concurrency-12',
                 'qemu-la-rtc/build/build.ninja','linux-la-platform/vmlinux',
+                'riscv-user-smp8/kernel-rv','loongarch-smp8/kernel-la',
                 'loongarch/program-libc/source/entry.c','loongarch/dynamic-dp-v2/root/lib/libc.so',
                 'loongarch/glibc/static-program','loongarch/diff-abi-cases')
             outputs=('loongarch/program-inventory-user-smp-review/state.json','loongarch/inventory-full/state.json','loongarch/program-inventory/state.json',
-                'riscv-smp/runs/2-512M.log',
+                'riscv-smp/runs/2-512M.log','riscv-user-smp8/runs/8cpu/root.img',
                 'riscv-user-smp/runs/run-first/report.json','riscv-user-smp/abi/run-first/root.img',
                 'riscv-user-smp/runtime/run-first/glibc/fixture.img',
                 'riscv-user-smp-composition/runs/run-first/report.json',
@@ -44,7 +44,10 @@ class CleanupContract(unittest.TestCase):
                 'riscv-mm-disk-smp-test/runs-v2/1-1G.json',
                 'riscv-file-io-smp-test/runs/2-512M/disk.img',
                 'riscv-file-io-smp-test/ci-unknown-elf/runs/user-1G/root.img',
+                'host/cache/concurrency-12','host/mm-disk/concurrency-12',
                 'host/cache/image-14.img','host/mm-disk/run.log','host/cache/diagnostic.elf',
+                'io-budget/kernels/profile/kernel-rv','network-budget/kernels/profile/kernel-rv',
+                'tools/network-rv/sdcard-rv.img','tools/oscomp/sdcard-la.img.gz',
                 'loongarch/review-boundary-green/linux.log','loongarch/diff-abi-run/linux.img',
                 'loongarch/rtc-model.case/state.bin','loongarch/sqlite-run.case/root.img',
                 'loongarch/program-libc/upstream.tar','loongarch/program-libc/build.log',
@@ -60,5 +63,20 @@ class CleanupContract(unittest.TestCase):
                 for name in caches:self.assertFalse(selected(build/name),name)
                 for name in outputs:self.assertTrue(selected(build/name),name)
             finally:prune.ROOT,prune.BUILD,prune.current_linux_keys=saved
+
+    def test_cleanup_does_not_remove_a_worktree_or_follow_parent_symlinks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary); build=root/'build'
+            worktree=build/'scratch'/'checkout'; worktree.mkdir(parents=True)
+            external=root/'external'; external.mkdir()
+            (build/'linked').symlink_to(external,target_is_directory=True)
+            saved=prune.BUILD
+            try:
+                prune.BUILD=build
+                paths=[worktree.parent,worktree,worktree/'notes',build/'ordinary-run',
+                       build/'linked',build/'linked'/'outside.img']
+                self.assertEqual(prune.deletion_paths(paths,[worktree]),
+                                 [build/'ordinary-run',build/'linked'])
+            finally:prune.BUILD=saved
 
 if __name__=='__main__':unittest.main()
