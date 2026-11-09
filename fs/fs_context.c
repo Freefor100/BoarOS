@@ -1,4 +1,6 @@
 #include "vfs_internal.h"
+#include "open_file_internal.h"
+#include "char_device_internal.h"
 #include <kernel/errno.h>
 #include <kernel/credentials.h>
 #include <kernel/fs_context.h>
@@ -11,13 +13,53 @@
 #include <stddef.h>
 #include <stdint.h>
 
+struct kernel_mount_namespace {
+    struct kernel_heap *heap;
+    struct kernel_vfs_path *top;
+    uint32_t references;
+    int copied_tree;
+    uint64_t id;
+};
+
 struct kernel_fs_context_record {
     struct kernel_vfs_path *root;
     struct kernel_vfs_path *cwd;
     uint32_t umask;
     uint32_t references;
     uint32_t exec_users;
+    struct kernel_mount_namespace *namespace;
 };
+
+static void mount_namespace_get_locked(struct kernel_mount_namespace *ns)
+{
+    if (!ns->references || ns->references==UINT32_MAX) __builtin_trap();
+    ns->references++;
+}
+
+static void mount_namespace_put(struct kernel_mount_namespace *ns)
+{
+    {
+        KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+        if (!ns->references) __builtin_trap();
+        if (--ns->references) return;
+    }
+    struct kernel_vfs_mount *top=kernel_vfs_path_mount(ns->top);
+    if (kernel_vfs_path_release(&ns->top)) __builtin_trap();
+    if (ns->copied_tree) kernel_vfs_retire_mount_tree(top);
+    kernel_heap_release(ns->heap,ns);
+}
+
+static struct kernel_mount_namespace *mount_namespace_create(struct kernel_heap *heap)
+{
+    static uint64_t sequence=UINT64_C(4026531840);
+    struct kernel_mount_namespace *ns=NULL;
+    if (kernel_heap_allocate_zeroed(heap,1,sizeof(*ns),(void **)&ns)) return NULL;
+    KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+    if (sequence==UINT64_MAX) __builtin_trap();
+    ns->id=sequence++;
+    ns->heap=heap;ns->references=1;
+    return ns;
+}
 
 static int empty_context(const struct kernel_fs_context *fs)
 {
@@ -59,7 +101,8 @@ static enum kernel_fs_context_status create_context(
     struct kernel_vfs_path *cwd,
     struct kernel_vfs_mount *root_mount,
     struct kernel_heap *heap,
-    uint32_t umask)
+    uint32_t umask,
+    struct kernel_mount_namespace *ns)
 {
     struct kernel_fs_context_record *record;
     enum kernel_heap_status heap_status;
@@ -95,7 +138,23 @@ static enum kernel_fs_context_status create_context(
     record->cwd = cwd;
     record->umask = umask;
     record->references = 1U;
+    if (!ns) {
+        ns=mount_namespace_create(heap);
+        if (!ns) {
+            if (kernel_vfs_path_release(&cwd) || kernel_vfs_path_release(&root))
+                __builtin_trap();
+            kernel_heap_release(heap,record);
+            return KERNEL_FS_CONTEXT_STATUS_NO_MEMORY;
+        }
+        if (kernel_vfs_path_acquire(root)) __builtin_trap();
+        ns->top=root;
+        record->namespace=ns;
+    }
     KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
+    if (!record->namespace) {
+        mount_namespace_get_locked(ns);
+        record->namespace=ns;
+    }
     fs->heap = heap;
     fs->record = record;
     fs->state = KERNEL_FS_CONTEXT_LIVE;
@@ -113,7 +172,7 @@ enum kernel_fs_context_status kernel_fs_context_create(
     if (!empty_context(fs)) {
         return KERNEL_FS_CONTEXT_STATUS_STATE;
     }
-    return create_context(fs, 0, 0, root_mount, heap, 0022U);
+    return create_context(fs, 0, 0, root_mount, heap, 0022U, NULL);
 }
 
 enum kernel_fs_context_status kernel_fs_context_acquire(
@@ -136,26 +195,194 @@ enum kernel_fs_context_status kernel_fs_context_acquire(
     return KERNEL_FS_CONTEXT_STATUS_OK;
 }
 
-enum kernel_fs_context_status kernel_fs_context_fork(
+static enum kernel_fs_context_status fork_context(
     struct kernel_fs_context *destination,
-    const struct kernel_fs_context *source)
+    const struct kernel_fs_context *source, int copy_namespace, int *copy_error)
 {
     if (destination == 0 || source == 0 || destination == source) {
         return KERNEL_FS_CONTEXT_STATUS_INVALID_ARGUMENT;
     }
     struct kernel_heap *heap;
+    struct kernel_mount_namespace *ns;
     struct kernel_fs_paths paths __attribute__((cleanup(kernel_fs_paths_release))) = {0};
     {
         KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
         if (!empty_context(destination) || !kernel_fs_context_is_live(source))
             return KERNEL_FS_CONTEXT_STATUS_STATE;
         heap = source->heap;
+        ns=source->record->namespace;
+        mount_namespace_get_locked(ns);
         paths = (struct kernel_fs_paths){source->record->root, source->record->cwd,
                                          source->record->umask};
         if (kernel_vfs_path_acquire(paths.root) || kernel_vfs_path_acquire(paths.cwd))
             __builtin_trap();
     }
-    return create_context(destination, paths.root, paths.cwd, 0, heap, paths.umask);
+    enum kernel_fs_context_status status;
+    if (!copy_namespace)
+        status=create_context(destination,paths.root,paths.cwd,NULL,heap,paths.umask,ns);
+    else {
+        status=KERNEL_FS_CONTEXT_STATUS_NO_MEMORY;
+        struct kernel_mount_namespace *copy=mount_namespace_create(heap);
+        if (copy) {
+            struct kernel_vfs_path *original[3]={ns->top,paths.root,paths.cwd},*cloned[3]={0};
+            int result=kernel_vfs_copy_mount_tree(kernel_vfs_path_mount(ns->top),original,cloned);
+            if (result) {
+                *copy_error=result;
+                kernel_heap_release(heap,copy);
+            } else {
+                copy->top=cloned[0];copy->copied_tree=1;
+                status=create_context(destination,cloned[1],cloned[2],NULL,heap,paths.umask,copy);
+                if (kernel_vfs_path_release(&cloned[2]) || kernel_vfs_path_release(&cloned[1]))
+                    __builtin_trap();
+                mount_namespace_put(copy);
+            }
+        }
+    }
+    mount_namespace_put(ns);
+    return status;
+}
+
+enum kernel_fs_context_status kernel_fs_context_fork(struct kernel_fs_context *destination,
+    const struct kernel_fs_context *source)
+{ return fork_context(destination,source,0,NULL); }
+
+int kernel_fs_context_fork_mount_namespace(struct kernel_fs_context *destination,
+    const struct kernel_fs_context *source)
+{
+    int error=0;
+    enum kernel_fs_context_status status=fork_context(destination,source,1,&error);
+    return error?error:!status?0:status==KERNEL_FS_CONTEXT_STATUS_NO_MEMORY?-KERNEL_ENOMEM:-KERNEL_EINVAL;
+}
+
+static int replace_context(struct kernel_fs_context *fs,struct kernel_fs_context *next,int exclusive)
+{
+    struct kernel_fs_context old;
+    {
+        KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+        if (!kernel_fs_context_is_live(fs) ||
+            (exclusive && fs->record->references!=1)) return -KERNEL_EINVAL;
+        old=*fs;*fs=*next;
+        finish_context(next,KERNEL_FS_CONTEXT_MOVED);
+    }
+    if (kernel_fs_context_release(&old)) __builtin_trap();
+    return 0;
+}
+
+int kernel_fs_context_unshare(struct kernel_fs_context *fs,int new_mount_namespace)
+{
+    struct kernel_fs_context next={0};
+    int result;
+    if (new_mount_namespace) result=kernel_fs_context_fork_mount_namespace(&next,fs);
+    else {
+        {
+            KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+            if (!kernel_fs_context_is_live(fs)) return -KERNEL_EINVAL;
+            if (fs->record->references==1) return 0;
+        }
+        enum kernel_fs_context_status status=kernel_fs_context_fork(&next,fs);
+        result=!status?0:status==KERNEL_FS_CONTEXT_STATUS_NO_MEMORY?-KERNEL_ENOMEM:-KERNEL_EINVAL;
+    }
+    if (result) return result;
+    result=replace_context(fs,&next,0);
+    if (result && kernel_fs_context_release(&next)) __builtin_trap();
+    return result;
+}
+
+int kernel_fs_context_set_mount_namespace(struct kernel_fs_context *fs,struct kernel_mount_namespace *ns)
+{
+    if (!ns || !kernel_fs_context_is_live(fs)) return -KERNEL_EINVAL;
+    {
+        KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+        if (fs->record->references!=1) return -KERNEL_EINVAL;
+    }
+    struct kernel_vfs_path *root=NULL;
+    int result=kernel_vfs_path_resolve(ns->top,ns->top,"/",1,&root);
+    if (result) return result;
+    struct kernel_fs_context next={0};
+    enum kernel_fs_context_status status=create_context(&next,root,root,NULL,fs->heap,
+        kernel_fs_context_umask(fs),ns);
+    if (kernel_vfs_path_release(&root)) __builtin_trap();
+    if (status) return status==KERNEL_FS_CONTEXT_STATUS_NO_MEMORY?-KERNEL_ENOMEM:-KERNEL_EINVAL;
+    result=replace_context(fs,&next,1);
+    if (result && kernel_fs_context_release(&next)) __builtin_trap();
+    return result;
+}
+
+uint64_t kernel_mount_namespace_id(const struct kernel_mount_namespace *ns)
+{ return ns->id; }
+
+static void mount_namespace_file_release(void *instance)
+{ mount_namespace_put(instance); }
+
+static uint32_t mount_namespace_file_poll(void *instance,uint32_t flags,uint32_t requested,
+    struct kernel_wait_queue **queue)
+{
+    (void)instance;(void)requested;(void)queue;
+    return flags&010000000U?KERNEL_POLLNVAL:
+        KERNEL_POLLIN|KERNEL_POLLOUT|KERNEL_POLLRDNORM|KERNEL_POLLWRNORM;
+}
+
+static const struct kernel_char_device mount_namespace_ops={
+    .release=mount_namespace_file_release,.poll=mount_namespace_file_poll,
+};
+
+int kernel_mount_namespace_open(struct kernel_mount_namespace *ns,struct kernel_heap *heap,
+    uint32_t flags,struct kernel_open_file_description **owner)
+{
+    if (flags & 0200000U) return -KERNEL_ENOTDIR;
+    if (!(flags&010000000U) && (flags&3U || flags&01000U)) return -KERNEL_EACCES;
+    struct kernel_open_file_description *file=NULL;
+    if (kernel_heap_allocate_zeroed(heap,1,sizeof(*file),(void **)&file)) return -KERNEL_ENOMEM;
+    file->heap=heap;
+    file->references=1;
+    file->kind=KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE;
+    file->proc_identity=ns->id;
+    file->open_flags=flags;
+    file->credentials=kernel_credentials_get(kernel_credentials_current());
+    file->device=&mount_namespace_ops;
+    file->device_instance=ns;
+    file->device_opened=1;
+    kernel_mutex_init(&file->offset_lock,10,(uintptr_t)file);
+    {
+        KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+        mount_namespace_get_locked(ns);
+    }
+    *owner=file;
+    return 0;
+}
+
+struct kernel_mount_namespace *kernel_mount_namespace_file(const struct kernel_open_file_description *file)
+{
+    return file && file->kind==KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE
+        ? file->device_instance:NULL;
+}
+
+struct kernel_vfs_mount *kernel_fs_context_mount_root(const struct kernel_fs_context *fs)
+{
+    KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+    return kernel_fs_context_is_live(fs)?kernel_vfs_path_mount(fs->record->namespace->top):NULL;
+}
+
+struct kernel_fs_mounts kernel_fs_context_mounts_snapshot(const struct kernel_fs_context *fs)
+{
+    struct kernel_fs_mounts mounts={0};
+    KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+    if (kernel_fs_context_is_live(fs)) {
+        mounts.namespace=fs->record->namespace;
+        mounts.root=fs->record->root;
+        mounts.top=mounts.namespace->top;
+        mount_namespace_get_locked(mounts.namespace);
+        if (kernel_vfs_path_acquire(mounts.root)) __builtin_trap();
+    }
+    return mounts;
+}
+
+void kernel_fs_mounts_release(struct kernel_fs_mounts *mounts)
+{
+    if (!mounts->namespace) return;
+    if (kernel_vfs_path_release(&mounts->root)) __builtin_trap();
+    mount_namespace_put(mounts->namespace);
+    *mounts=(struct kernel_fs_mounts){0};
 }
 
 int kernel_fs_context_exec_begin(const struct kernel_fs_context *fs, struct kernel_task *task)
@@ -345,6 +572,7 @@ enum kernel_fs_context_status kernel_fs_context_release(struct kernel_fs_context
     }
     if (kernel_vfs_path_release(&record->cwd) || kernel_vfs_path_release(&record->root))
         __builtin_trap();
+    mount_namespace_put(record->namespace);
     kernel_heap_release(heap, record);
     return KERNEL_FS_CONTEXT_STATUS_OK;
 }

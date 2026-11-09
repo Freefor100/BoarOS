@@ -330,6 +330,7 @@ COMMON_C_SOURCES := \
 	fs/files/poll.c \
 	fs/files/epoll.c \
 	fs/event_fd.c \
+	fs/inotify.c \
 	fs/mqueue.c \
 	fs/signal_fd.c \
 	fs/files/socket.c \

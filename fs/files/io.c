@@ -1,3 +1,4 @@
+#include "../vfs_notify.h"
 #include "private.h"
 #include "../open_file_internal.h"
 #include "../pipe_internal.h"
@@ -453,6 +454,10 @@ static enum kernel_files_status read_pinned(
     if(kind==KERNEL_OPEN_FILE_KIND_PIDFD) {
         *linux_result=-KERNEL_EINVAL;return KERNEL_FILES_STATUS_OK;
     }
+    if (kind==KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE) {
+        *linux_result=(kernel_open_file_flags(description)&010000000U)?-KERNEL_EBADF:-KERNEL_EINVAL;
+        return KERNEL_FILES_STATUS_OK;
+    }
     if (kind==KERNEL_OPEN_FILE_KIND_SIGNALFD) {
         *linux_result=kernel_signal_fd_read(description,mm,iov,iov_count,count);
         if (*linux_result<0) KERNEL_FILES_NOTE(files,read_failures,1);
@@ -469,7 +474,7 @@ static enum kernel_files_status read_pinned(
     if (kind == KERNEL_OPEN_FILE_KIND_SOCKET &&
         (kernel_open_file_flags(description) & KERNEL_FILES_O_NONBLOCK))
         socket_flags |= KERNEL_SOCKET_MSG_DONTWAIT;
-    KERNEL_SERVICE_SCOPE_IF(service, kind != KERNEL_OPEN_FILE_KIND_REGULAR && kind != KERNEL_OPEN_FILE_KIND_SOCKET && kind != KERNEL_OPEN_FILE_KIND_PIPE);
+    KERNEL_SERVICE_SCOPE_IF(service, kind != KERNEL_OPEN_FILE_KIND_INOTIFY && kind != KERNEL_OPEN_FILE_KIND_REGULAR && kind != KERNEL_OPEN_FILE_KIND_SOCKET && kind != KERNEL_OPEN_FILE_KIND_PIPE);
     KERNEL_LOCK_SCOPE(offset_guard);
     if (kind == KERNEL_OPEN_FILE_KIND_REGULAR || kind == KERNEL_OPEN_FILE_KIND_GENERATED)
         kernel_mutex_lock(&description->offset_lock, &offset_guard);
@@ -706,6 +711,8 @@ enum kernel_files_status kernel_files_read(
     }
     status = read_pinned(files, mm, &description, &iov, 1U, count, 1,
                          linux_result, 0U, 0, 0, NULL);
+    if (!status && *linux_result>0 && description)
+        kernel_vfs_notify_file(&description->file,VFS_NOTIFY_ACCESS);
     return release_io_description(files, &description, status);
 }
 
@@ -740,7 +747,12 @@ static enum kernel_files_status readv_request(
         KERNEL_FILES_NOTE(files, read_failures, 1);
         return KERNEL_FILES_STATUS_OK;
     }
-    KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_EVENTFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_TIMERFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SIGNALFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_MQUEUE);
+    KERNEL_SERVICE_SCOPE_IF(service, description->kind != KERNEL_OPEN_FILE_KIND_INOTIFY && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_EVENTFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_TIMERFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SIGNALFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_MQUEUE);
+    if (description->kind==KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE) {
+        *linux_result=(kernel_open_file_flags(description)&010000000U)?-KERNEL_EBADF:-KERNEL_EINVAL;
+        status=KERNEL_FILES_STATUS_OK;
+        goto out;
+    }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL ||
         kernel_open_file_kind(description)==KERNEL_OPEN_FILE_KIND_PIDFD) {
         *linux_result = positioned && kernel_open_file_kind(description)!=KERNEL_OPEN_FILE_KIND_PIDFD
@@ -787,6 +799,8 @@ static enum kernel_files_status readv_request(
                          snapshot.view, snapshot.count,
                          snapshot.total, 0, linux_result, 0U, 0, 0, NULL);
     dispatched = 1;
+    if (!status && *linux_result>0 && description)
+        kernel_vfs_notify_file(&description->file,VFS_NOTIFY_ACCESS);
 out:
     kernel_uaccess_iov_cleanup(&snapshot,files->heap);
     if (!dispatched && status == KERNEL_FILES_STATUS_OK &&
@@ -950,6 +964,8 @@ enum kernel_files_status kernel_files_pread(
     struct kernel_uaccess_iovec iov = {user_buffer, count};
     status = pread_iov_pinned(files, mm, &description, &iov, 1,
                               count, offset, 1, linux_result);
+    if (!status && *linux_result>0 && description)
+        kernel_vfs_notify_file(&description->file,VFS_NOTIFY_ACCESS);
     return release_io_description(files, &description, status);
 }
 
@@ -1369,6 +1385,7 @@ enum kernel_files_status kernel_files_sendfile(
     /* 两份 pin 由仍会恢复的 syscall 栈持有；退出先唤醒等待，正常展开再交还。 */
     *linux_result = sendfile_pinned(files, mm, input, &output, user_offset != 0U, &position, count);
     if (*linux_result > 0) {
+        kernel_vfs_notify_file(&input->file,VFS_NOTIFY_ACCESS);
         KERNEL_FILES_NOTE(files, bytes_read, (uint64_t)*linux_result);
         KERNEL_FILES_NOTE(files, bytes_written, (uint64_t)*linux_result);
     }
@@ -1477,6 +1494,7 @@ enum kernel_files_status kernel_files_copy_range(
     *linux_result = copy_range_pinned(mm, input, &output, user_in, position_in,
         user_out, position_out, count);
     if (*linux_result > 0) {
+        kernel_vfs_notify_file(&input->file,VFS_NOTIFY_ACCESS);
         KERNEL_FILES_NOTE(files, bytes_read, (uint64_t)*linux_result);
         KERNEL_FILES_NOTE(files, bytes_written, (uint64_t)*linux_result);
     }
@@ -2506,6 +2524,7 @@ enum kernel_files_status kernel_files_getdents(
     } while (total < request);
     KERNEL_FILES_NOTE(files, bytes_read, total);
     *linux_result = (int64_t)total;
+    kernel_vfs_notify_file(&description->file,VFS_NOTIFY_ACCESS);
     return KERNEL_FILES_STATUS_OK;
 }
 

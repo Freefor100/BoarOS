@@ -1,5 +1,6 @@
 #include "private.h"
 #include <kernel/event_fd.h>
+#include <kernel/inotify.h>
 #include <kernel/errno.h>
 #include <kernel/task.h>
 enum kernel_syscall_status syscall_handle_eventfd(struct kernel_task *caller,
@@ -24,4 +25,19 @@ enum kernel_syscall_status syscall_handle_timerfd(struct kernel_task *caller,
     else status=kernel_files_timerfd_gettime(files,mm,(int32_t)request->arguments[0],request->arguments[1],&decoded->value);
     decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
     return status?KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT:KERNEL_SYSCALL_STATUS_OK;
+}
+
+enum kernel_syscall_status syscall_handle_inotify(struct kernel_task *caller,
+    const struct kernel_syscall_request *request,struct kernel_syscall_result *decoded)
+{
+    struct kernel_files *files;
+    struct kernel_mm *mm=NULL;
+    const struct kernel_fs_context *fs=NULL;
+    if (kernel_task_files_borrow(caller,&files) ||
+        (request->number==27 && (kernel_task_mm_borrow_mutable(caller,&mm) ||
+        kernel_task_fs_context_borrow(caller,&fs)))) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+    return kernel_files_inotify(files,fs,mm,request->number,(int32_t)request->arguments[0],
+        request->arguments[1],(uint32_t)request->arguments[2],&decoded->value) ?
+        KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT : KERNEL_SYSCALL_STATUS_OK;
 }

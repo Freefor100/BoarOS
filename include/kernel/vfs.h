@@ -40,6 +40,7 @@ uint64_t kernel_vfs_allocate_mount_id(void);
 struct kernel_vfs_path;
 struct kernel_vfs_dentry;
 struct kernel_open_file_description;
+struct kernel_lock_guard;
 struct kernel_vfs_mount {
     void *private_data;
     uint64_t id;
@@ -62,12 +63,19 @@ struct kernel_vfs_mount {
     struct kernel_vfs_dentry *root_dentry;
     struct kernel_vfs_path *paths, *path_index; /* Weak mount-location registry and identity index. */
     struct kernel_vfs_mount *instance_next, **instance_previous;
+    struct kernel_vfs_mount *namespace_retirement_next;
 };
 
 /* 连接由挂载树持有 root/covered 引用；路径与打开文件分别保留实际视图。
  * 最后 view 归还只排队，reap 在所有 VFS/MM 资格释放后于 CPU0 执行。 */
 void kernel_vfs_mount_initialize(struct kernel_vfs_mount *mount);
 int kernel_vfs_bind_mount(struct kernel_vfs_path *source, struct kernel_vfs_path *target, int recursive);
+void kernel_vfs_mount_topology_lock(struct kernel_lock_guard *);
+int kernel_vfs_mount_contains(struct kernel_vfs_mount *, const struct kernel_vfs_path *);
+int kernel_vfs_copy_mount_tree(struct kernel_vfs_mount *top,
+    struct kernel_vfs_path *const source[3], struct kernel_vfs_path *destination[3]);
+/* Consume the private tree owner; detach at the existing lock-free reap point. */
+void kernel_vfs_retire_mount_tree(struct kernel_vfs_mount *);
 /* Transfer the attached source view and its children; existing owners retain
  * their exact mount and inode identities. Both input paths remain borrowed. */
 int kernel_vfs_move_mount(struct kernel_vfs_path *source, struct kernel_vfs_path *target);

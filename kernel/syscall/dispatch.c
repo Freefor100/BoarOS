@@ -74,6 +74,8 @@
 #define LINUX_SYSCALL_EXIT_GROUP 94U
 #define LINUX_SYSCALL_WAITID 95U
 #define LINUX_SYSCALL_SET_TID_ADDRESS 96U
+#define LINUX_SYSCALL_UNSHARE 97U
+#define LINUX_SYSCALL_SETNS 268U
 #define LINUX_SYSCALL_SET_ROBUST_LIST 99U
 #define LINUX_SYSCALL_GET_ROBUST_LIST 100U
 #define LINUX_SYSCALL_UNAME 160U
@@ -374,6 +376,9 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
     } else if (request->number >= 85U && request->number <= 87U) {
         if (syscall_handle_timerfd(caller,request,&decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number >= 26U && request->number <= 28U) {
+        if (syscall_handle_inotify(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_EVENTFD2) {
         if (syscall_handle_eventfd(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
@@ -417,6 +422,12 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
+    } else if (request->number == LINUX_SYSCALL_UNSHARE) {
+        if (syscall_handle_unshare(caller,request,&decoded)!=KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == LINUX_SYSCALL_SETNS) {
+        if (syscall_handle_setns(caller,request,&decoded)!=KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_MOUNT ||
                request->number == LINUX_SYSCALL_UMOUNT2) {
         if (syscall_handle_mount(caller, request, &decoded,

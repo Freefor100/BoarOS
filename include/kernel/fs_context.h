@@ -12,7 +12,9 @@ struct kernel_mm;
 struct kernel_fs_context_record;
 struct kernel_vfs_mount;
 struct kernel_vfs_path;
+struct kernel_mount_namespace;
 struct kernel_task;
+struct kernel_open_file_description;
 
 enum kernel_fs_context_status {
     KERNEL_FS_CONTEXT_STATUS_OK = 0,
@@ -50,6 +52,23 @@ enum kernel_fs_context_status kernel_fs_context_acquire(
 enum kernel_fs_context_status kernel_fs_context_fork(
     struct kernel_fs_context *destination,
     const struct kernel_fs_context *source);
+int kernel_fs_context_fork_mount_namespace(struct kernel_fs_context *,
+    const struct kernel_fs_context *);
+int kernel_fs_context_unshare(struct kernel_fs_context *, int new_mount_namespace);
+
+/* A proc reader owns both the namespace tree and its process-relative root. */
+struct kernel_fs_mounts {
+    struct kernel_mount_namespace *namespace;
+    struct kernel_vfs_path *root, *top;
+};
+struct kernel_fs_mounts kernel_fs_context_mounts_snapshot(const struct kernel_fs_context *);
+void kernel_fs_mounts_release(struct kernel_fs_mounts *);
+struct kernel_vfs_mount *kernel_fs_context_mount_root(const struct kernel_fs_context *);
+int kernel_fs_context_set_mount_namespace(struct kernel_fs_context *,struct kernel_mount_namespace *);
+uint64_t kernel_mount_namespace_id(const struct kernel_mount_namespace *);
+int kernel_mount_namespace_open(struct kernel_mount_namespace *,struct kernel_heap *,
+    uint32_t flags,struct kernel_open_file_description **);
+struct kernel_mount_namespace *kernel_mount_namespace_file(const struct kernel_open_file_description *);
 
 enum kernel_fs_context_status kernel_fs_context_move(
     struct kernel_fs_context *destination,

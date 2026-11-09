@@ -1,3 +1,4 @@
+#include "../vfs_notify.h"
 #include <kernel/scheduler.h>
 #include "../open_file_internal.h"
 #include "../pipe_internal.h"
@@ -434,6 +435,10 @@ Finish_open:
     if ((flags & (LINUX_O_SYNC & ~LINUX_O_DSYNC)) != 0U)
         flags |= LINUX_O_DSYNC;
     description->open_flags = (uint32_t)((flags & LINUX_O_PATH) ? flags & ~LINUX_O_CLOEXEC : flags);
+    if (!(flags&LINUX_O_PATH)) {
+        description->notify_opened=1;
+        kernel_vfs_notify_file(&description->file,VFS_NOTIFY_OPEN);
+    }
     files_status = kernel_files_install_new_owned_at(files,
                                                      fd,
                                                      fd_flags,

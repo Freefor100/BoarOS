@@ -60,6 +60,7 @@
      LINUX_WCONTINUED | LINUX___WNOTHREAD | LINUX___WALL | LINUX___WCLONE)
 #define LINUX_CLONE_VM UINT64_C(0x100)
 #define LINUX_CLONE_FS UINT64_C(0x200)
+#define LINUX_CLONE_NEWNS UINT64_C(0x20000)
 #define LINUX_CLONE_FILES UINT64_C(0x400)
 #define LINUX_CLONE_SIGHAND UINT64_C(0x800)
 #define LINUX_CLONE_CLEAR_SIGHAND UINT64_C(0x100000000)
@@ -806,6 +807,11 @@ enum kernel_scheduler_status arch_process_clone_current(
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         return status;
     }
+    if ((flags & LINUX_CLONE_NEWNS) &&
+        !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN)) {
+        *linux_result=-KERNEL_EPERM;
+        return KERNEL_SCHEDULER_STATUS_OK;
+    }
 
     status = allocate_task_storage(&child);
     if (status == KERNEL_SCHEDULER_STATUS_NO_MEMORY) {
@@ -885,7 +891,11 @@ enum kernel_scheduler_status arch_process_clone_current(
                     ? KERNEL_SCHEDULER_STATUS_OK
                     : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
         }
-        fs_status = (flags & LINUX_CLONE_FS) != 0U
+        if (flags & LINUX_CLONE_NEWNS) {
+            int error=kernel_fs_context_fork_mount_namespace(&child->fs,&parent->fs);
+            if (error) return finish_clone_failure(child,error,linux_result,KERNEL_SCHEDULER_STATUS_OK);
+            fs_status=KERNEL_FS_CONTEXT_STATUS_OK;
+        } else fs_status = (flags & LINUX_CLONE_FS) != 0U
             ? kernel_fs_context_acquire(&child->fs, &parent->fs)
             : kernel_fs_context_fork(&child->fs, &parent->fs);
         if (fs_status != KERNEL_FS_CONTEXT_STATUS_OK) {
@@ -2786,6 +2796,12 @@ enum kernel_task_status kernel_task_fs_context_borrow(
     }
     *fs = &task->fs;
     return KERNEL_TASK_STATUS_OK;
+}
+
+int kernel_task_unshare_fs(struct kernel_task *task,int new_mount_namespace)
+{
+    if (validate_task_resource_borrow(task)!=KERNEL_TASK_STATUS_OK) return -KERNEL_EINVAL;
+    return kernel_fs_context_unshare(&task->fs,new_mount_namespace);
 }
 
 int kernel_task_prepare_user_return(void)

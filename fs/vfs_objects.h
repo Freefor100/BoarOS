@@ -15,6 +15,7 @@
 #define VFS_FILE_STATE_LIVE UINT32_C(0x5646494c)
 #define VFS_FILE_STATE_CLEANUP UINT32_C(0x5646434c)
 
+struct kernel_vfs_notify_ops;
 struct kernel_vfs_instance {
     const struct kernel_vfs_backend *ops;
     void *backend_data;
@@ -46,6 +47,8 @@ struct kernel_vfs_instance {
     void (*release_storage)(struct kernel_vfs_mount *);
     uint8_t cleanup_queued, cleanup_running;
     struct kernel_vfs_mount *retry_view;
+    const struct kernel_vfs_notify_ops *notify_ops;
+    unsigned notify_marks; /* Protected by the active notification backend. */
 };
 
 struct kernel_vfs_node {

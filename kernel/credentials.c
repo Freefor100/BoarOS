@@ -73,7 +73,7 @@ struct kernel_uid_account *kernel_uid_account_put_locked(struct kernel_uid_accou
     if(!a->heap)return 0;
     if(!a->references)__builtin_trap();
     if(--a->references)return 0;
-    if(!a->heap||a->pending||a->processes||a->shm_locked_pages||a->mqueue_bytes||a->pipe_pages)__builtin_trap();
+    if(!a->heap||a->pending||a->processes||a->shm_locked_pages||a->mqueue_bytes||a->pipe_pages||a->inotify_groups||a->inotify_marks)__builtin_trap();
     struct kernel_uid_account **p=&accounts[a->uid%ACCOUNT_BUCKETS];
     while(*p&&*p!=a)p=&(*p)->next;
     if(!*p)__builtin_trap();
