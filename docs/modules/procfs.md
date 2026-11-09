@@ -1,8 +1,8 @@
 # procfs 模块
 
-`fs/procfs.c` 是可动态创建的 VFS 实例。当前提供真实物理页分配器读数的 `meminfo`、单 hart 运行/idle 计时的 `uptime`、进程及线程数字目录、`/proc/self`、`/proc/thread-self` 与进程的 `exe/cwd/root/fd` 对象链接、`/proc/self/mounts` 与 `/proc/mounts`，以及进程 `maps`、`fdinfo`、`stat/status` 的首批真实字段、`/proc/sysvipc/{shm,sem,msg}` 和 `/proc/sys/kernel/sched_rt_period_us`、`sched_rt_runtime_us`、只读的`pid_max`。线程目录提供 `stat/status`、`fd/fdinfo`、`exe/cwd/root` 和 `maps`；Linux 全量进程字段与无路径 console 的链接仍待接入。
+`fs/procfs.c` 是可动态创建的 VFS 实例。当前提供真实物理页分配器读数的 `meminfo`、单 hart 运行/idle 计时的 `uptime`、进程及线程数字目录、`/proc/self`、`/proc/thread-self` 与进程的 `exe/cwd/root/fd` 对象链接、`/proc/self/mounts` 与 `/proc/mounts`，以及进程 `maps`、`fdinfo`、`stat/status` 的首批真实字段、`/proc/sysvipc/{shm,sem,msg}` 和 `/proc/sys/kernel/sched_rt_period_us`、`sched_rt_runtime_us`、只读的`pid_max`。线程目录提供 `stat/status`、`fd/fdinfo`、`exe/cwd/root`、`maps`、`mounts` 和 `ns/mnt`；Linux 全量进程字段与无路径 console 的链接仍待接入。
 
-`mount(2)` 的 proc 实例不使用源字符串选择设备；用户态负责创建挂载点。bind、卸载和挂载属性的共同规则见[VFS 挂载说明](vfs-ext4.md)。挂载实例持有根及覆盖路径，最后释放时销毁无 I/O 的 proc 实例。PID 1 及后代退出后的根盘清理从最深子挂载开始拆除；当前任务共享一棵挂载树。
+`mount(2)` 的 proc 实例不使用源字符串选择设备；用户态负责创建挂载点。bind、卸载和挂载属性的共同规则见[VFS 挂载说明](vfs-ext4.md)。挂载实例持有根及覆盖路径，最后释放时销毁无 I/O 的 proc 实例。PID 1 及后代退出后的根盘清理从最深子挂载开始拆除；其他命名空间的私有树随进程和命名空间 FD 的最后引用退休。
 
 生成式普通文件不进入 ext4 页缓存。后端 `snapshot` 返回由 OFD 持有的堆缓冲；第一次非空读取形成快照，短读、readv 和 pread 使用它，seek 到零后释放并在下一次读取重新取值，`SEEK_END` 按固定 Linux 的 seq_file 语义返回 `EINVAL`。用户复制时不持有后端或 inode 锁；只推进已经复制的字节。OFD 末引用释放快照，mount 忙判断覆盖文件及目录引用。`fstat` 中的 size 为零是生成文件的元数据语义，不能由它推断 read EOF。
 
@@ -12,7 +12,7 @@ sem/msg 按 slot 索引逐行遍历，在索引和对应对象的短锁内复制
 
 `/proc/sys/kernel/pid_max`只读提供实际PID分配器的排他上界（最大可分配PID加1）；该值随分配器配置取得，查询此数值对应的TID返回ESRCH。它与已有实时预算控制同处`/proc/sys/kernel`，沿生成式文件快照读取，不提供运行时改写接口。`/proc/<pid>/status`的VmSwap在当前无swap机制下为0。
 
-`/proc/<pid>/maps`（包括 `self/maps`）按目标真实 VMA 地址顺序输出地址区间、当前读写执行许可、private/shared、文件偏移、设备号、inode 和路径；匿名行使用零设备号与 inode，初始堆、栈和 vDSO 分别标为 `[heap]`、`[stack]` 和 `[vdso]`。文件及 ELF 映射从实际后备 OFD 取得身份，ELF 全零区按匿名映射显示；路径中的换行转义为 `\012`，删除后仍保有后备的文件标为 `(deleted)`。VMA 元数据与后备 OFD 引用在 MM gate 内同次捕获，路径渲染、文件 stat、堆分配及用户复制在 gate 外。目标 PID 代次、凭据、dumpable 和 MM 身份在捕获前后检查，exec、退出和 PID 复用不会把旧许可用于新 MM。它沿用第一次读取生成文本、同 OFD 短读复用、rewind 后重新捕获的规则，首次生成时取得目标的当前 MM；不额外保存跨 rewind 的 MM 引用。线程目录目前仍只提供 stat/status。
+`/proc/<pid>/maps`（包括 `self/maps`）按目标真实 VMA 地址顺序输出地址区间、当前读写执行许可、private/shared、文件偏移、设备号、inode 和路径；匿名行使用零设备号与 inode，初始堆、栈和 vDSO 分别标为 `[heap]`、`[stack]` 和 `[vdso]`。文件及 ELF 映射从实际后备 OFD 取得身份，ELF 全零区按匿名映射显示；路径中的换行转义为 `\012`，删除后仍保有后备的文件标为 `(deleted)`。VMA 元数据与后备 OFD 引用在 MM gate 内同次捕获，路径渲染、文件 stat、堆分配及用户复制在 gate 外。目标 PID 代次、凭据、dumpable 和 MM 身份在捕获前后检查，exec、退出和 PID 复用不会把旧许可用于新 MM。它沿用第一次读取生成文本、同 OFD 短读复用、rewind 后重新捕获的规则，首次生成时取得目标的当前 MM；不额外保存跨 rewind 的 MM 引用。
 
 RT 控制文件标记为 `generated_control`，通过单独后端 `control` 回调动态读写，不形成 OFD 快照。offset 为零时每次读取 scheduler 的原子 period/runtime 对；非零读取直接 EOF，因而短读不会继续输出剩余数字。write/writev 先完整复制全部用户数据，再按固定 Linux 的单整数 sysctl 规则解析和调用原子 setter：base 0、不接受 `+`，只消耗首个数字及其后空白，32 位溢出和不合法配置返回 `EINVAL`。非零偏移写完整复制后忽略配置并推进偏移；复制失败不发布配置、不推进偏移，读复制失败也返回 `EFAULT` 且偏移不变。OFD offset 锁串行化同描述符操作，setter 自身保护全局配置；无 inode 锁跨用户复制或 scheduler 操作。只读 proc mount 写打开返回 `EROFS`。
 
@@ -40,7 +40,7 @@ PID 数字目录的 inode 编入单调分配代次；进程退出后旧目录对
 
 `fd/` 按活文件表枚举 0–1023，查找和链接读取重新核对 PID 代次及当前槽；关闭后返回 `ENOENT`，复用同一编号时按新槽解析。动态 inode 为 PID 保留完整 16 位（当前 PID 上限 32768）、fd 保留 10 位，另编入进程代次和节点种类。目录项回调以正值报告成功、零报告 EOF，`getdents64` 才会真正递进；曾经错误地以零报告成功，导致 `ps` 只打印表头。普通文件链接钉住目标路径对象，重新打开创建独立 OFD 与 offset。pipe/socket 的展示编号来自对象创建时的单调身份，不泄露内核地址；pipe 链接可按只读、只写或读写重新打开，建立新的 endpoint owner，旧 fd 关闭不拆除新端点。`O_RDWR` 端点分别计入 reader/writer，并用独立聚合等待队列支持 poll。socket 和 epoll 链接可 `readlink`，重新打开返回固定 Linux 的 `ENXIO`。`lstat` 的链接权限位按当前 OFD 读写能力重新计算；跟随式 `newfstatat` 对伪对象在短关中断区内取得与目标 `fstat` 相同的元数据快照，不通过展示文本查找。PID 1 启动时若根盘已有真实 5:1 `/dev/console`，标准 fd 持有该 VFS 路径并可展示；缺失节点时仍使用无路径 UART 兜底，后者没有路径链接。
 
-`/proc/mounts` 的链接文本为 `self/mounts`。进程 `mounts` 的第一次非空读取在短关中断区捕获整棵共享挂载树，并分别钉住挂载根与被覆盖路径；随后无锁格式化并由 OFD 持有本次文本。根 ext4 行的来源名为内部 `rootfs`，只表达本内核的根盘身份，不伪称 `/dev` 节点；proc 行的来源和类型均为 `proc`。输出包含实际挂载点、后端类型、实例的 `ro/rw`、实际 `nosuid/nodev/noexec` 状态和 `0 0` 字段，路径中的空白、反斜杠及 `#` 用八进制转义。卸载期间的引用会使普通卸载返回 `EBUSY`，快照交付后立即解除临时引用。`make test-diff-abi-riscv` 在固定 Linux 对照链接文本、打开能力和真实 proc 行；嵌套挂载与并发卸载还需要专门的真实用户态用例。
+`/proc/mounts` 的链接文本为 `self/mounts`。进程或线程 `mounts` 的第一次非空读取按目标 PID/TID 的当前挂载命名空间和根目录捕获挂载树，并分别钉住挂载根与被覆盖路径；随后无锁格式化并由 OFD 持有本次文本。根 ext4 行的来源名为内部 `rootfs`，只表达本内核的根盘身份，不伪称 `/dev` 节点；proc 行的来源和类型均为 `proc`。输出包含实际挂载点、后端类型、实例的 `ro/rw`、实际 `nosuid/nodev/noexec` 状态和 `0 0` 字段，路径中的空白、反斜杠及 `#` 用八进制转义。卸载期间的引用会使普通卸载返回 `EBUSY`，快照交付后立即解除临时引用。`make test-diff-abi-riscv` 在固定 Linux 对照链接文本、打开能力和真实 proc 行；嵌套挂载与并发卸载还需要专门的真实用户态用例。
 
 默认关闭的成本诊断构建另外提供完整命令控制与冻结快照，具体 owner、窗口和失败契约见
 [成本观测模块](kernel-cost.md)。普通构建的目录 cookie、节点集合和生成文件语义保持一致。
@@ -59,3 +59,5 @@ managed 峰值由分配器在 bootstrap、finalize 与 buddy 成功分配时维�
 上述 heap 指打开该 proc OFD 所属的 heap，本轮为 root heap；网卡 final 行稍后记录的 root-heap-peak 还可能包含 COST 文本格式化和结果文件持久化，不能把不同采样时点当成同一峰值。静态 lwIP 协议堆/pool 数组在内核映像中，另由 ELF 符号预算记录，不能因 managed 峰值相近就宣称候选内存成本相同。完整 scope 与诊断扰动见[数据路径报告](../learning/data-path-budget-experiments.md)。
 
 进程 fdinfo 目录按同一 FD 表枚举并输出 position、flags、mount ID 和 inode。目录及条目同时检查 FSCREDS 进程访问权限和文件 DAC；读取期间持有目标实际 OFD，再复核目标身份与执行安全状态。pidfd 增加 Pid/NSpid，单命名空间中两者相同，目标 TID 已撤下后均为 -1；固定 Linux 的 NSpid 输出还取决于 CONFIG_PID_NS。pidfd 的 FD 链接展示 anon_inode:[pidfd]，getfd 传递实际 OFD，proc 路径重新打开仍返回 ENXIO。文本沿共同生成文件规则，rewind 后重新取值。
+
+`/proc/<pid>/ns/mnt` 与线程目录的 `ns/mnt` 使用现有进程对象权限检查，`readlink` 显示稳定的 `mnt:[id]`，普通打开取得真实挂载命名空间 FD。FD 的 inode 号对应命名空间 ID，`fstatfs` 报告 NSFS，`NS_GET_NSTYPE` 返回 `CLONE_NEWNS`。目标退出不撤销已打开句柄；`setns` 的资格、路径更新和引用规则见 [VFS 挂载说明](vfs-ext4.md)。本实现不提供 `mountinfo` 和其他命名空间对象。

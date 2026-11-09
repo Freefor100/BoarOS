@@ -580,3 +580,18 @@ LA musl1.2.5 不提供旧 `fstat/newfstatat` syscall，而通过 statx 实现 li
 读写和就绪查询在发起CPU执行，epoll复用现有控制与关闭关联协议。无epoll观察者的末次关闭本地完成，有关联时由现有CPU0路径先拆除。匿名对象通过fstat及`/proc/<pid>/fd`显示身份；pread/pwrite返回ESPIPE，lseek保留Linux的noop行为。
 
 匿名事件的阻塞读写沿共同可重启调用协议返回ERESTARTSYS，由实际线程的handler设置决定EINTR或重执行。向量写已完成前缀时直接返回前缀，保留已接纳计数。timerfd行为见[时间模块](kernel-time.md#timerfd期限)。`tests/workloads/event/boundary.c`保留定位I/O、原始地址范围、定向ET、空向量及写入错误优先级的直接反例；`tests/userland/run.py --workload event`复用共同Linux/客户机对照入口，观察构建另核对实际载荷pin和执行CPU。
+
+## inotify 文件事件
+
+RV64／LA64 使用 `inotify_init1`、`inotify_add_watch` 和 `inotify_rm_watch`。
+监视按文件系统实例与 inode 建立；硬链接和 bind 视图可以引用同一个 inode，复用同一监视编号。
+目录监视记录直接子项的名称，重命名的两端共享一个非零 cookie。普通文件的读取、写入、
+打开和关闭，以及 VFS 的目录修改和属性变更发布对应事件。监视不持有 OFD：末链接删除后，
+最后使用者归还时发送 `IN_DELETE_SELF`，文件系统退役时发送 `IN_UNMOUNT`，
+两者都撤除监视并发送 `IN_IGNORED`。共享映射中的内存写入不产生 inotify 写事件。
+
+每个真实 UID 最多 128 个实例、65,536 个监视；每个实例的未读记录使用 64 KiB 环。
+环为 `IN_Q_OVERFLOW` 保留位置，读返回完整记录，名称以 NUL 补齐到记录边界。
+阻塞读取、`IN_NONBLOCK`、poll/epoll 和 `FIONREAD` 使用同一队列状态。事件发布时借用
+等待游标，释放短锁后通知；最后关闭在拆除 epoll 关联后释放实例，已选中的通知保持独立引用。
+直接探针见 [inotify.c](../../tests/workloads/fs/inotify.c)，覆盖目录事件、事件消费、溢出和卸载。

@@ -105,7 +105,7 @@ glibc 2.44 作为外部测试输入使用：官方源码归档保存在被忽略
 `references/sources.tsv`，用法见[CI 环境记录](learning/ci-native-environment.md)。
 
 GCC15.1.0 原官方 archive 固定于 `references/sources.tsv` 的 `gcc/gcc-15.1.0.tar.xz`；
-源码在忽略的 `build/loongarch/gcc-sf/source` 原样解包，许可见 `COPYING3`，目标运行库
+构建时从归档原样解包源码，许可见归档内的 `COPYING3`，目标运行库
 适用 `COPYING.RUNTIME` 的 GCC Runtime Library Exception3.1。仅构建 C/LP64S runtime，
 未导入 Git 或改动 GCC源码。musl1.2.5 仍使用既有固定归档（MIT）；原 BusyBox1.33.1
 使用 `tests/userland/inventory/inputs.json` 中 `b5ec6ef8497e1818cbdec3b54bb722f036e57972`
