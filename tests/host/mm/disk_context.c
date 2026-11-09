@@ -148,3 +148,4 @@ EXCLUDED(kernel_socket_rights_changed)
 EXCLUDED(kernel_pipe_release_endpoint)
 EXCLUDED(kernel_pipe_destroy)
 #endif
+EXCLUDED(kernel_bpf_mmap_page)

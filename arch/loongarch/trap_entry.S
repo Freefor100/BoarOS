@@ -133,6 +133,8 @@ la_trap_return:
 la_user_thread_trampoline:
     # 首次用户入口完成新栈交接；正常异常返回已经在C切换尾部完成。
     bl kernel_scheduler_switch_finish
+    move $a0, $sp
+    bl la_bpf_first_return
     b la_trap_return
 .Lguard_overflow:
     move $a0, $sp

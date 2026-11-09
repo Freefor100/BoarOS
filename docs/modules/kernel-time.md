@@ -43,11 +43,11 @@ REALTIME 和 MONOTONIC 直接读取用户可用的架构计数器，用与 sysca
 
 各 MM 共享一页时钟数据，每个映射 PTE 与 MM 的恢复后备分别持有引用。fork 继承后备，`MADV_DONTNEED` 只丢弃驻留映射；再次访问时，代码从内核 ELF 重新装入，数据重新接入同一时钟页。页表销毁后归还 MM 的后备引用，最后一个 MM 释放时先停止时间写者对该页的访问。
 
-直接检查：`python3 -B tests/userland/run.py --workload vdso_time --arch riscv --cpus 1 --memory 512M --libc glibc`，LA 用 `--arch loongarch`。该程序检查 auxv、符号版本、四种时钟的取值及分辨率、线程 CPU 时钟回退、fork 后丢页再访问和信号返回。
+直接检查：`python3 -B tests/userland/run.py --workload vdso_time --arch riscv --cpus 1 --memory 512M --libc glibc`，LA 用 `--arch loongarch`。该程序检查 auxv、符号版本、各时钟的取值及分辨率、线程 CPU 时钟与 BOOTTIME 回退、fork 后丢页再访问和信号返回。
 
 ## 消费者与验证
 
-syscall 层的 `clock_gettime(113)`、`clock_getres(114)` 支持 `CLOCK_REALTIME`、`CLOCK_MONOTONIC`、两种 `COARSE`（5、6）及[进程/线程 CPU 时钟](kernel-accounting.md#cpu-时钟)。未知 clockid 返回 `-EINVAL`。coarse getres 如实返回 10ms，NULL 输出成功，坏输出指针返回 EFAULT。`gettimeofday(169)` 使用 fine realtime；依次写出 timeval 和可选 timezone，后者为 UTC 的两个零值。先前输出已成功时，后续用户地址错误返回 EFAULT 并保留该输出。
+syscall 层的 `clock_gettime(113)`、`clock_getres(114)` 支持 `CLOCK_REALTIME`、`CLOCK_MONOTONIC`、`CLOCK_BOOTTIME`（7）、两种 `COARSE`（5、6）及[进程/线程 CPU 时钟](kernel-accounting.md#cpu-时钟)。系统不支持挂起，因此 BOOTTIME 与 fine MONOTONIC 使用同一计数，分辨率为 1ns；vDSO 将 BOOTTIME 查询交给 syscall。该查询支持不扩展睡眠或定时器可接受的 clockid。未知 clockid 返回 `-EINVAL`。coarse getres 如实返回 10ms，NULL 输出成功，坏输出指针返回 EFAULT。`gettimeofday(169)` 使用 fine realtime；依次写出 timeval 和可选 timezone，后者为 UTC 的两个零值。先前输出已成功时，后续用户地址错误返回 EFAULT 并保留该输出。
 
 `clock_nanosleep(115)` 支持 REALTIME、MONOTONIC、进程 CPU 时钟及编码后的其他线程 CPU 时钟。CPU 睡眠在调用者 CPU 登记和返回，复用 POSIX CPU 期限索引，按目标实际执行时间到期；不建立用户可见 timer ID，也不预留信号队列额度。内建 CLOCK_THREAD_CPUTIME_ID 与 coarse 时钟在读取 timespec 前返回 EOPNOTSUPP，编码后的本线程时钟返回 EINVAL。进程时钟可以由同组其他线程推进；只有睡眠线程且没有其他执行者时，CPU 时间不会因墙钟流逝增加。
 

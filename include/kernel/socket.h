@@ -16,6 +16,12 @@ struct kernel_socket_name;
 struct kernel_heap;
 struct kernel_mm;
 struct kernel_socket;
+struct kernel_bpf_program;
+struct kernel_bpf_program *kernel_socket_filter_get(struct kernel_socket *);
+int kernel_socket_filter_locked(struct kernel_socket *);
+int kernel_socket_filter_lock(struct kernel_socket *,int);
+/* Success transfers program ownership, failure leaves it with the caller. */
+int kernel_socket_filter_set(struct kernel_socket *,struct kernel_bpf_program *);
 struct kernel_wait_queue;
 struct kernel_task;
 struct kernel_open_file_description;
@@ -44,6 +50,21 @@ struct kernel_socket_read_request {
     struct kernel_open_file_description **pin_owner;
 };
 
+/* 地址字节为网络序，端口为宿主序；Linux 布局只在 syscall 边界出现。 */
+struct kernel_socket_address {
+    uint16_t family;
+    union { uint16_t port, unix_length; };
+    uint32_t scope;
+    union {
+        uint8_t bytes[16];
+        struct {
+            const unsigned char *unix_path;
+            struct kernel_socket_name *unix_owner;
+        };
+    };
+};
+_Static_assert(sizeof(struct kernel_socket_address) == 24, "socket address view");
+
 struct kernel_socket_write_request {
     struct kernel_socket_write_request *next;
     const struct kernel_socket_write_segment *segments;
@@ -51,7 +72,7 @@ struct kernel_socket_write_request {
     uint32_t flags;
     int result;
     uint32_t reserved;
-    uint8_t progressed;
+    uint8_t progressed, unix_receive_reserved;
 #if BOAROS_USER_SMP
     uint8_t tcp_prepare_failed;
     uint16_t tcp_prepare_mss, tcp_prepare_size;
@@ -67,7 +88,7 @@ struct kernel_socket_write_request {
     struct kernel_open_file_description **pin_owner;
     struct kernel_socket_write_request *active_next, **active_previous;
     const struct kernel_socket_address *destination;
-    void *protocol_address;
+    struct kernel_socket_address inet_destination;
     uint64_t payload_size;
     uint8_t operation, queued;
     struct kernel_socket *unix_destination;
@@ -86,6 +107,18 @@ int kernel_socket_prepare_receive(struct kernel_socket *socket);
 int kernel_socket_is_unix(const struct kernel_socket *socket);
 int kernel_socket_is_netlink(const struct kernel_socket *socket);
 int kernel_socket_discard_receive(const struct kernel_socket *socket, uint32_t flags);
+/* Import storage may overlap the not-yet-constructed request. Starting that
+ * request consumes *pin_owner until write/abort. Failure leaves
+ * or restores the pin; an empty UNIX STREAM write starts no request.
+ * Admission owns a compact INET address or resolves the UNIX name to a peer,
+ * so neither domain borrows destination bytes after preparation. */
+int kernel_socket_packet_prepare(struct kernel_socket_write_request *,
+    struct kernel_open_file_description **pin_owner,uint64_t count,uint32_t flags,
+    const struct kernel_socket_address *destination,int kernel_source,
+    struct kernel_socket_message *message);
+int kernel_socket_packet_write(struct kernel_socket_write_request *,
+    struct kernel_mm *,struct kernel_uaccess_iov_cursor *,const void *kernel_buffer,
+    int *user_fault,struct kernel_socket_message *message);
 int kernel_socket_write_datagram(struct kernel_open_file_description **pin_owner,
     struct kernel_mm *mm, const struct kernel_uaccess_iovec *iov,
     size_t iov_count, uint64_t count, uint32_t flags,
@@ -132,20 +165,6 @@ void kernel_socket_protocol_snapshot(uint64_t values[KERNEL_SOCKET_PROTOCOL_VALU
 #define KERNEL_SOCKET_AF_INET6 10U
 #define KERNEL_SOCKET_AF_NETLINK 16U
 
-/* 地址字节为网络序，端口为宿主序；Linux 布局只在 syscall 边界出现。 */
-struct kernel_socket_address {
-    uint16_t family;
-    union { uint16_t port, unix_length; };
-    uint32_t scope;
-    union {
-        uint8_t bytes[16];
-        struct {
-            const unsigned char *unix_path;
-            struct kernel_socket_name *unix_owner;
-        };
-    };
-};
-_Static_assert(sizeof(struct kernel_socket_address) == 24, "socket address view");
 /* Imported names borrow syscall storage. Exported names own unix_owner until
  * address_release; queued UNIX messages retain their sending endpoint. */
 void kernel_socket_address_release(struct kernel_socket_address *address);

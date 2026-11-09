@@ -80,3 +80,6 @@ EXCLUDED(kernel_page_cache_cancel_readahead)
 EXCLUDED(kernel_page_cache_accept_mapping_write)
 EXCLUDED(kernel_page_cache_finish_mapping_write)
 EXCLUDED(kernel_page_cache_writeback)
+#ifndef MM_TEST_BPF
+EXCLUDED(kernel_bpf_mmap_page)
+#endif

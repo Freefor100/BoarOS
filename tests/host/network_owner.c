@@ -117,6 +117,8 @@ static size_t user_remaining = SIZE_MAX;
 static struct kernel_socket *close_during_copy;
 static struct kernel_socket *shutdown_during_copy;
 static struct kernel_socket *read_shutdown_during_copy;
+static struct kernel_socket *unix_credit_copy_probe;
+static unsigned unix_credit_copy_observed;
 static unsigned heap_live, dma_eligible, nic_full, copy_attempts, copied_packets, segment_attempts, captured_size;
 static void (*heap_release_once)(void *);
 static uint64_t clock_ns = 1000000000ULL;
@@ -464,6 +466,11 @@ enum kernel_scheduler_status kernel_wait_finish(struct kernel_wait_token *t)
 enum kernel_uaccess_status kernel_copy_from_user(struct kernel_mm *m,void *out,uint64_t in,size_t n,size_t *copied)
 {
     (void)m;CHECK(!caller_owns_protocol() && !kernel_cpu_current()->raw_locks);*copied=n<user_remaining?n:user_remaining;
+    if(unix_credit_copy_probe) {
+        CHECK(unix_credit_copy_probe->tx_reserved &&
+            !(kernel_socket_poll(unix_credit_copy_probe,NULL)&KERNEL_POLLOUT));
+        unix_credit_copy_observed++;
+    }
     memcpy(out,(void *)(uintptr_t)in,*copied);
     if(remote_testing && remote_mode==3) {
         CHECK(!pthread_mutex_lock(&remote_gate));copy_waiting=1;
@@ -593,6 +600,11 @@ static void tcp_ephemeral_ports(void)
         struct kernel_socket *occupied=NULL,*listener=NULL,*endpoint=NULL,*accepted=NULL;
         struct kernel_socket_address local={.family=KERNEL_SOCKET_AF_INET,.bytes={127,0,0,1}};
         struct kernel_socket_address remote=local;remote.port=23000;
+        /* tcp_init resets the PCB context, so seed it before publishing any
+         * occupied endpoint or listener that this iteration must retain. */
+        fixed_random=1;random_value=cases[i].seed;
+        struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+        tcp_init();kernel_socket_protocol_leave(&scope);
         if(cases[i].occupied) {
             CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_STREAM,&occupied));
             local.port=cases[i].occupied;CHECK(!kernel_socket_bind(occupied,&local));local.port=0;
@@ -601,11 +613,6 @@ static void tcp_ephemeral_ports(void)
             CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_STREAM,&listener));
             CHECK(!kernel_socket_bind(listener,&remote) && !kernel_socket_listen(listener,1));
         }
-        /* Seed the real allocator through LWIP_RAND, including its inclusive
-         * upper endpoint; no private port counter is inspected or replaced. */
-        fixed_random=1;random_value=cases[i].seed;
-        struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
-        tcp_init();kernel_socket_protocol_leave(&scope);
         CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_STREAM,&endpoint));
         if(connecting) {
             int result=kernel_socket_connect(endpoint,&remote,0);
@@ -1260,6 +1267,71 @@ static void raw_owner_control(void)
     puts("PASS unowned raw TIME_WAIT PCBs do not invoke a socket owner");
 }
 
+struct raw_tcp_observation {
+    struct tcp_pcb *accepted;
+    const char *payload;
+    unsigned bytes, closed;
+};
+static err_t raw_tcp_received(void *context,struct tcp_pcb *pcb,struct pbuf *p,err_t error)
+{
+    struct raw_tcp_observation *observation=context;
+    CHECK(error==ERR_OK);
+    if (!p) { observation->closed++; return ERR_OK; }
+    char bytes[3];
+    CHECK(p->tot_len==sizeof(bytes) && pbuf_copy_partial(p,bytes,sizeof(bytes),0)==sizeof(bytes));
+    CHECK(!memcmp(bytes,observation->payload,sizeof(bytes)));
+    observation->bytes+=sizeof(bytes);tcp_recved(pcb,p->tot_len);pbuf_free(p);
+    return ERR_OK;
+}
+static void raw_tcp_error(void *context,err_t error)
+{
+    struct raw_tcp_observation *observation=context;
+    CHECK(error==ERR_CLSD);observation->accepted=NULL;
+}
+static err_t raw_tcp_accepted(void *context,struct tcp_pcb *pcb,err_t error)
+{
+    struct raw_tcp_observation *observation=context;
+    CHECK(error==ERR_OK && !observation->accepted);
+    observation->accepted=pcb;
+    tcp_arg(pcb,context);tcp_recv(pcb,raw_tcp_received);tcp_err(pcb,raw_tcp_error);
+    return ERR_OK;
+}
+static void raw_tcp_ingress(void)
+{
+    kernel_socket_network_initialize();
+    struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    for (unsigned ipv6=0;ipv6<2;ipv6++) {
+        struct raw_tcp_observation observation={.payload="raw"};
+        ip_addr_t address;
+        if (ipv6) IP_ADDR6_HOST(&address,0,0,0,1);
+        else IP_ADDR4(&address,127,0,0,1);
+        struct tcp_pcb *listener=tcp_new_ip_type(ipv6?IPADDR_TYPE_V6:IPADDR_TYPE_V4);
+        struct tcp_pcb *client=tcp_new_ip_type(ipv6?IPADDR_TYPE_V6:IPADDR_TYPE_V4);
+        CHECK(listener && client && tcp_bind(listener,&address,0)==ERR_OK);
+        listener=tcp_listen(listener);CHECK(listener);
+        tcp_arg(listener,&observation);tcp_accept(listener,raw_tcp_accepted);
+        tcp_arg(client,&observation);tcp_recv(client,raw_tcp_received);tcp_err(client,raw_error);
+        CHECK(tcp_connect(client,&address,listener->local_port,NULL)==ERR_OK);
+        netif_poll_all();
+        CHECK(observation.accepted && client->state==ESTABLISHED);
+        CHECK(tcp_write(client,observation.payload,3,TCP_WRITE_FLAG_COPY)==ERR_OK && tcp_output(client)==ERR_OK);
+        netif_poll_all();CHECK(observation.bytes==3);
+        CHECK(tcp_shutdown(client,0,1)==ERR_OK);netif_poll_all();
+        CHECK(observation.closed==1);
+        CHECK(tcp_shutdown(observation.accepted,0,1)==ERR_OK);netif_poll_all();
+        CHECK(observation.closed==2 && !observation.accepted && client->state==TIME_WAIT);
+        /* A late segment traverses the TIME_WAIT ingress path with the raw
+         * callback argument still owned by this caller. RST leaves it alive. */
+        tcp_rst(client,client->rcv_nxt,client->snd_nxt,&client->remote_ip,&client->local_ip,
+                client->remote_port,client->local_port);
+        netif_poll_all();CHECK(client->state==TIME_WAIT && client->callback_arg==&observation);
+        tcp_abort(client);CHECK(tcp_close(listener)==ERR_OK);netif_poll_all();
+        CHECK(!tcp_active_pcbs && !tcp_tw_pcbs && !lwip_stats.mem.used && !heap_live);
+        printf("PASS IPv%u raw TCP callback context survives listen, handshake, data and TIME_WAIT ingress\n",ipv6?6:4);
+    }
+    kernel_socket_protocol_leave(&scope);
+}
+
 static struct {
     struct kernel_socket *sender;
     struct socket_packet *incoming;
@@ -1749,9 +1821,10 @@ static void minshall_send(void)
     for(unsigned wrap=0;wrap<2;wrap++) {
     struct kernel_socket *listener=NULL,*client=NULL,*server=NULL;
     connected_pair(&listener,&client,&server);
-    static unsigned char bytes[TCP_MSS];memset(bytes,'m',sizeof(bytes));
     struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
-    client->tcp->cwnd=TCP_SND_BUF;
+    unsigned mss=tcp_mss(client->tcp);
+    unsigned char bytes[mss];memset(bytes,'m',sizeof(bytes));
+    client->tcp->cwnd=tcp_sndbuf_limit(client->tcp);
     if(wrap) {
         uint32_t sequence=UINT32_MAX-255U;
         CHECK(!client->tcp->unacked && !client->tcp->unsent);
@@ -1763,16 +1836,16 @@ static void minshall_send(void)
     }
     uint32_t start=client->tcp->snd_nxt;
     CHECK(write_buffer(client,bytes,sizeof(bytes),0)==(int)sizeof(bytes));
-    CHECK(client->tcp->unacked && !client->tcp->unsent && client->tcp->snd_nxt==start+TCP_MSS);
+    CHECK(client->tcp->unacked && !client->tcp->unsent && client->tcp->snd_nxt==start+mss);
     CHECK(write_buffer(client,"x",1,0)==1);
-    CHECK(!client->tcp->unsent && client->tcp->snd_nxt==start+TCP_MSS+1);
+    CHECK(!client->tcp->unsent && client->tcp->snd_nxt==start+mss+1);
     CHECK(write_buffer(client,"y",1,0)==1);
-    CHECK(client->tcp->unsent && client->tcp->snd_nxt==start+TCP_MSS+1);
-    CHECK(write_buffer(client,bytes,TCP_MSS-1,0)==TCP_MSS-1);
-    CHECK(!client->tcp->unsent && client->tcp->snd_nxt==start+2*TCP_MSS+1);
+    CHECK(client->tcp->unsent && client->tcp->snd_nxt==start+mss+1);
+    CHECK(write_buffer(client,bytes,mss-1,0)==(int)mss-1);
+    CHECK(!client->tcp->unsent && client->tcp->snd_nxt==start+2*mss+1);
     CHECK(write_buffer(client,"z",1,0)==1 && client->tcp->unsent);
     netif_poll_all();
-    CHECK(!client->tcp->unsent && server->rx_bytes==2*TCP_MSS+2);
+    CHECK(!client->tcp->unsent && server->rx_bytes==2*mss+2);
     if(client->tcp)tcp_abort(client->tcp);
     if(server->tcp)tcp_abort(server->tcp);
     kernel_socket_protocol_leave(&scope);
@@ -2380,7 +2453,9 @@ static void unix_space_topology(void)
 static void unix_write_completion_notifications(void)
 {
     kernel_socket_network_initialize();
-    for(int type=SOCKET_STREAM;type<=SOCKET_DGRAM;type++) {
+    const int types[]={SOCKET_STREAM,SOCKET_DGRAM,SOCKET_SEQPACKET};
+    for(unsigned t=0;t<sizeof(types)/sizeof(types[0]);t++) {
+        int type=types[t];
         struct kernel_socket *sender=NULL,*receiver=NULL;
         CHECK(!kernel_socket_pair(&test_heap,type,&sender,&receiver));
         unsigned notifications=0;
@@ -2392,18 +2467,25 @@ static void unix_write_completion_notifications(void)
         struct kernel_socket_address source=read_named_packet(receiver,"credit");
         kernel_socket_address_release(&source);
         CHECK(notifications && !sender->unix_memory && !sender->unix_packets);
-        unsigned before=notifications;
-        user_remaining=0;
-        const struct kernel_uaccess_iovec iov={(uintptr_t)"fault",5};
-        struct kernel_uaccess_iov_cursor cursor={&iov,1,0,0};
-        struct kernel_open_file_description *pin=(void *)sender;
-        int fault=0;
-        int result=type==SOCKET_DGRAM
-            ?kernel_socket_write_datagram(&pin,NULL,&iov,1,5,0,NULL, NULL)
-            :kernel_socket_write_unix(&pin,NULL,&cursor,5,0,&fault, NULL);
-        CHECK(result==-KERNEL_EFAULT && pin==(void *)sender);
-        user_remaining=SIZE_MAX;
-        CHECK(notifications>before && !sender->tx_reserved && !receiver->rx_bytes);
+        CHECK(!kernel_socket_set_option(sender,KERNEL_SOCKET_SNDBUF,4096));
+        char bytes[3000]={0};const unsigned sizes[]={sizeof(bytes),5};
+        for(unsigned i=0;i<sizeof(sizes)/sizeof(sizes[0]);i++) {
+            CHECK(kernel_socket_poll(sender,NULL)&KERNEL_POLLOUT);
+            unsigned before=notifications;
+            const struct kernel_uaccess_iovec iov={(uintptr_t)bytes,sizes[i]};
+            struct kernel_uaccess_iov_cursor cursor={&iov,1,0,0};
+            struct kernel_open_file_description *pin=(void *)sender;
+            unix_credit_copy_probe=i?NULL:sender;unix_credit_copy_observed=0;user_remaining=0;
+            int fault=0;
+            int result=type==SOCKET_DGRAM
+                ?kernel_socket_write_datagram(&pin,NULL,&iov,1,sizes[i],0,NULL,NULL)
+                :kernel_socket_write_unix(&pin,NULL,&cursor,sizes[i],0,&fault,NULL);
+            unix_credit_copy_probe=NULL;user_remaining=SIZE_MAX;
+            CHECK(result==-KERNEL_EFAULT && pin==(void *)sender);
+            CHECK(i || unix_credit_copy_observed);
+            CHECK(notifications>before && (kernel_socket_poll(sender,NULL)&KERNEL_POLLOUT));
+            CHECK(!sender->tx_reserved && !sender->unix_memory && !receiver->rx_bytes && !receiver->unix_reserved);
+        }
         CHECK(kernel_wait_node_remove_sync(&observer)==KERNEL_SCHEDULER_STATUS_OK);
         kernel_socket_destroy(sender);kernel_socket_destroy(receiver);CHECK(!heap_live);
     }
@@ -2966,6 +3048,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "receive-payload")) receive_payload();
     else if (!strcmp(argv[1], "udp-payload")) udp_final_payload();
     else if (!strcmp(argv[1], "loopback-work")) loopback_work();
+    else if (!strcmp(argv[1], "raw-tcp-ingress")) raw_tcp_ingress();
     else if (!strcmp(argv[1], "unix-sender")) unix_sender_owner();
     else if (!strcmp(argv[1], "tcp-batch")) copy_capacity(0,1);
     else if (!strcmp(argv[1], "tcp-quota-notify")) tcp_quota_notifications();

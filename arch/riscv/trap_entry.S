@@ -199,5 +199,7 @@ riscv_trap_return:
 riscv_user_thread_trampoline:
     /* 首次运行才有未完成的切换；普通异常返回不重复查询handoff。 */
     call kernel_scheduler_switch_finish
+    mv a0, sp
+    call riscv_bpf_first_return
     j riscv_trap_return
     .size riscv_user_thread_trampoline, . - riscv_user_thread_trampoline

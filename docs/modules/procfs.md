@@ -61,3 +61,7 @@ managed 峰值由分配器在 bootstrap、finalize 与 buddy 成功分配时维�
 进程 fdinfo 目录按同一 FD 表枚举并输出 position、flags、mount ID 和 inode。目录及条目同时检查 FSCREDS 进程访问权限和文件 DAC；读取期间持有目标实际 OFD，再复核目标身份与执行安全状态。pidfd 增加 Pid/NSpid，单命名空间中两者相同，目标 TID 已撤下后均为 -1；固定 Linux 的 NSpid 输出还取决于 CONFIG_PID_NS。pidfd 的 FD 链接展示 anon_inode:[pidfd]，getfd 传递实际 OFD，proc 路径重新打开仍返回 ENXIO。文本沿共同生成文件规则，rewind 后重新取值。
 
 `/proc/<pid>/ns/mnt` 与线程目录的 `ns/mnt` 使用现有进程对象权限检查，`readlink` 显示稳定的 `mnt:[id]`，普通打开取得真实挂载命名空间 FD。FD 的 inode 号对应命名空间 ID，`fstatfs` 报告 NSFS，`NS_GET_NSTYPE` 返回 `CLONE_NEWNS`。目标退出不撤销已打开句柄；`setns` 的资格、路径更新和引用规则见 [VFS 挂载说明](vfs-ext4.md)。本实现不提供 `mountinfo` 和其他命名空间对象。
+
+## BPF 状态
+
+`/proc/filesystems` 包含实际可挂载的 bpf、tracefs 和 sysfs。BPF/perf FD 的链接名与 fdinfo 来自对象快照，程序、map、BTF 和 link ID 对应仍存活的对象；共享 map 的 maps 行使用其 OFD 来源。`/proc/sys/kernel/unprivileged_bpf_disabled` 提供实际权限策略，取值与写入规则见 [BPF 模块](kernel-bpf.md#对象接口与权限)。

@@ -59,6 +59,7 @@ RISC-V 和 LoongArch 各自处理启动、异常入口、上下文切换和页�
 ### 5. 网络与事件等待
 - **网络协议**：使用 lwIP 处理 IPv4 TCP/UDP，并支持 IPv6 回环。用户数据复制和等待可在调用核执行。已建立的 TCP 连接由各归属核处理，UDP、监听和建连控制仍在 CPU0。IPv4 地址、掩码、MTU 和默认网关可在运行时配置。
 - **Linux 兼容 Socket API**：提供常用 Linux 套接字接口。UNIX 套接字还支持文件描述符传递与消息凭据。
+- **[BPF 过滤与跟踪](docs/modules/kernel-bpf.md)**：双架构共用校验器与解释器，提供 socket 过滤、map/bpffs/BTF、raw_syscalls tracepoint 和 ringbuf，供原版 bpftool、libbpf 与 bpftrace 使用。
 - **事件驱动多路复用**：通过 `epoll`、`poll` 和 `pselect` 等接口等待套接字、管道及事件 FD 的就绪状态。
 
 ---

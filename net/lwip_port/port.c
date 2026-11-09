@@ -154,3 +154,16 @@ void boaros_lwip_tcp_pcb_forget(struct tcp_pcb *pcb)
 int boaros_lwip_tcp_conflict(const struct tcp_pcb *pcb, const struct ip_addr *local, uint16_t local_port,
     const struct ip_addr *remote, uint16_t remote_port)
 { return protocol_hooks.tcp_conflict ? protocol_hooks.tcp_conflict(pcb,local,local_port,remote,remote_port) : 0; }
+
+int boaros_lwip_udp_ingress_filter(struct udp_pcb *pcb,struct pbuf *p,struct netif *input,
+    int ipv6,const void *network,uint16_t network_length,uint16_t header)
+{
+    return !protocol_hooks.udp_ingress_filter ||
+        protocol_hooks.udp_ingress_filter(pcb,p,input,ipv6,network,network_length,header);
+}
+int boaros_lwip_tcp_ingress_filter(struct tcp_pcb *pcb,struct pbuf *p,struct netif *input,
+    int ipv6,const void *network,uint16_t network_length,uint16_t header)
+{
+    return !protocol_hooks.tcp_ingress_filter ||
+        protocol_hooks.tcp_ingress_filter(pcb,p,input,ipv6,network,network_length,header);
+}

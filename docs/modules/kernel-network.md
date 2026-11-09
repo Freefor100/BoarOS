@@ -125,14 +125,14 @@ POLLOUT使用当前发送者内存的四分之一门限，实际write仍独立�
 避免包头使整块申请跨过buddy边界。部分读取不提前返还该packet的内存。DGRAM消息上限为sndbuf-32，一次write/writev形成
 一条消息；零消息仍占有真实metadata，队列有限。
 
-连接UNIX发送在同一次端点保护内检查状态、登记请求、借用对端并预留额度；
-需要等待时沿原等待协议释放实际外层保护并重试。复制完成后同次发布消息并撤销
+未显式指定目标的UNIX发送在同一次端点保护内检查状态、登记请求、借用对端并预留额度；
+需要等待时沿原等待协议释放实际外层保护并重试。记录型sendmsg/sendmmsg先完成header、名称、iov和控制区导入及端点接纳，再进入载荷复制。UNIX请求持有已经解析的对端引用，显式INET目标保存在请求的已校验紧凑地址快照中；导入元数据与正式写请求复用互不重叠生命周期的栈存储；名称视图在接纳后结束，准备阶段持有锁游标的函数帧在复制前返回。载荷复制借用外层iov快照与已登记请求，其冷缺页可沿文件I/O和调度等待继续执行。复制完成后同次发布消息并撤销
 请求登记，载荷复制在锁外进行。DGRAM在分配和usercopy前完成内存预留，复制完成后才移动整包owner；
-fault/OOM/取消先释放取得的内存，再归还预留与OFD pin，不发布前缀。截断读取或
+fault/OOM/取消先释放取得的内存，再归还预留与OFD pin，不发布前缀。UNIX发送者的预留按自身内存计费归还并通知等待者，不使用TCP的发送预算判断；正常发布只是把预留转为队列计费，请求摘除不额外通知。截断读取或
 接收fault丢弃整条datagram并归还其全部计费；DGRAM出队时在同一保护内归还
 sender额度，实际名称、端点和packet存储在锁外释放，释放后仍推进
 共享heap的INET接收容量等待。sender关闭后仍可读其queued内容。
-等待者被发送缓存增大、packet最后释放或peer状态变化唤醒，重新核对状态。
+等待者被发送缓存增大、packet最后释放、发送预留取消或peer状态变化唤醒，重新核对状态。
 STREAM的新write在peer关闭后返回EPIPE/SIGPIPE；已有写等待在peer带未读内容
 关闭时可交付一次ECONNRESET。DGRAM关闭peer后的首次send为ECONNREFUSED，
 后续未连接send为ENOTCONN，DGRAM的EPIPE不发送SIGPIPE。关闭状态、异步错误
@@ -143,7 +143,7 @@ STREAM的新write在peer关闭后返回EPIPE/SIGPIPE；已有写等待在peer带
 
 SEQPACKET按连接管理与整条记录收发：监听、connect和accept与STREAM共用，实际SO_TYPE及子端点保持类型5；一次发送发布一条完整记录，短接收截断并消费该记录，MSG_TRUNC可返回原长度。MSG_EOR和MSG_MORE发送标志接受后忽略，MSG_WAITALL接收仍停在一条记录，返回标志不添加MSG_EOR。SEQPACKET未连接或监听时接收返回ENOTCONN，EPIPE不发送SIGPIPE。
 
-空记录与EOF独立：空记录可交付SCM_RIGHTS和凭据；SEQPACKET无记录EOF返回零且控制区长度为零。STREAM保留自身空cookie规则。头、iovec及控制区字节先导入，随后按协议检查待决错误和连接，再解析SCM；不支持的SEQ标志在协议规定位置拒绝，输入故障与错误消费顺序和固定Linux一致。
+空记录与EOF独立：空记录可交付SCM_RIGHTS和凭据；SEQPACKET先交付排队记录；没有记录和待决错误时，本端SHUT_RD、对端SHUT_WR或对端最后关闭均返回EOF，O_NONBLOCK/MSG_DONTWAIT也返回零，控制区长度为零。DGRAM本端SHUT_RD后无记录的非阻塞接收仍返回EAGAIN。STREAM保留自身空cookie规则。头、iovec及控制区字节先导入，随后按协议检查待决错误和连接，再解析SCM；不支持的SEQ标志在协议规定位置拒绝，输入故障与错误消费顺序和固定Linux一致。
 
 UNIX报文持有发送端存储；接收时从该端点取得当前名称引用，所以发送后bind和发送端关闭后仍可返回正确来源。逻辑关闭摘除名称索引，名称对象随真实存储使用者释放；用户地址输出在端点锁外完成。带地址输出的UNIX STREAM和记录型接收共用此路径。STREAM/SEQ未接纳子连接由listener保活，listener关闭时即使子队列为空，也向client发布一次ECONNRESET；已接纳子端点归其真实OFD所有。
 
@@ -415,3 +415,11 @@ LA的budget/sendfile/unix_sender均在Linux/BoarOS两种RAM检查实际退出和
 覆盖真实等待/取消。完整双架构/程序回归继续按整个LA能力计划收口。
 
 `tests/workloads/network/unix_seqpacket.c`复用共同控制消息检查，另覆盖命名连接、记录边界、空记录/EOF、实际用户入口的来源名称、错误顺序、shutdown及等待。宿主network_owner中的SEQ记录、预约、SCM、pending child和shutdown专项检查真实引用与额度归还。
+
+## BPF 接收过滤
+
+socket 持有已校验程序的引用，替换或 detach 在端点锁下交换，执行方取得自己的引用后锁外运行。UDP 和 TCP 的协议入口先过滤再改变接收与连接状态；直接从 pbuf 链读取，返回 0 丢弃，正返回截断但保留协议处理所需的头部。TCP accept 继承过滤器与锁定状态；UNIX DGRAM/SEQPACKET 在队列接纳前过滤，STREAM 的接收保持 Linux 行为。过滤后丢弃仍按发送成功处理，SCM_RIGHTS 和载荷沿请求原有归还路径释放。
+
+lwIP 入口传递实际 UDP/TCP PCB，按已登记的 socket 回调识别关联；raw API 调用者的任意 callback_arg 不解释为 socket。TCP SYN_RCVD 在 accept 前借用仍活跃监听 PCB 的关联，已建立连接使用自己的关联；本地快速输出使用同一判断。设备停机及 socket 销毁先解除回调，已执行过滤所借用的程序和包/DMA 引用各自持有到停止使用。
+
+接口、权限、共同执行器和工具入口见 [BPF 模块](kernel-bpf.md)。

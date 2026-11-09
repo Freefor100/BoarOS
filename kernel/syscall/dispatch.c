@@ -4,6 +4,7 @@
 #include <kernel/errno.h>
 #include <kernel/pidfd.h>
 #include <kernel/kcmp.h>
+#include <kernel/bpf.h>
 #include <kernel/ioprio.h>
 #include <kernel/futex.h>
 #include <kernel/task.h>
@@ -262,7 +263,14 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
     struct kernel_syscall_result *result)
 {
     struct kernel_syscall_result decoded;
-    if (request->number == 32U) {
+    if (request->number == 280U) {
+        decoded.action=KERNEL_SYSCALL_ACTION_RETURN;
+        decoded.value=kernel_bpf_syscall(caller,(uint32_t)request->arguments[0],request->arguments[1],(uint32_t)request->arguments[2]);
+    } else if (request->number == 241U) {
+        decoded.action=KERNEL_SYSCALL_ACTION_RETURN;
+        decoded.value=kernel_bpf_perf_open(caller,request->arguments[0],(int32_t)request->arguments[1],
+            (int32_t)request->arguments[2],(int32_t)request->arguments[3],request->arguments[4]);
+    } else if (request->number == 32U) {
         if(syscall_handle_flock(caller,request,&decoded))return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == 436U) {
         if(syscall_handle_close_range(caller,request,&decoded))return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;

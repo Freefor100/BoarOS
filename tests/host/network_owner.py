@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[2]
 parser = argparse.ArgumentParser(description=__doc__)
 cases = ('ipv4-address-shutdown', 'ipv4-route', 'unix-shutdown-state', 'unix-seq-records', 'unix-seq-control', 'unix-seq-reservation', 'unix-seq-pending-control', 'unix-late-source', 'unix-pending-reset', 'unix-control-cleanup', 'unix-control-owner', 'unix-packet-boundary', 'unix-write-notify', 'unix-stream-state', 'unix-space-topology', 'unix-dgram-shutdown', 'unix-dgram-reconnect', 'unix-listener-lookup-close', 'unix-names', 'unix-peer-queued', 'unix-peer-accepted', 'unix-autobind-collision', 'notify-stop', 'stop-wait', 'remote-udp-stop', 'remote-copy-stop', 'remote-udp', 'remote-udp-fault', 'remote-protocol', 'remote-batch', 'remote-batch-ack', 'remote-turn', 'concurrent-reservation', 'endpoint-owner', 'protocol-owner', 'protocol-transaction', 'receive-prefix', 'receive-chains', 'nodelay', 'minshall', 'nodelay-capacity', 'tcp-batch', 'pool-release-owner', 'tcp-batch-last', 'tcp-batch-abort', 'tcp-batch-error', 'unix-payload', 'receive-payload', 'udp-payload', 'copy-indirect', 'copy-ineligible', 'timewait-capacity', 'timewait-timer', 'controls','unix-sender','loopback-work')
 cases += ('tcp-quota-notify', 'remote-quota-notify', 'remote-batch-writers', 'remote-direct')
-cases += ('tcp-loopback-checksum', 'tcp-detached', 'tcp-input-output', 'tcp-reset-receive-retry')
+cases += ('tcp-loopback-checksum', 'tcp-detached', 'tcp-input-output', 'tcp-reset-receive-retry', 'raw-tcp-ingress')
 parser.add_argument('--case', choices=(*cases, 'all'), action='append', help='repeat to share one host build; default: all')
 parser.add_argument('--sanitize', action='store_true')
 parser.add_argument('--page-shift', type=int, choices=(12, 14), default=12)
@@ -27,7 +27,7 @@ with tempfile.TemporaryDirectory(prefix='boaros-network-owner-') as directory:
                '-ffunction-sections', '-fdata-sections', '-Wl,--gc-sections',
                '-DBOAROS_MAX_CPUS=2', f'-DBOAROS_PAGE_SHIFT={args.page_shift}', '-DBOAROS_COST_DIAGNOSTICS=1', '-Itests/host/random', '-idirafter', 'include',
                '-idirafter', 'net/lwip_port/include', '-Ithird_party/lwip/src/include', '-I' + str(work),
-               'tests/host/network_owner.c','kernel/raw_lock.c','tests/host/cpu_context.c','-Wl,--wrap=kernel_raw_lock_acquire', *sources, '-o', str(program)]
+               'tests/host/network_owner.c','tests/host/bpf_unavailable.c','kernel/raw_lock.c','tests/host/cpu_context.c','-Wl,--wrap=kernel_raw_lock_acquire,--wrap=kernel_bpf_program_get,--wrap=kernel_bpf_program_put,--wrap=kernel_bpf_filter', *sources, '-o', str(program)]
     if args.sanitize: command += ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']
     subprocess.run(command, cwd=ROOT, check=True, timeout=60)
     for case in cases if not args.case or 'all' in args.case else args.case:

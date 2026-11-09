@@ -10,6 +10,7 @@
 - `kernel_open_file_description` 拥有一个 VFS file、当前 offset 和清理状态。分别打开同一路径会得到独立 description，因此 offset 互不影响。
 - pipe description 不拥有 VFS file，而是各自持有同一个 `struct kernel_pipe` 的读/写 endpoint；pipe 对象拥有16个片段槽、按需分配的单页后备、端点引用和等待队列。metadata raw 保护 ring、端点、代次与 readiness；用户复制、缺页和通知在 raw 外执行。关闭者保留本次已有 owner 至通知结束，再竞争最后销毁资格。核心分别返回接纳前缀和断端事实，SIGPIPE/重启由真实用户调用层处理。受控任务创建仍检查当前支持的消费者；这项检查不切换 pipe 同步方式；复制资格与页归还规则见下文 [pipe2](#pipe2-与-fifo-endpoint)。
 - socket description 同样不拥有 VFS file，而是独占 `struct kernel_socket`；fd 关闭、dup 覆盖、exec CLOEXEC 或退出导致最后一个真实 OFD 引用消失时，销毁 socket 并解绑 lwIP 回调。请求期间的 OFD pin 使 fd 复用不改变当前请求的 endpoint。普通 read/write 与向量路径使用 socket 数据队列，定位 I/O 返回 `ESPIPE`；`fstat` 报 `S_IFSOCK`。协议与等待契约见[网络模块](kernel-network.md)。
+- BPF description 持有程序、map、BTF、link 或 perf 事件对象；map 的共享映射独立持有 OFD，关闭 FD 不提前归还映射页。perf read/ioctl 及 ringbuf poll/epoll 接到实际对象，其余程序类对象不伪造文件读写能力；对象与 pin 生命周期见 [BPF](kernel-bpf.md)。
 - `kernel_fs_context` 在共同 VFS 状态短保护下读取和交换 umask，并为使用者生成带独立引用的 root/cwd 快照；cwd 替换、记录共享、移动和退出使用同一保护。它持有 root 和 cwd 的独立路径引用；普通 fork 复制两份引用，`CLONE_FS` 共享 context record，exec 保留。`chdir/fchdir/chroot/getcwd` 操作共享活目录项；exec 从当前目录对象解析相对路径。
 
 `kernel_files_pin()` 为 fd 指向的 open file description 增加一个独立引用。file-private mmap

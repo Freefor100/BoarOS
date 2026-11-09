@@ -43,6 +43,11 @@ UNUSED_SOCKET_API(void, udp_remove, struct udp_pcb *)
 UNUSED_SOCKET_API(err_t, udp_send, struct udp_pcb *, struct pbuf *)
 UNUSED_SOCKET_API(err_t, udp_sendto, struct udp_pcb *, struct pbuf *, const ip_addr_t *, u16_t)
 UNUSED_SOCKET_API(struct pbuf *, pbuf_alloc, pbuf_layer, u16_t, pbuf_type)
+UNUSED_SOCKET_API(void, pbuf_realloc, struct pbuf *, u16_t)
+UNUSED_SOCKET_API(u16_t, pbuf_copy_partial, const struct pbuf *, void *, u16_t, u16_t)
+UNUSED_SOCKET_API(void, kernel_bpf_program_get, struct kernel_bpf_program *)
+UNUSED_SOCKET_API(void, kernel_bpf_program_put, struct kernel_bpf_program *)
+UNUSED_SOCKET_API(uint32_t, kernel_bpf_filter, struct kernel_bpf_program *, const struct kernel_bpf_packet *)
 UNUSED_SOCKET_API(u32_t, sys_now, void)
 UNUSED_SOCKET_API(u32_t, sys_timeouts_sleeptime, void)
 UNUSED_SOCKET_API(unsigned, sys_check_timeouts_budget, unsigned)
@@ -452,7 +457,9 @@ void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *,struct kernel_raw_g
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_raw_guard *guard)
 {
 #ifdef SOCKET_PROTOCOL_CASES
-    assert(!shard_forbid_route || (lock!=&tcp_route_lock && lock!=&socket_state_lock));
+    /* The paired PCB avoids the route index. Filter attachment still needs
+     * its endpoint snapshot, independently of that stable peer identity. */
+    assert(!shard_forbid_route || lock!=&tcp_route_lock);
 #endif
     assert(!local_run_required || lock!=&kernel_wait_domain);
     if (local_park_token && active==&cpus[1]) {

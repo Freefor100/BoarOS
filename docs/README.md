@@ -38,6 +38,7 @@
 - **[LoongArch 浮点与 SIMD](modules/loongarch-fpu.md)**：LA464 浮点及 LSX/LASX 向量指令集支持与动态切换。
 - **[Linux 系统调用分发](modules/kernel-syscall.md)**：系统调用编号转换、参数校验、分发器实现与返回值规范。
 - **[用户内存安全访问 (uaccess)](modules/kernel-uaccess.md)**：内核访问用户空间指针的安全边界、缺页保护与地址检查。
+- **[BPF 网络过滤与系统调用跟踪](modules/kernel-bpf.md)**：共同校验器与解释器、map/bpffs、socket 过滤、tracepoint/perf 和原版工具。
 - **[内核日志系统](modules/kernel-log.md)**：printk 实现、环形日志缓冲区与 `dmesg` 接口支持。
 
 ### 3. 内存管理体系

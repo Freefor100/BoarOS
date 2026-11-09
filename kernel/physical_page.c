@@ -1260,6 +1260,48 @@ static void reclaim_hooks_release(struct physical_page_reclaim_hooks *hooks)
     if (hooks->release) hooks->release(hooks->context);
 }
 
+/* Split only this private allocated subtree. The free lists and available
+ * count do not change: ownership changes from one extent to its base pages. */
+static void split_allocated_pages(struct physical_page_allocator *a,
+    const struct physical_page_root *root, uint64_t node, uint32_t page,
+    unsigned order, struct page_work *work)
+{
+    if (!order) {
+        tree_set(a, root, node, BUDDY_ALLOCATED, work);
+        mark_head(a, page, 0, PHYSICAL_PAGE_STATE_ALLOCATED_HEAD, work);
+        return;
+    }
+    if (tree_get(a, root, 2*node+1, work) != BUDDY_INACTIVE ||
+        tree_get(a, root, 2*node+2, work) != BUDDY_INACTIVE)
+        __builtin_trap();
+    tree_set(a, root, node, BUDDY_SPLIT, work);
+    split_allocated_pages(a, root, 2*node+1, page, order-1, work);
+    split_allocated_pages(a, root, 2*node+2,
+        page+(uint32_t)order_page_count(order-1), order-1, work);
+}
+
+enum physical_page_status physical_page_allocate_contiguous(
+    struct physical_page_allocator *a, uint32_t order, uint64_t *address)
+{
+    if (!address) return PHYSICAL_PAGE_STATUS_INVALID;
+    uint64_t base;
+    enum physical_page_status status=physical_page_allocate_order(a, order, &base);
+    if (status) return status;
+    if (order) {
+        PAGE_METADATA_SCOPE(work, a);
+        uint32_t page;
+        struct buddy_owner owner;
+        if (!page_lookup_work(a,base,0,&page,&work) ||
+            !owner_find(a,page,&owner,&work) || owner.first!=page ||
+            owner.order!=order || owner.state!=BUDDY_ALLOCATED ||
+            a->metadata[page].reference_count!=1)
+            __builtin_trap();
+        split_allocated_pages(a,owner.root,owner.node,page,order,&work);
+    }
+    *address=base;
+    return PHYSICAL_PAGE_STATUS_OK;
+}
+
 enum physical_page_status physical_page_allocate_order(
     struct physical_page_allocator *allocator,
     uint32_t order,

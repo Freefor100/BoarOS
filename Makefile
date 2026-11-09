@@ -11,6 +11,7 @@ CC := $(CROSS_COMPILE)gcc
 NM := $(CROSS_COMPILE)nm
 OBJDUMP := $(CROSS_COMPILE)objdump
 READELF := $(CROSS_COMPILE)readelf
+PAHOLE ?= pahole
 QEMU_RISCV64 ?= qemu-system-riscv64
 QEMU_MEMORY ?= 1G
 # CI显式选择共同RAM矩阵；空值保留各聚焦入口原来的默认配置。
@@ -242,7 +243,9 @@ CPPFLAGS += -DBOAROS_MAX_CPUS=$(CPU_CAPACITY)
 CPPFLAGS += -DBOAROS_USER_SMP=$(USER_SMP)
 CPPFLAGS += -DBOAROS_USER_SMP_COMPOSITION=$(USER_SMP_COMPOSITION)
 CPPFLAGS += -DBOAROS_SMP_TEST=$(SMP_TEST) -DBOAROS_MM_DISK_TEST=$(MM_DISK_SMP_TEST)
-CFLAGS := $(ARCH_FLAGS) -std=gnu11 -O2 -g3 \
+# BTF has no atomic qualifier; strict DWARF4 retains the actual member layouts
+# without DW_TAG_atomic_type, which pahole cannot encode.
+CFLAGS := $(ARCH_FLAGS) -std=gnu11 -O2 -g3 -gdwarf-4 -gstrict-dwarf \
 	-ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie \
 	-ffunction-sections -fdata-sections -Wall -Wextra -Werror
 CFLAGS += -fstack-usage $(CFLAGS_EXTRA)
@@ -308,6 +311,10 @@ LWIP_SOURCES := \
 CPU_C_SOURCES := kernel/cpu.c kernel/raw_lock.c
 COMMON_C_SOURCES := \
 	$(CPU_C_SOURCES) \
+	kernel/bpf/vm.c kernel/bpf/verify.c kernel/bpf/classic.c \
+	kernel/bpf/maps.c kernel/bpf/ringbuf.c kernel/bpf/objects.c \
+	kernel/bpf/syscall.c kernel/bpf/program.c kernel/bpf/runtime.c \
+	kernel/bpf/btf.c kernel/bpf/trace.c kernel/bpf/info.c \
 	kernel/elf_image.c \
 	kernel/exec_image.c \
 	mm/mm.c \
@@ -351,6 +358,7 @@ COMMON_C_SOURCES := \
 	fs/vfs.c \
 	fs/file_mapping.c \
 	fs/procfs.c \
+	fs/bpffs.c fs/tracefs.c fs/sysfs.c \
 	fs/tmpfs.c \
 	fs/disk_mount.c \
 	fs/fat32.c \
@@ -901,9 +909,30 @@ test-lwext4-recovery-host:
 	sh tests/host/lwext4-recovery.sh
 	sh tests/host/lwext4-reclaim.sh
 
-$(KERNEL_RV): $(OBJECTS) arch/riscv/linker.ld $(BUILD_DIR)/generated/link-config
+RV_BTF_BASE := $(BUILD_DIR)/btf/kernel-base.elf
+RV_BTF_DATA := $(BUILD_DIR)/btf/vmlinux.btf
+RV_BTF_SOURCE := $(BUILD_DIR)/btf/vmlinux.S
+RV_BTF_OBJECT := $(BUILD_DIR)/btf/vmlinux.o
+
+# BTF describes the real production kernel's DWARF. Test kernels keep their
+# existing single link and the weak BTF symbols remain undefined in the base ELF.
+$(RV_BTF_BASE): $(OBJECTS) arch/riscv/linker.ld $(BUILD_DIR)/generated/link-config
+	@mkdir -p $(dir $@)
+	$(CC) $(LDFLAGS) -o $@ $(OBJECTS)
+$(RV_BTF_DATA): $(RV_BTF_BASE)
+	# pahole can report an encoding error with status 0 and no output file.
+	@rm -f $@.tmp
+	$(PAHOLE) --btf_encode_detached=$@.tmp $<
+	@test -s $@.tmp
+	mv $@.tmp $@
+$(RV_BTF_SOURCE): $(RV_BTF_DATA) tools/embed-btf.py
+	python3 -B tools/embed-btf.py $< $@
+$(RV_BTF_OBJECT): $(RV_BTF_SOURCE) $(RV_BTF_DATA) $(BUILD_DIR)/generated/cost-config.h
+	$(CC) $(ASFLAGS) -c $< -o $@
+
+$(KERNEL_RV): $(OBJECTS) $(RV_BTF_OBJECT) arch/riscv/linker.ld $(BUILD_DIR)/generated/link-config
 	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/kernel-rv.map \
-		-o $@ $(OBJECTS)
+		-Wl,--undefined=__boaros_btf_start -o $@ $(OBJECTS) $(RV_BTF_OBJECT)
 
 $(TRAP_TEST_KERNEL_RV): $(TRAP_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/tests/kernel-trap-rv.map \
@@ -2503,7 +2532,7 @@ run-user-smp-riscv: kernel-rv-user-smp
 .PHONY: test-socket-protocol-host
 test-socket-protocol-host:
 	@mkdir -p $(or $(SOCKET_PROTOCOL_HOST_BUILD),build/host/socket-protocol)
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -include sys/types.h -include limits.h -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -DSOCKET_PROTOCOL_CASES -Itests/host/sync -idirafter include -idirafter net/lwip_port/include -idirafter third_party/lwip/src/include tests/host/user_smp.c tests/host/user_stop.c kernel/signal_pending.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/sched/lifetime.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release,--wrap=kernel_scheduler_wake_signal,--wrap=kernel_wait_backend_quiesce,--wrap=kernel_rwlock_write,--wrap=kernel_rwlock_try_write -o $(or $(SOCKET_PROTOCOL_HOST_BUILD),build/host/socket-protocol)/scope
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -include sys/types.h -include limits.h -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -DSOCKET_PROTOCOL_CASES -Itests/host/sync -idirafter include -idirafter net/lwip_port/include -idirafter third_party/lwip/src/include tests/host/user_smp.c tests/host/user_stop.c kernel/signal_pending.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/sched/lifetime.c kernel/sched/policy.c kernel/sched/runqueue.c third_party/lwip/src/core/ip.c third_party/lwip/src/core/stats.c -Wl,--gc-sections,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release,--wrap=kernel_scheduler_wake_signal,--wrap=kernel_wait_backend_quiesce,--wrap=kernel_rwlock_write,--wrap=kernel_rwlock_try_write -o $(or $(SOCKET_PROTOCOL_HOST_BUILD),build/host/socket-protocol)/scope
 	$(or $(SOCKET_PROTOCOL_HOST_BUILD),build/host/socket-protocol)/scope
 
 test-user-smp-host:
@@ -2750,3 +2779,15 @@ test-pi-priority-host:
 .PHONY: test-pi-exit-host
 test-pi-exit-host:
 	sh tests/host/pi-exit.sh
+
+.PHONY: test-bpf-host
+test-bpf-host:
+	sh tests/host/bpf-vm.sh
+	sh tests/host/bpf-maps.sh
+	sh tests/host/bpf-btf.sh
+	sh tests/host/bpf-filesystems.sh
+	sh tests/host/bpf-metadata-io.sh
+	sh tests/host/bpf-test-run.sh
+	sh tests/host/bpf-trace.sh
+	sh tests/host/bpf-mmap.sh
+	python3 -B tests/host/bpf-socket-ingress.py

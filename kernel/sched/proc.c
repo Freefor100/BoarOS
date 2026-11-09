@@ -9,6 +9,7 @@
 #include <kernel/open_file.h>
 #include <kernel/proc_task.h>
 #include <kernel/pidfd.h>
+#include <kernel/bpf.h>
 #include <kernel/mqueue.h>
 #include "../../fs/open_file_internal.h"
 #include <kernel/fs_context.h>
@@ -561,6 +562,12 @@ int kernel_proc_fd_pseudo_snapshot(kernel_pid_t pid, uint64_t identity,
         snapshot->object_identity = kernel_open_file_pseudo_identity(file);
         result = snapshot->kind==KERNEL_OPEN_FILE_KIND_MQUEUE
             ?kernel_mqueue_name(file,snapshot->name,sizeof(snapshot->name)):0;
+        if(snapshot->kind==KERNEL_OPEN_FILE_KIND_BPF){
+            const char *name=kernel_bpf_fd_name(file);
+            if(!name)__builtin_trap();
+            size_t n=strlen(name)+1;if(n>sizeof(snapshot->name))__builtin_trap();
+            memcpy(snapshot->name,name,n);
+        }
     }
     return result;
 }
@@ -603,6 +610,8 @@ int kernel_proc_fdinfo_snapshot(kernel_pid_t pid,uint64_t identity,int fd,
         .mount_id=file->file.mount?file->file.mount->id:0,.inode=stat.ino,
         .pidfd=file->kind==KERNEL_OPEN_FILE_KIND_PIDFD,
         .pid=file->kind==KERNEL_OPEN_FILE_KIND_PIDFD?kernel_pidfd_number(file):0};
+    if(file->kind==KERNEL_OPEN_FILE_KIND_BPF)
+        return kernel_bpf_fdinfo(file,snapshot->extra,sizeof(snapshot->extra),&snapshot->extra_length);
     return 0;
 }
 

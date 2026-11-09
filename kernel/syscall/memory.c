@@ -1,6 +1,8 @@
 #include "private.h"
 
 #include <kernel/errno.h>
+#include <kernel/bpf.h>
+#include <kernel/sync.h>
 #include <kernel/mm.h>
 #include <kernel/files.h>
 #include <kernel/open_file.h>
@@ -203,7 +205,10 @@ enum kernel_syscall_status syscall_handle_mmap(
                 error=-KERNEL_EACCES;
             else if ((protections & LINUX_PROT_EXEC) && source->mount && source->mount->noexec)
                 error=-KERNEL_EPERM;
-            else if (kernel_open_file_kind(file)!=KERNEL_OPEN_FILE_KIND_REGULAR)
+            else if (kernel_open_file_kind(file)==KERNEL_OPEN_FILE_KIND_BPF) {
+                if (!(mm_flags & KERNEL_MM_MAP_SHARED)) error=-KERNEL_EINVAL;
+                else if (protections & LINUX_PROT_EXEC) error=-KERNEL_EPERM;
+            } else if (kernel_open_file_kind(file)!=KERNEL_OPEN_FILE_KIND_REGULAR)
                 error=-KERNEL_ENODEV;
             if (error) {
                 if (kernel_open_file_release(&file)!=KERNEL_OPEN_FILE_STATUS_OK)
@@ -211,7 +216,20 @@ enum kernel_syscall_status syscall_handle_mmap(
                 decoded->value=error;
                 return KERNEL_SYSCALL_STATUS_OK;
             }
-            status = kernel_mm_mmap_file_private(
+            if (kernel_open_file_kind(file)==KERNEL_OPEN_FILE_KIND_BPF) {
+                KERNEL_LOCK_SCOPE(mapping);
+                uint64_t *write_bytes=NULL;
+                error=kernel_bpf_mmap_begin(file,request->arguments[5],
+                    (request->arguments[1]+BOAROS_PAGE_MASK)&~BOAROS_PAGE_MASK,
+                    !!(protections & LINUX_PROT_WRITE),&mapping,&write_bytes);
+                if (error) {
+                    if (kernel_open_file_release(&file)) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+                    decoded->value=error; return KERNEL_SYSCALL_STATUS_OK;
+                }
+                status=kernel_mm_mmap_object_shared(mm,file,request->arguments[0],
+                    request->arguments[1],request->arguments[5],mm_permissions_from_linux(protections),
+                    mm_flags,write_bytes,&mapped_address);
+            } else status = kernel_mm_mmap_file_private(
                 mm,
                 &file,
                 request->arguments[0],
@@ -220,7 +238,7 @@ enum kernel_syscall_status syscall_handle_mmap(
                 mm_permissions_from_linux(protections),
                 mm_flags,
                 &mapped_address);
-            if (status != KERNEL_MM_STATUS_OK &&
+            if (file &&
                 kernel_open_file_release(&file) !=
                     KERNEL_OPEN_FILE_STATUS_OK) {
                 return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;

@@ -1,5 +1,6 @@
 #include "vfs_objects.h"
 #include <kernel/credentials.h>
+#include <kernel/bpf.h>
 
 #include <arch/context.h>
 #include <kernel/errno.h>
@@ -19,6 +20,7 @@
 #include <kernel/time.h>
 #include <kernel/tty_task.h>
 #include <kernel/socket.h>
+#include <kernel/bpf.h>
 #include <kernel/shm.h>
 #include <kernel/sem.h>
 #include <kernel/msg.h>
@@ -48,6 +50,7 @@
 #define PROC_SYSVIPC_MSG_INODE UINT64_C(19)
 #define PROC_NET_INODE UINT64_C(20)
 #define PROC_NET_ROUTE_INODE UINT64_C(21)
+#define PROC_UNPRIVILEGED_BPF_INODE UINT64_C(22)
 #define PROC_TASK_DIR_KIND 10U
 #define PROC_TID_DIR_KIND 11U
 #define PROC_TID_STAT_KIND 12U
@@ -256,6 +259,8 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
             *inode = PROC_RT_RUNTIME_INODE;
         else if (length == 7U && !memcmp(name, "pid_max", 7U))
             *inode = PROC_PID_MAX_INODE;
+        else if(length==25U && !memcmp(name,"unprivileged_bpf_disabled",25U))
+            *inode=PROC_UNPRIVILEGED_BPF_INODE;
         else return -KERNEL_ENOENT;
         *mode = KERNEL_VFS_S_IFREG |
             (*inode == PROC_PID_MAX_INODE ? 0444U : 0644U);
@@ -441,6 +446,7 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
          inode != PROC_MOUNTS_INODE && inode != PROC_SYS_INODE &&
          inode != PROC_KERNEL_INODE && inode != PROC_RT_PERIOD_INODE &&
          inode != PROC_RT_RUNTIME_INODE && inode != PROC_PID_MAX_INODE &&
+         inode != PROC_UNPRIVILEGED_BPF_INODE &&
          inode != PROC_SYSVIPC_INODE && inode != PROC_SYSVIPC_SHM_INODE &&
          inode != PROC_SYSVIPC_SEM_INODE && inode != PROC_SYSVIPC_MSG_INODE &&
          inode != PROC_NET_INODE && inode != PROC_NET_ROUTE_INODE &&
@@ -496,7 +502,7 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
     if (status != KERNEL_HEAP_STATUS_OK)
         return status == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
     node->generated_control = inode == PROC_RT_PERIOD_INODE ||
-                              inode == PROC_RT_RUNTIME_INODE;
+                              inode == PROC_RT_RUNTIME_INODE || inode==PROC_UNPRIVILEGED_BPF_INODE;
 #if BOAROS_COST_DIAGNOSTICS
     node->generated_control |= inode == PROC_COST_CONTROL_INODE;
     node->generated_diagnostic = inode == PROC_COST_INODE || inode == PROC_COST_CONTROL_INODE ||
@@ -624,11 +630,11 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
         return 1;
     }
     if (directory == PROC_SYS_INODE || directory == PROC_KERNEL_INODE) {
-        if (position > (directory == PROC_SYS_INODE ? 2U : 4U)) return 0;
+        if (position > (directory == PROC_SYS_INODE ? 2U : 5U)) return 0;
         const char *entry = position == 0 ? "." : position == 1 ? ".." :
             directory == PROC_SYS_INODE ? "kernel" : position == 2 ?
             "sched_rt_period_us" : position == 3 ? "sched_rt_runtime_us" :
-            "pid_max";
+            position==4?"pid_max":"unprivileged_bpf_disabled";
         size_t length = strlen(entry) + 1U;
         if (name_size < length) return -KERNEL_ERANGE;
         memcpy(name, entry, length);
@@ -637,7 +643,7 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
             (directory == PROC_SYS_INODE ? PROC_ROOT_INODE : PROC_SYS_INODE) :
             directory == PROC_SYS_INODE ? PROC_KERNEL_INODE : position == 2 ?
             PROC_RT_PERIOD_INODE : position == 3 ? PROC_RT_RUNTIME_INODE :
-            PROC_PID_MAX_INODE;
+            position==4?PROC_PID_MAX_INODE:PROC_UNPRIVILEGED_BPF_INODE;
         *type = position < 2 || directory == PROC_SYS_INODE ? 4U : 8U;
         return 1;
     }
@@ -891,7 +897,7 @@ static int proc_readlink(struct kernel_vfs_node *node, char *buffer,
                 proc_resource_identity(node->inode), proc_inode_fd(node->inode),
                 &pseudo);
             if (result) return result;
-            if(pseudo.kind==KERNEL_OPEN_FILE_KIND_MQUEUE){
+            if(pseudo.kind==KERNEL_OPEN_FILE_KIND_MQUEUE || pseudo.kind==KERNEL_OPEN_FILE_KIND_BPF){
                 size_t n=strlen(pseudo.name);if(n>size)n=size;
                 memcpy(buffer,pseudo.name,n);*count=n;return 0;
             }
@@ -1101,7 +1107,8 @@ static int proc_control(struct kernel_vfs_node *node, int write,
         if (offset) return 0;
         int64_t period, runtime;
         kernel_scheduler_rt_bandwidth_get(&period, &runtime);
-        int64_t value = node->inode == PROC_RT_RUNTIME_INODE ? runtime : period;
+        int64_t value = node->inode==PROC_UNPRIVILEGED_BPF_INODE?kernel_bpf_unprivileged_get():
+            node->inode == PROC_RT_RUNTIME_INODE ? runtime : period;
         char text[24];
         size_t length = 0;
         if (value < 0) text[length++] = '-';
@@ -1142,7 +1149,10 @@ static int proc_control(struct kernel_vfs_node *node, int write,
     if (position < limit && buffer[position] != ' ' &&
         buffer[position] != '\t' && buffer[position] != '\n') return -KERNEL_EINVAL;
     if (value > (negative ? UINT64_C(2147483648) : INT32_MAX)) return -KERNEL_EINVAL;
-    int result = kernel_scheduler_rt_bandwidth_set(
+    int result;
+    if(node->inode==PROC_UNPRIVILEGED_BPF_INODE)
+        result=negative || value>2?-KERNEL_EINVAL:kernel_bpf_unprivileged_set((unsigned)value);
+    else result = kernel_scheduler_rt_bandwidth_set(
         node->inode == PROC_RT_RUNTIME_INODE, negative ? -(int64_t)value : (int64_t)value);
     if (result) return result;
     while (position < limit && proc_space((unsigned char)buffer[position])) position++;
@@ -1172,6 +1182,7 @@ struct proc_mount_entry {
     struct kernel_vfs_path *path;
     struct kernel_vfs_path *mount_root;
     const char *source;
+    const char *bpf_type;
     uint8_t is_proc, is_tmpfs, is_devpts;
     uint8_t read_only,nosuid,nodev,noexec;
 };
@@ -1266,6 +1277,7 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
             entries[captured].path = path;
             entries[captured].mount_root = mount_root;
             entries[captured].source = it->source_name;
+            entries[captured].bpf_type = kernel_bpf_filesystem_type(it);
             entries[captured].is_proc = kernel_procfs_is_mount(it);
             entries[captured].is_tmpfs = kernel_tmpfs_is_mount(it);
             entries[captured].is_devpts = kernel_devpts_is_mount(it);
@@ -1305,9 +1317,11 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
         if (result == -KERNEL_ENOENT) { result = 0; continue; }
         if (result) goto Finish;
         const char *source = entries[i].source ? entries[i].source :
+                             entries[i].bpf_type ? entries[i].bpf_type :
                              entries[i].is_proc ? "proc" :
                              entries[i].is_tmpfs ? "tmpfs" : entries[i].is_devpts ? "devpts" : "rootfs";
-        const char *kind = entries[i].is_proc ? "proc" :
+        const char *kind = entries[i].bpf_type ? entries[i].bpf_type :
+                           entries[i].is_proc ? "proc" :
                            entries[i].is_tmpfs ? "tmpfs" : entries[i].is_devpts ? "devpts" : "ext4";
         const char *options[]={entries[i].read_only?" ro":" rw",
             entries[i].nosuid?",nosuid":"",entries[i].nodev?",nodev":"",
@@ -1530,7 +1544,10 @@ static int proc_maps_snapshot(struct kernel_vfs_node *node,
         struct kernel_mm_proc_map *row = &rows[i];
         struct kernel_vfs_stat stat = {0};
         const char *name = "";
-        if (row->file) {
+        if(row->file && kernel_open_file_kind(row->file)==KERNEL_OPEN_FILE_KIND_BPF){
+            error=kernel_open_file_pseudo_stat(row->file,&stat);if(error)goto Finish;
+            name=kernel_bpf_fd_name(row->file);if(!name){error=-KERNEL_EIO;goto Finish;}
+        }else if (row->file) {
             const struct kernel_vfs_file *file = kernel_open_file_vfs_borrow(row->file);
             struct kernel_vfs_path *path = kernel_open_file_path(row->file);
             if (!file || !path) { error = -KERNEL_EIO; goto Finish; }
@@ -1719,7 +1736,7 @@ static int proc_fdinfo_snapshot(struct kernel_vfs_node *node,struct kernel_heap 
         proc_inode_fd(node->inode),&info);
     if(error)return error;
     char *data=0;
-    enum kernel_heap_status allocation=kernel_heap_allocate(heap,256,(void **)&data);
+    enum kernel_heap_status allocation=kernel_heap_allocate(heap,256+info.extra_length,(void **)&data);
     if(allocation)return allocation==KERNEL_HEAP_STATUS_EMPTY?-KERNEL_ENOMEM:-KERNEL_EIO;
     size_t used=append_number_line(data,"pos:\t",info.position,"\n");
     memcpy(data+used,"flags:\t",7);used+=7;
@@ -1737,6 +1754,7 @@ static int proc_fdinfo_snapshot(struct kernel_vfs_node *node,struct kernel_heap 
             data[used++]='\n';
         }
     }
+    if(info.extra_length){memcpy(data+used,info.extra,info.extra_length);used+=info.extra_length;}
     data[used]=0;*buffer=data;*length=used;return 0;
 }
 

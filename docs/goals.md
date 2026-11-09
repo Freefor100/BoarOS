@@ -43,11 +43,12 @@ PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不�
 |---|---|---|
 | 信号、线程与事件 | futex2 的NUMA/MPOL等扩展；clone3 的指定 PID、cgroup、非挂载命名空间及其他扩展标志；timerfd的BOOTTIME/ALARM与运行时调钟取消 | [信号](modules/kernel-signal.md)、[调度](modules/kernel-scheduler.md)、[文件接口](modules/kernel-files.md)；clone3与CLONE_PIDFD覆盖现有进程资源共享组合 |
 | 用户内存 | mremap 的多VMA批量及特殊映射搬移；madvise 的 dump策略、回收/预装等扩展；/proc/<pid>/pagemap | [MM](modules/kernel-mm.md)；普通匿名/文件映射支持缩小、扩大、搬移和DONTUNMAP，零旧长度可复制共享映射；madvise五种基础操作、匿名FREE、四种fork策略与共享后备REMOVE、SHM_LOCK/UNLOCK及MEMLOCK计费已接入，沿共同pin与TLB回收规则；vDSO ELF 通过 AT_SYSINFO_EHDR 提供时间查询与信号返回 |
-| 进程查询与 IPC | pidfd 的扩展 ioctl、kcmp 的 EPOLL_TFD、IPC namespace、运行时 IPC sysctl；preadv2/pwritev2 的扩展标志 | execve/execveat及按FD执行、chroot；getrusage、kcmp 的 FILE/VM/FILES/FS/SIGHAND/IO/SYSVSEM、pidfd_open/send_signal/getfd、clone 创建 pidfd、waitid(P_ALL/P_PID/P_PGID/P_PIDFD)、wait4、times、SysV 共享内存的 INFO/STAT/ANY 查询、信号量和消息队列及其 /proc/sysvipc 查询、preadv/pwritev 已存在；逐接口补齐语义与资源归还 |
+| 进程查询与 IPC | pidfd 的扩展 ioctl、kcmp 的 EPOLL_TFD、IPC namespace、运行时 IPC sysctl；preadv2/pwritev2（整个 syscall 尚未实现） | execve/execveat及按FD执行、chroot；getrusage、kcmp 的 FILE/VM/FILES/FS/SIGHAND/IO/SYSVSEM、pidfd_open/send_signal/getfd、clone 创建 pidfd、waitid(P_ALL/P_PID/P_PGID/P_PIDFD)、wait4、times、SysV 共享内存的 INFO/STAT/ANY 查询、信号量和消息队列及其 /proc/sysvipc 查询、preadv/pwritev 已存在；逐接口补齐语义与资源归还 |
 | 文件接口扩展 | openat2 的纯缓存查找、memfd 的大页后备、copy_file_range跨实例及其他扩展标志 | [openat2](modules/kernel-files.md#openat-与路径边界)支持受限路径解析，[memfd_create](modules/kernel-files.md#memfd_create-与文件封印)支持匿名内存文件与封印；flock、close_range及UNSHARE/CLOEXEC、fchmodat2、epoll_pwait2、同实例文件复制、sendmmsg/recvmmsg、inotify 已提供；RV用户指令同步复用共享MM的指令代次与SBI确认 |
 | 存储介质与设备扩展 | GPT、扩展分区、FAT12/16、exFAT；块设备 mmap/discard/direct I/O；loop 分区扫描、CHANGE_FD 与 direct I/O | [块设备](modules/riscv-virtio-block.md)、[FAT32/VFAT](modules/fat32.md)；MBR 四主分区与常用文件后备 loop 已接入 |
 | 凭据与限制 | 用户命名空间、socketfs所有权与时间属性扩展、登录认证与用户数据库管理；NICE 的优先级接口与公平调度权重、core 文件写出 | [进程凭据](modules/kernel-scheduler.md)、[执行](modules/kernel-exec.md)、[内存](modules/kernel-mm.md)、[文件接口](modules/kernel-files.md)；16项资源限额均可查询、设置和继承；NPROC按真实UID计线程，RTPRIO约束调度授权，RTTIME限制连续RT执行，RSS/LOCKS沿Linux保留记录；AS/DATA、MEMLOCK锁页、CPU、NOFILE/STACK/CORE/FSIZE保持各自范围；线程 UID/GID/补充组、capability、DAC、set-ID/filecap 执行、tmpfs/ext4用户xattr及POSIX ACL，以及按真实 UID 的 SIGPENDING、POSIX mqueue 容量计账已接入 |
 | 网络与系统接口 | 外部 IPv6、IPv4 多地址与更丰富的路由；POSIX定时器的BOOTTIME/ALARM/TAI与运行时调钟、按需 prctl | [网络](modules/kernel-network.md)、[时钟](modules/kernel-time.md)；IPv4 地址、掩码、MTU 和单条默认网关可运行时设置；UNIX STREAM/DGRAM/SEQPACKET、FD传递与消息凭据已提供；匿名管道/FIFO支持容量查询、调整和创建 UID 额度；POSIX mqueue 与 libc 线程通知见[消息队列](modules/posix-mqueue.md)，NETLINK当前提供通知接收，通用路由处理另行实现；REAL/VIRTUAL/PROF间隔定时器及四类时钟的POSIX定时器已提供，DNS/TLS另核对真实随机/时间/证书依赖 |
+| BPF 网络与跟踪 | JIT、XDP/TC、AF_PACKET、seccomp、硬件 PMU 及 kprobe/uprobe/fentry 挂载 | [BPF](modules/kernel-bpf.md)；共用解释器、socket 过滤、map/BTF/bpffs、raw_syscalls tracepoint/perf/link 和 ringbuf 已接入；兼容范围围绕原版 bpftool/libbpf/bpftrace |
 | 架构与用户环境 | RV V；LA 纯 legacy PCI、更广原程序、客体原生开发及全断电恢复矩阵 | [LA](modules/loongarch-boot.md)、[程序环境](modules/program-environment.md)；不从共同清单或 SQLite 普通重启推定通过 |
 
 ### P1h 虚拟文件系统与多挂载
@@ -87,7 +88,7 @@ NOEXEC在最终挂载的执行打开、access及文件映射上执行；NODEV限
 实板 VF2/2K1000LA 需取得固件、DTB 和设备输入后独立验收 RAM、IRQ、DMA/cache、根盘与网络；
 ASID 复用/性能在能观察标签 TLB 的硬件上核对。并行构建与每核队列/allocator/cache 优化依赖多核正确性和争用证据。
 LA 原生开发、C++/Rust、离线交付与更广应用由明确消费者触发，不作为 SMP 的无限前置清单。
-NUMA、swap/透明大页、完整 namespace/cgroup、seccomp/eBPF、Linux 模块 ABI、io_uring 暂无主线排期。
+NUMA、swap/透明大页、完整 namespace/cgroup、seccomp、BPF 的 JIT/XDP/TC 与探针挂载、Linux 模块 ABI、io_uring 暂无主线排期。
 
 ## 验收与分支职责
 

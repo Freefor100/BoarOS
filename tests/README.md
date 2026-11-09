@@ -30,3 +30,7 @@ python3 -B tests/cost/cost-riscv.py --help
 先选当前问题对应的入口。新增用例优先加入现有消费者；单轮编排、临时探针和报告生成放在 `build/`。运行盘、日志、ELF、缓存也放在 `build/`，不放入本目录。
 
 内核机制见 `docs/modules/`，性能记录由兼容分支的既有报告维护。历史实验按对应 Git 提交复现。
+
+## BPF 聚焦验证
+
+`make test-bpf-host` 运行共同 VM/verifier、map/ringbuf、BTF/伪文件系统、TEST_RUN、trace、共享 mmap 和真实 lwIP 过滤检查。`tests/workloads/bpf/abi.py` 复用现有客户机执行器，在固定 Linux 与 BoarOS 运行同一 ELF；`baseline.py` 运行原版 bpftool/libbpf/bpftrace。输入、构建缓存和双架构命令见 [BPF 模块](../docs/modules/kernel-bpf.md#构建与检查)。

@@ -3129,6 +3129,26 @@ int kernel_vfs_mknod_at(struct kernel_vfs_path *start,
     return result;
 }
 
+struct bpf_object;
+int kernel_bpffs_pin_inode(struct kernel_vfs_instance *,uint64_t,const char *,struct bpf_object *,uint32_t);
+int kernel_vfs_bpf_pin_at(struct kernel_vfs_path *start,struct kernel_vfs_path *root,
+    const char *input,struct bpf_object *object,uint32_t umask)
+{
+    VFS_PATH_WALK(walk,start,root);
+    struct kernel_vfs_path *parent=0;
+    char name[256]={0};
+    int result=mutation_path(start,root,input,0,1,0,2,&parent,name,&walk);
+    if(result)return result;
+    result=!name[0]?-KERNEL_EEXIST:
+        kernel_vfs_mount_is_readonly(parent->file.mount)?-KERNEL_EROFS:
+        directory_mutation_allowed(parent,NULL);
+    if(!result)result=kernel_bpffs_pin_inode(parent->file.mount->private_data,
+        kernel_vfs_path_inode(parent),name,object,umask);
+    if(!result)notify_child(parent,name,VFS_NOTIFY_CREATE);
+    if(kernel_vfs_path_release(&parent))__builtin_trap();
+    return result;
+}
+
 int kernel_vfs_socket_bind_at(struct kernel_vfs_path *start,
     struct kernel_vfs_path *root, const char *input, uint32_t mode,
     struct kernel_vfs_path **owner,uint32_t umask)

@@ -65,3 +65,8 @@ EXCLUDED(kernel_signal_fd_read)
 EXCLUDED(kernel_event_fd_io)
 EXCLUDED(kernel_event_fd_poll)
 EXCLUDED(kernel_event_fd_close)
+
+/* No BPF program is attached by this ordinary I/O fixture. */
+EXCLUDED(kernel_bpf_program_get)
+EXCLUDED(kernel_bpf_program_put)
+EXCLUDED(kernel_bpf_filter)

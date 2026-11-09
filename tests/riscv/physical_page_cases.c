@@ -1060,6 +1060,36 @@ static void test_finalized_allocator_reclaims_once_and_guards_recursion(void)
     }
 }
 
+static void test_contiguous_pages_have_independent_owners(void)
+{
+    struct physical_page_allocator allocator;
+    uint64_t owned, base, available;
+    enum physical_page_status status=init_coalescing_buddy(&allocator,&owned);
+    if (status) fail_page(110U,PHYSICAL_PAGE_STATUS_OK,status);
+    available=physical_page_available(&allocator);
+    status=physical_page_allocate_contiguous(&allocator,2,&base);
+    if (status || physical_page_available(&allocator)!=available-4)
+        fail_page(111U,PHYSICAL_PAGE_STATUS_OK,status);
+    for (unsigned i=0;i<4;i++) {
+        uint32_t order=99, references=0;
+        uint64_t page=base+i*BOAROS_PAGE_SIZE;
+        if (physical_page_allocation_order(&allocator,page,&order) || order ||
+            physical_page_acquire(&allocator,page) ||
+            physical_page_reference_count(&allocator,page,&references) || references!=2 ||
+            physical_page_release(&allocator,page))
+            fail_page(112U,PHYSICAL_PAGE_STATUS_OK,PHYSICAL_PAGE_STATUS_STATE);
+    }
+    for (unsigned parity=0;parity<2;parity++) {
+        for (unsigned i=parity;i<4;i+=2)
+            if (physical_page_release(&allocator,base+i*BOAROS_PAGE_SIZE))
+                fail_page(113U,PHYSICAL_PAGE_STATUS_OK,PHYSICAL_PAGE_STATUS_STATE);
+        physical_page_allocator_audit(&allocator);
+    }
+    if (physical_page_available(&allocator)!=available ||
+        physical_page_release(&allocator,owned))
+        fail_page(114U,PHYSICAL_PAGE_STATUS_OK,PHYSICAL_PAGE_STATUS_STATE);
+}
+
 void run_physical_page_tests(void)
 {
     test_aligns_allocates_and_reports_exhaustion();
@@ -1078,4 +1108,5 @@ void run_physical_page_tests(void)
     test_single_page_api_uses_order_zero_after_finalize();
     test_finalized_order_zero_reference_counts();
     test_finalized_allocator_reclaims_once_and_guards_recursion();
+    test_contiguous_pages_have_independent_owners();
 }
