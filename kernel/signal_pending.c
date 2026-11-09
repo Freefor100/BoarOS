@@ -88,7 +88,8 @@ void signal_pending_post_timer_locked(struct kernel_task *t,int shared,struct si
     record->next=0;
     if(q->slots[slot].tail)q->slots[slot].tail->next=record;else q->slots[slot].head=record;
     q->slots[slot].tail=record;q->slots[slot].count++;q->native_count++;
-    *bits(t,shared)|=UINT64_C(1)<<slot;
+    uint64_t *pending=bits(t,shared);
+    __atomic_store_n(pending,*pending|(UINT64_C(1)<<slot),__ATOMIC_RELAXED);
 }
 int signal_pending_needs_record_locked(struct kernel_task *t,int shared,const struct kernel_task *charge_target,
     const struct kernel_signal_wait_info *info,int supplied)
@@ -140,7 +141,7 @@ int signal_pending_post_locked(struct kernel_task *t,int shared,const struct ker
             times[0]=available?info->user_time:0;times[1]=available?info->system_time:0;
         }
     }
-    *pending|=bit;return 0;
+    __atomic_store_n(pending,*pending|bit,__ATOMIC_RELAXED);return 0;
 }
 
 void signal_pending_take_locked(struct kernel_task *t,int shared,unsigned sig,
@@ -183,13 +184,17 @@ void signal_pending_take_locked(struct kernel_task *t,int shared,unsigned sig,
             retire_inline_account(s,p);
         }
     }
-    if(!s->queue||!s->queue->slots[sig-1].head)*bits(t,shared)&=~bit;
+    if(!s->queue||!s->queue->slots[sig-1].head) {
+        uint64_t *pending=bits(t,shared);
+        __atomic_store_n(pending,*pending&~bit,__ATOMIC_RELAXED);
+    }
 }
 
 static int clear_locked(struct kernel_task *t,int shared,uint64_t mask,
     struct signal_pending_prepared *p,int ignored)
 {
     struct kernel_signal_pending_state *s=state(t,shared);
+    uint64_t *pending=bits(t,shared);
     uint64_t charged=s->inline_charged&mask;
     uint64_t count=0;
     while(charged){charged&=charged-1;count++;}
@@ -207,9 +212,9 @@ static int clear_locked(struct kernel_task *t,int shared,uint64_t mask,
             if(r->timer){s->queue->native_count--;posix_timer_record_clear_locked(r,ignored,p);}
             else {uncharge(r->account,1);r->next=p->retired;p->retired=r;}
         }
-        *bits(t,shared)&=~(UINT64_C(1)<<i);
+        __atomic_store_n(pending,*pending&~(UINT64_C(1)<<i),__ATOMIC_RELAXED);
     }
-    *bits(t,shared)&=~mask;return 0;
+    __atomic_store_n(pending,*pending&~mask,__ATOMIC_RELAXED);return 0;
 }
 int signal_pending_clear_locked(struct kernel_task *t,int shared,uint64_t mask,struct signal_pending_prepared *p)
 {return clear_locked(t,shared,mask,p,0);}
@@ -247,7 +252,10 @@ void signal_pending_flush_timers(struct kernel_task *task)
                     else {uncharge(r->account,1);r->next=p.retired;p.retired=r;}
                 }
                 q->slots[i].tail=tail;
-                if(!q->slots[i].head&&!(q->inline_pending&(UINT64_C(1)<<i)))*bits(owner,shared)&=~(UINT64_C(1)<<i);
+                if(!q->slots[i].head&&!(q->inline_pending&(UINT64_C(1)<<i))) {
+                    uint64_t *pending=bits(owner,shared);
+                    __atomic_store_n(pending,*pending&~(UINT64_C(1)<<i),__ATOMIC_RELAXED);
+                }
             }
         }
     }
@@ -277,5 +285,5 @@ void kernel_signal_pending_adopt_locked(struct kernel_task *to,struct kernel_tas
     if(to->group_queue.queue || to->group_queue.inline_charged)__builtin_trap();
     to->group_queue=from->group_queue;from->group_queue=(struct kernel_signal_pending_state){0};
     memcpy(to->group_child_times,from->group_child_times,sizeof(to->group_child_times));
-    from->group_pending=0;
+    __atomic_store_n(&from->group_pending,0,__ATOMIC_RELAXED);
 }

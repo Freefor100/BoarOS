@@ -25,6 +25,17 @@
 
 #include <stdint.h>
 
+#if !BOAROS_USER_SMP
+static inline void kernel_wait_interrupt_locked(struct kernel_task *task)
+{
+    uint64_t generation=kernel_wait_signal_generation(&task->wait);
+    if (generation) {
+        struct kernel_wait_token token={task,generation};
+        (void)kernel_wait_notify_locked(&token,KERNEL_WAIT_SIGNALLED);
+    }
+}
+#endif
+
 #define KERNEL_SCHEDULER_INITIALIZED UINT32_C(0x53434844)
 #define KERNEL_THREAD_MAGIC UINT64_C(0x424f415254485244)
 #define KERNEL_STACK_CANARY UINT64_C(0x535441434b4f4b21)

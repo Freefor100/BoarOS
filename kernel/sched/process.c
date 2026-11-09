@@ -307,7 +307,7 @@ static void request_thread_termination_locked(struct kernel_task *task)
 {
     if (task->state == KERNEL_THREAD_STATE_EXITED || task->state == KERNEL_THREAD_STATE_ZOMBIE ||
         task->state == KERNEL_THREAD_STATE_GROUP_DEAD || task->retirement) return;
-    task->terminate_requested = 1;
+    __atomic_store_n(&task->terminate_requested,1,__ATOMIC_RELAXED);
 #if BOAROS_USER_SMP
     scheduler_user_request_locked(task);
 #endif
@@ -328,11 +328,7 @@ static void request_thread_termination_locked(struct kernel_task *task)
         if (task->wait.on_cpu) task->wait.ready_pending = 1;
         else ready_enqueue_locked(task, 0);
     }
-    uint64_t generation=kernel_wait_signal_generation(&task->wait);
-    if (generation) {
-        struct kernel_wait_token token = {task,generation};
-        (void)kernel_wait_notify_locked(&token, KERNEL_WAIT_SIGNALLED);
-    }
+    kernel_wait_interrupt_locked(task);
 }
 
 static void terminate_group_members(struct kernel_task *leader, struct kernel_task *except)
@@ -623,7 +619,7 @@ enum kernel_scheduler_status process_group_exec_current(void)
         task->dead_usage = leader->dead_usage;
         scheduler_usage_add(&task->dead_usage, &leader->usage);
         task->child_usage = leader->child_usage;
-        task->group_pending = leader->group_pending;
+        __atomic_store_n(&task->group_pending,leader->group_pending,__ATOMIC_RELAXED);
         task->group_child_info = leader->group_child_info;
         if(task->limits!=leader->limits)__builtin_trap();
         kernel_signal_pending_adopt_locked(task,leader);

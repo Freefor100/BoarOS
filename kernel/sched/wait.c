@@ -206,15 +206,63 @@ struct kernel_task *kernel_wait_current_task(void)
 }
 int kernel_wait_backend_initialized(void) { return scheduler.initialized == KERNEL_SCHEDULER_INITIALIZED; }
 int kernel_wait_backend_signal(struct kernel_task *task)
-{ return task->arch.user_mode && (task->terminate_requested || kernel_signal_has_pending(task)); }
+{ return task->arch.user_mode && (__atomic_load_n(&task->terminate_requested,__ATOMIC_RELAXED) || kernel_signal_has_pending(task)); }
 uint64_t kernel_wait_backend_time(void) { return arch_time_read(); }
+static inline void publish_blocked(struct kernel_task *task)
+{
+    task->wait.ready_flags=0;
+#if BOAROS_COST_DIAGNOSTICS
+    kernel_cost_block(&task->cost);
+#endif
+#if BOAROS_USER_SMP
+    __atomic_store_n(&task->state,KERNEL_THREAD_STATE_BLOCKED,__ATOMIC_RELAXED);
+#else
+    task->state=KERNEL_THREAD_STATE_BLOCKED;
+#endif
+}
+
+#if BOAROS_USER_SMP
+int kernel_wait_backend_park_local(const struct kernel_wait_token *token,
+    enum kernel_scheduler_status *status)
+{
+    struct kernel_task *task=token->task;
+    struct kernel_cpu *cpu=kernel_cpu_current();
+    if (cpu->preempt_depth) return 0;
+    {
+        KERNEL_RAW_SCOPE(run,kernel_run_lock(cpu));
+        /* vfork cancellation also detaches the parent/child relationship
+         * under the scheduler domain; leave that commit with its owner. */
+        if (task!=cpu->current || task->state!=KERNEL_THREAD_STATE_RUNNING ||
+            !scheduler_local_task(task,cpu) ||
+            __atomic_load_n(&task->default_wait_node.queue,__ATOMIC_ACQUIRE)==&task->vfork_done_queue)
+            return 0;
+        if (!task->wait.on_cpu || task->wait.ready_pending || task->wait.deadline) __builtin_trap();
+        /* A remote signal takes this queue after publishing pending state.
+         * It either precedes this sample or sees the committed wait. Resolve
+         * a positive sample in the signal domain, which owns group state. */
+        if (task->wait.interruptible && kernel_wait_backend_signal(task)) return 0;
+        if (!kernel_wait_try_commit(&task->wait,token->generation)) {
+            *status=KERNEL_SCHEDULER_STATUS_OK;
+            return 1;
+        }
+        publish_blocked(task);
+    }
+    struct kernel_task *next;
+    uint64_t deadline;
+    if (scheduler_select_local(1,0,0,&next,&deadline)) {
+        scheduler_arm_timer(deadline);
+        *status=next?scheduler_switch_claimed(task,next):KERNEL_SCHEDULER_STATUS_OK;
+    } else *status=scheduler_switch_current_away(task);
+    return 1;
+}
+#endif
+
 void kernel_wait_backend_commit(struct kernel_task *task, uint64_t deadline, int interruptible)
 {
 #if BOAROS_USER_SMP
     scheduler_user_reservation_release_locked(task);
     KERNEL_RAW_SCOPE(run,kernel_run_lock(kernel_cpu_current()));
 #endif
-    task->wait.ready_flags = 0;
     if (task->wait.deadline != deadline || task->wait.interruptible != (uint32_t)interruptible) __builtin_trap();
     if (deadline) {
         deadline_index_insert(task);
@@ -223,14 +271,7 @@ void kernel_wait_backend_commit(struct kernel_task *task, uint64_t deadline, int
             kernel_cpu_notify(arch_smp_cpu(0), ARCH_IPI_DEADLINE);
 #endif
     }
-#if BOAROS_COST_DIAGNOSTICS
-    kernel_cost_block(&task->cost);
-#endif
-#if BOAROS_USER_SMP
-    __atomic_store_n(&task->state,KERNEL_THREAD_STATE_BLOCKED,__ATOMIC_RELAXED);
-#else
-    task->state = KERNEL_THREAD_STATE_BLOCKED;
-#endif
+    publish_blocked(task);
 }
 void kernel_wait_backend_notify(struct kernel_task *task, uint32_t reason)
 {
@@ -341,15 +382,38 @@ enum kernel_scheduler_status kernel_scheduler_block_current(struct kernel_wait_q
     enum kernel_scheduler_status finish = kernel_wait_finish(&token);
     return status == KERNEL_SCHEDULER_STATUS_OK ? finish : status;
 }
+#if BOAROS_USER_SMP
+void kernel_wait_interrupt_locked(struct kernel_task *task)
+{
+    for (;;) {
+        struct kernel_cpu *cpu=__atomic_load_n(&task->cpu,__ATOMIC_ACQUIRE);
+        if (!cpu) break;
+        KERNEL_RAW_SCOPE(run,kernel_run_lock(cpu));
+        if (__atomic_load_n(&task->cpu,__ATOMIC_RELAXED)!=cpu) continue;
+        uint64_t generation=kernel_wait_signal_generation(&task->wait);
+        if (!generation) return;
+        /* Holding the queue excludes a new commit. For a committed ordinary
+         * task this is also the actual protection used by notify_locked. */
+        if (kernel_wait_record_phase(&task->wait)!=KERNEL_WAIT_COMMITTED ||
+            scheduler_local_task(task,cpu)) {
+            struct kernel_wait_token token={task,generation};
+            (void)kernel_wait_notify_locked(&token,KERNEL_WAIT_SIGNALLED);
+            return;
+        }
+        break;
+    }
+    uint64_t generation=kernel_wait_signal_generation(&task->wait);
+    if (generation) {
+        struct kernel_wait_token token={task,generation};
+        (void)kernel_wait_notify_locked(&token,KERNEL_WAIT_SIGNALLED);
+    }
+}
+#endif
 enum kernel_scheduler_status kernel_scheduler_wake_signal(struct kernel_task *task)
 {
     if (!kernel_wait_backend_initialized()) return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
     if (!task) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-    uint64_t generation=kernel_wait_signal_generation(&task->wait);
-    if (generation) {
-        struct kernel_wait_token token = {task,generation};
-        kernel_wait_notify_locked(&token, KERNEL_WAIT_SIGNALLED);
-    }
+    kernel_wait_interrupt_locked(task);
     return KERNEL_SCHEDULER_STATUS_OK;
 }

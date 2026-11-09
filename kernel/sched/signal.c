@@ -1705,16 +1705,25 @@ static void signal_stop_member(struct kernel_task *task, uint32_t sig)
 {
     struct signal_pending_prepared p __attribute__((cleanup(signal_pending_finish)))={0};
     uint64_t bit = signal_mask(sig);
+#if !BOAROS_USER_SMP
     int blocked;
+#endif
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         if (!signal_dispatchable_locked(task) || task->state==KERNEL_THREAD_STATE_STOPPED)
             return;
-        task->signal_pending |= bit;
+        __atomic_store_n(&task->signal_pending,task->signal_pending|bit,__ATOMIC_RELAXED);
+#if BOAROS_USER_SMP
+        /* A running member can publish BLOCKED without the signal domain. */
+        kernel_wait_interrupt_locked(task);
+#else
         blocked=task->state==KERNEL_THREAD_STATE_BLOCKED;
+#endif
     }
+#if !BOAROS_USER_SMP
     if (blocked && kernel_scheduler_wake_signal(task)!=KERNEL_SCHEDULER_STATUS_OK)
         return;
+#endif
     KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
     if (!signal_dispatchable_locked(task) || task->state==KERNEL_THREAD_STATE_STOPPED)
         return;
