@@ -3498,6 +3498,49 @@ static void *domain_quota_writer(void *argument)
     progress_writeback_caller=0;
     __atomic_store_n(&request->done,1,__ATOMIC_RELEASE);return NULL;
 }
+
+static void same_disk_admission(struct kernel_page_cache *cache,const char *path)
+{
+    image_fd=open(path,O_RDWR);assert(image_fd>=0);struct stat st;assert(!fstat(image_fd,&st));
+    struct kernel_block_device disk={.read=image_read,.write=image_write,.flush=image_flush,
+        .capacity_bytes=st.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
+    struct kernel_vfs_mount mount={0};struct kernel_vfs_file a={0},b={0},c={0};
+    assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,cache,0));current_cache=cache;
+    assert(!kernel_vfs_create(&mount,"/background",0600,&a) && !kernel_vfs_create(&mount,"/caller",0600,&b));
+    assert(!kernel_vfs_create(&mount,"/initially-clean",0600,&c));
+    struct kernel_vfs_instance *instance=mount.private_data;
+    struct kernel_writeback_statistics before,after;
+    kernel_writeback_domain_snapshot(&instance->writeback,&before);
+    char data[BOAROS_PAGE_SIZE];memset(data,0x53,sizeof(data));size_t done;
+    for (size_t offset=0;offset<before.high_bytes;offset+=sizeof(data))
+        assert(!kernel_vfs_pwrite(&a,offset,data,sizeof(data),&done) && done==sizeof(data));
+    for (unsigned i=0;i<3;i++)
+        assert(!kernel_vfs_pwrite(&b,i*sizeof(data),data,sizeof(data),&done) && done==sizeof(data));
+    write_entered=resume_write=0;pause_write=1;
+    assert(!kernel_page_cache_start_worker(cache) && !kernel_page_cache_request_writeback(cache));
+    wait_progress(&write_entered,1);
+    kernel_writeback_domain_snapshot(&instance->writeback,&before);
+    struct kernel_page_cache_concurrency_state queued_before,queued_after;
+    kernel_page_cache_get_concurrency_state(cache,&queued_before);
+    struct domain_quota_request request={.file=&c};pthread_t writer;
+    assert(!pthread_create(&writer,NULL,domain_quota_writer,&request));wait_progress(&request.done,1);
+    assert(!pthread_join(writer,NULL) && !resume_write);
+    kernel_page_cache_get_concurrency_state(cache,&queued_after);
+    kernel_writeback_domain_snapshot(&instance->writeback,&after);
+    assert(queued_after.executions_queued==queued_before.executions_queued && after.dirty_bytes<before.dirty_bytes);
+    __atomic_store_n(&resume_write,1,__ATOMIC_RELEASE);
+    kernel_page_cache_stop_worker(cache);
+    uint64_t observed=kernel_vfs_error_sequence(&c);assert(!kernel_vfs_sync(&c,0,&observed));
+    assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&c)));
+    assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&b)));
+    char persisted[5];assert(!kernel_vfs_pread(&c,0,persisted,sizeof(persisted),&done,NULL) &&
+        done==sizeof(persisted) && !memcmp(persisted,"quota",sizeof(persisted)));
+    assert(!kernel_vfs_pread(&b,0,persisted,sizeof(persisted),&done,NULL) &&
+        done==sizeof(persisted) && !memcmp(persisted,"SSSSS",sizeof(persisted)));
+    assert(!kernel_vfs_close(&a) && !kernel_vfs_close(&b) && !kernel_vfs_close(&c) && !kernel_vfs_unmount(&mount));
+    assert(!kernel_page_cache_destroy(cache) && !close(image_fd));current_cache=NULL;
+    puts("PASS same-disk pressure: clean caller claims an idle dirty inode without queuing behind the cache worker");
+}
 static void *admission_credit_writer(void *file)
 {
     cache_test_attach(10);admission_client=1;size_t done;
@@ -3819,6 +3862,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[2],"read-borrow-retire")) {read_borrow_retirement(&cache,argv[1]);goto owners;}
         if (!strcmp(argv[2],"snapshot-copy")) {snapshot_copy_case(&cache,argv[1]);goto owners;}
         if (!strcmp(argv[2],"admission-credit")) {admission_credit_case(&cache,argv[1]);goto owners;}
+        if (!strcmp(argv[2],"same-disk-admission")) {same_disk_admission(&cache,argv[1]);goto owners;}
         if (!strcmp(argv[2],"append-snapshot")) {append_snapshot(&cache,argv[1]);goto owners;}
         if (!strcmp(argv[2],"domain-start-failure")) {writeback_start_failure(&cache,argv[1]);return 0;}
         if (!strcmp(argv[2],"progress-owners")) {progress_writeback_owners(&cache,argv[1]);goto owners;}
