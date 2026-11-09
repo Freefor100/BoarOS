@@ -2,6 +2,7 @@
 #include <arch/timer.h>
 #include <kernel/time.h>
 #include <kernel/tick.h>
+#include <kernel/vdso.h>
 
 #include <stdint.h>
 
@@ -20,6 +21,89 @@ static uint64_t time_multiplier;
 static uint64_t time_ticks_multiplier;
 static uint64_t time_boot_realtime_ns;
 static uint64_t time_coarse_monotonic_ns;
+
+#if KERNEL_HAS_VDSO_ELF
+#include <kernel/page.h>
+#include <kernel/physical_page.h>
+#include <kernel/raw_lock.h>
+#include <string.h>
+
+static struct kernel_raw_lock vvar_lock = {
+    .rank = KERNEL_RAW_RANK_OBJECT, .initialized = KERNEL_RAW_INITIALIZED
+};
+static struct kernel_vdso_time_data *vvar;
+static struct physical_page_allocator *vvar_allocator;
+static uint64_t vvar_page;
+static uint32_t vvar_owners;
+
+static void publish_vvar(void)
+{
+    vvar->boot_realtime_ns = time_boot_realtime_ns;
+    vvar->coarse_resolution_ns = kernel_time_coarse_resolution_ns();
+    __atomic_store_n(&vvar->coarse_monotonic_ns,
+        __atomic_load_n(&time_coarse_monotonic_ns, __ATOMIC_RELAXED), __ATOMIC_RELAXED);
+    __atomic_store_n(&vvar->multiplier, time_multiplier, __ATOMIC_RELEASE);
+}
+
+int kernel_time_vvar_acquire(struct physical_page_allocator *allocator, uint64_t *page)
+{
+    uint64_t candidate;
+    void *pointer;
+    {
+        KERNEL_RAW_SCOPE(guard, &vvar_lock);
+        if (vvar) {
+            if (vvar_allocator != allocator || vvar_owners == UINT32_MAX) __builtin_trap();
+            vvar_owners++;
+            *page = vvar_page;
+            return 0;
+        }
+    }
+    if (physical_page_allocate(allocator, &candidate) != PHYSICAL_PAGE_STATUS_OK) return -1;
+    if (physical_page_map_owned(allocator, candidate, &pointer) != PHYSICAL_PAGE_STATUS_OK)
+        __builtin_trap();
+    /* The whole page is exposed, so only publish a cleared allocation. */
+    memset(pointer, 0, BOAROS_PAGE_SIZE);
+    {
+        KERNEL_RAW_SCOPE(guard, &vvar_lock);
+        if (!vvar) {
+            vvar = pointer;
+            vvar_allocator = allocator;
+            vvar_page = candidate;
+            vvar_owners = 1;
+            if (time_initialized) publish_vvar();
+            *page = candidate;
+            return 0;
+        }
+        if (vvar_allocator != allocator || vvar_owners == UINT32_MAX) __builtin_trap();
+        vvar_owners++;
+        *page = vvar_page;
+    }
+    if (physical_page_release(allocator, candidate) != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
+    return 0;
+}
+
+void kernel_time_vvar_retain(uint64_t page)
+{
+    KERNEL_RAW_SCOPE(guard, &vvar_lock);
+    if (!vvar || vvar_page != page || !vvar_owners || vvar_owners == UINT32_MAX) __builtin_trap();
+    vvar_owners++;
+}
+
+void kernel_time_vvar_release(struct physical_page_allocator *allocator, uint64_t page)
+{
+    {
+        KERNEL_RAW_SCOPE(guard, &vvar_lock);
+        if (!vvar || vvar_allocator != allocator || vvar_page != page || !vvar_owners)
+            __builtin_trap();
+        if (--vvar_owners) return;
+        /* Stop the tick writer before returning the last kernel reference. */
+        vvar = 0;
+        vvar_allocator = 0;
+        vvar_page = 0;
+    }
+    if (physical_page_release(allocator, page) != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
+}
+#endif
 
 enum kernel_time_status kernel_time_init(uint32_t timebase_frequency,
                                          uint64_t boot_realtime_ns)
@@ -42,7 +126,15 @@ enum kernel_time_status kernel_time_init(uint32_t timebase_frequency,
     time_boot_realtime_ns = boot_realtime_ns;
     __atomic_store_n(&time_coarse_monotonic_ns,
         kernel_time_ticks_to_ns(arch_time_read()), __ATOMIC_RELAXED);
+#if KERNEL_HAS_VDSO_ELF
+    {
+        KERNEL_RAW_SCOPE(guard, &vvar_lock);
+        time_initialized = 1U;
+        if (vvar) publish_vvar();
+    }
+#else
     time_initialized = 1U;
+#endif
 #if BOAROS_COST_DIAGNOSTICS
     kernel_cost_set_timebase(timebase_frequency);
 #endif
@@ -74,12 +166,22 @@ void kernel_time_update_coarse(void)
 {
     if (!time_initialized) return;
     /* 合并 tick 只采样一次真实 counter，不按补发次数虚构时间。 */
-    __atomic_store_n(&time_coarse_monotonic_ns,
-        kernel_time_monotonic_ns(), __ATOMIC_RELAXED);
+    uint64_t now = kernel_time_monotonic_ns();
+#if KERNEL_HAS_VDSO_ELF
+    KERNEL_RAW_SCOPE(guard, &vvar_lock);
+    if (vvar) __atomic_store_n(&vvar->coarse_monotonic_ns, now, __ATOMIC_RELAXED);
+#endif
+    __atomic_store_n(&time_coarse_monotonic_ns, now, __ATOMIC_RELAXED);
 }
 
 uint64_t kernel_time_coarse_monotonic_ns(void)
 {
+#if KERNEL_HAS_VDSO_ELF
+    /* Use the same sample as user space. A caller on another CPU cannot
+     * observe publication half-way through the tick update. */
+    KERNEL_RAW_SCOPE(guard, &vvar_lock);
+    if (vvar) return __atomic_load_n(&vvar->coarse_monotonic_ns, __ATOMIC_RELAXED);
+#endif
     return __atomic_load_n(&time_coarse_monotonic_ns, __ATOMIC_RELAXED);
 }
 

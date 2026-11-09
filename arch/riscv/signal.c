@@ -1,3 +1,4 @@
+#include <kernel/vdso.h>
 #include <arch/riscv/signal.h>
 #include <arch/riscv/fpu.h>
 #include <arch/riscv/process.h>
@@ -142,12 +143,12 @@ static void riscv_signal_build_frame(
         riscv_signal_bad_frame();
     }
     if (kernel_mm_vdso_address(mm, &vdso) != KERNEL_MM_STATUS_OK ||
-        vdso > UINT64_MAX - 4U) {
+        vdso > UINT64_MAX - KERNEL_VDSO_RESTORER_OFFSET) {
         riscv_signal_bad_frame();
     }
     frame->sp = user_sp;
     frame->sepc = delivery->handler;
-    frame->ra = vdso;
+    frame->ra = vdso + KERNEL_VDSO_RESTORER_OFFSET;
     frame->a0 = delivery->info.signal;
     frame->a1 = user_sp;
     frame->a2 = user_sp + RISCV_SIGNAL_INFO_SIZE;

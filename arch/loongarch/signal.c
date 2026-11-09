@@ -1,3 +1,4 @@
+#include <kernel/vdso.h>
 #include <arch/loongarch/signal.h>
 #include <arch/loongarch/fpu.h>
 #include <kernel/errno.h>
@@ -98,7 +99,7 @@ static void build_frame(struct kernel_task *task, struct kernel_mm *mm,
     memcpy(data,&prefix,576);
     if(kernel_copy_to_user(mm,sp,data,bytes,&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=bytes ||
        kernel_mm_vdso_address(mm,&vdso)!=KERNEL_MM_STATUS_OK)bad_frame();
-    frame->regs[3]=sp;frame->regs[1]=vdso;frame->era=delivery->handler;
+    frame->regs[3]=sp;frame->regs[1]=vdso+KERNEL_VDSO_RESTORER_OFFSET;frame->era=delivery->handler;
     frame->regs[4]=delivery->info.signal;frame->regs[5]=sp;frame->regs[6]=sp+128;
     kernel_signal_stack_delivered(task);
 }

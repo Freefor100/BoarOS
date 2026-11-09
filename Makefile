@@ -2152,6 +2152,7 @@ test-demand-read-riscv:
 	python3 -B tests/riscv/demand-read.py --qemu $(QEMU_RISCV64)
 
 include arch/loongarch/build.mk
+include vdso/build.mk
 
 .PHONY: test-build-config-host test-elf-layout-host
 test-build-config-host:

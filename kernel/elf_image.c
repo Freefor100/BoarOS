@@ -9,6 +9,7 @@
 #include <kernel/random.h>
 #include <kernel/rlimit.h>
 #include <kernel/vma.h>
+#include <kernel/vdso.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -445,7 +446,7 @@ static enum kernel_elf_image_status prepare_stack_layout(
     }
     table_words = 1U + (uint64_t)layout->argument_count + 1U +
                   (uint64_t)layout->environment_count + 1U +
-                  2U * (16U + (random_bytes != 0U ? 1U : 0U));
+                  2U * (16U + KERNEL_HAS_VDSO_ELF + (random_bytes != 0U ? 1U : 0U));
     if (table_words > UINT64_MAX / sizeof(uint64_t)) {
         return KERNEL_ELF_IMAGE_STATUS_STACK_LIMIT;
     }
@@ -534,8 +535,8 @@ static enum kernel_elf_image_status map_vdso_page(
     }
     status = arch_mmu_user_space_populate(space,
                                             address,
-                                            arch_elf_trampoline_start,
-                                            (size_t)(arch_elf_trampoline_end-arch_elf_trampoline_start));
+                                            arch_elf_vdso_start,
+                                            (size_t)(arch_elf_vdso_end-arch_elf_vdso_start));
     if (status != ARCH_MMU_STATUS_OK) {
         return KERNEL_ELF_IMAGE_STATUS_ADDRESS_SPACE;
     }
@@ -678,6 +679,9 @@ static enum kernel_elf_image_status build_stack(
         POPULATE_AUXILIARY(25U, layout->random_address);
     }
     POPULATE_AUXILIARY(31U, layout->executable_address);
+#if KERNEL_HAS_VDSO_ELF
+    POPULATE_AUXILIARY(33U, layout->vdso); /* AT_SYSINFO_EHDR */
+#endif
     POPULATE_AUXILIARY(0U, 0U);
 #undef POPULATE_AUXILIARY
     if (layout->has_random) {
@@ -690,6 +694,12 @@ static enum kernel_elf_image_status build_stack(
         }
     }
     return KERNEL_ELF_IMAGE_STATUS_OK;
+}
+
+static uint64_t vdso_slots(uint64_t start, uint64_t end)
+{
+    uint64_t pages = (end - start) / BOAROS_PAGE_SIZE;
+    return pages > KERNEL_HAS_VDSO_ELF ? pages - KERNEL_HAS_VDSO_ELF : 0;
 }
 
 static int choose_vdso(const struct kernel_elf_layout *layout,
@@ -751,14 +761,14 @@ static int choose_vdso(const struct kernel_elf_layout *layout,
     cursor = lower;
     for (index = 0U; index < blocked_count; index++) {
         if (starts[index] > cursor) {
-            free_pages += (starts[index] - cursor) / BOAROS_PAGE_SIZE;
+            free_pages += vdso_slots(cursor, starts[index]);
         }
         if (ends[index] > cursor) {
             cursor = ends[index];
         }
     }
     if (cursor < upper) {
-        free_pages += (upper - cursor) / BOAROS_PAGE_SIZE;
+        free_pages += vdso_slots(cursor, upper);
     }
     if (free_pages == 0U) {
         return 0;
@@ -767,8 +777,7 @@ static int choose_vdso(const struct kernel_elf_layout *layout,
     cursor = lower;
     for (index = 0U; index < blocked_count; index++) {
         uint64_t gap_pages = starts[index] > cursor
-                                 ? (starts[index] - cursor) /
-                                       BOAROS_PAGE_SIZE
+                                 ? vdso_slots(cursor, starts[index])
                                  : 0U;
 
         if (random_value < gap_pages) {
@@ -781,7 +790,7 @@ static int choose_vdso(const struct kernel_elf_layout *layout,
         }
     }
     if (cursor < upper &&
-        random_value < (upper - cursor) / BOAROS_PAGE_SIZE) {
+        random_value < vdso_slots(cursor, upper)) {
         *address = cursor + random_value * BOAROS_PAGE_SIZE;
         return 1;
     }

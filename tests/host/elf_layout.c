@@ -52,7 +52,7 @@ int __wrap_kernel_vfs_close(struct kernel_vfs_file *file)
     }
     return __real_kernel_vfs_close(file);
 }
-__asm__(".pushsection .rodata\n.global arch_elf_trampoline_start,arch_elf_trampoline_end\narch_elf_trampoline_start:\n.byte 0x73,0,0,0\narch_elf_trampoline_end:\n.popsection");
+__asm__(".pushsection .rodata\n.global arch_elf_vdso_start,arch_elf_vdso_end\narch_elf_vdso_start:\n.byte 0x73,0,0,0\narch_elf_vdso_end:\n.popsection");
 int kernel_random_available(void) { return 0; }
 enum kernel_random_status kernel_random_fill(void *buffer,size_t size)
 { (void)buffer; (void)size; abort(); }
