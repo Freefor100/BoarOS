@@ -36,6 +36,21 @@ static void socket_state_acquire(struct socket_state_guard *guard)
     guard->owner=guard;
     guard->count=0;guard->work.queue=0;guard->work_prepared=0;
 }
+static inline void socket_state_unlock(struct socket_state_guard *guard)
+{
+#if BOAROS_COST_DIAGNOSTICS
+    struct kernel_cost_tag tag=guard->raw.cost;
+    uint64_t wait=tag.epoch?guard->raw.wait_ticks:0;
+    uint64_t held=tag.epoch?kernel_cost_clock()-guard->raw.hold_start:0;
+#endif
+    kernel_irq_lock_release(&guard->raw);
+#if BOAROS_COST_DIAGNOSTICS
+    if (tag.epoch) {
+        kernel_cost_add_tag(tag,COST_NETWORK_STATE_WAIT_TICKS,wait);
+        kernel_cost_add_tag(tag,COST_NETWORK_STATE_HOLD_TICKS,held);
+    }
+#endif
+}
 static void socket_state_release(struct socket_state_guard *guard)
 {
     if(!guard->owner)return;
@@ -44,9 +59,9 @@ static void socket_state_release(struct socket_state_guard *guard)
 #if BOAROS_MAX_CPUS == 1 && !BOAROS_LOCK_DEBUG && !BOAROS_COST_DIAGNOSTICS
     socket_state_active=0;
 #endif
-    if(!guard->count && !guard->work.queue) {kernel_irq_lock_release(&guard->raw);return;}
+    if(!guard->count && !guard->work.queue) {socket_state_unlock(guard);return;}
     uintptr_t interrupts=guard->raw.interrupts;guard->raw.interrupts=0;
-    kernel_irq_lock_release(&guard->raw);
+    socket_state_unlock(guard);
     /* Queue cursors retain their actual storage; callbacks run without state locks. */
     for(unsigned i=0;i<guard->count;i++)kernel_wait_cursor_wake(&guard->notifications[i],1);
     if(guard->work.queue)kernel_wait_cursor_wake(&guard->work,1);

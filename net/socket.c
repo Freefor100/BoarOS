@@ -4031,8 +4031,16 @@ int kernel_socket_stream_preparev(struct kernel_socket_write_request *request,
     if (!segments || !count || size>request->reserved || request->tcp_prepare_size ||
         request->tcp_prepared || request->segments) __builtin_trap();
     request->tcp_prepare_size=(uint16_t)size;
+#if BOAROS_COST_DIAGNOSTICS
+    struct kernel_cost_tag preparing=kernel_cost_capture();
+    uint64_t started=preparing.epoch?kernel_cost_clock():0;
+#endif
     err_t error=boaros_lwip_tcp_preparev(segments,count,(u16_t)size,(u16_t)mss,
         &request->tcp_prepared);
+#if BOAROS_COST_DIAGNOSTICS
+    if (preparing.epoch)
+        kernel_cost_add_tag(preparing,COST_NETWORK_PREPARE_TICKS,kernel_cost_clock()-started);
+#endif
     if (error!=ERR_OK && error!=ERR_MEM) __builtin_trap();
     request->tcp_prepare_failed=error==ERR_MEM;
     return 1;

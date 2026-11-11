@@ -69,7 +69,7 @@ static const enum kernel_cost_metric lock_metrics[]={
     COST_LOCK21_ATTEMPTS,COST_LOCK31_ATTEMPTS,COST_LOCK32_ATTEMPTS,COST_LOCK35_ATTEMPTS,
     COST_LOCK45_ATTEMPTS
 };
-enum { cost_storage = sizeof(cost) + sizeof(names) + sizeof(name_offsets) + sizeof(units) + sizeof(unit_names) + sizeof(histograms) + sizeof(histogram_indexes) + sizeof(lanes) + sizeof(timebase) + sizeof(aggregate_lock) + sizeof(cpu_states) + sizeof(lock_metrics) + BOAROS_MAX_CPUS * (sizeof(struct kernel_cost_cpu) + KERNEL_COST_CPU_SERVICE_BYTES) };
+enum { cost_storage = sizeof(cost) + sizeof(names) + sizeof(name_offsets) + sizeof(units) + sizeof(unit_names) + sizeof(histograms) + sizeof(histogram_indexes) + sizeof(lanes) + sizeof(timebase) + sizeof(aggregate_lock) + sizeof(cpu_states) + sizeof(lock_metrics) + BOAROS_MAX_CPUS * (sizeof(struct kernel_cost_cpu) + KERNEL_COST_CPU_SERVICE_BYTES + KERNEL_COST_CPU_LWIP_BYTES) };
 _Static_assert(cost_storage <= 96 * 1024, "cost aggregate budget");
 static void record(struct kernel_cost_tag tag, enum kernel_cost_metric metric, uint64_t value);
 static void register_cpu(struct kernel_cost_cpu *cpu)

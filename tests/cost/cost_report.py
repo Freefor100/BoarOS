@@ -27,13 +27,16 @@ def supported_schemas():
     admission_previous=current[:next(i for i,x in enumerate(current) if x[0]=='stream_admit_blocked')]
     allocator_previous=current[:next(i for i,x in enumerate(current) if x[0]=='page_meta_checked')]
     raw_previous=current[:next(i for i,x in enumerate(current) if x[0]=='raw_wait_ticks')]
+    network_storage_previous=current[:next(i for i,x in enumerate(current) if x[0]=='network_state_wait_ticks')]
     smp_previous=current[:next(i for i,x in enumerate(current) if x[0]=='lock21_attempts')]
     smp_initial=current[:next(i for i,x in enumerate(current) if x[0]=='journal_resource_retries')]
     # M1 already published journal stages/retries before the new lock ranks.
     # That complete frozen registry is not a prefix of the current registry.
     pre_smp=[metric for metric in current if not metric[0].startswith(
         ('lock21_','lock31_','lock32_','lock35_'))]
-    registries=(current,pre_smp,smp_initial,smp_previous,memory_previous,previous,stored_pipeline,journal,original,network_previous,admission_previous,resize_previous,allocator_previous,raw_previous)
+    pre_smp_previous=[metric for metric in network_storage_previous if not metric[0].startswith(
+        ('lock21_','lock31_','lock32_','lock35_'))]
+    registries=(current,network_storage_previous,pre_smp,pre_smp_previous,smp_initial,smp_previous,memory_previous,previous,stored_pipeline,journal,original,network_previous,admission_previous,resize_previous,allocator_previous,raw_previous)
     # Frozen historical snapshots retain their original metric names and
     # values. They are separate registries, never aliases in current output.
     historical=tuple([(name.replace('_precommit_body','_journal_write'),unit,hist)

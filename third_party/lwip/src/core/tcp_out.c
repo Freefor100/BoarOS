@@ -61,6 +61,7 @@
  */
 
 #include "lwip/opt.h"
+#include <kernel/cost.h>
 
 #if LWIP_TCP /* don't build if not configured for use in lwipopts.h */
 
@@ -392,6 +393,11 @@ tcp_write_cursor_copy(struct tcp_write_cursor *input, void *dst, u16_t len
 #endif
 )
 {
+#if BOAROS_COST_DIAGNOSTICS
+  struct kernel_cost_tag copy = kernel_cost_capture();
+  uint64_t started = copy.epoch ? kernel_cost_clock() : 0;
+  u16_t bytes = len;
+#endif
   u8_t *out = dst;
   while (len) {
     if (!input->left) tcp_write_cursor_refill(input);
@@ -402,6 +408,13 @@ tcp_write_cursor_copy(struct tcp_write_cursor *input, void *dst, u16_t len
     out += take;
     len -= take;
   }
+#if BOAROS_COST_DIAGNOSTICS
+  if (copy.epoch) {
+    uint64_t elapsed = kernel_cost_clock() - started;
+    kernel_cost_add_tag(copy, COST_NETWORK_COPY_BYTES, bytes);
+    kernel_cost_add_tag(copy, COST_NETWORK_COPY_TICKS, elapsed);
+  }
+#endif
 }
 
 #if TCP_CHECKSUM_ON_COPY
@@ -423,11 +436,25 @@ tcp_copy_segment(const struct tcp_pcb *pcb, u16_t length, u16_t maximum,
   LWIP_UNUSED_ARG(pcb); LWIP_UNUSED_ARG(maximum); LWIP_UNUSED_ARG(oversize);
   LWIP_UNUSED_ARG(apiflags); LWIP_UNUSED_ARG(first);
 #endif
+#if BOAROS_COST_DIAGNOSTICS
+  struct kernel_cost_tag allocation = kernel_cost_capture();
+  uint64_t started = allocation.epoch ? kernel_cost_clock() : 0;
+#endif
   struct pbuf *p = tcp_pbuf_prealloc(PBUF_TRANSPORT, length + optlen, maximum,
                                   oversize, pcb, apiflags, first);
-  if (!p) return NULL;
+  if (!p) {
+#if BOAROS_COST_DIAGNOSTICS
+    if (allocation.epoch)
+      kernel_cost_add_tag(allocation, COST_NETWORK_SEGMENT_ALLOC_TICKS, kernel_cost_clock() - started);
+#endif
+    return NULL;
+  }
   void *destination = (u8_t *)p->payload + optlen;
   struct tcp_seg *seg = tcp_alloc_segment(p, optlen, optflags);
+#if BOAROS_COST_DIAGNOSTICS
+  if (allocation.epoch)
+    kernel_cost_add_tag(allocation, COST_NETWORK_SEGMENT_ALLOC_TICKS, kernel_cost_clock() - started);
+#endif
   if (!seg) return NULL;
   if (vector) TCP_COPY_CURSOR(vector, destination, length, &seg->chksum, &seg->chksum_swapped);
   else TCP_DATA_COPY(destination, source, length, seg);
