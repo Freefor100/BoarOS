@@ -240,3 +240,7 @@ O_DIRECT等缺口按内核能力处理；CPU-time sleep及RLIMIT_CPU已接入，
 夹具现在以用户态更新版本和明确握手检查稳定窗口；查询跨越更新时，Linux 检查字段的合法来源，BoarOS 仍始终检查身份保护内的完整快照。固定Linux同ELF对照七项通过，Linux有307次混合快照，BoarOS为0。这是自有夹具的假设修正，不属于原LTP发布输入。固定源码路径为`kernel/sched/syscalls.c`中的`sched_getattr`及`__sched_setscheduler`。
 
 另一个假设是`pthread_join`返回后旧TID立即从PID索引消失。Linux可先通过clear_child_tid唤醒join，再撤下身份；夹具改为有界等待该身份结束，已有快照仍严格核对。相关功能结果与性能见[本批记录](cpu-accounting-cost.md#单一就绪队列与-rv-八核la-四核2026-11-04)。
+
+### 原RV glibc IOzone在通用main版本标识下的准备失败（2026-11-11）
+
+本次临时32/128MiB工作盘直接使用官方`/glibc/iozone`及原loader；通用main返回`uname.release=0.1.0-boaros-dev`，原glibc loader因要求Linux 4.15而打印`FATAL: kernel too old`，IOzone main尚未执行。compat当前已有`4.15.0`标识。有限性能对照对双方统一应用该既有compat常量后，原glibc/musl四个IOzone窗口均正常执行；没有改原ELF或libc，不分类为文件I/O错误。专用标识与输入身份见[本次数据路径记录](data-path-budget-experiments.md#2026-11-11共同路径候选与文件网络归因)。
