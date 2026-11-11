@@ -116,6 +116,77 @@ static void tcp_remove_sacks_gt(struct tcp_pcb *pcb, u32_t seq);
 #endif /* TCP_OOSEQ_BYTES_LIMIT || TCP_OOSEQ_PBUFS_LIMIT */
 #endif /* LWIP_TCP_SACK_OUT */
 
+/* Parsing mutates pbuf positions and wire fields. Delay it until the selected
+ * socket has accepted this packet, before any TCP state transition. */
+static int tcp_prepare_input(struct tcp_input_state *rx,struct pbuf *p,u8_t hdrlen_bytes)
+{
+  /* Move the payload pointer in the pbuf so that it points to the
+     TCP data instead of the TCP header. */
+  rx->tcphdr_optlen = (u16_t)(hdrlen_bytes - TCP_HLEN);
+  rx->tcphdr_opt2 = NULL;
+  if (p->len >= hdrlen_bytes) {
+    /* all options are in the first pbuf */
+    rx->tcphdr_opt1len = rx->tcphdr_optlen;
+    pbuf_remove_header(p, hdrlen_bytes); /* cannot fail */
+  } else {
+    u16_t opt2len;
+    /* TCP header fits into first pbuf, options don't - data is in the next pbuf */
+    /* there must be a next pbuf, due to hdrlen_bytes sanity check above */
+    LWIP_ASSERT("p->next != NULL", p->next != NULL);
+
+    /* advance over the TCP header (cannot fail) */
+    pbuf_remove_header(p, TCP_HLEN);
+
+    /* determine how long the first and second parts of the options are */
+    rx->tcphdr_opt1len = p->len;
+    opt2len = (u16_t)(rx->tcphdr_optlen - rx->tcphdr_opt1len);
+
+    /* options continue in the next pbuf: set p to zero length and hide the
+        options in the next pbuf (adjusting p->tot_len) */
+    pbuf_remove_header(p, rx->tcphdr_opt1len);
+
+    /* check that the options fit in the second pbuf */
+    if (opt2len > p->next->len) {
+      /* drop short packets */
+      LWIP_DEBUGF(TCP_INPUT_DEBUG, ("tcp_input: options overflow second pbuf (%"U16_F" bytes)\n", p->next->len));
+      TCP_STATS_INC(tcp.lenerr);
+      return 0;
+    }
+
+    /* remember the pointer to the second part of the options */
+    rx->tcphdr_opt2 = (u8_t *)p->next->payload;
+
+    /* advance p->next to point after the options, and manually
+        adjust p->tot_len to keep it consistent with the changed p->next */
+    pbuf_remove_header(p->next, opt2len);
+    p->tot_len = (u16_t)(p->tot_len - opt2len);
+
+    LWIP_ASSERT("p->len == 0", p->len == 0);
+    LWIP_ASSERT("p->tot_len == p->next->tot_len", p->tot_len == p->next->tot_len);
+  }
+
+  /* Convert fields in TCP header to host byte order. */
+  rx->tcphdr->src = lwip_ntohs(rx->tcphdr->src);
+  rx->tcphdr->dest = lwip_ntohs(rx->tcphdr->dest);
+  rx->seqno = rx->tcphdr->seqno = lwip_ntohl(rx->tcphdr->seqno);
+  rx->ackno = rx->tcphdr->ackno = lwip_ntohl(rx->tcphdr->ackno);
+  rx->tcphdr->wnd = lwip_ntohs(rx->tcphdr->wnd);
+
+  rx->flags = TCPH_FLAGS(rx->tcphdr);
+  rx->tcplen = p->tot_len;
+  if (rx->flags & (TCP_FIN | TCP_SYN)) {
+    rx->tcplen++;
+    if (rx->tcplen < p->tot_len) {
+      /* u16_t overflow, cannot handle this */
+      LWIP_DEBUGF(TCP_INPUT_DEBUG, ("tcp_input: length u16_t overflow, cannot handle this\n"));
+      TCP_STATS_INC(tcp.lenerr);
+      return 0;
+    }
+  }
+
+  return 1;
+}
+
 /**
  * The initial input processing of TCP. It verifies the TCP header, demultiplexes
  * the segment between the PCBs and passes it on to tcp_process(), which implements
@@ -127,7 +198,8 @@ static void tcp_remove_sacks_gt(struct tcp_pcb *pcb, u32_t seq);
  */
 static void
 tcp_input_on(struct pbuf *p, struct netif *inp, struct netif *dest,
-    const ip_addr_t *src, const ip_addr_t *dst, int owner_only)
+    const ip_addr_t *src, const ip_addr_t *dst, int owner_only,
+    const void *network,u16_t network_length)
 {
   struct tcp_input_state scratch;
   struct tcp_input_state *rx = &scratch;
@@ -200,70 +272,6 @@ tcp_input_on(struct pbuf *p, struct netif *inp, struct netif *dest,
     goto dropped;
   }
 
-  /* Move the payload pointer in the pbuf so that it points to the
-     TCP data instead of the TCP header. */
-  rx->tcphdr_optlen = (u16_t)(hdrlen_bytes - TCP_HLEN);
-  rx->tcphdr_opt2 = NULL;
-  if (p->len >= hdrlen_bytes) {
-    /* all options are in the first pbuf */
-    rx->tcphdr_opt1len = rx->tcphdr_optlen;
-    pbuf_remove_header(p, hdrlen_bytes); /* cannot fail */
-  } else {
-    u16_t opt2len;
-    /* TCP header fits into first pbuf, options don't - data is in the next pbuf */
-    /* there must be a next pbuf, due to hdrlen_bytes sanity check above */
-    LWIP_ASSERT("p->next != NULL", p->next != NULL);
-
-    /* advance over the TCP header (cannot fail) */
-    pbuf_remove_header(p, TCP_HLEN);
-
-    /* determine how long the first and second parts of the options are */
-    rx->tcphdr_opt1len = p->len;
-    opt2len = (u16_t)(rx->tcphdr_optlen - rx->tcphdr_opt1len);
-
-    /* options continue in the next pbuf: set p to zero length and hide the
-        options in the next pbuf (adjusting p->tot_len) */
-    pbuf_remove_header(p, rx->tcphdr_opt1len);
-
-    /* check that the options fit in the second pbuf */
-    if (opt2len > p->next->len) {
-      /* drop short packets */
-      LWIP_DEBUGF(TCP_INPUT_DEBUG, ("tcp_input: options overflow second pbuf (%"U16_F" bytes)\n", p->next->len));
-      TCP_STATS_INC(tcp.lenerr);
-      goto dropped;
-    }
-
-    /* remember the pointer to the second part of the options */
-    rx->tcphdr_opt2 = (u8_t *)p->next->payload;
-
-    /* advance p->next to point after the options, and manually
-        adjust p->tot_len to keep it consistent with the changed p->next */
-    pbuf_remove_header(p->next, opt2len);
-    p->tot_len = (u16_t)(p->tot_len - opt2len);
-
-    LWIP_ASSERT("p->len == 0", p->len == 0);
-    LWIP_ASSERT("p->tot_len == p->next->tot_len", p->tot_len == p->next->tot_len);
-  }
-
-  /* Convert fields in TCP header to host byte order. */
-  rx->tcphdr->src = lwip_ntohs(rx->tcphdr->src);
-  rx->tcphdr->dest = lwip_ntohs(rx->tcphdr->dest);
-  rx->seqno = rx->tcphdr->seqno = lwip_ntohl(rx->tcphdr->seqno);
-  rx->ackno = rx->tcphdr->ackno = lwip_ntohl(rx->tcphdr->ackno);
-  rx->tcphdr->wnd = lwip_ntohs(rx->tcphdr->wnd);
-
-  rx->flags = TCPH_FLAGS(rx->tcphdr);
-  rx->tcplen = p->tot_len;
-  if (rx->flags & (TCP_FIN | TCP_SYN)) {
-    rx->tcplen++;
-    if (rx->tcplen < p->tot_len) {
-      /* u16_t overflow, cannot handle this */
-      LWIP_DEBUGF(TCP_INPUT_DEBUG, ("tcp_input: length u16_t overflow, cannot handle this\n"));
-      TCP_STATS_INC(tcp.lenerr);
-      goto dropped;
-    }
-  }
-
   /* Demultiplex an incoming segment. First, we check if it is destined
      for an active connection. */
   prev = NULL;
@@ -280,8 +288,8 @@ tcp_input_on(struct pbuf *p, struct netif *inp, struct netif *dest,
       continue;
     }
 
-    if (pcb->remote_port == rx->tcphdr->src &&
-        pcb->local_port == rx->tcphdr->dest &&
+    if (pcb->remote_port == lwip_ntohs(rx->tcphdr->src) &&
+        pcb->local_port == lwip_ntohs(rx->tcphdr->dest) &&
         ip_addr_eq(&pcb->remote_ip, rx->src) &&
         ip_addr_eq(&pcb->local_ip, rx->dst)) {
       /* Move this PCB to the front of the list so that subsequent
@@ -313,14 +321,16 @@ tcp_input_on(struct pbuf *p, struct netif *inp, struct netif *dest,
         continue;
       }
 
-      if (pcb->remote_port == rx->tcphdr->src &&
-          pcb->local_port == rx->tcphdr->dest &&
+      if (pcb->remote_port == lwip_ntohs(rx->tcphdr->src) &&
+          pcb->local_port == lwip_ntohs(rx->tcphdr->dest) &&
           ip_addr_eq(&pcb->remote_ip, rx->src) &&
           ip_addr_eq(&pcb->local_ip, rx->dst)) {
         /* We don't really care enough to move this PCB to the front
            of the list since we are not very likely to receive that
            many segments for connections in TIME-WAIT. */
         LWIP_DEBUGF(TCP_INPUT_DEBUG, ("tcp_input: packed for TIME_WAITing connection.\n"));
+        if (!boaros_lwip_tcp_ingress_filter(pcb,p,inp,IP_IS_V6(dst),network,network_length,hdrlen_bytes) ||
+            !tcp_prepare_input(rx,p,hdrlen_bytes)) goto dropped;
 #ifdef LWIP_HOOK_TCP_INPACKET_PCB
         if (LWIP_HOOK_TCP_INPACKET_PCB(pcb, rx->tcphdr, rx->tcphdr_optlen, rx->tcphdr_opt1len,
                                        rx->tcphdr_opt2, p) == ERR_OK)
@@ -348,7 +358,7 @@ tcp_input_on(struct pbuf *p, struct netif *inp, struct netif *dest,
         continue;
       }
 
-      if (lpcb->local_port == rx->tcphdr->dest) {
+      if (lpcb->local_port == lwip_ntohs(rx->tcphdr->dest)) {
         if (IP_IS_ANY_TYPE_VAL(lpcb->local_ip)) {
           /* found an ANY TYPE (IPv4/IPv6) match */
 #if SO_REUSE
@@ -397,6 +407,8 @@ tcp_input_on(struct pbuf *p, struct netif *inp, struct netif *dest,
       }
 
       LWIP_DEBUGF(TCP_INPUT_DEBUG, ("tcp_input: packed for LISTENing connection.\n"));
+      if (!boaros_lwip_tcp_ingress_filter((struct tcp_pcb *)lpcb,p,inp,IP_IS_V6(dst),network,network_length,hdrlen_bytes) ||
+          !tcp_prepare_input(rx,p,hdrlen_bytes)) goto dropped;
 #ifdef LWIP_HOOK_TCP_INPACKET_PCB
       if (LWIP_HOOK_TCP_INPACKET_PCB((struct tcp_pcb *)lpcb, rx->tcphdr, rx->tcphdr_optlen,
                                      rx->tcphdr_opt1len, rx->tcphdr_opt2, p) == ERR_OK)
@@ -415,6 +427,10 @@ tcp_input_on(struct pbuf *p, struct netif *inp, struct netif *dest,
   LWIP_DEBUGF(TCP_INPUT_DEBUG, ("-+-+-+-+-+-+-+-+-+-+-+-+-+-+\n"));
 #endif /* TCP_INPUT_DEBUG */
 
+
+  if (!pcb && !tcp_prepare_input(rx,p,hdrlen_bytes)) goto dropped;
+  if (pcb && (!boaros_lwip_tcp_ingress_filter(pcb,p,inp,IP_IS_V6(dst),network,network_length,hdrlen_bytes) ||
+      !tcp_prepare_input(rx,p,hdrlen_bytes))) goto dropped;
 
 #ifdef LWIP_HOOK_TCP_INPACKET_PCB
   if ((pcb != NULL) && LWIP_HOOK_TCP_INPACKET_PCB(pcb, rx->tcphdr, rx->tcphdr_optlen,
@@ -630,15 +646,15 @@ tcp_input(struct pbuf *p, struct netif *inp)
 #ifdef BOAROS_LWIP_TCP_CONTEXT
   if (boaros_lwip_parallel_enabled() && boaros_lwip_tcp_dispatch(p, inp, src, dst)) return;
 #endif
-  tcp_input_on(p, inp, ip_current_netif(), src, dst, 0);
+  tcp_input_on(p, inp, ip_current_netif(), src, dst, 0,((const unsigned char *)ip_next_header_ptr()-ip_current_header_tot_len()),ip_current_header_tot_len());
 }
 
 #ifdef BOAROS_LWIP_TCP_CONTEXT
 void
 boaros_lwip_tcp_input_packet(struct pbuf *p, struct netif *inp,
-    const ip_addr_t *src, const ip_addr_t *dst)
+    const ip_addr_t *src, const ip_addr_t *dst,const void *network,u16_t network_length)
 {
-  tcp_input_on(p, inp, NULL, src, dst, 1);
+  tcp_input_on(p, inp, NULL, src, dst, 1,network,network_length);
 }
 #endif
 

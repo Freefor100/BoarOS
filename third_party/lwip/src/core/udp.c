@@ -363,6 +363,11 @@ udp_input(struct pbuf *p, struct netif *inp)
       }
     }
 #endif /* CHECKSUM_CHECK_UDP */
+    if (pcb && !boaros_lwip_udp_ingress_filter(pcb,p,inp,ip_current_is_v6(),
+        ((const unsigned char *)ip_next_header_ptr()-ip_current_header_tot_len()),ip_current_header_tot_len(),UDP_HLEN)) {
+      pbuf_free(p);
+      goto end;
+    }
     if (pbuf_remove_header(p, UDP_HLEN)) {
       /* Can we cope with this failing? Just assert for now */
       LWIP_ASSERT("pbuf_remove_header failed", 0);

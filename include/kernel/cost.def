@@ -326,3 +326,12 @@ X(LOCK45_CANCELLED, lock45_cancelled, count, 0)
 /* Existing observed cache requests, once for each actual CPU0 window. */
 X(CACHE_QUEUE_NS, cache_queue_ns, ns, 1)
 X(CACHE_EXECUTE_NS, cache_execute_ns, ns, 1)
+/* Network endpoint qualification, shared lwIP storage, and final-pbuf COPY. */
+X(NETWORK_STATE_WAIT_TICKS, network_state_wait_ticks, ticks, 0)
+X(NETWORK_STATE_HOLD_TICKS, network_state_hold_ticks, ticks, 0)
+X(NETWORK_POOL_WAIT_TICKS, network_pool_wait_ticks, ticks, 0)
+X(NETWORK_POOL_HOLD_TICKS, network_pool_hold_ticks, ticks, 0)
+X(NETWORK_PREPARE_TICKS, network_prepare_ticks, ticks, 0)
+X(NETWORK_SEGMENT_ALLOC_TICKS, network_segment_alloc_ticks, ticks, 0)
+X(NETWORK_COPY_BYTES, network_copy_bytes, bytes, 0)
+X(NETWORK_COPY_TICKS, network_copy_ticks, ticks, 0)

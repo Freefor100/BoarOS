@@ -945,6 +945,20 @@ static int node_pressure(const struct kernel_vfs_node *node,struct kernel_page_c
     if (domain && domain_bytes(domain)>=(domain_limit(domain,low))) return 1;
     return __atomic_load_n(&record->group->dirty,__ATOMIC_RELAXED)>=(low?record->dirty_low:record->dirty_high);
 }
+#if BOAROS_MAX_CPUS > 1
+enum { DIRTY_BATCH_OWNED=1, DIRTY_BATCH_REVISIT=2 };
+static void dirty_batch_return(struct kernel_page_cache_record *r,struct kernel_vfs_node *node)
+{
+    struct kernel_page_cache_dirty *dirty=kernel_vfs_node_dirty_pages(node);
+    unsigned state=dirty->batch_state;
+    if (!(state&DIRTY_BATCH_OWNED)) __builtin_trap();
+    dirty->batch_state=0;
+    if ((state&DIRTY_BATCH_REVISIT) && dirty->count && !r->stopping) {
+        r->requested=1;
+        cache_wake(&r->work);
+    }
+}
+#endif
 static size_t dirty_batch(struct kernel_page_cache_record *r,struct kernel_page_cache_entry **batch,int all)
 {
     size_t count=0;unsigned scanned=0;
@@ -961,6 +975,14 @@ static size_t dirty_batch(struct kernel_page_cache_record *r,struct kernel_page_
             continue;
         }
         if (count && entry->node!=batch[0]->node) break;
+#if BOAROS_MAX_CPUS > 1
+        if (dirty->batch_state) {
+            dirty->batch_state|=DIRTY_BATCH_REVISIT;
+            uint64_t skip=dirty->count<r->dirty_remaining?dirty->count:r->dirty_remaining;
+            r->dirty_remaining-=skip;r->dirty_cursor=dirty->queue_next;r->dirty_scan_index=0;scanned++;
+            continue;
+        }
+#endif
         while (entry && r->dirty_remaining && scanned<64 && count<capacity) {
             r->dirty_scan_index=entry->page_index+1;
             r->dirty_remaining--;scanned++;r->statistics.worker_scanned++;
@@ -1953,7 +1975,7 @@ static void readahead_load(struct kernel_page_cache *cache, struct readahead_job
         int found;
         { CACHE_SCOPE(lookup, cache); found=index_find(plan->node,index)!=NULL; }
         if (found) continue;
-        struct kernel_page_cache_entry *entry;
+        struct kernel_page_cache_entry *entry=NULL;
         if (allocate_entry(cache, plan->node, index, 0, &entry)) break;
         entries[candidates] = entry;
         spans[candidates++] = (struct file_read_span){index << BOAROS_PAGE_SHIFT, entry->data, BOAROS_PAGE_SIZE, 0, 0};
@@ -3243,7 +3265,7 @@ struct write_admission_request {
     struct kernel_vfs_node *progress;
 #endif
     struct writeback_workspace *workspace;
-    int caller_writeback;
+    int caller_writeback, independent_batch, advanced;
     int result;
 };
 static void write_admission_window(void *argument)
@@ -3263,25 +3285,47 @@ static void write_admission_window(void *argument)
     {
         CACHE_SCOPE(guard,cache);
         if (request->caller_writeback && r->stopping) {request->result=-KERNEL_EIO;return;}
-        struct kernel_page_cache_dirty *dirty=r->dirty_head;
-        struct kernel_page_cache_entry *entry=NULL;
-        while (dirty) {
+        struct kernel_page_cache_dirty *dirty;
+        struct kernel_page_cache_entry *entry;
+#if BOAROS_MAX_CPUS > 1
+        if (request->independent_batch) {
+            /* First try the caller's inode. When it is clean or busy, claim a
+             * bounded window of another idle inode on the same device. */
+            struct kernel_page_cache_dirty *own=kernel_vfs_node_dirty_pages(request->node);
+            dirty=own;
+            for (unsigned checked=0;dirty && checked<16;checked++) {
+                entry=RB_MIN(kernel_page_cache_dirty_tree,&dirty->tree);
+                if (entry && !dirty->batch_state && !entry_loading(entry) && !entry->writeback &&
+                    !__atomic_load_n(&entry->writes,__ATOMIC_RELAXED) &&
+                    entry->node->instance->writeback.domain==request->node->instance->writeback.domain &&
+                    entry->node->instance->ops->file_operation_execution==KERNEL_VFS_EXECUTION_CALLER) break;
+                dirty=checked ? dirty->queue_next : r->dirty_head;
+                entry=NULL;
+            }
+        } else
+#endif
+        for (dirty=r->dirty_head;dirty;dirty=dirty->queue_next) {
             entry=RB_MIN(kernel_page_cache_dirty_tree,&dirty->tree);
             if (entry && entry->node->instance->writeback.domain==request->node->instance->writeback.domain &&
                 (!request->caller_writeback ||
                  entry->node->instance->ops->file_operation_execution==KERNEL_VFS_EXECUTION_CALLER)) break;
-            dirty=dirty->queue_next;
         }
         if (dirty) {
             while (entry && count<capacity) {
+                if (request->independent_batch && (entry_loading(entry) || entry->writeback ||
+                    __atomic_load_n(&entry->writes,__ATOMIC_RELAXED))) break;
                 selected[count++]=entry;entry_borrow(entry);
                 entry=RB_NEXT(kernel_page_cache_dirty_tree,&dirty->tree,entry);
             }
+#if BOAROS_MAX_CPUS > 1
+            if (count && request->independent_batch) dirty->batch_state=DIRTY_BATCH_OWNED;
+#endif
         }
     }
     if (count) {
         size_t used;
         int error=writeback_run(cache,selected,count,UINT64_MAX,&used,workspace);
+        request->advanced=!error && used!=0;
         /* 写回已把错误记在实际inode；不能把A的空间/I/O错误归给B的覆盖写。
          * 失败队首仍保留脏owner，但移到队尾，让后面的可回收数据取得进展。 */
         if (selected[0]->node==request->node && error!=-KERNEL_EBUSY && error!=-KERNEL_ENOMEM)
@@ -3294,6 +3338,9 @@ static void write_admission_window(void *argument)
 #endif
         CACHE_SCOPE(guard,cache);
         struct kernel_page_cache_dirty *dirty=kernel_vfs_node_dirty_pages(selected[0]->node);
+#if BOAROS_MAX_CPUS > 1
+        if (request->independent_batch) dirty_batch_return(r,selected[0]->node);
+#endif
         if (error && dirty->queue_next) {
             if (dirty->queue_previous) dirty->queue_previous->queue_next=dirty->queue_next;
             else r->dirty_head=dirty->queue_next;
@@ -3304,6 +3351,20 @@ static void write_admission_window(void *argument)
         for (size_t i=0;i<count;i++) entry_return(selected[i]);
     }
     reclaim_window_memory(cache);
+}
+
+static void write_admission_local(struct write_admission_request *request)
+{
+    union foreground_workspace *lease=foreground_workspace_take(request->cache);
+    struct writeback_workspace work;
+    if (lease) {
+        work=(struct writeback_workspace){.prepared=lease->writeback.prepared,
+            .spans=lease->writeback.spans,.selected=lease->writeback.selected};
+        request->workspace=&work;
+    }
+    write_admission_window(request);
+    request->workspace=NULL;
+    if (lease) foreground_workspace_put(request->cache,lease);
 }
 static int write_admission(struct kernel_page_cache *cache,struct kernel_vfs_node *node)
 {
@@ -3322,13 +3383,23 @@ static int write_admission(struct kernel_page_cache *cache,struct kernel_vfs_nod
     if (available<r->high) (void)kernel_page_cache_reclaim(cache,r->high-available);
     int executor=kernel_page_cache_is_executor(cache);
     struct kernel_writeback_domain *domain=node->instance->writeback.domain;
-    /* 有足够物理内存时，只差本设备额度的写者自己推进本设备的一批
-     * 脏页。单设备和全局低内存继续使用后台预留的控制区。 */
-    int caller_writeback=!executor && domain && domain->device &&
-        __atomic_load_n(&r->group->domain_count,__ATOMIC_RELAXED)>1 &&
-        domain_bytes(domain)>=domain_limit(domain,0) &&
+    int can_help=!executor && domain && domain->device &&
         physical_page_available(cache->allocator)>=r->high &&
         node->instance->ops->file_operation_execution==KERNEL_VFS_EXECUTION_CALLER;
+    int caller_writeback=can_help && domain_bytes(domain)>=domain_limit(domain,0) &&
+        __atomic_load_n(&r->group->domain_count,__ATOMIC_RELAXED)>1;
+    struct write_admission_request request={.cache=cache,.node=node,.caller_writeback=caller_writeback};
+#if BOAROS_MAX_CPUS > 1
+    /* Only dirty-data pressure warrants helping here. If pinned versions or
+     * journal metadata consume the budget, wait for their actual owner. */
+    if (can_help && !caller_writeback && kernel_cpu_get_boot_count()>1 &&
+        __atomic_load_n(&domain->dirty_bytes,__ATOMIC_RELAXED)>=domain_limit(domain,0)) {
+        request.caller_writeback=request.independent_batch=1;
+        write_admission_local(&request);
+        if (request.advanced || request.result) goto completed;
+        request.caller_writeback=request.independent_batch=0;
+    }
+#endif
     if (!executor && !caller_writeback &&
         physical_page_available(cache->allocator)>=r->high && node_pressure(node,r,0)) {
         /* 额度归还由跨cache的共同owner通知；dirty转为借出的版本不算归还。
@@ -3359,22 +3430,15 @@ static int write_admission(struct kernel_page_cache *cache,struct kernel_vfs_nod
         }
         if (physical_page_available(cache->allocator)>r->low && !node_pressure(node,r,0)) return 0;
     }
-    struct write_admission_request request={.cache=cache,.node=node,.caller_writeback=caller_writeback};
     /* 这里只借用缓存owner与调用栈；worker不取得调用者的OFD/写操作锁。
      * 保留整次write互斥，仍允许独立worker取得inode后推进一批写回。 */
-    if (caller_writeback) {
-        union foreground_workspace *lease=foreground_workspace_take(cache);
-        struct writeback_workspace work;
-        if (lease) {
-            work=(struct writeback_workspace){.prepared=lease->writeback.prepared,
-                .spans=lease->writeback.spans,.selected=lease->writeback.selected};
-            request.workspace=&work;
-        }
-        write_admission_window(&request);
-        if (lease) foreground_workspace_put(cache,lease);
-    } else if (!executor) {
+    if (caller_writeback) write_admission_local(&request);
+    else if (!executor) {
         if (run_request(cache,write_admission_window,&request,1,NULL)) request.result=-KERNEL_EIO;
     } else write_admission_window(&request);
+#if BOAROS_MAX_CPUS > 1
+completed:
+#endif
 #if BOAROS_PAGE_CACHE_BACKGROUND_PERCENT < 100
     /* quota先等已有提交归还版本；健康running组继续合并。物理余量低于
      * 回收目标线时允许结束running组，避免空等不可回收的版本。
@@ -3832,6 +3896,9 @@ static void cache_background(struct kernel_page_cache *cache)
             CACHE_SCOPE(guard,cache);
             if (r->stopping) break;
             count = dirty_batch(r,batch,force || physical_page_available(cache->allocator)<=r->low);
+#if BOAROS_MAX_CPUS > 1
+            if (count) kernel_vfs_node_dirty_pages(batch[0]->node)->batch_state=DIRTY_BATCH_OWNED;
+#endif
             if (!count && (!r->dirty_cursor || !r->dirty_remaining)) break;
         }
         if (count) {
@@ -3841,6 +3908,9 @@ static void cache_background(struct kernel_page_cache *cache)
                 CACHE_SCOPE(guard,cache);
                 if (!result) r->statistics.worker_written+=used;
                 else if (result!=-KERNEL_EBUSY && result!=-KERNEL_ENOMEM) r->statistics.worker_failed+=used;
+#if BOAROS_MAX_CPUS > 1
+                dirty_batch_return(r,batch[0]->node);
+#endif
                 for (size_t i=0;i<count;i++) entry_return(batch[i]);
             }
             reclaim_window_memory(cache);

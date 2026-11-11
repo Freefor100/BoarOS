@@ -21,6 +21,7 @@
 #define LINUX_CLOCK_MONOTONIC 1U
 #define LINUX_CLOCK_REALTIME_COARSE 5U
 #define LINUX_CLOCK_MONOTONIC_COARSE 6U
+#define LINUX_CLOCK_BOOTTIME 7U
 #define LINUX_CLOCK_NSECS_PER_SEC UINT64_C(1000000000)
 #define LINUX_TIMER_ABSTIME UINT64_C(1)
 
@@ -87,6 +88,7 @@ static int syscall_clock_id_coarse(uint64_t clock_id)
 static int syscall_clock_id_valid(uint64_t clock_id)
 {
     return clock_id == LINUX_CLOCK_REALTIME || clock_id == LINUX_CLOCK_MONOTONIC ||
+           clock_id == LINUX_CLOCK_BOOTTIME ||
            syscall_clock_id_coarse(clock_id);
 }
 
@@ -146,6 +148,8 @@ enum kernel_syscall_status syscall_handle_clock_gettime(
         }
     } else switch (clock) {
     case LINUX_CLOCK_REALTIME: nanoseconds = kernel_time_realtime_ns(); break;
+    /* No suspend support: boottime has no suspended interval to add. */
+    case LINUX_CLOCK_BOOTTIME:
     case LINUX_CLOCK_MONOTONIC: nanoseconds = kernel_time_monotonic_ns(); break;
     case LINUX_CLOCK_REALTIME_COARSE: nanoseconds = kernel_time_coarse_realtime_ns(); break;
     default: nanoseconds = kernel_time_coarse_monotonic_ns(); break;

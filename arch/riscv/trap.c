@@ -15,6 +15,7 @@
 #include <kernel/signal.h>
 #include <arch/riscv/signal.h>
 #include <kernel/syscall.h>
+#include <kernel/bpf.h>
 #include <kernel/time.h>
 #include <kernel/task.h>
 #include <kernel/tick.h>
@@ -261,6 +262,7 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
             },
         };
         struct kernel_syscall_result result;
+        kernel_bpf_trace_enter(caller,(int32_t)request.number,request.arguments);
 #if BOAROS_USER_SMP
         kernel_cpu_current()->syscall_dispatches++;
 #endif
@@ -287,6 +289,7 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
             if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) {
                 riscv_scheduler_fatal(frame, scheduler_status);
             }
+            kernel_bpf_trace_exit(kernel_task_current(),(int32_t)request.number,0);
             return;
         }
         if (result.action == KERNEL_SYSCALL_ACTION_CLONE) {
@@ -347,11 +350,13 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
         }
         if (result.action == KERNEL_SYSCALL_ACTION_SIGNAL_RETURN) {
             riscv_signal_restore_current(frame);
+            kernel_bpf_trace_exit(kernel_task_current(),(int32_t)frame->a7,(int64_t)frame->a0);
             return;
         }
         if (result.action != KERNEL_SYSCALL_ACTION_RETURN) {
             riscv_trap_fatal(frame);
         }
+        kernel_bpf_trace_exit(kernel_task_current(),(int32_t)request.number,result.value);
         if (result.value == -KERNEL_ERESTARTSYS) {
             kernel_signal_note_syscall_restart(kernel_task_current());
             return;
@@ -425,4 +430,12 @@ void riscv_trap_bad_return(struct riscv_trap_frame *frame)
     virt_uart_putc('\n');
 
     sbi_shutdown();
+}
+
+/* Only the first user trampoline calls this. Clone preserves its syscall
+ * number in the child frame; the initial process frame has a zero number. */
+void riscv_bpf_first_return(struct riscv_trap_frame *frame)
+{
+    if(frame->a7==220 || frame->a7==435)
+        kernel_bpf_trace_exit(kernel_task_current(),frame->a7,0);
 }

@@ -225,11 +225,17 @@ int kernel_pidfd_wait_target(struct kernel_files *files,int32_t fd,struct kernel
     KERNEL_FILES_PIN_SCOPE(pin);
     struct kernel_open_file_description *file=kernel_files_hold_fd(files,fd,&pin);
     if(!file || file->kind!=KERNEL_OPEN_FILE_KIND_PIDFD)return -KERNEL_EBADF;
-    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-    *owner=((struct pidfd_file *)file)->observer->identity;
-    kernel_pid_get(*owner);
+    *owner=kernel_pidfd_identity_ref(file);
     *nonblock=!!(kernel_open_file_flags(file)&PIDFD_NONBLOCK);
     return 0;
+}
+struct kernel_pid *kernel_pidfd_identity_ref(const struct kernel_open_file_description *file)
+{
+    if (!file || file->kind!=KERNEL_OPEN_FILE_KIND_PIDFD) return NULL;
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    struct kernel_pid *id=((const struct pidfd_file *)file)->observer->identity;
+    kernel_pid_get(id);
+    return id;
 }
 int kernel_pidfd_signal_target(struct kernel_task *caller,int32_t fd,uint32_t flags,
     struct kernel_pid **owner,unsigned *selected_scope)

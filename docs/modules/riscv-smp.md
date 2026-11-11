@@ -1,6 +1,6 @@
 # RV 多核执行与服务边界
 
-RV/LA默认交付均为单CPU；LA另有[真实多核构建](loongarch-boot.md#多核执行)。`kernel-rv-smp` 提供多核调度及显式绑定 MM/files 的内核任务；`USER_SMP` 另开放真实用户执行。SMP 默认容量为两核，`SMP_CPUS=4/8` 分别使用独立产物，最多支持实际启动八核。普通与受控 MM、页缓存、FD/OFD 使用同一保护与引用规则，任务创建时仅检查受控消费者的范围。普通系统分配器的压力挂钩可由远端调用者发布工作，干净回收只尝试取得缓存保护，实际写回继续由既有 CPU0 worker 完成。两种配置中的 ext4 读、文件空间修改、同步准备、路径和目录操作可在各发起核执行；挂载管理、设备配置和网络业务按下述边界推进。
+RV/LA默认交付均为单CPU；LA另有[真实多核构建](loongarch-boot.md#多核执行)。`kernel-rv-smp` 提供多核调度及显式绑定 MM/files 的内核任务；`USER_SMP` 另开放真实用户执行。SMP 默认容量为两核，`SMP_CPUS=4/8` 分别使用独立产物，最多支持实际启动八核。普通与受控 MM、页缓存、FD/OFD 使用同一保护与引用规则，任务创建时仅检查受控消费者的范围。普通系统分配器的压力挂钩可由远端调用者发布工作，干净回收只尝试取得缓存保护，页缓存后台数据写回继续由 CPU0 worker 完成；ext4 日志提交与 checkpoint 按挂载和在线核数选核。已建立的 TCP 连接由各归属核推进。两种配置中的 ext4 读、文件空间修改、同步准备、路径和目录操作可在各发起核执行；挂载管理、设备配置和网络业务按下述边界推进。
 
 ## 真实用户态与CPU0业务交接
 
@@ -60,9 +60,9 @@ make test-user-smp-composition-riscv QEMU_RISCV_FIRMWARE=/absolute/fw_dynamic.bi
 
 COST_DIAGNOSTICS配置才保存CPU1→CPU0交接等待ticks、含阻塞的服务elapsed ticks、按实际执行owner结算的running ns；整数时钟单位与运行耗时不同。普通构建不持有这些服务计时字段，调度资格由实际CPU/current与服务状态维护，不依赖迁移计数。ext4 前台文件与目录元数据在发起 CPU 执行，日志线程的选核见 [VFS 与 ext4](vfs-ext4.md)。设备配置、网络控制和其他文件系统命名空间沿各自 CPU0 范围执行；TCP 发送接纳的本地条件见[网络](kernel-network.md)。分配器通知和同步干净回收可就地执行。LA的真实多核沿用共同保护与执行策略，架构边界见[LA多核](loongarch-boot.md#多核执行)。
 
-futex 的等待、唤醒、比较重排与复合唤醒在发起 CPU 执行。MM 准备统一取得等待键与用户字 pin，桶操作锁序列化比较、登记和迁移，实际等待队列短锁维护节点；COMMITTED唤醒、READY与旧栈交接继续由共同调度保护协调，退出清理与远端唤醒沿同一协议。具体行为见[调度模块](kernel-scheduler.md#等待与-futex)。
+futex 的等待、唤醒、比较重排与复合唤醒在发起 CPU 执行。MM 准备统一取得等待键与用户字 pin，桶操作锁序列化比较、登记和迁移，实际等待队列短锁维护节点；普通无期限唤醒、READY 与旧栈交接使用目标核队列保护，有期限等待与其他控制使用共同调度保护，退出清理与远端唤醒沿同一协议。具体行为见[调度模块](kernel-scheduler.md#等待与-futex)。
 
-socket 普通收发在实际发起 CPU 完成队列预约、用户复制、发送额度接纳与等待。TCP COPY、UDP pbuf 准备/发送仍交给已有 CPU0 worker；请求及 pin 由调用者保留到结果发布。控制与最终销毁继续在 CPU0，远端 epoll 通知持有真实等待游标借用。具体状态和停止规则见[网络模块](kernel-network.md#发起-cpu-与等待寿命)。
+socket 普通收发在实际发起 CPU 完成队列预约、用户复制、发送额度接纳与等待。已建立的 TCP 连接在归属核推进；发送接纳可借用该核协议资格在调用核完成，竞争时交给归属核。UDP pbuf 准备和发送仍走 CPU0；控制与销毁沿各对象的执行资格，远端 epoll 通知持有真实等待游标借用。具体状态和停止规则见[网络模块](kernel-network.md#发起-cpu-与等待寿命)。
 
 ## 启动与本地状态
 
@@ -82,7 +82,7 @@ coarse time、load、等待期限和服务轮询。任意 secondary 新增期限
 
 ## 调度与资源
 
-统一 rank40 短锁保护每 CPU 的实际执行队列和执行 owner。每个 READY 任务只有一个内嵌 `ready_node`，尾部 `ready_cpu` 指向其唯一队列 owner；CPU0 实时服务使用同一个节点进入独立服务队列，来源实时保留节点只维护逻辑用户资格。没有全局重复就绪表或逐 CPU 资格节点。新任务与 wake 按有效 affinity、服务与保留资格选择空闲或较轻执行者，只通知该目标；同负载依次优先最后执行 CPU、调用 CPU、较小逻辑 ID。yield/时间片轮转留在本核 FIFO，优先级变更只更新实际 owner；空闲或阻塞的 CPU 可从异核队列取得最高优先级的合格 off-CPU 任务。具体放置与交接见[调度模块](kernel-scheduler.md)。
+每核 rank42 短锁保护该 CPU 的实际执行队列、运行所有权和旧栈交接；rank40 共同控制锁保护身份、期限和实时资格。每个 READY 任务只有一个内嵌 `ready_node`，尾部 `ready_cpu` 指向其唯一队列 owner；CPU0 实时服务使用同一个节点进入独立服务队列，来源实时保留节点只维护逻辑用户资格。没有全局重复就绪表或逐 CPU 资格节点。新任务与 wake 按有效 affinity、服务与保留资格选择空闲或较轻执行者，只通知该目标；同负载依次优先最后执行 CPU、调用 CPU、较小逻辑 ID。yield/时间片轮转留在本核 FIFO，优先级变更只更新实际 owner；空闲或阻塞的 CPU 可从异核队列取得最高优先级的合格 off-CPU 任务。具体放置与交接见[调度模块](kernel-scheduler.md)。
 普通创建接口默认CPU0；`kernel_thread_create_joinable_mask()`只供CPU0创建带join owner的受控任务。
 可睡眠的私有准备不取得已发布owner；最终rank40接纳点重查CPU在线状态，失效时锁外回滚且不发布join。
 `kernel_thread_set_cpu_mask()`要求受控任务已BLOCKED、off_cpu且没有runnable/pending成员，否则BUSY。
@@ -242,7 +242,7 @@ make test-mm-disk-smp-userland-riscv INIT_CONFIG=config/init.json \
 
 ## 共享 FD 表与匿名 pipe
 
-`kernel_thread_create_joinable_files()`在CPU0准备独立MM/files引用，最终任务发布移入这些handle；创建失败完整归还。控制者只持record引用，不额外持端点，因此真实最后关闭能产生EOF/EPIPE。退出在可信栈释放handle；匿名pipe末OFD可在CPU1归还，普通文件后端仍由CPU0完成最后释放。域校验与FD/pipe协议见[文件接口](kernel-files.md)。
+`kernel_thread_create_joinable_files()`在CPU0准备独立MM/files引用，最终任务发布移入这些handle；创建失败完整归还。控制者只持record引用，不额外持端点，因此真实最后关闭能产生EOF/EPIPE。退出在可信栈释放handle；匿名pipe末OFD可在CPU1归还，需要服务资格的后端由 CPU0 完成最后释放，普通 ext4 可在实际调用核关闭。域校验与FD/pipe协议见[文件接口](kernel-files.md)。
 
 ```sh
 make test-files-concurrency-host test-pipe-concurrency-host

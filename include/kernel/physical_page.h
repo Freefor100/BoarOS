@@ -116,6 +116,12 @@ enum physical_page_status physical_page_allocate_order(
     uint32_t order,
     uint64_t *address);
 
+/* Allocate 2^order contiguous pages, each with its own order-zero reference.
+ * mmap backing can share/release each page independently. No owners escape on
+ * failure; success must be released page-by-page, not with release_order. */
+enum physical_page_status physical_page_allocate_contiguous(
+    struct physical_page_allocator *allocator, uint32_t order, uint64_t *address);
+
 enum physical_page_status physical_page_release(
     struct physical_page_allocator *allocator,
     uint64_t address);
@@ -139,6 +145,11 @@ enum physical_page_status physical_page_release_order(
     struct physical_page_allocator *allocator,
     uint64_t address,
     uint32_t order);
+
+/* Return the actual order while releasing an owned buddy head. Corrupt or
+ * non-head input is fatal, as with release_order; discovery and release share
+ * one allocator critical section and the same complete buddy validation. */
+uint32_t physical_page_release_allocation(struct physical_page_allocator *, uint64_t address);
 
 /* Return the order stored on an allocated buddy head. */
 enum physical_page_status physical_page_allocation_order(

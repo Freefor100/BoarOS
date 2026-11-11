@@ -233,14 +233,15 @@ enum arch_mmu_status arch_mmu_user_prepare_move(struct arch_mmu_user_space *s,
 enum arch_mmu_status arch_mmu_user_map_prepared_page(struct arch_mmu_user_space *s,
     uint64_t v, uint64_t physical, uint32_t permissions, struct kernel_mm_leaf_preparation *prepared)
 {
-    if (!live(s) || !permissions || (permissions & ~7U) || !physical ||
+    if (!live(s) || (permissions & ~7U) || !physical ||
         physical > PTE_ADDRESS || (physical & BOAROS_PAGE_MASK)) return ARCH_MMU_STATUS_INVALID;
-    if (s->leaf_pages == UINT32_MAX) return ARCH_MMU_STATUS_STATE;
+    if ((permissions ? s->leaf_pages : s->protected_pages) == UINT32_MAX) return ARCH_MMU_STATUS_STATE;
     (void)table(s, physical);
     enum arch_mmu_status status = install_prepared_leaf(s, v,
         encode(physical, permissions, 0), prepared);
     if (status) return status;
-    s->leaf_pages++; resident_peak(s);
+    if (permissions) s->leaf_pages++; else s->protected_pages++;
+    resident_peak(s);
     return ARCH_MMU_STATUS_OK;
 }
 enum arch_mmu_status arch_mmu_user_move_leaf(struct arch_mmu_user_space *s,

@@ -17,6 +17,8 @@ _start:
     /* The first slice has no interrupt handlers, so establish that state. */
     csrw sie, zero
     csrci sstatus, 2
+    /* 用户 vDSO 只能读取 time，不开放 cycle 或 instret。 */
+    csrwi scounteren, 2
 
     la t0, __bss_start
     la t1, __bss_end

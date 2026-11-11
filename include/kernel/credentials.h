@@ -24,7 +24,7 @@ enum kernel_capability {
     KERNEL_CAP_SYS_RESOURCE=24, KERNEL_CAP_SYS_TIME=25,
     KERNEL_CAP_SYS_TTY_CONFIG=26, KERNEL_CAP_MKNOD=27,
     KERNEL_CAP_SETFCAP=31, KERNEL_CAP_MAC_OVERRIDE=32,
-    KERNEL_CAP_SYSLOG=34,
+    KERNEL_CAP_SYSLOG=34, KERNEL_CAP_PERFMON=38, KERNEL_CAP_BPF=39,
 };
 #define KERNEL_SECBIT_NOROOT UINT32_C(1)
 #define KERNEL_SECBIT_NO_SETUID_FIXUP UINT32_C(4)
@@ -41,6 +41,7 @@ struct kernel_uid_account {
     uint64_t unix_inflight; /* AF_UNIX queued descriptors, protected by socket state lock. */
     uint64_t shm_locked_pages; /* SHM_LOCK quota, protected by kernel_wait_domain. */
     uint32_t uid;
+    unsigned inotify_groups, inotify_marks; /* Protected by the notification index. */
     uint64_t mqueue_bytes, pipe_pages; /* 创建者账户；仅创建、调整及最终释放计量。 */
 };
 struct kernel_credential_groups {

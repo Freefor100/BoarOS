@@ -43,7 +43,11 @@ UNUSED_SOCKET_API(void, udp_remove, struct udp_pcb *)
 UNUSED_SOCKET_API(err_t, udp_send, struct udp_pcb *, struct pbuf *)
 UNUSED_SOCKET_API(err_t, udp_sendto, struct udp_pcb *, struct pbuf *, const ip_addr_t *, u16_t)
 UNUSED_SOCKET_API(struct pbuf *, pbuf_alloc, pbuf_layer, u16_t, pbuf_type)
-UNUSED_SOCKET_API(u8_t, pbuf_free, struct pbuf *)
+UNUSED_SOCKET_API(void, pbuf_realloc, struct pbuf *, u16_t)
+UNUSED_SOCKET_API(u16_t, pbuf_copy_partial, const struct pbuf *, void *, u16_t, u16_t)
+UNUSED_SOCKET_API(void, kernel_bpf_program_get, struct kernel_bpf_program *)
+UNUSED_SOCKET_API(void, kernel_bpf_program_put, struct kernel_bpf_program *)
+UNUSED_SOCKET_API(uint32_t, kernel_bpf_filter, struct kernel_bpf_program *, const struct kernel_bpf_packet *)
 UNUSED_SOCKET_API(u32_t, sys_now, void)
 UNUSED_SOCKET_API(u32_t, sys_timeouts_sleeptime, void)
 UNUSED_SOCKET_API(unsigned, sys_check_timeouts_budget, unsigned)
@@ -59,12 +63,24 @@ static char shard_order[4];
 static struct tcp_seg shard_unsent;
 static struct pbuf *shard_loop_source;
 static struct pbuf shard_loop_clone;
-static unsigned shard_forbid_route;
+static unsigned shard_forbid_route, shard_revoke_loop, shard_clone_freed;
 u16_t boaros_lwip_tcp_detached_mss(const struct tcp_pcb *pcb) { return pcb->mss; }
 u16_t lwip_htons(u16_t x) { return (u16_t)((x<<8)|(x>>8)); }
+u8_t pbuf_free(struct pbuf *p)
+{
+    assert(p==&shard_loop_clone && shard_revoke_loop && !active->raw_locks);
+    shard_clone_freed++;
+    return 1;
+}
 struct pbuf *pbuf_clone_shared(pbuf_layer layer, struct pbuf *p, u16_t head)
 {
     assert(layer==PBUF_RAW && p==shard_loop_source && head==TCP_HLEN && !active->raw_locks);
+    if (shard_revoke_loop) {
+        struct kernel_cpu *source=active;
+        active=&cpus[0];
+        fast_loopback_revoke(fast_loopback);
+        active=source;
+    }
     return &shard_loop_clone;
 }
 
@@ -117,6 +133,7 @@ static void socket_shard_copy_cases(void)
     scheduler.initialized=KERNEL_SCHEDULER_INITIALIZED;
     struct socket_tcp_owner *owner=tcp_owner_at(1);
     owner->index=1;
+    kernel_raw_lock_init(&owner->ingress,KERNEL_RAW_RANK_OBJECT+1);
     kernel_mutex_init(&owner->mutex,26,(uintptr_t)&owner->mutex);
     kernel_wait_queue_init(&owner->work);
     tcp_owner_count=1; boaros_lwip_parallel=1;
@@ -195,7 +212,7 @@ static void socket_shard_loopback_case(void)
       tx.boaros_route_next=&rx;
       tcp_routes[bucket]=&tx; }
     assert(tx.boaros_loopback_peer==&rx && rx.boaros_loopback_peer==&tx);
-    struct netif loop={0};fast_loopback=&loop;fast_loopback_available=1;
+    struct netif loop={0};fast_loopback=&loop;fast_loopback_state=LOOPBACK_AVAILABLE;
     struct tcp_hdr header={.src=lwip_htons(11),.dest=lwip_htons(22)};
     TCPH_HDRLEN_FLAGS_SET(&header,5,TCP_ACK);
     struct pbuf packet={.payload=&header,.len=TCP_HLEN};
@@ -204,15 +221,20 @@ static void socket_shard_loopback_case(void)
     assert(tcp_local_output(&tx,&packet,&loop,&tx.local_ip,&tx.remote_ip,&result) && result==ERR_OK);
     struct socket_tcp_input queued;
     assert(tcp_owner_take_input(owner,&queued) && queued.packet==&shard_loop_clone && queued.interface==&loop);
+    shard_revoke_loop=1;
+    assert(tcp_local_output(&tx,&packet,&loop,&tx.local_ip,&tx.remote_ip,&result) && result==ERR_RTE);
+    assert(!owner->output_reserved && shard_clone_freed==1 && !tcp_owner_take_input(owner,&queued));
+    shard_revoke_loop=0;
+    fast_loopback_state|=LOOPBACK_AVAILABLE;
     shard_forbid_route=0;
     tcp_pcb_forget(&rx);
     assert(!tx.boaros_loopback_peer && !rx.boaros_loopback_peer && !rx.boaros_owner);
     assert(!tcp_local_output(&tx,&packet,&loop,&tx.local_ip,&tx.remote_ip,&result));
     tcp_pcb_forget(&tx);
     assert(!tcp_routes[bucket]);
-    fast_loopback=0;fast_loopback_available=0;shard_loop_source=0;
+    fast_loopback=0;fast_loopback_state=0;shard_loop_source=0;
     kernel_socket_protocol_leave(&scope);
-    puts("PASS TCP paired loopback: direct packet without route lookup; peer retirement invalidates the pair");
+    puts("PASS TCP paired loopback: independent ingress, reservation rollback after interface revoke, peer retirement");
 }
 
 static int protocol_preempt,protocol_try_failure;
@@ -301,6 +323,27 @@ static void socket_protocol_cases(void)
 extern void scheduler_user_service_set_locked(struct kernel_task *, int);
 extern void scheduler_user_request_locked(struct kernel_task *);
 static int cancel_stop_on_handoff, local_rotation_active, local_run_required, forbid_cpu0_run;
+static const struct kernel_wait_token *local_park_token;
+static unsigned local_park_case, local_park_switched;
+enum kernel_scheduler_status __real_kernel_scheduler_wake_signal(struct kernel_task *);
+
+static void local_park_wake(void)
+{
+    struct kernel_cpu *saved=active;
+    active=&cpus[0];
+    if (local_park_case==5) {
+        {
+            KERNEL_RAW_SCOPE(domain,&kernel_wait_domain);
+            local_park_token->task->signal_pending=UINT64_C(1)<<9;
+        }
+        assert(!__real_kernel_scheduler_wake_signal(local_park_token->task));
+    } else if (local_park_case==4) {
+        KERNEL_RAW_SCOPE(domain,&kernel_wait_domain);
+        assert(kernel_wait_notify_locked(local_park_token,KERNEL_WAIT_WOKEN));
+    } else assert(!kernel_wait_notify(local_park_token,KERNEL_WAIT_WOKEN));
+    active=saved;
+}
+
 void user_signal_cancel_stop(struct kernel_task *);
 void user_signal_retarget_case(struct kernel_task *,struct kernel_task *);
 void user_signal_take_retargeted(struct kernel_task *);
@@ -336,6 +379,24 @@ static int scheduler_finish_local(struct kernel_cpu *cpu)
 /* 唯一模拟的是机器换栈：生产select/finish决定owner及两侧资格。 */
 enum kernel_scheduler_status scheduler_switch_claimed(struct kernel_task *old,struct kernel_task *next)
 {
+    if (local_park_token) {
+        assert(active==&cpus[1] && next==active->idle && old==local_park_token->task);
+        assert(old->state==KERNEL_THREAD_STATE_BLOCKED && old->wait.on_cpu &&
+            !old->ready_node.queued);
+        local_park_switched++;
+        if (local_park_case==3 || local_park_case==5) {
+            local_park_wake();
+            assert(old->wait.ready_pending && !old->ready_node.queued);
+        }
+        assert(scheduler_finish_local(active));
+        if (local_park_case==4) local_park_wake();
+        assert_ready_owner(old,active);
+        struct kernel_task *resumed;
+        uint64_t deadline;
+        assert(scheduler_select_local(0,0,0,&resumed,&deadline) && resumed==old);
+        assert(scheduler_finish_local(active));
+        return KERNEL_SCHEDULER_STATUS_OK;
+    }
     if (local_rotation_active) {
         assert(next!=active->idle && old->wait.on_cpu && !old->ready_node.queued && !old->ready_cpu);
         if (!old->idle) assert(old->wait.ready_flags==SCHED_READY_LOCAL);
@@ -396,9 +457,17 @@ void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *,struct kernel_raw_g
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_raw_guard *guard)
 {
 #ifdef SOCKET_PROTOCOL_CASES
+    /* The paired PCB avoids the route index. Filter attachment still needs
+     * its endpoint snapshot, independently of that stable peer identity. */
     assert(!shard_forbid_route || lock!=&tcp_route_lock);
 #endif
     assert(!local_run_required || lock!=&kernel_wait_domain);
+    if (local_park_token && active==&cpus[1]) {
+        assert(local_park_case==6 || lock!=&kernel_wait_domain);
+        if (local_park_case==1 && lock==kernel_run_lock(active) &&
+            kernel_wait_record_phase(&local_park_token->task->wait)==KERNEL_WAIT_PREPARED)
+            local_park_wake();
+    }
     assert(!forbid_cpu0_run || lock!=kernel_run_lock(&cpus[0]));
     __real_kernel_raw_lock_acquire(lock,guard);
 }
@@ -411,7 +480,11 @@ void __wrap_kernel_raw_lock_release(struct kernel_raw_guard *guard)
         shard_queued_writer->completion.task;
 #endif
     if (pause) stop_armed=0;
+    int early=local_park_token && local_park_case==2 && active==&cpus[1] &&
+        guard->lock==kernel_run_lock(active) &&
+        kernel_wait_record_phase(&local_park_token->task->wait)==KERNEL_WAIT_COMMITTED;
     __real_kernel_raw_lock_release(guard);
+    if (early) local_park_wake();
 #ifdef SOCKET_PROTOCOL_CASES
     if (drain) shard_drain_queued_writer();
 #endif
@@ -520,6 +593,37 @@ static void ordinary_local_claim(void)
     local_rotation_active=0;
     assert(!local_run_required && active->current==&tasks[1]);
     assert_ready_owner(&tasks[0],active);
+}
+
+static void ordinary_local_park(void)
+{
+    for (local_park_case=1;local_park_case<=6;local_park_case++) {
+        reset_two_queues();active=&cpus[1];
+        scheduler.initialized=KERNEL_SCHEDULER_INITIALIZED;
+        {
+            KERNEL_RAW_SCOPE(domain,&kernel_wait_domain);
+            setup_task(0,2,0);
+            if (local_park_case>=5) tasks[0].arch.user_mode=1;
+            if (local_park_case==6) tasks[0].signal_pending=UINT64_C(1)<<9;
+            assert(scheduler_select_next_locked(active,active->idle,1)==&tasks[0]);
+            kernel_wait_switch_finish_locked(&idles[1]);active->switch_previous=0;
+        }
+        struct kernel_wait_queue queue;
+        struct kernel_wait_token token;
+        enum kernel_wait_wake_reason reason;
+        kernel_wait_queue_init(&queue);
+        assert(!kernel_wait_prepare(&queue,0,local_park_case>=5,&token));
+        local_park_switched=0;local_park_token=&token;
+        assert(!kernel_wait_park(&token,&reason));
+        local_park_token=NULL;
+        assert(local_park_switched==(local_park_case>=3 && local_park_case<=5));
+        assert(reason==(local_park_case>=5?KERNEL_WAIT_SIGNALLED:KERNEL_WAIT_WOKEN) && active->current==&tasks[0] &&
+            tasks[0].state==KERNEL_THREAD_STATE_RUNNING && tasks[0].wait.on_cpu);
+        assert(!tasks[0].wait.ready_pending && !tasks[0].ready_node.queued && !active->switch_previous);
+        assert(!kernel_wait_finish(&token));
+        assert(!kernel_wait_queue_close(&queue) && !kernel_wait_queue_destroy(&queue));
+    }
+    puts("PASS local park: early notification, old stack, locked notifier and interruptible waits");
 }
 
 static void ordinary_local_wake(void)
@@ -631,9 +735,12 @@ static void remote_rt_precedence(void)
     puts("PASS remote RT work defers ordinary selection until the last eligible task leaves");
 }
 
-int main(void)
+int main(int argc,char **argv)
 {
+    (void)argv;
+    if (argc==2) {kernel_wait_domain_init();ordinary_local_park();return 0;}
     assert(!controlled_smp_main());
+    ordinary_local_park();
     local_fifo_cases();
     ordinary_local_claim();
     ordinary_local_wake();

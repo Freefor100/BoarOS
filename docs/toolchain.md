@@ -1,98 +1,68 @@
-# 工具链事实
+# BoarOS 工具链与开发环境配置指南
 
-本文区分记录 Desktop 与 Laptop 环境中实际观察到的工具与 Harness 行为。
-版本变化时重新验证，不把本机路径视为项目接口。
+本文档介绍构建与运行 BoarOS 所需的交叉编译工具链、模拟器及辅助工具的环境配置方法。
 
-## Desktop 工具快照（2026-08-10）
+---
 
-| 工具 | 版本 | 用途 |
-|---|---|---|
-| `riscv64-unknown-elf-gcc` | 14.2.0 | RISC-V freestanding 内核编译 |
-| RISC-V bare-metal binutils | 2.45.50.20251209 | 链接与 ELF 检查 |
-| `riscv64-linux-gnu-gcc` | 15.2.0 | Linux ABI 用户程序候选 |
-| `loongarch64-linux-gnu-gcc` | 15.2.0 | LoongArch freestanding 探针已通过 |
-| LoongArch GNU binutils | 2.46 | 链接与 ELF 检查 |
-| `qemu-system-riscv64` | 10.2.1 | RISC-V system emulator |
-| `qemu-system-loongarch64` | 10.2.1 | LoongArch system emulator |
-| GNU Make | 4.4.1 | 构建入口 |
-| Python | 3.13.13 | 宿主脚本可用 |
-| Docker CLI | 29.1.3 | CLI 已安装，daemon 尚未验证 |
+## 🛠️ 1. 环境依赖概览
 
-Desktop 的 `PATH` 中没有 Clang、LLD、Podman、bare-metal LoongArch GCC 或
-LoongArch musl GCC；它们目前不是项目依赖。
+内核使用 GNU Make 和目标架构的交叉 GCC 构建，脚本使用 Python 3 和 Git。运行或测试内核需要对应架构的 QEMU 系统模拟器。
 
-## Laptop 兼容验证（2026-08-20）
+| 目标 | 交叉编译器 | 模拟器 | 内核构建模式 |
+| :--- | :--- | :--- | :--- |
+| **RISC-V 64** | `riscv64-unknown-elf-gcc` 或 `riscv64-elf-gcc` | `qemu-system-riscv64` | GNU C11、freestanding |
+| **LoongArch 64** | `loongarch64-unknown-linux-gnu-gcc` | `qemu-system-loongarch64` | GNU C11、freestanding、LP64S |
 
-Laptop 的 Arch Linux 仓库提供 `riscv64-elf-gcc` 15.2.0 与 bare-metal
-binutils 2.45.1，工具前缀与 Desktop 不同。Makefile 默认优先选择 Desktop
-已验证的 `riscv64-unknown-elf-`，缺失时回退到 Laptop 提供的
-`riscv64-elf-`；显式传入 `CROSS_COMPILE` 会覆盖自动选择。
+以下是仓库使用过的环境和构建入口。固定测试输入的版本与校验见 [`references/sources.tsv`](../references/sources.tsv)。
 
-Laptop 已用不带 `CROSS_COMPILE` 覆盖的 `make all` 和 `make test-riscv`
-验证默认构建与 512 MiB、1 GiB 两种 guest RAM 启动。当前前缀由 Makefile
-自动选择，也可通过 `CROSS_COMPILE` 显式指定。
+---
 
-## Desktop Freestanding 证据
+## 🐧 2. RISC-V 64 开发环境配置
 
-同一份最小 C 源码已经在不使用 libc 和启动文件的条件下为两个目标生成 ELF64 little-endian 对象：
+通过宿主软件源或交叉工具链发行包安装 GCC、binutils 和 QEMU，并将它们加入 `PATH`。Makefile 优先选择 `riscv64-unknown-elf-`，其次选择 `riscv64-elf-`。Arch Linux 已验证使用 `riscv64-elf-gcc` 15.2.0 与 binutils 2.45.1。也可显式指定工具前缀和模拟器：
 
 ```sh
-riscv64-unknown-elf-gcc \
-  -std=gnu11 -ffreestanding -fno-builtin -fno-stack-protector \
-  -nostdlib -nostartfiles -march=rv64gc -mabi=lp64d -mcmodel=medany \
-  -c smoke.c -o smoke-riscv64.o
-
-loongarch64-linux-gnu-gcc \
-  -std=gnu11 -ffreestanding -fno-builtin -fno-stack-protector \
-  -nostdlib -nostartfiles -march=loongarch64 -mabi=lp64d \
-  -c smoke.c -o smoke-loongarch64.o
+make CROSS_COMPILE=riscv64-elf-
+make run-riscv QEMU_RISCV64=qemu-system-riscv64
 ```
 
-这只证明编译器前端和对象生成可用，不证明链接脚本、固件启动、QEMU 入口、ABI 或内核功能正确。
+RV 的 vDSO 是用户态共享 ELF，链接时还需要 `riscv64-linux-gnu-ld` 或 `riscv64-linux-musl-ld`。可以通过 `RV_VDSO_LD=/path/to/ld` 选择。内核和 vDSO 对象仍由原交叉 GCC 编译。LA 默认使用其交叉工具链的链接器。
 
-## Desktop Harness 事实（2026-08-10）
+---
 
-本地 `autotest-for-oskernel` 快照在提交目录执行 `make all`，随后读取仓库根目录的 `kernel-rv` 和 `kernel-la`。该快照的 RISC-V 命令使用 `qemu-system-riscv64 -machine virt -kernel kernel-rv -bios default`，并挂载 virtio-mmio 块设备与网络；LoongArch 命令使用 `qemu-system-loongarch64 -kernel kernel-la` 和 virtio-pci 设备。
+## 🐉 3. LoongArch 64 开发环境配置
 
-该快照的默认配置是 1 CPU、1 GiB、3600 秒，但比赛轮次可以覆盖。2026 BuildStorm 使用 8 CPU、8 GiB，guest 内构建目标为 RISC-V 或 LoongArch musl。这些是兼容性输入，不是永久项目 API；每次接入前都要以当前规则和 Harness 为准。
+### 3.1 交叉编译器
 
-## LA 首阶段工具快照（2026-10-06）
+先安装交叉 GCC 和 binutils，并将它们加入 `PATH`。已验证的交叉 GCC 为 15.1.0。默认前缀为 `loongarch64-unknown-linux-gnu-`，可在编译时覆盖：
 
-本机 `loongarch64-unknown-linux-gnu-gcc` 15.1.0 位于
-`/opt/loongarch64-tools/bin/`，二进制 SHA-256 为
-`93ffc1acbb540affea06c1c986a1f3869a48383a7fba849710cfe20e8fdd4cd0`。
-PATH 没有 LA QEMU，`make prepare-la-tools` 从固定 QEMU v11.1.0 源码构建
-带固定RTC补丁的 `build/qemu-la-rtc/qemu-system-loongarch64`，原版通过
-`make prepare-la-original-tools` 保留在 `build/qemu-la`；`make prepare-la-linux` 用相同LA GCC
-构建固定 Linux 的16KiB/三级页表initramfs对照，保存于 `build/linux-la`。
-来源commit、配置与命令见[LA首阶段](modules/loongarch-boot.md)和
-[输入身份](learning/loongarch-bringup.md)。两种缓存由prune保留，日志与运行镜像清除。
+```sh
+make kernel-la LA_CROSS_COMPILE=loongarch64-unknown-linux-gnu-
+```
 
-`make kernel-la` 使用LP64S、soft-float、禁用LSX/LASX，用户探针独立链接为
-`build/loongarch/user-probe`。`make test-loongarch` 在512MiB/1GiB下对照同一个ELF。
-首阶段结果不代表浮点ABI、实板或完整LA libc；第二阶段静态libc范围见下文。
+### 3.2 模拟器
 
+`make prepare-la-tools` 使用固定 QEMU 源码及 RTC 补丁构建模拟器，输出为 `build/qemu-la-rtc/qemu-system-loongarch64`。它只准备模拟器。已有适配的 QEMU 时，可以通过 `QEMU_LOONGARCH64` 指定其路径；涉及 RTC 的测试使用仓库固定版本。
 
-## LA 整数静态 libc 工具
+### 3.3 静态用户程序工具链
 
-`make prepare-la-userland` 从固定 GCC15.1.0 archive 构建
-`build/loongarch/gcc-sf/root/bin/loongarch64-unknown-linux-gnusf-gcc`，包括LP64S
-CRT/libgcc，匹配 `build/loongarch/musl-root` 的静态 musl1.2.5。系统工具仍用于
-整数内核、raw探针和固定Linux构建；系统LP64D runtime不能拿来链接LP64S libc。
-实际 musl/BusyBox 编译以 REALGCC 选择 gnusf driver，关闭FPU/LSX/LASX。
-源码归档、宿主 C/C++、binutils、配置和输出身份保存在缓存中；已有身份变化时
-拒绝混用，复用缓存会核对 ELF/libc/libgcc/CRT哈希。
+`make prepare-la-userland` 从固定归档构建 GCC 15.1.0 的 LP64S 用户态工具链、musl 1.2.5 和原配置 BusyBox。首次构建 GCC 需要宿主 C++ 编译器及 GMP、MPFR、MPC 开发库。安装结果保存在 `build/loongarch/`，后续按输入和产物清单核对后复用。
 
-BusyBox 原commit/完整配置和固定v6.6 LA UAPI未改动，`make test-root-loongarch`
-运行同ELF的固定Linux/BoarOS PCI/ext4验收。GCC构建需宿主g++、GMP/MPFR/MPC开发
-依赖，首次工具构建可耗时数分钟；后续保留源码/构建/安装缓存。原程序范围为模块
-列出的七个applet，完整动态libc/TLS/线程/信号与FPU仍独立验收。
+这套静态用户态工具与编译内核用的交叉 GCC 分开。LP64D 的运行库不能用于链接 LP64S 程序；程序使用 16 KiB 页的装载要求也要在 ELF 链接时满足。
 
-工具缓存命中前会核对 BusyBox revision、配置路径及固定内容哈希、UAPI归档、
-编译/配置选项。安装 manifest 覆盖整个 GCC/musl/UAPI 安装树，包括 cc1/collect2、
-specs、CRT、库、头文件、权限及符号链接目标；丢失或变更明确拒绝复用。
-`make test-la-userland-host` 的9个反例先验证合法缓存可命中，再单独改变输入、
-删除 helper、改变 specs/header/链接或编译 flags，要求拒绝。冷构建可使用
-`python3 -B tests/loongarch/prepare_userland.py --output build/loongarch/toolchain-check`；
-顶层 configure 后先执行真实 `configure-gcc`，才读取 GCC 子配置，不借已有 Makefile。
-此验证目录随后由 prune 清除，默认可复用工具缓存保留。
+---
+
+## 🔍 4. 环境验证与快速测试
+
+下列目标可检查内核构建与 QEMU 启动。无根盘时，RV 进入空闲循环，LA 生产内核报告根盘缺失。完整用户态启动见 [RV 根盘](modules/riscv-root-boot.md)和 [LA 根盘](modules/loongarch-boot.md)。
+
+```bash
+# 1. 编译并启动 RISC-V 内核（通过串口查看日志，Ctrl+A X 退出）
+make run-riscv
+
+# 2. 编译并启动 LoongArch 内核
+make run-loongarch
+
+# 3. 运行 RISC-V 架构与内核回归
+make test-riscv
+```

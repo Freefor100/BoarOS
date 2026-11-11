@@ -27,6 +27,7 @@ static void lookup_end(struct kernel_task **task)
 #define LINUX_CLONE_SIGHAND UINT64_C(0x800)
 #define LINUX_CLONE_CLEAR_SIGHAND UINT64_C(0x100000000)
 #define LINUX_CLONE_VFORK UINT64_C(0x4000)
+#define LINUX_CLONE_NEWNS UINT64_C(0x20000)
 #define LINUX_CLONE_CHILD_CLEARTID UINT64_C(0x200000)
 #define LINUX_CLONE_CHILD_SETTID UINT64_C(0x1000000)
 #define LINUX_CLONE_KNOWN_FLAGS UINT64_C(0x3ffffffff)
@@ -260,6 +261,7 @@ void syscall_decode_clone(const struct kernel_syscall_request *request,
 
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     if ((flags & ~LINUX_CLONE_KNOWN_FLAGS) != 0U ||
+        ((flags & LINUX_CLONE_NEWNS) && (flags & (LINUX_CLONE_FS | UINT64_C(0x10000)))) ||
         ((flags & UINT64_C(0x401000)) == UINT64_C(0x401000)) ||
         ((flags & UINT64_C(0x10000)) && !(flags & UINT64_C(0x800))) ||
         ((flags & UINT64_C(0x800)) && !(flags & LINUX_CLONE_VM)) ||
@@ -278,7 +280,7 @@ void syscall_decode_clone(const struct kernel_syscall_request *request,
         return;
     }
     /* A fork child owns its private child-TID store and exit clear. */
-    uint64_t process_flags = flags & ~(LINUX_CLONE_SIGNAL_MASK | LINUX_CLONE_FS | LINUX_CLONE_FILES | LINUX_CLONE_CLEAR_SIGHAND | UINT64_C(0x80001000) |
+    uint64_t process_flags = flags & ~(LINUX_CLONE_SIGNAL_MASK | LINUX_CLONE_FS | LINUX_CLONE_FILES | LINUX_CLONE_CLEAR_SIGHAND | LINUX_CLONE_NEWNS | UINT64_C(0x80001000) |
         UINT64_C(0x40000) | UINT64_C(0x80000) | UINT64_C(0x100000) |
         LINUX_CLONE_CHILD_SETTID | LINUX_CLONE_CHILD_CLEARTID);
     if (process_flags != 0 && process_flags != LINUX_CLONE_VM &&
@@ -292,6 +294,31 @@ void syscall_decode_clone(const struct kernel_syscall_request *request,
      * ignores the remaining arguments; musl's fork passes only two. */
     decoded->action = KERNEL_SYSCALL_ACTION_CLONE;
     decoded->value = 0;
+}
+
+enum kernel_syscall_status syscall_handle_unshare(struct kernel_task *caller,
+    const struct kernel_syscall_request *request,struct kernel_syscall_result *decoded)
+{
+    KERNEL_SERVICE_SCOPE(service);
+    uint64_t flags=request->arguments[0];
+    decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+    if (flags & ~(LINUX_CLONE_FS | LINUX_CLONE_NEWNS))
+        decoded->value=-KERNEL_EINVAL;
+    else if ((flags & LINUX_CLONE_NEWNS) &&
+             !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN))
+        decoded->value=-KERNEL_EPERM;
+    else decoded->value=flags?kernel_task_unshare_fs(caller,!!(flags&LINUX_CLONE_NEWNS)):0;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
+enum kernel_syscall_status syscall_handle_setns(struct kernel_task *caller,
+    const struct kernel_syscall_request *request,struct kernel_syscall_result *decoded)
+{
+    KERNEL_SERVICE_SCOPE(service);
+    decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value=kernel_task_setns_mount(caller,(int32_t)request->arguments[0],
+        (uint32_t)request->arguments[1]);
+    return KERNEL_SYSCALL_STATUS_OK;
 }
 
 enum kernel_syscall_status syscall_handle_clone3(struct kernel_task *caller,

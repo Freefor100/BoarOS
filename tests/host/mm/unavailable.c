@@ -80,3 +80,5 @@ EXCLUDED(kernel_page_cache_resident)
 
 EXCLUDED(kernel_page_cache_accept_mapping_write)
 EXCLUDED(kernel_page_cache_finish_mapping_write)
+EXCLUDED(kernel_bpf_mmap_page)
+EXCLUDED(kernel_open_file_kind)

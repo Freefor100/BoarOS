@@ -8,6 +8,8 @@ riscv_secondary_entry:
     /* a1指向CPU0已发布的物理mailbox；没有BSS或共享启动栈操作。 */
     csrw sie, zero
     csrci sstatus, 2
+    /* 用户 vDSO 只能读取 time，不开放 cycle 或 instret。 */
+    csrwi scounteren, 2
     csrw sscratch, zero
     fence r, rw
     ld sp, 0(a1)

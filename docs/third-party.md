@@ -117,7 +117,7 @@ glibc 2.44 作为外部测试输入使用：官方源码归档保存在被忽略
 `references/sources.tsv`，用法见[CI 环境记录](learning/ci-native-environment.md)。
 
 GCC15.1.0 原官方 archive 固定于 `references/sources.tsv` 的 `gcc/gcc-15.1.0.tar.xz`；
-源码在忽略的 `build/loongarch/gcc-sf/source` 原样解包，许可见 `COPYING3`，目标运行库
+构建时从归档原样解包源码，许可见归档内的 `COPYING3`，目标运行库
 适用 `COPYING.RUNTIME` 的 GCC Runtime Library Exception3.1。仅构建 C/LP64S runtime，
 未导入 Git 或改动 GCC源码。musl1.2.5 仍使用既有固定归档（MIT）；原 BusyBox1.33.1
 使用 `tests/userland/inventory/inputs.json` 中 `b5ec6ef8497e1818cbdec3b54bb722f036e57972`
@@ -135,3 +135,9 @@ applet或改上游源码；UAPI来自固定 Linux v6.6 archive 的LA导出。工
 SHA256集中在`references/sources.tsv`的`xattr-tools/`条目。两项目分别按其GPL-2.0-or-later
 和BSD-3-Clause OR GPL-2.0-only双许可分发。兼容分支的离线构建脚本生成两架构静态工具，
 只装入独立验证盘；attr以libgen.h提供musl的basename声明，保留原工具操作和参数。
+
+## BPF 用户工具与构建依赖
+
+BPF 内核实现为 BoarOS 公共 C 代码，Linux UAPI 与行为依据来自已固定的 `references/linux`。该源码的 bpftool（GPL-2.0-only）和 libbpf（LGPL-2.1 OR BSD-2-Clause）只交叉构建到测试客户机；上游代码保持原样。lwIP 本地增加 UDP/TCP 接收过滤 hook，在协议状态改变前执行 socket 程序，不改变 lwIP 的来源版本或许可。
+
+bpftrace 0.27.1 及其固定 libbpf 子模块、LLVM/Clang 23.1.4、BCC、cereal、elfutils 和 zlib 的归档 URL、revision 与 SHA-256 集中于 `references/sources.tsv` 的 `bpf/` 项。bpftrace/BCC 使用 Apache-2.0，LLVM 使用 Apache-2.0 WITH LLVM-exception，cereal 使用 BSD-3-Clause，elfutils 的 libelf 使用 LGPL-3.0-or-later（其他工具依上游 GPL 条款），zlib 使用 Zlib 许可。构建保留归档内的 LICENSE/COPYING 和声明，工具及运行库留在忽略的构建缓存，不导入内核第三方目录。构建、Linux 同输入对照与客户机运行方法见 [BPF 模块](modules/kernel-bpf.md#构建与检查)。

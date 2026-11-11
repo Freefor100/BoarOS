@@ -7,7 +7,10 @@ struct kernel_lock_guard;
 struct netif;
 struct pbuf;
 struct tcp_pcb;
+struct udp_pcb;
 struct boaros_lwip_hooks {
+    int (*udp_ingress_filter)(struct udp_pcb *,struct pbuf *,struct netif *,int,const void *,uint16_t,uint16_t);
+    int (*tcp_ingress_filter)(struct tcp_pcb *,struct pbuf *,struct netif *,int,const void *,uint16_t,uint16_t);
     void (*tcp_output)(struct tcp_pcb *);
     void (*work)(void);
     void (*loopback_publish)(struct netif *);
@@ -22,6 +25,8 @@ struct boaros_lwip_hooks {
     void (*pcb_forget)(struct tcp_pcb *);
     int (*tcp_conflict)(const struct tcp_pcb *, const struct ip_addr *, uint16_t, const struct ip_addr *, uint16_t);
 };
+int boaros_lwip_udp_ingress_filter(struct udp_pcb *,struct pbuf *,struct netif *,int,const void *,uint16_t,uint16_t);
+int boaros_lwip_tcp_ingress_filter(struct tcp_pcb *,struct pbuf *,struct netif *,int,const void *,uint16_t,uint16_t);
 void boaros_lwip_set_hooks(const struct boaros_lwip_hooks *hooks);
 void boaros_lwip_tcp_output(struct tcp_pcb *pcb);
 void boaros_lwip_work_ready(void);

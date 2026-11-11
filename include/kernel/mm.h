@@ -105,6 +105,10 @@ struct kernel_mm_user_pin {
 enum kernel_mm_status kernel_mm_pin_user_page(
     const struct kernel_mm *, uint64_t address, uint32_t access,
     struct kernel_mm_user_pin *);
+/* Resident-only borrow for non-sleeping probes. Closed admission is CONFLICT;
+ * no page is faulted in and no MM editor is waited for. */
+enum kernel_mm_status kernel_mm_try_pin_user_page(const struct kernel_mm *,
+    uint64_t address,uint32_t access,struct kernel_mm_user_pin *);
 void kernel_mm_unpin_user_page(struct kernel_mm_user_pin *);
 /* Borrow the first page, plus an already accessible second page. Only the
  * first address can wait; a missing second page leaves a usable prefix. */
@@ -277,6 +281,13 @@ enum kernel_mm_status kernel_mm_validate_file_private_mapping(
     uint64_t file_offset,
     uint32_t permissions,
     uint32_t flags);
+
+/* The caller retains its OFD pin through admission-lock release. The MM
+ * acquires a separate source owner; write_bytes is owned by that object. */
+enum kernel_mm_status kernel_mm_mmap_object_shared(struct kernel_mm *,
+    struct kernel_open_file_description *, uint64_t hint, uint64_t length,
+    uint64_t offset, uint32_t permissions, uint32_t flags,
+    uint64_t *write_bytes, uint64_t *address);
 
 /* Success consumes *file; failure leaves the caller's OFD reference intact. */
 enum kernel_mm_status kernel_mm_mmap_file_private(

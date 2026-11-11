@@ -10,6 +10,7 @@
 - `kernel_open_file_description` 拥有一个 VFS file、当前 offset 和清理状态。分别打开同一路径会得到独立 description，因此 offset 互不影响。
 - pipe description 不拥有 VFS file，而是各自持有同一个 `struct kernel_pipe` 的读/写 endpoint；pipe 对象拥有16个片段槽、按需分配的单页后备、端点引用和等待队列。metadata raw 保护 ring、端点、代次与 readiness；用户复制、缺页和通知在 raw 外执行。关闭者保留本次已有 owner 至通知结束，再竞争最后销毁资格。核心分别返回接纳前缀和断端事实，SIGPIPE/重启由真实用户调用层处理。受控任务创建仍检查当前支持的消费者；这项检查不切换 pipe 同步方式；复制资格与页归还规则见下文 [pipe2](#pipe2-与-fifo-endpoint)。
 - socket description 同样不拥有 VFS file，而是独占 `struct kernel_socket`；fd 关闭、dup 覆盖、exec CLOEXEC 或退出导致最后一个真实 OFD 引用消失时，销毁 socket 并解绑 lwIP 回调。请求期间的 OFD pin 使 fd 复用不改变当前请求的 endpoint。普通 read/write 与向量路径使用 socket 数据队列，定位 I/O 返回 `ESPIPE`；`fstat` 报 `S_IFSOCK`。协议与等待契约见[网络模块](kernel-network.md)。
+- BPF description 持有程序、map、BTF、link 或 perf 事件对象；map 的共享映射独立持有 OFD，关闭 FD 不提前归还映射页。perf read/ioctl 及 ringbuf poll/epoll 接到实际对象，其余程序类对象不伪造文件读写能力；对象与 pin 生命周期见 [BPF](kernel-bpf.md)。
 - `kernel_fs_context` 在共同 VFS 状态短保护下读取和交换 umask，并为使用者生成带独立引用的 root/cwd 快照；cwd 替换、记录共享、移动和退出使用同一保护。它持有 root 和 cwd 的独立路径引用；普通 fork 复制两份引用，`CLONE_FS` 共享 context record，exec 保留。`chdir/fchdir/chroot/getcwd` 操作共享活目录项；exec 从当前目录对象解析相对路径。
 
 `kernel_files_pin()` 为 fd 指向的 open file description 增加一个独立引用。file-private mmap
@@ -580,3 +581,18 @@ LA musl1.2.5 不提供旧 `fstat/newfstatat` syscall，而通过 statx 实现 li
 读写和就绪查询在发起CPU执行，epoll复用现有控制与关闭关联协议。无epoll观察者的末次关闭本地完成，有关联时由现有CPU0路径先拆除。匿名对象通过fstat及`/proc/<pid>/fd`显示身份；pread/pwrite返回ESPIPE，lseek保留Linux的noop行为。
 
 匿名事件的阻塞读写沿共同可重启调用协议返回ERESTARTSYS，由实际线程的handler设置决定EINTR或重执行。向量写已完成前缀时直接返回前缀，保留已接纳计数。timerfd行为见[时间模块](kernel-time.md#timerfd期限)。`tests/workloads/event/boundary.c`保留定位I/O、原始地址范围、定向ET、空向量及写入错误优先级的直接反例；`tests/userland/run.py --workload event`复用共同Linux/客户机对照入口，观察构建另核对实际载荷pin和执行CPU。
+
+## inotify 文件事件
+
+RV64／LA64 使用 `inotify_init1`、`inotify_add_watch` 和 `inotify_rm_watch`。
+监视按文件系统实例与 inode 建立；硬链接和 bind 视图可以引用同一个 inode，复用同一监视编号。
+目录监视记录直接子项的名称，重命名的两端共享一个非零 cookie。普通文件的读取、写入、
+打开和关闭，以及 VFS 的目录修改和属性变更发布对应事件。监视不持有 OFD：末链接删除后，
+最后使用者归还时发送 `IN_DELETE_SELF`，文件系统退役时发送 `IN_UNMOUNT`，
+两者都撤除监视并发送 `IN_IGNORED`。共享映射中的内存写入不产生 inotify 写事件。
+
+每个真实 UID 最多 128 个实例、65,536 个监视；每个实例的未读记录使用 64 KiB 环。
+环为 `IN_Q_OVERFLOW` 保留位置，读返回完整记录，名称以 NUL 补齐到记录边界。
+阻塞读取、`IN_NONBLOCK`、poll/epoll 和 `FIONREAD` 使用同一队列状态。事件发布时借用
+等待游标，释放短锁后通知；最后关闭在拆除 epoll 关联后释放实例，已选中的通知保持独立引用。
+直接探针见 [inotify.c](../../tests/workloads/fs/inotify.c)，覆盖目录事件、事件消费、溢出和卸载。

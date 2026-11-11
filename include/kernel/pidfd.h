@@ -27,6 +27,7 @@ int kernel_pidfd_signal_target(struct kernel_task *,int32_t,uint32_t,struct kern
 int64_t kernel_pidfd_send(struct kernel_task *, struct kernel_pid *,unsigned,uint32_t,
                           const struct kernel_signal_wait_info *);
 int kernel_pidfd_wait_target(struct kernel_files *, int32_t, struct kernel_pid **, int *);
+struct kernel_pid *kernel_pidfd_identity_ref(const struct kernel_open_file_description *);
 uint32_t kernel_pidfd_poll(struct kernel_open_file_description *, struct kernel_wait_queue **);
 int32_t kernel_pidfd_number(const struct kernel_open_file_description *);
 uint64_t kernel_pidfd_inode(const struct kernel_open_file_description *);

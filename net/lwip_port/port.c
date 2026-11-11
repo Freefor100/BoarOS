@@ -6,6 +6,10 @@
 #include "boaros_lwip.h"
 
 #include <stdint.h>
+#include <kernel/cost.h>
+#if BOAROS_COST_DIAGNOSTICS
+#include <kernel/cpu.h>
+#endif
 #if BOAROS_USER_SMP
 #include <kernel/sync.h>
 #endif
@@ -16,23 +20,57 @@
 #ifdef BOAROS_LWIP_SHARED_MEMORY
 unsigned boaros_lwip_parallel;
 static unsigned memory_busy;
+#if BOAROS_COST_DIAGNOSTICS
+static struct lwip_memory_cost {
+    struct kernel_cost_tag tag;
+    uint64_t wait, acquired;
+} memory_cost[BOAROS_MAX_CPUS];
+_Static_assert(sizeof(struct lwip_memory_cost)==KERNEL_COST_CPU_LWIP_BYTES,
+    "lwIP cost CPU budget");
+#endif
 sys_prot_t sys_arch_protect(void)
 {
     sys_prot_t irq=0;
 #if defined(__riscv) || defined(__loongarch__)
     irq=arch_interrupt_save();
 #endif
+#if BOAROS_COST_DIAGNOSTICS
+    struct lwip_memory_cost *cost=&memory_cost[kernel_cpu_current()->logical_id];
+    cost->tag=kernel_cost_capture();
+    uint64_t started=cost->tag.epoch?kernel_cost_clock():0;
+#endif
     if (boaros_lwip_parallel_enabled()) {
         while(__atomic_exchange_n(&memory_busy,1,__ATOMIC_ACQUIRE))
             while(__atomic_load_n(&memory_busy,__ATOMIC_RELAXED)) {}
     }
+#if BOAROS_COST_DIAGNOSTICS
+    if (cost->tag.epoch) {
+        cost->acquired=kernel_cost_clock();
+        cost->wait=cost->acquired-started;
+    }
+#endif
     return irq;
 }
 
 void sys_arch_unprotect(sys_prot_t irq)
 {
+#if BOAROS_COST_DIAGNOSTICS
+    struct lwip_memory_cost *cost=&memory_cost[kernel_cpu_current()->logical_id];
+    struct kernel_cost_tag tag=cost->tag;
+    uint64_t wait=cost->wait;
+    uint64_t held=tag.epoch?kernel_cost_clock()-cost->acquired:0;
+    cost->tag.epoch=0;
+#endif
     if (boaros_lwip_parallel_enabled())
         __atomic_store_n(&memory_busy,0,__ATOMIC_RELEASE);
+#if BOAROS_COST_DIAGNOSTICS
+    /* IRQ exclusion fixes the CPU until restore; the real storage lock is
+     * already free before publishing to the COST aggregate. */
+    if (tag.epoch) {
+        kernel_cost_add_tag(tag,COST_NETWORK_POOL_WAIT_TICKS,wait);
+        kernel_cost_add_tag(tag,COST_NETWORK_POOL_HOLD_TICKS,held);
+    }
+#endif
 #if defined(__riscv) || defined(__loongarch__)
     arch_interrupt_restore(irq);
 #else
@@ -154,3 +192,16 @@ void boaros_lwip_tcp_pcb_forget(struct tcp_pcb *pcb)
 int boaros_lwip_tcp_conflict(const struct tcp_pcb *pcb, const struct ip_addr *local, uint16_t local_port,
     const struct ip_addr *remote, uint16_t remote_port)
 { return protocol_hooks.tcp_conflict ? protocol_hooks.tcp_conflict(pcb,local,local_port,remote,remote_port) : 0; }
+
+int boaros_lwip_udp_ingress_filter(struct udp_pcb *pcb,struct pbuf *p,struct netif *input,
+    int ipv6,const void *network,uint16_t network_length,uint16_t header)
+{
+    return !protocol_hooks.udp_ingress_filter ||
+        protocol_hooks.udp_ingress_filter(pcb,p,input,ipv6,network,network_length,header);
+}
+int boaros_lwip_tcp_ingress_filter(struct tcp_pcb *pcb,struct pbuf *p,struct netif *input,
+    int ipv6,const void *network,uint16_t network_length,uint16_t header)
+{
+    return !protocol_hooks.tcp_ingress_filter ||
+        protocol_hooks.tcp_ingress_filter(pcb,p,input,ipv6,network,network_length,header);
+}

@@ -360,6 +360,12 @@ enum kernel_files_status kernel_files_fstatfs(
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     struct kernel_open_file_description *file = kernel_files_hold_fd(files, fd, &pin_guard);
     if (!file) { *linux_result = -KERNEL_EBADF; return KERNEL_FILES_STATUS_OK; }
+    if (file->kind==KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE) {
+        struct kernel_linux_statfs stat={.f_type=0x6e736673,.f_bsize=BOAROS_PAGE_SIZE,.f_namelen=255};
+        size_t copied;
+        *linux_result=kernel_copy_to_user(mm,user_buffer,&stat,sizeof(stat),&copied)?-KERNEL_EFAULT:0;
+        return KERNEL_FILES_STATUS_OK;
+    }
     if(file->kind==KERNEL_OPEN_FILE_KIND_MQUEUE){
         struct kernel_linux_statfs stat;
         int error=kernel_mqueue_statfs(file,&stat);if(error){*linux_result=error;return KERNEL_FILES_STATUS_OK;}

@@ -4,6 +4,7 @@
 #include <kernel/errno.h>
 #include <kernel/pidfd.h>
 #include <kernel/kcmp.h>
+#include <kernel/bpf.h>
 #include <kernel/ioprio.h>
 #include <kernel/futex.h>
 #include <kernel/task.h>
@@ -74,6 +75,8 @@
 #define LINUX_SYSCALL_EXIT_GROUP 94U
 #define LINUX_SYSCALL_WAITID 95U
 #define LINUX_SYSCALL_SET_TID_ADDRESS 96U
+#define LINUX_SYSCALL_UNSHARE 97U
+#define LINUX_SYSCALL_SETNS 268U
 #define LINUX_SYSCALL_SET_ROBUST_LIST 99U
 #define LINUX_SYSCALL_GET_ROBUST_LIST 100U
 #define LINUX_SYSCALL_UNAME 160U
@@ -260,7 +263,14 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
     struct kernel_syscall_result *result)
 {
     struct kernel_syscall_result decoded;
-    if (request->number == 32U) {
+    if (request->number == 280U) {
+        decoded.action=KERNEL_SYSCALL_ACTION_RETURN;
+        decoded.value=kernel_bpf_syscall(caller,(uint32_t)request->arguments[0],request->arguments[1],(uint32_t)request->arguments[2]);
+    } else if (request->number == 241U) {
+        decoded.action=KERNEL_SYSCALL_ACTION_RETURN;
+        decoded.value=kernel_bpf_perf_open(caller,request->arguments[0],(int32_t)request->arguments[1],
+            (int32_t)request->arguments[2],(int32_t)request->arguments[3],request->arguments[4]);
+    } else if (request->number == 32U) {
         if(syscall_handle_flock(caller,request,&decoded))return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == 436U) {
         if(syscall_handle_close_range(caller,request,&decoded))return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
@@ -374,6 +384,9 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
     } else if (request->number >= 85U && request->number <= 87U) {
         if (syscall_handle_timerfd(caller,request,&decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number >= 26U && request->number <= 28U) {
+        if (syscall_handle_inotify(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_EVENTFD2) {
         if (syscall_handle_eventfd(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
@@ -417,6 +430,12 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
+    } else if (request->number == LINUX_SYSCALL_UNSHARE) {
+        if (syscall_handle_unshare(caller,request,&decoded)!=KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == LINUX_SYSCALL_SETNS) {
+        if (syscall_handle_setns(caller,request,&decoded)!=KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_MOUNT ||
                request->number == LINUX_SYSCALL_UMOUNT2) {
         if (syscall_handle_mount(caller, request, &decoded,

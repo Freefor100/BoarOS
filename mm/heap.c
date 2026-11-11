@@ -212,7 +212,7 @@ static uint32_t bitmap_count(uint64_t value)
     return (uint32_t)((value * UINT64_C(0x0101010101010101)) >> 56U);
 }
 
-static int slab_metadata_valid(const struct kernel_heap *heap,
+static enum kernel_heap_status slab_metadata_validate(const struct kernel_heap *heap,
                                const struct kernel_slab *slab)
 {
     uint32_t allocated_count = 0U;
@@ -222,9 +222,12 @@ static int slab_metadata_valid(const struct kernel_heap *heap,
     if (slab->magic != KERNEL_SLAB_MAGIC || slab->heap != heap ||
         slab->class_index >= KERNEL_HEAP_SIZE_CLASS_COUNT ||
         slab->slot_offset != sizeof(*slab) || slab->slot_count == 0U ||
-        slab->slot_count > KERNEL_SLAB_BITMAP_WORDS * 64U ||
+        slab->slot_count > KERNEL_SLAB_BITMAP_WORDS * 64U) {
+        return KERNEL_HEAP_STATUS_INVALID;
+    }
+    if (slab->slot_count != (BOAROS_PAGE_SIZE-sizeof(*slab))/class_size(slab->class_index) ||
         slab->reserved != 0U || slab->free_count > slab->slot_count) {
-        return 0;
+        return KERNEL_HEAP_STATUS_STATE;
     }
 
     slots_remaining = slab->slot_count;
@@ -241,54 +244,54 @@ static int slab_metadata_valid(const struct kernel_heap *heap,
             slots_remaining = 0U;
         }
         if ((slab->allocated[word] & ~mask) != 0U) {
-            return 0;
+            return KERNEL_HEAP_STATUS_STATE;
         }
         allocated_count += bitmap_count(slab->allocated[word] & mask);
     }
     if (allocated_count + slab->free_count != slab->slot_count) {
-        return 0;
+        return KERNEL_HEAP_STATUS_STATE;
     }
 
     if (slab->free_count == 0U) {
         if (slab->free_head != KERNEL_SLAB_INDEX_NONE) {
-            return 0;
+            return KERNEL_HEAP_STATUS_STATE;
         }
     } else {
         uint32_t next;
 
         if (slab->free_head >= slab->slot_count ||
             bitmap_test(slab, slab->free_head)) {
-            return 0;
+            return KERNEL_HEAP_STATUS_STATE;
         }
         next = slot_next(slab, slab->free_head);
         if (next != KERNEL_SLAB_INDEX_NONE &&
             (next >= slab->slot_count || bitmap_test(slab, next))) {
-            return 0;
+            return KERNEL_HEAP_STATUS_STATE;
         }
     }
 
     if (slab->free_count == 0U) {
-        return slab->next == 0 && slab->previous == 0;
+        return !slab->next && !slab->previous ? KERNEL_HEAP_STATUS_OK : KERNEL_HEAP_STATUS_STATE;
     }
     if (slab->previous == 0) {
         if (heap->partial_slabs[slab->class_index] != slab) {
-            return 0;
+            return KERNEL_HEAP_STATUS_STATE;
         }
     } else if (slab->previous->magic != KERNEL_SLAB_MAGIC ||
                slab->previous->heap != heap ||
                slab->previous->class_index != slab->class_index ||
                slab->previous->next != slab) {
-        return 0;
+        return KERNEL_HEAP_STATUS_STATE;
     }
     if (slab->next != 0 &&
         (slab->next->magic != KERNEL_SLAB_MAGIC ||
          slab->next->heap != heap ||
          slab->next->class_index != slab->class_index ||
          slab->next->previous != slab)) {
-        return 0;
+        return KERNEL_HEAP_STATUS_STATE;
     }
 
-    return 1;
+    return KERNEL_HEAP_STATUS_OK;
 }
 
 static enum kernel_heap_status slab_create(struct kernel_heap *heap,
@@ -390,6 +393,7 @@ static enum kernel_heap_status allocate_small(struct kernel_heap *heap,
     enum kernel_heap_status status;
     {
         KERNEL_RAW_SCOPE(guard, &heap->lock);
+        heap->statistics.allocation_calls++;
         struct kernel_slab *slab = heap->partial_slabs[class_index];
         if (slab) return slab_allocate_slot(heap, slab, class_index, pointer);
     }
@@ -457,6 +461,7 @@ static enum kernel_heap_status allocate_large(struct kernel_heap *heap,
     {
         KERNEL_RAW_SCOPE(guard, &heap->lock);
         statistics_add_pages(heap, order);
+        heap->statistics.allocation_calls++;
         heap->statistics.live_allocations++;
     }
     *pointer = result;
@@ -508,17 +513,16 @@ enum kernel_heap_status kernel_heap_allocate(
     if (!heap_initialized(heap) || pointer == 0) {
         return KERNEL_HEAP_STATUS_INVALID;
     }
-    {
-        KERNEL_RAW_SCOPE(guard, &heap->lock);
-        heap->statistics.allocation_calls++;
-    }
     COST_ADD(HEAP_CALLS, 1); COST_ADD(HEAP_REQUESTED, size);
     if (size == 0U) {
+        KERNEL_RAW_SCOPE(guard, &heap->lock);
+        heap->statistics.allocation_calls++;
         *pointer = 0;
         return KERNEL_HEAP_STATUS_OK;
     }
 
-    if (small_class_for_size(size, &class_index)) {
+    int small = small_class_for_size(size, &class_index);
+    if (small) {
         status = allocate_small(heap, class_index, &result);
     } else {
         status = allocate_large(heap, size, &result);
@@ -526,6 +530,7 @@ enum kernel_heap_status kernel_heap_allocate(
     if (status != KERNEL_HEAP_STATUS_OK) {
         {
             KERNEL_RAW_SCOPE(guard, &heap->lock);
+            if (!small) heap->statistics.allocation_calls++;
             heap->statistics.allocation_failures++;
         }
         COST_ADD(HEAP_FAILURES, 1);
@@ -624,13 +629,9 @@ static enum kernel_heap_status allocation_information(
         uintptr_t slot_offset;
         uint32_t slot_index;
 
-        if (page_order != 0U || slab->magic != KERNEL_SLAB_MAGIC ||
-            slab->heap != heap ||
-            slab->class_index >= KERNEL_HEAP_SIZE_CLASS_COUNT ||
-            slab->slot_offset != sizeof(*slab) || slab->slot_count == 0U ||
-            slab->slot_count > KERNEL_SLAB_BITMAP_WORDS * 64U) {
-            return KERNEL_HEAP_STATUS_INVALID;
-        }
+        if (page_order != 0U) return KERNEL_HEAP_STATUS_INVALID;
+        enum kernel_heap_status status = slab_metadata_validate(heap, slab);
+        if (status) return status;
         slot_size = class_size(slab->class_index);
         slot_start = page_value + slab->slot_offset;
         if (value < slot_start) {
@@ -676,6 +677,16 @@ void kernel_heap_release(
     }
     KERNEL_RAW_SCOPE(guard, &heap->lock);
 
+    if (heap->statistics.live_allocations == 0U) __builtin_trap();
+    if (!((uintptr_t)pointer & BOAROS_PAGE_MASK)) {
+        if (!heap->physical_address(pointer, &physical_address) ||
+            (physical_address & BOAROS_PAGE_MASK)) __builtin_trap();
+        order = physical_page_release_allocation(heap->page_allocator, physical_address);
+        statistics_remove_pages(heap, order);
+        heap->statistics.live_allocations--;
+        return;
+    }
+
     status = allocation_information(heap,
                                     pointer,
                                     &physical_address,
@@ -687,19 +698,7 @@ void kernel_heap_release(
     if (status != KERNEL_HEAP_STATUS_OK) {
         __builtin_trap();
     }
-    if (slab != 0 && !slab_metadata_valid(heap, slab)) {
-        __builtin_trap();
-    }
-    if (heap->statistics.live_allocations == 0U) {
-        __builtin_trap();
-    }
-
-    if (slab == 0) {
-        (void)physical_page_release_order(heap->page_allocator,
-                                                  physical_address,
-                                                  order);
-        statistics_remove_pages(heap, order);
-    } else {
+    {
         int was_full = slab->free_count == 0U;
         if (slab->free_count >= slab->slot_count) {
             __builtin_trap();

@@ -39,7 +39,10 @@ enum kernel_files_status kernel_files_ioctl(
     enum kernel_files_status status = kernel_files_pin_data(files, fd, &description,
                                                        linux_result);
     if (status != KERNEL_FILES_STATUS_OK || *linux_result) return status;
-    *linux_result = description->block ? kernel_block_file_ioctl(files, &description, mm, command, argument) :
+    if (description->kind==KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE)
+        *linux_result=(kernel_open_file_flags(description)&010000000U)?-KERNEL_EBADF:
+            command==0xb703U?0x20000:-KERNEL_ENOTTY; /* NS_GET_NSTYPE */
+    else *linux_result = description->block ? kernel_block_file_ioctl(files, &description, mm, command, argument) :
         description->device && description->device->ioctl
         ? description->device->ioctl(description->device_instance, kernel_task_current(), files, &description, mm, command, argument) : -KERNEL_ENOTTY;
     enum kernel_open_file_status release = kernel_open_file_release(&description);

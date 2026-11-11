@@ -48,12 +48,14 @@ enum kernel_vma_kind {
     KERNEL_VMA_KIND_ANON_SHARED,
     KERNEL_VMA_KIND_FILE_SHARED,
     KERNEL_VMA_KIND_SYSV_SHM,
+    KERNEL_VMA_KIND_OBJECT_SHARED,
 };
 
 enum kernel_vma_role {
     KERNEL_VMA_ROLE_NONE = 0,
     KERNEL_VMA_ROLE_ELF,
     KERNEL_VMA_ROLE_VDSO,
+    KERNEL_VMA_ROLE_VVAR,
     KERNEL_VMA_ROLE_STACK,
     KERNEL_VMA_ROLE_HEAP,
     KERNEL_VMA_ROLE_MMAP,
@@ -67,6 +69,7 @@ enum kernel_vma_fault_policy {
     KERNEL_VMA_FAULT_ELF,
     KERNEL_VMA_FAULT_ANON_SHARED,
     KERNEL_VMA_FAULT_FILE_SHARED,
+    KERNEL_VMA_FAULT_OBJECT_SHARED,
 };
 
 /* A value copy; callers must not retain backing as a standalone owner. */
@@ -82,8 +85,8 @@ struct kernel_vma {
     uint32_t flags;
     void *backing;
     struct kernel_shm_attachment *shm_attachment;
-    /* Only sealable file VM_SHARED|VM_MAYWRITE mappings charge this inode.
-     * The MM's backing OFD owns it until all corresponding VMAs are gone. */
+    /* VM_MAYWRITE mappings charge their sealable file or shared object.
+     * The MM backing OFD owns the counter until all such VMAs are gone. */
     uint64_t *shared_write_bytes;
 };
 

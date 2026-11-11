@@ -27,6 +27,7 @@ struct kernel_open_file_description {
     uint32_t references;
     uint8_t kind;
     uint8_t vfs_closed;
+    uint8_t notify_opened;
     struct kernel_pipe *pipe;
     uint64_t pipe_observed_writers;
     uint8_t pipe_endpoint;

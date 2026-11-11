@@ -1,0 +1,20 @@
+BEGIN {
+  printf("BPFTRACE COMPILED BEGIN\n");
+}
+tracepoint:raw_syscalls:sys_enter /pid == $1 && args.id == 155/ {
+  @started[tid] = nsecs;
+  @entered[pid, tid] = count();
+}
+tracepoint:raw_syscalls:sys_exit /pid == $1 && args.id == 155/ {
+  if (@started[tid]) {
+    @completed[pid, tid] = count();
+    @latency_ns[pid, tid] = sum((int64)nsecs - (int64)@started[tid]);
+    printf("BPFTRACE syscall pid=%d tid=%d\n", pid, tid);
+    if (!delete(@started, tid)) {
+      printf("BPFTRACE DELETE FAILED\n");
+    }
+  }
+}
+END {
+  printf("BPFTRACE CLEAN END\n");
+}

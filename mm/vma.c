@@ -125,11 +125,11 @@ static int vma_valid(const struct kernel_vma *vma)
 {
     if (vma == 0 || vma->start >= vma->end ||
         vma->kind < KERNEL_VMA_KIND_ANONYMOUS ||
-        vma->kind > KERNEL_VMA_KIND_SYSV_SHM ||
+        vma->kind > KERNEL_VMA_KIND_OBJECT_SHARED ||
         vma->role < KERNEL_VMA_ROLE_NONE ||
         vma->role > KERNEL_VMA_ROLE_SYSV_SHM ||
         vma->fault_policy < KERNEL_VMA_FAULT_RESIDENT_REQUIRED ||
-        vma->fault_policy > KERNEL_VMA_FAULT_FILE_SHARED) {
+        vma->fault_policy > KERNEL_VMA_FAULT_OBJECT_SHARED) {
         return 0;
     }
     if ((vma->flags & ~KERNEL_VMA_ALL_FLAGS) || (vma->flags & KERNEL_VMA_LOCK_MASK) == KERNEL_VMA_LOCK_ONFAULT) return 0;
@@ -173,6 +173,10 @@ static int vma_valid(const struct kernel_vma *vma)
     if (vma->kind == KERNEL_VMA_KIND_FILE_SHARED &&
         (vma->backing == 0 ||
          vma->fault_policy != KERNEL_VMA_FAULT_FILE_SHARED ||
+         vma->backing_offset > UINT64_MAX - (vma->end - vma->start))) return 0;
+    if (vma->kind == KERNEL_VMA_KIND_OBJECT_SHARED &&
+        (!vma->backing || vma->fault_policy != KERNEL_VMA_FAULT_OBJECT_SHARED ||
+         (vma->backing_offset & BOAROS_PAGE_MASK) ||
          vma->backing_offset > UINT64_MAX - (vma->end - vma->start))) return 0;
     return 1;
 }
@@ -970,7 +974,7 @@ enum kernel_vma_status kernel_vma_set_commit_edit(
             account_bytes(&usage, &set->entries[index], bytes, 1);
         }
     } else {
-        /* mmap holds inode admission until publication. On replacement the
+        /* mmap holds file/object admission until publication. On replacement the
          * new charge precedes retirement; the old PTEs are already revoked. */
         if (edit->kind==KERNEL_VMA_EDIT_REPLACE)
             account_shared_write(&edit->replacement,edit->end-edit->start,1);

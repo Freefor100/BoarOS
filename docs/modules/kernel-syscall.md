@@ -46,6 +46,7 @@ LA的259仍返回`ENOSYS`。这些入口的直接消费者可用`python3 tests/u
 | epoll_create1/ctl/pwait（20–22）、dup/dup3/fcntl（23–25） | [文件模块](kernel-files.md)：OFD 共享、就绪与生命周期 |
 | getcwd（17）、mkdirat/unlinkat/symlinkat（34–36）、renameat/renameat2（38/276）、chdir/fchdir（49/50）、openat/close（56/57）、readlinkat（78） | [文件模块](kernel-files.md)：路径、flags、dirfd 与错误 |
 | ftruncate/fallocate（46/47）、pipe2（59）、getdents64/lseek（61/62）、read/write/readv/writev/pread64/pwrite64/preadv/pwritev（63–70） | [文件模块](kernel-files.md)：部分成功、offset、pin、稀疏文件、pipe 与目录 cookie |
+| bpf（280）、perf_event_open（241） | [BPF 模块](kernel-bpf.md)：对象/map/程序/BTF、socket 过滤与 raw_syscalls 跟踪 |
 | sendfile（71） | [文件模块](kernel-files.md)：有界内核复制、位置、来源片段、整包与同步错误 |
 | statfs/fstatfs（43/44）、utimensat（88） | [文件模块](kernel-files.md)：挂载统计、显式纳秒时间与 fd/nofollow |
 | pselect6/ppoll（72/73）、newfstatat/fstat（79/80） | [文件模块](kernel-files.md)：集合/信号屏蔽、stat 编码和元数据 |
@@ -54,7 +55,7 @@ LA的259仍返回`ENOSYS`。这些入口的直接消费者可用`python3 tests/u
 - `sched_yield` 编号 124 把当前任务排到其优先级队尾，再按优先级与实时预算资格重选；只有较低优先级 READY 任务时 FIFO/RR 可继续当前任务，RR 保留剩余时间片。调度失败属于内核不变量破坏，由 Trap 边界 fatal。
 - `sched_getscheduler(120)`、`sched_getparam(121)`、`sched_getaffinity(123)`、`sched_rr_get_interval(127)` 与 `sched_getattr(275)` 在发起 CPU 执行。任务身份、策略、基础优先级及亲和掩码在 scheduler 身份保护下取得完整小快照，释放保护后才复制到用户内存；PI 临时继承的有效优先级不替换查询到的基础值。`sched_setparam(118)`、`sched_setscheduler(119)` 和 `sched_setaffinity(122)` 保持 CPU0 服务执行规则；优先级上下限查询 125/126 与 `getcpu(168)` 也在发起 CPU 执行。
 - `sched_getattr(275)` 在 RV64/LA64 使用相同的 56 字节原生结构，接受 48 字节旧版、48～56 字节间的任意前缀，以及不超过架构基页大小的扩展结构。返回 `size=min(用户长度,56)`；扩展尾部先清零，再写已知前缀，因此尾部 `EFAULT` 不改写结构头。先检查空指针、负 TID 和长度，再查目标，随后检查 flags，最后输出；当前支持 OTHER/FIFO/RR，只有 flags=0 有效。策略与 RESET_ON_FORK 来自任务快照，nice 为实际固定值 0；OTHER 的 runtime 为当前普通调度量子 10ms，与 127 的普通策略间隔一致，FIFO/RR 的 runtime 为 0；deadline、period 与未启用的 util_min/util_max 为 0。Linux fair 类的 runtime 来自其自身调度 slice，具体数值不要求与 BoarOS 普通调度量子相等。
-- `preadv/pwritev` 编号 69/70，复用向量复制和定位 I/O；一次调用固定一份 OFD，保留完成前缀并保持共享当前位置。管道等不可定位对象返回 `ESPIPE`。
+- `preadv2/pwritev2` 编号 286/287 尚未实现，返回 `ENOSYS`。`preadv/pwritev` 编号 69/70，复用向量复制和定位 I/O；一次调用固定一份 OFD，保留完成前缀并保持共享当前位置。管道等不可定位对象返回 `ESPIPE`。
 - `exit` 编号 93 产生线程 `EXIT`，`exit_group` 编号 94 产生全组 `EXIT_GROUP`；状态保留参数 0 的低 8 位。组退出等待成员沿原内核调用栈释放在用资源，最后产生一次进程退出通知。
 - `set_tid_address` 编号 96 记录 clear_tid 用户指针并返回调用 TID；线程退出在释放 MM 前清零并唤醒同 key 的一个 futex waiter。坏用户指针不破坏内核状态。
 - `futex` 编号 98 支持 WAIT、WAKE、REQUEUE、CMP_REQUEUE、WAKE_OP、WAIT_BITSET、WAKE_BITSET、PI 锁及 PI 条件重排；`futex_waitv` 编号 449 支持多地址等待。key、排序、掩码、超时、错误码及扩展边界见[调度模块](kernel-scheduler.md#等待与-futex)；无超时等待按 SA_RESTART 选择 EINTR 或重新等待，带超时等待的用户 handler 总是看到 EINTR、无 handler restart 保持原 absolute deadline。

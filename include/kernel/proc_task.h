@@ -3,6 +3,7 @@
 
 #include <kernel/pid.h>
 #include <stdint.h>
+#include <stddef.h>
 
 struct kernel_vfs_path;
 struct kernel_task;
@@ -61,6 +62,9 @@ int kernel_proc_inode_owner(kernel_pid_t,uint64_t,int thread,uint32_t mode,uint3
 
 /* Identity changes on PID reuse; zero asks for the current allocation. */
 int kernel_proc_process_identity(kernel_pid_t pid, uint64_t *identity);
+struct kernel_fs_mounts;
+int kernel_proc_mounts_snapshot(kernel_pid_t,uint64_t,struct kernel_fs_mounts *);
+int kernel_proc_mount_handle(kernel_pid_t,uint64_t,struct kernel_fs_mounts *);
 /* Retain the already resolved proc process inode's identity, not a later
  * numeric lookup. The node releases this owner after its final reference. */
 int kernel_proc_process_identity_acquire(kernel_pid_t pid,uint64_t identity,
@@ -97,12 +101,14 @@ int kernel_proc_fd_path_acquire(kernel_pid_t pid, uint64_t identity,
 struct kernel_proc_fd_pseudo {
     uint64_t object_identity;
     uint8_t kind;
-    char name[267]; /* mqueue hidden-root link, including optional deleted suffix. */
+    char name[267]; /* Object display name, or mqueue path with deleted suffix. */
 };
 struct kernel_proc_fdinfo {
     uint64_t position, flags, mount_id, inode;
     int32_t pid;
     uint8_t pidfd;
+    size_t extra_length;
+    char extra[512];
 };
 int kernel_proc_fdinfo_snapshot(kernel_pid_t,uint64_t,int,struct kernel_proc_fdinfo *);
 int kernel_proc_fdinfo_access(kernel_pid_t,uint64_t);

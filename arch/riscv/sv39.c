@@ -1503,16 +1503,17 @@ enum riscv_sv39_status riscv_sv39_user_map_prepared_page(struct riscv_sv39_user_
     uint64_t address, uint64_t physical, uint32_t permissions,
     struct kernel_mm_leaf_preparation *prepared)
 {
-    if (!s || !valid_user_permissions(permissions) || (physical & BOAROS_PAGE_MASK))
+    if (!s || (permissions && !valid_user_permissions(permissions)) || (physical & BOAROS_PAGE_MASK))
         return RISCV_SV39_STATUS_INVALID;
     void *owner;
-    if (s->leaf_pages == UINT32_MAX ||
+    if ((permissions ? s->leaf_pages : s->protected_pages) == UINT32_MAX ||
         physical_page_map_owned(s->allocator, physical, &owner) != PHYSICAL_PAGE_STATUS_OK)
         return RISCV_SV39_STATUS_STATE;
     enum riscv_sv39_status status = install_prepared_leaf(s, address,
-        user_leaf_entry(physical, permissions), prepared);
+        permissions ? user_leaf_entry(physical, permissions) : protected_entry(physical, 0), prepared);
     if (status) return status;
-    s->leaf_pages++; resident_peak(s);
+    if (permissions) s->leaf_pages++; else s->protected_pages++;
+    resident_peak(s);
     return RISCV_SV39_STATUS_OK;
 }
 enum riscv_sv39_status riscv_sv39_user_move_leaf(struct riscv_sv39_user_space *s,

@@ -55,6 +55,19 @@ static inline void kernel_wait_record_store(struct kernel_wait_record *record,
 static inline void kernel_wait_record_transition(struct kernel_wait_record *record,
     uint64_t generation, unsigned phase, unsigned reason)
 { kernel_wait_record_store(record,generation,phase,reason); }
+/* The owner publishes COMMITTED under the protection that guards BLOCKED.
+ * A PREPARED notifier can win independently of either scheduling lock. */
+static inline int kernel_wait_try_commit(struct kernel_wait_record *record,uint64_t generation)
+{
+    uint64_t expected=kernel_wait_state(generation,KERNEL_WAIT_PREPARED,KERNEL_WAIT_WOKEN) |
+        ((uint64_t)record->interruptible<<4);
+    uint64_t committed=(expected&~UINT64_C(3))|KERNEL_WAIT_COMMITTED;
+    if (__atomic_compare_exchange_n(&record->state,&expected,committed,0,
+            __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) return 1;
+    if ((expected>>5)!=generation || (expected&3U)!=KERNEL_WAIT_NOTIFIED) __builtin_trap();
+    return 0;
+}
+
 #else
 #define KERNEL_WAIT_GENERATION_MAX UINT64_MAX
 static inline uint64_t kernel_wait_record_generation(const struct kernel_wait_record *record)
@@ -98,6 +111,7 @@ void kernel_wait_record_init(struct kernel_wait_record *);
 enum kernel_scheduler_status kernel_wait_node_bind_locked(struct kernel_wait_queue *,struct kernel_wait_node *,const struct kernel_wait_token *);
 int kernel_wait_notify_locked(const struct kernel_wait_token *, uint32_t);
 #if BOAROS_USER_SMP
+void kernel_wait_interrupt_locked(struct kernel_task *);
 /* 1: target queue protected, 0: obsolete, -1: common placement needed.
  * Only a caller with the wait domain may retire a deadline from the index. */
 int kernel_wait_backend_lock_local(const struct kernel_wait_token *,struct kernel_raw_guard *,int domain);
@@ -133,6 +147,12 @@ int kernel_wait_backend_initialized(void);
 int kernel_wait_backend_signal(struct kernel_task *);
 uint64_t kernel_wait_backend_time(void);
 void kernel_wait_backend_commit(struct kernel_task *, uint64_t, int);
+#if BOAROS_USER_SMP
+/* A handled request either resumed on its own stack or received an early
+ * notification. False leaves PREPARED for the normal scheduler domain. */
+int kernel_wait_backend_park_local(const struct kernel_wait_token *,
+    enum kernel_scheduler_status *);
+#endif
 void kernel_wait_backend_notify(struct kernel_task *, uint32_t);
 void kernel_wait_backend_ready(struct kernel_task *);
 /* Success resumes this owner with a stable NOTIFIED result until finish. */

@@ -97,6 +97,14 @@ staging 累计请求容量、heap 请求字节和成功物理页。短写以实�
 CPU0缓存请求复用已有窗口计时，输出 `cache_queue_ns` 与 `cache_execute_ns` 的累计、次数、最大值和直方图，单位为纳秒。
 续批每次重新入队后分别计时。排队包含其他请求执行及调度等待；执行包含本窗口内部的锁等待和设备I/O，二者均不是纯CPU开销。
 数据记录在实际worker所属lane，归属不随其借用的调用者记账身份改变。默认构建不生成这两项采样操作。
+网络分别记录端点状态锁的 `network_state_wait_ticks/hold_ticks`，以及 lwIP 共享存储保护的
+`network_pool_wait_ticks/hold_ticks`。前者复用实际 raw guard 的时间，后者覆盖静态堆、
+memp 和 pbuf 引用等共用的保护段；均在释放真实锁后发布计数，不含之后的通知执行。
+`network_prepare_ticks` 覆盖 detached TCP 准备，`network_segment_alloc_ticks` 覆盖新段的
+pbuf 与 segment 分配，`network_copy_bytes/ticks` 覆盖向最终 pbuf 的向量复制，包含
+inline 和 detached 两种入口。准备时间包含其内部的分配与复制，分配时间也包含池锁等待，
+不能把这些嵌套时间相加。新观察点仅在有效窗口读取时钟；共享存储保留每 CPU 32 字节，
+不增加任务字段，默认构建不生成这些状态或采样。
 设备按 registry 的磁盘0/1/其他聚合；请求在 submit 保存标量 epoch/lane，IRQ 完成和 reset
 使用提交身份，旧请求不能污染新窗口。fixture 未登记设备属于 other；设备详细计时只在
 观测构建产生，用户页解析由 `COST_USER_RESOLUTIONS` 统一记录。

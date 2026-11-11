@@ -3,7 +3,7 @@
 本文描述任务地址空间的通用所有权接口、共享 MM 策略、RISC-V Sv39 与 LA64 后端。页表格式、映射规则和硬件切换见 [RISC-V Sv39 分页模块](riscv-sv39.md)，地址空间与任务身份分离的背景见[内存管理学习总结](../learning/memory-management.md)。
 
 普通 MM、受控任务绑定的 MM 和 `USER_SMP` 使用分层并发协调协议：
-- `record->operations`（rank 25 读写锁）：非固定私有匿名映射创建、纯匿名撤销、锁页属性修改和匿名/COW 缺页可取得共享读资格；固定地址映射、fork、销毁、mremap、mprotect 和文件/ELF/SysV 映射使用独占写资格。撤销前在操作资格内判断映射类型；文件来源、resident 与 alias 仍由写者维护。默认 UP 使用独占资格。
+- `record->operations`（rank 25 读写锁）：非固定私有匿名映射创建、纯匿名撤销、锁页属性修改和匿名/COW 缺页可取得共享读资格；固定地址映射、fork、销毁、mremap、mprotect 和文件/ELF/SysV/BPF 对象映射使用独占写资格。撤销前在操作资格内判断映射类型；文件来源、resident 与 alias 仍由写者维护。默认 UP 使用独占资格。
 - 范围协调机制（`struct kernel_mm_range_claim`）：在 `record->metadata`（raw 自旋锁）保护下登记活动地址区间。不相交区间的匿名撤销、锁页及缺页可并行推进；重叠区间通过 `record->range_changed` 等待与排他协调。持有用户页借用的调用者非阻塞尝试范围资格，避免与排空 pin 的修改者相互等待。UP 的独占操作不重复登记范围。
 - VMA 局部锁（`record->vma_lock`，rank 31 读写锁）保护共享操作中的数组、用量及代次；锁页额度检查和属性提交使用同一次写资格。页表解绑、远端 TLB 广播和物理页归还在锁外执行。UP 的独占操作可直接使用 VMA 状态。
 - 并发缺页局部校验：私有匿名缺页在提交硬件页表前，在 `vma_lock` 保护下只校验目标地址对应的 VMA 一致性并检查范围认领冲突，其他核心对无关地址区间的 VMA 增删不会迫使当前缺页发生假冲突重试。
@@ -28,7 +28,7 @@ mincore 每页输出最低位的驻留状态，查询本身不装入页面。MM 
 
 RV64/LA64 的 madvise(233) 支持 NORMAL、RANDOM、SEQUENTIAL、WILLNEED、DONTNEED、FREE、REMOVE，以及 DONTFORK/DOFORK、WIPEONFORK/KEEPONFORK，参数中的 advice 按 Linux 32 位 int 解释。NORMAL/RANDOM/SEQUENTIAL 验证映射范围并沿用当前缓存策略；它们是性能建议。未接入的扩展模式返回 EINVAL。
 
-DONTNEED 在 MM 修改资格内撤销范围的 PTE 和文件驻留登记，保留 VMA、保护位、AS/DATA 用量和后备对象。私有匿名页重新访问得到零，私有文件 COW 页面重新取文件内容；共享匿名、SysV 和共享文件的数据保存在真实后备中。vDSO 保留特殊映射身份，缺页从内核中的架构信号返回代码重新装入，并完成指令缓存与 TLB 同步。复用现有有界退页过程，页和页表在活动 CPU 完成 TLB 失效后释放。范围中的空洞最终返回 ENOMEM，空洞两侧的有效映射仍执行；遇到锁定 VMA 返回 EINVAL，保留此前范围已经完成的变化。
+DONTNEED 在 MM 修改资格内撤销范围的 PTE 和文件驻留登记，保留 VMA、保护位、AS/DATA 用量和后备对象。私有匿名页重新访问得到零，私有文件 COW 页面重新取文件内容；共享匿名、SysV 和共享文件的数据保存在真实后备中；BPF 对象映射保留 map 数据但不补回 PTE，再访问产生 SIGBUS（见[BPF 对象共享映射](#bpf-对象共享映射)）。vDSO 代码缺页从内核内嵌的 ELF 重新装入，并完成指令缓存与 TLB 同步；只读 vVAR 缺页重新映射本 MM 持有的共享时钟页。复用现有有界退页过程，页和页表在活动 CPU 完成 TLB 失效后释放。范围中的空洞最终返回 ENOMEM，空洞两侧的有效映射仍执行；遇到锁定 VMA 返回 EINVAL，保留此前范围已经完成的变化。
 
 FREE 作用于私有匿名页及纯 BSS 零后备，登记时保留原内容；共享或文件后备及锁定范围返回 EINVAL。登记先排空已有写 pin，把当前页标记为写时故障，完成 TLB 确认后才接入回收。之后用户写或内核向用户页写成功时撤销该页候选，原有 COW 用实际引用处理 fork 后的独立写；fork 为继承页面复制回收候选，mremap 随页表叶移动候选，unmap 和退出归还登记。候选页和 PROT_NONE 页都保留真实 PTE owner。
 
@@ -380,6 +380,12 @@ make test-mm-smp-userland-riscv INIT_CONFIG=config/init.json
 
 host 链接真实 MM/VMA/Sv39/allocator/uaccess/等待实现，只替换硬件及调度后端；2/4 actor 模型与两逻辑 CPU 活动集合模型分列。真实 MTTCG 双RAM验证见[两核模块](riscv-smp.md)。固定资料、准备/提交理由及资源证据见[内存学习说明](../learning/memory-management.md#匿名并发的许可与失效完成)。
 
+
+## BPF 对象共享映射
+
+`OBJECT_SHARED` VMA 以 BPF map OFD 和 map 内偏移作为来源，同一个 MM 的来源列表持有 OFD，因此关闭 FD 后，fork、拆分和移动仍保留原 map。对象页没有 inode、page cache 或截断登记；ARRAY 值区与 RINGBUF 重复数据窗口直接取得 map 存储的真实物理页引用。mmap 在独占 MM 修改资格内装入整个范围，再发布 VMA；页表分配在 raw metadata 锁外完成，每个 PTE 接收一个真实页引用，初始 PROT_NONE 直接安装受保护的 PTE。中途失败撤销已经安装的页，并归还页表和来源；MAP_FIXED 失败留下空洞。撤销沿共同 TLB 确认和页退休路径归还引用。
+
+mmap 从 map 的 `mapping_lock` 接纳到 VMA 发布都与 freeze 串行。调用者的 OFD pin 保留至 admission 锁释放；MM 仅在首次登记该来源时另取一个引用，所以并发 munmap 与 FD close 不能释放尚未解锁的 map。最初可写映射把 `shared_write_bytes` 指向 map 的计数，VMA 拆分、fork、替换、移动和释放按映射字节维护；mprotect 降为只读仍保留可写上限及计数。最初只读映射清除 WRITE 上限，所有对象映射清除 EXEC 上限。MADV_DONTNEED 撤销 PTE 后保留 VMA 和 map 数据，但该映射没有补页路径，再访问返回 SIGBUS；fork、mprotect 和 mremap 都不会恢复已丢弃的页，新 mmap 可重新映射同一份数据。这与固定 Linux `remap_vmalloc_range` 预装页、BPF 默认 vm_ops 没有 fault 回调的行为一致。mremap 可移动或缩小；扩大范围或 old_size=0 复制返回 EFAULT，MREMAP_DONTUNMAP 返回 EINVAL，沿用 VM_DONTEXPAND 的限制。共享 futex 对此类没有 inode/匿名身份的 vmalloc 页返回 EFAULT，私有 futex 仍按 MM 和虚拟地址取键，与固定 Linux 的 BPF 映射规则一致。
 
 ## tmpfs 文件映射
 

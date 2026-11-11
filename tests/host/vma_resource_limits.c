@@ -92,6 +92,23 @@ int main(void)
     assert(!kernel_vma_set_trim_end(set,P,4*P,2*P));usage(set,1,1);
     assert(!kernel_vma_set_trim_end(set,P,2*P,P));usage(set,0,0);
     assert(!kernel_vma_set_destroy(&set));
+    /* Writable object VMAs retain MAYWRITE across mprotect. Splits, duplicate
+     * mappings and fork charge exact virtual bytes; removal balances them. */
+    uint64_t writable=0;
+    assert(!kernel_vma_set_create(&heap,&set));
+    v=(struct kernel_vma){.start=P,.end=4*P,.permissions=3,.maximum_permissions=3,
+        .kind=KERNEL_VMA_KIND_OBJECT_SHARED,.role=KERNEL_VMA_ROLE_MMAP,
+        .fault_policy=KERNEL_VMA_FAULT_OBJECT_SHARED,.backing=&backing,
+        .shared_write_bytes=&writable};
+    assert(!kernel_vma_set_insert(set,&v)&&writable==3*P);
+    assert(!kernel_vma_set_prepare_protect(set,2*P,3*P,1,&edit)&&
+        !kernel_vma_set_commit_edit(set,&edit)&&writable==3*P);
+    assert(kernel_vma_set_prepare_protect(set,P,2*P,7,&edit)==KERNEL_VMA_STATUS_ACCESS);
+    assert(!kernel_vma_set_fork(set,&copy)&&writable==6*P);
+    assert(!kernel_vma_set_prepare_replace(set,2*P,3*P,NULL,&edit)&&
+        !kernel_vma_set_commit_edit(set,&edit)&&writable==5*P);
+    assert(!kernel_vma_set_destroy(&copy)&&writable==2*P);
+    assert(!kernel_vma_set_destroy(&set)&&!writable);
     struct kernel_heap_statistics stats;kernel_heap_get_statistics(&heap,&stats);
     assert(!stats.live_allocations&&!stats.current_pages&&physical_page_available(&pages)==baseline);
     assert(!physical_page_allocator_audit(&pages));

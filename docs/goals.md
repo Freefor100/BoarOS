@@ -8,18 +8,18 @@
 
 RV、LA 已支持实际 1～8 核用户执行，默认交付仍为单核。每个 READY 任务只归属一个 CPU 队列；跨核调度、等待、共享 MM 失效、信号与各对象生命周期使用共同实现。
 
-主要数据路径已在调用核执行：ext4 读写及目录准备、用户复制、匿名缺页、futex、IPC 收发、普通管道和事件等待。各子系统的执行位置及共享状态统一见[共同调度与业务状态](modules/kernel-scheduler.md#smp-的共同调度与业务状态)。多核可调用与独立负载得到加速分别验收；INET 协议、设备中断、日志/后台写回及部分控制仍由 CPU0 推进，共享调度、缓存和 MM 编辑范围仍需按实际成本改善。
+主要数据路径已在调用核执行：ext4 读写及目录准备、用户复制、匿名缺页、futex、IPC 收发、普通管道和事件等待。各子系统的执行位置及共享状态统一见[共同调度与业务状态](modules/kernel-scheduler.md#smp-的共同调度与业务状态)。多核可调用与独立负载得到加速分别验收；已建立的 TCP 连接由各归属核推进；ext4 的日志提交和 checkpoint 按在线核数分配。设备中断、UDP、挂载控制和页缓存后台写回仍保留 CPU0 边界。
 | 主线 | 尚缺能力 | 完成口径 |
 |---|---|---|
 | 共享 MM 与子系统 | 非固定私有匿名映射、匿名撤销和锁页属性已支持范围协调；固定地址替换、mprotect、文件/ELF装页仍有独占范围。共享MM锁页循环的等待交接仍有多核负加速，非ext4后端、设备/DMA与退出仍有未覆盖的消费者组合 | 复制与撤映射、降权、截断、I/O/close/退出的强制交错正确；确认停止使用后才回收 |
 | 组合与 LA 扩展 | RV／LA八核的更广应用及尚未覆盖的故障/消费者组合、实板 | 架构结果独立验收，保留单核对照；正确性成立后再衡量并行收益 |
 
-普通任务的实际入队、领取和旧栈归还由各核协调；等待提交、期限与实时资格仍有共同控制。共享 MM 的数组编辑/PTE 发布、缓存索引与 LRU、CPU0 协议和后台写回仍有串行范围，尚有负加速和同步尾延迟问题。各负载的耗时、CPU、吞吐及同内核扩展性由兼容分支的[CPU 成本报告](learning/cpu-accounting-cost.md)维护。
+普通任务的实际入队、领取、旧栈归还及无期限等待的阻塞提交由各核协调；有期限的等待、信号状态及实时资格仍有共同控制。共享 MM 的数组编辑/PTE 发布、缓存元数据与 LRU、共享 IP 和协议内存池仍有串行范围，尚有负加速和同步尾延迟问题。各负载的耗时、CPU、吞吐及同内核扩展性由兼容分支的[CPU 成本报告](learning/cpu-accounting-cost.md)维护。
 
 ### P6b 锁、等待与中断规则
 
 CPU 本地/current、抢占控制、buddy/slab raw、代次等待与可睡眠锁内部保护已存在。
-压力挂钩使用实际组引用，可由远端发布通知；干净回收按正向锁序等待缓存元数据，归还物理引用后处理 node/entry 释放；脏数据由 worker 写回，写入接纳边界推进有界回收。网络协议与控制、epoll 控制、非 ext4 命名空间、挂载连接管理及设备业务仍有 CPU0 边界。可睡眠锁释放内部raw后才显式调度。
+压力挂钩使用实际组引用，可由远端发布通知；干净回收按正向锁序等待缓存元数据，归还物理引用后处理 node/entry 释放；脏数据由 worker 写回，写入接纳边界推进有界回收。UDP 与监听和建连控制、epoll 控制、部分文件后端、挂载连接管理及设备业务仍有 CPU0 边界。可睡眠锁释放内部raw后才显式调度。
 接口契约和调用边界见[调度模块](modules/kernel-scheduler.md#smp前置的同步与等待契约2026-10-09)。
 
 任务索引、身份发布、查找借用和退休归还已在统一短调度域保护。
@@ -41,23 +41,24 @@ PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不�
 
 | 类别 | 未完成部分与依赖 | 当前契约 |
 |---|---|---|
-| 信号、线程与事件 | futex2 的NUMA/MPOL等扩展；clone3 的指定PID、cgroup、命名空间及其他扩展 clone 标志；timerfd的BOOTTIME/ALARM与运行时调钟取消 | [信号](modules/kernel-signal.md)、[调度](modules/kernel-scheduler.md)、[文件接口](modules/kernel-files.md)；clone3与CLONE_PIDFD覆盖现有进程资源共享组合 |
-| 用户内存 | mremap 的多VMA批量及特殊映射搬移；madvise 的 dump策略、回收/预装等扩展；/proc/<pid>/pagemap；供用户库使用的完整 vDSO ELF 与 `AT_SYSINFO_EHDR` | [MM](modules/kernel-mm.md)；普通匿名/文件映射支持缩小、扩大、搬移和DONTUNMAP，零旧长度可复制共享映射；madvise五种基础操作、匿名FREE、四种fork策略与共享后备REMOVE、SHM_LOCK/UNLOCK及MEMLOCK计费已接入，沿共同pin与TLB回收规则；当前 vDSO 页提供信号返回代码 |
-| 进程查询与 IPC | pidfd 的扩展 ioctl、kcmp 的 EPOLL_TFD、IPC namespace、运行时 IPC sysctl；preadv2/pwritev2 的扩展标志 | execve/execveat及按FD执行、chroot；getrusage、kcmp 的 FILE/VM/FILES/FS/SIGHAND/IO/SYSVSEM、pidfd_open/send_signal/getfd、clone 创建 pidfd、waitid(P_ALL/P_PID/P_PGID/P_PIDFD)、wait4、times、SysV 共享内存的 INFO/STAT/ANY 查询、信号量和消息队列及其 /proc/sysvipc 查询、preadv/pwritev 已存在；逐接口补齐语义与资源归还 |
-| 文件接口扩展 | inotify；openat2 的纯缓存查找、memfd 的大页后备、copy_file_range跨实例及其他扩展标志 | [openat2](modules/kernel-files.md#openat-与路径边界)支持受限路径解析，[memfd_create](modules/kernel-files.md#memfd_create-与文件封印)支持匿名内存文件与封印；flock、close_range及UNSHARE/CLOEXEC、fchmodat2、epoll_pwait2、同实例文件复制、sendmmsg/recvmmsg已提供；RV用户指令同步复用共享MM的指令代次与SBI确认 |
+| 信号、线程与事件 | futex2 的NUMA/MPOL等扩展；clone3 的指定 PID、cgroup、非挂载命名空间及其他扩展标志；timerfd的BOOTTIME/ALARM与运行时调钟取消 | [信号](modules/kernel-signal.md)、[调度](modules/kernel-scheduler.md)、[文件接口](modules/kernel-files.md)；clone3与CLONE_PIDFD覆盖现有进程资源共享组合 |
+| 用户内存 | mremap 的多VMA批量及特殊映射搬移；madvise 的 dump策略、回收/预装等扩展；/proc/<pid>/pagemap | [MM](modules/kernel-mm.md)；普通匿名/文件映射支持缩小、扩大、搬移和DONTUNMAP，零旧长度可复制共享映射；madvise五种基础操作、匿名FREE、四种fork策略与共享后备REMOVE、SHM_LOCK/UNLOCK及MEMLOCK计费已接入，沿共同pin与TLB回收规则；vDSO ELF 通过 AT_SYSINFO_EHDR 提供时间查询与信号返回 |
+| 进程查询与 IPC | pidfd 的扩展 ioctl、kcmp 的 EPOLL_TFD、IPC namespace、运行时 IPC sysctl；preadv2/pwritev2（整个 syscall 尚未实现） | execve/execveat及按FD执行、chroot；getrusage、kcmp 的 FILE/VM/FILES/FS/SIGHAND/IO/SYSVSEM、pidfd_open/send_signal/getfd、clone 创建 pidfd、waitid(P_ALL/P_PID/P_PGID/P_PIDFD)、wait4、times、SysV 共享内存的 INFO/STAT/ANY 查询、信号量和消息队列及其 /proc/sysvipc 查询、preadv/pwritev 已存在；逐接口补齐语义与资源归还 |
+| 文件接口扩展 | openat2 的纯缓存查找、memfd 的大页后备、copy_file_range跨实例及其他扩展标志 | [openat2](modules/kernel-files.md#openat-与路径边界)支持受限路径解析，[memfd_create](modules/kernel-files.md#memfd_create-与文件封印)支持匿名内存文件与封印；flock、close_range及UNSHARE/CLOEXEC、fchmodat2、epoll_pwait2、同实例文件复制、sendmmsg/recvmmsg、inotify 已提供；RV用户指令同步复用共享MM的指令代次与SBI确认 |
 | 存储介质与设备扩展 | GPT、扩展分区、FAT12/16、exFAT；块设备 mmap/discard/direct I/O；loop 分区扫描、CHANGE_FD 与 direct I/O | [块设备](modules/riscv-virtio-block.md)、[FAT32/VFAT](modules/fat32.md)；MBR 四主分区与常用文件后备 loop 已接入 |
 | 凭据与限制 | 用户命名空间、socketfs所有权与时间属性扩展、登录认证与用户数据库管理；NICE 的优先级接口与公平调度权重、core 文件写出 | [进程凭据](modules/kernel-scheduler.md)、[执行](modules/kernel-exec.md)、[内存](modules/kernel-mm.md)、[文件接口](modules/kernel-files.md)；16项资源限额均可查询、设置和继承；NPROC按真实UID计线程，RTPRIO约束调度授权，RTTIME限制连续RT执行，RSS/LOCKS沿Linux保留记录；AS/DATA、MEMLOCK锁页、CPU、NOFILE/STACK/CORE/FSIZE保持各自范围；线程 UID/GID/补充组、capability、DAC、set-ID/filecap 执行、tmpfs/ext4用户xattr及POSIX ACL，以及按真实 UID 的 SIGPENDING、POSIX mqueue 容量计账已接入 |
 | 网络与系统接口 | 外部 IPv6、IPv4 多地址与更丰富的路由；POSIX定时器的BOOTTIME/ALARM/TAI与运行时调钟、按需 prctl | [网络](modules/kernel-network.md)、[时钟](modules/kernel-time.md)；IPv4 地址、掩码、MTU 和单条默认网关可运行时设置；UNIX STREAM/DGRAM/SEQPACKET、FD传递与消息凭据已提供；匿名管道/FIFO支持容量查询、调整和创建 UID 额度；POSIX mqueue 与 libc 线程通知见[消息队列](modules/posix-mqueue.md)，NETLINK当前提供通知接收，通用路由处理另行实现；REAL/VIRTUAL/PROF间隔定时器及四类时钟的POSIX定时器已提供，DNS/TLS另核对真实随机/时间/证书依赖 |
+| BPF 网络与跟踪 | JIT、XDP/TC、AF_PACKET、seccomp、硬件 PMU 及 kprobe/uprobe/fentry 挂载 | [BPF](modules/kernel-bpf.md)；共用解释器、socket 过滤、map/BTF/bpffs、raw_syscalls tracepoint/perf/link 和 ringbuf 已接入；兼容范围围绕原版 bpftool/libbpf/bpftrace |
 | 架构与用户环境 | RV V；LA 纯 legacy PCI、更广原程序、客体原生开发及全断电恢复矩阵 | [LA](modules/loongarch-boot.md)、[程序环境](modules/program-environment.md)；不从共同清单或 SQLite 普通重启推定通过 |
 
 ### P1h 虚拟文件系统与多挂载
 
-基础 proc/tmpfs/devpts/mqueue/ext4/vfat 挂载、覆盖、目录/文件 bind、rbind、MS_MOVE、chroot、RO/RW 重配置、普通忙卸载与 MNT_DETACH/UMOUNT_NOFOLLOW 已存在；这里保留扩展缺口。
+基础 proc/tmpfs/devpts/mqueue/ext4/vfat 挂载、覆盖、目录/文件 bind、rbind、MS_MOVE、chroot、RO/RW 重配置、普通忙卸载与 MNT_DETACH/UMOUNT_NOFOLLOW 已存在。私有挂载命名空间通过 CLONE_NEWNS、unshare、setns 与 /proc/<pid>/ns/mnt 使用。
 
 | 扩展 | 尚缺语义 |
 |---|---|
 | proc 线程信息 | 其他按需线程字段；task 枚举、线程 stat/status、fd/fdinfo、exe/cwd/root、maps 与 thread-self 已提供，边界见[procfs模块](modules/procfs.md) |
-| 传播与 mount namespace | 挂载边/实例/路径/OFD/MM 的引用及摘树关系，跨任务可见性与退出回收 |
+| 挂载传播 | 私有挂载命名空间已支持复制、切换与回收；shared/slave/unbindable 传播组尚未实现 |
 | 挂载属性扩展 | atime 策略、同步及其他尚未支持的属性与重配置选项 |
 | umount2 扩展 | MNT_FORCE/EXPIRE 及错误优先级；force 不允许提前释放用户或 DMA 在用对象 |
 
@@ -75,9 +76,9 @@ NOEXEC在最终挂载的执行打开、access及文件映射上执行；NODEV限
 | allocator 与批量 MM 成本 | 森林13.6%–22.4%、raw互斥6.0%–7.3%、等待交接的默认匿名新增2.5%–4.0%分别测量；后台提交/退出交错与批量MM的IRQ尾延迟仍有成本 | [森林](learning/cost-baseline.md#buddy-森林匹配时间2026-10-09)、[raw 对照](learning/cost-baseline.md#allocator-短锁的匹配时间)、[等待交接](learning/cost-baseline.md#等待交接的匹配时间) |
 | 普通文件逐页管理与stdio成本 | 同规格原版iozone仍有RV／LA吞吐差距；小记录stdio的描述符导入、多目的区用户借用及库内复制分别产生开销。物理引用合批候选未通过单核性能检查，当前保留逐页引用实现 | [读取机制](modules/vfs-ext4.md#缓存版本内的批量读)；对照结果由兼容分支现有数据路径报告维护 |
 | 共享调度域短窗口 | 4KiB复制唤醒与32等待者OFD的正式成本仍未决，归因已停止；保留数据，不追加诊断，不作为RV两核规划前置项 | [匹配时间](learning/cost-baseline.md#共享调度域的匹配时间) |
-| 文件后端执行与剩余串行范围 | 范围写回已按窗口续批，fsync由调用者等待固定目标；ext4 冷读和 mmap 冷页在调用 CPU 装入；已打开文件的空间修改与 journal 接纳在发起 CPU；ext4 目录、路径元数据与普通最终关闭在发起 CPU；多执行者 journal ext4 的不同目录/文件可并行准备，接纳和拓扑变更保留各自必要的互斥；mount 管理、日志和后台写回继续在 CPU0，当前固定版本的匹配性能另行核对 | [VFS](modules/vfs-ext4.md#后台写回与水位回收)、[RV执行位置](modules/riscv-smp.md#普通文件io的执行位置) |
+| 文件后端执行与剩余串行范围 | 范围写回已按窗口续批，fsync由调用者等待固定目标；ext4 冷读和 mmap 冷页在调用 CPU 装入；已打开文件的空间修改与 journal 接纳在发起 CPU；ext4 目录、路径元数据与普通最终关闭在发起 CPU；多执行者 journal ext4 的不同目录/文件可并行准备，接纳和拓扑变更保留各自必要的互斥；挂载管理和后台数据写回仍在 CPU0；日志提交和 checkpoint 按在线核数选核 | [VFS](modules/vfs-ext4.md#后台写回与水位回收)、[RV执行位置](modules/riscv-smp.md#普通文件io的执行位置) |
 | GDT timestamp-touch 候选 | 隔离候选消除了干净 GDT 的 undo/restore 复制，但完整读取仍有负向观察，未进入 main | [时间戳研究](learning/file-timestamps.md) |
-| 网络端点与原生构建成本 | 端点队列与预约由跨核短锁保护，收发的用户复制和等待在调用 CPU；协议请求交给既有 CPU0 执行者，普通用户管道与poll/epoll等待在调用CPU，控制与关联清理仍有CPU0边界。默认预算、同步/排空及Lua工程的剩余成本按对应负载检查 | [网络](learning/network-ownership.md)、[预算](learning/data-path-budget-experiments.md)、[工具链](learning/offline-toolchain-probe.md) |
+| 网络端点与原生构建成本 | 端点队列与预约由跨核短锁保护，收发的用户复制和等待在调用 CPU；TCP 按连接归属核推进，UDP 与监听和建连控制仍在 CPU0；普通用户管道与 poll/epoll 等待在调用 CPU，控制与关联清理仍有CPU0边界。默认预算、同步/排空及Lua工程的剩余成本按对应负载检查 | [网络](learning/network-ownership.md)、[预算](learning/data-path-budget-experiments.md)、[工具链](learning/offline-toolchain-probe.md) |
 | 未归因现场 | 历史Virtqueue/页释放fatal/偶发取消、RV块统计case47及固定Linux LA终端等待，保留各自首个阶段与缺失证据；同类修复和重跑不关闭原事件 | [事故边界](learning/cost-baseline.md#旧版内存释放与-virtqueue-告警2026-10-02)、[程序证据](learning/user-program-inventory.md)、[块诊断](modules/riscv-virtio-block.md) |
 
 这些条目不是新执行计划；已有修复的过程与反例留在对应模块/learning，不重复列入待做。
@@ -87,7 +88,7 @@ NOEXEC在最终挂载的执行打开、access及文件映射上执行；NODEV限
 实板 VF2/2K1000LA 需取得固件、DTB 和设备输入后独立验收 RAM、IRQ、DMA/cache、根盘与网络；
 ASID 复用/性能在能观察标签 TLB 的硬件上核对。并行构建与每核队列/allocator/cache 优化依赖多核正确性和争用证据。
 LA 原生开发、C++/Rust、离线交付与更广应用由明确消费者触发，不作为 SMP 的无限前置清单。
-NUMA、swap/透明大页、完整 namespace/cgroup、seccomp/eBPF、Linux 模块 ABI、io_uring 暂无主线排期。
+NUMA、swap/透明大页、完整 namespace/cgroup、seccomp、BPF 的 JIT/XDP/TC 与探针挂载、Linux 模块 ABI、io_uring 暂无主线排期。
 
 ## 验收与分支职责
 

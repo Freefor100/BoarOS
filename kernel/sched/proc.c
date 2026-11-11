@@ -9,6 +9,7 @@
 #include <kernel/open_file.h>
 #include <kernel/proc_task.h>
 #include <kernel/pidfd.h>
+#include <kernel/bpf.h>
 #include <kernel/mqueue.h>
 #include "../../fs/open_file_internal.h"
 #include <kernel/fs_context.h>
@@ -431,6 +432,55 @@ int kernel_proc_process_path_acquire(kernel_pid_t pid, uint64_t identity,
     return result;
 }
 
+int kernel_proc_mounts_snapshot(kernel_pid_t pid,uint64_t identity,struct kernel_fs_mounts *owner)
+{
+    SCHEDULER_TASK_BORROW(task,find_resource_owner(pid,identity));
+    if (!task) return -KERNEL_ENOENT;
+    *owner=kernel_fs_context_mounts_snapshot(&task->fs);
+    return owner->namespace?0:-KERNEL_ENOENT;
+}
+
+int kernel_proc_mount_handle(kernel_pid_t pid,uint64_t identity,struct kernel_fs_mounts *owner)
+{
+    SCHEDULER_TASK_BORROW(task,find_resource_owner(pid,identity));
+    PROC_ACCESS(task);
+    if (!task) return -KERNEL_ENOENT;
+    *owner=kernel_fs_context_mounts_snapshot(&task->fs);
+    if (!owner->namespace) return -KERNEL_ENOENT;
+    int error=proc_access_check(&access);
+    if (error) kernel_fs_mounts_release(owner);
+    return error;
+}
+
+int kernel_task_setns_mount(struct kernel_task *caller,int32_t fd,uint32_t type)
+{
+    const uint32_t clone_newns=0x20000U;
+    KERNEL_FILES_PIN_SCOPE(pin);
+    struct kernel_open_file_description *file=kernel_files_hold_fd(&caller->files,fd,&pin);
+    if (!file) return -KERNEL_EBADF;
+    if (type && type!=clone_newns) return -KERNEL_EINVAL;
+    struct kernel_mount_namespace *ns=kernel_mount_namespace_file(file);
+    if (ns && (kernel_open_file_flags(file)&010000000U)) return -KERNEL_EINVAL;
+    if (!ns && (type!=clone_newns || file->kind!=KERNEL_OPEN_FILE_KIND_PIDFD))
+        return -KERNEL_EINVAL;
+    const struct kernel_credentials *cred=kernel_credentials_current();
+    if (!kernel_credentials_capable(cred,KERNEL_CAP_SYS_ADMIN) ||
+        !kernel_credentials_capable(cred,KERNEL_CAP_SYS_CHROOT)) return -KERNEL_EPERM;
+    if (ns) return kernel_fs_context_set_mount_namespace(&caller->fs,ns);
+
+    struct kernel_pid *id __attribute__((cleanup(kernel_task_identity_end)))=kernel_pidfd_identity_ref(file);
+    SCHEDULER_TASK_BORROW(target,find_resource_owner(id->number,id->generation|KERNEL_PROC_THREAD_TARGET));
+    if (!target) return -KERNEL_ESRCH;
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        if (!kernel_credentials_may_access_locked(caller,target,0)) return -KERNEL_EPERM;
+    }
+    struct kernel_fs_mounts mounts __attribute__((cleanup(kernel_fs_mounts_release)))=
+        kernel_fs_context_mounts_snapshot(&target->fs);
+    if (!mounts.namespace) return -KERNEL_ESRCH;
+    return kernel_fs_context_set_mount_namespace(&caller->fs,mounts.namespace);
+}
+
 int kernel_proc_next_fd(kernel_pid_t pid, uint64_t identity,
                          int after, int *fd)
 {
@@ -512,6 +562,12 @@ int kernel_proc_fd_pseudo_snapshot(kernel_pid_t pid, uint64_t identity,
         snapshot->object_identity = kernel_open_file_pseudo_identity(file);
         result = snapshot->kind==KERNEL_OPEN_FILE_KIND_MQUEUE
             ?kernel_mqueue_name(file,snapshot->name,sizeof(snapshot->name)):0;
+        if(snapshot->kind==KERNEL_OPEN_FILE_KIND_BPF){
+            const char *name=kernel_bpf_fd_name(file);
+            if(!name)__builtin_trap();
+            size_t n=strlen(name)+1;if(n>sizeof(snapshot->name))__builtin_trap();
+            memcpy(snapshot->name,name,n);
+        }
     }
     return result;
 }
@@ -554,6 +610,8 @@ int kernel_proc_fdinfo_snapshot(kernel_pid_t pid,uint64_t identity,int fd,
         .mount_id=file->file.mount?file->file.mount->id:0,.inode=stat.ino,
         .pidfd=file->kind==KERNEL_OPEN_FILE_KIND_PIDFD,
         .pid=file->kind==KERNEL_OPEN_FILE_KIND_PIDFD?kernel_pidfd_number(file):0};
+    if(file->kind==KERNEL_OPEN_FILE_KIND_BPF)
+        return kernel_bpf_fdinfo(file,snapshot->extra,sizeof(snapshot->extra),&snapshot->extra_length);
     return 0;
 }
 

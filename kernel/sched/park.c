@@ -249,11 +249,8 @@ enum kernel_scheduler_status kernel_wait_prepare(struct kernel_wait_queue *queue
     KERNEL_IRQ_SCOPE(irq);
     return prepare_owner(0,deadline,interruptible,token);
 }
-#if BOAROS_USER_SMP
-static int notify_locked(const struct kernel_wait_token *token,uint32_t reason)
-#else
-int kernel_wait_notify_locked(const struct kernel_wait_token *token,uint32_t reason)
-#endif
+static int notify_locked(const struct kernel_wait_token *token,uint32_t reason,
+    int committed_locked)
 {
     if (!token || !token->task || !token->generation) return 0;
     struct kernel_wait_record *record=kernel_wait_record_of(token->task);
@@ -272,8 +269,10 @@ int kernel_wait_notify_locked(const struct kernel_wait_token *token,uint32_t rea
         if (!__atomic_compare_exchange_n(&record->state,&state,notified,0,
                 __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) {
             /* The owner can finish or start its next wait without this domain. */
-            if ((state>>5)==token->generation && (state&3U)==KERNEL_WAIT_COMMITTED)
-                __builtin_trap();
+            if ((state>>5)==token->generation && (state&3U)==KERNEL_WAIT_COMMITTED) {
+                if (committed_locked) __builtin_trap();
+                return -1; /* Local park won; acquire its run queue before notifying. */
+            }
             return 0;
         }
         COST_ADD(WAIT_NOTIFICATIONS,1);
@@ -281,6 +280,7 @@ int kernel_wait_notify_locked(const struct kernel_wait_token *token,uint32_t rea
     }
 #endif
     if (phase==KERNEL_WAIT_COMMITTED) {
+        if (!committed_locked) return -1;
         kernel_wait_backend_notify(token->task,reason);
         if (record->on_cpu) record->ready_pending=1;
         else kernel_wait_backend_ready(token->task);
@@ -289,19 +289,19 @@ int kernel_wait_notify_locked(const struct kernel_wait_token *token,uint32_t rea
     kernel_wait_record_transition(record,token->generation,KERNEL_WAIT_NOTIFIED,reason);
     return 1;
 }
-#if BOAROS_USER_SMP
 int kernel_wait_notify_locked(const struct kernel_wait_token *token,uint32_t reason)
 {
-    if (token && token->task && kernel_wait_record_phase(kernel_wait_record_of(token->task))==KERNEL_WAIT_COMMITTED) {
-        struct kernel_raw_guard run __attribute__((cleanup(kernel_raw_scope_release)))={0};
-        int local=kernel_wait_backend_lock_local(token,&run,1);
-        if (local>=0) return local ? notify_locked(token,reason) : 0;
-        KERNEL_RUN_SET(runs);
-        return notify_locked(token,reason);
-    }
-    return notify_locked(token,reason);
-}
+#if BOAROS_USER_SMP
+    /* The scheduler domain alone no longer excludes a local commit. */
+    int notified=notify_locked(token,reason,0);
+    if (notified>=0) return notified;
+    struct kernel_raw_guard run __attribute__((cleanup(kernel_raw_scope_release)))={0};
+    int local=kernel_wait_backend_lock_local(token,&run,1);
+    if (local>=0) return local ? notify_locked(token,reason,1) : 0;
+    KERNEL_RUN_SET(runs);
 #endif
+    return notify_locked(token,reason,1);
+}
 static int notify_token(const struct kernel_wait_token *token,uint32_t reason)
 {
 #if BOAROS_MAX_CPUS > 1
@@ -322,7 +322,7 @@ static int notify_token(const struct kernel_wait_token *token,uint32_t reason)
     struct kernel_raw_guard guard __attribute__((cleanup(kernel_raw_scope_release)))={0};
     if ((state&3U)==KERNEL_WAIT_COMMITTED) {
         int result=kernel_wait_backend_lock_local(token,&guard,0);
-        if (result>0) return notify_locked(token,reason);
+        if (result>0) return notify_locked(token,reason,1);
         if (!result) return 0;
     }
     kernel_raw_lock_acquire(&kernel_wait_domain,&guard);
@@ -358,6 +358,11 @@ enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *to
     }
     enum kernel_scheduler_status status;
 #endif
+#if BOAROS_USER_SMP
+    if ((state_fast>>5)==token->generation && (state_fast&3U)==KERNEL_WAIT_PREPARED &&
+        !record_fast->deadline &&
+        kernel_wait_backend_park_local(token,&status)) goto resumed;
+#endif
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         if (!matches(token)) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
@@ -374,16 +379,8 @@ enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *to
         }
         if (phase != KERNEL_WAIT_PREPARED) __builtin_trap();
 #if BOAROS_MAX_CPUS > 1
-        /* A PREPARED notifier may win after the phase check above. Never use
-         * a later NOTIFIED snapshot as an expected value for committing sleep. */
-        uint64_t expected=kernel_wait_state(token->generation,KERNEL_WAIT_PREPARED,KERNEL_WAIT_WOKEN) |
-            ((uint64_t)record->interruptible<<4);
-        uint64_t committed=(expected&~UINT64_C(3))|KERNEL_WAIT_COMMITTED;
-        if (!__atomic_compare_exchange_n(&record->state,&expected,committed,0,
-                __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) {
-            if ((expected >> 5) != token->generation || (expected & 3U) != KERNEL_WAIT_NOTIFIED)
-                __builtin_trap();
-            *reason=(enum kernel_wait_wake_reason)((expected >> 2) & 3U);
+        if (!kernel_wait_try_commit(record,token->generation)) {
+            *reason=kernel_wait_record_reason(record);
             return KERNEL_SCHEDULER_STATUS_OK;
         }
 #else
@@ -396,6 +393,9 @@ enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *to
     }
 #if BOAROS_MAX_CPUS == 1
     enum kernel_scheduler_status status = kernel_wait_backend_switch(token->task);
+#endif
+#if BOAROS_USER_SMP
+resumed:
 #endif
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     /* 调度交接已把CPU交还当前owner。NOTIFIED结果到本owner的finish前

@@ -43,7 +43,7 @@ endif
 LA_CC := $(LA_CROSS_COMPILE)gcc
 LA_FLAGS ?= -march=loongarch64 -mabi=lp64s -msoft-float -mno-lsx -mno-lasx -mcmodel=normal
 LA_CPPFLAGS := -DBOAROS_LOCK_DEBUG=$(LOCK_DEBUG) -Iinclude -DBOAROS_ARCH_LOONGARCH=1 -DBOAROS_MAX_CPUS=$(LA_CPU_CAPACITY) -DBOAROS_USER_SMP=$(LA_SMP) -DBOAROS_LA_SMP_TEST=$(LA_SMP_TEST) -DBOAROS_PAGE_SHIFT=14 -DBOAROS_COST_DIAGNOSTICS=$(COST_DIAGNOSTICS) -DBOAROS_UTS_MACHINE=\"loongarch64\"
-LA_CFLAGS := $(LA_FLAGS) -std=gnu11 -O2 -g3 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie -ffunction-sections -fdata-sections -Wall -Wextra -Werror -fstack-usage -MMD -MP
+LA_CFLAGS := $(LA_FLAGS) -std=gnu11 -O2 -g3 -gdwarf-4 -gstrict-dwarf -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie -ffunction-sections -fdata-sections -Wall -Wextra -Werror -fstack-usage -MMD -MP
 LA_C_SOURCES := $(COMMON_C_SOURCES) \
     arch/loongarch/main.c arch/loongarch/smp.c arch/loongarch/mmu.c arch/loongarch/context.c \
     arch/loongarch/timer.c arch/loongarch/trap.c arch/loongarch/signal.c arch/loongarch/fpu.c platform/loongarch_virt.c \
@@ -67,8 +67,24 @@ $(LA_BUILD)/%.o: %.c arch/loongarch/build.mk $(LA_BUILD)/generated/lock-config.h
 $(LA_BUILD)/%.o: %.S arch/loongarch/build.mk $(LA_BUILD)/generated/lock-config.h
 	@mkdir -p $(dir $@)
 	$(LA_CC) $(LA_CPPFLAGS) $(LA_FLAGS) -g3 -MMD -MP -c $< -o $@
-$(KERNEL_LA): $(LA_OBJECTS) arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config
-	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections -Wl,-Map,$(LA_BUILD)/kernel.map -o $@ $(LA_OBJECTS) -lgcc
+LA_BTF_BASE := $(LA_BUILD)/btf/kernel-base.elf
+LA_BTF_DATA := $(LA_BUILD)/btf/vmlinux.btf
+LA_BTF_SOURCE := $(LA_BUILD)/btf/vmlinux.S
+LA_BTF_OBJECT := $(LA_BUILD)/btf/vmlinux.o
+$(LA_BTF_BASE): $(LA_OBJECTS) arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config
+	@mkdir -p $(dir $@)
+	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections -o $@ $(LA_OBJECTS) -lgcc
+$(LA_BTF_DATA): $(LA_BTF_BASE)
+	@rm -f $@.tmp
+	$(PAHOLE) --btf_encode_detached=$@.tmp $<
+	@test -s $@.tmp
+	mv $@.tmp $@
+$(LA_BTF_SOURCE): $(LA_BTF_DATA) tools/embed-btf.py
+	python3 -B tools/embed-btf.py $< $@
+$(LA_BTF_OBJECT): $(LA_BTF_SOURCE) $(LA_BTF_DATA) $(LA_BUILD)/generated/lock-config.h
+	$(LA_CC) $(LA_FLAGS) -g3 -c $< -o $@
+$(KERNEL_LA): $(LA_OBJECTS) $(LA_BTF_OBJECT) arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config
+	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--undefined=__boaros_btf_start -Wl,-Map,$(LA_BUILD)/kernel.map -o $@ $(LA_OBJECTS) $(LA_BTF_OBJECT) -lgcc
 $(LA_BUILD)/kernel-contract-la: $(LA_TEST_OBJECTS) arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch -Wl,-Map,$(LA_BUILD)/contract.map -o $@ $(LA_TEST_OBJECTS) -lgcc
 .PHONY: kernel-la-contract

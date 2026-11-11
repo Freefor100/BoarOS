@@ -16,6 +16,8 @@ struct kernel_cost_task {
  * task's IO context. SMP service accounting retains two further timestamps. */
 #define KERNEL_COST_TASK_BYTES (sizeof(struct kernel_cost_task) + 6U * 16U + (BOAROS_USER_SMP ? 16U : 0U))
 #define KERNEL_COST_CPU_SERVICE_BYTES (BOAROS_USER_SMP ? 5U * sizeof(uint64_t) : 0U)
+/* lwIP storage protection retains one tag and two timestamps per CPU. */
+#define KERNEL_COST_CPU_LWIP_BYTES (BOAROS_MAX_CPUS > 1 ? 4U * sizeof(uint64_t) : 0U)
 _Static_assert(KERNEL_COST_TASK_BYTES <= 160, "cost task budget");
 enum kernel_cost_metric {
 #define X(id, name, unit, hist) COST_##id,

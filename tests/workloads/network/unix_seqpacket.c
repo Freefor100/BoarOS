@@ -96,8 +96,42 @@ static void seq_vectors_faults(void)
     CHECK(recvmsg(p[1],&message,0)==-1 && errno==EFAULT && !memcmp(left,"ab",2));struct received r=receive_control(p[1],8,0,0);CHECK(r.size==4 && !memcmp(r.data,"safe",4));
     close_pair(p);CHECK(!munmap(bad,page));seq_pass("vectored-content-fault-atomic-send-consumed-receive-size-limit");
 }
+#define SEQ_COLD_PAGE 16384
+#define SEQ_COLD(name) __attribute__((used,aligned(SEQ_COLD_PAGE),section(".rodata." #name)))
+/* Each metadata object has its own cold ELF page. Nonzero padding keeps the
+ * containing file blocks allocated, so the fault exercises disk I/O too. */
+struct seq_cold_header_page {struct msghdr value;unsigned char padding[SEQ_COLD_PAGE-sizeof(struct msghdr)-1],tail;};
+struct seq_cold_iov_page {struct iovec value;unsigned char padding[SEQ_COLD_PAGE-sizeof(struct iovec)-1],tail;};
+struct seq_cold_name_page {sa_family_t value;unsigned char padding[SEQ_COLD_PAGE-sizeof(sa_family_t)-1],tail;};
+struct seq_cold_control_page {struct cmsghdr value;unsigned char padding[SEQ_COLD_PAGE-sizeof(struct cmsghdr)-1],tail;};
+static const struct seq_cold_header_page seq_cold_header SEQ_COLD(seq_cold_header)={.padding={0xa1},.tail=0x71};
+static const struct seq_cold_iov_page seq_cold_iov SEQ_COLD(seq_cold_iov)={.padding={0xa2},.tail=0x72};
+static const struct seq_cold_name_page seq_cold_name SEQ_COLD(seq_cold_name)={.value=AF_UNIX,.padding={0xa3},.tail=0x73};
+static const struct seq_cold_control_page seq_cold_control SEQ_COLD(seq_cold_control)={
+    .value={.cmsg_len=CMSG_LEN(0),.cmsg_level=SOL_SOCKET,.cmsg_type=SCM_RIGHTS},.padding={0xa4},.tail=0x74};
+_Static_assert(sizeof(struct seq_cold_header_page)==SEQ_COLD_PAGE && sizeof(struct seq_cold_iov_page)==SEQ_COLD_PAGE &&
+    sizeof(struct seq_cold_name_page)==SEQ_COLD_PAGE && sizeof(struct seq_cold_control_page)==SEQ_COLD_PAGE,"cold metadata page size");
+static void seq_cold_import(const struct msghdr *message)
+{
+    int p[2];CHECK(!socketpair(AF_UNIX,SOCK_SEQPACKET|SOCK_NONBLOCK,0,p));
+    CHECK(syscall(SYS_sendmsg,p[0],message,MSG_DONTWAIT)==0);
+    char byte;CHECK(recv(p[1],&byte,1,MSG_DONTWAIT)==0);empty_queue(p[1]);close_pair(p);
+}
 static void seq_import_order(void)
 {
+    seq_cold_import(&seq_cold_header.value);
+    struct msghdr cold={.msg_iov=(struct iovec *)&seq_cold_iov.value,.msg_iovlen=1};seq_cold_import(&cold);
+    cold=(struct msghdr){.msg_name=(void *)&seq_cold_name.value,.msg_namelen=sizeof(sa_family_t)};seq_cold_import(&cold);
+    cold=(struct msghdr){.msg_control=(void *)&seq_cold_control.value,.msg_controllen=CMSG_SPACE(0)};seq_cold_import(&cold);
+    {
+        int pair[2];CHECK(!socketpair(AF_UNIX,SOCK_DGRAM|SOCK_NONBLOCK,0,pair));
+        struct sockaddr_un name={.sun_family=AF_UNIX,.sun_path="\0seq-msg-import"};
+        socklen_t length=NAME_OFFSET+sizeof("\0seq-msg-import")-1;
+        CHECK(!bind(pair[1],(void *)&name,length));
+        struct msghdr named={.msg_name=&name,.msg_namelen=length};
+        CHECK(syscall(SYS_sendmsg,pair[0],&named,MSG_DONTWAIT)==0);
+        char byte;CHECK(recv(pair[1],&byte,1,MSG_DONTWAIT)==0);empty_queue(pair[1]);close_pair(pair);
+    }
     size_t page=(size_t)sysconf(_SC_PAGESIZE);void *bad=mmap(0,page,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);CHECK(bad!=MAP_FAILED);
     int fd=seq_socket(0),invalid=-1;union control c={0};size_t used=add_rights(&c,0,&invalid,1);char byte='x';struct iovec iov={&byte,1};
     struct msghdr message={.msg_iov=&iov,.msg_iovlen=1,.msg_control=c.bytes,.msg_controllen=used};

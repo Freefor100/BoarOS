@@ -15,10 +15,12 @@
 #include <kernel/console.h>
 #include <kernel/errno.h>
 #include <kernel/event_fd.h>
+#include "vfs_notify.h"
 #include <kernel/mqueue.h>
 #include <kernel/signal_fd.h>
 #include <kernel/heap.h>
 #include <kernel/open_file.h>
+#include <kernel/bpf.h>
 #include <kernel/socket_control.h>
 #include <kernel/task.h>
 #include <kernel/page_cache.h>
@@ -191,6 +193,8 @@ struct kernel_flock_identity *kernel_open_file_flock_identity(
     case KERNEL_OPEN_FILE_KIND_EPOLL:
     case KERNEL_OPEN_FILE_KIND_EVENTFD:
     case KERNEL_OPEN_FILE_KIND_TIMERFD:
+    case KERNEL_OPEN_FILE_KIND_BPF:
+    case KERNEL_OPEN_FILE_KIND_INOTIFY:
     case KERNEL_OPEN_FILE_KIND_SIGNALFD: return kernel_flock_anonymous_identity();
     case KERNEL_OPEN_FILE_KIND_PIDFD: return kernel_pidfd_flock_identity(file);
     case KERNEL_OPEN_FILE_KIND_CONSOLE: return kernel_flock_bootstrap_console_identity();
@@ -621,6 +625,7 @@ uint64_t kernel_open_file_pseudo_identity(
     const struct kernel_open_file_description *file)
 {
     if (!open_file_live(file)) return 0U;
+    if (file->kind==KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE) return file->proc_identity;
     if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE)
         return kernel_pipe_proc_identity(file->pipe);
     if (file->kind == KERNEL_OPEN_FILE_KIND_SOCKET)
@@ -639,6 +644,11 @@ int kernel_open_file_pseudo_stat(
 {
     if (!open_file_live(file) || !stat || kernel_open_file_path(file))
         return -KERNEL_ENOTSUP;
+    if (file->kind==KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE) {
+        *stat=(struct kernel_vfs_stat){.mode=KERNEL_VFS_S_IFREG|0444U,.nlink=1,
+            .ino=file->proc_identity,.blksize=BOAROS_PAGE_SIZE};
+        return 0;
+    }
     uint32_t mode;
     uint64_t rdev = 0U;
     if(file->kind==KERNEL_OPEN_FILE_KIND_MQUEUE)
@@ -649,7 +659,7 @@ int kernel_open_file_pseudo_stat(
         mode = __atomic_load_n(&file->file.mode,__ATOMIC_ACQUIRE);
     else if (file->kind == KERNEL_OPEN_FILE_KIND_PIDFD)
         mode = 0700U; /* pidfs getattr deliberately masks S_IFMT. */
-    else if (file->kind == KERNEL_OPEN_FILE_KIND_EPOLL || (file->kind == KERNEL_OPEN_FILE_KIND_EVENTFD || file->kind == KERNEL_OPEN_FILE_KIND_TIMERFD || file->kind == KERNEL_OPEN_FILE_KIND_SIGNALFD))
+    else if (file->kind == KERNEL_OPEN_FILE_KIND_BPF || file->kind == KERNEL_OPEN_FILE_KIND_INOTIFY || file->kind == KERNEL_OPEN_FILE_KIND_EPOLL || (file->kind == KERNEL_OPEN_FILE_KIND_EVENTFD || file->kind == KERNEL_OPEN_FILE_KIND_TIMERFD || file->kind == KERNEL_OPEN_FILE_KIND_SIGNALFD))
         mode = 0600U;
     else if (file->kind == KERNEL_OPEN_FILE_KIND_CONSOLE) {
         mode = KERNEL_VFS_S_IFCHR | 0600U;
@@ -726,6 +736,12 @@ enum kernel_open_file_kind kernel_open_file_kind(
         return KERNEL_OPEN_FILE_KIND_REGULAR;
     }
     switch (file->kind) {
+    case KERNEL_OPEN_FILE_KIND_BPF:
+        return KERNEL_OPEN_FILE_KIND_BPF;
+    case KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE:
+        return KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE;
+    case KERNEL_OPEN_FILE_KIND_INOTIFY:
+        return KERNEL_OPEN_FILE_KIND_INOTIFY;
     case KERNEL_OPEN_FILE_KIND_MQUEUE:
         return KERNEL_OPEN_FILE_KIND_MQUEUE;
     case KERNEL_OPEN_FILE_KIND_PIDFD:
@@ -774,7 +790,10 @@ int kernel_open_file_supports_epoll(
         return 0;
     }
     switch (file->kind) {
+    case KERNEL_OPEN_FILE_KIND_BPF:
+        return file->device && file->device->poll;
     case KERNEL_OPEN_FILE_KIND_MQUEUE:
+    case KERNEL_OPEN_FILE_KIND_INOTIFY:
     case KERNEL_OPEN_FILE_KIND_PIDFD:
     case KERNEL_OPEN_FILE_KIND_SIGNALFD:
     case KERNEL_OPEN_FILE_KIND_TIMERFD:
@@ -822,7 +841,9 @@ static void close_cpu0(void *argument)
 
 static int close_is_local(const struct kernel_open_file_description *file)
 {
+    if(file->kind==KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE)return 0;
     if(file->kind==KERNEL_OPEN_FILE_KIND_MQUEUE)return 1;
+    if(file->kind==KERNEL_OPEN_FILE_KIND_INOTIFY || file->kind==KERNEL_OPEN_FILE_KIND_BPF)return !file->ep_items;
     if (file->vfs_closed) return 1;
     if (file->file.mount && !kernel_vfs_namespace_requires_cpu0(file->file.mount) &&
         (file->kind==KERNEL_OPEN_FILE_KIND_REGULAR || file->kind==KERNEL_OPEN_FILE_KIND_DIRECTORY ||
@@ -844,6 +865,9 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
     KERNEL_SERVICE_SCOPE_IF(service, !local);
     if (!local) kernel_assert_service_context();
     if (first) {
+        if (file->notify_opened)
+            kernel_vfs_notify_file(&file->file,(__atomic_load_n(&file->open_flags,__ATOMIC_RELAXED)&3U) ?
+                VFS_NOTIFY_CLOSE_WRITE : VFS_NOTIFY_CLOSE_NOWRITE);
         reset_read_prediction(file);release_record_locks(file);
         kernel_flock_release(&file->flock_owner);
         kernel_flock_destroy(&file->flock_identity);
@@ -859,7 +883,9 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
     }
     if (file->generated_ready) kernel_open_file_reset_generated(file);
     if (!file->vfs_closed) {
-        if (file->kind == KERNEL_OPEN_FILE_KIND_CONSOLE &&
+        if (file->kind == KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE) {
+            file->vfs_closed=1;
+        } else if (file->kind == KERNEL_OPEN_FILE_KIND_CONSOLE &&
             file->file.private_data == 0) {
             file->vfs_closed = 1U;
         } else if (file->kind == KERNEL_OPEN_FILE_KIND_PATH) {
@@ -879,6 +905,9 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
             if (file->file.private_data && kernel_vfs_close(&file->file))
                 return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED;
             file->vfs_closed = 1U;
+        } else if (file->kind==KERNEL_OPEN_FILE_KIND_INOTIFY || file->kind==KERNEL_OPEN_FILE_KIND_BPF) {
+            file->device->release(file->device_instance);
+            file->device_instance=NULL;file->vfs_closed=1;
         } else if(file->kind==KERNEL_OPEN_FILE_KIND_MQUEUE){
             if(kernel_mqueue_close(file))return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED;
             file->vfs_closed=1;
@@ -1065,6 +1094,8 @@ int kernel_open_file_readable(
     access_mode = kernel_open_file_flags(file) & 3U;
     switch (file->kind) {
     case KERNEL_OPEN_FILE_KIND_REGULAR:
+    case KERNEL_OPEN_FILE_KIND_BPF:
+    case KERNEL_OPEN_FILE_KIND_INOTIFY:
     case KERNEL_OPEN_FILE_KIND_MQUEUE:
     case KERNEL_OPEN_FILE_KIND_BLOCK:
     case KERNEL_OPEN_FILE_KIND_GENERATED:
@@ -1366,7 +1397,8 @@ int kernel_open_file_sync_range(struct kernel_open_file_description *file,
 
 int kernel_open_file_poll_requires_cpu0(const struct kernel_open_file_description *file)
 {
-    return file && (file->device || file->kind==KERNEL_OPEN_FILE_KIND_CONSOLE);
+    return file && ((file->device && file->kind!=KERNEL_OPEN_FILE_KIND_INOTIFY) ||
+        file->kind==KERNEL_OPEN_FILE_KIND_CONSOLE);
 }
 
 uint32_t kernel_open_file_poll(

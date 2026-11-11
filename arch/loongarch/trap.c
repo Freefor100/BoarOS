@@ -10,6 +10,7 @@
 #include <kernel/tick.h>
 #include <kernel/time.h>
 #include <kernel/syscall.h>
+#include <kernel/bpf.h>
 #include <kernel/errno.h>
 #include <kernel/signal.h>
 #include <kernel/console.h>
@@ -125,6 +126,7 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
         struct kernel_syscall_request request={.number=frame->regs[11],.user_sp=frame->regs[3]};
         for (unsigned i=0;i<6;i++) request.arguments[i]=frame->regs[4+i];
         struct kernel_syscall_result result;
+        kernel_bpf_trace_enter(caller,request.number,request.arguments);
         if (kernel_syscall_dispatch(caller,&request,&result)!=KERNEL_SYSCALL_STATUS_OK) la_virt_fatal("syscall dispatch");
         switch (result.action) {
         case KERNEL_SYSCALL_ACTION_EXIT_GROUP: kernel_user_group_exit(KERNEL_THREAD_EXIT_SYSCALL,result.value,0);
@@ -153,12 +155,15 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
             break;
         case KERNEL_SYSCALL_ACTION_EXEC:
             if (kernel_scheduler_exec_commit()!=KERNEL_SCHEDULER_STATUS_OK) la_virt_fatal("exec commit");
+            kernel_bpf_trace_exit(kernel_task_current(),request.number,0);
             return;
         case KERNEL_SYSCALL_ACTION_SIGNAL_RETURN:
-            la_signal_restore_current(frame);return;
+            la_signal_restore_current(frame);
+            kernel_bpf_trace_exit(kernel_task_current(),frame->regs[11],(int64_t)frame->regs[4]);return;
         case KERNEL_SYSCALL_ACTION_RETURN: break;
         default: la_virt_fatal("unsupported internal syscall action");
         }
+        kernel_bpf_trace_exit(kernel_task_current(),request.number,result.value);
         if (result.value==-KERNEL_ERESTARTSYS) {
             kernel_signal_note_syscall_restart(kernel_task_current()); return;
         }
@@ -214,4 +219,11 @@ void la_trap_return_prepare(struct arch_trap_frame *frame)
 #endif
     }
     else kernel_scheduler_prepare_idle_return();
+}
+
+/* Initial exec frames have nr=0; clone retains the actual originating nr. */
+void la_bpf_first_return(struct arch_trap_frame *frame)
+{
+    if(frame->regs[11]==220 || frame->regs[11]==435)
+        kernel_bpf_trace_exit(kernel_task_current(),frame->regs[11],0);
 }

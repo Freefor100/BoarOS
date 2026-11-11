@@ -34,6 +34,9 @@ struct kernel_page_cache_dirty {
     struct kernel_page_cache_dirty_tree tree;
     struct kernel_page_cache_dirty *queue_next, *queue_previous;
     size_t count;
+#if BOAROS_MAX_CPUS > 1
+    unsigned batch_state;
+#endif
 };
 struct kernel_vfs_file;
 struct kernel_vfs_mount;

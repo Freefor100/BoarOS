@@ -60,6 +60,7 @@
      LINUX_WCONTINUED | LINUX___WNOTHREAD | LINUX___WALL | LINUX___WCLONE)
 #define LINUX_CLONE_VM UINT64_C(0x100)
 #define LINUX_CLONE_FS UINT64_C(0x200)
+#define LINUX_CLONE_NEWNS UINT64_C(0x20000)
 #define LINUX_CLONE_FILES UINT64_C(0x400)
 #define LINUX_CLONE_SIGHAND UINT64_C(0x800)
 #define LINUX_CLONE_CLEAR_SIGHAND UINT64_C(0x100000000)
@@ -307,7 +308,7 @@ static void request_thread_termination_locked(struct kernel_task *task)
 {
     if (task->state == KERNEL_THREAD_STATE_EXITED || task->state == KERNEL_THREAD_STATE_ZOMBIE ||
         task->state == KERNEL_THREAD_STATE_GROUP_DEAD || task->retirement) return;
-    task->terminate_requested = 1;
+    __atomic_store_n(&task->terminate_requested,1,__ATOMIC_RELAXED);
 #if BOAROS_USER_SMP
     scheduler_user_request_locked(task);
 #endif
@@ -328,11 +329,7 @@ static void request_thread_termination_locked(struct kernel_task *task)
         if (task->wait.on_cpu) task->wait.ready_pending = 1;
         else ready_enqueue_locked(task, 0);
     }
-    uint64_t generation=kernel_wait_signal_generation(&task->wait);
-    if (generation) {
-        struct kernel_wait_token token = {task,generation};
-        (void)kernel_wait_notify_locked(&token, KERNEL_WAIT_SIGNALLED);
-    }
+    kernel_wait_interrupt_locked(task);
 }
 
 static void terminate_group_members(struct kernel_task *leader, struct kernel_task *except)
@@ -623,7 +620,7 @@ enum kernel_scheduler_status process_group_exec_current(void)
         task->dead_usage = leader->dead_usage;
         scheduler_usage_add(&task->dead_usage, &leader->usage);
         task->child_usage = leader->child_usage;
-        task->group_pending = leader->group_pending;
+        __atomic_store_n(&task->group_pending,leader->group_pending,__ATOMIC_RELAXED);
         task->group_child_info = leader->group_child_info;
         if(task->limits!=leader->limits)__builtin_trap();
         kernel_signal_pending_adopt_locked(task,leader);
@@ -810,6 +807,11 @@ enum kernel_scheduler_status arch_process_clone_current(
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         return status;
     }
+    if ((flags & LINUX_CLONE_NEWNS) &&
+        !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN)) {
+        *linux_result=-KERNEL_EPERM;
+        return KERNEL_SCHEDULER_STATUS_OK;
+    }
 
     status = allocate_task_storage(&child);
     if (status == KERNEL_SCHEDULER_STATUS_NO_MEMORY) {
@@ -889,7 +891,11 @@ enum kernel_scheduler_status arch_process_clone_current(
                     ? KERNEL_SCHEDULER_STATUS_OK
                     : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
         }
-        fs_status = (flags & LINUX_CLONE_FS) != 0U
+        if (flags & LINUX_CLONE_NEWNS) {
+            int error=kernel_fs_context_fork_mount_namespace(&child->fs,&parent->fs);
+            if (error) return finish_clone_failure(child,error,linux_result,KERNEL_SCHEDULER_STATUS_OK);
+            fs_status=KERNEL_FS_CONTEXT_STATUS_OK;
+        } else fs_status = (flags & LINUX_CLONE_FS) != 0U
             ? kernel_fs_context_acquire(&child->fs, &parent->fs)
             : kernel_fs_context_fork(&child->fs, &parent->fs);
         if (fs_status != KERNEL_FS_CONTEXT_STATUS_OK) {
@@ -2790,6 +2796,12 @@ enum kernel_task_status kernel_task_fs_context_borrow(
     }
     *fs = &task->fs;
     return KERNEL_TASK_STATUS_OK;
+}
+
+int kernel_task_unshare_fs(struct kernel_task *task,int new_mount_namespace)
+{
+    if (validate_task_resource_borrow(task)!=KERNEL_TASK_STATUS_OK) return -KERNEL_EINVAL;
+    return kernel_fs_context_unshare(&task->fs,new_mount_namespace);
 }
 
 int kernel_task_prepare_user_return(void)

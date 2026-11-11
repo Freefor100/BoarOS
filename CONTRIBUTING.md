@@ -37,7 +37,7 @@
 
 标题、正文、连续 trailer 之间各留一个空行，trailer 之间不插入空行，文件以换行结束；trailer 不代替说明正文。
 
-AI 对设计或代码有实质贡献时填写具体Agent型号，不使用笼统的`GPT-6`。例如：
+AI Trailer 例：
 
 ```text
 Co-authored-by: GPT-5.6 Sol <codex@openai.com>
