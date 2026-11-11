@@ -617,6 +617,69 @@ static void group_checkpoint_recovery(struct ext4_fs *fs)
     for (unsigned i=0;i<3*size;i++) CHECK(bytes[i]==(i/size==1?0x5a:0x73));
     CHECK(ext4_fclose(&file)==EOK); free(bytes);
 }
+static struct {
+    struct ext4_fs *fs;
+    ext4_file *file;
+    uint64_t targets[4];
+    bool seen;
+    unsigned boundary;
+} sync_group_probe;
+static void sync_group_during_commit(void)
+{
+    struct jbd_journal *journal=sync_group_probe.fs->jbd_journal;
+    CHECK(journal->committing && !sync_group_probe.seen);
+    sync_group_probe.seen=true;
+    for (unsigned i=0;i<4;i++) {
+        struct ext4_timestamp times[3]={{10211,i+1},{0,0},{0,0}};
+        CHECK(ext4_file_set_times(sync_group_probe.file,1,times)==EOK);
+        CHECK(ext4_file_sync_metadata_prepare(sync_group_probe.file,false,&sync_group_probe.targets[i])==EOK);
+        CHECK(sync_group_probe.targets[i] && sync_group_probe.targets[i]==sync_group_probe.targets[0]);
+    }
+    CHECK(journal->running && journal->running->sequence==sync_group_probe.targets[0] && !journal->sealed_count);
+    if (sync_group_probe.boundary) {
+        if (sync_group_probe.boundary==1) group_now+=100000000;
+        else CHECK(ext4_journal_group_commit("/",true)==EOK);
+        struct ext4_timestamp later[3]={{10212,1},{0,0},{0,0}};
+        CHECK(ext4_file_set_times(sync_group_probe.file,1,later)==EOK);
+        CHECK(journal->sealed_count==1 && journal->running &&
+            journal->running->sequence>sync_group_probe.targets[0]);
+        if (sync_group_probe.boundary==2) {
+            uint64_t target;
+            CHECK(ext4_file_sync_metadata_prepare(sync_group_probe.file,false,&target)==EOK &&
+                target==journal->running->sequence);
+        }
+    }
+}
+static void group_sync_coalesce(struct ext4_fs *fs,unsigned boundary)
+{
+    struct ext4_journal_runtime runtime={.now_ns=group_clock};
+    CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
+    ext4_file file;CHECK(ext4_fopen(&file,"/file","r+")==EOK);
+    struct ext4_timestamp first[3]={{10210,1},{0,0},{0,0}};
+    CHECK(ext4_file_set_times(&file,1,first)==EOK);
+    sync_group_probe=(__typeof__(sync_group_probe)){.fs=fs,.file=&file,.boundary=boundary};
+    uint64_t flushes=disk.flushes;
+    write_interleave=sync_group_during_commit;
+    CHECK(ext4_journal_group_commit("/",true)==EOK && sync_group_probe.seen);
+    struct jbd_journal *journal=fs->jbd_journal;
+    CHECK(journal->durable_sequence<sync_group_probe.targets[0] && !journal->committing);
+    if (boundary==2) {
+        /* A queued older group still owns the next consumer turn. A new
+         * sync request must not split the following group in that gap. */
+        uint64_t next=journal->running->sequence;
+        struct ext4_timestamp later[3]={{10212,2},{0,0},{0,0}};
+        CHECK(ext4_file_set_times(&file,1,later)==EOK && journal->running->sequence==next);
+    }
+    struct ext4_journal_progress progress;
+    CHECK(ext4_journal_group_progress("/",&progress)==EOK && progress.commit_ready);
+    CHECK(ext4_journal_group_commit("/",false)==EOK);
+    CHECK(journal->durable_sequence==sync_group_probe.targets[0] && disk.flushes==flushes+4);
+    struct ext4_inode inode;CHECK(ext4_fraw_inode_fill(&file,&inode)==EOK && to_le32(inode.access_time)==(boundary?10212U:10211U));
+    CHECK(ext4_journal_group_drain("/")==EOK && ext4_fclose(&file)==EOK);
+    sync_group_probe=(__typeof__(sync_group_probe)){0};
+    printf("PASS concurrent sync targets: one next group, exact target, four commit flushes, boundary=%u\n",boundary);
+}
+
 static void group_checkpoint_batching(struct ext4_fs *fs)
 {
     struct ext4_journal_runtime runtime={.now_ns=group_clock};
@@ -3130,6 +3193,8 @@ int main(int argc,char **argv)
     else if(!strcmp(argv[2],"group-independent-recovery"))group_independent_recovery(dev.fs,argc>3 && atoi(argv[3])>=10 && atoi(argv[3])<=13);
     else if(!strcmp(argv[2],"group-checkpoint-collapse")) {group_checkpoint_collapse(dev.fs,argc>3?strtoul(argv[3],NULL,10):0);return 0;}
     else if(!strcmp(argv[2],"group-checkpoint-recovery"))group_checkpoint_recovery(dev.fs);
+    else if(!strcmp(argv[2],"group-sync-coalesce") || !strcmp(argv[2],"group-sync-coalesce-age") || !strcmp(argv[2],"group-sync-coalesce-force"))
+        group_sync_coalesce(dev.fs,!strcmp(argv[2],"group-sync-coalesce-age")?1:!strcmp(argv[2],"group-sync-coalesce-force")?2:0);
     else if(!strcmp(argv[2],"group-checkpoint-batching"))group_checkpoint_batching(dev.fs);
     else if(!strcmp(argv[2],"group-checkpoint-target"))group_checkpoint_target(dev.fs);
     else if(!strcmp(argv[2],"group-checkpoint-pressure"))group_checkpoint_pressure(dev.fs);
