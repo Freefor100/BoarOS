@@ -11,8 +11,11 @@
 #include "lwip/tcp.h"
 static err_t copy_capacity_tcp_writev(struct tcp_pcb *,
     const struct kernel_socket_write_segment *,unsigned,u16_t,u8_t,u16_t *);
+static err_t held_completion_tcp_output(struct tcp_pcb *);
 #define boaros_lwip_tcp_writev copy_capacity_tcp_writev
+#define tcp_output(pcb) held_completion_tcp_output(pcb)
 #include "../../net/socket.c"
+#undef tcp_output
 #undef boaros_lwip_tcp_writev
 #include "../../net/ethernet.c"
 #include "../../kernel/pid.c"
@@ -64,6 +67,10 @@ static pthread_cond_t remote_changed=PTHREAD_COND_INITIALIZER;
 static unsigned remote_work,remote_done,remote_mode,remote_testing,remote_parked;
 static unsigned copy_waiting,copy_release,stop_waiting,stop_done,stop_borrows;
 static unsigned batch_waiting,batch_release;
+static struct {
+    struct kernel_socket *socket;
+    unsigned entered, release;
+} completion_output;
 static struct kernel_socket *remote_socket;
 static struct kernel_wait_queue *stop_probe_queue;
 static unsigned stop_probe_notified;
@@ -530,8 +537,10 @@ static err_t physical_output(struct netif *interface, struct pbuf *packet, const
     (void)destination;
     if(copy_capacity_output_request) {
         CHECK(!kernel_cpu_current()->raw_locks && caller_owns_protocol());
-        CHECK(copy_capacity_output_request->reserved==3);
-        CHECK(copy_capacity_output_request->socket->tx_reserved>=copy_capacity_output_request->reserved);
+        CHECK(copy_capacity_output_request->result==3 && !copy_capacity_output_request->reserved);
+        struct kernel_socket *socket=copy_capacity_output_request->socket;
+        SOCKET_STATE(state);
+        CHECK(!socket->tx_reserved && socket->tx_budget==tcp_protocol_budget(socket));
         copy_capacity_outputs++;
     }
     return link_output(interface, packet);
@@ -1863,6 +1872,115 @@ static void remote_work_ready(struct kernel_wait_node *node,uint32_t reason)
     CHECK(!pthread_mutex_lock(&remote_gate));remote_work=1;
     CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));
 }
+static err_t held_completion_tcp_output(struct tcp_pcb *pcb)
+{
+    if (completion_output.socket && pcb==completion_output.socket->tcp) {
+        CHECK(caller_owns_protocol() && !kernel_cpu_current()->raw_locks);
+        CHECK(!pthread_mutex_lock(&remote_gate));
+        completion_output.entered=1;
+        CHECK(!pthread_cond_broadcast(&remote_changed));
+        while (!completion_output.release)
+            CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
+        completion_output.socket=NULL;
+        CHECK(!pthread_mutex_unlock(&remote_gate));
+    }
+    return tcp_output(pcb);
+}
+struct completed_output_write {
+    struct kernel_socket *socket;
+    struct kernel_open_file_description *pin;
+};
+static void *completed_output_writer(void *argument)
+{
+    struct completed_output_write *write=argument;
+    kernel_cpu_current()->logical_id=1;remote_task=(void *)&test_context;
+    struct kernel_socket_write_request request={0};
+    kernel_socket_stream_begin(&request,&write->pin);
+    CHECK(kernel_socket_stream_reserve(&request,3,0)==3);
+    CHECK(kernel_socket_stream_commit(&request,"out",3,0)==3);
+    kernel_socket_stream_finish(&request);
+    CHECK(write->pin && kernel_open_file_socket(write->pin)==write->socket &&
+        !request.pin && !remote_waiter.request);
+    remote_task=NULL;
+    CHECK(!pthread_mutex_lock(&remote_gate));remote_done=1;
+    CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));
+    return NULL;
+}
+static void *completed_output_service(void *unused)
+{
+    (void)unused;
+    struct kernel_socket_service_result result=kernel_socket_service_pending(
+        (struct kernel_socket_service_budget){1,0,0});
+    CHECK(result.sockets==1);
+    return NULL;
+}
+static void *completed_output_close(void *argument)
+{
+    struct completed_output_write *write=argument;
+    CHECK(kernel_open_file_release(&write->pin)==KERNEL_OPEN_FILE_STATUS_OK && !write->pin);
+    return NULL;
+}
+static void queued_completion_before_output(void)
+{
+    remote_testing=1;remote_mode=11;
+    struct kernel_socket *listener=NULL,*client=NULL,*server=NULL;
+    connected_pair(&listener,&client,&server);
+    for(unsigned i=0;i<8;i++)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+    struct completed_output_write write={client,model_socket_file_create(client)};
+    struct kernel_wait_node work_node={.callback=remote_work_ready,.context=&remote_work};
+    kernel_wait_queue_init(&model_work_queue);model_work_queue.head=model_work_queue.tail=&work_node;
+    kernel_socket_network_hooks(NULL,&model_work_queue,NULL,&remote_work);
+    remote_socket=client;
+    struct kernel_socket_protocol_scope held;kernel_socket_protocol_enter(&held);
+    pthread_t writer,service,closer;
+    CHECK(!pthread_create(&writer,NULL,completed_output_writer,&write));
+    CHECK(!pthread_mutex_lock(&remote_gate));
+    while(!remote_work)CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
+    {SOCKET_STATE(state);CHECK(client->writes_head && client->active_writes->pin &&
+        kernel_open_file_socket(client->active_writes->pin)==client);}
+    CHECK(!pthread_mutex_unlock(&remote_gate));
+    kernel_socket_protocol_leave(&held);
+
+    completion_output.socket=client;
+    CHECK(!pthread_create(&service,NULL,completed_output_service,NULL));
+    CHECK(!pthread_mutex_lock(&remote_gate));
+    while(!completion_output.entered)CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
+    /* The real output call is stopped after COPY accepted the bytes. Its
+     * caller must already be allowed to finish and retire the request stack. */
+    {SOCKET_STATE(state);CHECK(client->active_writes && !client->active_writes->queued);}
+    CHECK(!pthread_cond_broadcast(&remote_changed));
+    while(!remote_done)CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
+    CHECK(!pthread_mutex_unlock(&remote_gate) && !pthread_join(writer,NULL));
+    {SOCKET_STATE(state);CHECK(!client->active_writes && !client->writes_head &&
+        !client->tx_reserved && !server->rx_bytes);}
+    CHECK(client->tcp && client->tcp->unsent && write.pin);
+
+    /* Last close is a different task. It reaches the actual protocol mutex
+     * while output holds it, so the worker's socket borrow stays valid. */
+    unsigned live=heap_live;
+    competing=1;
+    CHECK(!pthread_create(&closer,NULL,completed_output_close,&write));
+    CHECK(!pthread_mutex_lock(&handshake));
+    while(!waiter_registered)CHECK(!pthread_cond_wait(&handshake_changed,&handshake));
+    CHECK(heap_live==live && protocol_current_owner() && client->tcp);
+    CHECK(!pthread_mutex_unlock(&handshake));
+    CHECK(!pthread_mutex_lock(&remote_gate));completion_output.release=1;
+    CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));
+    CHECK(!pthread_join(service,NULL) && !pthread_join(closer,NULL));competing=0;
+    CHECK(!write.pin);
+    for(unsigned i=0;i<8;i++)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+    CHECK(server->rx_bytes==3);
+    char bytes[3];
+    CHECK(pbuf_copy_partial(server->packets_head->payload,bytes,3,0)==3 && !memcmp(bytes,"out",3));
+    kernel_socket_network_hooks(NULL,NULL,NULL,NULL);
+    struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    if(server->tcp)tcp_abort(server->tcp);
+    kernel_socket_protocol_leave(&scope);
+    kernel_socket_destroy(server);kernel_socket_destroy(listener);
+    kernel_socket_network_purge_orphans();
+    CHECK(!heap_live && !model_socket_files);
+    puts("PASS queued TCP completion: caller and OFD pin return before blocked output; last close waits for protocol owner and delivered COPY remains intact");
+}
 struct remote_write_args { struct kernel_socket *socket; const char *data; unsigned size; };
 static void *remote_writer(void *argument)
 {
@@ -3025,6 +3143,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "notify-stop")) notification_stop_lifetime();
     else if (!strcmp(argv[1], "stop-wait")) stopped_wait_notification();
     else if (!strcmp(argv[1], "remote-protocol")) remote_protocol_request(0);
+    else if (!strcmp(argv[1], "queued-completion")) queued_completion_before_output();
     else if (!strcmp(argv[1], "remote-direct")) remote_protocol_request(10);
     else if (!strcmp(argv[1], "remote-batch")) remote_protocol_request(5);
     else if (!strcmp(argv[1], "remote-batch-ack")) remote_protocol_request(7);

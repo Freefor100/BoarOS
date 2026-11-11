@@ -3833,20 +3833,24 @@ static void stream_commit_owned(struct kernel_socket_write_request **requests, u
         request->result=stream_copy_owned(request,reserved,&flush);
         reserved+=request->reserved;
     }
-    if(flush && !defer_output)tcp_flush_output(socket);
-    SOCKET_STATE(endpoint);
-    uint32_t previous=tcp_admission_capacity_locked(socket);
-    tcp_publish_capacity_locked(socket);
-    if(socket->tx_reserved<reserved)__builtin_trap();
-    socket->tx_reserved-=reserved;
-    for(unsigned i=0;i<count;i++) {
-        struct kernel_socket_write_request *request=requests[i];
-        request->reserved=0;
-        if(request->queued)complete_protocol_request_locked(request);
+    {
+        SOCKET_STATE(endpoint);
+        uint32_t previous=tcp_admission_capacity_locked(socket);
+        tcp_publish_capacity_locked(socket);
+        if(socket->tx_reserved<reserved)__builtin_trap();
+        socket->tx_reserved-=reserved;
+        for(unsigned i=0;i<count;i++) {
+            struct kernel_socket_write_request *request=requests[i];
+            request->reserved=0;
+            if(request->queued)complete_protocol_request_locked(request);
+        }
+        /* COPY 消耗与预约归还共同决定额度变化，只有净增加才唤醒额度等待者。 */
+        if(tcp_admission_capacity_locked(socket)>previous)socket_state_notify(&socket->wait);
+        if(flush && defer_output)socket_schedule_locked(socket,SOCKET_WORK_OUTPUT);
     }
-    /* COPY 消耗与预约归还共同决定额度变化，只有净增加才唤醒额度等待者。 */
-    if(tcp_admission_capacity_locked(socket)>previous)socket_state_notify(&socket->wait);
-    if(flush && defer_output)socket_schedule_locked(socket,SOCKET_WORK_OUTPUT);
+    /* caller可立即归还请求栈；出包只借用协议scope固定的socket，不再访问requests。
+     * 同一次服务仍完成原输出预算，最后close须等这份协议资格归还。 */
+    if(flush && !defer_output)tcp_flush_output(socket);
 }
 
 static int execute_protocol_request(struct kernel_socket_write_request *request)
