@@ -20,6 +20,47 @@ static unsigned char pool[64 * BOAROS_PAGE_SIZE]
 static uint64_t other_page, shared_page;
 static void *other_object;
 static uint64_t initial_free;
+static void setup(void);
+static int page_address(const void *,uint64_t *);
+static unsigned count_operations, heap_acquires, order_queries;
+void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *,struct kernel_raw_guard *);
+void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_raw_guard *guard)
+{
+    if (count_operations && lock==&heap.lock) heap_acquires++;
+    __real_kernel_raw_lock_acquire(lock,guard);
+}
+enum physical_page_status __real_physical_page_allocation_order(
+    const struct physical_page_allocator *,uint64_t,uint32_t *);
+enum physical_page_status __wrap_physical_page_allocation_order(
+    const struct physical_page_allocator *a,uint64_t address,uint32_t *order)
+{
+    if (count_operations) order_queries++;
+    return __real_physical_page_allocation_order(a,address,order);
+}
+static void operation_count_case(void)
+{
+    setup();
+    void *kept,*object,*large;
+    assert(!kernel_heap_allocate(&heap,64,&kept));
+    heap_acquires=order_queries=0;count_operations=1;
+    assert(!kernel_heap_allocate(&heap,64,&object));
+    count_operations=0;
+    assert(heap_acquires==1 && "warm slab allocation must count and take a slot under one lock");
+    assert(!kernel_heap_allocate(&heap,3*BOAROS_PAGE_SIZE,&large));
+    heap_acquires=order_queries=0;count_operations=1;
+    kernel_heap_release(&heap,large);
+    count_operations=0;
+    assert(!order_queries && "large release must discover and release its order in one allocator operation");
+    struct kernel_heap other;assert(!kernel_heap_init(&other,&allocator,page_address));
+    void *unchanged=(void *)(uintptr_t)1;
+    assert(kernel_heap_resize(&other,object,128,&unchanged)==KERNEL_HEAP_STATUS_INVALID);
+    assert(unchanged==(void *)(uintptr_t)1);
+    kernel_heap_release(&heap,object);kernel_heap_release(&heap,kept);
+    struct kernel_heap_statistics stats;kernel_heap_get_statistics(&heap,&stats);
+    assert(stats.allocation_calls==3 && !stats.allocation_failures);
+    assert(!stats.live_allocations && !stats.current_pages);
+    assert(physical_page_available(&allocator)==initial_free);
+}
 
 struct kernel_io_context *kernel_io_context_current(void)
 { return &contexts[current_task]; }
@@ -233,6 +274,7 @@ static void irq_restore_case(uintptr_t enabled)
 }
 int main(void)
 {
+    operation_count_case();
     unsigned n = page_case(0);
     for (unsigned i = 1; i <= n; i++) page_case(i);
     printf("page ownership: %u timer boundaries\n", n);

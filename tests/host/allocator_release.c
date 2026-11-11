@@ -441,11 +441,12 @@ static void test_legal_release_is_silent(void)
     available = physical_page_available(&allocator);
     assert(physical_page_allocate(&allocator, &page) == 0);
     assert(physical_page_acquire(&allocator, page) == 0);
-    assert(physical_page_release(&allocator, page) == 0);
+    assert(physical_page_release_allocation(&allocator, page) == 0);
     assert(physical_page_available(&allocator) == available - 1U);
     assert(physical_page_release(&allocator, page) == 0);
     assert(physical_page_allocate_order(&allocator, 1U, &page) == 0);
-    assert(physical_page_release_order(&allocator, page, 1U) == 0);
+    assert(physical_page_release_allocation(&allocator, page) == 1U);
+    assert(physical_page_available(&allocator) == available);
     assert(!kernel_heap_allocate(&heap, 32, &small));
     assert(!kernel_heap_allocate(&heap, 3 * BOAROS_PAGE_SIZE, &large));
     kernel_heap_release(&heap, small);

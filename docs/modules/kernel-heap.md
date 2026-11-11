@@ -8,7 +8,7 @@
 
 小对象按16字节起的二次幂size class分配：RV 4 KiB页最多2048字节，LA 16 KiB页最多8192字节。每张架构基页同时保存header、按页大小推导word数的bitmap、空闲slot链和对象；每个class维护非满slab双向链。最后一个对象释放时立即归还整页，因此空闲slab不长期占用物理内存。
 
-更大的请求按覆盖长度所需的最小 buddy order 直接分配连续页，返回页首地址。释放时通过物理页分配器保存的 allocated-head order 找回大小，不在对象前放隐藏 header，也不维护额外大对象表。这个布局让 4 KiB 请求恰好只占一页，并保持 DMA/页表消费者需要的页对齐；代价是非二次幂大对象存在 buddy 内部碎片。
+更大的请求按覆盖长度所需的最小 buddy order 直接分配连续页，返回页首地址。释放时由物理页分配器在同一次保护内检查完整 buddy 祖先、取得 allocated-head order 并归还对象，不再先查询大小再重新查找并释放。不在对象前放隐藏 header，也不维护额外大对象表。这个布局让 4 KiB 请求恰好只占一页，并保持 DMA/页表消费者需要的页对齐；代价是非二次幂大对象存在 buddy 内部碎片。
 
 ## 失败和统计
 
@@ -22,11 +22,10 @@
 
 共享slab查找/取槽、bitmap、链表、
 释放与统计使用每heap的raw锁，保存/恢复IRQ并禁止抢占，防止开中断内核线程被timer抢占后产生
-双 owner 或借用已回收 slab。缺 slab 时在区外分配并初始化私有页，再在区内发布和
+双 owner 或借用已回收 slab。已有 slab 的分配在取得槽位的同一次保护内更新调用统计；小对象释放和 resize 共用一次 header、槽位、bitmap 与归属检查。缺 slab 时在区外分配并初始化私有页，再在区内发布和
 取槽；期间其他任务也创建同类 slab 仍保持独立 owner。大对象页申请、calloc 清零和
 resize 复制不放进 heap 元数据临界区，回收可重入堆。
-size-class 热路径仍是一次链首访问、slot 链更新和 bitmap 更新；新建/回收 slab 或大
-对象才进入buddy。锁序为heap→physical allocator；嵌套页查询/释放不回收、不等待，
+size-class 热路径仍是一次链首访问、slot 链更新和 bitmap 更新；小对象取槽不访问 buddy；释放和 resize 仍核对物理页归属，空 slab 释放与大对象归还执行完整 buddy 校验。锁序为heap→physical allocator；嵌套页查询/释放不回收、不等待，
 页申请和压力回调在heap锁外。UP 保留中断和抢占嵌套，SMP 由同一 raw API 提供跨核互斥；没有 per-CPU cache。
 
 ## 验证

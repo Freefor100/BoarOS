@@ -2067,7 +2067,7 @@ test-allocator-preemption-host:
 	mkdir -p build/host/allocator
 	cc -std=c11 -O1 -fno-inline -finstrument-functions -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/allocator -Iinclude -c kernel/physical_page.c -o build/host/allocator/page.o
 	cc -std=c11 -O1 -fno-inline -finstrument-functions -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/allocator -Iinclude -c mm/heap.c -o build/host/allocator/heap.o
-	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/allocator -Iinclude $(HOST_CPU_SOURCES) tests/host/allocator_preemption.c build/host/allocator/page.o build/host/allocator/heap.o -o build/host/allocator/preemption
+	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/allocator -Iinclude $(HOST_CPU_SOURCES) tests/host/allocator_preemption.c build/host/allocator/page.o build/host/allocator/heap.o -Wl,--wrap=kernel_raw_lock_acquire,--wrap=physical_page_allocation_order -o build/host/allocator/preemption
 	build/host/allocator/preemption
 
 .PHONY: test-fifo-riscv

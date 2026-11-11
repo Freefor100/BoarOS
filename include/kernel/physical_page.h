@@ -146,6 +146,11 @@ enum physical_page_status physical_page_release_order(
     uint64_t address,
     uint32_t order);
 
+/* Return the actual order while releasing an owned buddy head. Corrupt or
+ * non-head input is fatal, as with release_order; discovery and release share
+ * one allocator critical section and the same complete buddy validation. */
+uint32_t physical_page_release_allocation(struct physical_page_allocator *, uint64_t address);
+
 /* Return the order stored on an allocated buddy head. */
 enum physical_page_status physical_page_allocation_order(
     const struct physical_page_allocator *allocator,
