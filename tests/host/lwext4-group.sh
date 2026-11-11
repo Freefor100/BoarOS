@@ -18,7 +18,7 @@ for block in 1024 4096; do
     "$work/probe" "$work/disk.img" seed
     "$work/probe" "$work/disk.img" operation-context
     cp "$work/disk.img" "$work/base.img"
-    for mode in group-checkpoint-batching group-checkpoint-target group-checkpoint-pressure; do
+    for mode in group-sync-coalesce group-sync-coalesce-age group-sync-coalesce-force group-checkpoint-batching group-checkpoint-target group-checkpoint-pressure; do
         cp "$work/base.img" "$work/checkpoint.img"
         "$work/probe" "$work/checkpoint.img" "$mode"
         e2fsck -fn "$work/checkpoint.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }

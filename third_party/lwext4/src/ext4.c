@@ -1417,11 +1417,17 @@ __unused
 static bool ext4_group_due(struct ext4_mountpoint *mp, bool force)
 {
 	/* All consumers hold STATE while borrowing the running group. */
-	struct jbd_trans *running = mp->fs.jbd_journal->running;
+	struct jbd_journal *journal = mp->fs.jbd_journal;
+	struct jbd_trans *running = journal->running;
 	if (!running) return false;
 	uint64_t now = mp->journal_runtime.now_ns ? mp->journal_runtime.now_ns(mp->journal_runtime.context) : 0;
-	return force || (mp->fs.jbd_journal->seal_target >= running->sequence) ||
-		(uint64_t)running->reserved_logs * mp->fs.jbd_journal->block_size >= 256 * 1024 ||
+	/* A sync target requests durability, not another queued commit boundary.
+	 * Keep the next group joinable while an older group occupies the consumer;
+	 * its fixed target is sealed as soon as that consumer becomes available. */
+	bool sync_due = journal->seal_target >= running->sequence &&
+		!journal->committing && TAILQ_EMPTY(&journal->sealed_queue);
+	return force || sync_due ||
+		(uint64_t)running->reserved_logs * journal->block_size >= 256 * 1024 ||
 		(now >= running->first_dirty_ns && now - running->first_dirty_ns >= 100000000);
 }
 
