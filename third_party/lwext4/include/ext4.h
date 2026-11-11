@@ -116,6 +116,8 @@ int ext4_journal_group_enable(const char *mount_point,
 int ext4_journal_group_service(const char *mount_point, bool force);
 int ext4_journal_group_commit(const char *mount_point, bool force);
 int ext4_journal_group_checkpoint(const char *mount_point);
+/* EAGAIN defers aged home I/O behind accepted commits; pressure never defers. */
+int ext4_journal_group_checkpoint_background(const char *mount_point);
 int ext4_journal_group_drain(const char *mount_point);
 /* Reclaim waits for ordered-data retirement at commit, or checkpoint when
  * only metadata/log owners remain. Memory pressure may end a running group;

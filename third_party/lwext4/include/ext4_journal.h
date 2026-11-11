@@ -319,7 +319,7 @@ unsigned jbd_journal_operation_resources(struct jbd_journal *journal, const stru
 /* Choose a still-owned resource release after its unreached retirement stage.
  * Pure memory pressure may retire ordered data at commit; log and quarantine
  * ownership always require checkpoint. Recheck resources after the wait. */
-bool jbd_journal_reclaim_goal(struct jbd_journal *, unsigned resources,
+bool jbd_journal_reclaim_goal(const struct jbd_journal *, unsigned resources,
     struct jbd_journal_reclaim *);
 int jbd_trans_quarantine(struct ext4_fs *fs, ext4_fsblk_t first,
 	uint32_t count, bool inode);

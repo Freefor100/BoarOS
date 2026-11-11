@@ -9,6 +9,7 @@ struct jbd_journal;
 struct jbd_memory;
 struct jbd_image;
 struct jbd_source;
+struct jbd_data;
 struct file_data_source;
 struct ext4_buf;
 /* Allocation accounting is independent of the journal's retention quota.
@@ -59,6 +60,8 @@ void jbd_memory_unpin_home(struct jbd_journal *, struct ext4_buf *);
 size_t jbd_allocation_charge(size_t);
 void *jbd_alloc(struct jbd_journal *, size_t);
 void jbd_free(void *);
+/* Consume a detached ordered-data list and return its controls in bounded batches. */
+void jbd_data_free_list(struct jbd_data *,unsigned);
 bool jbd_budget_room(struct jbd_journal *, size_t);
 void jbd_trim_cache(struct jbd_journal *, size_t target);
 size_t jbd_image_charge(const struct jbd_journal *);

@@ -680,6 +680,51 @@ static void group_sync_coalesce(struct ext4_fs *fs,unsigned boundary)
     printf("PASS concurrent sync targets: one next group, exact target, four commit flushes, boundary=%u\n",boundary);
 }
 
+static void group_checkpoint_background(struct ext4_fs *fs)
+{
+    struct ext4_journal_runtime runtime={.now_ns=group_clock};
+    CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
+    struct jbd_journal *journal=fs->jbd_journal;
+    ext4_file file;CHECK(ext4_fopen(&file,"/file","r+")==EOK);
+    struct ext4_timestamp times[3]={{10220,1},{0,0},{0,0}};
+    CHECK(ext4_file_set_times(&file,1,times)==EOK && ext4_journal_group_commit("/",true)==EOK);
+    uint64_t old=journal->durable_sequence,target,flushes=disk.flushes;
+    times[0].nanoseconds++;
+    CHECK(ext4_file_set_times(&file,1,times)==EOK &&
+        ext4_file_sync_metadata_prepare(&file,false,&target)==EOK && target>old);
+    CHECK(ext4_journal_group_checkpoint_background("/")==EAGAIN && disk.flushes==flushes &&
+        journal->checkpoint_sequence<old);
+    CHECK(ext4_journal_group_commit("/",false)==EOK && journal->durable_sequence==target);
+    CHECK(ext4_journal_group_checkpoint_background("/")==EOK &&
+        journal->checkpoint_sequence==target && disk.flushes==flushes+4);
+    for (unsigned i=0;i<4;i++) {
+        times[0].nanoseconds++;
+        CHECK(ext4_file_set_times(&file,1,times)==EOK && ext4_journal_group_commit("/",true)==EOK);
+    }
+    old=journal->durable_sequence;
+    CHECK(journal->checkpoint_count==4);
+    times[0].nanoseconds++;
+    CHECK(ext4_file_set_times(&file,1,times)==EOK && journal->accepted_sequence>old);
+    CHECK(ext4_journal_group_checkpoint_background("/")==EOK && journal->checkpoint_sequence==old);
+    CHECK(ext4_journal_group_commit("/",true)==EOK);
+    old=journal->durable_sequence;
+    times[0].nanoseconds++;
+    CHECK(ext4_file_set_times(&file,1,times)==EOK && journal->accepted_sequence>old);
+    CHECK(ext4_journal_group_checkpoint("/")==EOK && journal->checkpoint_sequence==old);
+    CHECK(ext4_journal_group_commit("/",true)==EOK);
+    old=journal->durable_sequence;
+    times[0].nanoseconds++;
+    CHECK(ext4_file_set_times(&file,1,times)==EOK);
+    jbd_memory_set_cache_disabled(journal,true);jbd_trim_cache(journal,0);
+    jbd_memory_set_limit(journal,jbd_memory_used(journal)+1);
+    struct ext4_journal_progress progress;
+    CHECK(ext4_journal_group_progress("/",&progress)==EOK && progress.checkpoint_ready);
+    CHECK(ext4_journal_group_checkpoint_background("/")==EOK && journal->checkpoint_sequence==old);
+    jbd_memory_set_limit(journal,4*1024*1024);
+    CHECK(ext4_journal_group_drain("/")==EOK && ext4_fclose(&file)==EOK);
+    puts("PASS background checkpoint: pending commit avoids idle home I/O; pressure and explicit targets still progress");
+}
+
 static void group_checkpoint_batching(struct ext4_fs *fs)
 {
     struct ext4_journal_runtime runtime={.now_ns=group_clock};
@@ -1005,6 +1050,57 @@ static void group_ordered_retire(struct ext4_fs *fs,bool fail)
         fail?"error":"completes");
 }
 
+struct retire_account { size_t bytes;unsigned references, returns; };
+static struct retire_account retired_account;
+static void retire_account_get(void *context)
+{ ((struct retire_account *)context)->references++; }
+static void retire_account_put(void *context)
+{ struct retire_account *a=context;CHECK(a->references>1);a->references--; }
+static void retire_account_change(void *context,size_t bytes,bool acquiring)
+{
+    struct retire_account *a=context;
+    if (acquiring) { CHECK(a->bytes<=SIZE_MAX-bytes);a->bytes+=bytes; }
+    else { CHECK(a->bytes>=bytes);a->bytes-=bytes;a->returns++; }
+}
+static void group_ordered_retire_batch(struct ext4_fs *fs)
+{
+    struct ext4_journal_runtime runtime={.now_ns=group_clock};
+    CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
+    struct jbd_journal *journal=fs->jbd_journal;
+    retired_account=(struct retire_account){.references=1};
+    struct retire_account *account=&retired_account;
+    struct jbd_memory_account methods={account,retire_account_get,retire_account_put,retire_account_change};
+    jbd_memory_set_account(journal->memory,&methods);
+    ext4_file file;CHECK(ext4_fopen(&file,"/file","r+")==EOK);
+    enum { COUNT=33 };
+    unsigned block=fs->bdev->lg_bsize;
+    struct owned_file_page pages[COUNT];struct file_write_span spans[COUNT];
+    for (unsigned i=0;i<COUNT;i++) {
+        owned_page_init(&pages[i],block,0x60+i);
+        spans[i]=(struct file_write_span){.offset=i*block,.buffer=pages[i].bytes,.size=block,
+            .source={&pages[i],owned_page_retain,owned_page_release,block}};
+    }
+    for (unsigned i=0;i<COUNT;i+=16)
+        CHECK(ext4_fpwrite_batch(&file,spans+i,COUNT-i<16?COUNT-i:16)==EOK);
+    for (unsigned i=0;i<COUNT;i++) { CHECK(spans[i].written==block);owned_page_release(&pages[i]); }
+    CHECK(jbd_journal_freeze(journal)==EOK && jbd_journal_select_stage(journal,JBD_JOURNAL_COMMIT)==JBD_JOURNAL_COMMIT);
+    CHECK(jbd_journal_submit(journal)==EOK);
+    struct jbd_memory_stats before,after;
+    jbd_memory_snapshot(journal->memory,&before);CHECK(before.borrowed==COUNT*block);
+    unsigned returns=account->returns;
+    CHECK(jbd_journal_retire_stage(journal,JBD_JOURNAL_COMMIT,EOK)==EOK);
+    unsigned retire_returns=account->returns-returns;
+    /* One owner notification per bounded batch, rather than for every
+     * source/control object; quota still follows the actual release. */
+    CHECK(retire_returns<COUNT/2);
+    jbd_memory_snapshot(journal->memory,&after);
+    CHECK(!after.borrowed && after.used<before.used && account->references==2);
+    for (unsigned i=0;i<COUNT;i++) CHECK(!pages[i].references && !pages[i].bytes);
+    CHECK(ext4_journal_group_drain("/")==EOK && ext4_fclose(&file)==EOK);
+    CHECK(ext4_journal_stop("/")==EOK);
+    printf("PASS ordered retire batch: %u sources, %u owner notifications, exact quota and release\n",COUNT,retire_returns);
+}
+
 static void group_ordered_retire_recover(struct ext4_fs *fs)
 {
     ext4_file file;
@@ -1063,18 +1159,22 @@ static void group_checkpoint_pressure(struct ext4_fs *fs)
     unsigned checkpoint_requests=group_work[1];
     times[0].nanoseconds++;
     CHECK(ext4_file_set_times(&file,7,times)==EOK && journal->running);
-    CHECK(group_work[1]==checkpoint_requests+1);
+    CHECK(group_work[1]==checkpoint_requests);
     CHECK(jbd_memory_used(journal)-jbd_memory_cached(journal)>jbd_memory_limit(journal)/2);
     CHECK(jbd_memory_used(journal)<=jbd_memory_limit(journal));
     CHECK(ext4_journal_group_progress("/",&progress)==EOK &&
-        progress.commit_ready && progress.checkpoint_ready && progress.checkpoint_pending);
+        progress.commit_ready && !progress.checkpoint_ready && progress.checkpoint_pending);
     struct jbd_trans *committing=TAILQ_FIRST(&journal->sealed_queue);
     CHECK(jbd_journal_select_stage(journal,JBD_JOURNAL_COMMIT)==JBD_JOURNAL_COMMIT &&
         journal->committing==committing && journal->running);
     CHECK(ext4_journal_group_progress("/",&progress)==EOK &&
-        !progress.commit_ready && progress.checkpoint_ready && progress.checkpoint_pending);
+        !progress.commit_ready && !progress.checkpoint_ready && progress.checkpoint_pending);
+    struct jbd_journal_reclaim goal;
+    CHECK(jbd_journal_reclaim_goal(journal,JBD_JOURNAL_MEMORY,&goal) &&
+        goal.stage==JBD_JOURNAL_COMMIT && goal.sequence==committing->sequence);
     uint64_t flushes=disk.flushes;
-    CHECK(ext4_journal_group_service("/",false)==EOK && disk.flushes==flushes+2);
+    CHECK(ext4_journal_group_checkpoint_background("/")==EAGAIN && disk.flushes==flushes);
+    CHECK(ext4_journal_group_checkpoint("/")==EOK && disk.flushes==flushes+2);
     CHECK(journal->checkpoint_sequence==target && !journal->checkpoint_count &&
         journal->committing==committing && journal->running);
     for (unsigned page=0;page<PAGES;page++) CHECK(pages[page].references==1 && pages[page].releases==1);
@@ -1087,7 +1187,7 @@ static void group_checkpoint_pressure(struct ext4_fs *fs)
     for (size_t i=0;i<bytes;i++) CHECK(readback[i]==0x60+i/PAGE_BYTES);
     CHECK(jbd_memory_peak(journal)<=jbd_memory_limit(journal));
     free(readback); CHECK(ext4_fclose(&file)==EOK);
-    puts("checkpoint pressure: actual retained sources cross half budget; one pending group checkpoints beside committing/running owners, exact source release and readback");
+    puts("checkpoint pressure: borrowed data selects its actual commit owner; idle CP defers, explicit CP still completes beside it; exact release and readback");
 }
 static struct owned_file_page direct_pages[32];
 static unsigned direct_batches, direct_fail_batch;
@@ -3195,6 +3295,7 @@ int main(int argc,char **argv)
     else if(!strcmp(argv[2],"group-checkpoint-recovery"))group_checkpoint_recovery(dev.fs);
     else if(!strcmp(argv[2],"group-sync-coalesce") || !strcmp(argv[2],"group-sync-coalesce-age") || !strcmp(argv[2],"group-sync-coalesce-force"))
         group_sync_coalesce(dev.fs,!strcmp(argv[2],"group-sync-coalesce-age")?1:!strcmp(argv[2],"group-sync-coalesce-force")?2:0);
+    else if(!strcmp(argv[2],"group-checkpoint-background"))group_checkpoint_background(dev.fs);
     else if(!strcmp(argv[2],"group-checkpoint-batching"))group_checkpoint_batching(dev.fs);
     else if(!strcmp(argv[2],"group-checkpoint-target"))group_checkpoint_target(dev.fs);
     else if(!strcmp(argv[2],"group-checkpoint-pressure"))group_checkpoint_pressure(dev.fs);
@@ -3222,6 +3323,7 @@ int main(int argc,char **argv)
         bool fail=!strcmp(argv[2],"group-ordered-retire-error");
         group_ordered_retire(dev.fs,fail);if(fail)return 0;
     }
+    else if(!strcmp(argv[2],"group-ordered-retire-batch"))group_ordered_retire_batch(dev.fs);
     else if(!strcmp(argv[2],"group-ordered-retire-recover"))group_ordered_retire_recover(dev.fs);
     else if(!strcmp(argv[2],"group-data-batch"))group_data_batch(dev.fs);
     else if(!strcmp(argv[2],"group-borrow-admission"))group_borrow_admission(dev.fs);
@@ -3277,6 +3379,8 @@ int main(int argc,char **argv)
     }
     else CHECK(!"unknown mode");
     CHECK(ext4_umount("/")==EOK);
+    if(!strcmp(argv[2],"group-ordered-retire-batch"))
+        CHECK(!retired_account.bytes && retired_account.references==1 && !live_allocations);
     if(!strncmp(argv[2],"extent-read-",12) || !strncmp(argv[2],"extent-prepend",14))CHECK(!live_allocations);
     fault_block_close(&disk);return exit_status;
 }
