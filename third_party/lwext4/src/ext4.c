@@ -1776,7 +1776,7 @@ int ext4_journal_group_enable(const char *mount_point,
 }
 
 static int ext4_journal_group_run(const char *mount_point, bool force,
-	enum jbd_journal_stage stage)
+	enum jbd_journal_stage stage, bool background)
 {
 	struct ext4_mountpoint *mp = ext4_get_mount(mount_point);
 	if (!mp) return ENOENT;
@@ -1790,9 +1790,14 @@ static int ext4_journal_group_run(const char *mount_point, bool force,
 	if (r == EOK && ext4_operation_depth(&mp->fs)) r = EBUSY;
 	/* An explicit checkpoint call requests the durable prefix that exists
 	 * now. The target survives a bounded selection until every batch retires. */
-	if (r == EOK && stage == JBD_JOURNAL_CHECKPOINT &&
-	    journal->checkpoint_target < journal->durable_sequence)
-		journal->checkpoint_target = journal->durable_sequence;
+	if (r == EOK && stage == JBD_JOURNAL_CHECKPOINT) {
+        /* Aged home writes are optional while newer accepted work needs the
+         * same device. Explicit targets and actual retention pressure win. */
+        if (background && journal->accepted_sequence > journal->durable_sequence &&
+            !jbd_journal_checkpoint_ready(journal)) r = EAGAIN;
+        else if (journal->checkpoint_target < journal->durable_sequence)
+            journal->checkpoint_target = journal->durable_sequence;
+    }
 	if (r == EOK && stage != JBD_JOURNAL_CHECKPOINT && ext4_group_due(mp, force)) {
 		r = ext4_group_freeze(mp, force);
 		if (r == EAGAIN) r = EOK; /* 已有提交 owner，先让队首进展。 */
@@ -1811,18 +1816,21 @@ static int ext4_journal_group_run(const char *mount_point, bool force,
 
 int ext4_journal_group_service(const char *mount_point, bool force)
 {
-	return ext4_journal_group_run(mount_point, force, JBD_JOURNAL_IDLE);
+	return ext4_journal_group_run(mount_point, force, JBD_JOURNAL_IDLE, false);
 }
 
 int ext4_journal_group_commit(const char *mount_point, bool force)
 {
-	return ext4_journal_group_run(mount_point, force, JBD_JOURNAL_COMMIT);
+	return ext4_journal_group_run(mount_point, force, JBD_JOURNAL_COMMIT, false);
 }
 
 int ext4_journal_group_checkpoint(const char *mount_point)
 {
-	return ext4_journal_group_run(mount_point, false, JBD_JOURNAL_CHECKPOINT);
+	return ext4_journal_group_run(mount_point, false, JBD_JOURNAL_CHECKPOINT, false);
 }
+
+int ext4_journal_group_checkpoint_background(const char *mount_point)
+{ return ext4_journal_group_run(mount_point, false, JBD_JOURNAL_CHECKPOINT, true); }
 
 static int ext4_journal_wait_reclaim(const char *mount_point, bool drain, bool memory_pressure)
 {

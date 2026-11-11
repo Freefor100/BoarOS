@@ -1327,16 +1327,19 @@ static void journal_checkpoint_worker(void *context)
         if (!progress.checkpoint_pending) pending_deadline = 0;
         else if (!pending_deadline) pending_deadline = kernel_time_monotonic_ns() + 100000000;
         int result = progress.error;
+        int deferred = 0;
         if (!result && (progress.checkpoint_ready || (pending_deadline &&
             kernel_time_monotonic_ns() >= pending_deadline))) {
-            result = ext4_journal_group_checkpoint(adapter->mount_point);
+            result = ext4_journal_group_checkpoint_background(adapter->mount_point);
             if (ext4_journal_group_progress(adapter->mount_point, &progress) != EOK) __builtin_trap();
+            if (result == EAGAIN && !progress.error) { result = EOK; deferred = 1; }
             if (!progress.checkpoint_pending) pending_deadline = 0;
         }
         if (!result && progress.checkpoint_ready) continue;
         uint64_t deadline = 0;
-        /* New groups share the first pending group's checkpoint window. */
-        if (!result && pending_deadline &&
+        /* Keep the first group's age. A deferred pass waits for real progress;
+         * do not keep waking on the already expired checkpoint deadline. */
+        if (!result && pending_deadline && !deferred &&
             kernel_time_deadline_from_monotonic(pending_deadline, &deadline) == KERNEL_TIME_STATUS_DEADLINE_PASSED)
             continue;
         kernel_lock_release(&service);

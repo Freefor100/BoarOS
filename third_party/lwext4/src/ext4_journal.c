@@ -2025,23 +2025,13 @@ static struct jbd_data *jbd_trans_detach_data(struct jbd_trans *trans)
     return first;
 }
 
-static void jbd_release_detached_data(struct jbd_data *data,unsigned count)
-{
-    while (data) {
-        struct jbd_data *next=TAILQ_NEXT(data,node);
-        if (!count--) __builtin_trap();
-        jbd_data_free(data);
-        data=next;
-    }
-    if (count) __builtin_trap();
-}
 
 static void jbd_trans_release_data(struct jbd_trans *trans)
 {
     struct jbd_data *data=jbd_trans_detach_data(trans);
     unsigned count=trans->ordered_count;
     trans->ordered_count=0;
-    jbd_release_detached_data(data,count);
+    jbd_data_free_list(data,count);
 }
 
 static int jbd_trans_write_ordered(struct jbd_trans *trans)
@@ -3220,7 +3210,12 @@ bool jbd_journal_checkpoint_ready(const struct jbd_journal *journal)
 		return true;
 	struct jbd_memory_stats memory;
 	jbd_memory_snapshot(journal->memory, &memory);
-	return memory.used - memory.cached > memory.limit / 2;
+    if (memory.used - memory.cached <= memory.limit / 2) return false;
+    /* Borrowed ordered data is released by commit, not by writing an older
+     * metadata prefix home. Use the same real owner as admission reclaim. */
+    struct jbd_journal_reclaim goal;
+    return jbd_journal_reclaim_goal(journal,JBD_JOURNAL_MEMORY,&goal) &&
+        goal.stage==JBD_JOURNAL_CHECKPOINT;
 }
 
 enum jbd_journal_stage jbd_journal_select_stage(struct jbd_journal *journal,
@@ -3389,7 +3384,7 @@ int jbd_journal_retire_stage(struct jbd_journal *journal,
         detached=jbd_trans_detach_data(trans);
         count=trans->ordered_count;
     }
-    jbd_release_detached_data(detached,count);
+    jbd_data_free_list(detached,count);
     {
         JBD_STATE_SCOPE(journal);
         if (journal->committing!=trans || trans->ordered_count!=count) __builtin_trap();
@@ -3415,7 +3410,7 @@ int jbd_journal_retire(struct jbd_journal *journal, int error)
 		JBD_JOURNAL_COMMIT : JBD_JOURNAL_CHECKPOINT, error);
 }
 
-bool jbd_journal_reclaim_goal(struct jbd_journal *journal, unsigned resources,
+bool jbd_journal_reclaim_goal(const struct jbd_journal *journal, unsigned resources,
     struct jbd_journal_reclaim *goal)
 {
     JBD_STATE_READ_SCOPE(journal);

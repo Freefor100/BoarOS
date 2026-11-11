@@ -226,6 +226,47 @@ static void borrowed_source_outlives_stop(unsigned size)
     assert(!storage.references && !storage.bytes);
     jbd_memory_put(owner);assert(!live && account.references==1);
 }
+static void ordered_batch_outlives_stop(unsigned size)
+{
+    struct jbd_journal journal;start(&journal,size,1024*1024);
+    struct external_account account={.references=1};
+    struct jbd_memory_account methods={&account,account_retain,account_release,account_change};
+    jbd_memory_set_account(journal.memory,&methods);
+    jbd_memory_set_grouped(&journal,true);jbd_memory_set_cache_disabled(&journal,true);
+    struct jbd_memory *owner=journal.memory;jbd_memory_get(owner);
+    struct external_source storage[2];
+    struct file_data_source sources[2];
+    for (unsigned i=0;i<2;i++) sources[i]=source_start(&storage[i],&account,size);
+    struct jbd_data *first=NULL,**tail=&first;
+    struct jbd_source *reader=NULL;
+    enum { COUNT=35 };
+    for (unsigned i=0;i<COUNT-1;i++) {
+        struct jbd_data *data=jbd_alloc(&journal,sizeof(*data));assert(data);
+        *tail=data;tail=&TAILQ_NEXT(data,node);
+        assert(jbd_source_borrow(&journal,&sources[i%2],&data->source)==EOK);
+        if (!i) {reader=data->source;jbd_source_get(reader);}
+    }
+    struct jbd_data *last=jbd_alloc(&journal,sizeof(*last));assert(last);*tail=last;
+    last->image=jbd_image_alloc(&journal);assert(last->image);
+    memset(last->image->data,0x47,size);
+    struct ext4_block_payload *image_reader=&last->image->payload;ext4_block_payload_get(image_reader);
+    for (unsigned i=0;i<2;i++) source_release(&storage[i]);
+    jbd_memory_stop(&journal);
+    /* Detached controls can outlive stop. Closed owners bypass the idle
+     * pool, while real source/image readers keep their own storage charged. */
+    jbd_data_free_list(first,COUNT);
+    struct jbd_memory_stats stats;jbd_memory_snapshot(owner,&stats);
+    assert(stats.used && !stats.cached && !stats.reserved && stats.borrowed==size);
+    assert(storage[0].references==1 && !storage[1].references);
+    for (unsigned i=0;i<size;i++) {
+        assert(((unsigned char *)storage[0].bytes)[i]==0x53);
+        assert(image_reader->data[i]==0x47);
+    }
+    jbd_source_put(reader);ext4_block_payload_put(image_reader);
+    jbd_memory_snapshot(owner,&stats);
+    assert(!stats.used && !stats.cached && !stats.borrowed && !account.active);
+    jbd_memory_put(owner);assert(!live && account.references==1);
+}
 struct borrowing_task {
     struct jbd_journal *journal;
     const struct file_data_source *owner;
@@ -333,8 +374,9 @@ int main(int argc,char **argv)
     assert(argc==2);unsigned size=(unsigned)strtoul(argv[1],NULL,10);assert(size==1024 || size==4096);
     payload_outlives_record_and_stop(size);pools_and_failed_allocations(size);transaction_controls_reuse(size);
     concurrent_reservation(size);borrowed_source_outlives_stop(size);
+    ordered_batch_outlives_stop(size);
     source_candidate_race(size,false);source_candidate_race(size,true);
     concurrent_pools(size);shared_home_charge(size);
-    printf("PASS journal budget payload/stop/pool/transaction-control/OOM/concurrent-reservation/source-reader-reuse/source-candidate-race/shared-home block=%u\n",size);
+    printf("PASS journal budget payload/stop/pool/transaction-control/OOM/concurrent-reservation/source-reader-reuse/ordered-batch-stop/source-candidate-race/shared-home block=%u\n",size);
     return 0;
 }
