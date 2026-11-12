@@ -109,7 +109,6 @@ split ring 使用协议规定的自然对齐布局，available/used 的 16 位 i
 ## 验证
 
 ```sh
-make test-dtb-riscv
 make test-block-riscv
 make test-block-host
 python3 -B tests/host/virtio_block_diagnostics.py
@@ -140,16 +139,14 @@ writethrough 的响应波次依据固定 QEMU v11.1.0（`references/qemu`，comm
 
 错误用例使第二个已发布 batch 写先失败，保留另一个 DMA，验证取消仍不能提前返回，再释放该 DMA 并回读确认未发布项未写入；正常单写与 batch 混合的八槽超时由 reset 结束，队列页和任务栈最终回收。等待前有限收割 used，没有完成时仍阻塞等待。
 
-RT 组合进展由 `make test-multi-disk-rt-riscv`（调用 `tests/riscv/multi-disk-io.py --rt-load`）单独验证：默认全局 RT 预算下，持续 FIFO/RR 子任务存在时，普通父任务与两台真实 NBD 的 READ/WRITE/FLUSH 均可完成，随后检查子任务、动态挂载、根页/堆/栈回收和两盘持久字节。该模式使用同一个 `tests/userland/multi_disk_io.c` 的显式 `/rt-load` fixture 分支，原错误隔离模式不变；详见[可睡眠存储](../learning/sleepable-storage.md#默认-rt-带宽下的存储进展)。
+RT 组合进展由 `make test-multi-disk-rt-riscv`（调用 `tests/riscv/multi-disk-io.py --rt-load`）单独验证：默认全局 RT 预算下，持续 FIFO/RR 子任务存在时，普通父任务与两台真实 NBD 的 READ/WRITE/FLUSH 均可完成，随后检查子任务、动态挂载、根页/堆/栈回收和两盘持久字节。该模式使用同一个 `tests/userland/multi_disk_io.c` 的显式 `/rt-load` fixture 分支，原错误隔离模式不变。
 
 双盘故障 runner 在确认隔离检查点后，通过 NBD `cut` 收到两盘的明确回执，再终止
 QEMU，避免直接 kill 截断健康盘的响应。诱导断线后的原始日志保留；进展和内核错误
 判断截至受控 cut 前，冷启动读回和 fsck 仍必须通过，服务器非零退出不被忽略。
-失败产物另含 guest/两盘退出码及 cut 请求/回执状态，详见[收口竞态](../learning/sleepable-storage.md#双盘受控收口2026-10-06)。
+失败产物另含 guest/两盘退出码及 cut 请求/回执状态。
 
 成本诊断的请求带提交时标量 epoch/lane，正常 IRQ 和 timeout/reset 均按该身份记账；registry 磁盘归属与 unknown 字节见[成本观测](kernel-cost.md)。
-
-2026-10-01 最终四组合 io-sleep 与真实日志/消费者路径均达到最大八个已发布请求；这不表示串行读或阶段间 FLUSH 也能保持八槽并行。消费者定点诊断的 ready/resume 关联只覆盖实际唤醒 owner 的请求，batch 会合并唤醒，不能把这一子集与旧所有请求样本直接比较平均延迟。存储流水线的恢复通过、Parent 收益未达标与完整输入身份见[最终验收](../learning/cost-baseline.md#s9-存储流水线验收2026-10-01)。
 
 批量读的旧驱动顺序回退在生产函数宿主模型中只能发布一个请求，新增“暂扣至八项”
 测试超时；新驱动同时发布八项。两种 transport 的反序完成、单项错误、错误时另项

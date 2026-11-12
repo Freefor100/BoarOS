@@ -13,7 +13,6 @@ def main():
     parser.add_argument('--kernel', default='build/loongarch/kernel-contract-la')
     parser.add_argument('--qemu', default=os.environ.get(
         'QEMU_LOONGARCH64', 'build/qemu-la-rtc/qemu-system-loongarch64'))
-    parser.add_argument('--stage', choices=('boot', 'mmu', 'user'), default='user')
     parser.add_argument('--timeout', type=float, default=90)
     parser.add_argument('--log')
     parser.add_argument('--marker',action='append',default=[])
@@ -33,13 +32,13 @@ def main():
             raise SystemExit(f'LA contract timed out ({memory})') from error
         logs.append(output)
         sys.stdout.write(output)
-        expected = f'LA {args.stage} contracts passed'
+        expected = 'LA user contracts passed'
         if code or expected not in output or 'fatal' in output or any(marker not in output for marker in args.marker):
             raise SystemExit(f'LA contract failed ({memory}, exit '
                              f'{code})')
     if args.log:
         Path(args.log).write_text(''.join(logs))
-    print(f'LoongArch {args.stage} contracts passed in 512M and 1G')
+    print('LoongArch contracts passed in 512M and 1G')
 
 
 if __name__ == '__main__':

@@ -1,6 +1,6 @@
 # 物理页分配模块
 
-本文描述物理页分配器从分页启动期到运行期 buddy 模式的稳定接口。相关概念、算法选择理由和分页关系见 [内存管理学习总结](../learning/memory-management.md)。它消费 `boot_memory_layout.usable[]`，不重新发现 RAM，也不解释 DTB。
+本文描述物理页分配器从分页启动期到运行期 buddy 模式的稳定接口。它消费 `boot_memory_layout.usable[]`，不重新发现 RAM，也不解释 DTB。
 
 ## 入口与契约
 
@@ -105,24 +105,6 @@ free/split/allocated/internal为权威状态，inactive节点不拥有页，编�
 finalized元数据操作使用每allocator的raw锁，保存/恢复本CPU的IRQ并禁止抢占；这里
 互斥只覆盖分配器元数据，不证明完整SMP或硬实时。耗尽后的压力回调、I/O等待不在buddy修改区内。
 
-`test-allocator-cost-host`在4/16 KiB下用公开API强制64/512/4096/32768页split/coalesce，
-并做10000次随机操作的独立owner模型、每步审计、多range/保留洞和finalize失败验证。
-工作量计根目录/树/块头/order入口的逻辑检查和重写，重复验证重复计，批量初始化须
-按实际记录计；finalize与独立审计不并入运行期热路径窗口。请求页数N、相关根深度H、
-目录二分深度L的门禁为检查 `32*(H+1)^2+16*N+64*(L+1)`、重写 `8*(H+1)+4*N`。
-分裂每层最多7次逻辑重写、合并每层最多7次，入口/最终发布余量由上述常数覆盖；
-邻居权威检查按相关路径计，ROOT上限由最大19个usable range及order31约束，L不超过11。
-这不是固定私有调用次数或循环行号。32768页反例新检查67/67、重写94/94；
-旧尾计数与新全部逻辑计数的口径差异见[学习记录](../learning/memory-management.md#buddy-元数据成本核实2026-10-08)。
-
-COST新增三项非直方图指标，在每次元数据区内局部累计，恢复IRQ后集中提交；默认关闭，
-不持对象引用。窗口内时间排除压力I/O，完整IRQ-off分布沿用现有观测；成本计数并不
-替代客户机时间。36次匹配启动已完成：默认关闭观测时三种匿名分配工作仍较旧核慢13.6%–22.4%，
-只读快路径减少了检查，完整修改校验仍比旧块头操作昂贵；本轮交付有界最坏工作量，
-不声明典型吞吐提升。完整时间、IRQ分布及固定输入见[成本记录](../learning/cost-baseline.md#buddy-森林匹配时间2026-10-09)。
-功能与资源证据见[组合验收](../learning/memory-management.md#阶段a组合收口2026-10-09)；
-正常owner回到预热baseline，未确认DMA停止或真实mount错误仍由所属owner保留。
-
 绑定前只允许顺序发放从未释放过的页；合法 bootstrap 释放完成即返回。越界、重复或
 不属于当前 owner 的释放触发 fatal trap。
 显式 order API 只对 finalized 分配器开放，bootstrap 调用返回 `STATE`。
@@ -143,7 +125,6 @@ bootstrap 分散耗尽时 finalize 仍返回 `EMPTY`。当前 QEMU 满足该约�
 ```sh
 make test-allocator-preemption-host
 make test-allocator-release-host
-make test-allocator-cost-host
 make test-allocator-concurrency-host
 make test-page-riscv
 make test-riscv
@@ -153,10 +134,7 @@ make test-riscv
 recycled/tail 导入、metadata 扣除、order 对齐、强制 split 与多级 coalesce、finalize
 失败保留，以及 finalized resolve 拒绝空闲页。测试还覆盖 order-0 多引用、末引用归还、
 合法 owner 的释放和压力回收的单次重试；非法释放由独立 fatal-path 测试验证，不再注入
-人工释放失败。完整启动测试在 512 MiB、1 GiB 和 16 GiB QEMU 配置下通过 direct map
-执行分配—解析—释放—再分配，并精确要求
-`total - available == Sv39 table_pages + metadata_pages`；生产 idle 测试还要求 buddy
-模式在 timer 启动前已经生效。
+人工释放失败。
 
 host fatal 测试仍要求非法释放终止于 `SIGILL`，同时检查 wrong-order、tail、重复释放、
 非对齐地址、未初始化分配器、计数损坏和 buddy 元数据损坏的 guard 原因、地址、order
@@ -206,5 +184,4 @@ slab 分配/释放和私有 slab 发布；压力模型验证递归抑制、等�
 COST 构建维护 `allocated_peak_pages`：每次 bootstrap/buddy 成功发放及 finalize
 发布 metadata 占用后，按 total-available 更新初始化以来的真实最大受管占用。
 共享引用增加不算第二次分配，释放不降低高水位；连续分配计完整 order。
-默认构建编译掉字段和更新。`tests/cost/page_test.c` 验证 bootstrap、metadata、
-连续页、耗尽到满池和释放后的峰值保持；proc 诊断输出的口径见[procfs](procfs.md)。
+默认构建编译掉字段和更新；proc 诊断输出的口径见[procfs](procfs.md)。

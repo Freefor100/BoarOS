@@ -20,7 +20,7 @@
 
 **BoarOS** 是面向 RISC-V 64 位与 LoongArch 64 位的单体内核，以兼容 Linux 用户态 ABI 为目标。内核主要用 C 编写，启动、异常入口和上下文切换使用架构汇编。
 
-目前在 QEMU virt 上验证，两种架构默认单核，多核版本可启动至八核。已运行基于 musl 和 glibc 的静态与动态 ELF，以及 BusyBox、SQLite 和 Lua 等程序。各程序的验证范围见[用户程序记录](docs/learning/user-program-inventory.md)；当前分支为 `oscomp-compat`，从 main 单向集成通用实现，并维护官方双架构启动、原程序监督、判分及 LA 调度运行时适配；入口与适配边界见[兼容模块](docs/modules/oscomp-compat.md)。实板支持仍待验证。
+目前在 QEMU virt 上验证，两种架构默认单核，多核版本可启动至八核。已运行基于 musl 和 glibc 的静态与动态 ELF，以及 BusyBox、SQLite 和 Lua 等程序。程序环境与运行方式见[程序环境](docs/modules/program-environment.md)；当前分支为 `oscomp-compat`，从 main 单向集成通用实现，并维护官方双架构启动、原程序监督、判分及 LA 调度运行时适配；入口与适配边界见[兼容模块](docs/modules/oscomp-compat.md)。实板支持仍待验证。
 
 ---
 

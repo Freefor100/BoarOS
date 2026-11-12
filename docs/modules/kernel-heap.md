@@ -1,6 +1,6 @@
 # 内核堆模块
 
-本文描述运行期页支持内核堆的接口、所有权和当前性能边界。物理页来源见[物理页分配模块](physical-pages.md)，算法背景见[内存管理学习总结](../learning/memory-management.md)。
+本文描述运行期页支持内核堆的接口、所有权和当前性能边界。物理页来源见[物理页分配模块](physical-pages.md)。
 
 ## 接口与布局
 
@@ -34,7 +34,6 @@ size-class 热路径仍是一次链首访问、slot 链更新和 bitmap 更新�
 make test-allocator-preemption-host
 make test-allocator-release-host
 make test-allocator-concurrency-host
-make test-heap-riscv
 make test-page-riscv
 ```
 
@@ -50,15 +49,13 @@ ticks 可以包含中断与切换，不能当作独占 CPU 时间。清零和搬
 入口分别按 1/2 KiB 对齐，RV/LA 的函数体均小于各自对齐范围，循环保持在同一代码页。
 对齐填充位于入口之前，不给清零和字符串函数插入额外执行指令。
 MM 的清页与 COW 也复用这些原语，不在各模块保留逐字节副本。
-`make test-string-host` 用全部对齐组合、双向重叠和守卫页检查边界；
-历史宽字微实验没有带来当时的 Lua 工程收益，见[有限归因](../learning/offline-toolchain-probe.md#内存操作的有限归因与未上线候选2026-10-03)。
+`make test-string-host` 用全部对齐组合、双向重叠和守卫页检查边界。
 
 堆 allocate/resize 与 MM 元数据变更使用任务 `allocation_depth` 限制回收：可回收干净且无外部引用的页，不允许在分配器内部发起脏页 I/O。物理分配器递归检测使用任务 `reclaim_depth`，一个任务睡眠不把其他任务误判为自身递归。脏页回收只在外层无锁处执行；不足返回真实 EMPTY/ENOMEM，不构造重试锁链。
 
 宿主抢占测试使用真实 heap/buddy 实现和有状态 IRQ 模型，在生产函数边界逐一切入第二个
 合法 owner；验证已有 slab 的分配/释放交错、私有新 slab 的发布、对象内容独立、最终
-活对象/当前页归零和空闲页回到基线。该模型补足单任务功能测试，实际 CSR 与现有内核
-线程 timer 抢占仍由 RV64 物理页、堆与调度聚焦测试验证。
+活对象/当前页归零和空闲页回到基线。该模型检查宿主执行的 owner 交错，不执行实际 CSR 或客户机 timer。
 
 LA 16 KiB fixture 用300个独立17字节对象验证位图覆盖、内容隔离及页回收；`make test-loongarch` 运行。RV allocator抢占与fatal释放测试保护既有4 KiB契约。
 

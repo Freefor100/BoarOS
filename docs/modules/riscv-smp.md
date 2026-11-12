@@ -36,7 +36,7 @@ make run-user-smp-riscv
 
 `make test-wait-process-smp-riscv QEMU_RISCV_FIRMWARE=/absolute/fw_dynamic.bin` 单独检查子进程等待，复用组合控制页和实际等待登记观察者。四个场景覆盖 waitid(P_PGID,0)、wait4(0) 阻塞后另一线程 setpgid、中断时 siginfo 输出，以及 WNOWAIT 持有真实 zombie claim 和任务借用时另一个线程登记等待，归还后消费一次。Linux 通过 `/proc/<tid>/stat` 确认已阻塞；BoarOS 在真实 park 入口观察登记，并在结果复制处暂停第一个线程。最终检查再次等待为 ECHILD、四次登记、一次 claim 暂停、控制页与页引用归还及根盘 fsck。该聚焦入口运行 1/2 CPU、512 MiB/1 GiB，`TEST_MEMORIES` 可指定内存矩阵。
 
-`tests/userland/inventory/run.py --execution-profile rv-user-smp`仍使用固定229项原程序及原ELF、参数和环境，但Linux参考单独启用SMP。2026-10-14最终内核下，512MiB/1GiB与2/1 CPU四个profile各229项全部通过；本地严格运行使用`--require-pass`，没有reference-not-pass、超时或未到达项。`native-extended.yml`配置相同四格的独立定时job，托管job尚未运行不能由本地结果代替。
+`tests/userland/inventory/run.py --execution-profile rv-user-smp`仍使用固定229项原程序及原ELF、参数和环境，但Linux参考单独启用SMP。2026-10-14最终内核下，512MiB/1GiB与2/1 CPU四个profile各229项全部通过；本地严格运行使用`--require-pass`，没有reference-not-pass、超时或未到达项。
 
 `test-user-smp-composition-riscv`把共享匿名/文件映射回收、pipe/futex等待与取消/组退出、SQLite DELETE/WAL及独立重启放进Linux/BoarOS组合。MM ELF 有 21 个有序功能案例，包括匿名和文件共享页的并发首fault，以及普通用户驻留读、冷缓存、用户fault、精确EFAULT前缀、共享位置与seek、close复用和信号、fork排写pin；顺序整页读另检查可选预读及seek取消。Linux和BoarOS功能profile使用同一ELF。BoarOS功能profile启用只读观察钩子但不下达压力/OOM/RFENCE命令，受控profile才运行CPU0真实页账本、目标操作OOM、退休同步暂停和等待登记控制。加压前准备未映射的干净observer文件页，回收统计覆盖账本分配和显式回收，并等待后台轮次发布实际回收数；不要求同步调用抢在后台worker之前回收候选。普通 I/O 控制器在真实 ecall 的复制、来源 pin、匿名 fault 与后端批次处观察 CPU。十种读场景共复制 65,666 字节，双核全部留在发起 CPU1，单核全部在 CPU0；其中冷 64 KiB 请求只产生一个后端批次，后端和实际 VirtIO 提交均在发起 CPU。三种普通写场景的四次来源 pin 同样留在发起 CPU。共享 offset、竞争 seek、close 复用、fork 排空写 pin、精确 EFAULT 前缀和最终 fsync 继续核对。无观察钩子的正式内核运行九项普通 I/O 场景，测试控制器与 link wrap 不进入发布构建。
 
@@ -172,7 +172,7 @@ host 直接链接生产 DTB、调度/策略/runqueue/raw 实现，验证稀疏�
 本地执行器为封存QEMU11.1.2/OpenSBI1.8.1；QEMU SHA-256
 `5713c546693820d225e87795a14e8177343cb7ac4d9b0610a9e41c7203eb023d`，固件SHA-256
 `894e2aef99590fc07ec6c60ab00282b8bc5d5d5bb2a1d0c6ada0c52df24274c0`。
-CI身份另记。启动交接及非叶失效依据见[学习说明](../learning/smp-handoff.md)。
+CI身份另记。
 
 ## 匿名 MM 验证
 
@@ -180,7 +180,7 @@ CI身份另记。启动交接及非叶失效依据见[学习说明](../learning/
 
 绑定任务 metadata/stack OOM 保留 caller MM 和空 join；自然退出要求 pin/active/pending 为零、所有任务与等待存储归还，16MiB 私有 arena 的 available 回到 finalize 后4079页并独占 audit，再归还系统 order12 owner。MM RFENCE及FENCE.I错误各用双RAM独立启动，核对新调用链保留 owner 后 fatal；不计自然退出或回收成功。CPU0 原静态/pthread程序与CPU1私有MM工作重叠的组合独立执行。
 
-2026-10-12匿名MM阶段的RV测试产物为MM记录544字节、pin56字节、SMP task2768字节和CPU记录1968字节；当时默认task2688、CPU288，后续磁盘域尺寸见[存储说明](../learning/sleepable-storage.md#受控磁盘映射的io与页写入交接)。记录和任务仍各占一个metadata页，pin与退休批次不动态分配；单页pin增加实际acquire/release及两段raw，COW共享页才复制4KiB。并发gate入口检查当前任务的pin链，成本为O(K)，K仅是该owner尚持片段数，普通逐页复制每次先归还片段。每段退休最多16个owner；页表准备最多两张，竞争可产生 loser 和重试，不能由容量上界宣称应用变快。runner保存整启动OFF时间、实际指令同步和 owner 计数；没有新增匹配性能门槛、并行吞吐或硬件性能结论。
+记录和任务仍各占一个metadata页，pin与退休批次不动态分配；单页pin增加实际acquire/release及两段raw，COW共享页才复制4KiB。并发gate入口检查当前任务的pin链，成本为O(K)，K仅是该owner尚持片段数，普通逐页复制每次先归还片段。每段退休最多16个owner；页表准备最多两张，竞争可产生 loser 和重试，不能由容量上界宣称应用变快。runner保存整启动OFF时间、实际指令同步和 owner 计数；没有新增匹配性能门槛、并行吞吐或硬件性能结论。
 
 共享匿名配置位于`build/riscv-mm-shared-smp-test/`，复用同一生产MM和MTTCG runner。
 2026-10-12双RAM的2/1CPU验证父子驻留/未驻留/PROT_NONE共享叶、同页首次缺页仅一次对象发布、
@@ -238,7 +238,7 @@ make test-mm-disk-smp-userland-riscv INIT_CONFIG=config/init.json \
 缓存请求、peak pages、后台写入/延期和MM准备/退休计数；它们随交错变化，不是并行收益。
 存储配置见[VFS/ext4](vfs-ext4.md#当前成本边界)；实际QEMU/OpenSBI身份由runner保存。
 接口、结构成本和竞态背景见[MM](kernel-mm.md#ext4-文件映射)、
-[VFS](vfs-ext4.md#后台写回与水位回收)及[存储学习说明](../learning/sleepable-storage.md#受控磁盘映射的io与页写入交接)。
+[VFS](vfs-ext4.md#后台写回与水位回收)。
 
 ## 共享 FD 表与匿名 pipe
 
@@ -288,5 +288,3 @@ make test-file-io-smp-userland-riscv INIT_CONFIG=config/init.json \
 热读不创建执行请求，用户 copy 在调用 hart；ext4 冷请求同样就地装入。慢路在候选发布前借用 cache，归还工作区后结束借用；worker 停止与调用者读取具有各自的寿命。运行时时间戳由挂载点raw锁保护共享值与dirty/staged链，锁外唤醒和归还节点；读取不为atime单独排队。可选预读的OFD预测用已有短锁，队列由缓存保护；取消只标记，CPU0预读worker在锁外归还节点。
 
 原生文件检查覆盖 1/2 hart、512 MiB/1 GiB、新盘与独立重启。双 hart 直接核对 CPU1 的块读、ext4 读取、普通冷读和 mmap 冷缺页，以及实际 VirtIO enqueue；单 hart 归到 CPU0。内容、EOF 补零、精确短读写、offset、close 与最终 arena 引用同时检查。真实用户 `ecall` 由 composition 检查发起 CPU 的后端批次和实际设备提交，静态与动态 musl 再检查共同入口。
-
-冷读执行位置的匹配时间、单核成本及混合负载的等待分布见[数据路径实验](../learning/data-path-budget-experiments.md#rv-ext4-在调用-cpu-冷装入2026-10-19)。

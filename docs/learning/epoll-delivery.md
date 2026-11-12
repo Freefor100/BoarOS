@@ -1,21 +1,5 @@
 # epoll 交付、扫描与对象寿命
 
-最初交付问题对应 `5687377c58dc96adfa1f72f1636a319bbd25b419`。
-固定依据是 `references/linux/fs/eventpoll.c`，Linux commit
-`f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的扫描隔离及逐事件交付。
-
-旧实现先摘 ready 项并消费 ET/解除 ONESHOT，再整体复制事件数组。
-同一 RV64 ELF 在固定 Linux 和 BoarOS 上确认：首项 EFAULT 后，Linux
-仍交付 ET/ONESHOT，旧 BoarOS 返回零；先成功复制一个完整 event 后 fault，
-Linux 返回 1 并保留失败项，旧 BoarOS 返回 EFAULT。提前地址范围检查不能
-代替真实复制的提交点，用户复制还可能因文件缺页睡眠。
-
-旧扫描把 item 标为未排队后调用目标 poll。poll 内的唤醒能把它加入全局
-ready，LT 回队再次使用同一个 next，形成自环。直接编译旧生产函数的
-宿主契约测试，在随后目标失去就绪时，由公开 `kernel_epoll_poll` 观察到
-不结束的查询；修正后查询和后续非阻塞等待均结束。这是同步边界模型，
-不作为完整客体服务器死锁的复现证据。
-
 注册由 epoll 私有 intrusive AVL 按 `(fd, OFD)` 索引。同一 OFD 的不同 dup fd
 分别登记；fd 复用后，旧 OFD 仍有其他持有者时，新旧 key 可以共存。
 ADD 先分配私有候选，再禁止 CPU0 任务切换，完成最终图检查、重复 key 检查和发布。
@@ -59,11 +43,7 @@ poll 的 prepared token 阶段对 epoll 只使用非阻塞候选提示；它只�
 最终目标 OFD 关闭和 item 堆释放在 epoll IRQ 保护及协议 scope 外，不能把
 FIFO 的 VFS 关闭、页归还或用户复制藏在目标查询的协议 mutex 内。
 
-嵌套 epoll 的通知按一次源队列唤醒合并。等待游标在本 CPU 的 IRQ 保护内为整轮嵌套通知提供序号；每个 epoll 在这一轮只唤醒父队列一次。每条注册仍更新自己的通知代次和 ready/pending 状态，扫描期间到达的事件不被合并掉。下一次源通知取得新序号，即使对象仍有 ready 项也会传播。128 个 epoll、3104 条注册的四层重复路径，单轮回调从 1,082,400 次变为 3104 次；这描述操作数，不是应用加速倍数。
-
-四层、每层 32 个 epoll 的无事件共享 DAG，单顶查询的底层 poll 次数从
-32768 次降至 32 次；再次空查询不再调用底层 poll，刷新不产生父回调。
-这些是宿主生产函数 fixture 的实测操作数，不是应用吞吐或延迟收益。
+嵌套 epoll 的通知按一次源队列唤醒合并。每个 epoll 在同轮只唤醒父队列一次，每条注册仍更新自己的通知代次及 ready/pending 状态。下一次源通知取得新序号，继续传播有效候选。
 
 可重建验证：
 
@@ -81,7 +61,3 @@ fixture 还检查目标查询处 IRQ 开启且可抢占，并在目标查询边�
 这是对锁外查询的边界模型，不是生产 socket poll 的保护方式。用户复制和最终
 OFD/堆释放不持协议 scope，prepared 候选提示不调用目标 query，
 park/finish保持IRQ关闭并在外层恢复原IRQ状态。
-原交付改动的真实 RV64 九组 LT/ET/ONESHOT × fault 位置在同一 ELF 的
-固定 Linux 与 BoarOS 两侧通过，并检查 ONESHOT MOD 重装；该次 QEMU 为 11.1.1。
-索引、共享 DAG 刷新及可睡眠目标查询的直接验证是宿主边界模型，
-未将历史客体验证或操作数变化描述为本轮客体并发、完整 ABI 或应用性能结果。

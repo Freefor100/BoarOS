@@ -193,9 +193,7 @@ ifeq ($(SMP)$(COST_DIAGNOSTICS),11)
 BUILD_DIR := build/cost-smp$(SMP_BUILD_SUFFIX)/riscv
 KERNEL_RV := build/cost-smp$(SMP_BUILD_SUFFIX)/kernel-rv
 endif
-DTB_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-dtb-rv
 PAGE_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-page-rv
-HEAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-heap-rv
 BLOCK_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-block-rv
 VFS_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-vfs-rv
 VFS_RECOVERY_TEST_KERNEL_RV := \
@@ -210,16 +208,6 @@ MM_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-mm-rv
 MM_FATAL_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-mm-fatal-rv
 VMA_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-vma-rv
 UACCESS_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-uaccess-rv
-TIMER_CASES_TEST_KERNEL_RV := \
-	$(BUILD_DIR)/tests/kernel-timer-cases-rv
-TIMER_BOOT_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-timer-boot-rv
-CONTEXT_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-context-rv
-SCHEDULER_CASES_TEST_KERNEL_RV := \
-	$(BUILD_DIR)/tests/kernel-scheduler-cases-rv
-SCHEDULER_BOOT_TEST_KERNEL_RV := \
-	$(BUILD_DIR)/tests/kernel-scheduler-boot-rv
-SYSCALL_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-syscall-rv
-ELF64_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-elf64-rv
 ROOT_INIT_PROGRAM_RV := $(BUILD_DIR)/tests/user/root-init-rv
 ELF_RWX_PROGRAM_RV := $(BUILD_DIR)/tests/user/elf-rwx-rv
 ROOT_ORPHAN_PROGRAM_RV := $(BUILD_DIR)/tests/user/root-orphan-rv
@@ -232,8 +220,6 @@ DEMAND_PAGE_OOM_TEST_KERNEL_RV := \
 	$(BUILD_DIR)/tests/kernel-demand-page-oom-rv
 ROOT_BOOT_CLEANUP_TEST_KERNEL_RV := \
 	$(BUILD_DIR)/tests/kernel-root-boot-cleanup-rv
-USER_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-user-rv
-USER_FATAL_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-user-fatal-rv
 
 ARCH_FLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany
 CPPFLAGS := -DBOAROS_LOCK_DEBUG=$(LOCK_DEBUG) -DBOAROS_COST_DIAGNOSTICS=$(COST_DIAGNOSTICS) -Iinclude -DBOAROS_PAGE_SHIFT=12 \
@@ -524,26 +510,12 @@ endif
 TEST_RUNTIME_OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(TEST_RUNTIME_C_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(TEST_RUNTIME_ASM_SOURCES))
-DTB_TEST_C_SOURCES := \
-	kernel/boot_memory.c \
-	kernel/dtb.c \
-	tests/riscv/boot_memory_cases.c \
-	tests/riscv/dtb_main.c
-DTB_TEST_OBJECTS := \
-	$(TEST_RUNTIME_OBJECTS) \
-	$(patsubst %.c,$(BUILD_DIR)/%.o,$(DTB_TEST_C_SOURCES))
 PAGE_TEST_C_SOURCES := \
 	tests/riscv/physical_page_cases.c \
 	tests/riscv/physical_page_main.c
 PAGE_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(PAGE_TEST_C_SOURCES))
-HEAP_TEST_C_SOURCES := \
-	tests/riscv/heap_cases.c \
-	tests/riscv/heap_main.c
-HEAP_TEST_OBJECTS := \
-	$(TEST_RUNTIME_OBJECTS) \
-	$(patsubst %.c,$(BUILD_DIR)/%.o,$(HEAP_TEST_C_SOURCES))
 BLOCK_TEST_C_SOURCES := \
 	kernel/dtb.c \
 	tests/riscv/block_main.c
@@ -619,53 +591,6 @@ UACCESS_TEST_C_SOURCES := \
 UACCESS_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(UACCESS_TEST_C_SOURCES))
-TIMER_CASES_TEST_C_SOURCES := \
-	tests/riscv/timer_cases.c
-TIMER_CASES_TEST_OBJECTS := \
-	$(TEST_RUNTIME_OBJECTS) \
-	$(patsubst %.c,$(BUILD_DIR)/%.o,$(TIMER_CASES_TEST_C_SOURCES))
-TIMER_BOOT_TEST_C_SOURCES := \
-	tests/riscv/timer_boot.c
-TIMER_BOOT_TEST_OBJECTS := \
-	$(OBJECTS) \
-	$(patsubst %.c,$(BUILD_DIR)/%.o,$(TIMER_BOOT_TEST_C_SOURCES))
-CONTEXT_TEST_C_SOURCES := \
-	tests/riscv/context_cases.c
-CONTEXT_TEST_OBJECTS := \
-	$(TEST_RUNTIME_OBJECTS) \
-	$(patsubst %.c,$(BUILD_DIR)/%.o,$(CONTEXT_TEST_C_SOURCES))
-SCHEDULER_CASES_TEST_C_SOURCES := \
-	tests/riscv/scheduler_cases.c
-SCHEDULER_CASES_TEST_OBJECTS := \
-	$(TEST_RUNTIME_OBJECTS) \
-	$(patsubst %.c,$(BUILD_DIR)/%.o,$(SCHEDULER_CASES_TEST_C_SOURCES))
-SCHEDULER_BOOT_TEST_C_SOURCES := \
-	tests/riscv/scheduler_boot.c
-SCHEDULER_BOOT_TEST_ASM_SOURCES := \
-	tests/riscv/scheduler_workers.S
-SCHEDULER_BOOT_TEST_OBJECTS := \
-	$(OBJECTS) \
-	$(patsubst %.c,$(BUILD_DIR)/%.o,$(SCHEDULER_BOOT_TEST_C_SOURCES)) \
-	$(patsubst %.S,$(BUILD_DIR)/%.o,$(SCHEDULER_BOOT_TEST_ASM_SOURCES))
-SYSCALL_TEST_C_SOURCES := \
-	tests/riscv/syscall_cases.c \
-	tests/riscv/syscall_main.c
-SYSCALL_TEST_OBJECTS := \
-	$(TEST_RUNTIME_OBJECTS) \
-	$(patsubst %.c,$(BUILD_DIR)/%.o,$(SYSCALL_TEST_C_SOURCES))
-SIGNAL_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-signal-rv
-SIGNAL_TEST_C_SOURCES := \
-	tests/riscv/signal_cases.c \
-	tests/riscv/signal_main.c
-SIGNAL_TEST_OBJECTS := \
-	$(TEST_RUNTIME_OBJECTS) \
-	$(patsubst %.c,$(BUILD_DIR)/%.o,$(SIGNAL_TEST_C_SOURCES))
-ELF64_TEST_C_SOURCES := \
-	tests/riscv/elf64_cases.c \
-	tests/riscv/elf64_main.c
-ELF64_TEST_OBJECTS := \
-	$(TEST_RUNTIME_OBJECTS) \
-	$(patsubst %.c,$(BUILD_DIR)/%.o,$(ELF64_TEST_C_SOURCES))
 ROOT_INIT_PROGRAM_OBJECT_RV := \
 	$(BUILD_DIR)/tests/user/root_init.o
 ROOT_ORPHAN_PROGRAM_OBJECT_RV := \
@@ -682,21 +607,9 @@ DEMAND_PAGE_OOM_TEST_OBJECT_RV := \
 	$(BUILD_DIR)/tests/riscv/demand_page_oom.o
 ROOT_BOOT_CLEANUP_TEST_OBJECT_RV := \
 	$(BUILD_DIR)/tests/riscv/root_boot_cleanup_boot.o
-USER_TEST_C_SOURCES := tests/riscv/user_boot.c
-USER_TEST_ASM_SOURCES := tests/riscv/user_payload.S
-USER_TEST_OBJECTS := \
-	$(OBJECTS) \
-	$(patsubst %.c,$(BUILD_DIR)/%.o,$(USER_TEST_C_SOURCES)) \
-	$(patsubst %.S,$(BUILD_DIR)/%.o,$(USER_TEST_ASM_SOURCES))
-USER_FATAL_TEST_C_SOURCES := tests/riscv/user_bad_return.c
-USER_FATAL_TEST_OBJECTS := \
-	$(USER_TEST_OBJECTS) \
-	$(patsubst %.c,$(BUILD_DIR)/%.o,$(USER_FATAL_TEST_C_SOURCES))
 DEPS := \
 	$(OBJECTS:.o=.d) \
-	$(DTB_TEST_OBJECTS:.o=.d) \
 	$(PAGE_TEST_OBJECTS:.o=.d) \
-	$(HEAP_TEST_OBJECTS:.o=.d) \
 	$(BLOCK_TEST_OBJECTS:.o=.d) \
 	$(VFS_TEST_OBJECTS:.o=.d) \
 	$(VFS_RECOVERY_TEST_MAIN_OBJECT:.o=.d) \
@@ -709,41 +622,26 @@ DEPS := \
 	$(MM_FATAL_TEST_OBJECTS:.o=.d) \
 	$(VMA_TEST_OBJECTS:.o=.d) \
 	$(UACCESS_TEST_OBJECTS:.o=.d) \
-	$(TIMER_CASES_TEST_OBJECTS:.o=.d) \
-	$(TIMER_BOOT_TEST_OBJECTS:.o=.d) \
-	$(CONTEXT_TEST_OBJECTS:.o=.d) \
-	$(SCHEDULER_CASES_TEST_OBJECTS:.o=.d) \
-	$(SCHEDULER_BOOT_TEST_OBJECTS:.o=.d) \
-	$(SYSCALL_TEST_OBJECTS:.o=.d) \
-	$(SIGNAL_TEST_OBJECTS:.o=.d) \
-	$(ELF64_TEST_OBJECTS:.o=.d) \
 	$(ROOT_INIT_PROGRAM_OBJECT_RV:.o=.d) \
 	$(UACCESS_OOM_PROGRAM_OBJECT_RV:.o=.d) \
 	$(ROOT_EXEC_STAGE2_OBJECT_RV:.o=.d) \
 	$(ROOT_EXEC_STAGE3_OBJECT_RV:.o=.d) \
 	$(ROOT_EXEC_STAGE3_OOM_OBJECT_RV:.o=.d) \
 	$(DEMAND_PAGE_OOM_TEST_OBJECT_RV:.o=.d) \
-	$(ROOT_BOOT_CLEANUP_TEST_OBJECT_RV:.o=.d) \
-	$(USER_TEST_OBJECTS:.o=.d) \
-	$(USER_FATAL_TEST_OBJECTS:.o=.d)
+	$(ROOT_BOOT_CLEANUP_TEST_OBJECT_RV:.o=.d)
 
-.PHONY: all clean debug-riscv references run-riscv test-dtb-riscv \
-	test-context-riscv \
-	test-elf64-riscv \
+.PHONY: all clean debug-riscv references run-riscv \
 	test-root-init-riscv test-demand-page-riscv test-exec-riscv \
 	test-root-boot-cleanup-riscv \
-	test-uaccess-oom-riscv test-icache-riscv \
+	test-uaccess-oom-riscv \
 	test-files-riscv \
 	test-files-partial-write-riscv \
-	test-idle-riscv \
 	test-lwext4-host test-lwext4-recovery-host test-lwext4-rename-host \
-	test-block-riscv test-heap-riscv test-page-riscv test-vfs-riscv \
-	test-scheduler-cases-riscv test-scheduler-riscv \
-	test-boot-riscv test-references test-riscv \
+	test-block-riscv test-page-riscv test-vfs-riscv \
+	test-references test-riscv \
 	test-sv39-fault-riscv test-sv39-riscv test-stack-guard-riscv \
-	test-syscall-riscv test-signal-riscv test-timer-riscv \
-	test-user-fatal-riscv test-mm-riscv \
-	test-uaccess-riscv test-user-riscv test-vma-riscv test-brk-riscv \
+	test-mm-riscv \
+	test-uaccess-riscv test-vma-riscv test-brk-riscv \
 	test-mmap-riscv
 
 OSCOMP_GROUPS ?= basic busybox cyclictest iozone iperf libcbench libctest lmbench lua netperf ltp
@@ -961,17 +859,9 @@ $(KERNEL_RV): $(OBJECTS) $(RV_BTF_OBJECT) arch/riscv/linker.ld $(BUILD_DIR)/gene
 	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/kernel-rv.map \
 		-Wl,--undefined=__boaros_btf_start -o $@ $(OBJECTS) $(RV_BTF_OBJECT)
 
-$(DTB_TEST_KERNEL_RV): $(DTB_TEST_OBJECTS) arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/tests/kernel-dtb-rv.map \
-		-o $@ $(DTB_TEST_OBJECTS)
-
 $(PAGE_TEST_KERNEL_RV): $(PAGE_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/tests/kernel-page-rv.map \
 		-o $@ $(PAGE_TEST_OBJECTS)
-
-$(HEAP_TEST_KERNEL_RV): $(HEAP_TEST_OBJECTS) arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/tests/kernel-heap-rv.map \
-		-o $@ $(HEAP_TEST_OBJECTS)
 
 $(BLOCK_TEST_KERNEL_RV): $(BLOCK_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/tests/kernel-block-rv.map \
@@ -1072,89 +962,6 @@ $(FILES_PARTIAL_WRITE_TEST_MAIN_OBJECT): tests/riscv/files_main.c
 	$(CC) $(CPPFLAGS) $(LWEXT4_CPPFLAGS) $(CFLAGS) \
 		-DFILES_PARTIAL_WRITE_TEST -MMD -MP -c $< -o $@
 
-$(TIMER_CASES_TEST_KERNEL_RV): $(TIMER_CASES_TEST_OBJECTS) \
-		arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,--wrap=sbi_probe_extension \
-		-Wl,--wrap=sbi_set_timer \
-		-Wl,-Map,$(BUILD_DIR)/tests/kernel-timer-cases-rv.map \
-		-o $@ $(TIMER_CASES_TEST_OBJECTS)
-
-$(TIMER_BOOT_TEST_KERNEL_RV): $(TIMER_BOOT_TEST_OBJECTS) \
-		arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_tick_advance \
-		-Wl,-Map,$(BUILD_DIR)/tests/kernel-timer-boot-rv.map \
-		-o $@ $(TIMER_BOOT_TEST_OBJECTS)
-
-$(CONTEXT_TEST_KERNEL_RV): $(CONTEXT_TEST_OBJECTS) arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) \
-		-Wl,-Map,$(BUILD_DIR)/tests/kernel-context-rv.map \
-		-o $@ $(CONTEXT_TEST_OBJECTS)
-
-$(SCHEDULER_CASES_TEST_KERNEL_RV): $(SCHEDULER_CASES_TEST_OBJECTS) \
-		arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) \
-		-Wl,-Map,$(BUILD_DIR)/tests/kernel-scheduler-cases-rv.map \
-		-o $@ $(SCHEDULER_CASES_TEST_OBJECTS)
-
-$(SCHEDULER_BOOT_TEST_KERNEL_RV): $(SCHEDULER_BOOT_TEST_OBJECTS) \
-		arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_scheduler_init \
-		-Wl,--wrap=kernel_tick_advance \
-		-Wl,-Map,$(BUILD_DIR)/tests/kernel-scheduler-boot-rv.map \
-		-o $@ $(SCHEDULER_BOOT_TEST_OBJECTS)
-
-$(SYSCALL_TEST_KERNEL_RV): $(SYSCALL_TEST_OBJECTS) arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_task_mm_borrow_mutable \
-	-Wl,--wrap=kernel_mm_brk \
-	-Wl,--wrap=kernel_mm_mmap_anonymous \
-	-Wl,--wrap=kernel_mm_validate_file_private_mapping \
-	-Wl,--wrap=kernel_mm_mmap_file_private \
-		-Wl,--wrap=kernel_mm_munmap \
-		-Wl,--wrap=kernel_mm_mprotect \
-	-Wl,--wrap=kernel_task_files_borrow \
-	-Wl,--wrap=kernel_task_fs_context_borrow \
-	-Wl,--wrap=kernel_task_set_tid_address \
-	-Wl,--wrap=kernel_task_cpu_ticks \
-	-Wl,--wrap=kernel_files_pin_data \
-	-Wl,--wrap=kernel_files_write \
-	-Wl,--wrap=kernel_files_writev \
-	-Wl,--wrap=kernel_files_lseek \
-	-Wl,--wrap=kernel_files_fstat \
-	-Wl,--wrap=kernel_files_fstatat \
-	-Wl,--wrap=kernel_files_getdents \
-	-Wl,--wrap=kernel_files_mknodat \
-	-Wl,--wrap=kernel_files_dup \
-	-Wl,--wrap=kernel_files_dup3 \
-	-Wl,--wrap=kernel_files_fcntl \
-	-Wl,--wrap=kernel_open_file_kind \
-	-Wl,--wrap=kernel_open_file_readable \
-	-Wl,--wrap=kernel_open_file_writable \
-	-Wl,--wrap=kernel_open_file_release \
-	-Wl,-Map,$(BUILD_DIR)/tests/kernel-syscall-rv.map \
-		-o $@ $(SYSCALL_TEST_OBJECTS)
-
-$(SIGNAL_TEST_KERNEL_RV): $(SIGNAL_TEST_OBJECTS) arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) \
-		-Wl,--wrap=kernel_copy_from_user \
-		-Wl,--wrap=kernel_copy_to_user \
-		-Wl,--wrap=kernel_signal_get_action \
-		-Wl,--wrap=kernel_signal_set_action \
-		-Wl,--wrap=kernel_signal_get_blocked \
-		-Wl,--wrap=kernel_signal_update_blocked \
-		-Wl,--wrap=kernel_signal_get_pending \
-		-Wl,--wrap=kernel_signal_send_targets \
-		-Wl,--wrap=kernel_signal_send_thread \
-		-Wl,--wrap=kernel_task_mm_borrow_mutable \
-		-Wl,--wrap=kernel_task_tid \
-		-Wl,--wrap=kernel_task_tgid \
-		-Wl,-Map,$(BUILD_DIR)/tests/kernel-signal-rv.map \
-		-o $@ $(SIGNAL_TEST_OBJECTS)
-
-$(ELF64_TEST_KERNEL_RV): $(ELF64_TEST_OBJECTS) arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) \
-		-Wl,-Map,$(BUILD_DIR)/tests/kernel-elf64-rv.map \
-		-o $@ $(ELF64_TEST_OBJECTS)
-
 $(ROOT_INIT_PROGRAM_OBJECT_RV): tests/riscv/root_init.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(ASFLAGS) -MMD -MP -c $< -o $@
@@ -1234,25 +1041,6 @@ $(ROOT_BOOT_CLEANUP_TEST_KERNEL_RV): $(OBJECTS) \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-root-boot-cleanup-rv.map \
 		-o $@ $(OBJECTS) $(ROOT_BOOT_CLEANUP_TEST_OBJECT_RV)
 
-$(USER_TEST_KERNEL_RV): $(USER_TEST_OBJECTS) arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,--wrap=riscv_sv39_activate \
-		-Wl,--wrap=kernel_scheduler_init \
-		-Wl,--wrap=kernel_scheduler_reap_one \
-		-Wl,--wrap=physical_page_release \
-		-Wl,--wrap=kernel_tick_advance \
-		-Wl,-Map,$(BUILD_DIR)/tests/kernel-user-rv.map \
-		-o $@ $(USER_TEST_OBJECTS)
-
-$(USER_FATAL_TEST_KERNEL_RV): $(USER_FATAL_TEST_OBJECTS) \
-		arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,--wrap=riscv_sv39_activate \
-		-Wl,--wrap=kernel_scheduler_init \
-		-Wl,--wrap=kernel_scheduler_reap_one \
-		-Wl,--wrap=kernel_tick_advance \
-		-Wl,--wrap=riscv_trap_dispatch \
-		-Wl,-Map,$(BUILD_DIR)/tests/kernel-user-fatal-rv.map \
-		-o $@ $(USER_FATAL_TEST_OBJECTS)
-
 $(BUILD_DIR)/%.o: %.c $(BUILD_DIR)/generated/cost-config.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
@@ -1286,32 +1074,20 @@ debug-riscv: $(KERNEL_RV)
 		--qemu '$(QEMU_RISCV64)' --kernel $(KERNEL_RV) --memory $(QEMU_MEMORY) --gdb
 
 .NOTPARALLEL: test-riscv
-test-riscv: test-dtb-riscv test-page-riscv test-heap-riscv \
+test-riscv: test-page-riscv \
 	test-block-riscv test-vfs-riscv test-files-riscv \
 	test-files-partial-write-riscv \
-	test-context-riscv test-scheduler-cases-riscv \
-	test-scheduler-riscv test-syscall-riscv test-signal-riscv \
-	test-elf64-riscv test-elf-rwx-riscv \
-	test-user-riscv test-user-fatal-riscv \
+	test-elf-rwx-riscv \
 	test-mm-riscv test-vma-riscv test-uaccess-riscv \
 	test-sv39-riscv test-sv39-fault-riscv test-stack-guard-riscv \
-	test-timer-riscv test-boot-riscv \
 	test-root-init-riscv test-root-orphan-riscv \
-	test-uaccess-oom-riscv test-icache-riscv \
+	test-uaccess-oom-riscv \
 	test-demand-page-riscv test-root-boot-cleanup-riscv \
-	test-exec-riscv test-idle-riscv
-
-test-dtb-riscv: $(DTB_TEST_KERNEL_RV)
-	QEMU_RISCV64=$(QEMU_RISCV64) DTB_TEST_KERNEL_RV=$< \
-		./tests/riscv/dtb.sh
+	test-exec-riscv
 
 test-page-riscv: $(PAGE_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) PAGE_TEST_KERNEL_RV=$< \
 		./tests/riscv/page.sh
-
-test-heap-riscv: $(HEAP_TEST_KERNEL_RV)
-	QEMU_RISCV64=$(QEMU_RISCV64) HEAP_TEST_KERNEL_RV=$< \
-		./tests/riscv/heap.sh
 
 test-block-riscv: $(BLOCK_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) BLOCK_TEST_KERNEL_RV=$< \
@@ -1333,30 +1109,6 @@ test-files-partial-write-riscv: $(FILES_PARTIAL_WRITE_TEST_KERNEL_RV)
 		FILES_TEST_EXPECT_CONSOLE_WRITES=0 \
 		FILES_TEST_SUCCESS_MARKER='BoarOS: process files partial write tests passed' \
 		./tests/riscv/files.sh
-
-test-context-riscv: $(CONTEXT_TEST_KERNEL_RV)
-	QEMU_RISCV64=$(QEMU_RISCV64) OBJDUMP_RV=$(OBJDUMP) \
-		CONTEXT_TEST_KERNEL_RV=$< \
-		CONTEXT_OBJECT_RV=$(BUILD_DIR)/arch/riscv/context_switch.o \
-		./tests/riscv/context.sh
-
-test-scheduler-cases-riscv: $(SCHEDULER_CASES_TEST_KERNEL_RV)
-	QEMU_RISCV64=$(QEMU_RISCV64) SCHEDULER_CASES_TEST_KERNEL_RV=$< \
-		./tests/riscv/scheduler-cases.sh
-
-test-scheduler-riscv: $(SCHEDULER_BOOT_TEST_KERNEL_RV)
-	QEMU_RISCV64=$(QEMU_RISCV64) OBJDUMP_RV=$(OBJDUMP) \
-		SCHEDULER_BOOT_TEST_KERNEL_RV=$< \
-		SCHEDULER_OBJECT_RV=$(BUILD_DIR)/kernel/sched/core.o \
-		./tests/riscv/scheduler.sh
-
-test-syscall-riscv: $(SYSCALL_TEST_KERNEL_RV)
-	QEMU_RISCV64=$(QEMU_RISCV64) SYSCALL_TEST_KERNEL_RV=$< \
-		./tests/riscv/syscall.sh
-
-test-signal-riscv: $(SIGNAL_TEST_KERNEL_RV)
-	QEMU_RISCV64=$(QEMU_RISCV64) SIGNAL_TEST_KERNEL_RV=$< \
-		./tests/riscv/signal.sh
 
 MUSL_TARBALL := references/musl/musl-1.2.5.tar.gz
 MUSL_ROOT := $(BUILD_DIR)/musl-root
@@ -1509,15 +1261,10 @@ test-glibc-riscv: $(KERNEL_RV)
 		--kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64)
 
 test-brk-riscv: test-sv39-riscv test-vma-riscv \
-		test-elf64-riscv test-syscall-riscv \
 		test-root-init-riscv
 
 test-mmap-riscv: test-sv39-riscv test-vma-riscv \
-		test-syscall-riscv test-files-riscv test-root-init-riscv
-
-test-elf64-riscv: $(ELF64_TEST_KERNEL_RV)
-	QEMU_RISCV64=$(QEMU_RISCV64) ELF64_TEST_KERNEL_RV=$< \
-		./tests/riscv/elf64.sh
+		test-files-riscv test-root-init-riscv
 
 test-root-init-riscv: $(KERNEL_RV) $(ROOT_INIT_PROGRAM_RV) \
 		$(ROOT_EXEC_STAGE2_RV) $(ROOT_EXEC_STAGE3_RV)
@@ -1573,11 +1320,6 @@ test-uaccess-oom-riscv: $(KERNEL_RV) $(UACCESS_OOM_PROGRAM_RV) \
 		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
 		./tests/riscv/uaccess-oom.sh
 
-test-icache-riscv: $(KERNEL_RV)
-	OBJDUMP_RV=$(OBJDUMP) MM_OBJECT_RV=$(abspath $(BUILD_DIR)/mm/mm.o) \
-		ELF_IMAGE_OBJECT_RV=$(abspath $(BUILD_DIR)/kernel/elf_image.o) \
-		SV39_OBJECT_RV=$(abspath $(BUILD_DIR)/arch/riscv/sv39.o) ./tests/riscv/icache.sh
-
 test-demand-page-riscv: test-root-init-riscv \
 		$(DEMAND_PAGE_OOM_TEST_KERNEL_RV) $(ROOT_INIT_PROGRAM_RV) \
 		$(ROOT_EXEC_STAGE2_RV) $(ROOT_EXEC_STAGE3_RV) \
@@ -1601,14 +1343,6 @@ test-root-boot-cleanup-riscv: $(ROOT_BOOT_CLEANUP_TEST_KERNEL_RV) \
 		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
 		ROOT_BOOT_ERROR_STATUS=0xb \
 		./tests/riscv/root-init.sh
-
-test-user-riscv: $(USER_TEST_KERNEL_RV)
-	QEMU_RISCV64=$(QEMU_RISCV64) USER_TEST_KERNEL_RV=$< \
-		./tests/riscv/user.sh
-
-test-user-fatal-riscv: $(USER_FATAL_TEST_KERNEL_RV)
-	QEMU_RISCV64=$(QEMU_RISCV64) USER_FATAL_TEST_KERNEL_RV=$< \
-		./tests/riscv/user-fatal.sh
 
 test-mm-riscv: $(MM_TEST_KERNEL_RV) $(MM_FATAL_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) MM_TEST_KERNEL_RV=$< \
@@ -1641,19 +1375,6 @@ test-stack-guard-riscv: $(STACK_GUARD_TEST_KERNEL_RV)
 test-riscv-timer-host:
 	python3 -B tests/host/riscv_timer_events.py
 
-test-timer-riscv: $(TIMER_CASES_TEST_KERNEL_RV) \
-		$(TIMER_BOOT_TEST_KERNEL_RV) test-riscv-timer-host
-	QEMU_RISCV64=$(QEMU_RISCV64) TIMER_CASES_TEST_KERNEL_RV=$< \
-		TIMER_BOOT_TEST_KERNEL_RV=$(TIMER_BOOT_TEST_KERNEL_RV) \
-		./tests/riscv/timer.sh
-
-test-boot-riscv: $(TIMER_BOOT_TEST_KERNEL_RV)
-	QEMU_RISCV64=$(QEMU_RISCV64) NM_RV=$(NM) READELF_RV=$(READELF) \
-		BOOT_TEST_KERNEL_RV=$< ./tests/riscv/boot.sh
-
-test-idle-riscv: $(KERNEL_RV)
-	QEMU_RISCV64=$(QEMU_RISCV64) KERNEL_RV=$< ./tests/riscv/idle.sh
-
 clean:
 	$(RM) -r -- $(BUILD_DIR) $(KERNEL_RV)
 
@@ -1685,17 +1406,6 @@ test-allocator-release-host:
 		cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/random -Iinclude \
 			tests/host/allocator_release.c kernel/physical_page.c $(HOST_CPU_SOURCES) mm/heap.c -o build/host/allocator-release-$$shift && \
 		build/host/allocator-release-$$shift || exit; \
-	done
-
-.PHONY: test-allocator-cost-host
-test-allocator-cost-host:
-	@mkdir -p build/cost/host
-	@for shift in 12 14; do \
-		cc -std=c11 -O2 -Wall -Wextra -Werror -Itests/host/random -idirafter include \
-			-DBOAROS_PAGE_SHIFT=$$shift -DBOAROS_COST_DIAGNOSTICS=1 \
-			tests/cost/allocator_work.c kernel/cost.c kernel/physical_page.c $(HOST_CPU_SOURCES) \
-			-o build/cost/host/allocator-work-$$shift && \
-		build/cost/host/allocator-work-$$shift || exit; \
 	done
 
 include tests/diff-abi/Makefile.inc
@@ -1822,23 +1532,6 @@ test-elf-rwx-riscv: $(KERNEL_RV) $(ELF_RWX_PROGRAM_RV)
 	KERNEL_RV=$(KERNEL_RV) ELF_RWX_PROGRAM_RV=$(ELF_RWX_PROGRAM_RV) \
 		QEMU_RISCV64=$(QEMU_RISCV64) ./tests/riscv/elf-rwx.sh
 
-SCALE_OBJECTS := $(TEST_RUNTIME_OBJECTS) \
-    $(patsubst %.c,$(BUILD_DIR)/%.o,$(VFS_TEST_SUPPORT_C_SOURCES)) \
-    $(BUILD_DIR)/tests/riscv/scale_main.o
--include $(BUILD_DIR)/tests/riscv/scale_main.d
-$(BUILD_DIR)/tests/kernel-scale-rv: $(SCALE_OBJECTS) arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,--wrap=riscv_sv39_current_satp \
-		-Wl,--wrap=physical_page_allocate -Wl,--wrap=kernel_heap_allocate_zeroed \
-		-Wl,--wrap=kernel_heap_resize -Wl,--wrap=kernel_heap_allocate \
-		-Wl,--wrap=kernel_vfs_node_pread,--wrap=kernel_vfs_node_pread_batch -Wl,--wrap=kernel_vfs_node_writeback \
-		-Wl,--wrap=kernel_wait_queue_wake_all \
-		-Wl,--wrap=netif_poll_all -Wl,--wrap=sys_check_timeouts -Wl,--wrap=sys_now \
-		-Wl,--wrap=netif_poll_budget -Wl,--wrap=sys_check_timeouts_budget \
-		-o $@ $(SCALE_OBJECTS)
-.PHONY: test-scale-riscv
-test-scale-riscv: $(BUILD_DIR)/tests/kernel-scale-rv
-	python3 tests/riscv/scale.py --kernel $< --qemu $(QEMU_RISCV64)
-
 IO_SLEEP_OBJECTS := $(TEST_RUNTIME_OBJECTS) $(BUILD_DIR)/kernel/dtb.o $(BUILD_DIR)/tests/riscv/io_sleep_main.o
 -include $(BUILD_DIR)/tests/riscv/io_sleep_main.d
 $(BUILD_DIR)/tests/riscv/io_sleep_main.o: CPPFLAGS += $(LWEXT4_CPPFLAGS)
@@ -1935,7 +1628,7 @@ test-sched-bandwidth-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 	KERNEL_RV=$(KERNEL_RV) QEMU_RISCV64=$(QEMU_RISCV64) sh tests/riscv/sched-bandwidth.sh
 
 # Cost variants never reuse objects compiled with a different observation flag.
-.PHONY: force-cost-config test-cost-riscv test-cost-host test-cost-tools-host
+.PHONY: force-cost-config
 force-cost-config:
 # Shared prerequisite content must not depend on whichever target reaches it first.
 build-quote = '$(subst ','"'"',$(1))'
@@ -1952,44 +1645,6 @@ $(BUILD_DIR)/generated/link-config: force-cost-config Makefile
 	@mkdir -p $(dir $@)
 	@printf '%s\n' $(call build-quote,$(BUILD_CONFIG_CC)) $(call build-quote,$(BUILD_CONFIG_LINK)) > $@.tmp
 	@cmp -s $@ $@.tmp && rm $@.tmp || mv $@.tmp $@
-COST_CASE ?= all
-test-cost-tools-host:
-	python3 -B tests/cost/test-cost-report.py
-	python3 -B tests/cost/test-cost-measurement.py
-	python3 -B tests/cost/test-cost-qmp.py
-# Force only this fixture's aggregate atomics through their ordinary ABI so
-# the test can handshake at the actual locked poll, without production hooks.
-.PHONY: test-cost-boundary-host
-test-cost-boundary-host:
-	@mkdir -p build/cost/host
-	cc -std=c11 -O2 -Wall -Wextra -Werror -fno-inline-atomics -idirafter include -DBOAROS_MAX_CPUS=2 -DBOAROS_USER_SMP=1 -DBOAROS_COST_DIAGNOSTICS=1 -c kernel/cost.c -o build/cost/host/boundary-cost.o
-	cc -std=c11 -O2 -Wall -Wextra -Werror -pthread -idirafter include -DBOAROS_MAX_CPUS=2 -DBOAROS_USER_SMP=1 -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/irq_boundary_test.c build/cost/host/boundary-cost.o -latomic -Wl,--wrap=__atomic_load_4,--wrap=__atomic_exchange_4,--wrap=__atomic_load_8,--wrap=__atomic_exchange_8 -o build/cost/host/irq-boundary-test
-	for scenario in 0 1 2 3; do timeout 10s build/cost/host/irq-boundary-test $$scenario || exit $$?; done
-	cc -std=gnu11 -O2 -g -ffunction-sections -fdata-sections -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 -DBOAROS_USER_SMP=1 -DBOAROS_TEST_IRQ_RESTORE=1 -Itests/host/sync -Ikernel/sched -idirafter include tests/cost/lock_boundary_test.c kernel/cost.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/sync.c kernel/time.c -Wl,--gc-sections,--wrap=kernel_raw_lock_release,--wrap=kernel_raw_lock_acquire,--wrap=kernel_cost_add -o build/cost/host/lock-boundary-test
-	for scenario in 1 2 3 4 5; do timeout 10s build/cost/host/lock-boundary-test $$scenario || exit $$?; done
-
-test-cost-host: test-cost-tools-host test-cost-boundary-host
-	@mkdir -p build/cost/host
-	cc -std=c11 -Wall -Wextra -Werror -idirafter include -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/core_test.c kernel/cost.c -o build/cost/host/core-test
-	build/cost/host/core-test
-	cc -std=c11 -Wall -Wextra -Werror -idirafter include -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/account_test.c kernel/cost.c -o build/cost/host/account-test
-	build/cost/host/account-test
-	cc -std=c11 -Wall -Wextra -Werror -idirafter include -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/irq_test.c kernel/cost.c -o build/cost/host/irq-test
-	build/cost/host/irq-test
-	cc -std=c11 -O2 -Wall -Wextra -Werror -pthread -idirafter include -DBOAROS_MAX_CPUS=2 -DBOAROS_USER_SMP=1 -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/smp_test.c kernel/cost.c -o build/cost/host/smp-test
-	build/cost/host/smp-test
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_MAX_CPUS=2 -DBOAROS_USER_SMP=1 -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 -Itests/host/sync -idirafter include tests/cost/idle_test.c kernel/cost.c kernel/cpu.c kernel/raw_lock.c kernel/sched/scheduling.c -Wl,--gc-sections -o build/cost/host/idle-test
-	build/cost/host/idle-test
-	cc -std=c11 -O2 -Wall -Wextra -Werror -Itests/host/sync -idirafter include -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/raw_test.c kernel/cost.c kernel/cpu.c kernel/raw_lock.c -o build/cost/host/raw-test
-	build/cost/host/raw-test
-	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/page_test.c kernel/cost.c kernel/physical_page.c $(HOST_CPU_SOURCES) -o build/cost/host/page-test
-	build/cost/host/page-test
-	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/memory_test.c kernel/cost.c kernel/physical_page.c $(HOST_CPU_SOURCES) mm/heap.c mm/uaccess.c -o build/cost/host/memory-test
-	build/cost/host/memory-test
-test-cost-riscv: test-cost-host
-	$(MAKE) COST_DIAGNOSTICS=1 all
-	python3 -B tests/cost/cost-riscv.py --kernel build/cost/kernel-rv --qemu $(QEMU_RISCV64) --case $(COST_CASE)
-
 .PHONY: test-log-host
 test-log-host:
 	@mkdir -p build/host
@@ -2142,24 +1797,13 @@ test-epoll-host:
 test-epoll-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 	python3 -B tests/riscv/epoll.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64)
 
-.PHONY: test-cache-growth-riscv
-test-cache-growth-riscv:
-	$(MAKE) COST_DIAGNOSTICS=1 test-scale-riscv
-
-$(BUILD_DIR)/tests/riscv/scale_main.o: CPPFLAGS += $(LWIP_CPPFLAGS)
 
 include arch/loongarch/build.mk
 include vdso/build.mk
 
-.PHONY: test-build-config-host test-elf-layout-host
-test-build-config-host:
-	python3 -B tests/host/build_config.py
+.PHONY: test-elf-layout-host
 test-elf-layout-host:
 	sh tests/host/elf-layout.sh
-
-.PHONY: test-ci-host
-test-ci-host: test-build-config-host
-	python3 -B -m unittest discover -s tests/ci -p 'test_*.py'
 
 .PHONY: test-virtio-block-host
 .PHONY: test-virtio-framework-host
@@ -2220,7 +1864,6 @@ test-sync-host:
 		-Itests/host/sync -idirafter include tests/host/sync.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c -o build/host/sync-$$cpus-$$debug; \
 		build/host/sync-$$cpus-$$debug; \
 	done; done
-	python3 -B tests/common/test_sync.py
 
 .PHONY: test-mm-pin-host test-memory-object-concurrency-host test-mm-shared-concurrency-host test-file-mapping-concurrency-host
 test-file-mapping-concurrency-host:

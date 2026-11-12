@@ -57,8 +57,6 @@ pin防止已许可片段使用的页被撤映射后重新发放，不固定内�
 COST 构建在成功解析后的固定长度页内 chunk 记录实际复制字节、次数、单次最大值
 及经过 ticks；解析失败、权限检查和字符串扫描不归入该复制样本。采样不改变已复制
 前缀。用户页解析次数只通过已有 `COST_USER_RESOLUTIONS` 记录，普通构建不维护每页全局原子计数。
-Lua 定点结果只归因当时的页内字节复制，不能用它排除解析、缺页或全部内存成本；
-[工具链记录](../learning/offline-toolchain-probe.md#内存操作的有限归因与未上线候选2026-10-03)保留历史字节实现与宽字候选的比较，不能作为当前实现的应用吞吐结果。
 
 QEMU `virt` 与 VisionFive 2 共享这套 Sv39 实现，板级 RAM/MMIO 差异已由启动内存和页表建立隔离。LoongArch 已用同一策略和自己的 16 KiB/三级页表、用户范围验证真实 ELF 与跨页用户复制；见[首阶段范围](loongarch-boot.md)。
 
@@ -71,8 +69,6 @@ make test-mm-smp-riscv
 make test-uaccess-riscv
 make test-files-partial-write-riscv
 make test-userland-riscv
-make test-syscall-riscv
-make test-user-riscv
 make test-riscv
 ```
 

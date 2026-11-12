@@ -1,46 +1,5 @@
 # 文件时间戳：请求边界、live inode 与 relatime
 
-## 共享读取中的 checksum 计算（2026-10-08）
-
-基线 `main@cfae103` 的 `third_party/lwext4/src/ext4_fs.c` 在 GDT 和 inode 的
-metadata checksum 计算期间，把共享缓冲中的 checksum 字段清零，算完再恢复。
-`fs/lwext4_port.c` 的普通查询持有共享读锁；`kernel/sched/sync.c` 的取得读锁
-在返回前恢复 IRQ，因此不能把这个短窗口当成读者之间的独占保护。
-确定性重入通过公共 `ext4_fraw_inode_fill()` 让第二读者在该窗口校验同一合法对象，
-原路径出现外层成功、第二读者 `EUCLEAN=117`。这证明错误交错存在，不声称已经
-捕获自然 timer 抢占中的同一次故障，也不据此解释历史吞吐负向。
-
-修复以 `ext4_crc32c_zeroed()` 对字段归一化：原字节段与两个零字节顺序进入 CRC，
-输入全程不变。原 checksum seed、inode number/generation、128-byte 截断和高字段
-选择保留；orphan 的 inode 计算使用同一原语，真正修改仍由持有写权限的 caller 发布。
-没有增加 inode copy、heap 分配或 IRQ 关闭区间，也没有改变 journal undo、prune、
-回滚和持久化规则。固定 Linux
-`references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的
-`fs/ext4/inode.c:ext4_inode_csum()` 和 `fs/ext4/super.c:ext4_group_desc_csum()`
-同样按字节段与本地零值计算；这里只引用其不修改输入的计算原则，保留 lwext4
-当前 inode 字段边界，未借此扩大磁盘格式承诺。lwext4 上游身份见下节。
-
-重建命令：
-
-```sh
-make test-lwext4-checksum-host
-make test-root-checksum-loongarch
-python3 -B tests/lwext4-checksum-read-host.py --source-root /path/to/cfae103 --output build/checksum-read-baseline
-make test-lwext4-metadata-host test-lwext4-group-host test-lwext4-recovery-host
-```
-
-CRC oracle 使用 `mprotect(PROT_READ)` 的输入，260例覆盖一个/两个字段、非零中段、
-实际 inode 124/130 offset、32～16384字节与原数据不变；7个非法内部布局必须 fatal。
-真实 ext4 镜像的8例覆盖1/4 KiB块、128/256-byte inode、GDT/inode两种交错，成功后
-归还引用、停止 journal、卸载、heap归零并经e2fsck检查。该门禁加入共同 host CI；
-本地门禁结果不等于远程 CI 已运行。LA 另外使用 `metadata_csum,64bit` 的正常根盘
-在512 MiB/1 GiB运行真实用户程序，正常退出、owner释放并通过e2fsck；同一原ELF在
-固定Linux的同类镜像另验证。默认根盘fixture不改变，checksum profile仅用于正常
-smoke路径，原错误fixture不能因更换格式而沿用未经核对的errno预期。
-
-GDT 只读定位的性能候选与更宽查询接口仍在隔离研究，尚未作为主线默认策略。
-上述修复处理已复现的 checksum 读者冲突，不声明它关闭了完整读写吞吐验收。
-
 ## 固定证据
 
 Linux 参考均为 `references/linux/` commit
@@ -109,7 +68,7 @@ refcount、新块checksum、inode占有扇区数和释放都必须一致。操�
 把块误记为空闲，后续复用才暴露损坏。独立e2fsck核对磁盘
 格式，raw-syscall差分核对可见语义，两类证据不能互相替代。
 
-重建用`./tests/lwext4-metadata-host.sh ownership`和`make test-diff-abi-riscv`。
+重建用`sh tests/host/lwext4-metadata.sh ownership`和`make test-diff-abi-riscv`。
 原BusyBox可用`chown 70001:80002 file`与`stat -c '%u:%g:%a' file`核对实际字段；
 显式sync后正常卸载再启动才能核对持久化，tmpfs和匿名pipe不适用重启保存要求。
 
@@ -126,8 +85,7 @@ node/journal/mount 保留，并在同步调用中观察。读侧 atime 错误按
 失败才安全回滚。重启按 journal/replay 和持久 orphan 恢复，见 [VFS 模块](../modules/vfs-ext4.md)。
 
 完整 fsync 先编码脏时间，再捕获 durable 目标。fdatasync 保留只同步数据所需依赖的语义，
-纯时间修改不单独推进 data 目标；与数据同事务编码的时间随数据持久化。性能收益必须由
-实际工作量的测量判断，历史组提交结果见[异步日志验收](cost-baseline.md#异步日志与组提交验收2026-10-01)。
+纯时间修改不单独推进 data 目标；与数据同事务编码的时间随数据持久化。
 
 ## 显式设置与检查顺序
 
@@ -162,92 +120,4 @@ relatime 相等/抑制/满 24 小时、负 epoch、2038/2106 边界、上限截�
 原始观察保留全部时间字段及操作前后 CLOCK_REALTIME，不把时间戳归零后比较。
 Linux `current_time()` 可以取 coarse clock，所以操作区间在一次 50ms 等待前开始，
 比较实际变更字段是否落在完整区间内，以及字段相等/relatime 条件是否一致。
-显式 utimensat 差分另保留请求值、NOW/OMIT、纳秒、范围端点、fd/dirfd/nofollow、坏指针与错误优先级。当前未覆盖 mmap 本身的 atime、noatime/lazytime 可配置挂载或 SMP 时间更新锁。
-
-## 原 RV 镜像 utime 的独立定位（2026-09-29）
-
-输入为 `references/oscomp-autotest/sdcard-rv.img`，SHA-256
-`f419468678d342133546add2f8459ea09aeba987ba968e28753d6ee656996b8b`；
-`/glibc/entry-static.exe` 为 `f140123cee82e5a0a1fc48ef9d845f24be920dfac9a07e5bd31ead053d3657ef`，
-`/glibc/entry-dynamic.exe` 为 `3829971b811d2b0ab5246e3697b1d1344e65b513a16160d5242817961fbfb6a0`。
-诊断内核 SHA-256 为 `d6aa60f1c09ff3d6cd7192453b7afe4dca968a37bdc75b6d7f3244bb05c34516`。
-未修改这些 ELF。主线 uname 使旧 libc 在测试前报 kernel too old，因此诊断 runner 在 build 内
-仅替换 uname 为 4.15.0 后隔离链接；主线源码默认值与评测分支均未改变。这不是正式评分。
-
-```sh
-make all
-python3 -B tests/runtime-diagnostics.py --output build/runtime-diagnostics --compat-release 4.15.0
-```
-
-runner 用相同原 ELF 在固定 Linux 和 BoarOS 各运行静态/动态 30 次，另构建两种时间记录探针：
-musl 驱动与链接原镜像 libc 的 `tests/workloads/diagnostics/time.c`，记录 time、coarse clock、
-realtime、UTIME_NOW 和 fstat。一次最终运行 Linux 为 30/30、30/30；BoarOS 为 13/30、14/30，
-失败率随栈内容和秒边界改变，不作为固定性能或评分指标。直接 realtime→NOW→fstat 八轮均正常，
-含一次 before=1790656006.996207100、atime=1790656006.996246800、after=1790656007.014658500。
-
-原 libc `/glibc/lib/libc.so.6` SHA-256
-`81af558241962fadf1d0199171be78dd2bb1e45098b8f7f786b22881b7bab33c` 的
-`riscv64-linux-gnu-objdump -d --disassemble=time` 在 `0x85a46` 设置 clockid=5，
-调用 clock_gettime 后不检查错误就读取栈上的 seconds。BoarOS 最小失败为
-`clock_gettime(CLOCK_REALTIME_COARSE, &ts) = -1, errno=EINVAL`；原 libc 探针 time 也留下
-errno=22。根因归时间 ABI 缺少 coarse clock，不是已经实现的 UTIME_NOW 元数据时间倒退。
-本次定位后补齐了真实 timer 来源的 coarse 时钟与 getres，未为这个程序特殊改 time 值；
-上面的通过率是修复前定位结果，不能作为当前回归结果。
-
-上述诊断所用固定 Linux 精简配置未启用 POSIX_TIMERS，raw/musl coarse 调用也返回 EINVAL；
-原 glibc 经 Linux vDSO 成功，独立原 libc 探针 coarse_rc=0、time errno=0。
-这一区别由原 ELF 反汇编、双侧探针及 `references/linux/kernel/time/posix-stubs.c`、
-`lib/vdso/gettimeofday.c`（固定 commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）共同解释，
-不能把 raw syscall 与 libc/vDSO 证据混为一谈。runner 的 JSON 记录原文件、探针、内核哈希和完整命令，
-这些可重建运行产物按 build 清理规则删除。
-
-## Timer 驱动的 coarse clock
-
-依据仍为固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e`：
-`kernel/time/timekeeping.c` 的 coarse 读取使用 timekeeper 已发布值；
-`kernel/time/posix-timers.c` 为两种 coarse 时钟报告每 tick 纳秒数，且缺少 `nsleep`
-回调时先返回 EOPNOTSUPP，早于用户 timespec 拷贝。
-
-BoarOS 初始化时采样一次，此后每次真实 timer interrupt 再采一次 counter，两个 coarse
-clock 从同一个 monotonic 样本与启动 RTC offset 派生。100Hz 对应 10ms getres。
-延迟或合并 tick 不能按 tick 个数补造时钟；coarse 查询也不能偷偷读 fine counter。
-fine realtime、无 RTC 时的相对时间回退和文件 UTIME_NOW 路径均保持原样。
-
-窄 RED 使用旧内核和同一 `tests/diff-abi/coarse.c` ELF，clock 5/6 全部返回 EINVAL；
-启用 POSIX_TIMERS 的固定 Linux 则能读出 coarse 时间，sleep 返回 EOPNOTSUPP。
-模块测试用未启动 timer 的环境证明多次读取保持旧样本，经过 25ms 后一次发布必须落在
-真实 fine 采样区间内，而不是固定前进一个 10ms。差分另外验证真实 timer 推进和 errno
-顺序；不同内核的 HZ 不同，不能强求 Linux 4ms 与 BoarOS 10ms getres 裸值相等。
-
-验证为 `make all test-syscall-riscv test-timer-riscv` 通过；同一 ELF 的 14 条 coarse
-窄差分与固定 Linux 匹配。用户态只要求连续采样非递减，不要求读数必然重复：两次 syscall
-之间可以被调度跨过一个 tick，重复读稳定性的确定性断言放在模块的无更新区间。
-
-原 RV 镜像的静态与动态 glibc `utime` 也已在 coarse 修复后独立复跑：两侧各
-30/30 成功，原 realtime/UTIME_NOW/fstat 跨秒探针继续成功。命令：
-
-```sh
-python3 -B tests/runtime-diagnostics.py --output build/coarse-original-diagnostics --compat-release 4.15.0
-```
-
-该命令仅为原旧 glibc 创建隔离 uname 变体，主线 uname 不变；不能拼成正式评分。
-变体内核 SHA-256 为 `9bc348b313eb4f1325a90e5b41fb6dd686f16bdb5783ce413ea961aec4c9fbb9`，驱动 ELF 为
-`1bf3667a580af999dcebfc9b0ef965a24e640d0e8c77431918ed5f05429a8bfb`；原镜像及原 ELF 哈希与上节固定输入相同。
-
-进程/随机/调度整合后再次运行同一脚本，输出目录为
-`build/process-final-runtime-diagnostics`。隔离 uname 变体内核
-`185f9cd378a10801974deb5d5de00d41dac1cfbe44b4bcc138acc43f1245e39c`
-来自最终生产快照 `be5ca22629c904a427241b0f92e9d561d0312952e787ab75870ec4beae0143b3`。
-固定 Linux 与 BoarOS 的原静态/动态 utime 仍各 30/30 成功，原 libc time/coarse
-及 UTIME_NOW/fstat 跨秒记录均完成；主线 uname 保持不变。
-
-路径资格与普通打开资格分别控制元数据操作。`O_PATH`的稳定path owner允许
-空字符串/AT_EMPTY_PATH操作；直接fchown/fchmod/futimens仍要求普通打开资格，
-不能因身份可查询就授予数据访问。固定Linux的`fs/open.c:build_open_how`
-先掩去open/openat的其他位，`build_open_flags`的严格校验只适用于已经构造的how；
-不能拿openat2的拒绝规则套用普通open。相关差分入口是`path_only.c`。
-
-截断的特权处理与chown不同。固定root对应`fs/attr.c:setattr_should_drop_suidgid`
-的CAP_FSETID边界，保留set-ID；`fs/open.c:do_truncate`仍检查
-`dentry_needs_remove_privs`，因此capability必须清理。属性清理须在大小变更
-的同一undo内，尤其保护共享外部EA块及同长度请求。路径入口无须临时用户fd。
+显式 utimensat 差分另保留请求值、NOW/OMIT、纳秒、范围端点、fd/dirfd/nofollow、坏指针与错误优先级。当前更新时间的同步、挂载策略和映射行为见[VFS 模块](../modules/vfs-ext4.md)。

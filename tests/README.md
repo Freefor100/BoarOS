@@ -1,21 +1,32 @@
 # 测试目录
 
-当前入口按执行环境组织，测试程序按用途组织。一个文件可能是多个用例共用的夹具、后端或运行器，并不等于一个测例。日常内核检查仍通过 `make test-*` 执行；具体分组见 `tests/ci/suites.json`。
+`make test-*` 按本次修改选择检查。目录按执行环境分开，用户程序按子系统组织；同一个夹具可供多个行为检查复用。
 
-| 目录 | 内容 |
+## 保留内容及用途
+
+| 路径 | 保留的实际用途 |
 |---|---|
-| `host/` | 宿主直接检查生产代码；C 夹具和相应 `.sh`／`.py` 入口放在一起 |
-| `riscv/`、`loongarch/` | 架构与平台的内核契约、启动检查和 QEMU 执行器 |
-| `common/` | 两架构共用的原生契约、启动代码及 ABI 头文件 |
-| `userland/` | 客机用户态、Linux 差分、libc／应用程序的构建与执行；`inventory/` 管理原程序清单 |
-| `workloads/` | 按子系统组织的用户态消费者；不保存每轮实验的版本副本 |
-| `diff-abi/` | 固定 Linux 参考、同 ELF 对照及 syscall 边界用例 |
-| `smp/` | 多核启动、真实用户执行和受控并发组合的执行器 |
-| `cost/` | 可复用性能程序、测量和解析工具；程序在 `cost/workloads/`，记账消费者在 `cost/accounting/` |
-| `ci/` | CI 分组、依赖准备及运行器检查 |
-| `tools/` | 栈／代码布局检查、输入校验和构建产物清理 |
+| `host/` | 直接链接生产实现，控制 OOM、设备错误、复制故障与并发交错；检查真实引用归还、回滚和唯一完成。用户程序无法稳定命中这些内部失败点 |
+| `host/allocator/`、`host/mm/`、`host/block_model/`、`host/sync/`、`host/random/` 等子目录 | 上述检查所需的架构替身、受控设备或配置头，供真实生产源编译；它们不是额外的一套功能实现 |
+| `riscv/` | 保留真实页表、缺页/COW、TLB 退休、MM/uaccess、块设备 DMA/取消及文件失败路径的客机检查。宿主替身不能执行这些架构边界 |
+| `loongarch/` | 保留 LA 页表、PCI/中断、异常与 FPU/SIMD、根盘及故障清理；同时提供固定工具和 Linux 参考的准备入口，不能用 RV 通过替代 LA 验收 |
+| `common/` | 两架构实际共用的等待、锁、启动汇编和 ABI 类型；避免各架构复制相同夹具。旧参数包装自测已删除 |
+| `diff-abi/` | 用同一 ELF 对照 Linux 的返回值、错误顺序和已发生的副作用；保留固定参考配置和实际 syscall 消费者 |
+| `userland/` | 真实 libc、线程、exec、信号、凭据、FD 和 MM 组合；覆盖生产调用链，防止模拟分派器掩盖行为差异 |
+| `userland/glibc/` | 固定 GNU 工具与运行库身份、动态装载和 TLS 消费者；验证原始 glibc，而非只验证无 libc 的 syscall 程序 |
+| `userland/inventory/` | 固定原程序构建输入、清单和执行器；检查未经替换的真实应用，保持用户程序与内核错误分类 |
+| `userland/tty/` | 真实终端交互、作业控制和阻塞取消，需要终端输入握手，不能由普通文件读写覆盖 |
+| `smp/` | secondary 启停、每核执行、运行权交接、远程 TLB 确认与受控组合；只有真实多核能暴露这些交错 |
+| `workloads/io/`、`workloads/network/` | 当前固定文件/TCP 工作量、向量/批量消息、复制和零拷贝消费者；内容核对、同步完成与吞吐比较复用相同程序 |
+| `workloads/credentials/`、`resource/`、`signal/`、`mremap/`、`fs/`、`xattr/` | 当前权限、进程/MM/挂载、信号恢复及文件属性接口的 Linux 可观察语义；保留直接调用与生命周期反例 |
+| `workloads/futex/`、`ipc/`、`locks/`、`pipe/`、`fifo/`、`epoll/`、`event/`、`smp/` | 原子操作、超时、中断、FD 复用、关闭与跨核通知；各自对象所有权不同，共用等待机制并不能替代对象自身的检查 |
+| `workloads/sqlite/`、`toolchain/`、`tty/` | SQLite 恢复、客机内编译和终端等实际消费者；它们覆盖多个 syscall 的真实组合，不是为单个入口打印成功 |
+| `workloads/bpf/` | 原 bpftool/libbpf/bpftrace 与同 ELF 原生 ABI 消费者；校验器、BTF、trace 和 mmap 必须同时与原工具兼容 |
+| `cost/` | 仅保留现用 I/O/TCP/accounting 执行器、它们的参数/完成条件自测，以及被实际导入的快照解析、fixture、插件和共用头。旧独立校准器、重复报告验证与无人调用负载已删除 |
+| `tools/` | 当前栈预算、ELF/CRC 布局、固定输入和构建清理；检查仍然存在的构建约束，不维护早期目录布局录制器 |
+| 根目录 Python 模块 | 实际执行器共用的架构配置、绑核、测量互斥、种子、网络与 NBD 控制；减少每个 runner 重写启动和资源清理 |
 
-根目录的七个 Python 模块供不同执行器共用：架构配置、宿主绑核、测量互斥、随机种子、运行环境、网络输入与 NBD 控制。
+具体行为以模块中的检查入口和测试源码为准；一个 shell/Python 文件可能负责编译、启动和结果检查，并不等于多个重复测例。
 
 ## 使用
 
@@ -24,15 +35,13 @@ make test-mm-pin-host
 make test-page-cache-concurrency-host
 make test-user-smp-riscv
 python3 -B tests/userland/run.py --help
-python3 -B tests/cost/cost-riscv.py --help
+python3 -B tests/cost/io-budget-experiment.py --help
 ```
 
-RISC-V 启动与 trap 返回通过 `test-boot-riscv`、`test-timer-riscv`、`test-user-riscv` 和 `test-user-fatal-riscv` 检查生产调用路径。存储的需求读取、稳定版本和预测行为主要由 `test-page-cache-concurrency-host`、`test-file-io-concurrency-host`、`test-readahead-host` 检查，`test-io-sleep-riscv` 补充真实设备等待与取消；应用成本继续使用 `workloads/io/` 和 `cost/` 的共同消费者。
+功能或实现变化后只运行对应检查。一次性诊断、单轮组合程序与中间报告放在忽略的 `build/`，不加入本目录。当前机制说明见 `docs/modules/`，仍在使用的测量方法见 `docs/learning/`。
 
-先选当前问题对应的入口。新增用例优先加入现有消费者；单轮编排、临时探针和报告生成放在 `build/`。运行盘、日志、ELF、缓存也放在 `build/`，不放入本目录。
+## 构建产物
 
-内核机制见 `docs/modules/`，性能记录由兼容分支的既有报告维护。历史实验按对应 Git 提交复现。`make prune-build` 默认删除历史运行盘、探针 ELF、旧核数／诊断配置及重复编译树；仅保留当前 UP／八核对象缓存、已安装工具和 SDK、可直接启动的参考内核。活动 worktree 不参与删除，临时保留指定输出可使用 `tests/tools/prune-build.py --keep build/<目录>`。
+`make prune-build` 默认删除内核对象、测试 ELF、参考内核、运行盘、日志和实验目录。自动保留的只有仍在使用的已安装工具/SDK、LA RTC 模拟器可执行文件与身份记录，以及尚未提交源码的本地归档；活动 Git worktree 的源码另行保护。工作区内的生成盘和构建目录仍应单独清理，不能因 worktree 被保护就把产物永久保留。
 
-## BPF 聚焦验证
-
-`make test-bpf-host` 运行共同 VM/verifier、map/ringbuf、BTF/伪文件系统、TEST_RUN、trace、共享 mmap 和真实 lwIP 过滤检查。`tests/workloads/bpf/abi.py` 复用现有客户机执行器，在固定 Linux 与 BoarOS 运行同一 ELF；`baseline.py` 运行原版 bpftool/libbpf/bpftrace。输入、构建缓存和双架构命令见 [BPF 模块](../docs/modules/kernel-bpf.md#构建与检查)。
+清理前可用 `python3 -B tests/tools/prune-build.py` 查看列表；仅本轮尚在使用的输出才用 `--keep build/<目录>` 明确保留。固定输入由 `references/sources.tsv` 与准备入口重建，旧实验通过 Git 历史查阅。

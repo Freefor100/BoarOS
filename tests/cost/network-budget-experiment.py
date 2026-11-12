@@ -10,7 +10,7 @@ Examples (run only after coordinating exclusive access to the measurement host):
   python3 -B tests/cost/network-budget-experiment.py smoke --variant current=kernel-rv \
       --cases tap:nonblocking:mixed:5:tx --tap-delay-ms 0
 
-The run command includes the original fixed baseline unless --observe is used.
+References are selected explicitly with --baseline or --linux-kernel.
 Each case is a fresh boot and disk copy; TAP also gets a fresh network namespace.
 A partial case/profile selection is reported exactly, never as the full matrix.
 Mixed cases add one independent RR control connection; near reduces bulk count
@@ -44,9 +44,6 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'tests'))
 import budget_identity as contracts
-BASELINE = ROOT / 'build/data-path-baselines/5687377/kernel-rv'
-BASELINE_SHA = 'b962c890989d268282b55d49a4fa9b51afbaf7008dab2fc47e717388a6fea2f4'
-BASELINE_COMMIT = '5687377c58dc96adfa1f72f1636a319bbd25b419'
 OUT = ROOT / 'build/network-budget'
 PORT = 18090
 RTT_SAMPLES = 16
@@ -494,10 +491,7 @@ def run_one(specfile):
                 if not cost: raise RuntimeError('missing cost counters')
                 sys.path.insert(0,str(ROOT/'tests'))
                 from cost import cost_report
-                for schema in cost_report.supported_schemas():
-                    try: row['cost'] = cost_report.parse(cost.group(1),1,schema); break
-                    except ValueError: pass
-                else: raise RuntimeError('invalid cost snapshot')
+                row['cost'] = cost_report.parse(cost.group(1), 1)
                 after = row['protocol_snapshots']['after']
                 row['memory_peaks'] = {key: after.get(key) for key in (
                     'heap_max', 'tcp_segment_peak', 'pbuf_peak', 'pbuf_pool_peak', 'tcp_active_peak', 'tcp_listen_peak')}
@@ -538,7 +532,7 @@ def run_one(specfile):
 def summarize(work):
     identity = json.loads((work / 'identity.json').read_text())
     contracts.validate_variants(identity['variants'], 'tcp', profile, definitions, identity['observe'],
-        identity.get('smoke', False), BASELINE_SHA, BASELINE_COMMIT, identity.get('linux_identity'))
+        identity.get('smoke', False), identity.get('baseline_sha256'), identity.get('baseline_commit'), identity.get('linux_identity'))
     rows = [json.loads(path.read_text()) for path in sorted(work.glob('runs/*/result.json'))]
     groups, fixtures, repetitions = {}, {}, set()
     cases = {case['name']: case for case in identity['cases']}
@@ -599,10 +593,12 @@ def run_locked(args):
         raise ValueError('use one explicit diagnostic boot per case; release distributions are separate')
     if args.smoke and args.repeat != 1:
         raise ValueError('smoke is exactly one functional boot per case; use run for performance')
-    variants = {} if args.observe or args.smoke else {'baseline': args.baseline.resolve()}
-    if not args.observe and not args.smoke and digest(args.baseline) != BASELINE_SHA:
-        raise ValueError('original baseline SHA-256 mismatch')
-    metadata = {'baseline': dict(management='fixed-baseline', kernel_sha256=BASELINE_SHA, source_commit=BASELINE_COMMIT)} if variants else {}
+    baseline = getattr(args, 'baseline', None)
+    if baseline and args.observe:
+        raise ValueError('explicit reference baseline is unavailable in diagnostic mode; use a managed variant')
+    baseline_sha, baseline_commit = (digest(baseline), getattr(args, 'baseline_commit', None)) if baseline else (None, None)
+    variants = {'baseline': baseline.resolve()} if baseline else {}
+    metadata = {'baseline': dict(management='fixed-baseline', kernel_sha256=baseline_sha, source_commit=baseline_commit)} if baseline else {}
     for item in args.variant:
         name, path = item.split('=', 1)
         if not re.fullmatch(r'[A-Za-z0-9_-]+', name) or name in variants or name in ('linux', 'baseline'):
@@ -623,7 +619,7 @@ def run_locked(args):
         metadata[name] = contracts.load_candidate(name, path, 'tcp', profile, definitions,
             args.observe, args.smoke, cross_prefix() + 'objcopy', symbols)
     contracts.validate_variants(metadata, 'tcp', profile, definitions, args.observe, args.smoke,
-                                BASELINE_SHA, BASELINE_COMMIT, linux_identity)
+                                baseline_sha, baseline_commit, linux_identity)
     cases = [parse_case(value, args.bytes, args.rounds) for value in case_values(args.cases)]
     if len({c['name'] for c in cases}) != len(cases):
         raise ValueError('duplicate case')
@@ -648,7 +644,7 @@ def run_locked(args):
                     qemu_version=output([qemu, '--version']), qemu_sha256=digest(qemu), compiler=output([str(compiler), '--version']),
                     variants={name: metadata[name] | {'kernel_sha256': digest(path), 'source_path': str(variants[name]),
                                      'static_storage_arrays': storage_symbols(path) if name != 'linux' else {}} for name, path in frozen.items()},
-                    baseline_commit=BASELINE_COMMIT, linux_identity=linux_identity, cases=cases, repeat=args.repeat, observe=args.observe,
+                    baseline_commit=baseline_commit, baseline_sha256=baseline_sha, linux_identity=linux_identity, cases=cases, repeat=args.repeat, observe=args.observe,
                     smoke=args.smoke, evidence_kind='functional-smoke-not-performance' if args.smoke else 'diagnostic' if args.observe else 'performance',
                     tap_delay_ms=args.tap_delay_ms, delay_direction='host-to-guest TAP egress only; loopback unchanged',
                     ram=args.ram, transport=args.transport, cache='fresh boot, fresh filesystem copy; no warmed prior network state',
@@ -695,7 +691,8 @@ def main():
         p = sub.add_parser(command, help='one functional boot per case; timings are not performance evidence' if smoke else 'serialized independent-boot measurements; coordinate with other workloads first')
         p.set_defaults(smoke=smoke)
         p.add_argument('--variant', action='append', required=True, help='label=kernel path; repeat for multiple variants')
-        p.add_argument('--baseline', type=Path, default=BASELINE)
+        p.add_argument('--baseline', type=Path, help='explicit baseline for this run; never inserted automatically')
+        p.add_argument('--baseline-commit', help='source commit for the explicitly selected baseline, when known')
         p.add_argument('--linux-kernel', type=Path, help='optional fixed Linux Image; same ELF, disk, RAM and devices')
         p.add_argument('--cases', default='loopback:blocking:bulk:1:rx,tap:nonblocking:mixed:1:tx', help='comma separated path:mode:kind:connections:direction, or all; mixed adds one control connection, near keeps four active PCB slots free')
         p.add_argument('--bytes', type=int, default=262144 if smoke else 4 * 1024 * 1024)

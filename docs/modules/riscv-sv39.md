@@ -1,6 +1,6 @@
 # RISC-V Sv39 分页模块
 
-本文描述当前 Sv39 建表与启用路径的稳定接口。分页原理、模式选择、叶子大小和规模分析见 [内存管理学习总结](../learning/memory-management.md)，启动顺序见 [RISC-V 启动模块](riscv-boot.md)。
+本文描述当前 Sv39 建表与启用路径的稳定接口。启动顺序见 [RISC-V 启动模块](riscv-boot.md)。
 
 ## 入口与职责
 
@@ -13,7 +13,7 @@
 | `arch/riscv/linker.ld`、`include/arch/riscv/memory_layout.h` | 固定高半区 VMA 并导出页对齐的 text、rodata、data 边界 |
 | `kernel/main.c` | 根据 DTB RAM、ELF 边界和 QEMU UART 建立启动地址空间与高半区别名 |
 | `tests/riscv/sv39_cases.c` | 验证 PTE、页表数量、用户空间生命周期、边界和失败语义 |
-| `tests/riscv/sv39_fault_main.c`、`tests/riscv/user.sh` | 验证只读页写故障、真实用户页故障和用户根切换 |
+| `tests/riscv/sv39_fault_main.c` | 验证只读页写故障 |
 
 RISC-V 构建固定 4 KiB 基页。页表对象首次使用前必须清零。初始化从物理页分配器取得并清零一个根页；该分配器的所有可用区间都必须位于 Sv39 可编码的 56 位物理地址范围内，否则初始化在取页前返回 `RISCV_SV39_STATUS_INVALID`。
 
@@ -75,7 +75,7 @@ unmap 清叶并摘除空表，再完成全局失效；两核配置等待在线�
 
 `riscv_sv39_user_map_owned_page()` 只接受 `[0x1000, 2^38)` 内按 4 KiB 对齐的低地址、已分配物理页和合法 R/W/X 权限。成功建立带 U/A（可写时还带 D）的 Level 0 叶子并接管物理页；失败仍由调用者持有该页。`riscv_sv39_user_map_zeroed_page()` 则在地址空间内部完成叶表路径准备、叶子分配、清零、映射和所有权登记，调用者不会接触处于“已经分配但尚无所有者”状态的叶子。中间表分配采用局部事务：若创建第二张中间表失败，会撤销本次新建且仍为空的上级表，不破坏更早的映射。
 
-新匿名页在构造方独占期间用整数块完成全页清零，之后才发布有效PTE；不访问本页之外，也不改变中间表或解析失败的回收顺序。成本边界见[匹配时间](../learning/cost-baseline.md#共享调度域的匹配时间)。
+新匿名页在构造方独占期间用整数块完成全页清零，之后才发布有效PTE；不访问本页之外，也不改变中间表或解析失败的回收顺序。
 
 `riscv_sv39_user_map_cow_page()` 接管调用者的一份 order-0 物理页引用，建立去掉 W 且以 RSW bit 8 标记的 present COW 叶子。`riscv_sv39_user_resolve_cow()` 只接受这种软件标记的页：引用数为 1 时原地恢复最终权限，否则分配并复制新页、替换当前 PTE 后释放旧引用。真正只读而未带 COW 标记的叶子不会被写 fault 放宽。空间统计分别记录当前 COW 页、复制次数和原地恢复次数，供正确性及后续成本测量使用。
 
@@ -112,13 +112,11 @@ RISC-V ELF 映像构造器是当前用户映射接口的真实调用方。它先
 
 ## 验证
 
-`test-icache-riscv` 检查 Make 传入的实际 BUILD_DIR 对象及入口的直接调用可达链，不要求固定私有函数或 fence 位于公开函数本体。它是指令存在门禁，不能替代真实可执行映射/缺页/COW/mprotect 的行为验收。`test-instruction-sync-host` 拒绝无关 fence、非调用引用和仅含环路的假通过。
+`tests/workloads/resource/icache.c` 通过真实用户程序检查指令缓存同步；`test-instruction-sync-host` 检查反汇编调用链解析器对无关 fence、非调用引用和环路的拒绝。
 
 ```sh
 make test-sv39-riscv
 make test-sv39-fault-riscv
-make test-user-riscv
-make test-user-fatal-riscv
 make test-demand-page-riscv
 make test-brk-riscv
 make test-mmap-riscv

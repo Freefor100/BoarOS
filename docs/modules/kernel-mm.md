@@ -1,6 +1,6 @@
 # 内核 MM 模块
 
-本文描述任务地址空间的通用所有权接口、共享 MM 策略、RISC-V Sv39 与 LA64 后端。页表格式、映射规则和硬件切换见 [RISC-V Sv39 分页模块](riscv-sv39.md)，地址空间与任务身份分离的背景见[内存管理学习总结](../learning/memory-management.md)。
+本文描述任务地址空间的通用所有权接口、共享 MM 策略、RISC-V Sv39 与 LA64 后端。页表格式、映射规则和硬件切换见 [RISC-V Sv39 分页模块](riscv-sv39.md)。
 
 普通 MM、受控任务绑定的 MM 和 `USER_SMP` 使用分层并发协调协议：
 - `record->operations`（rank 25 读写锁）：非固定私有匿名映射创建、纯匿名撤销、锁页属性修改和匿名/COW 缺页可取得共享读资格；固定地址映射、fork、销毁、mremap、mprotect 和文件/ELF/SysV/BPF 对象映射使用独占写资格。撤销前在操作资格内判断映射类型；文件来源、resident 与 alias 仍由写者维护。默认 UP 使用独占资格。
@@ -22,7 +22,6 @@
 mincore 每页输出最低位的驻留状态，查询本身不装入页面。MM raw 内查询已有页面归属，包含 PROT_NONE 页面；没有 PTE 时查询内存对象或已完成装入的文件缓存。一次最多处理 16 页，任务 I/O 工作区保存结果，用户输出在 MM 保护外完成。文件来源借用覆盖锁外权限和缓存查询，恢复 MM 资格后核对 VMA 代次；截断、解除映射和最终关闭沿原来源退休协议等待借用结束。文件所有者、CAP_FOWNER 或有当前写权限的调用者可见真实状态，其余调用者按 Linux 获得全 1；匿名映射直接返回真实状态。VMA 空洞返回 ENOMEM，之前完整输出的前缀保留。
 
 直接检查使用 `tests/workloads/resource/memlock.c` 和 `tests/host/mm-resource-limits.sh`；前者与固定 Linux 运行相同 ELF，后者检查映射接纳、计数、部分修改和物理分配失败。通用 MAP_GROWSDOWN 仍在后续范围。
-
 
 ## madvise 与共享段锁定
 
@@ -165,7 +164,6 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm);
 
 `riscv_kernel_mm_satp()` 是 RISC-V scheduler 创建任务时使用的架构入口。通用层不暴露 Sv39 对象，也没有运行期 vtable；RISC-V 构建通过 `include/arch/mmu.h` 直接绑定 Sv39 操作；通用策略位于 `mm/mm.c`。LoongArch 构建以后为同一后端契约提供 16 KiB/三级页表实现。这样任务和 syscall 层依赖 MM 语义，而不依赖页表格式，调用热路径也没有间接分派。
 
-
 `kernel_mm_pin_user_page()`只对resident且已许可的基页成功，在rank15短读资格内
 完成PTE和权限检查并取得实际物理引用；`NOT_MAPPED/ACCESS`要求调用者fault后重查。输出token零初始化，
 成功才发布；同一I/O owner在复制完成后调用`kernel_mm_unpin_user_page()`。
@@ -301,13 +299,12 @@ make test-vma-riscv
 make test-brk-riscv
 make test-mmap-riscv
 make test-demand-page-riscv
-make test-user-riscv
 make test-diff-abi-riscv
 make test-sqlite-wal-riscv
 make test-riscv
 ```
 
-MM 聚焦测试覆盖创建失败原子性、共享引用、移动、COW fork 的父子共享/写隔离/末引用原地恢复、`PROT_NONE` COW 属性，以及正常页表回收和物理页基线；VMA 聚焦测试另覆盖共享匿名页的 fork 前驻留、双方首次 fault 顺序、权限拆分、部分撤映射、替换、退出和 OOM 回滚。同一 MM target 还运行独立 fatal kernel，注入一次页表 backing 无法解析并确认只产生一个 fatal 结果、不会返回 retry/success 路径。文件测试覆盖 cache hit/miss、write-first、尾页补零、整页越 EOF、fd 关闭后 fault、fork 后 OFD 来源和最终回收。syscall 聚焦测试验证校验错误先于不可读 OFD 的 `EACCES`，两类拒绝都释放临时 pin 且不进入 MM 提交；`test-userland-riscv` 用真实 musl mmap 覆盖匿名共享的双向可见、fd 忽略、fixed 冲突，以及原有私有 mmap。`test-mmap-riscv` 与真实 ext4 `/init` 从 U-mode 完成匿名/文件私有 mmap、COW、SIGBUS、mprotect/munmap 生命周期；`test-diff-abi-riscv` 与 `test-sqlite-wal-riscv` 另验证文件共享 mmap、`msync` 和独立进程 WAL。
+MM 聚焦测试覆盖创建失败原子性、共享引用、移动、COW fork 的父子共享/写隔离/末引用原地恢复、`PROT_NONE` COW 属性，以及正常页表回收和物理页基线；VMA 聚焦测试另覆盖共享匿名页的 fork 前驻留、双方首次 fault 顺序、权限拆分、部分撤映射、替换、退出和 OOM 回滚。同一 MM target 还运行独立 fatal kernel，注入一次页表 backing 无法解析并确认只产生一个 fatal 结果、不会返回 retry/success 路径。文件测试覆盖 cache hit/miss、write-first、尾页补零、整页越 EOF、fd 关闭后 fault、fork 后 OFD 来源和最终回收。`test-userland-riscv` 用真实 musl mmap 覆盖匿名共享的双向可见、fd 忽略、fixed 冲突，以及原有私有 mmap。`test-mmap-riscv` 与真实 ext4 `/init` 从 U-mode 完成匿名/文件私有 mmap、COW、SIGBUS、mprotect/munmap 生命周期；`test-diff-abi-riscv` 与 `test-sqlite-wal-riscv` 另验证文件共享 mmap、`msync` 和独立进程 WAL。
 
 已接入构建期绑定的RV64 Sv39/4 KiB与LA64 16 KiB/三级页表后端；共用策略处理私有/共享匿名、ELF、SysV 及 tmpfs/ext4 映射；SysV attachment 和未并行化后端的实际业务仍在 CPU0 边界处理。普通 fork 使用独立 MM，私有页 COW、共享匿名与共享文件页保持共享；线程 clone/vfork 共享同一 MM record。匿名映射和 ELF image 使用每 MM 的 ASLR mmap ceiling（无任何随机材料时确定性降级；仅 DTB 混种不提供可信安全保证），但没有 commit accounting。栈 VMA 随实际向下增长更新，VmSize 不计尚未扩展的最大栈窗口。可读普通文件支持 MAP_PRIVATE/MAP_SHARED 与 `msync`。文件表和信号表不属于 MM。private futex 使用 MM 创建时分配的单调身份号与用户地址，避免 MM record 页回收后重用身份；共享映射的 futex 身份与引用由 MM 一并解析，具体规则见[调度模块](kernel-scheduler.md#等待与-futex)。
 
@@ -335,7 +332,7 @@ private 页内容。范围摘除复用下面的有界遍历，剩余 resident �
 物理分配失败；`test-userland-riscv` 与 `test-diff-abi-riscv` 验证真实驻留/COW、
 PROT_NONE、非当前 MM、尾页、关闭 fd、unlink、O_TRUNC 与重新增长。
 
-`riscv_kernel_mm_get_statistics` 提供诊断快照。驻留探测、准备页、pin 获取/等待、退休批次和 fault 重试等纯统计只在 `COST_DIAGNOSTICS=1` 更新；pin 数、页引用、活动 CPU 与 TLB 代次始终参与正确性。测试用链接包装观察实际 pin、锁与解析调用。驻留匿名页的 1、64、4096 字节双向复制均不调用受检查地址解析；MM 读资格覆盖权限许可与物理引用取得，归还物理引用在 MM 资格外完成。`make test-scale-riscv` 在 16/64 MiB 文件全部读驻留后按置换顺序首次写入，验证探测增长不超过 6 倍，并注入前 128 页准备阶段的元数据分配失败。首次写开放权限、写回 rearm、mprotect 和未发布 fork child 使用纯单页 PTE 修改，不在后端执行 SFENCE 或指令同步。已发布 MM 在 raw 内登记翻译/指令代次，raw 外按实际范围统一同步；未发布 child 由首次激活完成同步。单页降权/恢复合计只访问两个相关 resident，不随其他驻留页增长。VMA 权限编辑后以一次读写游标压缩相邻可合并项，被合并的 attachment 引用各归还一次，不再逐次左移后缀。宿主用巨大稀疏范围检查遍历跳过空子树并遵守结束地址。引用与脏代次协议保持不变。
+`riscv_kernel_mm_get_statistics` 提供诊断快照。驻留探测、准备页、pin 获取/等待、退休批次和 fault 重试等纯统计只在 `COST_DIAGNOSTICS=1` 更新；pin 数、页引用、活动 CPU 与 TLB 代次始终参与正确性。测试用链接包装观察实际 pin、锁与解析调用。驻留匿名页的 1、64、4096 字节双向复制均不调用受检查地址解析；MM 读资格覆盖权限许可与物理引用取得，归还物理引用在 MM 资格外完成。首次写开放权限、写回 rearm、mprotect 和未发布 fork child 使用纯单页 PTE 修改，不在后端执行 SFENCE 或指令同步。已发布 MM 在 raw 内登记翻译/指令代次，raw 外按实际范围统一同步；未发布 child 由首次激活完成同步。单页降权/恢复合计只访问两个相关 resident，不随其他驻留页增长。VMA 权限编辑后以一次读写游标压缩相邻可合并项，被合并的 attachment 引用各归还一次，不再逐次左移后缀。宿主用巨大稀疏范围检查遍历跳过空子树并遵守结束地址。引用与脏代次协议保持不变。
 
 调度器在任务发布及新映像提交时调用 `kernel_mm_add_user`，在退出或旧映像退休前调用 `kernel_mm_remove_user`。活跃使用者与 MM 资源引用分开：清理任务暂存的旧 MM 不影响 CHILD_CLEARTID 条件；fork 创建零使用者的新 MM，acquire/move 不隐式注册任务。计数下溢、溢出属于内核 owner 错误。
 
@@ -350,9 +347,6 @@ PROT_NONE、非当前 MM、尾页、关闭 fd、unlink、O_TRUNC 与重新增长
 默认关闭的 C3 成本观测记录 VMA 查询比较、coverage/权限检查、prepare/commit 时长、
 数组移动/编辑、全集合合并/字节重计、file_residents 遍历、实际 PTE 访问和地址/全局 TLB 失效。
 计数入口在实际循环或修改点，不改变 prepare 失败原子性；单页 PTE 路径与原 MM 统计独立核对。
-`make test-cost-riscv COST_CASE=mprotect` 使用固定一页目标和16/64/256无关VMA、
-0/16/64MiB文件驻留页，三个启动副本；权限拒绝和洞窗口要求PTE访问为0。
-OOM/split/fork 由 vma/scale/ABI 组合回归继续保护。
 
 
 ## 匿名 MM 的并发与回收
@@ -386,8 +380,7 @@ make test-mm-smp-riscv
 make test-mm-smp-userland-riscv INIT_CONFIG=config/init.json
 ```
 
-host 链接真实 MM/VMA/Sv39/allocator/uaccess/等待实现，只替换硬件及调度后端；2/4 actor 模型与两逻辑 CPU 活动集合模型分列。真实 MTTCG 双RAM验证见[两核模块](riscv-smp.md)。固定资料、准备/提交理由及资源证据见[内存学习说明](../learning/memory-management.md#匿名并发的许可与失效完成)。
-
+host 链接真实 MM/VMA/Sv39/allocator/uaccess/等待实现，只替换硬件及调度后端；2/4 actor 模型与两逻辑 CPU 活动集合模型分列。真实 MTTCG 双RAM验证见[两核模块](riscv-smp.md)。
 
 ## BPF 对象共享映射
 

@@ -1,10 +1,10 @@
 # DTB 与启动内存布局模块
 
-本文描述启动期 DTB 快照的稳定接口：读取器保存内存、timebase、保留区和 VirtIO MMIO transport 事实，启动布局构建器再排除固件、内核镜像和 DTB 自身占用。相关内存原理见[内存管理学习总结](../learning/memory-management.md)，设备消费者见[RISC-V VirtIO MMIO 块设备模块](riscv-virtio-block.md)。
+本文描述启动期 DTB 快照的稳定接口：读取器保存内存、timebase、保留区和 VirtIO MMIO transport 事实，启动布局构建器再排除固件、内核镜像和 DTB 自身占用。设备消费者见[RISC-V VirtIO MMIO 块设备模块](riscv-virtio-block.md)。
 
 ## 范围与入口
 
-`dtb_read_cpu_info()`提供最多两个CPU的独立身份快照，boot hart为逻辑0；
+`dtb_read_cpu_info()`提供最多八个CPU的独立身份快照，boot hart为逻辑0；
 非零/稀疏ID、disabled、重复/损坏和失败不修改输出由`make test-smp-host`保护，
 完整启动与容量边界见[RV两核模块](riscv-smp.md)。
 
@@ -13,9 +13,6 @@
 | `include/kernel/dtb.h`、`kernel/dtb.c` | 校验 DTB，读取第一段 RAM、DTB 大小、RISC-V timebase、`/chosen/rng-seed`、静态保留区和 VirtIO MMIO 范围 |
 | `include/kernel/boot_memory.h`、`kernel/boot_memory.c` | 规范化保留区并生成字节粒度的可用区间 |
 | `kernel/main.c` | 加入内核与 DTB 占用，输出启动布局诊断 |
-| `tests/riscv/dtb_main.c` | 用合成 DTB 验证格式、状态和输出契约 |
-| `tests/riscv/boot_memory_cases.c` | 验证区间裁剪、排序、合并与相减 |
-| `tests/riscv/dtb.sh`、`tests/riscv/boot.sh` | 运行聚焦测试和真实 QEMU 启动测试 |
 
 `dtb_read_boot_info` 成功时写出第一段非空 RAM、header 的 `total_size`、根节点直属 `/cpus/timebase-frequency`、`/chosen/rng-seed` 的前 32 字节（若存在且长度至少 32），以及 memory reservation block 和静态 `/reserved-memory/*/reg` 中的非空区间。两种保留区来源合计最多 16 项；超限返回 `DTB_STATUS_UNSUPPORTED`。缺少 `rng-seed` 不影响 DTB 成功，调用者据 `rng_seed_size == 0` 选择安全降级；长度不足返回 `DTB_STATUS_UNSUPPORTED`，重复属性返回 `DTB_STATUS_INVALID`。任何失败都不修改输出。
 
@@ -35,7 +32,7 @@
 - `/reserved-memory` 必须使用与根节点相同的 cell 数并带空 `ranges`；静态子节点的每个 `reg` tuple 都会保存。动态 `size` 形式和相关节点的 `status` 语义尚未实现，读取器明确返回 unsupported。
 - 布局构建器检查所有 `base + size` 运算，要求内核区间完整位于所选 RAM 中；DTB 或设备树保留区位于 RAM 外的部分会被裁掉。
 - 保留区排序后合并重叠或相邻项，再从 RAM 中相减。结果保持字节粒度，页边界对齐由后续物理页分配器负责。
-- 当前只选择第一段非空 RAM；多 RAM bank 尚未进入当前目标，不会静默拼接或伪装成已支持。
+- 快照保存全部非空 RAM bank，并在兼容字段中保留第一段；RV 启动布局使用首段，LA 平台处理全部范围。
 - VirtIO 发现只记录 transport 的物理 `reg`，不读取 MMIO device ID、协商 feature 或决定块设备；这些副作用属于设备驱动。
 
 ## 设计依据
@@ -50,22 +47,21 @@
 
 ```sh
 python3 -B tests/host/dtb_uart_test.py
-make test-dtb-riscv
 make test-riscv
 ```
 
-聚焦测试覆盖一或两个 cell、多 tuple、两类静态保留区、timebase 正常/缺失/错误位置/错误长度/零值/重复、VirtIO compatible list、status、嵌套 ranges、排序/重叠/容量/深度，以及布局的裁剪、合并、耗尽和溢出。完整启动测试在 QEMU `virt` 的 512 MiB、1 GiB 与 16 GiB 配置下验证真实 OpenSBI DTB、10 MHz timebase、原始 RAM 大小和非空启动布局。
+UART 宿主测试直接编译 DTB 解析器，检查设备范围、时钟、布局、路由和失败时的输出保留；CPU 发现由 `tests/host/smp_dtb_test.py` 检查。`make test-block-riscv test-io-sleep-riscv` 使用真实 QEMU DTB 中的设备与中断信息。
 
-本模块仍不处理多 RAM bank、动态 reserved-memory、NUMA、热插拔或 CMA；页边界收缩和单页分配由[物理页分配模块](physical-pages.md)承担。
+本模块仍不处理动态 reserved-memory、NUMA、热插拔或 CMA；页边界收缩和单页分配由[物理页分配模块](physical-pages.md)承担。
 
-`dtb_read_irq_info(dtb, boot_hart, ...)` 从固定 DTB 图解析 PLIC reg/ranges、CPU interrupt-controller phandle 与 `interrupts-extended` 的 supervisor context，并关联 VirtIO `interrupt-parent` 和 source。PLIC MMIO 进入最终高半区映射，交由 `arch/riscv/plic.c` claim/dispatch/complete；找不到启动 hart 的 S context 或路由越界时明确失败，不使用固定 IRQ/context 常数。见 `make test-dtb-riscv test-block-riscv test-io-sleep-riscv`。
+`dtb_read_irq_info(dtb, boot_hart, ...)` 从固定 DTB 图解析 PLIC reg/ranges、CPU interrupt-controller phandle 与 `interrupts-extended` 的 supervisor context，并关联 VirtIO `interrupt-parent` 和 source。PLIC MMIO 进入最终高半区映射，交由 `arch/riscv/plic.c` claim/dispatch/complete；找不到启动 hart 的 S context 或路由越界时明确失败，不使用固定 IRQ/context 常数。实际设备路径见 `make test-block-riscv test-io-sleep-riscv`。
 
 IRQ discovery additionally selects one enabled `ns16550a`/`ns16550` UART, translates its `reg` through parent buses and requires a valid PLIC parent/source plus nonzero `clock-frequency`. `reg-shift` defaults to zero and `reg-io-width` to one; supported layouts use shift 0–4 and width 1 or aligned width 4, with all eight registers inside the range. Unsupported endian/layout, missing clock/route and multiple UARTs are rejected; failure leaves the caller snapshot unchanged. This discovery has no hardware side effects. The UART fixture exercises the real parser without QEMU. Fixed board description: `references/qemu/hw/riscv/virt.c`, v11.1.0 commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648` (`create_fdt_uart`).
 
-## 不连续 RAM（2026-10-06）
+## 不连续 RAM
 
 `dtb_boot_info.memory` 保留首个非空 bank；新增 `memory_count` 和
 `memories[DTB_MAX_MEMORY_RANGES]` 保存所有非空 memory reg，最多16段。
 地址加长度溢出拒绝为INVALID，超过容量为UNSUPPORTED；不把平台MMIO洞当RAM。
 原RV入口继续使用首段，LA平台按物理地址排序并扣除boot信息、DTB、内核及
-DTB保留区后交给分配器。`make test-dtb-riscv` 验证两个不连续bank和原解析契约。
+DTB保留区后交给分配器。

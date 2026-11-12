@@ -2,7 +2,7 @@
 
 固定参考为 `references/linux/` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`：`drivers/char/random.c` 的 `crng_fast_key_erasure`、`getrandom`、`random_poll` 和 `lib/crypto/blake2s.c`。后者 SPDX 为 GPL-2.0 OR MIT，`kernel/blake2s.c` 保留来源与版权并在项目 GPL-2.0 路线下使用；不是隐藏依赖于 references 的构建输入。
 
-旧实现先向调用者复制完整 ChaCha20 块，再把该块前 32 字节作为下一次 key；因此知道一次输出即可预测后续输出。新实现每次请求在单 hart 短关中断区用全局 key 生成首块，仅将前 32 字节保存为新 key；调用者收到后 32 字节，再由独立局部旧 key / counter 生成余量。大块生成和用户复制都在临界区外，局部 key、块和密码原语工作数组显式擦除。 `getrandom` 完成就绪、范围和 MM 检查后，在数据生成与用户复制阶段显式开放 IRQ；每 256 字节检查已交付前缀后的信号，错误仍返回真实前缀，结束恢复入口 IRQ 状态。随机池自身保留短临界区，不在 syscall 入口统一开放中断。此为单 hart IRQ 排他契约，不是 SMP 同步。
+为避免输出泄漏下一次 key，每次请求在单 hart 短关中断区用全局 key 生成首块，仅将前 32 字节保存为新 key；调用者收到后 32 字节，再由独立局部旧 key / counter 生成余量。大块生成和用户复制都在临界区外，局部 key、块和密码原语工作数组显式擦除。 `getrandom` 完成就绪、范围和 MM 检查后，在数据生成与用户复制阶段显式开放 IRQ；每 256 字节检查已交付前缀后的信号，错误仍返回真实前缀，结束恢复入口 IRQ 状态。随机池自身保留短临界区，不在 syscall 入口统一开放中断。此为单 hart IRQ 排他契约，不是 SMP 同步。
 
 BLAKE2s 每次混入最多 32 字节输入与旧 32 字节 key，故混种临界区只执行一次有界压缩；重新取全局 key 避免 IRQ 并发更新被过期快照覆盖。`kernel_random_mix(data,size)` 只混入材料；`kernel_random_credit_bits(bits)` 独立按 bit 累计，饱和到 256 bit 后使 ready 单向置位并唤醒等待者。VirtIO RNG 仅对成功完成的响应按每字节 8 bit 计数。`RNDADDENTROPY` 使用 Linux 两个 native int（熵 bit 数与 payload 字节数）及后续 payload 布局；先检查调用者实际 CAP_SYS_ADMIN，缺少时返回 EPERM，负数拒绝，分块复制失败不计任何熵，完整混入后才增加声明的 bit 数。用户普通写入不计熵。DTB seed、时钟、测试 seed 与用户写入都是不计熵材料。可信设备失败不清除已获得的 ready，也不能把未完成或错误 DMA 缓冲计作可信字节。
 
@@ -10,34 +10,6 @@ BLAKE2s 每次混入最多 32 字节输入与旧 32 字节 key，故混种临界
 
 聚焦验证：`python3 tests/host/random_vectors.py` 将 BLAKE2s 与 Python hashlib 独立实现比较，覆盖空、63/64/65、127/128/129 和多块输入；同一命令还通过真实设备操作表验证未就绪 O_NONBLOCK、阻塞信号返回、poll 与 ioctl 熵计数及错误，并测试 fast key erasure、不可信混种不置 ready、31+1 字节可信初始化、ready 单向保持、无材料输出和等待错误。`tests/diff-abi/random.c` 是真实 U-mode 的 flags、长度、fault、节点读写、pread/lseek 与 poll 对照用例；已整合 ABI 清单双侧执行，host 与真实用户态证据分开。
 
-2026-09-29 窄差分的 34 条记录全部匹配，扩展后的完整 ABI 为 831 条匹配；`make test-random-host test-virtio-rng-host` 通过。`make test-rng-riscv` 两种传输共 8 次启动覆盖就绪、缺设备、信号取消、延迟响应及在途退出，均核对页/堆/栈回收。此次组合内核 SHA-256 `19854baa6e01ab86e11b80c970746dfb0d1e776a787cd0f4c094b25f691ea216`，随机窄探针 SHA-256 `aca76267b36edc4a6507a051041ed882deea323497e67f4c38266f82300648b3`；构建输入由固定 Linux 与 Harness 元数据约束。测试随机字节本身不参与差分。这是随机接口独立阶段的证据；其后的完整调度集成已完成，最新结果与验证快照边界见[程序清单](user-program-inventory.md)及[恢复矩阵](record-lock-sqlite-recovery.md)。
+启动混种后擦除 `boot_info.rng_seed` 的临时副本并清零长度，不改变固件拥有的原始 DTB。RV／LA 的固件种子均只作为不计熵材料；可信设备的初始化和停止契约见[随机设备模块](../modules/riscv-virtio-rng.md)。
 
-独立提交检查将暂存源码树导出到 `build/random-stage-src/` 后执行 `make -C build/random-stage-src -j4 all`，再用 `tests/rng-riscv.py --kernel build/random-stage-src/kernel-rv` 和 `tests/diff-abi/harness.py --kernel build/random-stage-src/kernel-rv` 重跑；8 次 RNG 启动与 831 条 ABI 全部通过。该独立内核 SHA-256 为 `c9d65f2fb9bfc96c1e393c61d06a937df242608b7a66e23472e686e72f49fd37`，确认不依赖尚未提交的会话和调度改动。
-
-启动混种后立即擦除 `boot_info.rng_seed` 的临时副本并将长度清零，避免初始化后继续保留无用途种子副本；不改固件拥有的原始 DTB。该收尾在独立会话基线核上重跑 8 次 RNG 生命周期启动通过，内核 SHA-256 `b87834c37520eecd114061dde95b5ba3047e4697ae3f4ae659287370100ee530`。
-
-LA固定QEMU同样提供32字节DTB种子：`references/qemu` commit
-`84f07211cc5b4fc6a371559bf8a5de4fb068e648`的
-`hw/loongarch/virt-fdt-build.c::create_fdt`调用guest random后写入`/chosen/rng-seed`。
-LA最初只消费DTB内存信息，GNU2.42启动因缺AT_RANDOM在main前访问零地址。
-现于完整启动布局验证成功后按上述不计熵策略混入并擦除临时种子；不引入启动等待或
-虚假ready。`make test-boot-random-loongarch`先真实RED再GREEN，两种RAM都验证
-available、零可信熵、ready为假及普通非阻塞等待EAGAIN；五种原GNU形态的
-Linux/BoarOS对照随后通过。可信PCI RNG生命周期仍另行验收。
-
-随后RNG共用transport/queue并接入LA PCI，正常、缺失、延迟与在途停止已完成同
-ELF的Linux/BoarOS、512MiB/1GiB对照；实际DMA/任务/栈OOM及IRQ失败返回准确错误
-并回到根基线。host另覆盖ready之后错误、短响应累计和拒绝reset保留owner。
-不能直接把缺设备等同于Linux未ready：固定Linux的LA`setup_arch()`先调用
-`fdt_setup()`，随后解析early params；`drivers/of/fdt.c`在前者已调用
-`add_bootloader_randomness()`，默认trust仍为true。故测试需控制固件输入。
-单用generic loader的reset写入又被稍后的ROM reset覆盖，实际对照仍ready；
-最后在已完成machine reset、vCPU尚未执行时，经GDB验证并NOP掉整个seed property。
-这只改变本轮RNG实验的公开固件输入，正常启动种子策略及固定内核/libc均未改变。
-
-在途停止的两端需要显式交接：EGD请求由QEMU异步发送，内核已提交descriptor
-不代表宿主已经读到请求。用户打印后立即退出会使合法停止与宿主事件读取竞速；
-托管LA/1GiB曾以请求计数1、可信字节0、正常退出42和owner归还触发该测试误判。
-探针现在等待console放行；runner只有在观察到真实EGD请求及等待标记后才放行，
-一直不返回熵。两侧同一ELF使用该握手，超时仍失败，不以延长sleep或重试隐藏竞争。
-`make test-ci-host`保护两种事件到达顺序，真实验证仍由双架构RNG入口执行。
+在途停止测试先由执行器观察真实 EGD 请求及客户机等待标记，再通过 console 放行退出，期间不返回熵；这样检查的是已提交请求的取消与 owner 归还，不让宿主读取请求与客户机退出竞争。

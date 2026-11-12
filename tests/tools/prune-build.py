@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep current compiler inputs and kernel caches; remove historical build outputs."""
+"""Keep installed tools and SDKs; remove rebuildable kernels and experiment outputs."""
 import sys
 from pathlib import Path
 sys.path[:0] = [str(Path(__file__).resolve().parent), str(Path(__file__).resolve().parents[1])]
@@ -14,18 +14,12 @@ ROOT = Path(__file__).resolve().parents[2]
 BUILD = ROOT / 'build'
 # Whole installed inputs, not every historical profile that once built them.
 CACHE_TREES = (
-    'tools/loongarch', 'tools/oscomp-local/host', 'tools/bc',
-    'tools/oscomp-analysis', 'qemu-la-rtc', 'program-environment',
-    'offline-c/alpine-tree', 'local-keep',
+    'tools/loongarch', 'tools/oscomp-local/host', 'local-keep',
+    'qemu-la-rtc/qemu-system-loongarch64', 'qemu-la-rtc/build/qemu-system-loongarch64',
+    'qemu-la-rtc/boaros-identity.json',
     'loongarch/musl-root', 'loongarch/gcc-sf/root',
-    'loongarch/busybox-source/busybox', 'loongarch/uapi',
     'riscv/musl-root', 'riscv-user-smp4/riscv/musl-root',
-    'bpf/downloads', 'bpf/riscv/root', 'bpf/loongarch/root',
 )
-KERNEL_CACHES = ('riscv', 'loongarch', 'riscv-user-smp8/riscv', 'loongarch-smp8')
-KERNEL_PARTS = ('arch', 'drivers', 'fs', 'generated', 'kernel', 'lib', 'mm',
-                'net', 'platform', 'third_party', 'vdso', 'btf')
-REFERENCE_FILES = ('.config', 'identity.json', 'boaros-identity.json')
 
 
 def protected_paths():
@@ -51,40 +45,13 @@ def deletion_paths(paths, protected):
     return result
 
 
-def current_linux_keys():
-    sys.dont_write_bytecode = True
-    sys.path.insert(0, str(ROOT / 'tests/diff-abi'))
-    import harness
-    return {harness.identity(ROOT / config)[0] for config in
-            ('tests/diff-abi/linux.config', 'tests/userland/inventory/linux.config',
-             'tests/userland/network-linux.config', 'tests/userland/tty/pty-linux.config', 'tests/smp/linux-user.config')}
-
-
 def candidates():
     if not BUILD.is_dir() or BUILD.is_symlink():
         return []
-    keys = current_linux_keys()  # Invalid reference inputs must stop cleanup.
     keep = {BUILD / name for name in CACHE_TREES}
-    for cache in KERNEL_CACHES:
-        keep.update(BUILD / cache / name for name in KERNEL_PARTS)
-        keep.update(BUILD / cache / name for name in
-                    ('kernel-rv', 'kernel-la', 'kernel-rv.map', 'kernel.map'))
-    keep.add(BUILD / 'riscv-user-smp8/kernel-rv')
     for arch in ('riscv', 'loongarch'):
         keep.update(BUILD / 'tools/oscomp-local' / arch / name for name in
                     ('mke2fs', 'mke2fs.conf', 'seed', 'identity.json'))
-    for cache in ('linux-la', 'linux-la-platform', 'linux-la-platform-noswap'):
-        keep.update(BUILD / cache / name for name in (*REFERENCE_FILES, 'vmlinux'))
-    for key in keys:
-        keep.update(BUILD / 'diff-abi/linux' / key / name for name in
-                    (*REFERENCE_FILES, 'arch/riscv/boot/Image'))
-    for arch in ('riscv', 'loongarch'):
-        base = BUILD / 'bpf' / arch
-        keep.update(base / 'linux' / name for name in
-                    (*REFERENCE_FILES, 'arch/riscv/boot/Image' if arch == 'riscv' else 'vmlinux'))
-        # baseline.py installs these libraries; compiler object trees are disposable.
-        keep.update((base / 'llvm/lib').glob('*.so*'))
-
     result = []
     def select(directory):
         for path in directory.iterdir():

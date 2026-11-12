@@ -1,6 +1,6 @@
 # 用户 ELF64 装载模块
 
-本文描述共用 ELF64 解析、不可变来源、缺页 backing 和映像布局。RV 生产路径用 Sv39/4 KiB；LA 的内存与 PCI/ext4 静态 ELF 用 LA64/16 KiB/三级页表，能力范围见[LA 模块](loongarch-boot.md)。ELF 的背景知识见[ELF 用户程序装载学习总结](../learning/elf-loading.md)，exec 事务见[进程映像替换模块](kernel-exec.md)。
+本文描述共用 ELF64 解析、不可变来源、缺页 backing 和映像布局。RV 生产路径用 Sv39/4 KiB；LA 的内存与 PCI/ext4 静态 ELF 用 LA64/16 KiB/三级页表，能力范围见[LA 模块](loongarch-boot.md)。exec 事务见[进程映像替换模块](kernel-exec.md)。
 
 ## 稳定单元
 
@@ -11,7 +11,6 @@
 | `include/kernel/elf_image.h`、`kernel/elf_image.c` | 共用地址布局、ASLR、初始栈/auxv 和 source-backed VMA 构造 |
 | `include/arch/elf.h`、`include/arch/mmu.h` | 构建期 machine、HWCAP、trampoline、用户范围及页表操作 |
 | `kernel/exec.c`、`kernel/exec_image.c` | `execve` 路径/解释器事务和共用映像绑定 |
-| `tests/riscv/elf64_cases.c` | 解析边界及 RFC 8439 ChaCha20 已知向量 |
 
 解析器入口为：
 
@@ -73,7 +72,6 @@ source、临时映像和 MM 的所有权按 exec 事务分层：事务持有创�
 
 ```sh
 make test-elf-boundary-riscv test-elf-boundary-loongarch TEST_MEMORIES="512M 1G"
-make test-elf64-riscv
 make test-elf-rwx-riscv
 make test-elf-tail-riscv
 make test-demand-page-riscv

@@ -35,7 +35,6 @@ fork/clone 先保存父进程当前硬件 FP 寄存器，再复制 32 个 D 寄�
 当前只实现RISC-V F/D 64位寄存器视图；未实现V扩展、向量上下文、用户态浮点异常信号或跨hart lazy ownership。每个 task 固定承担 272 字节状态空间，板级性能和 FPU trap 计数尚未测量，不能把 QEMU 的正确性通过写成性能结论。
 
 ```sh
-make test-signal-riscv
 make test-userland-riscv
 make test-smp-fpu-setup-riscv
 make test-riscv

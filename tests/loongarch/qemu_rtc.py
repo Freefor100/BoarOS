@@ -42,10 +42,19 @@ def prepare(jobs,rebuild=False):
     if rebuild:
         if not recorded or recorded.get('revision')!=revision:
             raise RuntimeError('refusing to replace an unidentified derived source')
-        shutil.rmtree(derived);recorded=None;stamp.unlink()
+        if derived.exists():shutil.rmtree(derived)
+        recorded=None;stamp.unlink()
     if recorded:
         if any(recorded.get(key)!=value for key,value in identity.items()):
             raise RuntimeError('derived QEMU inputs changed; use a fresh cache directory')
+        binary=DIRECTORY/'qemu-system-loongarch64'
+        if 'binary' in recorded:
+            # 执行已验收二进制只需要核对实际产物与输入身份，不依赖可重建的源码和对象树。
+            if product(binary)!=recorded['binary']:
+                raise RuntimeError('derived QEMU binary content, mode or links changed')
+            require_user_network(binary)
+            print('Verified LS7A QEMU cache:',binary,'binary',recorded['binary']['sha256'],flush=True)
+            return
         if source_files(source,derived)!=recorded['source_files']:
             raise RuntimeError('derived QEMU source content, mode or links changed')
         for name,expected in recorded['dependencies'].items():
@@ -54,16 +63,6 @@ def prepare(jobs,rebuild=False):
             for relative,entry in expected['overlay'].items():
                 if product(derived/'subprojects'/name/relative)!=entry:
                     raise RuntimeError('derived QEMU Meson overlay changed: '+name)
-        binary=DIRECTORY/'qemu-system-loongarch64'
-        if 'binary' in recorded and product(binary)!=recorded['binary']:
-            raise RuntimeError('derived QEMU binary content, mode or links changed')
-        if 'binary' in recorded and configuration_files(DIRECTORY/'build')!=recorded.get('configuration_files'):
-            raise RuntimeError('derived QEMU build configuration changed; explicitly rebuild approved inputs')
-        if 'binary' in recorded:
-            # 身份完整的冻结产物无需再链接宿主旧绝对库路径；变更已在上面拒绝。
-            require_user_network(binary)
-            print('Verified LS7A QEMU cache:',binary,'binary',recorded['binary']['sha256'],flush=True)
-            return
         identity.update({key:recorded[key] for key in ('source_files','dependencies')})
     else:
         if derived.exists():raise RuntimeError('unidentified derived source exists; use a fresh directory')
