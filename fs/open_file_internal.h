@@ -51,7 +51,11 @@ struct kernel_open_file_description {
 #endif
     struct kernel_flock_owner flock_owner;
     struct kernel_flock_identity flock_identity; /* Pathless private inode. */
+    uint32_t read_advice; /* Shared by dup/fork/SCM_RIGHTS, independently of status flags. */
 };
+enum { KERNEL_READ_RANDOM=1, KERNEL_READ_SEQUENTIAL=2, KERNEL_READ_NOREUSE=4 };
+static inline int kernel_open_file_read_no_reuse(const struct kernel_open_file_description *file)
+{ return !!(__atomic_load_n(&file->read_advice,__ATOMIC_RELAXED)&KERNEL_READ_NOREUSE); }
 struct kernel_flock_identity *kernel_open_file_flock_identity(
     struct kernel_open_file_description *);
 /* 已有OFD owner下的私有域验证，不为未映射普通文件分配映射登记状态。 */

@@ -379,7 +379,7 @@ static void mount_view_tree(struct kernel_vfs_mount *mount)
     assert(!kernel_vfs_path_resolve(root,root,"/single",1,&path));
     assert(!kernel_vfs_path_open(path,&file));
     assert(!kernel_vfs_umount(path,2)&&!kernel_vfs_path_release(&path));
-    char bytes[3]={0};int miss=0;
+    char bytes[3]={0};struct kernel_vfs_read_options miss={0};
     assert(!kernel_vfs_pread(&file,0,bytes,2,&done,&miss)&&done==2&&!strcmp(bytes,"ok"));
     assert(!kernel_vfs_close(&file)&&!kernel_vfs_path_release(&root));
 }

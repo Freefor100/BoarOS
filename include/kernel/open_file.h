@@ -154,6 +154,9 @@ int kernel_open_file_pipe_finish(struct kernel_heap *heap,
     struct kernel_open_file_pipe_pin *pin, uint32_t flags,
     struct kernel_open_file_description **owner);
 
+int kernel_open_file_advise(struct kernel_open_file_description *,int64_t offset,
+    int64_t length,int advice,int explicit_readahead);
+
 int kernel_open_file_supports_epoll(
     const struct kernel_open_file_description *file);
 

@@ -940,9 +940,9 @@ static void read_borrow_retirement(struct kernel_page_cache *cache,const char *p
     unsigned char bytes[BOAROS_PAGE_SIZE];memset(bytes,0x5d,sizeof(bytes));size_t done;
     assert(!kernel_vfs_pwrite(&file,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
     struct kernel_page_cache_read_page old={0},grown={0};
-    assert(!kernel_page_cache_get_batch(cache,&file,0,&old,1) && old.entry);
+    assert(!kernel_page_cache_get_batch(cache,&file,0,&old,1, 0) && old.entry);
     assert(!kernel_vfs_ftruncate(&file,0) && !kernel_vfs_ftruncate(&file,BOAROS_PAGE_SIZE));
-    assert(!kernel_page_cache_get_batch(cache,&file,0,&grown,1) && grown.entry);
+    assert(!kernel_page_cache_get_batch(cache,&file,0,&grown,1, 0) && grown.entry);
     assert(old.physical_address!=grown.physical_address &&
         !memcmp(access_page(old.physical_address),bytes,sizeof(bytes)));
     const unsigned char *zero=access_page(grown.physical_address);
@@ -1810,7 +1810,7 @@ static void *read_demand_batch(void *arg)
         read->status=read->pages[0].status=kernel_page_cache_get(current_cache,current_file,
             read->first,&read->pages[0].physical_address,&read->pages[0].valid_bytes);
     } else read->status = kernel_page_cache_get_batch(current_cache, current_file,
-        read->first, read->pages, read->count);
+        read->first, read->pages, read->count, 0);
     assert(!fail_workspace_allocation);
     demand_heap_allocations=NULL;
     delayed_load_token = (struct kernel_wait_token){0};
@@ -1877,7 +1877,7 @@ static void count_demand_read(struct counted_demand *read)
     read_allocator = current_cache->allocator;
     read_counts = &read->counts;
     result.status = kernel_page_cache_get_batch(current_cache, current_file, 16,
-        result.pages, result.count);
+        result.pages, result.count, 0);
     assert(!result.status);
     for (size_t i = 0; i < result.count; i++)
         demand_contents(&result.pages[i], 0x40 + i, BOAROS_PAGE_SIZE);
@@ -1904,7 +1904,7 @@ static void demand_operation_cases(struct kernel_page_cache *cache, struct kerne
             assert(!kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(file)));
             if (warm) {
                 struct demand_read prepared = {.count = count};
-                assert(!kernel_page_cache_get_batch(cache, file, 16, prepared.pages, prepared.count));
+                assert(!kernel_page_cache_get_batch(cache, file, 16, prepared.pages, prepared.count, 0));
                 demand_release(&prepared);
             }
             reset_demand_source();
@@ -2421,7 +2421,7 @@ static void demand_truncate(struct kernel_page_cache *cache, struct kernel_vfs_f
     __atomic_store_n(&resume_read, 1, __ATOMIC_RELEASE);
     assert(!pthread_join(client, 0) && !pthread_join(truncator, 0) && !loading.status);
     struct demand_read shrunk = {.count = 8};
-    shrunk.status = kernel_page_cache_get_batch(cache, file, 0, shrunk.pages, shrunk.count);
+    shrunk.status = kernel_page_cache_get_batch(cache, file, 0, shrunk.pages, shrunk.count, 0);
     assert(shrunk.status == KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE && source_reads == 8 && source_batches == 1);
     for (unsigned i = 0; i < 3; i++) {
         demand_contents(&shrunk.pages[i], 0x30 + i, i == 2 ? 37 : BOAROS_PAGE_SIZE);
@@ -2441,7 +2441,7 @@ static void demand_truncate(struct kernel_page_cache *cache, struct kernel_vfs_f
     assert(!kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(file)));
     reset_demand_source();
     struct demand_read eof = {.count = 8};
-    eof.status = kernel_page_cache_get_batch(cache, file, 0, eof.pages, eof.count);
+    eof.status = kernel_page_cache_get_batch(cache, file, 0, eof.pages, eof.count, 0);
     assert(eof.status == KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE &&
         source_reads == 3 && source_batches == 1 && source_batch_sizes[0] == 3);
     for (unsigned i = 0; i < 3; i++)
@@ -2453,7 +2453,7 @@ static void demand_truncate(struct kernel_page_cache *cache, struct kernel_vfs_f
     assert(!kernel_vfs_ftruncate(file, 8 * BOAROS_PAGE_SIZE));
     reset_demand_source();
     struct demand_read grown = {.count = 8};
-    grown.status = kernel_page_cache_get_batch(cache, file, 0, grown.pages, grown.count);
+    grown.status = kernel_page_cache_get_batch(cache, file, 0, grown.pages, grown.count, 0);
     assert(!grown.status && source_reads == 5 && source_batches == 1 && source_batch_sizes[0] == 5);
     demand_contents(&grown.pages[0], 0x30, BOAROS_PAGE_SIZE);
     demand_contents(&grown.pages[1], 0x31, BOAROS_PAGE_SIZE);

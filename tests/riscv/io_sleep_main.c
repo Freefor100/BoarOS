@@ -643,7 +643,7 @@ static void reader(void *arg)
     uintptr_t irq = riscv_interrupt_save();
     unsigned index = (uintptr_t)arg;
     struct kernel_page_cache_read_page page;
-    check(kernel_page_cache_get_batch(&cache, &file, 0, &page, 1) == KERNEL_PAGE_CACHE_STATUS_OK &&
+    check(kernel_page_cache_get_batch(&cache, &file, 0, &page, 1, 0) == KERNEL_PAGE_CACHE_STATUS_OK &&
         page.status == KERNEL_PAGE_CACHE_STATUS_OK, 11);
     size_t valid = page.valid_bytes;
     observed[index] = page.physical_address;

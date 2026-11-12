@@ -17,7 +17,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 
 调用者是 scheduler 当前不透明 task，供依赖任务身份或资源的系统调用取得明确上下文；通用解码层不从 RISC-V `tp` 隐式寻找 current。请求包含系统调用号和六个 64 位参数。结果动作定义在公共头中：
 
-当前分派覆盖RV的229个编号、LA的228个编号；这表示入口已接入，各接口的具体支持范围见对应模块。
+当前分派覆盖RV的231个编号、LA的230个编号；这表示入口已接入，各接口的具体支持范围见对应模块。
 `flock(32)`、`close_range(436)`、`epoll_pwait2(441)`、`fchmodat2(452)`和
 `copy_file_range(285)`见[文件接口](kernel-files.md)，`sendmmsg(269)`／`recvmmsg(243)`
 见[网络接口](kernel-network.md)。RV独有的`riscv_flush_icache(259)`见[MM](kernel-mm.md)；
@@ -56,6 +56,7 @@ LA的259仍返回`ENOSYS`。这些入口的直接消费者可用`python3 tests/u
 - `sched_getscheduler(120)`、`sched_getparam(121)`、`sched_getaffinity(123)`、`sched_rr_get_interval(127)` 与 `sched_getattr(275)` 在发起 CPU 执行。任务身份、策略、基础优先级及亲和掩码在 scheduler 身份保护下取得完整小快照，释放保护后才复制到用户内存；PI 临时继承的有效优先级不替换查询到的基础值。`sched_setparam(118)`、`sched_setscheduler(119)` 和 `sched_setaffinity(122)` 保持 CPU0 服务执行规则；优先级上下限查询 125/126 与 `getcpu(168)` 也在发起 CPU 执行。
 - `sched_getattr(275)` 在 RV64/LA64 使用相同的 56 字节原生结构，接受 48 字节旧版、48～56 字节间的任意前缀，以及不超过架构基页大小的扩展结构。返回 `size=min(用户长度,56)`；扩展尾部先清零，再写已知前缀，因此尾部 `EFAULT` 不改写结构头。先检查空指针、负 TID 和长度，再查目标，随后检查 flags，最后输出；当前支持 OTHER/FIFO/RR，只有 flags=0 有效。策略与 RESET_ON_FORK 来自任务快照，nice 为实际固定值 0；OTHER 的 runtime 为当前普通调度量子 10ms，与 127 的普通策略间隔一致，FIFO/RR 的 runtime 为 0；deadline、period 与未启用的 util_min/util_max 为 0。Linux fair 类的 runtime 来自其自身调度 slice，具体数值不要求与 BoarOS 普通调度量子相等。
 - `preadv2/pwritev2` 编号286/287，与69/70的原定位向量共用I/O核心；offset=-1使用共享位置，其余合法值保持定位语义。按次追加、同步及信号选项见[文件模块](kernel-files.md#向量-io-的按次选项)，NOWAIT／ATOMIC／DONTCACHE当前返回EOPNOTSUPP。
+- `fadvise64(223)` 支持六种建议，`readahead(213)` 接入有界显式预读；OFD策略、范围写回接纳和干净页回收见[文件模块](kernel-files.md#文件访问建议与显式预读)。
 - `exit` 编号 93 产生线程 `EXIT`，`exit_group` 编号 94 产生全组 `EXIT_GROUP`；状态保留参数 0 的低 8 位。组退出等待成员沿原内核调用栈释放在用资源，最后产生一次进程退出通知。
 - `set_tid_address` 编号 96 记录 clear_tid 用户指针并返回调用 TID；线程退出在释放 MM 前清零并唤醒同 key 的一个 futex waiter。坏用户指针不破坏内核状态。
 - `futex` 编号 98 支持 WAIT、WAKE、REQUEUE、CMP_REQUEUE、WAKE_OP、WAIT_BITSET、WAKE_BITSET、PI 锁及 PI 条件重排；`futex_waitv` 编号 449 支持多地址等待。key、排序、掩码、超时、错误码及扩展边界见[调度模块](kernel-scheduler.md#等待与-futex)；无超时等待按 SA_RESTART 选择 EINTR 或重新等待，带超时等待的用户 handler 总是看到 EINTR、无 handler restart 保持原 absolute deadline。

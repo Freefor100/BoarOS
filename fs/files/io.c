@@ -370,7 +370,7 @@ static enum kernel_files_status disk_read(
         enum kernel_page_cache_status loaded;
         loaded = kernel_page_cache_get_batch(
             cache, &description->file,
-            position >> BOAROS_PAGE_SHIFT, pages, count);
+            position >> BOAROS_PAGE_SHIFT, pages, count, kernel_open_file_read_no_reuse(description));
         if (loaded == KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT)
             return KERNEL_FILES_STATUS_STATE;
         struct kernel_uaccess_write_cursor user_copy={0};
@@ -1124,7 +1124,7 @@ static __attribute__((noinline)) int64_t regular_cached_copy(
         if (wanted>count-total) wanted=count-total;
         size_t nr=(offset+wanted+BOAROS_PAGE_MASK)>>BOAROS_PAGE_SHIFT;
         kernel_open_file_read_begin(input,position);
-        if (kernel_page_cache_get_batch(cache,&input->file,position>>BOAROS_PAGE_SHIFT,pages,nr)
+        if (kernel_page_cache_get_batch(cache,&input->file,position>>BOAROS_PAGE_SHIFT,pages,nr, kernel_open_file_read_no_reuse(input))
             ==KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT) __builtin_trap();
         size_t available=0,within=offset;
         int miss=0;
@@ -1305,7 +1305,7 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
                 struct kernel_page_cache_read_page page = {0};
                 struct kernel_page_cache *cache=kernel_open_file_page_cache(input);
                 loaded=kernel_page_cache_get_batch(cache,&input->file,
-                    position>>BOAROS_PAGE_SHIFT,&page,1);
+                    position>>BOAROS_PAGE_SHIFT,&page,1, kernel_open_file_read_no_reuse(input));
                 if (!loaded) {
                     physical=page.physical_address;valid=page.valid_bytes;cache_miss=page.cache_miss;
                     mapped=kernel_page_cache_read_data(&page);

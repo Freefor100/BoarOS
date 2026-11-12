@@ -90,6 +90,23 @@ APPEND 与 NOAPPEND 同时指定返回 EINVAL。NOAPPEND 可覆盖本次 O_APPEN
 追加、同步和信号选项保存在本次调用中，不修改共享 OFD 状态。按次同步复用实际完成范围及原有固定持久化目标、错误游标；
 数据已接纳后同步失败仍保留内容和应发生的位置更新。复制故障的已完成前缀、FSIZE、文件封印以及 set-ID／filecap 清除沿共同写入路径处理。
 
+## 文件访问建议与显式预读
+
+`fadvise64` 的 NORMAL、RANDOM、SEQUENTIAL、NOREUSE 策略归 OFD，dup、fork 与 FD 传递共享，独立 open 不共享。
+NORMAL 恢复默认窗口并清除 RANDOM／NOREUSE；RANDOM 取消该 OFD 的推测预读并禁止继续训练；
+SEQUENTIAL 清除 RANDOM，窗口上限为默认值两倍；NOREUSE 保留其他策略，读取命中仍统计和借用页面，但不提升缓存访问状态。
+窗口和状态在 OFD 的短保护内更新，锁外发布预读后重新检查，避免旧预测覆盖并发修改的策略。
+
+WILLNEED 与 `readahead` 将有界文件范围交给现有预读队列，队列持有真实 inode 引用；EOF、空槽、物理内存压力限制接纳量。
+工作区按原批次上限反复使用，不创建新 worker，也不安装用户 PTE。提示成功不承诺返回时全部驻留；
+队列满或装入失败不丢失后续真实读取应报告的错误。`readahead` 要求可读的普通文件；当前块设备没有文件缓存装入接口，返回 EINVAL。
+`fadvise64` 可以用于只写 FD，FIFO 返回 ESPIPE，O_PATH 返回 EBADF。tmpfs／memfd 没有 swap，合法建议不撤销其内存后备。
+
+DONTNEED 先尝试范围写回接纳，不执行 fsync、不等待日志 durable 目标；随后按 inode 索引遍历指定范围，
+复用压力回收的摘索引、借用和物理页归还过程。只回收干净、无用户映射、无读写借用、无在途装入／写回的页。
+首尾部分页按固定 Linux 的完整页及精确 EOF 规则处理；不会以全局 LRU 扫描或截断式失效替代范围回收。
+建议不改变文件位置、内容或时间戳。预读、关闭、卸载与停止仍按已有 inode／实例引用和队列排空规则交接。
+
 ## 传统与 OFD 记录锁
 
 `fs/record_lock.c` 为每个活 VFS inode 维护按有符号闭区间排序、带子树最大终点的 AVL 树和等待队列；冲突查询、同 owner 区间合并、分拆预留和批量摘除都按该树的相关范围搜索，不遍历 owner 在其他 inode 上的锁。每个锁节点同时挂在 owner 的侵入式链上，供关闭时定向释放；批量摘除通过 AVL 子树合并恢复平衡。长度为零延伸到 `INT64_MAX`，负长度向文件前方锁定，锁可以超过 EOF。`fs/files/locks.c` 导入 RV64 `struct flock` 并分派 `F_GETLK/F_SETLK/F_SETLKW` 与 `F_OFD_GETLK/F_OFD_SETLK/F_OFD_SETLKW`；标量 `fcntl` 命令仍走原入口。区间转换、读写权限、`l_pid`、坏指针和溢出错误按固定 Linux `references/linux/fs/locks.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 核对。

@@ -182,7 +182,7 @@ struct kernel_page_cache_read_page {
  * 自有加载先一起完成、发布，再等待他人的loading，避免重叠批次互等。 */
 enum kernel_page_cache_status kernel_page_cache_get_batch(
     struct kernel_page_cache *, const struct kernel_vfs_file *, uint64_t first,
-    struct kernel_page_cache_read_page *pages, size_t count);
+    struct kernel_page_cache_read_page *pages, size_t count, int no_reuse);
 void kernel_page_cache_put_batch(
     struct kernel_page_cache *cache,
     struct kernel_page_cache_read_page *pages,
@@ -268,6 +268,9 @@ void kernel_page_cache_truncate(struct kernel_page_cache *cache,
 
 /* Inode write owner excludes writeback capture; caller first drains dirty
  * bytes in every intersecting page and closes its mmap publication epoch. */
+/* Hint eviction: only clean, unmapped, unborrowed pages in this inode. */
+void kernel_page_cache_dontneed(struct kernel_page_cache *, struct kernel_vfs_node *,
+    uint64_t first, uint64_t last);
 void kernel_page_cache_invalidate_range(struct kernel_page_cache *cache,
     struct kernel_vfs_node *node, uint64_t start, uint64_t end);
 

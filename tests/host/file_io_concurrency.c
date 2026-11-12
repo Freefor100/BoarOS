@@ -172,6 +172,8 @@ enum kernel_heap_status __wrap_kernel_heap_allocate(struct kernel_heap *heap,siz
 }
 static struct kernel_rwlock *namespace_observed_lock;
 static unsigned namespace_lock_acquisitions;
+static const struct kernel_rwlock *advice_closing_lock;
+static unsigned advice_close_waiting;
 static _Thread_local const struct kernel_rwlock *write_sequence_lock;
 static _Thread_local unsigned write_sequence_queries,write_sequence_acquisitions;
 int __real_kernel_lock_held(const struct kernel_rwlock *,int);
@@ -184,6 +186,7 @@ void __real_kernel_rwlock_write(struct kernel_rwlock *,struct kernel_lock_guard 
 void __wrap_kernel_rwlock_write(struct kernel_rwlock *lock,struct kernel_lock_guard *guard)
 {
     if (lock==namespace_observed_lock) namespace_lock_acquisitions++;
+    if (lock==advice_closing_lock) __atomic_store_n(&advice_close_waiting,1,__ATOMIC_RELEASE);
     if (lock==write_sequence_lock) write_sequence_acquisitions++;
 #ifdef TCP_IO_CASES
     tcp_wait_locking(lock);
@@ -1510,6 +1513,102 @@ static void borrowed_page_case(struct physical_page_allocator *pages)
 #ifdef TCP_IO_CASES
 #include "tcp_usercopy_cases.h"
 #endif
+struct advice_close_call { struct kernel_files *files; int64_t result; };
+static void *advice_close_thread(void *argument)
+{
+    struct advice_close_call *call=argument;
+    mm_test_attach(1);mm_test_bind(&mm);mm_test_bind_files(call->files);mm_test_context=context;
+    assert(!kernel_files_close(call->files,0,&call->result));
+    mm_test_finish();return NULL;
+}
+static void file_advice_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount,
+    struct kernel_page_cache *cache)
+{
+    struct kernel_files local={0};struct kernel_open_file_description *file=NULL,*other=NULL;
+    int error;int64_t result;size_t written,copied;
+    assert(!kernel_files_create(&local,heap) &&
+        !kernel_open_file_create_mode(heap,mount,"/advice",0600,&file,&error) && !error);
+    file->open_flags=2;assert(!kernel_vfs_file_acquire_write(&file->file));
+    unsigned char *bytes=malloc(20*BOAROS_PAGE_SIZE+123);assert(bytes);
+    memset(bytes,0x5a,20*BOAROS_PAGE_SIZE+123);
+    assert(!kernel_vfs_pwrite(&file->file,0,bytes,20*BOAROS_PAGE_SIZE+123,&written) && written==20*BOAROS_PAGE_SIZE+123);
+    assert(!kernel_open_file_sync_range(file,0,UINT64_MAX));
+    struct kernel_open_file_description *slot=file;
+    assert(!kernel_files_install_new_owned_at(&local,0,0,&slot));
+    assert(!kernel_open_file_create(heap,mount,"/advice",&other,&error) && !error);
+    struct kernel_page_cache_read_page pin={0};
+    assert(!kernel_page_cache_get_batch(cache,&file->file,1,&pin,1,0));
+    assert(!kernel_files_advise(&local,0,BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE,4,0,&result) && !result &&
+        kernel_page_cache_resident(cache,&file->file,1));
+    kernel_page_cache_put_batch(cache,&pin,1);
+    assert(!kernel_files_advise(&local,0,BOAROS_PAGE_SIZE+1,2*BOAROS_PAGE_SIZE-1,4,0,&result) && !result &&
+        kernel_page_cache_resident(cache,&file->file,1) && !kernel_page_cache_resident(cache,&file->file,2) &&
+        kernel_page_cache_resident(cache,&file->file,3));
+    assert(!kernel_files_advise(&local,0,20*BOAROS_PAGE_SIZE,124,4,0,&result) && !result &&
+        kernel_page_cache_resident(cache,&file->file,20));
+    assert(!kernel_files_advise(&local,0,20*BOAROS_PAGE_SIZE,123,4,0,&result) && !result &&
+        !kernel_page_cache_resident(cache,&file->file,20));
+    assert(!kernel_files_advise(&local,0,0,0,4,0,&result) && !result);
+    assert(!kernel_page_cache_get_batch(cache,&file->file,0,&pin,1,0));
+    struct kernel_page_cache_read_page second={0};assert(!kernel_page_cache_get_batch(cache,&file->file,1,&second,1,0));
+    (void)kernel_page_cache_reclaim(cache,UINT64_MAX); /* Clear reference bits, both actual readers remain pinned. */
+    kernel_page_cache_put_batch(cache,&pin,1);kernel_page_cache_put_batch(cache,&second,1);
+    struct kernel_page_cache_statistics before,after;
+    kernel_page_cache_get_statistics(cache,&before);
+    assert(!kernel_files_pread(&local,&mm,0,0x200000,1,0,&result) && result==1);
+    assert(!kernel_files_advise(&local,0,0,0,5,0,&result) && !result);
+    assert(!kernel_files_pread(&local,&mm,0,0x200000,1,BOAROS_PAGE_SIZE,&result) && result==1);
+    kernel_page_cache_get_statistics(cache,&after);assert(after.hits==before.hits+2);
+    assert(kernel_page_cache_reclaim(cache,1)==1 && kernel_page_cache_resident(cache,&file->file,0) &&
+        !kernel_page_cache_resident(cache,&file->file,1));
+    assert(file->read_advice==KERNEL_READ_NOREUSE && !other->read_advice);
+    assert(!kernel_files_advise(&local,0,0,0,0,0,&result) && !result && !file->read_advice);
+    assert(!kernel_files_advise(&local,0,0,0,2,0,&result) && !result);
+    assert(!kernel_files_advise(&local,0,0,0,1,0,&result) && !result);
+    assert((file->read_advice&(KERNEL_READ_RANDOM|KERNEL_READ_SEQUENTIAL))==(KERNEL_READ_RANDOM|KERNEL_READ_SEQUENTIAL));
+    assert(!kernel_files_advise(&local,0,0,0,2,0,&result) && !result && !(file->read_advice&KERNEL_READ_RANDOM));
+    assert(!kernel_files_advise(&local,0,0,0,4,0,&result) && !result && !kernel_page_cache_resident(cache,&file->file,0));
+    assert(!kernel_files_ftruncate(&local,0,80*BOAROS_PAGE_SIZE,&result) && !result &&
+        !kernel_open_file_sync_range(file,0,UINT64_MAX));
+    assert(!kernel_page_cache_start_worker(cache));
+    assert(!kernel_files_advise(&local,0,0,0,1,0,&result) && !result);
+    kernel_page_cache_get_statistics(cache,&before);
+    assert(!kernel_open_file_pread(file,0,bytes,BOAROS_PAGE_SIZE,&copied) && copied==BOAROS_PAGE_SIZE);
+    assert(!kernel_open_file_pread(file,BOAROS_PAGE_SIZE,bytes,BOAROS_PAGE_SIZE,&copied) && copied==BOAROS_PAGE_SIZE);
+    kernel_page_cache_get_statistics(cache,&after);assert(after.readahead_queued==before.readahead_queued);
+    assert(!kernel_files_advise(&local,0,0,0,2,0,&result) && !result);
+    assert(!kernel_open_file_pread(file,8*BOAROS_PAGE_SIZE,bytes,BOAROS_PAGE_SIZE,&copied) && copied==BOAROS_PAGE_SIZE);
+    assert(!kernel_open_file_pread(file,9*BOAROS_PAGE_SIZE,bytes,BOAROS_PAGE_SIZE,&copied) && copied==BOAROS_PAGE_SIZE);
+    unsigned batch=BOAROS_PAGE_CACHE_READAHEAD_PAGES<16384U/BOAROS_PAGE_SIZE?
+        BOAROS_PAGE_CACHE_READAHEAD_PAGES:16384U/BOAROS_PAGE_SIZE;
+    uint64_t next=10;
+    for (;;) {
+        do { kernel_page_cache_get_statistics(cache,&after);sched_yield(); }
+        while (after.readahead_completed<after.readahead_queued);
+        if (file->readahead_pages==2*BOAROS_PAGE_CACHE_READAHEAD_PAGES) break;
+        assert(!kernel_open_file_pread(file,next*BOAROS_PAGE_SIZE,bytes,batch*BOAROS_PAGE_SIZE,&copied) && copied==batch*BOAROS_PAGE_SIZE);
+        next+=batch;batch*=2;
+    }
+    assert(!kernel_files_advise(&local,0,0,0,1,0,&result) && !result);
+    assert(!kernel_files_advise(&local,0,0,0,4,0,&result) && !result);
+    kernel_page_cache_get_statistics(cache,&before);
+    __atomic_store_n(&pause_access,1,__ATOMIC_RELEASE);access_entered=resume_access=0;
+    assert(!kernel_files_advise(&local,0,0,4*BOAROS_PAGE_SIZE,3,0,&result) && !result);
+    while (!__atomic_load_n(&access_entered,__ATOMIC_ACQUIRE)) sched_yield();
+    advice_closing_lock=&kernel_open_file_node(file)->io_lock;advice_close_waiting=0;
+    struct advice_close_call close_call={.files=&local};pthread_t closer;
+    assert(!pthread_create(&closer,NULL,advice_close_thread,&close_call));
+    while (!__atomic_load_n(&advice_close_waiting,__ATOMIC_ACQUIRE)) sched_yield();
+    __atomic_store_n(&resume_access,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(closer,NULL) && !close_call.result);advice_closing_lock=NULL;
+    for (;;) { kernel_page_cache_get_statistics(cache,&after);if(after.readahead_completed>before.readahead_completed)break;sched_yield(); }
+    assert(after.readahead_loaded>=4 && kernel_page_cache_resident(cache,&other->file,3));
+    assert(!kernel_open_file_pread(other,0,bytes,8,&copied) && copied==8 && bytes[0]==0x5a);
+    kernel_page_cache_stop_worker(cache);
+    assert(!kernel_open_file_release(&other) && !kernel_files_release(&local) && !kernel_vfs_unlink(mount,"/advice"));
+    free(bytes);
+    puts("PASS file advice: scoped eviction skips readers, NOREUSE preserves hit counts without promotion, RANDOM suppression, doubled SEQUENTIAL windows, independent opens and queued close owners");
+}
 int main(int argc,char **argv)
 {
     assert(argc==2); setvbuf(stdout,0,_IONBF,0); mm_test_attach(0); mm_test_activate_task();
@@ -1518,7 +1617,8 @@ int main(int argc,char **argv)
     struct kernel_heap heap={0},backend_heap={0};
     initialize(&pages,&heap,arena,sizeof(arena)); initialize(&backend_pages,&backend_heap,backend,sizeof(backend));
     uint64_t baseline=physical_page_available(&pages),backend_baseline=physical_page_available(&backend_pages);
-    int focused=getenv("FILE_IO_VECTORS_ONLY")!=NULL;
+    int advice_only=getenv("FILE_IO_ADVICE_ONLY")!=NULL;
+    int focused=advice_only || getenv("FILE_IO_VECTORS_ONLY")!=NULL;
     if (!focused) {
     borrowed_page_case(&pages);
     namespace_retiring_mount_case(&heap);
@@ -1578,7 +1678,8 @@ int main(int argc,char **argv)
     assert(!kernel_block_register(&disk,KERNEL_BLOCK_DEVICE_NUMBER(101)));
     struct kernel_vfs_mount mount={0}; assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,&cache,0));
     assert(!kernel_vfs_start_journal_worker(&mount));
-    if (focused) synchronous_write_ranges(&heap,&mount);
+    if (advice_only) file_advice_case(&heap,&mount,&cache);
+    else if (focused) synchronous_write_ranges(&heap,&mount);
     else {
     cached_copy_case(&heap,&mount);
     namespace_retirement_case(&heap,&mount);

@@ -1761,3 +1761,16 @@ enum kernel_syscall_status syscall_handle_copy_range(struct kernel_task *caller,
             (uint32_t)request->arguments[5],&value)) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     decoded->value=value;return KERNEL_SYSCALL_STATUS_OK;
 }
+
+enum kernel_syscall_status syscall_handle_file_advice(struct kernel_task *caller,
+    const struct kernel_syscall_request *request,struct kernel_syscall_result *decoded)
+{
+    struct kernel_files *files;
+    decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+    if (kernel_task_files_borrow(caller,&files)) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    int explicit_readahead=request->number==213U;
+    if (kernel_files_advise(files,(int32_t)request->arguments[0],(int64_t)request->arguments[1],
+        (int64_t)request->arguments[2],explicit_readahead?3:(int32_t)request->arguments[3],
+        explicit_readahead,&decoded->value)) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
