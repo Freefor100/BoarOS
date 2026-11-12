@@ -69,8 +69,7 @@ musl `/init`。它从 `/work/tools.conf` 读取客体内编译器、汇编器绝
 依赖它的后续阶段。产物和目录均 `fsync`；宿主先重放 ext4 journal，再从
 两个独立镜像提取 `.i`、`.s`、`.o`、ELF 和程序输出，逐项比较 SHA-256、
 最终输出及文件系统检查。异常退出留下的 ext4 orphan 仅在严格核对修复项后
-按下次挂载语义清理；其他 fsck 修复仍使测试失败，细节见
-[离线工具链学习记录](../learning/offline-toolchain-probe.md)。版本字符串和目标文件存在本身不构成成功。
+按下次挂载语义清理；其他 fsck 修复仍使测试失败。版本字符串和目标文件存在本身不构成成功。
 
 `make test-offline-c-baseline-riscv` 是**诊断模式**：该镜像故意不安装客体编译器，
 同一 ELF 在两侧均应准确停在 `preprocess:exec:2`。它通过只说明探针可定位
@@ -89,7 +88,7 @@ runner 从同一稀疏 ext4 fixture 建立 Linux 与 BoarOS 的独立原始镜�
 复制时保留空洞，避免为零区分配和写入宿主空间；QEMU 启动前同步 fixture
 与各副本，使镜像准备的写回成本单独计入准备阶段。预同步不代替客体块驱动
 当前30秒的有限请求期限，也不改变镜像内容、后续 journal 重放及产物比较
-规则。runner 记录副本的逻辑/占用字节和复制同步耗时供 CI 诊断，不设墙钟
+规则。runner 记录副本的逻辑/占用字节和复制同步耗时供本次诊断，不设墙钟
 性能门槛。
 
 | APK 包名 | 固定版本 | `.PKGINFO` 许可 |
@@ -185,14 +184,13 @@ Linux 环境准备失败使该例成为无效参考；BoarOS 缺能力的诊断�
 `reports.py` 校验上游 BusyBox/libc 脚本的完整有序断言，shell 退出码不足以证明通过。
 只有参考有效且双方退出状态、完整原始输出一致才记为 `pass`。suite 的 `complete` 仅表示
 manifest 所有项目完成；清单本身不是必过测试。原始命令、日志、输出及失败案例磁盘保留；通过案例的磁盘可从固定输入和基础 fixture 重建。不能因
-环境或参考失败把 BoarOS 标为通过。具体固定输入及证据边界见
-[真实程序清单](../learning/user-program-inventory.md)。
+环境或参考失败把 BoarOS 标为通过。固定输入与分类规则由该清单维护。
 
 公共镜像提供RTC的10:135别名和根块节点252:0。原BusyBox包装器显式按全部逐项
 contract和wait status比较，保留原输出及raw_output_equal；日期、内核日志、PID和容量
 随系统变化，不能据字节不同虚构程序失败。其他案例默认字节比较不变。独立
 `busybox.environment`核对日志-r/-c/-n、真实RTC内容和df/statfs同客体一致性。
-分类证据及后续应用边界见[程序清单](../learning/user-program-inventory.md#当前基线与口径)。
+
 
 ## 原版 Lua 工程
 
@@ -207,7 +205,7 @@ contract和wait status比较，保留原输出及raw_output_equal；日期、内
 `--observe --only boaros`使用默认关闭的COST构建；输出只留忽略的build。
 程序、同步、根卸载分别计时，卸载使用已有ROOT_DRAIN_FIXTURE，不增加用户ABI。
 固定Linux的PID1退出以panic停机，不能把它等同于BoarOS的根卸载；离线检查先重放日志。
-输入与输出身份在机器清单校验，人类结果和解释归[离线工具链记录](../learning/offline-toolchain-probe.md)。
+输入与输出身份由机器清单校验。
 
 ## LA 与 RV 共用真实程序清单
 
@@ -235,7 +233,6 @@ python3 -B tests/userland/inventory/run.py --arch loongarch --reuse-builds --req
 开发工具另行验收；229个ID通过不证明所有BusyBox applet均能使用。
 
 `make prune-build` 删除 inventory/ABI/SQLite/RTC 和 GNU 运行目录、临时磁盘、旧探针
-及可重建的编译树；保留当前 UP/八核对象缓存、已安装的工具链与运行库、正在使用的
-QEMU，以及参考 Linux 的镜像、配置和身份记录。旧程序可按固定输入重新构建，
+及可重建的编译树；仅保留实际使用的已安装工具链/SDK与QEMU二进制及身份记录。内核对象、参考Linux和旧程序可按固定输入重新构建，
 不以被忽略的运行目录作为永久档案；活动 Git worktree 另行保护。
 `python3 -B tests/tools/test-prune-build.py` 独立保护这项缓存/运行产物选择契约。

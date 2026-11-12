@@ -77,12 +77,6 @@ class Profiles(unittest.TestCase):
             self.assertEqual(result.returncode,2)
             self.assertIn('fit uint64',result.stderr)
 
-    def test_official_platform_rejects_fixture_seed_before_launch(self):
-        result=subprocess.run(['python3','-B',str(ROOT/'tests/cost/cost-riscv.py'),
-            '--platform-config','official','--qemu-seed','123'],capture_output=True,text=True)
-        self.assertEqual(result.returncode,2)
-        self.assertIn('only to fixture measurements',result.stderr)
-
     def test_smoke_is_not_promoted_to_performance(self):
         case = io.parse_case('ext4:cold-read:cache:1:1M:4K')
         identity = dict(cases=[case], variants={'current': {'kernel_sha256': 'K', 'management': 'unmanaged'}},

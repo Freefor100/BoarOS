@@ -64,24 +64,20 @@ PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不�
 
 当前新 mount 与基础 `MS_REMOUNT` 接受 `MS_RDONLY/MS_NOSUID/MS_NODEV/MS_NOEXEC/MS_SILENT`及atime策略，`MS_BIND` 与 `MS_BIND|MS_REC` 复用实例，`MS_REMOUNT|MS_BIND` 更新单个视图属性，`MS_MOVE` 移动既有挂载连接；umount2 接受 flags=0、`MNT_DETACH`、`UMOUNT_NOFOLLOW`及后两者组合；进程根所属挂载的普通卸载尝试转为 RO；目标仍须是实际挂载根，chroot子目录本身的卸载返回 `EINVAL`，无 parent 的全局根对 `MNT_DETACH` 返回 `EINVAL`。重配置的写入者、映射、同步和失败所有权见[VFS 模块](modules/vfs-ext4.md)。
 NOEXEC在最终挂载的执行打开、access及文件映射上执行；NODEV限制新的设备路径打开和块设备挂载源，已打开对象保留原权利。
-基础与扩展边界见 [VFS](modules/vfs-ext4.md)及[挂载学习记录](learning/memory-backed-mounts.md#基础挂载与扩展操作的边界)。
+基础与扩展边界见 [VFS](modules/vfs-ext4.md)。
 
-## 已知成本与未关闭现场
+## 当前性能边界
 
-重复查询、扫描、复制和不合理的等待归属可从实际调用链判断；吞吐、开销占比和尾延迟由相关负载比较。
-不据微实验或计数直接承诺应用加速，也不先加大网络窗口、设备队列或更换调度算法。
+下列是当前实现仍存在的共享范围。历史单轮百分比和旧候选矩阵留在 Git 历史；不能把它们当成当前版本的开销。
 
-| 项目 | 已有事实与剩余问题 | 证据 |
+| 部分 | 仍需处理的实际工作 | 当前机制 |
 |---|---|---|
-| allocator 与批量 MM 成本 | 森林13.6%–22.4%、raw互斥6.0%–7.3%、等待交接的默认匿名新增2.5%–4.0%分别测量；后台提交/退出交错与批量MM的IRQ尾延迟仍有成本 | [森林](learning/cost-baseline.md#buddy-森林匹配时间2026-10-09)、[raw 对照](learning/cost-baseline.md#allocator-短锁的匹配时间)、[等待交接](learning/cost-baseline.md#等待交接的匹配时间) |
-| 普通文件逐页管理与stdio成本 | 同规格原版iozone仍有RV／LA吞吐差距；小记录stdio的描述符导入、多目的区用户借用及库内复制分别产生开销。物理引用合批候选未通过单核性能检查，当前保留逐页引用实现 | [读取机制](modules/vfs-ext4.md#缓存版本内的批量读)；对照结果由兼容分支现有数据路径报告维护 |
-| 共享调度域短窗口 | 4KiB复制唤醒与32等待者OFD的正式成本仍未决，归因已停止；保留数据，不追加诊断，不作为RV两核规划前置项 | [匹配时间](learning/cost-baseline.md#共享调度域的匹配时间) |
-| 文件后端执行与剩余串行范围 | 范围写回已按窗口续批，fsync由调用者等待固定目标；ext4 冷读和 mmap 冷页在调用 CPU 装入；已打开文件的空间修改与 journal 接纳在发起 CPU；ext4 目录、路径元数据与普通最终关闭在发起 CPU；多执行者 journal ext4 的不同目录/文件可并行准备，接纳和拓扑变更保留各自必要的互斥；挂载管理和后台数据写回仍在 CPU0；日志提交和 checkpoint 按在线核数选核 | [VFS](modules/vfs-ext4.md#后台写回与水位回收)、[RV执行位置](modules/riscv-smp.md#普通文件io的执行位置) |
-| GDT timestamp-touch 候选 | 隔离候选消除了干净 GDT 的 undo/restore 复制，但完整读取仍有负向观察，未进入 main | [时间戳研究](learning/file-timestamps.md) |
-| 网络端点与原生构建成本 | 端点队列与预约由跨核短锁保护，收发的用户复制和等待在调用 CPU；TCP 按连接归属核推进，UDP 与监听和建连控制仍在 CPU0；普通用户管道与 poll/epoll 等待在调用 CPU，控制与关联清理仍有CPU0边界。默认预算、同步/排空及Lua工程的剩余成本按对应负载检查 | [网络](learning/network-ownership.md)、[预算](learning/data-path-budget-experiments.md)、[工具链](learning/offline-toolchain-probe.md) |
-| 未归因现场 | 历史Virtqueue/页释放fatal/偶发取消、RV块统计case47及固定Linux LA终端等待，保留各自首个阶段与缺失证据；同类修复和重跑不关闭原事件 | [事故边界](learning/cost-baseline.md#旧版内存释放与-virtqueue-告警2026-10-02)、[程序证据](learning/user-program-inventory.md)、[块诊断](modules/riscv-virtio-block.md) |
+| 分配器与 MM | 物理页管理、共享 VMA/PTE 编辑及远程失效协调仍有共同保护；先按实际负载分开锁等待、页面分配和确认成本 | [物理页](modules/physical-pages.md)、[MM](modules/kernel-mm.md) |
+| 调度与等待 | 普通任务由每核队列维护，有期限等待、信号状态和实时/PI 仍有共同控制；独立对象和共享对象的交接成本应分别比较 | [调度](modules/kernel-scheduler.md) |
+| 文件 I/O | 逐页用户借用、稳定版本、共享缓存/LRU、后台写回和日志持久目标各有成本；读取、写入接纳与最终同步分别报告 | [VFS/ext4](modules/vfs-ext4.md)、[数据路径工具](learning/data-path-budget-experiments.md) |
+| 网络 | TCP 按连接归属核推进；端点状态、协议池以及 UDP/监听/建连控制仍有共享范围 | [网络](modules/kernel-network.md) |
 
-这些条目不是新执行计划；已有修复的过程与反例留在对应模块/learning，不重复列入待做。
+重复工作可由源码判断，时间占比和应用收益需要相同 ELF、输入与完成条件的比较。现用测量方法见[CPU 测量](learning/cpu-accounting-cost.md)和[数据路径工具](learning/data-path-budget-experiments.md)。
 
 ## 后续项目边界
 
@@ -98,5 +94,4 @@ OOM/设备错误与非法所有权 fatal 分开，预算终止不证明资源回
 
 通用修复先落 `main`，再单向集成至 `oscomp-compat`；比赛配置、原盘适配、监督与分数由兼容分支维护。
 完整 Harness 的剩余失败和未到达项不能算通过，也不由共同229项清单推导。
-托管 CI 状态见[CI 模块](modules/continuous-integration.md)，配置或本地成功不代替实际远程执行。
 发布、push、比赛提交与实板操作依照 [AGENTS.md](../AGENTS.md)由维护者决定。

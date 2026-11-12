@@ -93,15 +93,11 @@ make test-pthread-oom-loongarch # 两处 clone 构造 OOM、真实 pthread EAGAI
 make test-permissions-loongarch # 冷/驻留 EXEC 页、fork、uaccess 与改权对照
 ```
 
-契约 runner 使用 `kernel-contract-la`；普通根盘、网络和用户程序 runner 使用 `kernel-la`。共用生产源在 `COMMON_C_SOURCES` 维护一次，RV 的链接顺序为 CPU/锁、架构后端、其余通用代码；LA 直接组合共用源与自身架构源，不从含 RV 测试配置的列表排除条目。普通与契约产物共享通用对象，启动 main/root 与测试对象分开保存。编译配置记录编译器身份、全局宏和 flags，链接配置记录对象集合与 wrappers；同目录反向切换也会更新受影响产物，内容未变时保留缓存。`make test-build-config-host` 用实际 Make 规则检查这些切换与无变更构建。
+契约 runner 使用 `kernel-contract-la`；普通根盘、网络和用户程序 runner 使用 `kernel-la`。共用生产源在 `COMMON_C_SOURCES` 维护一次，RV 的链接顺序为 CPU/锁、架构后端、其余通用代码；LA 直接组合共用源与自身架构源，不从含 RV 测试配置的列表排除条目。普通与契约产物共享通用对象，启动 main/root 与测试对象分开保存。编译配置记录编译器身份、全局宏和 flags，链接配置记录对象集合与 wrappers；同目录反向切换也会更新受影响产物，内容未变时保留缓存。
 
-`prepare-la-tools` 从固定 QEMU 加本地 RTC 补丁构建派生模拟器；`prepare-la-original-tools`
-保留无补丁对照构建。`prepare-la-linux` 从固定 Linux defconfig 建立
-16 KiB/三级页表、initramfs 对照。缓存分别位于 `build/qemu-la-rtc`、`build/qemu-la`、
-`build/linux-la`、`build/loongarch`；身份变化时拒绝混用。`make prune-build`
-保留工具、对象、ELF 和身份，删除运行日志及 initramfs。`QEMU_LOONGARCH64` 和
-`LA_CROSS_COMPILE` 可覆盖工具位置，版本变化需要重新验收。
-RTC模拟器缓存命中时核对源码、补丁、subproject、编译器、配置、二进制内容/权限/链接及user-network能力，全部匹配后直接复用。宿主库版本更新导致旧`build.ninja`中的绝对路径不存在，不应让完整身份的可执行产物重新链接；实际加载失败仍明确返回错误。缓存反例入口为`make test-platform-profile-host`，内容、权限或来源变化仍拒绝混用。
+`prepare-la-tools` 从固定 QEMU 与 RTC 补丁构建派生模拟器，`QEMU_LOONGARCH64` 可指定实际使用的工具。缓存命中时核对固定源码版本、补丁、编译器、配置参数，以及可执行文件的内容、权限、链接和 user-network 能力。运行已生成的二进制不要求继续保留派生源码和对象；`--rebuild` 重新展开固定输入并构建，构建期间检查实际源码和依赖。
+
+`make prune-build` 只保留该模拟器的二进制与身份记录，以及已安装 SDK。参考 Linux、内核对象、运行盘及日志均可重建并默认清理；`prepare-la-linux` 等准备入口负责再次生成各自参考配置。`LA_CROSS_COMPILE` 可指定编译器，版本改变时须使用对应输入重新构建。
 
 内核物理装载地址为2MiB，高地址为缓存DMW的`0x9000000000200000`。
 开启分页前临时建立低地址DMW，跳到高地址后立即撤销；用户模式不可使用
@@ -154,18 +150,13 @@ rt_sigaction/rt_sigreturn 已接入共用信号策略和 LA 整数帧；布局�
 - 首阶段可信 idle 栈回收 13 个任务栈，实测最小余量 31,016 字节、最大使用 1,736 字节；编译器 2,066 条函数记录（含 fatal fixture）最大单帧 3,392 字节。单帧检查不证明完整调用链上界。
 
 本轮 RV allocator、MM/VMA、uaccess、context、scheduler、exec 及 `test-riscv`、
-真实静态/动态用户程序、五种固定 glibc 形态、1,344 条 ABI 差分、栈检查与 SQLite
-DELETE/WAL 恢复回归通过。上述结果不代表 LA 完整线程、信号、libc 或比赛 Harness。
-下一阶段 PCI→VirtIO 块→ext4→静态 musl 已由人批准，采用共用块核心与独立 MMIO/PCI transport；
-该阶段现已通过下述根盘与静态用户程序验收。SMP、实板与动态加载另行验收。
 
 固定依据为`references/qemu` v11.1.0，commit
 `84f07211cc5b4fc6a371559bf8a5de4fb068e648`的`hw/loongarch/boot.c`、
 `include/hw/loongarch/virt.h`和FDT生成代码。工具为本机
 `loongarch64-unknown-linux-gnu-gcc`15.1.0；内核使用LP64S、禁用浮点和LSX/LASX。
-QEMU从该固定源码在`build/qemu-la`构建，未引入新的产品依赖。
-Linux 对照 commit 为 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；CSR、PTE、
-refill 和 syscall 核对路径及调试经验见[LA 学习记录](../learning/loongarch-bringup.md)。
+实际 RTC 派生模拟器与缓存规则见本文的工具准备说明。
+Linux 对照与工具版本由 `references/sources.tsv` 统一维护。
 
 ## 第二阶段：PCI 块设备已验证
 

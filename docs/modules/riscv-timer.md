@@ -1,6 +1,6 @@
 # RISC-V Timer 与内核 Tick 模块
 
-本文描述当前 RISC-V 定时器、生产 timer trap 和架构无关 tick 计数的稳定接口。硬件机制、性能含义和项目选择见 [RISC-V 时间与周期 Tick 学习总结](../learning/riscv-time.md)，Trap Frame 与返回契约见 [RISC-V Trap 模块](riscv-trap.md)。
+本文描述当前 RISC-V 定时器、生产 timer trap 和架构无关 tick 计数的稳定接口。Trap Frame 与返回契约见 [RISC-V Trap 模块](riscv-trap.md)。
 
 ## 范围与入口
 
@@ -13,9 +13,7 @@
 | `arch/riscv/virt_rtc.c`、`include/arch/riscv/virt_rtc.h` | goldfish RTC 墙钟读取，供内核时间子系统捕获启动时刻 |
 | `kernel/tick.c`、`include/kernel/tick.h` | 维护 100 Hz 策略使用的 64 位累计 tick |
 | `kernel/main.c` | 在最终 Sv39/direct map 后初始化时间子系统，再初始化 scheduler、启动 timer 并进入 `wfi` idle |
-| `tests/riscv/timer_cases.c`、`tests/riscv/timer.sh` | 验证状态、deadline 数学、SBI 错误与真实 QEMU timer trap |
-| `tests/riscv/timer_boot.c` | 只在测试 ELF 中累计真实中断并于有限 tick 后关机 |
-| `tests/riscv/idle.sh` | 验证正常内核启动 timer 后持续 idle |
+| `tests/host/riscv_timer_events.c`、`tests/host/riscv_timer_events.py` | 在 TIME/SBI/IRQ 替身边界执行真实 timer 状态机 |
 
 通用 tick 接口为：
 
@@ -84,20 +82,15 @@ handler 此时保留下一周期 tick 和尚未到期的调度事件，重新设
 ## 验证与限制
 
 ```sh
-make test-dtb-riscv
-make test-timer-riscv
-make test-scheduler-riscv
-make test-user-riscv
-make test-idle-riscv
+make test-riscv-timer-host
 make test-riscv
 ```
 
-合成 DTB 覆盖缺失、错误位置、错误长度、零值、重复属性和失败输出不变。timer cases 覆盖全部启动状态，以及恰好到期、周期内迟到、跨周期迟到、无效输出和 `UINT64_MAX` 回绕。`test-riscv-timer-host` 在真实 handler 的 TIME/SBI/IRQ 边界控制输入，覆盖取消及替换期限后的晚到中断、零 tick、周期相位、固件失败和两 CPU 状态独立。真实 QEMU 测试使用实际 DTB、`time` CSR、OpenSBI TIME 和 Trap Frame 返回路径，至少两次返回 `wfi` 后由测试链接包装在第三个累计 tick 关机。无根盘的正常 `kernel-rv` 持续 idle；挂载生产根盘时，timer 调度 PID 1，退出后由根生命周期主动关机。
+`test-riscv-timer-host` 在真实 handler 的 TIME/SBI/IRQ 边界控制输入，覆盖取消及替换期限后的晚到中断、零 tick、周期相位、固件失败和两 CPU 状态独立。该宿主入口不执行真实 CSR 或 trap 汇编；客户机任务的中断与调度由真实 libc/pthread 和根启动路径执行。
 
 调度事件期限由当前CPU记录。IRQ关闭期间，相同的已确认事件不重复调用SBI；
 新期限仅在固件成功后发布，失败保留旧值。周期IRQ仍推进周期期限、清除到期事件并
-重装硬件，不能因事件值相同而跳过中断后的重装。timer cases另验证重复设置、失败后
-重试及IRQ保存/恢复；真实tick和预算抢占保护实际事件进展。
+重装硬件，不能因事件值相同而跳过中断后的重装。
 
 默认配置为单hart、固定100Hz周期策略和SBI TIME后端。独立[RV受控两核配置](riscv-smp.md)将period、下一tick和armed放入CPU记录，
 两侧各记本地运行，CPU0单独推进全局tick/期限与服务；IPI请求CPU0重装远端新增期限。

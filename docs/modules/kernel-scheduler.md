@@ -1,6 +1,6 @@
 # 内核调度、线程组与生命周期
 
-本文记录RV/LA默认单CPU的OTHER/FIFO/RR调度、线程组资源、clone/exec/wait和回收契约；独立RV/LA用户1～8核配置见[执行与服务边界](riscv-smp.md#真实用户态与cpu0业务交接)。背景见[线程组与 futex](../learning/threads-and-futex.md)，信号、文件资源、MM的稳定边界分别见对应模块文档。
+本文记录RV/LA默认单CPU的OTHER/FIFO/RR调度、线程组资源、clone/exec/wait和回收契约；独立RV/LA用户1～8核配置见[执行与服务边界](riscv-smp.md#真实用户态与cpu0业务交接)。信号、文件资源、MM的稳定边界分别见对应模块文档。
 
 ## 实现入口
 
@@ -45,7 +45,7 @@ RV、LA 用户多核共用同一调度器。每核 rank42 保护实际就绪队�
 | `fs/files/table.c`、`mm/heap.c`、`kernel/physical_page.c` | FD查找后实际I/O、内核堆及页借还 | 每FD表、heap及物理分配器各有自己的短锁；它们不是同一把调度锁 |
 | `kernel/block.c`、`drivers/virtio/block.c`、`arch/{riscv,loongarch}/` | 调用核提交块请求，本地timer/IPI与架构状态 | 每设备队列与完成状态协调，设备IRQ由CPU0处理；当前单virtqueue，FLUSH/RMW保持实际顺序 |
 
-真实多核用户执行由 `tests/smp/user.py`、`tests/loongarch/smp.py` 检查；共同固定工作量程序位于 `tests/cost/workloads/smp_scale.c`，管道、事件和网络消费者保留各自性能入口。按当前问题选择组合，核对总工作量、实际 affinity 和资源归还；周期定时器按迟到、累计次数和 CPU 评价。
+真实多核用户执行由 `tests/smp/user.py`、`tests/loongarch/smp.py` 检查；管道、事件和网络消费者保留各自性能入口。按当前问题选择组合，核对总工作量、实际 affinity 和资源归还；周期定时器按迟到、累计次数和 CPU 评价。
 
 同一消息链的先收后发、同一打开文件的位置、PIPE_BUF接纳、同一信号的单次消费，以及页表撤权和持久化顺序存在真实依赖。能够减少的是交接次数、临界段工作、重复状态查询和无关对象之间的排队。独立对象被一把全局业务锁绑定、整个操作迁移CPU0、反复获取同一资格，是实现边界，不是这些接口的必要语义。
 
@@ -149,8 +149,6 @@ FIFO yield和RR到期只轮转同级候选；未节流且没有同级竞争者�
 ready 策略直接选择下一任务。退出栈只切离，回收仍由 worker 或 join owner 在可信栈
 执行；不能强制返回 idle，使已经 ready 的 joiner 在 `wfi` 中等待下一次 timer。
 没有 cleanup worker 的模块 fixture 继续返回负责回收的 idle。
-`test-scheduler-cases-riscv` 在未启动 timer 时验证退出、join 和清理的连续进展，
-以及除启动 owner 所持 cleanup worker 外的页回到基线。
 
 全局预算配置默认 period=1,000,000us、runtime=950,000us，消费量和结算起点按CPU保存；仅运行中的 FIFO/RR 扣费，阻塞及 idle 不扣。周期补充不积累旧余额；runtime=-1 禁用节流，0 不允许运行 RT。控制更新在调度短锁内先结算各CPU在旧配置下的实际运行，校验 period>0、runtime>=-1 且 runtime<=period（-1除外）、两值均不超过 INT_MAXus。runtime 修改不清消费；相同 period 写入不重开周期，改变 period 时从当前时刻建立新长度但保留已消费值。proc 控件见 [procfs](procfs.md)。
 
@@ -163,7 +161,6 @@ IRQ关闭的短入口复用同一次CPU/current定位，借用在切换或可睡
 任务的`scheduling.priority`保存实际运行优先级，既有就绪/每核资格/CPU0服务与来源保留队列按这个值排序。继承期间才在任务尾部保存基础优先级；sched查询、RTPRIO授权和fork使用基础值，proc的priority展示实际值、rt_priority展示基础值。优先级变更在调度保护内重新发布相关队列，并原子发布实际优先级标量、请求目标CPU调度；实际优先级未变时保留FIFO位置。普通futex与waitv观察到实际优先级为零时，基础优先级也只能为零，直接登记FIFO；RT/PI情况仍在调度保护内读取基础值。MQ按实际优先级的单次快照登记，不读取PI基础字段。每核就绪与保留队列记录被提升的成员，存在此类持锁者时解除该核RT带宽节流，使其能释放锁。
 
 sched_setparam/setscheduler/getparam/getscheduler、priority_min/max、rr_get_interval 和 CPU0 affinity 使用真实任务状态；未发布 child 不可被按 TID 查询。BATCH/IDLE/DEADLINE/EXT 的 min/max 查询按固定 Linux 返回 0，设置这些策略仍显式拒绝。RESET_ON_FORK 在子任务清除并将继承的 RT 变为 OTHER；exec 保留执行线程的策略。RV 用户执行支持真实1～8核，亲和性与执行资格见 [RV SMP](riscv-smp.md)；nice 调度、cgroup 配额和 deadline scheduler另行实现。
-
 
 RTPRIO、RTTIME限额属于线程组共享的资源记录，普通fork复制、线程clone共享，exec保留。没有CAP_SYS_NICE时，调度修改先满足同属主规则；进入或切换RT策略要求目标组的RTPRIO软值非零，提升优先级可使用目标软值或保留已经取得的更高RT优先级。降低优先级和退出RT沿Linux规则处理；清除RESET_ON_FORK仍需CAP_SYS_NICE。资源数值不裁成99，实际FIFO/RR优先级范围仍为1～99。
 
@@ -257,7 +254,6 @@ PID1收尾另等退休存储owner全部归还，最后释放通知已登记的cl
 借用延后归还及trusted-stack资源基线。宿主模型不替代客户机多核。
 固定依据仍为`references/linux/kernel/pid.c`、`kernel/fork.c`、`kernel/exit.c`和`fs/exec.c`，
 commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；本实现保留临时PID引用对数字的owner。
-
 
 每个用户执行线程有独立 TID、FP/整数寄存器、signal mask、线程 pending、clear-child-tid、robust-list 注册地址、restart 状态、私有元数据页和独立的连续物理内核栈。组长承载 TGID、进程组、父子树、组 pending、退出通知、已回卷记账及进程资源限制。每个用户任务持有一个含 Linux 16 项限额的 `kernel_resource_limits` 引用；组内线程共享记录，普通 fork 在调度域下复制取值，exec 和非组长 exec 保留该记录。最后任务存储引用回收时在锁外释放，内核 worker 不分配限额记录。双向成员环包含组长容器；组长停止执行后仍留在环中，直到组结束或非组长 exec 接管身份。
 
@@ -359,7 +355,7 @@ BoarOS 的 PID 1 最终退出启动整机收口：cleanup worker 保存它的完
 释放之前继续服务；不强制卸载活引用，也不按 daemon 名称清理。只在关机阶段枚举
 现有任务表，等待仍复用 cleanup 队列，不轮询忙等。实际子进程、STOPPED、组长先
 退出与关机中 fork 的回归为 `python3 -B tests/riscv/root-shutdown.py`；先用通用
-`INIT_CONFIG=config/init.json` 构建。根因与旧基线反例见[收口记录](../learning/threads-and-futex.md#pid-1-关机与存活后台-owner2026-10-06)。
+`INIT_CONFIG=config/init.json` 构建。
 
 组长先退出进入 GROUP_DEAD，保留进程容器；普通成员资源清理成功后从组环移除并回卷时间。最后一个成员结束后，组长才成为唯一进程退出对象，向父进程产生一次 zombie/SIGCHLD。SIGCHLD 显式忽略或 NOCLDWAIT 的自动回收仍遵循信号模块契约。
 
@@ -401,13 +397,13 @@ LA生产任务也沿现有内核栈窗口接口运行：PGDH共享骨架持有�
 
 futex 的直接宿主入口 `make test-futex-host` 运行真实 MM、park、桶锁和原子操作，覆盖 4/16 KiB pin、MM gate 被另一执行者持有时 private 操作继续完成、关闭新许可后的等待与撤权、冷页和 COW、同桶/跨桶与同 key requeue、六种有符号比较、bitset、短链单次调度锁通知、同桶碰撞与 17 节点游标续批、PREPARED/COMMITTED 通知及 owner 归还；`tests/workloads/futex/caller.c` 可在 Linux 与两种架构上运行相同用户探针。
 
-聚焦入口为 `make test-stack-usage`、`make test-scheduler-cases-riscv`、`make test-scheduler-riscv`、`make test-files-riscv` 和 `make test-signal-riscv`；`make test-userland-riscv` 验证真实 pthread、共享匿名 futex、bitset 绝对 realtime 等待在 stop/continue 后保留掩码和截止时刻。`make test-diff-abi-riscv` 用同一 ELF 对照固定 Linux 的零掩码、超时、错误、按掩码唤醒和 requeue，以及共享文件别名、独立打开、硬链接、偏移隔离、SysV 和共享 robust 退出；`make test-glibc-riscv` 验证 glibc 2.44 的 `pthread_join` 消费路径。阶段收口使用 `make test-riscv`。各次实际通过范围以 README 和提交验证说明为准，不把实现路径存在等同于全部线程负载已验证。
+聚焦入口为 `make test-stack-usage test-files-riscv`；`make test-userland-riscv` 验证真实 pthread、共享匿名 futex、bitset 绝对 realtime 等待在 stop/continue 后保留掩码和截止时刻。`make test-diff-abi-riscv` 用同一 ELF 对照固定 Linux 的零掩码、超时、错误、按掩码唤醒和 requeue，以及共享文件别名、独立打开、硬链接、偏移隔离、SysV 和共享 robust 退出；`make test-glibc-riscv` 验证 glibc 2.44 的 `pthread_join` 消费路径。
 
 RV普通用户任务、共享匿名/文件MM及ext4文件操作支持真实1～8核，执行位置和后端并发范围见[多核模块](riscv-smp.md)。实时信号队列和sigaltstack已提供；PI条件重排与futex_waitv已接入；NUMA/MPOL等futex2扩展继续后续安排。LoongArch默认单核，`LA_SMP=1`支持QEMU virt上的真实1～8核执行，启动/IPI/TLB与停止规则见[LA模块](loongarch-boot.md#多核执行)；已覆盖整数context、timer抢占、信号、musl TLS/pthread、动态musl/DSO TLS、标量FPU与LSX/LASX。固定语义依据见学习总结的Linux commit与musl归档。
 
 活动普通文件/TCP I/O 的单页暂存由任务持有并跨调用复用：首次使用时分配，调用期间登记在任务的 `io_buffer`，正常调用完成只解除登记。正常回收与构造失败共用栈上请求清理：先结束 epoll、socket read/write reservation 和 TTY 请求，再解除暂存登记，随后才释放 MM/文件表和任务栈；常驻页在任务最终存储释放时归还。页释放错误遵循物理分配器 fatal 不变量，不进入历史 cleanup 重试链。
 
-`make test-sched-policy-host` 的系统调用夹具链接生产 affinity 实现，检查有效掩码、空交集、PID、长度与用户地址错误；该既有目标纳入宿主 CI。
+`make test-sched-policy-host` 的系统调用夹具链接生产 affinity 实现，检查有效掩码、空交集、PID、长度与用户地址错误。
 
 读写锁按 FIFO 交接，读者每 16 项释放 metadata raw，并在分段之间恢复调用者原本的 IRQ 状态；再次取得短保护后继续原来的边界。`handoff_owner` 保留交接资格，新读者不能越过已排队的 writer。调用者进入时已关闭 IRQ，则交接不会自行开启。FIFO 交接当前不实现优先级继承，RT 带宽预算也不传递锁依赖。
 
@@ -417,11 +413,11 @@ RV普通用户任务、共享匿名/文件MM及ext4文件操作支持真实1～8
 
 `kernel/sync.h` 的 mutex/RWlock guard 记录任务 io_context owner 与锁序，非法释放、递归误用、逆序及读转写触发 fatal。争用者按 FIFO 排队；释放时先给队首写者预留独占资格，或给连续队首读者预留共享资格，再定向唤醒。预留者尚未运行时也阻止新到任务抢占；排队写者后的读者及 try_read 不能越过队列。等待不可中断，信号退出在取得与释放后处理，栈上的等待记录不被提前销毁。只有队列/引用/状态发布使用短关中断区，持锁跨设备等待允许其他任务运行。分配器回收深度及 lwext4 重入深度属于任务上下文。
 
-外部IRQ的公共trap返回在S-mode仅允许空闲任务、且未持I/O锁时消费need_resched，防止中断在开中断与WFI之间已处理却继续入睡。这条限制不适用于既有timer调度：开启SIE的普通内核线程仍可在tick切换，持有I/O锁不等于禁止抢占。syscall进入时SIE关闭，但显式block/yield仍能切换；共享元数据必须有独立临界区和睡眠前引用，不能以单hart或持锁作为整段不可切换的证明。buddy/slab已补对应保护，见[物理页模块](physical-pages.md)。`test-scheduler-cases-riscv` 不借助 timer 验证 idle 返回调度，并验证读写 FIFO、后到者不抢锁及 1/8/32 等待者；原实现分别出现一次 idle 失败和两次交接顺序失败。成本锁持有时间包含资格已交接但获得者尚未运行的区间。
+外部IRQ的公共trap返回在S-mode仅允许空闲任务、且未持I/O锁时消费need_resched，防止中断在开中断与WFI之间已处理却继续入睡。这条限制不适用于既有timer调度：开启SIE的普通内核线程仍可在tick切换，持有I/O锁不等于禁止抢占。syscall进入时SIE关闭，但显式block/yield仍能切换；共享元数据必须有独立临界区和睡眠前引用，不能以单hart或持锁作为整段不可切换的证明。buddy/slab已补对应保护，见[物理页模块](physical-pages.md)。成本锁持有时间包含资格已交接但获得者尚未运行的区间。
 
 存储等待以 `interruptible=0` 登记：pending 信号与组退出不能拆除 DMA owner；设备完成或 reset 后原调用栈先释放资源，再在用户返回边界处理退出。指定的 cleanup task 排空已退出任务和 root-boot 收尾，阻塞时正常调度；idle/IRQ 不进入运行期可睡眠存储。无块设备的纯模块 fixture 可继续由 idle 回收不含存储的任务。清理结束检查任务锁/backend 状态均为空。
 
-`make test-scheduler-cases-riscv test-scheduler-riscv test-io-sleep-riscv test-userland-riscv` 保护 FIFO 资格交接、设备等待/唤醒与真实任务组合行为。
+`make test-io-sleep-riscv` 检查设备等待、唤醒与存储 owner 清理；`make test-userland-riscv` 运行真实 libc/pthread 任务组合。
 
 `make test-diff-abi-riscv` 的 `tid.*` 使用同一 ELF 对照固定 Linux，覆盖私有 fork、共享页但独立 MM、vfork 退出/成功与失败 exec、坏地址/只读地址、线程 futex 等待。成功 exec 与退出共用旧 MM 的注销和清 TID 顺序；延迟资源清理不增加活跃使用者数。
 
@@ -431,13 +427,9 @@ RV普通用户任务、共享匿名/文件MM及ext4文件操作支持真实1～8
 
 `kernel_thread_create_joinable()` 的调用者持有 join handle；被等待线程退出不向普通 completion 队列发布业务完成。`kernel_thread_join()` 等在途调用展开到 EXITED 后，从可信调用栈摘取并释放目标栈/metadata；清理任务也可安全等待，不依赖它自己稍后执行 reap。通用 reap 同样清空并唤醒 handle。页缓存 stop 先禁止新压力提交，唤醒并 join worker，再释放专用快照页。
 
-`test-scheduler-cases-riscv` 验证任务数、活动负载、空闲等待衰减及不可中断等待增长，末引用释放回到页基线；`test-io-sleep-riscv` 覆盖 worker 构造 OOM 与退出清理。
+`test-io-sleep-riscv` 覆盖 worker 构造 OOM 与退出清理。
 
-身份对象独立契约验证：`cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude tests/host/pid-object.c kernel/pid.c -o /tmp/boaros-pid-object-test && /tmp/boaros-pid-object-test`；覆盖角色转移、最后成员与 pin 分离、编号复用后的新代次、容量与代次耗尽回滚。调度组合验证沿用 `make test-scheduler-cases-riscv test-scheduler-riscv` 与 `make test-userland-riscv`。
-
-真实消费者的独立调用链诊断见 [session-consumers](../learning/session-consumers.md)：
-固定 BusyBox setsid/chrt/taskset、musl daemon 和原 iperf3/cyclictest，
-使用 QEMU 用户态 ecall 入口观察器，不修改原 ELF、不计分。
+身份对象独立契约验证：`cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude tests/host/pid-object.c kernel/pid.c -o /tmp/boaros-pid-object-test && /tmp/boaros-pid-object-test`；覆盖角色转移、最后成员与 pin 分离、编号复用后的新代次、容量与代次耗尽回滚。真实任务组合由 `make test-userland-riscv` 运行。
 
 默认关闭的成本观测见[成本模块](kernel-cost.md)。开启后在实际调度事件结算运行、blocked/ready
 时间及按rank的锁等待/持有、唤醒/重阻塞；标量48字节加内嵌guard16字节不持有新owner。
@@ -447,10 +439,6 @@ RV普通用户任务、共享匿名/文件MM及ext4文件操作支持真实1～8
 C4 另计 queue validation 次数、shape/thread检查、deadline到期处理数与最大单轮到期数、
 实际timeout数量、到期到下一次运行的直方图。到期时复用已有 blocked_start 标量存期限，
 调度后清除，不增加任务字节。timer计时在可能切换前收口，跨切换的暂停栈不成为诊断在途owner。
-`make test-cost-riscv COST_CASE=deadline` 固定4期限任务加0/32/128/256无期限blocked，
-pipe/proc状态双握手确认，覆盖同期限、提前信号、默认信号、取消和对象复用。
-到期处理数必须与timeout数量一致且不随无期限blocked总数增长；队列shape检查只查头尾，
-计数与索引弹出分开，不将它误报成全队列扫描。
 
 
 ## SMP前置的同步与等待契约（2026-10-09）

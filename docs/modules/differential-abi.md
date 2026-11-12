@@ -54,25 +54,6 @@ Linux PID 1 在完整输出后 sync 并 reboot poweroff；同一程序在 BoarOS
 fixture 内 `/dev/console` 是由 debugfs 创建的字符设备 inode，用于 Linux init
 标准流；无需宿主 root 或 loop mount。
 
-## 独立 Review 组合边界（2026-09-30）
-
-当前完整同 ELF 差分为 **1091 条匹配**。相对 Review 起点的 1031 条，
-新增 `shm.c` 的 key/size/flags 20 条、附件片段计数与固定替换 18 条、权限上限 8 条，
-`socket.c` 的跨向量整包/零消息/复制 fault/64 KiB 边界 9 条，以及 `signals.c` 的
-真实 SEGV MAPERR/ACCERR、BUS、ILL、TRAP 故障信息 5 条。
-来源 pin、OOM、取消及整次文件写竞争另由 scale、io-sleep 与真实 musl 回归保护，
-不把内部探针计入这 1091 条 ABI 记录。
-
-生产内核 SHA-256 `0c0c6a77f54160c06f284f19133b6bb6516f7c6e2d8dcb5f0864390ce1361fbb`，
-用户 ELF `b53026fb30cd2cbeb4f47f275d46b3a69832c1a2997f5a4a75b0c869cebf4668`，
-案例清单 `d730732c4add15275ccb0e9bd7cf35d398948f8af3692529f23de875e0707309`，
-Linux Image `01d60a8ae733f56aa94cf11b4805da1fe876cac09d2ef81e7e7397568ee1f668`。
-实际 QEMU 11.1.1；`make test-diff-abi-riscv` 使用正式默认预算退出 0，
-18 项宿主协议测试也通过。同一生产源码的 RV64 全套、四组合 io-sleep、scale 与
-栈检查通过，生产内核通过 musl 和 glibc 五种形态；当时完整比赛Harness因无
-`kernel-la`保持阻塞。当前LA指定单核矩阵已验收，见[LA模块](loongarch-boot.md)；
-原评测容器基线由oscomp-compat独立记录，历史1091条证据不变。
-
 ## 进程、随机与调度阶段（2026-09-29）
 
 该阶段完整同 ELF 差分为 **1000 条匹配**：本阶段新增 coarse clock 14、随机接口 34、
@@ -110,8 +91,8 @@ make test-diff-abi-riscv
 运行期间 `build/diff-abi/run/` 保存双方 raw logs、normalized records、`results.diff` 和
 包含内核、程序、fixture 哈希、工具版本及完整 QEMU 命令的 `metadata.json`。
 启动 Linux 构建前即快照 BoarOS 内核、测试 ELF 和案例清单，哈希及运行均使用
-该快照，避免并行构建改变输入。成功时删除运行镜像，失败保留三份初始/运行镜像。每次运行替换此目录；核对结果应记录固定输入和结论，本地核对完成后用 `make prune-build` 清理该目录。CI 使用独立 job、精确 Linux cache key，
-始终上传日志，失败时另传镜像。
+该快照，避免并行构建改变输入。成功时删除运行镜像，失败保留三份初始/运行镜像。每次运行替换此目录；核对结果应记录固定输入和结论，本地核对完成后用 `make prune-build` 清理该目录。参考 Linux 使用精确输入身份，
+本次日志保存在执行目录，失败时另保留镜像。
 
 宿主协议测试包含刻意错误返回值/errno、数据、size、offset、signal，缺失/重复
 结果和实际子进程 timeout/nonzero，确保比较器不会将未执行或不完整运行当作成功。

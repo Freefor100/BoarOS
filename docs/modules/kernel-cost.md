@@ -1,287 +1,38 @@
 # 成本观测模块
 
-`COST_DIAGNOSTICS=1` 在 `build/cost/riscv/` 构建观测版本，内核为
-`build/cost/kernel-rv`；`SMP=1 USER_SMP=1 COST_DIAGNOSTICS=1` 的两核版本独立构建在
-`build/cost-smp/`。默认关闭观测。C/assembly 同用 `BOAROS_COST_DIAGNOSTICS`，
-每个对象依赖只在配置改变时更新的 `generated/cost-config.h`，包括显式覆盖
-`BUILD_DIR` 的构建。关闭时宏为空，任务/VFS 节点布局无观测字段，proc 无观测节点。
+`COST_DIAGNOSTICS=1` 在实际业务边界记录工作次数、等待、运行时间与设备提交量，默认构建不生成这些采样。它用于解释开销归属；吞吐和延迟比较仍使用关闭诊断的内核。
 
-`kernel/cost.c` 保持固定聚合，`kernel/sched/cost.c` 连接时钟、任务关系和用户返回。
-诊断存储不持有任务、MM、inode 或 OFD 引用；任务仅有标量 epoch、运行/等待时间戳、
-在途深度及控制抑制状态（标量48字节）；任务内两个 backend guard 和四个内嵌资源请求 guard 各新增16字节，
-用户两核服务计时再加16字节，故任务字段总开销为单核144字节、用户两核160字节。
-原任务元数据页容量断言继续生效。
-热路径不分配、不打印、不睡眠。聚合由 COST 专用原子锁保护，同一 CPU 的递归深度先于
-IRQ observer 回调建立，退出时恢复原 SIE。它不取得调度域、files 或 VFS 锁；任务关系
-查询和 descriptor 判断在锁外完成。每 CPU 独立保存 trap/return 时间戳、IRQ 区间、
-递归深度和实际执行者借用，共136字节；任务迁移只迁移任务计数，IRQ 区间仍属于原 CPU。
-CPU 原有 service 计数另占40字节/CPU。用户两核注册表、固定聚合和这些 CPU 诊断字段
-随CPU容量和所选指标集按sizeof计算，编译上限96KiB，快照 `storage_bytes` 如实输出；
-每任务字段另列 `task_bytes`，不计入固定聚合。物理 IRQ 入口在等待聚合锁前保存传入的边界；结束窗口先结算旧 return 尾段，
-再裁剪当前关闭区间。聚合锁等待单列 observer，不重复累计同一物理 IRQ 区间。
-任务增量仍为用户两核160字节；完整 CPU 对象按实际布局包含这些字段和对齐。
-直方图保留全部65桶。
+## 构建与控制
 
-普通构建也不再为诊断单独读取设备服务时间、在途积分和发布阶段时钟；VirtIO 只保留
-完成请求、字节、队列占用等运行统计，以及真实期限所需的时钟。详细时长由同一
-`BOAROS_COST_DIAGNOSTICS` 开关启用。用户页解析复用 COST 计数，删除了每个解析
-片段都更新的独立全局原子计数；关闭诊断后不保留这项探针。
+RV 默认观测内核位于 `build/cost/kernel-rv`；USER_SMP 观测版本使用 `build/cost-smp<容量后缀>/`。C 与汇编共用 `BOAROS_COST_DIAGNOSTICS`，配置改变时由生成头文件使相关对象重新编译。任务诊断字段和固定聚合容量均由编译断言检查，实际大小随快照输出。
 
-仅观测版本提供 `/proc/boaros_cost_control`（完整 `begin\n`、`end\n`）及只读
-`/proc/boaros_cost`。开始在发起控制命令的线程返回用户态时激活，结束由同一发起线程的返回完成；
-其他 CPU 的用户返回不能代替它越过边界。结束在共享锁内检查真实在途数量，并结算
-所有 CPU 的运行片段和已开放 IRQ 片段，再允许读取固定快照；控制 fd 的完整
-read/write/readv/writev/定位读写在 dispatch 前识别并抑制自身计数。重复开始 EBUSY，
-状态/命令错误 EINVAL，其他控制组结束 EPERM，在途结束 EBUSY，均不清零原窗口。
-控制组退出中止窗口并标 incomplete。完整用户复制先于控制发布，坏指针 EFAULT。
-控制节点使用同 OFD offset 串行机制，但完整命令不受当前 offset 限制。
+观测内核提供 `/proc/boaros_cost_control` 和 `/proc/boaros_cost`：
 
-consumer 和 write 包装器允许同步已达到 durable、后台 checkpoint 尚在途的窗口：被测操作
-结束时先记录 `COST RESULT` 的时间边界；`end` 返回 EBUSY 时在用户态有界等待重试，
-最多十秒，并另报 `COST CLOSING name ns retries`。关闭等待属于快照覆盖区间，
-不能并入原操作延迟，也不能把原操作已成功解释成 checkpoint 已排空。双核 fixed metadata 同样复用这项有界关闭等待；其他受控
-case 的严格结束检查不变；内核的 EBUSY/inflight/complete 契约不放宽。
+- 向控制节点写入完整 `begin\n` 开始窗口，写入 `end\n` 结束窗口。开始和结束均在发起线程返回用户态的边界完成，其他核的返回不能代替它。
+- 窗口归发起线程组及其后代；fork/clone 继承窗口身份，exec 保留。后台执行者的工作另行归类，不能把写者线程的 CPU 时间当成全部内核成本。
+- 重复开始返回 EBUSY；其他控制组结束返回 EPERM；仍有在途操作时结束返回 EBUSY。调用者需等待实际操作结束，不能清零在途状态冒充完整窗口。
+- 控制组退出使窗口中止并标为 incomplete。控制命令先完成用户输入复制，再改变窗口状态；复制故障不会提交半条命令。
+- 快照在结束或中止后形成；运行时读取返回 EBUSY。生成文本、短读、seek 和用户输出故障沿 proc 快照机制处理。
 
-`contract` 程序打印最后的快照与通过标记后，先 `fflush` 再 `tcdrain`，确认
-TTY 输出队列排空才退出。仅清 libc 缓冲不足以阻止关机 raw 诊断插入 UART
-队列中的快照行；runner 保持严格解析，不删除损坏行或把部分快照当成有效结果。
+诊断对象只记录标量身份和计数，不另持有任务、MM、inode 或 OFD。聚合使用独立保护，热路径不分配、打印或休眠；每核保存陷入、中断和用户返回边界。普通构建仍保留业务本来需要的请求数、字节数和期限，不保留仅用于观测的时钟读取。
 
-窗口身份是递增 epoch，owner 是进程身份代次。开始覆盖控制线程组和当前后代；
-后续 fork/clone 继承 epoch，exec 保留。开始前已阻塞的成员操作重新登记在途数量，
-结束不得越过它；取消消耗本任务尚未离开的 scope，未回到的栈不成为永久诊断 owner。
-内核 fixture 直接调用同一 begin/end/format，必须传 DTB frequency，并以 mode=fixture 标记。
+## 快照与归因
 
-版本 1 快照是完整固定键值 schema，入口定义在 `include/kernel/cost.def`；每个 metric
-提供 unit/value/samples/max，耗时直方图另有 bucket.0–64。0 桶只含零，桶 i 含
-`[2^(i-1), 2^i-1]`；分位数只能报告区间。时钟单位为 CSR time ticks，timebase 来自 DTB，
-快照给出纳秒分辨率的分数，不把 QEMU 墙钟当硬实时界限。
-前台按成员 epoch 归属，其他工作属于后台，计数/直方图更新体另计 observer_ticks。
-operation_ticks 是包含睡眠和嵌套的墙上客体时间；run_ticks 在切换/返回时结算。
-两者不能相加；观察体 ticks 也只是包含在运行时间中的子集，未计入口/时钟读/恢复指令。
-C2 在真实 block/wake/ready/switch 路径分别结算阻塞墙上时间、就绪等待和运行时间；
-idle/cleanup 上下文单列 idle_ticks，不能解释成精确 WFI 驻留时间。
+指标及单位以 `include/kernel/cost.def` 为准，`tests/cost/cost_report.py` 按当前 schema 严格解析。完整字段集、唯一性、单位、直方图与状态不匹配时直接报错；旧实验格式通过对应 Git 版本读取，不在当前解析器中保留历史适配分支。
 
-快照只在完成/中止后格式化，由生成式 OFD 持有文本；运行窗口中读取返回 EBUSY。
-短读、fault 前缀及 rewind 沿用 proc 快照契约。文本分配或容量失败返回明确错误，
-不会改变被测操作的 errno、短写或清理结果。溢出饱和并置标记，报告验收拒绝它。
+| 内容 | 含义与使用限制 |
+|---|---|
+| operation / run / blocked / ready | 分别描述操作经过时间、任务运行、阻塞及就绪等待；操作可包含睡眠和嵌套区间，不能相加成整次墙钟 |
+| foreground / background / observer | 分别归属窗口成员、后台执行及观测体；observer 是运行开销的一部分，不能再次加到运行时间 |
+| IRQ、raw lock、端点与协议池保护 | 记录实际边界的取得、等待或持有；多任务累计值可以超过整次耗时 |
+| cache queue / execute | 区分请求入队至执行和 worker 执行区间；执行区间仍可包含锁或设备等待，不等于纯 CPU 时间 |
+| 用户复制、页解析、分配与缓存查询 | 描述实际工作量；字节、引用容量和物理页数不能相加作为驻留峰值 |
+| 设备字节与提交阶段 | 按提交身份记录请求量；ordered data、日志正文、commit 与 checkpoint 的具体分类以当前指标为准，请求完成不等于全部数据持久化 |
 
-验证入口：`make test-cost-host`、`make test-cost-riscv COST_CASE=contract`。
-后者串行运行三个独立启动副本，在启动前保存 kernel/ELF/fixture 身份与源码内容哈希。
-目前交付 contract/write/locking/mprotect/deadline/latency/consumer/readers/metadata/allocator/scheduler，
-`all` 不跳过缺项；consumer 不将未完成命令标为完成。独立报告读器拒绝缺项、重复、未知键、单位错误、旧 epoch、
-直方图不一致、incomplete 和 overflow。scheduler固定8192次yield、8192次带内容核对的管道往返，以及1024次创建/wait/让出执行；
-三个业务窗口共wait完成1026个child；预热child在计时外。元数据资源归还另由生命周期门禁和整次启动基线核对。
-各窗口时间必须为正；ON还要求真实IRQ和raw取得/持有样本。冻结ELF通过`--coordinator-elf`复用。
-当前 Python discovery 不收集带连字符的文件，
-因此 host target 直接运行 `python3 -B tests/cost/test-cost-report.py`，必须实际执行测试。
+时钟频率来自实际架构时钟，快照报告分辨率。耗时直方图有 65 桶：零值独立一桶，其余为二的幂区间；据此计算的分位数应报告区间。溢出饱和并设置标记，incomplete、overflow 或未排空的窗口不能用作完整对照。
 
-fixture匹配测量可显式传`--qemu-seed`（uint64且整个副本跨度不得溢出），副本i使用
-base+i，并在基线/候选/返回及ON/OFF间配对。默认不设置，official配置拒绝该选项。
-它固定QEMU的客体PRNG，包括生成DTB及reset时更新的`rng-seed`，不把不可信启动材料
-改成可信熵或伪造random ready，也不保证host crypto/外部RNG确定性。实际参数、种子
-和DTB哈希进入启动前seal；resume同时核对身份和argv，不能混入未设置种子的旧启动。
-固定依据为`references/qemu` commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`的
-`qemu-options.hx`、`hw/riscv/virt.c`和`hw/riscv/boot.c`；固定timebase仍不代表固定速度。
+## 当前消费者
 
-`--fixture-cache PATH`只用于上述allocator/latency/locking/scheduler单盘BoarOS fixture。
-首次在客体启动前封存完整镜像及case/ELF/长度/SHA身份，以整目录发布，随后各次启动
-复制为独立可写盘。缓存损坏或半发布明确失败，不重新生成后冒充命中。三个副本的初始
-内容相同，但实际root drive路径必须不同；fresh历史记录仍使用原校验规则。冻结模式及
-内容身份进入seal，resume不能通过漏传或新增cache选项改变前置状态。默认和official不变。
+存储和 TCP 使用 `tests/cost/io-budget-experiment.py`、`network-budget-experiment.py` 及实际业务程序；运行方式与完成条件见[数据路径实验工具](../learning/data-path-budget-experiments.md)。CPU、线程及定时器使用 `tests/cost/accounting/cost.py`，见[CPU 测量](../learning/cpu-accounting-cost.md)。早期独立校准器和一次性参数矩阵已删除。
 
-C1 进一步按 file/stream/dgram/other 记录 calls、requested/accepted、实际 usercopy、页解析、
-staging 累计请求容量、heap 请求字节和成功物理页。短写以实际接受前缀为准；同步尾部失败
-不会抹掉先前接受量。全局 heap/page 指标是实际 allocator 入口和成功结果，按本层单位记录，
-不能把 heap 字节、物理页及 staging 引用容量相加当驻留峰值。
-缓存计 bucket probes、实际复制、范围写回候选访问、实际脏区间快照与逻辑后端接受量。旧两轮全页链与整页快照的历史值保持原解释，当前算法访问较小的候选集合。
-CPU0缓存请求复用已有窗口计时，输出 `cache_queue_ns` 与 `cache_execute_ns` 的累计、次数、最大值和直方图，单位为纳秒。
-续批每次重新入队后分别计时。排队包含其他请求执行及调度等待；执行包含本窗口内部的锁等待和设备I/O，二者均不是纯CPU开销。
-数据记录在实际worker所属lane，归属不随其借用的调用者记账身份改变。默认构建不生成这两项采样操作。
-网络分别记录端点状态锁的 `network_state_wait_ticks/hold_ticks`，以及 lwIP 共享存储保护的
-`network_pool_wait_ticks/hold_ticks`。前者复用实际 raw guard 的时间，后者覆盖静态堆、
-memp 和 pbuf 引用等共用的保护段；均在释放真实锁后发布计数，不含之后的通知执行。
-`network_prepare_ticks` 覆盖 detached TCP 准备，`network_segment_alloc_ticks` 覆盖新段的
-pbuf 与 segment 分配，`network_copy_bytes/ticks` 覆盖向最终 pbuf 的向量复制，包含
-inline 和 detached 两种入口。准备时间包含其内部的分配与复制，分配时间也包含池锁等待，
-不能把这些嵌套时间相加。新观察点仅在有效窗口读取时钟；共享存储保留每 CPU 32 字节，
-不增加任务字段，默认构建不生成这些状态或采样。
-设备按 registry 的磁盘0/1/其他聚合；请求在 submit 保存标量 epoch/lane，IRQ 完成和 reset
-使用提交身份，旧请求不能污染新窗口。fixture 未登记设备属于 other；设备详细计时只在
-观测构建产生，用户页解析由 `COST_USER_RESOLUTIONS` 统一记录。
-提交路径按纯数据阶段、提交前正文、checkpoint metadata 与 journal superblock 设置标量 phase，设备按真实提交上下文归因。`device*_precommit_body` 包含同一阶段的 ordered data 与日志正文，不声称区分二者；commit 记录计入总写入。历史 `device*_journal_write` 由旧记录格式读取，不出现在当前诊断输出；其余字节继续归 unknown_read/unknown_write（含之后失败的请求）。请求字节不表示持久字节；后端逻辑数据不足以证明其他扇区分类。
-复制/解析和设备请求由 scale 的独立 wrapper/原统计交叉验证；三个副本及完整窗口由
-`tests/cost/cost_report.py` 的 `validate_replicas` 核对。C1 结果和开关开销见[成本基线](../learning/cost-baseline.md)。
-
-`tests/cost/cost-riscv.py --case metadata --metadata-fixed-only --metadata-parallel` 在同一个协调 ELF 中执行固定总工作量：双任务 stat/open 各总计4096次、rename总计2048次、追加总计16MiB，另保留既有目录负载。单客核时两个任务都在CPU0，双客核时分别固定CPU0/1；单任务在双核时固定CPU1。每个修改窗口在计时结束前完成对应文件或父目录的真实fsync，最后全局排空单列。
-
-fixture runner 的 `--host-vcpu-cpus 0,2 --host-io-cpu 4` 通过QMP暂停启动，核对真实vCPU线程、设置并读回亲和性后恢复；主线程及已有I/O线程留在I/O核，后续块I/O worker沿QEMU主线程创建规则继承。`--qemu-seed` 写入匹配身份；同一比较组使用同一ELF、工作量、输入和完成条件，before/control内核逐字节一致。正式耗时使用关闭诊断的内核，观测版本单独解释锁与日志经过时间。原格式记录按整行、字段集合和唯一性解析，尾随垃圾、重复字段或损坏的额外记录直接报错。
-
-QMP 的 cpu-index 标识虚拟硬件 CPU，BoarOS 的逻辑 CPU0 则是 OpenSBI 选出的 boot hart。需要比较 CPU0 协议等固定职责时，`pin_qemu_threads` 可同时接收 RV 内核 ELF 和 GDB socket：在物理 kernel_main 入口核对 mhartid、a0 和 boot_cpu，删除断点并断开调试器，确认客机保持暂停，再按逻辑 CPU 顺序绑定宿主核后续跑。该入口早于 secondary 和用户任务启动。GDB 或映射校验失败时，QMP 停止并确认暂停后传播错误，调用者负责终止 QEMU。未提供这两个参数的调用沿用物理 CPU 顺序。 QMP绑定核对QEMU自身线程；其余宿主任务需在真实宿主PID视图中取得并恢复亲和性，记录PID namespace及proc1身份，避免只枚举runner子进程。对照同时保存CPU活动、IRQ、限温增量和vCPU硬件周期／CPU时间；固定内核control先检查运行条件。
-
-C2 按 rank 10/15/20/21/30/31/32/35/40/other 记录尝试、取得、阻塞、唤醒、重阻塞、取消及等待/持有直方图。
-资格等待包含 grant 前实际发生的诊断工作，按观察到的经过时间解释。
-等待止于 metadata 资格中实际授予 writer/readers 的时刻，持有由该 grant 开始、
-在实际撤销资格时结束；随后等待诊断发布不能改变这两个边界。排队者从授予预留起
-计入占用，恢复运行延迟不再计入资格等待。释放后的定点 scope 提交仍消费真实在途登记。
-持有 scope 参与在途计量，guard 只新增开始时刻和登记标量，不持有诊断任务引用。
-独立假时钟测试区分前台运行20 ticks、后台运行890 ticks、前台睡眠880 ticks和就绪10 ticks。
-低内存 io-sleep fixture 使用相同接口输出 pressure-io/timeout-cancel，完成后才分配快照；
-名称/单位使用字符数组，避免 fixture 关闭分页后解引用高半区绝对字符串指针。
-真实 U-mode 的13个 locking窗口检查同/独立OFD、同/不同inode、1/8/32等待者及双盘，
-覆盖冷映射输入、向量追加、O_SYNC和截断。U-mode取消阶段在write前撤销gate等待者；
-实际写入在途取消由低内存io-sleep的operation_mode=3保护。四种设备配置各三次 fixture 启动验证清理。
-
-C3 计数覆盖外围VMA查询/覆盖/权限/数组编辑/合并/recount、resident遍历和实际PTE/TLB，
-prepare/commit/整次改权为嵌套墙上耗时，不能相加。聚合上限包括名称、单位、索引、锁映射表和 CPU 本地状态。
-
-C5 使用每 CPU 独立状态跟踪实际SIE转换，嵌套不重起，切换不截断；采样段及明确盲区见成本基线。
-trap保存t0/t1后首采样，sret恢复其他寄存器后发布尾stamp，下一安全入口聚合。
-C save/restore、trampoline、timer启动、idle/trap/sret均接入；诊断原始临界区单列observer。
-wake_to_run只含实际wake，ready_ticks另含创建/yield等就绪。关闭后C/ASM都无新增指令。
-
-C6 使用固定原镜像的ELF/脚本/依赖，逐命令保存ELF、argv、cwd、真实wait status、
-诊断timeout与原stdout/stderr。解释器路径按原ELF安装，libc目录各自指定；不改ELF或uname。
-原脚本成功不作为原命令成功证据；wait=0、无timeout、原完成marker及未报告所选测试不可用四条件同时成立才记所选测试完成。另保留进程完成状态与拒绝原因。
-`--consumer-timeout-ms` 显式设置每命令客体预算（1000–3600000 ms，默认仍为180000）；
-配置写入启动前封存输入和fixture，同一协调ELF读取它并输出唯一预算header，Python核对一致性。
-宿主兜底预算按16条命令预算加120秒计算。放宽预算不会改变上述完成条件，
-新配置独立保存，不能覆盖旧180秒基线或冒充原评测3600秒总预算。
-原消费者的完成分类由 `tests/cost/cost_consumer.py` 按实际方法输出、退出和超时判定，
-输入与测量一致性由当前执行器和报告解析器维护。历史固定矩阵及归档结论见
-[成本报告](../learning/cost-baseline.md)，不作为当前执行器的额外成功条件。
-
-即时fixture begin为当前执行上下文初始化run/idle起点，end先结算最后一段；
-运行有效位与时间戳分开，时钟从0开始也不漏计。延期U-mode仍由用户返回边界启停。
-全局cancelled使用实际任务归属；回收重入导致的合法EMPTY仍计失败，不改变重入禁令。
-
-即时fixture还裁剪已开放IRQ区间的起点，并在end结算窗口内尾段；真实hart仍关闭时保留
-开放状态，后续enable不能污染已完成窗口。全局cancelled的单位是丢弃的在途scope深度，
-正常exit也可能贡献，不能解释成取消用户操作数；rank取消与原wait status分别报告。
-C4按握手确认的N+4个blocked成员检查扫描max下限，遗漏扫描或只计有期限任务都会失败。
-
-
-原版消费者定点归因可用 `--consumer-commands musl:0,musl:1,glibc:0,glibc:1`；部分集合的验收范围仅为该集合，不能替代完整八组。逐命令程序时间和排空时间分开保存；窗口关闭前包装器同步当前工作目录中的普通文件与目录。事务内存指标的 max 是按堆容量和 home buffer 保守计费的峰值，value 是每批峰值样本之和，不能当瞬时驻留量。
-
-设备请求保留观测标量的完成观察时刻，实际唤醒 owner 后记录同一请求从完成观察到 wake 返回、到原 submit 调用恢复的 ticks。`io_complete_to_ready` 是 wake 返回后的上界，`io_complete_to_resume` 包含 ready 等待与恢复后的少量记账；正常完成但设备返回错误的请求也可采样，错误另有计数，没有完成观察的 reset 路径不采样。batch 会合并唤醒，未实际 wake 的请求不在关联延迟子集中，不能与旧所有请求样本直接比较平均值。它们不保存任务引用；关闭构建无这些字段。S7 增加 checkpoint 耗时及三种等待原因后，固定聚合与声明预留为 65405 B，每任务仍为 64 B，均由快照输出和编译期断言核对。
-
-定点消费者启动可追加 `--consumer-sync`：同一启动中使用当前静态 musl 协调器执行四组固定 4KiB 热覆盖写，各 128 次，分别 O_SYNC/O_DSYNC/每次 fsync/每次 fdatasync，另核对读回内容。`--consumer-sync-only --linux --replicas 1` 只执行这些受控同步参考，不能称为原版 iozone 或完整消费者验收。原版八组 argv 不受该选项影响；同步窗口独立命名，计入本次新增窗口范围。
-
-`--coordinator-elf` 可直接复用先前封存的 consumer ELF，保证原消费者 ON/OFF 的协调二进制一致；执行器仍冻结它并记录实际哈希。该选项不与新增同步 probe 混用。短同步参考可另用 `--consumer-sync-only`；其窗口不计入原 iozone 成绩。
-
-当前快照可通过 `cost_report.parse` 检查 epoch、完成状态、单位和溢出；
-历史测量范围与开销见[成本报告](../learning/cost-baseline.md)。
-
-缓存纠错观测另计块缓存hit/miss/eviction/load_wait；hit表示取得已有缓冲引用，
-不保证内容已经有效，因此loading命中仍可等待。设备READ在实际发布处只按可证明的
-file_read/metadata_read/prepare_read归因，不能证明的仍为unknown。来源scope嵌套恢复，
-不改变既有OUT的data/journal/checkpoint/super分类。名称容量32字节，逐项编译断言；
-这13项无直方图指标共用本页开头的固定预算；历史182项schema继续可读。
-`--case readers`是统一起跑、每任务8MiB/1KiB的同/不同inode冷/热读诊断，
-全部工作者完成且内容/状态核对后结束，记录标量时间和字节，不保留对象引用。
-
-`--consumer-readers`在所选原消费者之后追加四个固定工作量窗口。同一协调ELF可用
-`--coordinator-elf`复用；consumer/readers镜像均预置五个8MiB文件，改变了原S9前置状态，
-因此只与相同前置文件、命令集合和协调ELF的旧版对照比较。独立readers记录逐任务
-统一放行、实际开始/完成时间、字节、校验值及成功退出；原程序停止规则另由固定源码解释。
-
-`ROOT_DRAIN_FIXTURE=1`仅用于独立构建目录，通过链接wrap测量内核卸载调用，默认构建
-无此钩子。boot先卸载子挂载、最后根挂载；保留全部成功记录，最后一项报告根盘剩余
-checkpoint与卸载清理时间。它不是全程checkpoint总耗时，也不包括调用前已停止worker的
-时间，不增加用户syscall。`--kernel-identity`核对外部构建二进制与源码身份；
-`--trace-read-lbas`保存QEMU实际读范围，范围是整个启动（含初始化/格式化读取），不能
-冒充窗口内重复读。`--resume-from`仅重解析身份匹配的完整旧日志，继续未执行副本，
-保留原输入seal；不会重新执行已完成程序来修正解析问题。
-
-缓存纠错匹配旧/新各3个OFF、各1个定点ON及各1个固定读OFF，共10启动、16快照。
-执行器的metric_schema及seal明确区分旧182/新195项；新schema热路径观测会明显
-扰动固定热读，成绩采用OFF。旧版外部构建的
-JSON指标表先规范化为受支持注册表，再做完整字段/epoch/溢出验证；不接受任意删项。
-程序、应用durable收尾、剩余内部卸载各自报告；有限收益和未唯一归因的历史分布保留，
-不把这10启动扩写为原八组全套或完整成本矩阵。
-
-`journal_prepare_ticks` 从外层操作成功 attach 计到接受前 detach，覆盖实际私有准备、
-解析及等待；嵌套操作不重复登记，失败准备也结算。每个活动操作在诊断构建中保存40字节
-scope，OFF 无该字段。`journal_record_prepare_ticks` 只计每次实际记录写视图的准备；
-`journal_publish_ticks` 计校验、合并和发布。三者是嵌套经过时间，不能相加当 CPU 时间。
-`journal_resource_retries` 计完整回滚后真实消费排序重放请求的次数；
-`journal_memory_retries` / `journal_log_retries` 只计调用者明确遇到配额/日志预约失败、
-完成回滚和回收等待后重新尝试的次数。真实 malloc 失败和磁盘 ENOSPC 不计作可回收重试。
-
-## 日志批次定点归因（2026-10-02）
-
-新增五项成功封口原因：operations、bytes、age、target、force。条件可以重叠，
-只能与组数对照，不能相加；operations仅用于旧策略对照，取消操作数阈值后为零。
-新增sealed/durable/checkpoint等待ticks，记录累计值、样本数与最大值；计时覆盖
-释放后端锁、阻塞到恢复取得锁的经过时间，不能当成CPU耗时或跨任务可加的总时间。
-旧195项registry仍明确可读，schema版本1不变；当前存储预算和任务开销见本页开头。
-关闭COST时没有这些诊断状态或采样代码。`make test-cost-host`保护接口、预算和解析。
-
-## 内存消费者的有限计时（2026-10-03）
-
-新增六项无直方图指标：heap_zero_bytes/ticks、heap_copy_bytes/ticks、
-uaccess_copy_bytes/ticks。它们只包围实际 calloc 清零、resize 搬迁和成功解析后的
-固定长度页内复制；公共 memcpy/memset 不采样，避免观测初始化递归。bytes 的值为
-实际累计字节，samples 是执行次数，max 是单次最大字节；对应 ticks 保存每次经过时间。
-采样前捕获 epoch/前后台身份，睡眠或切换后仍按该来源记账；不把经过时间称为独占
-CPU 时间。零字节成功执行可以有样本，失败准备不能伪造工作量。
-
-这些指标与其余注册表共用本页开头的固定预算；编译与快照均检查容量。追加前的
-完整203项 schema 继续可读，当时的209项必须齐全，版本1不变。关闭观测时没有新状态
-或指令。独立消费者 fixture 核对真实范围、失败边界、样本和时钟，而不是只测试
-公共内存函数。Lua 的一次定点窗口及候选未上线结论见
-[工具链记录](../learning/offline-toolchain-probe.md#内存操作的有限归因与未上线候选2026-10-03)。
-
-测量协调器的stdout经过TTY队列：`fflush`只清空libc缓冲，不能证明UART已发送完。
-输出最后一份快照后用`tcdrain`等待实际排空，再退出，避免关机raw日志插入快照尾部。
-损坏快照仍按严格格式拒绝；既有完整业务窗口可单独核验并注明观测范围，不能修补原始
-输出或把缺失的末窗口写成通过。
-
-增长指标 `resize_visits` / `resize_tail_pages` / `resize_alias_rearms` 区分缓存项访问、
-实际处理尾页及别名重新保护；哈希探测沿用 `cache_probes`。新指标追加在注册表尾部，
-解析器继续接受固定的旧完整 schema，缺字段不能当零。指标名按实际长度保存，
-聚合存储受本页开头的固定上限保护；测试约束这一公开预算，不绑定某个私有布局字节数。
-
-网络服务指标在版本 1 末尾追加，旧 schema 仍由报告器识别：服务批次、socket 工作单元、loopback 包、timer 回调、全局 registry 扫描、poll 查询及查询触发服务、带可执行工作睡眠次数。socket 工作单元含容量转交与到期重试，不能解释为唯一 socket 数；末项为睡前诊断谓词，正常应为零。没有新增对象引用或动态观测内存，聚合受同一固定上限保护。
-
-TCP admission 新增 `stream_admit_blocked`（预先无容量的尝试）、`stream_protocol_blocked`
-（复制后提交仍为 EAGAIN 的尝试）和 `stream_copy_blocked_bytes`（尚无进展时这些失败新复制的
-payload 字节）。阻塞调用可能有多次尝试，不能当作 syscall 次数；复用暂存后缀不再次计复制。
-现有 `stream_copy` 仍记录全部真实复制。指标在末尾追加，前一网络 schema 继续可读。
-
-
-## buddy元数据观测（2026-10-09）
-
-注册表末尾增加page_meta_checked、page_meta_written（逻辑记录）和allocator_meta_ticks
-（区间累计ticks/samples/max），均不带直方图。每次元数据区内局部累计，离开后一次
-原子提交三个计数；默认关闭，不持对象引用、不分配观测内存。计时不含压力回收与I/O
-等待。raw区间观测共用同一固定预算，旧223/226项完整registry仍可显式解析；缺少新
-指标标记不可用，不能填零，也不接受随意缺字段的快照。外部冻结kernel identity中的
-registry与二进制SHA必须匹配；同时声明两份registry时必须一致。
-
-`python3 -B tests/cost/cost-riscv.py --case allocator`执行1页×1024、64页×64、4096页×4
-的固定匿名映射、逐页零值/内容检查和撤映射。allocator及既有latency均支持
-`--coordinator-elf`冻结同一个ELF，`--kernel-identity`冻结构建身份，默认三次独立启动。
-allocator复用既有10秒异步关闭协议：实际工作计时先停止，checkpoint在途scope
-排空所需的关闭ns/retries另记；EBUSY不能被吞掉，超时继续失败。最终输出用真实
-fflush/tcdrain排空TTY，原始快照损坏仍拒绝。启动预算保持180秒。
-
-匹配旧/新/返回旧、ON/OFF共36次启动及负向结论见
-[学习记录](../learning/cost-baseline.md#buddy-森林匹配时间2026-10-09)。IRQ-off直方图与
-rank持锁/wake-to-run沿用RV观测；LA本轮仅功能和16KiB工作量门禁，没有声明LA时间验收。
-
-raw_wait_ticks记录轮询/原子获取区间（无争用获取也有样本），raw_hold_ticks记录取得后
-到释放前的区间；二者只记录累计ticks/samples/max，不增加直方图。默认关闭，guard仅
-存栈上tag与时间，不固定新owner；释放raw后集中提交。元数据计时从取得锁后开始，
-排除锁获取与压力/I/O。heap→page嵌套区间可能重叠，不能把raw_hold与meta时间相加当独占CPU时间。
-完整旧226项registry缺少这两项时标为不可用；任意缺字段或部分新增schema仍拒绝。
-
-## 测量执行与记录
-
-共享测量互斥在 `tests/cost_measurement.py`，QMP绑核在 `tests/qemu_thread_affinity.py`，
-种子和输入检查由 `tests/cost_seed.py` 与各执行器维护。按当前负载选择ELF、内核和工作量，
-正式计时关闭诊断；需要归因时另取短样本，不把诊断耗时当作性能结果。
-
-`make test-cost-tools-host` 检查当前报告解析、测量互斥及QMP线程身份，
-不启动客机。`make test-cost-host` 在这些检查之外验证实际观测代码；
-`tests/cost/cost-riscv.py` 负责受控程序的构建、启动与原始记录。
-固定历史版本和机器的成套实验不作为当前工具接口，其结果见[成本报告](../learning/cost-baseline.md)。
+各版本保持同一 ELF、输入、总工作量和同步完成条件，串行正式计时。诊断启动与正式时间分开；计数减少只能说明重复工作下降，应用收益由实际吞吐和延迟确认。当前线程亲和性、测量互斥和种子工具由现用执行器直接调用，不为旧实验保留第二套框架。

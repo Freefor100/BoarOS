@@ -186,8 +186,7 @@ epoll控制仍在CPU0，等待扫描和事件复制在发起CPU执行，详见[�
 ```sh
 make test-lwip-host test-lwip-reassembly-host test-ethernet-worker-host
 make test-network-riscv         # IPv6 UDP/TCP、双栈 accept，同一 ELF 对照 Linux
-make test-scale-riscv
-make test-syscall-riscv test-userland-riscv test-diff-abi-riscv test-stack-usage
+make test-userland-riscv test-diff-abi-riscv test-stack-usage
 python3 tests/userland/inventory/run.py --suite libc \
   --case libc.static.socket --case libc.dynamic.socket \
   --require-pass --output build/socket-program-check
@@ -197,11 +196,9 @@ python3 tests/userland/inventory/run.py --suite libc \
 每个配置的镜像/日志独立；result记录实际启动参数。RV official profile固定1GiB，
 冲突的显式RAM参数返回错误，不能忽略参数后给启动贴错标签。
 
-host 入口实测 UDP loopback、PCB 16 个用尽后第 17 个失败、全部释放和再分配，另在 `sndbuf>0` 时耗尽全局 TCP segment 池触发真实 `tcp_write ERR_MEM`，以及 TCP 握手/关闭后推进 200 秒协议计时、池用量回到基线。此前的 Linux/BoarOS 差分记录完全一致，包含 12 条新增 socketpair 差分记录，覆盖坏族、坏标志、坏协议、空指针、stream 双向读写、关闭 EOF、dgram 边界截断与 flags 校验。真实 pthread U-mode 另覆盖零长度 datagram、共享 socket 双读、阻塞读时 close/fd 复用、双读线程组 SIGKILL、全局池压力下错误可写事件及释放后写入进展。原版 hackbench 原 ELF 在 4 进程模式下传递消息并成功运行（Time: 0.014s），关机检查 `heap-live=0`。原版 libc-test `functional/socket.c` 的静态、动态直接 entry 用未改源码和同一 ELF 在双方通过；整合内核全量 228 项为 227 pass、1 BusyBox 包装失败，见[程序清单](../learning/user-program-inventory.md)。
+host 入口实测 UDP loopback、PCB 16 个用尽后第 17 个失败、全部释放和再分配，另在 `sndbuf>0` 时耗尽全局 TCP segment 池触发真实 `tcp_write ERR_MEM`，以及 TCP 握手/关闭后推进 200 秒协议计时、池用量回到基线。此前的 Linux/BoarOS 差分记录完全一致，包含 12 条新增 socketpair 差分记录，覆盖坏族、坏标志、坏协议、空指针、stream 双向读写、关闭 EOF、dgram 边界截断与 flags 校验。真实 pthread U-mode 另覆盖零长度 datagram、共享 socket 双读、阻塞读时 close/fd 复用、双读线程组 SIGKILL、全局池压力下错误可写事件及释放后写入进展。原版 libc-test `functional/socket.c` 的静态、动态 ELF 入口由程序清单 runner 运行，入口及结果规则见[程序环境](program-environment.md)。
 
 Linux ABI 依据本地 `references/linux/net/socket.c`、`net/ipv4/af_inet.c`、`fs/read_write.c`，固定 Linux v7.2；测试输入来自 `references/oscomp-testsuits` 固定 pre-2025 版本，精确身份在来源清单和机器归档。核对后运行 `make prune-build` 清理日志和镜像。
-
-规模回归补充 0/255/256/257/1500/4096/8192 字节 UDP 的三种入口、完整与不足容量、空 iovec、后继报文和跨页 fault；TCP 用错位缓冲与向量写累计传输 1 MiB，检查内容、非 256 字节接收和跨片段 fault 的字节守恒；`socketpair_scale`/`unix_datagram_budget` 及真实 pthread 补充 AF_UNIX 向量/跨页、零长度、按sndbuf的消息上限、整包 OOM、满队列阻塞/非阻塞、fault 无前缀、截断/接收 fault 后预算复用与取消；固定 Linux 差分累计 1086 条一致。`socketpair_scale` 覆盖 STREAM 全双工读写、对端关闭 EOF、写入关闭对端返回 EPIPE 以及 DGRAM 数据报截断边界。成本与边界见[单核规模回归](../learning/single-hart-scale.md)。
 
 本轮选项阶段接入 getpeername(205)、getsockopt(209)，以及 REUSEADDR、TYPE、
 ACCEPTCONN、ERROR、KEEPALIVE、收发预算/超时、TCP_NODELAY、TCP_MAXSEG 和
@@ -210,7 +207,7 @@ IPV6_V6ONLY。SO_ERROR 读取清除待观察错误，连接阶段 RST 返回 ECO
 固定 RV64 最小值分别为 4608/2304；不预分配。接收队列和 TCP 发送接受量执行
 预算，lwIP 窗口和全局池仍可更紧。UDP connect 设置/重置默认对端并由协议过滤。
 监听启用官方 backlog 计量：待 accept child 保留资格，accept/abort 归还。
-原版应用与完整组合的实测结论见学习记录；旧 glibc 使用兼容配置。
+旧 glibc 使用兼容配置。
 
 ## 流发送、整包与半关闭
 
@@ -240,7 +237,7 @@ reset 排队 child 在下次检查摘除。监听器的预算、超时和选项�
 同时设置实际 PCB。TIME_WAIT 在移交协议池前摘除所有堆回调；LAST_ACK 的
 ERR_CLSD 解除 PCB 借用。运行期 timer IRQ 只通知后台 owner；最后 OFD 关闭后的协议回收不依赖另一个用户 syscall。
 
-TCP refused-data 在接收内存不足时保留 pbuf 并登记重试，由任务上下文的有界服务处理接收堆归还或到期重试。scale 的独立堆包装器检查首次接收 OOM、IRQ 仅通知，以及显式服务后的成功接收。
+TCP refused-data 在接收内存不足时保留 pbuf 并登记重试，由任务上下文的有界服务处理接收堆归还或到期重试。
 UDP 分别记录显式地址与非零端口绑定，AF_UNSPEC 断开释放自动端口；TCP
 MSG_TRUNC 沿 reservation 消费而跳过 scratch/usercopy，UDP 和 UNIX 保持各自语义。
 
@@ -254,7 +251,6 @@ UDP 排队同时受每 socket 配额与共享协议堆约束。队列不能耗�
 `--workload content`，包括 16 MiB、五连接各 8 MiB、IPv6 UDP 一万次 64 字节
 请求响应。原 ELF 执行入口为 `tests/userland/network-consumers.py`，按原客户端参数、真实
 服务端 ready、逐项有效时间/接收量及 wait status 判定；原脚本退出零不替代传输。
-
 
 ## 原版应用与诊断入口
 
@@ -275,12 +271,7 @@ python3 -B tests/userland/network-consumers.py --only boaros --libc both --suite
 引用。TCP写入调用/字节为64位，lwIP包/错误计数为16位，会环绕，不能当作大流量
 窗口的完整总包数；pool用量和高水位是即时值。窗口仍使用已有 cost v1 schema，
 协议排队次数、park 次数、排队到完成的累计 ticks 与实际协议执行 ticks 分开记录；排队等待进一步分出入队至执行、完成至调用者恢复，两者包含调度和状态锁等待。多任务累计时间与墙钟分别解释，排队总量已包含执行部分。聚合存储沿用内核的编译期预算约束，默认构建没有新增诊断节点。观测影响吞吐，关闭
-观测的独立批次才是性能结果。此前纠错轮1179条ABI、完整RV64、真实musl/glibc 2.44、
-socket scale和栈检查通过；修复后的用户态契约覆盖reset、accept输出fault、
-TCP MSG_TRUNC、UDP自动端口释放，IRQ仅通知由独立heap包装器检查。
-
-结果与限制见[网络记录](../learning/network-ownership.md#原版网络应用交付2026-10-02)。
-该段是此前loopback验收；现已接入VirtIO-net；命名 AF_UNIX 的当前机制见上文，TCP_INFO 仍待实现，相关应用字段按实际验证范围解释。
+观测的独立批次才是性能结果。
 
 ## 接收状态纠错（2026-10-02）
 
@@ -308,11 +299,9 @@ peer关闭的类型对应错误、SIGKILL和内容守恒。相同ELF双侧运行
 标量及多iovec的TCP流发送共用有界页pin批次，正式游标只推进实际COPY接纳量；
 EAGAIN前归还pin，等待后重新准备未接纳输入，具体复制规则见[文件I/O](kernel-files.md)。
 非阻塞/fault/信号/期限仍返回已接受前缀；用户页不借用到 ACK。
-预算fixture的COST窗口独立核对全阻塞和部分发送各1000字节只有1000字节stream usercopy，
-旧全阻塞实现为2000字节。`--workload content`校验单TCP16MiB、五TCP各8MiB及UDP内容。
+`--workload content`校验单TCP16MiB、五TCP各8MiB及UDP内容。
 游标不跨系统调用保留内容。原iperf使用非阻塞socket，短写/EAGAIN后再次write仍可能
-重新处理未接纳输入；此前三次关闭观测的单TCP仅改善0.4%/2.2%，不宣称解决主要吞吐差距。
-结果、前台复制放大与代价见[本轮网络结果](../learning/network-ownership.md#本轮应用结果与剩余复制2026-10-02)。
+重新处理未接纳输入。
 
 实际阻塞接收等待使用`kernel_socket_receive_ready`，活动reservation始终未就绪；
 对外poll仍保留终止事件。HUP/ERR不能让第二读者绕过owner并空转。io-sleep fixture
@@ -332,22 +321,13 @@ reset确认；设备失败不等于DMA停止，TX在途owner与RX借用一律保
 已完成owner在worker归还。接口查询来自真实netif，DOWN撤下RUNNING。
 详细预算、寄存器、失败与验证命令见[网卡模块](riscv-virtio-net.md)。
 
-两种transport与两种libc的原wget/httpd均完成双向GET、CGI上传与文本POST。
-固定单/五TCP及UDP内容、压力下TCP进展、块/RNG混合IRQ、最终heap live=0已核对；
-完整1196 ABI、RV64、真实libc、scale和栈检查通过。TX 已用 indirect 表做零拷贝
-（每包最多两段镜像内 payload，其余回退复制），用户接收复制仍在；没有外部IPv6、
-DHCP/DNS/TLS或默认网关。结果、效率、
-程序与最终卸载计时边界见[真实网卡记录](../learning/network-ownership.md#真实-virtio-net-与宿主应用交付2026-10-02)。
+TX 使用 indirect 表借用每包最多两段镜像内 payload，其余回退复制，用户接收仍复制。外部应用测试入口见 `tests/userland/network-external.py`。当前没有外部 IPv6、DHCP/DNS/TLS 或默认网关。
 
 TX 的 SG 与复制回退在槽满时都登记 NIC 容量等待。无 indirect 特性或 pbuf 链
 不满足 SG 条件时，复制发送返回 `EAGAIN` 仍属于 NIC 槽不足，不能落入协议池
 等待。上述 `network_owner.py` 分别覆盖两种回退原因，冻结时钟、禁用包与 timer
 服务并确认协议池没有归还，仅通知 NIC 新容量就能重新输出实际 TCP 内容；
 该边界测试不把正常 timer 重传当作容量通知正确的证据。
-
-
-纯查询及预算回归位于 `tests/riscv/scale_main.c`：16 个无关 socket 下的 64 次 poll 没有协议调用；零/一单元服务遵守预算并最终交付完整内容。协议池回归冻结时钟且禁用包与 timer 服务，证明“空闲 segment 已有一个，再释放一个”足以恢复真正等待者。`make test-cache-growth-riscv` 的 COST 构建同时核对 poll 触发服务数和全局扫描数均为零；全局 registry 只用于 bind 冲突、销毁解绑与设备故障。重建与证据层次见[网络记录](../learning/network-ownership.md#纯就绪与有界协议服务2026-10-05)。
-
 
 ## TCP 发送接纳与复制（2026-10-05）
 
@@ -381,7 +361,6 @@ INET stream 的 write/writev/send/sendmsg 使用任务登记的 `kernel_socket_w
 跨页 fault 的提交片段大小是内部策略：本输入 Linux 未提交返回 EFAULT，BoarOS 返回已提交
 4096 字节，测试分别验证接收量与返回值，不能将该项写成逐值差分一致。
 
-scale 保护竞争 reservation、abort 归还及零容量下零页解析/零 stream usercopy；
 真实调度的 io-sleep 包装用户复制边界，覆盖保留 reservation 时关闭并复用 fd、并发 shutdown、
 用户页撤销后的 fault 和预算重取。它模型化可睡眠复制的交错，不宣称复现硬件缺页的具体时序。
 
@@ -396,12 +375,6 @@ TCP 的 27 组窗口/池/堆候选由 `BOAROS_LWIP_WINDOW_MSS`、`BOAROS_LWIP_PO
 控制流 tail 与固定输入约束见[预算实验](../learning/data-path-budget-experiments.md)，
 可运行候选不等于吞吐已经验收，默认值须依据匹配结果由人选择。
 
-`python3 -B tests/cost/network-budget-config.py` 独立验证无覆盖宏的生产默认 8/4/2，
-并显式覆盖全部 27 个候选，保留非法配置与统计计数宽度检查。
-`tests/cost/network-budget-selftest.py` 用临时头文件默认值漂移验证门禁会失败。
-
-阶段七已完成 TCP 27 组预算的发布筛选、30 项组合扩展与独立 COST 诊断；当时默认为 8/1/1。用户依据近池与 1/10 ms 结果批准改为 8/4/2，保留 8 MSS 和 32 PCB。历史默认的吞吐回退、全局池/堆饱和和 8/4/2 的有限负载收益保留在[实验报告](../learning/data-path-budget-experiments.md#正式匹配结果2026-10-06)，不重跑完整矩阵，也不将预算调整宣称为单连接吞吐保证。
-
 共用Ethernet的入口为`kernel_network_start(owner, heap, device, frequency)`。device
 由平台/root持有，网络层仅借用；NULL创建独立timer-only worker。正常停止先
 关闭工作接纳，把尚未执行的发送请求完成为 EIO，唤醒原调用者归还 pins，再 join。已经执行的 COPY 在同一协议资格内先完成；确认DMA停止后清理netif并归还TX/RX引用，再释放网络控制对象；
@@ -411,8 +384,7 @@ TCP 的 27 组窗口/池/堆候选由 `BOAROS_LWIP_WINDOW_MSS`、`BOAROS_LWIP_PO
 消息、坏用户页、sender关闭后读取、关闭peer的两次错误及各类型信号规则。
 LA的budget/sendfile/unix_sender均在Linux/BoarOS两种RAM检查实际退出和根基线；
 内部owner另由`tests/host/network_owner.py --case unix-sender --sanitize`验证两种
-关闭顺序，真实RV scale覆盖预留后的两处OOM、截断、接收fault及对端回收，pthread
-覆盖真实等待/取消。完整双架构/程序回归继续按整个LA能力计划收口。
+关闭顺序，pthread 用例覆盖真实等待与取消。
 
 `tests/workloads/network/unix_seqpacket.c`复用共同控制消息检查，另覆盖命名连接、记录边界、空记录/EOF、实际用户入口的来源名称、错误顺序、shutdown及等待。宿主network_owner中的SEQ记录、预约、SCM、pending child和shutdown专项检查真实引用与额度归还。
 

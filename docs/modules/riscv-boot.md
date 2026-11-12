@@ -1,6 +1,6 @@
 # RISC-V 启动模块
 
-本文描述当前代码的稳定事实。构建、地址空间、固件交接和项目选择的解释见 [RISC-V 启动学习总结](../learning/riscv-boot.md)，异常入口与返回契约见 [RISC-V Trap 模块](riscv-trap.md)，启动内存边界见 [DTB 与启动内存布局模块](dtb-memory.md)，分页切换见 [RISC-V Sv39 分页模块](riscv-sv39.md)，启动后的 timer/idle 契约见 [RISC-V Timer 与内核 Tick 模块](riscv-timer.md)。
+本文描述当前代码的稳定事实。异常入口与返回契约见 [RISC-V Trap 模块](riscv-trap.md)，启动内存边界见 [DTB 与启动内存布局模块](dtb-memory.md)，分页切换见 [RISC-V Sv39 分页模块](riscv-sv39.md)，启动后的 timer/idle 契约见 [RISC-V Timer 与内核 Tick 模块](riscv-timer.md)。
 
 ## 范围与入口
 
@@ -20,7 +20,6 @@
 | `arch/riscv/root_boot.c` | 从 DTB 发现的根块设备挂载 ext4、装载 `/init` 并收口 PID 1 生命周期 |
 | `arch/riscv/virt_uart.c` | QEMU `virt` NS16550A 轮询输出，以及最终页表生效后的高半区 MMIO 基址切换 |
 | `arch/riscv/sbi.c` | 通过 SBI Base/TIME/SRST 探测扩展、设置 timer 和请求关机 |
-| `tests/riscv/boot.sh`、`tests/riscv/idle.sh`、`tests/riscv/user.sh`、`tests/riscv/user-fatal.sh` | 验证 ELF/运行时地址契约、正常 idle、真实用户态返回与拒绝非法返回 |
 
 ## 入口契约与不变量
 
@@ -53,12 +52,7 @@ make run-riscv
 make test-riscv
 make test-sv39-riscv
 make test-sv39-fault-riscv
-make test-user-riscv
-make test-user-fatal-riscv
-make test-timer-riscv
-make test-idle-riscv
-make test-scheduler-riscv
 make debug-riscv
 ```
 
-`make test-riscv` 依次运行 DTB/布局、物理页、heap、VirtIO block、VFS/ext4、direct-map、Sv39、Trap、timer、scheduler、syscall、ELF 与生产根启动测试。通用完整启动在 512 MiB、1 GiB 与 16 GiB 下验证高 VMA/低物理装载、OpenSBI 传入的有效 DTB 指针、timebase、`satp.MODE=8`、页表/metadata 计数及 PC/SP/GP/`stvec`；它不对 QEMU 的 DTB 放置地址作跨配置相异性要求，也不再夹带无文件系统的占位块设备。根启动 runner 把独立静态 ELF 写入真实 ext4，要求 PID 1 执行、回收和关机；另一个 runner 要求无盘 `kernel-rv` 持续 idle。`make debug-riscv` 会在第一条 guest 指令前暂停，并在宿主 TCP 端口 1234 等待 GDB。
+`make test-riscv` 运行物理页、VirtIO block、VFS/ext4、Sv39、MM/VMA、用户复制、生产根启动及等待/调度生命周期测试。根启动 runner 把独立静态 ELF 写入真实 ext4，要求 PID 1 执行、回收和关机。`make debug-riscv` 会在第一条 guest 指令前暂停，并在宿主 TCP 端口 1234 等待 GDB。

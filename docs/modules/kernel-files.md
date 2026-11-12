@@ -477,8 +477,6 @@ filecap设置接受revision 2／3，revision 3的rootid=0查询为revision 2，�
 
 TCP 标量和向量写入共用有界用户页批次。取得接纳额度后，通常在协议保护外准备至多四个页引用和片段；RV 已迁入分片的连接最多准备九项，以覆盖未对齐的 32 KiB 回环窗口。同一用户页跨 iovec 复用引用，相邻片段在页内合并；已有引用时，后续缺页或 MM 编辑冲突先交付可用前缀，再归还页引用处理下一页。大批发送先把内容复制到最终 TCP 段，归还用户页后才取得分片接纳资格。小写入仍可填充已有 TCP 段的尾部。临时游标仅用于准备，实际接纳量决定正式游标推进；未接纳部分在等待后重新解析。一页输入的非连续片段超过批次上限时，复用同一工作区合并载荷；这条路径保留已复制但尚未接纳的尾部，直至实际接纳或调用结束。末批、窗口满或阻塞前推动出包；提前返回和退出也发送已接纳前缀。请求页不借给 TCP，协议保留 ACK 前的 COPY 版本。socket 接收直接从保活的 packet/pbuf 跨 iovec 复制到用户，AF_UNIX STREAM 直接填写最终队列块，INET UDP 直接填写最终 pbuf；datagram 保持整包 owner。pipe 保持自己的 ring 协议，console 保持小块暂存。普通文件的 offset、O_APPEND、定位写与同步错误观察规则不变；socket owner 细节见[网络模块](kernel-network.md)。
 
-`kernel_files_statistics.write_chunks` 记录普通文件的实际用户复制片段及 TCP/UNIX STREAM 的接纳批次，`read_chunks` 的 socket 项记录实际 packet 读取，不代表中转复制。`make test-scale-riscv` 用真实 VFS/MM/uaccess 验证对齐 1 MiB 文件写入的内容、部分失败和页解析；当前为 256 个片段、256 次用户页解析、1 MiB 用户复制、0 字节页缓存额外复制。页解析使用已有 COST 指标，普通构建不再更新独立的全局原子计数。这些数值描述复制量与工作次数，不代表吞吐倍数。
-
 ## 验证与限制
 
 `readv/writev` 的 8 项以内向量不分配导入缓冲；更长数组为完整输入快照分配至多 16 KiB 元数据，释放遵循堆不变量。数据仍直接从用户空间复制到 pipe 数据区，console 使用 64 字节暂存；目录条目在固定内核缓冲区中编码一次，再复制到用户空间，目录拆分没有引入转发层或额外数据复制。等待唤醒按实际事件队列通知，队列登记与任务状态由等待域保护。
@@ -502,7 +500,6 @@ TCP 标量和向量写入共用有界用户页批次。取得接纳额度后，�
 make test-uaccess-riscv
 make test-files-riscv
 make test-files-partial-write-riscv
-make test-syscall-riscv
 make test-exec-riscv
 make test-userland-riscv
 make test-diff-abi-riscv

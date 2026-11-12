@@ -100,8 +100,7 @@ python3 -B tests/userland/network-external.py --only linux --transport modern
 已完成 owner、不 abandon 在途引用；同一1514字节
 输入的custom路径零复制、回退路径精确复制1514字节，最后引用、OOM、控制余量
 及input失败回收均核对。边界模型不验证实际协议时钟或DMA。真实 TAP runner 在无特权 user/network namespace 内运行，
-不启用 vhost/offload、不设置网关，输出只留 build。应用、性能和最终资源证据见
-[网络学习记录](../learning/network-ownership.md)，当前收口状态见[开发路线](../goals.md)。
+不启用 vhost/offload、不设置网关，输出只留 build。应用入口见[网络模块](kernel-network.md)。
 
 协议依据固定 `references/qemu` v11.1.0 的 MMIO 与 virtio_net 标准头、
 `references/linux` v7.2 的 VirtIO-net 实现、`references/lwip` 2.2.1 的 Ethernet

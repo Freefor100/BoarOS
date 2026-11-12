@@ -1,6 +1,6 @@
 # VFS 与 ext4 模块
 
-本文描述当前根文件系统的稳定接口和 lwext4 私有适配。第三方版本与许可证见[第三方代码](../third-party.md)，存储知识见[存储与文件系统学习总结](../learning/storage-filesystems.md)。
+本文描述当前根文件系统的稳定接口和 lwext4 私有适配。第三方版本与许可证见[第三方代码](../third-party.md)。
 
 ## 通用边界
 
@@ -398,7 +398,7 @@ checkpoint积累到四组，或活动内存超过预算一半且实际回收者�
 
 提交屏障成功后，提交线程在挂载状态保护内摘下整条 ordered-data 队列并清空读取索引，锁外结束载荷借用，每16条数据记录将其控制对象合为一批归还。批次在一次预算保护内选择可复用对象，堆释放仍在保护外；实际归还后合并计量与额度通知，空闲池容量及最后读者规则不变。原提交组保留待归还计数，空间等待仍能找到这次提交；此前已持久化的其他组可以同时 checkpoint。归还结束才发布本组 durable 并交给 checkpoint。如果旧组的 checkpoint 在这期间发生错误，提交组保留恢复所需的元数据，返回该错误；已持久的 ordered-data 归还不影响之前已取得的读者引用。
 
-同步返回保证提交记录及其先决数据已经持久化。历史存储流水线及 SQLite 恢复结果见[2026-10-01 验收记录](../learning/cost-baseline.md#s9-存储流水线验收2026-10-01)。
+同步返回保证提交记录及其先决数据已经持久化。
 
 `make test-lwext4-group-host` 使用实际引擎与独立设备计数，覆盖 128 次时间修改只请求一次首组消费、嵌套 abort、后操作各预留点 OOM、提交期间同块新修改、冻结后禁止新分配、1/4 KiB 文件系统的 WRITE/FLUSH 失败与重启恢复。命名空间 worker 检查在实际等待登记后、park 前接纳首组，核对仅通知 commit、原 100 ms 期限与显式 fsync 不等待期限；暂停真实提交 owner 后再接纳下一组，原同步请求只等待其固定目标。新增交错检查把 checkpoint 停在实际 home write 内，后续真实 fsync 仍必须达到更晚的 durable 序号；
 双向注入另一路写入或 flush 失败，检查两个 owner 均保留，并逐边界断电、两次恢复及 fsck。
@@ -470,8 +470,7 @@ cookie 可以交给 `lseek`/`telldir`/`seekdir` 恢复。OFD 持有位置，所�
 从旧 EOF 后开始的写入只关闭旧 EOF 的非对齐尾页，清零旧 EOF 至本次写入起点的空洞，再发布长度；
 页对齐或同长度不访问 inode 页链，也不排空历史 cleanup。真正缩小仍在撤映射后
 处理越界页、尾页脏范围和 owner。该优化不改变私有 COW 副本，哈希探测与尾页
-实际别名工作单独计量。`make test-cache-growth-riscv` 在 COST 构建检查
-1/4/16/64 MiB × 1/4/64 KiB 写入的增长访问界及全文件内容，见[规模成本](../learning/single-hart-scale.md)。
+实际别名工作单独计量。
 `sh tests/host/page-cache-concurrency.sh append-snapshot` 检查同页 mmap 写借用期间的连续追加及覆盖越过 EOF、保留旧稳定版本、新尺寸、再次同步后的内容和最终资源归还。
 
 截断后端修改映射后，VFS 保持同一次 inode 写保护，发布实际 EOF、退休越界缓存页并完成尾页处理；不能先解锁再更新缓存，否则排队的写回仍会按旧 EOF 重建已删除的映射，扩展时读出旧内容。后端部分修改后报错时，也先发布实际尺寸与退休整页，再释放保护重取对应尾页资格；无变化失败保留原脏数据。`sh tests/host/page-cache-concurrency.sh truncate` 用明确握手让旧尾页写回排在后端截断之后，检查截零、部分截断及部分修改后 EIO 的前缀保留、扩展补零、资源归还和 `e2fsck -fn`，覆盖 4/16 KiB 页和 1/4 KiB 文件系统块。
@@ -676,18 +675,10 @@ Children 中位数为 80955.28 与 124837.63 KiB/s。此前单次 Parent 下降�
 只增加文件长度或 `fallocate` 留下的 unwritten extent 仍可能把初始化转换带入后续 flush。
 本地兼容分支运行器采用 `cp --reflink=never --sparse=never` 后 `fsync`，原盘内容和
 guest 测试不变。每份 4 GiB 工作镜像因此实际占用约 4 GiB，空间与准备时间计在运行前。
-结果解析由 `tests/cost/cost_consumer.py` 保留原值、完整子进程传输量与可推导区间，
-`tests/cost/test-cost-report.py` 覆盖提前停止、完整读取、零进度、缺失明细和打印舍入。
-
 
 完整冷覆盖及EOF后的新页先取得输入访问资格，在私有最终数据页完成复制，再于一次索引保护内发布ready+dirty；不建立无人需要等待的loading producer。来源游标只在成功接纳时推进，竞胜或暂不能接纳时保留原游标重试；已有页继续使用writer/mmap协议。部分页保留
 未修改内容，用户 fault 只接纳已经复制的前缀。元数据定位仍可能读取设备；
 普通 lwext4 部分写没有完整稳定块来源时也需要读取未修改内容。
-小范围同步测试用 64 MiB 文件的 16384 个实际常驻页：单页范围 1 次候选访问，
-3 个脏页全范围同步 3 次访问，16 个脏页中选一页仍 1 次；
-1 字节脏范围复制覆盖它的文件系统块，后端接纳量仍为 1 字节。
-规模准备采用稀疏零页，另独立验证第 0 页已存在且已同步的真实旧内容被完整覆盖。
-重建 `make test-scale-riscv test-cache-growth-riscv`；这是成本界验证，吞吐结果另行测量。
 
 `kernel_vfs_sync_range()` 分批交接目标范围的数据，再固定该 inode 的 full 同步目标；
 普通文件的 `kernel_vfs_sync()` 按 datasync 选择 full/data。同步写传入实际接纳前缀，
@@ -832,7 +823,7 @@ VFS 的错误发布和共享 OFD 错误游标消费另由实例任务短锁保�
 稀疏写调整旧 EOF 时，若已有用户 pin，遇到关闭页或活动 writer 返回 EBUSY；调用者归还来源后推进并结束 EOF 资格，再重新准备来源，避免携带 pin 等待需要排空该 pin 的 MM 编辑。
 `make test-write-target-host` 覆盖来源错位、整页覆盖、来源故障前缀、散布向量、共享 mmap 重叠、实际 MM 撤权交错及 resize 等待，并核对内容和借用归还。
 
-验证入口：`make test-io-sleep-riscv test-files-riscv test-files-partial-write-riscv test-lwext4-recovery-host`。设备握手、同页合并、快照、并发插入缓存页、最后 close/写回及完整恢复的证据见[可睡眠存储](../learning/sleepable-storage.md)。
+验证入口：`make test-io-sleep-riscv test-files-riscv test-files-partial-write-riscv test-lwext4-recovery-host`。
 
 `kernel_vfs_mknod_at` 在 namespace 锁内定位未存在的末级名字，普通文件、字符/块设备、FIFO 及 socket
 创建与 mode 设置放在同一个 lwext4 写事务内。失败回滚由原 mount/日志 owner 处理；
@@ -854,7 +845,6 @@ journal，tmpfs 使用相同的 VFS 身份规则。持有的 mount/inode 引用�
 loop 工作线程推进的是已经接纳的上层 I/O，免于重复接纳节流。这个执行性质不授予任何缓存工作区的所有权：写回调用使用自己传入的工作区，仅真实缓存执行者可以使用该缓存的预留工作区及后台忙页规则。独立的同步调用等待忙页完成，并保留自己的稳定版本。
 
 `BOAROS_PAGE_CACHE_BACKGROUND_PERCENT` 表示后台启动线占高线的比例，默认75，即总预算的9.375%（高线设为总物理内存的12.5%），前台仍在12.5%高线等待，后台沿5%低线停止。普通水位触发只发布压力工作，不使用逐次重脏都会唤醒的强制写回。物理余量充足时，额度受限的写入者在分配器组的共同进度队列登记，通知后台推进；稳定版本最后一个真实借用者归还、日志自有活动存储归还时直接通知该队列，不等待无关缓存批次或整轮降到低线。一批本地稳定版本的归还合并一次通知，dirty 转成仍被借用的 version 不发送容量归还通知。轮次结束仍不足，或处于物理内存恢复阶段、调用者本身就是cache执行者时，再走原有有界推进，保留实际错误处理。等待时只持文件操作资格，没有来源pin、entry或inode借用；登记后在缓存保护内重查额度、轮次与停止条件，覆盖归还先于登记的交错；资源归还通知只进入调度器等待队列，不反向取得缓存 mutex，因此可以在日志 STATE 与计量 raw 锁下执行。这样不会在dirty转成version、实际额度尚未归还时，让每次write反复排入一个竞争的小请求。接纳一批后仍需日志回收时，持实际所选inode引用等待已有封组、提交或checkpoint的最旧目标；普通额度压力保留尚未达到提交条件的running组继续合并，日志本身的大小、到龄和预算仍照常推进。物理余量低于回收目标线时，才允许为释放版本提前结束running组；不把dirty转成version误当成内存释放，也不把另一挂载的日志错误施加到当前调用者。
-
 
 `BOAROS_PAGE_CACHE_DIRTY_AGE=1` 默认启用五秒有限到龄回写。首次脏页为现有 worker 登记期限；到期推进一次有限脏页轮次，繁忙／错误数据保留并另设后续期限。最后脏页清除后取消期限。内存压力可以在缓存锁之外发布请求，因此 worker 登记等待后还会在发布者使用的组锁内复查，已有工作时直接撤销等待。该期限用于后台接纳，持久化完成仍由 fsync／同步目标及实际设备决定。
 
@@ -988,7 +978,6 @@ proc mounts 保留用户给出的磁盘来源名，并正确标识 tmpfs。
 独立 block_fault 设备计数和三个新生成的 journal 镜像，对比128次纯时间更新、
 4KiB热覆盖及组合操作；核对时间戳、读回内容及fsck。它测量后端请求数量，
 不经过VFS页缓存，不包含QEMU设备延迟，也不证明原iozone的CPU或总耗时占比。
-当前成本及可重建配置见[成本基线](../learning/cost-baseline.md)。
 
 `make test-journal-group-riscv` 在实际 IRQ 块 I/O 下验证 128 页内容、预算、100ms 期限、full/data 同步、truncate、unlink-but-open、最终卸载；观测构建亦检查后台来源明确的数据请求。`orphan_file` 的 slot 更新必须通过 `ext4_trans_block_get` 在修改前保留 undo/version，不能直接 get 后补记 dirty。
 
@@ -1010,7 +999,7 @@ proc mounts 保留用户给出的磁盘来源名，并正确标识 tmpfs。
 动态挂载仍由自己的source owner管理。公共程序镜像创建相应块节点，proc mount快照
 沿现有转义规则输出，原df根盘行与statfs容量/空闲/类型另做内容核对。
 
-COST 构建在成功封口时记录条件和 sealed/durable/checkpoint 等待时间；普通构建不做这些记录，重叠条件不能相加推导组数。历史 64 次操作封口策略及测量保存在[2026-10-02 对照记录](../learning/cost-baseline.md#版本量封口与socket纠错对照2026-10-02)，当前策略见上文事务说明。
+COST 构建在成功封口时记录条件和 sealed/durable/checkpoint 等待时间；普通构建不做这些记录，重叠条件不能相加推导组数。
 
 宿主组提交测试在固定时钟下检查：128 次同块修改不重复封口或分配组载荷；384 KiB 文件数据不会触发旧的 256 KiB 切组，继续写到 6 MiB 时由真实内存预算推动回收，全部内容正确。年龄在 100 ms 触发，封口 FIFO、近满盘复用、环绕、旧版本、OOM 和 WRITE/FLUSH 失败继续覆盖。追加分配的提交还检查两个 flush 的精确顺序，并在屏障失败后分别丢弃、撕裂和反序持久化提交记录，重启两次后核对文件长度、内容、时间戳及 e2fsck。
 
@@ -1027,22 +1016,6 @@ rank15整次操作锁、inode锁、缓存写回、尾页清零和跨MM失效沿�
 目录返回EISDIR，非普通节点EINVAL，负长度在访问pathname前EINVAL。
 权限及清特权按上文共同规则处理，包含同长度请求。共享外部 EA 块按引用计数
 复制或释放，失败只回滚本操作；日志、orphan和持久化顺序不变。
-
-## 元数据成本复建
-
-`tests/cost/cost-riscv.py --case metadata`复用既有统计，提供固定4096次stat/fstat/
-open窗口、2048次空文件创建删除，以及原lmbench的三种文件syscall和lat_fs、
-原iozone四进程(0,1)。open窗口逐次fstat校验身份，故包含校验成本；纯open/close
-成本由原lmbench对应项给出。路径持有与未持有分别测量，fstat本身必须持有fd。
-程序完成、显式同步和`ROOT_DRAIN_FIXTURE=1`的内部最终卸载分别记录。
-`--platform-config official`使用本地固定平台的1GiB、单hart、默认VirtIO、网卡和
-UTC RTC，不添加RNG；不是完整比赛Harness。原旧glibc使用兼容分支配置。
-关闭观测的重复启动与单次定点COST分别解释；原始输出和机器身份只进build。
-
-热路径查询与数据带宽应分开解释：弱path registry只共享仍活着的路径，普通分量仍先
-进行后端lookup；解析还使用有界临时缓冲。复用活inode减少后端owner准备，不消除整个
-路径遍历。定点计数按固定工作量核对；原lmbench自适应文件数，不能只比较整命令耗时。
-原旧glibc的完整metadata选择需要兼容分支内核，可通过`--kernel`指定，不改变main身份。
 
 ## devpts 节点与挂载
 
@@ -1064,10 +1037,9 @@ OFD 和控制终端保活配对，配对持有挂载 root/path 引用；挂载�
 
 双盘暂扣/错误隔离门禁由guest显式配置单字节控制终端，避免规范输入阻塞握手；
 `make test-multi-disk-io-riscv test-multi-disk-rt-riscv`覆盖原故障/重启和实时负载。
-runner超时保存token及guest/NBD边界现场，CI已接入原双盘目标，见[可睡眠存储](../learning/sleepable-storage.md)。
+runner 超时保存 token 及 guest/NBD 边界现场。
 正常及实时负载 runner 在进程退出后仍将 guest/NBD 管道读到 EOF，再检查退出状态、
-持久数据及回收基线；进程退出不意味着其输出管道已经读空。CI 归档退出状态 JSON。
-
+持久数据及回收基线；进程退出不意味着其输出管道已经读空。
 
 ## 缓存版本内的批量读
 
@@ -1189,12 +1161,10 @@ park 2,146–2,169 次。同核的重复计时可以稳定出现约 4% 差值，
 查询与对应的状态增减。成功与失败结果各在负责交付它们的位置写入，未增加锁、
 物理引用或数据复制。单页与多页继续复用同一需求读取和 SG 路径。
 
-
 深度至少 2 的 extent 树截断会修改非根内部索引；每次路径上移归还该引用前，必须
 通过 `ext4_ext_drop_refs` 重算已修改块的校验和。直接归还并清空块号会绕过最终
 checksum 更新，使下一轮合法查找返回 EUCLEAN。`make test-lwext4-deep-truncate-host`
 构造深层稀疏树，验证 1/4 KiB 文件系统部分截断、跨进程重启读回、截零和 e2fsck。
-
 
 ## 按需求装入反馈的有界顺序预读
 
@@ -1229,10 +1199,7 @@ inode read gate，复用 demand/full-overwrite 的 loading 页准备；已存在
 真实设备暂扣与取消由 `make test-io-sleep-riscv` 检查。
 
 SQLite NBD runner 的 marker 停机使用显式受控 cut：后端先冻结磁盘并确认退出零，
-再终止 guest，避免主动 kill 被误记成后端协议错误。默认及 RA8/WB8 的阶段七后
-完整 DELETE/WAL 恢复结果、未到达故障序号和输入身份见[最终恢复](../learning/record-lock-sqlite-recovery.md#数据路径最终恢复与宿主收口2026-10-06)。
-
-此前存储 20 组候选及 26 项扩展/同步负载使用当时的复制和提交结构比较，实验选择为 RA0/WB1；当前稳定版本向量与 SG 合批的机制见本文“当前成本边界”，旧结果不能直接代表新路径。RA8 改善所测顺序冷读、WB8 改善显式同步，但 WB8 在 64 MiB 缓存追加有回退；冷热、tmpfs、缓存完成与 durable 同步分列于[报告及每文件完成时间](../learning/data-path-budget-experiments.md#正式匹配结果2026-10-06)。
+再终止 guest，避免主动 kill 被误记成后端协议错误。
 
 ## 无metadata checksum的空索引目录（2026-10-07）
 

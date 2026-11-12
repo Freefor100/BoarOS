@@ -12,7 +12,6 @@
 | `kernel/syscall/shm.c` | 系统调用参数解码、用户指针有效性校验与 Linux ABI 返回值映射 |
 | `include/kernel/vma.h`、`mm/vma.c` | `KERNEL_VMA_KIND_SYSV_SHM` VMA 描述符定义与不合并（no-merge）约束 |
 | `include/kernel/mm.h`、`mm/mm.c` | `kernel_mm_shmat`/`kernel_mm_shmdt`、Sv39 共享按需缺页、fork 继承及 munmap/release 清理钩子 |
-| `tests/riscv/scale_main.c` | 裸机内核规模测试中的 SysV SHM 生命周期与多附加验证 |
 | `tests/diff-abi/shm.c` | 针对固定 Linux 参考内核的双侧差分 ABI 测试 |
 | `tests/userland/sysv_shm.h` | 真实 musl 用户态多进程 fork 与读写一致性验证 |
 
@@ -21,7 +20,7 @@
 1. **唯一段所有权与统一后备对象**：
    - 共享内存段使用 `struct kernel_memory_object` 提供物理页后备，与匿名共享映射基础设施完全统一，按需分配物理页。
    - 段所有权由内核段表统一管理，MM registry 持有后备对象引用；每次逻辑附加另有 `kernel_shm_attachment` owner，持有后备引用、固定 shmid 身份和原始起止地址。VMA 片段拥有 attachment 引用。
-   - `shmat` 给 MM registry 新取得的内存对象引用先由局部 owner 持有，再移动给 registry；分配或映射失败只消费临时 owner，不改变段表引用。`test-scale-riscv` 在附加元数据分配处注入 OOM，要求重试附加成功并最终回到资源基线。
+   - `shmat` 给 MM registry 新取得的内存对象引用先由局部 owner 持有，再移动给 registry；分配或映射失败只消费临时 owner，不改变段表引用。
 2. **段标识符与代次序列隔离**：
    - 最大段数量由 `KERNEL_SHMMNI`（128）固定。
    - `shmid = slot_index + seq * KERNEL_SHMMNI`。
@@ -59,7 +58,6 @@ SHM_LOCK/UNLOCK的真实UID账户、MEMLOCK和延迟归还见[MM模块](kernel-m
 
 ## 验证与回归
 
-- **裸机规模与生命周期测试**：`make test-scale-riscv` 覆盖 `IPC_PRIVATE` 分配、跨地址多 attach、读写数据比对、`IPC_STAT`、`IPC_RMID` 延迟销毁、命名 key 冲突与消除，并验证进程退出后 `physical_page_available == baseline` 零泄漏。
-- **Linux 差分 ABI 测试**：`make test-diff-abi-riscv` 覆盖 key/size/flags、片段计数/替换以及只读附件改权；截至权限上限阶段，1077 条全套记录与参考 Linux 内核一致。
+- **Linux 差分 ABI 测试**：`make test-diff-abi-riscv` 覆盖 key/size/flags、片段计数/替换以及只读附件改权。
 - **真实 musl U-mode 测试**：`make test-userland-riscv` 在真实 musl libc 运行环境下验证跨 fork 数据传递、`shmdt`、销毁后再次 attach 拒绝等完整场景。
 - **栈预算校验**：`make test-stack-usage` 确保所有新增函数均在栈安全边界内。

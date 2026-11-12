@@ -8,38 +8,9 @@ import shutil
 import tempfile
 
 
-def validate_resume_fixture(record, requested_sha256):
-    expected_mode = 'fresh' if requested_sha256 is None else 'frozen'
-    if record.get('fixture_mode', 'fresh') != expected_mode:
-        raise ValueError('resume fixture mode differs')
-    if expected_mode == 'frozen':
-        if (record.get('fixture_input_sha256') != requested_sha256 or
-                record.get('fixture_sha256') != requested_sha256):
-            raise ValueError('resume frozen fixture differs')
-    elif record.get('fixture_input_sha256') is not None:
-        raise ValueError('unexpected frozen fixture identity')
-
-
-def writable_root_path(record):
-    argv = record.get('argv', [])
-    roots = []
-    for index, argument in enumerate(argv):
-        if argument != '-drive' or index + 1 >= len(argv):
-            continue
-        fields = argv[index + 1].split(',')
-        if 'id=root' in fields:
-            files = [field[5:] for field in fields if field.startswith('file=')]
-            if len(files) != 1 or not files[0]:
-                raise ValueError('invalid frozen fixture drive')
-            roots.append(str(Path(files[0]).resolve()))
-    if len(roots) != 1:
-        raise ValueError('one writable root fixture required')
-    return roots[0]
-
-
 class FrozenFixture:
     def __init__(self, directory, case, elf_sha256, configuration=None):
-        if case not in ('allocator', 'latency', 'locking', 'scheduler', 'metadata', 'ipc-fds'):
+        if case != 'ipc-fds':
             raise ValueError('unsupported frozen fixture case')
         self.directory = Path(directory) / case
         self.case = case
@@ -74,8 +45,7 @@ class FrozenFixture:
         if self.directory.exists():
             raise ValueError('frozen fixture already published')
         self.directory.parent.mkdir(parents=True, exist_ok=True)
-        # Serial measurement lock excludes other publishers. Publish the image
-        # and identity together; failed preparation never becomes a cache hit.
+        # Publish bytes and identity together; failed preparation never becomes a cache hit.
         with tempfile.TemporaryDirectory(prefix='.fixture-', dir=self.directory.parent) as temporary:
             staging = Path(temporary) / 'published'; staging.mkdir()
             image = staging / 'root.img'

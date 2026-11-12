@@ -642,12 +642,7 @@ def boot(work, kernel, image, case, name, repetition, args, program_sha):
         if bodies:
             sys.path.insert(0, str(ROOT / 'tests'))
             from cost import cost_report
-            errors = []
-            for schema in cost_report.supported_schemas():
-                try:
-                    row['cost'] = cost_report.parse(bodies[0], 1, schema); break
-                except ValueError as error: errors.append(str(error))
-            else: raise RuntimeError('invalid cost snapshot: ' + errors[0])
+            row['cost'] = cost_report.parse(bodies[0], 1)
             memory = re.search(r'^IO MEM_AFTER BEGIN\n(.*?)^IO MEM_AFTER END$', text, re.M | re.S)
             row['memory_snapshot'] = memory.group(1) if memory else None
             peak = re.search(r'^IO MEM_PEAK BEGIN\n(.*?)^IO MEM_PEAK END$', text, re.M | re.S)

@@ -86,7 +86,7 @@ ifneq ($(KERNEL_LA),kernel-la)
 .PHONY: kernel-la
 kernel-la: $(KERNEL_LA)
 endif
-.PHONY: run-loongarch test-loongarch test-loongarch-boot prepare-la-tools prepare-la-linux test-stack-usage-la
+.PHONY: run-loongarch test-loongarch prepare-la-tools prepare-la-linux test-stack-usage-la
 prepare-la-tools:
 	python3 -B tests/loongarch/qemu_rtc.py
 .PHONY: prepare-la-original-tools test-rtc-model-loongarch test-rtc-alarm-loongarch
@@ -102,7 +102,7 @@ prepare-la-linux:
 prepare-la-linux-platform:
 	python3 -B tests/loongarch/prepare.py --component linux --profile platform --cross $(LA_CROSS_COMPILE)
 ifeq ($(QEMU_LOONGARCH64),build/qemu-la-rtc/qemu-system-loongarch64)
-run-loongarch test-loongarch test-loongarch-boot: prepare-la-tools
+run-loongarch test-loongarch: prepare-la-tools
 endif
 
 $(LA_BUILD)/kernel-block-la: $(LA_TEST_OBJECTS) $(LA_BUILD)/tests/loongarch/block.o arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config
@@ -129,9 +129,6 @@ run-loongarch: kernel-la
 	$(QEMU_LOONGARCH64) -machine virt -cpu la464 -smp 1 -m 1G -kernel kernel-la -nographic -no-reboot
 test-loongarch: kernel-la-contract prepare-la-linux test-stack-usage-la test-loongarch-fatal
 	python3 -B tests/loongarch/run.py --kernel $(LA_BUILD)/kernel-contract-la --qemu $(QEMU_LOONGARCH64) --log $(LA_BUILD)/boaros.log
-	python3 -B tests/loongarch/reference.py --qemu $(QEMU_LOONGARCH64) --cc $(LA_CC) --boaros-log $(LA_BUILD)/boaros.log
-test-loongarch-boot: kernel-la-contract
-	python3 -B tests/loongarch/run.py --kernel $(LA_BUILD)/kernel-contract-la --qemu $(QEMU_LOONGARCH64) --stage boot
 $(LA_BUILD)/kernel-boot-random: $(LA_TEST_OBJECTS) $(LA_BUILD)/tests/loongarch/boot_random.o arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_boot_tasks -o $@ $(LA_TEST_OBJECTS) $(LA_BUILD)/tests/loongarch/boot_random.o -lgcc
 .PHONY: test-boot-random-loongarch

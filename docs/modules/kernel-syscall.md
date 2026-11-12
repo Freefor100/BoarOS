@@ -2,7 +2,7 @@
 
 本文描述与架构 Trap Frame 解耦的系统调用语义接口。模块处理已经从用户寄存器复制出的请求、用户访问和所属子系统调用；RISC-V Trap 层负责 `a7/a0..a5` 转换、普通返回时的 `sepc` 推进、signal return 和 syscall restart，scheduler 负责退出、exec 提交与资源回收。
 
-RV 与 LA 的用户陷入先切换到任务内核栈并关闭中断。系统调用入口使用内核 TP 所属任务，核对陷入帧与当前 CPU 记录后直接传入分派器；不再为同一次查找额外保存和恢复中断状态。内核其他调用仍使用 `kernel_task_current()`，以处理切栈期间 CPU 已发布下一任务、当前栈仍属于旧任务的情况。成本对照见[CPU 成本](../learning/cpu-accounting-cost.md#用户陷入的调用者身份与文件查询)。
+RV 与 LA 的用户陷入先切换到任务内核栈并关闭中断。系统调用入口使用内核 TP 所属任务，核对陷入帧与当前 CPU 记录后直接传入分派器；不再为同一次查找额外保存和恢复中断状态。内核其他调用仍使用 `kernel_task_current()`，以处理切栈期间 CPU 已发布下一任务、当前栈仍属于旧任务的情况。
 
 ## 接口
 
@@ -95,7 +95,7 @@ LA的259仍返回`ENOSYS`。这些入口的直接消费者可用`python3 tests/u
 
 `make test-core-limit-abi-riscv test-core-limit-abi-loongarch test-capability-abi-riscv test-capability-abi-loongarch test-fsize-abi-riscv test-fsize-abi-loongarch`提供限额与capget的聚焦Linux对照；`make test-resource-limits-smp-riscv QEMU_RISCV_FIRMWARE=/absolute/fw_dynamic.bin`合并这些边界及CPU定时器，验证实际RV两核。
 
-`make test-selected-abi-riscv test-selected-abi-loongarch` 对本节的定位向量、错误顺序、时间输出、信号及嵌套 epoll 等边界运行同 ELF Linux 差分。`make test-syscall-riscv` 验证空指针失败原子性、`exit(93)`、`exit_group(94)`、`set_tid_address(96)`、raw `brk`、匿名/文件 mmap 参数、不可读文件映射的 `EACCES`、fd pin/失败释放、errno、munmap/mprotect 转发、内部 MM 状态升级、clone 参数分类和未知编号。`make test-signal-riscv` 验证信号 syscall、handler frame/sigreturn、默认动作和 syscall restart；`make test-uaccess-riscv` 与 `make test-files-riscv` 验证用户复制、页缓存、pipe 和映射所需的文件生命周期。`make test-mmap-riscv` 让真实 ext4 `/init` ELF 从 U-mode 完成 demand-zero、file-private COW、EOF/SIGBUS、PROT_NONE、fixed replace/noreplace、打洞/重填和释放；`make test-userland-riscv` 继续覆盖真实 musl 的 heap/fork/exec、文件访问模式、signal 和 pipe 生命周期。
+`make test-selected-abi-riscv test-selected-abi-loongarch` 使用同 ELF Linux 对照定位向量、错误顺序、时间输出、信号和嵌套 epoll。`make test-uaccess-riscv`、`make test-files-riscv` 检查实际用户复制和文件生命周期；`make test-mmap-riscv` 从真实 ext4 ELF 检查 demand-zero、私有 COW、EOF/SIGBUS、PROT_NONE、固定替换及打洞。`make test-userland-riscv` 运行真实 libc 的 heap/fork/exec、文件访问、信号及管道消费者。早期模拟 syscall 分派和首个用户程序夹具已由这些实际调用者替代。
 
 `tests/workloads/resource/sched_query.c` 用同一原生 ELF 检查调度查询的结构长度、参数宽度、错误顺序、输出前缀、每个可用 CPU 的亲和性与 `getcpu`、其他 TID 及退出生命周期、RESET_ON_FORK 和 PI 基础优先级。策略竞争中，握手及更新序号确认稳定窗口的完整结果；BoarOS 的每次竞争查询还必须返回同一份任务快照。固定 Linux 的 getter 只以 RCU 保护目标存活，逐字段读取与 setter 没有共用锁，跨越修改的结果允许组合两个输入的字段。线程 join 完成后，以有界等待检查 TID 从身份索引撤销，不能把 clear_child_tid 唤醒直接当作 PID 已消失。固定 Linux 对照的 RV/LA 配置均未启用 UCLAMP_TASK；宿主机可用 `--host-safe` 运行不修改实时策略的部分。
 
@@ -129,10 +129,7 @@ clone 的 child_tid/TLS 寄存器次序由适配层处理，信号 PC 与坏指�
 `ABI_PAGE_SIZE` 只决定目标页边界、映射/保护、管道槽和 tmpfs 页配额；文件块、扇区、
 4096 字节用户前缀、8192 字节消息和具体字符串解析用例保留原语义。
 
-当前共同 **1366 条**在 RV 的 Linux/BoarOS 和 LA 的 Linux/BoarOS、512 MiB/1 GiB
-均完整匹配。LA 每个程序只构建一次，四份完整 END/退出记录逐项比较；不是只比较
-同一 RAM，也不允许缺记录。runner 冻结程序与两内核，记录模拟器内容/权限/链接目标
-和各次启动参数，BoarOS 还需实际退出42与完整 root owner 释放。
+差分 runner 在每种架构上只构建一次程序，使用同一 ELF 对照 Linux 与 BoarOS。它核对完整退出记录、返回值、内容和副作用；BoarOS 另检查根任务退出和资源归还。输入、内核与实际 QEMU 命令随本次运行记录，不用历史条目数量代替当前检查。
 
 proc 测试在 clear_child_tid 后等待实际 nr_threads=1；线程组长的 held status OFD
 通过 lseek/re-read 等待真实 zombie 发布。固定 Linux 的 clear_child_tid 先于
@@ -141,5 +138,4 @@ exit_state 和最终 nr_threads 更新，不能把一个调度瞬间的 R/两线
 
 整体审查纠正了LA几处仍用4KiB指针偏移的fault夹具：UDP/TCP置于目标页尾2字节，
 null/zero置于尾4字节，sysctl置于尾1字节；预先断言实际EFAULT/partial4及失败
-offset不变，避免两侧都未触发fault时仍差分成功。修复后的1366条全量记录是当前
-口径，旧1366记录对这些边界的覆盖限制见[审查反例](../learning/loongarch-bringup.md#一次独立整体审查与集中修复2026-10-07)。
+offset不变，避免两侧都未触发fault时仍差分成功。夹具必须先断言预期页边界，避免两侧都未触发故障却被判为差分成功。

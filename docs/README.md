@@ -1,6 +1,6 @@
 # BoarOS 文档中心
 
-欢迎查阅 BoarOS 内核技术文档。本文档中心旨在系统化呈现 BoarOS 的系统架构、核心设计准则、子系统模块实现细节以及深度工程研究记录。
+本文索引当前架构、子系统接口、使用方法与设计原因。
 
 ---
 
@@ -12,7 +12,6 @@
 | **[设计与工程原则](design.md)** | 内核顶层设计哲学 | Linux ABI 兼容原则、内存与所有权模型、并发与锁策略、持久化边界 |
 | **[工具链与环境](toolchain.md)** | 交叉编译器与模拟器环境 | GCC 工具链版本、QEMU 模拟器环境、目标依赖准备指南 |
 | **[开发路线与能力现状](goals.md)** | 内核演进与功能支持 | 系统调用覆盖、应用生态支持、正在进行中的特性与已知瓶颈 |
-| **[持续集成与验证](modules/continuous-integration.md)** | 自动化测试与质量门禁 | 测试分层、真实 Linux 应用验证环境与测试入口 |
 | **[第三方组件说明](third-party.md)** | 依赖引入与开源许可 | 外部开源组件（lwIP、lwext4 等）的来源与授权协议 |
 
 ---
@@ -51,7 +50,6 @@
 ### 4. 任务、调度与同步
 - **[进程模型与 SMP 调度](modules/kernel-scheduler.md)**：Per-CPU 就绪队列、优先级时间片调度与进程状态流转。
 - **[任务生命周期与执行](modules/kernel-exec.md)**：ELF 装载、`execve` 提交与旧资源回收。
-- **[Futex 同步原语](learning/threads-and-futex.md)**：快速用户态互斥量、哈希等待队列与优先级继承。
 - **[POSIX 信号处理](modules/kernel-signal.md)**：信号产生、掩码屏蔽、信号递送与蹦床回跳（Trampoline）。
 - **[时钟与高精度定时器](modules/kernel-time.md)**：系统滴答时钟、软硬件定时器与 `nanosleep` / `clock_nanosleep`。
 - **[资源记账与限制](modules/kernel-accounting.md)**：`getrusage` 统计、时间片计算与进程资源限额（rlimit）。
@@ -74,33 +72,12 @@
 
 ---
 
-## 🔬 专题研究与深度分析
+## 专题契约与测量
 
-在 `docs/learning/` 目录下，记录了开发过程中的关键机制研究、真实应用适配经验与性能测量分析：
-
-- **体系结构与硬件交互**：
-  - [RISC-V 启动全流程解析](learning/riscv-boot.md)
-  - [Trap 异常与系统调用现场分析](learning/riscv-traps.md)
-  - [RISC-V 用户态隔离机制](learning/riscv-user-mode.md)
-  - [LoongArch 平台 Bringup 记录](learning/loongarch-bringup.md)
-- **并发、调度与性能基线**：
-  - [内核调度器演进与设计](learning/kernel-scheduling.md)
-  - [多核 SMP 任务交接与失效分析](learning/smp-handoff.md)
-  - [Futex 机制与多线程同步](learning/threads-and-futex.md)
-  - [CPU 资源记账与性能基准](learning/cpu-accounting-cost.md)
-  - [单核规模扩展与瓶颈排查](learning/single-hart-scale.md)
-- **存储、VFS 与持久化**：
-  - [存储子系统与文件系统架构](learning/storage-filesystems.md)
-  - [SQLite 记录锁与崩溃恢复测试](learning/record-lock-sqlite-recovery.md)
-  - [内存文件系统多挂载验证](learning/memory-backed-mounts.md)
-  - [文件时间戳精度与更新时机](learning/file-timestamps.md)
-- **I/O 多路复用与网络**：
-  - [I/O 多路复用机制演进](learning/io-multiplexing.md)
-  - [epoll 子系统深度解析](learning/epoll-subsystem.md)
-  - [网络对象所有权与多核并发模型](learning/network-ownership.md)
-  - [数据路径性能预算与吞吐调优](learning/data-path-budget-experiments.md)
-- **真实软件生态适配**：
-  - [真实程序清单、测试基准与已知兼容性](learning/user-program-inventory.md)
-  - [ELF 动态装载与重定位技术](learning/elf-loading.md)
-  - [客体内原生编译工具链探针](learning/offline-toolchain-probe.md)
-  - [原生 CI 运行环境配置](learning/ci-native-environment.md)
+- [epoll 对象与事件通知](learning/epoll-subsystem.md)：登记身份、图检查与通知关系。
+- [epoll 交付与取消](learning/epoll-delivery.md)：用户复制提交、扫描并发和对象寿命。
+- [文件时间戳](learning/file-timestamps.md)：Linux 更新时间、inode 编码与 I/O 错误语义。
+- [proc 控制文件](learning/proc-controls.md)：短读、seek、scatter fault 和配置提交。
+- [随机源](learning/random-source.md)：可信熵、输出所有权与字符设备协议。
+- [CPU 记账测量](learning/cpu-accounting-cost.md)：固定工作量、定时器状态和扩展性观察。
+- [数据路径实验工具](learning/data-path-budget-experiments.md)：存储、TCP 参数比较与完成条件。
