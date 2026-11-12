@@ -20,7 +20,7 @@
 | `arch/riscv/root_boot.c` | 从 DTB 发现的根块设备挂载 ext4、装载 `/init` 并收口 PID 1 生命周期 |
 | `arch/riscv/virt_uart.c` | QEMU `virt` NS16550A 轮询输出，以及最终页表生效后的高半区 MMIO 基址切换 |
 | `arch/riscv/sbi.c` | 通过 SBI Base/TIME/SRST 探测扩展、设置 timer 和请求关机 |
-| `tests/riscv/boot.sh`、`tests/riscv/idle.sh`、`tests/riscv/high-half-trap.sh`、`tests/riscv/no-identity.sh` | 验证 ELF/运行时地址契约、有限测试启动、正常 idle、高半区 trap 和最终低 RAM 失效 |
+| `tests/riscv/boot.sh`、`tests/riscv/idle.sh`、`tests/riscv/user.sh`、`tests/riscv/user-fatal.sh` | 验证 ELF/运行时地址契约、正常 idle、真实用户态返回与拒绝非法返回 |
 
 ## 入口契约与不变量
 
@@ -53,13 +53,10 @@ make run-riscv
 make test-riscv
 make test-sv39-riscv
 make test-sv39-fault-riscv
-make test-trap-return-riscv
 make test-user-riscv
 make test-user-fatal-riscv
 make test-timer-riscv
 make test-idle-riscv
-make test-high-half-trap-riscv
-make test-no-identity-riscv
 make test-scheduler-riscv
 make debug-riscv
 ```

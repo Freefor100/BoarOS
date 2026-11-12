@@ -217,7 +217,7 @@ int main(int argc,char **argv)
     setvbuf(stdout,0,_IONBF,0);
     if(argc==4&&!strcmp(argv[1],"--exec")){token(atoi(argv[2]),'e');expect(atoi(argv[3]),'x');return 0;}
     if(getpid()==1){CHECK(!mkdir("/proc",0555)||errno==EEXIST);CHECK(!mount("proc","/proc","proc",0,0));}
-    struct utsname name;CHECK(!uname(&name));boaros=!strcmp(name.release,"0.1.0-boaros-dev");
+    struct utsname name;CHECK(!uname(&name));boaros=strstr(name.release,"boaros")!=NULL;
     int fd=open("/kcmp-data",O_CREAT|O_RDWR|O_TRUNC,0600);CHECK(fd>=0&&write(fd,"same-ofd",8)==8);
     self_abi(fd);ofd(fd);fork_lazy(fd);vfork_query(fd);shared_fs();thread_objects(fd);semaphore_undo();permissions(fd);nonleader_exec(fd);zombie_resources(fd);
     CHECK(!close(fd)&&!unlink("/kcmp-data"));printf("KCMP END %u\n",cases);

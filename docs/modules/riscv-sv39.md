@@ -13,7 +13,7 @@
 | `arch/riscv/linker.ld`、`include/arch/riscv/memory_layout.h` | 固定高半区 VMA 并导出页对齐的 text、rodata、data 边界 |
 | `kernel/main.c` | 根据 DTB RAM、ELF 边界和 QEMU UART 建立启动地址空间与高半区别名 |
 | `tests/riscv/sv39_cases.c` | 验证 PTE、页表数量、用户空间生命周期、边界和失败语义 |
-| `tests/riscv/sv39_fault_main.c`、`tests/riscv/no_identity.c` | 验证只读页写故障和最终地址空间的低 RAM 访问故障 |
+| `tests/riscv/sv39_fault_main.c`、`tests/riscv/user.sh` | 验证只读页写故障、真实用户页故障和用户根切换 |
 
 RISC-V 构建固定 4 KiB 基页。页表对象首次使用前必须清零。初始化从物理页分配器取得并清零一个根页；该分配器的所有可用区间都必须位于 Sv39 可编码的 56 位物理地址范围内，否则初始化在取页前返回 `RISCV_SV39_STATUS_INVALID`。
 
@@ -117,8 +117,6 @@ RISC-V ELF 映像构造器是当前用户映射接口的真实调用方。它先
 ```sh
 make test-sv39-riscv
 make test-sv39-fault-riscv
-make test-high-half-trap-riscv
-make test-no-identity-riscv
 make test-user-riscv
 make test-user-fatal-riscv
 make test-demand-page-riscv

@@ -9,7 +9,7 @@ import subprocess
 import tarfile
 
 ROOT = Path(__file__).resolve().parents[3]
-BASE = ROOT/'build/bpf-20261107'
+BASE = ROOT/'build/bpf'
 LINUX_REVISION = 'f4cdf7ca9a1fdcca413157df19753f388a5a224e'
 ARCHIVES = {name:'bpf/'+name for name in (
     'bpftrace-0.27.1.tar.gz', 'libbpf-85c0d575.tar.gz',

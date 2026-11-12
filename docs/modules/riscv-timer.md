@@ -89,7 +89,6 @@ make test-timer-riscv
 make test-scheduler-riscv
 make test-user-riscv
 make test-idle-riscv
-make test-trap-return-riscv
 make test-riscv
 ```
 

@@ -530,9 +530,9 @@ worker 启动时仍只准备一个实际回写窗口，内存压力先释放窗�
 组成一条 SG 链；不相接的请求一起发布后只通知队列一次，详见
 [VirtIO 块设备](riscv-virtio-block.md#请求和-dma)。
 
-`python3 -B tests/riscv/writeback-batch.py` 检查 1/2/4/8/32 页与 1/4 KiB ext4，
-覆盖部分首尾、范围裁剪、干净间隙、无需连续大块分配、OOM、并发重脏、旧版本稳定、
-短写/EIO 脏页保留、读回及 e2fsck。`make test-lwext4-group-host` 另外检查外部稳定页
+`make test-page-cache-concurrency-host test-file-io-concurrency-host` 检查部分首尾、
+范围裁剪、稀疏脏块、OOM、并发重脏、旧版本稳定、短写/EIO 脏页保留、读回及引用归还。
+`make test-lwext4-group-host` 另外检查外部稳定页
 在接纳、替换、abort 和 commit 时的实际引用归还，以及冷读没有第二份文件数据缓存。
 cache 宿主测试另检查版本对象/物理页零分配复用、保留旧内容、空闲容量和压力回收、
 前后台争用最后版本时的 OOM 交错，以及 cache 销毁后最后来源引用归还。
@@ -1129,17 +1129,13 @@ gap 和同块 partial 重入结束分配窗口，出错释放所有尚未消费�
 OOM、独立错误与重试；后者运行 1/4/8 KiB ext4、extent/传统映射的洞、EOF 和片段。
 `make test-io-sleep-riscv` 另检查八个独立块请求一并发布，以及真实八页 VFS batch
 合成一个 32 KiB SG 请求；暂扣最后一次 DMA 时取消不能提前返回。
-`make test-demand-read-riscv` 固定 RA0，使用真实 `kernel_files_read/pread/readv`，
-在 1/4 KiB ext4、legacy/modern 设备上检查 256 KiB 需求的实际 READ 区间和两次
-128 KiB 请求，
-另检查单页 `read/pread` 只发出一次 4 KiB READ、单页热读没有设备读取。
-用户目标对齐的 4 KiB 复制登记一次写 pin，偏移 `0x618` 时跨两页，登记两次；
-64 KiB 的 read/pread 登记 16 次，碎 iovec 不增加数据页 pin，另有一次导入向量的读 pin。
-批次内的 pin 复用及一次性复制接口见[MM 模块](kernel-mm.md#匿名-mm-的并发与回收)。
-覆盖热命中、冷热混合、未对齐、洞、EOF、用户 fault、真实 READ EIO 前缀与重试，
-以及暂扣 DMA 时 close/reclaim/取消的引用寿命。`make test-page-cache-concurrency-host`
-在 4/16 KiB 基页检查重叠 loading、逐页错误、各分配位置 OOM、短 EOF、排队取消、
-截断和最终引用归还，并记录调用线程实际取得的缓存锁、inode 锁和物理页引用。
+`make test-file-io-concurrency-host` 使用真实 files/MM/uaccess 检查跨页与向量读取、
+用户 fault 的已完成前缀、共享 offset、close/reuse 和最终 owner。
+`make test-uaccess-riscv` 检查用户页 pin 与跨页复制；批次内的 pin 复用及一次性复制接口见
+[MM 模块](kernel-mm.md#匿名-mm-的并发与回收)。
+`make test-page-cache-concurrency-host` 在 4/16 KiB 基页检查冷热需求批次、重叠 loading、
+逐页错误、各分配位置 OOM、短 EOF、排队取消、截断和最终引用归还，并记录调用线程
+实际取得的缓存锁、inode 锁和物理页引用。
 后端无错误却未填满 inode 有效范围时，标量和批量读取均返回 I/O 错误，移除失败
 loading 并允许重试；不能把清零的未读尾部交付为成功数据。
 在无等待的 SMP `get_batch`＋`put_batch` 路径中，实测共享缓存元数据互斥取得次数如下；4/16 KiB 基页、本地和远端调用者相同。热读仍需取得一次本 inode 的索引短锁。
@@ -1226,13 +1222,11 @@ inode read gate，复用 demand/full-overwrite 的 loading 页准备；已存在
 已接纳批次，最后释放实例；截断/失效的 inode write gate 与加载互斥。每个批次完成后
 重新开放中断并让出，队列满或内存不足只放弃推测，不制造需求读错误。
 
-`make test-readahead-riscv` 覆盖配置窗口及 1/4 KiB ext4，验证实际缓存内容、窗口上限、
-seek/非顺序/关闭、冷不连续读、单页错误隔离、低水位、截断、unlink 和回收。
-`make test-readahead-host` 在 4/16 KiB 页上检查未对齐顺序流、窗口推进、微小读取、需求大批读取、EOF/EIO 前缀及取消后的引用归还。
-`python3 -B tests/riscv/readahead.py --pages 1 8 --block-size 4096 --held --transport legacy`
-及 modern 模式使用 NBD 暂扣所有窗口 READ，再保留最后一个；需求读取者和 stop/join
-调用者均须保持等待，响应后才归还 owner。`--pages 16` 额外检查 16→32→64 KiB 的实际装入、完整归还后的推进和热范围跳过排队。
-
+`make test-readahead-host` 在 4/16 KiB 页上检查未对齐顺序流、窗口推进、微小读取、
+需求大批读取、EOF/EIO 前缀及取消后的引用归还。
+`make test-file-io-concurrency-host` 检查独立 OFD 的预测、RANDOM/SEQUENTIAL 策略和排队关闭；
+`make test-page-cache-concurrency-host` 检查 loading 与截断、停止和取消的实际 owner 交错。
+真实设备暂扣与取消由 `make test-io-sleep-riscv` 检查。
 
 SQLite NBD runner 的 marker 停机使用显式受控 cut：后端先冻结磁盘并确认退出零，
 再终止 guest，避免主动 kill 被误记成后端协议错误。默认及 RA8/WB8 的阶段七后

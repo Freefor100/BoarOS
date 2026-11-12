@@ -493,12 +493,10 @@ make test-brk-riscv
 make test-mmap-riscv
 make test-demand-page-riscv
 make test-user-riscv
-make test-high-half-trap-riscv
-make test-no-identity-riscv
 make test-riscv
 ```
 
-Sv39 建表测试覆盖精确 PTE、2 MiB/4 KiB 选择、16 GiB 规模、边界拒绝和部分提交；权限故障测试覆盖 MMU 生效后的只读保护；VMA/demand-page 测试覆盖策略边界、真实页耗尽、回滚 owner、U-mode 深栈/heap/mmap 补页、protected owner、区间编辑和完整回收。`test-brk-riscv` 覆盖精确 raw 返回与 fork/exec heap 生命周期，`test-mmap-riscv` 覆盖真实 U-mode anonymous mmap/mprotect/munmap。完整启动测试再验证 512 MiB、1 GiB 和 16 GiB RAM 下的 `satp`、buddy metadata 与页表页精确计数和高半区执行上下文；高半区 trap 测试验证硬件实际使用迁移后的 `stvec`，no-identity 测试验证最终页表真实拒绝低 RAM load。开发板到手后还必须补充同类硬件验证和 fault/TLB 性能测量，不能把 QEMU 结果直接等同于板级兼容。
+Sv39 建表测试覆盖精确 PTE、2 MiB/4 KiB 选择、16 GiB 规模、边界拒绝和部分提交；权限故障测试覆盖 MMU 生效后的只读保护；VMA/demand-page 测试覆盖策略边界、真实页耗尽、回滚 owner、U-mode 深栈/heap/mmap 补页、protected owner、区间编辑和完整回收。`test-brk-riscv` 覆盖精确 raw 返回与 fork/exec heap 生命周期，`test-mmap-riscv` 覆盖真实 U-mode anonymous mmap/mprotect/munmap。完整启动测试再验证 512 MiB、1 GiB 和 16 GiB RAM 下的 `satp`、buddy metadata 与页表页精确计数和高半区执行上下文；真实用户态和 timer 测试经生产 trap 入口检查页表切换后的执行与返回。开发板到手后还必须补充同类硬件验证和 fault/TLB 性能测量，不能把 QEMU 结果直接等同于板级兼容。
 
 ## 资料依据
 
