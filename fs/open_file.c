@@ -106,6 +106,60 @@ static void reset_read_prediction(struct kernel_open_file_description *file)
 #endif
 }
 
+int kernel_open_file_advise(struct kernel_open_file_description *file,int64_t offset,
+    int64_t length,int advice,int explicit_readahead)
+{
+    if (file->kind==KERNEL_OPEN_FILE_KIND_PATH) return -KERNEL_EBADF;
+    if (explicit_readahead) {
+        if (!kernel_open_file_readable(file)) return -KERNEL_EBADF;
+        if (file->kind!=KERNEL_OPEN_FILE_KIND_REGULAR) return -KERNEL_EINVAL;
+    } else if (file->kind==KERNEL_OPEN_FILE_KIND_PIPE) return -KERNEL_ESPIPE;
+    if (offset<0 || length<0 || advice<0 || advice>5) return -KERNEL_EINVAL;
+    /* Memory files have no swap or reclaimable backing cache, as on Linux's
+     * noop BDI. Generated and pathless objects likewise have no page-cache action. */
+    if (file->kind!=KERNEL_OPEN_FILE_KIND_REGULAR || kernel_open_file_memory_backed(file) ||
+        kernel_vfs_file_generated(&file->file)) return 0;
+    if (advice==0 || advice==1 || advice==2 || advice==5) {
+        {
+            KERNEL_RAW_SCOPE(prediction,&file->offset_lock.lock.metadata);
+            uint32_t policy=file->read_advice;
+            if (advice==0) policy=0;
+            else if (advice==1) policy|=KERNEL_READ_RANDOM;
+            else if (advice==2) policy=(policy|KERNEL_READ_SEQUENTIAL)&~KERNEL_READ_RANDOM;
+            else policy|=KERNEL_READ_NOREUSE;
+            __atomic_store_n(&file->read_advice,policy,__ATOMIC_RELAXED);
+        }
+        if (advice!=5) reset_read_prediction(file);
+        return 0;
+    }
+    struct kernel_page_cache *cache=kernel_vfs_file_page_cache(&file->file);
+    struct kernel_vfs_node *node=kernel_vfs_file_node(&file->file);
+    if (!cache || !node) return 0;
+    uint64_t start=(uint64_t)offset,end=length?(uint64_t)offset+(uint64_t)length:UINT64_MAX;
+    if (end>INT64_MAX) end=UINT64_MAX;
+    if (advice==3) {
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+        uint64_t size=kernel_vfs_node_size(node);
+        if (end>size) end=size;
+        if (start<end) {
+            uint64_t first=start>>BOAROS_PAGE_SHIFT,pages=((end-1)>>BOAROS_PAGE_SHIFT)-first+1;
+            if (pages>BOAROS_PAGE_CACHE_READAHEAD_PAGES) pages=BOAROS_PAGE_CACHE_READAHEAD_PAGES;
+            (void)kernel_page_cache_readahead(cache,node,first,(unsigned)pages,0);
+        }
+#endif
+        return 0;
+    }
+    /* Writeback acceptance is a hint, not a durability barrier. Preserve its
+     * dirty/error owner even when the attempted writeback cannot make progress. */
+    (void)kernel_page_cache_writeback_range(cache,node,start,end);
+    uint64_t size=kernel_vfs_node_size(node);
+    uint64_t first=(start>>BOAROS_PAGE_SHIFT)+!!(start&BOAROS_PAGE_MASK);
+    uint64_t after=end>>BOAROS_PAGE_SHIFT;
+    if (end==size && (end&BOAROS_PAGE_MASK)) after++;
+    if (first<after) kernel_page_cache_dontneed(cache,node,first,after-1);
+    return 0;
+}
+
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
 void kernel_open_file_read_begin(struct kernel_open_file_description *file, uint64_t offset)
 {
@@ -126,13 +180,15 @@ void kernel_open_file_read_progress(struct kernel_open_file_description *file,
     uint64_t offset,size_t count,int cache_miss)
 {
     if (!count || !file || (!cache_miss && !__atomic_load_n(&file->read_sequential,__ATOMIC_RELAXED))) return;
+    uint32_t policy=__atomic_load_n(&file->read_advice,__ATOMIC_RELAXED);
+    if (policy&KERNEL_READ_RANDOM) return;
+    const unsigned maximum=BOAROS_PAGE_CACHE_READAHEAD_PAGES*((policy&KERNEL_READ_SEQUENTIAL)?2U:1U);
     if (!open_file_live(file) || file->kind!=KERNEL_OPEN_FILE_KIND_REGULAR ||
         kernel_open_file_memory_backed(file) || kernel_vfs_file_generated(&file->file)) return;
     /* A demand batch already as large as the prediction window needs no
      * competing speculative stream. Tiny configured windows still train on
      * page reads; the useful demand batching threshold starts at 16 KiB. */
-    const size_t demand_window=BOAROS_PAGE_CACHE_READAHEAD_PAGES*BOAROS_PAGE_SIZE<16384U?
-        16384U:BOAROS_PAGE_CACHE_READAHEAD_PAGES*BOAROS_PAGE_SIZE;
+    const size_t demand_window=maximum*BOAROS_PAGE_SIZE<16384U?16384U:maximum*BOAROS_PAGE_SIZE;
     if (count>=demand_window) {reset_read_prediction(file);return;}
     if (offset>UINT64_MAX-count) __builtin_trap();
     const unsigned initial=BOAROS_PAGE_CACHE_READAHEAD_PAGES<16384U/BOAROS_PAGE_SIZE?
@@ -142,6 +198,7 @@ void kernel_open_file_read_progress(struct kernel_open_file_description *file,
     unsigned pages=initial;int queue;
     {
         KERNEL_RAW_SCOPE(prediction,&file->offset_lock.lock.metadata);
+        if (file->read_advice!=policy) return;
         int sequential=file->read_sequential && file->read_end==offset;
         if (!sequential) {
             cancel=file->readahead_cookie;file->readahead_cookie=0;file->readahead_end=0;file->readahead_pages=initial;
@@ -153,8 +210,8 @@ void kernel_open_file_read_progress(struct kernel_open_file_description *file,
         queue=sequential && next_unread>=previous_end &&
             (previous_end || (end>>BOAROS_PAGE_SHIFT)>(offset>>BOAROS_PAGE_SHIFT));
         pages=file->readahead_pages?file->readahead_pages:initial;
-        if (queue && previous_end && pages<BOAROS_PAGE_CACHE_READAHEAD_PAGES) {
-            pages*=2;if (pages>BOAROS_PAGE_CACHE_READAHEAD_PAGES) pages=BOAROS_PAGE_CACHE_READAHEAD_PAGES;
+        if (queue && previous_end && pages<maximum) {
+            pages*=2;if (pages>maximum) pages=maximum;
         }
     }
     struct kernel_page_cache *cache=kernel_vfs_file_page_cache(&file->file);
@@ -165,7 +222,7 @@ void kernel_open_file_read_progress(struct kernel_open_file_description *file,
         int keep;
         {
             KERNEL_RAW_SCOPE(prediction,&file->offset_lock.lock.metadata);
-            keep=file->read_sequential && file->read_end==end && file->readahead_cookie==cookie;
+            keep=file->read_advice==policy && file->read_sequential && file->read_end==end && file->readahead_cookie==cookie;
             if (keep) {
                 file->readahead_cookie=published.cookie;file->readahead_end=published.end;
                 if (published.end>previous_end) file->readahead_pages=pages;
@@ -1376,9 +1433,9 @@ int kernel_open_file_pread(struct kernel_open_file_description *file,
     if (!open_file_live(file)) return -KERNEL_EINVAL;
     if (bytes_read) *bytes_read = 0;
     if (size) kernel_open_file_read_begin(file, offset);
-    int cache_miss=0;
-    int result = kernel_vfs_pread(&file->file, offset, buffer, size, bytes_read, &cache_miss);
-    if (bytes_read) kernel_open_file_read_progress(file, offset, *bytes_read, cache_miss);
+    struct kernel_vfs_read_options options={.no_reuse=kernel_open_file_read_no_reuse(file)};
+    int result = kernel_vfs_pread(&file->file, offset, buffer, size, bytes_read, &options);
+    if (bytes_read) kernel_open_file_read_progress(file, offset, *bytes_read, options.cache_miss);
     return result;
 }
 

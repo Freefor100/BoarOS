@@ -347,6 +347,17 @@ enum kernel_files_status kernel_files_pwrite(
     int64_t offset,
     int64_t *linux_result);
 
+/* Native Linux per-call I/O flags, separate from persistent O_* state. */
+#define KERNEL_RWF_HIPRI UINT32_C(0x001)
+#define KERNEL_RWF_DSYNC UINT32_C(0x002)
+#define KERNEL_RWF_SYNC UINT32_C(0x004)
+#define KERNEL_RWF_NOWAIT UINT32_C(0x008)
+#define KERNEL_RWF_APPEND UINT32_C(0x010)
+#define KERNEL_RWF_NOAPPEND UINT32_C(0x020)
+#define KERNEL_RWF_ATOMIC UINT32_C(0x040)
+#define KERNEL_RWF_DONTCACHE UINT32_C(0x080)
+#define KERNEL_RWF_NOSIGNAL UINT32_C(0x100)
+
 struct kernel_uaccess_iovec {
     uint64_t base;
     uint64_t length;
@@ -375,6 +386,11 @@ enum kernel_files_status kernel_files_pwritev(struct kernel_files *files,
     struct kernel_mm *mm, int64_t fd, uint64_t user_iov, uint64_t iovcnt,
     int64_t offset, int64_t *linux_result);
 
+enum kernel_files_status kernel_files_preadv2(struct kernel_files *,struct kernel_mm *,
+    int64_t fd,uint64_t user_iov,uint64_t count,int64_t offset,uint32_t flags,int64_t *result);
+enum kernel_files_status kernel_files_pwritev2(struct kernel_files *,struct kernel_mm *,
+    int64_t fd,uint64_t user_iov,uint64_t count,int64_t offset,uint32_t flags,int64_t *result);
+
 /* Install the console description at an empty fixed slot for PID 1 stdio. */
 enum kernel_files_status kernel_files_open_console(
     struct kernel_files *files,
@@ -397,6 +413,9 @@ enum kernel_files_status kernel_files_truncate(
     struct kernel_files *files, const struct kernel_fs_context *fs,
     struct kernel_mm *mm, uint64_t user_path, int64_t length,
     int64_t *linux_result);
+
+enum kernel_files_status kernel_files_advise(struct kernel_files *, int64_t fd,
+    int64_t offset, int64_t length, int advice, int explicit_readahead, int64_t *result);
 
 enum kernel_files_status kernel_files_fallocate(struct kernel_files *files,
     int64_t fd, unsigned mode, int64_t offset, int64_t length, int64_t *linux_result);

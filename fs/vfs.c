@@ -84,6 +84,13 @@ static int inode_permission(struct kernel_vfs_node *node, unsigned access)
     kernel_vfs_node_lock(node, &io, 0);
     return node_dac_permission(node,cred,access);
 }
+int kernel_vfs_file_noappend_allowed(const struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_node *node=kernel_vfs_file_node(file);
+    if (!node) __builtin_trap();
+    return !(node->metadata_restrictions&KERNEL_VFS_INODE_APPEND);
+}
+
 int kernel_vfs_file_mincore_allowed(const struct kernel_vfs_file *file)
 {
     struct kernel_vfs_node *node = kernel_vfs_file_node(file);
@@ -280,7 +287,7 @@ static int file_xattr(struct kernel_vfs_file *file,struct kernel_vfs_path *path,
             if (root==UINT32_MAX) return -KERNEL_EINVAL;
         }
     }
-    if (write && node->metadata_immutable) return -KERNEL_EPERM;
+    if (write && node->metadata_restrictions) return -KERNEL_EPERM;
     if (acl) {
         if (!instance->ops->acl_permission || (node->mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFLNK)
             return -KERNEL_EOPNOTSUPP;
@@ -2350,7 +2357,7 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
                      uint64_t offset,
                      void *buffer,
                      size_t size,
-                     size_t *bytes_read, int *cache_miss)
+                     size_t *bytes_read, struct kernel_vfs_read_options *options)
 {
     if (file == 0 || file->state != VFS_FILE_STATE_LIVE ||
         file->private_data == 0 || bytes_read == 0 ||
@@ -2360,7 +2367,7 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
     struct kernel_vfs_node *node = file->private_data;
     struct kernel_page_cache *cache = node->instance->page_cache;
     *bytes_read = 0;
-    if (cache_miss) *cache_miss=0;
+    if (options) options->cache_miss=0;
     if (offset > INT64_MAX) return -KERNEL_EOVERFLOW;
     if (node->memory) {
         KERNEL_LOCK_SCOPE(node_guard);
@@ -2389,7 +2396,7 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
             pages = larger;
             capacity = count;
         }
-        if (kernel_page_cache_get_batch(cache, file, offset >> BOAROS_PAGE_SHIFT, pages, count) ==
+        if (kernel_page_cache_get_batch(cache, file, offset >> BOAROS_PAGE_SHIFT, pages, count, options && options->no_reuse) ==
             KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT) __builtin_trap();
         int error = 0;
         for (size_t i = 0; i < count; i++) {
@@ -2405,7 +2412,7 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
             if (copied > size - *bytes_read) copied = size - *bytes_read;
             memcpy((unsigned char *)buffer + *bytes_read, page + start, copied);
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
-            if (copied && cache_miss && pages[i].cache_miss) *cache_miss=1;
+            if (copied && options && pages[i].cache_miss) options->cache_miss=1;
 #endif
             *bytes_read += copied; offset += copied; start = 0;
         }

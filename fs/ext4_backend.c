@@ -2036,7 +2036,8 @@ static int ext4_backend_open(struct kernel_vfs_mount *mount,
     if (path) result=ext4_fraw_inode_fill(lwext4_node_file(node),&initial);
     node->mode=ext4_inode_get_mode(&adapter->device.fs->sb,&initial);
     node->uid=ext4_inode_get_uid(&initial);node->gid=ext4_inode_get_gid(&initial);
-    node->metadata_immutable=!!(ext4_inode_get_flags(&initial) & (EXT4_INODE_FLAG_IMMUTABLE | EXT4_INODE_FLAG_APPEND));
+    node->metadata_restrictions=((ext4_inode_get_flags(&initial)&EXT4_INODE_FLAG_IMMUTABLE)?KERNEL_VFS_INODE_IMMUTABLE:0) |
+        ((ext4_inode_get_flags(&initial)&EXT4_INODE_FLAG_APPEND)?KERNEL_VFS_INODE_APPEND:0);
     if (!result) initialize_times(node,adapter,&initial);
     if(!result)result=retain_node_inode(node);
     if (result) {
@@ -2224,7 +2225,8 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
     node->size = ext4_fsize(lwext4_node_file(node));
     node->mode=ext4_inode_get_mode(&adapter->device.fs->sb,&initial);
     node->uid=ext4_inode_get_uid(&initial);node->gid=ext4_inode_get_gid(&initial);
-    node->metadata_immutable=!!(ext4_inode_get_flags(&initial) & (EXT4_INODE_FLAG_IMMUTABLE | EXT4_INODE_FLAG_APPEND));
+    node->metadata_restrictions=((ext4_inode_get_flags(&initial)&EXT4_INODE_FLAG_IMMUTABLE)?KERNEL_VFS_INODE_IMMUTABLE:0) |
+        ((ext4_inode_get_flags(&initial)&EXT4_INODE_FLAG_APPEND)?KERNEL_VFS_INODE_APPEND:0);
     initialize_times(node, adapter, &initial);
     ((struct lwext4_node *)node)->capability_absent=1;
     return kernel_vfs_publish_node(mount, node, file, 1);

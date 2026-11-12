@@ -23,6 +23,7 @@
 #include <assert.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -171,6 +172,8 @@ enum kernel_heap_status __wrap_kernel_heap_allocate(struct kernel_heap *heap,siz
 }
 static struct kernel_rwlock *namespace_observed_lock;
 static unsigned namespace_lock_acquisitions;
+static const struct kernel_rwlock *advice_closing_lock;
+static unsigned advice_close_waiting;
 static _Thread_local const struct kernel_rwlock *write_sequence_lock;
 static _Thread_local unsigned write_sequence_queries,write_sequence_acquisitions;
 int __real_kernel_lock_held(const struct kernel_rwlock *,int);
@@ -183,6 +186,7 @@ void __real_kernel_rwlock_write(struct kernel_rwlock *,struct kernel_lock_guard 
 void __wrap_kernel_rwlock_write(struct kernel_rwlock *lock,struct kernel_lock_guard *guard)
 {
     if (lock==namespace_observed_lock) namespace_lock_acquisitions++;
+    if (lock==advice_closing_lock) __atomic_store_n(&advice_close_waiting,1,__ATOMIC_RELEASE);
     if (lock==write_sequence_lock) write_sequence_acquisitions++;
 #ifdef TCP_IO_CASES
     tcp_wait_locking(lock);
@@ -730,9 +734,12 @@ static unsigned sync_pause,sync_entered,sync_resume,sync_progress;
 static struct kernel_vfs_file *write_sync_file;
 static uint64_t write_sync_start,write_sync_end;
 static int write_sync_data,write_sync_calls,write_sync_fail;
+static struct kernel_open_file_description *write_sync_owner;
+static uint32_t write_sync_expected_flags;
 static void observe_write_sync(struct kernel_vfs_file *file,uint64_t start,uint64_t end,int data_only)
 {
     if (file!=write_sync_file) return;
+    if (write_sync_owner) assert(write_sync_owner->open_flags==write_sync_expected_flags);
     write_sync_start=start;write_sync_end=end;write_sync_data=data_only;write_sync_calls++;
     if (write_sync_fail) kernel_vfs_record_writeback_error(kernel_vfs_file_node(file),-KERNEL_EIO);
 }
@@ -804,21 +811,25 @@ static void synchronous_write_ranges(struct kernel_heap *heap,struct kernel_vfs_
     uint64_t source=0x100000+2*BOAROS_PAGE_SIZE-4;
     assert(!kernel_copy_to_user(&mm,source,"sync",4,&copied) && copied==4);
     for (unsigned full=0;full<2;full++) for (unsigned append=0;append<2;append++)
-    for (unsigned mode=0;mode<4;mode++) for (unsigned fault=0;fault<2;fault++) {
+    for (unsigned mode=0;mode<6;mode++) for (unsigned fault=0;fault<2;fault++) {
         file->open_flags=2;
         assert(!kernel_files_ftruncate(&local,0,0,&result) && !result &&
             !kernel_vfs_pwrite(&file->file,0,"seed!",5,&written) && written==5 &&
             !kernel_files_lseek(&local,0,2,0,&result) && result==2);
-        file->open_flags=2|(full?KERNEL_FILES_O_SYNC:KERNEL_FILES_O_DSYNC)|
-            (append?KERNEL_FILES_O_APPEND:0);
+        uint32_t rwf=(full?KERNEL_RWF_SYNC:KERNEL_RWF_DSYNC)|
+            (append?KERNEL_RWF_APPEND:KERNEL_RWF_NOAPPEND);
+        file->open_flags=mode>=4?2|(append?0:KERNEL_FILES_O_APPEND):
+            2|(full?KERNEL_FILES_O_SYNC:KERNEL_FILES_O_DSYNC)|(append?KERNEL_FILES_O_APPEND:0);
+        write_sync_owner=file;write_sync_expected_flags=file->open_flags;
         struct kernel_uaccess_iovec iov[]={{source,4},{fault?source+4:source,4}};
         assert(!kernel_copy_to_user(&mm,0x200000,iov,sizeof(iov),&copied) && copied==sizeof(iov));
         write_sync_calls=0;write_sync_file=&file->file;
-        write_sync_fail=full && append && mode==3 && fault;
+        write_sync_fail=full && append && (mode==3 || mode==5) && fault;
         enum kernel_files_status status=mode==0?kernel_files_write(&local,&mm,0,source,fault?8:4,&result):
             mode==1?kernel_files_pwrite(&local,&mm,0,source,fault?8:4,1,&result):
             mode==2?kernel_files_writev(&local,&mm,0,0x200000,2,&result):
-                    kernel_files_pwritev(&local,&mm,0,0x200000,2,1,&result);
+            mode==3?kernel_files_pwritev(&local,&mm,0,0x200000,2,1,&result):
+                    kernel_files_pwritev2(&local,&mm,0,0x200000,2,mode==4?-1:1,rwf,&result);
         write_sync_file=NULL;
         size_t start=append?5:(mode&1)?1:2;
         size_t count=fault || mode<2?4:8;
@@ -833,9 +844,9 @@ static void synchronous_write_ranges(struct kernel_heap *heap,struct kernel_vfs_
         assert(!kernel_open_file_pread(file,start,actual,count,&copied) && copied==count &&
             !memcmp(actual,count==8?"syncsync":"sync",count));
     }
-    write_sync_fail=0;
+    write_sync_fail=0;write_sync_owner=NULL;
     assert(!kernel_files_release(&local));
-    puts("PASS O_SYNC/O_DSYNC accepted ranges: scalar/vector, append/pwrite, EFAULT prefix and failed sync preserve content/offset");
+    puts("PASS sync accepted ranges: scalar/vector/v2, per-call flags stay private, EFAULT and failed sync preserve content/offset");
 }
 static void sync_offset_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount,
     struct kernel_page_cache *cache,int range_first)
@@ -1502,6 +1513,102 @@ static void borrowed_page_case(struct physical_page_allocator *pages)
 #ifdef TCP_IO_CASES
 #include "tcp_usercopy_cases.h"
 #endif
+struct advice_close_call { struct kernel_files *files; int64_t result; };
+static void *advice_close_thread(void *argument)
+{
+    struct advice_close_call *call=argument;
+    mm_test_attach(1);mm_test_bind(&mm);mm_test_bind_files(call->files);mm_test_context=context;
+    assert(!kernel_files_close(call->files,0,&call->result));
+    mm_test_finish();return NULL;
+}
+static void file_advice_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount,
+    struct kernel_page_cache *cache)
+{
+    struct kernel_files local={0};struct kernel_open_file_description *file=NULL,*other=NULL;
+    int error;int64_t result;size_t written,copied;
+    assert(!kernel_files_create(&local,heap) &&
+        !kernel_open_file_create_mode(heap,mount,"/advice",0600,&file,&error) && !error);
+    file->open_flags=2;assert(!kernel_vfs_file_acquire_write(&file->file));
+    unsigned char *bytes=malloc(20*BOAROS_PAGE_SIZE+123);assert(bytes);
+    memset(bytes,0x5a,20*BOAROS_PAGE_SIZE+123);
+    assert(!kernel_vfs_pwrite(&file->file,0,bytes,20*BOAROS_PAGE_SIZE+123,&written) && written==20*BOAROS_PAGE_SIZE+123);
+    assert(!kernel_open_file_sync_range(file,0,UINT64_MAX));
+    struct kernel_open_file_description *slot=file;
+    assert(!kernel_files_install_new_owned_at(&local,0,0,&slot));
+    assert(!kernel_open_file_create(heap,mount,"/advice",&other,&error) && !error);
+    struct kernel_page_cache_read_page pin={0};
+    assert(!kernel_page_cache_get_batch(cache,&file->file,1,&pin,1,0));
+    assert(!kernel_files_advise(&local,0,BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE,4,0,&result) && !result &&
+        kernel_page_cache_resident(cache,&file->file,1));
+    kernel_page_cache_put_batch(cache,&pin,1);
+    assert(!kernel_files_advise(&local,0,BOAROS_PAGE_SIZE+1,2*BOAROS_PAGE_SIZE-1,4,0,&result) && !result &&
+        kernel_page_cache_resident(cache,&file->file,1) && !kernel_page_cache_resident(cache,&file->file,2) &&
+        kernel_page_cache_resident(cache,&file->file,3));
+    assert(!kernel_files_advise(&local,0,20*BOAROS_PAGE_SIZE,124,4,0,&result) && !result &&
+        kernel_page_cache_resident(cache,&file->file,20));
+    assert(!kernel_files_advise(&local,0,20*BOAROS_PAGE_SIZE,123,4,0,&result) && !result &&
+        !kernel_page_cache_resident(cache,&file->file,20));
+    assert(!kernel_files_advise(&local,0,0,0,4,0,&result) && !result);
+    assert(!kernel_page_cache_get_batch(cache,&file->file,0,&pin,1,0));
+    struct kernel_page_cache_read_page second={0};assert(!kernel_page_cache_get_batch(cache,&file->file,1,&second,1,0));
+    (void)kernel_page_cache_reclaim(cache,UINT64_MAX); /* Clear reference bits, both actual readers remain pinned. */
+    kernel_page_cache_put_batch(cache,&pin,1);kernel_page_cache_put_batch(cache,&second,1);
+    struct kernel_page_cache_statistics before,after;
+    kernel_page_cache_get_statistics(cache,&before);
+    assert(!kernel_files_pread(&local,&mm,0,0x200000,1,0,&result) && result==1);
+    assert(!kernel_files_advise(&local,0,0,0,5,0,&result) && !result);
+    assert(!kernel_files_pread(&local,&mm,0,0x200000,1,BOAROS_PAGE_SIZE,&result) && result==1);
+    kernel_page_cache_get_statistics(cache,&after);assert(after.hits==before.hits+2);
+    assert(kernel_page_cache_reclaim(cache,1)==1 && kernel_page_cache_resident(cache,&file->file,0) &&
+        !kernel_page_cache_resident(cache,&file->file,1));
+    assert(file->read_advice==KERNEL_READ_NOREUSE && !other->read_advice);
+    assert(!kernel_files_advise(&local,0,0,0,0,0,&result) && !result && !file->read_advice);
+    assert(!kernel_files_advise(&local,0,0,0,2,0,&result) && !result);
+    assert(!kernel_files_advise(&local,0,0,0,1,0,&result) && !result);
+    assert((file->read_advice&(KERNEL_READ_RANDOM|KERNEL_READ_SEQUENTIAL))==(KERNEL_READ_RANDOM|KERNEL_READ_SEQUENTIAL));
+    assert(!kernel_files_advise(&local,0,0,0,2,0,&result) && !result && !(file->read_advice&KERNEL_READ_RANDOM));
+    assert(!kernel_files_advise(&local,0,0,0,4,0,&result) && !result && !kernel_page_cache_resident(cache,&file->file,0));
+    assert(!kernel_files_ftruncate(&local,0,80*BOAROS_PAGE_SIZE,&result) && !result &&
+        !kernel_open_file_sync_range(file,0,UINT64_MAX));
+    assert(!kernel_page_cache_start_worker(cache));
+    assert(!kernel_files_advise(&local,0,0,0,1,0,&result) && !result);
+    kernel_page_cache_get_statistics(cache,&before);
+    assert(!kernel_open_file_pread(file,0,bytes,BOAROS_PAGE_SIZE,&copied) && copied==BOAROS_PAGE_SIZE);
+    assert(!kernel_open_file_pread(file,BOAROS_PAGE_SIZE,bytes,BOAROS_PAGE_SIZE,&copied) && copied==BOAROS_PAGE_SIZE);
+    kernel_page_cache_get_statistics(cache,&after);assert(after.readahead_queued==before.readahead_queued);
+    assert(!kernel_files_advise(&local,0,0,0,2,0,&result) && !result);
+    assert(!kernel_open_file_pread(file,8*BOAROS_PAGE_SIZE,bytes,BOAROS_PAGE_SIZE,&copied) && copied==BOAROS_PAGE_SIZE);
+    assert(!kernel_open_file_pread(file,9*BOAROS_PAGE_SIZE,bytes,BOAROS_PAGE_SIZE,&copied) && copied==BOAROS_PAGE_SIZE);
+    unsigned batch=BOAROS_PAGE_CACHE_READAHEAD_PAGES<16384U/BOAROS_PAGE_SIZE?
+        BOAROS_PAGE_CACHE_READAHEAD_PAGES:16384U/BOAROS_PAGE_SIZE;
+    uint64_t next=10;
+    for (;;) {
+        do { kernel_page_cache_get_statistics(cache,&after);sched_yield(); }
+        while (after.readahead_completed<after.readahead_queued);
+        if (file->readahead_pages==2*BOAROS_PAGE_CACHE_READAHEAD_PAGES) break;
+        assert(!kernel_open_file_pread(file,next*BOAROS_PAGE_SIZE,bytes,batch*BOAROS_PAGE_SIZE,&copied) && copied==batch*BOAROS_PAGE_SIZE);
+        next+=batch;batch*=2;
+    }
+    assert(!kernel_files_advise(&local,0,0,0,1,0,&result) && !result);
+    assert(!kernel_files_advise(&local,0,0,0,4,0,&result) && !result);
+    kernel_page_cache_get_statistics(cache,&before);
+    __atomic_store_n(&pause_access,1,__ATOMIC_RELEASE);access_entered=resume_access=0;
+    assert(!kernel_files_advise(&local,0,0,4*BOAROS_PAGE_SIZE,3,0,&result) && !result);
+    while (!__atomic_load_n(&access_entered,__ATOMIC_ACQUIRE)) sched_yield();
+    advice_closing_lock=&kernel_open_file_node(file)->io_lock;advice_close_waiting=0;
+    struct advice_close_call close_call={.files=&local};pthread_t closer;
+    assert(!pthread_create(&closer,NULL,advice_close_thread,&close_call));
+    while (!__atomic_load_n(&advice_close_waiting,__ATOMIC_ACQUIRE)) sched_yield();
+    __atomic_store_n(&resume_access,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(closer,NULL) && !close_call.result);advice_closing_lock=NULL;
+    for (;;) { kernel_page_cache_get_statistics(cache,&after);if(after.readahead_completed>before.readahead_completed)break;sched_yield(); }
+    assert(after.readahead_loaded>=4 && kernel_page_cache_resident(cache,&other->file,3));
+    assert(!kernel_open_file_pread(other,0,bytes,8,&copied) && copied==8 && bytes[0]==0x5a);
+    kernel_page_cache_stop_worker(cache);
+    assert(!kernel_open_file_release(&other) && !kernel_files_release(&local) && !kernel_vfs_unlink(mount,"/advice"));
+    free(bytes);
+    puts("PASS file advice: scoped eviction skips readers, NOREUSE preserves hit counts without promotion, RANDOM suppression, doubled SEQUENTIAL windows, independent opens and queued close owners");
+}
 int main(int argc,char **argv)
 {
     assert(argc==2); setvbuf(stdout,0,_IONBF,0); mm_test_attach(0); mm_test_activate_task();
@@ -1510,6 +1617,9 @@ int main(int argc,char **argv)
     struct kernel_heap heap={0},backend_heap={0};
     initialize(&pages,&heap,arena,sizeof(arena)); initialize(&backend_pages,&backend_heap,backend,sizeof(backend));
     uint64_t baseline=physical_page_available(&pages),backend_baseline=physical_page_available(&backend_pages);
+    int advice_only=getenv("FILE_IO_ADVICE_ONLY")!=NULL;
+    int focused=advice_only || getenv("FILE_IO_VECTORS_ONLY")!=NULL;
+    if (!focused) {
     borrowed_page_case(&pages);
     namespace_retiring_mount_case(&heap);
     struct ext4_bcache done_cache;
@@ -1520,6 +1630,7 @@ int main(int argc,char **argv)
     completed_buffer_wait=0;
     assert(!ext4_bcache_fini_dynamic(&done_cache));
     puts("PASS ext4 completion before wait callback: no registration and no sleep");
+    }
     struct arch_mmu_page_table kernel={0}; struct arch_mmu_user_space user={0};
     assert(!riscv_sv39_page_table_init(&kernel,&pages)); kernel.state=ARCH_MMU_STATE_ACTIVE;
     assert(!arch_mmu_user_space_init(&user,&pages,&kernel) && !kernel_mm_create(&mm,&user) &&
@@ -1531,6 +1642,7 @@ int main(int argc,char **argv)
         KERNEL_MM_MAP_FIXED_NOREPLACE,&address));
     assert(!kernel_mm_mmap_anonymous(&mm,0x200000,4*BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,
         KERNEL_MM_MAP_FIXED_NOREPLACE,&address));
+    if (!focused) {
     futex_pin_case();
     futex_robust_cases();
 #ifdef TCP_IO_CASES
@@ -1557,14 +1669,18 @@ int main(int argc,char **argv)
     for (unsigned actors=2;actors<=4;actors+=2) for (int append=0;append<=1;append++)
         parallel_case(&heap,memory,0,actors,append);
     assert(!kernel_vfs_unmount(memory));
+    }
     image=open(argv[1],O_RDWR); assert(image>=0); struct stat info; assert(!fstat(image,&info));
-    namespace_mount_slot_case(&heap,&backend_heap,&pages,info.st_size);
+    if (!focused) namespace_mount_slot_case(&heap,&backend_heap,&pages,info.st_size);
     struct kernel_page_cache cache={0}; assert(!kernel_page_cache_init(&cache,&heap,&pages));
     struct kernel_block_device disk={.read=read_image,.write=write_image,.flush=flush_image,
         .capacity_bytes=info.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
     assert(!kernel_block_register(&disk,KERNEL_BLOCK_DEVICE_NUMBER(101)));
     struct kernel_vfs_mount mount={0}; assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,&cache,0));
     assert(!kernel_vfs_start_journal_worker(&mount));
+    if (advice_only) file_advice_case(&heap,&mount,&cache);
+    else if (focused) synchronous_write_ranges(&heap,&mount);
+    else {
     cached_copy_case(&heap,&mount);
     namespace_retirement_case(&heap,&mount);
     namespace_snapshot_case(&heap,&mount);
@@ -1589,6 +1705,7 @@ int main(int argc,char **argv)
     sync_offset_case(&heap,&mount,&cache,1);
     for (unsigned actors=2;actors<=4;actors+=2) for (int append=0;append<=1;append++)
         parallel_case(&heap,&mount,&cache,actors,append);
+    }
     assert(!kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(&cache));
     assert(!kernel_block_unregister(&disk)); assert(!close(image));
     mm_test_context=0; /* 页表最终释放在可信kernel上下文。 */

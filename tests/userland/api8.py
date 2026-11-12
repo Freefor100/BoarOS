@@ -21,6 +21,9 @@ from reference import archive
 SOURCES={'init':'resource/api8.c','fd_events':'resource/fd_events.c',
          'flock':'locks/flock.c','mmsg':'network/mmsg.c','copy_range':'io/copy_range.c',
          'icache':'resource/icache.c','sched_query':'resource/sched_query.c'}
+LEGACY=tuple(name for name in SOURCES if name!='init')
+SOURCES['vectors_v2']='io/vectors_v2.c'
+SOURCES['file_advice']='io/file_advice.c'
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -42,6 +45,7 @@ def build(args,work):
         flags += ['-Wl,--dynamic-linker=/lib/'+Path(loader).name]
     programs={}
     for name,source in SOURCES.items():
+        if name!='init' and name not in args.programs:continue
         if name=='icache' and args.arch!='riscv':continue
         destination=work/name
         command=[str(compiler),*flags,*([] if args.dynamic else ['-static']),
@@ -54,6 +58,14 @@ def build(args,work):
     commands=['mkdir /proc','mkdir /tmp','mkdir /dev/mqueue']
     for name in programs:
         if name!='init':commands += [f'write "{work/name}" /{name}',f'set_inode_field /{name} mode 0100755']
+    if 'vectors_v2' in programs:
+        empty=work/'append-only';empty.write_bytes(b'')
+        commands += [f'write "{empty}" /vectors-append-only',
+                     'set_inode_field /vectors-append-only mode 0100600',
+                     'set_inode_field /vectors-append-only flags 0x80020']
+    selection=work/'api8-programs'
+    selection.write_text(''.join('/'+name+'\n' for name in args.programs))
+    commands += [f'write \"{selection}\" /api8-programs']
     if args.dynamic:
         headers=subprocess.check_output(['readelf','-lW',str(work/'init')],text=True)
         interpreter=re.findall(r'Requesting program interpreter: ([^\]]+)',headers)
@@ -81,22 +93,31 @@ def build(args,work):
     harness.run_logged(['e2fsck','-fn',str(image)],work/'fixture-fsck.log')
     return image,programs
 
-def accepted(raw,arch,cpus,target):
-    programs=[name for name in SOURCES if name!='init' and (name!='icache' or arch=='riscv')]
+def accepted(raw,arch,cpus,target,selected=None):
+    programs=[name for name in (selected or LEGACY) if name!='icache' or arch=='riscv']
     ends=[line for line in raw.replace('\r','').splitlines() if line.startswith('API8 END ')]
     expected=[f'API8 END /{name} status=0' for name in programs]
-    markers=['FD-EVENTS PASS','FLOCK-PASS','COPY_RANGE PASS',
-             'SCHED-QUERY END cases=7',f'API8 PASS programs={len(programs)}']
-    if arch=='riscv':markers+=[f'ICACHE PASS cpus={cpus}']
+    known={'fd_events':['FD-EVENTS PASS'],'flock':['FLOCK-PASS'],
+           'file_advice':['ADVICE RESULT cases=3 failures=0'],'copy_range':['COPY_RANGE PASS'],'sched_query':['SCHED-QUERY END cases=7'],
+           'icache':[f'ICACHE PASS cpus={cpus}'],
+           'vectors_v2':[*(f'VECTORS2 CASE {name} PASS' for name in (
+               'positions-libc-native-width','per-call-append-sync','vectors-errors-prefix',
+               'signal-targets-seals','caller-cpus-atomic-append')),'VECTORS2 PASS cases=5']}
+    markers=[f'API8 PASS programs={len(programs)}']
+    for name in programs:markers+=known.get(name,[])
     lines=raw.replace('\r','').splitlines()
     success=(f'Linux {"RV" if arch=="riscv" else "LA"} root application passed' in raw
              if target=='linux' else PROFILES[arch].root_success(raw,0))
     mmsg=[line for line in lines if re.fullmatch(r'MMSG PASS cases=[1-9][0-9]*',line)]
-    return ends==expected and len(mmsg)==1 and all(lines.count(marker)==1 for marker in markers) and success and 'API8 FAIL' not in raw
+    limited=('vectors_v2' not in programs or target!='boaros' or all(
+        lines.count(f'VECTORS2 CAP flag={flag} result=-95')==1 for flag in (8,64,128,2147483648)))
+    return limited and ends==expected and ('mmsg' not in programs or len(mmsg)==1) and all(lines.count(marker)==1 for marker in markers) and success and 'API8 FAIL' not in raw
 
 def main():
     parser=argparse.ArgumentParser(__doc__)
     parser.add_argument('--arch',choices=PROFILES,default='riscv')
+    parser.add_argument('--program',action='append',choices=[name for name in SOURCES if name!='init'],
+                        help='run only selected existing callers (repeatable)')
     parser.add_argument('--libc',choices=('musl','glibc'),default='musl')
     parser.add_argument('--dynamic',action='store_true')
     parser.add_argument('--kernel',type=Path)
@@ -107,6 +128,7 @@ def main():
     parser.add_argument('--output',type=Path)
     args=parser.parse_args()
     if args.dynamic and args.libc!='musl':parser.error('--dynamic requires musl')
+    args.programs=tuple(name for name in dict.fromkeys(args.program or LEGACY) if name!='icache' or args.arch=='riscv')
     profile=PROFILES[args.arch]
     work=(args.output or ROOT/'build/api8'/str(time.time_ns())).resolve()
     work.mkdir(parents=True,exist_ok=False)
@@ -149,7 +171,7 @@ def main():
             try:harness.run_logged(command,log,180)
             except (RuntimeError,TimeoutError) as error:record.update(returncode=-1,error=str(error))
             raw=log.read_text(errors='replace')
-            record['passed']=not record['returncode'] and accepted(raw,args.arch,args.cpus,target)
+            record['passed']=not record['returncode'] and accepted(raw,args.arch,args.cpus,target,args.programs)
             report['runs'].append(record)
             if not record['passed']:raise RuntimeError(f'{target} caller/exit/owner failure: {log}')
             harness.run_logged(['e2fsck','-fn',str(disk)],work/(target+'-fsck.log'))

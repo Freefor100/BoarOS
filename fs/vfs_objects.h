@@ -51,6 +51,8 @@ struct kernel_vfs_instance {
     unsigned notify_marks; /* Protected by the active notification backend. */
 };
 
+enum { KERNEL_VFS_INODE_IMMUTABLE=1, KERNEL_VFS_INODE_APPEND=2 };
+
 struct kernel_vfs_node {
     struct kernel_pipe *fifo_pipe;
     struct kernel_vfs_node *next, **previous;
@@ -87,7 +89,7 @@ struct kernel_vfs_node {
     /* Directory entries use a separate qualification from file data I/O. */
     struct kernel_rwlock namespace_lock;
     uint32_t uid, gid;
-    uint8_t metadata_immutable; /* Immutable/append-only inode flags, read with DAC fields. */
+    uint8_t metadata_restrictions; /* KERNEL_VFS_INODE_* restrictions, read with DAC fields. */
     uint8_t file_seals; /* tmpfs seals, protected by the inode I/O qualification. */
     uint8_t memfd;
     uint64_t shared_write_bytes; /* Committed MAYWRITE VMA bytes, including read-only mappings. */
