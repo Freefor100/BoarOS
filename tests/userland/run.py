@@ -350,7 +350,9 @@ def shm_lock_output(raw):
     lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('SHM-LOCK ')]
     return lines==[*(f'SHM-LOCK CASE {name} PASS' for name in SHM_LOCK_CASES),'SHM-LOCK END 8']
 
-MADVISE_CASES=('abi-width-alignment-zero-overflow','free-private-content-write-and-cow',
+MADVISE_CASES=('abi-width-alignment-zero-overflow',
+    'populate-anonymous-permissions-holes-and-cow','populate-mmap-nonblock-file-eof-and-private-write',
+    'dump-policy-partial-protect-fork-and-remap','populate-caller-cpus-shared-mm','free-private-content-write-and-cow',
     'free-types-lock-and-alignment','free-remote-writes','private-zero-rounding-protection',
     'private-cow-child-preserved','shared-anonymous-and-sysv-content','tmpfs-private-shared-data',
     'ext4-private-shared-data','locked-and-onfault-reject-after-prefix','hole-keeps-mapped-side-effects',
@@ -362,7 +364,7 @@ MADVISE_CASES=('abi-width-alignment-zero-overflow','free-private-content-write-a
     'wipe-pure-bss-zero-source','fork-remote-parent-cow-and-wipe')
 def madvise_output(raw):
     lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('MADVISE ')]
-    return lines==[*(f'MADVISE CASE {name} PASS' for name in MADVISE_CASES),'MADVISE END 25']
+    return lines==[*(f'MADVISE CASE {name} PASS' for name in MADVISE_CASES),'MADVISE END 29']
 
 KCMP_CASES=('abi-lookup-type-fd-width','real-ofd-dup-offset-stable-order',
     'fork-empty-sighand-lazy-identity','vfork-shared-vm-independent-tables','clone-fs-shared-object',

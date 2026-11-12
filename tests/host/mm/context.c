@@ -231,3 +231,6 @@ enum kernel_scheduler_status kernel_wait_backend_switch_locked(struct kernel_tas
     return kernel_wait_backend_switch(task);
 }
 #endif
+
+__attribute__((weak)) int kernel_signal_termination_requested(const struct kernel_task *task)
+{ return task && task->terminate_requested; }

@@ -28,6 +28,7 @@
 #define LINUX_MAP_HUGETLB UINT64_C(0x40000)
 #define LINUX_MAP_DENYWRITE UINT64_C(0x800)
 #define LINUX_MAP_POPULATE UINT64_C(0x8000)
+#define LINUX_MAP_NONBLOCK UINT64_C(0x10000)
 #define LINUX_MAP_EXECUTABLE UINT64_C(0x1000)
 #define LINUX_MAP_FIXED_NOREPLACE UINT64_C(0x100000)
 /* Fixed Linux LEGACY_MAP_MASK also accepts huge-page size encoding bits even
@@ -253,6 +254,11 @@ enum kernel_syscall_status syscall_handle_mmap(
         status != KERNEL_MM_STATUS_SEALED) {
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
+    /* Linux commits mmap before best-effort population; a failed fault
+     * leaves the mapping and any completed resident prefix intact. */
+    if (!status && (flags & LINUX_MAP_POPULATE) && !(flags & LINUX_MAP_NONBLOCK))
+        (void)kernel_mm_populate(mm,mapped_address,mapped_address+
+            ((request->arguments[1]+BOAROS_PAGE_MASK)&~BOAROS_PAGE_MASK),0);
     decoded->value = status == KERNEL_MM_STATUS_OK
                          ? (int64_t)mapped_address
                          : mmap_error(status);

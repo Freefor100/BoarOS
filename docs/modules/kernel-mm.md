@@ -26,7 +26,7 @@ mincore 每页输出最低位的驻留状态，查询本身不装入页面。MM 
 
 ## madvise 与共享段锁定
 
-RV64/LA64 的 madvise(233) 支持 NORMAL、RANDOM、SEQUENTIAL、WILLNEED、DONTNEED、FREE、REMOVE，以及 DONTFORK/DOFORK、WIPEONFORK/KEEPONFORK，参数中的 advice 按 Linux 32 位 int 解释。NORMAL/RANDOM/SEQUENTIAL 验证映射范围并沿用当前缓存策略；它们是性能建议。未接入的扩展模式返回 EINVAL。
+RV64/LA64 的 madvise(233) 支持 NORMAL、RANDOM、SEQUENTIAL、WILLNEED、DONTNEED、FREE、REMOVE，以及 DONTFORK/DOFORK、WIPEONFORK/KEEPONFORK、DONTDUMP/DODUMP和POPULATE_READ/WRITE，参数中的 advice 按 Linux 32 位 int 解释。NORMAL/RANDOM/SEQUENTIAL 验证映射范围并沿用当前缓存策略；它们是性能建议。未接入的扩展模式返回 EINVAL。
 
 DONTNEED 在 MM 修改资格内撤销范围的 PTE 和文件驻留登记，保留 VMA、保护位、AS/DATA 用量和后备对象。私有匿名页重新访问得到零，私有文件 COW 页面重新取文件内容；共享匿名、SysV 和共享文件的数据保存在真实后备中；BPF 对象映射保留 map 数据但不补回 PTE，再访问产生 SIGBUS（见[BPF 对象共享映射](#bpf-对象共享映射)）。vDSO 代码缺页从内核内嵌的 ELF 重新装入，并完成指令缓存与 TLB 同步；只读 vVAR 缺页重新映射本 MM 持有的共享时钟页。复用现有有界退页过程，页和页表在活动 CPU 完成 TLB 失效后释放。范围中的空洞最终返回 ENOMEM，空洞两侧的有效映射仍执行；遇到锁定 VMA 返回 EINVAL，保留此前范围已经完成的变化。
 
@@ -41,6 +41,12 @@ REMOVE 删除范围的共享后备数据，保留 VMA 和文件长度。锁定�
 共享匿名和 SysV 的 MM 来源节点向真实内存对象登记；REMOVE 持有对象引用，在 MM 资格外关闭对象映射代次，逐个 MM 排空用户 pin、撤销对应 PTE，再删除对象页并重新开放缺页。节点摘除后在 MM 资格外等待已有通知借用结束，再归还对象。缺页准备保存对象代次，发布前拒绝已删除的旧页。持有该 MM 的用户 pin 时若遇对象关闭，缺页返回 CONFLICT，让调用者先归还 pin；无 pin 才等待对象开放，避免打洞与 pin 排空相互等待；fork 只在子 VMA、页表都构造完成后登记，代次发生变化时撤销子共享叶，由首次访问重新装入。范围空洞两侧仍执行并最终返回 ENOMEM；后续 VMA 或后端失败保留先前已经完成的删除。
 
 WILLNEED 使用已有文件缓存装入过程，单次建议至多准备16个数据页，不安装用户 PTE、不改变OFD offset。文件/ELF来源借用覆盖锁外I/O，最后一个映射或原FD关闭后，来源在建议结束时归还。返回0表示接纳建议；装入失败采用 Linux 忽略 fadvise 返回值的规则，实际读取/缺页继续处理其实际I/O结果。无swap时私有匿名、纯BSS和无文件身份的ELF来源返回EBADF，共享内存没有swap-in工作。
+
+POPULATE_READ/WRITE 与锁页预装共用缺页准备和后端分派，但要求范围具有明确的读／写权限；WRITE完成必要的私有COW或共享文件写准备。它们装入真实PTE，不改变锁定属性及MEMLOCK用量。权限或特殊PFN来源不适合返回EINVAL，VMA空洞及OOM返回ENOMEM，文件越界等缺页失败返回EFAULT；已有驻留前缀保留。分配、文件I/O和等待使用共同锁外阶段，恢复后重查实际VMA及来源，每批最多16页后归还资格。致命中断结束预装，不把SIGBUS/SIGSEGV改作一次用户故障递送。
+
+mmap 的 MAP_POPULATE 在映射提交后执行同一预装过程，失败保留映射及驻留前缀；MAP_POPULATE|MAP_NONBLOCK跳过预装，NONBLOCK本身不创建驻留页。普通MAP_LOCKED继续保留锁页自己的接纳与预装错误规则。
+
+DONTDUMP/DODUMP修改真实VMA策略位，随分裂、合并、fork、mprotect和mremap保留。VVAR及BPF对象映射默认排除；VVAR、VDSO和不可扩张对象不允许DODUMP。当前没有core文件写出，策略状态及生命周期检查不代表已经验证core内容。
 
 DONTFORK 使指定范围不进入新建子 MM，DOFORK 恢复继承；WIPEONFORK 保留子进程的私有匿名范围，但不继承父物理页，首次访问从零后备装入，KEEPONFORK 清除此策略。纯 ELF BSS 按实际零后备处理，文件及共享映射拒绝 WIPEONFORK。策略随 VMA 分裂、合并、mprotect、mremap 和后续 fork 保留；锁定与 fork 策略共用原 flags 字段、分别按位修改，munlockall 只清除锁位。
 

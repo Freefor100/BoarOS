@@ -187,9 +187,13 @@ enum kernel_mm_advice {
     KERNEL_MM_ADVICE_FREE = 8,
     KERNEL_MM_ADVICE_REMOVE = 9,
     KERNEL_MM_ADVICE_DONTFORK = 10, KERNEL_MM_ADVICE_DOFORK = 11,
+    KERNEL_MM_ADVICE_DONTDUMP = 16, KERNEL_MM_ADVICE_DODUMP = 17,
     KERNEL_MM_ADVICE_WIPEONFORK = 18, KERNEL_MM_ADVICE_KEEPONFORK = 19,
+    KERNEL_MM_ADVICE_POPULATE_READ = 22, KERNEL_MM_ADVICE_POPULATE_WRITE = 23,
 };
 int kernel_mm_madvise(struct kernel_mm *, uint64_t, uint64_t, int32_t advice);
+/* Existing mapping; access=0 selects mmap population rather than strict READ/WRITE. */
+int kernel_mm_populate(struct kernel_mm *, uint64_t start, uint64_t end, uint32_t access);
 /* Reclaim anonymous MADV_FREE pages without waiting on a busy MM. */
 uint64_t kernel_mm_reclaim_lazy(struct physical_page_allocator *, uint64_t pages,
                                 uint64_t *mappings_detached);
