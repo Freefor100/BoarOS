@@ -91,6 +91,7 @@ void kernel_vfs_retire_mount_tree(struct kernel_vfs_mount *);
 int kernel_vfs_move_mount(struct kernel_vfs_path *source, struct kernel_vfs_path *target,unsigned flags);
 int kernel_vfs_clone_tree(struct kernel_vfs_path *,int,struct kernel_vfs_path **);
 void kernel_vfs_close_tree(struct kernel_vfs_mount *);
+int kernel_vfs_detach_created_mount(struct kernel_vfs_mount *,struct kernel_heap *,uint64_t,struct kernel_vfs_path **);
 int kernel_vfs_set_mount_attributes(struct kernel_vfs_path *,uint64_t,uint64_t,uint64_t,int);
 int kernel_vfs_pivot_root(const struct kernel_fs_context *,struct kernel_vfs_path *,struct kernel_vfs_path *);
 int kernel_vfs_umount(struct kernel_vfs_path *root, unsigned flags);
@@ -99,6 +100,7 @@ int kernel_vfs_reap_mounts(void);
 int kernel_vfs_cleanup_pending(void);
 int kernel_vfs_mount_attach(struct kernel_vfs_mount *mount,
                             struct kernel_vfs_path *covered);
+int kernel_vfs_mount_reconfigure(struct kernel_vfs_path *,uint64_t,uint64_t,const char *);
 int kernel_vfs_remount(struct kernel_vfs_path *root, uint64_t flags, const char *options);
 int kernel_vfs_mount_prepare_detach(struct kernel_vfs_mount *mount,
     const struct kernel_vfs_path *named_root);

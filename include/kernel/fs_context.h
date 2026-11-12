@@ -67,6 +67,7 @@ struct kernel_vfs_mount *kernel_fs_context_mount_root(const struct kernel_fs_con
 int kernel_fs_context_set_mount_namespace(struct kernel_fs_context *,struct kernel_mount_namespace *);
 uint64_t kernel_fs_context_namespace_id(const struct kernel_fs_context *);
 uint64_t kernel_mount_namespace_id(const struct kernel_mount_namespace *);
+int kernel_mount_namespace_take_tree(struct kernel_vfs_path **,struct kernel_heap *,struct kernel_open_file_description **);
 int kernel_mount_namespace_open_tree(struct kernel_vfs_path *,struct kernel_heap *,int,struct kernel_open_file_description **);
 int kernel_mount_namespace_open(struct kernel_mount_namespace *,struct kernel_heap *,
     uint32_t flags,struct kernel_open_file_description **);

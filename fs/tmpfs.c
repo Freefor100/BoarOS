@@ -892,6 +892,46 @@ static size_t memory_number(const char *p, size_t n, uint64_t *value)
     *value = v;
     return j;
 }
+static int parse_mount_parameter(uint64_t total,const char *key,size_t keylen,
+    const char *value,size_t length,size_t *pages,uint64_t *inodes,uint32_t *mode)
+{
+    if(!value)return -KERNEL_EINVAL;
+    uint64_t v;
+    if(keylen==4&&!memcmp(key,"mode",4)){
+        int error=number(value,length,8,&v);
+        if(error||v>UINT32_MAX)return -KERNEL_EINVAL;
+        *mode=(uint32_t)v&07777;return 0;
+    }
+    size_t consumed=memory_number(value,length,&v);
+    int size=keylen==4&&!memcmp(key,"size",4);
+    if(size&&consumed<length&&value[consumed]=='%'){
+        v=((v<<BOAROS_PAGE_SHIFT)*total)/100;consumed++;
+    }
+    if(!length||consumed!=length)return -KERNEL_EINVAL;
+    if(size)*pages=(v+BOAROS_PAGE_MASK)>>BOAROS_PAGE_SHIFT;
+    else if(keylen==9&&!memcmp(key,"nr_blocks",9)&&v<=INT64_MAX)*pages=v;
+    else if(keylen==9&&!memcmp(key,"nr_inodes",9)&&v<=UINT64_MAX/TMPFS_INODE_SPACE)*inodes=v;
+    else return -KERNEL_EINVAL;
+    return 0;
+}
+static int parse_mount_options(uint64_t total,const char *options,size_t *pages,uint64_t *inodes,uint32_t *mode)
+{
+    for(const char *p=options?options:"";*p;){
+        const char *end=p;while(*end&&*end!=',')end++;
+        const char *eq=p;while(eq<end&&*eq!='=')eq++;
+        if(eq==end)return -KERNEL_EINVAL;
+        int error=parse_mount_parameter(total,p,(size_t)(eq-p),eq+1,(size_t)(end-eq-1),pages,inodes,mode);
+        if(error)return error;
+        p=*end?end+1:end;
+    }
+    return 0;
+}
+int kernel_tmpfs_check_mount_parameter(struct kernel_heap *heap,const char *key,const char *value)
+{
+    size_t pages=0;uint64_t inodes=0;uint32_t mode=0;
+    return parse_mount_parameter(physical_page_total(heap->page_allocator),key,strlen(key),
+        value,value?strlen(value):0,&pages,&inodes,&mode);
+}
 int kernel_tmpfs_create(struct kernel_heap *heap,uint64_t flags,const char *options,struct kernel_vfs_mount **owner)
 {
     if(!heap || !owner || *owner) return -KERNEL_EINVAL;
@@ -900,34 +940,7 @@ int kernel_tmpfs_create(struct kernel_heap *heap,uint64_t flags,const char *opti
     m->instance.heap=heap; m->instance.backend_data=m;
     m->pages.limit=physical_page_total(heap->page_allocator)/2;
     m->inode_limit=m->pages.limit; uint32_t mode=01777;
-    int r=0;
-    for(const char *p=options ? options : "";*p;) {
-        const char *end=p; while(*end && *end!=',') end++;
-        const char *eq=p; while(eq<end && *eq!='=') eq++;
-        if(eq==end) { r=-KERNEL_EINVAL; break; }
-        uint64_t v; size_t n=(size_t)(end-eq-1);
-        size_t key=(size_t)(eq-p);
-        int ismode=key==4 && !memcmp(p,"mode",4);
-        if (ismode) {
-            r=number(eq+1,n,8,&v);
-            if (r || v > UINT32_MAX) { r=-KERNEL_EINVAL; break; }
-            mode=(uint32_t)v & 07777;
-        } else {
-            size_t consumed = memory_number(eq+1,n,&v);
-            int issize=key==4 && !memcmp(p,"size",4);
-            if (issize && consumed < n && eq[1+consumed]=='%') {
-                /* 固定 Linux memparse 饱和；shmem 百分比和向上取整使用 u64 算术。 */
-                v = ((v << BOAROS_PAGE_SHIFT) * physical_page_total(heap->page_allocator)) / 100;
-                consumed++;
-            }
-            if (!n || consumed != n) { r=-KERNEL_EINVAL; break; }
-            if (issize) m->pages.limit=(v+BOAROS_PAGE_MASK)>>BOAROS_PAGE_SHIFT;
-            else if(key==9 && !memcmp(p,"nr_blocks",9) && v<=INT64_MAX) m->pages.limit=v;
-            else if(key==9 && !memcmp(p,"nr_inodes",9) && v<=UINT64_MAX/TMPFS_INODE_SPACE) m->inode_limit=v;
-            else { r=-KERNEL_EINVAL; break; }
-        }
-        p=*end ? end+1 : end;
-    }
+    int r=parse_mount_options(physical_page_total(heap->page_allocator),options,&m->pages.limit,&m->inode_limit,&mode);
     if(r) {dispose(m,m);return r;}
     struct tmp_inode *i=0; r=allocate(m,sizeof(*i),(void **)&i);
     if(r) {dispose(m,m);return r;}

@@ -58,7 +58,7 @@ PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不�
 | 扩展 | 尚缺语义 |
 |---|---|
 | proc 查询扩展 | mounts/mountinfo的FD打开时根目录捕获语义、其他按需线程字段；task 枚举、线程 stat/status、fd/fdinfo、exe/cwd/root、maps 与 thread-self 已提供，边界见[procfs模块](modules/procfs.md) |
-| 挂载接口扩展 | fsopen/fsconfig/fsmount/fspick、open_tree的无VFS路径匿名FD视图及其他新mount API；pivot_root、open_tree、move_mount、mount_setattr与既有传播、命名空间共用连接和引用规则 |
+| 挂载接口扩展 | 文件系统专用参数的在线重配置、open_tree的无VFS路径匿名FD视图及其他新mount API扩展；fsopen/fsconfig/fsmount/fspick与pivot_root、open_tree、move_mount、mount_setattr已共用实例、连接和退休规则 |
 | 挂载属性扩展 | 同步、lazytime、NOSYMFOLLOW、ID映射及其他尚未支持的属性与重配置选项；四种atime策略及O_NOATIME已执行 |
 | umount2 扩展 | MNT_FORCE/EXPIRE 及错误优先级；force 不允许提前释放用户或 DMA 在用对象 |
 

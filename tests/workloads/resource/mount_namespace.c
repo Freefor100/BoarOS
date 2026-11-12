@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <poll.h>
+#include <sys/epoll.h>
 #include <sys/resource.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -246,6 +248,172 @@ static int tree_attr(int fd,const char *path,unsigned flags,uint64_t set,uint64_
     struct native_mount_attr attr={set,clear,propagation,0};
     return (int)syscall(442,fd,path,flags,&attr,sizeof(attr));
 }
+static int fs_open(const char *type,unsigned flags)
+{ return (int)syscall(430,type,flags); }
+static int fs_config(int fd,unsigned command,const char *key,const void *value,int aux)
+{ return (int)syscall(431,fd,command,key,value,aux); }
+static int fs_mount(int fd,unsigned flags,unsigned attributes)
+{ return (int)syscall(432,fd,flags,attributes); }
+static int fs_pick(int fd,const char *path,unsigned flags)
+{ return (int)syscall(433,fd,path,flags); }
+static int filesystem_api(void)
+{
+    ERROR(fs_open("tmpfs",2),EINVAL);ERROR(fs_open("not-a-filesystem",0),ENODEV);
+    ERROR(fs_open((void *)1,0),EFAULT);
+    ERROR(fs_config(-1,6,NULL,NULL,0),EINVAL);
+    ERROR(fs_config(999,6,NULL,NULL,0),EBADF);
+    ERROR(fs_config(999,99,NULL,NULL,0),EOPNOTSUPP);
+    ERROR(fs_config(999,1,NULL,"x",0),EINVAL);
+    ERROR(fs_mount(-1,0,0),EBADF);ERROR(fs_mount(-1,4,0),EINVAL);
+    ERROR(fs_mount(-1,0,0x40),EINVAL);
+    int context=fs_open("tmpfs",1);CHECK(context>=0);
+    CHECK(fcntl(context,F_GETFD)&FD_CLOEXEC);
+    CHECK((fcntl(context,F_GETFL)&O_ACCMODE)==O_RDWR);
+    struct stat st;CHECK(!fstat(context,&st)&&(st.st_mode&0777)==0600&&!(st.st_mode&S_IFMT));
+    struct statfs anonymous;CHECK(!fstatfs(context,&anonymous)&&anonymous.f_type==0x09041934);
+    char byte;ERROR(read(context,&byte,0),ENODATA);ERROR(read(context,&byte,1),ENODATA);ERROR(write(context,"x",1),EINVAL);
+    ERROR(pread(context,&byte,1,0),ESPIPE);ERROR(lseek(context,0,SEEK_SET),ESPIPE);
+    struct pollfd event={.fd=context,.events=POLLIN|POLLOUT};
+    CHECK(poll(&event,1,0)==1&&(event.revents&(POLLIN|POLLOUT))==(POLLIN|POLLOUT));
+    int epoll=epoll_create1(0);CHECK(epoll>=0);struct epoll_event registration={.events=EPOLLIN};
+    ERROR(epoll_ctl(epoll,EPOLL_CTL_ADD,context,&registration),EPERM);CHECK(!close(epoll));
+    CHECK(!mkdir("/context-proc",0755)&&!mount("proc","/context-proc","proc",0,NULL));
+    char fd_name[80],display[80];CHECK(snprintf(fd_name,sizeof(fd_name),"/context-proc/self/fd/%d",context)>0);
+    ssize_t display_len=readlink(fd_name,display,sizeof(display)-1);CHECK(display_len>0);display[display_len]=0;
+    CHECK(!strcmp(display,"anon_inode:[fscontext]")&&!umount("/context-proc")&&!rmdir("/context-proc"));
+    ERROR(fs_mount(context,0,0),EINVAL);
+    ERROR(fs_config(context,1,(void *)1,"0",0),EFAULT);
+    ERROR(fs_config(context,5,"source",NULL,999),EBADF);
+    ERROR(fs_config(context,1,"unknown-option","x",0),EINVAL);
+    ERROR(fs_config(context,1,"mode","0700,size=4096",0),EINVAL);
+    ERROR(fs_config(context,1,"size","64K,mode=0777",0),EINVAL);
+    int devpts_context=fs_open("devpts",0);CHECK(devpts_context>=0);
+    ERROR(fs_config(devpts_context,1,"newinstance","anything",0),EINVAL);
+    ERROR(fs_config(devpts_context,1,"mode","0620,uid=1",0),EINVAL);
+    CHECK(!fs_config(devpts_context,0,"newinstance",NULL,0)&&!close(devpts_context));
+    char long_mode[256];memset(long_mode,'0',sizeof(long_mode));memcpy(long_mode+252,"700",4);
+    CHECK(!fs_config(context,1,"mode",long_mode,0));
+    CHECK(!fs_config(context,1,"size","64K",0));
+    CHECK(!fs_config(context,1,"mode","0700",0));
+    CHECK(!fs_config(context,1,"nr_inodes","32",0));
+    CHECK(!fs_config(context,6,NULL,NULL,0));
+    ERROR(fs_config(context,1,"mode","0777",0),EBUSY);
+    int view=fs_mount(context,1,2|4|8);CHECK(view>=0);
+    CHECK(fcntl(view,F_GETFD)&FD_CLOEXEC);
+    touch("/wrong-mount-point");
+    ERROR(tree_move(view,"",AT_FDCWD,"/wrong-mount-point",4),EINVAL);
+    CHECK(!unlink("/wrong-mount-point")&&!mkdir("/fc",0755));
+    CHECK(!tree_move(view,"",AT_FDCWD,"/fc",4));
+    CHECK(!stat("/fc",&st)&&(st.st_mode&07777)==0700);
+    struct statfs stats;CHECK(!statfs("/fc",&stats)&&stats.f_blocks==65536/(unsigned long)sysconf(_SC_PAGESIZE));
+    int duplicate=dup(context);CHECK(duplicate>=0&&!close(context));context=duplicate;
+    ERROR(fs_config(context,6,NULL,NULL,0),EBUSY);
+    CHECK(!close(context)&&!close(view));touch("/fc/marker");
+    ERROR(mount("/missing-mount-source","/fc/marker","ext4",0,NULL),ENOENT);
+    ERROR(mount("tmpfs","/fc/marker","tmpfs",0,NULL),ENOTDIR);
+    puts("FS-CONTEXT CASE import-state-detached-view-and-dup PASS");
+
+    ERROR(fs_pick(AT_FDCWD,"/fc/marker",0),EINVAL);
+    int pick=fs_pick(AT_FDCWD,"/fc",1);CHECK(pick>=0);
+    ERROR(fs_mount(pick,0,0),EBUSY);
+    CHECK(!fs_config(pick,0,"ro",NULL,0));
+    CHECK(!fs_config(pick,7,NULL,NULL,0));
+    ERROR(open("/fc/new",O_CREAT|O_WRONLY,0600),EROFS);
+    CHECK(!fs_config(pick,0,"rw",NULL,0));CHECK(!fs_config(pick,7,NULL,NULL,0));
+    touch("/fc/new");CHECK(!close(pick));
+    CHECK(!mount(NULL,"/fc",NULL,MS_REMOUNT|MS_RDONLY,NULL));
+    pick=fs_pick(AT_FDCWD,"/fc",0);CHECK(pick>=0);
+    CHECK(!fs_config(pick,0,"rw",NULL,0)&&!fs_config(pick,7,NULL,NULL,0)&&!close(pick));
+    ERROR(open("/fc/legacy",O_CREAT|O_WRONLY,0600),EROFS);
+    CHECK(!tree_attr(AT_FDCWD,"/fc",0,0,1,0));
+    touch("/fc/legacy");puts("FS-CONTEXT CASE reconfigure-and-legacy-mount PASS");
+
+    context=fs_open("tmpfs",0);CHECK(context>=0&&!fs_config(context,6,NULL,NULL,0));
+    int ready[2],go[2];CHECK(!pipe(ready)&&!pipe(go));pid_t child=fork();CHECK(child>=0);
+    if(!child){
+        CHECK(!close(ready[0])&&!close(go[1])&&!unshare(CLONE_NEWNS));
+        int fd=fs_mount(context,0,0);CHECK(fd>=0&&!close(context));
+        CHECK(write(ready[1],"r",1)==1&&read(go[0],&byte,1)==1);
+        CHECK(!mkdir("/child-fc",0755)&&!tree_move(fd,"",AT_FDCWD,"/child-fc",4));
+        touch("/child-fc/alive");CHECK(!close(fd)&&!umount("/child-fc")&&!rmdir("/child-fc"));_exit(0);
+    }
+    CHECK(!close(ready[1])&&!close(go[0])&&read(ready[0],&byte,1)==1&&!close(context));
+    CHECK(write(go[1],"g",1)==1);joined(child);
+    CHECK(!close(ready[0])&&!close(go[1]));ERROR(access("/child-fc",F_OK),ENOENT);
+    puts("FS-CONTEXT CASE fork-namespace-and-last-config-close PASS");
+
+    context=fs_open("tmpfs",0);CHECK(context>=0&&!fs_config(context,6,NULL,NULL,0));
+    int ns=fs_mount(context,3,0);CHECK(ns>=0&&!close(context));
+    child=fork();CHECK(child>=0);
+    if(!child){CHECK(!setns(ns,CLONE_NEWNS));touch("/from-context");_exit(0);}
+    joined(child);CHECK(!close(ns));ERROR(access("/from-context",F_OK),ENOENT);
+    puts("FS-CONTEXT CASE namespace-fd PASS");
+
+    context=fs_open("ext4",0);CHECK(context>=0);
+    CHECK(!fs_config(context,1,"source","/does-not-exist",0));
+    ERROR(fs_config(context,6,NULL,NULL,0),ENOENT);
+    ERROR(fs_config(context,1,"source","/",0),EBUSY);CHECK(!close(context));
+    context=fs_open("tmpfs",0);CHECK(context>=0);
+    ERROR(fs_config(context,2,"size","x",0),EINVAL);
+    ERROR(fs_config(context,2,"size",(void *)1,4),EFAULT);
+    ERROR(fs_config(context,5,"source",NULL,999),EBADF);
+    CHECK(!fs_config(context,8,NULL,NULL,0));
+    int discarded=fs_mount(context,0,0);CHECK(discarded>=0&&!close(discarded)&&!close(context));
+    puts("FS-CONTEXT CASE failed-create-and-unattached-cleanup PASS");
+
+    struct stat original;CHECK(!stat("/",&original));
+    dev_t root_device=original.st_dev;
+    CHECK(!mknod("/context-device",S_IFBLK|0600,root_device)&&!mkdir("/context-disk",0755));
+    context=fs_open("ext4",0);CHECK(context>=0&&!fs_config(context,1,"source","/context-device",0));
+    ERROR(fs_config(context,8,NULL,NULL,0),EBUSY);CHECK(!close(context));
+    context=fs_open("ext4",0);CHECK(context>=0&&!fs_config(context,1,"source","/context-device",0));
+    CHECK(!fs_config(context,6,NULL,NULL,0));view=fs_mount(context,0,1);CHECK(view>=0&&!close(context));
+    CHECK(!tree_move(view,"",AT_FDCWD,"/context-disk",4));
+    CHECK(!stat("/context-disk",&st)&&st.st_dev==original.st_dev&&st.st_ino==original.st_ino);
+    ERROR(open("/context-disk/blocked",O_CREAT|O_WRONLY,0600),EROFS);
+    touch("/context-root-rw");CHECK(!unlink("/context-root-rw"));
+    CHECK(!close(view)&&!umount("/context-disk")&&!rmdir("/context-disk")&&!unlink("/context-device"));
+    puts("FS-CONTEXT CASE block-instance-reuse-exclusive-and-view-readonly PASS");
+
+    CHECK(syscall(151,1000)==0);context=fs_open("tmpfs",0);CHECK(context>=0);
+    CHECK(syscall(151,0)==1000&&!fs_config(context,6,NULL,NULL,0));
+    view=fs_mount(context,0,0);CHECK(view>=0&&!fstat(view,&st)&&st.st_uid==1000&&!close(view)&&!close(context));
+    context=fs_open("tmpfs",0);CHECK(context>=0);child=fork();CHECK(child>=0);
+    if(!child){CHECK(!setuid(1000));ERROR(fs_open("tmpfs",0),EPERM);ERROR(fs_config(context,6,NULL,NULL,0),EPERM);_exit(0);}
+    joined(child);CHECK(!fs_config(context,6,NULL,NULL,0));
+    struct rlimit old_limit,capped;CHECK(!getrlimit(RLIMIT_NOFILE,&old_limit));capped=old_limit;capped.rlim_cur=32;
+    CHECK(!setrlimit(RLIMIT_NOFILE,&capped));int occupied[32],used=0,extra;
+    while((extra=dup(context))>=0){CHECK(used<32);occupied[used++]=extra;}
+    CHECK(errno==EMFILE);ERROR(fs_open("tmpfs",0),EMFILE);ERROR(fs_mount(context,0,0),EMFILE);
+    while(used)CHECK(!close(occupied[--used]));
+    CHECK(!setrlimit(RLIMIT_NOFILE,&old_limit));
+    ERROR(fs_mount(context,0,0),EBUSY);CHECK(!close(context));
+    puts("FS-CONTEXT CASE creator-credentials-capability-and-fd-exhaustion PASS");
+
+    context=fs_open("tmpfs",0);CHECK(context>=0&&!pipe(ready)&&!pipe(go));
+    pid_t racers[2];
+    for(unsigned i=0;i<2;i++){
+        racers[i]=fork();CHECK(racers[i]>=0);
+        if(!racers[i]){CHECK(!close(ready[0])&&!close(go[1])&&read(go[0],&byte,1)==1);
+            int result=fs_config(context,6,NULL,NULL,0);result=result<0?-errno:0;
+            CHECK(write(ready[1],&result,sizeof(result))==sizeof(result));_exit(0);}
+    }
+    CHECK(!close(ready[1])&&!close(go[0])&&write(go[1],"gg",2)==2);
+    int results[2];CHECK(read(ready[0],&results[0],sizeof(int))==sizeof(int)&&read(ready[0],&results[1],sizeof(int))==sizeof(int));
+    joined(racers[0]);joined(racers[1]);CHECK(!close(ready[0])&&!close(go[1]));
+    CHECK((results[0]==0&&results[1]==-EBUSY)||(results[1]==0&&results[0]==-EBUSY));
+    view=fs_mount(context,0,0);CHECK(view>=0&&!close(view)&&!close(context));
+    puts("FS-CONTEXT CASE shared-context-single-create PASS");
+
+    CHECK(!mkdir("/picked-unmount",0755)&&!mount("tmpfs","/picked-unmount","tmpfs",0,NULL));
+    pick=fs_pick(AT_FDCWD,"/picked-unmount",0);CHECK(pick>=0);
+    CHECK(!umount("/picked-unmount")&&!rmdir("/picked-unmount"));
+    CHECK(!fs_config(pick,0,"ro",NULL,0)&&!fs_config(pick,7,NULL,NULL,0)&&!close(pick));
+    puts("FS-CONTEXT CASE pick-retains-instance-without-pinning-namespace-view PASS");
+
+    CHECK(!unlink("/fc/marker")&&!unlink("/fc/new")&&!unlink("/fc/legacy")&&!umount("/fc")&&!rmdir("/fc"));
+    puts("FS-CONTEXT END 9");return 0;
+}
 static int mount_api(void)
 {
     CHECK(!mkdir("/ma",0755)&&!mount("tmpfs","/ma","tmpfs",0,NULL));
@@ -399,6 +567,11 @@ static int mount_api(void)
 }
 int main(void)
 {
+#ifdef MOUNT_CONTEXT_ONLY
+    return filesystem_api();
+#else
+    (void)filesystem_api;
+#endif
 #ifdef MOUNT_API_ONLY
     return mount_api();
 #else

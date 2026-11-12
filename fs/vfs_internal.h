@@ -12,6 +12,8 @@
 extern struct kernel_raw_lock kernel_vfs_state_lock;
 struct kernel_fs_context;
 struct kernel_vfs_path;
+int kernel_vfs_reuse_block_tree(uint64_t,const char *,int,int,struct kernel_heap *,uint64_t,struct kernel_vfs_path **);
+
 size_t kernel_fs_context_pivot_publish(const struct kernel_fs_context *,struct kernel_vfs_path *,struct kernel_vfs_path *);
 struct kernel_vfs_path;
 int kernel_vfs_path_filesystem_string(const struct kernel_vfs_path *,char *,size_t);

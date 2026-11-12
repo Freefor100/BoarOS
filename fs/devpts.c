@@ -87,47 +87,48 @@ static int parse_index(const char *name, size_t n, uint32_t *number)
         return -KERNEL_ENOENT;
     return parse_number(name, n, 10U, number) ? -KERNEL_ENOENT : 0;
 }
-static int options(struct devpts_mount *m, const char *input)
+struct devpts_options {uint32_t slave_mode,max,uid,gid,uid_set,gid_set,ptmx_mode;};
+static int parse_parameter(struct devpts_options *m,const char *key,size_t keylen,const char *value,size_t length)
 {
-    m->slave_mode = 0600U;
-    m->max = KERNEL_DEVPTS_DEFAULT_MAX;
-    for (const char *p = input ? input : ""; *p;) {
-        const char *end = p;
-        while (*end && *end != ',') end++;
-        size_t n = (size_t)(end - p);
-        /* Linux generic_parse_monolithic skips empty comma-separated values. */
-        if (!n) { p = end + 1; continue; }
-        if (n == 11U && !memcmp(p, "newinstance", n)) {
-            p = *end ? end + 1 : end;
-            continue;
-        }
-        const char *eq = p;
-        while (eq < end && *eq != '=') eq++;
-        if (eq == end) return -KERNEL_EINVAL;
-        size_t key = (size_t)(eq - p);
-        int mode = key == 4U && !memcmp(p, "mode", key);
-        int ptmxmode = key == 8U && !memcmp(p, "ptmxmode", key);
-        int max = key == 3U && !memcmp(p, "max", key);
-        const char *value = eq + 1;
-        size_t length = (size_t)(end - value);
-        int negative = max && length && *value == '-';
-        if (negative) {
-            value++; length--;
-            if (length && *value == '+') return -KERNEL_EINVAL;
-        }
-        uint32_t v;
-        if (parse_number(value, length, mode || ptmxmode ? 8U : 0U, &v) ||
-            (negative && v)) return -KERNEL_EINVAL;
-        if (mode) m->slave_mode = v & 07777U;
-        else if (ptmxmode) m->ptmx.stat.mode = KERNEL_VFS_S_IFCHR | (v & 07777U);
-        else if (key == 3U && !memcmp(p, "uid", key) && v != UINT32_MAX) { m->uid = v; m->uid_set=1; }
-        else if (key == 3U && !memcmp(p, "gid", key) && v != UINT32_MAX) { m->gid = v; m->gid_set=1; }
-        else if (max && v <= DEVPTS_OPTION_MAX) m->max = v;
-        else return -KERNEL_EINVAL;
-        p = *end ? end + 1 : end;
+    if(keylen==11&&!memcmp(key,"newinstance",11))return value?-KERNEL_EINVAL:0;
+    if(!value)return -KERNEL_EINVAL;
+    int mode=keylen==4&&!memcmp(key,"mode",4),ptmxmode=keylen==8&&!memcmp(key,"ptmxmode",8);
+    int max=keylen==3&&!memcmp(key,"max",3);
+    int negative=max&&length&&*value=='-';
+    if(negative){value++;length--;if(length&&*value=='+')return -KERNEL_EINVAL;}
+    uint32_t v;
+    if(parse_number(value,length,mode||ptmxmode?8U:0U,&v)||(negative&&v))return -KERNEL_EINVAL;
+    if(mode)m->slave_mode=v&07777U;
+    else if(ptmxmode)m->ptmx_mode=KERNEL_VFS_S_IFCHR|(v&07777U);
+    else if(keylen==3&&!memcmp(key,"uid",3)&&v!=UINT32_MAX){m->uid=v;m->uid_set=1;}
+    else if(keylen==3&&!memcmp(key,"gid",3)&&v!=UINT32_MAX){m->gid=v;m->gid_set=1;}
+    else if(max&&v<=DEVPTS_OPTION_MAX)m->max=v;
+    else return -KERNEL_EINVAL;
+    return 0;
+}
+static int parse_options(struct devpts_options *m,const char *input)
+{
+    m->slave_mode=0600U;m->max=KERNEL_DEVPTS_DEFAULT_MAX;
+    for(const char *p=input?input:"";*p;){
+        const char *end=p;while(*end&&*end!=',')end++;
+        if(end==p){p=end+1;continue;}
+        const char *eq=p;while(eq<end&&*eq!='=')eq++;
+        int error=parse_parameter(m,p,(size_t)(eq-p),eq==end?NULL:eq+1,eq==end?0:(size_t)(end-eq-1));
+        if(error)return error;
+        p=*end?end+1:end;
     }
     return 0;
 }
+static int options(struct devpts_mount *m,const char *input)
+{
+    struct devpts_options value={.ptmx_mode=m->ptmx.stat.mode};
+    int error=parse_options(&value,input);if(error)return error;
+    m->slave_mode=value.slave_mode;m->max=value.max;m->uid=value.uid;m->gid=value.gid;
+    m->uid_set=value.uid_set;m->gid_set=value.gid_set;m->ptmx.stat.mode=value.ptmx_mode;
+    return 0;
+}
+int kernel_devpts_check_mount_parameter(const char *key,const char *value)
+{ struct devpts_options options={0};return parse_parameter(&options,key,strlen(key),value,value?strlen(value):0); }
 
 int kernel_devpts_entry_acquire(struct kernel_devpts_entry *entry)
 {

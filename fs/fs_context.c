@@ -397,15 +397,18 @@ int kernel_mount_namespace_open_tree(struct kernel_vfs_path *source,struct kerne
     struct kernel_vfs_path *copy=NULL;
     int error=kernel_vfs_clone_tree(source,recursive,&copy);
     if(error)return error;
+    error=kernel_mount_namespace_take_tree(&copy,heap,owner);
+    if(error && copy){kernel_vfs_close_tree(kernel_vfs_path_mount(copy));if(kernel_vfs_path_release(&copy))__builtin_trap();}
+    return error;
+}
+int kernel_mount_namespace_take_tree(struct kernel_vfs_path **owner,struct kernel_heap *heap,
+    struct kernel_open_file_description **file)
+{
     struct kernel_mount_namespace *ns=mount_namespace_create(heap);
-    if(!ns) {
-        kernel_vfs_close_tree(kernel_vfs_path_mount(copy));
-        if(kernel_vfs_path_release(&copy))__builtin_trap();
-        return -KERNEL_ENOMEM;
-    }
-    ns->top=copy;ns->copied_tree=1;
-    kernel_vfs_path_mount(copy)->detached_tree=0;
-    error=kernel_mount_namespace_open(ns,heap,0,owner);
+    if(!ns)return -KERNEL_ENOMEM;
+    ns->top=*owner;ns->copied_tree=1;*owner=NULL;
+    kernel_vfs_path_mount(ns->top)->detached_tree=0;
+    int error=kernel_mount_namespace_open(ns,heap,0,file);
     mount_namespace_put(ns);return error;
 }
 

@@ -919,6 +919,8 @@ static int proc_readlink(struct kernel_vfs_node *node, char *buffer,
                 prefix = "mnt:[";
             else if (file_kind == KERNEL_OPEN_FILE_KIND_SOCKET)
                 prefix = "socket:[";
+            else if (file_kind == KERNEL_OPEN_FILE_KIND_FS_CONTEXT)
+                prefix = "anon_inode:[fscontext]";
             else if (file_kind == KERNEL_OPEN_FILE_KIND_EPOLL)
                 prefix = "anon_inode:[eventpoll]";
             else if (file_kind == KERNEL_OPEN_FILE_KIND_INOTIFY)
@@ -932,14 +934,14 @@ static int proc_readlink(struct kernel_vfs_node *node, char *buffer,
             else if (file_kind==KERNEL_OPEN_FILE_KIND_PIDFD)
                 prefix="anon_inode:[pidfd]";
             else prefix = 0;
-            if (!prefix || (file_kind != KERNEL_OPEN_FILE_KIND_INOTIFY && file_kind != KERNEL_OPEN_FILE_KIND_PIDFD && file_kind != KERNEL_OPEN_FILE_KIND_EPOLL && file_kind != KERNEL_OPEN_FILE_KIND_EVENTFD && file_kind != KERNEL_OPEN_FILE_KIND_TIMERFD && file_kind != KERNEL_OPEN_FILE_KIND_SIGNALFD &&
+            if (!prefix || (file_kind != KERNEL_OPEN_FILE_KIND_FS_CONTEXT && file_kind != KERNEL_OPEN_FILE_KIND_INOTIFY && file_kind != KERNEL_OPEN_FILE_KIND_PIDFD && file_kind != KERNEL_OPEN_FILE_KIND_EPOLL && file_kind != KERNEL_OPEN_FILE_KIND_EVENTFD && file_kind != KERNEL_OPEN_FILE_KIND_TIMERFD && file_kind != KERNEL_OPEN_FILE_KIND_SIGNALFD &&
                             !identity)) result = -KERNEL_ENOENT;
             else {
                 char display[64];
                 prefix_length = strlen(prefix);
                 memcpy(display, prefix, prefix_length);
                 size_t length = prefix_length;
-                if (file_kind != KERNEL_OPEN_FILE_KIND_INOTIFY && file_kind != KERNEL_OPEN_FILE_KIND_PIDFD && file_kind != KERNEL_OPEN_FILE_KIND_EPOLL && file_kind != KERNEL_OPEN_FILE_KIND_EVENTFD && file_kind != KERNEL_OPEN_FILE_KIND_TIMERFD && file_kind != KERNEL_OPEN_FILE_KIND_SIGNALFD) {
+                if (file_kind != KERNEL_OPEN_FILE_KIND_FS_CONTEXT && file_kind != KERNEL_OPEN_FILE_KIND_INOTIFY && file_kind != KERNEL_OPEN_FILE_KIND_PIDFD && file_kind != KERNEL_OPEN_FILE_KIND_EPOLL && file_kind != KERNEL_OPEN_FILE_KIND_EVENTFD && file_kind != KERNEL_OPEN_FILE_KIND_TIMERFD && file_kind != KERNEL_OPEN_FILE_KIND_SIGNALFD) {
                     length += decimal(display + length, identity);
                     display[length++] = ']';
                 }

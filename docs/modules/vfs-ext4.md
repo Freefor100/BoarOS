@@ -126,6 +126,25 @@ ext4 转 RO 前排空至 checkpoint，再独占 journal 服务资格，暂停存
 
 ### 挂载树 FD 与根切换
 
+`fsopen(430)` 创建文件系统配置上下文 FD，`fsconfig(431)` 设置参数并执行创建或重配置，`fsmount(432)` 从已创建的实例取得独立挂载视图，`fspick(433)` 为现有挂载的实例创建重配置上下文。旧 `mount(40)` 与这些接口共用 `fs/mount_context.c` 的实例创建，以及 VFS 的重配置和树退休实现；不会拼装用户参数再调用一遍旧 syscall。
+
+| 对象 | 持有内容与结束方式 |
+|---|---|
+| 配置上下文 FD | 保存已接纳参数、创建者凭据和一份私有实例视图。dup、fork、FD传递共享同一OFD和配置锁；最后关闭归还视图及凭据 |
+| `fsmount` 返回的挂载 FD | 独立持有同一实例的另一份未接入视图，默认O_PATH；`move_mount`接入后由命名空间连接保活，关闭FD只结束该FD自己的借用 |
+| `fspick` 上下文 | 取得实例与目录项的私有视图，不保留所选命名空间挂载路径。因此上下文打开期间允许正常卸载原挂载，实例继续由上下文保活 |
+| 命名空间 FD | `FSMOUNT_NAMESPACE` 将新视图交给独立命名空间，可用于setns；命名空间最后使用者结束后退休其树 |
+
+上下文依次经过“创建参数→等待fsmount→重配置参数”；创建或重配置的实际执行失败后进入失败状态。fsmount建立视图后即结束原创建阶段，后续FD额度不足也不把上下文恢复成尚未挂载的状态。每个上下文使用可睡眠互斥，序列化共享FD上的配置与提交；用户参数先完整导入，再进入实际状态处理。
+
+当前创建类型为tmpfs、devpts、proc、mqueue、ext4、vfat、bpf、tracefs、sysfs。tmpfs支持size、nr_blocks、nr_inodes、mode；devpts支持newinstance、mode、ptmxmode、uid、gid、max；source使用字符串，块设备路径在创建时按本次调用者的root/cwd解析。新接口保留参数类型和完整值：旧mount的逗号选项与fsconfig的逐项参数复用后端标量解析，单个值不能被解释成多个选项。普通块设备创建复用已存在的实例及缓存/日志；CREATE_EXCL遇到已有实例返回EBUSY。
+
+ro/rw通过fsconfig控制实例状态；fsmount的RDONLY、NOSUID、NODEV、NOEXEC与atime属性控制新视图。fsconfig重新变为rw不会清除某个视图显式设置的RDONLY；旧remount仍按原规则同时更新实例及指定视图。CAP_SYS_ADMIN按实际调用者检查，创建者凭据仅用于创建实例时的默认归属。创建未接入、参数失败、FD耗尽和最后关闭均通过真实owner清理，设备错误保留既有退休/重试关系。
+
+当前重配置只支持共同的ro/rw，文件系统专用参数的在线修改仍未提供；同步、lazytime、NOSYMFOLLOW和ID映射没有因此开放。BINARY/PATH/FD形式完成原生参数和用户内存导入校验，当前后端没有使用这些类型的专用选项。配置FD使用anon_inode语义，可查询、dup、关闭和传递，不接受普通写入或定位I/O；当前不生成扩展诊断文本，无日志记录时read返回ENODATA。
+
+直接消费者为`tests/workloads/resource/mount_namespace.c`的mount_context选择，复用`tests/userland/api8.py --program mount_context`。同ELF Linux差分覆盖状态、参数类型、实例/视图只读区别、命名空间、实际卸载、创建者凭据、FD耗尽和共享上下文竞争；宿主created-tree组覆盖根路径与命名空间接管的分配失败及owner归还。
+
 `open_tree(428)` 不带克隆标志时取得实际路径的 O_PATH 描述；`OPEN_TREE_CLONE` 创建尚未连接的挂载视图树，`AT_RECURSIVE` 复制可绑定的子挂载。FD 本身不复制文件内容，克隆视图继续共用原文件系统实例。EMPTY_PATH当前要求FD有真实VFS路径，无路径的匿名socket等对象不提供挂载树视图。克隆根的原始 OFD 持有一份树清理 owner，dup、fork和FD传递共享它；最后一个 OFD 使用者关闭时，只有仍未连接的树才进入既有退休队列。其他路径、文件和 mmap 继续按自己的引用存活。`OPEN_TREE_NAMESPACE` 则把所选树放入独立挂载命名空间，返回可供 setns 使用的真实命名空间 FD，与 CLONE 标志互斥。
 
 `move_mount(429)` 使用目录 FD 与路径，或 EMPTY_PATH 指向的实际对象，转移挂载连接；源、目标 OFD 的借用覆盖整个操作，避免并发关闭提前退休未连接的源树。已连接源须属于调用者命名空间；分离源须为所持树根并核对创建时的命名空间ID，不能单独提取其中的子挂载。成功挂入后，连接接管原树 owner，关闭原克隆 FD 不会卸载它。符号链接跟随和空路径由源、目标各自的 flags 控制。BENEATH 将源挂在目标覆盖挂载下面，目标的原内容继续可见；SET_GROUP 在同一文件系统、符合根范围与传播资格的视图之间建立对应 peer/master 关系。现有 mount(MS_MOVE) 使用同一移动实现。

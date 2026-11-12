@@ -34,4 +34,5 @@ void kernel_tmpfs_memory_modified(struct kernel_vfs_file *file);
 int kernel_tmpfs_is_mount(const struct kernel_vfs_mount *mount);
 int kernel_tmpfs_create(struct kernel_heap *, uint64_t flags, const char *options,
                          struct kernel_vfs_mount **owner);
+int kernel_tmpfs_check_mount_parameter(struct kernel_heap *,const char *,const char *);
 #endif
