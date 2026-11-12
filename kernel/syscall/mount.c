@@ -263,7 +263,7 @@ static struct kernel_vfs_mount *mount_tree_top(const struct kernel_vfs_path *pat
 static int anonymous_tree(const struct kernel_vfs_path *path,uint64_t namespace_id)
 {
     struct kernel_vfs_mount *top=mount_tree_top(path);
-    return top->detached_tree && !top->namespace_retiring && !top->retired && top->detached_origin==namespace_id;
+    return top->detached_tree && !__atomic_load_n(&top->namespace_retiring,__ATOMIC_ACQUIRE) && !top->retired && top->detached_origin==namespace_id;
 }
 struct native_mount_attributes {uint64_t set,clear,propagation,userns;};
 /* User import is complete before the tree publication path begins; its
@@ -393,7 +393,8 @@ static int mount_api(struct kernel_task *caller,struct kernel_mm *mm,
         int target_here=kernel_vfs_mount_contains(top,call->target);
         if(flags&0x100U) {
             struct kernel_vfs_mount *from=mount_tree_top(call->source),*to=mount_tree_top(call->target);
-            error=(from->retired||from->namespace_retiring||to->retired||to->namespace_retiring)?-KERNEL_EINVAL:
+            error=(from->retired||__atomic_load_n(&from->namespace_retiring,__ATOMIC_ACQUIRE)||
+                to->retired||__atomic_load_n(&to->namespace_retiring,__ATOMIC_ACQUIRE))?-KERNEL_EINVAL:
                 kernel_vfs_move_mount(call->source,call->target,flags&0x300U);
         } else if(source_here)error=target_here?kernel_vfs_move_mount(call->source,call->target,flags&0x300U):-KERNEL_EINVAL;
         else error=source_anon && mount_tree_top(call->source)==kernel_vfs_path_mount(call->source) &&
