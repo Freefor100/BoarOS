@@ -1774,3 +1774,18 @@ enum kernel_syscall_status syscall_handle_file_advice(struct kernel_task *caller
         explicit_readahead,&decoded->value)) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     return KERNEL_SYSCALL_STATUS_OK;
 }
+
+enum kernel_syscall_status syscall_handle_splice(struct kernel_task *caller,
+    const struct kernel_syscall_request *request,struct kernel_syscall_result *decoded)
+{
+    struct kernel_files *files;struct kernel_mm *mm;
+    decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+    if(kernel_task_files_borrow(caller,&files))return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    if(request->number!=77 && kernel_task_mm_borrow_mutable(caller,&mm))return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    enum kernel_files_status status;
+    const uint64_t *a=request->arguments;
+    if(request->number==75)status=kernel_files_vmsplice(files,mm,(int32_t)a[0],a[1],a[2],(uint32_t)a[3],&decoded->value);
+    else if(request->number==77)status=kernel_files_tee(files,(int32_t)a[0],(int32_t)a[1],a[2],(uint32_t)a[3],&decoded->value);
+    else status=kernel_files_splice(files,mm,(int32_t)a[0],a[1],(int32_t)a[2],a[3],a[4],(uint32_t)a[5],&decoded->value);
+    return status?KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT:KERNEL_SYSCALL_STATUS_OK;
+}

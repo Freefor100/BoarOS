@@ -190,6 +190,7 @@ static void initialize_devices(void)
         null->rdev = UINT64_C(0x103);
         null->kind = KERNEL_OPEN_FILE_KIND_NULL;
         null->discard_writes = 1U;
+        null->splice_write = 1U;
         null->positioned = 1U;
         null->empty_range_fault = 1U;
         null->read = empty_read;
@@ -199,6 +200,7 @@ static void initialize_devices(void)
         zero->rdev = UINT64_C(0x105);
         zero->kind = KERNEL_OPEN_FILE_KIND_ZERO;
         zero->discard_writes = 1U;
+        zero->splice_read = zero->splice_write = 1U;
         zero->positioned = 1U;
         zero->empty_range_fault = 1U;
         zero->read = zero_read;
@@ -217,6 +219,7 @@ static void initialize_devices(void)
             rng->kind = i == 3 ? KERNEL_OPEN_FILE_KIND_RANDOM
                               : KERNEL_OPEN_FILE_KIND_URANDOM;
             rng->positioned = 1U;
+            rng->splice_read = rng->splice_write = 1U;
             rng->empty_range_fault = 1U;
             rng->ioctl = random_ioctl;
             rng->interruptible_bulk = 1U;

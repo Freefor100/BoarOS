@@ -330,6 +330,7 @@ COMMON_C_SOURCES := \
 	fs/files/table.c \
 	fs/files/locks.c \
 	fs/files/io.c \
+	fs/files/transfer.c \
 	fs/files/range.c \
 	fs/files/path.c \
 	fs/files/metadata.c \

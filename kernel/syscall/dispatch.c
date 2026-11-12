@@ -565,6 +565,9 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
                request->number == 286U || request->number == 287U) {
         if (syscall_handle_positioned_iov(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 75U || request->number == 76U || request->number == 77U) {
+        if(syscall_handle_splice(caller,request,&decoded)!=KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == 213U || request->number == 223U) {
         if (syscall_handle_file_advice(caller,request,&decoded)!=KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;

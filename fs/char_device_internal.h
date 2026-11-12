@@ -22,6 +22,7 @@ struct kernel_char_device {
     uint8_t positioned;
     uint8_t empty_range_fault;
     uint8_t interruptible_bulk;
+    uint8_t splice_read, splice_write;
     /* 一份OFD持有一个实例；dup/fork与阻塞pin不重复打开设备。 */
     int (*open)(struct kernel_heap *heap, struct kernel_task *caller,
                 uint32_t flags, const struct kernel_vfs_file *path, void **instance);

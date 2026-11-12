@@ -333,6 +333,13 @@ enum kernel_files_status kernel_files_write(
     uint64_t count,
     int64_t *linux_result);
 
+enum kernel_files_status kernel_files_splice(struct kernel_files *,struct kernel_mm *,
+    int64_t in_fd,uint64_t in_offset,int64_t out_fd,uint64_t out_offset,uint64_t count,uint32_t flags,int64_t *);
+enum kernel_files_status kernel_files_tee(struct kernel_files *,int64_t in_fd,int64_t out_fd,
+    uint64_t count,uint32_t flags,int64_t *);
+enum kernel_files_status kernel_files_vmsplice(struct kernel_files *,struct kernel_mm *,
+    int64_t fd,uint64_t iov,uint64_t count,uint32_t flags,int64_t *);
+
 enum kernel_files_status kernel_files_sendfile(
     struct kernel_files *files, struct kernel_mm *mm, int64_t out_fd,
     int64_t in_fd, uint64_t user_offset, uint64_t count, int64_t *linux_result);

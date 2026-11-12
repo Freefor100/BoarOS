@@ -8,6 +8,7 @@
 #include <kernel/files.h>
 #include <kernel/heap.h>
 #include <kernel/mm.h>
+#include <kernel/irq.h>
 #include <kernel/open_file.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
@@ -165,9 +166,9 @@ enum kernel_pipe_status kernel_pipe_create(
     kernel_wait_queue_init(&pipe->read_queue);
     kernel_wait_queue_init(&pipe->write_queue);
     kernel_wait_queue_init(&pipe->both_queue);
-    /* read在前，只有同页合并时才按key顺序短暂等待write；writer不反向取read。 */
-    kernel_mutex_init(&pipe->read_lock,15U,(uintptr_t)&pipe->read_lock);
-    kernel_mutex_init(&pipe->write_lock,15U,(uintptr_t)&pipe->write_lock);
+    /* 片段资格先于OFD/rank10、UNIX控制/rank10和VFS写操作/rank15；跨管道按key排列。 */
+    kernel_mutex_init(&pipe->read_lock,9U,(uintptr_t)&pipe->read_lock);
+    kernel_mutex_init(&pipe->write_lock,9U,(uintptr_t)&pipe->write_lock);
     uint64_t identity=__atomic_load_n(&next_pipe_proc_identity,__ATOMIC_RELAXED);
     for (;;) {
         if (!identity || identity==UINT64_MAX) __builtin_trap();
@@ -181,6 +182,7 @@ enum kernel_pipe_status kernel_pipe_create(
 
 static void pipe_notify(struct kernel_pipe *pipe,int readers,int writers)
 {
+    KERNEL_IRQ_SCOPE(irq);
     struct kernel_wait_queue *queues[]={&pipe->read_queue,&pipe->write_queue,&pipe->both_queue};
     int notify[]={readers,writers,readers||writers};
     for (unsigned i=0;i<3;i++) if (notify[i]) {
@@ -444,84 +446,272 @@ static uint16_t pipe_tail_space(const struct kernel_pipe *pipe)
                       pipe->buffers[last].length);
 }
 
-/* 已在对象raw保护内登记；释放复制资格后park，finish覆盖所有返回路径。 */
-static enum kernel_scheduler_status pipe_park(struct kernel_lock_guard *copy,
-    struct kernel_wait_token *token,enum kernel_wait_wake_reason *reason)
+static int pipe_wait_ready(struct kernel_pipe *pipe,int writing,int nonblocking)
 {
-    kernel_lock_release(copy);
-    enum kernel_scheduler_status status=kernel_wait_park(token,reason);
-    if (kernel_wait_finish(token)) __builtin_trap();
-    return status;
-}
-enum kernel_pipe_status kernel_pipe_readv(struct kernel_pipe *pipe,struct kernel_mm *mm,
-    const struct kernel_uaccess_iovec *iov,size_t iov_count,uint64_t count,
-    uint32_t flags,int64_t *result)
-{
-    if (!pipe || !mm || !result || !pipe->heap || !pipe->allocator)
-        return KERNEL_PIPE_STATUS_INVALID_ARGUMENT;
-    if ((flags & 3)==1) { *result=-KERNEL_EBADF; return KERNEL_PIPE_STATUS_OK; }
-    if (!count) { *result=0; return KERNEL_PIPE_STATUS_OK; }
-    uintptr_t irq=arch_interrupt_save();
-    KERNEL_LOCK_SCOPE(copy); kernel_mutex_lock(&pipe->read_lock,&copy);
-    uint64_t requested;
     for (;;) {
         struct kernel_wait_token token={0};
-        enum kernel_scheduler_status status;
         {
             PIPE_META(guard,pipe);
-            requested=count<pipe->bytes ? count : pipe->bytes;
-            if (requested) break;
-            if (!pipe->writers || (flags & KERNEL_PIPE_NONBLOCK)) {
-                *result=!pipe->writers ? 0 : -KERNEL_EAGAIN;
-                kernel_raw_scope_release(&guard);
-                kernel_lock_scope_release(&copy); arch_interrupt_restore(irq);
-                return KERNEL_PIPE_STATUS_OK;
-            }
-            status=kernel_wait_prepare(&pipe->read_queue,0,1,&token);
-            /* 条件和登记由同一metadata保护；发布者只能在解锁后改变条件。 */
-            if (pipe->bytes || !pipe->writers) __builtin_trap();
+            if (writing) {
+                if (!pipe->readers) return -KERNEL_EPIPE;
+                if (pipe->slots<pipe->ring_size) return 0;
+            } else if (pipe->bytes || !pipe->writers) return 0;
+            if (nonblocking) return -KERNEL_EAGAIN;
+            if (kernel_wait_prepare(writing?&pipe->write_queue:&pipe->read_queue,0,1,&token)) __builtin_trap();
         }
-        if (status) { kernel_lock_scope_release(&copy); arch_interrupt_restore(irq); return KERNEL_PIPE_STATUS_STATE; }
         enum kernel_wait_wake_reason reason;
-        status=pipe_park(&copy,&token,&reason);
-        if (status) { arch_interrupt_restore(irq); return KERNEL_PIPE_STATUS_STATE; }
-        if (reason==KERNEL_WAIT_SIGNALLED) { *result=-KERNEL_ERESTARTSYS; arch_interrupt_restore(irq); return KERNEL_PIPE_STATUS_OK; }
-        kernel_mutex_lock(&pipe->read_lock,&copy);
+        if (kernel_wait_park(&token,&reason) || kernel_wait_finish(&token)) __builtin_trap();
+        if (reason==KERNEL_WAIT_SIGNALLED) return -KERNEL_ERESTARTSYS;
     }
-    struct kernel_uaccess_iov_cursor cursor={iov,iov_count,0,0};
-    uint64_t committed=0; int fault=0;
-    while (committed<requested) {
-        uint32_t slot; uint16_t offset; size_t chunk;
+}
+int64_t kernel_pipe_read_begin(struct kernel_pipe *pipe,size_t count,int nonblocking,
+    struct kernel_pipe_read_borrow *borrow)
+{
+    if (!count || borrow->guard.lock) __builtin_trap();
+    for (;;) {
+        int error=pipe_wait_ready(pipe,0,nonblocking);
+        if (error) return error;
+        kernel_mutex_lock(&pipe->read_lock,&borrow->guard);
         for (;;) {
             PIPE_META(guard,pipe);
+            if (!pipe->bytes) break;
             if (pipe->merge_slot==pipe->head) {
                 kernel_raw_scope_release(&guard);
                 KERNEL_LOCK_SCOPE(writer);kernel_mutex_lock(&pipe->write_lock,&writer);
                 continue;
             }
-            slot=pipe->head; offset=pipe->buffers[slot].offset;
-            if (!pipe->slots || !pipe->buffers[slot].length) __builtin_trap();
-            uint64_t length=requested-committed;
-            chunk=length<pipe->buffers[slot].length ? (size_t)length : pipe->buffers[slot].length;
-            pipe->read_slot=slot;
+            struct kernel_pipe_buffer *part=&pipe->buffers[pipe->head];
+            if (!pipe->slots || !part->page || !part->length || pipe->read_slot!=KERNEL_PIPE_NO_SLOT) __builtin_trap();
+            pipe->read_slot=pipe->head;borrow->pipe=pipe;
+            borrow->length=count<pipe->bytes?count:(size_t)pipe->bytes;
+            borrow->cursor_slot=pipe->head;borrow->cursor_position=0;
+            return (int64_t)borrow->length;
+        }
+        int eof;
+        { PIPE_META(guard,pipe);eof=!pipe->bytes && !pipe->writers; }
+        kernel_lock_release(&borrow->guard);
+        if (eof) return 0;
+    }
+}
+void kernel_pipe_read_finish(struct kernel_pipe_read_borrow *borrow,size_t consumed)
+{
+    struct kernel_pipe *pipe=borrow->pipe;
+    if (!pipe || consumed>borrow->length || !borrow->guard.lock) __builtin_trap();
+    size_t left=consumed;
+    while (left) {
+        void *page=NULL;
+        {
+            PIPE_META(guard,pipe);
+            if (pipe->read_slot!=pipe->head || !pipe->slots) __builtin_trap();
+            /* A tail append may have started before this multi-buffer reader
+             * advanced to it. Its published prefix is stable, but do not
+             * retire that slot until the writer ends its reservation. */
+            if (pipe->merge_slot==pipe->head) {
+                kernel_raw_scope_release(&guard);
+                KERNEL_LOCK_SCOPE(writer);kernel_mutex_lock(&pipe->write_lock,&writer);
+                continue;
+            }
+            size_t n=left<pipe->buffers[pipe->head].length?left:pipe->buffers[pipe->head].length;
+            page=pipe_consume(pipe,n);left-=n;pipe->read_slot=pipe->head;
+        }
+        if (page) pipe_release_page(pipe,page);
+    }
+    { PIPE_META(guard,pipe);pipe->read_slot=KERNEL_PIPE_NO_SLOT; }
+    kernel_lock_release(&borrow->guard);*borrow=(struct kernel_pipe_read_borrow){0};
+    if (consumed) pipe_notify(pipe,0,1);
+}
+void kernel_pipe_read_fragment(struct kernel_pipe_read_borrow *borrow,size_t offset,
+    const void **data,size_t *count)
+{
+    struct kernel_pipe *pipe=borrow->pipe;
+    if (!pipe || !borrow->guard.lock || offset>=borrow->length) __builtin_trap();
+    if (offset<borrow->cursor_position) {borrow->cursor_slot=pipe->head;borrow->cursor_position=0;}
+    for (;;) {
+        struct kernel_pipe_buffer part;
+        { PIPE_META(guard,pipe);part=pipe->buffers[borrow->cursor_slot]; }
+        if (!part.length || !part.page) __builtin_trap();
+        size_t within=offset-borrow->cursor_position;
+        if (within<part.length) {
+            *data=part.page+part.offset+within;*count=part.length-within;
+            if (*count>borrow->length-offset)*count=borrow->length-offset;
+            return;
+        }
+        borrow->cursor_position+=part.length;borrow->cursor_slot=next_slot(pipe,borrow->cursor_slot);
+    }
+}
+void kernel_pipe_read_copy(struct kernel_pipe_read_borrow *borrow,size_t offset,void *target,size_t count)
+{
+    if (offset>borrow->length || count>borrow->length-offset) __builtin_trap();
+    unsigned char *out=target;
+    while (count) {
+        const void *data;size_t n;kernel_pipe_read_fragment(borrow,offset,&data,&n);
+        if(n>count)n=count;
+        memcpy(out,data,n);out+=n;offset+=n;count-=n;
+    }
+}
+int kernel_pipe_write_begin(struct kernel_pipe *pipe,int nonblocking,struct kernel_pipe_write_borrow *borrow)
+{
+    if (borrow->guard.lock) __builtin_trap();
+    for (;;) {
+        int error=pipe_wait_ready(pipe,1,nonblocking);
+        if (error) return error;
+        kernel_mutex_lock(&pipe->write_lock,&borrow->guard);
+        { PIPE_META(guard,pipe);
+          error=!pipe->readers?-KERNEL_EPIPE:0;
+          if (!error && pipe->slots<pipe->ring_size) {
+              borrow->pipe=pipe;borrow->slots=pipe->ring_size-pipe->slots;return 0;
+          }
+        }
+        kernel_lock_release(&borrow->guard);
+        if (error) return error;
+    }
+}
+int kernel_pipe_push_page(struct kernel_pipe_write_borrow *borrow,void *page,size_t offset,size_t length)
+{
+    struct kernel_pipe *pipe=borrow->pipe;
+    if (!pipe || !borrow->guard.lock || !page || !length || length>BOAROS_PAGE_SIZE-offset || !borrow->slots) __builtin_trap();
+    {
+        PIPE_META(guard,pipe);
+        if (!pipe->readers) return -KERNEL_EPIPE;
+        if (pipe->slots==pipe->ring_size || pipe->buffers[pipe->tail].page) __builtin_trap();
+        pipe->buffers[pipe->tail]=(struct kernel_pipe_buffer){page,(uint16_t)offset,(uint16_t)length,0};
+        pipe->tail=next_slot(pipe,pipe->tail);pipe->slots++;pipe->bytes+=length;borrow->slots--;
+    }
+    pipe_notify(pipe,1,0);
+    return 0;
+}
+void kernel_pipe_write_finish(struct kernel_pipe_write_borrow *borrow)
+{
+    if (!borrow->pipe || !borrow->guard.lock) __builtin_trap();
+    kernel_lock_release(&borrow->guard);*borrow=(struct kernel_pipe_write_borrow){0};
+}
+
+/* All copy qualifications are ordered by their actual keys, including reverse
+ * A->B/B->A transfers and resize's read->write pair. Wait with none held. */
+int64_t kernel_pipe_link(struct kernel_pipe *in,struct kernel_pipe *out,size_t count,
+    int nonblocking,int consume,unsigned *broken)
+{
+    *broken=0;
+    for (;;) {
+        int error=pipe_wait_ready(in,0,nonblocking);
+        if (!error) error=pipe_wait_ready(out,1,nonblocking);
+        if (error) {*broken=error==-KERNEL_EPIPE;return error;}
+        struct kernel_mutex *locks[]={&in->read_lock,&in->write_lock,&out->read_lock,&out->write_lock};
+        for (unsigned i=1;i<4;i++) for (unsigned j=i;j && (uintptr_t)locks[j]<(uintptr_t)locks[j-1];j--) {
+            struct kernel_mutex *swap=locks[j];locks[j]=locks[j-1];locks[j-1]=swap;
+        }
+        struct kernel_lock_guard guards[4]={{0}};
+        for (unsigned i=0;i<4;i++) kernel_mutex_lock(locks[i],&guards[i]);
+        uint64_t total=0;uint32_t index=in->head,remaining=in->slots;
+        int retry=0;
+        for (;;) {
+            if (!count) break;
+            struct kernel_pipe_buffer part={0};int eof=0,full=0;
+            {
+                PIPE_META(guard,in);
+                eof=!in->bytes && !in->writers;
+                if (remaining) part=in->buffers[index];
+            }
+            { PIPE_META(guard,out);
+              if (!out->readers) {*broken=1;error=-KERNEL_EPIPE;break;}
+              full=out->slots==out->ring_size;
+            }
+            if (!remaining || full || !count) {
+                retry=!total && !eof && (!remaining || full);break;
+            }
+            size_t n=count<part.length?count:part.length;
+            int move=consume && n==part.length;
+            /* Physical refs have a lower raw rank than endpoint metadata. */
+            if (!move) {
+                uint64_t physical;
+                if (!in->heap->physical_address(part.page,&physical) || in->allocator!=out->allocator ||
+                    physical_page_acquire(in->allocator,physical)) __builtin_trap();
+                part.can_merge=0;
+            }
+            int publish=0;
+            {
+                struct kernel_pipe *first=(uintptr_t)in<(uintptr_t)out?in:out,*second=first==in?out:in;
+                PIPE_META(a,first);PIPE_META(b,second);
+                if (!out->readers) {*broken=1;error=-KERNEL_EPIPE;}
+                else {
+                    if (in->read_slot!=KERNEL_PIPE_NO_SLOT || in->merge_slot!=KERNEL_PIPE_NO_SLOT ||
+                        out->read_slot!=KERNEL_PIPE_NO_SLOT || out->merge_slot!=KERNEL_PIPE_NO_SLOT ||
+                        out->buffers[out->tail].page) __builtin_trap();
+                    part.length=(uint16_t)n;out->buffers[out->tail]=part;
+                    out->tail=next_slot(out,out->tail);out->slots++;out->bytes+=n;
+                    if (consume) {void *released=pipe_consume(in,n);if (move && released!=part.page) __builtin_trap();}
+                    publish=1;
+                }
+            }
+            if (!publish) {if (!move) pipe_release_page(out,part.page);break;}
+            total+=n;count-=n;
+            if (consume) {index=in->head;remaining=in->slots;}
+            else {index=next_slot(in,index);remaining--;}
+        }
+        for (unsigned i=4;i;i--) kernel_lock_release(&guards[i-1]);
+        if (total) {pipe_notify(out,1,0);if (consume)pipe_notify(in,0,1);}
+        if (total || error || !retry) return total?(int64_t)total:error;
+    }
+}
+int64_t kernel_pipe_vmsplice(struct kernel_pipe *pipe,struct kernel_mm *mm,
+    const struct kernel_uaccess_iovec *iov,size_t count,uint64_t bytes,int nonblocking,unsigned *broken)
+{
+    *broken=0;
+    struct kernel_pipe_write_borrow borrow={0};
+    int error=kernel_pipe_write_begin(pipe,nonblocking,&borrow);
+    if (error) {*broken=error==-KERNEL_EPIPE;return error;}
+    struct kernel_uaccess_iov_cursor cursor={iov,count,0,0};uint64_t total=0;
+    while (total<bytes && borrow.slots) {
+        uint64_t address=0;size_t size=kernel_uaccess_iov_span(&cursor,bytes-total,&address);
+        if (!size) __builtin_trap();
+        size_t offset=address&BOAROS_PAGE_MASK;
+        if (size>BOAROS_PAGE_SIZE-offset) size=BOAROS_PAGE_SIZE-offset;
+        struct kernel_mm_user_pin pin={0};
+        enum kernel_mm_status status=kernel_uaccess_pin_resolved(mm,address,0,KERNEL_MM_READ,&pin,NULL);
+        if (status) {
+            if(status==KERNEL_MM_STATUS_NO_MEMORY)error=-KERNEL_ENOMEM;
+            else if(status==KERNEL_MM_STATUS_NOT_MAPPED || status==KERNEL_MM_STATUS_ACCESS ||
+                status==KERNEL_MM_STATUS_ADDRESS_SPACE || status==KERNEL_MM_STATUS_BUS_FAULT)error=-KERNEL_EFAULT;
+            else __builtin_trap();
             break;
         }
-        size_t done=0;
-        enum kernel_uaccess_status access=kernel_copy_to_user_iov(mm,&cursor,
-            pipe->buffers[slot].page+offset,chunk,&done);
-        if (access || done!=chunk) {
-            { PIPE_META(guard,pipe); pipe->read_slot=KERNEL_PIPE_NO_SLOT; }
-            if (access!=KERNEL_UACCESS_STATUS_FAULT) { kernel_lock_scope_release(&copy); arch_interrupt_restore(irq); return KERNEL_PIPE_STATUS_STATE; }
-            fault=1; break;
-        }
+        /* The queued reference is independent of the temporary MM pin: unmap,
+         * exit and COW can end that mapping while the pipe remains readable. */
         void *page;
-        { PIPE_META(guard,pipe);pipe->read_slot=KERNEL_PIPE_NO_SLOT;page=pipe_consume(pipe,chunk); }
-        if (page) pipe_release_page(pipe,page);
-        committed+=chunk;
+        if (mm->allocator!=pipe->allocator || physical_page_acquire(pipe->allocator,pin.physical_address) ||
+            physical_page_resolve(pipe->allocator,pin.physical_address,&page)) __builtin_trap();
+        kernel_mm_unpin_user_page(&pin);
+        error=kernel_pipe_push_page(&borrow,page,offset,size);
+        if (error) {pipe_release_page(pipe,page);break;}
+        cursor.offset+=size;total+=size;
     }
-    if (committed) pipe_notify(pipe,0,1);
-    kernel_lock_scope_release(&copy); arch_interrupt_restore(irq);
-    *result=committed ? (int64_t)committed : fault ? -KERNEL_EFAULT : 0;
+    kernel_pipe_write_finish(&borrow);
+    *broken=error==-KERNEL_EPIPE;
+    return total?(int64_t)total:error;
+}
+
+enum kernel_pipe_status kernel_pipe_readv(struct kernel_pipe *pipe,struct kernel_mm *mm,
+    const struct kernel_uaccess_iovec *iov,size_t iov_count,uint64_t count,
+    uint32_t flags,int64_t *result)
+{
+    if (!pipe || !mm || !result) return KERNEL_PIPE_STATUS_INVALID_ARGUMENT;
+    if ((flags&3)==1) {*result=-KERNEL_EBADF;return KERNEL_PIPE_STATUS_OK;}
+    if (!count) {*result=0;return KERNEL_PIPE_STATUS_OK;}
+    struct kernel_pipe_read_borrow borrow={0};
+    int64_t ready=kernel_pipe_read_begin(pipe,count,!!(flags&KERNEL_PIPE_NONBLOCK),&borrow);
+    if(ready<=0){*result=ready;return KERNEL_PIPE_STATUS_OK;}
+    struct kernel_uaccess_iov_cursor cursor={iov,iov_count,0,0};
+    uint64_t total=0;int error=0;
+    while (total<borrow.length) {
+        const void *data;size_t size,copied=0;
+        kernel_pipe_read_fragment(&borrow,(size_t)total,&data,&size);
+        enum kernel_uaccess_status status=kernel_copy_to_user_iov(mm,&cursor,data,size,&copied);
+        if (!status && copied!=size) __builtin_trap();
+        if (status) {if(status!=KERNEL_UACCESS_STATUS_FAULT)__builtin_trap();error=-KERNEL_EFAULT;break;}
+        total+=copied;
+    }
+    kernel_pipe_read_finish(&borrow,(size_t)total);
+    *result=total?(int64_t)total:error;
     return KERNEL_PIPE_STATUS_OK;
 }
 static enum kernel_pipe_status pipe_write_source(struct kernel_pipe *pipe,struct kernel_mm *mm,
@@ -540,7 +730,6 @@ static enum kernel_pipe_status pipe_write_source(struct kernel_pipe *pipe,struct
     struct kernel_uaccess_iov_cursor cursor={iov,iov_count,0,0};
     while (total<count) {
         uint32_t slot; uint16_t offset; size_t chunk; int merging,wait=0;
-        struct kernel_wait_token token={0}; enum kernel_scheduler_status status=KERNEL_SCHEDULER_STATUS_OK;
         {
             PIPE_META(guard,pipe);
             if (!pipe->readers) {
@@ -558,8 +747,6 @@ static enum kernel_pipe_status pipe_write_source(struct kernel_pipe *pipe,struct
                     kernel_lock_scope_release(&copy); arch_interrupt_restore(irq);
                     return KERNEL_PIPE_STATUS_OK;
                 }
-                status=kernel_wait_prepare(&pipe->write_queue,0,1,&token);
-                if (pipe->slots!=pipe->ring_size || !pipe->readers) __builtin_trap();
                 wait=1; slot=offset=0; chunk=0;
             } else {
                 slot=merging ? (pipe->tail+pipe->ring_size-1U)&(pipe->ring_size-1U) : pipe->tail;
@@ -569,13 +756,14 @@ static enum kernel_pipe_status pipe_write_source(struct kernel_pipe *pipe,struct
                 if (merging) pipe->merge_slot=slot;
             }
         }
-        if (status) { kernel_lock_scope_release(&copy); arch_interrupt_restore(irq); return KERNEL_PIPE_STATUS_STATE; }
         if (wait) {
-            enum kernel_wait_wake_reason reason;
-            status=pipe_park(&copy,&token,&reason);
-            if (status) { arch_interrupt_restore(irq); return KERNEL_PIPE_STATUS_STATE; }
-            if (reason==KERNEL_WAIT_SIGNALLED) {
-                result->bytes=total ? (int64_t)total : -KERNEL_ERESTARTSYS;
+            /* No copy reservation exists while full. Reuse the condition+
+             * registration step without carrying a wait token through faults. */
+            kernel_lock_release(&copy);
+            int error=pipe_wait_ready(pipe,1,0);
+            if (error) {
+                result->broken=error==-KERNEL_EPIPE;
+                result->bytes=total ? (int64_t)total : error;
                 arch_interrupt_restore(irq); return KERNEL_PIPE_STATUS_OK;
             }
             kernel_mutex_lock(&pipe->write_lock,&copy); continue;
