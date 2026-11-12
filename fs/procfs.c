@@ -1187,6 +1187,7 @@ static size_t append_hundredths(char *buffer, uint64_t value)
 }
 
 struct proc_mount_entry {
+    char *names; /* Mountpoint followed by filesystem root, captured together. */
     struct kernel_vfs_path *path;
     struct kernel_vfs_path *mount_root;
     const char *source;
@@ -1203,6 +1204,7 @@ static void release_mount_entries(struct kernel_heap *heap,
 {
     if (!*owner) return;
     for (size_t i = 0U; i < count; i++) {
+        if((*owner)[i].names)kernel_heap_release(heap,(*owner)[i].names);
         if ((*owner)[i].path && kernel_vfs_path_release(&(*owner)[i].path))
             __builtin_trap();
         if ((*owner)[i].mount_root &&
@@ -1232,22 +1234,25 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
                                 struct kernel_heap *heap,
                                 char **buffer, size_t *length)
 {
+    KERNEL_LOCK_SCOPE(topology);kernel_vfs_mount_topology_lock(&topology);
     struct kernel_fs_mounts mounts __attribute__((cleanup(kernel_fs_mounts_release)))={0};
     int result=kernel_proc_mounts_snapshot(proc_inode_pid(node->inode),
         proc_resource_identity(node->inode),&mounts);
     if (result) return result;
     struct kernel_vfs_path *root_path=mounts.root;
     struct kernel_vfs_mount *top=kernel_vfs_path_mount(mounts.top);
+    char *data=NULL,*path_text=NULL;
     struct proc_mount_entry *entries = 0;
     size_t captured = 0U;
     int information=proc_inode_kind(node->inode)==PROC_PID_MOUNTINFO_KIND;
     {
-        KERNEL_LOCK_SCOPE(topology);kernel_vfs_mount_topology_lock(&topology);
         size_t count=0;
         for(struct kernel_vfs_mount *it=top;it;it=kernel_vfs_mount_next(it,top))count++;
         if(!count || count>SIZE_MAX/sizeof(*entries) || count>SIZE_MAX/(12U*KERNEL_FS_PATH_MAX+256U))return -KERNEL_EOVERFLOW;
         enum kernel_heap_status hs=kernel_heap_allocate_zeroed(heap,count,sizeof(*entries),(void **)&entries);
         if(hs)return hs==KERNEL_HEAP_STATUS_EMPTY?-KERNEL_ENOMEM:-KERNEL_EIO;
+        hs=kernel_heap_allocate(heap,2U*KERNEL_FS_PATH_MAX,(void **)&path_text);
+        if(hs){result=hs==KERNEL_HEAP_STATUS_EMPTY?-KERNEL_ENOMEM:-KERNEL_EIO;goto Finish;}
         for(struct kernel_vfs_mount *it=top;it;it=kernel_vfs_mount_next(it,top)) {
             struct kernel_vfs_path *path=it==top?mounts.top:it->root_path;
             struct kernel_vfs_path *mount_root=it==top?mounts.top:it->root_path;
@@ -1270,10 +1275,23 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
                     peer=peer->propagation_group?peer->peer_next:master;
                 }while(peer!=master && !e->dominating);
             }
+            result=kernel_vfs_path_string(path,root_path,path_text,KERNEL_FS_PATH_MAX);
+            if(result==-KERNEL_ENOENT){result=0;continue;}
+            if(result)goto Finish;
+            path_text[KERNEL_FS_PATH_MAX]=0;
+            if(information) {
+                result=kernel_vfs_path_filesystem_string(mount_root,path_text+KERNEL_FS_PATH_MAX,KERNEL_FS_PATH_MAX);
+                if(result)goto Finish;
+            }
+            size_t first=strlen(path_text)+1,second=strlen(path_text+KERNEL_FS_PATH_MAX)+1;
+            hs=kernel_heap_allocate(heap,first+second,(void **)&e->names);
+            if(hs){result=hs==KERNEL_HEAP_STATUS_EMPTY?-KERNEL_ENOMEM:-KERNEL_EIO;goto Finish;}
+            memcpy(e->names,path_text,first);memcpy(e->names+first,path_text+KERNEL_FS_PATH_MAX,second);
         }
     }
+    kernel_lock_scope_release(&topology);
+    kernel_heap_release(heap,path_text);path_text=NULL;
     size_t capacity = captured * (12U * KERNEL_FS_PATH_MAX + 256U);
-    char *data = 0, *path_text = 0;
     enum kernel_heap_status allocation = kernel_heap_allocate(heap, capacity,
                                                               (void **)&data);
     if (allocation != KERNEL_HEAP_STATUS_OK) {
@@ -1281,19 +1299,11 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
                                                         : -KERNEL_EIO;
         goto Finish;
     }
-    allocation = kernel_heap_allocate(heap, 2U*KERNEL_FS_PATH_MAX,
-                                       (void **)&path_text);
-    if (allocation != KERNEL_HEAP_STATUS_OK) {
-        result = allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM
-                                                        : -KERNEL_EIO;
-        goto Finish;
-    }
     size_t used = 0U;
     for (size_t i = 0U; i < captured; i++) {
-        result = kernel_vfs_path_string(entries[i].path, root_path,
-                                        path_text, KERNEL_FS_PATH_MAX);
-        if (result == -KERNEL_ENOENT) { result = 0; continue; }
-        if (result) goto Finish;
+        if(!entries[i].names)continue;
+        const char *mountpoint=entries[i].names;
+        const char *filesystem_root=mountpoint+strlen(mountpoint)+1;
         const char *source = entries[i].source ? entries[i].source :
                              entries[i].bpf_type ? entries[i].bpf_type :
                              entries[i].is_proc ? "proc" :
@@ -1302,16 +1312,14 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
                            entries[i].is_proc ? "proc" :
                            entries[i].is_tmpfs ? "tmpfs" : entries[i].is_devpts ? "devpts" : "ext4";
         if(information) {
-            result=kernel_vfs_path_filesystem_string(entries[i].mount_root,path_text+KERNEL_FS_PATH_MAX,KERNEL_FS_PATH_MAX);
-            if(result)goto Finish;
             /* Capacity reserves escaped source, mountpoint, filesystem root
              * and bounded numeric fields for each captured entry. */
             used+=decimal(data+used,entries[i].id);data[used++]=' ';
             used+=decimal(data+used,entries[i].parent);data[used++]=' ';
             used+=decimal(data+used,((entries[i].device>>8U)&0xfffU)|((entries[i].device>>32U)&UINT64_C(0xfffff000)));data[used++]=':';
             used+=decimal(data+used,(entries[i].device&255U)|((entries[i].device>>12U)&UINT64_C(0xffffff00)));data[used++]=' ';
-            used+=append_escaped(data+used,path_text+KERNEL_FS_PATH_MAX);data[used++]=' ';
-            used+=append_escaped(data+used,path_text);
+            used+=append_escaped(data+used,filesystem_root);data[used++]=' ';
+            used+=append_escaped(data+used,mountpoint);
         }
         const char *options[]={entries[i].read_only?" ro":" rw",
             entries[i].nosuid?",nosuid":"",entries[i].nodev?",nodev":"",
@@ -1345,7 +1353,7 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
         size_t part;
         used += append_escaped(data + used, source);
         data[used++] = ' ';
-        used += append_escaped(data + used, path_text);
+        used += append_escaped(data + used, mountpoint);
         data[used++] = ' ';
         part = strlen(kind);
         memcpy(data + used, kind, part);
@@ -1360,6 +1368,7 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
     data = 0;
     result = 0;
 Finish:
+    kernel_lock_scope_release(&topology);
     if (path_text) kernel_heap_release(heap, path_text);
     if (data) kernel_heap_release(heap, data);
     release_mount_entries(heap, &entries, captured);

@@ -17,7 +17,9 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 
 调用者是 scheduler 当前不透明 task，供依赖任务身份或资源的系统调用取得明确上下文；通用解码层不从 RISC-V `tp` 隐式寻找 current。请求包含系统调用号和六个 64 位参数。结果动作定义在公共头中：
 
-当前分派覆盖RV的234个编号、LA的233个编号；这表示入口已接入，各接口的具体支持范围见对应模块。
+当前分派覆盖RV的238个编号、LA的237个编号；这表示入口已接入，各接口的具体支持范围见对应模块。
+
+`pivot_root(41)`、`open_tree(428)`、`move_mount(429)`、`mount_setattr(442)`复用挂载控制与真实FD资源；挂载树、root/cwd及命名空间寿命见[VFS模块](vfs-ext4.md#挂载树-fd-与根切换)。
 `flock(32)`、`close_range(436)`、`epoll_pwait2(441)`、`fchmodat2(452)`和
 `copy_file_range(285)`见[文件接口](kernel-files.md)，`sendmmsg(269)`／`recvmmsg(243)`
 见[网络接口](kernel-network.md)。RV独有的`riscv_flush_icache(259)`见[MM](kernel-mm.md)；
@@ -71,7 +73,7 @@ LA的259仍返回`ENOSYS`。这些入口的直接消费者可用`python3 tests/u
 - `mremap` 编号为 216，按五个原生64位参数调整普通匿名/文件映射，成功返回新地址。支持缩小、原地扩大、MAYMOVE与FIXED搬移，保留COW、共享后备与文件偏移，操作在发起CPU执行；涉及SysV附件的撤销部分沿CPU0执行规则。错误、副作用及未实现模式统一见[MM范围迁移](kernel-mm.md#mremap-区间调整与搬移)。
 - `clone` 编号为 220。支持 SIGCHLD fork/vfork 和 VM/FS/FILES/SIGHAND/THREAD 共享线程形态；进程形态接受 CHILD_SETTID、CHILD_CLEARTID 及 CLONE_FS，线程形态接受 SETTLS、PARENT_SETTID、CHILD_SETTID、CHILD_CLEARTID、SYSVSEM、DETACHED 位。RISC-V 参数顺序为 flags/stack/parent_tid/tls/child_tid。非法 flag 依赖返回 EINVAL，未支持的合法资源组合返回 ENOTSUP；资源、vfork 致命取消、发布和回滚契约见[调度模块](kernel-scheduler.md)。
 - `execve` 编号为 221，准备并提交 RISC-V `ET_EXEC`/`ET_DYN` 映像及非递归 `PT_INTERP` source；成功不返回，失败返回负 Linux errno。路径、解释器、提交点和资源保持规则见[进程映像替换模块](kernel-exec.md)。
-- `mmap` 编号为 222，当前接受 anonymous 或可读普通文件的 `MAP_PRIVATE/MAP_SHARED/MAP_SHARED_VALIDATE`，以及任意 `PROT_NONE/R/W/X` 组合。其中匿名映射接受 PRIVATE/SHARED；SHARED_VALIDATE 用于文件映射。普通 hint、`MAP_FIXED`、`MAP_FIXED_NOREPLACE`、`MAP_STACK` 和 `MAP_NORESERVE` 已实现；fixed-noreplace 冲突返回 `-EEXIST`，地址空间/metadata 不足返回 `-ENOMEM`。文件映射要求有效且非 `O_WRONLY` 的 fd 与页对齐 offset；零长度、非法 fixed 地址、offset 溢出与 fixed-noreplace 冲突在可读性检查前返回各自错误，不可读 OFD 才返回 `-EACCES`。两类拒绝都会释放 syscall 临时 pin 且不提交 VMA。成功后由 MM 独立持有 OFD，所以 close fd 不撤销映射；`MAP_SHARED` 文件写权限与后续 mprotect 升级受初始 OFD 权限约束，`MAP_POPULATE` 接受按需缺页的尽力填充语义；传统映射忽略未知扩展位，文件 SHARED_VALIDATE 对未知扩展返回 `EOPNOTSUPP`。未对齐 offset 或同时指定两种 fixed 模式返回 `EINVAL`，当前无巨大页 hstate，`MAP_HUGETLB` 返回 `EINVAL`，`MAP_LOCKED/MAP_GROWSDOWN` 返回 `EOPNOTSUPP`；anonymous fd 参数按 Linux 语义忽略。
+- `mmap` 编号为 222，当前接受 anonymous 或可读普通文件的 `MAP_PRIVATE/MAP_SHARED/MAP_SHARED_VALIDATE`，以及任意 `PROT_NONE/R/W/X` 组合。其中匿名映射接受 PRIVATE/SHARED；SHARED_VALIDATE 用于文件映射。普通 hint、`MAP_FIXED`、`MAP_FIXED_NOREPLACE`、`MAP_STACK` 和 `MAP_NORESERVE` 已实现；fixed-noreplace 冲突返回 `-EEXIST`，地址空间/metadata 不足返回 `-ENOMEM`。文件映射要求有效且非 `O_WRONLY` 的 fd 与页对齐 offset；零长度、非法 fixed 地址、offset 溢出与 fixed-noreplace 冲突在可读性检查前返回各自错误，不可读 OFD 才返回 `-EACCES`。两类拒绝都会释放 syscall 临时 pin 且不提交 VMA。成功后由 MM 独立持有 OFD，所以 close fd 不撤销映射；`MAP_SHARED` 文件写权限与后续 mprotect 升级受初始 OFD 权限约束，`MAP_POPULATE` 接受按需缺页的尽力填充语义；传统映射忽略未知扩展位，文件 SHARED_VALIDATE 对未知扩展返回 `EOPNOTSUPP`。未对齐 offset 或同时指定两种 fixed 模式返回 `EINVAL`，当前无巨大页 hstate，`MAP_HUGETLB` 返回 `EINVAL`，`MAP_GROWSDOWN` 返回 `EOPNOTSUPP`；MAP_LOCKED、ONFAULT、MAP_POPULATE/NONBLOCK的实际预装与计费见[MM模块](kernel-mm.md)；anonymous fd 参数按 Linux 语义忽略。
 - `mprotect` 编号为 226，要求页对齐起点，整个非空范围必须已有 VMA；洞返回 `-ENOMEM`。长度 0 成功。`PROT_NONE` 保留 resident 内容，恢复权限后内容仍在；RISC-V 仅写请求被规范化为 RW。
 - `waitid` 编号为 95，支持 `P_ALL/P_PID/P_PGID/P_PIDFD`，`WEXITED/WSTOPPED/WCONTINUED/WNOHANG/WNOWAIT` 及 `__WNOTHREAD/__WCLONE/__WALL` 标志。P_PIDFD 持有实际 pidfd 身份；NONBLOCK 目标尚无事件返回 EAGAIN，显式 WNOHANG 返回空信息。waitid/wait4 在调用开始时持有 PID/进程组 identity，阻塞期间 setpgid 或数字重用不改变等待目标。事件先于用户态复制消费（WNOWAIT 保持事件未消费并保留 zombie）；退出事件支持 NULL infop，EFAULT 不回滚已消费事件。有事件时先输出 rusage，再输出 siginfo 六个定义字段；EINVAL、ECHILD、中断和无事件也写六个零字段，保留 siginfo padding 与其余字段，rusage 保持原值。siginfo 复制失败以 EFAULT 覆盖原错误。wait claim 与任务借用覆盖输出过程，归还 claim 时唤醒排队的父线程。
 - `getrusage(165)` 支持 SELF、THREAD、CHILDREN，字段、单位和退出归并见[资源记账](kernel-accounting.md)。

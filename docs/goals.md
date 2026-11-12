@@ -57,9 +57,9 @@ PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不�
 
 | 扩展 | 尚缺语义 |
 |---|---|
-| proc 线程信息 | 其他按需线程字段；task 枚举、线程 stat/status、fd/fdinfo、exe/cwd/root、maps 与 thread-self 已提供，边界见[procfs模块](modules/procfs.md) |
-| 挂载接口扩展 | pivot_root及新mount API仍未提供；shared/slave/private/unbindable、递归转换及mountinfo已接入现有挂载操作 |
-| 挂载属性扩展 | 同步、lazytime及其他尚未支持的属性与重配置选项；四种atime策略及O_NOATIME已执行 |
+| proc 查询扩展 | mounts/mountinfo的FD打开时根目录捕获语义、其他按需线程字段；task 枚举、线程 stat/status、fd/fdinfo、exe/cwd/root、maps 与 thread-self 已提供，边界见[procfs模块](modules/procfs.md) |
+| 挂载接口扩展 | fsopen/fsconfig/fsmount/fspick、open_tree的无VFS路径匿名FD视图及其他新mount API；pivot_root、open_tree、move_mount、mount_setattr与既有传播、命名空间共用连接和引用规则 |
+| 挂载属性扩展 | 同步、lazytime、NOSYMFOLLOW、ID映射及其他尚未支持的属性与重配置选项；四种atime策略及O_NOATIME已执行 |
 | umount2 扩展 | MNT_FORCE/EXPIRE 及错误优先级；force 不允许提前释放用户或 DMA 在用对象 |
 
 当前新 mount 与基础 `MS_REMOUNT` 接受 `MS_RDONLY/MS_NOSUID/MS_NODEV/MS_NOEXEC/MS_SILENT`及atime策略，`MS_BIND` 与 `MS_BIND|MS_REC` 复用实例，`MS_REMOUNT|MS_BIND` 更新单个视图属性，`MS_MOVE` 移动既有挂载连接；umount2 接受 flags=0、`MNT_DETACH`、`UMOUNT_NOFOLLOW`及后两者组合；进程根所属挂载的普通卸载尝试转为 RO；目标仍须是实际挂载根，chroot子目录本身的卸载返回 `EINVAL`，无 parent 的全局根对 `MNT_DETACH` 返回 `EINVAL`。重配置的写入者、映射、同步和失败所有权见[VFS 模块](modules/vfs-ext4.md)。

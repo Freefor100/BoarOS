@@ -52,6 +52,7 @@ struct kernel_open_file_description {
     struct kernel_flock_owner flock_owner;
     struct kernel_flock_identity flock_identity; /* Pathless private inode. */
     uint32_t read_advice; /* Shared by dup/fork/SCM_RIGHTS, independently of status flags. */
+    struct kernel_vfs_mount *mount_tree; /* Borrowed through file.path; one detached tree owner. */
 };
 enum { KERNEL_READ_RANDOM=1, KERNEL_READ_SEQUENTIAL=2, KERNEL_READ_NOREUSE=4 };
 static inline int kernel_open_file_read_no_reuse(const struct kernel_open_file_description *file)

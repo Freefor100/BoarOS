@@ -27,6 +27,7 @@ SOURCES['splice']='io/splice.c'
 SOURCES['memory_advice']='resource/madvise.c'
 SOURCES['atime']='resource/mount_attributes.c'
 SOURCES['propagation']='resource/mount_namespace.c'
+SOURCES['mount_api']='resource/mount_namespace.c'
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -56,6 +57,7 @@ def build(args,work):
                  *(['-DMADVISE_POPULATION_ONLY=1'] if name=='memory_advice' else []),
                  *(['-DMOUNT_ATIME_ONLY=1'] if name=='atime' else []),
                  *(['-DMOUNT_PROPAGATION_ONLY=1'] if name=='propagation' else []),
+                 *(['-DMOUNT_API_ONLY=1'] if name=='mount_api' else []),
                  str(ROOT/'tests/workloads'/source),'-lrt','-o',str(destination)]
         with (work/(name+'-compile.log')).open('w') as log:
             subprocess.run(command,cwd=ROOT,env=env,stdout=log,stderr=subprocess.STDOUT,check=True)
@@ -96,9 +98,12 @@ def build(args,work):
 
 def accepted(raw,arch,cpus,target,selected=None):
     programs=[name for name in (selected or LEGACY) if name!='icache' or arch=='riscv']
+    if target=='boaros' and arch=='riscv' and 'mount_api' in programs:
+        free=re.search(r'task stacks released=0x[0-9a-f]+ min-free=0x([0-9a-f]+)',raw)
+        if not free or int(free[1],16)<1024:return False
     ends=[line for line in raw.replace('\r','').splitlines() if line.startswith('API8 END ')]
     expected=[f'API8 END /{name} status=0' for name in programs]
-    known={'propagation':['PROP END 9'],'atime':['MOUNT-ATTR END 4'],'memory_advice':['MADVISE END 5'],'fd_events':['FD-EVENTS PASS'],'flock':['FLOCK-PASS'],
+    known={'mount_api':['MOUNT-API END 5'],'propagation':['PROP END 9'],'atime':['MOUNT-ATTR END 4'],'memory_advice':['MADVISE END 5'],'fd_events':['FD-EVENTS PASS'],'flock':['FLOCK-PASS'],
            'splice':['SPLICE PASS cases=9'],'file_advice':['ADVICE RESULT cases=3 failures=0'],'copy_range':['COPY_RANGE PASS'],'sched_query':['SCHED-QUERY END cases=7'],
            'icache':[f'ICACHE PASS cpus={cpus}'],
            'vectors_v2':[*(f'VECTORS2 CASE {name} PASS' for name in (

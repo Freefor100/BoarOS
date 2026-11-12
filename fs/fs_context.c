@@ -28,7 +28,9 @@ struct kernel_fs_context_record {
     uint32_t references;
     uint32_t exec_users;
     struct kernel_mount_namespace *namespace;
+    struct kernel_fs_context_record *next,**previous;
 };
+static struct kernel_fs_context_record *contexts;
 
 static void mount_namespace_get_locked(struct kernel_mount_namespace *ns)
 {
@@ -155,6 +157,9 @@ static enum kernel_fs_context_status create_context(
         mount_namespace_get_locked(ns);
         record->namespace=ns;
     }
+    record->next=contexts;record->previous=&contexts;
+    if(contexts)contexts->previous=&record->next;
+    contexts=record;
     fs->heap = heap;
     fs->record = record;
     fs->state = KERNEL_FS_CONTEXT_LIVE;
@@ -202,6 +207,8 @@ static enum kernel_fs_context_status fork_context(
     if (destination == 0 || source == 0 || destination == source) {
         return KERNEL_FS_CONTEXT_STATUS_INVALID_ARGUMENT;
     }
+    KERNEL_LOCK_SCOPE(topology);
+    kernel_vfs_mount_topology_lock(&topology);
     struct kernel_heap *heap;
     struct kernel_mount_namespace *ns;
     struct kernel_fs_paths paths __attribute__((cleanup(kernel_fs_paths_release))) = {0};
@@ -291,6 +298,7 @@ int kernel_fs_context_unshare(struct kernel_fs_context *fs,int new_mount_namespa
 int kernel_fs_context_set_mount_namespace(struct kernel_fs_context *fs,struct kernel_mount_namespace *ns)
 {
     if (!ns || !kernel_fs_context_is_live(fs)) return -KERNEL_EINVAL;
+    KERNEL_LOCK_SCOPE(topology);kernel_vfs_mount_topology_lock(&topology);
     {
         KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
         if (fs->record->references!=1) return -KERNEL_EINVAL;
@@ -306,6 +314,37 @@ int kernel_fs_context_set_mount_namespace(struct kernel_fs_context *fs,struct ke
     result=replace_context(fs,&next,1);
     if (result && kernel_fs_context_release(&next)) __builtin_trap();
     return result;
+}
+
+/* The caller holds topology and VFS state protection. Return old path owners
+ * for release after publishing the complete topology and FS-context change. */
+size_t kernel_fs_context_pivot_publish(const struct kernel_fs_context *fs,
+    struct kernel_vfs_path *old,struct kernel_vfs_path *next)
+{
+    size_t count=0;
+    for(struct kernel_fs_context_record *r=contexts;r;r=r->next) {
+        if(r->root==old){if(kernel_vfs_path_acquire(next))__builtin_trap();r->root=next;count++;}
+        if(r->cwd==old){if(kernel_vfs_path_acquire(next))__builtin_trap();r->cwd=next;count++;}
+    }
+    struct kernel_mount_namespace *ns=fs->record->namespace;
+    if(ns->top==old){
+        if(!ns->copied_tree) {
+            /* The initial root was borrowed from the boot owner. Once it is
+             * an ordinary child, its connection needs an independent owner. */
+            struct kernel_vfs_mount *mount=kernel_vfs_path_mount(old);
+            if(mount->references==UINT32_MAX)__builtin_trap();
+            mount->references++;mount->external_owner=1;ns->copied_tree=1;
+        }
+        if(kernel_vfs_path_acquire(next))__builtin_trap();
+        ns->top=next;count++;
+    }
+    return count;
+}
+
+uint64_t kernel_fs_context_namespace_id(const struct kernel_fs_context *fs)
+{
+    KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+    return fs->record->namespace->id;
 }
 
 uint64_t kernel_mount_namespace_id(const struct kernel_mount_namespace *ns)
@@ -351,6 +390,25 @@ int kernel_mount_namespace_open(struct kernel_mount_namespace *ns,struct kernel_
     return 0;
 }
 
+int kernel_mount_namespace_open_tree(struct kernel_vfs_path *source,struct kernel_heap *heap,int recursive,
+    struct kernel_open_file_description **owner)
+{
+    if(!((kernel_vfs_path_mode(source)&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR))return -KERNEL_ENOTDIR;
+    struct kernel_vfs_path *copy=NULL;
+    int error=kernel_vfs_clone_tree(source,recursive,&copy);
+    if(error)return error;
+    struct kernel_mount_namespace *ns=mount_namespace_create(heap);
+    if(!ns) {
+        kernel_vfs_close_tree(kernel_vfs_path_mount(copy));
+        if(kernel_vfs_path_release(&copy))__builtin_trap();
+        return -KERNEL_ENOMEM;
+    }
+    ns->top=copy;ns->copied_tree=1;
+    kernel_vfs_path_mount(copy)->detached_tree=0;
+    error=kernel_mount_namespace_open(ns,heap,0,owner);
+    mount_namespace_put(ns);return error;
+}
+
 struct kernel_mount_namespace *kernel_mount_namespace_file(const struct kernel_open_file_description *file)
 {
     return file && file->kind==KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE
@@ -372,7 +430,7 @@ struct kernel_fs_mounts kernel_fs_context_mounts_snapshot(const struct kernel_fs
         mounts.root=fs->record->root;
         mounts.top=mounts.namespace->top;
         mount_namespace_get_locked(mounts.namespace);
-        if (kernel_vfs_path_acquire(mounts.root)) __builtin_trap();
+        if (kernel_vfs_path_acquire(mounts.root) || kernel_vfs_path_acquire(mounts.top)) __builtin_trap();
     }
     return mounts;
 }
@@ -380,7 +438,7 @@ struct kernel_fs_mounts kernel_fs_context_mounts_snapshot(const struct kernel_fs
 void kernel_fs_mounts_release(struct kernel_fs_mounts *mounts)
 {
     if (!mounts->namespace) return;
-    if (kernel_vfs_path_release(&mounts->root)) __builtin_trap();
+    if (kernel_vfs_path_release(&mounts->root) || kernel_vfs_path_release(&mounts->top)) __builtin_trap();
     mount_namespace_put(mounts->namespace);
     *mounts=(struct kernel_fs_mounts){0};
 }
@@ -569,6 +627,8 @@ enum kernel_fs_context_status kernel_fs_context_release(struct kernel_fs_context
         record = fs->record;
         finish_context(fs, KERNEL_FS_CONTEXT_RELEASED);
         if (--record->references) return KERNEL_FS_CONTEXT_STATUS_OK;
+        *record->previous=record->next;
+        if(record->next)record->next->previous=record->previous;
     }
     if (kernel_vfs_path_release(&record->cwd) || kernel_vfs_path_release(&record->root))
         __builtin_trap();
