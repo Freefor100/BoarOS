@@ -1,4 +1,4 @@
-"""The native workflow must select RV64 from a mixed OpenSBI package."""
+"""The firmware selector must choose RV64 from a mixed OpenSBI package."""
 import hashlib
 import json
 import os
@@ -8,8 +8,6 @@ import subprocess
 import sys
 import tempfile
 import unittest
-
-import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -34,11 +32,8 @@ class FirmwareSelection(unittest.TestCase):
         qemu.write_text('#!/bin/sh\nprintf "QEMU emulator version 8.2.2\\n"\n')
         qemu.chmod(0o755)
         (work / 'tests').symlink_to(ROOT / 'tests', target_is_directory=True)
-        workflow = yaml.safe_load((ROOT / '.github/workflows/native-contracts.yml').read_text())
-        step = next(step for step in workflow['jobs']['contracts']['steps']
-                    if step.get('name') == 'Record and select the actual SMP firmware')
         environment = work / 'github-env'
-        result = subprocess.run(['sh', '-e', '-c', step['run']], cwd=work,
+        result = subprocess.run([sys.executable, '-B', str(ROOT / 'tests/ci/firmware.py'), '--github-env'], cwd=work,
                                 env=dict(os.environ, PATH=str(binary) + ':' + os.environ['PATH'],
                                          GITHUB_ENV=str(environment)),
                                 capture_output=True, text=True)

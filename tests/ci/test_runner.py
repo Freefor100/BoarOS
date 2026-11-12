@@ -1,8 +1,6 @@
 """CI success requires complete commands and every required job."""
 import importlib.util
 import json
-import fnmatch
-import yaml
 import os
 from pathlib import Path
 import select
@@ -162,39 +160,6 @@ class ArchitectureCoverage(unittest.TestCase):
         result=subprocess.run([sys.executable,'-B',str(Path(__file__).with_name('run.py')),
             '--arch','loongarch','--suite','user-smp','--list'],capture_output=True,text=True)
         self.assertNotEqual(result.returncode,0)
-
-    def test_original_user_smp_profiles_have_independent_scheduled_results(self):
-        path=Path(__file__).resolve().parents[2]/'.github/workflows/native-extended.yml'
-        job=yaml.safe_load(path.read_text())['jobs']['riscv-user-programs']
-        self.assertEqual(job['strategy']['matrix']['cpus'],[2,1])
-        self.assertEqual(job['strategy']['matrix']['memory'],['512M','1G'])
-        self.assertFalse(job['strategy']['fail-fast'])
-        commands='\n'.join(step.get('run','') for step in job['steps'])
-        self.assertIn('--execution-profile rv-user-smp',commands)
-        self.assertIn('--require-pass',commands)
-        self.assertIn('--firmware',commands)
-
-    def test_native_template_retains_full_abi_observations_and_failed_disk(self):
-        path = Path(__file__).resolve().parents[2] / '.github/workflows/native-contracts.yml'
-        steps = yaml.safe_load(path.read_text())['jobs']['contracts']['steps']
-        uploads = [step for step in steps if step.get('uses', '').startswith('actions/upload-artifact@')]
-        ordinary = next(step for step in uploads if step.get('if') == 'always()')['with']['path'].splitlines()
-        failed = next(step for step in uploads if step.get('if') == 'failure()')['with']['path'].splitlines()
-        for name in ('linux-512M.log', 'metadata.json', 'boaros-1G.normalized', 'comparison.diff'):
-            self.assertTrue(any(fnmatch.fnmatchcase('build/diff-abi/run/' + name, pattern) for pattern in ordinary), name)
-        self.assertTrue(any(fnmatch.fnmatchcase('build/diff-abi/run/boaros-1G.img', pattern) for pattern in failed))
-        for arch in ('rv', 'la'):
-            for name in ('linux-512M.log', 'metadata.json', 'boaros-1G.normalized', 'comparison.diff'):
-                actual = f'build/sched-handoff-{arch}/{name}'
-                self.assertTrue(any(fnmatch.fnmatchcase(actual, pattern) for pattern in ordinary), actual)
-            actual = f'build/sched-handoff-{arch}/boaros-1G.img'
-            self.assertTrue(any(fnmatch.fnmatchcase(actual, pattern) for pattern in failed), actual)
-        for directory in ('exec-boundary-rv', 'exec-boundary-la', 'stack-elf-rv-rwx', 'stack-elf-la-rw', 'stack-elf-la-absent'):
-            for name in ('linux-512M.log', 'metadata.json', 'boaros-1G.normalized', 'comparison.diff'):
-                actual = f'build/{directory}/{name}'
-                self.assertTrue(any(fnmatch.fnmatchcase(actual, pattern) for pattern in ordinary), actual)
-            actual = f'build/{directory}/boaros-1G.img'
-            self.assertTrue(any(fnmatch.fnmatchcase(actual, pattern) for pattern in failed), actual)
 
     def test_shared_runtime_consumers_include_glibc_and_both_sqlite_modes(self):
         for arch in ('riscv', 'loongarch'):

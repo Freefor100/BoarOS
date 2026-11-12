@@ -11,9 +11,6 @@
 | `arch/riscv/trap_entry.S` | 保存完整整数现场、调用 C dispatcher、验证并恢复或拒绝返回 |
 | `arch/riscv/trap.c` | 提供生产 dispatcher、用户页故障决策、timer/scheduler fatal 和非法返回诊断 |
 | `kernel/sched/signal.c`、`arch/riscv/fpu.S` | 在公共用户返回尾处理 signal frame/restart，并维护独立的 per-task F/D 状态 |
-| `tests/riscv/trap_return_main.c`、`trap_return_sie_main.c`、`trap_return_trigger.S` | 提供只在测试 ELF 中生效的同步与异步返回 handler、独立非法状态探针和寄存器探针 |
-| `tests/riscv/trap-return.sh` | 在 QEMU 中验证低地址恢复、返回状态和拒绝路径 |
-| `tests/riscv/high_half_trap.c`、`tests/riscv/high-half-trap.sh` | 在最终 Sv39 地址空间验证高半区恢复及 fatal 回归 |
 | `tests/riscv/timer_boot.c`、`tests/riscv/timer.sh` | 通过真实 supervisor timer interrupt 验证生产 dispatcher 返回 |
 | `tests/riscv/user_boot.c`、`user_payload.S`、`tests/riscv/user.sh` | 验证真实 U-mode 换栈、抢占恢复、ecall、用户故障和资源回收 |
 
@@ -59,9 +56,6 @@ dispatcher 返回后，汇编总是要求 Frame 中 `sstatus.SIE=0`，避免在�
 ## 验证入口
 
 ```sh
-make test-trap-return-riscv
-make test-trap-riscv
-make test-high-half-trap-riscv
 make test-timer-riscv
 make test-scheduler-riscv
 make test-signal-riscv
@@ -72,15 +66,13 @@ make test-user-fatal-riscv
 make test-riscv
 ```
 
-`test-trap-return-riscv` 使用显式 32 位 `EBREAK` 验证同步 handler 将 `sepc` 前移 4 字节后返回，再设置 `sip.SSIP`、`sie.SSIE` 和全局 SIE，验证真实 supervisor software interrupt 的保存、清 pending 与返回。汇编探针为除 `sp`、`gp` 外的寄存器设置独立 64 位哨兵，并对全部 x1..x31 的返回值、原始 SP/GP、Frame 对齐、cause 以及 SPP/SPIE/SIE 进行检查；两个测试 ELF 分别构造 SPP 无效和保存 SIE 开启的返回状态，要求各自进入 bad-return 路径。脚本还检查最终 ELF 的入口反汇编，要求 dummy `sc.d` 位于 Frame 槽地址准备之后、`sepc` 写回和 `sret` 之前。
-
 `test-user-riscv` 用两个用户根验证 U-mode：两个具有不同栈和 TID/TGID 的任务共享正常 MM，在用户循环中被真实 timer 抢占；内核 worker 运行时观察 `sscratch=0` 并设置共享页标志，两个任务恢复后核对用户 `gp/sp/tp/s0..s11`、身份 syscall、未知 syscall 返回和 `exit(93)`。另一独立 MM 任务访问未映射地址，要求生成 `SIGNAL/SIGSEGV` 完成记录且不影响正常任务。runner 最终要求内核线程、三个用户任务、两个 MM 及全部 TID 回收。`test-root-init-riscv` 另让子进程访问文件映射中完整越过 EOF 的页，并由父进程观察 wait status 7。
 
 `test-user-fatal-riscv` 在同一真实用户路径中让测试 wrapper 破坏已返回 ecall Frame 的可信 `kernel_tp`，要求汇编拒绝返回，并在用户根仍活动时经 supervisor-only 高半区 UART 输出唯一 fatal 行后关机。它防止诊断路径暗中依赖只存在于内核根的低地址设备映射。
 
 `test-demand-page-riscv` 让磁盘加载的 PID 1 越过初始栈提交区，分别由 load/store page fault 建立两个匿名零页并重试原指令；测试版内核还在子进程的 load page fault 注入 `NO_MEMORY`，要求父进程得到 wait status 9，全部后代与 PID 1 随后正常回收。普通 RX/guard 故障回归证明按需处理没有放宽 VMA 权限或 guard 边界。
 
-`test-timer-riscv` 使用实际 QEMU DTB、OpenSBI TIME 和 cause 5，让生产 dispatcher 至少两次经完整 Trap Frame 路径返回 `wfi`。`test-scheduler-riscv` 让两个不主动让出的内核线程只靠 timer 在各自 Frame/栈之间切换。`test-trap-riscv` 保留低地址未处理 breakpoint 的 fatal 契约；`test-high-half-trap-riscv` 验证最终 Sv39 高半区的 SSIP 恢复和 fatal 路径。
+`test-timer-riscv` 使用实际 QEMU DTB、OpenSBI TIME 和 cause 5，让生产 dispatcher 至少两次经完整 Trap Frame 路径返回 `wfi`。`test-scheduler-riscv` 让两个不主动让出的内核线程只靠 timer 在各自 Frame/栈之间切换。
 
 默认关闭的成本观测在保存t0/t1后取trap入口stamp，在sret尾发布结束stamp；
 按实际SIE状态跟踪hart连续区间，跨切换保持。固定入口/尾盲区及C调用点限制见

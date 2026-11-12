@@ -71,8 +71,8 @@ PR CI 加入规模、SQLite DELETE/WAL 和离线 GCC 入口。SQLite/musl 源按
 恢复后结束和 epoch 复用。宿主核心检查溢出、零/最高桶、取消、延后激活/结束与抑制；
 五项报告测试刻意删除/重复/交换 owner 对应 lane/破坏单位、计数与 histogram，均拒绝。
 
-可重建命令：`make test-cost-riscv COST_CASE=contract`；
-`make COST_DIAGNOSTICS=1 test-context-riscv test-trap-return-riscv`。
+当前契约入口：`make test-cost-riscv COST_CASE=contract`；
+`make COST_DIAGNOSTICS=1 test-context-riscv test-user-riscv`。
 本阶段默认关闭 ELF 与原生产 ELF 的 `.text` 二进制逐字节一致，text/data/bss 分别
 376832/52/502880 字节，`nm` 无 kernel_cost 或聚合存储符号；观测任务新增 48 字节，
 聚合主体 5320 字节，DTB timebase 10 MHz。固定参考继续是
@@ -259,8 +259,8 @@ ordered data、log/commit、durable 与 checkpoint 的原屏障；1 KiB ext4 的
 最终矩阵恢复原触发步骤，未用绕开的夹具结果收口。
 
 ```sh
-make test-writeback-batch-riscv
-python3 -B tests/writeback-batch-riscv.py --pages 1 8 --block-size 1024 4096 --transport legacy
+make test-page-cache-concurrency-host test-file-io-concurrency-host
+make test-lwext4-group-host test-io-sleep-riscv
 ```
 
 这是该阶段的机制与成本验收；随后默认/RA8WB8 的完整恢复与匹配发布吞吐已完成，
@@ -290,9 +290,8 @@ python3 -B tests/writeback-batch-riscv.py --pages 1 8 --block-size 1024 4096 --t
 完整恢复矩阵继续在最终组合验证记录，不能以单函数门禁证明所有调用链。
 
 ```sh
-make test-readahead-riscv
-python3 -B tests/readahead-riscv.py --pages 1 2 4 8 --block-size 4096 --held --transport modern
-python3 -B tests/readahead-riscv.py --pages 1 8 --block-size 4096 --held --transport legacy
+make test-readahead-host test-page-cache-concurrency-host
+make test-file-io-concurrency-host test-io-sleep-riscv
 make CFLAGS_EXTRA='-DBOAROS_PAGE_CACHE_READAHEAD_PAGES=8 -DBOAROS_PAGE_CACHE_WRITEBACK_PAGES=8' test-stack-usage
 ```
 

@@ -27,9 +27,11 @@ python3 -B tests/userland/run.py --help
 python3 -B tests/cost/cost-riscv.py --help
 ```
 
+RISC-V 启动与 trap 返回通过 `test-boot-riscv`、`test-timer-riscv`、`test-user-riscv` 和 `test-user-fatal-riscv` 检查生产调用路径。存储的需求读取、稳定版本和预测行为主要由 `test-page-cache-concurrency-host`、`test-file-io-concurrency-host`、`test-readahead-host` 检查，`test-io-sleep-riscv` 补充真实设备等待与取消；应用成本继续使用 `workloads/io/` 和 `cost/` 的共同消费者。
+
 先选当前问题对应的入口。新增用例优先加入现有消费者；单轮编排、临时探针和报告生成放在 `build/`。运行盘、日志、ELF、缓存也放在 `build/`，不放入本目录。
 
-内核机制见 `docs/modules/`，性能记录由兼容分支的既有报告维护。历史实验按对应 Git 提交复现。
+内核机制见 `docs/modules/`，性能记录由兼容分支的既有报告维护。历史实验按对应 Git 提交复现。`make prune-build` 默认删除历史运行盘、探针 ELF、旧核数／诊断配置及重复编译树；仅保留当前 UP／八核对象缓存、已安装工具和 SDK、可直接启动的参考内核。活动 worktree 不参与删除，临时保留指定输出可使用 `tests/tools/prune-build.py --keep build/<目录>`。
 
 ## BPF 聚焦验证
 

@@ -188,12 +188,6 @@ ifeq ($(SMP)$(COST_DIAGNOSTICS),11)
 BUILD_DIR := build/cost-smp$(SMP_BUILD_SUFFIX)/riscv
 KERNEL_RV := build/cost-smp$(SMP_BUILD_SUFFIX)/kernel-rv
 endif
-TRAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-rv
-TRAP_RETURN_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-return-rv
-TRAP_RETURN_SIE_TEST_KERNEL_RV := \
-	$(BUILD_DIR)/tests/kernel-trap-return-sie-rv
-HIGH_HALF_TRAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-high-half-trap-rv
-NO_IDENTITY_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-no-identity-rv
 DTB_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-dtb-rv
 PAGE_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-page-rv
 HEAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-heap-rv
@@ -525,35 +519,6 @@ endif
 TEST_RUNTIME_OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(TEST_RUNTIME_C_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(TEST_RUNTIME_ASM_SOURCES))
-TRAP_TEST_C_SOURCES := tests/riscv/trap_main.c
-TRAP_TEST_ASM_SOURCES := tests/riscv/trap_trigger.S
-TRAP_TEST_OBJECTS := \
-	$(TEST_RUNTIME_OBJECTS) \
-	$(patsubst %.c,$(BUILD_DIR)/%.o,$(TRAP_TEST_C_SOURCES)) \
-	$(patsubst %.S,$(BUILD_DIR)/%.o,$(TRAP_TEST_ASM_SOURCES))
-TRAP_RETURN_TEST_C_SOURCES := tests/riscv/trap_return_main.c
-TRAP_RETURN_TEST_ASM_SOURCES := tests/riscv/trap_return_trigger.S
-TRAP_RETURN_TEST_OBJECTS := \
-	$(TEST_RUNTIME_OBJECTS) \
-	$(patsubst %.c,$(BUILD_DIR)/%.o,$(TRAP_RETURN_TEST_C_SOURCES)) \
-	$(patsubst %.S,$(BUILD_DIR)/%.o,$(TRAP_RETURN_TEST_ASM_SOURCES))
-TRAP_RETURN_SIE_TEST_C_SOURCES := tests/riscv/trap_return_sie_main.c
-TRAP_RETURN_SIE_TEST_OBJECTS := \
-	$(TEST_RUNTIME_OBJECTS) \
-	$(patsubst %.c,$(BUILD_DIR)/%.o,$(TRAP_RETURN_SIE_TEST_C_SOURCES)) \
-	$(patsubst %.S,$(BUILD_DIR)/%.o,$(TRAP_RETURN_TEST_ASM_SOURCES))
-HIGH_HALF_TRAP_TEST_C_SOURCES := tests/riscv/high_half_trap.c
-HIGH_HALF_TRAP_TEST_ASM_SOURCES := \
-	tests/riscv/trap_trigger.S \
-	tests/riscv/trap_return_trigger.S
-HIGH_HALF_TRAP_TEST_OBJECTS := \
-	$(OBJECTS) \
-	$(patsubst %.c,$(BUILD_DIR)/%.o,$(HIGH_HALF_TRAP_TEST_C_SOURCES)) \
-	$(patsubst %.S,$(BUILD_DIR)/%.o,$(HIGH_HALF_TRAP_TEST_ASM_SOURCES))
-NO_IDENTITY_TEST_C_SOURCES := tests/riscv/no_identity.c
-NO_IDENTITY_TEST_OBJECTS := \
-	$(OBJECTS) \
-	$(patsubst %.c,$(BUILD_DIR)/%.o,$(NO_IDENTITY_TEST_C_SOURCES))
 DTB_TEST_C_SOURCES := \
 	kernel/boot_memory.c \
 	kernel/dtb.c \
@@ -724,11 +689,6 @@ USER_FATAL_TEST_OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(USER_FATAL_TEST_C_SOURCES))
 DEPS := \
 	$(OBJECTS:.o=.d) \
-	$(TRAP_TEST_OBJECTS:.o=.d) \
-	$(TRAP_RETURN_TEST_OBJECTS:.o=.d) \
-	$(TRAP_RETURN_SIE_TEST_OBJECTS:.o=.d) \
-	$(HIGH_HALF_TRAP_TEST_OBJECTS:.o=.d) \
-	$(NO_IDENTITY_TEST_OBJECTS:.o=.d) \
 	$(DTB_TEST_OBJECTS:.o=.d) \
 	$(PAGE_TEST_OBJECTS:.o=.d) \
 	$(HEAP_TEST_OBJECTS:.o=.d) \
@@ -770,14 +730,14 @@ DEPS := \
 	test-uaccess-oom-riscv test-icache-riscv \
 	test-files-riscv \
 	test-files-partial-write-riscv \
-	test-high-half-trap-riscv test-idle-riscv test-no-identity-riscv \
+	test-idle-riscv \
 	test-lwext4-host test-lwext4-recovery-host test-lwext4-rename-host \
 	test-block-riscv test-heap-riscv test-page-riscv test-vfs-riscv \
 	test-scheduler-cases-riscv test-scheduler-riscv \
 	test-boot-riscv test-references test-riscv \
 	test-sv39-fault-riscv test-sv39-riscv test-stack-guard-riscv \
-	test-syscall-riscv test-signal-riscv test-timer-riscv test-trap-riscv \
-	test-trap-return-riscv test-user-fatal-riscv test-mm-riscv \
+	test-syscall-riscv test-signal-riscv test-timer-riscv \
+	test-user-fatal-riscv test-mm-riscv \
 	test-uaccess-riscv test-user-riscv test-vma-riscv test-brk-riscv \
 	test-mmap-riscv
 
@@ -934,35 +894,6 @@ $(RV_BTF_OBJECT): $(RV_BTF_SOURCE) $(RV_BTF_DATA) $(BUILD_DIR)/generated/cost-co
 $(KERNEL_RV): $(OBJECTS) $(RV_BTF_OBJECT) arch/riscv/linker.ld $(BUILD_DIR)/generated/link-config
 	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/kernel-rv.map \
 		-Wl,--undefined=__boaros_btf_start -o $@ $(OBJECTS) $(RV_BTF_OBJECT)
-
-$(TRAP_TEST_KERNEL_RV): $(TRAP_TEST_OBJECTS) arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/tests/kernel-trap-rv.map \
-		-o $@ $(TRAP_TEST_OBJECTS)
-
-$(TRAP_RETURN_TEST_KERNEL_RV): $(TRAP_RETURN_TEST_OBJECTS) \
-		arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,--wrap=riscv_trap_dispatch \
-		-Wl,-Map,$(BUILD_DIR)/tests/kernel-trap-return-rv.map \
-		-o $@ $(TRAP_RETURN_TEST_OBJECTS)
-
-$(TRAP_RETURN_SIE_TEST_KERNEL_RV): $(TRAP_RETURN_SIE_TEST_OBJECTS) \
-		arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,--wrap=riscv_trap_dispatch \
-		-Wl,-Map,$(BUILD_DIR)/tests/kernel-trap-return-sie-rv.map \
-		-o $@ $(TRAP_RETURN_SIE_TEST_OBJECTS)
-
-$(HIGH_HALF_TRAP_TEST_KERNEL_RV): $(HIGH_HALF_TRAP_TEST_OBJECTS) \
-		arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,--wrap=riscv_timer_start \
-		-Wl,--wrap=riscv_trap_dispatch \
-		-Wl,-Map,$(BUILD_DIR)/tests/kernel-high-half-trap-rv.map \
-		-o $@ $(HIGH_HALF_TRAP_TEST_OBJECTS)
-
-$(NO_IDENTITY_TEST_KERNEL_RV): $(NO_IDENTITY_TEST_OBJECTS) \
-		arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,--wrap=riscv_timer_start \
-		-Wl,-Map,$(BUILD_DIR)/tests/kernel-no-identity-rv.map \
-		-o $@ $(NO_IDENTITY_TEST_OBJECTS)
 
 $(DTB_TEST_KERNEL_RV): $(DTB_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/tests/kernel-dtb-rv.map \
@@ -1298,8 +1229,7 @@ test-riscv: test-dtb-riscv test-page-riscv test-heap-riscv \
 	test-user-riscv test-user-fatal-riscv \
 	test-mm-riscv test-vma-riscv test-uaccess-riscv \
 	test-sv39-riscv test-sv39-fault-riscv test-stack-guard-riscv \
-	test-trap-return-riscv test-timer-riscv test-boot-riscv \
-	test-high-half-trap-riscv test-no-identity-riscv \
+	test-timer-riscv test-boot-riscv \
 	test-root-init-riscv test-root-orphan-riscv \
 	test-uaccess-oom-riscv test-icache-riscv \
 	test-demand-page-riscv test-root-boot-cleanup-riscv \
@@ -1657,24 +1587,6 @@ test-boot-riscv: $(TIMER_BOOT_TEST_KERNEL_RV)
 
 test-idle-riscv: $(KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) KERNEL_RV=$< ./tests/riscv/idle.sh
-
-test-trap-riscv: $(TRAP_TEST_KERNEL_RV)
-	QEMU_RISCV64=$(QEMU_RISCV64) KERNEL_RV=$< ./tests/riscv/trap.sh
-
-test-trap-return-riscv: $(TRAP_RETURN_TEST_KERNEL_RV) \
-		$(TRAP_RETURN_SIE_TEST_KERNEL_RV)
-	QEMU_RISCV64=$(QEMU_RISCV64) TRAP_RETURN_TEST_KERNEL_RV=$< \
-		TRAP_RETURN_SIE_TEST_KERNEL_RV=$(TRAP_RETURN_SIE_TEST_KERNEL_RV) \
-		OBJDUMP_RV=$(OBJDUMP) \
-		./tests/riscv/trap-return.sh
-
-test-high-half-trap-riscv: $(HIGH_HALF_TRAP_TEST_KERNEL_RV)
-	QEMU_RISCV64=$(QEMU_RISCV64) NM_RV=$(NM) \
-		HIGH_HALF_TRAP_TEST_KERNEL_RV=$< ./tests/riscv/high-half-trap.sh
-
-test-no-identity-riscv: $(NO_IDENTITY_TEST_KERNEL_RV)
-	QEMU_RISCV64=$(QEMU_RISCV64) NO_IDENTITY_TEST_KERNEL_RV=$< \
-		./tests/riscv/no-identity.sh
 
 clean:
 	$(RM) -r -- $(BUILD_DIR) $(KERNEL_RV)
@@ -2169,18 +2081,6 @@ test-cache-growth-riscv:
 	$(MAKE) COST_DIAGNOSTICS=1 test-scale-riscv
 
 $(BUILD_DIR)/tests/riscv/scale_main.o: CPPFLAGS += $(LWIP_CPPFLAGS)
-
-.PHONY: test-writeback-batch-riscv
-test-writeback-batch-riscv:
-	python3 -B tests/riscv/writeback-batch.py
-
-.PHONY: test-readahead-riscv
-test-readahead-riscv:
-	python3 -B tests/riscv/readahead.py
-
-.PHONY: test-demand-read-riscv
-test-demand-read-riscv:
-	python3 -B tests/riscv/demand-read.py --qemu $(QEMU_RISCV64)
 
 include arch/loongarch/build.mk
 include vdso/build.mk

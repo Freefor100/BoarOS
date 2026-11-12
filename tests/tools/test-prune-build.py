@@ -14,50 +14,34 @@ class CleanupContract(unittest.TestCase):
     def test_reusable_inputs_and_runtime_outputs(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);build=root/'build'
-            caches=('qemu-la/qemu-system-loongarch64','qemu-la-rtc/source/rtc.c',
-                'riscv-smp/riscv/kernel/main.o',
-                'riscv-user-smp/riscv/mm/mm.o','riscv-user-smp/kernel-rv','riscv-user-smp/user-smp-rv','riscv-user-smp/user-smp-dynamic-rv', 'riscv-smp-test/guard/kernel-rv',
-                'riscv-user-smp-composition/composition-rv',
-                'riscv-user-smp-composition/common/riscv/mm/mm.o',
-                'riscv-user-smp-composition/controlled/kernel-rv',
-                'riscv-mm-smp-test/riscv/mm/mm.o', 'riscv-mm-smp-test/mm-fence-i/kernel-rv',
-                'riscv-mm-shared-smp-test/riscv/mm/mm.o', 'riscv-mm-shared-smp-test/rfence-error/kernel-rv',
-                'riscv-mm-file-smp-test/riscv/mm/mm.o', 'riscv-mm-file-smp-test/rfence-error/kernel-rv',
-                'riscv-mm-disk-smp-test/riscv/mm/mm.o', 'riscv-mm-disk-smp-test/rfence-error/kernel-rv',
-                'riscv-file-io-smp-test/riscv/fs/files/io.o',
-                'riscv-file-io-smp-test/ci-unknown-elf/kernel-rv',
-                'qemu-la-rtc/build/build.ninja','linux-la-platform/vmlinux',
-                'riscv-user-smp8/kernel-rv','loongarch-smp8/kernel-la',
-                'loongarch/program-libc/source/entry.c','loongarch/dynamic-dp-v2/root/lib/libc.so',
-                'loongarch/glibc/static-program','loongarch/diff-abi-cases')
-            outputs=('loongarch/program-inventory-user-smp-review/state.json','loongarch/inventory-full/state.json','loongarch/program-inventory/state.json',
-                'riscv-smp/runs/2-512M.log','riscv-user-smp8/runs/8cpu/root.img',
-                'riscv-user-smp/runs/run-first/report.json','riscv-user-smp/abi/run-first/root.img',
-                'riscv-user-smp/runtime/run-first/glibc/fixture.img',
-                'riscv-user-smp-composition/runs/run-first/report.json',
-                'riscv-user-smp-composition/runs/run-first/mm-512M-2cpu/boaros/guest.img',
-                'riscv-mm-smp-test/runs/rfence-error/2-1G.log',
-                'riscv-mm-shared-smp-test/runs/2-512M.log',
-                'riscv-mm-file-smp-test/runs/2-512M.log',
-                'riscv-mm-file-smp-test/runs-v3/1-1G.json',
-                'riscv-mm-disk-smp-test/runs/2-512M/disk.img',
-                'riscv-mm-disk-smp-test/runs-v2/1-1G.json',
-                'riscv-file-io-smp-test/runs/2-512M/disk.img',
-                'riscv-file-io-smp-test/ci-unknown-elf/runs/user-1G/root.img',
-                'host/cache/concurrency-12','host/mm-disk/concurrency-12',
-                'host/cache/image-14.img','host/mm-disk/run.log','host/cache/diagnostic.elf',
-                'io-budget/kernels/profile/kernel-rv','network-budget/kernels/profile/kernel-rv',
-                'tools/network-rv/sdcard-rv.img','tools/oscomp/sdcard-la.img.gz',
-                'loongarch/review-boundary-green/linux.log','loongarch/diff-abi-run/linux.img',
-                'loongarch/rtc-model.case/state.bin','loongarch/sqlite-run.case/root.img',
-                'loongarch/program-libc/upstream.tar','loongarch/program-libc/build.log',
-                'riscv/environment-run.case/root.img','riscv/glibc/run.case/fixture.img',
-                'loongarch/glibc/static.build.log')
+            caches=('qemu-la-rtc/qemu-system-loongarch64',
+                'riscv/kernel/main.o', 'loongarch/fs/vfs.o',
+                'riscv-user-smp8/riscv/mm/mm.o', 'riscv-user-smp8/kernel-rv',
+                'loongarch-smp8/kernel-la', 'tools/loongarch/bin/gcc',
+                'riscv-user-smp4/riscv/musl-root/bin/musl-gcc',
+                'local-keep/source.tar', 'loongarch/gcc-sf/root/bin/gcc',
+                'linux-la-platform/vmlinux', 'linux-la-platform/.config',
+                'bpf/riscv/root/usr/bin/bpftrace',
+                'bpf/loongarch/llvm/lib/libLLVM.so.23.1',
+                'bpf/riscv/linux/arch/riscv/boot/Image',
+                'bpf/riscv/linux/identity.json',
+                'diff-abi/linux/current/arch/riscv/boot/Image',
+                'diff-abi/linux/current/identity.json')
+            outputs=('host/cache/concurrency-12', 'io-budget/kernels/profile/kernel-rv',
+                'riscv-smp-test/guard/kernel-rv', 'riscv-mm-smp-test/mm.o',
+                'riscv-user-smp4/riscv/mm/mm.o', 'loongarch-smp4/kernel-la',
+                'riscv-user-smp8/runs/root.img', 'loongarch/glibc/run.case/root.img',
+                'loongarch/old-probe', 'tools/oscomp-local/riscv/scratch-template.img',
+                'bpf/production-snapshots/kernel-rv', 'bpf/src/llvm/source.c',
+                'bpf/loongarch/llvm/lib/LLVMCore.a',
+                'bpf/riscv/linux/kernel/main.o', 'linux-la-platform/kernel/main.o',
+                'diff-abi/linux/old/arch/riscv/boot/Image',
+                'diff-abi/linux/current/kernel/main.o')
             for name in caches+outputs:
                 path=build/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_text('fixture')
             saved=(prune.ROOT,prune.BUILD,prune.current_linux_keys)
             try:
-                prune.ROOT=root;prune.BUILD=build;prune.current_linux_keys=lambda:set()
+                prune.ROOT=root;prune.BUILD=build;prune.current_linux_keys=lambda:{"current"}
                 candidates=prune.candidates()
                 selected=lambda path:any(path==item or path.is_relative_to(item) for item in candidates)
                 for name in caches:self.assertFalse(selected(build/name),name)

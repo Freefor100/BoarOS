@@ -2,7 +2,7 @@
 
 `build.py` 从 `references/sources.tsv` 读取固定输入，原样构建 fixed Linux
 源码中的 bpftool/libbpf，以及 bpftrace 和其固定 libbpf。缓存、解包源码和
-日志均位于忽略的 `build/bpf-20261107/`，不改写 `references/linux/`。
+日志均位于忽略的 `build/bpf/`，不改写 `references/linux/`。清理时保留已安装工具、运行库及参考内核，删除运行盘、历史快照和可重建的编译中间产物。
 RV 使用 glibc 2.44，LA 使用 LP64D/glibc 2.42；编译器与仓库已有 GNU
 工具链缓存相同。LLVM 的本机 tblgen、flex 和 bison 只生成源码，不替代
 客机里的 bpftrace 编译执行。

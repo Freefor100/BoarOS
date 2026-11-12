@@ -234,7 +234,8 @@ python3 -B tests/userland/inventory/run.py --arch loongarch --reuse-builds --req
 失败，必须保留原因并在同一身份下重跑对应未完成项。完整比赛Harness与客体原生
 开发工具另行验收；229个ID通过不证明所有BusyBox applet均能使用。
 
-LA完整inventory/ABI/SQLite/RTC运行目录由既有 `make prune-build` 统一清理；LA
-program-libc源码/ELF、LP64D运行时、GNU程序、Linux及原版/派生QEMU缓存保留。
-GNU临时run目录、磁盘和构建日志清理，不以被忽略的运行目录作为永久档案。
+`make prune-build` 删除 inventory/ABI/SQLite/RTC 和 GNU 运行目录、临时磁盘、旧探针
+及可重建的编译树；保留当前 UP/八核对象缓存、已安装的工具链与运行库、正在使用的
+QEMU，以及参考 Linux 的镜像、配置和身份记录。旧程序可按固定输入重新构建，
+不以被忽略的运行目录作为永久档案；活动 Git worktree 另行保护。
 `python3 -B tests/tools/test-prune-build.py` 独立保护这项缓存/运行产物选择契约。
