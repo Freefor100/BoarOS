@@ -175,9 +175,9 @@ struct linux_new_utsname {
 static const struct linux_new_utsname kernel_utsname = {
     .sysname = "Linux",
     .nodename = "boaros",
-    /* BoarOS release identity, not a claimed Linux feature level. */
-    .release = "0.1.0-boaros-dev",
-    .version = "#1 BoarOS",
+    /* glibc checks this ABI baseline before main; it is not feature coverage. */
+    .release = "5.19.0-boaros",
+    .version = "#1 BoarOS 0.1.0",
     .machine = BOAROS_UTS_MACHINE,
     .domainname = "(none)",
 };

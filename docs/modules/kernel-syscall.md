@@ -63,7 +63,7 @@ LA的259仍返回`ENOSYS`。这些入口的直接消费者可用`python3 tests/u
 - `exit` 编号 93 产生线程 `EXIT`，`exit_group` 编号 94 产生全组 `EXIT_GROUP`；状态保留参数 0 的低 8 位。组退出等待成员沿原内核调用栈释放在用资源，最后产生一次进程退出通知。
 - `set_tid_address` 编号 96 记录 clear_tid 用户指针并返回调用 TID；线程退出在释放 MM 前清零并唤醒同 key 的一个 futex waiter。坏用户指针不破坏内核状态。
 - `futex` 编号 98 支持 WAIT、WAKE、REQUEUE、CMP_REQUEUE、WAKE_OP、WAIT_BITSET、WAKE_BITSET、PI 锁及 PI 条件重排；`futex_waitv` 编号 449 支持多地址等待。key、排序、掩码、超时、错误码及扩展边界见[调度模块](kernel-scheduler.md#等待与-futex)；无超时等待按 SA_RESTART 选择 EINTR 或重新等待，带超时等待的用户 handler 总是看到 EINTR、无 handler restart 保持原 absolute deadline。
-- `uname` 编号为 160，把六个 65 字节字段组成的 Linux `new_utsname` 写到参数 0 指向的用户缓冲区；成功返回 0，用户范围、映射或写权限错误返回 `-EFAULT`（-14）。当前固定报告 `Linux/boaros/0.1.0-boaros-dev/#1 BoarOS/riscv64/(none)`，其中 release 是 BoarOS 自身开发版本而非 Linux 能力等级，机器名由架构构建配置提供。
+- `uname` 编号为 160，把六个 65 字节字段组成的 Linux `new_utsname` 写到参数 0 指向的用户缓冲区；成功返回 0，用户范围、映射或写权限错误返回 `-EFAULT`（-14）。当前报告 `Linux/boaros/5.19.0-boaros/#1 BoarOS 0.1.0/<架构>/(none)`，机器名由架构构建配置提供。release 的数值用于通过现有 glibc 的启动检查：固定 RV glibc 的最低 Linux ABI 为 4.15，LA 为 5.19，因此两架构统一使用 5.19.0。该值不表示完整实现 Linux 5.19；BoarOS 自身版本保存在 version 字段，具体接口范围见能力目录。
 - `getpid` 编号为 172，返回调用任务所属线程组的 TGID。
 - `getppid` 编号为 173，返回当前父任务的 TGID；PID 1 或 parentless 进程返回 0，reparent 后观察到 PID 1。
 - `getuid/geteuid/getgid/getegid` 编号 174/175/176/177，返回调用线程当前真实／有效 UID/GID；调用无参数，忽略残留寄存器。`setregid/setgid/setreuid/setuid/setresuid/getresuid/setresgid/getresgid/setfsuid/setfsgid` 对应 143～152；`getgroups/setgroups` 为 158/159。raw 设置只影响调用线程，libc 负责全线程协调，凭据共享与发布见[用户凭据](kernel-scheduler.md#用户凭据)。
