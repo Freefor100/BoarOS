@@ -260,6 +260,16 @@ Linux 参考，复用既有 `ROOT_DIRECT_FILESYSTEM` 监督入口。使用同一
 通过保留的命名空间 FD 加入。原评测 ELF、libc、输入盘、judge 和监督参数未修改；
 此处调整仅用于自有 API8 功能差分。
 
+### mountinfo FD 的根路径捕获时机：现有内核语义缺口
+
+固定 Linux 的 `fs/proc_namespace.c` 在打开 mountinfo 时持有目标的 namespace/root，
+rewind 重新遍历挂载时仍使用该根。BoarOS 当前沿生成文件机制在首次读取及 rewind 时
+取得目标的当前根，因此跨 pivot/chroot 使用旧 FD 的结果并不完全相同。这是内核现有
+语义缺口，不应分类为发布输入或 Linux 参考环境错误；当前边界见[procfs说明](../modules/procfs.md)。
+
+本轮 pivot 消费者使用新打开的 mountinfo FD 验证切换后的根和挂载树；新 FD 的同 ELF
+对照通过，不表示旧 FD 的打开时根语义已经实现。官方 ELF、盘和 judge 未修改。
+
 ## 自有调度查询差分夹具的并发假设
 
 `sched_getattr` 的固定 Linux 实现仅在 RCU 读侧保护目标寿命，依次读取策略、RESET_ON_FORK、实时优先级；与另一线程修改策略并发时，各字段可来自不同更新。LA glibc 的自有消费者曾因只接受两种完整组合而失败，实际读到 FIFO／优先级21／RESET_ON_FORK=1。
