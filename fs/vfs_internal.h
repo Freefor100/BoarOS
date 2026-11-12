@@ -11,13 +11,26 @@
 /* Weak identities, mount edges and FS context publication; no I/O or callbacks. */
 extern struct kernel_raw_lock kernel_vfs_state_lock;
 struct kernel_vfs_path;
+int kernel_vfs_path_filesystem_string(const struct kernel_vfs_path *,char *,size_t);
 /* Capture a mutable parent edge and its owner in the same state protection. */
 int kernel_vfs_path_parent_pin(const struct kernel_vfs_path *path,struct kernel_vfs_path **owner);
 /* Existing object capability (PTY master) selects kernel-owned children without new DAC search. */
 int kernel_vfs_path_lookup_object(struct kernel_vfs_path *,const char *,size_t,struct kernel_vfs_path **);
 #include <stdint.h>
 
+#define VFS_PATH_CLOSING (UINT32_C(1)<<31U)
+#define VFS_ATIME_NONE 1U
+#define VFS_ATIME_STRICT 2U
+#define VFS_ATIME_NODIR 4U
+static inline uint8_t kernel_vfs_atime_policy(uint64_t flags,uint8_t previous,int remount)
+{
+    if (remount && !(flags & (UINT64_C(1024)|2048|2097152|16777216))) return previous;
+    return (flags&16777216U ? VFS_ATIME_STRICT : flags&1024U ? VFS_ATIME_NONE : 0) |
+        (flags&2048U ? VFS_ATIME_NODIR : 0);
+}
 struct kernel_vfs_file;
+int kernel_vfs_file_atime_enabled(const struct kernel_vfs_file *);
+int kernel_vfs_file_noatime_allowed(const struct kernel_vfs_file *);
 struct kernel_vfs_size_limit;
 int kernel_vfs_check_write_limit(struct kernel_vfs_size_limit *, uint64_t, size_t *);
 struct kernel_memory_object;

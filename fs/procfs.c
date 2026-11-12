@@ -71,6 +71,8 @@
 #define PROC_PID_MNT_NS_KIND 17U
 #define PROC_NS_DIR_BITS 0x100U
 #define PROC_MNT_NS_BITS 0x200U
+#define PROC_MOUNTINFO_BITS 0x300U
+#define PROC_PID_MOUNTINFO_KIND 18U
 #define PROC_SUPER_MAGIC UINT64_C(0x9fa0)
 
 struct procfs_mount {
@@ -94,9 +96,9 @@ static uint64_t proc_pid_inode_fd(kernel_pid_t pid, uint64_t identity,
 static uint64_t proc_pid_inode(kernel_pid_t pid, uint64_t identity,
                                uint8_t kind)
 {
-    if (kind == PROC_PID_NS_DIR_KIND || kind == PROC_PID_MNT_NS_KIND)
+    if (kind == PROC_PID_NS_DIR_KIND || kind == PROC_PID_MNT_NS_KIND || kind==PROC_PID_MOUNTINFO_KIND)
         return proc_pid_inode_fd(pid,identity,PROC_PID_MOUNTS_KIND,
-            kind==PROC_PID_NS_DIR_KIND?PROC_NS_DIR_BITS:PROC_MNT_NS_BITS);
+            kind==PROC_PID_NS_DIR_KIND?PROC_NS_DIR_BITS:kind==PROC_PID_MNT_NS_KIND?PROC_MNT_NS_BITS:PROC_MOUNTINFO_BITS);
     if (kind == PROC_TID_STAT_KIND || kind == PROC_TID_STATUS_KIND)
         return proc_pid_inode_fd(pid, identity,
             kind == PROC_TID_STAT_KIND ? PROC_PID_STAT_KIND : PROC_PID_STATUS_KIND, 1U);
@@ -108,7 +110,7 @@ static uint64_t proc_pid_inode(kernel_pid_t pid, uint64_t identity,
 static uint64_t proc_thread_resource_inode(kernel_pid_t pid, uint64_t identity,
                                             uint8_t kind, uint16_t fd)
 {
-    if (kind == PROC_PID_NS_DIR_KIND || kind == PROC_PID_MNT_NS_KIND)
+    if (kind == PROC_PID_NS_DIR_KIND || kind == PROC_PID_MNT_NS_KIND || kind==PROC_PID_MOUNTINFO_KIND)
         return proc_pid_inode(pid,identity,kind)|(UINT64_C(1)<<16U);
     if (kind == PROC_PID_FD_LINK_KIND || kind == PROC_PID_FDINFO_KIND)
         return proc_pid_inode_fd(pid, identity,
@@ -132,8 +134,10 @@ static uint8_t proc_inode_kind(uint64_t inode)
     if (kind == 12U) return PROC_PID_FD_LINK_KIND;
     if (kind == 13U) return PROC_PID_FDINFO_KIND;
     if (kind == PROC_PID_MOUNTS_KIND) {
-        if (inode & ((uint64_t)PROC_NS_DIR_BITS<<16U)) return PROC_PID_NS_DIR_KIND;
-        if (inode & ((uint64_t)PROC_MNT_NS_BITS<<16U)) return PROC_PID_MNT_NS_KIND;
+        unsigned encoded=(unsigned)(inode>>16U)&0x3feU;
+        if(encoded==PROC_NS_DIR_BITS)return PROC_PID_NS_DIR_KIND;
+        if(encoded==PROC_MNT_NS_BITS)return PROC_PID_MNT_NS_KIND;
+        if(encoded==PROC_MOUNTINFO_BITS)return PROC_PID_MOUNTINFO_KIND;
     }
     if ((inode & (UINT64_C(1) << 16U)) && kind == PROC_PID_STAT_KIND)
         return PROC_TID_STAT_KIND;
@@ -309,7 +313,8 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
                 ? PROC_PID_FD_DIR_KIND : length == 6U && !memcmp(name, "fdinfo", length)
                 ? PROC_PID_FDINFO_DIR_KIND : length == 2U && !memcmp(name,"ns",length)
                 ? PROC_PID_NS_DIR_KIND : length == 6U && !memcmp(name,"mounts",length)
-                ? PROC_PID_MOUNTS_KIND : 0;
+                ? PROC_PID_MOUNTS_KIND : length==9U && !memcmp(name,"mountinfo",length)
+                ? PROC_PID_MOUNTINFO_KIND : 0;
             if (!kind) return -KERNEL_ENOENT;
             if (kind != PROC_TID_STAT_KIND && kind != PROC_TID_STATUS_KIND &&
                 kernel_proc_thread_resources_live(pid, identity))
@@ -341,6 +346,8 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
             kind = PROC_PID_ROOT_KIND;
         else if (length == 6U && !memcmp(name, "mounts", length))
             kind = PROC_PID_MOUNTS_KIND;
+        else if(length==9U && !memcmp(name,"mountinfo",length))
+            kind=PROC_PID_MOUNTINFO_KIND;
         else if (length == 4U && !memcmp(name, "stat", length))
             kind = PROC_PID_STAT_KIND;
         else if (length == 6U && !memcmp(name, "status", length))
@@ -459,6 +466,7 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
           proc_inode_kind(inode) != PROC_PID_CWD_KIND &&
           proc_inode_kind(inode) != PROC_PID_ROOT_KIND &&
           proc_inode_kind(inode) != PROC_PID_MOUNTS_KIND &&
+          proc_inode_kind(inode) != PROC_PID_MOUNTINFO_KIND &&
           proc_inode_kind(inode) != PROC_PID_STAT_KIND &&
           proc_inode_kind(inode) != PROC_PID_STATUS_KIND &&
           proc_inode_kind(inode) != PROC_PID_FD_DIR_KIND &&
@@ -688,12 +696,12 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
                 *type = 4U;
                 return 1;
             }
-            if (position > 11U) return 0;
+            if (position > 12U) return 0;
             const char *entry = position == 0 ? "." : position == 1 ? ".." :
                 position == 2 ? "stat" : position == 3 ? "status" :
                 position == 4 ? "exe" : position == 5 ? "cwd" :
                 position == 6 ? "root" : position == 7 ? "maps" :
-                position == 8 ? "fd" : position==9?"fdinfo":position==10?"ns":"mounts";
+                position == 8 ? "fd" : position==9?"fdinfo":position==10?"ns":position==11?"mounts":"mountinfo";
             if (name_size <= strlen(entry)) return -KERNEL_ERANGE;
             strcpy(name, entry);
             *next_position = position + 1;
@@ -715,7 +723,7 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
                 position == 4 ? PROC_PID_EXE_KIND : position == 5 ? PROC_PID_CWD_KIND :
                 position == 6 ? PROC_PID_ROOT_KIND : position == 7 ? PROC_PID_MAPS_KIND :
                 position == 8 ? PROC_PID_FD_DIR_KIND : position==9?PROC_PID_FDINFO_DIR_KIND:
-                position==10?PROC_PID_NS_DIR_KIND:PROC_PID_MOUNTS_KIND, 0);
+                position==10?PROC_PID_NS_DIR_KIND:position==11?PROC_PID_MOUNTS_KIND:PROC_PID_MOUNTINFO_KIND, 0);
             return 1;
         }
         if (proc_inode_kind(directory) == PROC_PID_FD_DIR_KIND ||
@@ -747,7 +755,7 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
             *type = 4U;
             return 1;
         }
-        if (position > 12U) return 0;
+        if (position > 13U) return 0;
         const char *entry = position == 0U ? "." :
                             position == 1U ? ".." :
                             position == 2U ? "exe" :
@@ -756,7 +764,7 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
                             position == 5U ? "mounts" :
                             position == 6U ? "stat" :
                             position == 7U ? "status" : position == 8U ? "fd" :
-                            position == 9U ? "task" : position==10U?"maps":position==11U?"fdinfo":"ns";
+                            position == 9U ? "task" : position==10U?"maps":position==11U?"fdinfo":position==12U?"ns":"mountinfo";
         if (name_size < strlen(entry) + 1U) return -KERNEL_ERANGE;
         strcpy(name, entry);
         *next_position = position + 1U;
@@ -771,8 +779,8 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
                      position == 7U ? PROC_PID_STATUS_KIND :
                      position == 8U ? PROC_PID_FD_DIR_KIND :
                      position == 9U ? PROC_TASK_DIR_KIND : position==10U?PROC_PID_MAPS_KIND:
-                     position==11U?PROC_PID_FDINFO_DIR_KIND:PROC_PID_NS_DIR_KIND);
-        *type = position < 2U || position == 8U || position == 9U || position>=11U ? 4U :
+                     position==11U?PROC_PID_FDINFO_DIR_KIND:position==12U?PROC_PID_NS_DIR_KIND:PROC_PID_MOUNTINFO_KIND);
+        *type = position < 2U || position == 8U || position == 9U || position==11U || position==12U ? 4U :
                 position >= 5U ? 8U : 10U;
         return 1;
     }
@@ -1183,20 +1191,11 @@ struct proc_mount_entry {
     struct kernel_vfs_path *mount_root;
     const char *source;
     const char *bpf_type;
+    uint64_t id,parent,device,shared,master,dominating;
+    uint8_t unbindable,super_read_only;
     uint8_t is_proc, is_tmpfs, is_devpts;
-    uint8_t read_only,nosuid,nodev,noexec;
+    uint8_t read_only,nosuid,nodev,noexec,atime_policy;
 };
-
-static struct kernel_vfs_mount *next_mount(struct kernel_vfs_mount *mount,
-                                           struct kernel_vfs_mount *top)
-{
-    if (mount->first_child) return mount->first_child;
-    while (mount != top) {
-        if (mount->next_sibling) return mount->next_sibling;
-        mount = mount->parent;
-    }
-    return 0;
-}
 
 static void release_mount_entries(struct kernel_heap *heap,
                                    struct proc_mount_entry **owner,
@@ -1241,60 +1240,39 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
     struct kernel_vfs_mount *top=kernel_vfs_path_mount(mounts.top);
     struct proc_mount_entry *entries = 0;
     size_t captured = 0U;
-    result = -KERNEL_EAGAIN;
-    for (unsigned attempt = 0U; attempt < 3U; attempt++) {
-        size_t count = 0U;
-        uintptr_t irq = arch_interrupt_save();
-        for (struct kernel_vfs_mount *it = top; it;
-             it = next_mount(it, top)) count++;
-        arch_interrupt_restore(irq);
-        if (!count || count > SIZE_MAX / sizeof(*entries) ||
-            count > SIZE_MAX / (8U * KERNEL_FS_PATH_MAX + 80U))
-            return -KERNEL_EOVERFLOW;
-        enum kernel_heap_status allocation = kernel_heap_allocate_zeroed(
-            heap, count, sizeof(*entries), (void **)&entries);
-        if (allocation != KERNEL_HEAP_STATUS_OK)
-            return allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM
-                                                          : -KERNEL_EIO;
-        irq = arch_interrupt_save();
-        int changed = 0;
-        for (struct kernel_vfs_mount *it = top; it;
-             it = next_mount(it, top)) {
-            if (captured == count) { changed = 1; break; }
-            struct kernel_vfs_path *path = it == top ? mounts.top
-                                                     : it->covered_path;
-            struct kernel_vfs_path *mount_root = it == top ? mounts.top
-                                                           : it->root_path;
-            if (!path || !mount_root || kernel_vfs_path_acquire(path)) {
-                changed = 1;
-                break;
+    int information=proc_inode_kind(node->inode)==PROC_PID_MOUNTINFO_KIND;
+    {
+        KERNEL_LOCK_SCOPE(topology);kernel_vfs_mount_topology_lock(&topology);
+        size_t count=0;
+        for(struct kernel_vfs_mount *it=top;it;it=kernel_vfs_mount_next(it,top))count++;
+        if(!count || count>SIZE_MAX/sizeof(*entries) || count>SIZE_MAX/(12U*KERNEL_FS_PATH_MAX+256U))return -KERNEL_EOVERFLOW;
+        enum kernel_heap_status hs=kernel_heap_allocate_zeroed(heap,count,sizeof(*entries),(void **)&entries);
+        if(hs)return hs==KERNEL_HEAP_STATUS_EMPTY?-KERNEL_ENOMEM:-KERNEL_EIO;
+        for(struct kernel_vfs_mount *it=top;it;it=kernel_vfs_mount_next(it,top)) {
+            struct kernel_vfs_path *path=it==top?mounts.top:it->root_path;
+            struct kernel_vfs_path *mount_root=it==top?mounts.top:it->root_path;
+            if(!path || !mount_root || kernel_vfs_path_acquire(path) || kernel_vfs_path_acquire(mount_root))__builtin_trap();
+            struct proc_mount_entry *e=&entries[captured++];
+            e->path=path;e->mount_root=mount_root;e->source=it->source_name;
+            struct kernel_vfs_instance *instance=it->private_data;
+            e->bpf_type=kernel_bpf_filesystem_type(it);
+            if(!e->bpf_type)e->bpf_type=instance->ops->type;
+            e->is_proc=kernel_procfs_is_mount(it);e->is_tmpfs=kernel_tmpfs_is_mount(it);e->is_devpts=kernel_devpts_is_mount(it);
+            e->nosuid=it->nosuid;e->nodev=it->nodev;e->noexec=it->noexec;e->atime_policy=it->atime_policy;
+            e->read_only=kernel_vfs_mount_is_readonly(it);e->super_read_only=instance->read_only;
+            e->id=it->id;e->parent=it->parent?it->parent->id:it->id;e->device=instance->device_id;
+            e->shared=it->propagation_group;e->master=it->master?it->master->propagation_group:0;
+            e->unbindable=it->unbindable;
+            for(struct kernel_vfs_mount *master=it->master;master && !e->dominating;master=master->master) {
+                struct kernel_vfs_mount *peer=master;
+                do {
+                    if(kernel_vfs_mount_reachable(peer,root_path))e->dominating=master->propagation_group;
+                    peer=peer->propagation_group?peer->peer_next:master;
+                }while(peer!=master && !e->dominating);
             }
-            if (kernel_vfs_path_acquire(mount_root)) {
-                (void)kernel_vfs_path_release(&path);
-                changed = 1;
-                break;
-            }
-            entries[captured].path = path;
-            entries[captured].mount_root = mount_root;
-            entries[captured].source = it->source_name;
-            entries[captured].bpf_type = kernel_bpf_filesystem_type(it);
-            entries[captured].is_proc = kernel_procfs_is_mount(it);
-            entries[captured].is_tmpfs = kernel_tmpfs_is_mount(it);
-            entries[captured].is_devpts = kernel_devpts_is_mount(it);
-            entries[captured].nosuid=it->nosuid;
-            entries[captured].nodev=it->nodev;
-            entries[captured].noexec=it->noexec;
-            entries[captured].read_only =
-                kernel_vfs_mount_is_readonly(it);
-            captured++;
         }
-        arch_interrupt_restore(irq);
-        if (!changed) break;
-        release_mount_entries(heap, &entries, captured);
-        captured = 0U;
-        if (attempt == 2U) return result;
     }
-    size_t capacity = captured * (8U * KERNEL_FS_PATH_MAX + 80U);
+    size_t capacity = captured * (12U * KERNEL_FS_PATH_MAX + 256U);
     char *data = 0, *path_text = 0;
     enum kernel_heap_status allocation = kernel_heap_allocate(heap, capacity,
                                                               (void **)&data);
@@ -1303,7 +1281,7 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
                                                         : -KERNEL_EIO;
         goto Finish;
     }
-    allocation = kernel_heap_allocate(heap, KERNEL_FS_PATH_MAX,
+    allocation = kernel_heap_allocate(heap, 2U*KERNEL_FS_PATH_MAX,
                                        (void **)&path_text);
     if (allocation != KERNEL_HEAP_STATUS_OK) {
         result = allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM
@@ -1323,9 +1301,42 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
         const char *kind = entries[i].bpf_type ? entries[i].bpf_type :
                            entries[i].is_proc ? "proc" :
                            entries[i].is_tmpfs ? "tmpfs" : entries[i].is_devpts ? "devpts" : "ext4";
+        if(information) {
+            result=kernel_vfs_path_filesystem_string(entries[i].mount_root,path_text+KERNEL_FS_PATH_MAX,KERNEL_FS_PATH_MAX);
+            if(result)goto Finish;
+            /* Capacity reserves escaped source, mountpoint, filesystem root
+             * and bounded numeric fields for each captured entry. */
+            used+=decimal(data+used,entries[i].id);data[used++]=' ';
+            used+=decimal(data+used,entries[i].parent);data[used++]=' ';
+            used+=decimal(data+used,((entries[i].device>>8U)&0xfffU)|((entries[i].device>>32U)&UINT64_C(0xfffff000)));data[used++]=':';
+            used+=decimal(data+used,(entries[i].device&255U)|((entries[i].device>>12U)&UINT64_C(0xffffff00)));data[used++]=' ';
+            used+=append_escaped(data+used,path_text+KERNEL_FS_PATH_MAX);data[used++]=' ';
+            used+=append_escaped(data+used,path_text);
+        }
         const char *options[]={entries[i].read_only?" ro":" rw",
             entries[i].nosuid?",nosuid":"",entries[i].nodev?",nodev":"",
-            entries[i].noexec?",noexec":""," 0 0\n"};
+            entries[i].noexec?",noexec":"",
+            entries[i].atime_policy&VFS_ATIME_NONE?",noatime":
+                entries[i].atime_policy&VFS_ATIME_STRICT?"":",relatime",
+            entries[i].atime_policy&VFS_ATIME_NODIR?",nodiratime":""," 0 0\n"};
+        if(information) {
+            for(size_t j=0;j+1<sizeof(options)/sizeof(options[0]);j++) {
+                size_t n=strlen(options[j]);memcpy(data+used,options[j],n);used+=n;
+            }
+            const char *labels[]={" shared:"," master:"," propagate_from:"};
+            uint64_t values[]={entries[i].shared,entries[i].master,
+                entries[i].dominating!=entries[i].master?entries[i].dominating:0};
+            for(unsigned j=0;j<3;j++)if(values[j]) {
+                size_t n=strlen(labels[j]);memcpy(data+used,labels[j],n);used+=n;used+=decimal(data+used,values[j]);
+            }
+            if(entries[i].unbindable){memcpy(data+used," unbindable",11);used+=11;}
+            memcpy(data+used," - ",3);used+=3;
+            size_t n=strlen(kind);memcpy(data+used,kind,n);used+=n;data[used++]=' ';
+            used+=append_escaped(data+used,source);
+            const char *super=entries[i].super_read_only?" ro\n":" rw\n";
+            n=strlen(super);memcpy(data+used,super,n);used+=n;
+            continue;
+        }
         size_t suffix_length=0;
         for (size_t j=0;j<sizeof(options)/sizeof(options[0]);j++) suffix_length+=strlen(options[j]);
         size_t needed = 4U * strlen(source) + 1U + 4U * strlen(path_text) +
@@ -1862,7 +1873,8 @@ static int proc_snapshot(struct kernel_vfs_node *node, struct kernel_heap *heap,
         proc_inode_kind(node->inode) == PROC_TID_STAT_KIND ||
         proc_inode_kind(node->inode) == PROC_TID_STATUS_KIND)
         return proc_process_snapshot(node, heap, buffer, length);
-    if (proc_inode_kind(node->inode) == PROC_PID_MOUNTS_KIND) {
+    if (proc_inode_kind(node->inode) == PROC_PID_MOUNTS_KIND ||
+        proc_inode_kind(node->inode)==PROC_PID_MOUNTINFO_KIND) {
         uint64_t identity = 0U;
         if (proc_inode_identity_current(node->inode,&identity) ||
             identity != proc_inode_identity(node->inode)) return -KERNEL_ENOENT;
@@ -1931,6 +1943,7 @@ static void initialize_backend(void)
 {
     /* Early VFS module tests execute at physical addresses before Sv39. */
     volatile struct kernel_vfs_backend *ops = &proc_backend;
+    ops->type="proc";
     ops->error = proc_error;
     ops->root = proc_root;
     ops->lookup = proc_lookup;

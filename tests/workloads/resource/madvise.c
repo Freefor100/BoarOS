@@ -309,16 +309,84 @@ static void remote_free(void)
     for(unsigned i=0;i<cpus;i++)CHECK(!pthread_join(threads[i],0)&&p[i]==i+1);
     CHECK(!pthread_barrier_destroy(&barrier)&&!munmap(p,page));pass("free-remote-writes");
 }
+static void populate_anonymous(void)
+{
+    unsigned char *p=area(3,MAP_PRIVATE),resident[3];
+    CHECK(!mincore(p,3*page,resident)&&!resident[0]&&!resident[1]&&!resident[2]);
+    CHECK(!madvise(p,3*page,22));
+    CHECK(!mincore(p,3*page,resident)&&resident[0]&&resident[1]&&resident[2]);
+    CHECK(!mprotect(p+page,page,PROT_READ));
+    ERROR(madvise(p,3*page,23),EINVAL);
+    CHECK(!mprotect(p+page,page,PROT_NONE));ERROR(madvise(p+page,page,22),EINVAL);
+    CHECK(!munmap(p+page,page));ERROR(madvise(p,3*page,22),ENOMEM);
+    CHECK(!munmap(p,3*page));
+    p=area(2,MAP_PRIVATE);p[0]=37;pid_t child=fork();CHECK(child>=0);
+    if(!child){CHECK(!madvise(p,2*page,23));p[0]=51;p[page]=19;_exit(0);}joined(child);
+    CHECK(p[0]==37&&!p[page]&&!munmap(p,2*page));
+    pass("populate-anonymous-permissions-holes-and-cow");
+}
+static void populate_mapping(void)
+{
+    unsigned char resident[2];
+    unsigned char *p=mmap(NULL,2*page,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_POPULATE,-1,0);
+    CHECK(p!=MAP_FAILED&&!mincore(p,2*page,resident)&&resident[0]&&resident[1]&&!munmap(p,2*page));
+    p=mmap(NULL,2*page,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_POPULATE|MAP_NONBLOCK,-1,0);
+    CHECK(p!=MAP_FAILED&&!mincore(p,2*page,resident)&&!resident[0]&&!resident[1]&&!munmap(p,2*page));
+    p=mmap(NULL,page,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_POPULATE,-1,0);
+    CHECK(p!=MAP_FAILED&&!mincore(p,page,resident)&&!resident[0]&&!munmap(p,page));
+    int fd=open("/populate-file",O_CREAT|O_RDWR|O_TRUNC,0600);CHECK(fd>=0&&pwrite(fd,"p",1,0)==1);
+    p=mmap(NULL,2*page,PROT_READ|PROT_WRITE,MAP_PRIVATE,fd,0);CHECK(p!=MAP_FAILED);
+    CHECK(!madvise(p,page,22)&&p[0]=='p');ERROR(madvise(p,2*page,22),EFAULT);
+    CHECK(!madvise(p,page,23));p[0]='q';char c;CHECK(pread(fd,&c,1,0)==1&&c=='p');
+    CHECK(!munmap(p,2*page)&&!close(fd)&&!unlink("/populate-file"));
+    pass("populate-mmap-nonblock-file-eof-and-private-write");
+}
+static void dump_policy(void)
+{
+    unsigned char *p=area(3,MAP_PRIVATE);p[page]=42;
+    CHECK(!madvise(p+page,page,16)&&!mprotect(p+page,page,PROT_READ));
+    pid_t child=fork();CHECK(child>=0);
+    if(!child){CHECK(p[page]==42&&!madvise(p+page,page,17));_exit(0);}joined(child);
+    CHECK(!madvise(p+page,page,17)&&!madvise(p+page,page,16));
+    CHECK(!mprotect(p,3*page,PROT_READ|PROT_WRITE)&&!madvise(p,3*page,16));
+    p=mremap(p,3*page,4*page,MREMAP_MAYMOVE);CHECK(p!=MAP_FAILED&&p[page]==42);
+    CHECK(!madvise(p,4*page,17)&&!munmap(p,4*page));
+    pass("dump-policy-partial-protect-fork-and-remap");
+}
+struct populate_actor {unsigned char *p;unsigned cpu;pthread_barrier_t *barrier;};
+static void *populate_remote(void *argument)
+{
+    struct populate_actor *a=argument;cpu_set_t set;CPU_ZERO(&set);CPU_SET(a->cpu,&set);
+    CHECK(!sched_setaffinity(0,sizeof(set),&set));gate(a->barrier);
+    CHECK(!madvise(a->p,page,22)&&!madvise(a->p,page,23));a->p[0]=(unsigned char)(a->cpu+1);
+    gate(a->barrier);return NULL;
+}
+static void population_cpus(void)
+{
+    cpu_set_t set;CHECK(!sched_getaffinity(0,sizeof(set),&set));unsigned cpus[8],n=0;
+    for(unsigned i=0;i<CPU_SETSIZE&&n<8;i++)if(CPU_ISSET(i,&set))cpus[n++]=i;
+    CHECK(n);unsigned char *p=area(n,MAP_PRIVATE);pthread_barrier_t barrier;
+    CHECK(!pthread_barrier_init(&barrier,NULL,n+1));pthread_t threads[8];struct populate_actor args[8];
+    for(unsigned i=0;i<n;i++){args[i]=(struct populate_actor){p+i*page,cpus[i],&barrier};CHECK(!pthread_create(&threads[i],NULL,populate_remote,&args[i]));}
+    gate(&barrier);gate(&barrier);
+    for(unsigned i=0;i<n;i++)CHECK(!pthread_join(threads[i],NULL)&&p[i*page]==cpus[i]+1);
+    CHECK(!pthread_barrier_destroy(&barrier)&&!munmap(p,n*page));
+    pass("populate-caller-cpus-shared-mm");
+}
 int main(void)
 {
     setvbuf(stdout,0,_IONBF,0);page=(size_t)sysconf(_SC_PAGESIZE);CHECK(page==4096||page==16384);
     CHECK(!mkdir("/tmp",0755)||errno==EEXIST);CHECK(!mount("tmpfs","/tmp","tmpfs",0,0));
-    abi();lazy_free();lazy_free_errors();remote_free();anonymous();cow();shared();file_case("/tmp/madvise","tmpfs-private-shared-data");
+    abi();populate_anonymous();populate_mapping();dump_policy();population_cpus();
+#ifndef MADVISE_POPULATION_ONLY
+#define MADVISE_POPULATION_ONLY 0
+#endif
+    if (!MADVISE_POPULATION_ONLY) {lazy_free();lazy_free_errors();remote_free();anonymous();cow();shared();file_case("/tmp/madvise","tmpfs-private-shared-data");
     file_case("/madvise","ext4-private-shared-data");locked();hole();willneed();remote();
     remove_shared_memory();remove_file("/tmp/remove","remove-tmpfs-shared-file");
     remove_file("/remove","remove-ext4-shared-file");remove_hole();
     fork_absent();fork_wipe();fork_backing();fork_file("/tmp/fork-policy","dontfork-tmpfs-private-owner");
-    fork_file("/fork-policy","dontfork-ext4-private-owner");fork_hole_remap();fork_bss();fork_remote();
+    fork_file("/fork-policy","dontfork-ext4-private-owner");fork_hole_remap();fork_bss();fork_remote();}
     CHECK(!umount("/tmp"));printf("MADVISE END %u\n",cases);
     if(getpid()==1){sync();reboot(RB_POWER_OFF);}return 0;
 }

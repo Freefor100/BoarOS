@@ -330,10 +330,10 @@ def chroot_output(raw):
     lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('CHROOT ')]
     return lines==[*(f'CHROOT CASE {name} PASS' for name in CHROOT_CASES),f'CHROOT END {len(CHROOT_CASES)}']
 
-MOUNT_ATTR_CASES=('new-mount-flags-statfs-mounts', 'exec-script-format-writer-order', 'elf-interpreter-final-mount', 'symlinks-and-child-use-final-mount', 'access-directory-empty-fd-and-privilege', 'nodev-special-types-path-only-and-aliases', 'nodev-block-mount-source-and-type-order', 'mmap-noexec-mprotect-fork-remap-and-fixed-content', 'mmap-fd-rights-validation-and-no-mmap-order', 'overmount-proc-dirfd-and-prior-fd-rights', 'prior-pty-master-peer-path-and-io','mapping-owner-survives-close-and-fork-until-release')
+MOUNT_ATTR_CASES=('new-mount-flags-statfs-mounts','atime-tmpfs-views-and-directories','atime-ext4-views-and-directories','noatime-ofd-alias-flags-and-permission', 'exec-script-format-writer-order', 'elf-interpreter-final-mount', 'symlinks-and-child-use-final-mount', 'access-directory-empty-fd-and-privilege', 'nodev-special-types-path-only-and-aliases', 'nodev-block-mount-source-and-type-order', 'mmap-noexec-mprotect-fork-remap-and-fixed-content', 'mmap-fd-rights-validation-and-no-mmap-order', 'overmount-proc-dirfd-and-prior-fd-rights', 'prior-pty-master-peer-path-and-io','mapping-owner-survives-close-and-fork-until-release')
 def mount_attributes_output(raw):
     lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('MOUNT-ATTR ')]
-    return lines==[*(f'MOUNT-ATTR CASE {name} PASS' for name in MOUNT_ATTR_CASES),'MOUNT-ATTR END 12']
+    return lines==[*(f'MOUNT-ATTR CASE {name} PASS' for name in MOUNT_ATTR_CASES),'MOUNT-ATTR END 15']
 
 SHM_QUERY_CASES=('namespace-limits-and-empty','allocated-pages-and-highest-index',
     'slot-descriptor-and-generation','permission-and-stat-any','resident-shared-pages',
@@ -350,7 +350,9 @@ def shm_lock_output(raw):
     lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('SHM-LOCK ')]
     return lines==[*(f'SHM-LOCK CASE {name} PASS' for name in SHM_LOCK_CASES),'SHM-LOCK END 8']
 
-MADVISE_CASES=('abi-width-alignment-zero-overflow','free-private-content-write-and-cow',
+MADVISE_CASES=('abi-width-alignment-zero-overflow',
+    'populate-anonymous-permissions-holes-and-cow','populate-mmap-nonblock-file-eof-and-private-write',
+    'dump-policy-partial-protect-fork-and-remap','populate-caller-cpus-shared-mm','free-private-content-write-and-cow',
     'free-types-lock-and-alignment','free-remote-writes','private-zero-rounding-protection',
     'private-cow-child-preserved','shared-anonymous-and-sysv-content','tmpfs-private-shared-data',
     'ext4-private-shared-data','locked-and-onfault-reject-after-prefix','hole-keeps-mapped-side-effects',
@@ -362,7 +364,7 @@ MADVISE_CASES=('abi-width-alignment-zero-overflow','free-private-content-write-a
     'wipe-pure-bss-zero-source','fork-remote-parent-cow-and-wipe')
 def madvise_output(raw):
     lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('MADVISE ')]
-    return lines==[*(f'MADVISE CASE {name} PASS' for name in MADVISE_CASES),'MADVISE END 25']
+    return lines==[*(f'MADVISE CASE {name} PASS' for name in MADVISE_CASES),'MADVISE END 29']
 
 KCMP_CASES=('abi-lookup-type-fd-width','real-ofd-dup-offset-stable-order',
     'fork-empty-sighand-lazy-identity','vfork-shared-vm-independent-tables','clone-fs-shared-object',

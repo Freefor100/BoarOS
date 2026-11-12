@@ -566,6 +566,7 @@ static void initialize_backend(void)
 {
     /* Early VFS tests execute before Sv39; assign callback addresses at runtime. */
     volatile struct kernel_vfs_backend *ops = &devpts_backend;
+    ops->type="devpts";
     ops->error = no_error; ops->root = root; ops->lookup = lookup;
     ops->open = open_inode; ops->close_node = close_node;
     ops->release_unlinked = release_unlinked;

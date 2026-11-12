@@ -1063,6 +1063,16 @@ enum kernel_files_status kernel_files_fcntl(
         *result=kernel_pipe_capacity(file->pipe,(int)command,argument);
         return 0;
     }
+    if (command==KERNEL_FILES_F_SETFL) {
+        KERNEL_FILES_PIN_SCOPE(pin);
+        struct kernel_open_file_description *file=kernel_files_hold_fd(files,fd,&pin);
+        if(!file || file->kind==KERNEL_OPEN_FILE_KIND_PATH)*result=-KERNEL_EBADF;
+        else if((argument&KERNEL_FILES_O_NOATIME) && !(kernel_open_file_flags(file)&KERNEL_FILES_O_NOATIME) &&
+            !kernel_open_file_noatime_allowed(file))*result=-KERNEL_EPERM;
+        else if(argument&00040000U)*result=-KERNEL_EINVAL;
+        else {kernel_open_file_set_status_flags(file,(uint32_t)argument);*result=0;}
+        return 0;
+    }
     KERNEL_FILES_SCOPE(guard, files);
     struct kernel_open_file_description *source=lookup_locked(files, fd);
     if (!source) { *result=-KERNEL_EBADF; return KERNEL_FILES_STATUS_OK; }
@@ -1080,13 +1090,6 @@ enum kernel_files_status kernel_files_fcntl(
         slot->flags=flags; *result=0; break;
     }
     case KERNEL_FILES_F_GETFL: *result=kernel_open_file_flags(source); break;
-    case KERNEL_FILES_F_SETFL:
-        /* Immutable/open-only bits are ignored, not rejected. Direct I/O and
-         * no-atime remain unsupported mutable modes, as at open. */
-        if (argument & (00040000U | 01000000U))
-            *result=-KERNEL_EINVAL;
-        else { kernel_open_file_set_status_flags(source, (uint32_t)argument); *result=0; }
-        break;
     default: *result=-KERNEL_EINVAL; break;
     }
     return KERNEL_FILES_STATUS_OK;

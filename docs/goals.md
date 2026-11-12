@@ -42,7 +42,7 @@ PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不�
 | 类别 | 未完成部分与依赖 | 当前契约 |
 |---|---|---|
 | 信号、线程与事件 | futex2 的NUMA/MPOL等扩展；clone3 的指定 PID、cgroup、非挂载命名空间及其他扩展标志；timerfd的BOOTTIME/ALARM与运行时调钟取消 | [信号](modules/kernel-signal.md)、[调度](modules/kernel-scheduler.md)、[文件接口](modules/kernel-files.md)；clone3与CLONE_PIDFD覆盖现有进程资源共享组合 |
-| 用户内存 | mremap 的多VMA批量及特殊映射搬移；madvise 的 dump策略、回收/预装等扩展；/proc/<pid>/pagemap | [MM](modules/kernel-mm.md)；普通匿名/文件映射支持缩小、扩大、搬移和DONTUNMAP，零旧长度可复制共享映射；madvise五种基础操作、匿名FREE、四种fork策略与共享后备REMOVE、SHM_LOCK/UNLOCK及MEMLOCK计费已接入，沿共同pin与TLB回收规则；vDSO ELF 通过 AT_SYSINFO_EHDR 提供时间查询与信号返回 |
+| 用户内存 | mremap 的多VMA批量及特殊映射搬移；madvise 的 COLD/PAGEOUT 等回收扩展；/proc/<pid>/pagemap | [MM](modules/kernel-mm.md)；普通匿名/文件映射支持缩小、扩大、搬移和DONTUNMAP，零旧长度可复制共享映射；madvise基础建议、POPULATE预装、dump标记、匿名FREE、四种fork策略与共享后备REMOVE、SHM_LOCK/UNLOCK及MEMLOCK计费已接入，沿共同pin与TLB回收规则；vDSO ELF 通过 AT_SYSINFO_EHDR 提供时间查询与信号返回 |
 | 进程查询与 IPC | pidfd 的扩展 ioctl、kcmp 的 EPOLL_TFD、IPC namespace、运行时 IPC sysctl | execve/execveat及按FD执行、chroot；getrusage、kcmp 的 FILE/VM/FILES/FS/SIGHAND/IO/SYSVSEM、pidfd_open/send_signal/getfd、clone 创建 pidfd、waitid(P_ALL/P_PID/P_PGID/P_PIDFD)、wait4、times、SysV 共享内存的 INFO/STAT/ANY 查询、信号量和消息队列及其 /proc/sysvipc 查询；逐接口补齐语义与资源归还 |
 | 文件接口扩展 | openat2 的纯缓存查找、memfd 的大页后备、copy_file_range跨实例及其他扩展标志；RWF_NOWAIT／ATOMIC／DONTCACHE底层能力 | [openat2](modules/kernel-files.md#openat-与路径边界)支持受限路径解析，[memfd_create](modules/kernel-files.md#memfd_create-与文件封印)支持匿名内存文件与封印；flock、close_range及UNSHARE/CLOEXEC、fchmodat2、epoll_pwait2、同实例文件复制、sendmmsg/recvmmsg、splice/tee/vmsplice、inotify、preadv2/pwritev2的常用按次选项、六种fadvise建议及显式readahead已提供；RV用户指令同步复用共享MM的指令代次与SBI确认 |
 | 存储介质与设备扩展 | GPT、扩展分区、FAT12/16、exFAT；块设备 mmap/discard/direct I/O；loop 分区扫描、CHANGE_FD 与 direct I/O | [块设备](modules/riscv-virtio-block.md)、[FAT32/VFAT](modules/fat32.md)；MBR 四主分区与常用文件后备 loop 已接入 |
@@ -53,16 +53,16 @@ PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不�
 
 ### P1h 虚拟文件系统与多挂载
 
-基础 proc/tmpfs/devpts/mqueue/ext4/vfat 挂载、覆盖、目录/文件 bind、rbind、MS_MOVE、chroot、RO/RW 重配置、普通忙卸载与 MNT_DETACH/UMOUNT_NOFOLLOW 已存在。私有挂载命名空间通过 CLONE_NEWNS、unshare、setns 与 /proc/<pid>/ns/mnt 使用。
+基础 proc/tmpfs/devpts/mqueue/ext4/vfat 挂载、覆盖、目录/文件 bind、rbind、MS_MOVE、chroot、RO/RW 重配置、普通忙卸载与 MNT_DETACH/UMOUNT_NOFOLLOW 已存在。挂载命名空间通过CLONE_NEWNS、unshare、setns与/proc/<pid>/ns/mnt使用，复制保留传播关系。
 
 | 扩展 | 尚缺语义 |
 |---|---|
 | proc 线程信息 | 其他按需线程字段；task 枚举、线程 stat/status、fd/fdinfo、exe/cwd/root、maps 与 thread-self 已提供，边界见[procfs模块](modules/procfs.md) |
-| 挂载传播 | 私有挂载命名空间已支持复制、切换与回收；shared/slave/unbindable 传播组尚未实现 |
-| 挂载属性扩展 | atime 策略、同步及其他尚未支持的属性与重配置选项 |
+| 挂载接口扩展 | pivot_root及新mount API仍未提供；shared/slave/private/unbindable、递归转换及mountinfo已接入现有挂载操作 |
+| 挂载属性扩展 | 同步、lazytime及其他尚未支持的属性与重配置选项；四种atime策略及O_NOATIME已执行 |
 | umount2 扩展 | MNT_FORCE/EXPIRE 及错误优先级；force 不允许提前释放用户或 DMA 在用对象 |
 
-当前新 mount 与基础 `MS_REMOUNT` 接受 `MS_RDONLY/MS_NOSUID/MS_NODEV/MS_NOEXEC/MS_SILENT`，`MS_BIND` 与 `MS_BIND|MS_REC` 复用实例，`MS_REMOUNT|MS_BIND` 更新单个视图属性，`MS_MOVE` 移动既有挂载连接；umount2 接受 flags=0、`MNT_DETACH`、`UMOUNT_NOFOLLOW`及后两者组合；进程根所属挂载的普通卸载尝试转为 RO；目标仍须是实际挂载根，chroot子目录本身的卸载返回 `EINVAL`，无 parent 的全局根对 `MNT_DETACH` 返回 `EINVAL`。重配置的写入者、映射、同步和失败所有权见[VFS 模块](modules/vfs-ext4.md)。
+当前新 mount 与基础 `MS_REMOUNT` 接受 `MS_RDONLY/MS_NOSUID/MS_NODEV/MS_NOEXEC/MS_SILENT`及atime策略，`MS_BIND` 与 `MS_BIND|MS_REC` 复用实例，`MS_REMOUNT|MS_BIND` 更新单个视图属性，`MS_MOVE` 移动既有挂载连接；umount2 接受 flags=0、`MNT_DETACH`、`UMOUNT_NOFOLLOW`及后两者组合；进程根所属挂载的普通卸载尝试转为 RO；目标仍须是实际挂载根，chroot子目录本身的卸载返回 `EINVAL`，无 parent 的全局根对 `MNT_DETACH` 返回 `EINVAL`。重配置的写入者、映射、同步和失败所有权见[VFS 模块](modules/vfs-ext4.md)。
 NOEXEC在最终挂载的执行打开、access及文件映射上执行；NODEV限制新的设备路径打开和块设备挂载源，已打开对象保留原权利。
 基础与扩展边界见 [VFS](modules/vfs-ext4.md)及[挂载学习记录](learning/memory-backed-mounts.md#基础挂载与扩展操作的边界)。
 

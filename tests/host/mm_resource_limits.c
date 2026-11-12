@@ -161,6 +161,38 @@ static void *pressure_alloc_actor(void *unused)
     pressure_alloc_result=physical_page_allocate(&pages,&pressure_alloc_page);
     atomic_store(&pressure_alloc_done,1);return NULL;
 }
+static void population_and_dump(void)
+{
+    assert(!map(BASE,3*P,RW,0));
+    int populated=kernel_mm_madvise(&mm,BASE,3*P,22);
+    CHECK(!populated);
+    if (populated) { assert(!kernel_mm_munmap(&mm,BASE,3*P));return; }
+    unsigned char residency[3]={0};unsigned done=0;
+    CHECK(!kernel_mm_mincore(&mm,BASE,3,residency,&done) && done==3 &&
+        residency[0] && residency[1] && residency[2]);
+    CHECK(!kernel_mm_madvise(&mm,BASE+P,P,16));
+    struct kernel_vma vma;
+    CHECK(!kernel_mm_vma_lookup(&mm,BASE+P,&vma) && (vma.flags&16));
+    CHECK(!kernel_mm_mprotect(&mm,BASE+P,P,KERNEL_MM_READ));
+    CHECK(kernel_mm_madvise(&mm,BASE,3*P,23)==-KERNEL_EINVAL);
+    CHECK(!kernel_mm_vma_lookup(&mm,BASE+P,&vma) && (vma.flags&16));
+    struct kernel_mm child={0};CHECK(!kernel_mm_fork(&child,&mm));
+    CHECK(!kernel_mm_vma_lookup(&child,BASE+P,&vma) && (vma.flags&16));
+    struct kernel_mm_mapping parent_page,child_page;
+    CHECK(!kernel_mm_lookup(&mm,BASE,&parent_page));
+    CHECK(!kernel_mm_madvise(&child,BASE,P,23) && !kernel_mm_lookup(&child,BASE,&child_page));
+    CHECK(child_page.physical_address!=parent_page.physical_address);
+    CHECK(!kernel_mm_release(&child));
+    CHECK(!kernel_mm_madvise(&mm,BASE+P,P,17));
+    CHECK(!kernel_mm_vma_lookup(&mm,BASE+P,&vma) && !(vma.flags&16));
+    CHECK(!kernel_mm_munmap(&mm,BASE,3*P));
+    assert(!map(BASE,2*P,RW,0));
+    CHECK(!kernel_mm_madvise(&mm,BASE,P,23));
+    fail_page=1;CHECK(kernel_mm_madvise(&mm,BASE,2*P,23)==-KERNEL_ENOMEM);fail_page=0;
+    CHECK(!kernel_mm_mincore(&mm,BASE,2,residency,&done) && residency[0] && !residency[1]);
+    CHECK(!kernel_mm_munmap(&mm,BASE,2*P));
+    puts("PASS population: real PTEs, permissions, OOM prefix and dump policy inheritance");
+}
 int main(void)
 {
     mm_test_attach(0);
@@ -172,6 +204,7 @@ int main(void)
     uint64_t baseline=physical_page_available(&pages);
     assert(!arch_mmu_user_space_init(&space,&pages,&kernel) && !kernel_mm_create(&mm,&space) && !kernel_mm_vma_enable(&mm,&heap));
     assert(!kernel_mm_brk_initialize(&mm,0x10000,0x20000) && !kernel_mm_context(&mm,&mm_test_context));
+    population_and_dump();
     struct kernel_mm held = {0};
     struct kernel_raw_lock identity;
     kernel_raw_lock_init(&identity, 40);

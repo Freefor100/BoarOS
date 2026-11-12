@@ -16,7 +16,6 @@ ROOT=Path(__file__).resolve().parents[2]
 sys.path[:0]=[str(ROOT/'tests'),str(ROOT/'tests/diff-abi'),str(ROOT/'tests/loongarch')]
 import harness
 from arch_profiles import PROFILES
-from reference import archive
 
 SOURCES={'init':'resource/api8.c','fd_events':'resource/fd_events.c',
          'flock':'locks/flock.c','mmsg':'network/mmsg.c','copy_range':'io/copy_range.c',
@@ -25,6 +24,9 @@ LEGACY=tuple(name for name in SOURCES if name!='init')
 SOURCES['vectors_v2']='io/vectors_v2.c'
 SOURCES['file_advice']='io/file_advice.c'
 SOURCES['splice']='io/splice.c'
+SOURCES['memory_advice']='resource/madvise.c'
+SOURCES['atime']='resource/mount_attributes.c'
+SOURCES['propagation']='resource/mount_namespace.c'
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -51,6 +53,9 @@ def build(args,work):
         destination=work/name
         command=[str(compiler),*flags,*([] if args.dynamic else ['-static']),
                  '-O2','-pthread','-Wall','-Wextra','-Werror',
+                 *(['-DMADVISE_POPULATION_ONLY=1'] if name=='memory_advice' else []),
+                 *(['-DMOUNT_ATIME_ONLY=1'] if name=='atime' else []),
+                 *(['-DMOUNT_PROPAGATION_ONLY=1'] if name=='propagation' else []),
                  str(ROOT/'tests/workloads'/source),'-lrt','-o',str(destination)]
         with (work/(name+'-compile.log')).open('w') as log:
             subprocess.run(command,cwd=ROOT,env=env,stdout=log,stderr=subprocess.STDOUT,check=True)
@@ -80,15 +85,10 @@ def build(args,work):
              '-fno-stack-protector','-nostdlib','-nostartfiles','-static','-no-pie',
              '-Wl,--build-id=none','-T',str(ROOT/'tests/common/user.ld'),
              str(ROOT/'tests/loongarch/root_linux_init.c'),str(ROOT/'tests/common/user_start.S'),'-o',str(supervisor)]
-    if args.arch=='riscv':command+=['-DROOT_DIRECT_FILESYSTEM=1']
-    else:command+=['-Wl,-z,max-page-size=16384']
+    command+=['-DROOT_DIRECT_FILESYSTEM=1']
+    if args.arch=='loongarch':command+=['-Wl,-z,max-page-size=16384']
     harness.run_logged(command,work/'supervisor-compile.log')
-    if args.arch=='riscv':
-        commands += [f'write "{supervisor}" /supervisor','set_inode_field /supervisor mode 0100755']
-    else:
-        (work/'initramfs.gz').write_bytes(archive([
-            ('dev',0o040755,b'',0,0),('dev/console',0o020600,b'',5,1),
-            ('init',0o100755,supervisor.read_bytes(),0,0),('TRAILER!!!',0,b'',0,0)]))
+    commands += [f'write "{supervisor}" /supervisor','set_inode_field /supervisor mode 0100755']
     batch=work/'payload.debugfs';batch.write_text('\n'.join(commands)+'\n')
     harness.run_logged(['debugfs','-w','-f',str(batch),str(image)],work/'payload.log')
     harness.run_logged(['e2fsck','-fn',str(image)],work/'fixture-fsck.log')
@@ -98,7 +98,7 @@ def accepted(raw,arch,cpus,target,selected=None):
     programs=[name for name in (selected or LEGACY) if name!='icache' or arch=='riscv']
     ends=[line for line in raw.replace('\r','').splitlines() if line.startswith('API8 END ')]
     expected=[f'API8 END /{name} status=0' for name in programs]
-    known={'fd_events':['FD-EVENTS PASS'],'flock':['FLOCK-PASS'],
+    known={'propagation':['PROP END 9'],'atime':['MOUNT-ATTR END 4'],'memory_advice':['MADVISE END 5'],'fd_events':['FD-EVENTS PASS'],'flock':['FLOCK-PASS'],
            'splice':['SPLICE PASS cases=9'],'file_advice':['ADVICE RESULT cases=3 failures=0'],'copy_range':['COPY_RANGE PASS'],'sched_query':['SCHED-QUERY END cases=7'],
            'icache':[f'ICACHE PASS cpus={cpus}'],
            'vectors_v2':[*(f'VECTORS2 CASE {name} PASS' for name in (
@@ -165,8 +165,9 @@ def main():
                         else 'virtio-blk-pci,drive=fat,addr=2,disable-legacy=on')
                 command+=['-drive',f'file={fat},if=none,format=raw,id=fat','-device',device]
             if target=='linux':
-                command+=(['-append','root=/dev/vda rw rootwait console=ttyS0 init=/supervisor loglevel=3 panic=-1']
-                          if args.arch=='riscv' else ['-initrd',str(work/'initramfs.gz'),'-append','console=ttyS0 rdinit=/init loglevel=3'])
+                # setns installs the namespace root. Use a real root mount on
+                # both architectures, rather than a LA-only chroot in initrd.
+                command+=['-append','root=/dev/vda rw rootwait console=ttyS0 init=/supervisor loglevel=3 panic=-1']
             record={'target':target,'kernel_sha256':digest(snapshot),'command':command,'returncode':0}
             log=work/(target+'.log')
             try:harness.run_logged(command,log,180)

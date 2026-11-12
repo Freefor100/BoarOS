@@ -575,14 +575,14 @@ static enum kernel_block_status write_image(void *unused,uint64_t offset,const v
 }
 static enum kernel_block_status flush_image(void *unused)
 { (void)unused; return fsync(image)?KERNEL_BLOCK_STATUS_IO:KERNEL_BLOCK_STATUS_OK; }
-void __real_kernel_vfs_file_accessed(struct kernel_vfs_file *);
-void __wrap_kernel_vfs_file_accessed(struct kernel_vfs_file *file)
+void __real_kernel_vfs_file_accessed(struct kernel_vfs_file *,uint32_t);
+void __wrap_kernel_vfs_file_accessed(struct kernel_vfs_file *file,uint32_t flags)
 {
     if(__atomic_exchange_n(&pause_local_access,0,__ATOMIC_ACQ_REL)) {
         __atomic_store_n(&local_access_entered,1,__ATOMIC_RELEASE);
         while(!__atomic_load_n(&resume_local_access,__ATOMIC_ACQUIRE))sched_yield();
     }
-    __real_kernel_vfs_file_accessed(file);
+    __real_kernel_vfs_file_accessed(file,flags);
 }
 struct crossing { unsigned id,shared; enum kernel_files_status status; int64_t result; char bytes[8]; };
 static void *crossing_read(void *argument)

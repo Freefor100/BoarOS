@@ -630,7 +630,7 @@ static enum kernel_files_status read_pinned(
             return KERNEL_FILES_STATUS_STATE;
         }
         if (*linux_result > 0 && description->file.private_data)
-            kernel_vfs_file_accessed(&description->file);
+            kernel_vfs_file_accessed(&description->file,kernel_open_file_flags(description));
         if (*linux_result >= 0) {
             KERNEL_FILES_NOTE(files, bytes_read, (uint64_t)*linux_result);
         } else {
@@ -668,7 +668,7 @@ static enum kernel_files_status read_pinned(
     }
     if (kind == KERNEL_OPEN_FILE_KIND_REGULAR) {
         kernel_open_file_read_begin(description, kernel_open_file_offset(description));
-        kernel_vfs_file_accessed(&description->file);
+        kernel_vfs_file_accessed(&description->file,kernel_open_file_flags(description));
     }
     request = count > KERNEL_FILES_MAX_RW_COUNT
                   ? KERNEL_FILES_MAX_RW_COUNT
@@ -951,7 +951,7 @@ static enum kernel_files_status pread_iov_pinned(
     }
     if (kind == KERNEL_OPEN_FILE_KIND_REGULAR) {
         kernel_open_file_read_begin(description, (uint64_t)offset);
-        kernel_vfs_file_accessed(&description->file);
+        kernel_vfs_file_accessed(&description->file,kernel_open_file_flags(description));
     }
     request = count > KERNEL_FILES_MAX_RW_COUNT
                   ? KERNEL_FILES_MAX_RW_COUNT
@@ -1999,6 +1999,7 @@ enum kernel_files_status kernel_files_getdents(
     KERNEL_SERVICE_SCOPE_IF(service, kernel_vfs_namespace_requires_cpu0(description->file.mount));
     KERNEL_LOCK_SCOPE(offset_guard);
     kernel_mutex_lock(&description->offset_lock, &offset_guard);
+    kernel_vfs_file_accessed(&description->file,kernel_open_file_flags(description));
     /* The descriptor offset is the backend cookie for the next record. */
     position = kernel_open_file_offset(description);
     do {

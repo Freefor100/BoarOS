@@ -91,6 +91,16 @@ int kernel_vfs_file_noappend_allowed(const struct kernel_vfs_file *file)
     return !(node->metadata_restrictions&KERNEL_VFS_INODE_APPEND);
 }
 
+int kernel_vfs_file_noatime_allowed(const struct kernel_vfs_file *file)
+{
+    const struct kernel_credentials *cred=kernel_credentials_current();
+    if (kernel_credentials_capable(cred,KERNEL_CAP_FOWNER)) return 1;
+    struct kernel_vfs_node *node=kernel_vfs_file_node(file);
+    if (!node) return 0;
+    KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(node,&io,0);
+    return cred->fsuid==node->uid;
+}
+
 int kernel_vfs_file_mincore_allowed(const struct kernel_vfs_file *file)
 {
     struct kernel_vfs_node *node = kernel_vfs_file_node(file);
@@ -494,6 +504,8 @@ uint64_t kernel_vfs_allocate_mount_id(void)
 static struct kernel_vfs_instance *pending_instances, *retired_instances, *active_instances;
 static struct kernel_vfs_mount *retired_mount_trees;
 static void detach_retired_mount_tree(struct kernel_vfs_mount *);
+static void propagation_forget(struct kernel_vfs_mount *);
+static int enter_mounts(struct kernel_vfs_path **,unsigned);
 static int dentry_acquire(struct kernel_vfs_dentry *);
 static void dentry_release(struct kernel_vfs_dentry **);
 static int path_wrap(struct kernel_vfs_mount *,struct kernel_vfs_dentry *,struct kernel_vfs_path **);
@@ -513,6 +525,7 @@ void kernel_vfs_mount_initialize(struct kernel_vfs_mount *mount)
     if (!instance->backend_mount.private_data) {
         instance->backend_mount.private_data=instance;
         instance->backend_mount.id=mount->id;
+        instance->device_id=mount->id;
         instance->backend_mount.state=mount->state;
         instance->backend_mount.backend_owner=1;
         instance->backend_mount.source_name=mount->source_name;
@@ -730,7 +743,27 @@ int kernel_vfs_mount_contains(struct kernel_vfs_mount *root, const struct kernel
 }
 /* A mount edge is published after both paths are pinned. The short IRQ
  * section protects the edge and reference transfer; it never waits for I/O. */
-int kernel_vfs_mount_attach(struct kernel_vfs_mount *mount,
+static void publish_mount_edge(struct kernel_vfs_mount *mount,struct kernel_vfs_path *covered,struct kernel_vfs_path *root)
+{
+    struct kernel_vfs_mount *parent=covered->file.mount;
+    parent->child_mounts++;mount->covered_path=covered;mount->root_path=root;mount->parent=parent;
+    mount->propagation_staged=0;
+    mount->previous_sibling=NULL;mount->next_sibling=parent->first_child;
+    if(parent->first_child)parent->first_child->previous_sibling=mount;
+    parent->first_child=mount;covered->mounted_here=mount;covered->dentry->mountpoints++;
+}
+static void unpublish_mount_edge(struct kernel_vfs_mount *mount)
+{
+    struct kernel_vfs_mount *parent=mount->parent;struct kernel_vfs_path *covered=mount->covered_path;
+    if(!parent || covered->mounted_here!=mount || !parent->child_mounts || !covered->dentry->mountpoints)__builtin_trap();
+    if(mount->previous_sibling)mount->previous_sibling->next_sibling=mount->next_sibling;
+    else parent->first_child=mount->next_sibling;
+    if(mount->next_sibling)mount->next_sibling->previous_sibling=mount->previous_sibling;
+    covered->dentry->mountpoints--;covered->mounted_here=NULL;parent->child_mounts--;
+    mount->parent=mount->next_sibling=mount->previous_sibling=NULL;
+    mount->root_path=mount->covered_path=NULL;
+}
+static int mount_attach_one(struct kernel_vfs_mount *mount,
                             struct kernel_vfs_path *covered)
 {
     KERNEL_LOCK_SCOPE(topology);mount_topology_lock(&topology);
@@ -779,14 +812,7 @@ int kernel_vfs_mount_attach(struct kernel_vfs_mount *mount,
         (void)kernel_vfs_path_release(&new_root);
         return -KERNEL_EBUSY;
     }
-    parent->child_mounts++;
-    mount->covered_path = covered;
-    mount->root_path = new_root;
-    mount->parent = parent;
-    mount->next_sibling = parent->first_child;
-    if (parent->first_child) parent->first_child->previous_sibling = mount;
-    parent->first_child = mount;
-    covered->mounted_here = mount;covered->dentry->mountpoints++;
+    publish_mount_edge(mount,covered,new_root);
     path_topology_changed();
     kernel_task_lock_release(&irq);
     return 0;
@@ -805,7 +831,9 @@ int kernel_vfs_mount_prepare_detach(struct kernel_vfs_mount *mount,const struct 
     KERNEL_LOCK_SCOPE(namespace_guard);kernel_vfs_namespace_lock(mount,&namespace_guard);
     {
         KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
-        if (mount->covered_path->mounted_here!=mount || !mount_view_idle(mount,named)) return -KERNEL_EBUSY;
+        if (mount->covered_path->mounted_here!=mount ||
+            (!(__atomic_load_n(&mount->root_path->references,__ATOMIC_ACQUIRE)&VFS_PATH_CLOSING) &&
+             !mount_view_idle(mount,named))) return -KERNEL_EBUSY;
         if (instance->mount_views!=1) return 0;
         instance->quiescing=1;
     }
@@ -827,13 +855,7 @@ static int unlink_mount_edge(struct kernel_vfs_mount *mount,int lazy,const struc
         KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
         if (covered->mounted_here!=mount || !parent->child_mounts || mount->child_mounts || (!lazy && !mount_view_idle(mount,named)))
             return -KERNEL_EBUSY;
-        if (mount->previous_sibling) mount->previous_sibling->next_sibling=mount->next_sibling;
-        else parent->first_child=mount->next_sibling;
-        if (mount->next_sibling) mount->next_sibling->previous_sibling=mount->previous_sibling;
-        if (!covered->dentry->mountpoints) __builtin_trap();
-        covered->dentry->mountpoints--;covered->mounted_here=NULL;parent->child_mounts--;
-        mount->parent=NULL;mount->next_sibling=mount->previous_sibling=NULL;
-        mount->root_path=mount->covered_path=NULL;
+        unpublish_mount_edge(mount);
         path_topology_changed();
     }
     kernel_lock_scope_release(&namespace_guard);
@@ -861,8 +883,122 @@ static int dentry_below(const struct kernel_vfs_dentry *entry,const struct kerne
     KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
     while (entry) {if (entry==root) return 1;entry=entry->parent;}return 0;
 }
+int kernel_vfs_mount_reachable(struct kernel_vfs_mount *mount,const struct kernel_vfs_path *root)
+{
+    KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+    const struct kernel_vfs_dentry *entry=mount->root_dentry;
+    for(;;) {
+        if(mount==root->file.mount) {
+            while(entry && entry!=root->dentry)entry=entry->parent;
+            return entry!=NULL;
+        }
+        if(!mount->covered_path || !mount->parent)return 0;
+        entry=mount->covered_path->dentry;mount=mount->parent;
+    }
+}
+
+/* All peer/master links are weak and belong to the topology qualification.
+ * Retirement transfers downstream links before storage can lose its owner. */
+static uint64_t next_propagation_group=1,propagation_visit;
+#define PROP_SHARED UINT64_C(1048576)
+#define PROP_PRIVATE UINT64_C(262144)
+#define PROP_SLAVE UINT64_C(524288)
+#define PROP_UNBINDABLE UINT64_C(131072)
+#define CLONE_PROP_SLAVE 1U
+#define CLONE_PROP_SHARED 2U
+
+static void propagation_unmaster(struct kernel_vfs_mount *m)
+{
+    if (!m->master) return;
+    if (m->previous_slave) m->previous_slave->next_slave=m->next_slave;
+    else m->master->first_slave=m->next_slave;
+    if (m->next_slave) m->next_slave->previous_slave=m->previous_slave;
+    m->master=m->next_slave=m->previous_slave=NULL;
+}
+static void propagation_master(struct kernel_vfs_mount *m,struct kernel_vfs_mount *master)
+{
+    propagation_unmaster(m);
+    if (!master) return;
+    if (master==m || !master->propagation_group) __builtin_trap();
+    m->master=master;m->next_slave=master->first_slave;
+    if (m->next_slave) m->next_slave->previous_slave=m;
+    master->first_slave=m;
+}
+static void propagation_unshare(struct kernel_vfs_mount *m)
+{
+    if (!m->propagation_group) return;
+    m->peer_previous->peer_next=m->peer_next;
+    m->peer_next->peer_previous=m->peer_previous;
+    m->propagation_group=0;m->peer_next=m->peer_previous=NULL;
+}
+static void propagation_share(struct kernel_vfs_mount *m,struct kernel_vfs_mount *peer)
+{
+    if (peer==m) __builtin_trap();
+    propagation_unshare(m);
+    m->unbindable=0;
+    if (!peer) {
+        if (!next_propagation_group || next_propagation_group==UINT64_MAX) __builtin_trap();
+        m->propagation_group=next_propagation_group++;
+        m->peer_next=m->peer_previous=m;
+    } else {
+        if (!peer->propagation_group) __builtin_trap();
+        m->propagation_group=peer->propagation_group;
+        m->peer_next=peer->peer_next;m->peer_previous=peer;
+        peer->peer_next->peer_previous=m;peer->peer_next=m;
+    }
+}
+static void propagation_transfer(struct kernel_vfs_mount *m,struct kernel_vfs_mount *to)
+{
+    while (m->first_slave) propagation_master(m->first_slave,to);
+}
+static void propagation_forget(struct kernel_vfs_mount *m)
+{
+    struct kernel_vfs_mount *to=m->propagation_group && m->peer_next!=m ? m->peer_next : m->master;
+    propagation_transfer(m,to);propagation_unshare(m);propagation_unmaster(m);m->unbindable=0;
+}
+static void propagation_copy(struct kernel_vfs_mount *source,struct kernel_vfs_mount *copy,unsigned flags)
+{
+    if (flags&CLONE_PROP_SLAVE) {
+        propagation_master(copy,source);
+        if(flags&CLONE_PROP_SHARED)propagation_share(copy,NULL);
+    } else {
+        propagation_master(copy,source->master);
+        if(source->propagation_group)propagation_share(copy,source);
+        else if(flags&CLONE_PROP_SHARED)propagation_share(copy,NULL);
+        else copy->unbindable=source->unbindable;
+    }
+}
+struct kernel_vfs_mount *kernel_vfs_mount_next(struct kernel_vfs_mount *m,struct kernel_vfs_mount *top)
+{
+    if(m->first_child)return m->first_child;
+    while(m!=top){if(m->next_sibling)return m->next_sibling;m=m->parent;}
+    return NULL;
+}
+int kernel_vfs_change_propagation(struct kernel_vfs_path *root,uint64_t type,int recursive)
+{
+    KERNEL_LOCK_SCOPE(topology);mount_topology_lock(&topology);
+    if (!kernel_vfs_path_is_mount_root(root) || (type!=PROP_SHARED && type!=PROP_PRIVATE &&
+        type!=PROP_SLAVE && type!=PROP_UNBINDABLE)) return -KERNEL_EINVAL;
+    struct kernel_vfs_mount *top=root->file.mount;
+    size_t groups=0;
+    for(struct kernel_vfs_mount *m=top;m;m=recursive?kernel_vfs_mount_next(m,top):NULL)
+        if(type==PROP_SHARED && !m->propagation_group)groups++;
+    if(groups>UINT64_MAX-next_propagation_group-1)return -KERNEL_ENOSPC;
+    for(struct kernel_vfs_mount *m=top;m;m=recursive?kernel_vfs_mount_next(m,top):NULL) {
+        if(type==PROP_SHARED){if(!m->propagation_group)propagation_share(m,NULL);continue;}
+        struct kernel_vfs_mount *master=m->master;
+        if(m->propagation_group) {
+            if(m->peer_next!=m)master=m->peer_next;
+            propagation_transfer(m,master);propagation_unshare(m);
+        }
+        propagation_master(m,type==PROP_SLAVE?master:NULL);
+        m->unbindable=type==PROP_UNBINDABLE;
+    }
+    return 0;
+}
+
 static int clone_one_view(struct kernel_vfs_mount *source,struct kernel_vfs_dentry *root,
-    struct kernel_vfs_mount **owner)
+    unsigned flags,struct kernel_vfs_mount **owner)
 {
     struct kernel_vfs_instance *instance=source->private_data;
     struct kernel_vfs_mount *mount=NULL;
@@ -878,8 +1014,10 @@ static int clone_one_view(struct kernel_vfs_mount *source,struct kernel_vfs_dent
         if (mount->instance_next) mount->instance_next->instance_previous=&mount->instance_next;
         instance->views=mount;
         mount->read_only=source->read_only;mount->nosuid=source->nosuid;mount->nodev=source->nodev;
-        mount->noexec=source->noexec;mount->silent=source->silent;mount->source_name=instance->backend_mount.source_name;
+        mount->noexec=source->noexec;mount->silent=source->silent;mount->atime_policy=source->atime_policy;mount->source_name=instance->backend_mount.source_name;
     }
+    mount->propagation_staged=1;
+    propagation_copy(source,mount,flags);
     *owner=mount;return 0;
 }
 static int remap_cloned_paths(struct kernel_vfs_mount *original,struct kernel_vfs_mount *copy,
@@ -900,20 +1038,21 @@ static void release_cloned_paths(struct kernel_vfs_path *destination[3])
         if (destination[i] && kernel_vfs_path_release(&destination[i])) __builtin_trap();
 }
 static int clone_mount_view(struct kernel_vfs_mount *source,struct kernel_vfs_dentry *root,int recursive,
-    struct kernel_vfs_mount **owner,struct kernel_vfs_path *const paths[3],
+    unsigned flags,struct kernel_vfs_mount **owner,struct kernel_vfs_path *const paths[3],
     struct kernel_vfs_path *remapped[3])
 {
     struct kernel_vfs_mount *copy_root=NULL;
-    int result=clone_one_view(source,root,&copy_root);if (result) return result;
+    int result=clone_one_view(source,root,flags,&copy_root);if (result) return result;
     struct kernel_vfs_mount *cursor=recursive ? source->first_child : NULL,*parent_copy=copy_root;
     result=remap_cloned_paths(source,copy_root,paths,remapped);
     while (cursor && !result) {
-        if (paths || dentry_below(cursor->covered_path->dentry,cursor->parent==source ? root : cursor->parent->root_dentry)) {
+        if ((paths || !cursor->unbindable) && (paths ||
+            dentry_below(cursor->covered_path->dentry,cursor->parent==source ? root : cursor->parent->root_dentry))) {
             struct kernel_vfs_mount *copy=NULL;
-            result=clone_one_view(cursor,cursor->root_dentry,&copy);if (result) break;
+            result=clone_one_view(cursor,cursor->root_dentry,flags,&copy);if (result) break;
             struct kernel_vfs_path *covered=NULL;
             result=path_wrap(parent_copy,cursor->covered_path->dentry,&covered);
-            if (!result) result=kernel_vfs_mount_attach(copy,covered);
+            if (!result) result=mount_attach_one(copy,covered);
             if (covered && kernel_vfs_path_release(&covered)) __builtin_trap();
             if (result) {discard_staged_mount(copy);break;}
             result=remap_cloned_paths(cursor,copy,paths,remapped);
@@ -931,14 +1070,201 @@ static int clone_mount_view(struct kernel_vfs_mount *source,struct kernel_vfs_de
     *owner=copy_root;return 0;
 }
 
+struct propagation_target {
+    struct kernel_vfs_mount *parent,*tree;
+    struct kernel_vfs_path *covered,*root,*overmount_point,*old_covered;
+    struct kernel_vfs_mount *overmount;
+    size_t group,upstream,representative;
+};
+struct propagation_targets {
+    struct kernel_heap *heap;
+    struct propagation_target *items;
+    size_t count,capacity;
+    uint64_t visit;
+};
+static int propagation_active(struct kernel_vfs_mount *m)
+{
+    for(;m;m=m->parent)if(m->retired || __atomic_load_n(&m->namespace_retiring,__ATOMIC_ACQUIRE) || m->propagation_staged)return 0;
+    return 1;
+}
+static int propagation_add_group(struct propagation_targets *set,struct kernel_vfs_mount *first,size_t upstream)
+{
+    if(first->propagation_visit==set->visit)return 0;
+    size_t group=set->count;
+    struct kernel_vfs_mount *m=first;
+    do {
+        if(set->count==set->capacity) {
+            size_t capacity=set->capacity?set->capacity*2:8;
+            if(capacity>SIZE_MAX/sizeof(*set->items))return -KERNEL_ENOMEM;
+            void *resized=NULL;
+            enum kernel_heap_status hs=kernel_heap_resize(set->heap,set->items,capacity*sizeof(*set->items),&resized);
+            if(hs==KERNEL_HEAP_STATUS_EMPTY)return -KERNEL_ENOMEM;
+            if(hs)__builtin_trap();
+            set->items=resized;set->capacity=capacity;
+        }
+        set->items[set->count++]=(struct propagation_target){.parent=m,.group=group,
+            .upstream=upstream,.representative=SIZE_MAX};
+        m->propagation_visit=set->visit;
+        m=m->propagation_group?m->peer_next:first;
+    }while(m!=first);
+    return 0;
+}
+static int propagation_collect(struct kernel_vfs_mount *parent,struct propagation_targets *set)
+{
+    set->heap=((struct kernel_vfs_instance *)parent->private_data)->heap;
+    if(++propagation_visit==0)__builtin_trap();
+    set->visit=propagation_visit;
+    int error=propagation_add_group(set,parent,0);
+    for(size_t i=0;i<set->count && !error;i++)
+        for(struct kernel_vfs_mount *s=set->items[i].parent->first_slave;s && !error;s=s->next_slave)
+            error=propagation_add_group(set,s,set->items[i].group);
+    return error;
+}
+static void propagation_targets_release(struct propagation_targets *set)
+{
+    for(size_t i=0;i<set->count;i++) {
+        struct propagation_target *t=&set->items[i];
+        if(t->root && kernel_vfs_path_release(&t->root))__builtin_trap();
+        if(t->covered && kernel_vfs_path_release(&t->covered))__builtin_trap();
+        if(t->overmount_point && kernel_vfs_path_release(&t->overmount_point))__builtin_trap();
+        if(t->old_covered && kernel_vfs_path_release(&t->old_covered))__builtin_trap();
+        if(i && t->tree)discard_staged_mount(t->tree);
+    }
+    if(set->items)kernel_heap_release(set->heap,set->items);
+}
+/* Prepare every copy and path before acquiring the target directory's
+ * modification qualification. Publication itself performs no allocation. */
+static int mount_attach_propagated(struct kernel_vfs_mount *origin,struct kernel_vfs_path *covered,int moving)
+{
+    struct propagation_targets targets={0};
+    int error=propagation_collect(covered->file.mount,&targets);
+    struct kernel_vfs_mount **new_groups=NULL;size_t added=0,count=0;
+    struct kernel_vfs_path *old_root=NULL,*old_covered=NULL;
+    if(error)goto done;
+    if(!propagation_active(covered->file.mount)){error=-KERNEL_EINVAL;goto done;}
+    for(struct kernel_vfs_mount *m=origin;m;m=kernel_vfs_mount_next(m,origin)) {
+        if(m->unbindable){error=-KERNEL_EINVAL;goto done;}
+        if(!m->propagation_group)count++;
+    }
+    if(count) {
+        if(count>SIZE_MAX/sizeof(*new_groups) || count>UINT64_MAX-next_propagation_group-1){error=-KERNEL_ENOMEM;goto done;}
+        enum kernel_heap_status hs=kernel_heap_allocate(targets.heap,count*sizeof(*new_groups),(void **)&new_groups);
+        if(hs==KERNEL_HEAP_STATUS_EMPTY){error=-KERNEL_ENOMEM;goto done;}
+        if(hs)__builtin_trap();
+        for(struct kernel_vfs_mount *m=origin;m;m=kernel_vfs_mount_next(m,origin))
+            if(!m->propagation_group){new_groups[added++]=m;propagation_share(m,NULL);}
+    }
+    for(size_t group=0;group<targets.count && !error;) {
+        size_t end=group+1;while(end<targets.count && targets.items[end].group==group)end++;
+        size_t representative=SIZE_MAX;
+        for(size_t i=group;i<end && !error;i++) {
+            struct propagation_target *t=&targets.items[i];
+            if(!propagation_active(t->parent) || (i && !dentry_below(covered->dentry,t->parent->root_dentry)))continue;
+            if(i==0){if(kernel_vfs_path_acquire(covered))__builtin_trap();t->covered=covered;t->tree=origin;}
+            else {
+                error=path_wrap(t->parent,covered->dentry,&t->covered);if(error)break;
+                t->overmount=t->covered->mounted_here;
+                size_t from=representative;
+                unsigned flags=0;
+                if(from==SIZE_MAX) {
+                    size_t upstream=t->upstream;
+                    for(;;) {
+                        from=targets.items[upstream].representative;
+                        if(from!=SIZE_MAX || !upstream)break;
+                        upstream=targets.items[upstream].upstream;
+                    }
+                    if(from==SIZE_MAX)continue;
+                    flags=CLONE_PROP_SLAVE|(t->parent->propagation_group?CLONE_PROP_SHARED:0);
+                }
+                struct kernel_vfs_mount *source=targets.items[from].tree;
+                error=clone_mount_view(source,source->root_dentry,1,flags,&t->tree,NULL,NULL);
+                if(error)break;
+            }
+            error=kernel_vfs_path_root(t->tree,((struct kernel_vfs_instance *)t->tree->private_data)->heap,&t->root);
+            if(error)break;
+            if(((t->root->file.mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR)!=
+               ((t->covered->file.mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR)){error=-KERNEL_ENOTDIR;break;}
+            if(t->overmount && !(moving && t->overmount==origin)) {
+                struct kernel_vfs_path *point=t->root;
+                while(point->mounted_here)point=point->mounted_here->root_path;
+                if(kernel_vfs_path_acquire(point))__builtin_trap();
+                t->overmount_point=point;
+            }
+            if(representative==SIZE_MAX)representative=i;
+        }
+        targets.items[group].representative=representative;
+        group=end;
+    }
+    if(error)goto done;
+    {
+        KERNEL_LOCK_SCOPE(namespace_guard);kernel_vfs_namespace_lock(covered->file.mount,&namespace_guard);
+        struct kernel_vfs_path *container __attribute__((cleanup(release_path_pin)))=NULL;
+        error=kernel_vfs_path_parent_pin(covered,&container);if(error)goto done;
+        if(!container){if(kernel_vfs_path_acquire(covered))__builtin_trap();container=covered;}
+        KERNEL_LOCK_SCOPE(directory_guard);namespace_node_lock(container->file.private_data,&directory_guard,1);
+        KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+        for(size_t i=0;i<targets.count;i++) {
+            struct propagation_target *t=&targets.items[i];
+            if(!t->tree || !propagation_active(t->parent))continue;
+            struct kernel_vfs_mount *parent=t->covered->file.mount;
+            if(t->covered->dentry->detached || ((struct kernel_vfs_node *)t->covered->file.private_data)->unlinked) {error=-KERNEL_ENOENT;break;}
+            if(t->covered->mounted_here!=t->overmount || parent->retired || parent->child_mounts==UINT32_MAX ||
+                t->covered->dentry->mountpoints==UINT32_MAX){error=-KERNEL_EBUSY;break;}
+            if(((struct kernel_vfs_instance *)parent->private_data)->quiescing){error=-KERNEL_EIO;break;}
+            if(i || !moving) {
+                if(t->tree->parent || t->tree->root_path || t->tree->covered_path){error=-KERNEL_EINVAL;break;}
+            }
+        }
+        if(!error) {
+            if(moving) {
+                old_root=origin->root_path;old_covered=origin->covered_path;
+                unpublish_mount_edge(origin);
+            }
+            for(size_t i=0;i<targets.count;i++) {
+                struct propagation_target *t=&targets.items[i];
+                if(!t->tree || !propagation_active(t->parent))continue;
+                struct kernel_vfs_path *overmount_root=NULL;
+                if(t->overmount_point) {
+                    overmount_root=t->overmount->root_path;t->old_covered=t->overmount->covered_path;
+                    unpublish_mount_edge(t->overmount);
+                }
+                publish_mount_edge(t->tree,t->covered,t->root);
+                /* Propagated mounts are inserted below an existing receiver
+                 * overmount. Preserve its visible contents and real owner. */
+                if(t->overmount_point) {
+                    publish_mount_edge(t->overmount,t->overmount_point,overmount_root);
+                    t->overmount_point=NULL;
+                }
+                t->tree=NULL;t->covered=t->root=NULL;
+            }
+            path_topology_changed();
+        }
+    }
+done:
+    propagation_targets_release(&targets);
+    if(error)while(added)propagation_unshare(new_groups[--added]);
+    if(new_groups)kernel_heap_release(targets.heap,new_groups);
+    if(old_root && kernel_vfs_path_release(&old_root))__builtin_trap();
+    if(old_covered && kernel_vfs_path_release(&old_covered))__builtin_trap();
+    return error;
+}
+int kernel_vfs_mount_attach(struct kernel_vfs_mount *mount,struct kernel_vfs_path *covered)
+{
+    KERNEL_LOCK_SCOPE(topology);mount_topology_lock(&topology);
+    if(!mount || !covered || !covered->references || mount==covered->file.mount)return -KERNEL_EINVAL;
+    if(covered->file.mount->propagation_group)return mount_attach_propagated(mount,covered,0);
+    return mount_attach_one(mount,covered);
+}
+
 int kernel_vfs_bind_mount(struct kernel_vfs_path *source,struct kernel_vfs_path *target,int recursive)
 {
     if (!source || !target || !source->references || !target->references) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance=source->file.mount->private_data;
     KERNEL_LOCK_SCOPE(topology);mount_topology_lock(&topology);
     if (instance->quiescing) return -KERNEL_EIO;
+    if (source->file.mount->unbindable) return -KERNEL_EINVAL;
     struct kernel_vfs_mount *mount=NULL;
-    int result=clone_mount_view(source->file.mount,source->dentry,recursive,&mount,NULL,NULL);
+    int result=clone_mount_view(source->file.mount,source->dentry,recursive,0,&mount,NULL,NULL);
     if (!result) result=kernel_vfs_mount_attach(mount,target);
     if (result && mount) discard_staged_mount(mount);
     return result;
@@ -949,7 +1275,7 @@ int kernel_vfs_copy_mount_tree(struct kernel_vfs_mount *top,
     KERNEL_SERVICE_SCOPE(service);
     KERNEL_LOCK_SCOPE(topology);mount_topology_lock(&topology);
     struct kernel_vfs_mount *copy=NULL;
-    int result=clone_mount_view(top,top->root_dentry,1,&copy,source,destination);
+    int result=clone_mount_view(top,top->root_dentry,1,0,&copy,source,destination);
     if (result) return result;
     if (!destination[0]) __builtin_trap();
     /* chroot/cwd may retain a path from a detached or foreign mount. */
@@ -961,6 +1287,7 @@ int kernel_vfs_copy_mount_tree(struct kernel_vfs_mount *top,
         }
         destination[i]=source[i];
     }
+    copy->propagation_staged=0;
     return 0;
 }
 
@@ -974,7 +1301,7 @@ static void detach_retired_mount_tree(struct kernel_vfs_mount *top)
         if (view->first_child) {view=view->first_child;continue;}
         struct kernel_vfs_mount *parent=view->parent;
         if (parent && unlink_mount_edge(view,1,NULL)) __builtin_trap();
-        view->retired=1;
+        propagation_forget(view);view->retired=1;
         (void)mount_put(view);
         if (!parent) break;
         view=parent;
@@ -988,30 +1315,193 @@ void kernel_vfs_retire_mount_tree(struct kernel_vfs_mount *top)
     KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
     if (!top->dynamic_view || top->parent || top->retired || top->namespace_retirement_next)
         __builtin_trap();
+    __atomic_store_n(&top->namespace_retiring,1,__ATOMIC_RELEASE);
     top->namespace_retirement_next=__atomic_load_n(&retired_mount_trees,__ATOMIC_RELAXED);
     __atomic_store_n(&retired_mount_trees,top,__ATOMIC_RELEASE);
+}
+struct unmount_entry {
+    struct kernel_vfs_mount *mount;
+    struct kernel_vfs_path *root,*covered,*old_cover;
+    size_t next,pending;
+    unsigned forced:1,selected:1,marked:1;
+};
+static int unmount_selected(struct kernel_vfs_mount *m,uint64_t visit,const struct unmount_entry *items)
+{ return m->unmount_visit==visit && items[m->unmount_index].selected; }
+static int unmount_add(struct kernel_heap *heap,struct unmount_entry **items,size_t *count,
+    size_t *capacity,struct kernel_vfs_mount *m,uint64_t visit,int forced)
+{
+    if(m->unmount_visit==visit)return 0;
+    if(*count==*capacity) {
+        size_t n=*capacity?*capacity*2:8;void *allocation=NULL;
+        if(n>SIZE_MAX/sizeof(**items))return -KERNEL_ENOMEM;
+        enum kernel_heap_status hs=kernel_heap_resize(heap,*items,n*sizeof(**items),&allocation);
+        if(hs==KERNEL_HEAP_STATUS_EMPTY)return -KERNEL_ENOMEM;
+        if(hs)__builtin_trap();
+        *items=allocation;*capacity=n;
+    }
+    m->unmount_visit=visit;m->unmount_index=*count;
+    (*items)[(*count)++]=(struct unmount_entry){.mount=m,.forced=forced,.selected=1,.next=SIZE_MAX};return 0;
+}
+static struct kernel_vfs_mount *complete_overmount(struct kernel_vfs_mount *m)
+{
+    struct kernel_vfs_mount *child=m->first_child;
+    return m->child_mounts==1 && child && child->covered_path==m->root_path ? child : NULL;
+}
+/* A surviving overmount can slide through removed roots; a surviving child
+ * strictly inside a candidate prevents that candidate and its ancestors from
+ * disappearing. Visit each obstacle chain once, without rescanning the set. */
+static void unmount_trim(struct unmount_entry *items,size_t count,uint64_t visit)
+{
+    for(size_t i=0;i<count;i++) {
+        struct unmount_entry *e=&items[i];if(e->forced)continue;
+        int obstacle=0;
+        for(struct kernel_vfs_mount *c=e->mount->first_child;c;c=c->next_sibling)
+            if(!unmount_selected(c,visit,items)) {
+                obstacle=1;if(c->covered_path!=e->mount->root_path)e->selected=0;
+            }
+        if(!obstacle)continue;
+        struct kernel_vfs_mount *m=e->mount;
+        while(m->unmount_visit==visit) {
+            struct unmount_entry *current=&items[m->unmount_index];
+            if(current->marked)break;
+            current->marked=1;
+            struct kernel_vfs_mount *parent=m->parent;
+            if(!parent || parent->unmount_visit!=visit)break;
+            struct unmount_entry *p=&items[parent->unmount_index];
+            if(p->forced)__builtin_trap();
+            if(m->covered_path!=parent->root_path)p->selected=0;
+            m=parent;
+        }
+    }
+}
+static void unmount_reopen_paths(struct unmount_entry *items,size_t count)
+{
+    for(size_t i=0;i<count;i++)if(items[i].selected)
+        for(struct kernel_vfs_path *p=items[i].mount->paths;p;p=p->next)
+            __atomic_fetch_and(&p->references,~VFS_PATH_CLOSING,__ATOMIC_RELEASE);
+}
+static int unmount_close_paths(struct unmount_entry *items,size_t count,const struct kernel_vfs_path *named)
+{
+    for(size_t i=0;i<count;i++)if(items[i].selected) {
+        struct kernel_vfs_mount *m=items[i].mount;uint32_t locations=0;
+        for(struct kernel_vfs_path *p=m->paths;p;p=p->next) {
+            locations++;
+            uint32_t expected=(p==m->root_path)+(p==named);
+            for(struct kernel_vfs_mount *c=m->first_child;c;c=c->next_sibling)
+                expected+=c->covered_path==p;
+            if(!expected || !__atomic_compare_exchange_n(&p->references,&expected,
+                    expected|VFS_PATH_CLOSING,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return -KERNEL_EBUSY;
+        }
+        if(m->references!=locations+1U)return -KERNEL_EBUSY;
+    }
+    return 0;
 }
 int kernel_vfs_umount(struct kernel_vfs_path *root,unsigned flags)
 {
     KERNEL_LOCK_SCOPE(topology);mount_topology_lock(&topology);
-    if (!root || !root->references || (flags & ~2U)) return -KERNEL_EINVAL;
-    struct kernel_vfs_mount *mount=root->file.mount;
-    if (!mount->parent || mount->root_path!=root) return -KERNEL_EINVAL;
-    if (!flags) {
-        int result=kernel_vfs_mount_prepare_detach(mount,root);if (result) return result;
-        result=kernel_vfs_mount_detach(mount,root);if (result) return result;
-        /* 命名 root 的 owner 由本次调用借用；调用者归还它后才可能销毁视图。 */
-        mount->retired=1;return mount_put(mount);
+    if(!root || !root->references || (flags&~2U))return -KERNEL_EINVAL;
+    struct kernel_vfs_mount *origin=root->file.mount;
+    if(!origin->parent || origin->root_path!=root)return -KERNEL_EINVAL;
+    if(!flags && origin->child_mounts)return -KERNEL_EBUSY;
+    if(!flags && !origin->parent->propagation_group) {
+        int error=kernel_vfs_mount_prepare_detach(origin,root);if(error)return error;
+        error=kernel_vfs_mount_detach(origin,root);if(error)return error;
+        propagation_forget(origin);origin->retired=1;return mount_put(origin);
     }
-    while (mount->first_child) {
-        struct kernel_vfs_mount *leaf=mount->first_child;
-        while (leaf->first_child) leaf=leaf->first_child;
-        if (unlink_mount_edge(leaf,1,NULL)) __builtin_trap();
-        leaf->retired=1;(void)mount_put(leaf);
+    struct kernel_heap *heap=((struct kernel_vfs_instance *)origin->private_data)->heap;
+    struct unmount_entry *items=NULL;size_t count=0,capacity=0;
+    if(++propagation_visit==0)__builtin_trap();
+    uint64_t visit=propagation_visit;
+    int error=0,closed=0;
+    if(!flags)error=unmount_add(heap,&items,&count,&capacity,origin,visit,1);
+    else {
+        struct kernel_vfs_mount *m=origin;
+        while(m->first_child)m=m->first_child;
+        for(;;) {
+            error=unmount_add(heap,&items,&count,&capacity,m,visit,1);if(error || m==origin)break;
+            if(m->next_sibling){m=m->next_sibling;while(m->first_child)m=m->first_child;}
+            else m=m->parent;
+        }
     }
-    int result=unlink_mount_edge(mount,1,root);
-    if (!result) {mount->retired=1;(void)mount_put(mount);}
-    return result;
+    size_t forced=count;
+    for(size_t i=0;i<forced && !error;i++) {
+        struct kernel_vfs_mount *m=items[i].mount;
+        if(!m->parent->propagation_group)continue;
+        struct propagation_targets targets={0};error=propagation_collect(m->parent,&targets);
+        for(size_t j=0;j<targets.count && !error;j++) {
+            struct kernel_vfs_mount *parent=targets.items[j].parent;
+            if(!propagation_active(parent) || !dentry_below(m->covered_path->dentry,parent->root_dentry))continue;
+            struct kernel_vfs_path *point=NULL;
+            error=path_wrap(parent,m->covered_path->dentry,&point);if(error)break;
+            struct kernel_vfs_mount *child=point->mounted_here;
+            if(kernel_vfs_path_release(&point))__builtin_trap();
+            if(child)error=unmount_add(heap,&items,&count,&capacity,child,visit,0);
+        }
+        propagation_targets_release(&targets);
+    }
+    if(error)goto done;
+    unmount_trim(items,count,visit);
+    /* Close only selected view paths before backend preparation can stop an
+     * instance. CAS shares the reference word with lock-free readers, so a
+     * concurrent borrow either makes this operation busy or is refused. */
+    if(!flags) {
+        {
+            KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+            closed=1;error=unmount_close_paths(items,count,root);
+        }
+        if(error)goto done;
+        for(size_t i=0;i<count;i++)if(items[i].selected) {
+            error=kernel_vfs_mount_prepare_detach(items[i].mount,items[i].mount==origin?root:NULL);
+            if(error)goto done;
+        }
+    }
+    {
+        KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+        size_t ready=SIZE_MAX,remaining=0;
+        for(size_t i=0;i<count;i++)if(items[i].selected) {
+            struct kernel_vfs_mount *m=items[i].mount;remaining++;
+            for(struct kernel_vfs_mount *c=m->first_child;c;c=c->next_sibling)
+                items[i].pending+=unmount_selected(c,visit,items);
+            if(!items[i].pending){items[i].next=ready;ready=i;}
+        }
+        while(ready!=SIZE_MAX) {
+            size_t i=ready;struct unmount_entry *entry=&items[i];ready=entry->next;
+            struct kernel_vfs_mount *m=entry->mount,*parent=m->parent,*overmount=complete_overmount(m);
+            struct kernel_vfs_path *overmount_root=NULL;
+            if(overmount) {
+                overmount_root=overmount->root_path;entry->old_cover=overmount->covered_path;
+                unpublish_mount_edge(overmount);
+            }
+            if(m->child_mounts)__builtin_trap();
+            entry->root=m->root_path;entry->covered=m->covered_path;
+            unpublish_mount_edge(m);propagation_forget(m);m->retired=1;
+            if(overmount) {
+                publish_mount_edge(overmount,entry->covered,overmount_root);entry->covered=NULL;
+            }
+            if(parent->unmount_visit==visit && items[parent->unmount_index].selected) {
+                struct unmount_entry *p=&items[parent->unmount_index];
+                if(!p->pending)__builtin_trap();
+                if(!--p->pending){p->next=ready;ready=parent->unmount_index;}
+            }
+            remaining--;
+        }
+        if(remaining)__builtin_trap();
+        if(closed){unmount_reopen_paths(items,count);closed=0;}
+        path_topology_changed();
+    }
+    for(size_t i=0;i<count;i++)if(items[i].selected) {
+        (void)mount_put(items[i].mount);
+        if(kernel_vfs_path_release(&items[i].root))__builtin_trap();
+        if(items[i].covered && kernel_vfs_path_release(&items[i].covered))__builtin_trap();
+        if(items[i].old_cover && kernel_vfs_path_release(&items[i].old_cover))__builtin_trap();
+    }
+done:
+    if(closed) {
+        KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+        unmount_reopen_paths(items,count);
+    }
+    if(items)kernel_heap_release(heap,items);
+    return error;
 }
 
 static int enter_mounts(struct kernel_vfs_path **owner,unsigned resolve)
@@ -1058,6 +1548,10 @@ int kernel_vfs_move_mount(struct kernel_vfs_path *source,struct kernel_vfs_path 
     if (result) {covered=NULL;return result;}
     result=enter_mounts(&covered,0);if (result) return result;
     struct kernel_vfs_mount *parent=covered->file.mount;
+    for(struct kernel_vfs_mount *ancestor=parent;ancestor;ancestor=ancestor->parent)
+        if(ancestor==mount)return -KERNEL_ELOOP;
+    if(!mount->parent || mount->parent->propagation_group)return -KERNEL_EINVAL;
+    if(parent->propagation_group)return mount_attach_propagated(mount,covered,1);
     KERNEL_LOCK_SCOPE(namespace_guard);kernel_vfs_namespace_lock(parent,&namespace_guard);
     struct kernel_vfs_path *container __attribute__((cleanup(release_path_pin)))=NULL;
     result=kernel_vfs_path_parent_pin(covered,&container);if (result) return result;
@@ -1767,6 +2261,7 @@ static int path_wrap(struct kernel_vfs_mount *mount,struct kernel_vfs_dentry *en
     struct kernel_vfs_instance *instance=mount->private_data;
     {
         KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+        if(mount->root_path && (__atomic_load_n(&mount->root_path->references,__ATOMIC_ACQUIRE)&VFS_PATH_CLOSING))return -KERNEL_EBUSY;
         struct kernel_vfs_path *existing=find_location(mount,entry);
         if (existing) {int result=kernel_vfs_path_acquire(existing);if (!result) *owner=existing;return result;}
     }
@@ -1777,7 +2272,8 @@ static int path_wrap(struct kernel_vfs_mount *mount,struct kernel_vfs_dentry *en
     {
         KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
         existing=find_location(mount,entry);
-        if (existing) result=kernel_vfs_path_acquire(existing);
+        if(mount->root_path && (__atomic_load_n(&mount->root_path->references,__ATOMIC_ACQUIRE)&VFS_PATH_CLOSING))result=-KERNEL_EBUSY;
+        else if (existing) result=kernel_vfs_path_acquire(existing);
         else {
             if (mount->references==UINT32_MAX || dentry_acquire(entry)) __builtin_trap();
             mount->references++;
@@ -1788,7 +2284,7 @@ static int path_wrap(struct kernel_vfs_mount *mount,struct kernel_vfs_dentry *en
             mount->paths=path;mount->path_index=location_index_insert(mount->path_index,path);
         }
     }
-    if (existing) kernel_heap_release(instance->heap,path);
+    if (existing || result) kernel_heap_release(instance->heap,path);
     if (!result) *owner=existing ? existing : path;
     return result;
 }
@@ -1859,7 +2355,8 @@ int kernel_vfs_path_acquire(struct kernel_vfs_path *path)
     if (!path) return -KERNEL_EINVAL;
     uint32_t refs=__atomic_load_n(&path->references,__ATOMIC_ACQUIRE);
     for (;;) {
-        if (!refs || refs==UINT32_MAX) return -KERNEL_EOVERFLOW;
+        if(refs&VFS_PATH_CLOSING)return -KERNEL_EBUSY;
+        if (!refs || refs>=VFS_PATH_CLOSING-1U) return -KERNEL_EOVERFLOW;
         if (__atomic_compare_exchange_n(&path->references,&refs,refs+1,1,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) return 0;
     }
 }
@@ -1928,7 +2425,7 @@ static int vfs_open_inode_raw(struct kernel_vfs_mount *mount,
 }
 
 static int path_string(const struct kernel_vfs_path *path,const struct kernel_vfs_path *root,
-    char *buffer,size_t capacity,int display,int cwd)
+    char *buffer,size_t capacity,int display,int cwd,int filesystem)
 {
     if (!path || !root || !buffer || capacity<2) return -KERNEL_ERANGE;
     KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
@@ -1949,9 +2446,9 @@ static int path_string(const struct kernel_vfs_path *path,const struct kernel_vf
         if (cwd) return -KERNEL_ENOENT;
         if (display) deleted=1;
     }
-    while (entry!=root->dentry || mount!=root->file.mount) {
+    while (filesystem ? entry->parent!=NULL : (entry!=root->dentry || mount!=root->file.mount)) {
         if (!entry->parent && entry!=mount->root_dentry) {result=-KERNEL_ENOENT;break;}
-        if (entry==mount->root_dentry) {
+        if (!filesystem && entry==mount->root_dentry) {
             if (!mount->covered_path) {
                 /* proc 展示可越过进程根，或以摘树后的视图根为起点；
                  * 只有实际 getcwd 对外部的活路径加 unreachable 前缀。 */
@@ -1989,19 +2486,22 @@ int kernel_vfs_path_string(const struct kernel_vfs_path *path,
                            const struct kernel_vfs_path *root,
                            char *buffer, size_t capacity)
 {
-    return path_string(path, root, buffer, capacity, 0, 0);
+    return path_string(path, root, buffer, capacity, 0, 0,0);
 }
+
+int kernel_vfs_path_filesystem_string(const struct kernel_vfs_path *path,char *buffer,size_t capacity)
+{ return path_string(path,path,buffer,capacity,1,0,1); }
 
 int kernel_vfs_path_cwd_string(const struct kernel_vfs_path *path,
                                const struct kernel_vfs_path *root,
                                char *buffer,size_t capacity)
-{ return path_string(path,root,buffer,capacity,0,1); }
+{ return path_string(path,root,buffer,capacity,0,1,0); }
 
 int kernel_vfs_path_link_string(const struct kernel_vfs_path *path,
                                 const struct kernel_vfs_path *root,
                                 char *buffer, size_t capacity)
 {
-    return path_string(path, root, buffer, capacity, 1, 0);
+    return path_string(path, root, buffer, capacity, 1, 0,0);
 }
 
 int kernel_vfs_path_copy_name(const struct kernel_vfs_path *path, char *buffer, size_t capacity)
@@ -2146,6 +2646,8 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
                  (resolved->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFBLK)) result=-KERNEL_EACCES;
             else {
                 result=kernel_vfs_path_permission(resolved,request->access);
+                if (!result && (flags & KERNEL_VFS_OPEN_NOATIME) &&
+                    !kernel_vfs_file_noatime_allowed(&resolved->file)) result=-KERNEL_EPERM;
                 if (!result) result=path_open_locked(resolved,file);
             }
         } else {
@@ -4032,6 +4534,7 @@ int kernel_vfs_remount(struct kernel_vfs_path *root, uint64_t flags, const char 
         KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
         if (read_only && !mount->read_only && mount->write_openers) return -KERNEL_EBUSY;
         mount->read_only=read_only;
+        mount->atime_policy=kernel_vfs_atime_policy(flags,mount->atime_policy,1);
         mount->nosuid=!!(flags&2U);mount->nodev=!!(flags&4U);mount->noexec=!!(flags&8U);mount->silent=!!(flags&32768U);
         return 0;
     }
@@ -4054,6 +4557,7 @@ int kernel_vfs_remount(struct kernel_vfs_path *root, uint64_t flags, const char 
     {
         KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
         instance->read_only=read_only;mount->read_only=read_only;
+        mount->atime_policy=kernel_vfs_atime_policy(flags,mount->atime_policy,1);
         mount->nosuid=!!(flags&2U);mount->nodev=!!(flags&4U);mount->noexec=!!(flags&8U);
         mount->silent=!!(flags&32768U);
     }
@@ -4296,6 +4800,7 @@ void kernel_vfs_node_lock(struct kernel_vfs_node *node, struct kernel_lock_guard
 int kernel_vfs_unmount(struct kernel_vfs_mount *mount)
 {
     if (!mount) return -KERNEL_EINVAL;
+    KERNEL_LOCK_SCOPE(topology);mount_topology_lock(&topology);
     struct kernel_vfs_instance *instance;
     int retry=0;
     {
@@ -4314,7 +4819,7 @@ int kernel_vfs_unmount(struct kernel_vfs_mount *mount)
     {
         KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
         if (mount->covered_path || mount->child_mounts || mount->root_path || mount->references!=1) return -KERNEL_EBUSY;
-        mount->retired=1;
+        propagation_forget(mount);mount->retired=1;
     }
     struct kernel_vfs_instance *cleanup=NULL;
     (void)mount_release(mount,&cleanup);
@@ -4330,10 +4835,16 @@ int kernel_vfs_mount_statfs(struct kernel_vfs_mount *mount,
     if (instance->quiescing) return -KERNEL_EIO;
     int result=instance->ops->statfs(&instance->backend_mount, stat);
     if (!result) {
+        KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
         stat->flags=(stat->flags & ~UINT64_C(1)) | (kernel_vfs_mount_is_readonly(mount) ? 1U : 0U);
         if (mount->nosuid) stat->flags |= 2U;
         if (mount->nodev) stat->flags |= 4U;
         if (mount->noexec) stat->flags |= 8U;
+        uint8_t policy=mount->atime_policy;
+        stat->flags&=~UINT64_C(7168);
+        if(policy&VFS_ATIME_NONE)stat->flags|=1024U;
+        if(policy&VFS_ATIME_NODIR)stat->flags|=2048U;
+        if(!(policy&(VFS_ATIME_NONE|VFS_ATIME_STRICT)))stat->flags|=4096U;
     }
     return result;
 }
@@ -4471,11 +4982,18 @@ static int vfs_create_raw(struct kernel_vfs_mount *mount,
     return instance->ops->create(mount, parent_inode, path, mode, file,umask);
 }
 
-void kernel_vfs_file_accessed(struct kernel_vfs_file *file)
+int kernel_vfs_file_atime_enabled(const struct kernel_vfs_file *file)
 {
-    if (!file || !file->mount || !file->mount->private_data) return;
-    struct kernel_vfs_instance *instance = file->mount->private_data;
-    if (!kernel_vfs_mount_is_readonly(file->mount)) instance->ops->accessed(file);
+    if (!file || !file->mount || !file->mount->private_data) return 0;
+    uint8_t policy=__atomic_load_n(&file->mount->atime_policy,__ATOMIC_RELAXED);
+    return !kernel_vfs_mount_is_readonly(file->mount) && !(policy&VFS_ATIME_NONE) &&
+        !((policy&VFS_ATIME_NODIR) && (file->mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR);
+}
+void kernel_vfs_file_accessed(struct kernel_vfs_file *file,uint32_t open_flags)
+{
+    if ((open_flags&01000000U) || !kernel_vfs_file_atime_enabled(file)) return;
+    struct kernel_vfs_instance *instance=file->mount->private_data;
+    instance->ops->accessed(file);
 }
 
 int kernel_vfs_file_modified(struct kernel_vfs_file *file,

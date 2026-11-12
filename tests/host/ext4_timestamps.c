@@ -24,7 +24,7 @@ static void *access_during_remount(void *argument)
 {
     mm_test_attach(1); mm_test_activate_task();
     timestamp_pause = 1;
-    kernel_vfs_file_accessed(argument);
+    kernel_vfs_file_accessed(argument,0);
     mm_test_finish();
     return NULL;
 }
@@ -80,12 +80,12 @@ int main(int argc, char **argv)
     unsigned failures = 0;
     /* atime newer than mtime/ctime still expires at the whole-second day boundary. */
     timestamp_now = (struct ext4_timestamp){2000086499, 40};
-    kernel_vfs_file_accessed(&file);
+    kernel_vfs_file_accessed(&file,0);
     assert(!kernel_vfs_fstat(&file, &after));
     assert(after.atime.seconds == before.atime.seconds &&
            after.atime.nanoseconds == before.atime.nanoseconds);
     timestamp_now.seconds++;
-    kernel_vfs_file_accessed(&file);
+    kernel_vfs_file_accessed(&file,0);
     assert(!kernel_vfs_fstat(&file, &after));
     if (after.atime.seconds != timestamp_now.seconds || after.atime.nanoseconds != 40) {
         puts("FAIL relatime: newer atime must update after 24 hours"); failures++;
@@ -103,7 +103,7 @@ int main(int argc, char **argv)
         puts("FAIL writes: same-second mtime and ctime must follow the sampled clock"); failures++;
     } else puts("PASS writes: same-second mtime and ctime update");
     timestamp_fail = 1;
-    kernel_vfs_file_accessed(&file);
+    kernel_vfs_file_accessed(&file,0);
     timestamp_fail = 0;
     assert(!kernel_vfs_fstat(&file, &after));
     assert(after.atime.seconds == expected_atime.seconds &&
@@ -111,7 +111,7 @@ int main(int argc, char **argv)
     puts("PASS failed clock leaves post-write atime unchanged");
     timestamp_now.nanoseconds = 300;
     timestamp_samples = 0;
-    kernel_vfs_file_accessed(&file);
+    kernel_vfs_file_accessed(&file,0);
     assert(!kernel_vfs_fstat(&file, &after));
     assert(after.atime.seconds == timestamp_now.seconds && after.atime.nanoseconds == 300);
     expected_atime = after.atime;

@@ -669,9 +669,9 @@ static int time_not_after(struct kernel_vfs_timespec a, struct kernel_vfs_timesp
 {
     return a.seconds < b.seconds || (a.seconds == b.seconds && a.nanoseconds <= b.nanoseconds);
 }
-static int access_time_needed(const struct tmp_inode *i, struct kernel_vfs_timespec t)
+static int access_time_needed(const struct tmp_inode *i, struct kernel_vfs_timespec t,unsigned policy)
 {
-    return time_not_after(i->atime, i->mtime) || time_not_after(i->atime, i->ctime) ||
+    return (policy&VFS_ATIME_STRICT) || time_not_after(i->atime, i->mtime) || time_not_after(i->atime, i->ctime) ||
         (t.seconds >= i->atime.seconds && (uint64_t)t.seconds - (uint64_t)i->atime.seconds >= 86400);
 }
 static void accessed(struct kernel_vfs_file *f)
@@ -680,14 +680,14 @@ static void accessed(struct kernel_vfs_file *f)
     struct kernel_vfs_node *n=f->private_data;
     {
         KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
-        if (!access_time_needed(i,t)) return;
+        if (!access_time_needed(i,t,f->mount->atime_policy)) return;
     }
     KERNEL_LOCK_SCOPE(mutation);
     if (!f->write_lease) kernel_vfs_mutation_lock(f->mount,&mutation);
-    if (n->instance->read_only) return;
+    if (!kernel_vfs_file_atime_enabled(f)) return;
     t=now();
     KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
-    if (access_time_needed(i,t)) i->atime=t;
+    if (access_time_needed(i,t,f->mount->atime_policy)) i->atime=t;
 }
 
 static int killpriv(struct kernel_vfs_node *n,uint32_t mode)
@@ -744,6 +744,7 @@ static int unmount(struct kernel_vfs_mount *mount)
     return 0;
 }
 static const struct kernel_vfs_backend tmp_ops = {
+    .type="tmpfs",
     .check_domain=kernel_tmpfs_check_domain,
     .error=error, .root=root, .lookup=lookup, .open=open_inode, .close_node=close_node,
     .create=create, .mkdir=mkdir, .symlink=symlink, .mknod=mknod_node, .readlink=readlink,

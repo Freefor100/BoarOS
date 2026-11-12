@@ -1572,6 +1572,7 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     mount->state = VFS_MOUNT_STATE_CLEANUP;
     mount->id=kernel_vfs_allocate_mount_id();
     kernel_vfs_mount_initialize(mount);
+    adapter->instance.device_id=block->device_number?block->device_number:adapter->instance.backend_mount.id;
     result = kernel_block_claim(block, &adapter->instance.backend_mount);
     if (result) { (void)cleanup_mount(mount); return result; }
     adapter->block_claimed = 1U;
@@ -1669,6 +1670,7 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     mount->state = VFS_MOUNT_STATE_LIVE;
     adapter->instance.backend_mount.state=VFS_MOUNT_STATE_LIVE;
     kernel_vfs_mount_initialize(mount);
+    adapter->instance.device_id=block->device_number?block->device_number:adapter->instance.backend_mount.id;
     return 0;
 }
 
@@ -1743,8 +1745,7 @@ static void fill_stat(struct kernel_vfs_mount *mount,
     uint32_t creator_os;
 
     memset(stat, 0, sizeof(*stat));
-    struct kernel_block_device *block = lwext4_instance(mount->private_data)->block;
-    stat->dev = block->device_number ? block->device_number : ((struct kernel_vfs_instance *)mount->private_data)->backend_mount.id;
+    stat->dev = ((struct kernel_vfs_instance *)mount->private_data)->device_id;
     stat->ino = inode_number;
     stat->mode = ext4_inode_get_mode(superblock, inode);
     stat->nlink = ext4_inode_get_links_cnt(inode);
@@ -2232,9 +2233,9 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
     return kernel_vfs_publish_node(mount, node, file, 1);
 }
 
-static int time_access_needed(const struct lwext4_node *node, struct ext4_timestamp now)
+static int time_access_needed(const struct lwext4_node *node, struct ext4_timestamp now,unsigned policy)
 {
-    return time_compare(node->times[1], node->times[0]) >= 0 ||
+    return (policy&VFS_ATIME_STRICT) || time_compare(node->times[1], node->times[0]) >= 0 ||
         time_compare(node->times[2], node->times[0]) >= 0 ||
         now.seconds - node->times[0].seconds >= 86400;
 }
@@ -2248,8 +2249,9 @@ static void ext4_backend_accessed(struct kernel_vfs_file *file)
     if ((base->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) {
         KERNEL_LOCK_SCOPE(mutation);
         if (!file->write_lease) kernel_vfs_mutation_lock(file->mount, &mutation);
-        if (!base->instance->read_only)
-            (void)ext4_file_touch(lwext4_node_file(base), EXT4_TIME_ATIME | EXT4_TIME_RELATIME);
+        if (kernel_vfs_file_atime_enabled(file))
+            (void)ext4_file_touch(lwext4_node_file(base), EXT4_TIME_ATIME |
+                ((file->mount->atime_policy&VFS_ATIME_STRICT)?0:EXT4_TIME_RELATIME));
         return;
     }
     struct lwext4_node *node = (struct lwext4_node *)base;
@@ -2264,18 +2266,18 @@ static void ext4_backend_accessed(struct kernel_vfs_file *file)
     }
     /* 写后的relatime已由时间顺序决定；仅年龄判断需要提前采样。
      * 快照只用于跳过更新，发布仍在remount资格内重查当前时间。 */
-    if (!modified && (!ext4_file_read_clock(lwext4_node_file(base), &now) ||
+    if (!(file->mount->atime_policy&VFS_ATIME_STRICT) && !modified && (!ext4_file_read_clock(lwext4_node_file(base), &now) ||
         now.seconds - atime.seconds < 86400)) return;
     /* Suppressed relatime reads do not mutate the mount. Recheck after taking
      * remount qualification: another reader may already have published atime. */
     KERNEL_LOCK_SCOPE(mutation);
     if (!file->write_lease) kernel_vfs_mutation_lock(file->mount, &mutation);
-    if (base->instance->read_only || mount_error(adapter) ||
+    if (!kernel_vfs_file_atime_enabled(file) || mount_error(adapter) ||
         !ext4_file_read_clock(lwext4_node_file(base), &now)) return;
     int notify = 0;
     {
         TIMESTAMP_SCOPE(times, adapter);
-        if (time_access_needed(node, now))
+        if (time_access_needed(node, now,file->mount->atime_policy))
             notify = time_dirty_locked(node, EXT4_TIME_ATIME, now);
     }
     time_notify(adapter, notify);
@@ -2977,6 +2979,7 @@ static void initialize_backend(void)
     /* 首次在当前执行域生成回调；其他挂载不能再写远端读者共享的表。 */
     if (__atomic_load_n(&ext4_backend.pread_batch,__ATOMIC_ACQUIRE)) return;
     volatile struct kernel_vfs_backend *ops = &ext4_backend;
+    ops->type="ext4";
     ops->read_execution = KERNEL_VFS_EXECUTION_CALLER;
     ops->file_operation_execution = KERNEL_VFS_EXECUTION_CALLER;
     ops->namespace_execution = KERNEL_VFS_EXECUTION_CALLER;
