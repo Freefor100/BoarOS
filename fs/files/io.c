@@ -427,7 +427,7 @@ static enum kernel_files_status read_pinned(
     size_t iov_count,
     uint64_t count, int scalar,
     int64_t *linux_result, uint32_t socket_flags,
-    struct kernel_socket_address *peer, uint32_t *message_size, struct kernel_socket_message *socket_message)
+    struct kernel_socket_address *peer, uint32_t *message_size, struct kernel_socket_message *socket_message, const struct kernel_lock_guard *borrowed_offset)
 {
     struct kernel_open_file_description *description = *description_owner;
     if (description->block) {
@@ -476,7 +476,8 @@ static enum kernel_files_status read_pinned(
         socket_flags |= KERNEL_SOCKET_MSG_DONTWAIT;
     KERNEL_SERVICE_SCOPE_IF(service, kind != KERNEL_OPEN_FILE_KIND_INOTIFY && kind != KERNEL_OPEN_FILE_KIND_REGULAR && kind != KERNEL_OPEN_FILE_KIND_SOCKET && kind != KERNEL_OPEN_FILE_KIND_PIPE);
     KERNEL_LOCK_SCOPE(offset_guard);
-    if (kind == KERNEL_OPEN_FILE_KIND_REGULAR || kind == KERNEL_OPEN_FILE_KIND_GENERATED)
+    if ((kind == KERNEL_OPEN_FILE_KIND_REGULAR || kind == KERNEL_OPEN_FILE_KIND_GENERATED) &&
+        !regular_borrows_offset(description,borrowed_offset))
         kernel_mutex_lock(&description->offset_lock, &offset_guard);
     uint64_t request;
     uint64_t total = 0U;
@@ -710,7 +711,7 @@ enum kernel_files_status kernel_files_read(
         return release_io_description(files,&description,KERNEL_FILES_STATUS_OK);
     }
     status = read_pinned(files, mm, &description, &iov, 1U, count, 1,
-                         linux_result, 0U, 0, 0, NULL);
+                         linux_result, 0U, 0, 0, NULL, NULL);
     if (!status && *linux_result>0 && description)
         kernel_vfs_notify_file(&description->file,VFS_NOTIFY_ACCESS);
     return release_io_description(files, &description, status);
@@ -722,14 +723,32 @@ static enum kernel_files_status pread_iov_pinned(
     const struct kernel_uaccess_iovec *iov, size_t iov_count,
     uint64_t count, int64_t offset, int scalar, int64_t *linux_result);
 
+static int vector_request_error(struct kernel_open_file_description *file,
+    uint64_t position,uint64_t count,uint32_t flags)
+{
+    if ((file->kind==KERNEL_OPEN_FILE_KIND_REGULAR || file->kind==KERNEL_OPEN_FILE_KIND_GENERATED) &&
+        (position>INT64_MAX || count>INT64_MAX-position)) return -KERNEL_EINVAL;
+    if (flags&~UINT32_C(0x1ff)) return -KERNEL_EOPNOTSUPP;
+    if ((flags&(KERNEL_RWF_APPEND|KERNEL_RWF_NOAPPEND))==
+        (KERNEL_RWF_APPEND|KERNEL_RWF_NOAPPEND)) return -KERNEL_EINVAL;
+    if (flags&(KERNEL_RWF_NOWAIT|KERNEL_RWF_ATOMIC|KERNEL_RWF_DONTCACHE))
+        return -KERNEL_EOPNOTSUPP;
+    if ((flags&KERNEL_RWF_NOAPPEND) &&
+        (kernel_open_file_flags(file)&KERNEL_FILES_O_APPEND) &&
+        file->kind==KERNEL_OPEN_FILE_KIND_REGULAR && !kernel_vfs_file_noappend_allowed(&file->file))
+        return -KERNEL_EPERM;
+    return 0;
+}
+
 static enum kernel_files_status readv_request(
     struct kernel_files *files,
     struct kernel_mm *mm,
     int64_t fd,
     uint64_t user_iov,
     uint64_t iovcnt,
-    int positioned, int64_t offset, int64_t *linux_result)
+    int positioned, int64_t offset, uint32_t flags, int64_t *linux_result)
 {
+    KERNEL_LOCK_SCOPE(offset_guard);
     struct kernel_uaccess_iov_snapshot snapshot = {0};
     struct kernel_open_file_description *description = 0;
     enum kernel_files_status status;
@@ -785,6 +804,12 @@ static enum kernel_files_status readv_request(
         status = KERNEL_FILES_STATUS_OK;
         goto out;
     }
+    if (!positioned && (description->kind==KERNEL_OPEN_FILE_KIND_REGULAR ||
+        description->kind==KERNEL_OPEN_FILE_KIND_GENERATED))
+        kernel_mutex_lock(&description->offset_lock,&offset_guard);
+    *linux_result=vector_request_error(description,positioned?(uint64_t)offset:kernel_open_file_offset(description),
+        snapshot.total,flags);
+    if (*linux_result) goto out;
     if (positioned) {
         status = pread_iov_pinned(files, mm, &description, snapshot.view, snapshot.count,
                                   snapshot.total, offset, 0, linux_result);
@@ -797,11 +822,12 @@ static enum kernel_files_status readv_request(
         else KERNEL_FILES_NOTE(files, bytes_read, (uint64_t)*linux_result);
     } else status = read_pinned(files, mm, &description,
                          snapshot.view, snapshot.count,
-                         snapshot.total, 0, linux_result, 0U, 0, 0, NULL);
+                         snapshot.total, 0, linux_result, 0U, 0, 0, NULL,offset_guard.lock?&offset_guard:NULL);
     dispatched = 1;
     if (!status && *linux_result>0 && description)
         kernel_vfs_notify_file(&description->file,VFS_NOTIFY_ACCESS);
 out:
+    if (offset_guard.lock) kernel_lock_release(&offset_guard);
     kernel_uaccess_iov_cleanup(&snapshot,files->heap);
     if (!dispatched && status == KERNEL_FILES_STATUS_OK &&
         *linux_result < 0) {
@@ -815,15 +841,19 @@ enum kernel_files_status kernel_files_readv(struct kernel_files *files,
     struct kernel_mm *mm, int64_t fd, uint64_t user_iov, uint64_t iovcnt,
     int64_t *linux_result)
 {
-    return readv_request(files, mm, fd, user_iov, iovcnt, 0, 0, linux_result);
+    return readv_request(files, mm, fd, user_iov, iovcnt, 0, 0, 0, linux_result);
 }
 
 enum kernel_files_status kernel_files_preadv(struct kernel_files *files,
     struct kernel_mm *mm, int64_t fd, uint64_t user_iov, uint64_t iovcnt,
     int64_t offset, int64_t *linux_result)
 {
-    return readv_request(files, mm, fd, user_iov, iovcnt, 1, offset, linux_result);
+    return readv_request(files, mm, fd, user_iov, iovcnt, 1, offset, 0, linux_result);
 }
+
+enum kernel_files_status kernel_files_preadv2(struct kernel_files *files,struct kernel_mm *mm,
+    int64_t fd,uint64_t iov,uint64_t count,int64_t offset,uint32_t flags,int64_t *result)
+{ return readv_request(files,mm,fd,iov,count,offset!=-1,offset,flags,result); }
 
 static enum kernel_files_status pread_iov_pinned(
     struct kernel_files *files,
@@ -917,7 +947,7 @@ static enum kernel_files_status pread_iov_pinned(
     }
     if (description->device && description->device->positioned) {
         return read_pinned(files, mm, description_owner, iov, iov_count, count, 0,
-                           linux_result, 0U, 0, 0, NULL);
+                           linux_result, 0U, 0, 0, NULL, NULL);
     }
     if (kind == KERNEL_OPEN_FILE_KIND_REGULAR) {
         kernel_open_file_read_begin(description, (uint64_t)offset);
@@ -1542,15 +1572,17 @@ static enum kernel_files_status control_write(
     return KERNEL_FILES_STATUS_OK;
 }
 
+struct write_options { uint32_t flags;unsigned no_signal; };
+
 static enum kernel_files_status regular_write_request(
     struct kernel_files *files,struct kernel_mm *mm,
     struct kernel_open_file_description *description,
     const struct kernel_uaccess_iovec *iov,size_t iov_count,
     uint64_t count,int positioned,uint64_t requested_offset,int64_t *linux_result,
-    uint64_t *accepted_end)
+    uint64_t *accepted_end,const struct write_options *options)
 {
     if (!count) { *linux_result=0; return KERNEL_FILES_STATUS_OK; }
-    int append=(kernel_open_file_flags(description)&KERNEL_FILES_O_APPEND)!=0;
+    int append=(options->flags&KERNEL_FILES_O_APPEND)!=0;
     uint64_t offset=positioned?requested_offset:kernel_open_file_offset(description);
     struct kernel_vfs_size_limit size_limit={.maximum=kernel_task_current_fsize_limit()};
     struct kernel_vfs_user_write_result completed={0};
@@ -1576,13 +1608,14 @@ static enum kernel_files_status buffered_write_request(
     struct kernel_open_file_description *description,
     const struct kernel_uaccess_iovec *iov, size_t iov_count,
     uint64_t count, int positioned, uint64_t requested_offset,
-    int64_t *linux_result, unsigned char *staging, size_t capacity)
+    int64_t *linux_result, unsigned char *staging, size_t capacity,
+    const struct write_options *options)
 {
     uint64_t total = 0U;
 
     if (description->device && description->device->discard_writes) {
         size_t consumed = 0U;
-        int result = description->device->write(description->device_instance, kernel_task_current(), kernel_open_file_flags(description), 0, (size_t)count, &consumed);
+        int result = description->device->write(description->device_instance, kernel_task_current(), options->flags, 0, (size_t)count, &consumed);
         if (consumed > count) return KERNEL_FILES_STATUS_STATE;
         *linux_result = result && !consumed ? result : (int64_t)consumed;
         return KERNEL_FILES_STATUS_OK;
@@ -1597,8 +1630,8 @@ static enum kernel_files_status buffered_write_request(
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE) {
         struct kernel_pipe_result completed;
         if (kernel_pipe_writev(description->pipe,mm,iov,iov_count,count,
-            kernel_open_file_flags(description),&completed)!=KERNEL_PIPE_STATUS_OK ||
-            pipe_user_result(completed.bytes,completed.broken)) return KERNEL_FILES_STATUS_STATE;
+            options->flags,&completed)!=KERNEL_PIPE_STATUS_OK ||
+            pipe_user_result(completed.bytes,completed.broken && !options->no_signal)) return KERNEL_FILES_STATUS_STATE;
         *linux_result=completed.bytes;
         if (*linux_result > 0 && description->file.private_data &&
             !kernel_vfs_mount_is_readonly(description->file.mount)) {
@@ -1627,7 +1660,7 @@ static enum kernel_files_status buffered_write_request(
                                             iov[index].base + offset,
                                             chunk, &copied);
             size_t written = 0U;
-            int result = description->device->write(description->device_instance, kernel_task_current(), kernel_open_file_flags(description), staging, copied, &written);
+            int result = description->device->write(description->device_instance, kernel_task_current(), options->flags, staging, copied, &written);
             if (written > copied) return KERNEL_FILES_STATUS_STATE;
             total += written;
             offset += written;
@@ -1887,11 +1920,12 @@ static __attribute__((noinline)) enum kernel_files_status non_socket_write_reque
     struct kernel_open_file_description *description,
     const struct kernel_uaccess_iovec *iov, size_t iov_count,
     uint64_t count, int positioned, uint64_t requested_offset,
-    int64_t *linux_result, const struct kernel_lock_guard *borrowed)
+    int64_t *linux_result, const struct kernel_lock_guard *borrowed,
+    const struct write_options *options)
 {
     const enum kernel_open_file_kind kind=description->kind;
     KERNEL_LOCK_SCOPE(offset_guard);
-    if (((!positioned || (kernel_open_file_flags(description)&KERNEL_FILES_O_DSYNC)) &&
+    if (((!positioned || (options->flags&KERNEL_FILES_O_DSYNC)) &&
          kind == KERNEL_OPEN_FILE_KIND_REGULAR) || kind == KERNEL_OPEN_FILE_KIND_GENERATED) {
         if (!regular_borrows_offset(description,borrowed))
             kernel_mutex_lock(&description->offset_lock, &offset_guard);
@@ -1900,19 +1934,19 @@ static __attribute__((noinline)) enum kernel_files_status non_socket_write_reque
     uint64_t accepted_end=0;
     if (kind==KERNEL_OPEN_FILE_KIND_REGULAR) {
         status=regular_write_request(files,mm,description,iov,iov_count,count,
-            positioned,requested_offset,linux_result,&accepted_end);
+            positioned,requested_offset,linux_result,&accepted_end,options);
     } else {
         unsigned char small[KERNEL_FILES_WRITE_STAGING];
         unsigned char *staging = small;
         size_t capacity = sizeof(small);
         status=buffered_write_request(files,mm,description,iov,iov_count,count,
-            positioned,requested_offset,linux_result,staging,capacity);
+            positioned,requested_offset,linux_result,staging,capacity,options);
     }
     if (status == KERNEL_FILES_STATUS_OK) COST_IO_ADD(2, *linux_result > 0 ? (uint64_t)*linux_result : 0);
     if (status == KERNEL_FILES_STATUS_OK && *linux_result > 0 &&
         kind == KERNEL_OPEN_FILE_KIND_REGULAR &&
-        (kernel_open_file_flags(description) & KERNEL_FILES_O_DSYNC) != 0U) {
-        int datasync = (kernel_open_file_flags(description) & KERNEL_FILES_O_SYNC) !=
+        (options->flags & KERNEL_FILES_O_DSYNC) != 0U) {
+        int datasync = (options->flags & KERNEL_FILES_O_SYNC) !=
                         KERNEL_FILES_O_SYNC;
         const struct kernel_lock_guard *borrow = offset_guard.lock ? &offset_guard : borrowed;
         int error = kernel_vfs_sync_range_borrowing(&description->file,
@@ -1930,10 +1964,24 @@ static enum kernel_files_status write_request(
     struct kernel_open_file_description *description,
     const struct kernel_uaccess_iovec *iov, size_t iov_count,
     uint64_t count, int positioned, uint64_t requested_offset,
-    int64_t *linux_result, uint32_t socket_flags,const struct kernel_lock_guard *borrowed, struct kernel_socket_message *socket_message)
+    int64_t *linux_result, uint32_t socket_flags,const struct kernel_lock_guard *borrowed, struct kernel_socket_message *socket_message,uint32_t rwf)
 {
-    if (description->block) return kernel_block_file_io(description, mm, iov, iov_count,
-        count, 1, positioned, requested_offset, linux_result);
+    struct write_options options={.flags=kernel_open_file_flags(description),
+        .no_signal=!!(rwf&KERNEL_RWF_NOSIGNAL)};
+    if (rwf&KERNEL_RWF_NOAPPEND) options.flags&=~KERNEL_FILES_O_APPEND;
+    else if (rwf&KERNEL_RWF_APPEND) options.flags|=KERNEL_FILES_O_APPEND;
+    if (rwf&KERNEL_RWF_SYNC) options.flags|=KERNEL_FILES_O_SYNC;
+    else if (rwf&KERNEL_RWF_DSYNC) options.flags|=KERNEL_FILES_O_DSYNC;
+    if (description->block) {
+        enum kernel_files_status status=kernel_block_file_io(description,mm,iov,iov_count,
+            count,1,positioned,requested_offset,linux_result);
+        if (!status && *linux_result>0 && (rwf&(KERNEL_RWF_SYNC|KERNEL_RWF_DSYNC)) &&
+            !(kernel_open_file_flags(description)&KERNEL_FILES_O_DSYNC)) {
+            int error=kernel_block_file_sync(description);if (error) *linux_result=error;
+        }
+        return status;
+    }
+    if (options.no_signal) socket_flags|=KERNEL_SOCKET_MSG_NOSIGNAL;
     const enum kernel_open_file_kind kind = description->kind;
     if(kind==KERNEL_OPEN_FILE_KIND_MQUEUE){
         *linux_result=kernel_open_file_writable(description)?-KERNEL_EINVAL:-KERNEL_EBADF;
@@ -1948,7 +1996,7 @@ static enum kernel_files_status write_request(
     }
     /* 固定本次调用的等待资格；后续fcntl只影响下一次读写。 */
     if (kind == KERNEL_OPEN_FILE_KIND_SOCKET &&
-        (kernel_open_file_flags(description) & KERNEL_FILES_O_NONBLOCK))
+        (options.flags & KERNEL_FILES_O_NONBLOCK))
         socket_flags |= KERNEL_SOCKET_MSG_DONTWAIT;
     KERNEL_SERVICE_SCOPE_IF(service, kind != KERNEL_OPEN_FILE_KIND_REGULAR && kind != KERNEL_OPEN_FILE_KIND_SOCKET && kind != KERNEL_OPEN_FILE_KIND_PIPE);
     COST_SCOPE(write_cost, OPERATION_TICKS);
@@ -1974,7 +2022,7 @@ static enum kernel_files_status write_request(
         return status;
     }
     enum kernel_files_status status=non_socket_write_request(files,mm,description,
-        iov,iov_count,count,positioned,requested_offset,linux_result,borrowed);
+        iov,iov_count,count,positioned,requested_offset,linux_result,borrowed,&options);
     return status;
 }
 
@@ -1991,7 +2039,7 @@ enum kernel_files_status kernel_files_socket_iov_io(
     if (count > KERNEL_FILES_MAX_RW_COUNT) count = KERNEL_FILES_MAX_RW_COUNT;
     if (writing) {
         KERNEL_FILES_NOTE(files, write_calls, 1);
-        enum kernel_files_status status = write_request(files, mm, *owner, iov, iov_count, count, 0, 0, linux_result, flags,NULL, socket_message);
+        enum kernel_files_status status = write_request(files, mm, *owner, iov, iov_count, count, 0, 0, linux_result, flags,NULL, socket_message,0);
         if (status == KERNEL_FILES_STATUS_OK) {
             if (*linux_result >= 0) KERNEL_FILES_NOTE(files, bytes_written, (uint64_t)*linux_result);
             else KERNEL_FILES_NOTE(files, write_failures, 1);
@@ -1999,7 +2047,7 @@ enum kernel_files_status kernel_files_socket_iov_io(
         return status;
     }
     KERNEL_FILES_NOTE(files, read_calls, 1);
-    return read_pinned(files, mm, owner, iov, iov_count, count, 0, linux_result, flags, peer, message_size, socket_message);
+    return read_pinned(files, mm, owner, iov, iov_count, count, 0, linux_result, flags, peer, message_size, socket_message, NULL);
 }
 enum kernel_files_status kernel_files_socket_io(
     struct kernel_files *files, struct kernel_mm *mm,
@@ -2075,7 +2123,7 @@ enum kernel_files_status kernel_files_write(
             kernel_task_current(), files, &description, 0, mm, &iov, 1U,
             count, kernel_open_file_flags(description), linux_result);
     } else status = write_request(files, mm, description, &iov, 1U, count,
-                           0, 0U, linux_result, 0U,NULL, NULL);
+                           0, 0U, linux_result, 0U,NULL, NULL,0);
     if (status == KERNEL_FILES_STATUS_OK) {
         account_write(files, *linux_result);
     }
@@ -2137,7 +2185,7 @@ enum kernel_files_status kernel_files_pwrite(
     if (count > KERNEL_FILES_MAX_RW_COUNT) count = KERNEL_FILES_MAX_RW_COUNT;
     iov.length = count;
     status = write_request(files, mm, description, &iov, 1U, count,
-                           1, (uint64_t)offset, linux_result, 0U,NULL, NULL);
+                           1, (uint64_t)offset, linux_result, 0U,NULL, NULL,0);
     if (status == KERNEL_FILES_STATUS_OK) account_write(files, *linux_result);
     return release_io_description(files, &description, status);
 }
@@ -2145,8 +2193,9 @@ enum kernel_files_status kernel_files_pwrite(
 static enum kernel_files_status writev_request(
     struct kernel_files *files, struct kernel_mm *mm, int64_t fd,
     uint64_t user_iov, uint64_t iovcnt, int positioned, int64_t offset,
-    int64_t *linux_result)
+    uint32_t flags,int64_t *linux_result)
 {
+    KERNEL_LOCK_SCOPE(offset_guard);
     struct kernel_uaccess_iov_snapshot snapshot = {0};
     struct kernel_open_file_description *description = 0;
     enum kernel_files_status status = KERNEL_FILES_STATUS_OK;
@@ -2199,15 +2248,22 @@ static enum kernel_files_status writev_request(
     status=kernel_uaccess_iov_import(&snapshot,files->heap,mm,user_iov,iovcnt,linux_result);
     if (status) goto out;
     if (*linux_result) goto out;
-    if (!snapshot.total && description->kind==KERNEL_OPEN_FILE_KIND_EVENTFD) { *linux_result=0;goto out; }
+    if (!snapshot.total) { *linux_result=0;goto out; }
+    if (!positioned && (description->kind==KERNEL_OPEN_FILE_KIND_REGULAR ||
+        description->kind==KERNEL_OPEN_FILE_KIND_GENERATED))
+        kernel_mutex_lock(&description->offset_lock,&offset_guard);
+    *linux_result=vector_request_error(description,positioned?(uint64_t)offset:kernel_open_file_offset(description),
+        snapshot.total,flags);
+    if (*linux_result) goto out;
     if (!positioned && description->device && description->device->writev) {
         status = description->device->writev(description->device_instance,
             kernel_task_current(), files, &description,
             &snapshot.allocation, mm, snapshot.view, snapshot.count,
             snapshot.total, kernel_open_file_flags(description), linux_result);
     } else status = write_request(files, mm, description, snapshot.view, snapshot.count, snapshot.total,
-                           positioned, (uint64_t)offset, linux_result, 0U,NULL, NULL);
+                           positioned, (uint64_t)offset, linux_result, 0U,offset_guard.lock?&offset_guard:NULL, NULL,flags);
 out:
+    if (offset_guard.lock) kernel_lock_release(&offset_guard);
     kernel_uaccess_iov_cleanup(&snapshot,files->heap);
     if (status == KERNEL_FILES_STATUS_OK) {
         account_write(files, *linux_result);
@@ -2219,15 +2275,19 @@ enum kernel_files_status kernel_files_writev(struct kernel_files *files,
     struct kernel_mm *mm, int64_t fd, uint64_t user_iov, uint64_t iovcnt,
     int64_t *linux_result)
 {
-    return writev_request(files, mm, fd, user_iov, iovcnt, 0, 0, linux_result);
+    return writev_request(files, mm, fd, user_iov, iovcnt, 0, 0, 0, linux_result);
 }
 
 enum kernel_files_status kernel_files_pwritev(struct kernel_files *files,
     struct kernel_mm *mm, int64_t fd, uint64_t user_iov, uint64_t iovcnt,
     int64_t offset, int64_t *linux_result)
 {
-    return writev_request(files, mm, fd, user_iov, iovcnt, 1, offset, linux_result);
+    return writev_request(files, mm, fd, user_iov, iovcnt, 1, offset, 0, linux_result);
 }
+
+enum kernel_files_status kernel_files_pwritev2(struct kernel_files *files,struct kernel_mm *mm,
+    int64_t fd,uint64_t iov,uint64_t count,int64_t offset,uint32_t flags,int64_t *result)
+{ return writev_request(files,mm,fd,iov,count,offset!=-1,offset,flags,result); }
 
 static enum kernel_files_status lseek_pinned(
     struct kernel_open_file_description *description, int64_t offset,

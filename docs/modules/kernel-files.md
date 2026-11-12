@@ -75,6 +75,21 @@ CLOEXEC模式保留共享OFD再标记。分配失败保留旧表。候选和退�
 
 `/proc/<pid>/fd` 在 CPU0 的目标任务借用范围内，通过 FD 锁取得临时 OFD pin；普通文件再取得路径引用，伪对象只复制 kind/身份，调用结束归还 pin。重新打开 pipe 时，先在该短区预留一个 endpoint 引用，解锁后分配新 OFD，最后无论成功失败都撤销临时引用。只读、只写和读写的新 OFD 分别拥有 reader、writer 或两者；`O_RDWR` 的 poll 等待使用同时由读写状态变化唤醒的聚合队列。socket/epoll 不复制底层句柄来冒充新打开。
 
+## 向量 I/O 的按次选项
+
+`preadv/pwritev` 与 `preadv2/pwritev2` 共用一次 OFD 引用、一次 iovec 快照和读写核心。
+RV64／LA64 原生入口在第4参数传完整64位 offset，第5参数槽不参与拼接，第6参数取32位 flags。
+v2 的 offset=-1 使用并推进共享位置，非负值执行定位 I/O；原定位入口仍拒绝负偏移。
+8项以内描述符保存在栈内，超过后分配一份数组，最多1024项。空向量沿 Linux 的零长度规则返回，非空请求在导入后检查按次标志。
+
+支持 `RWF_HIPRI/DSYNC/SYNC/APPEND/NOAPPEND/NOSIGNAL`。HIPRI 使用现有缓冲 I/O，不启动 direct I/O 轮询；
+APPEND 与 NOAPPEND 同时指定返回 EINVAL。NOAPPEND 可覆盖本次 O_APPEND 行为，但不能绕过 inode 的 append-only 限制，
+这个限制也适用于带 O_APPEND 的只读 FD。NOSIGNAL 只抑制本次管道或 socket 的 SIGPIPE，不影响 FSIZE 的 SIGXFSZ。
+未知标志和当前不支持的 NOWAIT、ATOMIC、DONTCACHE 返回 EOPNOTSUPP；不会用可能阻塞的操作冒充 NOWAIT。
+
+追加、同步和信号选项保存在本次调用中，不修改共享 OFD 状态。按次同步复用实际完成范围及原有固定持久化目标、错误游标；
+数据已接纳后同步失败仍保留内容和应发生的位置更新。复制故障的已完成前缀、FSIZE、文件封印以及 set-ID／filecap 清除沿共同写入路径处理。
+
 ## 传统与 OFD 记录锁
 
 `fs/record_lock.c` 为每个活 VFS inode 维护按有符号闭区间排序、带子树最大终点的 AVL 树和等待队列；冲突查询、同 owner 区间合并、分拆预留和批量摘除都按该树的相关范围搜索，不遍历 owner 在其他 inode 上的锁。每个锁节点同时挂在 owner 的侵入式链上，供关闭时定向释放；批量摘除通过 AVL 子树合并恢复平衡。长度为零延伸到 `INT64_MAX`，负长度向文件前方锁定，锁可以超过 EOF。`fs/files/locks.c` 导入 RV64 `struct flock` 并分派 `F_GETLK/F_SETLK/F_SETLKW` 与 `F_OFD_GETLK/F_OFD_SETLK/F_OFD_SETLKW`；标量 `fcntl` 命令仍走原入口。区间转换、读写权限、`l_pid`、坏指针和溢出错误按固定 Linux `references/linux/fs/locks.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 核对。

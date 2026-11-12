@@ -571,7 +571,8 @@ enum kernel_syscall_status syscall_handle_positioned_iov(
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     /* Both 64-bit architectures pass the full low word in argument four. */
     int64_t offset = (int64_t)request->arguments[3];
-    if (offset < 0) {
+    int v2=request->number==286U || request->number==287U;
+    if (offset < (v2?-1:0)) {
         decoded->value = -KERNEL_EINVAL;
         return KERNEL_SYSCALL_STATUS_OK;
     }
@@ -583,7 +584,15 @@ enum kernel_syscall_status syscall_handle_positioned_iov(
     if (task_status != KERNEL_TASK_STATUS_OK ||
         kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK)
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-    enum kernel_files_status status = request->number == 69U
+    enum kernel_files_status status;
+    if (v2) {
+        uint32_t flags=(uint32_t)request->arguments[5];
+        status=request->number==286U
+            ? kernel_files_preadv2(files,mm,(int64_t)request->arguments[0],request->arguments[1],
+                request->arguments[2],offset,flags,&decoded->value)
+            : kernel_files_pwritev2(files,mm,(int64_t)request->arguments[0],request->arguments[1],
+                request->arguments[2],offset,flags,&decoded->value);
+    } else status = request->number == 69U
         ? kernel_files_preadv(files, mm, (int64_t)request->arguments[0],
             request->arguments[1], request->arguments[2], offset, &decoded->value)
         : kernel_files_pwritev(files, mm, (int64_t)request->arguments[0],

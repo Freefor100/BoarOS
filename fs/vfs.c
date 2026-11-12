@@ -84,6 +84,13 @@ static int inode_permission(struct kernel_vfs_node *node, unsigned access)
     kernel_vfs_node_lock(node, &io, 0);
     return node_dac_permission(node,cred,access);
 }
+int kernel_vfs_file_noappend_allowed(const struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_node *node=kernel_vfs_file_node(file);
+    if (!node) __builtin_trap();
+    return !(node->metadata_restrictions&KERNEL_VFS_INODE_APPEND);
+}
+
 int kernel_vfs_file_mincore_allowed(const struct kernel_vfs_file *file)
 {
     struct kernel_vfs_node *node = kernel_vfs_file_node(file);
@@ -280,7 +287,7 @@ static int file_xattr(struct kernel_vfs_file *file,struct kernel_vfs_path *path,
             if (root==UINT32_MAX) return -KERNEL_EINVAL;
         }
     }
-    if (write && node->metadata_immutable) return -KERNEL_EPERM;
+    if (write && node->metadata_restrictions) return -KERNEL_EPERM;
     if (acl) {
         if (!instance->ops->acl_permission || (node->mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFLNK)
             return -KERNEL_EOPNOTSUPP;

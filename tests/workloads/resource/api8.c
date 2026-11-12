@@ -27,17 +27,34 @@ int main(void)
         CHECK(!mount("/dev/vdb","/fat","vfat",0,NULL));
         CHECK(!setenv("COPY_RANGE_VFAT","/fat",1));
     }
-    int fd=socket(AF_INET,SOCK_DGRAM,0);CHECK(fd>=0);
-    struct ifreq interface={0};strcpy(interface.ifr_name,"lo");
-    CHECK(!ioctl(fd,SIOCGIFFLAGS,&interface));interface.ifr_flags|=IFF_UP;
-    CHECK(!ioctl(fd,SIOCSIFFLAGS,&interface)&&!close(fd));
-    const char *programs[]={"/fd_events","/flock","/mmsg","/copy_range",
+    const char *defaults[]={"/fd_events","/flock","/mmsg","/copy_range",
 #ifdef __riscv
         "/icache",
 #endif
         "/sched_query",
     };
-    unsigned count=sizeof(programs)/sizeof(programs[0]);
+    const char *programs[16];char paths[16][48];
+    unsigned count=sizeof(defaults)/sizeof(defaults[0]);
+    for(unsigned i=0;i<count;i++)programs[i]=defaults[i];
+    FILE *selection=fopen("/api8-programs","r");
+    if(selection) {
+        count=0;
+        while(count<16 && fgets(paths[count],sizeof(paths[count]),selection)) {
+            size_t length=strcspn(paths[count],"\n");
+            CHECK(paths[count][0]=='/' && paths[count][length]=='\n');
+            paths[count][length]=0;programs[count]=paths[count];count++;
+        }
+        CHECK(count && feof(selection) && !fclose(selection));
+    }
+    int network=0;
+    for(unsigned i=0;i<count;i++)network|=!strcmp(programs[i],"/mmsg");
+    if(network) {
+    int fd=socket(AF_INET,SOCK_DGRAM,0);CHECK(fd>=0);
+    struct ifreq interface={0};strcpy(interface.ifr_name,"lo");
+    CHECK(!ioctl(fd,SIOCGIFFLAGS,&interface));interface.ifr_flags|=IFF_UP;
+    CHECK(!ioctl(fd,SIOCSIFFLAGS,&interface)&&!close(fd));
+    }
+
     for(unsigned i=0;i<count;i++) {
         printf("API8 BEGIN %s\n",programs[i]);
         pid_t child=fork();CHECK(child>=0);

@@ -54,6 +54,8 @@ struct kernel_record_lock_state;
 
 struct kernel_vfs_node *kernel_vfs_file_node(
     const struct kernel_vfs_file *file);
+/* Per-call NOAPPEND cannot bypass inode format restrictions. */
+int kernel_vfs_file_noappend_allowed(const struct kernel_vfs_file *);
 int kernel_vfs_file_mincore_allowed(const struct kernel_vfs_file *);
 int kernel_vfs_namespace_requires_cpu0(const struct kernel_vfs_mount *);
 int kernel_vfs_file_metadata_requires_cpu0(const struct kernel_vfs_file *file);

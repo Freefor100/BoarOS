@@ -561,7 +561,8 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
     } else if (request->number == LINUX_SYSCALL_PREADV ||
-               request->number == LINUX_SYSCALL_PWRITEV) {
+               request->number == LINUX_SYSCALL_PWRITEV ||
+               request->number == 286U || request->number == 287U) {
         if (syscall_handle_positioned_iov(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_SENDFILE) {
