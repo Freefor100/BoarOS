@@ -3,6 +3,7 @@
 #include "private.h"
 #include "../../fs/vfs_internal.h"
 #include "../../fs/files/private.h"
+#include "../../fs/mount_context.h"
 #include <kernel/files.h>
 #include <kernel/open_file.h>
 #include <kernel/page.h>
@@ -48,9 +49,8 @@ static int import_string(struct kernel_mm *mm, char *buffer, size_t capacity,
 }
 
 struct mount_arguments {
-    char target[KERNEL_FS_PATH_MAX],source[KERNEL_FS_PATH_MAX];
-    char type[64],options[256];
-    struct kernel_vfs_stat stat;
+    char target[KERNEL_FS_PATH_MAX];
+    struct kernel_mount_parameters parameters;
 };
 static __attribute__((noinline)) int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context *fs,
                       const struct kernel_syscall_request *request)
@@ -59,33 +59,26 @@ static __attribute__((noinline)) int mount_filesystem(struct kernel_mm *mm, cons
     KERNEL_LOCK_SCOPE(topology);
     uint64_t flags = request->arguments[3];
     struct kernel_vfs_path *covered = NULL;
-    struct kernel_vfs_mount *mounted = NULL;
-    uint64_t source_device = 0;
+    struct kernel_vfs_path *created=NULL;
     struct mount_arguments *storage=NULL;
     enum kernel_heap_status allocation=kernel_heap_allocate(fs->heap,sizeof(*storage),(void **)&storage);
     if(allocation!=KERNEL_HEAP_STATUS_OK)
         return allocation==KERNEL_HEAP_STATUS_EMPTY?-KERNEL_ENOMEM:-KERNEL_EIO;
-    char *target=storage->target,*source_name=storage->source,*type=storage->type,*options=storage->options;
-    type[0]=options[0]=0;
+    char *target=storage->target,*source_name=storage->parameters.source,*type=storage->parameters.type,*options=storage->parameters.options;
+    type[0]=options[0]=source_name[0]=0;
     int result;
     if (request->arguments[2]) {
         result=import_string(mm,(flags&(LINUX_MS_BIND|LINUX_MS_MOVE))?target:type,
-            (flags&(LINUX_MS_BIND|LINUX_MS_MOVE))?KERNEL_FS_PATH_MAX:sizeof(storage->type),request->arguments[2]);
+            (flags&(LINUX_MS_BIND|LINUX_MS_MOVE))?KERNEL_FS_PATH_MAX:sizeof(storage->parameters.type),request->arguments[2]);
         if(result)goto Finish;
     }
-    int tmpfs = !strcmp(type, "tmpfs");
-    int ext4 = !strcmp(type, "ext4");
-    int disk = ext4 || !strcmp(type, "vfat");
-    int devpts = !strcmp(type, "devpts");
-    int mqueue = !strcmp(type, "mqueue");
-    int bpf = !strcmp(type, "bpf"), tracefs = !strcmp(type, "tracefs"), sysfs = !strcmp(type, "sysfs");
     if (request->arguments[0]) {
         result = import_string(mm, source_name, KERNEL_FS_PATH_MAX,
                                request->arguments[0]);
         if (result) goto Finish;
     }
     if (!(flags & (LINUX_MS_BIND|LINUX_MS_MOVE)) && request->arguments[4]) {
-        result = import_string(mm, options, sizeof(storage->options),
+        result = import_string(mm, options, 256,
                                request->arguments[4]);
         if (result) goto Finish;
     }
@@ -140,47 +133,15 @@ static __attribute__((noinline)) int mount_filesystem(struct kernel_mm *mm, cons
         goto Finish;
     }
     if (flags & LINUX_MS_REC) {result=-KERNEL_ENOTSUP;goto Finish;}
-    if(!tmpfs && !disk && !devpts && !mqueue && !bpf && !tracefs && !sysfs && strcmp(type,"proc")) {result=-KERNEL_ENODEV;goto Finish;}
-    if(!tmpfs && !devpts && options[0]) {result=-KERNEL_ENOTSUP;goto Finish;}
-    if(disk) {
-        if(!request->arguments[0]) {result=-KERNEL_EINVAL;goto Finish;}
-        struct kernel_vfs_path *source=0;struct kernel_vfs_stat *source_stat=&storage->stat;
-        result=kernel_vfs_path_resolve(fs_paths.cwd,fs_paths.root,source_name,1,&source);
-        if(!result)result=kernel_vfs_path_stat(source,source_stat);
-        if(!result && (source_stat->mode&KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFBLK)result=-KERNEL_ENOTBLK;
-        /* 同一设备号可以从不同挂载命名；使用已解析源路径的属性。 */
-        if(!result && kernel_vfs_path_mount(source)->nodev)result=-KERNEL_EACCES;
-        if(!result)source_device=source_stat->rdev;
-        if(source && kernel_vfs_path_release(&source))__builtin_trap();
-        if(result)goto Finish;
-    }
-    struct kernel_vfs_stat *stat=&storage->stat;
-    result = kernel_vfs_path_stat(covered, stat);
-    if (result) goto Finish;
-    if ((stat->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) {
-        result = -KERNEL_ENOTDIR;
-        goto Finish;
-    }
-    result = disk ? kernel_vfs_disk_create(fs->heap, source_device, flags & LINUX_MS_RDONLY, source_name, type, &mounted)
-           : bpf ? kernel_bpffs_mount(fs->heap, flags & LINUX_MS_RDONLY, &mounted)
-           : tracefs ? kernel_tracefs_mount(fs->heap, flags & LINUX_MS_RDONLY, &mounted)
-           : sysfs ? kernel_sysfs_mount(fs->heap, flags & LINUX_MS_RDONLY, &mounted)
-           : devpts ? kernel_devpts_create(fs->heap, flags & LINUX_MS_RDONLY, options, &mounted)
-           : mqueue ? kernel_mqueue_fs_create(fs->heap, flags & LINUX_MS_RDONLY, &mounted)
-           : tmpfs ? kernel_tmpfs_create(fs->heap, flags & LINUX_MS_RDONLY, options, &mounted)
-                   : kernel_procfs_create(fs->heap, flags & LINUX_MS_RDONLY, &mounted);
-    if (result) goto Finish;
-    mounted->nosuid=!!(flags&LINUX_MS_NOSUID);
-    mounted->nodev=!!(flags&LINUX_MS_NODEV);
-    mounted->noexec=!!(flags&LINUX_MS_NOEXEC);
-    mounted->silent=!!(flags&LINUX_MS_SILENT);
-    mounted->atime_policy=kernel_vfs_atime_policy(flags,0,0);
-    result = kernel_vfs_mount_attach(mounted, covered);
-    if (result) {
-        int cleanup = kernel_vfs_unmount(mounted);
-        if (cleanup) { if (disk) kernel_vfs_disk_defer_cleanup(mounted); else __builtin_trap(); }
-        mounted = 0;
-    }
+    if(!kernel_mount_type_supported(type)){result=-KERNEL_ENODEV;goto Finish;}
+    if((!strcmp(type,"ext4") || !strcmp(type,"vfat")) && !request->arguments[0]){result=-KERNEL_EINVAL;goto Finish;}
+    storage->parameters.flags=flags;
+    result=kernel_mount_create(fs,&storage->parameters,kernel_credentials_current(),0,&created);
+    /* Legacy mount checks the new root type after creating the filesystem;
+     * move_mount has its own EINVAL rule for mismatched existing trees. */
+    if(!result && (kernel_vfs_path_mode(covered)&KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFDIR)result=-KERNEL_ENOTDIR;
+    if(!result)result=kernel_vfs_move_mount(created,covered,0);
+    kernel_mount_discard(&created);
 Finish:
     if (covered && kernel_vfs_path_release(&covered)) __builtin_trap();
     kernel_heap_release(fs->heap, target);
@@ -414,6 +375,104 @@ done:
     return error;
 }
 
+static int install_context_file(struct kernel_files *files,struct kernel_open_file_description **owner,int cloexec)
+{
+    KERNEL_FILES_RESERVATION_SCOPE(reservation);
+    uint32_t fd;int error;
+    if(kernel_files_find_free_fd(files,&fd,&error))__builtin_trap();
+    if(error){if(kernel_open_file_release(owner))__builtin_trap();return error;}
+    reservation=(struct kernel_files_fd_reservation){files,fd};
+    if(kernel_files_install_new_owned_at(files,fd,cloexec,owner))__builtin_trap();
+    reservation.files=NULL;return (int)fd;
+}
+struct fsconfig_input {char key[256],value[KERNEL_FS_PATH_MAX],options[KERNEL_MOUNT_OPTIONS_MAX];};
+static __attribute__((noinline)) int configure_context(struct kernel_task *caller,struct kernel_mm *mm,
+    const struct kernel_fs_context *fs,const struct kernel_syscall_request *request)
+{
+    int fd=(int32_t)request->arguments[0],aux=(int32_t)request->arguments[4];
+    unsigned command=(unsigned)request->arguments[1];
+    uint64_t key=request->arguments[2],value=request->arguments[3];
+    if(fd<0)return -KERNEL_EINVAL;
+    switch(command){
+    case 0:if(!key||value||aux)return -KERNEL_EINVAL;break;
+    case 1:if(!key||!value||aux)return -KERNEL_EINVAL;break;
+    case 2:if(!key||!value||aux<=0||aux>1048576)return -KERNEL_EINVAL;break;
+    case 3:case 4:if(!key||!value||(aux!=KERNEL_FS_AT_FDCWD&&aux<0))return -KERNEL_EINVAL;break;
+    case 5:if(!key||value||aux<0)return -KERNEL_EINVAL;break;
+    case 6:case 7:case 8:if(key||value||aux)return -KERNEL_EINVAL;break;
+    default:return -KERNEL_EOPNOTSUPP;
+    }
+    struct kernel_files *files;if(kernel_task_files_borrow(caller,&files))__builtin_trap();
+    KERNEL_FILES_PIN_SCOPE(pin);KERNEL_FILES_PIN_SCOPE(value_pin);
+    struct kernel_open_file_description *file=kernel_files_hold_fd(files,fd,&pin);
+    if(!file)return -KERNEL_EBADF;
+    if(kernel_open_file_kind(file)!=KERNEL_OPEN_FILE_KIND_FS_CONTEXT)return -KERNEL_EINVAL;
+    if(command>=6)return kernel_mount_context_configure(file,fs,command,NULL,NULL,NULL);
+    struct fsconfig_input *input=NULL;
+    if(kernel_heap_allocate(fs->heap,sizeof(*input),(void **)&input))return -KERNEL_ENOMEM;
+    int error=import_string(mm,input->key,sizeof(input->key),key);
+    if(error==-KERNEL_ENAMETOOLONG)error=-KERNEL_EINVAL;
+    void *blob=NULL;
+    if(!error && command==2){
+        if(kernel_heap_allocate(fs->heap,(size_t)aux,(void **)&blob))error=-KERNEL_ENOMEM;
+        else {size_t copied;if(kernel_copy_from_user(mm,blob,value,(size_t)aux,&copied))error=-KERNEL_EFAULT;}
+    } else if(!error && (command==1||command==3||command==4)){
+        error=import_string(mm,input->value,command==1?256:sizeof(input->value),value);
+        if(command==1&&error==-KERNEL_ENAMETOOLONG)error=-KERNEL_EINVAL;
+        if(!error&&command==3&&!input->value[0])error=-KERNEL_ENOENT;
+    } else if(!error && command==5 && !kernel_files_hold_fd(files,aux,&value_pin))error=-KERNEL_EBADF;
+    if(!error)error=kernel_mount_context_configure(file,fs,command,input->key,
+        command==1||command==3||command==4?input->value:NULL,input->options);
+    if(blob)kernel_heap_release(fs->heap,blob);
+    kernel_heap_release(fs->heap,input);return error;
+}
+static __attribute__((noinline)) int filesystem_api(struct kernel_task *caller,struct kernel_mm *mm,
+    const struct kernel_fs_context *fs,const struct kernel_syscall_request *request)
+{
+    if(request->number==431)return configure_context(caller,mm,fs,request);
+    struct kernel_files *files;if(kernel_task_files_borrow(caller,&files))__builtin_trap();
+    unsigned flags=(unsigned)request->arguments[request->number==430?1:request->number==432?1:2];
+    if(request->number==432){
+        if(flags&~3U)return -KERNEL_EINVAL;
+        if(!kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN))return -KERNEL_EPERM;
+        unsigned attrs=(unsigned)request->arguments[2];
+        if(attrs&~0x2000ffU)return -KERNEL_EINVAL;
+        if(attrs&0x200000U)return -KERNEL_EOPNOTSUPP;
+        if((attrs&0x70U)!=0 && (attrs&0x70U)!=0x10U && (attrs&0x70U)!=0x20U)return -KERNEL_EINVAL;
+        KERNEL_FILES_PIN_SCOPE(pin);
+        struct kernel_open_file_description *file=kernel_files_hold_fd(files,(int32_t)request->arguments[0],&pin);
+        if(!file)return -KERNEL_EBADF;
+        struct kernel_open_file_description *result=NULL;
+        int error=kernel_mount_context_mount(file,fs,flags,attrs,&result);
+        return error?error:install_context_file(files,&result,flags&1U);
+    }
+    if(!kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN))return -KERNEL_EPERM;
+    if(flags&~(request->number==430?1U:15U))return -KERNEL_EINVAL;
+    if(request->number==430){
+        char *type=NULL;
+        if(kernel_heap_allocate(fs->heap,BOAROS_PAGE_SIZE,(void **)&type))return -KERNEL_ENOMEM;
+        int error=import_string(mm,type,BOAROS_PAGE_SIZE,request->arguments[0]);
+        struct kernel_open_file_description *file=NULL;
+        if(error==-KERNEL_ENAMETOOLONG)error=-KERNEL_EINVAL;
+        if(!error && !kernel_mount_type_supported(type))error=-KERNEL_ENODEV;
+        if(!error)error=kernel_mount_context_open(fs->heap,type,NULL,&file);
+        kernel_heap_release(fs->heap,type);
+        return error?error:install_context_file(files,&file,flags&1U);
+    }
+
+    struct mount_api_context *call __attribute__((cleanup(mount_api_finish)))=NULL;
+    if(kernel_heap_allocate_zeroed(fs->heap,1,sizeof(*call),(void **)&call))return -KERNEL_ENOMEM;
+    call->heap=fs->heap;call->paths=kernel_fs_context_snapshot(fs);
+    int error=import_string(mm,call->name,sizeof(call->name),request->arguments[1]);
+    if(error)return error;
+    error=mount_api_path(files,&call->paths,(int32_t)request->arguments[0],call->name,flags&8U,!(flags&2U),&call->source,&call->source_fd);
+    if(error)return error;
+    if(!kernel_vfs_path_is_mount_root(call->source))return -KERNEL_EINVAL;
+    struct kernel_open_file_description *file=NULL;
+    error=kernel_mount_context_open(fs->heap,NULL,call->source,&file);
+    return error?error:install_context_file(files,&file,flags&1U);
+}
+
 enum kernel_syscall_status syscall_handle_mount(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,
@@ -426,7 +485,7 @@ enum kernel_syscall_status syscall_handle_mount(
         kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK)
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
-    decoded->value = (request->number==41 || request->number==428 || request->number==429 || request->number==442)
+    decoded->value = request->number>=430 && request->number<=433 ? filesystem_api(caller,mm,fs,request) : (request->number==41 || request->number==428 || request->number==429 || request->number==442)
         ? mount_api(caller,mm,fs,request) : unmount ? unmount_filesystem(mm, fs, request)
                              : mount_filesystem(mm, fs, request);
     return KERNEL_SYSCALL_STATUS_OK;

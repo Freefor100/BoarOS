@@ -577,7 +577,7 @@ static enum kernel_files_status read_pinned(
         unsigned char staging[64];
         request = count > KERNEL_FILES_MAX_RW_COUNT
                       ? KERNEL_FILES_MAX_RW_COUNT : count;
-        while (total < request) {
+        while (total < request || (device->read_once && !total)) {
             if (device->interruptible_bulk && total >= 256U &&
                 kernel_signal_has_pending(kernel_task_current())) break;
             size_t received = 0U;
@@ -1451,6 +1451,9 @@ static enum kernel_files_status write_request(
     uint64_t count, int positioned, uint64_t requested_offset,
     int64_t *linux_result, uint32_t socket_flags,const struct kernel_lock_guard *borrowed, struct kernel_socket_message *socket_message,uint32_t rwf)
 {
+    if(description->device && !description->device->write && !description->device->writev){
+        *linux_result=-KERNEL_EINVAL;return KERNEL_FILES_STATUS_OK;
+    }
     struct write_options options={.flags=kernel_open_file_flags(description),
         .no_signal=!!(rwf&KERNEL_RWF_NOSIGNAL)};
     if (rwf&KERNEL_RWF_NOAPPEND) options.flags&=~KERNEL_FILES_O_APPEND;

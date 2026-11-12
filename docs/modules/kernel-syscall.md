@@ -17,9 +17,9 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 
 调用者是 scheduler 当前不透明 task，供依赖任务身份或资源的系统调用取得明确上下文；通用解码层不从 RISC-V `tp` 隐式寻找 current。请求包含系统调用号和六个 64 位参数。结果动作定义在公共头中：
 
-当前分派覆盖RV的238个编号、LA的237个编号；这表示入口已接入，各接口的具体支持范围见对应模块。
+当前分派覆盖RV的242个编号、LA的241个编号；这表示入口已接入，各接口的具体支持范围见对应模块。
 
-`pivot_root(41)`、`open_tree(428)`、`move_mount(429)`、`mount_setattr(442)`复用挂载控制与真实FD资源；挂载树、root/cwd及命名空间寿命见[VFS模块](vfs-ext4.md#挂载树-fd-与根切换)。
+`pivot_root(41)`、`open_tree(428)`、`move_mount(429)`、`fsopen(430)`、`fsconfig(431)`、`fsmount(432)`、`fspick(433)`、`mount_setattr(442)`复用挂载控制与真实FD资源；挂载树、root/cwd及命名空间寿命见[VFS模块](vfs-ext4.md#挂载树-fd-与根切换)。
 `flock(32)`、`close_range(436)`、`epoll_pwait2(441)`、`fchmodat2(452)`和
 `copy_file_range(285)`见[文件接口](kernel-files.md)，`sendmmsg(269)`／`recvmmsg(243)`
 见[网络接口](kernel-network.md)。RV独有的`riscv_flush_icache(259)`见[MM](kernel-mm.md)；

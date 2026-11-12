@@ -250,6 +250,7 @@ struct kernel_flock_identity *kernel_open_file_flock_identity(
     case KERNEL_OPEN_FILE_KIND_EPOLL:
     case KERNEL_OPEN_FILE_KIND_EVENTFD:
     case KERNEL_OPEN_FILE_KIND_TIMERFD:
+    case KERNEL_OPEN_FILE_KIND_FS_CONTEXT:
     case KERNEL_OPEN_FILE_KIND_BPF:
     case KERNEL_OPEN_FILE_KIND_INOTIFY:
     case KERNEL_OPEN_FILE_KIND_SIGNALFD: return kernel_flock_anonymous_identity();
@@ -716,6 +717,10 @@ int kernel_open_file_pseudo_stat(
 {
     if (!open_file_live(file) || !stat || kernel_open_file_path(file))
         return -KERNEL_ENOTSUP;
+    if (file->kind==KERNEL_OPEN_FILE_KIND_FS_CONTEXT) {
+        *stat=(struct kernel_vfs_stat){.mode=0600U,.nlink=1,
+            .blksize=BOAROS_PAGE_SIZE};return 0;
+    }
     if (file->kind==KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE) {
         *stat=(struct kernel_vfs_stat){.mode=KERNEL_VFS_S_IFREG|0444U,.nlink=1,
             .ino=file->proc_identity,.blksize=BOAROS_PAGE_SIZE};
@@ -808,6 +813,7 @@ enum kernel_open_file_kind kernel_open_file_kind(
         return KERNEL_OPEN_FILE_KIND_REGULAR;
     }
     switch (file->kind) {
+    case KERNEL_OPEN_FILE_KIND_FS_CONTEXT: return KERNEL_OPEN_FILE_KIND_FS_CONTEXT;
     case KERNEL_OPEN_FILE_KIND_BPF:
         return KERNEL_OPEN_FILE_KIND_BPF;
     case KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE:
@@ -955,7 +961,7 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
     }
     if (file->generated_ready) kernel_open_file_reset_generated(file);
     if (!file->vfs_closed) {
-        if (file->kind == KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE) {
+        if (file->kind == KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE || file->kind == KERNEL_OPEN_FILE_KIND_FS_CONTEXT) {
             file->vfs_closed=1;
         } else if (file->kind == KERNEL_OPEN_FILE_KIND_CONSOLE &&
             file->file.private_data == 0) {
@@ -1175,6 +1181,7 @@ int kernel_open_file_readable(
     access_mode = kernel_open_file_flags(file) & 3U;
     switch (file->kind) {
     case KERNEL_OPEN_FILE_KIND_REGULAR:
+    case KERNEL_OPEN_FILE_KIND_FS_CONTEXT:
     case KERNEL_OPEN_FILE_KIND_BPF:
     case KERNEL_OPEN_FILE_KIND_INOTIFY:
     case KERNEL_OPEN_FILE_KIND_MQUEUE:
@@ -1499,7 +1506,8 @@ uint32_t kernel_open_file_poll(
         return KERNEL_POLLNVAL;
     }
     KERNEL_SERVICE_SCOPE_IF(service, kernel_open_file_poll_requires_cpu0(file));
-    if (file->device) return file->device->poll ? file->device->poll(file->device_instance, kernel_open_file_flags(file), requested_events, out_queue) : 0U;
+    if (file->device) return file->device->poll ? file->device->poll(file->device_instance, kernel_open_file_flags(file), requested_events, out_queue) :
+        KERNEL_POLLIN|KERNEL_POLLOUT|KERNEL_POLLRDNORM|KERNEL_POLLWRNORM;
     switch (file->kind) {
     case KERNEL_OPEN_FILE_KIND_MQUEUE:
         return kernel_mqueue_poll(file,requested_events,out_queue);

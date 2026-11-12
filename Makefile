@@ -323,6 +323,7 @@ COMMON_C_SOURCES := \
 	fs/signal_fd.c \
 	fs/files/socket.c \
 	fs/fs_context.c \
+	fs/mount_context.c \
 	fs/char_device.c \
 	fs/tty.c \
 	fs/devpts.c \

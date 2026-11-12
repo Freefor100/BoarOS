@@ -40,4 +40,5 @@ void *kernel_devpts_mount_private(const struct kernel_vfs_mount *mount);
 void kernel_devpts_mount_set_private(struct kernel_vfs_mount *mount,
     void *private_data);
 
+int kernel_devpts_check_mount_parameter(const char *,const char *);
 #endif

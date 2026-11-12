@@ -69,3 +69,5 @@ mounts与mountinfo共用一次拓扑快照，捕获时分别持有进程根和�
 ## BPF 状态
 
 `/proc/filesystems` 包含实际可挂载的 bpf、tracefs 和 sysfs。BPF/perf FD 的链接名与 fdinfo 来自对象快照，程序、map、BTF 和 link ID 对应仍存活的对象；共享 map 的 maps 行使用其 OFD 来源。`/proc/sys/kernel/unprivileged_bpf_disabled` 提供实际权限策略，取值与写入规则见 [BPF 模块](kernel-bpf.md#对象接口与权限)。
+
+`fsopen`与`fspick`的配置FD在fd目录显示为`anon_inode:[fscontext]`；fstat采用共享匿名inode的模式，fstatfs报告匿名inode文件系统。它不提供VFS路径，不能通过该FD绕过路径解析取得挂载树。挂载视图FD与命名空间FD仍沿各自真实对象展示，生命周期见[VFS挂载上下文](vfs-ext4.md#挂载树-fd-与根切换)。

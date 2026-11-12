@@ -323,6 +323,44 @@ enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *h
     if (allocation_fail_at && ++allocation_calls==allocation_fail_at) return KERNEL_HEAP_STATUS_EMPTY;
     return __real_kernel_heap_allocate_zeroed(h,n,size,out);
 }
+static void created_tree_failures(struct kernel_vfs_mount *parent)
+{
+    for(unsigned fail=0;fail<10;fail++){
+        struct kernel_heap_statistics before,after;kernel_heap_get_statistics(&heap,&before);
+        struct kernel_vfs_mount *mount=NULL;struct kernel_vfs_path *root=NULL;
+        assert(!kernel_tmpfs_create(&heap,0,NULL,&mount));
+        allocation_calls=0;allocation_fail_at=fail;
+        int error=kernel_vfs_detach_created_mount(mount,&heap,1,&root);
+        allocation_fail_at=0;
+        if(error){assert(error==-KERNEL_ENOMEM&&!root&&!mount->root_path);assert(!kernel_vfs_unmount(mount));}
+        else {assert(root&&mount->root_path==root&&mount->detached_tree);kernel_vfs_close_tree(mount);assert(!kernel_vfs_path_release(&root));}
+        assert(!kernel_vfs_reap_mounts());kernel_heap_get_statistics(&heap,&after);
+        assert(before.live_allocations==after.live_allocations);
+    }
+    for(unsigned fail=0;fail<4;fail++){
+        struct kernel_heap_statistics before,after;kernel_heap_get_statistics(&heap,&before);
+        struct kernel_vfs_mount *mount=NULL;struct kernel_vfs_path *root=NULL;
+        struct kernel_open_file_description *file=NULL;
+        assert(!kernel_tmpfs_create(&heap,0,NULL,&mount)&&!kernel_vfs_detach_created_mount(mount,&heap,1,&root));
+        allocation_calls=0;allocation_fail_at=fail;
+        int error=kernel_mount_namespace_take_tree(&root,&heap,&file);
+        allocation_fail_at=0;
+        if(error){assert(error==-KERNEL_ENOMEM&&!file);if(root){kernel_vfs_close_tree(mount);assert(!kernel_vfs_path_release(&root));}}
+        else {assert(!root&&file&&!kernel_open_file_release(&file));}
+        assert(!kernel_vfs_reap_mounts());kernel_heap_get_statistics(&heap,&after);
+        assert(before.live_allocations==after.live_allocations);
+    }
+    struct kernel_vfs_path *parent_root=NULL,*target=NULL,*created=NULL;
+    struct kernel_vfs_mount *mount=NULL;
+    assert(!kernel_vfs_path_root(parent,&heap,&parent_root));
+    assert(!kernel_vfs_path_resolve(parent_root,parent_root,"/file",1,&target));
+    assert(!kernel_tmpfs_create(&heap,0,NULL,&mount)&&!kernel_vfs_detach_created_mount(mount,&heap,1,&created));
+    assert(kernel_vfs_move_mount(created,target,0)==-KERNEL_EINVAL&&mount->detached_tree&&!target->mounted_here);
+    kernel_vfs_close_tree(mount);
+    assert(!kernel_vfs_path_release(&created)&&!kernel_vfs_path_release(&target)&&!kernel_vfs_path_release(&parent_root));
+    assert(!kernel_vfs_reap_mounts());
+    puts("PASS created-tree: root/namespace allocation failures and invalid target preserve ownership");
+}
 static void mount_view_tree(struct kernel_vfs_mount *mount)
 {
     struct kernel_vfs_path *root=0,*source=0,*nested=0,*covered=0,*path=0,*copy=0,*tree=0,*held=0;
@@ -762,7 +800,8 @@ int main(int argc,char **argv)
     struct kernel_vfs_mount *mount=0;struct kernel_open_file_description *file=0;
     assert(!kernel_tmpfs_create(&heap,0,"nr_blocks=8",&mount));mount->noexec=mount->nodev=1;
     opened(mount,"/file",0755,&file);file->open_flags=2;
-    if(!strcmp(argv[1],"pivot-owner"))mount_pivot_owner();
+    if(!strcmp(argv[1],"created-tree"))created_tree_failures(mount);
+    else if(!strcmp(argv[1],"pivot-owner"))mount_pivot_owner();
     else if(!strcmp(argv[1],"mount-api"))mount_tree_api(mount);
     else if(!strcmp(argv[1],"propagation"))mount_propagation(mount);
     else if(!strcmp(argv[1],"atime"))atime_policy(mount,&file->file);

@@ -1072,7 +1072,7 @@ static int clone_one_view(struct kernel_vfs_mount *source,struct kernel_vfs_dent
     mount->dynamic_view=1;mount->references=1;mount->root_dentry=root;
     {
         KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
-        if (instance->mount_views==UINT32_MAX || dentry_acquire(root)) __builtin_trap();
+        if (instance->mount_views==UINT32_MAX || (root && dentry_acquire(root))) __builtin_trap();
         instance->mount_views++;
         mount->instance_next=instance->views;mount->instance_previous=&instance->views;
         if (mount->instance_next) mount->instance_next->instance_previous=&mount->instance_next;
@@ -1322,6 +1322,47 @@ int kernel_vfs_mount_attach(struct kernel_vfs_mount *mount,struct kernel_vfs_pat
     return mount_attach_one(mount,covered);
 }
 
+int kernel_vfs_detach_created_mount(struct kernel_vfs_mount *mount,struct kernel_heap *heap,uint64_t origin,
+    struct kernel_vfs_path **owner)
+{
+    KERNEL_LOCK_SCOPE(topology);mount_topology_lock(&topology);
+    if(mount->root_path){if(kernel_vfs_path_acquire(mount->root_path))__builtin_trap();*owner=mount->root_path;}
+    else {
+        int error=kernel_vfs_path_root(mount,heap,owner);if(error)return error;
+        mount->root_path=*owner;
+        if(kernel_vfs_path_acquire(*owner))__builtin_trap();
+        mount->detached_tree=1;
+    }
+    mount->detached_origin=origin;
+    return 0;
+}
+int kernel_vfs_reuse_block_tree(uint64_t device,const char *type,int read_only,int exclusive,
+    struct kernel_heap *heap,uint64_t origin,struct kernel_vfs_path **owner)
+{
+    KERNEL_SERVICE_SCOPE(service);
+    KERNEL_LOCK_SCOPE(topology);mount_topology_lock(&topology);
+    /* Mount creation/retirement is serialized here. The new view pins the
+     * instance before root loading or statfs may sleep. Never create a second
+     * cache/journal for a device that already has a live filesystem. */
+    for(struct kernel_vfs_instance *i=active_instances;i;i=i->active_next){
+        struct kernel_block_device *block=i->ops->block_device?i->ops->block_device(i):NULL;
+        if(!block || block->device_number!=device)continue;
+        if(exclusive || i->quiescing || !i->views || !!i->read_only!=read_only)return -KERNEL_EBUSY;
+        struct kernel_vfs_mount *copy=NULL;
+        int error=clone_one_view(i->views,NULL,0,&copy);
+        if(error)return error;
+        error=kernel_vfs_detach_created_mount(copy,heap,origin,owner);
+        if(error){discard_staged_mount(copy);return error;}
+        copy->propagation_staged=0;
+        struct kernel_vfs_statfs stat;
+        error=kernel_vfs_mount_statfs(copy,&stat);
+        uint64_t expected=!strcmp(type,"ext4")?UINT64_C(0xef53):UINT64_C(0x4d44);
+        if(!error && stat.type!=expected)error=-KERNEL_EBUSY;
+        if(error){kernel_vfs_close_tree(copy);if(kernel_vfs_path_release(owner))__builtin_trap();}
+        return error;
+    }
+    return 1;
+}
 int kernel_vfs_clone_tree(struct kernel_vfs_path *source,int recursive,struct kernel_vfs_path **owner)
 {
     KERNEL_LOCK_SCOPE(topology);mount_topology_lock(&topology);
@@ -4681,7 +4722,7 @@ observe:
     return result;
 }
 
-int kernel_vfs_remount(struct kernel_vfs_path *root, uint64_t flags, const char *options)
+int kernel_vfs_mount_reconfigure(struct kernel_vfs_path *root,uint64_t flags,uint64_t mask,const char *options)
 {
     if (!kernel_vfs_path_is_mount_root(root)) return -KERNEL_EINVAL;
     if (options && *options) return -KERNEL_ENOTSUP;
@@ -4691,7 +4732,7 @@ int kernel_vfs_remount(struct kernel_vfs_path *root, uint64_t flags, const char 
     KERNEL_LOCK_SCOPE(configuration);
     kernel_rwlock_write(&instance->reconfiguration,&configuration);
     if (instance->quiescing) return -KERNEL_EIO;
-    int read_only=!!(flags&1U), result=0;
+    int read_only=(mask&1U)?!!(flags&1U):instance->read_only, result=0;
     if (flags & 4096U) {
         KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
         if (read_only && !mount->read_only && mount->write_openers) return -KERNEL_EBUSY;
@@ -4718,13 +4759,21 @@ int kernel_vfs_remount(struct kernel_vfs_path *root, uint64_t flags, const char 
     }
     {
         KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
-        instance->read_only=read_only;mount->read_only=read_only;
-        mount->atime_policy=kernel_vfs_atime_policy(flags,mount->atime_policy,1);
-        mount->nosuid=!!(flags&2U);mount->nodev=!!(flags&4U);mount->noexec=!!(flags&8U);
-        mount->silent=!!(flags&32768U);
+        instance->read_only=read_only;
+        /* fsconfig changes the instance; legacy remount also changes this
+         * mount view. A view's explicit RDONLY must survive a later fsconfig rw. */
+        if(mask==UINT64_MAX){
+            mount->read_only=read_only;
+            mount->atime_policy=kernel_vfs_atime_policy(flags,mount->atime_policy,1);
+            mount->nosuid=!!(flags&2U);mount->nodev=!!(flags&4U);mount->noexec=!!(flags&8U);
+            mount->silent=!!(flags&32768U);
+        }
     }
     return 0;
 }
+
+int kernel_vfs_remount(struct kernel_vfs_path *root,uint64_t flags,const char *options)
+{ return kernel_vfs_mount_reconfigure(root,flags,UINT64_MAX,options); }
 
 static struct kernel_vfs_mount *sync_view_pin(struct kernel_vfs_instance *instance)
 {

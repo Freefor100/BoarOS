@@ -437,7 +437,7 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
         if (syscall_handle_setns(caller,request,&decoded)!=KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_MOUNT || request->number==41 ||
-               request->number==428 || request->number==429 || request->number==442 ||
+               request->number==428 || request->number==429 || (request->number>=430 && request->number<=433) || request->number==442 ||
                request->number == LINUX_SYSCALL_UMOUNT2) {
         if (syscall_handle_mount(caller, request, &decoded,
                 request->number == LINUX_SYSCALL_UMOUNT2) !=
