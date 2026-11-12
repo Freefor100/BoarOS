@@ -231,7 +231,7 @@ O_DIRECT等缺口按内核能力处理；CPU-time sleep及RLIMIT_CPU已接入，
 
 | 项目 | 实际问题 | 当前状态／依据 |
 |---|---|---|
-| `madvise01`的扩展建议 | 10月25日原程序中五种基础操作及DONTFORK/DOFORK、WIPEONFORK/KEEPONFORK通过；其余11种建议返回EINVAL，原程序记TCONF。 | 当时四配置各9/20，见[原结果](oscomp-ltp-analysis.md#madvise与shm锁定原程序结果2026-10-25)。之后实现 REMOVE 和匿名 FREE；原程序定向重跑四配置均 **11/20**，11项通过、9项TCONF，FREE实际通过。dump策略、KSM/大页、COLD/PAGEOUT仍是功能缺口。 |
+| `madvise01`的扩展建议 | 10月25日原程序中五种基础操作及DONTFORK/DOFORK、WIPEONFORK/KEEPONFORK通过；其余11种建议返回EINVAL，原程序记TCONF。 | 当时四配置各9/20，见[原结果](oscomp-ltp-analysis.md#madvise与shm锁定原程序结果2026-10-25)。之后实现 REMOVE 和匿名 FREE；原程序定向重跑四配置均 **11/20**，11项通过、9项TCONF，FREE实际通过。DONTDUMP/DODUMP随后已接入VMA策略，但尚无core文件写出；KSM/大页、COLD/PAGEOUT仍是功能缺口。本轮不重跑原madvise01，保留上述历史得分。 |
 | `madvise02`的WILLNEED/EBADF项 | 固定源码`tcases_filter()`因历史swap-prefetch变更主动将该条标为skip，与这次实际syscall结果无关。 | 四配置12/13。另有FREE、KSM、WIPEONFORK等负向输入得到EINVAL；这些TPASS仅验证该输入的错误，不表示正向操作已实现。[固定源码](https://github.com/linux-test-project/ltp/blob/20240524/testcases/kernel/syscalls/madvise/madvise02.c)。 |
 | 自有WILLNEED对照的swap配置 | 固定Linux在CONFIG_SWAP=n时对普通匿名/纯BSS的WILLNEED返回EBADF；LA原platform参考为SWAP=y，RV及BoarOS无swap，首次LA对照因此结果不同。 | madvise消费者使用独立`platform-noswap`的16 KiB LA参考缓存，保留原platform。不是替换官方libc/ELF，也不改变原测例判分。真实文件缓存装入、无PTE与最后unmap/close握手另有直接检查。 |
 | `shmctl01`的枚举前置查询 | 原先在`get_shm_idx_from_id()`的SHM_INFO(14)返回EINVAL；INFO/STAT/ANY和最高槽返回值已接入。 | 第一阶段四配置均进入主体并12/12通过；包含20个子进程的附加、解除和fork统计。STAT_ANY及槽复用另由直接消费者验证，见[本阶段结果](oscomp-ltp-analysis.md#fork策略与shm查询原程序结果2026-10-25)。[固定源码](https://github.com/linux-test-project/ltp/blob/20240524/testcases/kernel/syscalls/ipc/shmctl/shmctl01.c)。 |
@@ -245,6 +245,20 @@ O_DIRECT等缺口按内核能力处理；CPU-time sleep及RLIMIT_CPU已接入，
 ## 原盘futex覆盖范围
 
 2026-10-25核对RV/LA、glibc/musl四份发布目录：均有普通WAIT/WAKE、CMP_REQUEUE、BITSET和waitv程序，没有独立的LOCK_PI／UNLOCK_PI测例。因此原`futex_wait01/wake01/cmp_requeue01`的17/17用于普通路径回归；新增PI mutex的功能依据来自两架构直接程序、libc的PTHREAD_PRIO_INHERIT消费者及固定Linux差分。原ELF与判分保持原样，结果见[本批futex结果](oscomp-ltp-analysis.md#pi-mutex接入后的原futex短例2026-10-25)。该批未实现的waitv已在后续多地址等待阶段接入，原程序的版本检查结果见上表。
+
+## 自有挂载命名空间差分夹具的根挂载
+
+API8 的 LA Linux 参考原先从 initramfs 启动，将 ext4 挂在 `/root`，再由监督程序
+chroot 后执行消费者。`setns` 加入挂载命名空间时，固定 Linux 的 `mntns_install`
+会把进程根切到该命名空间的根挂载，即 initramfs，而不是先前的 ext4 chroot。
+因此传播消费者在 setns 后访问 `/mp/...` 得到 ENOENT；这属于本地差分夹具的
+根挂载模型不一致，不是 BoarOS 挂载传播错误，也不是官方 LTP 输入问题。
+
+API8 现统一使用 `root=/dev/vda init=/supervisor` 直接从 ext4 根盘启动两架构的
+Linux 参考，复用既有 `ROOT_DIRECT_FILESYSTEM` 监督入口。使用同一 ELF 的
+九项传播消费者已在两架构 Linux 与 BoarOS 通过，包含命名空间切换及源任务退出后
+通过保留的命名空间 FD 加入。原评测 ELF、libc、输入盘、judge 和监督参数未修改；
+此处调整仅用于自有 API8 功能差分。
 
 ## 自有调度查询差分夹具的并发假设
 
