@@ -47,7 +47,7 @@ int main(void)
         CHECK(count && feof(selection) && !fclose(selection));
     }
     int network=0;
-    for(unsigned i=0;i<count;i++)network|=!strcmp(programs[i],"/mmsg");
+    for(unsigned i=0;i<count;i++)network|=!strcmp(programs[i],"/mmsg") || !strcmp(programs[i],"/splice");
     if(network) {
     int fd=socket(AF_INET,SOCK_DGRAM,0);CHECK(fd>=0);
     struct ifreq interface={0};strcpy(interface.ifr_name,"lo");

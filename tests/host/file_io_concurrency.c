@@ -17,6 +17,7 @@
 #include <kernel/irq.h>
 #include "../../fs/files/private.h"
 #include "../../fs/open_file_internal.h"
+#include "../../fs/pipe_internal.h"
 #include "../../fs/vfs_internal.h"
 #include "../../fs/vfs_objects.h"
 #include "../../kernel/sched/private.h"
@@ -118,6 +119,8 @@ static void tcp_wait_locking(struct kernel_rwlock *);
 static int tcp_batch_unpinning(struct kernel_mm_user_pin *);
 static void tcp_batch_unpinned(struct kernel_mm_user_pin *);
 #endif
+static struct kernel_wait_queue *vmsplice_wait_queue;
+static unsigned vmsplice_wait_registered;
 enum kernel_scheduler_status __real_kernel_wait_prepare(struct kernel_wait_queue *,uint64_t,int,struct kernel_wait_token *);
 enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue *queue,
     uint64_t deadline,int interruptible,struct kernel_wait_token *token)
@@ -127,6 +130,7 @@ enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue
     tcp_wait_preparing(queue);
 #endif
     enum kernel_scheduler_status status=__real_kernel_wait_prepare(queue,deadline,interruptible,token);
+    if (!status && queue==vmsplice_wait_queue)__atomic_store_n(&vmsplice_wait_registered,1,__ATOMIC_RELEASE);
     if (!status && interruptible && futex_role==1)
         __atomic_store_n(&futex_registered,1,__ATOMIC_RELEASE);
 #ifdef TCP_IO_CASES
@@ -1513,6 +1517,50 @@ static void borrowed_page_case(struct physical_page_allocator *pages)
 #ifdef TCP_IO_CASES
 #include "tcp_usercopy_cases.h"
 #endif
+struct vmsplice_call {struct kernel_files *files;int64_t result;unsigned done;};
+static void *vmsplice_blocked_call(void *argument)
+{
+    struct vmsplice_call *call=argument;mm_test_attach(1);mm_test_bind(&mm);mm_test_bind_files(call->files);mm_test_context=context;
+    assert(!kernel_files_vmsplice(call->files,&mm,1,0x200000,1,0,&call->result));
+    __atomic_store_n(&call->done,1,__ATOMIC_RELEASE);mm_test_finish();return NULL;
+}
+static void transfer_cases(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
+{
+    struct kernel_files local={0};struct kernel_pipe *pipe=NULL;
+    struct kernel_open_file_description *reader=NULL,*writer=NULL,*target=NULL;
+    assert(!kernel_files_create(&local,heap) && !kernel_pipe_create(heap,&pipe));
+    assert(!kernel_open_file_create_pipe(heap,pipe,KERNEL_PIPE_ENDPOINT_READ,0,&reader) &&
+        !kernel_open_file_create_pipe(heap,pipe,KERNEL_PIPE_ENDPOINT_WRITE,KERNEL_FILES_O_NONBLOCK,&writer));
+    assert(!kernel_files_install_new_owned_at(&local,0,0,&reader) && !kernel_files_install_new_owned_at(&local,1,0,&writer));
+    assert(kernel_pipe_capacity(pipe,1031,BOAROS_PAGE_SIZE)==BOAROS_PAGE_SIZE);
+    unsigned char *fill=malloc(BOAROS_PAGE_SIZE);assert(fill);memset(fill,0x58,BOAROS_PAGE_SIZE);
+    struct kernel_pipe_result written;assert(!kernel_pipe_write_buffer(pipe,fill,BOAROS_PAGE_SIZE,1,&written) && written.bytes==BOAROS_PAGE_SIZE);
+    size_t copied;assert(!kernel_copy_to_user(&mm,0x100000,"V",1,&copied) && copied==1);
+    struct kernel_uaccess_iovec iov={0x100000,1};assert(!kernel_copy_to_user(&mm,0x200000,&iov,sizeof(iov),&copied) && copied==sizeof(iov));
+    int64_t result;assert(!kernel_files_vmsplice(&local,&mm,1,0x200000,1,2,&result) && result==-KERNEL_EAGAIN);
+    vmsplice_wait_queue=&pipe->write_queue;vmsplice_wait_registered=0;
+    struct vmsplice_call call={.files=&local};pthread_t worker;assert(!pthread_create(&worker,NULL,vmsplice_blocked_call,&call));
+    while (!__atomic_load_n(&vmsplice_wait_registered,__ATOMIC_ACQUIRE) && !__atomic_load_n(&call.done,__ATOMIC_ACQUIRE))sched_yield();
+    assert(vmsplice_wait_registered && "FD NONBLOCK does not replace vmsplice flags");
+    assert(!kernel_files_read(&local,&mm,0,0x200000,BOAROS_PAGE_SIZE,&result) && result==BOAROS_PAGE_SIZE);
+    assert(!pthread_join(worker,NULL) && call.result==1);vmsplice_wait_queue=NULL;
+    assert(!kernel_files_read(&local,&mm,0,0x200000,1,&result) && result==1 &&
+        !kernel_copy_from_user(&mm,fill,0x200000,1,&copied) && copied==1 && fill[0]=='V');
+    int error;assert(!kernel_open_file_create_mode(heap,mount,"/splice-sync",0600,&target,&error) && !error);
+    target->open_flags=2|KERNEL_FILES_O_SYNC;assert(!kernel_vfs_file_acquire_write(&target->file));
+    struct kernel_open_file_description *slot=target;assert(!kernel_files_install_new_owned_at(&local,2,0,&slot));
+    assert(!kernel_files_lseek(&local,2,1,0,&result) && result==1);
+    assert(!kernel_pipe_write_buffer(pipe,"sync",4,1,&written) && written.bytes==4);
+    write_sync_file=&target->file;write_sync_calls=0;write_sync_fail=1;
+    assert(!kernel_files_splice(&local,&mm,0,0,2,0,4,0,&result) && result==-KERNEL_EIO && pipe->bytes==4 && target->offset==1);
+    assert(write_sync_calls==1 && write_sync_start==1 && write_sync_end==5 && !write_sync_data);
+    unsigned char actual[4];assert(!kernel_open_file_pread(target,1,actual,4,&copied) && copied==4 && !memcmp(actual,"sync",4));
+    write_sync_fail=0;write_sync_calls=0;
+    assert(!kernel_files_splice(&local,&mm,0,0,2,0,4,0,&result) && result==4 && !pipe->bytes && target->offset==5 && write_sync_calls==1);
+    write_sync_file=NULL;assert(!kernel_files_release(&local));free(fill);
+    sendfile_pipe_case(heap,mount);cached_copy_case(heap,mount);
+    puts("PASS transfer core: vmsplice flags override FD blocking, one-time iovec import, sync EIO retains pipe/position and accepted file data; sendfile/copy reuse");
+}
 struct advice_close_call { struct kernel_files *files; int64_t result; };
 static void *advice_close_thread(void *argument)
 {
@@ -1618,7 +1666,8 @@ int main(int argc,char **argv)
     initialize(&pages,&heap,arena,sizeof(arena)); initialize(&backend_pages,&backend_heap,backend,sizeof(backend));
     uint64_t baseline=physical_page_available(&pages),backend_baseline=physical_page_available(&backend_pages);
     int advice_only=getenv("FILE_IO_ADVICE_ONLY")!=NULL;
-    int focused=advice_only || getenv("FILE_IO_VECTORS_ONLY")!=NULL;
+    int transfers_only=getenv("FILE_IO_TRANSFERS_ONLY")!=NULL;
+    int focused=advice_only || transfers_only || getenv("FILE_IO_VECTORS_ONLY")!=NULL;
     if (!focused) {
     borrowed_page_case(&pages);
     namespace_retiring_mount_case(&heap);
@@ -1678,7 +1727,8 @@ int main(int argc,char **argv)
     assert(!kernel_block_register(&disk,KERNEL_BLOCK_DEVICE_NUMBER(101)));
     struct kernel_vfs_mount mount={0}; assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,&cache,0));
     assert(!kernel_vfs_start_journal_worker(&mount));
-    if (advice_only) file_advice_case(&heap,&mount,&cache);
+    if (transfers_only) transfer_cases(&heap,&mount);
+    else if (advice_only) file_advice_case(&heap,&mount,&cache);
     else if (focused) synchronous_write_ranges(&heap,&mount);
     else {
     cached_copy_case(&heap,&mount);

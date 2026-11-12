@@ -32,21 +32,8 @@ static inline enum kernel_uaccess_status pin_user_prefix(
     struct kernel_mm *mm,uint64_t address,uint64_t second,uint32_t access,
     struct kernel_mm_user_pin *pin,unsigned *count)
 {
-    COST_ADD(USER_RESOLUTIONS, 1); COST_IO_ADD(4, 1);
-    enum kernel_mm_status status;
-    for (;;) {
-        status=count?kernel_mm_pin_user_pair(mm,address,second,access,pin,count):
-            kernel_mm_pin_user_page(mm,address,access,pin);
-        if (status!=KERNEL_MM_STATUS_NOT_MAPPED && status!=KERNEL_MM_STATUS_ACCESS) break;
-        status = kernel_mm_resolve_user_fault(mm, address, access);
-        if (status != KERNEL_MM_STATUS_OK) break;
-        /* fault归还临时写许可后，快照可再次撤W。最终pin才接纳复制；
-         * 重做fault会复查真实VMA/EOF，CONFLICT与真实撤权都不忙等。 */
-    }
-    if (status == KERNEL_MM_STATUS_OK) {
-        if (count) { COST_ADD(USER_RESOLUTIONS,1); COST_IO_ADD(4,1); }
-        return KERNEL_UACCESS_STATUS_OK;
-    }
+    enum kernel_mm_status status=kernel_uaccess_pin_resolved(mm,address,second,access,pin,count);
+    if(status==KERNEL_MM_STATUS_OK)return KERNEL_UACCESS_STATUS_OK;
     if (status == KERNEL_MM_STATUS_NOT_MAPPED || status == KERNEL_MM_STATUS_ACCESS ||
         status == KERNEL_MM_STATUS_ADDRESS_SPACE || status == KERNEL_MM_STATUS_BUS_FAULT ||
         status == KERNEL_MM_STATUS_NO_MEMORY) return KERNEL_UACCESS_STATUS_FAULT;

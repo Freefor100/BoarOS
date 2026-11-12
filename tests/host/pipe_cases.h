@@ -4,6 +4,7 @@
 #include <kernel/errno.h>
 #include <kernel/irq.h>
 #include <string.h>
+#include <stdlib.h>
 extern _Thread_local uint64_t mm_test_context;
 extern struct kernel_raw_lock kernel_wait_domain;
 #define PIPE_SOURCE UINT64_C(0x100000)
@@ -395,6 +396,76 @@ static void user_pipe_last_close(struct kernel_heap *heap)
 }
 
 #include "pipe_capacity_cases.h"
+static uint64_t splice_oom_address;
+enum kernel_mm_status __real_kernel_mm_resolve_user_fault(struct kernel_mm *,uint64_t,uint32_t);
+enum kernel_mm_status __wrap_kernel_mm_resolve_user_fault(struct kernel_mm *mm,uint64_t address,uint32_t access)
+{
+    if(splice_oom_address && (address&~BOAROS_PAGE_MASK)==splice_oom_address)return KERNEL_MM_STATUS_NO_MEMORY;
+    return __real_kernel_mm_resolve_user_fault(mm,address,access);
+}
+struct pipe_link_actor {struct kernel_pipe *in,*out;unsigned id;int64_t result;pthread_barrier_t *start;};
+static void *pipe_link_thread(void *argument)
+{
+    struct pipe_link_actor *actor=argument;pipe_bind(actor->id,0);
+    pthread_barrier_wait(actor->start);unsigned broken=0;
+    actor->result=kernel_pipe_link(actor->in,actor->out,32,0,1,&broken);assert(!broken);
+    mm_test_bind(0);mm_test_context=0;return 0;
+}
+static void pipe_splice_pages_case(struct kernel_heap *heap)
+{
+    struct kernel_pipe *a=0,*b=0;
+    assert(!kernel_pipe_create(heap,&a) && !kernel_pipe_create(heap,&b) &&
+        !kernel_pipe_acquire_endpoint(a,KERNEL_PIPE_ENDPOINT_BOTH) && !kernel_pipe_acquire_endpoint(b,KERNEL_PIPE_ENDPOINT_BOTH));
+    unsigned char *bytes=malloc(BOAROS_PAGE_SIZE);assert(bytes);memset(bytes,0xa1,BOAROS_PAGE_SIZE);
+    struct kernel_pipe_result wrote;assert(!kernel_pipe_write_buffer(a,bytes,BOAROS_PAGE_SIZE,1,&wrote) && wrote.bytes==BOAROS_PAGE_SIZE);
+    uint64_t physical;uint32_t references;
+    assert(heap->physical_address(a->buffers[a->head].page,&physical) &&
+        !physical_page_reference_count(heap->page_allocator,physical,&references) && references==1);
+    unsigned broken=0;
+    assert(kernel_pipe_link(a,b,17,0,0,&broken)==17 && !broken &&
+        a->buffers[a->head].page==b->buffers[b->head].page && !b->buffers[b->head].can_merge &&
+        !physical_page_reference_count(heap->page_allocator,physical,&references) && references==2);
+    struct kernel_uaccess_iovec out={PIPE_TARGET,BOAROS_PAGE_SIZE};int64_t got;size_t done;
+    assert(!kernel_pipe_readv(a,&domain_mm,&out,1,BOAROS_PAGE_SIZE,0,&got) && got==BOAROS_PAGE_SIZE &&
+        !physical_page_reference_count(heap->page_allocator,physical,&references) && references==1);
+    uint64_t free_before=physical_page_available(heap->page_allocator);
+    assert(!kernel_pipe_readv(b,&domain_mm,&out,1,17,0,&got) && got==17 &&
+        physical_page_available(heap->page_allocator)==free_before+1);
+    uint64_t address;
+    assert(!kernel_mm_mmap_anonymous(&domain_mm,PIPE_SOURCE+32*BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED_NOREPLACE,&address));
+    splice_oom_address=address;
+    struct kernel_uaccess_iovec missing={address,1};
+    assert(kernel_pipe_vmsplice(a,&domain_mm,&missing,1,1,0,&broken)==-KERNEL_ENOMEM && !broken && !a->bytes);
+    struct kernel_uaccess_iovec prefix[]={{PIPE_SOURCE,19},{address,1}};
+    assert(kernel_pipe_vmsplice(a,&domain_mm,prefix,2,20,0,&broken)==19 && !broken);
+    assert(!kernel_pipe_readv(a,&domain_mm,&out,1,19,0,&got) && got==19);
+    splice_oom_address=0;assert(!kernel_mm_munmap(&domain_mm,address,BOAROS_PAGE_SIZE));
+    struct kernel_mm_user_pin pin={0};assert(!kernel_mm_pin_user_page(&domain_mm,PIPE_SOURCE,KERNEL_MM_READ,&pin));
+    physical=pin.physical_address;void *source=pin.page;kernel_mm_unpin_user_page(&pin);
+    assert(!physical_page_reference_count(heap->page_allocator,physical,&references));uint32_t original=references;
+    struct kernel_uaccess_iovec from={PIPE_SOURCE+7,19};
+    assert(kernel_pipe_vmsplice(a,&domain_mm,&from,1,19,0,&broken)==19 && !broken &&
+        a->buffers[a->head].page==source && a->buffers[a->head].offset==7 && !a->buffers[a->head].can_merge &&
+        !physical_page_reference_count(heap->page_allocator,physical,&references) && references==original+1);
+    assert(!kernel_pipe_readv(a,&domain_mm,&out,1,19,0,&got) && got==19 &&
+        !physical_page_reference_count(heap->page_allocator,physical,&references) && references==original);
+    assert(!kernel_pipe_write_buffer(a,bytes,BOAROS_PAGE_SIZE,1,&wrote) && wrote.bytes==BOAROS_PAGE_SIZE);
+    memset(bytes,0xb2,BOAROS_PAGE_SIZE);assert(!kernel_pipe_write_buffer(b,bytes,BOAROS_PAGE_SIZE,1,&wrote) && wrote.bytes==BOAROS_PAGE_SIZE);
+    pthread_barrier_t start;assert(!pthread_barrier_init(&start,0,3));pthread_t tasks[2];
+    struct pipe_link_actor actors[]={{a,b,1,0,&start},{b,a,2,0,&start}};
+    for(unsigned i=0;i<2;i++)assert(!pthread_create(&tasks[i],0,pipe_link_thread,&actors[i]));
+    pthread_barrier_wait(&start);
+    for(unsigned i=0;i<2;i++)assert(!pthread_join(tasks[i],0) && actors[i].result==32);
+    assert(!pthread_barrier_destroy(&start));
+    for(unsigned side=0;side<2;side++) {
+        assert(!kernel_pipe_readv(side?b:a,&domain_mm,&out,1,BOAROS_PAGE_SIZE,0,&got) && got==BOAROS_PAGE_SIZE &&
+            !kernel_copy_from_user(&domain_mm,bytes,PIPE_TARGET,BOAROS_PAGE_SIZE,&done) && done==BOAROS_PAGE_SIZE);
+        for(unsigned i=0;i<BOAROS_PAGE_SIZE;i++)assert(bytes[i]==(i<BOAROS_PAGE_SIZE-32?(side?0xb2:0xa1):(side?0xa1:0xb2)));
+    }
+    assert(!kernel_pipe_release_endpoint(a,KERNEL_PIPE_ENDPOINT_BOTH) && !kernel_pipe_release_endpoint(b,KERNEL_PIPE_ENDPOINT_BOTH));
+    free(bytes);puts("PASS splice pages: real shared references, user-page loans, last release and simultaneous reverse transfers");
+}
 static void pipe_cases(struct kernel_heap *heap)
 {
     uint64_t address;
@@ -405,6 +476,7 @@ static void pipe_cases(struct kernel_heap *heap)
     assert(!kernel_copy_to_user(&domain_mm,PIPE_SOURCE,pipe_payload,KERNEL_PIPE_DEFAULT_CAPACITY+1,&done) && done==KERNEL_PIPE_DEFAULT_CAPACITY+1);
     pipe_capacity_case(heap);pipe_capacity_merge_case(heap);pipe_capacity_copy_case(heap);
     pipe_capacity_wake_case(heap);pipe_capacity_quota_case(heap);
+    pipe_splice_pages_case(heap);
     pipe_page_ownership_case(heap);pipe_copy_overlap_case(heap);pipe_merge_copy_case(heap);
     pipe_boundary_cases(heap); pipe_geometry_case(heap); pipe_tmpfs_buffer_case(heap);user_pipe_last_close(heap);
     pipe_packet_case(heap,2); pipe_packet_case(heap,4);

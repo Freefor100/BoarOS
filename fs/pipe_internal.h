@@ -105,6 +105,30 @@ enum kernel_pipe_status kernel_pipe_release_endpoint(
     uint32_t endpoint);
 
 /* I/O borrows numerically validated descriptors; copying checks user pages. */
+/* Copy qualification keeps a fixed published byte prefix and its pages alive. */
+struct kernel_pipe_read_borrow {
+    struct kernel_pipe *pipe;
+    struct kernel_lock_guard guard;
+    size_t length;
+    uint64_t cursor_position;
+    uint32_t cursor_slot;
+};
+int64_t kernel_pipe_read_begin(struct kernel_pipe *,size_t count,int nonblocking,
+    struct kernel_pipe_read_borrow *);
+void kernel_pipe_read_finish(struct kernel_pipe_read_borrow *,size_t consumed);
+void kernel_pipe_read_copy(struct kernel_pipe_read_borrow *,size_t offset,void *target,size_t count);
+void kernel_pipe_read_fragment(struct kernel_pipe_read_borrow *,size_t offset,const void **data,size_t *count);
+/* The writer owns this guard until finish. A successful push transfers one
+ * physical-page reference; shared pages never accept subsequent tail merging. */
+struct kernel_pipe_write_borrow { struct kernel_pipe *pipe; struct kernel_lock_guard guard; uint32_t slots; };
+int kernel_pipe_write_begin(struct kernel_pipe *,int nonblocking,struct kernel_pipe_write_borrow *);
+int kernel_pipe_push_page(struct kernel_pipe_write_borrow *,void *page,size_t offset,size_t length);
+void kernel_pipe_write_finish(struct kernel_pipe_write_borrow *);
+int64_t kernel_pipe_link(struct kernel_pipe *,struct kernel_pipe *,size_t count,
+    int nonblocking,int consume,unsigned *broken);
+int64_t kernel_pipe_vmsplice(struct kernel_pipe *,struct kernel_mm *,
+    const struct kernel_uaccess_iovec *,size_t count,uint64_t bytes,int nonblocking,unsigned *broken);
+
 enum kernel_pipe_status kernel_pipe_readv(
     struct kernel_pipe *pipe,
     struct kernel_mm *mm,

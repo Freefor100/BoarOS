@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the API8 callers in one guest per kernel, using identical ELF files."""
+"""Run selected user ABI callers on Linux and BoarOS using identical ELF files."""
 import sys
 from pathlib import Path
 sys.path[:0] = [str(Path(__file__).resolve().parent), str(Path(__file__).resolve().parents[1])]
@@ -24,6 +24,7 @@ SOURCES={'init':'resource/api8.c','fd_events':'resource/fd_events.c',
 LEGACY=tuple(name for name in SOURCES if name!='init')
 SOURCES['vectors_v2']='io/vectors_v2.c'
 SOURCES['file_advice']='io/file_advice.c'
+SOURCES['splice']='io/splice.c'
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -98,7 +99,7 @@ def accepted(raw,arch,cpus,target,selected=None):
     ends=[line for line in raw.replace('\r','').splitlines() if line.startswith('API8 END ')]
     expected=[f'API8 END /{name} status=0' for name in programs]
     known={'fd_events':['FD-EVENTS PASS'],'flock':['FLOCK-PASS'],
-           'file_advice':['ADVICE RESULT cases=3 failures=0'],'copy_range':['COPY_RANGE PASS'],'sched_query':['SCHED-QUERY END cases=7'],
+           'splice':['SPLICE PASS cases=9'],'file_advice':['ADVICE RESULT cases=3 failures=0'],'copy_range':['COPY_RANGE PASS'],'sched_query':['SCHED-QUERY END cases=7'],
            'icache':[f'ICACHE PASS cpus={cpus}'],
            'vectors_v2':[*(f'VECTORS2 CASE {name} PASS' for name in (
                'positions-libc-native-width','per-call-append-sync','vectors-errors-prefix',

@@ -4,7 +4,7 @@
 
 ## 对象与所有权
 
-`include/kernel/files.h` 是公共接口；`fs/files/table.c` 管槽位、引用及回收，`io.c` 管读写/定位/枚举，`path.c` 管打开与 stat，`metadata.c` 管显式时间和文件系统统计，`console.c` 管 UART 输入等待，`fs/char_device.c` 按类别登记字符设备操作、在 pin 的 VFS 上下文中取得实例，`fs/pipe.c` 管 pipe endpoint 与 ring，`include/kernel/fs_context.h` 和 `fs/fs_context.c` 管理根挂载与当前工作目录。文件表与 fs context 都从同一内核堆分配，并随用户 task 一起被 scheduler 接管：
+`include/kernel/files.h` 是公共接口；`fs/files/table.c` 管槽位、引用及回收，`io.c` 管普通读写/定位/枚举，`transfer.c` 管 sendfile、文件复制和管道搬运，`path.c` 管打开与 stat，`metadata.c` 管显式时间和文件系统统计，`console.c` 管 UART 输入等待，`fs/char_device.c` 按类别登记字符设备操作、在 pin 的 VFS 上下文中取得实例，`fs/pipe.c` 管 pipe endpoint 与 ring，`include/kernel/fs_context.h` 和 `fs/fs_context.c` 管理根挂载与当前工作目录。文件表与 fs context 都从同一内核堆分配，并随用户 task 一起被 scheduler 接管：
 
 - `kernel_files` 是进程可见的 fd 槽数组；槽保存 descriptor flags 和指向 open file description 的指针。
 - `kernel_open_file_description` 拥有一个 VFS file、当前 offset 和清理状态。分别打开同一路径会得到独立 description，因此 offset 互不影响。
@@ -213,7 +213,7 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 
 RV64 syscall 71 用内核有界复制支持 regular/tmpfs 输入，输出可为 regular、pipe、
 stream 或 datagram socket。输入、输出各有 OFD pin，正常或信号取消均沿保存的
-syscall 栈展开。stream socket 与 pipe 直接从取得引用的来源页复制到目标，
+syscall 栈展开。stream socket 从取得引用的来源页送入协议后备，pipe 直接借用来源页，
 不经过请求中转页；同一 task I/O 登记在正常返回、信号取消和退出回收时归还
 来源页引用。借用固定后备页寿命，不将来源变成不可修改的快照；TCP 在提交时
 仍 COPY 到协议自己持有至 ACK 的版本。tmpfs 稀疏洞只生成当前零片段，不为
@@ -235,9 +235,9 @@ OFD 的位置锁按 rank/key 排序，同一 OFD 或 dup alias 只取一个锁�
 不同，依据固定 Linux v7.2 的 `fs/read_write.c::do_sendfile`、`fs/splice.c`
 和 `generic_write_sync`。不改变 journal、必要 FLUSH 或 durable 条件。
 
-pipe 的内核来源片段不允许后继普通写并尾，普通 write/writev 的来源仍可合并。
-片段完全消费时清理 can_merge，复用时按新来源发布；数据仍在独立 pipe 缓冲中，
-不会借用可被普通写修改的文件页。这保护容量和等待语义，不能只检查内容复制成功。
+sendfile 的管道目标复用下述 splice 文件来源路径，借用真实缓存／内存页；稀疏内存文件的空洞使用临时零页，
+不为读取在源文件中分配存储。文件或用户来源的共享片段禁止后继普通 write 并尾；
+普通 write/writev 自有页仍可合并。片段消费后归还真实页引用，复用槽位时重新发布来源属性。
 
 ```sh
 python3 -B tests/userland/run.py --workload sendfile
@@ -247,8 +247,49 @@ make test-files-partial-write-riscv
 同一真实用户态探针检查位置、alias、错误顺序、传输后 offset fault、EOF/count
 上限、stream 短输出、datagram 边界和整包预算、pipe EINTR/EPIPE/SIGKILL，另有
 动态填满 pipe 后的来源组合回归。模块复用真实 FLUSH 错误，检查八种同步批次
-失败副作用；宿主、固定 RV64 Linux 与 BoarOS 证据见网络学习记录。输入特殊
-设备/proc 的 splice 能力及 splice 仍待扩展；管道容量已支持 F_GETPIPE_SZ/F_SETPIPE_SZ。
+失败副作用；宿主、固定 RV64 Linux 与 BoarOS 证据见网络学习记录。管道容量支持 F_GETPIPE_SZ/F_SETPIPE_SZ；特殊设备和 proc 来源见下节 splice 的方向能力。
+
+## `splice`、`tee` 与 `vmsplice`
+
+RV64／LA64 原生编号分别为75（vmsplice）、76（splice）、77（tee）。这三个入口与 sendfile、
+copy_file_range 共用 `fs/files/transfer.c` 的传输逻辑，固定实际 OFD 引用后再处理数据，
+不会通过反复调用 read/write syscall 搬运，也不临时更改共享 OFD 标志。
+
+- splice 至少一端必须是管道，支持文件→管道、管道→文件、管道→管道及已有 socket 数据路径。
+  文件来源包括 tmpfs/memfd、ext4、VFAT、块设备、proc快照／控制文件和明确开放该方向的字符设备。
+  /dev/zero 支持读写、/dev/null 只开放输出、随机设备沿现有读写能力执行；未开放方向返回具体错误。
+- tee 只接受两个不同管道，复制片段描述和页引用，源数据不消费。完整 splice 片段移交原引用；
+  部分片段及 tee 另取引用，禁止目标并尾，最后一个实际使用者结束后释放页面。
+- vmsplice 的可写 FD 把用户页接入管道，可读 FD 向用户 iovec 复制。先导入一份向量快照，最多1024项；
+  来源页在权限／缺页准备后取得独立物理引用，再归还临时 MM pin。解除映射、fork/COW及退出不使排队页失效。
+  缺页内存不足返回 ENOMEM，坏地址或权限失败返回 EFAULT；有进展时保留已完成前缀。
+
+接受 MOVE、NONBLOCK、MORE、GIFT。MOVE/GIFT是提示，不强制迁走物理页或撤销用户映射；共享页引用保证存储存活，
+调用者应遵守 Linux 对共享／赠予页面的修改约束。普通 pipe 写入不得把数据追加到这些共享页中。
+NONBLOCK控制管道等待，实际文件装入和socket收发保留后端规则；vmsplice只依据本次NONBLOCK标志决定等待，
+不把FD的O_NONBLOCK替代为调用标志。未知标志返回EINVAL。splice的零长度先返回0，tee先校验标志；
+vmsplice先检查标志、FD模式和向量，空向量可以在不访问管道数据时返回0。
+
+管道端不能提供offset指针，返回ESPIPE；两个普通文件或同一个管道返回EINVAL。普通文件的位置指针显式指定时
+不改变共享位置，未提供时在同一OFD位置资格内更新；字符设备按自身回调处理位置，读零或丢弃写入不累加offset。
+用户offset输出故障保留已发生的数据和消费副作用。封印、FSIZE／SIGXFSZ、set-ID／filecap清除使用共同文件写入过程。
+O_SYNC／O_DSYNC目标等待已写范围的固定同步目标：同步失败保留真实文件内容修改，但不提交本次管道消费和文件位置。
+
+管道片段资格在OFD位置、UNIX控制／引用图及文件写操作资格之前取得。等待管道数据或容量时不占文件位置；
+入口短快照保留Linux错误顺序，开始搬运时重新检查实际共享位置。一次读取固定已发布的输入前缀，
+输出接纳后统一消费，不在已有进度后重新等待其他读者留下的数据。跨管道按实际资格键排序，复制、分配、
+用户缺页和物理引用释放都在状态短保护外完成。普通read/readv及vmsplice读取也使用这一前缀借用。
+
+TCP与UNIX STREAM沿已有发送接纳和接收预约处理；信号中断后的正前缀不会再次重启。数据报／SEQPACKET输出
+按最多16个管道片段形成有界批次，复用暂存空间，保留消息消费、控制消息丢弃和发送预算规则。
+预先排队的UNIX FD控制记录由原网络机制归还，不把FD当作管道内容交付。管道搬运触发访问／修改通知，
+不会把普通FIFO read/write的时间戳更新强加给splice、tee或vmsplice。
+
+`python3 tests/userland/api8.py --program splice --program copy_range` 在固定Linux和BoarOS运行同一ELF，
+检查原始入口与libc包装、页共享／unmap、EFAULT、管道容量、offset输出故障、稀疏内存文件、字符设备、
+proc控制、FIFO时间戳、FSIZE、文件封印、TCP／UNIX控制消息、分段数据报及调用CPU。
+`tests/host/pipe-concurrency.sh`检查4/16KiB页的真实物理引用、OOM前缀、反向搬运和原管道并发契约；
+`FILE_IO_TRANSFERS_ONLY=1 tests/host/file-io-concurrency.sh`检查同步错误、vmsplice等待与共同文件复制路径。
 
 ## `copy_file_range`
 

@@ -44,6 +44,11 @@ enum kernel_files_status kernel_files_install_pair_reserved(
 enum kernel_files_status kernel_files_install_owned_locked(
     struct kernel_files *, uint32_t, uint32_t, struct kernel_open_file_description **);
 
+enum kernel_files_status kernel_files_release_io(struct kernel_files *,
+    struct kernel_open_file_description **, enum kernel_files_status);
+enum kernel_files_status kernel_files_pipe_result(int64_t bytes,unsigned broken);
+int kernel_files_description_writable(const struct kernel_open_file_description *);
+
 struct kernel_file_slot {
     struct kernel_open_file_description *description;
     uint32_t flags;

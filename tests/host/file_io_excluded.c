@@ -11,6 +11,7 @@ EXCLUDED(kernel_epoll_create)
 EXCLUDED(kernel_socket_copy_read)
 #ifndef TCP_IO_CASES
 EXCLUDED(kernel_socket_read_user)
+EXCLUDED(kernel_socket_abort_read)
 EXCLUDED(kernel_socket_wait_ready)
 #endif
 EXCLUDED(kernel_socket_discard_receive)
