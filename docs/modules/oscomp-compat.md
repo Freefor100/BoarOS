@@ -176,7 +176,7 @@ bootstrap host门禁验证目标loader、helper架构拒绝、独立配置和显
 退出、信号、组隔离、setsid、TERM无效后的KILL/reap、后续进展和源码helper跳过。
 Linux对照bootstrap为程序建立真实正进程组，因为直接内核init可继承PGID0。
 这些probe仅是诊断fixture，不是官方镜像结果。GNU空LOAD问题在main修正后合入，
-不通过修改链接产物绕过exec差异；背景见[ELF记录](../learning/elf-loading.md)。
+不通过修改链接产物绕过exec差异；背景见[ELF记录](kernel-exec.md)。
 
 当前双盘和 VFAT 接入后，basic 四种配置均为100/102，mount/umount各5/5；
 原始24个选定LTP、四个满盘/文件程序、磁盘检查和具体缺口见
@@ -192,7 +192,7 @@ LTP scratch 原准备失败涉及独立测试盘环境、用户态块设备 ABI�
 已完成原 mkfs/挂载/扇区查询，停在 O_DIRECT open 的 EOPNOTSUPP。
 账户、工具和真实熵仍按各自前置条件检查。原kill判分标签与实际后台PID、
 iperf连续脚本在Linux也有的listener重建竞态，以及cyclictest历史零采样，保留各自
-归因边界；历史证据见[程序清单](../learning/user-program-inventory.md)与
+归因边界；历史证据见[程序清单](program-environment.md)与
 [预算记录](../learning/data-path-budget-experiments.md)。本阶段不要求清空所有有效
 LTP能力缺口，也不修改原程序/libc/judge获取通过。
 

@@ -1001,7 +1001,7 @@ fork后父子分别打印，跨syscall交错不受单次write的序列保护；�
 本次保留实际输出与判分，不修改原程序、输出或judge，也不通过重跑替换本次成绩。
 
 ```sh
-make test-oscomp-host test-ci-host
+make test-oscomp-host
 make test-sync-host test-wait-host test-sleep-lock-host test-allocator-concurrency-host
 make test-oscomp-supervisor-riscv test-oscomp-supervisor-loongarch
 make all test-wait-riscv test-wait-loongarch INIT_CONFIG=config/init.json
