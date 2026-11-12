@@ -60,7 +60,11 @@ managed 峰值由分配器在 bootstrap、finalize 与 buddy 成功分配时维�
 
 进程 fdinfo 目录按同一 FD 表枚举并输出 position、flags、mount ID 和 inode。目录及条目同时检查 FSCREDS 进程访问权限和文件 DAC；读取期间持有目标实际 OFD，再复核目标身份与执行安全状态。pidfd 增加 Pid/NSpid，单命名空间中两者相同，目标 TID 已撤下后均为 -1；固定 Linux 的 NSpid 输出还取决于 CONFIG_PID_NS。pidfd 的 FD 链接展示 anon_inode:[pidfd]，getfd 传递实际 OFD，proc 路径重新打开仍返回 ENXIO。文本沿共同生成文件规则，rewind 后重新取值。
 
-`/proc/<pid>/ns/mnt` 与线程目录的 `ns/mnt` 使用现有进程对象权限检查，`readlink` 显示稳定的 `mnt:[id]`，普通打开取得真实挂载命名空间 FD。FD 的 inode 号对应命名空间 ID，`fstatfs` 报告 NSFS，`NS_GET_NSTYPE` 返回 `CLONE_NEWNS`。目标退出不撤销已打开句柄；`setns` 的资格、路径更新和引用规则见 [VFS 挂载说明](vfs-ext4.md)。本实现不提供 `mountinfo` 和其他命名空间对象。
+`/proc/<pid>/ns/mnt` 与线程目录的 `ns/mnt` 使用现有进程对象权限检查，`readlink` 显示稳定的 `mnt:[id]`，普通打开取得真实挂载命名空间 FD。FD 的 inode 号对应命名空间 ID，`fstatfs` 报告 NSFS，`NS_GET_NSTYPE` 返回 `CLONE_NEWNS`。目标退出不撤销已打开句柄；`setns` 的资格、路径更新和引用规则见 [VFS 挂载说明](vfs-ext4.md)。其他命名空间对象仍未提供。
+
+`/proc/<pid>/mountinfo`、线程目录的对应文件及self/thread-self链接展示目标的实际挂载命名空间。每行包含挂载ID、父ID、与fstat一致的文件系统设备号、文件系统内的bind根、目标进程根下的挂载点、视图属性及后端属性；可选字段shared/master/propagate_from/unbindable来自真实传播关系。chroot所在挂载使用其根路径生成挂载点，因此可显示为`/`；根外的挂载按Linux规则不输出。
+
+mounts与mountinfo共用一次拓扑快照，捕获时取得真实根和路径引用；格式化、转义和用户复制在保护外完成。设备身份与挂载ID分别维护，多个bind视图保持相同st_dev。读取沿已有生成文件规则，rewind后重新捕获；关闭快照归还全部引用。直接查询及生命周期由挂载传播消费者检查。
 
 ## BPF 状态
 

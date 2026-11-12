@@ -68,7 +68,7 @@ static int stat_inode(const struct kernel_vfs_file *file,struct kernel_vfs_stat 
     struct kernel_mqueue *q=kernel_mqueue_fs_file_queue(file);
     if(q)kernel_mqueue_queue_stat(q,stat);
     else kernel_mqueue_root_stat(stat);
-    stat->dev=0x19800202U;return 0;
+    stat->dev=((struct kernel_vfs_instance *)file->mount->private_data)->device_id;return 0;
 }
 static int statfs(struct kernel_vfs_mount *mount,struct kernel_vfs_statfs *stat)
 {
@@ -137,6 +137,7 @@ static int unmount(struct kernel_vfs_mount *mount)
 static void initialize_ops(void)
 {
     volatile struct kernel_vfs_backend *o=&mq_ops;
+    o->type="mqueue";
     o->read_execution=KERNEL_VFS_EXECUTION_CALLER;o->file_operation_execution=KERNEL_VFS_EXECUTION_CALLER;
     o->namespace_execution=KERNEL_VFS_EXECUTION_CALLER;
     o->error=error;o->root=root;o->lookup=lookup;o->open=open_inode;o->close_node=close_node;
@@ -161,6 +162,6 @@ int kernel_mqueue_fs_create(struct kernel_heap *heap,uint64_t flags,struct kerne
     kernel_raw_lock_init(&m->instance.error_lock,KERNEL_RAW_RANK_OBJECT);
     m->mount.private_data=&m->instance;m->mount.id=kernel_vfs_allocate_mount_id();
     m->mount.state=VFS_MOUNT_STATE_LIVE;m->mount.nosuid=!!(flags&2U);
-    kernel_vfs_mount_initialize(&m->mount);
+    kernel_vfs_mount_initialize(&m->mount);m->instance.device_id=0x19800202U;
     *owner=&m->mount;return 0;
 }

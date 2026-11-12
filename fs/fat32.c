@@ -1017,7 +1017,7 @@ static int stat_inode(const struct kernel_vfs_file *file, struct kernel_vfs_stat
     int r = fat_error(node->instance); if (r) return r;
     r = measure(m, i); if (r) return r;
     uint64_t size = (i->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR ? (uint64_t)i->clusters * m->cluster_size : node->size;
-    *stat = (struct kernel_vfs_stat){.dev = m->block->device_number, .ino = i->id, .mode = i->mode,
+    *stat = (struct kernel_vfs_stat){.dev = m->instance.device_id, .ino = i->id, .mode = i->mode,
         .nlink = i->linked ? ((i->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR ? 2 : 1) : 0,
         .size = size, .blocks = (uint64_t)i->clusters * m->cluster_size / 512,
         .blksize = m->cluster_size, .atime = i->atime, .mtime = i->mtime, .ctime = i->ctime};
@@ -1253,6 +1253,7 @@ static int check_domain(const struct kernel_vfs_node *node, const struct kernel_
     return fi((struct kernel_vfs_node *)node)->id == node->inode ? 0 : -KERNEL_EINVAL;
 }
 static const struct kernel_vfs_backend fat_ops = {
+    .type="vfat",
     .check_domain = check_domain,
     .error = fat_error, .root = root, .lookup = lookup, .entry_name = entry_name, .open = open_inode, .close_node = close_node,
     .create = create, .mkdir = mkdir_inode, .unlink = unlink_file, .rmdir = rmdir_inode,
@@ -1277,7 +1278,7 @@ int kernel_vfs_mount_fat32(struct kernel_vfs_mount *mount, struct kernel_block_d
     m->block=block;m->instance.heap=heap;m->instance.page_cache=cache;
     m->instance.backend_data=m;m->instance.ops=&fat_ops;m->instance.read_only=read_only!=0;
     mount->private_data=&m->instance;mount->id=kernel_vfs_allocate_mount_id();mount->state=VFS_MOUNT_STATE_CLEANUP;
-    kernel_vfs_mount_initialize(mount);m->mount=&m->instance.backend_mount;
+    kernel_vfs_mount_initialize(mount);m->instance.device_id=block->device_number;m->mount=&m->instance.backend_mount;
     int r=kernel_block_claim(block,m->mount);
     if (r) {mount->private_data=NULL;mount->id=mount->state=0;dispose(m,m);return r;}
     uint8_t boot[512];

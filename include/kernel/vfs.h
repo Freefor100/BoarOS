@@ -65,6 +65,11 @@ struct kernel_vfs_mount {
     struct kernel_vfs_mount *instance_next, **instance_previous;
     struct kernel_vfs_mount *namespace_retirement_next;
     uint8_t atime_policy; /* 0=relatime; NOATIME/STRICT/NODIR are per-view. */
+    uint8_t unbindable,namespace_retiring,propagation_staged;
+    uint64_t propagation_group,propagation_visit,unmount_visit;
+    size_t unmount_index;
+    struct kernel_vfs_mount *peer_next,*peer_previous;
+    struct kernel_vfs_mount *master,*first_slave,*next_slave,*previous_slave;
 };
 
 /* 连接由挂载树持有 root/covered 引用；路径与打开文件分别保留实际视图。
@@ -72,7 +77,10 @@ struct kernel_vfs_mount {
 void kernel_vfs_mount_initialize(struct kernel_vfs_mount *mount);
 int kernel_vfs_bind_mount(struct kernel_vfs_path *source, struct kernel_vfs_path *target, int recursive);
 void kernel_vfs_mount_topology_lock(struct kernel_lock_guard *);
+struct kernel_vfs_mount *kernel_vfs_mount_next(struct kernel_vfs_mount *,struct kernel_vfs_mount *);
+int kernel_vfs_change_propagation(struct kernel_vfs_path *,uint64_t type,int recursive);
 int kernel_vfs_mount_contains(struct kernel_vfs_mount *, const struct kernel_vfs_path *);
+int kernel_vfs_mount_reachable(struct kernel_vfs_mount *,const struct kernel_vfs_path *root);
 int kernel_vfs_copy_mount_tree(struct kernel_vfs_mount *top,
     struct kernel_vfs_path *const source[3], struct kernel_vfs_path *destination[3]);
 /* Consume the private tree owner; detach at the existing lock-free reap point. */

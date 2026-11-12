@@ -105,16 +105,10 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
               fs_paths.root, target, 1, &covered);
     if (result) goto Finish;
     if(!kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN)) {result=-KERNEL_EPERM;goto Finish;}
-    if(flags & ~(LINUX_MS_RDONLY|LINUX_MS_NOSUID|LINUX_MS_NODEV|LINUX_MS_NOEXEC|LINUX_MS_SILENT|LINUX_MS_REMOUNT|LINUX_MS_BIND|LINUX_MS_MOVE|LINUX_MS_REC|LINUX_MS_PRIVATE|UINT64_C(1024)|2048U|2097152U|16777216U)) {result=-KERNEL_ENOTSUP;goto Finish;}
+    if(flags & ~(LINUX_MS_RDONLY|LINUX_MS_NOSUID|LINUX_MS_NODEV|LINUX_MS_NOEXEC|LINUX_MS_SILENT|LINUX_MS_REMOUNT|LINUX_MS_BIND|LINUX_MS_MOVE|LINUX_MS_REC|UINT64_C(1966080)|UINT64_C(1024)|2048U|2097152U|16777216U)) {result=-KERNEL_ENOTSUP;goto Finish;}
     struct kernel_vfs_mount *top=kernel_fs_context_mount_root(fs);
     kernel_vfs_mount_topology_lock(&topology);
     if (!kernel_vfs_mount_contains(top,covered)) {result=-KERNEL_EINVAL;goto Finish;}
-    if (flags & LINUX_MS_PRIVATE) {
-        /* Views are already private; recursive private changes are idempotent. */
-        result=(flags & ~(LINUX_MS_PRIVATE|LINUX_MS_REC|LINUX_MS_SILENT)) ||
-            !kernel_vfs_path_is_mount_root(covered)?-KERNEL_EINVAL:0;
-        goto Finish;
-    }
     if (flags & LINUX_MS_REMOUNT) {
         result=kernel_vfs_remount(covered,flags,options);
         goto Finish;
@@ -126,6 +120,12 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
         if (!result && !kernel_vfs_mount_contains(top,source)) result=-KERNEL_EINVAL;
         if (!result) result=kernel_vfs_bind_mount(source,covered,!!(flags & LINUX_MS_REC));
         if (source && kernel_vfs_path_release(&source)) __builtin_trap();
+        goto Finish;
+    }
+    if(flags&UINT64_C(1966080)) {
+        uint64_t type=flags&UINT64_C(1966080);
+        result=(flags & ~(UINT64_C(1966080)|LINUX_MS_REC|LINUX_MS_SILENT)) ? -KERNEL_EINVAL :
+            kernel_vfs_change_propagation(covered,type,!!(flags&LINUX_MS_REC));
         goto Finish;
     }
     if (flags & LINUX_MS_MOVE) {

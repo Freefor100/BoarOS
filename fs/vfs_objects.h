@@ -49,6 +49,7 @@ struct kernel_vfs_instance {
     struct kernel_vfs_mount *retry_view;
     const struct kernel_vfs_notify_ops *notify_ops;
     unsigned notify_marks; /* Protected by the active notification backend. */
+    uint64_t device_id; /* Filesystem st_dev, shared by every mount view. */
 };
 
 enum { KERNEL_VFS_INODE_IMMUTABLE=1, KERNEL_VFS_INODE_APPEND=2 };
@@ -265,6 +266,7 @@ struct kernel_vfs_backend {
     /* Caller owns inode io_lock; positive result is the returned byte count. */
     int (*xattr)(struct kernel_vfs_node *, enum kernel_xattr_operation,
         const char *, void *, size_t, uint32_t);
+    const char *type; /* Immutable filesystem type, independent of its mount source. */
 };
 /* Called under the same inode writer as the corresponding metadata update. */
 

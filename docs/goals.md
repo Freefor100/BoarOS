@@ -53,12 +53,12 @@ PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不�
 
 ### P1h 虚拟文件系统与多挂载
 
-基础 proc/tmpfs/devpts/mqueue/ext4/vfat 挂载、覆盖、目录/文件 bind、rbind、MS_MOVE、chroot、RO/RW 重配置、普通忙卸载与 MNT_DETACH/UMOUNT_NOFOLLOW 已存在。私有挂载命名空间通过 CLONE_NEWNS、unshare、setns 与 /proc/<pid>/ns/mnt 使用。
+基础 proc/tmpfs/devpts/mqueue/ext4/vfat 挂载、覆盖、目录/文件 bind、rbind、MS_MOVE、chroot、RO/RW 重配置、普通忙卸载与 MNT_DETACH/UMOUNT_NOFOLLOW 已存在。挂载命名空间通过CLONE_NEWNS、unshare、setns与/proc/<pid>/ns/mnt使用，复制保留传播关系。
 
 | 扩展 | 尚缺语义 |
 |---|---|
 | proc 线程信息 | 其他按需线程字段；task 枚举、线程 stat/status、fd/fdinfo、exe/cwd/root、maps 与 thread-self 已提供，边界见[procfs模块](modules/procfs.md) |
-| 挂载传播 | 私有挂载命名空间已支持复制、切换与回收；shared/slave/unbindable 传播组尚未实现 |
+| 挂载接口扩展 | pivot_root及新mount API仍未提供；shared/slave/private/unbindable、递归转换及mountinfo已接入现有挂载操作 |
 | 挂载属性扩展 | 同步、lazytime及其他尚未支持的属性与重配置选项；四种atime策略及O_NOATIME已执行 |
 | umount2 扩展 | MNT_FORCE/EXPIRE 及错误优先级；force 不允许提前释放用户或 DMA 在用对象 |
 

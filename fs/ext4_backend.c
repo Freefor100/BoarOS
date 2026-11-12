@@ -1572,6 +1572,7 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     mount->state = VFS_MOUNT_STATE_CLEANUP;
     mount->id=kernel_vfs_allocate_mount_id();
     kernel_vfs_mount_initialize(mount);
+    adapter->instance.device_id=block->device_number?block->device_number:adapter->instance.backend_mount.id;
     result = kernel_block_claim(block, &adapter->instance.backend_mount);
     if (result) { (void)cleanup_mount(mount); return result; }
     adapter->block_claimed = 1U;
@@ -1669,6 +1670,7 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     mount->state = VFS_MOUNT_STATE_LIVE;
     adapter->instance.backend_mount.state=VFS_MOUNT_STATE_LIVE;
     kernel_vfs_mount_initialize(mount);
+    adapter->instance.device_id=block->device_number?block->device_number:adapter->instance.backend_mount.id;
     return 0;
 }
 
@@ -1743,8 +1745,7 @@ static void fill_stat(struct kernel_vfs_mount *mount,
     uint32_t creator_os;
 
     memset(stat, 0, sizeof(*stat));
-    struct kernel_block_device *block = lwext4_instance(mount->private_data)->block;
-    stat->dev = block->device_number ? block->device_number : ((struct kernel_vfs_instance *)mount->private_data)->backend_mount.id;
+    stat->dev = ((struct kernel_vfs_instance *)mount->private_data)->device_id;
     stat->ino = inode_number;
     stat->mode = ext4_inode_get_mode(superblock, inode);
     stat->nlink = ext4_inode_get_links_cnt(inode);
@@ -2978,6 +2979,7 @@ static void initialize_backend(void)
     /* 首次在当前执行域生成回调；其他挂载不能再写远端读者共享的表。 */
     if (__atomic_load_n(&ext4_backend.pread_batch,__ATOMIC_ACQUIRE)) return;
     volatile struct kernel_vfs_backend *ops = &ext4_backend;
+    ops->type="ext4";
     ops->read_execution = KERNEL_VFS_EXECUTION_CALLER;
     ops->file_operation_execution = KERNEL_VFS_EXECUTION_CALLER;
     ops->namespace_execution = KERNEL_VFS_EXECUTION_CALLER;

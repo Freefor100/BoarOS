@@ -10,6 +10,7 @@
 #include "../../fs/open_file_internal.h"
 #include "../../fs/vfs_objects.h"
 #include <pthread.h>
+#include <stdatomic.h>
 #include <sched.h>
 #include <assert.h>
 #include <stdio.h>
@@ -580,6 +581,99 @@ static void mount_sync_owner(struct kernel_vfs_mount *mount)
     assert(!kernel_vfs_path_release(&root));
 }
 #include "mount_move_cases.h"
+static unsigned unmount_resize_fail,unmount_resize_calls;
+extern enum kernel_heap_status __real_kernel_heap_resize(struct kernel_heap *,void *,size_t,void **);
+enum kernel_heap_status __wrap_kernel_heap_resize(struct kernel_heap *h,void *old,size_t bytes,void **out)
+{
+    if(unmount_resize_fail && ++unmount_resize_calls==unmount_resize_fail)return KERNEL_HEAP_STATUS_EMPTY;
+    return __real_kernel_heap_resize(h,old,bytes,out);
+}
+static atomic_int prepare_entered,prepare_resume;
+static int paused_prepare(struct kernel_vfs_mount *m)
+{
+    (void)m;atomic_store(&prepare_entered,1);
+    while(!atomic_load(&prepare_resume))sched_yield();
+    return 0;
+}
+struct unmount_actor {struct kernel_vfs_path *root;int result;};
+static void *unmount_actor(void *argument)
+{
+    struct unmount_actor *a=argument;mm_test_attach(1);a->result=kernel_vfs_umount(a->root,0);return NULL;
+}
+static void mount_propagation(struct kernel_vfs_mount *mount)
+{
+    struct kernel_vfs_path *root=NULL,*group=NULL,*target=NULL,*point=NULL,*slave=NULL;
+    assert(!kernel_vfs_path_root(mount,&heap,&root));
+    const char *dirs[]={"/group","/peer","/slave"};
+    for(unsigned i=0;i<3;i++)assert(!kernel_vfs_mkdir_at(root,root,dirs[i],0755,0));
+    struct kernel_vfs_mount *base=NULL;assert(!kernel_tmpfs_create(&heap,0,NULL,&base));
+    assert(!kernel_vfs_path_resolve(root,root,"/group",1,&target));
+    assert(!kernel_vfs_mount_attach(base,target)&&!kernel_vfs_path_release(&target));
+    assert(!kernel_vfs_path_resolve(root,root,"/group",1,&group));
+    assert(!kernel_vfs_mkdir_at(group,root,"point",0755,0));
+    assert(!kernel_vfs_change_propagation(group,1048576,0));uint64_t id=base->propagation_group;
+    for(unsigned i=1;i<3;i++) {
+        assert(!kernel_vfs_path_resolve(root,root,dirs[i],1,&target));
+        assert(!kernel_vfs_bind_mount(group,target,0)&&!kernel_vfs_path_release(&target));
+    }
+    assert(!kernel_vfs_path_resolve(root,root,"/slave",1,&slave));
+    assert(!kernel_vfs_change_propagation(slave,524288,0));
+    struct kernel_vfs_mount *down=slave->file.mount;
+    assert(down->master && down->master->propagation_group==id&&!down->propagation_group);
+    assert(!kernel_vfs_path_resolve(root,root,"/group/point",1,&point));
+    for(unsigned attempt=0;attempt<4;attempt++) {
+        struct kernel_vfs_mount *payload=NULL;assert(!kernel_tmpfs_create(&heap,0,NULL,&payload));
+        struct kernel_vfs_path *prime=NULL;assert(!kernel_vfs_path_root(payload,&heap,&prime));
+        struct kernel_heap_statistics before,after;kernel_heap_get_statistics(&heap,&before);
+        allocation_calls=0;allocation_fail_at=attempt? (attempt==1?1:attempt==2?2:4):0;
+        plain_allocation_fail=attempt==0;
+        int error=kernel_vfs_mount_attach(payload,point);
+        allocation_fail_at=plain_allocation_fail=0;
+        assert(error==-KERNEL_ENOMEM && !payload->propagation_group && !payload->first_slave);
+        assert(!point->mounted_here && base->propagation_group==id && base->peer_next!=base &&
+            down->master && down->master->propagation_group==id);
+        assert(!kernel_vfs_reap_mounts());kernel_heap_get_statistics(&heap,&after);
+        assert(before.live_allocations==after.live_allocations);
+        assert(!kernel_vfs_path_release(&prime)&&!kernel_vfs_unmount(payload));
+    }
+    /* Replace a slave receiver with another filesystem. A normal propagated
+     * unmount must close both views before preparing either backend. */
+    assert(!kernel_vfs_change_propagation(slave,262144,0));
+    struct kernel_vfs_path *peer=NULL,*selected=NULL,*receiver=NULL;
+    assert(!kernel_vfs_path_resolve(root,root,"/peer",1,&peer));
+    assert(!kernel_vfs_change_propagation(peer,524288,0));
+    struct kernel_vfs_mount *payload=NULL,*replacement=NULL;
+    assert(!kernel_tmpfs_create(&heap,0,NULL,&payload)&&!kernel_vfs_mount_attach(payload,point));
+    assert(!kernel_vfs_path_resolve(root,root,"/group/point",1,&selected));
+    assert(!kernel_vfs_path_resolve(root,root,"/peer/point",1,&receiver));
+    assert(!kernel_vfs_umount(receiver,0)&&!kernel_vfs_path_release(&receiver));
+    assert(!kernel_vfs_path_resolve(root,root,"/peer/point",1,&receiver));
+    assert(!kernel_tmpfs_create(&heap,0,NULL,&replacement)&&!kernel_vfs_mount_attach(replacement,receiver));
+    assert(!kernel_vfs_path_release(&receiver));
+    struct kernel_vfs_instance *instance=payload->private_data;
+    unmount_resize_calls=0;unmount_resize_fail=2;
+    assert(kernel_vfs_umount(selected,0)==-KERNEL_ENOMEM);unmount_resize_fail=0;
+    assert(!instance->quiescing&&!(selected->references&VFS_PATH_CLOSING));
+    const struct kernel_vfs_backend *original=instance->ops;
+    struct kernel_vfs_backend paused=*original;paused.prepare_unmount=paused_prepare;instance->ops=&paused;
+    struct unmount_actor request={.root=selected};pthread_t controller;
+    assert(!pthread_create(&controller,NULL,unmount_actor,&request));
+    while(!atomic_load(&prepare_entered))sched_yield();
+    int borrowed=kernel_vfs_path_resolve(root,root,"/peer/point",1,&receiver);
+    assert(borrowed==-KERNEL_EBUSY&&!receiver);
+    atomic_store(&prepare_resume,1);assert(!pthread_join(controller,NULL)&&!request.result);
+    instance->ops=original;
+    assert(!kernel_vfs_path_release(&selected)&&!kernel_vfs_path_release(&peer));
+    assert(!kernel_vfs_path_release(&point)&&!kernel_vfs_path_release(&slave)&&!kernel_vfs_path_release(&group));
+    assert(!kernel_vfs_path_resolve(root,root,"/group",1,&group));
+    assert(!kernel_vfs_change_propagation(group,262144,1)&&!kernel_vfs_path_release(&group));
+    for(unsigned i=0;i<3;i++) {
+        assert(!kernel_vfs_path_resolve(root,root,dirs[i],1,&target));
+        assert(!kernel_vfs_umount(target,2)&&!kernel_vfs_path_release(&target));
+    }
+    assert(!kernel_vfs_path_release(&root));
+    puts("PASS propagation: shared/slave identities, four mount OOM stages, pre-prepare unmount OOM, concurrent borrow refusal and exact final owners");
+}
 static void atime_policy(struct kernel_vfs_mount *mount,struct kernel_vfs_file *file)
 {
     struct kernel_vfs_path *root=NULL;assert(!kernel_vfs_path_root(mount,&heap,&root));
@@ -609,7 +703,8 @@ int main(int argc,char **argv)
     struct kernel_vfs_mount *mount=0;struct kernel_open_file_description *file=0;
     assert(!kernel_tmpfs_create(&heap,0,"nr_blocks=8",&mount));mount->noexec=mount->nodev=1;
     opened(mount,"/file",0755,&file);file->open_flags=2;
-    if(!strcmp(argv[1],"atime"))atime_policy(mount,&file->file);
+    if(!strcmp(argv[1],"propagation"))mount_propagation(mount);
+    else if(!strcmp(argv[1],"atime"))atime_policy(mount,&file->file);
     else if(!strcmp(argv[1],"executable-path"))mount_executable_path(mount);
     else if(!strcmp(argv[1],"move"))mount_move(mount);
     else if(!strcmp(argv[1],"cwd-unreachable"))mount_cwd_unreachable(mount);
