@@ -5527,6 +5527,88 @@ finish:
     mm_operation_end(operation);
     return status;
 }
+/* Stack growth edits and its VMA candidates are a separate operation from
+ * the normal file-fault path; do not retain those frames through device waits. */
+static __attribute__((noinline)) enum kernel_mm_status grow_fault_stack(struct kernel_mm_record *record,
+    uint64_t address,uint32_t access,struct kernel_vma *result,uint64_t *epoch)
+{
+    struct kernel_vma vma;
+    uint64_t generation=0;
+    enum kernel_vma_status vs;
+    struct kernel_lock_guard vma_guard = {0};
+    kernel_rwlock_write(&record->vma_lock, &vma_guard);
+    vs = kernel_vma_set_lookup(record->vmas, address, &vma);
+    if (vs == KERNEL_VMA_STATUS_OK) {
+        generation = kernel_vma_set_generation(record->vmas);
+        kernel_lock_release(&vma_guard);
+        *result=vma;*epoch=generation;return KERNEL_MM_STATUS_OK;
+    }
+    uint64_t page = address & ~BOAROS_PAGE_MASK;
+    if (kernel_vma_set_next(record->vmas, page, &vma) ||
+        vma.role != KERNEL_VMA_ROLE_STACK || !(vma.permissions & access) ||
+        vma.end - page > kernel_task_current_stack_limit() ||
+        !may_expand_current(record, &vma, vma.start - page) ||
+        ((vma.flags & KERNEL_VMA_LOCKED) && !may_lock_memory(record, vma.start - page))) {
+        kernel_lock_release(&vma_guard);
+        return KERNEL_MM_STATUS_NOT_MAPPED;
+    }
+    int overlaps;
+    /* Linux 栈增长与可访问的前一映射保留 256 个架构页的间隔。 */
+    if (page < 2 * BOAROS_PAGE_SIZE ||
+        kernel_vma_set_overlaps(record->vmas, page, vma.start, &overlaps) || overlaps) {
+        kernel_lock_release(&vma_guard);
+        return KERNEL_MM_STATUS_NOT_MAPPED;
+    }
+    struct kernel_vma previous;
+    enum kernel_vma_status prev_status = kernel_vma_set_previous(record->vmas, page, &previous);
+    if (prev_status != KERNEL_VMA_STATUS_OK && prev_status != KERNEL_VMA_STATUS_NOT_FOUND)
+        __builtin_trap();
+    if (prev_status == KERNEL_VMA_STATUS_OK && previous.role != KERNEL_VMA_ROLE_STACK &&
+        (previous.permissions & (KERNEL_MM_READ | KERNEL_MM_WRITE | KERNEL_MM_EXECUTE)) &&
+        page - previous.end < KERNEL_VMA_STACK_GUARD_PAGES * BOAROS_PAGE_SIZE) {
+        kernel_lock_release(&vma_guard);
+        return KERNEL_MM_STATUS_NOT_MAPPED;
+    }
+    struct kernel_vma growth = vma;
+    growth.start = page;
+    growth.end = vma.start;
+    vs = kernel_vma_set_insert(record->vmas, &growth);
+    if (vs) {
+        kernel_lock_release(&vma_guard);
+        return status_from_vma(vs);
+    }
+    if (kernel_vma_set_lookup(record->vmas, address, &vma)) __builtin_trap();
+    generation = kernel_vma_set_generation(record->vmas);
+    kernel_lock_release(&vma_guard);
+    *result=vma;*epoch=generation;return KERNEL_MM_STATUS_OK;
+}
+/* Revalidation owns only its new snapshot. It runs after page preparation,
+ * so its VMA and lock guard do not remain live across the nested file read. */
+static __attribute__((noinline)) int memory_fault_vma_changed(struct kernel_mm_record *record,
+    uint64_t address,const struct kernel_vma *original,uint64_t generation)
+{
+    struct kernel_vma latest;
+    int vma_mismatch = 0;
+        {
+#if BOAROS_MAX_CPUS > 1
+            struct kernel_lock_guard vma_guard = {0};
+            kernel_rwlock_read(&record->vma_lock, &vma_guard);
+#endif
+            if (kernel_vma_set_lookup(record->vmas, address, &latest) != KERNEL_VMA_STATUS_OK ||
+                latest.backing != original->backing || latest.backing_offset != original->backing_offset ||
+                latest.start != original->start || latest.end != original->end ||
+                latest.permissions != original->permissions ||
+                latest.kind != original->kind || latest.role != original->role ||
+                latest.fault_policy != original->fault_policy ||
+                (original->kind != KERNEL_VMA_KIND_ANONYMOUS && generation != kernel_vma_set_generation(record->vmas))) {
+                vma_mismatch = 1;
+            }
+#if BOAROS_MAX_CPUS > 1
+            kernel_lock_release(&vma_guard);
+#endif
+        }
+    return vma_mismatch;
+}
 static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_operation *operation,
     uint64_t address, uint32_t access, const struct kernel_vma *population_vma)
 {
@@ -5578,51 +5660,9 @@ lookup:
             goto lookup;
         }
 #endif
-        struct kernel_lock_guard vma_guard = {0};
-        kernel_rwlock_write(&record->vma_lock, &vma_guard);
-        vs = kernel_vma_set_lookup(record->vmas, address, &vma);
-        if (vs == KERNEL_VMA_STATUS_OK) {
-            generation = kernel_vma_set_generation(record->vmas);
-            kernel_lock_release(&vma_guard);
-            goto found;
-        }
-        uint64_t page = address & ~BOAROS_PAGE_MASK;
-        if (kernel_vma_set_next(record->vmas, page, &vma) ||
-            vma.role != KERNEL_VMA_ROLE_STACK || !(vma.permissions & access) ||
-            vma.end - page > kernel_task_current_stack_limit() ||
-            !may_expand_current(record, &vma, vma.start - page) ||
-            ((vma.flags & KERNEL_VMA_LOCKED) && !may_lock_memory(record, vma.start - page))) {
-            kernel_lock_release(&vma_guard);
-            return KERNEL_MM_STATUS_NOT_MAPPED;
-        }
-        int overlaps;
-        /* Linux 栈增长与可访问的前一映射保留 256 个架构页的间隔。 */
-        if (page < 2 * BOAROS_PAGE_SIZE ||
-            kernel_vma_set_overlaps(record->vmas, page, vma.start, &overlaps) || overlaps) {
-            kernel_lock_release(&vma_guard);
-            return KERNEL_MM_STATUS_NOT_MAPPED;
-        }
-        struct kernel_vma previous;
-        enum kernel_vma_status prev_status = kernel_vma_set_previous(record->vmas, page, &previous);
-        if (prev_status != KERNEL_VMA_STATUS_OK && prev_status != KERNEL_VMA_STATUS_NOT_FOUND)
-            __builtin_trap();
-        if (prev_status == KERNEL_VMA_STATUS_OK && previous.role != KERNEL_VMA_ROLE_STACK &&
-            (previous.permissions & (KERNEL_MM_READ | KERNEL_MM_WRITE | KERNEL_MM_EXECUTE)) &&
-            page - previous.end < KERNEL_VMA_STACK_GUARD_PAGES * BOAROS_PAGE_SIZE) {
-            kernel_lock_release(&vma_guard);
-            return KERNEL_MM_STATUS_NOT_MAPPED;
-        }
-        struct kernel_vma growth = vma;
-        growth.start = page;
-        growth.end = vma.start;
-        vs = kernel_vma_set_insert(record->vmas, &growth);
-        if (vs) {
-            kernel_lock_release(&vma_guard);
-            return status_from_vma(vs);
-        }
-        if (kernel_vma_set_lookup(record->vmas, address, &vma)) __builtin_trap();
-        generation = kernel_vma_set_generation(record->vmas);
-        kernel_lock_release(&vma_guard);
+        enum kernel_mm_status grown=grow_fault_stack(record,address,access,&vma,&generation);
+        if(grown)return grown;
+        vs=KERNEL_VMA_STATUS_OK;
     }
 found:
     if (vs != KERNEL_VMA_STATUS_OK) return KERNEL_MM_STATUS_STATE;
@@ -5797,26 +5837,7 @@ prepare_memory_tables:
 #endif
     int refill = 0, lazy_retired = 0;
     if (status == KERNEL_MM_STATUS_OK) {
-        struct kernel_vma latest;
-        int vma_mismatch = 0;
-        {
-#if BOAROS_MAX_CPUS > 1
-            struct kernel_lock_guard vma_guard = {0};
-            kernel_rwlock_read(&record->vma_lock, &vma_guard);
-#endif
-            if (kernel_vma_set_lookup(record->vmas, address, &latest) != KERNEL_VMA_STATUS_OK ||
-                latest.backing != vma.backing || latest.backing_offset != vma.backing_offset ||
-                latest.start != vma.start || latest.end != vma.end ||
-                latest.permissions != vma.permissions ||
-                latest.kind != vma.kind || latest.role != vma.role ||
-                latest.fault_policy != vma.fault_policy ||
-                (vma.kind != KERNEL_VMA_KIND_ANONYMOUS && generation != kernel_vma_set_generation(record->vmas))) {
-                vma_mismatch = 1;
-            }
-#if BOAROS_MAX_CPUS > 1
-            kernel_lock_release(&vma_guard);
-#endif
-        }
+        int vma_mismatch=memory_fault_vma_changed(record,address,&vma,generation);
         struct kernel_mm_mapping current;
         KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
         uint64_t latest_epoch=0;

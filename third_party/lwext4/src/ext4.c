@@ -4828,17 +4828,31 @@ int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsig
         for (unsigned i = 0; i < count; i++) spans[i].error = ENOMEM;
         return ENOMEM;
     }
+    /* Scalar requests cannot need more fragments than their filesystem
+     * blocks. Bound temporary planning storage by that range (at most eight),
+     * so a one-page ELF fault does not retain an unused eight-slot frame. */
+    unsigned scalar_capacity=1;
+    if (!work) {
+        unsigned bs=ext4_sb_get_block_size(&file->mp->fs.sb);
+        uint64_t blocks=spans[0].size/bs;
+        if(blocks>=8)scalar_capacity=8;
+        else {
+            scalar_capacity=(unsigned)blocks+(unsigned)((spans[0].offset%bs+spans[0].size%bs+bs-1)/bs);
+            if(!scalar_capacity)scalar_capacity=1;
+            if(scalar_capacity>8)scalar_capacity=8;
+        }
+    }
     size_t scalar_limit;
-    struct file_read_fragment scalar_fragments[8];
-    struct block_read_span scalar_reads[8];
-    unsigned scalar_owners[8];
+    struct file_read_fragment scalar_fragments[scalar_capacity];
+    struct block_read_span scalar_reads[scalar_capacity];
+    unsigned scalar_owners[scalar_capacity];
     int scalar_mapping_error;
     size_t *limits = work ? work->limits : &scalar_limit;
     struct file_read_fragment *fragments = work ? work->fragments : scalar_fragments;
     struct block_read_span *reads = work ? work->reads : scalar_reads;
     unsigned *owners = work ? work->owners : scalar_owners;
     int *mapping_errors = work ? work->mapping_errors : &scalar_mapping_error;
-    unsigned capacity = work ? EXT4_BLOCK_BATCH_MAX : 8;
+    unsigned capacity = work ? EXT4_BLOCK_BATCH_MAX : scalar_capacity;
     struct file_read_workspace *progress = completion && count > 1 ? work : NULL;
     if (progress) {
         progress->completion_spans = spans;
