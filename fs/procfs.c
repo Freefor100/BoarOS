@@ -1184,7 +1184,7 @@ struct proc_mount_entry {
     const char *source;
     const char *bpf_type;
     uint8_t is_proc, is_tmpfs, is_devpts;
-    uint8_t read_only,nosuid,nodev,noexec;
+    uint8_t read_only,nosuid,nodev,noexec,atime_policy;
 };
 
 static struct kernel_vfs_mount *next_mount(struct kernel_vfs_mount *mount,
@@ -1284,6 +1284,7 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
             entries[captured].nosuid=it->nosuid;
             entries[captured].nodev=it->nodev;
             entries[captured].noexec=it->noexec;
+            entries[captured].atime_policy=it->atime_policy;
             entries[captured].read_only =
                 kernel_vfs_mount_is_readonly(it);
             captured++;
@@ -1325,7 +1326,10 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
                            entries[i].is_tmpfs ? "tmpfs" : entries[i].is_devpts ? "devpts" : "ext4";
         const char *options[]={entries[i].read_only?" ro":" rw",
             entries[i].nosuid?",nosuid":"",entries[i].nodev?",nodev":"",
-            entries[i].noexec?",noexec":""," 0 0\n"};
+            entries[i].noexec?",noexec":"",
+            entries[i].atime_policy&VFS_ATIME_NONE?",noatime":
+                entries[i].atime_policy&VFS_ATIME_STRICT?"":",relatime",
+            entries[i].atime_policy&VFS_ATIME_NODIR?",nodiratime":""," 0 0\n"};
         size_t suffix_length=0;
         for (size_t j=0;j<sizeof(options)/sizeof(options[0]);j++) suffix_length+=strlen(options[j]);
         size_t needed = 4U * strlen(source) + 1U + 4U * strlen(path_text) +

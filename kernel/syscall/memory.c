@@ -217,6 +217,10 @@ enum kernel_syscall_status syscall_handle_mmap(
                 decoded->value=error;
                 return KERNEL_SYSCALL_STATUS_OK;
             }
+            /* file mmap's backend setup records access, before population.
+             * A later PTE refault does not create another file access. */
+            if (kernel_open_file_kind(file)==KERNEL_OPEN_FILE_KIND_REGULAR)
+                kernel_vfs_file_accessed((struct kernel_vfs_file *)source,kernel_open_file_flags(file));
             if (kernel_open_file_kind(file)==KERNEL_OPEN_FILE_KIND_BPF) {
                 KERNEL_LOCK_SCOPE(mapping);
                 uint64_t *write_bytes=NULL;

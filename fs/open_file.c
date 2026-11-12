@@ -1131,10 +1131,18 @@ uint32_t kernel_open_file_flags(
     return open_file_live(file) ? __atomic_load_n(&file->open_flags, __ATOMIC_RELAXED) &
         ~(file->kind==KERNEL_OPEN_FILE_KIND_PIDFD?(open_only&~0200U):open_only) : 0U;
 }
+int kernel_open_file_noatime_allowed(const struct kernel_open_file_description *file)
+{
+    const struct kernel_credentials *cred=kernel_credentials_current();
+    if(kernel_credentials_capable(cred,KERNEL_CAP_FOWNER))return 1;
+    if(file->file.private_data)return kernel_vfs_file_noatime_allowed(&file->file);
+    struct kernel_vfs_stat stat;
+    return !kernel_open_file_pseudo_stat(file,&stat) && stat.uid==cred->fsuid;
+}
 void kernel_open_file_set_status_flags(struct kernel_open_file_description *file, uint32_t flags)
 {
     if (!open_file_live(file)) __builtin_trap();
-    const uint32_t mask=00002000U | 00004000U;
+    const uint32_t mask=00002000U | 00004000U | 01000000U;
     uint32_t old=__atomic_load_n(&file->open_flags, __ATOMIC_RELAXED);
     while (!__atomic_compare_exchange_n(&file->open_flags, &old,
         (old & ~mask) | (flags & mask), 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}

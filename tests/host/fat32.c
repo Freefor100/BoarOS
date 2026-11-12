@@ -137,7 +137,7 @@ static void metadata(struct kernel_vfs_mount *mount,struct kernel_heap *heap)
     assert(!kernel_vfs_file_set_times(&file,old_time)); sync_file(&file);
     unsigned before_writes=writes;
     mm_test_attach(1);kernel_cpu_current()->logical_id=1;
-    assert(!kernel_vfs_file_modified(&file,0,0)); kernel_vfs_file_accessed(&file);
+    assert(!kernel_vfs_file_modified(&file,0,0)); kernel_vfs_file_accessed(&file,0);
     assert(writes==before_writes);
     mm_test_attach(0);
     assert(!kernel_vfs_fstat(&file,&stat) && stat.mtime.seconds>old_time[1].seconds+86400);

@@ -64,6 +64,7 @@ struct kernel_vfs_mount {
     struct kernel_vfs_path *paths, *path_index; /* Weak mount-location registry and identity index. */
     struct kernel_vfs_mount *instance_next, **instance_previous;
     struct kernel_vfs_mount *namespace_retirement_next;
+    uint8_t atime_policy; /* 0=relatime; NOATIME/STRICT/NODIR are per-view. */
 };
 
 /* 连接由挂载树持有 root/covered 引用；路径与打开文件分别保留实际视图。
@@ -198,6 +199,7 @@ enum kernel_vfs_open_flags {
     KERNEL_VFS_OPEN_PATH_ONLY = 1U << 4,
     KERNEL_VFS_OPEN_DIRECTORY = 1U << 5,
     KERNEL_VFS_OPEN_REGULAR = 1U << 6,
+    KERNEL_VFS_OPEN_NOATIME = 1U << 7,
 };
 enum kernel_vfs_resolve_flags {
     KERNEL_VFS_RESOLVE_NO_XDEV = 1U << 0,
@@ -338,7 +340,7 @@ int kernel_vfs_file_acquire_write(struct kernel_vfs_file *file);
 /* Request-boundary touches include cache hits, EOF and partial user faults.
  * Access-time I/O errors do not override the read result; modification errors
  * are returned before copying caller data. Neither API depends on a path. */
-void kernel_vfs_file_accessed(struct kernel_vfs_file *file);
+void kernel_vfs_file_accessed(struct kernel_vfs_file *file, uint32_t open_flags);
 int kernel_vfs_file_modified(struct kernel_vfs_file *file,
                               uint64_t offset, int append);
 

@@ -1,6 +1,7 @@
 #include <kernel/credentials.h>
 #include <kernel/scheduler.h>
 #include "private.h"
+#include "../../fs/vfs_internal.h"
 #include <kernel/mqueue.h>
 #include <kernel/bpf.h>
 
@@ -104,7 +105,7 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
               fs_paths.root, target, 1, &covered);
     if (result) goto Finish;
     if(!kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN)) {result=-KERNEL_EPERM;goto Finish;}
-    if(flags & ~(LINUX_MS_RDONLY|LINUX_MS_NOSUID|LINUX_MS_NODEV|LINUX_MS_NOEXEC|LINUX_MS_SILENT|LINUX_MS_REMOUNT|LINUX_MS_BIND|LINUX_MS_MOVE|LINUX_MS_REC|LINUX_MS_PRIVATE)) {result=-KERNEL_ENOTSUP;goto Finish;}
+    if(flags & ~(LINUX_MS_RDONLY|LINUX_MS_NOSUID|LINUX_MS_NODEV|LINUX_MS_NOEXEC|LINUX_MS_SILENT|LINUX_MS_REMOUNT|LINUX_MS_BIND|LINUX_MS_MOVE|LINUX_MS_REC|LINUX_MS_PRIVATE|UINT64_C(1024)|2048U|2097152U|16777216U)) {result=-KERNEL_ENOTSUP;goto Finish;}
     struct kernel_vfs_mount *top=kernel_fs_context_mount_root(fs);
     kernel_vfs_mount_topology_lock(&topology);
     if (!kernel_vfs_mount_contains(top,covered)) {result=-KERNEL_EINVAL;goto Finish;}
@@ -171,6 +172,7 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
     mounted->nodev=!!(flags&LINUX_MS_NODEV);
     mounted->noexec=!!(flags&LINUX_MS_NOEXEC);
     mounted->silent=!!(flags&LINUX_MS_SILENT);
+    mounted->atime_policy=kernel_vfs_atime_policy(flags,0,0);
     result = kernel_vfs_mount_attach(mounted, covered);
     if (result) {
         int cleanup = kernel_vfs_unmount(mounted);

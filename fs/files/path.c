@@ -51,10 +51,9 @@ static int validate_open_flags(uint64_t flags, uint64_t mode, uint64_t resolve,
                                  LINUX_O_APPEND | LINUX_O_EXCL;
     uint64_t unsupported_flags =
         LINUX_O_DIRECT |
-        LINUX_O_NOATIME |
         (LINUX_O_TMPFILE & ~LINUX_O_DIRECTORY);
     uint64_t known_flags = LINUX_O_ACCMODE | write_flags | LINUX_O_NOCTTY |
-        unsupported_flags | LINUX_O_NONBLOCK | LINUX_O_DIRECTORY |
+        unsupported_flags | LINUX_O_NOATIME | LINUX_O_NONBLOCK | LINUX_O_DIRECTORY |
         LINUX_O_NOFOLLOW |
         LINUX_O_LARGEFILE | LINUX_O_CLOEXEC | LINUX_O_SYNC | LINUX_O_PATH;
     uint64_t access_mode = flags & LINUX_O_ACCMODE;
@@ -285,6 +284,7 @@ static enum kernel_files_status files_open(
         request.access=(flags & 3U)==0 ? 4U : (flags & 3U)==1 ? 2U : 6U;
         if (flags & LINUX_O_TRUNC) request.access |= 2U;
     }
+    if ((flags & LINUX_O_NOATIME) && !(flags & LINUX_O_PATH)) request.flags|=KERNEL_VFS_OPEN_NOATIME;
     if (flags & LINUX_O_DIRECTORY) request.flags |= KERNEL_VFS_OPEN_DIRECTORY;
     if (flags & LINUX_O_NOFOLLOW) request.flags &= ~KERNEL_VFS_OPEN_FOLLOW;
     if (flags & LINUX_O_PATH) request.flags |= KERNEL_VFS_OPEN_PATH_ONLY;
@@ -329,6 +329,10 @@ static enum kernel_files_status files_open(
         kernel_service_scope_begin(&service);
     if (flags & LINUX_O_PATH) goto Finish_open;
     if (special_link) {
+        if ((flags & LINUX_O_NOATIME) && !kernel_open_file_noatime_allowed(description)) {
+            kernel_files_queue_description(files,description);
+            (void)kernel_files_drain_file_cleanup(files);*linux_result=-KERNEL_EPERM;return 0;
+        }
         if ((flags & LINUX_O_DIRECTORY) != 0U) {
             KERNEL_FILES_NOTE(files, open_failures, 1);
             kernel_files_queue_description(files, description);

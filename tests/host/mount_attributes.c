@@ -168,7 +168,7 @@ static void reconfiguration(struct kernel_vfs_mount *mount,struct kernel_open_fi
     assert(kernel_vfs_create(mount,"/denied",0600,&denied)==-KERNEL_EROFS);
     struct kernel_vfs_file read_only={0};struct kernel_vfs_stat before,after;
     assert(!kernel_vfs_open(mount,"/file",&read_only) && !kernel_vfs_fstat(&read_only,&before));
-    kernel_vfs_file_accessed(&read_only);
+    kernel_vfs_file_accessed(&read_only,0);
     assert(!kernel_vfs_fstat(&read_only,&after));
     assert(before.atime.seconds==after.atime.seconds && before.atime.nanoseconds==after.atime.nanoseconds);
     assert(!kernel_vfs_close(&read_only));
@@ -580,6 +580,23 @@ static void mount_sync_owner(struct kernel_vfs_mount *mount)
     assert(!kernel_vfs_path_release(&root));
 }
 #include "mount_move_cases.h"
+static void atime_policy(struct kernel_vfs_mount *mount,struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_path *root=NULL;assert(!kernel_vfs_path_root(mount,&heap,&root));
+    struct kernel_vfs_timespec t[2]={{2,0},{1,0}};struct kernel_vfs_stat stat;
+    assert(!kernel_vfs_file_set_times(file,t));
+    assert(!kernel_vfs_remount(root,1024,NULL));kernel_vfs_file_accessed(file,0);
+    assert(!kernel_vfs_fstat(file,&stat)&&stat.atime.seconds==2);
+    assert(!kernel_vfs_remount(root,16777216,NULL));
+    kernel_vfs_file_accessed(file,KERNEL_FILES_O_NOATIME);
+    assert(!kernel_vfs_fstat(file,&stat)&&stat.atime.seconds==2);
+    kernel_vfs_file_accessed(file,0);assert(!kernel_vfs_fstat(file,&stat)&&stat.atime.seconds>2);
+    assert(!kernel_vfs_remount(root,0,NULL)&&mount->atime_policy==VFS_ATIME_STRICT);
+    assert(!kernel_vfs_remount(root,2097152,NULL)&&!mount->atime_policy);
+    struct kernel_vfs_statfs fs;assert(!kernel_vfs_mount_statfs(mount,&fs)&&(fs.flags&4096));
+    assert(!kernel_vfs_path_release(&root));
+    puts("PASS atime: real inode updates, OFD suppression, remount preservation and statfs");
+}
 int main(int argc,char **argv)
 {
     assert(argc==2);mm_test_attach(0);
@@ -592,7 +609,8 @@ int main(int argc,char **argv)
     struct kernel_vfs_mount *mount=0;struct kernel_open_file_description *file=0;
     assert(!kernel_tmpfs_create(&heap,0,"nr_blocks=8",&mount));mount->noexec=mount->nodev=1;
     opened(mount,"/file",0755,&file);file->open_flags=2;
-    if(!strcmp(argv[1],"executable-path"))mount_executable_path(mount);
+    if(!strcmp(argv[1],"atime"))atime_policy(mount,&file->file);
+    else if(!strcmp(argv[1],"executable-path"))mount_executable_path(mount);
     else if(!strcmp(argv[1],"move"))mount_move(mount);
     else if(!strcmp(argv[1],"cwd-unreachable"))mount_cwd_unreachable(mount);
     else if(!strcmp(argv[1],"views"))mount_views(mount);

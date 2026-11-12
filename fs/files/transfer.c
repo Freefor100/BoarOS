@@ -253,7 +253,7 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
     if (kernel_open_file_flags(output) & KERNEL_FILES_O_APPEND) return -KERNEL_EINVAL;
     if (input->kind != KERNEL_OPEN_FILE_KIND_REGULAR) return -KERNEL_EINVAL;
     if (count) kernel_open_file_read_begin(input, start);
-    kernel_vfs_file_accessed(&input->file);
+    kernel_vfs_file_accessed(&input->file,kernel_open_file_flags(input));
     if (count == 0U || start >= kernel_open_file_size(input)) return 0;
     if (output->kind == KERNEL_OPEN_FILE_KIND_REGULAR) {
         int64_t result = regular_file_copy(mm, input, output, start, out_start, count, &size_limit, 1);
@@ -479,7 +479,7 @@ static int64_t copy_range_pinned(struct kernel_mm *mm,
     if (!count) return 0;
     if (count > KERNEL_FILES_MAX_RW_COUNT) count = KERNEL_FILES_MAX_RW_COUNT;
     kernel_open_file_read_begin(input, start);
-    kernel_vfs_file_accessed(&input->file);
+    kernel_vfs_file_accessed(&input->file,kernel_open_file_flags(input));
     int64_t result = regular_file_copy(mm, input, output, start, out_start, count, &limit, 0);
     kernel_files_size_limit_notify(&limit);
     if (result > 0) {
@@ -682,7 +682,7 @@ static int64_t file_into_pipe(struct kernel_open_file_description **input,
         if (*position>maximum || (count && *position==maximum)) return -KERNEL_EOVERFLOW;
         if (count>maximum-*position)count=(size_t)(maximum-*position);
         if (!count || *position>=kernel_open_file_size(file)) {
-            kernel_vfs_file_accessed(&file->file);return 0;
+            kernel_vfs_file_accessed(&file->file,kernel_open_file_flags(file));return 0;
         }
     }
     struct kernel_pipe_write_borrow borrow={0};
@@ -711,7 +711,7 @@ static int64_t file_into_pipe(struct kernel_open_file_description **input,
         kernel_pipe_write_finish(&borrow);return error;
     }
     if (file->kind==KERNEL_OPEN_FILE_KIND_REGULAR) {
-        kernel_vfs_file_accessed(&file->file);kernel_open_file_read_begin(file,*position);
+        kernel_vfs_file_accessed(&file->file,kernel_open_file_flags(file));kernel_open_file_read_begin(file,*position);
     }
     while (total<count && borrow.slots) {
         void *page=NULL;size_t offset,done;int miss;

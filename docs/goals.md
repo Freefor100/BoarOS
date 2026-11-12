@@ -59,10 +59,10 @@ PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不�
 |---|---|
 | proc 线程信息 | 其他按需线程字段；task 枚举、线程 stat/status、fd/fdinfo、exe/cwd/root、maps 与 thread-self 已提供，边界见[procfs模块](modules/procfs.md) |
 | 挂载传播 | 私有挂载命名空间已支持复制、切换与回收；shared/slave/unbindable 传播组尚未实现 |
-| 挂载属性扩展 | atime 策略、同步及其他尚未支持的属性与重配置选项 |
+| 挂载属性扩展 | 同步、lazytime及其他尚未支持的属性与重配置选项；四种atime策略及O_NOATIME已执行 |
 | umount2 扩展 | MNT_FORCE/EXPIRE 及错误优先级；force 不允许提前释放用户或 DMA 在用对象 |
 
-当前新 mount 与基础 `MS_REMOUNT` 接受 `MS_RDONLY/MS_NOSUID/MS_NODEV/MS_NOEXEC/MS_SILENT`，`MS_BIND` 与 `MS_BIND|MS_REC` 复用实例，`MS_REMOUNT|MS_BIND` 更新单个视图属性，`MS_MOVE` 移动既有挂载连接；umount2 接受 flags=0、`MNT_DETACH`、`UMOUNT_NOFOLLOW`及后两者组合；进程根所属挂载的普通卸载尝试转为 RO；目标仍须是实际挂载根，chroot子目录本身的卸载返回 `EINVAL`，无 parent 的全局根对 `MNT_DETACH` 返回 `EINVAL`。重配置的写入者、映射、同步和失败所有权见[VFS 模块](modules/vfs-ext4.md)。
+当前新 mount 与基础 `MS_REMOUNT` 接受 `MS_RDONLY/MS_NOSUID/MS_NODEV/MS_NOEXEC/MS_SILENT`及atime策略，`MS_BIND` 与 `MS_BIND|MS_REC` 复用实例，`MS_REMOUNT|MS_BIND` 更新单个视图属性，`MS_MOVE` 移动既有挂载连接；umount2 接受 flags=0、`MNT_DETACH`、`UMOUNT_NOFOLLOW`及后两者组合；进程根所属挂载的普通卸载尝试转为 RO；目标仍须是实际挂载根，chroot子目录本身的卸载返回 `EINVAL`，无 parent 的全局根对 `MNT_DETACH` 返回 `EINVAL`。重配置的写入者、映射、同步和失败所有权见[VFS 模块](modules/vfs-ext4.md)。
 NOEXEC在最终挂载的执行打开、access及文件映射上执行；NODEV限制新的设备路径打开和块设备挂载源，已打开对象保留原权利。
 基础与扩展边界见 [VFS](modules/vfs-ext4.md)及[挂载学习记录](learning/memory-backed-mounts.md#基础挂载与扩展操作的边界)。
 

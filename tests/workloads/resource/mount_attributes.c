@@ -17,6 +17,7 @@
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 #define CHECK(x) do {if(!(x)){dprintf(2,"MOUNT-ATTR FAIL line=%d errno=%d %s\n",__LINE__,errno,#x);_exit(1);}}while(0)
 #define ERROR(x,e) do {errno=0;CHECK((x)==-1&&errno==(e));}while(0)
@@ -286,12 +287,75 @@ static void mapping_lifetime(void)
     CHECK(!close(ready[0])&&!close(ready[1])&&!close(release[0])&&!close(release[1])&&!umount("/ma/hold"));
     pass("mapping-owner-survives-close-and-fork-until-release");
 }
+static void set_access_time(int fd,time_t atime)
+{
+    struct timespec t[2]={{atime,0},{1,0}};CHECK(!futimens(fd,t));
+}
+static time_t access_time(int fd) {struct stat s;CHECK(!fstat(fd,&s));return s.st_atim.tv_sec;}
+static void atime_view(const char *source,const char *name)
+{
+    char path[128];CHECK(snprintf(path,sizeof(path),"%s/timed",source)>0);
+    int original=open(path,O_CREAT|O_RDWR|O_TRUNC,0644);CHECK(original>=0&&write(original,"t",1)==1);
+    CHECK(!mount(source,"/ma/peer",NULL,MS_BIND,NULL));
+    int fd=open("/ma/peer/timed",O_RDONLY),dir=open("/ma/peer",O_RDONLY|O_DIRECTORY);CHECK(fd>=0&&dir>=0);
+    CHECK(!mount(NULL,"/ma/peer",NULL,MS_REMOUNT|MS_BIND|MS_NOATIME,NULL));
+    struct statfs fs;CHECK(!fstatfs(fd,&fs)&&(fs.f_flags&MS_NOATIME));
+    set_access_time(original,2);char c;CHECK(pread(fd,&c,1,0)==1&&c=='t'&&access_time(original)==2);
+    CHECK(!mount(NULL,"/ma/peer",NULL,MS_REMOUNT|MS_BIND|MS_STRICTATIME,NULL));
+    struct timespec now;CHECK(!clock_gettime(CLOCK_REALTIME,&now));time_t future=now.tv_sec+3600;
+    set_access_time(original,future);CHECK(pread(fd,&c,1,0)==1&&access_time(original)!=future);
+    CHECK(!mount(NULL,"/ma/peer",NULL,MS_REMOUNT|MS_BIND|MS_RELATIME,NULL));
+    set_access_time(original,future);CHECK(pread(fd,&c,1,0)==1&&access_time(original)==future);
+    CHECK(!mount(NULL,"/ma/peer",NULL,MS_REMOUNT|MS_BIND,NULL)); /* unspecified policy retained */
+    CHECK(pread(fd,&c,1,0)==1&&access_time(original)==future);
+    set_access_time(original,2);CHECK(pread(original,&c,1,0)==1&&access_time(original)!=2);
+    CHECK(!mount(NULL,"/ma/peer",NULL,MS_REMOUNT|MS_BIND|MS_STRICTATIME|MS_NODIRATIME,NULL));
+    set_access_time(dir,2);char entries[512];CHECK(syscall(SYS_getdents64,dir,entries,sizeof(entries))>0&&access_time(dir)==2);
+    CHECK(!mount(NULL,"/ma/peer",NULL,MS_REMOUNT|MS_BIND|MS_STRICTATIME,NULL));
+    CHECK(lseek(dir,0,SEEK_SET)==0&&syscall(SYS_getdents64,dir,entries,sizeof(entries))>0&&access_time(dir)!=2);
+    CHECK(!close(dir)&&!close(fd)&&!close(original)&&!umount("/ma/peer")&&!unlink(path));pass(name);
+}
+static void noatime_ofd(void)
+{
+    text_file("/ma/base/noatime","n");int fd=open("/ma/base/noatime",O_RDWR|O_NOATIME);CHECK(fd>=0);
+    set_access_time(fd,2);char c;CHECK(pread(fd,&c,1,0)==1&&access_time(fd)==2);
+    int alias=dup(fd);CHECK(alias>=0&&fcntl(alias,F_SETFL,fcntl(alias,F_GETFL)&~O_NOATIME)==0);
+    CHECK(!(fcntl(fd,F_GETFL)&O_NOATIME)&&pread(fd,&c,1,0)==1&&access_time(fd)!=2);
+    CHECK(!fcntl(fd,F_SETFL,fcntl(fd,F_GETFL)|O_NOATIME));set_access_time(fd,2);
+    CHECK(pread(alias,&c,1,0)==1&&access_time(fd)==2);
+    void *mapping=mmap(NULL,page,PROT_READ,MAP_PRIVATE,alias,0);
+    CHECK(mapping!=MAP_FAILED&&access_time(fd)==2&&!munmap(mapping,page));
+    CHECK(!fcntl(fd,F_SETFL,fcntl(fd,F_GETFL)&~O_NOATIME));set_access_time(fd,2);
+    mapping=mmap(NULL,page,PROT_READ,MAP_PRIVATE,alias,0);
+    CHECK(mapping!=MAP_FAILED&&access_time(fd)!=2&&!munmap(mapping,page));
+    CHECK(!fcntl(fd,F_SETFL,fcntl(fd,F_GETFL)|O_NOATIME));
+    struct {uint64_t flags,mode,resolve;} how={O_RDONLY|O_NOATIME,0,0};
+    int native=(int)syscall(437,AT_FDCWD,"/ma/base/noatime",&how,sizeof(how));
+    CHECK(native>=0&&(fcntl(native,F_GETFL)&O_NOATIME)&&!close(native));
+    text_file("/ma/base/owned","o");CHECK(!chown("/ma/base/owned",1001,1001));
+    pid_t child=fork();CHECK(child>=0);if(!child){
+        CHECK(!setresgid(1001,1001,1001)&&!setresuid(1001,1001,1001));
+        ERROR(open("/ma/base/noatime",O_RDONLY|O_NOATIME),EPERM);
+        int ordinary=open("/ma/base/noatime",O_RDONLY);CHECK(ordinary>=0);
+        ERROR(fcntl(ordinary,F_SETFL,O_NOATIME),EPERM);
+        int owned=open("/ma/base/owned",O_RDONLY|O_NOATIME);CHECK(owned>=0&&!close(owned));
+        int path=open("/ma/base/noatime",O_PATH|O_NOATIME);
+        CHECK(path>=0&&!(fcntl(path,F_GETFL)&O_NOATIME)&&!close(path));
+        CHECK(!fcntl(alias,F_SETFL,fcntl(alias,F_GETFL)));_exit(0);
+    }joined(child,0);CHECK(!close(alias)&&!close(fd)&&!unlink("/ma/base/noatime")&&!unlink("/ma/base/owned"));
+    pass("noatime-ofd-alias-flags-and-permission");
+}
 int main(int argc,char **argv)
 {
     if(argc>1&&!strcmp(argv[1],"--exec-ok"))return 42;
     setvbuf(stdout,0,_IONBF,0);page=(size_t)sysconf(_SC_PAGESIZE);CHECK(page==4096||page==16384);
-    setup();execution();interpreter();links_and_children();access_cases();device_cases();mount_source();
-    mapping_cases();mapping_errors();old_fd_mounts();pty_peer();mapping_lifetime();
+    setup();directory("/atime-disk");atime_view("/ma/base","atime-tmpfs-views-and-directories");
+    atime_view("/atime-disk","atime-ext4-views-and-directories");CHECK(!rmdir("/atime-disk"));noatime_ofd();
+#ifndef MOUNT_ATIME_ONLY
+#define MOUNT_ATIME_ONLY 0
+#endif
+    if (!MOUNT_ATIME_ONLY) {execution();interpreter();links_and_children();access_cases();device_cases();mount_source();
+    mapping_cases();mapping_errors();old_fd_mounts();pty_peer();mapping_lifetime();}
     CHECK(!umount("/ma/devpts")&&!umount("/ma/proc")&&!umount("/ma/deny")&&!umount("/ma"));
     printf("MOUNT-ATTR END %u\n",cases);if(getpid()==1){sync();reboot(RB_POWER_OFF);}return 0;
 }

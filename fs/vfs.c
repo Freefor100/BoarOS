@@ -91,6 +91,16 @@ int kernel_vfs_file_noappend_allowed(const struct kernel_vfs_file *file)
     return !(node->metadata_restrictions&KERNEL_VFS_INODE_APPEND);
 }
 
+int kernel_vfs_file_noatime_allowed(const struct kernel_vfs_file *file)
+{
+    const struct kernel_credentials *cred=kernel_credentials_current();
+    if (kernel_credentials_capable(cred,KERNEL_CAP_FOWNER)) return 1;
+    struct kernel_vfs_node *node=kernel_vfs_file_node(file);
+    if (!node) return 0;
+    KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(node,&io,0);
+    return cred->fsuid==node->uid;
+}
+
 int kernel_vfs_file_mincore_allowed(const struct kernel_vfs_file *file)
 {
     struct kernel_vfs_node *node = kernel_vfs_file_node(file);
@@ -878,7 +888,7 @@ static int clone_one_view(struct kernel_vfs_mount *source,struct kernel_vfs_dent
         if (mount->instance_next) mount->instance_next->instance_previous=&mount->instance_next;
         instance->views=mount;
         mount->read_only=source->read_only;mount->nosuid=source->nosuid;mount->nodev=source->nodev;
-        mount->noexec=source->noexec;mount->silent=source->silent;mount->source_name=instance->backend_mount.source_name;
+        mount->noexec=source->noexec;mount->silent=source->silent;mount->atime_policy=source->atime_policy;mount->source_name=instance->backend_mount.source_name;
     }
     *owner=mount;return 0;
 }
@@ -2146,6 +2156,8 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
                  (resolved->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFBLK)) result=-KERNEL_EACCES;
             else {
                 result=kernel_vfs_path_permission(resolved,request->access);
+                if (!result && (flags & KERNEL_VFS_OPEN_NOATIME) &&
+                    !kernel_vfs_file_noatime_allowed(&resolved->file)) result=-KERNEL_EPERM;
                 if (!result) result=path_open_locked(resolved,file);
             }
         } else {
@@ -4032,6 +4044,7 @@ int kernel_vfs_remount(struct kernel_vfs_path *root, uint64_t flags, const char 
         KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
         if (read_only && !mount->read_only && mount->write_openers) return -KERNEL_EBUSY;
         mount->read_only=read_only;
+        mount->atime_policy=kernel_vfs_atime_policy(flags,mount->atime_policy,1);
         mount->nosuid=!!(flags&2U);mount->nodev=!!(flags&4U);mount->noexec=!!(flags&8U);mount->silent=!!(flags&32768U);
         return 0;
     }
@@ -4054,6 +4067,7 @@ int kernel_vfs_remount(struct kernel_vfs_path *root, uint64_t flags, const char 
     {
         KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
         instance->read_only=read_only;mount->read_only=read_only;
+        mount->atime_policy=kernel_vfs_atime_policy(flags,mount->atime_policy,1);
         mount->nosuid=!!(flags&2U);mount->nodev=!!(flags&4U);mount->noexec=!!(flags&8U);
         mount->silent=!!(flags&32768U);
     }
@@ -4334,6 +4348,11 @@ int kernel_vfs_mount_statfs(struct kernel_vfs_mount *mount,
         if (mount->nosuid) stat->flags |= 2U;
         if (mount->nodev) stat->flags |= 4U;
         if (mount->noexec) stat->flags |= 8U;
+        uint8_t policy=mount->atime_policy;
+        stat->flags&=~UINT64_C(7168);
+        if(policy&VFS_ATIME_NONE)stat->flags|=1024U;
+        if(policy&VFS_ATIME_NODIR)stat->flags|=2048U;
+        if(!(policy&(VFS_ATIME_NONE|VFS_ATIME_STRICT)))stat->flags|=4096U;
     }
     return result;
 }
@@ -4471,11 +4490,18 @@ static int vfs_create_raw(struct kernel_vfs_mount *mount,
     return instance->ops->create(mount, parent_inode, path, mode, file,umask);
 }
 
-void kernel_vfs_file_accessed(struct kernel_vfs_file *file)
+int kernel_vfs_file_atime_enabled(const struct kernel_vfs_file *file)
 {
-    if (!file || !file->mount || !file->mount->private_data) return;
-    struct kernel_vfs_instance *instance = file->mount->private_data;
-    if (!kernel_vfs_mount_is_readonly(file->mount)) instance->ops->accessed(file);
+    if (!file || !file->mount || !file->mount->private_data) return 0;
+    uint8_t policy=__atomic_load_n(&file->mount->atime_policy,__ATOMIC_RELAXED);
+    return !kernel_vfs_mount_is_readonly(file->mount) && !(policy&VFS_ATIME_NONE) &&
+        !((policy&VFS_ATIME_NODIR) && (file->mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR);
+}
+void kernel_vfs_file_accessed(struct kernel_vfs_file *file,uint32_t open_flags)
+{
+    if ((open_flags&01000000U) || !kernel_vfs_file_atime_enabled(file)) return;
+    struct kernel_vfs_instance *instance=file->mount->private_data;
+    instance->ops->accessed(file);
 }
 
 int kernel_vfs_file_modified(struct kernel_vfs_file *file,

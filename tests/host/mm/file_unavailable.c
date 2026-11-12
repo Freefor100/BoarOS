@@ -83,3 +83,8 @@ EXCLUDED(kernel_page_cache_writeback)
 #ifndef MM_TEST_BPF
 EXCLUDED(kernel_bpf_mmap_page)
 #endif
+
+EXCLUDED(kernel_page_cache_read_data)
+#ifndef MM_TEST_BPF
+EXCLUDED(kernel_bpf_mmap_begin)
+#endif

@@ -17,7 +17,18 @@ int kernel_vfs_path_parent_pin(const struct kernel_vfs_path *path,struct kernel_
 int kernel_vfs_path_lookup_object(struct kernel_vfs_path *,const char *,size_t,struct kernel_vfs_path **);
 #include <stdint.h>
 
+#define VFS_ATIME_NONE 1U
+#define VFS_ATIME_STRICT 2U
+#define VFS_ATIME_NODIR 4U
+static inline uint8_t kernel_vfs_atime_policy(uint64_t flags,uint8_t previous,int remount)
+{
+    if (remount && !(flags & (UINT64_C(1024)|2048|2097152|16777216))) return previous;
+    return (flags&16777216U ? VFS_ATIME_STRICT : flags&1024U ? VFS_ATIME_NONE : 0) |
+        (flags&2048U ? VFS_ATIME_NODIR : 0);
+}
 struct kernel_vfs_file;
+int kernel_vfs_file_atime_enabled(const struct kernel_vfs_file *);
+int kernel_vfs_file_noatime_allowed(const struct kernel_vfs_file *);
 struct kernel_vfs_size_limit;
 int kernel_vfs_check_write_limit(struct kernel_vfs_size_limit *, uint64_t, size_t *);
 struct kernel_memory_object;
