@@ -956,3 +956,39 @@ POSIX MQ、libc通知和管道容量于10月28日14:48～14:50完成；16:25的�
 | LA musl | 4 条 TPASS，退出 0 | 0/0 | 67 ms |
 
 四项依次检查未对齐地址、无效输出地址、范围中的未映射页面和地址范围溢出，均返回程序期望的错误；四配置均无超时。原程序采用旧 LTP 输出，只打印 TPASS，没有原 judge 读取的 `Summary:`，因此原 judge 均记 0/0。两架构根盘和第二盘三个分区共八对象检查均为 0，启动种子槽检查通过；默认交付内核已恢复，运行盘已清理。原始日志、ELF 和判分结果见主工作区 `build/stack-limits-20261101/original/`。
+
+
+## 向量按次选项与文件建议原程序（2026-11-12）
+
+`preadv2/pwritev2` 和 `fadvise64/readahead` 的通用实现先进入 main，再单向合入兼容分支。
+本批只运行指定的七个原 ELF；两架构各一次启动、每次依次执行 glibc 和 musl，保留原参数、judge、
+300秒单程序监督及程序自己的内部时限。临时 init 只筛选原脚本的遍历列表，不改变程序和判分行；
+默认生产交付保持单核，完成后恢复默认 init 与内核。没有运行 IOzone、TCP 或性能批次。
+
+下表程序耗时单位为 ms；四组合得分相同，均正常退出0，无 TFAIL、TBROK、程序超时或组内未到达的程序。
+
+| 原程序 | 四组合原 judge | RV glibc | RV musl | LA glibc | LA musl |
+|---|---:|---:|---:|---:|---:|
+| preadv201 | 6/6 | 152 | 63 | 162 | 63 |
+| preadv202 | 8/8 | 89 | 63 | 62 | 64 |
+| pwritev201 | 6/6 | 83 | 42 | 68 | 63 |
+| pwritev202 | 7/7 | 64 | 62 | 86 | 66 |
+| posix_fadvise01 | 6/6 | 64 | 63 | 65 | 42 |
+| posix_fadvise02 | 6/6 | 64 | 41 | 64 | 62 |
+| readahead01 | 15/23 | 83 | 63 | 88 | 67 |
+
+前六项每组合39/39。`readahead01` 实际完成15项，另8项在创建被测FD时由LTP报TCONF：
+fanotify、userfaultfd、io_uring、fsopen、fspick、open_tree、memfd_secret 的创建接口返回ENOSYS；
+perf_event_open 的软件CPU时钟事件返回ENOENT。没有执行这8类FD上的readahead断言，原judge保留15/23，
+不能写成23项通过。这些是现有能力范围造成的跳过，统一说明见[测例问题](oscomp-test-issues.md#readahead01被测fd创建阶段的跳过)。
+
+直接消费者另检查原syscall与libc包装、原生offset参数、按次追加／同步／NOSIGNAL、append-only读写、
+有符号位置溢出的错误顺序、EFAULT前缀、FSIZE与封印，以及缓存驻留和范围回收。
+宿主4/16KiB页和1/4KiB文件系统块检查NOREUSE不提升页面但保留命中统计、RANDOM抑制推测预读、
+SEQUENTIAL两倍窗口、借用页不回收及预读与最终关闭交接。RV单核glibc、双核动态musl／1GiB、
+八核静态musl／512MiB、LA单核glibc和双核musl均通过，并使用相同ELF作固定Linux对照；
+RV glibc直接消费者的最小内核栈余量为1656字节，原程序启动为1528字节。任务元数据编译断言继续成立。
+
+两架构根盘和第二盘p1/p2/p3共八个文件系统对象只读检查全部为0，检查后已清理四张运行副本。
+原ELF、输入SHA、内核、逐程序结果、原judge、耗时及fsck日志保留在主工作区
+`build/file-api4-20261112/official/`；功能短例在同一父目录。当前语义见[文件模块](../modules/kernel-files.md#向量-io-的按次选项)。

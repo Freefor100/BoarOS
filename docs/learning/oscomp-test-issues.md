@@ -196,6 +196,19 @@ netstress 的默认模式见[固定源码](https://github.com/linux-test-project
 
 依据：[固定 semctl03 源码](https://github.com/oscomp/testsuits-for-oskernel/blob/8b58dd16d26d30f7c74d48d5832d870d3051b703/ltp-full-20240524/testcases/kernel/syscalls/ipc/semctl/semctl03.c)。本轮原输出与原 judge 的6/8继续保留，见[分项结果](oscomp-ltp-analysis.md#sysv-信号量与-socketpair-错误分类修复后的原程序结果)；这两项跳过由程序的上述条件直接触发，不据此推断环境或内核缺口，也不把独立故障检查的通过数补入原程序分数。
 
+### readahead01：被测FD创建阶段的跳过
+
+2026-11-12四组合均15条TPASS、8条TCONF、退出0；原judge为15/23。
+这些TCONF发生在LTP的`tst_fd_next()`准备被测FD时，尚未调用对应FD的readahead：
+fanotify_init、userfaultfd、io_uring_setup、fsopen、fspick、open_tree和memfd_secret返回ENOSYS。
+perf_event_open请求`PERF_TYPE_SOFTWARE/PERF_COUNT_SW_CPU_CLOCK`，当前事件源未实现，返回ENOENT。
+这是内核现有接口／事件支持范围，不是缺库、缺用户数据库，也不是已执行的readahead断言失败。
+固定来源见[LTP 20240524的FD构造器](https://raw.githubusercontent.com/linux-test-project/ltp/20240524/lib/tst_fd.c)。
+
+已创建的O_PATH、目录、/dev/zero、管道、UNIX/INET socket、epoll、eventfd、signalfd、timerfd、
+inotify及BPF map分别返回原程序期望的错误；普通可读文件的实际装入、范围回收及引用归还由直接消费者验证。
+原结果和耗时见[本批七项结果](oscomp-ltp-analysis.md#向量按次选项与文件建议原程序2026-11-12)。
+
 ## fs_fill：评测预算取舍
 
 `fs_fill` 的两个细项已经通过，相关磁盘检查正常。它以三名 writer 分别执行向量和
