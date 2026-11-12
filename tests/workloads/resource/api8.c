@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <net/if.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +20,9 @@ int main(void)
 {
     setvbuf(stdout,NULL,_IONBF,0);
     CHECK(directory("/proc")&&directory("/tmp")&&directory("/dev/mqueue"));
+    /* A root pivot legitimately updates other FS contexts in the namespace.
+     * Keep our execution root as an actual path, not a reconstructed name. */
+    int execution_root=open("/",O_PATH|O_DIRECTORY|O_CLOEXEC);CHECK(execution_root>=0);
     int proc=!mount("proc","/proc","proc",0,NULL);CHECK(proc || errno==EBUSY);
     int mq=!mount("mqueue","/dev/mqueue","mqueue",0,NULL);CHECK(mq || errno==EBUSY);
     int fat=access("/with-vfat",F_OK)==0;
@@ -63,9 +67,10 @@ int main(void)
         if (!WIFEXITED(status)||WEXITSTATUS(status)) {
             fprintf(stderr,"API8 FAIL child=%s status=%d\n",programs[i],status);return 1;
         }
+        CHECK(!fchdir(execution_root)&&!chroot(".")&&!chdir("/"));
         printf("API8 END %s status=0\n",programs[i]);
     }
     CHECK((!mq||!umount("/dev/mqueue"))&&(!proc||!umount("/proc")));
-    CHECK(!fat || !umount("/fat"));
+    CHECK(!fat || !umount("/fat"));CHECK(!close(execution_root));
     printf("API8 PASS programs=%u\n",count);return 0;
 }

@@ -39,6 +39,7 @@ uint32_t kernel_vfs_write_mode(uint32_t mode, uint32_t gid);
 uint64_t kernel_vfs_allocate_mount_id(void);
 struct kernel_vfs_path;
 struct kernel_vfs_dentry;
+struct kernel_fs_context;
 struct kernel_open_file_description;
 struct kernel_lock_guard;
 struct kernel_vfs_mount {
@@ -65,8 +66,8 @@ struct kernel_vfs_mount {
     struct kernel_vfs_mount *instance_next, **instance_previous;
     struct kernel_vfs_mount *namespace_retirement_next;
     uint8_t atime_policy; /* 0=relatime; NOATIME/STRICT/NODIR are per-view. */
-    uint8_t unbindable,namespace_retiring,propagation_staged;
-    uint64_t propagation_group,propagation_visit,unmount_visit;
+    uint8_t unbindable,namespace_retiring,propagation_staged,detached_tree,external_owner;
+    uint64_t propagation_group,propagation_visit,unmount_visit,detached_origin;
     size_t unmount_index;
     struct kernel_vfs_mount *peer_next,*peer_previous;
     struct kernel_vfs_mount *master,*first_slave,*next_slave,*previous_slave;
@@ -87,7 +88,11 @@ int kernel_vfs_copy_mount_tree(struct kernel_vfs_mount *top,
 void kernel_vfs_retire_mount_tree(struct kernel_vfs_mount *);
 /* Transfer the attached source view and its children; existing owners retain
  * their exact mount and inode identities. Both input paths remain borrowed. */
-int kernel_vfs_move_mount(struct kernel_vfs_path *source, struct kernel_vfs_path *target);
+int kernel_vfs_move_mount(struct kernel_vfs_path *source, struct kernel_vfs_path *target,unsigned flags);
+int kernel_vfs_clone_tree(struct kernel_vfs_path *,int,struct kernel_vfs_path **);
+void kernel_vfs_close_tree(struct kernel_vfs_mount *);
+int kernel_vfs_set_mount_attributes(struct kernel_vfs_path *,uint64_t,uint64_t,uint64_t,int);
+int kernel_vfs_pivot_root(const struct kernel_fs_context *,struct kernel_vfs_path *,struct kernel_vfs_path *);
 int kernel_vfs_umount(struct kernel_vfs_path *root, unsigned flags);
 /* User-return/exit drains fresh retirements; explicit cleanup also retries failures. */
 int kernel_vfs_reap_mounts(void);

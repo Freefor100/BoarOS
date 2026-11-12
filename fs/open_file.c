@@ -281,7 +281,7 @@ static void initialize_path_description(struct kernel_open_file_description *fil
     file->references = 1U;
     file->observed_mount_error = kernel_vfs_mount_error_sequence(file->file.mount);
     kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
-    if (kernel_vfs_file_generated(&file->file))
+    if (file->kind!=KERNEL_OPEN_FILE_KIND_PATH && kernel_vfs_file_generated(&file->file))
         file->kind = KERNEL_OPEN_FILE_KIND_GENERATED;
     file->observed_writeback_error = kernel_vfs_error_sequence(&file->file);
     file->credentials = kernel_credentials_get(kernel_credentials_current());
@@ -328,6 +328,21 @@ static enum kernel_open_file_status create_open_file(
     *owner = file;
     *linux_result = 0;
     return KERNEL_OPEN_FILE_STATUS_OK;
+}
+
+int kernel_open_file_create_path(struct kernel_heap *heap,struct kernel_vfs_path *path,
+    struct kernel_vfs_mount *tree,struct kernel_open_file_description **owner)
+{
+    struct kernel_open_file_description *file=NULL;
+    if(kernel_heap_allocate_zeroed(heap,1,sizeof(*file),(void **)&file))return -KERNEL_ENOMEM;
+    int error=kernel_vfs_path_acquire(path);
+    if(error){kernel_heap_release(heap,file);return error;}
+    file->file.path=path;file->file.mount=kernel_vfs_path_mount(path);
+    file->file.mode=kernel_vfs_path_mode(path);file->kind=KERNEL_OPEN_FILE_KIND_PATH;
+    file->heap=heap;file->references=1;file->open_flags=010000000U;
+    kernel_mutex_init(&file->offset_lock,10,(uintptr_t)file);
+    file->credentials=kernel_credentials_get(kernel_credentials_current());
+    file->mount_tree=tree;*owner=file;return 0;
 }
 
 int kernel_open_file_create_memfd(struct kernel_heap *heap,const char *name,uint32_t flags,
@@ -898,7 +913,7 @@ static void close_cpu0(void *argument)
 
 static int close_is_local(const struct kernel_open_file_description *file)
 {
-    if(file->kind==KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE)return 0;
+    if(file->mount_tree || file->kind==KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE)return 0;
     if(file->kind==KERNEL_OPEN_FILE_KIND_MQUEUE)return 1;
     if(file->kind==KERNEL_OPEN_FILE_KIND_INOTIFY || file->kind==KERNEL_OPEN_FILE_KIND_BPF)return !file->ep_items;
     if (file->vfs_closed) return 1;
@@ -946,6 +961,7 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
             file->file.private_data == 0) {
             file->vfs_closed = 1U;
         } else if (file->kind == KERNEL_OPEN_FILE_KIND_PATH) {
+            if(file->mount_tree){kernel_vfs_close_tree(file->mount_tree);file->mount_tree=NULL;}
             if (kernel_vfs_path_release(&file->file.path)) __builtin_trap();
             file->vfs_closed = 1U;
         } else if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE) {

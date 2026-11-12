@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/resource.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
@@ -235,8 +236,174 @@ static int propagation(void)
     puts("PROP CASE propagated-busy-lazy-detach-and-open-owner PASS");
     puts("PROP END 9");return 0;
 }
+struct native_mount_attr { uint64_t set,clear,propagation,userns; };
+static int tree_open(int fd,const char *path,unsigned flags)
+{ return (int)syscall(428,fd,path,flags); }
+static int tree_move(int from,const char *a,int to,const char *b,unsigned flags)
+{ return (int)syscall(429,from,a,to,b,flags); }
+static int tree_attr(int fd,const char *path,unsigned flags,uint64_t set,uint64_t clear,uint64_t propagation)
+{
+    struct native_mount_attr attr={set,clear,propagation,0};
+    return (int)syscall(442,fd,path,flags,&attr,sizeof(attr));
+}
+static int mount_api(void)
+{
+    CHECK(!mkdir("/ma",0755)&&!mount("tmpfs","/ma","tmpfs",0,NULL));
+    CHECK(!mkdir("/ma/source",0755)&&!mkdir("/ma/target",0755)&&!mkdir("/ma/other",0755));
+    CHECK(!mount("tmpfs","/ma/source","tmpfs",0,NULL));
+    touch("/ma/source/marker");CHECK(!mkdir("/ma/source/sub",0755));
+    CHECK(!mount("tmpfs","/ma/source/sub","tmpfs",0,NULL));touch("/ma/source/sub/child");
+    int path=tree_open(AT_FDCWD,"/ma/source",O_CLOEXEC);
+    CHECK(path>=0&&(fcntl(path,F_GETFL)&O_PATH)&&(fcntl(path,F_GETFD)&FD_CLOEXEC));
+    struct stat a,b;CHECK(!fstat(path,&a)&&!stat("/ma/source",&b)&&a.st_ino==b.st_ino&&a.st_dev==b.st_dev);
+    ERROR(tree_open(AT_FDCWD,"/ma/source",0x40000000U),EINVAL);
+    ERROR(tree_open(path,"",0),ENOENT);
+    int same=tree_open(path,"",AT_EMPTY_PATH);CHECK(same>=0&&!close(same));
+    int generated=tree_open(AT_FDCWD,"/proc/meminfo",0);CHECK(generated>=0);
+    char zero;ERROR(read(generated,&zero,1),EBADF);CHECK(!close(generated));
+    generated=open("/proc/meminfo",O_PATH);CHECK(generated>=0);ERROR(read(generated,&zero,1),EBADF);CHECK(!close(generated));
+    ERROR(tree_open(AT_FDCWD,"/ma/source/marker",2U),ENOTDIR);
+    struct rlimit limit,small;CHECK(!getrlimit(RLIMIT_NOFILE,&limit));small=limit;small.rlim_cur=32;
+    CHECK(!setrlimit(RLIMIT_NOFILE,&small));
+    int filled[32],n=0,fd;
+    while((fd=dup(path))>=0){CHECK(n<32);filled[n++]=fd;}
+    CHECK(errno==EMFILE);ERROR(tree_open(-1,"missing",0x40000000U),EMFILE);
+    while(n)CHECK(!close(filled[--n]));
+    CHECK(!setrlimit(RLIMIT_NOFILE,&limit));
+    int ns=tree_open(path,"",2U|AT_EMPTY_PATH|O_CLOEXEC);CHECK(ns>=0);
+    pid_t ns_child=fork();CHECK(ns_child>=0);
+    if(!ns_child){CHECK(!setns(ns,CLONE_NEWNS));marker(AT_FDCWD,"/marker");_exit(0);}
+    joined(ns_child);CHECK(!close(ns));
+    CHECK(!tree_attr(path,"",AT_EMPTY_PATH,0,0,MS_SHARED));
+    int detached=tree_open(path,"",1U|AT_EMPTY_PATH|AT_RECURSIVE);CHECK(detached>=0);
+    ns_child=fork();CHECK(ns_child>=0);
+    if(!ns_child) {
+        CHECK(!unshare(CLONE_NEWNS));
+        ERROR(tree_open(path,"",1U|AT_EMPTY_PATH),EINVAL);
+        ERROR(tree_open(detached,"",1U|AT_EMPTY_PATH),EINVAL);
+        int local=tree_open(AT_FDCWD,"/ma/source",0),clone=tree_open(local,"",1U|AT_EMPTY_PATH|AT_RECURSIVE);
+        CHECK(local>=0&&clone>=0);
+        ERROR(tree_move(local,"",clone,"",4U|64U),EINVAL);
+        int sub=openat(clone,"sub",O_PATH|O_DIRECTORY);CHECK(sub>=0);
+        ERROR(tree_move(sub,"",AT_FDCWD,"/ma/target",4U),EINVAL);
+        ERROR(tree_attr(sub,"",AT_EMPTY_PATH,2U,0,0),EINVAL);
+        CHECK(!tree_attr(local,"",AT_EMPTY_PATH,0,0,MS_PRIVATE));
+        CHECK(!tree_move(path,"",local,"",4U|64U|0x100U));
+        CHECK(!close(sub)&&!close(clone)&&!close(local));_exit(0);
+    }
+    joined(ns_child);CHECK(!close(detached));
+    puts("MOUNT-API CASE path-fd-and-input PASS");
+
+    int tree=tree_open(path,"",1U|AT_EMPTY_PATH|AT_RECURSIVE|O_CLOEXEC);
+    CHECK(tree>=0);same=dup(tree);CHECK(same>=0&&!close(tree));tree=same;
+    int old=openat(tree,"marker",O_RDONLY);CHECK(old>=0);
+    CHECK(!tree_attr(tree,"",AT_EMPTY_PATH|AT_RECURSIVE,1U|2U|4U|8U,0,MS_PRIVATE));
+    struct statfs sf;CHECK(!fstatfs(tree,&sf)&&(sf.f_flags&1U));
+    ERROR(openat(tree,"new",O_CREAT|O_WRONLY,0600),EROFS);
+    CHECK(!tree_attr(tree,"",AT_EMPTY_PATH|AT_RECURSIVE,0,1U,0));
+    CHECK(!tree_attr(path,"",AT_EMPTY_PATH,0,0,MS_SHARED));
+    CHECK(!tree_move(path,"",tree,"",4U|64U|0x100U));
+    int filetree=tree_open(path,"marker",1U);CHECK(filetree>=0);
+    CHECK(!tree_attr(filetree,"",AT_EMPTY_PATH,0,0,MS_PRIVATE));
+    CHECK(!tree_move(path,"",filetree,"",4U|64U|0x100U)&&!close(filetree));
+    CHECK(!tree_move(tree,"",AT_FDCWD,"/ma/target",4U));
+    marker(AT_FDCWD,"/ma/target/marker");marker(AT_FDCWD,"/ma/target/sub/child");
+    CHECK(!close(tree));marker(AT_FDCWD,"/ma/target/marker");
+    char c;CHECK(read(old,&c,1)==1&&c=='x'&&!close(old));
+    CHECK(!tree_attr(AT_FDCWD,"/ma/target",AT_RECURSIVE,0,0,MS_PRIVATE));
+    CHECK(!umount2("/ma/target",MNT_DETACH));
+    tree=tree_open(path,"",1U|AT_EMPTY_PATH);CHECK(tree>=0);
+    int hidden=open("/ma/target",O_PATH|O_DIRECTORY);CHECK(hidden>=0);
+    CHECK(!mount("tmpfs","/ma/target","tmpfs",0,NULL));touch("/ma/target/top");
+    ERROR(tree_move(tree,"",hidden,"",4U|64U|0x200U),EINVAL);CHECK(!close(hidden));
+    CHECK(!tree_move(tree,"",AT_FDCWD,"/ma/target",4U|0x200U)&&!close(tree));
+    marker(AT_FDCWD,"/ma/target/top");ERROR(access("/ma/target/marker",F_OK),ENOENT);
+    CHECK(!umount("/ma/target"));marker(AT_FDCWD,"/ma/target/marker");CHECK(!umount("/ma/target"));
+    puts("MOUNT-API CASE clone-recursive-attributes-move-and-close PASS");
+
+    CHECK(!tree_attr(path,"",AT_EMPTY_PATH|AT_RECURSIVE,0,2U|4U|8U,0));
+    int writer=open("/ma/source/sub/writer",O_CREAT|O_WRONLY,0600);CHECK(writer>=0);
+    ERROR(tree_attr(path,"",AT_EMPTY_PATH|AT_RECURSIVE,1U,0,0),EBUSY);
+    CHECK(!fstatfs(path,&sf)&&!(sf.f_flags&1U));
+    CHECK(!close(writer));
+    CHECK(!tree_attr(path,"",AT_EMPTY_PATH,0x10U,0x70U,0));
+    CHECK(!fstatfs(path,&sf)&&(sf.f_flags&1024U));
+    ERROR(tree_attr(path,"",AT_EMPTY_PATH,0,0x10U,0),EINVAL);
+    struct native_mount_attr noop={0};
+    CHECK(!syscall(442,-1,(void *)1,0,&noop,sizeof(noop)));
+    ERROR(syscall(442,path,"",AT_EMPTY_PATH,&noop,31),EINVAL);
+    struct {struct native_mount_attr value;uint64_t tail;} extended={.tail=1};
+    ERROR(syscall(442,path,"",AT_EMPTY_PATH,&extended,sizeof(extended)),E2BIG);
+    ERROR(syscall(442,path,"",AT_EMPTY_PATH,(void *)1,32),EFAULT);
+    ERROR(tree_attr(path,"",AT_EMPTY_PATH,0x10U,0,0),EINVAL);
+    ERROR(tree_attr(path,"",AT_EMPTY_PATH,0,0,MS_SHARED|MS_PRIVATE),EINVAL);
+    CHECK(!tree_attr(path,"",AT_EMPTY_PATH,0,0x70U,0));
+    CHECK(!tree_move(AT_FDCWD,"/ma/source",AT_FDCWD,"/ma/other",0));
+    marker(path,"marker");marker(AT_FDCWD,"/ma/other/sub/child");CHECK(!close(path));
+    CHECK(!umount2("/ma/other",MNT_DETACH));
+    puts("MOUNT-API CASE atomic-recursive-busy-and-source-fd PASS");
+
+    CHECK(!mount("tmpfs","/ma/source","tmpfs",0,NULL));touch("/ma/source/marker");
+    tree=tree_open(AT_FDCWD,"/ma/source",1U);CHECK(tree>=0);
+    int held=openat(tree,"marker",O_RDONLY);CHECK(held>=0&&!close(tree));
+    CHECK(read(held,&c,1)==1&&c=='x'&&!close(held));
+    CHECK(!umount("/ma/source"));
+    pid_t child=fork();CHECK(child>=0);
+    if(!child) {
+        CHECK(!unshare(CLONE_NEWNS)&&!mount(NULL,"/",NULL,MS_PRIVATE|MS_REC,NULL));
+        CHECK(!mount("tmpfs","/ma/target","tmpfs",0,NULL));
+        CHECK(!mkdir("/ma/target/old",0755));touch("/ma/target/mark");
+        int oldroot=open("/",O_PATH|O_DIRECTORY);CHECK(oldroot>=0&&!chdir("/"));
+        int entered[2],go[2];CHECK(!pipe(entered)&&!pipe(go));
+        pid_t observer=fork();CHECK(observer>=0);
+        if(!observer) {
+            int info=open("/proc/self/mountinfo",O_RDONLY);CHECK(info>=0);
+            char text[4096],byte,cwd[32];CHECK(read(info,text,sizeof(text))>0);
+            CHECK(write(entered[1],"x",1)==1&&read(go[0],&byte,1)==1);
+            CHECK(getcwd(cwd,sizeof(cwd))&&!strcmp(cwd,"/"));marker(AT_FDCWD,"/mark");
+            /* Linux binds a mountinfo FD to its open-time root. Use a fresh
+             * FD when asking about the process root after the pivot. */
+            CHECK(!close(info));info=open("/old/proc/self/mountinfo",O_RDONLY);CHECK(info>=0);
+            ssize_t bytes=read(info,text,sizeof(text)-1);CHECK(bytes>0);text[bytes]=0;
+            CHECK(strstr(text," /old ")&&!close(info));_exit(0);
+        }
+        char byte;CHECK(read(entered[0],&byte,1)==1);
+        CHECK(!syscall(41,"/ma/target","/ma/target/old"));
+        CHECK(write(go[1],"x",1)==1);joined(observer);
+        CHECK(!close(entered[0])&&!close(entered[1])&&!close(go[0])&&!close(go[1]));
+        char cwd[32];CHECK(getcwd(cwd,sizeof(cwd))&&!strcmp(cwd,"/"));
+        marker(AT_FDCWD,"/mark");CHECK(!access("/old/ma/target",F_OK));
+        CHECK(!fstat(oldroot,&a)&&!stat("/old",&b)&&a.st_ino==b.st_ino&&a.st_dev==b.st_dev);
+        CHECK(!close(oldroot));_exit(0);
+    }
+    joined(child);CHECK(!access("/ma/target",F_OK));
+    puts("MOUNT-API CASE detached-last-owner-and-pivot-root PASS");
+    child=fork();CHECK(child>=0);
+    if(!child) {
+        CHECK(!setuid(65534));ERROR(tree_open(AT_FDCWD,"/ma",1U),EPERM);
+        ERROR(tree_move(-1,"",-1,"",4U|64U),EPERM);
+        ERROR(tree_attr(-1,"",AT_EMPTY_PATH,1,0,0),EPERM);
+        ERROR(syscall(41,"/", "/"),EPERM);
+        ERROR(syscall(41,"/missing-root","/missing-old"),ENOENT);_exit(0);
+    }
+    joined(child);CHECK(!umount("/ma")&&!rmdir("/ma"));
+    /* Exercise the initial namespace as well as the copied-tree child. The
+     * supervisor and existing executable mappings retain their old objects. */
+    CHECK(!mkdir("/final-root",0755)&&!mount("tmpfs","/final-root","tmpfs",0,NULL));
+    CHECK(!mkdir("/final-root/old",0755));touch("/final-root/alive");
+    CHECK(!chdir("/")&&!syscall(41,"/final-root","/final-root/old"));
+    char cwd[32];CHECK(getcwd(cwd,sizeof(cwd))&&!strcmp(cwd,"/"));
+    marker(AT_FDCWD,"/alive");CHECK(!access("/old",F_OK));
+    puts("MOUNT-API CASE permissions-and-cleanup PASS");
+    puts("MOUNT-API END 5");return 0;
+}
 int main(void)
 {
+#ifdef MOUNT_API_ONLY
+    return mount_api();
+#else
+    (void)mount_api;
+#endif
 #ifndef MOUNT_PROPAGATION_ONLY
 #define MOUNT_PROPAGATION_ONLY 0
 #endif

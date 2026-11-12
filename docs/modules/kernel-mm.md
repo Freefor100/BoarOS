@@ -250,6 +250,8 @@ VMA 保留后备对象、文件权限上限和源子范围偏移。共享匿名�
 
 ## 硬件用户缺页解析
 
+缺页准备只保留跨装页过程必需的旧 VMA 快照；栈增长和返回后的 VMA 复查各自使用独立的临时帧，避免把它们的候选 VMA 一直保留到设备等待。lwext4 单范围读取的临时片段存储按实际可能涉及的文件系统块数取值，上限仍为八；已有批量工作区和 DMA 借用规则不变，不为冷缺页增加堆分配或常驻逐页数组。
+
 `kernel_mm_resolve_user_fault()` 的 `access` 必须恰为 READ、WRITE、EXECUTE 之一。通用层先检查用户范围、VMA、逻辑权限和现有 PTE；地址无 VMA 返回 `NOT_MAPPED`，合法 VMA 的权限不足返回 `ACCESS`。`ELF_PRIVATE/ELF` VMA 按 source 区间二分取得 FILE、COMPOSITE 或 ZERO backing，再按实际缺失的资源准备候选。硬件缺页与 uaccess 使用同一解析器，不为非法软件访问分配页面。
 
 匿名成功路径按架构页大小对齐故障地址，分配并清零一页，以 VMA 权限建立用户 PTE。文件路径按上述缓存/私有策略取得页面。实际提交者根据本次 PTE 变化登记翻译与指令代次：已有表内的单页发布按页同步，非叶结构变化使用全范围同步；可执行内容填充、COW 和执行权限发布还同步取指。RISC-V 对应 `SFENCE.VMA`、必要的远端 RFENCE 与 `FENCE.I`，不能由后端每次改单页时隐含执行。dispatcher 保持 `sepc` 不变，`sret` 后硬件重试原 load/store/fetch。`NOT_MAPPED/ACCESS` 在 Trap 边界形成 `SIGSEGV` 的 MAPERR/ACCERR，文件整页越过 EOF 的 `BUS_FAULT` 形成 `SIGBUS`；uaccess 将这些用户访问错误转换为 `EFAULT`。物理页耗尽精确返回 `NO_MEMORY`，非法页表或分配器状态直接 fatal。

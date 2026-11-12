@@ -122,7 +122,19 @@ ext4 转 RO 前排空至 checkpoint，再独占 journal 服务资格，暂停存
 
 `clone/clone3(CLONE_NEWNS)` 和 `unshare(CLONE_NEWNS)` 在原文件系统实例上复制整棵挂载视图树，并按源视图身份把 root/cwd 转到新树；进程已有 FD 和 mmap 继续持有原视图。普通 fork 继承命名空间，`CLONE_FS` 另共享 root/cwd/umask；`CLONE_NEWNS` 与 `CLONE_FS` 或线程创建互斥。复制完整成功才替换调用者上下文或发布子任务，失败按叶到根归还候选视图。挂载、移动、重配置和卸载只接受调用者树中的视图，已有外部 dirfd/cwd 不授予改变原树的资格。新视图继承挂载属性；通过同一实例访问的文件数据、inode 和全实例重配置仍然共享。初始视图默认私有，命名空间复制保留源视图的peer及master关系；`MS_PRIVATE|MS_REC` 实际断开对应传播关系。
 
-`setns` 接受 `/proc/<pid>/ns/mnt` 打开的命名空间 FD，或用 `CLONE_NEWNS` 选择 pidfd 目标的当前挂载命名空间。加入要求 `CAP_SYS_ADMIN`、`CAP_SYS_CHROOT` 和独占 FS 上下文，成功后 root/cwd 指向目标树的可见根，保留 umask。命名空间 FD 保持实际树存活，源任务退出也能加入；最后一个命名空间 owner 归还后，VFS 在既有安全回收点摘下该树，旧 OFD、路径和映射仍按各自引用释放。`pivot_root` 和其他命名空间类型仍未提供。直接用例见 `tests/workloads/resource/mount_namespace.c`。
+`setns` 接受 `/proc/<pid>/ns/mnt` 打开的命名空间 FD，或用 `CLONE_NEWNS` 选择 pidfd 目标的当前挂载命名空间。加入要求 `CAP_SYS_ADMIN`、`CAP_SYS_CHROOT` 和独占 FS 上下文，成功后 root/cwd 指向目标树的可见根，保留 umask。命名空间 FD 保持实际树存活，源任务退出也能加入；最后一个命名空间 owner 归还后，VFS 在既有安全回收点摘下该树，旧 OFD、路径和映射仍按各自引用释放。其他命名空间类型仍未提供。直接用例见 `tests/workloads/resource/mount_namespace.c`。
+
+### 挂载树 FD 与根切换
+
+`open_tree(428)` 不带克隆标志时取得实际路径的 O_PATH 描述；`OPEN_TREE_CLONE` 创建尚未连接的挂载视图树，`AT_RECURSIVE` 复制可绑定的子挂载。FD 本身不复制文件内容，克隆视图继续共用原文件系统实例。EMPTY_PATH当前要求FD有真实VFS路径，无路径的匿名socket等对象不提供挂载树视图。克隆根的原始 OFD 持有一份树清理 owner，dup、fork和FD传递共享它；最后一个 OFD 使用者关闭时，只有仍未连接的树才进入既有退休队列。其他路径、文件和 mmap 继续按自己的引用存活。`OPEN_TREE_NAMESPACE` 则把所选树放入独立挂载命名空间，返回可供 setns 使用的真实命名空间 FD，与 CLONE 标志互斥。
+
+`move_mount(429)` 使用目录 FD 与路径，或 EMPTY_PATH 指向的实际对象，转移挂载连接；源、目标 OFD 的借用覆盖整个操作，避免并发关闭提前退休未连接的源树。已连接源须属于调用者命名空间；分离源须为所持树根并核对创建时的命名空间ID，不能单独提取其中的子挂载。成功挂入后，连接接管原树 owner，关闭原克隆 FD 不会卸载它。符号链接跟随和空路径由源、目标各自的 flags 控制。BENEATH 将源挂在目标覆盖挂载下面，目标的原内容继续可见；SET_GROUP 在同一文件系统、符合根范围与传播资格的视图之间建立对应 peer/master 关系。现有 mount(MS_MOVE) 使用同一移动实现。
+
+`mount_setattr(442)` 接受原生32字节 mount_attr，较大结构的扩展尾部必须为零。支持视图的 RDONLY、NOSUID、NODEV、NOEXEC、四种 atime 策略及传播类型；递归修改先按稳定实例顺序取得重配置资格，检查全部选中视图的写入者及状态，再共同发布。后代忙或准备分配失败时保留全部原属性，不用逐个 bind-remount 形成部分成功。atime 是枚举，改变策略时须在 attr_clr 中完整清除 ATIME 字段。该接口不重配置共享后端的只读状态；IDMAP 和 NOSYMFOLLOW 当前返回 EOPNOTSUPP。
+
+`pivot_root(41)` 将当前根挂载移到 new_root 下的 put_old，并把 new_root 放到原根的位置。路径关系、挂载根和 shared 父连接按固定 Linux 检查；连接转移及所有仍精确指向旧根的 root/cwd 在同一状态保护内发布。FS 上下文按实际共享对象登记，独立 fork 上下文和 CLONE_FS 使用者均得到对应更新，其他 cwd 保留原路径身份。命名空间 top 的快照单独持有路径引用，旧快照不会因根替换而悬空。初始根的内核启动 owner 与新建立的命名空间连接各持一份引用；命名空间退出可退休整棵替换树，启动 owner 留到关机时完成后端释放。
+
+四个入口沿现有 CPU0 挂载控制执行，不改变文件数据路径的执行位置。`tests/userland/api8.py --program mount_api` 与固定 Linux 运行同一 ELF，检查路径／命名空间 FD、克隆及关闭、移动与传播组、递归属性失败、根切换和旧对象身份。宿主 mount-api 组检查候选分配失败及真实 owner 归还。
 
 ### 挂载传播与连接发布
 

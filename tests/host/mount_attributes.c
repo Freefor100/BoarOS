@@ -3,6 +3,7 @@
 #include <kernel/open_file.h>
 #include <kernel/uaccess.h>
 #include <kernel/heap.h>
+#include <kernel/fs_context.h>
 #include <kernel/errno.h>
 #include <kernel/task.h>
 #include "../../kernel/syscall/private.h"
@@ -674,6 +675,64 @@ static void mount_propagation(struct kernel_vfs_mount *mount)
     assert(!kernel_vfs_path_release(&root));
     puts("PASS propagation: shared/slave identities, four mount OOM stages, pre-prepare unmount OOM, concurrent borrow refusal and exact final owners");
 }
+static void mount_tree_api(struct kernel_vfs_mount *mount)
+{
+    struct kernel_vfs_path *root=NULL,*point=NULL,*source=NULL,*copy=NULL;
+    assert(!kernel_vfs_path_root(mount,&heap,&root));
+    assert(!kernel_vfs_mkdir_at(root,root,"/api-source",0755,0));
+    assert(!kernel_vfs_mkdir_at(root,root,"/api-target",0755,0));
+    struct kernel_vfs_mount *base=NULL;assert(!kernel_tmpfs_create(&heap,0,NULL,&base));
+    assert(!kernel_vfs_path_resolve(root,root,"/api-source",1,&point));
+    assert(!kernel_vfs_mount_attach(base,point)&&!kernel_vfs_path_release(&point));
+    assert(!kernel_vfs_path_resolve(root,root,"/api-source",1,&source));
+    struct kernel_heap_statistics before,after;kernel_heap_get_statistics(&heap,&before);
+    allocation_calls=0;allocation_fail_at=1;
+    assert(kernel_vfs_clone_tree(source,1,&copy)==-KERNEL_ENOMEM&&!copy);
+    allocation_fail_at=0;kernel_heap_get_statistics(&heap,&after);
+    assert(before.live_allocations==after.live_allocations);
+    assert(!kernel_vfs_clone_tree(source,1,&copy));
+    struct kernel_vfs_mount *tree=kernel_vfs_path_mount(copy);
+    struct kernel_open_file_description *file=NULL;
+    assert(!kernel_open_file_create_path(&heap,copy,tree,&file));
+    assert(!kernel_open_file_acquire(file));
+    struct kernel_open_file_description *borrow=file;
+    assert(!kernel_open_file_release(&file)&&borrow&&tree->detached_tree);
+    allocation_calls=0;allocation_fail_at=1;
+    assert(kernel_vfs_set_mount_attributes(copy,1,0,0,1)==-KERNEL_ENOMEM);
+    allocation_fail_at=0;assert(!tree->read_only);
+    assert(!kernel_vfs_set_mount_attributes(copy,1|2|4|8,0,0,1)&&tree->read_only&&!base->read_only);
+    assert(!kernel_vfs_set_mount_attributes(copy,0,1,0,1));
+    assert(!kernel_vfs_change_propagation(source,1048576,0));
+    assert(!kernel_vfs_move_mount(source,copy,0x100U)&&tree->propagation_group==base->propagation_group);
+    assert(!kernel_vfs_path_resolve(root,root,"/api-target",1,&point));
+    assert(!kernel_vfs_move_mount(copy,point,0)&&!tree->detached_tree);
+    assert(!kernel_vfs_path_release(&point)&&!kernel_open_file_release(&borrow));
+    assert(!kernel_vfs_umount(copy,2)&&!kernel_vfs_path_release(&copy));
+    assert(!kernel_vfs_umount(source,0)&&!kernel_vfs_path_release(&source));
+    assert(!kernel_vfs_path_release(&root)&&!kernel_vfs_reap_mounts());
+    puts("PASS mount-api: detached OFD owners, clone and attribute OOM rollback, view attributes and attach/close cleanup");
+}
+static void mount_pivot_owner(void)
+{
+    struct kernel_vfs_mount *boot=NULL,*next=NULL;
+    assert(!kernel_tmpfs_create(&heap,0,NULL,&boot)&&!kernel_tmpfs_create(&heap,0,NULL,&next));
+    struct kernel_fs_context fs={0};assert(!kernel_fs_context_create(&fs,boot,&heap));
+    struct kernel_vfs_path *old=NULL,*new_root=NULL,*covered=NULL,*put_old=NULL;
+    assert(!kernel_vfs_path_root(boot,&heap,&old));
+    assert(!kernel_vfs_mkdir_at(old,old,"new",0755,0));
+    assert(!kernel_vfs_path_resolve(old,old,"new",1,&covered));
+    assert(!kernel_vfs_mount_attach(next,covered)&&!kernel_vfs_path_release(&covered));
+    assert(!kernel_vfs_path_resolve(old,old,"new",1,&new_root));
+    assert(!kernel_vfs_mkdir_at(new_root,old,"old",0755,0));
+    assert(!kernel_vfs_path_resolve(new_root,old,"old",1,&put_old));
+    assert(!kernel_vfs_pivot_root(&fs,new_root,put_old));
+    assert(!kernel_vfs_path_release(&put_old)&&!kernel_vfs_path_release(&old));
+    assert(!kernel_vfs_path_resolve(new_root,new_root,"old",1,&old));
+    assert(!kernel_vfs_umount(old,0)&&!kernel_vfs_path_release(&old));
+    assert(!kernel_vfs_unmount(boot));
+    assert(!kernel_vfs_path_release(&new_root)&&!kernel_fs_context_release(&fs)&&!kernel_vfs_reap_mounts());
+    puts("PASS pivot-root: independent boot owner does not make an idle old root busy; namespace and external owners drain");
+}
 static void atime_policy(struct kernel_vfs_mount *mount,struct kernel_vfs_file *file)
 {
     struct kernel_vfs_path *root=NULL;assert(!kernel_vfs_path_root(mount,&heap,&root));
@@ -703,7 +762,9 @@ int main(int argc,char **argv)
     struct kernel_vfs_mount *mount=0;struct kernel_open_file_description *file=0;
     assert(!kernel_tmpfs_create(&heap,0,"nr_blocks=8",&mount));mount->noexec=mount->nodev=1;
     opened(mount,"/file",0755,&file);file->open_flags=2;
-    if(!strcmp(argv[1],"propagation"))mount_propagation(mount);
+    if(!strcmp(argv[1],"pivot-owner"))mount_pivot_owner();
+    else if(!strcmp(argv[1],"mount-api"))mount_tree_api(mount);
+    else if(!strcmp(argv[1],"propagation"))mount_propagation(mount);
     else if(!strcmp(argv[1],"atime"))atime_policy(mount,&file->file);
     else if(!strcmp(argv[1],"executable-path"))mount_executable_path(mount);
     else if(!strcmp(argv[1],"move"))mount_move(mount);

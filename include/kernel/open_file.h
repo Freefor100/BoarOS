@@ -79,6 +79,10 @@ enum kernel_open_file_status kernel_open_file_create_at(
     const struct kernel_vfs_open_request *request,
     struct kernel_open_file_description **owner, int *created, int *linux_result);
 
+/* Exact path owner; detached cleanup is consumed by this OFD, not each dup. */
+int kernel_open_file_create_path(struct kernel_heap *,struct kernel_vfs_path *,
+    struct kernel_vfs_mount *,struct kernel_open_file_description **);
+
 /* Recheck current execute permission and acquire an independent executable
  * owner from the actual path identity, including an unlinked O_PATH file. */
 enum kernel_open_file_status kernel_open_file_create_executable_path(
