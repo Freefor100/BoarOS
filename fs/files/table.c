@@ -41,7 +41,18 @@ enum kernel_files_status kernel_files_ioctl(
     enum kernel_files_status status = kernel_files_pin_data(files, fd, &description,
                                                        linux_result);
     if (status != KERNEL_FILES_STATUS_OK || *linux_result) return status;
-    if (command==UINT32_C(0x80086601) || command==UINT32_C(0x40086602)) {
+    if (command==UINT32_C(0x5421)) { /* FIONBIO changes OFD state, not device configuration. */
+        int32_t on=0;size_t copied=0;
+        if (kernel_copy_from_user(mm,&on,argument,sizeof(on),&copied) || copied!=sizeof(on))
+            *linux_result=-KERNEL_EFAULT;
+        else {
+            /* Change only this bit, without overwriting concurrent F_SETFL
+             * updates to append, noatime or asynchronous notification. */
+            if (on) __atomic_fetch_or(&description->open_flags,LINUX_O_NONBLOCK,__ATOMIC_RELAXED);
+            else __atomic_fetch_and(&description->open_flags,~(uint32_t)LINUX_O_NONBLOCK,__ATOMIC_RELAXED);
+            *linux_result=0;
+        }
+    } else if (command==UINT32_C(0x80086601) || command==UINT32_C(0x40086602)) {
         uint32_t flags=0;
         size_t copied=0;
         int set=command==UINT32_C(0x40086602);
