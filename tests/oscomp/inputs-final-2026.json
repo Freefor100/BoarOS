@@ -1,0 +1,33 @@
+{
+  "name": "final-2026-public",
+  "testsuite_url": "https://github.com/oscomp/testsuits-for-oskernel.git",
+  "branch": "final-2026",
+  "commit": "b5ec6ef8497e1818cbdec3b54bb722f036e57972",
+  "image_source": "Public disk download linked by final-2026 README; user-provided archives",
+  "architectures": {
+    "riscv": {
+      "archive": "sdcard-rv-pub.img.gz",
+      "archive_bytes": 2138539618,
+      "archive_sha256": "cba87f43ae569bcf2b8e4614f75cec1bf51bedb2804626fe466fcce3861df6f1",
+      "image_bytes": 15032385536,
+      "image_sha256": "d74e436522f5946ca17280a7a25f17dbb6604b71fe675bb8a021ce8e849b334c",
+      "source_has_pending_journal": true,
+      "test_script_sha256": {
+        "cagent_testcode.sh": "7d90e3aa265b36836ae70ec03f8362da5e52a81d4f68b7e5fa6dd310f7c62d88",
+        "buildstorm_testcode.sh": "5bfbaa5bd99bec595ccd980fff0ebc002d42c0ce0a7e28af266f0ddad69b7189"
+      }
+    },
+    "loongarch": {
+      "archive": "sdcard-la-pub.img.gz",
+      "archive_bytes": 2156749715,
+      "archive_sha256": "2c411447274fbd83505d2fac505a5d9e8ed8ff3bdfc3d2d6cbdb8f61ff7d90d2",
+      "image_bytes": 15032385536,
+      "image_sha256": "d1410544e677e11efb1c240be6ffb201c89d6de58c9675e73314a696e4cefdc5",
+      "source_has_pending_journal": true,
+      "test_script_sha256": {
+        "cagent_testcode.sh": "7d90e3aa265b36836ae70ec03f8362da5e52a81d4f68b7e5fa6dd310f7c62d88",
+        "buildstorm_testcode.sh": "5bfbaa5bd99bec595ccd980fff0ebc002d42c0ce0a7e28af266f0ddad69b7189"
+      }
+    }
+  }
+}

@@ -23,6 +23,30 @@ pre-20250615，盘内 LTP 报告版本为 20240524。运行和交付方式见
 
 ## 发布程序与版本预期
 
+### final-2026：公开盘日志恢复与 BuildStorm 管道 ioctl
+
+输入和版本集中在 [`inputs-final-2026.json`](../../tests/oscomp/inputs-final-2026.json)，
+与此前 pre-20250615 分开维护。RV、LA 两张公开盘各为14 GiB，带 `needs_recovery`。
+直接使用公开盘副本启动时，两架构均在根盘挂载阶段失败，尚未进入 CAgent 或 BuildStorm。
+LA 返回 `EUCLEAN`（117）；RV 最终显示清理失败，调试器确认其保存的原始失败是挂载。
+Linux `e2fsck -E journal_only -p` 能正常重放副本日志，随后同一 BoarOS 内核可以挂载并执行
+两题。解压模板与原压缩包未修改。这里暴露的是 BoarOS 对这组待恢复日志的兼容问题，
+具体拒绝检查点仍待定位，不能把恢复后启动算成原盘直接通过。
+
+恢复后的两架构均通过 Rust/Cargo 版本检查，但最小构建、tg-xtask 预构建及正式构建失败。
+正式构建均退出101、产物0字节。盘内同版本 Rust 源码显示：
+`Child::wait_with_output` → `sys/process/unix/common.rs::read_output` →
+`FileDesc::set_nonblocking` → `ioctl(pipefd, FIONBIO, &one)`。
+BoarOS `kernel_files_ioctl` 未实现这项通用命令，普通管道落入 `ENOTTY`（25）；
+工具链在 `process.rs:2454` 对双管道收集结果调用 `unwrap()`，因此 panic。
+这是内核 ioctl 缺口，不是缺库，也不是编译耗时超限。本次只记录，没有修改内核或工具链。
+
+本分支原判分脚本还有三处解释边界：CAgent 十项全部取得时间奖励时合计199.1分，
+不是 README 声称的200分；BuildStorm 在正式编译失败时仍给版本检查8分，
+与 README 的“编不出则本题0分”文字不一致；README 要求八核，而 BuildStorm judge 的
+LA 核数告警期望值是12。本次按 README 使用八核，不修改判分脚本，不折算正式比赛总成绩。
+具体结果见[本次公开盘运行](oscomp-official-delivery.md#final-2026-公开盘首次运行)。
+
 ### BusyBox 定向属性检查的 shell 与交互要求
 
 LA 原盘的 `sh` 是 hush，不支持 `set -u`；同一 ELF 在固定 Linux 上也对
