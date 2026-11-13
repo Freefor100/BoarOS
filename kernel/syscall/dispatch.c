@@ -12,6 +12,7 @@
 #include <kernel/uaccess.h>
 #include <kernel/scheduler.h>
 #include <kernel/time.h>
+#include <kernel/tty.h>
 #include <arch/context.h>
 
 #include <stddef.h>
@@ -52,6 +53,7 @@
 #define LINUX_SYSCALL_OPENAT2 437U
 #define LINUX_SYSCALL_MEMFD_CREATE 279U
 #define LINUX_SYSCALL_CLOSE 57U
+#define LINUX_SYSCALL_VHANGUP 58U
 #define LINUX_SYSCALL_PIPE2 59U
 #define LINUX_SYSCALL_GETDENTS64 61U
 #define LINUX_SYSCALL_LSEEK 62U
@@ -474,6 +476,9 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
     } else if (request->number == LINUX_SYSCALL_MEMFD_CREATE) {
         if (syscall_handle_memfd_create(caller,request,&decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == LINUX_SYSCALL_VHANGUP) {
+        decoded.action=KERNEL_SYSCALL_ACTION_RETURN;
+        decoded.value=kernel_tty_vhangup(caller);
     } else if (request->number == LINUX_SYSCALL_CLOSE) {
         if (syscall_handle_close(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {

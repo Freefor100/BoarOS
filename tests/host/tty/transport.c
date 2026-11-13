@@ -5,10 +5,6 @@
 #include "../../../fs/vfs_objects.h"
 #include <kernel/devpts.h>
 #include <kernel/credentials.h>
-const struct kernel_credentials *kernel_credentials_current(void)
-{ static const struct kernel_credentials root={.effective=KERNEL_CAP_VALID_MASK};return &root; }
-int kernel_credentials_capable(const struct kernel_credentials *credentials,unsigned capability)
-{ return capability<64 && !!(credentials->effective & (UINT64_C(1)<<capability)); }
 
 /* 模型只替代VFS身份与调度；传输和行规程执行生产代码。 */
 struct kernel_devpts_entry {

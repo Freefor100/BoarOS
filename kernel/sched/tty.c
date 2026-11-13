@@ -106,6 +106,21 @@ void kernel_task_tty_signal_group(struct kernel_pid *group, unsigned signal)
         scheduler_task_cursor_next(&cursor);
     }
 }
+void kernel_task_tty_notify_session(struct kernel_pid *session)
+{
+    SCHEDULER_TASK_BORROW(leader,0);
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        struct kernel_pid_member *member=session->members[KERNEL_PID_TID];
+        if(member && process_identity(member->task,KERNEL_PID_SID)==session) {
+            leader=member->task;scheduler_task_get_locked(leader);
+        }
+    }
+    if(leader) {
+        (void)signal_send_kernel_group(leader,1);
+        (void)signal_send_kernel_group(leader,18);
+    }
+}
 void kernel_task_tty_signal_session(struct kernel_tty *tty, struct kernel_pid *session)
 {
     if (!session) return;

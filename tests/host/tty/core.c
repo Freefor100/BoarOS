@@ -2,11 +2,14 @@
 #include "../../../fs/open_file_internal.h"
 #include <assert.h>
 #include <kernel/errno.h>
+#include <kernel/credentials.h>
+#include <kernel/async_io.h>
 #include <kernel/heap.h>
 #include <kernel/signal.h>
 #include <kernel/time.h>
 #include <kernel/tty.h>
 #include <kernel/tty_task.h>
+#include <kernel/wait_internal.h>
 #include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,11 +24,15 @@ static struct kernel_heap heap;
 static struct kernel_tty *tty;
 static const struct kernel_char_device *device;
 static void *instance;
-static unsigned live, fail_alloc, closes, kicks, signals[65];
+static unsigned live, fail_alloc, closes, kicks, signals[65], session_signals;
 static uint64_t now_ns, fault_address;
 static unsigned char output[65536];
 static size_t output_size, credit = 65536;
 static struct kernel_pid identity = {.number = 7, .references = 1};
+static struct kernel_credentials credentials = {.effective = KERNEL_CAP_VALID_MASK};
+const struct kernel_credentials *kernel_credentials_current(void) { return &credentials; }
+int kernel_credentials_capable(const struct kernel_credentials *c, unsigned capability)
+{ return capability < 64 && !!(c->effective & (UINT64_C(1) << capability)); }
 static void (*sleep_action)(void);
 static unsigned sleeps, pending, restart_notes;
 static jmp_buf cancelled;
@@ -59,6 +66,7 @@ void kernel_pid_get(struct kernel_pid *id)
     assert(id->references);
     id->references++;
 }
+void kernel_task_identity_retain(struct kernel_pid *id) { kernel_pid_get(id); }
 void kernel_pid_put(struct kernel_pid *id)
 {
     assert(id->references > 1);
@@ -95,10 +103,11 @@ void kernel_task_identity_put(struct kernel_pid *id) { kernel_pid_put(id); }
 int kernel_task_tty_identity_matches(const struct kernel_task *t, enum kernel_pid_role r,
                                      const struct kernel_pid *id)
 { (void)r; return t && id == &identity; }
+static enum kernel_pid_role last_identity_role;
 struct kernel_pid *kernel_task_tty_identity(const struct kernel_task *t,
                                             enum kernel_pid_role r)
 {
-    (void)r;
+    last_identity_role=r;
     if (t) kernel_pid_get(&identity);
     return t ? &identity : 0;
 }
@@ -135,8 +144,11 @@ void kernel_task_tty_signal_group(struct kernel_pid *g, unsigned s)
     if (g)
         signals[s]++;
 }
+void kernel_task_tty_notify_session(struct kernel_pid *sid)
+{ if(sid)session_signals++; }
 void kernel_task_tty_signal_session(struct kernel_tty *v, struct kernel_pid *sid)
 {
+    if (sid) session_signals++;
     kernel_task_tty_clear_session(v, sid);
 }
 void kernel_task_tty_request_set(struct kernel_task *t, struct kernel_tty_request *r)
@@ -172,6 +184,25 @@ enum kernel_scheduler_status kernel_wait_queue_wake_all(struct kernel_wait_queue
 {
     assert(q->initialized);
     return 0;
+}
+int kernel_wait_cursor_prepare_event(struct kernel_wait_queue *q, struct kernel_wait_cursor *c,
+                                     uint64_t event, struct kernel_task *recipient)
+{
+    assert(q->initialized);
+    if (!q->head) return 0;
+    *c = (struct kernel_wait_cursor){.queue = q, .node = q->head,
+                                    .event = event, .recipient = recipient};
+    return c->node != 0;
+}
+void kernel_wait_cursor_wake(struct kernel_wait_cursor *c, int all)
+{
+    (void)all;
+    while (c->node) {
+        struct kernel_wait_node *n = c->node;
+        c->node = n->next;
+        if (n->callback) n->callback(n, KERNEL_WAIT_WOKEN, c->event);
+    }
+    *c = (struct kernel_wait_cursor){0};
 }
 enum kernel_scheduler_status
 kernel_scheduler_block_current(struct kernel_wait_queue *q, uint64_t deadline,
@@ -503,6 +534,7 @@ int main(void)
     kernel_tty_shutdown(tty);
     assert(read_into(buf, 1, 0) == 0);
     assert(device->poll(instance, 0, 0, 0) & KERNEL_POLLHUP);
+    assert(device->poll(instance, 0, 0, 0) & KERNEL_POLLERR);
     assert(kernel_tty_service_output(tty, 100) == 1);
     assert(device->write(instance, &task, 0, "x", 1, &written) == -KERNEL_EIO);
     pin = &file;

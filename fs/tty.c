@@ -1,4 +1,5 @@
 #include <kernel/credentials.h>
+#include <kernel/async_io.h>
 #include "char_device_internal.h"
 #include "files/private.h"
 #include "open_file_internal.h"
@@ -12,6 +13,7 @@
 #include <kernel/time.h>
 #include <kernel/tty.h>
 #include <kernel/tty_task.h>
+#include <kernel/wait_internal.h>
 #include <string.h>
 
 #define RING 4096U
@@ -70,7 +72,7 @@ struct kernel_tty {
     struct kernel_tty_transport transport;
     void *transport_owner;
     struct kernel_tty_termios settings;
-    struct kernel_wait_queue events;
+    struct kernel_wait_queue events, async_events;
     struct kernel_tty_request *reader, *writer, *mode_owner;
     struct kernel_pid *session, *foreground;
     uint64_t rdev, generation, head, tail, canonical_head;
@@ -148,8 +150,32 @@ int32_t kernel_tty_foreground(const struct kernel_tty *tty)
 }
 static int hungup(const struct tty_instance *instance)
 {
-    return instance->tty->shutdown || instance->generation != instance->tty->generation;
+    return instance->tty->shutdown || (!instance->console &&
+           instance->generation != instance->tty->generation);
 }
+static struct kernel_wait_queue *device_async_source(void *opaque)
+{
+    struct tty_instance *instance = opaque;
+    return hungup(instance) ? 0 : &instance->tty->async_events;
+}
+static struct kernel_pid *device_async_owner(void *opaque, struct kernel_task *caller,
+                                            int *owner_type)
+{
+    struct tty_instance *instance = opaque;
+    uintptr_t irq = arch_interrupt_save();
+    struct kernel_pid *group = instance->tty->foreground;
+    if (group) {
+        kernel_task_identity_retain(group);
+        *owner_type = 2; /* F_OWNER_PGRP */
+    } else {
+        group = kernel_task_tty_identity(caller, KERNEL_PID_TID);
+        *owner_type = 1; /* F_OWNER_PID */
+    }
+    arch_interrupt_restore(irq);
+    return group;
+}
+static int writable(struct kernel_tty *tty)
+{ return tty->order_head - tty->order_tail < 256 && tty->tx_head - tty->tx_tail < RING; }
 static void packet_event(struct kernel_tty *tty, unsigned flags)
 {
     if (tty->transport.event) tty->transport.event(tty->transport_owner, flags);
@@ -657,6 +683,8 @@ static size_t receive_input(struct kernel_tty *tty, const struct kernel_tty_rx *
     size_t j = 0;
     for (; j < count; j++) {
         uintptr_t irq = arch_interrupt_save();
+        struct kernel_wait_cursor async = {0};
+        uint64_t old_head = tty->head, old_canonical = tty->canonical_head;
         if (nonblocking && tty->deferred_flush) {
             if (tty->mode_owner) { arch_interrupt_restore(irq); break; }
             tty->deferred_flush = 0;
@@ -706,7 +734,11 @@ static size_t receive_input(struct kernel_tty *tty, const struct kernel_tty_rx *
         } else {
             input_byte(tty, c, 0);
         }
+        if (canonical_mode(tty) ? tty->canonical_head != old_canonical && tty->canonical_head > tty->tail
+                                : tty->head != old_head && tty->head > tty->tail)
+            (void)kernel_wait_cursor_prepare_event(&tty->async_events, &async, KERNEL_ASYNC_POLL_IN, 0);
         arch_interrupt_restore(irq);
+        if (async.queue) kernel_wait_cursor_wake(&async, 1);
     }
     tty->nonblocking_rx = 0;
     tty->transport.kick(tty->transport_owner);
@@ -723,6 +755,8 @@ size_t kernel_tty_service_output(struct kernel_tty *tty, size_t budget)
         return 0;
     while (total < budget) {
         uintptr_t irq = arch_interrupt_save();
+        struct kernel_wait_cursor async = {0};
+        int was_writable = writable(tty);
         unsigned char c;
         int priority = tty->xchar_valid;
         if (priority)
@@ -750,9 +784,12 @@ size_t kernel_tty_service_output(struct kernel_tty *tty, size_t budget)
                     tty->tx_tail++;
             }
             changed(tty);
+            if (!was_writable && writable(tty))
+                (void)kernel_wait_cursor_prepare_event(&tty->async_events, &async, KERNEL_ASYNC_POLL_OUT, 0);
             total++;
         }
         arch_interrupt_restore(irq);
+        if (async.queue) kernel_wait_cursor_wake(&async, 1);
         if (!sent)
             break;
     }
@@ -787,8 +824,12 @@ static void drop_session(struct kernel_tty *tty)
 void kernel_tty_disassociate(struct kernel_tty *tty, int on_exit)
 {
     uintptr_t irq = arch_interrupt_save();
+    /* Clearing the final ctty owner may let the PTY worker retire its base. */
+    kernel_tty_get(tty);
+    struct kernel_wait_cursor async = {0};
     if (on_exit) {
         tty->generation++;
+        (void)kernel_wait_cursor_prepare_event(&tty->async_events, &async, KERNEL_ASYNC_INVALIDATE, 0);
         flush_input(tty);
         kernel_task_tty_signal_session(tty, tty->session);
         kernel_task_tty_signal_group(tty->foreground, 1);
@@ -800,6 +841,48 @@ void kernel_tty_disassociate(struct kernel_tty *tty, int on_exit)
     drop_session(tty);
     changed(tty);
     arch_interrupt_restore(irq);
+    if (async.queue) kernel_wait_cursor_wake(&async, 1);
+    irq = arch_interrupt_save();
+    kernel_tty_put(tty);
+    arch_interrupt_restore(irq);
+}
+int kernel_tty_vhangup(struct kernel_task *caller)
+{
+    if (!kernel_credentials_capable(kernel_credentials_current(), KERNEL_CAP_SYS_TTY_CONFIG))
+        return -KERNEL_EPERM;
+    KERNEL_SERVICE_SCOPE(service);
+    uintptr_t irq = arch_interrupt_save();
+    struct kernel_tty *tty = kernel_task_controlling_tty(caller);
+    struct kernel_wait_cursor async = {0};
+    struct kernel_pid *session = 0;
+    if (tty) {
+        kernel_tty_get(tty);
+        session = tty->session;
+        if (session) kernel_task_identity_retain(session);
+        tty->generation++;
+        (void)kernel_wait_cursor_prepare_event(&tty->async_events, &async, KERNEL_ASYNC_INVALIDATE, 0);
+        flush_input(tty);
+        flush_output(tty);
+        tty->stopped = tty->flow_stopped = tty->throttled = tty->xchar_valid = 0;
+        tty->packet_status = 0;
+        kernel_task_tty_clear_session(tty, session);
+        drop_session(tty);
+        changed(tty);
+    }
+    arch_interrupt_restore(irq);
+    /* Signal records may allocate; the operation reference keeps the tty
+     * alive while session owners and asynchronous subscriptions are removed. */
+    if (session) {
+        kernel_task_tty_notify_session(session);
+        kernel_task_identity_put(session);
+    }
+    if (async.queue) kernel_wait_cursor_wake(&async, 1);
+    if (tty) {
+        irq = arch_interrupt_save();
+        kernel_tty_put(tty);
+        arch_interrupt_restore(irq);
+    }
+    return 0;
 }
 void kernel_tty_shutdown(struct kernel_tty *tty)
 {
@@ -807,10 +890,13 @@ void kernel_tty_shutdown(struct kernel_tty *tty)
         return;
     kernel_tty_disassociate(tty, 1);
     uintptr_t irq = arch_interrupt_save();
+    struct kernel_wait_cursor async = {0};
     tty->shutdown = 1;
+    (void)kernel_wait_cursor_prepare_event(&tty->async_events, &async, KERNEL_ASYNC_INVALIDATE, 0);
     tty->stopped = tty->flow_stopped = 0;
     changed(tty);
     arch_interrupt_restore(irq);
+    if (async.queue) kernel_wait_cursor_wake(&async, 1);
     tty->transport.kick(tty->transport_owner);
 }
 static int acquire_ctty(struct kernel_tty *tty, struct kernel_task *caller, int steal)
@@ -936,6 +1022,7 @@ int kernel_tty_create(struct kernel_heap *heap, const struct kernel_tty_transpor
                                         26, 0,  18,  15, 23, 22, 0, 0, 0};
     memcpy(tty->settings.cc, defaults, 19);
     kernel_wait_queue_init(&tty->events);
+    kernel_wait_queue_init(&tty->async_events);
     int error = transport->configure(owner, &tty->settings);
     if (error) {
         kernel_heap_release(heap, tty);
@@ -984,6 +1071,8 @@ void kernel_tty_publish_serial(struct kernel_tty *tty)
                                                  .write = device_write,
                                                  .ioctl = device_ioctl,
                                                  .poll = device_poll,
+                                                 .async_source = device_async_source,
+                                                 .async_owner = device_async_owner,
                                                  .readv = device_readv,
                                                  .writev = device_writev};
     arch_interrupt_restore(irq);
@@ -1345,7 +1434,7 @@ static uint32_t device_poll(void *opaque, uint32_t flags, uint32_t requested,
         *queue = &tty->events;
     if (hungup(i))
         result = KERNEL_POLLIN | KERNEL_POLLRDNORM | KERNEL_POLLOUT | KERNEL_POLLWRNORM |
-                 KERNEL_POLLHUP;
+                 KERNEL_POLLERR | KERNEL_POLLHUP;
     else {
         if (canonical_mode(tty)) {
             if (tty->canonical_head > tty->tail)
@@ -1359,7 +1448,7 @@ static uint32_t device_poll(void *opaque, uint32_t flags, uint32_t requested,
         }
         if (peer_state(tty) != KERNEL_TTY_PEER_LIVE) result |= KERNEL_POLLHUP;
         if (tty->packet && tty->packet_status) result |= KERNEL_POLLPRI | KERNEL_POLLIN | KERNEL_POLLRDNORM;
-        if (tty->order_head - tty->order_tail < 256 && tty->tx_head - tty->tx_tail < RING)
+        if (writable(tty))
             result |= KERNEL_POLLOUT | KERNEL_POLLWRNORM;
     }
     arch_interrupt_restore(irq);
@@ -1398,6 +1487,9 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
                         uint64_t command, uint64_t argument)
 {
     struct tty_instance *i = opaque;
+    /* The original OFD must remain hung up even when mode ioctls target its peer. */
+    if (hungup(i))
+        return command == 0x5410 ? -KERNEL_ENOTTY : -KERNEL_EIO;
     struct kernel_tty *tty = i->tty;
     struct kernel_tty *control = tty->master && tty->transport.peer ? tty->transport.peer(tty->transport_owner) : tty;
     struct tty_instance target = *i;
@@ -1732,7 +1824,8 @@ const struct kernel_char_device *kernel_tty_device_template(void)
     static const struct kernel_char_device operations = {
         .kind = KERNEL_OPEN_FILE_KIND_CONSOLE, .release = release_instance,
         .read = device_read, .write = device_write, .readv = device_readv,
-        .writev = device_writev, .ioctl = device_ioctl, .poll = device_poll
+        .writev = device_writev, .ioctl = device_ioctl, .poll = device_poll,
+        .async_source = device_async_source, .async_owner = device_async_owner
     };
     return &operations;
 }
