@@ -1484,7 +1484,7 @@ static int proc_process_snapshot(struct kernel_vfs_node *node,
             process.user_ticks, process.kernel_ticks,
             process.child_user_ticks, process.child_kernel_ticks,
             (uint64_t)(int64_t)process.scheduling_priority,
-            0U, process.threads, 0U, process.start_ticks,
+            (uint64_t)(int64_t)process.scheduling_nice, process.threads, 0U, process.start_ticks,
             process.virtual_bytes, process.resident_pages,
             process.rss_limit, process.start_code, process.end_code,
             process.start_stack, 0U, 0U,
@@ -1501,6 +1501,8 @@ static int proc_process_snapshot(struct kernel_vfs_node *node,
                 data[used++] = '-';
                 used += decimal(data + used,
                                 (uint32_t)-process.scheduling_priority);
+            } else if(i==10U && process.scheduling_nice<0) {
+                data[used++]='-';used+=decimal(data+used,(uint32_t)-process.scheduling_nice);
             } else used += decimal(data + used, fields[i]);
         }
         data[used++] = '\n';

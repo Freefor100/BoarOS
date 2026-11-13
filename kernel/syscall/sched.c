@@ -42,6 +42,11 @@ enum kernel_syscall_status syscall_handle_sched(
     struct kernel_sched_policy state;
     int result;
     decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+    if(nr==140 || nr==141) {
+        decoded->value=kernel_task_priority(caller,nr==140,(int32_t)request->arguments[0],
+            (int32_t)request->arguments[1],(int32_t)request->arguments[2]);
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
     if (nr==168) {
         unsigned cpu=0,node=0;
 #if BOAROS_MAX_CPUS > 1
@@ -96,6 +101,7 @@ enum kernel_syscall_status syscall_handle_sched(
             struct linux_sched_attr attr={
                 .size=size<sizeof(attr) ? size : sizeof(attr),
                 .policy=(uint32_t)state.policy,
+                .nice=state.policy==KERNEL_SCHED_FIFO||state.policy==KERNEL_SCHED_RR?0:state.nice,
                 .flags=state.reset_on_fork ? 1 : 0,
                 .priority=(state.policy==KERNEL_SCHED_FIFO || state.policy==KERNEL_SCHED_RR)
                     ? (uint32_t)state.priority : 0,

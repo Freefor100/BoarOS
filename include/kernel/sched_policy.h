@@ -43,6 +43,7 @@ uint64_t kernel_rt_bandwidth_delay(const struct kernel_rt_bandwidth *state,
 int kernel_rt_bandwidth_set(struct kernel_rt_bandwidth *state, int runtime_field,
                             int64_t value_us, uint64_t now_ns, int running_rt);
 struct kernel_task;
+int64_t kernel_task_priority(struct kernel_task *,int setting,int32_t which,int32_t who,int32_t nice);
 int kernel_task_sched_get(struct kernel_task *caller, int32_t pid,
                            struct kernel_sched_policy *state);
 int kernel_task_sched_set(struct kernel_task *caller, int32_t pid,

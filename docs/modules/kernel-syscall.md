@@ -17,7 +17,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 
 调用者是 scheduler 当前不透明 task，供依赖任务身份或资源的系统调用取得明确上下文；通用解码层不从 RISC-V `tp` 隐式寻找 current。请求包含系统调用号和六个 64 位参数。结果动作定义在公共头中：
 
-当前分派覆盖RV的246个编号、LA的245个编号；这表示入口已接入，各接口的具体支持范围见对应模块。
+当前分派覆盖RV的248个编号、LA的247个编号；这表示入口已接入，各接口的具体支持范围见对应模块。
 
 `pivot_root(41)`、`open_tree(428)`、`move_mount(429)`、`fsopen(430)`、`fsconfig(431)`、`fsmount(432)`、`fspick(433)`、`mount_setattr(442)`复用挂载控制与真实FD资源；挂载树、root/cwd及命名空间寿命见[VFS模块](vfs-ext4.md#挂载树-fd-与根切换)。
 `flock(32)`、`close_range(436)`、`epoll_pwait2(441)`、`fchmodat2(452)`和
@@ -54,9 +54,10 @@ LA的259仍返回`ENOSYS`。这些入口的直接消费者可用`python3 tests/u
 | pselect6/ppoll（72/73）、newfstatat/fstat（79/80） | [文件模块](kernel-files.md)：集合/信号屏蔽、stat 编码和元数据 |
 
 - `clock_gettime` 编号 113、`clock_getres` 编号 114、`gettimeofday` 编号 169、`clock_nanosleep` 编号 115 与 `nanosleep` 编号 101 构成时间族，语义见[内核时间模块](kernel-time.md)。
+- `setpriority(140)`、`getpriority(141)`支持线程、进程组和真实UID集合，权限、RLIMIT_NICE与实际CPU权重见[调度模块](kernel-scheduler.md)。
 - `sched_yield` 编号 124 把当前任务排到其优先级队尾，再按优先级与实时预算资格重选；只有较低优先级 READY 任务时 FIFO/RR 可继续当前任务，RR 保留剩余时间片。调度失败属于内核不变量破坏，由 Trap 边界 fatal。
 - `sched_getscheduler(120)`、`sched_getparam(121)`、`sched_getaffinity(123)`、`sched_rr_get_interval(127)` 与 `sched_getattr(275)` 在发起 CPU 执行。任务身份、策略、基础优先级及亲和掩码在 scheduler 身份保护下取得完整小快照，释放保护后才复制到用户内存；PI 临时继承的有效优先级不替换查询到的基础值。`sched_setparam(118)`、`sched_setscheduler(119)` 和 `sched_setaffinity(122)` 保持 CPU0 服务执行规则；优先级上下限查询 125/126 与 `getcpu(168)` 也在发起 CPU 执行。
-- `sched_getattr(275)` 在 RV64/LA64 使用相同的 56 字节原生结构，接受 48 字节旧版、48～56 字节间的任意前缀，以及不超过架构基页大小的扩展结构。返回 `size=min(用户长度,56)`；扩展尾部先清零，再写已知前缀，因此尾部 `EFAULT` 不改写结构头。先检查空指针、负 TID 和长度，再查目标，随后检查 flags，最后输出；当前支持 OTHER/FIFO/RR，只有 flags=0 有效。策略与 RESET_ON_FORK 来自任务快照，nice 为实际固定值 0；OTHER 的 runtime 为当前普通调度量子 10ms，与 127 的普通策略间隔一致，FIFO/RR 的 runtime 为 0；deadline、period 与未启用的 util_min/util_max 为 0。Linux fair 类的 runtime 来自其自身调度 slice，具体数值不要求与 BoarOS 普通调度量子相等。
+- `sched_getattr(275)` 在 RV64/LA64 使用相同的 56 字节原生结构，接受 48 字节旧版、48～56 字节间的任意前缀，以及不超过架构基页大小的扩展结构。返回 `size=min(用户长度,56)`；扩展尾部先清零，再写已知前缀，因此尾部 `EFAULT` 不改写结构头。先检查空指针、负 TID 和长度，再查目标，随后检查 flags，最后输出；当前支持 OTHER/FIFO/RR，只有 flags=0 有效。策略与 RESET_ON_FORK 来自任务快照，nice 在非实时策略中来自目标线程，FIFO/RR 的该字段为0；OTHER 的 runtime 为当前普通调度量子 10ms，与 127 的普通策略间隔一致，FIFO/RR 的 runtime 为 0；deadline、period 与未启用的 util_min/util_max 为 0。Linux fair 类的 runtime 来自其自身调度 slice，具体数值不要求与 BoarOS 普通调度量子相等。
 - `preadv2/pwritev2` 编号286/287，与69/70的原定位向量共用I/O核心；offset=-1使用共享位置，其余合法值保持定位语义。按次追加、同步及信号选项见[文件模块](kernel-files.md#向量-io-的按次选项)，NOWAIT／ATOMIC／DONTCACHE当前返回EOPNOTSUPP。
 - `vmsplice(75)`、`splice(76)`、`tee(77)` 使用原生64位参数，页借用、offset、等待和失败消费规则见[文件模块](kernel-files.md#splice-tee-与-vmsplice)。
 - `fadvise64(223)` 支持六种建议，`readahead(213)` 接入有界显式预读；OFD策略、范围写回接纳和干净页回收见[文件模块](kernel-files.md#文件访问建议与显式预读)。

@@ -1,6 +1,8 @@
 #include "../../kernel/sched/private.h"
 #include <arch/timer.h>
 #include <kernel/time.h>
+#include <kernel/credentials.h>
+#include <kernel/errno.h>
 #include <assert.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -937,8 +939,39 @@ static void resource_snapshot(void)
     puts("resource SELF/THREAD/CHILDREN snapshots preserve units, dead-thread separation and RSS maximum");
 }
 
+static void nice_permissions(void)
+{
+    scheduler=(struct kernel_scheduler){0};
+    kernel_cpu_initialize(&cpus[0],0,0);active_cpu=&cpus[0];
+    kernel_wait_domain_init();idles[0]=(struct kernel_task){.idle=1};cpus[0].current=&idles[0];
+    struct kernel_credentials caller={.uid=1001,.euid=1001},other=caller;
+    struct kernel_resource_limits limited={0},permitted={0};
+    tasks[0]=tasks[1]=(struct kernel_task){.magic=KERNEL_THREAD_MAGIC,.accounted=1,.tid_owned=1};
+    for(unsigned i=0;i<2;i++){tasks[i].arch.user_mode=1;tasks[i].cpu=&cpus[0];tasks[i].credentials=i?&other:&caller;}
+    tasks[0].limits=&limited;tasks[1].limits=&permitted;
+    assert(kernel_task_priority(&tasks[0],0,0,0,0)==20);
+    assert(!kernel_task_priority(&tasks[0],1,0,0,5));
+    assert(kernel_task_priority(&tasks[0],1,0,0,0)==-KERNEL_EACCES);
+    limited.values[KERNEL_RLIMIT_NICE].current=20;
+    assert(!kernel_task_priority(&tasks[0],1,0,0,0));
+    limited.values[KERNEL_RLIMIT_NICE].current=0;
+    permitted.values[KERNEL_RLIMIT_NICE].current=21;
+    scheduler.all_tasks=&tasks[0];tasks[0].all_next=&tasks[1];tasks[1].all_previous=&tasks[0];
+    assert(kernel_task_priority(&tasks[0],1,2,1001,-1)==-KERNEL_EACCES);
+    assert(tasks[0].scheduling.nice==0 && tasks[1].scheduling.nice==-1);
+    assert(kernel_task_priority(&tasks[0],0,2,1001,0)==21);
+    other.uid=other.euid=1002;
+    assert(kernel_task_priority(&tasks[0],1,2,1002,10)==-KERNEL_EPERM && tasks[1].scheduling.nice==-1);
+    caller.effective=UINT64_C(1)<<KERNEL_CAP_SYS_NICE;
+    assert(!kernel_task_priority(&tasks[0],1,2,1002,-30) && tasks[1].scheduling.nice==-20);
+    assert(kernel_task_priority(&tasks[0],0,3,0,0)==-KERNEL_EINVAL);
+    assert(!tasks[0].storage_borrows&&!tasks[1].storage_borrows);
+    puts("nice: real UID sets, per-target limits, partial success and privilege passed");
+}
+
 int main(void)
 {
+    nice_permissions();
     accounting_progress_without_scheduler_lock();
     cpu_time_without_ticks();
     resource_snapshot();

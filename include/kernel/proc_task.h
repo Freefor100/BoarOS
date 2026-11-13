@@ -46,7 +46,7 @@ struct kernel_proc_process_snapshot {
     uint32_t threads;
     uint32_t wait_channel_flag;
     uint32_t no_new_privs;
-    int32_t scheduling_priority;
+    int32_t scheduling_priority, scheduling_nice;
     uint32_t rt_priority;
     uint32_t scheduling_policy;
     char state;

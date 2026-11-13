@@ -22,6 +22,11 @@ int __wrap_kernel_task_sched_get(struct kernel_task *caller,int32_t pid,struct k
 { (void)caller;if(pid<0)return -KERNEL_EINVAL;if(pid>1)return -KERNEL_ESRCH;*out=state;return 0; }
 int __wrap_kernel_task_sched_set(struct kernel_task *caller,int32_t pid,int policy,int priority,int keep)
 { struct kernel_sched_policy old;int r=__wrap_kernel_task_sched_get(caller,pid,&old);return r?r:kernel_sched_policy_set(&state,policy,priority,keep); }
+int64_t __wrap_kernel_task_priority(struct kernel_task *caller,int setting,int32_t which,int32_t who,int32_t nice)
+{
+    (void)caller;if(which<0||which>2)return -KERNEL_EINVAL;if(who)return -KERNEL_ESRCH;
+    if(setting){state.nice=nice<-20?-20:nice>19?19:nice;return 0;}return 20-state.nice;
+}
 enum kernel_task_status kernel_task_mm_borrow_mutable(struct kernel_task *task,struct kernel_mm **mm)
 {(void)task;*mm=0;return KERNEL_TASK_STATUS_OK;}
 enum kernel_uaccess_status kernel_copy_to_user(struct kernel_mm *mm,uint64_t address,const void *source,size_t size,size_t *copied)
@@ -73,6 +78,10 @@ int main(void)
     kernel_cpu_initialize(&cpu, 0, &io);
     kernel_raw_lock_init(&kernel_wait_domain, KERNEL_RAW_RANK_SCHEDULER);
     task.accounted = 1; task.arch.user_mode = 1; task.tid_owned = 1;
+    assert(call(141,0,0,0)==20);
+    assert(call(140,0,0,UINT64_C(0x100000005))==0 && call(141,0,0,0)==15);
+    assert(call(140,0,0,(uint32_t)-21)==0 && call(141,0,0,0)==40);
+    assert(call(140,0,0,0)==0);
     int priority=50, copied=-1;
     assert(call(125,1,0,0)==99 && call(126,2,0,0)==1);
     assert(call(125,3,0,0)==0 && call(126,5,0,0)==0);

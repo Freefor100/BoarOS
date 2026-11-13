@@ -253,7 +253,8 @@ static int proc_task_snapshot(struct kernel_task *task, uint64_t identity,
         .threads = threads,
         .no_new_privs=task->no_new_privs,
         .scheduling_priority = task->scheduling.priority
-            ? -(task->scheduling.priority + 1) : 20,
+            ? -(task->scheduling.priority + 1) : 20+task->scheduling.nice,
+        .scheduling_nice=task->scheduling.nice,
         .rt_priority = scheduler_base_priority(task),
         .scheduling_policy = (uint32_t)task->scheduling.policy,
     };
