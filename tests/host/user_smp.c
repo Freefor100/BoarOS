@@ -368,6 +368,9 @@ uint64_t kernel_time_ticks_to_ns(uint64_t ticks) { (void)ticks;assert(!kernel_ti
 uint64_t riscv_time_read(void) { return 1; }
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t ns,uint64_t *ticks)
 { (void)ns; (void)ticks; __builtin_trap(); }
+enum kernel_time_status kernel_time_deadline_from_realtime(uint64_t ns,uint64_t *ticks)
+{ return kernel_time_deadline_from_monotonic(ns,ticks); }
+
 enum riscv_timer_status riscv_timer_set_scheduler_deadline(uint64_t deadline)
 { (void)deadline; return RISCV_TIMER_STATUS_NOT_STARTED; }
 enum kernel_scheduler_status validate_queues_locked(void) { __builtin_trap(); }
@@ -910,8 +913,8 @@ int main(int argc,char **argv)
     { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
       assert(ready_best_locked()==&tasks[1]);
       ready_remove_locked(&tasks[1]); ready_remove_locked(&tasks[3]);
-      assert(!cpus[0].user_reservations.first && !cpus[1].user_reservations.first &&
-             !scheduler.rt_services.first && !cpus[0].runqueue.first && !cpus[1].runqueue.first); }
+      assert(!cpus[0].user_reservations.rt_first && !cpus[1].user_reservations.rt_first &&
+             !scheduler.rt_services.rt_first && !kernel_sched_pick(&cpus[0].runqueue,1) && !kernel_sched_pick(&cpus[1].runqueue,1)); }
     active=&cpus[0];
     scheduler.initialized=KERNEL_SCHEDULER_INITIALIZED;
     struct kernel_wait_token borrowed_token;

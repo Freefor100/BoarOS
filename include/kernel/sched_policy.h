@@ -4,12 +4,18 @@
 #define KERNEL_SCHED_OTHER 0
 #define KERNEL_SCHED_FIFO 1
 #define KERNEL_SCHED_RR 2
+#define KERNEL_SCHED_BATCH 3
+#define KERNEL_SCHED_IDLE 5
+#define KERNEL_SCHED_FAIR_NS UINT64_C(10000000)
+#define KERNEL_SCHED_WAKE_NS UINT64_C(1000000)
 #define KERNEL_SCHED_RESET_ON_FORK 0x40000000
 #define KERNEL_SCHED_RR_NS UINT64_C(100000000)
 struct kernel_sched_policy {
     int policy, priority;
     unsigned reset_on_fork;
+    int nice;
     uint64_t rr_remaining_ns;
+    uint32_t fair_remainder, fair_slice_used;
 };
 struct kernel_rt_bandwidth {
     uint64_t period_ns, period_start_ns, consumed_ns, last_account_ns;
@@ -19,6 +25,8 @@ struct kernel_rt_configuration {
     uint64_t period_ns;
     int64_t runtime_ns;
 };
+unsigned kernel_sched_weight(const struct kernel_sched_policy *);
+uint64_t kernel_sched_fair_delta(struct kernel_sched_policy *,uint64_t actual_ns);
 int kernel_sched_policy_set(struct kernel_sched_policy *state,
                             int policy, int priority, int keep_policy);
 void kernel_sched_policy_fork(struct kernel_sched_policy *child,

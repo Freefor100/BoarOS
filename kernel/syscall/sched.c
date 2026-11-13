@@ -99,7 +99,7 @@ enum kernel_syscall_status syscall_handle_sched(
                 .flags=state.reset_on_fork ? 1 : 0,
                 .priority=(state.policy==KERNEL_SCHED_FIFO || state.policy==KERNEL_SCHED_RR)
                     ? (uint32_t)state.priority : 0,
-                .runtime=state.policy==KERNEL_SCHED_OTHER
+                .runtime=state.policy!=KERNEL_SCHED_FIFO && state.policy!=KERNEL_SCHED_RR
                     ? UINT64_C(1000000000)/KERNEL_TICKS_PER_SECOND : 0,
             };
             /* Linux先清扩展尾部；尾部fault时不写已知字段。任务快照已释放身份锁。 */

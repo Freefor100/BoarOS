@@ -205,6 +205,8 @@ enum kernel_scheduler_status scheduler_switch_claimed(
 void scheduler_cpu_initialize(struct kernel_cpu *cpu, struct kernel_task *idle,
                               uint64_t now_ns);
 uint64_t scheduler_deadline_locked(struct kernel_cpu *cpu);
+uint64_t scheduler_cpu_execution_ns(struct kernel_cpu *,const struct kernel_task *);
+void scheduler_fair_account(struct kernel_task *,uint64_t total_ns);
 void scheduler_arm_timer(uint64_t deadline);
 void scheduler_rearm_timer(void);
 /* IRQ关闭；CPU/current借用只覆盖决策，架构切换后不得继续使用缓存值。 */

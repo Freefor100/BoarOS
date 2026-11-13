@@ -105,6 +105,9 @@ enum riscv_timer_status riscv_timer_set_scheduler_deadline(uint64_t deadline)
 { assert(!cpu.raw_locks);timer_request=deadline;return RISCV_TIMER_STATUS_NOT_STARTED; }
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t ns, uint64_t *ticks)
 { *ticks = ns; return KERNEL_TIME_STATUS_OK; }
+enum kernel_time_status kernel_time_deadline_from_realtime(uint64_t ns,uint64_t *ticks)
+{ return kernel_time_deadline_from_monotonic(ns,ticks); }
+
 enum kernel_scheduler_status __wrap_scheduler_switch_claimed(struct kernel_task *previous, struct kernel_task *next)
 {
     assert(previous != cpu.current && next == cpu.current &&

@@ -1546,7 +1546,7 @@ test-sched-policy-host:
 		tests/host/sched_policy_test.c kernel/sched/policy.c -o build/host/sched-policy
 	build/host/sched-policy
 	cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude \
-		tests/host/sched_runqueue_test.c kernel/sched/runqueue.c -o build/host/sched-runqueue
+		tests/host/sched_runqueue_test.c kernel/sched/runqueue.c kernel/sched/policy.c -o build/host/sched-runqueue
 	build/host/sched-runqueue
 	cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -Iinclude \

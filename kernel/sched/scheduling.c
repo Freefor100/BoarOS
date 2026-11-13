@@ -7,6 +7,29 @@
 #include <kernel/time.h>
 #include <kernel/tick.h>
 
+static struct kernel_sched_runqueue *cpu_queue(struct kernel_cpu *cpu)
+{
+#if BOAROS_MAX_CPUS > 1
+    return &cpu->runqueue;
+#else
+    (void)cpu;return &scheduler.runqueue;
+#endif
+}
+static void fair_place(struct kernel_task *task,struct kernel_cpu *cpu)
+{
+    struct kernel_sched_runqueue *queue=cpu_queue(cpu);
+    kernel_sched_fair_place(queue,&task->ready_node,task->fair_queue);
+    task->fair_queue=queue;
+}
+static int fair_preempts(const struct kernel_task *task,const struct kernel_task *current)
+{
+    if(!task || !current || task->scheduling.priority || current->scheduling.priority)return 0;
+    if(current->idle)return 1;
+    if(current->scheduling.policy==KERNEL_SCHED_IDLE && task->scheduling.policy!=KERNEL_SCHED_IDLE)return 1;
+    if(task->scheduling.policy!=KERNEL_SCHED_OTHER || current->ready_node.fair.key<=task->ready_node.fair.key)return 0;
+    return current->ready_node.fair.key-task->ready_node.fair.key>KERNEL_SCHED_WAKE_NS;
+}
+
 static int is_rt(const struct kernel_task *task)
 {
     return task && !task->idle && task->scheduling.priority != 0;
@@ -354,8 +377,12 @@ static void account_cpu(struct kernel_cpu *cpu, uint64_t now)
     if (cpu->current && cpu->current->arch.user_mode && cpu->current->user_service &&
         cpu->current->service_started_ticks) cpu->current->service_running_ns += delta;
 #endif
-    if (cpu->current && !cpu->current->idle)
-        kernel_sched_policy_charge(&cpu->current->scheduling, delta);
+    if (cpu->current && !cpu->current->idle) {
+        struct kernel_task *task=cpu->current;
+        scheduler_fair_account(task,scheduler_cpu_execution_ns(cpu,task));
+        kernel_sched_fair_advance(cpu_queue(cpu),task->scheduling.priority?0:&task->ready_node);
+        kernel_sched_policy_charge(&task->scheduling,delta);
+    }
     kernel_rt_bandwidth_account(&cpu->rt_bandwidth, now, is_rt(cpu->current));
 }
 
@@ -485,7 +512,7 @@ static struct kernel_task *ready_pull_locked(struct kernel_cpu *cpu)
     struct kernel_task *best=0;
     for (struct kernel_cpu *other=scheduler.cpus;other;other=other->scheduler_next) {
         if (other==cpu || !other->pullable_ready) continue;
-        for (struct kernel_sched_node *node=other->runqueue.first;node;node=node->next) {
+        for (struct kernel_sched_node *node=kernel_sched_pick(&other->runqueue,1);node;node=kernel_sched_next(&other->runqueue,node)) {
             if (best && node->priority<=(unsigned)best->scheduling.priority) break;
             struct kernel_task *task=node->owner;
             if (task->wait.on_cpu || task->ready_cpu!=other) __builtin_trap();
@@ -586,6 +613,7 @@ static void ready_enqueue_at_locked(struct kernel_task *task, int flags
     if (task->ready_cpu) __builtin_trap();
     if (!target) target=ready_place_locked(task,flags);
     task->ready_cpu=target;
+    fair_place(task,target);
     struct kernel_sched_runqueue *queue=ready_queue(task,target);
     enqueue_task(queue,&task->ready_node,task,flags&SCHED_READY_HEAD);
     /* Requested masks change only after dequeue. Unlike effective affinity,
@@ -603,10 +631,12 @@ static void ready_enqueue_at_locked(struct kernel_task *task, int flags
     }
 #else
     struct kernel_cpu *target=task->cpu?task->cpu:kernel_cpu_current();
+    fair_place(task,target);
     enqueue_task(&scheduler.runqueue,&task->ready_node,task,flags&SCHED_READY_HEAD);
 #endif
     int preempt=!target->current || target->current->idle ||
-        task->scheduling.priority>target->current->scheduling.priority;
+        task->scheduling.priority>target->current->scheduling.priority ||
+        fair_preempts(task,target->current);
 #if BOAROS_USER_SMP
     preempt |= is_rt_service(task) && !is_rt_service(target->current);
 #endif
@@ -668,6 +698,8 @@ static struct kernel_task *claim_next_locked(struct kernel_cpu *cpu,
     if (!next || next->wait.on_cpu || (next->idle && next->cpu != cpu)) __builtin_trap();
     if (!next->idle) {
         ready_remove_owned(next);
+        fair_place(next,cpu);
+        next->scheduling.fair_slice_used=0;
 #if BOAROS_USER_SMP
         if (!next->user_service && next->reservation_cpu==cpu)
             scheduler_user_reservation_release_locked(next);
@@ -709,19 +741,24 @@ uint64_t scheduler_deadline_locked(struct kernel_cpu *cpu)
     uint64_t delay = kernel_rt_bandwidth_delay(&cpu->rt_bandwidth,
         is_rt(cpu->current),
 #if BOAROS_MAX_CPUS > 1
-        (cpu->runqueue.first && cpu->runqueue.first->priority != 0)
+        (cpu->runqueue.rt_first!=0)
 #if BOAROS_USER_SMP
-        || (!cpu->logical_id && scheduler.rt_services.first)
+        || (!cpu->logical_id && scheduler.rt_services.rt_first)
 #endif
         );
 #else
-        scheduler.runqueue.first && scheduler.runqueue.first->priority != 0);
+        scheduler.runqueue.rt_first!=0);
 #endif
     if (cpu->current && cpu->current != cpu->idle &&
         cpu->current->scheduling.policy == KERNEL_SCHED_RR) {
         uint64_t slice = cpu->current->scheduling.rr_remaining_ns;
         if (!slice) slice = 1;
         if (!delay || slice < delay) delay = slice;
+    }
+    if(cpu->current && !cpu->current->idle && !cpu->current->scheduling.priority && cpu_queue(cpu)->fair_root) {
+        uint64_t fair=KERNEL_SCHED_FAIR_NS-cpu->current->scheduling.fair_slice_used;
+        if(!fair)fair=1;
+        if(!delay||fair<delay)delay=fair;
     }
     uint64_t deadline = 0;
     if (delay && kernel_time_is_initialized()) {
@@ -807,9 +844,9 @@ void scheduler_ready_local_locked(struct kernel_task *task,struct kernel_cpu *cp
 static int local_queue_eligible(struct kernel_cpu *cpu,struct kernel_task *current,int blocked)
 {
     return (current->idle || (scheduler_local_task(current,cpu) && !current->user_slice_expired &&
-        (blocked || current->state==KERNEL_THREAD_STATE_RUNNING))) && !cpu->user_reservations.first &&
-        (cpu->logical_id || !scheduler.rt_services.first) &&
-        (!cpu->runqueue.first || !cpu->runqueue.first->priority);
+        (blocked || current->state==KERNEL_THREAD_STATE_RUNNING))) && !cpu->user_reservations.rt_first &&
+        (cpu->logical_id || !scheduler.rt_services.rt_first) &&
+        !cpu->runqueue.rt_first;
 }
 
 static int remote_rt_ready(const struct kernel_cpu *cpu)
@@ -834,8 +871,8 @@ static __attribute__((noinline)) int try_pull_ordinary(struct kernel_cpu *cpu,
             KERNEL_RAW_SCOPE(first,one);
             KERNEL_RAW_SCOPE(second,two);
             if (!local_queue_eligible(cpu,current,blocked) || remote_rt_ready(cpu)) return -1;
-            if (cpu->runqueue.first || (blocked && current->wait.ready_pending)) return 0;
-            for (struct kernel_sched_node *node=source->runqueue.first;node;node=node->next) {
+            if (cpu->runqueue.count || (blocked && current->wait.ready_pending)) return 0;
+            for (struct kernel_sched_node *node=kernel_sched_pick(&source->runqueue,1);node;node=kernel_sched_next(&source->runqueue,node)) {
                 if (node->priority) continue;
                 if (!ready_allowed_on(cpu,node->owner)) continue;
                 if (!scheduler_local_task(node->owner,cpu)) return -1;
@@ -874,7 +911,7 @@ int scheduler_select_local(int blocked,int rotate,int voluntary,struct kernel_ta
         KERNEL_RAW_SCOPE(guard,kernel_run_lock(cpu));
         if (!local_queue_eligible(cpu,current,blocked)) return 0;
         if ((blocked || current->idle) && remote_rt_ready(cpu)) return 0;
-        struct kernel_sched_node *head=cpu->runqueue.first;
+        struct kernel_sched_node *head=kernel_sched_pick(&cpu->runqueue,1);
         account_cpu(cpu,kernel_time_monotonic_ns());
         if (blocked) {
             /* 唤醒在选择后继前到达时，当前栈仍归自己，无需切走再取回。 */
@@ -886,7 +923,10 @@ int scheduler_select_local(int blocked,int rotate,int voluntary,struct kernel_ta
             (void)kernel_cpu_consume_schedule(cpu);
             rotate |= cpu->rotate_other;
             cpu->rotate_other=0;
-            if (head && (current->idle || rotate || voluntary)) {
+            int expired=current->scheduling.fair_slice_used>=KERNEL_SCHED_FAIR_NS;
+            if(expired)current->scheduling.fair_slice_used=0;
+            int due=head && current->ready_node.fair.key>=head->fair.key;
+            if (head && (current->idle || voluntary || ((rotate||expired)&&due) || fair_preempts(head->owner,current))) {
                 if (current->idle) cpu->idle_context_saved=1;
                 else {
                     if (current->wait.ready_pending) __builtin_trap();
@@ -963,9 +1003,11 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
 #endif
     struct kernel_task *next = ready_best_locked();
     int higher = next && (current == cpu->idle ||
-                         next->scheduling.priority > current->scheduling.priority);
-    int rotate = voluntary || expired ||
-                 (rotate_other && !is_rt(current));
+                         next->scheduling.priority > current->scheduling.priority || fair_preempts(next,current));
+    int fair_expired=!is_rt(current) && current->scheduling.fair_slice_used>=KERNEL_SCHED_FAIR_NS;
+    if(fair_expired)current->scheduling.fair_slice_used=0;
+    int rotate=voluntary||expired||((rotate_other||fair_expired)&&!is_rt(current)&&next&&
+        current->ready_node.fair.key>=next->ready_node.fair.key);
     /* 当前任务尚未入队；yield/片尾只可轮转同级，不能把低优先级当成替代者。 */
     int same_priority = next && next->scheduling.priority == current->scheduling.priority;
     int disallowed = 0;
