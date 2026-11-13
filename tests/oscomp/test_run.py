@@ -242,6 +242,25 @@ class ReportTests(unittest.TestCase):
 
 
 class Final2026Tests(unittest.TestCase):
+    def test_cli_preserves_the_profile_failure_exit_code(self):
+        import final2026
+        import runpy
+        with patch.object(final2026,'main',return_value=1), patch.object(sys,'argv',
+                [str(HERE/'run.py'),'--profile','final-2026']):
+            with self.assertRaises(SystemExit) as exited:
+                runpy.run_path(str(HERE/'run.py'),run_name='__main__')
+        self.assertEqual(exited.exception.code,1)
+
+    def test_outer_timeout_is_incomplete_not_a_failed_compile(self):
+        import final2026
+        records=[{'completed':True,'functional_success':True},
+                 {'completed':False,'functional_success':False}]
+        self.assertEqual(final2026.run_status(records),'incomplete')
+        records[1]['completed']=True
+        self.assertEqual(final2026.run_status(records),'completed-with-failures')
+        records[1]['functional_success']=True
+        self.assertEqual(final2026.run_status(records),'passed')
+
     def test_new_images_cannot_silently_select_the_legacy_run(self):
         import subprocess
         result=subprocess.run([sys.executable,str(HERE/'run.py'),'--images-dir','/unused'],

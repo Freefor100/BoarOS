@@ -61,6 +61,10 @@ def functional_success(reports,groups):
             if {case['name'] for case in cases if case['pass']==1}&required!=required:return False
     return True
 
+def run_status(records):
+    if any(not record['completed'] for record in records):return 'incomplete'
+    return 'passed' if all(record['functional_success'] for record in records) else 'completed-with-failures'
+
 def judge_reports(raw,groups,suite):
     reports={}
     for group in groups:
@@ -197,7 +201,7 @@ def main(args):
             report['architectures'][arch].update(run_guest(args,arch,directory/TAGS[arch],groups,budget,host_vcpus,suite))
             save(directory/'report.json',report)
         passed=all(record['functional_success'] for record in report['architectures'].values())
-        report['status']='passed' if passed else 'completed-with-failures'
+        report['status']=run_status(report['architectures'].values())
         print(report['status'],directory,flush=True)
         return 0 if passed else 1
     except BaseException as error:
