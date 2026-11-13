@@ -16,7 +16,7 @@ enum kernel_random_status kernel_random_initialize(
     size_t seed_size);
 
 /* Material availability is not a trust claim. fill is an insecure fallback
- * before ready, for early boot ASLR and GRND_INSECURE only. */
+ * before ready, for early exec ASLR/AT_RANDOM and GRND_INSECURE only. */
 int kernel_random_available(void);
 int kernel_random_ready(void);
 unsigned kernel_random_credited_bits(void);

@@ -51,7 +51,6 @@ struct kernel_elf_layout {
     uint64_t string_address;
     uint64_t executable_address;
     uint64_t random_address;
-    size_t random_size;
     size_t argument_count;
     const struct kernel_exec_string *arguments;
     size_t environment_count;
@@ -59,7 +58,6 @@ struct kernel_elf_layout {
     const struct kernel_exec_string *executable;
     uint32_t stack_permissions;
     int has_interpreter;
-    int has_random;
     uint8_t random_data[16];
     uint32_t uid, euid, gid, egid, secureexec;
 };
@@ -391,7 +389,7 @@ static enum kernel_elf_image_status prepare_stack_layout(
     uint64_t table_words;
     uint64_t table_bytes;
     uint64_t total_bytes;
-    uint64_t random_bytes = kernel_random_available() ? 16U : 0U;
+    uint64_t random_bytes = sizeof(layout->random_data);
     size_t index;
 
     *layout = *base;
@@ -449,7 +447,7 @@ static enum kernel_elf_image_status prepare_stack_layout(
     }
     table_words = 1U + (uint64_t)layout->argument_count + 1U +
                   (uint64_t)layout->environment_count + 1U +
-                  2U * (16U + KERNEL_HAS_VDSO_ELF + (random_bytes != 0U ? 1U : 0U));
+                  2U * (17U + KERNEL_HAS_VDSO_ELF);
     if (table_words > UINT64_MAX / sizeof(uint64_t)) {
         return KERNEL_ELF_IMAGE_STATUS_STACK_LIMIT;
     }
@@ -477,8 +475,6 @@ static enum kernel_elf_image_status prepare_stack_layout(
     if (layout->committed_stack_base < layout->stack_soft_base) {
         layout->committed_stack_base = layout->stack_soft_base;
     }
-    layout->random_size = (size_t)random_bytes;
-    layout->has_random = random_bytes != 0U;
     layout->executable_address = layout->string_address;
     if (layout->argument_count != 0U) {
         layout->executable_address +=
@@ -678,23 +674,19 @@ static enum kernel_elf_image_status build_stack(
     POPULATE_AUXILIARY(13U, layout->gid);
     POPULATE_AUXILIARY(14U, layout->egid);
     POPULATE_AUXILIARY(23U, layout->secureexec);
-    if (layout->has_random) {
-        POPULATE_AUXILIARY(25U, layout->random_address);
-    }
+    POPULATE_AUXILIARY(25U, layout->random_address);
     POPULATE_AUXILIARY(31U, layout->executable_address);
 #if KERNEL_HAS_VDSO_ELF
     POPULATE_AUXILIARY(33U, layout->vdso); /* AT_SYSINFO_EHDR */
 #endif
     POPULATE_AUXILIARY(0U, 0U);
 #undef POPULATE_AUXILIARY
-    if (layout->has_random) {
-        if (arch_mmu_user_space_populate(space,
-                                           layout->random_address,
-                                           layout->random_data,
-                                           sizeof(layout->random_data)) !=
-            ARCH_MMU_STATUS_OK) {
-            return KERNEL_ELF_IMAGE_STATUS_ADDRESS_SPACE;
-        }
+    if (arch_mmu_user_space_populate(space,
+                                       layout->random_address,
+                                       layout->random_data,
+                                       sizeof(layout->random_data)) !=
+        ARCH_MMU_STATUS_OK) {
+        return KERNEL_ELF_IMAGE_STATUS_ADDRESS_SPACE;
     }
     return KERNEL_ELF_IMAGE_STATUS_OK;
 }
@@ -822,7 +814,6 @@ enum kernel_elf_image_status kernel_elf_image_build(
     uint64_t stack_limit;
     uint64_t stack_request;
     uint64_t mmap_gap;
-    uint8_t stack_random[16];
     uint64_t image_ceiling;
     enum kernel_elf_image_status status;
     enum arch_mmu_status backend_status;
@@ -1041,8 +1032,9 @@ enum kernel_elf_image_status kernel_elf_image_build(
     if (status != KERNEL_ELF_IMAGE_STATUS_OK) {
         return status;
     }
-    if (layout.has_random &&
-        kernel_random_fill(stack_random, sizeof(stack_random)) !=
+    /* libc consumes AT_RANDOM before main, even without early seed material.
+     * This nonblocking output does not credit entropy or make getrandom ready. */
+    if (kernel_random_fill(layout.random_data, sizeof(layout.random_data)) !=
             KERNEL_RANDOM_STATUS_OK) {
         return KERNEL_ELF_IMAGE_STATUS_ADDRESS_SPACE;
     }
@@ -1061,13 +1053,6 @@ enum kernel_elf_image_status kernel_elf_image_build(
     if (status != KERNEL_ELF_IMAGE_STATUS_OK) {
         (void)cleanup_space(&image->mm, &space);
         return status;
-    }
-    if (layout.has_random) {
-        for (uint32_t random_index = 0U;
-             random_index < sizeof(stack_random);
-             random_index++) {
-            layout.random_data[random_index] = stack_random[random_index];
-        }
     }
     status = build_stack(&space, request->executable_source, &layout);
     if (status != KERNEL_ELF_IMAGE_STATUS_OK) {

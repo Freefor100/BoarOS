@@ -105,8 +105,9 @@ make test-permissions-loongarch # 冷/驻留 EXEC 页、fork、uaccess 与改权
 表数与范围；按DTB中所有RAM bank排序，扣除启动信息、DTB、内核和保留区。
 物理分配器复用通用buddy实现，页大小在构建期固定为16KiB。
 完整启动布局验证成功后，将DTB的rng-seed交给共用随机核心作为不计熵材料，随后
-擦除临时副本；原DTB仍属于固件。缺种子不伪造材料或ready；AT_RANDOM只在有材料
-时构造。固定QEMU的32字节种子使GNU启动可用，可信初始化仍等待真实RNG设备输入。
+擦除临时副本；原DTB仍属于固件。缺种子不伪造材料或ready；共同ELF路径仍提供
+libc所需的16字节`AT_RANDOM`，早期输出不代表可信初始化，见[用户ELF](user-elf.md)。
+`getrandom`的可信初始化仍等待真实RNG设备输入。
 根现从PCI身份发现device4，以共用RNG核心及joinable worker提供真实可信材料。
 根退出在消费设备/BAR前stop/join并确认DMA停止，错误保留实际owner；未就绪实验
 的固件输入与正常DTB策略分开，见[随机设备模块](riscv-virtio-rng.md)。
