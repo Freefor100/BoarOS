@@ -573,12 +573,20 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
                request->number==LINUX_SYSCALL_GETGROUPS || request->number==LINUX_SYSCALL_SETGROUPS) {
         if (syscall_handle_credentials(caller,request,&decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 92U) {
+        if(syscall_handle_personality(caller,request,&decoded)!=KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == 117U) {
         decoded.action=KERNEL_SYSCALL_ACTION_RETURN;
         decoded.value=kernel_ptrace_request(caller,request->arguments[0],(int32_t)request->arguments[1],request->arguments[2],request->arguments[3]);
     } else if (request->number == 270U || request->number == 271U) {
         if(syscall_handle_process_vm(caller,request,&decoded)!=KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+#if !defined(BOAROS_ARCH_LOONGARCH)
+    } else if (request->number == 163U || request->number == 164U) {
+        if(syscall_handle_legacy_rlimit(caller,request,&decoded)!=KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+#endif
     } else if (request->number == LINUX_SYSCALL_PRLIMIT64) {
         if (syscall_handle_prlimit64(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {

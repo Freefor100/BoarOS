@@ -12,6 +12,8 @@
 #include <kernel/signal_fd.h>
 #include <kernel/socket.h>
 #include <kernel/task.h>
+#include <kernel/task_state.h>
+#include <kernel/personality.h>
 #include <kernel/time.h>
 #include <kernel/uaccess.h>
 
@@ -117,12 +119,14 @@ static int poll_compute_deadline(
 
 static void poll_write_remaining_timeout(
     struct kernel_mm *mm,
+    struct kernel_task *task,
     uint64_t user_timeout,
     int has_timeout,
     int zero_timeout,
     uint64_t target_monotonic_ns)
 {
-    if (user_timeout == 0U || !has_timeout || zero_timeout) {
+    if (user_timeout == 0U || !has_timeout || zero_timeout ||
+        (task->personality & KERNEL_PERSONALITY_STICKY_TIMEOUTS)) {
         return;
     }
     struct kernel_timespec rem_ts = {0, 0};
@@ -446,6 +450,7 @@ enum kernel_files_status kernel_files_ppoll(
     }
 
     poll_write_remaining_timeout(mm,
+                                 task,
                                  user_timeout,
                                  has_timeout,
                                  zero_timeout,
@@ -737,6 +742,7 @@ cleanup:
     }
 
     poll_write_remaining_timeout(mm,
+                                 task,
                                  user_timeout,
                                  has_timeout,
                                  zero_timeout,

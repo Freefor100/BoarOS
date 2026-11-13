@@ -9,6 +9,16 @@
 - 并发缺页局部校验：私有匿名缺页在提交硬件页表前，在 `vma_lock` 保护下只校验目标地址对应的 VMA 一致性并检查范围认领冲突，其他核心对无关地址区间的 VMA 增删不会迫使当前缺页发生假冲突重试。
 - 匿名缺页和驻留用户复制可在发起 CPU 完成，ext4 普通文件冷页在发起 CPU 完成缓存装入与请求提交，日志和后台写回由 CPU0 推进。非叶变更同步全范围，退休页在本地与远端 TLB 确认后才归还。实际执行边界见[RV 两核](riscv-smp.md#真实用户态与cpu0业务交接)。
 
+## 远端用户内存
+
+`kernel_mm_remote_transfer` 为 `process_vm_readv/writev` 和 ptrace 访问真实目标 MM。调用者先取得独立 MM 引用，目标随后 exec 或退出不改变这次访问所属的地址空间；每页复用既有缺页、COW、物理 pin 和共享文件缓存写借用。错误保留实际复制前缀，process_vm 返回已完成字节，ptrace 的不足一字访问由调用层转为 EIO。
+
+process_vm 按 REALCREDS、dumpable 和 CAP_SYS_PTRACE 检查目标。两个 iovec 数组在访问前导入为内核快照，各自最多 1024 项，八项以内使用请求内缓冲，更多项由堆持有。远端地址在实际访问到对应页时检查，避免无效尾项抹掉已完成的前缀。源页先复制到任务已有的一页 I/O 工作区并归还 pin，再解析目的页；同一 MM 或两个 MM 之间都不跨目的缺页保留源页。活动请求由任务持有独立堆对象，在首次用户页等待前登记。正常返回和任务取消共同归还向量快照及工作区借用；若目标 exec 或退出后本请求成为旧 MM 的最后持有者，真实文件关闭失败会保留请求和 MM 清理状态供后续调用或退出重试，不借用已经返回的内核栈。
+
+普通远端访问服从当前页权限。ptrace 的 force 读取依据 VMA 的 MAYREAD；强制写只允许 MAYWRITE 的私有匿名、文件及 ELF 映射越过当前只读保护。它复用实际 COW 准备与提交，保留原 VMA 和最终 PTE 权限，PROT_NONE 仍用后端真实的受保护叶表示，不临时开放用户写权限。共享只读映射不能通过 force 写入，磁盘共享页沿原缓存写许可与脏页协议。远端写完成数据存储后发布 MM 指令代次并同步活动 CPU，RV 和 LA 使用各自的现有指令/TLB 同步后端。
+
+直接行为检查使用 `tests/workloads/resource/process_memory.c`；真实 MM 的只读 COW、PROT_NONE、前缀和引用归还由 `tests/host/mm-remote.sh` 检查。
+
 ## 锁页、MEMLOCK 与驻留查询
 
 `mlock`、`mlock2`、`munlock`、`mlockall`、`munlockall` 和 `MAP_LOCKED` 使用同一份 VMA 属性。`LOCKED` 表示锁定范围，`ONFAULT` 表示保留按需装入；MM 保存未来映射策略。VMA 分裂、合并、替换、搬移和删除同时维护锁定虚拟字节数，合并必须具有相同锁定策略。`/proc/<pid>/status` 的 `VmLck` 包含尚未触页的 ONFAULT 范围。纯匿名范围的 `mlock` 与 `munlock` 接入范围协调并在 `vma_lock` 保护下更新锁定标记，互不重叠范围可在不同核心并发推进。
@@ -198,6 +208,8 @@ RISC-V 创建先分配并解析记录页，最后才把 LIVE Sv39 空间移入�
 
 ## Program break 与匿名 heap
 
+exec 的 ADDR_NO_RANDOMIZE 候选状态控制主 ELF/解释器、mmap ceiling、brk、vDSO 与栈的所有地址随机抽样。禁用后相同映像与参数得到确定布局；AT_RANDOM 的 16 字节仍独立从随机源生成。候选只在成功 exec 提交到任务，失败保留原状态。
+
 `kernel_mm_brk_initialize()` 只用于尚未发布、只有一个 owner 且已经启用 VMA 的新映像。它记录页对齐的起始 break、当前精确 break 和页对齐上界；RISC-V ELF image 把最高非空 `PT_LOAD` 的 `p_vaddr + p_memsz` 向上对齐作为起点，并将独立布局计算出的 mmap ceiling/vDSO 作为约束。每次 exec 因而得到由新 ELF 独立计算的 break，而 fork 复制父进程调用时的精确值。
 
 `kernel_mm_brk()` 实现 raw Linux syscall 所需的返回语义：参数 0 查询当前值；落在起点以下、上界以上、溢出或因 VMA 冲突/metadata OOM 无法增长时，MM 保持不变并把原 break 写入结果，而不是产生负 errno。成功结果保留字节粒度；只有 VMA 和 PTE 操作向上按 4 KiB 对齐。
@@ -205,6 +217,8 @@ RISC-V 创建先分配并解析记录页，最后才把 LIVE Sv39 空间移入�
 跨页增长只把新增 `[old_page_end, new_page_end)` 登记为 RW anonymous `DEMAND_ZERO` heap VMA，不提前分配数据页。首次 U-mode load/store 复用普通匿名 fault 路径分配零页。跨页缩小通过通用区间编辑撤销目标范围，因此能容忍用户先用 `munmap` 打洞、用 `mprotect` 分段或用 fixed mmap 替换局部区域；它不再依赖一个从 break 起点连续延伸的阶段性 heap VMA。缩小先让范围内用户 PTE 失效并刷新本 hart TLB，再无分配地提交 VMA 删除和精确 break；物理页释放完成后该操作才返回。
 
 ## 匿名与文件映射
+
+调用线程的 READ_IMPLIES_EXEC 在 mmap 接纳时把 PROT_READ 转为可读可执行；文件来源位于 noexec 挂载时不添加执行权限，显式 PROT_EXEC 仍按原规则拒绝。mprotect 在一次范围修改资格内按 VMA 的 maximum_permissions 决定是否添加隐含执行权限，最大权限不含 EXEC 的范围仍可设为只读；显式执行请求继续校验最大权限。真实 VMA、驻留 PTE 和后续缺页使用相同权限，遇到后续空洞或拒绝时保留已提交前缀。
 
 `kernel_mm_mmap_anonymous()` 实现 private demand-zero 与 `MAP_SHARED|MAP_ANONYMOUS`。非 fixed 请求优先使用空闲的页对齐 hint，否则在每个 MM 的随机 mmap ceiling 以下、栈 guard 之外 top-down 选址；`FIXED_NOREPLACE` 只检查冲突，`FIXED` 则撤销旧页和 VMA 后替换。长度向上按 4 KiB 对齐，返回地址只在成功时写入。RISC-V 的 W&&!R PTE 编码保留，因此仅写保护被规范化为 RW。
 
