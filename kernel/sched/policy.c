@@ -2,6 +2,31 @@
 #include <kernel/errno.h>
 #include <stdint.h>
 
+/* Linux's per-thread nice weights: equal nice levels receive equal CPU share,
+ * while each +1 step reduces weight by approximately 20 percent. */
+static const unsigned nice_weights[40]={
+    88761,71755,56483,46273,36291,29154,23254,18705,14949,11916,
+    9548,7620,6100,4904,3906,3121,2501,1991,1586,1277,
+    1024,820,655,526,423,335,272,215,172,137,
+    110,87,70,56,45,36,29,23,18,15
+};
+unsigned kernel_sched_weight(const struct kernel_sched_policy *state)
+{
+    if (state->nice < -20 || state->nice > 19) __builtin_trap();
+    return state->policy==KERNEL_SCHED_IDLE ? 3U : nice_weights[state->nice+20];
+}
+uint64_t kernel_sched_fair_delta(struct kernel_sched_policy *state,uint64_t ns)
+{
+    unsigned weight=kernel_sched_weight(state);
+    if (weight==1024) return ns;
+    uint64_t whole=ns/weight;
+    uint64_t fraction=(ns%weight)*1024U+state->fair_remainder;
+    uint64_t tail=fraction/weight;
+    if(whole>(UINT64_MAX-tail)/1024U)__builtin_trap();
+    state->fair_remainder=(uint32_t)(fraction%weight);
+    return whole*1024U+tail;
+}
+
 int kernel_sched_policy_set(struct kernel_sched_policy *state,
                             int policy, int priority, int keep_policy)
 {
@@ -10,9 +35,10 @@ int kernel_sched_policy_set(struct kernel_sched_policy *state,
     if (keep_policy) policy = state->policy;
     else policy &= ~KERNEL_SCHED_RESET_ON_FORK;
     if (policy != KERNEL_SCHED_OTHER && policy != KERNEL_SCHED_FIFO &&
-        policy != KERNEL_SCHED_RR) return -KERNEL_EINVAL;
+        policy != KERNEL_SCHED_RR && policy != KERNEL_SCHED_BATCH &&
+        policy != KERNEL_SCHED_IDLE) return -KERNEL_EINVAL;
     if (priority < 0 || priority > 99 ||
-        ((policy == KERNEL_SCHED_OTHER) != (priority == 0))) return -KERNEL_EINVAL;
+        ((policy != KERNEL_SCHED_FIFO && policy != KERNEL_SCHED_RR) != (priority == 0))) return -KERNEL_EINVAL;
     if (!state->rr_remaining_ns && policy == KERNEL_SCHED_RR)
         state->rr_remaining_ns = KERNEL_SCHED_RR_NS;
     state->policy = policy;
@@ -26,10 +52,12 @@ void kernel_sched_policy_fork(struct kernel_sched_policy *child,
 {
     *child = *parent;
     child->rr_remaining_ns = KERNEL_SCHED_RR_NS;
+    child->fair_remainder=child->fair_slice_used=0;
     if (child->reset_on_fork) {
-        child->policy = KERNEL_SCHED_OTHER;
-        child->priority = 0;
-        child->reset_on_fork = 0;
+        if (child->policy==KERNEL_SCHED_FIFO || child->policy==KERNEL_SCHED_RR) {
+            child->policy=KERNEL_SCHED_OTHER;child->priority=0;child->nice=0;
+        } else if (child->nice<0) child->nice=0;
+        child->reset_on_fork=0;
     }
 }
 

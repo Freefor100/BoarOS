@@ -2,10 +2,34 @@
 #include <kernel/posix_timer.h>
 #include "private.h"
 #include <kernel/event_fd.h>
+#include <kernel/tty_task.h>
 #include <arch/timer.h>
 #include <kernel/errno.h>
 #include <kernel/time.h>
 #include <kernel/tick.h>
+
+static struct kernel_sched_runqueue *cpu_queue(struct kernel_cpu *cpu)
+{
+#if BOAROS_MAX_CPUS > 1
+    return &cpu->runqueue;
+#else
+    (void)cpu;return &scheduler.runqueue;
+#endif
+}
+static void fair_place(struct kernel_task *task,struct kernel_cpu *cpu)
+{
+    struct kernel_sched_runqueue *queue=cpu_queue(cpu);
+    kernel_sched_fair_place(queue,&task->ready_node,task->fair_queue);
+    task->fair_queue=queue;
+}
+static int fair_preempts(const struct kernel_task *task,const struct kernel_task *current)
+{
+    if(!task || !current || task->scheduling.priority || current->scheduling.priority)return 0;
+    if(current->idle)return 1;
+    if(current->scheduling.policy==KERNEL_SCHED_IDLE && task->scheduling.policy!=KERNEL_SCHED_IDLE)return 1;
+    if(task->scheduling.policy!=KERNEL_SCHED_OTHER || current->ready_node.fair.key<=task->ready_node.fair.key)return 0;
+    return current->ready_node.fair.key-task->ready_node.fair.key>KERNEL_SCHED_WAKE_NS;
+}
 
 static int is_rt(const struct kernel_task *task)
 {
@@ -354,8 +378,12 @@ static void account_cpu(struct kernel_cpu *cpu, uint64_t now)
     if (cpu->current && cpu->current->arch.user_mode && cpu->current->user_service &&
         cpu->current->service_started_ticks) cpu->current->service_running_ns += delta;
 #endif
-    if (cpu->current && !cpu->current->idle)
-        kernel_sched_policy_charge(&cpu->current->scheduling, delta);
+    if (cpu->current && !cpu->current->idle) {
+        struct kernel_task *task=cpu->current;
+        scheduler_fair_account(task,scheduler_cpu_execution_ns(cpu,task));
+        kernel_sched_fair_advance(cpu_queue(cpu),task->scheduling.priority?0:&task->ready_node);
+        kernel_sched_policy_charge(&task->scheduling,delta);
+    }
     kernel_rt_bandwidth_account(&cpu->rt_bandwidth, now, is_rt(cpu->current));
 }
 
@@ -485,7 +513,7 @@ static struct kernel_task *ready_pull_locked(struct kernel_cpu *cpu)
     struct kernel_task *best=0;
     for (struct kernel_cpu *other=scheduler.cpus;other;other=other->scheduler_next) {
         if (other==cpu || !other->pullable_ready) continue;
-        for (struct kernel_sched_node *node=other->runqueue.first;node;node=node->next) {
+        for (struct kernel_sched_node *node=kernel_sched_pick(&other->runqueue,1);node;node=kernel_sched_next(&other->runqueue,node)) {
             if (best && node->priority<=(unsigned)best->scheduling.priority) break;
             struct kernel_task *task=node->owner;
             if (task->wait.on_cpu || task->ready_cpu!=other) __builtin_trap();
@@ -586,6 +614,7 @@ static void ready_enqueue_at_locked(struct kernel_task *task, int flags
     if (task->ready_cpu) __builtin_trap();
     if (!target) target=ready_place_locked(task,flags);
     task->ready_cpu=target;
+    fair_place(task,target);
     struct kernel_sched_runqueue *queue=ready_queue(task,target);
     enqueue_task(queue,&task->ready_node,task,flags&SCHED_READY_HEAD);
     /* Requested masks change only after dequeue. Unlike effective affinity,
@@ -603,10 +632,12 @@ static void ready_enqueue_at_locked(struct kernel_task *task, int flags
     }
 #else
     struct kernel_cpu *target=task->cpu?task->cpu:kernel_cpu_current();
+    fair_place(task,target);
     enqueue_task(&scheduler.runqueue,&task->ready_node,task,flags&SCHED_READY_HEAD);
 #endif
     int preempt=!target->current || target->current->idle ||
-        task->scheduling.priority>target->current->scheduling.priority;
+        task->scheduling.priority>target->current->scheduling.priority ||
+        fair_preempts(task,target->current);
 #if BOAROS_USER_SMP
     preempt |= is_rt_service(task) && !is_rt_service(target->current);
 #endif
@@ -668,6 +699,8 @@ static struct kernel_task *claim_next_locked(struct kernel_cpu *cpu,
     if (!next || next->wait.on_cpu || (next->idle && next->cpu != cpu)) __builtin_trap();
     if (!next->idle) {
         ready_remove_owned(next);
+        fair_place(next,cpu);
+        next->scheduling.fair_slice_used=0;
 #if BOAROS_USER_SMP
         if (!next->user_service && next->reservation_cpu==cpu)
             scheduler_user_reservation_release_locked(next);
@@ -709,19 +742,24 @@ uint64_t scheduler_deadline_locked(struct kernel_cpu *cpu)
     uint64_t delay = kernel_rt_bandwidth_delay(&cpu->rt_bandwidth,
         is_rt(cpu->current),
 #if BOAROS_MAX_CPUS > 1
-        (cpu->runqueue.first && cpu->runqueue.first->priority != 0)
+        (cpu->runqueue.rt_first!=0)
 #if BOAROS_USER_SMP
-        || (!cpu->logical_id && scheduler.rt_services.first)
+        || (!cpu->logical_id && scheduler.rt_services.rt_first)
 #endif
         );
 #else
-        scheduler.runqueue.first && scheduler.runqueue.first->priority != 0);
+        scheduler.runqueue.rt_first!=0);
 #endif
     if (cpu->current && cpu->current != cpu->idle &&
         cpu->current->scheduling.policy == KERNEL_SCHED_RR) {
         uint64_t slice = cpu->current->scheduling.rr_remaining_ns;
         if (!slice) slice = 1;
         if (!delay || slice < delay) delay = slice;
+    }
+    if(cpu->current && !cpu->current->idle && !cpu->current->scheduling.priority && cpu_queue(cpu)->fair_root) {
+        uint64_t fair=KERNEL_SCHED_FAIR_NS-cpu->current->scheduling.fair_slice_used;
+        if(!fair)fair=1;
+        if(!delay||fair<delay)delay=fair;
     }
     uint64_t deadline = 0;
     if (delay && kernel_time_is_initialized()) {
@@ -807,9 +845,9 @@ void scheduler_ready_local_locked(struct kernel_task *task,struct kernel_cpu *cp
 static int local_queue_eligible(struct kernel_cpu *cpu,struct kernel_task *current,int blocked)
 {
     return (current->idle || (scheduler_local_task(current,cpu) && !current->user_slice_expired &&
-        (blocked || current->state==KERNEL_THREAD_STATE_RUNNING))) && !cpu->user_reservations.first &&
-        (cpu->logical_id || !scheduler.rt_services.first) &&
-        (!cpu->runqueue.first || !cpu->runqueue.first->priority);
+        (blocked || current->state==KERNEL_THREAD_STATE_RUNNING))) && !cpu->user_reservations.rt_first &&
+        (cpu->logical_id || !scheduler.rt_services.rt_first) &&
+        !cpu->runqueue.rt_first;
 }
 
 static int remote_rt_ready(const struct kernel_cpu *cpu)
@@ -834,8 +872,8 @@ static __attribute__((noinline)) int try_pull_ordinary(struct kernel_cpu *cpu,
             KERNEL_RAW_SCOPE(first,one);
             KERNEL_RAW_SCOPE(second,two);
             if (!local_queue_eligible(cpu,current,blocked) || remote_rt_ready(cpu)) return -1;
-            if (cpu->runqueue.first || (blocked && current->wait.ready_pending)) return 0;
-            for (struct kernel_sched_node *node=source->runqueue.first;node;node=node->next) {
+            if (cpu->runqueue.count || (blocked && current->wait.ready_pending)) return 0;
+            for (struct kernel_sched_node *node=kernel_sched_pick(&source->runqueue,1);node;node=kernel_sched_next(&source->runqueue,node)) {
                 if (node->priority) continue;
                 if (!ready_allowed_on(cpu,node->owner)) continue;
                 if (!scheduler_local_task(node->owner,cpu)) return -1;
@@ -874,7 +912,7 @@ int scheduler_select_local(int blocked,int rotate,int voluntary,struct kernel_ta
         KERNEL_RAW_SCOPE(guard,kernel_run_lock(cpu));
         if (!local_queue_eligible(cpu,current,blocked)) return 0;
         if ((blocked || current->idle) && remote_rt_ready(cpu)) return 0;
-        struct kernel_sched_node *head=cpu->runqueue.first;
+        struct kernel_sched_node *head=kernel_sched_pick(&cpu->runqueue,1);
         account_cpu(cpu,kernel_time_monotonic_ns());
         if (blocked) {
             /* 唤醒在选择后继前到达时，当前栈仍归自己，无需切走再取回。 */
@@ -886,7 +924,10 @@ int scheduler_select_local(int blocked,int rotate,int voluntary,struct kernel_ta
             (void)kernel_cpu_consume_schedule(cpu);
             rotate |= cpu->rotate_other;
             cpu->rotate_other=0;
-            if (head && (current->idle || rotate || voluntary)) {
+            int expired=current->scheduling.fair_slice_used>=KERNEL_SCHED_FAIR_NS;
+            if(expired)current->scheduling.fair_slice_used=0;
+            int due=head && current->ready_node.fair.key>=head->fair.key;
+            if (head && (current->idle || voluntary || ((rotate||expired)&&due) || fair_preempts(head->owner,current))) {
                 if (current->idle) cpu->idle_context_saved=1;
                 else {
                     if (current->wait.ready_pending) __builtin_trap();
@@ -963,9 +1004,11 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
 #endif
     struct kernel_task *next = ready_best_locked();
     int higher = next && (current == cpu->idle ||
-                         next->scheduling.priority > current->scheduling.priority);
-    int rotate = voluntary || expired ||
-                 (rotate_other && !is_rt(current));
+                         next->scheduling.priority > current->scheduling.priority || fair_preempts(next,current));
+    int fair_expired=!is_rt(current) && current->scheduling.fair_slice_used>=KERNEL_SCHED_FAIR_NS;
+    if(fair_expired)current->scheduling.fair_slice_used=0;
+    int rotate=voluntary||expired||((rotate_other||fair_expired)&&!is_rt(current)&&next&&
+        current->ready_node.fair.key>=next->ready_node.fair.key);
     /* 当前任务尚未入队；yield/片尾只可轮转同级，不能把低优先级当成替代者。 */
     int same_priority = next && next->scheduling.priority == current->scheduling.priority;
     int disallowed = 0;
@@ -1134,7 +1177,7 @@ void scheduler_pi_priority_locked(struct kernel_task *task,unsigned base,unsigne
 #endif
     }
     task->pi_base_priority=saved;
-    __atomic_store_n(&task->scheduling.priority,(int)priority,__ATOMIC_RELAXED);
+    kernel_sched_publish_priority(&task->scheduling,(int)priority,task->scheduling.nice);
 #if BOAROS_USER_SMP
     if(move && reservation && priority) {
         task->reservation_cpu=reservation;
@@ -1155,53 +1198,167 @@ void scheduler_pi_priority_locked(struct kernel_task *task,unsigned base,unsigne
         kernel_cpu_request_schedule(task->cpu?task->cpu:caller);
 }
 
-int kernel_task_sched_set(struct kernel_task *caller, int32_t pid,
-                           int policy, int priority, int keep_policy)
+static int nice_reduction_allowed(struct kernel_task *target,int nice)
+{ return (uint64_t)(20-nice)<=target->limits->values[KERNEL_RLIMIT_NICE].current; }
+
+/* Effective priority alone changes index membership. The PI updater owns
+ * removal and RT head/tail placement; saved nice changes neither an RT FIFO
+ * position nor a READY fair node's virtual-runtime key. */
+static void sched_commit_locked(struct kernel_task *task,const struct kernel_sched_policy *updated)
 {
-    if (pid < 0) return -KERNEL_EINVAL;
-    uintptr_t irq = arch_interrupt_save();
-    int result = -KERNEL_ESRCH;
-    {
-        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        struct kernel_task *task = sched_target(caller, pid);
-        if (task) {
-            KERNEL_RUN_SET(runs);
-            struct kernel_sched_policy updated = task->scheduling;
-            updated.priority=(int)scheduler_base_priority(task);
-            result = kernel_sched_policy_set(&updated, policy, priority, keep_policy);
-            if (!result && !kernel_credentials_capable(kernel_credentials_task_locked(caller),KERNEL_CAP_SYS_NICE)) {
-                uint64_t rtprio=task->limits->values[KERNEL_RLIMIT_RTPRIO].current;
-                if(!sched_owner_locked(caller,task) ||
-                    (updated.priority &&
-                     ((updated.policy!=task->scheduling.policy && !rtprio) ||
-                      ((unsigned)updated.priority>scheduler_base_priority(task) &&
-                       (uint64_t)updated.priority>rtprio))) ||
-                    (task->scheduling.policy==5 && updated.policy!=5) ||
-                    (task->scheduling.reset_on_fork && !updated.reset_on_fork))result=-KERNEL_EPERM;
-            }
-            if (!result) {
-                if(updated.policy!=task->scheduling.policy && task->wait.on_cpu) {
-                    if(!task->cpu)__builtin_trap();
-                    if(task->cpu->current==task)account_cpu(task->cpu,kernel_time_monotonic_ns());
-                }
-                if(task->pi_owned || task->pi_request)
-                    kernel_futex_pi_recalculate_locked(task,updated.priority);
-                else scheduler_pi_priority_locked(task,(unsigned)updated.priority,0);
-                task->scheduling.policy=updated.policy;
-                task->scheduling.reset_on_fork=updated.reset_on_fork;
-                if(updated.policy==KERNEL_SCHED_RR && !task->scheduling.rr_remaining_ns)
-                    task->scheduling.rr_remaining_ns=KERNEL_SCHED_RR_NS;
-                struct kernel_cpu *target=task->cpu?task->cpu:kernel_cpu_current();
+    if(task->scheduling.policy==updated->policy && task->scheduling.nice==updated->nice &&
+        scheduler_base_priority(task)==(unsigned)updated->priority) {
+        task->scheduling.reset_on_fork=updated->reset_on_fork;return;
+    }
+    if(task->wait.on_cpu && task->cpu) {
+        if(task->cpu->current==task)account_cpu(task->cpu,kernel_time_monotonic_ns());
+        else if(task->cpu->accounting_owner==task)
+            scheduler_fair_account(task,scheduler_cpu_execution_ns(task->cpu,task));
+    }
+    int weight_changed=task->scheduling.nice!=updated->nice || task->scheduling.policy!=updated->policy;
+    kernel_sched_publish_priority(&task->scheduling,task->scheduling.priority,updated->nice);
+    if(task->pi_owned||task->pi_request)kernel_futex_pi_recalculate_locked(task,updated->priority);
+    else scheduler_pi_priority_locked(task,(unsigned)updated->priority,0);
+    if(weight_changed)task->scheduling.fair_remainder=0;
+    task->scheduling.policy=updated->policy;
+    task->scheduling.reset_on_fork=updated->reset_on_fork;
+    if(updated->policy==KERNEL_SCHED_RR && !task->scheduling.rr_remaining_ns)
+        task->scheduling.rr_remaining_ns=KERNEL_SCHED_RR_NS;
+    struct kernel_cpu *cpu=task->cpu?task->cpu:kernel_cpu_current();
 #if BOAROS_MAX_CPUS > 1
-                if (task->ready_node.queued) target=task->ready_cpu;
+    if(task->ready_node.queued)cpu=task->ready_cpu;
 #endif
-                kernel_cpu_request_schedule(target);
+    kernel_cpu_request_schedule(cpu);
+}
+static int sched_permission_locked(struct kernel_task *caller,struct kernel_task *task,
+    const struct kernel_sched_policy *updated)
+{
+    if(kernel_credentials_capable(kernel_credentials_task_locked(caller),KERNEL_CAP_SYS_NICE))return 0;
+    uint64_t rtprio=task->limits->values[KERNEL_RLIMIT_RTPRIO].current;
+    if(!sched_owner_locked(caller,task) ||
+        (updated->priority && ((updated->policy!=task->scheduling.policy && !rtprio) ||
+         ((unsigned)updated->priority>scheduler_base_priority(task) && (uint64_t)updated->priority>rtprio))) ||
+        (!updated->priority && updated->nice<task->scheduling.nice && !nice_reduction_allowed(task,updated->nice)) ||
+        (task->scheduling.policy==KERNEL_SCHED_IDLE && updated->policy!=KERNEL_SCHED_IDLE &&
+            !nice_reduction_allowed(task,task->scheduling.nice)) ||
+        (task->scheduling.reset_on_fork&&!updated->reset_on_fork))return -KERNEL_EPERM;
+    return 0;
+}
+int kernel_task_sched_set(struct kernel_task *caller,int32_t pid,int policy,int priority,int keep_policy)
+{
+    if(pid<0)return -KERNEL_EINVAL;
+    int result=-KERNEL_ESRCH;
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        struct kernel_task *task=sched_target(caller,pid);
+        if(task) {
+            KERNEL_RUN_SET(runs);
+            struct kernel_sched_policy updated=task->scheduling;
+            updated.priority=(int)scheduler_base_priority(task);
+            result=kernel_sched_policy_set(&updated,policy,priority,keep_policy);
+            if(!result)result=sched_permission_locked(caller,task,&updated);
+            if(!result)sched_commit_locked(task,&updated);
+        }
+    }
+    if(!result)scheduler_rearm_timer();
+    return result;
+}
+int kernel_task_sched_setattr(struct kernel_task *caller,int32_t pid,const struct kernel_sched_attr *input)
+{
+    if(pid<0)return -KERNEL_EINVAL;
+    int result=-KERNEL_ESRCH;
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        struct kernel_task *task=sched_target(caller,pid);
+        if(task) {
+            KERNEL_RUN_SET(runs);
+            struct kernel_sched_attr attr=*input;
+            int policy=(attr.flags&8U)?task->scheduling.policy:(int)attr.policy;
+            if(attr.flags&16U) {
+                if(task->scheduling.policy==KERNEL_SCHED_FIFO || task->scheduling.policy==KERNEL_SCHED_RR)
+                    attr.priority=scheduler_base_priority(task);
+                else {attr.nice=task->scheduling.nice;attr.runtime=KERNEL_SCHED_FAIR_NS;}
+            }
+            if(attr.flags&~UINT64_C(0x7f))result=-KERNEL_EINVAL;
+            else if(attr.flags&0x66U)result=-KERNEL_ENOTSUP;
+            else if(policy==6||policy==7)result=-KERNEL_ENOTSUP;
+            else if(policy!=0&&policy!=1&&policy!=2&&policy!=3&&policy!=5)result=-KERNEL_EINVAL;
+            else if(attr.priority>99)result=-KERNEL_EINVAL;
+            else if(policy!=KERNEL_SCHED_FIFO && policy!=KERNEL_SCHED_RR &&
+                    attr.runtime && attr.runtime!=KERNEL_SCHED_FAIR_NS)result=-KERNEL_ENOTSUP;
+            else {
+                struct kernel_sched_policy updated=task->scheduling;
+                updated.priority=(int)scheduler_base_priority(task);
+                int requested=policy|((attr.flags&1U)?KERNEL_SCHED_RESET_ON_FORK:0);
+                result=kernel_sched_policy_set(&updated,requested,(int)attr.priority,(attr.flags&8U)!=0);
+                if(policy!=KERNEL_SCHED_FIFO && policy!=KERNEL_SCHED_RR)updated.nice=attr.nice;
+                if(!result)result=sched_permission_locked(caller,task,&updated);
+                if(!result && (attr.flags&16U)) {
+                    unsigned reset=updated.reset_on_fork;
+                    updated=task->scheduling;updated.priority=(int)scheduler_base_priority(task);
+                    updated.reset_on_fork=reset;
+                }
+                if(!result)sched_commit_locked(task,&updated);
             }
         }
     }
-    if (!result) scheduler_rearm_timer();
-    arch_interrupt_restore(irq);
+    if(!result)scheduler_rearm_timer();
     return result;
+}
+
+static int priority_one_locked(struct kernel_task *caller,struct kernel_task *task,int nice)
+{
+    if(!sched_owner_locked(caller,task))return -KERNEL_EPERM;
+    if(nice<task->scheduling.nice && !nice_reduction_allowed(task,nice) &&
+        !kernel_credentials_capable(kernel_credentials_task_locked(caller),KERNEL_CAP_SYS_NICE))
+        return -KERNEL_EACCES;
+    KERNEL_RUN_SET(runs);
+    struct kernel_sched_policy updated=task->scheduling;
+    updated.priority=(int)scheduler_base_priority(task);updated.nice=nice;
+    sched_commit_locked(task,&updated);return 0;
+}
+int64_t kernel_task_priority(struct kernel_task *caller,int setting,int32_t which,int32_t who,int32_t nice)
+{
+    if(which<0||which>2)return -KERNEL_EINVAL;
+    if(nice < -20)nice=-20;
+    if(nice>19)nice=19;
+    if(which==0) {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        struct kernel_task *task=who>0?sched_target(caller,who):who?0:caller;
+        if(!task)return -KERNEL_ESRCH;
+        return setting?priority_one_locked(caller,task,nice):20-task->scheduling.nice;
+    }
+    struct kernel_pid *group __attribute__((cleanup(kernel_task_identity_end)))=0;
+    uint32_t uid;
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        uid=who?(uint32_t)who:kernel_credentials_task_locked(caller)->uid;
+        if(which==1) {
+            group=who>0?kernel_pid_find(&scheduler.identities,who):who?0:process_identity(caller,KERNEL_PID_PGID);
+            if(!group)return -KERNEL_ESRCH;
+            kernel_pid_get(group);
+        }
+    }
+    int result=-KERNEL_ESRCH;
+    struct scheduler_task_cursor cursor;scheduler_task_cursor_begin(&cursor);
+    while(cursor.task) {
+        {
+            KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+            struct kernel_task *task=cursor.task;
+            if(task->arch.user_mode && task->tid_owned && !task->retirement &&
+                (which==1?process_identity(task,KERNEL_PID_PGID)==group:
+                 kernel_credentials_task_locked(task)->uid==uid)) {
+                if(setting) {
+                    int error=priority_one_locked(caller,task,nice);
+                    if(error)result=error;else if(result==-KERNEL_ESRCH)result=0;
+                } else {
+                    int value=20-task->scheduling.nice;if(value>result)result=value;
+                }
+            }
+        }
+        scheduler_task_cursor_next(&cursor);
+    }
+    scheduler_task_cursor_end(&cursor);return result;
 }
 
 void kernel_scheduler_rt_bandwidth_get(int64_t *period_us, int64_t *runtime_us)

@@ -375,10 +375,12 @@ static enum kernel_scheduler_status validate_ready_queue(
 #endif
     )
 {
-    if (!!queue->first != !!queue->last || !!queue->first != !!queue->count ||
-        (queue->first && queue->first->previous) || (queue->last && queue->last->next))
+    if (!!queue->rt_first!=!!queue->rt_last ||
+        (queue->rt_first && queue->rt_first->previous) || (queue->rt_last && queue->rt_last->next))
         return KERNEL_SCHEDULER_STATUS_QUEUE_CORRUPT;
-    struct kernel_sched_node *ends[2]={queue->first,queue->last};
+    struct kernel_sched_node *ends[2]={kernel_sched_pick(queue,1),kernel_sched_last(queue)};
+    if(!!ends[0]!=!!queue->count || !!ends[1]!=!!queue->count)
+        return KERNEL_SCHEDULER_STATUS_QUEUE_CORRUPT;
     for (unsigned i=0; i<2 && ends[i]; i++) {
         struct kernel_sched_node *node=ends[i];
         struct kernel_task *task=node->owner;
@@ -1127,9 +1129,9 @@ int kernel_scheduler_core_quiescent(struct kernel_cpu *cpu)
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     KERNEL_RUN_SET(runs);
     return !scheduler.controlled_owners && cpu && cpu->current == cpu->idle &&
-        !cpu->switch_previous && !cpu->runqueue.first && !cpu->active_mm_record
+        !cpu->switch_previous && !cpu->runqueue.count && !cpu->active_mm_record
 #if BOAROS_USER_SMP
-        && !cpu->user_reservations.first && !scheduler.rt_services.first
+        && !cpu->user_reservations.count && !scheduler.rt_services.count
 #endif
         ;
 }

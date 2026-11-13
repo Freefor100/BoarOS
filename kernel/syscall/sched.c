@@ -9,16 +9,8 @@
 #include <kernel/tick.h>
 #include <stdint.h>
 
-struct linux_sched_attr {
-    uint32_t size, policy;
-    uint64_t flags;
-    int32_t nice;
-    uint32_t priority;
-    uint64_t runtime, deadline, period;
-    uint32_t util_min, util_max;
-};
-_Static_assert(sizeof(struct linux_sched_attr)==56,"native sched_attr size");
-_Static_assert(offsetof(struct linux_sched_attr,util_min)==48,"sched_attr version 0 size");
+_Static_assert(sizeof(struct kernel_sched_attr)==56,"native sched_attr size");
+_Static_assert(offsetof(struct kernel_sched_attr,util_min)==48,"sched_attr version 0 size");
 
 static int sched_copy(struct kernel_task *caller, uint64_t address,
                       void *buffer, size_t size, int to_user)
@@ -33,6 +25,37 @@ static int sched_copy(struct kernel_task *caller, uint64_t address,
     return status==KERNEL_UACCESS_STATUS_OK && copied==size ? 0 : -KERNEL_EFAULT;
 }
 
+static int sched_import_attr(struct kernel_task *caller,uint64_t address,struct kernel_sched_attr *attr)
+{
+    uint32_t size;
+    int error=sched_copy(caller,address,&size,sizeof(size),0);
+    if(error)return error;
+    if(!size)size=48;
+    if(size<48 || size>BOAROS_PAGE_SIZE)goto wrong_size;
+    if(address>UINT64_MAX-size)return -KERNEL_EFAULT;
+    /* Check future fields before importing the known prefix, as Linux does. */
+    for(size_t offset=sizeof(*attr);offset<size;) {
+        unsigned char bytes[64];size_t count=size-offset;
+        size_t page_left=BOAROS_PAGE_SIZE-((address+offset)&(BOAROS_PAGE_SIZE-1));
+        if(count>sizeof(bytes))count=sizeof(bytes);
+        if(count>page_left)count=page_left;
+        error=sched_copy(caller,address+offset,bytes,count,0);if(error)return error;
+        for(size_t i=0;i<count;i++)if(bytes[i])goto wrong_size;
+        offset+=count;
+    }
+    *attr=(struct kernel_sched_attr){0};
+    error=sched_copy(caller,address,attr,size<sizeof(*attr)?size:sizeof(*attr),0);
+    if(error)return error;
+    if((attr->flags&0x60U) && size<56)return -KERNEL_EINVAL;
+    if(attr->nice < -20)attr->nice=-20;
+    if(attr->nice>19)attr->nice=19;
+    return 0;
+wrong_size:
+    size=sizeof(*attr);
+    (void)sched_copy(caller,address,&size,sizeof(size),1);
+    return -KERNEL_E2BIG;
+}
+
 enum kernel_syscall_status syscall_handle_sched(
     struct kernel_task *caller, const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
@@ -42,6 +65,11 @@ enum kernel_syscall_status syscall_handle_sched(
     struct kernel_sched_policy state;
     int result;
     decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+    if(nr==140 || nr==141) {
+        decoded->value=kernel_task_priority(caller,nr==140,(int32_t)request->arguments[0],
+            (int32_t)request->arguments[1],(int32_t)request->arguments[2]);
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
     if (nr==168) {
         unsigned cpu=0,node=0;
 #if BOAROS_MAX_CPUS > 1
@@ -61,7 +89,15 @@ enum kernel_syscall_status syscall_handle_sched(
                 (nr==125 ? 99 : 1) : -KERNEL_EINVAL;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    if (nr==118 || nr==119) {
+    if(nr==274) {
+        KERNEL_SERVICE_SCOPE(service);
+        struct kernel_sched_attr attr;
+        if(pid<0 || !request->arguments[1] || (uint32_t)request->arguments[2])result=-KERNEL_EINVAL;
+        else if((result=sched_import_attr(caller,request->arguments[1],&attr))==0) {
+            if((int32_t)attr.policy<0)result=-KERNEL_EINVAL;
+            else result=kernel_task_sched_setattr(caller,pid,&attr);
+        }
+    } else if (nr==118 || nr==119) {
         KERNEL_SERVICE_SCOPE(service);
         uint64_t address=request->arguments[nr==118 ? 1 : 2];
         int priority, policy=nr==118 ? 0 : (int)request->arguments[1];
@@ -93,14 +129,15 @@ enum kernel_syscall_status syscall_handle_sched(
         else result=kernel_task_sched_get(caller,pid,&state);
         if (!result && flags) result=-KERNEL_EINVAL;
         if (!result) {
-            struct linux_sched_attr attr={
+            struct kernel_sched_attr attr={
                 .size=size<sizeof(attr) ? size : sizeof(attr),
                 .policy=(uint32_t)state.policy,
+                .nice=state.policy==KERNEL_SCHED_FIFO||state.policy==KERNEL_SCHED_RR?0:state.nice,
                 .flags=state.reset_on_fork ? 1 : 0,
                 .priority=(state.policy==KERNEL_SCHED_FIFO || state.policy==KERNEL_SCHED_RR)
                     ? (uint32_t)state.priority : 0,
-                .runtime=state.policy==KERNEL_SCHED_OTHER
-                    ? UINT64_C(1000000000)/KERNEL_TICKS_PER_SECOND : 0,
+                .runtime=state.policy!=KERNEL_SCHED_FIFO && state.policy!=KERNEL_SCHED_RR
+                    ? KERNEL_SCHED_FAIR_NS : 0,
             };
             /* Linux先清扩展尾部；尾部fault时不写已知字段。任务快照已释放身份锁。 */
             const uint64_t zeros[8]={0};
@@ -124,7 +161,7 @@ enum kernel_syscall_status syscall_handle_sched(
                 struct { int64_t sec,nsec; } interval={0,
                     state.policy==KERNEL_SCHED_FIFO ? 0 :
                     state.policy==KERNEL_SCHED_RR ? KERNEL_SCHED_RR_NS :
-                        UINT64_C(1000000000)/KERNEL_TICKS_PER_SECOND};
+                        KERNEL_SCHED_FAIR_NS};
                 result=sched_copy(caller,request->arguments[1],&interval,sizeof(interval),1);
             }
         }

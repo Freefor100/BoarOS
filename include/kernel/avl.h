@@ -117,4 +117,15 @@ static inline struct kernel_avl_node *kernel_avl_after(struct kernel_avl_node *r
     while(root){if(root->key>key){next=root;root=root->left;}else root=root->right;}
     return next;
 }
+/* Successor of an actual node, including equal-key neighbours. */
+static inline struct kernel_avl_node *kernel_avl_next(struct kernel_avl_node *root,
+    const struct kernel_avl_node *node)
+{
+    struct kernel_avl_node *next=0;
+    while(root) {
+        if(kernel_avl_before(node,root)){next=root;root=root->left;}
+        else root=root->right;
+    }
+    return next;
+}
 #endif

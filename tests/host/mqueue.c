@@ -307,6 +307,24 @@ static void abandoned_owners_and_allocations(void)
     assert(kernel_mqueue_shutdown()==-KERNEL_EBUSY&&!kernel_mqueue_lookup_name("shutdown",8));
     closefd(fd);assert(!kernel_mqueue_shutdown()&&!mq_table.heap);
 }
+static void scheduler_wait_order(void)
+{
+    current(0);struct kernel_mqueue *q=make("wait-rank",2,32);
+    struct kernel_mqueue_request requests[3]={0};
+    const int nice[3]={10,-5,19};
+    for(unsigned i=0;i<3;i++) {
+        current(i);kernel_sched_publish_priority(&tasks[i].scheduling,i==2?1:0,nice[i]);
+        requests[i].task=&tasks[i];requests[i].queue=q;
+        KERNEL_RAW_SCOPE(g,&q->lock);assert(request_prepare(&requests[i])==1);
+    }
+    assert(q->recv_head==&requests[2]&&q->recv_head->next==&requests[1]&&q->recv_tail==&requests[0]);
+    for(unsigned i=0;i<3;i++) {
+        {KERNEL_RAW_SCOPE(g,&q->lock);request_remove(&requests[i]);}
+        current(i);assert(!kernel_wait_finish(&requests[i].token));kernel_sched_publish_priority(&tasks[i].scheduling,0,0);
+    }
+    current(0);removeq(q);puts("mqueue waiter order uses normal nice and effective RT rank");
+}
+
 int main(void)
 {
     kernel_wait_domain_init();assert(!kernel_mqueue_init(&heap));
@@ -314,7 +332,7 @@ int main(void)
         identities[i].number=(int32_t)i+1;identities[i].references=1;
         tasks[i].identities[KERNEL_PID_TGID].identity=&identities[i];
         kernel_wait_record_init(&tasks[i].wait);kernel_wait_node_init(&tasks[i].default_wait_node,&tasks[i]);}
-    current(0);priority_and_lifetime();notifications();handoff_and_timeout();fault_and_quota();namespace_metadata();abandoned_owners_and_allocations();
+    current(0);scheduler_wait_order();priority_and_lifetime();notifications();handoff_and_timeout();fault_and_quota();namespace_metadata();abandoned_owners_and_allocations();
     assert(!allocations&&!mq_table.queues&&!account.mqueue_bytes&&account.references==1);
     for(unsigned i=0;i<3;i++)assert(identities[i].references==1&&!tasks[i].mqueue_request);
     puts("mqueue core: priority/FIFO, segmented payload, quota/name/OFD lifetime, notify, direct handoff, timeout/signal/fault, abandoned import/cookie/wait, allocation cleanup, shutdown PASS");return 0;

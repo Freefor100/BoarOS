@@ -62,6 +62,45 @@ static __attribute__((noinline)) int accounting_initialize(struct kernel_cpu *cp
     __atomic_store_n(&cpu->accounting_started_ticks,accounting_counter(),__ATOMIC_RELAXED);
     return 1;
 }
+/* Scheduling consumes the same real execution counters as CPU clocks, not
+ * wall time between decisions (which can include interrupts or sleep). */
+uint64_t scheduler_cpu_execution_ns(struct kernel_cpu *cpu,const struct kernel_task *task)
+{
+    for (;;) {
+#if BOAROS_MAX_CPUS > 1
+        uint64_t seq=__atomic_load_n(&cpu->accounting_sequence,__ATOMIC_ACQUIRE);
+        if(seq&1U)continue;
+#endif
+        uint64_t total=task->usage.user_ns+task->usage.kernel_ns;
+        if(cpu->accounting_owner==task) {
+            uint64_t u=__atomic_load_n(&cpu->accounting_user_ticks,__ATOMIC_RELAXED);
+            uint64_t k=__atomic_load_n(&cpu->accounting_kernel_ticks,__ATOMIC_RELAXED);
+            uint64_t started=__atomic_load_n(&cpu->accounting_started_ticks,__ATOMIC_RELAXED);
+            uint32_t mode=__atomic_load_n(&task->accounting_mode,__ATOMIC_RELAXED);
+            uint64_t now=accounting_counter();
+            if(now<started)__builtin_trap();
+            if(mode==ACCOUNT_USER)u+=now-started;
+            else if(mode==ACCOUNT_KERNEL)k+=now-started;
+            total+=kernel_time_ticks_to_ns(u)+kernel_time_ticks_to_ns(k);
+        }
+#if BOAROS_MAX_CPUS > 1
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if(seq!=__atomic_load_n(&cpu->accounting_sequence,__ATOMIC_RELAXED))continue;
+#endif
+        return total;
+    }
+}
+void scheduler_fair_account(struct kernel_task *task,uint64_t total)
+{
+    if(total<task->fair_runtime_seen)__builtin_trap();
+    uint64_t delta=total-task->fair_runtime_seen;task->fair_runtime_seen=total;
+    if(task->scheduling.policy==KERNEL_SCHED_FIFO||task->scheduling.policy==KERNEL_SCHED_RR)return;
+    uint64_t advance=kernel_sched_fair_delta(&task->scheduling,delta);
+    if(advance>UINT64_MAX-task->ready_node.fair.key)__builtin_trap();
+    task->ready_node.fair.key+=advance;
+    uint64_t used=task->scheduling.fair_slice_used+delta;
+    task->scheduling.fair_slice_used=used>KERNEL_SCHED_FAIR_NS?KERNEL_SCHED_FAIR_NS:(uint32_t)used;
+}
 void scheduler_cpu_time_switch(struct kernel_task *previous,struct kernel_task *next)
 {
 #if BOAROS_USER_SMP
@@ -82,6 +121,7 @@ void scheduler_cpu_time_switch(struct kernel_task *previous,struct kernel_task *
     /* task保存已结束执行片段的纳秒值；本CPU的硬件tick只在查询/交接换算。 */
     previous->usage.user_ns+=kernel_time_ticks_to_ns(cpu->accounting_user_ticks);
     previous->usage.kernel_ns+=kernel_time_ticks_to_ns(cpu->accounting_kernel_ticks);
+    if(!previous->idle)scheduler_fair_account(previous,previous->usage.user_ns+previous->usage.kernel_ns);
     __atomic_store_n(&cpu->accounting_user_ticks,0,__ATOMIC_RELAXED);
     __atomic_store_n(&cpu->accounting_kernel_ticks,0,__ATOMIC_RELAXED);
     accounting_write_end(cpu);

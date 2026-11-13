@@ -100,7 +100,7 @@ static void assert_ready_owner(struct kernel_task *task,struct kernel_cpu *owner
     unsigned matches=0;
     for (struct kernel_cpu *cpu=scheduler.cpus;cpu;cpu=cpu->scheduler_next) {
         unsigned count=0;
-        for (struct kernel_sched_node *node=cpu->runqueue.first;node;node=node->next) {
+        for (struct kernel_sched_node *node=kernel_sched_pick(&cpu->runqueue,1);node;node=kernel_sched_next(&cpu->runqueue,node)) {
             count++;
             struct kernel_task *queued=node->owner;
             assert(node==&queued->ready_node && queued->ready_cpu==cpu && !queued->wait.on_cpu);
@@ -171,10 +171,10 @@ static void owned_queue_cases(void)
           ready_enqueue_locked(&tasks[i],0);
       }
       assert_ready_owner(&tasks[0],&cpus[0]);assert_ready_owner(&tasks[1],&cpus[1]);
-      struct kernel_sched_node *unrelated=cpus[1].runqueue.first;
+      struct kernel_sched_node *unrelated=kernel_sched_pick(&cpus[1].runqueue,1);
       scheduler_pi_priority_locked(&tasks[0],0,80);
       assert_ready_owner(&tasks[0],&cpus[0]);
-      assert(cpus[1].runqueue.first==unrelated && cpus[1].runqueue.count==1 &&
+      assert(kernel_sched_pick(&cpus[1].runqueue,1)==unrelated && cpus[1].runqueue.count==1 &&
           !cpus[1].runqueue.boosted && cpus[0].runqueue.boosted==1);
       scheduler_pi_priority_locked(&tasks[0],80,0);
       kernel_cpu_consume_schedule(&cpus[0]);kernel_cpu_consume_schedule(&cpus[1]);
@@ -253,7 +253,7 @@ static void many_claims(void)
             unsigned owners=0;
             for(unsigned i=0;i<BOAROS_MAX_CPUS;i++) {
                 owners+=selected[i]==&tasks[t];
-                assert(!cpus[i].runqueue.first);
+                assert(!kernel_sched_pick(&cpus[i].runqueue,1));
             }
             assert(owners==1 && tasks[t].wait.on_cpu && !tasks[t].ready_node.queued && !tasks[t].ready_cpu);
         }
@@ -315,7 +315,7 @@ int main(void)
     assert((selected[0] == &tasks[3]) + (selected[1] == &tasks[3]) == 1);
     assert(tasks[3].wait.on_cpu && !tasks[3].ready_node.queued);
     assert(!tasks[3].ready_cpu);
-    assert(!cpus[0].runqueue.first && !cpus[1].runqueue.first);
+    assert(!kernel_sched_pick(&cpus[0].runqueue,1) && !kernel_sched_pick(&cpus[1].runqueue,1));
     unsigned owner = tasks[3].cpu->logical_id;
     assert(cpus[owner].switch_previous == &idles[owner] && idles[owner].wait.on_cpu);
     assert(deliveries);
@@ -347,7 +347,7 @@ int main(void)
     for (unsigned i = 0; i < 4; i++) assert(!pthread_create(&actors[i], 0, publish_and_claim, (void *)(uintptr_t)i));
     for (unsigned i = 0; i < 4; i++) assert(!pthread_join(actors[i], 0));
     assert(selected[0] != selected[1] && selected[0] && selected[1]);
-    assert(!cpus[0].runqueue.first && !cpus[1].runqueue.first);
+    assert(!kernel_sched_pick(&cpus[0].runqueue,1) && !kernel_sched_pick(&cpus[1].runqueue,1));
     assert(tasks[0].wait.on_cpu && tasks[1].wait.on_cpu && tasks[0].cpu != tasks[1].cpu);
     pthread_barrier_destroy(&gate);
 #if BOAROS_MAX_CPUS >= 4

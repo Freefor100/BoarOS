@@ -69,7 +69,9 @@ static int effective_locked(const struct kernel_task *task)
 {
     uint16_t raw=task->io_priority?task->io_priority->priority:0;
     if(valid_priority(raw))return raw;
-    return ((task->scheduling.policy==KERNEL_SCHED_FIFO || task->scheduling.policy==KERNEL_SCHED_RR)?1:2)*8192+4;
+    unsigned cls=task->scheduling.policy==KERNEL_SCHED_IDLE?3:
+        (task->scheduling.policy==KERNEL_SCHED_FIFO||task->scheduling.policy==KERNEL_SCHED_RR)?1:2;
+    return (int)(cls*8192U+(unsigned)(task->scheduling.nice+20)/5U);
 }
 
 static int change_one(struct kernel_task *caller,struct kernel_task *target,uint16_t priority)

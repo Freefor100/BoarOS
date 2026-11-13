@@ -275,6 +275,8 @@ struct kernel_task {
     /* 调度域内的唯一执行队列owner；未入队时为空，cpu保留最后执行者。 */
     struct kernel_cpu *ready_cpu;
 #endif
+    struct kernel_sched_runqueue *fair_queue;
+    uint64_t fair_runtime_seen;
 } __attribute__((aligned(16)));
 
 #endif

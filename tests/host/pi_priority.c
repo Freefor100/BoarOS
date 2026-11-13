@@ -48,8 +48,8 @@ static void ready_and_running(void)
     assert(ready_best_locked()==&tasks[1]);
     scheduler_pi_priority_locked(&tasks[0],10,80);
     assert(tasks[0].scheduling.priority==80 && ready_best_locked()==&tasks[0]);
-    assert(tasks[0].ready_cpu==&cpus[0] && cpus[0].runqueue.first->owner==&tasks[0]);
-    for(unsigned i=1;i<4;i++)assert(!cpus[i].runqueue.first);
+    assert(tasks[0].ready_cpu==&cpus[0] && kernel_sched_pick(&cpus[0].runqueue,1)->owner==&tasks[0]);
+    for(unsigned i=1;i<4;i++)assert(!kernel_sched_pick(&cpus[i].runqueue,1));
     scheduler_pi_priority_locked(&tasks[0],10,0);
     assert(tasks[0].scheduling.priority==10 && ready_best_locked()==&tasks[1]);
     ready_remove_locked(&tasks[0]);tasks[0].state=KERNEL_THREAD_STATE_RUNNING;
@@ -77,10 +77,10 @@ static void service_and_bandwidth(void)
     kernel_sched_enqueue(&cpus[1].user_reservations,&tasks[0].reservation_node,&tasks[0],10,0);
     ready_enqueue_locked(&tasks[0],0);
     scheduler_pi_priority_locked(&tasks[0],10,80);
-    assert(scheduler.rt_services.first->priority==80);
-    assert(cpus[1].user_reservations.first->priority==80);
+    assert(scheduler.rt_services.rt_first->priority==80);
+    assert(cpus[1].user_reservations.rt_first->priority==80);
     scheduler_pi_priority_locked(&tasks[0],10,0);
-    assert(scheduler.rt_services.first->priority==10 && cpus[1].user_reservations.first->priority==10);
+    assert(scheduler.rt_services.rt_first->priority==10 && cpus[1].user_reservations.rt_first->priority==10);
     scheduler_user_reservation_release_locked(&tasks[0]);ready_remove_locked(&tasks[0]);
     tasks[0].user_service=0;
     tasks[0].cpu_mask=tasks[1].cpu_mask=tasks[3].cpu_mask=1;
