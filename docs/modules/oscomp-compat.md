@@ -1,13 +1,13 @@
 # 双架构原评测运行与评分
 
-本模块仅存在于oscomp-compat。main保留通用内核和自身身份；通用修复先落main再
-单向合入此分支。本分支保留兼容uname4.15.0、原盘启动配置、监督与判分。分支
+本模块仅存在于oscomp-compat。通用修复先落main再单向合入此分支，Linux ABI身份
+与main一致。本分支维护比赛原盘的启动配置、监督与判分。分支
 由oscomp-rv-compat更名，现行维护名称为oscomp-compat，与main共同保留。旧名称
 仅用于历史提交与RV专项结果身份；运行时DSO留在本分支，main默认不预加载。
 原盘、调用与判分问题集中见[评测输入与测例问题](../learning/oscomp-test-issues.md)；
 历次结果和具体对照见[评测学习记录](../learning/oscomp-compat-baseline.md)。
-当前共同内核已集成 main 的 CPU 本地/raw、buddy/slab、代次等待和切换尾部；
-生产仍是单 CPU，业务对象与共享 MM 尚未完成跨核同步。
+默认旧评测交付仍为单CPU；RV、LA均可构建支持实际1～8核执行的内核。
+调度、等待和各子系统的并发范围见[多核机制](riscv-smp.md)与[LA启动](loongarch-boot.md)。
 
 ## 固定输入与入口
 
@@ -30,6 +30,39 @@
 init.json和头文件；`INIT_CONFIG_RV`/`INIT_CONFIG_LA`独立覆盖，显式共同
 `INIT_CONFIG=config/init.json`同时恢复通用fixture。构建中不可让另一组不同配置
 覆盖正在冻结的kernel；先构建、复制内核及身份，再运行。
+
+## final-2026 可选入口
+
+`final-2026` 使用公开的Debian根文件系统，运行glibc的CAgent和BuildStorm，
+与默认pre-20250615入口分开选择。输入归档名、解压后大小、SHA256、源码版本与脚本身份
+集中在 [`inputs-final-2026.json`](../../tests/oscomp/inputs-final-2026.json)。
+两份压缩包分别对应RV和LA，每台虚拟机只挂自己的一张根盘。
+
+```sh
+make run-oscomp-final-2026 OSCOMP_FINAL_IMAGES=/path/to/archives OSCOMP_FINAL_ARCH=both
+
+python3 -B tests/oscomp/run.py --profile final-2026 --arch both \
+  --images-dir /path/to/archives \
+  --host-vcpu-cpus 8,9,10,11,12,13,14,15 --host-io-cpu 0
+```
+
+入口校验压缩包和原始镜像，直接解压成各自的运行副本，不调用宿主日志重放或修复工具。
+内核通过 `INIT_CONFIG_RV/LA` 分别构建RV八核、LA八核版本，使用8 GiB内存；
+默认单核交付物和旧评测配置不被替换。启动使用盘内`/glibc/busybox`准备proc、sysfs、
+devpts、共享内存目录和回环接口，再用盘内bash/sh运行原脚本。
+保留原Debian加载器和库，不添加旧盘调度DSO或工具分区。
+
+`--groups cagent`或`--groups buildstorm`可单独选择一题。两架构串行运行，
+`--host-vcpu-cpus`须提供八个不同的宿主CPU，并与`--host-io-cpu`搭配使用；
+不指定时使用宿主原有亲和性。正式时限沿原脚本，包括BuildStorm的14400秒内部超时；
+默认另设15000秒外层时限，可用`--diagnostic-timeout`调整，0仅取消外层时限。
+
+输出保存原串口、原judge逐项结果、脚本状态、实际内核／输入／QEMU身份及可选绑核记录。
+工具链版本查询通过不等于构建成功，脚本退出0也不代替产物检查；编译成功但时间分为0
+仍可表示功能通过。CLI在功能失败或运行不完整时返回非零。
+正常退出并通过只读磁盘检查后默认删除运行盘，`--keep-disks`可保留；
+错误或未完成的运行盘保留供调查。原压缩包不修改，结果与原盘问题见
+[公开盘记录](../learning/oscomp-official-delivery.md#final-2026-公开盘首次运行)。
 
 ## 官方双盘、启动熵与格式化工具
 

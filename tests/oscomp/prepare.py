@@ -8,17 +8,39 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 
+def write_profile(profile, output):
+    output.parent.mkdir(parents=True, exist_ok=True)
+    value = json.dumps(profile, ensure_ascii=False, indent=2) + '\n'
+    if not output.exists() or output.read_text() != value:
+        output.write_text(value)
+
 
 def main():
     parser = argparse.ArgumentParser(__doc__)
+    parser.add_argument('--profile', choices=('pre-20250615', 'final-2026'), default='pre-20250615')
     parser.add_argument('--arch', choices=('riscv', 'loongarch'), default='riscv')
-    parser.add_argument('--case', type=Path, required=True)
+    parser.add_argument('--case', type=Path)
     parser.add_argument('--runtime', type=Path)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--groups', default='basic busybox cyclictest iozone iperf libcbench libctest lmbench lua netperf ltp')
+    parser.add_argument('--groups')
     parser.add_argument('--case-timeout', type=int, default=300)
     parser.add_argument('--diagnostic-exclude', default='', help='space-separated LTP basenames, empty by default')
     args = parser.parse_args()
+    if args.profile == 'final-2026':
+        groups = args.groups or 'cagent buildstorm'
+        if not groups.split() or not set(groups.split()) <= {'cagent', 'buildstorm'}:
+            parser.error('unknown final-2026 evaluation group')
+        if args.case or args.runtime or args.diagnostic_exclude:
+            parser.error('final-2026 uses the public rootfs without old supervisors or runtime overlays')
+        write_profile({'path': '/glibc/busybox',
+            'argv': ['/glibc/busybox', 'sh', '-c', (HERE / 'final-2026-init.sh').read_text()],
+            'envp': ['PATH=/usr/bin:/bin:/glibc', 'HOME=/root', 'TERM=vt100',
+                     'BOAROS_EVAL_ARCH=' + args.arch,
+                     'BOAROS_EVAL_GROUPS=' + groups]}, args.output)
+        return
+    if args.case is None:
+        parser.error('--case is required for pre-20250615')
+    args.groups = args.groups or 'basic busybox cyclictest iozone iperf libcbench libctest lmbench lua netperf ltp'
     known = {'basic','busybox','cyclictest','iozone','iperf','libcbench','libctest','lmbench','lua','netperf','ltp'}
     if not args.groups.split() or not set(args.groups.split()) <= known:
         parser.error('unknown evaluation group')
@@ -87,10 +109,7 @@ def main():
                         'BOAROS_LINUX_SCHED_PRELOAD=' + runtime_path,
                         'BOAROS_LTP_CASE_TIMEOUT=' + str(args.case_timeout),
                         'BOAROS_DIAGNOSTIC_EXCLUDE=' + ' '.join(exclusions)]}
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    value = json.dumps(profile, ensure_ascii=False, indent=2) + '\n'
-    if not args.output.exists() or args.output.read_text() != value:
-        args.output.write_text(value)
+    write_profile(profile, args.output)
 
 
 if __name__ == '__main__':

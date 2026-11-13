@@ -277,17 +277,29 @@ def diagnostic_build(architectures, selected, case_timeout, exclusions):
 
 def main():
     ap = argparse.ArgumentParser(__doc__)
+    ap.add_argument('--profile', choices=('pre-20250615','final-2026'), default='pre-20250615')
     ap.add_argument('--arch', choices=tuple(ARCH_KEYS) + ('both',), default='both')
     ap.add_argument('--output', type=Path, default=None)
     ap.add_argument('--verify-inputs', action='store_true')
     ap.add_argument('--diagnostic-timeout', type=int)
-    ap.add_argument('--groups', choices=tuple(GROUPS) + ('all', 'benchmarks', 'environment'), default='all')
+    ap.add_argument('--groups', choices=tuple(GROUPS) + ('all', 'benchmarks', 'environment','cagent','buildstorm'), default='all')
+    ap.add_argument('--images-dir', type=Path, help='final-2026 archives; default ~/Downloads')
+    ap.add_argument('--host-vcpu-cpus', help='final-2026: one distinct host CPU per vCPU')
+    ap.add_argument('--host-io-cpu', type=int, help='final-2026: host CPU for QEMU main/I/O')
+    ap.add_argument('--keep-disks', action='store_true', help='final-2026: retain checked runtime images')
     ap.add_argument('--case-timeout', type=int, default=300)
     ap.add_argument('--diagnostic-exclude', action='append', default=[], metavar='CASE')
     ap.add_argument('--qemu-riscv', default=os.environ.get('QEMU_RISCV64', 'qemu-system-riscv64'))
     ap.add_argument('--qemu-loongarch', default=os.environ.get('QEMU_LOONGARCH64', 'build/qemu-la-rtc/qemu-system-loongarch64'))
     ap.add_argument('--local-cache', type=Path, default=Path(os.environ.get('OSCOMP_LOCAL_CACHE', ROOT / 'build/tools/oscomp-local')))
     args = ap.parse_args()
+    if args.profile == 'final-2026':
+        if args.groups not in ('all','cagent','buildstorm'):ap.error('unknown final-2026 group')
+        import final2026
+        return final2026.main(args)
+    if args.groups in ('cagent','buildstorm'):ap.error('select --profile final-2026 for these groups')
+    if args.images_dir is not None or args.host_vcpu_cpus is not None or args.host_io_cpu is not None or args.keep_disks:
+        ap.error('these options require --profile final-2026')
     architectures = tuple(ARCH_KEYS) if args.arch == 'both' else (args.arch,)
     directory = args.output.resolve() if args.output else ROOT / 'build' / ('oscomp-diagnostic-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f'))
     if directory.exists(): ap.error('output already exists; use a new run directory')

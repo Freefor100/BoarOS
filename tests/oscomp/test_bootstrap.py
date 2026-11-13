@@ -10,6 +10,28 @@ HERE = Path(__file__).resolve().parent
 
 
 class BootstrapTests(unittest.TestCase):
+    def test_final_profile_uses_public_glibc_rootfs_without_legacy_payload(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            target=Path(temporary)/'init.json'
+            result=subprocess.run(['python3', '-B', str(HERE/'prepare.py'), '--profile','final-2026',
+                '--arch','loongarch','--groups','buildstorm','--output',str(target)],capture_output=True,text=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+            profile=json.loads(target.read_text())
+            self.assertEqual(profile['path'],'/glibc/busybox')
+            self.assertIn('BOAROS_EVAL_GROUPS=buildstorm',profile['envp'])
+            self.assertFalse(any('LD_PRELOAD' in item or 'SCHED_PRELOAD' in item for item in profile['envp']))
+            self.assertNotIn('/boaros-tools',profile['argv'][3])
+            self.assertNotIn('journal_only',profile['argv'][3])
+            subprocess.run(['sh','-n','-c',profile['argv'][3]],check=True)
+
+    def test_final_profile_rejects_old_group_before_publishing_config(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            target=Path(temporary)/'init.json'
+            result=subprocess.run(['python3','-B',str(HERE/'prepare.py'),'--profile','final-2026',
+                '--groups','basic','--output',str(target)],capture_output=True,text=True)
+            self.assertNotEqual(result.returncode,0)
+            self.assertFalse(target.exists())
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
