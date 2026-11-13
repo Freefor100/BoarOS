@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/ptrace.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
@@ -116,6 +117,58 @@ static void final_wait_ownership(void)
     CHECK(waitpid(parent,&status,0)==parent && WIFEXITED(status) && !WEXITSTATUS(status));
     close(ids[0]); close(ids[1]); close(release[0]); close(release[1]);
 }
+static void tracer_death(unsigned options)
+{
+    int fd=open("/tmp/ptrace-tracer-death",O_RDWR|O_CREAT|O_EXCL,0600);
+    CHECK(fd>=0 && !unlink("/tmp/ptrace-tracer-death"));
+    int identity[2],stopped[2],release[2];
+    CHECK(!pipe(identity) && !pipe(stopped) && !pipe(release));
+    pid_t tracer=fork();
+    CHECK(tracer>=0);
+    if (!tracer) {
+        pid_t target;
+        close(identity[1]); close(stopped[0]); close(release[0]);
+        CHECK(read(identity[0],&target,sizeof(target))==sizeof(target));
+        CHECK(!ptrace(PTRACE_SEIZE,target,0,(void *)(uintptr_t)(options|PTRACE_O_TRACESYSGOOD)));
+        CHECK(write(release[1],"r",1)==1);
+        int status;
+        CHECK(waitpid(target,&status,0)==target && WIFSTOPPED(status) && WSTOPSIG(status)==SIGUSR1);
+        CHECK(!ptrace(PTRACE_SYSCALL,target,0,0));
+        CHECK(waitpid(target,&status,0)==target && WIFSTOPPED(status) && WSTOPSIG(status)==(SIGTRAP|128));
+        uint64_t info[10]={0};
+        CHECK(syscall(SYS_ptrace,0x420e,target,sizeof(info),info)==80 &&
+            (uint8_t)info[0]==1 && info[3]==SYS_write && info[4]==(uint64_t)fd);
+        CHECK(write(stopped[1],"s",1)==1);
+        for (;;) pause();
+    }
+    close(identity[0]); close(stopped[1]); close(release[1]);
+    pid_t target=fork();
+    CHECK(target>=0);
+    if (!target) {
+        /* Yama can require a sibling tracer to be named explicitly. Kernels
+         * without that LSM reject this prctl; SEIZE must succeed in either case. */
+        CHECK(!prctl(PR_SET_PTRACER,(unsigned long)tracer,0UL,0UL,0UL) || errno==EINVAL);
+        pid_t me=getpid();
+        CHECK(write(identity[1],&me,sizeof(me))==sizeof(me));
+        char byte;
+        CHECK(read(release[0],&byte,1)==1 && byte=='r');
+        CHECK(!syscall(SYS_kill,me,SIGUSR1));
+        CHECK(syscall(SYS_write,fd,"x",1)==1);
+        _exit(43);
+    }
+    close(identity[1]); close(release[0]);
+    char byte;
+    CHECK(read(stopped[0],&byte,1)==1 && byte=='s');
+    CHECK(!kill(tracer,SIGKILL));
+    int status;
+    CHECK(waitpid(tracer,&status,0)==tracer && WIFSIGNALED(status) && WTERMSIG(status)==SIGKILL);
+    CHECK(waitpid(target,&status,0)==target);
+    if (options) CHECK(WIFSIGNALED(status) && WTERMSIG(status)==SIGKILL);
+    else CHECK(WIFEXITED(status) && WEXITSTATUS(status)==43);
+    struct stat st;
+    CHECK(!fstat(fd,&st) && st.st_size==(options?0:1));
+    close(stopped[0]); close(fd);
+}
 int main(void)
 {
     pid_t pid = fork(); CHECK(pid >= 0);
@@ -207,6 +260,8 @@ int main(void)
     final_wait_ownership();
     continue_before_listen();
     kill_before_write();
+    tracer_death(0);
+    tracer_death(PTRACE_O_EXITKILL);
     puts("PTRACE traced-stop memory syscall-info exit PASS");
     return 0;
 }

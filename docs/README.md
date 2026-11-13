@@ -51,6 +51,7 @@
 - **[进程模型与 SMP 调度](modules/kernel-scheduler.md)**：Per-CPU 就绪队列、优先级时间片调度与进程状态流转。
 - **[任务生命周期与执行](modules/kernel-exec.md)**：ELF 装载、`execve` 提交与旧资源回收。
 - **[POSIX 信号处理](modules/kernel-signal.md)**：信号产生、掩码屏蔽、信号递送与蹦床回跳（Trampoline）。
+- **[进程跟踪](modules/kernel-ptrace.md)**：ptrace 停止与恢复、调用和信号事件、原生寄存器及调试内存访问。
 - **[时钟与高精度定时器](modules/kernel-time.md)**：系统滴答时钟、软硬件定时器与 `nanosleep` / `clock_nanosleep`。
 - **[资源记账与限制](modules/kernel-accounting.md)**：`getrusage` 统计、时间片计算与进程资源限额（rlimit）。
 - **[TTY 与控制终端](modules/kernel-tty.md)**：会话管理、前台进程组、作业控制与标准输入输出重定向。

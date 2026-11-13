@@ -17,3 +17,12 @@ RV64 和 LA64 提供 Linux `ptrace(117)`。跟踪关系绑定线程。被跟踪�
 `PEEKTEXT` 和 `PEEKDATA` 的原始系统调用把机器字复制到 data 指针并返回零；libc 的 ptrace 包装返回读取的机器字。`POKETEXT` 和 `POKEDATA` 使用传入的机器字更新目标。停止期间的访问固定目标的执行状态，私有映射的写入使用 COW，写入可执行页后发布指令缓存。映射与页所有权见 [内存管理](kernel-mm.md)。
 
 单步、硬件断点和 seccomp 事件均超出此接口当前支持的跟踪范围。
+
+## 直接消费者与工具
+
+`tests/userland/api8.py --program ptrace --program ptrace_signal --program ptrace_tools`
+运行直接调用、信号交接和原版工具消费者，架构、libc、核数及内核由同一执行器选择。
+`ptrace_tools` 使用固定上游 strace 7.3，检查 `-f` 跟踪中的线程、fork、vfork、
+非组长 exec、信号和文件操作记录，并对已经运行的目标执行 attach。
+`tools/build-strace.py --arch riscv` 或 `--arch loongarch` 构建静态 musl 工具；
+来源及构建约束见[第三方组件](../third-party.md#strace-验证工具)。

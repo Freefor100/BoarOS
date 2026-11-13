@@ -686,14 +686,21 @@ void ptrace_begin_exit(struct kernel_task *t,uint32_t status)
             child=t->ptrace->first;
             if (!child) break;
             scheduler_task_get_locked(child);
+            kill=(child->ptrace->options&EXITKILL) && !child->proc_exiting &&
+                child->ptrace->phase!=TRACE_FINAL;
+        }
+        /* Keep the existing stop while publishing SIGKILL. The group exit
+         * path sets terminate_requested before it notifies the wait token. */
+        if (kill) (void)kernel_signal_send_task(child,9,0);
+        {
+            KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
             struct kernel_ptrace_state *s=child->ptrace;
+            if (s->tracer!=t) continue;
             final=s->phase==TRACE_FINAL;
-            kill=s->options&EXITKILL;
             cred=unlink_locked(child);
             s->phase=TRACE_RUNNING; resume_locked(s);
         }
         kernel_credentials_put(cred);
-        if (kill && !final) (void)kernel_signal_send_task(child,9,0);
         if (final) process_release_traced_zombie(child);
     }
 }

@@ -8,6 +8,7 @@
 #include <kernel/ioprio.h>
 #include <kernel/futex.h>
 #include <kernel/task.h>
+#include <kernel/ptrace.h>
 #include <kernel/mm.h>
 #include <kernel/uaccess.h>
 #include <kernel/scheduler.h>
@@ -571,6 +572,12 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
     } else if ((request->number>=LINUX_SYSCALL_SETREGID && request->number<=LINUX_SYSCALL_SETFSGID) ||
                request->number==LINUX_SYSCALL_GETGROUPS || request->number==LINUX_SYSCALL_SETGROUPS) {
         if (syscall_handle_credentials(caller,request,&decoded) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 117U) {
+        decoded.action=KERNEL_SYSCALL_ACTION_RETURN;
+        decoded.value=kernel_ptrace_request(caller,request->arguments[0],(int32_t)request->arguments[1],request->arguments[2],request->arguments[3]);
+    } else if (request->number == 270U || request->number == 271U) {
+        if(syscall_handle_process_vm(caller,request,&decoded)!=KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_PRLIMIT64) {
         if (syscall_handle_prlimit64(caller, request, &decoded) !=
