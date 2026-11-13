@@ -482,10 +482,39 @@ static void test_retired_payload_is_not_owner(void)
     assert(physical_page_allocator_audit(&allocator) == 0);
 }
 
+static unsigned unexpected_reclaim;
+static uint64_t no_sleep_reclaim(void *context, uint64_t wanted)
+{ (void)context; (void)wanted; unexpected_reclaim++; return 0; }
+static void test_no_sleep_allocation(void)
+{
+    setup();
+    uint64_t initial=physical_page_available(&allocator), pages[256];
+    struct physical_page_reclaim_hooks hooks={.reclaim=no_sleep_reclaim};
+    assert(!physical_page_allocator_set_reclaimer(&allocator,&hooks));
+    void *small=0,*large=0;
+    kernel_preempt_disable();
+    assert(!kernel_heap_allocate_nosleep(&heap,48,&small));
+    assert(!kernel_heap_allocate_zeroed_nosleep(&heap,2,BOAROS_PAGE_SIZE,&large));
+    for (unsigned i=0;i<2*BOAROS_PAGE_SIZE;i++) assert(!((unsigned char *)large)[i]);
+    kernel_heap_release(&heap,small);kernel_heap_release(&heap,large);
+    unsigned count=0;
+    while(count<256 && !physical_page_allocate_order_nosleep(&allocator,0,&pages[count])) count++;
+    assert(count && count<256);
+    small=(void *)(uintptr_t)0x1234;
+    assert(kernel_heap_allocate_nosleep(&heap,48,&small)==KERNEL_HEAP_STATUS_EMPTY);
+    assert(small==(void *)(uintptr_t)0x1234 && !unexpected_reclaim);
+    while(count) assert(!physical_page_release(&allocator,pages[--count]));
+    kernel_preempt_enable();
+    assert(!physical_page_allocator_clear_reclaimer(&allocator));
+    assert(physical_page_available(&allocator)==initial);
+    assert(!physical_page_allocator_audit(&allocator));
+}
+
 int main(void)
 {
     struct rlimit limit = {0, 0};
     assert(setrlimit(RLIMIT_CORE, &limit) == 0);
+    test_no_sleep_allocation();
     test_legal_release_is_silent();
     test_retired_payload_is_not_owner();
     for (unsigned int i = 0; i < 24; i++) {

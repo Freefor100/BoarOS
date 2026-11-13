@@ -9,6 +9,8 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
+void kernel_open_file_async_close(struct kernel_open_file_description *file)
+{ assert(file && !file->async_io); }
 
 _Thread_local uintptr_t sync_test_irq;
 static struct kernel_cpu cpu={.initialized=KERNEL_CPU_INITIALIZED,.logical_id=1};

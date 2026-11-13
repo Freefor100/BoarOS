@@ -30,15 +30,17 @@ static struct kernel_signal_pending_state *state(struct kernel_task *t,int share
 static uint64_t *bits(struct kernel_task *t,int shared)
 { return shared ? &t->group_pending : &t->signal_pending; }
 
-void signal_pending_prepare_record(struct kernel_heap *heap,struct signal_pending_prepared *p)
+static void prepare_record(struct kernel_heap *heap,struct signal_pending_prepared *p,int nosleep)
 {
     if(!heap || p->record)return;
-    enum kernel_heap_status status=kernel_heap_allocate_zeroed(heap,1,sizeof(*p->record),(void **)&p->record);
+    enum kernel_heap_status status=nosleep
+        ? kernel_heap_allocate_zeroed_nosleep(heap,1,sizeof(*p->record),(void **)&p->record)
+        : kernel_heap_allocate_zeroed(heap,1,sizeof(*p->record),(void **)&p->record);
     if(!status)p->record->heap=heap;
     else if(status!=KERNEL_HEAP_STATUS_EMPTY)__builtin_trap();
 }
-void signal_pending_prepare_queue(struct kernel_task *t,int shared,struct kernel_heap *heap,
-    struct signal_pending_prepared *p)
+static void prepare_queue(struct kernel_task *t,int shared,struct kernel_heap *heap,
+    struct signal_pending_prepared *p,int nosleep)
 {
     if(!heap)return;
     int needs_index;
@@ -50,22 +52,35 @@ void signal_pending_prepare_queue(struct kernel_task *t,int shared,struct kernel
         if(q && !p->record){p->record=q->spare;q->spare=0;}
     }
     if(needs_index){
-        enum kernel_heap_status status=kernel_heap_allocate_zeroed(heap,1,sizeof(*p->index),(void **)&p->index);
+        enum kernel_heap_status status=nosleep
+            ? kernel_heap_allocate_zeroed_nosleep(heap,1,sizeof(*p->index),(void **)&p->index)
+            : kernel_heap_allocate_zeroed(heap,1,sizeof(*p->index),(void **)&p->index);
         if(!status)p->index->heap=heap;
         else if(status!=KERNEL_HEAP_STATUS_EMPTY)__builtin_trap();
     }
 }
-void signal_pending_prepare(struct kernel_task *t,int shared,const struct kernel_task *charge_target,struct kernel_heap *heap,
-    const struct kernel_signal_wait_info *info,int supplied,struct signal_pending_prepared *p)
+static void prepare(struct kernel_task *t,int shared,const struct kernel_task *charge_target,struct kernel_heap *heap,
+    const struct kernel_signal_wait_info *info,int supplied,struct signal_pending_prepared *p,int nosleep)
 {
     if(info->signal<32 && !supplied && !info->uid) {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         struct kernel_signal_pending_state *s=state(t,shared);
         if(!s->inline_account || s->inline_account==kernel_credentials_task_locked(charge_target)->account)return;
     }
-    signal_pending_prepare_queue(t,shared,heap,p);
-    signal_pending_prepare_record(heap,p);
+    prepare_queue(t,shared,heap,p,nosleep);
+    prepare_record(heap,p,nosleep);
 }
+void signal_pending_prepare_record(struct kernel_heap *heap,struct signal_pending_prepared *p)
+{ prepare_record(heap,p,0); }
+void signal_pending_prepare_queue(struct kernel_task *t,int shared,struct kernel_heap *heap,struct signal_pending_prepared *p)
+{ prepare_queue(t,shared,heap,p,0); }
+void signal_pending_prepare(struct kernel_task *t,int shared,const struct kernel_task *charge,struct kernel_heap *heap,
+    const struct kernel_signal_wait_info *info,int supplied,struct signal_pending_prepared *p)
+{ prepare(t,shared,charge,heap,info,supplied,p,0); }
+void signal_pending_prepare_nosleep(struct kernel_task *t,int shared,const struct kernel_task *charge,struct kernel_heap *heap,
+    const struct kernel_signal_wait_info *info,int supplied,struct signal_pending_prepared *p)
+{ prepare(t,shared,charge,heap,info,supplied,p,1); }
+
 int signal_pending_reserve_locked(const struct kernel_task *task,struct kernel_uid_account **owner)
 {
     struct kernel_uid_account *account=kernel_credentials_task_locked(task)->account;

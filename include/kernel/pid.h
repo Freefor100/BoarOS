@@ -42,6 +42,11 @@ enum kernel_pid_status kernel_pid_release(
 enum kernel_pid_role { KERNEL_PID_TID, KERNEL_PID_TGID,
     KERNEL_PID_PGID, KERNEL_PID_SID, KERNEL_PID_ROLES };
 struct kernel_pid;
+/* Global task identity owners. Number zero selects the current TGID. */
+int kernel_task_identity_get(int32_t number,struct kernel_pid **owner);
+void kernel_task_identity_retain(struct kernel_pid *);
+void kernel_task_identity_put(struct kernel_pid *);
+
 struct kernel_pid_member {
     struct kernel_pid *identity;
     struct kernel_pid_member *previous, *next;

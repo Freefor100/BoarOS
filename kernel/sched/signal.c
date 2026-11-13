@@ -30,9 +30,15 @@ void kernel_signal_encode_info(void *output, const struct kernel_signal_wait_inf
 { memcpy(output,info,sizeof(*info)); }
 
 
+struct signal_sigio_permission { uint32_t uid,euid; struct kernel_pid *identity; int type; };
+static enum kernel_signal_status signal_send_one_mode(
+    struct kernel_task *,uint32_t,kernel_pid_t,int,int16_t,
+    const struct kernel_signal_wait_info *,int,uint64_t,int,
+    const struct signal_sigio_permission *);
 static enum kernel_signal_status signal_send_one(
-    struct kernel_task *, uint32_t, kernel_pid_t, int, int16_t,
-    const struct kernel_signal_wait_info *, int queued, uint64_t thread_generation);
+    struct kernel_task *task,uint32_t sig,kernel_pid_t sender,int process,int16_t code,
+    const struct kernel_signal_wait_info *info,int queued,uint64_t generation)
+{ return signal_send_one_mode(task,sig,sender,process,code,info,queued,generation,0,0); }
 
 static struct kernel_task *real_timers;
 /* PID-derived identities occupy the low generation range. */
@@ -920,7 +926,7 @@ static int signal_wants_sigchld_stop(const struct kernel_task *parent)
 }
 
 static void signal_send_child(struct kernel_task *parent, struct kernel_task *child,
-    uint32_t signal, int16_t code, int32_t status)
+    uint32_t signal, int16_t code, int32_t status,int nosleep)
 {
     SCHEDULER_TASK_BORROW(representative, signal_group_representative_get(parent));
     struct kernel_signal_wait_info info = {.signal=signal,.sender=(uint32_t)child->tid,.code=code,.status=status};
@@ -937,7 +943,7 @@ static void signal_send_child(struct kernel_task *parent, struct kernel_task *ch
     if (representative)
         /* The compact inline child payload belongs to SIGCHLD; other exit
          * signals need the complete status and CPU-time record. */
-        (void)signal_send_one(parent, signal, child->tid, 1, code, &info, signal!=17U, 0);
+        (void)signal_send_one_mode(parent,signal,child->tid,1,code,&info,signal!=17U,0,nosleep,0);
 }
 
 void kernel_signal_notify_child_exit(struct kernel_task *child)
@@ -957,13 +963,12 @@ void kernel_signal_notify_child_exit(struct kernel_task *child)
         uint32_t status = child->wait_status;
         signal_send_child(parent, child, child->exit_signal,
             (status & 0x7fU) ? ((status & 0x80U) ? 3 : 2) : 1,
-            (status & 0x7fU) ? (int32_t)(status & 0x7fU) : (int32_t)((status >> 8) & 0xffU));
+            (status & 0x7fU) ? (int32_t)(status & 0x7fU) : (int32_t)((status >> 8) & 0xffU),0);
     }
     wake_waiting_parent(child);
 }
 
-void kernel_signal_notify_child_stop(struct kernel_task *child,
-                                     int continued)
+static void signal_notify_child_stop(struct kernel_task *child,int continued,int nosleep)
 {
     SCHEDULER_TASK_BORROW(parent, 0);
 
@@ -977,10 +982,13 @@ void kernel_signal_notify_child_stop(struct kernel_task *child,
     }
     if (parent != 0 && signal_wants_sigchld_stop(parent)) {
         signal_send_child(parent, child, 17U, continued ? 6 : 5,
-            continued ? SIGNAL_CONTINUE : (child->wait_status >> 8) & 0xffU);
+            continued ? SIGNAL_CONTINUE : (child->wait_status >> 8) & 0xffU,nosleep);
     }
     wake_waiting_parent(child);
 }
+
+void kernel_signal_notify_child_stop(struct kernel_task *child,int continued)
+{ signal_notify_child_stop(child,continued,0); }
 
 static void signal_resume_stopped(struct kernel_task *task)
 {
@@ -998,7 +1006,7 @@ static void signal_resume_stopped(struct kernel_task *task)
     else ready_enqueue_locked(task, 0);
 }
 
-static void signal_prepare_group(struct kernel_task *task, uint32_t sig)
+static void signal_prepare_group(struct kernel_task *task, uint32_t sig,int nosleep)
 {
     struct kernel_task *leader;
     struct scheduler_group_cursor cursor;
@@ -1035,7 +1043,7 @@ static void signal_prepare_group(struct kernel_task *task, uint32_t sig)
                 leader->continue_notified = 1;
             }
         }
-        if (continued) kernel_signal_notify_child_stop(leader, 1);
+        if (continued) signal_notify_child_stop(leader,1,nosleep);
     }
     scheduler_group_cursor_end(&cursor);
 }
@@ -1152,14 +1160,26 @@ static int signal_permitted_locked(struct kernel_task *caller,struct kernel_task
         process_identity(caller,KERNEL_PID_SID)==process_identity(target,KERNEL_PID_SID);
 }
 
-static enum kernel_signal_status signal_send_one(
-    struct kernel_task *target, uint32_t sig, kernel_pid_t sender_tid,
-    int process_directed, int16_t code,
-    const struct kernel_signal_wait_info *provided, int queued, uint64_t thread_generation)
+static int sigio_permitted_locked(const struct kernel_task *target,const struct signal_sigio_permission *owner)
+{
+    if(!owner)return 1;
+    if(owner->type<2) {
+        struct kernel_pid_member *member=owner->identity->members[KERNEL_PID_TID];
+        if(!member || member->task!=target)return 0;
+    } else if(process_identity(target,KERNEL_PID_PGID)!=owner->identity)return 0;
+    if(!owner->euid)return 1;
+    const struct kernel_credentials *to=kernel_credentials_task_locked(target);
+    return owner->uid==to->uid || owner->uid==to->suid ||
+        owner->euid==to->uid || owner->euid==to->suid;
+}
+static enum kernel_signal_status signal_send_one_mode(
+    struct kernel_task *target,uint32_t sig,kernel_pid_t sender_tid,
+    int process_directed,int16_t code,const struct kernel_signal_wait_info *provided,
+    int queued,uint64_t thread_generation,int nosleep,const struct signal_sigio_permission *owner)
 {
     if (!target || !sig || sig>KERNEL_SIGNAL_COUNT) return KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
     struct kernel_task *executing=kernel_task_current();
-    struct kernel_task *sender=(sender_tid || provided) && code<=0?executing:0;
+    struct kernel_task *sender=!owner && (sender_tid || provided) && code<=0?executing:0;
     struct signal_pending_prepared p __attribute__((cleanup(signal_pending_finish)))={0};
     struct kernel_signal_wait_info info={.signal=sig,.sender=(uint32_t)sender_tid,.code=code};
     struct kernel_pid *identity __attribute__((cleanup(kernel_task_identity_end)))=0;
@@ -1168,7 +1188,7 @@ static enum kernel_signal_status signal_send_one(
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         /* Authorize and acquire the identity/container in the same snapshot.
          * Allocation may sleep, so publication still rechecks permission. */
-        if(sender && !signal_permitted_locked(sender,target,sig))
+        if(!sigio_permitted_locked(target,owner) || (sender && !signal_permitted_locked(sender,target,sig)))
             return KERNEL_SIGNAL_STATUS_PERMISSION;
         struct kernel_task *leader=target->group_leader;
         if(!leader || leader->retirement || leader->group_leader!=leader)
@@ -1198,7 +1218,9 @@ static enum kernel_signal_status signal_send_one(
         if(!id || thread_generation!=id->generation)
             return KERNEL_SIGNAL_STATUS_INVALID_STATE;
     }
-    signal_prepare_group(target,sig);
+    if(owner) { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        if(!sigio_permitted_locked(target,owner))return KERNEL_SIGNAL_STATUS_PERMISSION; }
+    signal_prepare_group(target,sig,nosleep);
     if(sig==SIGNAL_KILL) {process_group_request_exit(target,KERNEL_THREAD_EXIT_SIGNAL,sig,0);return KERNEL_SIGNAL_STATUS_OK;}
     if(provided)info=*provided;
     else if(sender)info.uid=kernel_credentials_current()->uid;
@@ -1223,7 +1245,8 @@ static enum kernel_signal_status signal_send_one(
             {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);heap=actual->proc_exiting?0:actual->files.heap;}
             /* The group container may already have exited. A live receiver's
              * root heap supplies candidates; the container only owns state. */
-            signal_pending_prepare(process_directed?group:actual,process_directed,target,heap,&info,1,&p);
+            if(nosleep)signal_pending_prepare_nosleep(process_directed?group:actual,process_directed,target,heap,&info,1,&p);
+            else signal_pending_prepare(process_directed?group:actual,process_directed,target,heap,&info,1,&p);
             prepared=1;
         }
         SCHEDULER_TASK_BORROW(selected,0);
@@ -1249,7 +1272,8 @@ static enum kernel_signal_status signal_send_one(
                 wake_target=0;retarget=signal_mask(sig);
             }
             /* 接收者只决定唤醒谁；权限和 UID 额度始终使用原始目标线程。 */
-            if(sender && sender!=target && !signal_permitted_locked(sender,target,sig))return KERNEL_SIGNAL_STATUS_PERMISSION;
+            if(!sigio_permitted_locked(target,owner) ||
+                (sender && sender!=target && !signal_permitted_locked(sender,target,sig)))return KERNEL_SIGNAL_STATUS_PERMISSION;
             if(signal_ignored_unblocked(wake_target,sig))return KERNEL_SIGNAL_STATUS_OK;
             /* 改UID后，已有内联事件仍属于旧账户。仅这种混合账户
              * 需要在锁外补备记录；同账户标准信号复用当前发布保护。 */
@@ -1318,7 +1342,7 @@ void kernel_signal_mqueue_notify(struct kernel_pid *identity,struct kernel_exec_
             scheduler_task_get_locked(actual);scheduler_task_get_locked(group);
             heap=actual->files.heap;
         }
-        signal_prepare_group(actual,sig);
+        signal_prepare_group(actual,sig,0);
         if(sig==SIGNAL_KILL) {
             process_group_request_exit(actual,KERNEL_THREAD_EXIT_SIGNAL,sig,0);return;
         }
@@ -1386,7 +1410,7 @@ int signal_timer_post_locked(struct kernel_pid *id,int thread,struct signal_queu
 }
 void signal_timer_notify(struct kernel_task *task,unsigned sig)
 {
-    signal_prepare_group(task,sig);
+    signal_prepare_group(task,sig,0);
     if(sig==SIGNAL_KILL)process_group_request_exit(task,KERNEL_THREAD_EXIT_SIGNAL,sig,0);
     else (void)kernel_scheduler_wake_signal(task);
 }
@@ -1426,6 +1450,49 @@ int kernel_signal_queue_info(int32_t group,int32_t pid,int thread,
             :KERNEL_SIGNAL_STATUS_OK;
     }
     return status==KERNEL_SIGNAL_STATUS_OK?0:status==KERNEL_SIGNAL_STATUS_PERMISSION?-KERNEL_EPERM:status==KERNEL_SIGNAL_STATUS_QUEUE_FULL?-KERNEL_EAGAIN:-KERNEL_ESRCH;
+}
+
+static void signal_sigio_target(struct kernel_task *target,int process,uint64_t generation,
+    const struct signal_sigio_permission *owner,unsigned signum,int fd,unsigned reason)
+{
+    static const uint32_t bands[]={0,0x41,0x304,0x441,0x8,0x82,0x18};
+    if(signum) {
+        struct kernel_signal_wait_info info={.signal=signum,.code=(int32_t)reason};
+        /* Fault/child codes share positive numbers with POLL_*; SI_SIGIO keeps
+         * their payload interpretation unambiguous for a selected signal. */
+        if(signum==4 || signum==5 || signum==7 || signum==8 || signum==11 || signum==17 || signum==31)
+            info.code=-5;
+        info.address=bands[reason];memcpy(info.payload+8,&fd,sizeof(fd));
+        enum kernel_signal_status status=signal_send_one_mode(target,signum,0,process,
+            (int16_t)info.code,&info,1,generation,1,owner);
+        if(status!=KERNEL_SIGNAL_STATUS_QUEUE_FULL)return;
+    }
+    (void)signal_send_one_mode(target,29,0,process,128,0,0,generation,1,owner);
+}
+void kernel_signal_sigio(struct kernel_pid *identity,int type,uint32_t uid,uint32_t euid,
+    unsigned signum,int fd,unsigned reason)
+{
+    if(!identity || type<0 || type>2 || signum>KERNEL_SIGNAL_COUNT || !reason || reason>6)__builtin_trap();
+    const struct signal_sigio_permission owner={uid,euid,identity,type};
+    if(type<2) {
+        SCHEDULER_TASK_BORROW(target,0);
+        {
+            KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+            struct kernel_pid_member *member=identity->members[KERNEL_PID_TID];
+            if(member){target=member->task;scheduler_task_get_locked(target);}
+        }
+        if(target)signal_sigio_target(target,type==1,type==0?identity->generation:0,&owner,signum,fd,reason);
+        return;
+    }
+    struct scheduler_task_cursor cursor;scheduler_task_cursor_begin(&cursor);
+    while(cursor.task) {
+        int selected;
+        { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+          selected=!cursor.task->retirement && cursor.task->identities[KERNEL_PID_TGID].identity &&
+              process_identity(cursor.task,KERNEL_PID_PGID)==identity; }
+        if(selected)signal_sigio_target(cursor.task,1,0,&owner,signum,fd,reason);
+        scheduler_task_cursor_next(&cursor);
+    }
 }
 
 enum kernel_signal_status signal_send_kernel_group(struct kernel_task *target, uint32_t sig)

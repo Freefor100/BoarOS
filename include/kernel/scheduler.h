@@ -169,7 +169,7 @@ struct kernel_wait_token {
 };
 
 typedef void (*kernel_wait_callback_fn)(struct kernel_wait_node *node,
-                                        uint32_t reason);
+                                        uint32_t reason, uint64_t event);
 
 /* 一个node最多登记一条queue；token绑定节点必须保持至wait_finish。
  * 队列借用不取得业务对象引用。回调在调度raw锁外同步执行，禁止抢占/阻塞；

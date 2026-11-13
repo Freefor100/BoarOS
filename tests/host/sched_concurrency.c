@@ -339,8 +339,8 @@ static void retired_cursor_chain(void)
     assert(disposals == 3 && !scheduler.retired_pending && !scheduler.task_count);
 }
 
-static void parent_callback(struct kernel_wait_node *node, uint32_t reason)
-{
+static void parent_callback(struct kernel_wait_node *node, uint32_t reason,uint64_t event)
+{ (void)event;
     struct kernel_task *parent = node->context;
     assert(reason == KERNEL_WAIT_WOKEN && parent->storage_borrows == 1);
     assert(parent->child_exit_queue.borrows && !active_cpu->raw_locks);

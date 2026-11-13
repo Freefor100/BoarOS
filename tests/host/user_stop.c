@@ -118,7 +118,7 @@ void user_signal_retarget_case(struct kernel_task *receiver,struct kernel_task *
         waiter->state=KERNEL_THREAD_STATE_STOPPED;stopped_append_locked(waiter);
         waiter->user_return_pending=0;
     }
-    signal_prepare_group(receiver,SIGNAL_CONTINUE);
+    signal_prepare_group(receiver,SIGNAL_CONTINUE,0);
     assert(waiter->state==KERNEL_THREAD_STATE_READY && waiter->ready_node.queued);
     assert(waiter->user_return_pending & KERNEL_USER_RETURN_SIGNAL);
     puts("PASS SIGCONT restoring a READY member also exposes signals published while it was stopped");
@@ -132,7 +132,7 @@ void user_signal_take_retargeted(struct kernel_task *waiter)
     puts("PASS a handler blocking a shared signal transfers it to another real interruptible waiter");
 }
 void user_signal_cancel_stop(struct kernel_task *task)
-{ signal_prepare_group(task,SIGNAL_CONTINUE); }
+{ signal_prepare_group(task,SIGNAL_CONTINUE,0); }
 void user_signal_stop_selection(struct kernel_task *task)
 {
     task->group_members=1;task->group_next=task->group_previous=task;
@@ -158,3 +158,6 @@ enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t
 { (void)h;(void)n;(void)size;(void)out;abort(); }
 void kernel_heap_release(struct kernel_heap *h,void *p)
 { (void)h;(void)p;abort(); }
+
+enum kernel_heap_status kernel_heap_allocate_zeroed_nosleep(struct kernel_heap *heap,size_t count,size_t size,void **out)
+{ return kernel_heap_allocate_zeroed(heap,count,size,out); }

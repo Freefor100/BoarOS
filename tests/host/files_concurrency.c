@@ -19,6 +19,21 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <kernel/time.h>
+
+enum kernel_time_status kernel_time_deadline_from_realtime(uint64_t ns,uint64_t *deadline)
+{ *deadline=ns; return KERNEL_TIME_STATUS_OK; }
+int kernel_task_identity_get(int32_t number,struct kernel_pid **owner)
+{ (void)number;*owner=NULL;return -3; }
+void kernel_task_identity_retain(struct kernel_pid *id)
+{ (void)id;assert(!"anonymous files fixture has no process identity"); }
+void kernel_task_identity_put(struct kernel_pid *id)
+{ (void)id;assert(!"anonymous files fixture has no process identity"); }
+void kernel_signal_sigio(struct kernel_pid *id,int type,uint32_t uid,uint32_t euid,unsigned sig,int fd,unsigned reason)
+{ (void)id;(void)type;(void)uid;(void)euid;(void)sig;(void)fd;(void)reason;assert(!"no asynchronous owner installed"); }
+struct kernel_socket;
+struct kernel_wait_queue *kernel_socket_async_source(struct kernel_socket *socket)
+{ (void)socket;assert(!"files fixture does not install sockets");return NULL; }
 
 void mm_test_attach(unsigned);
 void mm_test_bind(struct kernel_mm *);
@@ -153,8 +168,8 @@ static void broken_kernel_writer(struct kernel_heap *heap)
 }
 #endif
 static struct kernel_files views[4];
-static void forbidden_pipe_callback(struct kernel_wait_node *node,uint32_t reason)
-{ (void)node; (void)reason; assert(!"publication notified a domain-external observer"); }
+static void forbidden_pipe_callback(struct kernel_wait_node *node,uint32_t reason,uint64_t event)
+{ (void)event; (void)node; (void)reason; assert(!"publication notified a domain-external observer"); }
 static void reject_external_pipe_owner(struct kernel_heap *heap)
 {
     files=(struct kernel_files){0};
@@ -309,6 +324,14 @@ static void concurrent_dup_case(struct kernel_heap *heap,unsigned actors)
     assert(!kernel_files_fcntl(&files,2,KERNEL_FILES_F_SETFL,KERNEL_FILES_O_NONBLOCK,&result) && !result);
     assert(!kernel_files_fcntl(&files,1,KERNEL_FILES_F_GETFL,0,&result) &&
         result==(KERNEL_FILES_O_NONBLOCK|1));
+    assert(!kernel_files_fcntl(&files,1,8,0,&result) && result==0);
+    assert(!kernel_files_fcntl(&files,1,9,0,&result) && result==0);
+    assert(!kernel_files_fcntl(&files,1,10,64,&result) && result==0);
+    assert(!kernel_files_fcntl(&files,2,11,0,&result) && result==64);
+    assert(!kernel_files_fcntl(&files,1,10,65,&result) && result==-22);
+    assert(!kernel_files_fcntl(&files,2,KERNEL_FILES_F_SETFL,020000U,&result) && result==0);
+    assert(!kernel_files_fcntl(&files,1,KERNEL_FILES_F_GETFL,0,&result) && result==(020000U|1));
+    assert(!kernel_files_fcntl(&files,1,KERNEL_FILES_F_SETFL,0,&result) && result==0);
     assert(!kernel_files_close_on_exec(&files));
     kernel_files_get_statistics(&files,&stats);
     assert(stats.current_open_fds==2 && !stats.close_on_exec_fds);

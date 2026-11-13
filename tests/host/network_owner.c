@@ -147,6 +147,13 @@ int kernel_wait_cursor_prepare(struct kernel_wait_queue *queue,struct kernel_wai
     if(queue->head) {queue->borrows++;queue->head->references++;*cursor=(struct kernel_wait_cursor){.queue=queue,.node=queue->head};return 1;}
     return 0;
 }
+int kernel_wait_cursor_prepare_event(struct kernel_wait_queue *queue,struct kernel_wait_cursor *cursor,uint64_t event,struct kernel_task *recipient)
+{
+    CHECK(!recipient);
+    int prepared=kernel_wait_cursor_prepare(queue,cursor);
+    if(prepared)cursor->event=event;
+    return prepared;
+}
 void kernel_wait_cursor_wake(struct kernel_wait_cursor *cursor,int all)
 {
     CHECK(all && cursor->queue->borrows && !kernel_cpu_current()->raw_locks);
@@ -159,7 +166,7 @@ void kernel_wait_cursor_wake(struct kernel_wait_cursor *cursor,int all)
             if(next)next->references++;
             CHECK(node->callback);
             if(node->callback==unix_space_notify)space_callbacks++;
-            node->callback(node,KERNEL_WAIT_WOKEN);
+            node->callback(node,KERNEL_WAIT_WOKEN,cursor->event);
             CHECK(node->references);node->references--;node=next;
         }
     }
@@ -227,7 +234,7 @@ const struct kernel_credentials *kernel_credentials_current(void)
 }
 /* The host boundary has one published process identity and one UID account.
  * Ancillary snapshots borrow them with the same reference ownership as tasks. */
-int kernel_task_socket_identity(int32_t pid,struct kernel_pid **owner)
+int kernel_task_identity_get(int32_t pid,struct kernel_pid **owner)
 {
     if(!owner)return -KERNEL_EINVAL;
     *owner=NULL;
@@ -1422,8 +1429,8 @@ struct loopback_observation {
     err_t error;
 };
 
-static void loopback_wake(struct kernel_wait_node *node,uint32_t reason)
-{CHECK(reason==KERNEL_WAIT_WOKEN);((struct loopback_observation *)node->context)->wakes++;}
+static void loopback_wake(struct kernel_wait_node *node,uint32_t reason,uint64_t event)
+{ (void)event;CHECK(reason==KERNEL_WAIT_WOKEN);((struct loopback_observation *)node->context)->wakes++;}
 
 static void loopback_receive(void *context, struct udp_pcb *pcb, struct pbuf *packet,
     const ip_addr_t *address, u16_t port)
@@ -1782,8 +1789,8 @@ static void pool_release_owner(void)
     puts("PASS protocol pool release: actual pbuf ownership returned and capacity generation published without endpoint contention");
 }
 
-static void tcp_quota_wakeup(struct kernel_wait_node *node,uint32_t reason)
-{ CHECK(reason==KERNEL_WAIT_WOKEN);(*(unsigned *)node->context)++; }
+static void tcp_quota_wakeup(struct kernel_wait_node *node,uint32_t reason,uint64_t event)
+{ (void)event; CHECK(reason==KERNEL_WAIT_WOKEN);(*(unsigned *)node->context)++; }
 static void tcp_quota_notifications(void)
 {
     struct kernel_socket *listener=NULL,*client=NULL,*server=NULL;
@@ -1866,8 +1873,8 @@ static void minshall_send(void)
     puts("PASS Minshall: full packet permits first small packet, another small waits for ACK, full packet does not erase small-packet debt, no timer");
 }
 
-static void remote_work_ready(struct kernel_wait_node *node,uint32_t reason)
-{
+static void remote_work_ready(struct kernel_wait_node *node,uint32_t reason,uint64_t event)
+{ (void)event;
     CHECK(reason==KERNEL_WAIT_WOKEN && node->context==&remote_work && !kernel_cpu_current()->raw_locks);
     CHECK(!pthread_mutex_lock(&remote_gate));remote_work=1;
     CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));
@@ -2149,8 +2156,8 @@ static void remote_protocol_request(unsigned mode)
         printf("PASS remote protocol %u: CPU1 copies/waits, CPU0 executes, request/OFD/payload returned\n",mode);
 }
 
-static void held_work_notification(struct kernel_wait_node *node,uint32_t reason)
-{
+static void held_work_notification(struct kernel_wait_node *node,uint32_t reason,uint64_t event)
+{ (void)event;
     CHECK(reason==KERNEL_WAIT_WOKEN && node->context==&notify_queue && !kernel_cpu_current()->raw_locks);
     CHECK(!pthread_mutex_lock(&remote_gate));notify_entered=1;
     CHECK(!pthread_cond_broadcast(&remote_changed));
@@ -2530,8 +2537,8 @@ static void unix_stream_receive_state(void)
     puts("PASS UNIX stream receive state: unconnected/listener EINVAL before waiting, established peer close remains EOF");
 }
 
-static void count_space_wakeup(struct kernel_wait_node *node,uint32_t reason)
-{ CHECK(reason==KERNEL_WAIT_WOKEN);(*(unsigned *)node->context)++; }
+static void count_space_wakeup(struct kernel_wait_node *node,uint32_t reason,uint64_t event)
+{ (void)event; CHECK(reason==KERNEL_WAIT_WOKEN);(*(unsigned *)node->context)++; }
 
 static void unix_space_topology(void)
 {
@@ -3111,12 +3118,52 @@ static void unix_seqpacket_pending_control(void)
     puts("PASS UNIX SEQ pending SCM: listener roots unaccepted rights, accept transfers root to OFD, final close returns socket/OFD/PID/UID/heap owners");
 }
 
+static unsigned async_reasons[7];
+static void async_observer(struct kernel_wait_node *node,uint32_t reason,uint64_t event)
+{(void)node;CHECK(reason==KERNEL_WAIT_WOKEN&&event>=1&&event<=6);async_reasons[event]++;}
+static void async_events(void)
+{
+    kernel_socket_network_initialize();
+    struct kernel_socket *sender=NULL,*receiver=NULL;
+    CHECK(!kernel_socket_pair(&test_heap,SOCKET_DGRAM,&sender,&receiver));
+    struct kernel_wait_node observer={0};kernel_wait_node_init_callback(&observer,async_observer,NULL);
+    kernel_wait_queue_add(&receiver->async_events,&observer);
+    CHECK(write_buffer(sender,"a",1,0)==1&&write_buffer(sender,"b",1,0)==1);
+    CHECK(async_reasons[KERNEL_ASYNC_POLL_IN]==2);
+    struct kernel_socket_address source=read_named_packet(receiver,"a");kernel_socket_address_release(&source);
+    source=read_named_packet(receiver,"b");kernel_socket_address_release(&source);
+    CHECK(async_reasons[KERNEL_ASYNC_POLL_IN]==2);
+    {
+        SOCKET_STATE(state);
+        socket_state_notify(&receiver->wait);socket_state_notify(&receiver->wait);
+        socket_async(receiver,KERNEL_ASYNC_POLL_IN);socket_async(receiver,KERNEL_ASYNC_POLL_IN);
+    }
+    CHECK(async_reasons[KERNEL_ASYNC_POLL_IN]==4);
+    CHECK(!kernel_socket_shutdown(sender,0)&&!kernel_socket_shutdown(sender,1)&&!kernel_socket_shutdown(sender,2));
+    CHECK(async_reasons[KERNEL_ASYNC_POLL_IN]==4&&!async_reasons[KERNEL_ASYNC_POLL_OUT]&&!async_reasons[KERNEL_ASYNC_POLL_HUP]);
+    kernel_socket_destroy(sender);CHECK(!async_reasons[KERNEL_ASYNC_POLL_HUP]);
+    CHECK(!kernel_wait_node_remove_sync(&observer));kernel_socket_destroy(receiver);CHECK(!heap_live);
+    const int types[]={SOCKET_STREAM,SOCKET_SEQPACKET};
+    for(unsigned i=0;i<2;i++) {
+        memset(async_reasons,0,sizeof(async_reasons));observer=(struct kernel_wait_node){0};sender=receiver=NULL;
+        CHECK(!kernel_socket_pair(&test_heap,types[i],&sender,&receiver));
+        kernel_wait_node_init_callback(&observer,async_observer,NULL);kernel_wait_queue_add(&receiver->async_events,&observer);
+        CHECK(!kernel_socket_shutdown(sender,0));CHECK(!async_reasons[KERNEL_ASYNC_POLL_IN]&&!async_reasons[KERNEL_ASYNC_POLL_HUP]);
+        CHECK(!kernel_socket_shutdown(sender,1));CHECK(async_reasons[KERNEL_ASYNC_POLL_IN]==1&&!async_reasons[KERNEL_ASYNC_POLL_HUP]);
+        CHECK(!kernel_socket_shutdown(sender,2));CHECK(async_reasons[KERNEL_ASYNC_POLL_HUP]==1);
+        kernel_socket_destroy(sender);CHECK(async_reasons[KERNEL_ASYNC_POLL_HUP]==2);
+        CHECK(!kernel_wait_node_remove_sync(&observer));kernel_socket_destroy(receiver);CHECK(!heap_live);
+    }
+    puts("PASS socket async events: accepted datagrams, independent cursors, and Linux UNIX shutdown/close cadence");
+}
+
 int main(int argc, char **argv)
 {
     CHECK(argc == 2);
     CHECK(kernel_pid_allocator_init(&model_pid_numbers,model_pid_bitmap,1024)==KERNEL_PID_STATUS_OK);
     CHECK(kernel_pid_publish(&model_pid_registry,&model_pid)==KERNEL_PID_STATUS_OK);
-    if (!strcmp(argv[1], "unix-seq-records")) unix_seqpacket_records();
+    if (!strcmp(argv[1], "async-events")) async_events();
+    else if (!strcmp(argv[1], "unix-seq-records")) unix_seqpacket_records();
     else if (!strcmp(argv[1], "ipv4-route")) ipv4_route_output();
     else if (!strcmp(argv[1], "tcp-loopback-checksum")) tcp_loopback_checksum();
     else if (!strcmp(argv[1], "tcp-detached")) tcp_detached_copy();

@@ -1,4 +1,5 @@
 #include <kernel/credentials.h>
+#include <kernel/async_io.h>
 #include <kernel/tmpfs.h>
 #include <kernel/pidfd.h>
 #include "open_file_internal.h"
@@ -943,6 +944,7 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
     KERNEL_SERVICE_SCOPE_IF(service, !local);
     if (!local) kernel_assert_service_context();
     if (first) {
+        kernel_open_file_async_close(file);
         if (file->notify_opened)
             kernel_vfs_notify_file(&file->file,(__atomic_load_n(&file->open_flags,__ATOMIC_RELAXED)&3U) ?
                 VFS_NOTIFY_CLOSE_WRITE : VFS_NOTIFY_CLOSE_NOWRITE);
@@ -1164,7 +1166,7 @@ int kernel_open_file_noatime_allowed(const struct kernel_open_file_description *
 void kernel_open_file_set_status_flags(struct kernel_open_file_description *file, uint32_t flags)
 {
     if (!open_file_live(file)) __builtin_trap();
-    const uint32_t mask=00002000U | 00004000U | 01000000U;
+    const uint32_t mask=00002000U | 00004000U | 00020000U | 01000000U;
     uint32_t old=__atomic_load_n(&file->open_flags, __ATOMIC_RELAXED);
     while (!__atomic_compare_exchange_n(&file->open_flags, &old,
         (old & ~mask) | (flags & mask), 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}

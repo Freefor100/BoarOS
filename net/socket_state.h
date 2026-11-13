@@ -11,6 +11,9 @@ struct socket_state_guard {
     struct socket_state_guard *owner;
     struct kernel_wait_cursor notifications[2];
     unsigned count;
+    /* Real producers retain each event, independently of poll-wake dedup. */
+    struct kernel_wait_cursor async_notifications[4];
+    unsigned async_count;
     struct kernel_wait_cursor work;
     unsigned work_prepared;
 };
@@ -34,7 +37,7 @@ static void socket_state_acquire(struct socket_state_guard *guard)
     kernel_raw_lock_acquire(&socket_state_lock,&guard->raw);
 #endif
     guard->owner=guard;
-    guard->count=0;guard->work.queue=0;guard->work_prepared=0;
+    guard->count=0;guard->async_count=0;guard->work.queue=0;guard->work_prepared=0;
 }
 static inline void socket_state_unlock(struct socket_state_guard *guard)
 {
@@ -59,11 +62,12 @@ static void socket_state_release(struct socket_state_guard *guard)
 #if BOAROS_MAX_CPUS == 1 && !BOAROS_LOCK_DEBUG && !BOAROS_COST_DIAGNOSTICS
     socket_state_active=0;
 #endif
-    if(!guard->count && !guard->work.queue) {socket_state_unlock(guard);return;}
+    if(!guard->count && !guard->async_count && !guard->work.queue) {socket_state_unlock(guard);return;}
     uintptr_t interrupts=guard->raw.interrupts;guard->raw.interrupts=0;
     socket_state_unlock(guard);
     /* Queue cursors retain their actual storage; callbacks run without state locks. */
     for(unsigned i=0;i<guard->count;i++)kernel_wait_cursor_wake(&guard->notifications[i],1);
+    for(unsigned i=0;i<guard->async_count;i++)kernel_wait_cursor_wake(&guard->async_notifications[i],1);
     if(guard->work.queue)kernel_wait_cursor_wake(&guard->work,1);
     arch_interrupt_restore(interrupts);
 }
@@ -95,5 +99,15 @@ static void socket_state_notify(struct kernel_wait_queue *queue)
     for(unsigned i=0;i<guard->count;i++)if(guard->notifications[i].queue==queue)return;
     if(guard->count==2)__builtin_trap();
     if(kernel_wait_cursor_prepare(queue,&guard->notifications[guard->count]))guard->count++;
+}
+static void socket_state_async(struct kernel_wait_queue *queue,unsigned reason)
+{
+    struct socket_state_guard *guard=socket_state_owner();
+    if (!kernel_wait_queue_registrations(queue)) return;
+    /* A state transaction publishes at most one receive event and one event
+     * for each of its two endpoints. Loops release state between transactions. */
+    if (guard->async_count==4) __builtin_trap();
+    if (kernel_wait_cursor_prepare_event(queue,&guard->async_notifications[guard->async_count],reason,NULL))
+        guard->async_count++;
 }
 #endif

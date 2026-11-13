@@ -87,8 +87,8 @@ enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *task
 void kernel_wait_backend_quiesce(void){sched_yield();}
 static void barrier(pthread_barrier_t *b)
 {int result=pthread_barrier_wait(b);assert(!result || result==PTHREAD_BARRIER_SERIAL_THREAD);}
-static void callback(struct kernel_wait_node *node,uint32_t reason)
-{
+static void callback(struct kernel_wait_node *node,uint32_t reason,uint64_t event)
+{ (void)event;
     assert(node->context==(void *)(uintptr_t)0x1234 && reason==KERNEL_WAIT_WOKEN && !cpu.raw_locks);
     callbacks++;barrier(&entered);barrier(&released);
 }

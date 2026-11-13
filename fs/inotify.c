@@ -1,4 +1,5 @@
 #include <kernel/inotify.h>
+#include <kernel/async_io.h>
 #include <kernel/credentials.h>
 #include <kernel/errno.h>
 #include <kernel/fs_context.h>
@@ -36,6 +37,8 @@ struct inotify_mark {
     struct kernel_heap *heap;
     struct kernel_vfs_instance *instance;
     struct inotify_mark *next, **previous, *group_next, **group_previous;
+    struct inotify_mark *retired_next,*dispose_next;
+    unsigned references;
     uint64_t inode;
     int wd;
     uint32_t mask;
@@ -44,6 +47,7 @@ struct inotify_group {
     struct kernel_heap *heap;
     struct kernel_uid_account *account;
     struct kernel_wait_queue queue;
+    struct kernel_wait_queue async_events;
     struct kernel_wait_cursor notification;
     struct inotify_group *pending;
     struct inotify_mark *marks;
@@ -91,6 +95,7 @@ static void group_put(struct inotify_group *group)
     }
     if (last) {
         if (kernel_wait_queue_destroy(&group->queue)) __builtin_trap();
+        if (kernel_wait_queue_destroy(&group->async_events)) __builtin_trap();
         kernel_uid_account_put(group->account);
         kernel_heap_release(group->heap,group);
     }
@@ -126,8 +131,8 @@ static void drain_notifications(void)
     }
 }
 
-static void enqueue(struct inotify_group *group,int wd,uint32_t mask,uint32_t cookie,
-    const char *name)
+static int enqueue(struct inotify_group *group,int wd,uint32_t mask,uint32_t cookie,
+    const char *name,struct kernel_wait_cursor *async)
 {
     struct notify_event event={wd,mask,cookie,0};
     unsigned length=name?(unsigned)strlen(name)+1:0;
@@ -137,14 +142,14 @@ static void enqueue(struct inotify_group *group,int wd,uint32_t mask,uint32_t co
         struct notify_event last;
         ring_read(group,group->last,&last,sizeof(last));
         if (last.wd==wd && last.mask==mask && last.cookie==cookie && last.len==event.len) {
-            if (!length) return;
+            if (!length) return 0;
             char old[256];
             ring_read(group,(group->last+sizeof(last))&(IN_RING_SIZE-1),old,length);
-            if (!memcmp(old,name,length)) return;
+            if (!memcmp(old,name,length)) return 0;
         }
     }
     if (group->used+sizeof(event)+event.len > IN_RING_SIZE-sizeof(event)) {
-        if (group->overflow) return;
+        if (group->overflow) return 0;
         event=(struct notify_event){-1,IN_Q_OVERFLOW,0,0};
         length=0;
         group->overflow=1;
@@ -161,11 +166,27 @@ static void enqueue(struct inotify_group *group,int wd,uint32_t mask,uint32_t co
     }
     group->used+=sizeof(event)+event.len;
     notify_readers(group);
+    if (async && kernel_wait_cursor_prepare_event(&group->async_events,async,KERNEL_ASYNC_POLL_IN,NULL))
+        group->references++;
+    return 1;
 }
 
-static void remove_mark(struct inotify_mark *mark,struct inotify_mark **retired,int ignored)
+static void mark_get_locked(struct inotify_mark *mark)
 {
-    if (ignored) enqueue(mark->group,mark->wd,IN_IGNORED,0,NULL);
+    if (!mark->references || mark->references==UINT32_MAX || mark->group->references==UINT32_MAX)
+        __builtin_trap();
+    mark->references++;mark->group->references++;
+}
+static void remove_mark(struct inotify_mark *mark,struct inotify_mark **retired,int ignored,
+    struct kernel_wait_cursor *async)
+{
+    if (ignored) enqueue(mark->group,mark->wd,IN_IGNORED,0,NULL,async);
+    /* A borrowed removed mark retains its traversal successor. The dispose
+     * chain is separate, so concurrent removals never overwrite a walker. */
+    mark->retired_next=NULL;
+    if (mark->references>1 && mark->next) {
+        mark_get_locked(mark->next);mark->retired_next=mark->next;
+    }
     *mark->previous=mark->next;
     if (mark->next) mark->next->previous=mark->previous;
     *mark->group_previous=mark->group_next;
@@ -173,34 +194,63 @@ static void remove_mark(struct inotify_mark *mark,struct inotify_mark **retired,
     if (!--mark->instance->notify_marks)
         __atomic_store_n(&mark->instance->notify_ops,NULL,__ATOMIC_RELEASE);
     mark->group->account->inotify_marks--;
-    mark->next=*retired;
-    *retired=mark;
+    mark->previous=NULL;mark->group_previous=NULL;
+    if (!--mark->references) {mark->dispose_next=*retired;*retired=mark;}
 }
 static void dispose_marks(struct inotify_mark *list)
 {
     while (list) {
-        struct inotify_mark *next=list->next;
+        struct inotify_mark *next=list->dispose_next;
         kernel_heap_release(list->heap,list);
         list=next;
     }
 }
+static void mark_put(struct inotify_mark *mark)
+{
+    while (mark) {
+        struct inotify_mark *next=NULL;
+        struct inotify_group *group=mark->group;
+        int release;
+        {
+            KERNEL_RAW_SCOPE(guard,&notify_lock);
+            if (!mark->references) __builtin_trap();
+            release=!--mark->references;
+            if (release) {if (mark->previous) __builtin_trap();next=mark->retired_next;}
+        }
+        if (release) kernel_heap_release(mark->heap,mark);
+        group_put(group);
+        mark=next;
+    }
+}
+static void deliver_async(struct inotify_group *group,struct kernel_wait_cursor *cursor)
+{
+    if (!cursor->queue) return;
+    kernel_wait_cursor_wake(cursor,1);group_put(group);
+}
 static void emit(struct kernel_vfs_instance *instance,uint64_t inode,uint32_t mask,
     uint32_t cookie,const char *name,int detached)
 {
-    struct inotify_mark *retired=NULL;
-    {
-        KERNEL_RAW_SCOPE(guard,&notify_lock);
-        for (struct inotify_mark *m=*bucket(instance,inode),*next;m;m=next) {
-            next=m->next;
-            if (m->instance!=instance || m->inode!=inode) continue;
-            if ((m->mask&mask&IN_EVENTS) && !(detached && (m->mask&IN_EXCL_UNLINK))) {
-                enqueue(m->group,m->wd,mask,cookie,name);
-                if (m->mask&IN_ONESHOT) {remove_mark(m,&retired,1);continue;}
+    struct inotify_mark *m;
+    {KERNEL_RAW_SCOPE(guard,&notify_lock);m=*bucket(instance,inode);if (m) mark_get_locked(m);}
+    while (m) {
+        struct inotify_mark *next,*retired=NULL;
+        struct inotify_group *group=m->group;
+        struct kernel_wait_cursor async[2]={{0},{0}};
+        {
+            KERNEL_RAW_SCOPE(guard,&notify_lock);
+            next=m->previous?m->next:m->retired_next;
+            if (next) mark_get_locked(next);
+            if (m->previous && m->instance==instance && m->inode==inode) {
+                if ((m->mask&mask&IN_EVENTS) && !(detached && (m->mask&IN_EXCL_UNLINK))) {
+                    enqueue(group,m->wd,mask,cookie,name,&async[0]);
+                    if (m->mask&IN_ONESHOT) remove_mark(m,&retired,1,&async[1]);
+                }
+                if (m->previous && (mask&VFS_NOTIFY_DELETE_SELF)) remove_mark(m,&retired,1,&async[1]);
             }
-            if (mask&VFS_NOTIFY_DELETE_SELF) remove_mark(m,&retired,1);
         }
+        deliver_async(group,&async[0]);deliver_async(group,&async[1]);
+        dispose_marks(retired);mark_put(m);m=next;
     }
-    dispose_marks(retired);
     drain_notifications();
 }
 static void unmount(struct kernel_vfs_instance *instance)
@@ -208,18 +258,24 @@ static void unmount(struct kernel_vfs_instance *instance)
     /* Last-view retirement excludes new marks. Return each bucket's storage
      * without holding the lock across the full filesystem teardown. */
     for (unsigned i=0;i<IN_BUCKETS;i++) {
-        struct inotify_mark *retired=NULL;
-        {
-            KERNEL_RAW_SCOPE(guard,&notify_lock);
-            if (!instance->notify_marks) break;
-            for (struct inotify_mark *m=buckets[i],*next;m;m=next) {
-                next=m->next;
-                if (m->instance!=instance) continue;
-                enqueue(m->group,m->wd,VFS_NOTIFY_UNMOUNT,0,NULL);
-                remove_mark(m,&retired,1);
+        struct inotify_mark *m;
+        {KERNEL_RAW_SCOPE(guard,&notify_lock);m=buckets[i];if (m)mark_get_locked(m);}
+        while (m) {
+            struct inotify_mark *next,*retired=NULL;
+            struct inotify_group *group=m->group;
+            struct kernel_wait_cursor async[2]={{0},{0}};
+            {
+                KERNEL_RAW_SCOPE(guard,&notify_lock);
+                next=m->previous?m->next:m->retired_next;
+                if (next)mark_get_locked(next);
+                if (m->previous && m->instance==instance) {
+                    enqueue(group,m->wd,VFS_NOTIFY_UNMOUNT,0,NULL,&async[0]);
+                    remove_mark(m,&retired,1,&async[1]);
+                }
             }
+            deliver_async(group,&async[0]);deliver_async(group,&async[1]);
+            dispose_marks(retired);mark_put(m);m=next;
         }
-        dispose_marks(retired);
     }
     drain_notifications();
 }
@@ -234,11 +290,12 @@ static void release_group(void *object)
             KERNEL_RAW_SCOPE(guard,&notify_lock);
             if (!group->marks) break;
             for (unsigned i=0;i<32 && group->marks;i++)
-                remove_mark(group->marks,&retired,0);
+                remove_mark(group->marks,&retired,0,NULL);
         }
         dispose_marks(retired);
     }
     if (kernel_wait_queue_close(&group->queue)) __builtin_trap();
+    if (kernel_wait_queue_close(&group->async_events)) __builtin_trap();
     group_put(group);
 }
 
@@ -314,6 +371,8 @@ static uint32_t inotify_poll(void *object,uint32_t flags,uint32_t requested,
     if (queue) *queue=&group->queue;
     return group->used?KERNEL_POLLIN|KERNEL_POLLRDNORM:0;
 }
+static struct kernel_wait_queue *inotify_async_source(void *object)
+{return &((struct inotify_group *)object)->async_events;}
 static int inotify_ioctl(void *object,struct kernel_task *task,struct kernel_files *files,
     struct kernel_open_file_description **owner,struct kernel_mm *mm,uint64_t cmd,uint64_t arg)
 {
@@ -328,7 +387,7 @@ static int inotify_ioctl(void *object,struct kernel_task *task,struct kernel_fil
 }
 static const struct kernel_char_device inotify_file_ops={
     .kind=KERNEL_OPEN_FILE_KIND_INOTIFY, .release=release_group,
-    .readv=inotify_readv, .poll=inotify_poll, .ioctl=inotify_ioctl
+    .readv=inotify_readv, .poll=inotify_poll, .ioctl=inotify_ioctl,.async_source=inotify_async_source
 };
 
 static enum kernel_files_status create(struct kernel_files *files,uint32_t flags,int64_t *result)
@@ -363,6 +422,7 @@ static enum kernel_files_status create(struct kernel_files *files,uint32_t flags
     }
     group->heap=files->heap;group->references=1;group->account=account;
     kernel_wait_queue_init(&group->queue);
+    kernel_wait_queue_init(&group->async_events);
     file->heap=files->heap;file->references=1;file->kind=KERNEL_OPEN_FILE_KIND_INOTIFY;
     file->open_flags=flags&IN_NONBLOCK;file->device=&inotify_file_ops;file->device_instance=group;
     file->credentials=kernel_credentials_get(cred);
@@ -395,6 +455,7 @@ static int watch_install(struct inotify_group *group,struct kernel_vfs_instance 
     candidate->next=*head;candidate->previous=head;
     if (*head) (*head)->previous=&candidate->next;
     *head=candidate;
+    candidate->references=1;candidate->retired_next=NULL;candidate->dispose_next=NULL;
     candidate->group_next=group->marks;candidate->group_previous=&group->marks;
     if (group->marks) group->marks->group_previous=&candidate->group_next;
     group->marks=candidate;
@@ -462,15 +523,16 @@ enum kernel_files_status kernel_files_inotify(struct kernel_files *files,
     } else {
         struct inotify_group *group=file->device_instance;
         struct inotify_mark *retired=NULL;
+        struct kernel_wait_cursor async={0};
         *result=-KERNEL_EINVAL;
         {
             KERNEL_RAW_SCOPE(guard,&notify_lock);
             for (struct inotify_mark *m=group->marks;m;m=m->group_next) {
                 if (m->wd!=(int32_t)path_or_watch) continue;
-                remove_mark(m,&retired,1);*result=0;break;
+                remove_mark(m,&retired,1,&async);*result=0;break;
             }
         }
-        dispose_marks(retired);drain_notifications();
+        deliver_async(group,&async);dispose_marks(retired);drain_notifications();
     }
     if (kernel_open_file_release(&file)) {
         if (!file) __builtin_trap();

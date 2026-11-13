@@ -16,6 +16,7 @@ struct kernel_socket_name;
 struct kernel_heap;
 struct kernel_mm;
 struct kernel_socket;
+struct kernel_wait_queue *kernel_socket_async_source(struct kernel_socket *);
 struct kernel_bpf_program;
 struct kernel_bpf_program *kernel_socket_filter_get(struct kernel_socket *);
 int kernel_socket_filter_locked(struct kernel_socket *);

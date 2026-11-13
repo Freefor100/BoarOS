@@ -214,8 +214,8 @@ static void *run_worker(void *data)
 static void await_waiter(void)
 {while(!(__atomic_load_n(&waiting,__ATOMIC_ACQUIRE)&2U))sched_yield();}
 static unsigned queue_callbacks;
-static void queue_changed(struct kernel_wait_node *node,uint32_t reason)
-{(void)node;(void)reason;queue_callbacks++;}
+static void queue_changed(struct kernel_wait_node *node,uint32_t reason,uint64_t event)
+{ (void)event;(void)node;(void)reason;queue_callbacks++;}
 static void handoff_and_timeout(void)
 {
     struct kernel_mqueue *q=make("handoff",1,32);int fd=descriptor(q,2);pthread_t thread;

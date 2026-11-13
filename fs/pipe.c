@@ -1,4 +1,5 @@
 #include <kernel/credentials.h>
+#include <kernel/async_io.h>
 #include "pipe_internal.h"
 #include "vfs_objects.h"
 #include "uaccess_iov_internal.h"
@@ -95,8 +96,8 @@ static enum kernel_pipe_status pipe_destroy(struct kernel_pipe *pipe)
 {
     kernel_flock_destroy(&pipe->flock_identity);
     if (pipe->read_queue.initialized) {
-        struct kernel_wait_queue *queues[]={&pipe->read_queue,&pipe->write_queue,&pipe->both_queue};
-        for (unsigned i=0;i<3;i++) {
+        struct kernel_wait_queue *queues[]={&pipe->read_queue,&pipe->write_queue,&pipe->both_queue,&pipe->async_events};
+        for (unsigned i=0;i<4;i++) {
             enum kernel_scheduler_status status=kernel_wait_queue_close(queues[i]);
             /* bootstrap可构造/关闭管道，此时没有可park任务；destroy仍核对借用归零。 */
             if (status!=KERNEL_SCHEDULER_STATUS_OK && status!=KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED)
@@ -166,6 +167,7 @@ enum kernel_pipe_status kernel_pipe_create(
     kernel_wait_queue_init(&pipe->read_queue);
     kernel_wait_queue_init(&pipe->write_queue);
     kernel_wait_queue_init(&pipe->both_queue);
+    kernel_wait_queue_init(&pipe->async_events);
     /* 片段资格先于OFD/rank10、UNIX控制/rank10和VFS写操作/rank15；跨管道按key排列。 */
     kernel_mutex_init(&pipe->read_lock,9U,(uintptr_t)&pipe->read_lock);
     kernel_mutex_init(&pipe->write_lock,9U,(uintptr_t)&pipe->write_lock);
@@ -190,6 +192,13 @@ static void pipe_notify(struct kernel_pipe *pipe,int readers,int writers)
         if (status!=KERNEL_SCHEDULER_STATUS_OK && status!=KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED)
             __builtin_trap();
     }
+}
+
+static void pipe_async(struct kernel_pipe *pipe,unsigned reason)
+{
+    struct kernel_wait_cursor cursor={0};
+    {PIPE_META(guard,pipe);kernel_wait_cursor_prepare_event(&pipe->async_events,&cursor,reason,NULL);}
+    if (cursor.queue) kernel_wait_cursor_wake(&cursor,1);
 }
 
 int64_t kernel_pipe_capacity(struct kernel_pipe *pipe,int command,uint64_t argument)
@@ -322,6 +331,10 @@ enum kernel_pipe_status kernel_pipe_release_endpoint(struct kernel_pipe *pipe,ui
     }
     /* 本次关闭的owner仍在owners里；另一个关闭者不能提前释放通知目标。 */
     pipe_notify(pipe,readers,writers);
+    if (readers!=writers) {
+        pipe_async(pipe,KERNEL_ASYNC_POLL_IN);
+        pipe_async(pipe,KERNEL_ASYNC_POLL_OUT);
+    }
     { PIPE_META(guard,pipe); if (!pipe->owners) __builtin_trap(); last=!--pipe->owners; }
     enum kernel_pipe_status status=last ? pipe_destroy(pipe) : KERNEL_PIPE_STATUS_OK;
     arch_interrupt_restore(irq);
@@ -519,6 +532,7 @@ void kernel_pipe_read_finish(struct kernel_pipe_read_borrow *borrow,size_t consu
     { PIPE_META(guard,pipe);pipe->read_slot=KERNEL_PIPE_NO_SLOT; }
     kernel_lock_release(&borrow->guard);*borrow=(struct kernel_pipe_read_borrow){0};
     if (consumed) pipe_notify(pipe,0,1);
+    pipe_async(pipe,KERNEL_ASYNC_POLL_OUT);
 }
 void kernel_pipe_read_fragment(struct kernel_pipe_read_borrow *borrow,size_t offset,
     const void **data,size_t *count)
@@ -575,7 +589,7 @@ int kernel_pipe_push_page(struct kernel_pipe_write_borrow *borrow,void *page,siz
         if (!pipe->readers) return -KERNEL_EPIPE;
         if (pipe->slots==pipe->ring_size || pipe->buffers[pipe->tail].page) __builtin_trap();
         pipe->buffers[pipe->tail]=(struct kernel_pipe_buffer){page,(uint16_t)offset,(uint16_t)length,0};
-        pipe->tail=next_slot(pipe,pipe->tail);pipe->slots++;pipe->bytes+=length;borrow->slots--;
+        pipe->tail=next_slot(pipe,pipe->tail);pipe->slots++;pipe->bytes+=length;borrow->slots--;borrow->changed=1;
     }
     pipe_notify(pipe,1,0);
     return 0;
@@ -583,7 +597,9 @@ int kernel_pipe_push_page(struct kernel_pipe_write_borrow *borrow,void *page,siz
 void kernel_pipe_write_finish(struct kernel_pipe_write_borrow *borrow)
 {
     if (!borrow->pipe || !borrow->guard.lock) __builtin_trap();
+    struct kernel_pipe *pipe=borrow->pipe;unsigned changed=borrow->changed;
     kernel_lock_release(&borrow->guard);*borrow=(struct kernel_pipe_write_borrow){0};
+    if (changed) pipe_async(pipe,KERNEL_ASYNC_POLL_IN);
 }
 
 /* All copy qualifications are ordered by their actual keys, including reverse
@@ -649,7 +665,10 @@ int64_t kernel_pipe_link(struct kernel_pipe *in,struct kernel_pipe *out,size_t c
             else {index=next_slot(in,index);remaining--;}
         }
         for (unsigned i=4;i;i--) kernel_lock_release(&guards[i-1]);
-        if (total) {pipe_notify(out,1,0);if (consume)pipe_notify(in,0,1);}
+        if (total) {
+            pipe_notify(out,1,0);pipe_async(out,KERNEL_ASYNC_POLL_IN);
+            if (consume) {pipe_notify(in,0,1);pipe_async(in,KERNEL_ASYNC_POLL_OUT);}
+        }
         if (total || error || !retry) return total?(int64_t)total:error;
     }
 }
@@ -699,7 +718,7 @@ enum kernel_pipe_status kernel_pipe_readv(struct kernel_pipe *pipe,struct kernel
     if (!count) {*result=0;return KERNEL_PIPE_STATUS_OK;}
     struct kernel_pipe_read_borrow borrow={0};
     int64_t ready=kernel_pipe_read_begin(pipe,count,!!(flags&KERNEL_PIPE_NONBLOCK),&borrow);
-    if(ready<=0){*result=ready;return KERNEL_PIPE_STATUS_OK;}
+    if(ready<=0){pipe_async(pipe,KERNEL_ASYNC_POLL_OUT);*result=ready;return KERNEL_PIPE_STATUS_OK;}
     struct kernel_uaccess_iov_cursor cursor={iov,iov_count,0,0};
     uint64_t total=0;int error=0;
     while (total<borrow.length) {
@@ -714,7 +733,7 @@ enum kernel_pipe_status kernel_pipe_readv(struct kernel_pipe *pipe,struct kernel
     *result=total?(int64_t)total:error;
     return KERNEL_PIPE_STATUS_OK;
 }
-static enum kernel_pipe_status pipe_write_source(struct kernel_pipe *pipe,struct kernel_mm *mm,
+static enum kernel_pipe_status pipe_write_source_locked(struct kernel_pipe *pipe,struct kernel_mm *mm,
     const struct kernel_uaccess_iovec *iov,size_t iov_count,uint64_t count,uint32_t flags,
     struct kernel_pipe_result *result,const unsigned char *buffer)
 {
@@ -760,6 +779,7 @@ static enum kernel_pipe_status pipe_write_source(struct kernel_pipe *pipe,struct
             /* No copy reservation exists while full. Reuse the condition+
              * registration step without carrying a wait token through faults. */
             kernel_lock_release(&copy);
+            pipe_async(pipe,KERNEL_ASYNC_POLL_IN);
             int error=pipe_wait_ready(pipe,1,0);
             if (error) {
                 result->broken=error==-KERNEL_EPIPE;
@@ -815,6 +835,14 @@ static enum kernel_pipe_status pipe_write_source(struct kernel_pipe *pipe,struct
     kernel_lock_scope_release(&copy); arch_interrupt_restore(irq);
     result->bytes=(int64_t)total;
     return KERNEL_PIPE_STATUS_OK;
+}
+static enum kernel_pipe_status pipe_write_source(struct kernel_pipe *pipe,struct kernel_mm *mm,
+    const struct kernel_uaccess_iovec *iov,size_t iov_count,uint64_t count,uint32_t flags,
+    struct kernel_pipe_result *result,const unsigned char *buffer)
+{
+    enum kernel_pipe_status status=pipe_write_source_locked(pipe,mm,iov,iov_count,count,flags,result,buffer);
+    if (!status && count && (flags&3U)) pipe_async(pipe,KERNEL_ASYNC_POLL_IN);
+    return status;
 }
 enum kernel_pipe_status kernel_pipe_writev(struct kernel_pipe *pipe,struct kernel_mm *mm,
     const struct kernel_uaccess_iovec *iov,size_t iov_count,uint64_t count,uint32_t flags,

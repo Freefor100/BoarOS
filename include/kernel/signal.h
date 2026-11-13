@@ -202,6 +202,11 @@ enum kernel_signal_status kernel_signal_send(struct kernel_task *target,
                                              uint32_t sig,
                                              kernel_pid_t sender_tid);
 
+/* Identity is retained by the notification owner; type is F_OWNER_TID/PID/PGRP.
+ * Captured setter UID/EUID authorizes against the receiver at publication. */
+void kernel_signal_sigio(struct kernel_pid *,int type,uint32_t uid,uint32_t euid,
+    unsigned signum,int fd,unsigned reason);
+
 /* Same target-storage contract; sends a thread-directed signal to one task. */
 int kernel_signal_queue_info(int32_t group,int32_t pid,int thread,
     const struct kernel_signal_wait_info *);

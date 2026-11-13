@@ -50,44 +50,44 @@ int main(void)
     struct kernel_pid *tid = thread.identities[KERNEL_PID_TID].identity;
     unsigned group_refs = group->references, tid_refs = tid->references;
     struct kernel_pid *owner = NULL;
-    assert(!kernel_task_socket_identity(0, &owner) && owner == group &&
+    assert(!kernel_task_identity_get(0, &owner) && owner == group &&
         group->references == group_refs + 1);
     kernel_task_identity_put(owner); owner = NULL;
-    assert(!kernel_task_socket_identity(thread.tid, &owner) && owner == tid &&
+    assert(!kernel_task_identity_get(thread.tid, &owner) && owner == tid &&
         tid->references == tid_refs + 1);
     kernel_task_identity_put(owner); owner = NULL;
     assert(group->references == group_refs && tid->references == tid_refs);
     active = &cpus[1];
-    assert(!kernel_task_socket_identity(0, &owner) &&
+    assert(!kernel_task_identity_get(0, &owner) &&
         owner == remote.identities[KERNEL_PID_TGID].identity);
     kernel_task_identity_put(owner); owner = NULL;
     active = &cpus[0];
-    assert(kernel_task_socket_identity(-1, &owner) == -KERNEL_ESRCH && !owner);
-    assert(kernel_task_socket_identity(127, &owner) == -KERNEL_ESRCH && !owner);
+    assert(kernel_task_identity_get(-1, &owner) == -KERNEL_ESRCH && !owner);
+    assert(kernel_task_identity_get(127, &owner) == -KERNEL_ESRCH && !owner);
     struct kernel_task private = {0}; private.group_leader = &private;
     assert(!process_identity_create(&private, NULL, 0));
-    assert(kernel_task_socket_identity(private.tid, &owner) == -KERNEL_ESRCH && !owner);
+    assert(kernel_task_identity_get(private.tid, &owner) == -KERNEL_ESRCH && !owner);
     process_identity_release(&private); process_identity_collect();
 
     kernel_pid_t number = thread.tid;
-    assert(!kernel_task_socket_identity(number, &owner));
+    assert(!kernel_task_identity_get(number, &owner));
     uint64_t generation = owner->generation;
     process_identity_release(&thread);
     struct kernel_pid *after_exit = NULL;
-    assert(kernel_task_socket_identity(number, &after_exit) == -KERNEL_ESRCH && !after_exit);
+    assert(kernel_task_identity_get(number, &after_exit) == -KERNEL_ESRCH && !after_exit);
     assert(owner->generation == generation && !owner->members[KERNEL_PID_TID] && owner->published == 2);
     struct kernel_task replacement = {0};
     scheduler.pid_allocator.cursor = (uint32_t)number - 1U;
     publish(&replacement, NULL, 0);
     assert(replacement.tid == number);
-    assert(!kernel_task_socket_identity(number, &after_exit) && after_exit != owner &&
+    assert(!kernel_task_identity_get(number, &after_exit) && after_exit != owner &&
         after_exit->generation != generation);
     kernel_task_identity_put(owner); owner = NULL;
     assert(after_exit->members[KERNEL_PID_TID]->task == &replacement);
     kernel_task_identity_put(after_exit); after_exit = NULL;
     process_identity_release(&replacement);
     cpus[0].current = NULL;
-    assert(kernel_task_socket_identity(0, &owner) == -KERNEL_ESRCH && !owner);
+    assert(kernel_task_identity_get(0, &owner) == -KERNEL_ESRCH && !owner);
     process_identity_release(&leader); process_identity_release(&remote);
     process_identity_collect();
     assert(!allocated && !scheduler.pid_allocator.allocated);

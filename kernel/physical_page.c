@@ -1302,6 +1302,17 @@ enum physical_page_status physical_page_allocate_contiguous(
     return PHYSICAL_PAGE_STATUS_OK;
 }
 
+enum physical_page_status physical_page_allocate_order_nosleep(
+    struct physical_page_allocator *allocator, uint32_t order, uint64_t *address)
+{
+    COST_ADD(PAGE_CALLS,1);
+    enum physical_page_status status=physical_page_allocate_order_once(allocator,order,address,NULL);
+    if (status==PHYSICAL_PAGE_STATUS_OK) {
+        COST_ADD(PAGE_ACCEPTED,order_page_count(order));COST_IO_ADD(7,order_page_count(order));
+    } else COST_ADD(PAGE_FAILURES,1);
+    return status;
+}
+
 enum physical_page_status physical_page_allocate_order(
     struct physical_page_allocator *allocator,
     uint32_t order,

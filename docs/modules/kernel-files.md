@@ -75,6 +75,29 @@ CLOEXEC模式保留共享OFD再标记。分配失败保留旧表。候选和退�
 
 `/proc/<pid>/fd` 在 CPU0 的目标任务借用范围内，通过 FD 锁取得临时 OFD pin；普通文件再取得路径引用，伪对象只复制 kind/身份，调用结束归还 pin。重新打开 pipe 时，先在该短区预留一个 endpoint 引用，解锁后分配新 OFD，最后无论成功失败都撤销临时引用。只读、只写和读写的新 OFD 分别拥有 reader、writer 或两者；`O_RDWR` 的 poll 等待使用同时由读写状态变化唤醒的聚合队列。socket/epoll 不复制底层句柄来冒充新打开。
 
+## 信号驱动 I/O
+
+`F_SETOWN/F_GETOWN`、`F_SETOWN_EX/F_GETOWN_EX` 和 `F_SETSIG/F_GETSIG` 的状态归 OFD，
+因此 dup、fork 和 SCM_RIGHTS 传递共享所有者、选择信号和通知登记。首次设置时才分配
+异步上下文；所有者持有稳定 PID 身份及设置者当时的 UID/EUID，目标退出后不跟随 PID
+数字复用。默认信号为 SIGIO，`F_SETSIG` 接受 0–64。目标选择、权限和队列回退规则见
+[调度与信号模块](kernel-scheduler.md)。
+
+`F_SETFL` 的 O_ASYNC 从关闭变为开启时，先准备上下文，再登记真实事件源并保存此次 fd。
+准备失败不改变其它状态标志。已经开启时通过另一个 dup 修改 O_NONBLOCK 不会替换通知的
+`si_fd`；关闭后重新开启才保存新的 fd。没有异步事件源的普通文件接受设置操作，查询时
+不保留 O_ASYNC。最终 OFD 关闭先摘除登记并等在途回调归还，
+再释放 PID 身份和底层对象；登记不为 OFD 自增引用。
+
+管道/FIFO 的信号源独立于普通 poll 等待队列。非空读操作结束通知写端 POLL_OUT，
+非空写操作结束和阻塞等待前通知读端 POLL_IN；一次多片段写入不会按内部复制页重复发送。
+一侧端点数归零而另一侧仍存在时，两方向分别收到 POLL_IN/POLL_OUT。端点方向决定各
+OFD 订阅的通知，`O_RDWR` 同时订阅两方向。对象短锁内取得等待游标，回调在锁外执行。
+TTY、socket 和 inotify 也提供自己的事件源，不把一次普通 poll 唤醒当作 I/O 事件。
+
+直接宿主检查为 `sh tests/host/async-io.sh`，覆盖共享状态、分配失败、保存的 fd 和末次
+关闭等待回调；真实用户消费者见 [async_io.c](../../tests/workloads/io/async_io.c)。
+
 ## 向量 I/O 的按次选项
 
 `preadv/pwritev` 与 `preadv2/pwritev2` 共用一次 OFD 引用、一次 iovec 快照和读写核心。
@@ -665,4 +688,11 @@ RV64／LA64 使用 `inotify_init1`、`inotify_add_watch` 和 `inotify_rm_watch`�
 环为 `IN_Q_OVERFLOW` 保留位置，读返回完整记录，名称以 NUL 补齐到记录边界。
 阻塞读取、`IN_NONBLOCK`、poll/epoll 和 `FIONREAD` 使用同一队列状态。事件发布时借用
 等待游标，释放短锁后通知；最后关闭在拆除 epoll 关联后释放实例，已选中的通知保持独立引用。
+每个实际入队的记录向独立异步源发送一次 POLL_IN，包括 IN_IGNORED 和首次溢出记录；
+相邻合并及溢出后的抑制不发送信号。普通 poll 的 pending_wake 继续合并唤醒，不能代替
+记录数。遍历仅跨锁借用当前 mark 和后继，移除中的后继由独立退休链接保活；mark 的借用
+同时持有 group，因此另一线程关闭监视组后，锁外回调和剩余遍历仍有实际所有者覆盖。
+
 直接探针见 [inotify.c](../../tests/workloads/fs/inotify.c)，覆盖目录事件、事件消费、溢出和卸载。
+`sh tests/host/inotify-async.sh` 检查入队/合并/溢出/忽略的通知次数，以及回调期间并发关闭
+后继 mark 和 group 的交错。

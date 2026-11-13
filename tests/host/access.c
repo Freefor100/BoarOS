@@ -10,6 +10,7 @@
 #include <kernel/uaccess.h>
 #include "../../fs/files/private.h"
 #include "../../fs/vfs_objects.h"
+#include "../../fs/open_file_internal.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -26,6 +27,9 @@ static struct kernel_files files;
 static struct kernel_fs_context fs;
 static struct kernel_mm mm;
 static uint64_t user_path;
+/* Access checks construct path OFDs without asynchronous subscriptions. */
+void kernel_open_file_async_close(struct kernel_open_file_description *file)
+{ assert(file && !file->async_io); }
 
 /* This fixture's timer ticks use the same nanoseconds as disk_context.c. */
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t ns,uint64_t *deadline)

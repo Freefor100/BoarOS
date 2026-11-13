@@ -314,3 +314,6 @@ int main(void)
     clock_steps();queued_periodic_clock_steps();
     puts("POSIX native reservation, mixed FIFO, stale generation, ignore phase, completion/delete owner and clock steps passed");return 0;
 }
+
+enum kernel_heap_status kernel_heap_allocate_zeroed_nosleep(struct kernel_heap *heap,size_t count,size_t size,void **out)
+{ return kernel_heap_allocate_zeroed(heap,count,size,out); }

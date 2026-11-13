@@ -74,6 +74,22 @@ static void *produce(void *arg)
 int main(void)
 {
     struct kernel_task a,b;init(&a);init(&b);
+    {
+        struct signal_pending_prepared p={0};
+        struct kernel_signal_wait_info in={.signal=36,.code=1,.address=0x41};
+        fail=1;kernel_cpu_current()->preempt_depth++;
+        signal_pending_prepare_nosleep(&b,0,&b,&heap,&in,1,&p);
+        assert(!p.record && !p.index);
+        {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(signal_pending_post_locked(&b,0,&b,&in,1,&p)==-KERNEL_EAGAIN);}
+        signal_pending_finish(&p);
+        in=(struct kernel_signal_wait_info){.signal=29,.code=128};
+        signal_pending_prepare_nosleep(&b,0,&b,&heap,&in,0,&p);
+        {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(!signal_pending_post_locked(&b,0,&b,&in,0,&p));}
+        signal_pending_finish(&p);kernel_cpu_current()->preempt_depth--;fail=0;
+        struct kernel_signal_wait_info out=take(&b,0,29);
+        assert(out.signal==29 && out.code==128 && !live && !count());
+    }
+
     assert(!post(&a,0,10,0,0,0) && count()==1);
     assert(!post(&a,0,10,0,0,0) && count()==1);
     struct kernel_signal_wait_info expected={.signal=10,.sender=42};
@@ -160,3 +176,6 @@ int main(void)
     signal_pending_finish(&detached);assert(!live);
     puts("signal pending FIFO/quota/abort/merge/lifetime and distinct-target UID ownership passed");return 0;
 }
+
+enum kernel_heap_status kernel_heap_allocate_zeroed_nosleep(struct kernel_heap *heap,size_t count,size_t size,void **out)
+{ return kernel_heap_allocate_zeroed(heap,count,size,out); }

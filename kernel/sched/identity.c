@@ -115,6 +115,12 @@ void process_identity_release(struct kernel_task *task)
     process_identity_release_locked(task);
 }
 
+void kernel_task_identity_retain(struct kernel_pid *id)
+{
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    kernel_pid_get(id);
+}
+
 void kernel_task_identity_put(struct kernel_pid *id)
 {
     {
@@ -124,7 +130,7 @@ void kernel_task_identity_put(struct kernel_pid *id)
     process_identity_collect();
 }
 
-int kernel_task_socket_identity(int32_t pid, struct kernel_pid **owner)
+int kernel_task_identity_get(int32_t pid, struct kernel_pid **owner)
 {
     if (!owner) return -KERNEL_EINVAL;
     *owner = 0;

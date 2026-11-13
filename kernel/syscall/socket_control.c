@@ -90,7 +90,7 @@ static int set_credentials(struct kernel_socket_control *control, const struct c
     /* The identity helper's zero selects self for automatic credentials; an
      * explicitly supplied zero follows find_get_pid(0), which has no owner. */
     if (!value->pid) return -KERNEL_ESRCH;
-    int error=kernel_task_socket_identity(value->pid,&pid);
+    int error=kernel_task_identity_get(value->pid,&pid);
     if (error) return error;
     if (control->pid) kernel_task_identity_put(control->pid);
     control->pid=pid; control->uid=value->uid; control->gid=value->gid;
