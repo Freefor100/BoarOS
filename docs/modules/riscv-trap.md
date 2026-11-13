@@ -31,7 +31,9 @@ dispatcher 返回表示当前恢复到的线程 Frame 已经可以恢复。生�
 
 ## 返回契约
 
-dispatcher 返回后，汇编总是要求 Frame 中 `sstatus.SIE=0`，避免在寄存器恢复窗口提前接受中断。进入汇编恢复前，C return tail 会调用 `riscv_signal_prepare_user_return()`：它处理 pending signal、默认动作/handler frame、被信号唤醒的 syscall restart，并在有 F/D 状态时由独立 FP 模块维护寄存器。SPP=1 直接返回 S-mode；SPP=0 还要求 Frame 的 `kernel_tp` 非零、等于当前内核 `tp`，且线程前缀标记为用户任务，否则进入 `invalid trap return`，不会把任意 S-mode `tp` 当指针解引用。
+dispatcher 返回后，汇编总是要求 Frame 中 `sstatus.SIE=0`。实际硬件的 SIE 也必须在修改 `sscratch` 前保持关闭：Frame 的检查不能阻止此前已经开启的中断。RV 的 `riscv_interrupt_restore()`与固定 Linux 的低层实现相同，只按保存值重新开启 SIE，调用时要求中断已经关闭。`getrandom`等临时开中断的耗时路径，结束时必须先关闭中断，再恢复入口状态；不能直接把保存的零值交给 restore。否则，中断可能在用户入口标记已经写入、寄存器尚未恢复时到达，将内核现场误当用户现场并覆盖原 Frame。
+
+进入汇编恢复前，C return tail 会调用 `riscv_signal_prepare_user_return()`：它处理 pending signal、默认动作/handler frame、被信号唤醒的 syscall restart，并在有 F/D 状态时由独立 FP 模块维护寄存器。SPP=1 直接返回 S-mode；SPP=0 还要求 Frame 的 `kernel_tp` 非零、等于当前内核 `tp`，且线程前缀标记为用户任务，否则进入 `invalid trap return`，不会把任意 S-mode `tp` 当指针解引用。
 
 合法返回按以下顺序完成：
 
@@ -47,7 +49,7 @@ dispatcher 返回后，汇编总是要求 Frame 中 `sstatus.SIE=0`，避免在�
 
 - `stvec` 使用 Direct 模式，所有 S-mode trap 进入同一入口；启动和页表切换阶段保持 `sie=0` 与全局 SIE 关闭，最终地址空间稳定后只开启 STIE 和全局 SIE。
 - `sscratch` 在内核执行期间固定为零，用户执行期间保存 current thread。入口先用 `csrrw` 与用户 `tp` 交换，从可信线程前缀取得 `kernel_sp`；保存用户 `tp/sp` 后立即把 `sscratch` 清零，再进入 C。
-- 保存现场和 C dispatcher 期间不重新打开 SIE，不支持嵌套异步中断。同步异常可以再次进入当前栈，但 handler、栈或诊断路径自身故障后的递归失败仍没有独立恢复保证。
+- 入口保存现场及寄存器恢复期间关闭 SIE。C 路径只有在任务栈、`tp`和`sscratch=0`已经稳定后，才允许耗时操作临时开中断；结束时必须恢复入口状态。同步异常和这些区间的异步中断使用当前内核栈，handler、栈或诊断路径自身故障后的递归失败仍没有独立恢复保证。
 - boot idle 使用 16 KiB 静态启动栈，普通内核/用户任务各使用独立 8 KiB 连续物理栈；没有独立 Trap 栈、guard page、per-hart IRQ 栈或溢出恢复。
 - 当前已处理 PLIC supervisor external IRQ、静态 timer、U ecall、匿名 demand-zero、file-private/COW fault、标准 signal delivery/handler/sigreturn 和用户同步故障终止；没有 IPI、V 向量上下文或嵌套异步中断。不可解析的用户故障仍直接终止任务。
 

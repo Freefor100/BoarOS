@@ -6,9 +6,11 @@
 #define BOAROS_ARCH_CONTEXT_H
 #define ARCH_INTERRUPT_ENABLE_MASK 2U
 static uintptr_t irq;
+static unsigned restore_sets_only;
 static void *arch_current_cpu_get(void) { return NULL; }
 static uintptr_t arch_interrupt_save(void) { uintptr_t old=irq;irq=0;return old; }
-static void arch_interrupt_restore(uintptr_t value) { irq=value; }
+static void arch_interrupt_restore(uintptr_t value)
+{ if (restore_sets_only) irq|=value&2U; else irq=value; }
 #ifndef RANDOM_SOURCE
 #define RANDOM_SOURCE "../../kernel/syscall/random.c"
 #endif
@@ -66,6 +68,9 @@ int main(void)
 {
     memory.allocator=(struct physical_page_allocator *)&memory;
     size_t bytes=2*BOAROS_PAGE_SIZE+17;
+    /* RV restore sets saved SIE after the caller has disabled IRQs; LA
+     * replaces IE. Exercise the production syscall against both seams. */
+    for(restore_sets_only=0;restore_sets_only<=1;restore_sets_only++)
     for(unsigned initial=0;initial<=2;initial+=2) {
         run(initial,bytes,0,0,0,bytes);run(initial,bytes,1,0,0,BOAROS_PAGE_SIZE);
         run(initial,bytes,0,1,0,-KERNEL_EIO);run(initial,bytes,0,2,0,BOAROS_PAGE_SIZE);
@@ -74,5 +79,5 @@ int main(void)
         output_offset=BOAROS_PAGE_SIZE-2;run(initial,BOAROS_PAGE_SIZE+5,0,0,0,BOAROS_PAGE_SIZE+5);output_offset=0;
         scratch_oom=1;run(initial,bytes,0,0,0,-KERNEL_ENOMEM);scratch_oom=0;
     }
-    puts("getrandom IRQ: preparation/copy enabled, signal/error prefix and entry-state restore passed");
+    puts("getrandom IRQ: RV/LA restore, enabled copy, signal/error prefix and entry-state restore passed");
 }

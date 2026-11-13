@@ -77,6 +77,9 @@ enum kernel_syscall_status syscall_handle_getrandom(
     /* 每次覆盖同一工作区，中间不用反复清零；最后一次实际使用结束再擦除。 */
     kernel_random_erase(block, size < capacity ? size : capacity);
     if (workspace.allocator) kernel_task_io_buffer_release(&workspace);
+    /* RV restore only re-enables saved SIE. Close this temporary IRQ window
+     * before restoring an entry state that may have had interrupts disabled. */
+    (void)arch_interrupt_save();
     arch_interrupt_restore(saved_interrupts);
     decoded->value = total ? (int64_t)total : error;
     return KERNEL_SYSCALL_STATUS_OK;

@@ -999,7 +999,7 @@ static void creation_stop_race(void)
             !creation_gate.registrations && !creation_gate.borrows &&
             physical_page_available(allocator) == available, "creation-stopped-rollback-owner");
     { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-      require(!scheduler.controlled_owners && !riscv_smp_cpu(1)->runqueue.first,
+      require(!scheduler.controlled_owners && !riscv_smp_cpu(1)->runqueue.count,
               "creation-stopped-no-publication"); }
     virt_uart_puts("BoarOS: SMP sleeping create rechecks STOPPED and returns private owners\n");
 }
@@ -1082,7 +1082,10 @@ void riscv_smp_test_poll(void)
 {
     if (!__atomic_load_n(&done, __ATOMIC_ACQUIRE)) return;
     { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-      require(!scheduler.all_tasks && !scheduler.task_count && !scheduler.runqueue.first &&
+      KERNEL_RUN_SET(runs);
+      for (struct kernel_cpu *cpu=scheduler.cpus;cpu;cpu=cpu->scheduler_next)
+          require(!cpu->runqueue.count, "test-ready-owner-baseline");
+      require(!scheduler.all_tasks && !scheduler.task_count &&
               !scheduler.deadline_root && !scheduler.exited_head &&
               !scheduler.retired_pending && !scheduler.retired_tasks && !scheduler.controlled_owners &&
               !kernel_cpu_current()->switch_previous, "test-scheduler-owner-baseline"); }
