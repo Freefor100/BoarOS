@@ -18,6 +18,8 @@
 #include <kernel/bpf.h>
 #include <kernel/time.h>
 #include <kernel/task.h>
+#include <kernel/task_state.h>
+#include <kernel/ptrace.h>
 #include <kernel/tick.h>
 
 #include <stdint.h>
@@ -249,6 +251,8 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
         struct kernel_task *caller = arch_current_thread_get();
         if (!caller || frame->kernel_tp != (uintptr_t)caller ||
             kernel_cpu_current()->current != caller) riscv_trap_fatal(frame);
+        if (__atomic_load_n(&caller->ptrace, __ATOMIC_ACQUIRE) &&
+            !kernel_ptrace_syscall_enter(caller, frame)) return;
         struct kernel_syscall_request request = {
             .number = frame->a7,
             .user_sp = frame->sp,
@@ -290,6 +294,7 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
                 riscv_scheduler_fatal(frame, scheduler_status);
             }
             kernel_bpf_trace_exit(kernel_task_current(),(int32_t)request.number,0);
+            if(kernel_task_current()->ptrace)kernel_ptrace_syscall_exit(kernel_task_current(),frame,request.number);
             return;
         }
         if (result.action == KERNEL_SYSCALL_ACTION_CLONE) {
@@ -351,6 +356,7 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
         if (result.action == KERNEL_SYSCALL_ACTION_SIGNAL_RETURN) {
             riscv_signal_restore_current(frame);
             kernel_bpf_trace_exit(kernel_task_current(),(int32_t)frame->a7,(int64_t)frame->a0);
+            if(kernel_task_current()->ptrace)kernel_ptrace_syscall_exit(kernel_task_current(),frame,request.number);
             return;
         }
         if (result.action != KERNEL_SYSCALL_ACTION_RETURN) {
@@ -358,6 +364,13 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
         }
         kernel_bpf_trace_exit(kernel_task_current(),(int32_t)request.number,result.value);
         if (result.value == -KERNEL_ERESTARTSYS) {
+            if(caller->ptrace) {
+                uint64_t argument=frame->a0;
+                frame->a0=(uint64_t)result.value;frame->sepc+=4;
+                kernel_ptrace_syscall_exit(caller,frame,request.number);
+                if((int64_t)frame->a0!=-KERNEL_ERESTARTSYS)return;
+                frame->a0=argument;frame->sepc-=4;
+            }
             kernel_signal_note_syscall_restart(kernel_task_current());
             return;
         }
@@ -368,6 +381,7 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
         }
         frame->a0 = (unsigned long)result.value;
         frame->sepc += 4U;
+        if(caller->ptrace)kernel_ptrace_syscall_exit(caller,frame,request.number);
         return;
     }
 
@@ -394,6 +408,9 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
 
 void riscv_trap_return_prepare(struct riscv_trap_frame *frame)
 {
+    if(!(frame->sstatus&RISCV_SSTATUS_SPP) &&
+       __atomic_load_n(&kernel_task_current()->ptrace,__ATOMIC_ACQUIRE))
+        kernel_ptrace_user_return(kernel_task_current(),frame);
 #if BOAROS_USER_SMP
     if ((frame->sstatus & RISCV_SSTATUS_SPP) == 0U) {
         do {
@@ -402,6 +419,7 @@ void riscv_trap_return_prepare(struct riscv_trap_frame *frame)
                 if (kernel_scheduler_user_service_active())
                     kernel_scheduler_leave_user_service();
             }
+            if(kernel_task_current()->ptrace)kernel_ptrace_user_return(kernel_task_current(),frame);
         } while (kernel_scheduler_user_return_pending());
         kernel_cpu_current()->user_returns++;
     } else kernel_scheduler_prepare_idle_return();
@@ -409,6 +427,8 @@ void riscv_trap_return_prepare(struct riscv_trap_frame *frame)
     if ((frame->sstatus & RISCV_SSTATUS_SPP) == 0U) kernel_task_prepare_user_return();
     else kernel_scheduler_prepare_idle_return();
     riscv_signal_prepare_user_return(frame);
+    if(!(frame->sstatus&RISCV_SSTATUS_SPP) && kernel_task_current()->ptrace)
+        kernel_ptrace_user_return(kernel_task_current(),frame);
 #endif
 #if BOAROS_COST_DIAGNOSTICS
     if ((frame->sstatus & RISCV_SSTATUS_SPP) == 0U) kernel_cost_user_return();

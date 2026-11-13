@@ -1,4 +1,5 @@
 #include "private.h"
+#include <kernel/ptrace.h>
 #include <kernel/credentials.h>
 
 static void domain_owned(void)
@@ -208,6 +209,7 @@ void scheduler_task_collect(void)
          * dispositions retain their identity through zombie/reap, then leave
          * with the container; queue quiescence and page disposal stay outside raw. */
         if (task->signal_table_address && kernel_signal_release_table(task)) __builtin_trap();
+        kernel_ptrace_dispose(task);
         kernel_resource_limits_put(task->limits);
         task->limits = 0;
         kernel_credentials_put(task->credentials);

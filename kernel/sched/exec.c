@@ -4,6 +4,7 @@
 
 #include <kernel/exec.h>
 #include <kernel/credentials.h>
+#include <kernel/ptrace.h>
 #include <kernel/futex.h>
 #include <kernel/files.h>
 #include <kernel/heap.h>
@@ -152,6 +153,7 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
         thread->mm = transaction->image.mm;
         previous=thread->credentials;
         thread->credentials=transaction->credentials;
+        thread->personality=transaction->personality;
         transaction->credentials=0;
         previous_security=thread->exec_security;
         thread->exec_security=transaction->exec_security;
@@ -167,7 +169,8 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
                           transaction->image.stack_pointer,
                           transaction->image.thread_pointer);
     kernel_signal_reset_on_exec(thread);
-    transaction->state = KERNEL_EXEC_TRANSACTION_COMMITTED_CLEANUP;
+    __atomic_store_n(&transaction->state,KERNEL_EXEC_TRANSACTION_COMMITTED_CLEANUP,__ATOMIC_RELEASE);
+    (void)kernel_wait_queue_wake_all(&thread->child_exit_queue);
 
     exec_status = kernel_exec_transaction_cleanup(transaction);
     /* The parent needs the shared MM back, not completion of unrelated
@@ -181,6 +184,7 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
                                 UINT64_C(0x45584543),
                                 exec_status);
     }
+    kernel_ptrace_exec(thread,old_tid);
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
@@ -196,7 +200,10 @@ enum kernel_exec_status kernel_task_exec_attach(
         !kernel_exec_transaction_valid(transaction, task->files.heap)) {
         return KERNEL_EXEC_STATUS_STATE;
     }
-    task->exec_transaction = transaction;
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        task->exec_transaction = transaction;
+    }
     return KERNEL_EXEC_STATUS_OK;
 }
 
@@ -235,7 +242,34 @@ enum kernel_exec_status kernel_task_exec_finish(
      * replaced MM remains when the transaction container is finally freed. */
     process_complete_vfork(task);
     heap = transaction->heap;
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        task->exec_transaction = 0;
+    }
     kernel_heap_release(heap, transaction);
-    task->exec_transaction = 0;
+    (void)kernel_wait_queue_wake_all(&task->child_exit_queue);
     return KERNEL_EXEC_STATUS_OK;
+}
+
+int kernel_task_ptrace_exec_busy_locked(struct kernel_task *task)
+{
+    if(!kernel_raw_lock_owned(&kernel_wait_domain))__builtin_trap();
+    if(task->proc_exiting || !task->exec_transaction)return 0;
+    unsigned state=__atomic_load_n(&task->exec_transaction->state,__ATOMIC_ACQUIRE);
+    return state==KERNEL_EXEC_TRANSACTION_PREPARING || state==KERNEL_EXEC_TRANSACTION_PREPARED;
+}
+
+void kernel_task_exec_abort(struct kernel_task *task,struct kernel_exec_transaction *transaction)
+{
+    int changed=0;
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        if(task->exec_transaction!=transaction)__builtin_trap();
+        unsigned state=__atomic_load_n(&transaction->state,__ATOMIC_RELAXED);
+        if(state==KERNEL_EXEC_TRANSACTION_PREPARING || state==KERNEL_EXEC_TRANSACTION_PREPARED) {
+            __atomic_store_n(&transaction->state,KERNEL_EXEC_TRANSACTION_ABORTED_CLEANUP,__ATOMIC_RELEASE);
+            changed=1;
+        }
+    }
+    if(changed)(void)kernel_wait_queue_wake_all(&task->child_exit_queue);
 }

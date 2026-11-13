@@ -6,6 +6,8 @@
 #include <arch/loongarch/fpu.h>
 #include <platform/loongarch_virt.h>
 #include <kernel/task.h>
+#include <kernel/task_state.h>
+#include <kernel/ptrace.h>
 #include <kernel/cpu.h>
 #include <kernel/tick.h>
 #include <kernel/time.h>
@@ -123,6 +125,8 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
         struct kernel_task *caller=arch_current_thread_get();
         if(!caller || frame->kernel_tp!=(uintptr_t)caller ||
            kernel_cpu_current()->current!=caller)la_virt_fatal("syscall owner");
+        if (__atomic_load_n(&caller->ptrace, __ATOMIC_ACQUIRE) &&
+            !kernel_ptrace_syscall_enter(caller, frame)) return;
         struct kernel_syscall_request request={.number=frame->regs[11],.user_sp=frame->regs[3]};
         for (unsigned i=0;i<6;i++) request.arguments[i]=frame->regs[4+i];
         struct kernel_syscall_result result;
@@ -156,18 +160,30 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
         case KERNEL_SYSCALL_ACTION_EXEC:
             if (kernel_scheduler_exec_commit()!=KERNEL_SCHEDULER_STATUS_OK) la_virt_fatal("exec commit");
             kernel_bpf_trace_exit(kernel_task_current(),request.number,0);
+            if(kernel_task_current()->ptrace)kernel_ptrace_syscall_exit(kernel_task_current(),frame,request.number);
             return;
         case KERNEL_SYSCALL_ACTION_SIGNAL_RETURN:
             la_signal_restore_current(frame);
-            kernel_bpf_trace_exit(kernel_task_current(),frame->regs[11],(int64_t)frame->regs[4]);return;
+            kernel_bpf_trace_exit(kernel_task_current(),frame->regs[11],(int64_t)frame->regs[4]);
+            if(kernel_task_current()->ptrace)kernel_ptrace_syscall_exit(kernel_task_current(),frame,request.number);
+            return;
         case KERNEL_SYSCALL_ACTION_RETURN: break;
         default: la_virt_fatal("unsupported internal syscall action");
         }
         kernel_bpf_trace_exit(kernel_task_current(),request.number,result.value);
         if (result.value==-KERNEL_ERESTARTSYS) {
+            if(caller->ptrace) {
+                uint64_t argument=frame->regs[4];
+                frame->regs[4]=(uint64_t)result.value;frame->era+=4;
+                kernel_ptrace_syscall_exit(caller,frame,request.number);
+                if((int64_t)frame->regs[4]!=-KERNEL_ERESTARTSYS)return;
+                frame->regs[4]=argument;frame->era-=4;
+            }
             kernel_signal_note_syscall_restart(kernel_task_current()); return;
         }
-        frame->regs[4]=(uint64_t)result.value; frame->era+=4; return;
+        frame->regs[4]=(uint64_t)result.value; frame->era+=4;
+        if(caller->ptrace)kernel_ptrace_syscall_exit(caller,frame,request.number);
+        return;
     }
     if (user) {
         if(code==12) {
@@ -202,16 +218,20 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
 void la_trap_return_prepare(struct arch_trap_frame *frame)
 {
     if ((frame->prmd&3)==3) {
+        if(__atomic_load_n(&kernel_task_current()->ptrace,__ATOMIC_ACQUIRE))
+            kernel_ptrace_user_return(kernel_task_current(),frame);
 #if BOAROS_USER_SMP
         do {
             if(kernel_task_prepare_user_return()) {
                 la_signal_prepare_user_return(frame);
                 if(kernel_scheduler_user_service_active())kernel_scheduler_leave_user_service();
             }
+            if(kernel_task_current()->ptrace)kernel_ptrace_user_return(kernel_task_current(),frame);
         } while(kernel_scheduler_user_return_pending());
         kernel_cpu_current()->user_returns++;
 #else
         kernel_task_prepare_user_return();la_signal_prepare_user_return(frame);
+        if(kernel_task_current()->ptrace)kernel_ptrace_user_return(kernel_task_current(),frame);
 #endif
         kernel_cpu_account_user_return();
 #if BOAROS_COST_DIAGNOSTICS

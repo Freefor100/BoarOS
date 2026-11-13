@@ -1,5 +1,7 @@
 #include "exec_internal.h"
 #include <kernel/credentials.h>
+#include <kernel/personality.h>
+#include <kernel/ptrace.h>
 
 #include <kernel/errno.h>
 #include <kernel/elf64_source.h>
@@ -133,7 +135,7 @@ enum kernel_exec_status kernel_exec_transaction_cleanup(
     release_allocation(transaction, (void **)&transaction->string_bytes);
     release_allocation(transaction, (void **)&transaction->original_path);
     if (!failed && transaction_resources_empty(transaction)) {
-        transaction->state = KERNEL_EXEC_TRANSACTION_EMPTY_CLEANUP;
+        __atomic_store_n(&transaction->state,KERNEL_EXEC_TRANSACTION_EMPTY_CLEANUP,__ATOMIC_RELEASE);
         return KERNEL_EXEC_STATUS_OK;
     }
     return KERNEL_EXEC_STATUS_CLEANUP_REQUIRED;
@@ -552,6 +554,7 @@ static enum kernel_exec_status finish_prepare_failure(
     int64_t failure,
     int64_t *linux_result)
 {
+    kernel_task_exec_abort(task,transaction);
     enum kernel_exec_status cleanup_status =
         kernel_exec_transaction_cleanup(transaction);
 
@@ -566,6 +569,7 @@ static enum kernel_exec_status finish_prepare_state(
     struct kernel_task *task,
     struct kernel_exec_transaction *transaction)
 {
+    kernel_task_exec_abort(task,transaction);
     enum kernel_exec_status cleanup_status =
         kernel_exec_transaction_cleanup(transaction);
 
@@ -708,7 +712,7 @@ enum kernel_exec_status kernel_execveat_prepare(
         return KERNEL_EXEC_STATUS_STATE;
     }
     transaction->heap = files->heap;
-    transaction->state = KERNEL_EXEC_TRANSACTION_PREPARING;
+    __atomic_store_n(&transaction->state,KERNEL_EXEC_TRANSACTION_PREPARING,__ATOMIC_RELEASE);
     if (kernel_task_exec_attach(task, transaction) !=
         KERNEL_EXEC_STATUS_OK) {
         kernel_heap_release(files->heap, transaction);
@@ -893,13 +897,21 @@ enum kernel_exec_status kernel_execveat_prepare(
     transaction->credentials=kernel_credentials_clone(transaction->heap,old);
     if (!transaction->credentials) return finish_prepare_failure(task,transaction,-KERNEL_ENOMEM,linux_result);
     path_result=kernel_exec_credentials_prepare(transaction->credentials,old,&metadata,
-        transaction->unsafe_fs,task->no_new_privs,&transaction->secureexec,&transaction->dumpable);
+        transaction->unsafe_fs || kernel_ptrace_exec_unsafe(task),
+        task->no_new_privs,&transaction->secureexec,&transaction->dumpable);
     if (path_result) return finish_prepare_failure(task,transaction,path_result,linux_result);
     transaction->exec_security=kernel_exec_security_create(transaction->heap,transaction->dumpable);
     if(!transaction->exec_security) return finish_prepare_failure(task,transaction,-KERNEL_ENOMEM,linux_result);
     image_request.uid=transaction->credentials->uid; image_request.euid=transaction->credentials->euid;
     image_request.gid=transaction->credentials->gid; image_request.egid=transaction->credentials->egid;
     image_request.secureexec=transaction->secureexec;
+    transaction->personality = task->personality;
+    /* Linux clears these flags when set-ID mode is honored, even when its ID
+     * equals the current ID. An unreadable file alone is not a set-ID exec. */
+    if (!metadata.nosuid && !task->no_new_privs &&
+        ((metadata.mode & 04000U) || (metadata.mode & 02010U) == 02010U))
+        transaction->personality &= ~KERNEL_PERSONALITY_CLEAR_ON_SETID;
+    image_request.personality = transaction->personality;
     {
         struct kernel_rlimit64 stack_limit;
 
@@ -935,7 +947,7 @@ enum kernel_exec_status kernel_execveat_prepare(
                    ? KERNEL_EXEC_STATUS_CLEANUP_REQUIRED
                    : KERNEL_EXEC_STATUS_STATE;
     }
-    transaction->state = KERNEL_EXEC_TRANSACTION_PREPARED;
+    __atomic_store_n(&transaction->state,KERNEL_EXEC_TRANSACTION_PREPARED,__ATOMIC_RELEASE);
     *linux_result = 0;
     return KERNEL_EXEC_STATUS_OK;
 }

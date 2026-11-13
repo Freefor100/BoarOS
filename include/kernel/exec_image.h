@@ -31,6 +31,7 @@ struct kernel_exec_image_request {
     const struct kernel_exec_string *environment;
     size_t environment_count;
     uint32_t uid, euid, gid, egid, secureexec;
+    uint32_t personality;
 };
 
 struct kernel_exec_image {

@@ -3,6 +3,7 @@
 #include "private.h"
 #include <kernel/namespace.h>
 #include <kernel/reboot.h>
+#include <kernel/personality.h>
 
 #include <kernel/errno.h>
 #include <kernel/exec.h>
@@ -28,11 +29,84 @@ static void lookup_end(struct kernel_task **task)
 #define LINUX_CLONE_FILES UINT64_C(0x400)
 #define LINUX_CLONE_SIGHAND UINT64_C(0x800)
 #define LINUX_CLONE_CLEAR_SIGHAND UINT64_C(0x100000000)
+#define LINUX_CLONE_PTRACE UINT64_C(0x2000)
 #define LINUX_CLONE_VFORK UINT64_C(0x4000)
+#define LINUX_CLONE_UNTRACED UINT64_C(0x800000)
 #define LINUX_CLONE_NEWNS UINT64_C(0x20000)
 #define LINUX_CLONE_CHILD_CLEARTID UINT64_C(0x200000)
 #define LINUX_CLONE_CHILD_SETTID UINT64_C(0x1000000)
 #define LINUX_CLONE_KNOWN_FLAGS UINT64_C(0x3ffffffff)
+
+enum kernel_syscall_status syscall_handle_personality(
+    struct kernel_task *caller, const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    uint32_t value = (uint32_t)request->arguments[0];
+    uint32_t previous = caller->personality;
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    if (value != UINT32_MAX) {
+        if (value & ~KERNEL_PERSONALITY_SUPPORTED) {
+            decoded->value = -KERNEL_EOPNOTSUPP;
+            return KERNEL_SYSCALL_STATUS_OK;
+        }
+        caller->personality = value;
+    }
+    decoded->value = previous;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
+/* Both native rlimit ABIs use the same values and state transition. The syscall
+ * front ends retain their distinct user-copy and target-lookup ordering. */
+static enum kernel_syscall_status resource_limit_change(
+    struct kernel_task *target, uint32_t resource,
+    const struct kernel_rlimit64 *replacement, struct kernel_rlimit64 *before,
+    int64_t *result)
+{
+    *result = kernel_task_prlimit(target, resource, replacement, before,
+        kernel_credentials_capable(kernel_credentials_current(), KERNEL_CAP_SYS_RESOURCE));
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
+static enum kernel_syscall_status resource_limit_copy(
+    struct kernel_mm *mm, uint64_t address, struct kernel_rlimit64 *value,
+    int output, int64_t *result)
+{
+    size_t copied = 0;
+    enum kernel_uaccess_status access = output
+        ? kernel_copy_to_user(mm, address, value, sizeof(*value), &copied)
+        : kernel_copy_from_user(mm, value, address, sizeof(*value), &copied);
+    if (access == KERNEL_UACCESS_STATUS_FAULT ||
+        (access == KERNEL_UACCESS_STATUS_OK && copied != sizeof(*value))) {
+        *result = -KERNEL_EFAULT;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (access != KERNEL_UACCESS_STATUS_OK) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    *result = 0;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
+enum kernel_syscall_status syscall_handle_legacy_rlimit(
+    struct kernel_task *caller, const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    KERNEL_SERVICE_SCOPE(service);
+    struct kernel_mm *mm;
+    struct kernel_rlimit64 before, replacement;
+    uint32_t resource = (uint32_t)request->arguments[0];
+    int setting = request->number == 164U;
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    if (kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK)
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    enum kernel_syscall_status status;
+    if (setting) {
+        status = resource_limit_copy(mm, request->arguments[1], &replacement, 0, &decoded->value);
+        if (status || decoded->value) return status;
+    }
+    status = resource_limit_change(caller, resource, setting ? &replacement : NULL,
+                                    &before, &decoded->value);
+    if (status || decoded->value || setting) return status;
+    return resource_limit_copy(mm, request->arguments[1], &before, 1, &decoded->value);
+}
 
 enum kernel_syscall_status syscall_handle_prlimit64(
     struct kernel_task *caller,
@@ -48,22 +122,14 @@ enum kernel_syscall_status syscall_handle_prlimit64(
     uint32_t resource = (uint32_t)request->arguments[1];
     uint64_t new_address = request->arguments[2];
     uint64_t old_address = request->arguments[3];
-    size_t copied = 0U;
-    enum kernel_uaccess_status access_status;
 
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     if (kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK)
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     if (new_address != 0U) {
-        access_status = kernel_copy_from_user(mm, &replacement, new_address,
-                                              sizeof(replacement), &copied);
-        if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
-            decoded->value = -KERNEL_EFAULT;
-            return KERNEL_SYSCALL_STATUS_OK;
-        }
-        if (access_status != KERNEL_UACCESS_STATUS_OK ||
-            copied != sizeof(replacement))
-            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        enum kernel_syscall_status status = resource_limit_copy(mm, new_address,
+            &replacement, 0, &decoded->value);
+        if (status || decoded->value) return status;
     }
     target = pid == 0 ? caller :
              pid > 0 && pid <= INT32_MAX
@@ -73,58 +139,11 @@ enum kernel_syscall_status syscall_handle_prlimit64(
         decoded->value = -KERNEL_ESRCH;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    {
-        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-        const struct kernel_credentials *from=kernel_credentials_task_locked(caller),
-            *to=kernel_credentials_task_locked(target);
-        if(caller!=target && !kernel_credentials_capable(from,KERNEL_CAP_SYS_RESOURCE) &&
-            !(from->uid==to->uid && from->uid==to->euid && from->uid==to->suid &&
-              from->gid==to->gid && from->gid==to->egid && from->gid==to->sgid)) {
-            decoded->value=-KERNEL_EPERM;return KERNEL_SYSCALL_STATUS_OK;
-        }
-    }
-    if (resource >= KERNEL_RLIMIT_COUNT) {
-        decoded->value = -KERNEL_EINVAL;
-        return KERNEL_SYSCALL_STATUS_OK;
-    }
-    enum kernel_task_status task_status = kernel_task_get_rlimit(target, resource, &before);
-    if (task_status == KERNEL_TASK_STATUS_STATE) {
-        decoded->value = -KERNEL_ESRCH;
-        return KERNEL_SYSCALL_STATUS_OK;
-    }
-    if (task_status != KERNEL_TASK_STATUS_OK) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-    if (new_address != 0U) {
-        uint64_t capacity = resource == KERNEL_RLIMIT_NOFILE
-                                ? KERNEL_RLIMIT_NOFILE_CAP : KERNEL_RLIM_INFINITY;
-        if (replacement.current > replacement.maximum) {
-            decoded->value = -KERNEL_EINVAL;
-            return KERNEL_SYSCALL_STATUS_OK;
-        }
-        if (replacement.maximum > capacity ||
-            (replacement.maximum>before.maximum &&
-             !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_RESOURCE))) {
-            decoded->value = -KERNEL_EPERM;
-            return KERNEL_SYSCALL_STATUS_OK;
-        }
-        task_status = kernel_task_set_rlimit(target, resource, &replacement);
-        if (task_status == KERNEL_TASK_STATUS_STATE) {
-            decoded->value = -KERNEL_ESRCH;
-            return KERNEL_SYSCALL_STATUS_OK;
-        }
-        if (task_status != KERNEL_TASK_STATUS_OK) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-    }
-    if (old_address != 0U) {
-        copied = 0U;
-        access_status = kernel_copy_to_user(mm, old_address, &before,
-                                            sizeof(before), &copied);
-        if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
-            decoded->value = -KERNEL_EFAULT;
-            return KERNEL_SYSCALL_STATUS_OK;
-        }
-        if (access_status != KERNEL_UACCESS_STATUS_OK ||
-            copied != sizeof(before))
-            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-    }
+    enum kernel_syscall_status limit_status = resource_limit_change(target, resource,
+        new_address ? &replacement : NULL, &before, &decoded->value);
+    if (limit_status || decoded->value) return limit_status;
+    if (old_address != 0U)
+        return resource_limit_copy(mm, old_address, &before, 1, &decoded->value);
     decoded->value = 0;
     return KERNEL_SYSCALL_STATUS_OK;
 }
@@ -256,7 +275,8 @@ void syscall_decode_clone(const struct kernel_syscall_request *request,
 {
     uint64_t flags = request->arguments[0];
     const uint64_t thread_required = UINT64_C(0x100) | UINT64_C(0x800) | UINT64_C(0x10000);
-    const uint64_t thread_optional = LINUX_CLONE_FS | LINUX_CLONE_FILES | UINT64_C(0x80001000) |
+    const uint64_t thread_optional = LINUX_CLONE_PTRACE | LINUX_CLONE_UNTRACED |
+        LINUX_CLONE_FS | LINUX_CLONE_FILES | UINT64_C(0x80001000) |
         UINT64_C(0x40000) | UINT64_C(0x80000) |
         UINT64_C(0x100000) | UINT64_C(0x200000) | UINT64_C(0x400000) |
         UINT64_C(0x1000000) | KERNEL_NS_UTS | KERNEL_NS_IPC;
@@ -282,7 +302,8 @@ void syscall_decode_clone(const struct kernel_syscall_request *request,
         return;
     }
     /* A fork child owns its private child-TID store and exit clear. */
-    uint64_t process_flags = flags & ~(LINUX_CLONE_SIGNAL_MASK | LINUX_CLONE_FS | LINUX_CLONE_FILES | LINUX_CLONE_CLEAR_SIGHAND | LINUX_CLONE_NEWNS | KERNEL_NS_UTS | KERNEL_NS_IPC | UINT64_C(0x80001000) |
+    uint64_t process_flags = flags & ~(LINUX_CLONE_PTRACE | LINUX_CLONE_UNTRACED |
+        LINUX_CLONE_SIGNAL_MASK | LINUX_CLONE_FS | LINUX_CLONE_FILES | LINUX_CLONE_CLEAR_SIGHAND | LINUX_CLONE_NEWNS | KERNEL_NS_UTS | KERNEL_NS_IPC | UINT64_C(0x80001000) |
         UINT64_C(0x40000) | UINT64_C(0x80000) | UINT64_C(0x100000) |
         LINUX_CLONE_CHILD_SETTID | LINUX_CLONE_CHILD_CLEARTID);
     if (process_flags != 0 && process_flags != LINUX_CLONE_VM &&

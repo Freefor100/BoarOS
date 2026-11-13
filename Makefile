@@ -371,6 +371,7 @@ COMMON_C_SOURCES := \
 	kernel/sched/kcmp.c \
 	kernel/sched/exec.c \
 	kernel/sched/process.c \
+	kernel/sched/ptrace.c \
 	kernel/sched/proc.c \
 	kernel/sched/signal.c \
 	kernel/signal_stack.c \
@@ -386,6 +387,7 @@ COMMON_C_SOURCES := \
 	kernel/syscall/mount.c \
 	kernel/syscall/memory.c \
 	kernel/syscall/process.c \
+	kernel/syscall/process_vm.c \
 	kernel/syscall/signal.c \
 	kernel/syscall/socket.c \
 	kernel/syscall/socket_control.c \
@@ -433,6 +435,7 @@ RV_C_SOURCES := \
 	arch/riscv/elf_image.c \
 	arch/riscv/exec.c \
 	arch/riscv/process.c \
+	arch/riscv/ptrace.c \
 	arch/riscv/mm.c \
 	arch/riscv/root_boot.c \
 	arch/riscv/sbi.c \
@@ -2062,11 +2065,11 @@ test-proc-index-host:
 	@mkdir -p build/host
 	@set -e; for shift in 12 14; do \
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -DBOAROS_LOCK_DEBUG=1 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/sync -idirafter include tests/host/proc_index.c kernel/credentials.c kernel/sched/identity.c kernel/pid.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c -Wl,--gc-sections -o build/host/proc-index-$$shift; \
-	build/host/proc-index-$$shift; build/host/proc-index-$$shift snapshot; done
+	build/host/proc-index-$$shift; build/host/proc-index-$$shift snapshot; build/host/proc-index-$$shift remote-mm; done
 
 test-sched-concurrency-host:
 	@mkdir -p build/host
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sched_concurrency.c tests/host/signal_owner.c kernel/signal_pending.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/sched/process.c kernel/pid.c kernel/sched/futex_pi.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_sched_policy_charge,--wrap=kernel_sched_policy_set,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release -o build/host/sched-concurrency
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sched_concurrency.c tests/host/signal_owner.c kernel/signal_pending.c kernel/reboot.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/sched/lifetime.c kernel/sched/ptrace.c kernel/sched/identity.c kernel/sched/process.c kernel/pid.c kernel/sched/futex_pi.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_sched_policy_charge,--wrap=kernel_sched_policy_set,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release -o build/host/sched-concurrency
 	build/host/sched-concurrency
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/process_child_links.c kernel/cpu.c kernel/raw_lock.c -Wl,--gc-sections -o build/host/process-child-links
 	build/host/process-child-links

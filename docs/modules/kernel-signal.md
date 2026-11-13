@@ -63,13 +63,13 @@ handler与sigtimedwait取得同一规范记录，用户输出在消费之后发�
 
 ## SMP上的状态和执行位置
 
-RV USER_SMP中的普通信号在实际执行线程所在CPU递送。pending及其来源、共享disposition、blocked和SA_RESETHAND的修改由调度raw保护：选择信号时一次取走pending、复制完整action、记录恢复mask、设置handler期间的屏蔽位，并重置一次性动作。锁外只使用线程栈上的delivery快照。后续rt_sigaction替换同一项时，本次递送继续使用已选版本；替换的新动作也保留。rt_sigaction的旧动作和新动作在同一提交点交换，fork复制与exec重置同样使用该保护。
+RV USER_SMP中的普通信号在实际执行线程所在CPU递送。pending及其来源、共享disposition、blocked和SA_RESETHAND的修改由调度raw保护。未被跟踪的线程在同一保护内取走pending、复制完整action、记录恢复mask、设置handler期间的屏蔽位并重置一次性动作；锁外只使用线程栈上的delivery快照，后续rt_sigaction替换保留新动作。被跟踪的线程先取走pending并完成原生定时器记录，再在锁外进入信号递送停点；tracer可抑制、替换信号或修改完整siginfo。恢复后重新读取最终信号的action，仅实际递送的handler提交mask和SA_RESETHAND；重新被屏蔽的信号带完整载荷放回原线程或组队列。已忽略的信号仍可被tracer观察，SIGKILL绕过递送停点。rt_sigaction的旧动作和新动作在同一提交点交换，fork复制与exec重置同样使用该保护。
 
 构造信号帧、用户复制、寄存器/FPU恢复由当前线程执行。任务执行所有权持有本线程存储、MM及disposition表引用；uaccess借用实际物理页，缺页和等待沿共同MM路径处理。调度raw不跨用户复制、缺页或等待。sigreturn完整导入并检查用户上下文后，在短锁内恢复mask，再更新本线程寄存器和FPU。
 
 既有返回通知字区分“CPU0业务”和“本地信号”两种工作。发布者在保护下置相应位，需要时通知远端CPU；共同返回准备读取一次通知字，已有本地信号时才消费本批通知并要求信号选择，普通返回复用原检查。消费期间的新发布留在下一轮，两种消费者只清除各自的位。mask解除屏蔽时重新检查旧pending，覆盖sigprocmask、sigreturn、sigsuspend和临时等待mask；一批信号中仍有可交付项时保留后续检查。新增屏蔽位若挡住仍pending的组信号，锁外复用组游标通知并唤醒另一合适成员；发布时也重查候选，退出者在proc_exiting提交后、组拆除前转交未消费的组信号。sigtimedwait的接收集合在同一raw内发布，结束等待时也转交因退出集合而被本线程屏蔽的组pending。SIGCONT恢复READY成员时重新发布已有可递送信号的通知。游标持有真实task存储，短锁不跨等待唤醒，单成员路径无需遍历。普通周期CPU定时器的handler和sigreturn沿该本地路径运行。
 
-组停止/退出仍进入进程生命周期的CPU0范围。默认停止动作先迁移、再重新选择和消费pending，途中SIGCONT清除的停止请求会被丢弃；REAL定时器消费后的重装仍进入CPU0的墙钟期限索引。临时mask尚需等待真正handler时沿原等待路径阻塞，相应操作在短锁外取得执行资格。新增屏蔽位转交与停止取消的Linux依据为固定`references/linux/kernel/signal.c`中的`retarget_shared_pending`、`__set_task_blocked`和`get_signal`。调度交接见[RV两核](riscv-smp.md#真实用户态与cpu0业务交接)，CPU定时器统计见[时间模块](kernel-time.md#进程-cpu-间隔定时器)。
+组停止/退出仍进入进程生命周期的CPU0范围。被跟踪成员的组停请求由其执行者处理，不受该成员的信号mask或action影响；实际跟踪等待与普通STOPPED状态分别维护。SIGCONT清除尚未执行的组停请求，并通知LISTEN中的tracer；在信号递送停点期间收到的SIGCONT取消随后重注入的停止动作。tracer的SIGCHLD携带实际CLD_TRAPPED或CLD_STOPPED原因，信号状态不混入ptrace事件编号，最终退出沿CLD_EXITED/KILLED/DUMPED编码。默认停止动作先迁移、再重新选择和消费pending，途中SIGCONT清除的停止请求会被丢弃；REAL定时器消费后的重装仍进入CPU0的墙钟期限索引。临时mask尚需等待真正handler时沿原等待路径阻塞，相应操作在短锁外取得执行资格。新增屏蔽位转交与停止取消的Linux依据为固定`references/linux/kernel/signal.c`中的`retarget_shared_pending`、`__set_task_blocked`和`get_signal`。调度交接见[RV两核](riscv-smp.md#真实用户态与cpu0业务交接)，CPU定时器统计见[时间模块](kernel-time.md#进程-cpu-间隔定时器)。
 
 ## 输入、信号帧与恢复
 
@@ -118,6 +118,8 @@ RV 构帧复用 prefix/mcontext 存储，不在内核栈放置整份1088字节fr
 
 `make test-signal-wait-abi-riscv test-signal-wait-abi-loongarch`提供等待的聚焦差分：包含空等待集合和SA_RESTART，子进程通过真实`/proc/<pid>/stat`睡眠状态握手后发信号，直接检查syscall返回，区分libc自身的EINTR重试。
 
+`tests/workloads/resource/ptrace_signal.c` 检查抑制时保留一次性动作和mask、被屏蔽替换信号的完整siginfo重排队、忽略动作的可观察性、SIGCONT取消停止，以及初始SEIZE停点、信号递送停点和退出的真实SIGCHLD原因。`tests/host/signal_owner.c` 在实际选择路径模拟tracer恢复决定，检查恢复后action重读、完整载荷、定时器完成时机和队列资源归还。
+
 `test-sched-concurrency-host`在真实选择解锁后让另一宿主线程替换action，检查旧delivery快照、mask、SA_RESETHAND及新动作均保持正确；旧实现会读到后来的handler。`test-user-smp-host`检查两类通知分别消费及晚发布、handler新增屏蔽位、接收者退出和结束sigtimedwait后转交组信号、真实COMMITTED等待者被唤醒及消费，以及CPU0换栈窗口中的SIGCONT取消STOP、恢复成员重新取得信号通知。`test-user-smp-riscv`的静态/动态musl案例另覆盖屏蔽后已pending的信号经sigsuspend解除屏蔽、嵌套handler和sigreturn恢复原mask，运行真实1/2CPU及双RAM。
 
 `make test-diff-abi-riscv` 以同一 RISC-V ELF 对照等待信号的参数、真实超时、线程/进程定向来源、阻塞送达、siginfo EFAULT 消费和其他 handler 打断；`tests/diff-abi/signals.c` 还对照 SIGCHLD 的停止/继续、退出/信号终止、首个事件合并、SA_NOCLDSTOP、SA_NOCLDWAIT、显式忽略及 SA_SIGINFO handler；`make test-userland-riscv` 以真实静态 musl 验证 handler/sigreturn、libc ucontext、sigsuspend、睡眠 EINTR、vfork、SIGCHLD 回收及 pipe 等待。架构和调度边界由 `make test-riscv` 回归。
@@ -144,7 +146,7 @@ U-mode 未映射/权限页故障分别记录 SIGSEGV/SEGV_MAPERR、SEGV_ACCERR�
 
 线程有一个独立同步故障记录，经统一用户返回路径优先选取；交付 handler 时保留故障 PC，可由 handler 修复映射后重试，或修改 ucontext 跳过指令。被阻塞或忽略的致命同步信号改为默认动作并解除阻塞；默认动作终止全组。坏 signal frame 同样终止全组。fork/exec 清除故障记录；syscall 用户复制仍返回 EFAULT，内核自身 trap 仍 fatal。
 
-`tests/userland/fault_signals.h` 验证 SEGV/BUS/ILL/TRAP siginfo、修复/上下文返回、默认组退出、阻塞/忽略和坏 frame；`tests/diff-abi/signals.c` 的 5 条真实故障对照固定 Linux，累计 1091 条差分一致。ptrace及后续信号接口仍列在能力目录；RV真实两核的递送与恢复使用上面的共同协议。
+`tests/userland/fault_signals.h` 验证 SEGV/BUS/ILL/TRAP siginfo、修复/上下文返回、默认组退出、阻塞/忽略和坏 frame；`tests/diff-abi/signals.c` 的 5 条真实故障对照固定 Linux，累计 1091 条差分一致。[ptrace](kernel-ptrace.md)在动作提交前提供信号递送停止；RV真实两核的递送与恢复使用上面的共同协议。
 
 TTY 的前台终端信号使用稳定 PGID 发向整个进程组；背景 TTIN/TTOU 和会话 HUP/CONT
 的 owner、忽略/阻塞/orphan 条件及生命周期见 [Serial TTY](kernel-tty.md)。终端 read/write

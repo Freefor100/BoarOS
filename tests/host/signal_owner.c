@@ -10,10 +10,15 @@
 #define stopped_append_locked signal_owner_unexpected_stop
 #define physical_page_allocate signal_owner_unexpected_allocate
 #define physical_page_resolve signal_owner_unexpected_resolve
+#define kernel_ptrace_signal signal_owner_trace_signal
+#define kernel_ptrace_tracer_tid_locked signal_owner_trace_tid
 #ifndef SIGNAL_SOURCE
 #define SIGNAL_SOURCE "../../kernel/sched/signal.c"
 #endif
+#include <kernel/ptrace.h>
 #include SIGNAL_SOURCE
+#undef kernel_ptrace_signal
+#undef kernel_ptrace_tracer_tid_locked
 #undef process_group_request_exit
 #undef kernel_user_thread_exit
 #undef process_group_is_orphaned
@@ -42,14 +47,73 @@ enum physical_page_status signal_owner_unexpected_resolve(const struct physical_
 #include <stdio.h>
 
 extern void signal_owner_bind_cpu(struct kernel_cpu *);
+static struct kernel_heap queue_heap;
+static unsigned queue_allocations;
+static struct kernel_task *trace_target;
+static struct kernel_signal_table *trace_table;
+static unsigned trace_calls,trace_mode;
+static struct kernel_signal_wait_info trace_expected;
+uint32_t signal_owner_trace_tid(const struct kernel_task *task)
+{ return task == trace_target ? 7 : 0; }
+uint32_t signal_owner_trace_signal(struct kernel_task *task,struct kernel_signal_wait_info *info)
+{
+    assert(task==trace_target && !kernel_cpu_current()->raw_locks);
+    trace_calls++;
+    if(trace_mode==3) {
+        assert(!memcmp(info,&trace_expected,sizeof(*info)));
+        return info->signal;
+    }
+    assert(info->signal==10 && !task->signal_blocked);
+    if(trace_mode==4) { assert(trace_table->actions[9].handler==KERNEL_SIGNAL_IGN);return 0; }
+    assert(trace_table->actions[9].handler==0x5000);
+    if(trace_mode==1) {
+        trace_table->actions[9]=(struct kernel_signal_action){.handler=0x6000,.flags=LINUX_SA_NODEFER,.mask=signal_mask(14)};
+        return info->signal;
+    }
+    if(trace_mode==2) {
+        trace_expected=(struct kernel_signal_wait_info){.signal=12,.code=-1,.sender=37,.uid=42,.value=UINT64_C(0x1234567887654321)};
+        *info=trace_expected;task->signal_blocked=signal_mask(12);return 12;
+    }
+    return 0;
+}
+static void traced_action_suppression(struct kernel_task *task,struct kernel_signal_table *table)
+{
+    task->signal_blocked=0;task->signal_pending=signal_mask(10);
+    table->actions[9]=(struct kernel_signal_action){.handler=0x5000,.flags=LINUX_SA_RESETHAND,.mask=signal_mask(12)};
+    trace_target=task;trace_table=table;trace_calls=trace_mode=0;
+    struct kernel_signal_delivery delivery={0};
+    assert(kernel_signal_select(task,&delivery)==KERNEL_SIGNAL_SELECT_NONE);
+    assert(trace_calls==1 && table->actions[9].handler==0x5000 && !task->signal_blocked);
+    task->signal_pending=signal_mask(10);trace_mode=1;
+    assert(kernel_signal_select(task,&delivery)==KERNEL_SIGNAL_SELECT_HANDLER);
+    assert(delivery.handler==0x6000 && delivery.flags==LINUX_SA_NODEFER &&
+        task->signal_blocked==signal_mask(14) && table->actions[9].handler==0x6000);
+    task->signal_blocked=0;task->signal_pending=signal_mask(10);trace_mode=4;
+    table->actions[9].handler=KERNEL_SIGNAL_IGN;
+    assert(!signal_ignored_unblocked(task,10));
+    assert(kernel_signal_select(task,&delivery)==KERNEL_SIGNAL_SELECT_NONE && trace_calls==3);
+    task->signal_pending=signal_mask(10);trace_mode=2;
+    table->actions[9]=(struct kernel_signal_action){.handler=0x5000,.flags=LINUX_SA_RESETHAND,.mask=signal_mask(12)};
+    table->actions[11]=(struct kernel_signal_action){.handler=0x7000,.flags=LINUX_SA_SIGINFO};
+    task->limits->values[KERNEL_RLIMIT_SIGPENDING].current=64;task->files.heap=&queue_heap;
+    assert(kernel_signal_select(task,&delivery)==KERNEL_SIGNAL_SELECT_NONE);
+    assert(task->signal_pending==signal_mask(12) && table->actions[9].handler==0x5000);
+    task->signal_blocked=0;trace_mode=3;
+    assert(kernel_signal_select(task,&delivery)==KERNEL_SIGNAL_SELECT_HANDLER && trace_calls==5);
+    assert(delivery.handler==0x7000 && !memcmp(&delivery.info,&trace_expected,sizeof(trace_expected)));
+    trace_target=0;
+    unsigned members=task->group_members;task->group_members=1;
+    kernel_signal_pending_cleanup(task);task->group_members=members;task->files.heap=0;
+    assert(!queue_allocations);
+    puts("traced selector: suppression/RESETHAND/masks, resumed action, ignored signals, blocked full-siginfo requeue passed");
+}
 static unsigned action_phase;
 static _Thread_local unsigned pause_selection;
 static struct kernel_task *action_target;
 static struct kernel_cpu action_cpu;
 static struct signal_queue_record native_record;
 static struct kernel_signal_wait_info *native_output;
-static unsigned native_stale, native_completions, queue_allocations;
-static struct kernel_heap queue_heap;
+static unsigned native_stale, native_completions;
 
 /* Exercise the selector's output lifetime. Timer reservation/generation and
  * object ownership use the real implementation in test-posix-timer-host. */
@@ -163,6 +227,7 @@ void signal_owner_cases(unsigned *lock_calls)
     leader.group_next = leader.group_previous = &member;
     member.group_next = member.group_previous = &leader;
     struct kernel_signal_table table = {.magic=KERNEL_SIGNAL_TABLE_MAGIC,.references=1};
+    kernel_wait_queue_init(&table.signalfd_waiters);
     leader.signal_table_address=(uintptr_t)&table;
     leader.signal_blocked = signal_mask(17);
     assert(signal_wants_sigchld_stop(&leader));
@@ -205,6 +270,7 @@ void signal_owner_cases(unsigned *lock_calls)
     info=(struct kernel_signal_wait_info){.signal=11,.address=UINT64_C(0x123456789)};kernel_signal_encode_info(encoded,&info);
     uint64_t address;memcpy(&address,encoded+16,8);assert(address==UINT64_C(0x123456789));
     assert(!kernel_signal_wait_take(&leader,&info) && !info.signal);
+    traced_action_suppression(&leader,&table);
     selected_action_snapshot(&leader,&table);
     selected_payloads(&leader,&table);
     kernel_cpu_current()->current=previous;
@@ -231,12 +297,12 @@ void signal_owner_cases(unsigned *lock_calls)
     puts("signal target selector: direct leader, dead leader fallback and unique borrow passed");
 }
 
-/* Only selected_payloads installs a native queue index. */
+/* Pending reinjection and native timer cases retain real queue ownership. */
 enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t n,size_t size,void **out)
-{ assert(h==&queue_heap && !queue_allocations && !kernel_cpu_current()->raw_locks);
+{ assert(h==&queue_heap && !kernel_cpu_current()->raw_locks);
   *out=calloc(n,size);assert(*out);queue_allocations++;return KERNEL_HEAP_STATUS_OK; }
 void kernel_heap_release(struct kernel_heap *h,void *p)
-{ assert(h==&queue_heap && queue_allocations==1 && p && !kernel_cpu_current()->raw_locks);
+{ assert(h==&queue_heap && queue_allocations && p && !kernel_cpu_current()->raw_locks);
   free(p);queue_allocations--; }
 
 enum kernel_heap_status kernel_heap_allocate_zeroed_nosleep(struct kernel_heap *heap,size_t count,size_t size,void **out)

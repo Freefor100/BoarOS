@@ -7,6 +7,7 @@
 #include <kernel/mm.h>
 #include <kernel/page.h>
 #include <kernel/random.h>
+#include <kernel/personality.h>
 #include <kernel/rlimit.h>
 #include <kernel/vma.h>
 #include <kernel/vdso.h>
@@ -101,7 +102,7 @@ static int align_up_page(uint64_t value, uint64_t *result)
     return 1;
 }
 
-static int random_pages(uint32_t bits, uint64_t *value)
+static int random_pages(uint32_t bits, int randomize, uint64_t *value)
 {
     uint64_t random_value;
 
@@ -109,7 +110,7 @@ static int random_pages(uint32_t bits, uint64_t *value)
         return 0;
     }
     *value = 0U;
-    if (!kernel_random_available()) {
+    if (!randomize || !kernel_random_available()) {
         return 1;
     }
     if (kernel_random_fill(&random_value, sizeof(random_value)) !=
@@ -268,6 +269,7 @@ static int source_highest_end(const struct kernel_elf64_source *source,
 
 static int choose_pie_bias(const struct kernel_elf64_source *source,
                            uint64_t mmap_base,
+                           int randomize,
                            uint64_t *bias)
 {
     uint64_t minimum;
@@ -283,7 +285,7 @@ static int choose_pie_bias(const struct kernel_elf64_source *source,
 
     if (!source_bounds(source, &minimum, &maximum, &alignment) ||
         maximum < minimum || mmap_base < maximum ||
-        !random_pages(KERNEL_ELF_LAYOUT_RANDOM_BITS, &random_value)) {
+        !random_pages(KERNEL_ELF_LAYOUT_RANDOM_BITS, randomize, &random_value)) {
         return 0;
     }
     target = (ARCH_MMU_USER_LIMIT / 3U) * 2U;
@@ -316,6 +318,7 @@ static int choose_pie_bias(const struct kernel_elf64_source *source,
 static int choose_interpreter_bias(const struct kernel_elf64_source *source,
                                    uint64_t upper,
                                    uint64_t lower,
+                                   int randomize,
                                    uint64_t *bias)
 {
     uint64_t minimum;
@@ -331,7 +334,7 @@ static int choose_interpreter_bias(const struct kernel_elf64_source *source,
     if (!source_bounds(source, &minimum, &maximum, &alignment) ||
         maximum < minimum || upper <= lower ||
         maximum > upper ||
-        !random_pages(KERNEL_ELF_LAYOUT_RANDOM_BITS, &random_value)) {
+        !random_pages(KERNEL_ELF_LAYOUT_RANDOM_BITS, randomize, &random_value)) {
         return 0;
     }
     if (lower <= minimum) {
@@ -703,7 +706,7 @@ static uint64_t vdso_slots(uint64_t start, uint64_t end)
 }
 
 static int choose_vdso(const struct kernel_elf_layout *layout,
-                       uint64_t *address)
+                       int randomize, uint64_t *address)
 {
     uint64_t starts[2];
     uint64_t ends[2];
@@ -716,7 +719,7 @@ static int choose_vdso(const struct kernel_elf_layout *layout,
     uint64_t upper = layout->mmap_base;
 
     if (upper <= lower + BOAROS_PAGE_SIZE || address == 0 ||
-        !random_pages(KERNEL_ELF_LAYOUT_RANDOM_BITS, &random_value)) {
+        !random_pages(KERNEL_ELF_LAYOUT_RANDOM_BITS, randomize, &random_value)) {
         return 0;
     }
 
@@ -832,6 +835,7 @@ enum kernel_elf_image_status kernel_elf_image_build(
         kernel_table->state != ARCH_MMU_STATE_ACTIVE) {
         return KERNEL_ELF_IMAGE_STATUS_INVALID_ARGUMENT;
     }
+    int randomize = !(request->personality & KERNEL_PERSONALITY_ADDR_NO_RANDOMIZE);
     stack_request = request->stack_limit_valid != 0U
                       ? request->stack_limit : KERNEL_RLIMIT_STACK_DEFAULT;
     /* Initial stack pages and the fault-time limit are page-granular. */
@@ -889,7 +893,7 @@ enum kernel_elf_image_status kernel_elf_image_build(
          interpreter_minimum < BOAROS_PAGE_SIZE)) {
         return KERNEL_ELF_IMAGE_STATUS_MALFORMED;
     }
-    if (!random_pages(KERNEL_ELF_STACK_RANDOM_BITS, &random_value)) {
+    if (!random_pages(KERNEL_ELF_STACK_RANDOM_BITS, randomize, &random_value)) {
         return KERNEL_ELF_IMAGE_STATUS_ADDRESS_SPACE;
     }
     base.stack_top = ARCH_MMU_USER_LIMIT -
@@ -914,7 +918,7 @@ enum kernel_elf_image_status kernel_elf_image_build(
     if (base.stack_top <= BOAROS_PAGE_SIZE + mmap_gap) {
         return KERNEL_ELF_IMAGE_STATUS_ADDRESS_SPACE;
     }
-    if (!random_pages(KERNEL_ELF_LAYOUT_RANDOM_BITS, &random_value) ||
+    if (!random_pages(KERNEL_ELF_LAYOUT_RANDOM_BITS, randomize, &random_value) ||
         random_value > (base.stack_top - mmap_gap - BOAROS_PAGE_SIZE) /
                            BOAROS_PAGE_SIZE) {
         random_value = 0U;
@@ -937,7 +941,7 @@ enum kernel_elf_image_status kernel_elf_image_build(
         base.main_bias = 0U;
     } else if (!choose_pie_bias(request->executable_source,
                                 image_ceiling,
-                                &base.main_bias)) {
+                                randomize, &base.main_bias)) {
         return KERNEL_ELF_IMAGE_STATUS_ADDRESS_SPACE;
     }
     if (base.main_bias > UINT64_MAX - main_minimum ||
@@ -956,7 +960,7 @@ enum kernel_elf_image_status kernel_elf_image_build(
         } else if (!choose_interpreter_bias(request->interpreter_source,
                                             base.mmap_base,
                                             base.main_end + BOAROS_PAGE_SIZE,
-                                            &base.interpreter_bias)) {
+                                            randomize, &base.interpreter_bias)) {
             return KERNEL_ELF_IMAGE_STATUS_ADDRESS_SPACE;
         }
         if (base.interpreter_bias > UINT64_MAX - interpreter_minimum ||
@@ -1004,7 +1008,7 @@ enum kernel_elf_image_status kernel_elf_image_build(
         base.brk_limit = base.interpreter_start;
     if (base.main_end >= base.brk_limit)
         return KERNEL_ELF_IMAGE_STATUS_ADDRESS_SPACE;
-    if (!random_pages(18U, &random_value)) {
+    if (!random_pages(18U, randomize, &random_value)) {
         return KERNEL_ELF_IMAGE_STATUS_ADDRESS_SPACE;
     }
     random_value %= (base.brk_limit - base.main_end - 1U) /
@@ -1025,7 +1029,7 @@ enum kernel_elf_image_status kernel_elf_image_build(
         base.mmap_base <= base.brk_start) {
         return KERNEL_ELF_IMAGE_STATUS_ADDRESS_SPACE;
     }
-    if (!choose_vdso(&base, &base.vdso)) {
+    if (!choose_vdso(&base, randomize, &base.vdso)) {
         return KERNEL_ELF_IMAGE_STATUS_ADDRESS_SPACE;
     }
     /* Keep the heap below the independently selected VDSO when necessary. */

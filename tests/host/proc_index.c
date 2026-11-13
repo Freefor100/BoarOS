@@ -26,8 +26,22 @@ static struct kernel_signal_table actions;
 void *sync_test_cpu(void) { return active; }
 void *sync_test_current_task(void) { return active->current; }
 struct kernel_task *kernel_task_current(void) { return active->current; }
+uint32_t kernel_ptrace_tracer_tid_locked(const struct kernel_task *task)
+{
+    assert(active->raw_locks && active->raw_locks->lock==&kernel_wait_domain && !task->ptrace);
+    return 0;
+}
 void scheduler_task_get_locked(struct kernel_task *task)
 { assert(active->raw_locks && task->accounted); task->storage_borrows++; }
+struct kernel_task *scheduler_task_lookup(kernel_pid_t tid,enum kernel_pid_role role,uint64_t generation)
+{
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    struct kernel_task *task=process_find_identity(tid,role);
+    struct kernel_pid *id=process_identity(task,role);
+    if(!task || !id || (generation&&id->generation!=generation) ||
+       !task->accounted || task->retirement)return 0;
+    scheduler_task_get_locked(task);return task;
+}
 void scheduler_task_put(struct kernel_task *task)
 {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
@@ -454,11 +468,43 @@ static void memory_owner_case(void)
     puts("PASS proc VmSize/VmRSS use captured MM owner across target MM replacement");
 }
 
+extern int kernel_task_remote_mm_acquire(int32_t,struct kernel_mm *) __attribute__((weak));
+static void remote_memory_owner_case(void)
+{
+    assert(kernel_task_remote_mm_acquire);
+    setup();active->current=&tasks[0];
+    struct kernel_credentials from=*kernel_credentials_initial(),to=from;
+    from.uid=from.euid=from.suid=to.uid=to.euid=to.suid=1000;
+    from.gid=from.egid=from.sgid=to.gid=to.egid=to.sgid=1000;
+    from.fsuid=from.fsgid=2000;to.fsuid=to.fsgid=1000;
+    from.effective=from.permitted=to.effective=to.permitted=0;
+    tasks[0].credentials=&from;tasks[1].credentials=&to;
+    tasks[1].mm=(struct kernel_mm){.record=(void *)(uintptr_t)1,.state=KERNEL_MM_LIVE};
+    struct kernel_mm owner={0};
+    assert(!kernel_task_remote_mm_acquire(2,&owner)&&maps_mm_refs==1);
+    tasks[1].mm.record=(void *)(uintptr_t)2;
+    assert(owner.record==(void *)(uintptr_t)1&&!kernel_mm_release(&owner));
+    owner=(struct kernel_mm){0};tasks[1].mm.record=(void *)(uintptr_t)1;
+    kernel_exec_security_set_dumpable(tasks[1].exec_security,0);
+    assert(kernel_task_remote_mm_acquire(2,&owner)==-KERNEL_EPERM&&!owner.record&&!maps_mm_refs);
+    from.effective=from.permitted=UINT64_C(1)<<KERNEL_CAP_SYS_PTRACE;
+    assert(!kernel_task_remote_mm_acquire(2,&owner)&&!kernel_mm_release(&owner));
+    owner=(struct kernel_mm){0};tasks[1].proc_exiting=1;
+    assert(kernel_task_remote_mm_acquire(2,&owner)==-KERNEL_ESRCH&&!owner.record);
+    tasks[1].proc_exiting=0;tasks[1].mm.state=KERNEL_MM_RELEASED;
+    assert(kernel_task_remote_mm_acquire(2,&owner)==-KERNEL_ESRCH&&!owner.record);
+    assert(kernel_task_remote_mm_acquire(0,&owner)==-KERNEL_ESRCH);
+    tasks[0].credentials=tasks[1].credentials=kernel_credentials_initial();
+    borrows_returned();active->current=0;
+    puts("PASS remote memory REALCREDS, dumpable, capability, captured old MM and returned task owners");
+}
+
 int main(int argc, char **argv)
 {
     active = &cpus[0]; kernel_cpu_initialize(active, 0, 0); kernel_cpu_initialize(&cpus[1], 1, 0);
     kernel_raw_lock_init(&kernel_wait_domain, KERNEL_RAW_RANK_SCHEDULER);
-    if (argc > 1 && !strcmp(argv[1], "snapshot")) snapshot_case();
+    if (argc > 1 && !strcmp(argv[1], "remote-mm")) remote_memory_owner_case();
+    else if (argc > 1 && !strcmp(argv[1], "snapshot")) snapshot_case();
     else {lookup_cases();access_case();maps_access_cases();memory_owner_case();thread_resources_case();namespace_handles_case();}
     for(unsigned i=0;i<6;i++)kernel_exec_security_put(tasks[i].exec_security);
     return 0;

@@ -9,6 +9,9 @@ struct kernel_task;
 int kernel_task_affinity_get(struct kernel_task *, int32_t, uint64_t *);
 int kernel_task_affinity_set(struct kernel_task *, int32_t, uint64_t);
 struct kernel_mm;
+/* Own the target's current MM after coherent REALCREDS/exec access checks.
+ * The returned owner remains valid if the target later exits or execs. */
+int kernel_task_remote_mm_acquire(int32_t tid,struct kernel_mm *owner);
 struct kernel_files;
 struct kernel_fs_context;
 struct kernel_fs_context_record;
@@ -89,9 +92,8 @@ enum kernel_task_status kernel_task_tgid(
 enum kernel_task_status kernel_task_get_rlimit(
     const struct kernel_task *task, uint32_t resource,
     struct kernel_rlimit64 *limit);
-enum kernel_task_status kernel_task_set_rlimit(
-    struct kernel_task *task, uint32_t resource,
-    const struct kernel_rlimit64 *limit);
+int kernel_task_prlimit(struct kernel_task *,uint32_t,
+    const struct kernel_rlimit64 *replacement,struct kernel_rlimit64 *before,int can_raise);
 
 /* Current user task's stack soft limit; default capacity for kernel setup. */
 uint64_t kernel_task_current_stack_limit(void);
