@@ -993,7 +993,6 @@ enum kernel_scheduler_status arch_process_clone_current(
         kernel_sched_policy_fork(&child->scheduling,&inherited);
     }
     child->proc_start_ticks = kernel_tick_count();
-    memcpy(child->comm, parent->comm, sizeof(child->comm));
     child->group_leader = child;
     child->group_members = 1U;
     child->fork_no_exec = 1U;
@@ -1081,6 +1080,7 @@ enum kernel_scheduler_status arch_process_clone_current(
         rejected = kernel_reboot_requested_locked() || parent->retirement || parent->terminate_requested ||
                    leader->group_exiting || leader->group_execing;
         if (!rejected) {
+            memcpy(child->comm, parent->comm, sizeof(child->comm));
             if(pidfd.files) kernel_pidfd_install_clone_locked(&pidfd);
             if (thread_clone) {
                 child->group_leader = leader;

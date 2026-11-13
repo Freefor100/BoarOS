@@ -4,6 +4,7 @@
 #include <kernel/namespace.h>
 #include <kernel/reboot.h>
 #include <kernel/personality.h>
+#include <kernel/proc_task.h>
 
 #include <kernel/errno.h>
 #include <kernel/exec.h>
@@ -36,6 +37,36 @@ static void lookup_end(struct kernel_task **task)
 #define LINUX_CLONE_CHILD_CLEARTID UINT64_C(0x200000)
 #define LINUX_CLONE_CHILD_SETTID UINT64_C(0x1000000)
 #define LINUX_CLONE_KNOWN_FLAGS UINT64_C(0x3ffffffff)
+
+enum kernel_syscall_status syscall_handle_prctl(
+    struct kernel_task *caller, const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    uint32_t option = (uint32_t)request->arguments[0];
+    if (option != 15U && option != 16U)
+        return syscall_handle_prctl_credentials(caller, request, decoded);
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = 0;
+    struct kernel_mm *mm;
+    if (kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK)
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    uint64_t address = request->arguments[1];
+    size_t copied = 0;
+    char name[16] = {0};
+    if (option == 15U) {
+        enum kernel_uaccess_status status = kernel_copy_string_from_user(
+            mm, name, address, sizeof(name) - 1U, &copied);
+        if (status != KERNEL_UACCESS_STATUS_OK && status != KERNEL_UACCESS_STATUS_TOO_LONG) {
+            if (status != KERNEL_UACCESS_STATUS_FAULT) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+            decoded->value = -KERNEL_EFAULT;
+        } else kernel_task_comm_set(caller, name);
+    } else {
+        kernel_task_comm_get(caller, name);
+        if (kernel_copy_to_user(mm, address, name, sizeof(name), &copied) !=
+            KERNEL_UACCESS_STATUS_OK || copied != sizeof(name)) decoded->value = -KERNEL_EFAULT;
+    }
+    return KERNEL_SYSCALL_STATUS_OK;
+}
 
 enum kernel_syscall_status syscall_handle_personality(
     struct kernel_task *caller, const struct kernel_syscall_request *request,

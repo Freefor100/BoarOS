@@ -83,7 +83,7 @@ struct kernel_vfs_node {
     uint8_t closed;
     uint8_t unlinked;
     uint8_t retired;
-    uint8_t generated_control;
+    uint8_t generated_control, control_write_prefix;
 #if BOAROS_COST_DIAGNOSTICS
     uint8_t generated_diagnostic;
 #endif

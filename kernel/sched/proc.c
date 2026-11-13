@@ -69,13 +69,51 @@ static int proc_access_check(struct proc_access *access)
     int access_error=proc_access_begin(task,&access); \
     if(access_error)return access_error
 
+static void comm_assign(struct kernel_task *task, const char name[16])
+{
+    size_t length = 0;
+    while (length < sizeof(task->comm) - 1U && name[length]) length++;
+    memcpy(task->comm, name, length);
+    memset(task->comm + length, 0, sizeof(task->comm) - length);
+}
+
+void kernel_task_comm_get(struct kernel_task *task, char name[16])
+{
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    memcpy(name, task->comm, sizeof(task->comm));
+}
+
+void kernel_task_comm_set(struct kernel_task *task, const char name[16])
+{
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    comm_assign(task, name);
+}
+
+int kernel_proc_comm(kernel_pid_t pid, uint64_t identity, int thread,
+                     char name[16], int writing)
+{
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    enum kernel_pid_role role = thread ? KERNEL_PID_TID : KERNEL_PID_TGID;
+    struct kernel_task *task = process_find_identity(pid, role);
+    struct kernel_pid *id = task ? process_identity(task, role) : 0;
+    if (!id || id->generation != identity || !task->accounted || task->retirement)
+        return -KERNEL_ESRCH;
+    if (writing) {
+        struct kernel_task *caller = kernel_task_current();
+        if (!caller || caller->group_leader != task->group_leader) return -KERNEL_EINVAL;
+        comm_assign(task, name);
+    } else memcpy(name, task->comm, sizeof(task->comm));
+    return 0;
+}
+
 void kernel_proc_task_update_comm(struct kernel_task *task)
 {
     struct kernel_vfs_path *path = 0;
-    if (kernel_mm_executable_path_acquire(&task->mm, &path) !=
-        KERNEL_MM_STATUS_OK) return;
-    if (kernel_vfs_path_copy_name(path, task->comm, sizeof(task->comm))) __builtin_trap();
+    if (kernel_mm_executable_path_acquire(&task->mm, &path) != KERNEL_MM_STATUS_OK) return;
+    char name[16] = {0};
+    if (kernel_vfs_path_copy_name(path, name, sizeof(name))) __builtin_trap();
     if (kernel_vfs_path_release(&path)) __builtin_trap();
+    kernel_task_comm_set(task, name);
 }
 
 static int proc_visible(const struct kernel_task *task)

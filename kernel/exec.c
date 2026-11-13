@@ -767,6 +767,15 @@ enum kernel_exec_status kernel_execveat_prepare(
     if (capture_status == EXEC_CAPTURE_LINUX_ERROR)
         return finish_prepare_failure(task, transaction, *linux_result, linux_result);
     if (capture_status != EXEC_CAPTURE_OK) return finish_prepare_state(task, transaction);
+    int comm_from_dentry = !filename_length;
+    if (!comm_from_dentry) {
+        const char *base = transaction->original_path;
+        for (const char *it = base; *it; it++) if (*it == '/') base = it + 1;
+        size_t length = 0;
+        while (length < sizeof(transaction->comm) - 1U && base[length]) length++;
+        memcpy(transaction->comm, base, length);
+        transaction->comm[length] = 0;
+    }
     if (dirfd != KERNEL_FS_AT_FDCWD && transaction->original_path[0] != '/')
         filename_length = prepend_fd_name(transaction->original_path, filename_length, dirfd);
     capture_status = capture_vector(transaction,
@@ -802,6 +811,13 @@ enum kernel_exec_status kernel_execveat_prepare(
         return finish_prepare_failure(task, transaction, *linux_result, linux_result);
     if (capture_status != EXEC_CAPTURE_OK)
         return finish_prepare_state(task, transaction);
+    /* Empty-path exec names the script interpreter after shebang expansion;
+     * a PT_INTERP loader does not replace this executable identity. */
+    if (comm_from_dentry) {
+        struct kernel_vfs_path *path = kernel_open_file_path(transaction->executable_file);
+        if (!path || kernel_vfs_path_copy_name(path, transaction->comm, sizeof(transaction->comm)))
+            __builtin_trap();
+    }
     {
         enum kernel_elf64_source_status source_status =
             kernel_elf64_source_create(transaction->heap,

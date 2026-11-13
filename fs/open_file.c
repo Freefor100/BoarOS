@@ -1134,6 +1134,7 @@ void kernel_open_file_reset_generated(struct kernel_open_file_description *file)
     if (file->generated_data) kernel_heap_release(file->heap, file->generated_data);
     file->generated_data = 0;
     file->generated_length = 0U;
+    file->generated_read_offset = 0;
     file->generated_ready = 0U;
 }
 

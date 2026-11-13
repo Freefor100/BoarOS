@@ -610,10 +610,12 @@ static int read_transfer_page(struct kernel_open_file_description *file,struct k
     }
     if (!file->block && file->kind!=KERNEL_OPEN_FILE_KIND_GENERATED &&
         !(file->device && file->device->splice_read && file->device->read)) return -KERNEL_EINVAL;
+    if (file->kind == KERNEL_OPEN_FILE_KIND_GENERATED && kernel_vfs_file_control_prefix(&file->file))
+        return -KERNEL_EINVAL;
     int error=new_transfer_page(pipe,page);
     if (error) return error;
     if (file->block) error=kernel_block_file_pread(file,position,*page,wanted,done);
-    else if (file->kind==KERNEL_OPEN_FILE_KIND_GENERATED && kernel_vfs_file_is_control(&file->file)) {
+    else if (file->kind==KERNEL_OPEN_FILE_KIND_GENERATED && kernel_vfs_file_is_control(&file->file,0)) {
         error=kernel_vfs_file_control_permission(&file->file,0);
         if (!error) error=kernel_vfs_file_control(&file->file,0,&position,*page,wanted,done);
     }

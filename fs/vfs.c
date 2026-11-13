@@ -5315,17 +5315,23 @@ int kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,
     return result;
 }
 
-int kernel_vfs_file_is_control(const struct kernel_vfs_file *file)
+size_t kernel_vfs_file_control_prefix(const struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_node *node=kernel_vfs_file_node(file);
+    return node ? node->control_write_prefix : 0;
+}
+
+int kernel_vfs_file_is_control(const struct kernel_vfs_file *file,int write)
 {
     struct kernel_vfs_node *node = kernel_vfs_file_node(file);
-    return node && node->generated_control;
+    return node && (node->generated_control & (write ? KERNEL_VFS_CONTROL_WRITE : KERNEL_VFS_CONTROL_READ));
 }
 
 int kernel_vfs_file_control(const struct kernel_vfs_file *file, int write,
     uint64_t *offset, char *buffer, size_t size, size_t *count)
 {
     struct kernel_vfs_node *node = kernel_vfs_file_node(file);
-    if (!node || !node->generated_control || !offset || !count || (!buffer && size))
+    if (!kernel_vfs_file_is_control(file,write) || !offset || !count || (!buffer && size))
         return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = node->instance;
     KERNEL_LOCK_SCOPE(mutation);
@@ -5338,7 +5344,7 @@ int kernel_vfs_file_control(const struct kernel_vfs_file *file, int write,
 int kernel_vfs_file_control_permission(const struct kernel_vfs_file *file, int write)
 {
     struct kernel_vfs_node *node = kernel_vfs_file_node(file);
-    if (!node || !node->generated_control) return -KERNEL_EINVAL;
+    if (!kernel_vfs_file_is_control(file,write)) return -KERNEL_EINVAL;
     const struct kernel_vfs_backend *ops = node->instance->ops;
     if (!ops->permission) return 0;
     int result = ops->permission(node, kernel_credentials_current(), write ? 2U : 4U);

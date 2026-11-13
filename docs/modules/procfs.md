@@ -1,10 +1,21 @@
 # procfs 模块
 
-`fs/procfs.c` 是可动态创建的 VFS 实例。当前提供真实物理页分配器读数的 `meminfo`、单 hart 运行/idle 计时的 `uptime`、进程及线程数字目录、`/proc/self`、`/proc/thread-self` 与进程的 `exe/cwd/root/fd` 对象链接、`/proc/self/mounts` 与 `/proc/mounts`，以及进程 `maps`、`fdinfo`、`stat/status` 的首批真实字段、`/proc/sysvipc/{shm,sem,msg}` 和 `/proc/sys/kernel/sched_rt_period_us`、`sched_rt_runtime_us`、`hostname`、`domainname`、只读的`pid_max`。线程目录提供 `stat/status`、`fd/fdinfo`、`exe/cwd/root`、`maps`、`mounts` 和 `ns/{mnt,uts,ipc}`；Linux 全量进程字段与无路径 console 的链接仍待接入。
+`fs/procfs.c` 是可动态创建的 VFS 实例。当前提供真实物理页分配器读数的 `meminfo`、单 hart 运行/idle 计时的 `uptime`、进程及线程数字目录、`/proc/self`、`/proc/thread-self` 与进程的 `exe/cwd/root/fd` 对象链接、`/proc/self/mounts` 与 `/proc/mounts`，以及进程 `maps`、`fdinfo`、`comm`、`stat/status` 的真实字段、`/proc/sysvipc/{shm,sem,msg}` 和 `/proc/sys/kernel/sched_rt_period_us`、`sched_rt_runtime_us`、`hostname`、`domainname`、只读的`pid_max`。线程目录提供 `comm`、`stat/status`、`fd/fdinfo`、`exe/cwd/root`、`maps`、`mounts` 和 `ns/{mnt,uts,ipc}`；Linux 全量进程字段与无路径 console 的链接仍待接入。
 
 `mount(2)` 的 proc 实例不使用源字符串选择设备；用户态负责创建挂载点。bind、卸载和挂载属性的共同规则见[VFS 挂载说明](vfs-ext4.md)。挂载实例持有根及覆盖路径，最后释放时销毁无 I/O 的 proc 实例。PID 1 及后代退出后的根盘清理从最深子挂载开始拆除；其他命名空间的私有树随进程和命名空间 FD 的最后引用退休。
 
-生成式普通文件不进入 ext4 页缓存。后端 `snapshot` 返回由 OFD 持有的堆缓冲；第一次非空读取形成快照，短读、readv 和 pread 使用它，seek 到零后释放并在下一次读取重新取值，`SEEK_END` 按固定 Linux 的 seq_file 语义返回 `EINVAL`。用户复制时不持有后端或 inode 锁；只推进已经复制的字节。OFD 末引用释放快照，mount 忙判断覆盖文件及目录引用。`fstat` 中的 size 为零是生成文件的元数据语义，不能由它推断 read EOF。
+生成式普通文件不进入 ext4 页缓存。后端 `snapshot` 返回由 OFD 持有的堆缓冲；第一次非空顺序读取或非零seek形成快照，连续短读、readv和pread复用已生成的内容，seek 到零后释放并在下一次读取重新取值；定位读取偏移与上次读取进度不连续时也重新生成，`SEEK_END` 按固定 Linux 的 seq_file 语义返回 `EINVAL`。用户复制时不持有后端或 inode 锁；只推进已经复制的字节。OFD 末引用释放快照，mount 忙判断覆盖文件及目录引用。`fstat` 中的 size 为零是生成文件的元数据语义，不能由它推断 read EOF。
+
+`/proc/<pid>/comm` 和 `/proc/<pid>/task/<tid>/comm` 展示对应线程的名称，
+`PR_SET_NAME/PR_GET_NAME` 与这两个文件共用任务中已有的16字节 `comm`。
+最多保存15字节并补NUL；fork/clone复制名称，成功exec取本次执行请求路径的末级名称；空路径execveat取脚本展开后的执行inode名称，PT_INTERP装载器不替换这一名称，
+不使用调用者提供的argv[0]。名称发布和stat/status快照使用同一短保护。
+
+comm读取采用上述OFD快照规则，输出名称后附一个换行。写入仅复制每次写请求的前15字节，
+超长部分不访问但计入成功返回长度；writev分别处理各段，后段故障保留前段已完成的名称修改。
+零长度write设置空名称，零总长度writev不修改；定位写入返回ESPIPE。
+写入者必须与目标属于同一线程组；线程comm的同组访问不受dumpable变化影响。
+节点保留查找时的PID代次，目标退出或编号复用后不会修改新线程的名称。
 
 `/proc/sysvipc` 下的 `shm`、`sem`、`msg` 为 0444 的生成式文件，列名、列顺序及数值格式沿固定 Linux 的 `ipc/{shm,sem,msg}.c`：key 使用有符号十进制，权限使用八进制，ID、归属、时间和计数来自真实对象。元数据列表对普通用户可读，与 `IPC_STAT` 的对象访问权限分别处理。共享内存还报告实际后备对象的 resident 字节；当前没有 swap 后备，swap 列为零。已标记 `IPC_RMID` 但仍有附加的共享段继续出现，权限列带 `SHM_DEST`，最后附加和临时 owner 归还后才消失。
 

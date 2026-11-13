@@ -56,6 +56,13 @@ struct kernel_proc_process_snapshot {
     const struct kernel_credentials *credentials; /* snapshot caller releases */
 };
 
+/* Thread execution owns current task storage; proc callers select a retained
+ * PID generation and may write names only within their own thread group. */
+void kernel_task_comm_get(struct kernel_task *, char name[16]);
+void kernel_task_comm_set(struct kernel_task *, const char name[16]);
+int kernel_proc_comm(kernel_pid_t, uint64_t identity, int thread,
+                     char name[16], int writing);
+
 int kernel_proc_same_group(kernel_pid_t,uint64_t,int thread);
 int kernel_proc_inode_owner(kernel_pid_t,uint64_t,int thread,uint32_t mode,uint32_t *uid,uint32_t *gid);
 

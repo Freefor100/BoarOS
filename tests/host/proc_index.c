@@ -499,11 +499,44 @@ static void remote_memory_owner_case(void)
     puts("PASS remote memory REALCREDS, dumpable, capability, captured old MM and returned task owners");
 }
 
+static void comm_case(void)
+{
+    setup(); active->current = &tasks[1];
+    const char first[16] = "thread-name";
+    char name[16];
+    kernel_task_comm_set(&tasks[1], first);
+    kernel_task_comm_get(&tasks[1], name);
+    assert(!memcmp(name, first, sizeof(name)));
+    assert(!kernel_proc_comm(2, ids[1].generation, 0, name, 0));
+    assert(!memcmp(name, first, sizeof(name)));
+    memcpy(name, "other-thread", 13);
+    assert(!kernel_proc_comm(3, ids[2].generation, 1, name, 1));
+    assert(!strcmp(tasks[2].comm, "other-thread"));
+    char embedded[16] = {'A', 0, 'B'};
+    assert(!kernel_proc_comm(3, ids[2].generation, 1, embedded, 1));
+    kernel_task_comm_get(&tasks[2], name);
+    assert(name[0] == 'A');
+    for (unsigned i = 1; i < sizeof(name); i++) assert(!name[i]);
+
+    assert(kernel_proc_comm(3, ids[2].generation + 1, 1, name, 0) == -KERNEL_ESRCH);
+    active->current = &tasks[0];
+    assert(kernel_proc_comm(2, ids[1].generation, 0, name, 1) == -KERNEL_EINVAL);
+    assert(!strcmp(tasks[1].comm, "thread-name"));
+    assert(!kernel_proc_comm(2, ids[1].generation, 0, name, 0));
+    tasks[1].state = KERNEL_THREAD_STATE_ZOMBIE; tasks[1].proc_exiting = 1;
+    assert(!kernel_proc_comm(2, ids[1].generation, 0, name, 0));
+    tasks[1].retirement = 1;
+    assert(kernel_proc_comm(2, ids[1].generation, 0, name, 0) == -KERNEL_ESRCH);
+    borrows_returned(); active->current = 0;
+    puts("PASS comm current/selected thread, same-group update, generation, zombie and retirement");
+}
+
 int main(int argc, char **argv)
 {
     active = &cpus[0]; kernel_cpu_initialize(active, 0, 0); kernel_cpu_initialize(&cpus[1], 1, 0);
     kernel_raw_lock_init(&kernel_wait_domain, KERNEL_RAW_RANK_SCHEDULER);
-    if (argc > 1 && !strcmp(argv[1], "remote-mm")) remote_memory_owner_case();
+    if (argc > 1 && !strcmp(argv[1], "comm")) comm_case();
+    else if (argc > 1 && !strcmp(argv[1], "remote-mm")) remote_memory_owner_case();
     else if (argc > 1 && !strcmp(argv[1], "snapshot")) snapshot_case();
     else {lookup_cases();access_case();maps_access_cases();memory_owner_case();thread_resources_case();namespace_handles_case();}
     for(unsigned i=0;i<6;i++)kernel_exec_security_put(tasks[i].exec_security);

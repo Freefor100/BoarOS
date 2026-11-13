@@ -2065,7 +2065,7 @@ test-proc-index-host:
 	@mkdir -p build/host
 	@set -e; for shift in 12 14; do \
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -DBOAROS_LOCK_DEBUG=1 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/sync -idirafter include tests/host/proc_index.c kernel/credentials.c kernel/sched/identity.c kernel/pid.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c -Wl,--gc-sections -o build/host/proc-index-$$shift; \
-	build/host/proc-index-$$shift; build/host/proc-index-$$shift snapshot; build/host/proc-index-$$shift remote-mm; done
+	build/host/proc-index-$$shift; build/host/proc-index-$$shift snapshot; build/host/proc-index-$$shift remote-mm; build/host/proc-index-$$shift comm; done
 
 test-sched-concurrency-host:
 	@mkdir -p build/host

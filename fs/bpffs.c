@@ -88,7 +88,7 @@ static int open_inode(struct kernel_vfs_mount *m,const char *path,uint64_t id,ui
     node->inode=id;node->backend_data=n;node->mode=n->stat.mode;node->uid=n->stat.uid;node->gid=n->stat.gid;
     node->size=n->stat.size;node->max_size=n->stat.size;node->memory=n->memory;
     if(n->memory)node->file_seals=KERNEL_SEAL_SEAL|KERNEL_SEAL_SHRINK|KERNEL_SEAL_GROW|KERNEL_SEAL_WRITE;
-    if(n->object)node->generated_control=1;
+    if(n->object)node->generated_control=KERNEL_VFS_CONTROL_READ|KERNEL_VFS_CONTROL_WRITE;
     KERNEL_RAW_SCOPE(guard,&fs(i)->lock);n->references++;
     kernel_raw_lock_release(&guard);
     return kernel_vfs_publish_node(m,node,file,0);

@@ -227,6 +227,7 @@ enum kernel_vfs_resolve_flags {
 #define KERNEL_VFS_RESOLVE_SCOPED (KERNEL_VFS_RESOLVE_BENEATH | KERNEL_VFS_RESOLVE_IN_ROOT)
 struct kernel_vfs_open_request { unsigned flags; uint32_t mode, umask; unsigned access, resolve; };
 #define KERNEL_VFS_MAY_EXEC 1U
+enum { KERNEL_VFS_CONTROL_READ=1, KERNEL_VFS_CONTROL_WRITE=2 };
 #define KERNEL_VFS_MAY_WRITE 2U
 #define KERNEL_VFS_MAY_READ 4U
 int kernel_vfs_path_permission(struct kernel_vfs_path *path, unsigned access);
