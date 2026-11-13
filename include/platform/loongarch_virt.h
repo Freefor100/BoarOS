@@ -9,6 +9,8 @@ int la_virt_uart_start(struct ns16550_port **,struct kernel_heap *,uint64_t);
 void la_virt_puts(const char *);
 void la_virt_hex(uint64_t);
 void la_virt_shutdown(void) __attribute__((noreturn));
+void la_virt_restart(void) __attribute__((noreturn));
+void la_virt_halt(void) __attribute__((noreturn));
 void la_virt_fatal(const char *) __attribute__((noreturn));
 int la_virt_boot_memory(uint64_t, uint64_t, uint64_t, struct boot_memory_layout *);
 void *la_virt_page_access(uint64_t);

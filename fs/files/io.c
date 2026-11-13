@@ -456,7 +456,7 @@ static enum kernel_files_status read_pinned(
     if(kind==KERNEL_OPEN_FILE_KIND_PIDFD) {
         *linux_result=-KERNEL_EINVAL;return KERNEL_FILES_STATUS_OK;
     }
-    if (kind==KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE) {
+    if (kind==KERNEL_OPEN_FILE_KIND_NAMESPACE) {
         *linux_result=(kernel_open_file_flags(description)&010000000U)?-KERNEL_EBADF:-KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
     }
@@ -769,7 +769,7 @@ static enum kernel_files_status readv_request(
         return KERNEL_FILES_STATUS_OK;
     }
     KERNEL_SERVICE_SCOPE_IF(service, description->kind != KERNEL_OPEN_FILE_KIND_INOTIFY && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_EVENTFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_TIMERFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SIGNALFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_MQUEUE);
-    if (description->kind==KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE) {
+    if (description->kind==KERNEL_OPEN_FILE_KIND_NAMESPACE) {
         *linux_result=(kernel_open_file_flags(description)&010000000U)?-KERNEL_EBADF:-KERNEL_EINVAL;
         status=KERNEL_FILES_STATUS_OK;
         goto out;

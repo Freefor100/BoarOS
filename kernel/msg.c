@@ -1,6 +1,7 @@
 #include <kernel/avl.h>
 #include <kernel/heap.h>
 #include <kernel/msg.h>
+#include <kernel/ipc_namespace.h>
 #include <kernel/raw_lock.h>
 #include <kernel/signal.h>
 #include <kernel/socket_task.h>
@@ -24,6 +25,7 @@ struct msg_message {
     unsigned char data[];
 };
 struct msg_queue {
+    struct kernel_msg_table *table;
     struct kernel_avl_node slot_node, key_node;
     struct kernel_raw_lock lock;
     uint32_t references, removed;
@@ -47,18 +49,19 @@ struct kernel_msg_request {
     int64_t type;
     uint64_t size;
 };
-static struct {
+struct kernel_msg_table {
+    uint32_t references;
     struct kernel_raw_lock lock;
-    struct kernel_heap *heap;
     struct kernel_avl_node *slots, *keys;
     uint32_t queues, next_slot;
     uint64_t bytes, messages;
     uint16_t sequence[KERNEL_MSGMNI];
-} msg_table;
+};
+static struct kernel_heap *msg_heap;
 static void *msg_allocate(size_t size)
 {
     void *p = 0;
-    enum kernel_heap_status s = kernel_heap_allocate_zeroed(msg_table.heap, 1, size, &p);
+    enum kernel_heap_status s = kernel_heap_allocate_zeroed(msg_heap, 1, size, &p);
     if (s == KERNEL_HEAP_STATUS_EMPTY)
         return 0;
     if (s != KERNEL_HEAP_STATUS_OK)
@@ -68,8 +71,25 @@ static void *msg_allocate(size_t size)
 static void msg_free(void *p)
 {
     if (p)
-        kernel_heap_release(msg_table.heap, p);
+        kernel_heap_release(msg_heap, p);
 }
+static struct kernel_msg_table *msg_namespace_table(struct kernel_namespace *base,int create)
+{
+    struct kernel_ipc_namespace *ns=kernel_ipc_namespace_state(base);
+    struct kernel_msg_table *table=__atomic_load_n(&ns->msg,__ATOMIC_ACQUIRE);
+    if(table||!create)return table;
+    struct kernel_msg_table *candidate=msg_allocate(sizeof(*candidate));
+    if(!candidate)return 0;
+    candidate->references=1;
+    kernel_raw_lock_init(&candidate->lock,25);
+    {KERNEL_RAW_SCOPE(g,&ns->lock);
+     if(!ns->msg)__atomic_store_n(&ns->msg,candidate,__ATOMIC_RELEASE);
+     table=ns->msg;}
+    if(table!=candidate)msg_free(candidate);
+    return table;
+}
+static void msg_table_put(struct kernel_msg_table *table)
+{if(!__atomic_sub_fetch(&table->references,1,__ATOMIC_ACQ_REL))msg_free(table);}
 static int64_t msg_now(void)
 {
     return (int64_t)(kernel_time_realtime_ns() / UINT64_C(1000000000));
@@ -104,15 +124,19 @@ static void queue_put(struct msg_queue *q)
         kernel_task_identity_put(q->spid);
     if (q->rpid)
         kernel_task_identity_put(q->rpid);
+    struct kernel_msg_table *table=q->table;
     msg_free(q);
+    msg_table_put(table);
 }
 static struct msg_queue *queue_lookup(int32_t id, int by_slot)
 {
     if (id < 0)
         return 0;
-    KERNEL_RAW_SCOPE(g, &msg_table.lock);
+    struct kernel_msg_table *table=msg_namespace_table(kernel_task_ipc_namespace(),0);
+    if(!table)return 0;
+    KERNEL_RAW_SCOPE(g, &table->lock);
     struct msg_queue *q =
-        slot_queue(index_find(msg_table.slots, by_slot ? (uint32_t)id : ((uint32_t)id & 32767U)));
+        slot_queue(index_find(table->slots, by_slot ? (uint32_t)id : ((uint32_t)id & 32767U)));
     if (q && (by_slot || q->id == id))
         queue_get(q);
     else
@@ -128,12 +152,14 @@ static void queue_descriptor(const struct msg_queue *q, struct kernel_msqid64_ds
         .msg_lrpid = q->rpid ? q->rpid->number : 0,
     };
 }
-int kernel_msg_proc_next(uint32_t *cursor, int32_t *id, struct kernel_msqid64_ds *row)
+int kernel_msg_proc_next(struct kernel_namespace *ns, uint32_t *cursor, int32_t *id, struct kernel_msqid64_ds *row)
 {
-    KERNEL_RAW_SCOPE(index, &msg_table.lock);
+    struct kernel_msg_table *table=msg_namespace_table(ns,0);
+    if(!table)return 0;
+    KERNEL_RAW_SCOPE(index, &table->lock);
     struct kernel_avl_node *node = *cursor
-        ? kernel_avl_after(msg_table.slots, (uint64_t)*cursor - 1U)
-        : kernel_avl_first(msg_table.slots);
+        ? kernel_avl_after(table->slots, (uint64_t)*cursor - 1U)
+        : kernel_avl_first(table->slots);
     if (!node) return 0;
     struct msg_queue *q = slot_queue(node);
     KERNEL_RAW_SCOPE(state, &q->lock);
@@ -200,47 +226,51 @@ int kernel_msg_init(struct kernel_heap *heap)
 {
     if (!heap)
         return -KERNEL_EINVAL;
-    if (msg_table.heap)
-        return msg_table.heap == heap ? 0 : -KERNEL_EINVAL;
-    kernel_raw_lock_init(&msg_table.lock, 25);
-    msg_table.heap = heap;
+    if (msg_heap)
+        return msg_heap == heap ? 0 : -KERNEL_EINVAL;
+    int error=kernel_ipc_namespace_boot(heap);if(error)return error;
+    msg_heap = heap;
     return 0;
 }
 int64_t kernel_msg_get(struct kernel_task *task, int32_t key, int32_t flags)
 {
     (void)task;
-    if (!msg_table.heap)
+    if (!msg_heap)
         return -KERNEL_ENOSPC;
+    struct kernel_msg_table *table=msg_namespace_table(kernel_task_ipc_namespace(),
+        key==KERNEL_IPC_PRIVATE || (flags&KERNEL_IPC_CREAT));
+    if(!table)return key!=KERNEL_IPC_PRIVATE && !(flags&KERNEL_IPC_CREAT)?-KERNEL_ENOENT:-KERNEL_ENOMEM;
     const struct kernel_credentials *c = kernel_credentials_current();
     struct msg_queue *candidate = 0;
     int64_t result;
     for (;;) {
         struct msg_queue *found = 0;
         {
-            KERNEL_RAW_SCOPE(g, &msg_table.lock);
+            KERNEL_RAW_SCOPE(g, &table->lock);
             if (key != KERNEL_IPC_PRIVATE)
-                found = key_queue(index_find(msg_table.keys, (uint32_t)key));
+                found = key_queue(index_find(table->keys, (uint32_t)key));
             if (found)
                 queue_get(found);
             else if (key != KERNEL_IPC_PRIVATE && !(flags & KERNEL_IPC_CREAT))
                 result = -KERNEL_ENOENT;
-            else if (msg_table.queues == KERNEL_MSGMNI)
+            else if (table->queues == KERNEL_MSGMNI)
                 result = -KERNEL_ENOSPC;
             else if (!candidate)
                 result = INT64_MIN;
             else {
-                uint32_t slot = msg_table.next_slot;
-                while (index_find(msg_table.slots, slot))
+                uint32_t slot = table->next_slot;
+                while (index_find(table->slots, slot))
                     slot = (slot + 1) % KERNEL_MSGMNI;
-                msg_table.next_slot = (slot + 1) % KERNEL_MSGMNI;
+                table->next_slot = (slot + 1) % KERNEL_MSGMNI;
                 candidate->slot_node.key = slot;
                 candidate->key_node.key = (uint32_t)key;
-                candidate->permission.seq = msg_table.sequence[slot];
+                candidate->permission.seq = table->sequence[slot];
                 candidate->id = (int32_t)(((uint32_t)candidate->permission.seq << 15) | slot);
-                msg_table.slots = kernel_avl_insert_node(msg_table.slots, &candidate->slot_node);
+                table->slots = kernel_avl_insert_node(table->slots, &candidate->slot_node);
                 if (key != KERNEL_IPC_PRIVATE)
-                    msg_table.keys = kernel_avl_insert_node(msg_table.keys, &candidate->key_node);
-                msg_table.queues++;
+                    table->keys = kernel_avl_insert_node(table->keys, &candidate->key_node);
+                __atomic_fetch_add(&table->references,1,__ATOMIC_RELAXED);
+                table->queues++;
                 result = candidate->id;
                 candidate = 0;
             }
@@ -270,6 +300,7 @@ int64_t kernel_msg_get(struct kernel_task *task, int32_t key, int32_t flags)
         }
         kernel_raw_lock_init(&candidate->lock, 30);
         candidate->references = 1;
+        candidate->table=table;
         candidate->slot_node.height = candidate->key_node.height = 1;
         candidate->limit = KERNEL_MSGMNB;
         candidate->ctime = msg_now();
@@ -437,8 +468,8 @@ static void message_enqueue(struct msg_queue *q, struct msg_message *m)
     q->tail = m;
     q->count++;
     q->bytes += m->size;
-    __atomic_fetch_add(&msg_table.messages, 1, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&msg_table.bytes, m->size, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&q->table->messages, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&q->table->bytes, m->size, __ATOMIC_RELAXED);
 }
 static void message_detach(struct msg_queue *q, struct msg_message *m)
 {
@@ -453,8 +484,8 @@ static void message_detach(struct msg_queue *q, struct msg_message *m)
     m->previous = m->next = 0;
     q->count--;
     q->bytes -= m->size;
-    __atomic_fetch_sub(&msg_table.messages, 1, __ATOMIC_RELAXED);
-    __atomic_fetch_sub(&msg_table.bytes, m->size, __ATOMIC_RELAXED);
+    __atomic_fetch_sub(&q->table->messages, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_sub(&q->table->bytes, m->size, __ATOMIC_RELAXED);
 }
 static void message_publish(struct kernel_msg_request *sender)
 {
@@ -632,28 +663,29 @@ done:
 }
 static int queue_remove(struct msg_queue *q, const struct kernel_credentials *c)
 {
+    struct kernel_msg_table *table=q->table;
     struct msg_message *messages;
     {
-        KERNEL_RAW_SCOPE(index_guard, &msg_table.lock);
+        KERNEL_RAW_SCOPE(index_guard, &table->lock);
         KERNEL_RAW_SCOPE(queue_guard, &q->lock);
         if (q->removed)
             return -KERNEL_EIDRM;
-        if (!owner(q, c))
+        if (c && !owner(q, c))
             return -KERNEL_EPERM;
         q->removed = 1;
-        msg_table.slots = kernel_avl_remove_node(msg_table.slots, &q->slot_node);
+        table->slots = kernel_avl_remove_node(table->slots, &q->slot_node);
         if (q->permission.key != KERNEL_IPC_PRIVATE)
-            msg_table.keys = kernel_avl_remove_node(msg_table.keys, &q->key_node);
-        msg_table.queues--;
-        msg_table.sequence[q->slot_node.key]++;
+            table->keys = kernel_avl_remove_node(table->keys, &q->key_node);
+        table->queues--;
+        table->sequence[q->slot_node.key]++;
         while (q->send_head)
             request_complete(q->send_head, -KERNEL_EIDRM);
         while (q->recv_head)
             request_complete(q->recv_head, -KERNEL_EIDRM);
         messages = q->head;
         q->head = q->tail = 0;
-        __atomic_fetch_sub(&msg_table.messages, q->count, __ATOMIC_RELAXED);
-        __atomic_fetch_sub(&msg_table.bytes, q->bytes, __ATOMIC_RELAXED);
+        __atomic_fetch_sub(&q->table->messages, q->count, __ATOMIC_RELAXED);
+        __atomic_fetch_sub(&q->table->bytes, q->bytes, __ATOMIC_RELAXED);
         q->count = q->bytes = 0;
     }
     while (messages) {
@@ -678,18 +710,20 @@ static int64_t msg_info(struct kernel_mm *mm, int32_t cmd, uint64_t arg)
                                .msgssz = 16,
                                .msgtql = KERNEL_MSGMNB,
                                .msgseg = 65535};
-    int64_t last;
+    int64_t last=0;
     size_t copied;
-    {
-        KERNEL_RAW_SCOPE(g, &msg_table.lock);
-        struct kernel_avl_node *n = kernel_avl_last(msg_table.slots);
+    struct kernel_msg_table *table=msg_namespace_table(kernel_task_ipc_namespace(),0);
+    if(cmd==KERNEL_MSG_INFO)i.msgpool=i.msgmap=i.msgtql=0;
+    if(table) {
+        KERNEL_RAW_SCOPE(g, &table->lock);
+        struct kernel_avl_node *n = kernel_avl_last(table->slots);
         last = n ? (int64_t)n->key : 0;
         if (cmd == KERNEL_MSG_INFO)
-            i.msgpool = (int32_t)msg_table.queues;
+            i.msgpool = (int32_t)table->queues;
     }
-    if (cmd == KERNEL_MSG_INFO) {
-        i.msgmap = info_count(__atomic_load_n(&msg_table.messages, __ATOMIC_RELAXED));
-        i.msgtql = info_count(__atomic_load_n(&msg_table.bytes, __ATOMIC_RELAXED));
+    if (cmd == KERNEL_MSG_INFO && table) {
+        i.msgmap = info_count(__atomic_load_n(&table->messages, __ATOMIC_RELAXED));
+        i.msgtql = info_count(__atomic_load_n(&table->bytes, __ATOMIC_RELAXED));
     }
     return kernel_copy_to_user(mm, arg, &i, sizeof(i), &copied) ? -KERNEL_EFAULT : last;
 }
@@ -724,7 +758,7 @@ int64_t kernel_msg_ctl(struct kernel_task *task, struct kernel_mm *mm, int32_t i
         if (q->removed)
             result = -KERNEL_EIDRM;
         else if (cmd == KERNEL_IPC_SET) {
-            if (!owner(q, c))
+            if (c && !owner(q, c))
                 result = -KERNEL_EPERM;
             else if ((uint32_t)d.msg_qbytes > KERNEL_MSGMNB &&
                      !kernel_credentials_capable(c, KERNEL_CAP_SYS_RESOURCE))
@@ -766,4 +800,14 @@ void kernel_msg_abort(struct kernel_task *task)
     }
     task->msg_request = 0;
     request_release(r);
+}
+
+void kernel_msg_namespace_destroy(struct kernel_msg_table *table)
+{
+    if(!table)return;
+    while(table->slots){
+        struct msg_queue *q=slot_queue(kernel_avl_first(table->slots));
+        if(queue_remove(q,0))__builtin_trap();
+    }
+    msg_table_put(table);
 }

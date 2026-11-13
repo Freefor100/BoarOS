@@ -8,7 +8,7 @@
 |---|---|
 | `include/kernel/ipc.h` | 与信号量共用的 `ipc64_perm`、IPC常数及身份/权限规则 |
 | `include/kernel/shm.h` | `shmid64_ds` 等SHM原生布局、常数、内核段结构与接口声明 |
-| `mm/shm.c` | 全局段表、`IPC_PRIVATE` 与命名 key 映射、代次 sequence、延迟销毁（`IPC_RMID`）与 `nattch` 引用计数 |
+| `mm/shm.c` | 各IPC命名空间的段表、`IPC_PRIVATE` 与命名 key 映射、代次 sequence、延迟销毁（`IPC_RMID`）与 `nattch` 引用计数 |
 | `kernel/syscall/shm.c` | 系统调用参数解码、用户指针有效性校验与 Linux ABI 返回值映射 |
 | `include/kernel/vma.h`、`mm/vma.c` | `KERNEL_VMA_KIND_SYSV_SHM` VMA 描述符定义与不合并（no-merge）约束 |
 | `include/kernel/mm.h`、`mm/mm.c` | `kernel_mm_shmat`/`kernel_mm_shmdt`、Sv39 共享按需缺页、fork 继承及 munmap/release 清理钩子 |
@@ -28,7 +28,7 @@
 3. **延迟销毁语义（`IPC_RMID`）**：
    - 调用 `shmctl(shmid, IPC_RMID, NULL)` 时：
      - 若当前片段计数 `nattch == 0` 且逻辑 attachment owner 数 `attachments == 0`，立即释放物理页与内存对象，槽位复位。
-     - 否则标记 `marked_for_deletion = 1`，并将 key 改为 `IPC_PRIVATE`，使 `IPC_STAT` 和 proc 列表与命名查找的撤销一致。当前后续对该段的 `shmat` 拒绝附加（返回 `-EIDRM`），`shmget` 不再能按原 key 查找到该段。已有附加的虚拟内存映射保持有效并可正常读写。Linux 允许对仍存活的 RMID 段再次附加；该既有限制仍存在。
+     - 否则标记 `marked_for_deletion = 1`，并将 key 改为 `IPC_PRIVATE`，使 `IPC_STAT` 和 proc 列表与命名查找的撤销一致。后续 `shmget` 不再能按原 key 查找到该段；只要该段仍存活，按完整 ID 的 `shmat` 可以再次附加。已有附加的虚拟内存映射保持有效并可正常读写。
      - 随 `shmdt`、`munmap`、进程 `exit` 或 `execve` 解除附加，当最后一个片段及临时 attachment owner 消失时，触发物理资源与段槽位的彻底释放。
 4. **`IPC_STAT` 与 `SHM_DEST` 标志**：
    - 当段已被 `IPC_RMID` 标记删除但仍有附加时，`shmctl(..., IPC_STAT, ...)` 仍可成功查询，并在 `shm_perm.mode` 中反映 `SHM_DEST`（01000）标志位，符合 Linux 原生行为。
@@ -36,6 +36,8 @@
 创建时保存调用者 effective UID/GID 到 owner 和 creator 字段。按 key 查找、shmat 和 IPC_STAT 分别检查所需读写/执行位，CAP_IPC_OWNER 允许越过访问位；IPC_SET/RMID 要求 owner、creator 或 CAP_SYS_ADMIN。IPC_SET 先完整导入用户结构，再检查对象及管理权限，成功后更新 owner/group/mode；数字 UID/GID 采用初始用户命名空间的有效值。
 
 `/proc/sysvipc/shm` 与 `IPC_STAT` 共用段描述符，并从实际 memory object 读取 resident 页数，按客机页尺寸换算为字节；当前没有 swap 后备。仍被附加持有的 RMID 段保留列表项及 `SHM_DEST`，最后释放后撤下。列表读取与其他 IPC 列表的共同规则见 [procfs 模块](procfs.md)。
+
+命名空间隔离及旧 attachment 在空间切换后的所有权见 [IPC 命名空间](ipc-namespace.md)。
 
 ## 限额、用量与槽查询
 

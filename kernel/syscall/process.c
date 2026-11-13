@@ -1,6 +1,8 @@
 #include <kernel/credentials.h>
 #include <kernel/scheduler.h>
 #include "private.h"
+#include <kernel/namespace.h>
+#include <kernel/reboot.h>
 
 #include <kernel/errno.h>
 #include <kernel/exec.h>
@@ -257,7 +259,7 @@ void syscall_decode_clone(const struct kernel_syscall_request *request,
     const uint64_t thread_optional = LINUX_CLONE_FS | LINUX_CLONE_FILES | UINT64_C(0x80001000) |
         UINT64_C(0x40000) | UINT64_C(0x80000) |
         UINT64_C(0x100000) | UINT64_C(0x200000) | UINT64_C(0x400000) |
-        UINT64_C(0x1000000);
+        UINT64_C(0x1000000) | KERNEL_NS_UTS | KERNEL_NS_IPC;
 
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     if ((flags & ~LINUX_CLONE_KNOWN_FLAGS) != 0U ||
@@ -280,7 +282,7 @@ void syscall_decode_clone(const struct kernel_syscall_request *request,
         return;
     }
     /* A fork child owns its private child-TID store and exit clear. */
-    uint64_t process_flags = flags & ~(LINUX_CLONE_SIGNAL_MASK | LINUX_CLONE_FS | LINUX_CLONE_FILES | LINUX_CLONE_CLEAR_SIGHAND | LINUX_CLONE_NEWNS | UINT64_C(0x80001000) |
+    uint64_t process_flags = flags & ~(LINUX_CLONE_SIGNAL_MASK | LINUX_CLONE_FS | LINUX_CLONE_FILES | LINUX_CLONE_CLEAR_SIGHAND | LINUX_CLONE_NEWNS | KERNEL_NS_UTS | KERNEL_NS_IPC | UINT64_C(0x80001000) |
         UINT64_C(0x40000) | UINT64_C(0x80000) | UINT64_C(0x100000) |
         LINUX_CLONE_CHILD_SETTID | LINUX_CLONE_CHILD_CLEARTID);
     if (process_flags != 0 && process_flags != LINUX_CLONE_VM &&
@@ -296,18 +298,40 @@ void syscall_decode_clone(const struct kernel_syscall_request *request,
     decoded->value = 0;
 }
 
+enum kernel_syscall_status syscall_handle_reboot(struct kernel_task *caller,
+    const struct kernel_syscall_request *request,struct kernel_syscall_result *decoded)
+{
+    decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value=-KERNEL_EPERM;
+    if(!kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_BOOT))
+        return KERNEL_SYSCALL_STATUS_OK;
+    enum kernel_reboot_action action;
+    int error=kernel_reboot_decode((uint32_t)request->arguments[0],(uint32_t)request->arguments[1],
+        (uint32_t)request->arguments[2],&action);
+    if(error){decoded->value=error;return KERNEL_SYSCALL_STATUS_OK;}
+    char command[KERNEL_REBOOT_COMMAND_SIZE]={0};
+    if((uint32_t)request->arguments[2]==KERNEL_REBOOT_CMD_RESTART2) {
+        struct kernel_mm *mm;size_t length=0;
+        if(kernel_task_mm_borrow_mutable(caller,&mm))return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        enum kernel_uaccess_status copied=kernel_copy_string_from_user(mm,command,request->arguments[3],
+            sizeof(command)-1,&length);
+        if(copied==KERNEL_UACCESS_STATUS_FAULT){decoded->value=-KERNEL_EFAULT;return KERNEL_SYSCALL_STATUS_OK;}
+        if(copied!=KERNEL_UACCESS_STATUS_OK && copied!=KERNEL_UACCESS_STATUS_TOO_LONG)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        command[sizeof(command)-1]=0;
+    }
+    KERNEL_SERVICE_SCOPE(service);
+    decoded->value=kernel_reboot_request(action,command);
+    if(!decoded->value)decoded->action=KERNEL_SYSCALL_ACTION_EXIT_GROUP;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
 enum kernel_syscall_status syscall_handle_unshare(struct kernel_task *caller,
     const struct kernel_syscall_request *request,struct kernel_syscall_result *decoded)
 {
     KERNEL_SERVICE_SCOPE(service);
-    uint64_t flags=request->arguments[0];
     decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
-    if (flags & ~(LINUX_CLONE_FS | LINUX_CLONE_NEWNS))
-        decoded->value=-KERNEL_EINVAL;
-    else if ((flags & LINUX_CLONE_NEWNS) &&
-             !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN))
-        decoded->value=-KERNEL_EPERM;
-    else decoded->value=flags?kernel_task_unshare_fs(caller,!!(flags&LINUX_CLONE_NEWNS)):0;
+    decoded->value=kernel_task_unshare_namespaces(caller,request->arguments[0]);
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
@@ -316,7 +340,7 @@ enum kernel_syscall_status syscall_handle_setns(struct kernel_task *caller,
 {
     KERNEL_SERVICE_SCOPE(service);
     decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
-    decoded->value=kernel_task_setns_mount(caller,(int32_t)request->arguments[0],
+    decoded->value=kernel_task_setns(caller,(int32_t)request->arguments[0],
         (uint32_t)request->arguments[1]);
     return KERNEL_SYSCALL_STATUS_OK;
 }

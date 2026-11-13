@@ -1,5 +1,7 @@
 /* The fixture uses the real priority queue, namespace and ownership code. */
 #include "../../kernel/mqueue.c"
+#define IPC_FIXTURE_MQ
+#include "ipc_namespace_fixture.h"
 #include <assert.h>
 #include <pthread.h>
 #include <sched.h>
@@ -152,7 +154,7 @@ static void current(unsigned index){cpu.current=&tasks[index];}
 static struct kernel_mqueue *make(const char *name,unsigned count,unsigned size)
 {
     struct kernel_mqueue *q=0;int created=0;struct kernel_mq_attr a={.maxmsg=count,.msgsize=size};
-    assert(!kernel_mqueue_create_name(cpu.current,name,0600,&a,1,&q,&created)&&created);return q;
+    assert(!kernel_mqueue_create_name(kernel_mqueue_namespace_tree(kernel_task_ipc_namespace(),1),cpu.current,name,0600,&a,1,&q,&created)&&created);return q;
 }
 static int descriptor(struct kernel_mqueue *q,unsigned flags)
 {
@@ -171,7 +173,7 @@ static int notifyq(int fd,int type,int signal,uint64_t value)
     return (int)kernel_mqueue_notify(cpu.current,&cpu.current->mm,fd,(uintptr_t)&n);
 }
 static void removeq(struct kernel_mqueue *q)
-{assert(!kernel_mqueue_remove_name(q->name,strlen(q->name)));kernel_mqueue_put(q);}
+{assert(!kernel_mqueue_remove_name(kernel_mqueue_namespace_tree(kernel_task_ipc_namespace(),1),q->name,strlen(q->name)));kernel_mqueue_put(q);}
 static void priority_and_lifetime(void)
 {
     privileged=1;struct kernel_mqueue *q=make("priority",4,9000);privileged=0;
@@ -183,7 +185,7 @@ static void priority_and_lifetime(void)
     assert(recvq(fd,b,sizeof(b),&p)==9000&&p==4&&!memcmp(a,b,sizeof(a)));
     assert(recvq(fd,b,sizeof(b),&p)==4&&p==0);assert(recvq(fd,b,sizeof(b),0)==-KERNEL_EAGAIN);
     uint64_t charge=q->charge;assert(charge==4*(9000+48)+4*48&&account.mqueue_bytes==charge);
-    assert(!kernel_mqueue_remove_name("priority",8));assert(!kernel_mqueue_lookup_name("priority",8));
+    assert(!kernel_mqueue_remove_name(kernel_mqueue_namespace_tree(kernel_task_ipc_namespace(),1),"priority",8));assert(!kernel_mqueue_lookup_name(kernel_mqueue_namespace_tree(kernel_task_ipc_namespace(),1),"priority",8));
     assert(!sendq(fd,"unlinked",9,3));kernel_mqueue_put(q);
     assert(account.mqueue_bytes==charge);closefd(fd);assert(!account.mqueue_bytes);
 }
@@ -249,24 +251,24 @@ static void fault_and_quota(void)
     assert(!sendq(fd,"lost",5,0));output_fault=(uintptr_t)out;
     assert(recvq(fd,out,32,0)==-KERNEL_EFAULT&&!q->count);output_fault=0;
     struct kernel_mqueue *large=0;int made;struct kernel_mq_attr a={.maxmsg=65536,.msgsize=16777216};
-    privileged=1;assert(kernel_mqueue_create_name(cpu.current,"overquota",0600,&a,1,&large,&made)==-KERNEL_EMFILE);privileged=0;
+    privileged=1;assert(kernel_mqueue_create_name(kernel_mqueue_namespace_tree(kernel_task_ipc_namespace(),1),cpu.current,"overquota",0600,&a,1,&large,&made)==-KERNEL_EMFILE);privileged=0;
     assert(!large&&account.references==2);closefd(fd);removeq(q);
 }
 static void namespace_metadata(void)
 {
     struct kernel_mqueue *q=make("root",1,32),*opened=0;int made=0;
-    privileged=1;assert(!kernel_mqueue_root_set_mode(0000));privileged=0;
-    assert(!kernel_mqueue_create_name(cpu.current,"root",0600,0,0,&opened,&made)&&!made);
+    privileged=1;assert(!kernel_mqueue_root_set_mode(kernel_mqueue_namespace_tree(kernel_task_ipc_namespace(),1),0000));privileged=0;
+    assert(!kernel_mqueue_create_name(kernel_mqueue_namespace_tree(kernel_task_ipc_namespace(),1),cpu.current,"root",0600,0,0,&opened,&made)&&!made);
     kernel_mqueue_put(opened);
     struct kernel_mq_attr attr={.maxmsg=1,.msgsize=32};
-    assert(kernel_mqueue_create_name(cpu.current,"denied",0600,&attr,1,&opened,&made)==-KERNEL_EACCES);
-    assert(kernel_mqueue_remove_name("root",4)==-KERNEL_EACCES);
-    privileged=1;assert(!kernel_mqueue_root_set_mode(03777));assert(!kernel_mqueue_root_set_owner(0,77));privileged=0;
+    assert(kernel_mqueue_create_name(kernel_mqueue_namespace_tree(kernel_task_ipc_namespace(),1),cpu.current,"denied",0600,&attr,1,&opened,&made)==-KERNEL_EACCES);
+    assert(kernel_mqueue_remove_name(kernel_mqueue_namespace_tree(kernel_task_ipc_namespace(),1),"root",4)==-KERNEL_EACCES);
+    privileged=1;assert(!kernel_mqueue_root_set_mode(kernel_mqueue_namespace_tree(kernel_task_ipc_namespace(),1),03777));assert(!kernel_mqueue_root_set_owner(kernel_mqueue_namespace_tree(kernel_task_ipc_namespace(),1),0,77));privileged=0;
     struct kernel_mqueue *group=make("group",1,32);assert(group->gid==20);removeq(group);
     privileged=1;assert(!kernel_mqueue_queue_set_owner(q,40,50));privileged=0;
-    assert(kernel_mqueue_remove_name("root",4)==-KERNEL_EPERM);
-    credentials.fsuid=40;assert(!kernel_mqueue_remove_name("root",4));credentials.fsuid=10;kernel_mqueue_put(q);
-    privileged=1;assert(!kernel_mqueue_root_set_mode(01777));assert(!kernel_mqueue_root_set_owner(0,0));privileged=0;
+    assert(kernel_mqueue_remove_name(kernel_mqueue_namespace_tree(kernel_task_ipc_namespace(),1),"root",4)==-KERNEL_EPERM);
+    credentials.fsuid=40;assert(!kernel_mqueue_remove_name(kernel_mqueue_namespace_tree(kernel_task_ipc_namespace(),1),"root",4));credentials.fsuid=10;kernel_mqueue_put(q);
+    privileged=1;assert(!kernel_mqueue_root_set_mode(kernel_mqueue_namespace_tree(kernel_task_ipc_namespace(),1),01777));assert(!kernel_mqueue_root_set_owner(kernel_mqueue_namespace_tree(kernel_task_ipc_namespace(),1),0,0));privileged=0;
 }
 static void *abandon_operation(void *arg)
 {
@@ -304,8 +306,8 @@ static void abandoned_owners_and_allocations(void)
     }
     closefd(fd);removeq(q);
     q=make("shutdown",1,32);fd=descriptor(q,2);kernel_mqueue_put(q);
-    assert(kernel_mqueue_shutdown()==-KERNEL_EBUSY&&!kernel_mqueue_lookup_name("shutdown",8));
-    closefd(fd);assert(!kernel_mqueue_shutdown()&&!mq_table.heap);
+    assert(kernel_mqueue_shutdown()==-KERNEL_EBUSY&&!kernel_mqueue_lookup_name(kernel_mqueue_namespace_tree(kernel_task_ipc_namespace(),1),"shutdown",8));
+    closefd(fd);assert(!kernel_mqueue_shutdown()&&!kernel_ipc_namespace_state(kernel_ipc_initial())->mq);
 }
 static void scheduler_wait_order(void)
 {
@@ -325,6 +327,37 @@ static void scheduler_wait_order(void)
     current(0);removeq(q);puts("mqueue waiter order uses normal nice and effective RT rank");
 }
 
+static void ipc_namespace_lifetime(void)
+{
+    unsigned before=allocations;struct kernel_namespace *left=0,*right=0;
+    assert(!kernel_ipc_namespace_create(&heap,&left)&&!kernel_ipc_namespace_create(&heap,&right));
+    host_ipc_namespace=left;
+    unsigned empty=allocations;
+    assert(!kernel_mqueue_namespace_tree(left,0)&&allocations==empty);
+    struct kernel_mqueue *q=make("isolated",2,32);int fd=descriptor(q,2);
+    struct kernel_mqueue_tree *tree=q->tree;kernel_mqueue_tree_get(tree); /* Mount owner. */
+    kernel_mqueue_put(q);
+    host_ipc_namespace=right;
+    assert(!kernel_mqueue_namespace_tree(right,0));
+    struct kernel_mqueue *other=make("isolated",2,32);
+    assert(other!=q&&other->tree!=tree&&other->account==q->account);
+    assert(account.mqueue_bytes==q->charge+other->charge);
+    struct kernel_vfs_stat a,b;kernel_mqueue_queue_stat(q,&a);kernel_mqueue_queue_stat(other,&b);
+    assert(a.dev!=b.dev);
+    kernel_namespace_put(left);
+    assert(!tree->namespace&&tree->head==q);
+    struct kernel_mqueue *found=kernel_mqueue_lookup_name(tree,"isolated",8);assert(found==q);kernel_mqueue_put(found);
+    struct kernel_mqueue *made=0;int created=0;
+    assert(kernel_mqueue_create_name(tree,cpu.current,"new",0600,0,1,&made,&created)==-KERNEL_EACCES);
+    int notifications=signal_count;
+    assert(!notifyq(fd,0,35,99)&&!sendq(fd,"alive",6,0)&&signal_count==notifications+1);
+    char data[32];assert(recvq(fd,data,sizeof(data),0)==6&&!strcmp(data,"alive"));
+    kernel_mqueue_tree_put(tree); /* Last mount drops names, OFD remains usable. */
+    assert(!q->linked&&!sendq(fd,"fd",3,0)&&recvq(fd,data,sizeof(data),0)==3);
+    closefd(fd);kernel_mqueue_put(other);kernel_namespace_put(right);host_ipc_namespace=0;
+    assert(allocations==before&&!account.mqueue_bytes);
+    puts("mqueue IPC namespace isolation, orphan mount creation and old FD notification PASS");
+}
 int main(void)
 {
     kernel_wait_domain_init();assert(!kernel_mqueue_init(&heap));
@@ -333,7 +366,8 @@ int main(void)
         tasks[i].identities[KERNEL_PID_TGID].identity=&identities[i];
         kernel_wait_record_init(&tasks[i].wait);kernel_wait_node_init(&tasks[i].default_wait_node,&tasks[i]);}
     current(0);scheduler_wait_order();priority_and_lifetime();notifications();handoff_and_timeout();fault_and_quota();namespace_metadata();abandoned_owners_and_allocations();
-    assert(!allocations&&!mq_table.queues&&!account.mqueue_bytes&&account.references==1);
+    ipc_namespace_lifetime();
+    assert(!allocations&&!kernel_ipc_namespace_state(kernel_ipc_initial())->mq&&!account.mqueue_bytes&&account.references==1);
     for(unsigned i=0;i<3;i++)assert(identities[i].references==1&&!tasks[i].mqueue_request);
     puts("mqueue core: priority/FIFO, segmented payload, quota/name/OFD lifetime, notify, direct handoff, timeout/signal/fault, abandoned import/cookie/wait, allocation cleanup, shutdown PASS");return 0;
 }

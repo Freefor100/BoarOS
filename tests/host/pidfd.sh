@@ -33,7 +33,7 @@ for shift in 12 14; do
         -DBOAROS_USER_SMP=1 -DBOAROS_PAGE_SHIFT="$shift" -DBOAROS_PAGE_CACHE_READAHEAD_PAGES=0 \
         -ffunction-sections -fdata-sections -Itests/host/sync -idirafter include \
         -fsanitize=address,undefined tests/host/pidfd_close.c tests/host/pidfd_close_unavailable.c \
-        fs/open_file.c -Wl,--gc-sections -o "$out/close-$shift"
+        fs/open_file.c kernel/namespace.c -Wl,--gc-sections -o "$out/close-$shift"
     timeout -k 1s 10s "$out/close-$shift"
     cc -std=gnu11 -O2 -Wall -Wextra -Werror -DBOAROS_MAX_CPUS=2 -DBOAROS_PAGE_SHIFT="$shift" \
         -ffunction-sections -fdata-sections -Itests/host/sync -idirafter include \

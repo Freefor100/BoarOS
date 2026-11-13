@@ -12,6 +12,8 @@ struct kernel_pid;
 int kernel_procfs_create(struct kernel_heap *heap, uint64_t flags,
                          struct kernel_vfs_mount **owner);
 int kernel_procfs_is_mount(const struct kernel_vfs_mount *mount);
+/* Only these generated files retain the opener's IPC namespace in their OFD. */
+int kernel_procfs_ipc_file(const struct kernel_vfs_file *file);
 /* Borrowed while the actual opened process-directory file remains owned. */
 struct kernel_pid *kernel_procfs_process_identity(const struct kernel_vfs_file *file);
 /* Called after all users have exited, before the root ext4 unmount. */

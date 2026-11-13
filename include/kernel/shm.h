@@ -64,10 +64,14 @@ _Static_assert(sizeof(struct kernel_shminfo64) == 72, "shminfo64 layout");
 _Static_assert(sizeof(struct kernel_shm_info) == 48 &&
     offsetof(struct kernel_shm_info, shm_tot) == 8, "shm_info layout");
 
+struct kernel_namespace;
+struct kernel_shm_table;
 struct kernel_memory_object;
 struct kernel_uid_account;
 
 struct kernel_shm_segment {
+    struct kernel_namespace *namespace;
+    struct kernel_shm_table *table;
     int32_t shmid;
     uint16_t seq;
     int32_t key;
@@ -95,6 +99,7 @@ struct kernel_shm_segment {
  * Temporary owners do not contribute to the user-visible fragment count. */
 struct kernel_shm_attachment {
     struct kernel_heap *heap;
+    struct kernel_namespace *namespace;
     struct kernel_shm_segment *segment;
     struct kernel_memory_object *memory;
     uint64_t start, end;
@@ -151,7 +156,7 @@ void kernel_shm_attachment_close(struct kernel_shm_attachment *attachment);
 
 /* CPU0 namespace caller, as with shmget/shmctl. Includes attached RMID segments;
  * rss is resident bytes, copied while the segment's memory owner is stable. */
-int kernel_shm_proc_next(uint32_t *cursor, int32_t *id,
+int kernel_shm_proc_next(struct kernel_namespace *,uint32_t *cursor, int32_t *id,
                          struct kernel_shmid64_ds *row, uint64_t *rss);
 
 #endif /* BOAROS_KERNEL_SHM_H */

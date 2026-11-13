@@ -1,4 +1,5 @@
 #include <kernel/sem.h>
+#include <kernel/ipc_namespace.h>
 #include <kernel/avl.h>
 #include <kernel/credentials.h>
 #include <kernel/errno.h>
@@ -30,6 +31,7 @@ struct kernel_sem_undo {
 };
 struct sem_member { int32_t value; struct kernel_pid *pid; };
 struct sem_set {
+    struct kernel_sem_table *table;
     struct kernel_avl_node slot_node, key_node;
     struct kernel_raw_lock lock;
     uint32_t references, removed, nsems;
@@ -52,23 +54,41 @@ struct kernel_sem_request {
     int result;
     struct kernel_sembuf ops[];
 };
-static struct {
+struct kernel_sem_table {
+    uint32_t references;
     struct kernel_raw_lock lock;
-    struct kernel_heap *heap;
     struct kernel_avl_node *slots, *keys;
     uint32_t sets, members, next_slot;
     uint16_t sequence[KERNEL_SEMMNI];
-} sem_table;
+};
+static struct kernel_heap *sem_heap;
 
 static void *sem_allocate(size_t size)
 {
     void *p = 0;
-    enum kernel_heap_status status = kernel_heap_allocate_zeroed(sem_table.heap, 1, size, &p);
+    enum kernel_heap_status status = kernel_heap_allocate_zeroed(sem_heap, 1, size, &p);
     if (status == KERNEL_HEAP_STATUS_EMPTY) return 0;
     if (status != KERNEL_HEAP_STATUS_OK) __builtin_trap();
     return p;
 }
-static void sem_free(void *p) { if (p) kernel_heap_release(sem_table.heap, p); }
+static void sem_free(void *p) { if (p) kernel_heap_release(sem_heap, p); }
+static struct kernel_sem_table *sem_namespace_table(struct kernel_namespace *base,int create)
+{
+    struct kernel_ipc_namespace *ns=kernel_ipc_namespace_state(base);
+    struct kernel_sem_table *table=__atomic_load_n(&ns->sem,__ATOMIC_ACQUIRE);
+    if(table||!create)return table;
+    struct kernel_sem_table *candidate=sem_allocate(sizeof(*candidate));
+    if(!candidate)return 0;
+    candidate->references=1;
+    kernel_raw_lock_init(&candidate->lock,25);
+    {KERNEL_RAW_SCOPE(g,&ns->lock);
+     if(!ns->sem)__atomic_store_n(&ns->sem,candidate,__ATOMIC_RELEASE);
+     table=ns->sem;}
+    if(table!=candidate)sem_free(candidate);
+    return table;
+}
+static void sem_table_put(struct kernel_sem_table *table)
+{if(!__atomic_sub_fetch(&table->references,1,__ATOMIC_ACQ_REL))sem_free(table);}
 static int64_t sem_now(void) { return (int64_t)(kernel_time_realtime_ns() / UINT64_C(1000000000)); }
 static struct sem_set *slot_set(struct kernel_avl_node *n)
 { return n ? (struct sem_set *)((char *)n - offsetof(struct sem_set, slot_node)) : 0; }
@@ -90,14 +110,18 @@ static void set_put(struct sem_set *set)
     if (!set->removed || set->head || set->undo) __builtin_trap();
     for (uint32_t i = 0; i < set->nsems; i++)
         if (set->members[i].pid) kernel_task_identity_put(set->members[i].pid);
+    struct kernel_sem_table *table=set->table;
     sem_free(set);
+    sem_table_put(table);
 }
 static struct sem_set *set_lookup(int32_t id, int by_slot)
 {
     if (id < 0) return 0;
-    KERNEL_RAW_SCOPE(guard, &sem_table.lock);
+    struct kernel_sem_table *table=sem_namespace_table(kernel_task_ipc_namespace(),0);
+    if(!table)return 0;
+    KERNEL_RAW_SCOPE(guard, &table->lock);
     uint32_t slot = by_slot ? (uint32_t)id : ((uint32_t)id & 32767U);
-    struct sem_set *set = slot_set(index_find(sem_table.slots, slot));
+    struct sem_set *set = slot_set(index_find(table->slots, slot));
     if (set && (by_slot || set->id == id)) set_get(set);
     else set = 0;
     return set;
@@ -107,12 +131,14 @@ static void set_descriptor(const struct sem_set *set, struct kernel_semid64_ds *
     *d = (struct kernel_semid64_ds){.sem_perm = set->permission,
         .sem_otime = set->otime, .sem_ctime = set->ctime, .sem_nsems = set->nsems};
 }
-int kernel_sem_proc_next(uint32_t *cursor, int32_t *id, struct kernel_semid64_ds *row)
+int kernel_sem_proc_next(struct kernel_namespace *ns, uint32_t *cursor, int32_t *id, struct kernel_semid64_ds *row)
 {
-    KERNEL_RAW_SCOPE(index, &sem_table.lock);
+    struct kernel_sem_table *table=sem_namespace_table(ns,0);
+    if(!table)return 0;
+    KERNEL_RAW_SCOPE(index, &table->lock);
     struct kernel_avl_node *node = *cursor
-        ? kernel_avl_after(sem_table.slots, (uint64_t)*cursor - 1U)
-        : kernel_avl_first(sem_table.slots);
+        ? kernel_avl_after(table->slots, (uint64_t)*cursor - 1U)
+        : kernel_avl_first(table->slots);
     if (!node) return 0;
     struct sem_set *set = slot_set(node);
     KERNEL_RAW_SCOPE(state, &set->lock);
@@ -153,45 +179,49 @@ static void member_pid_set(struct sem_member *member, struct kernel_pid *pid)
 int kernel_sem_init(struct kernel_heap *heap)
 {
     if (!heap) return -KERNEL_EINVAL;
-    if (sem_table.heap) return sem_table.heap == heap ? 0 : -KERNEL_EINVAL;
-    kernel_raw_lock_init(&sem_table.lock, 25);
-    sem_table.heap = heap;
+    if (sem_heap) return sem_heap == heap ? 0 : -KERNEL_EINVAL;
+    int error=kernel_ipc_namespace_boot(heap);if(error)return error;
+    sem_heap = heap;
     return 0;
 }
 
 int64_t kernel_sem_get(struct kernel_task *task, int32_t key, int32_t nsems, int32_t flags)
 {
     (void)task;
-    if (!sem_table.heap) return -KERNEL_ENOSPC;
+    if (!sem_heap) return -KERNEL_ENOSPC;
     if (nsems < 0 || nsems > (int32_t)KERNEL_SEMMSL) return -KERNEL_EINVAL;
+    struct kernel_sem_table *table=sem_namespace_table(kernel_task_ipc_namespace(),
+        key==KERNEL_IPC_PRIVATE || (flags&KERNEL_IPC_CREAT));
+    if(!table)return key!=KERNEL_IPC_PRIVATE && !(flags&KERNEL_IPC_CREAT)?-KERNEL_ENOENT:-KERNEL_ENOMEM;
     const struct kernel_credentials *cred = kernel_credentials_current();
     struct sem_set *candidate = 0;
     int64_t result;
     for (;;) {
         struct sem_set *found = 0;
         {
-            KERNEL_RAW_SCOPE(guard, &sem_table.lock);
+            KERNEL_RAW_SCOPE(guard, &table->lock);
             if (key != KERNEL_IPC_PRIVATE)
-                found = key_set(index_find(sem_table.keys, (uint32_t)key));
+                found = key_set(index_find(table->keys, (uint32_t)key));
             if (found) set_get(found);
             else if (key != KERNEL_IPC_PRIVATE && !(flags & KERNEL_IPC_CREAT)) result = -KERNEL_ENOENT;
             else if (!nsems) result = -KERNEL_EINVAL;
-            else if (sem_table.sets == KERNEL_SEMMNI ||
-                     (uint32_t)nsems > KERNEL_SEMMNS - sem_table.members) result = -KERNEL_ENOSPC;
+            else if (table->sets == KERNEL_SEMMNI ||
+                     (uint32_t)nsems > KERNEL_SEMMNS - table->members) result = -KERNEL_ENOSPC;
             else if (!candidate) result = INT64_MIN;
             else {
-                uint32_t slot = sem_table.next_slot;
-                while (index_find(sem_table.slots, slot)) slot = (slot + 1) % KERNEL_SEMMNI;
-                sem_table.next_slot = (slot + 1) % KERNEL_SEMMNI;
+                uint32_t slot = table->next_slot;
+                while (index_find(table->slots, slot)) slot = (slot + 1) % KERNEL_SEMMNI;
+                table->next_slot = (slot + 1) % KERNEL_SEMMNI;
                 candidate->slot_node.key = slot;
                 candidate->key_node.key = (uint32_t)key;
-                candidate->permission.seq = sem_table.sequence[slot];
+                candidate->permission.seq = table->sequence[slot];
                 candidate->id = (int32_t)(((uint32_t)candidate->permission.seq << 15) | slot);
-                sem_table.slots = kernel_avl_insert_node(sem_table.slots, &candidate->slot_node);
+                table->slots = kernel_avl_insert_node(table->slots, &candidate->slot_node);
                 if (key != KERNEL_IPC_PRIVATE)
-                    sem_table.keys = kernel_avl_insert_node(sem_table.keys, &candidate->key_node);
-                sem_table.sets++;
-                sem_table.members += (uint32_t)nsems;
+                    table->keys = kernel_avl_insert_node(table->keys, &candidate->key_node);
+                __atomic_fetch_add(&table->references,1,__ATOMIC_RELAXED);
+                table->sets++;
+                table->members += (uint32_t)nsems;
                 result = candidate->id;
                 candidate = 0; /* The namespace now owns the prepared reference. */
             }
@@ -216,6 +246,7 @@ int64_t kernel_sem_get(struct kernel_task *task, int32_t key, int32_t nsems, int
         if (!candidate) { result = -KERNEL_ENOMEM; break; }
         kernel_raw_lock_init(&candidate->lock, 30);
         candidate->references = 1;
+        candidate->table=table;
         candidate->slot_node.height = candidate->key_node.height = 1;
         candidate->nsems = (uint32_t)nsems;
         candidate->ctime = sem_now();
@@ -241,7 +272,7 @@ int kernel_sem_clone(struct kernel_task *parent, struct kernel_task *child, int 
     if (!parent->sem_undo) {
         struct kernel_sem_undo *created=undo_create();
         if (!created) return -KERNEL_ENOMEM;
-        KERNEL_RAW_SCOPE(domain,&kernel_wait_domain);
+        KERNEL_RAW_SCOPE(access,&parent->files_access);
         parent->sem_undo=created;
     }
     struct kernel_sem_undo *group = parent->sem_undo;
@@ -275,7 +306,7 @@ static int request_undo(struct kernel_sem_request *request)
     if (!task->sem_undo) {
         struct kernel_sem_undo *created=undo_create();
         if (!created) return -KERNEL_ENOMEM;
-        KERNEL_RAW_SCOPE(domain,&kernel_wait_domain);
+        KERNEL_RAW_SCOPE(access,&task->files_access);
         task->sem_undo=created;
     }
     struct kernel_sem_undo *group = task->sem_undo;
@@ -543,18 +574,19 @@ static void undo_unlink(struct sem_undo_entry *entry)
 }
 static int set_remove(struct sem_set *set, const struct kernel_credentials *cred)
 {
+    struct kernel_sem_table *table=set->table;
     {
-        KERNEL_RAW_SCOPE(index_guard, &sem_table.lock);
+        KERNEL_RAW_SCOPE(index_guard, &table->lock);
         KERNEL_RAW_SCOPE(set_guard, &set->lock);
         if (set->removed) return -KERNEL_EIDRM;
-        if (!is_owner(set, cred)) return -KERNEL_EPERM;
+        if (cred && !is_owner(set, cred)) return -KERNEL_EPERM;
         set->removed = 1;
-        sem_table.slots = kernel_avl_remove_node(sem_table.slots, &set->slot_node);
+        table->slots = kernel_avl_remove_node(table->slots, &set->slot_node);
         if (set->permission.key != KERNEL_IPC_PRIVATE)
-            sem_table.keys = kernel_avl_remove_node(sem_table.keys, &set->key_node);
-        sem_table.sets--;
-        sem_table.members -= set->nsems;
-        sem_table.sequence[set->slot_node.key]++;
+            table->keys = kernel_avl_remove_node(table->keys, &set->key_node);
+        table->sets--;
+        table->members -= set->nsems;
+        table->sequence[set->slot_node.key]++;
     }
     struct kernel_sem_request *wake = 0;
     struct sem_undo_entry *retired = 0;
@@ -593,12 +625,14 @@ static int64_t sem_info(struct kernel_mm *mm, int32_t cmd, uint64_t arg)
         .semopm = KERNEL_SEMOPM, .semume = KERNEL_SEMOPM, .semusz = 20,
         .semvmx = KERNEL_SEMVMX, .semaem = KERNEL_SEMAEM };
     size_t copied;
-    int64_t max_slot;
-    {
-        KERNEL_RAW_SCOPE(guard, &sem_table.lock);
-        struct kernel_avl_node *last = kernel_avl_last(sem_table.slots);
+    int64_t max_slot=0;
+    struct kernel_sem_table *table=sem_namespace_table(kernel_task_ipc_namespace(),0);
+    if(cmd==KERNEL_SEM_INFO)info.semusz=info.semaem=0;
+    if(table) {
+        KERNEL_RAW_SCOPE(guard, &table->lock);
+        struct kernel_avl_node *last = kernel_avl_last(table->slots);
         max_slot = last ? (int64_t)last->key : 0;
-        if (cmd == KERNEL_SEM_INFO) { info.semusz = (int32_t)sem_table.sets; info.semaem = (int32_t)sem_table.members; }
+        if (cmd == KERNEL_SEM_INFO) { info.semusz = (int32_t)table->sets; info.semaem = (int32_t)table->members; }
     }
     return kernel_copy_to_user(mm, arg, &info, sizeof(info), &copied) ? -KERNEL_EFAULT : max_slot;
 }
@@ -665,7 +699,7 @@ int64_t kernel_sem_ctl(struct kernel_task *task, struct kernel_mm *mm, int32_t i
         KERNEL_RAW_SCOPE(guard, &set->lock);
         if (set->removed) { result = -KERNEL_EIDRM; goto unlock; }
         if (cmd == KERNEL_IPC_SET) {
-            if (!is_owner(set, cred)) { result = -KERNEL_EPERM; goto unlock; }
+            if (cred && !is_owner(set, cred)) { result = -KERNEL_EPERM; goto unlock; }
             if (descriptor.sem_perm.uid == UINT32_MAX || descriptor.sem_perm.gid == UINT32_MAX) {
                 result = -KERNEL_EINVAL;
                 goto unlock;
@@ -761,7 +795,7 @@ void kernel_sem_exit(struct kernel_task *task)
     kernel_sem_abort(task);
     struct kernel_sem_undo *group;
     {
-        KERNEL_RAW_SCOPE(domain,&kernel_wait_domain);
+        KERNEL_RAW_SCOPE(access,&task->files_access);
         group=task->sem_undo;
         task->sem_undo=0;
     }
@@ -814,4 +848,14 @@ void kernel_sem_exit(struct kernel_task *task)
     }
     if (pid) kernel_task_identity_put(pid);
     sem_free(group);
+}
+
+void kernel_sem_namespace_destroy(struct kernel_sem_table *table)
+{
+    if(!table)return;
+    while(table->slots){
+        struct sem_set *set=slot_set(kernel_avl_first(table->slots));
+        if(set_remove(set,0))__builtin_trap();
+    }
+    sem_table_put(table);
 }

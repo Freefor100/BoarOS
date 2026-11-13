@@ -2,6 +2,8 @@
 #define BOAROS_KERNEL_MQUEUE_H
 #include <stddef.h>
 #include <stdint.h>
+struct kernel_namespace;
+struct kernel_mqueue_tree;
 struct kernel_heap;
 struct kernel_task;
 struct kernel_mm;
@@ -51,30 +53,33 @@ int kernel_mqueue_read(struct kernel_open_file_description *,uint64_t offset,
 int kernel_mqueue_name(struct kernel_open_file_description *,char *,size_t);
 int kernel_mqueue_reopen(struct kernel_open_file_description *,struct kernel_heap *,uint32_t,
     struct kernel_open_file_description **);
-/* Filesystem nodes and OFDs own queue references independently of the name.
- * Every mount sees the same registry; unlink only removes name discovery. */
-int kernel_mqueue_fs_create(struct kernel_heap *,uint64_t,struct kernel_vfs_mount **);
+/* Mounts own a tree independently of the namespace; queue OFDs retain the
+ * original queue. An orphan tree permits existing operations but no creation. */
+struct kernel_mqueue_tree *kernel_mqueue_namespace_tree(struct kernel_namespace *,int create);
+void kernel_mqueue_tree_get(struct kernel_mqueue_tree *);
+void kernel_mqueue_tree_put(struct kernel_mqueue_tree *);
+int kernel_mqueue_fs_create(struct kernel_heap *,uint64_t,struct kernel_namespace *,struct kernel_vfs_mount **);
 int kernel_mqueue_fs_is_mount(const struct kernel_vfs_mount *);
 /* Success moves the real VFS file into the new OFD and clears the source. */
 int kernel_mqueue_fs_open(struct kernel_heap *,struct kernel_vfs_file *,uint32_t,
     struct kernel_open_file_description **);
-struct kernel_mqueue *kernel_mqueue_lookup_name(const char *,size_t);
-struct kernel_mqueue *kernel_mqueue_lookup_inode(uint64_t);
+struct kernel_mqueue *kernel_mqueue_lookup_name(struct kernel_mqueue_tree *,const char *,size_t);
+struct kernel_mqueue *kernel_mqueue_lookup_inode(struct kernel_mqueue_tree *,uint64_t);
 void kernel_mqueue_get(struct kernel_mqueue *);
 void kernel_mqueue_put(struct kernel_mqueue *);
-int kernel_mqueue_create_name(struct kernel_task *,const char *,uint32_t,
+int kernel_mqueue_create_name(struct kernel_mqueue_tree *,struct kernel_task *,const char *,uint32_t,
     const struct kernel_mq_attr *,int exclusive,struct kernel_mqueue **,int *created);
-int kernel_mqueue_remove_name(const char *,size_t);
+int kernel_mqueue_remove_name(struct kernel_mqueue_tree *,const char *,size_t);
 int kernel_mqueue_queue_stat(struct kernel_mqueue *,struct kernel_vfs_stat *);
 int kernel_mqueue_queue_set_mode(struct kernel_mqueue *,uint32_t);
 int kernel_mqueue_queue_set_owner(struct kernel_mqueue *,uint32_t,uint32_t);
 int kernel_mqueue_queue_set_times(struct kernel_mqueue *,const struct kernel_vfs_timespec *);
 int kernel_mqueue_queue_read(struct kernel_mqueue *,uint64_t,void *,size_t,size_t *);
 int kernel_mqueue_queue_permission(struct kernel_mqueue *,unsigned);
-int kernel_mqueue_root_stat(struct kernel_vfs_stat *);
-int kernel_mqueue_root_permission(unsigned);
-int kernel_mqueue_root_set_mode(uint32_t);
-int kernel_mqueue_root_set_owner(uint32_t,uint32_t);
-int kernel_mqueue_root_set_times(const struct kernel_vfs_timespec *);
-int kernel_mqueue_next(uint64_t *,uint64_t *,char *,size_t);
+int kernel_mqueue_root_stat(struct kernel_mqueue_tree *,struct kernel_vfs_stat *);
+int kernel_mqueue_root_permission(struct kernel_mqueue_tree *,unsigned);
+int kernel_mqueue_root_set_mode(struct kernel_mqueue_tree *,uint32_t);
+int kernel_mqueue_root_set_owner(struct kernel_mqueue_tree *,uint32_t,uint32_t);
+int kernel_mqueue_root_set_times(struct kernel_mqueue_tree *,const struct kernel_vfs_timespec *);
+int kernel_mqueue_next(struct kernel_mqueue_tree *,uint64_t *,uint64_t *,char *,size_t);
 #endif

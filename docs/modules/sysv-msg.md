@@ -4,7 +4,7 @@
 
 RV64 和 LA64 提供原生 Linux `msgget(186)`、`msgctl(187)`、`msgrcv(188)`、`msgsnd(189)`。消息由一个正的 64 位类型和最多 8192 字节正文组成；新队列默认容纳 16384 字节，最多同时存在 32000 个队列。正文长度不包含类型字段。队列通过私有创建或 key 查找取得带代次的 ID，创建者退出后仍然存在，直到 `IPC_RMID`。
 
-ID 和 key 分别通过 AVL 索引查找。命名空间保护只负责发现、配额与 ID 代次；每个队列独立保护权限、消息链、发送者和接收者等待链。调用者在自己的 CPU 完成导入、权限检查、队列更新和返回；普通操作没有业务 worker 或 CPU0 交接。普通发送只查询索引和目标队列，不扫描全部队列。全局消息数和字节数在入队、出队及删除时更新，`MSG_INFO` 直接读取计数。
+ID 和 key 分别通过 AVL 索引查找。命名空间保护只负责发现、配额与 ID 代次；每个队列独立保护权限、消息链、发送者和接收者等待链。调用者在自己的 CPU 完成导入、权限检查、队列更新和返回；普通操作没有业务 worker 或 CPU0 交接。普通发送只查询索引和目标队列，不扫描全部队列。空间内消息数和字节数在入队、出队及删除时更新，`MSG_INFO` 直接读取计数。
 
 `msgctl` 支持 `IPC_SET/STAT/RMID/INFO`、`MSG_STAT/INFO/STAT_ANY`。IPC 权限沿用公共 effective UID、补充组、creator/owner、`CAP_IPC_OWNER` 和 `CAP_SYS_ADMIN` 规则；增加容量超过系统默认值需要 `CAP_SYS_RESOURCE`。原生 64 位命令直接解释，不剥离 `IPC_64`。控制结构使用 48 字节 `ipc64_perm`、120 字节 `msqid64_ds` 和 32 字节 `msginfo`；`IPC_SET` 的 qbytes 经过 Linux 控制路径相同的有符号 32 位参数转换。固定依据为 `references/linux/ipc/msg.c`、`ipc/msgutil.c` 和对应 UAPI，来源版本集中见 `references/sources.tsv`。
 
@@ -37,4 +37,4 @@ python3 tests/userland/run.py --workload sysv_msg --only boaros --cpus 4 --memor
 
 `tests/workloads/network/sysv_msg.c` 检查 libc 与原生系统调用、选择顺序、零长度容量、控制布局与命令、完整 `MSG_COPY`、输入输出错误、进程间交换、信号及每个允许 CPU 上的实际调用。数字 UID/GID 1001 的子进程通过管道握手，分别检查 0600 拒绝、0666 允许收发、管理操作仍拒绝及 `MSG_STAT_ANY` 的权限例外，不依赖用户数据库。Linux 对照与 BoarOS 运行结果由 runner 分别记录。
 
-`/proc/sysvipc/msg` 提供当前队列的真实元数据列表，沿 `msgctl` 共用的描述符生成函数取得队列状态；读取所有权和重读规则见 [procfs 模块](procfs.md)。`msgctl` 继续提供索引枚举和统计接口。当前不提供 IPC namespace 和运行时 IPC sysctl。
+`/proc/sysvipc/msg` 提供当前队列的真实元数据列表，沿 `msgctl` 共用的描述符生成函数取得队列状态；读取所有权和重读规则见 [procfs 模块](procfs.md)。`msgctl` 继续提供索引枚举和统计接口。命名空间隔离与最终回收见 [IPC 命名空间](ipc-namespace.md)；当前不提供运行时 IPC sysctl。

@@ -1,5 +1,6 @@
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/virt_uart.h>
+#include <arch/context.h>
 
 #define SBI_SUCCESS 0L
 
@@ -10,6 +11,7 @@
 #define SBI_EXT_SRST 0x53525354UL
 #define SBI_SRST_FID_SYSTEM_RESET 0UL
 #define SBI_SRST_SHUTDOWN 0UL
+#define SBI_SRST_COLD_REBOOT 1UL
 #define SBI_SRST_REASON_NONE 0UL
 
 struct sbi_ret {
@@ -76,16 +78,26 @@ long sbi_remote_sfence(uint64_t hart, uint64_t address, uint64_t size)
 long sbi_remote_fence_i(uint64_t hart)
 { return sbi_ecall(SBI_EXT_RFENCE, 0, 1, hart, 0, 0).error; }
 
-void sbi_shutdown(void)
+void sbi_halt(void)
 {
-    (void)sbi_ecall(SBI_EXT_SRST,
-                    SBI_SRST_FID_SYSTEM_RESET,
-                    SBI_SRST_SHUTDOWN,
-                    SBI_SRST_REASON_NONE, 0U, 0U);
-
-    virt_uart_puts("BoarOS: SBI shutdown failed\n");
-
+    (void)arch_interrupt_save();
     for (;;) {
         asm volatile("wfi");
     }
 }
+
+static void sbi_system_reset(unsigned long type) __attribute__((noreturn));
+static void sbi_system_reset(unsigned long type)
+{
+    struct sbi_ret result=sbi_ecall(SBI_EXT_SRST,
+        SBI_SRST_FID_SYSTEM_RESET, type, SBI_SRST_REASON_NONE, 0U, 0U);
+    virt_uart_puts("BoarOS: SBI system reset returned type=");
+    virt_uart_put_hex(type);
+    virt_uart_puts(" error=");
+    virt_uart_put_hex((unsigned long)result.error);
+    virt_uart_puts("\n");
+    sbi_halt();
+}
+
+void sbi_shutdown(void) { sbi_system_reset(SBI_SRST_SHUTDOWN); }
+void sbi_cold_reboot(void) { sbi_system_reset(SBI_SRST_COLD_REBOOT); }

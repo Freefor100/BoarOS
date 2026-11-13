@@ -120,10 +120,9 @@ enum riscv_root_boot_status riscv_root_boot_start_with_irq(
 enum riscv_root_boot_status riscv_root_boot_cleanup(
     struct riscv_root_boot *root);
 
-/* Call only after the scheduler has completely reaped PID 1. */
+/* Call only after the scheduler has released all user tasks and resources. */
 enum riscv_root_boot_status riscv_root_boot_finish(
     struct riscv_root_boot *root,
-    const struct kernel_thread_completion *completion,
     struct kernel_heap_statistics *heap_statistics,
     uint64_t *available_pages);
 

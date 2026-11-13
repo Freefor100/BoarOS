@@ -12,6 +12,7 @@ struct kernel_heap;
 struct kernel_vfs_stat;
 struct kernel_credentials;
 struct kernel_mm_proc_map;
+struct kernel_namespace;
 
 enum kernel_proc_path_kind {
     KERNEL_PROC_PATH_EXE = 1,
@@ -64,7 +65,9 @@ int kernel_proc_inode_owner(kernel_pid_t,uint64_t,int thread,uint32_t mode,uint3
 int kernel_proc_process_identity(kernel_pid_t pid, uint64_t *identity);
 struct kernel_fs_mounts;
 int kernel_proc_mounts_snapshot(kernel_pid_t,uint64_t,struct kernel_fs_mounts *);
-int kernel_proc_mount_handle(kernel_pid_t,uint64_t,struct kernel_fs_mounts *);
+int kernel_proc_namespace_handle(kernel_pid_t,uint64_t,uint32_t,struct kernel_namespace **);
+/* Requested entries are returned with real references, in MNT/UTS/IPC order. */
+int kernel_proc_namespaces_handle(kernel_pid_t,uint64_t,uint32_t,int fscreds,struct kernel_namespace *owners[3]);
 /* Retain the already resolved proc process inode's identity, not a later
  * numeric lookup. The node releases this owner after its final reference. */
 int kernel_proc_process_identity_acquire(kernel_pid_t pid,uint64_t identity,

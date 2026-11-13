@@ -1,5 +1,6 @@
 #include <kernel/credentials.h>
 #include <kernel/shm.h>
+#include <kernel/ipc_namespace.h>
 #include <kernel/heap.h>
 #include <kernel/physical_page.h>
 #include <kernel/memory_object.h>
@@ -21,12 +22,35 @@ struct kernel_shm_table {
     struct kernel_shm_segment segments[KERNEL_SHMMNI];
     struct kernel_heap *heap;
     struct physical_page_allocator *allocator;
+    struct kernel_namespace *namespace;
     int initialized;
 };
 
-static struct kernel_shm_table shm_table;
+static struct kernel_heap *shm_heap;
+static struct physical_page_allocator *shm_allocator;
+static struct kernel_shm_table empty_shm_table={.initialized=1};
 static uint64_t next_shm_file_identity = 1;
 
+static struct kernel_shm_table *shm_namespace_table(struct kernel_namespace *base,int create)
+{
+    struct kernel_ipc_namespace *ns=kernel_ipc_namespace_state(base);
+    struct kernel_shm_table *table=__atomic_load_n(&ns->shm,__ATOMIC_ACQUIRE);
+    if(table||!create)return table;
+    struct kernel_shm_table *candidate=0;
+    enum kernel_heap_status status=kernel_heap_allocate_zeroed(base->heap,1,sizeof(*candidate),(void **)&candidate);
+    if(status)return 0;
+    candidate->heap=base->heap;candidate->allocator=shm_allocator;
+    candidate->namespace=base;candidate->initialized=1;
+    for(uint32_t i=0;i<KERNEL_SHMMNI;i++){
+        candidate->segments[i].shmid=-1;candidate->segments[i].seq=1;
+        candidate->segments[i].namespace=base;candidate->segments[i].table=candidate;
+    }
+    {KERNEL_RAW_SCOPE(g,&ns->lock);
+     if(!ns->shm)__atomic_store_n(&ns->shm,candidate,__ATOMIC_RELEASE);
+     table=ns->shm;}
+    if(table!=candidate)kernel_heap_release(base->heap,candidate);
+    return table;
+}
 static void shm_descriptor(const struct kernel_shm_segment *seg, struct kernel_shmid64_ds *ds)
 {
     *ds = (struct kernel_shmid64_ds){
@@ -40,12 +64,14 @@ static void shm_descriptor(const struct kernel_shm_segment *seg, struct kernel_s
     };
 }
 
-int kernel_shm_proc_next(uint32_t *cursor, int32_t *id,
+int kernel_shm_proc_next(struct kernel_namespace *ns, uint32_t *cursor, int32_t *id,
                          struct kernel_shmid64_ds *row, uint64_t *rss)
 {
+    struct kernel_shm_table *table=shm_namespace_table(ns,0);
+    if(!table)return 0;
     uintptr_t irq = arch_interrupt_save();
     while (*cursor < KERNEL_SHMMNI) {
-        const struct kernel_shm_segment *seg = &shm_table.segments[(*cursor)++];
+        const struct kernel_shm_segment *seg = &table->segments[(*cursor)++];
         if (!seg->active) continue;
         *id = seg->shmid;
         shm_descriptor(seg, row);
@@ -126,24 +152,9 @@ enum kernel_shm_status kernel_shm_init(
     if (heap == 0 || allocator == 0) {
         return KERNEL_SHM_STATUS_INVALID_ARGUMENT;
     }
-    uintptr_t irq = arch_interrupt_save();
-    shm_table.heap = heap;
-    shm_table.allocator = allocator;
-    if (!shm_table.initialized) {
-        for (uint32_t i = 0U; i < KERNEL_SHMMNI; i++) {
-            shm_table.segments[i].shmid = -1;
-            shm_table.segments[i].seq = 1U;
-            shm_table.segments[i].key = KERNEL_IPC_PRIVATE;
-            shm_table.segments[i].size = 0;
-            shm_table.segments[i].aligned_size = 0;
-            shm_table.segments[i].memory = 0;
-            shm_table.segments[i].nattch = 0;
-            shm_table.segments[i].active = 0;
-            shm_table.segments[i].marked_for_deletion = 0;
-        }
-        shm_table.initialized = 1;
-    }
-    arch_interrupt_restore(irq);
+    if(shm_heap && (shm_heap!=heap || shm_allocator!=allocator))return KERNEL_SHM_STATUS_INVALID_ARGUMENT;
+    if(kernel_ipc_namespace_boot(heap))return KERNEL_SHM_STATUS_INVALID_ARGUMENT;
+    shm_heap=heap;shm_allocator=allocator;
     return KERNEL_SHM_STATUS_OK;
 }
 
@@ -154,16 +165,20 @@ int kernel_shm_get(struct kernel_task *caller, int32_t key, uint64_t size,
         return -KERNEL_EFAULT;
     }
     int32_t caller_pid = current_tgid(caller);
+    if(!shm_heap||!shm_allocator)return -KERNEL_ENOSPC;
+    struct kernel_shm_table *table=shm_namespace_table(kernel_task_ipc_namespace(),
+        key==KERNEL_IPC_PRIVATE || (shmflg&KERNEL_IPC_CREAT));
+    if(!table)return key!=KERNEL_IPC_PRIVATE && !(shmflg&KERNEL_IPC_CREAT)?-KERNEL_ENOENT:-KERNEL_ENOMEM;
 
     uintptr_t irq = arch_interrupt_save();
-    if (!shm_table.initialized || shm_table.heap == 0 || shm_table.allocator == 0) {
+    if (!table->initialized || table->heap == 0 || table->allocator == 0) {
         arch_interrupt_restore(irq);
         return -KERNEL_ENOSPC;
     }
 
     if (key != KERNEL_IPC_PRIVATE) {
         for (uint32_t i = 0U; i < KERNEL_SHMMNI; i++) {
-            struct kernel_shm_segment *seg = &shm_table.segments[i];
+            struct kernel_shm_segment *seg = &table->segments[i];
             if (seg->active && !seg->marked_for_deletion && seg->key == key) {
                 if ((shmflg & (KERNEL_IPC_CREAT | KERNEL_IPC_EXCL)) ==
                     (KERNEL_IPC_CREAT | KERNEL_IPC_EXCL)) {
@@ -199,7 +214,7 @@ int kernel_shm_get(struct kernel_task *caller, int32_t key, uint64_t size,
     /* Allocate new slot */
     int slot_idx = -1;
     for (uint32_t i = 0U; i < KERNEL_SHMMNI; i++) {
-        if (!shm_table.segments[i].active) {
+        if (!table->segments[i].active) {
             slot_idx = (int)i;
             break;
         }
@@ -209,10 +224,10 @@ int kernel_shm_get(struct kernel_task *caller, int32_t key, uint64_t size,
         return -KERNEL_ENOSPC;
     }
 
-    struct kernel_shm_segment *new_seg = &shm_table.segments[slot_idx];
+    struct kernel_shm_segment *new_seg = &table->segments[slot_idx];
     struct kernel_memory_object *mem = 0;
     enum kernel_memory_object_status mem_status =
-        kernel_memory_object_create(shm_table.heap, shm_table.allocator, &mem);
+        kernel_memory_object_create(table->heap, table->allocator, &mem);
     if (mem_status != KERNEL_MEMORY_OBJECT_OK) {
         arch_interrupt_restore(irq);
         return mem_status == KERNEL_MEMORY_OBJECT_NO_MEMORY ? -KERNEL_ENOMEM
@@ -256,22 +271,20 @@ int kernel_shm_at_mm(struct kernel_mm *mm, int32_t caller_pid, int32_t shmid, ui
         return -KERNEL_EINVAL;
     }
     uint32_t slot_idx = (uint32_t)shmid % KERNEL_SHMMNI;
+    struct kernel_shm_table *table=shm_namespace_table(kernel_task_ipc_namespace(),0);
+    if(!table)return -KERNEL_EINVAL;
 
     uintptr_t irq = arch_interrupt_save();
-    if (!shm_table.initialized) {
+    if (!table->initialized) {
         arch_interrupt_restore(irq);
         return -KERNEL_EINVAL;
     }
-    struct kernel_shm_segment *seg = &shm_table.segments[slot_idx];
+    struct kernel_shm_segment *seg = &table->segments[slot_idx];
     if (!seg->active || seg->shmid != shmid) {
         arch_interrupt_restore(irq);
         return -KERNEL_EINVAL;
     }
-    if (seg->marked_for_deletion) {
-        arch_interrupt_restore(irq);
-        return -KERNEL_EIDRM;
-    }
-
+    /* Linux permits another shmat by ID while an RMID segment remains alive. */
     unsigned requested=(shmflg&KERNEL_SHM_RDONLY)?4U:6U;
     if(shmflg&KERNEL_SHM_EXEC)requested|=1;
     int permission=shm_permission(seg,requested);
@@ -363,7 +376,7 @@ enum kernel_shm_status kernel_shm_attachment_create(
         (source && (source->segment != segment || !source->file_identity)) ||
         (!source && !next_shm_file_identity)) __builtin_trap();
     enum kernel_heap_status status = kernel_heap_allocate_zeroed(
-        shm_table.heap, 1, sizeof(*attachment), (void **)&attachment);
+        segment->table->heap, 1, sizeof(*attachment), (void **)&attachment);
     if (status != KERNEL_HEAP_STATUS_OK) {
         arch_interrupt_restore(irq);
         if (status != KERNEL_HEAP_STATUS_EMPTY) __builtin_trap();
@@ -372,7 +385,7 @@ enum kernel_shm_status kernel_shm_attachment_create(
     if (kernel_memory_object_acquire(segment->memory) != KERNEL_MEMORY_OBJECT_OK)
         __builtin_trap();
     *attachment = (struct kernel_shm_attachment){
-        .heap = shm_table.heap, .segment = segment, .memory = segment->memory,
+        .heap = segment->table->heap, .namespace=kernel_namespace_get(segment->namespace), .segment = segment, .memory = segment->memory,
         .start = start, .end = end, .shmid = segment->shmid, .references = 1,
         .file_identity = source ? source->file_identity : next_shm_file_identity++,
     };
@@ -399,7 +412,9 @@ void kernel_shm_attachment_release(struct kernel_shm_attachment **owner)
     struct kernel_shm_attachment *attachment = *owner;
     attachment_valid(attachment);
     *owner = 0;
+    struct kernel_namespace *namespace=0;
     if (--attachment->references == 0) {
+        namespace=attachment->namespace;
         struct kernel_shm_segment *segment = attachment->segment;
         kernel_memory_object_release(&attachment->memory);
         segment->attachments--;
@@ -408,6 +423,7 @@ void kernel_shm_attachment_release(struct kernel_shm_attachment **owner)
             kernel_shm_destroy_segment_locked(segment);
     }
     arch_interrupt_restore(irq);
+    if(namespace)kernel_namespace_put(namespace);
 }
 
 void kernel_shm_attachment_open(struct kernel_shm_attachment *attachment)
@@ -455,8 +471,10 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
         }
     }
 
+    struct kernel_shm_table *table=shm_namespace_table(kernel_task_ipc_namespace(),0);
+    if(!table)table=&empty_shm_table;
     uintptr_t irq = arch_interrupt_save();
-    if (!shm_table.initialized) {
+    if (!table->initialized) {
         arch_interrupt_restore(irq);
         return -KERNEL_EINVAL;
     }
@@ -474,7 +492,7 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
         if (pure_cmd == KERNEL_IPC_INFO || pure_cmd == KERNEL_SHM_INFO) {
             /* CPU0 段表保护覆盖槽身份和 memory owner；驻留页数由对象原子读取。 */
             for (uint32_t i = 0; i < KERNEL_SHMMNI; i++) {
-                const struct kernel_shm_segment *seg = &shm_table.segments[i];
+                const struct kernel_shm_segment *seg = &table->segments[i];
                 if (!seg->active) continue;
                 result = i;
                 if (pure_cmd == KERNEL_SHM_INFO) {
@@ -494,7 +512,7 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
                 size = sizeof(snapshot.usage);
             }
         } else {
-            struct kernel_shm_segment *seg = &shm_table.segments[(uint32_t)shmid % KERNEL_SHMMNI];
+            struct kernel_shm_segment *seg = &table->segments[(uint32_t)shmid % KERNEL_SHMMNI];
             /* SHM_STAT* 按槽枚举并返回当前完整 ID；IPC_STAT 还校验代次。 */
             if (!seg->active || (pure_cmd == KERNEL_IPC_STAT && seg->shmid != shmid)) {
                 arch_interrupt_restore(irq);
@@ -523,7 +541,7 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
     }
 
     uint32_t slot_idx = (uint32_t)shmid % KERNEL_SHMMNI;
-    struct kernel_shm_segment *seg = &shm_table.segments[slot_idx];
+    struct kernel_shm_segment *seg = &table->segments[slot_idx];
     if (!seg->active || seg->shmid != shmid) {
         arch_interrupt_restore(irq);
         return -KERNEL_EINVAL;
@@ -597,4 +615,15 @@ int kernel_shm_ctl(struct kernel_task *caller, int32_t shmid, int32_t cmd,
         (void)kernel_task_mm_borrow_mutable(caller, &mm);
     }
     return kernel_shm_ctl_mm(mm, shmid, cmd, user_buf, out_result);
+}
+
+void kernel_shm_namespace_destroy(struct kernel_shm_table *table)
+{
+    if(!table)return;
+    for(uint32_t i=0;i<KERNEL_SHMMNI;i++){
+        struct kernel_shm_segment *seg=&table->segments[i];
+        if(seg->attachments||seg->nattch)__builtin_trap();
+        kernel_shm_destroy_segment_locked(seg);
+    }
+    kernel_heap_release(table->heap,table);
 }

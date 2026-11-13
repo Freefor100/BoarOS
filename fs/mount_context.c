@@ -9,6 +9,7 @@
 #include <kernel/devpts.h>
 #include <kernel/procfs.h>
 #include <kernel/mqueue.h>
+#include <kernel/ipc_namespace.h>
 #include <kernel/bpf.h>
 #include <string.h>
 
@@ -78,7 +79,7 @@ int kernel_mount_create(const struct kernel_fs_context *fs,const struct kernel_m
         !strcmp(p->type,"tracefs")?kernel_tracefs_mount(fs->heap,p->flags&1U,&mount):
         !strcmp(p->type,"sysfs")?kernel_sysfs_mount(fs->heap,p->flags&1U,&mount):
         !strcmp(p->type,"devpts")?kernel_devpts_create(fs->heap,p->flags&1U,p->options,&mount):
-        !strcmp(p->type,"mqueue")?kernel_mqueue_fs_create(fs->heap,p->flags&1U,&mount):
+        !strcmp(p->type,"mqueue")?kernel_mqueue_fs_create(fs->heap,p->flags&1U,p->ipc_namespace?p->ipc_namespace:kernel_task_ipc_namespace(),&mount):
         !strcmp(p->type,"tmpfs")?kernel_tmpfs_create(fs->heap,p->flags&1U,p->options,&mount):
         kernel_procfs_create(fs->heap,p->flags&1U,&mount);
     kernel_credentials_override(previous);
@@ -99,6 +100,7 @@ static void context_release(void *object)
     struct mount_context *ctx=object;
     kernel_mount_discard(&ctx->root);
     kernel_credentials_put(ctx->creator);
+    if(ctx->parameters.ipc_namespace)kernel_namespace_put(ctx->parameters.ipc_namespace);
     kernel_heap_release(ctx->heap,ctx);
 }
 static int context_read(void *object,struct kernel_task *task,uint32_t flags,
@@ -117,6 +119,8 @@ int kernel_mount_context_open(struct kernel_heap *heap,const char *type,struct k
     ctx->heap=heap;ctx->creator=kernel_credentials_get(kernel_credentials_current());
     kernel_mutex_init(&ctx->lock,12,(uintptr_t)ctx);
     if(type)memcpy(ctx->parameters.type,type,strlen(type)+1);
+    if(type&&!strcmp(type,"mqueue")&&!root)
+        ctx->parameters.ipc_namespace=kernel_namespace_get(kernel_task_ipc_namespace());
     if(root) {
         int error=kernel_vfs_clone_tree(root,0,&ctx->root);
         if(!error)error=kernel_vfs_change_propagation(ctx->root,UINT64_C(262144),0);

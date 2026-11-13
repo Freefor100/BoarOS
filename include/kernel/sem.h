@@ -36,6 +36,7 @@ _Static_assert(sizeof(struct kernel_sembuf) == 6, "sembuf layout");
 _Static_assert(sizeof(struct kernel_semid64_ds) == 88, "semid64_ds layout");
 _Static_assert(sizeof(struct kernel_seminfo) == 40, "seminfo layout");
 
+struct kernel_namespace;
 struct kernel_heap;
 struct kernel_task;
 struct kernel_mm;
@@ -54,5 +55,5 @@ int kernel_sem_clone(struct kernel_task *parent, struct kernel_task *child, int 
 void kernel_sem_abort(struct kernel_task *);
 void kernel_sem_exit(struct kernel_task *);
 /* Slot cursor starts at zero; the copied row holds no set/undo/PID owners. */
-int kernel_sem_proc_next(uint32_t *cursor, int32_t *id, struct kernel_semid64_ds *row);
+int kernel_sem_proc_next(struct kernel_namespace *,uint32_t *cursor, int32_t *id, struct kernel_semid64_ds *row);
 #endif

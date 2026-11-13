@@ -165,7 +165,7 @@ struct kernel_vfs_backend {
     /* Generated files return an owned, single-read-epoch snapshot. The OFD
      * releases it and creates a new one after seek to offset zero. */
     int (*snapshot)(struct kernel_vfs_node *node, struct kernel_heap *heap,
-        char **buffer, size_t *length);
+        struct kernel_namespace *ipc_namespace, char **buffer, size_t *length);
     /* Controls use a complete kernel buffer and return the new position,
      * which can differ from old position + accepted bytes. The files layer
      * commits that position only after successful user copying. */

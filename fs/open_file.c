@@ -3,6 +3,9 @@
 #include <kernel/tmpfs.h>
 #include <kernel/pidfd.h>
 #include "open_file_internal.h"
+#include <kernel/namespace.h>
+#include <kernel/procfs.h>
+#include <kernel/ipc_namespace.h>
 #include "block_file_internal.h"
 #include "record_lock.h"
 #include "pipe_internal.h"
@@ -285,6 +288,8 @@ static void initialize_path_description(struct kernel_open_file_description *fil
     kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
     if (file->kind!=KERNEL_OPEN_FILE_KIND_PATH && kernel_vfs_file_generated(&file->file))
         file->kind = KERNEL_OPEN_FILE_KIND_GENERATED;
+    if (file->kind==KERNEL_OPEN_FILE_KIND_GENERATED && kernel_procfs_ipc_file(&file->file))
+        file->ipc_proc_namespace=kernel_namespace_get(kernel_task_ipc_namespace());
     file->observed_writeback_error = kernel_vfs_error_sequence(&file->file);
     file->credentials = kernel_credentials_get(kernel_credentials_current());
 }
@@ -699,7 +704,7 @@ uint64_t kernel_open_file_pseudo_identity(
     const struct kernel_open_file_description *file)
 {
     if (!open_file_live(file)) return 0U;
-    if (file->kind==KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE) return file->proc_identity;
+    if (file->kind==KERNEL_OPEN_FILE_KIND_NAMESPACE) return file->proc_identity;
     if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE)
         return kernel_pipe_proc_identity(file->pipe);
     if (file->kind == KERNEL_OPEN_FILE_KIND_SOCKET)
@@ -722,7 +727,7 @@ int kernel_open_file_pseudo_stat(
         *stat=(struct kernel_vfs_stat){.mode=0600U,.nlink=1,
             .blksize=BOAROS_PAGE_SIZE};return 0;
     }
-    if (file->kind==KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE) {
+    if (file->kind==KERNEL_OPEN_FILE_KIND_NAMESPACE) {
         *stat=(struct kernel_vfs_stat){.mode=KERNEL_VFS_S_IFREG|0444U,.nlink=1,
             .ino=file->proc_identity,.blksize=BOAROS_PAGE_SIZE};
         return 0;
@@ -817,8 +822,8 @@ enum kernel_open_file_kind kernel_open_file_kind(
     case KERNEL_OPEN_FILE_KIND_FS_CONTEXT: return KERNEL_OPEN_FILE_KIND_FS_CONTEXT;
     case KERNEL_OPEN_FILE_KIND_BPF:
         return KERNEL_OPEN_FILE_KIND_BPF;
-    case KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE:
-        return KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE;
+    case KERNEL_OPEN_FILE_KIND_NAMESPACE:
+        return KERNEL_OPEN_FILE_KIND_NAMESPACE;
     case KERNEL_OPEN_FILE_KIND_INOTIFY:
         return KERNEL_OPEN_FILE_KIND_INOTIFY;
     case KERNEL_OPEN_FILE_KIND_MQUEUE:
@@ -920,7 +925,9 @@ static void close_cpu0(void *argument)
 
 static int close_is_local(const struct kernel_open_file_description *file)
 {
-    if(file->mount_tree || file->kind==KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE)return 0;
+    if(file->mount_tree || file->ipc_proc_namespace || (file->kind==KERNEL_OPEN_FILE_KIND_NAMESPACE &&
+        kernel_namespace_file(file)->type!=KERNEL_NS_UTS))return 0;
+    if(file->kind==KERNEL_OPEN_FILE_KIND_NAMESPACE)return !file->ep_items;
     if(file->kind==KERNEL_OPEN_FILE_KIND_MQUEUE)return 1;
     if(file->kind==KERNEL_OPEN_FILE_KIND_INOTIFY || file->kind==KERNEL_OPEN_FILE_KIND_BPF)return !file->ep_items;
     if (file->vfs_closed) return 1;
@@ -963,7 +970,7 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
     }
     if (file->generated_ready) kernel_open_file_reset_generated(file);
     if (!file->vfs_closed) {
-        if (file->kind == KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE || file->kind == KERNEL_OPEN_FILE_KIND_FS_CONTEXT) {
+        if (file->kind == KERNEL_OPEN_FILE_KIND_NAMESPACE || file->kind == KERNEL_OPEN_FILE_KIND_FS_CONTEXT) {
             file->vfs_closed=1;
         } else if (file->kind == KERNEL_OPEN_FILE_KIND_CONSOLE &&
             file->file.private_data == 0) {
@@ -1019,6 +1026,7 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
             file->vfs_closed = 1U;
         }
     }
+    kernel_namespace_put(file->ipc_proc_namespace);
     kernel_credentials_put(file->credentials);
     kernel_heap_release(file->heap, file);
     *owner = 0;
@@ -1109,7 +1117,7 @@ int kernel_open_file_generate(struct kernel_open_file_description *file)
     if (!open_file_live(file) || file->kind != KERNEL_OPEN_FILE_KIND_GENERATED)
         return -KERNEL_EINVAL;
     if (file->generated_ready) return 0;
-    int result = kernel_vfs_file_snapshot(&file->file, file->heap,
+    int result = kernel_vfs_file_snapshot(&file->file,file->heap,file->ipc_proc_namespace,
                                            &file->generated_data,
                                            &file->generated_length);
     if (result) {

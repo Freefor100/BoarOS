@@ -371,13 +371,41 @@ RV/LA 的 futex(98) 接受 LOCK_PI、TRYLOCK_PI、UNLOCK_PI 和 LOCK_PI2。未�
 
 exit 只退出当前线程，exit_group 和默认致命信号结束全组。退出先完成本线程的 robust-list 清理，仅当同一 MM 仍有其他活跃使用者时执行 clear-child-tid 清零/唤醒，完成可能睡眠的用户复制后再注销本使用者，最后释放 exec/files/fs/MM 等资源。任务仍在自己的内核栈上时不释放栈；切回可信清理上下文后检查 canary、高水位并回收旧栈；运行期需要存储的资源释放由可调度内核清理任务执行。
 
-BoarOS 的 PID 1 最终退出启动整机收口：cleanup worker 保存它的完成状态，通过
-`kernel_scheduler_stop_users()` 对剩余用户组请求致命退出，等待正常取消/回收完成，
-再停止网络与存储 worker、卸载根盘及检查内存基线。内核 worker 在用户 I/O owner
-释放之前继续服务；不强制卸载活引用，也不按 daemon 名称清理。只在关机阶段枚举
-现有任务表，等待仍复用 cleanup 队列，不轮询忙等。实际子进程、STOPPED、组长先
-退出与关机中 fork 的回归为 `python3 -B tests/riscv/root-shutdown.py`；先用通用
-`INIT_CONFIG=config/init.json` 构建。
+PID 1 最终退出或显式 `reboot(142)` 请求均由原有 cleanup worker 结束整机生命周期。
+前者保存真实 completion 并默认关机；后者即使 PID 1 仍存活，也通过
+`kernel_scheduler_stop_users()` 结束全部用户组，包括 PID 1、STOPPED 进程和组长已经
+退出的线程组，等待正常取消与资源回收完成，再停止网络、设备和存储 worker，
+卸载根盘并检查内存基线，最后停止其他 CPU 并执行平台终止动作。I/O worker 在
+用户 owner 和文件系统需要它们期间继续服务；不强制卸载活引用，也不按名称清理。
+枚举只发生在终止阶段，等待仍复用 cleanup 队列。
+
+`kernel/reboot.c` 持有首次请求的动作及至多 255 字节命令，发布后保持不变。
+生产根 cleanup worker 注册完成才启用请求；没有生产清理者的模块 fixture 返回
+`ENOSYS`。请求发布、clone 最终发布以及 cleanup 等待条件共用 wait domain，
+请求后的新用户任务发布返回 `EAGAIN`；即使通知早于等待登记，清理者也会从持久
+请求中看到变化。后续请求不覆盖首次动作，成功调用者沿用户组退出路径离开，
+不会返回用户态。
+
+显式请求的清理失败会报告具体阶段并停驻当前 CPU，保留尚未释放的 owner；
+不会把重启或 HALT 改成断电，也不会提前停止其他 CPU 或强制释放失败资源。
+RISC-V 保留原 finish 阶段及错误码，LoongArch 的 I/O 清理仍最多重试三次；
+所有权基线失败直接报告并停驻。平台 reset 若返回同样停驻，不执行另一种终止动作。
+
+syscall 按 Linux 32 位参数解释 magic 和 cmd，先检查 `CAP_SYS_BOOT(22)`，再检查
+magic1 与四个合法 magic2，最后解码命令。支持 RESTART、RESTART2、HALT 和
+POWER_OFF；CAD、kexec、suspend 与未知命令返回 `EINVAL`。只有 RESTART2 读取
+arg，最多复制 255 字节并补 NUL；未出现 NUL 的长输入截断，复制故障返回 `EFAULT`
+且不发布请求。关机不额外执行一轮 sync，持久化继续由既有卸载、checkpoint 和设备
+flush 负责。RESTART2 的命令保留至平台动作，不改变当前 virt 平台的冷重启方式。
+
+`python3 -B tests/riscv/root-shutdown.py` 保留子进程、STOPPED、组长先退出与
+关机中 fork 的退出检查；`--arch riscv|loongarch --cpus 8 --cases reboot,halt`
+使用同一行为探针检查活 PID 1 下的非 PID 1 请求、停止进程 owner、RESTART2
+页边界截断、三次启动之间的实际文件内容及最终资源归还。QMP 必须观察到两次
+guest-reset 和一次 guest-shutdown；HALT 要求 VM 仍运行且没有 reset/shutdown
+事件，随后由宿主终止。两种动作均对结束后的镜像执行只读 fsck。内核使用通用
+`INIT_CONFIG=config/init.json`；宿主解码与首次请求并发检查为 `sh tests/host/reboot.sh`，
+在 4 KiB 和 16 KiB 配置直接链接生产实现，不调用宿主 reboot。
 
 组长先退出进入 GROUP_DEAD，保留进程容器；普通成员资源清理成功后从组环移除并回卷时间。最后一个成员结束后，组长才成为唯一进程退出对象，向父进程产生一次 zombie/SIGCHLD。SIGCHLD 显式忽略或 NOCLDWAIT 的自动回收仍遵循信号模块契约。
 

@@ -204,10 +204,16 @@ PT_INTERP已按fs context打开唯一解释器source并交给共用image，路�
 永久可信 cleanup 栈在页基线前创建，启动构造也在该内核任务上执行。设备与
 cache/mount/files/fs/source/image 的真实字段一直保存 owner；映像准备、I/O worker
 就绪后才原子转交 MM/files/fs 并发布 PID 1。页缓存和 journal 使用原共用 worker，
-运行期 I/O 通过 PCI IRQ 睡眠；idle 只负责调度。PID 1 completion 后先停止其他
-用户 owner，回收用户任务，再 stop/join cache worker、卸载 journal/mount、销毁
+运行期 I/O 通过 PCI IRQ 睡眠；idle 只负责调度。PID 1 completion 或显式 reboot
+请求后先停止全部用户 owner，回收用户任务，再 stop/join cache worker、卸载 journal/mount、销毁
 cache、摘 block 注册并 stop DMA/IRQ、释放队列和 BAR claims。成功要求 heap live
 和 heap pages 均为0，物理页回到排除永久 cleanup 栈后的精确基线；当前栈不提前释放。
+
+完成上述回收后才停止其他 CPU。POWER_OFF 向 ACPI GED sleep control
+`0x100e001c` 写入 `0x34`；RESTART/RESTART2 向 GED reset `0x100e001e` 写入
+`0x42`，地址与值来自固定 QEMU `hw/loongarch/virt.c` 和
+`include/hw/acpi/generic_event_device.h`。HALT 关闭本核中断并停在 `idle 0`，
+不访问这两个寄存器。请求发布和 syscall 行为见[调度与退出](kernel-scheduler.md)。
 
 真实 I/O 清理失败仍由原对象持有，最多三次清理后报告并关机，不打印资源回收成功。
 `test-root-io-loongarch` 用原 NBD fault server 在真实现代 PCI 盘注入 write EIO，

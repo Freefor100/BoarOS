@@ -1,12 +1,17 @@
 # procfs 模块
 
-`fs/procfs.c` 是可动态创建的 VFS 实例。当前提供真实物理页分配器读数的 `meminfo`、单 hart 运行/idle 计时的 `uptime`、进程及线程数字目录、`/proc/self`、`/proc/thread-self` 与进程的 `exe/cwd/root/fd` 对象链接、`/proc/self/mounts` 与 `/proc/mounts`，以及进程 `maps`、`fdinfo`、`stat/status` 的首批真实字段、`/proc/sysvipc/{shm,sem,msg}` 和 `/proc/sys/kernel/sched_rt_period_us`、`sched_rt_runtime_us`、`hostname`、`domainname`、只读的`pid_max`。线程目录提供 `stat/status`、`fd/fdinfo`、`exe/cwd/root`、`maps`、`mounts` 和 `ns/mnt`；Linux 全量进程字段与无路径 console 的链接仍待接入。
+`fs/procfs.c` 是可动态创建的 VFS 实例。当前提供真实物理页分配器读数的 `meminfo`、单 hart 运行/idle 计时的 `uptime`、进程及线程数字目录、`/proc/self`、`/proc/thread-self` 与进程的 `exe/cwd/root/fd` 对象链接、`/proc/self/mounts` 与 `/proc/mounts`，以及进程 `maps`、`fdinfo`、`stat/status` 的首批真实字段、`/proc/sysvipc/{shm,sem,msg}` 和 `/proc/sys/kernel/sched_rt_period_us`、`sched_rt_runtime_us`、`hostname`、`domainname`、只读的`pid_max`。线程目录提供 `stat/status`、`fd/fdinfo`、`exe/cwd/root`、`maps`、`mounts` 和 `ns/{mnt,uts,ipc}`；Linux 全量进程字段与无路径 console 的链接仍待接入。
 
 `mount(2)` 的 proc 实例不使用源字符串选择设备；用户态负责创建挂载点。bind、卸载和挂载属性的共同规则见[VFS 挂载说明](vfs-ext4.md)。挂载实例持有根及覆盖路径，最后释放时销毁无 I/O 的 proc 实例。PID 1 及后代退出后的根盘清理从最深子挂载开始拆除；其他命名空间的私有树随进程和命名空间 FD 的最后引用退休。
 
 生成式普通文件不进入 ext4 页缓存。后端 `snapshot` 返回由 OFD 持有的堆缓冲；第一次非空读取形成快照，短读、readv 和 pread 使用它，seek 到零后释放并在下一次读取重新取值，`SEEK_END` 按固定 Linux 的 seq_file 语义返回 `EINVAL`。用户复制时不持有后端或 inode 锁；只推进已经复制的字节。OFD 末引用释放快照，mount 忙判断覆盖文件及目录引用。`fstat` 中的 size 为零是生成文件的元数据语义，不能由它推断 read EOF。
 
 `/proc/sysvipc` 下的 `shm`、`sem`、`msg` 为 0444 的生成式文件，列名、列顺序及数值格式沿固定 Linux 的 `ipc/{shm,sem,msg}.c`：key 使用有符号十进制，权限使用八进制，ID、归属、时间和计数来自真实对象。元数据列表对普通用户可读，与 `IPC_STAT` 的对象访问权限分别处理。共享内存还报告实际后备对象的 resident 字节；当前没有 swap 后备，swap 列为零。已标记 `IPC_RMID` 但仍有附加的共享段继续出现，权限列带 `SHM_DEST`，最后附加和临时 owner 归还后才消失。
+
+这三类文件在普通 open 创建 OFD 时持有打开者当时的 IPC namespace 引用，
+第一次读取、短读和 rewind 重新生成都从该 namespace 的实际对象表取行。
+调用者后来 unshare/setns 不改变旧 FD 的观察范围；dup、fork 与 SCM_RIGHTS
+共享同一 OFD，最后关闭才归还 namespace。O_PATH 不建立这份对象表观察引用。
 
 sem/msg 按 slot 索引逐行遍历，在索引和对应对象的短锁内复制描述符；删除操作使用相同锁序，因此取行时对象及 PID 元数据有效。SHM 管理继续由 CPU0 执行，沿其已有本地中断保护复制段状态与 resident 计数。格式化、快照缓冲扩容和用户复制在这些保护外完成，文本没有 IPC 对象借用。并发创建或删除期间，各行分别取一致状态，整张表不占用全程全局锁。BoarOS 的完整文本沿上述共同生成文件规则保存到 rewind；Linux 的 seq_file 可以分批生成，跨 read 的并发删除不保证与该整份文本相同。`tests/host/proc_sysvipc.c` 检查目录 cookie、格式、空表及分配失败归还；`tests/workloads/ipc/proc_sysvipc.c` 用三类真实对象检查字段、数字用户读取、稳定对象的短读拼接、延迟删除及删除后 rewind。
 
@@ -16,7 +21,7 @@ sem/msg 按 slot 索引逐行遍历，在索引和对应对象的短锁内复制
 
 RT 控制文件标记为 `generated_control`，通过单独后端 `control` 回调动态读写，不形成 OFD 快照。offset 为零时每次读取 scheduler 的原子 period/runtime 对；非零读取直接 EOF，因而短读不会继续输出剩余数字。write/writev 先完整复制全部用户数据，再按固定 Linux 的单整数 sysctl 规则解析和调用原子 setter：base 0、不接受 `+`，只消耗首个数字及其后空白，32 位溢出和不合法配置返回 `EINVAL`。非零偏移写完整复制后忽略配置并推进偏移；复制失败不发布配置、不推进偏移，读复制失败也返回 `EFAULT` 且偏移不变。OFD offset 锁串行化同描述符操作，setter 自身保护全局配置；无 inode 锁跨用户复制或 scheduler 操作。只读 proc mount 写打开返回 `EROFS`。
 
-`hostname`、`domainname` 为 0644 字符串控制文件，与 `sethostname/setdomainname` 及 `uname` 共用 `kernel/uts.c` 中的状态。每次读取取得当前名称，按偏移继续输出字符串和末尾换行；seek 到零可重新读取。写入先完整复制用户数据，再从当前偏移替换到首个 NUL、换行或 64 字节上界，并加终止 NUL；返回完整输入长度，位置按输入长度推进。若写偏移超过当前字符串末尾，仍返回输入长度，但状态和位置均不变。并发写的字段替换在 UTS 短锁内完成；复制用户数据不持锁。按固定 Linux sysctl 表权限，以当前有效 UID 判断，只有 euid 0 可写，不由 DAC capability 绕过；已打开 FD 降权后再写返回 `EPERM`，写打开被拒绝为 `EACCES`。系统调用自身的 `CAP_SYS_ADMIN` 规则见 [系统调用模块](kernel-syscall.md)。
+`hostname`、`domainname` 为 0644 字符串控制文件，与 `sethostname/setdomainname` 及 `uname` 共用 `kernel/uts.c` 中的状态。每次操作查询调用者当前 UTS namespace，已打开 FD 不固定原 namespace；读取取得当前名称，按偏移继续输出字符串和末尾换行，seek 到零可重新读取。写入先完整复制用户数据，再从当前偏移替换到首个 NUL、换行或 64 字节上界，并加终止 NUL；返回完整输入长度，位置按输入长度推进。若写偏移超过当前字符串末尾，仍返回输入长度，但状态和位置均不变。并发写的字段替换在 UTS 短锁内完成；复制用户数据不持锁。按固定 Linux sysctl 表权限，以当前有效 UID 判断，只有 euid 0 可写，不由 DAC capability 绕过；已打开 FD 降权后再写返回 `EPERM`，写打开被拒绝为 `EACCES`。系统调用自身的 `CAP_SYS_ADMIN` 规则见 [系统调用模块](kernel-syscall.md)。
 
 控制文件使用 Linux `default_llseek` 语义：`SEEK_END` 以元数据 size 0 为基准，非负 `SEEK_DATA/HOLE` 返回 `ENXIO`；其他生成文件保留原 seq_file 规则。`sys/kernel` 目录使用固定 cookie；普通 proc 文件原有快照、fault 前缀和 rewind 行为不改变。实时预算的聚焦同 ELF 对照为 `tests/diff-abi/rt_controls.c`，覆盖动态刷新、数值/偏移、scatter fault、readonly mount 与 seek；解析及取舍依据见 [proc 控制文件](../learning/proc-controls.md)。
 
@@ -62,7 +67,15 @@ managed 峰值由分配器在 bootstrap、finalize 与 buddy 成功分配时维�
 
 进程 fdinfo 目录按同一 FD 表枚举并输出 position、flags、mount ID 和 inode。目录及条目同时检查 FSCREDS 进程访问权限和文件 DAC；读取期间持有目标实际 OFD，再复核目标身份与执行安全状态。pidfd 增加 Pid/NSpid，单命名空间中两者相同，目标 TID 已撤下后均为 -1；固定 Linux 的 NSpid 输出还取决于 CONFIG_PID_NS。pidfd 的 FD 链接展示 anon_inode:[pidfd]，getfd 传递实际 OFD，proc 路径重新打开仍返回 ENXIO。文本沿共同生成文件规则，rewind 后重新取值。
 
-`/proc/<pid>/ns/mnt` 与线程目录的 `ns/mnt` 使用现有进程对象权限检查，`readlink` 显示稳定的 `mnt:[id]`，普通打开取得真实挂载命名空间 FD。FD 的 inode 号对应命名空间 ID，`fstatfs` 报告 NSFS，`NS_GET_NSTYPE` 返回 `CLONE_NEWNS`。目标退出不撤销已打开句柄；`setns` 的资格、路径更新和引用规则见 [VFS 挂载说明](vfs-ext4.md)。其他命名空间对象仍未提供。
+`/proc/<pid>/ns/{mnt,uts,ipc}` 与线程目录的对应链接使用 FSCREDS 进程对象权限
+检查，`readlink` 分别显示稳定的 `mnt:[id]`、`uts:[id]`、`ipc:[id]`。普通打开与
+`/proc/self/fd` 重新打开使用共同 namespace FD 实现：inode 对应 namespace ID，
+`fstatfs` 报告 NSFS，`NS_GET_NSTYPE` 返回实际 CLONE_NEWNS、CLONE_NEWUTS 或
+CLONE_NEWIPC。捕获和复核覆盖 PID 代次、目标资源存续、exec/MM、凭据与 dumpable；
+线程路径取得指定 TID 的对象。持有 FD 会保留真实 namespace，目标退出不会撤销它。
+pidfd setns 的多类型查询在同一目标资源保护中取得 MNT/UTS/IPC 引用，按 REALCREDS
+检查权限；proc 链接继续按 FSCREDS 检查。挂载路径和引用规则见
+[VFS 挂载说明](vfs-ext4.md)。
 
 `/proc/<pid>/mountinfo`、线程目录的对应文件及self/thread-self链接展示目标的实际挂载命名空间。每行包含挂载ID、父ID、与fstat一致的文件系统设备号、文件系统内的bind根、目标进程根下的挂载点、视图属性及后端属性；可选字段shared/master/propagate_from/unbindable来自真实传播关系。chroot所在挂载使用其根路径生成挂载点，因此可显示为`/`；根外的挂载按Linux规则不输出。
 

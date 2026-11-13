@@ -17,7 +17,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 
 调用者是 scheduler 当前不透明 task，供依赖任务身份或资源的系统调用取得明确上下文；通用解码层不从 RISC-V `tp` 隐式寻找 current。请求包含系统调用号和六个 64 位参数。结果动作定义在公共头中：
 
-当前分派覆盖RV的250个编号、LA的249个编号；这表示入口已接入，各接口的具体支持范围见对应模块。
+当前分派覆盖RV的251个编号、LA的250个编号；这表示入口已接入，各接口的具体支持范围见对应模块。
 `vhangup(58)` 提供有权限的控制终端挂断，旧实例失效而设备保持可重新打开；具体行为见[终端模块](kernel-tty.md)。`fcntl` 的异步 owner、所选信号和 `O_ASYNC` 见[文件接口](kernel-files.md)及[信号模块](kernel-signal.md#sigio-异步-io-通知)。
 
 
@@ -67,9 +67,9 @@ LA的259仍返回`ENOSYS`。这些入口的直接消费者可用`python3 tests/u
 - `exit` 编号 93 产生线程 `EXIT`，`exit_group` 编号 94 产生全组 `EXIT_GROUP`；状态保留参数 0 的低 8 位。组退出等待成员沿原内核调用栈释放在用资源，最后产生一次进程退出通知。
 - `set_tid_address` 编号 96 记录 clear_tid 用户指针并返回调用 TID；线程退出在释放 MM 前清零并唤醒同 key 的一个 futex waiter。坏用户指针不破坏内核状态。
 - `futex` 编号 98 支持 WAIT、WAKE、REQUEUE、CMP_REQUEUE、WAKE_OP、WAIT_BITSET、WAKE_BITSET、PI 锁及 PI 条件重排；`futex_waitv` 编号 449 支持多地址等待。key、排序、掩码、超时、错误码及扩展边界见[调度模块](kernel-scheduler.md#等待与-futex)；无超时等待按 SA_RESTART 选择 EINTR 或重新等待，带超时等待的用户 handler 总是看到 EINTR、无 handler restart 保持原 absolute deadline。
-- `uname` 编号为 160，把六个 65 字节字段组成的 Linux `new_utsname` 写到参数 0 指向的用户缓冲区；成功返回 0，用户范围、映射或写权限错误返回 `-EFAULT`（-14）。初始值为 `Linux/boaros/5.19.0-boaros/#1 BoarOS 0.1.0/<架构>/(none)`，机器名由架构构建配置提供。`kernel/uts.c` 持有所有任务共享的初始 UTS 状态；`uname` 在短锁内取得完整副本，在锁外写用户内存。release 的数值用于通过现有 glibc 的启动检查：固定 RV glibc 的最低 Linux ABI 为 4.15，LA 为 5.19，因此两架构统一使用 5.19.0。该值不表示完整实现 Linux 5.19；BoarOS 自身版本保存在 version 字段，具体接口范围见能力目录。
+- `uname` 编号为 160，把六个 65 字节字段组成的 Linux `new_utsname` 写到参数 0 指向的用户缓冲区；成功返回 0，用户范围、映射或写权限错误返回 `-EFAULT`（-14）。初始值为 `Linux/boaros/5.19.0-boaros/#1 BoarOS 0.1.0/<架构>/(none)`，机器名由架构构建配置提供。`kernel/uts.c` 持有各 UTS 命名空间的完整名称；`uname` 在调用线程当前命名空间的短锁内取得副本，在锁外写用户内存。release 的数值用于通过现有 glibc 的启动检查：固定 RV glibc 的最低 Linux ABI 为 4.15，LA 为 5.19，因此两架构统一使用 5.19.0。该值不表示完整实现 Linux 5.19；BoarOS 自身版本保存在 version 字段，具体接口范围见能力目录。
 - `clock_settime(112)`、`settimeofday(170)` 修改软件墙钟和时区，要求 CAP_SYS_TIME；参数顺序、vDSO 发布和各类绝对期限的处理见[时间模块](kernel-time.md#运行时调钟与绝对等待)。
-- `sethostname`、`setdomainname` 编号为 161、162，参数为用户字节地址和有符号 32 位长度。沿固定 Linux `kernel/sys.c`，先检查 `CAP_SYS_ADMIN`（缺少时 `EPERM`），再检查长度是否在 0–64 内（否则 `EINVAL`），最后完整复制用户输入（失败为 `EFAULT`）。成功后一次替换对应字段并清零剩余字节；长度零清空名称且不访问用户地址，64 字节名称在第 65 字节补 NUL。它们与 `/proc/sys/kernel/{hostname,domainname}` 修改同一状态，fork、exec 和各 proc 挂载都观察该状态；不提供独立 UTS 命名空间。proc 字符串的权限、偏移与截断规则见 [procfs 模块](procfs.md)。
+- `sethostname`、`setdomainname` 编号为 161、162，参数为用户字节地址和有符号 32 位长度。沿固定 Linux `kernel/sys.c`，先检查 `CAP_SYS_ADMIN`（缺少时 `EPERM`），再检查长度是否在 0–64 内（否则 `EINVAL`），最后完整复制用户输入（失败为 `EFAULT`）。成功后一次替换对应字段并清零剩余字节；长度零清空名称且不访问用户地址，64 字节名称在第 65 字节补 NUL。它们与 `/proc/sys/kernel/{hostname,domainname}` 修改调用线程当前 UTS 命名空间的同一状态；普通 fork 共享，exec 保留，`CLONE_NEWUTS` 复制当前六字段后独立修改。proc 字符串的权限、偏移与截断规则见 [procfs 模块](procfs.md)。
 - `getpid` 编号为 172，返回调用任务所属线程组的 TGID。
 - `getppid` 编号为 173，返回当前父任务的 TGID；PID 1 或 parentless 进程返回 0，reparent 后观察到 PID 1。
 - `getuid/geteuid/getgid/getegid` 编号 174/175/176/177，返回调用线程当前真实／有效 UID/GID；调用无参数，忽略残留寄存器。`setregid/setgid/setreuid/setuid/setresuid/getresuid/setresgid/getresgid/setfsuid/setfsgid` 对应 143～152；`getgroups/setgroups` 为 158/159。raw 设置只影响调用线程，libc 负责全线程协调，凭据共享与发布见[用户凭据](kernel-scheduler.md#用户凭据)。
@@ -145,3 +145,11 @@ exit_state 和最终 nr_threads 更新，不能把一个调度瞬间的 R/两线
 整体审查纠正了LA几处仍用4KiB指针偏移的fault夹具：UDP/TCP置于目标页尾2字节，
 null/zero置于尾4字节，sysctl置于尾1字节；预先断言实际EFAULT/partial4及失败
 offset不变，避免两侧都未触发fault时仍差分成功。夹具必须先断言预期页边界，避免两侧都未触发故障却被判为差分成功。
+
+### UTS 命名空间与命名空间 FD
+
+`clone(CLONE_NEWUTS)` 和 `unshare(CLONE_NEWUTS)` 要求 `CAP_SYS_ADMIN`，新对象从调用线程当前命名空间复制完整的 390 字节名称。任务分别持有 UTS、IPC 及 FS 挂载命名空间的真实引用；各后端共用 `kernel/namespace.c` 的类型、唯一 ID、引用归还与命名空间 FD，实现自身状态和销毁。UTS 的名称锁仅保护复制和字段修改，不跨用户复制、分配或阻塞操作。
+
+`/proc/<pid>/ns/uts` 和线程目录下对应链接打开为持有实际命名空间的 FD；`NS_GET_NSTYPE` 返回 `CLONE_NEWUTS`，`fstat` 的 inode 与链接中的 ID 相同，`fstatfs` 返回 nsfs 类型。dup、fork 和传递 FD 复用同一 OFD owner，源任务退出后仍可 `setns`。`setns` 接受 UTS FD，type 为零或 `CLONE_NEWUTS`；pidfd 形式按非零命名空间类型位选择目标任务的当前对象。名称状态由命名空间引用保持，最后引用归还后释放；初始命名空间保留启动 owner。字符串控制文件每次操作选择调用线程的当前 UTS，因而打开 FD 后再切换命名空间也观察新名称。
+
+直接用户消费者为 `tests/workloads/resource/uts_namespace.c`，覆盖复制与隔离、普通 fork 共享、线程单独切换、非组长 exec 保留、clone3 同时创建、pidfd 多类型一致快照、共享 FS 下单独加入 MNT 失败时的状态与 SEM_UNDO 保持、多类型加入成功后的共享路径与独立命名空间、SCM_RIGHTS 传递及源任务退出后的 FD 加入，以及字符串 FD 的按次选择和权限错误。宿主 `tests/host/mount-attributes.sh` 的 `namespace-uts` 组检查复制分配失败、共同引用与 ID、FD 寿命和准备后提交的 FS 上下文；`namespace-shared-fs` 组检查共享路径、独立挂载引用及 foreign root/cwd 的复制。

@@ -1,5 +1,6 @@
 /* Production proc queries and PID identities; scheduler fixtures own storage. */
 #include "../../kernel/sched/proc.c"
+#include "../../kernel/namespace.c"
 #include <assert.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -13,6 +14,9 @@ static _Thread_local struct kernel_cpu *active;
 static struct kernel_task tasks[6];
 static struct kernel_resource_limits limits[6];
 static struct kernel_pid ids[7];
+static struct kernel_namespace namespaces[6][3];
+static unsigned namespace_change;
+static struct kernel_credentials namespace_credentials;
 static uint64_t bitmap[2];
 static unsigned all_steps, ancestry_steps;
 static int invalidate_ancestry, reset_actions, replace_mm;
@@ -117,6 +121,10 @@ static void setup(void)
     scheduler.identities = (struct kernel_pid_registry){.numbers = &scheduler.pid_allocator, .next_generation = 1};
     for (unsigned i = 0; i < 6; i++) {
         struct kernel_task *task = &tasks[i];
+        kernel_raw_lock_init(&task->files_access,KERNEL_RAW_RANK_TASK_FILES);
+        const uint32_t types[]={KERNEL_NS_MNT,KERNEL_NS_UTS,KERNEL_NS_IPC};
+        for(unsigned j=0;j<3;j++)namespaces[i][j]=(struct kernel_namespace){.references=1,.type=types[j],.id=1000+i*3+j};
+        task->uts_namespace=&namespaces[i][1];task->ipc_namespace=&namespaces[i][2];
         task->limits=&limits[i];
         limits[i].values[KERNEL_RLIMIT_RSS].current=UINT64_MAX;
         task->exec_security=kernel_exec_security_create(&scheduler.identity_heap,1);
@@ -156,6 +164,28 @@ struct kernel_fs_paths kernel_fs_context_snapshot(const struct kernel_fs_context
         .cwd = (void *)(uintptr_t)(fs == &tasks[1].fs ? 2 : 3)};
 }
 void kernel_fs_paths_release(struct kernel_fs_paths *paths) { (void)paths; }
+struct kernel_fs_mounts kernel_fs_context_mounts_snapshot(const struct kernel_fs_context *fs)
+{
+    unsigned task=fs==&tasks[1].fs ? 1 : 2;
+    assert(fs==&tasks[task].fs && kernel_raw_lock_owned(&tasks[task].files_access));
+    struct kernel_namespace *ns=kernel_namespace_get(&namespaces[task][0]);
+    if(namespace_change) {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        if(namespace_change==1)tasks[1].mm.record=(void *)(uintptr_t)2;
+        if(namespace_change==2)tasks[1].credentials=&namespace_credentials;
+        if(namespace_change==3)ids[1].generation++;
+        if(namespace_change==4)tasks[1].proc_exiting=1;
+    }
+    return (struct kernel_fs_mounts){.namespace=(struct kernel_mount_namespace *)ns};
+}
+struct kernel_namespace *kernel_mount_namespace_base(struct kernel_mount_namespace *ns)
+{return (struct kernel_namespace *)ns;}
+void kernel_fs_mounts_release(struct kernel_fs_mounts *mounts)
+{
+    assert(!active->raw_locks);
+    kernel_namespace_put((struct kernel_namespace *)mounts->namespace);
+    *mounts=(struct kernel_fs_mounts){0};
+}
 int kernel_vfs_path_acquire(struct kernel_vfs_path *path)
 { assert((uintptr_t)path >= 1 && (uintptr_t)path <= 3); return 0; }
 int kernel_vfs_path_release(struct kernel_vfs_path **path) { *path = 0; return 0; }
@@ -185,6 +215,47 @@ static void thread_resources_case(void)
     assert(kernel_proc_next_fd(3, thread, -1, &fd) == -KERNEL_ENOENT);
     tasks[2].proc_exiting = 0; borrows_returned(); active->current = 0;
     puts("PASS proc selected TID owns files and cwd; stale and exiting identities rejected");
+}
+static void namespace_handles_case(void)
+{
+    const uint32_t mask=KERNEL_NS_MNT|KERNEL_NS_UTS|KERNEL_NS_IPC;
+    for(namespace_change=0;namespace_change<=4;namespace_change++) {
+        setup();active->current=&tasks[1];
+        struct kernel_namespace *owners[3]={0};
+        namespace_credentials=*kernel_credentials_initial();
+        int error=kernel_proc_namespaces_handle(2,ids[1].generation,mask,1,owners);
+        if(namespace_change) {
+            assert(error==(namespace_change>=3 ? -KERNEL_ENOENT : -KERNEL_EACCES));
+            assert(!owners[0]&&!owners[1]&&!owners[2]);
+        } else {
+            assert(!error);
+            for(unsigned i=0;i<3;i++) {
+                assert(owners[i]==&namespaces[1][i] && owners[i]->references==2);
+                kernel_namespace_put(owners[i]);
+            }
+            struct kernel_namespace *thread=0;
+            assert(!kernel_proc_namespace_handle(3,ids[2].generation|KERNEL_PROC_THREAD_TARGET,KERNEL_NS_UTS,&thread));
+            assert(thread==&namespaces[2][1]);kernel_namespace_put(thread);
+            thread=0;
+            assert(kernel_proc_namespace_handle(3,(ids[2].generation+1)|KERNEL_PROC_THREAD_TARGET,KERNEL_NS_IPC,&thread)==-KERNEL_ENOENT);
+        }
+        for(unsigned i=0;i<3;i++)assert(namespaces[1][i].references==1);
+        borrows_returned();tasks[1].credentials=kernel_credentials_initial();active->current=0;
+    }
+    namespace_change=0;
+    setup();active->current=&tasks[0];
+    struct kernel_credentials from=*kernel_credentials_initial(),to=from;
+    from.uid=from.euid=from.suid=to.uid=to.euid=to.suid=to.fsuid=1000;
+    from.gid=from.egid=from.sgid=to.gid=to.egid=to.sgid=to.fsgid=1000;
+    from.fsuid=from.fsgid=2000;from.effective=from.permitted=to.effective=to.permitted=0;
+    tasks[0].credentials=&from;tasks[1].credentials=&to;
+    struct kernel_namespace *owners[3]={0};
+    assert(!kernel_proc_namespaces_handle(2,ids[1].generation,KERNEL_NS_UTS,0,owners));
+    kernel_namespace_put(owners[1]);owners[1]=0;
+    assert(kernel_proc_namespaces_handle(2,ids[1].generation,KERNEL_NS_UTS,1,owners)==-KERNEL_EACCES);
+    assert(!owners[0]&&!owners[1]&&!owners[2]);borrows_returned();
+    tasks[0].credentials=tasks[1].credentials=kernel_credentials_initial();active->current=0;
+    puts("PASS proc combined MNT/UTS/IPC owner snapshot, selected TID, REALCREDS/FSCREDS, changed MM/credentials/PID identity/exit and returned references");
 }
 static void lookup_cases(void)
 {
@@ -388,7 +459,7 @@ int main(int argc, char **argv)
     active = &cpus[0]; kernel_cpu_initialize(active, 0, 0); kernel_cpu_initialize(&cpus[1], 1, 0);
     kernel_raw_lock_init(&kernel_wait_domain, KERNEL_RAW_RANK_SCHEDULER);
     if (argc > 1 && !strcmp(argv[1], "snapshot")) snapshot_case();
-    else {lookup_cases();access_case();maps_access_cases();memory_owner_case();thread_resources_case();}
+    else {lookup_cases();access_case();maps_access_cases();memory_owner_case();thread_resources_case();namespace_handles_case();}
     for(unsigned i=0;i<6;i++)kernel_exec_security_put(tasks[i].exec_security);
     return 0;
 }
