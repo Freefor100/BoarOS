@@ -35,6 +35,14 @@ void kernel_ptrace_dispose(struct kernel_task *t)
     kernel_heap_release(&scheduler.identity_heap,s);
 }
 
+int kernel_ptrace_stop_requested(struct kernel_task *task)
+{
+    struct kernel_ptrace_state *s=state(task);
+    if (!s) return 0;
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    return s->pending || s->group_pending;
+}
+
 uint32_t kernel_ptrace_tracer_tid_locked(const struct kernel_task *t)
 { return state(t) && t->ptrace->tracer ? t->ptrace->tracer->tid : 0; }
 
@@ -364,7 +372,7 @@ static int attach(struct kernel_task *caller,struct kernel_task *target,int32_t 
     struct kernel_task *t=self?caller:target;
     if (self) {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-        struct kernel_pid *creator=t->child_creator;
+        struct kernel_pid *creator=t->group_leader->child_creator;
         tracer=creator?scheduler_task_lookup_locked(creator->number,KERNEL_PID_TID,creator->generation):0;
         if (!tracer && t->group_leader->parent) {
             tracer=t->group_leader->parent; scheduler_task_get_locked(tracer);

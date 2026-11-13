@@ -159,6 +159,10 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
         previous_security=thread->exec_security;
         thread->exec_security=transaction->exec_security;
         transaction->exec_security=0;
+        /* commit_creds applies to the new image. The old image may still
+         * be shared by another process through CLONE_VM. */
+        kernel_credentials_changed_locked(thread, previous, thread->credentials);
+        if (transaction->secureexec) thread->parent_death_signal = 0;
         finish_mm_move(&transaction->image.mm);
     }
     kernel_credentials_put(previous);

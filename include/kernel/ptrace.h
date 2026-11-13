@@ -13,6 +13,7 @@ struct kernel_task;
 int64_t kernel_ptrace_request(struct kernel_task *,uint64_t,int32_t,uint64_t,uint64_t);
 int kernel_ptrace_syscall_enter(struct kernel_task *,struct arch_trap_frame *);
 void kernel_ptrace_syscall_exit(struct kernel_task *,struct arch_trap_frame *,uint64_t);
+int kernel_ptrace_stop_requested(struct kernel_task *);
 void kernel_ptrace_user_return(struct kernel_task *,struct arch_trap_frame *);
 uint32_t kernel_ptrace_signal(struct kernel_task *,struct kernel_signal_wait_info *);
 int kernel_ptrace_switch_finish_locked(struct kernel_task *,struct kernel_ptrace_notice *);

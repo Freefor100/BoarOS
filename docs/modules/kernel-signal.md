@@ -24,6 +24,10 @@
 
 SIGCHLD 的默认忽略不同于显式 SIG_IGN：默认仍保留 zombie 供 wait4 回收；显式 SIG_IGN 或 SA_NOCLDWAIT 在全组退出资源清理完成后自动回收。SA_NOCLDWAIT 不抑制退出通知，包括被阻塞的默认 SIGCHLD；SA_NOCLDSTOP 单独控制 stop/continue 通知。默认 SIGCHLD 被阻塞时，停止和继续也进入 pending，显式 SIG_IGN 则不进入。清理失败保留 task/owner，由 cleanup context 重试，不能丢失父进程的唤醒。kill 使用组 pending，tkill/tgkill 与同步产生的 SIGPIPE 使用线程 pending；SIGKILL 和默认致命动作终止全组。用户发送（含 signal=0）按调用者 real/effective UID 与目标 real/saved UID、CAP_KILL 判断；同线程组以及同 session 的 SIGCONT 保留对应许可。进程组内至少一个目标获准即成功，只有存在目标且全部无权限时返回 EPERM。内核产生的 TTY、故障和定时器事件沿其原有来源递送。 指定 PID/TID 的进程定向发送，授权和 UID 计费使用原目标线程；共享队列归组容器，唤醒者另行选择。线程用原始 syscall 改成不同身份时，也不会把这三个对象的身份混用。
 
+`PR_SET_PDEATHSIG` 给调用线程设置 1～64 号信号，0 取消。fork 和线程 clone 创建的线程初值为 0。普通 exec 保留配置；secureexec、有效或文件系统 UID/GID 改变、permitted capabilities 增加时清除。单独设置 dumpable 保留配置。
+
+创建子进程的父线程退出时，即使父组内还有其他线程，每个已设置信号的子线程都可产生一次组定向发送。按退出父线程和各子线程的凭据检查许可，`SI_USER` 携带父进程 TGID 和父线程的真实 UID。变更实际父线程关系时保存信号，持有子组 PID 身份并在调度保护外投递到共享 pending；标准信号按原规则合并，实时信号分别排队。收养线程以后退出时按当时的配置再次发送。ptrace 的跟踪者关系独立于实际父线程。
+
 ## 待决记录与计费
 
 pending位图是就绪摘要。普通标准信号继续在任务原有字段保存首条来源；实时信号及完整用户载荷使用按需分配的记录。每个线程和线程组各有一个按信号编号分槽的FIFO索引，出队不遍历其他信号的记录；handler、sigtimedwait和signalfd共用一次出队和128字节siginfo快照。消费直接填写调用者的输出：内联事件先清零再填写有效字段，排队记录完整覆盖；handler的输出就是本线程delivery载荷，原生定时器在锁外完成期间继续借用这块存储，构帧前归还，不再暂存并复制载荷。同类标准信号合并，同类实时信号按FIFO；线程pending先于共享pending，每个集合按固定Linux的同步信号优先规则选择。
@@ -81,7 +85,7 @@ RV USER_SMP中的普通信号在实际执行线程所在CPU递送。pending及�
 
 `SA_ONSTACK`首次从登记区顶端构帧；已在备用栈上的嵌套处理从当前SP继续向下。两架构按实际对齐后的整数、FP/SIMD帧检查范围，再通过共同uaccess复制；不可写、未映射或空间耗尽终止用户线程组并报告SIGSEGV。`uc_stack`保存交付前的原始登记状态，与查询时计算的`SS_ONSTACK`含义不同。完整构帧成功后，`SS_AUTODISARM`停用原配置，处理函数可以重新设置。sigreturn完整导入`uc_stack`和其他恢复输入后，按恢复后的SP应用登记；字段不可读为坏帧，可读设置产生的EINVAL、ENOMEM、EPERM按固定Linux的`restore_altstack`忽略。恢复后寄存器、mask及浮点状态继续沿原路径处理。
 
-rt_sigaction/rt_sigprocmask 先完整复制输入，再提交状态，最后输出旧状态，允许输入输出地址别名。输入 EFAULT 不提交；输出 EFAULT 不回滚已经提交的有效动作。复制 helper 返回真实 uaccess 状态，handler 映射 errno。rt_sigpending 返回组与线程 pending 的并集再与 blocked 取交集。`rt_sigtimedwait` 校验 8 字节 mask 和相对 timespec，在当前线程登记临时等待集合；匹配的标准信号可以唤醒线程，但只由等待 syscall 从线程或组 pending 中取走，不经普通 handler。返回 `siginfo` 的 signo、SI_USER/SI_TKILL/SI_KERNEL、发送者进程 ID 和 uid；SIGCHLD 另携带 CLD_EXITED/KILLED/DUMPED/STOPPED/CONTINUED 与对应退出码或信号。pending 位、来源和事件状态在调度 raw 保护内共同发布与取走，标准信号合并保留首个未消费事件。每个线程和组只各补充一份紧凑的子事件状态；`rt_sigtimedwait` 与 RV/LA 信号帧共用 128 字节 ABI 编码。`siginfo` 输出 EFAULT 发生在取走信号之后。超时返回 EAGAIN，其他可递送信号打断返回 EINTR，SA_RESTART也保留这一返回。实时信号使用相同的FIFO待决记录。
+rt_sigaction/rt_sigprocmask 先完整复制输入，再提交状态，最后输出旧状态，允许输入输出地址别名。输入 EFAULT 不提交；输出 EFAULT 不回滚已经提交的有效动作。复制 helper 返回真实 uaccess 状态，handler 映射 errno。rt_sigpending 返回组与线程 pending 的并集再与 blocked 取交集。`rt_sigtimedwait` 校验 8 字节 mask 和相对 timespec，在当前线程登记临时等待集合；匹配的标准信号可以唤醒线程，但只由等待 syscall 从线程或组 pending 中取走，不经普通 handler。返回 `siginfo` 的 signo、SI_USER/SI_TKILL/SI_KERNEL、发送者进程 ID 和 uid；SIGCHLD 另携带 CLD_EXITED/KILLED/DUMPED/STOPPED/CONTINUED 与对应退出码或信号。pending 位、来源和事件状态在调度 raw 保护内共同发布与取走，标准信号合并保留首个未消费事件。每个线程和组只各补充一份紧凑的子事件状态；`rt_sigtimedwait` 与 RV/LA 信号帧共用 128 字节 ABI 编码。`siginfo` 输出 EFAULT 发生在取走信号之后。登记等待后再次检查 ptrace 停止请求。等待返回时先取匹配的信号；没有匹配项时，超时返回 EAGAIN，信号或跟踪请求打断返回 EINTR，SA_RESTART 也保留这一返回。跟踪请求随后在返回用户态前产生 ptrace 停点。实时信号使用相同的FIFO待决记录。
 
 RISC-V 交付 frame 共 1088 字节，16 字节对齐：128 字节 siginfo 加 960 字节 ucontext。ucontext 内 sigmask 偏移 40、mcontext 偏移 176；mcontext 包含 32 个整数寄存器和按 Q 扩展容量保留的 528 字节、16 字节对齐 FP union。当前只填写 D 寄存器与 32 位 fcsr，其余扩展存储清零。内核静态断言和真实 musl ucontext 共同核对布局，不能仅用同一套手写偏移自证正确。
 
@@ -105,7 +109,7 @@ wait4、console read 和 pipe I/O 可被未阻塞信号唤醒；handler 的 SA_R
 
 nanosleep/clock_nanosleep 遇到用户 handler 始终返回 EINTR，不受 SA_RESTART 影响。没有进入 handler 的 stop/continue 等路径中，相对睡眠通过 restart_syscall 保留原到期期限；绝对睡眠重试原 syscall，重新导入用户请求。绝对睡眠不写 remaining。纳秒输入及 tick deadline 使用明确的饱和范围，tick 的未来距离不超过 INT64_MAX，避免远期时间被有符号差值误判为过去。
 
-sigsuspend 在等待和选择 handler 时保留临时 mask，把原 mask 写入信号恢复上下文，由 sigreturn 恢复；不能先恢复旧 mask 再选择信号。vfork 使用具体子进程的一次性完成条件，不由普通信号解除等待。
+sigsuspend 在等待和选择 handler 时保留临时 mask，把原 mask 写入信号恢复上下文，由 sigreturn 恢复。单独的 ptrace 停止请求会结束当前等待登记，线程停下供跟踪者观察，继续执行后仍使用同一临时 mask 等待信号。vfork 使用具体子进程的一次性完成条件，不由普通信号解除等待。
 
 ## 验证与当前边界
 

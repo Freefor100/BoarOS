@@ -283,6 +283,10 @@ struct kernel_task {
     struct kernel_ptrace_state *ptrace;
     struct kernel_remote_memory_request *remote_memory_request;
     uint32_t personality;
+    uint32_t parent_death_signal;
+    uint32_t child_subreaper;
+    struct kernel_task *parent_death_next;
+    uint32_t parent_death_notice;
 } __attribute__((aligned(16)));
 
 #endif

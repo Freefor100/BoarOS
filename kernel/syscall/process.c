@@ -43,15 +43,31 @@ enum kernel_syscall_status syscall_handle_prctl(
     struct kernel_syscall_result *decoded)
 {
     uint32_t option = (uint32_t)request->arguments[0];
-    if (option != 15U && option != 16U)
+    if (option != 1U && option != 2U && option != 15U && option != 16U &&
+        option != 36U && option != 37U)
         return syscall_handle_prctl_credentials(caller, request, decoded);
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     decoded->value = 0;
+    if (option == 1U) {
+        decoded->value = kernel_task_set_parent_death_signal(caller, request->arguments[1]);
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (option == 36U) {
+        kernel_task_set_subreaper(caller, request->arguments[1] != 0);
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
     struct kernel_mm *mm;
     if (kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK)
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     uint64_t address = request->arguments[1];
     size_t copied = 0;
+    if (option == 2U || option == 37U) {
+        uint32_t value = option == 2U ? kernel_task_get_parent_death_signal(caller) :
+                                      kernel_task_get_subreaper(caller);
+        if (kernel_copy_to_user(mm, address, &value, sizeof(value), &copied) !=
+            KERNEL_UACCESS_STATUS_OK || copied != sizeof(value)) decoded->value = -KERNEL_EFAULT;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
     char name[16] = {0};
     if (option == 15U) {
         enum kernel_uaccess_status status = kernel_copy_string_from_user(

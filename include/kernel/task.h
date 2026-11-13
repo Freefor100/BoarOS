@@ -144,6 +144,11 @@ void kernel_task_cpu_ticks(const struct kernel_task *task,
                            uint64_t *child_user_ticks,
                            uint64_t *child_kernel_ticks);
 
+int kernel_task_set_parent_death_signal(struct kernel_task *, uint64_t);
+uint32_t kernel_task_get_parent_death_signal(struct kernel_task *);
+void kernel_task_set_subreaper(struct kernel_task *, int);
+uint32_t kernel_task_get_subreaper(struct kernel_task *);
+
 /* Linux process-group/session operations; all identity changes are atomic. */
 int64_t kernel_task_setpgid(struct kernel_task *task, kernel_pid_t pid, kernel_pid_t pgid);
 int64_t kernel_task_getpgid(struct kernel_task *task, kernel_pid_t pid);
