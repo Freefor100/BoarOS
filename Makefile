@@ -659,11 +659,11 @@ OSCOMP_CASE_TIMEOUT ?= 300
 OSCOMP_DIAGNOSTIC_EXCLUDE ?=
 OSCOMP_LOCAL_CACHE ?= build/tools/oscomp-local
 OSCOMP_LOCAL_ARGS = --cache '$(OSCOMP_LOCAL_CACHE)'
-OSCOMP_FINAL_IMAGES ?= $(HOME)/Downloads
+OSCOMP_FINAL_IMAGES ?=
 OSCOMP_FINAL_ARCH ?= both
 .PHONY: run-oscomp-final-2026
 run-oscomp-final-2026:
-	python3 -B tests/oscomp/run.py --profile final-2026 --arch '$(OSCOMP_FINAL_ARCH)' --images-dir '$(OSCOMP_FINAL_IMAGES)'
+	python3 -B tests/oscomp/run.py --profile final-2026 --arch '$(OSCOMP_FINAL_ARCH)' $(if $(OSCOMP_FINAL_IMAGES),--images-dir '$(OSCOMP_FINAL_IMAGES)')
 all: prepare-oscomp-local-riscv prepare-oscomp-local-loongarch
 OSCOMP_CASE := build/riscv/oscomp/case
 OSCOMP_INIT := $(BUILD_DIR)/oscomp/init.json

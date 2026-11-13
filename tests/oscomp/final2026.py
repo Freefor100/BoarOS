@@ -24,6 +24,11 @@ def sha(path):
     with Path(path).open('rb') as stream:
         return hashlib.file_digest(stream,'sha256').hexdigest()
 
+def default_image_directory():
+    common=subprocess.check_output(['git','rev-parse','--path-format=absolute','--git-common-dir'],
+                                   cwd=ROOT,text=True).strip()
+    return Path(common).parent/'download'
+
 def save(path,value):
     path.write_text(json.dumps(value,indent=2)+'\n')
 
@@ -166,7 +171,7 @@ def main(args):
     if args.host_vcpu_cpus is None and args.host_io_cpu is not None:
         raise ValueError('--host-vcpu-cpus is required with --host-io-cpu')
     host_vcpus=host_cpu_selection(args.host_vcpu_cpus,8,args.host_io_cpu)
-    budget=args.diagnostic_timeout if args.diagnostic_timeout is not None else 15000
+    budget=args.diagnostic_timeout if args.diagnostic_timeout is not None else 0
     if budget<0:raise ValueError('budget must be nonnegative')
     directory=(args.output or ROOT/'build'/('oscomp-final-2026-'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S'))).resolve()
     if not directory.is_relative_to(ROOT/'build'):raise ValueError('outputs must be under build/')
@@ -176,7 +181,7 @@ def main(args):
     revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=suite,text=True).strip()
     dirty=subprocess.check_output(['git','status','--porcelain'],cwd=suite,text=True).strip()
     if revision!=manifest['commit'] or dirty:raise ValueError('final-2026 source identity or clean worktree differs')
-    images=(args.images_dir or Path.home()/'Downloads').resolve()
+    images=(args.images_dir or default_image_directory()).resolve()
     for arch in architectures:
         archive=images/manifest['architectures'][arch]['archive']
         if not archive.is_file():raise FileNotFoundError(archive)

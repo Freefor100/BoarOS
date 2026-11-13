@@ -37,9 +37,11 @@ init.json和头文件；`INIT_CONFIG_RV`/`INIT_CONFIG_LA`独立覆盖，显式�
 与默认pre-20250615入口分开选择。输入归档名、解压后大小、SHA256、源码版本与脚本身份
 集中在 [`inputs-final-2026.json`](../../tests/oscomp/inputs-final-2026.json)。
 两份压缩包分别对应RV和LA，每台虚拟机只挂自己的一张根盘。
+默认从主工作区的`download/`读取`sdcard-rv-pub.img.gz`和`sdcard-la-pub.img.gz`；
+在兼容分支工作区运行时也使用该目录，可通过下面的参数指定其他位置。
 
 ```sh
-make run-oscomp-final-2026 OSCOMP_FINAL_IMAGES=/path/to/archives OSCOMP_FINAL_ARCH=both
+make run-oscomp-final-2026 OSCOMP_FINAL_ARCH=both
 
 python3 -B tests/oscomp/run.py --profile final-2026 --arch both \
   --images-dir /path/to/archives \
@@ -54,8 +56,10 @@ devpts、共享内存目录和回环接口，再用盘内bash/sh运行原脚本�
 
 `--groups cagent`或`--groups buildstorm`可单独选择一题。两架构串行运行，
 `--host-vcpu-cpus`须提供八个不同的宿主CPU，并与`--host-io-cpu`搭配使用；
-不指定时使用宿主原有亲和性。正式时限沿原脚本，包括BuildStorm的14400秒内部超时；
-默认另设15000秒外层时限，可用`--diagnostic-timeout`调整，0仅取消外层时限。
+不指定时使用宿主原有亲和性。默认不增加外层时间限制，保留原脚本的超时：CAgent各项
+20～35秒，BuildStorm正式编译14400秒。工具链检查、小项目编译和tg-xtask预构建
+不计入这14400秒。需要主动截断诊断时，才用`--diagnostic-timeout`设置外层秒数，
+0表示不设外层限制；外层中断记为运行不完整，不记为编译失败。
 
 输出保存原串口、原judge逐项结果、脚本状态、实际内核／输入／QEMU身份及可选绑核记录。
 工具链版本查询通过不等于构建成功，脚本退出0也不代替产物检查；编译成功但时间分为0

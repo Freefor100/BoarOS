@@ -281,9 +281,10 @@ def main():
     ap.add_argument('--arch', choices=tuple(ARCH_KEYS) + ('both',), default='both')
     ap.add_argument('--output', type=Path, default=None)
     ap.add_argument('--verify-inputs', action='store_true')
-    ap.add_argument('--diagnostic-timeout', type=int)
+    ap.add_argument('--diagnostic-timeout', type=int,
+                    help='optional external time limit in seconds; final-2026 defaults to none (0)')
     ap.add_argument('--groups', choices=tuple(GROUPS) + ('all', 'benchmarks', 'environment','cagent','buildstorm'), default='all')
-    ap.add_argument('--images-dir', type=Path, help='final-2026 archives; default ~/Downloads')
+    ap.add_argument('--images-dir', type=Path, help='final-2026 archives; default main worktree download/')
     ap.add_argument('--host-vcpu-cpus', help='final-2026: one distinct host CPU per vCPU')
     ap.add_argument('--host-io-cpu', type=int, help='final-2026: host CPU for QEMU main/I/O')
     ap.add_argument('--keep-disks', action='store_true', help='final-2026: retain checked runtime images')
