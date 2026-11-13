@@ -60,10 +60,17 @@ BoarOS `kernel_files_ioctl` 未实现这项通用命令，普通管道落入 `EN
 RV单核及八核真实调用正常退出。这里修复的是执行错误，不把未完成编译折算成吞吐结果。
 
 修复后的原RV BuildStorm已经完整通过；两架构耗时与自动分见交付结果。RV整轮最低栈
-余量808字节，低于1024字节目标，本次没有溢出，仍作为独立未达项保留。另在自有的LA
-RNG辅助短例（`tests/userland/rng.py`，并非原盘题目）中，使用调试器撤去固件随机种子的启动条件会触发SIGSEGV；同一ELF在修复前保存的
-内核也复现，保留固件种子时正常退出。该额外控制条件的触发原因未定位，不计为本次修复
-引入的回退，也不将它记成已通过或已确定的LA内核缺陷；原盘BuildStorm未使用该种子控制。
+余量808字节，低于1024字节目标，本次没有溢出，仍作为独立未达项保留。
+
+自有LA RNG辅助短例（`tests/userland/rng.py`，并非原盘题目）的无固件种子SIGSEGV现已
+定位：共同ELF构帧在`kernel_random_available()==false`时省略了`AT_RANDOM`。PID 1可在
+RNG worker取得材料前启动，glibc在`__libc_start_main+0x11c`（PC `0x120000f9c`）
+解引用空`_dl_random`，BADV为零。实际设备DTB的属性位置及GDB改写前后寄存器均核对一致，
+不是辅助用例改错DTB或寄存器；不经GDB的host构帧反例也直接复现缺项。
+main已改为每次exec使用现有生成器提供16字节`AT_RANDOM`，与Linux早期exec的处理一致；
+这不提供可信熵、不设置ready，不放开安全`getrandom`等待。修复后同一glibc探针保留原有
+种子控制，n/a/d/s四个短例均正常退出，分别覆盖设备就绪、缺设备、延迟输入及在途停止；
+真实owner检查通过。原盘BuildStorm保留固件种子，已有成绩不为此重复运行。
 
 本分支原判分脚本还有三处解释边界：CAgent 十项全部取得时间奖励时合计199.1分，
 不是 README 声称的200分；BuildStorm 在正式编译失败时仍给版本检查8分，
