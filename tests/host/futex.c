@@ -173,7 +173,15 @@ int kernel_vfs_node_release(struct kernel_vfs_node **node)
 uint64_t kernel_time_monotonic_ns(void) { return 1; }
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t ns, uint64_t *ticks)
 { *ticks = ns; return ns ? KERNEL_TIME_STATUS_OK : KERNEL_TIME_STATUS_DEADLINE_PASSED; }
-uint64_t kernel_time_boot_realtime_offset(void) { return 0; }
+static uint64_t realtime_offset;
+enum kernel_time_status kernel_time_deadline_from_realtime(uint64_t ns, uint64_t *ticks)
+{
+    uint64_t offset=__atomic_load_n(&realtime_offset,__ATOMIC_ACQUIRE);
+    if(ns<=offset+1) {*ticks=1;return KERNEL_TIME_STATUS_DEADLINE_PASSED;}
+    *ticks=ns-offset;return KERNEL_TIME_STATUS_OK;
+}
+uint64_t kernel_time_boot_realtime_offset(void)
+{ return __atomic_load_n(&realtime_offset,__ATOMIC_ACQUIRE); }
 void kernel_signal_note_futex_timed_restart(struct kernel_task *task, uint64_t address,
     uint32_t operation, uint32_t value, uint64_t deadline, uint32_t bitset)
 { (void)task; (void)address; (void)operation; (void)value; (void)deadline; (void)bitset; abort(); }
@@ -213,13 +221,13 @@ static uint32_t get(uint64_t address)
 { uint32_t value; size_t n; assert(!kernel_copy_from_user(&mm, &value, address, sizeof(value), &n) && n == sizeof(value)); return value; }
 static unsigned encode(unsigned op, unsigned cmp, int arg, int comparison)
 { return op << 28 | cmp << 24 | ((unsigned)arg & 4095) << 12 | ((unsigned)comparison & 4095); }
-struct waiter { unsigned id, bitset; uint64_t address; int64_t result; uint32_t expected, operation; };
+struct waiter { unsigned id, bitset; uint64_t address; int64_t result; uint32_t expected, operation; uint64_t timeout; };
 static void *waiter(void *arg)
 {
     struct waiter *w = arg;
     attach(w->id);
     w->result = call(w->address, w->operation ? w->operation : (9 | 128),
-        w->expected, 0, 0, w->bitset);
+        w->expected, w->timeout, 0, w->bitset);
     detach();
     return 0;
 }
@@ -320,7 +328,7 @@ static void wake_batches(void)
 {
     assert(measured_wake(source,1)==0 && !domain_takes && queue_takes==1);
     put(source, 0);
-    struct waiter w = {1, 1, source, -99, 0, 0};
+    struct waiter w = {1, 1, source, -99, 0, 0, 0};
     unsigned before = mm_test_parked(1); pthread_t worker;
     assert(!pthread_create(&worker, 0, waiter, &w)); queued(1, before);
     struct kernel_futex_key key;
@@ -412,7 +420,7 @@ static void private_with_mm_gate_busy(void)
     assert(call(source, 4 | 128, 0, 1, target, 0) == 0);
     assert(call(source, 5 | 128, 0, 0, target, encode(1, 0, 1, 0)) == 0);
     assert(call(source, 0 | 128, 1, 0, 0, 0) == -KERNEL_EAGAIN);
-    struct waiter w = {1, 1, source, -99, 0, 0};
+    struct waiter w = {1, 1, source, -99, 0, 0, 0};
     unsigned before = mm_test_parked(1);
     private_pin_probe=1;private_pin_returns=0;
     assert(!pthread_create(&waiting, 0, waiter, &w)); queued(1, before);
@@ -468,7 +476,7 @@ static void private_admission(void)
     unsigned before_edit = mm_test_parked(2), before_read = mm_test_parked(1);
     pthread_t edit, read;
     assert(!pthread_create(&edit, 0, revoke_private_read, 0)); queued(2, before_edit);
-    struct waiter w = {1, 1, source, -99, 1, 0};
+    struct waiter w = {1, 1, source, -99, 1, 0, 0};
     admission_waited = 0; admission_arm = 1;
     assert(!pthread_create(&read, 0, waiter, &w)); queued(1, before_read);
     assert(__atomic_load_n(&admission_waited, __ATOMIC_ACQUIRE));
@@ -507,7 +515,7 @@ static void comparisons(void)
 static void requeue(uint64_t destination)
 {
     put(source, 0); put(target, 0);
-    struct waiter a = {1, 1, source, -99, 0, 0}, b = {2, 2, source, -99, 0, 0};
+    struct waiter a = {1, 1, source, -99, 0, 0, 0}, b = {2, 2, source, -99, 0, 0, 0};
     unsigned before_a = mm_test_parked(1), before_b = mm_test_parked(2);
     pthread_t x, y;
     assert(!pthread_create(&x, 0, waiter, &a)); queued(1, before_a);
@@ -532,7 +540,7 @@ static void *mover(void *argument)
 static void opposite(uint64_t destination)
 {
     put(source, 0);
-    struct waiter w = {1, 1, source, -99, 0, 0};
+    struct waiter w = {1, 1, source, -99, 0, 0, 0};
     unsigned before = mm_test_parked(1); pthread_t wait_thread, first, second;
     assert(!pthread_create(&wait_thread, 0, waiter, &w)); queued(1, before);
     bucket_entered = bucket_waiter = 0; opposite_arm = 1;
@@ -624,10 +632,10 @@ struct vector_user {uint64_t value,address;uint32_t flags,reserved;};
 static const uint64_t vector_address=0x40400;
 static void vector_set(struct vector_user *items,unsigned n)
 {size_t copied;assert(!kernel_copy_to_user(&mm,vector_address,items,n*sizeof(*items),&copied)&&copied==n*sizeof(*items));}
-struct vector_actor {unsigned count;int64_t result;};
+struct vector_actor {unsigned count;int64_t result;uint64_t timeout;int clock;};
 static void *vector_waiter(void *arg)
 {
-    struct vector_actor *v=arg;attach(1);v->result=vector_call(vector_address,v->count,0,0,999);detach();return 0;
+    struct vector_actor *v=arg;attach(1);v->result=vector_call(vector_address,v->count,0,v->timeout,v->clock);detach();return 0;
 }
 static void waitv_cases(void)
 {
@@ -699,6 +707,40 @@ static void waitv_cases(void)
     put(source,0);put(target,0);
     puts("waitv ABI, full-key precedence, duplicate wake count, vector requeue and128 owners PASS");
 }
+/* Hosted clock changes here exercise PREPARED -> COMMITTED conversion only.
+ * The production scheduler's retiming of already committed waits is tested in
+ * the guest; this model has no timer interrupt/deadline AVL. */
+static void realtime_prepared_cases(void)
+{
+    const uint64_t timeout_address=source+512;
+    struct {int64_t seconds,nanoseconds;} expiry={0,100};size_t copied;
+    assert(!kernel_copy_to_user(&mm,timeout_address,&expiry,sizeof(expiry),&copied) && copied==sizeof(expiry));
+    put(source,0);
+    for(unsigned vector=0;vector<2;vector++)for(unsigned backward=0;backward<2;backward++) {
+        struct waiter w={.id=1,.bitset=1,.address=source,.result=-99,.operation=9|256,
+            .timeout=timeout_address};
+        struct vector_actor v={.count=1,.result=-99,.timeout=timeout_address,.clock=0};
+        if(vector) {
+            struct vector_user item={.value=0,.address=source,.flags=2};
+            vector_set(&item,1);
+        }
+        __atomic_store_n(&realtime_offset,backward?200:0,__ATOMIC_RELEASE);
+        vector_pause=1;vector_paused=vector_resume=0;
+        unsigned before=mm_test_parked(1);pthread_t worker;
+        assert(!pthread_create(&worker,0,vector?vector_waiter:waiter,vector?(void *)&v:(void *)&w));
+        while(!__atomic_load_n(&vector_paused,__ATOMIC_ACQUIRE))sched_yield();
+        assert(futex_queue && futex_queue->head &&
+            futex_queue->head->task->wait.realtime_deadline==100 &&
+            kernel_wait_record_phase(&futex_queue->head->task->wait)==KERNEL_WAIT_PREPARED);
+        __atomic_store_n(&realtime_offset,backward?0:200,__ATOMIC_RELEASE);
+        __atomic_store_n(&vector_resume,1,__ATOMIC_RELEASE);
+        if(backward) {queued(1,before);assert(call(source,1,1,0,0,0)==1);}
+        assert(!pthread_join(worker,0));
+        assert((vector?v.result:w.result)==(backward?0:-KERNEL_ETIMEDOUT));
+    }
+    __atomic_store_n(&realtime_offset,0,__ATOMIC_RELEASE);
+    puts("futex BITSET/waitv preserve wall deadlines across forward/backward prepared waits PASS");
+}
 int main(void)
 {
     struct physical_page_allocator allocator = {0};
@@ -724,6 +766,7 @@ int main(void)
     attach(0);
     wait_priority_snapshot();
     waitv_cases();
+    realtime_prepared_cases();
     notification_batch();
     wake_batches(); operations(); private_with_mm_gate_busy(); private_access(); private_admission();
     requeue(target); requeue(source + 1024); comparisons();

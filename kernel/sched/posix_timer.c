@@ -31,13 +31,16 @@ struct kernel_posix_timer {
     struct kernel_posix_event event;
     uint32_t id,references,valid,dead,charged;
     int32_t clock,overrun;
+    /* A later backwards wall step must retain periods already observed by
+     * gettime. Claimed notifications keep their own generation's accounting. */
+    int64_t pending_overrun,claim_overrun;
     uint64_t expires,interval,generation;
     struct kernel_avl_node deadline;
     struct kernel_cpu_timer_index *cpu_index;
     struct kernel_posix_timer *park_next;
-    uint64_t queued_generation,queued_expiry,claim_generation,claim_expiry,claim_interval;
+    uint64_t queued_generation,claim_generation,claim_expiry,claim_interval;
     struct kernel_signal_wait_info *claim_output;
-    uint32_t indexed,armed,queued,busy,deferred,parked;
+    uint32_t indexed,armed,queued,busy,deferred,parked,realtime,claim_realtime;
 
 };
 /* Only user-visible timers have a registry owner. Internal CPU sleeps share
@@ -95,15 +98,20 @@ uint64_t kernel_posix_timer_deadline(void)
 {return __atomic_load_n(&wall_next,__ATOMIC_ACQUIRE);}
 static uint64_t add_time(uint64_t a,uint64_t b)
 {return a>(uint64_t)INT64_MAX-b?INT64_MAX:a+b;}
-static uint64_t forward_time(uint64_t expires,uint64_t interval,uint64_t now,uint64_t *overrun)
+static uint64_t forward_time(uint64_t expires,uint64_t interval,uint64_t now,uint64_t *forwarded)
 {
-    uint64_t periods=now>=expires?(now-expires)/interval+1:1;
-    if(overrun)*overrun=periods-1;
+    uint64_t periods=now>=expires?(now-expires)/interval+1:0;
+    if(forwarded)*forwarded=periods;
     uint64_t delta=periods>(uint64_t)INT64_MAX/interval?INT64_MAX:periods*interval;
     return add_time(expires,delta);
 }
+static void accumulate_overrun(int64_t *overrun,uint64_t periods)
+{
+    if(periods>INT64_MAX||*overrun>INT64_MAX-(int64_t)periods)*overrun=INT64_MAX;
+    else *overrun+=(int64_t)periods;
+}
 static uint64_t timer_now(struct kernel_posix_timer *t)
-{return t->clock==0?kernel_time_realtime_ns():kernel_time_monotonic_ns();}
+{return t->realtime?kernel_time_realtime_ns():kernel_time_monotonic_ns();}
 static void unpark_locked(struct kernel_posix_timer *t)
 {
     if(!t->parked)return;
@@ -136,10 +144,10 @@ static void arm_locked(struct kernel_posix_timer *t)
         t->cpu_index=index;t->indexed=t->armed=1;
         scheduler_cpu_timer_update_locked(target,t->cpu.thread);return;
     }
-    uint64_t mono=t->expires;
-    if(!t->clock){uint64_t offset=kernel_time_boot_realtime_offset();mono=mono<=offset?0:mono-offset;}
     t->deadline=(struct kernel_avl_node){.height=1};
-    enum kernel_time_status status=kernel_time_deadline_from_monotonic(mono,&t->deadline.key);
+    enum kernel_time_status status=t->realtime?
+        kernel_time_deadline_from_realtime(t->expires,&t->deadline.key):
+        kernel_time_deadline_from_monotonic(t->expires,&t->deadline.key);
     if(status==KERNEL_TIME_STATUS_DEADLINE_PASSED)t->deadline.key=arch_time_read()+1;
     else if(status)__builtin_trap();
     t->armed=1;t->indexed=1;wall_root=kernel_avl_insert_node(wall_root,&t->deadline);wall_publish_locked();
@@ -149,18 +157,25 @@ static void snapshot_locked(struct kernel_posix_timer *t,uint64_t now,struct ker
     *out=(struct kernel_posix_itimerspec){.interval={t->interval/1000000000,t->interval%1000000000}};
     uint64_t remaining=0;
     int pending=(t->queued&&t->queued_generation==t->generation)||
-        (t->busy&&t->claim_generation==t->generation)||t->parked;
+        (t->busy&&t->claim_generation==t->generation)||t->parked||t->deferred;
     if(t->event.notify==1||t->armed||(pending&&t->interval)) {
-        if(t->interval&&!t->armed&&t->expires<=now)t->expires=forward_time(t->expires,t->interval,now,0);
+        if(t->interval&&!t->armed&&t->expires<=now) {
+            uint64_t periods;
+            t->expires=forward_time(t->expires,t->interval,now,&periods);
+            if(t->busy&&t->claim_generation==t->generation) {
+                t->claim_expiry=t->expires;accumulate_overrun(&t->claim_overrun,periods);
+            } else accumulate_overrun(&t->pending_overrun,periods);
+        }
         remaining=t->expires>now?t->expires-now:((t->event.notify!=1&&t->expires)?1:0);
     }
     out->value=(struct kernel_posix_timespec){remaining/1000000000,remaining%1000000000};
 }
-static void queue_locked(struct kernel_posix_timer *t,struct kernel_wait_cursor *cursor,struct kernel_task **wake)
+static void queue_locked(struct kernel_posix_timer *t,struct kernel_wait_cursor *cursor,struct kernel_task **wake,int fresh)
 {
     t->armed=0;
-    if(t->busy){t->deferred=1;t->queued_expiry=t->expires;return;}
-    t->queued_generation=t->generation;t->queued_expiry=t->expires;
+    if(fresh)t->pending_overrun=-1;
+    if(t->busy){t->deferred=1;return;}
+    t->queued_generation=t->generation;
     if(t->queued)return;
     struct signal_queue_record *r=t->notification.record;
     r->info=(struct kernel_signal_wait_info){.signal=(uint32_t)t->event.signal,.code=-2,.sender=t->id,.value=t->event.value};
@@ -220,8 +235,9 @@ int posix_timer_record_take_locked(struct signal_queue_record *record,struct ker
     struct kernel_posix_timer *t=record->timer;t->queued=0;
     if(t->dead||t->queued_generation!=t->generation){out->signal=0;retire_record_locked(t,p);return 0;}
     if(t->busy)__builtin_trap();
-    t->busy=1;t->claim_generation=t->generation;t->claim_expiry=t->queued_expiry;
+    t->busy=1;t->claim_generation=t->generation;t->claim_expiry=t->expires;
     t->claim_interval=t->interval;t->claim_output=out;
+    t->claim_overrun=t->pending_overrun;t->claim_realtime=t->realtime;
     record->next=p->completed;p->completed=record;
     return 1;
 }
@@ -240,17 +256,21 @@ void posix_timer_record_complete(struct signal_queue_record *record)
     if(t->cpu.identity) {
         struct kernel_task_usage usage;
         alive=!scheduler_cpu_clock_sample(&t->cpu,&usage);
-        now=alive?usage.user_ns+(t->cpu.kind==1?0:usage.kernel_ns):t->claim_expiry;
-    } else now=timer_now(t);
+        now=alive?usage.user_ns+(t->cpu.kind==1?0:usage.kernel_ns):0;
+    } else now=t->claim_realtime?kernel_time_realtime_ns():kernel_time_monotonic_ns();
     struct kernel_wait_cursor cursor={0};struct kernel_task *wake=0;
     int free_it;
     {
-        KERNEL_RAW_SCOPE(g,&kernel_wait_domain);uint64_t overrun=0,next=0;
-        if(alive&&t->claim_interval)next=forward_time(t->claim_expiry,t->claim_interval,now,&overrun);
-        int over=overrun>INT32_MAX?INT32_MAX:(int)overrun;
+        KERNEL_RAW_SCOPE(g,&kernel_wait_domain);uint64_t periods=0,next=0;
+        int over=0;
+        if(alive&&t->claim_interval) {
+            next=forward_time(t->claim_expiry,t->claim_interval,now,&periods);
+            accumulate_overrun(&t->claim_overrun,periods);
+            over=t->claim_overrun>INT32_MAX?INT32_MAX:(int)t->claim_overrun;
+        }
         t->claim_output->uid=(uint32_t)over;t->claim_output=0;t->busy=0;
         if(!t->dead&&t->claim_generation==t->generation){t->overrun=over;t->expires=next;if(next)arm_locked(t);}
-        if(!t->dead&&t->deferred){t->deferred=0;queue_locked(t,&cursor,&wake);}
+        if(!t->dead&&t->deferred){t->deferred=0;queue_locked(t,&cursor,&wake,0);}
         free_it=timer_put_locked(t);
     }
     if(cursor.queue)kernel_wait_cursor_wake(&cursor,1);
@@ -357,9 +377,9 @@ int kernel_posix_timer_delete(struct kernel_task *caller,int32_t id)
 }
 /* CPU snapshots acquire the scheduler domain internally. The setting and
  * identity role are checked again before publishing a sampled result. */
-static int sample_timer(struct kernel_posix_timer *t,uint64_t *now)
+static int sample_timer(struct kernel_posix_timer *t,unsigned realtime,uint64_t *now)
 {
-    if(!t->cpu.identity){*now=timer_now(t);return 0;}
+    if(!t->cpu.identity){*now=realtime?kernel_time_realtime_ns():kernel_time_monotonic_ns();return 0;}
     struct kernel_task_usage usage;int error=scheduler_cpu_clock_sample(&t->cpu,&usage);
     if(!error)*now=usage.user_ns+(t->cpu.kind==1?0:usage.kernel_ns);
     return error;
@@ -369,9 +389,9 @@ int kernel_posix_timer_get(struct kernel_task *caller,int32_t id,struct kernel_p
     struct kernel_posix_timer *t=timer_get(caller,id);if(!t)return -KERNEL_EINVAL;
     int error=0;
     for(;;) {
-        uint64_t generation,now=0;
-        {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);generation=t->generation;}
-        int gone=sample_timer(t,&now);
+        uint64_t generation,now=0;unsigned realtime;
+        {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);generation=t->generation;realtime=t->realtime;}
+        int gone=sample_timer(t,realtime,&now);
         KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
         if(!t->valid){error=-KERNEL_EINVAL;break;}
         if(generation!=t->generation)continue;
@@ -399,16 +419,20 @@ int kernel_posix_timer_set(struct kernel_task *caller,int32_t id,int flags,
     uint64_t interval=in->interval.seconds>INT64_MAX/1000000000?INT64_MAX:add_time((uint64_t)in->interval.seconds*1000000000,(uint64_t)in->interval.nanoseconds);
     int error=0;
     for(;;) {
-        uint64_t generation,now=0;
-        {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);generation=t->generation;}
-        int gone=sample_timer(t,&now);
+        uint64_t generation,now=0;unsigned realtime;
+        {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);generation=t->generation;realtime=t->realtime;}
+        int gone=sample_timer(t,realtime,&now);
         KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
         if(!t->valid){error=-KERNEL_EINVAL;break;}
         if(generation!=t->generation)continue;
         if(gone||(t->cpu.identity&&!cpu_target_locked(&t->cpu))){error=-KERNEL_ESRCH;break;}
         snapshot_locked(t,now,old);deactivate_locked(t);t->generation++;t->deferred=0;t->overrun=0;
-        t->interval=value?interval:0;
-        if(value){t->expires=(flags&1)?value:add_time(now,value);arm_locked(t);}
+        t->interval=value?interval:0;t->pending_overrun=-1;
+        if(value){
+            t->realtime=!t->cpu.identity&&t->clock==0&&(flags&1);
+            if(!t->cpu.identity)now=timer_now(t);
+            t->expires=(flags&1)?value:add_time(now,value);arm_locked(t);
+        }
         else if(t->event.notify!=1||t->cpu.identity)t->expires=0;
         break;
     }
@@ -462,7 +486,7 @@ void scheduler_cpu_timer_expire(void)
                     kernel_wait_notify_locked(&sleep->token,KERNEL_WAIT_WOKEN);
                     continue;
                 }
-                timer->references++;deactivate_locked(timer);queue_locked(timer,&cursor,&wake);
+                timer->references++;deactivate_locked(timer);queue_locked(timer,&cursor,&wake,1);
             }
             notify(&cursor,wake,(unsigned)timer->event.signal);timer_put(timer);
         }
@@ -493,13 +517,32 @@ void kernel_posix_timer_expire(uint64_t now)
         {
             KERNEL_RAW_SCOPE(g,&kernel_wait_domain);struct kernel_avl_node *node=kernel_avl_first(wall_root);
             if(!node||(int64_t)(now-node->key)<0)break;
-            t=(void *)((char *)node- offsetof(struct kernel_posix_timer,deadline));t->references++;
-            deactivate_locked(t);queue_locked(t,&cursor,&wake);
+            t=(void *)((char *)node- offsetof(struct kernel_posix_timer,deadline));
+            if(timer_now(t)<t->expires) {
+                deactivate_locked(t);arm_locked(t);continue;
+            }
+            t->references++;deactivate_locked(t);queue_locked(t,&cursor,&wake,1);
         }
         if(cursor.queue)kernel_wait_cursor_wake(&cursor,1);
         if(wake){signal_timer_notify(wake,(unsigned)t->event.signal);scheduler_task_put(wake);}
         timer_put(t);
     }
+}
+static void wall_reindex_locked(struct kernel_avl_node *node)
+{
+    if(!node)return;
+    struct kernel_avl_node *left=node->left,*right=node->right;
+    wall_reindex_locked(left);wall_reindex_locked(right);
+    struct kernel_posix_timer *t=(void *)((char *)node- offsetof(struct kernel_posix_timer,deadline));
+    t->indexed=0;arm_locked(t);
+}
+void kernel_posix_timer_clock_changed(void)
+{
+    {
+        KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+        struct kernel_avl_node *old=wall_root;wall_root=0;wall_reindex_locked(old);wall_publish_locked();
+    }
+    kernel_posix_timer_expire(arch_time_read());kernel_posix_timer_changed();
 }
 void kernel_posix_timer_unignore(struct kernel_task *task,unsigned sig)
 {
@@ -512,7 +555,7 @@ void kernel_posix_timer_unignore(struct kernel_task *task,unsigned sig)
                 if((unsigned)t->event.signal==sig&&!signal_timer_disposition_ignored_locked(t->recipient,t->event.notify==4,sig))break;
             }
             if(!t)break;
-            t->references++;unpark_locked(t);t->expires=t->queued_expiry;queue_locked(t,&cursor,&wake);
+            t->references++;unpark_locked(t);queue_locked(t,&cursor,&wake,0);
         }
         if(cursor.queue)kernel_wait_cursor_wake(&cursor,1);
         if(wake){signal_timer_notify(wake,(unsigned)t->event.signal);scheduler_task_put(wake);}

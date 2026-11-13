@@ -27,6 +27,7 @@
 #include <kernel/socket_control.h>
 #include <kernel/task.h>
 #include <kernel/time.h>
+#include <kernel/uts.h>
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
 
@@ -131,17 +132,18 @@ enum kernel_files_status kernel_files_release_io(
     return KERNEL_FILES_STATUS_STATE;
 }
 
-/* Sysctl reads commit the offset only after the complete generated prefix was
- * copied. Unlike ordinary proc snapshots, every offset-zero read is fresh. */
+/* Sysctl reads commit the backend position only after the complete generated
+ * prefix was copied. Every call reads the current configuration. */
 static enum kernel_files_status control_read(
     struct kernel_files *files, struct kernel_mm *mm,
     struct kernel_open_file_description *description,
     struct kernel_uaccess_iov_cursor *cursor, uint64_t count,
     uint64_t offset, int advance, int64_t *linux_result)
 {
-    char buffer[32];
+    char buffer[KERNEL_UTS_FIELD_SIZE];
     size_t length = 0, copied = 0;
-    int result = kernel_vfs_file_control(&description->file, 0, offset, buffer,
+    int result = kernel_vfs_file_control_permission(&description->file, 0);
+    if (!result) result = kernel_vfs_file_control(&description->file, 0, &offset, buffer,
         count < sizeof(buffer) ? (size_t)count : sizeof(buffer), &length);
     if (!result && length) {
         enum kernel_uaccess_status access = kernel_copy_to_user_iov(
@@ -155,7 +157,7 @@ static enum kernel_files_status control_read(
         KERNEL_FILES_NOTE(files, read_failures, 1);
         return KERNEL_FILES_STATUS_OK;
     }
-    if (advance && kernel_open_file_advance(description, length) != KERNEL_OPEN_FILE_STATUS_OK)
+    if (advance && kernel_open_file_seek(description, offset) != KERNEL_OPEN_FILE_STATUS_OK)
         return KERNEL_FILES_STATUS_STATE;
     KERNEL_FILES_NOTE(files, bytes_read, length);
     *linux_result = (int64_t)length;
@@ -1039,7 +1041,8 @@ static enum kernel_files_status control_write(
 {
     char *buffer = 0;
     size_t copied = 0, accepted = 0;
-    int result = 0;
+    int result = kernel_vfs_file_control_permission(&description->file, 1);
+    if (result) { *linux_result = result; return KERNEL_FILES_STATUS_OK; }
     if (!count) { *linux_result = 0; return KERNEL_FILES_STATUS_OK; }
     enum kernel_heap_status allocation = kernel_heap_allocate(
         files->heap, (size_t)count, (void **)&buffer);
@@ -1058,12 +1061,12 @@ static enum kernel_files_status control_write(
         *linux_result = -KERNEL_EFAULT;
         return KERNEL_FILES_STATUS_OK;
     }
-    if (!result) result = kernel_vfs_file_control(&description->file, 1,
-        positioned ? requested_offset : kernel_open_file_offset(description),
+    uint64_t offset = positioned ? requested_offset : kernel_open_file_offset(description);
+    result = kernel_vfs_file_control(&description->file, 1, &offset,
         buffer, (size_t)count, &accepted);
     kernel_heap_release(files->heap, buffer);
     if (result) { *linux_result = result; return KERNEL_FILES_STATUS_OK; }
-    if (!positioned && kernel_open_file_advance(description, accepted) != KERNEL_OPEN_FILE_STATUS_OK)
+    if (!positioned && kernel_open_file_seek(description, offset) != KERNEL_OPEN_FILE_STATUS_OK)
         return KERNEL_FILES_STATUS_STATE;
     *linux_result = (int64_t)accepted;
     return KERNEL_FILES_STATUS_OK;

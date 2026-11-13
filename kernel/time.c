@@ -21,6 +21,8 @@ static uint64_t time_multiplier;
 static uint64_t time_ticks_multiplier;
 static uint64_t time_boot_realtime_ns;
 static uint64_t time_coarse_monotonic_ns;
+static int32_t time_timezone[2];
+static uint32_t time_sequence;
 
 #if KERNEL_HAS_VDSO_ELF
 #include <kernel/page.h>
@@ -29,7 +31,7 @@ static uint64_t time_coarse_monotonic_ns;
 #include <string.h>
 
 static struct kernel_raw_lock vvar_lock = {
-    .rank = KERNEL_RAW_RANK_OBJECT, .initialized = KERNEL_RAW_INITIALIZED
+    .rank = KERNEL_RAW_RANK_WAIT_QUEUE, .initialized = KERNEL_RAW_INITIALIZED
 };
 static struct kernel_vdso_time_data *vvar;
 static struct physical_page_allocator *vvar_allocator;
@@ -38,11 +40,15 @@ static uint32_t vvar_owners;
 
 static void publish_vvar(void)
 {
-    vvar->boot_realtime_ns = time_boot_realtime_ns;
+    __atomic_add_fetch(&vvar->sequence, 1, __ATOMIC_ACQ_REL);
+    __atomic_store_n(&vvar->boot_realtime_ns, time_boot_realtime_ns, __ATOMIC_RELAXED);
+    __atomic_store_n(&vvar->minuteswest, time_timezone[0], __ATOMIC_RELAXED);
+    __atomic_store_n(&vvar->dsttime, time_timezone[1], __ATOMIC_RELAXED);
     vvar->coarse_resolution_ns = kernel_time_coarse_resolution_ns();
     __atomic_store_n(&vvar->coarse_monotonic_ns,
         __atomic_load_n(&time_coarse_monotonic_ns, __ATOMIC_RELAXED), __ATOMIC_RELAXED);
     __atomic_store_n(&vvar->multiplier, time_multiplier, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&vvar->sequence, 1, __ATOMIC_RELEASE);
 }
 
 int kernel_time_vvar_acquire(struct physical_page_allocator *allocator, uint64_t *page)
@@ -159,7 +165,14 @@ uint64_t kernel_time_monotonic_ns(void)
 
 uint64_t kernel_time_realtime_ns(void)
 {
-    return time_boot_realtime_ns + kernel_time_monotonic_ns();
+    for (;;) {
+        uint32_t seq=__atomic_load_n(&time_sequence,__ATOMIC_ACQUIRE);
+        if (seq&1) continue;
+        uint64_t offset=__atomic_load_n(&time_boot_realtime_ns,__ATOMIC_RELAXED);
+        uint64_t value=offset+kernel_time_monotonic_ns();
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (seq==__atomic_load_n(&time_sequence,__ATOMIC_RELAXED)) return value;
+    }
 }
 
 void kernel_time_update_coarse(void)
@@ -187,8 +200,14 @@ uint64_t kernel_time_coarse_monotonic_ns(void)
 
 uint64_t kernel_time_coarse_realtime_ns(void)
 {
-    /* RTC offset 启动后不可变；单个原子样本避免两套快照撕裂。 */
-    return time_boot_realtime_ns + kernel_time_coarse_monotonic_ns();
+    for (;;) {
+        uint32_t seq=__atomic_load_n(&time_sequence,__ATOMIC_ACQUIRE);
+        if (seq&1) continue;
+        uint64_t offset=__atomic_load_n(&time_boot_realtime_ns,__ATOMIC_RELAXED);
+        uint64_t value=offset+kernel_time_coarse_monotonic_ns();
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (seq==__atomic_load_n(&time_sequence,__ATOMIC_RELAXED)) return value;
+    }
 }
 
 uint64_t kernel_time_coarse_resolution_ns(void)
@@ -198,7 +217,7 @@ uint64_t kernel_time_coarse_resolution_ns(void)
 
 uint64_t kernel_time_boot_realtime_offset(void)
 {
-    return time_boot_realtime_ns;
+    return __atomic_load_n(&time_boot_realtime_ns, __ATOMIC_ACQUIRE);
 }
 
 enum kernel_time_status kernel_time_deadline_from_monotonic(
@@ -235,4 +254,46 @@ enum kernel_time_status kernel_time_deadline_from_monotonic(
         *deadline = 1U;
     }
     return KERNEL_TIME_STATUS_OK;
+}
+
+enum kernel_time_status kernel_time_set_realtime(uint64_t ns)
+{
+#if KERNEL_HAS_VDSO_ELF
+    KERNEL_RAW_SCOPE(guard, &vvar_lock);
+#endif
+    uint64_t now=kernel_time_monotonic_ns();
+    if (ns < now || ns > INT64_MAX) return KERNEL_TIME_STATUS_INVALID_ARGUMENT;
+    __atomic_add_fetch(&time_sequence,1,__ATOMIC_ACQ_REL);
+    __atomic_store_n(&time_boot_realtime_ns, ns-now, __ATOMIC_RELAXED);
+#if KERNEL_HAS_VDSO_ELF
+    if (vvar) publish_vvar();
+#endif
+    __atomic_add_fetch(&time_sequence,1,__ATOMIC_RELEASE);
+    return KERNEL_TIME_STATUS_OK;
+}
+void kernel_time_get_timezone(int32_t timezone[2])
+{
+#if KERNEL_HAS_VDSO_ELF
+    KERNEL_RAW_SCOPE(guard, &vvar_lock);
+#endif
+    timezone[0]=time_timezone[0];timezone[1]=time_timezone[1];
+}
+void kernel_time_set_timezone(const int32_t timezone[2])
+{
+#if KERNEL_HAS_VDSO_ELF
+    KERNEL_RAW_SCOPE(guard, &vvar_lock);
+#endif
+    __atomic_add_fetch(&time_sequence,1,__ATOMIC_ACQ_REL);
+    time_timezone[0]=timezone[0];time_timezone[1]=timezone[1];
+#if KERNEL_HAS_VDSO_ELF
+    if (vvar) publish_vvar();
+#endif
+    __atomic_add_fetch(&time_sequence,1,__ATOMIC_RELEASE);
+}
+enum kernel_time_status kernel_time_deadline_from_realtime(uint64_t ns,uint64_t *deadline)
+{
+    uint64_t offset=kernel_time_boot_realtime_offset();
+    enum kernel_time_status status=kernel_time_deadline_from_monotonic(ns>offset?ns-offset:0,deadline);
+    if (status==KERNEL_TIME_STATUS_DEADLINE_PASSED) *deadline=arch_time_read()+1;
+    return status;
 }

@@ -16,6 +16,7 @@ static struct kernel_task task;
 static struct kernel_pid pid;
 static struct kernel_pid_member members[2];
 static uint64_t now_ns;
+static uint64_t wall_offset;
 static unsigned live,ignored,allocation_calls,allocation_fail,cpu_samples;
 static uint64_t cpu_user,cpu_kernel;
 static pthread_barrier_t entered,released;
@@ -26,11 +27,13 @@ uint64_t kernel_time_monotonic_ns(void)
     if(hold_clock&&!kernel_cpu_current()->raw_locks){hold_clock=0;gate(&entered);gate(&released);}
     return __atomic_load_n(&now_ns,__ATOMIC_RELAXED);
 }
-uint64_t kernel_time_realtime_ns(void){return kernel_time_monotonic_ns()+1000000000000ULL;}
-uint64_t kernel_time_boot_realtime_offset(void){return 1000000000000ULL;}
+uint64_t kernel_time_realtime_ns(void){return kernel_time_monotonic_ns()+wall_offset;}
+uint64_t kernel_time_boot_realtime_offset(void){return wall_offset;}
 uint64_t riscv_time_read(void){return kernel_time_monotonic_ns()/100;}
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t ns,uint64_t *out)
 {if(ns<=kernel_time_monotonic_ns())return KERNEL_TIME_STATUS_DEADLINE_PASSED;*out=(ns+99)/100;return 0;}
+enum kernel_time_status kernel_time_deadline_from_realtime(uint64_t ns,uint64_t *out)
+{if(ns<=kernel_time_realtime_ns()){*out=riscv_time_read()+1;return KERNEL_TIME_STATUS_DEADLINE_PASSED;}return kernel_time_deadline_from_monotonic(ns-wall_offset,out);}
 void kernel_scheduler_deadline_changed(void){assert(!kernel_cpu_current()->raw_locks);}
 void kernel_cpu_flush_notifications(void){assert(!kernel_cpu_current()->outbound);}
 struct kernel_cpu *riscv_smp_cpu(uint32_t n){assert(!n);return kernel_cpu_current();}
@@ -97,14 +100,14 @@ static void init(void)
     task.limits->values[KERNEL_RLIMIT_SIGPENDING]=(struct kernel_rlimit64){4096,4096};task.tid=1;
     pid=(struct kernel_pid){.number=1,.references=1,.generation=1};
     for(unsigned r=0;r<2;r++){members[r]=(struct kernel_pid_member){.identity=&pid,.role=r,.task=&task};pid.members[r]=&members[r];}
-    ignored=allocation_fail=cpu_samples=0;cpu_user=cpu_kernel=0;now_ns=1000000000;
+    ignored=allocation_fail=cpu_samples=0;cpu_user=cpu_kernel=0;now_ns=1000000000;wall_offset=1000000000000ULL;
 }
 static void finish(void)
 {kernel_posix_timers_exec(&task);kernel_signal_pending_cleanup(&task);assert(!count()&&!live&&!task.storage_borrows&&pid.references==1&&!kernel_posix_timer_deadline());}
-static int create_timer(int sig)
+static int create_timer(int clock,int sig)
 {
     struct kernel_posix_event event={.notify=0,.signal=sig,.value=0x12345678};int32_t id;
-    struct kernel_posix_timer *t;assert(!kernel_posix_timer_prepare(&task,1,&event,&id,&t));kernel_posix_timer_publish(t,1);return id;
+    struct kernel_posix_timer *t;assert(!kernel_posix_timer_prepare(&task,clock,&event,&id,&t));kernel_posix_timer_publish(t,1);return id;
 }
 static void arm(int id,uint64_t value,uint64_t interval)
 {
@@ -120,7 +123,7 @@ static struct kernel_signal_wait_info take(unsigned sig)
 }
 static void reservation_and_mixed(void)
 {
-    init();int a=create_timer(10),b=create_timer(10);assert(count()==2);
+    init();int a=create_timer(1,10),b=create_timer(1,10);assert(count()==2);
     struct signal_pending_prepared p={0};struct kernel_signal_wait_info info={.signal=10,.code=0,.sender=42};
     {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(!signal_pending_post_locked(&task,1,&task,&info,0,&p));}
     signal_pending_finish(&p);assert(count()==3);
@@ -134,11 +137,11 @@ static void reservation_and_mixed(void)
 }
 static void stale_and_ignored(void)
 {
-    init();int id=create_timer(36);arm(id,now_ns+100,100);expire(now_ns+100);
+    init();int id=create_timer(1,36);arm(id,now_ns+100,100);expire(now_ns+100);
     arm(id,now_ns+1000000,0);assert(!take(36).signal&&count()==1);
     expire(now_ns+1000000);assert(!kernel_posix_timer_delete(&task,id)&&count()==1);
     assert(!take(36).signal&&!count());finish();
-    init();ignored=1;id=create_timer(36);arm(id,now_ns+100,100);expire(now_ns+100);
+    init();ignored=1;id=create_timer(1,36);arm(id,now_ns+100,100);expire(now_ns+100);
     assert(!task.group_pending&&!kernel_posix_timer_deadline()&&count()==1);
     now_ns+=100000;ignored=0;kernel_posix_timer_unignore(&task,36);expire(now_ns+100);
     struct kernel_signal_wait_info out=take(36);assert(out.signal==36&&out.uid>=1000);
@@ -146,7 +149,7 @@ static void stale_and_ignored(void)
 }
 static void clear_batch_and_exec(void)
 {
-    init();int ids[32];for(unsigned i=0;i<32;i++){ids[i]=create_timer(10);arm(ids[i],now_ns+100,100);}
+    init();int ids[32];for(unsigned i=0;i<32;i++){ids[i]=create_timer(1,10);arm(ids[i],now_ns+100,100);}
     expire(now_ns+100);assert(count()==32);ignored=1;
     struct signal_pending_prepared p={0};int more;
     {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);more=signal_pending_ignore_locked(&task,1,UINT64_C(1)<<9,&p);}
@@ -158,7 +161,7 @@ static void clear_batch_and_exec(void)
     assert(!task.group_pending&&count()==32);
     for(unsigned i=0;i<32;i++)assert(!kernel_posix_timer_delete(&task,ids[i]));
     finish();
-    init();int id=create_timer(36);struct kernel_signal_wait_info info={.signal=36,.code=-1,.value=7};
+    init();int id=create_timer(1,36);struct kernel_signal_wait_info info={.signal=36,.code=-1,.value=7};
     signal_pending_prepare(&task,1,&task,&heap,&info,1,&p);
     {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(!signal_pending_post_locked(&task,1,&task,&info,1,&p));}
     signal_pending_finish(&p);info.code=-2;
@@ -173,7 +176,7 @@ static void *delete_during_completion(void *unused)
 {(void)unused;gate(&entered);assert(!kernel_posix_timer_delete(&task,changing_id)&&count()==1);gate(&released);return 0;}
 static void completion_owner(void)
 {
-    init();changing_id=create_timer(36);arm(changing_id,now_ns+100,100);expire(now_ns+100);
+    init();changing_id=create_timer(1,36);arm(changing_id,now_ns+100,100);expire(now_ns+100);
     assert(!pthread_barrier_init(&entered,0,2)&&!pthread_barrier_init(&released,0,2));pthread_t other;
     assert(!pthread_create(&other,0,delete_during_completion,0));hold_clock=1;
     struct kernel_signal_wait_info info=take(36);assert(info.signal==36&&info.sender==(unsigned)changing_id);
@@ -187,7 +190,7 @@ static void *reset_during_completion(void *unused)
 }
 static void completion_reset(void)
 {
-    init();changing_id=create_timer(36);arm(changing_id,now_ns+100,100);expire(now_ns+100);
+    init();changing_id=create_timer(1,36);arm(changing_id,now_ns+100,100);expire(now_ns+100);
     assert(!pthread_barrier_init(&entered,0,2)&&!pthread_barrier_init(&released,0,2));pthread_t other;
     assert(!pthread_create(&other,0,reset_during_completion,0));hold_clock=1;
     struct kernel_signal_wait_info out=take(36);assert(out.signal==36);
@@ -220,7 +223,7 @@ static void cpu_thresholds(void)
 }
 static void changed_uid_reservation(void)
 {
-    init();int id=create_timer(36);
+    init();int id=create_timer(1,36);
     struct kernel_credentials user=*kernel_credentials_initial();
     user.uid=1000;user.account=kernel_uid_account_get(&heap,user.uid);assert(user.account);
     task.credentials=&user;
@@ -263,9 +266,51 @@ static void retired_kernel_worker(void)
     assert(!worker.cpu_timer_index[0].indexed && !worker.cpu_timer_index[1].indexed);
     assert(!worker.limits && !live);
 }
+static uint64_t remaining(int id)
+{
+    struct kernel_posix_itimerspec out;assert(!kernel_posix_timer_get(&task,id,&out));
+    return (uint64_t)out.value.seconds*1000000000+(uint64_t)out.value.nanoseconds;
+}
+static void clock_steps(void)
+{
+    init();int relative=create_timer(0,36),absolute=create_timer(0,36),monotonic=create_timer(1,36);
+    struct kernel_posix_itimerspec in={.value={0,1000}},old;
+    assert(!kernel_posix_timer_set(&task,relative,0,&in,&old));
+    arm(absolute,kernel_time_realtime_ns()+2000,0);arm(monotonic,now_ns+3000,0);
+    uint64_t first=kernel_posix_timer_deadline();
+    wall_offset-=500;kernel_posix_timer_clock_changed();
+    assert(remaining(relative)==1000&&remaining(absolute)==2500&&remaining(monotonic)==3000&&kernel_posix_timer_deadline()==first);
+    wall_offset+=3000;kernel_posix_timer_clock_changed();kernel_posix_timer_expire(riscv_time_read()+1);
+    struct kernel_signal_wait_info out=take(36);assert(out.signal==36&&out.sender==(unsigned)absolute&&!task.group_pending);
+    assert(remaining(relative)==1000&&remaining(monotonic)==3000);
+    assert(!kernel_posix_timer_delete(&task,relative)&&!kernel_posix_timer_delete(&task,absolute)&&!kernel_posix_timer_delete(&task,monotonic));finish();
+    init();absolute=create_timer(0,36);arm(absolute,kernel_time_realtime_ns()+100,0);
+    first=kernel_posix_timer_deadline();wall_offset-=200;now_ns+=100;
+    kernel_posix_timer_expire(first);assert(!task.group_pending&&remaining(absolute)==200);
+    kernel_posix_timer_clock_changed();expire(now_ns+200);
+    assert(take(36).signal==36&&!kernel_posix_timer_delete(&task,absolute));finish();
+}
+static void queued_periodic_clock_steps(void)
+{
+    init();int id=create_timer(0,36);arm(id,kernel_time_realtime_ns()+100,100);expire(now_ns+100);
+    wall_offset-=200;kernel_posix_timer_clock_changed();
+    struct kernel_signal_wait_info out=take(36);
+    /* The fixed Linux common_hrtimer_rearm adds zero to initial overrun -1
+     * when wall time has moved before this already queued expiration. */
+    assert(out.signal==36&&(int32_t)out.uid==-1&&remaining(id)==200);
+    expire(now_ns+200);out=take(36);assert(out.signal==36&&!out.uid&&remaining(id)==100);
+    assert(!kernel_posix_timer_delete(&task,id));finish();
+    init();id=create_timer(0,36);arm(id,kernel_time_realtime_ns()+100,100);expire(now_ns+100);
+    wall_offset+=350;kernel_posix_timer_clock_changed();assert(remaining(id)==50);
+    wall_offset-=600;kernel_posix_timer_clock_changed();out=take(36);
+    assert(out.signal==36&&out.uid==3&&kernel_posix_timer_overrun(&task,id)==3&&remaining(id)==650);
+    expire(now_ns+650);out=take(36);assert(out.signal==36&&!out.uid&&remaining(id)==100);
+    assert(!kernel_posix_timer_delete(&task,id));finish();
+}
 int main(void)
 {
     retired_kernel_worker();rttime_index_only();cpu_sleep_owner();
     reservation_and_mixed();stale_and_ignored();clear_batch_and_exec();completion_owner();completion_reset();cpu_thresholds();changed_uid_reservation();
-    puts("POSIX native reservation, mixed FIFO, stale generation, ignore phase and completion/delete owner passed");return 0;
+    clock_steps();queued_periodic_clock_steps();
+    puts("POSIX native reservation, mixed FIFO, stale generation, ignore phase, completion/delete owner and clock steps passed");return 0;
 }

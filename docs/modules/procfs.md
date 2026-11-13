@@ -1,6 +1,6 @@
 # procfs 模块
 
-`fs/procfs.c` 是可动态创建的 VFS 实例。当前提供真实物理页分配器读数的 `meminfo`、单 hart 运行/idle 计时的 `uptime`、进程及线程数字目录、`/proc/self`、`/proc/thread-self` 与进程的 `exe/cwd/root/fd` 对象链接、`/proc/self/mounts` 与 `/proc/mounts`，以及进程 `maps`、`fdinfo`、`stat/status` 的首批真实字段、`/proc/sysvipc/{shm,sem,msg}` 和 `/proc/sys/kernel/sched_rt_period_us`、`sched_rt_runtime_us`、只读的`pid_max`。线程目录提供 `stat/status`、`fd/fdinfo`、`exe/cwd/root`、`maps`、`mounts` 和 `ns/mnt`；Linux 全量进程字段与无路径 console 的链接仍待接入。
+`fs/procfs.c` 是可动态创建的 VFS 实例。当前提供真实物理页分配器读数的 `meminfo`、单 hart 运行/idle 计时的 `uptime`、进程及线程数字目录、`/proc/self`、`/proc/thread-self` 与进程的 `exe/cwd/root/fd` 对象链接、`/proc/self/mounts` 与 `/proc/mounts`，以及进程 `maps`、`fdinfo`、`stat/status` 的首批真实字段、`/proc/sysvipc/{shm,sem,msg}` 和 `/proc/sys/kernel/sched_rt_period_us`、`sched_rt_runtime_us`、`hostname`、`domainname`、只读的`pid_max`。线程目录提供 `stat/status`、`fd/fdinfo`、`exe/cwd/root`、`maps`、`mounts` 和 `ns/mnt`；Linux 全量进程字段与无路径 console 的链接仍待接入。
 
 `mount(2)` 的 proc 实例不使用源字符串选择设备；用户态负责创建挂载点。bind、卸载和挂载属性的共同规则见[VFS 挂载说明](vfs-ext4.md)。挂载实例持有根及覆盖路径，最后释放时销毁无 I/O 的 proc 实例。PID 1 及后代退出后的根盘清理从最深子挂载开始拆除；其他命名空间的私有树随进程和命名空间 FD 的最后引用退休。
 
@@ -16,7 +16,9 @@ sem/msg 按 slot 索引逐行遍历，在索引和对应对象的短锁内复制
 
 RT 控制文件标记为 `generated_control`，通过单独后端 `control` 回调动态读写，不形成 OFD 快照。offset 为零时每次读取 scheduler 的原子 period/runtime 对；非零读取直接 EOF，因而短读不会继续输出剩余数字。write/writev 先完整复制全部用户数据，再按固定 Linux 的单整数 sysctl 规则解析和调用原子 setter：base 0、不接受 `+`，只消耗首个数字及其后空白，32 位溢出和不合法配置返回 `EINVAL`。非零偏移写完整复制后忽略配置并推进偏移；复制失败不发布配置、不推进偏移，读复制失败也返回 `EFAULT` 且偏移不变。OFD offset 锁串行化同描述符操作，setter 自身保护全局配置；无 inode 锁跨用户复制或 scheduler 操作。只读 proc mount 写打开返回 `EROFS`。
 
-这两个控制文件使用 Linux `default_llseek` 语义：`SEEK_END` 以元数据 size 0 为基准，非负 `SEEK_DATA/HOLE` 返回 `ENXIO`；其他生成文件保留原 seq_file 规则。新增 `sys/kernel` 目录使用固定 cookie，根的动态 PID cookie 基数为 8，仍按 PID 及代次继续遍历。普通 proc 文件原有快照、fault 前缀和 rewind 行为不改变。聚焦同 ELF 对照为 `tests/diff-abi/rt_controls.c`，覆盖动态刷新、数值/偏移、scatter fault、readonly mount 与 seek；解析及取舍依据见 [proc 控制文件](../learning/proc-controls.md)。
+`hostname`、`domainname` 为 0644 字符串控制文件，与 `sethostname/setdomainname` 及 `uname` 共用 `kernel/uts.c` 中的状态。每次读取取得当前名称，按偏移继续输出字符串和末尾换行；seek 到零可重新读取。写入先完整复制用户数据，再从当前偏移替换到首个 NUL、换行或 64 字节上界，并加终止 NUL；返回完整输入长度，位置按输入长度推进。若写偏移超过当前字符串末尾，仍返回输入长度，但状态和位置均不变。并发写的字段替换在 UTS 短锁内完成；复制用户数据不持锁。按固定 Linux sysctl 表权限，以当前有效 UID 判断，只有 euid 0 可写，不由 DAC capability 绕过；已打开 FD 降权后再写返回 `EPERM`，写打开被拒绝为 `EACCES`。系统调用自身的 `CAP_SYS_ADMIN` 规则见 [系统调用模块](kernel-syscall.md)。
+
+控制文件使用 Linux `default_llseek` 语义：`SEEK_END` 以元数据 size 0 为基准，非负 `SEEK_DATA/HOLE` 返回 `ENXIO`；其他生成文件保留原 seq_file 规则。`sys/kernel` 目录使用固定 cookie；普通 proc 文件原有快照、fault 前缀和 rewind 行为不改变。实时预算的聚焦同 ELF 对照为 `tests/diff-abi/rt_controls.c`，覆盖动态刷新、数值/偏移、scatter fault、readonly mount 与 seek；解析及取舍依据见 [proc 控制文件](../learning/proc-controls.md)。
 
 meminfo 使用与 `sysinfo` 相同的 `kernel_memory_snapshot()`，输出 KiB。`Cached` 包含文件缓存和共享匿名后备页，`Shmem` 单列后者；`Dirty`、`Writeback`、`Buffers` 分别来自缓存状态与真实块缓冲。`MemAvailable` 的资格、余量和上下界见[物理页模块](physical-pages.md)。没有 swap 和可延后收缩的 slab cache，因此 `SwapTotal/SwapFree/SReclaimable` 为零；不能把普通堆空闲等同于 slab reclaimable。原 LTP 已越过缺少 Cached 的失败点，后续 chown ENOSYS 单列。固定 Linux 的 root 可以用写模式打开 `meminfo`，但写入返回 `EIO`；该行为与内容不可修改一致。未知目录项返回 `ENOENT`。首批 U-mode 对照见 `tests/diff-abi/proc.c`；内部挂载树测试见 `tests/riscv/vfs_main.c`。
 

@@ -179,15 +179,16 @@ void kernel_signal_restore_temporary_mask(
  * handling; the generic form keeps the original trap arguments. */
 void kernel_signal_note_syscall_restart(struct kernel_task *task);
 
-/* Records a nanosleep restart: wall deadlines use architecture ticks,
- * CPU clock deadlines use the selected CPU clock in nanoseconds. */
+/* Records a nanosleep restart: absolute REALTIME uses wall nanoseconds,
+ * other wall sleeps use architecture ticks, CPU sleeps use their selected
+ * CPU clock in nanoseconds. */
 void kernel_signal_note_nanosleep_restart(struct kernel_task *task,
                                           int32_t clock_id, int absolute,
                                           uint64_t deadline,
                                           uint64_t remaining_address);
 
-/* Records a timed futex wait using the first call's absolute monotonic
- * deadline so restart_syscall cannot grant a fresh relative timeout. */
+/* Records the first futex deadline in its original clock domain. Operation
+ * flags retain REALTIME so restart cannot grant a fresh relative timeout. */
 void kernel_signal_note_futex_timed_restart(struct kernel_task *task,
                                             uint64_t address,
                                             uint32_t operation,

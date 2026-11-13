@@ -38,19 +38,38 @@ static struct kernel_event_fd *event_of(struct kernel_open_file_description *fil
 struct kernel_timer_fd {
     struct kernel_event_fd event;
     struct kernel_avl_node deadline;
-    uint64_t expires,interval;
+    struct kernel_timer_fd *cancel_next,**cancel_previous,*notify_next;
+    uint64_t expires,interval,cancel_offset;
     uint32_t clock,flags,notifications;
-    uint8_t indexed,expired;
+    uint8_t indexed,expired,realtime,canceled;
 };
 static struct kernel_raw_lock timer_lock={.rank=KERNEL_RAW_RANK_OBJECT,.initialized=KERNEL_RAW_INITIALIZED};
 static struct kernel_avl_node *timer_root;
+static struct kernel_timer_fd *cancel_timers;
 uint64_t kernel_timer_fd_next;
 static int is_timer(const struct kernel_event_fd *event)
 { return event->file.kind==KERNEL_OPEN_FILE_KIND_TIMERFD; }
 static struct kernel_raw_lock *event_lock(struct kernel_event_fd *event)
 { return is_timer(event)?&timer_lock:&event->lock; }
 static uint64_t timer_now(const struct kernel_timer_fd *timer)
-{ return timer->clock==0?kernel_time_realtime_ns():kernel_time_monotonic_ns(); }
+{ return timer->realtime?kernel_time_realtime_ns():kernel_time_monotonic_ns(); }
+static void timer_cancel_registration(struct kernel_timer_fd *timer,int enable)
+{
+    if(enable&&!timer->cancel_previous) {
+        timer->cancel_next=cancel_timers;timer->cancel_previous=&cancel_timers;
+        if(cancel_timers)cancel_timers->cancel_previous=&timer->cancel_next;
+        cancel_timers=timer;
+    } else if(!enable&&timer->cancel_previous) {
+        *timer->cancel_previous=timer->cancel_next;
+        if(timer->cancel_next)timer->cancel_next->cancel_previous=timer->cancel_previous;
+        timer->cancel_next=0;timer->cancel_previous=0;
+    }
+}
+static int timer_canceled(struct kernel_timer_fd *timer)
+{
+    if(!timer->cancel_previous||!timer->canceled)return 0;
+    timer->canceled=0;timer->cancel_offset=kernel_time_boot_realtime_offset();return 1;
+}
 static void timer_remove(struct kernel_timer_fd *timer)
 {
     if (!timer->indexed) return;
@@ -80,9 +99,9 @@ static void timer_changed(void)
 }
 static void timer_insert(struct kernel_timer_fd *timer)
 {
-    uint64_t mono=timer->expires;
-    if (!timer->clock) { uint64_t offset=kernel_time_boot_realtime_offset();mono=mono<=offset?0:mono-offset; }
-    enum kernel_time_status status=kernel_time_deadline_from_monotonic(mono,&timer->deadline.key);
+    enum kernel_time_status status=timer->realtime?
+        kernel_time_deadline_from_realtime(timer->expires,&timer->deadline.key):
+        kernel_time_deadline_from_monotonic(timer->expires,&timer->deadline.key);
     if (status==KERNEL_TIME_STATUS_DEADLINE_PASSED) timer->deadline.key=arch_time_read()+1;
     else if (status) __builtin_trap();
     timer->deadline.left=timer->deadline.right=0;timer->deadline.height=1;timer->indexed=1;
@@ -92,7 +111,7 @@ static void timer_forward(struct kernel_timer_fd *timer)
 {
     if (!timer->expired||!timer->interval) return;
     uint64_t now=timer_now(timer);
-    uint64_t periods=now>=timer->expires?(now-timer->expires)/timer->interval+1:1;
+    uint64_t periods=now>=timer->expires?(now-timer->expires)/timer->interval+1:0;
     timer->event.count+=periods-1;
     uint64_t advance=periods>(UINT64_MAX-timer->expires)/timer->interval?UINT64_MAX:periods*timer->interval;
     timer->expires=advance>INT64_MAX-timer->expires?INT64_MAX:timer->expires+advance;
@@ -106,6 +125,10 @@ void kernel_timer_fd_expire(uint64_t now)
             KERNEL_RAW_SCOPE(guard,&timer_lock);
             timer=timer_first();
             if (!timer || (int64_t)(now-timer->deadline.key)<0) break;
+            /* A backwards clock step can publish before its index update. */
+            if(timer_now(timer)<timer->expires) {
+                timer_remove(timer);timer_insert(timer);timer_publish();continue;
+            }
             timer_remove(timer);timer->expired=1;timer->event.count++;
             notify=kernel_wait_cursor_prepare(&timer->event.waiters,&cursor);
             if (notify) timer->notifications++;
@@ -118,6 +141,41 @@ void kernel_timer_fd_expire(uint64_t now)
             timer->notifications--;
         }
     }
+}
+static void timer_reindex(struct kernel_avl_node *node)
+{
+    if(!node)return;
+    struct kernel_avl_node *left=node->left,*right=node->right;
+    timer_reindex(left);timer_reindex(right);
+    struct kernel_timer_fd *timer=(void *)((char *)node- offsetof(struct kernel_timer_fd,deadline));
+    timer_insert(timer);
+}
+void kernel_timer_fd_clock_changed(void)
+{
+    /* Clock setters serialize these batches; settime and close use timer_lock. */
+    struct kernel_timer_fd *notifications=0;
+    {
+        KERNEL_RAW_SCOPE(guard,&timer_lock);
+        struct kernel_avl_node *old=timer_root;timer_root=0;timer_reindex(old);timer_publish();
+        uint64_t offset=kernel_time_boot_realtime_offset();
+        for(struct kernel_timer_fd *timer=cancel_timers;timer;timer=timer->cancel_next) {
+            if(!timer->canceled&&timer->cancel_offset==offset)continue;
+            timer->canceled=1;timer->event.count++;
+            /* Close waits for these borrows, including before cursor setup. */
+            timer->notifications++;timer->notify_next=notifications;notifications=timer;
+        }
+    }
+    while(notifications) {
+        struct kernel_timer_fd *timer=notifications;struct kernel_wait_cursor cursor={0};int notify;
+        {
+            KERNEL_RAW_SCOPE(guard,&timer_lock);
+            notifications=timer->notify_next;timer->notify_next=0;
+            notify=kernel_wait_cursor_prepare(&timer->event.waiters,&cursor);
+        }
+        if(notify)kernel_wait_cursor_wake(&cursor,1);
+        {KERNEL_RAW_SCOPE(guard,&timer_lock);if(!timer->notifications)__builtin_trap();timer->notifications--;}
+    }
+    kernel_timer_fd_expire(arch_time_read());timer_changed();
 }
 static enum kernel_files_status install_event(struct kernel_files *files,
     struct kernel_event_fd *event, uint32_t flags, int64_t *result)
@@ -170,7 +228,7 @@ void kernel_event_fd_close(struct kernel_open_file_description *file)
     struct kernel_event_fd *event=event_of(file);
     if (is_timer(event)) {
         { KERNEL_RAW_SCOPE(guard,&timer_lock);struct kernel_timer_fd *timer=(void *)event;
-          timer_remove(timer);timer_publish(); }
+          timer_cancel_registration(timer,0);timer_remove(timer);timer_publish(); }
         timer_changed();
     }
     struct kernel_wait_queue *queues[3]={&event->waiters,0,0};unsigned count=1;
@@ -208,13 +266,18 @@ uint32_t kernel_event_fd_poll(struct kernel_open_file_description *file,uint32_t
  * lock, while user faults, callback invocation and parking happen outside it. */
 static int event_transfer(struct kernel_event_fd *event,uint64_t *value,int writing,uint32_t flags)
 {
+    int interrupted=0;
     for (;;) {
         struct kernel_wait_token token={0};struct kernel_wait_cursor cursor={0},directed={0};
         int wait=0,notify=0,notify_directed=0;
         {
             KERNEL_RAW_SCOPE(guard,event_lock(event));
             wait=writing ? *value>UINT64_MAX-1-event->count : !event->count;
+            if(!writing&&is_timer(event)&&(!wait||interrupted||(flags&EVENT_NONBLOCK))&&timer_canceled((void *)event)) {
+                event->count=0;((struct kernel_timer_fd *)event)->expired=0;return -KERNEL_ECANCELED;
+            }
             if (wait) {
+                if(interrupted)return -KERNEL_ERESTARTSYS;
                 if (flags&EVENT_NONBLOCK) return -KERNEL_EAGAIN;
                 struct kernel_wait_queue *queue=&event->waiters;
                 if (!is_timer(event)) {struct kernel_counter_fd *counter=(void *)event;queue=writing?&counter->writers:&counter->readers;}
@@ -236,12 +299,15 @@ static int event_transfer(struct kernel_event_fd *event,uint64_t *value,int writ
         if (notify) kernel_wait_cursor_wake(&cursor,1);
         if (notify_directed) kernel_wait_cursor_wake(&directed,1);
         if (!wait && is_timer(event)) timer_changed();
-        if (!wait) return 0;
+        if (!wait) return interrupted&&!*value?-KERNEL_ERESTARTSYS:0;
         enum kernel_wait_wake_reason reason;
         enum kernel_scheduler_status status=kernel_wait_park(&token,&reason);
         if (kernel_wait_finish(&token)||status) __builtin_trap();
         if (reason==KERNEL_WAIT_SIGNALLED) {
-            return -KERNEL_ERESTARTSYS;
+            if(writing||!is_timer(event))return -KERNEL_ERESTARTSYS;
+            /* timerfd consumes cancellation or ticks already published when
+             * the wait ended, even when a signal won the wait token first. */
+            interrupted=1;
         }
     }
 }
@@ -255,6 +321,7 @@ int64_t kernel_event_fd_io(struct kernel_open_file_description *file,struct kern
         if (length<8) return -KERNEL_EINVAL;
         uint64_t value=0;int error=event_transfer(event,&value,0,flags);
         if (error) { if(error==-KERNEL_ERESTARTSYS)kernel_signal_note_syscall_restart(kernel_task_current());return error; }
+        if(is_timer(event)&&!value)return 0;
         struct kernel_uaccess_iov_cursor cursor={iov,count,0,0};size_t copied=0;
         enum kernel_uaccess_status access=kernel_copy_to_user_iov(mm,&cursor,&value,8,&copied);
         if (access && access!=KERNEL_UACCESS_STATUS_FAULT) __builtin_trap();
@@ -304,6 +371,7 @@ enum kernel_files_status kernel_files_timerfd_create(struct kernel_files *files,
     int error=allocate_event(files,sizeof(struct kernel_timer_fd),KERNEL_OPEN_FILE_KIND_TIMERFD,flags,&event);
     if (error) { *result=error;return 0; }
     ((struct kernel_timer_fd *)event)->clock=(uint32_t)clock;
+    ((struct kernel_timer_fd *)event)->cancel_offset=kernel_time_boot_realtime_offset();
     return install_event(files,event,flags,result);
 }
 static enum kernel_files_status timer_time(struct kernel_files *files,struct kernel_mm *mm,
@@ -320,9 +388,10 @@ static enum kernel_files_status timer_time(struct kernel_files *files,struct ker
     if (!file) { *result=-KERNEL_EBADF;return 0; }
     if (file->kind!=KERNEL_OPEN_FILE_KIND_TIMERFD) { *result=-KERNEL_EINVAL;return 0; }
     struct kernel_timer_fd *timer=(void *)file;
-    struct kernel_wait_cursor cursor={0};int notify=0;
+    struct kernel_wait_cursor cursor={0};int notify=0,error=0;
     {
         KERNEL_RAW_SCOPE(guard,&timer_lock);
+        if(setting)timer_cancel_registration(timer,timer->clock==0&&(flags&3U)==3U);
         timer_forward(timer);
         uint64_t now=timer_now(timer);
         old.interval=time_spec(timer->interval);
@@ -330,17 +399,20 @@ static enum kernel_files_status timer_time(struct kernel_files *files,struct ker
         if (setting) {
             timer_remove(timer);timer->event.count=0;timer->expired=0;
             timer->interval=time_ns(new.interval);timer->expires=time_ns(new.value);timer->flags=flags;
+            timer->realtime=timer->clock==0&&(flags&1U);
+            now=timer_now(timer);
             if (timer->expires) {
                 if (!(flags&1U)) timer->expires=timer->expires>INT64_MAX-now?INT64_MAX:timer->expires+now;
                 if (timer->expires<=now) { timer->expired=1;timer->event.count=1;notify=kernel_wait_cursor_prepare(&timer->event.waiters,&cursor); }
                 else timer_insert(timer);
+                if(timer_canceled(timer))error=-KERNEL_ECANCELED;
             }
         }
         timer_publish();
     }
     if (notify) kernel_wait_cursor_wake(&cursor,1);
     timer_changed();
-    *result=(!setting||output)?copy_event(mm,&old,output,sizeof(old),1):0;
+    *result=error?error:(!setting||output)?copy_event(mm,&old,output,sizeof(old),1):0;
     return 0;
 }
 enum kernel_files_status kernel_files_timerfd_settime(struct kernel_files *files,struct kernel_mm *mm,

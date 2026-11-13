@@ -1,3 +1,4 @@
+#include <kernel/time.h>
 #include <kernel/wait_internal.h>
 #include <kernel/irq.h>
 #include <string.h>
@@ -223,7 +224,7 @@ static enum kernel_scheduler_status prepare_owner(struct kernel_wait_queue *queu
     if (wait_generation==KERNEL_WAIT_GENERATION_MAX) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     generation=++wait_generation;
 #endif
-    record->deadline=deadline;record->interruptible=interruptible;
+    record->deadline=deadline;record->realtime_deadline=0;record->interruptible=interruptible;
     kernel_wait_record_store(record,generation,KERNEL_WAIT_PREPARED,KERNEL_WAIT_WOKEN);
     *token=(struct kernel_wait_token){task,generation};
     if (queue) {
@@ -248,6 +249,17 @@ enum kernel_scheduler_status kernel_wait_prepare(struct kernel_wait_queue *queue
     }
     KERNEL_IRQ_SCOPE(irq);
     return prepare_owner(0,deadline,interruptible,token);
+}
+enum kernel_scheduler_status kernel_wait_prepare_realtime(struct kernel_wait_queue *queue,
+    uint64_t ns,int interruptible,struct kernel_wait_token *token)
+{
+    uint64_t deadline;
+    enum kernel_time_status time=kernel_time_deadline_from_realtime(ns,&deadline);
+    if (time!=KERNEL_TIME_STATUS_OK && time!=KERNEL_TIME_STATUS_DEADLINE_PASSED)
+        return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
+    enum kernel_scheduler_status status=kernel_wait_prepare(queue,deadline,interruptible,token);
+    if (!status) kernel_wait_record_of(token->task)->realtime_deadline=ns;
+    return status;
 }
 static int notify_locked(const struct kernel_wait_token *token,uint32_t reason,
     int committed_locked)
@@ -368,6 +380,9 @@ enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *to
         if (!matches(token)) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         struct kernel_wait_record *record = kernel_wait_record_of(token->task);
         if (kernel_wait_record_phase(record) == KERNEL_WAIT_PREPARED) {
+            if (record->realtime_deadline && kernel_time_deadline_from_realtime(
+                    record->realtime_deadline,&record->deadline)==KERNEL_TIME_STATUS_DEADLINE_PASSED)
+                record->deadline=1;
             if (record->interruptible && kernel_wait_backend_signal(token->task))
                 kernel_wait_notify_locked(token, KERNEL_WAIT_SIGNALLED);
             else if (record->deadline && (int64_t)(kernel_wait_backend_time() - record->deadline) >= 0)
@@ -430,7 +445,7 @@ enum kernel_scheduler_status kernel_wait_finish(struct kernel_wait_token *token)
         node->generation=0;node->event_mask=0;node->token_next=0;
     }
     while (kernel_wait_record_borrows(record)) kernel_wait_backend_quiesce();
-    record->deadline=0;record->interruptible=0;
+    record->deadline=0;record->realtime_deadline=0;record->interruptible=0;
     kernel_wait_record_transition(record,token->generation,KERNEL_WAIT_FINISHED,KERNEL_WAIT_WOKEN);
     *token=(struct kernel_wait_token){0};
     return KERNEL_SCHEDULER_STATUS_OK;

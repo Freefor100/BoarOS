@@ -74,6 +74,7 @@ struct kernel_mqueue_request {
     struct mq_notification pending,outgoing;
     struct kernel_wait_token token;
     uint64_t deadline;
+    unsigned timed;
     int32_t sender_tgid;
     uint32_t sender_uid,outgoing_reason;
     int result,sending,queued,wait_priority;
@@ -433,11 +434,7 @@ static int import_timeout(struct kernel_mm *mm,uint64_t address,uint64_t *deadli
     if(ts.sec<0||ts.nsec<0||ts.nsec>=1000000000)return -KERNEL_EINVAL;
     uint64_t ns=(uint64_t)ts.sec>(UINT64_MAX-(uint64_t)ts.nsec)/1000000000
         ?UINT64_MAX:(uint64_t)ts.sec*1000000000+(uint64_t)ts.nsec;
-    uint64_t offset=kernel_time_boot_realtime_offset();
-    ns=ns<=offset?0:ns-offset;
-    enum kernel_time_status s=kernel_time_deadline_from_monotonic(ns,deadline);
-    if(s==KERNEL_TIME_STATUS_DEADLINE_PASSED){*deadline=UINT64_MAX;return 0;}
-    if(s)__builtin_trap();
+    *deadline=ns;
     return 0;
 }
 static void request_complete(struct kernel_mqueue_request *r)
@@ -447,10 +444,10 @@ static void request_complete(struct kernel_mqueue_request *r)
 }
 static int request_prepare(struct kernel_mqueue_request *r)
 {
-    if(r->deadline==UINT64_MAX)return -KERNEL_ETIMEDOUT;
-    if(r->deadline && (int64_t)(kernel_wait_backend_time()-r->deadline)>=0)return -KERNEL_ETIMEDOUT;
+    if(r->timed && kernel_time_realtime_ns()>=r->deadline)return -KERNEL_ETIMEDOUT;
     if(kernel_signal_has_pending(r->task)||kernel_signal_termination_requested(r->task))return -KERNEL_ERESTARTSYS;
-    if(kernel_wait_prepare(0,r->deadline,1,&r->token))__builtin_trap();
+    if(r->timed ? kernel_wait_prepare_realtime(0,r->deadline,1,&r->token) :
+        kernel_wait_prepare(0,0,1,&r->token))__builtin_trap();
     /* 只需登记时的实际优先级标量；PI/策略更新按同一原子字段发布。 */
     r->wait_priority=__atomic_load_n(&r->task->scheduling.priority,__ATOMIC_RELAXED);
     struct kernel_mqueue *q=r->queue;
@@ -547,7 +544,7 @@ int64_t kernel_mqueue_send(struct kernel_task *task,struct kernel_mm *mm,int64_t
     struct kernel_mqueue_request *r=request_create(task,fd,1,&error,&storage);if(!r)return error;
     if((r->file->open_flags&3U)!=1&&(r->file->open_flags&3U)!=2){error=-KERNEL_EBADF;goto done;}
     if(size>r->queue->msgsize){error=-KERNEL_EMSGSIZE;goto done;}
-    r->deadline=deadline;error=message_import(r,mm,data,size,priority);if(error)goto done;
+    r->deadline=deadline;r->timed=abstime!=0;error=message_import(r,mm,data,size,priority);if(error)goto done;
     if(kernel_task_tgid(task,&r->sender_tgid))__builtin_trap();
     r->sender_uid=kernel_credentials_current()->uid;r->outgoing_reason=1;
     struct kernel_wait_cursor cursor={0};int notify=0;
@@ -586,7 +583,7 @@ int64_t kernel_mqueue_receive(struct kernel_task *task,struct kernel_mm *mm,int6
     struct kernel_mqueue_request *r=request_create(task,fd,0,&error,&storage);if(!r)return error;
     if((r->file->open_flags&3U)!=0&&(r->file->open_flags&3U)!=2){error=-KERNEL_EBADF;goto done;}
     if(size<r->queue->msgsize){error=-KERNEL_EMSGSIZE;goto done;}
-    r->deadline=deadline;
+    r->deadline=deadline;r->timed=abstime!=0;
     struct kernel_wait_cursor cursor={0};int notify=0;
     { KERNEL_RAW_SCOPE(g,&r->queue->lock);
       if(r->queue->count){

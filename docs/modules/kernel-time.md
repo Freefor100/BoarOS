@@ -6,7 +6,7 @@
 
 | 文件 | 当前职责 |
 |---|---|
-| `include/kernel/time.h`、`kernel/time.c` | 固定点乘数换算、单调/实时时钟、timer 驱动 coarse 快照、deadline 换算 |
+| `include/kernel/time.h`、`kernel/time.c` | 固定点乘数换算、单调/实时时钟、timer 驱动 coarse 快照、运行时墙钟与时区、deadline 换算 |
 | `arch/riscv/virt_rtc.c`、`include/arch/riscv/virt_rtc.h` | QEMU virt goldfish RTC 读取与合理性探测 |
 | `kernel/main.c`、`arch/loongarch/main.c` | 在 timer 启动前读取 RTC 并调用 `kernel_time_init` |
 | `platform/loongarch_rtc.c`、`include/platform/loongarch_rtc.h` | QEMU virt LS7A TOY 启用、一致 UTC 读取与明确失败 |
@@ -26,20 +26,32 @@ syscall 将有效的非负 timespec 饱和到 `INT64_MAX` 纳秒，比较目标�
 ## 时钟语义
 
 - `kernel_time_monotonic_ns()`：自启动的单调纳秒。
-- `kernel_time_realtime_ns()`：启动时 RTC 读数加单调值；不在运行期重读 RTC，也没有 settimeofday/adjtime 语义。
-- `kernel_time_boot_realtime_offset()`：暴露启动 RTC 读数，供绝对 REALTIME deadline 换算到单调域。
+- `kernel_time_realtime_ns()`：当前墙钟偏移加单调值；偏移由启动 RTC 初始化，可由 `clock_settime/settimeofday` 阶跃修改，不在运行期重读 RTC。
+- `kernel_time_boot_realtime_offset()`：返回当前 REALTIME 与 MONOTONIC 的偏移。函数沿用原名，但返回值不再是不可变的启动读数。
 - `kernel_time_deadline_from_monotonic()`：把单调域目标时间换成 `time` CSR 绝对 deadline；目标不在未来时返回 `DEADLINE_PASSED`。
-- `kernel_time_coarse_monotonic_ns()` / `kernel_time_coarse_realtime_ns()`：只读取初始化和最近一次 timer interrupt 发布的样本，不在查询时读取 counter。单个原子 monotonic 样本加不可变 RTC offset，保证两种 coarse 时间来自同一采样域，避免分开发布两套状态。
+- `kernel_time_coarse_monotonic_ns()` / `kernel_time_coarse_realtime_ns()`：只读取初始化和最近一次 timer interrupt 发布的样本，不在查询时读取 counter。单个原子 monotonic 样本加当前墙钟偏移，偏移与读取计数器的组合通过发布序列复查，避免在调钟中间拼出不一致的时间。
 
 `kernel_time_init` 返回前就发布首个有效样本。运行期 `kernel_time_update_coarse` 每次读取真实 counter；延迟或合并多个 tick 时只采一次实际时间，不重复增加虚构的 10ms。当前 timer 为 `KERNEL_TICKS_PER_SECOND=100`，`kernel_time_coarse_resolution_ns()` 因而返回 10,000,000ns。分辨率表示正常更新周期，不承诺关中断或阻塞 timer delivery 时快照的最大陈旧时间；不会把 fine 时钟截断成 10ms 冒充 timer 快照。
 
-CLOCK_REALTIME 的墙钟完全取决于启动时的 RTC 探测。goldfish RTC 读数必须两次采样非递减、间隔小于 1 秒且不早于 2020-01-01，否则视为无 RTC，CLOCK_REALTIME 退化为自启动相对时间（固定从epoch 起算的值不可得）。DTB 解析 RTC 节点是演进路径；当前地址按 `virt_uart.h` 先例硬编码 `0x101000`。
+CLOCK_REALTIME 的初始墙钟来自启动 RTC 探测，运行期可由有权限的程序设置。goldfish RTC 读数必须两次采样非递减、间隔小于 1 秒且不早于 2020-01-01，否则视为无 RTC，CLOCK_REALTIME 退化为自启动相对时间（固定从epoch 起算的值不可得）。DTB 解析 RTC 节点是演进路径；当前地址按 `virt_uart.h` 先例硬编码 `0x101000`。
+
+## 运行时调钟与绝对等待
+
+`clock_settime(112)` 当前只设置 CLOCK_REALTIME；`settimeofday(170)` 支持 timeval 和可选 timezone。两者要求当前线程具有 CAP_SYS_TIME。时间输入采用原生 64 位秒及纳秒／微秒，遵循固定 Linux 的有效范围，并拒绝把墙钟设置到当前 MONOTONIC 之前。MONOTONIC、BOOTTIME、CPU 时钟、相对睡眠与 ITIMER_REAL 不随调钟改变。
+
+clock_settime 先检查时钟编号，再导入并验证 timespec，最后检查权限。settimeofday 先导入 timeval 并检查微秒，再导入 timezone，检查时间范围与权限，随后检查 minuteswest 在 -900～900 内。timezone 先发布，因此后续墙钟下限检查失败不撤销时区。第一次成功提供 timezone 时，若没有 timeval，则按 minuteswest 将软件墙钟调整一次；同时提供 timeval 只消费首次资格、不执行额外调整。dsttime 原样保存；此接口不配置地域时区数据库。
+
+调钟使用一个任务互斥串行完成发布和各期限索引调整。现有调度短保护内同时提交新偏移、更新 vDSO 数据并重排已提交的绝对 REALTIME 等待；记录保存原始墙钟期限，尚未阻塞的请求在提交时重新换算。MQ、futex BITSET/waitv/PI 及绝对 clock_nanosleep 因而不需要撤销登记再重排队，也不会把调钟冒充实际唤醒。相对请求继续使用 MONOTONIC。信号重启保留原时钟域和期限；处理函数可观察的 EINTR 与无处理函数的自动重启规则不变。
+
+timerfd 和 POSIX 墙钟索引在各自已有保护内更新，通知和信号投递在保护外完成；远端修改通过既有 deadline IPI 让 CPU0 重新编程事件。期限处理再次核对有效时钟，覆盖偏移已经提交、对象索引尚未更新时的倒拨。正常时钟查询不取得调钟互斥，也不扫描等待者。调钟不新增 worker、RTC 写入或 NTP 调整。
+
+功能消费者为 `python3 -B tests/userland/api8.py --program system_control --arch riscv --libc glibc --only boaros`，LA 使用 `--arch loongarch`。它通过实际 BLOCKED 状态握手检查等待期间调钟，并直接调用 vDSO 符号与 syscall 对照，不以 libc 回退掩盖入口缺失。
 
 ## 用户态 vDSO
 
 RV64 和 LA64 的 exec 映射一个只读可执行 ELF 页和紧随其后的只读 `[vvar]` 页。auxv 的 `AT_SYSINFO_EHDR` 指向 ELF 头；三个时间符号 `__vdso_clock_gettime`、`__vdso_clock_getres`、`__vdso_gettimeofday` 分别采用 RV 的 `LINUX_4.15` 与 LA 的 `LINUX_5.10` 版本。信号处理器的返回地址指向同一 ELF 内的 `__vdso_rt_sigreturn`。
 
-REALTIME 和 MONOTONIC 直接读取用户可用的架构计数器，用与 syscall 相同的乘数换算。两种 COARSE 读取 CPU0 最近发布的原子样本；CPU 时钟和其他时钟编号交给 syscall。vDSO 在用户态写出结果，因此错误输出地址按普通用户内存访问处理。内核只在计时初始化时发布乘数和墙钟偏移；计时中断更新样本时不遍历进程。
+REALTIME 和 MONOTONIC 直接读取用户可用的架构计数器，用与 syscall 相同的乘数换算。两种 COARSE 读取 CPU0 最近发布的原子样本；CPU 时钟和其他时钟编号交给 syscall。vDSO 在用户态写出结果，因此错误输出地址按普通用户内存访问处理。乘数在初始化后不变；调钟和时区修改更新共享数据页的序列，vDSO 在同一序列内读取偏移和 counter，发现写者介入则重读。内核 REALTIME 查询同样复查序列。计时中断只更新 coarse 单调样本，不遍历进程。
 
 各 MM 共享一页时钟数据，每个映射 PTE 与 MM 的恢复后备分别持有引用。fork 继承后备，`MADV_DONTNEED` 只丢弃驻留映射；再次访问时，代码从内核 ELF 重新装入，数据重新接入同一时钟页。页表销毁后归还 MM 的后备引用，最后一个 MM 释放时先停止时间写者对该页的访问。
 
@@ -47,7 +59,7 @@ REALTIME 和 MONOTONIC 直接读取用户可用的架构计数器，用与 sysca
 
 ## 消费者与验证
 
-syscall 层的 `clock_gettime(113)`、`clock_getres(114)` 支持 `CLOCK_REALTIME`、`CLOCK_MONOTONIC`、`CLOCK_BOOTTIME`（7）、两种 `COARSE`（5、6）及[进程/线程 CPU 时钟](kernel-accounting.md#cpu-时钟)。系统不支持挂起，因此 BOOTTIME 与 fine MONOTONIC 使用同一计数，分辨率为 1ns；vDSO 将 BOOTTIME 查询交给 syscall。该查询支持不扩展睡眠或定时器可接受的 clockid。未知 clockid 返回 `-EINVAL`。coarse getres 如实返回 10ms，NULL 输出成功，坏输出指针返回 EFAULT。`gettimeofday(169)` 使用 fine realtime；依次写出 timeval 和可选 timezone，后者为 UTC 的两个零值。先前输出已成功时，后续用户地址错误返回 EFAULT 并保留该输出。
+syscall 层的 `clock_gettime(113)`、`clock_getres(114)` 支持 `CLOCK_REALTIME`、`CLOCK_MONOTONIC`、`CLOCK_BOOTTIME`（7）、两种 `COARSE`（5、6）及[进程/线程 CPU 时钟](kernel-accounting.md#cpu-时钟)。系统不支持挂起，因此 BOOTTIME 与 fine MONOTONIC 使用同一计数，分辨率为 1ns；vDSO 将 BOOTTIME 查询交给 syscall。该查询支持不扩展睡眠或定时器可接受的 clockid。未知 clockid 返回 `-EINVAL`。coarse getres 如实返回 10ms，NULL 输出成功，坏输出指针返回 EFAULT。`gettimeofday(169)` 使用 fine realtime；依次写出 timeval 和可选 timezone，后者返回系统保存的 timezone，两字段初始均为零。先前输出已成功时，后续用户地址错误返回 EFAULT 并保留该输出。
 
 `clock_nanosleep(115)` 支持 REALTIME、MONOTONIC、进程 CPU 时钟及编码后的其他线程 CPU 时钟。CPU 睡眠在调用者 CPU 登记和返回，复用 POSIX CPU 期限索引，按目标实际执行时间到期；不建立用户可见 timer ID，也不预留信号队列额度。内建 CLOCK_THREAD_CPUTIME_ID 与 coarse 时钟在读取 timespec 前返回 EOPNOTSUPP，编码后的本线程时钟返回 EINVAL。进程时钟可以由同组其他线程推进；只有睡眠线程且没有其他执行者时，CPU 时间不会因墙钟流逝增加。
 
@@ -55,7 +67,7 @@ CPU 睡眠对象由调用线程持有，期限检查和取消在共同调度保�
 
 `tests/diff-abi/coarse.c` 覆盖真实 U-mode timer 推进、查询错误和拒绝 coarse sleep。固定 Linux 必须启用 `CONFIG_POSIX_TIMERS` 才能对照 raw coarse syscall；Linux HZ=250 的 4ms 与 BoarOS HZ=100 的 10ms 分辨率按各自真实周期验证，不要求裸值相等。`make test-userland-riscv` 用 musl 验证真实 trap→expire→wake 闭环和 RTC 墙钟。
 
-当前限制：无 NTP/阶跃调整；POSIX 定时器的期限推进见下节；timekeeper只在启动采样RTC，此后由CSR换算推进，用户RTC_RD_TIME仍读取设备当前值；SMP的coarse快照由CPU0发布。
+当前限制：无 NTP、adjtime/clock_adjtime 渐进校准；POSIX 定时器的期限推进见下节；timekeeper只在启动采样RTC，此后由CSR换算推进，用户RTC_RD_TIME仍读取设备当前值；SMP的coarse快照由CPU0发布。
 
 fine时钟和deadline换算精度不等于到期唤醒精度。普通blocked deadline由timer路径
 检查；`kernel/sched/scheduling.c::scheduler_rearm_timer`的架构timer事件取min(实时预算、
@@ -65,7 +77,7 @@ RR时间片、最早睡眠deadline)，到期由按(deadline, tid)排序的索引
 
 任务CPU执行时间、`times`及等待返回的rusage使用共同统计，执行边界、单位和归属见[资源记账](kernel-accounting.md)。
 
-Goldfish的真实墙钟另由10:135 RTC字符后端提供只读RTC_RD_TIME；UTC转换、OFD独占和限制见[文件设备](kernel-files.md#仅读rtc与ofd设备资格)。这没有增加RTC写入或clock_settime能力。
+Goldfish的真实墙钟另由10:135 RTC字符后端提供只读RTC_RD_TIME；UTC转换、OFD独占和限制见[文件设备](kernel-files.md#仅读rtc与ofd设备资格)。软件墙钟设置不修改 RTC 硬件，RTC 字符设备仍只读。
 
 ## 应用 alarm 与进程组实时时间定时器
 
@@ -111,7 +123,7 @@ CPU0在既有timer路径只遍历具有活动CPU期限或有限CPU限额的目�
 unavailable，realtime offset 为零。固定 QEMU 的 TOY 读数只有整秒，按 **1 秒**记录
 实际 RTC 分辨率；fine CLOCK_REALTIME 的运行期增量仍来自 CPU counter。
 
-共用 RTC 字符设备仍只提供 RTC_RD_TIME、10:135 别名和 OFD 独占。BoarOS 写时钟、
+共用 RTC 字符设备仍只提供 RTC_RD_TIME、10:135 别名和 OFD 独占。RTC 硬件写入、
 告警和事件 read 返回既有 ENOTSUP；派生模拟器的 Linux 告警验证不改变这个用户接口。
 `make test-rtc-loongarch-host test-environment-loongarch` 覆盖日期失败、真实 UTC、
 OFD/fork/exec/错误指针和原 BusyBox hwclock/dmesg/df；两项清日志测试各用独立启动。
@@ -123,7 +135,9 @@ OFD/fork/exec/错误指针和原 BusyBox hwclock/dmesg/df；两项清日志测�
 
 首次到期只记一次并通知。周期在read/gettime中按原绝对期限累计漏过次数、前移和重装，保留周期相位，避免短周期造成密集IRQ。settime完整导入输入后交换设置，输出旧值EFAULT不撤销新设置。timerfd read消费计数后复制，部分输出返回实际完成前缀，区别于eventfd的EFAULT返回。
 
-末次关闭从索引摘除对象后，等待已经取得的到期通知借用和等待游标结束，再归还对象。dup/fork共享设置和计数。BOOTTIME、ALARM时钟仍在能力目录；CANCEL_ON_SET接受并保存，当前墙钟只在启动初始化，运行时调钟的取消通知随调钟接口增加。
+末次关闭从索引摘除对象后，等待已经取得的到期通知借用和等待游标结束，再归还对象。dup/fork共享设置和计数。BOOTTIME、ALARM时钟仍在能力目录。相对 REALTIME 设置使用 MONOTONIC，绝对 REALTIME 设置随墙钟偏移重新计算期限。
+
+REALTIME、ABSTIME、CANCEL_ON_SET 三者同时成立时登记取消通知，即使当前已停用。偏移改变后发布可读状态，下一次 read 返回一次 ECANCELED 并消费取消标记；底层尚未到期的计时器继续运行，后续调钟仍可再次通知。未消费取消时重新设置非零期限，先安装新设置，再返回 ECANCELED，不输出旧值；零期限不消费旧取消标记。取消资格被移除则不返回该错误。周期计时器到期后倒拨到原期限之前，read 可返回零字节并在原期限重装，不凭空前移一周期。
 
 ## POSIX 定时器对象
 
@@ -137,7 +151,9 @@ REALTIME、MONOTONIC以及进程/线程CPU时钟均在调用CPU创建、设置�
 
 通知记录区分普通分配和原生定时器预留：每只定时器最多有一条待决记录，不同定时器可同时使用同一标准信号。到期只使用创建时准备的存储。普通内联事件与排队记录共存时，索引保留内联事件的先后位置；原生记录消费不重复计费。用户提供的SI_TIMER仍是普通载荷，不据此执行重装。
 
-REALTIME/MONOTONIC使用共享AVL算法和各自对象保护，调度器只读取最早期限摘要，远端提前设置沿既有deadline IPI通知CPU0。消费先在调度保护内取得记录及原设置快照，锁外计算进度，再核对设置代次决定重装；处理函数、sigwaitinfo和signalfd取得同一份最终overrun。删除或重设后的旧事件被丢弃，已取得的消费借用覆盖最后释放。周期按原期限推进，不按处理完成时刻重新起算。单次到期入队后查询剩余量为零，待决记录仍保留到消费或清除。STOP/CONT沿共同进程组流程清理相反待决信号并恢复停止组；KILL请求整组退出，这些组操作在状态保护外执行。
+相对 REALTIME 设置的有效时钟为 MONOTONIC；只有绝对 REALTIME 设置随墙钟变化。REALTIME/MONOTONIC使用共享AVL算法和各自对象保护，调度器只读取最早期限摘要，远端提前设置沿既有deadline IPI通知CPU0。消费先在调度保护内取得记录及原设置快照，锁外计算进度，再核对设置代次决定重装；处理函数、sigwaitinfo和signalfd取得同一份最终overrun。删除或重设后的旧事件被丢弃，已取得的消费借用覆盖最后释放。周期按原期限推进，不按处理完成时刻重新起算。单次到期入队后查询剩余量为零，待决记录仍保留到消费或清除。STOP/CONT沿共同进程组流程清理相反待决信号并恢复停止组；KILL请求整组退出，这些组操作在状态保护外执行。
+
+已排队或已领取的信号不因调钟改变设置代次或消失。周期推进允许零次；pending/claim 保留已经观察到的推进位置和累计 overrun，避免“前拨、gettime、倒拨、消费”丢失已累计的次数。
 
 SIG_IGN的周期事件停放并保留相位，恢复disposition时移回待决队列；单独屏蔽不会重新投递已经停放的事件。SIGEV_NONE只按查询推进，停用后的旧单次期限仍可能返回剩余量，沿固定Linux的common_timer_get行为。timer_settime只解释TIMER_ABSTIME位，其余位按参考Linux忽略；NULL新值返回EINVAL，旧值输出EFAULT保留新设置。exec清除原生及用户提供的SI_TIMER记录，保留其他排队消息的顺序。
 

@@ -108,8 +108,9 @@ int kernel_vfs_node_pread(struct kernel_vfs_node *node,
                           size_t size,
                           size_t *bytes_read);
 int kernel_vfs_file_is_control(const struct kernel_vfs_file *file);
+int kernel_vfs_file_control_permission(const struct kernel_vfs_file *file, int write);
 int kernel_vfs_file_control(const struct kernel_vfs_file *file, int write,
-    uint64_t offset, char *buffer, size_t size, size_t *count);
+    uint64_t *offset, char *buffer, size_t size, size_t *count);
 int kernel_vfs_file_generated(const struct kernel_vfs_file *file);
 int kernel_vfs_check_io_domain(const struct kernel_vfs_node *,const struct kernel_heap *,
     const struct physical_page_allocator *);
