@@ -3620,6 +3620,8 @@ static enum kernel_mm_status commit_file_mapping(
     int may_write=object ? !!(plan.permissions & KERNEL_MM_WRITE) : kernel_open_file_writable(*file),sealed=0;
     uint64_t *write_bytes=object_write_bytes;
     if (!object && (flags&KERNEL_MM_MAP_SHARED) && may_write) {
+        if (kernel_vfs_node_attributes(kernel_open_file_node(*file))&KERNEL_VFS_INODE_APPEND)
+            return KERNEL_MM_STATUS_ACCESS;
         write_bytes=kernel_vfs_node_shared_write_counter(kernel_open_file_node(*file),&sealed);
         if (sealed) {
             if (plan.permissions&KERNEL_MM_WRITE) return KERNEL_MM_STATUS_SEALED;
@@ -5283,6 +5285,7 @@ static enum kernel_mm_status cached_write_fault(struct mm_operation *operation,
     struct kernel_mm_record *record=operation->record;
     struct kernel_vfs_node *node=kernel_open_file_node(file);
     uint64_t generation=kernel_vma_set_generation(record->vmas),epoch,latest;
+    if (kernel_vfs_node_attributes(node)&KERNEL_VFS_INODE_IMMUTABLE) return KERNEL_MM_STATUS_BUS_FAULT;
     if (kernel_file_mapping_epoch(node,&epoch)) return KERNEL_MM_STATUS_CONFLICT;
     uint64_t offset=vma->backing_offset+address-vma->start;
     /* 准备磁盘空间不能持有 MM gate 或 inode 读资格；同文件源缺页、

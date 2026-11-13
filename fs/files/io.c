@@ -190,14 +190,18 @@ static enum kernel_files_status generated_read(
     struct kernel_uaccess_iov_cursor *cursor, uint64_t count,
     uint64_t offset, int advance, int64_t *linux_result)
 {
-    if (kernel_vfs_file_is_control(&description->file))
+    if (kernel_vfs_file_is_control(&description->file, 0))
         return control_read(files, mm, description, cursor, count, offset, advance, linux_result);
+    if (!count) { *linux_result = 0; return KERNEL_FILES_STATUS_OK; }
+    if (description->generated_ready && (!offset || offset != description->generated_read_offset))
+        kernel_open_file_reset_generated(description);
     int result = kernel_open_file_generate(description);
     if (result) {
         *linux_result = result;
         KERNEL_FILES_NOTE(files, read_failures, 1);
         return KERNEL_FILES_STATUS_OK;
     }
+    description->generated_read_offset = offset;
     uint64_t total = 0U;
     if (offset < description->generated_length) {
         uint64_t available = description->generated_length - offset;
@@ -214,6 +218,7 @@ static enum kernel_files_status generated_read(
                            KERNEL_OPEN_FILE_STATUS_OK)
             return KERNEL_FILES_STATUS_STATE;
         total += copied;
+        description->generated_read_offset = offset + total;
         KERNEL_FILES_NOTE(files, read_chunks, 1);
         if (access == KERNEL_UACCESS_STATUS_FAULT) {
             *linux_result = total ? (int64_t)total : -KERNEL_EFAULT;
@@ -1039,6 +1044,35 @@ static enum kernel_files_status control_write(
     const struct kernel_uaccess_iovec *iov, size_t iov_count, uint64_t count,
     int positioned, uint64_t requested_offset, int64_t *linux_result)
 {
+    size_t prefix = kernel_vfs_file_control_prefix(&description->file);
+    if (prefix) {
+        /* seq_file writes have no pwrite operation. Each writev component
+         * invokes the legacy write callback independently; ignored tail bytes
+         * must not be faulted in, even though the whole component is consumed. */
+        if (positioned) { *linux_result = -KERNEL_ESPIPE; return KERNEL_FILES_STATUS_OK; }
+        char buffer[16];
+        if (prefix >= sizeof(buffer)) __builtin_trap();
+        uint64_t total = 0;
+        for (size_t i = 0; i < iov_count; i++) {
+            size_t segment = iov[i].length > count - total ? (size_t)(count - total) : (size_t)iov[i].length;
+            if (!segment && count) continue;
+            size_t imported = segment > prefix ? prefix : segment;
+            size_t copied = 0, accepted = 0;
+            enum kernel_uaccess_status access = kernel_copy_from_user(mm, buffer, iov[i].base, imported, &copied);
+            int error = access == KERNEL_UACCESS_STATUS_FAULT ? -KERNEL_EFAULT : 0;
+            if (access != KERNEL_UACCESS_STATUS_OK && !error) return KERNEL_FILES_STATUS_STATE;
+            if (!error && copied != imported) return KERNEL_FILES_STATUS_STATE;
+            uint64_t offset = kernel_open_file_offset(description);
+            if (!error) error = kernel_vfs_file_control(&description->file, 1, &offset, buffer, imported, &accepted);
+            if (error) { *linux_result = total ? (int64_t)total : error; return KERNEL_FILES_STATUS_OK; }
+            if (accepted != imported) return KERNEL_FILES_STATUS_STATE;
+            total += segment;
+            if (total == count) break;
+        }
+        *linux_result = (int64_t)total;
+        return KERNEL_FILES_STATUS_OK;
+    }
+
     char *buffer = 0;
     size_t copied = 0, accepted = 0;
     int result = kernel_vfs_file_control_permission(&description->file, 1);
@@ -1121,7 +1155,7 @@ static enum kernel_files_status buffered_write_request(
         return KERNEL_FILES_STATUS_OK;
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_GENERATED) {
-        if (kernel_vfs_file_is_control(&description->file))
+        if (kernel_vfs_file_is_control(&description->file, 1))
             return control_write(files, mm, description, iov, iov_count, count,
                                  positioned, requested_offset, linux_result);
         *linux_result = -KERNEL_EIO;
@@ -1736,7 +1770,8 @@ static enum kernel_files_status writev_request(
     if (positioned && ((description->device && !description->device->positioned) ||
         (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EVENTFD || kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_TIMERFD || kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SIGNALFD) ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE ||
-        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET)) {
+        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET ||
+        (description->kind == KERNEL_OPEN_FILE_KIND_GENERATED && kernel_vfs_file_control_prefix(&description->file)))) {
         *linux_result = -KERNEL_ESPIPE;
         goto out;
     }
@@ -1827,7 +1862,7 @@ static enum kernel_files_status lseek_pinned(
         return KERNEL_FILES_STATUS_OK;
     }
     current = (int64_t)kernel_open_file_offset(description);
-    int control = kernel_vfs_file_is_control(&description->file);
+    int control = kernel_vfs_file_is_control(&description->file, 0);
     if (control && (whence == 3U || whence == 4U)) {
         /* default_llseek treats sysctl i_size (zero) as the EOF hole. */
         if (offset >= 0) {
@@ -1870,6 +1905,18 @@ static enum kernel_files_status lseek_pinned(
     if (target < 0 || (description->block && (uint64_t)target > kernel_open_file_size(description))) {
         *linux_result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
+    }
+    if (description->kind == KERNEL_OPEN_FILE_KIND_GENERATED && !control && target &&
+        (uint64_t)target != description->generated_read_offset) {
+        kernel_open_file_reset_generated(description);
+        int error = kernel_open_file_generate(description);
+        if (error) {
+            (void)kernel_open_file_seek(description, 0);
+            kernel_open_file_reset_generated(description);
+            *linux_result = error;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        description->generated_read_offset = (uint64_t)target;
     }
     if (kernel_open_file_seek(description, (uint64_t)target) !=
         KERNEL_OPEN_FILE_STATUS_OK) {

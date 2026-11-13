@@ -214,8 +214,49 @@ static void selected_payloads(struct kernel_task *task,struct kernel_signal_tabl
     assert(!queue_allocations);
     puts("signal selection publishes complete fault/native payloads and skips stale records before the next handler");
 }
+static void parent_death_payloads(struct kernel_task *leader, struct kernel_task *member)
+{
+    struct kernel_task *previous = kernel_cpu_current()->current;
+    struct kernel_task cleanup = {0};
+    struct kernel_credentials cleanup_cred = {.uid=123, .euid=123};
+    cleanup.credentials = &cleanup_cred;
+    cleanup.group_leader = &cleanup;
+    kernel_cpu_current()->current = &cleanup;
+    struct kernel_pid group = {.number=88, .generation=21, .registry=&scheduler.identities, .references=1};
+    { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+      kernel_pid_attach(&leader->identities[KERNEL_PID_TGID], &group, KERNEL_PID_TGID, leader); }
+    leader->signal_blocked = member->signal_blocked = signal_mask(42);
+    leader->signal_wait_mask = member->signal_wait_mask = 0;
+    leader->files.heap = &queue_heap;
+    leader->limits->values[KERNEL_RLIMIT_SIGPENDING].current = 64;
+    kernel_signal_parent_death(leader, &group, 42, 71, 456);
+    kernel_signal_parent_death(member, &group, 42, 71, 456);
+    assert(leader->group_pending == signal_mask(42) && !member->signal_pending);
+    kernel_cpu_current()->current = leader;
+    leader->signal_wait_mask = signal_mask(42);
+    struct kernel_signal_wait_info info;
+    for (unsigned i = 0; i < 2; i++) {
+        assert(!kernel_signal_wait_take(leader, &info));
+        assert(info.signal == 42 && !info.code && info.sender == 71 && info.uid == 456);
+    }
+    assert(!kernel_signal_wait_take(leader, &info) && !info.signal);
+    kernel_cpu_current()->current = previous;
+    unsigned members = leader->group_members;
+    leader->group_members = 1;
+    kernel_signal_pending_cleanup(leader);
+    leader->group_members = members;
+    leader->files.heap = 0;
+    leader->signal_wait_mask = 0;
+    assert(group.references == 2 && !leader->storage_borrows && !member->storage_borrows);
+    assert(!queue_allocations);
+    { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); kernel_pid_detach(&leader->identities[KERNEL_PID_TGID]); }
+    assert(group.references == 1 && !group.members[KERNEL_PID_TGID]);
+    puts("parent death: two RT records in group pending, departing TGID/UID despite unprivileged cleanup sender");
+}
+
 void signal_owner_cases(unsigned *lock_calls)
 {
+    scheduler.initialized = KERNEL_SCHEDULER_INITIALIZED;
     struct kernel_task leader = {0}, member = {0};
     struct kernel_resource_limits limits={0};
     leader.limits=member.limits=&limits;
@@ -273,6 +314,7 @@ void signal_owner_cases(unsigned *lock_calls)
     traced_action_suppression(&leader,&table);
     selected_action_snapshot(&leader,&table);
     selected_payloads(&leader,&table);
+    parent_death_payloads(&leader,&member);
     kernel_cpu_current()->current=previous;
     puts("SIGCHLD: blocked default stop policy, protected pending payload and common ABI encoding passed");
     *lock_calls = 0;

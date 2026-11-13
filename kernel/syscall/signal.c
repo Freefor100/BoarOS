@@ -6,6 +6,7 @@
 #include <kernel/signal.h>
 #include <kernel/signal_fd.h>
 #include <kernel/pidfd.h>
+#include <kernel/ptrace.h>
 #include <kernel/tty_task.h>
 #include <kernel/task.h>
 #include <kernel/time.h>
@@ -227,7 +228,7 @@ enum kernel_syscall_status syscall_handle_rt_sigtimedwait(
     int has_timeout = request->arguments[2] != 0U;
     enum kernel_uaccess_status copy_status;
     enum kernel_signal_status signal_status;
-    enum kernel_time_status time_status;
+    enum kernel_time_status time_status = KERNEL_TIME_STATUS_OK;
 
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     if (request->arguments[3] != LINUX_SIGSET_SIZE) {
@@ -262,49 +263,29 @@ enum kernel_syscall_status syscall_handle_rt_sigtimedwait(
     signal_status = kernel_signal_wait_begin(caller, mask);
     if (signal_status != KERNEL_SIGNAL_STATUS_OK)
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-    for (;;) {
-        enum kernel_wait_wake_reason wake_reason;
-
-        signal_status = kernel_signal_wait_take(caller, &taken);
-        if (signal_status != KERNEL_SIGNAL_STATUS_OK) {
-            kernel_signal_wait_end(caller);
-            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-        }
-        if (taken.signal != 0U) break;
-        if (kernel_signal_has_pending(caller) ||
-            kernel_signal_termination_requested(caller) ||
-            !has_timeout || target_ns == 0U) {
-            if (kernel_signal_has_pending(caller) ||
-                kernel_signal_termination_requested(caller))
-                decoded->value = -KERNEL_EINTR;
-            else if (has_timeout)
-                decoded->value = -KERNEL_EAGAIN;
-            else {
-                if (KERNEL_WAIT_RECHECK(0, 0U, 1,
-                                                   &wake_reason,
-                (1)) !=
-                    KERNEL_SCHEDULER_STATUS_OK) {
-                    kernel_signal_wait_end(caller);
-                    return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-                }
-                continue;
+    signal_status = kernel_signal_wait_take(caller, &taken);
+    if (signal_status == KERNEL_SIGNAL_STATUS_OK && !taken.signal) {
+        enum kernel_wait_wake_reason reason = KERNEL_WAIT_TIMEOUT;
+        if (has_timeout)
+            time_status = kernel_time_deadline_from_monotonic(target_ns, &deadline);
+        if (time_status == KERNEL_TIME_STATUS_OK) {
+            /* An attach requests a trace stop without queuing a user signal.
+             * After registration it either prevents parking or wakes the token. */
+            if (KERNEL_WAIT_RECHECK(0, deadline, 1, &reason,
+                                    !kernel_ptrace_stop_requested(caller))) {
+                kernel_signal_wait_end(caller);
+                return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
             }
-            break;
-        }
-        time_status = kernel_time_deadline_from_monotonic(target_ns,
-                                                          &deadline);
-        if (time_status == KERNEL_TIME_STATUS_DEADLINE_PASSED) {
-            decoded->value = -KERNEL_EAGAIN;
-            break;
-        }
-        if (time_status != KERNEL_TIME_STATUS_OK ||
-            KERNEL_WAIT_RECHECK(0, deadline, 1,
-                                           &wake_reason,
-                (1)) !=
-                KERNEL_SCHEDULER_STATUS_OK) {
+            signal_status = kernel_signal_wait_take(caller, &taken);
+        } else if (time_status != KERNEL_TIME_STATUS_DEADLINE_PASSED) {
             kernel_signal_wait_end(caller);
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
+        decoded->value = reason == KERNEL_WAIT_TIMEOUT ? -KERNEL_EAGAIN : -KERNEL_EINTR;
+    }
+    if (signal_status != KERNEL_SIGNAL_STATUS_OK) {
+        kernel_signal_wait_end(caller);
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
     kernel_signal_wait_end(caller);
     if (taken.signal == 0U) return KERNEL_SYSCALL_STATUS_OK;

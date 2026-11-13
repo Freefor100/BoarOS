@@ -30,7 +30,7 @@ PTE、fork及pin不重复收费。驻留数/statfs使用值读取，不承诺跨
 
 `fallocate(PUNCH_HOLE|KEEP_SIZE)` 复用 inode 的映射失效过程，释放打洞范围内的完整后备页与页配额，边界页仅清除实际覆盖的字节；文件长度保留，独立私有 COW 不变。`MADV_REMOVE` 的共享映射检查、来源借用及内存对象代次见 [MM 模块](kernel-mm.md#madvise-与共享段锁定)。tmpfs 尚不实现 fallocate 的预分配模式，返回 EOPNOTSUPP。
 
-mode、UID/GID和时间属于inode，硬链接和已unlink的fd仍观察同一对象。
+mode、UID/GID、inode 标志和时间由同一个 tmpfs inode 持有。硬链接与已 unlink 的 FD 仍可查询或设置标志，子 inode 继承父目录的 nodump 位。与固定 Linux 的 shmem 一致，通过原有可写 FD 仍可写入随后被设为 immutable 的文件，普通文件的原有可写 FD 也可对其执行 ftruncate。设置 immutable 后，原有共享映射仍可写入内存后备页。append 禁止用可写 FD 新建共享映射，包括初始只读映射。
 `fchown/fchownat`检查实际调用者身份；`UINT32_MAX`保留字段。非目录先按旧
 所属组决定set-ID清除，产生模式变更时再按新所属组过滤SGID；目录保留set-ID。
 创建在目录发布时设置fsuid/fsgid，SGID父目录决定新节点的GID及子目录SGID。

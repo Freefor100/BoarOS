@@ -79,6 +79,8 @@ static int64_t regular_copy_output(struct kernel_open_file_description *out,
     const void *buffer,const struct kernel_page_cache_read_page *pages,size_t source_offset,
     size_t size,uint64_t position,struct kernel_vfs_size_limit *limit,int first)
 {
+    KERNEL_LOCK_SCOPE(operation);
+    kernel_vfs_file_write_lock(&out->file,&operation);
     size_t allowed=size,written=0;
     int error=kernel_vfs_check_write_limit(limit,position,&allowed);
     if (error) return error;
@@ -462,6 +464,7 @@ static int64_t copy_range_pinned(struct kernel_mm *mm,
     if (!kernel_open_file_readable(input) || !kernel_files_description_writable(output) ||
         (kernel_open_file_flags(output) & KERNEL_FILES_O_APPEND)) return -KERNEL_EBADF;
     if (input->file.mount->private_data != output->file.mount->private_data) return -KERNEL_EXDEV;
+    if (kernel_vfs_node_attributes(output->file.private_data)&KERNEL_VFS_INODE_IMMUTABLE) return -KERNEL_EPERM;
     if (start > UINT64_MAX - count || out_start > UINT64_MAX - count) return -KERNEL_EOVERFLOW;
     uint64_t size = kernel_open_file_size(input);
     if ((int64_t)start >= (int64_t)size) count = 0;
@@ -610,10 +613,12 @@ static int read_transfer_page(struct kernel_open_file_description *file,struct k
     }
     if (!file->block && file->kind!=KERNEL_OPEN_FILE_KIND_GENERATED &&
         !(file->device && file->device->splice_read && file->device->read)) return -KERNEL_EINVAL;
+    if (file->kind == KERNEL_OPEN_FILE_KIND_GENERATED && kernel_vfs_file_control_prefix(&file->file))
+        return -KERNEL_EINVAL;
     int error=new_transfer_page(pipe,page);
     if (error) return error;
     if (file->block) error=kernel_block_file_pread(file,position,*page,wanted,done);
-    else if (file->kind==KERNEL_OPEN_FILE_KIND_GENERATED && kernel_vfs_file_is_control(&file->file)) {
+    else if (file->kind==KERNEL_OPEN_FILE_KIND_GENERATED && kernel_vfs_file_is_control(&file->file,0)) {
         error=kernel_vfs_file_control_permission(&file->file,0);
         if (!error) error=kernel_vfs_file_control(&file->file,0,&position,*page,wanted,done);
     }

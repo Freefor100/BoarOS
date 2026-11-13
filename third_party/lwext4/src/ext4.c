@@ -2329,6 +2329,60 @@ static void ext4_inode_set_mode_initial(struct ext4_inode_ref *ref, uint32_t mod
     ref->dirty = true;
 }
 
+struct ext4_flags_change {
+    ext4_file *file;
+    uint32_t mask, flags;
+    struct ext4_timestamp ctime;
+    bool changed;
+};
+
+static int ext4_apply_flags(void *argument)
+{
+    struct ext4_flags_change *change=argument;
+    struct ext4_mountpoint *mp=change->file->mp;
+    change->changed=false;
+    int result=ext4_trans_start(mp);
+    if (result) return result;
+    struct ext4_inode_ref ref;
+    result=ext4_fs_get_inode_ref(&mp->fs,change->file->inode,&ref);
+    if (!result) {
+        struct ext4_timestamp now;
+        if (!mp->clock || !mp->clock(&now)) result=EIO;
+        else {
+            uint32_t flags=ext4_inode_get_flags(ref.inode);
+            ext4_inode_set_flags(ref.inode,(flags&~change->mask)|(change->flags&change->mask));
+            ext4_time_store(&ref,offsetof(struct ext4_inode,change_inode_time),
+                offsetof(struct ext4_inode,ctime_extra),now);
+            change->ctime=ext4_time_load(&ref,offsetof(struct ext4_inode,change_inode_time),
+                offsetof(struct ext4_inode,ctime_extra));
+            ref.dirty=true;
+            change->changed=true;
+        }
+        result=ext4_result(result,ext4_fs_put_inode_ref(&ref));
+    }
+    return ext4_trans_finish(mp,result);
+}
+
+int ext4_file_set_flags(ext4_file *file,uint32_t mask,uint32_t flags,
+    struct ext4_timestamp *ctime,bool *published)
+{
+    *published=false;
+    if (!file || !file->mp || !file->mp->mounted) return EINVAL;
+    struct ext4_mountpoint *mp=file->mp;
+    struct ext4_flags_change change={.file=file,.mask=mask,.flags=flags};
+    EXT4_MP_LOCK(mp);
+    int result=mp->fs.read_only ? EROFS : ext4_metadata_execute_locked(mp,ext4_apply_flags,&change);
+    /* A nonjournal home-write error, or a failed synchronous journal submit,
+     * can retain the changed cache image. Grouped preparation errors undo it. */
+    if (change.changed && (!result || (!mp->fs.jbd_journal ||
+        (!mp->fs.jbd_journal->grouped && !ext4_file_rolled_back(file,result))))) {
+        *published=true;
+        *ctime=change.ctime;
+    }
+    EXT4_MP_UNLOCK(mp);
+    return result;
+}
+
 int ext4_file_set_mode(ext4_file *file, uint32_t mode)
 {
     if (!file || !file->mp || !file->mp->mounted) return EINVAL;
@@ -2581,9 +2635,9 @@ static int ext4_reclaim_orphan(struct ext4_mountpoint *mp, uint32_t index,
 			ext4_inode_set_size(ref.inode, 0);
 			ref.dirty = true;
 		}
-		if (ext4_inode_can_truncate(ext4_fs_super(&mp->fs), ref.inode))
-			r = ext4_inode_truncate_step(&ref, &done);
-		else done = true;
+		/* The truncate/unlink already passed permission checks. A surviving
+		 * descriptor may since have set immutable or append-only. */
+		r = ext4_inode_truncate_step(&ref, &done);
         if (r == EOK && done && dead && !release_inode)
             r = ext4_orphan_mark_truncate(&ref, false);
 		if (r == EOK && done && (!dead || release_inode)) {
@@ -2800,6 +2854,8 @@ static int ext4_open_relative(ext4_file *f, struct ext4_mountpoint *mp,
 				break;
 
 			ext4_fs_inode_blocks_init(fs, &child_ref);
+			if (ext4_inode_has_flag(ref.inode, EXT4_INODE_FLAG_NODUMP))
+				ext4_inode_set_flag(child_ref.inode, EXT4_INODE_FLAG_NODUMP);
 			/* 固定 root 创建者仍从 setgid 父目录继承 group；目录继承该位。 */
 			if (ext4_inode_get_mode(sb, ref.inode) & 02000U) {
 				ext4_inode_set_gid(child_ref.inode, ext4_inode_get_gid(ref.inode));
@@ -3752,7 +3808,12 @@ int ext4_orphan_free(const char *path, uint32_t inode)
 	}
 
 	if (!ext4_inode_get_links_cnt(child.inode)) {
-		r = ext4_trunc_inode(mp, child.index, 0);
+		/* No VFS owner remains. Reclaim the accepted unlinked inode even
+		 * if its last description changed flags after removing the name. */
+		ext4_inode_set_size(child.inode, 0);
+		child.dirty = true;
+		bool done = false;
+		while (!r && !done) r = ext4_inode_truncate_step(&child, &done);
 		if (r != EOK) {
 			r = ext4_result(r, ext4_fs_put_inode_ref(&child));
 			r = ext4_trans_finish(mp, r);

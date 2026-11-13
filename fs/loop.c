@@ -9,6 +9,7 @@
 #include <kernel/irq.h>
 #include <kernel/page.h>
 #include "open_file_internal.h"
+#include "vfs_internal.h"
 #include "block_file_internal.h"
 #include "char_device_internal.h"
 #include "files/private.h"
@@ -118,6 +119,8 @@ static int backing_transfer(struct loop_device *loop,int writing,uint64_t positi
     else if (loop->backing->kind==KERNEL_OPEN_FILE_KIND_BLOCK)
         error=kernel_block_file_pwrite(loop->backing,offset,buffer,size,done);
     else {
+        KERNEL_LOCK_SCOPE(operation);
+        kernel_vfs_file_write_lock(&loop->backing->file,&operation);
         error=kernel_vfs_file_modified(&loop->backing->file,offset,0);
         if (!error) error=kernel_vfs_pwrite(&loop->backing->file,offset,buffer,size,done);
     }

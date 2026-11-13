@@ -204,6 +204,12 @@ enum kernel_signal_status kernel_signal_send(struct kernel_task *target,
                                              uint32_t sig,
                                              kernel_pid_t sender_tid);
 
+/* Caller checks the departing parent's credentials while transferring the
+ * child. Posting uses the held TGID and the saved SI_USER payload. */
+int kernel_signal_permitted_locked(struct kernel_task *, struct kernel_task *, unsigned);
+void kernel_signal_parent_death(struct kernel_task *member, struct kernel_pid *group,
+    uint32_t sig, kernel_pid_t sender, uint32_t uid);
+
 /* Identity is retained by the notification owner; type is F_OWNER_TID/PID/PGRP.
  * Captured setter UID/EUID authorizes against the receiver at publication. */
 void kernel_signal_sigio(struct kernel_pid *,int type,uint32_t uid,uint32_t euid,

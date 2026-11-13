@@ -35,11 +35,11 @@ struct signal_sigio_permission { uint32_t uid,euid; struct kernel_pid *identity;
 static enum kernel_signal_status signal_send_one_mode(
     struct kernel_task *,uint32_t,kernel_pid_t,int,int16_t,
     const struct kernel_signal_wait_info *,int,uint64_t,int,
-    const struct signal_sigio_permission *);
+    const struct signal_sigio_permission *, struct kernel_pid *);
 static enum kernel_signal_status signal_send_one(
     struct kernel_task *task,uint32_t sig,kernel_pid_t sender,int process,int16_t code,
     const struct kernel_signal_wait_info *info,int queued,uint64_t generation)
-{ return signal_send_one_mode(task,sig,sender,process,code,info,queued,generation,0,0); }
+{ return signal_send_one_mode(task,sig,sender,process,code,info,queued,generation,0,0,0); }
 
 static struct kernel_task *real_timers;
 /* PID-derived identities occupy the low generation range. */
@@ -944,7 +944,7 @@ static void signal_send_child(struct kernel_task *parent, struct kernel_task *ch
     if (representative)
         /* The compact inline child payload belongs to SIGCHLD; other exit
          * signals need the complete status and CPU-time record. */
-        (void)signal_send_one_mode(parent,signal,child->tid,1,code,&info,signal!=17U,0,nosleep,0);
+        (void)signal_send_one_mode(parent,signal,child->tid,1,code,&info,signal!=17U,0,nosleep,0,0);
 }
 
 void kernel_signal_notify_tracer(struct kernel_task *tracer,struct kernel_task *child,int why,int status)
@@ -1158,7 +1158,7 @@ static int signal_ignored_unblocked(const struct kernel_task *target,
             signal_default_action(sig) == KERNEL_SIGNAL_DEFAULT_CONTINUE);
 }
 
-static int signal_permitted_locked(struct kernel_task *caller,struct kernel_task *target,unsigned sig)
+int kernel_signal_permitted_locked(struct kernel_task *caller,struct kernel_task *target,unsigned sig)
 {
     if(!caller || caller->group_leader==target->group_leader)return 1;
     const struct kernel_credentials *from=kernel_credentials_task_locked(caller),
@@ -1184,11 +1184,12 @@ static int sigio_permitted_locked(const struct kernel_task *target,const struct 
 static enum kernel_signal_status signal_send_one_mode(
     struct kernel_task *target,uint32_t sig,kernel_pid_t sender_tid,
     int process_directed,int16_t code,const struct kernel_signal_wait_info *provided,
-    int queued,uint64_t thread_generation,int nosleep,const struct signal_sigio_permission *owner)
+    int queued,uint64_t thread_generation,int nosleep,const struct signal_sigio_permission *owner,
+    struct kernel_pid *authorized_group)
 {
     if (!target || !sig || sig>KERNEL_SIGNAL_COUNT) return KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
     struct kernel_task *executing=kernel_task_current();
-    struct kernel_task *sender=!owner && (sender_tid || provided) && code<=0?executing:0;
+    struct kernel_task *sender=!authorized_group && !owner && (sender_tid || provided) && code<=0?executing:0;
     struct signal_pending_prepared p __attribute__((cleanup(signal_pending_finish)))={0};
     struct kernel_signal_wait_info info={.signal=sig,.sender=(uint32_t)sender_tid,.code=code};
     struct kernel_pid *identity __attribute__((cleanup(kernel_task_identity_end)))=0;
@@ -1197,9 +1198,11 @@ static enum kernel_signal_status signal_send_one_mode(
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         /* Authorize and acquire the identity/container in the same snapshot.
          * Allocation may sleep, so publication still rechecks permission. */
-        if(!sigio_permitted_locked(target,owner) || (sender && !signal_permitted_locked(sender,target,sig)))
+        if(!sigio_permitted_locked(target,owner) || (sender && !kernel_signal_permitted_locked(sender,target,sig)))
             return KERNEL_SIGNAL_STATUS_PERMISSION;
-        struct kernel_task *leader=target->group_leader;
+        struct kernel_task *leader=authorized_group
+            ? (authorized_group->members[KERNEL_PID_TGID] ? authorized_group->members[KERNEL_PID_TGID]->task : 0)
+            : target->group_leader;
         if(!leader || leader->retirement || leader->group_leader!=leader)
             return KERNEL_SIGNAL_STATUS_INVALID_STATE;
         if(process_directed) {
@@ -1229,8 +1232,9 @@ static enum kernel_signal_status signal_send_one_mode(
     }
     if(owner) { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         if(!sigio_permitted_locked(target,owner))return KERNEL_SIGNAL_STATUS_PERMISSION; }
-    signal_prepare_group(target,sig,nosleep);
-    if(sig==SIGNAL_KILL) {process_group_request_exit(target,KERNEL_THREAD_EXIT_SIGNAL,sig,0);return KERNEL_SIGNAL_STATUS_OK;}
+    struct kernel_task *control_target=authorized_group && group_owner ? group_owner : target;
+    signal_prepare_group(control_target,sig,nosleep);
+    if(sig==SIGNAL_KILL) {process_group_request_exit(control_target,KERNEL_THREAD_EXIT_SIGNAL,sig,0);return KERNEL_SIGNAL_STATUS_OK;}
     if(provided)info=*provided;
     else if(sender)info.uid=kernel_credentials_current()->uid;
     int prepared=0,needs_prepare=sig>=32 || queued || info.uid;
@@ -1282,7 +1286,7 @@ static enum kernel_signal_status signal_send_one_mode(
             }
             /* 接收者只决定唤醒谁；权限和 UID 额度始终使用原始目标线程。 */
             if(!sigio_permitted_locked(target,owner) ||
-                (sender && sender!=target && !signal_permitted_locked(sender,target,sig)))return KERNEL_SIGNAL_STATUS_PERMISSION;
+                (sender && sender!=target && !kernel_signal_permitted_locked(sender,target,sig)))return KERNEL_SIGNAL_STATUS_PERMISSION;
             if(signal_ignored_unblocked(wake_target,sig))return KERNEL_SIGNAL_STATUS_OK;
             /* 改UID后，已有内联事件仍属于旧账户。仅这种混合账户
              * 需要在锁外补备记录；同账户标准信号复用当前发布保护。 */
@@ -1436,6 +1440,13 @@ enum kernel_signal_status kernel_signal_send(struct kernel_task *target,
     return signal_send_one(target, sig, sender_tid, 1, 0, 0, 0, 0);
 }
 
+void kernel_signal_parent_death(struct kernel_task *member, struct kernel_pid *group,
+    uint32_t sig, kernel_pid_t sender, uint32_t uid)
+{
+    struct kernel_signal_wait_info info = {.signal=sig, .sender=(uint32_t)sender, .uid=uid};
+    (void)signal_send_one_mode(member,sig,sender,1,0,&info,0,0,0,0,group);
+}
+
 int kernel_signal_queue_info(int32_t group,int32_t pid,int thread,
     const struct kernel_signal_wait_info *info)
 {
@@ -1448,7 +1459,7 @@ int kernel_signal_queue_info(int32_t group,int32_t pid,int thread,
         generation=process_identity(target,KERNEL_PID_TID)->generation;
         if(!target->group_leader || (thread && target->group_leader->tid!=group))return -KERNEL_ESRCH;
         if(info->signal>KERNEL_SIGNAL_COUNT)return -KERNEL_EINVAL;
-        if(!signal_permitted_locked(kernel_task_current(),target,info->signal))return -KERNEL_EPERM;
+        if(!kernel_signal_permitted_locked(kernel_task_current(),target,info->signal))return -KERNEL_EPERM;
         if(!info->signal || (thread && !signal_dispatchable_locked(target)))return 0;
     }
     enum kernel_signal_status status;
@@ -1474,10 +1485,10 @@ static void signal_sigio_target(struct kernel_task *target,int process,uint64_t 
             info.code=-5;
         info.address=bands[reason];memcpy(info.payload+8,&fd,sizeof(fd));
         enum kernel_signal_status status=signal_send_one_mode(target,signum,0,process,
-            (int16_t)info.code,&info,1,generation,1,owner);
+            (int16_t)info.code,&info,1,generation,1,owner,0);
         if(status!=KERNEL_SIGNAL_STATUS_QUEUE_FULL)return;
     }
-    (void)signal_send_one_mode(target,29,0,process,128,0,0,generation,1,owner);
+    (void)signal_send_one_mode(target,29,0,process,128,0,0,generation,1,owner,0);
 }
 void kernel_signal_sigio(struct kernel_pid *identity,int type,uint32_t uid,uint32_t euid,
     unsigned signum,int fd,unsigned reason)
@@ -1605,7 +1616,7 @@ static int64_t signal_target_group(struct kernel_task *caller,struct kernel_task
         if (!target || !target->accounted || target->retirement || !leader ||
             !leader->accounted || leader->retirement || !leader->identities[KERNEL_PID_TGID].identity)
             return 0;
-        if(!signal_permitted_locked(caller,target,sig))return -KERNEL_EPERM;
+        if(!kernel_signal_permitted_locked(caller,target,sig))return -KERNEL_EPERM;
     }
     /* zombie 仍是可查询的进程；没有可运行成员时信号成功但不入队。 */
     if (!deliver) return 1;
@@ -1679,7 +1690,7 @@ static int64_t signal_identity_target(struct kernel_pid *id,unsigned role,
             target=member->task;
         }
         scheduler_task_get_locked(target);
-        if(!signal_permitted_locked(caller,target,sig))return -KERNEL_EPERM;
+        if(!kernel_signal_permitted_locked(caller,target,sig))return -KERNEL_EPERM;
         if(!sig)return 0;
         if(role==KERNEL_PID_TID &&
             (target->proc_exiting || !signal_dispatchable_locked(target)))return 0;
@@ -1702,7 +1713,7 @@ static int64_t signal_identity_target(struct kernel_pid *id,unsigned role,
             (target->proc_exiting || !signal_dispatchable_locked(target))) {
             /* Exit can win during unlocked signal preparation. The retained
              * TID still exists, so Linux accepts and drops the notification. */
-            return signal_permitted_locked(caller,target,sig)?0:-KERNEL_EPERM;
+            return kernel_signal_permitted_locked(caller,target,sig)?0:-KERNEL_EPERM;
         }
     }
     return status==KERNEL_SIGNAL_STATUS_OK?0:status==KERNEL_SIGNAL_STATUS_PERMISSION?-KERNEL_EPERM:
@@ -1764,7 +1775,7 @@ int64_t kernel_signal_send_thread(struct kernel_task *caller,
     }
     if (sig == 0U) {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-        return signal_permitted_locked(caller,target,sig)?1:-KERNEL_EPERM;
+        return kernel_signal_permitted_locked(caller,target,sig)?1:-KERNEL_EPERM;
     }
     /* 实际发送由 signal_send_one 在分配前授权、发布时复核；探测信号
      * 没有该后续步骤，只有它需要在此单独检查。 */
@@ -1984,8 +1995,10 @@ enum kernel_signal_status kernel_signal_suspend(struct kernel_task *task,
     signal_retarget_shared(task,retarget);
     while (!kernel_signal_has_pending(task) &&
            task->terminate_requested == 0U) {
+        /* A trace-only stop resumes this suspend with the same temporary
+         * mask. End the interruptible token before entering the tracer stop. */
         if (KERNEL_WAIT_RECHECK(0, 0U, 1, &reason,
-                (1)) !=
+                !kernel_ptrace_stop_requested(task)) !=
             KERNEL_SCHEDULER_STATUS_OK) {
             {
                 KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
@@ -1995,6 +2008,7 @@ enum kernel_signal_status kernel_signal_suspend(struct kernel_task *task,
             signal_retarget_shared(task,retarget);
             return KERNEL_SIGNAL_STATUS_INVALID_STATE;
         }
+        if (kernel_ptrace_stop_requested(task)) kernel_ptrace_user_return(task, 0);
     }
     /* Keep the temporary mask until delivery. The signal frame contains
      * the pre-suspend mask, which sigreturn restores atomically. */
@@ -2162,7 +2176,7 @@ static __attribute__((noinline)) enum kernel_signal_select_result signal_select_
                 /* As in Linux ptrace_signal, a blocked reinjection uses the
                  * original pending type and the complete edited siginfo. */
                 (void)signal_send_one_mode(task,sig,(kernel_pid_t)info->sender,shared,
-                    (int16_t)info->code,info,1,0,0,0);
+                    (int16_t)info->code,info,1,0,0,0,0);
                 continue;
             }
         }

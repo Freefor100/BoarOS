@@ -5,6 +5,7 @@
 #include <kernel/exec.h>
 #include <kernel/credentials.h>
 #include <kernel/ptrace.h>
+#include <kernel/proc_task.h>
 #include <kernel/futex.h>
 #include <kernel/files.h>
 #include <kernel/heap.h>
@@ -158,11 +159,15 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
         previous_security=thread->exec_security;
         thread->exec_security=transaction->exec_security;
         transaction->exec_security=0;
+        /* commit_creds applies to the new image. The old image may still
+         * be shared by another process through CLONE_VM. */
+        kernel_credentials_changed_locked(thread, previous, thread->credentials);
+        if (transaction->secureexec) thread->parent_death_signal = 0;
         finish_mm_move(&transaction->image.mm);
     }
     kernel_credentials_put(previous);
     kernel_exec_security_put(previous_security);
-    kernel_proc_task_update_comm(thread);
+    kernel_task_comm_set(thread, transaction->comm);
     arch_thread_set_mm(&thread->arch, new_context);
     arch_process_prepare_exec(thread,
                           transaction->image.entry,

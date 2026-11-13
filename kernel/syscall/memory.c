@@ -81,6 +81,7 @@ static uint32_t mm_permissions_from_linux(uint64_t protections)
 
 static int64_t mmap_error(enum kernel_mm_status status)
 {
+    if (status == KERNEL_MM_STATUS_ACCESS) return -KERNEL_EACCES;
     if (status == KERNEL_MM_STATUS_LOCK_PERMISSION || status == KERNEL_MM_STATUS_SEALED) return -KERNEL_EPERM;
     if (status == KERNEL_MM_STATUS_LOCK_LIMIT) return -KERNEL_EAGAIN;
     if (status == KERNEL_MM_STATUS_NO_MEMORY) {
@@ -264,7 +265,7 @@ enum kernel_syscall_status syscall_handle_mmap(
         status != KERNEL_MM_STATUS_NO_MEMORY &&
         status != KERNEL_MM_STATUS_CONFLICT &&
         status != KERNEL_MM_STATUS_LOCK_LIMIT && status != KERNEL_MM_STATUS_LOCK_PERMISSION &&
-        status != KERNEL_MM_STATUS_SEALED) {
+        status != KERNEL_MM_STATUS_ACCESS && status != KERNEL_MM_STATUS_SEALED) {
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
     /* Linux commits mmap before best-effort population; a failed fault

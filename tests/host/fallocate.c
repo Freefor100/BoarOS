@@ -1229,6 +1229,119 @@ static void admission_mmap(struct kernel_page_cache *cache,struct kernel_heap *h
     (void)cache;
     puts("PASS mmap admission: full valid page required before writable PTE; private COW survives full disk, no dirty error");
 }
+struct set_immutable_args {
+    struct kernel_vfs_file *file;
+    uint32_t flags;
+    int result;
+};
+
+static void *set_immutable_thread(void *argument)
+{
+    struct set_immutable_args *args=argument;
+    cache_test_attach(1);
+    hold_ordinary_wait=1;
+    args->result=kernel_vfs_file_attributes(args->file,1,&args->flags);
+    return NULL;
+}
+
+static void inode_attributes(struct kernel_heap *heap,struct physical_page_allocator *pages,
+    struct kernel_vfs_mount *mount,int memory)
+{
+    struct kernel_vfs_file created={0};
+    assert(!(memory ? kernel_vfs_create(mount,"/attr",0600,&created) :
+        create_file(mount,"/attr",0600,&created)));
+    assert(!kernel_vfs_close(&created));
+    struct kernel_open_file_description *file=NULL;
+    int error;
+    assert(!kernel_open_file_create(heap,mount,"/attr",&file,&error) && !error);
+    file->open_flags=2;
+    struct kernel_vfs_file *f=&file->file;
+    assert(!kernel_vfs_ftruncate(f,BOAROS_PAGE_SIZE));
+
+    struct arch_mmu_page_table kernel={0};
+    struct arch_mmu_user_space space={0};
+    struct kernel_mm mm={0};
+    assert(!riscv_sv39_page_table_init(&kernel,pages));
+    kernel.state=ARCH_MMU_STATE_ACTIVE;
+    assert(!arch_mmu_user_space_init(&space,pages,&kernel) && !kernel_mm_create(&mm,&space));
+    assert(!kernel_mm_vma_enable(&mm,heap) && !kernel_mm_context(&mm,&mm_test_context));
+    assert(!kernel_mm_brk_initialize(&mm,0x10000,0x20000));
+    uint64_t shared,private;
+    struct kernel_open_file_description *source=file;
+    assert(!kernel_open_file_acquire(source));
+    assert(!kernel_mm_mmap_file_private(&mm,&source,0x40000,BOAROS_PAGE_SIZE,0,KERNEL_MM_READ|KERNEL_MM_WRITE,
+        KERNEL_MM_MAP_FIXED|KERNEL_MM_MAP_SHARED,&shared));
+    source=file;
+    assert(!kernel_open_file_acquire(source));
+    assert(!kernel_mm_mmap_file_private(&mm,&source,0x80000,BOAROS_PAGE_SIZE,0,KERNEL_MM_READ|KERNEL_MM_WRITE,
+        KERNEL_MM_MAP_FIXED,&private));
+    size_t copied;
+    assert(!kernel_copy_to_user(&mm,shared,"S",1,&copied) && copied==1);
+    assert(!kernel_copy_to_user(&mm,private,"P",1,&copied) && copied==1);
+    uint32_t before,after,immutable;
+    assert(!kernel_vfs_file_attributes(f,0,&before));
+    immutable=before|KERNEL_VFS_INODE_IMMUTABLE;
+    if (!memory) {
+        uint64_t sequence=kernel_vfs_error_sequence(f);
+        write_error=2;
+        assert(kernel_vfs_file_attributes(f,1,&immutable)==-KERNEL_EIO && !write_error);
+        assert(kernel_vfs_error_sequence(f)>sequence);
+        assert(!kernel_vfs_file_attributes(f,0,&after) && after==before);
+        assert(!kernel_copy_to_user(&mm,shared,"S",1,&copied) && copied==1);
+    }
+    if (memory) assert(!kernel_vfs_file_attributes(f,1,&immutable));
+    else {
+        struct kernel_mm_user_pin pin={0};
+        assert(!kernel_mm_pin_user_page(&mm,shared,KERNEL_MM_WRITE,&pin));
+        pthread_t setter;
+        struct set_immutable_args args={.file=f,.flags=immutable,.result=1};
+        ordinary_wait_entered=ordinary_wait_resume=0;
+        assert(!pthread_create(&setter,NULL,set_immutable_thread,&args));
+        wait_progress(&ordinary_wait_entered,1);
+        assert(!(kernel_vfs_node_attributes(kernel_vfs_file_node(f))&KERNEL_VFS_INODE_IMMUTABLE));
+        *(char *)pin.page='S';
+        kernel_mm_unpin_user_page(&pin);
+        __atomic_store_n(&ordinary_wait_resume,1,__ATOMIC_RELEASE);
+        assert(!pthread_join(setter,NULL) && !args.result);
+    }
+    struct kernel_vfs_stat stat;
+    assert(!kernel_vfs_fstat(f,&stat) && (stat.attributes&KERNEL_VFS_INODE_IMMUTABLE));
+    assert(disk_read(&mm,shared)=='S' && disk_read(&mm,private)=='P');
+    assert(!kernel_copy_to_user(&mm,private,"Q",1,&copied) && copied==1);
+    enum kernel_mm_status fault=kernel_mm_resolve_user_fault(&mm,shared,KERNEL_MM_WRITE);
+    assert(fault==(memory ? KERNEL_MM_STATUS_OK : KERNEL_MM_STATUS_BUS_FAULT));
+    assert(kernel_vfs_pwrite(f,0,"W",1,&copied)==(memory ? 0 : -KERNEL_EPERM));
+    assert(!kernel_vfs_file_attributes(f,1,&before));
+    assert(!kernel_copy_to_user(&mm,shared,"R",1,&copied) && copied==1);
+    assert(disk_read(&mm,private)=='Q');
+    mm_test_bind(NULL);mm_test_context=0;
+    assert(!kernel_mm_release(&mm) && !physical_page_release(pages,kernel.root_address));
+    uint32_t nodump=before|KERNEL_VFS_INODE_NODUMP;
+    if (!memory) {
+        struct lwext4_mount_adapter *adapter=lwext4_instance(mount->private_data);
+        if (adapter->device.fs->jbd_journal) {
+            struct ext4_journal_runtime runtime={.now_ns=metadata_clock};
+            assert(!ext4_journal_group_enable(adapter->mount_point,&runtime,4*1024*1024));
+            struct jbd_journal *journal=adapter->device.fs->jbd_journal;
+            jbd_memory_set_limit(journal,1);
+            assert(kernel_vfs_file_attributes(f,1,&nodump)==-KERNEL_ENOMEM);
+            jbd_memory_set_limit(journal,4*1024*1024);
+            assert(!kernel_vfs_file_attributes(f,0,&after) && after==before);
+        }
+    }
+    assert(!kernel_vfs_file_attributes(f,1,&nodump));
+    assert(!kernel_open_file_release(&file));
+    assert(!kernel_vfs_open(mount,"/attr",&created));
+    assert(!kernel_vfs_file_attributes(&created,0,&after) && after==nodump);
+    /* Reclaim the data blocks even if flags changed after unlink. */
+    assert(!kernel_vfs_unlink(mount,"/attr"));
+    immutable=nodump|KERNEL_VFS_INODE_IMMUTABLE;
+    assert(!kernel_vfs_file_attributes(&created,1,&immutable));
+    assert(!kernel_vfs_close(&created));
+    puts(memory ? "PASS tmpfs flags, old shared write and private COW" :
+        "PASS ext4 flags, flush failure, shared write protection, private COW and reopen");
+}
+
 static void mmap_ranges(struct kernel_page_cache *cache,struct kernel_heap *heap,
     struct physical_page_allocator *pages,struct kernel_vfs_mount *mount)
 {
@@ -1596,6 +1709,7 @@ int main(int argc,char **argv)
         namespace_pressure(&cache,&mount,!strcmp(argv[2],"namespace-reclaim"));goto mounted_done;
     }
 #ifdef CACHE_MM_CASES
+    if (!strcmp(argv[2],"inode-attributes")) {inode_attributes(&heap,&pages,&mount,0);goto mounted_done;}
     if (!strcmp(argv[2],"admission-fault")) {
         admission_fault(&cache,&heap,&pages,&mount); goto mounted_done;
     }
@@ -1631,6 +1745,9 @@ mounted_done:
     assert(!kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(&cache) && !close(image_fd));
     struct kernel_vfs_mount *memory=NULL; struct kernel_vfs_file unsupported={0};
     assert(!kernel_tmpfs_create(&heap,0,NULL,&memory));
+#ifdef CACHE_MM_CASES
+    if (!strcmp(argv[2],"inode-attributes")) inode_attributes(&heap,&pages,memory,1);
+#endif
     if (!strcmp(argv[2],"vfs-socket")) vfs_socket_paths(memory);
     if (!strcmp(argv[2],"vfs-credentials")) credential_vfs_cases(memory);
     if (!strcmp(argv[2],"credential-chown")) credential_chown_groups(memory);

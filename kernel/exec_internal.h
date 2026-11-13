@@ -28,6 +28,7 @@ enum kernel_exec_transaction_state {
 struct kernel_exec_transaction {
     struct kernel_heap *heap;
     char *original_path;
+    char comm[16];
     char *string_bytes;
     size_t string_size;
     size_t string_capacity;

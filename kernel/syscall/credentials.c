@@ -151,7 +151,7 @@ enum kernel_syscall_status syscall_handle_credentials(struct kernel_task *caller
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
-enum kernel_syscall_status syscall_handle_prctl(struct kernel_task *caller,
+enum kernel_syscall_status syscall_handle_prctl_credentials(struct kernel_task *caller,
     const struct kernel_syscall_request *request,struct kernel_syscall_result *decoded)
 {
     const struct kernel_credentials *old=kernel_credentials_task_locked(caller);

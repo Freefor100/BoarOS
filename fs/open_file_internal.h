@@ -45,6 +45,7 @@ struct kernel_open_file_description {
     uint8_t device_opened;
     char *generated_data;
     size_t generated_length;
+    uint64_t generated_read_offset;
     uint8_t generated_ready;
     const struct kernel_credentials *credentials;
     struct kernel_namespace *ipc_proc_namespace; /* /proc/sysvipc discovery owner from open. */
