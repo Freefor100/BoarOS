@@ -10,6 +10,7 @@
 #include "../../fs/event_fd.c"
 _Thread_local uintptr_t network_host_irq=RISCV_SSTATUS_SIE;
 static uint64_t now_ns=1000000000;
+static uint64_t wall_offset=10000000000;
 static unsigned allocations,notifications,arms;
 static size_t copy_limit=SIZE_MAX;
 static struct kernel_open_file_description *slots[256];
@@ -31,9 +32,11 @@ void kernel_scheduler_deadline_changed(void){assert(!kernel_cpu_current()->raw_l
 enum kernel_scheduler_status kernel_scheduler_yield_current(void){sched_yield();return 0;}
 uint64_t riscv_time_read(void){return __atomic_load_n(&now_ns,__ATOMIC_RELAXED);}
 uint64_t kernel_time_monotonic_ns(void){return __atomic_load_n(&now_ns,__ATOMIC_RELAXED);}
-uint64_t kernel_time_realtime_ns(void){return kernel_time_monotonic_ns()+10000000000;}
-uint64_t kernel_time_boot_realtime_offset(void){return 10000000000;}
+uint64_t kernel_time_realtime_ns(void){return kernel_time_monotonic_ns()+wall_offset;}
+uint64_t kernel_time_boot_realtime_offset(void){return wall_offset;}
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t n,uint64_t *t){*t=n;return n<=now_ns?KERNEL_TIME_STATUS_DEADLINE_PASSED:KERNEL_TIME_STATUS_OK;}
+enum kernel_time_status kernel_time_deadline_from_realtime(uint64_t n,uint64_t *t)
+{if(n<=kernel_time_realtime_ns()){*t=now_ns+1;return KERNEL_TIME_STATUS_DEADLINE_PASSED;}*t=n-wall_offset;return 0;}
 int kernel_files_is_live(const struct kernel_files *f){return f!=0;}
 enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t n,size_t z,void **out){(void)h;assert(!kernel_cpu_current()->raw_locks);*out=calloc(n,z);assert(*out);allocations++;return 0;}
 void kernel_heap_release(struct kernel_heap *h,void *p){(void)h;assert(p&&allocations);allocations--;free(p);}
@@ -51,9 +54,10 @@ void kernel_wait_cursor_wake(struct kernel_wait_cursor *c,int all){assert(!kerne
 enum kernel_scheduler_status kernel_wait_queue_close(struct kernel_wait_queue *q){__atomic_store_n(&q->closed,1,__ATOMIC_RELEASE);return 0;}
 enum kernel_scheduler_status kernel_wait_queue_destroy(struct kernel_wait_queue *q){return __atomic_load_n(&q->borrows,__ATOMIC_ACQUIRE)?KERNEL_SCHEDULER_STATUS_BUSY:KERNEL_SCHEDULER_STATUS_OK;}
 static void (*on_park)(void);
+static enum kernel_wait_wake_reason park_reason=KERNEL_WAIT_WOKEN;
 static unsigned prepared;
 enum kernel_scheduler_status kernel_wait_prepare(struct kernel_wait_queue *q,uint64_t d,int i,struct kernel_wait_token *t){(void)q;(void)d;(void)i;assert(!prepared);prepared=1;t->generation=1;return 0;}
-enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *t,enum kernel_wait_wake_reason *r){(void)t;assert(prepared&&on_park&&!kernel_cpu_current()->raw_locks);on_park();*r=KERNEL_WAIT_WOKEN;return 0;}
+enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *t,enum kernel_wait_wake_reason *r){(void)t;assert(prepared&&on_park&&!kernel_cpu_current()->raw_locks);on_park();*r=park_reason;return 0;}
 enum kernel_scheduler_status kernel_wait_finish(struct kernel_wait_token *t){(void)t;assert(prepared);prepared=0;return 0;}
 struct kernel_task *kernel_task_current(void){return (void *)&prepared;}
 void kernel_signal_note_syscall_restart(struct kernel_task *t){(void)t;}
@@ -104,4 +108,94 @@ static void lifecycle(void)
  assert(!pthread_join(expire,0)&&!pthread_join(close,0)&&released);paused=0;
  pthread_barrier_destroy(&callback_enter);pthread_barrier_destroy(&callback_leave);puts("PASS timer expiry borrow versus final close");
 }
-int main(void){counters();index_cases();lifecycle();assert(!allocations&&!timer_root&&!prepared&&!credential_references);printf("EVENT HOST PASS page=%lu\n",BOAROS_PAGE_SIZE);return 0;}
+static int open_timer(int clock)
+{int64_t fd;assert(!kernel_files_timerfd_create(&files,clock,EVENT_NONBLOCK,&fd)&&fd>=0);return (int)fd;}
+static void close_timer(int fd)
+{struct kernel_open_file_description *owner=slots[fd];slots[fd]=0;assert(!kernel_open_file_release(&owner));}
+static int64_t set_timer(int fd,unsigned flags,uint64_t value,uint64_t interval)
+{
+ struct event_itimerspec input={.value=time_spec(value),.interval=time_spec(interval)};int64_t result;
+ assert(!kernel_files_timerfd_settime(&files,0,fd,flags,(uintptr_t)&input,0,&result));return result;
+}
+static uint64_t remaining(int fd)
+{
+ struct event_itimerspec output;int64_t result;
+ assert(!kernel_files_timerfd_gettime(&files,0,fd,(uintptr_t)&output,&result)&&!result);return time_ns(output.value);
+}
+static int64_t read_timer(int fd,uint64_t *value)
+{struct kernel_uaccess_iovec iov={(uintptr_t)value,8};return kernel_event_fd_io(slots[fd],0,&iov,1,8,0);}
+static void clock_steps(void)
+{
+ int relative=open_timer(0),absolute=open_timer(0),monotonic=open_timer(1);uint64_t value;
+ uint64_t real=kernel_time_realtime_ns(),start=now_ns;
+ assert(!set_timer(relative,0,1000,0)&&!set_timer(absolute,1,real+2000,0)&&!set_timer(monotonic,1,start+3000,0));
+ uint64_t first=kernel_timer_fd_deadline();assert(first==start+1000);
+ wall_offset-=500;kernel_timer_fd_clock_changed();
+ assert(remaining(relative)==1000&&remaining(absolute)==2500&&remaining(monotonic)==3000&&kernel_timer_fd_deadline()==first);
+ wall_offset+=3000;kernel_timer_fd_clock_changed();kernel_timer_fd_expire(now_ns+1);
+ assert(read_timer(absolute,&value)==8&&value==1);
+ assert(read_timer(relative,&value)==-KERNEL_EAGAIN&&remaining(relative)==1000&&remaining(monotonic)==3000);
+ close_timer(relative);close_timer(absolute);close_timer(monotonic);
+ /* An expiry already selected using the old ticks must recheck wall time. */
+ absolute=open_timer(0);assert(!set_timer(absolute,1,kernel_time_realtime_ns()+100,0));
+ uint64_t old=kernel_timer_fd_deadline();wall_offset-=200;now_ns+=100;
+ kernel_timer_fd_expire(old);assert(read_timer(absolute,&value)==-KERNEL_EAGAIN&&remaining(absolute)==200);
+ kernel_timer_fd_clock_changed();now_ns+=200;kernel_timer_fd_expire(now_ns);
+ assert(read_timer(absolute,&value)==8&&value==1);close_timer(absolute);
+ puts("PASS timerfd relative/absolute forward/backward clock steps");
+}
+static void clock_cancellation(void)
+{
+ int fd=open_timer(0);uint64_t value;
+ assert(!set_timer(fd,3,kernel_time_realtime_ns()+10000,0));
+ wall_offset++;kernel_timer_fd_clock_changed();
+ assert(kernel_event_fd_poll(slots[fd],KERNEL_POLLIN,0)&KERNEL_POLLIN);
+ assert(read_timer(fd,&value)==-KERNEL_ECANCELED&&read_timer(fd,&value)==-KERNEL_EAGAIN);
+ wall_offset++;kernel_timer_fd_clock_changed();assert(read_timer(fd,&value)==-KERNEL_ECANCELED);
+ wall_offset++;kernel_timer_fd_clock_changed();
+ struct event_itimerspec input={.value=time_spec(kernel_time_realtime_ns()+20)},output;
+ memset(&output,0x5a,sizeof(output));struct event_itimerspec unchanged=output;int64_t result;
+ assert(!kernel_files_timerfd_settime(&files,0,fd,3,(uintptr_t)&input,(uintptr_t)&output,&result));
+ assert(result==-KERNEL_ECANCELED&&!memcmp(&output,&unchanged,sizeof(output))&&remaining(fd)==20);
+ assert(read_timer(fd,&value)==-KERNEL_EAGAIN);now_ns+=20;kernel_timer_fd_expire(now_ns);
+ assert(read_timer(fd,&value)==8&&value==1);
+ assert(!set_timer(fd,3,0,0));wall_offset++;kernel_timer_fd_clock_changed();
+ assert(read_timer(fd,&value)==-KERNEL_ECANCELED&&read_timer(fd,&value)==-KERNEL_EAGAIN);
+ close_timer(fd);puts("PASS timerfd cancel read/reset/disarmed registration");
+}
+static void periodic_clock_rewind(void)
+{
+ int fd=open_timer(0);uint64_t value;
+ assert(!set_timer(fd,1,kernel_time_realtime_ns()+100,100));now_ns+=100;kernel_timer_fd_expire(now_ns);
+ wall_offset-=200;kernel_timer_fd_clock_changed();
+ assert(read_timer(fd,&value)==0&&remaining(fd)==200);
+ now_ns+=200;kernel_timer_fd_expire(now_ns);assert(read_timer(fd,&value)==8&&value==1&&remaining(fd)==100);
+ close_timer(fd);puts("PASS timerfd pending periodic expiry before wall rewind");
+}
+static void signal_then_cancel(void)
+{park_reason=KERNEL_WAIT_SIGNALLED;wall_offset++;kernel_timer_fd_clock_changed();}
+static void signal_then_expire(void)
+{park_reason=KERNEL_WAIT_SIGNALLED;now_ns+=100;kernel_timer_fd_expire(now_ns);}
+static void signal_then_rewind_expiry(void)
+{signal_then_expire();wall_offset-=200;kernel_timer_fd_clock_changed();}
+static void signal_only(void)
+{park_reason=KERNEL_WAIT_SIGNALLED;}
+static void interrupted_timer_read(void)
+{
+ int fd=open_timer(0);uint64_t value;
+ slots[fd]->open_flags&=~EVENT_NONBLOCK;
+ assert(!set_timer(fd,3,kernel_time_realtime_ns()+10000,0));
+ /* The token reports the signal winner; cancellation is published before
+  * read reacquires its condition lock, as in Linux timerfd_read_iter. */
+ on_park=signal_then_cancel;assert(read_timer(fd,&value)==-KERNEL_ECANCELED);
+ slots[fd]->open_flags|=EVENT_NONBLOCK;assert(read_timer(fd,&value)==-KERNEL_EAGAIN);
+ slots[fd]->open_flags&=~EVENT_NONBLOCK;
+ on_park=signal_only;assert(read_timer(fd,&value)==-KERNEL_ERESTARTSYS);
+ assert(!set_timer(fd,1,kernel_time_realtime_ns()+100,0));
+ on_park=signal_then_expire;assert(read_timer(fd,&value)==8&&value==1);
+ assert(!set_timer(fd,1,kernel_time_realtime_ns()+100,100));
+ on_park=signal_then_rewind_expiry;assert(read_timer(fd,&value)==-KERNEL_ERESTARTSYS&&remaining(fd)==200);
+ on_park=0;park_reason=KERNEL_WAIT_WOKEN;close_timer(fd);
+ puts("PASS timerfd published cancel/expiry after signal winner");
+}
+int main(void){counters();index_cases();lifecycle();clock_steps();clock_cancellation();periodic_clock_rewind();interrupted_timer_read();assert(!allocations&&!timer_root&&!cancel_timers&&!prepared&&!credential_references);printf("EVENT HOST PASS page=%lu\n",BOAROS_PAGE_SIZE);return 0;}

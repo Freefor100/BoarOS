@@ -296,7 +296,7 @@ static int allocate_state(struct kernel_futex_pi_request *request)
     request->candidate->heap=request->task->files.heap;request->candidate->references=1;return 0;
 }
 static int pi_deadline(struct kernel_task *task,uint64_t timeout,int realtime,
-    uint64_t *deadline,int *expired)
+    uint64_t *deadline,uint64_t *deadline_ns)
 {
     if(!timeout)return 0;
     struct {int64_t seconds,nanoseconds;} ts;size_t copied;
@@ -304,9 +304,11 @@ static int pi_deadline(struct kernel_task *task,uint64_t timeout,int realtime,
     if(ts.seconds<0 || ts.nanoseconds<0 || ts.nanoseconds>=1000000000)return -KERNEL_EINVAL;
     __uint128_t wide=(__uint128_t)(uint64_t)ts.seconds*1000000000+(uint64_t)ts.nanoseconds;
     uint64_t ns=wide>INT64_MAX?INT64_MAX:(uint64_t)wide;
-    if(realtime){uint64_t offset=kernel_time_boot_realtime_offset();ns=ns<=offset?0:ns-offset;}
-    enum kernel_time_status converted=kernel_time_deadline_from_monotonic(ns,deadline);
-    if(converted==KERNEL_TIME_STATUS_DEADLINE_PASSED)*expired=1;
+    *deadline_ns=ns;
+    enum kernel_time_status converted=realtime ?
+        kernel_time_deadline_from_realtime(ns,deadline) :
+        kernel_time_deadline_from_monotonic(ns,deadline);
+    if(converted==KERNEL_TIME_STATUS_DEADLINE_PASSED)*deadline=1;
     else if(converted!=KERNEL_TIME_STATUS_OK)__builtin_trap();
     return 0;
 }
@@ -349,9 +351,10 @@ int64_t kernel_futex_pi(struct kernel_task *task,uint64_t address,uint32_t opera
     uint64_t timeout,enum kernel_scheduler_status *status)
 {
     unsigned command=operation&~(FUTEX_PRIVATE|FUTEX_CLOCK_REALTIME);
-    uint64_t deadline=0;int expired=0;
+    uint64_t deadline=0,deadline_ns=0;
+    int realtime=command==6 || (operation&FUTEX_CLOCK_REALTIME);
     if(timeout && (command==6 || command==13)) {
-        int error=pi_deadline(task,timeout,command==6 || (operation&FUTEX_CLOCK_REALTIME),&deadline,&expired);
+        int error=pi_deadline(task,timeout,realtime,&deadline,&deadline_ns);
         if(error)return error;
     }
     if((operation&FUTEX_CLOCK_REALTIME) && command!=13)return -KERNEL_ENOSYS;
@@ -386,13 +389,15 @@ int64_t kernel_futex_pi(struct kernel_task *task,uint64_t address,uint32_t opera
             if(action==WAITING) {
                 if(waiter_order==UINT64_MAX)__builtin_trap();
                 request.order=++waiter_order;
-                if(kernel_wait_prepare(0,deadline,1,&request.token))__builtin_trap();
+                enum kernel_scheduler_status prepared=timeout && realtime ?
+                    kernel_wait_prepare_realtime(0,deadline_ns,1,&request.token) :
+                    kernel_wait_prepare(0,deadline,1,&request.token);
+                if(prepared)__builtin_trap();
                 waiter_insert(&request);kernel_futex_pi_recalculate_locked(request.state->owner,-1);
-                if(expired)(void)kernel_wait_notify_locked(&request.token,KERNEL_WAIT_TIMEOUT);
 #if BOAROS_MAX_CPUS > 1
                 struct kernel_task *owner=request.state->owner;
                 struct kernel_cpu *cpu=__atomic_load_n(&owner->cpu,__ATOMIC_ACQUIRE);
-                spin=!expired && request.state->head==&request && owner->wait.on_cpu &&
+                spin=request.state->head==&request && owner->wait.on_cpu &&
                     owner->state==KERNEL_THREAD_STATE_RUNNING && cpu &&
                     cpu!=kernel_cpu_current() && __atomic_load_n(&cpu->current,__ATOMIC_ACQUIRE)==owner;
 #endif
@@ -455,8 +460,9 @@ int64_t kernel_futex_wait_requeue_pi(struct kernel_task *task,uint64_t address,
     uint32_t operation,uint32_t value,uint64_t timeout,uint64_t target,
     enum kernel_scheduler_status *status)
 {
-    uint64_t deadline=0;int expired=0;
-    int result=pi_deadline(task,timeout,operation&FUTEX_CLOCK_REALTIME,&deadline,&expired);
+    uint64_t deadline=0,deadline_ns=0;
+    int realtime=(operation&FUTEX_CLOCK_REALTIME)!=0;
+    int result=pi_deadline(task,timeout,realtime,&deadline,&deadline_ns);
     if(result)return result;
     if(address==target)return -KERNEL_EINVAL;
     struct kernel_futex_pi_request pi_request={.task=task,.address=target,.operation=operation,.requeue_stage=1};
@@ -478,11 +484,13 @@ int64_t kernel_futex_wait_requeue_pi(struct kernel_task *task,uint64_t address,
         uint32_t *word=(void *)((unsigned char *)pi_request.source_pin.page+(address&BOAROS_PAGE_MASK));
         if(__atomic_load_n(word,__ATOMIC_ACQUIRE)!=value){result=-KERNEL_EAGAIN;goto out;}
         KERNEL_RAW_SCOPE(raw,&kernel_wait_domain);
-        if(kernel_wait_prepare(0,deadline,1,&pi_request.token))__builtin_trap();
+        enum kernel_scheduler_status prepared=timeout && realtime ?
+            kernel_wait_prepare_realtime(0,deadline_ns,1,&pi_request.token) :
+            kernel_wait_prepare(0,deadline,1,&pi_request.token);
+        if(prepared)__builtin_trap();
         entry.priority=scheduler_base_priority(task);
         { KERNEL_IRQ_LOCK_SCOPE(queue_guard,&bucket->waiters.lock);
           futex_bind_entry_locked(&bucket->waiters,&entry,&pi_request.token); }
-        if(expired)(void)kernel_wait_notify_locked(&pi_request.token,KERNEL_WAIT_TIMEOUT);
     }
     kernel_mm_unpin_user_page(&pi_request.source_pin);
     enum kernel_wait_wake_reason reason;

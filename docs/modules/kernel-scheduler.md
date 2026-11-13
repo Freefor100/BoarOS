@@ -313,7 +313,7 @@ REQUEUE 返回唤醒数与迁移数之和，CMP_REQUEUE 先比较源字，不相
 
 值不匹配为 EAGAIN，非法地址或权限为 EFAULT，准备时缺页分配耗尽为 ENOMEM，零掩码及负 requeue 计数等非法参数为 EINVAL，超时为 ETIMEDOUT。
 
-WAIT 的超时为相对 monotonic；WAIT_BITSET 的超时为绝对 monotonic 或带 `FUTEX_CLOCK_REALTIME` 的绝对 realtime。当前没有 `clock_settime`/`settimeofday` 写入口，启动后的 realtime offset 不变，故可一次转换为 monotonic deadline；将来加入可调时钟时必须重新审查阻塞中的实时截止时刻。无超时等待的 signal 唤醒走 generic restart：用户 handler 没有 SA_RESTART 时返回 EINTR，带 SA_RESTART 时 sigreturn 后重新执行并再次比较用户字。带超时等待使用 tagged restart state 保存用户地址、expected、operation、掩码和首次调用的 monotonic absolute deadline；用户 handler 无论 flags 均看到 EINTR，没有 handler 的 stop/continue 路径经 restart_syscall 继续剩余 deadline。未支持命令为 ENOSYS。用户访问层状态损坏不能转换成普通用户错误。
+WAIT 的超时为相对 monotonic；WAIT_BITSET 的超时为绝对 monotonic 或带 `FUTEX_CLOCK_REALTIME` 的绝对 realtime。绝对 REALTIME 等待保留原始墙钟期限，由共同等待记录在提交时换算；运行期调钟在同一调度保护内重排已阻塞的期限索引，不撤销 futex 节点。无超时等待的 signal 唤醒走 generic restart：用户 handler 没有 SA_RESTART 时返回 EINTR，带 SA_RESTART 时 sigreturn 后重新执行并再次比较用户字。带超时等待使用 tagged restart state 保存用户地址、expected、operation、掩码和首次调用的绝对期限及原时钟域；用户 handler 无论 flags 均看到 EINTR，没有 handler 的 stop/continue 路径经 restart_syscall 继续剩余 deadline。未支持命令为 ENOSYS。用户访问层状态损坏不能转换成普通用户错误。
 
 `set_robust_list` 只核对 RV64 链头长度 24 字节并保存线程私有地址，允许空指针注销，不在注册时预读用户链。`get_robust_list` 支持当前线程及存活目标 TID；跨组查询按 Linux READ_REALCREDS 检查 UID/GID、capability 和目标执行安全状态的 dumpable，输出先写长度再写指针。普通 clone/fork 不继承注册，失败 exec 保留，成功 exec 清理旧链并重置。链头与节点是可变用户内存，退出时才有界读取，不作为内核对象持有引用。
 

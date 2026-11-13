@@ -226,10 +226,10 @@ static int64_t futex_wait_until(struct kernel_task *task, uint64_t address,
     struct kernel_lock_guard guards[2] = {0};
     struct futex_bucket *resolved[2];
     uint64_t deadline = 0;
-    int expired = 0;
-    if (has_timeout) {
+    int realtime = (operation & FUTEX_CLOCK_REALTIME) != 0;
+    if (has_timeout && !realtime) {
         enum kernel_time_status result = kernel_time_deadline_from_monotonic(deadline_ns, &deadline);
-        if (result == KERNEL_TIME_STATUS_DEADLINE_PASSED) expired = 1;
+        if (result == KERNEL_TIME_STATUS_DEADLINE_PASSED) deadline = 1;
         else if (result != KERNEL_TIME_STATUS_OK) {
             *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
             return 0;
@@ -263,17 +263,19 @@ static int64_t futex_wait_until(struct kernel_task *task, uint64_t address,
         if (*status != KERNEL_SCHEDULER_STATUS_OK || result) return result;
         kernel_mm_unpin_user_page(&pin);
     }
-    if (actual != value || expired) {
+    if (actual != value) {
         futex_unlock_buckets(guards);
         if (pin.registration) kernel_mm_unpin_user_page(&pin);
         futex_key_release(&key);
-        return actual != value ? -KERNEL_EAGAIN : -KERNEL_ETIMEDOUT;
+        return -KERNEL_EAGAIN;
     }
     struct kernel_futex_entry entry={.node={.task=task},.key=key,.bitset=bitset};
     struct kernel_futex_request request={.task=task,.entries=&entry,.count=1};
     if(task->futex_request)__builtin_trap();
     task->futex_request=&request;
-    *status=kernel_wait_prepare(0,deadline,1,&request.token);
+    *status=has_timeout && realtime ?
+        kernel_wait_prepare_realtime(0,deadline_ns,1,&request.token) :
+        kernel_wait_prepare(0,deadline,1,&request.token);
     if(!*status) {
         entry.priority=futex_wait_priority(task);
         KERNEL_IRQ_LOCK_SCOPE(guard,&resolved[0]->waiters.lock);
@@ -348,12 +350,8 @@ int64_t kernel_futex(struct kernel_task *task, uint64_t address,
                 (uint64_t)duration.nanoseconds;
         if (nanoseconds > INT64_MAX) nanoseconds = INT64_MAX;
         if (command == FUTEX_WAIT_BITSET) {
-            uint64_t absolute = (uint64_t)nanoseconds;
-
-            if ((operation & FUTEX_CLOCK_REALTIME) != 0U) {
-                uint64_t offset = kernel_time_boot_realtime_offset();
-                deadline_ns = absolute <= offset ? 0U : absolute - offset;
-            } else deadline_ns = absolute;
+            /* Keep the original wall deadline for clock changes and restart. */
+            deadline_ns = (uint64_t)nanoseconds;
         } else {
             now = kernel_time_monotonic_ns();
             deadline_ns = now >= INT64_MAX ||

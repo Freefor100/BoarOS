@@ -24,7 +24,7 @@ uint32_t kernel_time_is_initialized(void);
 /* Nanoseconds since boot, derived from the arch time-counter. */
 uint64_t kernel_time_monotonic_ns(void);
 
-/* Wall-clock nanoseconds: boot reading plus monotonic. */
+/* Wall-clock nanoseconds: mutable offset plus monotonic, read consistently. */
 uint64_t kernel_time_realtime_ns(void);
 
 /* Init and each delivered timer interrupt publish one actual counter sample.
@@ -37,7 +37,7 @@ uint64_t kernel_time_coarse_resolution_ns(void);
 /* Converts time-counter ticks to nanoseconds (0 before init). */
 uint64_t kernel_time_ticks_to_ns(uint64_t ticks);
 
-/* The wall-clock reading captured at boot (0 without an RTC source). */
+/* Current REALTIME minus MONOTONIC offset; changed only by clock control. */
 uint64_t kernel_time_boot_realtime_offset(void);
 
 /*
@@ -49,4 +49,10 @@ enum kernel_time_status kernel_time_deadline_from_monotonic(
     uint64_t target_monotonic_ns,
     uint64_t *deadline);
 
+/* Caller serializes clock control and holds the scheduler wait domain so that
+ * publishing the offset and retargeting committed waits are one operation. */
+enum kernel_time_status kernel_time_set_realtime(uint64_t nanoseconds);
+void kernel_time_get_timezone(int32_t timezone[2]);
+void kernel_time_set_timezone(const int32_t timezone[2]);
+enum kernel_time_status kernel_time_deadline_from_realtime(uint64_t nanoseconds, uint64_t *deadline);
 #endif

@@ -398,6 +398,7 @@ COMMON_C_SOURCES := \
 	kernel/syscall/msg.c \
 	kernel/syscall/mqueue.c \
 	kernel/syscall/time.c \
+	kernel/syscall/uts.c \
 	kernel/syscall/event.c \
 	kernel/credentials.c \
 	kernel/posix_acl.c \
@@ -409,6 +410,7 @@ COMMON_C_SOURCES := \
 	kernel/syscall/sched.c \
 	kernel/tick.c \
 	kernel/time.c \
+	kernel/uts.c \
 	kernel/cost.c \
 	kernel/sched/cost.c \
 	net/socket.c \

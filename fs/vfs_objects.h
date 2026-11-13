@@ -166,8 +166,10 @@ struct kernel_vfs_backend {
      * releases it and creates a new one after seek to offset zero. */
     int (*snapshot)(struct kernel_vfs_node *node, struct kernel_heap *heap,
         char **buffer, size_t *length);
-    /* Controls use a complete kernel buffer; failure never commits user offset. */
-    int (*control)(struct kernel_vfs_node *node, int write, uint64_t offset,
+    /* Controls use a complete kernel buffer and return the new position,
+     * which can differ from old position + accepted bytes. The files layer
+     * commits that position only after successful user copying. */
+    int (*control)(struct kernel_vfs_node *node, int write, uint64_t *offset,
         char *buffer, size_t size, size_t *count);
     int (*truncate)(struct kernel_vfs_node *node, uint64_t size, uint64_t *actual, int *changed);
     int (*fallocate)(struct kernel_vfs_node *node, unsigned mode, uint64_t offset,

@@ -22,7 +22,7 @@ int64_t kernel_futex_waitv(struct kernel_task *task,uint64_t address,unsigned co
         *status=KERNEL_SCHEDULER_STATUS_INVALID_STATE;return 0;
     }
     if(flags || !address || !count || count>128)return -KERNEL_EINVAL;
-    uint64_t deadline=0,deadline_ns=0;int expired=0;
+    uint64_t deadline=0,deadline_ns=0;
     if(timeout) {
         if(clock!=0 && clock!=1)return -KERNEL_EINVAL;
         struct {int64_t seconds,nanoseconds;} t;size_t copied;
@@ -30,10 +30,11 @@ int64_t kernel_futex_waitv(struct kernel_task *task,uint64_t address,unsigned co
         if(t.seconds<0 || t.nanoseconds<0 || t.nanoseconds>=1000000000)return -KERNEL_EINVAL;
         __uint128_t ns=(__uint128_t)(uint64_t)t.seconds*1000000000+(uint64_t)t.nanoseconds;
         deadline_ns=ns>INT64_MAX?INT64_MAX:(uint64_t)ns;
-        if(!clock) {uint64_t offset=kernel_time_boot_realtime_offset();deadline_ns=deadline_ns<=offset?0:deadline_ns-offset;}
-        enum kernel_time_status result=kernel_time_deadline_from_monotonic(deadline_ns,&deadline);
-        if(result==KERNEL_TIME_STATUS_DEADLINE_PASSED)expired=1;
-        else if(result!=KERNEL_TIME_STATUS_OK)__builtin_trap();
+        if(clock) {
+            enum kernel_time_status result=kernel_time_deadline_from_monotonic(deadline_ns,&deadline);
+            if(result==KERNEL_TIME_STATUS_DEADLINE_PASSED)deadline=1;
+            else if(result!=KERNEL_TIME_STATUS_OK)__builtin_trap();
+        }
     }
     struct kernel_futex_request request={.task=task,.heap=task->files.heap,.count=count};
     enum kernel_heap_status allocated=kernel_heap_allocate_zeroed(request.heap,count,sizeof(*request.entries),(void **)&request.entries);
@@ -58,7 +59,10 @@ int64_t kernel_futex_waitv(struct kernel_task *task,uint64_t address,unsigned co
             result=futex_prepare(task,&entry->address,1,entry->operation,0,0,&entry->key,0,status);
             if(result || *status)goto out;
         }
-        if(kernel_wait_prepare(0,deadline,1,&request.token))__builtin_trap();
+        enum kernel_scheduler_status prepared_wait=timeout && !clock ?
+            kernel_wait_prepare_realtime(0,deadline_ns,1,&request.token) :
+            kernel_wait_prepare(0,deadline,1,&request.token);
+        if(prepared_wait)__builtin_trap();
         unsigned priority=futex_wait_priority(task);
         unsigned retry=count;struct futex_bucket *busy=0;
         for(unsigned i=0;i<count;i++) {
@@ -83,7 +87,7 @@ int64_t kernel_futex_waitv(struct kernel_task *task,uint64_t address,unsigned co
             if(result || consumed(&request)>=0)break;
         }
         enum kernel_wait_wake_reason reason=KERNEL_WAIT_WOKEN;
-        if(!result && retry==count && consumed(&request)<0 && !expired && !*status)
+        if(!result && retry==count && consumed(&request)<0 && !*status)
             *status=kernel_wait_park(&request.token,&reason);
         /* finish会等待在途游标；此后再读取获胜项，包含清理期间真实发生的wake。 */
         if(kernel_wait_finish(&request.token))__builtin_trap();
@@ -103,7 +107,7 @@ int64_t kernel_futex_waitv(struct kernel_task *task,uint64_t address,unsigned co
             }
             continue;
         }
-        if(timeout && (expired || kernel_time_monotonic_ns()>=deadline_ns)) {result=-KERNEL_ETIMEDOUT;goto out;}
+        if(timeout && reason==KERNEL_WAIT_TIMEOUT) {result=-KERNEL_ETIMEDOUT;goto out;}
         if(reason==KERNEL_WAIT_SIGNALLED) {kernel_signal_note_syscall_restart(task);result=-KERNEL_ERESTARTSYS;goto out;}
         release_keys(&request);
     }

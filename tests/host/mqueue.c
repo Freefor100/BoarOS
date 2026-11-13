@@ -79,6 +79,8 @@ uint64_t kernel_time_realtime_ns(void){return now_ns;}
 uint64_t kernel_time_boot_realtime_offset(void){return 0;}
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t ns,uint64_t *deadline)
 {*deadline=ns;return ns<=now_ns?KERNEL_TIME_STATUS_DEADLINE_PASSED:0;}
+enum kernel_time_status kernel_time_deadline_from_realtime(uint64_t ns,uint64_t *deadline)
+{*deadline=ns<=now_ns?now_ns+1:ns;return ns<=now_ns?KERNEL_TIME_STATUS_DEADLINE_PASSED:0;}
 enum kernel_task_status kernel_task_get_rlimit(const struct kernel_task *task,uint32_t resource,struct kernel_rlimit64 *limit)
 {(void)task;assert(resource==KERNEL_RLIMIT_MSGQUEUE);*limit=(struct kernel_rlimit64){819200,819200};return 0;}
 int kernel_uid_account_mqueue_charge(struct kernel_uid_account *a,uint64_t bytes,uint64_t limit)

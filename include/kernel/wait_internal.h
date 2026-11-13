@@ -15,6 +15,9 @@ struct kernel_wait_record {
     uint64_t generation;
 #endif
     uint64_t deadline;
+    /* Nonzero original absolute REALTIME ns. Prepared waits convert at commit;
+     * committed deadlines are reindexed atomically with a wall-clock step. */
+    uint64_t realtime_deadline;
     struct kernel_wait_node *nodes;
 #if BOAROS_MAX_CPUS == 1
     uint32_t phase, reason, interruptible;

@@ -7,9 +7,12 @@
 #ifndef __ASSEMBLER__
 #include <stdint.h>
 
-/* Shared by the kernel writer and the read-only userspace mapping. The
- * multiplier is published last; boot parameters then remain immutable. */
+/* Mutable clock offset and timezone are published under sequence. Readers
+ * sample the counter inside that sequence; monotonic itself never steps. */
 struct kernel_vdso_time_data {
+    uint32_t sequence;
+    int32_t minuteswest, dsttime;
+    uint32_t reserved;
     uint64_t multiplier;
     uint64_t boot_realtime_ns;
     uint64_t coarse_monotonic_ns;

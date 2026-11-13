@@ -214,7 +214,7 @@ static int check_domain(const struct kernel_vfs_node *node,const struct kernel_h
     return n->stat.ino!=node->inode || n->memory!=node->memory ||
         kernel_memory_object_check_domain(n->memory,heap,allocator)?-KERNEL_EINVAL:0;
 }
-static int pin_control(struct kernel_vfs_node *n,int write,uint64_t offset,char *bytes,size_t size,size_t *count)
+static int pin_control(struct kernel_vfs_node *n,int write,uint64_t *offset,char *bytes,size_t size,size_t *count)
 {(void)n;(void)write;(void)offset;(void)bytes;(void)size;*count=0;return -KERNEL_EINVAL;}
 static int unmount(struct kernel_vfs_mount *m)
 {

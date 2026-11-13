@@ -18,4 +18,5 @@ extern uint64_t kernel_timer_fd_next;
 static inline uint64_t kernel_timer_fd_deadline(void)
 { return __atomic_load_n(&kernel_timer_fd_next,__ATOMIC_ACQUIRE); }
 void kernel_timer_fd_expire(uint64_t);
+void kernel_timer_fd_clock_changed(void);
 #endif

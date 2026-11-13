@@ -157,68 +157,6 @@
 #define LINUX_SYSCALL_RT_SIGRETURN 139U
 #define LINUX_SYSCALL_RESTART_SYSCALL 128U
 #define LINUX_EXIT_STATUS_MASK UINT64_C(0xff)
-#define LINUX_UTS_FIELD_SIZE 65U
-
-#ifndef BOAROS_UTS_MACHINE
-#error "BOAROS_UTS_MACHINE must name the Linux architecture"
-#endif
-
-struct linux_new_utsname {
-    char sysname[LINUX_UTS_FIELD_SIZE];
-    char nodename[LINUX_UTS_FIELD_SIZE];
-    char release[LINUX_UTS_FIELD_SIZE];
-    char version[LINUX_UTS_FIELD_SIZE];
-    char machine[LINUX_UTS_FIELD_SIZE];
-    char domainname[LINUX_UTS_FIELD_SIZE];
-};
-
-static const struct linux_new_utsname kernel_utsname = {
-    .sysname = "Linux",
-    .nodename = "boaros",
-    /* glibc checks this ABI baseline before main; it is not feature coverage. */
-    .release = "5.19.0-boaros",
-    .version = "#1 BoarOS 0.1.0",
-    .machine = BOAROS_UTS_MACHINE,
-    .domainname = "(none)",
-};
-
-_Static_assert(sizeof(struct linux_new_utsname) == 390U,
-               "Linux new_utsname ABI size must remain 390 bytes");
-
-static enum kernel_syscall_status syscall_handle_uname(
-    struct kernel_task *caller,
-    uint64_t user_address,
-    struct kernel_syscall_result *decoded)
-{
-    struct kernel_mm *mm;
-    size_t copied;
-    enum kernel_task_status task_status;
-    enum kernel_uaccess_status access_status;
-
-    task_status = kernel_task_mm_borrow_mutable(caller, &mm);
-    if (task_status != KERNEL_TASK_STATUS_OK) {
-        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-    }
-    access_status = kernel_copy_to_user(mm,
-                                        user_address,
-                                        &kernel_utsname,
-                                        sizeof(kernel_utsname),
-                                        &copied);
-    if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
-        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
-        decoded->value = -KERNEL_EFAULT;
-        return KERNEL_SYSCALL_STATUS_OK;
-    }
-    if (access_status != KERNEL_UACCESS_STATUS_OK ||
-        copied != sizeof(kernel_utsname)) {
-        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-    }
-    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
-    decoded->value = 0;
-    return KERNEL_SYSCALL_STATUS_OK;
-}
-
-
 struct linux_sysinfo {
     int64_t uptime;
     uint64_t loads[3], totalram, freeram, sharedram, bufferram, totalswap, freeswap;
@@ -770,9 +708,8 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
-    } else if (request->number == LINUX_SYSCALL_UNAME) {
-        if (syscall_handle_uname(caller,
-                         request->arguments[0],
+    } else if (request->number == LINUX_SYSCALL_UNAME || request->number == 161U || request->number == 162U) {
+        if (syscall_handle_uts(caller, request,
                          &decoded) != KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
@@ -850,6 +787,9 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
     } else if (request->number == LINUX_SYSCALL_GETRANDOM) {
         if (syscall_handle_getrandom(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 112U || request->number == 170U) {
+        if (syscall_handle_settime(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_CLOCK_GETTIME) {
         if (syscall_handle_clock_gettime(caller, request, &decoded) !=

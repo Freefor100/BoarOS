@@ -18,6 +18,7 @@
 #include <kernel/task.h>
 #include <kernel/tick.h>
 #include <kernel/time.h>
+#include <kernel/uts.h>
 #include <kernel/tty_task.h>
 #include <kernel/socket.h>
 #include <kernel/bpf.h>
@@ -51,6 +52,8 @@
 #define PROC_NET_INODE UINT64_C(20)
 #define PROC_NET_ROUTE_INODE UINT64_C(21)
 #define PROC_UNPRIVILEGED_BPF_INODE UINT64_C(22)
+#define PROC_HOSTNAME_INODE UINT64_C(23)
+#define PROC_DOMAINNAME_INODE UINT64_C(24)
 #define PROC_TASK_DIR_KIND 10U
 #define PROC_TID_DIR_KIND 11U
 #define PROC_TID_STAT_KIND 12U
@@ -265,6 +268,10 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
             *inode = PROC_PID_MAX_INODE;
         else if(length==25U && !memcmp(name,"unprivileged_bpf_disabled",25U))
             *inode=PROC_UNPRIVILEGED_BPF_INODE;
+        else if (length == 8U && !memcmp(name, "hostname", 8U))
+            *inode = PROC_HOSTNAME_INODE;
+        else if (length == 10U && !memcmp(name, "domainname", 10U))
+            *inode = PROC_DOMAINNAME_INODE;
         else return -KERNEL_ENOENT;
         *mode = KERNEL_VFS_S_IFREG |
             (*inode == PROC_PID_MAX_INODE ? 0444U : 0644U);
@@ -454,6 +461,7 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
          inode != PROC_KERNEL_INODE && inode != PROC_RT_PERIOD_INODE &&
          inode != PROC_RT_RUNTIME_INODE && inode != PROC_PID_MAX_INODE &&
          inode != PROC_UNPRIVILEGED_BPF_INODE &&
+         inode != PROC_HOSTNAME_INODE && inode != PROC_DOMAINNAME_INODE &&
          inode != PROC_SYSVIPC_INODE && inode != PROC_SYSVIPC_SHM_INODE &&
          inode != PROC_SYSVIPC_SEM_INODE && inode != PROC_SYSVIPC_MSG_INODE &&
          inode != PROC_NET_INODE && inode != PROC_NET_ROUTE_INODE &&
@@ -490,7 +498,8 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
         ((inode == PROC_MEMINFO_INODE || inode == PROC_UPTIME_INODE ||
           inode == PROC_PID_MAX_INODE || inode == PROC_SYSVIPC_SHM_INODE ||
           inode == PROC_SYSVIPC_SEM_INODE || inode == PROC_SYSVIPC_MSG_INODE ||
-          inode == PROC_NET_ROUTE_INODE) &&
+          inode == PROC_NET_ROUTE_INODE || inode == PROC_HOSTNAME_INODE ||
+          inode == PROC_DOMAINNAME_INODE) &&
          (mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG))
         return -KERNEL_EINVAL;
     if (inode >= (UINT64_C(1) << 30U)) {
@@ -510,7 +519,8 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
     if (status != KERNEL_HEAP_STATUS_OK)
         return status == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
     node->generated_control = inode == PROC_RT_PERIOD_INODE ||
-                              inode == PROC_RT_RUNTIME_INODE || inode==PROC_UNPRIVILEGED_BPF_INODE;
+                              inode == PROC_RT_RUNTIME_INODE || inode==PROC_UNPRIVILEGED_BPF_INODE ||
+                              inode == PROC_HOSTNAME_INODE || inode == PROC_DOMAINNAME_INODE;
 #if BOAROS_COST_DIAGNOSTICS
     node->generated_control |= inode == PROC_COST_CONTROL_INODE;
     node->generated_diagnostic = inode == PROC_COST_INODE || inode == PROC_COST_CONTROL_INODE ||
@@ -535,6 +545,11 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
 
 static int proc_permission(struct kernel_vfs_node *node,const struct kernel_credentials *cred,unsigned mask)
 {
+    if (node->inode == PROC_HOSTNAME_INODE || node->inode == PROC_DOMAINNAME_INODE) {
+        /* sysctl table permissions use effective UID and grant no DAC bypass. */
+        unsigned granted = cred->euid == 0 ? 6U : 4U;
+        return mask & ~granted & 7U ? -KERNEL_EACCES : 0;
+    }
     if(node->inode>=(UINT64_C(1)<<30U) &&
         (proc_inode_kind(node->inode)==PROC_PID_FDINFO_DIR_KIND ||
          proc_inode_kind(node->inode)==PROC_PID_FDINFO_KIND)) {
@@ -638,11 +653,12 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
         return 1;
     }
     if (directory == PROC_SYS_INODE || directory == PROC_KERNEL_INODE) {
-        if (position > (directory == PROC_SYS_INODE ? 2U : 5U)) return 0;
+        if (position > (directory == PROC_SYS_INODE ? 2U : 7U)) return 0;
         const char *entry = position == 0 ? "." : position == 1 ? ".." :
             directory == PROC_SYS_INODE ? "kernel" : position == 2 ?
             "sched_rt_period_us" : position == 3 ? "sched_rt_runtime_us" :
-            position==4?"pid_max":"unprivileged_bpf_disabled";
+            position == 4 ? "pid_max" : position == 5 ? "unprivileged_bpf_disabled" :
+            position == 6 ? "hostname" : "domainname";
         size_t length = strlen(entry) + 1U;
         if (name_size < length) return -KERNEL_ERANGE;
         memcpy(name, entry, length);
@@ -651,7 +667,8 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
             (directory == PROC_SYS_INODE ? PROC_ROOT_INODE : PROC_SYS_INODE) :
             directory == PROC_SYS_INODE ? PROC_KERNEL_INODE : position == 2 ?
             PROC_RT_PERIOD_INODE : position == 3 ? PROC_RT_RUNTIME_INODE :
-            position==4?PROC_PID_MAX_INODE:PROC_UNPRIVILEGED_BPF_INODE;
+            position == 4 ? PROC_PID_MAX_INODE : position == 5 ? PROC_UNPRIVILEGED_BPF_INODE :
+            position == 6 ? PROC_HOSTNAME_INODE : PROC_DOMAINNAME_INODE;
         *type = position < 2 || directory == PROC_SYS_INODE ? 4U : 8U;
         return 1;
     }
@@ -1101,20 +1118,44 @@ static unsigned proc_digit(unsigned char c)
 }
 
 static int proc_control(struct kernel_vfs_node *node, int write,
-    uint64_t offset, char *buffer, size_t size, size_t *count)
+    uint64_t *offset, char *buffer, size_t size, size_t *count)
 {
     *count = 0;
 #if BOAROS_COST_DIAGNOSTICS
     if (node->inode == PROC_COST_CONTROL_INODE) {
         if (!write) return -KERNEL_EACCES;
         int result = kernel_cost_control(buffer, size);
-        if (!result) *count = size;
+        if (!result) { *count = size; *offset += size; }
         return result;
     }
 #endif
     if (!size) return 0;
+    if (node->inode == PROC_HOSTNAME_INODE || node->inode == PROC_DOMAINNAME_INODE) {
+        enum kernel_uts_name which = node->inode == PROC_HOSTNAME_INODE ?
+            KERNEL_UTS_HOSTNAME : KERNEL_UTS_DOMAINNAME;
+        if (write) {
+            size_t length = 0;
+            while (length < size && length < KERNEL_UTS_NAME_MAX &&
+                   buffer[length] && buffer[length] != '\n') length++;
+            if (kernel_uts_name_write(which, *offset, buffer, length)) *offset += size;
+            *count = size;
+        } else {
+            struct kernel_utsname name;
+            kernel_uts_snapshot(&name);
+            const char *field = which == KERNEL_UTS_HOSTNAME ? name.nodename : name.domainname;
+            size_t length = strlen(field);
+            if (*offset > length) return 0;
+            length -= (size_t)*offset;
+            if (length > size) length = size;
+            if (length) memcpy(buffer, field + *offset, length);
+            if (length < size) buffer[length++] = '\n';
+            *count = length;
+            *offset += length;
+        }
+        return 0;
+    }
     if (!write) {
-        if (offset) return 0;
+        if (*offset) return 0;
         int64_t period, runtime;
         kernel_scheduler_rt_bandwidth_get(&period, &runtime);
         int64_t value = node->inode==PROC_UNPRIVILEGED_BPF_INODE?kernel_bpf_unprivileged_get():
@@ -1127,10 +1168,11 @@ static int proc_control(struct kernel_vfs_node *node, int write,
         if (length > size) length = size;
         memcpy(buffer, text, length);
         *count = length;
+        *offset += length;
         return 0;
     }
     /* Linux first-position-only sysctl still copies the whole write first. */
-    if (offset) { *count = size; return 0; }
+    if (*offset) { *count = size; *offset += size; return 0; }
     size_t limit = size > BOAROS_PAGE_SIZE - 1U ? BOAROS_PAGE_SIZE - 1U : size;
     size_t position = 0;
     while (position < limit && proc_space((unsigned char)buffer[position])) position++;
@@ -1167,6 +1209,7 @@ static int proc_control(struct kernel_vfs_node *node, int write,
     if (result) return result;
     while (position < limit && proc_space((unsigned char)buffer[position])) position++;
     *count = size - (limit - position);
+    *offset += *count;
     return 0;
 }
 
