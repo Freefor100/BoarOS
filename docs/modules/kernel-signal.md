@@ -39,6 +39,16 @@ handler与sigtimedwait取得同一规范记录，用户输出在消费之后发�
 原生POSIX定时器的通知使用创建时预留记录和额度，凭内部来源识别重装行为；handler、sigwaitinfo和signalfd在消费时共用代次核对和超期计算。单次已到期查询、忽略停放、进程组控制与对象寿命见[POSIX定时器](kernel-time.md#posix-定时器对象)。
 
 
+## SIGIO 异步 I/O 通知
+
+`F_SETOWN/F_SETOWN_EX` 在 OFD 中保存目标的 PID 身份引用、目标种类及设置者的 real/effective UID；dup、fork 和 FD 传递共用这份配置。投递时对原目标线程的当前 real/saved UID 检查权限，随后按线程、进程或进程组选择队列；进程定向 owner 指向非组长 TID 时仍使用该线程授权，共享 pending 归其线程组。退出或 exec 撤下原身份后，不按复用的数字寻找新目标。
+
+管道、socket、TTY 和 inotify 从实际事件发布 `POLL_IN/OUT/ERR/HUP` 等原因，异步订阅与普通 poll 唤醒分开维护。源对象保护内捕获游标借用，保护外执行通知；`si_fd` 保留启用时的编号，别名上的无变化 `F_SETFL` 不改变它。最后 OFD 关闭先撤下订阅并结束所有回调借用，再释放配置及后备。
+
+未设置替代信号时发送普通 SIGIO，使用 `SI_KERNEL`。`F_SETSIG` 选择的信号携带完整的 `si_code/si_band/si_fd`，共用 handler、sigtimedwait 和 signalfd 的消费过程；与故障或子进程代码歧义的信号使用 `SI_SIGIO`。实时通知逐事件排队，额度或记录分配不足时按 Linux 回退为普通 SIGIO，不改变已经完成的 I/O 结果。
+
+通知回调不进入内存回收或等待：信号索引及记录使用同一 slab/buddy 实现的一次尝试分配，所有候选准备均在源对象短保护外。SIGCONT 的恢复及其父进程 SIGCHLD 通知沿用同一非阻塞发送方式，保留 stop/continue 取消及组恢复规则；未采用的候选和消费后的记录仍由原释放路径归还。
+
 ## signalfd与等待源
 
 `signalfd4(74)`创建独立OFD，保存接收掩码；dup/fork共享该掩码和NONBLOCK状态，CLOEXEC属于FD槽。更新已有FD只替换掩码，创建标志不改变现有FD。SIGKILL/SIGSTOP从接收集合移除，信号的blocked掩码由线程另行维护。

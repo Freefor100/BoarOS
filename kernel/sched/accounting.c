@@ -98,8 +98,9 @@ void scheduler_fair_account(struct kernel_task *task,uint64_t total)
     uint64_t advance=kernel_sched_fair_delta(&task->scheduling,delta);
     if(advance>UINT64_MAX-task->ready_node.fair.key)__builtin_trap();
     task->ready_node.fair.key+=advance;
-    uint64_t used=task->scheduling.fair_slice_used+delta;
-    task->scheduling.fair_slice_used=used>KERNEL_SCHED_FAIR_NS?KERNEL_SCHED_FAIR_NS:(uint32_t)used;
+    uint32_t used=task->scheduling.fair_slice_used;
+    task->scheduling.fair_slice_used=delta>=KERNEL_SCHED_FAIR_MAX_NS-used
+        ? KERNEL_SCHED_FAIR_MAX_NS : used+(uint32_t)delta;
 }
 void scheduler_cpu_time_switch(struct kernel_task *previous,struct kernel_task *next)
 {

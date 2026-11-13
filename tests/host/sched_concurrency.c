@@ -339,8 +339,8 @@ static void retired_cursor_chain(void)
     assert(disposals == 3 && !scheduler.retired_pending && !scheduler.task_count);
 }
 
-static void parent_callback(struct kernel_wait_node *node, uint32_t reason)
-{
+static void parent_callback(struct kernel_wait_node *node, uint32_t reason,uint64_t event)
+{ (void)event;
     struct kernel_task *parent = node->context;
     assert(reason == KERNEL_WAIT_WOKEN && parent->storage_borrows == 1);
     assert(parent->child_exit_queue.borrows && !active_cpu->raw_locks);
@@ -973,7 +973,8 @@ static void nice_permissions(void)
     assert(!kernel_task_sched_setattr(&tasks[0],0,&a)&&tasks[0].scheduling.policy==KERNEL_SCHED_BATCH);
     a.policy=KERNEL_SCHED_OTHER;a.flags=16;a.nice=-20;a.runtime=1;
     assert(!kernel_task_sched_setattr(&tasks[0],0,&a)&&tasks[0].scheduling.nice==4&&tasks[0].scheduling.policy==KERNEL_SCHED_BATCH);
-    a.flags=0;a.runtime=1;assert(kernel_task_sched_setattr(&tasks[0],0,&a)==-KERNEL_ENOTSUP);
+    a.flags=0;a.runtime=1;a.nice=4;
+    assert(!kernel_task_sched_setattr(&tasks[0],0,&a) && tasks[0].scheduling.fair_slice_ns==100000);
     a=(struct kernel_sched_attr){.size=56,.policy=KERNEL_SCHED_FIFO,.priority=30,.nice=-20};
     assert(!kernel_task_sched_setattr(&tasks[0],0,&a)&&tasks[0].scheduling.nice==4&&tasks[0].scheduling.priority==30);
     a=(struct kernel_sched_attr){.size=56,.policy=KERNEL_SCHED_OTHER,.nice=4};
@@ -1036,13 +1037,98 @@ static void rt_parameter_queue_order(void)
     assert(!kernel_task_sched_setattr(&tasks[0],0,&attr));
     assert(!kernel_task_priority(&tasks[0],1,0,0,9));
     assert(kernel_sched_pick(&cpus[0].runqueue,1)==&tasks[0].ready_node && scheduler_base_priority(&tasks[0])==0);
+    attr.nice=9;attr.runtime=2000000;
+    unsigned effective=(unsigned)tasks[0].scheduling.priority,boost=tasks[0].pi_base_priority;
+    assert(!kernel_task_sched_setattr(&tasks[0],0,&attr));
+    assert(tasks[0].scheduling.fair_slice_ns==2000000 && tasks[0].pi_base_priority==boost &&
+        (unsigned)tasks[0].scheduling.priority==effective && tasks[0].pi_owned==&owned);
+    assert(kernel_sched_pick(&cpus[0].runqueue,1)==&tasks[0].ready_node);
     {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);tasks[0].pi_owned=0;scheduler_pi_priority_locked(&tasks[0],0,0);
      ready_remove_locked(&tasks[0]);ready_remove_locked(&tasks[1]);tasks[2].pi_request=0;}
     puts("RT parameter updates retain FIFO order, demotion head and PI owner's position");
 }
 
+static void fair_slice_updates(void)
+{
+    scheduler=(struct kernel_scheduler){.rt_configuration={1000000000,950000000}};
+    kernel_wait_domain_init();now=0;
+    struct kernel_credentials root={.effective=UINT64_C(1)<<KERNEL_CAP_SYS_NICE};
+    for(unsigned i=0;i<2;i++) {
+        kernel_cpu_initialize(&cpus[i],i,0);active_cpu=&cpus[i];cpus[i].logical_id=i;
+        cpus[i].state=KERNEL_CPU_ONLINE;idles[i]=(struct kernel_task){.idle=1};cpus[i].current=&idles[i];
+        scheduler_cpu_initialize(&cpus[i],&idles[i],0);
+    }
+    active_cpu=&cpus[0];
+    tasks[0]=(struct kernel_task){.magic=KERNEL_THREAD_MAGIC,.accounted=1,.tid_owned=1,
+        .arch.user_mode=1,.credentials=&root,.cpu=&cpus[1],.cpu_mask=2};
+    const uint64_t requests[]={1,99999,100000,2000000,100000000,UINT64_MAX,0};
+    const uint32_t saved[]={100000,100000,100000,2000000,100000000,100000000,0};
+    for(unsigned policy=0;policy<3;policy++) {
+        struct kernel_sched_attr a={.size=56,.policy=policy==0?KERNEL_SCHED_OTHER:policy==1?KERNEL_SCHED_BATCH:KERNEL_SCHED_IDLE};
+        for(unsigned i=0;i<sizeof(requests)/sizeof(*requests);i++) {
+            a.runtime=requests[i];assert(!kernel_task_sched_setattr(&tasks[0],0,&a));
+            assert(tasks[0].scheduling.fair_slice_ns==saved[i]);
+        }
+    }
+    struct kernel_sched_attr a={.size=56,.policy=KERNEL_SCHED_OTHER,.nice=5,.runtime=30000000};
+    assert(!kernel_task_sched_setattr(&tasks[0],0,&a));
+    tasks[0].state=KERNEL_THREAD_STATE_RUNNING;tasks[0].wait.on_cpu=1;
+    cpus[1].current=cpus[1].accounting_owner=&tasks[0];tasks[0].accounting_mode=1;
+    now=5000000;a.runtime=2000000;
+    assert(!kernel_task_sched_setattr(&tasks[0],0,&a));
+    assert(tasks[0].fair_runtime_seen==5000000 && tasks[0].scheduling.fair_slice_used==5000000);
+    assert(kernel_cpu_schedule_requested(&cpus[1]) && (cpus[1].events&1U));
+    assert(!kernel_cpu_schedule_requested(&cpus[0]));
+    uint32_t remainder=tasks[0].scheduling.fair_remainder;
+    uint64_t key=tasks[0].ready_node.fair.key;
+    kernel_cpu_consume_schedule(&cpus[1]);cpus[1].events=0;
+    now=6000000;assert(!kernel_task_sched_setattr(&tasks[0],0,&a));
+    assert(!kernel_cpu_schedule_requested(&cpus[1]) && !cpus[1].events);
+    assert(tasks[0].fair_runtime_seen==5000000 && tasks[0].ready_node.fair.key==key);
+    a.runtime=20000000;assert(!kernel_task_sched_setattr(&tasks[0],0,&a));
+    assert(tasks[0].scheduling.fair_slice_used==6000000 && tasks[0].scheduling.fair_remainder!=remainder);
+    /* Save a nonzero fractional remainder after settling the old interval. */
+    remainder=tasks[0].scheduling.fair_remainder;
+    a.runtime=100000;assert(!kernel_task_sched_setattr(&tasks[0],0,&a));
+    assert(tasks[0].scheduling.fair_slice_used==6000000 && tasks[0].scheduling.fair_remainder==remainder);
+    tasks[1]=(struct kernel_task){.magic=KERNEL_THREAD_MAGIC,.accounted=1,.cpu=&cpus[1],
+        .cpu_mask=2,.state=KERNEL_THREAD_STATE_READY};
+    { KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+      ready_enqueue_locked(&tasks[1],SCHED_READY_LOCAL);
+      assert(scheduler_deadline_locked(&cpus[1])==now+1);
+      ready_remove_locked(&tasks[1]); }
+    assert(!kernel_task_sched_set(&tasks[0],0,KERNEL_SCHED_BATCH,0,0));
+    assert(!kernel_task_sched_set(&tasks[0],0,0,0,1));
+    assert(!kernel_task_priority(&tasks[0],1,0,0,6));
+    assert(tasks[0].scheduling.fair_slice_ns==100000 && tasks[0].scheduling.fair_slice_used==6000000);
+    a=(struct kernel_sched_attr){.size=56,.policy=KERNEL_SCHED_OTHER,.flags=16,.runtime=UINT64_MAX,.nice=-20};
+    assert(!kernel_task_sched_setattr(&tasks[0],0,&a));
+    assert(tasks[0].scheduling.policy==KERNEL_SCHED_BATCH && tasks[0].scheduling.nice==6 && tasks[0].scheduling.fair_slice_ns==100000);
+    a=(struct kernel_sched_attr){.size=56,.policy=KERNEL_SCHED_FIFO,.priority=20,.runtime=UINT64_MAX};
+    assert(!kernel_task_sched_setattr(&tasks[0],0,&a));
+    assert(tasks[0].scheduling.fair_slice_ns==100000);
+    assert(!kernel_task_sched_set(&tasks[0],0,KERNEL_SCHED_OTHER,0,0));
+    /* Saturate actual execution at the largest supported request, not 10ms. */
+    scheduler_fair_account(&tasks[0],tasks[0].fair_runtime_seen+200000000);
+    assert(tasks[0].scheduling.fair_slice_used==KERNEL_SCHED_FAIR_MAX_NS);
+    tasks[0].wait.on_cpu=0;cpus[1].accounting_owner=0;cpus[1].current=&idles[1];
+    tasks[0].state=KERNEL_THREAD_STATE_READY;
+    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);ready_enqueue_locked(&tasks[0],SCHED_READY_LOCAL);ready_enqueue_locked(&tasks[1],SCHED_READY_LOCAL);}
+    struct kernel_sched_node *first=kernel_sched_pick(&cpus[1].runqueue,1);
+    key=tasks[0].ready_node.fair.key;remainder=tasks[0].scheduling.fair_remainder;
+    a=(struct kernel_sched_attr){.size=56,.policy=KERNEL_SCHED_OTHER,.nice=6,.runtime=2000000};
+    assert(!kernel_task_sched_setattr(&tasks[0],0,&a));
+    assert(tasks[0].ready_cpu==&cpus[1] && kernel_sched_pick(&cpus[1].runqueue,1)==first);
+    assert(tasks[0].ready_node.fair.key==key && tasks[0].scheduling.fair_remainder==remainder && tasks[0].scheduling.fair_slice_used==100000000);
+    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);ready_remove_locked(&tasks[0]);ready_remove_locked(&tasks[1]);}
+    now=0;
+    puts("fair slice: bounds, zero, old execution, no refill/no-op, target IPI, overdue deadline, legacy/KEEP/RT and READY order passed");
+}
+
 int main(int argc,char **argv)
 {
+    fair_slice_updates();
+    if(argc==2&&!strcmp(argv[1],"--slice-only"))return 0;
     nice_permissions();fair_wake_policy();rt_parameter_queue_order();
     if(argc==2&&!strcmp(argv[1],"--nice-only"))return 0;
     accounting_progress_without_scheduler_lock();

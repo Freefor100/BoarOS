@@ -238,3 +238,6 @@ enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t
 void kernel_heap_release(struct kernel_heap *h,void *p)
 { assert(h==&queue_heap && queue_allocations==1 && p && !kernel_cpu_current()->raw_locks);
   free(p);queue_allocations--; }
+
+enum kernel_heap_status kernel_heap_allocate_zeroed_nosleep(struct kernel_heap *heap,size_t count,size_t size,void **out)
+{ return kernel_heap_allocate_zeroed(heap,count,size,out); }

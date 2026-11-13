@@ -47,6 +47,7 @@ struct kernel_pipe {
     struct kernel_wait_queue read_queue;
     struct kernel_wait_queue write_queue;
     struct kernel_wait_queue both_queue;
+    struct kernel_wait_queue async_events;
     uint32_t read_slot, merge_slot;
     struct kernel_mutex read_lock, write_lock;
     struct kernel_raw_lock metadata_lock;
@@ -120,7 +121,7 @@ void kernel_pipe_read_copy(struct kernel_pipe_read_borrow *,size_t offset,void *
 void kernel_pipe_read_fragment(struct kernel_pipe_read_borrow *,size_t offset,const void **data,size_t *count);
 /* The writer owns this guard until finish. A successful push transfers one
  * physical-page reference; shared pages never accept subsequent tail merging. */
-struct kernel_pipe_write_borrow { struct kernel_pipe *pipe; struct kernel_lock_guard guard; uint32_t slots; };
+struct kernel_pipe_write_borrow { struct kernel_pipe *pipe; struct kernel_lock_guard guard; uint32_t slots; unsigned changed; };
 int kernel_pipe_write_begin(struct kernel_pipe *,int nonblocking,struct kernel_pipe_write_borrow *);
 int kernel_pipe_push_page(struct kernel_pipe_write_borrow *,void *page,size_t offset,size_t length);
 void kernel_pipe_write_finish(struct kernel_pipe_write_borrow *);

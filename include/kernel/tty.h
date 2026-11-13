@@ -40,7 +40,7 @@ struct kernel_tty_transport {
     int (*configure2)(void *owner, struct kernel_tty_termios2 *settings);
     void (*kick)(void *owner);
     void (*last_close)(void *owner, uint32_t cflag);
-    /* 内部base引用不调用此hook；OFD/ctty引用才保活配对。 */
+    /* 内部base引用不调用此hook；OFD/ctty与跨发布区的操作引用保活配对。 */
     void (*external_ref)(void *owner, int delta);
     void (*opened)(void *owner);
     int (*open_check)(void *owner);
@@ -66,6 +66,7 @@ size_t kernel_tty_service_output(struct kernel_tty *tty, size_t budget);
 int kernel_tty_output_pending(struct kernel_tty *tty);
 void kernel_tty_transport_ready(struct kernel_tty *tty);
 void kernel_tty_shutdown(struct kernel_tty *tty);
+int kernel_tty_vhangup(struct kernel_task *caller);
 void kernel_tty_configure_identity(struct kernel_tty *tty, uint64_t rdev, int raw);
 int kernel_tty_open(struct kernel_tty *tty, struct kernel_heap *heap,
     struct kernel_task *caller, uint32_t flags, int automatic_ctty, void **instance);

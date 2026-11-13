@@ -7,6 +7,8 @@
 #define KERNEL_SCHED_BATCH 3
 #define KERNEL_SCHED_IDLE 5
 #define KERNEL_SCHED_FAIR_NS UINT64_C(10000000)
+#define KERNEL_SCHED_FAIR_MIN_NS UINT64_C(100000)
+#define KERNEL_SCHED_FAIR_MAX_NS UINT64_C(100000000)
 #define KERNEL_SCHED_WAKE_NS UINT64_C(1000000)
 #define KERNEL_SCHED_RESET_ON_FORK 0x40000000
 #define KERNEL_SCHED_RR_NS UINT64_C(100000000)
@@ -19,7 +21,10 @@ struct kernel_sched_policy {
     };
     uint64_t rr_remaining_ns;
     uint32_t fair_remainder, fair_slice_used;
+    uint32_t fair_slice_ns; /* Zero selects the default request. */
 };
+static inline uint32_t kernel_sched_fair_slice(const struct kernel_sched_policy *state)
+{ return state->fair_slice_ns ? state->fair_slice_ns : KERNEL_SCHED_FAIR_NS; }
 /* MQ consumes the effective priority and saved nice as one publication.
  * RT/PI ranks dominate every normal nice level without taking a run lock. */
 static inline void kernel_sched_publish_priority(struct kernel_sched_policy *state,int priority,int nice)

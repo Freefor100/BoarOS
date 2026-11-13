@@ -25,6 +25,7 @@ int kernel_task_tty_signal_ignored(const struct kernel_task *task, unsigned sign
 int kernel_task_tty_group_orphaned(const struct kernel_task *task);
 void kernel_task_tty_signal_group(struct kernel_pid *group, unsigned signal);
 void kernel_task_tty_signal_session(struct kernel_tty *tty, struct kernel_pid *session);
+void kernel_task_tty_notify_session(struct kernel_pid *session);
 void kernel_task_tty_request_set(struct kernel_task *task, struct kernel_tty_request *request);
 void kernel_task_tty_request_clear(struct kernel_task *task,
                                    struct kernel_tty_request *request);

@@ -757,8 +757,9 @@ uint64_t scheduler_deadline_locked(struct kernel_cpu *cpu)
         if (!delay || slice < delay) delay = slice;
     }
     if(cpu->current && !cpu->current->idle && !cpu->current->scheduling.priority && cpu_queue(cpu)->fair_root) {
-        uint64_t fair=KERNEL_SCHED_FAIR_NS-cpu->current->scheduling.fair_slice_used;
-        if(!fair)fair=1;
+        uint32_t slice=kernel_sched_fair_slice(&cpu->current->scheduling);
+        uint32_t used=cpu->current->scheduling.fair_slice_used;
+        uint64_t fair=used>=slice?1:slice-used;
         if(!delay||fair<delay)delay=fair;
     }
     uint64_t deadline = 0;
@@ -924,7 +925,7 @@ int scheduler_select_local(int blocked,int rotate,int voluntary,struct kernel_ta
             (void)kernel_cpu_consume_schedule(cpu);
             rotate |= cpu->rotate_other;
             cpu->rotate_other=0;
-            int expired=current->scheduling.fair_slice_used>=KERNEL_SCHED_FAIR_NS;
+            int expired=current->scheduling.fair_slice_used>=kernel_sched_fair_slice(&current->scheduling);
             if(expired)current->scheduling.fair_slice_used=0;
             int due=head && current->ready_node.fair.key>=head->fair.key;
             if (head && (current->idle || voluntary || ((rotate||expired)&&due) || fair_preempts(head->owner,current))) {
@@ -1005,7 +1006,7 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
     struct kernel_task *next = ready_best_locked();
     int higher = next && (current == cpu->idle ||
                          next->scheduling.priority > current->scheduling.priority || fair_preempts(next,current));
-    int fair_expired=!is_rt(current) && current->scheduling.fair_slice_used>=KERNEL_SCHED_FAIR_NS;
+    int fair_expired=!is_rt(current) && current->scheduling.fair_slice_used>=kernel_sched_fair_slice(&current->scheduling);
     if(fair_expired)current->scheduling.fair_slice_used=0;
     int rotate=voluntary||expired||((rotate_other||fair_expired)&&!is_rt(current)&&next&&
         current->ready_node.fair.key>=next->ready_node.fair.key);
@@ -1206,8 +1207,10 @@ static int nice_reduction_allowed(struct kernel_task *target,int nice)
  * position nor a READY fair node's virtual-runtime key. */
 static void sched_commit_locked(struct kernel_task *task,const struct kernel_sched_policy *updated)
 {
-    if(task->scheduling.policy==updated->policy && task->scheduling.nice==updated->nice &&
-        scheduler_base_priority(task)==(unsigned)updated->priority) {
+    int parameters_changed=task->scheduling.policy!=updated->policy || task->scheduling.nice!=updated->nice ||
+        scheduler_base_priority(task)!=(unsigned)updated->priority;
+    int slice_changed=task->scheduling.fair_slice_ns!=updated->fair_slice_ns;
+    if(!parameters_changed && !slice_changed) {
         task->scheduling.reset_on_fork=updated->reset_on_fork;return;
     }
     if(task->wait.on_cpu && task->cpu) {
@@ -1216,12 +1219,17 @@ static void sched_commit_locked(struct kernel_task *task,const struct kernel_sch
             scheduler_fair_account(task,scheduler_cpu_execution_ns(task->cpu,task));
     }
     int weight_changed=task->scheduling.nice!=updated->nice || task->scheduling.policy!=updated->policy;
-    kernel_sched_publish_priority(&task->scheduling,task->scheduling.priority,updated->nice);
-    if(task->pi_owned||task->pi_request)kernel_futex_pi_recalculate_locked(task,updated->priority);
-    else scheduler_pi_priority_locked(task,(unsigned)updated->priority,0);
+    if(parameters_changed) {
+        kernel_sched_publish_priority(&task->scheduling,task->scheduling.priority,updated->nice);
+        if(task->pi_owned||task->pi_request)kernel_futex_pi_recalculate_locked(task,updated->priority);
+        else scheduler_pi_priority_locked(task,(unsigned)updated->priority,0);
+    }
     if(weight_changed)task->scheduling.fair_remainder=0;
     task->scheduling.policy=updated->policy;
     task->scheduling.reset_on_fork=updated->reset_on_fork;
+    /* The old execution interval was charged above; changing a request does
+     * not replenish its consumed slice or move a queued/PI-boosted task. */
+    task->scheduling.fair_slice_ns=updated->fair_slice_ns;
     if(updated->policy==KERNEL_SCHED_RR && !task->scheduling.rr_remaining_ns)
         task->scheduling.rr_remaining_ns=KERNEL_SCHED_RR_NS;
     struct kernel_cpu *cpu=task->cpu?task->cpu:kernel_cpu_current();
@@ -1277,21 +1285,25 @@ int kernel_task_sched_setattr(struct kernel_task *caller,int32_t pid,const struc
             if(attr.flags&16U) {
                 if(task->scheduling.policy==KERNEL_SCHED_FIFO || task->scheduling.policy==KERNEL_SCHED_RR)
                     attr.priority=scheduler_base_priority(task);
-                else {attr.nice=task->scheduling.nice;attr.runtime=KERNEL_SCHED_FAIR_NS;}
+                else {attr.nice=task->scheduling.nice;attr.runtime=task->scheduling.fair_slice_ns;}
             }
             if(attr.flags&~UINT64_C(0x7f))result=-KERNEL_EINVAL;
             else if(attr.flags&0x66U)result=-KERNEL_ENOTSUP;
             else if(policy==6||policy==7)result=-KERNEL_ENOTSUP;
             else if(policy!=0&&policy!=1&&policy!=2&&policy!=3&&policy!=5)result=-KERNEL_EINVAL;
             else if(attr.priority>99)result=-KERNEL_EINVAL;
-            else if(policy!=KERNEL_SCHED_FIFO && policy!=KERNEL_SCHED_RR &&
-                    attr.runtime && attr.runtime!=KERNEL_SCHED_FAIR_NS)result=-KERNEL_ENOTSUP;
             else {
                 struct kernel_sched_policy updated=task->scheduling;
                 updated.priority=(int)scheduler_base_priority(task);
                 int requested=policy|((attr.flags&1U)?KERNEL_SCHED_RESET_ON_FORK:0);
                 result=kernel_sched_policy_set(&updated,requested,(int)attr.priority,(attr.flags&8U)!=0);
-                if(policy!=KERNEL_SCHED_FIFO && policy!=KERNEL_SCHED_RR)updated.nice=attr.nice;
+                if(policy!=KERNEL_SCHED_FIFO && policy!=KERNEL_SCHED_RR) {
+                    updated.nice=attr.nice;
+                    uint64_t slice=attr.runtime;
+                    if(slice && slice<KERNEL_SCHED_FAIR_MIN_NS)slice=KERNEL_SCHED_FAIR_MIN_NS;
+                    if(slice>KERNEL_SCHED_FAIR_MAX_NS)slice=KERNEL_SCHED_FAIR_MAX_NS;
+                    updated.fair_slice_ns=(uint32_t)slice;
+                }
                 if(!result)result=sched_permission_locked(caller,task,&updated);
                 if(!result && (attr.flags&16U)) {
                     unsigned reset=updated.reset_on_fork;

@@ -1,7 +1,14 @@
 #include "../../../kernel/sched/private.h"
+#include "../../../fs/open_file_internal.h"
+#include <kernel/time.h>
 #include <assert.h>
 #include <sched.h>
 #include <pthread.h>
+#if !defined(FILE_IO_CASES) && !defined(FILES_PIPE_CASES) && !defined(CACHE_MM_CASES)
+/* Mapping/source-only fixtures do not create asynchronous OFD subscriptions. */
+void kernel_open_file_async_close(struct kernel_open_file_description *file)
+{ assert(file && !file->async_io); }
+#endif
 
 /* 宿主无法汇编目标架构指令；ELF 布局测试可用自己的强符号覆盖。 */
 __asm__(".pushsection .rodata\n"
@@ -152,6 +159,14 @@ struct kernel_wait_node *kernel_wait_default_node(struct kernel_task *task) { re
 struct kernel_task *kernel_wait_current_task(void) { return &actor.task; }
 int kernel_wait_backend_initialized(void) { return 1; }
 int kernel_wait_backend_signal(struct kernel_task *task) { (void)task; return 0; }
+/* Dedicated timer/futex fixtures provide their own conversion. These MM/file
+ * actors otherwise have no wall-clock wait model. */
+__attribute__((weak)) enum kernel_time_status kernel_time_deadline_from_realtime(uint64_t ns,uint64_t *deadline)
+{
+    (void)ns;(void)deadline;
+    assert(!"unopened CLOCK_REALTIME wait in MM host fixture");
+    return KERNEL_TIME_STATUS_INVALID_ARGUMENT;
+}
 uint64_t kernel_wait_backend_time(void) { return 1; }
 void kernel_wait_backend_commit(struct kernel_task *task, uint64_t deadline, int interruptible)
 {

@@ -200,6 +200,17 @@ static void rotate_case(int policy, int next_priority, int expected)
     assert(!cpu.raw_locks && !cpu.preempt_depth && !sync_test_irq);
 }
 
+static void fair_slice_case(uint32_t slice)
+{
+    setup(KERNEL_SCHED_OTHER,0,0);
+    running.scheduling.fair_slice_ns=slice;
+    running.scheduling.fair_slice_used=slice-1;
+    assert(!scheduler_reschedule(0,0,1) && !switches && timer_request==2);
+    running.scheduling.fair_slice_used++;
+    assert(!scheduler_reschedule(0,0,1) && switches==1 && selected==&peer);
+    assert(!running.scheduling.fair_slice_used);
+}
+
 static void private_storage_case(void)
 {
     memset(metadata_arena, 0xa7, sizeof(metadata_arena));
@@ -265,8 +276,15 @@ static void join_cursor_lifetime_case(void)
     assert(!kernel_wait_queue_close(&join.waiters) && !kernel_wait_queue_destroy(&join.waiters));
     puts("scheduler handoff: join waits for the detached remote cursor before returning its queue owner");
 }
-int main(void)
+int main(int argc,char **argv)
 {
+    fair_slice_case(100000);fair_slice_case(30000000);fair_slice_case(100000000);
+    setup(KERNEL_SCHED_OTHER,0,0);
+    running.scheduling.fair_slice_ns=100000;running.scheduling.fair_slice_used=5000000;
+    scheduler_rearm_timer();assert(timer_request==2);
+    assert(!scheduler_reschedule(0,0,1) && switches==1 && selected==&peer);
+    puts("fair slice: short/long request rotation and overdue shortened deadline passed");
+    if(argc==2&&!strcmp(argv[1],"--slice-only"))return 0;
     setup(KERNEL_SCHED_OTHER,0,0);
     struct kernel_wait_token token;
     enum kernel_wait_wake_reason reason;

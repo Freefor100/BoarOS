@@ -12,6 +12,7 @@ struct kernel_mm;
 struct kernel_task;
 struct kernel_heap;
 struct kernel_vfs_file;
+struct kernel_pid;
 
 /* Built-in character backends are selected by st_rdev, not pathname. */
 struct kernel_char_device {
@@ -36,6 +37,9 @@ struct kernel_char_device {
                  struct kernel_mm *mm, uint64_t command, uint64_t argument);
     uint32_t (*poll)(void *instance, uint32_t flags, uint32_t requested,
                      struct kernel_wait_queue **out_queue);
+    struct kernel_wait_queue *(*async_source)(void *instance);
+    /* First enable with no explicit owner: returns an owned stable identity. */
+    struct kernel_pid *(*async_owner)(void *instance,struct kernel_task *,int *owner_type);
     /* 行规程的等待/continuation归完整请求，不能每个staging块重新开始。
      * owner/iov_owner移交给栈上活调用；正常恢复，强制取消消费以免栈退出泄漏。 */
     enum kernel_files_status (*readv)(void *instance, struct kernel_task *caller,

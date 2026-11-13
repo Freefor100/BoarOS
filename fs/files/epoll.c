@@ -61,8 +61,8 @@ static void epoll_notify(struct kernel_epoll *epoll)
     epoll_state_notify(&epoll->wait_queue);
 }
 
-static void kernel_epoll_wait_callback(struct kernel_wait_node *node, uint32_t reason)
-{
+static void kernel_epoll_wait_callback(struct kernel_wait_node *node, uint32_t reason,uint64_t event)
+{ (void)event;
     if (!node || !node->context) return;
     EPOLL_STATE(irq);
     struct kernel_epoll_item *item = node->context;
@@ -599,7 +599,7 @@ enum kernel_files_status kernel_files_epoll_ctl(
         epoll_state_acquire(&irq);
         if (item->linked && control == item->control_generation &&
             (current_revents & (item->events | KERNEL_POLLERR | KERNEL_POLLHUP)))
-            kernel_epoll_wait_callback(&item->wait_node, 0);
+            kernel_epoll_wait_callback(&item->wait_node, 0, 0);
         epoll_state_release(&irq);
         epoll_item_put(item);
         *linux_result = 0;
@@ -623,7 +623,7 @@ enum kernel_files_status kernel_files_epoll_ctl(
         epoll_state_acquire(&irq);
         if (item->linked && control == item->control_generation &&
             (current_revents & (events | KERNEL_POLLERR | KERNEL_POLLHUP)))
-            kernel_epoll_wait_callback(&item->wait_node, 0);
+            kernel_epoll_wait_callback(&item->wait_node, 0, 0);
         epoll_state_release(&irq);
         epoll_item_put(item);
         *linux_result = 0;

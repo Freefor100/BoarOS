@@ -43,6 +43,9 @@ enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t target,uint
 static void cache_raw_observe(struct kernel_raw_lock *);
 #ifdef CACHE_MM_CASES
 #include "mm_disk_cases.h"
+/* This cache/MM fixture does not construct asynchronous OFD state. */
+void kernel_open_file_async_close(struct kernel_open_file_description *file)
+{ assert(file && !file->async_io); }
 #endif
 
 static unsigned char backend_pool[16 * 1024 * 1024] __attribute__((aligned(16384)));

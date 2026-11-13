@@ -16,6 +16,14 @@ IPv4 重组键包括源/目的地址、IP ID、协议号和输入 netif 身份�
 不把未接纳的终片当作完整内容已交付。`duplicate_final_timeout` 覆盖持有、超时
 归还和槽复用；资源始终受重组预算约束。
 
+socket 的信号驱动通知由 OFD 的 [异步状态](kernel-files.md#信号驱动-io) 管理。
+`FIOSETOWN/SIOCSPGRP/FIOGETOWN/SIOCGPGRP` 与 fcntl 所有者接口共享同一状态。
+端点另有 async_events 队列：接纳接收包或监听子连接产生 POLL_IN，发送容量实际归还
+产生 POLL_OUT，协议/设备错误与断连接分别使用 POLL_ERR/POLL_HUP。源游标在端点短锁
+内取得，状态保护归还后同步执行回调。同一事务的普通 poll 唤醒仍按队列合并，异步事件
+分别保存游标，因此两次已接纳事件不会因共享 poll 唤醒而丢失。读预约、取消和一般状态
+唤醒本身不发送输入信号。最终关闭先撤销 OFD 订阅，端点销毁再排空异步队列借用。
+
 ## 已验收 ABI 与等待
 
 当前支持 `AF_INET`/`AF_INET6` 的 `SOCK_DGRAM`/`SOCK_STREAM`，`SOCK_CLOEXEC`、`SOCK_NONBLOCK`，UDP bind/getsockname/sendto/recvfrom 和 `SO_RCVTIMEO`，TCP bind/listen/connect/accept，以及连接后的普通读写和就绪。绑定非零低端口（小于 1024）要求当前调用者的 CAP_NET_BIND_SERVICE，端口 0 仍由协议选择临时端口。网卡启停、IPv4 地址/掩码/MTU 和默认网关的实际接口及权限见[网络设备](riscv-virtio-net.md#地址与用户接口)。地址在 syscall 边界使用 RV64 `sockaddr_in`/`sockaddr_in6` 布局；内核地址携带族、16 字节网络序地址、宿主序端口和 scope。官方 loopif 提供 `::1`；IPv6 通配监听默认接收 IPv4，accept 返回映射地址。V6ONLY 在绑定前生效，双栈通配与纯 IPv6/IPv4 的端口交集由非持引用的 endpoint 登记补齐 lwIP TCP bind 的 ANY 检查缺口。登记在 OFD 销毁前摘除。非阻塞、坏 fd/地址/指针和协议错误由固定 Linux 同一 ELF 差分约束。未覆盖的地址族、选项和操作返回明确 errno，不伪造成功。

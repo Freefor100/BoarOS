@@ -174,6 +174,74 @@ static void red(void)
     unsigned char c; read_all(p.slave, &c, 1); exact(c, 'R', "red transfer");
     pair_close(&p); record("unix98-red-path", 1);
 }
+static void no_async_signal(const sigset_t *set)
+{
+    struct timespec zero = {0};
+    errno = 0;
+    error_is(sigtimedwait(set, NULL, &zero), EAGAIN, "no settings or incomplete-line SIGIO");
+}
+static void sigio_hangup(void)
+{
+    struct pair p = pair_new();
+    pid_t child = fork(); truth(child >= 0, "SIGIO child fork");
+    if (!child) {
+        truth(setsid() > 0, "SIGIO isolated session");
+        struct { uint32_t version; int32_t pid; } header = {UINT32_C(0x20080522), 0};
+        struct { uint32_t effective, permitted, inheritable; } saved[2], reduced[2];
+        exact(syscall(SYS_capget, &header, saved), 0, "vhangup capget");
+        truth(saved[0].effective & (UINT32_C(1) << 26), "vhangup fixture capability");
+        memcpy(reduced, saved, sizeof(reduced));
+        reduced[0].effective &= ~(UINT32_C(1) << 26);
+        exact(syscall(SYS_capset, &header, reduced), 0, "drop TTY capability");
+        errno = 0; error_is(syscall(SYS_vhangup), EPERM, "vhangup checks capability without ctty");
+        exact(syscall(SYS_capset, &header, saved), 0, "restore TTY capability");
+        exact(syscall(SYS_vhangup), 0, "privileged vhangup without ctty");
+        exact(ioctl(p.slave, TIOCSCTTY, 0), 0, "SIGIO acquire controlling tty");
+        truth(signal(SIGHUP, SIG_IGN) != SIG_ERR && signal(SIGCONT, SIG_IGN) != SIG_ERR,
+              "survive own terminal hangup");
+        struct termios t; exact(tcgetattr(p.slave, &t), 0, "SIGIO get settings");
+        cfmakeraw(&t); t.c_lflag = ICANON;
+        exact(tcsetattr(p.slave, TCSANOW, &t), 0, "SIGIO canonical without echo");
+        int signo = SIGRTMIN + 1;
+        sigset_t set; sigemptyset(&set); sigaddset(&set, signo);
+        exact(sigprocmask(SIG_BLOCK, &set, NULL), 0, "block SIGIO notification");
+        exact(fcntl(p.slave, F_SETSIG, signo), 0, "TTY F_SETSIG");
+        exact(fcntl(p.slave, F_SETOWN, getpid()), 0, "TTY F_SETOWN");
+        int flags = fcntl(p.slave, F_GETFL); truth(flags >= 0, "TTY get flags");
+        exact(fcntl(p.slave, F_SETFL, flags | O_ASYNC), 0, "TTY enable async");
+        write_all(p.master, "x", 1);
+        truth(!(ready(p.slave, POLLIN, 0) & POLLIN), "incomplete canonical input");
+        no_async_signal(&set);
+        exact(tcsetattr(p.slave, TCSANOW, &t), 0, "TTY same settings");
+        no_async_signal(&set);
+        write_all(p.master, "\n", 1);
+        struct timespec timeout = {5, 0}; siginfo_t info;
+        exact(sigtimedwait(&set, &info, &timeout), signo, "TTY canonical input signal");
+        exact(info.si_code, 1, "TTY POLL_IN code");
+        exact(info.si_fd, p.slave, "TTY notification fd");
+        truth((info.si_band & (POLLIN | POLLRDNORM)) == (POLLIN | POLLRDNORM), "TTY input signal band");
+        char bytes[4]; read_all(p.slave, bytes, 2); truth(!memcmp(bytes, "x\n", 2), "TTY signaled data");
+        exact(syscall(SYS_vhangup), 0, "vhangup controlling terminal");
+        truth(!(fcntl(p.slave, F_GETFL) & O_ASYNC), "vhangup detaches async subscription");
+        errno = 0; error_is(fcntl(p.slave, F_SETFL, flags | O_ASYNC), ENOTTY, "hung-up TTY rejects async enable");
+        exact(read(p.slave, bytes, 1), 0, "hung-up old read EOF");
+        errno = 0; error_is(write(p.slave, "X", 1), EIO, "hung-up old write");
+        errno = 0; error_is(tcgetattr(p.slave, &t), EIO, "hung-up old ioctl");
+        pid_t group = getpgrp();
+        errno = 0; error_is(ioctl(p.slave, TIOCSPGRP, &group), ENOTTY, "hung-up old TIOCSPGRP");
+        short mask = ready(p.slave, POLLIN | POLLOUT, 0);
+        truth((mask & (POLLIN | POLLOUT | POLLERR | POLLHUP)) == (POLLIN | POLLOUT | POLLERR | POLLHUP), "hung-up poll mask");
+        int fresh = open(p.path, O_RDWR | O_NOCTTY | O_CLOEXEC);
+        truth(fresh >= 0, "open new terminal generation"); raw(fresh);
+        write_all(p.master, "R", 1); read_all(fresh, bytes, 1); exact(bytes[0], 'R', "new terminal generation transfer");
+        exact(read(p.slave, bytes, 1), 0, "old generation stays hung up");
+        exact(close(fresh), 0, "new generation close");
+        pair_close(&p); _exit(0);
+    }
+    int status; exact(waitpid(child, &status, 0), child, "SIGIO child wait");
+    truth(WIFEXITED(status) && WEXITSTATUS(status) == 0, "SIGIO child result");
+    pair_close(&p); record("sigio-vhangup-generation", 1);
+}
 static void locks_and_nodes(void)
 {
     struct pair p = pair_new(); struct stat a, b;
@@ -988,8 +1056,18 @@ static void recording_check(void)
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
+#ifdef TTY_ASYNC_ONLY
+    (void)argc;(void)argv;
+    truth(mkdir("/dev/pts",0755)==0 || errno==EEXIST,"devpts directory");
+    truth(mount("devpts","/dev/pts","devpts",0,"mode=620,ptmxmode=666")==0 || errno==EBUSY,"devpts mount");
+    sigio_hangup();return 0;
+#endif
+
     if (argc > 1 && !strcmp(argv[1], "--api")) {
         api_record = "real-glibc-openpty-login_tty"; libc_api(); return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "--sigio-hangup")) {
+        sigio_hangup(); return 0;
     }
     if (argc > 1 && !strcmp(argv[1], "--emit")) {
         truth(argc == 5, "script emitter parameters");
@@ -1007,6 +1085,7 @@ int main(int argc, char **argv)
     FILE *config = fopen("/pty-case", "r");
     if (config) { truth(fscanf(config, "%31s %u %llu", selected, &pairs, &bytes) >= 1, "case config"); fclose(config); }
     if (!strcmp(selected, "red")) red();
+    else if (!strcmp(selected, "sigio-hangup")) sigio_hangup();
     else if (!strcmp(selected, "core")) { locks_and_nodes(); transfers(); packets(); faults(); lifecycle(); controlling(0); controlling(1); termios2_cases(); }
     else if (!strcmp(selected, "libc")) libc_both();
     else if (!strcmp(selected, "script")) scripts();

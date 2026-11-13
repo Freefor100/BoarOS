@@ -583,7 +583,7 @@ static void cursor_wake_reason(struct kernel_wait_cursor *cursor,int all,uint32_
         /* Cursor/node borrows cover both the token and callback after unlock. */
         if (token.task) notified=notify_token(&token,KERNEL_WAIT_WOKEN);
         if (callback) {
-            kernel_preempt_disable();callback(node,reason);kernel_preempt_enable();
+            kernel_preempt_disable();callback(node,reason,cursor->event);kernel_preempt_enable();
             notified=1;
         }
         if (notified && !all) break;

@@ -22,6 +22,11 @@ leader 清除整个会话关联并向前台 PGID 发 HUP/CONT，对普通线程�
 leader 最后成员退出的 serial hangup 向 session leader 发 HUP/CONT，并向前台组发 HUP；
 既有实例的 generation 随 hangup 失效，后来的新 session 不会复活旧 OFD。普通 close
 不触发会话 hangup，最后一次真实 OFD close 的 HUPCL 由 transport 操作硬件 modem。
+`vhangup` 先检查 CAP_SYS_TTY_CONFIG；具备该能力但没有 ctty 时成功返回。
+有 ctty 时清空输入/输出、撤销会话关联，向 session leader 发 HUP/CONT；它不额外
+向前台组发 HUP，也不关闭 transport。旧普通 OFD 读返回 EOF、写和 ioctl 返回 EIO
+（TIOCSPGRP 返回 ENOTTY），poll 返回 IN/OUT/ERR/HUP；新 open 取得当前 generation。
+`/dev/console` 的重定向写实例保留使用资格，真实 shutdown 才使其失效。
 proc stat 的 tty_nr/tpgid 来自同一受保护的实际关联快照。
 TIOCSPGRP 查找数字身份：身份不存在返回 ESRCH；存在但属于其他 session 或没有活成员
 返回 EPERM。按固定 Linux 在无 PGID 成员时检查 PID 成员的 session，成功才更新前台引用。
@@ -73,8 +78,14 @@ libc 的更大布局。硬件普通配置由 transport configure 校验并回写
 其他 ldisc 与完整 modem ioctl 未实现，返回明确错误。真实应用收口状态见[开发路线](../goals.md)。
 支持 winsize、TCXONC、TCFLSH、FIONREAD、TIOCOUTQ、TIOCGETD(N_TTY)、前台 PGID/SID
 与 ctty 操作。TCSBRK 的非零参数真实 drain；零参数没有 break 生成 owner，返回 ENOTSUP。
-IN/OUT/HUP 使用统一事件队列；canonical IN 需要完整 line/EOF，raw poll 按其 minimum/time
-规则，hungup 实例返回实际 HUP 与 EOF/EIO。
+read/write/poll 共用等待事件队列；canonical IN 需要完整 line/EOF，raw poll 按其
+minimum/time 规则，hungup 实例返回实际 HUP 与 EOF/EIO。
+O_ASYNC 订阅另用独立队列：canonical delimiter/EOF、实际 raw 输入和输出容量恢复
+分别发布 POLL_IN/POLL_OUT；设置变更、流控和普通等待唤醒不冒充异步数据事件。
+OFD 首次启用时以 TTY 前台 PGID 为默认 owner，没有前台组则用调用者 TGID；
+显式 F_SETOWN 保持调用者选择。hangup 摘除失效 generation 的异步订阅并清除 O_ASYNC，
+保留 console 和新 generation 的订阅。事件游标在输入/输出状态发布时取得，回调在该
+发布区外执行，订阅 owner 的生命周期由 OFD 负责。
 
 ## 固定依据与验证
 
@@ -101,8 +112,8 @@ handshake 注入；原始字节不做文本归一化。原 BusyBox ash、stty �
 
 ## 配对 transport 接缝
 
-TTY core 仍由 transport 的 base owner 管理；外部 OFD/ctty 引用通过可选通知保活
-配对，base 引用不反向保活配对。打开上下文只借用已 pin 的路径，实例不借用临时
+TTY core 仍由 transport 的 base owner 管理；外部 OFD/ctty 和跨发布区的操作引用通过
+可选通知保活配对，base 引用不反向保活配对。打开上下文只借用已 pin 的路径，实例不借用临时
 用户指针。分配完成后在发布区重新核对锁定和对端关闭，防止检查到安装之间的状态变化。
 
 `kernel_tty_receive_nonblocking` 返回已经处理的前缀。raw 容量不足保留后缀；

@@ -3,6 +3,7 @@
 #include "../../kernel/sched/private.h"
 #include <kernel/errno.h>
 #include <kernel/irq.h>
+#include <kernel/async_io.h>
 #include <string.h>
 #include <stdlib.h>
 extern _Thread_local uint64_t mm_test_context;
@@ -466,6 +467,34 @@ static void pipe_splice_pages_case(struct kernel_heap *heap)
     assert(!kernel_pipe_release_endpoint(a,KERNEL_PIPE_ENDPOINT_BOTH) && !kernel_pipe_release_endpoint(b,KERNEL_PIPE_ENDPOINT_BOTH));
     free(bytes);puts("PASS splice pages: real shared references, user-page loans, last release and simultaneous reverse transfers");
 }
+static unsigned pipe_async_inputs,pipe_async_outputs;
+static void pipe_async_observer(struct kernel_wait_node *node,uint32_t reason,uint64_t event)
+{
+    (void)node;assert(!kernel_cpu_current()->raw_locks && reason==KERNEL_WAIT_WOKEN);
+    if (event==KERNEL_ASYNC_POLL_IN) pipe_async_inputs++;
+    else {assert(event==KERNEL_ASYNC_POLL_OUT);pipe_async_outputs++;}
+}
+static void pipe_async_cadence(struct kernel_heap *heap)
+{
+    pipe_bind(0,0);struct kernel_pipe *pipe=pipe_table(heap);mm_test_bind_files(&files);
+    struct kernel_wait_node observer={0};kernel_wait_node_init_callback(&observer,pipe_async_observer,NULL);
+    kernel_wait_queue_add(&pipe->async_events,&observer);
+    struct kernel_pipe_result written;size_t count=3*BOAROS_PAGE_SIZE+13;
+    assert(!kernel_pipe_write_buffer(pipe,pipe_payload,count,1,&written) && written.bytes==(int64_t)count);
+    assert(pipe_async_inputs==1 && !pipe_async_outputs);
+    struct kernel_uaccess_iovec target={PIPE_TARGET,count};int64_t got;
+    assert(!kernel_pipe_readv(pipe,&domain_mm,&target,1,count,0,&got) && got==(int64_t)count);
+    assert(pipe_async_inputs==1 && pipe_async_outputs==1);
+    assert(!kernel_pipe_readv(pipe,&domain_mm,&target,1,1,KERNEL_PIPE_NONBLOCK,&got) && got==-KERNEL_EAGAIN);
+    assert(pipe_async_outputs==2);
+    assert(!kernel_pipe_readv(pipe,&domain_mm,&target,1,0,0,&got) && !got);
+    assert(!kernel_pipe_write_buffer(pipe,pipe_payload,0,1,&written) && !written.bytes);
+    assert(pipe_async_inputs==1 && pipe_async_outputs==2);
+    assert(!kernel_files_close(&files,1,&got) && !got);
+    assert(pipe_async_inputs==2 && pipe_async_outputs==3);
+    assert(!kernel_wait_node_remove_sync(&observer) && !kernel_files_release(&files));
+    puts("PASS pipe async cadence: one multi-page write, completed/empty reads, zero-count and last-writer directions");
+}
 static void pipe_cases(struct kernel_heap *heap)
 {
     uint64_t address;
@@ -476,6 +505,7 @@ static void pipe_cases(struct kernel_heap *heap)
     assert(!kernel_copy_to_user(&domain_mm,PIPE_SOURCE,pipe_payload,KERNEL_PIPE_DEFAULT_CAPACITY+1,&done) && done==KERNEL_PIPE_DEFAULT_CAPACITY+1);
     pipe_capacity_case(heap);pipe_capacity_merge_case(heap);pipe_capacity_copy_case(heap);
     pipe_capacity_wake_case(heap);pipe_capacity_quota_case(heap);
+    pipe_async_cadence(heap);
     pipe_splice_pages_case(heap);
     pipe_page_ownership_case(heap);pipe_copy_overlap_case(heap);pipe_merge_copy_case(heap);
     pipe_boundary_cases(heap); pipe_geometry_case(heap); pipe_tmpfs_buffer_case(heap);user_pipe_last_close(heap);

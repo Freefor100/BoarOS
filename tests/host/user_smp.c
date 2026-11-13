@@ -5,6 +5,7 @@
 #undef main
 #include <arch/timer.h>
 #include <kernel/time.h>
+#include <string.h>
 /* This scheduler/standard-signal model has no active timerfd. */
 uint64_t kernel_timer_fd_next;
 
@@ -738,9 +739,30 @@ static void remote_rt_precedence(void)
     puts("PASS remote RT work defers ordinary selection until the last eligible task leaves");
 }
 
+static void ordinary_local_slice(void)
+{
+    const uint32_t slices[]={100000,30000000,100000000};
+    for(unsigned i=0;i<sizeof(slices)/sizeof(*slices);i++) {
+        reset_two_queues();active=&cpus[1];
+        tasks[0]=(struct kernel_task){.accounted=1,.cpu_mask=2,.cpu=active,
+            .state=KERNEL_THREAD_STATE_RUNNING,.wait.on_cpu=1};
+        tasks[0].scheduling.fair_slice_ns=slices[i];tasks[0].scheduling.fair_slice_used=slices[i]-1;
+        active->current=&tasks[0];idles[1].wait.on_cpu=0;
+        {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);setup_task(1,2,0);}
+        struct kernel_task *next=0;uint64_t deadline;
+        assert(scheduler_select_local(0,0,0,&next,&deadline) && !next);
+        assert(tasks[0].scheduling.fair_slice_used==slices[i]-1);
+        tasks[0].scheduling.fair_slice_used++;
+        assert(scheduler_select_local(0,0,0,&next,&deadline) && next==&tasks[1]);
+        assert(!tasks[0].scheduling.fair_slice_used && tasks[0].wait.ready_pending);
+        assert(scheduler_finish_local(active));assert_ready_owner(&tasks[0],active);
+    }
+    puts("PASS ordinary local selection rotates at each thread's short/long fair slice");
+}
+
 int main(int argc,char **argv)
 {
-    (void)argv;
+    if(argc==2&&!strcmp(argv[1],"--slice-only")) {kernel_wait_domain_init();ordinary_local_slice();return 0;}
     if (argc==2) {kernel_wait_domain_init();ordinary_local_park();return 0;}
     assert(!controlled_smp_main());
     ordinary_local_park();
@@ -749,6 +771,7 @@ int main(int argc,char **argv)
     ordinary_local_wake();
     ordinary_wake_after_affinity_change();
     ordinary_pull();
+    ordinary_local_slice();
     remote_rt_precedence();
     reservation_placement_cases();
     scheduler = (struct kernel_scheduler){0};

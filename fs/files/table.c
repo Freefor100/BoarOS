@@ -1,4 +1,5 @@
 #include <kernel/scheduler.h>
+#include <kernel/async_io.h>
 #include "private.h"
 #include "../open_file_internal.h"
 #include "../pipe_internal.h"
@@ -39,7 +40,17 @@ enum kernel_files_status kernel_files_ioctl(
     enum kernel_files_status status = kernel_files_pin_data(files, fd, &description,
                                                        linux_result);
     if (status != KERNEL_FILES_STATUS_OK || *linux_result) return status;
-    if (description->kind==KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE)
+    if (description->kind==KERNEL_OPEN_FILE_KIND_SOCKET && command>=0x8901 && command<=0x8904) {
+        int32_t value=0;size_t copied=0;
+        if (command<=0x8902) {
+            if (kernel_copy_from_user(mm,&value,argument,sizeof(value),&copied) || copied!=sizeof(value))
+                *linux_result=-KERNEL_EFAULT;
+            else *linux_result=kernel_open_file_async_fcntl(description,KERNEL_FILES_F_SETOWN,(uint32_t)value,mm);
+        } else {
+            value=(int32_t)kernel_open_file_async_fcntl(description,KERNEL_FILES_F_GETOWN,0,mm);
+            *linux_result=kernel_copy_to_user(mm,argument,&value,sizeof(value),&copied) || copied!=sizeof(value)?-KERNEL_EFAULT:0;
+        }
+    } else if (description->kind==KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE)
         *linux_result=(kernel_open_file_flags(description)&010000000U)?-KERNEL_EBADF:
             command==0xb703U?0x20000:-KERNEL_ENOTTY; /* NS_GET_NSTYPE */
     else *linux_result = description->block ? kernel_block_file_ioctl(files, &description, mm, command, argument) :
@@ -1070,7 +1081,20 @@ enum kernel_files_status kernel_files_fcntl(
         else if((argument&KERNEL_FILES_O_NOATIME) && !(kernel_open_file_flags(file)&KERNEL_FILES_O_NOATIME) &&
             !kernel_open_file_noatime_allowed(file))*result=-KERNEL_EPERM;
         else if(argument&00040000U)*result=-KERNEL_EINVAL;
-        else {kernel_open_file_set_status_flags(file,(uint32_t)argument);*result=0;}
+        else *result=kernel_open_file_async_flags(file,(int)fd,(uint32_t)argument);
+        return 0;
+    }
+    if ((command>=KERNEL_FILES_F_SETOWN && command<=KERNEL_FILES_F_GETSIG) ||
+        command==KERNEL_FILES_F_SETOWN_EX || command==KERNEL_FILES_F_GETOWN_EX) {
+        KERNEL_FILES_PIN_SCOPE(pin);
+        struct kernel_open_file_description *file=kernel_files_hold_fd(files,fd,&pin);
+        if (!file || file->kind==KERNEL_OPEN_FILE_KIND_PATH) *result=-KERNEL_EBADF;
+        else {
+            const struct kernel_mm *mm=NULL;
+            if (command==KERNEL_FILES_F_SETOWN_EX || command==KERNEL_FILES_F_GETOWN_EX)
+                (void)kernel_task_mm_borrow(kernel_task_current(),&mm);
+            *result=kernel_open_file_async_fcntl(file,(unsigned)command,argument,(struct kernel_mm *)mm);
+        }
         return 0;
     }
     KERNEL_FILES_SCOPE(guard, files);

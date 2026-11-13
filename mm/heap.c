@@ -296,7 +296,7 @@ static enum kernel_heap_status slab_metadata_validate(const struct kernel_heap *
 
 static enum kernel_heap_status slab_create(struct kernel_heap *heap,
                                            uint32_t class_index,
-                                           struct kernel_slab **slab_out)
+                                           struct kernel_slab **slab_out, int nosleep)
 {
     uint64_t physical_address;
     void *pointer;
@@ -305,9 +305,9 @@ static enum kernel_heap_status slab_create(struct kernel_heap *heap,
     uint32_t index;
     enum physical_page_status page_status;
 
-    page_status = physical_page_allocate_order(heap->page_allocator,
-                                                0U,
-                                                &physical_address);
+    page_status = nosleep
+        ? physical_page_allocate_order_nosleep(heap->page_allocator,0U,&physical_address)
+        : physical_page_allocate_order(heap->page_allocator,0U,&physical_address);
     if (page_status != PHYSICAL_PAGE_STATUS_OK) {
         return page_status_to_heap(page_status);
     }
@@ -387,7 +387,7 @@ static enum kernel_heap_status slab_allocate_slot(struct kernel_heap *heap,
 
 static enum kernel_heap_status allocate_small(struct kernel_heap *heap,
                                               uint32_t class_index,
-                                              void **pointer)
+                                              void **pointer, int nosleep)
 {
     struct kernel_slab *prepared = 0;
     enum kernel_heap_status status;
@@ -398,7 +398,7 @@ static enum kernel_heap_status allocate_small(struct kernel_heap *heap,
         if (slab) return slab_allocate_slot(heap, slab, class_index, pointer);
     }
     /* 回收可能重入堆；申请页时尚未借用任何共享 slab 指针。 */
-    status = slab_create(heap, class_index, &prepared);
+    status = slab_create(heap, class_index, &prepared,nosleep);
     if (status != KERNEL_HEAP_STATUS_OK) return status;
     {
         KERNEL_RAW_SCOPE(guard, &heap->lock);
@@ -432,7 +432,7 @@ static int allocation_order_for_size(size_t size, uint32_t *order)
 
 static enum kernel_heap_status allocate_large(struct kernel_heap *heap,
                                               size_t size,
-                                              void **pointer)
+                                              void **pointer, int nosleep)
 {
     uint32_t order;
     uint64_t physical_address;
@@ -442,9 +442,9 @@ static enum kernel_heap_status allocate_large(struct kernel_heap *heap,
     if (!allocation_order_for_size(size, &order)) {
         return KERNEL_HEAP_STATUS_OVERFLOW;
     }
-    page_status = physical_page_allocate_order(heap->page_allocator,
-                                                order,
-                                                &physical_address);
+    page_status = nosleep
+        ? physical_page_allocate_order_nosleep(heap->page_allocator,order,&physical_address)
+        : physical_page_allocate_order(heap->page_allocator,order,&physical_address);
     if (page_status != PHYSICAL_PAGE_STATUS_OK) {
         return page_status_to_heap(page_status);
     }
@@ -499,13 +499,9 @@ enum kernel_heap_status kernel_heap_init(
     return KERNEL_HEAP_STATUS_OK;
 }
 
-enum kernel_heap_status kernel_heap_allocate(
-    struct kernel_heap *heap,
-    size_t size,
-    void **pointer)
+static enum kernel_heap_status heap_allocate(
+    struct kernel_heap *heap, size_t size, void **pointer, int nosleep)
 {
-    kernel_assert_can_block();
-    KERNEL_NO_RECLAIM_IO;
     uint32_t class_index;
     void *result = 0;
     enum kernel_heap_status status;
@@ -523,9 +519,9 @@ enum kernel_heap_status kernel_heap_allocate(
 
     int small = small_class_for_size(size, &class_index);
     if (small) {
-        status = allocate_small(heap, class_index, &result);
+        status = allocate_small(heap, class_index, &result,nosleep);
     } else {
-        status = allocate_large(heap, size, &result);
+        status = allocate_large(heap, size, &result,nosleep);
     }
     if (status != KERNEL_HEAP_STATUS_OK) {
         {
@@ -542,11 +538,16 @@ enum kernel_heap_status kernel_heap_allocate(
     return KERNEL_HEAP_STATUS_OK;
 }
 
-enum kernel_heap_status kernel_heap_allocate_zeroed(
-    struct kernel_heap *heap,
-    size_t count,
-    size_t size,
-    void **pointer)
+enum kernel_heap_status kernel_heap_allocate(struct kernel_heap *heap,size_t size,void **pointer)
+{
+    kernel_assert_can_block();KERNEL_NO_RECLAIM_IO;
+    return heap_allocate(heap,size,pointer,0);
+}
+enum kernel_heap_status kernel_heap_allocate_nosleep(struct kernel_heap *heap,size_t size,void **pointer)
+{ return heap_allocate(heap,size,pointer,1); }
+
+static enum kernel_heap_status heap_allocate_zeroed(
+    struct kernel_heap *heap, size_t count, size_t size, void **pointer, int nosleep)
 {
     size_t total;
     void *result;
@@ -562,7 +563,8 @@ enum kernel_heap_status kernel_heap_allocate_zeroed(
         return KERNEL_HEAP_STATUS_OVERFLOW;
     }
     total = count * size;
-    status = kernel_heap_allocate(heap, total, &result);
+    status = nosleep ? kernel_heap_allocate_nosleep(heap,total,&result)
+                     : kernel_heap_allocate(heap,total,&result);
     if (status != KERNEL_HEAP_STATUS_OK) {
         return status;
     }
@@ -581,6 +583,11 @@ enum kernel_heap_status kernel_heap_allocate_zeroed(
     *pointer = result;
     return KERNEL_HEAP_STATUS_OK;
 }
+
+enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *heap,size_t count,size_t size,void **pointer)
+{ return heap_allocate_zeroed(heap,count,size,pointer,0); }
+enum kernel_heap_status kernel_heap_allocate_zeroed_nosleep(struct kernel_heap *heap,size_t count,size_t size,void **pointer)
+{ return heap_allocate_zeroed(heap,count,size,pointer,1); }
 
 static enum kernel_heap_status allocation_information(
     struct kernel_heap *heap,

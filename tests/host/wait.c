@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include <kernel/time.h>
 #include <kernel/wait_internal.h>
 #include <kernel/sched_runqueue.h>
 #include <assert.h>
@@ -293,8 +294,8 @@ static struct kernel_wait_queue callbacks, nested;
 static struct kernel_wait_node nodes[64];
 static pthread_barrier_t callback_entered, callback_release;
 static unsigned callback_calls;
-static void callback(struct kernel_wait_node *node, uint32_t reason)
-{
+static void callback(struct kernel_wait_node *node, uint32_t reason,uint64_t event)
+{ (void)event;
     assert(reason == KERNEL_WAIT_WOKEN && cpu.preempt_depth && !cpu.raw_locks);
     assert(node->context == &callback_calls);
     callback_calls++;
@@ -618,11 +619,11 @@ static void committed_segments(void)
         /* 真实backend在notify时摘默认节点；不能在通知后读取被清空的next。 */
         {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-            assert(!queue.registrations && runnable.first && runnable.last);
+            assert(!queue.registrations && runnable.count);
         }
         barrier(&segment_woken);
         for (unsigned i = 0; i < count; i++) assert(!pthread_join(workers[i], 0));
-        assert(!runnable.first && !runnable.last && !queue.borrows);
+        assert(!runnable.count && !queue.borrows);
         assert(kernel_wait_queue_close(&queue) == KERNEL_SCHEDULER_STATUS_OK);
         assert(kernel_wait_queue_destroy(&queue) == KERNEL_SCHEDULER_STATUS_OK);
         assert(!pthread_barrier_destroy(&segment_committed) && !pthread_barrier_destroy(&segment_woken));
@@ -635,8 +636,8 @@ struct mixed_context {
     struct kernel_wait_node *extra;
     unsigned before, after, calls, extra_calls;
 };
-static void mixed_callback(struct kernel_wait_node *node, uint32_t reason)
-{
+static void mixed_callback(struct kernel_wait_node *node, uint32_t reason,uint64_t event)
+{ (void)event;
     struct mixed_context *context = node->context;
     assert(reason == KERNEL_WAIT_WOKEN && cpu.preempt_depth && !cpu.raw_locks);
     for (unsigned i = 0; i < context->before; i++) assert(kernel_wait_record_phase(&context->actors[i].wait) == KERNEL_WAIT_NOTIFIED);
@@ -645,8 +646,8 @@ static void mixed_callback(struct kernel_wait_node *node, uint32_t reason)
     kernel_wait_queue_add(context->queue, context->extra);
     context->calls++;
 }
-static void appended_callback(struct kernel_wait_node *node, uint32_t reason)
-{
+static void appended_callback(struct kernel_wait_node *node, uint32_t reason,uint64_t event)
+{ (void)event;
     struct mixed_context *context = node->context;
     assert(reason == KERNEL_WAIT_WOKEN && cpu.preempt_depth && !cpu.raw_locks);
     context->extra_calls++;
@@ -711,8 +712,8 @@ static void task_segments(void)
 static struct kernel_wait_queue notification_queues[2];
 static uint64_t callback_sequence;
 static unsigned notification_calls;
-static void sequence_callback(struct kernel_wait_node *node, uint32_t reason)
-{
+static void sequence_callback(struct kernel_wait_node *node, uint32_t reason,uint64_t event)
+{ (void)event;
     (void)reason;
     uint64_t sequence = kernel_wait_notification_sequence();
     assert(sequence && cpu.preempt_depth && !cpu.raw_locks);
@@ -746,8 +747,8 @@ static void notification_sequences(void)
 static struct kernel_wait_queue retiring;
 static struct kernel_wait_node retiring_node;
 static pthread_barrier_t retiring_entered,retiring_leave;
-static void pollfree_callback(struct kernel_wait_node *node,uint32_t reason)
-{
+static void pollfree_callback(struct kernel_wait_node *node,uint32_t reason,uint64_t event)
+{ (void)event;
     assert(reason==KERNEL_WAIT_POLL_FREE);
     assert(node==&retiring_node && !kernel_cpu_current()->raw_locks);
     kernel_wait_queue_remove(node);
@@ -777,9 +778,12 @@ static void pollfree_lifetime(void)
     assert(!pthread_barrier_destroy(&retiring_entered)&&!pthread_barrier_destroy(&retiring_leave));
     puts("wait: POLLFREE detaches callbacks and retains source through prior cursors passed");
 }
+enum kernel_time_status kernel_time_deadline_from_realtime(uint64_t ns,uint64_t *deadline)
+{ *deadline=ns;return KERNEL_TIME_STATUS_OK; }
 static unsigned event_calls[2];
-static void event_callback(struct kernel_wait_node *node,uint32_t reason)
-{ assert(reason==KERNEL_WAIT_WOKEN);(*(unsigned *)node->context)++; }
+static uint64_t observed_event;
+static void event_callback(struct kernel_wait_node *node,uint32_t reason,uint64_t event)
+{ assert(reason==KERNEL_WAIT_WOKEN);observed_event=event;(*(unsigned *)node->context)++; }
 static void event_filtering(void)
 {
     struct kernel_wait_queue queue;kernel_wait_queue_init(&queue);
@@ -794,7 +798,7 @@ static void event_filtering(void)
     assert(kernel_wait_cursor_prepare_event(&queue,&cursor,1,&actors[0]));
     kernel_wait_cursor_wake(&cursor,1);
     assert(kernel_wait_record_phase(&actors[0].wait)==KERNEL_WAIT_NOTIFIED && kernel_wait_record_phase(&actors[1].wait)==KERNEL_WAIT_PREPARED && kernel_wait_record_phase(&actors[2].wait)==KERNEL_WAIT_PREPARED);
-    assert(event_calls[0]==1&&!event_calls[1]);
+    assert(event_calls[0]==1&&!event_calls[1] && observed_event==1);
     assert(kernel_wait_cursor_prepare_event(&queue,&cursor,1,0));
     kernel_wait_cursor_wake(&cursor,1);assert(kernel_wait_record_phase(&actors[2].wait)==KERNEL_WAIT_NOTIFIED&&kernel_wait_record_phase(&actors[1].wait)==KERNEL_WAIT_PREPARED);
     /* A mask replacement wakes the whole source, independent of old interest. */

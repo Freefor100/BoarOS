@@ -11,6 +11,7 @@ struct kernel_epoll_item;
 struct kernel_record_lock;
 struct kernel_char_device;
 struct kernel_block_device;
+struct kernel_async_io;
 
 struct kernel_open_file_description {
     struct kernel_vfs_file file;
@@ -25,6 +26,7 @@ struct kernel_open_file_description {
     uint64_t proc_identity;
     uint32_t open_flags;
     uint32_t references;
+    struct kernel_async_io *async_io; /* On demand; shared by all OFD aliases. */
     uint8_t kind;
     uint8_t vfs_closed;
     uint8_t notify_opened;

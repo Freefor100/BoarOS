@@ -749,8 +749,8 @@ static void *tcp_write_revoke(void *unused)
     tcp_write_editor=0;__atomic_store_n(&tcp_write_edit_done,1,__ATOMIC_RELEASE);
     mm_test_finish();return NULL;
 }
-static void tcp_write_work_notification(struct kernel_wait_node *node,uint32_t reason)
-{ (void)node;(void)reason;__atomic_fetch_add(&tcp_write_notifications,1,__ATOMIC_RELEASE); }
+static void tcp_write_work_notification(struct kernel_wait_node *node,uint32_t reason,uint64_t event)
+{ (void)event; (void)node;(void)reason;__atomic_fetch_add(&tcp_write_notifications,1,__ATOMIC_RELEASE); }
 /* SIGPIPE is observed at the signal boundary so this fixture can inspect its target.
  * Every unrelated signal remains an unexpected consumer, rather than a success stub. */
 enum kernel_signal_status __wrap_kernel_signal_send_task(struct kernel_task *task,uint32_t signal,kernel_pid_t sender_tid)

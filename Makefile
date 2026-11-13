@@ -340,6 +340,7 @@ COMMON_C_SOURCES := \
 	fs/pipe.c \
 	fs/record_lock.c \
 	fs/flock.c \
+	fs/async_io.c \
 	fs/files/flock.c \
 	fs/page_cache.c \
 	fs/vfs.c \
@@ -2439,3 +2440,9 @@ test-bpf-host:
 	sh tests/host/bpf-trace.sh
 	sh tests/host/bpf-mmap.sh
 	python3 -B tests/host/bpf-socket-ingress.py
+
+.PHONY: test-async-io-host test-inotify-async-host
+test-async-io-host:
+	sh tests/host/async-io.sh
+test-inotify-async-host:
+	sh tests/host/inotify-async.sh

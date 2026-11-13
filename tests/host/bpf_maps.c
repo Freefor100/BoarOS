@@ -213,8 +213,8 @@ static uint32_t ring_header_at(uint64_t *physical,unsigned size,uint64_t pos)
     return __atomic_load_n(p,__ATOMIC_ACQUIRE);
 }
 static unsigned wakes,pollfree;
-static void ring_wake(struct kernel_wait_node *node,enum kernel_wait_wake_reason reason)
-{
+static void ring_wake(struct kernel_wait_node *node,enum kernel_wait_wake_reason reason,uint64_t event)
+{ (void)event;
     assert(!kernel_cpu_current()->raw_locks);
     if (reason==KERNEL_WAIT_POLL_FREE) { pollfree++;kernel_wait_queue_remove(node); }
     else { assert(reason==KERNEL_WAIT_WOKEN);wakes++; }
