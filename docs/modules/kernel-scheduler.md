@@ -166,7 +166,7 @@ IRQ关闭的短入口复用同一次CPU/current定位，借用在切换或可睡
 缺页服务使用当前执行owner固定的task/MM，不把CPU指针带过睡眠。RV/LA timer
 后端保留已确认的相同事件，避免每次yield重复写硬件，周期IRQ仍自行重装。
 
-任务的`scheduling.priority`保存实际运行优先级，既有就绪/每核资格/CPU0服务与来源保留队列按这个值排序。继承期间才在任务尾部保存基础优先级；sched查询、RTPRIO授权和fork使用基础值，proc的priority展示实际值、rt_priority展示基础值。优先级变更在调度保护内重新发布相关队列，并原子发布实际优先级标量、请求目标CPU调度；实际优先级未变时保留FIFO位置。普通futex与waitv观察到实际优先级为零时，基础优先级也只能为零，直接登记FIFO；RT/PI情况仍在调度保护内读取基础值。MQ按实际优先级的单次快照登记，不读取PI基础字段。每核就绪与保留队列记录被提升的成员，存在此类持锁者时解除该核RT带宽节流，使其能释放锁。
+任务的`scheduling.priority`保存有效RT/PI等级，普通任务为0；实时执行与来源保留队列按该等级排序，普通就绪索引按虚拟运行时间排序。继承期间才在任务尾部保存基础优先级；sched查询、RTPRIO授权和fork使用基础值，proc的priority展示实际值、rt_priority展示基础值。优先级变更在调度保护内重新发布相关队列，并原子发布实际优先级标量、请求目标CPU调度；实际优先级未变时保留FIFO位置。普通futex与waitv观察到实际优先级为零时，基础优先级也只能为零，直接登记FIFO；RT/PI情况仍在调度保护内读取基础值。MQ按实际优先级的单次快照登记，不读取PI基础字段。每核就绪与保留队列记录被提升的成员，存在此类持锁者时解除该核RT带宽节流，使其能释放锁。
 
 sched_setparam/setscheduler/getparam/getscheduler、priority_min/max、rr_get_interval 和 CPU0 affinity 使用真实任务状态；未发布 child 不可被按 TID 查询。BATCH/IDLE/DEADLINE/EXT 的 min/max 查询按固定 Linux 返回 0；OTHER/BATCH/IDLE/FIFO/RR 可设置，DEADLINE/EXT 尚未接入。RESET_ON_FORK 在子任务清除并将继承的 RT 变为 OTHER；exec 保留执行线程的策略。RV 用户执行支持真实1～8核，亲和性与执行资格见 [RV SMP](riscv-smp.md)；nice设置使用下述接口；cgroup配额与deadline scheduler另行实现。
 
@@ -174,7 +174,15 @@ sched_setparam/setscheduler/getparam/getscheduler、priority_min/max、rr_get_in
 
 修改先检查调用者与目标的euid/real/effective身份或CAP_SYS_NICE。降低nice数值时，目标线程组的RLIMIT_NICE软值须至少为20减新nice，或调用者具有CAP_SYS_NICE；setpriority在这项限制失败时返回EACCES，跨属主失败为EPERM。调度策略修改沿其自身EPERM规则。fork/clone继承nice，exec保留；RESET_ON_FORK清除子任务负nice，继承RT策略的子任务恢复OTHER及nice0。RT任务的nice单独保存，不改变实时优先级；getattr的RT nice/runtime仍为0，getpriority与proc nice可观察保存值。
 
-候选在共同调度保护与实际运行队列保护内一次提交。已就绪目标先摘除原索引，再更新nice/策略并重新发布；运行者先结算旧参数的实际CPU时间。proc stat的nice展示保存值，priority展示含PI提升的有效值，rt_priority和policy展示基础策略。组查询与修改复用实际任务借用游标，退出或编号复用不会把旧对象当成新目标。
+候选在共同调度保护与实际运行队列保护内一次提交。只有有效执行优先级变化时才由PI更新过程迁移索引，并保留RT的同级位置、提优先级尾插与降优先级头插规则。单独修改保存nice不移动RT/PI队列，普通READY节点的虚拟时间键也保持原进度；运行者先结算旧参数的实际CPU时间，包括current已指向下一任务但旧栈仍在执行的窗口。proc stat的nice展示保存值，priority展示含PI提升的有效值，rt_priority和policy展示基础策略。组查询与修改复用实际任务借用游标，退出或编号复用不会把旧对象当成新目标。
+
+`sched_setattr(274)`与旧setscheduler/setparam共用候选权限检查和参数发布。原生结构为56字节，兼容48字节及size=0；扩展部分须为零，长度错误尝试回写当前尺寸后返回E2BIG，回写fault仍保留该长度错误。所有用户输入和扩展尾检查在状态保护外完成。
+
+支持RESET_ON_FORK、KEEP_POLICY、KEEP_PARAMS。KEEP_POLICY保持原策略和reset标志；KEEP_PARAMS按目标当前策略导入参数用于校验，实际提交保留原策略、nice和priority，仅处理独立的reset状态。OTHER/BATCH/IDLE的getattr.runtime统一返回默认请求量子10,000,000ns；设置接受0或该值，其他自定义量子返回EOPNOTSUPP。FIFO/RR的runtime/deadline/period按该策略的无效字段处理；不请求UTIL标志时对应数值不改变状态。未知标志返回EINVAL，DEADLINE/EXT、利用率约束与尚未接入的已知扩展返回明确不支持。
+
+有效RT优先级与保存nice共用一次原子发布，避免消息队列在跨核修改期间拼接新旧状态。MQ插入等待者时按实际RT/PI等级及普通nice排序，不为此重取共同调度锁；默认I/O优先级的派生与原始查询规则见后面的I/O优先级说明。
+
+功能消费者为`python3 -B tests/userland/api8.py --program sched_control`。它检查raw/libc返回值、组部分成功与目标限额、fork/exec、KEEP/RESET、远端线程修改和PI下的基础参数；同核CPU份额以功能性进展和允许量子误差检查，不作为吞吐或加速比结论。
 
 RTPRIO、RTTIME限额属于线程组共享的资源记录，普通fork复制、线程clone共享，exec保留。没有CAP_SYS_NICE时，调度修改先满足同属主规则；进入或切换RT策略要求目标组的RTPRIO软值非零，提升优先级可使用目标软值或保留已经取得的更高RT优先级。降低优先级和退出RT沿Linux规则处理；清除RESET_ON_FORK仍需CAP_SYS_NICE。资源数值不裁成99，实际FIFO/RR优先级范围仍为1～99。
 
@@ -295,7 +303,7 @@ SETTLS写r2/TP、child stack写r3/SP、返回a0=0并使ERA前进4字节。LA已�
 
 RV/LA 的 clone 和 clone3 共用进程创建，支持 CLONE_VM、CLONE_FILES、CLONE_FS、CLONE_IO，以及共享 VM 时的 CLONE_SIGHAND 和可选 CLONE_VFORK；线程要求 VM/SIGHAND/THREAD，FILES 和 FS 按标志选择。CHILD_SETTID/CHILD_CLEARTID、SETTLS/PARENT_SETTID 与 CLONE_SYSVSEM 沿实际标志处理。clone3 检查结构长度、扩展字节和子栈范围，再转换成共同创建参数；CLONE_CLEAR_SIGHAND 在独立信号表中重置子进程处理动作，不能与 CLONE_SIGHAND 同用。指定 PID 数组、cgroup 和其他未接入的资源组合返回 ENOTSUP。CLONE_SYSVSEM 的最后共享者退出补偿见[SysV信号量](sysv-sem.md)。
 
-`ioprio_set/get` 支持按线程、进程组和真实 UID 设置或查询优先级；RT 设置检查 CAP_SYS_ADMIN/CAP_SYS_NICE。首次设置时按需分配块 I/O 优先级上下文；CLONE_IO 共享已经存在的对象，父线程没有对象时子线程也从空状态开始。普通 fork 对已设置的优先级生成独立副本，exec 保留执行线程的对象，退出与创建失败归还真实引用。KCMP_IO 比较该对象，包括两个空对象相等；它与每任务持锁和用户页借用的 `kernel_io_context` 分开。固定 Linux 的 `ioprio_set(USER, 0)` 按数值 UID 0 匹配，而 `get(USER, 0)` 查询调用者的真实 UID。当前块队列仍按需求 I/O 和后台回收类别服务，尚未按用户设置的 I/O 优先级调度请求。
+`ioprio_set/get` 支持按线程、进程组和真实 UID 设置或查询优先级；RT 设置检查 CAP_SYS_ADMIN/CAP_SYS_NICE。首次设置时按需分配块 I/O 优先级上下文；CLONE_IO 共享已经存在的对象，父线程没有对象时子线程也从空状态开始。普通 fork 对已设置的优先级生成独立副本，exec 保留执行线程的对象，退出与创建失败归还真实引用。未显式设置时，集合查询按基础策略派生RT/BE/IDLE类，并用(nice+20)/5得到默认级别；单进程原始查询保留NONE。KCMP_IO 比较该对象，包括两个空对象相等；它与每任务持锁和用户页借用的 `kernel_io_context` 分开。固定 Linux 的 `ioprio_set(USER, 0)` 按数值 UID 0 匹配，而 `get(USER, 0)` 查询调用者的真实 UID。当前块队列仍按需求 I/O 和后台回收类别服务，尚未按用户设置的 I/O 优先级调度请求。
 
 CLONE_PIDFD 在复制子任务文件表之后预留父进程 FD 和真实 PID 身份，输出用户地址失败时撤销预留并回收子任务。发布时先取得文件表保护，再在调度保护内安装 FD 并让子任务就绪，因此共享文件表的子任务启动时已能看到该 FD。pidfd 自带 CLOEXEC，线程 pidfd 指向实际 TID。进程可指定退出信号；0 表示不发送信号，非 SIGCHLD 子进程由 __WCLONE 或 __WALL 选择，成功 exec 后恢复 SIGCHLD。
 

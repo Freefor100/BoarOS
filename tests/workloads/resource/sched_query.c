@@ -3,6 +3,8 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
+#include <stdatomic.h>
+#include <sys/resource.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -233,6 +235,11 @@ static void changing_policy(void)
     printf("SCHED-QUERY SNAPSHOT samples=%u stable=%u mixed=%u changes=1024\n",samples,stable,mixed);pass("query-during-policy-change");
 }
 
+#ifndef SCHED_CONTROL_ONLY
+#define SCHED_CONTROL_ONLY 0
+#endif
+static long control_nice(int32_t);
+static void control_attr(struct attr *);
 struct pi_waiter {uint32_t *word;int ready[2];};
 static void *donate(void *p)
 {
@@ -253,18 +260,177 @@ static void pi_base_priority(void)
     struct pi_waiter w={.word=&word};pthread_t th;CHECK(!pipe(w.ready)&&!pthread_create(&th,0,donate,&w));read_byte(w.ready[0]);
     uint64_t end=stamp()+2000000000;
     while(own_effective_priority()!=-61){CHECK(stamp()<end);sched_yield();}
-    state(attr_get(0),SCHED_FIFO,20,0);struct sched_param p;
-    CHECK(!syscall(SYS_sched_getparam,0,&p)&&p.sched_priority==20);
+    unsigned base=20;
+    if(SCHED_CONTROL_ONLY) {
+        CHECK(!setpriority(PRIO_PROCESS,0,7)&&control_nice(0)==7);
+        struct attr changed=attr_get(0);changed.priority=30;control_attr(&changed);base=30;
+        CHECK(own_effective_priority()==-61);
+    }
+    state(attr_get(0),SCHED_FIFO,base,0);struct sched_param p;
+    CHECK(!syscall(SYS_sched_getparam,0,&p)&&p.sched_priority==(int)base);
     CHECK(!syscall(SYS_futex,&word,7|128,0,0,0,0));CHECK(!pthread_join(th,0)&&!word);
-    CHECK(!close(w.ready[0])&&!close(w.ready[1]));policy(0,SCHED_OTHER,0);pass("pi-effective-versus-base-priority");
+    CHECK(!close(w.ready[0])&&!close(w.ready[1]));policy(0,SCHED_OTHER,0);if(SCHED_CONTROL_ONLY)CHECK(!setpriority(PRIO_PROCESS,0,0));pass("pi-effective-versus-base-priority");
+}
+
+#ifndef SCHED_CONTROL_ONLY
+#define SCHED_CONTROL_ONLY 0
+#endif
+static long control_nice(int32_t who)
+{errno=0;long n=getpriority(PRIO_PROCESS,who);CHECK(n!=-1||!errno);return n;}
+static void control_attr(struct attr *a)
+{CHECK(!syscall(SYS_sched_setattr,0,a,0));}
+static void control_policy(int kind,int n)
+{struct attr a={.size=sizeof(a),.policy=(uint32_t)kind,.nice=n};control_attr(&a);}
+static void control_abi(void)
+{
+    CHECK(control_nice(0)==0&&syscall(SYS_getpriority,PRIO_PROCESS,0)==20);
+    CHECK(!setpriority(PRIO_PROCESS,0,-1));errno=0;CHECK(getpriority(PRIO_PROCESS,0)==-1&&!errno);
+    CHECK(syscall(SYS_getpriority,PRIO_PROCESS,0)==21);
+    CHECK(!setpriority(PRIO_PROCESS,0,100)&&control_nice(0)==19);
+    CHECK(!setpriority(PRIO_PROCESS,0,-100)&&control_nice(0)==-20);
+    CHECK(!setpriority(PRIO_PROCESS,0,0));CHECK(nice(1)==1);CHECK(!setpriority(PRIO_PROCESS,0,0));
+    ERROR(syscall(SYS_getpriority,3,0),EINVAL);ERROR(syscall(SYS_setpriority,3,0,0),EINVAL);
+    ERROR(syscall(SYS_getpriority,0,-1),ESRCH);
+    unsigned char bytes[80]={0};struct attr *a=(void *)bytes;
+    a->size=0;a->policy=SCHED_BATCH;a->nice=5;control_attr(a);
+    struct attr got=attr_get(0);CHECK(got.policy==SCHED_BATCH&&got.nice==5);
+    a->size=56;a->nice=7;a->policy=99;a->flags=8;control_attr(a);
+    got=attr_get(0);CHECK(got.policy==SCHED_BATCH&&got.nice==7);
+    *a=got;a->policy=SCHED_OTHER;a->nice=-20;a->flags=16;control_attr(a);
+    got=attr_get(0);CHECK(got.policy==SCHED_BATCH&&got.nice==7);
+    *a=got;a->nice=3;control_attr(a);CHECK(control_nice(0)==3); /* get-modify-set */
+    a->size=47;ERROR(syscall(SYS_sched_setattr,0,a,0),E2BIG);CHECK(a->size==56&&control_nice(0)==3);
+    a->size=80;bytes[79]=1;ERROR(syscall(SYS_sched_setattr,0,a,0),E2BIG);CHECK(a->size==56);
+    bytes[79]=0;a->size=80;control_attr(a);
+    a->size=48;a->flags=0x20;ERROR(syscall(SYS_sched_setattr,0,a,0),EINVAL);
+    a->size=56;a->flags=UINT64_C(1)<<63;ERROR(syscall(SYS_sched_setattr,0,a,0),EINVAL);
+    a->flags=0;ERROR(syscall(SYS_sched_setattr,0,a,1),EINVAL);ERROR(syscall(SYS_sched_setattr,0,(void *)1,0),EFAULT);
+    if(boaros){a->runtime=2000000;ERROR(syscall(SYS_sched_setattr,0,a,0),EOPNOTSUPP);a->runtime=0;
+        a->flags=0x20;ERROR(syscall(SYS_sched_setattr,0,a,0),EOPNOTSUPP);a->flags=0;}
+    control_policy(SCHED_OTHER,0);pass("nice-native-libc-and-attr-abi");
+}
+static void control_inherit(void)
+{
+    control_policy(SCHED_BATCH,6);
+    pid_t child=fork();CHECK(child>=0);
+    if(!child){CHECK(control_nice(0)==6);execl("/sched_control","sched_control","--nice-exec",(char *)0);_exit(91);}child_ok(child);
+    struct attr a={.size=56,.policy=SCHED_BATCH,.nice=-5,.flags=1};control_attr(&a);
+    child=fork();CHECK(child>=0);
+    if(!child){struct attr got=attr_get(0);CHECK(got.policy==SCHED_BATCH&&got.nice==0&&!got.flags);_exit(0);}child_ok(child);
+    a=(struct attr){.size=56,.policy=SCHED_FIFO,.priority=20,.flags=1};control_attr(&a);
+    child=fork();CHECK(child>=0);
+    if(!child){struct attr got=attr_get(0);CHECK(got.policy==SCHED_OTHER&&got.nice==0&&!got.priority&&!got.flags);_exit(0);}child_ok(child);
+    control_policy(SCHED_OTHER,0);pass("nice-fork-exec-reset");
+}
+static void control_permissions(void)
+{
+    pid_t child=fork();CHECK(child>=0);
+    if(!child){struct rlimit limit={25,25};CHECK(!setrlimit(RLIMIT_NICE,&limit)&&!setuid(1001));
+        CHECK(!setpriority(PRIO_PROCESS,0,-5));ERROR(setpriority(PRIO_PROCESS,0,-6),EACCES);
+        limit=(struct rlimit){0,0};CHECK(!setrlimit(RLIMIT_NICE,&limit));CHECK(!setpriority(PRIO_PROCESS,0,5));
+        ERROR(setpriority(PRIO_PROCESS,0,0),EACCES);
+        struct attr a={.size=56,.policy=SCHED_OTHER,.nice=0};ERROR(syscall(SYS_sched_setattr,0,&a,0),EPERM);
+        a.policy=SCHED_IDLE;a.nice=5;control_attr(&a);CHECK(attr_get(0).policy==SCHED_IDLE);
+        a.policy=SCHED_BATCH;ERROR(syscall(SYS_sched_setattr,0,&a,0),EPERM);_exit(0);}
+    child_ok(child);
+    int ready[2],release[2];CHECK(!pipe(ready)&&!pipe(release));pid_t peers[2];
+    for(unsigned i=0;i<2;i++) {
+        peers[i]=fork();CHECK(peers[i]>=0);
+        if(!peers[i]){CHECK(!setpgid(0,i?peers[0]:0));struct rlimit limit={i?0:21,i?0:21};
+            CHECK(!setrlimit(RLIMIT_NICE,&limit)&&!setuid(1001));send_byte(ready[1]);read_byte(release[0]);_exit(0);}
+        read_byte(ready[0]);
+    }
+    child=fork();CHECK(child>=0);
+    if(!child){CHECK(!setpgid(0,peers[0]));struct rlimit limit={0,0};CHECK(!setrlimit(RLIMIT_NICE,&limit)&&!setuid(1001));
+        ERROR(setpriority(PRIO_USER,0,-1),EACCES);CHECK(control_nice(peers[0])==-1&&control_nice(peers[1])==0&&control_nice(0)==0);
+        errno=0;CHECK(getpriority(PRIO_PGRP,0)==-1&&!errno);
+        CHECK(!setpriority(PRIO_PGRP,0,7)&&getpriority(PRIO_USER,0)==7);_exit(0);}
+    child_ok(child);CHECK(control_nice(peers[0])==7&&control_nice(peers[1])==7);
+    child=fork();CHECK(child>=0);
+    if(!child){CHECK(!setuid(1002));ERROR(setpriority(PRIO_PROCESS,peers[0],8),EPERM);_exit(0);}child_ok(child);
+    send_byte(release[1]);send_byte(release[1]);child_ok(peers[0]);child_ok(peers[1]);
+    CHECK(!close(ready[0])&&!close(ready[1])&&!close(release[0])&&!close(release[1]));pass("nice-target-limits-group-partial-and-owner");
+}
+struct control_thread {pthread_barrier_t gate;_Atomic int tid,phase;int channel[2];unsigned cpu;};
+static void *control_actor(void *arg)
+{
+    struct control_thread *t=arg;cpu_set_t set;CPU_ZERO(&set);CPU_SET(t->cpu,&set);CHECK(!sched_setaffinity(0,sizeof(set),&set));
+    atomic_store(&t->tid,(int)syscall(SYS_gettid));barrier(&t->gate);read_byte(t->channel[0]);atomic_store(&t->phase,1);
+    while(atomic_load(&t->phase)==1)__asm__ volatile("":::"memory");
+    CHECK(control_nice(0)==4);return NULL;
+}
+static void control_remote(void)
+{
+    cpu_set_t allowed;CHECK(!sched_getaffinity(0,sizeof(allowed),&allowed));unsigned first=CPU_SETSIZE,last=0;
+    for(unsigned i=0;i<CPU_SETSIZE;i++)if(CPU_ISSET(i,&allowed)){if(first==CPU_SETSIZE)first=i;last=i;}
+    CHECK(first!=CPU_SETSIZE);cpu_set_t one;CPU_ZERO(&one);CPU_SET(first,&one);CHECK(!sched_setaffinity(0,sizeof(one),&one));
+    struct control_thread t={.cpu=last};CHECK(!pipe(t.channel)&&!pthread_barrier_init(&t.gate,0,2));pthread_t thread;
+    CHECK(!pthread_create(&thread,0,control_actor,&t));barrier(&t.gate);int tid=atomic_load(&t.tid);
+    CHECK(!setpriority(PRIO_PROCESS,tid,5)&&control_nice(tid)==5&&control_nice(0)==0);
+    struct attr a={.size=56,.policy=SCHED_BATCH,.nice=6};CHECK(!syscall(SYS_sched_setattr,tid,&a,0));
+    CHECK(attr_get(tid).nice==6&&attr_get(tid).policy==SCHED_BATCH);
+    send_byte(t.channel[1]);while(!atomic_load(&t.phase))sched_yield();
+    CHECK(!setpriority(PRIO_PROCESS,tid,4));CPU_ZERO(&one);CPU_SET(first,&one);CHECK(!sched_setaffinity(tid,sizeof(one),&one));
+    atomic_store(&t.phase,2);CHECK(!pthread_join(thread,0)&&!pthread_barrier_destroy(&t.gate));
+    /* clear_child_tid can finish pthread_join before the exiting task has
+     * detached its PID. Until then its saved nice remains queryable. */
+    uint64_t until=stamp()+2000000000;
+    for(;;){errno=0;long raw=syscall(SYS_getpriority,PRIO_PROCESS,tid);
+        if(raw==-1&&errno==ESRCH)break;
+        CHECK(raw==16&&stamp()<until);sched_yield();}
+
+    CHECK(!close(t.channel[0])&&!close(t.channel[1])&&!sched_setaffinity(0,sizeof(allowed),&allowed));
+    pass("nice-blocked-running-migration-and-exit");
+}
+struct share_case {pthread_barrier_t gate;_Atomic int stop;unsigned cpu;int policy;uint64_t times[2];};
+struct share_actor {struct share_case *test;unsigned index;};
+static void *share_actor(void *arg)
+{
+    struct share_actor *actor=arg;struct share_case *t=actor->test;unsigned i=actor->index;
+    cpu_set_t set;CPU_ZERO(&set);CPU_SET(t->cpu,&set);CHECK(!sched_setaffinity(0,sizeof(set),&set));
+    control_policy(i?t->policy:SCHED_OTHER,i?5:0);barrier(&t->gate);
+    struct timespec start,end;CHECK(!clock_gettime(CLOCK_THREAD_CPUTIME_ID,&start));
+    uint64_t work=1;while(!atomic_load_explicit(&t->stop,memory_order_relaxed)){
+        for(unsigned n=0;n<4096;n++)work=work*6364136223846793005ULL+1;
+        __asm__ volatile(""::"r"(work):"memory");}
+    CHECK(!clock_gettime(CLOCK_THREAD_CPUTIME_ID,&end));t->times[i]=(uint64_t)(end.tv_sec-start.tv_sec)*1000000000+end.tv_nsec-start.tv_nsec;return NULL;
+}
+static void control_shares(void)
+{
+    cpu_set_t set;CHECK(!sched_getaffinity(0,sizeof(set),&set));unsigned cpu=0;while(!CPU_ISSET(cpu,&set))cpu++;
+    for(unsigned pass_no=0;pass_no<3;pass_no++){
+        struct share_case t={.cpu=cpu,.policy=pass_no==0?SCHED_OTHER:pass_no==1?SCHED_BATCH:SCHED_IDLE};
+        CHECK(!pthread_barrier_init(&t.gate,0,3));struct share_actor actors[2]={{&t,0},{&t,1}};pthread_t threads[2];
+        for(unsigned i=0;i<2;i++)CHECK(!pthread_create(&threads[i],0,share_actor,&actors[i]));
+        barrier(&t.gate);
+        /* Readiness is the barrier; this fixed interval tests CPU allocation,
+         * rather than using a delay as a concurrency handshake. */
+        struct timespec until;CHECK(!clock_gettime(CLOCK_MONOTONIC,&until));until.tv_nsec+=400000000;
+        if(until.tv_nsec>=1000000000){until.tv_sec++;until.tv_nsec-=1000000000;}
+        CHECK(!clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&until,NULL));atomic_store(&t.stop,1);
+        for(unsigned i=0;i<2;i++)CHECK(!pthread_join(threads[i],0));
+        CHECK(!pthread_barrier_destroy(&t.gate));
+        CHECK(t.times[0]>t.times[1]+t.times[1]/2&&t.times[1]>0);
+        printf("SCHED-CONTROL SHARE policy=%d high_cpu_ns=%llu low_cpu_ns=%llu\n",t.policy,(unsigned long long)t.times[0],(unsigned long long)t.times[1]);
+    }
+    pass("nice-other-batch-idle-cpu-share");
+}
+static void controls(void)
+{
+    puts("SCHED-CONTROL BEGIN");control_abi();control_inherit();control_permissions();control_remote();control_shares();pi_base_priority();
+    CHECK(control_nice(0)==0&&attr_get(0).policy==SCHED_OTHER);printf("SCHED-CONTROL END cases=%u\n",cases);
 }
 
 int main(int argc,char **argv)
 {
+    if(argc==2&&!strcmp(argv[1],"--nice-exec")) {
+        CHECK(control_nice(0)==6&&attr_get(0).policy==SCHED_BATCH);return 0;
+    }
     host_safe=argc==2&&!strcmp(argv[1],"--host-safe");CHECK(argc==1||host_safe);
     setvbuf(stdout,0,_IONBF,0);alarm(30);page_size=(size_t)sysconf(_SC_PAGESIZE);
-    struct utsname uts;CHECK(!uname(&uts));boaros=strstr(uts.release,"boaros")!=0;
+    struct utsname uts;CHECK(!uname(&uts));boaros=strstr(uts.version,"BoarOS")!=0;
     if(getpid()==1){mkdir("/proc",0755);CHECK(!mount("proc","/proc","proc",0,0)||errno==EBUSY);}
+    if(SCHED_CONTROL_ONLY){controls();alarm(0);return 0;}
     puts("SCHED-QUERY BEGIN");sizes_and_order();output_fault();cpu_queries();lifetime();
     if(host_safe)puts("SCHED-QUERY SKIP privileged-policy-and-pi host-safe");
     else {policies();changing_policy();pi_base_priority();}

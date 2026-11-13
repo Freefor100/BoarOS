@@ -1,4 +1,5 @@
 #include "../../kernel/sched/private.h"
+#include "../../kernel/sched/futex_internal.h"
 #include <arch/timer.h>
 #include <kernel/time.h>
 #include <kernel/credentials.h>
@@ -7,6 +8,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <sched.h>
+#include <string.h>
 
 struct kernel_scheduler scheduler;
 _Thread_local uintptr_t sync_test_irq;
@@ -965,13 +967,84 @@ static void nice_permissions(void)
     caller.effective=UINT64_C(1)<<KERNEL_CAP_SYS_NICE;
     assert(!kernel_task_priority(&tasks[0],1,2,1002,-30) && tasks[1].scheduling.nice==-20);
     assert(kernel_task_priority(&tasks[0],0,3,0,0)==-KERNEL_EINVAL);
+    struct kernel_sched_attr a={.size=56,.policy=KERNEL_SCHED_BATCH,.nice=6,.runtime=KERNEL_SCHED_FAIR_NS};
+    assert(!kernel_task_sched_setattr(&tasks[0],0,&a)&&tasks[0].scheduling.nice==6);
+    a.policy=99;a.flags=8;a.nice=4;
+    assert(!kernel_task_sched_setattr(&tasks[0],0,&a)&&tasks[0].scheduling.policy==KERNEL_SCHED_BATCH);
+    a.policy=KERNEL_SCHED_OTHER;a.flags=16;a.nice=-20;a.runtime=1;
+    assert(!kernel_task_sched_setattr(&tasks[0],0,&a)&&tasks[0].scheduling.nice==4&&tasks[0].scheduling.policy==KERNEL_SCHED_BATCH);
+    a.flags=0;a.runtime=1;assert(kernel_task_sched_setattr(&tasks[0],0,&a)==-KERNEL_ENOTSUP);
+    a=(struct kernel_sched_attr){.size=56,.policy=KERNEL_SCHED_FIFO,.priority=30,.nice=-20};
+    assert(!kernel_task_sched_setattr(&tasks[0],0,&a)&&tasks[0].scheduling.nice==4&&tasks[0].scheduling.priority==30);
+    a=(struct kernel_sched_attr){.size=56,.policy=KERNEL_SCHED_OTHER,.nice=4};
+    assert(!kernel_task_sched_setattr(&tasks[0],0,&a));
+    struct kernel_sched_policy old=tasks[0].scheduling;
+    uint64_t virtual_before=tasks[0].ready_node.fair.key;
+    cpus[0].accounting_owner=&tasks[0];cpus[0].accounting_user_ticks=123456;
+    cpus[0].accounting_started_ticks=now;tasks[0].wait.on_cpu=1;
+    assert(cpus[0].current!=&tasks[0]); /* next task published, old stack retained */
+    assert(!kernel_task_priority(&tasks[0],1,0,0,5));
+    assert(tasks[0].fair_runtime_seen==123456 && tasks[0].ready_node.fair.key==
+        virtual_before+kernel_sched_fair_delta(&old,123456));
+    tasks[0].wait.on_cpu=0;cpus[0].accounting_owner=0;
     assert(!tasks[0].storage_borrows&&!tasks[1].storage_borrows);
     puts("nice: real UID sets, per-target limits, partial success and privilege passed");
 }
 
-int main(void)
+static void fair_wake_policy(void)
 {
-    nice_permissions();
+    scheduler=(struct kernel_scheduler){0};
+    kernel_cpu_initialize(&cpus[0],0,0);active_cpu=&cpus[0];kernel_wait_domain_init();
+    tasks[0]=tasks[1]=(struct kernel_task){.magic=KERNEL_THREAD_MAGIC,.accounted=1};
+    for(unsigned i=0;i<2;i++){tasks[i].cpu=&cpus[0];tasks[i].cpu_mask=1;tasks[i].fair_queue=&cpus[0].runqueue;}
+    tasks[0].state=KERNEL_THREAD_STATE_RUNNING;tasks[0].wait.on_cpu=1;cpus[0].current=&tasks[0];
+    tasks[0].ready_node.fair.key=2000000;tasks[1].state=KERNEL_THREAD_STATE_READY;
+    KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+    tasks[1].scheduling.policy=KERNEL_SCHED_BATCH;cpus[0].need_resched=0;
+    ready_enqueue_locked(&tasks[1],0);assert(!cpus[0].need_resched);ready_remove_locked(&tasks[1]);
+    tasks[1].scheduling.policy=KERNEL_SCHED_OTHER;
+    ready_enqueue_locked(&tasks[1],0);assert(cpus[0].need_resched);ready_remove_locked(&tasks[1]);
+    cpus[0].need_resched=0;tasks[0].ready_node.fair.key=500000;
+    ready_enqueue_locked(&tasks[1],0);assert(!cpus[0].need_resched);ready_remove_locked(&tasks[1]);
+    tasks[0].scheduling.policy=KERNEL_SCHED_IDLE;tasks[1].scheduling.policy=KERNEL_SCHED_BATCH;
+    ready_enqueue_locked(&tasks[1],0);assert(cpus[0].need_resched);ready_remove_locked(&tasks[1]);
+    puts("fair wake: OTHER granularity, BATCH restraint and IDLE response passed");
+}
+
+static void rt_parameter_queue_order(void)
+{
+    scheduler=(struct kernel_scheduler){0};kernel_cpu_initialize(&cpus[0],0,0);
+    active_cpu=&cpus[0];kernel_wait_domain_init();idles[0]=(struct kernel_task){.idle=1};cpus[0].current=&idles[0];
+    struct kernel_credentials root={.effective=UINT64_C(1)<<KERNEL_CAP_SYS_NICE};
+    for(unsigned i=0;i<3;i++) {
+        tasks[i]=(struct kernel_task){.magic=KERNEL_THREAD_MAGIC,.accounted=1,.tid_owned=1,.state=KERNEL_THREAD_STATE_READY};
+        tasks[i].cpu=&cpus[0];tasks[i].cpu_mask=1;tasks[i].arch.user_mode=1;tasks[i].credentials=&root;
+        tasks[i].scheduling.policy=KERNEL_SCHED_FIFO;tasks[i].scheduling.priority=20;
+    }
+    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);ready_enqueue_locked(&tasks[0],0);ready_enqueue_locked(&tasks[1],0);}
+    assert(!kernel_task_priority(&tasks[0],1,0,0,8));
+    assert(kernel_sched_pick(&cpus[0].runqueue,1)==&tasks[0].ready_node);
+    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);scheduler_pi_priority_locked(&tasks[0],80,0);}
+    struct kernel_sched_attr attr={.size=56,.policy=KERNEL_SCHED_FIFO,.priority=20};
+    assert(!kernel_task_sched_setattr(&tasks[0],0,&attr));
+    assert(kernel_sched_pick(&cpus[0].runqueue,1)==&tasks[0].ready_node);
+    struct kernel_futex_pi_request donor={.task=&tasks[2]};
+    struct kernel_futex_pi_state owned={.owner=&tasks[0],.head=&donor,.tail=&donor};
+    donor.state=&owned;donor.queued=1;tasks[2].pi_request=&donor;
+    tasks[2].state=KERNEL_THREAD_STATE_BLOCKED;tasks[2].scheduling.priority=20;tasks[0].pi_owned=&owned;
+    attr=(struct kernel_sched_attr){.size=56,.policy=KERNEL_SCHED_OTHER,.nice=8};
+    assert(!kernel_task_sched_setattr(&tasks[0],0,&attr));
+    assert(!kernel_task_priority(&tasks[0],1,0,0,9));
+    assert(kernel_sched_pick(&cpus[0].runqueue,1)==&tasks[0].ready_node && scheduler_base_priority(&tasks[0])==0);
+    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);tasks[0].pi_owned=0;scheduler_pi_priority_locked(&tasks[0],0,0);
+     ready_remove_locked(&tasks[0]);ready_remove_locked(&tasks[1]);tasks[2].pi_request=0;}
+    puts("RT parameter updates retain FIFO order, demotion head and PI owner's position");
+}
+
+int main(int argc,char **argv)
+{
+    nice_permissions();fair_wake_policy();rt_parameter_queue_order();
+    if(argc==2&&!strcmp(argv[1],"--nice-only"))return 0;
     accounting_progress_without_scheduler_lock();
     cpu_time_without_ticks();
     resource_snapshot();

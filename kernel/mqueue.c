@@ -77,7 +77,7 @@ struct kernel_mqueue_request {
     unsigned timed;
     int32_t sender_tgid;
     uint32_t sender_uid,outgoing_reason;
-    int result,sending,queued,wait_priority;
+    int result,sending,queued;
 };
 static struct {
     struct kernel_raw_lock lock;
@@ -448,13 +448,12 @@ static int request_prepare(struct kernel_mqueue_request *r)
     if(kernel_signal_has_pending(r->task)||kernel_signal_termination_requested(r->task))return -KERNEL_ERESTARTSYS;
     if(r->timed ? kernel_wait_prepare_realtime(0,r->deadline,1,&r->token) :
         kernel_wait_prepare(0,0,1,&r->token))__builtin_trap();
-    /* 只需登记时的实际优先级标量；PI/策略更新按同一原子字段发布。 */
-    r->wait_priority=__atomic_load_n(&r->task->scheduling.priority,__ATOMIC_RELAXED);
+    int priority=kernel_sched_wait_priority(&r->task->scheduling);
     struct kernel_mqueue *q=r->queue;
     struct kernel_mqueue_request **head=r->sending?&q->send_head:&q->recv_head;
     struct kernel_mqueue_request **tail=r->sending?&q->send_tail:&q->recv_tail;
     struct kernel_mqueue_request *next=*head;
-    while(next&&next->wait_priority>=r->wait_priority)next=next->next;
+    while(next&&kernel_sched_wait_priority(&next->task->scheduling)>=priority)next=next->next;
     r->next=next;r->previous=next?next->previous:*tail;
     if(r->previous)r->previous->next=r;else *head=r;
     if(next)next->previous=r;else *tail=r;

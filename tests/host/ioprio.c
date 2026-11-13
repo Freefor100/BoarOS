@@ -76,6 +76,14 @@ int main(void)
     cpu.current=&caller;kernel_raw_lock_init(&kernel_wait_domain,KERNEL_RAW_RANK_SCHEDULER);
     caller.tid_owned=1;caller.files.heap=&heap;caller.credentials=&credentials;
     target.tid_owned=1;target.files.heap=&heap;target.credentials=&credentials;
+    caller.scheduling.nice=-10;
+    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(effective_locked(&caller)==((2<<13)|2));}
+    assert(!kernel_ioprio_call(&caller,0,1,0,0)); /* historical process query remains NONE */
+    caller.scheduling.policy=KERNEL_SCHED_IDLE;
+    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(effective_locked(&caller)==((3<<13)|2));}
+    caller.scheduling.policy=KERNEL_SCHED_FIFO;caller.scheduling.nice=5;
+    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(effective_locked(&caller)==((1<<13)|5));}
+    caller.scheduling=(struct kernel_sched_policy){0};
     exit_during_lookup(0);exit_during_lookup(1);
     assert(!kernel_ioprio_call(&caller,1,1,0,(2<<13)|4));
     fail_alloc=1;assert(kernel_ioprio_clone(&caller,&target,0)==-KERNEL_ENOMEM && !target.io_priority);fail_alloc=0;

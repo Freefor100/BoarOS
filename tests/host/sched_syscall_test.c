@@ -27,6 +27,15 @@ int64_t __wrap_kernel_task_priority(struct kernel_task *caller,int setting,int32
     (void)caller;if(which<0||which>2)return -KERNEL_EINVAL;if(who)return -KERNEL_ESRCH;
     if(setting){state.nice=nice<-20?-20:nice>19?19:nice;return 0;}return 20-state.nice;
 }
+int __wrap_kernel_task_sched_setattr(struct kernel_task *caller,int32_t pid,const struct kernel_sched_attr *input)
+{
+    (void)caller;if(pid>1)return -KERNEL_ESRCH;
+    if(input->flags&~UINT64_C(0x7f))return -KERNEL_EINVAL;
+    if(input->flags&0x66U)return -KERNEL_ENOTSUP;
+    struct kernel_sched_policy candidate=state;
+    int result=kernel_sched_policy_set(&candidate,(int)input->policy|((input->flags&1U)?KERNEL_SCHED_RESET_ON_FORK:0),(int)input->priority,0);
+    if(!result){candidate.nice=input->nice;state=candidate;}return result;
+}
 enum kernel_task_status kernel_task_mm_borrow_mutable(struct kernel_task *task,struct kernel_mm **mm)
 {(void)task;*mm=0;return KERNEL_TASK_STATUS_OK;}
 enum kernel_uaccess_status kernel_copy_to_user(struct kernel_mm *mm,uint64_t address,const void *source,size_t size,size_t *copied)
@@ -73,11 +82,32 @@ static void getattr_abi(void)
     assert(call(275,0,(uintptr_t)&attr,56)==0);
     assert(!attr.policy&&!attr.priority&&!attr.flags&&attr.runtime==10000000);
 }
+static void setattr_abi(void)
+{
+    unsigned char bytes[80]={0};struct kernel_sched_attr *attr=(void *)bytes;
+    attr->size=56;attr->policy=3;attr->nice=5;
+    assert(!call(274,0,(uintptr_t)bytes,0)&&state.policy==3&&state.nice==5);
+    attr->nice=100;assert(!call(274,0,(uintptr_t)bytes,0)&&state.nice==19);
+    attr->nice=-30;attr->size=0;assert(!call(274,0,(uintptr_t)bytes,0)&&state.nice==-20);
+    attr->size=47;assert(call(274,0,(uintptr_t)bytes,0)==-KERNEL_E2BIG&&attr->size==56);
+    attr->size=80;bytes[79]=1;assert(call(274,0,(uintptr_t)bytes,0)==-KERNEL_E2BIG&&attr->size==56);
+    bytes[79]=0;attr->size=80;assert(!call(274,0,(uintptr_t)bytes,0));
+    attr->size=48;attr->flags=0x20;assert(call(274,0,(uintptr_t)bytes,0)==-KERNEL_EINVAL);
+    attr->size=56;assert(call(274,0,(uintptr_t)bytes,0)==-KERNEL_ENOTSUP);
+    attr->flags=0;assert(call(274,0,(uintptr_t)bytes,1)==-KERNEL_EINVAL);
+    assert(call(274,0,1,0)==-KERNEL_EFAULT);
+    attr->size=47;output_limit=(uintptr_t)bytes;assert(call(274,0,(uintptr_t)bytes,0)==-KERNEL_E2BIG);output_limit=0;
+    state=(struct kernel_sched_policy){0};
+    puts("scheduler setattr import/size writeback/flags/fault/commit parsing PASS");
+}
+
 int main(void)
 {
     kernel_cpu_initialize(&cpu, 0, &io);
     kernel_raw_lock_init(&kernel_wait_domain, KERNEL_RAW_RANK_SCHEDULER);
     task.accounted = 1; task.arch.user_mode = 1; task.tid_owned = 1;
+    assert(call(274,-1,0,0)==-KERNEL_EINVAL);
+    setattr_abi();
     assert(call(141,0,0,0)==20);
     assert(call(140,0,0,UINT64_C(0x100000005))==0 && call(141,0,0,0)==15);
     assert(call(140,0,0,(uint32_t)-21)==0 && call(141,0,0,0)==40);

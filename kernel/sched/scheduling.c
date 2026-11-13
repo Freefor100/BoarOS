@@ -1177,7 +1177,7 @@ void scheduler_pi_priority_locked(struct kernel_task *task,unsigned base,unsigne
 #endif
     }
     task->pi_base_priority=saved;
-    __atomic_store_n(&task->scheduling.priority,(int)priority,__ATOMIC_RELAXED);
+    kernel_sched_publish_priority(&task->scheduling,(int)priority,task->scheduling.nice);
 #if BOAROS_USER_SMP
     if(move && reservation && priority) {
         task->reservation_cpu=reservation;
@@ -1201,36 +1201,32 @@ void scheduler_pi_priority_locked(struct kernel_task *task,unsigned base,unsigne
 static int nice_reduction_allowed(struct kernel_task *target,int nice)
 { return (uint64_t)(20-nice)<=target->limits->values[KERNEL_RLIMIT_NICE].current; }
 
-/* The caller holds the identity domain and participating run queues. Queue
- * ownership is removed before changing the parameters used by its index. */
+/* Effective priority alone changes index membership. The PI updater owns
+ * removal and RT head/tail placement; saved nice changes neither an RT FIFO
+ * position nor a READY fair node's virtual-runtime key. */
 static void sched_commit_locked(struct kernel_task *task,const struct kernel_sched_policy *updated)
 {
     if(task->scheduling.policy==updated->policy && task->scheduling.nice==updated->nice &&
-        scheduler_base_priority(task)==(unsigned)updated->priority &&
-        task->scheduling.reset_on_fork==updated->reset_on_fork)return;
-    if(task->wait.on_cpu && task->cpu && task->cpu->current==task)
-        account_cpu(task->cpu,kernel_time_monotonic_ns());
-    int queued=task->ready_node.queued;
-#if BOAROS_MAX_CPUS > 1
-    struct kernel_cpu *owner=task->ready_cpu;
-#endif
-    if(queued)ready_remove_locked(task);
+        scheduler_base_priority(task)==(unsigned)updated->priority) {
+        task->scheduling.reset_on_fork=updated->reset_on_fork;return;
+    }
+    if(task->wait.on_cpu && task->cpu) {
+        if(task->cpu->current==task)account_cpu(task->cpu,kernel_time_monotonic_ns());
+        else if(task->cpu->accounting_owner==task)
+            scheduler_fair_account(task,scheduler_cpu_execution_ns(task->cpu,task));
+    }
+    int weight_changed=task->scheduling.nice!=updated->nice || task->scheduling.policy!=updated->policy;
+    kernel_sched_publish_priority(&task->scheduling,task->scheduling.priority,updated->nice);
     if(task->pi_owned||task->pi_request)kernel_futex_pi_recalculate_locked(task,updated->priority);
     else scheduler_pi_priority_locked(task,(unsigned)updated->priority,0);
-    if(task->scheduling.nice!=updated->nice || task->scheduling.policy!=updated->policy)
-        task->scheduling.fair_remainder=0;
-    task->scheduling.policy=updated->policy;task->scheduling.nice=updated->nice;
+    if(weight_changed)task->scheduling.fair_remainder=0;
+    task->scheduling.policy=updated->policy;
     task->scheduling.reset_on_fork=updated->reset_on_fork;
     if(updated->policy==KERNEL_SCHED_RR && !task->scheduling.rr_remaining_ns)
         task->scheduling.rr_remaining_ns=KERNEL_SCHED_RR_NS;
-    if(queued)ready_enqueue_at_locked(task,0
-#if BOAROS_MAX_CPUS > 1
-        ,owner
-#endif
-        );
     struct kernel_cpu *cpu=task->cpu?task->cpu:kernel_cpu_current();
 #if BOAROS_MAX_CPUS > 1
-    if(queued)cpu=owner;
+    if(task->ready_node.queued)cpu=task->ready_cpu;
 #endif
     kernel_cpu_request_schedule(cpu);
 }
@@ -1267,6 +1263,49 @@ int kernel_task_sched_set(struct kernel_task *caller,int32_t pid,int policy,int 
     if(!result)scheduler_rearm_timer();
     return result;
 }
+int kernel_task_sched_setattr(struct kernel_task *caller,int32_t pid,const struct kernel_sched_attr *input)
+{
+    if(pid<0)return -KERNEL_EINVAL;
+    int result=-KERNEL_ESRCH;
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        struct kernel_task *task=sched_target(caller,pid);
+        if(task) {
+            KERNEL_RUN_SET(runs);
+            struct kernel_sched_attr attr=*input;
+            int policy=(attr.flags&8U)?task->scheduling.policy:(int)attr.policy;
+            if(attr.flags&16U) {
+                if(task->scheduling.policy==KERNEL_SCHED_FIFO || task->scheduling.policy==KERNEL_SCHED_RR)
+                    attr.priority=scheduler_base_priority(task);
+                else {attr.nice=task->scheduling.nice;attr.runtime=KERNEL_SCHED_FAIR_NS;}
+            }
+            if(attr.flags&~UINT64_C(0x7f))result=-KERNEL_EINVAL;
+            else if(attr.flags&0x66U)result=-KERNEL_ENOTSUP;
+            else if(policy==6||policy==7)result=-KERNEL_ENOTSUP;
+            else if(policy!=0&&policy!=1&&policy!=2&&policy!=3&&policy!=5)result=-KERNEL_EINVAL;
+            else if(attr.priority>99)result=-KERNEL_EINVAL;
+            else if(policy!=KERNEL_SCHED_FIFO && policy!=KERNEL_SCHED_RR &&
+                    attr.runtime && attr.runtime!=KERNEL_SCHED_FAIR_NS)result=-KERNEL_ENOTSUP;
+            else {
+                struct kernel_sched_policy updated=task->scheduling;
+                updated.priority=(int)scheduler_base_priority(task);
+                int requested=policy|((attr.flags&1U)?KERNEL_SCHED_RESET_ON_FORK:0);
+                result=kernel_sched_policy_set(&updated,requested,(int)attr.priority,(attr.flags&8U)!=0);
+                if(policy!=KERNEL_SCHED_FIFO && policy!=KERNEL_SCHED_RR)updated.nice=attr.nice;
+                if(!result)result=sched_permission_locked(caller,task,&updated);
+                if(!result && (attr.flags&16U)) {
+                    unsigned reset=updated.reset_on_fork;
+                    updated=task->scheduling;updated.priority=(int)scheduler_base_priority(task);
+                    updated.reset_on_fork=reset;
+                }
+                if(!result)sched_commit_locked(task,&updated);
+            }
+        }
+    }
+    if(!result)scheduler_rearm_timer();
+    return result;
+}
+
 static int priority_one_locked(struct kernel_task *caller,struct kernel_task *task,int nice)
 {
     if(!sched_owner_locked(caller,task))return -KERNEL_EPERM;

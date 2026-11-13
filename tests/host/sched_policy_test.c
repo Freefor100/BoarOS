@@ -41,6 +41,9 @@ int main(void)
     batch.nice=-5;batch.reset_on_fork=1;kernel_sched_policy_fork(&child,&batch);
     assert(child.policy==3 && child.nice==0 && !child.reset_on_fork);
     batch.nice=7;kernel_sched_policy_fork(&child,&batch);assert(child.nice==7);
+    kernel_sched_publish_priority(&normal,0,-5);assert(kernel_sched_wait_priority(&normal)==25);
+    kernel_sched_publish_priority(&normal,1,19);assert(kernel_sched_wait_priority(&normal)==41);
+    kernel_sched_publish_priority(&normal,0,19);assert(kernel_sched_wait_priority(&normal)==1);
     struct kernel_rt_bandwidth budget;
     kernel_rt_bandwidth_init(&budget,0);
     kernel_rt_bandwidth_account(&budget,940*MS,1);
