@@ -137,7 +137,7 @@ enum kernel_syscall_status syscall_handle_sched(
                 .priority=(state.policy==KERNEL_SCHED_FIFO || state.policy==KERNEL_SCHED_RR)
                     ? (uint32_t)state.priority : 0,
                 .runtime=state.policy!=KERNEL_SCHED_FIFO && state.policy!=KERNEL_SCHED_RR
-                    ? KERNEL_SCHED_FAIR_NS : 0,
+                    ? kernel_sched_fair_slice(&state) : 0,
             };
             /* Linux先清扩展尾部；尾部fault时不写已知字段。任务快照已释放身份锁。 */
             const uint64_t zeros[8]={0};
@@ -161,7 +161,7 @@ enum kernel_syscall_status syscall_handle_sched(
                 struct { int64_t sec,nsec; } interval={0,
                     state.policy==KERNEL_SCHED_FIFO ? 0 :
                     state.policy==KERNEL_SCHED_RR ? KERNEL_SCHED_RR_NS :
-                        KERNEL_SCHED_FAIR_NS};
+                        kernel_sched_fair_slice(&state)};
                 result=sched_copy(caller,request->arguments[1],&interval,sizeof(interval),1);
             }
         }

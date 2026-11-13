@@ -64,7 +64,7 @@ static void getattr_abi(void)
     assert(call(275,0,0,56)==-KERNEL_EINVAL);
     assert(call(275,-1,(uintptr_t)bytes,56)==-KERNEL_EINVAL);
     assert(call(275,2,1,47)==-KERNEL_EINVAL);
-    assert(call(275,0,(uintptr_t)bytes,4097)==-KERNEL_EINVAL);
+    assert(call(275,0,(uintptr_t)bytes,BOAROS_PAGE_SIZE+1)==-KERNEL_EINVAL);
     assert(call4(275,2,1,56,1)==-KERNEL_ESRCH);
     assert(call4(275,0,1,56,1)==-KERNEL_EINVAL);
     assert(call(275,2,1,56)==-KERNEL_ESRCH);
@@ -81,6 +81,14 @@ static void getattr_abi(void)
     int priority=0;assert(call(119,0,0,(uintptr_t)&priority)==0);
     assert(call(275,0,(uintptr_t)&attr,56)==0);
     assert(!attr.policy&&!attr.priority&&!attr.flags&&attr.runtime==10000000);
+    state.fair_slice_ns=2000000;
+    assert(!call(275,0,(uintptr_t)&attr,56) && attr.runtime==2000000);
+    struct {int64_t sec,ns;} interval;
+    assert(!call(127,0,(uintptr_t)&interval,0) && !interval.sec && interval.ns==2000000);
+    state.policy=KERNEL_SCHED_BATCH;
+    assert(!call(275,0,(uintptr_t)&attr,56) && attr.runtime==2000000);
+    state.policy=KERNEL_SCHED_IDLE;
+    assert(!call(127,0,(uintptr_t)&interval,0) && interval.ns==2000000);
 }
 static void setattr_abi(void)
 {

@@ -54,6 +54,7 @@ void kernel_sched_policy_fork(struct kernel_sched_policy *child,
     child->rr_remaining_ns = KERNEL_SCHED_RR_NS;
     child->fair_remainder=child->fair_slice_used=0;
     if (child->reset_on_fork) {
+        child->fair_slice_ns=0;
         if (child->policy==KERNEL_SCHED_FIFO || child->policy==KERNEL_SCHED_RR) {
             child->policy=KERNEL_SCHED_OTHER;child->priority=0;child->nice=0;
         } else if (child->nice<0) child->nice=0;

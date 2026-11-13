@@ -127,7 +127,7 @@ IRQ恢复及非法owner/上下文。真实I/O等待继续用`make test-io-sleep-
 
 RV、LA 的用户任务按实际 affinity 在各 CPU 执行；默认交付仍单核。每核维护唯一执行权，跨核资格按上面的共同控制规则交接。设备中断和部分控制留在 CPU0；日志与 TCP 执行位置由各业务机制维护。任务构造、栈窗口和实际回收沿 CPU0 流程，停止时真实存储使用者归零后才确认 STOPPED。平台边界见[RV多核](riscv-smp.md)与[LA多核](loongarch-boot.md#多核执行)。
 
-OTHER 保留 100 Hz tick 轮转，内核 worker 使用 OTHER。FIFO/RR 的用户优先级为 1–99，数值越大越优先；FIFO 不因 tick 同级轮转，RR 每片 100ms，按实际在 CPU 上运行的纳秒扣除。更高优先级抢占、阻塞和 yield 不重新赠送 RR 时间片；耗尽后才重装。唤醒及策略修改标记 need_resched，在 IRQ 或返回用户态的安全边界切换。降优先级排到新级队首，升优先级排队尾，同级修改保留位置；高优先级抢占的当前任务回原级队首。
+内核 worker 使用 OTHER，普通策略按下述公平进度与请求量子选择后继。FIFO/RR 的用户优先级为 1–99，数值越大越优先；FIFO 不因 tick 同级轮转，RR 每片 100ms，按实际在 CPU 上运行的纳秒扣除。更高优先级抢占、阻塞和 yield 不重新赠送 RR 时间片；耗尽后才重装。唤醒及策略修改标记 need_resched，在 IRQ 或返回用户态的安全边界切换。降优先级排到新级队首，升优先级排队尾，同级修改保留位置；高优先级抢占的当前任务回原级队首。
 
 挑选、摘队列与取得on_cpu执行owner在同一个短锁发布点完成，普通切换与退出复用该入口；锁外才切换架构状态，旧owner仍由新栈交接释放。未使用的拆分pop入口已删除。
 yield、预算tick与普通tick在同一次决策raw内完成队列校验、运行记账、挑选和最早期限计算，
@@ -154,7 +154,7 @@ ready 策略直接选择下一任务。退出栈只切离，回收仍由 worker 
 
 每个就绪节点在实时 FIFO 链和普通 AVL 树之间复用存储，任何时刻只属于一个 CPU 的一种执行索引。普通候选按虚拟运行时间选择；OTHER/BATCH 使用固定 Linux 的40档 nice 权重，IDLE 使用权重3。实际执行纳秒乘以1024再除以权重，保留余数；nice=0直接累计。计量复用 CPU 执行边界的用户／内核计数，睡眠和中断执行不增加份额成本，切栈前的最后执行片段归原任务。
 
-每核维护单调前进的 min_vruntime。跨核放置平移两个队列的基准，CPU0服务往返遵守同一规则；唤醒最多补偿一个10ms基准量子。默认请求量子为10ms，有本核普通竞争者时才设置额外片尾期限。OTHER在公平进度相差超过1ms时可请求唤醒抢占；BATCH不因刚唤醒抢占，非IDLE唤醒优先响应于IDLE。PI提升进入实时资格，解除后恢复保存的普通进度。RT优先级、带宽及来源保留继续使用原协议。
+每核维护单调前进的 min_vruntime。跨核放置平移两个队列的基准，CPU0服务往返遵守同一规则；唤醒最多补偿一个固定10ms基准量子。每线程默认请求量子为10ms，可通过下述sched_attr.runtime设置；有本核普通竞争者时才设置额外片尾期限。量子影响重新比较公平进度的时间，不改变nice权重。实际执行消费最多累计到支持的最大量子100ms；修改请求前先结算旧执行片段，缩短至已消费量以下时片尾立即到期，加长或恢复默认不清除已消费量。只修改量子保留公平余数、就绪位置和PI状态，并请求实际执行或就绪owner CPU重调度。OTHER在公平进度相差超过固定1ms时可请求唤醒抢占；BATCH不因刚唤醒抢占，非IDLE唤醒优先响应于IDLE。PI提升进入实时资格，解除后恢复保存的普通进度。RT优先级、带宽及来源保留继续使用原协议。
 
 `test-sched-policy-host`覆盖权重、余数、可重复的受控CPU份额、两类索引和迁移补偿；交接及PI检查复用实际调度实现。应用的实际吞吐或多核加速比不由这些功能检查推定。
 
@@ -178,7 +178,7 @@ sched_setparam/setscheduler/getparam/getscheduler、priority_min/max、rr_get_in
 
 `sched_setattr(274)`与旧setscheduler/setparam共用候选权限检查和参数发布。原生结构为56字节，兼容48字节及size=0；扩展部分须为零，长度错误尝试回写当前尺寸后返回E2BIG，回写fault仍保留该长度错误。所有用户输入和扩展尾检查在状态保护外完成。
 
-支持RESET_ON_FORK、KEEP_POLICY、KEEP_PARAMS。KEEP_POLICY保持原策略和reset标志；KEEP_PARAMS按目标当前策略导入参数用于校验，实际提交保留原策略、nice和priority，仅处理独立的reset状态。OTHER/BATCH/IDLE的getattr.runtime统一返回默认请求量子10,000,000ns；设置接受0或该值，其他自定义量子返回EOPNOTSUPP。FIFO/RR的runtime/deadline/period按该策略的无效字段处理；不请求UTIL标志时对应数值不改变状态。未知标志返回EINVAL，DEADLINE/EXT、利用率约束与尚未接入的已知扩展返回明确不支持。
+支持RESET_ON_FORK、KEEP_POLICY、KEEP_PARAMS。KEEP_POLICY保持原策略和reset标志；KEEP_PARAMS按目标当前策略导入参数用于校验，实际提交保留原策略、nice、priority和请求量子，仅处理独立的reset状态。OTHER/BATCH/IDLE通过runtime设置请求量子：0选择默认10,000,000ns，正值限制在100,000–100,000,000ns；getattr.runtime和普通策略的rr_get_interval返回实际生效值。sched_setscheduler、sched_setparam和setpriority保留请求量子。fork/clone继承，exec保留；RESET_ON_FORK使子线程恢复默认量子。FIFO/RR的runtime/deadline/period按该策略的无效字段处理，保留之前的普通请求；不请求UTIL标志时对应数值不改变状态。未知标志返回EINVAL，DEADLINE/EXT、利用率约束与尚未接入的已知扩展返回明确不支持。
 
 有效RT优先级与保存nice共用一次原子发布，避免消息队列在跨核修改期间拼接新旧状态。MQ插入等待者时按实际RT/PI等级及普通nice排序，不为此重取共同调度锁；默认I/O优先级的派生与原始查询规则见后面的I/O优先级说明。
 
