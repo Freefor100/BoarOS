@@ -127,7 +127,7 @@ enum kernel_scheduler_status kernel_wait_node_remove_sync(struct kernel_wait_nod
 enum kernel_scheduler_status kernel_wait_queue_wake_all(struct kernel_wait_queue *q)
 {
     if (!notification_depth++) notification_sequence++;
-    for(struct kernel_wait_node *n=q->head;n;n=n->next) { if(n->callback) { callbacks++; n->callback(n,0); } else if(n->task) task_wakes++; }
+    for(struct kernel_wait_node *n=q->head;n;n=n->next) { if(n->callback) { callbacks++; n->callback(n,0,0); } else if(n->task) task_wakes++; }
     notification_depth--;
     return KERNEL_SCHEDULER_STATUS_OK;
 }
@@ -516,7 +516,7 @@ static void complete_pollfree(struct kernel_wait_node *node)
 {
     struct kernel_wait_queue *source=&target_wait[0];
     CHECK(node->references==1 && source->borrows==1);
-    node->callback(node,KERNEL_WAIT_POLL_FREE);
+    node->callback(node,KERNEL_WAIT_POLL_FREE,0);
     CHECK(!source->head && !node->queue);
     node->references--;source->borrows--;source->closed=1;
     CHECK(!kernel_wait_queue_destroy(source));
