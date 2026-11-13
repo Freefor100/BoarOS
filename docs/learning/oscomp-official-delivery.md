@@ -284,3 +284,21 @@ CPU记账的旧成本、资源限制一轮的功能净影响及定时器启用�
 两台 QEMU 外层用时 RV 303.891 秒、LA 251.163 秒，均正常退出，owner 释放完成、heap-live=0。两张根盘与双方 p1/p3 共六次 e2fsck 1.47.2，以及两侧 p2 的 fsck.fat，共八次检查全部返回 0；第二盘种子槽清零。默认交付物已经恢复，与定向构建前本次保存的默认内核逐字节相同。验证结束时，原输入、judge、配置均未改动，兼容分支与原测试仓库工作树干净。
 
 原始结果、原 judge、耗时、QEMU/内核/init/盘身份、磁盘检查及恢复记录集中在 `build/ext4-parallel/official-delivery-13/`。四张检查后的运行盘已清理，保留 ELF、缓存、串口和必要日志。当前并行机制及独立串行性能见 [数据路径实验](data-path-budget-experiments.md)。
+
+## inode 标志的原 BusyBox 消费者
+
+2026-11-13 将进程监督与 inode 属性实现从 main 合入后，分别从固定 RV、LA 发布盘的
+`/musl/busybox` 只读提取原 ELF，装入独立 ext4 验证盘的 `/busybox`。没有重新编译或修改
+BusyBox，也没有执行原 BusyBox 整份清单。入口为
+[`tests/oscomp/inode-flags.sh`](../../tests/oscomp/inode-flags.sh)，只用原 `chattr/lsattr`
+查询、设置和清除 immutable、append-only、nodump，并检查追加内容、覆盖和删除的拒绝。
+
+| 配置 | ext4 | tmpfs | 正常退出与磁盘 |
+|---|---|---|---|
+| RV 默认单核，512 MiB | 通过 | 通过 | PID 1 退出 0，heap-live=0，e2fsck -fn=0 |
+| LA 默认单核，512 MiB | 通过 | 通过 | PID 1 退出 0，heap-live=0，e2fsck -fn=0 |
+
+这是新增接口的定向工具验证，没有对应的原 judge 分数，不改写此前评测得分。
+RV 最小空闲内核栈为 1776 字节。原 ELF、脚本、内核身份、完整输出及磁盘检查保存在
+`build/process-flags-round/busybox-{rv,la}-checked/`，检查完成的运行盘已删除。
+通用语义和后端差别见[文件接口](../modules/kernel-files.md#普通文件和目录的-inode-标志)。

@@ -23,6 +23,15 @@ pre-20250615，盘内 LTP 报告版本为 20240524。运行和交付方式见
 
 ## 发布程序与版本预期
 
+### BusyBox 定向属性检查的 shell 与交互要求
+
+LA 原盘的 `sh` 是 hush，不支持 `set -u`；同一 ELF 在固定 Linux 上也对
+`set -eu` 报 `invalid option`。属性检查脚本使用它支持的 `set -e`。
+检查 immutable 文件的删除拒绝时须调用 `rm -f`：普通 `rm` 在终端输入可用时会先询问
+是否删除写保护文件，隐藏 stderr 只会隐藏提示，仍会等待输入。RV 的固定 Linux 对照
+也出现这次等待。使用 `-f` 跳过交互后，原程序仍实际调用删除并得到权限拒绝；
+RV、LA 的 ext4/tmpfs 检查均通过。这里只调整自有定向脚本，原 ELF 与评测脚本保持原样。
+
 ### acl1：发布程序未包含 ACL 测试
 
 两架构、两种 libc 的原 `acl1` 都输出 `The acl library was missing upon compilation.`，
