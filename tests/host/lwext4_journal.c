@@ -1155,7 +1155,7 @@ static void group_revoke_reservation(struct ext4_blockdev *dev,
         dev->lg_bsize, revokes, fault);
 }
 
-/* Corrupt actual on-disk records independently of the writer/replay code. */
+/* Edit actual on-disk records independently of the writer/replay code. */
 static void mutate_log(struct ext4_blockdev *dev, struct jbd_fs *jfs,
                        const char *kind)
 {
@@ -1210,6 +1210,12 @@ static void mutate_log(struct ext4_blockdev *dev, struct jbd_fs *jfs,
                 extra->flags = to_be32(JBD_FLAG_SAME_UUID);
                 next += sizeof(*tag);
             }
+            repair_checksum = true;
+        } else if (!strncmp(kind, "descriptor-uuid-", 16)) {
+            struct jbd_block_tag3 *tag = (void *)(hdr + 1);
+            CHECK(to_be32(jfs->sb.feature_incompat) & JBD_FEATURE_INCOMPAT_CSUM_V3);
+            CHECK(!(to_be32(tag->flags) & JBD_FLAG_SAME_UUID));
+            memset(tag + 1, !strcmp(kind,"descriptor-uuid-zero") ? 0 : 0x5a, UUID_SIZE);
             repair_checksum = true;
         } else if (!strcmp(kind, "descriptor-target")) {
             struct jbd_block_tag3 *tag = (void *)(hdr + 1);
@@ -1269,14 +1275,18 @@ int main(int argc, char **argv)
     }
     if (!strcmp(argv[2], "recover-corrupt")) {
         ext4_fsblk_t journal_sb;
-        struct jbd_sb before, after;
+        unsigned char *images=malloc((size_t)dev.lg_bsize*2);
+        CHECK(images != NULL);
+        struct jbd_sb *before=(void *)images;
+        struct jbd_sb *after=(void *)(images+dev.lg_bsize);
         CHECK(jbd_inode_bmap(&jfs, 0, &journal_sb) == EOK);
-        CHECK(ext4_blocks_get_direct(&dev, &before, journal_sb, 1) == EOK);
+        CHECK(ext4_blocks_get_direct(&dev, before, journal_sb, 1) == EOK);
         CHECK(jbd_recover(&jfs) == atoi(argv[3]));
-        CHECK(jfs.sb.start == before.start && before.start != 0);
+        CHECK(jfs.sb.start == before->start && before->start != 0);
         CHECK(fault_block_crash(&disk) == 0);
-        CHECK(ext4_blocks_get_direct(&dev, &after, journal_sb, 1) == EOK);
-        CHECK(memcmp(&before, &after, sizeof(before)) == 0);
+        CHECK(ext4_blocks_get_direct(&dev, after, journal_sb, 1) == EOK);
+        CHECK(memcmp(before, after, dev.lg_bsize) == 0);
+        free(images);
         return 0;
     }
     if (dev.fs->super_replay_required && !strncmp(argv[2], "recover", 7)) {

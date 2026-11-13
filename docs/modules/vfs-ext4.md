@@ -180,6 +180,12 @@ ro/rw通过fsconfig控制实例状态；fsmount的RDONLY、NOSUID、NODEV、NOEX
 
 `kernel_vfs_mount_root()` 根据传入块设备是否提供 `write` 回调决定只读还是读写挂载。读写 journal 挂载先 replay、校验 orphan 记录、启动日志并回收遗留 orphan，完成后才发布根路径。只读介质不能完成恢复时明确拒绝；未知必需特性、损坏日志或元数据也不能作为干净镜像继续访问。
 
+日志描述符未设置 `SAME_UUID` 时包含16字节可选UUID，恢复按格式跳过该字段，不要求它等于
+日志超级块UUID；Linux生成的记录可在此处保存全零。描述符、数据和提交记录的校验和仍使用
+日志超级块UUID派生的校验种子，记录长度、LAST_TAG和目标块范围检查继续执行。
+`JOURNAL_TEST_CASE=recovery-uuid sh tests/host/lwext4-journal.sh` 覆盖1/4KiB块、普通及多描述符
+记录、零／不同UUID，并检查损坏校验和、越界目标和缺失LAST_TAG仍被拒绝。
+
 `kernel_vfs_file_read_source()` 把保持打开的文件导出为带 `size/context/read_at` 的精确随机读源。回调只有填满整个范围才返回零；EOF 以内的短读转成 `-EIO`。ELF parser 因而能复用内存和 VFS 来源，而不依赖文件系统类型。
 
 `kernel_vfs_open_executable()` 在普通 open 之上统一要求 regular file 和至少一个执行位；目录、非普通文件或无执行位返回 `-EACCES`。若目标 node 存在活动的写打开者（`node->write_openers > 0`），返回 `-ETXTBSY`；检查通过后累加 `node->exec_users` 并持有 `file->exec_lease`。对应地，以写权限打开普通文件需调用 `kernel_vfs_file_acquire_write()`，当 `node->exec_users > 0` 时准确返回 `-ETXTBSY`，否则累加 `node->write_openers` 并持有 `file->write_lease`。该租约在 `kernel_vfs_close()` 时释放，严格保障运行中二进制与写入者之间的互斥。

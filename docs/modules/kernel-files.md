@@ -29,7 +29,13 @@ lookup 与 OFD acquire 在同一临界区完成；跨解锁消费者持实际 OF
 close/dup 替换在锁内摘槽，锁外处理选定 OFD；fd 复用不改变已 pin 请求的身份。
 扩容先在锁外分配并清零候选，锁内复查、最多复制 8 KiB 后发布，旧数组及竞争失败候选在锁外释放。
 open/pipe/socket 的编号预留保持到安装或取消；成对 fd 在用户输出成功后一起发布，复制失败不会按复用后的编号关闭对象。
-共享 OFD 的 APPEND/NONBLOCK 使用原子 status 更新，访问方向保持；F_SETFL 忽略不可变/open-only位，保留 O_SYNC/O_DSYNC、DIRECTORY/NOFOLLOW；未支持的 DIRECT/NOATIME 仍返回 EINVAL。FD_CLOEXEC 仍属于各张表。
+共享 OFD 的 APPEND/NONBLOCK 使用原子 status 更新，访问方向保持；F_SETFL 忽略不可变/open-only位，保留 O_SYNC/O_DSYNC、DIRECTORY/NOFOLLOW，DIRECT 仍返回 EINVAL。O_NOATIME 资格见[访问时间策略](vfs-ext4.md)。FD_CLOEXEC 仍属于各张表。
+
+通用 `ioctl(FIONBIO)` 从用户地址读取四字节整数，非零启用、零关闭 `O_NONBLOCK`。
+它适用于所有有效的普通 OFD，在设备专用 ioctl 分派前执行；dup、fork 和 FD 传递共享
+修改后的状态。更新仅原子修改这一位，不覆盖同时改变的 APPEND、NOATIME 或异步通知状态。
+FD 与 O_PATH 检查先于用户复制，输入 EFAULT 保留原标志。管道、socket 等对象仍由各自
+读写路径执行非阻塞行为，普通文件不会因此虚构 EAGAIN。
 普通与受控 FD 表共同使用这些保护和引用规则，不再封存 OFD、pipe 或表的并发资格。`kernel_files_check_task_domain()` 在受控任务创建时检查当前实际消费者和资源绑定；它不改变对象状态，也不要求额外保留 CPU0 控制引用来规避末次释放。
 
 `readv/preadv/writev/pwritev/sendmsg/recvmsg` 在入口通过同一导入实现取得描述符快照：8项以内用调用栈，更多项只有一次堆分配。快照将只读的 view、count、total 与可转移的 allocation owner 分开；后端借用同一份描述符，不重扫数值范围，实际用户页权限和缺页仍在复制或 pin 时检查。导入先检查全部有符号长度，再检查原始范围；单向量先裁剪长度，多向量检查未裁剪的每项范围后裁剪总量，因此达到总量上限也不会掩盖非法尾项。TTY等待期间接管堆owner和OFD，正常完成归还，强制取消消费；栈上view不会因owner置空而改变。标量read/pread保留各对象原有的范围、空读与类型错误顺序。读取分派只传调用者持有的真实OFD owner，pread也沿用该owner；后端入口借用一次description，避免同时传同一对象的裸指针与owner。

@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -19,6 +20,36 @@
 #include <time.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"FD-EVENTS:%d %s errno=%d\n",__LINE__,#x,errno);exit(1); } } while (0)
+static void nonblocking_ioctl(void)
+{
+    int p[2];CHECK(!pipe(p));int alias=dup(p[0]);CHECK(alias>=0);
+    int on=-7,off=0;char byte;
+    CHECK(!ioctl(alias,FIONBIO,&on) && (fcntl(p[0],F_GETFL)&O_NONBLOCK));
+    errno=0;CHECK(read(p[0],&byte,1)==-1 && errno==EAGAIN);
+    errno=0;CHECK(ioctl(alias,FIONBIO,(void *)1)==-1 && errno==EFAULT);
+    CHECK(fcntl(p[0],F_GETFL)&O_NONBLOCK);
+    errno=0;CHECK(ioctl(-1,FIONBIO,(void *)1)==-1 && errno==EBADF);
+    pid_t child=fork();CHECK(child>=0);
+    if(!child){CHECK(!ioctl(alias,FIONBIO,&off));_exit(0);}
+    int status;CHECK(waitpid(child,&status,0)==child && WIFEXITED(status) && !WEXITSTATUS(status));
+    CHECK(!(fcntl(p[0],F_GETFL)&O_NONBLOCK));
+    long ps=sysconf(_SC_PAGESIZE);char *mapping=mmap(NULL,(size_t)ps*2,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);CHECK(mapping!=MAP_FAILED);
+    CHECK(!mprotect(mapping+ps,(size_t)ps,PROT_NONE));int *edge=(int *)(mapping+ps-sizeof(int));*edge=1;
+    CHECK(!ioctl(p[0],FIONBIO,edge) && (fcntl(alias,F_GETFL)&O_NONBLOCK));
+    CHECK(!munmap(mapping,(size_t)ps*2));
+    char path[]="/tmp/boaros-ioctl-XXXXXX";int file=mkstemp(path);CHECK(file>=0);
+    CHECK(!fcntl(file,F_SETFL,O_APPEND|O_NOATIME));int old=fcntl(file,F_GETFL);
+    CHECK(!ioctl(file,FIONBIO,&on) && fcntl(file,F_GETFL)==(old|O_NONBLOCK));
+    CHECK(!ioctl(file,FIONBIO,&off) && fcntl(file,F_GETFL)==old);
+    int opath=open(path,O_PATH);CHECK(opath>=0);errno=0;CHECK(ioctl(opath,FIONBIO,&on)==-1 && errno==EBADF);
+    int s[2],event=eventfd(0,EFD_NONBLOCK);CHECK(event>=0 && !socketpair(AF_UNIX,SOCK_STREAM,0,s));
+    CHECK(!ioctl(event,FIONBIO,&off) && !(fcntl(event,F_GETFL)&O_NONBLOCK));
+    CHECK(!ioctl(s[0],FIONBIO,&on) && (fcntl(s[0],F_GETFL)&O_NONBLOCK));
+    errno=0;CHECK(read(s[0],&byte,1)==-1 && errno==EAGAIN);
+    CHECK(!close(s[0]) && !close(s[1]) && !close(event) && !close(opath) && !close(file) && !unlink(path));
+    CHECK(!close(alias) && !close(p[0]) && !close(p[1]));puts("FD-IOCTL PASS");
+}
+#ifndef FIONBIO_ONLY
 static long close_range_raw(unsigned first,unsigned last,unsigned flags)
 { return syscall(436,first,last,flags); }
 static int child_unshare(void *argument)
@@ -148,6 +179,9 @@ static void callers(void)
 }
 int main(void)
 {
-    setvbuf(stdout,NULL,_IONBF,0);ranges();permissions();waits();instructions();callers();
+    setvbuf(stdout,NULL,_IONBF,0);nonblocking_ioctl();ranges();permissions();waits();instructions();callers();
     puts("FD-EVENTS PASS");return 0;
 }
+#else
+int main(void) { nonblocking_ioctl();return 0; }
+#endif
