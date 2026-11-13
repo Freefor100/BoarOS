@@ -58,7 +58,7 @@ static unsigned entropy_seed, entropy_calls;
 int kernel_random_available(void) { return entropy_seed != 0; }
 enum kernel_random_status kernel_random_fill(void *buffer,size_t size)
 {
-    assert(entropy_seed); entropy_calls++;
+    entropy_calls++;
     memset(buffer,0,size);
     ((unsigned char *)buffer)[0]=(unsigned char)(entropy_seed+entropy_calls);
     return KERNEL_RANDOM_STATUS_OK;
@@ -121,12 +121,18 @@ static void build_case(uint16_t main_type,uint64_t main_address,uint16_t interpr
         uint64_t stack[36]; size_t copied;
         assert(!kernel_copy_from_user(&image.mm,stack,image.stack_pointer,sizeof(stack),&copied) && copied==sizeof(stack));
         assert(stack[0]==1 && !stack[2] && !stack[3]);
-        uint64_t main_entry=0,phdr=0,interpreter_bias=0;
+        uint64_t main_entry=0,phdr=0,interpreter_bias=0,at_random=0;
         for (unsigned i=4;i+1<36 && stack[i];i+=2) {
             if (stack[i]==9) main_entry=stack[i+1];
             if (stack[i]==3) phdr=stack[i+1];
             if (stack[i]==7) interpreter_bias=stack[i+1];
+            if (stack[i]==25) at_random=stack[i+1];
         }
+        /* Unseeded early exec still supplies libc's mandatory 16-byte input. */
+        unsigned char random[16],expected[16]={0};
+        expected[0]=(unsigned char)(entropy_seed+entropy_calls);
+        assert(at_random && !kernel_copy_from_user(&image.mm,random,at_random,sizeof(random),&copied) &&
+            copied==sizeof(random) && !memcmp(random,expected,sizeof(random)));
         assert(main_entry && phdr==main_entry-184+64);
         assert(!kernel_mm_vma_lookup(&image.mm,main_entry,&vma) && vma.backing==main);
         if (interpreter) assert(interpreter_bias==image.entry-interpreter_address-184);
