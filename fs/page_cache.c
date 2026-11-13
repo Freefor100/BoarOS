@@ -2554,6 +2554,9 @@ static void prepare_space(void *argument)
     KERNEL_LOCK_SCOPE(io); kernel_vfs_node_lock(node,&io,1);
     size_t length=request->length;
     if (request->mapping) {
+        uint64_t epoch;
+        if (kernel_file_mapping_epoch(node,&epoch)) { request->error=-KERNEL_EBUSY; return; }
+        if (kernel_vfs_node_attributes(node)&KERNEL_VFS_INODE_IMMUTABLE) { request->error=-KERNEL_EPERM; return; }
         if (request->offset>=node->size) { request->error=-KERNEL_EFAULT; return; }
         if (length>node->size-request->offset) length=node->size-request->offset;
     }

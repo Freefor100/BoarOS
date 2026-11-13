@@ -30,7 +30,7 @@ struct tmp_inode {
     uint32_t mode, links, handles, uid, gid;
     struct kernel_memory_object *memory;
     char *target;
-    uint8_t memfd, initial_seals;
+    uint8_t memfd, initial_seals, attributes;
     struct kernel_vfs_timespec atime, mtime, ctime;
     struct tmp_xattr *xattrs, *capability, *access_acl, *default_acl;
 };
@@ -304,6 +304,7 @@ static int create_child(struct tmp_mount *m, uint64_t parent_inode, const char *
             else dispose(m,candidate);
         }
     } else if (type!=KERNEL_VFS_S_IFLNK) mode &= ~umask;
+    i->attributes=parent->attributes&KERNEL_VFS_INODE_NODUMP;
     i->mode = mode; i->parent = parent->number;
     if ((mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR) i->size = 2 * TMPFS_DIRENT_SIZE;
     if (!r && (mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG) {
@@ -380,6 +381,7 @@ static int open_inode(struct kernel_vfs_mount *mount, const char *path, uint64_t
     struct kernel_vfs_node *n = 0;
     r = allocate(m, sizeof(*n), (void **)&n); if (r) return r;
     n->inode = i->number; n->mode = i->mode; n->uid=i->uid; n->gid=i->gid; n->size = i->size; n->max_size = INT64_MAX;
+    n->attributes=i->attributes;
     n->backend_data = i; n->memory = i->memory; i->handles++;
     n->memfd=i->memfd; n->unlinked=i->memfd;
     n->file_seals=i->memfd ? i->initial_seals : KERNEL_SEAL_SEAL;
@@ -521,12 +523,27 @@ static int rename_inode(struct kernel_vfs_instance *instance, uint64_t old_paren
     i->ctime=now(); op->mtime=op->ctime=np->mtime=np->ctime=now(); result->changed=1;
     return 0;
 }
+static int get_flags(struct kernel_vfs_node *node,uint32_t *flags)
+{
+    *flags=ti(node)->attributes;
+    return 0;
+}
+static int set_flags(struct kernel_vfs_node *node,uint32_t flags)
+{
+    struct tmp_inode *i=ti(node);
+    struct kernel_vfs_timespec time=now();
+    KERNEL_RAW_SCOPE(metadata,&node->io_lock.metadata);
+    i->attributes=flags;
+    i->ctime=time;
+    __atomic_store_n(&node->attributes,flags,__ATOMIC_RELEASE);
+    return 0;
+}
 static int stat_inode(const struct kernel_vfs_file *f, struct kernel_vfs_stat *s)
 {
     struct kernel_vfs_node *n=f->private_data; struct tmp_inode *i=ti(n);
     KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
     *s=(struct kernel_vfs_stat){.dev=n->instance->backend_mount.id,.ino=i->number,.mode=i->mode,.nlink=i->links,.uid=i->uid,.gid=i->gid,.rdev=i->rdev,
-        .size=i->size,.blksize=BOAROS_PAGE_SIZE,
+        .size=i->size,.blksize=BOAROS_PAGE_SIZE,.attributes=i->attributes,.attributes_mask=KERNEL_VFS_INODE_ATTRIBUTES,
         .blocks=i->memory ? kernel_memory_object_resident_pages(i->memory)*(BOAROS_PAGE_SIZE/512) : 0,
         .atime=i->atime,.mtime=i->mtime,.ctime=i->ctime}; return 0;
 }
@@ -752,6 +769,7 @@ static const struct kernel_vfs_backend tmp_ops = {
     .rename=rename_inode, .stat=stat_inode, .statfs=statfs, .dir_entry=dir_entry,
     .truncate=truncate_inode, .fallocate=punch_inode, .pread=pread_inode,
     .memory_written=memory_written, .set_times=set_times, .set_mode=set_mode, .set_owner=set_owner,
+    .get_flags=get_flags,.set_flags=set_flags,
     .accessed=accessed, .modified=modified, .killpriv=killpriv, .writeback_allowed=no_writeback,
     .flush=error, .unmount=unmount, .xattr=xattr_inode, .exec_metadata=exec_metadata,
     .acl_permission=permission,

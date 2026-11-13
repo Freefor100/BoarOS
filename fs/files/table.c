@@ -41,7 +41,18 @@ enum kernel_files_status kernel_files_ioctl(
     enum kernel_files_status status = kernel_files_pin_data(files, fd, &description,
                                                        linux_result);
     if (status != KERNEL_FILES_STATUS_OK || *linux_result) return status;
-    if (description->kind==KERNEL_OPEN_FILE_KIND_SOCKET && command>=0x8901 && command<=0x8904) {
+    if (command==UINT32_C(0x80086601) || command==UINT32_C(0x40086602)) {
+        uint32_t flags=0;
+        size_t copied=0;
+        int set=command==UINT32_C(0x40086602);
+        if (set && (kernel_copy_from_user(mm,&flags,argument,sizeof(flags),&copied) || copied!=sizeof(flags)))
+            *linux_result=-KERNEL_EFAULT;
+        else {
+            *linux_result=kernel_vfs_file_attributes(&description->file,set,&flags);
+            if (!set && !*linux_result && (kernel_copy_to_user(mm,argument,&flags,sizeof(flags),&copied) || copied!=sizeof(flags)))
+                *linux_result=-KERNEL_EFAULT;
+        }
+    } else if (description->kind==KERNEL_OPEN_FILE_KIND_SOCKET && command>=0x8901 && command<=0x8904) {
         int32_t value=0;size_t copied=0;
         if (command<=0x8902) {
             if (kernel_copy_from_user(mm,&value,argument,sizeof(value),&copied) || copied!=sizeof(value))
@@ -1079,6 +1090,8 @@ enum kernel_files_status kernel_files_fcntl(
         KERNEL_FILES_PIN_SCOPE(pin);
         struct kernel_open_file_description *file=kernel_files_hold_fd(files,fd,&pin);
         if(!file || file->kind==KERNEL_OPEN_FILE_KIND_PATH)*result=-KERNEL_EBADF;
+        else if (((argument^kernel_open_file_flags(file))&KERNEL_FILES_O_APPEND) &&
+            file->file.private_data && !kernel_vfs_file_noappend_allowed(&file->file)) *result=-KERNEL_EPERM;
         else if((argument&KERNEL_FILES_O_NOATIME) && !(kernel_open_file_flags(file)&KERNEL_FILES_O_NOATIME) &&
             !kernel_open_file_noatime_allowed(file))*result=-KERNEL_EPERM;
         else if(argument&00040000U)*result=-KERNEL_EINVAL;

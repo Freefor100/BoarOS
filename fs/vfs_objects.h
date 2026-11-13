@@ -52,7 +52,6 @@ struct kernel_vfs_instance {
     uint64_t device_id; /* Filesystem st_dev, shared by every mount view. */
 };
 
-enum { KERNEL_VFS_INODE_IMMUTABLE=1, KERNEL_VFS_INODE_APPEND=2 };
 
 struct kernel_vfs_node {
     struct kernel_pipe *fifo_pipe;
@@ -90,7 +89,7 @@ struct kernel_vfs_node {
     /* Directory entries use a separate qualification from file data I/O. */
     struct kernel_rwlock namespace_lock;
     uint32_t uid, gid;
-    uint8_t metadata_restrictions; /* KERNEL_VFS_INODE_* restrictions, read with DAC fields. */
+    uint8_t attributes; /* Three Linux inode flags, published after backend acceptance. */
     uint8_t file_seals; /* tmpfs seals, protected by the inode I/O qualification. */
     uint8_t memfd;
     uint64_t shared_write_bytes; /* Committed MAYWRITE VMA bytes, including read-only mappings. */
@@ -218,6 +217,8 @@ struct kernel_vfs_backend {
         struct kernel_vfs_statfs *stat);
     int (*set_times)(struct kernel_vfs_file *file,
         const struct kernel_vfs_timespec times[2]);
+    int (*get_flags)(struct kernel_vfs_node *,uint32_t *);
+    int (*set_flags)(struct kernel_vfs_node *,uint32_t);
     int (*set_mode)(struct kernel_vfs_file *file, uint32_t mode);
     int (*set_owner)(struct kernel_vfs_file *file, uint32_t uid, uint32_t gid);
     int (*permission)(struct kernel_vfs_node *, const struct kernel_credentials *, unsigned);

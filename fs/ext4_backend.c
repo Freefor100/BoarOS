@@ -1748,6 +1748,8 @@ static void fill_stat(struct kernel_vfs_mount *mount,
     stat->dev = ((struct kernel_vfs_instance *)mount->private_data)->device_id;
     stat->ino = inode_number;
     stat->mode = ext4_inode_get_mode(superblock, inode);
+    stat->attributes=ext4_inode_get_flags(inode)&KERNEL_VFS_INODE_ATTRIBUTES;
+    stat->attributes_mask=KERNEL_VFS_INODE_ATTRIBUTES;
     stat->nlink = ext4_inode_get_links_cnt(inode);
     stat->uid = to_le16(inode->uid);
     stat->gid = to_le16(inode->gid);
@@ -1871,6 +1873,43 @@ static int ext4_backend_set_times(struct kernel_vfs_file *file,
                                                     (uint32_t)times[i].nanoseconds};
     }
     return lwext4_error(ext4_file_set_times(lwext4_node_file(node), fields, values));
+}
+
+static int ext4_backend_get_flags(struct kernel_vfs_node *node,uint32_t *flags)
+{
+    struct ext4_inode inode;
+    int result=ext4_fraw_inode_fill(lwext4_node_file(node),&inode);
+    if (result) return lwext4_error(result);
+    /* EXT4_FL_USER_VISIBLE, excluding project inheritance on regular files. */
+    uint32_t visible=UINT32_C(0x725bdfff);
+    if ((node->mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFREG) visible&=~UINT32_C(0x20000000);
+    *flags=ext4_inode_get_flags(&inode)&visible;
+    return 0;
+}
+
+static int ext4_backend_set_flags(struct kernel_vfs_node *node,uint32_t flags)
+{
+    uint32_t old=kernel_vfs_node_attributes(node);
+    if ((old&flags&KERNEL_VFS_INODE_IMMUTABLE) && flags!=old) return -KERNEL_EPERM;
+    struct ext4_timestamp ctime;
+    bool published;
+    int result=lwext4_error(ext4_file_set_flags(lwext4_node_file(node),KERNEL_VFS_INODE_ATTRIBUTES,
+        flags,&ctime,&published));
+    if (published) {
+        struct lwext4_node *owner=(struct lwext4_node *)node;
+        struct kernel_vfs_node *pin;
+        {
+            TIMESTAMP_SCOPE(times,lwext4_instance(node->instance));
+            owner->times[2]=ctime;
+            if (!++owner->time_version[2]) __builtin_trap();
+            owner->dirty_fields&=~EXT4_TIME_CTIME;
+            pin=time_drop_dirty(owner);
+            __atomic_store_n(&node->attributes,flags,__ATOMIC_RELEASE);
+        }
+        if (pin && kernel_vfs_node_release(&pin)) __builtin_trap();
+        if (result) kernel_vfs_record_writeback_error(node,result);
+    }
+    return result;
 }
 
 static int ext4_backend_set_mode(struct kernel_vfs_file *file, uint32_t mode)
@@ -2037,8 +2076,7 @@ static int ext4_backend_open(struct kernel_vfs_mount *mount,
     if (path) result=ext4_fraw_inode_fill(lwext4_node_file(node),&initial);
     node->mode=ext4_inode_get_mode(&adapter->device.fs->sb,&initial);
     node->uid=ext4_inode_get_uid(&initial);node->gid=ext4_inode_get_gid(&initial);
-    node->metadata_restrictions=((ext4_inode_get_flags(&initial)&EXT4_INODE_FLAG_IMMUTABLE)?KERNEL_VFS_INODE_IMMUTABLE:0) |
-        ((ext4_inode_get_flags(&initial)&EXT4_INODE_FLAG_APPEND)?KERNEL_VFS_INODE_APPEND:0);
+    node->attributes=ext4_inode_get_flags(&initial)&KERNEL_VFS_INODE_ATTRIBUTES;
     if (!result) initialize_times(node,adapter,&initial);
     if(!result)result=retain_node_inode(node);
     if (result) {
@@ -2226,8 +2264,7 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
     node->size = ext4_fsize(lwext4_node_file(node));
     node->mode=ext4_inode_get_mode(&adapter->device.fs->sb,&initial);
     node->uid=ext4_inode_get_uid(&initial);node->gid=ext4_inode_get_gid(&initial);
-    node->metadata_restrictions=((ext4_inode_get_flags(&initial)&EXT4_INODE_FLAG_IMMUTABLE)?KERNEL_VFS_INODE_IMMUTABLE:0) |
-        ((ext4_inode_get_flags(&initial)&EXT4_INODE_FLAG_APPEND)?KERNEL_VFS_INODE_APPEND:0);
+    node->attributes=ext4_inode_get_flags(&initial)&KERNEL_VFS_INODE_ATTRIBUTES;
     initialize_times(node, adapter, &initial);
     ((struct lwext4_node *)node)->capability_absent=1;
     return kernel_vfs_publish_node(mount, node, file, 1);
@@ -2408,6 +2445,7 @@ static int ext4_backend_modified(struct kernel_vfs_file *file,
     KERNEL_LOCK_SCOPE(node_guard);
     kernel_vfs_node_lock(node, &node_guard, 1);
     if (node->instance->read_only) return -KERNEL_EROFS;
+    if (kernel_vfs_node_attributes(node)&KERNEL_VFS_INODE_IMMUTABLE) return -KERNEL_EPERM;
     if (append) offset = node->size;
     /* Linux generic/ext4 write checks reject the maximum position before
      * file_modified, even when the user buffer would fault. */
@@ -3009,6 +3047,8 @@ static void initialize_backend(void)
     ops->prepare_unmount = ext4_backend_prepare_unmount;
     ops->remount = ext4_backend_remount;
     ops->statfs = ext4_backend_statfs;
+    ops->get_flags = ext4_backend_get_flags;
+    ops->set_flags = ext4_backend_set_flags;
     ops->set_times = ext4_backend_set_times;
     ops->set_mode = ext4_backend_set_mode;
     ops->set_owner = ext4_backend_set_owner;

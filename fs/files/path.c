@@ -283,6 +283,7 @@ static enum kernel_files_status files_open(
     if (!(flags & LINUX_O_PATH)) {
         request.access=(flags & 3U)==0 ? 4U : (flags & 3U)==1 ? 2U : 6U;
         if (flags & LINUX_O_TRUNC) request.access |= 2U;
+        else if (flags & LINUX_O_APPEND) request.flags |= KERNEL_VFS_OPEN_APPEND;
     }
     if ((flags & LINUX_O_NOATIME) && !(flags & LINUX_O_PATH)) request.flags|=KERNEL_VFS_OPEN_NOATIME;
     if (flags & LINUX_O_DIRECTORY) request.flags |= KERNEL_VFS_OPEN_DIRECTORY;
@@ -646,18 +647,6 @@ static int stat_description(
     return result;
 }
 
-static int fill_linux_stat(
-    struct kernel_linux_stat *stat,
-    const struct kernel_open_file_description *description)
-{
-    memset(stat, 0, sizeof(*stat));
-    struct kernel_vfs_stat vfs_stat;
-    int result = stat_description(&vfs_stat, description);
-    if (result) return result;
-    fill_linux_vfs_stat(stat, &vfs_stat);
-    return 0;
-}
-
 struct linux_statx_timestamp { int64_t seconds; uint32_t nanoseconds; int32_t reserved; };
 struct linux_statx {
     uint32_t mask,blksize; uint64_t attributes;
@@ -674,13 +663,17 @@ static uint32_t device_minor(uint64_t device)
 { return (device&0xff)|((device>>12)&0xffffff00); }
 static int copy_stat_to_user(struct kernel_mm *mm,
                              uint64_t user_buffer,
-                             const struct kernel_linux_stat *stat,
+                             const struct kernel_vfs_stat *source,
                              int64_t *linux_result, int extended)
 {
     struct linux_statx statx={0};
+    struct kernel_linux_stat basic={0};
+    fill_linux_vfs_stat(&basic,source);
+    const struct kernel_linux_stat *stat=&basic;
     const void *bytes=stat;size_t size=sizeof(*stat);
     if(extended) {
-        /* 本地 inode 提供 BASIC_STATS；未实现 birthtime/属性等位保持未报告。 */
+        statx.attributes=source->attributes;
+        statx.attributes_mask=source->attributes_mask;
         statx.mask=0x7ff;statx.blksize=stat->st_blksize;
         statx.nlink=stat->st_nlink;statx.uid=stat->st_uid;statx.gid=stat->st_gid;
         statx.mode=stat->st_mode;statx.ino=stat->st_ino;statx.size=stat->st_size;statx.blocks=stat->st_blocks;
@@ -712,11 +705,11 @@ static int copy_stat_to_user(struct kernel_mm *mm,
 static enum kernel_files_status stat_pinned(struct kernel_open_file_description *description,
     struct kernel_mm *mm,uint64_t user_buffer,int64_t *linux_result)
 {
-    struct kernel_linux_stat stat;
+    struct kernel_vfs_stat stat={0};
     int copy_result;
     int result;
 
-    result = fill_linux_stat(&stat, description);
+    result = stat_description(&stat, description);
     if (result != 0) {
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
@@ -751,8 +744,7 @@ static enum kernel_files_status stat_at_to_user(
     int64_t *linux_result, int extended)
 {
     KERNEL_FILES_PIN_SCOPE(pin_guard);
-    struct kernel_linux_stat stat = {0};
-    struct kernel_vfs_stat vfs_stat;
+    struct kernel_vfs_stat stat={0};
     KERNEL_FILES_PATH_SCOPE(start);
     char *path = 0;
     size_t length = 0;
@@ -783,7 +775,7 @@ static enum kernel_files_status stat_at_to_user(
         if (empty && dirfd >= 0) {
             if(!extended) return kernel_files_fstat(files, mm, dirfd, user_buffer, linux_result);
             struct kernel_open_file_description *file=kernel_files_hold_fd(files,dirfd,&pin_guard);
-            result=file ? fill_linux_stat(&stat,file) : -KERNEL_EBADF;
+            result=file ? stat_description(&stat,file) : -KERNEL_EBADF;
             if(result) { *linux_result=result; return KERNEL_FILES_STATUS_OK; }
             int copied=copy_stat_to_user(mm,user_buffer,&stat,linux_result,1);
             if(copied<0) return KERNEL_FILES_STATUS_STATE;
@@ -820,18 +812,16 @@ static enum kernel_files_status stat_at_to_user(
     }
     if (empty) {
         if (dirfd == KERNEL_FS_AT_FDCWD) {
-            result = kernel_vfs_path_stat(fs_paths.cwd, &vfs_stat);
-            if (!result) fill_linux_vfs_stat(&stat, &vfs_stat);
+            result = kernel_vfs_path_stat(fs_paths.cwd, &stat);
         } else {
             struct kernel_open_file_description *file =
                 kernel_files_hold_fd(files, dirfd, &pin_guard);
-            result = file ? fill_linux_stat(&stat, file) : -KERNEL_EBADF;
+            result = file ? stat_description(&stat, file) : -KERNEL_EBADF;
         }
     } else {
         result = kernel_files_path_start(files, &fs_paths, dirfd, path, &start);
         if (!result) result = kernel_vfs_stat_at(start, fs_paths.root,
-                    path, !(flags & KERNEL_FILES_AT_SYMLINK_NOFOLLOW), &vfs_stat);
-        if (!result) fill_linux_vfs_stat(&stat, &vfs_stat);
+                    path, !(flags & KERNEL_FILES_AT_SYMLINK_NOFOLLOW), &stat);
     }
     if (path) kernel_files_release_allocation(files, path);
     if (result) { *linux_result = result; return KERNEL_FILES_STATUS_OK; }

@@ -131,6 +131,7 @@ struct kernel_vfs_stat {
     uint64_t size;
     uint64_t blocks;
     uint64_t blksize;
+    uint32_t attributes, attributes_mask;
     struct kernel_vfs_timespec atime;
     struct kernel_vfs_timespec mtime;
     struct kernel_vfs_timespec ctime;
@@ -215,6 +216,7 @@ enum kernel_vfs_open_flags {
     KERNEL_VFS_OPEN_DIRECTORY = 1U << 5,
     KERNEL_VFS_OPEN_REGULAR = 1U << 6,
     KERNEL_VFS_OPEN_NOATIME = 1U << 7,
+    KERNEL_VFS_OPEN_APPEND = 1U << 8,
 };
 enum kernel_vfs_resolve_flags {
     KERNEL_VFS_RESOLVE_NO_XDEV = 1U << 0,
@@ -228,6 +230,14 @@ enum kernel_vfs_resolve_flags {
 struct kernel_vfs_open_request { unsigned flags; uint32_t mode, umask; unsigned access, resolve; };
 #define KERNEL_VFS_MAY_EXEC 1U
 enum { KERNEL_VFS_CONTROL_READ=1, KERNEL_VFS_CONTROL_WRITE=2 };
+enum {
+    KERNEL_VFS_INODE_IMMUTABLE=0x10, KERNEL_VFS_INODE_APPEND=0x20, KERNEL_VFS_INODE_NODUMP=0x40,
+    KERNEL_VFS_INODE_PROTECTED=KERNEL_VFS_INODE_IMMUTABLE|KERNEL_VFS_INODE_APPEND,
+    KERNEL_VFS_INODE_ATTRIBUTES=KERNEL_VFS_INODE_PROTECTED|KERNEL_VFS_INODE_NODUMP
+};
+uint32_t kernel_vfs_node_attributes(const struct kernel_vfs_node *);
+int kernel_vfs_file_attributes(struct kernel_vfs_file *,int set,uint32_t *flags);
+
 #define KERNEL_VFS_MAY_WRITE 2U
 #define KERNEL_VFS_MAY_READ 4U
 int kernel_vfs_path_permission(struct kernel_vfs_path *path, unsigned access);

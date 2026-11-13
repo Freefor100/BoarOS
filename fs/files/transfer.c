@@ -79,6 +79,8 @@ static int64_t regular_copy_output(struct kernel_open_file_description *out,
     const void *buffer,const struct kernel_page_cache_read_page *pages,size_t source_offset,
     size_t size,uint64_t position,struct kernel_vfs_size_limit *limit,int first)
 {
+    KERNEL_LOCK_SCOPE(operation);
+    kernel_vfs_file_write_lock(&out->file,&operation);
     size_t allowed=size,written=0;
     int error=kernel_vfs_check_write_limit(limit,position,&allowed);
     if (error) return error;
@@ -462,6 +464,7 @@ static int64_t copy_range_pinned(struct kernel_mm *mm,
     if (!kernel_open_file_readable(input) || !kernel_files_description_writable(output) ||
         (kernel_open_file_flags(output) & KERNEL_FILES_O_APPEND)) return -KERNEL_EBADF;
     if (input->file.mount->private_data != output->file.mount->private_data) return -KERNEL_EXDEV;
+    if (kernel_vfs_node_attributes(output->file.private_data)&KERNEL_VFS_INODE_IMMUTABLE) return -KERNEL_EPERM;
     if (start > UINT64_MAX - count || out_start > UINT64_MAX - count) return -KERNEL_EOVERFLOW;
     uint64_t size = kernel_open_file_size(input);
     if ((int64_t)start >= (int64_t)size) count = 0;

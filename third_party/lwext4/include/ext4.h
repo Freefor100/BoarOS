@@ -214,6 +214,8 @@ int ext4_file_set_times(ext4_file *file, unsigned fields,
 int ext4_file_writeback_times(ext4_file *file, bool wait);
 /* Preserve inode identity after unlink; update permission bits and ctime in one
  * transaction, with the same file error owner as other metadata mutations. */
+int ext4_file_set_flags(ext4_file *file, uint32_t mask, uint32_t flags,
+    struct ext4_timestamp *ctime, bool *published);
 int ext4_file_set_mode(ext4_file *file, uint32_t mode);
 int ext4_file_capability(ext4_file *,void *,size_t,size_t *);
 int ext4_file_remove_privileges(ext4_file *,uint32_t mode);

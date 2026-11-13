@@ -455,7 +455,7 @@ extent 向左合并相邻新分配区间时，`ext4_ext_insert_leaf()` 同时移
 已打开inode；set/remove通过既有metadata执行入口开始私有操作，修改内部／外部EA、
 ctime和校验数据，失败执行原有回滚及资源归还。未保留另一套完整路径重查接口。
 列表仅输出已接入的名称空间，trusted条目的可见性由共同权限层传入。
-inode的immutable/append-only状态随模式与归属一并初始化，扩展属性修改检查该状态。
+`FS_IOC_GETFLAGS` 从真实 inode 读取用户可见位，包括已有的 extents、目录索引等格式位。`FS_IOC_SETFLAGS` 仅替换 immutable、append 和 nodump，保留其余磁盘位，将标志与 ctime 写入同一 inode。普通文件设置 immutable 时，写操作锁等待已接纳的普通写入，映射代次关闭新的共享写缺页；页缓存写回重设共享 PTE、完成 TLB 失效并等待在途的写 pin，然后 VFS 发布新标志。后续共享写缺页产生 SIGBUS，独立私有 COW 页保留。已经打开的可写 FD 在 ext4 的写入入口重新检查 immutable。最后一个无链接 inode owner 释放时，回收已分配的数据块，包括删除名字后才设置 immutable 或 append 的情形。
 inline EA在读取magic前检查范围；外部EA读取校验checksum，临时列表记录保持原生对齐。
 
 `kernel_vfs_fstat()` 把当前 open handle 指向的 raw ext4 inode 转换为统一 `kernel_vfs_stat`，不按路径重新查找。普通文件 size 与 atime/mtime/ctime 来自共享 node 的当前值，其余字段来自实际 inode。它读取 inode 的 ino/mode/nlink、Linux low/high uid/gid、64-bit size、以 512 字节为单位的 allocated block count，以及 filesystem block size；atime/mtime/ctime 按磁盘 inode size 与 `extra_isize` 共同判断 extra 字段是否存在，再解码 2-bit epoch 与纳秒。该编码依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `references/linux/fs/ext4/ext4.h`。文件系统实例维护唯一的`st_dev`：ext4/VFAT使用其块设备编号，虚拟后端使用自身设备身份；bind和命名空间视图不生成新的设备号。挂载ID与设备号分别维护。lwext4 的 `ext4_fraw_inode_fill()` 是最小 handle adapter，使最后一个 dentry 删除后仍能查询活着的 inode。
