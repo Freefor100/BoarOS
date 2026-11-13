@@ -4,6 +4,7 @@
 #include <kernel/errno.h>
 #include <kernel/heap.h>
 #include <kernel/memory_object.h>
+#include <kernel/mm.h>
 #include <kernel/page.h>
 #include <kernel/task.h>
 #include <kernel/uaccess.h>
@@ -12,6 +13,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#define IPC_FIXTURE_SHM
+#include "ipc_namespace_fixture.h"
 void mm_test_attach(unsigned);
 static unsigned char pool[16*1024*1024] __attribute__((aligned(16384)));
 static struct physical_page_allocator pages;
@@ -190,6 +193,54 @@ static void queries(void)
     printf("SHM_QUERY page_shift=%u checks=%u failures=%u\n",BOAROS_PAGE_SHIFT,query_checks,query_failures);
 }
 
+/* SHM storage is real; this boundary commits logical MM attachment owners. */
+static struct kernel_shm_attachment *mapped[4];
+enum kernel_mm_status kernel_mm_shmat(struct kernel_mm *mm,struct kernel_shm_segment *segment,
+    uint64_t hint,uint32_t permissions,uint32_t flags,uint64_t *out)
+{
+    (void)mm;(void)permissions;(void)flags;
+    unsigned slot=0;while(slot<4&&mapped[slot])slot++;assert(slot<4);
+    uint64_t address=hint?hint:(slot+1)*BOAROS_PAGE_SIZE;
+    assert(!kernel_shm_attachment_create(segment,address,address+segment->aligned_size,0,&mapped[slot]));
+    kernel_shm_attachment_open(mapped[slot]);
+    struct kernel_shm_attachment *prepared=mapped[slot];kernel_shm_attachment_release(&prepared);
+    *out=address;return KERNEL_MM_STATUS_OK;
+}
+static void namespace_lifetime(void)
+{
+    struct kernel_heap_statistics before,after;kernel_heap_get_statistics(&heap,&before);
+    struct kernel_namespace *left=0,*right=0;
+    assert(!kernel_ipc_namespace_create(&heap,&left)&&!kernel_ipc_namespace_create(&heap,&right));
+    host_ipc_namespace=left;
+    int32_t first=-1,second=-1;uint64_t address=0;
+    assert(kernel_shm_get(0,321,0,0,&first)==-KERNEL_ENOENT);
+    assert(!kernel_ipc_namespace_state(left)->shm);
+    information(0,0,0,0);assert(!kernel_ipc_namespace_state(left)->shm);
+    fail_allocation=1;
+    assert(kernel_shm_get(0,321,BOAROS_PAGE_SIZE,KERNEL_IPC_CREAT|0600,&first)==-KERNEL_ENOMEM);
+    assert(!kernel_ipc_namespace_state(left)->shm);
+    assert(!kernel_shm_get(0,321,BOAROS_PAGE_SIZE,KERNEL_IPC_CREAT|0600,&first));
+    assert(!kernel_shm_at_mm((struct kernel_mm *)1,123,first,0,0,&address));
+    struct kernel_shm_attachment *old=mapped[0];assert(old&&old->namespace==left);
+    assert(!ctl(first,KERNEL_IPC_RMID,0));
+    assert(!kernel_shm_at_mm((struct kernel_mm *)1,123,first,0,0,&address));
+    assert(mapped[1]->segment==old->segment&&old->segment->nattch==2);
+    host_ipc_namespace=right;
+    assert(!kernel_shm_get(0,321,BOAROS_PAGE_SIZE,KERNEL_IPC_CREAT|0600,&second)&&second==first);
+    struct kernel_shmid64_ds row;assert(!ctl(second,KERNEL_IPC_STAT,&row)&&!row.shm_nattch);
+    kernel_namespace_put(left); /* Only old attachments now own this namespace. */
+    struct kernel_shm_attachment *copy=0;
+    assert(!kernel_shm_attachment_create(old->segment,8*BOAROS_PAGE_SIZE,9*BOAROS_PAGE_SIZE,old,&copy));
+    assert(copy->namespace==old->namespace&&copy->file_identity==old->file_identity);
+    kernel_shm_attachment_release(&copy);
+    kernel_shm_attachment_close(mapped[0]);mapped[0]=0;
+    assert(mapped[1]->segment->nattch==1);
+    kernel_shm_attachment_close(mapped[1]);mapped[1]=0;
+    assert(!ctl(second,KERNEL_IPC_STAT,&row)&&!row.shm_nattch);
+    host_ipc_namespace=0;kernel_namespace_put(right);
+    kernel_heap_get_statistics(&heap,&after);assert(before.live_allocations==after.live_allocations);
+    puts("SHM namespace isolation, RMID reattach and old attachment/fork identity PASS");
+}
 int main(void)
 {
     mm_test_attach(0);
@@ -202,6 +253,8 @@ int main(void)
     assert(!ctl(id,KERNEL_SHM_UNLOCK,0)&&!ctl(id,KERNEL_IPC_RMID,0));
     queries();
     lifecycle();
+    namespace_lifetime();
+    assert(!kernel_ipc_initial_shutdown());
     struct kernel_heap_statistics stats;kernel_heap_get_statistics(&heap,&stats);
     assert(!stats.live_allocations&&!stats.current_pages&&!pages.shared_anon_pages&&!physical_page_allocator_audit(&pages));
     printf("SHM_LOCK page_shift=%u permissions/repeats/UID-quota/chown/account-owners/lazy-storage/OOM PASS\n",BOAROS_PAGE_SHIFT);

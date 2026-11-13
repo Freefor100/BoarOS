@@ -12,6 +12,7 @@ struct kernel_record_lock;
 struct kernel_char_device;
 struct kernel_block_device;
 struct kernel_async_io;
+struct kernel_namespace;
 
 struct kernel_open_file_description {
     struct kernel_vfs_file file;
@@ -46,6 +47,7 @@ struct kernel_open_file_description {
     size_t generated_length;
     uint8_t generated_ready;
     const struct kernel_credentials *credentials;
+    struct kernel_namespace *ipc_proc_namespace; /* /proc/sysvipc discovery owner from open. */
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
     uint64_t read_end,readahead_cookie,readahead_end; /* Last field is a page boundary. */
     unsigned readahead_pages;

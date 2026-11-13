@@ -162,6 +162,8 @@ int scheduler_task_descends_from(struct kernel_task *, const struct kernel_task 
 void scheduler_task_cursor_begin(struct scheduler_task_cursor *);
 void scheduler_task_cursor_next(struct scheduler_task_cursor *);
 void scheduler_task_cursor_end(struct scheduler_task_cursor *);
+void kernel_task_namespaces_initial(struct kernel_task *);
+void kernel_task_namespaces_release(struct kernel_task *);
 void process_identity_commit_locked(struct kernel_task *);
 void process_identity_sync_locked(struct kernel_task *);
 void process_identity_release_locked(struct kernel_task *);

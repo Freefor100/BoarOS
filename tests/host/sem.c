@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../../kernel/sem.c"
+#define IPC_FIXTURE_SEM
+#include "ipc_namespace_fixture.h"
 
 _Thread_local uintptr_t sync_test_irq = 2;
 static _Thread_local struct kernel_cpu cpu = {.initialized = KERNEL_CPU_INITIALIZED};
@@ -45,6 +47,8 @@ int kernel_credentials_capable(const struct kernel_credentials *c, unsigned cap)
     return 0;
 }
 uint64_t kernel_time_realtime_ns(void) { return time_ns; }
+enum kernel_time_status kernel_time_deadline_from_realtime(uint64_t n,uint64_t *d)
+{*d=n;return n<=time_ns?KERNEL_TIME_STATUS_DEADLINE_PASSED:0;}
 uint64_t kernel_time_monotonic_ns(void) { return time_ns; }
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t n, uint64_t *d)
 {
@@ -234,10 +238,10 @@ static void remove_exit_race(void)
     assert(!pthread_create(&t, 0, exiter, 0));
     barrier(&parked);
     rm(id);
-    assert(!sem_table.sets && !sem_table.members);
+    assert(!sem_namespace_table(kernel_ipc_initial(),0)->sets && !sem_namespace_table(kernel_ipc_initial(),0)->members);
     barrier(&proceed);
     assert(!pthread_join(t, 0));
-    assert(!allocations && !task[1].sem_undo);
+    assert(allocations==1 && !task[1].sem_undo);
     puts("PASS RMID wins after last undo owner borrows entry and set");
 }
 static void basic(void)
@@ -266,7 +270,7 @@ static void basic(void)
     rm(a);
     assert(ctl(a, 0, KERNEL_SEM_GETVAL, 0) == -KERNEL_EINVAL);
     rm(b);
-    assert(!allocations);
+    assert(allocations==1);
     puts("PASS atomic duplicate rollback, range, permission, info and PID owners");
 }
 static void undo_share(void)
@@ -292,10 +296,10 @@ static void undo_share(void)
     assert(!op(id, &x, 1));
     unsigned baseline = allocations;
     rm(id);
-    assert(allocations == 1 && baseline > allocations);
+    assert(allocations == 2 && baseline > allocations);
     assert(task[0].sem_undo && !task[0].sem_undo->entries);
     kernel_sem_exit(&task[0]);
-    assert(!allocations);
+    assert(allocations==1);
     puts("PASS empty clone undo sharing, SETVAL clears, RMID releases entry storage");
 }
 static void waits(void)
@@ -317,7 +321,7 @@ static void waits(void)
     rm(id);
     end_wait(t, -KERNEL_EIDRM);
     kernel_sem_exit(&task[1]);
-    assert(!allocations);
+    assert(allocations==1);
     id = make(1);
     vec[0] = (struct kernel_sembuf){0, -1, 0};
     wake_on_park = KERNEL_WAIT_SIGNALLED;
@@ -326,7 +330,7 @@ static void waits(void)
     assert(op(id, vec, 1) == -KERNEL_EAGAIN);
     wake_on_park = -1;
     rm(id);
-    assert(!allocations);
+    assert(allocations==1);
     puts(
         "PASS real prepare/park/finish completion, first blocking count, RMID, signal and timeout");
 }
@@ -347,13 +351,13 @@ static void oom(void)
         kernel_sem_exit(&task[0]);
         assert(allocations == before);
         rm(id);
-        assert(!allocations);
+        assert(allocations==1);
     }
     fail_at = 0;
     allocation_calls = 0;
     assert(kernel_sem_clone(&task[0], &task[1], 1) == -KERNEL_ENOMEM);
     fail_at = -1;
-    assert(!task[0].sem_undo && !task[1].sem_undo && !allocations);
+    assert(!task[0].sem_undo && !task[1].sem_undo && allocations==1);
     puts("PASS request/group/entry ENOMEM releases all owners");
 }
 static void forced_exit(void)
@@ -376,7 +380,7 @@ static void forced_exit(void)
     assert(val(id, 0) == 0 && ctl(id, 0, KERNEL_SEM_GETPID, 0) == pid[1].number);
     kernel_sem_exit(&task[1]);
     rm(id);
-    assert(!allocations);
+    assert(allocations==1);
     puts("PASS forced syscall-stack abandonment releases request and uses exiting TGID");
 }
 static void limits_and_reuse(void)
@@ -400,7 +404,7 @@ static void limits_and_reuse(void)
     for (int i = 0; i < info.semmni; i++)
         rm(ids[i]);
     free(ids);
-    assert(!allocations);
+    assert(allocations==1);
     puts("PASS published 32000-set quota, namespace counters and ID slot reuse");
 }
 static void undo_boundaries_and_thread_pid(void)
@@ -439,7 +443,7 @@ static void undo_boundaries_and_thread_pid(void)
     task[1].group_leader = &task[1];
     task[1].identities[KERNEL_PID_TGID].identity = &pid[1];
     rm(id);
-    assert(!allocations);
+    assert(allocations==1);
     puts("PASS signed undo boundary, exit clamping and nonleader TGID ownership");
 }
 static void *import_abandoner(void *unused)
@@ -480,7 +484,7 @@ static void import_order(void)
     kernel_sem_abort(&task[1]);
     assert(!task[1].sem_request && allocations == before);
     rm(id);
-    assert(!allocations);
+    assert(allocations==1);
     puts("PASS timeout/count/vector/ID validation order and unbound import owner cleanup");
 }
 static void proc_rows(void)
@@ -489,21 +493,71 @@ static void proc_rows(void)
     rm(second);
     unsigned before = allocations;
     uint32_t cursor = 0; int32_t id; struct kernel_semid64_ds row;
-    assert(kernel_sem_proc_next(&cursor, &id, &row) && id == first);
+    assert(kernel_sem_proc_next(kernel_ipc_initial(),&cursor, &id, &row) && id == first);
     assert(row.sem_perm.uid == cred.euid && row.sem_perm.gid == cred.egid &&
         row.sem_perm.mode == 0600 && row.sem_nsems == 3 && row.sem_ctime == 1);
-    assert(before == allocations && !kernel_sem_proc_next(&cursor, &id, &row));
+    assert(before == allocations && !kernel_sem_proc_next(kernel_ipc_initial(),&cursor, &id, &row));
     rm(first);
     assert(row.sem_nsems == 3);
-    cursor = 0; assert(!kernel_sem_proc_next(&cursor, &id, &row));
-    assert(!allocations);
+    cursor = 0; assert(!kernel_sem_proc_next(kernel_ipc_initial(),&cursor, &id, &row));
+    assert(allocations==1);
     puts("PASS proc semaphore rows use real metadata, skip removed slots and retain no owners");
 }
-int main(void)
+static void namespace_isolation(void)
+{
+    unsigned before=allocations;
+    struct kernel_namespace *left=0,*right=0;
+    assert(!kernel_ipc_namespace_create(&heap,&left));
+    assert(!kernel_ipc_namespace_create(&heap,&right));
+    host_ipc_namespace=left;
+    unsigned empty=allocations;uint32_t cursor=0;int32_t id;struct kernel_semid64_ds row;
+    assert(kernel_sem_get(cpu.current,123,1,0)==-KERNEL_ENOENT);
+    assert(!kernel_sem_proc_next(left,&cursor,&id,&row)&&allocations==empty);
+    struct kernel_seminfo info;assert(!ctl(0,0,KERNEL_SEM_INFO,(uintptr_t)&info));
+    assert(!info.semusz&&!info.semaem&&allocations==empty);
+    allocation_calls=0;fail_at=0;
+    assert(kernel_sem_get(cpu.current,123,1,KERNEL_IPC_CREAT|0600)==-KERNEL_ENOMEM);
+    fail_at=-1;assert(!kernel_ipc_namespace_state(left)->sem&&allocations==empty);
+    int first=(int)kernel_sem_get(cpu.current,123,1,KERNEL_IPC_CREAT|0600);
+    assert(first>=0&&!ctl(first,0,KERNEL_SEM_SETVAL,7));
+    struct sem_set *held=set_lookup(first,0);assert(held);
+    host_ipc_namespace=right;
+    assert(kernel_sem_get(cpu.current,123,1,0)==-KERNEL_ENOENT);
+    assert(val(first,0)==-KERNEL_EINVAL);
+    int second=(int)kernel_sem_get(cpu.current,123,1,KERNEL_IPC_CREAT|0600);
+    assert(second==first&&!ctl(second,0,KERNEL_SEM_SETVAL,11)&&val(second,0)==11);
+    cursor=0;assert(kernel_sem_proc_next(left,&cursor,&id,&row)&&id==first);
+    assert(row.sem_nsems==1&&held->members[0].value==7);
+    kernel_namespace_put(left);
+    assert(held->removed&&held->table->sets==0&&val(second,0)==11);
+    set_put(held);kernel_namespace_put(right);host_ipc_namespace=0;
+    assert(allocations==before);
+    puts("PASS namespace isolation, lazy empty lookup and old set/table lifetime");
+}
+static void initial_shutdown(void)
+{
+    struct kernel_namespace *base=kernel_ipc_initial();
+    struct kernel_ipc_namespace *ns=kernel_ipc_namespace_state(base);
+    struct kernel_sem_table *table=ns->sem;
+    int id=make(1);assert(id>=0&&table->sets==1);
+    struct kernel_namespace *live=kernel_namespace_get(base);
+    unsigned before=allocations;
+    assert(kernel_ipc_initial_shutdown()==-KERNEL_EBUSY);
+    assert(ns->sem==table&&table->sets==1&&allocations==before&&val(id,0)==0);
+    kernel_namespace_put(live);
+    use_permission=1; /* Actual internal deletion does not borrow caller privilege. */
+    assert(!kernel_ipc_initial_shutdown());use_permission=0;
+    assert(base->references==1&&!ns->sem&&!ns->msg&&!ns->shm&&!ns->mq&&!allocations);
+    assert(!kernel_ipc_initial_shutdown());
+    puts("PASS initial shutdown rejects live refs without mutation and releases real tables/sets");
+}
+int main(int argc,char **argv)
 {
     kernel_wait_domain_init();
     assert(!kernel_sem_init(&heap));
+    assert(sem_namespace_table(kernel_ipc_initial(),1));
     for (unsigned i = 0; i < 4; i++) {
+        kernel_raw_lock_init(&task[i].files_access,KERNEL_RAW_RANK_TASK_FILES);
         pid[i].number = (int)i + 10;
         pid[i].references = 1;
         task[i].identities[KERNEL_PID_TGID].identity = &pid[i];
@@ -511,6 +565,7 @@ int main(void)
     }
     assert(!pthread_barrier_init(&parked, 0, 2) && !pthread_barrier_init(&proceed, 0, 2));
     current(0);
+    if(argc==2&&!strcmp(argv[1],"shutdown-only")){initial_shutdown();return 0;}
     basic();
     import_order();
     undo_share();
@@ -521,9 +576,11 @@ int main(void)
     limits_and_reuse();
     forced_exit();
     proc_rows();
+    namespace_isolation();
     for (unsigned i = 0; i < 4; i++)
         assert(pid[i].references == 1);
-    assert(!sem_table.sets && !sem_table.members && !allocations);
+    assert(!sem_namespace_table(kernel_ipc_initial(),0)->sets && !sem_namespace_table(kernel_ipc_initial(),0)->members && allocations==1);
+    initial_shutdown();
     puts("SEM CORE HOST PASS");
     return 0;
 }

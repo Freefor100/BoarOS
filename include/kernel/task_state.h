@@ -277,6 +277,7 @@ struct kernel_task {
 #endif
     struct kernel_sched_runqueue *fair_queue;
     uint64_t fair_runtime_seen;
+    struct kernel_namespace *uts_namespace, *ipc_namespace;
 } __attribute__((aligned(16)));
 
 #endif

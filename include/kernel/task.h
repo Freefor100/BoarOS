@@ -127,8 +127,10 @@ int64_t kernel_task_close_range(struct kernel_task *, uint32_t first,
 enum kernel_task_status kernel_task_fs_context_borrow(
     const struct kernel_task *task,
     const struct kernel_fs_context **fs);
-int kernel_task_unshare_fs(struct kernel_task *,int new_mount_namespace);
-int kernel_task_setns_mount(struct kernel_task *,int32_t fd,uint32_t type);
+struct kernel_namespace;
+struct kernel_namespace *kernel_task_uts_namespace(void);
+int kernel_task_unshare_namespaces(struct kernel_task *,uint64_t flags);
+int kernel_task_setns(struct kernel_task *,int32_t fd,uint32_t type);
 
 /*
  * CPU accounting in scheduler ticks: own user/kernel time plus the rolled

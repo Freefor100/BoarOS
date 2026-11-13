@@ -1,4 +1,5 @@
 #include <kernel/mqueue.h>
+#include <kernel/ipc_namespace.h>
 #include <kernel/avl.h>
 #include <kernel/credentials.h>
 #include <kernel/errno.h>
@@ -50,6 +51,7 @@ struct mq_notification {
     int32_t type,signal;
 };
 struct kernel_mqueue {
+    struct kernel_mqueue_tree *tree;
     struct kernel_flock_identity flock_identity;
     struct kernel_mqueue *next;
     struct kernel_raw_lock lock;
@@ -79,23 +81,25 @@ struct kernel_mqueue_request {
     uint32_t sender_uid,outgoing_reason;
     int result,sending,queued;
 };
-static struct {
+struct kernel_mqueue_tree {
+    uint32_t references,owners;
+    struct kernel_namespace *namespace; /* Weak: mounts and queues must not retain an IPC namespace. */
     struct kernel_raw_lock lock;
-    struct kernel_heap *heap;
     struct kernel_mqueue *head;
-    uint64_t next_inode,named;
+    uint64_t next_inode,named,device_id;
     uint32_t queues,root_mode,root_uid,root_gid;
     struct kernel_vfs_timespec root_atime,root_mtime,root_ctime;
-} mq_table;
+};
+static struct kernel_heap *mq_heap;
 static void *mq_allocate(size_t size)
 {
     void *p=0;
-    enum kernel_heap_status s=kernel_heap_allocate_zeroed(mq_table.heap,1,size,&p);
+    enum kernel_heap_status s=kernel_heap_allocate_zeroed(mq_heap,1,size,&p);
     if(s==KERNEL_HEAP_STATUS_EMPTY) return 0;
     if(s) __builtin_trap();
     return p;
 }
-static void mq_free(void *p) { if(p)kernel_heap_release(mq_table.heap,p); }
+static void mq_free(void *p) { if(p)kernel_heap_release(mq_heap,p); }
 static struct kernel_vfs_timespec mq_now(void)
 {
     uint64_t n=kernel_time_realtime_ns();
@@ -104,22 +108,65 @@ static struct kernel_vfs_timespec mq_now(void)
 int kernel_mqueue_init(struct kernel_heap *heap)
 {
     if(!heap)return -KERNEL_EINVAL;
-    if(mq_table.heap)return mq_table.heap==heap?0:-KERNEL_EINVAL;
-    kernel_raw_lock_init(&mq_table.lock,25);mq_table.heap=heap;mq_table.next_inode=2;
-    mq_table.root_mode=KERNEL_VFS_S_IFDIR|01777;mq_table.root_uid=mq_table.root_gid=0;
-    mq_table.root_atime=mq_table.root_mtime=mq_table.root_ctime=mq_now();
-    return 0;
+    if(mq_heap)return mq_heap==heap?0:-KERNEL_EINVAL;
+    int error=kernel_ipc_namespace_boot(heap);if(error)return error;
+    mq_heap=heap;return 0;
+}
+struct kernel_mqueue_tree *kernel_mqueue_namespace_tree(struct kernel_namespace *base,int create)
+{
+    struct kernel_ipc_namespace *ns=kernel_ipc_namespace_state(base);
+    struct kernel_mqueue_tree *tree=__atomic_load_n(&ns->mq,__ATOMIC_ACQUIRE);
+    if(tree||!create)return tree;
+    struct kernel_mqueue_tree *candidate=mq_allocate(sizeof(*candidate));
+    if(!candidate)return 0;
+    candidate->namespace=base;candidate->device_id=base->id;
+    candidate->references=candidate->owners=1;candidate->next_inode=2;
+    candidate->root_mode=KERNEL_VFS_S_IFDIR|01777;
+    candidate->root_atime=candidate->root_mtime=candidate->root_ctime=mq_now();
+    kernel_raw_lock_init(&candidate->lock,25);
+    {KERNEL_RAW_SCOPE(g,&ns->lock);
+     if(!ns->mq)__atomic_store_n(&ns->mq,candidate,__ATOMIC_RELEASE);
+     tree=ns->mq;}
+    if(tree!=candidate)mq_free(candidate);
+    return tree;
+}
+static void tree_put(struct kernel_mqueue_tree *tree)
+{if(!__atomic_sub_fetch(&tree->references,1,__ATOMIC_ACQ_REL))mq_free(tree);}
+void kernel_mqueue_tree_get(struct kernel_mqueue_tree *tree)
+{
+    KERNEL_RAW_SCOPE(g,&tree->lock);
+    if(!tree->owners||tree->owners==UINT32_MAX)__builtin_trap();
+    tree->owners++;__atomic_fetch_add(&tree->references,1,__ATOMIC_RELAXED);
+}
+void kernel_mqueue_tree_put(struct kernel_mqueue_tree *tree)
+{
+    if(!tree)return;
+    struct kernel_mqueue *head=0;
+    {KERNEL_RAW_SCOPE(g,&tree->lock);
+     if(!tree->owners)__builtin_trap();
+     if(!--tree->owners){head=tree->head;tree->head=0;tree->named=0;
+       for(struct kernel_mqueue *q=head;q;q=q->next){KERNEL_RAW_SCOPE(state,&q->lock);q->linked=0;}}}
+    while(head){struct kernel_mqueue *q=head;head=q->next;q->next=0;kernel_mqueue_put(q);}
+    tree_put(tree);
+}
+void kernel_mqueue_namespace_destroy(struct kernel_mqueue_tree *tree)
+{
+    if(!tree)return;
+    {KERNEL_RAW_SCOPE(g,&tree->lock);tree->namespace=0;}
+    kernel_mqueue_tree_put(tree);
 }
 int kernel_mqueue_shutdown(void)
 {
-    if(!mq_table.heap)return 0;
+    struct kernel_ipc_namespace *ns=kernel_ipc_namespace_state(kernel_ipc_initial());
+    struct kernel_mqueue_tree *tree=ns->mq;if(!tree)return 0;
+    if(tree->owners!=1)return -KERNEL_EBUSY;
     struct kernel_mqueue *head;
-    {KERNEL_RAW_SCOPE(g,&mq_table.lock);head=mq_table.head;mq_table.head=0;mq_table.named=0;
+    {KERNEL_RAW_SCOPE(g,&tree->lock);
+     head=tree->head;tree->head=0;tree->named=0;
      for(struct kernel_mqueue *q=head;q;q=q->next){KERNEL_RAW_SCOPE(state,&q->lock);q->linked=0;}}
     while(head){struct kernel_mqueue *q=head;head=q->next;q->next=0;kernel_mqueue_put(q);}
-    KERNEL_RAW_SCOPE(g,&mq_table.lock);
-    if(mq_table.queues)return -KERNEL_EBUSY;
-    mq_table.heap=0;return 0;
+    {KERNEL_RAW_SCOPE(g,&tree->lock);if(tree->queues)return -KERNEL_EBUSY;}
+    ns->mq=0;kernel_mqueue_namespace_destroy(tree);return 0;
 }
 void kernel_mqueue_get(struct kernel_mqueue *q)
 {
@@ -160,21 +207,23 @@ void kernel_mqueue_put(struct kernel_mqueue *q)
     }
     notification_finish(&q->notification,2,0,0);
     if(q->account)kernel_uid_account_mqueue_uncharge(q->account,q->charge);
-    if(q->published){KERNEL_RAW_SCOPE(g,&mq_table.lock);if(!mq_table.queues)__builtin_trap();mq_table.queues--;}
+    struct kernel_mqueue_tree *tree=q->tree;
+    if(q->published){KERNEL_RAW_SCOPE(g,&tree->lock);if(!tree->queues)__builtin_trap();tree->queues--;}
     mq_free(q);
+    if(tree)tree_put(tree);
 }
-struct kernel_mqueue *kernel_mqueue_lookup_name(const char *name,size_t size)
+struct kernel_mqueue *kernel_mqueue_lookup_name(struct kernel_mqueue_tree *tree,const char *name,size_t size)
 {
-    if(!mq_table.heap)return 0;
-    KERNEL_RAW_SCOPE(g,&mq_table.lock);
-    for(struct kernel_mqueue *q=mq_table.head;q;q=q->next)
+    if(!tree)return 0;
+    KERNEL_RAW_SCOPE(g,&tree->lock);
+    for(struct kernel_mqueue *q=tree->head;q;q=q->next)
         if(strlen(q->name)==size&&!memcmp(q->name,name,size)){kernel_mqueue_get(q);return q;}
     return 0;
 }
-struct kernel_mqueue *kernel_mqueue_lookup_inode(uint64_t id)
+struct kernel_mqueue *kernel_mqueue_lookup_inode(struct kernel_mqueue_tree *tree,uint64_t id)
 {
-    KERNEL_RAW_SCOPE(g,&mq_table.lock);
-    for(struct kernel_mqueue *q=mq_table.head;q;q=q->next)
+    KERNEL_RAW_SCOPE(g,&tree->lock);
+    for(struct kernel_mqueue *q=tree->head;q;q=q->next)
         if(q->inode==id){kernel_mqueue_get(q);return q;}
     return 0;
 }
@@ -183,37 +232,37 @@ int kernel_mqueue_queue_permission(struct kernel_mqueue *q,unsigned access)
     KERNEL_RAW_SCOPE(g,&q->lock);
     return kernel_vfs_dac_permission(q->mode,q->uid,q->gid,access,kernel_credentials_current());
 }
-int kernel_mqueue_root_stat(struct kernel_vfs_stat *stat)
+int kernel_mqueue_root_stat(struct kernel_mqueue_tree *tree,struct kernel_vfs_stat *stat)
 {
-    KERNEL_RAW_SCOPE(g,&mq_table.lock);
-    *stat=(struct kernel_vfs_stat){.dev=0x19800202,.ino=1,.mode=mq_table.root_mode,.nlink=2,
-        .uid=mq_table.root_uid,.gid=mq_table.root_gid,.size=40+20*mq_table.named,.blksize=BOAROS_PAGE_SIZE,
-        .atime=mq_table.root_atime,.mtime=mq_table.root_mtime,.ctime=mq_table.root_ctime};return 0;
+    KERNEL_RAW_SCOPE(g,&tree->lock);
+    *stat=(struct kernel_vfs_stat){.dev=tree->device_id,.ino=1,.mode=tree->root_mode,.nlink=2,
+        .uid=tree->root_uid,.gid=tree->root_gid,.size=40+20*tree->named,.blksize=BOAROS_PAGE_SIZE,
+        .atime=tree->root_atime,.mtime=tree->root_mtime,.ctime=tree->root_ctime};return 0;
 }
-int kernel_mqueue_root_permission(unsigned access)
+int kernel_mqueue_root_permission(struct kernel_mqueue_tree *tree,unsigned access)
 {
-    KERNEL_RAW_SCOPE(g,&mq_table.lock);
-    return kernel_vfs_dac_permission(mq_table.root_mode,mq_table.root_uid,mq_table.root_gid,access,kernel_credentials_current());
+    KERNEL_RAW_SCOPE(g,&tree->lock);
+    return kernel_vfs_dac_permission(tree->root_mode,tree->root_uid,tree->root_gid,access,kernel_credentials_current());
 }
-int kernel_mqueue_root_set_mode(uint32_t mode)
+int kernel_mqueue_root_set_mode(struct kernel_mqueue_tree *tree,uint32_t mode)
 {
-    KERNEL_RAW_SCOPE(g,&mq_table.lock);uint32_t result=KERNEL_VFS_S_IFDIR|(mode&07777);
-    int error=kernel_vfs_chmod_allowed(mq_table.root_uid,mq_table.root_gid,&result);if(error)return error;
-    mq_table.root_mode=result;mq_table.root_ctime=mq_now();return 0;
+    KERNEL_RAW_SCOPE(g,&tree->lock);uint32_t result=KERNEL_VFS_S_IFDIR|(mode&07777);
+    int error=kernel_vfs_chmod_allowed(tree->root_uid,tree->root_gid,&result);if(error)return error;
+    tree->root_mode=result;tree->root_ctime=mq_now();return 0;
 }
-int kernel_mqueue_root_set_owner(uint32_t uid,uint32_t gid)
+int kernel_mqueue_root_set_owner(struct kernel_mqueue_tree *tree,uint32_t uid,uint32_t gid)
 {
-    KERNEL_RAW_SCOPE(g,&mq_table.lock);
-    int error=kernel_vfs_chown_allowed(mq_table.root_uid,mq_table.root_gid,mq_table.root_mode,uid,gid);if(error)return error;
-    if(uid!=UINT32_MAX)mq_table.root_uid=uid;
-    if(gid!=UINT32_MAX)mq_table.root_gid=gid;
-    mq_table.root_ctime=mq_now();return 0;
+    KERNEL_RAW_SCOPE(g,&tree->lock);
+    int error=kernel_vfs_chown_allowed(tree->root_uid,tree->root_gid,tree->root_mode,uid,gid);if(error)return error;
+    if(uid!=UINT32_MAX)tree->root_uid=uid;
+    if(gid!=UINT32_MAX)tree->root_gid=gid;
+    tree->root_ctime=mq_now();return 0;
 }
-int kernel_mqueue_create_name(struct kernel_task *task,const char *name,uint32_t mode,
+int kernel_mqueue_create_name(struct kernel_mqueue_tree *tree,struct kernel_task *task,const char *name,uint32_t mode,
     const struct kernel_mq_attr *attr,int exclusive,struct kernel_mqueue **out,int *created)
 {
     *out=0;*created=0;
-    if(!mq_table.heap)return -KERNEL_ENOSPC;
+    if(!tree)return -KERNEL_ENOSPC;
     size_t n=strlen(name);
     if(!n||n>255)return !n?-KERNEL_ENOENT:-KERNEL_ENAMETOOLONG;
     if(!strcmp(name,".")||!strcmp(name,".."))return -KERNEL_EACCES;
@@ -224,17 +273,18 @@ int kernel_mqueue_create_name(struct kernel_task *task,const char *name,uint32_t
     int result=0;
     for(;;){
         struct kernel_mqueue *found=0;
-        { KERNEL_RAW_SCOPE(g,&mq_table.lock);
-          for(found=mq_table.head;found;found=found->next)if(!strcmp(found->name,name))break;
+        { KERNEL_RAW_SCOPE(g,&tree->lock);
+          if(!tree->namespace){result=-KERNEL_EACCES;break;}
+          for(found=tree->head;found;found=found->next)if(!strcmp(found->name,name))break;
           if(found){kernel_mqueue_get(found);}
-          else if((result=kernel_vfs_dac_permission(mq_table.root_mode,mq_table.root_uid,mq_table.root_gid,3,c))){}
-          else if(!privileged && mq_table.queues>=256)result=-KERNEL_ENOSPC;
+          else if((result=kernel_vfs_dac_permission(tree->root_mode,tree->root_uid,tree->root_gid,3,c))){}
+          else if(!privileged && tree->queues>=256)result=-KERNEL_ENOSPC;
           else if(!candidate)result=1;
           else {
-              if(mq_table.next_inode==UINT64_MAX)__builtin_trap();
-              candidate->inode=mq_table.next_inode++;candidate->next=mq_table.head;
-              mq_table.head=candidate;mq_table.queues++;mq_table.named++;candidate->linked=candidate->published=1;
-              mq_table.root_mtime=mq_table.root_ctime=mq_now();
+              if(tree->next_inode==UINT64_MAX)__builtin_trap();
+              candidate->inode=tree->next_inode++;candidate->next=tree->head;
+              tree->head=candidate;tree->queues++;tree->named++;candidate->linked=candidate->published=1;
+              tree->root_mtime=tree->root_ctime=mq_now();
               kernel_mqueue_get(candidate);*out=candidate;*created=1;candidate=0;result=0;
           }
         }
@@ -245,7 +295,7 @@ int kernel_mqueue_create_name(struct kernel_task *task,const char *name,uint32_t
             result=-KERNEL_EINVAL;break;
         }
         candidate=mq_allocate(sizeof(*candidate));if(!candidate){result=-KERNEL_ENOMEM;break;}
-        candidate->references=1;candidate->maxmsg=(uint64_t)count;candidate->msgsize=(uint64_t)size;
+        candidate->references=1;candidate->tree=tree;__atomic_fetch_add(&tree->references,1,__ATOMIC_RELAXED);candidate->maxmsg=(uint64_t)count;candidate->msgsize=(uint64_t)size;
         candidate->charge=(uint64_t)count*((uint64_t)size+48)+((uint64_t)count<MQ_PRIO_MAX?(uint64_t)count:MQ_PRIO_MAX)*48;
         struct kernel_rlimit64 limit;
         if(kernel_task_get_rlimit(task,KERNEL_RLIMIT_MSGQUEUE,&limit))__builtin_trap();
@@ -260,34 +310,34 @@ int kernel_mqueue_create_name(struct kernel_task *task,const char *name,uint32_t
     }
     if(candidate){
         if(candidate->account)kernel_mqueue_put(candidate);
-        else mq_free(candidate);
+        else {tree_put(candidate->tree);mq_free(candidate);}
     }
     return result;
 }
-int kernel_mqueue_remove_name(const char *name,size_t n)
+int kernel_mqueue_remove_name(struct kernel_mqueue_tree *tree,const char *name,size_t n)
 {
     struct kernel_mqueue *q=0;int result=-KERNEL_ENOENT;
     const struct kernel_credentials *c=kernel_credentials_current();
-    { KERNEL_RAW_SCOPE(g,&mq_table.lock);
-      struct kernel_mqueue **link=&mq_table.head;
+    { KERNEL_RAW_SCOPE(g,&tree->lock);
+      struct kernel_mqueue **link=&tree->head;
       while(*link && (strlen((*link)->name)!=n||memcmp((*link)->name,name,n)))link=&(*link)->next;
       q=*link;
       if(q){KERNEL_RAW_SCOPE(state,&q->lock);
-          if((result=kernel_vfs_dac_permission(mq_table.root_mode,mq_table.root_uid,mq_table.root_gid,3,c))){}
-          else if((mq_table.root_mode&01000U)&&c->fsuid!=mq_table.root_uid&&c->fsuid!=q->uid&&
+          if((result=kernel_vfs_dac_permission(tree->root_mode,tree->root_uid,tree->root_gid,3,c))){}
+          else if((tree->root_mode&01000U)&&c->fsuid!=tree->root_uid&&c->fsuid!=q->uid&&
               !kernel_credentials_capable(c,KERNEL_CAP_FOWNER))result=-KERNEL_EPERM;
-          else{*link=q->next;q->next=0;q->linked=0;mq_table.named--;
-              q->ctime=mq_table.root_mtime=mq_table.root_ctime=mq_now();result=0;}
+          else{*link=q->next;q->next=0;q->linked=0;tree->named--;
+              q->ctime=tree->root_mtime=tree->root_ctime=mq_now();result=0;}
       }
     }
     if(!result)kernel_mqueue_put(q);
     return result;
 }
-int kernel_mqueue_next(uint64_t *cursor,uint64_t *id,char *name,size_t capacity)
+int kernel_mqueue_next(struct kernel_mqueue_tree *tree,uint64_t *cursor,uint64_t *id,char *name,size_t capacity)
 {
-    KERNEL_RAW_SCOPE(g,&mq_table.lock);
+    KERNEL_RAW_SCOPE(g,&tree->lock);
     struct kernel_mqueue *best=0;
-    for(struct kernel_mqueue *q=mq_table.head;q;q=q->next)
+    for(struct kernel_mqueue *q=tree->head;q;q=q->next)
         if(q->inode>*cursor&&(!best||q->inode<best->inode))best=q;
     if(!best)return 0;
     size_t n=strlen(best->name);if(n+1>capacity)return -KERNEL_ENAMETOOLONG;
@@ -341,13 +391,15 @@ int64_t kernel_mqueue_open(struct kernel_task *task,struct kernel_mm *mm,uint64_
     if(kernel_files_find_free_fd(files,&fd,&error))__builtin_trap();
     if(error)return error;
     KERNEL_FILES_RESERVATION_SCOPE(reservation);reservation.files=files;reservation.fd=fd;
+    struct kernel_mqueue_tree *tree=kernel_mqueue_namespace_tree(kernel_task_ipc_namespace(),!!(flags&MQ_CREAT));
+    if(!tree)return (flags&MQ_CREAT)?-KERNEL_ENOMEM:-KERNEL_ENOENT;
     struct kernel_mqueue *q=0;int created=0;
     if(flags&MQ_CREAT){
         const struct kernel_fs_context *fs;
         if(kernel_task_fs_context_borrow(task,&fs))__builtin_trap();
         mode&=~kernel_fs_context_umask(fs);
-        result=kernel_mqueue_create_name(task,name,mode,attributes,!!(flags&MQ_EXCL),&q,&created);
-    }else{q=kernel_mqueue_lookup_name(name,strlen(name));result=q?0:-KERNEL_ENOENT;}
+        result=kernel_mqueue_create_name(tree,task,name,mode,attributes,!!(flags&MQ_EXCL),&q,&created);
+    }else{q=kernel_mqueue_lookup_name(tree,name,strlen(name));result=q?0:-KERNEL_ENOENT;}
     if(result)return result;
     if(!created)result=(flags&3U)==3U?-KERNEL_EINVAL:
         kernel_mqueue_queue_permission(q,(flags&3U)==0?4:(flags&3U)==1?2:6);
@@ -364,7 +416,9 @@ int64_t kernel_mqueue_open(struct kernel_task *task,struct kernel_mm *mm,uint64_
 int64_t kernel_mqueue_unlink(struct kernel_task *task,struct kernel_mm *mm,uint64_t address)
 {
     (void)task;char name[256];int r=import_name(mm,address,name);
-    return r?r:kernel_mqueue_remove_name(name,strlen(name));
+    if(r)return r;
+    struct kernel_mqueue_tree *tree=kernel_mqueue_namespace_tree(kernel_task_ipc_namespace(),0);
+    return tree?kernel_mqueue_remove_name(tree,name,strlen(name)):-KERNEL_ENOENT;
 }
 static void request_remove(struct kernel_mqueue_request *r)
 {
@@ -696,7 +750,7 @@ int64_t kernel_mqueue_getsetattr(struct kernel_task *task,struct kernel_mm *mm,i
 int kernel_mqueue_queue_stat(struct kernel_mqueue *q,struct kernel_vfs_stat *stat)
 {
     KERNEL_RAW_SCOPE(g,&q->lock);
-    *stat=(struct kernel_vfs_stat){.dev=0x19800202U,.ino=q->inode,.mode=q->mode,.nlink=q->linked,
+    *stat=(struct kernel_vfs_stat){.dev=q->tree->device_id,.ino=q->inode,.mode=q->mode,.nlink=q->linked,
         .uid=q->uid,.gid=q->gid,.size=80,.blksize=BOAROS_PAGE_SIZE,.atime=q->atime,.mtime=q->mtime,.ctime=q->ctime};
     return 0;
 }
@@ -708,8 +762,9 @@ int kernel_mqueue_statfs(struct kernel_open_file_description *file,struct kernel
     if(file->file.mount){struct kernel_vfs_statfs native;int error=kernel_vfs_mount_statfs(file->file.mount,&native);
         if(error)return error;
         flags=native.flags;}
+    uint64_t device=file_queue(file)->tree->device_id;
     *stat=(struct kernel_linux_statfs){.f_type=0x19800202,.f_bsize=BOAROS_PAGE_SIZE,.f_namelen=255,
-        .f_fsid={0x19800202,0},.f_frsize=BOAROS_PAGE_SIZE,.f_flags=(int64_t)flags};return 0;
+        .f_fsid={(int32_t)device,(int32_t)(device>>32)},.f_frsize=BOAROS_PAGE_SIZE,.f_flags=(int64_t)flags};return 0;
 }
 int kernel_mqueue_queue_set_mode(struct kernel_mqueue *q,uint32_t mode)
 {
@@ -760,11 +815,11 @@ int kernel_mqueue_set_times(struct kernel_open_file_description *file,const stru
     if(file->file.mount && kernel_vfs_mount_is_readonly(file->file.mount))return -KERNEL_EROFS;
     return kernel_mqueue_queue_set_times(file_queue(file),times);
 }
-int kernel_mqueue_root_set_times(const struct kernel_vfs_timespec *times)
+int kernel_mqueue_root_set_times(struct kernel_mqueue_tree *tree,const struct kernel_vfs_timespec *times)
 {
-    KERNEL_RAW_SCOPE(g,&mq_table.lock);
-    return update_times(mq_table.root_mode,mq_table.root_uid,mq_table.root_gid,
-        &mq_table.root_atime,&mq_table.root_mtime,&mq_table.root_ctime,times);
+    KERNEL_RAW_SCOPE(g,&tree->lock);
+    return update_times(tree->root_mode,tree->root_uid,tree->root_gid,
+        &tree->root_atime,&tree->root_mtime,&tree->root_ctime,times);
 }
 static size_t append_decimal(char *buffer,size_t at,uint64_t value,unsigned width)
 {

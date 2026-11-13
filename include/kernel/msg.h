@@ -24,6 +24,7 @@ struct kernel_msginfo {
 };
 _Static_assert(sizeof(struct kernel_msqid64_ds) == 120, "msqid64_ds layout");
 _Static_assert(sizeof(struct kernel_msginfo) == 32, "msginfo layout");
+struct kernel_namespace;
 struct kernel_heap;
 struct kernel_task;
 struct kernel_mm;
@@ -41,5 +42,5 @@ int64_t kernel_msg_receive(struct kernel_task *, struct kernel_mm *, int32_t id,
 void kernel_msg_abort(struct kernel_task *);
 /* Slot cursor starts at zero. Copy one live row under index/object protection;
  * the returned descriptor owns no queue, PID, message or wait references. */
-int kernel_msg_proc_next(uint32_t *cursor, int32_t *id, struct kernel_msqid64_ds *row);
+int kernel_msg_proc_next(struct kernel_namespace *,uint32_t *cursor, int32_t *id, struct kernel_msqid64_ds *row);
 #endif

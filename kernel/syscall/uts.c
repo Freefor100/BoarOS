@@ -19,7 +19,7 @@ enum kernel_syscall_status syscall_handle_uts(
         struct kernel_utsname name;
         if (kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-        kernel_uts_snapshot(&name);
+        kernel_uts_snapshot(kernel_task_uts_namespace(),&name);
         access = kernel_copy_to_user(mm, request->arguments[0], &name,
                                      sizeof(name), &copied);
         if (access == KERNEL_UACCESS_STATUS_FAULT) decoded->value = -KERNEL_EFAULT;
@@ -53,7 +53,7 @@ enum kernel_syscall_status syscall_handle_uts(
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
     /* Publish only after the complete user range has been copied. */
-    kernel_uts_name_set(request->number == 161U ? KERNEL_UTS_HOSTNAME :
+    kernel_uts_name_set(kernel_task_uts_namespace(),request->number == 161U ? KERNEL_UTS_HOSTNAME :
                         KERNEL_UTS_DOMAINNAME, name, (size_t)length);
     decoded->value = 0;
     return KERNEL_SYSCALL_STATUS_OK;

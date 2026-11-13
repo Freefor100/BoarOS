@@ -4,6 +4,8 @@
 #include <kernel/uaccess.h>
 #include <kernel/heap.h>
 #include <kernel/fs_context.h>
+#include <kernel/namespace.h>
+#include <kernel/uts.h>
 #include <kernel/errno.h>
 #include <kernel/task.h>
 #include "../../kernel/syscall/private.h"
@@ -788,6 +790,100 @@ static void atime_policy(struct kernel_vfs_mount *mount,struct kernel_vfs_file *
     assert(!kernel_vfs_path_release(&root));
     puts("PASS atime: real inode updates, OFD suppression, remount preservation and statfs");
 }
+static void namespace_uts(struct kernel_vfs_mount *mount)
+{
+    struct kernel_namespace *initial=kernel_uts_initial(),*copy=NULL;
+    struct kernel_utsname before,after;
+    kernel_uts_snapshot(initial,&before);
+    struct kernel_heap_statistics baseline,current;
+    kernel_heap_get_statistics(&heap,&baseline);
+    allocation_calls=0;allocation_fail_at=1;
+    assert(kernel_uts_clone(initial,&heap,&copy)==-KERNEL_ENOMEM&&!copy);
+    allocation_fail_at=0;
+    kernel_heap_get_statistics(&heap,&current);
+    assert(baseline.live_allocations==current.live_allocations);
+    assert(!kernel_uts_clone(initial,&heap,&copy)&&copy->type==KERNEL_NS_UTS&&copy->id!=initial->id);
+    kernel_uts_snapshot(copy,&after);assert(!memcmp(&before,&after,sizeof(before)));
+    kernel_uts_name_set(copy,KERNEL_UTS_HOSTNAME,"private-host",12);
+    kernel_uts_name_set(copy,KERNEL_UTS_DOMAINNAME,"private.domain",14);
+    assert(kernel_uts_name_write(copy,KERNEL_UTS_HOSTNAME,8,"tail",4));
+    assert(!kernel_uts_name_write(copy,KERNEL_UTS_HOSTNAME,30,"ignored",7));
+    kernel_uts_snapshot(copy,&after);
+    assert(!strcmp(after.nodename,"private-tail")&&!strcmp(after.domainname,"private.domain"));
+    kernel_uts_snapshot(initial,&after);assert(!memcmp(&before,&after,sizeof(before)));
+    struct kernel_open_file_description *file=NULL;
+    assert(kernel_namespace_open(copy,&heap,0200000,&file)==-KERNEL_ENOTDIR&&!file);
+    const uint32_t writes[]={1,2,01000};
+    for(unsigned i=0;i<sizeof(writes)/sizeof(writes[0]);i++)
+        assert(kernel_namespace_open(copy,&heap,writes[i],&file)==-KERNEL_EPERM&&!file);
+    assert(!kernel_namespace_open(copy,&heap,0,&file)&&kernel_namespace_file(file)==copy);
+    uint64_t id=copy->id;
+    kernel_namespace_put(copy);copy=NULL;
+    assert(kernel_namespace_file(file)->id==id&&kernel_namespace_file(file)->type==KERNEL_NS_UTS);
+    assert(!kernel_open_file_release(&file));
+    struct kernel_fs_context fs={0},candidate={0};
+    assert(!kernel_fs_context_create(&fs,mount,&heap));
+    allocation_calls=0;allocation_fail_at=1;
+    assert(!kernel_fs_context_prepare_unshare(&candidate,&fs,0)&&
+        candidate.state==KERNEL_FS_CONTEXT_EMPTY&&!allocation_calls);
+    allocation_fail_at=0;
+    struct kernel_fs_context shared={0};assert(!kernel_fs_context_acquire(&shared,&fs));
+    allocation_calls=0;allocation_fail_at=1;
+    assert(kernel_fs_context_prepare_unshare(&candidate,&fs,0)==-KERNEL_ENOMEM&&
+        candidate.state==KERNEL_FS_CONTEXT_EMPTY&&kernel_fs_context_is_live(&shared));
+    allocation_fail_at=0;
+    assert(!kernel_fs_context_prepare_unshare(&candidate,&fs,0)&&kernel_fs_context_is_live(&candidate));
+    struct kernel_fs_context previous={0};
+    kernel_fs_context_exchange(&fs,&candidate,&previous);
+    assert(kernel_fs_context_is_live(&previous)&&candidate.state==KERNEL_FS_CONTEXT_MOVED);
+    assert(!kernel_fs_context_release(&previous));
+    candidate=(struct kernel_fs_context){0};
+    assert(!kernel_fs_context_release(&shared));
+    struct kernel_fs_mounts mounts=kernel_fs_context_mounts_snapshot(&fs);
+    assert(kernel_mount_namespace_base(mounts.namespace)->id!=initial->id&&
+        kernel_mount_namespace_base(mounts.namespace)->id!=id);
+    assert(!kernel_fs_context_prepare_namespace(&candidate,&fs,mounts.namespace,0));
+    kernel_fs_context_commit(&fs,&candidate);
+    kernel_fs_mounts_release(&mounts);
+    assert(!kernel_fs_context_release(&fs));
+    kernel_heap_get_statistics(&heap,&current);
+    assert(baseline.live_allocations==current.live_allocations);
+    puts("PASS namespace-uts: isolated copy, OOM rollback, globally unique IDs, common FD lifetime and prepared FS commit");
+}
+static void namespace_shared_fs(struct kernel_vfs_mount *mount)
+{
+    struct kernel_fs_context fs={0},peer={0},target={0},candidate={0},old={0};
+    assert(!kernel_fs_context_create(&fs,mount,&heap)&&!kernel_fs_context_acquire(&peer,&fs));
+    assert(!kernel_fs_context_fork_mount_namespace(&target,&fs));
+    uint64_t original=kernel_fs_context_namespace_id(&fs),selected=kernel_fs_context_namespace_id(&target);
+    assert(original!=selected);
+    struct kernel_fs_mounts target_mounts=kernel_fs_context_mounts_snapshot(&target);
+    assert(kernel_fs_context_prepare_namespace(&candidate,&fs,target_mounts.namespace,0)==-KERNEL_EINVAL);
+    assert(candidate.state==KERNEL_FS_CONTEXT_EMPTY);
+    assert(!kernel_fs_context_prepare_namespace(&candidate,&fs,target_mounts.namespace,1));
+    struct kernel_fs_context_record *shared_record=fs.record;
+    struct kernel_fs_paths before=kernel_fs_context_snapshot(&fs),next=kernel_fs_context_snapshot(&candidate);
+    assert(before.root!=next.root&&before.cwd!=next.cwd);
+    uint32_t previous;assert(!kernel_fs_context_exchange_umask(&peer,0071,&previous));
+    kernel_fs_context_exchange_paths_namespace(&fs,&candidate,&old);
+    assert(fs.record==shared_record&&peer.record==shared_record&&candidate.state==KERNEL_FS_CONTEXT_MOVED);
+    assert(kernel_fs_context_namespace_id(&fs)==selected&&kernel_fs_context_namespace_id(&peer)==original);
+    struct kernel_fs_paths current=kernel_fs_context_snapshot(&fs),shared=kernel_fs_context_snapshot(&peer);
+    struct kernel_fs_paths replaced=kernel_fs_context_snapshot(&old);
+    assert(current.root==next.root&&current.cwd==next.cwd&&current.umask==0071);
+    assert(shared.root==current.root&&shared.cwd==current.cwd&&shared.umask==0071);
+    assert(replaced.root==before.root&&replaced.cwd==before.cwd&&kernel_fs_context_namespace_id(&old)==original);
+    struct kernel_fs_context foreign={0};assert(!kernel_fs_context_fork_mount_namespace(&foreign,&peer));
+    struct kernel_fs_paths foreign_paths=kernel_fs_context_snapshot(&foreign);
+    assert(foreign_paths.root==shared.root&&foreign_paths.cwd==shared.cwd);
+    assert(kernel_fs_context_namespace_id(&foreign)!=original&&kernel_fs_context_namespace_id(&foreign)!=selected);
+    kernel_fs_paths_release(&foreign_paths);assert(!kernel_fs_context_release(&foreign));
+    kernel_fs_paths_release(&before);kernel_fs_paths_release(&next);kernel_fs_paths_release(&current);
+    kernel_fs_paths_release(&shared);kernel_fs_paths_release(&replaced);kernel_fs_mounts_release(&target_mounts);
+    assert(!kernel_fs_context_release(&old)&&!kernel_fs_context_release(&target));
+    assert(!kernel_fs_context_release(&fs)&&!kernel_fs_context_release(&peer)&&!kernel_vfs_reap_mounts());
+    puts("PASS namespace-shared-fs: shared paths and umask, distinct mount owners, pure-MNT refusal, combined publication and foreign-path clone");
+}
 int main(int argc,char **argv)
 {
     assert(argc==2);mm_test_attach(0);
@@ -800,7 +896,9 @@ int main(int argc,char **argv)
     struct kernel_vfs_mount *mount=0;struct kernel_open_file_description *file=0;
     assert(!kernel_tmpfs_create(&heap,0,"nr_blocks=8",&mount));mount->noexec=mount->nodev=1;
     opened(mount,"/file",0755,&file);file->open_flags=2;
-    if(!strcmp(argv[1],"created-tree"))created_tree_failures(mount);
+    if(!strcmp(argv[1],"namespace-uts"))namespace_uts(mount);
+    else if(!strcmp(argv[1],"namespace-shared-fs"))namespace_shared_fs(mount);
+    else if(!strcmp(argv[1],"created-tree"))created_tree_failures(mount);
     else if(!strcmp(argv[1],"pivot-owner"))mount_pivot_owner();
     else if(!strcmp(argv[1],"mount-api"))mount_tree_api(mount);
     else if(!strcmp(argv[1],"propagation"))mount_propagation(mount);

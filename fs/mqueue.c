@@ -9,7 +9,12 @@ struct mq_mount {
     struct kernel_vfs_mount mount;
     struct kernel_vfs_instance instance;
     uint64_t flags;
+    struct kernel_mqueue_tree *tree;
 };
+static struct kernel_mqueue_tree *instance_tree(const struct kernel_vfs_instance *i)
+{return ((const struct mq_mount *)i->backend_data)->tree;}
+static struct kernel_mqueue_tree *mount_tree(const struct kernel_vfs_mount *m)
+{return instance_tree(m->private_data);}
 static struct kernel_vfs_backend mq_ops;
 int kernel_mqueue_fs_is_mount(const struct kernel_vfs_mount *mount)
 {
@@ -24,12 +29,12 @@ struct kernel_mqueue *kernel_mqueue_fs_file_queue(const struct kernel_vfs_file *
 }
 static int error(struct kernel_vfs_instance *i){(void)i;return 0;}
 static int root(struct kernel_vfs_instance *i,uint64_t *id,uint32_t *mode)
-{(void)i;struct kernel_vfs_stat stat;kernel_mqueue_root_stat(&stat);*id=1;*mode=stat.mode;return 0;}
+{struct kernel_vfs_stat stat;kernel_mqueue_root_stat(instance_tree(i),&stat);*id=1;*mode=stat.mode;return 0;}
 static int lookup(struct kernel_vfs_instance *i,uint64_t parent,const char *name,
     size_t n,uint64_t *id,uint32_t *mode)
 {
     (void)i;if(parent!=1)return -KERNEL_ENOTDIR;
-    struct kernel_mqueue *q=kernel_mqueue_lookup_name(name,n);if(!q)return -KERNEL_ENOENT;
+    struct kernel_mqueue *q=kernel_mqueue_lookup_name(instance_tree(i),name,n);if(!q)return -KERNEL_ENOENT;
     struct kernel_vfs_stat stat;kernel_mqueue_queue_stat(q,&stat);kernel_mqueue_put(q);
     *id=stat.ino;*mode=stat.mode;return 0;
 }
@@ -37,13 +42,13 @@ static int open_inode(struct kernel_vfs_mount *mount,const char *path,uint64_t i
     uint32_t mode,struct kernel_vfs_file *file)
 {
     (void)path;(void)mode;struct kernel_vfs_instance *i=mount->private_data;
-    struct kernel_mqueue *q=id==1?0:kernel_mqueue_lookup_inode(id);
+    struct kernel_mqueue *q=id==1?0:kernel_mqueue_lookup_inode(instance_tree(i),id);
     if(id!=1&&!q)return -KERNEL_ENOENT;
     struct kernel_vfs_node *node=0;
     enum kernel_heap_status s=kernel_heap_allocate_zeroed(i->heap,1,sizeof(*node),(void **)&node);
     if(s){if(q)kernel_mqueue_put(q);return s==KERNEL_HEAP_STATUS_EMPTY?-KERNEL_ENOMEM:-KERNEL_EIO;}
     node->inode=id;node->backend_data=q;node->max_size=80;
-    struct kernel_vfs_stat st;if(q)kernel_mqueue_queue_stat(q,&st);else kernel_mqueue_root_stat(&st);
+    struct kernel_vfs_stat st;if(q)kernel_mqueue_queue_stat(q,&st);else kernel_mqueue_root_stat(instance_tree(i),&st);
     node->mode=st.mode;node->uid=st.uid;node->gid=st.gid;node->size=st.size;
     return kernel_vfs_publish_node(mount,node,file,0);
 }
@@ -56,29 +61,29 @@ static int create(struct kernel_vfs_mount *mount,uint64_t parent,const char *nam
     if(parent!=1)return -KERNEL_ENOTDIR;
     if((mode&KERNEL_VFS_S_IFMT)&&(mode&KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFREG)return -KERNEL_EPERM;
     struct kernel_mqueue *q=0;int made=0;
-    int result=kernel_mqueue_create_name(kernel_task_current(),name,mode,0,1,&q,&made);
+    int result=kernel_mqueue_create_name(mount_tree(mount),kernel_task_current(),name,mode,0,1,&q,&made);
     if(result)return result;
     struct kernel_vfs_stat st;kernel_mqueue_queue_stat(q,&st);
     result=open_inode(mount,name,st.ino,st.mode,file);kernel_mqueue_put(q);return result;
 }
 static int unlink_file(struct kernel_vfs_mount *mount,uint64_t parent,const char *name)
-{(void)mount;return parent==1?kernel_mqueue_remove_name(name,strlen(name)):-KERNEL_ENOTDIR;}
+{(void)mount;return parent==1?kernel_mqueue_remove_name(mount_tree(mount),name,strlen(name)):-KERNEL_ENOTDIR;}
 static int stat_inode(const struct kernel_vfs_file *file,struct kernel_vfs_stat *stat)
 {
     struct kernel_mqueue *q=kernel_mqueue_fs_file_queue(file);
     if(q)kernel_mqueue_queue_stat(q,stat);
-    else kernel_mqueue_root_stat(stat);
+    else kernel_mqueue_root_stat(mount_tree(file->mount),stat);
     stat->dev=((struct kernel_vfs_instance *)file->mount->private_data)->device_id;return 0;
 }
 static int statfs(struct kernel_vfs_mount *mount,struct kernel_vfs_statfs *stat)
 {
     struct mq_mount *m=((struct kernel_vfs_instance *)mount->private_data)->backend_data;
     *stat=(struct kernel_vfs_statfs){.type=0x19800202U,.block_size=BOAROS_PAGE_SIZE,
-        .fsid=0x19800202U,.name_length=255,.flags=m->instance.read_only?1U:0U};return 0;
+        .fsid=m->instance.device_id,.name_length=255,.flags=m->instance.read_only?1U:0U};return 0;
 }
 static int permission(struct kernel_vfs_node *node,const struct kernel_credentials *c,unsigned access)
 {
-    (void)c;if(!node->backend_data)return kernel_mqueue_root_permission(access);
+    (void)c;if(!node->backend_data)return kernel_mqueue_root_permission(instance_tree(node->instance),access);
     /* q metadata is shared across mount-local node caches. Permission always
      * consults that authoritative queue, including chmod from another mount. */
     return kernel_mqueue_queue_permission(node->backend_data,access);
@@ -87,18 +92,18 @@ static int set_mode(struct kernel_vfs_file *file,uint32_t mode)
 {
     if(((struct kernel_vfs_instance *)file->mount->private_data)->read_only)return -KERNEL_EROFS;
     struct kernel_mqueue *q=kernel_mqueue_fs_file_queue(file);
-    return q?kernel_mqueue_queue_set_mode(q,mode):kernel_mqueue_root_set_mode(mode);
+    return q?kernel_mqueue_queue_set_mode(q,mode):kernel_mqueue_root_set_mode(mount_tree(file->mount),mode);
 }
 static int set_owner(struct kernel_vfs_file *file,uint32_t uid,uint32_t gid)
 {
     struct kernel_mqueue *q=kernel_mqueue_fs_file_queue(file);
-    return q?kernel_mqueue_queue_set_owner(q,uid,gid):kernel_mqueue_root_set_owner(uid,gid);
+    return q?kernel_mqueue_queue_set_owner(q,uid,gid):kernel_mqueue_root_set_owner(mount_tree(file->mount),uid,gid);
 }
 static int set_times(struct kernel_vfs_file *file,const struct kernel_vfs_timespec times[2])
 {
     if(((struct kernel_vfs_instance *)file->mount->private_data)->read_only)return -KERNEL_EROFS;
     struct kernel_mqueue *q=kernel_mqueue_fs_file_queue(file);
-    return q?kernel_mqueue_queue_set_times(q,times):kernel_mqueue_root_set_times(times);
+    return q?kernel_mqueue_queue_set_times(q,times):kernel_mqueue_root_set_times(mount_tree(file->mount),times);
 }
 static int no_mkdir(struct kernel_vfs_mount *mount,uint64_t parent,const char *name,uint32_t mode,uint32_t umask)
 {(void)mount;(void)parent;(void)name;(void)mode;(void)umask;return -KERNEL_EPERM;}
@@ -119,7 +124,7 @@ static int dir_entry(struct kernel_vfs_file *file,uint64_t position,uint64_t *ne
         const char *s=position?"..":".";size_t n=strlen(s)+1;if(size<n)return -KERNEL_ERANGE;
         memcpy(name,s,n);*next=position+1;*id=1;*type=4;return 1;
     }
-    uint64_t cursor=position-1;int result=kernel_mqueue_next(&cursor,id,name,size);
+    uint64_t cursor=position-1;int result=kernel_mqueue_next(mount_tree(file->mount),&cursor,id,name,size);
     if(result>0){*next=cursor+1;*type=8;}return result;
 }
 static int pread_inode(struct kernel_vfs_node *node,uint64_t offset,void *buffer,size_t size,size_t *read)
@@ -132,7 +137,7 @@ static int unmount(struct kernel_vfs_mount *mount)
     struct mq_mount *m=((struct kernel_vfs_instance *)mount->private_data)->backend_data;struct kernel_vfs_instance *i=&m->instance;
     if(mount->covered_path||mount->root_path||mount->child_mounts||i->external_files||
        !kernel_vfs_nodes_idle(i,0)||i->paths)return -KERNEL_EBUSY;
-    kernel_heap_release(i->heap,m);return 0;
+    kernel_mqueue_tree_put(m->tree);kernel_heap_release(i->heap,m);return 0;
 }
 static void initialize_ops(void)
 {
@@ -148,13 +153,16 @@ static void initialize_ops(void)
     o->release_unlinked=release_unlinked;
     o->dir_entry=dir_entry;o->pread=pread_inode;o->unmount=unmount;
 }
-int kernel_mqueue_fs_create(struct kernel_heap *heap,uint64_t flags,struct kernel_vfs_mount **owner)
+int kernel_mqueue_fs_create(struct kernel_heap *heap,uint64_t flags,struct kernel_namespace *namespace,struct kernel_vfs_mount **owner)
 {
     if(!heap||!owner||*owner)return -KERNEL_EINVAL;
     int result=kernel_mqueue_init(heap);if(result)return result;
     struct mq_mount *m=0;
     enum kernel_heap_status s=kernel_heap_allocate_zeroed(heap,1,sizeof(*m),(void **)&m);
     if(s)return s==KERNEL_HEAP_STATUS_EMPTY?-KERNEL_ENOMEM:-KERNEL_EIO;
+    m->tree=kernel_mqueue_namespace_tree(namespace,1);
+    if(!m->tree){kernel_heap_release(heap,m);return -KERNEL_ENOMEM;}
+    kernel_mqueue_tree_get(m->tree);
     initialize_ops();m->flags=flags;m->instance.heap=heap;m->instance.ops=&mq_ops;
     m->instance.backend_data=m;m->instance.read_only=!!(flags&1U);
     kernel_rwlock_init(&m->instance.reconfiguration, 19, (uintptr_t)&m->instance);
@@ -162,6 +170,7 @@ int kernel_mqueue_fs_create(struct kernel_heap *heap,uint64_t flags,struct kerne
     kernel_raw_lock_init(&m->instance.error_lock,KERNEL_RAW_RANK_OBJECT);
     m->mount.private_data=&m->instance;m->mount.id=kernel_vfs_allocate_mount_id();
     m->mount.state=VFS_MOUNT_STATE_LIVE;m->mount.nosuid=!!(flags&2U);
-    kernel_vfs_mount_initialize(&m->mount);m->instance.device_id=0x19800202U;
+    kernel_vfs_mount_initialize(&m->mount);
+    struct kernel_vfs_stat stat;kernel_mqueue_root_stat(m->tree,&stat);m->instance.device_id=stat.dev;
     *owner=&m->mount;return 0;
 }

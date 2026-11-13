@@ -9,7 +9,7 @@ RV64和LA64接入原生Linux的semget(190)、semctl(191)、semtimedop(192)、sem
 
 semctl支持IPC_SET/STAT/RMID、GETVAL/SETVAL、GETALL/SETALL、GETPID、GETNCNT/GETZCNT、IPC_INFO、SEM_INFO和SEM_STAT/ANY。IPC权限使用effective身份、补充组、creator/owner和CAP_IPC_OWNER/CAP_SYS_ADMIN，与共享内存共用规则。固定ABI和检查顺序依据references/linux/ipc/sem.c及对应UAPI；64位nsops寄存器按Linux的unsigned int参数截断。
 
-默认上限为32000个集合、每集合32000项、总计1024000000项，每次最多500个操作。计数范围0～32767，撤销调整范围-32768～32767。集合、成员和撤销数组按需分配；32000槽的16位代次表使用静态64000字节。INFO返回真实限额和当前使用量。集合在IPC_RMID前持续存在，程序退出不会自动删除一个普通集合。
+默认上限为32000个集合、每集合32000项、总计1024000000项，每次最多500个操作。计数范围0～32767，撤销调整范围-32768～32767。集合、成员和撤销数组按需分配；每个IPC命名空间首次创建时分配包含32000槽、64000字节代次数组的表。INFO返回真实限额和当前使用量。集合在IPC_RMID前持续存在，程序退出不会自动删除一个普通集合。
 
 ## 对象、等待与撤销
 
@@ -23,7 +23,7 @@ SEM_UNDO在独立共享组中按集合保存反向调整。任务各持一份组
 
 SETVAL清除所有组对该项的调整，SETALL清除该集合全部调整；RMID摘除关联并归还记录。集合保护、组成员保护和实际引用共同覆盖RMID与最后共享者退出的交错。线程的TGID从实际进程组身份取得，清理者使用被退出任务的身份。
 
-`/proc/sysvipc/sem` 与 `semctl` 共用真实集合描述符，按 slot 输出当前集合及操作、修改时间；读取所有权和重读规则见 [procfs 模块](procfs.md)。消息队列由独立的 [SysV 消息模块](sysv-msg.md) 提供。当前未提供 IPC namespace、运行时 IPC sysctl 和 unshare 扩展。
+`/proc/sysvipc/sem` 与 `semctl` 共用真实集合描述符，按 slot 输出当前集合及操作、修改时间；读取所有权和重读规则见 [procfs 模块](procfs.md)。消息队列由独立的 [SysV 消息模块](sysv-msg.md) 提供。命名空间隔离、切换和最终回收见 [IPC 命名空间](ipc-namespace.md)；当前未提供运行时 IPC sysctl。
 
 ## 聚焦验证与应用
 

@@ -4,6 +4,12 @@
 #include <assert.h>
 #include <sched.h>
 #include <pthread.h>
+/* These fixtures supply tmpfs/disk objects. A real procfs implementation, when
+ * linked, overrides classification; selecting IPC without it is a fixture bug. */
+__attribute__((weak)) int kernel_procfs_ipc_file(const struct kernel_vfs_file *file)
+{ (void)file;return 0; }
+__attribute__((weak)) struct kernel_namespace *kernel_task_ipc_namespace(void)
+{ assert(!"IPC namespace is outside this fixture");return NULL; }
 #if !defined(FILE_IO_CASES) && !defined(FILES_PIPE_CASES) && !defined(CACHE_MM_CASES)
 /* Mapping/source-only fixtures do not create asynchronous OFD subscriptions. */
 void kernel_open_file_async_close(struct kernel_open_file_description *file)

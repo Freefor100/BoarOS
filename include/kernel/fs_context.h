@@ -13,6 +13,7 @@ struct kernel_fs_context_record;
 struct kernel_vfs_mount;
 struct kernel_vfs_path;
 struct kernel_mount_namespace;
+struct kernel_namespace;
 struct kernel_task;
 struct kernel_open_file_description;
 
@@ -36,6 +37,7 @@ enum kernel_fs_context_state {
 struct kernel_fs_context {
     struct kernel_heap *heap;
     struct kernel_fs_context_record *record;
+    struct kernel_mount_namespace *namespace;
     enum kernel_fs_context_state state;
 };
 
@@ -44,7 +46,7 @@ enum kernel_fs_context_status kernel_fs_context_create(
     struct kernel_vfs_mount *root_mount,
     struct kernel_heap *heap);
 
-/* Share the root and current-working-directory context. */
+/* Share root/cwd/umask; each wrapper retains its own mount namespace owner. */
 enum kernel_fs_context_status kernel_fs_context_acquire(
     struct kernel_fs_context *destination,
     const struct kernel_fs_context *source);
@@ -54,7 +56,9 @@ enum kernel_fs_context_status kernel_fs_context_fork(
     const struct kernel_fs_context *source);
 int kernel_fs_context_fork_mount_namespace(struct kernel_fs_context *,
     const struct kernel_fs_context *);
-int kernel_fs_context_unshare(struct kernel_fs_context *, int new_mount_namespace);
+/* Empty candidate on success means the existing FS context is exclusive. */
+int kernel_fs_context_prepare_unshare(struct kernel_fs_context *,
+    const struct kernel_fs_context *,int new_mount_namespace);
 
 /* A proc reader owns both the namespace tree and its process-relative root. */
 struct kernel_fs_mounts {
@@ -64,13 +68,24 @@ struct kernel_fs_mounts {
 struct kernel_fs_mounts kernel_fs_context_mounts_snapshot(const struct kernel_fs_context *);
 void kernel_fs_mounts_release(struct kernel_fs_mounts *);
 struct kernel_vfs_mount *kernel_fs_context_mount_root(const struct kernel_fs_context *);
-int kernel_fs_context_set_mount_namespace(struct kernel_fs_context *,struct kernel_mount_namespace *);
+/* Prepare all fallible path/allocation work before publishing a combined
+ * namespace change. Commit consumes the live candidate and cannot fail. */
+int kernel_fs_context_prepare_namespace(struct kernel_fs_context *,
+    const struct kernel_fs_context *,struct kernel_mount_namespace *,int allow_shared);
+void kernel_fs_context_commit(struct kernel_fs_context *,struct kernel_fs_context *);
+/* Publish only; the caller releases the returned old context after dropping
+ * the task resource protection used for a combined namespace exchange. */
+void kernel_fs_context_exchange(struct kernel_fs_context *,struct kernel_fs_context *,
+    struct kernel_fs_context *old);
+/* Combined pidfd setns retains the shared FS record and its umask. The
+ * returned candidate owns the replaced paths and this caller's old namespace. */
+void kernel_fs_context_exchange_paths_namespace(struct kernel_fs_context *,
+    struct kernel_fs_context *,struct kernel_fs_context *old);
 uint64_t kernel_fs_context_namespace_id(const struct kernel_fs_context *);
 uint64_t kernel_mount_namespace_id(const struct kernel_mount_namespace *);
 int kernel_mount_namespace_take_tree(struct kernel_vfs_path **,struct kernel_heap *,struct kernel_open_file_description **);
 int kernel_mount_namespace_open_tree(struct kernel_vfs_path *,struct kernel_heap *,int,struct kernel_open_file_description **);
-int kernel_mount_namespace_open(struct kernel_mount_namespace *,struct kernel_heap *,
-    uint32_t flags,struct kernel_open_file_description **);
+struct kernel_namespace *kernel_mount_namespace_base(struct kernel_mount_namespace *);
 struct kernel_mount_namespace *kernel_mount_namespace_file(const struct kernel_open_file_description *);
 
 enum kernel_fs_context_status kernel_fs_context_move(
@@ -81,7 +96,7 @@ enum kernel_fs_context_status kernel_fs_context_move(
  * record, not the wrapper; borrowing its mutable contents requires snapshot. */
 static inline int kernel_fs_context_is_live(const struct kernel_fs_context *fs)
 {
-    return fs && fs->state == KERNEL_FS_CONTEXT_LIVE && fs->heap && fs->record;
+    return fs && fs->state == KERNEL_FS_CONTEXT_LIVE && fs->heap && fs->record && fs->namespace;
 }
 
 /* An owned pair is coherent with CLONE_FS cwd replacement and context move. */

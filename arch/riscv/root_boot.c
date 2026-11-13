@@ -16,6 +16,7 @@
 #include <kernel/procfs.h>
 #include <kernel/loop.h>
 #include <kernel/shm.h>
+#include <kernel/ipc_namespace.h>
 #include <kernel/sem.h>
 #include <kernel/msg.h>
 #include <kernel/mqueue.h>
@@ -649,6 +650,8 @@ enum riscv_root_boot_status riscv_root_boot_finish(
         return RISCV_ROOT_BOOT_STATUS_CLEANUP;
     }
     error=kernel_mqueue_shutdown();
+    if(error) {root->finish_failure=RISCV_ROOT_FINISH_UNMOUNT;root->finish_error=error;return RISCV_ROOT_BOOT_STATUS_CLEANUP;}
+    error=kernel_ipc_initial_shutdown();
     if(error) {root->finish_failure=RISCV_ROOT_FINISH_UNMOUNT;root->finish_error=error;return RISCV_ROOT_BOOT_STATUS_CLEANUP;}
     error = (int)kernel_page_cache_destroy(&root->page_cache);
     if (error != KERNEL_PAGE_CACHE_STATUS_OK) {

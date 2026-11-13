@@ -851,6 +851,7 @@ enum kernel_scheduler_status release_task_storage(
         kernel_wait_record_phase(&thread->wait) != KERNEL_WAIT_FINISHED) __builtin_trap();
     if (thread->io_context.user_pins || thread->sem_request || thread->sem_undo ||
         thread->msg_request || thread->mqueue_request) __builtin_trap();
+    kernel_task_namespaces_release(thread);
     enum kernel_scheduler_status status = release_task_stack(thread);
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     scheduler_forget_task(thread);
@@ -1310,6 +1311,7 @@ enum kernel_scheduler_status kernel_user_thread_create(
     }
     thread->arch.user_sp = 0U;
     thread->arch.user_mode = 1U;
+    kernel_task_namespaces_initial(thread);
     kernel_signal_stack_reset(thread);
 #if BOAROS_USER_SMP
     thread->user_service = 1;

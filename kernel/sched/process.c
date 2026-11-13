@@ -1,3 +1,9 @@
+#include "../../fs/files/private.h"
+#include "../../fs/open_file_internal.h"
+#include <kernel/namespace.h>
+#include <kernel/ipc_namespace.h>
+#include <kernel/uts.h>
+#include <kernel/proc_task.h>
 #include <kernel/posix_timer.h>
 #include <kernel/credentials.h>
 #include <arch/task.h>
@@ -61,6 +67,8 @@
 #define LINUX_CLONE_VM UINT64_C(0x100)
 #define LINUX_CLONE_FS UINT64_C(0x200)
 #define LINUX_CLONE_NEWNS UINT64_C(0x20000)
+#define LINUX_CLONE_NEWUTS UINT64_C(0x04000000)
+#define LINUX_CLONE_NEWIPC UINT64_C(0x08000000)
 #define LINUX_CLONE_FILES UINT64_C(0x400)
 #define LINUX_CLONE_SIGHAND UINT64_C(0x800)
 #define LINUX_CLONE_CLEAR_SIGHAND UINT64_C(0x100000000)
@@ -669,6 +677,48 @@ enum kernel_scheduler_status process_group_exec_current(void)
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
+void kernel_task_namespaces_initial(struct kernel_task *task)
+{
+    if(task->uts_namespace || task->ipc_namespace)__builtin_trap();
+    task->uts_namespace=kernel_namespace_get(kernel_uts_initial());
+    task->ipc_namespace=kernel_namespace_get(kernel_ipc_initial());
+}
+void kernel_task_namespaces_release(struct kernel_task *task)
+{
+    if(!task->uts_namespace && !task->ipc_namespace)return;
+    struct kernel_namespace *uts,*ipc;
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      uts=task->uts_namespace;ipc=task->ipc_namespace;
+      task->uts_namespace=task->ipc_namespace=0; }
+    kernel_namespace_put(uts);kernel_namespace_put(ipc);
+}
+struct kernel_namespace *kernel_task_uts_namespace(void)
+{
+    struct kernel_task *task=kernel_task_current();
+    if(task && task->arch.user_mode && !task->uts_namespace)__builtin_trap();
+    return task && task->uts_namespace?task->uts_namespace:kernel_uts_initial();
+}
+struct kernel_namespace *kernel_task_ipc_namespace(void)
+{
+    struct kernel_task *task=kernel_task_current();
+    if(task && task->arch.user_mode && !task->ipc_namespace)__builtin_trap();
+    return task && task->ipc_namespace?task->ipc_namespace:kernel_ipc_initial();
+}
+static int clone_namespaces(struct kernel_task *child,struct kernel_task *parent,uint64_t flags)
+{
+    if(!parent->uts_namespace || !parent->ipc_namespace)__builtin_trap();
+    int result=0;
+    if(flags&LINUX_CLONE_NEWUTS)
+        result=kernel_uts_clone(parent->uts_namespace,parent->files.heap,&child->uts_namespace);
+    else child->uts_namespace=kernel_namespace_get(parent->uts_namespace);
+    if(!result) {
+        if(flags&LINUX_CLONE_NEWIPC)
+            result=kernel_ipc_namespace_create(parent->files.heap,&child->ipc_namespace);
+        else child->ipc_namespace=kernel_namespace_get(parent->ipc_namespace);
+    }
+    return result;
+}
+
 static int release_clone_resources(struct kernel_task *thread)
 {
     int cleanup_failed = 0;
@@ -701,6 +751,7 @@ static int release_clone_resources(struct kernel_task *thread)
             cleanup_failed = 1;
         }
     }
+    if(!cleanup_failed)kernel_task_namespaces_release(thread);
     return cleanup_failed;
 }
 
@@ -807,7 +858,7 @@ enum kernel_scheduler_status arch_process_clone_current(
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         return status;
     }
-    if ((flags & LINUX_CLONE_NEWNS) &&
+    if ((flags & (LINUX_CLONE_NEWNS|LINUX_CLONE_NEWUTS|LINUX_CLONE_NEWIPC)) &&
         !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN)) {
         *linux_result=-KERNEL_EPERM;
         return KERNEL_SCHEDULER_STATUS_OK;
@@ -833,6 +884,9 @@ enum kernel_scheduler_status arch_process_clone_current(
         kernel_resource_limits_create(parent->limits->heap,parent->limits);
     if(!child->limits)
         return finish_clone_failure(child,-KERNEL_ENOMEM,linux_result,KERNEL_SCHEDULER_STATUS_OK);
+    int namespace_result=clone_namespaces(child,parent,flags);
+    if(namespace_result)
+        return finish_clone_failure(child,namespace_result,linux_result,KERNEL_SCHEDULER_STATUS_OK);
     int sem_result=kernel_sem_clone(parent,child,(flags & UINT64_C(0x40000))!=0);
     if (sem_result)
         return finish_clone_failure(child,sem_result,linux_result,KERNEL_SCHEDULER_STATUS_OK);
@@ -2080,6 +2134,7 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
     }
     mm_status=cleanup_user_mm(thread);
     if (mm_status != KERNEL_SCHEDULER_STATUS_OK) return mm_status;
+    kernel_task_namespaces_release(thread);
     /* MM/FD/cwd已归还，脱树挂载的最后owner可在此安全停止后端。 */
     (void)kernel_vfs_reap_mounts();
     if (thread->mm.state == KERNEL_MM_RELEASED) {
@@ -2798,10 +2853,73 @@ enum kernel_task_status kernel_task_fs_context_borrow(
     return KERNEL_TASK_STATUS_OK;
 }
 
-int kernel_task_unshare_fs(struct kernel_task *task,int new_mount_namespace)
+/* All fallible preparation precedes undo consumption and publication. The
+ * access qualification gives pidfd readers one combined FS/UTS/IPC view. */
+static void install_namespaces(struct kernel_task *task,struct kernel_fs_context *fs,
+    struct kernel_namespace **uts,struct kernel_namespace **ipc,int detach_sem,int shared_paths)
 {
-    if (validate_task_resource_borrow(task)!=KERNEL_TASK_STATUS_OK) return -KERNEL_EINVAL;
-    return kernel_fs_context_unshare(&task->fs,new_mount_namespace);
+    struct kernel_fs_context previous={0};
+    struct kernel_namespace *old_uts=0,*old_ipc=0;
+    if(detach_sem)kernel_sem_exit(task);
+    {
+        KERNEL_RAW_SCOPE(access,&task->files_access);
+        if(fs->state==KERNEL_FS_CONTEXT_LIVE) {
+            if(shared_paths)kernel_fs_context_exchange_paths_namespace(&task->fs,fs,&previous);
+            else kernel_fs_context_exchange(&task->fs,fs,&previous);
+        }
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        if(*uts){old_uts=task->uts_namespace;task->uts_namespace=*uts;*uts=0;}
+        if(*ipc){old_ipc=task->ipc_namespace;task->ipc_namespace=*ipc;*ipc=0;}
+    }
+    if(previous.state==KERNEL_FS_CONTEXT_LIVE && kernel_fs_context_release(&previous))__builtin_trap();
+    kernel_namespace_put(old_uts);kernel_namespace_put(old_ipc);
+}
+int kernel_task_unshare_namespaces(struct kernel_task *task,uint64_t flags)
+{
+    const uint64_t supported=LINUX_CLONE_FS|KERNEL_NS_MNT|KERNEL_NS_UTS|KERNEL_NS_IPC|UINT64_C(0x40000);
+    if(flags&~supported)return -KERNEL_EINVAL;
+    if(!flags)return 0;
+    if((flags&(KERNEL_NS_MNT|KERNEL_NS_UTS|KERNEL_NS_IPC)) &&
+        !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN))return -KERNEL_EPERM;
+    struct kernel_fs_context fs={0};struct kernel_namespace *uts=0,*ipc=0;int error=0;
+    if(flags&(LINUX_CLONE_FS|KERNEL_NS_MNT))
+        error=kernel_fs_context_prepare_unshare(&fs,&task->fs,!!(flags&KERNEL_NS_MNT));
+    if(!error && (flags&KERNEL_NS_UTS))error=kernel_uts_clone(task->uts_namespace,task->files.heap,&uts);
+    if(!error && (flags&KERNEL_NS_IPC))error=kernel_ipc_namespace_create(task->files.heap,&ipc);
+    if(!error)install_namespaces(task,&fs,&uts,&ipc,!!(flags&(KERNEL_NS_IPC|UINT64_C(0x40000))),0);
+    if(fs.state==KERNEL_FS_CONTEXT_LIVE && kernel_fs_context_release(&fs))__builtin_trap();
+    kernel_namespace_put(uts);kernel_namespace_put(ipc);return error;
+}
+int kernel_task_setns(struct kernel_task *task,int32_t fd,uint32_t type)
+{
+    KERNEL_FILES_PIN_SCOPE(pin);
+    struct kernel_open_file_description *file=kernel_files_hold_fd(&task->files,fd,&pin);
+    if(!file)return -KERNEL_EBADF;
+    const uint32_t all=KERNEL_NS_MNT|KERNEL_NS_UTS|KERNEL_NS_IPC;
+    struct kernel_namespace *next[3]={0},*direct=kernel_namespace_file(file);
+    uint32_t mask=type;int error=0;
+    if(direct) {
+        if((type && type!=direct->type) || (kernel_open_file_flags(file)&010000000U))return -KERNEL_EINVAL;
+        mask=direct->type;
+        next[mask==KERNEL_NS_MNT?0:mask==KERNEL_NS_UTS?1:2]=kernel_namespace_get(direct);
+    } else if(file->kind!=KERNEL_OPEN_FILE_KIND_PIDFD || !mask || (mask&~all))return -KERNEL_EINVAL;
+    const struct kernel_credentials *cred=kernel_credentials_current();
+    if(!kernel_credentials_capable(cred,KERNEL_CAP_SYS_ADMIN) ||
+        ((mask&KERNEL_NS_MNT) && !kernel_credentials_capable(cred,KERNEL_CAP_SYS_CHROOT)))error=-KERNEL_EPERM;
+    if(!error && !direct) {
+        struct kernel_pid *id __attribute__((cleanup(kernel_task_identity_end)))=kernel_pidfd_identity_ref(file);
+        error=id?kernel_proc_namespaces_handle(id->number,id->generation|KERNEL_PROC_THREAD_TARGET,mask,0,next):-KERNEL_ESRCH;
+        if(error==-KERNEL_ENOENT)error=-KERNEL_ESRCH;
+        else if(error==-KERNEL_EACCES)error=-KERNEL_EPERM;
+    }
+    struct kernel_fs_context fs={0};
+    int shared_paths=(mask&KERNEL_NS_MNT) && (mask&~KERNEL_NS_MNT);
+    if(!error && next[0])error=kernel_fs_context_prepare_namespace(&fs,&task->fs,
+        (struct kernel_mount_namespace *)next[0],shared_paths);
+    if(!error)install_namespaces(task,&fs,&next[1],&next[2],!!(mask&KERNEL_NS_IPC),shared_paths);
+    if(fs.state==KERNEL_FS_CONTEXT_LIVE && kernel_fs_context_release(&fs))__builtin_trap();
+    for(unsigned i=0;i<3;i++)kernel_namespace_put(next[i]);
+    return error;
 }
 
 int kernel_task_prepare_user_return(void)

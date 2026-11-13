@@ -16,6 +16,7 @@
 #include <kernel/task.h>
 #include <kernel/tty_task.h>
 #include <kernel/vfs.h>
+#include <kernel/namespace.h>
 #include <string.h>
 
 int kernel_credentials_may_access_locked(const struct kernel_task *caller,const struct kernel_task *target,int fscreds)
@@ -39,25 +40,28 @@ struct proc_access {
     const struct kernel_credentials *credentials;
     struct kernel_mm_record *mm;
     struct kernel_exec_security *security;
+    int fscreds;
 };
 static void proc_access_release(struct proc_access *access)
 { if(access->credentials)kernel_credentials_put(access->credentials); kernel_exec_security_put(access->security); }
-static int proc_access_begin(struct kernel_task *task,struct proc_access *access)
+static int proc_access_begin_mode(struct kernel_task *task,struct proc_access *access,int fscreds)
 {
     KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
     if(!task)return -KERNEL_ENOENT;
-    if(!kernel_credentials_may_access_locked(kernel_task_current(),task,1))return -KERNEL_EACCES;
+    if(!kernel_credentials_may_access_locked(kernel_task_current(),task,fscreds))return -KERNEL_EACCES;
     *access=(struct proc_access){task,kernel_credentials_get(kernel_credentials_task_locked(task)),task->mm.record,
-        kernel_exec_security_get(task->exec_security)};
+        kernel_exec_security_get(task->exec_security),fscreds};
     return 0;
 }
+static int proc_access_begin(struct kernel_task *task,struct proc_access *access)
+{return proc_access_begin_mode(task,access,1);}
 static int proc_access_check(struct proc_access *access)
 {
     KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
     struct kernel_task *task=access->task;
     return task && task->mm.record==access->mm && task->exec_security==access->security &&
         kernel_credentials_task_locked(task)==access->credentials &&
-        kernel_credentials_may_access_locked(kernel_task_current(),task,1)?0:-KERNEL_EACCES;
+        kernel_credentials_may_access_locked(kernel_task_current(),task,access->fscreds)?0:-KERNEL_EACCES;
 }
 #define PROC_ACCESS(task) \
     struct proc_access access __attribute__((cleanup(proc_access_release)))={0}; \
@@ -354,7 +358,7 @@ int kernel_proc_maps_snapshot(kernel_pid_t pid, uint64_t identity,
         if (kernel_mm_acquire(&mm, &task->mm)) return -KERNEL_EIO;
         access = (struct proc_access){ task,
             kernel_credentials_get(kernel_credentials_task_locked(task)), mm.record,
-            kernel_exec_security_get(task->exec_security) };
+            kernel_exec_security_get(task->exec_security),1 };
     }
     enum kernel_mm_status status = kernel_mm_proc_maps_snapshot(&mm, heap, rows, count);
     int error = status == KERNEL_MM_STATUS_NO_MEMORY ? -KERNEL_ENOMEM :
@@ -441,45 +445,52 @@ int kernel_proc_mounts_snapshot(kernel_pid_t pid,uint64_t identity,struct kernel
     return owner->namespace?0:-KERNEL_ENOENT;
 }
 
-int kernel_proc_mount_handle(kernel_pid_t pid,uint64_t identity,struct kernel_fs_mounts *owner)
+int kernel_proc_namespaces_handle(kernel_pid_t pid,uint64_t identity,uint32_t mask,int fscreds,
+    struct kernel_namespace *owners[3])
 {
+    if(pid<=0 || !identity || !owners || owners[0] || owners[1] || owners[2] ||
+       !mask || (mask&~(KERNEL_NS_MNT|KERNEL_NS_UTS|KERNEL_NS_IPC)))return -KERNEL_EINVAL;
     SCHEDULER_TASK_BORROW(task,find_resource_owner(pid,identity));
-    PROC_ACCESS(task);
-    if (!task) return -KERNEL_ENOENT;
-    *owner=kernel_fs_context_mounts_snapshot(&task->fs);
-    if (!owner->namespace) return -KERNEL_ENOENT;
-    int error=proc_access_check(&access);
-    if (error) kernel_fs_mounts_release(owner);
+    struct proc_access access __attribute__((cleanup(proc_access_release)))={0};
+    int error=proc_access_begin_mode(task,&access,fscreds);
+    if(error)return error;
+    struct kernel_namespace *snapshot[3]={0};
+    struct kernel_fs_mounts mounts __attribute__((cleanup(kernel_fs_mounts_release)))={0};
+    {
+        KERNEL_RAW_SCOPE(resources,&task->files_access);
+        if(mask&KERNEL_NS_MNT)mounts=kernel_fs_context_mounts_snapshot(&task->fs);
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        if(!proc_resource_matches_locked(task,pid,identity))error=-KERNEL_ENOENT;
+        else {
+            if(mask&KERNEL_NS_MNT)snapshot[0]=kernel_namespace_get(kernel_mount_namespace_base(mounts.namespace));
+            if(mask&KERNEL_NS_UTS)snapshot[1]=kernel_namespace_get(task->uts_namespace);
+            if(mask&KERNEL_NS_IPC)snapshot[2]=kernel_namespace_get(task->ipc_namespace);
+            if(((mask&KERNEL_NS_MNT)&&!snapshot[0]) || ((mask&KERNEL_NS_UTS)&&!snapshot[1]) ||
+               ((mask&KERNEL_NS_IPC)&&!snapshot[2]))error=-KERNEL_ENOENT;
+        }
+    }
+    if(!error) {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        if(!proc_resource_matches_locked(task,pid,identity))error=-KERNEL_ENOENT;
+        else if(task->mm.record!=access.mm || task->exec_security!=access.security ||
+            kernel_credentials_task_locked(task)!=access.credentials ||
+            !kernel_credentials_may_access_locked(kernel_task_current(),task,fscreds))error=-KERNEL_EACCES;
+    }
+    for(unsigned i=0;i<3;i++) {
+        if(error)kernel_namespace_put(snapshot[i]);
+        else owners[i]=snapshot[i];
+    }
     return error;
 }
 
-int kernel_task_setns_mount(struct kernel_task *caller,int32_t fd,uint32_t type)
+int kernel_proc_namespace_handle(kernel_pid_t pid,uint64_t identity,uint32_t type,
+    struct kernel_namespace **owner)
 {
-    const uint32_t clone_newns=0x20000U;
-    KERNEL_FILES_PIN_SCOPE(pin);
-    struct kernel_open_file_description *file=kernel_files_hold_fd(&caller->files,fd,&pin);
-    if (!file) return -KERNEL_EBADF;
-    if (type && type!=clone_newns) return -KERNEL_EINVAL;
-    struct kernel_mount_namespace *ns=kernel_mount_namespace_file(file);
-    if (ns && (kernel_open_file_flags(file)&010000000U)) return -KERNEL_EINVAL;
-    if (!ns && (type!=clone_newns || file->kind!=KERNEL_OPEN_FILE_KIND_PIDFD))
-        return -KERNEL_EINVAL;
-    const struct kernel_credentials *cred=kernel_credentials_current();
-    if (!kernel_credentials_capable(cred,KERNEL_CAP_SYS_ADMIN) ||
-        !kernel_credentials_capable(cred,KERNEL_CAP_SYS_CHROOT)) return -KERNEL_EPERM;
-    if (ns) return kernel_fs_context_set_mount_namespace(&caller->fs,ns);
-
-    struct kernel_pid *id __attribute__((cleanup(kernel_task_identity_end)))=kernel_pidfd_identity_ref(file);
-    SCHEDULER_TASK_BORROW(target,find_resource_owner(id->number,id->generation|KERNEL_PROC_THREAD_TARGET));
-    if (!target) return -KERNEL_ESRCH;
-    {
-        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-        if (!kernel_credentials_may_access_locked(caller,target,0)) return -KERNEL_EPERM;
-    }
-    struct kernel_fs_mounts mounts __attribute__((cleanup(kernel_fs_mounts_release)))=
-        kernel_fs_context_mounts_snapshot(&target->fs);
-    if (!mounts.namespace) return -KERNEL_ESRCH;
-    return kernel_fs_context_set_mount_namespace(&caller->fs,mounts.namespace);
+    if(!owner || *owner || (type!=KERNEL_NS_MNT && type!=KERNEL_NS_UTS && type!=KERNEL_NS_IPC))return -KERNEL_EINVAL;
+    struct kernel_namespace *snapshot[3]={0};
+    int error=kernel_proc_namespaces_handle(pid,identity,type,1,snapshot);
+    if(!error)*owner=snapshot[type==KERNEL_NS_MNT ? 0 : type==KERNEL_NS_UTS ? 1 : 2];
+    return error;
 }
 
 int kernel_proc_next_fd(kernel_pid_t pid, uint64_t identity,
@@ -569,6 +580,14 @@ int kernel_proc_fd_pseudo_snapshot(kernel_pid_t pid, uint64_t identity,
             size_t n=strlen(name)+1;if(n>sizeof(snapshot->name))__builtin_trap();
             memcpy(snapshot->name,name,n);
         }
+        if(snapshot->kind==KERNEL_OPEN_FILE_KIND_NAMESPACE) {
+            struct kernel_namespace *ns=kernel_namespace_file(file);
+            if(!ns)__builtin_trap();
+            const char *prefix=ns->type==KERNEL_NS_MNT ? "mnt:[" :
+                ns->type==KERNEL_NS_UTS ? "uts:[" : ns->type==KERNEL_NS_IPC ? "ipc:[" : NULL;
+            if(!prefix)__builtin_trap();
+            memcpy(snapshot->name,prefix,6);
+        }
     }
     return result;
 }
@@ -654,6 +673,8 @@ int kernel_proc_fd_reopen_link(kernel_pid_t pid, uint64_t identity,
     int result = file ? -KERNEL_ENXIO : -KERNEL_ENOENT;
     /* 解锁后 fd 可关闭；先钉住 pipe endpoint 再分配新 OFD。 */
     if (file && kernel_open_file_path(file)) result = -KERNEL_ENOTSUP;
+    else if(file && kernel_open_file_kind(file)==KERNEL_OPEN_FILE_KIND_NAMESPACE)
+        return kernel_namespace_open(kernel_namespace_file(file),heap,flags,owner);
     else if(file && kernel_open_file_kind(file)==KERNEL_OPEN_FILE_KIND_MQUEUE)
         return kernel_mqueue_reopen(file,heap,flags,owner);
     else if (file &&

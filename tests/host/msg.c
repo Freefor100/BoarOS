@@ -1,6 +1,8 @@
 /* Focused ownership/interleaving fixture: real msg.c, raw_lock.c and park.c;
  * heap, usercopy, PID registry and context-switch machine boundaries are modeled. */
 #include "../../kernel/msg.c"
+#define IPC_FIXTURE_MSG
+#include "ipc_namespace_fixture.h"
 #include <assert.h>
 #include <pthread.h>
 #include <sched.h>
@@ -114,6 +116,8 @@ uint64_t kernel_time_realtime_ns(void)
 {
     return time_ns;
 }
+enum kernel_time_status kernel_time_deadline_from_realtime(uint64_t n,uint64_t *d)
+{*d=n;return n<=time_ns?KERNEL_TIME_STATUS_DEADLINE_PASSED:0;}
 uint64_t kernel_time_monotonic_ns(void)
 {
     return time_ns;
@@ -334,7 +338,7 @@ static void limit(int q, uint64_t n)
 }
 static void clean(void)
 {
-    assert(!msg_table.queues && !msg_table.messages && !msg_table.bytes && !allocations);
+    assert(!msg_namespace_table(kernel_ipc_initial(),0)->queues && !msg_namespace_table(kernel_ipc_initial(),0)->messages && !msg_namespace_table(kernel_ipc_initial(),0)->bytes && allocations==1);
     for (unsigned i = 0; i < 4; i++)
         assert(!task[i].msg_request && !task[i].wait.borrows && pid[i].references == 1);
 }
@@ -668,7 +672,7 @@ static void copy_remove_race(void)
         pthread_t t = start(&w);
         assert(statq(q).msg_qnum == copy);
         rm(q);
-        assert(!msg_table.queues && allocations);
+        assert(!msg_namespace_table(kernel_ipc_initial(),0)->queues && allocations);
         end(t, &w, 11);
         assert(w.packet.type == 6 && !memcmp(w.packet.data, "still-owned", 11));
         clean();
@@ -746,7 +750,7 @@ static void namespace_and_pid(void)
     use_permission = 0;
     rm(q);
     assert(kernel_msg_get(cpu.current, 123456, 0) == -KERNEL_ENOENT);
-    msg_table.next_slot = (uint32_t)q & 32767U;
+    msg_namespace_table(kernel_ipc_initial(),0)->next_slot = (uint32_t)q & 32767U;
     int next = make();
     assert(next != q && ((uint32_t)next & 32767U) == ((uint32_t)q & 32767U));
     assert(ctl(q, KERNEL_IPC_STAT, &d) == -KERNEL_EINVAL);
@@ -857,21 +861,52 @@ static void proc_rows(void)
     rm(second);
     unsigned before = allocations;
     uint32_t cursor = 0; int32_t id; struct kernel_msqid64_ds row;
-    assert(kernel_msg_proc_next(&cursor, &id, &row) && id == first);
+    assert(kernel_msg_proc_next(kernel_ipc_initial(),&cursor, &id, &row) && id == first);
     assert(row.msg_perm.uid == cred.euid && row.msg_perm.gid == cred.egid &&
         row.msg_perm.mode == 0600 && row.msg_cbytes == 4 && row.msg_qnum == 1 &&
         row.msg_lspid == pid[0].number && row.msg_stime == 1);
-    assert(before == allocations && !kernel_msg_proc_next(&cursor, &id, &row));
+    assert(before == allocations && !kernel_msg_proc_next(kernel_ipc_initial(),&cursor, &id, &row));
     rm(first);
     assert(row.msg_cbytes == 4 && row.msg_qnum == 1); /* A row owns no live queue data. */
-    cursor = 0; assert(!kernel_msg_proc_next(&cursor, &id, &row));
+    cursor = 0; assert(!kernel_msg_proc_next(kernel_ipc_initial(),&cursor, &id, &row));
     clean();
     puts("PASS proc queue rows use real metadata, skip removed slots and retain no owners");
+}
+static void namespace_isolation(void)
+{
+    unsigned before=allocations;
+    struct kernel_namespace *left=0,*right=0;
+    assert(!kernel_ipc_namespace_create(&heap,&left));
+    assert(!kernel_ipc_namespace_create(&heap,&right));
+    host_ipc_namespace=left;
+    unsigned empty=allocations;uint32_t cursor=0;int32_t id;struct kernel_msqid64_ds row;
+    assert(kernel_msg_get(cpu.current,123,0)==-KERNEL_ENOENT);
+    assert(!kernel_msg_proc_next(left,&cursor,&id,&row)&&allocations==empty);
+    struct kernel_msginfo info;assert(!ctl(0,KERNEL_MSG_INFO,&info));
+    assert(!info.msgpool&&!info.msgmap&&!info.msgtql&&allocations==empty);
+    allocation_calls=0;fail_at=0;
+    assert(kernel_msg_get(cpu.current,123,KERNEL_IPC_CREAT|0600)==-KERNEL_ENOMEM);
+    fail_at=-1;assert(!kernel_ipc_namespace_state(left)->msg&&allocations==empty);
+    int first=(int)kernel_msg_get(cpu.current,123,KERNEL_IPC_CREAT|0600);
+    struct packet packet={.type=1,.data="left"};assert(first>=0&&!send(first,&packet,5,0));
+    struct msg_queue *held=queue_lookup(first,0);assert(held);
+    host_ipc_namespace=right;
+    assert(kernel_msg_get(cpu.current,123,0)==-KERNEL_ENOENT);
+    assert(ctl(first,KERNEL_IPC_STAT,&row)==-KERNEL_EINVAL);
+    int second=(int)kernel_msg_get(cpu.current,123,KERNEL_IPC_CREAT|0600);
+    assert(second==first&&statq(second).msg_qnum==0);
+    cursor=0;assert(kernel_msg_proc_next(left,&cursor,&id,&row)&&row.msg_qnum==1);
+    kernel_namespace_put(left);
+    assert(held->removed&&!held->table->queues&&!held->table->messages&&!held->table->bytes);
+    queue_put(held);kernel_namespace_put(right);host_ipc_namespace=0;
+    assert(allocations==before);
+    puts("PASS namespace isolation, lazy empty lookup and old queue/table lifetime");
 }
 int main(void)
 {
     kernel_wait_domain_init();
     assert(!kernel_msg_init(&heap));
+    assert(msg_namespace_table(kernel_ipc_initial(),1));
     for (unsigned i = 0; i < 4; i++) {
         pid[i].number = (int)i + 10;
         pid[i].references = 1;
@@ -893,7 +928,10 @@ int main(void)
     completion_ownership();
     quota();
     proc_rows();
+    namespace_isolation();
     clean();
+    assert(!kernel_ipc_initial_shutdown());
+    assert(!allocations);
     puts("MSG CORE HOST PASS");
     return 0;
 }

@@ -7,6 +7,7 @@
 #include <kernel/mqueue.h>
 #include <kernel/tmpfs.h>
 #include <kernel/task.h>
+#include <kernel/namespace.h>
 #include "../vfs_internal.h"
 #include "../char_device_internal.h"
 #include "../block_file_internal.h"
@@ -50,9 +51,9 @@ enum kernel_files_status kernel_files_ioctl(
             value=(int32_t)kernel_open_file_async_fcntl(description,KERNEL_FILES_F_GETOWN,0,mm);
             *linux_result=kernel_copy_to_user(mm,argument,&value,sizeof(value),&copied) || copied!=sizeof(value)?-KERNEL_EFAULT:0;
         }
-    } else if (description->kind==KERNEL_OPEN_FILE_KIND_MOUNT_NAMESPACE)
+    } else if (description->kind==KERNEL_OPEN_FILE_KIND_NAMESPACE)
         *linux_result=(kernel_open_file_flags(description)&010000000U)?-KERNEL_EBADF:
-            command==0xb703U?0x20000:-KERNEL_ENOTTY; /* NS_GET_NSTYPE */
+            command==0xb703U?(int64_t)kernel_namespace_file(description)->type:-KERNEL_ENOTTY; /* NS_GET_NSTYPE */
     else *linux_result = description->block ? kernel_block_file_ioctl(files, &description, mm, command, argument) :
         description->device && description->device->ioctl
         ? description->device->ioctl(description->device_instance, kernel_task_current(), files, &description, mm, command, argument) : -KERNEL_ENOTTY;
