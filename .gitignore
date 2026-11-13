@@ -7,6 +7,7 @@
 
 # Kernel and userspace build outputs.
 /build/
+/download/
 /out/
 /dist/
 /target/
