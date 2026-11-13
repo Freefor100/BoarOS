@@ -23,6 +23,7 @@
 
 #include "../exec_internal.h"
 #include "private.h"
+#include <kernel/ptrace.h>
 #include <kernel/credentials.h>
 
 /* 链接器将CPU控制、调度锁和调度器前缀集中在一页，减少普通入口触达的静态页。 */
@@ -482,7 +483,8 @@ void kernel_scheduler_switch_finish(void)
     }
 #endif
     struct kernel_wait_cursor joined;
-    int notify = 0;
+    struct kernel_ptrace_notice traced;
+    int notify = 0,trace_notify=0;
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         KERNEL_RUN_SET(runs);
@@ -490,10 +492,12 @@ void kernel_scheduler_switch_finish(void)
         cpu->switch_previous = 0;
         if (previous == cpu->current || !cpu->current->wait.on_cpu) __builtin_trap();
         kernel_wait_switch_finish_locked(previous);
+        trace_notify=kernel_ptrace_switch_finish_locked(previous,&traced);
         if (previous->state == KERNEL_THREAD_STATE_EXITED && previous->join)
             notify = kernel_wait_cursor_prepare(&previous->join->waiters, &joined);
     }
     if (notify) kernel_wait_cursor_wake(&joined, 1);
+    if (trace_notify) kernel_ptrace_switch_notify(&traced);
 }
 
 enum kernel_scheduler_status scheduler_switch_current_away(struct kernel_task *previous)
@@ -850,7 +854,7 @@ enum kernel_scheduler_status release_task_storage(
     if (thread->wait.on_cpu || kernel_wait_record_borrows(&thread->wait) || thread->wait.nodes ||
         kernel_wait_record_phase(&thread->wait) != KERNEL_WAIT_FINISHED) __builtin_trap();
     if (thread->io_context.user_pins || thread->sem_request || thread->sem_undo ||
-        thread->msg_request || thread->mqueue_request) __builtin_trap();
+        thread->msg_request || thread->mqueue_request || thread->remote_memory_request) __builtin_trap();
     kernel_task_namespaces_release(thread);
     enum kernel_scheduler_status status = release_task_stack(thread);
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;

@@ -1543,7 +1543,7 @@ enum riscv_sv39_status riscv_sv39_user_cow_snapshot(struct riscv_sv39_user_space
     uint64_t *leaf;
     enum riscv_sv39_status status = resolve_existing_user_leaf(s, address, &leaf, 0);
     if (status != RISCV_SV39_STATUS_OK) return status;
-    if (!present_cow_entry(*leaf)) return valid_user_leaf_entry(*leaf) ?
+    if (!present_cow_entry(*leaf) && !protected_cow_entry(*leaf)) return (valid_user_leaf_entry(*leaf) || valid_protected_entry(*leaf)) ?
         RISCV_SV39_STATUS_NOT_MAPPED : RISCV_SV39_STATUS_STATE;
     *cookie = *leaf; *physical = entry_address(*leaf);
     return RISCV_SV39_STATUS_OK;
@@ -1553,7 +1553,7 @@ enum riscv_sv39_status riscv_sv39_user_cow_commit(struct riscv_sv39_user_space *
     struct kernel_mm_retirement *batch)
 {
     if (!batch || batch->count >= KERNEL_MM_RETIRE_CAPACITY ||
-        !valid_user_permissions(permissions) || !(permissions & RISCV_SV39_WRITE) ||
+        (permissions && !valid_user_permissions(permissions)) ||
         (replacement != KERNEL_MM_NO_PAGE && (replacement & BOAROS_PAGE_MASK))) return RISCV_SV39_STATUS_INVALID;
     uint64_t actual, physical;
     enum riscv_sv39_status status = riscv_sv39_user_cow_snapshot(s, address, &actual, &physical);
@@ -1570,7 +1570,10 @@ enum riscv_sv39_status riscv_sv39_user_cow_commit(struct riscv_sv39_user_space *
     uint64_t *leaf;
     status = resolve_existing_user_leaf(s, address, &leaf, 0);
     if (status != RISCV_SV39_STATUS_OK) return status;
-    __atomic_store_n(leaf, user_leaf_entry(replacement == KERNEL_MM_NO_PAGE ? physical : replacement, permissions), __ATOMIC_RELEASE);
+    if (valid_protected_entry(actual) && permissions) { s->protected_pages--; s->leaf_pages++; }
+    if (!valid_protected_entry(actual) && !permissions) { s->leaf_pages--; s->protected_pages++; }
+    uint64_t target=replacement == KERNEL_MM_NO_PAGE ? physical : replacement;
+    __atomic_store_n(leaf, permissions ? user_leaf_entry(target,permissions) : protected_entry(target,0), __ATOMIC_RELEASE);
     s->cow_pages--;
     if (replacement != KERNEL_MM_NO_PAGE) { s->cow_copies++; kernel_mm_retirement_add(batch, physical, 0); }
     else s->cow_in_place++;

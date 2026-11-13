@@ -141,3 +141,13 @@ SHA256集中在`references/sources.tsv`的`xattr-tools/`条目。两项目分别
 BPF 内核实现为 BoarOS 公共 C 代码，Linux UAPI 与行为依据来自已固定的 `references/linux`。该源码的 bpftool（GPL-2.0-only）和 libbpf（LGPL-2.1 OR BSD-2-Clause）只交叉构建到测试客户机；上游代码保持原样。lwIP 本地增加 UDP/TCP 接收过滤 hook，在协议状态改变前执行 socket 程序，不改变 lwIP 的来源版本或许可。
 
 bpftrace 0.27.1 及其固定 libbpf 子模块、LLVM/Clang 23.1.4、BCC、cereal、elfutils 和 zlib 的归档 URL、revision 与 SHA-256 集中于 `references/sources.tsv` 的 `bpf/` 项。bpftrace/BCC 使用 Apache-2.0，LLVM 使用 Apache-2.0 WITH LLVM-exception，cereal 使用 BSD-3-Clause，elfutils 的 libelf 使用 LGPL-3.0-or-later（其他工具依上游 GPL 条款），zlib 使用 Zlib 许可。构建保留归档内的 LICENSE/COPYING 和声明，工具及运行库留在忽略的构建缓存，不导入内核第三方目录。构建、Linux 同输入对照与客户机运行方法见 [BPF 模块](modules/kernel-bpf.md#构建与检查)。
+
+## strace 验证工具
+
+strace 7.3 作为原版外部用户程序构建输入，官方发布归档及 SHA-256 固定于
+`references/sources.tsv` 的 `strace/` 条目。`tools/build-strace.py` 保留归档、原样源码和
+两架构静态 musl 构建缓存于被忽略的 `build/tools/strace-7.3/`；不修改上游源码，
+也不替换其 ptrace、寄存器或远端内存访问逻辑。strace 本体采用 LGPL-2.1-or-later，
+测试套件采用 GPL-2.0-or-later；bundled Linux UAPI 保留 GPL-2.0 WITH Linux-syscall-note
+声明。构建仅显式关闭可选调用栈展开和跨 ABI personalities，目标架构的普通系统调用
+跟踪保持原实现。许可证全文随归档及原样解包的源码缓存保留。

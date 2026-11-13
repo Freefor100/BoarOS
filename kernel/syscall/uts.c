@@ -5,6 +5,32 @@
 #include <kernel/task.h>
 #include <kernel/uaccess.h>
 #include <kernel/uts.h>
+#include <kernel/personality.h>
+#include <kernel/task_state.h>
+#include <string.h>
+
+static void project_legacy_release(char release[KERNEL_UTS_FIELD_SIZE])
+{
+    const char *cursor = release;
+    unsigned major = 0, minor = 0, dots = 0;
+    while (*cursor >= '0' && *cursor <= '9') major = major * 10U + (unsigned)(*cursor++ - '0');
+    if (*cursor++ != '.') __builtin_trap();
+    while (*cursor >= '0' && *cursor <= '9') minor = minor * 10U + (unsigned)(*cursor++ - '0');
+    cursor = release;
+    while (*cursor) {
+        if (*cursor == '.' && ++dots >= 3) break;
+        if ((*cursor < '0' || *cursor > '9') && *cursor != '.') break;
+        cursor++;
+    }
+    unsigned version = minor + (major >= 4 ? 60U : 40U);
+    char digits[10], projected[KERNEL_UTS_FIELD_SIZE] = "2.6.";
+    size_t count = 0, used = 4;
+    do { digits[count++] = (char)('0' + version % 10U); version /= 10U; } while (version);
+    while (count) projected[used++] = digits[--count];
+    while (*cursor && used < sizeof(projected)-1) projected[used++] = *cursor++;
+    projected[used] = 0;
+    memcpy(release, projected, sizeof(projected));
+}
 
 enum kernel_syscall_status syscall_handle_uts(
     struct kernel_task *caller, const struct kernel_syscall_request *request,
@@ -20,6 +46,8 @@ enum kernel_syscall_status syscall_handle_uts(
         if (kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         kernel_uts_snapshot(kernel_task_uts_namespace(),&name);
+        if (caller->personality & KERNEL_PERSONALITY_UNAME26)
+            project_legacy_release(name.release);
         access = kernel_copy_to_user(mm, request->arguments[0], &name,
                                      sizeof(name), &copied);
         if (access == KERNEL_UACCESS_STATUS_FAULT) decoded->value = -KERNEL_EFAULT;

@@ -8,6 +8,8 @@
 #include <kernel/open_file.h>
 #include <kernel/page.h>
 #include <kernel/task.h>
+#include <kernel/task_state.h>
+#include <kernel/personality.h>
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
 
@@ -153,6 +155,9 @@ enum kernel_syscall_status syscall_handle_mmap(
             decoded->value = type_error;
             return KERNEL_SYSCALL_STATUS_OK;
         }
+        if ((protections & LINUX_PROT_READ) &&
+            (caller->personality & KERNEL_PERSONALITY_READ_IMPLIES_EXEC))
+            protections |= LINUX_PROT_EXEC;
         status = kernel_mm_mmap_anonymous(
             mm,
             request->arguments[0],
@@ -197,6 +202,10 @@ enum kernel_syscall_status syscall_handle_mmap(
             }
         } else {
             const struct kernel_vfs_file *source=kernel_open_file_vfs_borrow(file);
+            if ((protections & LINUX_PROT_READ) &&
+                (caller->personality & KERNEL_PERSONALITY_READ_IMPLIES_EXEC) &&
+                !(source->mount && source->mount->noexec))
+                protections |= LINUX_PROT_EXEC;
             /* mmap检查打开模式；epoll等对象没有read操作并不表示OFD无读权限。 */
             uint32_t access_mode=kernel_open_file_flags(file)&3U;
             int error=0;
@@ -333,10 +342,11 @@ enum kernel_syscall_status syscall_handle_mprotect(
         KERNEL_TASK_STATUS_OK) {
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
-    status = kernel_mm_mprotect(mm,
+    status = kernel_mm_mprotect_personality(mm,
                                 request->arguments[0],
                                 request->arguments[1],
-                                mm_permissions_from_linux(protections));
+                                mm_permissions_from_linux(protections),
+                                !!(caller->personality & KERNEL_PERSONALITY_READ_IMPLIES_EXEC));
     if (status != KERNEL_MM_STATUS_OK &&
         status != KERNEL_MM_STATUS_INVALID_ARGUMENT &&
         status != KERNEL_MM_STATUS_NOT_MAPPED &&

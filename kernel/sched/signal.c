@@ -1,5 +1,6 @@
 #include <kernel/credentials.h>
 #include <kernel/pidfd.h>
+#include <kernel/ptrace.h>
 #include <arch/task.h>
 #include "private.h"
 #include "../signal_pending.h"
@@ -946,6 +947,12 @@ static void signal_send_child(struct kernel_task *parent, struct kernel_task *ch
         (void)signal_send_one_mode(parent,signal,child->tid,1,code,&info,signal!=17U,0,nosleep,0);
 }
 
+void kernel_signal_notify_tracer(struct kernel_task *tracer,struct kernel_task *child,int why,int status)
+{
+    if (why>=4 ? signal_wants_sigchld_stop(tracer) : kernel_signal_wants_sigchld(tracer))
+        signal_send_child(tracer,child,17U,(int16_t)why,status,1);
+}
+
 void kernel_signal_notify_child_exit(struct kernel_task *child)
 {
     SCHEDULER_TASK_BORROW(parent, 0);
@@ -993,6 +1000,7 @@ void kernel_signal_notify_child_stop(struct kernel_task *child,int continued)
 static void signal_resume_stopped(struct kernel_task *task)
 {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    kernel_ptrace_group_continue_locked(task);
     if (task->state != KERNEL_THREAD_STATE_STOPPED) return;
     KERNEL_RUN_SET(runs);
     stopped_unlink_locked(task);
@@ -1135,7 +1143,8 @@ static int signal_ignored_unblocked(const struct kernel_task *target,
     const struct kernel_signal_action *entry;
 
     if (target != 0 &&
-        (target->signal_wait_mask & signal_mask(sig)) != 0U) return 0;
+        ((target->signal_wait_mask & signal_mask(sig)) != 0U ||
+         kernel_ptrace_tracer_tid_locked(target))) return 0;
     if (target == 0 ||
         (target->signal_blocked & signal_mask(sig)) != 0U) {
         return 0;
@@ -1378,6 +1387,7 @@ int signal_timer_disposition_ignored_locked(struct kernel_pid *id,int thread,uns
 {
     struct kernel_task *wake=0,*actual=timer_receiver_locked(id,thread,sig,&wake);
     if(!actual)return -1;
+    if (kernel_ptrace_tracer_tid_locked(actual) || (wake && kernel_ptrace_tracer_tid_locked(wake))) return 0;
     const struct kernel_signal_action *action=signal_action_of(actual,sig);
     return (action&&action->handler==KERNEL_SIGNAL_IGN)||
         ((!action||action->handler==KERNEL_SIGNAL_DFL)&&(signal_default_action(sig)==KERNEL_SIGNAL_DEFAULT_IGNORE||signal_default_action(sig)==KERNEL_SIGNAL_DEFAULT_CONTINUE));
@@ -1561,6 +1571,11 @@ enum kernel_signal_status kernel_signal_send_task(
     struct kernel_task *target, uint32_t sig, kernel_pid_t sender_tid)
 {
     return signal_send_one(target, sig, sender_tid, 0, -6, 0, 0, 0);
+}
+
+enum kernel_signal_status kernel_signal_send_ptrace_syscall(struct kernel_task *target,uint32_t sig)
+{
+    return signal_send_one(target,sig,0,0,128,0,0,0); /* send_sig(sig, current, 1) */
 }
 
 enum kernel_signal_status kernel_signal_send_file_limit(struct kernel_task *target)
@@ -1779,6 +1794,9 @@ static void signal_stop_member(struct kernel_task *task, uint32_t sig)
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         if (!signal_dispatchable_locked(task) || task->state==KERNEL_THREAD_STATE_STOPPED)
             return;
+        /* Traced group-stop requests are job-control work, independent of the
+         * recipient's signal mask and disposition. Its executor parks itself. */
+        if (kernel_ptrace_group_prepare_locked(task,sig)) return;
         __atomic_store_n(&task->signal_pending,task->signal_pending|bit,__ATOMIC_RELAXED);
 #if BOAROS_USER_SMP
         /* A running member can publish BLOCKED without the signal domain. */
@@ -1826,13 +1844,20 @@ static void signal_stop_group(struct kernel_task *task, uint32_t sig)
     if (leader == 0) {
         signal_terminate(11U, 1);
     }
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        /* A SIGCONT which crossed the ptrace signal stop cancels this stop
+         * before any sibling receives a group-stop request. */
+        if (kernel_ptrace_group_prepare_locked(task,sig)==2) return;
+    }
     scheduler_group_cursor_begin(task, &cursor);
     while (cursor.task) {
         struct kernel_task *member = cursor.task;
         signal_stop_member(member, sig);
         {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-            if (signal_dispatchable_locked(member) && member->state != KERNEL_THREAD_STATE_STOPPED) all_stopped = 0;
+            if (signal_dispatchable_locked(member) && member->state != KERNEL_THREAD_STATE_STOPPED &&
+                !kernel_ptrace_group_stopped_locked(member)) all_stopped = 0;
         }
         scheduler_group_cursor_next(&cursor);
     }
@@ -1850,7 +1875,18 @@ static void signal_stop_group(struct kernel_task *task, uint32_t sig)
     if (notify) kernel_signal_notify_child_stop(leader, 0);
     /* Park exactly like a blocked task: switch away and let SIGCONT or
      * SIGKILL put the task back on the ready queue. */
-    (void)scheduler_switch_current_away(task);
+    if (!kernel_ptrace_group_stop(task,sig))
+        (void)scheduler_switch_current_away(task);
+}
+
+void kernel_signal_ptrace_group_stop(struct kernel_task *task,unsigned sig)
+{
+    KERNEL_SERVICE_SCOPE(service);
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        if (!kernel_ptrace_group_pending_locked(task,sig)) return;
+    }
+    signal_stop_group(task,sig);
 }
 
 static void signal_terminate(uint32_t sig, int core_dump)
@@ -2033,6 +2069,20 @@ static inline int signal_return_work(const struct kernel_task *task)
            task->signal_restore_mask || (observed & ~__atomic_load_n(&task->signal_blocked,__ATOMIC_RELAXED));
 }
 
+static uint64_t signal_commit_handler_locked(struct kernel_task *task,uint32_t sig,
+    const struct kernel_signal_action *action,struct kernel_signal_delivery *delivery)
+{
+    delivery->handler=action->handler;
+    delivery->flags=action->flags;
+    delivery->restore_mask=task->signal_restore_mask ? task->signal_saved_mask : task->signal_blocked;
+    task->signal_restore_mask=0;
+    uint64_t retarget=signal_set_blocked_locked(task,task->signal_blocked | action->mask |
+        ((action->flags & LINUX_SA_NODEFER) ? 0 : signal_mask(sig)));
+    if (action->flags & LINUX_SA_RESETHAND)
+        signal_table_of(task)->actions[sig-1].handler=KERNEL_SIGNAL_DFL;
+    return retarget;
+}
+
 /* 事件交付需要的临时载荷和保存寄存器留在有事件的路径，普通返回只检查位。
  * 每次继续处理忽略/停止等事件前仍重查，真正消费保留原调度域保护。 */
 static __attribute__((noinline)) enum kernel_signal_select_result signal_select_active(
@@ -2045,7 +2095,7 @@ static __attribute__((noinline)) enum kernel_signal_select_result signal_select_
         struct kernel_signal_wait_info *info = &delivery->info;
         uint64_t pending;
         int shared = 0;
-        int needs_service=0;
+        int needs_service=0,trace_signal=0;
         uint64_t retarget=0;
         uint32_t sig = 0;
         struct signal_pending_prepared p={0};
@@ -2068,6 +2118,7 @@ static __attribute__((noinline)) enum kernel_signal_select_result signal_select_
                 sig = signal_first_set(pending);
                 const struct kernel_signal_action *entry=signal_action_of(task,sig);
                 if (entry) action=*entry;
+                trace_signal=sig!=SIGNAL_KILL && kernel_ptrace_tracer_tid_locked(task);
                 if (action.handler==KERNEL_SIGNAL_DFL && signal_default_action(sig)==KERNEL_SIGNAL_DEFAULT_STOP &&
                     !kernel_scheduler_user_service_active()) {
                     /* 保留pending跨迁移；途中SIGCONT可取消停止，CPU0重新选择。 */
@@ -2077,19 +2128,9 @@ static __attribute__((noinline)) enum kernel_signal_select_result signal_select_
                         task->signal_fault=(struct kernel_signal_fault){0};
                         *info=(struct kernel_signal_wait_info){.signal=sig,.code=fault.code,.address=fault.address};
                     } else signal_pending_take_locked(shared?leader:task,shared,sig,info,&p);
-                    if (info->signal && action.handler!=KERNEL_SIGNAL_DFL && action.handler!=KERNEL_SIGNAL_IGN) {
-                        /* pending、disposition、mask和RESETHAND在同一次选择中提交。
-                         * 直接写入本线程delivery，原生定时器完成也更新同一载荷；
-                         * 解锁后构帧不再读取共享action指针。 */
-                        delivery->handler=action.handler;
-                        delivery->flags=action.flags;
-                        delivery->restore_mask=task->signal_restore_mask ? task->signal_saved_mask : task->signal_blocked;
-                        task->signal_restore_mask=0;
-                        retarget=signal_set_blocked_locked(task,task->signal_blocked | action.mask |
-                                                           ((action.flags & LINUX_SA_NODEFER) ? 0 : signal_mask(sig)));
-                        if (action.flags & LINUX_SA_RESETHAND)
-                            signal_table_of(task)->actions[sig-1].handler=KERNEL_SIGNAL_DFL;
-                    }
+                    if (info->signal && !trace_signal && action.handler!=KERNEL_SIGNAL_DFL &&
+                        action.handler!=KERNEL_SIGNAL_IGN)
+                        retarget=signal_commit_handler_locked(task,sig,&action,delivery);
                 }
             }
         }
@@ -2097,10 +2138,35 @@ static __attribute__((noinline)) enum kernel_signal_select_result signal_select_
             kernel_service_scope_begin(&return_service);
             continue;
         }
+        /* Complete timer records while their output still names this delivery;
+         * no queue record or action pointer is borrowed across a tracer wait. */
         signal_pending_finish(&p);
         if(pending&&!info->signal)continue;
-        signal_retarget_shared(task,retarget);
         if (shared && sig == 14) real_timer_rearm(leader);
+        if (trace_signal) {
+            sig=kernel_ptrace_signal(task,info);
+            if (!sig) continue;
+            if (sig>KERNEL_SIGNAL_COUNT || info->signal!=sig) __builtin_trap();
+            int requeue;
+            {
+                KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+                requeue=(task->signal_blocked & signal_mask(sig)) || task->terminate_requested;
+                if (!requeue) {
+                    const struct kernel_signal_action *entry=signal_action_of(task,sig);
+                    action=entry ? *entry : (struct kernel_signal_action){0};
+                    if (action.handler!=KERNEL_SIGNAL_DFL && action.handler!=KERNEL_SIGNAL_IGN)
+                        retarget=signal_commit_handler_locked(task,sig,&action,delivery);
+                }
+            }
+            if (requeue) {
+                /* As in Linux ptrace_signal, a blocked reinjection uses the
+                 * original pending type and the complete edited siginfo. */
+                (void)signal_send_one_mode(task,sig,(kernel_pid_t)info->sender,shared,
+                    (int16_t)info->code,info,1,0,0,0);
+                continue;
+            }
+        }
+        signal_retarget_shared(task,retarget);
         if (pending == 0U) {
             if (task->signal_restore_mask != 0U) {
                 kernel_service_scope_begin(&return_service);
@@ -2127,6 +2193,7 @@ static __attribute__((noinline)) enum kernel_signal_select_result signal_select_
             continue;
         case KERNEL_SIGNAL_DEFAULT_STOP: {
             if (sig != SIGNAL_STOP && process_group_is_orphaned(task)) break;
+            kernel_service_scope_begin(&return_service);
             signal_stop_group(task, sig);
             continue;
         }

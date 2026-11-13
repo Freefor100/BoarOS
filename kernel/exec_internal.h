@@ -21,6 +21,7 @@ enum kernel_exec_transaction_state {
     KERNEL_EXEC_TRANSACTION_PREPARING = 1,
     KERNEL_EXEC_TRANSACTION_PREPARED,
     KERNEL_EXEC_TRANSACTION_COMMITTED_CLEANUP,
+    KERNEL_EXEC_TRANSACTION_ABORTED_CLEANUP,
     KERNEL_EXEC_TRANSACTION_EMPTY_CLEANUP,
 };
 
@@ -52,6 +53,7 @@ struct kernel_exec_transaction {
     struct kernel_exec_security *exec_security;
     const struct kernel_fs_context *exec_fs;
     unsigned unsafe_fs, secureexec, dumpable;
+    uint32_t personality;
 };
 
 enum kernel_exec_status kernel_exec_transaction_cleanup(
@@ -87,5 +89,6 @@ enum kernel_exec_status kernel_task_exec_borrow(
 enum kernel_exec_status kernel_task_exec_finish(
     struct kernel_task *task,
     struct kernel_exec_transaction *transaction);
+void kernel_task_exec_abort(struct kernel_task *,struct kernel_exec_transaction *);
 
 #endif

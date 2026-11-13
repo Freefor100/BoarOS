@@ -24,6 +24,7 @@ enum kernel_proc_path_kind {
 struct kernel_proc_process_snapshot {
     kernel_pid_t pid, tgid;
     kernel_pid_t ppid;
+    kernel_pid_t tracer_pid;
     kernel_pid_t process_group;
     kernel_pid_t session_id;
     uint64_t tty_nr;

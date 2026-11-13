@@ -7,6 +7,8 @@
 
 struct kernel_task;
 struct kernel_exec_security;
+/* Executor handles a traced sibling's already-decided group-stop request. */
+void kernel_signal_ptrace_group_stop(struct kernel_task *,unsigned);
 void kernel_signal_mqueue_notify(struct kernel_pid *,struct kernel_exec_security *,int,
     uint64_t value,int32_t sender,uint32_t uid);
 
@@ -215,6 +217,7 @@ enum kernel_signal_status kernel_signal_send_task(
     uint32_t sig,
     kernel_pid_t sender_tid);
 /* Linux send_sig(SIGXFSZ, current, 0): thread directed with SI_USER metadata. */
+enum kernel_signal_status kernel_signal_send_ptrace_syscall(struct kernel_task *,uint32_t);
 enum kernel_signal_status kernel_signal_send_file_limit(struct kernel_task *);
 
 enum kernel_signal_status kernel_signal_get_action(

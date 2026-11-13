@@ -43,6 +43,8 @@ struct kernel_io_priority_context;
 struct kernel_futex_pi_state;
 struct kernel_futex_pi_request;
 struct kernel_futex_request;
+struct kernel_ptrace_state;
+struct kernel_remote_memory_request;
 
 enum kernel_thread_state {
     KERNEL_THREAD_STATE_IDLE = 0,
@@ -278,6 +280,9 @@ struct kernel_task {
     struct kernel_sched_runqueue *fair_queue;
     uint64_t fair_runtime_seen;
     struct kernel_namespace *uts_namespace, *ipc_namespace;
+    struct kernel_ptrace_state *ptrace;
+    struct kernel_remote_memory_request *remote_memory_request;
+    uint32_t personality;
 } __attribute__((aligned(16)));
 
 #endif

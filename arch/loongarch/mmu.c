@@ -267,14 +267,14 @@ enum arch_mmu_status arch_mmu_user_cow_snapshot(struct arch_mmu_user_space *s,
     uint64_t *slot;
     enum arch_mmu_status status = walk(s, v, 0, &slot);
     if (status != ARCH_MMU_STATUS_OK) return status;
-    if (!(*slot & PTE_COW) || (*slot & PTE_NONE)) return ARCH_MMU_STATUS_NOT_MAPPED;
+    if (!(*slot & PTE_COW)) return ARCH_MMU_STATUS_NOT_MAPPED;
     *cookie = *slot; *physical = *slot & PTE_ADDRESS;
     return ARCH_MMU_STATUS_OK;
 }
 enum arch_mmu_status arch_mmu_user_cow_commit(struct arch_mmu_user_space *s, uint64_t v,
     uint64_t cookie, uint64_t replacement, uint32_t permissions, struct kernel_mm_retirement *batch)
 {
-    if (!batch || batch->count >= KERNEL_MM_RETIRE_CAPACITY || !(permissions & ARCH_MMU_WRITE) ||
+    if (!batch || batch->count >= KERNEL_MM_RETIRE_CAPACITY ||
         (permissions & ~7U) || (replacement != KERNEL_MM_NO_PAGE &&
         (!replacement || (replacement & BOAROS_PAGE_MASK) || replacement > PTE_ADDRESS)))
         return ARCH_MMU_STATUS_INVALID;
@@ -291,6 +291,8 @@ enum arch_mmu_status arch_mmu_user_cow_commit(struct arch_mmu_user_space *s, uin
     uint64_t *slot;
     status = walk(s, v, 0, &slot);
     if (status != ARCH_MMU_STATUS_OK) return status;
+    if ((actual & PTE_NONE) && permissions) { s->protected_pages--; s->leaf_pages++; }
+    if (!(actual & PTE_NONE) && !permissions) { s->leaf_pages--; s->protected_pages++; }
     __atomic_store_n(slot, encode(replacement == KERNEL_MM_NO_PAGE ? physical : replacement, permissions, 0), __ATOMIC_RELEASE);
     s->cow_pages--;
     if (replacement != KERNEL_MM_NO_PAGE) { s->cow_copies++; kernel_mm_retirement_add(batch, physical, 0); }

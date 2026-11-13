@@ -90,7 +90,7 @@ def prepare(args):
             subprocess.run([*command, 'defconfig'], check=True)
             subprocess.run([str(source / 'scripts/config'), '--file', str(directory / '.config'),
                             '-e', 'BLK_DEV_INITRD', '-e', 'RD_GZIP', '-e', 'DEVTMPFS',
-                            '-e', 'BINFMT_ELF', '-d', '4KB_3LEVEL', '-d', '4KB_4LEVEL',
+                            '-e', 'BINFMT_ELF', '-e', 'CROSS_MEMORY_ATTACH', '-d', '4KB_3LEVEL', '-d', '4KB_4LEVEL',
                             '-e', '16KB_3LEVEL'], check=True)
             if profile in ('platform','platform-noswap'):
                 subprocess.run([str(source/'scripts/config'),'--file',str(configuration),
@@ -99,6 +99,8 @@ def prepare(args):
             if profile=='platform-noswap':
                 subprocess.run([str(source/'scripts/config'),'--file',str(configuration),'-d','SWAP'],check=True)
             subprocess.run([*command, 'olddefconfig'], check=True)
+        if 'CONFIG_CROSS_MEMORY_ATTACH=y' not in configuration.read_text():
+            raise SystemExit('Linux LA cache lacks process_vm_readv/writev support')
         if 'CONFIG_16KB_3LEVEL=y' not in (directory / '.config').read_text():
             raise SystemExit('Linux LA cache no longer uses 16 KiB, three levels')
         if profile in ('platform','platform-noswap') and any('CONFIG_'+symbol+'=y' not in configuration.read_text()

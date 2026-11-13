@@ -1554,6 +1554,7 @@ static int proc_process_snapshot(struct kernel_vfs_node *node,
         const char *state_name = process.state == 'R' ? " (running)\n" :
                                  process.state == 'Z' ? " (zombie)\n" :
                                  process.state == 'T' ? " (stopped)\n" :
+                                 process.state == 't' ? " (tracing stop)\n" :
                                                         " (sleeping)\n";
         size_t state_length = strlen(state_name);
         memcpy(data + used, state_name, state_length);
@@ -1564,6 +1565,8 @@ static int proc_process_snapshot(struct kernel_vfs_node *node,
                                    (uint32_t)process.pid, "\n");
         used += append_number_line(data + used, "PPid:\t",
                                    (uint32_t)process.ppid, "\n");
+        used += append_number_line(data + used, "TracerPid:\t",
+                                   (uint32_t)process.tracer_pid, "\n");
         used += append_number_line(data + used, "Threads:\t",
                                    process.threads, "\n");
         used += append_number_line(data + used, "VmSize:\t",

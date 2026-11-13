@@ -35,6 +35,11 @@ SOURCES['async_io']='io/async_io.c'
 SOURCES['tty_async']='tty/pty_probe.c'
 SOURCES['uts_namespace']='resource/uts_namespace.c'
 SOURCES['ipc_namespace']='resource/ipc_namespace.c'
+SOURCES['process_memory']='resource/process_memory.c'
+SOURCES['personality']='resource/personality.c'
+SOURCES['ptrace']='resource/ptrace.c'
+SOURCES['ptrace_tools']='resource/ptrace_tools.c'
+SOURCES['ptrace_signal']='resource/ptrace_signal.c'
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -76,6 +81,11 @@ def build(args,work):
     commands=['mkdir /proc','mkdir /tmp','mkdir /dev/mqueue']
     for name in programs:
         if name!='init':commands += [f'write "{work/name}" /{name}',f'set_inode_field /{name} mode 0100755']
+    if 'ptrace_tools' in programs:
+        harness.run_logged([sys.executable,str(ROOT/'tools/build-strace.py'),'--arch',args.arch],work/'strace-build.log')
+        tool=ROOT/'build/tools/strace-7.3'/args.arch/'src/strace'
+        programs['strace']={'path':str(tool),'sha256':digest(tool),'upstream_version':'7.3'}
+        commands += [f'write "{tool}" /strace','set_inode_field /strace mode 0100755']
     if 'vectors_v2' in programs:
         empty=work/'append-only';empty.write_bytes(b'')
         commands += [f'write "{empty}" /vectors-append-only',
@@ -108,12 +118,12 @@ def build(args,work):
 
 def accepted(raw,arch,cpus,target,selected=None):
     programs=[name for name in (selected or LEGACY) if name!='icache' or arch=='riscv']
-    if target=='boaros' and arch=='riscv' and ('mount_api' in programs or 'mount_context' in programs or 'system_control' in programs or 'sched_control' in programs or 'async_io' in programs or 'tty_async' in programs or 'uts_namespace' in programs or 'ipc_namespace' in programs):
+    if target=='boaros' and arch=='riscv' and ('mount_api' in programs or 'mount_context' in programs or 'system_control' in programs or 'sched_control' in programs or 'async_io' in programs or 'tty_async' in programs or 'uts_namespace' in programs or 'ipc_namespace' in programs or any(p in programs for p in ('ptrace','ptrace_signal','ptrace_tools','process_memory','personality'))):
         free=re.search(r'task stacks released=0x[0-9a-f]+ min-free=0x([0-9a-f]+)',raw)
         if not free or int(free[1],16)<1024:return False
     ends=[line for line in raw.replace('\r','').splitlines() if line.startswith('API8 END ')]
     expected=[f'API8 END /{name} status=0' for name in programs]
-    known={'uts_namespace':['UTS NAMESPACE PASS cases=8'],'ipc_namespace':['IPCNS PASS cases=3'],'async_io':['ASYNC PASS cases=4'],'tty_async':['PTY_RECORD sigio-vhangup-generation 1'],'sched_control':['SCHED-CONTROL END cases=6'],'system_control':['SYSTEM CONTROL PASS cases=5'],'mount_context':['FS-CONTEXT END 9'],'mount_api':['MOUNT-API END 5'],'propagation':['PROP END 9'],'atime':['MOUNT-ATTR END 4'],'memory_advice':['MADVISE END 5'],'fd_events':['FD-EVENTS PASS'],'flock':['FLOCK-PASS'],
+    known={'ptrace_signal':['PTRACE SIGNAL suppression reset-mask blocked-replacement siginfo ignored continue-cancels-stop PASS'],'process_memory':['PROCESS_MEMORY PASS'],'personality':['PERSONALITY PASS'],'ptrace':['PTRACE traced-stop memory syscall-info exit PASS'],'ptrace_tools':['PTRACE_TOOLS PASS'],'uts_namespace':['UTS NAMESPACE PASS cases=8'],'ipc_namespace':['IPCNS PASS cases=3'],'async_io':['ASYNC PASS cases=4'],'tty_async':['PTY_RECORD sigio-vhangup-generation 1'],'sched_control':['SCHED-CONTROL END cases=6'],'system_control':['SYSTEM CONTROL PASS cases=5'],'mount_context':['FS-CONTEXT END 9'],'mount_api':['MOUNT-API END 5'],'propagation':['PROP END 9'],'atime':['MOUNT-ATTR END 4'],'memory_advice':['MADVISE END 5'],'fd_events':['FD-EVENTS PASS'],'flock':['FLOCK-PASS'],
            'splice':['SPLICE PASS cases=9'],'file_advice':['ADVICE RESULT cases=3 failures=0'],'copy_range':['COPY_RANGE PASS'],'sched_query':['SCHED-QUERY END cases=7'],
            'icache':[f'ICACHE PASS cpus={cpus}'],
            'vectors_v2':[*(f'VECTORS2 CASE {name} PASS' for name in (

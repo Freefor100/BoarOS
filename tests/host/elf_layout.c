@@ -4,6 +4,7 @@
 #include <kernel/heap.h>
 #include <kernel/uaccess.h>
 #include <kernel/random.h>
+#include <kernel/personality.h>
 #include <kernel/exec.h>
 #include <kernel/errno.h>
 #include <kernel/open_file.h>
@@ -53,9 +54,15 @@ int __wrap_kernel_vfs_close(struct kernel_vfs_file *file)
     return __real_kernel_vfs_close(file);
 }
 __asm__(".pushsection .rodata\n.global arch_elf_vdso_start,arch_elf_vdso_end\narch_elf_vdso_start:\n.byte 0x73,0,0,0\narch_elf_vdso_end:\n.popsection");
-int kernel_random_available(void) { return 0; }
+static unsigned entropy_seed, entropy_calls;
+int kernel_random_available(void) { return entropy_seed != 0; }
 enum kernel_random_status kernel_random_fill(void *buffer,size_t size)
-{ (void)buffer; (void)size; abort(); }
+{
+    assert(entropy_seed); entropy_calls++;
+    memset(buffer,0,size);
+    ((unsigned char *)buffer)[0]=(unsigned char)(entropy_seed+entropy_calls);
+    return KERNEL_RANDOM_STATUS_OK;
+}
 void mm_test_fence(uint64_t address,int instructions)
 { (void)address; (void)instructions; assert(!kernel_cpu_current()->raw_locks); }
 static void *page_access(uint64_t address) { return (void *)(uintptr_t)address; }
@@ -135,6 +142,59 @@ static void build_case(uint16_t main_type,uint64_t main_address,uint16_t interpr
     assert(!kernel_elf64_source_release(&main));
     assert(physical_page_available(&pages)==before && !physical_page_allocator_audit(&pages));
     fprintf(stderr,"ELF actual build main=%u interp=%u overlap=%d: OK\n",main_type,interpreter_type,overlap);
+}
+
+static void personality_layout(void)
+{
+    uint64_t before=physical_page_available(&pages);
+    unsigned char bytes[256];
+    struct kernel_elf64_source *main_source=source(bytes,3,0x20000,0x31,0);
+    struct kernel_exec_string name={"/layout",7};
+    struct kernel_exec_image_request request={.executable_source=main_source,
+        .executable=name,.arguments=&name,.argument_count=1,
+        .personality=KERNEL_PERSONALITY_ADDR_NO_RANDOMIZE};
+    uint64_t entries[2],stacks[2],heaps[2],mappings[2],vdsos[2];
+    unsigned char random[2][16];
+    for(unsigned pass=0;pass<2;pass++) {
+        entropy_seed=pass+1;entropy_calls=0;
+        struct kernel_exec_image image={0};
+        assert(!kernel_elf_image_build(&request,&heap,&pages,&kernel,&image));
+        assert(entropy_calls==1); /* AT_RANDOM survives disabled address randomization. */
+        assert(!kernel_mm_context(&image.mm,&mm_test_context));
+        entries[pass]=image.entry;stacks[pass]=image.stack_pointer;
+        assert(!kernel_mm_brk(&image.mm,0,&heaps[pass]));
+        assert(!kernel_mm_mmap_anonymous(&image.mm,0,BOAROS_PAGE_SIZE,KERNEL_MM_READ,0,&mappings[pass]));
+        assert(!kernel_mm_vdso_address(&image.mm,&vdsos[pass]));
+        uint64_t stack[40],at_random=0;size_t copied;
+        assert(!kernel_copy_from_user(&image.mm,stack,image.stack_pointer,sizeof(stack),&copied)&&copied==sizeof(stack));
+        for(unsigned i=4;i+1<40 && stack[i];i+=2)if(stack[i]==25)at_random=stack[i+1];
+        assert(at_random && !kernel_copy_from_user(&image.mm,random[pass],at_random,16,&copied)&&copied==16);
+        /* Per-VMA execute ceilings also apply when execute is implied. */
+        uint64_t a=mappings[pass];
+        assert(!kernel_mm_resolve_user_fault(&image.mm,a,KERNEL_MM_READ));
+        assert(!kernel_mm_mprotect_personality(&image.mm,a,BOAROS_PAGE_SIZE,KERNEL_MM_READ,1));
+        struct kernel_vma vma;struct kernel_mm_mapping mapping;
+        assert(!kernel_mm_vma_lookup(&image.mm,a,&vma) && (vma.permissions & KERNEL_MM_EXECUTE));
+        assert(!kernel_mm_lookup(&image.mm,a,&mapping) && (mapping.permissions & KERNEL_MM_EXECUTE));
+        assert(!kernel_mm_mprotect(&image.mm,a,BOAROS_PAGE_SIZE,KERNEL_MM_READ));
+        assert(!kernel_mm_vma_lookup(&image.mm,a,&vma) && !(vma.permissions & KERNEL_MM_EXECUTE));
+        assert(!kernel_mm_vma_insert_anon(&image.mm,a-BOAROS_PAGE_SIZE,a,KERNEL_MM_READ,
+            KERNEL_VMA_ROLE_VVAR,KERNEL_VMA_FAULT_DEMAND_ZERO));
+        assert(!kernel_mm_resolve_user_fault(&image.mm,a-BOAROS_PAGE_SIZE,KERNEL_MM_READ));
+        assert(!kernel_mm_mprotect_personality(&image.mm,a-BOAROS_PAGE_SIZE,2*BOAROS_PAGE_SIZE,KERNEL_MM_READ,1));
+        assert(!kernel_mm_vma_lookup(&image.mm,a-BOAROS_PAGE_SIZE,&vma) && !(vma.permissions & KERNEL_MM_EXECUTE));
+        assert(!kernel_mm_lookup(&image.mm,a-BOAROS_PAGE_SIZE,&mapping) && !(mapping.permissions & KERNEL_MM_EXECUTE));
+        assert(!kernel_mm_vma_lookup(&image.mm,a,&vma) && (vma.permissions & KERNEL_MM_EXECUTE));
+        assert(kernel_mm_mprotect_personality(&image.mm,a-BOAROS_PAGE_SIZE,2*BOAROS_PAGE_SIZE,
+            KERNEL_MM_READ|KERNEL_MM_EXECUTE,1)==KERNEL_MM_STATUS_ACCESS);
+        mm_test_context=0;assert(!kernel_mm_release(&image.mm));
+    }
+    assert(entries[0]==entries[1] && stacks[0]==stacks[1] && heaps[0]==heaps[1] &&
+        mappings[0]==mappings[1] && vdsos[0]==vdsos[1] && memcmp(random[0],random[1],16));
+    entropy_seed=0;
+    assert(!kernel_elf64_source_release(&main_source));
+    assert(physical_page_available(&pages)==before);
+    puts("ELF personality: deterministic layouts, independent AT_RANDOM, implied execute VMA/PTE passed");
 }
 
 static void large_stack_layout(uint64_t limit)
@@ -232,6 +292,7 @@ int main(void)
     large_stack_layout(UINT64_C(512)*1024*1024);
     large_stack_layout(UINT64_MAX-4096);
     large_stack_layout(UINT64_MAX);
+    personality_layout();
     cleanup_transaction();
     struct kernel_heap_statistics stats; kernel_heap_get_statistics(&heap,&stats);
     assert(!stats.live_allocations && !stats.current_pages && physical_page_available(&pages)==baseline);

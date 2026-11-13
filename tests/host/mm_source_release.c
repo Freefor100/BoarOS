@@ -5,6 +5,8 @@
 #include <kernel/uaccess.h>
 #include <kernel/file_mapping.h>
 #include <kernel/errno.h>
+#include <kernel/elf64_source.h>
+#include <string.h>
 #include "../../fs/open_file_internal.h"
 #include "../../kernel/sched/private.h"
 #include <assert.h>
@@ -100,6 +102,37 @@ static void *unmap_callback(void *unused)
     (void)unused; mm_test_attach(6); kernel_cpu_current()->logical_id=0; mm_test_context=context;
     assert(!kernel_mm_munmap(&mm,0x40000,BOAROS_PAGE_SIZE)); publish(&unmap_done); return NULL;
 }
+static void u16(unsigned char *p,uint16_t value)
+{ for(unsigned i=0;i<2;i++)p[i]=(unsigned char)(value>>(8*i)); }
+static void u32(unsigned char *p,uint32_t value)
+{ for(unsigned i=0;i<4;i++)p[i]=(unsigned char)(value>>(8*i)); }
+static void u64(unsigned char *p,uint64_t value)
+{ for(unsigned i=0;i<8;i++)p[i]=(unsigned char)(value>>(8*i)); }
+static void remote_last_executable_close(void)
+{
+    unsigned char bytes[128]={0};memcpy(bytes,"\177ELF\2\1\1",7);
+    u16(bytes+16,KERNEL_ELF64_TYPE_EXECUTABLE);u16(bytes+18,KERNEL_ELF64_MACHINE_RISCV);
+    u32(bytes+20,1);u64(bytes+24,0x100078);u64(bytes+32,64);
+    u16(bytes+52,64);u16(bytes+54,56);u16(bytes+56,1);
+    u32(bytes+64,KERNEL_ELF64_PROGRAM_LOAD);u32(bytes+68,KERNEL_ELF64_FLAG_READ|KERNEL_ELF64_FLAG_EXECUTE);
+    u64(bytes+80,0x100000);u64(bytes+96,sizeof(bytes));u64(bytes+104,BOAROS_PAGE_SIZE);u64(bytes+112,BOAROS_PAGE_SIZE);
+    struct kernel_read_source reader;
+    struct kernel_elf64_source *source=NULL;
+    assert(!kernel_read_source_from_memory(bytes,sizeof(bytes),&reader));
+    assert(!kernel_elf64_source_create_reader(&heap,&reader,BOAROS_PAGE_SIZE,KERNEL_ELF64_MACHINE_RISCV,&source));
+    assert(!kernel_mm_map_elf_source(&mm,source,0));assert(!kernel_elf64_source_release(&source));
+    struct kernel_open_file_description *file=NULL;int error;
+    assert(!kernel_open_file_create_mode(&heap,mount,"/remote-executable",0700,&file,&error)&&!error);
+    assert(!kernel_mm_set_executable(&mm,file));close_caller(&file);
+    struct kernel_mm remote={0};assert(!kernel_mm_acquire(&remote,&mm));
+    mm_test_context=0;assert(!kernel_mm_release(&mm));
+    unsigned before=last_releases;fail_close=1;
+    assert(kernel_mm_release(&remote)==KERNEL_MM_STATUS_CLEANUP_REQUIRED);
+    assert(!fail_close&&watched&&!watched->references&&last_releases==before);
+    assert(remote.state==KERNEL_MM_CLEANUP&&remote.cleanup_stage==KERNEL_MM_CLEANUP_ELF_SOURCES);
+    assert(!kernel_mm_release(&remote)&&!watched&&last_releases==before+1);
+    puts("MM remote last executable close failure retains actual MM/OFD for retry");
+}
 int main(void)
 {
     mm_test_attach(0);
@@ -151,7 +184,7 @@ int main(void)
     publish(&callback_resume);
     assert(!pthread_join(notifier,NULL) && !pthread_join(remover,NULL) && unmap_done);
     assert(!kernel_open_file_release(&callback_file));
-    mm_test_context=0; assert(!kernel_mm_release(&mm) && !kernel_vfs_unmount(mount));
+    remote_last_executable_close();assert(!kernel_vfs_unmount(mount));
     struct kernel_heap_statistics stats; kernel_heap_get_statistics(&heap,&stats);
     assert(!stats.live_allocations && !stats.current_pages && physical_page_available(&pages)==baseline);
     assert(!physical_page_allocator_audit(&pages));

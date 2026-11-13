@@ -41,6 +41,8 @@
 
 #include "../exec_internal.h"
 #include "private.h"
+#include "ptrace_internal.h"
+#include <kernel/remote_memory.h>
 
 #define LINUX_WNOHANG UINT32_C(0x00000001)
 #define LINUX_WUNTRACED UINT32_C(0x00000002)
@@ -338,6 +340,7 @@ static void request_thread_termination_locked(struct kernel_task *task)
         if (task->wait.on_cpu) task->wait.ready_pending = 1;
         else ready_enqueue_locked(task, 0);
     }
+    ptrace_terminate_locked(task);
     kernel_wait_interrupt_locked(task);
 }
 
@@ -601,6 +604,9 @@ enum kernel_scheduler_status process_group_exec_current(void)
             kernel_user_thread_exit(KERNEL_THREAD_EXIT_SYSCALL, 0U, 0U);
     }
     if (task != leader) {
+        /* The dying leader loses its numeric identity here. The execing
+         * thread keeps its own trace relationship across identity_adopt. */
+        ptrace_consume_final(leader);
         if (task->controlling_tty) kernel_task_tty_clear(task);
         kernel_signal_timer_adopt(task, leader);
         struct kernel_pid *old_identity;
@@ -894,6 +900,7 @@ enum kernel_scheduler_status arch_process_clone_current(
     int io_result=kernel_ioprio_clone(parent,child,(flags & UINT64_C(0x80000000))!=0);
     if(io_result)
         return finish_clone_failure(child,io_result,linux_result,KERNEL_SCHEDULER_STATUS_OK);
+    child->personality=parent->personality;
     child->no_new_privs=parent->no_new_privs;
     child->arch.user_mode = 1U;
 #if BOAROS_USER_SMP
@@ -1033,6 +1040,9 @@ enum kernel_scheduler_status arch_process_clone_current(
             KERNEL_SCHEDULER_STATUS_INVALID_STATE);
     }
 
+    if (ptrace_clone_prepare(parent,child))
+        return finish_clone_failure(child,-KERNEL_ENOMEM,linux_result,KERNEL_SCHEDULER_STATUS_OK);
+
     if (flags & UINT64_C(0x1000)) {
         int error=kernel_pidfd_prepare_clone(parent,process_identity(child,KERNEL_PID_TID),thread_clone,&pidfd);
         if (!error) {
@@ -1058,6 +1068,7 @@ enum kernel_scheduler_status arch_process_clone_current(
 #if BOAROS_COST_DIAGNOSTICS
     kernel_cost_inherit(&child->cost, &parent->cost);
 #endif
+    unsigned trace_event=0;
     if (vfork) kernel_wait_queue_init(&parent->vfork_done_queue);
     int rejected;
     {
@@ -1089,6 +1100,7 @@ enum kernel_scheduler_status arch_process_clone_current(
                 parent->vfork_waiting = 1;
                 parent->vfork_wait_child = child;
             }
+            trace_event=ptrace_clone_locked(parent,child,flags);
             child->state = KERNEL_THREAD_STATE_READY;
             if(!thread_clone && child->limits->values[KERNEL_RLIMIT_CPU].current!=KERNEL_RLIM_INFINITY)
                 scheduler_cpu_timer_update_locked(child,0);
@@ -1100,6 +1112,7 @@ enum kernel_scheduler_status arch_process_clone_current(
         return finish_clone_failure(child, -KERNEL_EAGAIN, linux_result, KERNEL_SCHEDULER_STATUS_OK);
     }
     *linux_result = tid;
+    if (trace_event) ptrace_event(parent,trace_event,tid);
 
     if (vfork) {
         /* Linux suspends the vfork parent inside the syscall until the
@@ -1112,6 +1125,7 @@ enum kernel_scheduler_status arch_process_clone_current(
                 return status;
             }
         }
+        ptrace_event(parent,TRACE_VFORK_DONE,tid);
     }
     return KERNEL_SCHEDULER_STATUS_OK;
 }
@@ -1361,6 +1375,9 @@ static enum kernel_scheduler_status select_wait_child(struct kernel_task *parent
     *selected = 0;
     *event = 0;
     *matching = 0;
+    if (ptrace_select(parent,which,target,options,selected,event,matching))
+        return KERNEL_SCHEDULER_STATUS_OK;
+    int trace_matching=*matching;
     struct kernel_task *leader = parent->group_leader;
     SCHEDULER_TASK_BORROW(owner, 0);
     uint64_t epoch = 0;
@@ -1383,7 +1400,7 @@ static enum kernel_scheduler_status select_wait_child(struct kernel_task *parent
                     return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
                 epoch = leader->children_epoch;
                 count = previous = 0;
-                *matching = 0;
+                *matching = trace_matching;
             }
             struct kernel_task *child = restart ? leader->first_child : owner;
             restart = 0;
@@ -1402,7 +1419,7 @@ static enum kernel_scheduler_status select_wait_child(struct kernel_task *parent
                     if (child->state == KERNEL_THREAD_STATE_ZOMBIE) {
                         if (options & LINUX_WEXITED) {
                             *matching = 1;
-                            if (!child->reaping) {
+                            if (!child->reaping && !kernel_ptrace_tracer_tid_locked(child)) {
                                 child->reaping = 1;
                                 scheduler_task_get_locked(child);
                                 *selected = child;
@@ -1412,7 +1429,11 @@ static enum kernel_scheduler_status select_wait_child(struct kernel_task *parent
                         }
                     } else {
                         *matching = 1;
-                        uint32_t kind = child->group_stopped && (options & (LINUX_WUNTRACED | LINUX_WSTOPPED)) && !child->stop_notified ? 2 :
+                        /* The same parent group can reach this child through
+                         * both lists. Its ptrace stop is the sole stop report. */
+                        int traced_here=child->ptrace && child->ptrace->tracer &&
+                            child->ptrace->tracer->group_leader==leader;
+                        uint32_t kind = !traced_here && child->group_stopped && (options & (LINUX_WUNTRACED | LINUX_WSTOPPED)) && !child->stop_notified ? 2 :
                             !child->group_stopped && (options & LINUX_WCONTINUED) && child->continue_notified ? 3 : 0;
                         if (kind && !child->reaping) {
                             child->reaping = 1;
@@ -1446,6 +1467,7 @@ static void wait_claim_end(struct kernel_task **task)
 {
     if (!*task) return;
     scheduler_task_wait_claim_release(*task);
+    ptrace_wait_claim_done(*task);
 }
 
 /* 返回的child同时带有storage borrow和wait claim，由调用者保持到输出完成。 */
@@ -1485,6 +1507,43 @@ static enum kernel_scheduler_status wait_for_child(struct kernel_task *parent,
     }
 }
 
+/* The tracer used a separate wait index. Release to the parent that owns the
+ * child list, or resume ordinary retirement of an unparented thread. */
+void process_release_traced_zombie(struct kernel_task *child)
+{
+    SCHEDULER_TASK_BORROW(parent,0);
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        parent=child->parent;
+        if (parent) scheduler_task_get_locked(parent);
+    }
+    if (parent) kernel_signal_notify_child_exit(child);
+    int autoreap=parent && child->exit_signal==17 && kernel_signal_child_autoreap(parent);
+    int cleanup=0;
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        if (child->state!=KERNEL_THREAD_STATE_ZOMBIE) return;
+        if (autoreap && child->parent==parent) child_remove_locked(parent,child);
+        if (!child->parent) {
+            child->state=KERNEL_THREAD_STATE_EXITED;
+            exited_append_locked(child);
+            cleanup=1;
+        }
+    }
+    if (cleanup) (void)kernel_wait_queue_wake_all(&scheduler.cleanup_queue);
+}
+
+static int finish_traced_wait(struct kernel_task *parent,struct kernel_task *child)
+{
+    ptrace_consume_final(child);
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        if (child->parent==parent->group_leader) return 1;
+    }
+    process_release_traced_zombie(child);
+    return 0;
+}
+
 enum kernel_scheduler_status kernel_scheduler_wait4_current(int64_t pid,
     uint64_t status_address, uint32_t options, uint64_t rusage_address, int64_t *linux_result)
 {
@@ -1504,16 +1563,18 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(int64_t pid,
     struct kernel_task *claim __attribute__((cleanup(wait_claim_end))) = 0;
     uint32_t event;
     enum kernel_scheduler_status status = wait_for_child(parent, which, target,
-        options | LINUX_WEXITED, &child, &event, linux_result);
+        options | LINUX_WEXITED | UINT32_C(0x10000000), &child, &event, linux_result);
     claim = child;
     if (status != KERNEL_SCHEDULER_STATUS_OK || !child) return status;
+    if (event==TRACE_WAIT_FINAL && finish_traced_wait(parent,child)) event=1;
     if (event == 1) return reap_waited_child(parent, child, status_address, rusage_address, linux_result);
     uint32_t reported;
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        reported = event == 2 ? child->wait_status : LINUX_WAIT_CONTINUED;
+        if (event==TRACE_WAIT_STOP) reported=ptrace_wait_status_locked(child,1);
+        else reported = event == 2 || event==TRACE_WAIT_FINAL ? child->wait_status : LINUX_WAIT_CONTINUED;
         if (event == 2) child->stop_notified = 1;
-        else child->continue_notified = 0;
+        else if (event==3) child->continue_notified = 0;
     }
     return report_wait_event(parent, child, reported, status_address, rusage_address, linux_result);
 }
@@ -1579,17 +1640,20 @@ enum kernel_scheduler_status kernel_scheduler_waitid_current(int32_t which,
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
             child_pid = child->tid;
             child_uid = kernel_credentials_task_locked(child)->uid;
-            ws = child->wait_status;
+            ws = event==TRACE_WAIT_STOP ? ptrace_wait_status_locked(child,!(options&LINUX_WNOWAIT)) : child->wait_status;
             if (event == 2 && !(options & LINUX_WNOWAIT)) child->stop_notified = 1;
             if (event == 3 && !(options & LINUX_WNOWAIT)) child->continue_notified = 0;
         }
-        if (event == 1) {
+        if (event==TRACE_WAIT_FINAL && !(options&LINUX_WNOWAIT) && finish_traced_wait(parent,child)) event=1;
+        if (event == 1 || event==TRACE_WAIT_FINAL) {
             cause = !(ws & 0x7fU) ? 1 /* CLD_EXITED */ : (ws & 0x80U) ? 3 /* CLD_DUMPED */ : 2 /* CLD_KILLED */;
             status_code = (int32_t)(cause == 1 ? (ws >> 8U) & 0xffU : ws & 0x7fU);
-            if (!(options & LINUX_WNOWAIT)) {
+            if (event==1 && !(options & LINUX_WNOWAIT)) {
                 status = retire_waited_zombie(parent, child, &usage);
                 if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
             }
+        } else if (event==TRACE_WAIT_STOP) {
+            cause=4; status_code=(int32_t)(ws>>8);
         } else if (event == 2) {
             cause = 5; /* CLD_STOPPED */
             status_code = (int32_t)((ws >> 8U) & 0xffU);
@@ -1744,8 +1808,9 @@ static void reap_claim_end(struct kernel_task **task)
 }
 
 /* 这些句柄借用旧调用栈；先结束端点请求，再归还请求可能使用的暂存页。 */
-static void cleanup_task_io_requests(struct kernel_task *thread)
+static int cleanup_task_io_requests(struct kernel_task *thread)
 {
+    if (thread->remote_memory_request && kernel_remote_memory_abort(thread)) return -KERNEL_EIO;
     kernel_files_abort_flock(thread);
     if(thread->pi_request)kernel_futex_pi_abort(thread);
     kernel_futex_abort(thread);
@@ -1759,6 +1824,7 @@ static void cleanup_task_io_requests(struct kernel_task *thread)
     if (thread->socket_call) kernel_socket_call_abort(thread->socket_call);
     if (thread->tty_request) kernel_tty_abort_request(thread->tty_request);
     if (thread->io_buffer) kernel_task_io_buffer_release(thread->io_buffer);
+    return 0;
 }
 
 enum kernel_scheduler_status kernel_scheduler_reap_one(
@@ -1816,7 +1882,7 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
         kernel_pidfd_exit_identity(thread);
     /* Request handles may live on the old stack; release them before it. */
     if (thread->io_context.locks || thread->io_context.backend_depth) __builtin_trap();
-    cleanup_task_io_requests(thread);
+    if (cleanup_task_io_requests(thread)) return KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP;
     kernel_ioprio_exit(thread);
     kernel_sem_exit(thread);
     kernel_posix_timers_exit(thread);
@@ -1915,6 +1981,23 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
         if (thread->group_leader == thread) kernel_signal_timer_cancel(thread);
         process_orphan_notify(thread, 0);
         /* Reparenting may append orphan zombies behind this tail. */
+        struct kernel_ptrace_notice trace_notice;
+        int traced;
+        {
+            KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+            traced=ptrace_publish_final_locked(thread,&trace_notice);
+            if (traced) {
+                exited_remove_locked(thread);
+                thread->state=KERNEL_THREAD_STATE_ZOMBIE;
+                thread->reaping=0;
+                if (thread->parent) thread->publish_completion=0;
+                claim=0;
+            }
+        }
+        if (traced) {
+            kernel_ptrace_switch_notify(&trace_notice);
+            return KERNEL_SCHEDULER_STATUS_EMPTY;
+        }
         if (thread->parent != 0) {
             kernel_signal_notify_child_exit(thread);
             if (thread->exit_signal == 17U && kernel_signal_child_autoreap(thread->parent)) {
@@ -2074,7 +2157,7 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
     enum kernel_files_status files_status;
     enum kernel_fs_context_status fs_status;
 
-    cleanup_task_io_requests(thread);
+    if (cleanup_task_io_requests(thread)) return KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP;
     files_status=finish_files_change(thread);
     if(files_status) return files_status==KERNEL_FILES_STATUS_CLEANUP_REQUIRED
         ? KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP : KERNEL_SCHEDULER_STATUS_INVALID_STATE;
@@ -2099,16 +2182,18 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
 
         /* A sibling may terminate a thread after exec preparation. The
          * prepared image is still owned by this transaction and is aborted. */
-        if (transaction->state == KERNEL_EXEC_TRANSACTION_PREPARED)
-            transaction->state = KERNEL_EXEC_TRANSACTION_PREPARING;
+        kernel_task_exec_abort(thread,transaction);
         exec_status = kernel_exec_transaction_cleanup(transaction);
         if (exec_status != KERNEL_EXEC_STATUS_OK) {
             return exec_status == KERNEL_EXEC_STATUS_CLEANUP_REQUIRED
                        ? KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP
                        : KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
+        {
+            KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+            thread->exec_transaction=0;
+        }
         kernel_heap_release(heap, transaction);
-        thread->exec_transaction = 0;
     }
     if (thread->files.state == KERNEL_FILES_LIVE ||
         thread->files.state == KERNEL_FILES_CLEANUP) {
@@ -2349,7 +2434,7 @@ static enum kernel_scheduler_status reparent_children(struct kernel_task *parent
             child_creator_change_locked(child, replacement);
             if (new_parent) child_append_locked(new_parent, child);
             child->exit_signal = 17U;
-            zombie = child->state == KERNEL_THREAD_STATE_ZOMBIE;
+            zombie = child->state == KERNEL_THREAD_STATE_ZOMBIE && !kernel_ptrace_tracer_tid_locked(child);
             if (zombie && !new_parent) {
                 child->state = KERNEL_THREAD_STATE_EXITED;
                 child->publish_completion = 0;
@@ -2417,6 +2502,7 @@ static void kernel_thread_finish(
         switch_to_fatal_idle(status);
     }
 
+    if (current->arch.user_mode) ptrace_begin_exit(current,user_wait_status(completion));
     process_begin_exit(current, completion);
     /* Undo is visible before publishing exit or waking a child-TID joiner. */
     if (current->arch.user_mode) kernel_sem_exit(current);
@@ -2624,30 +2710,32 @@ enum kernel_task_status kernel_task_get_rlimit(
     return KERNEL_TASK_STATUS_OK;
 }
 
-enum kernel_task_status kernel_task_set_rlimit(
-    struct kernel_task *task, uint32_t resource,
-    const struct kernel_rlimit64 *limit)
+int kernel_task_prlimit(struct kernel_task *task,uint32_t resource,
+    const struct kernel_rlimit64 *replacement,struct kernel_rlimit64 *before,int can_raise)
 {
     kernel_pid_t tgid;
-
-    if (limit == 0 || limit->current > limit->maximum ||
-        (resource == KERNEL_RLIMIT_NOFILE &&
-         limit->maximum > KERNEL_RLIMIT_NOFILE_CAP) ||
-        resource >= KERNEL_RLIMIT_COUNT)
-        return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
     {
-        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        if (task_tgid_locked(task, &tgid) != KERNEL_TASK_STATUS_OK)
-            return KERNEL_TASK_STATUS_STATE;
-        struct kernel_rlimit64 *slot = task_limit_slot(task->group_leader, resource);
-        if(!slot)__builtin_trap();
-        __atomic_store_n(&slot->current, limit->current, __ATOMIC_RELAXED);
-        __atomic_store_n(&slot->maximum, limit->maximum, __ATOMIC_RELAXED);
-        if(resource==KERNEL_RLIMIT_CPU)
-            scheduler_cpu_timer_update_locked(task->group_leader,0);
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        if(task_tgid_locked(task,&tgid)!=KERNEL_TASK_STATUS_OK)return -KERNEL_ESRCH;
+        struct kernel_task *caller=kernel_task_current();
+        const struct kernel_credentials *from=kernel_credentials_task_locked(caller),
+            *to=kernel_credentials_task_locked(task);
+        if(caller!=task && !kernel_credentials_capable(from,KERNEL_CAP_SYS_RESOURCE) &&
+           !(from->uid==to->uid && from->uid==to->euid && from->uid==to->suid &&
+             from->gid==to->gid && from->gid==to->egid && from->gid==to->sgid))return -KERNEL_EPERM;
+        struct kernel_rlimit64 *slot=task_limit_slot(task->group_leader,resource);
+        if(!slot || (replacement&&replacement->current>replacement->maximum))return -KERNEL_EINVAL;
+        if(replacement && ((resource==KERNEL_RLIMIT_NOFILE&&replacement->maximum>KERNEL_RLIMIT_NOFILE_CAP) ||
+           (replacement->maximum>slot->maximum&&!can_raise)))return -KERNEL_EPERM;
+        if(before)*before=*slot;
+        if(replacement) {
+            __atomic_store_n(&slot->current,replacement->current,__ATOMIC_RELAXED);
+            __atomic_store_n(&slot->maximum,replacement->maximum,__ATOMIC_RELAXED);
+            if(resource==KERNEL_RLIMIT_CPU)scheduler_cpu_timer_update_locked(task->group_leader,0);
+        }
     }
-    if(resource==KERNEL_RLIMIT_CPU)kernel_posix_timer_changed();
-    return KERNEL_TASK_STATUS_OK;
+    if(replacement&&resource==KERNEL_RLIMIT_CPU)kernel_posix_timer_changed();
+    return 0;
 }
 
 uint64_t kernel_task_current_fsize_limit(void)

@@ -17,6 +17,7 @@
 #include <kernel/tty_task.h>
 #include <kernel/vfs.h>
 #include <kernel/namespace.h>
+#include "ptrace_internal.h"
 #include <string.h>
 
 int kernel_credentials_may_access_locked(const struct kernel_task *caller,const struct kernel_task *target,int fscreds)
@@ -238,6 +239,7 @@ static int proc_task_snapshot(struct kernel_task *task, uint64_t identity,
         .process_group = process_identity_number(leader, KERNEL_PID_PGID),
         .session_id = process_identity_number(leader, KERNEL_PID_SID),
         .identity = identity,
+        .tracer_pid=kernel_ptrace_tracer_tid_locked(task),
         .start_ticks = task->proc_start_ticks,
         .state = task->proc_exiting ||
                  task->state == KERNEL_THREAD_STATE_EXITED ||
@@ -245,7 +247,8 @@ static int proc_task_snapshot(struct kernel_task *task, uint64_t identity,
                  task->state == KERNEL_THREAD_STATE_ZOMBIE ? 'Z' :
                  task->state == KERNEL_THREAD_STATE_RUNNING ||
                  task->state == KERNEL_THREAD_STATE_READY ? 'R' :
-                 task->state == KERNEL_THREAD_STATE_STOPPED ? 'T' : 'S',
+                 task->state == KERNEL_THREAD_STATE_STOPPED ? 'T' :
+                 task->ptrace && (task->ptrace->phase==TRACE_STOPPED || task->ptrace->phase==TRACE_LISTENING) ? 't' : 'S',
         .child_minor_faults = leader->child_usage.minor_faults,
         .child_major_faults = leader->child_usage.major_faults,
         .signal_pending = task->signal_pending,
@@ -336,6 +339,22 @@ static int proc_resource_matches_locked(struct kernel_task *task, kernel_pid_t p
     return task->accounted && !task->retirement && !task->proc_exiting &&
         process_find_identity(pid, role) == task && id &&
         id->generation == (target & ~KERNEL_PROC_THREAD_TARGET);
+}
+
+int kernel_task_remote_mm_acquire(int32_t tid,struct kernel_mm *owner)
+{
+    if(!owner || owner->state!=KERNEL_MM_EMPTY || owner->record)__builtin_trap();
+    if(tid<=0)return -KERNEL_ESRCH;
+    SCHEDULER_TASK_BORROW(task,scheduler_task_lookup(tid,KERNEL_PID_TID,0));
+    if(!task)return -KERNEL_ESRCH;
+    KERNEL_RAW_SCOPE(resources,&task->files_access);
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    struct kernel_pid *id=process_identity(task,KERNEL_PID_TID);
+    if(!id || !proc_resource_matches_locked(task,tid,id->generation|KERNEL_PROC_THREAD_TARGET) ||
+       task->mm.state!=KERNEL_MM_LIVE)return -KERNEL_ESRCH;
+    if(!kernel_credentials_may_access_locked(kernel_task_current(),task,0))return -KERNEL_EPERM;
+    if(kernel_mm_acquire(owner,&task->mm))__builtin_trap();
+    return 0;
 }
 
 int kernel_proc_maps_snapshot(kernel_pid_t pid, uint64_t identity,

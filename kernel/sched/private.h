@@ -222,6 +222,7 @@ static inline __attribute__((always_inline)) int scheduler_finish_local_locked(s
 {
     struct kernel_task *previous=cpu->switch_previous;
     if (!previous || previous==cpu->current || !cpu->current->wait.on_cpu) __builtin_trap();
+    if (__atomic_load_n(&previous->ptrace,__ATOMIC_ACQUIRE)) return 0;
     unsigned state=__atomic_load_n(&previous->state,__ATOMIC_RELAXED);
     if (!previous->idle && (!scheduler_local_task(previous,cpu) ||
         (state!=KERNEL_THREAD_STATE_READY && state!=KERNEL_THREAD_STATE_BLOCKED))) return 0;

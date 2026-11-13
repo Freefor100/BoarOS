@@ -117,6 +117,12 @@ enum kernel_mm_status kernel_mm_pin_user_pair(const struct kernel_mm *,
     struct kernel_mm_user_pin pins[2], unsigned *count);
 void kernel_mm_unpin_user_pair(struct kernel_mm_user_pin pins[2]);
 
+/* Caller retains an independently acquired MM owner through faults and copy.
+ * force is debugger access through VM_MAY*: readonly private stores resolve
+ * COW without changing VMA/PTE permissions. Errors retain the true prefix. */
+int kernel_mm_remote_transfer(struct kernel_mm *, uint64_t address, void *buffer,
+    size_t length, int writing, int force, size_t *copied);
+
 /* Source owner and handle remain stable through this non-sleeping acquire.
  * Success creates another independently owned reference to the same MM. */
 enum kernel_mm_status kernel_mm_acquire(
@@ -317,6 +323,10 @@ enum kernel_mm_status kernel_mm_mprotect(
     uint64_t address,
     uint64_t length,
     uint32_t permissions);
+
+/* READ_IMPLIES_EXEC adds execute only to VMAs which permit it. */
+enum kernel_mm_status kernel_mm_mprotect_personality(struct kernel_mm *,
+    uint64_t address, uint64_t length, uint32_t permissions, int read_implies_exec);
 
 /* Linux msync flags; returns zero or a negative Linux errno. */
 int kernel_mm_msync(struct kernel_mm *mm, uint64_t address,
