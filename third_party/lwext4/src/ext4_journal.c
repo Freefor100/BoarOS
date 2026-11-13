@@ -935,8 +935,10 @@ jbd_extract_block_tag(struct jbd_fs *jbd_fs,
 	if (flags & ~(JBD_FLAG_ESCAPE | JBD_FLAG_SAME_UUID |
 		      JBD_FLAG_DELETED | JBD_FLAG_LAST_TAG))
 		return EUCLEAN;
-	if (tag_info->block >= jbd_fs->bdev->lg_bcnt ||
-	    (tag_info->uuid_exist && memcmp(tag_info->uuid, jbd_fs->sb.uuid, UUID_SIZE)))
+	/* The optional descriptor UUID is opaque to Linux recovery. In
+	 * particular, Linux can write an all-zero j_uuid while the journal
+	 * superblock UUID supplies the checksum seed. They need not match. */
+	if (tag_info->block >= jbd_fs->bdev->lg_bcnt)
 		return EUCLEAN;
 	return EOK;
 }

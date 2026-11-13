@@ -18,6 +18,31 @@ mkfs.ext4 -q -F -b 1024 "$work/base.img"
 printf 'Old data' > "$work/data"
 debugfs -w -R "write $work/data /probe" "$work/base.img" >/dev/null 2>&1
 for block in 1024 4096; do
+    truncate -s "$((block * 32768))" "$work/uuid-base.img"
+    mkfs.ext4 -q -F -b "$block" "$work/uuid-base.img"
+    debugfs -w -R "write $work/data /probe" "$work/uuid-base.img" >/dev/null 2>&1
+    for format in checksum3 checksum3-wide; do
+        for uuid in descriptor-uuid-zero descriptor-uuid-other; do
+            cp "$work/uuid-base.img" "$work/uuid.img"
+            timeout 30 "$work/probe" "$work/uuid.img" "$format"
+            timeout 30 "$work/probe" "$work/uuid.img" mutate "$uuid"
+            timeout 30 "$work/probe" "$work/uuid.img" recover-crash 78
+            e2fsck -fn "$work/uuid.img" > "$work/uuid-fsck.log" 2>&1 || { cat "$work/uuid-fsck.log"; exit 1; }
+        done
+        for damage in descriptor-csum data-csum descriptor-target descriptor-no-last; do
+            cp "$work/uuid-base.img" "$work/uuid.img"
+            timeout 30 "$work/probe" "$work/uuid.img" "$format"
+            timeout 30 "$work/probe" "$work/uuid.img" mutate descriptor-uuid-zero
+            timeout 30 "$work/probe" "$work/uuid.img" mutate "$damage"
+            expected=5
+            case "$damage" in descriptor-target|descriptor-no-last) expected=117;; esac
+            timeout 30 "$work/probe" "$work/uuid.img" recover-corrupt "$expected"
+        done
+    done
+done
+printf '%s\n' 'PASS: descriptor UUID is opaque; bounds and checksums remain enforced'
+if [ "${JOURNAL_TEST_CASE:-}" = recovery-uuid ]; then exit 0; fi
+for block in 1024 4096; do
     truncate -s 32M "$work/group-base.img"
     mkfs.ext4 -q -F -b "$block" "$work/group-base.img"
     debugfs -w -R "write $work/data /probe" "$work/group-base.img" >/dev/null 2>&1
