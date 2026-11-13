@@ -2,6 +2,7 @@
 #include <kernel/scheduler.h>
 #include "private.h"
 #include <kernel/namespace.h>
+#include <kernel/reboot.h>
 
 #include <kernel/errno.h>
 #include <kernel/exec.h>
@@ -295,6 +296,34 @@ void syscall_decode_clone(const struct kernel_syscall_request *request,
      * ignores the remaining arguments; musl's fork passes only two. */
     decoded->action = KERNEL_SYSCALL_ACTION_CLONE;
     decoded->value = 0;
+}
+
+enum kernel_syscall_status syscall_handle_reboot(struct kernel_task *caller,
+    const struct kernel_syscall_request *request,struct kernel_syscall_result *decoded)
+{
+    decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value=-KERNEL_EPERM;
+    if(!kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_BOOT))
+        return KERNEL_SYSCALL_STATUS_OK;
+    enum kernel_reboot_action action;
+    int error=kernel_reboot_decode((uint32_t)request->arguments[0],(uint32_t)request->arguments[1],
+        (uint32_t)request->arguments[2],&action);
+    if(error){decoded->value=error;return KERNEL_SYSCALL_STATUS_OK;}
+    char command[KERNEL_REBOOT_COMMAND_SIZE]={0};
+    if((uint32_t)request->arguments[2]==KERNEL_REBOOT_CMD_RESTART2) {
+        struct kernel_mm *mm;size_t length=0;
+        if(kernel_task_mm_borrow_mutable(caller,&mm))return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        enum kernel_uaccess_status copied=kernel_copy_string_from_user(mm,command,request->arguments[3],
+            sizeof(command)-1,&length);
+        if(copied==KERNEL_UACCESS_STATUS_FAULT){decoded->value=-KERNEL_EFAULT;return KERNEL_SYSCALL_STATUS_OK;}
+        if(copied!=KERNEL_UACCESS_STATUS_OK && copied!=KERNEL_UACCESS_STATUS_TOO_LONG)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        command[sizeof(command)-1]=0;
+    }
+    KERNEL_SERVICE_SCOPE(service);
+    decoded->value=kernel_reboot_request(action,command);
+    if(!decoded->value)decoded->action=KERNEL_SYSCALL_ACTION_EXIT_GROUP;
+    return KERNEL_SYSCALL_STATUS_OK;
 }
 
 enum kernel_syscall_status syscall_handle_unshare(struct kernel_task *caller,

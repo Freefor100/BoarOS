@@ -43,10 +43,21 @@ void la_virt_hex(uint64_t value)
     for (unsigned i = 0; i < 16; i++) text[17-i] = "0123456789abcdef"[(value >> (i*4)) & 15];
     la_virt_puts(text);
 }
+void la_virt_halt(void)
+{
+    (void)arch_interrupt_save();
+    for (;;) __asm__ volatile("idle 0");
+}
 void la_virt_shutdown(void)
 {
     *(volatile unsigned char *)(LA_UNCACHED_BASE + 0x100e001c) = 0x34;
-    for (;;) __asm__ volatile("idle 0");
+    la_virt_halt();
+}
+void la_virt_restart(void)
+{
+    /* ACPI GED regs + RESET, as defined by the fixed QEMU virt platform. */
+    *(volatile unsigned char *)(LA_UNCACHED_BASE + 0x100e001e) = 0x42;
+    la_virt_halt();
 }
 void la_virt_fatal(const char *message)
 { kernel_console_emergency_begin(); la_virt_puts("BoarOS: fatal LA "); la_virt_puts(message); la_virt_puts("\n"); la_virt_shutdown(); }

@@ -65,6 +65,7 @@ struct kernel_stack_statistics {
 };
 void kernel_scheduler_stack_statistics(struct kernel_stack_statistics *statistics);
 /* One registered kernel task owns potentially sleeping exit cleanup. */
+void kernel_scheduler_notify_cleanup(void);
 void kernel_scheduler_register_cleanup(void);
 void kernel_scheduler_wait_cleanup(uint64_t retry_deadline);
 int kernel_scheduler_can_sleep(void);

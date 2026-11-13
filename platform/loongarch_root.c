@@ -1,4 +1,6 @@
 #include <kernel/bpf.h>
+#include <kernel/reboot.h>
+#include <kernel/console.h>
 #include <arch/loongarch/smp.h>
 #include "init-config.h"
 #include <platform/loongarch_virt.h>
@@ -82,6 +84,16 @@ static int start_network(struct physical_page_allocator *allocator,struct pci_ho
         root.net.device.configured ? &root.net.device : 0,la_timer_frequency());
 }
 
+static void park_failed_reboot(const char *stage,int error) __attribute__((noreturn));
+static void park_failed_reboot(const char *stage,int error)
+{
+    kernel_console_emergency_begin();
+    la_virt_puts("BoarOS: reboot failed stage=");la_virt_puts(stage);
+    la_virt_puts(" error=");la_virt_hex((uint64_t)(int64_t)error);
+    la_virt_puts("; remaining owners retained; parked\n");
+    la_virt_halt();
+}
+
 /* 文件、映像和 mount 仍是 I/O owner 时保留原字段，下一次只重试未完成项。 */
 static int release_root(void)
 {
@@ -159,6 +171,8 @@ static int release_root(void)
         la_virt_puts("LA root baseline available=");la_virt_hex(available);
         la_virt_puts(" expected=");la_virt_hex(root.baseline);la_virt_puts(" heap-live=");la_virt_hex(stats.live_allocations);
         la_virt_puts(" heap-pages=");la_virt_hex(stats.current_pages);la_virt_puts("\n");
+        if(kernel_reboot_action_requested()!=KERNEL_REBOOT_NONE)
+            park_failed_reboot("ownership-baseline",-KERNEL_EIO);
         la_virt_fatal("root ownership baseline");
     }
     la_virt_puts("LA root owners released; pages=");la_virt_hex(available);la_virt_puts(" heap-live=0\n");
@@ -168,6 +182,7 @@ static int start_root(void);
 static void cleanup_worker(void *unused)
 {
     (void)unused; (void)arch_interrupt_save(); kernel_scheduler_register_cleanup();
+    kernel_reboot_enable();
     int boot_error=start_root();
     if(boot_error) {
         la_virt_puts("LA root boot errno=");la_virt_hex((uint64_t)(int64_t)boot_error);la_virt_puts("\n");
@@ -194,15 +209,26 @@ static void cleanup_worker(void *unused)
                completion.kind==KERNEL_THREAD_KIND_USER && completion.tid==1 && completion.tgid==1) { init=completion; reaped=1; }
         } while(status==KERNEL_SCHEDULER_STATUS_OK ||
                 (status==KERNEL_SCHEDULER_STATUS_EMPTY && kernel_scheduler_reap_pending()));
-        int pending=reaped && kernel_scheduler_stop_users();
+        enum kernel_reboot_action action=kernel_reboot_action_requested();
+        int stopping=reaped || action!=KERNEL_REBOOT_NONE;
+        int pending=stopping && kernel_scheduler_stop_users();
         arch_interrupt_restore(irq);
-        if(reaped && !pending) {
+        if(stopping && !pending) {
             int error=release_root();
             if(!error) {
 #if BOAROS_MAX_CPUS > 1
                 /* Unmount drains and joins the journal workers first. */
                 la_smp_stop();
 #endif
+                if(action!=KERNEL_REBOOT_NONE) {
+                    la_virt_puts("BoarOS: root owners released; reboot action=");
+                    la_virt_puts(action==KERNEL_REBOOT_RESTART ? "restart" :
+                        action==KERNEL_REBOOT_HALT ? "halt" : "poweroff");
+                    la_virt_puts(" command=");la_virt_puts(kernel_reboot_command());la_virt_puts("\n");
+                    if(action==KERNEL_REBOOT_RESTART)la_virt_restart();
+                    if(action==KERNEL_REBOOT_HALT) {la_virt_puts("BoarOS: halted\n");la_virt_halt();}
+                    la_virt_shutdown();
+                }
                 la_virt_puts("LA PID 1 exited reason=");la_virt_hex(init.reason);
                 la_virt_puts(" status=");la_virt_hex(init.status);la_virt_puts("\n");
 #if BOAROS_MAX_CPUS > 1
@@ -217,13 +243,17 @@ static void cleanup_worker(void *unused)
                 la_virt_puts(" cache=");la_virt_hex(root.cache.record!=0);
                 la_virt_puts(" devices=");la_virt_hex(root.count);
                 la_virt_puts(" claims=");la_virt_hex(pci_host_claimed(la_virt_pci_host()));la_virt_puts("\n");
+                if(action!=KERNEL_REBOOT_NONE)park_failed_reboot("root-cleanup",error);
                 la_virt_shutdown();
             }
             irq=arch_interrupt_save();kernel_scheduler_wait_cleanup(arch_time_read()+la_timer_frequency()/100);arch_interrupt_restore(irq);
             continue;
         }
         if(status!=KERNEL_SCHEDULER_STATUS_EMPTY && status!=KERNEL_SCHEDULER_STATUS_BUSY &&
-           status!=KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP) la_virt_fatal("root reaper");
+           status!=KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP) {
+            if(action!=KERNEL_REBOOT_NONE)park_failed_reboot("root-reaper",(int)status);
+            la_virt_fatal("root reaper");
+        }
         irq=arch_interrupt_save();kernel_scheduler_wait_cleanup(status==KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP ?
             arch_time_read()+la_timer_frequency()/100 : 0);arch_interrupt_restore(irq);
     }

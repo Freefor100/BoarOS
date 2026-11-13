@@ -17,7 +17,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 
 调用者是 scheduler 当前不透明 task，供依赖任务身份或资源的系统调用取得明确上下文；通用解码层不从 RISC-V `tp` 隐式寻找 current。请求包含系统调用号和六个 64 位参数。结果动作定义在公共头中：
 
-当前分派覆盖RV的250个编号、LA的249个编号；这表示入口已接入，各接口的具体支持范围见对应模块。
+当前分派覆盖RV的251个编号、LA的250个编号；这表示入口已接入，各接口的具体支持范围见对应模块。
 `vhangup(58)` 提供有权限的控制终端挂断，旧实例失效而设备保持可重新打开；具体行为见[终端模块](kernel-tty.md)。`fcntl` 的异步 owner、所选信号和 `O_ASYNC` 见[文件接口](kernel-files.md)及[信号模块](kernel-signal.md#sigio-异步-io-通知)。
 
 

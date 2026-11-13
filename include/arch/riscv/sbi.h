@@ -18,5 +18,7 @@ long sbi_send_ipi(uint64_t hart);
 long sbi_remote_sfence(uint64_t hart, uint64_t address, uint64_t size);
 long sbi_remote_fence_i(uint64_t hart);
 void sbi_shutdown(void) __attribute__((noreturn));
+void sbi_cold_reboot(void) __attribute__((noreturn));
+void sbi_halt(void) __attribute__((noreturn));
 
 #endif

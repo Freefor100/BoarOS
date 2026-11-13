@@ -15,6 +15,7 @@
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
 #include <kernel/random.h>
+#include <kernel/reboot.h>
 #include <kernel/scheduler.h>
 #include <kernel/socket.h>
 #include <kernel/tick.h>
@@ -673,14 +674,27 @@ static int __attribute__((noinline)) boot_storage_present(const struct dtb_boot_
     return 0;
 }
 
+static void park_failed_reboot(const char *stage, unsigned long status)
+    __attribute__((noreturn));
+
+static void park_failed_reboot(const char *stage, unsigned long status)
+{
+    virt_uart_emergency_begin();
+    virt_uart_puts("BoarOS: reboot failed stage=");virt_uart_puts(stage);
+    virt_uart_puts(" status=");virt_uart_put_hex(status);
+    virt_uart_puts("; remaining owners retained; parked\n");
+    sbi_halt();
+}
+
 static void storage_cleanup_worker(void *argument)
 {
     (void)argument;
     (void)arch_interrupt_save();
     kernel_scheduler_register_cleanup();
+    kernel_reboot_enable();
     enum kernel_scheduler_status scheduler_status;
     enum riscv_root_boot_status root_status;
-    struct kernel_thread_completion init_completion;
+    struct kernel_thread_completion init_completion={0};
     int init_reaped = 0;
     for (;;) {
         uintptr_t interrupt_status = arch_interrupt_save();
@@ -698,10 +712,12 @@ static void storage_cleanup_worker(void *argument)
         } while (scheduler_status == KERNEL_SCHEDULER_STATUS_OK ||
                  (scheduler_status == KERNEL_SCHEDULER_STATUS_EMPTY &&
                  kernel_scheduler_reap_pending()));
-        /* PID 1死亡后先结束用户owner，不能带着daemon的cwd/MM去卸载根盘。 */
-        int users_pending = init_reaped && kernel_scheduler_stop_users();
+        enum kernel_reboot_action action=kernel_reboot_action_requested();
+        int stopping=init_reaped || action!=KERNEL_REBOOT_NONE;
+        /* Explicit requests also stop PID 1 before releasing device/FS owners. */
+        int users_pending = stopping && kernel_scheduler_stop_users();
         arch_interrupt_restore(interrupt_status);
-        if (init_reaped && !users_pending) {
+        if (stopping && !users_pending) {
 #if BOAROS_USER_SMP_COMPOSITION
             riscv_user_composition_finish();
 #endif
@@ -714,11 +730,10 @@ static void storage_cleanup_worker(void *argument)
             uint64_t available_pages;
 
             root_status = riscv_root_boot_finish(&root_boot,
-                                                  &init_completion,
                                                   &heap_statistics,
                                                   &available_pages);
             if (root_status != RISCV_ROOT_BOOT_STATUS_OK) {
-                /* 即将关机，先切同步输出，避免失败owner还在UART队列中。 */
+                /* Cleanup may retain the UART owner; failure output must be synchronous. */
                 virt_uart_emergency_begin();
                 if (root_status == RISCV_ROOT_BOOT_STATUS_CLEANUP) {
                     virt_uart_puts("BoarOS: root finish failure stage=");
@@ -740,6 +755,8 @@ static void storage_cleanup_worker(void *argument)
                     }
                     virt_uart_putc('\n');
                 }
+                if(action!=KERNEL_REBOOT_NONE)
+                    park_failed_reboot("root-finish",(unsigned long)root_status);
                 shutdown_for_root_boot_error(root_status);
             }
 #if BOAROS_MAX_CPUS > 1
@@ -762,6 +779,20 @@ static void storage_cleanup_worker(void *argument)
             virt_uart_puts(" max-used=");
             virt_uart_put_hex((unsigned long)stack_statistics.maximum_used_bytes);
             virt_uart_putc('\n');
+            if (action!=KERNEL_REBOOT_NONE) {
+                virt_uart_puts("BoarOS: root owners released; reboot action=");
+                virt_uart_puts(action==KERNEL_REBOOT_RESTART ? "restart" :
+                    action==KERNEL_REBOOT_HALT ? "halt" : "poweroff");
+                virt_uart_puts(" command=");virt_uart_puts(kernel_reboot_command());
+                virt_uart_puts("\n");
+                if (action==KERNEL_REBOOT_RESTART) sbi_cold_reboot();
+                if (action==KERNEL_REBOOT_HALT) {
+                    virt_uart_puts("BoarOS: halted\n");
+                    sbi_halt();
+                }
+                sbi_shutdown();
+            }
+            if(!init_reaped)__builtin_trap();
             virt_uart_puts("BoarOS: PID 1 exited status=");
             virt_uart_put_hex((unsigned long)init_completion.status);
             virt_uart_puts(" pages=");
@@ -775,6 +806,8 @@ static void storage_cleanup_worker(void *argument)
         if (scheduler_status != KERNEL_SCHEDULER_STATUS_EMPTY &&
             scheduler_status != KERNEL_SCHEDULER_STATUS_BUSY &&
             scheduler_status != KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP) {
+            if(action!=KERNEL_REBOOT_NONE)
+                park_failed_reboot("root-reaper",(unsigned long)scheduler_status);
             shutdown_for_scheduler_error(scheduler_status);
         }
         int cleanup_retry =

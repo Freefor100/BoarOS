@@ -572,16 +572,13 @@ fail:
 
 enum riscv_root_boot_status riscv_root_boot_finish(
     struct riscv_root_boot *root,
-    const struct kernel_thread_completion *completion,
     struct kernel_heap_statistics *heap_statistics,
     uint64_t *available_pages)
 {
     int error;
 
-    if (root == 0 || completion == 0 || heap_statistics == 0 ||
-        available_pages == 0 || root->state != RISCV_ROOT_BOOT_LIVE ||
-        completion->kind != KERNEL_THREAD_KIND_USER ||
-        completion->tid != 1 || completion->tgid != 1) {
+    if (root == 0 || heap_statistics == 0 ||
+        available_pages == 0 || root->state != RISCV_ROOT_BOOT_LIVE) {
         return RISCV_ROOT_BOOT_STATUS_INVALID;
     }
     root->finish_failure = RISCV_ROOT_FINISH_NONE;

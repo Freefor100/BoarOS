@@ -476,6 +476,8 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
     } else if (request->number == LINUX_SYSCALL_MEMFD_CREATE) {
         if (syscall_handle_memfd_create(caller,request,&decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 142U) {
+        if(syscall_handle_reboot(caller,request,&decoded))return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_VHANGUP) {
         decoded.action=KERNEL_SYSCALL_ACTION_RETURN;
         decoded.value=kernel_tty_vhangup(caller);

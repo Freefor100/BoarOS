@@ -1,5 +1,6 @@
 #include "../../fs/files/private.h"
 #include "../../fs/open_file_internal.h"
+#include <kernel/reboot.h>
 #include <kernel/namespace.h>
 #include <kernel/ipc_namespace.h>
 #include <kernel/uts.h>
@@ -1066,7 +1067,7 @@ enum kernel_scheduler_status arch_process_clone_current(
         if(pidfd.files) kernel_raw_lock_acquire(kernel_pidfd_clone_files_lock(&pidfd),&files_guard);
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         struct kernel_task *leader = parent->group_leader;
-        rejected = parent->retirement || parent->terminate_requested ||
+        rejected = kernel_reboot_requested_locked() || parent->retirement || parent->terminate_requested ||
                    leader->group_exiting || leader->group_execing;
         if (!rejected) {
             if(pidfd.files) kernel_pidfd_install_clone_locked(&pidfd);
@@ -1624,11 +1625,14 @@ void kernel_scheduler_register_cleanup(void)
     if (scheduler.cleanup_task) __builtin_trap();
     scheduler.cleanup_task = kernel_cpu_current()->current;
 }
+void kernel_scheduler_notify_cleanup(void)
+{ (void)kernel_wait_queue_wake_all(&scheduler.cleanup_queue); }
 static int cleanup_waiting(uint64_t retry_deadline)
 {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     return retry_deadline ||
-        (!scheduler.shutdown_progress && !scheduler_cleanup_ready_locked());
+        ((!kernel_reboot_requested_locked() || scheduler.shutdown_waiting) &&
+         !scheduler.shutdown_progress && !scheduler_cleanup_ready_locked());
 }
 
 void kernel_scheduler_wait_cleanup(uint64_t retry_deadline)

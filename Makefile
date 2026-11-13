@@ -409,6 +409,7 @@ COMMON_C_SOURCES := \
 	kernel/uts.c \
 	kernel/namespace.c \
 	kernel/ipc_namespace.c \
+	kernel/reboot.c \
 	kernel/cost.c \
 	kernel/sched/cost.c \
 	net/socket.c \

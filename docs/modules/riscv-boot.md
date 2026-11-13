@@ -19,7 +19,7 @@
 | `kernel/main.c` | 建立启动内存布局、物理页分配器和启动地址空间，协调 root、PLIC、timer 与可调度 cleanup task |
 | `arch/riscv/root_boot.c` | 从 DTB 发现的根块设备挂载 ext4、装载 `/init` 并收口 PID 1 生命周期 |
 | `arch/riscv/virt_uart.c` | QEMU `virt` NS16550A 轮询输出，以及最终页表生效后的高半区 MMIO 基址切换 |
-| `arch/riscv/sbi.c` | 通过 SBI Base/TIME/SRST 探测扩展、设置 timer 和请求关机 |
+| `arch/riscv/sbi.c` | 通过 SBI Base/TIME/SRST 探测扩展、设置 timer、请求关机或冷重启 |
 
 ## 入口契约与不变量
 
@@ -34,7 +34,7 @@
 - 过渡页表页属于内核静态镜像，不进入正式物理页分配器；正常启动日志中的最终页表数必须等于正式物理页总数与可用页数之差。
 - 最终页表和 direct-map 访问路径验证完成前保持中断关闭。Scheduler 发布后先尝试从 VirtIO MMIO legacy 或 modern virtio-blk/ext4 建立 PID 1，再从 DTB timebase 启动 SBI timer，先设置未来 deadline 后开启 STIE 和 SIE。无根设备时成功路径永久执行 `wfi`；有根设备时 PID 1 被完整 reaper 后卸载根并通过 SBI 关机。
 - UART 物理基址 `0x10000000` 是 QEMU `virt` 的 guest MMIO 地址，不是 RAM 或宿主 I/O 端口。过渡表按该低地址访问；最终 `satp` 生效后驱动切到 `0xffffffe000000000` 高半区别名。发送路径轮询 LSR bit 5，再向 THR 写一个字节。
-- 关机使用 SBI System Reset 扩展：`a7=0x53525354`、`a6=0`、`a0=0`、`a1=0` 后执行 `ecall`。调用若返回则输出失败信息并停在 `wfi`，不会报告假成功。
+- 关机与冷重启使用 SBI System Reset 扩展：`a7=0x53525354`、`a6=0`，`a0` 分别为 shutdown(0) 或 cold reboot(1)，`a1=0`。调用若返回，输出真实 SBI error 并关中断停在 `wfi`。HALT 直接关中断停在 `wfi`，不请求断电。用户请求与全体 owner 回收顺序见[调度与退出](kernel-scheduler.md)。
 
 ## 当前限制
 
