@@ -28,6 +28,7 @@ static struct kernel_open_file_description *controller;
 static struct kernel_mm views[5];
 static uint64_t roots[5], target;
 static unsigned capture, entered[5], resume, fail_heap, fail_page, capture_allocate;
+static _Thread_local unsigned local_tlb_fences;
 enum kernel_heap_status __real_kernel_heap_allocate_zeroed(struct kernel_heap *,size_t,size_t,void **);
 enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t n,size_t size,void **out)
 {
@@ -132,7 +133,11 @@ static void private_case(void)
 static void *access(uint64_t p) { return (void *)(uintptr_t)p; }
 static int address_of(const void *p, uint64_t *out) { *out=(uintptr_t)p; return 1; }
 void mm_test_fence(uint64_t v, int instructions)
-{ (void)v; (void)instructions; assert(!kernel_cpu_current()->raw_locks); __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+{
+    (void)v; assert(!kernel_cpu_current()->raw_locks);
+    if (!instructions) local_tlb_fences++;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
 int __real_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *,uint64_t,
     struct kernel_open_file_page_preparation *);
 int __wrap_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *file,uint64_t index,
@@ -384,6 +389,9 @@ int main(void)
     }
     unsigned char byte=0x73; size_t done;
     assert(!kernel_copy_to_user(&parent,mapped,&byte,1,&done) && done==1);
+    unsigned before_fences=local_tlb_fences;
+    assert(!kernel_mm_resolve_user_fault(&parent,mapped,KERNEL_MM_READ));
+    assert(local_tlb_fences==before_fences+1);
     uint64_t child_root; assert(!kernel_mm_context(&child,&child_root)); mm_test_context=child_root;
     byte=0; assert(!kernel_copy_from_user(&child,&byte,mapped,1,&done) && done==1 && byte==0x73);
     mm_test_context=roots[1];

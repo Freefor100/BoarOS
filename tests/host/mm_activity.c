@@ -33,6 +33,9 @@ static unsigned membership_pause, membership_entered, membership_flush;
 static unsigned membership_joined, membership_leave, membership_left;
 static unsigned membership_sync, membership_sampled, membership_ack, membership_done;
 static uint64_t membership_address;
+static unsigned publication_mode, publication_ready, publication_done, publication_leave;
+static unsigned publication_visible, publication_invalid, publication_syncs;
+static const uint64_t publication_address = UINT64_C(0x20000000);
 #ifdef REMOTE_USER_CASE
 static unsigned copying, cow_fences;
 static uint64_t cow_old;
@@ -93,7 +96,12 @@ void kernel_cpu_flush_notifications(void) {}
 void kernel_cpu_notify(struct kernel_cpu *cpu, unsigned events) { (void)cpu; (void)events; abort(); }
 void mm_test_fence(uint64_t address, int instructions)
 {
-    (void)address;
+    if (publication_mode && kernel_cpu_current()->logical_id == 1 && !instructions &&
+        __atomic_load_n(&publication_invalid, __ATOMIC_ACQUIRE)) {
+        /* The peer may have cached an invalid nonleaf, not just this leaf. */
+        assert(address == UINT64_MAX);
+        __atomic_store_n(&publication_invalid, 0, __ATOMIC_RELEASE);
+    }
     if (!instructions && kernel_cpu_current()->logical_id == 1 &&
         mm_test_context == context && __atomic_exchange_n(&membership_pause, 0, __ATOMIC_ACQ_REL)) {
         /* 活动bit已发布，切root后的本地失效尚未完成。 */
@@ -200,6 +208,65 @@ static void membership_before_publication(uint64_t address)
     assert(!kernel_copy_to_user(&mm, address, &byte, 1, &copied) && copied == 1);
     puts("MM join before PTE withdrawal, leave during held last-target acknowledgement and retired owners verified");
 }
+static void *publication_peer(void *unused)
+{
+    (void)unused; mm_test_attach(1); kernel_cpu_current()->logical_id = 1;
+    assert(!kernel_mm_activate(&mm, kernel_context));
+    for (unsigned i = 0; i < 2; i++) {
+        uint64_t address = publication_address + i * BOAROS_PAGE_SIZE;
+        struct kernel_mm_mapping mapping;
+        assert(kernel_mm_lookup(&mm, address, &mapping) == KERNEL_MM_STATUS_NOT_MAPPED);
+        __atomic_store_n(&publication_invalid, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&publication_ready, i + 1, __ATOMIC_RELEASE);
+        while (__atomic_load_n(&publication_visible, __ATOMIC_ACQUIRE) != i + 1) sched_yield();
+        assert(__atomic_load_n(&publication_invalid, __ATOMIC_ACQUIRE));
+        assert(!kernel_mm_lookup(&mm, address, &mapping) && (mapping.permissions & KERNEL_MM_WRITE));
+        unsigned before = flushes, before_instructions = instruction_sync;
+        assert(!kernel_mm_resolve_user_fault(&mm, address, KERNEL_MM_WRITE));
+        assert(flushes == before + 1 && instruction_sync == before_instructions);
+        assert(!__atomic_load_n(&publication_invalid, __ATOMIC_ACQUIRE));
+        __atomic_store_n(&publication_done, i + 1, __ATOMIC_RELEASE);
+    }
+    await(&publication_leave);
+    assert(!kernel_mm_activate(NULL, kernel_context));
+    return NULL;
+}
+static void new_mapping_publication(void)
+{
+    uint64_t placed;
+    assert(!kernel_mm_mmap_anonymous(&mm, publication_address, 3 * BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED, &placed));
+    assert(!kernel_mm_activate(&mm, kernel_context));
+    publication_mode = 1;
+    pthread_t peer; alarm(10);
+    assert(!pthread_create(&peer, NULL, publication_peer, NULL));
+    for (unsigned i = 0; i < 2; i++) {
+        while (__atomic_load_n(&publication_ready, __ATOMIC_ACQUIRE) != i + 1) sched_yield();
+        assert(!kernel_mm_resolve_user_fault(&mm,
+            publication_address + i * BOAROS_PAGE_SIZE, KERNEL_MM_WRITE));
+        assert(publication_syncs == i + 1);
+        __atomic_store_n(&publication_visible, i + 1, __ATOMIC_RELEASE);
+        while (__atomic_load_n(&publication_done, __ATOMIC_ACQUIRE) != i + 1) sched_yield();
+    }
+    publication_mode = 2;
+    assert(!kernel_mm_mprotect(&mm, publication_address + 2 * BOAROS_PAGE_SIZE,
+        BOAROS_PAGE_SIZE, KERNEL_MM_READ | KERNEL_MM_EXECUTE));
+    unsigned before = publication_syncs, before_instructions = instruction_sync;
+    assert(!kernel_mm_resolve_user_fault(&mm,
+        publication_address + 2 * BOAROS_PAGE_SIZE, KERNEL_MM_EXECUTE));
+    assert(publication_syncs == before + 1);
+    assert(instruction_sync == before_instructions + 1);
+    assert(!kernel_mm_mprotect(&mm, publication_address, BOAROS_PAGE_SIZE, KERNEL_MM_READ));
+    before = publication_syncs;
+    assert(kernel_mm_resolve_user_fault(&mm, publication_address, KERNEL_MM_WRITE) == KERNEL_MM_STATUS_ACCESS);
+    assert(publication_syncs == before);
+    publication_mode = 0;
+    publish(&publication_leave);
+    assert(!pthread_join(peer, NULL)); alarm(0);
+    assert(!kernel_mm_activate(NULL, kernel_context)); mm_test_context = context;
+    assert(!kernel_mm_munmap(&mm, publication_address, 3 * BOAROS_PAGE_SIZE));
+    puts("MM new nonleaf/leaf publication avoids remote invalidation; stale faults flush locally; executable and revoked mappings synchronize both CPUs");
+}
 #if BOAROS_MAX_CPUS == 4
 static unsigned many_mm_entered, many_mm_release, many_mm_sampled, many_mm_sync;
 static uint64_t many_mm_page;
@@ -237,6 +304,18 @@ void riscv_smp_sync_user(uint32_t targets, uint64_t address, uint64_t size, int 
 {
     (void)address; (void)size; (void)instructions;
     assert(!kernel_cpu_current()->raw_locks);
+    if (publication_mode) {
+        assert(kernel_cpu_current()->logical_id == 0);
+        if (publication_mode == 1) {
+            assert(!targets && !instructions);
+            if (!publication_syncs) assert(!address && size == UINT64_MAX);
+            else assert(address == publication_address + BOAROS_PAGE_SIZE && size == BOAROS_PAGE_SIZE);
+        } else assert(targets == 3);
+        publication_syncs++;
+        mm_test_fence(size == BOAROS_PAGE_SIZE ? address : UINT64_MAX, 0);
+        if (instructions) mm_test_fence(0, 1);
+        return;
+    }
     if (membership_sync) {
         /* 最后一个叶被移除也会退休空非叶，实际同步覆盖完整翻译。 */
         assert(targets == 2 && !address && size == UINT64_MAX && !instructions);
@@ -533,6 +612,7 @@ int main(void)
         KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED, &address));
     assert(!kernel_copy_to_user(&mm, address, &byte, 1, &copied));
     assert(!kernel_mm_check_task_domain(&mm));
+    new_mapping_publication();
     same_mm_reentry(address);
     membership_before_publication(address);
 #if BOAROS_MAX_CPUS == 4

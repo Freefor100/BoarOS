@@ -1995,6 +1995,24 @@ static uint32_t note_tlb_change_locked(struct kernel_mm_record *record,
     }
     return mm_sync_targets(record);
 }
+static uint32_t note_fault_change_locked(struct kernel_mm_record *record,
+    const struct kernel_mm_retirement *batch, int replacement, int instructions)
+{
+#if BOAROS_MAX_CPUS > 1 && !defined(BOAROS_ARCH_LOONGARCH)
+    if (!replacement && !instructions) {
+        if (batch->count) __builtin_trap();
+        /* A new translation cannot leave a stale permission or physical page.
+         * Invalid walk-cache entries on other harts may fault once; that fault
+         * flushes locally after finding the published PTE. Keep the generation
+         * for joining/re-entering CPUs, without waiting for unrelated harts. */
+        mm_generation_advance(&record->tlb_generation);
+        return 0;
+    }
+#else
+    (void)replacement;
+#endif
+    return note_tlb_change_locked(record, batch, instructions);
+}
 static void finish_tlb_change(struct kernel_mm_record *record,
     struct kernel_mm_retirement *batch, uint32_t targets, uint64_t address,
     uint64_t size, int instructions)
@@ -5439,6 +5457,11 @@ static __attribute__((noinline)) enum kernel_mm_status mapped_file_fault(struct 
             goto finish;
         }
         if (status == KERNEL_MM_STATUS_OK && ((mapping.permissions & access) || (force && access == KERNEL_MM_READ))) {
+            kernel_raw_lock_release(&guard);
+            if (!operation->populate) {
+                arch_mmu_flush_all();
+                if (vma.permissions & KERNEL_MM_EXECUTE) arch_mmu_sync_instructions();
+            }
             goto finish;
         }
         if (status == KERNEL_MM_STATUS_OK) {
@@ -5567,7 +5590,8 @@ prepare_file_tables:
             page->address=address; page->physical_address=replacement;
             page->private=!shared && access==KERNEL_MM_WRITE;
             if (resident) { publish_file_resident(record,resident); resident=0; }
-            targets=note_tlb_change_locked(record, &batch, (vma.permissions & KERNEL_MM_EXECUTE) != 0);
+            targets=note_fault_change_locked(record, &batch, cookie != 0,
+                (vma.permissions & KERNEL_MM_EXECUTE) != 0);
         }
     }
     if (status == KERNEL_MM_STATUS_OK) {
@@ -5777,15 +5801,13 @@ found:
         KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
         status = force ? remote_lookup_record(record,address,&mapping) : lookup_record(record,address,&mapping);
         if (status == KERNEL_MM_STATUS_OK && ((mapping.permissions & access) || (force && access == KERNEL_MM_READ))) {
-#if BOAROS_MAX_CPUS > 1
-            if (operation->shared && !operation->populate && vma.kind == KERNEL_VMA_KIND_ANONYMOUS &&
-                !(vma.permissions & KERNEL_MM_EXECUTE)) {
-                /* 同MM预装者可能尚未确认新叶；真实故障者先清本地walk
-                 * cache即可重试，不替另一owner提前完成远端批次。 */
-                kernel_raw_lock_release(&guard);
+            kernel_raw_lock_release(&guard);
+            if (!operation->populate) {
+                /* Another CPU may have published this leaf or its parents
+                 * after the hardware fault cached an invalid translation. */
                 arch_mmu_flush_all();
+                if (vma.permissions & KERNEL_MM_EXECUTE) arch_mmu_sync_instructions();
             }
-#endif
             return KERNEL_MM_STATUS_OK;
         }
         if (status == KERNEL_MM_STATUS_OK) {
@@ -5955,7 +5977,8 @@ prepare_memory_tables:
                     if (lazy) { lazy_retire(record,lazy);lazy_retired=1; }
                 }
                 replacement = KERNEL_MM_NO_PAGE;
-                targets = note_tlb_change_locked(record, &batch, (vma.permissions & KERNEL_MM_EXECUTE) != 0);
+                targets = note_fault_change_locked(record, &batch, cookie != 0,
+                    (vma.permissions & KERNEL_MM_EXECUTE) != 0);
             }
         }
     }

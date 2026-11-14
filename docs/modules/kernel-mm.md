@@ -266,11 +266,11 @@ VMA 保留后备对象、文件权限上限和源子范围偏移。共享匿名�
 
 `kernel_mm_resolve_user_fault()` 的 `access` 必须恰为 READ、WRITE、EXECUTE 之一。通用层先检查用户范围、VMA、逻辑权限和现有 PTE；地址无 VMA 返回 `NOT_MAPPED`，合法 VMA 的权限不足返回 `ACCESS`。`ELF_PRIVATE/ELF` VMA 按 source 区间二分取得 FILE、COMPOSITE 或 ZERO backing，再按实际缺失的资源准备候选。硬件缺页与 uaccess 使用同一解析器，不为非法软件访问分配页面。
 
-匿名成功路径按架构页大小对齐故障地址，分配并清零一页，以 VMA 权限建立用户 PTE。文件路径按上述缓存/私有策略取得页面。实际提交者根据本次 PTE 变化登记翻译与指令代次：已有表内的单页发布按页同步，非叶结构变化使用全范围同步；可执行内容填充、COW 和执行权限发布还同步取指。RISC-V 对应 `SFENCE.VMA`、必要的远端 RFENCE 与 `FENCE.I`，不能由后端每次改单页时隐含执行。dispatcher 保持 `sepc` 不变，`sret` 后硬件重试原 load/store/fetch。`NOT_MAPPED/ACCESS` 在 Trap 边界形成 `SIGSEGV` 的 MAPERR/ACCERR，文件整页越过 EOF 的 `BUS_FAULT` 形成 `SIGBUS`；uaccess 将这些用户访问错误转换为 `EFAULT`。物理页耗尽精确返回 `NO_MEMORY`，非法页表或分配器状态直接 fatal。
+匿名成功路径按架构页大小对齐故障地址，分配并清零一页，以 VMA 权限建立用户 PTE。文件路径按上述缓存/私有策略取得页面。实际提交者根据本次 PTE 变化登记翻译与指令代次：已有表内的单页发布按页同步，非叶结构变化使用全范围同步；可执行内容填充、COW 和执行权限发布还同步取指。多 CPU RISC-V 的新非执行映射只在提交 CPU 执行 `SFENCE.VMA`，其他 CPU 对旧 invalid walk-cache 的处理见下段；替换、撤权及可执行映射仍确认活动 CPU 的 RFENCE 与必要的 `FENCE.I`。同步由 MM 在 raw 锁外完成，后端不在每次改单页时隐含执行。dispatcher 保持 `sepc` 不变，`sret` 后硬件重试原 load/store/fetch。`NOT_MAPPED/ACCESS` 在 Trap 边界形成 `SIGSEGV` 的 MAPERR/ACCERR，文件整页越过 EOF 的 `BUS_FAULT` 形成 `SIGBUS`；uaccess 将这些用户访问错误转换为 `EFAULT`。物理页耗尽精确返回 `NO_MEMORY`，非法页表或分配器状态直接 fatal。
 
 scheduler 的 U-mode 硬件页故障和当前任务的 uaccess 都可进入该入口。uaccess 在 pin 遇到未驻留或需要写故障处理的页面时解析；成功后重新 pin，VMA 外或权限不符仍按用户访问错误处理。
 
-并发 fault 可以在候选准备期间由另一任务先完成同一地址的映射或权限升级。恢复 gate 后，若 VMA 仍允许且 PTE 已满足请求，resolver 直接成功；实际提交者负责 SFENCE/RFENCE，迟到或 resumed resolver 不重复同步。映射代次、来源、EOF 或权限已经变化时丢弃本次候选并重新判断，不能把过期候选提交给新 VMA。固定资料 [`mm/memory.c`](../../references/linux/mm/memory.c) 的 `fix_spurious_fault()` 用于核对该语义；真实匿名及文件同页竞争见[RV 两核](riscv-smp.md#用户态原程序与压力组合)。
+并发 fault 可以在候选准备期间由另一任务先完成同一地址的映射或权限升级。恢复 gate 后，若 VMA 仍允许且 PTE 已满足请求，匿名、ELF 和文件 resolver 在 raw 锁外全量刷新本地翻译，再成功返回；执行映射另补本地指令同步，不重复发送远端 RFENCE。全量刷新同时覆盖该 CPU 在新非叶发布前缓存的 invalid 父项。多 CPU RISC-V 的新非执行映射没有旧物理页、权限或退休引用可撤销，因此只推进翻译代次并做本地发布；其他 CPU 若仍缓存 invalid 项，会进入上述 spurious-fault 路径。旧映射的撤销和资源归还仍先完成全部目标确认，不把旧 positive 翻译当作 invalid 处理。预装的非执行匿名叶保留既有批量本地同步。固定资料 [`pgtable.h`](../../references/linux/arch/riscv/include/asm/pgtable.h) 的 `update_mmu_cache_range()` 同样使用本地刷新发布新有效 PTE；[`mm/memory.c`](../../references/linux/mm/memory.c) 的 `fix_spurious_fault()` 用于核对并发已满足的 fault 语义。映射代次、来源、EOF 或权限已经变化时丢弃本次候选并重新判断，不能把过期候选提交给新 VMA。真实匿名及文件同页竞争见[RV 两核](riscv-smp.md#用户态原程序与压力组合)。
 
 ## fork 与 COW
 
@@ -365,7 +365,7 @@ PROT_NONE、非当前 MM、尾页、关闭 fd、unlink、O_TRUNC 与重新增长
 
 ## 匿名 MM 的并发与回收
 
-VMA 编辑使用写资格，匿名、COW 与共享内存缺页在多 CPU 构建中使用读资格；栈扩展释放读资格后重新取得写资格并复查，不能原地升级。相同地址的竞争者在 MM raw 下比较 PTE/COW 快照，未发布的候选仍由各自调用者归还。不同地址的翻译同步可以同时进行，每个调用者只归还自己那批已确认失效的退休页。读者先完成自己待确认的新页范围再释放资格；提取退休来源、排空回调和重新开放 pin 许可属于原写操作。普通 SMP 缺页若发现非执行私有匿名 PTE 已满足权限，先执行本地全量 SFENCE，覆盖并行预装尚未确认的新叶，再返回重试；远端确认仍由预装操作持有。UP 不包含共享模式字段、读资格分支或批量确认状态。
+VMA 编辑使用写资格，匿名、COW 与共享内存缺页在多 CPU 构建中使用读资格；栈扩展释放读资格后重新取得写资格并复查，不能原地升级。相同地址的竞争者在 MM raw 下比较 PTE/COW 快照，未发布的候选仍由各自调用者归还。不同地址的翻译同步可以同时进行，每个调用者只归还自己那批已确认失效的退休页。读者先完成自己的新页本地同步范围再释放资格；提取退休来源、排空回调和重新开放 pin 许可属于原写操作。并行预装者尚未完成批量本地同步时，实际 fault 也按[硬件用户缺页解析](#硬件用户缺页解析)刷新本地翻译后重试。UP 不包含共享模式字段、读资格分支或批量确认状态。
 
 自持同一 MM pin 的调用者只尝试取得 operation gate；忙时返回 `CONFLICT`，原 pin、映射和未发布的输出保持。新 pin 许可已关闭也不等待；缺页准备后的重取 gate 使用同一规则，冲突归还候选及 COW 临时引用后返回，不在保留 pin 时自旋重试。调用者归还原 pin 后可重试，无争用的自持 pin 撤映射仍有效。零长度 mprotect 不进入 gate。
 
@@ -379,7 +379,7 @@ futex 的登记与 pin 顺序见[调度模块](kernel-scheduler.md#等待与-fut
 
 文件与 ELF 的来源节点持有实际 OFD/ELF owner；缺页准备期间借用该节点，最后 VMA 消失也不能提前关闭来源。映射登记在 gate 内停止和摘除，gate、inode 与 raw 外排空回调，再释放来源。最终关闭暂时需要 CPU0 或真实 I/O 清理时，同一退休节点继续持有 owner；用户返回准备在 offset、pin 等调用资格已经归还后排空它，不复活已退休来源，也不建立第二组引用。
 
-TLB 代次与退休批次在 MM raw 写资格内维护，代次以 release 发布。多 CPU 构建的活动集合使用原子位图，加入和离开不取得 MM raw。调用者的实际 MM 引用固定根页表，加入者先以顺序一致原子操作发布本 CPU 的 bit，再捕获翻译和指令代次、切根并执行本地全量失效；首次进入还同步指令。发布者完成 PTE/代次写入后先执行全屏障，再原子采样目标集合：采到加入者则等待该目标确认，未采到则由加入者置位后的本地失效覆盖已发布的 PTE。离开者在旧根停止使用并完成本地失效后原子清 bit；已经采样的目标仍须实际确认，清 bit 不提前归还退休页。UP 保留原来的活动集合与 raw 协议。
+TLB 代次与退休批次在 MM raw 写资格内维护，代次以 release 发布。多 CPU 构建的活动集合使用原子位图，加入和离开不取得 MM raw。调用者的实际 MM 引用固定根页表，加入者先以顺序一致原子操作发布本 CPU 的 bit，再捕获翻译和指令代次、切根并执行本地全量失效；首次进入还同步指令。需要远端确认的发布者完成 PTE/代次写入后先执行全屏障，再原子采样目标集合：采到加入者则等待该目标确认，未采到则由加入者置位后的本地失效覆盖已发布的 PTE。新非执行映射不采样目标集合；晚加入者仍先刷新本地翻译，首次进入与本地 invalid-fault 规则覆盖并发发布。离开者在旧根停止使用并完成本地失效后原子清 bit；已经采样的目标仍须实际确认，清 bit 不提前归还退休页。UP 保留原来的活动集合与 raw 协议。
 
 撤映射、降权、COW 和截断先固定退休 owner，raw 外完成本地失效与架构远端确认，之后才将同批数据和表页的引用交给[物理页分配器](physical-pages.md)；固件失败保留实际资源并 fatal。已登记 CPU 再次激活同一 MM 时以 acquire 读取代次，相同代次保留 TLB。CPU 只记录失效前捕获的代次，不把同步期间的新发布记成已经完成。可执行页的填充、COW、执行权限发布及文件尾清零另推进指令代次；首次进入和未观察到该代次的 CPU 执行指令同步，不把普通 PTE 修改一概当作代码变化。
 

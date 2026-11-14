@@ -26,6 +26,7 @@ EXCLUDED(kernel_task_account_fault)
 #endif
 EXCLUDED(kernel_vfs_node_lock)
 EXCLUDED(kernel_vfs_node_try_read)
+EXCLUDED(kernel_vfs_node_attributes)
 EXCLUDED(kernel_open_file_size)
 EXCLUDED(kernel_open_file_memory_backed)
 EXCLUDED(kernel_open_file_get_page_for_fault)
