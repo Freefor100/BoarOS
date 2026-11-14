@@ -2209,7 +2209,7 @@ int ext4_file_relatime_needed(ext4_file *file, bool *needed)
         mp->os_locks->read_lock(mp->os_locks->context);
     else EXT4_MP_LOCK(mp);
     struct ext4_inode_ref ref;
-    int result = ext4_fs_get_inode_ref(&mp->fs, file->inode, &ref);
+    int result = ext4_fs_get_inode_ref_read(&mp->fs, file->inode, &ref);
     if (result == EOK) {
         struct ext4_timestamp atime = ext4_time_load(&ref,
             offsetof(struct ext4_inode, access_time), offsetof(struct ext4_inode, atime_extra));
@@ -2470,7 +2470,7 @@ int ext4_file_capability(ext4_file *file,void *data,size_t capacity,size_t *size
     struct ext4_mountpoint *mp=file->mp;
     EXT4_MP_LOCK(mp);
     struct ext4_inode_ref ref;
-    int result=ext4_fs_get_inode_ref(&mp->fs,file->inode,&ref);
+    int result=ext4_fs_get_inode_ref_read(&mp->fs,file->inode,&ref);
     if (!result) {
         result=ext4_xattr_get(&ref,6,"capability",10,data,capacity,size);
         result=ext4_result(result,ext4_fs_put_inode_ref(&ref));
@@ -5540,7 +5540,7 @@ int ext4_fraw_inode_fill(const ext4_file *file, struct ext4_inode *inode)
 		return EINVAL;
 	mp = file->mp;
 	EXT4_MP_LOCK(mp);
-	r = ext4_fs_get_inode_ref(&mp->fs, file->inode, &inode_ref);
+	r = ext4_fs_get_inode_ref_read(&mp->fs, file->inode, &inode_ref);
 	if (r != EOK) {
 		EXT4_MP_UNLOCK(mp);
 		return r;
@@ -6665,7 +6665,7 @@ int ext4_fopen_inode(ext4_file *file, const char *mount_point,
     if (!mp || !file || inode_number == 0)
         return EINVAL;
     EXT4_MP_LOCK(mp);
-    result = ext4_fs_get_inode_ref(&mp->fs, inode_number, &ref);
+    result = ext4_fs_get_inode_ref_read(&mp->fs, inode_number, &ref);
     if (result == EOK) {
         file->mp = mp;
         file->inode = inode_number;
@@ -6700,7 +6700,7 @@ int ext4_lookup_child(const char *mount_point, uint32_t parent_inode,
         !child_inode || !child_mode)
         return EINVAL;
     EXT4_MP_LOCK(mp);
-    result = ext4_fs_get_inode_ref(&mp->fs, parent_inode, &parent);
+    result = ext4_fs_get_inode_ref_read(&mp->fs, parent_inode, &parent);
     if (result != EOK) goto Unlock;
     if (ext4_inode_type(ext4_fs_super(&mp->fs), parent.inode) !=
         EXT4_INODE_MODE_DIRECTORY) {
@@ -6710,7 +6710,7 @@ int ext4_lookup_child(const char *mount_point, uint32_t parent_inode,
     result = ext4_dir_find_entry(&found, &parent, name, name_length);
     if (result == EOK) {
         uint32_t index = ext4_dir_en_get_inode(found.dentry);
-        result = ext4_fs_get_inode_ref(&mp->fs, index, &child);
+        result = ext4_fs_get_inode_ref_read(&mp->fs, index, &child);
         if (result == EOK) {
             *child_inode = index;
             *child_mode = ext4_inode_get_mode(ext4_fs_super(&mp->fs), child.inode);
@@ -6798,7 +6798,7 @@ int ext4_dir_entry_next_status(ext4_dir *dir,
         return EOK;
     }
 
-    result = ext4_fs_get_inode_ref(&dir->f.mp->fs, dir->f.inode,
+    result = ext4_fs_get_inode_ref_read(&dir->f.mp->fs, dir->f.inode,
                                    &dir_inode);
     if (result != EOK) {
         EXT4_MP_UNLOCK(dir->f.mp);

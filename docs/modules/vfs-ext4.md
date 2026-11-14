@@ -467,6 +467,8 @@ ctime和校验数据，失败执行原有回滚及资源归还。未保留另一
 inline EA在读取magic前检查范围；外部EA读取校验checksum，临时列表记录保持原生对齐。
 
 `kernel_vfs_fstat()` 把当前 open handle 指向的 raw ext4 inode 转换为统一 `kernel_vfs_stat`，不按路径重新查找。普通文件 size 与 atime/mtime/ctime 来自共享 node 的当前值，其余字段来自实际 inode。它读取 inode 的 ino/mode/nlink、Linux low/high uid/gid、64-bit size、以 512 字节为单位的 allocated block count，以及 filesystem block size；atime/mtime/ctime 按磁盘 inode size 与 `extra_isize` 共同判断 extra 字段是否存在，再解码 2-bit epoch 与纳秒。该编码依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `references/linux/fs/ext4/ext4.h`。文件系统实例维护唯一的`st_dev`：ext4/VFAT使用其块设备编号，虚拟后端使用自身设备身份；bind和命名空间视图不生成新的设备号。挂载ID与设备号分别维护。lwext4 的 `ext4_fraw_inode_fill()` 是最小 handle adapter，使最后一个 dentry 删除后仍能查询活着的 inode。
+
+GDT 与 inode 的成功校验绑定块数据的实际 payload 版本。每个 payload 只保存四个 64-bit 记录，包含对象编号、字节范围与记录类型；同一版本、同一记录再次查询时复用校验结果，元数据仍从当前借用的真实 inode 读取。按父目录 lookup、raw inode 查询、按 inode 打开和目录枚举使用只读引用。事务私有版本在修改期间不复用校验，接纳发布时清空记录，新旧读者各自持有自己的版本；abort 不修改已接纳版本。无日志的原地写先永久关闭该 payload 的校验复用，晚完成的旧校验只能用 CAS 发布，不能越过写资格重新标记成功。缓冲淘汰、块复用和 journal image 复用均重新开始校验。
 目录修改由父 inode 和单个名称定位；`kernel_vfs_unlink` 保留 Linux 打开后删除的对象语义：
 - `kernel_vfs_unlink` 在需要时先从挂载的 orphan 记录池预留一个回收记录，再调用 `ext4_unlink_child` 从父目录中立即移除目标目录项；后续对原路径的 `open` 立即返回 `-ENOENT`，并在同名路径重新创建时分配独立全新 inode。没有现存 node 的文件也使用这份预留记录，因而 orphan 回收失败时由 mount 单独持有。
 - 若目标文件当前仍处于打开状态（`node->open_files > 0`），VFS 标记 `node->unlinked = 1`，旧 open 描述符（包括只读/读写 OFD 以及正在运行的源映射 ELF 可执行文件）保留底层 inode 数据与有效物理块，继续正常执行 `read/write/fstat` 与缺页加载（demand fault）；
@@ -903,7 +905,7 @@ ext4 冷读由发起任务取得 inode 读资格，在缓存保护内复查并�
 普通标量取页与批量取页都先在缓存索引保护内检查 inode 映射是否 closing、页是否 CLOSED，
 并按当前 EOF 确定有效长度；已完成的热页在同一保护内取得物理引用，无需先取得 inode 读资格或排队。
 不满足资格时转入既有 inode 读保护路径；loading 页仍由 entry 借用跨等待持有。
-MM 取得来源页前后仍核对映射 epoch，最终提交 PTE 前重新取得 inode 资格，复查来源 epoch、VMA 身份和 EOF。
+MM 取得来源页前后仍核对映射 epoch，最终提交 PTE 前重新取得 inode 资格，复查来源 epoch、VMA 身份和 EOF。SMP 的 `kernel_page_cache_lookup/resident` 也只取得该 inode 的索引保护，不再等待共享的脏队列/LRU mutex；lookup 在同一保护内检查 closing、READY/CLOSED 并取得真实物理引用，resident 仍报告物理驻留而非可读性。UP 继续在全局保护内维护 LRU。
 普通及受控任务共用后端执行策略，ext4 在发起 CPU 完成冷页装入，普通 read/readv/pread 在调用 hart 消费结果并复制用户数据；共享offset在调用者取得，需要位置或写操作门的后端回调只借用已有资格。独立fsync不取得offset锁，分批交接与prepare之后由原调用者等待固定目标，完成事件同时处理错误观察。SMP 运行时时间戳的共享值、dirty链及deadline由一把挂载raw锁维护，staged记录归各自操作持有；单 hart 构建的这些短更新不阻塞，只需 IRQ 保护，不维护跨核锁。前台时间编码使用调用者的后端写资格；日志和后台时间编码使用挂载自己的 worker。可选预读队列由缓存保护，取消后的节点由CPU0 worker锁外释放。预读复用普通候选分配和索引发布，取得 inode 读资格后先检查映射关闭状态；截断准备至 MM 通知期间取消预测，不能按旧 EOF 装入边界页。
 worker 停止拒绝新排队请求并结束实际在途窗口；CALLER 读取由自己的缓存、inode 和文件引用覆盖，继续完成。cache 销毁检查这些借用及页引用。
 `make test-page-cache-concurrency-host` 链接真实 VFS/lwext4 和镜像块读写，在4/16 KiB、

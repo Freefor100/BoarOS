@@ -57,7 +57,17 @@ struct ext4_block_payload {
 	uint8_t *data;
 	uint32_t references;
 	void (*release)(struct ext4_block_payload *);
+	/* Successful metadata checks belong to these exact bytes, not the LBA.
+	 * UINT64_MAX disables reuse after exposing in-place write access. */
+	uint64_t verified[4];
 };
+/* Call before exposing bytes for in-place mutation; this owner never becomes
+ * reusable again. Journal publication accepts a distinct private owner. */
+static inline void ext4_block_payload_write(struct ext4_block_payload *payload)
+{
+    for (unsigned i = 0; i < 4; i++)
+        __atomic_store_n(&payload->verified[i], UINT64_MAX, __ATOMIC_RELEASE);
+}
 void ext4_block_payload_init(struct ext4_block_payload *, uint8_t *,
 	void (*release)(struct ext4_block_payload *));
 static inline __attribute__((always_inline)) void ext4_block_payload_get(struct ext4_block_payload *payload)

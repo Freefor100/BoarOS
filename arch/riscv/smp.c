@@ -110,6 +110,18 @@ static void fail_hart(const char *stage, long error, uint64_t target)
 void riscv_smp_fail(const char *stage, long error)
 { fail_hart(stage, error, kernel_cpu_current()->hardware_id); }
 
+void riscv_smp_rfence_fail(const char *stage, long error, uint64_t mask, uint64_t base)
+{
+    claim_fatal();
+    virt_uart_puts("BoarOS: SMP failure stage="); virt_uart_puts(stage);
+    virt_uart_puts(" hart="); virt_uart_put_hex(kernel_cpu_current()->hardware_id);
+    virt_uart_puts(" target-mask="); virt_uart_put_hex(mask);
+    virt_uart_puts(" target-base="); virt_uart_put_hex(base);
+    virt_uart_puts(" error="); virt_uart_put_hex((unsigned long)error);
+    virt_uart_putc('\n');
+    sbi_shutdown();
+}
+
 static uint64_t image_physical(const void *p, uint64_t size)
 {
     uint64_t address;
@@ -332,51 +344,4 @@ void riscv_smp_stop(void)
     kernel_preempt_enable();
 }
 
-void riscv_smp_sync_kernel(uint64_t address, uint64_t size)
-{
-    if (kernel_cpu_current()->logical_id || kernel_cpu_current()->raw_locks) __builtin_trap();
-    asm volatile("sfence.vma" ::: "memory");
-    for (unsigned i = 1; i < cpu_count; i++) {
-        if (!kernel_cpu_online(cpus[i])) continue;
-        long error = sbi_remote_sfence(cpus[i]->hardware_id, address, size);
-        if (error) fail_hart("RFENCE", error, cpus[i]->hardware_id);
-        kernel_cpu_current()->rfence_requests++;
-    }
-}
-void riscv_smp_sync_instructions(uint32_t targets)
-{
-    struct kernel_cpu *local=kernel_cpu_current();
-    if (local->raw_locks || !local->preempt_depth ||
-        (targets & ~((1U << BOAROS_MAX_CPUS)-1U))) __builtin_trap();
-    /* 先让代码数据写入对目标hart可见，再请求其FENCE.I；不失效地址翻译。 */
-    riscv_mmu_instruction_publish_barrier();
-    riscv_mmu_sync_instructions();
-    for (unsigned i=0;i<cpu_count;i++) {
-        if (!(targets & (1U<<i)) || cpus[i]==local) continue;
-        if (!kernel_cpu_online(cpus[i])) riscv_smp_fail("ICACHE-inactive-target",-1);
-        long error=sbi_remote_fence_i(cpus[i]->hardware_id);
-        if (error) fail_hart("ICACHE-FENCE.I",error,cpus[i]->hardware_id);
-        local->rfence_requests++;
-    }
-}
-void riscv_smp_sync_user(uint32_t targets, uint64_t address, uint64_t size,
-    int instructions)
-{
-    struct kernel_cpu *local = kernel_cpu_current();
-    if (local->raw_locks || (targets & ~((1U << BOAROS_MAX_CPUS) - 1U))) __builtin_trap();
-    if (size == BOAROS_PAGE_SIZE) riscv_mmu_flush_address(address);
-    else riscv_mmu_flush_all();
-    if (instructions) riscv_mmu_sync_instructions();
-    for (unsigned i = 0; i < cpu_count; i++) {
-        if (!(targets & (1U << i)) || cpus[i] == local) continue;
-        if (!kernel_cpu_online(cpus[i])) riscv_smp_fail("MM-inactive-target", -1);
-        long error = sbi_remote_sfence(cpus[i]->hardware_id, address, size);
-        if (error) fail_hart("MM-RFENCE", error, cpus[i]->hardware_id);
-        local->rfence_requests++;
-        if (instructions) {
-            error = sbi_remote_fence_i(cpus[i]->hardware_id);
-            if (error) fail_hart("MM-FENCE.I", error, cpus[i]->hardware_id);
-        }
-    }
-}
 #endif

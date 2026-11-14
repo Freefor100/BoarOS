@@ -235,6 +235,9 @@ static inline void kernel_open_file_read_progress(struct kernel_open_file_descri
 #endif
 
 int kernel_open_file_memory_backed(struct kernel_open_file_description *file);
+/* Existing owner covers lifetime; sample the current OFD advice atomically.
+ * RANDOM/NOREUSE prohibit optional reads and neighbour mappings. */
+int kernel_open_file_speculative_read_allowed(const struct kernel_open_file_description *);
 /* Memory shared first-write notification; source pin owns the inode lifetime. */
 void kernel_open_file_memory_modified(struct kernel_open_file_description *file);
 /* A newly materialized memory page remains rollback-owned until publication.

@@ -68,6 +68,10 @@ void ext4_bcache_publish(struct ext4_buf *buf, struct ext4_block_payload *payloa
         KERNEL_TASK_LOCK_SCOPE(guard,&buf->bc->metadata);
         if (!buf->refctr || buf->loading) __builtin_trap();
         if (buf->current_payload==payload) return;
+        /* A private replacement is complete before publication; no writer
+         * retains permission to mutate this accepted version. */
+        for (unsigned i = 0; i < 4; i++)
+            __atomic_store_n(&payload->verified[i], 0, __ATOMIC_RELAXED);
         ext4_block_payload_get(payload);old=buf->current_payload;
         buf->current_payload=payload;buf->data=payload->data;
     }
@@ -223,6 +227,7 @@ void ext4_bcache_prepare_private(struct ext4_block *client, struct ext4_block *a
 {
     if (!client || !client->buf || !client->payload || !accepted || client==accepted ||
         !private_payload || !private_payload->data) __builtin_trap();
+    ext4_block_payload_write(private_payload);
     struct ext4_buf *buf=client->buf;
     struct ext4_block_payload *old=NULL;
     {

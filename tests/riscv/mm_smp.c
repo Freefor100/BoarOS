@@ -202,8 +202,8 @@ void __wrap_riscv_trap_dispatch(struct riscv_trap_frame *frame)
     }
     __real_riscv_trap_dispatch(frame);
 }
-long __real_sbi_remote_sfence(uint64_t, uint64_t, uint64_t);
-long __wrap_sbi_remote_sfence(uint64_t hart, uint64_t address, uint64_t size)
+long __real_sbi_remote_sfence(uint64_t, uint64_t, uint64_t, uint64_t);
+long __wrap_sbi_remote_sfence(uint64_t mask, uint64_t base, uint64_t address, uint64_t size)
 {
     if (fence_armed && (kernel_task_current() == actors[0].task
 #if BOAROS_MM_SHARED_TEST
@@ -262,7 +262,7 @@ long __wrap_sbi_remote_sfence(uint64_t hart, uint64_t address, uint64_t size)
 #endif
 #endif
     }
-    return __real_sbi_remote_sfence(hart, address, size);
+    return __real_sbi_remote_sfence(mask, base, address, size);
 }
 enum kernel_memory_object_status __real_kernel_memory_object_prepare_page(
     struct kernel_memory_object *,uint64_t,uint64_t *,int *);
@@ -308,8 +308,8 @@ int __wrap_kernel_open_file_prepare_mapping_page(struct kernel_open_file_descrip
 #endif
     return result;
 }
-long __real_sbi_remote_fence_i(uint64_t);
-long __wrap_sbi_remote_fence_i(uint64_t hart)
+long __real_sbi_remote_fence_i(uint64_t, uint64_t);
+long __wrap_sbi_remote_fence_i(uint64_t mask, uint64_t base)
 {
     require(!kernel_cpu_current()->raw_locks, "mm-FENCE.I-inside-raw");
     __atomic_fetch_add(&remote_instruction, 1, __ATOMIC_RELAXED);
@@ -322,7 +322,7 @@ long __wrap_sbi_remote_fence_i(uint64_t hart)
         return -1;
     }
 #endif
-    return __real_sbi_remote_fence_i(hart);
+    return __real_sbi_remote_fence_i(mask, base);
 }
 static void user_probe(uint64_t cause, uint64_t fault_address, uint64_t argument,
     uint64_t expected)

@@ -8,6 +8,7 @@
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #if BOAROS_USER_SMP && defined(REMOTE_USER_CASE)
 #include "../../kernel/sched/private.h"
@@ -35,7 +36,12 @@ static unsigned membership_sync, membership_sampled, membership_ack, membership_
 static uint64_t membership_address;
 static unsigned publication_mode, publication_ready, publication_done, publication_leave;
 static unsigned publication_visible, publication_invalid, publication_syncs;
+static unsigned publication_instruction_request, publication_instruction_ack;
+static unsigned publication_execute_ready, publication_execute_ready_seen;
+static unsigned publication_executable_done, publication_executable_seen, publication_instruction_syncs;
 static const uint64_t publication_address = UINT64_C(0x20000000);
+static unsigned exclusive_cow, exclusive_cow_syncs;
+static uint64_t exclusive_cow_address, exclusive_cow_physical;
 #ifdef REMOTE_USER_CASE
 static unsigned copying, cow_fences;
 static uint64_t cow_old;
@@ -239,6 +245,24 @@ static void *publication_peer(void *unused)
         }
         __atomic_store_n(&publication_done, i + 1, __ATOMIC_RELEASE);
     }
+    await(&publication_execute_ready);
+    assert(!kernel_mm_activate(&mm, kernel_context));
+    unsigned before = flushes;
+    publish(&publication_execute_ready_seen);
+    await(&publication_instruction_request);
+    struct kernel_mm_mapping executable;
+    assert(!kernel_mm_lookup(&mm, publication_address + 2 * BOAROS_PAGE_SIZE, &executable));
+    assert((executable.permissions & (KERNEL_MM_READ | KERNEL_MM_EXECUTE)) ==
+        (KERNEL_MM_READ | KERNEL_MM_EXECUTE) && !(executable.permissions & KERNEL_MM_WRITE));
+    mm_test_fence(0, 1);
+    assert(!__atomic_load_n(&publication_executable_done, __ATOMIC_ACQUIRE));
+    publish(&publication_instruction_ack);
+    await(&publication_executable_done);
+    /* New executable bytes require I$ publication, but have no old TLB entry
+     * to revoke. Reentry must not clear the peer's valid data translations. */
+    assert(!kernel_mm_activate(&mm, kernel_context));
+    assert(flushes == before);
+    publish(&publication_executable_seen);
     await(&publication_leave);
     assert(!kernel_mm_activate(NULL, kernel_context));
     return NULL;
@@ -263,18 +287,31 @@ static void new_mapping_publication(void)
         __atomic_store_n(&publication_visible, i + 1, __ATOMIC_RELEASE);
         while (__atomic_load_n(&publication_done, __ATOMIC_ACQUIRE) != i + 1) sched_yield();
     }
-    publication_mode = 2;
+    publication_mode = 4;
     assert(!kernel_mm_mprotect(&mm, publication_address + 2 * BOAROS_PAGE_SIZE,
         BOAROS_PAGE_SIZE, KERNEL_MM_READ | KERNEL_MM_EXECUTE));
     assert(!kernel_mm_activate(&mm, kernel_context));
+    publish(&publication_execute_ready);
+    await(&publication_execute_ready_seen);
+    publication_mode = 2;
     unsigned before = publication_syncs, before_instructions = instruction_sync;
+    unsigned before_flushes = flushes;
+    struct kernel_mm_concurrency_state state;
+    kernel_mm_get_concurrency_state(&mm, &state);
+    uint64_t generation = state.generation;
     assert(!kernel_mm_resolve_user_fault(&mm,
         publication_address + 2 * BOAROS_PAGE_SIZE, KERNEL_MM_EXECUTE));
     assert(publication_syncs == before + 1);
-    assert(instruction_sync == before_instructions + 1);
-    before = flushes; before_instructions = instruction_sync;
+    assert(flushes == before_flushes + 1 && instruction_sync == before_instructions + 1);
+    assert(publication_instruction_syncs == 1);
+    kernel_mm_get_concurrency_state(&mm, &state);
+    assert(state.generation == generation && !state.pending_retirement && state.active_cpus == 3);
+    publish(&publication_executable_done);
+    before = flushes;
     assert(!kernel_mm_activate(&mm, kernel_context));
-    assert(flushes == before + 1 && instruction_sync == before_instructions + 1);
+    assert(flushes == before);
+    await(&publication_executable_seen);
+    publication_mode = 4;
     assert(!kernel_mm_mprotect(&mm, publication_address, BOAROS_PAGE_SIZE, KERNEL_MM_READ));
     before = flushes; before_instructions = instruction_sync;
     assert(!kernel_mm_activate(&mm, kernel_context));
@@ -287,7 +324,49 @@ static void new_mapping_publication(void)
     assert(!pthread_join(peer, NULL)); alarm(0);
     assert(!kernel_mm_activate(NULL, kernel_context)); mm_test_context = context;
     assert(!kernel_mm_munmap(&mm, publication_address, 3 * BOAROS_PAGE_SIZE));
-    puts("MM new nonleaf/leaf publication avoids remote invalidation; stale faults flush locally; executable and revoked mappings synchronize both CPUs");
+    puts("MM fresh executable publication flushes only local TLB and confirms both instruction caches; revocation still confirms both TLBs");
+}
+static void executable_exclusive_cow(void)
+{
+    struct kernel_mm child = {0};
+    uint64_t placed;
+    exclusive_cow_address = publication_address + UINT64_C(0x600000);
+    assert(!kernel_mm_mmap_anonymous(&mm, exclusive_cow_address, BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ | KERNEL_MM_WRITE | KERNEL_MM_EXECUTE, KERNEL_MM_MAP_FIXED, &placed));
+    assert(!kernel_mm_activate(&mm, kernel_context));
+    unsigned char byte = 0x53;
+    size_t copied;
+    assert(!kernel_copy_to_user(&mm, exclusive_cow_address, &byte, 1, &copied) && copied == 1);
+    assert(!kernel_mm_fork(&child, &mm));
+    assert(!kernel_mm_release(&child));
+    struct kernel_mm_mapping mapping;
+    assert(!kernel_mm_lookup(&mm, exclusive_cow_address, &mapping));
+    exclusive_cow_physical = mapping.physical_address;
+    assert((mapping.permissions & (KERNEL_MM_READ | KERNEL_MM_EXECUTE)) ==
+        (KERNEL_MM_READ | KERNEL_MM_EXECUTE) && !(mapping.permissions & KERNEL_MM_WRITE));
+    uint32_t references;
+    assert(!physical_page_reference_count(&allocator, exclusive_cow_physical, &references) && references == 1);
+    assert(!kernel_mm_activate(&mm, kernel_context));
+    unsigned before_flushes = flushes, before_instructions = instruction_sync;
+    uint64_t available = physical_page_available(&allocator);
+    struct kernel_mm_concurrency_state state;
+    exclusive_cow = 1;
+    assert(!kernel_mm_resolve_user_fault(&mm, exclusive_cow_address, KERNEL_MM_WRITE));
+    exclusive_cow = 0;
+    assert(exclusive_cow_syncs == 1 && flushes == before_flushes + 1 &&
+        instruction_sync == before_instructions);
+    assert(!kernel_mm_lookup(&mm, exclusive_cow_address, &mapping) &&
+        mapping.physical_address == exclusive_cow_physical && (mapping.permissions & KERNEL_MM_WRITE));
+    assert(physical_page_available(&allocator) == available);
+    kernel_mm_get_concurrency_state(&mm, &state);
+    assert(!state.pending_retirement);
+    assert(!kernel_copy_from_user(&mm, &byte, exclusive_cow_address, 1, &copied) && copied == 1 && byte == 0x53);
+    byte = 0x74;
+    assert(!kernel_copy_to_user(&mm, exclusive_cow_address, &byte, 1, &copied) && copied == 1);
+    assert(!kernel_copy_from_user(&mm, &byte, exclusive_cow_address, 1, &copied) && copied == 1 && byte == 0x74);
+    assert(!kernel_mm_activate(NULL, kernel_context)); mm_test_context = context;
+    assert(!kernel_mm_munmap(&mm, exclusive_cow_address, BOAROS_PAGE_SIZE));
+    puts("MM exclusive executable COW restores write permission on the same bytes/page without instruction synchronization or retirement");
 }
 static void fresh_population_reentry(void)
 {
@@ -345,12 +424,27 @@ void riscv_smp_sync_user(uint32_t targets, uint64_t address, uint64_t size, int 
 {
     (void)address; (void)size; (void)instructions;
     assert(!kernel_cpu_current()->raw_locks);
+    if (exclusive_cow) {
+        assert(!(targets & ~UINT32_C(1)) && address == exclusive_cow_address &&
+            size == BOAROS_PAGE_SIZE && !instructions);
+        struct kernel_mm_concurrency_state state;
+        kernel_mm_get_concurrency_state(&mm, &state);
+        uint32_t references;
+        assert(!state.pending_retirement &&
+            !physical_page_reference_count(&allocator, exclusive_cow_physical, &references) && references == 1);
+        exclusive_cow_syncs++;
+        mm_test_fence(address, 0);
+        return;
+    }
     if (publication_mode) {
         assert(kernel_cpu_current()->logical_id == 0);
         if (publication_mode == 1) {
             assert(!targets && !instructions);
             if (!publication_syncs) assert(!address && size == UINT64_MAX);
             else assert(address == publication_address + BOAROS_PAGE_SIZE && size == BOAROS_PAGE_SIZE);
+        } else if (publication_mode == 2) {
+            assert(!targets && !instructions);
+            assert(address == publication_address + 2 * BOAROS_PAGE_SIZE && size == BOAROS_PAGE_SIZE);
         } else if (publication_mode == 3) assert(!targets && !instructions);
         else assert(targets == 3);
         publication_syncs++;
@@ -383,8 +477,9 @@ void riscv_smp_sync_user(uint32_t targets, uint64_t address, uint64_t size, int 
         return;
     }
 #endif
-    assert(targets == (kernel_cpu_current()->active_mm_record ?
-        UINT32_C(1) << kernel_cpu_current()->logical_id : 0));
+    uint32_t local = kernel_cpu_current()->active_mm_record ?
+        UINT32_C(1) << kernel_cpu_current()->logical_id : 0;
+    assert(!(targets & ~local));
 #ifdef REMOTE_USER_CASE
     if (expect_nonleaf_sync) { assert(address==0 && size==UINT64_MAX); expect_nonleaf_sync=0; }
     if (copying) {
@@ -410,6 +505,14 @@ void riscv_smp_sync_instructions(uint32_t targets)
     struct kernel_cpu *cpu=kernel_cpu_current();
     assert(cpu->preempt_depth && !cpu->raw_locks);
     mm_test_fence(0,1);
+    if (publication_mode == 2) {
+        assert(cpu->logical_id == 0 && targets == 3);
+        publication_instruction_syncs++;
+        publish(&publication_instruction_request);
+        await(&publication_instruction_ack);
+        assert(!__atomic_load_n(&publication_executable_done, __ATOMIC_ACQUIRE));
+        return;
+    }
     if (!(targets & ~(1U<<cpu->logical_id))) return;
     assert(cpu->logical_id==0 && targets==3);
     icache_global_calls++;
@@ -654,7 +757,14 @@ int main(void)
         KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED, &address));
     assert(!kernel_copy_to_user(&mm, address, &byte, 1, &copied));
     assert(!kernel_mm_check_task_domain(&mm));
+    const char *selected = getenv("MM_ACTIVITY_CASE");
+    int exclusive_only = selected && !strcmp(selected, "exclusive-cow");
+    if (exclusive_only) {
+        executable_exclusive_cow();
+        goto finish;
+    }
     new_mapping_publication();
+    executable_exclusive_cow();
     fresh_population_reentry();
     same_mm_reentry(address);
     membership_before_publication(address);
@@ -746,7 +856,9 @@ int main(void)
     assert(walk_calls && walk_calls<=256); /* 64GiB空洞不按虚拟页枚举。 */
 #endif
     instruction_publication_cases();
+finish:
     mm_test_context = 0; assert(!kernel_mm_release(&mm));
     assert(physical_page_available(&allocator) == baseline && !physical_page_allocator_audit(&allocator));
-    puts("MM late entry, same-root reuse, independent instruction publication and leave-before-retirement verified");
+    puts(exclusive_only ? "MM exclusive COW page/heap owners returned" :
+        "MM late entry, same-root reuse, independent instruction publication and leave-before-retirement verified");
 }

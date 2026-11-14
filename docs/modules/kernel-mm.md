@@ -35,7 +35,7 @@ mincore 每页输出最低位的驻留状态，查询本身不装入页面。MM 
 
 ## madvise 与共享段锁定
 
-RV64/LA64 的 madvise(233) 支持 NORMAL、RANDOM、SEQUENTIAL、WILLNEED、DONTNEED、FREE、REMOVE，以及 DONTFORK/DOFORK、WIPEONFORK/KEEPONFORK、DONTDUMP/DODUMP和POPULATE_READ/WRITE，参数中的 advice 按 Linux 32 位 int 解释。RANDOM 在 VMA 上保存随机访问建议，禁止该范围冷缺页的邻页批量装入；NORMAL/SEQUENTIAL 清除此标志。建议随 VMA 分裂、合并、fork 和 mremap 保留，不改变权限或文件位置。未接入的扩展模式返回 EINVAL。
+RV64/LA64 的 madvise(233) 支持 NORMAL、RANDOM、SEQUENTIAL、WILLNEED、DONTNEED、FREE、REMOVE，以及 DONTFORK/DOFORK、WIPEONFORK/KEEPONFORK、DONTDUMP/DODUMP和POPULATE_READ/WRITE，参数中的 advice 按 Linux 32 位 int 解释。RANDOM 在 VMA 上保存随机访问建议，禁止该范围冷缺页的邻页批量装入及已驻留邻页映射；NORMAL/SEQUENTIAL 清除此标志。建议随 VMA 分裂、合并、fork 和 mremap 保留，不改变权限或文件位置。未接入的扩展模式返回 EINVAL。
 
 DONTNEED 在 MM 修改资格内撤销范围的 PTE 和文件驻留登记，保留 VMA、保护位、AS/DATA 用量和后备对象。私有匿名页重新访问得到零，私有文件 COW 页面重新取文件内容；共享匿名、SysV 和共享文件的数据保存在真实后备中；BPF 对象映射保留 map 数据但不补回 PTE，再访问产生 SIGBUS（见[BPF 对象共享映射](#bpf-对象共享映射)）。vDSO 代码缺页从内核内嵌的 ELF 重新装入，并完成指令缓存与 TLB 同步；只读 vVAR 缺页重新映射本 MM 持有的共享时钟页。复用现有有界退页过程，页和页表在活动 CPU 完成 TLB 失效后释放。范围中的空洞最终返回 ENOMEM，空洞两侧的有效映射仍执行；遇到锁定 VMA 返回 EINVAL，保留此前范围已经完成的变化。
 
@@ -266,17 +266,21 @@ VMA 保留后备对象、文件权限上限和源子范围偏移。共享匿名�
 
 `kernel_mm_resolve_user_fault()` 的 `access` 必须恰为 READ、WRITE、EXECUTE 之一。通用层先检查用户范围、VMA、逻辑权限和现有 PTE；地址无 VMA 返回 `NOT_MAPPED`，合法 VMA 的权限不足返回 `ACCESS`。`ELF_PRIVATE/ELF` VMA 按 source 区间二分取得 FILE、COMPOSITE 或 ZERO backing，再按实际缺失的资源准备候选。硬件缺页与 uaccess 使用同一解析器，不为非法软件访问分配页面。
 
-匿名成功路径按架构页大小对齐故障地址，分配并清零一页，以 VMA 权限建立用户 PTE。文件路径按上述缓存/私有策略取得页面。实际提交者根据本次 PTE 变化决定同步范围及是否推进翻译、指令代次：已有表内的单页发布按页同步，非叶结构变化使用全范围同步；可执行内容填充、COW 和执行权限发布还同步取指。多 CPU RISC-V 的新非执行映射只在提交 CPU 执行 `SFENCE.VMA`，其他 CPU 对旧 invalid walk-cache 的处理见下段；替换、撤权及可执行映射仍确认活动 CPU 的 RFENCE 与必要的 `FENCE.I`。同步由 MM 在 raw 锁外完成，后端不在每次改单页时隐含执行。dispatcher 保持 `sepc` 不变，`sret` 后硬件重试原 load/store/fetch。`NOT_MAPPED/ACCESS` 在 Trap 边界形成 `SIGSEGV` 的 MAPERR/ACCERR，文件整页越过 EOF 的 `BUS_FAULT` 形成 `SIGBUS`；uaccess 将这些用户访问错误转换为 `EFAULT`。物理页耗尽精确返回 `NO_MEMORY`，非法页表或分配器状态直接 fatal。
+匿名成功路径按架构页大小对齐故障地址，分配并清零一页，以 VMA 权限建立用户 PTE。文件路径按上述缓存/私有策略取得页面。实际提交者根据本次 PTE 变化决定同步范围及是否推进翻译、指令代次：已有表内的单页发布按页同步，非叶结构变化使用全范围同步；可执行内容填充、发生复制的 COW 和执行权限发布还同步取指。多 CPU RISC-V 的新映射只在提交 CPU 执行 `SFENCE.VMA`，其他 CPU 对旧 invalid walk-cache 的处理见下段；新执行映射另推进指令代次并确认活动 CPU 的 `FENCE.I`，不为不存在的旧翻译广播远端 TLB 失效。替换、撤权及旧页面退休仍确认实际目标的 TLB 失效；只有发布了新内容或新的可执行映射时才同时同步取指。同步由 MM 在 raw 锁外完成，后端不在每次改单页时隐含执行。dispatcher 保持 `sepc` 不变，`sret` 后硬件重试原 load/store/fetch。`NOT_MAPPED/ACCESS` 在 Trap 边界形成 `SIGSEGV` 的 MAPERR/ACCERR，文件整页越过 EOF 的 `BUS_FAULT` 形成 `SIGBUS`；uaccess 将这些用户访问错误转换为 `EFAULT`。物理页耗尽精确返回 `NO_MEMORY`，非法页表或分配器状态直接 fatal。
 
 scheduler 的 U-mode 硬件页故障和当前任务的 uaccess 都可进入该入口。uaccess 在 pin 遇到未驻留或需要写故障处理的页面时解析；成功后重新 pin，VMA 外或权限不符仍按用户访问错误处理。
 
-并发 fault 可以在候选准备期间由另一任务先完成同一地址的映射或权限升级。恢复 gate 后，若 VMA 仍允许且 PTE 已满足请求，匿名、ELF 和文件 resolver 在 raw 锁外全量刷新本地翻译，再成功返回；执行映射另补本地指令同步，不重复发送远端 RFENCE。全量刷新同时覆盖该 CPU 在新非叶发布前缓存的 invalid 父项。多 CPU RISC-V 的新非执行映射没有旧物理页、权限或退休引用可撤销，因此只做本地发布，不推进用于旧翻译失效的代次；其他 CPU 若仍缓存 invalid 项，会进入上述 spurious-fault 路径。同一 MM 的线程切换不因新页发布额外清空 TLB，首次加入或跨根重新进入仍执行全量刷新。旧映射的撤销和资源归还仍先完成全部目标确认，不把旧 positive 翻译当作 invalid 处理。预装的非执行匿名叶保留既有批量本地同步。固定资料 [`pgtable.h`](../../references/linux/arch/riscv/include/asm/pgtable.h) 的 `update_mmu_cache_range()` 同样使用本地刷新发布新有效 PTE；[`mm/memory.c`](../../references/linux/mm/memory.c) 的 `fix_spurious_fault()` 用于核对并发已满足的 fault 语义。映射代次、来源、EOF 或权限已经变化时丢弃本次候选并重新判断，不能把过期候选提交给新 VMA。真实匿名及文件同页竞争见[RV 两核](riscv-smp.md#用户态原程序与压力组合)。
+并发 fault 可以在候选准备期间由另一任务先完成同一地址的映射或权限升级。恢复 gate 后，若 VMA 仍允许且 PTE 已满足请求，匿名、ELF 和文件 resolver 在 raw 锁外全量刷新本地翻译，再成功返回；执行映射另补本地指令同步，不重复发送远端 RFENCE。全量刷新同时覆盖该 CPU 在新非叶发布前缓存的 invalid 父项。多 CPU RISC-V 的新映射没有旧物理页、权限或退休引用可撤销，因此翻译只做本地发布，不推进用于旧翻译失效的代次；新执行页仍独立推进指令代次并确认取指同步。其他 CPU 若仍缓存 invalid 项，会进入上述 spurious-fault 路径。同一 MM 的线程切换不因新页发布额外清空 TLB，首次加入或跨根重新进入仍执行全量刷新。旧映射的撤销和资源归还仍先完成全部目标确认，不把旧 positive 翻译当作 invalid 处理。预装的非执行匿名叶保留既有批量本地同步。固定资料 [`pgtable.h`](../../references/linux/arch/riscv/include/asm/pgtable.h) 的 `update_mmu_cache_range()` 同样使用本地刷新发布新有效 PTE；[`mm/memory.c`](../../references/linux/mm/memory.c) 的 `fix_spurious_fault()` 用于核对并发已满足的 fault 语义。映射代次、来源、EOF 或权限已经变化时丢弃本次候选并重新判断，不能把过期候选提交给新 VMA。真实匿名及文件同页竞争见[RV 两核](riscv-smp.md#用户态原程序与压力组合)。
+
+磁盘私有文件的普通读/执行缺页还会映射同一自然对齐64KiB窗口内向前、VMA与EOF范围内已经READY的缓存页。需求页先取得真实来源页、resident元数据、页表和hash容量，包含重取MM后实际缺失表页的补齐；之后才使用不回收、不等待的heap入口准备可选resident，数量不超过现有hash空槽。可选分配失败不改变需求页结果，不为邻页分配数据页、装入页面或新建页表。
+
+已有MM写资格和inode读资格固定发布范围及文件版本，短raw保护内只向空PTE转交已取得的物理引用。邻页以只读COW形式发布，登记在原文件resident索引中；后续私有写、fork、truncate、打洞与解除映射沿同一协议处理。已有私有/COW/PROT_NONE叶不替换，LOADING/缺失缓存页直接跳过；共享文件、内存后备、写缺页、force访问、显式预装及RANDOM/NOREUSE不使用此扩展。目标和实际新增邻页完成后只发布一次同步范围/代次，其他CPU晚进入仍由activate补齐。来源仍借用真实OFD，不设置新的常驻页数组或后台执行者；每个实际映射页仍持有原resident元数据，解除映射时归还。预先建立的PTE会延长对应缓存页的驻留，RSS和resident数量可增加；RANDOM/NOREUSE可禁止该扩展。直接边界与OOM检查复用 `tests/host/fault-read-window.sh`，与缓存批读的差别见[VFS冷页装入](vfs-ext4.md#文件缺页的同步批量装入)。
 
 ## fork 与 COW
 
 `kernel_mm_fork()` 先克隆所有会分配的 VMA、共享匿名对象引用和文件来源 metadata，最后才调用 Sv39 两阶段 fork。子页表先取得每个 active/`PROT_NONE` 4 KiB 页的物理引用；共享匿名页保持原权限，其他页以 COW 形态建立。全部构造成功后再把父进程私有可写叶子去掉 W 并标记 COW，随后刷新父地址空间 TLB。metadata 或子页表构造失败时父 PTE 不变；父提交阶段不再分配。无效或已撤销的页不进入子地址空间，内核高半区仍只借用稳定映射。
 
-写 fault 只接受软件明确标记的 present COW 页，不能把真正只读页误当成可写。若物理引用数大于 1，就分配并复制新页、把当前 PTE 改回 VMA 权限并释放旧引用；若只剩一个引用，则原地恢复写权限而不复制。`mprotect(PROT_NONE)` 使用不同 RSW 编码保存 exclusive/COW 属性，恢复后仍能正确决定是否复制。uaccess 写入也进入同一 resolver，因此内核代用户写内存不会绕过 COW。
+写 fault 只接受软件明确标记的 present COW 页，不能把真正只读页误当成可写。若物理引用数大于 1，就分配并复制新页、把当前 PTE 改回 VMA 权限并释放旧引用；若只剩一个引用，则原地恢复写权限而不复制；它没有修改页面内容，不推进指令代次或发送取指同步，仍完成写权限变更所需的TLB失效。`mprotect(PROT_NONE)` 使用不同 RSW 编码保存 exclusive/COW 属性，恢复后仍能正确决定是否复制。uaccess 写入也进入同一 resolver，因此内核代用户写内存不会绕过 COW。
 
 创建失败时，目标句柄要么仍为 EMPTY，要么仍持有尚未发布的完整 owner；分配器释放不失败，调用者不按释放错误建立重试状态。Fork 仍需遍历已提交页并构造子页表；共享页分类在子构造和父提交时对每个驻留页查询 VMA，成本为 `O(P log V)`（P 为驻留页数，V 为 VMA 数），另有 metadata 和页表遍历，但不在 fork 时复制每页内容或预留同量数据内存。额外数据页成本只落在之后真正写入的页。fork 在 gate 下构造私有 child，分配和复制在 MM raw 外完成，父私有叶的 COW 发布在 raw 内完成，确认远端失效后再归还旧引用。文件登记与实际来源沿同一协议迁移。
 

@@ -197,12 +197,14 @@ void __wrap_riscv_context_switch(struct riscv_switch_context *previous,
     __real_riscv_context_switch(previous, next);
 }
 
-long __real_sbi_remote_sfence(uint64_t, uint64_t, uint64_t);
-long __wrap_sbi_remote_sfence(uint64_t hart, uint64_t address, uint64_t size)
+long __real_sbi_remote_sfence(uint64_t, uint64_t, uint64_t, uint64_t);
+long __wrap_sbi_remote_sfence(uint64_t mask, uint64_t base, uint64_t address, uint64_t size)
 {
     last_fence_address = address;
     last_fence_size = size;
-    int last = hart == riscv_smp_cpu(kernel_cpu_get_boot_count()-1)->hardware_id;
+    uint64_t last_hart = riscv_smp_cpu(kernel_cpu_get_boot_count()-1)->hardware_id;
+    int last = last_hart >= base && last_hart - base < 64 &&
+        (mask & (UINT64_C(1) << (last_hart - base)));
     if (BOAROS_SMP_NEGATIVE == 5 && fence_hold && last) {
         uint32_t references;
         if (physical_page_reference_count(allocator, fence_table, &references) != PHYSICAL_PAGE_STATUS_OK ||
@@ -211,7 +213,7 @@ long __wrap_sbi_remote_sfence(uint64_t hart, uint64_t address, uint64_t size)
         virt_uart_puts("BoarOS: SMP RFENCE error retains table and page owners\n");
         return -4;
     }
-    long error = __real_sbi_remote_sfence(hart, address, size);
+    long error = __real_sbi_remote_sfence(mask, base, address, size);
     if (!error && fence_hold && last) {
         __atomic_store_n(&fence_completed, 1, __ATOMIC_RELEASE);
         uint64_t end = riscv_time_read() + 50000000;

@@ -1168,6 +1168,7 @@ static void jbd_replay_block_tags(struct jbd_fs *jbd_fs,
 		struct ext4_buf *buf = ext4_bcache_find_get(fs->bdev->bc, &cached,
 							  tag_info->block, NULL);
 		if (buf) {
+			ext4_block_payload_write(cached.payload);
 			memcpy(buf->data, log.data, block_size);
 			ext4_bcache_clear_dirty(buf);
 			ext4_bcache_set_flag(buf, BC_UPTODATE);

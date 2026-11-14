@@ -317,11 +317,13 @@ int ext4_block_get_range(struct ext4_blockdev *bdev, struct ext4_block *b,
         if (trans) {
             if (access == EXT4_BLOCK_WRITE)
                 r=jbd_trans_get_write_access_range(trans,b,offset,length);
+            return r; /* The transaction exposes only its private write view. */
         }
     }
 #else
     (void)access;
 #endif
+    if (!r && access == EXT4_BLOCK_WRITE) ext4_block_payload_write(b->payload);
     return r;
 }
 int ext4_block_get(struct ext4_blockdev *bdev, struct ext4_block *b, uint64_t lba)

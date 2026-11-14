@@ -1323,6 +1323,11 @@ enum kernel_open_file_status kernel_open_file_check_io_domain(
     int error=kernel_vfs_check_io_domain(node,heap,allocator);
     return error?KERNEL_OPEN_FILE_STATUS_STATE:KERNEL_OPEN_FILE_STATUS_OK;
 }
+int kernel_open_file_speculative_read_allowed(const struct kernel_open_file_description *file)
+{
+    return !(__atomic_load_n(&file->read_advice,__ATOMIC_RELAXED)&(KERNEL_READ_RANDOM|KERNEL_READ_NOREUSE));
+}
+
 static inline __attribute__((always_inline)) enum kernel_page_cache_status disk_fault_page(
     struct kernel_open_file_description *file,struct kernel_page_cache *cache,
     uint64_t index,uint64_t *address,size_t *valid,int read_window)
