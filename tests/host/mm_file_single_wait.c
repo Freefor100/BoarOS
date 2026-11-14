@@ -24,6 +24,7 @@ static struct kernel_vfs_mount *mount;
 static struct kernel_open_file_description *controller;
 static unsigned source_prepared, final_inject;
 static unsigned final_entered, final_writer_claimed, final_replaced, final_before_park;
+static unsigned final_unmap;
 static uint64_t final_root;
 static void *access(uint64_t p) { return (void *)(uintptr_t)p; }
 static int address_of(const void *p,uint64_t *out) { *out=(uintptr_t)p; return 1; }
@@ -66,15 +67,18 @@ static void *final_writer(void *unused)
     while (!__atomic_load_n(&final_replaced,__ATOMIC_ACQUIRE)) sched_yield();
     return 0;
 }
-static void *final_replace(void *unused)
+static void *final_edit(void *unused)
 {
     (void)unused; mm_test_attach(2); mm_test_context=final_root;
     while (mm_test_parked(0)==final_before_park) sched_yield();
     assert(!kernel_io_context_current()->locks && !kernel_cpu_current()->raw_locks);
-    uint64_t replaced;
-    assert(!kernel_mm_mmap_anonymous(&parent,0x40000,BOAROS_PAGE_SIZE,
-        KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&replaced));
-    assert(replaced==0x40000);
+    if (final_unmap) assert(!kernel_mm_munmap(&parent,0x40000,BOAROS_PAGE_SIZE));
+    else {
+        uint64_t replaced;
+        assert(!kernel_mm_mmap_anonymous(&parent,0x40000,BOAROS_PAGE_SIZE,
+            KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&replaced));
+        assert(replaced==0x40000);
+    }
     __atomic_store_n(&final_replaced,1,__ATOMIC_RELEASE);
     return 0;
 }
@@ -96,23 +100,33 @@ int main(void)
     controller->open_flags=2;
     unsigned char value=0x77; size_t done;
     assert(!kernel_vfs_pwrite(&controller->file,0,&value,1,&done) && done==1);
-    uint64_t mapped; struct kernel_open_file_description *source=controller;
-    assert(!kernel_open_file_acquire(source) && !kernel_mm_mmap_file_private(&parent,&source,0x40000,
-        BOAROS_PAGE_SIZE,0,KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED|KERNEL_MM_MAP_SHARED,&mapped));
-    final_inject=1; final_root=mm_test_context; final_before_park=mm_test_parked(0);
-    pthread_t writer, modifier;
-    assert(!pthread_create(&writer,0,final_writer,0) && !pthread_create(&modifier,0,final_replace,0));
-    unsigned char observed=0; done=0;
-    enum kernel_uaccess_status status=kernel_copy_from_user(&parent,&observed,mapped,1,&done);
-    assert(!pthread_join(writer,0) && !pthread_join(modifier,0));
-    assert(mm_test_parked(0)>final_before_park);
-    struct kernel_vma latest; assert(!kernel_mm_vma_lookup(&parent,mapped,&latest));
-    assert(status==KERNEL_UACCESS_STATUS_OK && done==1 && !observed && latest.kind==KERNEL_VMA_KIND_ANONYMOUS);
+    for (final_unmap=0;final_unmap<2;final_unmap++) {
+        source_prepared=final_entered=final_writer_claimed=final_replaced=0;
+        uint64_t mapped; struct kernel_open_file_description *source=controller;
+        assert(!kernel_open_file_acquire(source) && !kernel_mm_mmap_file_private(&parent,&source,0x40000,
+            BOAROS_PAGE_SIZE,0,KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED|KERNEL_MM_MAP_SHARED,&mapped));
+        final_inject=1; final_root=mm_test_context; final_before_park=mm_test_parked(0);
+        pthread_t writer, modifier;
+        assert(!pthread_create(&writer,0,final_writer,0) && !pthread_create(&modifier,0,final_edit,0));
+        unsigned char observed=0; done=0;
+        enum kernel_uaccess_status status=kernel_copy_from_user(&parent,&observed,mapped,1,&done);
+        assert(!pthread_join(writer,0) && !pthread_join(modifier,0));
+        kernel_mm_drain_sources(&parent);
+        assert(mm_test_parked(0)>final_before_park && controller->references==1);
+        struct kernel_vma latest;
+        if (final_unmap)
+            assert(status==KERNEL_UACCESS_STATUS_FAULT && !done &&
+                kernel_mm_vma_lookup(&parent,mapped,&latest)==KERNEL_MM_STATUS_NOT_MAPPED);
+        else {
+            assert(!kernel_mm_vma_lookup(&parent,mapped,&latest));
+            assert(status==KERNEL_UACCESS_STATUS_OK && done==1 && !observed && latest.kind==KERNEL_VMA_KIND_ANONYMOUS);
+        }
+    }
     mm_test_context=0;
     assert(!kernel_mm_release(&parent) && !kernel_open_file_release(&controller) && !kernel_vfs_unmount(mount));
     struct kernel_heap_statistics stats; kernel_heap_get_statistics(&heap,&stats);
     assert(!stats.live_allocations && !stats.current_pages && physical_page_available(&pages)==baseline);
     assert(!physical_page_allocator_audit(&pages));
-    puts("single-CPU file fault: actual final I/O park, VMA replacement and owner closure passed");
+    puts("single-CPU file fault: final I/O park, VMA replacement/unmap and source owner closure passed");
     return 0;
 }

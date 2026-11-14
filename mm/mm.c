@@ -1057,8 +1057,26 @@ static void drain_file_registrations(struct kernel_mm_record *record,
     }
 }
 
-/* Detached nodes keep their real OFD owner through callback drain and close.
- * A failed close returns the same node to the MM for the existing retry path. */
+/* Keep busy retired nodes published while holding MM write qualification.
+ * Their last borrower may return without that qualification (self-pin try),
+ * so a later operation/user return must still find the cleanup obligation. */
+static struct kernel_mm_file_source *take_ready_file_sources(struct kernel_mm_record *record)
+{
+    struct kernel_mm_file_source *pending=record->retired_file_sources;
+    struct kernel_mm_file_source *ready=NULL,*busy=NULL;
+    while (pending) {
+        struct kernel_mm_file_source *source=pending; pending=source->next;
+        if (__atomic_load_n(&source->operations,__ATOMIC_ACQUIRE)) {
+            if (record->stage!=KERNEL_MM_RECORD_LIVE) __builtin_trap();
+            source->next=busy; busy=source;
+        } else { source->next=ready; ready=source; }
+    }
+    record->retired_file_sources=busy;
+    return ready;
+}
+
+/* Detached, idle nodes keep their real OFD owner through callback drain and
+ * close. A failed close returns the same node to the existing retry path. */
 static int release_file_sources(struct kernel_mm_record *record,
     struct kernel_mm_file_source *sources)
 {
@@ -1086,8 +1104,6 @@ static enum kernel_mm_status drain_file_sources(
 {
     struct kernel_mm_file_source **link = &record->file_sources;
     int invalid=0,defer=kernel_lock_held(&record->operations,1);
-    struct kernel_mm_file_source *released=defer ? NULL : record->retired_file_sources;
-    if (released) record->retired_file_sources=NULL;
 
     drain_file_registrations(record, unused_only);
 
@@ -1095,11 +1111,7 @@ static enum kernel_mm_status drain_file_sources(
         struct kernel_mm_file_source *source = *link;
         int in_use = 0;
 
-        if (source->operations || source->draining) {
-            if (!unused_only) __builtin_trap();
-            link = &source->next;
-            continue;
-        }
+        if (!unused_only && source->operations) __builtin_trap();
         if (source->file != 0) {
             if (unused_only != 0) {
                 if (record->vmas == 0 ||
@@ -1117,11 +1129,9 @@ static enum kernel_mm_status drain_file_sources(
         }
         *link = source->next;
         source->draining=1;
-        if (defer) {
-            source->next=record->retired_file_sources; record->retired_file_sources=source;
-        } else { source->next=released; released=source; }
+        source->next=record->retired_file_sources; record->retired_file_sources=source;
     }
-    int failed=release_file_sources(record,released);
+    int failed=release_file_sources(record,defer ? NULL : take_ready_file_sources(record));
     if (invalid) return KERNEL_MM_STATUS_STATE;
     return failed != 0 ? KERNEL_MM_STATUS_CLEANUP_REQUIRED
                        : KERNEL_MM_STATUS_OK;
@@ -1162,24 +1172,33 @@ static int release_elf_sources(struct kernel_mm_record *record,
     return 1;
 }
 
+static struct kernel_mm_elf_source *take_ready_elf_sources(struct kernel_mm_record *record)
+{
+    struct kernel_mm_elf_source *pending=record->retired_elf_sources;
+    struct kernel_mm_elf_source *ready=NULL,*busy=NULL;
+    while (pending) {
+        struct kernel_mm_elf_source *source=pending; pending=source->next;
+        if (__atomic_load_n(&source->faults,__ATOMIC_ACQUIRE)) {
+            if (record->stage!=KERNEL_MM_RECORD_LIVE) __builtin_trap();
+            source->next=busy; busy=source;
+        } else { source->next=ready; ready=source; }
+    }
+    record->retired_elf_sources=busy;
+    return ready;
+}
+
 static enum kernel_mm_status drain_elf_sources(
     struct kernel_mm_record *record,
     int unused_only)
 {
     struct kernel_mm_elf_source **link = &record->elf_sources;
     int invalid=0,defer=kernel_lock_held(&record->operations,1);
-    struct kernel_mm_elf_source *released=defer ? NULL : record->retired_elf_sources;
-    if (released) record->retired_elf_sources=NULL;
 
     while (*link != 0) {
         struct kernel_mm_elf_source *entry = *link;
         int in_use = 0;
 
-        if (entry->faults || entry->draining) {
-            if (!unused_only) __builtin_trap();
-            link = &entry->next;
-            continue;
-        }
+        if (!unused_only && entry->faults) __builtin_trap();
         if (entry->source != 0) {
             if (unused_only != 0) {
                 if (record->vmas == 0 ||
@@ -1197,11 +1216,9 @@ static enum kernel_mm_status drain_elf_sources(
         }
         *link = entry->next;
         entry->draining=1;
-        if (defer) {
-            entry->next=record->retired_elf_sources; record->retired_elf_sources=entry;
-        } else { entry->next=released; released=entry; }
+        entry->next=record->retired_elf_sources; record->retired_elf_sources=entry;
     }
-    int failed=release_elf_sources(record,released);
+    int failed=release_elf_sources(record,defer ? NULL : take_ready_elf_sources(record));
     if (invalid) return KERNEL_MM_STATUS_STATE;
     return failed != 0 ? KERNEL_MM_STATUS_CLEANUP_REQUIRED
                        : KERNEL_MM_STATUS_OK;
@@ -2003,9 +2020,8 @@ static uint32_t note_fault_change_locked(struct kernel_mm_record *record,
         if (batch->count) __builtin_trap();
         /* A new translation cannot leave a stale permission or physical page.
          * Invalid walk-cache entries on other harts may fault once; that fault
-         * flushes locally after finding the published PTE. Keep the generation
-         * for joining/re-entering CPUs, without waiting for unrelated harts. */
-        mm_generation_advance(&record->tlb_generation);
+         * flushes locally after finding the published PTE. Joining CPUs flush
+         * the whole root, so no invalidation generation needs to advance. */
         return 0;
     }
 #else
@@ -2079,10 +2095,11 @@ static void mm_operation_end(struct mm_operation *operation)
         record->retired_file_mappings=0;
         struct mm_file_resident *residents=record->retired_file_residents;
         record->retired_file_residents=0;
-        struct kernel_mm_file_source *files=record->retired_file_sources;
-        if (files) record->retired_file_sources=0;
-        struct kernel_mm_elf_source *elfs=record->retired_elf_sources;
-        if (elfs) record->retired_elf_sources=0;
+        /* Close/retry can wait for another MM writer. Keep ready sources
+         * published too while this actor still owes any user-page pins. */
+        int may_close = kernel_io_context_current()->user_pins == NULL;
+        struct kernel_mm_file_source *files=may_close ? take_ready_file_sources(record) : NULL;
+        struct kernel_mm_elf_source *elfs=may_close ? take_ready_elf_sources(record) : NULL;
         struct kernel_mm_shared_anon *shared=record->retired_shared_anon;
         record->retired_shared_anon=0;
         mm_operation_release(operation);
@@ -4758,8 +4775,6 @@ static int sync_mapped_ranges(struct kernel_mm *mm,uint64_t address,uint64_t len
         }
         enum kernel_mm_status acquired=mm_operation_begin(mm,operation);
         if (acquired) return acquired==KERNEL_MM_STATUS_CONFLICT?-KERNEL_EAGAIN:-KERNEL_ENOMEM;
-        enum kernel_mm_status drained=drain_file_sources(operation->record,1);
-        if (drained!=KERNEL_MM_STATUS_OK && drained!=KERNEL_MM_STATUS_CLEANUP_REQUIRED) __builtin_trap();
         if (result || cursor>=end) break;
     }
     return result?result:hole?-KERNEL_ENOMEM:0;
@@ -5509,7 +5524,8 @@ static __attribute__((noinline)) enum kernel_mm_status mapped_file_fault(struct 
         if (status == KERNEL_MM_STATUS_OK) {
             void *bytes = old_bytes;
             if (!cookie && physical_page_map_owned(allocator,source.address,&bytes)) __builtin_trap();
-            memcpy(copy, bytes, BOAROS_PAGE_SIZE);
+            { COST_SCOPE(copy_cost, MM_COW_COPY_TICKS);
+              memcpy(copy, bytes, BOAROS_PAGE_SIZE); }
             MM_DIAGNOSTIC(count++);
         }
     }
@@ -5623,7 +5639,6 @@ finish:
     for (unsigned i=0; i<2; i++) if (prepared.tables[i] != KERNEL_MM_NO_PAGE) physical_page_release(allocator,prepared.tables[i]);
     if (resident) kernel_heap_release(record->vma_heap,resident);
     if (!__atomic_fetch_sub(&file_source->operations, 1, __ATOMIC_RELEASE)) __builtin_trap();
-    if (operation->guard.lock) (void)drain_file_sources(record, 1);
     mm_operation_end(operation);
     return status;
 }
@@ -5880,7 +5895,8 @@ found:
             status = allocate_fault_page(operation, &replacement, &new_pointer);
             if (!status) {
                 if (physical_page_map_owned(allocator, original, &bytes)) __builtin_trap();
-                memcpy(new_pointer, bytes, BOAROS_PAGE_SIZE);
+                { COST_SCOPE(copy_cost, MM_COW_COPY_TICKS);
+                  memcpy(new_pointer, bytes, BOAROS_PAGE_SIZE); }
                 source_shared = 0;
             }
             physical_page_release(allocator, original);
@@ -5909,7 +5925,8 @@ found:
         if (status == KERNEL_MM_STATUS_OK) {
             MM_DIAGNOSTIC(prepared_count++);
             if (cookie) {
-                memcpy(new_pointer, old_pointer, BOAROS_PAGE_SIZE);
+                { COST_SCOPE(copy_cost, MM_COW_COPY_TICKS);
+                  memcpy(new_pointer, old_pointer, BOAROS_PAGE_SIZE); }
             } else {
                 clear_page(new_pointer);
                 if (vma.role == KERNEL_VMA_ROLE_VDSO) {
@@ -6015,7 +6032,6 @@ memory_tables_changed:
     }
     if (object) kernel_memory_object_release(&object);
     if (source_owner && !__atomic_fetch_sub(&source_owner->faults, 1, __ATOMIC_RELEASE)) __builtin_trap();
-    if (operation->guard.lock && source_owner) (void)drain_elf_sources(record, 1);
     for (unsigned i = 0; i < 2; i++) if (prepared.tables[i] != KERNEL_MM_NO_PAGE) physical_page_release(allocator, prepared.tables[i]);
     if (cookie) physical_page_release(allocator, old);
     return status;
@@ -6036,6 +6052,7 @@ static void fault_retry(struct kernel_mm_record *record, uint64_t address)
 static enum kernel_mm_status resolve_user_fault(struct kernel_mm *mm,
     uint64_t address, uint32_t access, int force)
 {
+    COST_SCOPE(fault_cost, MM_FAULT_TICKS);
     for (;;) {
         struct mm_operation operation __attribute__((cleanup(mm_operation_end))) = {0};
         enum kernel_mm_status acquired = force ? mm_operation_begin(mm,&operation) : mm_fault_operation_begin(mm,address,&operation);
@@ -6609,8 +6626,6 @@ static int advise_file(struct mm_operation *operation, const struct kernel_vma *
     }
     if (!__atomic_fetch_sub(borrow, 1, __ATOMIC_RELEASE)) __builtin_trap();
     if (mm_operation_begin(mm, operation)) return -KERNEL_EAGAIN;
-    (void)drain_file_sources(record, 1);
-    (void)drain_elf_sources(record, 1);
     /* Linux accepts the hint even if fadvise/page-in cannot complete it. The
      * remaining range is still validated, without a residency guarantee. */
     return 0;
@@ -6695,7 +6710,6 @@ static int advise_remove(struct mm_operation *operation,const struct kernel_vma 
         (int64_t)offset,(int64_t)(end-address),NULL);
     if (!__atomic_fetch_sub(&source->operations,1,__ATOMIC_RELEASE)) __builtin_trap();
     if (mm_operation_begin(mm,operation)) return error ? error : -KERNEL_EAGAIN;
-    (void)drain_file_sources(record,1);
     return error;
 }
 
@@ -6983,11 +6997,8 @@ int kernel_mm_mincore(struct kernel_mm *mm, uint64_t address, unsigned count,
             if (object) kernel_memory_object_release(&object);
             if (borrow && !__atomic_fetch_sub(borrow, 1, __ATOMIC_RELEASE)) __builtin_trap();
             if (mm_operation_begin(mm, &operation)) return -KERNEL_EAGAIN;
-            if (borrow) {
-                (void)drain_file_sources(record, 1);
-                (void)drain_elf_sources(record, 1);
-            }
-            if (generation != kernel_vma_set_generation(record->vmas)) continue;
+            int changed = generation != kernel_vma_set_generation(record->vmas);
+            if (changed) continue;
         }
         output[i] = (unsigned char)present;
         *completed = ++i;

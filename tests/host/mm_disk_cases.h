@@ -2,11 +2,19 @@
 #include <kernel/mm_backend.h>
 #include <kernel/uaccess.h>
 #include <kernel/open_file.h>
+#include <kernel/vma.h>
 #include "../../fs/open_file_internal.h"
 extern _Thread_local uint64_t mm_test_context;
 void mm_test_bind(struct kernel_mm *);
 #include <ext4.h>
 static _Thread_local unsigned *disk_raw_observe;
+static _Thread_local unsigned disk_forbid_backing_scans;
+enum kernel_vma_status __real_kernel_vma_set_backing_in_use(const struct kernel_vma_set *,const void *,int *);
+enum kernel_vma_status __wrap_kernel_vma_set_backing_in_use(const struct kernel_vma_set *set,const void *backing,int *used)
+{
+    assert(!disk_forbid_backing_scans && "unchanged file advice/query must not scan backing membership");
+    return __real_kernel_vma_set_backing_in_use(set,backing,used);
+}
 void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *,struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_raw_guard *guard)
 {
@@ -169,6 +177,13 @@ static void disk_mm_case(struct kernel_page_cache *cache,struct kernel_heap *hea
     struct kernel_mm_mapping p,c;
     assert(!kernel_mm_lookup(&parent,shared,&p) && !kernel_mm_lookup(&child,shared,&c) && p.physical_address==c.physical_address);
     mm_test_bind(0); assert(!kernel_mm_context(&parent,&mm_test_context));
+    disk_forbid_backing_scans=1;
+    assert(!kernel_mm_madvise(&parent,shared,BOAROS_PAGE_SIZE,KERNEL_MM_ADVICE_WILLNEED));
+    unsigned char resident; unsigned completed;
+    assert(!kernel_mm_mincore(&parent,shared,1,&resident,&completed) && completed==1 && resident);
+    assert(!kernel_mm_resolve_user_fault(&parent,shared,KERNEL_MM_READ));
+    disk_forbid_backing_scans=0;
+    puts("PASS real ext4 MM: unchanged WILLNEED/mincore/resident fault avoid VMA backing scans");
     /* 新页在不同MM同时准备：worker只读一次，最终PTE共享同一页。 */
     disk_cohort(&parent,&child,shared+BOAROS_PAGE_SIZE,2);
     assert(!kernel_mm_munmap(&parent,shared+BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE));
