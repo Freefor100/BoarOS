@@ -31,6 +31,9 @@ static unsigned capture, entered[5], resume, fail_heap, fail_page, capture_alloc
 static _Thread_local unsigned local_tlb_fences;
 static _Thread_local int rendezvous_file_read;
 static unsigned file_read_fences;
+static _Thread_local int private_reader;
+static unsigned publication_writers;
+static uint64_t parallel_private_address;
 enum kernel_heap_status __real_kernel_heap_allocate_zeroed(struct kernel_heap *,size_t,size_t,void **);
 enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t n,size_t size,void **out)
 {
@@ -57,6 +60,8 @@ static unsigned callback_pause, callback_entered, callback_resume, truncate_done
 void __real_kernel_rwlock_write(struct kernel_rwlock *,struct kernel_lock_guard *);
 void __wrap_kernel_rwlock_write(struct kernel_rwlock *lock,struct kernel_lock_guard *guard)
 {
+    if (private_reader && lock->rank==25)
+        __atomic_fetch_add(&publication_writers,1,__ATOMIC_RELAXED);
     if (kernel_cpu_current()->hardware_id==5 && lock->rank==25 &&
         __atomic_exchange_n(&callback_pause,0,__ATOMIC_ACQ_REL)) {
         assert(!kernel_cpu_current()->raw_locks && !kernel_lock_held(&kernel_open_file_node(controller)->io_lock,0));
@@ -359,6 +364,36 @@ static void futex_key_lifetime(void)
 
 /* A present file translation still needs a local flush after a hardware
  * fault. Both readers must reach their own flush before either returns. */
+static void *private_first_reader(void *opaque)
+{
+    unsigned index=(unsigned)(uintptr_t)opaque;
+    mm_test_attach(index+8);
+    mm_test_context=roots[1];
+    private_reader=1;
+    assert(!kernel_mm_resolve_user_fault(&parent,parallel_private_address+(index+1)*BOAROS_PAGE_SIZE,KERNEL_MM_READ));
+    private_reader=0;
+    return NULL;
+}
+static void parallel_private_faults(void)
+{
+    struct kernel_open_file_description *owner=controller;
+    assert(!kernel_open_file_acquire(owner));
+    assert(!kernel_mm_mmap_file_private(&parent,&owner,0xc0000,3*BOAROS_PAGE_SIZE,0,
+        KERNEL_MM_READ,KERNEL_MM_MAP_FIXED,&parallel_private_address));
+    /* Reserve the resident table with a real fault; the following first
+     * faults must not exclude a reader already using this same MM. */
+    assert(!kernel_mm_resolve_user_fault(&parent,parallel_private_address,KERNEL_MM_READ));
+    pthread_t readers[2];
+    for(unsigned i=0;i<2;i++)assert(!pthread_create(&readers[i],NULL,private_first_reader,(void *)(uintptr_t)i));
+    for(unsigned i=0;i<2;i++)assert(!pthread_join(readers[i],NULL));
+    assert(publication_writers==0);
+    struct kernel_mm_mapping a,b;
+    assert(!kernel_mm_lookup(&parent,parallel_private_address+BOAROS_PAGE_SIZE,&a));
+    assert(!kernel_mm_lookup(&parent,parallel_private_address+2*BOAROS_PAGE_SIZE,&b));
+    assert(a.physical_address!=b.physical_address && !(a.permissions&KERNEL_MM_WRITE) && !(b.permissions&KERNEL_MM_WRITE));
+    assert(!kernel_mm_munmap(&parent,parallel_private_address,3*BOAROS_PAGE_SIZE));
+    puts("private file first faults publish under shared MM permission and return all page owners");
+}
 static void *resident_file_fault(void *argument)
 {
     unsigned id = (unsigned)(uintptr_t)argument;
@@ -422,7 +457,7 @@ int main(void)
     byte=0; assert(!kernel_copy_from_user(&child,&byte,mapped,1,&done) && done==1 && byte==0x73);
     mm_test_context=roots[1];
     futex_key_lifetime();
-    first_fault(2); first_fault(4); adjacent_table_removal(); stale_shrink(); fault_failures(); unregister_callback(); private_case();
+    first_fault(2); first_fault(4); adjacent_table_removal(); stale_shrink(); fault_failures(); unregister_callback(); private_case(); parallel_private_faults();
     mm_test_context=0;
     for (unsigned id=1; id<=4; id++) assert(!kernel_mm_release(&views[id]));
     assert(!kernel_mm_release(&child) && !kernel_mm_release(&parent));

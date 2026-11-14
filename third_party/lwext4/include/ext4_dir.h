@@ -184,6 +184,11 @@ static inline void ext4_dir_en_set_inode_type(struct ext4_sblock *sb,
 bool ext4_dir_csum_verify(struct ext4_inode_ref *inode_ref,
 			  struct ext4_dir_en *dirent);
 
+/* Reuse validation only for this immutable payload and directory identity.
+ * The extra kind bit distinguishes leaf and HTree checksum layouts. */
+uint64_t ext4_dir_check_key(const struct ext4_inode_ref *, int indexed);
+bool ext4_dir_block_csum_verify(struct ext4_inode_ref *, const struct ext4_block *);
+
 /* Validate every directory block before reporting it empty. */
 int ext4_dir_check_empty(struct ext4_inode_ref *dir, bool *empty);
 

@@ -3,6 +3,7 @@
 #include "lwext4_metadata.c"
 #undef main
 #include <ext4_dir.h>
+#include <ext4_dir_idx.h>
 #include <stddef.h>
 
 static ext4_file *second_reader;
@@ -13,6 +14,8 @@ static bool armed, changed;
 static uint32_t directory_reader, nested_inode, nested_mode;
 static int nested_status;
 static unsigned crc_calls;
+static struct ext4_block_payload *invalidate_directory;
+static const void *directory_check_bytes;
 static struct ext4_fs *qualify_fs;
 static uint32_t qualify_inode;
 static struct ext4_inode_ref qualified_writer;
@@ -47,7 +50,14 @@ uint32_t __wrap_ext4_crc32c(uint32_t seed, const void *bytes, uint32_t length)
             nested_status = ext4_fraw_inode_fill(second_reader, &inode);
         }
     }
-    return __real_ext4_crc32c(seed, bytes, length);
+    uint32_t result=__real_ext4_crc32c(seed, bytes, length);
+    if (invalidate_directory && bytes == directory_check_bytes) {
+        /* The writer's qualification wins after the calculation and before
+         * the reader tries to publish its successful validation. */
+        ext4_block_payload_write(invalidate_directory);
+        invalidate_directory=NULL;
+    }
+    return result;
 }
 
 static void readonly_directory_queries(struct ext4_fs *fs, struct ext4_blockdev *dev)
@@ -57,11 +67,12 @@ static void readonly_directory_queries(struct ext4_fs *fs, struct ext4_blockdev 
     CHECK(ext4_transaction_begin("/") == EOK);
     payload_threshold = dev->lg_bsize;
     payload_allocations = 0;
+    unsigned warmed_crc = crc_calls;
     for (unsigned i = 0; i < 8; i++)
         CHECK(ext4_lookup_child("/", EXT4_INODE_ROOT_INDEX, "file", 4, &ino, &mode) == EOK);
-    printf("directory read: block=%u lookup-payload-allocations=%u\n",
-        dev->lg_bsize, payload_allocations);
-    CHECK(!payload_allocations);
+    printf("directory read: block=%u lookup-payload-allocations=%u repeated-CRC=%u\n",
+        dev->lg_bsize, payload_allocations,crc_calls-warmed_crc);
+    CHECK(!payload_allocations && crc_calls == warmed_crc);
     struct ext4_inode_ref directory;
     CHECK(ext4_fs_get_inode_ref_read(fs, EXT4_INODE_ROOT_INDEX, &directory) == EOK);
     payload_allocations = 0;
@@ -69,6 +80,22 @@ static void readonly_directory_queries(struct ext4_fs *fs, struct ext4_blockdev 
     CHECK(ext4_dir_iterator_init(&it, &directory, 0) == EOK);
     while (it.curr) CHECK(ext4_dir_iterator_next(&it) == EOK);
     CHECK(ext4_dir_iterator_fini(&it) == EOK);
+    ext4_fsblk_t home;
+    struct ext4_block block;
+    CHECK(ext4_fs_get_inode_dblk_idx(&directory,0,&home,false)==EOK);
+    CHECK(ext4_block_get(dev,&block,home)==EOK);
+    __atomic_store_n(&block.payload->directory_verified,0,__ATOMIC_RELEASE);
+    directory_check_bytes=block.data;
+    invalidate_directory=block.payload;
+    bool indexed=ext4_inode_has_flag(directory.inode,EXT4_INODE_FLAG_INDEX);
+    CHECK(indexed ? ext4_dir_dx_check(&directory,&block)==EOK :
+        ext4_dir_block_csum_verify(&directory,&block));
+    CHECK(!invalidate_directory && block.payload->directory_verified==UINT64_MAX);
+    unsigned before=crc_calls;
+    CHECK(indexed ? ext4_dir_dx_check(&directory,&block)==EOK :
+        ext4_dir_block_csum_verify(&directory,&block));
+    CHECK(crc_calls>before);
+    CHECK(ext4_block_set(dev,&block)==EOK);
     CHECK(ext4_fs_put_inode_ref(&directory) == EOK);
     printf("directory read: block=%u iterator-payload-allocations=%u\n",
         dev->lg_bsize, payload_allocations);
@@ -82,6 +109,16 @@ static void readonly_directory_queries(struct ext4_fs *fs, struct ext4_blockdev 
     CHECK(ext4_transaction_abort("/", ECANCELED) == ECANCELED);
     CHECK(ext4_lookup_child("/", EXT4_INODE_ROOT_INDEX, "directory-private", 17,
         &ino, &mode) == ENOENT);
+    CHECK(ext4_fopen(&child,"/directory-accepted","w+")==EOK);
+    CHECK(ext4_fclose(&child)==EOK);
+    CHECK(ext4_lookup_child("/",EXT4_INODE_ROOT_INDEX,"directory-accepted",18,&ino,&mode)==EOK);
+    CHECK(ext4_fs_get_inode_ref_read(fs,EXT4_INODE_ROOT_INDEX,&directory)==EOK);
+    CHECK(ext4_fs_get_inode_dblk_idx(&directory,0,&home,false)==EOK);
+    CHECK(ext4_block_get(dev,&block,home)==EOK);
+    CHECK(block.payload->directory_verified==ext4_dir_check_key(&directory,
+        ext4_inode_has_flag(directory.inode,EXT4_INODE_FLAG_INDEX)));
+    CHECK(ext4_block_set(dev,&block)==EOK);
+    CHECK(ext4_fs_put_inode_ref(&directory)==EOK);
 }
 
 static void reuse_queries(struct ext4_fs *fs, struct ext4_blockdev *dev)
@@ -205,6 +242,9 @@ int main(int argc, char **argv)
         CHECK(ext4_fs_get_inode_dblk_idx(&ref, 0, &address, false) == EOK);
         struct ext4_block index;
         CHECK(ext4_block_get(&dev, &index, address) == EOK);
+        /* Model the first read of this byte version, even if earlier
+         * directory setup already warmed its validation result. */
+        __atomic_store_n(&index.payload->directory_verified,0,__ATOMIC_RELEASE);
         observed = index.data; observed_size = dev.lg_bsize;
         CHECK(observed_size <= sizeof(original));
         memcpy(original, observed, observed_size);
@@ -223,6 +263,7 @@ int main(int argc, char **argv)
               outer_mode == nested_mode && (outer_mode & EXT4_INODE_MODE_TYPE_MASK) == EXT4_INODE_MODE_FILE);
         CHECK(!memcmp(original, observed, observed_size));
         /* The immutable verification must still reject an actual bad tail. */
+        ext4_block_payload_write(index.payload);
         observed[tail + offsetof(struct ext4_dir_idx_tail, checksum)] ^= 1;
         int corrupt = ext4_lookup_child("/", directory_reader, "target", 6,
             &outer_inode, &outer_mode);

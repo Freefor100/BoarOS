@@ -343,6 +343,18 @@ static void ext4_dir_set_dx_csum(struct ext4_inode_ref *inode_ref,
 #define ext4_dir_dx_csum_verify(...) true
 #define ext4_dir_set_dx_csum(...)
 #endif
+static bool ext4_dir_dx_block_verify(struct ext4_inode_ref *inode, const struct ext4_block *block)
+{
+    uint64_t key = ext4_dir_check_key(inode, 1);
+    uint64_t observed = __atomic_load_n(&block->payload->directory_verified, __ATOMIC_ACQUIRE);
+    if (key && observed == key) return true;
+    if (!ext4_dir_dx_csum_verify(inode, (void *)block->data)) return false;
+    if (key && observed != UINT64_MAX)
+        (void)__atomic_compare_exchange_n(&block->payload->directory_verified,
+            &observed, key, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    return true;
+}
+
 
 /****************************************************************************/
 
@@ -623,7 +635,7 @@ static int ext4_dir_dx_get_leaf(struct ext4_hash_info *hinfo,
 		if (limit != entry_space)
 			return EXT4_ERR_BAD_DX_DIR;
 
-		if (!ext4_dir_dx_csum_verify(inode_ref, (void *)tmp_blk->data))
+		if (!ext4_dir_dx_block_verify(inode_ref, tmp_blk))
 			return EUCLEAN;
 	}
 
@@ -683,7 +695,7 @@ static int ext4_dir_dx_next_block(struct ext4_inode_ref *inode_ref,
 		if (r != EOK)
 			return r;
 
-		if (!ext4_dir_dx_csum_verify(inode_ref, (void *)b.data)) {
+		if (!ext4_dir_dx_block_verify(inode_ref, &b)) {
 			ext4_block_set(inode_ref->fs->bdev, &b);
 			return EUCLEAN;
 		}
@@ -724,7 +736,7 @@ int ext4_dir_dx_find_entry(struct ext4_dir_search_result *result,
 	if (rc != EOK)
 		return rc;
 
-	if (!ext4_dir_dx_csum_verify(inode_ref, (void *)root_block.data)) {
+	if (!ext4_dir_dx_block_verify(inode_ref, &root_block)) {
 		ext4_block_set(fs->bdev, &root_block);
 		return EUCLEAN;
 	}
@@ -767,7 +779,7 @@ int ext4_dir_dx_find_entry(struct ext4_dir_search_result *result,
 		if (rc != EOK)
 			goto cleanup;
 
-		if (!ext4_dir_csum_verify(inode_ref, (void *)b.data)) {
+		if (!ext4_dir_block_csum_verify(inode_ref, &b)) {
 			ext4_block_set(fs->bdev, &b);
 			rc = EUCLEAN;
 			goto cleanup;
@@ -1229,7 +1241,7 @@ int ext4_dir_dx_add_entry(struct ext4_inode_ref *parent,
 	if (r != EOK)
 		return r;
 
-	if (!ext4_dir_dx_csum_verify(parent, (void*)root_blk.data)) {
+	if (!ext4_dir_dx_block_verify(parent, &root_blk)) {
 		ext4_block_set(fs->bdev, &root_blk);
 		return EUCLEAN;
 	}
@@ -1275,7 +1287,7 @@ int ext4_dir_dx_add_entry(struct ext4_inode_ref *parent,
 	if (r != EOK)
 		goto release_index;
 
-	if (!ext4_dir_csum_verify(parent,(void *)target_block.data)) {
+	if (!ext4_dir_block_csum_verify(parent, &target_block)) {
 		r = EUCLEAN;
 		goto release_target_index;
 	}
@@ -1347,7 +1359,7 @@ int ext4_dir_dx_reset_parent_inode(struct ext4_inode_ref *dir,
 	if (rc != EOK)
 		return rc;
 
-	if (!ext4_dir_dx_csum_verify(dir, (void *)block.data)) {
+	if (!ext4_dir_dx_block_verify(dir, &block)) {
 		ext4_block_set(dir->fs->bdev, &block);
 		return EUCLEAN;
 	}
@@ -1395,7 +1407,7 @@ int ext4_dir_dx_check(struct ext4_inode_ref *dir, struct ext4_block *block)
         uint32_t child = ext4_dir_dx_entry_get_block(&entries[i]);
         if (!child || child >= blocks) return EUCLEAN;
     }
-    return ext4_dir_dx_csum_verify(dir, (void *)block->data) ? EOK : EUCLEAN;
+    return ext4_dir_dx_block_verify(dir, block) ? EOK : EUCLEAN;
 }
 
 int ext4_dir_dx_is_node(struct ext4_inode_ref *dir, uint32_t logical, bool *is_node)
@@ -1444,7 +1456,7 @@ static int ext4_dir_parent_block(struct ext4_inode_ref *dir, struct ext4_block *
     struct ext4_dir_en *parent = (void *)(block->data + 12);
     bool indexed = ext4_inode_has_flag(dir->inode, EXT4_INODE_FLAG_INDEX);
     if (indexed) r = ext4_dir_dx_check(dir, block);
-    else if (!ext4_dir_csum_verify(dir, dot)) r = EUCLEAN;
+    else if (!ext4_dir_block_csum_verify(dir, block)) r = EUCLEAN;
     uint32_t ino = ext4_dir_en_get_inode(parent);
     uint16_t length = ext4_dir_en_get_entry_len(parent);
     if (r == EOK && (ext4_dir_en_get_entry_len(dot) != 12 ||
