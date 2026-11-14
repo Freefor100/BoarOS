@@ -3825,6 +3825,8 @@ uint64_t kernel_page_cache_reclaim(struct kernel_page_cache *cache,uint64_t targ
       }
     }
     if (!remote_cache_client() && !kernel_lock_held(&cache->record->group->walk.lock,1)) { uint64_t extra=0;(void)drain_entries(cache,&extra); }
+    if (released<target_pages)
+        released+=kernel_vfs_reclaim_clean(cache->allocator,target_pages-released);
     return released;
 }
 

@@ -33,6 +33,7 @@ uint64_t riscv_file_io_retained_shared_pages(void);
 #endif
 #define DATA UINT64_C(0x40000)
 #define CODE UINT64_C(0x40000000)
+#define NEW_DATA UINT64_C(0x60000000)
 static struct physical_page_allocator *system_pages;
 static struct physical_page_allocator arena;
 static struct kernel_heap heap;
@@ -46,6 +47,8 @@ static unsigned pin_try, pin_conflict;
 static unsigned hardware_cached, hardware_protected, hardware_denied, hardware_remapped;
 static unsigned fence_armed, fence_entered, fence_release, remote_instruction;
 static unsigned execute_cached, code_replaced;
+static unsigned new_mapping_faulted, new_mapping_published;
+static uint64_t new_mapping_address;
 static struct kernel_mm child;
 static struct kernel_thread_join fork_join, cow_join;
 static unsigned fork_done, cow_ready[2], cow_go;
@@ -451,6 +454,39 @@ static void actor(void *argument)
         } else if (operation == 12) {
             __atomic_store_n(&completed[id], 1, __ATOMIC_RELEASE);
             return;
+        } else if (operation == 40) {
+            uint64_t placed;
+            require(!kernel_mm_mmap_anonymous(mm, NEW_DATA, 2 * BOAROS_PAGE_SIZE,
+                KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED, &placed) && placed == NEW_DATA,
+                "mm-new-translation-vma");
+        } else if (operation == 41) {
+            /* Touch the invalid translation on the remote hart before the
+             * publisher installs either a new parent or an existing-table leaf. */
+            uintptr_t irq = arch_interrupt_save(); unsigned cpu = kernel_cpu_current()->logical_id;
+            probes[cpu].pc = (uintptr_t)mm_smp_store_pc; probes[cpu].cause = RISCV_SCAUSE_STORE_PAGE_FAULT;
+            probes[cpu].address = new_mapping_address; probes[cpu].caught = 0; probes[cpu].armed = 1;
+            mm_smp_store(new_mapping_address, 0);
+            require(probes[cpu].caught, "mm-new-translation-hardware-miss"); probes[cpu].armed = 0;
+            arch_interrupt_restore(irq);
+            __atomic_store_n(&new_mapping_faulted, 1, __ATOMIC_RELEASE);
+            uint64_t end = riscv_time_read() + UINT64_C(50000000);
+            while (!__atomic_load_n(&new_mapping_published, __ATOMIC_ACQUIRE))
+                require((int64_t)(riscv_time_read() - end) < 0, "mm-new-translation-published");
+            require(!kernel_mm_resolve_user_fault(mm, new_mapping_address, KERNEL_MM_WRITE),
+                "mm-new-translation-spurious-fault");
+            require(mm_smp_load(new_mapping_address) == 0, "mm-new-translation-zero");
+            mm_smp_store(new_mapping_address, UINT64_C(0x5a1234));
+            require(mm_smp_load(new_mapping_address) == UINT64_C(0x5a1234), "mm-new-translation-retry");
+        } else if (operation == 42) {
+            uint64_t fences = kernel_cpu_current()->rfence_requests;
+            struct kernel_mm_concurrency_state state;
+            kernel_mm_get_concurrency_state(mm, &state);
+            require(state.active_cpus & 2U, "mm-new-translation-remote-still-active");
+            require(!kernel_mm_resolve_user_fault(mm, new_mapping_address, KERNEL_MM_WRITE),
+                "mm-new-translation-publish");
+            require(kernel_cpu_current()->rfence_requests == fences, "mm-new-translation-no-remote-RFENCE");
+        } else if (operation == 43) {
+            require(!kernel_mm_munmap(mm, NEW_DATA, 2 * BOAROS_PAGE_SIZE), "mm-new-translation-owners-return");
         }
 #if BOAROS_MM_SHARED_TEST
         else if(operation==20) {
@@ -920,6 +956,19 @@ static void execute(void *unused)
             physical_page_available(system_pages) == available, "mm-create-failure-keeps-caller-owner");
         require(kernel_mm_release(&owner) == KERNEL_MM_STATUS_OK, "mm-create-failure-caller-return");
     }
+    if (cpu_count == 2) {
+        request(0, 40);
+        for (unsigned i = 0; i < 2; i++) {
+            new_mapping_address = NEW_DATA + i * BOAROS_PAGE_SIZE;
+            new_mapping_faulted = new_mapping_published = 0;
+            send(1, 41); wait_flag(&new_mapping_faulted, "mm-new-translation-remote-miss");
+            request(0, 42);
+            __atomic_store_n(&new_mapping_published, 1, __ATOMIC_RELEASE);
+            wait_flag(&completed[1], "mm-new-translation-remote-retry");
+        }
+        request(0, 43);
+        virt_uart_puts("BoarOS: MM SMP new nonleaf/leaf local publication and remote hardware retry passed\n");
+    }
     send(1, 1); wait_flag(&pin_held, "mm-old-write-pin-ready");
     send(0, 2);
     for (;;) {
@@ -1160,7 +1209,10 @@ void riscv_smp_test_poll(void)
 {
     if (!__atomic_load_n(&done, __ATOMIC_ACQUIRE)) return;
     { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-      require(!scheduler.all_tasks && !scheduler.task_count && !scheduler.runqueue.first &&
+      KERNEL_RUN_SET(runs);
+      for (struct kernel_cpu *cpu=scheduler.cpus;cpu;cpu=cpu->scheduler_next)
+          require(!cpu->runqueue.count, "mm-final-ready-owner-baseline");
+      require(!scheduler.all_tasks && !scheduler.task_count &&
           !scheduler.retired_pending && !scheduler.retired_tasks && !scheduler.controlled_owners &&
           !kernel_cpu_current()->active_mm_record, "mm-final-task-and-CPU-owner-baseline"); }
     require(physical_page_available(system_pages) == baseline &&

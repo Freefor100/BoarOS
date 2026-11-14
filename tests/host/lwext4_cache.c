@@ -332,4 +332,26 @@ static void idle_order(void)
     finish(&cache);
     puts("cache LRU eviction follows idle age, without making a recent return oldest");
 }
-int main(void) { ready_read_work();idle_order();competing_allocation();concurrent_load();cycle(8,0,7,100);cycle(8,0,8,100);cycle(8,8,1,100);cycle(8,8,2,100);cycle(8,8,8,100);cycle(64,8,1,100);contracts();batch_contracts();invalid_physical_batch();return 0; }
+static void pressure_reclaim(void)
+{
+    struct ext4_bcache cache;struct ext4_blockdev dev;struct ext4_blockdev_iface iface;
+    struct ext4_block held={0},dirty={0},journal={0};
+    init(&cache,&dev,&iface,256);
+    get(&dev,&held,200);
+    get(&dev,&dirty,201);ext4_bcache_set_flag(dirty.buf,BC_DIRTY);
+    CHECK(ext4_bcache_free(&cache,&dirty)==EOK);
+    get(&dev,&journal,202);journal.buf->journal_pending=1;
+    CHECK(ext4_bcache_free(&cache,&journal)==EOK);
+    for (unsigned i=0;i<128;i++) warm(&dev,i);
+    unsigned before=reads;
+    for (unsigned i=0;i<128;i++) warm(&dev,i);
+    CHECK(reads==before); /* The metadata working set fits without rereading. */
+    CHECK(ext4_bcache_reclaim(&cache)==128);
+    CHECK(cache.ref_blocks==3 && !writes && held.buf->refctr==1);
+    get(&dev,&journal,202);journal.buf->journal_pending=0;
+    CHECK(ext4_bcache_free(&cache,&journal)==EOK);
+    CHECK(ext4_bcache_free(&cache,&held)==EOK);
+    finish(&cache);
+    puts("cache pressure releases clean idle metadata, retaining loans/dirty/journal owners");
+}
+int main(void) { pressure_reclaim();ready_read_work();idle_order();competing_allocation();concurrent_load();cycle(8,0,7,100);cycle(8,0,8,100);cycle(8,8,1,100);cycle(8,8,2,100);cycle(8,8,8,100);cycle(64,8,1,100);contracts();batch_contracts();invalid_physical_batch();return 0; }

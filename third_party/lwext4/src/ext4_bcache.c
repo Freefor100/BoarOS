@@ -436,6 +436,30 @@ int ext4_bcache_shake(struct ext4_bcache *bc)
     return result;
 }
 
+uint32_t ext4_bcache_reclaim(struct ext4_bcache *bc)
+{
+    uint32_t remaining, reclaimed=0;
+    { KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);remaining=bc->idle_blocks; }
+    /* Bound this pass to the starting population. Rotate protected owners so
+     * a dirty head cannot hide clean victims, without retaining an unlocked
+     * list cursor that a concurrent borrower could remove and free. */
+    while (remaining--) {
+        struct ext4_buf *victim=NULL;
+        {
+            KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
+            struct ext4_buf *buf=bc->lru_head;
+            if (!buf) break;
+            if (!buf->journal_pending && !ext4_bcache_test_flag(buf,BC_DIRTY)) {
+                drop_locked(bc,buf);victim=buf;
+            } else {
+                idle_remove_locked(bc,buf);idle_append_locked(bc,buf);
+            }
+        }
+        if (victim) { COST_ADD(BLOCK_CACHE_EVICTIONS,1);free_buffer(victim);reclaimed++; }
+    }
+    return reclaimed;
+}
+
 void ext4_bcache_scope_begin(struct ext4_bcache *bc, struct ext4_writeback_scope *scope)
 {
     KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);

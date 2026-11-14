@@ -529,6 +529,55 @@ static void instance_register(struct kernel_vfs_instance *instance)
     if (instance->active_next) instance->active_next->active_previous=&instance->active_next;
     active_instances=instance;
 }
+static int can_reclaim_clean(const struct kernel_vfs_instance *instance,
+    const struct physical_page_allocator *allocator)
+{
+    return instance->ops->reclaim_clean && instance->heap->page_allocator==allocator &&
+        instance->backend_mount.state==VFS_MOUNT_STATE_LIVE && !instance->quiescing &&
+        !instance->cleanup_running && !instance->cleanup_queued && instance->views;
+}
+uint64_t kernel_vfs_reclaim_clean(struct physical_page_allocator *allocator,uint64_t target_pages)
+{
+    if (!target_pages) return 0;
+    struct kernel_vfs_instance *current=NULL;
+    size_t remaining=0;
+    {
+        KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+        for (struct kernel_vfs_instance *it=active_instances;it;it=it->active_next) {
+            remaining++;
+            if (!current && can_reclaim_clean(it,allocator)) current=it;
+        }
+        if (current) {
+            if (current->transient_owners==SIZE_MAX) __builtin_trap();
+            current->transient_owners++;
+        }
+    }
+    uint64_t released=0;
+    while (current && remaining--) {
+        uint64_t before=physical_page_available(allocator);
+        current->ops->reclaim_clean(current);
+        uint64_t after=physical_page_available(allocator);
+        if (after>before) released+=after-before;
+        KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+        /* The current owner keeps its registry links alive. Borrow the next
+         * eligible instance before returning this owner; never keep a raw
+         * next pointer across unlock. New registrations are prepended, and
+         * the initial population also bounds this pass. */
+        struct kernel_vfs_instance *next=NULL;
+        if (released<target_pages && remaining) {
+            for (next=current->active_next;next;next=next->active_next)
+                if (can_reclaim_clean(next,allocator)) break;
+            if (next) {
+                if (next->transient_owners==SIZE_MAX) __builtin_trap();
+                next->transient_owners++;
+            }
+        }
+        if (!current->transient_owners) __builtin_trap();
+        current->transient_owners--;
+        current=next;
+    }
+    return released;
+}
 void kernel_vfs_mount_initialize(struct kernel_vfs_mount *mount)
 {
     if (!mount || !mount->private_data || mount->backend_owner) return;
@@ -641,6 +690,21 @@ static int release_instance_owned(struct kernel_vfs_instance *instance)
     }
     return result;
 }
+static struct kernel_vfs_instance *take_ready_instances(struct kernel_vfs_instance **queue)
+{
+    struct kernel_vfs_instance *first=__atomic_load_n(queue,__ATOMIC_RELAXED);
+    struct kernel_vfs_instance *batch=NULL,**tail=&batch,**link=&first;
+    while (*link) {
+        struct kernel_vfs_instance *instance=*link;
+        if (instance->transient_owners) {link=&instance->cleanup_next;continue;}
+        if (instance->cleanup_running) __builtin_trap();
+        *link=instance->cleanup_next;
+        instance->cleanup_next=NULL;instance->cleanup_queued=0;instance->cleanup_running=1;
+        *tail=instance;tail=&instance->cleanup_next;
+    }
+    __atomic_store_n(queue,first,__ATOMIC_RELEASE);
+    return batch;
+}
 static int drain_instances(int retry_failed)
 {
     if (!__atomic_load_n(&retired_mount_trees,__ATOMIC_ACQUIRE) &&
@@ -666,16 +730,12 @@ static int drain_instances(int retry_failed)
         struct kernel_vfs_instance *batch;
         {
             KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
-            batch=__atomic_exchange_n(&retired_instances,NULL,__ATOMIC_ACQ_REL);
+            batch=take_ready_instances(&retired_instances);
             if (retry_failed) {
                 struct kernel_vfs_instance **tail=&batch;
                 while (*tail) tail=&(*tail)->cleanup_next;
-                *tail=__atomic_exchange_n(&pending_instances,NULL,__ATOMIC_ACQ_REL);
+                *tail=take_ready_instances(&pending_instances);
                 retry_failed=0;
-            }
-            for (struct kernel_vfs_instance *it=batch;it;it=it->cleanup_next) {
-                if (it->cleanup_running) __builtin_trap();
-                it->cleanup_queued=0;it->cleanup_running=1;
             }
         }
         if (!batch) break;
@@ -707,7 +767,7 @@ static int mount_release(struct kernel_vfs_mount *mount,struct kernel_vfs_instan
         if (mount->instance_next) mount->instance_next->instance_previous=mount->instance_previous;
         mount->instance_next=NULL;mount->instance_previous=NULL;
         final=!--instance->mount_views;
-        if (final && cleanup_owner) {
+        if (final && cleanup_owner && !instance->transient_owners) {
             instance->cleanup_running=1;*cleanup_owner=instance;
             if (!dynamic) instance->retry_view=mount;
         }
@@ -716,7 +776,7 @@ static int mount_release(struct kernel_vfs_mount *mount,struct kernel_vfs_instan
     }
     if (root) dentry_release(&root);
     if (dynamic) kernel_heap_release(instance->heap,mount);
-    if (final && !cleanup_owner) {
+    if (final && (!cleanup_owner || !*cleanup_owner)) {
         KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
         instance->cleanup_next=__atomic_load_n(&retired_instances,__ATOMIC_RELAXED);
         __atomic_store_n(&retired_instances,instance,__ATOMIC_RELEASE);instance->cleanup_queued=1;
@@ -4503,7 +4563,7 @@ uint32_t kernel_vfs_internal_file_count(struct kernel_vfs_instance *instance)
 int kernel_vfs_nodes_internal_idle(struct kernel_vfs_instance *instance)
 {
     KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
-    if (instance->retiring_nodes) return 0;
+    if (instance->transient_owners) return 0;
     /* prepare 已核对 external_files 全部属于 canonical dentry；这里只排除
      * 缓存、异步时间与退休回调等额外 node owner，避免按每个 node 重扫目录项。 */
     for (struct kernel_vfs_node *node=instance->nodes;node;node=node->next)
@@ -4513,14 +4573,14 @@ int kernel_vfs_nodes_internal_idle(struct kernel_vfs_instance *instance)
 int kernel_vfs_nodes_idle(struct kernel_vfs_instance *instance, struct kernel_vfs_node *root)
 {
     KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
-    return !instance->retiring_nodes && instance->nodes == root && (!root || !root->next);
+    return !instance->transient_owners && instance->nodes == root && (!root || !root->next);
 }
 
 static void node_retirement_end(struct kernel_vfs_instance *instance)
 {
     KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
-    if (!instance->retiring_nodes) __builtin_trap();
-    instance->retiring_nodes--;
+    if (!instance->transient_owners) __builtin_trap();
+    instance->transient_owners--;
 }
 
 struct kernel_vfs_node *kernel_vfs_file_node(
@@ -4589,8 +4649,8 @@ int kernel_vfs_node_release(struct kernel_vfs_node **owner)
         if (node->next) node->next->previous = node->previous;
         node->previous = 0; node->next = 0;
         node->instance->node_count--;
-        if (node->instance->retiring_nodes == SIZE_MAX) __builtin_trap();
-        node->instance->retiring_nodes++;
+        if (node->instance->transient_owners == SIZE_MAX) __builtin_trap();
+        node->instance->transient_owners++;
         kernel_task_lock_release(&irq);
         break;
     }
@@ -4768,7 +4828,7 @@ int kernel_vfs_mount_reconfigure(struct kernel_vfs_path *root,uint64_t flags,uin
         /* Read-only mappings retain their OFD too; unlinked readers retain
          * an eventual inode deletion which still needs a writable backend. */
         KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
-        if (instance->cleanup_nodes || instance->retiring_nodes) return -KERNEL_EBUSY;
+        if (instance->cleanup_nodes || instance->transient_owners) return -KERNEL_EBUSY;
         for (struct kernel_vfs_node *node=instance->nodes;node;node=node->next)
             if (node->write_openers || node->unlinked) return -KERNEL_EBUSY;
     }
@@ -5041,7 +5101,7 @@ int kernel_vfs_unmount(struct kernel_vfs_mount *mount)
         KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
         instance=mount->private_data;
         if (!instance) return -KERNEL_EINVAL;
-        if (!mount->retired && instance->mount_views==1 && instance->retiring_nodes) return -KERNEL_EBUSY;
+        if (!mount->retired && instance->mount_views==1 && instance->transient_owners) return -KERNEL_EBUSY;
         if (mount->retired) {
             if(instance->mount_views) {
                 /* A pivoted boot root can retire its namespace connection

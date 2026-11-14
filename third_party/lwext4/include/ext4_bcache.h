@@ -252,6 +252,8 @@ void ext4_bcache_insert_dirty_node(struct ext4_bcache *, struct ext4_buf *);
 void ext4_bcache_remove_dirty_node(struct ext4_bcache *, struct ext4_buf *);
 /* Select and detach clean victims atomically, flushing only in a write context. */
 int ext4_bcache_shake(struct ext4_bcache *);
+/* Memory pressure: drop only idle clean buffers, without I/O or allocation. */
+uint32_t ext4_bcache_reclaim(struct ext4_bcache *);
 int ext4_bcache_free_read(struct ext4_bcache *, struct ext4_block *);
 /* Caller owns the returned dirty buffer across lock-free device I/O. */
 struct ext4_buf *ext4_bcache_dirty_get(struct ext4_bcache *, struct ext4_block *);
