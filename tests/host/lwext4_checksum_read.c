@@ -14,8 +14,10 @@ static bool armed, changed;
 static uint32_t directory_reader, nested_inode, nested_mode;
 static int nested_status;
 static unsigned crc_calls;
-static struct ext4_block_payload *invalidate_directory;
-static const void *directory_check_bytes;
+static uint32_t capture_extent_bytes;
+static const void *captured_extent;
+static struct ext4_block_payload *invalidate_tree;
+static const void *tree_check_bytes;
 static struct ext4_fs *qualify_fs;
 static uint32_t qualify_inode;
 static struct ext4_inode_ref qualified_writer;
@@ -37,6 +39,7 @@ uint32_t __real_ext4_crc32c(uint32_t, const void *, uint32_t);
 uint32_t __wrap_ext4_crc32c(uint32_t seed, const void *bytes, uint32_t length)
 {
     crc_calls++;
+    if (length==capture_extent_bytes) captured_extent=bytes;
     if (armed && (directory_reader ? bytes == observed :
         length == sizeof(observed_index) && seed == observed_seed &&
         !memcmp(bytes, &observed_index, sizeof(observed_index)))) {
@@ -51,11 +54,11 @@ uint32_t __wrap_ext4_crc32c(uint32_t seed, const void *bytes, uint32_t length)
         }
     }
     uint32_t result=__real_ext4_crc32c(seed, bytes, length);
-    if (invalidate_directory && bytes == directory_check_bytes) {
+    if (invalidate_tree && bytes == tree_check_bytes) {
         /* The writer's qualification wins after the calculation and before
          * the reader tries to publish its successful validation. */
-        ext4_block_payload_write(invalidate_directory);
-        invalidate_directory=NULL;
+        ext4_block_payload_write(invalidate_tree);
+        invalidate_tree=NULL;
     }
     return result;
 }
@@ -84,13 +87,13 @@ static void readonly_directory_queries(struct ext4_fs *fs, struct ext4_blockdev 
     struct ext4_block block;
     CHECK(ext4_fs_get_inode_dblk_idx(&directory,0,&home,false)==EOK);
     CHECK(ext4_block_get(dev,&block,home)==EOK);
-    __atomic_store_n(&block.payload->directory_verified,0,__ATOMIC_RELEASE);
-    directory_check_bytes=block.data;
-    invalidate_directory=block.payload;
+    __atomic_store_n(&block.payload->tree_verified,0,__ATOMIC_RELEASE);
+    tree_check_bytes=block.data;
+    invalidate_tree=block.payload;
     bool indexed=ext4_inode_has_flag(directory.inode,EXT4_INODE_FLAG_INDEX);
     CHECK(indexed ? ext4_dir_dx_check(&directory,&block)==EOK :
         ext4_dir_block_csum_verify(&directory,&block));
-    CHECK(!invalidate_directory && block.payload->directory_verified==UINT64_MAX);
+    CHECK(!invalidate_tree && block.payload->tree_verified==UINT64_MAX);
     unsigned before=crc_calls;
     CHECK(indexed ? ext4_dir_dx_check(&directory,&block)==EOK :
         ext4_dir_block_csum_verify(&directory,&block));
@@ -115,10 +118,87 @@ static void readonly_directory_queries(struct ext4_fs *fs, struct ext4_blockdev 
     CHECK(ext4_fs_get_inode_ref_read(fs,EXT4_INODE_ROOT_INDEX,&directory)==EOK);
     CHECK(ext4_fs_get_inode_dblk_idx(&directory,0,&home,false)==EOK);
     CHECK(ext4_block_get(dev,&block,home)==EOK);
-    CHECK(block.payload->directory_verified==ext4_dir_check_key(&directory,
+    CHECK(block.payload->tree_verified==ext4_fs_tree_check_key(&directory,
         ext4_inode_has_flag(directory.inode,EXT4_INODE_FLAG_INDEX)));
     CHECK(ext4_block_set(dev,&block)==EOK);
     CHECK(ext4_fs_put_inode_ref(&directory)==EOK);
+}
+
+/* More records than the old four hash slots share one accepted inode block. */
+static void metadata_record_queries(struct ext4_fs *fs)
+{
+    uint32_t ids[32];
+    for(unsigned i=0;i<32;i++) {
+        char name[40];snprintf(name,sizeof(name),"/record-%u",i);
+        ext4_file file;CHECK(ext4_fopen(&file,name,"w+")==EOK);
+        ids[i]=file.inode;CHECK(ext4_fclose(&file)==EOK);
+    }
+    struct ext4_inode_ref held[32];
+    for(unsigned i=0;i<32;i++) CHECK(ext4_fs_get_inode_ref_read(fs,ids[i],&held[i])==EOK);
+    for(unsigned round=0;round<2;round++) {
+        unsigned warmed=crc_calls;
+        for(unsigned i=0;i<32;i++) {
+            struct ext4_inode_ref ref;
+            CHECK(ext4_fs_get_inode_ref_read(fs,ids[i],&ref)==EOK);
+            CHECK(ref.index==ids[i]);
+            CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+        }
+        if(round) {
+            printf("metadata record reuse: inode=%u repeated CRC=%u\n",ext4_get16(&fs->sb,inode_size),crc_calls-warmed);
+            CHECK(crc_calls==warmed);
+        }
+    }
+    for(unsigned i=0;i<32;i++) CHECK(ext4_fs_put_inode_ref(&held[i])==EOK);
+}
+
+static void extent_node_queries(struct ext4_fs *fs)
+{
+    ext4_file file;CHECK(ext4_fopen(&file,"/extent-node-checks","w+")==EOK);
+    uint32_t size=ext4_sb_get_block_size(&fs->sb);
+    for(unsigned i=0;i<6;i++) {
+        bool changed=false;
+        CHECK(ext4_fallocate(&file,EXT4_FALLOC_KEEP_SIZE,(uint64_t)i*2*size,size,&changed,UINT32_MAX)==EOK && changed);
+    }
+    struct ext4_inode_ref inode;struct ext4_inode_block_range range;
+    CHECK(ext4_fs_get_inode_ref_read(fs,file.inode,&inode)==EOK);
+    capture_extent_bytes=size-4;captured_extent=NULL;
+    CHECK(ext4_fs_get_inode_dblk_range(&inode,0,1,false,&range)==EOK && range.block);
+    capture_extent_bytes=0;CHECK(captured_extent);
+    struct ext4_buf *buffer;ext4_fsblk_t home=0;
+    for(buffer=fs->bdev->bc->lru_head;buffer;buffer=buffer->lru_next)
+        if(buffer->data==captured_extent) {home=buffer->lba;break;}
+    CHECK(home);
+    struct ext4_block old;CHECK(ext4_block_get(fs->bdev,&old,home)==EOK);
+    ext4_fsblk_t physical=range.block;unsigned warmed=crc_calls;
+    for(unsigned i=0;i<32;i++) {
+        CHECK(ext4_fs_get_inode_dblk_range(&inode,0,1,false,&range)==EOK &&
+            range.block==physical && range.unwritten);
+    }
+    printf("accepted extent node: repeated CRC=%u\n",crc_calls-warmed);
+    CHECK(crc_calls==warmed);
+    __atomic_store_n(&old.payload->tree_verified,0,__ATOMIC_RELEASE);
+    tree_check_bytes=old.data;invalidate_tree=old.payload;
+    CHECK(ext4_fs_get_inode_dblk_range(&inode,0,1,false,&range)==EOK);
+    CHECK(!invalidate_tree && old.payload->tree_verified==UINT64_MAX);
+    warmed=crc_calls;
+    CHECK(ext4_fs_get_inode_dblk_range(&inode,0,1,false,&range)==EOK && crc_calls>warmed);
+    old.data[size-1]^=1;
+    CHECK(ext4_fs_get_inode_dblk_range(&inode,0,1,false,&range)==EUCLEAN);
+    old.data[size-1]^=1;
+    CHECK(ext4_fs_get_inode_dblk_range(&inode,0,1,false,&range)==EOK);
+    unsigned char retained[128];memcpy(retained,old.data,sizeof(retained));
+    CHECK(ext4_fs_put_inode_ref(&inode)==EOK);
+    bool changed=false;
+    CHECK(ext4_fallocate(&file,EXT4_FALLOC_KEEP_SIZE,12*(uint64_t)size,size,&changed,UINT32_MAX)==EOK && changed);
+    CHECK(ext4_fs_get_inode_ref_read(fs,file.inode,&inode)==EOK);
+    warmed=crc_calls;
+    CHECK(ext4_fs_get_inode_dblk_range(&inode,0,1,false,&range)==EOK && range.block==physical);
+    CHECK(crc_calls>warmed);
+    warmed=crc_calls;
+    CHECK(ext4_fs_get_inode_dblk_range(&inode,0,1,false,&range)==EOK && crc_calls==warmed);
+    CHECK(!memcmp(retained,old.data,sizeof(retained)));
+    CHECK(ext4_block_set(fs->bdev,&old)==EOK);
+    CHECK(ext4_fs_put_inode_ref(&inode)==EOK && ext4_fclose(&file)==EOK);
 }
 
 static void reuse_queries(struct ext4_fs *fs, struct ext4_blockdev *dev)
@@ -207,8 +287,10 @@ int main(int argc, char **argv)
     bool gdt = !strcmp(argv[2], "gdt");
     bool dx = !strcmp(argv[2], "dx");
     bool reuse = !strcmp(argv[2], "reuse");
+    bool records = !strcmp(argv[2], "records");
+    bool extent = !strcmp(argv[2], "extent");
     bool read_directory = !strcmp(argv[2], "directory-read");
-    CHECK(gdt || dx || reuse || read_directory || !strcmp(argv[2], "inode"));
+    CHECK(gdt || dx || reuse || records || extent || read_directory || !strcmp(argv[2], "inode"));
     CHECK(fault_block_open(&disk, argv[1]) == 0);
     unsigned char scratch[512];
     struct ext4_blockdev_iface iface = {.open=dev_open, .close=dev_open,
@@ -220,7 +302,11 @@ int main(int argc, char **argv)
     CHECK(ext4_recover("/") == EOK && ext4_journal_start("/") == EOK);
     struct ext4_fs *fs = dev.fs;
     CHECK(ext4_sb_feature_ro_com(&fs->sb, EXT4_FRO_COM_METADATA_CSUM));
-    if (reuse || read_directory) {
+    if (reuse || read_directory || records || extent) {
+        if (extent) extent_node_queries(fs);
+        else
+        if (records) metadata_record_queries(fs);
+        else
         if (reuse) reuse_queries(fs, &dev);
         else readonly_directory_queries(fs, &dev);
         CHECK(ext4_journal_stop("/") == EOK);
@@ -244,7 +330,7 @@ int main(int argc, char **argv)
         CHECK(ext4_block_get(&dev, &index, address) == EOK);
         /* Model the first read of this byte version, even if earlier
          * directory setup already warmed its validation result. */
-        __atomic_store_n(&index.payload->directory_verified,0,__ATOMIC_RELEASE);
+        __atomic_store_n(&index.payload->tree_verified,0,__ATOMIC_RELEASE);
         observed = index.data; observed_size = dev.lg_bsize;
         CHECK(observed_size <= sizeof(original));
         memcpy(original, observed, observed_size);

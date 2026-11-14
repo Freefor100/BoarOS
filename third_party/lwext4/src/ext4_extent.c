@@ -410,7 +410,7 @@ static struct ext4_extent_header *ext_inode_hdr(struct ext4_inode *inode)
 	return (struct ext4_extent_header *)inode->blocks;
 }
 
-static struct ext4_extent_header *ext_block_hdr(struct ext4_block *block)
+static struct ext4_extent_header *ext_block_hdr(const struct ext4_block *block)
 {
 	return (struct ext4_extent_header *)block->data;
 }
@@ -721,9 +721,10 @@ static void ext4_ext_drop_refs(struct ext4_inode_ref *inode_ref,
  * is correct or not.
  */
 static int ext4_ext_check(struct ext4_inode_ref *inode_ref,
-			  struct ext4_extent_header *eh, uint16_t depth,
-			  ext4_fsblk_t pblk __unused)
+                          const struct ext4_block *block,uint16_t depth,
+                          ext4_fsblk_t pblk __unused)
 {
+    struct ext4_extent_header *eh=ext_block_hdr(block);
 	struct ext4_extent_tail *tail;
 	struct ext4_sblock *sb = ext4_fs_super(inode_ref->fs);
 	const char *error_msg;
@@ -754,6 +755,9 @@ static int ext4_ext_check(struct ext4_inode_ref *inode_ref,
 
 	tail = find_ext4_extent_tail(eh);
 	if (ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM)) {
+        uint64_t key=ext4_fs_tree_check_key(inode_ref,EXT4_TREE_EXTENT);
+        uint64_t observed=__atomic_load_n(&block->payload->tree_verified,__ATOMIC_ACQUIRE);
+        if (key && observed==key) return EOK;
 		if (tail->et_checksum !=
 		    to_le32(ext4_ext_block_csum(inode_ref, eh))) {
 			ext4_dbg(DEBUG_EXTENT,
@@ -762,6 +766,9 @@ static int ext4_ext_check(struct ext4_inode_ref *inode_ref,
 				 pblk);
 			return EUCLEAN;
 		}
+        if (key && observed!=UINT64_MAX)
+            (void)__atomic_compare_exchange_n(&block->payload->tree_verified,
+                &observed,key,false,__ATOMIC_RELEASE,__ATOMIC_RELAXED);
 	}
 
 	return EOK;
@@ -785,7 +792,7 @@ static int read_extent_tree_block(struct ext4_inode_ref *inode_ref,
 	if (err != EOK)
 		return err;
 
-	err = ext4_ext_check(inode_ref, ext_block_hdr(bh), depth, pblk);
+	err = ext4_ext_check(inode_ref, bh, depth, pblk);
 	if (err != EOK)
 		goto errout;
 
@@ -895,7 +902,7 @@ static int extent_lookup_range(struct ext4_inode_ref *ref,ext4_lblk_t logical,
         result=ext4_block_get(ref->fs->bdev,&held,block);
         if (result) return result;
         at.header=ext_block_hdr(&held);
-        result=ext4_ext_check(ref,at.header,--depth,block);
+        result=ext4_ext_check(ref,&held,--depth,block);
         if (result) goto Out;
     }
     ext4_ext_binsearch(&at,logical);
