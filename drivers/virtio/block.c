@@ -82,7 +82,6 @@ struct block_request {
     unsigned cost_woken;
 #endif
 };
-struct block_segment { uint64_t address; uint32_t length; };
 struct batch_transfer {
     struct block_request *request;
     uint64_t offset;
@@ -94,7 +93,16 @@ struct batch_transfer {
 
 struct block_batch_workspace {
     struct batch_transfer parts[KERNEL_BLOCK_BATCH_MAX];
-    struct block_segment segments[KERNEL_BLOCK_BATCH_MAX];
+    struct kernel_wait_queue done;
+    /* Published descriptors contain the SG addresses and lengths. The same
+     * workspace can then hold a capacity registration until wait_finish. */
+    union {
+        struct {
+            uint64_t addresses[KERNEL_BLOCK_BATCH_MAX];
+            uint32_t lengths[KERNEL_BLOCK_BATCH_MAX];
+        };
+        struct kernel_wait_node capacity_node;
+    };
 };
 _Static_assert(sizeof(struct block_batch_workspace) <= VIRTIO_BLOCK_BATCH_WORKSPACE_BYTES, "batch workspace exceeds pool slot");
 
@@ -536,15 +544,16 @@ static int completion_wait_needed(struct virtio_block_device *device, const stru
 }
 static void wait_for_progress(struct virtio_block_device *device, struct kernel_wait_queue *queue,
     uint64_t deadline, const struct block_request *request, int submitted,
-    struct kernel_wait_queue *also,kernel_irq_lock_guard *guard)
+    struct kernel_wait_queue *also,struct kernel_wait_node *capacity_node,kernel_irq_lock_guard *guard)
 {
     if (!completion_wait_needed(device, request)) return;
     struct kernel_wait_token token;
     enum kernel_wait_wake_reason reason = KERNEL_WAIT_WOKEN;
     if (kernel_wait_prepare(queue, deadline, 0, &token) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
-    struct kernel_wait_node capacity_node = {.task = token.task};
-    if (also && kernel_wait_node_bind(also, &capacity_node, &token) != KERNEL_SCHEDULER_STATUS_OK)
-        __builtin_trap();
+    if (also) {
+        *capacity_node=(struct kernel_wait_node){.task=token.task};
+        if (kernel_wait_node_bind(also,capacity_node,&token)) __builtin_trap();
+    }
     /* 登记期间设备仍可完成DMA；先更新软件owner，再决定是否真正park。 */
     int needed=completion_wait_needed(device,request);
 #if BOAROS_COST_DIAGNOSTICS
@@ -611,7 +620,7 @@ static int begin_call(struct virtio_block_device *device, int barrier)
             return 1;
         }
         if (!device->irq_source) __builtin_trap();
-        wait_for_progress(device,barrier ? &device->idle : &device->admission,0,NULL,0,NULL,&guard);
+        wait_for_progress(device,barrier ? &device->idle : &device->admission,0,NULL,0,NULL,NULL,&guard);
     }
     if (barrier) device->barrier_waiters--;
     return 0;
@@ -668,7 +677,7 @@ static struct block_request *reserve_request_prio(struct virtio_block_device *de
         if (!device->irq_source) __builtin_trap();
         struct kernel_wait_queue *wq = (prio == KERNEL_BLOCK_PRIO_LOW) ?
             &device->slots_low : &device->slots;
-        wait_for_progress(device, wq, 0, NULL, 0, NULL,&guard);
+        wait_for_progress(device, wq, 0,NULL,0,NULL,NULL,&guard);
     }
     if (!device_live(device)) r = 0;
     return r;
@@ -729,7 +738,7 @@ static unsigned first_descriptor(uint64_t bits)
  * header/status/bounce, while only the queue owns published descriptors. */
 static enum kernel_block_status publish_segments(struct virtio_block_device *device,
     struct block_request *r, uint32_t type, uint64_t sector,
-    const struct block_segment *segments, unsigned count, int bounce)
+    const uint64_t *addresses,const uint32_t *lengths,unsigned count,int bounce)
 {
     if (!device_live(device)) return KERNEL_BLOCK_STATUS_IO;
     if (r->state != 1 || r->owner != kernel_io_context_current() || count + 2 > device->queue.size) __builtin_trap();
@@ -743,8 +752,8 @@ static enum kernel_block_status publish_segments(struct virtio_block_device *dev
     if (found != count + 2) return KERNEL_BLOCK_STATUS_NOT_SUBMITTED;
     uint32_t data_length = 0;
     for (unsigned i = 0; i < count; i++) {
-        if (data_length > UINT32_MAX - segments[i].length) __builtin_trap();
-        data_length += segments[i].length;
+        if (data_length > UINT32_MAX - lengths[i]) __builtin_trap();
+        data_length += lengths[i];
     }
     int flushing = type == VIRTIO_BLOCK_REQUEST_FLUSH;
     r->header = (struct virtio_block_request_header){type, 0, sector};
@@ -778,7 +787,7 @@ static enum kernel_block_status publish_segments(struct virtio_block_device *dev
     uint64_t physical = request_physical(device, r);
     d[indices[0]] = (struct virtio_descriptor){physical, sizeof(r->header), VIRTQ_DESC_NEXT, indices[1]};
     for (unsigned i = 0; i < count; i++)
-        d[indices[i + 1]] = (struct virtio_descriptor){segments[i].address, segments[i].length,
+        d[indices[i + 1]] = (struct virtio_descriptor){addresses[i], lengths[i],
             VIRTQ_DESC_NEXT | (type == VIRTIO_BLOCK_REQUEST_IN ? VIRTQ_DESC_WRITE : 0), indices[i + 2]};
     d[indices[count + 1]] = (struct virtio_descriptor){physical + offsetof(struct block_request, status), 1, VIRTQ_DESC_WRITE, 0};
     if (virtio_split_enqueue(&device->queue, &device->transport, indices[0], r,
@@ -793,9 +802,8 @@ static enum kernel_block_status publish_request_locked(struct virtio_block_devic
     struct block_request *r, uint32_t type, uint64_t sector,
     uint64_t data_address, uint32_t data_length, int bounce)
 {
-    struct block_segment segment = {data_address, data_length};
     enum kernel_block_status status = publish_segments(device, r, type, sector,
-        &segment, type == VIRTIO_BLOCK_REQUEST_FLUSH ? 0 : 1, bounce);
+        &data_address,&data_length, type == VIRTIO_BLOCK_REQUEST_FLUSH ? 0 : 1, bounce);
     if (status == KERNEL_BLOCK_STATUS_OK &&
         virtio_split_notify(&device->queue, &device->transport, 0) != VIRTIO_OK) __builtin_trap();
     return status;
@@ -834,7 +842,7 @@ static enum kernel_block_status wait_request(struct virtio_block_device *device,
             }
             break;
         }
-        if (device->irq_source) wait_for_progress(device, &r->done, r->deadline, r, 1, NULL,&guard);
+        if (device->irq_source) wait_for_progress(device, &r->done, r->deadline,r,1,NULL,NULL,&guard);
     }
     enum kernel_block_status result = finish_request(device, r);
     return result;
@@ -849,7 +857,7 @@ static enum kernel_block_status submit_request(struct virtio_block_device *devic
         KERNEL_IRQ_LOCK_SCOPE(guard,&device->metadata);
         while ((result = publish_request_locked(device, r, type, sector,
                 data_address, data_length, bounce)) == KERNEL_BLOCK_STATUS_NOT_SUBMITTED) {
-            if (device->irq_source) wait_for_progress(device, &device->descriptors, 0, NULL, 0, NULL,&guard);
+            if (device->irq_source) wait_for_progress(device, &device->descriptors, 0,NULL,0,NULL,NULL,&guard);
             else collect_used_locked(device);
         }
     }
@@ -1074,7 +1082,7 @@ static int earlier_sector_pending(const struct kernel_block_span *spans,
 static enum kernel_block_status publish_batch_part(struct virtio_block_device *device,
     struct batch_transfer *parts, size_t count, size_t index,
     const struct kernel_block_span *writes, int writing, int phase, unsigned free,
-    struct block_segment *segments)
+    uint64_t *addresses,uint32_t *lengths)
 {
     struct batch_transfer *part = &parts[index];
     struct block_request *r = part->request;
@@ -1096,11 +1104,11 @@ static enum kernel_block_status publish_batch_part(struct virtio_block_device *d
             uint64_t address;
             if (!length || !device->dma_address(candidate->buffer + candidate->copied, length, &address)) break;
             if (segments_count &&
-                segments[segments_count - 1].address + segments[segments_count - 1].length == address &&
-                (uint64_t)segments[segments_count - 1].length + length <= device->max_segment_size) {
-                segments[segments_count - 1].length += (uint32_t)length;
+                addresses[segments_count - 1] + lengths[segments_count - 1] == address &&
+                (uint64_t)lengths[segments_count - 1] + length <= device->max_segment_size) {
+                lengths[segments_count - 1] += (uint32_t)length;
             } else {
-                segments[segments_count++] = (struct block_segment){address, (uint32_t)length};
+                addresses[segments_count]=address;lengths[segments_count++]=(uint32_t)length;
             }
             candidate->copied += length;
             members |= UINT32_C(1) << next;
@@ -1131,11 +1139,12 @@ static enum kernel_block_status publish_batch_part(struct virtio_block_device *d
             if (!part->modify_ready && (skip || part->copied < VIRTIO_BLOCK_SECTOR_SIZE)) type = VIRTIO_BLOCK_REQUEST_IN;
             else bytes_copy(r->bounce + skip, part->buffer, part->copied);
         }
-        segments[segments_count++] = (struct block_segment){device->queue_physical_address + bounce_offset(device, r), VIRTIO_BLOCK_SECTOR_SIZE};
+        addresses[0]=device->queue_physical_address+bounce_offset(device,r);
+        lengths[0]=VIRTIO_BLOCK_SECTOR_SIZE;segments_count=1;
     }
     part->members = members;
     return publish_segments(device, r, type, part->offset / VIRTIO_BLOCK_SECTOR_SIZE,
-        segments, segments_count, bounce);
+        addresses,lengths,segments_count,bounce);
 }
 
 static void batch_ready_insert(struct batch_transfer *parts, uint8_t *head, unsigned index)
@@ -1148,13 +1157,13 @@ static void batch_ready_insert(struct batch_transfer *parts, uint8_t *head, unsi
 
 static enum kernel_block_status transfer_batch_parts(struct virtio_block_device *device,
     const struct kernel_block_span *writes, struct block_read_span *reads, size_t count,
-    struct batch_transfer *parts, struct block_segment *segments,
+    struct block_batch_workspace *workspace,
     kernel_block_phase_next_fn next, const void *next_context, const void *cursor,
     const struct block_read_completion *completion,
     enum kernel_block_priority priority)
 {
-    struct kernel_wait_queue done;
-    kernel_wait_queue_init(&done);
+    struct batch_transfer *parts=workspace->parts;
+    kernel_wait_queue_init(&workspace->done);
     int writing = writes || next;
     COST_SCOPE(device_cost, OPERATION_TICKS);
     if (!begin_call(device, 0)) {
@@ -1281,11 +1290,11 @@ static enum kernel_block_status transfer_batch_parts(struct virtio_block_device 
             if (!part->request) {
                 part->request = try_reserve_request(device, priority);
                 if (!part->request) { if (next) break; else continue; }
-                part->request->completion = &done;
+                part->request->completion = &workspace->done;
             }
             if (part->request->state == 1) {
                 enum kernel_block_status status = publish_batch_part(device, parts, count, i, writes, writing,
-                    next != NULL, free, segments);
+                    next != NULL,free,workspace->addresses,workspace->lengths);
                 if (status == KERNEL_BLOCK_STATUS_OK) {
                     published++;
                     if (next) {
@@ -1370,8 +1379,8 @@ static enum kernel_block_status transfer_batch_parts(struct virtio_block_device 
             } else {
                 capacity = &device->slots;
             }
-            wait_for_progress(device, pending ? &done : capacity, deadline, NULL,
-                pending != 0, pending && needs_capacity ? capacity : NULL,&guard);
+            wait_for_progress(device, pending ? &workspace->done : capacity, deadline, NULL,
+                pending != 0, pending && needs_capacity ? capacity : NULL,&workspace->capacity_node,&guard);
         }
         kernel_irq_lock_release(&guard);
     }
@@ -1397,7 +1406,7 @@ static enum kernel_block_status transfer_batch(struct virtio_block_device *devic
             if (!(device->batch_claimed & (1U << slot))) break;
         if (slot < slot_count(device)) { device->batch_claimed |= 1U << slot; WORKSPACE_CHANGE(device); break; }
         if (!device->irq_source) __builtin_trap();
-        wait_for_progress(device, &device->workspaces, 0, NULL, 0, NULL,&guard);
+        wait_for_progress(device, &device->workspaces, 0,NULL,0,NULL,NULL,&guard);
     }
     if (!device_live(device)) {
         kernel_irq_lock_release(&guard);
@@ -1410,7 +1419,7 @@ static enum kernel_block_status transfer_batch(struct virtio_block_device *devic
     struct block_batch_workspace *workspace = (void *)((unsigned char *)device->batch_memory[slot / per_page] +
         (slot % per_page) * VIRTIO_BLOCK_BATCH_WORKSPACE_BYTES);
     enum kernel_block_status status = transfer_batch_parts(device, writes, reads, count,
-        workspace->parts, workspace->segments, next, next_context, cursor, completion, priority);
+        workspace,next,next_context,cursor,completion,priority);
     /* 全部本次 DMA 完成或 reset 确认后，才归还槽位供另一调用使用。 */
     kernel_irq_lock_acquire(&device->metadata,&guard);
     if (!(device->batch_claimed & (1U << slot))) __builtin_trap();
