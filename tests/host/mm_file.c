@@ -374,6 +374,88 @@ static void *private_first_reader(void *opaque)
     private_reader=0;
     return NULL;
 }
+static _Thread_local unsigned cow_view_pause;
+static unsigned cow_view_entered,cow_view_resume;
+static uint64_t cow_upgrade_address;
+void __real_kernel_lock_release(struct kernel_lock_guard *);
+void __wrap_kernel_lock_release(struct kernel_lock_guard *guard)
+{
+    int pause=cow_view_pause && guard->lock && guard->lock->rank==31;
+    __real_kernel_lock_release(guard);
+    if (pause) {
+        cow_view_pause=0;
+        __atomic_store_n(&cow_view_entered,1,__ATOMIC_RELEASE);
+        while (!__atomic_load_n(&cow_view_resume,__ATOMIC_ACQUIRE)) sched_yield();
+    }
+}
+static void *cow_permission_fault(void *unused)
+{
+    (void)unused;mm_test_attach(11);mm_test_context=roots[1];
+    cow_view_pause=1;
+    assert(!kernel_mm_resolve_user_fault(&parent,cow_upgrade_address,KERNEL_MM_WRITE));
+    return NULL;
+}
+static void cow_permission_upgrade(void)
+{
+    assert(!kernel_mm_mmap_anonymous(&parent,0x1c0000,BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&cow_upgrade_address));
+    unsigned char value=0x57;size_t copied;
+    assert(!kernel_copy_to_user(&parent,cow_upgrade_address,&value,1,&copied) && copied==1);
+    struct kernel_mm copy={0};
+    assert(!kernel_mm_fork(&copy,&parent));
+    mm_test_context=0;assert(!kernel_mm_release(&copy));mm_test_context=roots[1];
+    pthread_t writer;assert(!pthread_create(&writer,NULL,cow_permission_fault,NULL));
+    while (!__atomic_load_n(&cow_view_entered,__ATOMIC_ACQUIRE)) sched_yield();
+    assert(!kernel_mm_mprotect(&parent,cow_upgrade_address,BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ|KERNEL_MM_WRITE|KERNEL_MM_EXECUTE));
+    __atomic_store_n(&cow_view_resume,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(writer,NULL));
+    struct kernel_mm_mapping mapping;
+    assert(!kernel_mm_lookup(&parent,cow_upgrade_address,&mapping) &&
+        (mapping.permissions&(KERNEL_MM_WRITE|KERNEL_MM_EXECUTE))==(KERNEL_MM_WRITE|KERNEL_MM_EXECUTE));
+    assert(!kernel_mm_resolve_user_fault(&parent,cow_upgrade_address,KERNEL_MM_EXECUTE));
+    assert(read_byte(&parent,cow_upgrade_address)==value);
+    assert(!kernel_mm_munmap(&parent,cow_upgrade_address,BOAROS_PAGE_SIZE));
+    puts("In-place COW retries an old VMA after concurrent executable permission publication");
+}
+/* A remote user-page borrower must not stop anonymous stack commits. */
+static unsigned permission_pin_entered,permission_pin_release;
+static void *permission_borrower(void *unused)
+{
+    (void)unused;
+    mm_test_attach(10);mm_test_context=roots[1];
+    struct kernel_mm_user_pin pin={0};
+    assert(!kernel_mm_pin_user_page(&parent,0x40000,KERNEL_MM_READ,&pin));
+    __atomic_store_n(&permission_pin_entered,1,__ATOMIC_RELEASE);
+    while (!__atomic_load_n(&permission_pin_release,__ATOMIC_ACQUIRE)) sched_yield();
+    kernel_mm_unpin_user_page(&pin);
+    return NULL;
+}
+static void anonymous_permission_commits(void)
+{
+    uint64_t address;
+    assert(!kernel_mm_mmap_anonymous(&parent,0x180000,2*BOAROS_PAGE_SIZE,0,
+        KERNEL_MM_MAP_FIXED,&address));
+    pthread_t borrower;
+    assert(!pthread_create(&borrower,NULL,permission_borrower,NULL));
+    while (!__atomic_load_n(&permission_pin_entered,__ATOMIC_ACQUIRE)) sched_yield();
+    unsigned before=local_tlb_fences;
+    assert(!kernel_mm_mprotect(&parent,address,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE));
+    assert(!kernel_mm_mprotect(&parent,address,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE));
+    assert(local_tlb_fences==before);
+    __atomic_store_n(&permission_pin_release,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(borrower,NULL));
+    unsigned char value=0x9a; size_t copied;
+    assert(!kernel_copy_to_user(&parent,address,&value,1,&copied) && copied==1);
+    assert(read_byte(&parent,address)==value);
+    assert(!kernel_mm_mprotect(&parent,address,BOAROS_PAGE_SIZE,0));
+    struct kernel_mm_user_pin rejected={0};
+    assert(kernel_mm_pin_user_page(&parent,address,KERNEL_MM_READ,&rejected)!=KERNEL_MM_STATUS_OK && !rejected.page);
+    assert(!kernel_mm_mprotect(&parent,address,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE));
+    assert(read_byte(&parent,address)==value);
+    assert(!kernel_mm_munmap(&parent,address,2*BOAROS_PAGE_SIZE));
+    puts("Anonymous permission additions preserve a remote user's borrow without empty TLB flushes; revocation and contents retained");
+}
 static void parallel_private_faults(void)
 {
     struct kernel_open_file_description *owner=controller;
@@ -457,7 +539,8 @@ int main(void)
     byte=0; assert(!kernel_copy_from_user(&child,&byte,mapped,1,&done) && done==1 && byte==0x73);
     mm_test_context=roots[1];
     futex_key_lifetime();
-    first_fault(2); first_fault(4); adjacent_table_removal(); stale_shrink(); fault_failures(); unregister_callback(); private_case(); parallel_private_faults();
+    first_fault(2); first_fault(4); adjacent_table_removal(); stale_shrink(); fault_failures(); unregister_callback(); private_case(); cow_permission_upgrade(); anonymous_permission_commits();
+    parallel_private_faults();
     mm_test_context=0;
     for (unsigned id=1; id<=4; id++) assert(!kernel_mm_release(&views[id]));
     assert(!kernel_mm_release(&child) && !kernel_mm_release(&parent));

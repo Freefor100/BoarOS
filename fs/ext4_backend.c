@@ -2859,6 +2859,30 @@ static int ext4_backend_lookup(struct kernel_vfs_instance *instance, uint64_t pa
     if (!error) *inode = result_inode;
     return error;
 }
+static int ext4_backend_stat_child(const struct kernel_vfs_file *parent,
+    const char *name,size_t length,struct kernel_vfs_stat *stat)
+{
+    struct kernel_vfs_instance *instance=parent->mount->private_data;
+    struct lwext4_mount_adapter *adapter=lwext4_instance(instance);
+    int error=ext4_backend_error(instance);
+    if (error) return error;
+    uint32_t inode_number;
+    struct ext4_inode inode;
+    error=lwext4_error(ext4_stat_child(adapter->mount_point,
+        kernel_vfs_file_inode(parent),name,length,&inode_number,&inode));
+    if (error) return error;
+    /* A different hard link can already hold live EOF and delayed times.
+     * Borrow that actual node rather than reporting its older disk image. */
+    struct kernel_vfs_node *node=kernel_vfs_node_pin(instance,inode_number);
+    if (node) {
+        struct kernel_vfs_file file={.state=VFS_FILE_STATE_LIVE,.mount=parent->mount,.private_data=node};
+        error=ext4_backend_stat(&file,stat);
+        if (kernel_vfs_node_release(&node)) __builtin_trap();
+        return error;
+    }
+    fill_stat(parent->mount,adapter->superblock,inode_number,&inode,stat);
+    return 0;
+}
 static int ext4_backend_readlink(struct kernel_vfs_node *node, char *buffer, size_t size, size_t *count)
 {
     KERNEL_LOCK_SCOPE(inode_guard);
@@ -3035,6 +3059,7 @@ static void initialize_backend(void)
     ops->error = ext4_backend_error;
     ops->root = ext4_backend_root;
     ops->lookup = ext4_backend_lookup;
+    ops->stat_child = ext4_backend_stat_child;
     ops->readlink = ext4_backend_readlink;
     ops->check_domain = ext4_check_domain;
     ops->truncate = ext4_backend_truncate;

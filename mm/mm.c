@@ -4080,17 +4080,20 @@ enum kernel_mm_status kernel_mm_shmdt(struct kernel_mm *mm, uint64_t address)
     return KERNEL_MM_STATUS_OK;
 }
 
-static enum kernel_mm_status protect_vma_range(struct kernel_mm_record *record,
+static enum kernel_mm_status protect_vma_pages(struct kernel_mm_record *record,
     const struct kernel_vma_edit *edit)
 {
     uint64_t address = edit->start, end = edit->end;
     uint32_t normalized = edit->permissions;
     enum arch_mmu_status backend_status;
     uint64_t cursor = address, leaf;
-    while ((backend_status = arch_mmu_user_next_owned(&record->space, &cursor,
-                   end, &leaf)) == ARCH_MMU_STATUS_OK) {
-        uint32_t leaf_permissions = normalized;
+    int touched=0;
+    for (;;) {
         KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
+        backend_status=arch_mmu_user_next_owned(&record->space,&cursor,end,&leaf);
+        if (backend_status != ARCH_MMU_STATUS_OK) break;
+        touched=1;
+        uint32_t leaf_permissions = normalized;
         struct mm_file_resident *resident = find_file_resident(record, leaf);
         if (resident) {
             COST_ADD(MPROTECT_RESIDENT_VISITS, 1);
@@ -4101,13 +4104,20 @@ static enum kernel_mm_status protect_vma_range(struct kernel_mm_record *record,
                 backend_permissions_from_mm(leaf_permissions))) __builtin_trap();
     }
     if (backend_status != ARCH_MMU_STATUS_NOT_MAPPED) __builtin_trap();
-    {
+    if (touched) {
         struct kernel_mm_retirement batch={0};
         uint32_t targets;
         { KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
           targets=note_tlb_change_locked(record,&batch,(normalized & KERNEL_MM_EXECUTE)!=0); }
         finish_tlb_change(record,&batch,targets,address,end-address,(normalized & KERNEL_MM_EXECUTE)!=0);
     }
+    return KERNEL_MM_STATUS_OK;
+}
+static enum kernel_mm_status protect_vma_range(
+    struct kernel_mm_record *record, const struct kernel_vma_edit *edit)
+{
+    enum kernel_mm_status status=protect_vma_pages(record,edit);
+    if (status) return status;
     {
         struct kernel_lock_guard vma_guard = {0};
         kernel_rwlock_write(&record->vma_lock, &vma_guard);
@@ -4993,6 +5003,63 @@ enum kernel_mm_status kernel_mm_munmap(struct kernel_mm *mm, uint64_t address, u
     return status;
 #endif
 }
+#if BOAROS_MAX_CPUS > 1
+static int anonymous_permission_addition(struct kernel_vma_set *set,
+    uint64_t start,uint64_t end,uint32_t permissions,int *unchanged)
+{
+    *unchanged=1;
+    while (start<end) {
+        struct kernel_vma vma;
+        if (kernel_vma_set_lookup(set,start,&vma) ||
+            vma.kind!=KERNEL_VMA_KIND_ANONYMOUS ||
+            (vma.permissions & ~permissions)) return 0;
+        if (vma.permissions!=permissions) *unchanged=0;
+        start=vma.end<end?vma.end:end;
+    }
+    return 1;
+}
+/* Adding anonymous access does not revoke any pin or replace a source.
+ * The range claim excludes overlapping edits and fault publication, while
+ * unrelated faults keep their shared MM ownership. */
+static enum kernel_mm_status mprotect_addition(struct kernel_mm *mm,uint64_t address,
+    uint64_t length,uint32_t permissions,int *handled)
+{
+    struct mm_operation operation __attribute__((cleanup(mm_operation_end)))={.shared=1,.mm=mm};
+    enum kernel_mm_status status=mutable_vma_record(mm,&operation.record);
+    if (!status) status=mm_operation_lock(&operation);
+    if (status) { *handled=1;return status; }
+    struct kernel_mm_record *record=operation.record;
+    uint64_t end=address+length;
+    int unchanged,eligible;
+    {
+        KERNEL_LOCK_SCOPE(vma);
+        kernel_rwlock_read(&record->vma_lock,&vma);
+        eligible=anonymous_permission_addition(record->vmas,address,end,permissions,&unchanged);
+        if (eligible && unchanged) { *handled=1;return KERNEL_MM_STATUS_OK; }
+    }
+    if (!eligible) return KERNEL_MM_STATUS_OK;
+    status=mm_operation_claim_range(&operation,address,end);
+    if (status) { *handled=1;return status; }
+    struct kernel_vma_edit edit={0};
+    {
+        KERNEL_LOCK_SCOPE(vma);
+        kernel_rwlock_write(&record->vma_lock,&vma);
+        if (!anonymous_permission_addition(record->vmas,address,end,permissions,&unchanged))
+            return KERNEL_MM_STATUS_OK;
+        *handled=1;
+        if (unchanged) return KERNEL_MM_STATUS_OK;
+        status=status_from_vma(kernel_vma_set_prepare_mprotect(record->vmas,
+            address,end,permissions,&edit));
+        if (edit.set && kernel_vma_set_commit_edit(record->vmas,&edit)) __builtin_trap();
+    }
+    if (edit.set) {
+        enum kernel_mm_status published=protect_vma_pages(record,&edit);
+        if (published) return published;
+    }
+    return status;
+}
+#endif
+
 enum kernel_mm_status kernel_mm_mprotect_personality(struct kernel_mm *mm,
     uint64_t address, uint64_t length, uint32_t permissions, int read_implies_exec)
 {
@@ -5002,6 +5069,13 @@ enum kernel_mm_status kernel_mm_mprotect_personality(struct kernel_mm *mm,
     if (length && (!align_mapping_length(length, &aligned_length) ||
         address > ARCH_MMU_USER_LIMIT - aligned_length)) return KERNEL_MM_STATUS_NO_MEMORY;
     if (!length) return mm_mprotect_impl(mm, address, length, permissions);
+#if BOAROS_MAX_CPUS > 1
+    if (!read_implies_exec || !(permissions & KERNEL_MM_READ) || (permissions & KERNEL_MM_EXECUTE)) {
+        int handled=0;
+        enum kernel_mm_status status=mprotect_addition(mm,address,aligned_length,normalized,&handled);
+        if (handled) return status;
+    }
+#endif
     MM_RANGE_OPERATION(mm, address, length);
     close_pins(&operation, 0);
     if (!read_implies_exec || !(permissions & KERNEL_MM_READ) ||
@@ -5769,10 +5843,13 @@ static __attribute__((noinline)) enum kernel_mm_status grow_fault_stack(struct k
     kernel_lock_release(&vma_guard);
     *result=vma;*epoch=generation;return KERNEL_MM_STATUS_OK;
 }
-/* Only anonymous mappings accept an unrelated edit under a new generation. */
-static __attribute__((noinline)) int memory_fault_vma_changed(struct kernel_mm_record *record,
+/* The caller holds VMA qualification and raw metadata through publication.
+ * Only anonymous mappings accept an unrelated edit under a new generation. */
+static __attribute__((noinline)) int memory_fault_view_changed(struct kernel_mm_record *record,
     uint64_t address, const struct fault_vma *view)
 {
+    for (struct kernel_mm_range_claim *c=record->range_claims;c;c=c->next)
+        if (address>=c->start && address<c->end) return 1;
     if (kernel_vma_set_generation(record->vmas) == view->generation) return 0;
     const struct kernel_vma *original = &view->vma;
     struct kernel_vma latest;
@@ -5815,6 +5892,7 @@ static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_op
     struct kernel_mm_leaf_preparation prepared = KERNEL_MM_LEAF_PREPARATION_INIT;
     {
         struct kernel_mm_mapping mapping;
+        KERNEL_LOCK_SCOPE(vma_guard);
         KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
         status = force ? remote_lookup_record(record,address,&mapping) : lookup_record(record,address,&mapping);
         if (status == KERNEL_MM_STATUS_OK && ((mapping.permissions & access) || (force && access == KERNEL_MM_READ))) {
@@ -5828,6 +5906,19 @@ static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_op
             return KERNEL_MM_STATUS_OK;
         }
         if (status == KERNEL_MM_STATUS_OK) {
+            if (operation->shared && access==KERNEL_MM_WRITE) {
+                /* A single-owner COW page can be upgraded without copying.
+                 * Its saved VMA still needs the same publication check as
+                 * a prepared page, including a concurrent mprotect upgrade. */
+                kernel_raw_lock_release(&guard);
+                kernel_rwlock_read(&record->vma_lock,&vma_guard);
+                kernel_raw_rwlock_write_acquire(&record->metadata,&guard);
+                if (memory_fault_view_changed(record,address,view))
+                    return KERNEL_MM_STATUS_CONFLICT;
+                status=force?remote_lookup_record(record,address,&mapping):lookup_record(record,address,&mapping);
+                if (status!=KERNEL_MM_STATUS_OK || (mapping.permissions&access))
+                    return KERNEL_MM_STATUS_CONFLICT;
+            }
             if (force && access == KERNEL_MM_WRITE && !shared &&
                 arch_mmu_user_mark_cow_page(&record->space,address)) __builtin_trap();
             if (shared || access != KERNEL_MM_WRITE || arch_mmu_user_cow_snapshot(&record->space,
@@ -5843,6 +5934,7 @@ static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_op
                 if (lazy) lazy_retire(record,lazy);
                 targets = note_tlb_change_locked(record, &batch, 0);
                 kernel_raw_lock_release(&guard);
+                kernel_lock_scope_release(&vma_guard);
                 if (lazy) lazy_drain(record);
                 finish_tlb_change(record, &batch, targets, address, BOAROS_PAGE_SIZE,0);
                 return KERNEL_MM_STATUS_OK;
@@ -5962,18 +6054,10 @@ prepare_memory_tables:
         KERNEL_LOCK_SCOPE(vma_guard);
         if (operation->shared)
             kernel_rwlock_read(&record->vma_lock, &vma_guard);
-        int vma_mismatch = memory_fault_vma_changed(record, address, view);
         struct kernel_mm_mapping current;
         KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
         uint64_t latest_epoch=0;
-        int range_conflict = 0;
-        for (struct kernel_mm_range_claim *c = record->range_claims; c; c = c->next) {
-            if (address >= c->start && address < c->end) {
-                range_conflict = 1;
-                break;
-            }
-        }
-        if (vma_mismatch || range_conflict ||
+        if (memory_fault_view_changed(record,address,view) ||
             (object && (kernel_memory_object_epoch(object,&latest_epoch) || latest_epoch!=object_epoch)))
             status = KERNEL_MM_STATUS_CONFLICT;
         else {
