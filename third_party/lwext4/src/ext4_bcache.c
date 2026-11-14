@@ -72,6 +72,7 @@ void ext4_bcache_publish(struct ext4_buf *buf, struct ext4_block_payload *payloa
          * retains permission to mutate this accepted version. */
         for (unsigned i = 0; i < 4; i++)
             __atomic_store_n(&payload->verified[i], 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&payload->directory_verified, 0, __ATOMIC_RELAXED);
         ext4_block_payload_get(payload);old=buf->current_payload;
         buf->current_payload=payload;buf->data=payload->data;
     }

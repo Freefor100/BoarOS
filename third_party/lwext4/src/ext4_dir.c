@@ -126,6 +126,25 @@ bool ext4_dir_csum_verify(struct ext4_inode_ref *inode_ref,
 	return true;
 }
 
+uint64_t ext4_dir_check_key(const struct ext4_inode_ref *inode, int indexed)
+{
+    if (inode->index > (UINT32_MAX >> 1)) return 0;
+    return ((uint64_t)inode->index << 33) |
+        ((uint64_t)ext4_inode_get_generation(inode->inode) << 1) | (indexed != 0);
+}
+
+bool ext4_dir_block_csum_verify(struct ext4_inode_ref *inode, const struct ext4_block *block)
+{
+    uint64_t key = ext4_dir_check_key(inode, 0);
+    uint64_t observed = __atomic_load_n(&block->payload->directory_verified, __ATOMIC_ACQUIRE);
+    if (key && observed == key) return true;
+    if (!ext4_dir_csum_verify(inode, (void *)block->data)) return false;
+    if (key && observed != UINT64_MAX)
+        (void)__atomic_compare_exchange_n(&block->payload->directory_verified,
+            &observed, key, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    return true;
+}
+
 void ext4_dir_init_entry_tail(struct ext4_dir_entry_tail *t)
 {
 	memset(t, 0, sizeof(struct ext4_dir_entry_tail));
@@ -395,7 +414,7 @@ int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
 		if (r != EOK)
 			return r;
 
-		if (!ext4_dir_csum_verify(parent, (void *)block.data)) {
+		if (!ext4_dir_block_csum_verify(parent, &block)) {
 			ext4_dbg(DEBUG_DIR,
 				 DBG_WARN "Leaf block checksum failed."
 				 "Inode: %" PRIu32", "
@@ -498,7 +517,7 @@ int ext4_dir_find_entry(struct ext4_dir_search_result *result,
 		if (r != EOK)
 			return r;
 
-		if (!ext4_dir_csum_verify(parent, (void *)b.data)) {
+		if (!ext4_dir_block_csum_verify(parent, &b)) {
 			ext4_dbg(DEBUG_DIR,
 				 DBG_WARN "Leaf block checksum failed."
 				 "Inode: %" PRIu32", "
@@ -727,7 +746,6 @@ int ext4_dir_check_empty(struct ext4_inode_ref *dir, bool *empty)
         struct ext4_block block = EXT4_BLOCK_ZERO();
         r = ext4_block_get(dir->fs->bdev, &block, home);
         if (r != EOK) return r;
-        struct ext4_dir_en *first = (void *)block.data;
         bool index_block=false;
         if(indexed) {
             r=ext4_dir_dx_is_node(dir,i,&index_block);
@@ -736,7 +754,7 @@ int ext4_dir_check_empty(struct ext4_inode_ref *dir, bool *empty)
         bool found = false;
         if (index_block) r = ext4_dir_dx_check(dir, &block);
         else {
-            if (!ext4_dir_csum_verify(dir, first)) r = EUCLEAN;
+            if (!ext4_dir_block_csum_verify(dir, &block)) r = EUCLEAN;
             for (uint32_t pos = 0; r == EOK && pos < size; ) {
                 struct ext4_dir_en *entry = (void *)(block.data + pos);
                 if (size - pos < 8) { r = EUCLEAN; break; }
