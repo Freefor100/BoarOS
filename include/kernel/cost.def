@@ -312,6 +312,7 @@ X(FD_TABLE_HOLD, fd_table_hold, ticks, 0)
 /* Bounded shared-MM prefault investigation; compiled out of production. */
 X(MM_PAGE_ALLOC_TICKS, mm_page_alloc_ticks, ticks, 0)
 X(MM_SYNC_TICKS, mm_sync_ticks, ticks, 0)
+X(MM_ACTIVATE_INSTRUCTION_FLUSHES, mm_activate_instruction_flushes, count, 0)
 X(MM_FAULT_TICKS, mm_fault_ticks, ticks, 0)
 X(MM_COW_COPY_TICKS, mm_cow_copy_ticks, ticks, 0)
 X(FILE_QUERY_TICKS, file_query_ticks, ticks, 0)

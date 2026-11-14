@@ -21,6 +21,7 @@ RV 默认观测内核位于 `build/cost/kernel-rv`；USER_SMP 观测版本使用
 缺页观察使用 `mm_fault_ticks` 记录共同解析器，包含后备页准备、等待与提交；
 `mm_cow_copy_ticks` 只记录实际私有页复制，`mm_page_alloc_ticks` 只覆盖分配器调用。
 `mm_sync_ticks` 覆盖显式提交及预装尾部同步，不含激活 MM 或 spurious fault 的直接本地刷新。
+`mm_activate_instruction_flushes`只计进入MM时实际执行的本地指令同步，不含通用发布路径或固件内的其他同步；
 `file_query_ticks` 覆盖 stat/statx 的路径导入、查询及结果输出；`path_fallback_ticks`
 记录需要从魔术链接实际对象取得属性或重新打开的额外处理；`rfence_calls` 为真实 SBI
 RFENCE 调用数。这些阶段存在嵌套，累计经过时间含等待，不能直接相加为墙钟或纯 CPU。

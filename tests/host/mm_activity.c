@@ -129,6 +129,33 @@ static void *hold_reentry_lookup(void *unused)
     assert(!kernel_mm_lookup(&mm, reentry_address, &mapping));
     return NULL;
 }
+static unsigned history_left, history_published;
+static void *reenter_after_local_publication(void *unused)
+{
+    (void)unused;
+    mm_test_attach(1); kernel_cpu_current()->logical_id = 1;
+    assert(!kernel_mm_activate(&mm, kernel_context));
+    assert(!kernel_mm_activate(NULL, kernel_context));
+    unsigned instructions = instruction_sync;
+    publish(&history_left); await(&history_published);
+    assert(!kernel_mm_activate(&mm, kernel_context));
+    assert(instruction_sync == instructions + 1);
+    assert(!kernel_mm_activate(NULL, kernel_context));
+    assert(!kernel_mm_activate(&mm, kernel_context));
+    assert(instruction_sync == instructions + 1);
+    assert(!kernel_mm_activate(NULL, kernel_context));
+    return NULL;
+}
+static void inactive_instruction_publication(void)
+{
+    pthread_t peer;
+    assert(!pthread_create(&peer, NULL, reenter_after_local_publication, NULL));
+    await(&history_left);
+    assert(!kernel_mm_flush_instructions(&mm, 1));
+    publish(&history_published);
+    assert(!pthread_join(peer, NULL));
+    puts("MM retained instruction history detects LOCAL publication while CPU is absent");
+}
 static void same_mm_reentry(uint64_t address)
 {
     assert(!kernel_mm_activate(&mm, kernel_context));
@@ -145,7 +172,9 @@ static void same_mm_reentry(uint64_t address)
     /* 同一稳定MM的离开与再次进入也无需等无关PTE查询结束。 */
     assert(!kernel_mm_activate(NULL, kernel_context));
     assert(!kernel_mm_activate(&mm, kernel_context));
-    assert(flushes == tlb + 2 && instruction_sync == instructions + 1);
+    /* A root switch still invalidates translations. With no instruction
+     * publication, returning to this MM must retain this CPU's completed I$. */
+    assert(flushes == tlb + 2 && instruction_sync == instructions);
     publish(&reentry_release);
     assert(!pthread_join(lookup, NULL));
     alarm(0);
@@ -240,7 +269,7 @@ static void *publication_peer(void *unused)
             before = flushes;
             assert(!kernel_mm_activate(NULL, kernel_context));
             assert(!kernel_mm_activate(&mm, kernel_context));
-            assert(flushes == before + 2 && instruction_sync == before_instructions + 1);
+            assert(flushes == before + 2 && instruction_sync == before_instructions);
             assert(!kernel_mm_lookup(&mm, address, &mapping) && (mapping.permissions & KERNEL_MM_WRITE));
         }
         __atomic_store_n(&publication_done, i + 1, __ATOMIC_RELEASE);
@@ -771,6 +800,9 @@ int main(void)
 #if BOAROS_MAX_CPUS == 4
     many_mm_activity(address);
 #endif
+    /* Publish a real new instruction generation: a fresh host pthread is not
+     * a fresh CPU, and CPU1 may already have synchronized this MM earlier. */
+    assert(!kernel_mm_flush_instructions(&mm, 1));
     sample_activation=1;
     pthread_t modifier, visitor;
     assert(!pthread_create(&visitor, 0, enter, 0) && !pthread_create(&modifier, 0, modify, 0));
@@ -856,6 +888,7 @@ int main(void)
     assert(walk_calls && walk_calls<=256); /* 64GiB空洞不按虚拟页枚举。 */
 #endif
     instruction_publication_cases();
+    inactive_instruction_publication();
 finish:
     mm_test_context = 0; assert(!kernel_mm_release(&mm));
     assert(physical_page_available(&allocator) == baseline && !physical_page_allocator_audit(&allocator));
