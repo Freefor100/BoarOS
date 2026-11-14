@@ -326,7 +326,7 @@ static void wait_priority_snapshot(void)
 
 static void wake_batches(void)
 {
-    assert(measured_wake(source,1)==0 && !domain_takes && queue_takes==1);
+    assert(measured_wake(source,1)==0 && !domain_takes && !queue_takes);
     put(source, 0);
     struct waiter w = {1, 1, source, -99, 0, 0, 0};
     unsigned before = mm_test_parked(1); pthread_t worker;
@@ -354,7 +354,7 @@ static void wake_batches(void)
     assert(!pthread_join(worker, 0) && w.result == 0);
     assert(measured_wake(source+1024,1)==1 && !domain_takes && queue_takes==1);
     assert(measured_wake(source,2)==1 && !domain_takes && queue_takes==1);
-    assert(measured_wake(source,3)==0 && !domain_takes && queue_takes==1);
+    assert(measured_wake(source,3)==0 && !domain_takes && !queue_takes);
     synthetic_remove(3);
     /* More than sixteen registrations retain the borrowed cursor path. */
     synthetic_add(17, &key);

@@ -349,8 +349,12 @@ static int sockopt(struct kernel_socket *socket, struct kernel_files *files, str
                 KERNEL_UACCESS_STATUS_OK || copied != sizeof(length)) return -KERNEL_EFAULT;
     }
     if (length < 0) return -KERNEL_EINVAL;
-    if(level==LINUX_SOL_SOCKET && (name==26 || name==27 || name==44 || name==50))
+    if(level==LINUX_SOL_SOCKET && (name==26 || name==27 || name==44 || name==50)) {
+        /* Classic-program import/export holds separate heap/program owners
+         * across user faults. Keep their existing service lifetime. */
+        KERNEL_SERVICE_SCOPE(service);
         return filter_sockopt(socket,files,mm,request,get,length);
+    }
     if (timed) size = sizeof(payload.timeout);
     else if (peercred) size = sizeof(payload.peercred);
     else {
@@ -891,7 +895,8 @@ enum kernel_syscall_status syscall_handle_socket_operation(
     struct kernel_syscall_result *decoded)
 {
     int op = (int)request->number;
-    KERNEL_SERVICE_SCOPE_IF(service, op != 206 && op != 207);
+    int local=op==204 || op==205 || op==206 || op==207 || op==208 || op==209;
+    KERNEL_SERVICE_SCOPE_IF(service,!local);
     struct kernel_files *files;
     struct kernel_open_file_description *file = 0;
     struct kernel_socket *socket;
@@ -922,7 +927,7 @@ enum kernel_syscall_status syscall_handle_socket_operation(
         decoded->value = result;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    if (op==206 || op==207) {
+    if (local) {
         kernel_socket_call_begin(&data_call,files,&file);
         data_call.address=&peer_address;
     }

@@ -6,8 +6,10 @@
 - 固定版本：`STABLE-2_2_1_RELEASE`，peeled commit `77dcd25a72509eb83f72b033d219b1d40cd8eb95`；`references/sources.tsv` 固定恢复身份，2026-09-27 核对。
 - 导入路径：`third_party/lwip/`，保留 `src/core/`、`src/include/`、官方 Ethernet 入口和 `COPYING`；未导入 socket/netconn API 实现、应用、PPP 和上游具体网卡驱动。
 - 许可证：BSD-3-Clause，原有版权和许可声明保留在每个源码文件及 `COPYING`。
-- 用途：向 BoarOS 自有 socket fd/OFD 与 Linux ABI 层提供单 hart IPv4 UDP/TCP 协议核心；本阶段先用 NO_SYS raw API 和 loopback，网卡后端另行验证。
+- 用途：向 BoarOS 的 socket 层提供 IPv4／IPv6 的 UDP 和 TCP 协议实现，使用 NO_SYS raw API。IP 输入、UDP 和网卡由网络执行者服务，已建立的 TCP 连接可分属不同 CPU。
 - 本地修改：IPv4重组增加协议/输入网卡键、重复/重叠/终点校验及按网卡清理，另在 netif/timeouts 增加有预算的轮回入口，旧公开入口保持无限预算包装；mem/memp 增加可选的每次真实归还 hook，netif 增加 loopback 入队 hook。netif 地址设置增加保留既有 PCB 的入口，供 Linux 运行时地址配置使用，原设备移除的 PCB 清理不变。TCP Nagle 使用 Minshall 规则，tcp_pcb 尾部保存新发小包的确认边界，tcp.c/tcp_in.c 初始化、tcp_out.c 在实际成功输出后更新，tcp_priv.h 按序列号判断。对应头文件声明随实现维护；补丁不升级固定版本，其余导入文件保持原版。BoarOS 的 lwIP 配置、端口和 socket 所有权适配位于 `net/` 与 `fs/`，不以 lwIP 的 socket fd 空间代替 BoarOS 文件表。
+
+UDP PCB 按本地端口分桶，绑定冲突、临时端口查找和输入分发共用同一索引。IPv4/IPv6 通配、绑定地址、已连接对端和复用规则在桶内匹配。断开自动分配端口的连接时，先从该桶摘除 PCB。
 
 TCP 临时端口分配在自增前判断范围上界，允许随机初值取上界，并在下一次分配时
 回绕到范围起点，避免首次 bind/connect 把 0 当作端口耗尽；占用端口仍按实际 PCB

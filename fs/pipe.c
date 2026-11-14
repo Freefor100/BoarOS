@@ -197,8 +197,10 @@ static void pipe_notify(struct kernel_pipe *pipe,int readers,int writers)
 static void pipe_async(struct kernel_pipe *pipe,unsigned reason)
 {
     struct kernel_wait_cursor cursor={0};
-    {PIPE_META(guard,pipe);kernel_wait_cursor_prepare_event(&pipe->async_events,&cursor,reason,NULL);}
-    if (cursor.queue) kernel_wait_cursor_wake(&cursor,1);
+    /* The caller owns the pipe through producer completion. The queue lock
+     * captures subscriber borrows; no endpoint fields enter the event. */
+    if (!kernel_wait_cursor_prepare_event(&pipe->async_events,&cursor,reason,NULL)) return;
+    kernel_wait_cursor_wake(&cursor,1);
 }
 
 int64_t kernel_pipe_capacity(struct kernel_pipe *pipe,int command,uint64_t argument)
@@ -511,6 +513,7 @@ void kernel_pipe_read_finish(struct kernel_pipe_read_borrow *borrow,size_t consu
     struct kernel_pipe *pipe=borrow->pipe;
     if (!pipe || consumed>borrow->length || !borrow->guard.lock) __builtin_trap();
     size_t left=consumed;
+    int wake_writers=0;
     while (left) {
         void *page=NULL;
         {
@@ -525,13 +528,14 @@ void kernel_pipe_read_finish(struct kernel_pipe_read_borrow *borrow,size_t consu
                 continue;
             }
             size_t n=left<pipe->buffers[pipe->head].length?left:pipe->buffers[pipe->head].length;
+            if (n==pipe->buffers[pipe->head].length && pipe->slots==pipe->ring_size) wake_writers=1;
             page=pipe_consume(pipe,n);left-=n;pipe->read_slot=pipe->head;
         }
         if (page) pipe_release_page(pipe,page);
     }
     { PIPE_META(guard,pipe);pipe->read_slot=KERNEL_PIPE_NO_SLOT; }
     kernel_lock_release(&borrow->guard);*borrow=(struct kernel_pipe_read_borrow){0};
-    if (consumed) pipe_notify(pipe,0,1);
+    if (wake_writers) pipe_notify(pipe,0,1);
     pipe_async(pipe,KERNEL_ASYNC_POLL_OUT);
 }
 void kernel_pipe_read_fragment(struct kernel_pipe_read_borrow *borrow,size_t offset,
@@ -619,7 +623,7 @@ int64_t kernel_pipe_link(struct kernel_pipe *in,struct kernel_pipe *out,size_t c
         struct kernel_lock_guard guards[4]={{0}};
         for (unsigned i=0;i<4;i++) kernel_mutex_lock(locks[i],&guards[i]);
         uint64_t total=0;uint32_t index=in->head,remaining=in->slots;
-        int retry=0;
+        int retry=0,wake_writers=0;
         for (;;) {
             if (!count) break;
             struct kernel_pipe_buffer part={0};int eof=0,full=0;
@@ -655,7 +659,11 @@ int64_t kernel_pipe_link(struct kernel_pipe *in,struct kernel_pipe *out,size_t c
                         out->buffers[out->tail].page) __builtin_trap();
                     part.length=(uint16_t)n;out->buffers[out->tail]=part;
                     out->tail=next_slot(out,out->tail);out->slots++;out->bytes+=n;
-                    if (consume) {void *released=pipe_consume(in,n);if (move && released!=part.page) __builtin_trap();}
+                    if (consume) {
+                        if (move && in->slots==in->ring_size) wake_writers=1;
+                        void *released=pipe_consume(in,n);
+                        if (move && released!=part.page) __builtin_trap();
+                    }
                     publish=1;
                 }
             }
@@ -667,7 +675,8 @@ int64_t kernel_pipe_link(struct kernel_pipe *in,struct kernel_pipe *out,size_t c
         for (unsigned i=4;i;i--) kernel_lock_release(&guards[i-1]);
         if (total) {
             pipe_notify(out,1,0);pipe_async(out,KERNEL_ASYNC_POLL_IN);
-            if (consume) {pipe_notify(in,0,1);pipe_async(in,KERNEL_ASYNC_POLL_OUT);}
+            if (wake_writers) pipe_notify(in,0,1);
+            if (consume) pipe_async(in,KERNEL_ASYNC_POLL_OUT);
         }
         if (total || error || !retry) return total?(int64_t)total:error;
     }

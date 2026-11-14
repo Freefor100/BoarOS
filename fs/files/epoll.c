@@ -55,6 +55,9 @@ static void epoll_item_put(struct kernel_epoll_item *item)
 
 static void epoll_notify(struct kernel_epoll *epoll)
 {
+    /* Registration precedes the waiter's final ready check. With no observer
+     * the ready list itself retains the event for later poll or delivery. */
+    if (!kernel_wait_queue_registrations(&epoll->wait_queue)) return;
     uint64_t sequence = kernel_wait_notification_sequence();
     if (sequence && epoll->notification_sequence == sequence) return;
     epoll->notification_sequence = sequence;

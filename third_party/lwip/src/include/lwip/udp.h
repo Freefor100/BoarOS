@@ -84,7 +84,7 @@ struct udp_pcb {
 
 /* Protocol specific PCB members */
 
-  struct udp_pcb *next;
+  struct udp_pcb *next, **previous;
 
   u8_t flags;
   /** ports are in host byte order */
@@ -111,8 +111,8 @@ struct udp_pcb {
   /** user-supplied argument for the recv callback */
   void *recv_arg;
 };
-/* udp_pcbs export for external reference (e.g. SNMP agent) */
-extern struct udp_pcb *udp_pcbs;
+/* Release an automatically assigned Linux local port after AF_UNSPEC. */
+void boaros_lwip_udp_release_port(struct udp_pcb *pcb);
 
 /* The following functions is the application layer interface to the
    UDP code. */

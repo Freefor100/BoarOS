@@ -474,6 +474,11 @@ static void pipe_async_observer(struct kernel_wait_node *node,uint32_t reason,ui
     if (event==KERNEL_ASYNC_POLL_IN) pipe_async_inputs++;
     else {assert(event==KERNEL_ASYNC_POLL_OUT);pipe_async_outputs++;}
 }
+static void pipe_writer_wake(struct kernel_wait_node *node,uint32_t reason,uint64_t event)
+{
+    assert(reason==KERNEL_WAIT_WOKEN && !event && !kernel_cpu_current()->raw_locks);
+    (*(unsigned *)node->context)++;
+}
 static void pipe_async_cadence(struct kernel_heap *heap)
 {
     pipe_bind(0,0);struct kernel_pipe *pipe=pipe_table(heap);mm_test_bind_files(&files);
@@ -490,8 +495,16 @@ static void pipe_async_cadence(struct kernel_heap *heap)
     assert(!kernel_pipe_readv(pipe,&domain_mm,&target,1,0,0,&got) && !got);
     assert(!kernel_pipe_write_buffer(pipe,pipe_payload,0,1,&written) && !written.bytes);
     assert(pipe_async_inputs==1 && pipe_async_outputs==2);
+    assert(kernel_pipe_capacity(pipe,1031,BOAROS_PAGE_SIZE)==BOAROS_PAGE_SIZE);
+    unsigned wakes=0;struct kernel_wait_node writer={0};
+    kernel_wait_node_init_callback(&writer,pipe_writer_wake,&wakes);
+    kernel_wait_queue_add(&pipe->write_queue,&writer);
+    assert(!kernel_pipe_write_buffer(pipe,pipe_payload,4,1,&written) && written.bytes==4);
+    assert(!kernel_pipe_readv(pipe,&domain_mm,&target,1,1,0,&got) && got==1 && !wakes);
+    assert(!kernel_pipe_readv(pipe,&domain_mm,&target,1,3,0,&got) && got==3 && wakes==1);
+    assert(!kernel_wait_node_remove_sync(&writer) && pipe_async_inputs==2 && pipe_async_outputs==4);
     assert(!kernel_files_close(&files,1,&got) && !got);
-    assert(pipe_async_inputs==2 && pipe_async_outputs==3);
+    assert(pipe_async_inputs==3 && pipe_async_outputs==5);
     assert(!kernel_wait_node_remove_sync(&observer) && !kernel_files_release(&files));
     puts("PASS pipe async cadence: one multi-page write, completed/empty reads, zero-count and last-writer directions");
 }

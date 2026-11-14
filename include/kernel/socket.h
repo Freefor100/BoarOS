@@ -189,7 +189,7 @@ int kernel_socket_connect(struct kernel_socket *socket,
 int kernel_socket_connection_result(struct kernel_socket *socket);
 int kernel_socket_accept(struct kernel_socket *socket,
                          struct kernel_socket **owner, struct kernel_open_file_description *file);
-int kernel_socket_accept_check(const struct kernel_socket *socket);
+int kernel_socket_accept_check(struct kernel_socket *socket);
 int kernel_socket_write_packet_buffer(struct kernel_open_file_description **pin_owner,
     const void *buffer, uint64_t count, uint32_t flags);
 int kernel_socket_receive_ready(struct kernel_socket *socket);
@@ -236,10 +236,10 @@ int kernel_socket_get_option(struct kernel_socket *socket,
 /* Preserve a later recvmmsg error after returning its completed prefix. */
 void kernel_socket_save_error(struct kernel_socket *socket, int error);
 void kernel_socket_set_send_timeout(struct kernel_socket *socket, uint64_t nanoseconds);
-uint64_t kernel_socket_send_timeout(const struct kernel_socket *socket);
+uint64_t kernel_socket_send_timeout(struct kernel_socket *socket);
 void kernel_socket_set_receive_timeout(struct kernel_socket *socket,
                                        uint64_t nanoseconds);
-uint64_t kernel_socket_receive_timeout(const struct kernel_socket *socket);
+uint64_t kernel_socket_receive_timeout(struct kernel_socket *socket);
 uint32_t kernel_socket_poll(struct kernel_socket *socket,
                             struct kernel_wait_queue **queue);
 struct kernel_wait_queue *kernel_socket_wait_queue(struct kernel_socket *socket);
