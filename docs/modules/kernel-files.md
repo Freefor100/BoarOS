@@ -661,7 +661,7 @@ read/readv、pread 系列与 sendfile 在访问时间更新等首次可睡眠动
 ## statx 与 LoongArch musl
 
 `kernel_files_statx()` 与 `fstatat` 共用路径、fd pin 和真实 inode 元数据，按 Linux
-固定的 256 字节布局写入用户缓冲。`stx_mask` 报告 `STATX_BASIC_STATS`，后端支持的
+固定的 256 字节布局写入用户缓冲。`stx_mask` 报告 `STATX_BASIC_STATS`；当前不发布 `STATX_BTIME`，文件创建时间查询得到“不提供”。后端支持的
 inode 属性由独立的 `stx_attributes_mask` 声明，见[普通文件和目录的 inode 标志](#普通文件和目录的-inode-标志)。未知 request mask 位忽略，
 保留 bit31 与同时指定 FORCE_SYNC/DONT_SYNC 返回 EINVAL。正 fd 的空路径可为 NULL，
 与固定 Linux 一样略过其他 lookup 位；路径查询仍校验 lookup 位。坏缓冲或跨入

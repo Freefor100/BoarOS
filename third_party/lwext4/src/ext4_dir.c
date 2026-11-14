@@ -126,21 +126,15 @@ bool ext4_dir_csum_verify(struct ext4_inode_ref *inode_ref,
 	return true;
 }
 
-uint64_t ext4_dir_check_key(const struct ext4_inode_ref *inode, int indexed)
-{
-    if (inode->index > (UINT32_MAX >> 1)) return 0;
-    return ((uint64_t)inode->index << 33) |
-        ((uint64_t)ext4_inode_get_generation(inode->inode) << 1) | (indexed != 0);
-}
 
 bool ext4_dir_block_csum_verify(struct ext4_inode_ref *inode, const struct ext4_block *block)
 {
-    uint64_t key = ext4_dir_check_key(inode, 0);
-    uint64_t observed = __atomic_load_n(&block->payload->directory_verified, __ATOMIC_ACQUIRE);
+    uint64_t key = ext4_fs_tree_check_key(inode, EXT4_TREE_DIRECTORY_LEAF);
+    uint64_t observed = __atomic_load_n(&block->payload->tree_verified, __ATOMIC_ACQUIRE);
     if (key && observed == key) return true;
     if (!ext4_dir_csum_verify(inode, (void *)block->data)) return false;
     if (key && observed != UINT64_MAX)
-        (void)__atomic_compare_exchange_n(&block->payload->directory_verified,
+        (void)__atomic_compare_exchange_n(&block->payload->tree_verified,
             &observed, key, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
     return true;
 }

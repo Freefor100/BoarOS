@@ -58,15 +58,15 @@ LA_TEST_OBJECTS = $(filter-out $(LA_BUILD)/arch/loongarch/main.o $(LA_BUILD)/pla
     $(patsubst %.c,$(LA_BUILD)/%.o,$(LA_TEST_SOURCES)) $(LA_BUILD)/tests/loongarch/user_blob.o
 $(LA_BUILD)/contract/%.o: %.c arch/loongarch/build.mk $(LA_BUILD)/generated/lock-config.h
 	@mkdir -p $(dir $@)
-	$(LA_CC) $(LA_CPPFLAGS) $(LWEXT4_CPPFLAGS) $(LWIP_CPPFLAGS) $(LA_CFLAGS) -DBOAROS_LA_CONTRACT=1 -I$(LA_BUILD)/generated -c $< -o $@
+	$(LA_CC) $(LA_CPPFLAGS) $(LWEXT4_CPPFLAGS) $(LWIP_CPPFLAGS) $(LA_CFLAGS) -DBOAROS_LA_CONTRACT=1 -I$(LA_BUILD)/generated $(DEP_TARGET_FLAGS) -c $< -o $@
 $(LA_BUILD)/contract/platform/loongarch_root.o: $(LA_BUILD)/generated/init-config.h $(LA_BUILD)/generated/lock-config.h
 
 $(LA_BUILD)/%.o: %.c arch/loongarch/build.mk $(LA_BUILD)/generated/lock-config.h
 	@mkdir -p $(dir $@)
-	$(LA_CC) $(LA_CPPFLAGS) $(LWEXT4_CPPFLAGS) $(LWIP_CPPFLAGS) $(LA_CFLAGS) -c $< -o $@
+	$(LA_CC) $(LA_CPPFLAGS) $(LWEXT4_CPPFLAGS) $(LWIP_CPPFLAGS) $(LA_CFLAGS) $(DEP_TARGET_FLAGS) -c $< -o $@
 $(LA_BUILD)/%.o: %.S arch/loongarch/build.mk $(LA_BUILD)/generated/lock-config.h
 	@mkdir -p $(dir $@)
-	$(LA_CC) $(LA_CPPFLAGS) $(LA_FLAGS) -g3 -MMD -MP -c $< -o $@
+	$(LA_CC) $(LA_CPPFLAGS) $(LA_FLAGS) -g3 -MMD -MP $(DEP_TARGET_FLAGS) -c $< -o $@
 LA_BTF_BASE := $(LA_BUILD)/btf/kernel-base.elf
 LA_BTF_DATA := $(LA_BUILD)/btf/vmlinux.btf
 LA_BTF_SOURCE := $(LA_BUILD)/btf/vmlinux.S
@@ -146,7 +146,7 @@ test-stack-usage-la: kernel-la
 	python3 -B tests/tools/stack-usage.py $(LA_BUILD) --stack-bytes 32768 --trap-frame-bytes 304
 
 $(LA_BUILD)/stack-guard-%.o: tests/loongarch/stack_guard.c $(LA_BUILD)/generated/lock-config.h
-	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DLA_STACK_CASE=$* -c $< -o $@
+	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DLA_STACK_CASE=$* $(DEP_TARGET_FLAGS) -c $< -o $@
 $(LA_BUILD)/kernel-stack-guard-%: $(LA_TEST_OBJECTS) $(LA_BUILD)/stack-guard-%.o arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_boot_tasks -o $@ $(LA_TEST_OBJECTS) $(LA_BUILD)/stack-guard-$*.o -lgcc
 ifeq ($(LA_SMP),1)
@@ -178,7 +178,7 @@ $(LA_BUILD)/user-probe: tests/loongarch/user.c tests/loongarch/user_start.S test
 $(LA_BUILD)/tests/loongarch/user_blob.o: $(LA_BUILD)/user-probe $(LA_BUILD)/generated/lock-config.h
 
 $(LA_BUILD)/fatal-%.o: tests/loongarch/fatal.c $(LA_BUILD)/generated/lock-config.h
-	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DLA_FATAL_CASE=$* -c $< -o $@
+	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DLA_FATAL_CASE=$* $(DEP_TARGET_FLAGS) -c $< -o $@
 $(LA_BUILD)/kernel-fatal-%: $(LA_BUILD)/fatal-%.o $(LA_TEST_OBJECTS) arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_boot_tasks -o $@ $(LA_TEST_OBJECTS) $< -lgcc
 .PHONY: test-loongarch-fatal
@@ -209,7 +209,7 @@ test-root-loongarch: $(LA_BUILD)/root-probe
 test-root-checksum-loongarch: kernel-la $(LA_BUILD)/root-probe prepare-la-tools
 	python3 -B tests/loongarch/root.py --qemu $(QEMU_LOONGARCH64) --cc $(LA_CC) --smoke --metadata-csum
 $(LA_BUILD)/root-oom-%.o: tests/loongarch/root_oom.c $(LA_BUILD)/generated/lock-config.h
-	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DROOT_OOM_CASE=$* -c $< -o $@
+	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DROOT_OOM_CASE=$* $(DEP_TARGET_FLAGS) -c $< -o $@
 $(LA_BUILD)/kernel-root-oom-%: $(LA_BUILD)/root-oom-%.o $(LA_TEST_OBJECTS) arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=$(if $(filter 1,$*),kernel_exec_image_prepare,$(if $(filter 2,$*),kernel_user_thread_create,kernel_page_cache_start_worker)) -o $@ $(LA_TEST_OBJECTS) $< -lgcc
 
@@ -228,7 +228,7 @@ $(LA_BUILD)/rng-probe: tests/userland/rng.c prepare-la-userland
 test-rng-loongarch: kernel-la $(LA_BUILD)/rng-probe prepare-la-tools prepare-la-linux-platform
 	python3 -B tests/userland/rng.py --arch loongarch $(TEST_MEMORY_ARGS)
 $(LA_BUILD)/rng-fail-%.o: tests/loongarch/rng_failures.c arch/loongarch/build.mk $(LA_BUILD)/generated/lock-config.h
-	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DRNG_FAIL_AFTER=$* -c $< -o $@
+	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DRNG_FAIL_AFTER=$* $(DEP_TARGET_FLAGS) -c $< -o $@
 $(LA_BUILD)/kernel-rng-fail-%: $(LA_TEST_OBJECTS) $(LA_BUILD)/rng-fail-%.o arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=virtio_rng_start -o $@ $(LA_TEST_OBJECTS) $(LA_BUILD)/rng-fail-$*.o -lgcc
 .PHONY: test-rng-failures-loongarch
@@ -259,7 +259,7 @@ test-pthread-loongarch: kernel-la $(LA_BUILD)/pthread-probe prepare-la-tools pre
 $(LA_BUILD)/pthread-oom-probe: tests/loongarch/pthread_oom.c prepare-la-userland
 	REALGCC=$(abspath $(LA_USER_CC)) $(LA_MUSL_CC) $(LA_FLAGS) -O2 -static -pthread -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 -o $@ $<
 $(LA_BUILD)/clone-oom-%.o: tests/loongarch/clone_oom.c $(LA_BUILD)/generated/lock-config.h
-	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DCLONE_OOM_AFTER=$* -c $< -o $@
+	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DCLONE_OOM_AFTER=$* $(DEP_TARGET_FLAGS) -c $< -o $@
 $(LA_BUILD)/kernel-clone-oom-%: $(LA_BUILD)/clone-oom-%.o $(LA_TEST_OBJECTS) arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=arch_process_clone_current -o $@ $(LA_TEST_OBJECTS) $< -lgcc
 .PHONY: test-pthread-oom-loongarch
@@ -335,7 +335,7 @@ test-network-loongarch: kernel-la prepare-la-userland prepare-la-linux-platform 
 	python3 -B tests/userland/run.py --arch loongarch --workload budget $(TEST_MEMORY_ARGS)
 	python3 -B tests/userland/run.py --arch loongarch --workload unix_sender $(TEST_MEMORY_ARGS)
 $(LA_BUILD)/net-failure-%.o: tests/loongarch/net_failures.c $(LA_BUILD)/generated/lock-config.h
-	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DNET_FAIL_CASE=$* -c $< -o $@
+	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DNET_FAIL_CASE=$* $(DEP_TARGET_FLAGS) -c $< -o $@
 $(LA_BUILD)/kernel-net-failure-%: $(LA_TEST_OBJECTS) $(LA_BUILD)/net-failure-%.o arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=virtio_net_init,--wrap=kernel_network_start,--wrap=kernel_heap_allocate_zeroed,--wrap=kernel_thread_create_joinable,--wrap=virtio_transport_reset -o $@ $(LA_TEST_OBJECTS) $(LA_BUILD)/net-failure-$*.o -lgcc
 .PHONY: test-net-failures-loongarch test-network-external-loongarch
@@ -347,7 +347,7 @@ test-network-external-loongarch: kernel-la prepare-la-userland prepare-la-linux-
 	python3 -B tests/userland/network-external.py --arch loongarch
 
 $(LA_BUILD)/uart-failure-%.o: tests/loongarch/uart_failures.c $(LA_BUILD)/generated/lock-config.h
-	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DUART_FAIL_CASE=$* -c $< -o $@
+	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DUART_FAIL_CASE=$* $(DEP_TARGET_FLAGS) -c $< -o $@
 $(LA_BUILD)/kernel-uart-failure-%: $(LA_TEST_OBJECTS) $(LA_BUILD)/uart-failure-%.o arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=ns16550_start,--wrap=kernel_heap_allocate_zeroed,--wrap=kernel_thread_create_joinable -o $@ $(LA_TEST_OBJECTS) $(LA_BUILD)/uart-failure-$*.o -lgcc
 $(LA_BUILD)/tty-probe: tests/workloads/tty/probe.c $(LA_BUILD)/musl-root/bin/musl-gcc
@@ -415,7 +415,7 @@ test-sqlite-rollback-loongarch: $(LA_BUILD)/sqlite-rollback $(LA_BUILD)/sqlite3-
 
 $(LA_BUILD)/sync-%.o: tests/common/sync.c $(LA_BUILD)/generated/lock-config.h
 	@mkdir -p $(dir $@)
-	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DBOAROS_SYNC_CASE=$* -c $< -o $@
+	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DBOAROS_SYNC_CASE=$* $(DEP_TARGET_FLAGS) -c $< -o $@
 $(LA_BUILD)/sync-%: $(LA_TEST_OBJECTS) $(LA_BUILD)/sync-%.o arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_boot_tasks -o $@ $(LA_TEST_OBJECTS) $(LA_BUILD)/sync-$*.o -lgcc
 .PHONY: test-sync-loongarch
@@ -424,7 +424,7 @@ test-sync-loongarch: $(foreach case,0 1 2 3 4,$(LA_BUILD)/sync-$(case)) prepare-
 
 $(LA_BUILD)/wait-native.o: tests/common/wait.c $(LA_BUILD)/generated/lock-config.h
 	@mkdir -p $(dir $@)
-	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -c $< -o $@
+	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) $(DEP_TARGET_FLAGS) -c $< -o $@
 $(LA_BUILD)/wait-native: $(LA_TEST_OBJECTS) $(LA_BUILD)/wait-native.o arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_boot_tasks,--wrap=kernel_wait_backend_switch,--wrap=kernel_wait_backend_switch_locked -o $@ $(LA_TEST_OBJECTS) $(LA_BUILD)/wait-native.o -lgcc
 .PHONY: test-wait-loongarch
@@ -433,7 +433,7 @@ test-wait-loongarch: $(LA_BUILD)/wait-native prepare-la-tools
 
 $(LA_BUILD)/sched-lifecycle-native.o: tests/common/wait.c Makefile $(LA_BUILD)/generated/lock-config.h
 	@mkdir -p $(dir $@)
-	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DBOAROS_SCHED_LIFECYCLE=1 -c $< -o $@
+	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DBOAROS_SCHED_LIFECYCLE=1 $(DEP_TARGET_FLAGS) -c $< -o $@
 $(LA_BUILD)/sched-lifecycle-native: $(LA_TEST_OBJECTS) $(LA_BUILD)/sched-lifecycle-native.o arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_boot_tasks,--wrap=kernel_wait_backend_switch,--wrap=kernel_wait_backend_switch_locked -o $@ $(LA_TEST_OBJECTS) $(LA_BUILD)/sched-lifecycle-native.o -lgcc
 .PHONY: test-sched-lifecycle-loongarch

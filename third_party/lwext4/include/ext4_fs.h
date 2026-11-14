@@ -269,6 +269,10 @@ int ext4_fs_put_block_group_ref(struct ext4_block_group_ref *ref);
  */
 int ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 			  struct ext4_inode_ref *ref);
+enum ext4_tree_block_type {
+    EXT4_TREE_DIRECTORY_LEAF, EXT4_TREE_DIRECTORY_INDEX, EXT4_TREE_EXTENT,
+};
+uint64_t ext4_fs_tree_check_key(const struct ext4_inode_ref *,enum ext4_tree_block_type);
 int ext4_fs_get_inode_ref_read(struct ext4_fs *fs, uint32_t index,
     struct ext4_inode_ref *ref);
 /* Qualify an existing read reference before exposing writable inode bytes. */
