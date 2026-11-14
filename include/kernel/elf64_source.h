@@ -94,7 +94,7 @@ enum kernel_elf64_source_status kernel_elf64_source_page(
     struct physical_page_allocator *allocator,
     uint64_t virtual_offset,
     uint64_t *physical_address,
-    int *shared);
+    int *shared,int read_window);
 
 uint64_t kernel_elf64_source_file_size(
     const struct kernel_elf64_source *source);

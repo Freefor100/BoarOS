@@ -35,7 +35,7 @@ mincore 每页输出最低位的驻留状态，查询本身不装入页面。MM 
 
 ## madvise 与共享段锁定
 
-RV64/LA64 的 madvise(233) 支持 NORMAL、RANDOM、SEQUENTIAL、WILLNEED、DONTNEED、FREE、REMOVE，以及 DONTFORK/DOFORK、WIPEONFORK/KEEPONFORK、DONTDUMP/DODUMP和POPULATE_READ/WRITE，参数中的 advice 按 Linux 32 位 int 解释。NORMAL/RANDOM/SEQUENTIAL 验证映射范围并沿用当前缓存策略；它们是性能建议。未接入的扩展模式返回 EINVAL。
+RV64/LA64 的 madvise(233) 支持 NORMAL、RANDOM、SEQUENTIAL、WILLNEED、DONTNEED、FREE、REMOVE，以及 DONTFORK/DOFORK、WIPEONFORK/KEEPONFORK、DONTDUMP/DODUMP和POPULATE_READ/WRITE，参数中的 advice 按 Linux 32 位 int 解释。RANDOM 在 VMA 上保存随机访问建议，禁止该范围冷缺页的邻页批量装入；NORMAL/SEQUENTIAL 清除此标志。建议随 VMA 分裂、合并、fork 和 mremap 保留，不改变权限或文件位置。未接入的扩展模式返回 EINVAL。
 
 DONTNEED 在 MM 修改资格内撤销范围的 PTE 和文件驻留登记，保留 VMA、保护位、AS/DATA 用量和后备对象。私有匿名页重新访问得到零，私有文件 COW 页面重新取文件内容；共享匿名、SysV 和共享文件的数据保存在真实后备中；BPF 对象映射保留 map 数据但不补回 PTE，再访问产生 SIGBUS（见[BPF 对象共享映射](#bpf-对象共享映射)）。vDSO 代码缺页从内核内嵌的 ELF 重新装入，并完成指令缓存与 TLB 同步；只读 vVAR 缺页重新映射本 MM 持有的共享时钟页。复用现有有界退页过程，页和页表在活动 CPU 完成 TLB 失效后释放。范围中的空洞最终返回 ENOMEM，空洞两侧的有效映射仍执行；遇到锁定 VMA 返回 EINVAL，保留此前范围已经完成的变化。
 
@@ -262,7 +262,7 @@ VMA 保留后备对象、文件权限上限和源子范围偏移。共享匿名�
 
 ## 硬件用户缺页解析
 
-缺页准备只保留跨装页过程必需的旧 VMA 快照；栈增长和返回后的 VMA 复查各自使用独立的临时帧，避免把它们的候选 VMA 一直保留到设备等待。lwext4 单范围读取的临时片段存储按实际可能涉及的文件系统块数取值，上限仍为八；已有批量工作区和 DMA 借用规则不变，不为冷缺页增加堆分配或常驻逐页数组。
+缺页准备只保留跨装页过程必需的旧 VMA 快照；栈增长和返回后的 VMA 复查各自使用独立的临时帧，避免把它们的候选 VMA 一直保留到设备等待。lwext4 单范围读取的临时片段存储按实际可能涉及的文件系统块数取值，上限仍为八；冷页批量装入沿用页缓存的堆工作区和 DMA 借用规则；热命中不租用工作区，调用者仍只持有所需页面，不在内核栈增加邻页数组。
 
 `kernel_mm_resolve_user_fault()` 的 `access` 必须恰为 READ、WRITE、EXECUTE 之一。通用层先检查用户范围、VMA、逻辑权限和现有 PTE；地址无 VMA 返回 `NOT_MAPPED`，合法 VMA 的权限不足返回 `ACCESS`。`ELF_PRIVATE/ELF` VMA 按 source 区间二分取得 FILE、COMPOSITE 或 ZERO backing，再按实际缺失的资源准备候选。硬件缺页与 uaccess 使用同一解析器，不为非法软件访问分配页面。
 

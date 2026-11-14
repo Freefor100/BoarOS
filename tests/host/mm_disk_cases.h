@@ -64,12 +64,12 @@ static struct kernel_mm *disk_views[5];
 static uint64_t disk_roots[5],disk_target;
 static unsigned disk_capture,disk_entered[5],disk_resume;
 static enum kernel_uaccess_status disk_results[5];
-int __real_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *,uint64_t,
+int __real_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *,uint64_t,int,
     struct kernel_open_file_page_preparation *);
-int __wrap_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *file,uint64_t index,
+int __wrap_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *file,uint64_t index,int read_window,
     struct kernel_open_file_page_preparation *prepared)
 {
-    int result=__real_kernel_open_file_prepare_mapping_page(file,index,prepared);
+    int result=__real_kernel_open_file_prepare_mapping_page(file,index,read_window,prepared);
     unsigned id=kernel_cpu_current()->hardware_id;
     if (!result && id<5 && (__atomic_fetch_and(&disk_capture,~(1U<<id),__ATOMIC_ACQ_REL)&(1U<<id))) {
         assert(!kernel_io_context_current()->locks && !kernel_cpu_current()->raw_locks);

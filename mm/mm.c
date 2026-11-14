@@ -5511,7 +5511,8 @@ static __attribute__((noinline)) enum kernel_mm_status mapped_file_fault(struct 
     kernel_lock_release(&inode);
     if (operation->guard.lock) mm_operation_release(operation);
     if (!cookie) {
-        int error = kernel_open_file_prepare_mapping_page(file,offset >> BOAROS_PAGE_SHIFT,&source);
+        int error = kernel_open_file_prepare_mapping_page(file,offset >> BOAROS_PAGE_SHIFT,
+            !(vma.flags&KERNEL_VMA_RANDOM_READ),&source);
         status = !error ? KERNEL_MM_STATUS_OK : error == -KERNEL_EBUSY ? KERNEL_MM_STATUS_CONFLICT :
             error == -KERNEL_ENOMEM ? KERNEL_MM_STATUS_NO_MEMORY : KERNEL_MM_STATUS_BUS_FAULT;
         if (status == KERNEL_MM_STATUS_OK) {
@@ -5883,7 +5884,8 @@ found:
         mm_operation_release(operation);
     if (source) {
         enum kernel_elf64_source_status result = kernel_elf64_source_page(source, allocator,
-            vma.backing_offset + address - vma.start, &replacement, &source_shared);
+            vma.backing_offset + address - vma.start, &replacement, &source_shared,
+            !(vma.flags&KERNEL_VMA_RANDOM_READ));
         status = !result ? KERNEL_MM_STATUS_OK : result == KERNEL_ELF64_SOURCE_STATUS_NO_MEMORY ?
             KERNEL_MM_STATUS_NO_MEMORY : result == KERNEL_ELF64_SOURCE_STATUS_IO ?
             KERNEL_MM_STATUS_BUS_FAULT : result == KERNEL_ELF64_SOURCE_STATUS_CLEANUP_REQUIRED ?
@@ -6620,7 +6622,7 @@ static int advise_file(struct mm_operation *operation, const struct kernel_vma *
     for (uint64_t done = 0; done < length && *budget; done += BOAROS_PAGE_SIZE) {
         struct kernel_open_file_page_preparation prepared = {0};
         (*budget)--;
-        if (kernel_open_file_prepare_mapping_page(file, (offset + done) >> BOAROS_PAGE_SHIFT, &prepared))
+        if (kernel_open_file_prepare_mapping_page(file, (offset + done) >> BOAROS_PAGE_SHIFT, 0, &prepared))
             break;
         kernel_open_file_finish_mapping_page(file, &prepared, 0);
     }
@@ -6811,6 +6813,17 @@ int kernel_mm_madvise(struct kernel_mm *mm, uint64_t address, uint64_t length, i
             error = advise_remove(&operation, &vma, address, finish);
         else if (advice == KERNEL_MM_ADVICE_FREE)
             error = advise_free(&operation,&vma,address,&finish);
+        else if (advice == KERNEL_MM_ADVICE_NORMAL || advice == KERNEL_MM_ADVICE_RANDOM ||
+                 advice == KERNEL_MM_ADVICE_SEQUENTIAL) {
+            uint32_t value=advice==KERNEL_MM_ADVICE_RANDOM?KERNEL_VMA_RANDOM_READ:0;
+            if ((vma.flags&KERNEL_VMA_RANDOM_READ)!=value) {
+                struct kernel_vma_edit edit;
+                enum kernel_vma_status changed=kernel_vma_set_prepare_flags(record->vmas,address,finish,
+                    KERNEL_VMA_RANDOM_READ,value,&edit);
+                if (changed==KERNEL_VMA_STATUS_NO_MEMORY) error=-KERNEL_EAGAIN;
+                else if (changed || kernel_vma_set_commit_edit(record->vmas,&edit)) __builtin_trap();
+            }
+        }
         else if (fork_policy) error = advise_fork(record, &vma, address, &finish, advice);
         else if (dump_policy) {
             if (advice==KERNEL_MM_ADVICE_DODUMP && (vma.role==KERNEL_VMA_ROLE_VVAR ||
@@ -6822,8 +6835,6 @@ int kernel_mm_madvise(struct kernel_mm *mm, uint64_t address, uint64_t length, i
             if (changed==KERNEL_VMA_STATUS_NO_MEMORY) error=-KERNEL_EAGAIN;
             else if (changed || kernel_vma_set_commit_edit(record->vmas,&edit)) __builtin_trap();
         }
-        /* NORMAL/RANDOM/SEQUENTIAL are advisory: keep the existing global
-         * cache policy, validate the complete mapped range, and store no hint. */
         if (error) return error;
         address = finish;
     }

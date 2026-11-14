@@ -272,6 +272,9 @@ struct cache_request {
 
 struct read_workspace {
     struct file_read_workspace backend;
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+    struct kernel_page_cache_read_page fault_pages[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
+#endif
     struct kernel_page_cache_entry *entries[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
     struct kernel_page_cache_entry *loads[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
     struct file_read_span spans[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
@@ -328,7 +331,7 @@ struct read_batch_load {
     struct file_read_span *spans;
     struct file_read_workspace *backend;
     enum kernel_page_cache_status allocation;
-    int no_reuse;
+    int no_reuse,speculative;
 };
 
 static int remote_cache_client(void)
@@ -2226,13 +2229,17 @@ const void *kernel_page_cache_read_data(const struct kernel_page_cache_read_page
     return entry->data;
 }
 
-enum kernel_page_cache_status kernel_page_cache_get(
+static enum kernel_page_cache_status get_batch(struct kernel_page_cache *,
+    const struct kernel_vfs_file *,uint64_t,struct kernel_page_cache_read_page *,size_t,int,int);
+
+static enum kernel_page_cache_status get_page(
     struct kernel_page_cache *cache, const struct kernel_vfs_file *file,
-    uint64_t page_index, uint64_t *physical_address, size_t *valid_bytes)
+    uint64_t page_index, uint64_t *physical_address, size_t *valid_bytes,
+    int read_window,int no_reuse)
 {
     if (!physical_address || !valid_bytes) return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
     struct kernel_page_cache_read_page page = {0};
-    enum kernel_page_cache_status status = kernel_page_cache_get_batch(cache, file, page_index, &page, 1, 0);
+    enum kernel_page_cache_status status = get_batch(cache,file,page_index,&page,1,no_reuse,read_window);
     if (!status) {
         if (physical_page_acquire(cache->allocator, page.physical_address)) __builtin_trap();
         *physical_address = page.physical_address;
@@ -2241,6 +2248,16 @@ enum kernel_page_cache_status kernel_page_cache_get(
     }
     return status;
 }
+
+enum kernel_page_cache_status kernel_page_cache_get(
+    struct kernel_page_cache *cache,const struct kernel_vfs_file *file,
+    uint64_t index,uint64_t *address,size_t *valid)
+{ return get_page(cache,file,index,address,valid,0,0); }
+
+enum kernel_page_cache_status kernel_page_cache_get_for_fault(
+    struct kernel_page_cache *cache,const struct kernel_vfs_file *file,
+    uint64_t index,uint64_t *address,size_t *valid,int read_window,int no_reuse)
+{ return get_page(cache,file,index,address,valid,read_window,no_reuse); }
 
 
 
@@ -2280,7 +2297,9 @@ static void commit_read_batch(void *argument)
             }
             struct kernel_page_cache_entry *entry=index_find(node,first+i);
             if (entry) {
-                if (read_entry_ready(entry)) {
+                if (request->speculative && i) {
+                    pages[i].status=KERNEL_PAGE_CACHE_STATUS_BUSY;
+                } else if (read_entry_ready(entry)) {
                     take_read_page_borrow(cache,entry,&pages[i].physical_address,&pages[i].valid_bytes,&pages[i].entry,entry_valid_bytes(entry),request->no_reuse);
                     pages[i].status=KERNEL_PAGE_CACHE_STATUS_OK;
                 } else { entry_borrow(entry);entries[i]=entry; }
@@ -2305,7 +2324,7 @@ static void commit_read_batch(void *argument)
 /* 只有缺失批次进入此处；页、描述及容量由调用CPU准备，热命中不租工作区。 */
 static void __attribute__((noinline)) read_batch_local(struct kernel_page_cache *cache,const struct kernel_vfs_file *file,
     uint64_t first,struct kernel_page_cache_read_page *pages,size_t count,
-    struct kernel_page_cache_entry **entries,struct read_workspace *workspace,int no_reuse)
+    struct kernel_page_cache_entry **entries,struct read_workspace *workspace,int no_reuse,int speculative)
 {
     struct kernel_vfs_node *node=kernel_vfs_file_node(file);
     struct kernel_page_cache_entry *single_load;
@@ -2320,6 +2339,11 @@ static void __attribute__((noinline)) read_batch_local(struct kernel_page_cache 
     /* 容量按批次准备；候选未发布，整批分配不制造尚未提交的loading依赖。 */
     for (size_t i=0;!allocation && i<count;i++) {
         if (pages[i].status!=KERNEL_PAGE_CACHE_STATUS_NOT_FOUND || entries[i]) continue;
+        if (i && speculative && (cache->record->stopping ||
+            physical_page_available(cache->allocator)<=cache->record->high)) {
+            allocation=KERNEL_PAGE_CACHE_STATUS_NO_MEMORY;
+            break;
+        }
         allocation=allocate_entry(cache,node,first+i,0,&loads[i]);
         if (allocation) break;
         spans[i]=(struct file_read_span){(first+i)<<BOAROS_PAGE_SHIFT,loads[i]->data,BOAROS_PAGE_SIZE,0,0};
@@ -2327,7 +2351,7 @@ static void __attribute__((noinline)) read_batch_local(struct kernel_page_cache 
     }
     if (candidates) {
         struct read_batch_load request={cache,file,first,pages,count,entries,loads,outputs,spans,
-            workspace?&workspace->backend:NULL,allocation,no_reuse};
+            workspace?&workspace->backend:NULL,allocation,no_reuse,speculative};
         enum kernel_page_cache_status submitted=KERNEL_PAGE_CACHE_STATUS_OK;
         if (node->instance->ops->read_execution==KERNEL_VFS_EXECUTION_CPU0 && remote_cache_client())
             submitted=run_request(cache,commit_read_batch,&request,0,NULL);
@@ -2356,7 +2380,7 @@ struct cache_read_batch_request {
     uint64_t first;
     struct kernel_page_cache_read_page *pages;
     size_t count;
-    int no_reuse;
+    int no_reuse,read_window;
 };
 
 static int read_cached_batch(struct cache_read_batch_request *request)
@@ -2424,15 +2448,43 @@ static void __attribute__((noinline)) prepare_read_batch(void *argument)
     struct cache_read_batch_request *request = argument;
     struct kernel_page_cache *cache = request->cache;
     struct kernel_vfs_node *node=request->node;
-    union foreground_workspace *lease=request->count>1?foreground_workspace_take(cache):NULL;
+    struct kernel_page_cache_read_page *demand=request->pages;
+    size_t demand_count=request->count;
+    size_t window=1;
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+    if (request->read_window && !request->no_reuse && demand_count==1) {
+        CACHE_SCOPE(check,cache);
+        uint64_t size=kernel_vfs_node_size(node);
+        uint64_t offset=request->first<<BOAROS_PAGE_SHIFT;
+        if (!cache->record->stopping && read_cache_open(node) && offset<size &&
+            !index_find(node,request->first) &&
+            physical_page_available(cache->allocator)>cache->record->high+
+                BOAROS_PAGE_CACHE_READAHEAD_PAGES+2U) {
+            uint64_t remaining=((size-1)>>BOAROS_PAGE_SHIFT)+1-request->first;
+            window=remaining<BOAROS_PAGE_CACHE_READAHEAD_PAGES?
+                (size_t)remaining:BOAROS_PAGE_CACHE_READAHEAD_PAGES;
+        }
+    }
+#endif
+    union foreground_workspace *lease=(demand_count>1 || window>1)?foreground_workspace_take(cache):NULL;
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+    if (window>1 && lease) {
+        request->pages=lease->read.fault_pages;
+        request->count=window;
+        memset(request->pages,0,window*sizeof(*request->pages));
+        request->pages[0]=*demand;
+        for (size_t i=1;i<window;i++) request->pages[i].status=KERNEL_PAGE_CACHE_STATUS_NOT_FOUND;
+    } else window=1;
+#endif
     if (request->count>1 && !lease) {
         for (size_t i=0;i<request->count;i++)
             if (request->pages[i].status==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND)
                 request->pages[i].status=KERNEL_PAGE_CACHE_STATUS_NO_MEMORY;
         return;
     }
-    /* 单页fault只保留一个entry；多页的借用表和装入器共用已有工作区。
-     * 热命中在调用本函数前返回，不为慢路数组预留栈空间。 */
+scalar:
+    /* The lease lives only in the existing prepared-read callback. A cold
+     * fault may borrow a bounded result table here; callers still own one page. */
     struct kernel_page_cache_entry *single_entry;
     struct kernel_page_cache_entry **entries=lease?lease->read.entries:&single_entry;
     int pending=0;
@@ -2455,6 +2507,10 @@ static void __attribute__((noinline)) prepare_read_batch(void *argument)
             }
             struct kernel_page_cache_entry *entry=index_find(node,request->first+i);
             if (entry) {
+                if (window>1 && i) {
+                    page->status=KERNEL_PAGE_CACHE_STATUS_BUSY;
+                    continue;
+                }
                 if (read_entry_ready(entry)) {
                     size_t valid = size - offset < BOAROS_PAGE_SIZE ? size - offset : BOAROS_PAGE_SIZE;
                     take_read_page_borrow(cache, entry, &page->physical_address, &page->valid_bytes, &page->entry, valid,request->no_reuse);
@@ -2468,13 +2524,25 @@ static void __attribute__((noinline)) prepare_read_batch(void *argument)
         break;
     }
     if (pending) read_batch_local(cache,request->file,request->first,request->pages,request->count,entries,
-        lease?&lease->read:NULL,request->no_reuse);
+        lease?&lease->read:NULL,request->no_reuse,window>1);
+    if (window>1) {
+        *demand=request->pages[0];
+        kernel_page_cache_put_batch(cache,request->pages+1,window-1);
+        request->pages=demand;request->count=demand_count;
+        if (demand->status==KERNEL_PAGE_CACHE_STATUS_NO_MEMORY) {
+            /* Optional descriptors/pages must not turn a scalar demand into
+             * ENOMEM. Drain first, release the lease, then try scalar once. */
+            kernel_heap_release(cache->heap,lease);lease=NULL;
+            window=1;*demand=(struct kernel_page_cache_read_page){.status=KERNEL_PAGE_CACHE_STATUS_NOT_FOUND};
+            goto scalar;
+        }
+    }
     if (lease) foreground_workspace_put(cache,lease);
 }
 
-enum kernel_page_cache_status kernel_page_cache_get_batch(
+static enum kernel_page_cache_status get_batch(
     struct kernel_page_cache *cache, const struct kernel_vfs_file *file, uint64_t first,
-    struct kernel_page_cache_read_page *pages, size_t count, int no_reuse)
+    struct kernel_page_cache_read_page *pages, size_t count, int no_reuse,int read_window)
 {
     struct kernel_vfs_node *node=kernel_vfs_file_node(file);
     if (!cache_live(cache) || !node || count > KERNEL_PAGE_CACHE_READ_BATCH_MAX ||
@@ -2488,7 +2556,7 @@ enum kernel_page_cache_status kernel_page_cache_get_batch(
 #endif
     }
     if (!count) return KERNEL_PAGE_CACHE_STATUS_OK;
-    struct cache_read_batch_request request = {cache, file, node, first, pages, count,no_reuse};
+    struct cache_read_batch_request request = {cache,file,node,first,pages,count,no_reuse,read_window};
     /* local首个缺页后交给inode资格下的重查，不重复预扫整批。remote须先
      * 取出全部热页：尚未执行的CPU0请求被取消时，后部成功项也继续有效。 */
     if (read_cached_batch(&request)) {
@@ -2503,6 +2571,11 @@ enum kernel_page_cache_status kernel_page_cache_get_batch(
     }
     return result;
 }
+
+enum kernel_page_cache_status kernel_page_cache_get_batch(
+    struct kernel_page_cache *cache,const struct kernel_vfs_file *file,uint64_t first,
+    struct kernel_page_cache_read_page *pages,size_t count,int no_reuse)
+{ return get_batch(cache,file,first,pages,count,no_reuse,0); }
 
 static void resize_apply(struct kernel_page_cache_resize *,uint64_t);
 static int write_admission(struct kernel_page_cache *cache,struct kernel_vfs_node *node);

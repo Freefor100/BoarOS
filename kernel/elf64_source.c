@@ -788,7 +788,7 @@ enum kernel_elf64_source_status kernel_elf64_source_page(
     struct physical_page_allocator *allocator,
     uint64_t virtual_offset,
     uint64_t *physical_address,
-    int *shared)
+    int *shared,int read_window)
 {
     const struct kernel_elf64_source_run *run;
     uint64_t address;
@@ -807,6 +807,7 @@ enum kernel_elf64_source_status kernel_elf64_source_page(
     if (run->kind == KERNEL_ELF64_SOURCE_RUN_FILE && source->file) {
         uint64_t file_offset;
         size_t valid_bytes;
+        int created;
         enum kernel_page_cache_status cache_status;
 
         if (run->file_offset > UINT64_MAX - (virtual_offset - run->start) ||
@@ -815,11 +816,11 @@ enum kernel_elf64_source_status kernel_elf64_source_page(
             return KERNEL_ELF64_SOURCE_STATUS_MALFORMED;
         }
         file_offset = run->file_offset + (virtual_offset - run->start);
-        cache_status = kernel_open_file_get_page(
+        cache_status = kernel_open_file_get_page_for_fault(
             source->file,
             file_offset >> BOAROS_PAGE_SHIFT,
             physical_address,
-            &valid_bytes);
+            &valid_bytes,&created,read_window);
         if (cache_status != KERNEL_PAGE_CACHE_STATUS_OK) {
             return cache_status == KERNEL_PAGE_CACHE_STATUS_NO_MEMORY
                        ? KERNEL_ELF64_SOURCE_STATUS_NO_MEMORY

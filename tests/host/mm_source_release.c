@@ -40,23 +40,23 @@ static _Thread_local unsigned forbid_backing_scans;
 static void outside_gate(void);
 static void publish(unsigned *flag) { __atomic_store_n(flag,1,__ATOMIC_RELEASE); }
 static void await(unsigned *flag) { while (!__atomic_load_n(flag,__ATOMIC_ACQUIRE)) sched_yield(); }
-int __real_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *,uint64_t,
+int __real_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *,uint64_t,int,
     struct kernel_open_file_page_preparation *);
-int __wrap_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *file,uint64_t index,
+int __wrap_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *file,uint64_t index,int read_window,
     struct kernel_open_file_page_preparation *prepared)
 {
-    int result=__real_kernel_open_file_prepare_mapping_page(file,index,prepared);
+    int result=__real_kernel_open_file_prepare_mapping_page(file,index,read_window,prepared);
     if (!result && __atomic_exchange_n(&self_pin_prepare,0,__ATOMIC_ACQ_REL)) {
         outside_gate(); publish(&self_pin_prepared); await(&self_pin_writer_held);
     }
     return result;
 }
 enum kernel_elf64_source_status __real_kernel_elf64_source_page(struct kernel_elf64_source *,
-    struct physical_page_allocator *,uint64_t,uint64_t *,int *);
+    struct physical_page_allocator *,uint64_t,uint64_t *,int *,int);
 enum kernel_elf64_source_status __wrap_kernel_elf64_source_page(struct kernel_elf64_source *source,
-    struct physical_page_allocator *allocator,uint64_t offset,uint64_t *address,int *shared)
+    struct physical_page_allocator *allocator,uint64_t offset,uint64_t *address,int *shared,int read_window)
 {
-    enum kernel_elf64_source_status result=__real_kernel_elf64_source_page(source,allocator,offset,address,shared);
+    enum kernel_elf64_source_status result=__real_kernel_elf64_source_page(source,allocator,offset,address,shared,read_window);
     if (!result && __atomic_exchange_n(&elf_pin_prepare,0,__ATOMIC_ACQ_REL)) {
         outside_gate(); publish(&self_pin_prepared); await(&self_pin_writer_held);
     }

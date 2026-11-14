@@ -540,12 +540,12 @@ void __wrap_riscv_smp_sync_user(uint32_t targets,uint64_t address,uint64_t size,
     }
     __real_riscv_smp_sync_user(targets,address,size,instructions);
 }
-int __real_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *,uint64_t,
+int __real_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *,uint64_t,int,
     struct kernel_open_file_page_preparation *);
-int __wrap_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *file,uint64_t index,
+int __wrap_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *file,uint64_t index,int read_window,
     struct kernel_open_file_page_preparation *prepared)
 {
-    int status=__real_kernel_open_file_prepare_mapping_page(file,index,prepared);
+    int status=__real_kernel_open_file_prepare_mapping_page(file,index,read_window,prepared);
     kernel_pid_t tid=0;
     if (!status && index==0 &&
         __atomic_load_n(&fault_race_armed,__ATOMIC_ACQUIRE) && fault_race_file &&
