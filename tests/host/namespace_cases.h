@@ -682,9 +682,11 @@ static void *namespace_create_competing(void *argument)
     struct kernel_vfs_open_request request={.flags=KERNEL_VFS_OPEN_FOLLOW |
         KERNEL_VFS_OPEN_CREATE | (creator->exclusive?KERNEL_VFS_OPEN_EXCLUSIVE:0),.mode=0600};
     struct kernel_vfs_file file={0};
+    struct kernel_vfs_open_result opened={0};
     pthread_barrier_wait(creator->gate);
     creator->error=kernel_vfs_open_at(creator->root,creator->root,creator->name,
-                                     &request,&file,&creator->created);
+                                     &request,&file,&opened);
+    creator->created=opened.created;
     if (!creator->error) {
         creator->inode=kernel_vfs_file_inode(&file);
         assert(!kernel_vfs_close(&file));
@@ -723,31 +725,31 @@ static void namespace_open_request_case(struct kernel_heap *heap,
                                         struct kernel_vfs_mount *mount)
 {
     struct kernel_vfs_path *root=NULL;
-    struct kernel_vfs_file file={0};int created=-1;
+    struct kernel_vfs_file file={0};struct kernel_vfs_open_result opened={0};
     struct kernel_vfs_open_request request={.flags=KERNEL_VFS_OPEN_FOLLOW |
         KERNEL_VFS_OPEN_CREATE,.mode=0640};
     assert(!kernel_vfs_path_root(mount,heap,&root));
-    assert(!kernel_vfs_open_at(root,root,"/namespace-open",&request,&file,&created) && created==1);
+    assert(!kernel_vfs_open_at(root,root,"/namespace-open",&request,&file,&opened) && opened.created==1);
     uint64_t inode=kernel_vfs_file_inode(&file);
     assert(!kernel_vfs_close(&file));
-    assert(!kernel_vfs_open_at(root,root,"/namespace-open",&request,&file,&created) && !created);
+    assert(!kernel_vfs_open_at(root,root,"/namespace-open",&request,&file,&opened) && !opened.created);
     assert(kernel_vfs_file_inode(&file)==inode && !kernel_vfs_close(&file));
     request.flags|=KERNEL_VFS_OPEN_EXCLUSIVE;
     request.flags&=~KERNEL_VFS_OPEN_FOLLOW;
-    assert(kernel_vfs_open_at(root,root,"/namespace-open",&request,&file,&created)==-KERNEL_EEXIST && !created);
+    assert(kernel_vfs_open_at(root,root,"/namespace-open",&request,&file,&opened)==-KERNEL_EEXIST && !opened.created);
     assert(!kernel_vfs_symlink_at(root,root,"namespace-open-target","/namespace-open-link"));
-    assert(kernel_vfs_open_at(root,root,"/namespace-open-link",&request,&file,&created)==-KERNEL_EEXIST);
+    assert(kernel_vfs_open_at(root,root,"/namespace-open-link",&request,&file,&opened)==-KERNEL_EEXIST);
     request.flags=KERNEL_VFS_OPEN_CREATE;
-    assert(kernel_vfs_open_at(root,root,"/namespace-open-link",&request,&file,&created)==-KERNEL_ELOOP);
+    assert(kernel_vfs_open_at(root,root,"/namespace-open-link",&request,&file,&opened)==-KERNEL_ELOOP);
     request.flags|=KERNEL_VFS_OPEN_FOLLOW;
-    assert(!kernel_vfs_open_at(root,root,"/namespace-open-link",&request,&file,&created) && created);
+    assert(!kernel_vfs_open_at(root,root,"/namespace-open-link",&request,&file,&opened) && opened.created);
     assert(!kernel_vfs_close(&file));
     struct kernel_vfs_instance *instance=mount->private_data;
     unsigned read_only=instance->read_only;instance->read_only=1;
     request.flags|=KERNEL_VFS_OPEN_EXCLUSIVE;
     request.flags&=~KERNEL_VFS_OPEN_FOLLOW;
-    assert(kernel_vfs_open_at(root,root,"/namespace-open",&request,&file,&created)==-KERNEL_EEXIST);
-    assert(kernel_vfs_open_at(root,root,"/namespace-open-missing",&request,&file,&created)==-KERNEL_EROFS);
+    assert(kernel_vfs_open_at(root,root,"/namespace-open",&request,&file,&opened)==-KERNEL_EEXIST);
+    assert(kernel_vfs_open_at(root,root,"/namespace-open-missing",&request,&file,&opened)==-KERNEL_EROFS);
     instance->read_only=read_only;
     assert(!kernel_vfs_unlink_at(root,root,"/namespace-open-link",0));
     assert(!kernel_vfs_unlink_at(root,root,"/namespace-open-target",0));

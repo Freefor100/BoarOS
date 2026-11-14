@@ -74,11 +74,13 @@ enum kernel_open_file_kind {
 /* VFS errors are returned through linux_result when status is OK. */
 struct kernel_vfs_path;
 struct kernel_vfs_open_request;
+struct kernel_vfs_open_result;
 enum kernel_open_file_status kernel_open_file_create_at(
     struct kernel_heap *heap, struct kernel_vfs_path *start,
     struct kernel_vfs_path *root, const char *path,
     const struct kernel_vfs_open_request *request,
-    struct kernel_open_file_description **owner, int *created, int *linux_result);
+    struct kernel_open_file_description **owner, struct kernel_vfs_open_result *result,
+    int *linux_result);
 
 /* Exact path owner; detached cleanup is consumed by this OFD, not each dup. */
 int kernel_open_file_create_path(struct kernel_heap *,struct kernel_vfs_path *,

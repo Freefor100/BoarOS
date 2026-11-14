@@ -376,12 +376,13 @@ enum kernel_open_file_status kernel_open_file_create_at(
     struct kernel_heap *heap, struct kernel_vfs_path *start,
     struct kernel_vfs_path *root, const char *path,
     const struct kernel_vfs_open_request *request,
-    struct kernel_open_file_description **owner, int *created, int *linux_result)
+    struct kernel_open_file_description **owner, struct kernel_vfs_open_result *opened,
+    int *linux_result)
 {
     struct kernel_open_file_description *file;
     if (!heap || !start || !root || !path || !request || !owner || *owner || !linux_result)
         return KERNEL_OPEN_FILE_STATUS_INVALID_ARGUMENT;
-    if (created) *created=0;
+    if (opened) *opened=(struct kernel_vfs_open_result){0};
     enum kernel_heap_status allocation = kernel_heap_allocate_zeroed(heap,
                                          1U, sizeof(*file), (void **)&file);
     if (allocation != KERNEL_HEAP_STATUS_OK) {
@@ -389,7 +390,7 @@ enum kernel_open_file_status kernel_open_file_create_at(
         *linux_result = -KERNEL_ENOMEM;
         return KERNEL_OPEN_FILE_STATUS_OK;
     }
-    int result=kernel_vfs_open_at(start,root,path,request,&file->file,created);
+    int result=kernel_vfs_open_at(start,root,path,request,&file->file,opened);
     if (!result && (request->flags & KERNEL_VFS_OPEN_PATH_ONLY))
         file->kind=KERNEL_OPEN_FILE_KIND_PATH;
     if (result) {

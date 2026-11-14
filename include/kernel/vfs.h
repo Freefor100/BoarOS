@@ -228,6 +228,9 @@ enum kernel_vfs_resolve_flags {
 };
 #define KERNEL_VFS_RESOLVE_SCOPED (KERNEL_VFS_RESOLVE_BENEATH | KERNEL_VFS_RESOLVE_IN_ROOT)
 struct kernel_vfs_open_request { unsigned flags; uint32_t mode, umask; unsigned access, resolve; };
+/* A failed final magic-link follow can return its owned link identity for
+ * an OFD-level reopen. The caller releases pathless_link even on failure. */
+struct kernel_vfs_open_result { int created; struct kernel_vfs_path *pathless_link; };
 #define KERNEL_VFS_MAY_EXEC 1U
 enum { KERNEL_VFS_CONTROL_READ=1, KERNEL_VFS_CONTROL_WRITE=2 };
 enum {
@@ -254,14 +257,13 @@ int kernel_vfs_exec_metadata(struct kernel_vfs_file *file,
     struct kernel_vfs_exec_metadata *metadata, int read_filecap);
 /* One lookup yields an existing identity or its held parent and missing name.
  * FOLLOW is explicit: syscall O_EXCL omits it; strict VFS create may follow.
- * created reports an actual filesystem creation, independently of OFD setup. */
+ * result reports creation and may own a pathless final link on failure. */
 int kernel_vfs_open_at(struct kernel_vfs_path *start,
                        struct kernel_vfs_path *root, const char *path,
                        const struct kernel_vfs_open_request *request,
-                       struct kernel_vfs_file *file, int *created);
-/* Only special final links handle this; ENOTSUP means ordinary resolution. */
-int kernel_vfs_reopen_link_at(struct kernel_vfs_path *start,
-    struct kernel_vfs_path *root, const char *path, struct kernel_heap *heap,
+                       struct kernel_vfs_file *file, struct kernel_vfs_open_result *result);
+/* Borrows the actual final link retained by this same lookup. */
+int kernel_vfs_reopen_link(struct kernel_vfs_path *link, struct kernel_heap *heap,
     uint32_t flags, struct kernel_open_file_description **owner);
 int kernel_vfs_create_at(struct kernel_vfs_path *start,
                          struct kernel_vfs_path *root, const char *path,
