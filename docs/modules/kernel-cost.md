@@ -18,6 +18,14 @@ RV 默认观测内核位于 `build/cost/kernel-rv`；USER_SMP 观测版本使用
 
 ## 快照与归因
 
+缺页观察使用 `mm_fault_ticks` 记录共同解析器，包含后备页准备、等待与提交；
+`mm_cow_copy_ticks` 只记录实际私有页复制，`mm_page_alloc_ticks` 只覆盖分配器调用。
+`mm_sync_ticks` 覆盖显式提交及预装尾部同步，不含激活 MM 或 spurious fault 的直接本地刷新。
+`file_query_ticks` 覆盖 stat/statx 的路径导入、查询及结果输出；`path_fallback_ticks`
+记录需要从魔术链接实际对象取得属性或重新打开的额外处理；`rfence_calls` 为真实 SBI
+RFENCE 调用数。这些阶段存在嵌套，累计经过时间含等待，不能直接相加为墙钟或纯 CPU。
+诊断静态聚合区上限为100KiB，实际占用仍由快照报告，默认构建不包含这些存储与采样。
+
 指标及单位以 `include/kernel/cost.def` 为准，`tests/cost/cost_report.py` 按当前 schema 严格解析。完整字段集、唯一性、单位、直方图与状态不匹配时直接报错；旧实验格式通过对应 Git 版本读取，不在当前解析器中保留历史适配分支。
 
 | 内容 | 含义与使用限制 |

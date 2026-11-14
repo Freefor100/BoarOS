@@ -38,7 +38,7 @@ def parse(text, epoch):
     if fields['version'] != 1 or fields['epoch'] != epoch or epoch < 1: raise ValueError('version/epoch')
     if fields['state'] != 'complete' or fields['mode'] not in ('user','fixture'): raise ValueError('incomplete snapshot')
     if fields['overflow'] or fields['inflight']: raise ValueError('overflow/inflight')
-    if not 0 < fields['task_bytes'] <= 160 or not 0 < fields['storage_bytes'] <= 96*1024: raise ValueError('storage budget')
+    if not 0 < fields['task_bytes'] <= 160 or not 0 < fields['storage_bytes'] <= 100*1024: raise ValueError('storage budget')
     if not fields['owner'] or not fields['timebase_hz'] or fields['end_ticks'] < fields['start_ticks']: raise ValueError('invalid timing/owner')
     if fields['resolution_ns_numerator'] != 1000000000 or fields['resolution_ns_denominator'] != fields['timebase_hz']: raise ValueError('clock resolution')
     for lane in LANES:
