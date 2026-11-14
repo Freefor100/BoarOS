@@ -4090,13 +4090,13 @@ static enum kernel_mm_status protect_vma_range(struct kernel_mm_record *record,
     while ((backend_status = arch_mmu_user_next_owned(&record->space, &cursor,
                    end, &leaf)) == ARCH_MMU_STATUS_OK) {
         uint32_t leaf_permissions = normalized;
+        KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
         struct mm_file_resident *resident = find_file_resident(record, leaf);
         if (resident) {
             COST_ADD(MPROTECT_RESIDENT_VISITS, 1);
             if (kernel_page_cache_alias_active(&resident->alias))
                 leaf_permissions &= ~KERNEL_MM_WRITE;
         }
-        KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
         if (arch_mmu_user_protect_owned_page(&record->space, leaf,
                 backend_permissions_from_mm(leaf_permissions))) __builtin_trap();
     }
@@ -5421,16 +5421,15 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
     uint64_t limit = (address | UINT64_C(65535)) + 1;
     if (limit > vma->end) limit = vma->end;
     unsigned slots = KERNEL_PAGE_CACHE_READY_WINDOW;
-    if (record->resident_capacity - record->resident_count < slots)
-        slots = record->resident_capacity - record->resident_count;
-    if (first >= limit || !slots) return end;
-
     unsigned wanted = 0;
-    for (uint64_t next = first; next < limit; next += BOAROS_PAGE_SIZE) {
-        /* Every owned file leaf, including PROT_NONE and private copies,
-         * stays in this index until it is removed under the MM writer. */
-        if (!find_file_resident(record, next))
-            wanted |= 1U << ((next - first) >> BOAROS_PAGE_SHIFT);
+    {
+        KERNEL_RAW_READ_SCOPE(raw, &record->metadata);
+        if (record->resident_capacity - record->resident_count < slots)
+            slots = record->resident_capacity - record->resident_count;
+        if (first >= limit || !slots) return end;
+        for (uint64_t next = first; next < limit; next += BOAROS_PAGE_SIZE)
+            if (!find_file_resident(record, next))
+                wanted |= 1U << ((next - first) >> BOAROS_PAGE_SHIFT);
     }
     uint64_t refs[KERNEL_PAGE_CACHE_READY_WINDOW];
     uint64_t offset = vma->backing_offset + first - vma->start;
@@ -5454,6 +5453,15 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
         {
             struct kernel_mm_leaf_preparation tables = KERNEL_MM_LEAF_PREPARATION_INIT;
             KERNEL_RAW_WRITE_SCOPE(raw, &record->metadata);
+            /* Another reader can have installed this neighbour while the
+             * cache loan and metadata were prepared outside MM protection. */
+            if (find_file_resident(record, next) ||
+                record->resident_count == record->resident_capacity) {
+                kernel_raw_lock_release(&raw);
+                physical_page_release(record->space.allocator, page->physical_address);
+                kernel_heap_release(record->vma_heap, page);
+                continue;
+            }
             if (arch_mmu_user_map_prepared_page(&record->space, page->address, page->physical_address,
                     backend_permissions_from_mm(vma->permissions & ~KERNEL_MM_WRITE), &tables) ||
                 arch_mmu_user_mark_cow_page(&record->space, page->address)) __builtin_trap();
@@ -5589,21 +5597,40 @@ prepare_file_tables:
         status = allocate_private_page(allocator,&prepared.tables[i],&table);
         if (status == KERNEL_MM_STATUS_OK) { clear_page(table); MM_DIAGNOSTIC(count++); }
     }
-    operation->shared = 0; /* Publication owns the resident index and shared aliases. */
+    /* Private first faults publish only their PTE and resident under metadata.
+     * Shared aliases and COW replacement retain the exclusive operation. */
+    operation->shared = !shared && !cookie;
+
     enum kernel_mm_status gate_status = mm_operation_lock(operation);
     if (gate_status != KERNEL_MM_STATUS_OK) status = gate_status;
+    if (!gate_status && operation->shared) {
+        int full;
+        { KERNEL_RAW_READ_SCOPE(raw, &record->metadata);
+          full = record->resident_count == record->resident_capacity; }
+        if (full) {
+            mm_operation_release(operation);
+            operation->shared = 0;
+            gate_status = mm_operation_lock(operation);
+            if (gate_status) status = gate_status;
+        }
+    }
 #if BOAROS_COST_DIAGNOSTICS
     { KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata); record->prepared_pages += count; count=0; }
 #endif
     if (status == KERNEL_MM_STATUS_OK) {
         if (!fault_inode_lock(operation, node, &inode)) status = KERNEL_MM_STATUS_CONFLICT;
-        uint64_t latest;
-        if (!status && (generation != kernel_vma_set_generation(record->vmas) ||
+        uint64_t latest, latest_generation;
+        {
+            KERNEL_LOCK_SCOPE(vma_guard);
+            if (operation->shared) kernel_rwlock_read(&record->vma_lock, &vma_guard);
+            latest_generation = kernel_vma_set_generation(record->vmas);
+        }
+        if (!status && (generation != latest_generation ||
             kernel_file_mapping_epoch(node,&latest) || latest != epoch ||
             (source.pending && source.epoch != epoch) || offset >= kernel_open_file_size(file)))
             status = KERNEL_MM_STATUS_CONFLICT;
     }
-    if (status == KERNEL_MM_STATUS_OK && !cookie)
+    if (status == KERNEL_MM_STATUS_OK && !cookie && !operation->shared)
         status = reserve_file_residents(record,record->resident_count + 1);
     if (status == KERNEL_MM_STATUS_OK && !cookie) {
         int refill = 0;
@@ -5628,7 +5655,9 @@ prepare_file_tables:
     if (status == KERNEL_MM_STATUS_OK) {
         KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
         enum arch_mmu_status backend;
-        if (cookie) backend = arch_mmu_user_cow_commit(&record->space,address,cookie,replacement,
+        if (!cookie && record->resident_count == record->resident_capacity)
+            backend = ARCH_MMU_STATUS_CONFLICT;
+        else if (cookie) backend = arch_mmu_user_cow_commit(&record->space,address,cookie,replacement,
             backend_permissions_from_mm(vma->permissions),&batch);
         else {
             backend = arch_mmu_user_map_prepared_page(&record->space,address,replacement,
