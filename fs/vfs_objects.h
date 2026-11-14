@@ -151,6 +151,10 @@ struct kernel_vfs_backend {
     int (*root)(struct kernel_vfs_instance *instance, uint64_t *inode, uint32_t *mode);
     int (*lookup)(struct kernel_vfs_instance *instance, uint64_t parent,
         const char *name, size_t length, uint64_t *inode, uint32_t *mode);
+    /* Final attributes can be returned by the lookup that already reads them.
+     * The caller holds the parent qualification and has checked search access. */
+    int (*stat_child)(const struct kernel_vfs_file *parent,const char *name,
+        size_t length,struct kernel_vfs_stat *stat);
     /* A backend with one directory entry per inode can expose several lookup
      * spellings (VFAT long/short names). They share one canonical path owner. */
     int (*entry_name)(struct kernel_vfs_instance *, uint64_t inode, char *, size_t);

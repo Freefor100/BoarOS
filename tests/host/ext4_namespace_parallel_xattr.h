@@ -48,7 +48,6 @@ static void *namespace_ea_chown(void *argument)
 struct namespace_ea_seed {
     struct lwext4_mount_adapter *adapter;
     struct kernel_vfs_file *files;
-    const char *path;
     uint64_t shared;
 };
 static int namespace_ea_seed_apply(void *argument)
@@ -56,8 +55,8 @@ static int namespace_ea_seed_apply(void *argument)
     struct namespace_ea_seed *seed=argument;
     struct ext4_fs *fs=seed->adapter->device.fs;
     uint32_t capability[5]={0x02000000,1,0,0,0};unsigned char padding[48]={1};
-    int result=ext4_setxattr(seed->path,"user.padding",12,padding,sizeof(padding));
-    if(!result)result=ext4_setxattr(seed->path,"security.capability",19,capability,sizeof(capability));
+    int result=ext4_file_setxattr(lwext4_node_file(seed->files[0].private_data),"user.padding",12,padding,sizeof(padding),0);
+    if(!result)result=ext4_file_setxattr(lwext4_node_file(seed->files[0].private_data),"security.capability",19,capability,sizeof(capability),0);
     if(result)return result;
     struct ext4_inode first;
     result=ext4_fraw_inode_fill(lwext4_node_file(seed->files[0].private_data),&first);
@@ -102,9 +101,7 @@ static void namespace_parallel_xattr_case(struct lwext4_mount_adapter *adapter,s
             assert(!kernel_vfs_file_acquire_write(&files[1]) &&
                    !kernel_vfs_pwrite(&files[1],0,payload,sizeof(payload),&written) && written==sizeof(payload));
         }
-        char paths[2][96];
-        for(unsigned i=0;i<2;i++)snprintf(paths[i],sizeof(paths[i]),"%sea-parallel-%c",adapter->mount_point,'a'+i);
-        struct namespace_ea_seed seed={adapter,files,paths[0],0};
+        struct namespace_ea_seed seed={adapter,files,0};
         assert(!ext4_metadata_execute(adapter->mount_point,namespace_ea_seed_apply,&seed));
         assert(!ext4_journal_group_drain(adapter->mount_point));
         if(removing)assert(!kernel_vfs_close(&files[1]));
@@ -154,9 +151,14 @@ static void namespace_parallel_xattr_case(struct lwext4_mount_adapter *adapter,s
         }
         uint32_t value[5],capability[5]={0x02000000,1,0,0,0};size_t length;
         for(unsigned i=0;i<2;i++) {
-            int result=ext4_getxattr(paths[i],"security.capability",19,value,sizeof(value),&length);
-            if(i && removing)assert(result==ENOENT);
-            else if(!i && abort)assert(!result && length==sizeof(capability) && !memcmp(value,capability,sizeof(value)));
+            if(i && removing) {
+                struct kernel_vfs_path *absent=NULL;
+                assert(kernel_vfs_path_lookup(root,"ea-parallel-b",13,&absent)==-KERNEL_ENOENT && !absent);
+                continue;
+            }
+            int result=ext4_file_getxattr(lwext4_node_file(files[i].private_data),
+                "security.capability",19,value,sizeof(value),&length);
+            if(!i && abort)assert(!result && length==sizeof(capability) && !memcmp(value,capability,sizeof(value)));
             else assert(result==ENODATA);
             if(!i || !removing)assert(!kernel_vfs_close(&files[i]));
         }

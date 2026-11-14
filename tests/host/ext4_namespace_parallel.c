@@ -8,6 +8,63 @@
 #include <kernel/time.h>
 #include <stdlib.h>
 
+static unsigned stat_lookup_watch,stat_lookup_reads,stat_lookup_opens;
+int __real_ext4_fs_get_inode_ref_read(struct ext4_fs *,uint32_t,struct ext4_inode_ref *);
+int __wrap_ext4_fs_get_inode_ref_read(struct ext4_fs *fs,uint32_t inode,struct ext4_inode_ref *ref)
+{
+    if (stat_lookup_watch) stat_lookup_reads++;
+    return __real_ext4_fs_get_inode_ref_read(fs,inode,ref);
+}
+int __real_ext4_fopen_inode(ext4_file *,const char *,uint32_t,struct ext4_inode *);
+int __wrap_ext4_fopen_inode(ext4_file *file,const char *mount,uint32_t inode,struct ext4_inode *initial)
+{
+    if (stat_lookup_watch) stat_lookup_opens++;
+    return __real_ext4_fopen_inode(file,mount,inode,initial);
+}
+static void lookup_attributes_case(struct kernel_vfs_path *root)
+{
+    struct kernel_vfs_file file={0};
+    struct kernel_vfs_stat stat,live;
+    assert(!kernel_vfs_create_at(root,root,"stat-only",0640,&file,0));
+    uint64_t inode=kernel_vfs_file_inode(&file);
+    assert(!kernel_vfs_close(&file));
+    stat_lookup_watch=1;stat_lookup_reads=stat_lookup_opens=0;
+    assert(!kernel_vfs_stat_at(root,root,"stat-only",1,&stat));
+    stat_lookup_watch=0;
+    assert(stat.ino==inode && (stat.mode&0777)==0640 && !stat.size);
+    assert(stat_lookup_reads==2 && !stat_lookup_opens);
+    assert(kernel_vfs_stat_at(root,root,"stat-only/",1,&stat)==-KERNEL_ENOTDIR);
+    assert(!kernel_vfs_symlink_at(root,root,"stat-only","stat-link"));
+    assert(!kernel_vfs_stat_at(root,root,"stat-link",0,&stat) && (stat.mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFLNK);
+    assert(!kernel_vfs_stat_at(root,root,"stat-link",1,&stat) && stat.ino==inode);
+    assert(kernel_vfs_stat_at(root,root,"stat-link/",0,&stat)==-KERNEL_ENOTDIR);
+    assert(kernel_vfs_stat_at(root,root,"stat-absent",1,&stat)==-KERNEL_ENOENT);
+    assert(!kernel_vfs_create_at(root,root,"stat-live",0600,&file,0));
+    struct kernel_vfs_path *source=NULL;
+    assert(!kernel_vfs_path_lookup(root,"stat-live",9,&source));
+    assert(!kernel_vfs_link_at(source,root,root,"stat-hard"));
+    size_t written;
+    assert(!kernel_vfs_pwrite(&file,0,"live EOF",8,&written) && written==8);
+    assert(!kernel_vfs_fstat(&file,&live));
+    assert(!kernel_vfs_stat_at(root,root,"stat-hard",1,&stat));
+    assert(stat.ino==live.ino && stat.size==8 && stat.blocks==live.blocks &&
+        stat.mtime.seconds==live.mtime.seconds && stat.mtime.nanoseconds==live.mtime.nanoseconds);
+    assert(!kernel_vfs_path_release(&source) && !kernel_vfs_close(&file));
+    struct kernel_vfs_instance *instance=root->file.mount->private_data;
+    struct kernel_vfs_mount *mounted=NULL;
+    struct kernel_vfs_path *covered=NULL,*visible=NULL;
+    assert(!kernel_vfs_mkdir_at(root,root,"stat-covered",0700,0));
+    assert(!kernel_vfs_path_lookup(root,"stat-covered",12,&covered));
+    assert(!kernel_tmpfs_create(instance->heap,0,"",&mounted) && !kernel_vfs_mount_attach(mounted,covered));
+    assert(!kernel_vfs_path_resolve(root,root,"stat-covered",1,&visible) && !kernel_vfs_path_stat(visible,&live));
+    assert(!kernel_vfs_stat_at(root,root,"stat-covered",1,&stat) && stat.dev==live.dev && stat.ino==live.ino);
+    assert(!kernel_vfs_path_release(&visible) && !kernel_vfs_mount_prepare_detach(mounted,NULL) &&
+        !kernel_vfs_mount_detach(mounted,NULL) && !kernel_vfs_unmount(mounted));
+    assert(!kernel_vfs_path_release(&covered) && !kernel_vfs_unlink_at(root,root,"stat-covered",1));
+    const char *names[]={"stat-only","stat-link","stat-live","stat-hard"};
+    for(unsigned i=0;i<4;i++) assert(!kernel_vfs_unlink_at(root,root,names[i],0));
+    puts("PASS final stat reuses one directory/inode lookup without opening the child; symlink, trailing slash and live hard-link attributes preserved");
+}
 struct parallel_actor {
     struct kernel_vfs_path *parent,*root;
     struct kernel_vfs_file file,*existing;
@@ -305,7 +362,9 @@ static void rename_inode_case(struct lwext4_mount_adapter *adapter,struct kernel
         pthread_t modifying,renaming;
         assert(!pthread_create(&modifying,NULL,parallel_modify,&modifier));wait_entered(&modifier);
         assert(modifier.resource->rank==31 && modifier.resource->key==kernel_vfs_file_inode(&file));
-        struct rename_inode_actor rename={.root=root,.resource=modifier.resource};
+        /* Rename first waits for the source VFS data owner, before its
+         * backend inode qualifier. Observe that actual first wait. */
+        struct rename_inode_actor rename={.root=root,.resource=&((struct kernel_vfs_node *)file.private_data)->io_lock};
         assert(!pthread_create(&renaming,NULL,rename_inode_run,&rename));
         while(!__atomic_load_n(&rename.waiting,__ATOMIC_ACQUIRE)) {
             assert(!__atomic_load_n(&rename.done,__ATOMIC_ACQUIRE));sched_yield();
@@ -404,6 +463,8 @@ int main(int argc,char **argv)
     }
     struct kernel_vfs_path *root=NULL,*directories[65]={0};
     assert(!kernel_vfs_path_root(&mount,&heap,&root));
+    lookup_attributes_case(root);
+    if (getenv("EXT4_NAMESPACE_STAT_ONLY")) goto Finish;
     worker_notification_case(adapter,root);
     rename_order_case(adapter,root);
     rename_order_directory_case(adapter,root);
@@ -462,6 +523,7 @@ int main(int argc,char **argv)
         assert(checkpoint_calls>=3);
         puts("PASS real CPU0 journal/checkpoint workers: CPU1 lookup completes during checkpoint and another private operation");
     }
+Finish:
     assert(!kernel_vfs_path_release(&root) && !kernel_vfs_unmount(&mount) &&
            !kernel_page_cache_destroy(&cache) && !kernel_block_unregister(&disk));
     assert(physical_page_available(&pages)==available && physical_page_available(&backend_pages)==backend_available);

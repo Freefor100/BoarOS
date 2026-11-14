@@ -391,6 +391,8 @@ struct vfs_path_walk {
     struct kernel_vfs_node *directory;
     struct kernel_vfs_path **pathless_link;
     unsigned final_write, resolve;
+    struct kernel_vfs_stat *final_stat;
+    unsigned stat_leaf:1, stat_follow:1, stat_directory:1, stat_complete:1;
     uint64_t topology_generation;
 };
 static void path_walk_release(struct vfs_path_walk *walk)
@@ -2089,7 +2091,7 @@ int kernel_vfs_path_stat(const struct kernel_vfs_path *path,
 
 static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
     const char *name,size_t name_length,struct kernel_vfs_path **owner,int search,
-    const struct vfs_path_walk *walk)
+    struct vfs_path_walk *walk)
 {
     if (!parent || !parent->references || !name || !name_length || !owner || *owner) return -KERNEL_EINVAL;
     if (name_length>255U) return -KERNEL_ENAMETOOLONG;
@@ -2142,8 +2144,23 @@ static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
         }
     }
     uint64_t inode;uint32_t mode;
-    result=instance->ops->lookup(instance,kernel_vfs_path_inode(parent),name,name_length,&inode,&mode);
-    if (result) return result;
+    if (walk && walk->stat_leaf && instance->ops->stat_child) {
+        result=instance->ops->stat_child(&parent->file,name,name_length,walk->final_stat);
+        if (result) return result;
+        unsigned type=walk->final_stat->mode & KERNEL_VFS_S_IFMT;
+        if (type!=KERNEL_VFS_S_IFLNK || !walk->stat_follow) {
+            if (walk->stat_directory && type!=KERNEL_VFS_S_IFDIR) return -KERNEL_ENOTDIR;
+            walk->stat_complete=1;
+            return 0;
+        }
+        /* Following a link needs its path, but not another lookup of the
+         * child whose identity was just obtained under the parent guard. */
+        inode=walk->final_stat->ino;
+        mode=walk->final_stat->mode;
+    } else {
+        result=instance->ops->lookup(instance,kernel_vfs_path_inode(parent),name,name_length,&inode,&mode);
+        if (result) return result;
+    }
     char canonical[256];
     if (instance->ops->entry_name) {
         result=instance->ops->entry_name(instance,inode,canonical,sizeof(canonical));
@@ -2282,6 +2299,9 @@ static int resolve_object(struct kernel_vfs_path *start,
             result = -KERNEL_ENAMETOOLONG;
             goto Finish;
         }
+        walk->stat_leaf=walk->final_stat && trailing_only;
+        walk->stat_follow=follow_final || suffix;
+        walk->stat_directory=suffix;
         if (current == root && component_length == 2U &&
             pending[begin] == '.' && pending[begin + 1U] == '.') {
             result = inode_permission(current->file.private_data, KERNEL_VFS_MAY_EXEC);
@@ -2292,6 +2312,7 @@ static int resolve_object(struct kernel_vfs_path *start,
         } else {
             result = path_lookup_locked_mode(current,pending+begin,component_length,&next,1,walk);
         }
+        if (walk->stat_complete) goto Finish;
         if (result == -KERNEL_ENOENT && allow_missing_final &&
             (!suffix || (allow_missing_trailing && trailing_only)) &&
             missing_name != 0) {
@@ -2444,11 +2465,13 @@ static int path_resolve(struct kernel_vfs_path *start,
                             struct kernel_vfs_path *root,
                             const char *path, int follow_final,
                             struct kernel_vfs_path **owner,
-                            struct kernel_vfs_path **pathless_link)
+                            struct kernel_vfs_path **pathless_link,
+                            struct kernel_vfs_stat *stat)
 {
     if (!path || !start || !start->file.mount || !start->file.mount->private_data) return -KERNEL_EINVAL;
     VFS_PATH_WALK(walk,start,root);
     walk.pathless_link=pathless_link;
+    walk.final_stat=stat;
     return resolve_object(start, root, path, strlen(path), follow_final, 0, 0, VFS_TRAILING_FOLLOW,
                           owner, 0, &walk);
 }
@@ -2457,7 +2480,7 @@ int kernel_vfs_path_resolve(struct kernel_vfs_path *start,
                             struct kernel_vfs_path *root,
                             const char *path, int follow_final,
                             struct kernel_vfs_path **owner)
-{ return path_resolve(start,root,path,follow_final,owner,NULL); }
+{ return path_resolve(start,root,path,follow_final,owner,NULL,NULL); }
 
 static int location_key_compare(const struct kernel_vfs_dentry *entry,const struct kernel_vfs_path *path)
 { return ((uintptr_t)entry>(uintptr_t)path->dentry)-((uintptr_t)entry<(uintptr_t)path->dentry); }
@@ -3825,12 +3848,13 @@ static int stat_at_resolved(struct kernel_vfs_path *start,
                             int follow_final, struct kernel_vfs_stat *stat,
                             struct kernel_vfs_path **target)
 {
-    struct kernel_vfs_path *resolved = 0;
+    struct kernel_vfs_path *resolved __attribute__((cleanup(release_path_pin))) = 0;
     struct kernel_vfs_path *link __attribute__((cleanup(release_path_pin))) = 0;
-    int result = path_resolve(start, root, path, follow_final, &resolved, &link);
-    if (!result) {
+    int result = path_resolve(start, root, path, follow_final, &resolved, &link,
+        target ? NULL : stat);
+    if (!result && resolved) {
         result = kernel_vfs_path_stat(resolved, stat);
-        *target = resolved;
+        if (target) { *target=resolved;resolved=NULL; }
     } else if (link) {
         COST_SCOPE(fallback_cost, PATH_FALLBACK_TICKS);
         int original = result;
@@ -3847,8 +3871,7 @@ int kernel_vfs_stat_at(struct kernel_vfs_path *start,
                        struct kernel_vfs_path *root, const char *path,
                        int follow_final, struct kernel_vfs_stat *stat)
 {
-    struct kernel_vfs_path *target __attribute__((cleanup(release_path_pin))) = 0;
-    return stat_at_resolved(start, root, path, follow_final, stat, &target);
+    return stat_at_resolved(start, root, path, follow_final, stat, NULL);
 }
 
 static int access_check(const struct kernel_vfs_stat *stat,

@@ -6687,9 +6687,9 @@ int ext4_fopen_inode(ext4_file *file, const char *mount_point,
     return result;
 }
 
-int ext4_lookup_child(const char *mount_point, uint32_t parent_inode,
+static int lookup_child(const char *mount_point, uint32_t parent_inode,
                       const char *name, uint32_t name_length,
-                      uint32_t *child_inode, uint32_t *child_mode)
+                      uint32_t *child_inode, uint32_t *child_mode, struct ext4_inode *snapshot)
 {
     struct ext4_mountpoint *mp = ext4_get_mount(mount_point);
     struct ext4_inode_ref parent, child;
@@ -6714,6 +6714,12 @@ int ext4_lookup_child(const char *mount_point, uint32_t parent_inode,
         if (result == EOK) {
             *child_inode = index;
             *child_mode = ext4_inode_get_mode(ext4_fs_super(&mp->fs), child.inode);
+            if (snapshot) {
+                size_t size=ext4_get16(ext4_fs_super(&mp->fs),inode_size);
+                if (size>sizeof(*snapshot)) size=sizeof(*snapshot);
+                memcpy(snapshot,child.inode,size);
+                memset((uint8_t *)snapshot+size,0,sizeof(*snapshot)-size);
+            }
             result = ext4_fs_put_inode_ref(&child);
         }
     }
@@ -6729,6 +6735,18 @@ PutParent:
 Unlock:
     EXT4_MP_UNLOCK(mp);
     return result;
+}
+
+int ext4_lookup_child(const char *mount_point, uint32_t parent_inode,
+    const char *name,uint32_t name_length,uint32_t *child_inode,uint32_t *child_mode)
+{
+    return lookup_child(mount_point,parent_inode,name,name_length,child_inode,child_mode,NULL);
+}
+int ext4_stat_child(const char *mount_point,uint32_t parent_inode,
+    const char *name,uint32_t name_length,uint32_t *child_inode,struct ext4_inode *snapshot)
+{
+    uint32_t mode;
+    return lookup_child(mount_point,parent_inode,name,name_length,child_inode,&mode,snapshot);
 }
 
 int ext4_readlink_inode(const char *mount_point, uint32_t inode_number,

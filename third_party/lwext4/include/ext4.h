@@ -841,6 +841,9 @@ int ext4_unlink_child(const char *mount, uint32_t parent, const char *name,
 int ext4_lookup_child(const char *mount_point, uint32_t parent_inode,
                       const char *name, uint32_t name_length,
                       uint32_t *child_inode, uint32_t *child_mode);
+/* Snapshot the child while its checked directory lookup still holds the inode. */
+int ext4_stat_child(const char *mount,uint32_t parent,const char *name,
+    uint32_t length,uint32_t *inode,struct ext4_inode *snapshot);
 int ext4_readlink_inode(const char *mount_point, uint32_t inode_number,
                         char *buffer, size_t capacity, size_t *bytes_read);
 int ext4_fdir_unlink_dentry(const char *path, uint32_t *out_inode);
