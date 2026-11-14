@@ -14,6 +14,7 @@
 #include <kernel/open_file.h>
 #include <kernel/page.h>
 #include <kernel/task.h>
+#include <kernel/scheduler.h>
 #include <kernel/task_state.h>
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
@@ -157,6 +158,9 @@ static enum kernel_exec_status drain_attached_transaction(
     if (transaction->state == KERNEL_EXEC_TRANSACTION_PREPARED) {
         return KERNEL_EXEC_STATUS_STATE;
     }
+    /* A previous commit may still own a SysV mapping or a descriptor whose
+     * backend cleanup must be retried by the lifecycle executor. */
+    KERNEL_SERVICE_SCOPE(service);
     status = kernel_exec_transaction_cleanup(transaction);
     if (status != KERNEL_EXEC_STATUS_OK) {
         return status;

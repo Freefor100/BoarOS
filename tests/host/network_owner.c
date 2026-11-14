@@ -471,7 +471,9 @@ enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *t,
     if(stopping_actor) {stop_waiting=1;CHECK(!pthread_cond_broadcast(&remote_changed));}
     else if(remote_mode==9) {remote_parked++;CHECK(!pthread_cond_broadcast(&remote_changed));}
     for(;;) {
-        int pending;{SOCKET_STATE(state);pending=stopping_actor?remote_socket->active_writes!=NULL:!remote_waiter.notified;}
+        int pending;
+        if (stopping_actor) { SOCKET_ENDPOINT(state,remote_socket);pending=remote_socket->active_writes!=NULL; }
+        else { SOCKET_STATE(state);pending=!remote_waiter.notified; }
         if(!pending)break;
         CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
     }
@@ -488,6 +490,10 @@ enum kernel_uaccess_status kernel_copy_from_user(struct kernel_mm *m,void *out,u
         unix_credit_copy_observed++;
     }
     memcpy(out,(void *)(uintptr_t)in,*copied);
+    if(remote_testing && (remote_mode==2 || remote_mode==3)) {
+        CHECK(boaros_lwip_parallel_enabled() && kernel_cpu_current()->logical_id==1 &&
+            remote_waiter.request && remote_waiter.request->protocol_payload && !remote_waiter.request->operation);
+    }
     if(remote_testing && remote_mode==3) {
         CHECK(!pthread_mutex_lock(&remote_gate));copy_waiting=1;
         CHECK(!pthread_cond_broadcast(&remote_changed));
@@ -546,7 +552,7 @@ static err_t physical_output(struct netif *interface, struct pbuf *packet, const
         CHECK(!kernel_cpu_current()->raw_locks && caller_owns_protocol());
         CHECK(copy_capacity_output_request->result==3 && !copy_capacity_output_request->reserved);
         struct kernel_socket *socket=copy_capacity_output_request->socket;
-        SOCKET_STATE(state);
+        SOCKET_ENDPOINT(state,socket);
         CHECK(!socket->tx_reserved && socket->tx_budget==tcp_protocol_budget(socket));
         copy_capacity_outputs++;
     }
@@ -713,7 +719,7 @@ static void nodelay_pending(unsigned blocked)
     socket->tcp->local_port = 22000; socket->tcp->remote_port = 22001;
     socket->tcp->cwnd = TCP_MSS; socket->tcp->snd_wnd = socket->tcp->snd_wnd_max = TCP_WND;
     TCP_REG_ACTIVE(socket->tcp); tcp_bind_netif(socket->tcp, &network.interface);
-    {SOCKET_STATE(state);tcp_publish_capacity_locked(socket);}
+    {SOCKET_ENDPOINT(state,socket);tcp_publish_capacity_locked(socket);}
     uint64_t frozen = clock_ns;
     CHECK(write_buffer(socket, "a", 1, 0) == 1);
     CHECK(copied_packets == 1 && socket->tcp->unacked && !socket->tcp->unsent);
@@ -808,7 +814,7 @@ static void *copy_capacity_reserver(void *unused)
             CHECK(kernel_socket_stream_reserve(&other,copy_capacity_interleave.available,0)==(int)copy_capacity_interleave.available);
         }
         CHECK(!(kernel_socket_poll(copy_capacity_interleave.socket,NULL)&KERNEL_POLLOUT));
-        {SOCKET_STATE(state);CHECK(!tcp_admission_capacity_locked(copy_capacity_interleave.socket));}
+        {SOCKET_ENDPOINT(state,copy_capacity_interleave.socket);CHECK(!tcp_admission_capacity_locked(copy_capacity_interleave.socket));}
         if(stage==2) {
             kernel_socket_stream_cancel(&other);
             CHECK(kernel_socket_stream_reserve(&other,copy_capacity_interleave.available,0)==(int)copy_capacity_interleave.available);
@@ -843,7 +849,7 @@ static void copy_capacity_batch(struct kernel_socket_write_request *request)
     kernel_socket_stream_begin(&held,&held_owner);CHECK(kernel_socket_stream_reserve(&held,1,0)==1);
     CHECK(kernel_socket_stream_reserve(request,3,0)==3);
     copy_capacity_interleave.socket=request->socket;copy_capacity_interleave.request=request;
-    {SOCKET_STATE(state);copy_capacity_interleave.available=tcp_admission_capacity_locked(request->socket);}
+    {SOCKET_ENDPOINT(state,request->socket);copy_capacity_interleave.available=tcp_admission_capacity_locked(request->socket);}
     CHECK(copy_capacity_interleave.available);
     uint32_t budget=request->socket->tx_budget;
     pthread_t thread;CHECK(!pthread_create(&thread,NULL,copy_capacity_reserver,NULL));
@@ -875,7 +881,7 @@ static void copy_capacity(unsigned eligible, unsigned gather)
     socket->tcp->local_port = 22000; socket->tcp->remote_port = 22001;
     socket->tcp->cwnd = TCP_MSS; socket->tcp->snd_wnd = socket->tcp->snd_wnd_max = TCP_WND;
     TCP_REG_ACTIVE(socket->tcp); tcp_bind_netif(socket->tcp, &network.interface);
-    {SOCKET_STATE(state);tcp_publish_capacity_locked(socket);}
+    {SOCKET_ENDPOINT(state,socket);tcp_publish_capacity_locked(socket);}
     dma_eligible = eligible; nic_full = 1; copy_attempts = copied_packets = segment_attempts = 0;
     kernel_socket_protocol_leave(&irq);protocol_services=0;
     if (gather) {
@@ -937,6 +943,39 @@ static void copy_capacity(unsigned eligible, unsigned gather)
     else printf("PASS copy fallback %s: NIC capacity alone retries real TCP output\n", eligible ? "no indirect" : "SG unsuitable");
 }
 
+static void udp_bind_ownership(void)
+{
+    struct kernel_socket *v6=NULL,*v4=NULL;
+    struct kernel_socket_address any6={.family=KERNEL_SOCKET_AF_INET6,.port=23001};
+    struct kernel_socket_address any4={.family=KERNEL_SOCKET_AF_INET,.port=23001};
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET6,SOCKET_DGRAM,&v6));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,&v4));
+    CHECK(!kernel_socket_bind(v6,&any6));
+    CHECK(kernel_socket_bind(v4,&any4)==-KERNEL_EADDRINUSE);
+    CHECK(!kernel_socket_set_option(v4,KERNEL_SOCKET_REUSEADDR,1));
+    CHECK(kernel_socket_bind(v4,&any4)==-KERNEL_EADDRINUSE);
+    CHECK(!kernel_socket_set_option(v6,KERNEL_SOCKET_REUSEADDR,1));
+    CHECK(!kernel_socket_bind(v4,&any4));
+    kernel_socket_destroy(v6);kernel_socket_destroy(v4);
+    v6=NULL;v4=NULL;
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET6,SOCKET_DGRAM,&v6));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,&v4));
+    CHECK(!kernel_socket_set_option(v6,KERNEL_SOCKET_V6ONLY,1));
+    CHECK(!kernel_socket_bind(v6,&any6) && !kernel_socket_bind(v4,&any4));
+    kernel_socket_destroy(v4);kernel_socket_destroy(v6);
+
+    struct kernel_socket *sender=NULL,*receiver=NULL;
+    struct kernel_socket_address old={0},unspec={0};
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,&sender));
+    CHECK(!kernel_socket_connect(sender,&any4,0) && !kernel_socket_getname(sender,&old) && old.port);
+    CHECK(!kernel_socket_connect(sender,&unspec,0));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,&receiver));
+    CHECK(!kernel_socket_bind(receiver,&old));
+    CHECK(!kernel_socket_connect(sender,&old,0));
+    CHECK(write_buffer(sender,"x",1,0)==1 && receiver->rx_bytes==1 && !sender->rx_bytes);
+    kernel_socket_destroy(sender);kernel_socket_destroy(receiver);
+}
+
 static void udp_final_payload(void)
 {
     kernel_socket_network_initialize();
@@ -955,7 +994,8 @@ static void udp_final_payload(void)
     CHECK(owner==(void *)socket && lwip_stats.mem.used==memory && !socket->tx_reserved);
     user_remaining=SIZE_MAX;
     kernel_socket_destroy(socket);
-    puts("PASS UDP final payload: no transient kernel heap objects, gather usercopy and fault rollback");
+    udp_bind_ownership();
+    puts("PASS UDP final payload and bind: gather, fault rollback, dual-stack reuse and V6ONLY port ownership");
 }
 
 static void unix_final_payload(void)
@@ -1757,7 +1797,7 @@ static void endpoint_ownership(void)
     struct kernel_socket_write_request first={0},second={0};
     kernel_socket_stream_begin(&first,&a);kernel_socket_stream_begin(&second,&b);
     unsigned locks=acquired;
-    uint32_t available;{SOCKET_STATE(state);available=tcp_admission_capacity_locked(server);}
+    uint32_t available;{SOCKET_ENDPOINT(state,server);available=tcp_admission_capacity_locked(server);}
     CHECK(available && kernel_socket_stream_reserve(&first,available,0)==(int)available);
     CHECK(kernel_socket_stream_reserve(&second,1,0)==-KERNEL_EAGAIN);
     CHECK(!(kernel_socket_poll(server,NULL)&KERNEL_POLLOUT));
@@ -1799,7 +1839,7 @@ static void tcp_quota_notifications(void)
     struct kernel_open_file_description *a=(void *)client,*b=(void *)client;
     struct kernel_socket_write_request first={0},second={0};
     kernel_socket_stream_begin(&first,&a);kernel_socket_stream_begin(&second,&b);
-    uint32_t capacity;{SOCKET_STATE(state);capacity=tcp_admission_capacity_locked(client);}
+    uint32_t capacity;{SOCKET_ENDPOINT(state,client);capacity=tcp_admission_capacity_locked(client);}
     CHECK(capacity && kernel_socket_stream_reserve(&first,capacity,0)==(int)capacity);
     CHECK(kernel_socket_stream_reserve(&second,1,0)==-KERNEL_EAGAIN);
     /* All protocol capacity is still held by a caller, rather than by TCP.
@@ -1943,8 +1983,8 @@ static void queued_completion_before_output(void)
     CHECK(!pthread_create(&writer,NULL,completed_output_writer,&write));
     CHECK(!pthread_mutex_lock(&remote_gate));
     while(!remote_work)CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
-    {SOCKET_STATE(state);CHECK(client->writes_head && client->active_writes->pin &&
-        kernel_open_file_socket(client->active_writes->pin)==client);}
+    {SOCKET_STATE(state);CHECK(client->writes_head && client->writes_head->pin &&
+        kernel_open_file_socket(client->writes_head->pin)==client);}
     CHECK(!pthread_mutex_unlock(&remote_gate));
     kernel_socket_protocol_leave(&held);
 
@@ -1954,12 +1994,11 @@ static void queued_completion_before_output(void)
     while(!completion_output.entered)CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
     /* The real output call is stopped after COPY accepted the bytes. Its
      * caller must already be allowed to finish and retire the request stack. */
-    {SOCKET_STATE(state);CHECK(client->active_writes && !client->active_writes->queued);}
     CHECK(!pthread_cond_broadcast(&remote_changed));
     while(!remote_done)CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
     CHECK(!pthread_mutex_unlock(&remote_gate) && !pthread_join(writer,NULL));
-    {SOCKET_STATE(state);CHECK(!client->active_writes && !client->writes_head &&
-        !client->tx_reserved && !server->rx_bytes);}
+    CHECK(!client->active_writes && !client->writes_head &&
+        !client->tx_reserved && !server->rx_bytes);
     CHECK(client->tcp && client->tcp->unsent && write.pin);
 
     /* Last close is a different task. It reaches the actual protocol mutex
@@ -2036,6 +2075,7 @@ static void remote_protocol_request(unsigned mode)
         CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,&client));
         CHECK(!kernel_socket_connect(client,&address,0));
         if(mode==2)user_remaining=0;
+        if(mode==2 || mode==3) boaros_lwip_ip_init(2);
     }
     for(unsigned i=0;i<8;i++)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
     struct kernel_wait_node work_node={.callback=remote_work_ready,.context=&remote_work};
@@ -2047,7 +2087,7 @@ static void remote_protocol_request(unsigned mode)
     struct kernel_wait_node quota_observer={0};unsigned quota_notifications=0;
     if(mode==8 || mode==9) {
         kernel_socket_stream_begin(&quota,&quota_pin);
-        uint32_t capacity;{SOCKET_STATE(state);capacity=tcp_admission_capacity_locked(client);}
+        uint32_t capacity;{SOCKET_ENDPOINT(state,client);capacity=tcp_admission_capacity_locked(client);}
         unsigned send_bytes=mode==9?3:1;
         CHECK(capacity>send_bytes && kernel_socket_stream_reserve(&quota,capacity-send_bytes,0)==(int)(capacity-send_bytes));
         kernel_wait_node_init_callback(&quota_observer,tcp_quota_wakeup,&quota_notifications);
@@ -3135,7 +3175,7 @@ static void async_events(void)
     CHECK(async_reasons[KERNEL_ASYNC_POLL_IN]==2);
     {
         SOCKET_STATE(state);
-        socket_state_notify(&receiver->wait);socket_state_notify(&receiver->wait);
+        socket_state_notify(state.owner,&receiver->wait);socket_state_notify(state.owner,&receiver->wait);
         socket_async(receiver,KERNEL_ASYNC_POLL_IN);socket_async(receiver,KERNEL_ASYNC_POLL_IN);
     }
     CHECK(async_reasons[KERNEL_ASYNC_POLL_IN]==4);

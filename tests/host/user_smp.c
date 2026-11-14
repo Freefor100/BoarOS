@@ -143,6 +143,7 @@ static void socket_shard_copy_cases(void)
     struct tcp_pcb pcb={.state=ESTABLISHED,.snd_buf=TCP_SND_BUF};
     struct kernel_socket socket={.tcp=&pcb,.domain=KERNEL_SOCKET_DOMAIN_INET,.type=SOCKET_STREAM,
         .connected=1,.tx_limit=TCP_SND_BUF,.tx_budget=TCP_SND_BUF,.tcp_cpu=1};
+    kernel_raw_lock_init(&socket.endpoint_lock,KERNEL_RAW_RANK_OBJECT-1);
     kernel_wait_queue_init(&socket.wait);
     struct kernel_open_file_description *pin=(void *)&socket;
     for (unsigned mode=0; mode<3; mode++) {
@@ -178,7 +179,7 @@ static void socket_shard_copy_cases(void)
         assert(shard_outputs==mode);
         if (!mode) {
             assert(owner->ready.head==&socket && socket.work_flags==SOCKET_WORK_OUTPUT);
-            { SOCKET_STATE(state); work_remove(&owner->ready,&socket); socket.work_flags=0; }
+            { SOCKET_STATE(state); work_remove_locked(&owner->ready,&socket); socket.work_flags=0; }
         } else assert(!owner->ready.head && !socket.work_flags);
         if (mode==2) {
             uintptr_t irq=sync_test_irq;

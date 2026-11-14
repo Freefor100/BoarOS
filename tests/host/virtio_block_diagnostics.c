@@ -125,7 +125,7 @@ static void sg_device_step(void)
     uint16_t *used = physical_pointer(registers[1] == 1 ? base + 4096 : register_address(0xa0), 4 + size * 8);
     struct wire_completion *done = (void *)(used + 2);
     unsigned count = (uint16_t)(available[1] - batch_popped), first = batch_popped;
-    assert(count && count <= 8);
+    assert((count || phase_held_status) && count <= 8);
     if (notifications == 1) first_notify_heads = count;
     batch_popped += count;
     for (unsigned n = count; n; n--) {
@@ -177,7 +177,7 @@ static void sg_device_step(void)
             reported != UINT32_MAX ? reported : error || type != 0 ? 1 : bytes + 1};
         if (reported != UINT32_MAX) sg_used_length = UINT32_MAX;
     }
-    if (phase_hold && phase_later_completed && phase_held_status) {
+    if (phase_hold == 1 && phase_later_completed && phase_held_status) {
         *phase_held_status=0;
         done[batch_pushed++ % size]=(struct wire_completion){phase_held_head,1};
         phase_held_status=NULL;
@@ -343,6 +343,8 @@ enum kernel_scheduler_status kernel_scheduler_block_current(struct kernel_wait_q
     (void)queue; (void)deadline; (void)interruptible;
     assert(!block_cpu.raw_locks && !block_cpu.preempt_depth);
     park_calls++;
+    if (fault == SG_BATCH && wait_irq_device && !release_batch_slot)
+        assert(wait_irq_device->queue.inflight && "no submitted DMA can free capacity");
     if (wait_irq_device) {
         if (release_batch_slot) {
             wait_irq_device->batch_claimed &= ~(1U << (release_batch_slot - 1));
@@ -814,7 +816,8 @@ static void sg_batch_case(unsigned version, unsigned queue_size, int writing, in
         reads[i] = (struct block_read_span){offset, batch_output[i], 512, 0, 0};
         writes[i] = (struct kernel_block_span){offset, batch_output[i], 512};
     }
-    enum kernel_block_status result = writing ? kernel_block_write_batch(&device.block, writes, 8) :
+    enum kernel_block_status result = writing ? kernel_block_write_batch_prio(&device.block, writes, 8,
+        writing == 2 ? KERNEL_BLOCK_PRIO_LOW : KERNEL_BLOCK_PRIO_NORMAL) :
         kernel_block_read_batch(&device.block, reads, 8, NULL);
     assert(result == (failing ? KERNEL_BLOCK_STATUS_IO : KERNEL_BLOCK_STATUS_OK));
     if (queue_size == 32) {
@@ -907,8 +910,23 @@ static void sg_128k_case(unsigned version, unsigned queue_size, int writing,
 }
 
 struct phase_entry { struct kernel_block_span span; struct phase_entry *next; };
+static struct virtio_block_device *fail_during_phase;
 static int phase_next(const void *context, const void **cursor, struct kernel_block_span *span)
 {
+    assert(!block_cpu.raw_locks);
+    if (phase_hold == 2 && phase_held_status) {
+        /* Complete the held DMA at the actual unlocked refill boundary,
+         * after the batch owner has scanned the previous completion set. */
+        phase_hold = 1;
+        phase_later_completed = 1;
+        sg_device_step();
+        block_irq(wait_irq_device);
+    }
+    if (fail_during_phase && fail_during_phase->active) {
+        KERNEL_IRQ_LOCK_SCOPE(guard, &fail_during_phase->metadata);
+        fail_device(fail_during_phase, KERNEL_BLOCK_STATUS_IO);
+        fail_during_phase = NULL;
+    }
     (void)context;
     const struct phase_entry *entry=*cursor;
     if (!entry) return 0;
@@ -944,6 +962,16 @@ static void write_phase_case(unsigned version, int failing)
     if (!failing) for (unsigned i=0;i<80;i++) for (unsigned j=0;j<512;j++)
         assert(sg_disk[i*1024+j]==(unsigned char)(i+3));
     else assert(device.statistics.requests<80);
+    if (!failing) {
+        phase_hold = 2;
+        phase_later_completed = 0;
+        entries[31].next = NULL;
+        assert(kernel_block_write_phase(&device.block,phase_next,0,entries)==KERNEL_BLOCK_STATUS_OK);
+        assert(phase_hold == 1 && !phase_held_status && !device.queue.inflight);
+        fail_during_phase = &device;
+        assert(kernel_block_write_phase(&device.block,phase_next,0,entries)==KERNEL_BLOCK_STATUS_IO);
+        assert(!fail_during_phase && !device.active && !device.queue.claimed && !device.batch_claimed);
+    }
     phase_hold=0; device.irq_source=0; wait_irq_device=NULL;
     printf("PASS journal phase transport=%u error=%d: 80 spans, later requests complete while first DMA held, error drains owners\n",version,failing);
     assert(destroy_model(&device)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations==releases);
@@ -1037,7 +1065,10 @@ static void notification_conditions_case(unsigned version)
     watched_queues[0]=&device.slots; watched_queues[1]=&device.idle; watched_queues[2]=&device.descriptors;
     struct kernel_wait_node sentinels[3]={0};
     memset(watched_wakes,0,sizeof(watched_wakes));
-    for (unsigned i=0;i<3;i++) watched_queues[i]->head=watched_queues[i]->tail=&sentinels[i];
+    for (unsigned i=0;i<3;i++) {
+        watched_queues[i]->head=watched_queues[i]->tail=&sentinels[i];
+        watched_queues[i]->registrations=1;
+    }
     device.barrier_waiters=1;
     sg_device_step(); collect_for_test(&device);
     printf("block notification harvest: slots=%u idle=%u descriptors=%u\n",
@@ -1051,6 +1082,7 @@ static void notification_conditions_case(unsigned version)
     }
     device.barrier_waiters=0;
     for (unsigned i=0;i<3;i++) {
+        watched_queues[i]->registrations=0;
         watched_queues[i]->head=watched_queues[i]->tail=NULL; watched_queues[i]=NULL;
     }
     assert(destroy_model(&device)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations==releases);
@@ -1323,6 +1355,13 @@ int main(int argc, char **argv)
         }
         return 0;
     }
+    if (argc == 2 && !strcmp(argv[1], "low-progress")) {
+        for (unsigned version=1;version<=2;version++) {
+            sg_batch_case(version,4,2,0,0);
+            sg_batch_case(version,8,2,0,0);
+        }
+        return 0;
+    }
     if (argc == 2 && (!strcmp(argv[1], "sg") || !strcmp(argv[1], "sg-batch"))) {
         for (unsigned version = 1; version <= 2; version++) {
             if (!strcmp(argv[1], "sg")) scalar_dma_before_irq_case(version);
@@ -1369,6 +1408,8 @@ int main(int argc, char **argv)
     for (unsigned version = 1; version <= 2; ++version) {
         for (unsigned mode = 0; mode < 3; mode++)
             for (unsigned length = 0; length < 5; length++) short_read_case(version, mode, length);
+        sg_batch_case(version,4,2,0,0);
+        sg_batch_case(version,8,2,0,0);
         late_harvest_case(version); notification_conditions_case(version);
         cross_cpu_notification_case(version);
         large_phase_case(version);

@@ -206,7 +206,7 @@ ext4 和 tmpfs 的 `FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS` 使用 32 位数据。�
 
 `kernel_files_pipe2()` 创建两个新的 open file description 和两个 fd 槽，共享一个片段环。默认容量为16个目标页（RV64KiB、LA256KiB），对象内保留16个槽描述符；更大的环另外分配描述符数组。各槽在写入时才取得一张独立目标页，不要求连续物理区间；扩容不预分配数据页，空 pipe 只占对象和必要的环元数据。读端只增加 read-side 引用，写端只增加 write-side 引用。`O_CLOEXEC` 保存在两个 descriptor flag 中，`O_NONBLOCK` 保存在两个 OFD status 中；`F_SETFL` 可切换 `O_NONBLOCK`，并接受 64 位目标上 musl 每次带来的 `O_LARGEFILE` 兼容位而不改变该位。
 
-读端有数据时按 ring 顺序返回，空且仍有 writer 时：阻塞 fd 进入 interruptible wait，非阻塞 fd 返回 `-EAGAIN`。所有 writer 关闭后空读返回 EOF；写端没有 reader 时返回 `-EPIPE`，同时向当前 task 发送 SIGPIPE，因此有 handler 时先观察信号、无 handler 时按默认动作终止。写端空间不足时阻塞或返回 `-EAGAIN`；不超过 4096 字节的单次写由writer复制资格和完整片段发布保持原子，较大写按可用空间推进。EOF/EPIPE 唤醒全部受影响 waiter；数据/空间变化也唤醒对端全部 waiter，被唤醒后重查条件，并可被未阻塞信号唤醒后返回 `-EINTR`/按 `SA_RESTART` 重启。
+读端有数据时按 ring 顺序返回，空且仍有 writer 时：阻塞 fd 进入 interruptible wait，非阻塞 fd 返回 `-EAGAIN`。所有 writer 关闭后空读返回 EOF；写端没有 reader 时返回 `-EPIPE`，同时向当前 task 发送 SIGPIPE，因此有 handler 时先观察信号、无 handler 时按默认动作终止。写端空间不足时阻塞或返回 `-EAGAIN`；不超过 4096 字节的单次写由writer复制资格和完整片段发布保持原子，较大写按可用空间推进。EOF/EPIPE 唤醒全部受影响 waiter。发布数据通知读者，读取或 splice 从已满环中释放首个槽时通知写者。异步读写信号维持各自的操作时点。等待者被唤醒后重查条件，也可被未阻塞信号唤醒后返回 `-EINTR`/按 `SA_RESTART` 重启。
 
 每个已发布的 pipe 片段拥有一张独立页，完全消费后立即归还。尚未发布的写入页也先归槽所有，复制 fault 时撤销并释放，最后端点销毁会回收全部剩余槽页。`write/writev` 跨 iovec 复制完整片段后才增加有效长度；复制中途 fault 时丢弃尚未发布的片段，已发布的前缀仍返回。后续写入只按请求长度的页内余数尝试并入尾片段，其余使用新页片段。`read/readv` 对一个片段的本轮请求必须完整复制到用户空间才消费它；fault 可使用户缓冲区出现前缀，但该未完成片段仍可被再次读取。已消费的先前片段决定返回进度，之后不会为了下一 iovec 再等待新数据。当前容量的槽已占满时 `poll` 不报告可写，即使尾页尚有可合并空间；小写入仍可尝试尾页合并。这些边界按固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `references/linux/fs/pipe.c` 对照。
 

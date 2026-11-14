@@ -667,8 +667,12 @@ static unsigned resident_protect, resident_started, resident_done;
 static struct kernel_mm resident_child;
 static void *resident_mutate(void *unused)
 {
-    (void)unused; mm_test_attach(3); kernel_cpu_current()->logical_id=0;
-    mm_test_context=context; publish(&resident_started);
+    (void)unused; mm_test_attach(3);
+    kernel_cpu_current()->logical_id = 1;
+    mm_test_context = context;
+    mm_test_bind(&mm);
+    kernel_task_current()->arch.user_mode = 1;
+    publish(&resident_started);
     if (resident_protect)
         assert(!kernel_mm_mprotect(&mm,0x40000,BOAROS_PAGE_SIZE,KERNEL_MM_READ));
     else assert(!kernel_mm_fork(&resident_child,&mm));

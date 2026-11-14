@@ -29,6 +29,8 @@ static struct kernel_mm views[5];
 static uint64_t roots[5], target;
 static unsigned capture, entered[5], resume, fail_heap, fail_page, capture_allocate;
 static _Thread_local unsigned local_tlb_fences;
+static _Thread_local int rendezvous_file_read;
+static unsigned file_read_fences;
 enum kernel_heap_status __real_kernel_heap_allocate_zeroed(struct kernel_heap *,size_t,size_t,void **);
 enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t n,size_t size,void **out)
 {
@@ -136,6 +138,11 @@ void mm_test_fence(uint64_t v, int instructions)
 {
     (void)v; assert(!kernel_cpu_current()->raw_locks);
     if (!instructions) local_tlb_fences++;
+    if (rendezvous_file_read) {
+        rendezvous_file_read = 0;
+        __atomic_fetch_add(&file_read_fences, 1, __ATOMIC_RELEASE);
+        while (__atomic_load_n(&file_read_fences, __ATOMIC_ACQUIRE) < 2) sched_yield();
+    }
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
 int __real_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *,uint64_t,int,
@@ -350,6 +357,19 @@ static void futex_key_lifetime(void)
     assert(!kernel_mm_munmap(&parent,cold,BOAROS_PAGE_SIZE));
 }
 
+/* A present file translation still needs a local flush after a hardware
+ * fault. Both readers must reach their own flush before either returns. */
+static void *resident_file_fault(void *argument)
+{
+    unsigned id = (unsigned)(uintptr_t)argument;
+    mm_test_attach(id);
+    mm_test_context = roots[1];
+    rendezvous_file_read = 1;
+    assert(!kernel_mm_resolve_user_fault(&parent, 0x40000, KERNEL_MM_READ));
+    assert(!rendezvous_file_read);
+    return NULL;
+}
+
 int main(void)
 {
     mm_test_attach(0);
@@ -392,6 +412,12 @@ int main(void)
     unsigned before_fences=local_tlb_fences;
     assert(!kernel_mm_resolve_user_fault(&parent,mapped,KERNEL_MM_READ));
     assert(local_tlb_fences==before_fences+1);
+    pthread_t readers[2];
+    for (unsigned i=0; i<2; i++)
+        assert(!pthread_create(&readers[i], NULL, resident_file_fault, (void *)(uintptr_t)(i+1)));
+    for (unsigned i=0; i<2; i++) assert(!pthread_join(readers[i], NULL));
+    assert(file_read_fences == 2);
+    puts("two same-MM file readers complete their concurrent resident translation flushes");
     uint64_t child_root; assert(!kernel_mm_context(&child,&child_root)); mm_test_context=child_root;
     byte=0; assert(!kernel_copy_from_user(&child,&byte,mapped,1,&done) && done==1 && byte==0x73);
     mm_test_context=roots[1];

@@ -691,6 +691,8 @@ static void storage_cleanup_worker(void *argument)
     (void)argument;
     (void)arch_interrupt_save();
     kernel_scheduler_register_cleanup();
+    if (root_started && kernel_page_cache_start_background(&root_boot.page_cache))
+        shutdown_for_root_boot_error(RISCV_ROOT_BOOT_STATUS_RESOURCES);
     kernel_reboot_enable();
     enum kernel_scheduler_status scheduler_status;
     enum riscv_root_boot_status root_status;
@@ -938,7 +940,9 @@ static void kernel_main_high(void)
                                         &kernel_page_table);
     if (root_status == RISCV_ROOT_BOOT_STATUS_OK) {
         root_started = 1;
-        if (kernel_page_cache_start_worker(&root_boot.page_cache) != 0)
+        /* Bootstrap can publish a CPU0 task but cannot park to join it if
+         * another worker fails. The cleanup task owns the remaining startup. */
+        if (kernel_page_cache_start_executor(&root_boot.page_cache) != 0)
             shutdown_for_root_boot_error(RISCV_ROOT_BOOT_STATUS_RESOURCES);
 #if !BOAROS_USER_SMP
         if (kernel_vfs_start_journal_worker(&root_boot.mount) != 0)

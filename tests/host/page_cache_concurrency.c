@@ -74,6 +74,10 @@ static struct { unsigned before_registration, entered, resume, parked, done; int
 static _Thread_local unsigned progress_writeback_caller;
 static unsigned progress_writeback_waiting;
 static struct { unsigned observing, registered, armed, entered, resume, done; } writeback_wake;
+#if BOAROS_USER_SMP
+static unsigned failed_lane_submit, failed_lane_idle;
+static _Thread_local unsigned fail_lane_backend;
+#endif
 static uint64_t age_clock_offset,age_deadlines[2];
 static struct kernel_wait_token age_tokens[2];
 uint64_t __real_kernel_time_monotonic_ns(void);
@@ -386,6 +390,11 @@ enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue
     }
     enum kernel_scheduler_status status=__real_kernel_wait_prepare(queue,deadline,interruptible,token);
     if (!status && writeback_wait) __atomic_store_n(&writeback_wake.registered,1,__ATOMIC_RELEASE);
+#if BOAROS_USER_SMP
+    if (!status && deadline && __atomic_load_n(&failed_lane_submit,__ATOMIC_ACQUIRE) &&
+        kernel_page_cache_is_executor(current_cache))
+        __atomic_store_n(&failed_lane_idle,1,__ATOMIC_RELEASE);
+#endif
     if (!status && fixed_target_client && journal_wait_owner && queue==&journal_wait_owner->journal_progress)
         __atomic_store_n(&fixed_target_waiting,1,__ATOMIC_RELEASE);
     if (!status && progress_writeback_caller && queue) __atomic_store_n(&progress_writeback_waiting,1,__ATOMIC_RELEASE);
@@ -469,6 +478,13 @@ int __wrap_ext4_fpwrite_batch(ext4_file *file,struct file_write_span *spans,unsi
         assert((const void *)spans==(const void *)write_counts->spans);
     }
     unsigned fault=__atomic_exchange_n(&write_error,0,__ATOMIC_ACQ_REL);
+#if BOAROS_USER_SMP
+    if (fail_lane_backend) {
+        fail_lane_backend=0;
+        fault=1;
+        __atomic_store_n(&failed_lane_submit,1,__ATOMIC_RELEASE);
+    }
+#endif
     if (fault) {
         for (unsigned i=0;i<count;i++) spans[i].written=0;
         if (fault==2 && count && spans[0].size>1) {
@@ -800,9 +816,37 @@ static int cycle_rearm_foreground(void *owner,uint64_t address)
     while(!__atomic_load_n(&cycle_fg_resume,__ATOMIC_ACQUIRE))sched_yield();
     return 0;
 }
+#if BOAROS_USER_SMP
+static struct {
+    struct kernel_vfs_node *nodes[2];
+    unsigned calls[2], entered[2], resume[2], cpu[2], fail_first;
+    struct retained_version retained[2];
+} parallel_writeback;
+
+static void observe_parallel_writeback(struct kernel_vfs_node *node, struct file_write_span *span)
+{
+    unsigned i = node == parallel_writeback.nodes[0] ? 0 : 1;
+    if (node != parallel_writeback.nodes[i]) return;
+    unsigned call = __atomic_fetch_add(&parallel_writeback.calls[i], 1, __ATOMIC_ACQ_REL);
+    if (call) {
+        assert(__atomic_load_n(&parallel_writeback.resume[i], __ATOMIC_ACQUIRE));
+        return;
+    }
+    assert(kernel_io_context_current()->background_reclaim && span->source.retain);
+    parallel_writeback.cpu[i] = kernel_cpu_current()->logical_id;
+    span->source.retain(span->source.context);
+    parallel_writeback.retained[i] = (struct retained_version){span->source, span->buffer};
+    __atomic_store_n(&parallel_writeback.entered[i], 1, __ATOMIC_RELEASE);
+    wait_progress(&parallel_writeback.resume[i], 1);
+    if (!i && parallel_writeback.fail_first) fail_lane_backend=1;
+}
+#endif
 int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *,struct file_write_span *,size_t);
 int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node,struct file_write_span *spans,size_t count)
 {
+#if BOAROS_USER_SMP
+    observe_parallel_writeback(node, spans);
+#endif
     if (node == executor_fairness.writer) {
         unsigned batch = __atomic_add_fetch(&executor_fairness.batches, 1, __ATOMIC_ACQ_REL);
         if (batch == 1) {
@@ -3833,6 +3877,121 @@ static void progress_writeback_owners(struct kernel_page_cache *cache,const char
     puts("PASS progress I/O keeps its own writeback workspace and waits for busy entries; worker versions, exact disk contents and owners survive");
 }
 
+#if BOAROS_USER_SMP
+static void parallel_writeback_case(struct kernel_page_cache *cache, const char *path)
+{
+    image_fd = open(path, O_RDWR);
+    struct stat st;
+    assert(image_fd >= 0 && !fstat(image_fd, &st));
+    struct kernel_block_device disk = {.read=image_read, .write=image_write, .flush=image_flush,
+        .logical_block_size=512, .capacity_bytes=st.st_size, .cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
+    struct kernel_vfs_mount mount = {0};
+    assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,cache,0));
+    current_cache = cache;
+#ifndef CACHE_MM_CASES
+    /* RV boot first publishes a CPU0 executor. Failure to allocate the
+     * later lane must join the restarted services and leave the cache reusable. */
+    assert(!kernel_page_cache_start_executor(cache));
+    assert(kernel_page_cache_check_domain(cache,cache->heap,cache->allocator));
+    fail_cache_entry=1;
+    assert(kernel_page_cache_start_background(cache)==-KERNEL_ENOMEM && !fail_cache_entry);
+    assert(!kernel_page_cache_check_domain(cache,cache->heap,cache->allocator));
+#endif
+    struct kernel_vfs_file files[2] = {{0}};
+    for (unsigned i=0; i<2; i++)
+        assert(!kernel_vfs_create(&mount,i ? "/parallel-b" : "/parallel-a",0600,&files[i]));
+
+    /* One extra dirty page on the first inode forces the selector to pass an
+     * owned inode mid-scan, with the second inode still inside this round. */
+    unsigned last = BOAROS_PAGE_CACHE_WRITEBACK_PAGES;
+    enum { NORMAL, STOPPING, FAILED };
+    for (unsigned mode=NORMAL; mode<=FAILED; mode++) {
+        memset(&parallel_writeback,0,sizeof(parallel_writeback));
+        parallel_writeback.fail_first=mode==FAILED;
+        unsigned char block[BOAROS_PAGE_SIZE];
+        size_t done;
+        for (unsigned i=0; i<2; i++) {
+            for (unsigned page=0; page<=(i ? 0 : last); page++) {
+                memset(block,0x20+i+page+mode,sizeof(block));
+                assert(!kernel_vfs_pwrite(&files[i],(uint64_t)page*sizeof(block),block,sizeof(block),&done) &&
+                    done==sizeof(block));
+            }
+            parallel_writeback.nodes[i]=kernel_vfs_file_node(&files[i]);
+        }
+        uint64_t observed[2]={kernel_vfs_error_sequence(&files[0]),kernel_vfs_error_sequence(&files[1])};
+        assert(!kernel_page_cache_start_worker(cache));
+        struct kernel_page_cache_concurrency_state before, state;
+        kernel_page_cache_get_concurrency_state(cache,&before);
+        assert(!kernel_page_cache_request_writeback(cache));
+        wait_progress(&parallel_writeback.entered[0],1);
+        wait_progress(&parallel_writeback.entered[1],1);
+        assert(parallel_writeback.cpu[0]==1 && parallel_writeback.cpu[1]==0);
+        assert(parallel_writeback.retained[0].source.context!=parallel_writeback.retained[1].source.context);
+
+        writeback_wake.done=progress_writeback_waiting=0;
+        pthread_t waiter;
+        if (mode!=FAILED) {
+            assert(!pthread_create(&waiter,NULL,writeback_pressure_wait,cache));
+            wait_progress(&progress_writeback_waiting,1);
+        }
+        __atomic_store_n(&parallel_writeback.resume[1],1,__ATOMIC_RELEASE);
+        /* The request returns through the main cache worker even while the
+         * other backend holds its version and all its selected entry loans. */
+        if (mode!=FAILED) {
+            pthread_t foreground;
+            assert(!pthread_create(&foreground,NULL,execute_client,NULL) && !pthread_join(foreground,NULL));
+            kernel_page_cache_get_concurrency_state(cache,&state);
+            assert(state.writeback_rounds==before.writeback_rounds && state.entry_borrows &&
+                !__atomic_load_n(&writeback_wake.done,__ATOMIC_ACQUIRE) && parallel_writeback.calls[0]==1);
+        }
+        pthread_t stopper;
+        if (mode==STOPPING) {
+            watch_stop=1;stop_entered=stop_done=0;
+            assert(!pthread_create(&stopper,NULL,stop_cache,NULL));
+            wait_progress(&stop_entered,1);
+            assert(!__atomic_load_n(&stop_done,__ATOMIC_ACQUIRE));
+        }
+        __atomic_store_n(&parallel_writeback.resume[0],1,__ATOMIC_RELEASE);
+        if (mode!=FAILED) assert(!pthread_join(waiter,NULL));
+        if (mode==STOPPING) {
+            assert(!pthread_join(stopper,NULL) && stop_done);
+            watch_stop=0;
+        } else if (mode==FAILED) {
+            wait_progress(&failed_lane_idle,1);
+            assert(parallel_writeback.calls[0]==1 && parallel_writeback.calls[1]==1);
+            kernel_page_cache_stop_worker(cache);
+        } else {
+            wait_progress(&parallel_writeback.calls[0],2);
+            kernel_page_cache_stop_worker(cache);
+        }
+        for (unsigned i=0; i<2; i++) {
+            assert(*parallel_writeback.retained[i].data==0x20+i+mode);
+            parallel_writeback.retained[i].source.release(parallel_writeback.retained[i].source.context);
+            parallel_writeback.nodes[i]=NULL;
+        }
+        kernel_page_cache_get_concurrency_state(cache,&state);
+        assert(!state.entry_borrows && !state.pending && !state.running &&
+            state.writeback_rounds>before.writeback_rounds && parallel_writeback.calls[1]==1);
+        /* Stopping may leave the extra page dirty. Sync then read the disk
+         * directly, so the cache cannot supply the expected bytes. */
+        for (unsigned i=0; i<2; i++) {
+            if (mode==FAILED && !i) assert(kernel_vfs_sync(&files[i],0,&observed[i])==-KERNEL_EIO);
+            assert(!kernel_vfs_sync(&files[i],0,&observed[i]));
+            assert(!kernel_vfs_node_dirty_pages(kernel_vfs_file_node(&files[i]))->count);
+            for (unsigned page=0; page<=(i ? 0 : last); page++) {
+                assert(!__real_kernel_vfs_node_pread(kernel_vfs_file_node(&files[i]),
+                    (uint64_t)page*sizeof(block),block,sizeof(block),&done) && done==sizeof(block));
+                for (size_t n=0;n<done;n++) assert(block[n]==0x20+i+page+mode);
+            }
+        }
+    }
+    assert(!kernel_vfs_close(&files[0]) && !kernel_vfs_close(&files[1]) &&
+        !kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(cache) && !close(image_fd));
+    current_cache=NULL;
+    puts("PASS independent inode writebacks overlap, same-inode continuation, pressure round, stop/join and stable owners");
+}
+#endif
+
 static void (*metadata_reclaim_clean)(struct kernel_vfs_instance *);
 static unsigned metadata_reclaim_entered,metadata_reclaim_resume;
 static void metadata_reclaim_held(struct kernel_vfs_instance *instance)
@@ -3932,6 +4091,9 @@ int main(int argc, char **argv)
     assert(kernel_page_cache_init(&cache, &heap, &pages) ==
         KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT);
     if (argc==3) {
+#if BOAROS_USER_SMP
+        if (!strcmp(argv[2],"parallel-writeback")) {parallel_writeback_case(&cache,argv[1]);goto owners;}
+#endif
         if (!strcmp(argv[2],"metadata-pressure")) {metadata_allocator_pressure(&cache,argv[1]);goto owners;}
         if (!strcmp(argv[2],"writeback-wake")) {writeback_registration_wake(&cache);goto owners;}
         if (!strcmp(argv[2],"read-borrow-retire")) {read_borrow_retirement(&cache,argv[1]);goto owners;}

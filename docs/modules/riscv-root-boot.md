@@ -93,4 +93,6 @@ root finish 停止其 worker、同步日志和释放全部设备并精确恢复 
 第二次启动把同一第二盘设为设备只读，读回包括 root finish 刷新的最后文件；
 每次结束以 `e2fsck -fn` 检查第二盘。两种 transport 的四次启动均已通过。
 
+根盘先启动 CPU0 页缓存执行者。调度开始后，已有的存储清理任务启动预读和写回辅助线程，此时副核已经上线，启动失败时该任务可等待已创建的线程退出。
+
 生产启动使用 `riscv_root_boot_start_with_irq`，在 scheduler/PLIC/heap 就绪后、标准 OFD 打开前发布 DTB 串口 TTY。模块启动仍可通过原入口只保留早期 console。root 拥有 UART port 和 joinable worker，启动失败与正常退出都在最后 baseline 检查前停止并释放；硬件 drain 超时保留真实 port，失败标识为 `RISCV_ROOT_FINISH_UART`。具体队列、IRQ 与配置契约见[串口传输](riscv-uart-tty.md)。

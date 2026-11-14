@@ -291,7 +291,10 @@ int main(void)
         !physical_page_allocator_finalize(&pages) && !kernel_heap_init(&heap,&pages,page_address));
     assert(!riscv_sv39_page_table_init(&kernel,&pages)); kernel.state=ARCH_MMU_STATE_ACTIVE;
     uint64_t baseline=physical_page_available(&pages);
+    /* An exec candidate owns its MM before any CPU can activate it. */
+    kernel_cpu_current()->logical_id = 1;
     build_case(2,0x40000000,2,0x60000000,0);
+    kernel_cpu_current()->logical_id = 0;
     build_case(2,0x40000000,2,0x40000000,1);
     build_case(2,0x40000000,0,0,0);
     build_case(3,0x20000,3,0x10000,0);

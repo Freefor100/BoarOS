@@ -109,9 +109,9 @@ void kernel_wait_queue_init(struct kernel_wait_queue *q) { *q=(struct kernel_wai
 void kernel_wait_node_init_callback(struct kernel_wait_node *n,kernel_wait_callback_fn fn,void *ctx)
 { *n=(struct kernel_wait_node){.callback=fn,.context=ctx}; }
 void kernel_wait_queue_add(struct kernel_wait_queue *q,struct kernel_wait_node *n)
-{ CHECK(!n->queue); n->queue=q; n->previous=q->tail; if(q->tail)q->tail->next=n;else q->head=n;q->tail=n; }
+{ CHECK(!n->queue); q->registrations++;n->queue=q; n->previous=q->tail; if(q->tail)q->tail->next=n;else q->head=n;q->tail=n; }
 void kernel_wait_queue_remove(struct kernel_wait_node *n)
-{ struct kernel_wait_queue *q=n->queue; if(!q)return;CHECK(q->initialized); if(n->previous)n->previous->next=n->next;else q->head=n->next;
+{ struct kernel_wait_queue *q=n->queue; if(!q)return;CHECK(q->initialized && q->registrations);q->registrations--; if(n->previous)n->previous->next=n->next;else q->head=n->next;
   if(n->next)n->next->previous=n->previous;else q->tail=n->previous;n->queue=NULL;n->next=n->previous=NULL; }
 enum kernel_scheduler_status kernel_wait_node_remove_sync(struct kernel_wait_node *node)
 {

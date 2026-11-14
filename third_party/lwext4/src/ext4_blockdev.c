@@ -310,21 +310,19 @@ int ext4_block_get_range(struct ext4_blockdev *bdev, struct ext4_block *b,
         r=ext4_blocks_get_direct(bdev,b->data,lba,1);
         ext4_block_loaded(bdev,b->buf,r);
     } else if (read==EXT4_BCACHE_READ_WAIT) r=ext4_block_wait_loaded(bdev,b->buf);
-    if (r) ext4_bcache_free_read(bdev->bc,b);
-#if CONFIG_JOURNALING_ENABLE
-    else if (bdev->fs) {
-        struct jbd_trans *trans=ext4_current_trans(bdev->fs);
-        if (trans) {
-            if (access == EXT4_BLOCK_WRITE)
-                r=jbd_trans_get_write_access_range(trans,b,offset,length);
-            return r; /* The transaction exposes only its private write view. */
-        }
+    if (r) {
+        ext4_bcache_free_read(bdev->bc,b);
+        return r;
     }
-#else
-    (void)access;
+    if (access != EXT4_BLOCK_WRITE) return EOK;
+#if CONFIG_JOURNALING_ENABLE
+    if (bdev->fs) {
+        struct jbd_trans *trans=ext4_current_trans(bdev->fs);
+        if (trans) return jbd_trans_get_write_access_range(trans,b,offset,length);
+    }
 #endif
-    if (!r && access == EXT4_BLOCK_WRITE) ext4_block_payload_write(b->payload);
-    return r;
+    ext4_block_payload_write(b->payload);
+    return EOK;
 }
 int ext4_block_get(struct ext4_blockdev *bdev, struct ext4_block *b, uint64_t lba)
 { return ext4_block_get_range(bdev,b,lba,0,bdev->lg_bsize,EXT4_BLOCK_READ); }
@@ -406,7 +404,7 @@ int ext4_block_get_batch(struct ext4_blockdev *bdev, struct ext4_block *blocks,
 			blocks[i].data, bdev->lg_bsize, 0, EIO};
 	}
 	/* 先完成自己发布的加载，再等待别人的 loading，重叠批次不会互等未发布页。 */
-	ext4_blockdev_read_batch(bdev, reads, pending, NULL);
+	if (pending) ext4_blockdev_read_batch(bdev, reads, pending, NULL);
     for (unsigned i=0;i<pending;i++) {
         unsigned owner=owners[i];
         errors[owner]=reads[i].status;

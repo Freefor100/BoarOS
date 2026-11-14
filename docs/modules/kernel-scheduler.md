@@ -301,13 +301,15 @@ SETTLS写r2/TP、child stack写r3/SP、返回a0=0并使ERA前进4字节。LA已�
 组生命周期由 `make test-pthread-loongarch` 双侧验证，两处构造OOM和重试由
 `make test-pthread-oom-loongarch` 验证；任务页/栈及根盘owner要求恢复基线。
 
+用户多核下，调用线程在当前核导入 clone3 参数，准备子任务栈页、凭据、文件表和 MM。CPU0 映射内核栈窗口后在新栈建立首次返回的寄存器现场。普通 fork 在父 MM 写资格内排空写 pin 并提交 COW，父映射含 SysV 附件时在 CPU0 更新段的附着计数。CPU0 继承控制终端，在同一次调度锁保护下发布子进程身份、pidfd、组与亲子关系，并按继承的亲和性选择就绪队列。子任务在实际运行核处理首次返回和 CHILD_SETTID。只读的资源限额、PGID、SID 和 robust-list 查询在调用核取得受保护的快照。
+
 RV/LA 的 clone 和 clone3 共用进程创建，支持 CLONE_VM、CLONE_FILES、CLONE_FS、CLONE_IO，以及共享 VM 时的 CLONE_SIGHAND 和可选 CLONE_VFORK；线程要求 VM/SIGHAND/THREAD，FILES 和 FS 按标志选择。CHILD_SETTID/CHILD_CLEARTID、SETTLS/PARENT_SETTID 与 CLONE_SYSVSEM 沿实际标志处理。clone3 检查结构长度、扩展字节和子栈范围，再转换成共同创建参数；CLONE_CLEAR_SIGHAND 在独立信号表中重置子进程处理动作，不能与 CLONE_SIGHAND 同用。指定 PID 数组、cgroup 和其他未接入的资源组合返回 ENOTSUP。CLONE_SYSVSEM 的最后共享者退出补偿见[SysV信号量](sysv-sem.md)。
 
 `ioprio_set/get` 支持按线程、进程组和真实 UID 设置或查询优先级；RT 设置检查 CAP_SYS_ADMIN/CAP_SYS_NICE。首次设置时按需分配块 I/O 优先级上下文；CLONE_IO 共享已经存在的对象，父线程没有对象时子线程也从空状态开始。普通 fork 对已设置的优先级生成独立副本，exec 保留执行线程的对象，退出与创建失败归还真实引用。未显式设置时，集合查询按基础策略派生RT/BE/IDLE类，并用(nice+20)/5得到默认级别；单进程原始查询保留NONE。KCMP_IO 比较该对象，包括两个空对象相等；它与每任务持锁和用户页借用的 `kernel_io_context` 分开。固定 Linux 的 `ioprio_set(USER, 0)` 按数值 UID 0 匹配，而 `get(USER, 0)` 查询调用者的真实 UID。当前块队列仍按需求 I/O 和后台回收类别服务，尚未按用户设置的 I/O 优先级调度请求。
 
 CLONE_PIDFD 在复制子任务文件表之后预留父进程 FD 和真实 PID 身份，输出用户地址失败时撤销预留并回收子任务。发布时先取得文件表保护，再在调度保护内安装 FD 并让子任务就绪，因此共享文件表的子任务启动时已能看到该 FD。pidfd 自带 CLOEXEC，线程 pidfd 指向实际 TID。进程可指定退出信号；0 表示不发送信号，非 SIGCHLD 子进程由 __WCLONE 或 __WALL 选择，成功 exec 后恢复 SIGCHLD。
 
-子线程继承完整 FP、整数现场和 mask；a0 为 0，PC 越过 ecall，非零 child_stack 替换 sp，SETTLS 设置 tp。CHILD_SETTID 在子任务首次返回用户态前、子 MM 激活后写入，因此可正常处理 COW 和缺页；PARENT_SETTID 仍在父任务发布 clone 时写入。SETTID 用户存储失败不回滚已经创建的任务，与固定 Linux clone 路径一致。所有内核分配失败都在发布前回滚；若回滚触及真实 VFS/block I/O owner，则由所属文件或 mount 记录，物理页和堆释放不另建重试状态；不会发布半构造子进程。
+子线程继承完整 FP、整数现场和 mask；a0 为 0，PC 越过 ecall，非零 child_stack 替换 sp，SETTLS 设置 tp。CHILD_SETTID 在子任务首次返回用户态前、子 MM 激活后写入，因此可正常处理 COW 和缺页；PARENT_SETTID 在最终发布 PID、pidfd 和亲子关系后由父线程写入。此时子任务处于 NEW，只有创建者能在写入尝试结束后将其加入就绪队列。SETTID 用户存储失败不回滚已经创建的任务，与固定 Linux clone 路径一致。所有内核分配失败都在发布前回滚；若回滚触及真实 VFS/block I/O owner，则由所属文件或 mount 记录，物理页和堆释放不另建重试状态；不会发布半构造子进程。
 
 vfork 共享 MM；files、fs 及 disposition 分别按 CLONE_FILES、CLONE_FS 和 CLONE_SIGHAND 选择共享或复制。父线程和具体子进程保持双向完成关联；子进程释放共享 MM 引用后一次性完成等待。普通信号不解除等待。组退出/exec 的致命取消先断开双向关联，再唤醒父线程；子进程自己的 MM 引用仍有效，之后完成也不能访问已释放父任务。
 

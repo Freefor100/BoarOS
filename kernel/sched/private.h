@@ -191,6 +191,8 @@ enum kernel_scheduler_status process_group_exec_current(void);
 
 /* 调用者独占从allocator取得的页对齐存储，完整清零后才发布对象。 */
 void clear_page(void *pointer);
+enum kernel_scheduler_status allocate_task_pages(struct kernel_task **task);
+enum kernel_scheduler_status map_task_stack(struct kernel_task *task);
 enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task);
 enum kernel_scheduler_status release_task_stack(struct kernel_task *task);
 void kernel_task_release_io_scratch(struct kernel_task *task);
@@ -241,6 +243,8 @@ enum kernel_scheduler_status scheduler_switch_current_away(
     struct kernel_task *previous);
 enum kernel_scheduler_status scheduler_switch_current_away_locked(
     struct kernel_task *, struct kernel_raw_guard *);
+void scheduler_policy_snapshot_locked(const struct kernel_task *,
+                                      struct kernel_sched_policy *);
 void process_complete_vfork(struct kernel_task *thread);
 enum kernel_scheduler_status activate_thread_address_space(
     const struct kernel_task *thread);

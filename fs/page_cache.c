@@ -197,6 +197,9 @@ struct kernel_page_cache_record {
     struct version_pool *versions;
     size_t writeback_capacity;
     struct writeback_workspace *writeback_workspace;
+#if BOAROS_USER_SMP
+    struct writeback_lane *lane;
+#endif
     union foreground_workspace *foreground_workspace;
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
     struct readahead_job readahead_jobs[8];
@@ -951,13 +954,15 @@ static int node_pressure(const struct kernel_vfs_node *node,struct kernel_page_c
 }
 #if BOAROS_MAX_CPUS > 1
 enum { DIRTY_BATCH_OWNED=1, DIRTY_BATCH_REVISIT=2 };
-static void dirty_batch_return(struct kernel_page_cache_record *r,struct kernel_vfs_node *node)
+static void dirty_batch_return(struct kernel_page_cache_record *r,struct kernel_vfs_node *node,int result)
 {
     struct kernel_page_cache_dirty *dirty=kernel_vfs_node_dirty_pages(node);
     unsigned state=dirty->batch_state;
     if (!(state&DIRTY_BATCH_OWNED)) __builtin_trap();
     dirty->batch_state=0;
-    if ((state&DIRTY_BATCH_REVISIT) && dirty->count && !r->stopping) {
+    /* An unchanged failed prefix cannot make progress by requeueing itself.
+     * Busy aliases and writers publish their own retry when they release. */
+    if (!result && (state&DIRTY_BATCH_REVISIT) && dirty->count && !r->stopping) {
         r->requested=1;
         cache_wake(&r->work);
     }
@@ -973,20 +978,24 @@ static size_t dirty_batch(struct kernel_page_cache_record *r,struct kernel_page_
         struct kernel_page_cache_entry key={.page_index=r->dirty_scan_index};
         struct kernel_page_cache_entry *entry=RB_NFIND(kernel_page_cache_dirty_tree,&dirty->tree,&key);
         if (!entry) {r->dirty_cursor=dirty->queue_next;r->dirty_scan_index=0;continue;}
-        if (!all && !node_pressure(entry->node,r,1)) {
-            uint64_t skip=dirty->count<r->dirty_remaining?dirty->count:r->dirty_remaining;
-            r->dirty_remaining-=skip;r->dirty_cursor=dirty->queue_next;r->dirty_scan_index=0;scanned++;
-            continue;
-        }
         if (count && entry->node!=batch[0]->node) break;
+        int skip=!all && !node_pressure(entry->node,r,1);
 #if BOAROS_MAX_CPUS > 1
-        if (dirty->batch_state) {
+        if (!skip && dirty->batch_state) {
             dirty->batch_state|=DIRTY_BATCH_REVISIT;
-            uint64_t skip=dirty->count<r->dirty_remaining?dirty->count:r->dirty_remaining;
-            r->dirty_remaining-=skip;r->dirty_cursor=dirty->queue_next;r->dirty_scan_index=0;scanned++;
-            continue;
+            skip=1;
         }
 #endif
+        if (skip) {
+            /* A prefix of this inode may already have used the round budget.
+             * Charging its full size again would hide the next dirty inode. */
+            if (!r->dirty_scan_index) {
+                uint64_t pages=dirty->count<r->dirty_remaining?dirty->count:r->dirty_remaining;
+                r->dirty_remaining-=pages;
+            }
+            r->dirty_cursor=dirty->queue_next;r->dirty_scan_index=0;scanned++;
+            continue;
+        }
         while (entry && r->dirty_remaining && scanned<64 && count<capacity) {
             r->dirty_scan_index=entry->page_index+1;
             r->dirty_remaining--;scanned++;r->statistics.worker_scanned++;
@@ -1772,6 +1781,40 @@ enum kernel_page_cache_status kernel_page_cache_lookup(
     if (!read_entry_ready(entry)) return entry_load_status(entry) ? entry_load_status(entry) : KERNEL_PAGE_CACHE_STATUS_BUSY;
     take_read_page(cache,entry,address,valid,entry_valid_bytes(entry));
     return KERNEL_PAGE_CACHE_STATUS_OK;
+}
+
+unsigned kernel_page_cache_acquire_ready(struct kernel_page_cache *cache,
+    const struct kernel_vfs_file *file, uint64_t first, unsigned selected,
+    uint64_t *addresses, unsigned capacity)
+{
+    _Static_assert(KERNEL_PAGE_CACHE_READY_WINDOW <= PHYSICAL_PAGE_REFERENCE_BATCH_MAX &&
+        KERNEL_PAGE_CACHE_READY_WINDOW < 32, "bounded cache and physical reference batch");
+    if (!selected || !capacity) return 0;
+    struct kernel_vfs_node *node = kernel_vfs_file_node(file);
+    if (!cache_live(cache) || !node || !addresses ||
+        selected >> KERNEL_PAGE_CACHE_READY_WINDOW) __builtin_trap();
+#if BOAROS_MAX_CPUS > 1
+    CACHE_INDEX_SCOPE(guard, node);
+    if (node->cache_index_closed) return 0;
+#else
+    CACHE_SCOPE(guard, cache);
+#endif
+    if (!read_cache_open(node)) return 0;
+    uint64_t size = kernel_vfs_node_size(node);
+    unsigned acquired = 0, count = 0;
+    struct kernel_page_cache_entry *entry = index_at_or_after(node, first);
+    while (entry && count < capacity && entry->page_index - first < KERNEL_PAGE_CACHE_READY_WINDOW) {
+        unsigned bit = 1U << (entry->page_index - first);
+        if (bit > selected || !size || entry->page_index > (size - 1) >> BOAROS_PAGE_SHIFT) break;
+        if ((selected & bit) && read_entry_ready(entry)) {
+            addresses[count++] = entry->physical_address;
+            acquired |= bit;
+            note_read_hit(cache, entry, 0);
+        }
+        entry = RB_NEXT(kernel_page_cache_tree, &node->cache_pages, entry);
+    }
+    physical_page_acquire_batch(cache->allocator, addresses, count);
+    return acquired;
 }
 
 /* 未发布的候选持有自己的node/page；分配完成后才在cache保护内竞争发布。 */
@@ -2952,6 +2995,20 @@ struct writeback_workspace {
     struct file_write_span *spans;
     struct kernel_page_cache_entry **selected;
 };
+#if BOAROS_USER_SMP
+/* count publishes both the selected entry loans and exclusive use of the
+ * workspace. Only the consuming thread returns the loans, including on stop. */
+struct writeback_lane {
+    struct kernel_page_cache *cache;
+    struct kernel_thread_join worker;
+    struct kernel_wait_queue work;
+    struct writeback_workspace workspace;
+    uint64_t round_start_pages;
+    int round_waiting;
+    struct kernel_page_cache_entry *batch[BOAROS_PAGE_CACHE_WRITEBACK_PAGES];
+    size_t count;
+};
+#endif
 static int writeback_workspace_init(struct kernel_page_cache *cache,struct writeback_workspace *work)
 {
     size_t count=BOAROS_PAGE_CACHE_WRITEBACK_PAGES;
@@ -3282,7 +3339,7 @@ static void reclaim_window_memory(struct kernel_page_cache *cache)
  * version, so the batch never requires physically contiguous snapshot storage. */
 static int writeback_run(struct kernel_page_cache *cache,
     struct kernel_page_cache_entry **entries,size_t count,uint64_t limit,size_t *used,
-    struct writeback_workspace *workspace)
+    struct writeback_workspace *workspace,int background)
 {
     if (!count || count>BOAROS_PAGE_CACHE_WRITEBACK_PAGES) __builtin_trap();
     reclaim_window_memory(cache);
@@ -3303,7 +3360,6 @@ static int writeback_run(struct kernel_page_cache *cache,
     }
     struct prepared_writeback *prepared=workspace->prepared;
     struct file_write_span *spans=workspace->spans;
-    const int background=kernel_page_cache_is_executor(cache) && kernel_io_context_current()->background_reclaim;
     for (size_t first=0;first<count;) {
         memset(prepared,0,(count-first)*sizeof(*prepared));
         memset(spans,0,(count-first)*sizeof(*spans));
@@ -3422,7 +3478,7 @@ static void write_admission_window(void *argument)
     }
     if (count) {
         size_t used;
-        int error=writeback_run(cache,selected,count,UINT64_MAX,&used,workspace);
+        int error=writeback_run(cache,selected,count,UINT64_MAX,&used,workspace,0);
         request->advanced=!error && used!=0;
         /* 写回已把错误记在实际inode；不能把A的空间/I/O错误归给B的覆盖写。
          * 失败队首仍保留脏owner，但移到队尾，让后面的可回收数据取得进展。 */
@@ -3437,7 +3493,7 @@ static void write_admission_window(void *argument)
         CACHE_SCOPE(guard,cache);
         struct kernel_page_cache_dirty *dirty=kernel_vfs_node_dirty_pages(selected[0]->node);
 #if BOAROS_MAX_CPUS > 1
-        if (request->independent_batch) dirty_batch_return(r,selected[0]->node);
+        if (request->independent_batch) dirty_batch_return(r,selected[0]->node,error);
 #endif
         if (error && dirty->queue_next) {
             if (dirty->queue_previous) dirty->queue_previous->queue_next=dirty->queue_next;
@@ -3585,7 +3641,7 @@ static void writeback_window(void *argument)
     if (!count) { request->done=1; return; }
     /* 窗口只借用本批条目；下一次提交前重查索引，截断可退休其余页。 */
     request->cursor=request->selected[count-1]->page_index+1;
-    request->result=writeback_run(cache,request->selected,count,request->end,&used,request->workspace);
+    request->result=writeback_run(cache,request->selected,count,request->end,&used,request->workspace,0);
     {
         CACHE_SCOPE(guard,cache);
         for (size_t i=0;i<count;i++) entry_return(request->selected[i]);
@@ -4010,6 +4066,68 @@ static void pressure_wait(void *context)
     }
 }
 
+static void write_dirty_batch(struct kernel_page_cache *cache,
+    struct kernel_page_cache_entry **batch,size_t count,struct writeback_workspace *workspace)
+{
+    struct kernel_page_cache_record *r=cache->record;
+    size_t used;
+    int result=writeback_run(cache,batch,count,UINT64_MAX,&used,workspace,1);
+    {
+        CACHE_SCOPE(guard,cache);
+        if (!result) r->statistics.worker_written+=used;
+        else if (result!=-KERNEL_EBUSY && result!=-KERNEL_ENOMEM) r->statistics.worker_failed+=used;
+#if BOAROS_MAX_CPUS > 1
+        dirty_batch_return(r,batch[0]->node,result);
+#endif
+        for (size_t i=0;i<count;i++) entry_return(batch[i]);
+    }
+    reclaim_window_memory(cache);
+}
+
+/* The main worker accounts for both writebacks and wakes pressure waiters
+ * only after every batch in this round has returned its entry loans. */
+static void complete_writeback_round(struct kernel_page_cache *cache,uint64_t before)
+{
+    struct kernel_page_cache_record *r=cache->record;
+    if (!r->dirty_pages) r->force_writeback=0;
+    r->completed++;
+    group_complete(r,physical_page_available(cache->allocator)>before);
+}
+
+#if BOAROS_USER_SMP
+static void independent_writeback_worker(void *argument)
+{
+    struct writeback_lane *lane=argument;
+    struct kernel_page_cache *cache=lane->cache;
+    struct kernel_io_context *io=kernel_io_context_current();
+    io->background_reclaim=1;
+    for (;;) {
+        struct kernel_wait_token token={0};
+        size_t count;
+        {
+            CACHE_SCOPE(guard,cache);
+            count=lane->count;
+            if (!count) {
+                if (cache->record->stopping) break;
+                if (kernel_wait_prepare(&lane->work,0,0,&token)) __builtin_trap();
+            }
+        }
+        if (!count) {
+            enum kernel_wait_wake_reason reason;
+            if (kernel_wait_park(&token,&reason) || kernel_wait_finish(&token)) __builtin_trap();
+            continue;
+        }
+        write_dirty_batch(cache,lane->batch,count,&lane->workspace);
+        {
+            CACHE_SCOPE(guard,cache);
+            lane->count=0;
+            if (lane->round_waiting) cache_wake(&cache->record->work);
+        }
+    }
+    io->background_reclaim=0;
+}
+#endif
+
 /* 单个worker不能等待自己尚未执行的冷读；忙写回由真实结束事件重试。 */
 static void cache_yield(void)
 {
@@ -4042,26 +4160,24 @@ static void cache_background(struct kernel_page_cache *cache)
             if (count) kernel_vfs_node_dirty_pages(batch[0]->node)->batch_state=DIRTY_BATCH_OWNED;
 #endif
             if (!count && (!r->dirty_cursor || !r->dirty_remaining)) break;
-        }
-        if (count) {
-            size_t used;
-            int result=writeback_run(cache,batch,count,UINT64_MAX,&used,r->writeback_workspace);
-            {
-                CACHE_SCOPE(guard,cache);
-                if (!result) r->statistics.worker_written+=used;
-                else if (result!=-KERNEL_EBUSY && result!=-KERNEL_ENOMEM) r->statistics.worker_failed+=used;
-#if BOAROS_MAX_CPUS > 1
-                dirty_batch_return(r,batch[0]->node);
-#endif
-                for (size_t i=0;i<count;i++) entry_return(batch[i]);
+#if BOAROS_USER_SMP
+            if (count && r->lane && !r->lane->count && r->dirty_head!=r->dirty_tail &&
+                batch[0]->node->instance->ops->file_operation_execution==KERNEL_VFS_EXECUTION_CALLER) {
+                memcpy(r->lane->batch,batch,count*sizeof(*batch));
+                r->lane->count=count;
+                cache_wake(&r->lane->work);
+                count=0;
             }
-            reclaim_window_memory(cache);
+#endif
         }
-        int demands;
-        { CACHE_SCOPE(guard,cache); demands=r->reads_head!=0; r->statistics.worker_batches++; }
-        if (demands) {
-            CACHE_SCOPE(guard,cache); r->requested=1; interrupted=1;
-            break;
+        if (count) write_dirty_batch(cache,batch,count,r->writeback_workspace);
+        {
+            CACHE_SCOPE(guard,cache);
+            r->statistics.worker_batches++;
+            if (r->reads_head) {
+                r->requested=1;interrupted=1;
+                break;
+            }
         }
         cache_yield();
     }
@@ -4078,10 +4194,15 @@ static void cache_background(struct kernel_page_cache *cache)
             }
 #endif
         }
-        if (!r->dirty_pages) r->force_writeback=0;
-        r->completed++;
+#if BOAROS_USER_SMP
+        if (r->lane && r->lane->count) {
+            r->lane->round_start_pages=before;
+            r->lane->round_waiting=1;
+            return;
+        }
+#endif
+        complete_writeback_round(cache,before);
     }
-    group_complete(r,physical_page_available(cache->allocator)>before);
 }
 static void page_cache_worker(void *argument)
 {
@@ -4093,23 +4214,34 @@ static void page_cache_worker(void *argument)
     for (;;) {
         struct cache_request *request = 0;
         struct kernel_wait_token token = {0};
-        int cleanup = 0, stopping=0, park=1;
+        int cleanup = 0, stopping=0, park=1, waiting_batch=0;
         {
             CACHE_SCOPE(check, cache);
             stopping=r->stopping;
+#if BOAROS_USER_SMP
+            /* Only this worker finishes rounds. While the dispatched batch
+             * owns its loans, continue serving queued foreground requests. */
+            if (r->lane && r->lane->round_waiting) {
+                if (r->lane->count) waiting_batch=1;
+                else {
+                    r->lane->round_waiting=0;
+                    complete_writeback_round(cache,r->lane->round_start_pages);
+                }
+            }
+#endif
 #if BOAROS_PAGE_CACHE_DIRTY_AGE
             if (!stopping && r->dirty_deadline && kernel_time_monotonic_ns()>=r->dirty_deadline) {
                 r->dirty_deadline=0;r->expired_writeback=1;r->requested=1;
             }
 #endif
-            if (r->requested && (reads>=16 || !r->reads_head)) {
+            if (r->requested && !waiting_batch && (reads>=16 || !r->reads_head)) {
                 r->requested=0; cleanup=1; reads=0;
             } else if (r->reads_head) {
                 request = r->reads_head; r->reads_head = request->next;
                 if (!r->reads_head) r->reads_tail = &r->reads_head;
                 r->reads_running++; reads++;
             } else if (cleanup_entries) cleanup=2;
-            else if (r->stopping) break;
+            else if (r->stopping && !waiting_batch) break;
             else {
                 uint64_t deadline=0;
 #if BOAROS_PAGE_CACHE_DIRTY_AGE
@@ -4128,7 +4260,7 @@ static void page_cache_worker(void *argument)
 #if BOAROS_MAX_CPUS > 1
                 KERNEL_RAW_SCOPE(group,&r->group->metadata);
 #endif
-                park=!r->requested;
+                park=waiting_batch || !r->requested;
             }
         }
         if (!request) {
@@ -4196,7 +4328,7 @@ static void page_cache_worker(void *argument)
 
 
 
-int kernel_page_cache_start_worker(struct kernel_page_cache *cache)
+int kernel_page_cache_start_executor(struct kernel_page_cache *cache)
 {
     if (!cache_live(cache) || cache->record->started) return -KERNEL_EINVAL;
     struct kernel_page_cache_record *r = cache->record;
@@ -4231,7 +4363,22 @@ int kernel_page_cache_start_worker(struct kernel_page_cache *cache)
         return result == KERNEL_SCHEDULER_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EINVAL;
     }
     { CACHE_SCOPE(publish,cache); r->dirty_cursor=NULL; r->dirty_remaining=0; r->started = 1; }
+    kernel_page_cache_notify_pressure(cache);
+    return 0;
+}
+
+/* The caller owns mount startup. Its task can join the published threads on
+ * failure, and a secondary target has already entered the scheduler. */
+int kernel_page_cache_start_background(struct kernel_page_cache *cache)
+{
+    if (!cache_live(cache) || !cache->record->started || cache->record->stopping)
+        return -KERNEL_EINVAL;
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES || BOAROS_USER_SMP
+    struct kernel_page_cache_record *r=cache->record;
+    enum kernel_scheduler_status result;
+#endif
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+    if (r->readahead_started) return -KERNEL_EINVAL;
     kernel_wait_queue_init(&r->readahead_work);
     result = kernel_thread_create_joinable(readahead_worker, cache, &r->readahead_worker);
     if (result != KERNEL_SCHEDULER_STATUS_OK) {
@@ -4240,8 +4387,37 @@ int kernel_page_cache_start_worker(struct kernel_page_cache *cache)
     }
     { CACHE_SCOPE(publish, cache); r->readahead_started = 1; }
 #endif
-    kernel_page_cache_notify_pressure(cache);
+#if BOAROS_USER_SMP
+    unsigned cpus=kernel_cpu_get_boot_count();
+    if (cpus>1) {
+        if (r->lane) return -KERNEL_EINVAL;
+        struct writeback_lane *lane=NULL;
+        if (kernel_heap_allocate_zeroed(cache->heap,1,sizeof(*lane),(void **)&lane) ||
+            writeback_workspace_init(cache,&lane->workspace)) {
+            if (lane) kernel_heap_release(cache->heap,lane);
+            kernel_page_cache_stop_worker(cache);
+            return -KERNEL_ENOMEM;
+        }
+        lane->cache=cache;
+        kernel_wait_queue_init(&lane->work);
+        result=kernel_thread_create_joinable_worker(independent_writeback_worker,lane,&lane->worker,cpus-1);
+        if (result) {
+            writeback_workspace_release(cache,&lane->workspace);
+            kernel_heap_release(cache->heap,lane);
+            kernel_page_cache_stop_worker(cache);
+            return result==KERNEL_SCHEDULER_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+        }
+        CACHE_SCOPE(publish,cache);
+        r->lane=lane;
+    }
+#endif
     return 0;
+}
+
+int kernel_page_cache_start_worker(struct kernel_page_cache *cache)
+{
+    int error=kernel_page_cache_start_executor(cache);
+    return error ? error : kernel_page_cache_start_background(cache);
 }
 
 void kernel_page_cache_stop_worker(struct kernel_page_cache *cache)
@@ -4276,7 +4452,19 @@ void kernel_page_cache_stop_worker(struct kernel_page_cache *cache)
     }
 #endif
     cache_wake(&r->work);
+#if BOAROS_USER_SMP
+    if (r->lane) cache_wake(&r->lane->work);
+#endif
     kernel_thread_join(&r->worker);
+#if BOAROS_USER_SMP
+    if (r->lane) {
+        kernel_thread_join(&r->lane->worker);
+        if (r->lane->count) __builtin_trap();
+        writeback_workspace_release(cache,&r->lane->workspace);
+        kernel_heap_release(cache->heap,r->lane);
+        r->lane=NULL;
+    }
+#endif
     version_pool_unreserve(r->versions);r->writeback_capacity=0;
     writeback_workspace_release(cache,r->writeback_workspace);
     kernel_heap_release(cache->heap,r->writeback_workspace);

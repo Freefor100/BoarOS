@@ -4,6 +4,7 @@
 #include <kernel/rlimit.h>
 #include <kernel/task.h>
 #include <kernel/vma.h>
+#include <arch/mmu.h>
 #include <kernel/shm.h>
 
 #include <stddef.h>
@@ -226,6 +227,21 @@ static uint32_t lower_bound(const struct kernel_vma_set *set,
         }
     }
     return low;
+}
+
+/* The caller holds the MM operation lock. Include the interval containing
+ * start, then walk only the sorted entries overlapping the requested range. */
+int kernel_vma_set_has_shm(const struct kernel_vma_set *set,
+                           uint64_t start, uint64_t length)
+{
+    if (!set || !length || start >= ARCH_MMU_USER_LIMIT ||
+        length > ARCH_MMU_USER_LIMIT - start) return 0;
+    uint64_t end = start + length;
+    uint32_t index = lower_bound(set, start);
+    if (index && set->entries[index - 1].end > start) index--;
+    for (; index < set->count && set->entries[index].start < end; index++)
+        if (set->entries[index].shm_attachment) return 1;
+    return 0;
 }
 
 uint32_t kernel_vma_set_count(const struct kernel_vma_set *set)

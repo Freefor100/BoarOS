@@ -85,6 +85,12 @@ static int64_t futex_wake(const struct kernel_futex_key *source,
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         if (futex_pi_conflict_locked(bucket,source))return -KERNEL_EINVAL;
     }
+    /* Registration and requeue both take this bucket's operation lock.
+     * An empty source stays empty until this operation returns. */
+    if (!kernel_wait_queue_registrations(queue)) {
+        if (moved_count) *moved_count=0;
+        return 0;
+    }
     if (!target_bucket) {
         struct kernel_wait_token tokens[16];
         int short_scan=0;

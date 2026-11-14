@@ -15,6 +15,9 @@ struct kernel_random_state {
 };
 
 static struct kernel_random_state random_state;
+static struct kernel_raw_lock key_lock = {
+    .rank = KERNEL_RAW_RANK_WAIT_QUEUE, .initialized = KERNEL_RAW_INITIALIZED
+};
 static struct kernel_wait_queue ready_queue;
 
 void kernel_random_erase(void *buffer, size_t size)
@@ -128,7 +131,7 @@ struct kernel_wait_queue *kernel_random_wait_queue(void)
 
 unsigned kernel_random_credited_bits(void) { return random_state.credited_bits; }
 int kernel_random_ready(void) { return random_state.credited_bits == 256U; }
-int kernel_random_available(void) { return random_state.seeded != 0U; }
+int kernel_random_available(void) { return __atomic_load_n(&random_state.seeded, __ATOMIC_ACQUIRE) != 0U; }
 
 void kernel_random_mix(const void *data, size_t size)
 {
@@ -137,13 +140,13 @@ void kernel_random_mix(const void *data, size_t size)
     if (!data) return;
     while (size) {
         size_t n = size > 32U ? 32U : size;
-        uintptr_t irq = arch_interrupt_save();
-        memcpy(input, random_state.key, 32U);
-        memcpy(input + 32U, p, n);
-        /* 有界压缩在关中断区完成，避免 IRQ 混种被旧快照覆盖。 */
-        kernel_blake2s(input, 32U + n, (uint8_t *)random_state.key);
-        random_state.seeded = 1U;
-        arch_interrupt_restore(irq);
+        {
+            KERNEL_IRQ_LOCK_SCOPE(guard, &key_lock);
+            memcpy(input, random_state.key, 32U);
+            memcpy(input + 32U, p, n);
+            kernel_blake2s(input, 32U + n, (uint8_t *)random_state.key);
+            __atomic_store_n(&random_state.seeded, 1U, __ATOMIC_RELEASE);
+        }
         p += n;
         size -= n;
     }
@@ -194,12 +197,14 @@ enum kernel_random_status kernel_random_fill(void *buffer, size_t size)
     uint32_t counter = 1U;
     if (!buffer && size) return KERNEL_RANDOM_STATUS_INVALID_ARGUMENT;
     if (!size) return KERNEL_RANDOM_STATUS_OK;
-    uintptr_t irq = arch_interrupt_save();
-    memcpy(key, random_state.key, sizeof(key));
-    kernel_random_chacha20_block(key, nonce, 0U, block);
-    /* 首半块仅作为新全局 key；调用者只能看到后半块和旧 key 的独立流。 */
-    memcpy(random_state.key, block, 32U);
-    arch_interrupt_restore(irq);
+    {
+        /* Each caller takes a distinct key; only ratcheting the shared key
+         * needs exclusion against other CPUs and interrupt-time mixing. */
+        KERNEL_IRQ_LOCK_SCOPE(guard, &key_lock);
+        memcpy(key, random_state.key, sizeof(key));
+        kernel_random_chacha20_block(key, nonce, 0U, block);
+        memcpy(random_state.key, block, 32U);
+    }
     size_t n = size > 32U ? 32U : size;
     memcpy(p, block + 32U, n);
     p += n; size -= n;
