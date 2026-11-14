@@ -3,6 +3,8 @@
 #include <kernel/mm_backend.h>
 #include <kernel/signal.h>
 #include <kernel/time.h>
+#include <kernel/ptrace.h>
+#include <kernel/namespace.h>
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -21,6 +23,16 @@ static struct kernel_wait_queue *join_borrow_queue;
 static unsigned join_borrow_returned;
 /* This scheduler-only fixture creates neither event FDs nor dispositions. */
 uint64_t kernel_timer_fd_next;
+/* These scheduler actors have no tracer or namespace owners. Check that
+ * boundary explicitly when the production lifetime path reaches it. */
+int kernel_ptrace_switch_finish_locked(struct kernel_task *task,struct kernel_ptrace_notice *notice)
+{ (void)notice;assert(!task->ptrace);return 0; }
+void kernel_ptrace_switch_notify(struct kernel_ptrace_notice *notice)
+{ assert(!notice->tracer && !notice->child && !notice->waiters.queue); }
+void kernel_ptrace_dispose(struct kernel_task *task)
+{ assert(!task->ptrace); }
+void kernel_namespace_put(struct kernel_namespace *ns)
+{ assert(!ns); }
 int kernel_signal_has_pending(const struct kernel_task *task)
 { (void)task;__builtin_trap(); /* These kernel actors have no signal state. */ }
 enum kernel_signal_status kernel_signal_release_table(struct kernel_task *task)
@@ -211,6 +223,32 @@ static void fair_slice_case(uint32_t slice)
     assert(!running.scheduling.fair_slice_used);
 }
 
+static void deferred_slice_case(void)
+{
+    for (unsigned rr=0;rr<2;rr++) {
+        setup(rr?KERNEL_SCHED_RR:KERNEL_SCHED_OTHER,rr?50:0,rr?50:0);
+        running.scheduling.fair_slice_used=100000000;
+        running.scheduling.rr_remaining_ns=0;
+        kernel_preempt_disable();
+        for (unsigned irq=0;irq<4;irq++) {
+            assert(!scheduler_reschedule(0,0,1));
+            assert(!timer_request && !switches && cpu.current==&running);
+            assert(running.scheduling.fair_slice_used==100000000 &&
+                   !running.scheduling.rr_remaining_ns && kernel_cpu_schedule_requested(&cpu));
+        }
+        /* An unrelated wait deadline must still fire while a task-only
+         * qualification delays the actual context switch. */
+        { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+          ready_remove_locked(&peer);peer.wait.deadline=73;deadline_index_insert(&peer); }
+        assert(!scheduler_reschedule(0,0,0) && timer_request==73 && !switches);
+        { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+          deadline_index_remove(&peer);peer.wait.deadline=0;ready_enqueue_locked(&peer,0); }
+        kernel_preempt_enable();
+        assert(!scheduler_reschedule(1,0,1) && switches==1 && selected==&peer);
+    }
+    puts("deferred expired fair/RR slices preserve external deadlines without immediate-IRQ livelock");
+}
+
 static void private_storage_case(void)
 {
     memset(metadata_arena, 0xa7, sizeof(metadata_arena));
@@ -278,6 +316,7 @@ static void join_cursor_lifetime_case(void)
 }
 int main(int argc,char **argv)
 {
+    deferred_slice_case();
     fair_slice_case(100000);fair_slice_case(30000000);fair_slice_case(100000000);
     setup(KERNEL_SCHED_OTHER,0,0);
     running.scheduling.fair_slice_ns=100000;running.scheduling.fair_slice_used=5000000;

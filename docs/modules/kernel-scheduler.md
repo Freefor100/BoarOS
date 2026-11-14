@@ -160,7 +160,7 @@ ready 策略直接选择下一任务。退出栈只切离，回收仍由 worker 
 
 全局预算配置默认 period=1,000,000us、runtime=950,000us，消费量和结算起点按CPU保存；仅运行中的 FIFO/RR 扣费，阻塞及 idle 不扣。周期补充不积累旧余额；runtime=-1 禁用节流，0 不允许运行 RT。控制更新在调度短锁内先结算各CPU在旧配置下的实际运行，校验 period>0、runtime>=-1 且 runtime<=period（-1除外）、两值均不超过 INT_MAXus。runtime 修改不清消费；相同 period 写入不重开周期，改变 period 时从当前时刻建立新长度但保留已消费值。proc 控件见 [procfs](procfs.md)。
 
-硬件 timer 的最后编程期限由当前CPU持有，取普通 tick、该CPU的RT配额耗尽/补充和当前任务RR片尾中的最早期限。预算 IRQ 可以返回 elapsed_ticks=0；此时仍重新记账调度，但不推进 tick、CPU tick 统计或 coarse clock。实际运行时间由切换、策略/配置修改和 timer 入口结算，精度受关中断临界区与模拟器 IRQ 延迟限制。用户访问复制与可睡眠路径不放在调度状态锁内。
+硬件 timer 的最后编程期限由当前CPU持有，取普通 tick、该CPU的RT配额耗尽/补充和当前任务RR片尾中的最早期限。预算 IRQ 可以返回 elapsed_ticks=0；此时仍重新记账调度，但不推进 tick、CPU tick 统计或 coarse clock。实际运行时间由切换、策略/配置修改和 timer 入口结算，精度受关中断临界区与模拟器 IRQ 延迟限制。禁止抢占期间仍记录待调度请求并处理等待、timerfd 和 POSIX timer 的期限，但不重装当前任务的时间片或 RT 执行预算期限；这些期限无法使当前任务切离，耗尽后反复设为立即到期会使原临界区无法继续执行。周期中断保持运行，退出禁止抢占范围后在原安全边界消费待调度请求。用户访问复制与可睡眠路径不放在调度状态锁内。
 
 IRQ关闭的短入口复用同一次CPU/current定位，借用在切换或可睡眠服务前结束；
 缺页服务使用当前执行owner固定的task/MM，不把CPU指针带过睡眠。RV/LA timer
