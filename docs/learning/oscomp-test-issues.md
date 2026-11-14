@@ -345,3 +345,17 @@ rewind 重新遍历挂载时仍使用该根。BoarOS 当前沿生成文件机制
 ### 原RV glibc IOzone在通用main版本标识下的准备失败（2026-11-11）
 
 本次临时32/128MiB工作盘直接使用官方`/glibc/iozone`及原loader；通用main返回`uname.release=0.1.0-boaros-dev`，原glibc loader因要求Linux 4.15而打印`FATAL: kernel too old`，IOzone main尚未执行。compat当前已有`4.15.0`标识。有限性能对照对双方统一应用该既有compat常量后，原glibc/musl四个IOzone窗口均正常执行；没有改原ELF或libc，不分类为文件I/O错误。专用标识与输入身份见[本次数据路径记录](data-path-budget-experiments.md#2026-11-11共同路径候选与文件网络归因)。
+
+
+### 本地namespace并发fixture：旧分配尺寸握手失效（2026-11-14）
+
+这不是盘内原程序失败。`tests/host/namespace_cases.h`的pause=2按
+`sizeof(kernel_vfs_path)+5`拦截分配，但现有path_wrap已把dentry／name分离，只申请
+`sizeof(path)`，lookup线程成功退出后，控制线程仍等待永远不会置位的entered[0]。
+当前缓存回收版及采用旧VFS/page-cache源码的同fixture对照，都在第407行同点超时；
+该结果未记为内核通过，也不归因到本次transient owner或退休队列改动。
+测试回调已同步现有umask参数及字段名；本批没有重写这份旧握手。
+
+本批实际验收由真实分配耗尽、只读／可写缓存、无设备I/O回收及lazy-detach交错覆盖。
+源码副本、命令和两个线程回溯在主工作区`build/host/namespace-metadata-review/`，
+直接验证记录在`build/host/cache-metadata-review/validation.txt`。
