@@ -11,6 +11,52 @@ static unsigned window_allocate_entered,window_allocate_resume;
 static _Thread_local unsigned window_pause_after_get;
 static unsigned window_get_entered,window_get_resume;
 static uint64_t window_get_address;
+static _Thread_local unsigned window_fail_nosleep,window_nosleep_failures;
+static _Thread_local struct {
+    struct physical_page_allocator *pages;
+    uint64_t *borrowed;
+    size_t count,capacity;
+    unsigned armed,triggered;
+} window_oom_order;
+static void window_borrow_after_optional(void)
+{
+    if (!window_oom_order.armed) return;
+    window_oom_order.armed=0;window_oom_order.triggered++;
+    assert(!kernel_cpu_current()->raw_locks);
+    for (;;) {
+        uint64_t address;
+        enum physical_page_status status=physical_page_allocate_order_nosleep(window_oom_order.pages,0,&address);
+        if (status==PHYSICAL_PAGE_STATUS_EMPTY) break;
+        assert(!status && window_oom_order.count<window_oom_order.capacity);
+        window_oom_order.borrowed[window_oom_order.count++]=address;
+    }
+    assert(window_oom_order.count && !physical_page_available(window_oom_order.pages));
+    printf("fault-around OOM order: first optional metadata succeeded; borrowed=%zu actual_free=0\n",
+        window_oom_order.count);
+}
+enum kernel_heap_status __real_kernel_heap_allocate_nosleep(struct kernel_heap *,size_t,void **);
+enum kernel_heap_status __real_kernel_heap_allocate_zeroed_nosleep(struct kernel_heap *,size_t,size_t,void **);
+enum kernel_heap_status __wrap_kernel_heap_allocate_nosleep(struct kernel_heap *heap,size_t bytes,void **out)
+{
+    if (window_fail_nosleep) {
+        window_nosleep_failures++;
+        return KERNEL_HEAP_STATUS_EMPTY;
+    }
+    enum kernel_heap_status status=__real_kernel_heap_allocate_nosleep(heap,bytes,out);
+    if (!status) window_borrow_after_optional();
+    return status;
+}
+enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed_nosleep(struct kernel_heap *heap,
+    size_t count,size_t size,void **out)
+{
+    if (window_fail_nosleep) {
+        window_nosleep_failures++;
+        return KERNEL_HEAP_STATUS_EMPTY;
+    }
+    enum kernel_heap_status status=__real_kernel_heap_allocate_zeroed_nosleep(heap,count,size,out);
+    if (!status) window_borrow_after_optional();
+    return status;
+}
 enum kernel_page_cache_status __real_kernel_page_cache_get_for_fault(struct kernel_page_cache *,
     const struct kernel_vfs_file *,uint64_t,uint64_t *,size_t *,int,int);
 enum kernel_page_cache_status __wrap_kernel_page_cache_get_for_fault(struct kernel_page_cache *cache,
@@ -312,6 +358,302 @@ static unsigned char window_mm_read(struct kernel_mm *mm,uint64_t context,uint64
     assert(!kernel_copy_from_user(mm,&value,address,1,&copied) && copied==1);
     mm_test_bind(NULL);mm_test_context=0;return value;
 }
+static void window_mm_faultaround(struct kernel_page_cache *cache,struct kernel_heap *heap,
+    struct physical_page_allocator *pages,struct kernel_open_file_description *file)
+{
+    if (BOAROS_PAGE_CACHE_READAHEAD_PAGES<3) return;
+    const uint64_t base=0x400000,p=BOAROS_PAGE_SIZE;
+    reset_window(cache,file);struct window_mm view={0};window_mm_create(&view,heap,pages);
+    window_map(&view,file,base,3*p);
+    assert(!kernel_mm_mprotect(&view.mm,base,3*p,KERNEL_MM_READ|KERNEL_MM_WRITE));
+    assert(window_mm_read(&view.mm,view.context,base)==0x30);
+    uint64_t cached[3];
+    for (unsigned i=0;i<3;i++) {
+        struct kernel_mm_mapping mapping;size_t valid;uint32_t references;
+        enum kernel_mm_status status=kernel_mm_lookup(&view.mm,base+i*p,&mapping);
+        printf("fault-around first read: page=%u lookup=%u\n",i,status);
+        assert(!status && (mapping.permissions&(KERNEL_MM_READ|KERNEL_MM_WRITE|KERNEL_MM_EXECUTE))==KERNEL_MM_READ);
+        assert(!kernel_page_cache_lookup(cache,&file->file,i,&cached[i],&valid) && valid==p &&
+            mapping.physical_address==cached[i]);
+        assert(!physical_page_release(pages,cached[i]));
+        assert(!physical_page_reference_count(pages,cached[i],&references) && references==2);
+        const unsigned char *bytes=access_page(cached[i]);
+        for (size_t j=0;j<p;j++) assert(bytes[j]==0x30+i);
+    }
+    struct kernel_mm_mapping mapping;
+    assert(kernel_mm_lookup(&view.mm,base+3*p,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    unsigned reads=source_reads;unsigned char byte=0xe7;size_t copied;
+    mm_test_bind(&view.mm);mm_test_context=view.context;
+    assert(!kernel_copy_to_user(&view.mm,base+p,&byte,1,&copied) && copied==1);
+    mm_test_bind(NULL);mm_test_context=0;
+    assert(!kernel_mm_lookup(&view.mm,base+p,&mapping) &&
+        mapping.physical_address!=cached[1] && (mapping.permissions&KERNEL_MM_WRITE));
+    assert(window_mm_read(&view.mm,view.context,base+p)==byte && source_reads==reads &&
+        *(unsigned char *)access_page(cached[1])==0x31);
+    assert(!kernel_mm_munmap(&view.mm,base,3*p));
+    for (unsigned i=0;i<3;i++) {
+        uint32_t references;
+        assert(kernel_mm_lookup(&view.mm,base+i*p,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+        assert(!physical_page_reference_count(pages,cached[i],&references) && references==1);
+    }
+    window_mm_close(&view,pages);demand_idle(cache,0);
+    puts("PASS first private read maps READY neighbours read-only with real COW; VMA bound, cache bytes and final owners retained");
+}
+static void window_ready_pair(struct kernel_page_cache *cache,struct kernel_open_file_description *file)
+{
+    reset_window(cache,file);
+    for (unsigned i=0;i<2;i++) {
+        struct kernel_open_file_page_preparation prepared={0};
+        assert(!kernel_open_file_prepare_mapping_page(file,i,0,&prepared));
+        kernel_open_file_finish_mapping_page(file,&prepared,0);
+    }
+    assert(source_reads==2);
+}
+struct window_hot_lookup {
+    struct kernel_page_cache *cache;
+    struct kernel_open_file_description *file;
+    uint64_t address;
+    size_t valid;
+    unsigned entered,start,done;
+    int resident;
+    enum kernel_page_cache_status status;
+};
+static void *window_hot_lookup_actor(void *argument)
+{
+    struct window_hot_lookup *call=argument;cache_test_attach(1);
+    __atomic_store_n(&call->entered,1,__ATOMIC_RELEASE);wait_progress(&call->start,1);
+    call->resident=kernel_page_cache_resident(call->cache,&call->file->file,0);
+    call->status=kernel_page_cache_lookup(call->cache,&call->file->file,0,&call->address,&call->valid);
+    __atomic_store_n(&call->done,1,__ATOMIC_RELEASE);return NULL;
+}
+static int window_hot_lookup(struct kernel_page_cache *cache,struct kernel_open_file_description *file)
+{
+    window_ready_pair(cache,file);
+    struct kernel_page_cache_concurrency_state state;
+    observe_cache_metadata=1;kernel_page_cache_get_concurrency_state(cache,&state);observe_cache_metadata=0;
+    assert(cache_metadata_lock);
+    struct window_hot_lookup call={.cache=cache,.file=file};pthread_t reader;
+    assert(!pthread_create(&reader,NULL,window_hot_lookup_actor,&call));wait_progress(&call.entered,1);
+    unsigned parked=mm_test_parked(1);
+    KERNEL_LOCK_SCOPE(global);kernel_rwlock_write(cache_metadata_lock,&global);
+    __atomic_store_n(&call.start,1,__ATOMIC_RELEASE);
+    struct timespec start,now;assert(!clock_gettime(CLOCK_MONOTONIC,&start));
+    while (!__atomic_load_n(&call.done,__ATOMIC_ACQUIRE) && mm_test_parked(1)==parked) {
+        assert(!clock_gettime(CLOCK_MONOTONIC,&now) && now.tv_sec-start.tv_sec<5);sched_yield();
+    }
+    int progressed=__atomic_load_n(&call.done,__ATOMIC_ACQUIRE);
+    kernel_lock_release(&global);
+    assert(!pthread_join(reader,NULL));
+    printf("hot lookup holding global mutex: completed_before_release=%u resident=%d status=%u\n",
+        progressed,call.resident,call.status);
+    assert(call.resident && !call.status && call.valid==BOAROS_PAGE_SIZE && source_reads==2);
+    uint32_t references;
+    assert(!physical_page_reference_count(cache->allocator,call.address,&references) && references==2);
+    const unsigned char *bytes=access_page(call.address);
+    for (size_t i=0;i<call.valid;i++) assert(bytes[i]==0x30);
+    assert(!physical_page_release(cache->allocator,call.address) &&
+        !physical_page_reference_count(cache->allocator,call.address,&references) && references==1);
+    demand_idle(cache,0);
+    if (progressed) puts("PASS READY resident and lookup complete while another actor holds cache-global metadata; real page owner and contents retained");
+    return !progressed;
+}
+static int window_mm_faultaround_oom_order(struct kernel_page_cache *cache,struct kernel_heap *heap,
+    struct physical_page_allocator *pages,struct kernel_open_file_description *file)
+{
+    const uint64_t base=0x400000,p=BOAROS_PAGE_SIZE;
+    window_ready_pair(cache,file);
+    /* Keep both cache entries borrowed: physical exhaustion must not turn
+     * into eviction of the two READY inputs and a different I/O workload. */
+    struct kernel_page_cache_read_page held[2]={0};
+    assert(!kernel_page_cache_get_batch(cache,&file->file,0,held,2,0));
+    for (unsigned i=0;i<2;i++) assert(!held[i].status && held[i].entry && held[i].valid_bytes==p);
+    struct window_mm view={0};window_mm_create(&view,heap,pages);window_map(&view,file,base,2*p);
+    struct kernel_mm_mapping mapping;
+    assert(kernel_mm_lookup(&view.mm,base,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    window_oom_order.pages=pages;window_oom_order.count=window_oom_order.triggered=0;
+    window_oom_order.capacity=physical_page_available(pages);
+    window_oom_order.borrowed=malloc(window_oom_order.capacity*sizeof(*window_oom_order.borrowed));
+    assert(window_oom_order.borrowed);window_oom_order.armed=1;
+    mm_test_bind(&view.mm);mm_test_context=view.context;
+    unsigned char value=0;size_t copied=0;
+    enum kernel_uaccess_status status=kernel_copy_from_user(&view.mm,&value,base,1,&copied);
+    mm_test_bind(NULL);mm_test_context=0;window_oom_order.armed=0;
+    assert(window_oom_order.triggered==1 && window_oom_order.count);
+    int failed=status!=KERNEL_UACCESS_STATUS_OK || copied!=1 || value!=0x30;
+    printf("fault-around OOM order: target_status=%u copied=%zu value=%u borrowed=%zu\n",
+        status,copied,value,window_oom_order.count);
+    if (!failed) assert(!kernel_mm_lookup(&view.mm,base,&mapping) &&
+        mapping.physical_address==held[0].physical_address && !(mapping.permissions&KERNEL_MM_WRITE));
+    for (size_t i=0;i<window_oom_order.count;i++)
+        assert(!physical_page_release(pages,window_oom_order.borrowed[i]));
+    free(window_oom_order.borrowed);window_oom_order.borrowed=NULL;
+    window_mm_close(&view,pages);
+    for (unsigned i=0;i<2;i++) {
+        uint32_t references;
+        assert(!physical_page_reference_count(pages,held[i].physical_address,&references) && references==1);
+        const unsigned char *bytes=kernel_page_cache_read_data(&held[i]);
+        for (size_t j=0;j<p;j++) assert(bytes[j]==0x30+i);
+    }
+    kernel_page_cache_put_batch(cache,held,2);demand_idle(cache,0);
+    if (!failed) puts("PASS optional metadata cannot consume the target's required page-table/hash resources; all borrowed pages and PTE owners returned");
+    return failed;
+}
+static void window_mm_faultaround_policy(struct kernel_page_cache *cache,struct kernel_heap *heap,
+    struct physical_page_allocator *pages,struct kernel_open_file_description *file)
+{
+    const uint64_t base=0x400000,p=BOAROS_PAGE_SIZE;
+    for (unsigned policy=0;policy<3;policy++) {
+        assert(!kernel_open_file_advise(file,0,0,0,0));window_ready_pair(cache,file);
+        struct window_mm view={0};window_mm_create(&view,heap,pages);window_map(&view,file,base,2*p);
+        if (!policy) assert(!kernel_mm_madvise(&view.mm,base,2*p,KERNEL_MM_ADVICE_RANDOM));
+        else assert(!kernel_open_file_advise(file,0,0,policy==1?1:5,0));
+        assert(window_mm_read(&view.mm,view.context,base)==0x30 && source_reads==2);
+        struct kernel_mm_mapping mapping;
+        assert(!kernel_mm_lookup(&view.mm,base,&mapping) &&
+            !(mapping.permissions&KERNEL_MM_WRITE));
+        assert(kernel_mm_lookup(&view.mm,base+p,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+        window_mm_close(&view,pages);demand_idle(cache,0);
+    }
+    assert(!kernel_open_file_advise(file,0,0,0,0));
+    puts("PASS MADV_RANDOM and FADV_RANDOM/NOREUSE suppress PTE neighbours even when their cache pages are READY");
+}
+static void window_mm_faultaround_existing(struct kernel_page_cache *cache,struct kernel_heap *heap,
+    struct physical_page_allocator *pages,struct kernel_open_file_description *file)
+{
+    if (BOAROS_PAGE_CACHE_READAHEAD_PAGES<3) return;
+    const uint64_t base=0x400000,p=BOAROS_PAGE_SIZE;
+    reset_window(cache,file);struct window_mm view={0};window_mm_create(&view,heap,pages);
+    window_map(&view,file,base,3*p);
+    struct kernel_open_file_page_preparation prepared={0};
+    assert(!kernel_open_file_prepare_mapping_page(file,0,0,&prepared));
+    kernel_open_file_finish_mapping_page(file,&prepared,0);
+    assert(!kernel_mm_mprotect(&view.mm,base,3*p,KERNEL_MM_READ|KERNEL_MM_WRITE));
+    unsigned char byte=0xc9;size_t copied;
+    mm_test_bind(&view.mm);mm_test_context=view.context;
+    assert(!kernel_copy_to_user(&view.mm,base+p,&byte,1,&copied) && copied==1);
+    mm_test_bind(NULL);mm_test_context=0;
+    struct kernel_mm_mapping before,after;
+    assert(!kernel_mm_lookup(&view.mm,base+p,&before) && (before.permissions&KERNEL_MM_WRITE));
+    assert(kernel_mm_lookup(&view.mm,base,&after)==KERNEL_MM_STATUS_NOT_MAPPED &&
+        kernel_mm_lookup(&view.mm,base+2*p,&after)==KERNEL_MM_STATUS_NOT_MAPPED);
+    unsigned reads=source_reads;
+    assert(window_mm_read(&view.mm,view.context,base)==0x30 && source_reads==reads);
+    assert(!kernel_mm_lookup(&view.mm,base+p,&after) && after.physical_address==before.physical_address &&
+        after.permissions==before.permissions && window_mm_read(&view.mm,view.context,base+p)==byte);
+    assert(!kernel_mm_lookup(&view.mm,base+2*p,&after) && !(after.permissions&KERNEL_MM_WRITE));
+    window_mm_close(&view,pages);demand_idle(cache,0);
+    reset_window(cache,file);memset(&view,0,sizeof(view));window_mm_create(&view,heap,pages);
+    window_map(&view,file,base,3*p);
+    assert(!kernel_open_file_prepare_mapping_page(file,0,0,&prepared));
+    kernel_open_file_finish_mapping_page(file,&prepared,0);
+    assert(!kernel_mm_mprotect(&view.mm,base,3*p,KERNEL_MM_READ|KERNEL_MM_WRITE));
+    mm_test_bind(&view.mm);mm_test_context=view.context;
+    assert(!kernel_copy_to_user(&view.mm,base+p,&byte,1,&copied) && copied==1);
+    mm_test_bind(NULL);mm_test_context=0;
+    assert(!kernel_mm_lookup(&view.mm,base+p,&before));
+    assert(!kernel_mm_mprotect(&view.mm,base+p,p,0));
+    reads=source_reads;
+    assert(window_mm_read(&view.mm,view.context,base)==0x30 && source_reads==reads);
+    assert(kernel_mm_lookup(&view.mm,base+p,&after)==KERNEL_MM_STATUS_NOT_MAPPED &&
+        kernel_mm_lookup(&view.mm,base+2*p,&after)==KERNEL_MM_STATUS_NOT_MAPPED);
+    assert(!kernel_mm_mprotect(&view.mm,base+p,p,KERNEL_MM_READ|KERNEL_MM_WRITE));
+    assert(!kernel_mm_lookup(&view.mm,base+p,&after) && after.physical_address==before.physical_address &&
+        window_mm_read(&view.mm,view.context,base+p)==byte && source_reads==reads);
+    window_mm_close(&view,pages);demand_idle(cache,0);
+    puts("PASS private write faults stay scalar; read neighbours preserve private and PROT_NONE leaves and stop at VMA boundaries");
+}
+static void window_mm_faultaround_oom(struct kernel_page_cache *cache,struct kernel_heap *heap,
+    struct physical_page_allocator *pages,struct kernel_open_file_description *file)
+{
+    const uint64_t base=0x400000,p=BOAROS_PAGE_SIZE;
+    window_ready_pair(cache,file);struct window_mm view={0};window_mm_create(&view,heap,pages);
+    window_map(&view,file,base,2*p);window_nosleep_failures=0;window_fail_nosleep=1;
+    assert(window_mm_read(&view.mm,view.context,base)==0x30 && source_reads==2);
+    window_fail_nosleep=0;
+    struct kernel_mm_mapping mapping;
+    assert(window_nosleep_failures && !kernel_mm_lookup(&view.mm,base,&mapping) &&
+        kernel_mm_lookup(&view.mm,base+p,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    window_mm_close(&view,pages);demand_idle(cache,0);
+    puts("PASS optional resident metadata OOM preserves the successful target and returns every neighbour owner");
+}
+static void window_mm_faultaround_bounds(struct kernel_page_cache *cache,struct kernel_heap *heap,
+    struct physical_page_allocator *pages,struct kernel_open_file_description *file)
+{
+    const uint64_t base=0x400000,p=BOAROS_PAGE_SIZE;
+    const unsigned last=65536U/BOAROS_PAGE_SIZE-1;
+    if (BOAROS_PAGE_CACHE_READAHEAD_PAGES<2) return;
+    reset_window(cache,file);struct window_mm view={0};window_mm_create(&view,heap,pages);
+    window_map(&view,file,base,32*p);
+    struct kernel_open_file_page_preparation prepared={0};
+    assert(!kernel_open_file_prepare_mapping_page(file,last-1,0,&prepared));
+    kernel_open_file_finish_mapping_page(file,&prepared,0);
+    assert(window_mm_read(&view.mm,view.context,base+last*p)==0x30+last);
+    struct kernel_mm_mapping mapping;uint64_t next;size_t valid;
+    assert(!kernel_page_cache_lookup(cache,&file->file,last+1,&next,&valid) && valid==p);
+    assert(!physical_page_release(pages,next));
+    assert(kernel_mm_lookup(&view.mm,base+(last-1)*p,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED &&
+        kernel_mm_lookup(&view.mm,base+(last+1)*p,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    window_mm_close(&view,pages);demand_idle(cache,0);
+    puts("PASS READY pages before the target and beyond its natural 64 KiB window stay unmapped");
+}
+struct window_mm_read_call { struct window_mm *view; uint64_t address; unsigned done; unsigned char value; };
+static void *window_mm_read_actor(void *argument)
+{
+    struct window_mm_read_call *call=argument;cache_test_attach(2);
+    call->value=window_mm_read(&call->view->mm,call->view->context,call->address);
+    __atomic_store_n(&call->done,1,__ATOMIC_RELEASE);return NULL;
+}
+static void window_mm_faultaround_loading(struct kernel_page_cache *cache,struct kernel_heap *heap,
+    struct physical_page_allocator *pages,struct kernel_open_file_description *file)
+{
+    const uint64_t base=0x400000,p=BOAROS_PAGE_SIZE;
+    reset_window(cache,file);struct kernel_open_file_page_preparation prepared={0};
+    assert(!kernel_open_file_prepare_mapping_page(file,0,0,&prepared));
+    kernel_open_file_finish_mapping_page(file,&prepared,0);
+    struct window_mm view={0};window_mm_create(&view,heap,pages);window_map(&view,file,base,2*p);
+    pause_read=1;struct window_call neighbour={.file=file,.index=1,.actor=1};pthread_t producer,reader;
+    assert(!pthread_create(&producer,NULL,window_reader,&neighbour));wait_progress(&read_entered,1);
+    struct window_mm_read_call target={.view=&view,.address=base};
+    assert(!pthread_create(&reader,NULL,window_mm_read_actor,&target));wait_progress(&target.done,1);
+    assert(!pthread_join(reader,NULL) && target.value==0x30 && source_reads==2 &&
+        !__atomic_load_n(&neighbour.done,__ATOMIC_ACQUIRE));
+    struct kernel_mm_mapping mapping;
+    assert(kernel_mm_lookup(&view.mm,base+p,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    __atomic_store_n(&resume_read,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(producer,NULL) && !neighbour.error);
+    finish_window(cache,file,&neighbour.prepared);
+    window_mm_close(&view,pages);demand_idle(cache,0);
+    puts("PASS real private target fault returns while the neighbour producer remains paused in I/O; no neighbour PTE or owner borrowed");
+}
+static void window_mm_faultaround_truncate(struct kernel_page_cache *cache,struct kernel_heap *heap,
+    struct physical_page_allocator *pages,struct kernel_open_file_description *file)
+{
+    if (BOAROS_PAGE_CACHE_READAHEAD_PAGES<3) return;
+    const uint64_t base=0x400000,p=BOAROS_PAGE_SIZE;
+    reset_window(cache,file);struct window_mm view={0};window_mm_create(&view,heap,pages);
+    window_map(&view,file,base,4*p);
+    assert(window_mm_read(&view.mm,view.context,base)==0x30);
+    struct kernel_mm_mapping mapping;uint64_t held;size_t valid;uint32_t references;
+    assert(!kernel_mm_lookup(&view.mm,base+2*p,&mapping));
+    assert(!kernel_page_cache_lookup(cache,&file->file,2,&held,&valid) && valid==37 &&
+        mapping.physical_address==held);
+    assert(!physical_page_reference_count(pages,held,&references) && references==3);
+    const unsigned char *bytes=access_page(held);
+    for (size_t i=0;i<37;i++) assert(bytes[i]==0x32);
+    for (size_t i=37;i<p;i++) assert(!bytes[i]);
+    assert(kernel_mm_lookup(&view.mm,base+3*p,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    assert(!kernel_vfs_ftruncate(&file->file,2*p));
+    assert(kernel_mm_lookup(&view.mm,base+2*p,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED &&
+        !physical_page_reference_count(pages,held,&references) && references==1);
+    assert(!physical_page_release(pages,held));
+    assert(window_mm_read(&view.mm,view.context,base+p)==0x31);
+    mm_test_bind(&view.mm);mm_test_context=view.context;
+    unsigned char value;size_t copied;
+    assert(kernel_copy_from_user(&view.mm,&value,base+2*p,1,&copied)==KERNEL_UACCESS_STATUS_FAULT && !copied);
+    mm_test_bind(NULL);mm_test_context=0;
+    window_mm_close(&view,pages);demand_idle(cache,0);
+    puts("PASS EOF bounds READY neighbour PTEs and zero tail; truncate withdraws a mapped neighbour and its cache/PTE owners");
+}
 static void window_mm_hints(struct kernel_page_cache *cache,struct kernel_heap *heap,
     struct physical_page_allocator *pages,struct kernel_open_file_description *file)
 {
@@ -436,6 +778,10 @@ static void window_elf(struct kernel_page_cache *cache,struct kernel_heap *heap,
 int main(int argc,char **argv)
 {
     assert(argc==3);setvbuf(stdout,NULL,_IONBF,0);cache_test_attach(0);
+    const char *test_case=getenv("FAULT_WINDOW_CASE");
+    int oom_order_only=test_case && !strcmp(test_case,"oom-order"),oom_order_failed=0;
+    int hot_lookup_only=test_case && !strcmp(test_case,"hot-lookup"),hot_lookup_failed=0;
+    assert(!test_case || oom_order_only || hot_lookup_only);
     struct physical_page_allocator pages={0};struct kernel_heap heap={0};
     init_window_heap(&pages,&heap,pool,sizeof(pool));
     init_window_heap(&backend_pages,&backend_heap,backend_pool,sizeof(backend_pool));
@@ -456,16 +802,29 @@ int main(int argc,char **argv)
     }
     uint64_t observed=kernel_vfs_error_sequence(&file->file);
     assert(!kernel_vfs_sync(&file->file,0,&observed));
+    if (oom_order_only) oom_order_failed=window_mm_faultaround_oom_order(&cache,&heap,&pages,file);
+    else if (hot_lookup_only) hot_lookup_failed=window_hot_lookup(&cache,file);
+    else {
+    hot_lookup_failed=window_hot_lookup(&cache,file);
     cold_window(&cache,file);
     window_errors(&cache,file);
     window_policy(&cache,file);
     window_loading(&cache,file);
     window_neighbour_loading(&cache,file);
     window_stop(&cache,file);
+    window_mm_faultaround(&cache,&heap,&pages,file);
+    window_mm_faultaround_policy(&cache,&heap,&pages,file);
+    window_mm_faultaround_existing(&cache,&heap,&pages,file);
+    window_mm_faultaround_oom(&cache,&heap,&pages,file);
+    oom_order_failed=window_mm_faultaround_oom_order(&cache,&heap,&pages,file);
+    window_mm_faultaround_bounds(&cache,&heap,&pages,file);
+    window_mm_faultaround_loading(&cache,&heap,&pages,file);
     window_mm_hints(&cache,&heap,&pages,file);
     window_mm_cancel(&cache,&heap,&pages,file);
     capture_reads=0;window_elf(&cache,&heap,&pages,&mount);
     window_truncate(&cache,file);
+    window_mm_faultaround_truncate(&cache,&heap,&pages,file);
+    }
     capture_reads=0;current_file=NULL;
     assert(!kernel_open_file_release(&file) && !kernel_vfs_unmount(&mount));
     assert(!kernel_page_cache_destroy(&cache) && !close(image_fd));current_cache=NULL;
@@ -475,5 +834,7 @@ int main(int argc,char **argv)
     assert(!physical_page_allocator_audit(&pages) && !physical_page_allocator_audit(&backend_pages));
     assert(physical_page_available(&pages)==baseline && physical_page_available(&backend_pages)==backend_baseline);
     puts("PASS fault-window final page, heap, node and cache owners");
+    assert(!oom_order_failed && "optional metadata must never starve the successful scalar target");
+    assert(!hot_lookup_failed && "hot resident and lookup must complete before cache-global metadata is released");
     return 0;
 }

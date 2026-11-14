@@ -1740,9 +1740,16 @@ static int read_entry_ready(struct kernel_page_cache_entry *entry)
 int kernel_page_cache_resident(struct kernel_page_cache *cache,
     const struct kernel_vfs_file *file, uint64_t index)
 {
+    struct kernel_vfs_node *node=kernel_vfs_file_node(file);
+    if (!cache_live(cache) || !node) return 0;
+#if BOAROS_MAX_CPUS > 1
+    CACHE_INDEX_SCOPE(guard,node);
+    if (node->cache_index_closed) return 0;
+#else
     CACHE_SCOPE(guard, cache);
-    struct kernel_page_cache_entry *entry;
-    return !lookup_entry(cache, file, index, &entry) && !entry_retired(entry) &&
+#endif
+    struct kernel_page_cache_entry *entry=index_find(node,index);
+    return entry && !entry_retired(entry) &&
         entry_load_status(entry) == KERNEL_PAGE_CACHE_STATUS_OK;
 }
 
@@ -1750,13 +1757,18 @@ enum kernel_page_cache_status kernel_page_cache_lookup(
     struct kernel_page_cache *cache, const struct kernel_vfs_file *file,
     uint64_t index, uint64_t *address, size_t *valid)
 {
-    if (!cache_live(cache) || !address || !valid || !kernel_vfs_file_node(file))
+    struct kernel_vfs_node *node=kernel_vfs_file_node(file);
+    if (!cache_live(cache) || !address || !valid || !node)
         return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
+#if BOAROS_MAX_CPUS > 1
+    CACHE_INDEX_SCOPE(guard,node);
+    if (node->cache_index_closed) return KERNEL_PAGE_CACHE_STATUS_BUSY;
+#else
     CACHE_SCOPE(guard,cache);
-    if (!read_cache_open(kernel_vfs_file_node(file))) return KERNEL_PAGE_CACHE_STATUS_BUSY;
-    struct kernel_page_cache_entry *entry;
-    enum kernel_page_cache_status status=lookup_entry(cache,file,index,&entry);
-    if (status) return status;
+#endif
+    if (!read_cache_open(node)) return KERNEL_PAGE_CACHE_STATUS_BUSY;
+    struct kernel_page_cache_entry *entry=index_find(node,index);
+    if (!entry) return KERNEL_PAGE_CACHE_STATUS_NOT_FOUND;
     if (!read_entry_ready(entry)) return entry_load_status(entry) ? entry_load_status(entry) : KERNEL_PAGE_CACHE_STATUS_BUSY;
     take_read_page(cache,entry,address,valid,entry_valid_bytes(entry));
     return KERNEL_PAGE_CACHE_STATUS_OK;

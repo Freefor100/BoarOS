@@ -35,7 +35,7 @@ mincore 每页输出最低位的驻留状态，查询本身不装入页面。MM 
 
 ## madvise 与共享段锁定
 
-RV64/LA64 的 madvise(233) 支持 NORMAL、RANDOM、SEQUENTIAL、WILLNEED、DONTNEED、FREE、REMOVE，以及 DONTFORK/DOFORK、WIPEONFORK/KEEPONFORK、DONTDUMP/DODUMP和POPULATE_READ/WRITE，参数中的 advice 按 Linux 32 位 int 解释。RANDOM 在 VMA 上保存随机访问建议，禁止该范围冷缺页的邻页批量装入；NORMAL/SEQUENTIAL 清除此标志。建议随 VMA 分裂、合并、fork 和 mremap 保留，不改变权限或文件位置。未接入的扩展模式返回 EINVAL。
+RV64/LA64 的 madvise(233) 支持 NORMAL、RANDOM、SEQUENTIAL、WILLNEED、DONTNEED、FREE、REMOVE，以及 DONTFORK/DOFORK、WIPEONFORK/KEEPONFORK、DONTDUMP/DODUMP和POPULATE_READ/WRITE，参数中的 advice 按 Linux 32 位 int 解释。RANDOM 在 VMA 上保存随机访问建议，禁止该范围冷缺页的邻页批量装入及已驻留邻页映射；NORMAL/SEQUENTIAL 清除此标志。建议随 VMA 分裂、合并、fork 和 mremap 保留，不改变权限或文件位置。未接入的扩展模式返回 EINVAL。
 
 DONTNEED 在 MM 修改资格内撤销范围的 PTE 和文件驻留登记，保留 VMA、保护位、AS/DATA 用量和后备对象。私有匿名页重新访问得到零，私有文件 COW 页面重新取文件内容；共享匿名、SysV 和共享文件的数据保存在真实后备中；BPF 对象映射保留 map 数据但不补回 PTE，再访问产生 SIGBUS（见[BPF 对象共享映射](#bpf-对象共享映射)）。vDSO 代码缺页从内核内嵌的 ELF 重新装入，并完成指令缓存与 TLB 同步；只读 vVAR 缺页重新映射本 MM 持有的共享时钟页。复用现有有界退页过程，页和页表在活动 CPU 完成 TLB 失效后释放。范围中的空洞最终返回 ENOMEM，空洞两侧的有效映射仍执行；遇到锁定 VMA 返回 EINVAL，保留此前范围已经完成的变化。
 
@@ -271,6 +271,10 @@ VMA 保留后备对象、文件权限上限和源子范围偏移。共享匿名�
 scheduler 的 U-mode 硬件页故障和当前任务的 uaccess 都可进入该入口。uaccess 在 pin 遇到未驻留或需要写故障处理的页面时解析；成功后重新 pin，VMA 外或权限不符仍按用户访问错误处理。
 
 并发 fault 可以在候选准备期间由另一任务先完成同一地址的映射或权限升级。恢复 gate 后，若 VMA 仍允许且 PTE 已满足请求，匿名、ELF 和文件 resolver 在 raw 锁外全量刷新本地翻译，再成功返回；执行映射另补本地指令同步，不重复发送远端 RFENCE。全量刷新同时覆盖该 CPU 在新非叶发布前缓存的 invalid 父项。多 CPU RISC-V 的新映射没有旧物理页、权限或退休引用可撤销，因此翻译只做本地发布，不推进用于旧翻译失效的代次；新执行页仍独立推进指令代次并确认取指同步。其他 CPU 若仍缓存 invalid 项，会进入上述 spurious-fault 路径。同一 MM 的线程切换不因新页发布额外清空 TLB，首次加入或跨根重新进入仍执行全量刷新。旧映射的撤销和资源归还仍先完成全部目标确认，不把旧 positive 翻译当作 invalid 处理。预装的非执行匿名叶保留既有批量本地同步。固定资料 [`pgtable.h`](../../references/linux/arch/riscv/include/asm/pgtable.h) 的 `update_mmu_cache_range()` 同样使用本地刷新发布新有效 PTE；[`mm/memory.c`](../../references/linux/mm/memory.c) 的 `fix_spurious_fault()` 用于核对并发已满足的 fault 语义。映射代次、来源、EOF 或权限已经变化时丢弃本次候选并重新判断，不能把过期候选提交给新 VMA。真实匿名及文件同页竞争见[RV 两核](riscv-smp.md#用户态原程序与压力组合)。
+
+磁盘私有文件的普通读/执行缺页还会映射同一自然对齐64KiB窗口内向前、VMA与EOF范围内已经READY的缓存页。需求页先取得真实来源页、resident元数据、页表和hash容量，包含重取MM后实际缺失表页的补齐；之后才使用不回收、不等待的heap入口准备可选resident，数量不超过现有hash空槽。可选分配失败不改变需求页结果，不为邻页分配数据页、装入页面或新建页表。
+
+已有MM写资格和inode读资格固定发布范围及文件版本，短raw保护内只向空PTE转交已取得的物理引用。邻页以只读COW形式发布，登记在原文件resident索引中；后续私有写、fork、truncate、打洞与解除映射沿同一协议处理。已有私有/COW/PROT_NONE叶不替换，LOADING/缺失缓存页直接跳过；共享文件、内存后备、写缺页、force访问、显式预装及RANDOM/NOREUSE不使用此扩展。目标和实际新增邻页完成后只发布一次同步范围/代次，其他CPU晚进入仍由activate补齐。来源仍借用真实OFD，不设置新的常驻页数组或后台执行者；每个实际映射页仍持有原resident元数据，解除映射时归还。预先建立的PTE会延长对应缓存页的驻留，RSS和resident数量可增加；RANDOM/NOREUSE可禁止该扩展。直接边界与OOM检查复用 `tests/host/fault-read-window.sh`，与缓存批读的差别见[VFS冷页装入](vfs-ext4.md#文件缺页的同步批量装入)。
 
 ## fork 与 COW
 

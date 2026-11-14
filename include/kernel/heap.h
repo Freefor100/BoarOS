@@ -59,8 +59,9 @@ enum kernel_heap_status kernel_heap_allocate_zeroed(
     size_t size,
     void **pointer);
 
-/* Same ownership and corruption checks; one allocation attempt without
- * reclaim or sleeping. Call outside source locks, including from callbacks. */
+/* Same ownership and corruption checks; one attempt without reclaim, source
+ * callbacks or sleeping. No caller raw/state lock may cover allocation or
+ * zeroing; sleepable source qualifications may remain held. */
 enum kernel_heap_status kernel_heap_allocate_nosleep(struct kernel_heap *,size_t,void **);
 enum kernel_heap_status kernel_heap_allocate_zeroed_nosleep(struct kernel_heap *,size_t,size_t,void **);
 
