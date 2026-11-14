@@ -130,6 +130,7 @@ int ext4_trans_write_data_batch(struct ext4_blockdev *bdev,
         struct ext4_block cached = EXT4_BLOCK_ZERO();
         struct ext4_buf *old = ext4_bcache_find_get(bdev->bc, &cached, spans[i].offset / bdev->lg_bsize + j, NULL);
         if (!old) continue;
+        ext4_block_payload_write(cached.payload);
         memcpy(cached.data, (const uint8_t *)spans[i].buffer + (size_t)j * bdev->lg_bsize, bdev->lg_bsize);
         ext4_bcache_set_flag(old, BC_UPTODATE);
         ext4_bcache_clear_dirty(old);
@@ -177,6 +178,7 @@ int ext4_trans_write_data(struct ext4_blockdev *bdev, uint64_t lba,
 		if (!r && old) {
 			/* An explicitly held standalone bcache reference sees the new
 			 * contents too; no stale dirty version may overwrite direct DMA. */
+			ext4_block_payload_write(cached.payload);
 			memcpy(cached.data, payload, bdev->lg_bsize);
 			ext4_bcache_set_flag(old, BC_UPTODATE);
 			ext4_bcache_clear_dirty(old);
@@ -194,6 +196,7 @@ int ext4_trans_write_data(struct ext4_blockdev *bdev, uint64_t lba,
 	int r = initialize || (!offset && length == bdev->lg_bsize)
 		? ext4_block_get_noread(bdev, &block, lba) : ext4_block_get(bdev, &block, lba);
 	if (r) return r;
+	ext4_block_payload_write(block.payload);
 	if (initialize) memset(block.data, 0, bdev->lg_bsize);
 	if (data) memcpy(block.data + offset, data, length);
 	else memset(block.data + offset, 0, length);

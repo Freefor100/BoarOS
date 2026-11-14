@@ -11,9 +11,28 @@ static uint32_t observed_seed, observed_index;
 static bool armed, changed;
 static uint32_t directory_reader, nested_inode, nested_mode;
 static int nested_status;
+static unsigned crc_calls;
+static struct ext4_fs *qualify_fs;
+static uint32_t qualify_inode;
+static struct ext4_inode_ref qualified_writer;
+static const void *qualify_bytes;
+uint32_t __real_ext4_crc32c_zeroed(uint32_t, const void *, uint32_t, uint32_t, uint32_t);
+uint32_t __wrap_ext4_crc32c_zeroed(uint32_t seed, const void *bytes, uint32_t length,
+    uint32_t first, uint32_t second)
+{
+    uint32_t crc = __real_ext4_crc32c_zeroed(seed, bytes, length, first, second);
+    if (bytes == qualify_bytes) {
+        qualify_bytes = NULL;
+        /* The old verifier has computed its checksum but has not published
+         * success. Expose write access before it can publish that result. */
+        CHECK(ext4_fs_get_inode_ref(qualify_fs, qualify_inode, &qualified_writer) == EOK);
+    }
+    return crc;
+}
 uint32_t __real_ext4_crc32c(uint32_t, const void *, uint32_t);
 uint32_t __wrap_ext4_crc32c(uint32_t seed, const void *bytes, uint32_t length)
 {
+    crc_calls++;
     if (armed && (directory_reader ? bytes == observed :
         length == sizeof(observed_index) && seed == observed_seed &&
         !memcmp(bytes, &observed_index, sizeof(observed_index)))) {
@@ -30,13 +49,93 @@ uint32_t __wrap_ext4_crc32c(uint32_t seed, const void *bytes, uint32_t length)
     return __real_ext4_crc32c(seed, bytes, length);
 }
 
+static void reuse_queries(struct ext4_fs *fs, struct ext4_blockdev *dev)
+{
+    ext4_file file;
+    uint32_t ino, mode;
+    CHECK(ext4_lookup_child("/", EXT4_INODE_ROOT_INDEX, "file", 4, &ino, &mode) == EOK);
+    CHECK(ext4_fopen_inode(&file, "/", ino, NULL) == EOK);
+    ext4_bcache_reclaim(dev->bc);
+    struct ext4_inode before, after;
+    CHECK(ext4_fraw_inode_fill(&file, &before) == EOK);
+    unsigned warmed = crc_calls;
+    for (unsigned i = 0; i < 8; i++) {
+        CHECK(ext4_fraw_inode_fill(&file, &after) == EOK);
+        CHECK(!memcmp(&before, &after, sizeof(before)));
+    }
+    printf("checksum reuse: block=%u inode=%u warm-query-crcs=%u\n",
+        dev->lg_bsize, ext4_get16(&fs->sb, inode_size), crc_calls - warmed);
+    CHECK(crc_calls == warmed);
+
+    struct ext4_inode_ref old;
+    CHECK(ext4_fs_get_inode_ref_read(fs, ino, &old) == EOK);
+    unsigned char old_bytes[512];
+    uint32_t isize = ext4_get16(&fs->sb, inode_size);
+    CHECK(isize <= sizeof(old_bytes));
+    memcpy(old_bytes, old.inode, isize);
+    struct ext4_timestamp times[3] = {{1234, 0}, {2345, 0}, {3456, 0}};
+    CHECK(ext4_file_set_times(&file, 7, times) == EOK);
+    CHECK(!memcmp(old_bytes, old.inode, isize));
+    warmed = crc_calls;
+    CHECK(ext4_fraw_inode_fill(&file, &after) == EOK);
+    CHECK(crc_calls > warmed && to_le32(after.modification_time) == 2345);
+    warmed = crc_calls;
+    CHECK(ext4_fraw_inode_fill(&file, &before) == EOK && crc_calls == warmed);
+    CHECK(ext4_fs_put_inode_ref(&old) == EOK);
+
+    CHECK(ext4_transaction_begin("/") == EOK);
+    times[1].seconds = 4567;
+    CHECK(ext4_file_set_times(&file, 2, times) == EOK);
+    CHECK(ext4_fraw_inode_fill(&file, &after) == EOK && to_le32(after.modification_time) == 4567);
+    warmed = crc_calls;
+    CHECK(ext4_fraw_inode_fill(&file, &after) == EOK && crc_calls > warmed);
+    CHECK(ext4_transaction_abort("/", ECANCELED) == ECANCELED);
+    CHECK(ext4_fraw_inode_fill(&file, &after) == EOK && !memcmp(&before, &after, sizeof(after)));
+
+    /* A new read version starts uncached. Force an overlapping writer after
+     * this version's checksum, then ensure no late success was remembered. */
+    CHECK(ext4_file_set_times(&file, 2, times) == EOK);
+    CHECK(ext4_fs_get_inode_ref_read(fs, ino, &old) == EOK);
+    struct ext4_timestamp newer[3] = {{0}, {5678, 0}, {0}};
+    CHECK(ext4_file_set_times(&file, 2, newer) == EOK);
+    /* The address is obtained from the existing accepted owner, without
+     * invoking another metadata verifier before the instrumented query. */
+    struct ext4_block current_block;
+    CHECK(ext4_block_get(dev, &current_block, old.block.lb_id) == EOK);
+    qualify_bytes = current_block.data + ((uint8_t *)old.inode - old.block.data);
+    qualify_fs = fs; qualify_inode = ino;
+    CHECK(ext4_fraw_inode_fill(&file, &after) == EOK && !qualify_bytes);
+    CHECK(ext4_fs_put_inode_ref(&old) == EOK && ext4_block_set(dev, &current_block) == EOK);
+    warmed = crc_calls;
+    CHECK(ext4_fraw_inode_fill(&file, &after) == EOK && crc_calls > warmed);
+    uint16_t mode_before = qualified_writer.inode->mode;
+    qualified_writer.inode->mode ^= 1;
+    CHECK(ext4_fraw_inode_fill(&file, &after) == EUCLEAN);
+    qualified_writer.inode->mode = mode_before;
+    CHECK(ext4_fs_put_inode_ref(&qualified_writer) == EOK);
+    CHECK(ext4_fraw_inode_fill(&file, &after) == EOK && to_le32(after.modification_time) == 5678);
+
+    uint32_t bg = (ino - 1) / ext4_get32(&fs->sb, inodes_per_group);
+    struct ext4_block_group_ref group;
+    CHECK(ext4_fs_get_block_group_ref_write(fs, bg, &group) == EOK);
+    uint16_t checksum = group.block_group->checksum;
+    group.block_group->checksum ^= 1;
+    CHECK(ext4_fraw_inode_fill(&file, &after) == EUCLEAN);
+    group.block_group->checksum = checksum;
+    CHECK(ext4_fs_put_block_group_ref(&group) == EOK);
+    CHECK(ext4_fraw_inode_fill(&file, &after) == EOK);
+    printf("checksum versions: accepted/abort, old reader, late verifier, inode/GDT corruption rejected\n");
+    CHECK(ext4_fclose(&file) == EOK);
+}
+
 int main(int argc, char **argv)
 {
     CHECK(argc == 3);
     if (!strcmp(argv[2], "seed")) return metadata_main(argc, argv);
     bool gdt = !strcmp(argv[2], "gdt");
     bool dx = !strcmp(argv[2], "dx");
-    CHECK(gdt || dx || !strcmp(argv[2], "inode"));
+    bool reuse = !strcmp(argv[2], "reuse");
+    CHECK(gdt || dx || reuse || !strcmp(argv[2], "inode"));
     CHECK(fault_block_open(&disk, argv[1]) == 0);
     unsigned char scratch[512];
     struct ext4_blockdev_iface iface = {.open=dev_open, .close=dev_open,
@@ -48,6 +147,13 @@ int main(int argc, char **argv)
     CHECK(ext4_recover("/") == EOK && ext4_journal_start("/") == EOK);
     struct ext4_fs *fs = dev.fs;
     CHECK(ext4_sb_feature_ro_com(&fs->sb, EXT4_FRO_COM_METADATA_CSUM));
+    if (reuse) {
+        reuse_queries(fs, &dev);
+        CHECK(ext4_journal_stop("/") == EOK);
+        CHECK(ext4_umount("/") == EOK && !live_allocations);
+        fault_block_close(&disk);
+        return 0;
+    }
     if (dx) {
         CHECK(ext4_dir_mk("/checksum-directory") == EOK);
         ext4_file child;
@@ -106,7 +212,9 @@ int main(int argc, char **argv)
     CHECK(ext4_fopen(&f, "/checksum-target", "w+") == EOK);
     struct ext4_block_group_ref group;
     uint32_t bg = (f.inode - 1) / ext4_get32(&fs->sb, inodes_per_group);
-    CHECK(ext4_fs_get_block_group_ref(fs, bg, &group) == EOK);
+    /* An outstanding writable loan requires real verification on every
+     * query, including the intentionally overlapping checksum below. */
+    CHECK(ext4_fs_get_block_group_ref_write(fs, bg, &group) == EOK);
     struct ext4_inode_ref inode;
     CHECK(ext4_fs_get_inode_ref(fs, f.inode, &inode) == EOK);
     CHECK(ext4_current_trans(fs) == NULL);

@@ -573,6 +573,26 @@ bool ext4_fs_verify_bg_csum(struct ext4_sblock *sb,
 void ext4_fs_update_bg_csum(struct ext4_sblock *sb,uint32_t bgid,struct ext4_bgroup *bg)
 { bg->checksum=to_le16(ext4_fs_bg_checksum(sb,bgid,bg)); }
 
+static uint64_t metadata_check_key(uint32_t index, uint32_t offset,
+    uint32_t length, bool inode)
+{
+    /* Metadata records are 32-byte aligned; both units fit in 16 bits even
+     * for a 64 KiB block. The type distinguishes GDT and inode identities. */
+    if ((offset & 31) || (length & 31) || !length || offset > 65535 || length > 65536)
+        return 0;
+    return (uint64_t)index << 32 | (uint64_t)(offset / 32) << 16 |
+        (uint64_t)(length / 32) << 1 | inode;
+}
+
+static void metadata_checked(uint64_t *slot, uint64_t observed, uint64_t key)
+{
+    /* In-place write access permanently sets MAX before exposing bytes.
+     * A verifier holding an older read loan must not publish across it. */
+    if (key && observed != UINT64_MAX && observed != key)
+        __atomic_compare_exchange_n(slot, &observed, key, false,
+            __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+}
+
 static int ext4_fs_get_block_group_ref_mode(struct ext4_fs *fs, uint32_t bgid,
     struct ext4_block_group_ref *ref, bool write)
 {
@@ -600,8 +620,11 @@ static int ext4_fs_get_block_group_ref_mode(struct ext4_fs *fs, uint32_t bgid,
 	ref->index = bgid;
 	ref->dirty = false;
 	struct ext4_bgroup *bg = ref->block_group;
+	uint64_t key = metadata_check_key(bgid, offset, size, false);
+	uint64_t *slot = &ref->block.payload->verified[bgid % 4];
+	uint64_t observed = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
 
-	if (!ext4_fs_verify_bg_csum(ext4_fs_super(fs), bgid, bg)) {
+	if ((!key || observed != key) && !ext4_fs_verify_bg_csum(ext4_fs_super(fs), bgid, bg)) {
 		ext4_dbg(DEBUG_FS,
 			 DBG_WARN "Block group descriptor checksum failed."
 			 "Block group index: %" PRIu32"\n",
@@ -609,6 +632,7 @@ static int ext4_fs_get_block_group_ref_mode(struct ext4_fs *fs, uint32_t bgid,
 		ext4_block_set(fs->bdev, &ref->block);
 		return EUCLEAN;
 	}
+	metadata_checked(slot, observed, key);
 	return EOK;
 }
 
@@ -886,8 +910,11 @@ __ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 	ref->index = index + 1;
 	ref->fs = fs;
 	ref->dirty = false;
+	uint64_t key = metadata_check_key(ref->index, offset_in_block, inode_size, true);
+	uint64_t *slot = &ref->block.payload->verified[ref->index % 4];
+	uint64_t observed = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
 
-	if (initialized && !ext4_fs_verify_inode_csum(ref)) {
+	if (initialized && (!key || observed != key) && !ext4_fs_verify_inode_csum(ref)) {
 		ext4_dbg(DEBUG_FS,
 			DBG_WARN "Inode checksum failed."
 			"Inode: %" PRIu32"\n",
@@ -895,6 +922,7 @@ __ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 		ext4_block_set(fs->bdev, &ref->block);
 		return EUCLEAN;
 	}
+	if (initialized) metadata_checked(slot, observed, key);
 
 	return EOK;
 }
@@ -912,7 +940,7 @@ int ext4_fs_get_inode_ref_read(struct ext4_fs *fs, uint32_t index,
 int ext4_fs_inode_ref_write(struct ext4_inode_ref *ref)
 {
     struct jbd_trans *trans = ext4_current_trans(ref->fs);
-    if (!trans) return EOK;
+    if (!trans) { ext4_block_payload_write(ref->block.payload); return EOK; }
     int result = ext4_operation_require_resource(ref->fs, EXT4_RESOURCE_INODE, ref->index);
     if (result) return result;
     uint32_t offset = (uint32_t)((uint8_t *)ref->inode - ref->block.data);

@@ -12,6 +12,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source-root', type=Path, default=ROOT)
     parser.add_argument('--output', type=Path, default=ROOT/'build/lwext4-checksum-read-host')
+    parser.add_argument('--modes', nargs='+', choices=('gdt', 'inode', 'dx', 'reuse'), default=('gdt', 'inode', 'dx', 'reuse'))
+    parser.add_argument('--page-shift', type=int, choices=(12, 14), default=12)
     args = parser.parse_args()
     source = args.source_root.resolve(); out = args.output.resolve(); out.mkdir(parents=True, exist_ok=True)
     program = out/'probe'
@@ -19,6 +21,7 @@ def main():
         '-Wno-unused-but-set-variable', '-Wno-stringop-truncation',
         '-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-no-pie',
         '-DBOAROS_MAX_CPUS=2', '-DCONFIG_USE_DEFAULT_CFG=1', '-DCONFIG_USE_USER_MALLOC=1',
+        '-DBOAROS_PAGE_SHIFT='+str(args.page_shift),
         '-include', str(source/'tests/host/lwext4_memory.h'),
         '-I'+str(source/'third_party/lwext4/include'), '-I'+str(ROOT/'tests/host/block_model'),
         '-idirafter', str(source/'include'), '-pthread']
@@ -26,7 +29,7 @@ def main():
     command += [str(ROOT/'tests/host/lwext4_checksum_read.c'), str(source/'tests/host/block_fault.c'),
         str(source/'kernel/block.c'), str(source/'kernel/raw_lock.c'),
         str(ROOT/'tests/host/block_runtime.c'), str(ROOT/'tests/host/sync/notifications.c'),
-        '-Wl,--wrap=ext4_crc32c', '-o', str(program)]
+        '-Wl,--wrap=ext4_crc32c', '-Wl,--wrap=ext4_crc32c_zeroed', '-o', str(program)]
     subprocess.run(command, check=True)
     with (out/'results.log').open('w') as log:
         for block in (1024, 4096):
@@ -35,11 +38,11 @@ def main():
                 with base.open('wb') as f: f.truncate(32*1024*1024)
                 subprocess.run(['mkfs.ext4', '-q', '-F', '-b', str(block), '-I', str(inode), str(base)], check=True)
                 subprocess.run([str(program), str(base), 'seed'], check=True, stdout=log, stderr=log)
-                for mode in ('gdt', 'inode', 'dx'):
+                for mode in args.modes:
                     image = out/f'{block}-{inode}-{mode}.img'
                     subprocess.run(['cp', '--sparse=always', str(base), str(image)], check=True)
                     subprocess.run([str(program), str(image), mode], check=True, stdout=log, stderr=log)
                     subprocess.run(['e2fsck', '-fn', str(image)], check=True, stdout=log, stderr=log)
-    print('PASS: 12 overlapping GDT/inode/htree checksum reads, immutable buffers, corrupt htree rejection, heap owners and independent e2fsck')
+    print(f'PASS: {4 * len(args.modes)} checksum cases ({", ".join(args.modes)}), page={1 << args.page_shift}; heap owners and independent e2fsck')
 
 if __name__ == '__main__': main()
