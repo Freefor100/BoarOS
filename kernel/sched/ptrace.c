@@ -344,15 +344,16 @@ void kernel_ptrace_exec(struct kernel_task *t,uint32_t old_tid)
     if (options&(1U<<TRACE_EXEC)) ptrace_event(t,TRACE_EXEC,old_tid);
     else if (!seized) (void)kernel_signal_send_task(t,5,0);
 }
-int ptrace_clone_prepare(struct kernel_task *p,struct kernel_task *c)
-{ return tracing(p,0) ? ensure_state(c) : 0; }
-unsigned ptrace_clone_locked(struct kernel_task *p,struct kernel_task *c,uint64_t flags)
+int ptrace_clone_prepare(struct kernel_task *child)
+{ return ensure_state(child); }
+int ptrace_clone_locked(struct kernel_task *p,struct kernel_task *c,uint64_t flags)
 {
     struct kernel_ptrace_state *s=state(p);
-    if (!s || !s->tracer || !c->ptrace || (flags&0x800000)) return 0;
+    if (!s || !s->tracer || (flags&0x800000)) return 0;
     unsigned event=(flags&0x4000)?TRACE_VFORK:(flags&255)!=17?TRACE_CLONE:TRACE_FORK;
     unsigned enabled=s->options&(1U<<event);
     if (enabled || (flags&0x2000)) {
+        if (!c->ptrace) return -KERNEL_ENOMEM;
         link_locked(s->tracer,c,s->credentials,s->seized,s->options);
         c->ptrace->pending=s->seized?STOP_STATUS(5,TRACE_STOP):STOP_STATUS(19,0);
     }

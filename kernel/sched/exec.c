@@ -27,10 +27,6 @@ static void finish_mm_move(struct kernel_mm *mm)
 
 enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
 {
-#if BOAROS_USER_SMP
-    if (kernel_task_has_user_context(kernel_task_current()) && !kernel_scheduler_user_service_active())
-        kernel_scheduler_enter_user_service();
-#endif
     struct kernel_task *thread;
     struct kernel_exec_transaction *transaction;
     struct kernel_mm_mapping entry_mapping;
@@ -83,8 +79,8 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
                                          transaction->image.entry,
                                          &entry_vma);
         if (mm_status == KERNEL_MM_STATUS_OK &&
-            (entry_vma.permissions & KERNEL_MM_EXECUTE) != 0U) {
-            mm_status = KERNEL_MM_STATUS_OK;
+            !(entry_vma.permissions & KERNEL_MM_EXECUTE)) {
+            return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
     }
     if (mm_status != KERNEL_MM_STATUS_OK ||
@@ -111,6 +107,10 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
                    : KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
 
+#if BOAROS_USER_SMP
+    if (!kernel_scheduler_user_service_active())
+        kernel_scheduler_enter_user_service();
+#endif
     status = process_group_exec_current();
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     thread->fork_no_exec = 0U;
@@ -180,7 +180,8 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
     exec_status = kernel_exec_transaction_cleanup(transaction);
     /* The parent needs the shared MM back, not completion of unrelated
      * executable or descriptor cleanup that may have to be retried. */
-    if (transaction->retired_mm.state == KERNEL_MM_RELEASED)
+    if (exec_status == KERNEL_EXEC_STATUS_CLEANUP_REQUIRED &&
+        transaction->retired_mm.state == KERNEL_MM_RELEASED)
         process_complete_vfork(thread);
     if (exec_status == KERNEL_EXEC_STATUS_OK) {
         (void)kernel_task_exec_finish(thread, transaction);
@@ -245,14 +246,14 @@ enum kernel_exec_status kernel_task_exec_finish(
     }
     /* Also reached after a real source/OFD cleanup retry. No user of the
      * replaced MM remains when the transaction container is finally freed. */
-    process_complete_vfork(task);
+    if (transaction->retired_mm.state == KERNEL_MM_RELEASED)
+        process_complete_vfork(task);
     heap = transaction->heap;
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         task->exec_transaction = 0;
     }
     kernel_heap_release(heap, transaction);
-    (void)kernel_wait_queue_wake_all(&task->child_exit_queue);
     return KERNEL_EXEC_STATUS_OK;
 }
 

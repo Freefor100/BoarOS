@@ -506,26 +506,17 @@ void process_complete_vfork(struct kernel_task *thread)
     SCHEDULER_TASK_BORROW(parent, 0);
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        if (!thread->vfork_child || !thread->vfork_parent) return;
         parent = thread->vfork_parent;
+        if (!parent) return;
+        if (!thread->vfork_child || !parent->vfork_waiting ||
+            parent->vfork_wait_child != thread) __builtin_trap();
         scheduler_task_get_locked(parent);
+        thread->vfork_child = 0;
+        thread->vfork_parent = 0;
+        parent->vfork_waiting = 0;
+        parent->vfork_wait_child = 0;
     }
-    /* MM remains a single-CPU business handle this round. Storage pinning
-     * covers the parent record, not shared-MM permission or release ordering. */
-    if (thread->mm.state == KERNEL_MM_LIVE && thread->mm.record == parent->mm.record)
-        return;
-    int notify = 0;
-    {
-        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        if (thread->vfork_child && thread->vfork_parent == parent) {
-            thread->vfork_child = 0;
-            thread->vfork_parent = 0;
-            parent->vfork_waiting = 0;
-            parent->vfork_wait_child = 0;
-            notify = 1;
-        }
-    }
-    if (notify) (void)kernel_wait_queue_wake_one(&parent->vfork_done_queue);
+    (void)kernel_wait_queue_wake_one(&parent->vfork_done_queue);
 }
 
 static int vfork_waiting(const struct kernel_task *task)
@@ -753,6 +744,7 @@ static enum kernel_scheduler_status finish_clone_failure(
     int64_t *linux_result,
     enum kernel_scheduler_status scheduler_failure)
 {
+    KERNEL_SERVICE_SCOPE(service);
     int cleanup_failed;
     enum kernel_scheduler_status stack_status;
 
@@ -761,8 +753,16 @@ static enum kernel_scheduler_status finish_clone_failure(
     thread->vfork_parent = 0;
     thread->vfork_child = 0U;
     if (thread->controlling_tty) kernel_task_tty_clear(thread);
-    stack_status = release_task_stack(thread);
-    if (stack_status != KERNEL_SCHEDULER_STATUS_OK) return stack_status;
+    if (thread->arch.kernel_sp) {
+        stack_status = release_task_stack(thread);
+        if (stack_status != KERNEL_SCHEDULER_STATUS_OK) return stack_status;
+    } else {
+        /* The private pages never acquired a kernel stack mapping. */
+        (void)physical_page_release_order(scheduler.allocator,
+                                          thread->stack_physical_address, KERNEL_STACK_ORDER);
+        thread->stack_physical_address = KERNEL_THREAD_NO_PAGE;
+        thread->stack_low = thread->stack_high = 0;
+    }
     cleanup_failed = release_clone_resources(thread);
 
     process_identity_release(thread);
@@ -792,7 +792,6 @@ enum kernel_scheduler_status arch_process_clone_current(
     uint64_t pidfd_address,
     int64_t *linux_result)
 {
-    KERNEL_SERVICE_SCOPE(service);
     struct kernel_task *parent;
     struct kernel_task *child;
     uint64_t child_context;
@@ -820,10 +819,6 @@ enum kernel_scheduler_status arch_process_clone_current(
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         return status;
     }
-    status = validate_queues();
-    if (status != KERNEL_SCHEDULER_STATUS_OK) {
-        return status;
-    }
     parent = kernel_cpu_current()->current;
     if (parent == kernel_cpu_current()->idle || parent->arch.user_mode != 1U ||
         parent->tid_owned != 1U ||
@@ -833,24 +828,19 @@ enum kernel_scheduler_status arch_process_clone_current(
         arch_frame_pc(parent_frame) > UINT64_MAX - 4U) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
-    status = validate_child_endpoints(parent);
-    if (status != KERNEL_SCHEDULER_STATUS_OK) {
-        return status;
-    }
     if ((flags & (LINUX_CLONE_NEWNS|LINUX_CLONE_NEWUTS|LINUX_CLONE_NEWIPC)) &&
         !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN)) {
         *linux_result=-KERNEL_EPERM;
         return KERNEL_SCHEDULER_STATUS_OK;
     }
 
-    status = allocate_task_storage(&child);
+    status = allocate_task_pages(&child);
     if (status == KERNEL_SCHEDULER_STATUS_NO_MEMORY) {
         *linux_result = -KERNEL_ENOMEM;
         return KERNEL_SCHEDULER_STATUS_OK;
     }
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     child->magic = KERNEL_THREAD_MAGIC;
-    kernel_credentials_put(child->credentials);
     /* f_cred 身份用于空路径 linkat；普通 fork 与 Linux 一样产生独立
      * credential 对象，补充组和 UID 账户仍共享真实引用。 */
     child->credentials = thread_clone ? kernel_credentials_get(parent->credentials) :
@@ -875,10 +865,6 @@ enum kernel_scheduler_status arch_process_clone_current(
     child->personality=parent->personality;
     child->no_new_privs=parent->no_new_privs;
     child->arch.user_mode = 1U;
-#if BOAROS_USER_SMP
-    child->cpu_mask = parent->cpu_mask;
-    child->user_service = 1;
-#endif
     child->state = KERNEL_THREAD_STATE_EXITED;
     child->completion.kind = KERNEL_THREAD_KIND_USER;
     child->completion.reason = KERNEL_THREAD_EXIT_USER_FAULT;
@@ -926,6 +912,7 @@ enum kernel_scheduler_status arch_process_clone_current(
                     : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
         }
         if (flags & LINUX_CLONE_NEWNS) {
+            KERNEL_SERVICE_SCOPE(mount_service);
             int error=kernel_fs_context_fork_mount_namespace(&child->fs,&parent->fs);
             if (error) return finish_clone_failure(child,error,linux_result,KERNEL_SCHEDULER_STATUS_OK);
             fs_status=KERNEL_FS_CONTEXT_STATUS_OK;
@@ -960,8 +947,11 @@ enum kernel_scheduler_status arch_process_clone_current(
     tid = child->tid;
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-        struct kernel_sched_policy inherited=parent->scheduling;
-        inherited.priority=(int)scheduler_base_priority(parent);
+#if BOAROS_USER_SMP
+        child->cpu_mask = parent->cpu_mask;
+#endif
+        struct kernel_sched_policy inherited;
+        scheduler_policy_snapshot_locked(parent, &inherited);
         kernel_sched_policy_fork(&child->scheduling,&inherited);
     }
     child->proc_start_ticks = kernel_tick_count();
@@ -1001,6 +991,18 @@ enum kernel_scheduler_status arch_process_clone_current(
     arch_thread_set_mm(&child->arch, child_context);
     if ((flags & LINUX_CLONE_CHILD_CLEARTID) != 0U)
         child->clear_tid_address = child_tid;
+    if (flags & UINT64_C(0x1000)) {
+        int error=kernel_pidfd_prepare_clone(parent,process_identity(child,KERNEL_PID_TID),thread_clone,&pidfd);
+        if (error) return finish_clone_failure(child,error,linux_result,KERNEL_SCHEDULER_STATUS_OK);
+    }
+
+    /* Controlling TTY inheritance shares the lifecycle executor with setsid
+     * and hangup. Keep it through child publication and vfork completion. */
+    KERNEL_SERVICE_SCOPE(service);
+    status = map_task_stack(child);
+    if (status != KERNEL_SCHEDULER_STATUS_OK)
+        return finish_clone_failure(child, -KERNEL_ENOMEM, linux_result,
+            status == KERNEL_SCHEDULER_STATUS_NO_MEMORY ? KERNEL_SCHEDULER_STATUS_OK : status);
     status = arch_process_prepare_clone(child, parent, parent_frame,
                                          child_stack,
                                          (flags & LINUX_CLONE_SETTLS) != 0U,
@@ -1011,28 +1013,14 @@ enum kernel_scheduler_status arch_process_clone_current(
             KERNEL_SCHEDULER_STATUS_INVALID_STATE);
     }
 
-    if (ptrace_clone_prepare(parent,child))
-        return finish_clone_failure(child,-KERNEL_ENOMEM,linux_result,KERNEL_SCHEDULER_STATUS_OK);
-
-    if (flags & UINT64_C(0x1000)) {
-        int error=kernel_pidfd_prepare_clone(parent,process_identity(child,KERNEL_PID_TID),thread_clone,&pidfd);
-        if (!error) {
-            size_t copied;
-            if (kernel_copy_to_user(&parent->mm,pidfd_address,&pidfd.fd,sizeof(pidfd.fd),&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=sizeof(pidfd.fd))
-                error=-KERNEL_EFAULT;
-        }
-        if (error) return finish_clone_failure(child,error,linux_result,KERNEL_SCHEDULER_STATUS_OK);
-    }
-
-    /* Linux does not roll clone back when a SETTID user store faults. */
-    {
+    if (pidfd.files) {
         size_t copied;
-        if ((flags & LINUX_CLONE_PARENT_SETTID) != 0U)
-            (void)kernel_copy_to_user(&parent->mm, parent_tid,
-                                      &tid, sizeof(tid), &copied);
-        if ((flags & LINUX_CLONE_CHILD_SETTID) != 0U)
-            child->set_tid_address = child_tid;
+        if (kernel_copy_to_user(&parent->mm, pidfd_address, &pidfd.fd, sizeof(pidfd.fd), &copied) ||
+            copied != sizeof(pidfd.fd))
+            return finish_clone_failure(child, -KERNEL_EFAULT, linux_result, KERNEL_SCHEDULER_STATUS_OK);
     }
+
+    if (flags & LINUX_CLONE_CHILD_SETTID) child->set_tid_address = child_tid;
     if (!thread_clone && kernel_task_controlling_tty(parent) &&
         kernel_task_tty_set(child, kernel_task_controlling_tty(parent))) __builtin_trap();
     kernel_mm_add_user(&child->mm);
@@ -1040,9 +1028,8 @@ enum kernel_scheduler_status arch_process_clone_current(
     kernel_cost_inherit(&child->cost, &parent->cost);
 #endif
     unsigned trace_event=0;
-    if (vfork) kernel_wait_queue_init(&parent->vfork_done_queue);
     int rejected;
-    {
+    for (;;) {
         /* A CLONE_FILES child can inspect the descriptor as soon as queued.
          * File-table rank precedes the scheduler rank. */
         struct kernel_raw_guard files_guard __attribute__((cleanup(kernel_raw_scope_release)))={0};
@@ -1051,37 +1038,70 @@ enum kernel_scheduler_status arch_process_clone_current(
         struct kernel_task *leader = parent->group_leader;
         rejected = kernel_reboot_requested_locked() || parent->retirement || parent->terminate_requested ||
                    leader->group_exiting || leader->group_execing;
-        if (!rejected) {
-            memcpy(child->comm, parent->comm, sizeof(child->comm));
-            if(pidfd.files) kernel_pidfd_install_clone_locked(&pidfd);
-            if (thread_clone) {
-                child->group_leader = leader;
-                child->group_members = 0;
-                child->group_next = leader;
-                child->group_previous = leader->group_previous;
-                leader->group_previous->group_next = child;
-                leader->group_previous = child;
-                leader->group_members++;
-                if (++leader->group_epoch == 0) __builtin_trap();
-                child->completion.tgid = leader->tid;
-            } else {
-                child_creator_change_locked(child, process_identity(parent, KERNEL_PID_TID));
-                child_append_locked(parent->group_leader, child);
+        if (rejected) break;
+        /* Attach may race the fallible allocations above. Choose the child
+         * trace link at publication, outside-lock allocation only if needed. */
+        int event = ptrace_clone_locked(parent, child, flags);
+        if (event == -KERNEL_ENOMEM) {
+            kernel_raw_lock_release(&guard);
+            if (files_guard.lock) kernel_raw_lock_release(&files_guard);
+            if (ptrace_clone_prepare(child)) {
+                (void)kernel_mm_remove_user(&child->mm);
+                return finish_clone_failure(child, -KERNEL_ENOMEM, linux_result, KERNEL_SCHEDULER_STATUS_OK);
             }
-            if (vfork) {
-                parent->vfork_waiting = 1;
-                parent->vfork_wait_child = child;
-            }
-            trace_event=ptrace_clone_locked(parent,child,flags);
+            continue;
+        }
+        trace_event = (unsigned)event;
+        memcpy(child->comm, parent->comm, sizeof(child->comm));
+        if(pidfd.files) kernel_pidfd_install_clone_locked(&pidfd);
+        if (thread_clone) {
+            child->group_leader = leader;
+            child->group_members = 0;
+            child->group_next = leader;
+            child->group_previous = leader->group_previous;
+            leader->group_previous->group_next = child;
+            leader->group_previous = child;
+            leader->group_members++;
+            if (++leader->group_epoch == 0) __builtin_trap();
+            child->completion.tgid = leader->tid;
+#if BOAROS_USER_SMP
+            if (kernel_signal_has_pending(child)) scheduler_signal_request_locked(child);
+#endif
+        } else {
+            child_creator_change_locked(child, process_identity(parent, KERNEL_PID_TID));
+            child_append_locked(parent->group_leader, child);
+        }
+        if (vfork) {
+            parent->vfork_waiting = 1;
+            parent->vfork_wait_child = child;
+        }
+        if(!thread_clone && child->limits->values[KERNEL_RLIMIT_CPU].current!=KERNEL_RLIM_INFINITY)
+            scheduler_cpu_timer_update_locked(child,0);
+        if (flags & LINUX_CLONE_PARENT_SETTID) {
+            /* The user store may fault or sleep. PID, pidfd and group links
+             * commit together; only this caller can first enqueue a NEW child. */
+            child->state = KERNEL_THREAD_STATE_NEW;
+            scheduler_task_publish_locked(child);
+        } else {
             child->state = KERNEL_THREAD_STATE_READY;
-            if(!thread_clone && child->limits->values[KERNEL_RLIMIT_CPU].current!=KERNEL_RLIM_INFINITY)
-                scheduler_cpu_timer_update_locked(child,0);
             ready_enqueue_locked(child, 0);
         }
+        break;
     }
     if (rejected) {
         (void)kernel_mm_remove_user(&child->mm);
         return finish_clone_failure(child, -KERNEL_EAGAIN, linux_result, KERNEL_SCHEDULER_STATUS_OK);
+    }
+    if (flags & LINUX_CLONE_PARENT_SETTID) {
+        size_t copied;
+        (void)kernel_copy_to_user(&parent->mm, parent_tid, &tid, sizeof(tid), &copied);
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        if (child->state != KERNEL_THREAD_STATE_NEW) __builtin_trap();
+        child->state = KERNEL_THREAD_STATE_READY;
+#if BOAROS_USER_SMP
+        if (kernel_signal_has_pending(child)) scheduler_signal_request_locked(child);
+#endif
+        ready_enqueue_locked(child, 0);
     }
     *linux_result = tid;
     if (trace_event) ptrace_event(parent,trace_event,tid);
@@ -1381,7 +1401,7 @@ static enum kernel_scheduler_status select_wait_child(struct kernel_task *parent
                     child->idle || child->arch.user_mode != 1 || !child->tid_owned || child->tid <= 0 ||
                     child->parent != leader || (uintptr_t)child->previous_sibling != previous ||
                     child->publish_completion || child->state < KERNEL_THREAD_STATE_READY ||
-                    child->state > KERNEL_THREAD_STATE_GROUP_DEAD) {
+                    child->state > KERNEL_THREAD_STATE_NEW) {
                     status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
                     break;
                 }
@@ -1447,11 +1467,9 @@ static enum kernel_scheduler_status wait_for_child(struct kernel_task *parent,
     int32_t which, const struct kernel_pid *target, uint32_t options,
     struct kernel_task **child, uint32_t *event, int64_t *linux_result)
 {
+    enum kernel_scheduler_status status = validate_current();
+    if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     for (;;) {
-        enum kernel_scheduler_status status = validate_current();
-        if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
-        status = validate_queues();
-        if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
         struct kernel_wait_token token = {0};
         int matching;
         status = select_wait_child(parent, which, target, options, child, event, &matching);
@@ -3076,6 +3094,14 @@ int kernel_task_prepare_user_return(void)
     if (task->files.state==KERNEL_FILES_LIVE) (void)kernel_files_drain_file_cleanup(&task->files);
     kernel_mm_drain_sources(&task->mm);
     (void)kernel_vfs_reap_mounts();
+    uint64_t address = task->set_tid_address;
+    if (address) {
+        task->set_tid_address = 0U;
+        size_t copied;
+        /* 在子 MM 激活后处理 COW；坏地址不撤销已发布的 clone。 */
+        (void)kernel_copy_to_user(&task->mm, address, &task->tid,
+                                  sizeof(task->tid), &copied);
+    }
 #if BOAROS_USER_SMP
     /* 业务准备已持有当前执行者；共用一次通知读取，普通返回不另作信号查询。 */
     uint32_t work=__atomic_load_n(&task->user_return_pending,__ATOMIC_ACQUIRE);
@@ -3086,14 +3112,6 @@ int kernel_task_prepare_user_return(void)
     kernel_scheduler_enter_user_service();
     kernel_scheduler_ack_user_service();
 #endif
-    uint64_t address = task->set_tid_address;
-    task->set_tid_address = 0U;
-    if (address) {
-        size_t copied;
-        /* 在子 MM 激活后处理 COW；坏地址不撤销已发布的 clone。 */
-        (void)kernel_copy_to_user(&task->mm, address, &task->tid,
-                                  sizeof(task->tid), &copied);
-    }
     return 1;
 }
 

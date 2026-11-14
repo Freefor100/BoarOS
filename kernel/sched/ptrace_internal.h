@@ -18,8 +18,8 @@ struct kernel_ptrace_state {
     int why;
     uint32_t unread,resume_signal,resume_sender,resume_uid,access,release_deferred,group_signal,group_pending,delivery_active,delivery_continued;
 };
-int ptrace_clone_prepare(struct kernel_task *,struct kernel_task *);
-unsigned ptrace_clone_locked(struct kernel_task *,struct kernel_task *,uint64_t);
+int ptrace_clone_prepare(struct kernel_task *);
+int ptrace_clone_locked(struct kernel_task *,struct kernel_task *,uint64_t);
 void ptrace_event(struct kernel_task *,unsigned,uint64_t);
 void ptrace_begin_exit(struct kernel_task *,uint32_t);
 void ptrace_terminate_locked(struct kernel_task *);

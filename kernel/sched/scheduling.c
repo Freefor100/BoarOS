@@ -1130,6 +1130,20 @@ int kernel_task_affinity_set(struct kernel_task *caller, int32_t pid, uint64_t m
     return 0;
 }
 
+/* Slice usage and RR time remaining belong to the run queue. Only policy
+ * settings are exported to a syscall or inherited by a new task. */
+void scheduler_policy_snapshot_locked(const struct kernel_task *task,
+                                      struct kernel_sched_policy *out)
+{
+    *out = (struct kernel_sched_policy){
+        .policy = task->scheduling.policy,
+        .priority = scheduler_base_priority(task),
+        .nice = task->scheduling.nice,
+        .reset_on_fork = task->scheduling.reset_on_fork,
+        .fair_slice_ns = task->scheduling.fair_slice_ns,
+    };
+}
+
 int kernel_task_sched_get(struct kernel_task *caller, int32_t pid,
                            struct kernel_sched_policy *state)
 {
@@ -1138,7 +1152,7 @@ int kernel_task_sched_get(struct kernel_task *caller, int32_t pid,
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         struct kernel_task *task = sched_target(caller, pid);
-        if (task) { *state = task->scheduling; state->priority=scheduler_base_priority(task); result = 0; }
+        if (task) { scheduler_policy_snapshot_locked(task, state); result = 0; }
     }
     return result;
 }

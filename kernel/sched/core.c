@@ -661,9 +661,8 @@ static void kernel_stack_slots_reset(void)
 }
 
 /* Allocate the metadata and execution stack before publishing any owner. */
-enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task)
+enum kernel_scheduler_status allocate_task_pages(struct kernel_task **task)
 {
-    kernel_assert_service_context();
     struct kernel_task *thread;
     uint64_t metadata_address;
     uint64_t stack_address;
@@ -706,18 +705,26 @@ enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task)
     fill_owned_storage(stack, KERNEL_STACK_BYTES,
                        UINT64_C(0x0101010101010101) * KERNEL_STACK_FILL);
     thread->stack_physical_address = stack_address;
+    if (!arch_mmu_kernel_window_active()) {
+        thread->stack_low = (uintptr_t)stack + KERNEL_STACK_GUARD_BYTES;
+        thread->stack_high = (uintptr_t)stack + KERNEL_STACK_BYTES;
+    }
+    *task = thread;
+    return KERNEL_SCHEDULER_STATUS_OK;
+}
+
+/* The task is private until its mapped stack and saved context both exist. */
+enum kernel_scheduler_status map_task_stack(struct kernel_task *thread)
+{
+    kernel_assert_service_context();
+    uint64_t stack_address = thread->stack_physical_address;
     if (arch_mmu_kernel_window_active()) {
         uint64_t window;
         uint64_t stack_va;
         enum arch_mmu_status map_status;
 
-        if (kernel_stack_slot_acquire(stack_address, &window) != 0) {
-            (void)physical_page_release_order(scheduler.allocator,
-                                              stack_address,
-                                              KERNEL_STACK_ORDER);
-            return release_after_create_failure(
-                metadata_address, KERNEL_SCHEDULER_STATUS_NO_MEMORY);
-        }
+        if (kernel_stack_slot_acquire(stack_address, &window) != 0)
+            return KERNEL_SCHEDULER_STATUS_NO_MEMORY;
         stack_va = window + BOAROS_PAGE_SIZE;
 #if !defined(BOAROS_ARCH_LOONGARCH)
         map_status = arch_mmu_kernel_window_map_pages(scheduler.allocator, stack_va,
@@ -739,24 +746,29 @@ enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task)
                 scheduler.allocator, stack_va + BOAROS_PAGE_SIZE);
 #endif
             kernel_stack_slot_release(window);
-            (void)physical_page_release_order(scheduler.allocator,
-                                              stack_address,
-                                              KERNEL_STACK_ORDER);
-            return release_after_create_failure(
-                metadata_address,
-                map_status == ARCH_MMU_STATUS_NO_MEMORY
-                    ? KERNEL_SCHEDULER_STATUS_NO_MEMORY
-                    : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
+            return map_status == ARCH_MMU_STATUS_NO_MEMORY
+                ? KERNEL_SCHEDULER_STATUS_NO_MEMORY : KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
         thread->stack_low = (uintptr_t)(stack_va + KERNEL_STACK_GUARD_BYTES);
         thread->stack_high = (uintptr_t)(stack_va + KERNEL_STACK_BYTES);
-    } else {
-        thread->stack_low = (uintptr_t)stack + KERNEL_STACK_GUARD_BYTES;
-        thread->stack_high = (uintptr_t)stack + KERNEL_STACK_BYTES;
     }
     thread->arch.kernel_sp = thread->stack_high;
-    thread->credentials = kernel_credentials_get(kernel_credentials_initial());
     *(uint64_t *)(thread->stack_low - sizeof(uint64_t)) = KERNEL_STACK_CANARY;
+    return KERNEL_SCHEDULER_STATUS_OK;
+}
+
+enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task)
+{
+    struct kernel_task *thread;
+    enum kernel_scheduler_status status = allocate_task_pages(&thread);
+    if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+    status = map_task_stack(thread);
+    if (status != KERNEL_SCHEDULER_STATUS_OK) {
+        (void)physical_page_release_order(scheduler.allocator,
+                                          thread->stack_physical_address, KERNEL_STACK_ORDER);
+        return release_after_create_failure(thread->physical_address, status);
+    }
+    thread->credentials = kernel_credentials_get(kernel_credentials_initial());
     *task = thread;
     return KERNEL_SCHEDULER_STATUS_OK;
 }

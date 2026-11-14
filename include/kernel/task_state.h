@@ -55,6 +55,7 @@ enum kernel_thread_state {
     KERNEL_THREAD_STATE_ZOMBIE,
     KERNEL_THREAD_STATE_STOPPED,
     KERNEL_THREAD_STATE_GROUP_DEAD,
+    KERNEL_THREAD_STATE_NEW, /* Identity published; creator still owns first enqueue. */
 };
 
 enum kernel_syscall_restart_kind {

@@ -226,6 +226,7 @@ static int directory_mutation_allowed(struct kernel_vfs_path *parent,struct kern
 int kernel_vfs_exec_metadata(struct kernel_vfs_file *file,struct kernel_vfs_exec_metadata *out, int read_filecap)
 {
     if (!file || !file->exec_lease || !file->private_data || !out) return -KERNEL_EINVAL;
+    KERNEL_SERVICE_SCOPE_IF(service, kernel_vfs_namespace_requires_cpu0(file->mount));
     struct kernel_vfs_node *node=file->private_data;
     KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(node,&io,0);
     *out=(struct kernel_vfs_exec_metadata){.mode=node->mode,.uid=node->uid,.gid=node->gid,

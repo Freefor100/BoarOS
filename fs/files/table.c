@@ -256,7 +256,6 @@ static enum kernel_files_status fork_files_range(
     struct kernel_files *destination, const struct kernel_files *source,
     int exclude, uint32_t first, uint32_t last)
 {
-    kernel_assert_service_context();
     uint32_t index;
     enum kernel_files_status status;
 

@@ -136,11 +136,11 @@ enum kernel_syscall_status syscall_handle_legacy_rlimit(
     struct kernel_task *caller, const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
-    KERNEL_SERVICE_SCOPE(service);
     struct kernel_mm *mm;
     struct kernel_rlimit64 before, replacement;
     uint32_t resource = (uint32_t)request->arguments[0];
     int setting = request->number == 164U;
+    KERNEL_SERVICE_SCOPE_IF(service, setting);
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     if (kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK)
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
@@ -160,7 +160,6 @@ enum kernel_syscall_status syscall_handle_prlimit64(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
-    KERNEL_SERVICE_SCOPE(service);
     struct kernel_rlimit64 before;
     struct kernel_rlimit64 replacement;
     struct kernel_mm *mm;
@@ -169,6 +168,7 @@ enum kernel_syscall_status syscall_handle_prlimit64(
     uint32_t resource = (uint32_t)request->arguments[1];
     uint64_t new_address = request->arguments[2];
     uint64_t old_address = request->arguments[3];
+    KERNEL_SERVICE_SCOPE_IF(service, new_address != 0);
 
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     if (kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK)
@@ -231,7 +231,6 @@ enum kernel_syscall_status syscall_handle_get_robust_list(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
-    KERNEL_SERVICE_SCOPE(service);
     int32_t pid = (int32_t)(uint32_t)request->arguments[0];
     struct kernel_task *target = pid == 0 ? caller :
                                  pid > 0 ? kernel_signal_find_by_tid(pid) : 0;
@@ -285,10 +284,6 @@ enum kernel_syscall_status syscall_handle_execve(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
-#if BOAROS_USER_SMP
-    if (kernel_task_has_user_context(kernel_task_current()) && !kernel_scheduler_user_service_active())
-        kernel_scheduler_enter_user_service();
-#endif
     int64_t linux_result;
 
     enum kernel_exec_status status = request->number == 281
@@ -492,7 +487,6 @@ enum kernel_syscall_status syscall_handle_setpgid(struct kernel_task *caller,
 enum kernel_syscall_status syscall_handle_getpgid(struct kernel_task *caller,
     const struct kernel_syscall_request *request, struct kernel_syscall_result *decoded)
 {
-    KERNEL_SERVICE_SCOPE(service);
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     decoded->value = kernel_task_getpgid(caller, (int32_t)request->arguments[0]);
     return KERNEL_SYSCALL_STATUS_OK;
@@ -501,7 +495,6 @@ enum kernel_syscall_status syscall_handle_getpgid(struct kernel_task *caller,
 enum kernel_syscall_status syscall_handle_getsid(struct kernel_task *caller,
     const struct kernel_syscall_request *request, struct kernel_syscall_result *decoded)
 {
-    KERNEL_SERVICE_SCOPE(service);
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     decoded->value = kernel_task_getsid(caller, (int32_t)request->arguments[0]);
     return KERNEL_SYSCALL_STATUS_OK;

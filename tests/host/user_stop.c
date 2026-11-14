@@ -8,6 +8,13 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
+/* The scheduler actors in this model have no ptrace state. */
+uint32_t kernel_ptrace_tracer_tid_locked(const struct kernel_task *task)
+{ assert(!task->ptrace);return 0; }
+void kernel_ptrace_group_continue_locked(struct kernel_task *task)
+{ assert(!task->ptrace); }
+void kernel_ptrace_dispose(struct kernel_task *task)
+{ assert(!task->ptrace); }
 void user_signal_unexpected_group_exit(struct kernel_task *task,enum kernel_thread_exit_reason reason,uint64_t status,uint64_t detail)
 { (void)task;(void)reason;(void)status;(void)detail;abort(); }
 void user_signal_unexpected_exit(enum kernel_thread_exit_reason reason,uint64_t status,uint64_t detail)
