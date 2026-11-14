@@ -762,6 +762,7 @@ static int unmount(struct kernel_vfs_mount *mount)
 }
 static const struct kernel_vfs_backend tmp_ops = {
     .type="tmpfs",
+    .owns_dentry_names=true,
     .check_domain=kernel_tmpfs_check_domain,
     .error=error, .root=root, .lookup=lookup, .open=open_inode, .close_node=close_node,
     .create=create, .mkdir=mkdir, .symlink=symlink, .mknod=mknod_node, .readlink=readlink,

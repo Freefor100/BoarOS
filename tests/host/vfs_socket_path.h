@@ -82,6 +82,26 @@ static void vfs_socket_paths(struct kernel_vfs_mount *mount)
     assert(!kernel_vfs_link_at(bound,root,root,"/socket-alias"));
     assert(!kernel_vfs_socket_lookup_at(root,root,"/socket-alias",&alias));
     assert(kernel_vfs_path_inode(alias)==original && kernel_vfs_path_mount(alias)==mount);
+    if (!kernel_tmpfs_is_mount(mount)) {
+        unsigned calls=retained_name_lookups;
+        for (unsigned i=0;i<8;i++) {
+            assert(!kernel_vfs_socket_lookup_at(root,root,"/socket-node",&lookup) && lookup==bound);
+            assert(!kernel_vfs_path_release(&lookup));
+        }
+        assert(retained_name_lookups==calls);
+        /* Dynamic backends still revalidate a retained positive name. */
+        const struct kernel_vfs_backend *original_ops=instance->ops;
+        struct kernel_vfs_backend dynamic=*original_ops;
+        dynamic.owns_dentry_names=false;instance->ops=&dynamic;
+        assert(!kernel_vfs_socket_lookup_at(root,root,"/socket-node",&lookup));
+        assert(!kernel_vfs_path_release(&lookup));
+        instance->ops=original_ops;
+        assert(retained_name_lookups==calls+1);
+        struct lwext4_mount_adapter *adapter=lwext4_instance(instance);
+        adapter->mount_error=EIO;
+        assert(kernel_vfs_socket_lookup_at(root,root,"/socket-node",&lookup)==-KERNEL_EIO && !lookup);
+        adapter->mount_error=0;
+    }
     assert(!kernel_vfs_symlink_at(root,root,"socket-alias","/socket-link"));
     assert(!kernel_vfs_socket_lookup_at(root,root,"/socket-link",&lookup));
     assert(kernel_vfs_path_inode(lookup)==original && !kernel_vfs_path_release(&lookup));
