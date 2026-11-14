@@ -25,6 +25,11 @@ typedef int (*virtio_dma_address_fn)(
     uint64_t size,
     uint64_t *physical_address);
 
+struct virtio_capacity_statistics {
+    uint64_t full_ticks, full_since, waits, wait_ticks;
+    uint32_t used, peak;
+};
+
 struct virtio_block_statistics {
     uint64_t requests;
     uint64_t direct_requests;
@@ -37,6 +42,10 @@ struct virtio_block_statistics {
     uint64_t interrupts, sleeps, wakes, queue_waits, max_inflight;
     /* BOAROS_COST_DIAGNOSTICS下累计时间；普通构建保持零。 */
     uint64_t inflight_ticks, busy_ticks, total_ticks, queue_wait_ticks, service_ticks;
+#if BOAROS_COST_DIAGNOSTICS
+    struct virtio_capacity_statistics slots, descriptors, workspaces;
+    uint64_t completion_or_capacity_waits, priority_waits;
+#endif
 };
 
 #define VIRTIO_BLOCK_REQUEST_SLOTS 8U
@@ -55,7 +64,7 @@ struct virtio_block_device {
     uint16_t queue_size;
     uint64_t batch_physical[VIRTIO_BLOCK_BATCH_POOL_PAGES];
     void *batch_memory[VIRTIO_BLOCK_BATCH_POOL_PAGES];
-    unsigned batch_claimed;
+    unsigned batch_claimed, free_slots;
     struct kernel_raw_lock metadata;
     struct virtio_split_queue queue;
     uint32_t transport_version;
