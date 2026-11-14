@@ -148,6 +148,7 @@ enum kernel_vma_status kernel_vma_set_lookup(
     uint64_t virtual_address,
     struct kernel_vma *vma);
 
+int kernel_vma_set_has_shm(const struct kernel_vma_set *, uint64_t start, uint64_t length);
 uint32_t kernel_vma_set_count(const struct kernel_vma_set *set);
 
 enum kernel_vma_status kernel_vma_set_get_at(

@@ -205,6 +205,13 @@ enum kernel_page_cache_status kernel_page_cache_lookup(
     uint64_t *physical_address,
     size_t *valid_bytes);
 
+/* Selected bits are offsets from first. Returned bits identify READY pages;
+ * addresses are packed in increasing index order, one physical owner per bit. */
+#define KERNEL_PAGE_CACHE_READY_WINDOW (65536U / BOAROS_PAGE_SIZE)
+unsigned kernel_page_cache_acquire_ready(struct kernel_page_cache *,
+    const struct kernel_vfs_file *, uint64_t first, unsigned selected,
+    uint64_t *addresses, unsigned capacity);
+
 enum kernel_page_cache_status kernel_page_cache_alias_attach(
     struct kernel_page_cache *cache, const struct kernel_vfs_file *file,
     uint64_t page_index, uint64_t physical_address,
@@ -290,6 +297,10 @@ struct kernel_page_cache_prediction kernel_page_cache_readahead(struct kernel_pa
 void kernel_page_cache_cancel_readahead(struct kernel_page_cache *cache, uint64_t cookie);
 #endif
 
+/* RV boot publishes the CPU0 executor before secondary CPUs are online.
+ * Its cleanup task starts the background threads once joining is possible. */
+int kernel_page_cache_start_executor(struct kernel_page_cache *cache);
+int kernel_page_cache_start_background(struct kernel_page_cache *cache);
 int kernel_page_cache_start_worker(struct kernel_page_cache *cache);
 void kernel_page_cache_stop_worker(struct kernel_page_cache *cache);
 

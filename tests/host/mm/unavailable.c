@@ -79,6 +79,7 @@ EXCLUDED(kernel_vfs_file_mincore_allowed)
 EXCLUDED(kernel_vfs_file_memory)
 EXCLUDED(kernel_page_cache_resident)
 EXCLUDED(kernel_page_cache_lookup)
+EXCLUDED(kernel_page_cache_acquire_ready)
 EXCLUDED(kernel_open_file_speculative_read_allowed)
 
 EXCLUDED(kernel_page_cache_accept_mapping_write)

@@ -11,11 +11,14 @@
 #include "../../../kernel/sched/private.h"
 #endif
 void mm_test_attach(unsigned);
-struct disk_host_thread { pthread_t thread; void (*entry)(void *); void *argument; };
+struct disk_host_thread { pthread_t thread; void (*entry)(void *); void *argument; unsigned cpu; };
 static void *run_thread(void *p)
 {
     struct disk_host_thread *thread = p;
-    mm_test_attach(0);
+    mm_test_attach(thread->cpu);
+#if BOAROS_MAX_CPUS > 1
+    kernel_cpu_current()->logical_id=thread->cpu;
+#endif
 #ifdef FILE_IO_CASES
     void mm_test_activate_task(void);
     mm_test_activate_task();
@@ -27,16 +30,19 @@ static void *run_thread(void *p)
 #endif
     return 0;
 }
-enum kernel_scheduler_status kernel_thread_create_joinable(
-    void (*entry)(void *), void *arg, struct kernel_thread_join *join)
+enum kernel_scheduler_status kernel_thread_create_joinable_worker(
+    void (*entry)(void *), void *arg, struct kernel_thread_join *join, unsigned cpu)
 {
     struct disk_host_thread *t = calloc(1, sizeof(*t));
     if (!t) return KERNEL_SCHEDULER_STATUS_NO_MEMORY;
-    t->entry = entry; t->argument = arg;
+    t->entry = entry; t->argument = arg; t->cpu=cpu;
     if (pthread_create(&t->thread, 0, run_thread, t)) { free(t); return KERNEL_SCHEDULER_STATUS_NO_MEMORY; }
     join->task = (struct kernel_task *)t;
     return KERNEL_SCHEDULER_STATUS_OK;
 }
+enum kernel_scheduler_status kernel_thread_create_joinable(
+    void (*entry)(void *), void *arg, struct kernel_thread_join *join)
+{ return kernel_thread_create_joinable_worker(entry,arg,join,0); }
 void kernel_thread_join(struct kernel_thread_join *join)
 {
     struct disk_host_thread *t = (void *)join->task;
@@ -88,6 +94,9 @@ __attribute__((weak)) void kernel_task_current_memory_limits(struct kernel_memor
 { *out = (struct kernel_memory_limits){UINT64_MAX, UINT64_MAX, UINT64_MAX}; }
 #endif
 static void excluded(void) { fputs("unopened consumer reached\n", stderr); abort(); }
+#if BOAROS_USER_SMP && !defined(FILE_IO_CASES)
+void mm_test_unavailable(void) { excluded(); }
+#endif
 #define EXCLUDED(name) void name(void) { excluded(); }
 EXCLUDED(kernel_event_fd_close)
 EXCLUDED(kernel_pidfd_close)

@@ -1552,7 +1552,7 @@ void physical_page_release_batch(struct physical_page_allocator *a,
     const uint64_t *addresses, unsigned count)
 {
     if (!count) return;
-    if (!addresses || count > PHYSICAL_PAGE_RELEASE_BATCH_MAX) __builtin_trap();
+    if (!addresses || count > PHYSICAL_PAGE_REFERENCE_BATCH_MAX) __builtin_trap();
     if (!allocator_initialized(a))
         physical_page_release_fatal(a, addresses[0], 0U, "allocator-state", addresses[0]);
     if (!physical_page_allocator_is_finalized(a)) {
@@ -1566,20 +1566,36 @@ void physical_page_release_batch(struct physical_page_allocator *a,
         physical_page_release_buddy(a, addresses[i], 0U, &work);
 }
 
+static void acquire_page_locked(struct physical_page_allocator *a, uint64_t address,
+    struct page_work *work)
+{
+    uint32_t page;
+    if (!physical_page_allocator_is_finalized(a) ||
+        !page_lookup_work(a, address, 0, &page, work)) __builtin_trap();
+    struct buddy_owner head = {.first=page, .order=0, .state=BUDDY_ALLOCATED};
+    if (!head_valid(a, &head, work) ||
+        a->metadata[page].state != PHYSICAL_PAGE_STATE_ALLOCATED_HEAD ||
+        a->metadata[page].reference_count == UINT32_MAX) __builtin_trap();
+    a->metadata[page].reference_count++;
+    page_written(work);
+}
+
 enum physical_page_status physical_page_acquire(struct physical_page_allocator *a,
                                                 uint64_t address)
 {
     PAGE_METADATA_SCOPE(work, a);
-    uint32_t page;
-    if (!physical_page_allocator_is_finalized(a) ||
-        !page_lookup_work(a, address, 0, &page, &work)) __builtin_trap();
-    struct buddy_owner head = {.first=page, .order=0, .state=BUDDY_ALLOCATED};
-    if (!head_valid(a, &head, &work) ||
-        a->metadata[page].state != PHYSICAL_PAGE_STATE_ALLOCATED_HEAD ||
-        a->metadata[page].reference_count == UINT32_MAX) __builtin_trap();
-    a->metadata[page].reference_count++;
-    page_written(&work);
+    acquire_page_locked(a, address, &work);
     return PHYSICAL_PAGE_STATUS_OK;
+}
+
+void physical_page_acquire_batch(struct physical_page_allocator *a,
+    const uint64_t *addresses, unsigned count)
+{
+    if (!count) return;
+    if (!addresses || count > PHYSICAL_PAGE_REFERENCE_BATCH_MAX) __builtin_trap();
+    PAGE_METADATA_SCOPE(work, a);
+    for (unsigned i = 0; i < count; i++)
+        acquire_page_locked(a, addresses[i], &work);
 }
 
 enum physical_page_status
