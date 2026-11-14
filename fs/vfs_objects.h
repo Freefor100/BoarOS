@@ -142,6 +142,9 @@ struct kernel_vfs_backend {
     enum kernel_vfs_execution read_execution;
     enum kernel_vfs_execution file_operation_execution;
     enum kernel_vfs_execution namespace_execution;
+    /* Existing positive dentries are authoritative: all name changes use VFS
+     * parent qualification and update its index before releasing it. */
+    bool owns_dentry_names;
     int (*check_domain)(const struct kernel_vfs_node *, const struct kernel_heap *,
         const struct physical_page_allocator *);
     int (*error)(struct kernel_vfs_instance *instance);

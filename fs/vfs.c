@@ -2123,6 +2123,23 @@ static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
     if (((struct kernel_vfs_node *)parent->file.private_data)->unlinked) return -KERNEL_ENOENT;
     for (size_t i=0;i<name_length;i++) if (name[i]=='/' || !name[i]) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance=mount->private_data;
+    struct kernel_vfs_dentry *entry=NULL;
+    char key[256];memcpy(key,name,name_length);key[name_length]=0;
+    if (instance->ops->owns_dentry_names) {
+        /* The held parent qualification spans backend mutation and dentry
+         * publication. A retained positive name needs no second disk lookup;
+         * pseudo-filesystems with independent name changes still revalidate. */
+        {
+            KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+            entry=find_path(instance,parent->dentry,key);
+            if (entry && dentry_acquire(entry)) __builtin_trap();
+        }
+        if (entry) {
+            result=instance->ops->error ? instance->ops->error(instance) : 0;
+            if (result) {dentry_release(&entry);return result;}
+            goto Found;
+        }
+    }
     uint64_t inode;uint32_t mode;
     result=instance->ops->lookup(instance,kernel_vfs_path_inode(parent),name,name_length,&inode,&mode);
     if (result) return result;
@@ -2132,8 +2149,7 @@ static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
         if (result) return result;
         name=canonical;name_length=strlen(name);
     }
-    char key[256];memcpy(key,name,name_length);key[name_length]=0;
-    struct kernel_vfs_dentry *entry=NULL;
+    memcpy(key,name,name_length);key[name_length]=0;
     {
         KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
         entry=find_path(instance,parent->dentry,key);
@@ -2150,6 +2166,7 @@ static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
         if (result) {dentry_release(&entry->parent);kernel_heap_release(entry->heap,entry);return result;}
         result=register_path(&entry);if (result) return result;
     }
+Found:
     result=path_wrap(mount,entry,owner);dentry_release(&entry);
     if (!result) {result=enter_mounts(owner,walk ? walk->resolve : 0);if (result) (void)kernel_vfs_path_release(owner);}
     return result;

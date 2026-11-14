@@ -247,7 +247,7 @@ static int ext4_dir_iterator_seek(struct ext4_dir_iter *it, uint64_t pos)
 		if (r != EOK)
 			return r;
 
-		r = ext4_trans_block_get(bdev, &it->curr_blk, next_blk);
+		r = ext4_block_get(bdev, &it->curr_blk, next_blk);
 		if (r != EOK) {
 			it->curr_blk.lb_id = 0;
 			return r;
@@ -458,7 +458,7 @@ int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
 
 int ext4_dir_find_entry(struct ext4_dir_search_result *result,
 			struct ext4_inode_ref *parent, const char *name,
-			uint32_t name_len)
+			uint32_t name_len, bool write)
 {
 	int r;
 	struct ext4_sblock *sb = &parent->fs->sb;
@@ -471,7 +471,7 @@ int ext4_dir_find_entry(struct ext4_dir_search_result *result,
 	/* Index search */
 	if ((ext4_sb_feature_com(sb, EXT4_FCOM_DIR_INDEX)) &&
 	    (ext4_inode_has_flag(parent->inode, EXT4_INODE_FLAG_INDEX))) {
-		r = ext4_dir_dx_find_entry(result, parent, name_len, name);
+		r = ext4_dir_dx_find_entry(result, parent, name_len, name, write);
 		return r == EXT4_ERR_BAD_DX_DIR ? EUCLEAN : r;
 	}
 #endif
@@ -493,7 +493,8 @@ int ext4_dir_find_entry(struct ext4_dir_search_result *result,
 
 		/* Load data block */
 		struct ext4_block b;
-		r = ext4_trans_block_get(parent->fs->bdev, &b, fblock);
+		r = write ? ext4_trans_block_get(parent->fs->bdev, &b, fblock) :
+            ext4_block_get(parent->fs->bdev, &b, fblock);
 		if (r != EOK)
 			return r;
 
@@ -536,7 +537,7 @@ int ext4_dir_remove_entry(struct ext4_inode_ref *parent, const char *name,
 
 	/* Try to find entry */
 	struct ext4_dir_search_result result = {0};
-	int rc = ext4_dir_find_entry(&result, parent, name, name_len);
+	int rc = ext4_dir_find_entry(&result, parent, name, name_len, true);
 	if (rc == EOK) rc = ext4_dir_remove_found(parent, &result);
 	int cleanup = ext4_dir_destroy_result(parent, &result);
 	return rc == EOK ? cleanup : rc;
@@ -724,7 +725,7 @@ int ext4_dir_check_empty(struct ext4_inode_ref *dir, bool *empty)
         if (r != EOK) return r;
         if (!home || home >= dir->fs->bdev->lg_bcnt) return EUCLEAN;
         struct ext4_block block = EXT4_BLOCK_ZERO();
-        r = ext4_trans_block_get(dir->fs->bdev, &block, home);
+        r = ext4_block_get(dir->fs->bdev, &block, home);
         if (r != EOK) return r;
         struct ext4_dir_en *first = (void *)block.data;
         bool index_block=false;

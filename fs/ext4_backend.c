@@ -3031,6 +3031,7 @@ static void initialize_backend(void)
     ops->read_execution = KERNEL_VFS_EXECUTION_CALLER;
     ops->file_operation_execution = KERNEL_VFS_EXECUTION_CALLER;
     ops->namespace_execution = KERNEL_VFS_EXECUTION_CALLER;
+    ops->owns_dentry_names = true;
     ops->error = ext4_backend_error;
     ops->root = ext4_backend_root;
     ops->lookup = ext4_backend_lookup;

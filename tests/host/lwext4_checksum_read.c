@@ -2,6 +2,7 @@
 #define main metadata_main
 #include "lwext4_metadata.c"
 #undef main
+#include <ext4_dir.h>
 #include <stddef.h>
 
 static ext4_file *second_reader;
@@ -47,6 +48,40 @@ uint32_t __wrap_ext4_crc32c(uint32_t seed, const void *bytes, uint32_t length)
         }
     }
     return __real_ext4_crc32c(seed, bytes, length);
+}
+
+static void readonly_directory_queries(struct ext4_fs *fs, struct ext4_blockdev *dev)
+{
+    uint32_t ino, mode;
+    CHECK(ext4_lookup_child("/", EXT4_INODE_ROOT_INDEX, "file", 4, &ino, &mode) == EOK);
+    CHECK(ext4_transaction_begin("/") == EOK);
+    payload_threshold = dev->lg_bsize;
+    payload_allocations = 0;
+    for (unsigned i = 0; i < 8; i++)
+        CHECK(ext4_lookup_child("/", EXT4_INODE_ROOT_INDEX, "file", 4, &ino, &mode) == EOK);
+    printf("directory read: block=%u lookup-payload-allocations=%u\n",
+        dev->lg_bsize, payload_allocations);
+    CHECK(!payload_allocations);
+    struct ext4_inode_ref directory;
+    CHECK(ext4_fs_get_inode_ref_read(fs, EXT4_INODE_ROOT_INDEX, &directory) == EOK);
+    payload_allocations = 0;
+    struct ext4_dir_iter it;
+    CHECK(ext4_dir_iterator_init(&it, &directory, 0) == EOK);
+    while (it.curr) CHECK(ext4_dir_iterator_next(&it) == EOK);
+    CHECK(ext4_dir_iterator_fini(&it) == EOK);
+    CHECK(ext4_fs_put_inode_ref(&directory) == EOK);
+    printf("directory read: block=%u iterator-payload-allocations=%u\n",
+        dev->lg_bsize, payload_allocations);
+    CHECK(!payload_allocations);
+    payload_threshold = 0;
+    ext4_file child;
+    CHECK(ext4_fopen(&child, "/directory-private", "w+") == EOK);
+    CHECK(ext4_lookup_child("/", EXT4_INODE_ROOT_INDEX, "directory-private", 17,
+        &ino, &mode) == EOK && ino == child.inode);
+    CHECK(ext4_fclose(&child) == EOK);
+    CHECK(ext4_transaction_abort("/", ECANCELED) == ECANCELED);
+    CHECK(ext4_lookup_child("/", EXT4_INODE_ROOT_INDEX, "directory-private", 17,
+        &ino, &mode) == ENOENT);
 }
 
 static void reuse_queries(struct ext4_fs *fs, struct ext4_blockdev *dev)
@@ -135,7 +170,8 @@ int main(int argc, char **argv)
     bool gdt = !strcmp(argv[2], "gdt");
     bool dx = !strcmp(argv[2], "dx");
     bool reuse = !strcmp(argv[2], "reuse");
-    CHECK(gdt || dx || reuse || !strcmp(argv[2], "inode"));
+    bool read_directory = !strcmp(argv[2], "directory-read");
+    CHECK(gdt || dx || reuse || read_directory || !strcmp(argv[2], "inode"));
     CHECK(fault_block_open(&disk, argv[1]) == 0);
     unsigned char scratch[512];
     struct ext4_blockdev_iface iface = {.open=dev_open, .close=dev_open,
@@ -147,8 +183,9 @@ int main(int argc, char **argv)
     CHECK(ext4_recover("/") == EOK && ext4_journal_start("/") == EOK);
     struct ext4_fs *fs = dev.fs;
     CHECK(ext4_sb_feature_ro_com(&fs->sb, EXT4_FRO_COM_METADATA_CSUM));
-    if (reuse) {
-        reuse_queries(fs, &dev);
+    if (reuse || read_directory) {
+        if (reuse) reuse_queries(fs, &dev);
+        else readonly_directory_queries(fs, &dev);
         CHECK(ext4_journal_stop("/") == EOK);
         CHECK(ext4_umount("/") == EOK && !live_allocations);
         fault_block_close(&disk);

@@ -737,6 +737,36 @@ struct kernel_task *scheduler_select_next_locked(struct kernel_cpu *cpu,
     return claim_next_locked(cpu, previous, ready_allowed ? ready_best_locked() : 0);
 }
 
+/* External deadlines remain actionable even while a CPU cannot switch its
+ * current task. A consumed CPU budget only needs the pending reschedule flag. */
+static uint64_t event_deadline_locked(struct kernel_cpu *cpu,uint64_t deadline)
+{
+#if BOAROS_MAX_CPUS == 1
+    (void)cpu;
+#endif
+#if BOAROS_USER_SMP
+    uint64_t wait_deadline=cpu->logical_id?0:__atomic_load_n(&scheduler.wait_deadline,__ATOMIC_ACQUIRE);
+    if (wait_deadline && (!deadline || wait_deadline < deadline)) deadline=wait_deadline;
+#else
+    struct kernel_task *blocked =
+#if BOAROS_MAX_CPUS > 1
+        cpu->logical_id ? 0 :
+#endif
+        deadline_index_first();
+    if (blocked != 0 && (!deadline || blocked->wait.deadline < deadline))
+        deadline = blocked->wait.deadline;
+#endif
+    uint64_t event=0;
+#if BOAROS_MAX_CPUS > 1
+    if (!cpu->logical_id)
+#endif
+        event=kernel_timer_fd_deadline();
+    if (event && (!deadline || event<deadline)) deadline=event;
+    event=kernel_posix_timer_deadline();
+    if(event&&(!deadline||event<deadline))deadline=event;
+    return deadline;
+}
+
 uint64_t scheduler_deadline_locked(struct kernel_cpu *cpu)
 {
     uint64_t delay = kernel_rt_bandwidth_delay(&cpu->rt_bandwidth,
@@ -770,28 +800,7 @@ uint64_t scheduler_deadline_locked(struct kernel_cpu *cpu)
         if (status == KERNEL_TIME_STATUS_DEADLINE_PASSED) deadline = arch_time_read() + 1U;
         else if (status != KERNEL_TIME_STATUS_OK) __builtin_trap();
     }
-    /* 最早阻塞期限与 RT/时间片预算同为 tick 域；取最小者编入硬件事件。 */
-#if BOAROS_USER_SMP
-    uint64_t wait_deadline=cpu->logical_id?0:__atomic_load_n(&scheduler.wait_deadline,__ATOMIC_ACQUIRE);
-    if (wait_deadline && (!deadline || wait_deadline < deadline)) deadline=wait_deadline;
-#else
-    struct kernel_task *blocked =
-#if BOAROS_MAX_CPUS > 1
-        cpu->logical_id ? 0 :
-#endif
-        deadline_index_first();
-    if (blocked != 0 && (!deadline || blocked->wait.deadline < deadline))
-        deadline = blocked->wait.deadline;
-#endif
-    uint64_t event=0;
-#if BOAROS_MAX_CPUS > 1
-    if (!cpu->logical_id)
-#endif
-        event=kernel_timer_fd_deadline();
-    if (event && (!deadline || event<deadline)) deadline=event;
-    event=kernel_posix_timer_deadline();
-    if(event&&(!deadline||event<deadline))deadline=event;
-    return deadline;
+    return event_deadline_locked(cpu,deadline);
 }
 
 void scheduler_arm_timer(uint64_t deadline)
@@ -967,7 +976,7 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
                 if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
             }
             scheduler_account_runtime_locked();
-            deadline = scheduler_deadline_locked(cpu);
+            deadline = event_deadline_locked(cpu,0);
         }
         if (voluntary) __builtin_trap();
         kernel_cpu_request_schedule(cpu);

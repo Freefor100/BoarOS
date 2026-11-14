@@ -178,6 +178,10 @@ struct kernel_mm_record {
     struct kernel_wait_queue lazy_drained;
     uint32_t lazy_borrows, lazy_registered;
     uint64_t lazy_seen_round, lazy_birth;
+    /* Each CPU owns its slot while preemption is disabled. Zero is unseen;
+     * publication generations start at one. Keep completion across MM switches
+     * without a new shared lock. */
+    uint64_t instruction_seen[BOAROS_MAX_CPUS];
 };
 
 /* 关闭位与归还计数共用原子字：最后归还者不需要跨变量猜测是否有人排空。
@@ -567,6 +571,7 @@ enum kernel_mm_status kernel_mm_create(
 
     clear_page(pointer);
     record = pointer;
+    record->instruction_generation = 1;
     record->futex_id = reserve_mm_identity();
     if (!record->futex_id) return abandon_unresolved_record(mm, allocator,
         record_page_address, KERNEL_MM_STATUS_NO_MEMORY);
@@ -1522,6 +1527,7 @@ static enum kernel_mm_status mm_fork_impl(
     }
     clear_page(pointer);
     destination_record = pointer;
+    destination_record->instruction_generation = 1;
     destination_record->futex_id = reserve_mm_identity();
     if (!destination_record->futex_id) return abandon_unresolved_record(destination,
         source->allocator, record_page_address, KERNEL_MM_STATUS_NO_MEMORY);
@@ -4332,8 +4338,13 @@ enum kernel_mm_status kernel_mm_flush_instructions(struct kernel_mm *mm, int loc
     }
     arch_mmu_sync_instruction_cpus(targets);
     /* 远端可在等待期间发布更新代次，不能把它冒充为本次已同步。 */
-    if (cpu->active_mm_record==record)
-        cpu->active_mm_instruction_generation=generation;
+    if (cpu->active_mm_record==record) {
+        unsigned logical = 0;
+#if BOAROS_MAX_CPUS > 1
+        logical = cpu->logical_id;
+#endif
+        record->instruction_seen[logical] = generation;
+    }
     kernel_preempt_enable();
     if (kernel_mm_release(&owner)) __builtin_trap();
     return KERNEL_MM_STATUS_OK;
@@ -4385,17 +4396,21 @@ enum kernel_mm_status kernel_mm_activate(const struct kernel_mm *next, uint64_t 
         /* A root switch already flushed translations. Record only captured
          * generations; a concurrent newer publication needs its own sync. */
         if (!changed && (joining || cpu->active_mm_generation != generation)) arch_mmu_flush_all();
-        if (joining || cpu->active_mm_instruction_generation != instructions) arch_mmu_sync_instructions();
+        if (record->instruction_seen[logical] != instructions) {
+            COST_ADD(MM_ACTIVATE_INSTRUCTION_FLUSHES, 1);
+            arch_mmu_sync_instructions();
+            /* Only the captured generation was completed. A concurrent newer
+             * publication remains pending even if it raced with this fence. */
+            record->instruction_seen[logical] = instructions;
+        }
         cpu->active_mm_record = record;
         cpu->active_mm_generation = generation;
-        cpu->active_mm_instruction_generation = instructions;
     } else {
         if (arch_mmu_switch_context(kernel_context) != ARCH_MMU_STATUS_OK) {
             status = KERNEL_MM_STATUS_ADDRESS_SPACE; goto out;
         }
         cpu->active_mm_record = 0;
         cpu->active_mm_generation = 0;
-        cpu->active_mm_instruction_generation = 0;
     }
     if (previous && previous != record) {
 #if BOAROS_MAX_CPUS > 1

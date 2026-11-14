@@ -10,6 +10,14 @@
 #include <kernel/tmpfs.h>
 #include <kernel/credentials.h>
 #include "../../fs/pipe_internal.h"
+static unsigned retained_name_lookups;
+int __real_ext4_lookup_child(const char *,uint32_t,const char *,size_t,uint32_t *,uint32_t *);
+int __wrap_ext4_lookup_child(const char *mount,uint32_t parent,const char *name,size_t length,
+    uint32_t *inode,uint32_t *mode)
+{
+    retained_name_lookups++;
+    return __real_ext4_lookup_child(mount,parent,name,length,inode,mode);
+}
 static unsigned credential_pin_pause,credential_pin_entered,credential_pin_resume;
 enum kernel_uaccess_status __real_kernel_uaccess_pin_user_page(struct kernel_mm *,uint64_t,uint32_t,struct kernel_mm_user_pin *);
 enum kernel_uaccess_status __wrap_kernel_uaccess_pin_user_page(struct kernel_mm *mm,uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin)

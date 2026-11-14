@@ -63,13 +63,13 @@ int __wrap_ext4_fs_put_inode_ref(struct ext4_inode_ref *ref)
 }
 
 int __real_ext4_dir_find_entry(struct ext4_dir_search_result *, struct ext4_inode_ref *,
-    const char *, uint32_t);
+    const char *, uint32_t, bool);
 int __wrap_ext4_dir_find_entry(struct ext4_dir_search_result *result, struct ext4_inode_ref *parent,
-    const char *name, uint32_t length)
+    const char *name, uint32_t length, bool write)
 {
     if (create_ref.active && strlen(create_ref.name) == length && !memcmp(create_ref.name, name, length))
         create_ref.searches++;
-    return __real_ext4_dir_find_entry(result, parent, name, length);
+    return __real_ext4_dir_find_entry(result, parent, name, length, write);
 }
 
 int __real_ext4_dir_add_entry(struct ext4_inode_ref *, const char *, uint32_t, struct ext4_inode_ref *);

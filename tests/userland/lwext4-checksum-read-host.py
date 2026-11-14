@@ -12,7 +12,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source-root', type=Path, default=ROOT)
     parser.add_argument('--output', type=Path, default=ROOT/'build/lwext4-checksum-read-host')
-    parser.add_argument('--modes', nargs='+', choices=('gdt', 'inode', 'dx', 'reuse'), default=('gdt', 'inode', 'dx', 'reuse'))
+    parser.add_argument('--modes', nargs='+', choices=('gdt', 'inode', 'dx', 'reuse', 'directory-read'), default=('gdt', 'inode', 'dx', 'reuse', 'directory-read'))
     parser.add_argument('--page-shift', type=int, choices=(12, 14), default=12)
     args = parser.parse_args()
     source = args.source_root.resolve(); out = args.output.resolve(); out.mkdir(parents=True, exist_ok=True)
