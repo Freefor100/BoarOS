@@ -216,6 +216,10 @@ DEMAND_PAGE_OOM_TEST_KERNEL_RV := \
 ROOT_BOOT_CLEANUP_TEST_KERNEL_RV := \
 	$(BUILD_DIR)/tests/kernel-root-boot-cleanup-rv
 
+# A build cache may be named by an absolute or repository-relative path.
+# Both target spellings must receive the same generated header dependencies.
+DEP_TARGET_FLAGS = -MQ '$(abspath $@)' -MQ '$(patsubst $(CURDIR)/%,%,$(abspath $@))'
+
 ARCH_FLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany
 CPPFLAGS := -DBOAROS_LOCK_DEBUG=$(LOCK_DEBUG) -DBOAROS_COST_DIAGNOSTICS=$(COST_DIAGNOSTICS) -Iinclude -DBOAROS_PAGE_SHIFT=12 \
 	-DBOAROS_UTS_MACHINE=\"riscv64\"
@@ -760,7 +764,7 @@ $(BUILD_DIR)/tests/riscv/journal_group_main.o: CPPFLAGS += -Ifs/lwext4_config -I
 $(BUILD_DIR)/tests/riscv/journal_group_backend.o: CPPFLAGS += -Ifs/lwext4_config -Ithird_party/lwext4/include -DCONFIG_USE_DEFAULT_CFG=0 -Dkernel_time_monotonic_ns=journal_group_time_monotonic_ns
 $(BUILD_DIR)/tests/riscv/journal_group_backend.o: fs/ext4_backend.c $(BUILD_DIR)/generated/cost-config.h
 	@mkdir -p $(dir $@)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP $(DEP_TARGET_FLAGS) -c $< -o $@
 -include $(BUILD_DIR)/tests/riscv/journal_group_main.d
 -include $(BUILD_DIR)/tests/riscv/journal_group_backend.d
 $(JOURNAL_GROUP_KERNEL): $(JOURNAL_GROUP_RUNTIME_OBJECTS) $(BUILD_DIR)/kernel/dtb.o $(BUILD_DIR)/tests/riscv/journal_group_main.o arch/riscv/linker.ld
@@ -829,7 +833,7 @@ $(VFS_RECOVERY_TEST_KERNEL_RV): $(VFS_RECOVERY_TEST_OBJECTS) \
 $(VFS_RECOVERY_TEST_MAIN_OBJECT): tests/riscv/vfs_main.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DVFS_EXPECT_RECOVERY \
-		-MMD -MP -c $< -o $@
+		-MMD -MP $(DEP_TARGET_FLAGS) -c $< -o $@
 
 $(SV39_TEST_KERNEL_RV): $(SV39_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/tests/kernel-sv39-rv.map \
@@ -905,11 +909,11 @@ $(FILES_PARTIAL_WRITE_TEST_KERNEL_RV): \
 $(FILES_PARTIAL_WRITE_TEST_MAIN_OBJECT): tests/riscv/files_main.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(LWEXT4_CPPFLAGS) $(CFLAGS) \
-		-DFILES_PARTIAL_WRITE_TEST -MMD -MP -c $< -o $@
+		-DFILES_PARTIAL_WRITE_TEST -MMD -MP $(DEP_TARGET_FLAGS) -c $< -o $@
 
 $(ROOT_INIT_PROGRAM_OBJECT_RV): tests/riscv/root_init.S
 	@mkdir -p $(dir $@)
-	$(CC) $(CPPFLAGS) $(ASFLAGS) -MMD -MP -c $< -o $@
+	$(CC) $(CPPFLAGS) $(ASFLAGS) -MMD -MP $(DEP_TARGET_FLAGS) -c $< -o $@
 
 $(ROOT_INIT_PROGRAM_RV): $(ROOT_INIT_PROGRAM_OBJECT_RV) \
 		tests/riscv/user_elf.ld
@@ -919,7 +923,7 @@ $(ROOT_INIT_PROGRAM_RV): $(ROOT_INIT_PROGRAM_OBJECT_RV) \
 
 $(ROOT_ORPHAN_PROGRAM_OBJECT_RV): tests/riscv/root_orphan_init.S
 	@mkdir -p $(dir $@)
-	$(CC) $(CPPFLAGS) $(ASFLAGS) -MMD -MP -c $< -o $@
+	$(CC) $(CPPFLAGS) $(ASFLAGS) -MMD -MP $(DEP_TARGET_FLAGS) -c $< -o $@
 
 $(ROOT_ORPHAN_PROGRAM_RV): $(ROOT_ORPHAN_PROGRAM_OBJECT_RV) \
 		tests/riscv/user_elf.ld
@@ -929,7 +933,7 @@ $(ROOT_ORPHAN_PROGRAM_RV): $(ROOT_ORPHAN_PROGRAM_OBJECT_RV) \
 
 $(UACCESS_OOM_PROGRAM_OBJECT_RV): tests/riscv/uaccess_oom.S
 	@mkdir -p $(dir $@)
-	$(CC) $(CPPFLAGS) $(ASFLAGS) -MMD -MP -c $< -o $@
+	$(CC) $(CPPFLAGS) $(ASFLAGS) -MMD -MP $(DEP_TARGET_FLAGS) -c $< -o $@
 
 $(UACCESS_OOM_PROGRAM_RV): $(UACCESS_OOM_PROGRAM_OBJECT_RV) \
 		tests/riscv/user_elf.ld
@@ -940,18 +944,18 @@ $(UACCESS_OOM_PROGRAM_RV): $(UACCESS_OOM_PROGRAM_OBJECT_RV) \
 $(ROOT_EXEC_STAGE2_OBJECT_RV): tests/riscv/root_exec_stage.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(ASFLAGS) -DROOT_EXEC_STAGE=2 \
-		-MMD -MP -c $< -o $@
+		-MMD -MP $(DEP_TARGET_FLAGS) -c $< -o $@
 
 $(ROOT_EXEC_STAGE3_OBJECT_RV): tests/riscv/root_exec_stage.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(ASFLAGS) -DROOT_EXEC_STAGE=3 \
-		-MMD -MP -c $< -o $@
+		-MMD -MP $(DEP_TARGET_FLAGS) -c $< -o $@
 
 $(ROOT_EXEC_STAGE3_OOM_OBJECT_RV): tests/riscv/root_exec_stage.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(ASFLAGS) -DROOT_EXEC_STAGE=3 \
 		-DROOT_FAULT_WAIT_STATUS=9 -DROOT_FAULT_INJECT_OOM=1 \
-		-MMD -MP -c $< -o $@
+		-MMD -MP $(DEP_TARGET_FLAGS) -c $< -o $@
 
 $(ROOT_EXEC_STAGE2_RV): $(ROOT_EXEC_STAGE2_OBJECT_RV) \
 		tests/riscv/user_elf.ld
@@ -988,7 +992,7 @@ $(ROOT_BOOT_CLEANUP_TEST_KERNEL_RV): $(OBJECTS) \
 
 $(BUILD_DIR)/%.o: %.c $(BUILD_DIR)/generated/cost-config.h
 	@mkdir -p $(dir $@)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP $(DEP_TARGET_FLAGS) -c $< -o $@
 
 $(BUILD_DIR)/fs/lwext4_port.o $(BUILD_DIR)/fs/ext4_backend.o $(BUILD_DIR)/fs/page_cache.o: \
 	CPPFLAGS += $(LWEXT4_CPPFLAGS)
@@ -1004,11 +1008,11 @@ $(BUILD_DIR)/third_party/lwext4/src/%.o: \
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(LWEXT4_CPPFLAGS) $(CFLAGS) \
 		-Wno-unused-but-set-variable -Wno-stringop-truncation \
-		-MMD -MP -c $< -o $@
+		-MMD -MP $(DEP_TARGET_FLAGS) -c $< -o $@
 
 $(BUILD_DIR)/%.o: %.S $(BUILD_DIR)/generated/cost-config.h
 	@mkdir -p $(dir $@)
-	$(CC) $(CPPFLAGS) $(ASFLAGS) -MMD -MP -c $< -o $@
+	$(CC) $(CPPFLAGS) $(ASFLAGS) -MMD -MP $(DEP_TARGET_FLAGS) -c $< -o $@
 
 run-riscv: $(KERNEL_RV)
 	$(QEMU_RISCV64) -machine virt -bios default -kernel $< \
@@ -1900,7 +1904,7 @@ test-allocator-concurrency-host:
 
 $(BUILD_DIR)/sync-%.o: tests/common/sync.c Makefile
 	@mkdir -p $(dir $@)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -DBOAROS_SYNC_CASE=$* -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP $(DEP_TARGET_FLAGS) -DBOAROS_SYNC_CASE=$* -c $< -o $@
 $(BUILD_DIR)/sync-%: $(OBJECTS) $(BUILD_DIR)/sync-%.o arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_main -o $@ $(OBJECTS) $(BUILD_DIR)/sync-$*.o
 .PHONY: test-sync-riscv
@@ -1916,7 +1920,7 @@ test-wait-host:
 
 $(BUILD_DIR)/wait-native.o: tests/common/wait.c Makefile
 	@mkdir -p $(dir $@)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP $(DEP_TARGET_FLAGS) -c $< -o $@
 $(BUILD_DIR)/wait-native: $(OBJECTS) $(BUILD_DIR)/wait-native.o arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_scheduler_init,--wrap=kernel_wait_backend_switch,--wrap=kernel_wait_backend_switch_locked -o $@ $(OBJECTS) $(BUILD_DIR)/wait-native.o
 .PHONY: test-wait-riscv
@@ -1925,7 +1929,7 @@ test-wait-riscv: $(BUILD_DIR)/wait-native
 
 $(BUILD_DIR)/sched-lifecycle-native.o: tests/common/wait.c Makefile
 	@mkdir -p $(dir $@)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -DBOAROS_SCHED_LIFECYCLE=1 -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP $(DEP_TARGET_FLAGS) -DBOAROS_SCHED_LIFECYCLE=1 -c $< -o $@
 $(BUILD_DIR)/sched-lifecycle-native: $(OBJECTS) $(BUILD_DIR)/sched-lifecycle-native.o arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_scheduler_init,--wrap=kernel_wait_backend_switch,--wrap=kernel_wait_backend_switch_locked -o $@ $(OBJECTS) $(BUILD_DIR)/sched-lifecycle-native.o
 .PHONY: test-sched-lifecycle-riscv
