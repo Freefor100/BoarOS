@@ -35,13 +35,13 @@ static bool source_search_match(struct ext4_inode_ref *parent,const char *name,u
     return source_search.active && parent->index==source_search.parent &&
         strlen(source_search.name)==length && !memcmp(source_search.name,name,length);
 }
-int __real_ext4_dir_find_entry(struct ext4_dir_search_result *,struct ext4_inode_ref *,const char *,uint32_t);
+int __real_ext4_dir_find_entry(struct ext4_dir_search_result *,struct ext4_inode_ref *,const char *,uint32_t,bool);
 int __wrap_ext4_dir_find_entry(struct ext4_dir_search_result *found,struct ext4_inode_ref *parent,
-    const char *name,uint32_t length)
+    const char *name,uint32_t length, bool write)
 {
     bool watched=source_search_match(parent,name,length);
     if(watched && !source_search.depth++)source_search.lookups++;
-    int result=__real_ext4_dir_find_entry(found,parent,name,length);
+    int result=__real_ext4_dir_find_entry(found,parent,name,length,write);
     if(watched && result==EOK) {
         if(!source_search.first_leaf)source_search.first_leaf=found->block.lb_id;
         source_search.last_leaf=found->block.lb_id;
@@ -431,7 +431,7 @@ static void damage(struct ext4_fs *fs, const char *kind)
     CHECK(ext4_fs_get_inode_ref(fs, number, &ref) == EOK);
     if (!strcmp(kind, "entry")) {
         struct ext4_dir_search_result found;
-        CHECK(ext4_dir_find_entry(&found, &ref, "source", 6) == EOK);
+        CHECK(ext4_dir_find_entry(&found, &ref, "source", 6, true) == EOK);
         ext4_dir_en_set_entry_len(found.dentry, 4);
         ext4_dir_set_csum(&ref, (void *)found.block.data);
         CHECK(ext4_blocks_set_direct(fs->bdev, found.block.data, found.block.lb_id, 1) == EOK);

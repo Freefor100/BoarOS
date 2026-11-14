@@ -82,7 +82,7 @@ int ext4_dir_dx_init(struct ext4_inode_ref *dir,
  */
 int ext4_dir_dx_find_entry(struct ext4_dir_search_result *result,
 			   struct ext4_inode_ref *inode_ref, size_t name_len,
-			   const char *name);
+			   const char *name, bool write);
 
 /**@brief Add new entry to indexed directory
  * @param parent Directory i-node

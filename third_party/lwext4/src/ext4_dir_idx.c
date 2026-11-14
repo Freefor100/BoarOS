@@ -535,7 +535,7 @@ static int ext4_dir_dx_get_leaf(struct ext4_hash_info *hinfo,
 				struct ext4_inode_ref *inode_ref,
 				struct ext4_block *root_block,
 				struct ext4_dir_idx_block **dx_block,
-				struct ext4_dir_idx_block *dx_blocks)
+				struct ext4_dir_idx_block *dx_blocks, bool write)
 {
 	struct ext4_dir_idx_root *root;
 	struct ext4_dir_idx_entry *entries;
@@ -604,7 +604,8 @@ static int ext4_dir_dx_get_leaf(struct ext4_hash_info *hinfo,
 			return r;
 
 		tmp_blk = &(tmp_dx_blk + 1)->b;
-		r = ext4_trans_block_get(inode_ref->fs->bdev, tmp_blk, fblk);
+		r = write ? ext4_trans_block_get(inode_ref->fs->bdev, tmp_blk, fblk) :
+            ext4_block_get(inode_ref->fs->bdev, tmp_blk, fblk);
 		if (r != EOK)
 			return r;
 		++tmp_dx_blk;
@@ -678,7 +679,7 @@ static int ext4_dir_dx_next_block(struct ext4_inode_ref *inode_ref,
 			return r;
 
 		struct ext4_block b;
-		r = ext4_trans_block_get(inode_ref->fs->bdev, &b, blk_adr);
+		r = ext4_block_get(inode_ref->fs->bdev, &b, blk_adr);
 		if (r != EOK)
 			return r;
 
@@ -706,7 +707,7 @@ static int ext4_dir_dx_next_block(struct ext4_inode_ref *inode_ref,
 
 int ext4_dir_dx_find_entry(struct ext4_dir_search_result *result,
 			   struct ext4_inode_ref *inode_ref, size_t name_len,
-			   const char *name)
+			   const char *name, bool write)
 {
 	/* Load direct block 0 (index root) */
 	ext4_fsblk_t root_block_addr;
@@ -719,7 +720,7 @@ int ext4_dir_dx_find_entry(struct ext4_dir_search_result *result,
 	struct ext4_fs *fs = inode_ref->fs;
 
 	struct ext4_block root_block;
-	rc = ext4_trans_block_get(fs->bdev, &root_block, root_block_addr);
+	rc = ext4_block_get(fs->bdev, &root_block, root_block_addr);
 	if (rc != EOK)
 		return rc;
 
@@ -745,7 +746,7 @@ int ext4_dir_dx_find_entry(struct ext4_dir_search_result *result,
 	struct ext4_dir_idx_block *tmp;
 
 	rc = ext4_dir_dx_get_leaf(&hinfo, inode_ref, &root_block, &dx_block,
-				  dx_blocks);
+				  dx_blocks, false);
 	if (rc != EOK)
 		goto cleanup;
 
@@ -761,7 +762,8 @@ int ext4_dir_dx_find_entry(struct ext4_dir_search_result *result,
 		if (rc != EOK)
 			goto cleanup;
 
-		rc = ext4_trans_block_get(fs->bdev, &b, leaf_block_addr);
+		rc = write ? ext4_trans_block_get(fs->bdev, &b, leaf_block_addr) :
+            ext4_block_get(fs->bdev, &b, leaf_block_addr);
 		if (rc != EOK)
 			goto cleanup;
 
@@ -1248,7 +1250,7 @@ int ext4_dir_dx_add_entry(struct ext4_inode_ref *parent,
 	struct ext4_dir_idx_block *dx_blk;
 	struct ext4_dir_idx_block *dx_it;
 
-	r = ext4_dir_dx_get_leaf(&hinfo, parent, &root_blk, &dx_blk, dx_blks);
+	r = ext4_dir_dx_get_leaf(&hinfo, parent, &root_blk, &dx_blk, dx_blks, true);
 	if (r != EOK)
 		goto release_index;
 
@@ -1406,7 +1408,7 @@ int ext4_dir_dx_is_node(struct ext4_inode_ref *dir, uint32_t logical, bool *is_n
     if(r!=EOK)return r;
     if(!home || home>=dir->fs->bdev->lg_bcnt)return EUCLEAN;
     struct ext4_block block=EXT4_BLOCK_ZERO();
-    r=ext4_trans_block_get(dir->fs->bdev,&block,home);
+    r=ext4_block_get(dir->fs->bdev,&block,home);
     if(r!=EOK)return r;
     r=ext4_dir_dx_check(dir,&block);
     if(r==EOK) {
@@ -1425,7 +1427,7 @@ int ext4_dir_dx_is_node(struct ext4_inode_ref *dir, uint32_t logical, bool *is_n
 }
 
 static int ext4_dir_parent_block(struct ext4_inode_ref *dir, struct ext4_block *block,
-                                 struct ext4_dir_en **entry)
+                                 struct ext4_dir_en **entry, bool write)
 {
     struct ext4_sblock *sb = &dir->fs->sb;
     if (!ext4_inode_is_type(sb, dir->inode, EXT4_INODE_MODE_DIRECTORY)) return ENOTDIR;
@@ -1435,7 +1437,8 @@ static int ext4_dir_parent_block(struct ext4_inode_ref *dir, struct ext4_block *
     int r = ext4_fs_get_inode_dblk_idx(dir, 0, &home, false);
     if (r != EOK) return r;
     if (!home || home >= dir->fs->bdev->lg_bcnt) return EUCLEAN;
-    r = ext4_trans_block_get(dir->fs->bdev, block, home);
+    r = write ? ext4_trans_block_get(dir->fs->bdev, block, home) :
+        ext4_block_get(dir->fs->bdev, block, home);
     if (r != EOK) return r;
     struct ext4_dir_en *dot = (void *)block->data;
     struct ext4_dir_en *parent = (void *)(block->data + 12);
@@ -1462,7 +1465,7 @@ int ext4_dir_parent_inode(struct ext4_inode_ref *dir, uint32_t *parent)
 {
     struct ext4_block block = EXT4_BLOCK_ZERO();
     struct ext4_dir_en *entry;
-    int r = ext4_dir_parent_block(dir, &block, &entry);
+    int r = ext4_dir_parent_block(dir, &block, &entry, false);
     if (r != EOK) return r;
     uint32_t ino = ext4_dir_en_get_inode(entry);
     r = ext4_block_set(dir->fs->bdev, &block);
@@ -1475,7 +1478,7 @@ int ext4_dir_reparent(struct ext4_inode_ref *dir, uint32_t expected_parent,
 {
     struct ext4_block block = EXT4_BLOCK_ZERO();
     struct ext4_dir_en *entry;
-    int r = ext4_dir_parent_block(dir, &block, &entry);
+    int r = ext4_dir_parent_block(dir, &block, &entry, true);
     if (r != EOK) return r;
     if (ext4_dir_en_get_inode(entry) != expected_parent) r = EUCLEAN;
     if (r == EOK) {
