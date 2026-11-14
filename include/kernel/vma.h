@@ -21,7 +21,8 @@ void kernel_vma_set_clear_locks(struct kernel_vma_set *);
 #define KERNEL_VMA_DONTFORK 4U
 #define KERNEL_VMA_WIPEONFORK 8U
 #define KERNEL_VMA_DONTDUMP 16U
-#define KERNEL_VMA_ALL_FLAGS 31U
+#define KERNEL_VMA_RANDOM_READ 32U
+#define KERNEL_VMA_ALL_FLAGS 63U
 uint64_t kernel_vma_set_data_bytes(const struct kernel_vma_set *set);
 int kernel_vma_is_data(const struct kernel_vma *vma);
 

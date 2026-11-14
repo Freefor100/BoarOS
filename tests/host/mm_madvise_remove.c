@@ -4,6 +4,7 @@
 #undef main
 #include <kernel/shm.h>
 #include <kernel/memory_object.h>
+#include <kernel/ipc_namespace.h>
 #include <stdlib.h>
 
 #define REMOVE_BASE UINT64_C(0x700000)
@@ -320,6 +321,18 @@ int main(int argc,char **argv)
         assert(!kernel_vfs_unmount(&mount)&&!kernel_page_cache_destroy(&cache)&&!kernel_block_unregister(&disk)&&!close(image));
     }
     mm_test_context=0;assert(!kernel_mm_release(&mm)&&!physical_page_release(&pages,kernel.root_address));
+    kernel_task_namespaces_release(kernel_task_current());
+    struct kernel_namespace *initial=kernel_ipc_initial();
+    assert(__atomic_load_n(&initial->references,__ATOMIC_ACQUIRE)==1);
+    struct kernel_ipc_namespace *ipc=kernel_ipc_namespace_state(initial);
+    struct kernel_shm_table *table;
+    {
+        KERNEL_RAW_SCOPE(guard,&ipc->lock);
+        /* This fixture opens only SHM; the initial identity remains permanent. */
+        assert(!ipc->sem&&!ipc->msg&&!ipc->mq);
+        table=ipc->shm;ipc->shm=NULL;
+    }
+    kernel_shm_namespace_destroy(table);
     struct kernel_heap_statistics stats;kernel_heap_get_statistics(&heap,&stats);assert(!stats.live_allocations&&!stats.current_pages);
     kernel_heap_get_statistics(&backend_heap,&stats);assert(!stats.live_allocations&&!stats.current_pages);
     assert(!physical_page_allocator_audit(&pages)&&!physical_page_allocator_audit(&backend_pages)&&

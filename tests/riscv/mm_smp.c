@@ -287,12 +287,12 @@ enum kernel_memory_object_status __wrap_kernel_memory_object_prepare_page(
 #endif
     return result;
 }
-int __real_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *,uint64_t,
+int __real_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *,uint64_t,int,
     struct kernel_open_file_page_preparation *);
-int __wrap_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *file,uint64_t index,
+int __wrap_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *file,uint64_t index,int read_window,
     struct kernel_open_file_page_preparation *prepared)
 {
-    int result=__real_kernel_open_file_prepare_mapping_page(file,index,prepared);
+    int result=__real_kernel_open_file_prepare_mapping_page(file,index,read_window,prepared);
 #if BOAROS_MM_FILE_TEST
     unsigned id=kernel_task_current()==actors[1].task ? 1 : 0;
     if (!result && shared_stage && index==1 && !__atomic_load_n(&shared_entered[id],__ATOMIC_ACQUIRE)) {

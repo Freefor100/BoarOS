@@ -214,7 +214,8 @@ static enum kernel_files_status files_open(
     enum kernel_fs_context_status fs_status;
     enum kernel_files_status files_status;
 
-    int created = 0;
+    struct kernel_vfs_open_result opened={0};
+    KERNEL_FILES_PATH_SCOPE(pathless_link);
     int special_link = 0;
 
     if (!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) ||
@@ -297,16 +298,18 @@ static enum kernel_files_status files_open(
         }
     }
     open_status=kernel_open_file_create_at(files->heap,start,root,path,
-                        &request,&description,&created,&result);
+                        &request,&description,&opened,&result);
+    pathless_link=opened.pathless_link;
     if (open_status==KERNEL_OPEN_FILE_STATUS_OK && result==-KERNEL_ENOENT && !resolve &&
         (request.flags & KERNEL_VFS_OPEN_FOLLOW) &&
-        !(request.flags & (KERNEL_VFS_OPEN_EXCLUSIVE | KERNEL_VFS_OPEN_REGULAR))) {
-        int link_result=kernel_vfs_reopen_link_at(start,fs_paths.root,path,files->heap,
+        !(request.flags & (KERNEL_VFS_OPEN_EXCLUSIVE | KERNEL_VFS_OPEN_REGULAR)) && pathless_link) {
+        int link_result=kernel_vfs_reopen_link(pathless_link,files->heap,
                                                 (uint32_t)flags,&description);
         if (link_result!=-KERNEL_ENOTSUP) {
             result=link_result;special_link=!result;
         }
     }
+    kernel_files_path_guard_release(&pathless_link);
     kernel_files_release_allocation(files, path);
     if (open_status == KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED) {
         if (description != 0) {
@@ -371,7 +374,7 @@ static enum kernel_files_status files_open(
                 return KERNEL_FILES_STATUS_OK;
             }
         }
-        if (!generated && !created && (flags & LINUX_O_TRUNC) != 0U) {
+        if (!generated && !opened.created && (flags & LINUX_O_TRUNC) != 0U) {
             int trunc_result = kernel_vfs_ftruncate(&description->file, 0U);
 
             if (trunc_result != 0) {
@@ -743,6 +746,7 @@ static enum kernel_files_status stat_at_to_user(
     uint64_t flags,
     int64_t *linux_result, int extended)
 {
+    COST_SCOPE(query_cost, FILE_QUERY_TICKS);
     KERNEL_FILES_PIN_SCOPE(pin_guard);
     struct kernel_vfs_stat stat={0};
     KERNEL_FILES_PATH_SCOPE(start);

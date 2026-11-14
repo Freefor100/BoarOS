@@ -166,6 +166,11 @@ enum kernel_page_cache_status kernel_page_cache_get(
     uint64_t page_index,
     uint64_t *physical_address,
     size_t *valid_bytes);
+/* A cold demand may synchronously fill bounded neighbours. Only the target
+ * page result is returned; hot/loading pages retain the scalar path. */
+enum kernel_page_cache_status kernel_page_cache_get_for_fault(
+    struct kernel_page_cache *,const struct kernel_vfs_file *,uint64_t,
+    uint64_t *,size_t *,int read_window,int no_reuse);
 
 #define KERNEL_PAGE_CACHE_READ_BATCH_MAX (131072U / BOAROS_PAGE_SIZE)
 struct kernel_page_cache_read_page {

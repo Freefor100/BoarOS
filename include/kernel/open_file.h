@@ -74,11 +74,13 @@ enum kernel_open_file_kind {
 /* VFS errors are returned through linux_result when status is OK. */
 struct kernel_vfs_path;
 struct kernel_vfs_open_request;
+struct kernel_vfs_open_result;
 enum kernel_open_file_status kernel_open_file_create_at(
     struct kernel_heap *heap, struct kernel_vfs_path *start,
     struct kernel_vfs_path *root, const char *path,
     const struct kernel_vfs_open_request *request,
-    struct kernel_open_file_description **owner, int *created, int *linux_result);
+    struct kernel_open_file_description **owner, struct kernel_vfs_open_result *result,
+    int *linux_result);
 
 /* Exact path owner; detached cleanup is consumed by this OFD, not each dup. */
 int kernel_open_file_create_path(struct kernel_heap *,struct kernel_vfs_path *,
@@ -180,7 +182,7 @@ void kernel_open_file_finish_memory_page(struct kernel_open_file_description *,
     struct kernel_open_file_page_preparation *, int accepted);
 /* 同一准备/接纳契约；disk合法读页已被cache接纳，失败只归还额外页引用。 */
 int kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *,
-    uint64_t index, struct kernel_open_file_page_preparation *);
+    uint64_t index, int read_window, struct kernel_open_file_page_preparation *);
 void kernel_open_file_finish_mapping_page(struct kernel_open_file_description *,
     struct kernel_open_file_page_preparation *, int accepted);
 enum kernel_open_file_status kernel_open_file_check_mapping_domain(
@@ -239,7 +241,7 @@ void kernel_open_file_memory_modified(struct kernel_open_file_description *file)
  * Disk-cache pages always report created == 0 and keep their cache owner. */
 enum kernel_page_cache_status kernel_open_file_get_page_for_fault(
     struct kernel_open_file_description *file, uint64_t page_index,
-    uint64_t *physical_address, size_t *valid_bytes, int *created);
+    uint64_t *physical_address, size_t *valid_bytes, int *created,int read_window);
 void kernel_open_file_discard_new_page(struct kernel_open_file_description *file,
     uint64_t page_index, uint64_t physical_address);
 enum kernel_page_cache_status kernel_open_file_get_page(

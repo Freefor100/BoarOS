@@ -6,6 +6,7 @@
 #include <kernel/file_mapping.h>
 #include <kernel/errno.h>
 #include <kernel/elf64_source.h>
+#include <kernel/vma.h>
 #include <string.h>
 #include "../../fs/open_file_internal.h"
 #include "../../kernel/sched/private.h"
@@ -25,11 +26,72 @@ static struct kernel_heap heap;
 static struct kernel_mm mm;
 static struct kernel_vfs_mount *mount;
 static struct kernel_open_file_description *watched, *callback_file;
+static struct kernel_elf64_source *watched_elf;
 static uint64_t context;
 static unsigned last_releases, pause_callback, callback_after_fence, callback_entered, callback_resume, unmap_done;
 static unsigned fail_close;
+static unsigned fail_page, mincore_pause, mincore_entered, mincore_resume;
+static unsigned self_pin_prepare, self_pin_prepared, self_pin_hold, self_pin_writer_held, self_pin_returned;
+static unsigned elf_pin_prepare, elf_releases;
+static uint64_t self_pin_address;
+static int mincore_result;
+static unsigned mincore_completed;
+static _Thread_local unsigned forbid_backing_scans;
+static void outside_gate(void);
 static void publish(unsigned *flag) { __atomic_store_n(flag,1,__ATOMIC_RELEASE); }
 static void await(unsigned *flag) { while (!__atomic_load_n(flag,__ATOMIC_ACQUIRE)) sched_yield(); }
+int __real_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *,uint64_t,int,
+    struct kernel_open_file_page_preparation *);
+int __wrap_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *file,uint64_t index,int read_window,
+    struct kernel_open_file_page_preparation *prepared)
+{
+    int result=__real_kernel_open_file_prepare_mapping_page(file,index,read_window,prepared);
+    if (!result && __atomic_exchange_n(&self_pin_prepare,0,__ATOMIC_ACQ_REL)) {
+        outside_gate(); publish(&self_pin_prepared); await(&self_pin_writer_held);
+    }
+    return result;
+}
+enum kernel_elf64_source_status __real_kernel_elf64_source_page(struct kernel_elf64_source *,
+    struct physical_page_allocator *,uint64_t,uint64_t *,int *,int);
+enum kernel_elf64_source_status __wrap_kernel_elf64_source_page(struct kernel_elf64_source *source,
+    struct physical_page_allocator *allocator,uint64_t offset,uint64_t *address,int *shared,int read_window)
+{
+    enum kernel_elf64_source_status result=__real_kernel_elf64_source_page(source,allocator,offset,address,shared,read_window);
+    if (!result && __atomic_exchange_n(&elf_pin_prepare,0,__ATOMIC_ACQ_REL)) {
+        outside_gate(); publish(&self_pin_prepared); await(&self_pin_writer_held);
+    }
+    return result;
+}
+void __real_kernel_lock_release(struct kernel_lock_guard *);
+void __wrap_kernel_lock_release(struct kernel_lock_guard *guard)
+{
+    if (kernel_cpu_current()->hardware_id==8 && guard->lock && guard->lock->rank==25 && guard->write &&
+        __atomic_exchange_n(&self_pin_hold,0,__ATOMIC_ACQ_REL)) {
+        assert(!kernel_cpu_current()->raw_locks);
+        publish(&self_pin_writer_held); await(&self_pin_returned);
+    }
+    __real_kernel_lock_release(guard);
+}
+enum kernel_vma_status __real_kernel_vma_set_backing_in_use(const struct kernel_vma_set *,const void *,int *);
+enum kernel_vma_status __wrap_kernel_vma_set_backing_in_use(const struct kernel_vma_set *set,const void *backing,int *used)
+{
+    assert(!forbid_backing_scans && "unchanged VMA borrow must not scan backing membership");
+    return __real_kernel_vma_set_backing_in_use(set,backing,used);
+}
+enum physical_page_status __real_physical_page_allocate(struct physical_page_allocator *,uint64_t *);
+enum physical_page_status __wrap_physical_page_allocate(struct physical_page_allocator *allocator,uint64_t *address)
+{
+    if (__atomic_exchange_n(&fail_page,0,__ATOMIC_ACQ_REL)) return PHYSICAL_PAGE_STATUS_EMPTY;
+    return __real_physical_page_allocate(allocator,address);
+}
+int __real_kernel_vfs_file_mincore_allowed(const struct kernel_vfs_file *);
+int __wrap_kernel_vfs_file_mincore_allowed(const struct kernel_vfs_file *file)
+{
+    if (__atomic_exchange_n(&mincore_pause,0,__ATOMIC_ACQ_REL)) {
+        outside_gate(); publish(&mincore_entered); await(&mincore_resume);
+    }
+    return __real_kernel_vfs_file_mincore_allowed(file);
+}
 static void *access_page(uint64_t address) { return (void *)(uintptr_t)address; }
 static int address_of(const void *p,uint64_t *address) { *address=(uintptr_t)p; return 1; }
 static void outside_gate(void)
@@ -64,7 +126,9 @@ void __wrap_kernel_heap_release(struct kernel_heap *h,void *pointer)
         /* 此resident已摘索引；callback尚未返回，registration仍被实际借用。 */
         publish(&callback_entered); await(&callback_resume);
     }
+    int last_elf=watched_elf && pointer==watched_elf;
     __real_kernel_heap_release(h,pointer);
+    if (last_elf) {watched_elf=NULL;elf_releases++;}
 }
 void kernel_assert_service_context(void) { assert(!kernel_cpu_current()->logical_id); }
 void kernel_cpu_flush_notifications(void) {}
@@ -102,6 +166,73 @@ static void *unmap_callback(void *unused)
     (void)unused; mm_test_attach(6); kernel_cpu_current()->logical_id=0; mm_test_context=context;
     assert(!kernel_mm_munmap(&mm,0x40000,BOAROS_PAGE_SIZE)); publish(&unmap_done); return NULL;
 }
+static void *mincore_last_mapping(void *unused)
+{
+    (void)unused; mm_test_attach(7); kernel_cpu_current()->logical_id=0; mm_test_context=context;
+    unsigned char resident;
+    mincore_result=kernel_mm_mincore(&mm,0x60000,1,&resident,&mincore_completed);
+    return NULL;
+}
+static void mincore_unmap(void)
+{
+    struct kernel_open_file_description *file=map_file("/mincore-unmap",0x60000);
+    close_caller(&file);
+    unsigned before=last_releases;
+    mincore_pause=1; pthread_t reader;
+    assert(!pthread_create(&reader,NULL,mincore_last_mapping,NULL)); await(&mincore_entered);
+    assert(!kernel_mm_munmap(&mm,0x60000,BOAROS_PAGE_SIZE));
+    assert(watched && watched->references==1 && last_releases==before);
+    publish(&mincore_resume); assert(!pthread_join(reader,NULL));
+    assert(mincore_result==-KERNEL_ENOMEM && !mincore_completed);
+    assert(!watched && last_releases==before+1);
+    puts("MM mincore last mapping removed during source borrow: no stale result and final owner returned");
+}
+static void *self_pin_unmap(void *unused)
+{
+    (void)unused; mm_test_attach(8); kernel_cpu_current()->logical_id=0; mm_test_context=context;
+    await(&self_pin_prepared);
+    assert(!kernel_mm_munmap(&mm,self_pin_address,BOAROS_PAGE_SIZE));
+    return NULL;
+}
+static void self_pin_source_retirement(void)
+{
+    uint64_t placed;
+    assert(!kernel_mm_mmap_anonymous(&mm,0xa0000,BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&placed));
+    assert(!kernel_mm_resolve_user_fault(&mm,placed,KERNEL_MM_WRITE));
+    struct kernel_mm_user_pin pin={0};
+    assert(!kernel_mm_pin_user_page(&mm,placed,KERNEL_MM_WRITE,&pin));
+    struct kernel_open_file_description *file=map_file("/self-pin-unmap",0x70000);
+    close_caller(&file);
+    unsigned before=last_releases;
+    self_pin_address=0x70000;
+    self_pin_prepare=self_pin_hold=1;
+    pthread_t modifier; assert(!pthread_create(&modifier,NULL,self_pin_unmap,NULL));
+    assert(kernel_mm_resolve_user_fault(&mm,0x70000,KERNEL_MM_READ)==KERNEL_MM_STATUS_CONFLICT);
+    /* The writer already checked/removes sources, but still owns its gate.
+     * This pin forbids the fault from waiting for that writer to release it. */
+    assert(self_pin_writer_held && watched && watched->references==1 && last_releases==before);
+    publish(&self_pin_returned); assert(!pthread_join(modifier,NULL));
+    kernel_mm_unpin_user_page(&pin);
+    assert(!kernel_io_context_current()->user_pins);
+    fail_close=1;
+    kernel_mm_drain_sources(&mm); /* The production user-return consumer. */
+    assert(!fail_close && watched && !watched->references && last_releases==before);
+    kernel_mm_drain_sources(&mm);
+    assert(!watched && last_releases==before+1);
+    puts("MM self-pin last source borrow survives writer drain and failed close; user-return drain closes the retained owner");
+    assert(!kernel_mm_pin_user_page(&mm,placed,KERNEL_MM_WRITE,&pin));
+    file=map_file("/pinned-ready-source",0xb0000); close_caller(&file);
+    before=last_releases; fail_close=1;
+    assert(!kernel_mm_munmap(&mm,0xb0000,BOAROS_PAGE_SIZE));
+    assert(fail_close && watched && watched->references==1 && last_releases==before);
+    kernel_mm_unpin_user_page(&pin);
+    kernel_mm_drain_sources(&mm);
+    assert(!fail_close && watched && !watched->references && last_releases==before);
+    kernel_mm_drain_sources(&mm);
+    assert(!watched && last_releases==before+1);
+    puts("MM idle retired source defers close while its actor holds a pin; user-return retries the actual close failure");
+}
 static void u16(unsigned char *p,uint16_t value)
 { for(unsigned i=0;i<2;i++)p[i]=(unsigned char)(value>>(8*i)); }
 static void u32(unsigned char *p,uint32_t value)
@@ -120,7 +251,28 @@ static void remote_last_executable_close(void)
     struct kernel_elf64_source *source=NULL;
     assert(!kernel_read_source_from_memory(bytes,sizeof(bytes),&reader));
     assert(!kernel_elf64_source_create_reader(&heap,&reader,BOAROS_PAGE_SIZE,KERNEL_ELF64_MACHINE_RISCV,&source));
+    watched_elf=source;
     assert(!kernel_mm_map_elf_source(&mm,source,0));assert(!kernel_elf64_source_release(&source));
+    struct kernel_mm_user_pin pin={0};
+    assert(!kernel_mm_pin_user_page(&mm,0xa0000,KERNEL_MM_WRITE,&pin));
+    unsigned released_before=elf_releases;
+    self_pin_address=0x100000;
+    self_pin_prepared=self_pin_writer_held=self_pin_returned=0;
+    elf_pin_prepare=self_pin_hold=1;
+    pthread_t modifier; assert(!pthread_create(&modifier,NULL,self_pin_unmap,NULL));
+    assert(kernel_mm_resolve_user_fault(&mm,0x100078,KERNEL_MM_EXECUTE)==KERNEL_MM_STATUS_CONFLICT);
+    assert(self_pin_writer_held && watched_elf && elf_releases==released_before);
+    publish(&self_pin_returned); assert(!pthread_join(modifier,NULL));
+    kernel_mm_unpin_user_page(&pin);
+    kernel_mm_drain_sources(&mm);
+    assert(!watched_elf && elf_releases==released_before+1);
+    puts("MM self-pin ELF borrow remains retired through writer drain; user-return drain returns its source owner");
+    assert(!kernel_elf64_source_create_reader(&heap,&reader,BOAROS_PAGE_SIZE,KERNEL_ELF64_MACHINE_RISCV,&source));
+    assert(!kernel_mm_map_elf_source(&mm,source,0));assert(!kernel_elf64_source_release(&source));
+    forbid_backing_scans=1;
+    assert(!kernel_mm_resolve_user_fault(&mm,0x100078,KERNEL_MM_EXECUTE));
+    forbid_backing_scans=0;
+    puts("MM ordinary ELF fault skips unchanged VMA backing scans");
     struct kernel_open_file_description *file=NULL;int error;
     assert(!kernel_open_file_create_mode(&heap,mount,"/remote-executable",0700,&file,&error)&&!error);
     assert(!kernel_mm_set_executable(&mm,file));close_caller(&file);
@@ -149,6 +301,17 @@ int main(void)
     assert(!kernel_mm_context(&mm,&context)); mm_test_context=context;
     assert(!kernel_tmpfs_create(&heap,0,"nr_blocks=8",&mount));
 
+    struct kernel_open_file_description *normal=map_file("/normal",0x90000);
+    forbid_backing_scans=1; fail_page=1;
+    assert(kernel_mm_resolve_user_fault(&mm,0x90000,KERNEL_MM_READ)==KERNEL_MM_STATUS_NO_MEMORY && !fail_page);
+    struct kernel_mm_mapping missing;
+    assert(kernel_mm_lookup(&mm,0x90000,&missing)==KERNEL_MM_STATUS_NOT_MAPPED);
+    assert(!kernel_mm_resolve_user_fault(&mm,0x90000,KERNEL_MM_READ));
+    assert(!kernel_mm_resolve_user_fault(&mm,0x90000,KERNEL_MM_READ));
+    unsigned char resident; unsigned completed;
+    assert(!kernel_mm_mincore(&mm,0x90000,1,&resident,&completed) && completed==1 && resident);
+    forbid_backing_scans=0;
+
     struct kernel_open_file_description *file=map_file("/unmap",0x40000);
     close_caller(&file); assert(!kernel_mm_munmap(&mm,0x40000,BOAROS_PAGE_SIZE) && last_releases==1 && !watched);
     file=map_file("/replace",0x40000); close_caller(&file);
@@ -161,8 +324,13 @@ int main(void)
     file=map_file("/close-failure",0x40000); close_caller(&file); fail_close=1;
     assert(!kernel_mm_munmap(&mm,0x40000,BOAROS_PAGE_SIZE));
     assert(!fail_close && watched && !watched->references && last_releases==4);
-    assert(!kernel_mm_mmap_anonymous(&mm,0x40000,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,
-        KERNEL_MM_MAP_FIXED,&address) && !watched && last_releases==5);
+    forbid_backing_scans=1;
+    assert(!kernel_mm_resolve_user_fault(&mm,0x90000,KERNEL_MM_READ) && !watched && last_releases==5);
+    forbid_backing_scans=0;
+    assert(!kernel_mm_munmap(&mm,0x90000,BOAROS_PAGE_SIZE) && !kernel_open_file_release(&normal));
+    puts("MM ordinary file faults and mincore skip unchanged VMA scans; OOM preserves source and retired close retries still progress");
+    mincore_unmap();
+    self_pin_source_retirement();
 
     callback_file=map_file("/callback",0x40000);
     unsigned char byte=0; size_t copied;

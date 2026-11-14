@@ -1,6 +1,7 @@
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/virt_uart.h>
 #include <arch/context.h>
+#include <kernel/cost.h>
 
 #define SBI_SUCCESS 0L
 
@@ -74,9 +75,9 @@ long sbi_hart_stop(void)
 long sbi_send_ipi(uint64_t hart)
 { return sbi_ecall(SBI_EXT_IPI, 0, 1, hart, 0, 0).error; }
 long sbi_remote_sfence(uint64_t hart, uint64_t address, uint64_t size)
-{ return sbi_ecall(SBI_EXT_RFENCE, 1, 1, hart, address, size).error; }
+{ COST_ADD(RFENCE_CALLS,1);return sbi_ecall(SBI_EXT_RFENCE, 1, 1, hart, address, size).error; }
 long sbi_remote_fence_i(uint64_t hart)
-{ return sbi_ecall(SBI_EXT_RFENCE, 0, 1, hart, 0, 0).error; }
+{ COST_ADD(RFENCE_CALLS,1);return sbi_ecall(SBI_EXT_RFENCE, 0, 1, hart, 0, 0).error; }
 
 void sbi_halt(void)
 {

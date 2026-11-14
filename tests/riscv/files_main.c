@@ -93,12 +93,12 @@ char __wrap_virt_uart_getc(void)
 static struct kernel_mm *unmap_during_fault;
 static uint64_t unmap_fault_address;
 static int complete_peer_fault;
-int __real_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *, uint64_t,
+int __real_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *, uint64_t, int,
     struct kernel_open_file_page_preparation *);
 int __wrap_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *file,
-    uint64_t index, struct kernel_open_file_page_preparation *prepared)
+    uint64_t index,int read_window, struct kernel_open_file_page_preparation *prepared)
 {
-    int status = __real_kernel_open_file_prepare_mapping_page(file, index, prepared);
+    int status = __real_kernel_open_file_prepare_mapping_page(file, index, read_window, prepared);
     if (unmap_during_fault && !status) {
         struct kernel_mm *mm = unmap_during_fault;
         unmap_during_fault = 0;

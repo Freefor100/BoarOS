@@ -376,12 +376,13 @@ enum kernel_open_file_status kernel_open_file_create_at(
     struct kernel_heap *heap, struct kernel_vfs_path *start,
     struct kernel_vfs_path *root, const char *path,
     const struct kernel_vfs_open_request *request,
-    struct kernel_open_file_description **owner, int *created, int *linux_result)
+    struct kernel_open_file_description **owner, struct kernel_vfs_open_result *opened,
+    int *linux_result)
 {
     struct kernel_open_file_description *file;
     if (!heap || !start || !root || !path || !request || !owner || *owner || !linux_result)
         return KERNEL_OPEN_FILE_STATUS_INVALID_ARGUMENT;
-    if (created) *created=0;
+    if (opened) *opened=(struct kernel_vfs_open_result){0};
     enum kernel_heap_status allocation = kernel_heap_allocate_zeroed(heap,
                                          1U, sizeof(*file), (void **)&file);
     if (allocation != KERNEL_HEAP_STATUS_OK) {
@@ -389,7 +390,7 @@ enum kernel_open_file_status kernel_open_file_create_at(
         *linux_result = -KERNEL_ENOMEM;
         return KERNEL_OPEN_FILE_STATUS_OK;
     }
-    int result=kernel_vfs_open_at(start,root,path,request,&file->file,created);
+    int result=kernel_vfs_open_at(start,root,path,request,&file->file,opened);
     if (!result && (request->flags & KERNEL_VFS_OPEN_PATH_ONLY))
         file->kind=KERNEL_OPEN_FILE_KIND_PATH;
     if (result) {
@@ -1322,8 +1323,18 @@ enum kernel_open_file_status kernel_open_file_check_io_domain(
     int error=kernel_vfs_check_io_domain(node,heap,allocator);
     return error?KERNEL_OPEN_FILE_STATUS_STATE:KERNEL_OPEN_FILE_STATUS_OK;
 }
+static inline __attribute__((always_inline)) enum kernel_page_cache_status disk_fault_page(
+    struct kernel_open_file_description *file,struct kernel_page_cache *cache,
+    uint64_t index,uint64_t *address,size_t *valid,int read_window)
+{
+    uint32_t policy=__atomic_load_n(&file->read_advice,__ATOMIC_RELAXED);
+    return kernel_page_cache_get_for_fault(cache,&file->file,index,address,valid,
+        read_window && !(policy&(KERNEL_READ_RANDOM|KERNEL_READ_NOREUSE)),
+        !!(policy&KERNEL_READ_NOREUSE));
+}
+
 int kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *file,
-    uint64_t index,struct kernel_open_file_page_preparation *prepared)
+    uint64_t index,int read_window,struct kernel_open_file_page_preparation *prepared)
 {
     if (kernel_open_file_memory_backed(file)) return kernel_open_file_prepare_memory_page(file,index,prepared);
     if (!prepared || prepared->pending || !open_file_live(file)) return -KERNEL_EINVAL;
@@ -1341,7 +1352,7 @@ int kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *f
     }
     /* 不能携带inode读资格等CPU0再取得读资格：排队writer会形成等待环。 */
     uint64_t address; size_t valid;
-    enum kernel_page_cache_status status=kernel_page_cache_get(cache,&file->file,index,&address,&valid);
+    enum kernel_page_cache_status status=disk_fault_page(file,cache,index,&address,&valid,read_window);
     if (status) return status==KERNEL_PAGE_CACHE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM :
         -KERNEL_EIO;
     {
@@ -1392,7 +1403,7 @@ void kernel_open_file_memory_modified(struct kernel_open_file_description *file)
 
 enum kernel_page_cache_status kernel_open_file_get_page_for_fault(
     struct kernel_open_file_description *file, uint64_t index,
-    uint64_t *address, size_t *valid, int *created)
+    uint64_t *address, size_t *valid, int *created,int read_window)
 {
     if (!created || !address || !valid || !open_file_live(file) ||
         !file->file.mount || !file->file.mount->private_data)
@@ -1400,7 +1411,7 @@ enum kernel_page_cache_status kernel_open_file_get_page_for_fault(
     *created = 0;
     if (kernel_open_file_memory_backed(file))
         return memory_page(file, index, address, valid, 1, created);
-    return kernel_open_file_get_page(file, index, address, valid);
+    return disk_fault_page(file,kernel_vfs_file_page_cache(&file->file),index,address,valid,read_window);
 }
 
 void kernel_open_file_discard_new_page(struct kernel_open_file_description *file,

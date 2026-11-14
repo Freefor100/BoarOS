@@ -1570,8 +1570,8 @@ static void credential_vfs_cases(struct kernel_vfs_mount *mount)
     assert(!kernel_vfs_close(&root_file));
     (void)kernel_credentials_override(&user);
     struct kernel_vfs_open_request create={.flags=KERNEL_VFS_OPEN_CREATE|KERNEL_VFS_OPEN_EXCLUSIVE|KERNEL_VFS_OPEN_FOLLOW,.access=6};
-    struct kernel_vfs_file file={0};int created=0;struct kernel_vfs_stat stat;
-    assert(!kernel_vfs_open_at(path,path,"/identities/zero",&create,&file,&created) && created);
+    struct kernel_vfs_file file={0};struct kernel_vfs_open_result opened={0};struct kernel_vfs_stat stat;
+    assert(!kernel_vfs_open_at(path,path,"/identities/zero",&create,&file,&opened) && opened.created);
     assert(!kernel_vfs_fstat(&file,&stat) && stat.uid==1000 && stat.gid==100 && !(stat.mode&0777));
     size_t done=0;
     assert(!kernel_vfs_pwrite(&file,0,"owner",5,&done) && done==5);

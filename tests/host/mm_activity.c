@@ -222,9 +222,21 @@ static void *publication_peer(void *unused)
         assert(__atomic_load_n(&publication_invalid, __ATOMIC_ACQUIRE));
         assert(!kernel_mm_lookup(&mm, address, &mapping) && (mapping.permissions & KERNEL_MM_WRITE));
         unsigned before = flushes, before_instructions = instruction_sync;
+        assert(!kernel_mm_activate(&mm, kernel_context));
+        assert(flushes == before && instruction_sync == before_instructions);
+        assert(__atomic_load_n(&publication_invalid, __ATOMIC_ACQUIRE));
         assert(!kernel_mm_resolve_user_fault(&mm, address, KERNEL_MM_WRITE));
         assert(flushes == before + 1 && instruction_sync == before_instructions);
         assert(!__atomic_load_n(&publication_invalid, __ATOMIC_ACQUIRE));
+        assert(!kernel_mm_activate(&mm, kernel_context));
+        assert(flushes == before + 1 && instruction_sync == before_instructions);
+        if (i == 1) {
+            before = flushes;
+            assert(!kernel_mm_activate(NULL, kernel_context));
+            assert(!kernel_mm_activate(&mm, kernel_context));
+            assert(flushes == before + 2 && instruction_sync == before_instructions + 1);
+            assert(!kernel_mm_lookup(&mm, address, &mapping) && (mapping.permissions & KERNEL_MM_WRITE));
+        }
         __atomic_store_n(&publication_done, i + 1, __ATOMIC_RELEASE);
     }
     await(&publication_leave);
@@ -245,18 +257,28 @@ static void new_mapping_publication(void)
         assert(!kernel_mm_resolve_user_fault(&mm,
             publication_address + i * BOAROS_PAGE_SIZE, KERNEL_MM_WRITE));
         assert(publication_syncs == i + 1);
+        unsigned before = flushes, before_instructions = instruction_sync;
+        assert(!kernel_mm_activate(&mm, kernel_context));
+        assert(flushes == before && instruction_sync == before_instructions);
         __atomic_store_n(&publication_visible, i + 1, __ATOMIC_RELEASE);
         while (__atomic_load_n(&publication_done, __ATOMIC_ACQUIRE) != i + 1) sched_yield();
     }
     publication_mode = 2;
     assert(!kernel_mm_mprotect(&mm, publication_address + 2 * BOAROS_PAGE_SIZE,
         BOAROS_PAGE_SIZE, KERNEL_MM_READ | KERNEL_MM_EXECUTE));
+    assert(!kernel_mm_activate(&mm, kernel_context));
     unsigned before = publication_syncs, before_instructions = instruction_sync;
     assert(!kernel_mm_resolve_user_fault(&mm,
         publication_address + 2 * BOAROS_PAGE_SIZE, KERNEL_MM_EXECUTE));
     assert(publication_syncs == before + 1);
     assert(instruction_sync == before_instructions + 1);
+    before = flushes; before_instructions = instruction_sync;
+    assert(!kernel_mm_activate(&mm, kernel_context));
+    assert(flushes == before + 1 && instruction_sync == before_instructions + 1);
     assert(!kernel_mm_mprotect(&mm, publication_address, BOAROS_PAGE_SIZE, KERNEL_MM_READ));
+    before = flushes; before_instructions = instruction_sync;
+    assert(!kernel_mm_activate(&mm, kernel_context));
+    assert(flushes == before + 1 && instruction_sync == before_instructions);
     before = publication_syncs;
     assert(kernel_mm_resolve_user_fault(&mm, publication_address, KERNEL_MM_WRITE) == KERNEL_MM_STATUS_ACCESS);
     assert(publication_syncs == before);
@@ -266,6 +288,25 @@ static void new_mapping_publication(void)
     assert(!kernel_mm_activate(NULL, kernel_context)); mm_test_context = context;
     assert(!kernel_mm_munmap(&mm, publication_address, 3 * BOAROS_PAGE_SIZE));
     puts("MM new nonleaf/leaf publication avoids remote invalidation; stale faults flush locally; executable and revoked mappings synchronize both CPUs");
+}
+static void fresh_population_reentry(void)
+{
+    uint64_t address = publication_address + UINT64_C(0x400000), placed;
+    assert(!kernel_mm_mmap_anonymous(&mm, address, 3 * BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED, &placed));
+    assert(!kernel_mm_activate(&mm, kernel_context));
+    publication_mode = 3;
+    unsigned before = publication_syncs;
+    assert(!kernel_mm_populate(&mm, address, address + 3 * BOAROS_PAGE_SIZE, KERNEL_MM_WRITE));
+    assert(publication_syncs == before + 2); /* new nonleaf, then the leaf batch */
+    before = flushes;
+    unsigned before_instructions = instruction_sync;
+    assert(!kernel_mm_activate(&mm, kernel_context));
+    assert(flushes == before && instruction_sync == before_instructions);
+    publication_mode = 0;
+    assert(!kernel_mm_activate(NULL, kernel_context)); mm_test_context = context;
+    assert(!kernel_mm_munmap(&mm, address, 3 * BOAROS_PAGE_SIZE));
+    puts("MM fresh anonymous population confirms its nonleaf and leaf batch without invalidating same-root reuse");
 }
 #if BOAROS_MAX_CPUS == 4
 static unsigned many_mm_entered, many_mm_release, many_mm_sampled, many_mm_sync;
@@ -310,7 +351,8 @@ void riscv_smp_sync_user(uint32_t targets, uint64_t address, uint64_t size, int 
             assert(!targets && !instructions);
             if (!publication_syncs) assert(!address && size == UINT64_MAX);
             else assert(address == publication_address + BOAROS_PAGE_SIZE && size == BOAROS_PAGE_SIZE);
-        } else assert(targets == 3);
+        } else if (publication_mode == 3) assert(!targets && !instructions);
+        else assert(targets == 3);
         publication_syncs++;
         mm_test_fence(size == BOAROS_PAGE_SIZE ? address : UINT64_MAX, 0);
         if (instructions) mm_test_fence(0, 1);
@@ -613,6 +655,7 @@ int main(void)
     assert(!kernel_copy_to_user(&mm, address, &byte, 1, &copied));
     assert(!kernel_mm_check_task_domain(&mm));
     new_mapping_publication();
+    fresh_population_reentry();
     same_mm_reentry(address);
     membership_before_publication(address);
 #if BOAROS_MAX_CPUS == 4
@@ -658,7 +701,9 @@ int main(void)
     resident_pin_cases(address);
 #endif
     struct kernel_mm child = {0};
+    assert(!kernel_mm_activate(&mm, kernel_context));
     assert(!kernel_mm_fork(&child, &mm));
+    assert(!kernel_mm_activate(&mm, kernel_context));
     struct kernel_mm_mapping original;
     assert(!kernel_mm_lookup(&mm,address,&original)); cow_old=original.physical_address;
     uint64_t before_failure=physical_page_available(&allocator);
@@ -669,8 +714,12 @@ int main(void)
     copying=1; byte=27;
     assert(!kernel_copy_to_user(&mm,address,&byte,1,&copied) && copied==1);
     copying=0; assert(cow_fences);
+    before_flush = flushes;
+    assert(!kernel_mm_activate(&mm, kernel_context));
+    assert(flushes == before_flush + 1);
     assert(!kernel_copy_from_user(&child,&byte,address,1,&copied) && byte==19);
     assert(!kernel_mm_release(&child));
+    assert(!kernel_mm_activate(NULL, kernel_context)); mm_test_context = context;
     uint64_t failed_va=UINT64_C(0x800000000), placed;
     assert(!kernel_mm_mmap_anonymous(&mm,failed_va,BOAROS_PAGE_SIZE,
         KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&placed));
