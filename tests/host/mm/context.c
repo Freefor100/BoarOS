@@ -206,6 +206,11 @@ __attribute__((weak)) void riscv_smp_sync_user(uint32_t targets, uint64_t addres
     mm_test_fence(size == BOAROS_PAGE_SIZE ? address : UINT64_MAX, 0);
     if (instructions) mm_test_fence(0, 1);
 }
+__attribute__((weak)) void riscv_smp_sync_instructions(uint32_t targets)
+{
+    assert(!(targets & ~1U) && kernel_cpu_current()->preempt_depth);
+    mm_test_fence(0,1);
+}
 #endif
 
 __attribute__((weak)) uint64_t kernel_task_current_memlock_limit(void) { return UINT64_MAX; }

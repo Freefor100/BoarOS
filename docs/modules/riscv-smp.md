@@ -140,7 +140,9 @@ make test-smp-userland-riscv QEMU_RISCV64=build/data-path-baselines/sync-b3/qemu
 make run-smp-riscv
 ```
 
-host 直接链接生产 DTB、调度/策略/runqueue/raw 实现，验证稀疏身份、失败原子性、唯一就绪 owner、本核 FIFO、实际目标的 RT 抢占、异核拉取与同时 claim 的唯一执行 owner。
+RFENCE 将实际目标 hart 按 64 位编号窗口合并为 SBI mask/base；同一窗口的一次调用由固件并行通知全部目标，等待全体确认后才返回。逻辑 CPU mask 不直接用作硬件 hart mask，稀疏和大于 63 的 hart ID 仍保留原身份。执行内容同步独立发送 FENCE.I；任一窗口失败按其 mask/base 报告并进入 fatal，调用者不能继续归还旧映射 owner。
+
+host 直接链接生产 DTB、调度/策略/runqueue/raw 实现，验证稀疏身份、失败原子性、唯一就绪 owner、本核 FIFO、实际目标的 RT 抢占、异核拉取与同时 claim 的唯一执行 owner。`test-riscv-rfence-host` 直接运行生产同步入口，检查 hart 窗口分组、目标确认和失败；硬件 fence/SBI 由宿主边界模型提供，真实旧翻译失效和退休 owner 仍由下述 RV 用例检查。
 `tests/smp/riscv.py`使用MTTCG、2/1 CPU及512MiB/1GiB，记录vCPU线程、工具和输入SHA、完整串口及native退出状态。
 2026-10-11本地验收覆盖：
 

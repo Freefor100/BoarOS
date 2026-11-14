@@ -430,6 +430,7 @@ COMMON_C_SOURCES := \
 
 RV_C_SOURCES := \
 	arch/riscv/smp.c \
+	arch/riscv/smp_sync.c \
 	arch/riscv/context.c \
 	arch/riscv/direct_map.c \
 	arch/riscv/elf_image.c \
@@ -462,7 +463,7 @@ ASM_SOURCES := \
 	arch/riscv/trap_entry.S \
 	arch/riscv/signal_trampoline.S
 # 无根模块测试复用生产运行时，由各目标追加测试入口。
-TEST_RUNTIME_C_SOURCES := $(filter-out arch/riscv/smp.c arch/riscv/root_boot.c \
+TEST_RUNTIME_C_SOURCES := $(filter-out arch/riscv/smp.c arch/riscv/smp_sync.c arch/riscv/root_boot.c \
     kernel/main.c kernel/boot_memory.c kernel/dtb.c net/ethernet.c,\
     $(C_SOURCES))
 TEST_RUNTIME_ASM_SOURCES := $(filter-out arch/riscv/secondary.S,$(ASM_SOURCES))
@@ -1816,6 +1817,10 @@ test-mm-pin-host:
 		-Wl,--gc-sections,--wrap=kernel_raw_lock_acquire,--wrap=physical_page_resolve -o build/host/mm/pin
 	build/host/mm/pin
 
+.PHONY: test-mm-activity-host
+test-mm-activity-host:
+	sh tests/host/mm-activity.sh
+
 .PHONY: test-mm-concurrency-host
 test-mm-concurrency-host:
 	@mkdir -p build/host/mm
@@ -1826,20 +1831,7 @@ test-mm-concurrency-host:
 		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
 		-Wl,--gc-sections,--wrap=physical_page_allocate,--wrap=kernel_raw_lock_acquire -o build/host/mm/concurrency
 	timeout 30s build/host/mm/concurrency
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections \
-		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include \
-		tests/host/mm_activity.c tests/host/mm/unavailable.c tests/host/mm/context.c \
-		kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c \
-		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
-		-Wl,--gc-sections -o build/host/mm/activity
-	timeout 30s build/host/mm/activity
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=4 -ffunction-sections -fdata-sections \
-		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include \
-		tests/host/mm_activity.c tests/host/mm/unavailable.c tests/host/mm/context.c \
-		kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c \
-		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
-		-Wl,--gc-sections -o build/host/mm/activity4
-	timeout 30s build/host/mm/activity4
+	sh tests/host/mm-activity.sh
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections \
 		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include \
 		tests/host/mm_zero.c tests/host/mm/unavailable.c tests/host/mm/context.c \
@@ -2146,7 +2138,10 @@ kernel-rv-smp:
 	$(MAKE) SMP=1 SMP_TEST=0 COST_DIAGNOSTICS=0 all
 run-smp-riscv: kernel-rv-smp
 	$(QEMU_RISCV64) -machine virt -accel tcg,thread=multi -smp $(SMP_CPUS) -m $(QEMU_MEMORY) -nographic -bios $(QEMU_RISCV_FIRMWARE) -kernel build/riscv-smp$(SMP_BUILD_SUFFIX)/kernel-rv
-test-smp-host:
+.PHONY: test-riscv-rfence-host
+test-riscv-rfence-host:
+	sh tests/host/riscv-rfence.sh
+test-smp-host: test-riscv-rfence-host
 	@mkdir -p build/host
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=4 -Itests/host/sync -idirafter include tests/host/cpu_events.c -o build/host/cpu-events
 	build/host/cpu-events
