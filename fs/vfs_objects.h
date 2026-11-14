@@ -35,7 +35,7 @@ struct kernel_vfs_instance {
     uint8_t quiescing;
     struct kernel_raw_lock error_lock;
     struct kernel_vfs_dentry *path_index;
-    size_t retiring_nodes; /* Removed from weak index; close/free still owns instance. */
+    size_t transient_owners; /* Node retirement and clean reclaim still borrow the backend. */
     uint8_t namespace_parallel; /* Enabled only after this mount's metadata owners are ready. */
     struct kernel_writeback_owner writeback;
     struct kernel_vfs_mount backend_mount; /* Instance lifetime, independent of caller view storage. */
@@ -189,6 +189,8 @@ struct kernel_vfs_backend {
     struct kernel_block_device *(*block_device)(struct kernel_vfs_instance *instance);
     int (*close_node)(struct kernel_vfs_node *node);
     int (*writeback_allowed)(struct kernel_vfs_instance *instance);
+    /* No allocation, I/O or executor migration; only release idle clean storage. */
+    void (*reclaim_clean)(struct kernel_vfs_instance *instance);
     /* Caller has returned source/entry and inode qualifications before waiting. */
     int (*writeback_reclaim)(struct kernel_vfs_instance *instance, int memory_pressure);
     /* Returns after capturing/registering a fixed target. The backend completes

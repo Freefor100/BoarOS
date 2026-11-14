@@ -55,7 +55,7 @@ static inline const struct kernel_vfs_backend *ops(struct kernel_vfs_mount *m)
 { return ((struct kernel_vfs_instance *)m->private_data)->ops; }
 static inline struct kernel_vfs_instance *instance(struct kernel_vfs_mount *m) { return m->private_data; }
 int __wrap_kernel_vfs_nodes_idle(struct kernel_vfs_instance *i, struct kernel_vfs_node *root)
-{ return !i->retiring_nodes && i->nodes == root && (!root || !root->next); }
+{ return !i->transient_owners && i->nodes == root && (!root || !root->next); }
 static inline void close_file(struct kernel_vfs_file *f)
 {
     struct kernel_vfs_node *n = f->private_data;

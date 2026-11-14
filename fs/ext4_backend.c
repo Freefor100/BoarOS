@@ -1630,6 +1630,14 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
         return lwext4_error(result);
     }
     adapter->mounted = 1U;
+    /* Keep the filesystem's metadata working set instead of the embedded
+     * library's eight-block default. Storage is still allocated on misses;
+     * pressure can reclaim idle clean blocks independently of journal owners.
+     * This bounds retained payload; buffer/slab overhead is accounted separately. */
+    uint64_t cache_bytes = physical_page_total(heap->page_allocator) * BOAROS_PAGE_SIZE / 256;
+    if (cache_bytes < 128 * 1024) cache_bytes = 128 * 1024;
+    if (cache_bytes > 8 * 1024 * 1024) cache_bytes = 8 * 1024 * 1024;
+    adapter->device.bc->cnt = (uint32_t)(cache_bytes / adapter->device.bc->itemsize);
     heap->page_allocator->buffer_bytes = ext4_buffer_bytes;
     heap->page_allocator->buffer_context = heap;
     result = ext4_mount_setup_locks(adapter->mount_point, &adapter->locks);
@@ -2919,6 +2927,8 @@ static int ext4_backend_close_node(struct kernel_vfs_node *node)
 }
 static int ext4_backend_writeback_allowed(struct kernel_vfs_instance *instance)
 { (void)instance; return !boaros_lwext4_allocation_active(); }
+static void ext4_backend_reclaim_clean(struct kernel_vfs_instance *instance)
+{ (void)ext4_bcache_reclaim(lwext4_instance(instance)->device.bc); }
 static int ext4_backend_writeback_reclaim(struct kernel_vfs_instance *instance, int memory_pressure)
 {
     struct lwext4_mount_adapter *adapter = lwext4_instance(instance);
@@ -3035,6 +3045,7 @@ static void initialize_backend(void)
     ops->block_device = ext4_backend_block_device;
     ops->close_node = ext4_backend_close_node;
     ops->writeback_allowed = ext4_backend_writeback_allowed;
+    ops->reclaim_clean = ext4_backend_reclaim_clean;
     ops->writeback_reclaim = ext4_backend_writeback_reclaim;
     ops->sync_prepare = ext4_backend_sync_prepare;
     ops->sync_filesystem = ext4_backend_sync_filesystem;

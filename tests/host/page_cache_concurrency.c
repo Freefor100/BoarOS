@@ -56,6 +56,7 @@ static void *access_page(uint64_t p) { return (void *)(uintptr_t)p; }
 static int page_address(const void *p, uint64_t *out)
 { *out = (uintptr_t)p; return 1; }
 static int image_fd;
+static unsigned metadata_pressure_io;
 static unsigned age_observing,age_waits,age_empty_wait;
 static void wait_progress(const unsigned *,unsigned);
 static struct { const void *source; unsigned armed, entered, resume; } snapshot_copy;
@@ -585,17 +586,20 @@ static enum kernel_block_status image_read(void *context, uint64_t off, void *ou
 {
     (void)context;
     assert(!kernel_cpu_current()->raw_locks);
+    assert(!metadata_pressure_io);
     return pread(image_fd, out, size, off) == (ssize_t)size ? KERNEL_BLOCK_STATUS_OK : KERNEL_BLOCK_STATUS_IO;
 }
 static enum kernel_block_status image_write(void *context, uint64_t off, const void *in, size_t size)
 {
     (void)context;
     assert(!kernel_cpu_current()->raw_locks);
+    assert(!metadata_pressure_io);
     return pwrite(image_fd, in, size, off) == (ssize_t)size ? KERNEL_BLOCK_STATUS_OK : KERNEL_BLOCK_STATUS_IO;
 }
 static enum kernel_block_status image_flush(void *context)
 {
     (void)context;
+    assert(!metadata_pressure_io);
     if (__atomic_exchange_n(&durable_wait.armed,0,__ATOMIC_ACQ_REL)) {
         assert(kernel_io_context_current()->background_reclaim &&
             !kernel_page_cache_is_executor(current_cache));
@@ -3829,6 +3833,73 @@ static void progress_writeback_owners(struct kernel_page_cache *cache,const char
     puts("PASS progress I/O keeps its own writeback workspace and waits for busy entries; worker versions, exact disk contents and owners survive");
 }
 
+static void (*metadata_reclaim_clean)(struct kernel_vfs_instance *);
+static unsigned metadata_reclaim_entered,metadata_reclaim_resume;
+static void metadata_reclaim_held(struct kernel_vfs_instance *instance)
+{
+    assert(!kernel_cpu_current()->raw_locks && instance->transient_owners==1);
+    __atomic_store_n(&metadata_reclaim_entered,1,__ATOMIC_RELEASE);
+    wait_progress(&metadata_reclaim_resume,1);
+    metadata_reclaim_clean(instance);
+}
+static void *metadata_reclaim_client(void *argument)
+{
+    cache_test_attach(1);
+    (void)kernel_page_cache_reclaim(argument,UINT64_MAX);
+    return NULL;
+}
+static void metadata_allocator_pressure(struct kernel_page_cache *cache,const char *path)
+{
+    image_fd=open(path,O_RDWR);assert(image_fd>=0);
+    struct stat st;assert(!fstat(image_fd,&st));
+    struct kernel_block_device disk={.read=image_read,.write=image_write,.flush=image_flush,
+        .logical_block_size=512,.capacity_bytes=st.st_size,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
+    for (unsigned read_only=0;read_only<2;read_only++) {
+        struct kernel_vfs_mount mount={0};
+        assert(!kernel_vfs_mount_ext4(&mount,&disk,cache->heap,cache,read_only));
+        struct kernel_vfs_stat stat;
+        assert(!kernel_vfs_stat_path(&mount,"/lost+found",1,&stat));
+        struct lwext4_mount_adapter *adapter=mount.private_data;
+        unsigned idle=adapter->device.bc->idle_blocks;
+        assert(idle>1);
+        uint64_t *held=calloc(physical_page_total(cache->allocator),sizeof(*held));assert(held);
+        size_t count=0;
+        while (!physical_page_allocate_order_nosleep(cache->allocator,0,&held[count])) count++;
+        assert(!physical_page_available(cache->allocator));
+        uint64_t page;
+        metadata_pressure_io=1;
+        enum physical_page_status status=physical_page_allocate(cache->allocator,&page);
+        metadata_pressure_io=0;
+        assert(status==PHYSICAL_PAGE_STATUS_OK && adapter->device.bc->idle_blocks<idle);
+        assert(!physical_page_release(cache->allocator,page));
+        for (size_t i=0;i<count;i++) assert(!physical_page_release(cache->allocator,held[i]));
+        free(held);
+        assert(!kernel_vfs_stat_path(&mount,"/lost+found",1,&stat));
+        assert(!kernel_vfs_unmount(&mount));
+    }
+    struct kernel_vfs_mount mount={0};
+    assert(!kernel_vfs_mount_ext4(&mount,&disk,cache->heap,cache,1));
+    struct kernel_vfs_path *root=NULL;
+    assert(!kernel_vfs_detach_created_mount(&mount,cache->heap,0,&root));
+    struct lwext4_mount_adapter *adapter=mount.private_data;
+    struct kernel_vfs_backend observed=*adapter->instance.ops;
+    metadata_reclaim_clean=observed.reclaim_clean;observed.reclaim_clean=metadata_reclaim_held;
+    adapter->instance.ops=&observed;
+    pthread_t caller;
+    assert(!pthread_create(&caller,NULL,metadata_reclaim_client,cache));
+    wait_progress(&metadata_reclaim_entered,1);
+    kernel_vfs_close_tree(&mount);
+    assert(!kernel_vfs_path_release(&root) && !kernel_vfs_reap_mounts());
+    assert(!mount.private_data && adapter->instance.cleanup_queued &&
+        adapter->instance.transient_owners==1 && adapter->mounted);
+    __atomic_store_n(&metadata_reclaim_resume,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(caller,NULL));
+    assert(adapter->instance.cleanup_queued && !adapter->instance.transient_owners && adapter->mounted);
+    assert(!kernel_vfs_reap_mounts());
+    assert(!close(image_fd) && !kernel_page_cache_destroy(cache));
+    puts("PASS allocator pressure reclaims read-only/writable ext4 metadata without I/O; lazy detach waits for the clean-reclaim owner and next reap closes it");
+}
+
 #include "sync_goal_cases.h"
 
 int main(int argc, char **argv)
@@ -3861,6 +3932,7 @@ int main(int argc, char **argv)
     assert(kernel_page_cache_init(&cache, &heap, &pages) ==
         KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT);
     if (argc==3) {
+        if (!strcmp(argv[2],"metadata-pressure")) {metadata_allocator_pressure(&cache,argv[1]);goto owners;}
         if (!strcmp(argv[2],"writeback-wake")) {writeback_registration_wake(&cache);goto owners;}
         if (!strcmp(argv[2],"read-borrow-retire")) {read_borrow_retirement(&cache,argv[1]);goto owners;}
         if (!strcmp(argv[2],"snapshot-copy")) {snapshot_copy_case(&cache,argv[1]);goto owners;}

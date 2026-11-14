@@ -276,7 +276,7 @@ static int namespace_parallel_open(struct kernel_vfs_mount *mount,const char *pa
     return kernel_vfs_publish_node(mount,node,file,0);
 }
 static int namespace_parallel_create(struct kernel_vfs_mount *mount,uint64_t parent,
-    const char *name,uint32_t mode,struct kernel_vfs_file *file)
+    const char *name,uint32_t mode,struct kernel_vfs_file *file,uint32_t umask)
 {
     assert((parent==10 || parent==20) && !strcmp(name,"created"));
     struct kernel_vfs_node *directory=kernel_vfs_node_pin(mount->private_data,parent);
@@ -289,7 +289,7 @@ static int namespace_parallel_create(struct kernel_vfs_mount *mount,uint64_t par
     __atomic_fetch_add(&namespace_parallel_creates,1,__ATOMIC_RELAXED);
     if (__atomic_exchange_n(&namespace_parallel_created[parent==20],parent+1,__ATOMIC_ACQ_REL))
         return -KERNEL_EEXIST;
-    return namespace_parallel_open(mount,NULL,parent+1,KERNEL_VFS_S_IFREG|mode,file);
+    return namespace_parallel_open(mount,NULL,parent+1,KERNEL_VFS_S_IFREG|(mode&~umask),file);
 }
 static void namespace_parallel_assert_writer(struct kernel_vfs_instance *instance,uint64_t inode)
 {
@@ -370,7 +370,7 @@ static void *namespace_parallel_thread(void *argument)
 static int namespace_parallel_unmount(struct kernel_vfs_mount *mount)
 {
     struct kernel_vfs_instance *instance=mount->private_data;
-    return instance->external_files || instance->nodes || instance->paths || instance->retiring_nodes ? -KERNEL_EBUSY : 0;
+    return instance->external_files || instance->nodes || instance->paths || instance->transient_owners ? -KERNEL_EBUSY : 0;
 }
 static void namespace_parallel_publication_case(struct kernel_heap *heap)
 {
@@ -571,7 +571,7 @@ static void namespace_parallel_publication_case(struct kernel_heap *heap)
            retired_path.references==1 && retired.references==1);
     for(unsigned i=0;i<2;i++)assert(!kernel_vfs_path_release(&parents[i]));
     assert(!kernel_vfs_path_release(&root) && !kernel_vfs_unmount(&mount) && !instance.nodes && !instance.paths &&
-           !instance.node_count && !instance.external_files && !instance.retiring_nodes);
+           !instance.node_count && !instance.external_files && !instance.transient_owners);
     namespace_parallel_instance=NULL;
     puts("PASS parallel shared lookup and unique inode/path candidate publication; losing candidates and all owners returned");
     puts("PASS independent directory creates overlap; shared directory creation waits, rechecks the name and opens one inode");
@@ -1020,7 +1020,7 @@ static void namespace_retiring_mount_case(struct kernel_heap *heap)
     assert(!pthread_create(&thread,NULL,namespace_retire_node,&node));
     while (!__atomic_load_n(&namespace_retire_entered,__ATOMIC_ACQUIRE)) sched_yield();
     /* The weak index is empty, but close still borrows the backend and heap. */
-    assert(instance->retiring_nodes==1 && !kernel_vfs_node_find(instance,node->inode));
+    assert(instance->transient_owners==1 && !kernel_vfs_node_find(instance,node->inode));
     assert(kernel_vfs_unmount(mount)==-KERNEL_EBUSY);
     __atomic_store_n(&namespace_retire_resume,1,__ATOMIC_RELEASE);
     assert(!pthread_join(thread,NULL) && !node);

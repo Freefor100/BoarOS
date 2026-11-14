@@ -13,7 +13,7 @@ static inline void riscv_interrupt_restore(uintptr_t flags) { (void)flags; }
 #include <stdlib.h>
 
 int kernel_vfs_nodes_idle(struct kernel_vfs_instance *i, struct kernel_vfs_node *root)
-{ return !i->retiring_nodes && i->nodes == root && (!root || !root->next); }
+{ return !i->transient_owners && i->nodes == root && (!root || !root->next); }
 static struct kernel_cpu test_cpu = {.initialized=KERNEL_CPU_INITIALIZED};
 static void *devpts_cpu(void) { return &test_cpu; }
 struct kernel_raw_lock kernel_vfs_state_lock = {.rank=KERNEL_RAW_RANK_OBJECT, .initialized=KERNEL_RAW_INITIALIZED};
