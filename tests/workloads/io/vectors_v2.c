@@ -221,6 +221,16 @@ static void local_user_copy(int fd)
     memset(input+page-8,'x',8);errno=0;
     CHECK(open((char *)input+page-8,O_RDONLY)==-1 && errno==EFAULT);
     CHECK(!munmap(input,3*page) && !munmap(output,3*page));
+    int tail=open("/vectors-eof-tail",O_RDWR|O_CREAT|O_TRUNC,0600);
+    CHECK(tail>=0 && write(tail,"short file",10)==10 && !fsync(tail));
+    CHECK(!posix_fadvise(tail,0,0,POSIX_FADV_DONTNEED));
+    unsigned char *mapped=mmap(NULL,page,PROT_READ,MAP_PRIVATE,tail,0);
+    CHECK(mapped!=MAP_FAILED && !memcmp(mapped,"short file",10));
+    for(size_t i=10;i<page;i++)CHECK(!mapped[i]);
+    unsigned char *suffix=malloc(page);CHECK(suffix);memset(suffix,0xa7,page);
+    CHECK(pread(tail,suffix,page,0)==10 && !memcmp(suffix,"short file",10));
+    for(size_t i=10;i<page;i++)CHECK(suffix[i]==0xa7);
+    free(suffix);CHECK(!munmap(mapped,page) && !close(tail) && !unlink("/vectors-eof-tail"));
     CHECK(!ftruncate(fd,0));
     pass("local-copy-fault-prefix-cow-string");
 }

@@ -4814,7 +4814,7 @@ int ext4_fpread(const ext4_file *file, uint64_t offset, void *buf, size_t size, 
 {
     if (!rcnt) return EINVAL;
     struct file_read_span span = {offset, buf, size, 0, EOK};
-    int result = ext4_fpread_batch(file, &span, 1, NULL, UINT64_MAX, NULL);
+    int result = ext4_fpread_batch(file, &span, 1, NULL, UINT64_MAX, NULL, false);
     *rcnt = span.completed;
     return result;
 }
@@ -4851,7 +4851,7 @@ static void ext4_file_read_completed(void *context, unsigned index, const struct
 }
 
 int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsigned count,
-    struct file_read_workspace *work, uint64_t size_limit, const struct file_read_completion *completion)
+    struct file_read_workspace *work, uint64_t size_limit, const struct file_read_completion *completion, bool pad_eof)
 {
     if (!file || !file->mp || count > EXT4_BLOCK_BATCH_MAX || (count && !spans)) return EINVAL;
     for (unsigned i = 0; i < count; i++) { spans[i].completed = 0; spans[i].error = EINVAL; }
@@ -4985,12 +4985,21 @@ int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsig
                 void *out = (uint8_t *)spans[i].buffer + planned;
                 unsigned sector = fs->bdev->bdif->ph_bsize;
                 uint64_t block = fs->bdev->part_offset + physical * block_size + skip;
-                bool aligned = physical && !(skip % sector) && !(length % sector);
+                /* Cache targets own their EOF suffix. Use that real capacity
+                 * for the last sector instead of allocating/copying scratch;
+                 * logical completion remains length and the cache zeros EOF. */
+                size_t io_length=length;
+                if (pad_eof && physical && !(skip%sector) && offset+length==size) {
+                    size_t rounded=(length+sector-1)/sector*sector;
+                    if (rounded<=block_size-skip && rounded<=spans[i].size-planned)
+                        io_length=rounded;
+                }
+                bool aligned=physical && !(skip%sector) && !(io_length%sector);
                 bool extend = parts && pending && aligned &&
                     fragments[parts - 1].span == i && owners[pending - 1] == parts - 1 &&
                     reads[pending - 1].offset + reads[pending - 1].size == block &&
                     (uint8_t *)reads[pending - 1].buffer + reads[pending - 1].size == out &&
-                    length <= (uint64_t)UINT32_MAX * sector - reads[pending - 1].size;
+                    io_length <= (uint64_t)UINT32_MAX * sector - reads[pending - 1].size;
                 /* A sparse run has one immediate completion fragment, even
                  * when it spans many filesystem blocks. Keep its neighboring
                  * disk fragments in the same submission wave. */
@@ -5007,7 +5016,7 @@ int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsig
                     /* 片段已满时仍可扩展最后一个设备区间。空输出只查询当前
                      * 版本，不能把未接纳片段提前复制进调用者。 */
                     if (!extend || ext4_copy_pending_data(fs->bdev, physical, skip, NULL, 0)) break;
-                    reads[pending - 1].size += length;
+                    reads[pending - 1].size += io_length;
                     fragments[parts - 1].length += length;
                     planned += length;
                     range_offset = offset + length;
@@ -5021,12 +5030,12 @@ int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsig
                         fragments[part].error = ext4_read_pending_data(fs->bdev, physical, skip, out, length);
                     else if (extend) {
                         parts--;
-                        reads[pending - 1].size += length;
+                        reads[pending - 1].size += io_length;
                         fragments[parts - 1].length += length;
                     }
                     else {
                         owners[pending] = part;
-                        reads[pending++] = (struct block_read_span){block, out, length, 0, EIO};
+                        reads[pending++] = (struct block_read_span){block, out, io_length, 0, EIO};
                     }
                 }
                 planned += length;

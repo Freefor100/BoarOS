@@ -2822,7 +2822,7 @@ static int ext4_backend_pread_batch(struct kernel_vfs_node *node,
     struct ext4_file_read_progress progress = {node, stored, completion, 0};
     const struct file_read_completion forward = {file_read_completed, &progress};
     int result = ext4_fpread_batch(lwext4_node_file(node), spans, count, workspace, stored,
-        completion ? &forward : NULL);
+        completion ? &forward : NULL, true);
     adapter->locks.unlock(adapter->locks.context);
     for (size_t i = 0; i < count; i++)
         file_read_result(&progress, &spans[i], !(progress.completed & (UINT32_C(1) << i)));

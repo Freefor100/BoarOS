@@ -593,9 +593,12 @@ int ext4_fpread(const ext4_file *file, uint64_t offset, void *buf, size_t size, 
 /* At most FILE_READ_BATCH_MAX disjoint outputs; every span reports a contiguous prefix.
  * Reads consult cache versions, including dirty and journal-pending data.
  * Multi-output callers lend a workspace until return; scalar callers may pass
- * NULL. size_limit caps visible EOF without changing the caller's span sizes. */
+ * NULL. size_limit caps visible EOF without changing the caller's span sizes.
+ * pad_eof grants DMA access within each span beyond logical EOF. Only callers
+ * owning that suffix may enable it; they initialize the tail before exposure.
+ * Ordinary positioned reads preserve their untouched suffix by passing false. */
 int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsigned count,
-    struct file_read_workspace *workspace, uint64_t size_limit, const struct file_read_completion *completion);
+    struct file_read_workspace *workspace, uint64_t size_limit, const struct file_read_completion *completion, bool pad_eof);
 
 
 /**@brief   Write data to file.

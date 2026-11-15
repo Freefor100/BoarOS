@@ -5536,7 +5536,8 @@ int kernel_vfs_node_pread(struct kernel_vfs_node *node,
 int kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,
     struct file_read_span *spans, size_t count, struct file_read_workspace *workspace, const struct file_read_completion *completion)
 {
-    /* 私有调用者已固定独立的缓存页；后端边界负责自己的参数校验和结果初始化。 */
+    /* 私有调用者固定完整缓存页，允许后端在span容量内读入EOF扇区尾部；
+     * 缓存完成层在页面可见前清零EOF。后端负责参数及结果初始化。 */
     struct kernel_vfs_instance *instance = node->mount->private_data;
     if (instance->ops->pread_batch) return instance->ops->pread_batch(node, spans, count, workspace, completion);
     int result = 0;
