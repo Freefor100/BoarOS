@@ -280,6 +280,7 @@ struct read_workspace {
 #endif
     struct kernel_page_cache_entry *entries[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
     struct kernel_page_cache_entry *loads[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
+    uint64_t allocation_pages[PHYSICAL_PAGE_ALLOCATION_BATCH_MAX];
     struct file_read_span spans[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
     struct kernel_page_cache_read_page *outputs[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
 };
@@ -1822,29 +1823,37 @@ unsigned kernel_page_cache_acquire_ready(struct kernel_page_cache *cache,
     return acquired;
 }
 
-/* 未发布的候选持有自己的node/page；分配完成后才在cache保护内竞争发布。 */
+/* Headers and data pages have separate preparation. Neither is visible to
+ * readers until commit_read_batch publishes a complete loading owner. */
+static enum kernel_page_cache_status allocate_entry_header(struct kernel_page_cache *cache,
+    struct kernel_vfs_node *node,uint64_t index,struct kernel_page_cache_entry **output)
+{
+    struct kernel_page_cache_entry *entry;
+    if (kernel_heap_allocate_zeroed(cache->heap,1,sizeof(*entry),(void **)&entry))
+        return KERNEL_PAGE_CACHE_STATUS_NO_MEMORY;
+    if (kernel_vfs_node_acquire(node)) {
+        kernel_heap_release(cache->heap,entry);return KERNEL_PAGE_CACHE_STATUS_STATE;
+    }
+    entry->cache=cache;entry->node=node;entry->page_index=index;*output=entry;
+    return KERNEL_PAGE_CACHE_STATUS_OK;
+}
 static enum kernel_page_cache_status allocate_entry(struct kernel_page_cache *cache,
     struct kernel_vfs_node *node,uint64_t index,int clear,
     struct kernel_page_cache_entry **output)
 {
     struct kernel_page_cache_entry *entry;
-    if (kernel_heap_allocate_zeroed(cache->heap,1,sizeof(*entry),(void **)&entry))
-        return KERNEL_PAGE_CACHE_STATUS_NO_MEMORY;
-    if (physical_page_allocate(cache->allocator,&entry->physical_address)) {
-        kernel_heap_release(cache->heap,entry);
-        return KERNEL_PAGE_CACHE_STATUS_NO_MEMORY;
-    }
+    enum kernel_page_cache_status status=allocate_entry_header(cache,node,index,&entry);
+    if (status) return status;
+    if (physical_page_allocate(cache->allocator,&entry->physical_address))
+        return abandon_entry(cache,entry,KERNEL_PAGE_CACHE_STATUS_NO_MEMORY);
     entry->page_references_owned=1;
-    void *page;
-    if (physical_page_map_owned(cache->allocator,entry->physical_address,&page))
+    if (physical_page_map_owned(cache->allocator,entry->physical_address,(void **)&entry->data))
         return abandon_entry(cache,entry,KERNEL_PAGE_CACHE_STATUS_STATE);
-    entry->data=page;
-    if (clear) memset(page,0,BOAROS_PAGE_SIZE);
-    if (kernel_vfs_node_acquire(node)) return abandon_entry(cache,entry,KERNEL_PAGE_CACHE_STATUS_STATE);
-    entry->cache=cache;entry->node=node;entry->page_index=index;
+    if (clear) memset(entry->data,0,BOAROS_PAGE_SIZE);
     *output=entry;
     return KERNEL_PAGE_CACHE_STATUS_OK;
 }
+
 static void publish_entry(struct kernel_page_cache *cache,struct kernel_page_cache_entry *entry,
     enum kernel_page_cache_status status)
 {
@@ -2396,19 +2405,57 @@ static void __attribute__((noinline)) read_batch_local(struct kernel_page_cache 
     size_t candidates=0;
     memset(loads,0,count*sizeof(*loads));
     enum kernel_page_cache_status allocation=KERNEL_PAGE_CACHE_STATUS_OK;
-    /* 容量按批次准备；候选未发布，整批分配不制造尚未提交的loading依赖。 */
     for (size_t i=0;!allocation && i<count;i++) {
         if (pages[i].status!=KERNEL_PAGE_CACHE_STATUS_NOT_FOUND || entries[i]) continue;
-        if (i && speculative && (cache->record->stopping ||
-            physical_page_available(cache->allocator)<=cache->record->high)) {
-            allocation=KERNEL_PAGE_CACHE_STATUS_NO_MEMORY;
+        allocation=allocate_entry_header(cache,node,first+i,&loads[i]);
+        if (!allocation) candidates++;
+    }
+    /* Materialize only this batch's actual misses. Larger buddy blocks are
+     * split into independent page owners under the same allocator protection;
+     * shortage falls through to the existing one-page reclaim/wait path. */
+    size_t prepared=0;
+    unsigned owned=0,next=0;
+    uint64_t *allocated=workspace?workspace->allocation_pages:NULL;
+    for (size_t i=0;i<count;i++) {
+        struct kernel_page_cache_entry *entry=loads[i];
+        if (!entry) continue;
+        enum kernel_page_cache_status status=KERNEL_PAGE_CACHE_STATUS_OK;
+        uint64_t allowance=UINT64_MAX;
+        if (speculative) {
+            uint64_t free=physical_page_available(cache->allocator);
+            allowance=free>cache->record->high?free-cache->record->high:0;
+            if (i && (cache->record->stopping || (!allowance && next==owned)))
+                status=KERNEL_PAGE_CACHE_STATUS_NO_MEMORY;
+        }
+        if (!status && next==owned && allocated && candidates-prepared>1) {
+            unsigned wanted=candidates-prepared>PHYSICAL_PAGE_ALLOCATION_BATCH_MAX?
+                PHYSICAL_PAGE_ALLOCATION_BATCH_MAX:(unsigned)(candidates-prepared);
+            if (allowance<wanted) wanted=(unsigned)allowance;
+            owned=wanted?physical_page_allocate_batch(cache->allocator,allocated,wanted):0;
+            next=0;
+        }
+        if (!status) {
+            if (next<owned) entry->physical_address=allocated[next++];
+            else if (physical_page_allocate(cache->allocator,&entry->physical_address))
+                status=KERNEL_PAGE_CACHE_STATUS_NO_MEMORY;
+            if (!status) {
+                entry->page_references_owned=1;
+                if (physical_page_map_owned(cache->allocator,entry->physical_address,(void **)&entry->data))
+                    status=KERNEL_PAGE_CACHE_STATUS_STATE;
+            }
+        }
+        if (status) {
+            allocation=status;
+            for (size_t j=i;j<count;j++) if (loads[j]) {
+                (void)abandon_entry(cache,loads[j],status);loads[j]=NULL;
+            }
             break;
         }
-        allocation=allocate_entry(cache,node,first+i,0,&loads[i]);
-        if (allocation) break;
-        spans[i]=(struct file_read_span){(first+i)<<BOAROS_PAGE_SHIFT,loads[i]->data,BOAROS_PAGE_SIZE,0,0};
-        candidates++;
+        spans[i]=(struct file_read_span){(first+i)<<BOAROS_PAGE_SHIFT,entry->data,BOAROS_PAGE_SIZE,0,0};
+        prepared++;
     }
+    if (next<owned) physical_page_release_batch(cache->allocator,allocated+next,owned-next);
+    candidates=prepared;
     if (candidates) {
         struct read_batch_load request={cache,file,first,pages,count,entries,loads,outputs,spans,
             workspace?&workspace->backend:NULL,allocation,no_reuse,speculative};

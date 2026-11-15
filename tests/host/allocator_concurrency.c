@@ -155,8 +155,8 @@ static void hook_notify(void *context)
 static void *hook_allocate(void *unused)
 {
     (void)unused;kernel_cpu_initialize(&cpu,1,&io);cpu.logical_id=1;
-    uint64_t page;assert(!physical_page_allocate(&allocator,&page));
-    assert(!physical_page_release(&allocator,page));return NULL;
+    uint64_t pages[7];assert(physical_page_allocate_batch(&allocator,pages,7)==7);
+    physical_page_release_batch(&allocator,pages,7);return NULL;
 }
 static void hook_lifetime(void)
 {
