@@ -91,6 +91,15 @@ BoarOS ELF 的 DWARF 生成 BTF，嵌入最终 ELF，再以只读文件页提供
 原版工具及其运行库构建在被忽略的缓存中，默认并行度为 2，客户机内存为 1 GiB。
 `build.py --help` 列出组件选择；Linux 对照内核由同目录 `linux.py` 构建。
 
+默认内核构建使用 `tools/build-pahole.py` 从随仓库保留的固定源码离线编译宿主 pahole，
+生成实际内核 ELF 的 BTF；RV 与 LA 共用 `build/tools/pahole/`。脚本校验归档、使用宿主
+编译器并串行保护共享缓存，成功后才发布工具及身份记录；已有且身份一致的工具直接复用。
+libdw、libelf、libbpf 静态链接进工具，不要求评测环境预装这些开发包；宿主需提供 C
+编译器、make、CMake、Python、binutils、pkg-config 及 zlib 开发库。显式设置
+`PAHOLE=/path/to/pahole` 可改用已有工具。BTF 转换失败仍终止构建，不生成占位数据。
+`tests/host/bpf-btf.sh path/to/vmlinux.btf ...` 可将真实生成的数据交给内核解析器检查，
+同时检查引用与分配归还；省略文件时运行原有格式与损坏反例。
+
 ```sh
 python3 tests/workloads/bpf/build.py --help
 python3 tests/workloads/bpf/linux.py --help
