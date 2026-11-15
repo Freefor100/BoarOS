@@ -35,8 +35,8 @@ struct kernel_vfs_instance {
     uint8_t quiescing;
     struct kernel_raw_lock error_lock;
     struct kernel_vfs_dentry *path_index;
-    struct kernel_vfs_dentry *directory_cache_first, *directory_cache_last;
-    size_t directory_cache_count, directory_cache_limit;
+    struct kernel_vfs_dentry *dentry_cache_first, *dentry_cache_last;
+    size_t dentry_cache_count, dentry_cache_limit;
     size_t transient_owners; /* Node retirement and clean reclaim still borrow the backend. */
     uint8_t namespace_parallel; /* Enabled only after this mount's metadata owners are ready. */
     struct kernel_writeback_owner writeback;
@@ -153,12 +153,9 @@ struct kernel_vfs_backend {
         const struct physical_page_allocator *);
     int (*error)(struct kernel_vfs_instance *instance);
     int (*root)(struct kernel_vfs_instance *instance, uint64_t *inode, uint32_t *mode);
+    /* Owned-name backends accept NULL mode: open imports real inode state. */
     int (*lookup)(struct kernel_vfs_instance *instance, uint64_t parent,
         const char *name, size_t length, uint64_t *inode, uint32_t *mode);
-    /* Final attributes can be returned by the lookup that already reads them.
-     * The caller holds the parent qualification and has checked search access. */
-    int (*stat_child)(const struct kernel_vfs_file *parent,const char *name,
-        size_t length,struct kernel_vfs_stat *stat);
     /* A backend with one directory entry per inode can expose several lookup
      * spellings (VFAT long/short names). They share one canonical path owner. */
     int (*entry_name)(struct kernel_vfs_instance *, uint64_t inode, char *, size_t);

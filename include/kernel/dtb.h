@@ -9,10 +9,12 @@
 #define DTB_MAX_MEMORY_RANGES 16U
 #define DTB_MAX_VIRTIO_MMIO_RANGES 16U
 #define DTB_MAX_CPUS 8U
+#define DTB_CPU_MMU_SVVPTC UINT32_C(1)
 
 struct dtb_cpu_info {
     uint64_t hart_ids[DTB_MAX_CPUS];
     uint32_t count;
+    uint32_t mmu_features; /* Intersection over the enabled harts. */
 };
 
 enum dtb_status {
@@ -64,5 +66,7 @@ enum dtb_status dtb_read_boot_info(const void *dtb,
 /* 独立快照：boot hart 为逻辑0，其余可用hart排序；失败不发布。 */
 enum dtb_status dtb_read_cpu_info(const void *dtb, uint64_t boot_hart,
                                 struct dtb_cpu_info *info);
+/* UP selects only the boot hart, without imposing a secondary capacity. */
+enum dtb_status dtb_read_boot_cpu_features(const void *,uint64_t,uint32_t *);
 
 #endif

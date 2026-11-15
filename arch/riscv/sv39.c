@@ -6,6 +6,8 @@
 
 #include <stdint.h>
 
+unsigned riscv_mmu_svvptc;
+
 #define RISCV_SV39_PTE_VALID UINT64_C(0x001)
 #define RISCV_SV39_PTE_READ UINT64_C(0x002)
 #define RISCV_SV39_PTE_WRITE UINT64_C(0x004)

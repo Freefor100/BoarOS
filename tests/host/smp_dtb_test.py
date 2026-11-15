@@ -10,10 +10,10 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class CpuInfo(C.Structure):
-    _fields_ = [("hart_ids", C.c_uint64 * 8), ("count", C.c_uint32)]
+    _fields_ = [("hart_ids", C.c_uint64 * 8), ("count", C.c_uint32), ("mmu_features", C.c_uint32)]
 
 
-def blob(cpus, cells=1, parent_status=None):
+def blob(cpus, cells=1, parent_status=None, extensions=None, isa=None):
     strings, body, offsets = bytearray(), bytearray(), {}
     word = lambda value: struct.pack(">I", value)
 
@@ -50,6 +50,10 @@ def blob(cpus, cells=1, parent_status=None):
         prop("reg", value)
         if duplicate:
             prop("reg", value)
+        if extensions and hart in extensions:
+            prop("riscv,isa-extensions", extensions[hart])
+        if isa and hart in isa:
+            prop("riscv,isa", isa[hart])
         if status:
             prop("status", status)
         end()
@@ -85,6 +89,29 @@ def main():
             return status, out
 
         cpu = lambda hart: (hart, None, None, False)
+        feature=b"i\0svvptc\0"
+        status, out=run([cpu(0),cpu(1)],extensions={0:feature,1:feature})
+        assert status==0 and out.mmu_features==1, "Svvptc on every enabled hart must be published"
+        assert run([cpu(0),cpu(1)],extensions={0:feature})[1].mmu_features==0
+        assert run([cpu(0),(1,b"disabled\0",None,False)],extensions={0:feature})[1].mmu_features==1
+        assert run([cpu(0)],isa={0:b"rv64imac_svvptc\0"})[1].mmu_features==1
+        assert run([cpu(0)],isa={0:b"rv64imac_svvptc1p0\0"})[1].mmu_features==1
+        assert run([cpu(0)],isa={0:b"rv64imac_svvptc1\0"})[1].mmu_features==1
+        assert run([cpu(0)],isa={0:b"rv64imacsvvptc\0"})[1].mmu_features==1
+        assert run([cpu(0)],isa={0:b"rv64i2p1m2p0ac_svvptc1p0\0"})[1].mmu_features==1
+        assert run([cpu(0)],isa={0:b"rv64imac_svvptcbogus\0"})[1].mmu_features==0
+        assert run([cpu(0)],isa={0:b"rv64imac_xsvvptc\0"})[1].mmu_features==0
+        assert run([cpu(0)],extensions={0:b"i\0"},isa={0:b"rv64imac_svvptc\0"})[1].mmu_features==0
+        assert run([cpu(0)],extensions={0:b"i\0svvptc"})[0]!=0
+        boot_features=C.CDLL(str(lib)).dtb_read_boot_cpu_features
+        boot_features.argtypes=[C.c_void_p,C.c_uint64,C.POINTER(C.c_uint32)]
+        data=C.create_string_buffer(blob([cpu(i) for i in range(10)],extensions={3:feature}))
+        features=C.c_uint32(0x55555555)
+        assert boot_features(data,3,C.byref(features))==0 and features.value==1
+        assert boot_features(data,5,C.byref(features))==0 and features.value==0
+        features.value=0x55555555
+        assert boot_features(data,19,C.byref(features))!=0 and features.value==0x55555555
+
         status, out = run([cpu(19), cpu(7), cpu(63), cpu(2)], boot=19)
         assert status == 0 and out.count == 4 and list(out.hart_ids) == [19, 2, 7, 63, 0, 0, 0, 0]
         status, out = run([cpu(hart) for hart in (19, 7, 63, 2, 8, 91, 4, 5)], boot=19)

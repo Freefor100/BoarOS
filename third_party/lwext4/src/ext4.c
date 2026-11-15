@@ -5553,12 +5553,6 @@ int ext4_fraw_inode_fill(const ext4_file *file,struct ext4_inode *inode)
     if (!file || !inode || !file->mp || !file->mp->mounted) return EINVAL;
     return read_inode_snapshot(file->mp,file->inode,inode);
 }
-int ext4_read_inode(const char *mount,uint32_t number,struct ext4_inode *inode)
-{
-    struct ext4_mountpoint *mp=ext4_get_mount(mount);
-    if (!mp || !inode || !number) return EINVAL;
-    return read_inode_snapshot(mp,number,inode);
-}
 
 int ext4_file_sync_metadata_prepare(ext4_file *file, bool data_only, uint64_t *target)
 {

@@ -447,6 +447,7 @@ RV_C_SOURCES := \
 	arch/riscv/process.c \
 	arch/riscv/ptrace.c \
 	arch/riscv/mm.c \
+	arch/riscv/uaccess.c \
 	arch/riscv/root_boot.c \
 	arch/riscv/sbi.c \
 	arch/riscv/sv39.c \
@@ -470,6 +471,7 @@ ASM_SOURCES := \
 	arch/riscv/context_switch.S \
 	arch/riscv/fpu.S \
 	arch/riscv/trap_entry.S \
+	arch/riscv/user_copy.S \
 	arch/riscv/signal_trampoline.S
 # 无根模块测试复用生产运行时，由各目标追加测试入口。
 TEST_RUNTIME_C_SOURCES := $(filter-out arch/riscv/smp.c arch/riscv/smp_sync.c arch/riscv/root_boot.c \

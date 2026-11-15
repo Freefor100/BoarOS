@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include "../../common/raw_syscall.h"
 
@@ -166,11 +167,68 @@ static void concurrent_append(int fd)
     for(unsigned i=0;i<n;i++) CHECK(seen[actors[i].cpu]==16);
     pass("caller-cpus-atomic-append");
 }
+static void local_user_copy(int fd)
+{
+    size_t page=(size_t)sysconf(_SC_PAGESIZE),size=2*page;
+    unsigned char *input=mmap(NULL,3*page,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    unsigned char *output=mmap(NULL,3*page,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    CHECK(input!=MAP_FAILED && output!=MAP_FAILED);
+    for(size_t i=0;i<size;i++)input[i]=(unsigned char)(i*17+3);
+    CHECK(pwrite(fd,input,size,0)==(ssize_t)size);
+    /* Cold destination faults return to the copy owner before page preparation. */
+    CHECK(pread(fd,output,size,0)==(ssize_t)size && !memcmp(input,output,size));
+    for(unsigned offset=0;offset<64;offset++) {
+        CHECK(pread(fd,output+offset,129,0)==129 && !memcmp(input,output+offset,129));
+    }
+    CHECK(!mprotect(output+page,page,PROT_NONE));
+    CHECK(pread(fd,output,size,0)==(ssize_t)page && !memcmp(input,output,page));
+    CHECK(!mprotect(output,page,PROT_READ));
+    errno=0;CHECK(pread(fd,output,32,0)==-1 && errno==EFAULT);
+    CHECK(!mprotect(output,2*page,PROT_READ|PROT_WRITE));
+    memset(output,0x91,page);
+    pid_t child=fork();CHECK(child>=0);
+    if(!child) {
+        if(pread(fd,output,page,0)!=(ssize_t)page || memcmp(input,output,page))_exit(7);
+        _exit(0);
+    }
+    int status;CHECK(waitpid(child,&status,0)==child && WIFEXITED(status) && !WEXITSTATUS(status));
+    for(size_t i=0;i<page;i++)CHECK(output[i]==0x91);
+    int shared_fd=open("/vectors-local-shared",O_RDWR|O_CREAT|O_TRUNC,0600);
+    CHECK(shared_fd>=0 && !ftruncate(shared_fd,(off_t)size));
+    unsigned char *shared=mmap(NULL,size,PROT_READ|PROT_WRITE,MAP_SHARED,shared_fd,0);
+    CHECK(shared!=MAP_FAILED && pread(fd,shared,size,0)==(ssize_t)size);
+    CHECK(!msync(shared,size,MS_SYNC));
+    CHECK(pread(shared_fd,output,size,0)==(ssize_t)size && !memcmp(input,output,size));
+    /* A completed snapshot revoked the old W PTEs. The next kernel store must
+     * enter the same alias write preparation as a user-mode store. */
+    CHECK(pread(fd,shared,size,0)==(ssize_t)size && !fsync(shared_fd));
+    CHECK(!mprotect(shared,size,PROT_READ));errno=0;
+    CHECK(pread(fd,shared,32,0)==-1 && errno==EFAULT);
+    CHECK(!munmap(shared,size));
+    unsigned char *private=mmap(NULL,page,PROT_READ|PROT_WRITE,MAP_PRIVATE,shared_fd,0);
+    int pipefd[2];CHECK(private!=MAP_FAILED && !pipe(pipefd));
+    CHECK(write(pipefd[1],"private",8)==8 && read(pipefd[0],private,8)==8 && !memcmp(private,"private",8));
+    CHECK(pread(shared_fd,output,8,0)==8 && !memcmp(input,output,8));
+    CHECK(!close(pipefd[0]) && !close(pipefd[1]) && !munmap(private,page));
+    CHECK(!close(shared_fd) && !unlink("/vectors-local-shared"));
+    CHECK(!pipe(pipefd) && !mprotect(input+page,page,PROT_NONE));
+    CHECK(write(pipefd[1],input,size)==(ssize_t)page);
+    CHECK(read(pipefd[0],output,page)==(ssize_t)page && !memcmp(input,output,page));
+    CHECK(!close(pipefd[0]) && !close(pipefd[1]));
+    char *name=(char *)input+page-sizeof("/vectors-v2.data");
+    memcpy(name,"/vectors-v2.data",sizeof("/vectors-v2.data"));
+    int opened=open(name,O_RDONLY);CHECK(opened>=0 && !close(opened));
+    memset(input+page-8,'x',8);errno=0;
+    CHECK(open((char *)input+page-8,O_RDONLY)==-1 && errno==EFAULT);
+    CHECK(!munmap(input,3*page) && !munmap(output,3*page));
+    CHECK(!ftruncate(fd,0));
+    pass("local-copy-fault-prefix-cow-string");
+}
 int main(void)
 {
     setvbuf(stdout,NULL,_IONBF,0);
     int fd=open("/vectors-v2.data",O_RDWR|O_CREAT|O_TRUNC,0600);CHECK(fd>=0);
-    positions(fd);options(fd);vectors_faults(fd);signals_and_seals(fd);concurrent_append(fd);
+    local_user_copy(fd);positions(fd);options(fd);vectors_faults(fd);signals_and_seals(fd);concurrent_append(fd);
     CHECK(!fsync(fd) && !close(fd) && !unlink("/vectors-v2.data"));
     printf("VECTORS2 PASS cases=%u\n",cases);return 0;
 }
