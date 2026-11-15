@@ -287,10 +287,11 @@ int main(int argc, char **argv)
     bool gdt = !strcmp(argv[2], "gdt");
     bool dx = !strcmp(argv[2], "dx");
     bool reuse = !strcmp(argv[2], "reuse");
+    bool legacy_gdt = !strcmp(argv[2], "gdt16");
     bool records = !strcmp(argv[2], "records");
     bool extent = !strcmp(argv[2], "extent");
     bool read_directory = !strcmp(argv[2], "directory-read");
-    CHECK(gdt || dx || reuse || records || extent || read_directory || !strcmp(argv[2], "inode"));
+    CHECK(gdt || legacy_gdt || dx || reuse || records || extent || read_directory || !strcmp(argv[2], "inode"));
     CHECK(fault_block_open(&disk, argv[1]) == 0);
     unsigned char scratch[512];
     struct ext4_blockdev_iface iface = {.open=dev_open, .close=dev_open,
@@ -301,6 +302,21 @@ int main(int argc, char **argv)
     CHECK(ext4_mount("metadata", "/", false) == EOK);
     CHECK(ext4_recover("/") == EOK && ext4_journal_start("/") == EOK);
     struct ext4_fs *fs = dev.fs;
+    if (legacy_gdt) {
+        CHECK(!ext4_sb_feature_ro_com(&fs->sb,EXT4_FRO_COM_METADATA_CSUM) &&
+              ext4_sb_feature_ro_com(&fs->sb,EXT4_FRO_COM_GDT_CSUM));
+        struct ext4_block_group_ref writable,read;
+        CHECK(ext4_fs_get_block_group_ref_write(fs,0,&writable)==EOK);
+        uint16_t original=writable.block_group->checksum;
+        writable.block_group->checksum^=1;
+        CHECK(ext4_fs_get_block_group_ref(fs,0,&read)==EUCLEAN);
+        writable.block_group->checksum=original;
+        CHECK(ext4_fs_put_block_group_ref(&writable)==EOK);
+        CHECK(ext4_fs_get_block_group_ref(fs,0,&read)==EOK && ext4_fs_put_block_group_ref(&read)==EOK);
+        CHECK(ext4_journal_stop("/")==EOK && ext4_umount("/")==EOK && !live_allocations);
+        fault_block_close(&disk);puts("PASS legacy GDT_CSUM: corrupt descriptor rejected, restored descriptor accepted");
+        return 0;
+    }
     CHECK(ext4_sb_feature_ro_com(&fs->sb, EXT4_FRO_COM_METADATA_CSUM));
     if (reuse || read_directory || records || extent) {
         if (extent) extent_node_queries(fs);

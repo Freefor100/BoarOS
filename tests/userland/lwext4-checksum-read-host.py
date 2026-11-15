@@ -12,7 +12,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source-root', type=Path, default=ROOT)
     parser.add_argument('--output', type=Path, default=ROOT/'build/lwext4-checksum-read-host')
-    parser.add_argument('--modes', nargs='+', choices=('gdt', 'inode', 'dx', 'reuse', 'directory-read', 'records', 'extent'), default=('gdt', 'inode', 'dx', 'reuse', 'directory-read', 'records', 'extent'))
+    parser.add_argument('--modes', nargs='+', choices=('gdt', 'gdt16', 'inode', 'dx', 'reuse', 'directory-read', 'records', 'extent'), default=('gdt', 'gdt16', 'inode', 'dx', 'reuse', 'directory-read', 'records', 'extent'))
     parser.add_argument('--page-shift', type=int, choices=(12, 14), default=12)
     args = parser.parse_args()
     source = args.source_root.resolve(); out = args.output.resolve(); out.mkdir(parents=True, exist_ok=True)
@@ -40,7 +40,11 @@ def main():
                 subprocess.run([str(program), str(base), 'seed'], check=True, stdout=log, stderr=log)
                 for mode in args.modes:
                     image = out/f'{block}-{inode}-{mode}.img'
-                    subprocess.run(['cp', '--sparse=always', str(base), str(image)], check=True)
+                    if mode=='gdt16':
+                        with image.open('wb') as f:f.truncate(32*1024*1024)
+                        subprocess.run(['mkfs.ext4','-q','-F','-b',str(block),'-I',str(inode),
+                                        '-O','^metadata_csum,uninit_bg',str(image)],check=True)
+                    else:subprocess.run(['cp', '--sparse=always', str(base), str(image)], check=True)
                     subprocess.run([str(program), str(image), mode], check=True, stdout=log, stderr=log)
                     subprocess.run(['e2fsck', '-fn', str(image)], check=True, stdout=log, stderr=log)
     print(f'PASS: {4 * len(args.modes)} checksum cases ({", ".join(args.modes)}), page={1 << args.page_shift}; heap owners and independent e2fsck')

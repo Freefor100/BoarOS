@@ -75,6 +75,10 @@ struct ext4_fs {
 	struct jbd_fs *jbd_fs;
 	struct jbd_journal *jbd_journal;
 	struct ext4_orphan_index *orphan_index;
+	/* Accepted inode-table locations; writable GDT exposure disables that
+	 * group's reuse until recovery/remount. No mutable allocation state. */
+	ext4_fsblk_t *inode_table_starts;
+	uint32_t inode_table_groups;
 	uint32_t active_operations;
 	const struct ext4_lock *os_locks;
     const struct ext4_inode_observer *inode_observer;
@@ -170,6 +174,8 @@ struct ext4_inode_ref {
 
 /* Read-only geometry/GDT/journal validation; output changes only on success. */
 int ext4_fs_calculate_overhead(struct ext4_fs *fs, uint64_t *blocks);
+void ext4_fs_prepare_inode_locations(struct ext4_fs *fs);
+void ext4_fs_reset_inode_locations(struct ext4_fs *fs);
 
 
 /**@brief Convert block address to relative index in block group.

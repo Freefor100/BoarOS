@@ -5,12 +5,26 @@
 #include <ext4_journal.h>
 #include <ext4_inode.h>
 #include <ext4_super.h>
+#include <ext4_block_group.h>
 #include <kernel/time.h>
 #include <kernel/credentials.h>
 #include <stdlib.h>
 
 static unsigned stat_lookup_watch,stat_lookup_reads,stat_lookup_opens,stat_lookup_io_locks,stat_lookup_allocations;
 static unsigned borrowed_path_watch,borrowed_path_state_locks;
+static _Thread_local unsigned inode_geometry_watch,inode_geometry_reads,inode_geometry_fail;
+static uint64_t inode_geometry_block;
+static struct ext4_blockdev *inode_geometry_device;
+int __real_ext4_block_get_range(struct ext4_blockdev *,struct ext4_block *,uint64_t,uint32_t,uint32_t,enum ext4_block_access);
+int __wrap_ext4_block_get_range(struct ext4_blockdev *device,struct ext4_block *block,
+    uint64_t lba,uint32_t offset,uint32_t length,enum ext4_block_access access)
+{
+    if (inode_geometry_watch && device==inode_geometry_device && lba==inode_geometry_block) {
+        inode_geometry_reads++;
+        if (inode_geometry_fail) return EIO;
+    }
+    return __real_ext4_block_get_range(device,block,lba,offset,length,access);
+}
 void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *,struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_raw_guard *guard)
 {
@@ -47,6 +61,53 @@ int __wrap_ext4_fopen_inode(ext4_file *file,const char *mount,uint32_t inode,str
 {
     if (stat_lookup_watch) stat_lookup_opens++;
     return __real_ext4_fopen_inode(file,mount,inode,initial);
+}
+static void inode_geometry_reuse_case(struct lwext4_mount_adapter *adapter)
+{
+    struct ext4_fs *fs=adapter->device.fs;
+    const uint32_t number=EXT4_INODE_ROOT_INDEX;
+    uint32_t index=(number-1)/ext4_get32(&fs->sb,inodes_per_group);
+    adapter->locks.lock(adapter->locks.context);
+    struct ext4_block_group_ref group;
+    assert(!ext4_fs_get_block_group_ref(fs,index,&group));
+    inode_geometry_device=fs->bdev;inode_geometry_block=group.block.lb_id;
+    assert(!ext4_fs_put_block_group_ref(&group));
+    ext4_fs_reset_inode_locations(fs);
+    inode_geometry_watch=1;inode_geometry_reads=0;inode_geometry_fail=1;
+    struct ext4_inode_ref failed;
+    assert(ext4_fs_get_inode_ref_read(fs,number,&failed)==EIO);
+    assert(ext4_fs_get_inode_ref_read(fs,number,&failed)==EIO && inode_geometry_reads==2);
+    inode_geometry_reads=0;inode_geometry_fail=0;
+    for(unsigned i=0;i<32;i++) {
+        struct ext4_inode_ref inode;
+        assert(!ext4_fs_get_inode_ref_read(fs,number,&inode) && inode.index==number);
+        assert(!ext4_fs_put_inode_ref(&inode));
+    }
+    inode_geometry_watch=0;
+    printf("inode location reuse: GDT reads=%u\n",inode_geometry_reads);
+    assert(inode_geometry_reads<=1);
+    assert(!ext4_fs_get_block_group_ref_write(fs,index,&group));
+    uint16_t checksum=group.block_group->checksum;
+    group.block_group->checksum^=1;
+    struct ext4_inode_ref inode;
+    assert(ext4_fs_get_inode_ref_read(fs,number,&inode)==EUCLEAN);
+    group.block_group->checksum=checksum;
+    uint64_t table=ext4_bg_get_inode_table_first_block(group.block_group,&fs->sb);
+    ext4_bg_set_inode_table_first_block(group.block_group,&fs->sb,ext4_sb_get_blocks_cnt(&fs->sb));
+    ext4_fs_update_bg_csum(&fs->sb,index,group.block_group);
+    assert(ext4_fs_get_inode_ref_read(fs,number,&inode)==EUCLEAN);
+    ext4_bg_set_inode_table_first_block(group.block_group,&fs->sb,table);
+    group.block_group->checksum=checksum;
+    assert(!ext4_fs_put_block_group_ref(&group));
+    inode_geometry_watch=1;inode_geometry_reads=0;
+    for(unsigned i=0;i<32;i++) {
+        assert(!ext4_fs_get_inode_ref_read(fs,number,&inode));
+        assert(!ext4_fs_put_inode_ref(&inode));
+    }
+    inode_geometry_watch=0;
+    assert(inode_geometry_reads==32);
+    adapter->locks.unlock(adapter->locks.context);
+    puts("PASS inode location reuse: pristine facts, writable GDT corruption and original verification fallback");
 }
 static void directory_reuse_case(struct kernel_vfs_path *root)
 {
@@ -588,6 +649,7 @@ int main(int argc,char **argv)
            !kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,&cache,0));
     struct lwext4_mount_adapter *adapter=mount.private_data;struct ext4_fs *fs=adapter->device.fs;
     assert(fs->jbd_journal && fs->orphan_index && !fs->active_operations);
+    if (getenv("EXT4_NAMESPACE_REUSE_ONLY")) inode_geometry_reuse_case(adapter);
     worker_mode=getenv("EXT4_NAMESPACE_PARALLEL_WORKERS")!=NULL;
     if(worker_mode) {
         parallel_worker_startup(adapter,1);
