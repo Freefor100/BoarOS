@@ -35,6 +35,8 @@ struct kernel_vfs_instance {
     uint8_t quiescing;
     struct kernel_raw_lock error_lock;
     struct kernel_vfs_dentry *path_index;
+    struct kernel_vfs_dentry *directory_cache_first, *directory_cache_last;
+    size_t directory_cache_count, directory_cache_limit;
     size_t transient_owners; /* Node retirement and clean reclaim still borrow the backend. */
     uint8_t namespace_parallel; /* Enabled only after this mount's metadata owners are ready. */
     struct kernel_writeback_owner writeback;
@@ -105,6 +107,8 @@ struct kernel_vfs_dentry {
     struct kernel_heap *heap;
     struct kernel_vfs_dentry *parent, *next, **previous;
     uint32_t references;
+    struct kernel_vfs_dentry *cache_next, *cache_previous;
+    uint8_t cached;
     uint8_t detached;
     uint32_t mountpoints;
     char *name;

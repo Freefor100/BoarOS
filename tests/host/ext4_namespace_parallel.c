@@ -6,6 +6,7 @@
 #include <ext4_inode.h>
 #include <ext4_super.h>
 #include <kernel/time.h>
+#include <kernel/credentials.h>
 #include <stdlib.h>
 
 static unsigned stat_lookup_watch,stat_lookup_reads,stat_lookup_opens;
@@ -20,6 +21,50 @@ int __wrap_ext4_fopen_inode(ext4_file *file,const char *mount,uint32_t inode,str
 {
     if (stat_lookup_watch) stat_lookup_opens++;
     return __real_ext4_fopen_inode(file,mount,inode,initial);
+}
+static void directory_reuse_case(struct kernel_vfs_path *root)
+{
+    struct kernel_vfs_file f={0};struct kernel_vfs_stat before,after;
+    struct kernel_vfs_instance *instance=root->file.mount->private_data;
+    assert(!kernel_vfs_mkdir_at(root,root,"reuse-parent",0755,0));
+    assert(!kernel_vfs_mkdir_at(root,root,"reuse-parent/child",0700,0));
+    assert(!kernel_vfs_create_at(root,root,"reuse-parent/child/file",0600,&f,0));
+    assert(!kernel_vfs_close(&f));
+    assert(!kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&before));
+    stat_lookup_watch=1;stat_lookup_reads=stat_lookup_opens=0;
+    for(unsigned i=0;i<32;i++) {
+        assert(!kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&after));
+        assert(after.ino==before.ino && after.mode==before.mode);
+    }
+    stat_lookup_watch=0;
+    printf("directory reuse: inode reads=%u opens=%u\n",stat_lookup_reads,stat_lookup_opens);
+    assert(!stat_lookup_opens && stat_lookup_reads==64);
+    struct kernel_credentials *lower=kernel_credentials_clone(instance->heap,kernel_credentials_current());
+    assert(lower);lower->fsuid=70001;lower->fsgid=70001;lower->effective=0;
+    const struct kernel_credentials *previous=kernel_credentials_override(lower);
+    assert(kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&after)==-KERNEL_EACCES);
+    assert(kernel_credentials_override(previous)==lower);
+    struct kernel_vfs_path *held=NULL;
+    assert(!kernel_vfs_path_resolve(root,root,"reuse-parent/child",1,&held));
+    assert(!kernel_vfs_path_set_mode(held,0711));
+    previous=kernel_credentials_override(lower);
+    assert(!kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&after));
+    assert(kernel_credentials_override(previous)==lower);kernel_credentials_put(lower);
+    assert(!kernel_vfs_stat_at(root,root,"reuse-parent/child",1,&after) && (after.mode&0777)==0711);
+    assert(!kernel_vfs_rename_at(root,root,root,"reuse-parent","reuse-renamed",0));
+    assert(kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&after)==-KERNEL_ENOENT);
+    assert(!kernel_vfs_stat_at(root,root,"reuse-renamed/child/file",1,&after) && after.ino==before.ino);
+    (void)kernel_vfs_reclaim_clean(instance->heap->page_allocator,1);
+    assert(!instance->directory_cache_count);
+    assert(!kernel_vfs_stat_at(held,root,"file",1,&after) && after.ino==before.ino);
+    assert(!kernel_vfs_path_release(&held));
+    assert(!kernel_vfs_unlink_at(root,root,"reuse-renamed/child/file",0));
+    assert(!kernel_vfs_unlink_at(root,root,"reuse-renamed/child",1));
+    assert(!kernel_vfs_mkdir_at(root,root,"reuse-renamed/child",0750,0));
+    assert(!kernel_vfs_stat_at(root,root,"reuse-renamed/child",1,&after) && (after.mode&0777)==0750);
+    assert(!kernel_vfs_unlink_at(root,root,"reuse-renamed/child",1));
+    assert(!kernel_vfs_unlink_at(root,root,"reuse-renamed",1));
+    puts("PASS directory reuse: stable lookup, current mode, rename, pressure, detached identity and final reclamation");
 }
 static void lookup_attributes_case(struct kernel_vfs_path *root)
 {
@@ -463,6 +508,9 @@ int main(int argc,char **argv)
     }
     struct kernel_vfs_path *root=NULL,*directories[65]={0};
     assert(!kernel_vfs_path_root(&mount,&heap,&root));
+    if (getenv("EXT4_NAMESPACE_REUSE_ONLY")) {
+        directory_reuse_case(root);lookup_attributes_case(root);
+        rename_order_case(adapter,root);rename_order_directory_case(adapter,root);goto Finish;}
     lookup_attributes_case(root);
     if (getenv("EXT4_NAMESPACE_STAT_ONLY")) goto Finish;
     worker_notification_case(adapter,root);

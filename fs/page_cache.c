@@ -1093,12 +1093,17 @@ static uint64_t group_reclaim(void *context, uint64_t target)
 {
     struct page_cache_group *g=context;
     struct kernel_lock_guard *held=kernel_io_context_current()->locks;
+    /* Directory retirement closes real inodes. Do it before the group walk
+     * and only from an allocation caller without lower-level qualifications. */
+    uint64_t released=held || kernel_io_context_current()->user_pins ||
+        kernel_io_context_current()->cache_writes ? 0 :
+        kernel_vfs_reclaim_clean(g->allocator,target);
+    if (released>=target) return released;
     KERNEL_LOCK_SCOPE(walk);
-    if (held && held->lock->rank>=g->walk.lock.rank) return 0;
+    if (held && held->lock->rank>=g->walk.lock.rank) return released;
     kernel_mutex_lock(&g->walk,&walk);
     struct kernel_page_cache_record *first=g->cursor?g->cursor:g->head,*r=first;
-    uint64_t released=0;
-    if (!r) return 0;
+    if (!r) return released;
     do {
         released+=kernel_page_cache_reclaim(r->owner,target-released);
         r=r->next?r->next:g->head;
