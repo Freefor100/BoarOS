@@ -15,6 +15,8 @@
 #define RISCV_SV39_PAGE_SIZE_4K UINT64_C(0x1000)
 #define RISCV_SV39_PAGE_SIZE_2M UINT64_C(0x200000)
 #define RISCV_SV39_USER_LIMIT (UINT64_C(1) << 38U)
+/* Boot publishes the intersection for the harts that will execute userspace. */
+extern unsigned riscv_mmu_svvptc;
 
 #define RISCV_SV39_READ (UINT32_C(1) << 0U)
 #define RISCV_SV39_WRITE (UINT32_C(1) << 1U)

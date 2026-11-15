@@ -8,6 +8,8 @@
 非零/稀疏ID、disabled、重复/损坏和失败不修改输出由`make test-smp-host`保护，
 完整启动与容量边界见[RV两核模块](riscv-smp.md)。
 
+CPU快照同时保存所有启用hart的MMU能力交集。Svvptc优先从NUL分隔的`riscv,isa-extensions`读取；只有该属性缺失时才解析旧`riscv,isa`中的完整扩展名及版本后缀。缺少能力时保持保守同步，不能从某一个hart推断全机支持。UP通过`dtb_read_boot_cpu_features()`只读取boot hart能力，不因DTB中存在超出编译容量的secondary拒绝启动。能力在用户执行及secondary启动前发布，此后不变。首次PTE发布与旧映射失效的区别见[MM缺页同步](kernel-mm.md#硬件用户缺页解析)。
+
 | 文件 | 当前职责 |
 |---|---|
 | `include/kernel/dtb.h`、`kernel/dtb.c` | 校验 DTB，读取第一段 RAM、DTB 大小、RISC-V timebase、`/chosen/rng-seed`、静态保留区和 VirtIO MMIO 范围 |

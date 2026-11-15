@@ -67,6 +67,10 @@ static inline void arch_mmu_sync_instructions(void)
 static inline void arch_mmu_flush_address(uint64_t address)
 { riscv_mmu_flush_address(address); }
 static inline void arch_mmu_flush_all(void) { riscv_mmu_flush_all(); }
+/* Svvptc covers invalid-to-valid PTE publication, including non-leaf entries.
+ * Valid mappings and instruction contents still need their explicit sync. */
+static inline int arch_mmu_new_translation_needs_sync(void)
+{ return !riscv_mmu_svvptc; }
 static inline void arch_mmu_sync_instruction_cpus(uint32_t targets)
 {
 #if BOAROS_MAX_CPUS > 1

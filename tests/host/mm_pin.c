@@ -20,8 +20,13 @@ extern _Thread_local int mm_test_wrong_owner;
 void mm_test_attach(unsigned);
 static unsigned char pool[4 * 1024 * 1024] __attribute__((aligned(16384)));
 void kernel_console_putc(char c) { fputc(c, stderr); }
+static _Thread_local unsigned tlb_fences,instruction_fences;
 void mm_test_fence(uint64_t address, int instructions)
-{ (void)address; (void)instructions; __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+{
+    (void)address;
+    if (instructions) instruction_fences++;else tlb_fences++;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
 void mm_test_unavailable(void) { fputs("excluded business path reached\n", stderr); abort(); }
 static unsigned watch_pin_entries,pin_entries;
 enum kernel_mm_status __real_kernel_mm_pin_user_page(const struct kernel_mm *,uint64_t,uint32_t,struct kernel_mm_user_pin *);
@@ -43,6 +48,42 @@ static void cold_copy_case(struct kernel_mm *mm)
     value=0;assert(!kernel_copy_from_user(mm,&value,address,1,&copied) && copied==1 && value==0x37);
     assert(!kernel_mm_munmap(mm,address,BOAROS_PAGE_SIZE));
 }
+static void new_mapping_sync_case(struct kernel_mm *mm)
+{
+    const uint64_t hint=0x180000;
+    uint64_t address;
+    for (unsigned supported=0;supported<=1;supported++) {
+        riscv_mmu_svvptc=supported;
+        assert(!kernel_mm_mmap_anonymous(mm,hint,BOAROS_PAGE_SIZE,
+            KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&address));
+        tlb_fences=instruction_fences=0;
+        assert(!kernel_mm_resolve_user_fault(mm,address,KERNEL_MM_WRITE));
+        printf("new anonymous mapping Svvptc=%u TLB fences=%u\n",supported,tlb_fences);fflush(stdout);
+        assert(supported ? !tlb_fences : tlb_fences!=0);
+        assert(!instruction_fences);
+        tlb_fences=0;
+        assert(!kernel_mm_mprotect(mm,address,BOAROS_PAGE_SIZE,KERNEL_MM_READ));
+        assert(tlb_fences && "Svvptc must not bypass permission invalidation");
+        assert(!kernel_mm_mprotect(mm,address,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE));
+        struct kernel_mm child={0};struct kernel_mm_mapping old,current;
+        assert(!kernel_mm_lookup(mm,address,&old) && !kernel_mm_fork(&child,mm));
+        tlb_fences=0;
+        assert(!kernel_mm_resolve_user_fault(mm,address,KERNEL_MM_WRITE));
+        assert(tlb_fences && !kernel_mm_lookup(mm,address,&current) && current.physical_address!=old.physical_address);
+        assert(!kernel_mm_release(&child));
+        tlb_fences=0;assert(!kernel_mm_munmap(mm,address,BOAROS_PAGE_SIZE));
+        assert(tlb_fences && "retired pages still wait for invalidation");
+    }
+    riscv_mmu_svvptc=1;
+    assert(!kernel_mm_mmap_anonymous(mm,hint,BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ|KERNEL_MM_WRITE|KERNEL_MM_EXECUTE,KERNEL_MM_MAP_FIXED,&address));
+    tlb_fences=instruction_fences=0;
+    assert(!kernel_mm_resolve_user_fault(mm,address,KERNEL_MM_WRITE));
+    assert(!tlb_fences && instruction_fences);
+    assert(!kernel_mm_munmap(mm,address,BOAROS_PAGE_SIZE));
+    riscv_mmu_svvptc=0;
+}
+
 static uint64_t watched_record;
 static unsigned record_resolutions;
 static uint64_t qualifying_page;
@@ -242,6 +283,7 @@ int main(void)
     uint64_t address, context;
     assert(kernel_mm_context(&mm, &context) == 0);
     mm_test_context = context;
+    new_mapping_sync_case(&mm);
     cold_copy_case(&mm);
     assert(kernel_mm_mmap_anonymous(&mm, 0x40000, BOAROS_PAGE_SIZE,
         KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED, &address) == 0);

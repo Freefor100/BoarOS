@@ -2022,7 +2022,7 @@ static uint32_t note_tlb_change_locked(struct kernel_mm_record *record,
 static uint32_t note_fault_change_locked(struct kernel_mm_record *record,
     const struct kernel_mm_retirement *batch, int replacement, int instructions)
 {
-#if BOAROS_MAX_CPUS > 1 && !defined(BOAROS_ARCH_LOONGARCH)
+#if !defined(BOAROS_ARCH_LOONGARCH)
     if (!replacement) {
         if (batch->count) __builtin_trap();
         /* A new translation cannot leave a stale permission or physical page.
@@ -2060,12 +2060,14 @@ static void finish_fault_change(struct kernel_mm_record *record,
     struct kernel_mm_retirement *batch,uint32_t targets,uint64_t address,
     uint64_t size,int replacement,int instructions)
 {
-#if BOAROS_MAX_CPUS > 1 && !defined(BOAROS_ARCH_LOONGARCH)
+#if !defined(BOAROS_ARCH_LOONGARCH)
     if (!replacement) {
         if (batch->count) __builtin_trap();
         COST_SCOPE(sync_cost,MM_SYNC_TICKS);
+        int translations=arch_mmu_new_translation_needs_sync();
+        if (!translations && !instructions) return;
         kernel_preempt_disable();
-        arch_mmu_sync_user(0,address,size,0);
+        if (translations) arch_mmu_sync_user(0,address,size,0);
         if (instructions) arch_mmu_sync_instruction_cpus(targets);
         kernel_preempt_enable();
         return;
@@ -2084,8 +2086,14 @@ static void mm_operation_release(struct mm_operation *operation)
         if (!operation->guard.lock || operation->guard.write || !operation->populate) __builtin_trap();
         {
             COST_SCOPE(sync_cost, MM_SYNC_TICKS);
-            arch_mmu_sync_user(operation->sync_targets, operation->sync_start,
-                operation->sync_end - operation->sync_start, 0);
+#if defined(BOAROS_ARCH_LOONGARCH)
+            arch_mmu_sync_user(operation->sync_targets,operation->sync_start,
+                operation->sync_end-operation->sync_start,0);
+#else
+            if (operation->sync_targets) __builtin_trap();
+            if (arch_mmu_new_translation_needs_sync())
+                arch_mmu_sync_user(0,operation->sync_start,operation->sync_end-operation->sync_start,0);
+#endif
         }
         operation->sync_start = operation->sync_end = 0;
         operation->sync_targets = 0;
@@ -5919,7 +5927,11 @@ static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_op
 #if BOAROS_COST_DIAGNOSTICS
     unsigned prepared_count = 0;
 #endif
+#if BOAROS_MAX_CPUS > 1
     uint32_t targets;
+#else
+    uint32_t targets=0;
+#endif
     struct kernel_mm_retirement batch = {0};
     struct kernel_mm_leaf_preparation prepared = KERNEL_MM_LEAF_PREPARATION_INIT;
     {
@@ -6140,7 +6152,8 @@ memory_tables_changed:
             targets=note_fault_change_locked(record,&batch,0,
                 (vma->permissions&KERNEL_MM_EXECUTE)!=0);
         }
-        /* 新非叶的walk cache也全量失效；旧COW PTE owner留到完成确认。 */
+        /* Without Svvptc a new non-leaf needs full walk-cache invalidation;
+         * replaced COW owners always remain until actual sync completes. */
         int nonleaf = missing && ((missing & 1U && prepared.tables[0] == KERNEL_MM_NO_PAGE) ||
             (missing & 2U && prepared.tables[1] == KERNEL_MM_NO_PAGE));
 #if BOAROS_MAX_CPUS > 1
