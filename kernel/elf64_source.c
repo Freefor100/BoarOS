@@ -773,6 +773,23 @@ static const struct kernel_elf64_source_run *find_run(
     return 0;
 }
 
+unsigned kernel_elf64_source_acquire_ready(struct kernel_elf64_source *source,
+    uint64_t first,unsigned selected,uint64_t *addresses,unsigned capacity)
+{
+    if (!source_valid(source) || !source->file || (first & BOAROS_PAGE_MASK) ||
+        !kernel_open_file_speculative_read_allowed(source->file)) return 0;
+    const struct kernel_elf64_source_run *run=find_run(source,first);
+    if (!run || run->kind!=KERNEL_ELF64_SOURCE_RUN_FILE) return 0;
+    uint64_t offset=run->file_offset+first-run->start;
+    if (offset<run->file_offset || (offset & BOAROS_PAGE_MASK)) return 0;
+    uint64_t pages=(run->end-first)/BOAROS_PAGE_SIZE;
+    if (pages<KERNEL_PAGE_CACHE_READY_WINDOW) selected&=(1U<<pages)-1;
+    struct kernel_page_cache *cache=kernel_open_file_page_cache(source->file);
+    if (!cache) return 0;
+    return kernel_page_cache_acquire_ready(cache,kernel_open_file_vfs_borrow(source->file),
+        offset>>BOAROS_PAGE_SHIFT,selected,addresses,capacity);
+}
+
 static void zero_page(void *page, uint64_t page_size)
 {
     unsigned char *bytes = page;
