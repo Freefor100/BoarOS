@@ -77,7 +77,7 @@ static int node_dac_permission(struct kernel_vfs_node *node,
     }
     return kernel_vfs_dac_permission(node->mode,node->uid,node->gid,access,cred);
 }
-static int inode_permission(struct kernel_vfs_node *node, unsigned access)
+static int inode_permission(struct kernel_vfs_node *node,unsigned access,int directory_guarded)
 {
     const struct kernel_credentials *cred=kernel_credentials_current();
     uint32_t type=node->mode & KERNEL_VFS_S_IFMT;
@@ -87,8 +87,12 @@ static int inode_permission(struct kernel_vfs_node *node, unsigned access)
      * owner/mode snapshot except the execute-bit check on non-directories. */
     if (!access || (!(access&2U) && !node->instance->ops->acl_permission && kernel_credentials_capable(cred,KERNEL_CAP_DAC_OVERRIDE) &&
         (!(access & 1U) || (node->mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR))) return 0;
+    /* Directory chmod/chown/ACL changes take the namespace writer already
+     * excluded by this path walk. Reuse that qualification for the DAC/ACL
+     * snapshot; backend-specific dynamic permission still uses inode I/O. */
     KERNEL_LOCK_SCOPE(io);
-    kernel_vfs_node_lock(node, &io, 0);
+    if (!directory_guarded || type!=KERNEL_VFS_S_IFDIR || node->instance->ops->permission)
+        kernel_vfs_node_lock(node,&io,0);
     return node_dac_permission(node,cred,access);
 }
 int kernel_vfs_file_noappend_allowed(const struct kernel_vfs_file *file)
@@ -127,7 +131,7 @@ int kernel_vfs_path_permission(struct kernel_vfs_path *path, unsigned access)
         ((path->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFREG ||
          (path->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR ||
          (path->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFLNK)) return -KERNEL_EROFS;
-    return inode_permission(path->file.private_data, access);
+    return inode_permission(path->file.private_data,access,0);
 }
 int kernel_vfs_chmod_allowed(uint32_t uid,uint32_t gid,uint32_t *mode)
 {
@@ -2164,7 +2168,7 @@ static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
     if (!parent || !parent->references || !name || !name_length || !owner || *owner) return -KERNEL_EINVAL;
     if (name_length>255U) return -KERNEL_ENAMETOOLONG;
     if ((parent->file.mode & KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFDIR) return -KERNEL_ENOTDIR;
-    int result=search ? inode_permission(parent->file.private_data,KERNEL_VFS_MAY_EXEC) : 0;
+    int result=search ? inode_permission(parent->file.private_data,KERNEL_VFS_MAY_EXEC,1) : 0;
     if (result) return result;
     if (name_length==1 && name[0]=='.') {
         result=kernel_vfs_path_acquire(parent);if (!result) *owner=parent;return result;
@@ -2374,7 +2378,7 @@ static int resolve_object(struct kernel_vfs_path *start,
         walk->stat_directory=suffix;
         if (current == root && component_length == 2U &&
             pending[begin] == '.' && pending[begin + 1U] == '.') {
-            result = inode_permission(current->file.private_data, KERNEL_VFS_MAY_EXEC);
+            result = inode_permission(current->file.private_data,KERNEL_VFS_MAY_EXEC,1);
             if (!result && (walk->resolve & KERNEL_VFS_RESOLVE_BENEATH))
                 result=-KERNEL_EXDEV;
             if (!result) result = kernel_vfs_path_acquire(root);

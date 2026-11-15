@@ -2868,8 +2868,10 @@ static int ext4_backend_stat_child(const struct kernel_vfs_file *parent,
     if (error) return error;
     uint32_t inode_number;
     struct ext4_inode inode;
-    error=lwext4_error(ext4_stat_child(adapter->mount_point,
-        kernel_vfs_file_inode(parent),name,length,&inode_number,&inode));
+    /* Parent namespace qualification keeps the name stable. Select the live
+     * inode before importing attributes, so its I/O guard covers one read. */
+    error=lwext4_error(ext4_lookup_child(adapter->mount_point,
+        kernel_vfs_file_inode(parent),name,length,&inode_number,NULL));
     if (error) return error;
     /* A different hard link can already hold live EOF and delayed times.
      * Borrow that actual node rather than reporting its older disk image. */
@@ -2880,6 +2882,8 @@ static int ext4_backend_stat_child(const struct kernel_vfs_file *parent,
         if (kernel_vfs_node_release(&node)) __builtin_trap();
         return error;
     }
+    error=lwext4_error(ext4_read_inode(adapter->mount_point,inode_number,&inode));
+    if (error) return error;
     fill_stat(parent->mount,adapter->superblock,inode_number,&inode,stat);
     return 0;
 }
