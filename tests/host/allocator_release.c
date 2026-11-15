@@ -510,11 +510,46 @@ static void test_no_sleep_allocation(void)
     assert(!physical_page_allocator_audit(&allocator));
 }
 
+static void test_batch_allocation(void)
+{
+    setup();
+    uint64_t initial=physical_page_available(&allocator),pages[272];
+    struct physical_page_reclaim_hooks hooks={.reclaim=no_sleep_reclaim};
+    assert(!physical_page_allocator_set_reclaimer(&allocator,&hooks));
+    unsigned count=physical_page_allocate_batch(&allocator,pages,7);
+    assert(count==7);
+    for(unsigned i=0;i<count;i++) {
+        uint32_t order,references;
+        assert(!physical_page_allocation_order(&allocator,pages[i],&order) && !order);
+        assert(!physical_page_reference_count(&allocator,pages[i],&references) && references==1);
+        for(unsigned j=0;j<i;j++)assert(pages[j]!=pages[i]);
+    }
+    assert(physical_page_available(&allocator)==initial-7);
+    while(count<initial) {
+        unsigned wanted=initial-count>16?16:(unsigned)(initial-count);
+        unsigned n=physical_page_allocate_batch(&allocator,pages+count,16);
+        assert(n==wanted);count+=n;
+    }
+    uint64_t unchanged=UINT64_C(0x716153);
+    assert(!physical_page_allocate_batch(&allocator,&unchanged,1) && unchanged==UINT64_C(0x716153));
+    assert(!unexpected_reclaim);
+    /* Fragmented free pages remain usable; a batch does not require one
+     * physically contiguous block and never consumes a hidden spare page. */
+    for(unsigned i=0;i<count;i+=2)assert(!physical_page_release(&allocator,pages[i]));
+    uint64_t fragmented[16];
+    assert(physical_page_allocate_batch(&allocator,fragmented,16)==16);
+    physical_page_release_batch(&allocator,fragmented,16);
+    for(unsigned i=1;i<count;i+=2)assert(!physical_page_release(&allocator,pages[i]));
+    assert(physical_page_available(&allocator)==initial && !physical_page_allocator_audit(&allocator));
+    assert(!physical_page_allocator_clear_reclaimer(&allocator));
+}
+
 int main(void)
 {
     struct rlimit limit = {0, 0};
     assert(setrlimit(RLIMIT_CORE, &limit) == 0);
     test_no_sleep_allocation();
+    test_batch_allocation();
     test_legal_release_is_silent();
     test_retired_payload_is_not_owner();
     for (unsigned int i = 0; i < 24; i++) {

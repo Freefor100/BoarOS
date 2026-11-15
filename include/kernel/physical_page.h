@@ -133,6 +133,12 @@ enum physical_page_status physical_page_release(
 
 /* Each array item transfers one order-zero reference, including duplicate addresses. */
 #define PHYSICAL_PAGE_REFERENCE_BATCH_MAX 16U
+/* Try once for up to sixteen independent order-zero owners. Return the
+ * completed prefix; publish pressure once outside the allocator protection.
+ * A short prefix lets the caller enter its ordinary reclaim/wait path. */
+#define PHYSICAL_PAGE_ALLOCATION_BATCH_MAX 16U
+unsigned physical_page_allocate_batch(struct physical_page_allocator *,
+    uint64_t *addresses, unsigned count);
 void physical_page_release_batch(struct physical_page_allocator *allocator,
     const uint64_t *addresses, unsigned count);
 

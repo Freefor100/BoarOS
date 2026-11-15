@@ -82,6 +82,13 @@ struct kernel_cpu {
     /* 栈上通知批次只在本CPU禁止抢占、IRQ关闭期间借用。 */
     struct kernel_cpu_notification_batch *notification_batch;
 #endif
+    /* Kernel execution retains the root and record storage, independently
+     * of MM users: VMA, file and user-page lifetimes are not extended. */
+    struct physical_page_allocator *borrowed_mm_allocator;
+    void *borrowed_mm_record;
+    uint64_t active_mm_record_page,borrowed_mm_record_page;
+    uint64_t borrowed_mm_root,borrowed_mm_context,borrowed_mm_identity;
+    uint64_t borrowed_mm_generation,borrowed_mm_kernel_context;
 };
 #if BOAROS_COST_DIAGNOSTICS
 _Static_assert(offsetof(struct kernel_cpu, cost) == 32, "cost assembly CPU prefix");

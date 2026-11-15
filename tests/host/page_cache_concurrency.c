@@ -727,8 +727,9 @@ int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,
 #ifndef CACHE_MM_CASES
 static unsigned fail_cache_page, fail_cache_entry;
 static unsigned pause_candidate,candidate_entered,candidate_resume;
+static _Thread_local unsigned *demand_page_batches;
 enum physical_page_status __real_physical_page_allocate(struct physical_page_allocator *, uint64_t *);
-enum physical_page_status __wrap_physical_page_allocate(struct physical_page_allocator *pages, uint64_t *out)
+static void pause_cache_allocation(struct physical_page_allocator *pages)
 {
     if (current_cache && pages==current_cache->allocator &&
         __atomic_exchange_n(&pause_candidate,0,__ATOMIC_ACQ_REL)) {
@@ -736,6 +737,10 @@ enum physical_page_status __wrap_physical_page_allocate(struct physical_page_all
         __atomic_store_n(&candidate_entered,1,__ATOMIC_RELEASE);
         while (!__atomic_load_n(&candidate_resume,__ATOMIC_ACQUIRE)) sched_yield();
     }
+}
+enum physical_page_status __wrap_physical_page_allocate(struct physical_page_allocator *pages, uint64_t *out)
+{
+    pause_cache_allocation(pages);
     if (fail_cache_page && current_cache && pages == current_cache->allocator && !--fail_cache_page)
         return PHYSICAL_PAGE_STATUS_EMPTY;
     enum physical_page_status status=__real_physical_page_allocate(pages,out);
@@ -759,6 +764,24 @@ enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *h
     return __real_kernel_heap_allocate_zeroed(heap, count, size, out);
 }
 #endif
+unsigned __real_physical_page_allocate_batch(struct physical_page_allocator *,uint64_t *,unsigned);
+unsigned __wrap_physical_page_allocate_batch(struct physical_page_allocator *pages,uint64_t *out,unsigned count)
+{
+#ifndef CACHE_MM_CASES
+    pause_cache_allocation(pages);
+    if (demand_page_batches) (*demand_page_batches)++;
+    unsigned wanted=count;
+    if (current_cache && pages==current_cache->allocator && fail_cache_page && fail_cache_page<=count)
+        wanted=fail_cache_page-1;
+    unsigned n=wanted?__real_physical_page_allocate_batch(pages,out,wanted):0;
+    if (current_cache && pages==current_cache->allocator && fail_cache_page) fail_cache_page-=n;
+    if (read_counts && current_cache && pages==current_cache->allocator)
+        for(unsigned i=0;i<n;i++)memset(access_page(out[i]),0xd7,BOAROS_PAGE_SIZE);
+    return n;
+#else
+    return __real_physical_page_allocate_batch(pages,out,count);
+#endif
+}
 static void *get_cold_page(void *arg)
 {
     unsigned id = (unsigned)(uintptr_t)arg;
@@ -1836,6 +1859,7 @@ struct demand_read {
     unsigned cpu, done;
     unsigned watch_inode, inode_attempts, pause_inode, resume_inode, scalar;
     unsigned fail_workspace;
+    unsigned page_batches;
     unsigned delay_registration;
     size_t heap_allocations;
     uint64_t first;
@@ -1855,6 +1879,7 @@ static void *read_demand_batch(void *arg)
     }
     fail_workspace_allocation=read->fail_workspace;
     demand_heap_allocations=&read->heap_allocations;
+    demand_page_batches=&read->page_batches;
     /* 结果必须由本次调用完整填写，错误页不能沿用旧地址或字节数。 */
     memset(read->pages, 0xa5, sizeof(read->pages));
     if(read->scalar) {
@@ -1865,7 +1890,7 @@ static void *read_demand_batch(void *arg)
     } else read->status = kernel_page_cache_get_batch(current_cache, current_file,
         read->first, read->pages, read->count, 0);
     assert(!fail_workspace_allocation);
-    demand_heap_allocations=NULL;
+    demand_heap_allocations=NULL;demand_page_batches=NULL;
     delayed_load_token = (struct kernel_wait_token){0};
     delay_load_registration = 0;
     attempt_inode_lock=NULL;inode_read_attempts=NULL;inode_read_resume=NULL;
@@ -2237,7 +2262,7 @@ static void demand_published_before_drain(struct kernel_page_cache *cache, struc
     assert(valid == BOAROS_PAGE_SIZE && *(unsigned char *)access_page(page) == 0x30);
     assert(!physical_page_release(cache->allocator, page));
     __atomic_store_n(&resume_read, 1, __ATOMIC_RELEASE);
-    assert(!pthread_join(producer, NULL) && !batch.status);
+    assert(!pthread_join(producer, NULL) && !batch.status && batch.page_batches==1);
     demand_release(&batch); demand_idle(cache,0);
     puts("PASS completed page is visible while its batch owner is still draining");
 }

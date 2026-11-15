@@ -134,7 +134,7 @@ struct kernel_mm_record {
     struct kernel_wait_queue range_changed;
     struct kernel_mm_range_claim *range_claims;
     struct kernel_wait_queue pins_changed;
-    uint32_t active_cpus, pending_retirement;
+    uint32_t active_cpus, pending_retirement,borrowed_cpus;
     uint64_t tlb_generation, instruction_generation;
     uint64_t pin_acquisitions, prepared_pages, fault_retries;
     uint64_t retirement_batches, retired_pages, pin_waits;
@@ -274,15 +274,19 @@ static inline uint32_t mm_active_cpus(const struct kernel_mm_record *record)
     return record->active_cpus;
 #endif
 }
-static inline uint32_t mm_sync_targets(const struct kernel_mm_record *record)
+static inline uint32_t mm_sync_targets(const struct kernel_mm_record *record, int include_borrowed)
 {
 #if BOAROS_MAX_CPUS > 1
-    /* PTE/代次先于目标采样可见；与加入者的SC置位形成两种交接：采到它
+    /* Retiring translations includes kernel-only roots; pure instruction
+     * publication is caught by their generation check on user re-entry.
+     * PTE/代次先于目标采样可见；与加入者的SC置位形成两种交接：采到它
      * 就等待远端确认，没采到则其置位后的本地全量失效覆盖这些写入。 */
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    return __atomic_load_n(&record->active_cpus, __ATOMIC_SEQ_CST);
+    uint32_t active=__atomic_load_n(&record->active_cpus,__ATOMIC_SEQ_CST);
+    uint32_t borrowed=include_borrowed ? __atomic_load_n(&record->borrowed_cpus,__ATOMIC_SEQ_CST) : 0;
+    return active | (include_borrowed ? borrowed : 0);
 #else
-    return record->active_cpus;
+    return record->active_cpus | (include_borrowed ? record->borrowed_cpus : 0);
 #endif
 }
 
@@ -961,7 +965,7 @@ static void truncate_file_residents(void *owner, struct kernel_vfs_node *node,
         uint32_t targets;
         { KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
           mm_generation_advance(&record->instruction_generation);
-          targets = mm_sync_targets(record); }
+          targets = mm_sync_targets(record,0); }
         arch_mmu_sync_user(targets, 0, UINT64_MAX, 1);
     }
     struct mm_file_resident *retired=record->retired_file_residents;
@@ -2017,7 +2021,7 @@ static uint32_t note_tlb_change_locked(struct kernel_mm_record *record,
         record->retired_pages += batch->count;
 #endif
     }
-    return mm_sync_targets(record);
+    return mm_sync_targets(record,1);
 }
 static uint32_t note_fault_change_locked(struct kernel_mm_record *record,
     const struct kernel_mm_retirement *batch, int replacement, int instructions)
@@ -2031,7 +2035,7 @@ static uint32_t note_fault_change_locked(struct kernel_mm_record *record,
          * the whole root, so no invalidation generation needs to advance. */
         if (!instructions) return 0;
         mm_generation_advance(&record->instruction_generation);
-        return mm_sync_targets(record);
+        return mm_sync_targets(record,0);
     }
 #else
     (void)replacement;
@@ -4369,7 +4373,7 @@ enum kernel_mm_status kernel_mm_flush_instructions(struct kernel_mm *mm, int loc
     {
         KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
         generation=mm_generation_advance(&record->instruction_generation);
-        targets=local_only?0:mm_sync_targets(record);
+        targets=local_only?0:mm_sync_targets(record,0);
     }
     arch_mmu_sync_instruction_cpus(targets);
     /* 远端可在等待期间发布更新代次，不能把它冒充为本次已同步。 */
@@ -4386,8 +4390,31 @@ enum kernel_mm_status kernel_mm_flush_instructions(struct kernel_mm *mm, int loc
 }
 #endif
 
-enum kernel_mm_status kernel_mm_activate(const struct kernel_mm *next, uint64_t kernel_context)
+static void release_borrowed_root(struct kernel_cpu *cpu)
 {
+    struct physical_page_allocator *allocator=cpu->borrowed_mm_allocator;
+    if (!allocator) return;
+    struct kernel_mm_record *record=cpu->borrowed_mm_record;
+    uint64_t pages[2]={cpu->borrowed_mm_root,cpu->borrowed_mm_record_page};
+    unsigned logical=0;
+#if BOAROS_MAX_CPUS > 1
+    logical=cpu->logical_id;
+#endif
+    if (!(__atomic_fetch_and(&record->borrowed_cpus,~(1U<<logical),__ATOMIC_SEQ_CST) & (1U<<logical)))
+        __builtin_trap();
+    cpu->borrowed_mm_allocator=NULL;cpu->borrowed_mm_root=0;
+    cpu->borrowed_mm_record=NULL;cpu->borrowed_mm_record_page=0;
+    cpu->borrowed_mm_context=cpu->borrowed_mm_identity=0;
+    cpu->borrowed_mm_generation=cpu->borrowed_mm_kernel_context=0;
+    physical_page_release_batch(allocator,pages,2);
+}
+
+static enum kernel_mm_status activate_mm(const struct kernel_mm *next,
+    uint64_t kernel_context,int borrow_kernel_root)
+{
+#if defined(BOAROS_ARCH_LOONGARCH)
+    (void)borrow_kernel_root;
+#endif
     /* 在整个本地交接期间不允许被抢占；这里不分配、不进固件、无两个MM锁嵌套。 */
     uintptr_t irq = arch_interrupt_save();
     struct kernel_cpu *cpu = kernel_cpu_current();
@@ -4430,7 +4457,13 @@ enum kernel_mm_status kernel_mm_activate(const struct kernel_mm *next, uint64_t 
         if (arch_mmu_switch_context(context) != ARCH_MMU_STATUS_OK) __builtin_trap();
         /* A root switch already flushed translations. Record only captured
          * generations; a concurrent newer publication needs its own sync. */
-        if (!changed && (joining || cpu->active_mm_generation != generation)) arch_mmu_flush_all();
+        int resumed=0;
+#if !defined(BOAROS_ARCH_LOONGARCH)
+        resumed=cpu->borrowed_mm_allocator && cpu->borrowed_mm_context==context &&
+            cpu->borrowed_mm_identity==record->futex_id &&
+            cpu->borrowed_mm_generation==generation && !arch_mmu_new_translation_needs_sync();
+#endif
+        if (!changed && !resumed && (joining || cpu->active_mm_generation != generation)) arch_mmu_flush_all();
         if (record->instruction_seen[logical] != instructions) {
             COST_ADD(MM_ACTIVATE_INSTRUCTION_FLUSHES, 1);
             arch_mmu_sync_instructions();
@@ -4439,12 +4472,37 @@ enum kernel_mm_status kernel_mm_activate(const struct kernel_mm *next, uint64_t 
             record->instruction_seen[logical] = instructions;
         }
         cpu->active_mm_record = record;
+        cpu->active_mm_record_page=next->record_page_address;
         cpu->active_mm_generation = generation;
-    } else {
+    }
+#if !defined(BOAROS_ARCH_LOONGARCH)
+    else if (borrow_kernel_root && (previous || cpu->borrowed_mm_allocator)) {
+        if (previous) {
+            if (cpu->borrowed_mm_allocator) __builtin_trap();
+            /* Publish the page owner before clearing the old active bit. A
+             * final MM cleanup can then find the root's extra reference. */
+            uint64_t pages[2]={previous->space.root_address,cpu->active_mm_record_page};
+            physical_page_acquire_batch(previous->space.allocator,pages,2);
+            cpu->borrowed_mm_root=previous->space.root_address;
+            cpu->borrowed_mm_context=arch_mmu_current_context();
+            cpu->borrowed_mm_identity=previous->futex_id;
+            cpu->borrowed_mm_generation=cpu->active_mm_generation;
+            cpu->borrowed_mm_kernel_context=kernel_context;
+            cpu->borrowed_mm_record=previous;
+            cpu->borrowed_mm_record_page=cpu->active_mm_record_page;
+            cpu->borrowed_mm_allocator=previous->space.allocator;
+            if (__atomic_fetch_or(&previous->borrowed_cpus,1U<<logical,__ATOMIC_SEQ_CST) & (1U<<logical))
+                __builtin_trap();
+        }
+        cpu->active_mm_record=NULL;cpu->active_mm_generation=0;cpu->active_mm_record_page=0;
+    }
+#endif
+    else {
         if (arch_mmu_switch_context(kernel_context) != ARCH_MMU_STATUS_OK) {
             status = KERNEL_MM_STATUS_ADDRESS_SPACE; goto out;
         }
         cpu->active_mm_record = 0;
+        cpu->active_mm_record_page=0;
         cpu->active_mm_generation = 0;
     }
     if (previous && previous != record) {
@@ -4458,10 +4516,17 @@ enum kernel_mm_status kernel_mm_activate(const struct kernel_mm *next, uint64_t 
         previous->active_cpus &= ~(1U << logical);
 #endif
     }
+    if (next || !borrow_kernel_root) release_borrowed_root(cpu);
 out:
     arch_interrupt_restore(irq);
     return status;
 }
+
+enum kernel_mm_status kernel_mm_activate(const struct kernel_mm *next,uint64_t kernel_context)
+{ return activate_mm(next,kernel_context,0); }
+
+enum kernel_mm_status kernel_mm_activate_for_task(const struct kernel_mm *next,uint64_t kernel_context)
+{ return activate_mm(next,kernel_context,1); }
 
 enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
 {
@@ -4498,6 +4563,12 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
             }
         }
         if (!references) __builtin_trap();
+        /* This CPU may be the kernel executor that inherited the dying root.
+         * Leave it before the backend detaches and frees user page tables. */
+        struct kernel_cpu *cpu=kernel_cpu_current();
+        if (cpu->borrowed_mm_allocator==mm->allocator &&
+            cpu->borrowed_mm_root==record->space.root_address &&
+            kernel_mm_activate(NULL,cpu->borrowed_mm_kernel_context)) __builtin_trap();
         lazy_unregister(record);
         KERNEL_LOCK_SCOPE(retire);
         kernel_rwlock_write(&record->operations,&retire);
@@ -6289,7 +6360,7 @@ int kernel_mm_remote_transfer(struct kernel_mm *mm, uint64_t address,
             uint32_t targets;
             { KERNEL_RAW_WRITE_SCOPE(raw,&record->metadata);
               mm_generation_advance(&record->instruction_generation);
-              targets=mm_sync_targets(record); }
+              targets=mm_sync_targets(record,0); }
             arch_mmu_sync_user(targets,current & ~BOAROS_PAGE_MASK,BOAROS_PAGE_SIZE,1);
         }
     }

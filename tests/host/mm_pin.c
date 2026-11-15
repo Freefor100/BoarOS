@@ -3,6 +3,7 @@
 #include <kernel/heap.h>
 #include <kernel/sync.h>
 #include <kernel/cpu.h>
+#include <kernel/irq.h>
 #include <kernel/uaccess.h>
 #include <assert.h>
 #include <stdio.h>
@@ -21,6 +22,29 @@ void mm_test_attach(unsigned);
 static unsigned char pool[4 * 1024 * 1024] __attribute__((aligned(16384)));
 void kernel_console_putc(char c) { fputc(c, stderr); }
 static _Thread_local unsigned tlb_fences,instruction_fences;
+static unsigned root_fence_watch,root_fence_entered,root_fence_ack;
+static void root_fence_confirm(void)
+{
+    if (__atomic_load_n(&root_fence_watch,__ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&root_fence_entered,1,__ATOMIC_RELEASE);
+        while (!__atomic_load_n(&root_fence_ack,__ATOMIC_ACQUIRE))sched_yield();
+    }
+}
+void riscv_smp_sync_kernel(uint64_t address,uint64_t size)
+{ assert(!address && size==UINT64_MAX);mm_test_fence(address,0);root_fence_confirm(); }
+void riscv_smp_sync_user(uint32_t targets,uint64_t address,uint64_t size,int instructions)
+{
+    assert(!(targets&~3U));
+    mm_test_fence(size==BOAROS_PAGE_SIZE?address:UINT64_MAX,0);
+    if (instructions) mm_test_fence(0,1);
+    if (targets&2U) { assert(root_fence_watch && !instructions);root_fence_confirm(); }
+}
+void riscv_smp_sync_instructions(uint32_t targets)
+{
+    /* A kernel-only root borrower executes no user instructions. Its next
+     * user activation must observe the published instruction generation. */
+    assert(!targets);mm_test_fence(0,1);
+}
 void mm_test_fence(uint64_t address, int instructions)
 {
     (void)address;
@@ -28,6 +52,90 @@ void mm_test_fence(uint64_t address, int instructions)
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
 void mm_test_unavailable(void) { fputs("excluded business path reached\n", stderr); abort(); }
+struct root_borrow_request {
+    struct kernel_mm *mm;struct physical_page_allocator *allocator;
+    uint64_t context,root,page;unsigned entered,release;
+};
+static void *remote_root_borrow(void *argument)
+{
+    struct root_borrow_request *request=argument;
+    mm_test_attach(1);kernel_cpu_current()->logical_id=1;mm_test_context=0;
+    assert(!kernel_mm_activate(request->mm,0) && !kernel_mm_activate_for_task(NULL,0));
+    __atomic_store_n(&request->entered,1,__ATOMIC_RELEASE);
+    while (!__atomic_load_n(&root_fence_entered,__ATOMIC_ACQUIRE))sched_yield();
+    uint32_t references;void *bytes;
+    assert(!physical_page_reference_count(request->allocator,request->root,&references) && references==2);
+    assert(!physical_page_reference_count(request->allocator,request->page,&references) && references==1);
+    assert(!physical_page_map_owned(request->allocator,request->root,&bytes));
+    for (unsigned i=0;i<256;i++)assert(!((uint64_t *)bytes)[i]);
+    __atomic_store_n(&root_fence_ack,1,__ATOMIC_RELEASE);
+    while (!__atomic_load_n(&request->release,__ATOMIC_ACQUIRE))sched_yield();
+    /* Every user owner is gone. Root and record storage remain solely for
+     * this CPU's mask removal and final physical owner return. */
+    assert(mm_test_context==request->context && !kernel_cpu_current()->active_mm_record);
+    assert(!physical_page_reference_count(request->allocator,request->root,&references) && references==1);
+    assert(!kernel_mm_activate(NULL,0) && !kernel_cpu_current()->borrowed_mm_allocator);
+    return NULL;
+}
+static void kernel_root_borrow_case(struct physical_page_allocator *allocator,
+    struct kernel_heap *heap,struct arch_mmu_page_table *kernel)
+{
+    pid_t child=fork();assert(child>=0);
+    if (!child) {
+        struct arch_mmu_user_space space={0};struct kernel_mm mm={0};
+        uint64_t baseline=physical_page_available(allocator),address,context;
+        assert(!arch_mmu_user_space_init(&space,allocator,kernel) && !kernel_mm_create(&mm,&space));
+        assert(!kernel_mm_vma_enable(&mm,heap) && !kernel_mm_brk_initialize(&mm,0x10000,0x20000));
+        assert(!kernel_mm_mmap_anonymous(&mm,0x80000,BOAROS_PAGE_SIZE,
+            KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&address));
+        assert(!kernel_mm_resolve_user_fault(&mm,address,KERNEL_MM_WRITE));
+        assert(!kernel_mm_context(&mm,&context) && !kernel_mm_activate(&mm,0));
+        riscv_mmu_svvptc=1;
+        uint64_t root=(context&((UINT64_C(1)<<44)-1))<<BOAROS_PAGE_SHIFT;uint32_t references;
+        assert(!physical_page_reference_count(allocator,root,&references) && references==1);
+        assert(!kernel_mm_activate_for_task(NULL,0));
+        assert(mm_test_context==context && !kernel_cpu_current()->active_mm_record);
+        assert(!physical_page_reference_count(allocator,root,&references) && references==2);
+        unsigned before=tlb_fences;
+        assert(!kernel_mm_activate_for_task(&mm,0) && mm_test_context==context && tlb_fences==before);
+        assert(!physical_page_reference_count(allocator,root,&references) && references==1);
+        assert(!kernel_mm_activate_for_task(NULL,0));
+        assert(!kernel_mm_mprotect(&mm,address,BOAROS_PAGE_SIZE,KERNEL_MM_READ));
+        before=tlb_fences;
+        assert(!kernel_mm_activate_for_task(&mm,0) && tlb_fences==before+1);
+        assert(!kernel_mm_activate_for_task(NULL,0));
+        /* Last MM owner ends userspace even if this CPU retained the root. */
+        assert(!kernel_mm_release(&mm) && !mm_test_context);
+        assert(physical_page_available(allocator)==baseline && !physical_page_allocator_audit(allocator));
+        for (unsigned live_unmap=0;live_unmap<2;live_unmap++) {
+        mm=(struct kernel_mm){0};space=(struct arch_mmu_user_space){0};
+        assert(!arch_mmu_user_space_init(&space,allocator,kernel) && !kernel_mm_create(&mm,&space));
+        assert(!kernel_mm_vma_enable(&mm,heap) && !kernel_mm_brk_initialize(&mm,0x10000,0x20000));
+        assert(!kernel_mm_mmap_anonymous(&mm,0x80000,BOAROS_PAGE_SIZE,
+            KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&address));
+        assert(!kernel_mm_resolve_user_fault(&mm,address,KERNEL_MM_WRITE) && !kernel_mm_context(&mm,&context));
+        struct kernel_mm_mapping mapped;assert(!kernel_mm_lookup(&mm,address,&mapped));
+        struct root_borrow_request request={.mm=&mm,.allocator=allocator,.context=context,
+            .root=(context&((UINT64_C(1)<<44)-1))<<BOAROS_PAGE_SHIFT,.page=mapped.physical_address};
+        root_fence_watch=1;root_fence_entered=root_fence_ack=0;
+        pthread_t remote;assert(!pthread_create(&remote,NULL,remote_root_borrow,&request));
+        while (!__atomic_load_n(&request.entered,__ATOMIC_ACQUIRE))sched_yield();
+        assert(!kernel_mm_flush_instructions(&mm,0));
+        if (live_unmap) {
+            assert(!kernel_mm_munmap(&mm,address,BOAROS_PAGE_SIZE));
+            assert(root_fence_entered && root_fence_ack);
+        }
+        assert(!kernel_mm_release(&mm));
+        assert(root_fence_entered && root_fence_ack && physical_page_available(allocator)==baseline-2);
+        __atomic_store_n(&request.release,1,__ATOMIC_RELEASE);
+        assert(!pthread_join(remote,NULL));root_fence_watch=0;
+        assert(physical_page_available(allocator)==baseline && !physical_page_allocator_audit(allocator));
+        }
+        _exit(0);
+    }
+    int status;assert(waitpid(child,&status,0)==child && WIFEXITED(status) && !WEXITSTATUS(status));
+    puts("kernel root loan: unchanged return, generation recheck, userspace teardown and final page owner verified");
+}
 static unsigned watch_pin_entries,pin_entries;
 enum kernel_mm_status __real_kernel_mm_pin_user_page(const struct kernel_mm *,uint64_t,uint32_t,struct kernel_mm_user_pin *);
 enum kernel_mm_status __wrap_kernel_mm_pin_user_page(const struct kernel_mm *mm,uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin)
@@ -276,6 +384,7 @@ int main(void)
     assert(riscv_sv39_page_table_init(&kernel_table, &allocator) == 0);
     kernel_table.state = ARCH_MMU_STATE_ACTIVE;
     uint64_t baseline = physical_page_available(&allocator);
+    kernel_root_borrow_case(&allocator,&heap,&kernel_table);
     assert(arch_mmu_user_space_init(&space, &allocator, &kernel_table) == 0);
     assert(kernel_mm_create(&mm, &space) == 0);
     assert(kernel_mm_vma_enable(&mm, &heap) == 0);

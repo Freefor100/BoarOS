@@ -29,6 +29,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <linux/stat.h>
 
 void mm_test_attach(unsigned);
 void mm_test_bind(struct kernel_mm *);
@@ -159,11 +160,13 @@ enum kernel_scheduler_status __wrap_kernel_wait_finish(struct kernel_wait_token 
 }
 #endif
 static unsigned path_expansion_observed,path_expansion_failed,path_expansion_allocations;
+static unsigned path_snapshot_watch,path_snapshot_allocations;
 static size_t iov_allocation_size;
 static unsigned iov_allocations,iov_allocation_failure;
 enum kernel_heap_status __real_kernel_heap_allocate(struct kernel_heap *,size_t,void **);
 enum kernel_heap_status __wrap_kernel_heap_allocate(struct kernel_heap *heap,size_t size,void **owner)
 {
+    if (path_snapshot_watch && size==KERNEL_FS_PATH_MAX) path_snapshot_allocations++;
     if (iov_allocation_size && size==iov_allocation_size) {
         iov_allocations++;
         if (iov_allocation_failure) return KERNEL_HEAP_STATUS_EMPTY;
@@ -1509,6 +1512,49 @@ static void borrowed_page_case(struct physical_page_allocator *pages)
     mm_test_finish();mm_test_attach(0);mm_test_activate_task();
 }
 
+static void pathname_storage_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
+{
+    struct kernel_files local={0};struct kernel_fs_context directory={0};
+    struct kernel_vfs_file file={0};int64_t result;size_t copied;
+    assert(!kernel_files_create(&local,heap) && !kernel_fs_context_create(&directory,mount,heap));
+    assert(!kernel_vfs_create(mount,"/pathname-storage",0600,&file) && !kernel_vfs_close(&file));
+    assert(!kernel_copy_to_user(&mm,0x100000,"/pathname-storage",18,&copied) && copied==18);
+    struct kernel_vfs_stat expected;struct statx query;
+    assert(!kernel_vfs_stat_path(mount,"/pathname-storage",1,&expected));
+    memset(&query,0xa5,sizeof(query));
+    assert(sizeof(query)==256 && !kernel_copy_to_user(&mm,0x200000,&query,sizeof(query),&copied));
+    /* Warm the actual inode and the task's existing scratch owner first. */
+    assert(!kernel_files_statx(&local,&directory,&mm,-100,0x100000,0,0x7ff,0x200000,&result) && !result);
+    assert(!kernel_copy_from_user(&mm,&query,0x200000,sizeof(query),&copied) && copied==sizeof(query));
+    assert(query.stx_mask==STATX_BASIC_STATS && query.stx_mode==expected.mode &&
+        query.stx_uid==expected.uid && query.stx_gid==expected.gid && query.stx_nlink==expected.nlink &&
+        query.stx_ino==expected.ino && query.stx_size==expected.size && query.stx_blocks==expected.blocks &&
+        query.stx_blksize==expected.blksize && query.stx_atime.tv_sec==expected.atime.seconds &&
+        query.stx_atime.tv_nsec==expected.atime.nanoseconds && query.stx_mtime.tv_sec==expected.mtime.seconds &&
+        query.stx_ctime.tv_sec==expected.ctime.seconds && !query.stx_btime.tv_sec && !query.stx_btime.tv_nsec);
+    for(unsigned i=144;i<sizeof(query);i++)assert(!((unsigned char *)&query)[i]);
+    path_snapshot_watch=1;path_snapshot_allocations=0;
+    for (unsigned i=0;i<16;i++) {
+        assert(!kernel_files_statx(&local,&directory,&mm,-100,0x100000,0,0x7ff,0x200000,&result) && !result);
+        assert(!kernel_files_openat(&local,&directory,&mm,-100,0x100000,0,0,&result) && result>=0);
+        assert(!kernel_files_close(&local,result,&result) && !result);
+        assert(!kernel_task_current()->io_buffer);
+    }
+    assert(!kernel_files_statx(&local,&directory,&mm,-100,0x300000,0,0x7ff,0x200000,&result) && result==-KERNEL_EFAULT);
+    assert(!kernel_copy_to_user(&mm,0x100000,"/pathname-missing",18,&copied));
+    assert(!kernel_files_openat(&local,&directory,&mm,-100,0x100000,0,0,&result) && result==-KERNEL_ENOENT);
+    char *long_path=malloc(KERNEL_FS_PATH_MAX);assert(long_path);memset(long_path,'x',KERNEL_FS_PATH_MAX);
+    assert(!kernel_copy_to_user(&mm,0x100000,long_path,KERNEL_FS_PATH_MAX,&copied));free(long_path);
+    assert(!kernel_files_statx(&local,&directory,&mm,-100,0x100000,0,0x7ff,0x200000,&result) && result==-KERNEL_ENAMETOOLONG);
+    path_snapshot_watch=0;
+    printf("pathname snapshots: full-size allocations=%u\n",path_snapshot_allocations);
+    assert(!path_snapshot_allocations && !kernel_task_current()->io_buffer);
+    assert(!kernel_files_release(&local) && !kernel_fs_context_release(&directory));
+    assert(!kernel_vfs_unlink(mount,"/pathname-storage"));
+    mm_test_finish();mm_test_attach(0);mm_test_activate_task();
+    puts("PASS pathname storage: repeated stat/open, input fault, missing name, long name and final scratch release");
+}
+
 #include "namespace_cases.h"
 #include "block_file_cases.h"
 #ifdef LOOP_IO_CASES
@@ -1667,7 +1713,8 @@ int main(int argc,char **argv)
     uint64_t baseline=physical_page_available(&pages),backend_baseline=physical_page_available(&backend_pages);
     int advice_only=getenv("FILE_IO_ADVICE_ONLY")!=NULL;
     int transfers_only=getenv("FILE_IO_TRANSFERS_ONLY")!=NULL;
-    int focused=advice_only || transfers_only || getenv("FILE_IO_VECTORS_ONLY")!=NULL;
+    int paths_only=getenv("FILE_IO_PATHS_ONLY")!=NULL;
+    int focused=advice_only || transfers_only || paths_only || getenv("FILE_IO_VECTORS_ONLY")!=NULL;
     if (!focused) {
     borrowed_page_case(&pages);
     namespace_retiring_mount_case(&heap);
@@ -1691,6 +1738,11 @@ int main(int argc,char **argv)
         KERNEL_MM_MAP_FIXED_NOREPLACE,&address));
     assert(!kernel_mm_mmap_anonymous(&mm,0x200000,4*BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,
         KERNEL_MM_MAP_FIXED_NOREPLACE,&address));
+    if (paths_only) {
+        struct kernel_vfs_mount *memory=NULL;
+        assert(!kernel_tmpfs_create(&heap,0,"",&memory));
+        pathname_storage_case(&heap,memory);assert(!kernel_vfs_unmount(memory));
+    }
     if (!focused) {
     futex_pin_case();
     futex_robust_cases();
@@ -1727,7 +1779,8 @@ int main(int argc,char **argv)
     assert(!kernel_block_register(&disk,KERNEL_BLOCK_DEVICE_NUMBER(101)));
     struct kernel_vfs_mount mount={0}; assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,&cache,0));
     assert(!kernel_vfs_start_journal_worker(&mount));
-    if (transfers_only) transfer_cases(&heap,&mount);
+    if (paths_only) pathname_storage_case(&heap,&mount);
+    else if (transfers_only) transfer_cases(&heap,&mount);
     else if (advice_only) file_advice_case(&heap,&mount,&cache);
     else if (focused) synchronous_write_ranges(&heap,&mount);
     else {

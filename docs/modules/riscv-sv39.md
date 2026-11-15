@@ -98,13 +98,13 @@ direct-map/allocator/owner invariant 破坏并直接 fatal；没有可恢复 pro
 根物理地址可以为 0，因此是否存在正常树由 `table_pages` 判断，不能由 `root_address != 0`
 推断。
 
-`riscv_sv39_user_space_satp()` 只为 LIVE 对象生成 `MODE=8, ASID=0, PPN=root`；`riscv_sv39_switch_satp()` 只接受 Bare 或 Sv39 ASID 0，相同 `satp` 直接返回；换根写入后执行一次全局 `SFENCE.VMA`。scheduler 在修改 ready/current 状态之前完成切根。运行期 demand-zero、file-private 或 COW fault 成功更新当前 MM 的单页 PTE 后执行 `SFENCE.VMA fault_va, zero`，只失效本 hart 上该 VA 的 ASID 0 翻译；新填充或复制到执行映射的页面还执行 `FENCE.I`。当前用户 MM 没有 ASID 分配或跨核 shootdown；受控两核的共享内核栈另有 RFENCE 确认。
+`riscv_sv39_user_space_satp()` 只为 LIVE 对象生成 `MODE=8, ASID=0, PPN=root`；`riscv_sv39_switch_satp()` 只接受 Bare 或 Sv39 ASID 0，相同 `satp` 直接返回；换根写入后执行一次全局 `SFENCE.VMA`。scheduler 在修改 ready/current 状态之前完成切根。运行期首次发布有效 PTE 时，具有 Svvptc 的核不执行冗余 TLB 失效；其他核沿新映射同步规则处理。替换 COW 页、撤权限及退休映射先失效相应翻译，再归还旧 owner；单页使用地址失效，批次按共同 MM 捕获的范围与目标同步。新填充或复制到执行映射的页面另推进指令代次并执行必要的 `FENCE.I`。当前用户 MM 使用 ASID 0；MM 根据活动及根页借用集合发出同步 SBI RFENCE，确认完成后才释放退休页和页表。内核任务的根页借用与重新进入时的代次处理见 [MM 模块](kernel-mm.md#并发与性能边界)。
 
 `riscv_sv39_user_unmap_owned_range()` 只处理对齐的 4 KiB 用户范围。调用方先证明目标就是本 hart 当前活动 MM；walker 预检覆盖范围中已有的页表分支、表项形态、物理页可访问性和 active/protected 计数，输入或状态错误在写 PTE 前返回。提交时先把 active 和 protected owner 暂时改为 `V=0` 的软件 PTE，再执行一次本地全局 `SFENCE.VMA`，随后立即释放物理页并清零 PTE。函数返回时不保留临时 invalid PTE、页计数或回收接口；释放不变量错误直接 fatal。
 
 运行期不回收变空的 Level 0/Level 1 表，它们保留到 MM 销毁，以避免在 shrink 提交中增加中间表的额外遍历。连续高水位每 2 MiB 至多保留一张 4 KiB Level 0 表，约为虚拟跨度的 0.2%；极稀疏触页时相对实际驻留数据的比例会更高。
 
-`riscv_sv39_user_protect_owned_range()` 原地改变已有 owner 的权限。非零权限重建同一 PPN 的 U-mode leaf；切换到 `PROT_NONE` 时使用 RSW bit 9 建立 `V=0` 的 protected PTE，并用 bit 8 继续区分 COW。protected owner 保留内容及 exclusive/COW 属性并可恢复，不能与 unmap 的瞬时 invalid PTE 混用。恢复执行权限前先执行 `FENCE.I`。单页范围及共享页 rearm 使用 `riscv_sv39_user_protect_owned_page`：直接走三级页表，先验证 PTE、物理页与所有权计数，再修改并执行本地 `SFENCE.VMA va, zero`；多页范围仍执行本地全局失效。非当前 MM 继续依赖 ASID 0 切根时的全局失效，未引入延迟失效或 SMP 保证。fork 为 active/protected owner 增加物理页引用并在父子页表保持相同 COW 关系；unmap 和 destroy 都释放自己持有的一份引用。
+`riscv_sv39_user_protect_owned_range()` 原地改变已有 owner 的权限。非零权限重建同一 PPN 的 U-mode leaf；切换到 `PROT_NONE` 时使用 RSW bit 9 建立 `V=0` 的 protected PTE，并用 bit 8 继续区分 COW。protected owner 保留内容及 exclusive/COW 属性并可恢复，不能与 unmap 的瞬时 invalid PTE 混用。恢复执行权限前先执行 `FENCE.I`。单页范围及共享页 rearm 使用 `riscv_sv39_user_protect_owned_page`：直接走三级页表，先验证 PTE、物理页与所有权计数，再修改并执行本地 `SFENCE.VMA va, zero`；多页范围仍执行本地全局失效。非当前 MM 的修改由共同 MM 发布翻译代次，同步实际活动与根页借用核；后来进入的核在激活时检查代次并完成本地失效。fork 为 active/protected owner 增加物理页引用并在父子页表保持相同 COW 关系；unmap 和 destroy 都释放自己持有的一份引用。
 
 `riscv_sv39_user_space_fork()` 使用“两阶段子构造—父提交”。它先建立完整子树、逐页 acquire；MM 的 VMA 分类回调使共享匿名 leaf 保持原权限和物理身份，其他 leaf 转成 COW。任何分配/acquire 失败只销毁子 owner，父页表保持原样。子空间全部成功后，提交阶段不再分配，只修改父进程的私有 PTE、更新计数并执行全局本地 `SFENCE.VMA`。这保证普通 fork 的失败原子性，同时把私有页面内容复制推迟到父或子真正写入时。
 
@@ -125,4 +125,4 @@ make test-riscv
 
 聚焦建表测试除启动 PTE、规模和失败语义外，还检查用户根高半区借用、U 页权限、零页/COW 映射、fork 父提交失败原子性、复制与末引用原地恢复、owned-range 参数失败不变、实际撤销/释放、跨页离线填充、用户地址半开区间、数值为 0 的合法用户根地址、lookup、move、活动根销毁拒绝、后序回收、OOM 回滚、`satp` 编码和失败输出不变。VMA/mmap 用例覆盖 protected COW 保持、fixed replace 和 unmap 的 PTE—fence—release 顺序；真实 U-mode mmap 还覆盖匿名和 ext4 文件私有映射、EOF/SIGBUS。非法释放由 allocator fatal-path 测试覆盖。
 
-当前未实现 1 GiB 叶子和 ASID 分配；受控私有/共享匿名 MM 已通过 gate、短 metadata 锁、active mask 与 SBI RFENCE 闭合跨核提交和失效。普通用户、共享文件和外部后备业务仍限 CPU0；文件截断撤销支持非当前 MM，但尚无文件业务跨 hart 协议。按需提交用于匿名栈、`brk` heap、私有/共享匿名 mmap 和普通文件映射，用户页固定为 4 KiB。prepared-map、COW snapshot/commit 和 detach 的无分配提交边界见[MM 模块](kernel-mm.md#匿名-mm-的并发与回收)。direct map 只映射 DTB 报告的第一段 RAM，不包含 MMIO，也不放宽内核 text/rodata 的别名权限。
+当前未实现 1 GiB 叶子和 ASID 分配。匿名、COW、文件及共享后备的用户缺页在执行核处理，通过操作资格、短 metadata 锁、活动/根页借用集合和 SBI RFENCE 协调发布与退休；文件截断与打洞的回调同样覆盖非当前及跨核 MM。按需提交用于匿名栈、`brk` heap、私有/共享匿名 mmap 和普通文件映射，用户页固定为 4 KiB。prepared-map、COW snapshot/commit 和 detach 的无分配提交边界见[MM 模块](kernel-mm.md#匿名-mm-的并发与回收)。direct map 只映射 DTB 报告的第一段 RAM，不包含 MMIO，也不放宽内核 text/rodata 的别名权限。

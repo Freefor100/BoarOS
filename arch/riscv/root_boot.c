@@ -12,6 +12,8 @@
 #include <kernel/files.h>
 #include <kernel/fs_context.h>
 #include <kernel/mm.h>
+#include <kernel/mm_backend.h>
+#include <arch/riscv/smp.h>
 #include <kernel/open_file.h>
 #include <kernel/procfs.h>
 #include <kernel/loop.h>
@@ -663,6 +665,13 @@ enum riscv_root_boot_status riscv_root_boot_finish(
         return RISCV_ROOT_BOOT_STATUS_CLEANUP;
     }
 
+#if BOAROS_MAX_CPUS > 1
+    riscv_smp_drain_roots();
+#else
+    struct kernel_cpu *cpu=kernel_cpu_current();
+    if (cpu->borrowed_mm_allocator && kernel_mm_activate(NULL,cpu->borrowed_mm_kernel_context))
+        __builtin_trap();
+#endif
     kernel_heap_get_statistics(&root->heap, heap_statistics);
     *available_pages = physical_page_available(root->heap.page_allocator);
     if (heap_statistics->live_allocations != 0U ||

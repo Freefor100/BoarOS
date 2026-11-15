@@ -7,6 +7,7 @@
 #define RISCV_IPI_DEADLINE 2U
 #define RISCV_IPI_HANDSHAKE 4U
 #define RISCV_IPI_STOP 8U
+#define RISCV_IPI_DROP_ROOT 16U
 #if BOAROS_MAX_CPUS > 1
 void riscv_smp_start(const struct dtb_cpu_info *, uint64_t transition_satp,
                      uint64_t final_satp, uint32_t frequency);
@@ -14,6 +15,8 @@ void riscv_smp_handle_ipi(void);
 void riscv_smp_timer_seen(void);
 void riscv_smp_idle(void);
 void riscv_smp_stop(void);
+/* Called by final root cleanup before checking physical resource baselines. */
+void riscv_smp_drain_roots(void);
 /* CPU停止及根业务/UART drain完成之后，由可信CPU0输出静态统计。 */
 void riscv_smp_report_user_execution(void);
 void riscv_smp_sync_instructions(uint32_t targets);

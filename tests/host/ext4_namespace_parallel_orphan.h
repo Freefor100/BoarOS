@@ -14,7 +14,9 @@ static void orphan_normal_order_case(struct lwext4_mount_adapter *adapter,
             static const char payload[4096]="retained unlinked data";
             size_t written;
             assert(!kernel_vfs_pwrite(&file,0,payload,sizeof(payload),&written) && written==sizeof(payload));
-            assert(!ext4_journal_group_drain(adapter->mount_point));
+            /* A journal drain does not submit the file's delayed dirty pages. */
+            uint64_t observed=kernel_vfs_error_sequence(&file);
+            assert(!kernel_vfs_sync(&file,0,&observed));
             adapter->locks.read_lock(adapter->locks.context);
             struct ext4_inode_ref ref;
             assert(!ext4_fs_get_inode_ref(adapter->device.fs,inode,&ref) &&

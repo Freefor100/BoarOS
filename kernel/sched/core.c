@@ -345,7 +345,10 @@ enum kernel_scheduler_status validate_current_on_cpu(struct kernel_cpu *cpu)
         stack_pointer >= current->stack_high) {
         return KERNEL_SCHEDULER_STATUS_STACK_CORRUPT;
     }
-    if (arch_mmu_current_context() != arch_thread_mm(&current->arch)) {
+    uint64_t actual=arch_mmu_current_context();
+    if (actual != arch_thread_mm(&current->arch) &&
+        !(current->mm.state!=KERNEL_MM_LIVE && !cpu->active_mm_record &&
+          cpu->borrowed_mm_allocator && actual==cpu->borrowed_mm_context)) {
         return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
     }
     return KERNEL_SCHEDULER_STATUS_OK;
@@ -362,7 +365,7 @@ enum kernel_scheduler_status activate_thread_address_space(
     if (thread == 0) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
-    if (kernel_mm_activate(thread->mm.state == KERNEL_MM_LIVE ? &thread->mm : 0,
+    if (kernel_mm_activate_for_task(thread->mm.state == KERNEL_MM_LIVE ? &thread->mm : 0,
         scheduler.kernel_context) != KERNEL_MM_STATUS_OK) {
         return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
     }

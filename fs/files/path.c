@@ -15,6 +15,7 @@
 #include <kernel/open_file.h>
 #include <kernel/mqueue.h>
 #include <kernel/page.h>
+#include <kernel/task.h>
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
 
@@ -43,6 +44,11 @@
 #define LINUX_O_TMPFILE UINT64_C(020200000)
 #define LINUX_O_EMPTYPATH (UINT64_C(1) << 26)
 #define LINUX_OPENAT2_REGULAR (UINT64_C(1) << 32)
+
+static void path_buffer_release(struct kernel_task_io_buffer *buffer)
+{
+    if (buffer->allocator) kernel_task_io_buffer_release(buffer);
+}
 
 static int validate_open_flags(uint64_t flags, uint64_t mode, uint64_t resolve,
                                int strict, uint32_t *fd_flags)
@@ -202,6 +208,7 @@ static enum kernel_files_status files_open(
     int64_t *linux_result)
 {
     KERNEL_SERVICE_SCOPE_IF(service, 0);
+    struct kernel_task_io_buffer path_buffer __attribute__((cleanup(path_buffer_release)))={0};
     KERNEL_FS_PATHS(fs_paths, fs);
     struct kernel_open_file_description *description = 0;
     KERNEL_FILES_PATH_SCOPE(start);
@@ -209,7 +216,6 @@ static enum kernel_files_status files_open(
     uint32_t fd;
     uint32_t fd_flags = 0U;
     int result;
-    enum kernel_heap_status heap_status;
     enum kernel_open_file_status open_status;
     enum kernel_fs_context_status fs_status;
     enum kernel_files_status files_status;
@@ -241,17 +247,16 @@ static enum kernel_files_status files_open(
         return KERNEL_FILES_STATUS_OK;
     }
     struct kernel_files_fd_reservation reservation __attribute__((cleanup(kernel_files_cancel_reservation))) = {files, fd};
-    heap_status = kernel_heap_allocate(files->heap,
-                                       KERNEL_FS_PATH_MAX,
-                                       (void **)&path);
-    if (heap_status == KERNEL_HEAP_STATUS_EMPTY) {
+    enum kernel_task_status storage=kernel_task_io_buffer_acquire(&path_buffer,mm->allocator);
+    if (storage == KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) {
         KERNEL_FILES_NOTE(files, open_failures, 1);
         *linux_result = -KERNEL_ENOMEM;
         return KERNEL_FILES_STATUS_OK;
     }
-    if (heap_status != KERNEL_HEAP_STATUS_OK) {
+    if (storage != KERNEL_TASK_STATUS_OK) {
         return KERNEL_FILES_STATUS_STATE;
     }
+    path=path_buffer.data;
     fs_status = copy_path(mm,user_path,path,KERNEL_FS_PATH_MAX,&result);
     if (fs_status==KERNEL_FS_CONTEXT_STATUS_OK && !result) {
         if (path[0]=='/' && (resolve & KERNEL_VFS_RESOLVE_BENEATH)) result=-KERNEL_EXDEV;
@@ -265,12 +270,10 @@ static enum kernel_files_status files_open(
         if (!result && (resolve & KERNEL_VFS_RESOLVE_CACHED)) result=-KERNEL_EAGAIN;
     }
     if (fs_status != KERNEL_FS_CONTEXT_STATUS_OK) {
-        kernel_files_release_allocation(files, path);
         return KERNEL_FILES_STATUS_STATE;
     }
     if (result != 0) {
         KERNEL_FILES_NOTE(files, open_failures, 1);
-        kernel_files_release_allocation(files, path);
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
@@ -310,7 +313,7 @@ static enum kernel_files_status files_open(
         }
     }
     kernel_files_path_guard_release(&pathless_link);
-    kernel_files_release_allocation(files, path);
+    kernel_task_io_buffer_release(&path_buffer);
     if (open_status == KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED) {
         if (description != 0) {
             kernel_files_queue_description(files, description);
@@ -669,23 +672,25 @@ static int copy_stat_to_user(struct kernel_mm *mm,
                              const struct kernel_vfs_stat *source,
                              int64_t *linux_result, int extended)
 {
-    struct linux_statx statx={0};
-    struct kernel_linux_stat basic={0};
-    fill_linux_vfs_stat(&basic,source);
-    const struct kernel_linux_stat *stat=&basic;
-    const void *bytes=stat;size_t size=sizeof(*stat);
-    if(extended) {
-        statx.attributes=source->attributes;
-        statx.attributes_mask=source->attributes_mask;
-        statx.mask=0x7ff;statx.blksize=stat->st_blksize;
-        statx.nlink=stat->st_nlink;statx.uid=stat->st_uid;statx.gid=stat->st_gid;
-        statx.mode=stat->st_mode;statx.ino=stat->st_ino;statx.size=stat->st_size;statx.blocks=stat->st_blocks;
-        statx.atime=(struct linux_statx_timestamp){stat->st_atime,stat->st_atime_nsec,0};
-        statx.mtime=(struct linux_statx_timestamp){stat->st_mtime,stat->st_mtime_nsec,0};
-        statx.ctime=(struct linux_statx_timestamp){stat->st_ctime,stat->st_ctime_nsec,0};
-        statx.dev_major=device_major(stat->st_dev);statx.dev_minor=device_minor(stat->st_dev);
-        statx.rdev_major=device_major(stat->st_rdev);statx.rdev_minor=device_minor(stat->st_rdev);
-        bytes=&statx;size=sizeof(statx);
+    union {struct linux_statx extended;struct kernel_linux_stat basic;} output;
+    const void *bytes;size_t size;
+    if (extended) {
+        struct linux_statx *stat=&output.extended;
+        memset(stat,0,sizeof(*stat));
+        stat->attributes=source->attributes;stat->attributes_mask=source->attributes_mask;
+        stat->mask=0x7ff;stat->blksize=source->blksize;
+        stat->nlink=source->nlink;stat->uid=source->uid;stat->gid=source->gid;
+        stat->mode=source->mode;stat->ino=source->ino;stat->size=source->size;stat->blocks=source->blocks;
+        stat->atime=(struct linux_statx_timestamp){source->atime.seconds,source->atime.nanoseconds,0};
+        stat->mtime=(struct linux_statx_timestamp){source->mtime.seconds,source->mtime.nanoseconds,0};
+        stat->ctime=(struct linux_statx_timestamp){source->ctime.seconds,source->ctime.nanoseconds,0};
+        stat->dev_major=device_major(source->dev);stat->dev_minor=device_minor(source->dev);
+        stat->rdev_major=device_major(source->rdev);stat->rdev_minor=device_minor(source->rdev);
+        bytes=stat;size=sizeof(*stat);
+    } else {
+        memset(&output.basic,0,sizeof(output.basic));
+        fill_linux_vfs_stat(&output.basic,source);
+        bytes=&output.basic;size=sizeof(output.basic);
     }
     size_t copied = 0U;
     enum kernel_uaccess_status access_status =
@@ -747,6 +752,7 @@ static enum kernel_files_status stat_at_to_user(
     int64_t *linux_result, int extended)
 {
     COST_SCOPE(query_cost, FILE_QUERY_TICKS);
+    struct kernel_task_io_buffer path_buffer __attribute__((cleanup(path_buffer_release)))={0};
     KERNEL_FILES_PIN_SCOPE(pin_guard);
     struct kernel_vfs_stat stat={0};
     KERNEL_FILES_PATH_SCOPE(start);
@@ -795,17 +801,16 @@ static enum kernel_files_status stat_at_to_user(
      * path snapshot only for operations that actually resolve a path. */
     KERNEL_FS_PATHS(fs_paths, fs);
     if (!empty) {
-        enum kernel_heap_status allocation = kernel_heap_allocate(files->heap,
-                                             KERNEL_FS_PATH_MAX, (void **)&path);
-        if (allocation != KERNEL_HEAP_STATUS_OK) {
-            if (allocation != KERNEL_HEAP_STATUS_EMPTY) return KERNEL_FILES_STATUS_STATE;
+        enum kernel_task_status allocation=kernel_task_io_buffer_acquire(&path_buffer,mm->allocator);
+        if (allocation != KERNEL_TASK_STATUS_OK) {
+            if (allocation != KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) return KERNEL_FILES_STATUS_STATE;
             *linux_result = -KERNEL_ENOMEM;
             return KERNEL_FILES_STATUS_OK;
         }
+        path=path_buffer.data;
         enum kernel_uaccess_status access = kernel_copy_string_from_user(mm, path,
                                      user_path, KERNEL_FS_PATH_MAX, &length);
         if (access != KERNEL_UACCESS_STATUS_OK) {
-            kernel_files_release_allocation(files, path);
             if (access != KERNEL_UACCESS_STATUS_FAULT && access != KERNEL_UACCESS_STATUS_TOO_LONG)
                 return KERNEL_FILES_STATUS_STATE;
             *linux_result = access == KERNEL_UACCESS_STATUS_FAULT ? -KERNEL_EFAULT
@@ -827,7 +832,7 @@ static enum kernel_files_status stat_at_to_user(
         if (!result) result = kernel_vfs_stat_at(start, fs_paths.root,
                     path, !(flags & KERNEL_FILES_AT_SYMLINK_NOFOLLOW), &stat);
     }
-    if (path) kernel_files_release_allocation(files, path);
+    path_buffer_release(&path_buffer);
     if (result) { *linux_result = result; return KERNEL_FILES_STATUS_OK; }
     int copied = copy_stat_to_user(mm, user_buffer, &stat, linux_result, extended);
     if (copied < 0) return KERNEL_FILES_STATUS_STATE;

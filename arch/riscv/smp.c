@@ -8,6 +8,7 @@
 #include <arch/riscv/trap.h>
 #include <arch/riscv/virt_uart.h>
 #include <kernel/scheduler.h>
+#include <kernel/mm_backend.h>
 #include <kernel/time.h>
 #include <kernel/tick.h>
 #include <kernel/page.h>
@@ -68,7 +69,7 @@ _Static_assert(offsetof(struct secondary_launch, offset) == 32, "secondary mailb
 struct secondary_state {
     struct kernel_cpu cpu;
     struct secondary_launch launch;
-    unsigned ping_seen, timer_seen, stop_requested, attached;
+    unsigned ping_seen, timer_seen, stop_requested, attached,root_drain_pending;
     unsigned char stack[16384] __attribute__((aligned(4096)));
 };
 /* 邮箱、idle 和栈由镜像常驻持有，HSM 返回不结束远核的借用。 */
@@ -189,6 +190,13 @@ static void consume_ipi(int interrupt)
         __atomic_store_n(&current_secondary()->stop_requested, 1, __ATOMIC_RELEASE);
     if (events & RISCV_IPI_DEADLINE)
         kernel_scheduler_deadline_changed();
+    if (events & RISCV_IPI_DROP_ROOT) {
+        if (cpu->active_mm_record) riscv_smp_fail("root-drain-live-user",-1);
+        if (cpu->borrowed_mm_allocator &&
+            kernel_mm_activate(NULL,cpu->borrowed_mm_kernel_context))
+            riscv_smp_fail("root-drain-owner",-1);
+        __atomic_store_n(&current_secondary()->root_drain_pending,0,__ATOMIC_RELEASE);
+    }
 }
 void riscv_smp_handle_ipi(void) { consume_ipi(1); }
 
@@ -237,6 +245,9 @@ void riscv_smp_secondary_high(void)
             if (cpu->current != cpu->idle || cpu->switch_previous ||
                 cpu->raw_locks || cpu->preempt_depth)
                 riscv_smp_fail("stop-owner", -1);
+            if (cpu->borrowed_mm_allocator &&
+                kernel_mm_activate(NULL,cpu->borrowed_mm_kernel_context))
+                riscv_smp_fail("stop-root-owner",-1);
             __atomic_store_n(&cpu->state, KERNEL_CPU_QUIESCING, __ATOMIC_RELEASE);
             asm volatile("csrw sie, zero" ::: "memory");
             (void)sbi_set_timer(UINT64_MAX);
@@ -318,8 +329,34 @@ void riscv_smp_report_user_execution(void)
 #endif
 }
 
+void riscv_smp_drain_roots(void)
+{
+    struct kernel_cpu *local=kernel_cpu_current();
+    if (local->logical_id || local->raw_locks) __builtin_trap();
+    kernel_preempt_disable();
+    if (local->active_mm_record) riscv_smp_fail("root-drain-live-user",-1);
+    if (local->borrowed_mm_allocator &&
+        kernel_mm_activate(NULL,local->borrowed_mm_kernel_context))
+        riscv_smp_fail("root-drain-owner",-1);
+    for (unsigned i=1;i<cpu_count;i++) if (kernel_cpu_online(cpus[i])) {
+        __atomic_store_n(&secondaries[i-1].root_drain_pending,1,__ATOMIC_RELEASE);
+        kernel_cpu_notify(cpus[i],RISCV_IPI_DROP_ROOT);
+    }
+    for (unsigned i=1;i<cpu_count;i++) {
+        uint64_t end=riscv_time_read()+(uint64_t)timebase*5;
+        while (__atomic_load_n(&secondaries[i-1].root_drain_pending,__ATOMIC_ACQUIRE))
+            if ((int64_t)(riscv_time_read()-end)>=0)
+                fail_hart("root-drain-confirmation",-1,cpus[i]->hardware_id);
+    }
+    kernel_preempt_enable();
+}
+
 void riscv_smp_stop(void)
 {
+    struct kernel_cpu *local=kernel_cpu_current();
+    if (local->borrowed_mm_allocator &&
+        kernel_mm_activate(NULL,local->borrowed_mm_kernel_context))
+        riscv_smp_fail("stop-root-owner",-1);
     if (cpu_count < 2) return;
     if (kernel_cpu_current()->logical_id) __builtin_trap();
     kernel_preempt_disable();
