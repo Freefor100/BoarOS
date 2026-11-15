@@ -4115,7 +4115,7 @@ int main(int argc, char **argv)
             goto owners;
         }
 #ifdef CACHE_MM_CASES
-        if (!strcmp(argv[2],"mremap") || !strcmp(argv[2],"shared-mmap")) {
+        if (!strcmp(argv[2],"mremap") || !strcmp(argv[2],"shared-mmap") || !strcmp(argv[2],"fault-batch")) {
             image_fd=open(argv[1],O_RDWR); assert(image_fd>=0);
             struct stat st; assert(!fstat(image_fd,&st));
             struct kernel_block_device disk={.read=image_read,.write=image_write,.flush=image_flush,
@@ -4130,7 +4130,8 @@ int main(int argc, char **argv)
                 assert(!kernel_vfs_pwrite(&file,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
                 assert(!kernel_vfs_close(&file));
                 disk_mm_case(&cache,&heap,&pages,&mount,"/shared-mmap");
-            } else disk_remap_case(&heap,&pages,&mount);
+            } else if (!strcmp(argv[2],"fault-batch")) disk_fault_batch_case(&heap,&pages,&mount);
+            else disk_remap_case(&heap,&pages,&mount);
             kernel_page_cache_stop_worker(&cache);
             assert(!kernel_vfs_unmount(&mount) && !close(image_fd) && !kernel_page_cache_destroy(&cache));
             goto owners;

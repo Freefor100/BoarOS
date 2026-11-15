@@ -3,6 +3,7 @@
 #include <kernel/uaccess.h>
 #include <kernel/open_file.h>
 #include <kernel/vma.h>
+#include <kernel/elf64_source.h>
 #include "../../fs/open_file_internal.h"
 extern _Thread_local uint64_t mm_test_context;
 void mm_test_bind(struct kernel_mm *);
@@ -370,4 +371,66 @@ static void disk_remap_case(struct kernel_heap *heap,
     assert(!kernel_mm_release(&mm) && !kernel_open_file_release(&file));
     assert(!physical_page_release(pages,kernel.root_address));
     puts("PASS mremap ext4: alias borrowed before move rearms current VA; replacement stays writable; post-move dirty byte persisted");
+}
+
+static void batch_put(unsigned char *p,uint64_t value,unsigned width)
+{for(unsigned i=0;i<width;i++)p[i]=(unsigned char)(value>>(8*i));}
+static void disk_fault_batch_case(struct kernel_heap *heap,
+    struct physical_page_allocator *pages,struct kernel_vfs_mount *mount)
+{
+    struct arch_mmu_page_table kernel={0};struct arch_mmu_user_space space={0};
+    struct kernel_mm mm={0};struct kernel_open_file_description *file=NULL;int error;
+    assert(!riscv_sv39_page_table_init(&kernel,pages));kernel.state=ARCH_MMU_STATE_ACTIVE;
+    assert(!arch_mmu_user_space_init(&space,pages,&kernel) && !kernel_mm_create(&mm,&space) &&
+        !kernel_mm_vma_enable(&mm,heap) && !kernel_mm_brk_initialize(&mm,0x10000,0x20000));
+    assert(!kernel_mm_context(&mm,&mm_test_context));mm_test_bind(&mm);
+    struct kernel_vfs_file created={0};
+    assert(!kernel_vfs_create(mount,"/batch-elf",0700,&created) && !kernel_vfs_close(&created));
+    assert(!kernel_open_file_create(heap,mount,"/batch-elf",&file,&error) && !error);
+    unsigned count=131072/BOAROS_PAGE_SIZE;size_t done;
+    unsigned char bytes[BOAROS_PAGE_SIZE];
+    for(unsigned i=0;i<count;i++) {
+        memset(bytes,0x40+i,sizeof(bytes));
+        if(!i) {
+            memset(bytes,0,120);memcpy(bytes,"\177ELF\2\1\1",7);
+            batch_put(bytes+16,2,2);batch_put(bytes+18,243,2);batch_put(bytes+20,1,4);
+            batch_put(bytes+24,0x40080,8);batch_put(bytes+32,64,8);
+            batch_put(bytes+52,64,2);batch_put(bytes+54,56,2);batch_put(bytes+56,1,2);
+            batch_put(bytes+64,1,4);batch_put(bytes+68,5,4);batch_put(bytes+80,0x40000,8);
+            batch_put(bytes+96,(uint64_t)count*BOAROS_PAGE_SIZE,8);
+            batch_put(bytes+104,(uint64_t)count*BOAROS_PAGE_SIZE,8);batch_put(bytes+112,BOAROS_PAGE_SIZE,8);
+        }
+        assert(!kernel_vfs_pwrite(&file->file,(uint64_t)i*BOAROS_PAGE_SIZE,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+    }
+    struct kernel_elf64_source *source=NULL;
+    assert(!kernel_elf64_source_create(heap,&file,BOAROS_PAGE_SIZE,KERNEL_ELF64_MACHINE_RISCV,&source) && !file);
+    assert(!kernel_mm_map_elf_source(&mm,source,0));
+    struct kernel_mm_mapping mapping;
+    assert(kernel_mm_lookup(&mm,0x40000,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    assert(!kernel_mm_resolve_user_fault(&mm,0x40000+BOAROS_PAGE_SIZE,KERNEL_MM_READ));
+    unsigned window=65536/BOAROS_PAGE_SIZE;
+    for(unsigned i=0;i<window;i++) {
+        assert(!kernel_mm_lookup(&mm,0x40000+(uint64_t)i*BOAROS_PAGE_SIZE,&mapping));
+        assert((mapping.permissions&(KERNEL_MM_READ|KERNEL_MM_EXECUTE))==(KERNEL_MM_READ|KERNEL_MM_EXECUTE));
+        assert(!(mapping.permissions&KERNEL_MM_WRITE));
+    }
+    assert(kernel_mm_lookup(&mm,0x50000,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    assert(!kernel_mm_mprotect(&mm,0x40000,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE));
+    unsigned char value=0xd4;assert(!kernel_copy_to_user(&mm,0x40080,&value,1,&done) && done==1);
+    value=0;assert(!kernel_vfs_pread(&kernel_elf64_source_file(source)->file,0x80,&value,1,&done,NULL) && done==1 && value==0x40);
+    assert(!kernel_mm_madvise(&mm,0x40000,65536,4));
+    assert(!kernel_mm_resolve_user_fault(&mm,0x40000,KERNEL_MM_READ));
+    assert(kernel_mm_lookup(&mm,0x40000+BOAROS_PAGE_SIZE,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    assert(!kernel_open_file_create(heap,mount,"/batch-elf",&file,&error) && !error);
+    struct kernel_open_file_description *owner=file;uint64_t placed;
+    assert(!kernel_open_file_acquire(owner) && !kernel_mm_mmap_file_private(&mm,&owner,
+        0x80000,65536,0,KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&placed));
+    assert(!kernel_mm_resolve_user_fault(&mm,placed+BOAROS_PAGE_SIZE,KERNEL_MM_READ));
+    for(unsigned i=0;i<window;i++)
+        assert(!kernel_mm_lookup(&mm,placed+(uint64_t)i*BOAROS_PAGE_SIZE,&mapping) && !(mapping.permissions&KERNEL_MM_WRITE));
+    assert(!kernel_open_file_release(&file));
+    mm_test_bind(NULL);mm_test_context=0;
+    assert(!kernel_mm_release(&mm) && !kernel_elf64_source_release(&source));
+    assert(!physical_page_release(pages,kernel.root_address));
+    puts("PASS file PTE batch: cached ELF pages, full bounded window, current VMA, COW and all owners returned");
 }

@@ -96,6 +96,12 @@ enum kernel_elf64_source_status kernel_elf64_source_page(
     uint64_t *physical_address,
     int *shared,int read_window);
 
+/* Borrow only READY full file pages in the same immutable source run.
+ * Returned bits identify consecutive source pages; compact references belong
+ * to the caller. No I/O, allocation, or composite/zero-page substitution. */
+unsigned kernel_elf64_source_acquire_ready(struct kernel_elf64_source *,
+    uint64_t first,unsigned selected,uint64_t *addresses,unsigned capacity);
+
 uint64_t kernel_elf64_source_file_size(
     const struct kernel_elf64_source *source);
 

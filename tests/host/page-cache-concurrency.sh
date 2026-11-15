@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-case "${1:-all}" in all|parallel-writeback|metadata-pressure|same-disk-admission|writeback-wake|read-borrow-retire|snapshot-copy|admission-credit|read-batch|allocation-claims|truncate|append-snapshot|indexed-reclaim|pressure-domains|dirty-age|progress-owners|version-pool|pressure|pressure-errors|fallocate|durable-progress|datasync-times|durable-fixed-target|caller-metadata-owners|shared-mmap|mremap) ;; *) echo 'usage: page-cache-concurrency.sh [all|parallel-writeback|metadata-pressure|same-disk-admission|writeback-wake|read-borrow-retire|snapshot-copy|admission-credit|read-batch|allocation-claims|truncate|append-snapshot|indexed-reclaim|pressure-domains|dirty-age|progress-owners|version-pool|pressure|pressure-errors|fallocate|durable-progress|datasync-times|durable-fixed-target|caller-metadata-owners|shared-mmap|mremap]' >&2; exit 2;; esac
+case "${1:-all}" in all|parallel-writeback|metadata-pressure|same-disk-admission|writeback-wake|read-borrow-retire|snapshot-copy|admission-credit|read-batch|allocation-claims|truncate|append-snapshot|indexed-reclaim|pressure-domains|dirty-age|progress-owners|version-pool|pressure|pressure-errors|fallocate|durable-progress|datasync-times|durable-fixed-target|caller-metadata-owners|shared-mmap|mremap|fault-batch) ;; *) echo 'usage: page-cache-concurrency.sh [all|parallel-writeback|metadata-pressure|same-disk-admission|writeback-wake|read-borrow-retire|snapshot-copy|admission-credit|read-batch|allocation-claims|truncate|append-snapshot|indexed-reclaim|pressure-domains|dirty-age|progress-owners|version-pool|pressure|pressure-errors|fallocate|durable-progress|datasync-times|durable-fixed-target|caller-metadata-owners|shared-mmap|mremap]' >&2; exit 2;; esac
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$root"
 if [ "${1:-all}" = parallel-writeback ]; then
@@ -67,7 +67,7 @@ for shift in ${CACHE_HOST_SHIFTS:-12 14}; do
             timeout 20s "$build_dir/concurrency-$shift" "$fault" domain-start-failure
             continue
         fi
-        if [ "${1:-all}" = mremap ] || [ "${1:-all}" = shared-mmap ]; then
+        if [ "${1:-all}" = mremap ] || [ "${1:-all}" = shared-mmap ] || [ "${1:-all}" = fault-batch ]; then
             image="$build_dir/$1-$shift-$block.img"
             truncate -s 32M "$image"; mkfs.ext4 -q -F -b "$block" "$image"
             timeout 20s "$build_dir/concurrency-$shift" "$image" "$1"
