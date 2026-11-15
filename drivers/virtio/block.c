@@ -837,6 +837,16 @@ static enum kernel_block_status wait_request(struct virtio_block_device *device,
              * the deadline before revoking the caller's borrowed buffer. */
             collect_used_locked(device);
             if (r->state == 2) {
+                if (r->header.type == VIRTIO_BLOCK_REQUEST_FLUSH) {
+                    /* A host backing-file flush has no bounded completion
+                     * time. Keep this request and the flush barrier owned
+                     * until the device publishes its real result. */
+                    r->deadline = time_now() + device->timeout_ticks;
+                    block_puts("BoarOS: FLUSH still pending; waiting for completion device=");
+                    block_hex((uintptr_t)device->transport.context);
+                    block_puts("\n");
+                    continue;
+                }
                 device->statistics.timeouts++;
                 fail_device(device, KERNEL_BLOCK_STATUS_TIMEOUT);
             }
