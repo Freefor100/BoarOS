@@ -1,6 +1,9 @@
 #include <kernel/cost.h>
 #include <kernel/cpu.h>
 #include <arch/mmu.h>
+#include <arch/uaccess.h>
+#include <kernel/task.h>
+#include <kernel/scheduler.h>
 #include <kernel/mm.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
@@ -15,7 +18,7 @@ enum kernel_uaccess_status kernel_user_range_check(
     uint64_t user_address,
     size_t size)
 {
-    /* 这里只做区间算术；真正访问由MM pin检查绑定域及权限。 */
+    /* 这里只做区间算术；实际权限由本核硬件访问或远端MM pin检查。 */
     if (size == 0U) {
         return KERNEL_UACCESS_STATUS_OK;
     }
@@ -26,19 +29,91 @@ enum kernel_uaccess_status kernel_user_range_check(
     return KERNEL_UACCESS_STATUS_OK;
 }
 
+static inline enum kernel_uaccess_status access_status(enum kernel_mm_status status)
+{
+    if (status==KERNEL_MM_STATUS_OK) return KERNEL_UACCESS_STATUS_OK;
+    if (status==KERNEL_MM_STATUS_NOT_MAPPED || status==KERNEL_MM_STATUS_ACCESS ||
+        status==KERNEL_MM_STATUS_ADDRESS_SPACE || status==KERNEL_MM_STATUS_BUS_FAULT ||
+        status==KERNEL_MM_STATUS_NO_MEMORY) return KERNEL_UACCESS_STATUS_FAULT;
+    return KERNEL_UACCESS_STATUS_STATE;
+}
+
 /* The same fault/retry rule applies to a single page and a bounded prefix.
  * Only the first page may fault; a second page is borrowed if already ready. */
 static inline enum kernel_uaccess_status pin_user_prefix(
     struct kernel_mm *mm,uint64_t address,uint64_t second,uint32_t access,
     struct kernel_mm_user_pin *pin,unsigned *count)
+{ return access_status(kernel_uaccess_pin_resolved(mm,address,second,access,pin,count)); }
+
+#if ARCH_UACCESS_NATIVE
+static inline int local_user_mm(const struct kernel_mm *mm)
 {
-    enum kernel_mm_status status=kernel_uaccess_pin_resolved(mm,address,second,access,pin,count);
-    if(status==KERNEL_MM_STATUS_OK)return KERNEL_UACCESS_STATUS_OK;
-    if (status == KERNEL_MM_STATUS_NOT_MAPPED || status == KERNEL_MM_STATUS_ACCESS ||
-        status == KERNEL_MM_STATUS_ADDRESS_SPACE || status == KERNEL_MM_STATUS_BUS_FAULT ||
-        status == KERNEL_MM_STATUS_NO_MEMORY) return KERNEL_UACCESS_STATUS_FAULT;
-    return KERNEL_UACCESS_STATUS_STATE;
+    return mm && mm->state==KERNEL_MM_LIVE && mm->record &&
+        kernel_cpu_current()->active_mm_record==mm->record &&
+        kernel_task_has_user_context(kernel_task_current());
 }
+
+static enum kernel_uaccess_status resolve_copy_fault(struct kernel_mm *mm,
+    uint64_t address,uint32_t access,uintptr_t cause)
+{
+    /* Access faults cannot be repaired by republishing an already valid PTE. */
+    if (cause!=13 && cause!=15) return KERNEL_UACCESS_STATUS_FAULT;
+    return access_status(kernel_mm_resolve_user_fault(mm,address,access));
+}
+
+static enum kernel_uaccess_status local_copy(struct kernel_mm *mm,uint64_t user,
+    void *buffer,size_t size,size_t *copied,int writing)
+{
+    *copied=0;
+    while (*copied<size) {
+        size_t remaining=size-*copied;
+#if BOAROS_COST_DIAGNOSTICS
+        struct kernel_cost_tag tag=kernel_cost_capture();uint64_t start=kernel_cost_clock();
+#endif
+        struct arch_uaccess_result result=writing ?
+            arch_copy_to_user((void *)(uintptr_t)(user+*copied),(char *)buffer+*copied,remaining) :
+            arch_copy_from_user((char *)buffer+*copied,(void *)(uintptr_t)(user+*copied),remaining);
+        if (result.remaining>remaining) __builtin_trap();
+        size_t done=remaining-result.remaining;
+#if BOAROS_COST_DIAGNOSTICS
+        kernel_cost_add_tag(tag,COST_UACCESS_COPY_TICKS,kernel_cost_clock()-start);
+        kernel_cost_add_tag(tag,COST_UACCESS_COPY_BYTES,done);
+#endif
+        if (writing) COST_ADD(COPY_TO_USER,done);
+        else {COST_ADD(COPY_FROM_USER,done);COST_IO_ADD(3,done);}
+        *copied+=done;
+        if (!result.remaining) return KERNEL_UACCESS_STATUS_OK;
+        /* The hardware fault already returned through its recovery PC. No
+         * nested trap frame remains while the common resolver may sleep. */
+        enum kernel_uaccess_status status=resolve_copy_fault(mm,user+*copied,
+            writing?KERNEL_MM_WRITE:KERNEL_MM_READ,result.cause);
+        if (status) return status;
+    }
+    return KERNEL_UACCESS_STATUS_OK;
+}
+
+static enum kernel_uaccess_status local_string(struct kernel_mm *mm,char *buffer,
+    uint64_t user,size_t capacity,size_t *length)
+{
+    size_t copied=0;
+    while (copied<capacity) {
+        uint64_t current=user+copied;
+        if (current>=ARCH_MMU_USER_LIMIT) break;
+        size_t count=capacity-copied;
+        if (count>ARCH_MMU_USER_LIMIT-current) count=ARCH_MMU_USER_LIMIT-current;
+        struct arch_uaccess_result result=arch_copy_string_from_user(buffer+copied,
+            (const char *)(uintptr_t)current,count);
+        if (result.remaining>count) __builtin_trap();
+        copied+=count-result.remaining;*length=copied;
+        if (!result.cause) return result.remaining ? KERNEL_UACCESS_STATUS_OK :
+            copied==capacity ? KERNEL_UACCESS_STATUS_TOO_LONG : KERNEL_UACCESS_STATUS_FAULT;
+        enum kernel_uaccess_status status=resolve_copy_fault(mm,user+copied,KERNEL_MM_READ,result.cause);
+        if (status) return status;
+    }
+    *length=copied;
+    return KERNEL_UACCESS_STATUS_FAULT;
+}
+#endif
 
 enum kernel_uaccess_status kernel_uaccess_pin_user_page(
     struct kernel_mm *mm,uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin)
@@ -94,6 +169,13 @@ enum kernel_uaccess_status kernel_uaccess_write_cursor_copy(
         *bytes_copied = 0U;
         return KERNEL_UACCESS_STATUS_FAULT;
     }
+
+#if ARCH_UACCESS_NATIVE
+    if (local_user_mm(mm)) {
+        kernel_uaccess_write_cursor_finish(cursor);
+        return local_copy(mm,user_destination,(void *)kernel_source,size,bytes_copied,1);
+    }
+#endif
 
     while (copied < size) {
         unsigned char *page;
@@ -166,7 +248,11 @@ enum kernel_uaccess_status kernel_copy_to_user(
 {
     size_t first=BOAROS_PAGE_SIZE-(user_destination&BOAROS_PAGE_MASK);
     if (size>first && size-first<=BOAROS_PAGE_SIZE && mm && kernel_source &&
-        bytes_copied && !kernel_user_range_check(user_destination,size))
+        bytes_copied && !kernel_user_range_check(user_destination,size)
+#if ARCH_UACCESS_NATIVE
+        && !local_user_mm(mm)
+#endif
+        )
         return copy_to_user_pair(mm,user_destination,kernel_source,size,first,bytes_copied);
     return copy_to_user_cursor(mm,user_destination,kernel_source,size,bytes_copied);
 }
@@ -195,6 +281,10 @@ enum kernel_uaccess_status kernel_copy_from_user(
         *bytes_copied = 0U;
         return KERNEL_UACCESS_STATUS_FAULT;
     }
+
+#if ARCH_UACCESS_NATIVE
+    if (local_user_mm(mm)) return local_copy(mm,user_source,kernel_destination,size,bytes_copied,0);
+#endif
 
     while (copied < size) {
         struct kernel_mm_user_pin pin = {0};
@@ -279,6 +369,10 @@ enum kernel_uaccess_status kernel_copy_string_from_user(
     if (user_source >= ARCH_MMU_USER_LIMIT) {
         return KERNEL_UACCESS_STATUS_FAULT;
     }
+
+#if ARCH_UACCESS_NATIVE
+    if (local_user_mm(mm)) return local_string(mm,kernel_destination,user_source,capacity,string_length);
+#endif
 
     while (copied < capacity) {
         struct kernel_mm_user_pin pin = {0};

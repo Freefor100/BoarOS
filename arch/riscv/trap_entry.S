@@ -89,6 +89,12 @@ riscv_trap_entry:
 
     csrr t0, sstatus
     sd t0, RISCV_TRAP_FRAME_SSTATUS(sp)
+    /* Only an interrupted/faulting user-copy window carries SUM. */
+    li t1,0x40000
+    and t1,t0,t1
+    beqz t1,.Lsum_clear
+    csrc sstatus,t1
+.Lsum_clear:
     csrr t0, sepc
     sd t0, RISCV_TRAP_FRAME_SEPC(sp)
     csrr t0, scause

@@ -132,7 +132,7 @@ def accepted(raw,arch,cpus,target,selected=None):
            'icache':[f'ICACHE PASS cpus={cpus}'],
            'vectors_v2':[*(f'VECTORS2 CASE {name} PASS' for name in (
                'positions-libc-native-width','per-call-append-sync','vectors-errors-prefix',
-               'signal-targets-seals','caller-cpus-atomic-append')),'VECTORS2 PASS cases=5']}
+               'signal-targets-seals','caller-cpus-atomic-append','local-copy-fault-prefix-cow-string')),'VECTORS2 PASS cases=6']}
     markers=[f'API8 PASS programs={len(programs)}']
     for name in programs:markers+=known.get(name,[])
     lines=raw.replace('\r','').splitlines()
