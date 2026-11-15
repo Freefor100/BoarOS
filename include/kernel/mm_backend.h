@@ -9,6 +9,9 @@ enum kernel_mm_status kernel_mm_context(const struct kernel_mm *, uint64_t *);
 /* 调度域外调用；next拥有MM引用，旧执行owner覆盖旧record借用。
  * NULL选择稳定kernel_context；已登记的同MM激活按实际观察的翻译/指令代次同步。 */
 enum kernel_mm_status kernel_mm_activate(const struct kernel_mm *next, uint64_t kernel_context);
+/* Scheduler kernel tasks may retain a root-page-only loan; explicit activate
+ * with NULL still selects the kernel root and ends that loan. */
+enum kernel_mm_status kernel_mm_activate_for_task(const struct kernel_mm *,uint64_t kernel_context);
 /* 受控内核任务在创建处检查支持的后备消费者；不切换MM同步模型。 */
 enum kernel_mm_status kernel_mm_check_task_domain(const struct kernel_mm *);
 struct kernel_mm_statistics {

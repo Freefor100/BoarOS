@@ -31,6 +31,8 @@ struct mm_test_actor { struct kernel_task task; unsigned dispatched; };
 static _Thread_local struct mm_test_actor actor;
 static _Thread_local unsigned actor_id;
 #if BOAROS_MAX_CPUS > 1
+__attribute__((weak)) void riscv_smp_sync_kernel(uint64_t address,uint64_t size)
+{ mm_test_fence(size==BOAROS_PAGE_SIZE?address:UINT64_MAX,0); }
 static _Thread_local struct kernel_mm *bound_mm;
 static _Thread_local struct kernel_files *bound_files;
 #endif

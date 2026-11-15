@@ -2746,13 +2746,25 @@ enum riscv_sv39_status riscv_sv39_user_space_destroy(
         __builtin_trap();
     }
 
-    for (index = 0U; index < RISCV_SV39_USER_ROOT_ENTRIES; index++) {
-        if (root[index] == 0U) {
-            continue;
+    uint32_t references;
+    if (physical_page_reference_count(space->allocator,space->root_address,&references))
+        __builtin_trap();
+    for (index=0;index<RISCV_SV39_USER_ROOT_ENTRIES;) {
+        uint64_t detached[16];unsigned count=0;
+        while (index<RISCV_SV39_USER_ROOT_ENTRIES && count<16) {
+            if (root[index]) {
+                if (!valid_nonleaf_entry(root[index])) return RISCV_SV39_STATUS_STATE;
+                detached[count++]=root[index];
+                __atomic_store_n(&root[index],0,__ATOMIC_RELEASE);
+            }
+            index++;
         }
-        status = destroy_level1(space, &root[index]);
-        if (status != RISCV_SV39_STATUS_OK) {
-            return status;
+        /* Root-only borrowers can still have speculative user walks. Detach
+         * their parent entries and finish every RFENCE before freeing children. */
+        if (count && references>1) kernel_window_sync(0,UINT64_MAX);
+        for (unsigned i=0;i<count;i++) {
+            status=destroy_level1(space,&detached[i]);
+            if (status) return status;
         }
     }
     if (space->leaf_pages != 0U || space->protected_pages != 0U ||

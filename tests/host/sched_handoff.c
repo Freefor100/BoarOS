@@ -141,7 +141,7 @@ enum kernel_scheduler_status __wrap_scheduler_switch_claimed(struct kernel_task 
     }
     return KERNEL_SCHEDULER_STATUS_OK;
 }
-enum kernel_mm_status kernel_mm_activate(const struct kernel_mm *mm,uint64_t context)
+enum kernel_mm_status kernel_mm_activate_for_task(const struct kernel_mm *mm,uint64_t context)
 { (void)mm;(void)context;assert(park_handoff && !cpu.raw_locks);return KERNEL_MM_STATUS_OK; }
 void riscv_fpu_switch(struct riscv_fpu_state *previous,struct riscv_fpu_state *next)
 {

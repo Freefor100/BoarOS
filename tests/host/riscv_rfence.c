@@ -118,6 +118,9 @@ static void same_window(void)
     riscv_smp_sync_kernel(0x8000, 8192);
     assert(request_count == 1 && requests[0].mask == 0xf6 && !requests[0].instructions);
     assert(flushes == 1 && !instruction_syncs);
+    current=cpus[1];request_count=flushes=0;
+    riscv_smp_sync_kernel(0,UINT64_MAX);
+    assert(request_count==1 && requests[0].mask==0xf5 && !requests[0].instructions && flushes==1);
 }
 static void sparse_windows(void)
 {
