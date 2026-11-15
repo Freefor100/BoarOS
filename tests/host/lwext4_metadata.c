@@ -3100,8 +3100,8 @@ static void handle_return_test(struct ext4_fs *fs)
     CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
     ext4_file file;
     CHECK(ext4_fopen(&file,"/handle-return","w+")==EOK);
-    struct ext4_time_observer observer={.written=handle_return_written};
-    CHECK(ext4_mount_setup_time_observer("/",&observer)==EOK);
+    struct ext4_inode_observer observer={.written=handle_return_written};
+    CHECK(ext4_mount_setup_inode_observer("/",&observer)==EOK);
     handle_return_entered=handle_return_resume=0;
     pthread_t first;
     CHECK(!pthread_create(&first,NULL,handle_return_first,&file));
@@ -3126,7 +3126,7 @@ static void handle_return_test(struct ext4_fs *fs)
     unsigned char byte;size_t read;
     CHECK(ext4_fpread(&file,0,&byte,1,&read)==EOK && read==1 && byte=='A');
     CHECK(ext4_fpread(&file,8192,&byte,1,&read)==EOK && read==1 && byte=='B');
-    CHECK(ext4_mount_setup_time_observer("/",NULL)==EOK && ext4_fclose(&file)==EOK);
+    CHECK(ext4_mount_setup_inode_observer("/",NULL)==EOK && ext4_fclose(&file)==EOK);
     CHECK(ext4_fremove("/handle-return")==EOK && ext4_journal_group_drain("/")==EOK);
     puts("PASS delayed handle return: another task's larger accepted EOF and later sync/data goals survive");
 }

@@ -66,6 +66,10 @@ struct lwext4_node {
 
     struct ext4_delalloc delalloc;
     uint8_t capability_absent; /* Inode writer updates this after capability set/remove and killpriv. */
+    /* Basic attributes belong to this live inode. Completion of every actual
+     * metadata mutation invalidates them under the existing timestamp lock. */
+    struct kernel_vfs_stat metadata;
+    uint64_t metadata_epoch, metadata_seen;
 };
 _Static_assert(offsetof(struct lwext4_mount_adapter, instance) == 0,
                "mount private_data begins with its VFS instance");

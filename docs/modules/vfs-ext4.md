@@ -10,7 +10,11 @@
 `fs/vfs.c` 管理路径身份、引用、执行/写租约、记录锁和缓存；
 `fs/file_mapping.c` 管理 inode–MM 登记、借用游标和文件代次。
 
-路径属性查询与open共用最终对象解析，直接复用名称索引中的真实dentry/inode。没有活对象时才查目录并建立节点；ext4打开inode时一并导入mode、owner和group，不先单独读取子inode的mode再打开同一inode。stat随后在目标inode的I/O保护下读取当前属性，合入当前大小、延迟分配块数及待发布时间戳，不保存另一份可能过时的stat快照。路径搜索直接复用已有目录命名空间读资格检查mode、owner和ACL，因为chmod、chown及ACL修改都持有对应写资格，不再每个分量叠加一次inode I/O锁。ACL读取错误仍返回原错误；没有目录资格的独立查询及proc等动态权限后端保留原I/O保护。目录搜索权限仍先检查，已保留路径和挂载点仍解析真实视图，需要跟随的符号链接继续展开目标。
+路径属性查询与open共用最终对象解析，直接复用名称索引中的真实dentry/inode。没有活对象时才查目录并建立节点；ext4打开inode时一并导入mode、owner和group，不先单独读取子inode的mode再打开同一inode。活ext4节点同时保存从已校验inode导入的基本属性，stat按下述修改代次复用，合入当前大小、延迟分配块数及待发布时间戳。路径搜索直接复用已有目录命名空间读资格检查mode、owner和ACL，因为chmod、chown及ACL修改都持有对应写资格，不再每个分量叠加一次inode I/O锁。ACL读取错误仍返回原错误；没有目录资格的独立查询及proc等动态权限后端保留原I/O保护。目录搜索权限仍先检查，已保留路径和挂载点仍解析真实视图，需要跟随的符号链接继续展开目标。
+
+基本属性与时间共用实际元数据操作的staged-inode记录和真实节点引用。dirty inode进入已有操作记录时登记修改者，外层接纳或回滚完成后，在原时间状态短保护内使旧属性失效；非journal失败可能已有完成前缀，因此失败也失效。登记分配失败时立即使已修改节点的旧属性失效，不能依赖一份未成功建立的完成记录。相同操作已经持有的节点直接复用，不反复查inode索引和借还引用。最后关闭、unlink、namespace修改、写回及范围修改均经过同一记录，结束实际借用后释放节点。
+
+stat命中有效代次时只取得基本属性和当前待发布时间；失效时在保护外读取当前后端inode，重新取得保护且代次未变才保存结果。操作内查询仍读取该操作自己的实际版本，不用已接纳属性替代。普通文件继续取得inode I/O读资格，大小从活节点读取、预留块数从真实delalloc状态叠加；属性保留的旧值不会延长权限或映射资格。目录和链接的元数据变化也使其结果失效。原inode装入、格式与校验和检查仍执行，减少的是相同版本的重复装入与借还。当前RV普通构建的节点从888增至1024字节，仍处于同一1024字节slab档位。
 
 映射登记由 MM 持有，来源 OFD 维持 inode 寿命。inode 的 rank30 raw 仅保护登记、
 代次、关闭状态和借用；注销先停止新借用并摘链，再在 MM gate、inode I/O 和 raw 锁外 drain。
@@ -470,7 +474,7 @@ ctime和校验数据，失败执行原有回滚及资源归还。未保留另一
 `FS_IOC_GETFLAGS` 从真实 inode 读取用户可见位，包括已有的 extents、目录索引等格式位。`FS_IOC_SETFLAGS` 仅替换 immutable、append 和 nodump，保留其余磁盘位，将标志与 ctime 写入同一 inode。普通文件设置 immutable 时，写操作锁等待已接纳的普通写入，映射代次关闭新的共享写缺页；页缓存写回重设共享 PTE、完成 TLB 失效并等待在途的写 pin，然后 VFS 发布新标志。后续共享写缺页产生 SIGBUS，独立私有 COW 页保留。已经打开的可写 FD 在 ext4 的写入入口重新检查 immutable。最后一个无链接 inode owner 释放时，回收已分配的数据块，包括删除名字后才设置 immutable 或 append 的情形。
 inline EA在读取magic前检查范围；外部EA读取校验checksum，临时列表记录保持原生对齐。
 
-`kernel_vfs_fstat()` 把当前 open handle 指向的 raw ext4 inode 转换为统一 `kernel_vfs_stat`，不按路径重新查找。普通文件 size 与 atime/mtime/ctime 来自共享 node 的当前值，其余字段来自实际 inode。它读取 inode 的 ino/mode/nlink、Linux low/high uid/gid、64-bit size、以 512 字节为单位的 allocated block count，以及 filesystem block size；atime/mtime/ctime 按磁盘 inode size 与 `extra_isize` 共同判断 extra 字段是否存在，再解码 2-bit epoch 与纳秒。该编码依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `references/linux/fs/ext4/ext4.h`。文件系统实例维护唯一的`st_dev`：ext4/VFAT使用其块设备编号，虚拟后端使用自身设备身份；bind和命名空间视图不生成新的设备号。挂载ID与设备号分别维护。lwext4 的 `ext4_fraw_inode_fill()` 是最小 handle adapter，使最后一个 dentry 删除后仍能查询活着的 inode。
+`kernel_vfs_fstat()` 从当前open handle取得统一`kernel_vfs_stat`，不按路径重新查找。ext4基本属性的复用、失效与当前值叠加见本文通用边界；仅在确需刷新时，通过`ext4_fraw_inode_fill()`取得真实inode。装入时读取ino/mode/nlink、Linux low/high uid/gid、64-bit size、以512字节为单位的allocated block count及文件系统块大小；atime/mtime/ctime按磁盘inode size与`extra_isize`判断extra字段，再解码2-bit epoch与纳秒。该编码依据固定Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `references/linux/fs/ext4/ext4.h`。文件系统实例维护唯一的`st_dev`：ext4/VFAT使用块设备编号，虚拟后端使用自身身份；bind和命名空间视图不生成新的设备号。挂载ID与设备号分别维护。最后一个dentry删除后，实际打开对象仍保活原inode。
 
 GDT 与 inode 的成功校验绑定块数据的实际 payload 版本。每个 payload 保存元数据表的首记录身份、记录尺寸和类型，以256位位图分别记录已验证的实际位置。同一块中的不同inode或GDT记录不再争用四个哈希槽；超出位图范围或不能形成表布局的记录继续完整校验。元数据始终从当前借用的真实inode读取。父目录lookup、raw inode查询、按inode打开和目录枚举使用只读inode引用；目录查找、遍历、空目录检查及父目录编号查询也按只读方式借用叶块和HTree索引。只有修改返回目录项、插入索引或重设父目录的调用者取得事务写版本。
 

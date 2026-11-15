@@ -44,7 +44,7 @@ static void directory_reuse_case(struct kernel_vfs_path *root)
     }
     stat_lookup_watch=0;
     printf("directory reuse: inode reads=%u opens=%u inode I/O locks=%u\n",stat_lookup_reads,stat_lookup_opens,stat_lookup_io_locks);
-    assert(!stat_lookup_opens && stat_lookup_reads==32);
+    assert(!stat_lookup_opens && !stat_lookup_reads);
     assert(stat_lookup_io_locks==32);
     struct kernel_credentials *lower=kernel_credentials_clone(instance->heap,kernel_credentials_current());
     assert(lower);lower->fsuid=70001;lower->fsgid=70001;lower->effective=0;
@@ -84,7 +84,7 @@ static void lookup_attributes_case(struct kernel_vfs_path *root)
     assert(!kernel_vfs_stat_at(root,root,"stat-only",1,&stat));
     stat_lookup_watch=0;
     assert(stat.ino==inode && (stat.mode&0777)==0640 && !stat.size);
-    assert(stat_lookup_reads==1 && !stat_lookup_opens);
+    assert(!stat_lookup_reads && !stat_lookup_opens);
     assert(kernel_vfs_stat_at(root,root,"stat-only/",1,&stat)==-KERNEL_ENOTDIR);
     assert(!kernel_vfs_symlink_at(root,root,"stat-only","stat-link"));
     assert(!kernel_vfs_stat_at(root,root,"stat-link",0,&stat) && (stat.mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFLNK);
@@ -102,7 +102,7 @@ static void lookup_attributes_case(struct kernel_vfs_path *root)
     assert(!kernel_vfs_stat_at(root,root,"stat-hard",1,&stat));
     stat_lookup_watch=0;
     printf("live hard-link stat: inode reads=%u opens=%u\n",stat_lookup_reads,stat_lookup_opens);
-    assert(stat_lookup_reads==2 && !stat_lookup_opens);
+    assert(stat_lookup_reads==1 && !stat_lookup_opens);
     assert(stat.ino==live.ino && stat.size==8 && stat.blocks==live.blocks &&
         stat.mtime.seconds==live.mtime.seconds && stat.mtime.nanoseconds==live.mtime.nanoseconds);
     assert(!kernel_vfs_path_release(&source) && !kernel_vfs_close(&file));
@@ -121,6 +121,35 @@ static void lookup_attributes_case(struct kernel_vfs_path *root)
     for(unsigned i=0;i<4;i++) assert(!kernel_vfs_unlink_at(root,root,names[i],0));
     puts("PASS final stat reuses one directory/inode lookup without opening the child; symlink, trailing slash and live hard-link attributes preserved");
 }
+static void inode_attribute_lifecycle(struct lwext4_mount_adapter *adapter,struct kernel_vfs_path *root)
+{
+    struct kernel_vfs_file file={0};struct kernel_vfs_path *path=NULL;
+    struct kernel_vfs_stat stat;
+    assert(!kernel_vfs_create_at(root,root,"attributes",0600,&file,0));
+    assert(!kernel_vfs_path_lookup(root,"attributes",10,&path));
+    assert(!kernel_vfs_fstat(&file,&stat) && stat.nlink==1 && !stat.size);
+    assert(!kernel_vfs_file_set_mode(&file,0640));
+    assert(!kernel_vfs_file_set_owner(&file,70001,70002));
+    assert(!kernel_vfs_fstat(&file,&stat) && (stat.mode&0777)==0640 &&
+        stat.uid==70001 && stat.gid==70002);
+    assert(!kernel_vfs_link_at(path,root,root,"attributes-link"));
+    assert(!kernel_vfs_fstat(&file,&stat) && stat.nlink==2);
+    assert(!kernel_vfs_unlink_at(root,root,"attributes-link",0));
+    assert(!kernel_vfs_fstat(&file,&stat) && stat.nlink==1);
+    size_t written;
+    assert(!kernel_vfs_pwrite(&file,0,"content",7,&written) && written==7);
+    assert(!kernel_vfs_fstat(&file,&stat) && stat.size==7 && stat.blocks);
+    assert(!kernel_page_cache_writeback(kernel_vfs_file_page_cache(&file),file.private_data));
+    assert(!ext4_journal_group_drain(adapter->mount_point));
+    assert(!kernel_vfs_fstat(&file,&stat) && stat.size==7 && stat.blocks);
+    assert(!kernel_vfs_ftruncate(&file,0));
+    assert(!kernel_vfs_fstat(&file,&stat) && !stat.size && !stat.blocks);
+    assert(!kernel_vfs_unlink_at(root,root,"attributes",0));
+    assert(!kernel_vfs_fstat(&file,&stat) && !stat.nlink);
+    assert(!kernel_vfs_path_release(&path) && !kernel_vfs_close(&file));
+    puts("PASS live inode attributes: chmod/chown, link/unlink, delayed/allocated blocks, truncate and unlinked FD");
+}
+
 struct parallel_actor {
     struct kernel_vfs_path *parent,*root;
     struct kernel_vfs_file file,*existing;
@@ -520,8 +549,9 @@ int main(int argc,char **argv)
     struct kernel_vfs_path *root=NULL,*directories[65]={0};
     assert(!kernel_vfs_path_root(&mount,&heap,&root));
     if (getenv("EXT4_NAMESPACE_REUSE_ONLY")) {
-        directory_reuse_case(root);lookup_attributes_case(root);
-        rename_order_case(adapter,root);rename_order_directory_case(adapter,root);goto Finish;}
+        directory_reuse_case(root);lookup_attributes_case(root);inode_attribute_lifecycle(adapter,root);
+        rename_order_case(adapter,root);rename_order_directory_case(adapter,root);
+        rename_inode_case(adapter,root);goto Finish;}
     lookup_attributes_case(root);
     if (getenv("EXT4_NAMESPACE_STAT_ONLY")) goto Finish;
     worker_notification_case(adapter,root);

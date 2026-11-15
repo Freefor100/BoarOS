@@ -2,6 +2,52 @@
 #include "file_io_concurrency.c"
 #undef main
 #include <ext4.h>
+#include <ext4_inode.h>
+#include <ext4_fs.h>
+
+static _Thread_local unsigned stage_oom,inside_stage;
+static unsigned stage_denied;
+static void (*original_store)(void *,void *,uint32_t,unsigned,struct ext4_timestamp);
+static void (*original_changed)(void *,uint32_t);
+void *__real_ext4_user_calloc(size_t,size_t);
+void *__wrap_ext4_user_calloc(size_t count,size_t bytes)
+{
+    if (stage_oom && inside_stage) { stage_denied++;return NULL; }
+    return __real_ext4_user_calloc(count,bytes);
+}
+static void observe_store(void *context,void *owner,uint32_t inode,unsigned field,
+    struct ext4_timestamp value)
+{
+    inside_stage++;original_store(context,owner,inode,field,value);inside_stage--;
+}
+static void observe_changed(void *context,uint32_t inode)
+{ inside_stage++;original_changed(context,inode);inside_stage--; }
+int __real_ext4_mount_setup_inode_observer(const char *,const struct ext4_inode_observer *);
+int __wrap_ext4_mount_setup_inode_observer(const char *path,const struct ext4_inode_observer *observer)
+{
+    if (!observer) return __real_ext4_mount_setup_inode_observer(path,NULL);
+    struct ext4_inode_observer watched=*observer;
+    original_store=watched.store;original_changed=watched.changed;
+    if (watched.store) watched.store=observe_store;
+    if (watched.changed) watched.changed=observe_changed;
+    return __real_ext4_mount_setup_inode_observer(path,&watched);
+}
+static void nonjournal_staging_failure(struct lwext4_mount_adapter *adapter,struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_stat cached,actual;
+    assert(!adapter->device.fs->jbd_journal && !kernel_vfs_fstat(file,&cached));
+    stage_oom=1;stage_denied=0;
+    int result=kernel_vfs_file_set_mode(file,0640);
+    stage_oom=0;
+    assert(result==-KERNEL_ENOMEM && stage_denied);
+    struct ext4_inode inode;
+    assert(!ext4_fraw_inode_fill(lwext4_node_file(file->private_data),&inode));
+    assert(!kernel_vfs_fstat(file,&actual) &&
+        actual.mode==ext4_inode_get_mode(adapter->superblock,&inode));
+    assert((actual.mode&0777)==0640 && actual.mode!=cached.mode);
+    assert(!kernel_vfs_file_set_mode(file,0660) && !kernel_vfs_file_set_mode(file,0600));
+    puts("PASS nonjournal staging ENOMEM preserves actual changed prefix and invalidates cached attributes");
+}
 
 static struct ext4_timestamp timestamp_now;
 static unsigned timestamp_sampling, timestamp_continue;
@@ -72,6 +118,7 @@ int main(int argc, char **argv)
     const struct kernel_vfs_open_request request = {.flags = KERNEL_VFS_OPEN_FOLLOW};
     if (argc == 3) assert(!kernel_vfs_open_at(root, root, "timestamp", &request, &file, NULL));
     else assert(!kernel_vfs_create_at(root, root, "timestamp", 0600, &file,0));
+    if (argc==3) nonjournal_staging_failure(adapter,&file);
     uint64_t observed_error = kernel_vfs_error_sequence(&file);
     const struct kernel_vfs_timespec explicit[2] = {{2000000100, 20}, {1999999900, 30}};
     assert(!kernel_vfs_file_set_times(&file, explicit));
