@@ -149,6 +149,9 @@ int main(int argc,char **argv)
     assert(!kernel_vfs_create_at(root,root,"replayed-pin",0600,&candidate,0) && replayed==1);
     assert(!kernel_vfs_close(&candidate) && !kernel_vfs_unlink_at(root,root,"replayed-pin",0));
     puts("PASS candidate loser/overflow, pre-accept pin ENOMEM rollback and same-constructor abort/replay return their references");
+    /* A positive name now owns an internal file. Drop only that cache owner
+     * while the actual user file still keeps this inode/resource alive. */
+    (void)kernel_vfs_reclaim_clean(adapter->instance.heap->page_allocator,UINT64_MAX);
     struct kernel_vfs_node *closing=file.private_data;close_fault=lwext4_node_file(closing);
     assert(!kernel_vfs_close(&file) && adapter->instance.cleanup_nodes && !watched_frees && ((struct lwext4_node *)closing)->inode_resource);
     close_fault=NULL;

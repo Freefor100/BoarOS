@@ -652,7 +652,6 @@ int ext4_raw_inode_fill(const char *path, uint32_t *ret_ino,
  * entry has been unlinked while the handle still owns the inode.
  */
 int ext4_fraw_inode_fill(const ext4_file *file, struct ext4_inode *inode);
-int ext4_read_inode(const char *mount,uint32_t inode,struct ext4_inode *snapshot);
 
 /* Submit the held inode's metadata buffer, without draining unrelated files.
  * Caller must have submitted data first and issue the device barrier after. */

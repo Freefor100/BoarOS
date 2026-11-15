@@ -368,7 +368,7 @@ static int lookup(struct kernel_vfs_instance *instance, uint64_t parent, const c
     if ((p->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) return -KERNEL_ENOTDIR;
     struct tmp_entry *e = entry(p, name, n);
     if (!e) return -KERNEL_ENOENT;
-    *id = e->inode->number; *mode = e->inode->mode; return 0;
+    *id = e->inode->number; if (mode) *mode = e->inode->mode; return 0;
 }
 static int open_inode(struct kernel_vfs_mount *mount, const char *path, uint64_t id,
                        uint32_t mode, struct kernel_vfs_file *file)

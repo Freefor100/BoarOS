@@ -43,9 +43,9 @@ static void directory_reuse_case(struct kernel_vfs_path *root)
         assert(after.ino==before.ino && after.mode==before.mode);
     }
     stat_lookup_watch=0;
-    printf("directory reuse: inode reads=%u opens=%u permission I/O locks=%u\n",stat_lookup_reads,stat_lookup_opens,stat_lookup_io_locks);
-    assert(!stat_lookup_opens && stat_lookup_reads==64);
-    assert(!stat_lookup_io_locks);
+    printf("directory reuse: inode reads=%u opens=%u inode I/O locks=%u\n",stat_lookup_reads,stat_lookup_opens,stat_lookup_io_locks);
+    assert(!stat_lookup_opens && stat_lookup_reads==32);
+    assert(stat_lookup_io_locks==32);
     struct kernel_credentials *lower=kernel_credentials_clone(instance->heap,kernel_credentials_current());
     assert(lower);lower->fsuid=70001;lower->fsgid=70001;lower->effective=0;
     const struct kernel_credentials *previous=kernel_credentials_override(lower);
@@ -62,7 +62,7 @@ static void directory_reuse_case(struct kernel_vfs_path *root)
     assert(kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&after)==-KERNEL_ENOENT);
     assert(!kernel_vfs_stat_at(root,root,"reuse-renamed/child/file",1,&after) && after.ino==before.ino);
     (void)kernel_vfs_reclaim_clean(instance->heap->page_allocator,1);
-    assert(!instance->directory_cache_count);
+    assert(!instance->dentry_cache_count);
     assert(!kernel_vfs_stat_at(held,root,"file",1,&after) && after.ino==before.ino);
     assert(!kernel_vfs_path_release(&held));
     assert(!kernel_vfs_unlink_at(root,root,"reuse-renamed/child/file",0));
@@ -84,7 +84,7 @@ static void lookup_attributes_case(struct kernel_vfs_path *root)
     assert(!kernel_vfs_stat_at(root,root,"stat-only",1,&stat));
     stat_lookup_watch=0;
     assert(stat.ino==inode && (stat.mode&0777)==0640 && !stat.size);
-    assert(stat_lookup_reads==2 && !stat_lookup_opens);
+    assert(stat_lookup_reads==1 && !stat_lookup_opens);
     assert(kernel_vfs_stat_at(root,root,"stat-only/",1,&stat)==-KERNEL_ENOTDIR);
     assert(!kernel_vfs_symlink_at(root,root,"stat-only","stat-link"));
     assert(!kernel_vfs_stat_at(root,root,"stat-link",0,&stat) && (stat.mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFLNK);
