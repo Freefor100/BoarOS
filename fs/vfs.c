@@ -396,7 +396,7 @@ struct vfs_path_walk {
     struct kernel_vfs_mount *mount;
     struct kernel_vfs_mount *mount_owner;
     struct kernel_vfs_dentry *directory_owner;
-    struct kernel_vfs_path *component;
+    struct kernel_vfs_path *component,*terminal;
     struct kernel_lock_guard guard, mutation;
     struct kernel_service_scope service;
     struct kernel_vfs_node *directory;
@@ -2393,6 +2393,9 @@ static int resolve_object(struct kernel_vfs_path *start,
                     walk->component=&components[i];break;
                 }
                 if (!walk->component) __builtin_trap();
+            } else if (walk->terminal) {
+                if (walk->terminal->references) __builtin_trap();
+                walk->component=walk->terminal;
             }
             result=path_lookup_locked_mode(current,pending+begin,component_length,&next,1,walk);
             walk->component=NULL;
@@ -2530,7 +2533,7 @@ static int resolve_object(struct kernel_vfs_path *start,
     *owner = current;
     current = 0;
 Finish:
-    if (!result && *owner && (*owner)->transient) {
+    if (!result && *owner && (*owner)->transient && *owner!=walk->terminal) {
         struct kernel_vfs_path *accepted=NULL;
         result=path_wrap((*owner)->file.mount,(*owner)->dentry,&accepted);
         if (kernel_vfs_path_release(owner)) __builtin_trap();
@@ -2555,11 +2558,12 @@ static int path_resolve(struct kernel_vfs_path *start,
                             struct kernel_vfs_path *root,
                             const char *path, int follow_final,
                             struct kernel_vfs_path **owner,
-                            struct kernel_vfs_path **pathless_link)
+                            struct kernel_vfs_path **pathless_link,
+                            struct kernel_vfs_path *terminal)
 {
     if (!path || !start || !start->file.mount || !start->file.mount->private_data) return -KERNEL_EINVAL;
     VFS_PATH_WALK(walk,start,root);
-    walk.pathless_link=pathless_link;
+    walk.pathless_link=pathless_link;walk.terminal=terminal;
     return resolve_object(start, root, path, strlen(path), follow_final, 0, 0, VFS_TRAILING_FOLLOW,
                           owner, 0, &walk);
 }
@@ -2568,7 +2572,7 @@ int kernel_vfs_path_resolve(struct kernel_vfs_path *start,
                             struct kernel_vfs_path *root,
                             const char *path, int follow_final,
                             struct kernel_vfs_path **owner)
-{ return path_resolve(start,root,path,follow_final,owner,NULL); }
+{ return path_resolve(start,root,path,follow_final,owner,NULL,NULL); }
 
 static int location_key_compare(const struct kernel_vfs_dentry *entry,const struct kernel_vfs_path *path)
 { return ((uintptr_t)entry>(uintptr_t)path->dentry)-((uintptr_t)entry<(uintptr_t)path->dentry); }
@@ -2662,6 +2666,13 @@ static void dentry_release(struct kernel_vfs_dentry **owner)
 {
     struct kernel_vfs_dentry *entry=*owner;*owner=NULL;
     while (entry) {
+        /* An owned non-final reference changes no namespace or cache state.
+         * Only the last transition competes with weak index lookups. */
+        uint32_t refs=__atomic_load_n(&entry->references,__ATOMIC_ACQUIRE);
+        while (refs>1) {
+            if (__atomic_compare_exchange_n(&entry->references,&refs,refs-1,1,
+                __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) return;
+        }
         {
             KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
             if (!entry->references) __builtin_trap();
@@ -2690,7 +2701,7 @@ static void path_bind(struct kernel_vfs_path *path,struct kernel_vfs_mount *moun
 static int path_walk_wrap(struct kernel_vfs_mount *mount,struct kernel_vfs_dentry *entry,
     struct kernel_vfs_path **owner,struct vfs_path_walk *walk)
 {
-    if (!walk || !walk->component || (entry->file.mode&KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFDIR)
+    if (!walk || !walk->component)
         return path_wrap(mount,entry,owner);
     KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
     if (mount->root_path && (mount->root_path->references&VFS_PATH_CLOSING)) return -KERNEL_EBUSY;
@@ -2809,6 +2820,11 @@ int kernel_vfs_path_release(struct kernel_vfs_path **owner)
 {
     if (!owner || !*owner) return -KERNEL_EINVAL;
     struct kernel_vfs_path *path=*owner;*owner=NULL;
+    uint32_t refs=__atomic_load_n(&path->references,__ATOMIC_ACQUIRE);
+    while (refs>1 && !(refs&VFS_PATH_CLOSING)) {
+        if (__atomic_compare_exchange_n(&path->references,&refs,refs-1,1,
+            __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) return 0;
+    }
     {
         KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
         if (!path->references) __builtin_trap();
@@ -3958,16 +3974,17 @@ uint64_t kernel_vfs_file_size(const struct kernel_vfs_file *file)
     return __atomic_load_n(&node->size,__ATOMIC_ACQUIRE);
 }
 
-/* A real target stays pinned through its attribute and mount checks. Pathless
- * link metadata has no target mount; the link's mount must not stand in for it. */
+/* The caller's terminal storage survives the returned target through access
+ * checks; only metadata-only operations use it. All object/mount refs remain
+ * real. A pathless link's mount must not stand in for a missing target mount. */
 static int stat_at_resolved(struct kernel_vfs_path *start,
                             struct kernel_vfs_path *root, const char *path,
                             int follow_final, struct kernel_vfs_stat *stat,
-                            struct kernel_vfs_path **target)
+                            struct kernel_vfs_path **target,struct kernel_vfs_path *terminal)
 {
     struct kernel_vfs_path *resolved __attribute__((cleanup(release_path_pin))) = 0;
     struct kernel_vfs_path *link __attribute__((cleanup(release_path_pin))) = 0;
-    int result=path_resolve(start,root,path,follow_final,&resolved,&link);
+    int result=path_resolve(start,root,path,follow_final,&resolved,&link,terminal);
     if (!result && resolved) {
         result = kernel_vfs_path_stat(resolved, stat);
         if (target) { *target=resolved;resolved=NULL; }
@@ -3987,7 +4004,8 @@ int kernel_vfs_stat_at(struct kernel_vfs_path *start,
                        struct kernel_vfs_path *root, const char *path,
                        int follow_final, struct kernel_vfs_stat *stat)
 {
-    return stat_at_resolved(start, root, path, follow_final, stat, NULL);
+    struct kernel_vfs_path terminal={0};
+    return stat_at_resolved(start,root,path,follow_final,stat,NULL,&terminal);
 }
 
 static int access_check(const struct kernel_vfs_stat *stat,
@@ -4033,7 +4051,8 @@ int kernel_vfs_access_at(struct kernel_vfs_path *start,
 {
     struct kernel_vfs_path *target __attribute__((cleanup(release_path_pin))) = 0;
     struct kernel_vfs_stat stat;
-    int result=stat_at_resolved(start,root,path,follow_final,&stat,&target);
+    struct kernel_vfs_path terminal={0};
+    int result=stat_at_resolved(start,root,path,follow_final,&stat,&target,&terminal);
     return result ? result : access_check(&stat,target ? target->file.mount : NULL,
                          target ? target->file.private_data : NULL,mode);
 }

@@ -10,6 +10,13 @@
 #include <stdlib.h>
 
 static unsigned stat_lookup_watch,stat_lookup_reads,stat_lookup_opens,stat_lookup_io_locks,stat_lookup_allocations;
+static unsigned borrowed_path_watch,borrowed_path_state_locks;
+void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *,struct kernel_raw_guard *);
+void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_raw_guard *guard)
+{
+    if (borrowed_path_watch && lock==&kernel_vfs_state_lock) borrowed_path_state_locks++;
+    __real_kernel_raw_lock_acquire(lock,guard);
+}
 static struct kernel_rwlock *removed_directory_lock;
 static unsigned removed_entered,removed_continue;
 static _Thread_local int removed_walker;
@@ -43,6 +50,14 @@ int __wrap_ext4_fopen_inode(ext4_file *file,const char *mount,uint32_t inode,str
 }
 static void directory_reuse_case(struct kernel_vfs_path *root)
 {
+    borrowed_path_watch=1;borrowed_path_state_locks=0;
+    for (unsigned i=0;i<32;i++) {
+        struct kernel_vfs_path *borrowed=root;
+        assert(!kernel_vfs_path_acquire(borrowed) && !kernel_vfs_path_release(&borrowed));
+    }
+    borrowed_path_watch=0;
+    printf("borrowed path returns: state locks=%u\n",borrowed_path_state_locks);
+    assert(!borrowed_path_state_locks);
     struct kernel_vfs_file f={0};struct kernel_vfs_stat before,after;
     struct kernel_vfs_instance *instance=root->file.mount->private_data;
     assert(!kernel_vfs_mkdir_at(root,root,"reuse-parent",0755,0));
@@ -60,7 +75,7 @@ static void directory_reuse_case(struct kernel_vfs_path *root)
     assert(!stat_lookup_opens && !stat_lookup_reads);
     assert(stat_lookup_io_locks==32);
     printf("path query zeroed allocations=%u\n",stat_lookup_allocations);
-    assert(stat_lookup_allocations<=32);
+    assert(!stat_lookup_allocations);
     struct kernel_credentials *lower=kernel_credentials_clone(instance->heap,kernel_credentials_current());
     assert(lower);lower->fsuid=70001;lower->fsgid=70001;lower->effective=0;
     const struct kernel_credentials *previous=kernel_credentials_override(lower);
