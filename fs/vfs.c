@@ -386,10 +386,17 @@ enum vfs_trailing_policy {
     VFS_TRAILING_CREATE,
 };
 
+static int mount_put(struct kernel_vfs_mount *);
+static struct kernel_vfs_path *find_location(struct kernel_vfs_mount *,struct kernel_vfs_dentry *);
+static int dentry_acquire(struct kernel_vfs_dentry *);
+static void dentry_release(struct kernel_vfs_dentry **);
+
 struct vfs_path_walk {
     const struct kernel_vfs_path *start, *root;
     struct kernel_vfs_mount *mount;
-    struct kernel_vfs_path *mount_owner;
+    struct kernel_vfs_mount *mount_owner;
+    struct kernel_vfs_dentry *directory_owner;
+    struct kernel_vfs_path *component;
     struct kernel_lock_guard guard, mutation;
     struct kernel_service_scope service;
     struct kernel_vfs_node *directory;
@@ -401,7 +408,8 @@ static void path_walk_release(struct vfs_path_walk *walk)
 {
     kernel_lock_scope_release(&walk->guard);
     kernel_lock_scope_release(&walk->mutation);
-    if (walk->mount_owner && kernel_vfs_path_release(&walk->mount_owner)) __builtin_trap();
+    if (walk->directory_owner) dentry_release(&walk->directory_owner);
+    if (walk->mount_owner) { (void)mount_put(walk->mount_owner);walk->mount_owner=NULL; }
     kernel_service_scope_end(&walk->service);
     walk->service.entered=0;
     walk->mount=NULL;
@@ -470,14 +478,19 @@ static int path_walk_select_mode(struct vfs_path_walk *walk,
         kernel_lock_held(&instance->reconfiguration,0)) && (!namespace_is_parallel(instance) ||
         (walk->directory==node && (!write || walk->guard.write)))) return 0;
     path_walk_release(walk);
-    /* 输入起点/根的caller owner覆盖整次操作；其他挂载保留一个实际路径，
-     * 逐目录资格也独立pin目录，直到解锁再归还，避免循环前移先释放锁存储。 */
-    if (namespace_is_parallel(instance) ||
-       ((!walk->start || walk->start->file.mount!=mount) &&
-        (!walk->root || walk->root->file.mount!=mount))) {
-        int result=kernel_vfs_path_acquire(path);
-        if (result) return result;
-        walk->mount_owner=path;
+    /* The dentry keeps both lock storage and the final close alive until
+     * qualifications are dropped. A node pin alone would allow last close
+     * under the directory guard after a concurrent rmdir. */
+    int crossing=(!walk->start || walk->start->file.mount!=mount) &&
+        (!walk->root || walk->root->file.mount!=mount);
+    if (namespace_is_parallel(instance) || crossing) {
+        if (dentry_acquire(path->dentry)) return -KERNEL_EOVERFLOW;
+        walk->directory_owner=path->dentry;
+    }
+    if (crossing) {
+        KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+        if (mount->references==UINT32_MAX) return -KERNEL_EOVERFLOW;
+        mount->references++;walk->mount_owner=mount;
     }
 #if BOAROS_USER_SMP
     if (kernel_vfs_namespace_requires_cpu0(mount)) kernel_service_scope_begin(&walk->service);
@@ -528,6 +541,8 @@ static int dentry_acquire(struct kernel_vfs_dentry *);
 static void dentry_release(struct kernel_vfs_dentry **);
 static void dentry_cache_trim(struct kernel_vfs_instance *,size_t);
 static int path_wrap(struct kernel_vfs_mount *,struct kernel_vfs_dentry *,struct kernel_vfs_path **);
+static int path_walk_wrap(struct kernel_vfs_mount *,struct kernel_vfs_dentry *,
+    struct kernel_vfs_path **,struct vfs_path_walk *);
 static int mount_put(struct kernel_vfs_mount *);
 static void instance_register(struct kernel_vfs_instance *instance)
 {
@@ -1725,7 +1740,9 @@ static int enter_mounts(struct kernel_vfs_path **owner,unsigned resolve)
         struct kernel_vfs_path *next;
         kernel_task_lock_guard irq = {0};
         kernel_task_lock_acquire(&kernel_vfs_state_lock, &irq);
-        struct kernel_vfs_mount *child = current->mounted_here;
+        struct kernel_vfs_path *location=current->transient?
+            find_location(current->file.mount,current->dentry):current;
+        struct kernel_vfs_mount *child=location?location->mounted_here:NULL;
         if (!child) {
             kernel_task_lock_release(&irq);
             *owner = current;
@@ -2193,7 +2210,7 @@ static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
             } else if (ancestor!=mount->root_dentry && ancestor->parent) ancestor=ancestor->parent;
             if (dentry_acquire(ancestor)) __builtin_trap();
         }
-        result=path_wrap(mount,ancestor,owner);dentry_release(&ancestor);return result;
+        result=path_walk_wrap(mount,ancestor,owner,walk);dentry_release(&ancestor);return result;
     }
     if (((struct kernel_vfs_node *)parent->file.private_data)->unlinked) return -KERNEL_ENOENT;
     for (size_t i=0;i<name_length;i++) if (name[i]=='/' || !name[i]) return -KERNEL_EINVAL;
@@ -2247,7 +2264,7 @@ static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
         result=register_path(&entry);if (result) return result;
     }
 Found:
-    result=path_wrap(mount,entry,owner);dentry_release(&entry);
+    result=path_walk_wrap(mount,entry,owner,walk);dentry_release(&entry);
     if (!result) {result=enter_mounts(owner,walk ? walk->resolve : 0);if (result) (void)kernel_vfs_path_release(owner);}
     return result;
 }
@@ -2303,6 +2320,7 @@ static int resolve_object(struct kernel_vfs_path *start,
                           char missing_name[256], struct vfs_path_walk *walk)
 {
     struct kernel_vfs_path *current;
+    struct kernel_vfs_path components[2]={0};
     struct kernel_vfs_instance *adapter;
     char *work = 0;
     const char *pending=path;
@@ -2369,7 +2387,15 @@ static int resolve_object(struct kernel_vfs_path *start,
             if (!result) result = kernel_vfs_path_acquire(root);
             if (!result) next = root;
         } else {
-            result = path_lookup_locked_mode(current,pending+begin,component_length,&next,1,walk);
+            walk->component=NULL;
+            if (suffix && !trailing_only) {
+                for (unsigned i=0;i<2;i++) if (!components[i].references) {
+                    walk->component=&components[i];break;
+                }
+                if (!walk->component) __builtin_trap();
+            }
+            result=path_lookup_locked_mode(current,pending+begin,component_length,&next,1,walk);
+            walk->component=NULL;
         }
         if (result == -KERNEL_ENOENT && allow_missing_final &&
             (!suffix || (allow_missing_trailing && trailing_only)) &&
@@ -2504,6 +2530,12 @@ static int resolve_object(struct kernel_vfs_path *start,
     *owner = current;
     current = 0;
 Finish:
+    if (!result && *owner && (*owner)->transient) {
+        struct kernel_vfs_path *accepted=NULL;
+        result=path_wrap((*owner)->file.mount,(*owner)->dentry,&accepted);
+        if (kernel_vfs_path_release(owner)) __builtin_trap();
+        if (!result) *owner=accepted;
+    }
     if (!result && *owner && (walk->mount!=(*owner)->file.mount || !walk->guard.lock)) {
         result=path_walk_select(walk,*owner);
         if (result && kernel_vfs_path_release(owner)) __builtin_trap();
@@ -2644,6 +2676,34 @@ static void dentry_release(struct kernel_vfs_dentry **owner)
         kernel_heap_release(entry->heap,entry);entry=parent;
     }
 }
+/* State protection owns these ref transitions and persistent publication. */
+static void path_bind(struct kernel_vfs_path *path,struct kernel_vfs_mount *mount,
+    struct kernel_vfs_dentry *entry,int transient)
+{
+    if (mount->references==UINT32_MAX || dentry_acquire(entry)) __builtin_trap();
+    mount->references++;
+    *path=(struct kernel_vfs_path){.file=entry->file,
+        .heap=((struct kernel_vfs_instance *)mount->private_data)->heap,
+        .dentry=entry,.references=1,.transient=transient};
+    path->file.mount=mount;path->file.location_owner=0;
+}
+static int path_walk_wrap(struct kernel_vfs_mount *mount,struct kernel_vfs_dentry *entry,
+    struct kernel_vfs_path **owner,struct vfs_path_walk *walk)
+{
+    if (!walk || !walk->component || (entry->file.mode&KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFDIR)
+        return path_wrap(mount,entry,owner);
+    KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+    if (mount->root_path && (mount->root_path->references&VFS_PATH_CLOSING)) return -KERNEL_EBUSY;
+    struct kernel_vfs_path *existing=find_location(mount,entry);
+    if (existing) {
+        int result=kernel_vfs_path_acquire(existing);
+        if (!result) *owner=existing;
+        return result;
+    }
+    if (walk->component->references) __builtin_trap();
+    path_bind(walk->component,mount,entry,1);*owner=walk->component;
+    return 0;
+}
 static int path_wrap(struct kernel_vfs_mount *mount,struct kernel_vfs_dentry *entry,struct kernel_vfs_path **owner)
 {
     struct kernel_vfs_instance *instance=mount->private_data;
@@ -2663,10 +2723,7 @@ static int path_wrap(struct kernel_vfs_mount *mount,struct kernel_vfs_dentry *en
         if(mount->root_path && (__atomic_load_n(&mount->root_path->references,__ATOMIC_ACQUIRE)&VFS_PATH_CLOSING))result=-KERNEL_EBUSY;
         else if (existing) result=kernel_vfs_path_acquire(existing);
         else {
-            if (mount->references==UINT32_MAX || dentry_acquire(entry)) __builtin_trap();
-            mount->references++;
-            path->file=entry->file;path->file.mount=mount;path->file.location_owner=0;
-            path->heap=instance->heap;path->dentry=entry;path->references=1;
+            path_bind(path,mount,entry,0);
             path->next=mount->paths;path->previous=&mount->paths;
             if (path->next) path->next->previous=&path->next;
             mount->paths=path;mount->path_index=location_index_insert(mount->path_index,path);
@@ -2756,14 +2813,18 @@ int kernel_vfs_path_release(struct kernel_vfs_path **owner)
         KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
         if (!path->references) __builtin_trap();
         if (__atomic_fetch_sub(&path->references,1,__ATOMIC_ACQ_REL)!=1) return 0;
-        path->file.mount->path_index=location_index_remove(path->file.mount->path_index,path);
-        *path->previous=path->next;
-        if (path->next) path->next->previous=path->previous;
+        if (!path->transient) {
+            path->file.mount->path_index=location_index_remove(path->file.mount->path_index,path);
+            *path->previous=path->next;
+            if (path->next) path->next->previous=path->previous;
+        }
     }
     struct kernel_vfs_mount *mount=path->file.mount;
     KERNEL_SERVICE_SCOPE_IF(service,kernel_vfs_namespace_requires_cpu0(mount));
     struct kernel_vfs_dentry *entry=path->dentry;
-    dentry_release(&entry);kernel_heap_release(path->heap,path);mount_put(mount);return 0;
+    dentry_release(&entry);
+    if (!path->transient) kernel_heap_release(path->heap,path);
+    (void)mount_put(mount);return 0;
 }
 
 struct kernel_vfs_mount *kernel_vfs_path_mount(

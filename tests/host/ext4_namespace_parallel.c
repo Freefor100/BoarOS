@@ -9,11 +9,24 @@
 #include <kernel/credentials.h>
 #include <stdlib.h>
 
-static unsigned stat_lookup_watch,stat_lookup_reads,stat_lookup_opens,stat_lookup_io_locks;
+static unsigned stat_lookup_watch,stat_lookup_reads,stat_lookup_opens,stat_lookup_io_locks,stat_lookup_allocations;
+static struct kernel_rwlock *removed_directory_lock;
+static unsigned removed_entered,removed_continue;
+static _Thread_local int removed_walker;
+enum kernel_heap_status __real_kernel_heap_allocate_zeroed(struct kernel_heap *,size_t,size_t,void **);
+enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *heap,size_t n,size_t size,void **out)
+{
+    if (stat_lookup_watch)stat_lookup_allocations++;
+    return __real_kernel_heap_allocate_zeroed(heap,n,size,out);
+}
 void __real_kernel_rwlock_read(struct kernel_rwlock *,struct kernel_lock_guard *);
 void __wrap_kernel_rwlock_read(struct kernel_rwlock *lock,struct kernel_lock_guard *guard)
 {
     if (stat_lookup_watch && lock->rank==30) stat_lookup_io_locks++;
+    if (removed_walker && lock==removed_directory_lock) {
+        removed_walker=0;__atomic_store_n(&removed_entered,1,__ATOMIC_RELEASE);
+        while (!__atomic_load_n(&removed_continue,__ATOMIC_ACQUIRE))sched_yield();
+    }
     __real_kernel_rwlock_read(lock,guard);
 }
 int __real_ext4_fs_get_inode_ref_read(struct ext4_fs *,uint32_t,struct ext4_inode_ref *);
@@ -37,7 +50,7 @@ static void directory_reuse_case(struct kernel_vfs_path *root)
     assert(!kernel_vfs_create_at(root,root,"reuse-parent/child/file",0600,&f,0));
     assert(!kernel_vfs_close(&f));
     assert(!kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&before));
-    stat_lookup_watch=1;stat_lookup_reads=stat_lookup_opens=stat_lookup_io_locks=0;
+    stat_lookup_watch=1;stat_lookup_reads=stat_lookup_opens=stat_lookup_io_locks=stat_lookup_allocations=0;
     for(unsigned i=0;i<32;i++) {
         assert(!kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&after));
         assert(after.ino==before.ino && after.mode==before.mode);
@@ -46,6 +59,8 @@ static void directory_reuse_case(struct kernel_vfs_path *root)
     printf("directory reuse: inode reads=%u opens=%u inode I/O locks=%u\n",stat_lookup_reads,stat_lookup_opens,stat_lookup_io_locks);
     assert(!stat_lookup_opens && !stat_lookup_reads);
     assert(stat_lookup_io_locks==32);
+    printf("path query zeroed allocations=%u\n",stat_lookup_allocations);
+    assert(stat_lookup_allocations<=32);
     struct kernel_credentials *lower=kernel_credentials_clone(instance->heap,kernel_credentials_current());
     assert(lower);lower->fsuid=70001;lower->fsgid=70001;lower->effective=0;
     const struct kernel_credentials *previous=kernel_credentials_override(lower);
@@ -148,6 +163,35 @@ static void inode_attribute_lifecycle(struct lwext4_mount_adapter *adapter,struc
     assert(!kernel_vfs_fstat(&file,&stat) && !stat.nlink);
     assert(!kernel_vfs_path_release(&path) && !kernel_vfs_close(&file));
     puts("PASS live inode attributes: chmod/chown, link/unlink, delayed/allocated blocks, truncate and unlinked FD");
+}
+
+struct removed_walk { struct kernel_vfs_path *root;uint64_t inode; };
+static void *walk_removed_directory(void *argument)
+{
+    struct removed_walk *test=argument;struct kernel_vfs_path *found=NULL;
+    mm_test_attach(7);mm_test_activate_task();kernel_cpu_current()->logical_id=1;
+    removed_walker=1;
+    assert(!kernel_vfs_path_resolve(test->root,test->root,"walk-removed/../walk-stable",1,&found));
+    assert(kernel_vfs_path_inode(found)==test->inode && !kernel_vfs_path_release(&found));
+    mm_test_finish();return NULL;
+}
+static void removed_directory_qualification(struct kernel_vfs_path *root)
+{
+    struct kernel_vfs_path *directory=NULL;struct kernel_vfs_file file={0};
+    assert(!kernel_vfs_mkdir_at(root,root,"walk-removed",0700,0));
+    assert(!kernel_vfs_path_resolve(root,root,"walk-removed",1,&directory));
+    removed_directory_lock=&((struct kernel_vfs_node *)directory->file.private_data)->namespace_lock;
+    assert(!kernel_vfs_path_release(&directory));
+    assert(!kernel_vfs_create_at(root,root,"walk-stable",0600,&file,0));
+    struct removed_walk test={root,kernel_vfs_file_inode(&file)};
+    assert(!kernel_vfs_close(&file));removed_entered=removed_continue=0;
+    pthread_t walking;assert(!pthread_create(&walking,NULL,walk_removed_directory,&test));
+    while (!__atomic_load_n(&removed_entered,__ATOMIC_ACQUIRE))sched_yield();
+    assert(!kernel_vfs_unlink_at(root,root,"walk-removed",1));
+    __atomic_store_n(&removed_continue,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(walking,NULL) && !kernel_vfs_unlink_at(root,root,"walk-stable",0));
+    removed_directory_lock=NULL;
+    puts("PASS removed intermediate directory: last dentry close follows namespace qualification return");
 }
 
 struct parallel_actor {
@@ -549,7 +593,7 @@ int main(int argc,char **argv)
     struct kernel_vfs_path *root=NULL,*directories[65]={0};
     assert(!kernel_vfs_path_root(&mount,&heap,&root));
     if (getenv("EXT4_NAMESPACE_REUSE_ONLY")) {
-        directory_reuse_case(root);lookup_attributes_case(root);inode_attribute_lifecycle(adapter,root);
+        directory_reuse_case(root);removed_directory_qualification(root);lookup_attributes_case(root);inode_attribute_lifecycle(adapter,root);
         rename_order_case(adapter,root);rename_order_directory_case(adapter,root);
         rename_inode_case(adapter,root);goto Finish;}
     lookup_attributes_case(root);

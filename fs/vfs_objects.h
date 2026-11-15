@@ -126,6 +126,7 @@ struct kernel_vfs_path {
     uint8_t index_height;
     struct kernel_vfs_mount *mounted_here;
     uint32_t references;
+    uint8_t transient; /* Resolver-owned component storage, never published. */
 };
 
 struct kernel_vfs_rename_result {
