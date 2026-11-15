@@ -359,3 +359,17 @@ rewind 重新遍历挂载时仍使用该根。BoarOS 当前沿生成文件机制
 本批实际验收由真实分配耗尽、只读／可写缓存、无设备I/O回收及lazy-detach交错覆盖。
 源码副本、命令和两个线程回溯在主工作区`build/host/namespace-metadata-review/`，
 直接验证记录在`build/host/cache-metadata-review/validation.txt`。
+
+
+### 本地orphan fixture把日志排空等同于脏页写回（2026-11-15）
+
+`tests/host/ext4_namespace_parallel_orphan.h` 的 `orphan_normal_order_case`
+在 `kernel_vfs_pwrite` 后只调用 `ext4_journal_group_drain`，随后要求磁盘inode已有
+allocated blocks。当前普通写首先进入页缓存和delalloc，日志排空并不负责将这些脏页
+写入后端，因而第20行断言可在没有分配磁盘块时失败。这是自有fixture未建立检查前提，
+不属于官方盘输入；没有以放宽断言或伪造blocks掩盖。
+
+本批未将这份全量orphan用例记为通过，也未扩展成整套回归。直接属性生命周期用例显式
+完成页缓存写回，再排空日志，分别核对延迟预留、实际分配及truncate后的blocks，已通过。
+原失败保留于主工作区 `build/stat-read-round/stat-red.log`；旧fixture后续应通过其实际
+写回入口建立已分配状态，再继续原有orphan及资源归还检查。
