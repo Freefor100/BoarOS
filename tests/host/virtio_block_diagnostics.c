@@ -660,9 +660,10 @@ static void queue_reuse_case(unsigned version)
     printf("PASS block queue reuse transport=%u: 65544 requests, reversed completions, index wrap\n", version);
 }
 
-/* A valid backing-file sync can take several seconds. Independently advance
- * the device clock, then complete successfully; no wall-clock sleep or retry. */
-static void slow_completion_case(unsigned version, unsigned type)
+/* Advance device time independently of the caller. A late FLUSH must keep its
+ * original DMA request and report its eventual result, without reissuing it. */
+static void slow_completion_case(unsigned version, unsigned type,
+                                 uint64_t completion_time, enum fault_kind kind)
 {
     struct riscv_virtio_mmio_block device = {0};
     struct physical_page_allocator allocator = {0};
@@ -675,9 +676,9 @@ static void slow_completion_case(unsigned version, unsigned type)
     registers[0x34 / 4] = 32;
     registers[0x100 / 4] = 16;
     clock_value = 0;
-    complete_at = 2500;
+    complete_at = completion_time;
     injected = 0;
-    fault = NORMAL;
+    fault = kind;
     diagnostic_length = 0;
     diagnostic[0] = 0;
     assert(initialize_model(&device, registers, sizeof(registers),
@@ -685,13 +686,22 @@ static void slow_completion_case(unsigned version, unsigned type)
     enum kernel_block_status status = type == 4 ? device.block.flush(device.block.context) :
         type == 1 ? device.block.write(device.block.context, 0, buffer, sizeof(buffer)) :
                     device.block.read(device.block.context, 0, buffer, sizeof(buffer));
-    assert(status == KERNEL_BLOCK_STATUS_OK);
-    assert(clock_value >= 2500 && !device.statistics.timeouts && !diagnostic_length);
+    assert(status == (kind == DEVICE_IO ? KERNEL_BLOCK_STATUS_IO :
+        kind == DEVICE_UNSUPPORTED ? KERNEL_BLOCK_STATUS_UNSUPPORTED : KERNEL_BLOCK_STATUS_OK));
+    assert(clock_value >= completion_time && !device.statistics.timeouts);
+    if (completion_time > device.timeout_ticks) {
+        assert(type == VIRTIO_BLOCK_REQUEST_FLUSH);
+        assert(strstr(diagnostic, "FLUSH still pending") != NULL);
+        assert(strstr(diagnostic, "resetting device") == NULL);
+    } else assert(!diagnostic_length);
+    /* The model also rejects an available index other than one at completion. */
+    assert(device.queue.next_available == 1 && injected);
     assert(device_live(&device) && !device.active && !device.queue.inflight);
     assert(destroy_model(&device) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
     assert(allocations == releases);
     complete_at = 0;
-    printf("PASS block slow completion transport=%u type=%u: 2.5 seconds, no false timeout\n", version, type);
+    printf("PASS block slow completion transport=%u type=%u: %llu ticks, result=%u, one request, no reset\n",
+        version, type, (unsigned long long)completion_time, status);
 }
 
 struct read_observation {
@@ -1388,11 +1398,17 @@ int main(int argc, char **argv)
             for (unsigned mode = 0; mode < 7; mode++) read_batch_case(version, mode);
         return 0;
     }
+    if (argc == 2 && !strcmp(argv[1], "flush-late")) {
+        for (unsigned version = 1; version <= 2; version++)
+            for (enum fault_kind kind = NORMAL; kind <= DEVICE_UNSUPPORTED; kind++)
+                slow_completion_case(version, 4, 95000, kind);
+        return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "slow")) {
         for (unsigned version = 1; version <= 2; version++) {
-            slow_completion_case(version, 0);
-            slow_completion_case(version, 1);
-            slow_completion_case(version, 4);
+            slow_completion_case(version, 0, 2500, NORMAL);
+            slow_completion_case(version, 1, 2500, NORMAL);
+            slow_completion_case(version, 4, 2500, NORMAL);
         }
         return 0;
     }
@@ -1431,9 +1447,11 @@ int main(int argc, char **argv)
             sg_batch_case(version, 4, writing, 0, 0);
             sg_batch_case(version, 8, writing, 0, 0);
         }
-        slow_completion_case(version, 0);
-        slow_completion_case(version, 1);
-        slow_completion_case(version, 4);
+        slow_completion_case(version, 0, 2500, NORMAL);
+        slow_completion_case(version, 1, 2500, NORMAL);
+        slow_completion_case(version, 4, 2500, NORMAL);
+        for (enum fault_kind kind = NORMAL; kind <= DEVICE_UNSUPPORTED; kind++)
+            slow_completion_case(version, 4, 95000, kind);
         queue_reuse_case(version);
         completed_before_park_case(version, 0);
         completed_before_park_case(version, 1);

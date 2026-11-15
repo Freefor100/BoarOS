@@ -90,7 +90,7 @@ flush仍同步实际后备对象，解绑与自动清理沿设备使用者和在
 
 reset 停止 DMA 的依据是固定 `references/qemu/hw/virtio/virtio-mmio.c` 的 `virtio_mmio_soft_reset()`/STATUS 写入路径，以及 `references/qemu/hw/block/virtio-blk.c` 的 `virtio_blk_reset()` 中 `blk_drain()`；版本为 v11.1.0，commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`。
 
-扇区对齐且位于 direct map 的目标缓冲区直接作为 DMA 地址，连续多扇区合并成一个请求；写入请求使用 `VIRTIO_BLOCK_REQUEST_OUT` 且数据描述符不设 `VIRTQ_DESC_WRITE`。非整扇区写入通过 bounce buffer 执行读-改-写（Read-Modify-Write）：先读出包含该范围的完整扇区，将修改字节合并到 bounce buffer，再将该扇区写回磁盘。启动阶段显式轮询；生产调度启用后，PLIC IRQ 先确认设备中断，再读取 used ring 并唤醒任务，使确认期间的新完成保留通知。轮询和期限唤醒都先收割已发布完成，再判定请求超时；期限唤醒只做一次收割，运行期不连续轮询。单次和批量调用在等待前都先收割 used；登记等待期间若发现 DMA 已完成而 IRQ 尚未处理，也经同一完成校验路径更新 request 状态，再决定是否 park。设备已完成的调用不增加 sleeps；没有新完成时仍阻塞，不建立运行期轮询。运行期满槽和设备等待均不可中断地睡眠，idle/IRQ 提交会 fatal，不能退回忙等。超时采用 DTB timebase 的30秒有限期限，从请求发布时计算，先停止提交并 reset，确认 DMA 停止后统一完成未完成请求；设备保持失败态，不自动重试写。IRQ 与超时在同一短关中断区仲裁，完成、唤醒和槽归还各一次。期限用于识别停滞，不是正常I/O延迟上限；合法FLUSH可能等待宿主整个后备文件落盘，一秒会误判。固定Linux v7.2的 `references/linux/block/blk-mq.c` 同样采用30秒默认块队列期限；BoarOS仍在超时后冻结设备，不承诺Linux的恢复策略。
+扇区对齐且位于 direct map 的目标缓冲区直接作为 DMA 地址，连续多扇区合并成一个请求；写入请求使用 `VIRTIO_BLOCK_REQUEST_OUT` 且数据描述符不设 `VIRTQ_DESC_WRITE`。非整扇区写入通过 bounce buffer 执行读-改-写（Read-Modify-Write）：先读出包含该范围的完整扇区，将修改字节合并到 bounce buffer，再将该扇区写回磁盘。启动阶段显式轮询；生产调度启用后，PLIC IRQ 先确认设备中断，再读取 used ring 并唤醒任务，使确认期间的新完成保留通知。轮询和期限唤醒都先收割已发布完成，再判定请求超时；期限唤醒只做一次收割，运行期不连续轮询。单次和批量调用在等待前都先收割 used；登记等待期间若发现 DMA 已完成而 IRQ 尚未处理，也经同一完成校验路径更新 request 状态，再决定是否 park。设备已完成的调用不增加 sleeps；没有新完成时仍阻塞，不建立运行期轮询。运行期满槽和设备等待均不可中断地睡眠，idle/IRQ 提交会 fatal，不能退回忙等。普通读写从请求发布起使用 DTB timebase 的30秒期限；到期仍无完成时停止提交并 reset，确认 DMA 停止后统一完成未完成请求，设备保持失败态，不自动重试写。FLUSH 则每30秒检查一次：仍未完成时输出等待提示并延长检查期限，保持同一个已发布请求、DMA owner 和软件屏障，直到设备返回真实结果；不重复发送、不复位、不将等待当作持久化成功。后备文件同步没有固定完成上限，永久不响应的 FLUSH 也会持续等待，提示用于区分这类停滞。设备返回 IOERR 或 UNSUPP 仍交付对应错误。IRQ 与期限检查在同一元数据保护内仲裁，完成、唤醒和槽归还各一次。固定 Linux 的 `references/linux/block/blk-mq.c` 在驱动未提供 timeout 回调时重新启动请求计时器；`references/linux/drivers/block/virtio_blk.c` 未注册该回调，因此不能将其默认30秒期限解释为到期立即复位。
 
 完成通知与资源归还分开：每个请求或批次等待自己的完成队列；DMA 完成只归还描述符并通知完成 owner，请求结果消费后才归还请求槽。普通调用入场、flush 等待逻辑调用排空、描述符、请求槽和批量工作区分别等待对应条件。只有 active 降到零才通知 flush，屏障结束后才放行普通调用。仍有在途请求又需要补发的批次，同时登记自己的完成和缺少的资源，不等无关的设备广播。故障确认 reset 后通知所有终止条件，也通知同轮先完成但尚未消费的 owner。
 
@@ -102,7 +102,7 @@ PLIC 路由由 `dtb_read_irq_info()` 根据 CPU interrupt-controller phandle、�
 
 完成队列的冷路径诊断在 reset 前输出 `block queue fault`：used 快照与消费差值超过槽容量为 `used-overflow`；完成项的描述符 head 超出队列范围、指向数据/status 描述符为 `used-element`；legacy 的零长度完成同样被拒绝；指向未发布 head、重复 head 或非 submitted 请求为 `slot-state`；设备 status 超出 OK/IOERR/UNSUPP 为 `device-status`。输出包含 transport context/device status、中断快照、transport、队列虚拟/物理地址及容量，used、consumed、avail、入口观察到的完成数，逻辑调用/在途数和 reserved/published/complete 槽数；每个固定槽记录 state、owner/completion 指针值、status、type、字节数、扇区与期限。只读取驱动持有的 transport、队列和最多八个固定槽，不追 owner/completion 或设备提供的描述符地址，不分配、不增加重试。used 是触发校验的快照，consumed 包含已经取出的非法项，avail/status 是打印期间的标量；它不是跨 DMA 的原子快照。modern IN 只有 used length 覆盖全部数据和末尾 status、且 status 成功时才交付数据；零长和其他短完成直接使该请求返回 I/O 错误，不读取未覆盖的 status，不补零，也不因此复位整台设备。合法 used 已结束本次 DMA，完成 owner 照常归还，后续请求仍可执行。legacy 保留现有长度兼容范围。正常完成、短完成和普通 IOERR/UNSUPP 不输出这段诊断，其他损坏的 reset 与 owner 回收契约不变。重复完成若发生在本次合法完成已收割之后，设备仍失败，但不会覆写已完成请求的真实结果。
 
-纯超时也在reset前输出同一快照，原因为`timeout`，不附带不存在的非法完成项。
+普通读写的纯超时也在reset前输出同一快照，原因为`timeout`，不附带不存在的非法完成项。
 这覆盖设备停止推进、used仍然合法的路径：固定QEMU的`virtio_error()`会将设备置为
 broken，legacy又不会发布modern的NEEDS_RESET状态，原先只有一行超时信息就reset会
 丢掉关键现场。新增输出仍返回TIMEOUT，且reset确认之前保留所有DMA owner；它用于
