@@ -66,6 +66,7 @@
 #include <ext4_extent.h>
 
 #include <string.h>
+#include <stdlib.h>
 
 int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 		 bool read_only)
@@ -86,6 +87,8 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
     fs->inode_observer = NULL;
 	fs->jbd_fs = NULL;
 	fs->orphan_index = NULL;
+	fs->inode_table_starts = NULL;
+	fs->inode_table_groups = 0;
 	RB_INIT(&fs->inode_goals);
 	TAILQ_INIT(&fs->pending_inode_goals);
 	fs->super_replay_required = false;
@@ -164,6 +167,32 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 	return r;
 }
 
+void ext4_fs_prepare_inode_locations(struct ext4_fs *fs)
+{
+	uint32_t groups = ext4_block_group_cnt(ext4_fs_super(fs));
+	if (fs->inode_table_starts || !groups)
+		return;
+	/* This is an optional acceleration. A failed allocation leaves ordinary
+	 * GDT lookup responsible for every inode, with its original errors. */
+	fs->inode_table_starts = ext4_calloc(groups, sizeof(*fs->inode_table_starts));
+	if (fs->inode_table_starts)
+		fs->inode_table_groups = groups;
+}
+
+void ext4_fs_reset_inode_locations(struct ext4_fs *fs)
+{
+	for (uint32_t i = 0; i < fs->inode_table_groups; i++)
+		__atomic_store_n(&fs->inode_table_starts[i], 0, __ATOMIC_RELEASE);
+}
+
+static void free_inode_locations(struct ext4_fs *fs)
+{
+	ext4_fsblk_t *locations = fs->inode_table_starts;
+	fs->inode_table_starts = NULL;
+	fs->inode_table_groups = 0;
+	ext4_free(locations);
+}
+
 int ext4_fs_fini(struct ext4_fs *fs)
 {
 	ext4_assert(fs);
@@ -171,6 +200,7 @@ int ext4_fs_fini(struct ext4_fs *fs)
 	/* Journal stop commits and checkpoints the final superblock itself. */
 	if (fs->journaled_session || fs->read_only) {
 		ext4_orphan_index_fini(fs);
+		free_inode_locations(fs);
 		return EOK;
 	}
 
@@ -178,7 +208,10 @@ int ext4_fs_fini(struct ext4_fs *fs)
 	ext4_set16(ext4_fs_super(fs), state, EXT4_SUPERBLOCK_STATE_VALID_FS);
 
 	int r = ext4_sb_write(fs->bdev, ext4_fs_super(fs));
-	if (r == EOK) ext4_orphan_index_fini(fs);
+	if (r == EOK) {
+		ext4_orphan_index_fini(fs);
+		free_inode_locations(fs);
+	}
 	return r;
 }
 
@@ -561,7 +594,8 @@ bool ext4_fs_verify_bg_csum(struct ext4_sblock *sb,
 				   struct ext4_bgroup *bg)
 {
 #if CONFIG_META_CSUM_ENABLE
-	if (!ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM))
+	if (!ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM) &&
+	    !ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_GDT_CSUM))
 		return true;
 
 	return ext4_fs_bg_checksum(sb, bgid, bg) == to_le16(bg->checksum);
@@ -622,6 +656,12 @@ static int ext4_fs_get_block_group_ref_mode(struct ext4_fs *fs, uint32_t bgid,
 	COST_PHASE_SCOPE(read_source, 6);
 	if (bgid >= ext4_block_group_cnt(ext4_fs_super(fs)))
 		return EUCLEAN;
+	/* A mutable descriptor can later change without another get. Permanently
+	 * stop reusing this group's fact before exposing its writable bytes; a
+	 * delayed reader can no longer publish over this marker. */
+	if (write && fs->inode_table_starts && bgid < fs->inode_table_groups)
+		(void)__atomic_exchange_n(&fs->inode_table_starts[bgid],
+					  UINT64_MAX, __ATOMIC_ACQ_REL);
 	/* Compute number of descriptors, that fits in one data block */
 	uint32_t block_size = ext4_sb_get_block_size(ext4_fs_super(fs));
 	uint32_t size = ext4_sb_get_desc_size(ext4_fs_super(fs));
@@ -791,6 +831,9 @@ int ext4_fs_put_block_group_ref(struct ext4_block_group_ref *ref)
 {
 	/* Check if reference modified */
 	if (ref->dirty) {
+		if (ref->fs->inode_table_starts && ref->index < ref->fs->inode_table_groups)
+			(void)__atomic_exchange_n(&ref->fs->inode_table_starts[ref->index],
+						  UINT64_MAX, __ATOMIC_ACQ_REL);
 		/* Compute new checksum of block group */
 		uint16_t cs;
 		cs = ext4_fs_bg_checksum(ext4_fs_super(ref->fs), ref->index,
@@ -867,6 +910,46 @@ static bool ext4_fs_verify_inode_csum(struct ext4_inode_ref *inode_ref)
 #define ext4_fs_verify_inode_csum(...) true
 #endif
 
+static int inode_table_start(struct ext4_fs *fs, uint32_t group, ext4_fsblk_t *output)
+{
+	struct ext4_sblock *sb = ext4_fs_super(fs);
+	if (group >= ext4_block_group_cnt(sb))
+		return EUCLEAN;
+	ext4_fsblk_t *fact = fs->inode_table_starts && group < fs->inode_table_groups ?
+		&fs->inode_table_starts[group] : NULL;
+	uint64_t cached = fact ? __atomic_load_n(fact, __ATOMIC_ACQUIRE) : 0;
+	if (cached && cached != UINT64_MAX) {
+		*output = cached;
+		return EOK;
+	}
+	struct ext4_block_group_ref ref;
+	int result = ext4_fs_get_block_group_ref(fs, group, &ref);
+	if (result)
+		return result;
+	uint64_t table = ext4_bg_get_inode_table_first_block(ref.block_group, sb);
+	uint32_t size = ext4_sb_get_block_size(sb), per_group = ext4_get32(sb, inodes_per_group);
+	uint64_t table_bytes = (uint64_t)per_group * ext4_get16(sb, inode_size);
+	uint64_t total = ext4_sb_get_blocks_cnt(sb), low = ext4_get32(sb, first_data_block), high = total;
+	if (!ext4_sb_feature_incom(sb, EXT4_FINCOM_FLEX_BG)) {
+		low += (uint64_t)group * ext4_get32(sb, blocks_per_group);
+		if (total - low > ext4_get32(sb, blocks_per_group))
+			high = low + ext4_get32(sb, blocks_per_group);
+	}
+	if (!table || table < low || table >= high || table_bytes % size || table_bytes / size > high - table)
+		result = EUCLEAN;
+	int release = ext4_fs_put_block_group_ref(&ref);
+	if (result || release)
+		return result ? result : release;
+	if (fact && cached != UINT64_MAX) {
+		uint64_t expected = 0;
+		if (!__atomic_compare_exchange_n(fact, &expected, table, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) &&
+		    expected != table && expected != UINT64_MAX)
+			return EUCLEAN;
+	}
+	*output = table;
+	return EOK;
+}
+
 static int
 __ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 			struct ext4_inode_ref *ref,
@@ -886,23 +969,10 @@ __ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 	uint32_t block_group = index / inodes_per_group;
 	uint32_t offset_in_group = index % inodes_per_group;
 
-	/* Load block group, where i-node is located */
-	struct ext4_block_group_ref bg_ref;
-
-	int rc = ext4_fs_get_block_group_ref(fs, block_group, &bg_ref);
-	if (rc != EOK) {
+	ext4_fsblk_t table_start;
+	int rc = inode_table_start(fs, block_group, &table_start);
+	if (rc != EOK)
 		return rc;
-	}
-
-	/* Load block address, where i-node table is located */
-	ext4_fsblk_t inode_table_start =
-	    ext4_bg_get_inode_table_first_block(bg_ref.block_group, ext4_fs_super(fs));
-
-	/* Put back block group reference (not needed more) */
-	rc = ext4_fs_put_block_group_ref(&bg_ref);
-	if (rc != EOK) {
-		return rc;
-	}
 
 	/* Compute position of i-node in the block group */
 	uint16_t inode_size = ext4_get16(ext4_fs_super(fs), inode_size);
@@ -911,7 +981,7 @@ __ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 
 	/* Compute block address */
 	ext4_fsblk_t block_id =
-	    inode_table_start + (byte_offset_in_group / block_size);
+	    table_start + (byte_offset_in_group / block_size);
 
 	uint32_t offset_in_block = byte_offset_in_group % block_size;
 	if (write && initialized && ext4_current_trans(fs)) {

@@ -1186,6 +1186,9 @@ int ext4_mount(const char *dev_name, const char *mount_point,
 	}
 
 	bd->fs = &mp->fs;
+	/* Binding is complete; optional geometry storage adds no failed-mount
+	 * owner. Inode data and mutable descriptors still use the normal cache. */
+	ext4_fs_prepare_inode_locations(&mp->fs);
 	{ KERNEL_TASK_LOCK_SCOPE(index, &mount_index_lock); mp->mounted = 1; }
 	return r;
 }
@@ -1376,6 +1379,8 @@ static int __ext4_recover(const char *mount_point)
 		mp->fs.jbd_fs = jbd_fs;
 		mp->journal_stopped = true;
 		r = jbd_recover(jbd_fs);
+		/* Replay may have restored only a prefix before reporting an error. */
+		ext4_fs_reset_inode_locations(&mp->fs);
 		int cleanup = jbd_put_fs(jbd_fs);
 		if (cleanup == EOK) {
 			mp->fs.jbd_fs = NULL;
