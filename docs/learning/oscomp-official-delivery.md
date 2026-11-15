@@ -1480,3 +1480,12 @@ RV UP glibc、RV8 musl及LA UP glibc向量消费者通过；RV最小内核栈余
 | Linux同ELF | 1.635 | 1.163 | 0.609 | 15.225 | 9.998 | 3.695 |
 
 该单组链接器墙钟/sys为−1.01%/−2.12%，Cargo为−1.90%/−3.18%，只报告观察值，不宣布独立稳定加速。最后Cargo sys为同组Linux的1.57倍，链接器为2.35倍，差距仍在。三份运行盘再次只读检查通过，链接ELF保持原SHA256；位置复用版heap-live=0、最小内核栈余量1032字节，堆峰值9613页，前一完成版9619页，不把这个小差值解释为稳定内存收益。默认RV/LA交付构建通过，通用提交单向合入兼容分支 `9a9a6137`，两份既有脚本修改保持原哈希。按本次要求完成这项修复后停止，未追加新的定位方向或性能批次。
+
+
+## 2026-11-15：比赛提交的离线构建依赖
+
+main `16014248` 的宿主 BTF 编码工具构建经 `cd55d688` 单向合入兼容分支。使用该提交的纯 Git archive，重新建立没有 build 缓存的源码目录；在固定官方容器 `zhouzhouyi/os-contest@sha256:85dec949df7cef41fd03d30c6ad69f952204540e18d2c62bced9d2e262fef12d` 内断网执行原命令 `make all`，返回0。实际生成 RV64／LA64 ELF、`disk.img` 和 `disk-la.img`，没有借用本机 pahole、libdw/libelf 开发文件或本机脚本改动。BTF 仍从真实内核生成，构建机制见[BPF说明](../modules/kernel-bpf.md#构建与检查)。
+
+此次只核对比赛冷构建、产物和默认启动配置，未重跑整套测例。两架构生成的 PID1 配置均包含 LTP 组和 `BOAROS_LTP_CASE_TIMEOUT=300`，通过盘内 hook 接入客户机监督程序；单项300秒后TERM、宽限2秒后KILL，超时返回124继续原遍历。它不依赖宿主 `run.py`，也不替代评测平台的整机总时限。跳过表、原判分和两份既有本机脚本修改保持不变。
+
+原命令、源码/内核身份、构建输出及配置核对保存在主工作区 `build/pahole-port/official-submit-result.json` 和 `official-make.log`。这项成功对应公开 Harness 指定的20260510容器，不据此冒称已在旧README列出的QEMU9.2.1平台重跑。
