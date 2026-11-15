@@ -67,7 +67,7 @@ LA_BTF_OBJECT := $(LA_BUILD)/btf/vmlinux.o
 $(LA_BTF_BASE): $(LA_OBJECTS) arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config
 	@mkdir -p $(dir $@)
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections -o $@ $(LA_OBJECTS) -lgcc
-$(LA_BTF_DATA): $(LA_BTF_BASE)
+$(LA_BTF_DATA): $(LA_BTF_BASE) $(PAHOLE_DEP)
 	@rm -f $@.tmp
 	$(PAHOLE) --btf_encode_detached=$@.tmp $<
 	@test -s $@.tmp

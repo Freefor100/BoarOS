@@ -28,8 +28,19 @@ static void check(const uint32_t *records,size_t n,int valid)
     assert(!allocations);
 }
 #define CHECK(a,v) check(a,sizeof(a)/4,v)
-int main(void)
+int main(int argc,char **argv)
 {
+    for(int i=1;i<argc;i++) {
+        FILE *stream=fopen(argv[i],"rb");assert(stream);
+        assert(!fseek(stream,0,SEEK_END));long length=ftell(stream);
+        assert(length>0 && (uint64_t)length<=UINT32_MAX && !fseek(stream,0,SEEK_SET));
+        unsigned char *file=malloc((size_t)length);assert(file);
+        assert(fread(file,1,(size_t)length,stream)==(size_t)length && !fclose(stream));
+        struct bpf_btf *parsed=0;
+        assert(!bpf_btf_parse(0,file,(uint32_t)length,&parsed) && parsed);
+        bpf_object_put(&parsed->object);assert(!allocations);
+        printf("PASS generated BTF: %s (%ld bytes), actual parser and owner return\n",argv[i],length);
+    }
     const uint32_t integer[]={1,1U<<24,4,32};CHECK(integer,1);
     uint32_t truncated[]={1,1U<<24,4};CHECK(truncated,0);
     uint32_t badref[]={0,2U<<24,2};CHECK(badref,0);

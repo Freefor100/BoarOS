@@ -1,4 +1,7 @@
 # kind	path	url	remote-ref	commit-or-sha256
+# Host-only BTF encoder; unmodified archives are shipped in third_party/sources for offline builds.
+file	pahole/dwarves-1.28.tar.xz	https://fedorapeople.org/~acme/dwarves/dwarves-1.28.tar.xz	-	a4c1a3c16c7d41f27eba8323e05b59fe33581832d5c50ef8390fa102d75a16e3
+file	pahole/elfutils-0.192.tar.bz2	https://sourceware.org/elfutils/ftp/0.192/elfutils-0.192.tar.bz2	-	616099beae24aba11f9b63d86ca6cc8d566d968b802391334c91df54eab416b4
 full	os2026	https://gitlab.eduxiji.net/csc1/csc-os/os2026	-	d9a3cf1fbe597f13584988e0597ae9b4e9163ea7
 full	oscomp-testsuits	https://github.com/oscomp/testsuits-for-oskernel.git	-	b5ec6ef8497e1818cbdec3b54bb722f036e57972
 full	oscomp-autotest	https://github.com/oscomp/autotest-for-oskernel.git	-	d1bb3a3c4b27274e196a2648518525c1a304e339

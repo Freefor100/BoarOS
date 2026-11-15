@@ -1,3 +1,5 @@
+.DEFAULT_GOAL := all
+
 CROSS_COMPILE ?= $(shell \
 	if command -v riscv64-unknown-elf-gcc >/dev/null 2>&1; then \
 		printf '%s' riscv64-unknown-elf-; \
@@ -11,7 +13,16 @@ CC := $(CROSS_COMPILE)gcc
 NM := $(CROSS_COMPILE)nm
 OBJDUMP := $(CROSS_COMPILE)objdump
 READELF := $(CROSS_COMPILE)readelf
-PAHOLE ?= pahole
+HOSTCC ?= cc
+ifeq ($(origin PAHOLE),undefined)
+PAHOLE := build/tools/pahole/pahole
+PAHOLE_DEP := $(PAHOLE)
+.PHONY: force-pahole
+force-pahole:
+$(PAHOLE): force-pahole tools/build-pahole.py tools/pahole-elfutils-const.patch references/sources.tsv \
+		third_party/sources/dwarves-1.28.tar.xz third_party/sources/elfutils-0.192.tar.bz2
+	python3 -B tools/build-pahole.py --cc '$(HOSTCC)'
+endif
 QEMU_RISCV64 ?= qemu-system-riscv64
 QEMU_MEMORY ?= 1G
 # CI显式选择共同RAM矩阵；空值保留各聚焦入口原来的默认配置。
@@ -795,7 +806,7 @@ RV_BTF_OBJECT := $(BUILD_DIR)/btf/vmlinux.o
 $(RV_BTF_BASE): $(OBJECTS) arch/riscv/linker.ld $(BUILD_DIR)/generated/link-config
 	@mkdir -p $(dir $@)
 	$(CC) $(LDFLAGS) -o $@ $(OBJECTS)
-$(RV_BTF_DATA): $(RV_BTF_BASE)
+$(RV_BTF_DATA): $(RV_BTF_BASE) $(PAHOLE_DEP)
 	# pahole can report an encoding error with status 0 and no output file.
 	@rm -f $@.tmp
 	$(PAHOLE) --btf_encode_detached=$@.tmp $<

@@ -8,5 +8,5 @@ for shift in ${BPF_HOST_SHIFTS:-12 14}; do
         -ffunction-sections -fdata-sections -Itests/host/mm -Itests/host/sync -idirafter include \
         tests/host/bpf_btf.c kernel/bpf/btf.c ${BPF_HOST_FLAGS:-} \
         -Wl,--gc-sections -o "build/host/bpf/btf-$shift"
-    timeout 30s "build/host/bpf/btf-$shift"
+    timeout 30s "build/host/bpf/btf-$shift" "$@"
 done
