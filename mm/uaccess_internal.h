@@ -12,14 +12,17 @@ static inline enum kernel_mm_status kernel_uaccess_pin_resolved(
     struct kernel_mm_user_pin *pin,unsigned *count)
 {
     COST_ADD(USER_RESOLUTIONS,1);COST_IO_ADD(4,1);
-    enum kernel_mm_status status;
-    for (;;) {
-        status=count?kernel_mm_pin_user_pair(mm,address,second,access,pin,count):
-            kernel_mm_pin_user_page(mm,address,access,pin);
-        if(status!=KERNEL_MM_STATUS_NOT_MAPPED && status!=KERNEL_MM_STATUS_ACCESS)break;
-        status=kernel_mm_resolve_user_fault(mm,address,access);
-        if(status!=KERNEL_MM_STATUS_OK)break;
-        /* fault结束后快照可再次撤W；最终pin必须重新检查实际权限。 */
+    enum kernel_mm_status status=count ? kernel_mm_pin_user_pair(mm,address,second,access,pin,count) :
+        kernel_mm_pin_user_page(mm,address,access,pin);
+    if (status==KERNEL_MM_STATUS_NOT_MAPPED || status==KERNEL_MM_STATUS_ACCESS) {
+        status=kernel_mm_resolve_user_pin(mm,address,access,pin);
+        if (!status && count) {
+            *count=1;
+            enum kernel_mm_status next=kernel_mm_try_pin_user_page(mm,second,access,pin+1);
+            if (!next) *count=2;
+            else if (next!=KERNEL_MM_STATUS_NOT_MAPPED && next!=KERNEL_MM_STATUS_ACCESS &&
+                next!=KERNEL_MM_STATUS_ADDRESS_SPACE && next!=KERNEL_MM_STATUS_CONFLICT) __builtin_trap();
+        }
     }
     if(!status && count){COST_ADD(USER_RESOLUTIONS,1);COST_IO_ADD(4,1);}
     return status;

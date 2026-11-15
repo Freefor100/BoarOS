@@ -37,18 +37,6 @@ enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *h
     return __real_kernel_heap_allocate_zeroed(heap,count,size,out);
 }
 static unsigned disk_gap_capture,disk_gap_ready,disk_gap_resume;
-enum kernel_mm_status __real_kernel_mm_resolve_user_fault(struct kernel_mm *,uint64_t,uint32_t);
-enum kernel_mm_status __wrap_kernel_mm_resolve_user_fault(struct kernel_mm *mm,uint64_t address,uint32_t access)
-{
-    enum kernel_mm_status result=__real_kernel_mm_resolve_user_fault(mm,address,access);
-    if (!result && access==KERNEL_MM_WRITE && kernel_cpu_current()->hardware_id==1 &&
-        __atomic_exchange_n(&disk_gap_capture,0,__ATOMIC_ACQ_REL)) {
-        assert(!kernel_io_context_current()->locks && !kernel_cpu_current()->raw_locks);
-        __atomic_store_n(&disk_gap_ready,1,__ATOMIC_RELEASE);
-        while (!__atomic_load_n(&disk_gap_resume,__ATOMIC_ACQUIRE)) sched_yield();
-    }
-    return result;
-}
 static unsigned disk_truncate_error;
 int __real_ext4_ftruncate(ext4_file *,uint64_t, uint32_t privilege_mode);
 int __wrap_ext4_ftruncate(ext4_file *file,uint64_t size, uint32_t privilege_mode)
@@ -65,6 +53,25 @@ static struct kernel_mm *disk_views[5];
 static uint64_t disk_roots[5],disk_target;
 static unsigned disk_capture,disk_entered[5],disk_resume;
 static enum kernel_uaccess_status disk_results[5];
+void __real_kernel_lock_release(struct kernel_lock_guard *);
+void __wrap_kernel_lock_release(struct kernel_lock_guard *guard)
+{
+    __real_kernel_lock_release(guard);
+    /* Pause after publication releases the real MM gate, before the shared
+     * mapping obtains its final copy loan. No private function boundary is
+     * required: the competing writer must actually be able to enter now. */
+    struct kernel_mm_mapping mapping;
+    if (kernel_cpu_current()->hardware_id==1 &&
+        __atomic_load_n(&disk_gap_capture,__ATOMIC_ACQUIRE) &&
+        !kernel_io_context_current()->locks && !kernel_io_context_current()->user_pins &&
+        !kernel_cpu_current()->raw_locks &&
+        !kernel_mm_lookup(disk_views[1],disk_target,&mapping) && (mapping.permissions&KERNEL_MM_WRITE) &&
+        __atomic_exchange_n(&disk_gap_capture,0,__ATOMIC_ACQ_REL)) {
+        __atomic_store_n(&disk_gap_ready,1,__ATOMIC_RELEASE);
+        while (!__atomic_load_n(&disk_gap_resume,__ATOMIC_ACQUIRE)) sched_yield();
+    }
+}
+
 int __real_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *,uint64_t,int,
     struct kernel_open_file_page_preparation *);
 int __wrap_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *file,uint64_t index,int read_window,
