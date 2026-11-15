@@ -132,13 +132,13 @@ static void observe_metadata_store(void *context, void *owner, uint32_t inode,
     }
     metadata_store(context,owner,inode,field,value);
 }
-int __real_ext4_mount_setup_time_observer(const char *,const struct ext4_time_observer *);
-int __wrap_ext4_mount_setup_time_observer(const char *path,const struct ext4_time_observer *observer)
+int __real_ext4_mount_setup_inode_observer(const char *,const struct ext4_inode_observer *);
+int __wrap_ext4_mount_setup_inode_observer(const char *path,const struct ext4_inode_observer *observer)
 {
-    if (!observer) return __real_ext4_mount_setup_time_observer(path,observer);
-    struct ext4_time_observer observed=*observer;
+    if (!observer) return __real_ext4_mount_setup_inode_observer(path,observer);
+    struct ext4_inode_observer observed=*observer;
     metadata_store=observer->store; observed.store=observe_metadata_store;
-    return __real_ext4_mount_setup_time_observer(path,&observed);
+    return __real_ext4_mount_setup_inode_observer(path,&observed);
 }
 static int observe_metadata_close(struct kernel_vfs_node *node)
 {

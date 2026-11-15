@@ -77,6 +77,7 @@ struct ext4_fs {
 	struct ext4_orphan_index *orphan_index;
 	uint32_t active_operations;
 	const struct ext4_lock *os_locks;
+    const struct ext4_inode_observer *inode_observer;
     struct kernel_raw_lock block_space;
     uint64_t reserved_blocks;
     uint64_t delayed_blocks;

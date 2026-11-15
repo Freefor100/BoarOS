@@ -68,7 +68,7 @@ static int dev_batch(struct ext4_blockdev *d,struct block_read_span *s,unsigned 
 }
 static struct file_read_workspace read_workspace;
 static int read_batch(const ext4_file *f,struct file_read_span *s,unsigned n)
-{return ext4_fpread_batch(f,s,n,n>1?&read_workspace:NULL,UINT64_MAX, file_completion);}
+{return ext4_fpread_batch(f,s,n,n>1?&read_workspace:NULL,UINT64_MAX, file_completion, false);}
 struct held_read {
     const ext4_file *file;
     struct file_read_span spans[2];
@@ -79,7 +79,7 @@ struct held_read {
 static void *read_while_held(void *arg)
 {
     struct held_read *read=arg;hold_current=1;
-    read->result=ext4_fpread_batch(read->file,read->spans,2,&read->workspace,UINT64_MAX, NULL);
+    read->result=ext4_fpread_batch(read->file,read->spans,2,&read->workspace,UINT64_MAX, NULL, false);
     return NULL;
 }
 static unsigned char expected(size_t off){return off<8*4096 || off>=12*4096 ? 1+off/4096:0;}
@@ -154,7 +154,21 @@ int main(int argc,char **argv)
     track_allocations=0;
     printf("steady multi-page read allocation attempts=%u\n",allocation_attempts);
     CHECK(allocation_attempts==0);
-    CHECK(ext4_fpread_batch(&file,spans,8,NULL,UINT64_MAX, NULL)==ENOMEM);
+    /* The cache owns the entire output page, including the EOF tail. A
+     * sector-aligned read can use that capacity without a scratch page. */
+    memset(out,0xcd,sizeof(out));
+    spans[0]=(struct file_read_span){0,out[0],4096,0,0};
+    allocation_attempts=0;track_allocations=2;
+    CHECK(ext4_fpread_batch(&file,spans,1,NULL,123,NULL,true)==EOK);
+    track_allocations=0;
+    CHECK(!allocation_attempts && spans[0].completed==123 && !spans[0].error);
+    for(unsigned i=0;i<123;i++)CHECK(out[0][i]==1);
+    for(unsigned i=512;i<4096;i++)CHECK(out[0][i]==0xcd);
+    spans[0]=(struct file_read_span){0,out[0],4096,0,0};memset(out[0],0xcd,4096);
+    CHECK(ext4_fpread_batch(&file,spans,1,NULL,123,NULL,false)==EOK && spans[0].completed==123);
+    for(unsigned i=123;i<4096;i++)CHECK(out[0][i]==0xcd);
+    puts("cache EOF tail uses final output storage; ordinary read preserves its untouched suffix");
+    CHECK(ext4_fpread_batch(&file,spans,8,NULL,UINT64_MAX, NULL, false)==ENOMEM);
     for(unsigned i=0;i<8;i++)CHECK(spans[i].error==ENOMEM && !spans[i].completed);
     struct file_read_workspace aliased_workspace;
     struct file_read_span endpoint[3]={{65536+123,(void *)(UINTPTR_MAX-7),8,0,0},
@@ -162,14 +176,14 @@ int main(int argc,char **argv)
     CHECK(read_batch(&file,endpoint,2)==EOK && !endpoint[0].completed && !endpoint[1].completed);
     CHECK(read_batch(&file,endpoint,3)==EINVAL && endpoint[2].error==EINVAL);
     struct file_read_span overlap={0,&aliased_workspace,sizeof(aliased_workspace),0,0};
-    CHECK(ext4_fpread_batch(&file,&overlap,1,&aliased_workspace,UINT64_MAX, NULL)==EINVAL);
+    CHECK(ext4_fpread_batch(&file,&overlap,1,&aliased_workspace,UINT64_MAX, NULL, false)==EINVAL);
     union {struct file_read_workspace workspace;struct file_read_span spans[2];} aliased;
     aliased.spans[0]=(struct file_read_span){0,out[0],4096,0,0};
-    CHECK(ext4_fpread_batch(&file,aliased.spans,1,&aliased.workspace,UINT64_MAX, NULL)==EINVAL);
+    CHECK(ext4_fpread_batch(&file,aliased.spans,1,&aliased.workspace,UINT64_MAX, NULL, false)==EINVAL);
     memset(out,0xcd,sizeof(out));
     spans[0]=(struct file_read_span){4090,out[0],4096,0,0};
     spans[1]=(struct file_read_span){8192,out[1],4096,0,0};
-    CHECK(ext4_fpread_batch(&file,spans,2,&read_workspace,4096, NULL)==EOK);
+    CHECK(ext4_fpread_batch(&file,spans,2,&read_workspace,4096, NULL, false)==EOK);
     CHECK(spans[0].size==4096 && spans[0].completed==6 && spans[1].size==4096 && !spans[1].completed);
     for(unsigned i=0;i<4096;i++)CHECK(out[0][i]==(i<6?1:0xcd) && out[1][i]==0xcd);
     for(unsigned i=0;i<8;i++)spans[i]=(struct file_read_span){i*4096,out[i],4096,0,0};

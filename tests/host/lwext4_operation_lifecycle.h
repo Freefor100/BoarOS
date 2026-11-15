@@ -170,8 +170,8 @@ static void lifecycle_admission(struct ext4_fs *fs, ext4_file *file)
     jbd_memory_set_limit(journal, used + minimum - 1);
     CHECK(ext4_transaction_begin("/") == ENOMEM);
     CHECK(!ext4_current_operation(fs) && !fs->active_operations && jbd_memory_used(journal) == used);
-    struct ext4_time_observer observer = {.snapshot = lifecycle_times};
-    CHECK(ext4_mount_setup_time_observer("/", &observer) == EOK);
+    struct ext4_inode_observer observer = {.snapshot = lifecycle_times};
+    CHECK(ext4_mount_setup_inode_observer("/", &observer) == EOK);
     CHECK(ext4_file_writeback_times(file, false) == EAGAIN);
     CHECK(!ext4_current_operation(fs) && !fs->active_operations && jbd_memory_used(journal) == used);
 
@@ -188,7 +188,7 @@ static void lifecycle_admission(struct ext4_fs *fs, ext4_file *file)
     fail_allocation = 0;
     CHECK(!kernel_io_context_current()->ext4_last_memory_reservation_failed);
     CHECK(jbd_memory_budget_failures(journal) == denials && jbd_memory_used(journal) == used);
-    CHECK(ext4_mount_setup_time_observer("/", NULL) == EOK);
+    CHECK(ext4_mount_setup_inode_observer("/", NULL) == EOK);
 
     const struct ext4_timestamp times[3] = {{750, 5}, {760, 6}, {770, 7}};
     CHECK(ext4_file_set_times(file, 7, times) == EOK && journal->running);

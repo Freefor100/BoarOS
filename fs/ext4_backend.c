@@ -482,8 +482,8 @@ static uint64_t time_deadline(struct lwext4_mount_adapter *adapter)
     return adapter->times_deadline;
 }
 
-struct lwext4_staged_time {
-    struct lwext4_staged_time *next;
+struct lwext4_staged_inode {
+    struct lwext4_staged_inode *next;
     struct lwext4_node *node;
     struct jbd_journal *journal;
     struct ext4_timestamp values[3];
@@ -491,51 +491,69 @@ struct lwext4_staged_time {
     unsigned fields;
 };
 
-static void time_stage(void *context, void *owner, uint32_t inode, unsigned field,
-                       struct ext4_timestamp value)
+static struct lwext4_staged_inode *stage_inode(struct lwext4_mount_adapter *adapter,
+    void *owner,uint32_t inode)
 {
-    struct lwext4_mount_adapter *adapter = context;
-    struct ext4_operation *operation = ext4_current_operation(adapter->device.fs);
-    struct kernel_vfs_node *pin = owner ? 0 : kernel_vfs_node_pin(&adapter->instance, inode);
-    struct kernel_vfs_node *base = owner ? owner : pin;
+    struct ext4_operation *operation=ext4_current_operation(adapter->device.fs);
     if (!operation) __builtin_trap();
-    if (base && (base->instance != &adapter->instance || base->inode != inode)) __builtin_trap();
-    if (base && (base->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG) {
-        struct lwext4_staged_time *record = operation->staged_times;
-        while (record && &record->node->node != base) record = record->next;
-        if (!record) {
-            struct jbd_journal *journal = adapter->device.fs->jbd_journal;
-            record = journal ? jbd_journal_alloc(journal, sizeof(*record)) :
-                ext4_user_calloc(1, sizeof(*record));
-            if (!record) {
-                if (!operation->error) operation->error = ENOMEM;
-                if (operation->trans && !operation->trans->error) operation->trans->error = ENOMEM;
-                goto Release;
-            }
-            *record = (struct lwext4_staged_time){.next = operation->staged_times,
-                .node = (struct lwext4_node *)base, .journal = journal};
-            if (kernel_vfs_node_acquire(base)) __builtin_trap();
-            operation->staged_times = record;
+    for (struct lwext4_staged_inode *record=operation->staged_inodes;record;record=record->next)
+        if (record->node->node.inode==inode) {
+            if (owner && owner!=&record->node->node) __builtin_trap();
+            return record;
         }
-        TIMESTAMP_SCOPE(times, adapter);
-        record->values[field] = value;
-        record->versions[field] = record->node->time_version[field];
-        record->fields |= 1U << field;
+    struct kernel_vfs_node *pin=owner?NULL:kernel_vfs_node_pin(&adapter->instance,inode);
+    struct kernel_vfs_node *base=owner?owner:pin;
+    if (base && (base->instance!=&adapter->instance || base->inode!=inode)) __builtin_trap();
+    struct lwext4_staged_inode *record=NULL;
+    if (base) {
+        struct jbd_journal *journal=adapter->device.fs->jbd_journal;
+        record=journal?jbd_journal_alloc(journal,sizeof(*record)):ext4_user_calloc(1,sizeof(*record));
+        if (!record) {
+            /* Nonjournal bytes can already be modified on this failure.
+             * There is no record left to invalidate at completion. */
+            { TIMESTAMP_SCOPE(snapshot,adapter);
+              if (!++((struct lwext4_node *)base)->metadata_epoch) __builtin_trap(); }
+            if (!operation->error) operation->error=ENOMEM;
+            if (operation->trans && !operation->trans->error) operation->trans->error=ENOMEM;
+        } else {
+            *record=(struct lwext4_staged_inode){.next=operation->staged_inodes,
+                .node=(struct lwext4_node *)base,.journal=journal};
+            if (kernel_vfs_node_acquire(base)) __builtin_trap();
+            operation->staged_inodes=record;
+        }
     }
-Release:
     if (pin && kernel_vfs_node_release(&pin)) __builtin_trap();
+    return record;
+}
+static void inode_changed(void *context,uint32_t inode)
+{ (void)stage_inode(context,NULL,inode); }
+
+static void time_stage(void *context,void *owner,uint32_t inode,unsigned field,
+    struct ext4_timestamp value)
+{
+    struct lwext4_mount_adapter *adapter=context;
+    struct lwext4_staged_inode *record=stage_inode(adapter,owner,inode);
+    if (record && (record->node->node.mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFREG) {
+        TIMESTAMP_SCOPE(times,adapter);
+        record->values[field]=value;
+        record->versions[field]=record->node->time_version[field];
+        record->fields|=1U<<field;
+    }
 }
 
-static void time_finish(void *context, void *staged_times, bool accepted)
+static void time_finish(void *context, void *staged_inodes, bool accepted)
 {
     struct lwext4_mount_adapter *adapter = context;
-    struct lwext4_staged_time *record = staged_times;
+    struct lwext4_staged_inode *record = staged_inodes;
     while (record) {
-        struct lwext4_staged_time *next = record->next;
+        struct lwext4_staged_inode *next = record->next;
         struct lwext4_node *node = record->node;
         struct kernel_vfs_node *dirty_pin, *staged_pin = &node->node;
         {
             TIMESTAMP_SCOPE(times, adapter);
+            /* Invalidate even after abort: nonjournal failures may have an
+             * accepted prefix. No candidate attributes are ever published. */
+            if (!++node->metadata_epoch) __builtin_trap();
             for (unsigned i = 0; i < 3; i++) {
                 if (!accepted || !(record->fields & (1U << i)) ||
                     record->versions[i] != node->time_version[i]) continue;
@@ -635,6 +653,9 @@ static void initialize_times(struct kernel_vfs_node *base,
     struct lwext4_mount_adapter *adapter, struct ext4_inode *inode)
 {
     struct lwext4_node *node = (struct lwext4_node *)base;
+    fill_stat(&adapter->instance.backend_mount,adapter->superblock,
+        base->inode,inode,&node->metadata);
+    node->metadata_seen=node->metadata_epoch;
     lwext4_node_file(base)->time_owner = base;
     lwext4_node_file(base)->delalloc = &node->delalloc;
     node->noatime = ext4_inode_has_flag(inode, EXT4_INODE_FLAG_NOATIME);
@@ -1642,8 +1663,9 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     heap->page_allocator->buffer_context = heap;
     result = ext4_mount_setup_locks(adapter->mount_point, &adapter->locks);
     if (result != EOK) { (void)cleanup_mount(mount); return lwext4_error(result); }
-    struct ext4_time_observer observer = {adapter, time_stage, time_finish, time_snapshot, time_written};
-    result = ext4_mount_setup_time_observer(adapter->mount_point, &observer);
+    struct ext4_inode_observer observer={.context=adapter,.store=time_stage,
+        .changed=inode_changed,.finish=time_finish,.snapshot=time_snapshot,.written=time_written};
+    result = ext4_mount_setup_inode_observer(adapter->mount_point, &observer);
     if (result != EOK) { (void)cleanup_mount(mount); return lwext4_error(result); }
     result = ext4_mount_setup_clock(adapter->mount_point, vfs_realtime);
     if (result != EOK) {
@@ -2466,11 +2488,22 @@ static int ext4_backend_modified(struct kernel_vfs_file *file,
     return 0;
 }
 
+/* Keep the raw inode buffer out of a metadata hit's call frame. */
+static __attribute__((noinline)) int read_inode_attributes(const struct kernel_vfs_file *file,
+    struct kernel_vfs_stat *stat)
+{
+    struct kernel_vfs_node *node=file->private_data;
+    struct ext4_inode inode;
+    int result=ext4_fraw_inode_fill(lwext4_node_file(node),&inode);
+    if (result!=EOK) return lwext4_error(result);
+    fill_stat(file->mount,lwext4_instance(node->instance)->superblock,node->inode,&inode,stat);
+    return 0;
+}
+
 static int ext4_backend_stat(const struct kernel_vfs_file *file,
                      struct kernel_vfs_stat *stat)
 {
     const struct kernel_vfs_node *node;
-    struct ext4_inode inode;
     int result;
 
     if (file == 0 || stat == 0 || file->state != VFS_FILE_STATE_LIVE ||
@@ -2486,10 +2519,32 @@ static int ext4_backend_stat(const struct kernel_vfs_file *file,
         kernel_vfs_node_lock((struct kernel_vfs_node *)node,&inode_guard,0);
     if (node->instance == 0 || lwext4_instance(node->instance)->superblock == 0)
         return -KERNEL_EIO;
-    result = ext4_fraw_inode_fill(lwext4_node_file(node), &inode);
-    if (result != EOK) return lwext4_error(result);
-    fill_stat(file->mount, lwext4_instance(node->instance)->superblock,
-              node->inode, &inode, stat);
+    struct lwext4_node *live=(struct lwext4_node *)node;
+    struct lwext4_mount_adapter *adapter=lwext4_instance(node->instance);
+    struct ext4_timestamp times[3];
+    int regular=(node->mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFREG;
+    uint64_t epoch=0;
+    int cached=0,private=ext4_current_operation(adapter->device.fs)!=NULL;
+    if (!private) {
+        TIMESTAMP_SCOPE(snapshot,adapter);
+        epoch=live->metadata_epoch;
+        if (live->metadata_seen==epoch) {
+            *stat=live->metadata;cached=1;
+            if (regular) memcpy(times,live->times,sizeof(times));
+        }
+    }
+    if (!cached) {
+        result=read_inode_attributes(file,stat);
+        if (result) return result;
+        if (!private || regular) {
+            TIMESTAMP_SCOPE(snapshot,adapter);
+            if (!private && epoch==live->metadata_epoch) {
+                live->metadata=*stat;live->metadata_seen=epoch;
+            }
+            if (regular) memcpy(times,live->times,sizeof(times));
+        }
+    }
+    stat->dev=node->instance->device_id;
     if ((node->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG) {
         stat->size = node->size;
         /* Linux reports reserved delayed data in st_blocks while its physical
@@ -2498,8 +2553,6 @@ static int ext4_backend_stat(const struct kernel_vfs_file *file,
         ext4_fs_state_read_lock(fs);
         stat->blocks+=((struct lwext4_node *)node)->delalloc.blocks*(stat->blksize/512);
         ext4_fs_state_unlock(fs);
-        struct ext4_timestamp times[3];
-        (void)ext4_backend_pending_times((struct kernel_vfs_node *)node, times);
         stat->atime = (struct kernel_vfs_timespec){times[0].seconds, times[0].nanoseconds};
         stat->mtime = (struct kernel_vfs_timespec){times[1].seconds, times[1].nanoseconds};
         stat->ctime = (struct kernel_vfs_timespec){times[2].seconds, times[2].nanoseconds};
@@ -2822,7 +2875,7 @@ static int ext4_backend_pread_batch(struct kernel_vfs_node *node,
     struct ext4_file_read_progress progress = {node, stored, completion, 0};
     const struct file_read_completion forward = {file_read_completed, &progress};
     int result = ext4_fpread_batch(lwext4_node_file(node), spans, count, workspace, stored,
-        completion ? &forward : NULL);
+        completion ? &forward : NULL, true);
     adapter->locks.unlock(adapter->locks.context);
     for (size_t i = 0; i < count; i++)
         file_read_result(&progress, &spans[i], !(progress.completed & (UINT32_C(1) << i)));

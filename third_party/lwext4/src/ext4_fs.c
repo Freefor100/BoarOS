@@ -83,6 +83,7 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
     fs->delayed_blocks = 0;
 	fs->reserved_inodes = 0;
 	fs->jbd_journal = NULL;
+    fs->inode_observer = NULL;
 	fs->jbd_fs = NULL;
 	fs->orphan_index = NULL;
 	RB_INIT(&fs->inode_goals);

@@ -258,9 +258,12 @@ RB_GENERATE_STATIC(ext4_inode_goal_tree, ext4_inode_goal, index, inode_goal_orde
 
 int ext4_operation_record_inode(struct ext4_fs *fs, uint32_t inode, bool data)
 {
+    struct ext4_operation *operation = ext4_current_operation(fs);
+    if (operation && fs->inode_observer && fs->inode_observer->changed)
+        fs->inode_observer->changed(fs->inode_observer->context,inode);
+    if (operation && operation->error) return operation->error;
     struct jbd_journal *journal = fs->jbd_journal;
     if (!journal || !journal->grouped) return EOK;
-    struct ext4_operation *operation = ext4_current_operation(fs);
     if (!operation) __builtin_trap();
     if (operation->error) return operation->error;
     struct ext4_inode_goal probe = {.inode = inode};
@@ -642,7 +645,7 @@ struct ext4_mountpoint {
 
 	/* Optional adapter-owned realtime source; cleared on mount reuse. */
 	ext4_clock_read clock;
-	struct ext4_time_observer time_observer;
+	struct ext4_inode_observer inode_observer;
 	struct ext4_journal_runtime journal_runtime;
 
 	/**@brief   Ext4 filesystem internals.*/
@@ -922,9 +925,9 @@ static void ext4_publish_times(struct ext4_mountpoint *mp,
         offsetof(struct ext4_inode, modification_time), offsetof(struct ext4_inode, change_inode_time)};
     static const size_t extra[3] = {offsetof(struct ext4_inode, atime_extra),
         offsetof(struct ext4_inode, mtime_extra), offsetof(struct ext4_inode, ctime_extra)};
-    if (!mp->time_observer.store) return;
+    if (!mp->inode_observer.store) return;
     for (unsigned i = 0; i < 3; i++) if (fields & (1U << i))
-        mp->time_observer.store(mp->time_observer.context, owner, ref->index, i,
+        mp->inode_observer.store(mp->inode_observer.context, owner, ref->index, i,
                                ext4_time_load(ref, base[i], extra[i]));
 }
 
@@ -1955,7 +1958,7 @@ static int ext4_trans_finish(struct ext4_mountpoint *mp __unused, int result)
     struct ext4_operation *operation = ext4_current_operation(&mp->fs);
     if (!operation || !operation->depth) return result ? result : EINVAL;
     bool outer = operation->depth == 1;
-    void *staged_times = outer ? operation->staged_times : NULL;
+    void *staged_inodes = outer ? operation->staged_inodes : NULL;
 #if CONFIG_JOURNALING_ENABLE
     unsigned work=0;
     if (mp->fs.jbd_journal) result = __ext4_trans_finish(mp,result,&work);
@@ -1982,8 +1985,8 @@ static int ext4_trans_finish(struct ext4_mountpoint *mp __unused, int result)
     if (work && mp->journal_runtime.request)
         mp->journal_runtime.request(mp->journal_runtime.context,work);
 #endif
-    if (outer && mp->time_observer.finish)
-        mp->time_observer.finish(mp->time_observer.context, staged_times, result == EOK);
+    if (outer && mp->inode_observer.finish)
+        mp->inode_observer.finish(mp->inode_observer.context, staged_inodes, result == EOK);
     return result;
 }
 
@@ -2189,12 +2192,13 @@ bool ext4_file_read_clock(const ext4_file *file, struct ext4_timestamp *now)
         file->mp->clock(now);
 }
 
-int ext4_mount_setup_time_observer(const char *mount_point,
-                                  const struct ext4_time_observer *observer)
+int ext4_mount_setup_inode_observer(const char *mount_point,
+                                  const struct ext4_inode_observer *observer)
 {
     struct ext4_mountpoint *mp = ext4_get_mount(mount_point);
     if (!mp) return ENOENT;
-    mp->time_observer = observer ? *observer : (struct ext4_time_observer){0};
+    mp->inode_observer = observer ? *observer : (struct ext4_inode_observer){0};
+    mp->fs.inode_observer=&mp->inode_observer;
     return EOK;
 }
 
@@ -2279,8 +2283,8 @@ static int ext4_file_set_times_common(ext4_file *file, unsigned fields,
     EXT4_MP_LOCK(mp);
     if (!publish) {
         times = current;
-        fields = mp->time_observer.snapshot
-            ? mp->time_observer.snapshot(file->time_owner, current) : 0;
+        fields = mp->inode_observer.snapshot
+            ? mp->inode_observer.snapshot(file->time_owner, current) : 0;
     }
     if (fields & ~(EXT4_TIME_ATIME | EXT4_TIME_MTIME | EXT4_TIME_CTIME) ||
         (fields && !times)) { r = EINVAL; goto Unlock; }
@@ -2295,8 +2299,8 @@ static int ext4_file_set_times_common(ext4_file *file, unsigned fields,
     r = ext4_trans_start_mode(mp, wait);
     if (r != EOK) goto Unlock;
     r = ext4_fs_get_inode_ref(&mp->fs, file->inode, &ref);
-    if (!publish && mp->time_observer.snapshot)
-        fields = mp->time_observer.snapshot(file->time_owner, current);
+    if (!publish && mp->inode_observer.snapshot)
+        fields = mp->inode_observer.snapshot(file->time_owner, current);
     if (r == EOK) {
         for (unsigned i = 0; i < 3; i++)
             if (fields & (1U << i)) ext4_time_store(&ref, base[i], extra[i], times[i]);
@@ -2304,8 +2308,8 @@ static int ext4_file_set_times_common(ext4_file *file, unsigned fields,
         r = ext4_fs_put_inode_ref(&ref);
     }
     r = ext4_trans_finish(mp, r);
-    if (!publish && !ext4_operation_depth(&mp->fs) && mp->time_observer.written)
-        mp->time_observer.written(file->time_owner, fields, times, r);
+    if (!publish && !ext4_operation_depth(&mp->fs) && mp->inode_observer.written)
+        mp->inode_observer.written(file->time_owner, fields, times, r);
 Unlock:
     if (r != EOK && ext4_current_trans(&mp->fs) && !ext4_current_trans(&mp->fs)->error)
         ext4_current_trans(&mp->fs)->error = r;
@@ -4814,7 +4818,7 @@ int ext4_fpread(const ext4_file *file, uint64_t offset, void *buf, size_t size, 
 {
     if (!rcnt) return EINVAL;
     struct file_read_span span = {offset, buf, size, 0, EOK};
-    int result = ext4_fpread_batch(file, &span, 1, NULL, UINT64_MAX, NULL);
+    int result = ext4_fpread_batch(file, &span, 1, NULL, UINT64_MAX, NULL, false);
     *rcnt = span.completed;
     return result;
 }
@@ -4851,7 +4855,7 @@ static void ext4_file_read_completed(void *context, unsigned index, const struct
 }
 
 int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsigned count,
-    struct file_read_workspace *work, uint64_t size_limit, const struct file_read_completion *completion)
+    struct file_read_workspace *work, uint64_t size_limit, const struct file_read_completion *completion, bool pad_eof)
 {
     if (!file || !file->mp || count > EXT4_BLOCK_BATCH_MAX || (count && !spans)) return EINVAL;
     for (unsigned i = 0; i < count; i++) { spans[i].completed = 0; spans[i].error = EINVAL; }
@@ -4985,12 +4989,21 @@ int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsig
                 void *out = (uint8_t *)spans[i].buffer + planned;
                 unsigned sector = fs->bdev->bdif->ph_bsize;
                 uint64_t block = fs->bdev->part_offset + physical * block_size + skip;
-                bool aligned = physical && !(skip % sector) && !(length % sector);
+                /* Cache targets own their EOF suffix. Use that real capacity
+                 * for the last sector instead of allocating/copying scratch;
+                 * logical completion remains length and the cache zeros EOF. */
+                size_t io_length=length;
+                if (pad_eof && physical && !(skip%sector) && offset+length==size) {
+                    size_t rounded=(length+sector-1)/sector*sector;
+                    if (rounded<=block_size-skip && rounded<=spans[i].size-planned)
+                        io_length=rounded;
+                }
+                bool aligned=physical && !(skip%sector) && !(io_length%sector);
                 bool extend = parts && pending && aligned &&
                     fragments[parts - 1].span == i && owners[pending - 1] == parts - 1 &&
                     reads[pending - 1].offset + reads[pending - 1].size == block &&
                     (uint8_t *)reads[pending - 1].buffer + reads[pending - 1].size == out &&
-                    length <= (uint64_t)UINT32_MAX * sector - reads[pending - 1].size;
+                    io_length <= (uint64_t)UINT32_MAX * sector - reads[pending - 1].size;
                 /* A sparse run has one immediate completion fragment, even
                  * when it spans many filesystem blocks. Keep its neighboring
                  * disk fragments in the same submission wave. */
@@ -5007,7 +5020,7 @@ int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsig
                     /* 片段已满时仍可扩展最后一个设备区间。空输出只查询当前
                      * 版本，不能把未接纳片段提前复制进调用者。 */
                     if (!extend || ext4_copy_pending_data(fs->bdev, physical, skip, NULL, 0)) break;
-                    reads[pending - 1].size += length;
+                    reads[pending - 1].size += io_length;
                     fragments[parts - 1].length += length;
                     planned += length;
                     range_offset = offset + length;
@@ -5021,12 +5034,12 @@ int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsig
                         fragments[part].error = ext4_read_pending_data(fs->bdev, physical, skip, out, length);
                     else if (extend) {
                         parts--;
-                        reads[pending - 1].size += length;
+                        reads[pending - 1].size += io_length;
                         fragments[parts - 1].length += length;
                     }
                     else {
                         owners[pending] = part;
-                        reads[pending++] = (struct block_read_span){block, out, length, 0, EIO};
+                        reads[pending++] = (struct block_read_span){block, out, io_length, 0, EIO};
                     }
                 }
                 planned += length;
@@ -5338,8 +5351,8 @@ Retry:
     if (!r) r = direct_result;
     ext4_free(direct);
     struct ext4_timestamp times[3];
-    unsigned fields = !r && file->mp->time_observer.snapshot
-        ? file->mp->time_observer.snapshot(file->time_owner, times) : 0;
+    unsigned fields = !r && file->mp->inode_observer.snapshot
+        ? file->mp->inode_observer.snapshot(file->time_owner, times) : 0;
     if (!r && fields) {
         if (fields & EXT4_TIME_ATIME) ext4_time_store(&ref,
             offsetof(struct ext4_inode, access_time), offsetof(struct ext4_inode, atime_extra), times[0]);
@@ -5352,8 +5365,8 @@ Retry:
 	int cleanup = ext4_fs_put_inode_ref(&ref);
 	if (!r) r = cleanup;
 	r = ext4_file_data_finish(file, r);
-	if (!ext4_operation_depth(&file->mp->fs) && file->mp->time_observer.written) {
-		file->mp->time_observer.written(file->time_owner, fields, times, r);
+	if (!ext4_operation_depth(&file->mp->fs) && file->mp->inode_observer.written) {
+		file->mp->inode_observer.written(file->time_owner, fields, times, r);
 	}
 Completed:
 	if (ext4_file_rolled_back(file, r)) {

@@ -1685,7 +1685,7 @@ static void group_data_error(struct ext4_fs *fs, bool fail_flush)
     struct file_read_span spans[2]={
         {block+13,readback,17,0,EIO},{2*block+29,readback+32,19,0,EIO}};
     struct file_read_workspace read_work;
-    CHECK(ext4_fpread_batch(&file,spans,2,&read_work,UINT64_MAX, NULL)==EOK && spans[0].completed==17 && spans[1].completed==19);
+    CHECK(ext4_fpread_batch(&file,spans,2,&read_work,UINT64_MAX, NULL, false)==EOK && spans[0].completed==17 && spans[1].completed==19);
     for (unsigned i=0;i<17;i++) CHECK(readback[i]==0x43);
     for (unsigned i=0;i<19;i++) CHECK(readback[32+i]==0x42);
     CHECK(ext4_journal_group_drain("/")==EIO);
@@ -2425,7 +2425,7 @@ static void public_batch_ranges(struct ext4_blockdev *dev)
     CHECK(range_queries==1 && bitmap_crc_calls==2);
     watched_bitmap_bytes=0;range_queries=0;
 #endif
-    CHECK(ext4_fpread_batch(&file,reads_out,32,&read_work,UINT64_MAX, NULL)==EOK);
+    CHECK(ext4_fpread_batch(&file,reads_out,32,&read_work,UINT64_MAX, NULL, false)==EOK);
 #ifdef TEST_RANGE_WORK_COUNTERS
     CHECK(range_queries==1);
 #endif
@@ -2448,7 +2448,7 @@ static void public_batch_ranges(struct ext4_blockdev *dev)
 #ifdef TEST_RANGE_WORK_COUNTERS
     range_queries=0;
 #endif
-    CHECK(ext4_fpread_batch(&file,reads_out,32,&read_work,UINT64_MAX, NULL)==EOK);
+    CHECK(ext4_fpread_batch(&file,reads_out,32,&read_work,UINT64_MAX, NULL, false)==EOK);
 #ifdef TEST_RANGE_WORK_COUNTERS
     CHECK(range_queries==1);
 #endif
@@ -3100,8 +3100,8 @@ static void handle_return_test(struct ext4_fs *fs)
     CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
     ext4_file file;
     CHECK(ext4_fopen(&file,"/handle-return","w+")==EOK);
-    struct ext4_time_observer observer={.written=handle_return_written};
-    CHECK(ext4_mount_setup_time_observer("/",&observer)==EOK);
+    struct ext4_inode_observer observer={.written=handle_return_written};
+    CHECK(ext4_mount_setup_inode_observer("/",&observer)==EOK);
     handle_return_entered=handle_return_resume=0;
     pthread_t first;
     CHECK(!pthread_create(&first,NULL,handle_return_first,&file));
@@ -3126,7 +3126,7 @@ static void handle_return_test(struct ext4_fs *fs)
     unsigned char byte;size_t read;
     CHECK(ext4_fpread(&file,0,&byte,1,&read)==EOK && read==1 && byte=='A');
     CHECK(ext4_fpread(&file,8192,&byte,1,&read)==EOK && read==1 && byte=='B');
-    CHECK(ext4_mount_setup_time_observer("/",NULL)==EOK && ext4_fclose(&file)==EOK);
+    CHECK(ext4_mount_setup_inode_observer("/",NULL)==EOK && ext4_fclose(&file)==EOK);
     CHECK(ext4_fremove("/handle-return")==EOK && ext4_journal_group_drain("/")==EOK);
     puts("PASS delayed handle return: another task's larger accepted EOF and later sync/data goals survive");
 }

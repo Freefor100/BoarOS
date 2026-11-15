@@ -36,7 +36,7 @@ struct ext4_operation {
         uint32_t inodes, ro_flags, orphan_head, checksum;
     } super_publish;
     struct ext4_writeback_scope scope;
-    void *staged_times;
+    void *staged_inodes;
     struct ext4_inode_goal_tree inode_goals;
 #if BOAROS_COST_DIAGNOSTICS
     struct kernel_cost_scope prepare_cost;
