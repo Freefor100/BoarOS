@@ -23,6 +23,26 @@ void kernel_console_putc(char c) { fputc(c, stderr); }
 void mm_test_fence(uint64_t address, int instructions)
 { (void)address; (void)instructions; __atomic_thread_fence(__ATOMIC_SEQ_CST); }
 void mm_test_unavailable(void) { fputs("excluded business path reached\n", stderr); abort(); }
+static unsigned watch_pin_entries,pin_entries;
+enum kernel_mm_status __real_kernel_mm_pin_user_page(const struct kernel_mm *,uint64_t,uint32_t,struct kernel_mm_user_pin *);
+enum kernel_mm_status __wrap_kernel_mm_pin_user_page(const struct kernel_mm *mm,uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin)
+{
+    if(watch_pin_entries)pin_entries++;
+    return __real_kernel_mm_pin_user_page(mm,address,access,pin);
+}
+static void cold_copy_case(struct kernel_mm *mm)
+{
+    uint64_t address;size_t copied=0;unsigned char value=0x37;
+    assert(!kernel_mm_mmap_anonymous(mm,0x80000,BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&address));
+    watch_pin_entries=1;pin_entries=0;
+    assert(!kernel_copy_to_user(mm,address,&value,1,&copied) && copied==1);
+    watch_pin_entries=0;
+    printf("cold copy pin entries=%u\n",pin_entries);fflush(stdout);
+    assert(pin_entries==1);
+    value=0;assert(!kernel_copy_from_user(mm,&value,address,1,&copied) && copied==1 && value==0x37);
+    assert(!kernel_mm_munmap(mm,address,BOAROS_PAGE_SIZE));
+}
 static uint64_t watched_record;
 static unsigned record_resolutions;
 static uint64_t qualifying_page;
@@ -222,6 +242,7 @@ int main(void)
     uint64_t address, context;
     assert(kernel_mm_context(&mm, &context) == 0);
     mm_test_context = context;
+    cold_copy_case(&mm);
     assert(kernel_mm_mmap_anonymous(&mm, 0x40000, BOAROS_PAGE_SIZE,
         KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED, &address) == 0);
     /* 构造resident页，准备完成后测试lookup到复制结束的物理owner。 */

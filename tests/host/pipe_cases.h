@@ -404,6 +404,13 @@ enum kernel_mm_status __wrap_kernel_mm_resolve_user_fault(struct kernel_mm *mm,u
     if(splice_oom_address && (address&~BOAROS_PAGE_MASK)==splice_oom_address)return KERNEL_MM_STATUS_NO_MEMORY;
     return __real_kernel_mm_resolve_user_fault(mm,address,access);
 }
+enum kernel_mm_status __real_kernel_mm_resolve_user_pin(struct kernel_mm *,uint64_t,uint32_t,struct kernel_mm_user_pin *);
+enum kernel_mm_status __wrap_kernel_mm_resolve_user_pin(struct kernel_mm *mm,uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin)
+{
+    if(splice_oom_address && (address&~BOAROS_PAGE_MASK)==splice_oom_address)return KERNEL_MM_STATUS_NO_MEMORY;
+    return __real_kernel_mm_resolve_user_pin(mm,address,access,pin);
+}
+
 struct pipe_link_actor {struct kernel_pipe *in,*out;unsigned id;int64_t result;pthread_barrier_t *start;};
 static void *pipe_link_thread(void *argument)
 {

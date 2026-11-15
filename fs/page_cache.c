@@ -3976,9 +3976,19 @@ uint64_t kernel_page_cache_reclaim(struct kernel_page_cache *cache,uint64_t targ
     return released;
 }
 
+static uint64_t cache_low_watermark(const struct physical_page_allocator *allocator)
+{
+    uint64_t low=physical_page_total(allocator)/50;
+    return low?low:1;
+}
+
 static void group_notify_available(struct page_cache_group *g,uint64_t available)
 {
     uint64_t dirty=group_dirty(g);
+    /* All started members use this physical low watermark. A clean group
+     * above it cannot request work in either loop. A concurrent new dirty
+     * publisher sends its own notification after publishing the counters. */
+    if (!dirty && available>cache_low_watermark(g->allocator)) return;
     KERNEL_RAW_SCOPE(guard,&g->metadata);
     for (struct kernel_page_cache_record *r=g->head;r;r=r->next) {
         if (!r->started || r->stopping || (available>r->low && (g->domains || dirty<background_limit(r->dirty_high)))) continue;
@@ -4351,7 +4361,7 @@ int kernel_page_cache_start_executor(struct kernel_page_cache *cache)
         r->writeback_workspace=NULL; return -KERNEL_ENOMEM;
     }
     uint64_t total = physical_page_total(cache->allocator);
-    r->low = total / 50 ? total / 50 : 1;
+    r->low=cache_low_watermark(cache->allocator);
     r->high = total / 25 > r->low ? total / 25 : r->low + 1;
     r->dirty_low = total / 20 ? total / 20 : 1;
     r->dirty_high = total / 8 > r->dirty_low ? total / 8 : r->dirty_low + 1;

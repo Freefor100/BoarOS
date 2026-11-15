@@ -1851,6 +1851,7 @@ struct mm_operation {
     const struct kernel_mm *mm;
     struct kernel_lock_guard guard;
     unsigned shared, populate;
+    struct kernel_mm_user_pin *fault_pin;
 #if BOAROS_MAX_CPUS > 1
     uint64_t sync_start, sync_end;
     uint32_t sync_targets;
@@ -2303,6 +2304,26 @@ static inline enum kernel_mm_status lookup_user_mapping(const struct kernel_mm_r
         (access | KERNEL_MM_USER) ? KERNEL_MM_STATUS_OK : KERNEL_MM_STATUS_ACCESS;
 }
 
+static __attribute__((always_inline)) inline void register_user_pin(const struct kernel_mm *mm,
+    struct kernel_mm_record *record,uint64_t physical,void *pointer,uint32_t access,
+    struct kernel_mm_user_pin *pin)
+{
+    if (physical_page_acquire(mm->allocator, physical) != PHYSICAL_PAGE_STATUS_OK)
+        __builtin_trap();
+    if (pin_count_add(&record->access_pins) == UINT32_MAX) __builtin_trap();
+#if BOAROS_COST_DIAGNOSTICS
+    __atomic_fetch_add(&record->pin_acquisitions, 1U, __ATOMIC_RELAXED);
+#endif
+    if ((access & KERNEL_MM_WRITE) && pin_count_add(&record->write_pins) == UINT32_MAX)
+        __builtin_trap();
+    struct kernel_io_context *owner = kernel_io_context_current();
+    pin->mm=mm; pin->record=record; pin->owner=owner; pin->registration=pin;
+    pin->owner_next=owner->user_pins; pin->owner_previous=&owner->user_pins;
+    if (pin->owner_next) pin->owner_next->owner_previous=&pin->owner_next;
+    pin->page=pointer; pin->physical_address=physical; pin->access=access;
+    owner->user_pins = pin;
+}
+
 /* PTE、resident索引与权限许可由同一短读资格固定；实际页acquire不能移出。 */
 static __attribute__((always_inline)) inline enum kernel_mm_status pin_mapping(const struct kernel_mm *mm,
     struct kernel_mm_record *record, uint64_t address, uint32_t access,
@@ -2337,21 +2358,25 @@ static __attribute__((always_inline)) inline enum kernel_mm_status pin_mapping(c
             if (admitted) __builtin_trap();
         }
     }
-    if (physical_page_acquire(mm->allocator, physical) != PHYSICAL_PAGE_STATUS_OK)
-        __builtin_trap();
-    if (pin_count_add(&record->access_pins) == UINT32_MAX) __builtin_trap();
-#if BOAROS_COST_DIAGNOSTICS
-    __atomic_fetch_add(&record->pin_acquisitions, 1U, __ATOMIC_RELAXED);
-#endif
-    if ((access & KERNEL_MM_WRITE) && pin_count_add(&record->write_pins) == UINT32_MAX)
-        __builtin_trap();
-    struct kernel_io_context *owner = kernel_io_context_current();
-    pin->mm=mm; pin->record=record; pin->owner=owner; pin->registration=pin;
-    pin->owner_next=owner->user_pins; pin->owner_previous=&owner->user_pins;
-    if (pin->owner_next) pin->owner_next->owner_previous=&pin->owner_next;
-    pin->page=pointer; pin->physical_address=physical; pin->access=access;
-    owner->user_pins = pin;
+    register_user_pin(mm,record,physical,pointer,access,pin);
     return KERNEL_MM_STATUS_OK;
+}
+
+/* The publishing private fault already validated its VMA and PTE under raw.
+ * Acquire the final copy loan there instead of releasing and walking again.
+ * Closed admission simply leaves the ordinary post-fault pin path in charge. */
+static __attribute__((always_inline)) inline void pin_private_fault(struct mm_operation *operation,
+    const struct kernel_vma *vma,uint64_t physical,uint32_t access)
+{
+    if (!operation->fault_pin || (vma->kind!=KERNEL_VMA_KIND_ANONYMOUS &&
+        vma->kind!=KERNEL_VMA_KIND_ELF_PRIVATE)) return;
+    struct kernel_mm_record *record=operation->record;
+    int closed=pin_admission_closed(record);
+    if (closed==1 || (closed==2 && (access&KERNEL_MM_WRITE))) return;
+    void *pointer;
+    if (physical_page_map_owned(record->space.allocator,physical&~BOAROS_PAGE_MASK,&pointer))
+        __builtin_trap();
+    register_user_pin(operation->mm,record,physical&~BOAROS_PAGE_MASK,pointer,access,operation->fault_pin);
 }
 
 static inline enum kernel_mm_status pin_user_prefix(const struct kernel_mm *mm,
@@ -5627,8 +5652,7 @@ static __attribute__((noinline)) enum kernel_mm_status mapped_file_fault(struct 
                 status = KERNEL_MM_STATUS_ADDRESS_SPACE;
                 goto finish;
             }
-            uint32_t refs;
-            if (physical_page_reference_count(allocator,old,&refs)) __builtin_trap();
+            uint32_t refs=physical_page_cow_borrow(allocator,old);
             if (refs == 1) {
                 if (arch_mmu_user_cow_commit(&record->space,address,cookie,KERNEL_MM_NO_PAGE,
                         backend_permissions_from_mm(vma->permissions),&batch)) __builtin_trap();
@@ -5639,8 +5663,7 @@ static __attribute__((noinline)) enum kernel_mm_status mapped_file_fault(struct 
                 old = KERNEL_MM_NO_PAGE;
                 goto finish;
             }
-            if (physical_page_acquire(allocator,old) || physical_page_map_owned(allocator,old,&old_bytes))
-                __builtin_trap();
+            if (physical_page_map_owned(allocator,old,&old_bytes)) __builtin_trap();
         } else if (status == KERNEL_MM_STATUS_NOT_MAPPED) {
             if (arch_mmu_user_leaf_missing(&record->space,address,&missing)) __builtin_trap();
             status = KERNEL_MM_STATUS_OK;
@@ -5905,6 +5928,7 @@ static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_op
         KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
         status = force ? remote_lookup_record(record,address,&mapping) : lookup_record(record,address,&mapping);
         if (status == KERNEL_MM_STATUS_OK && ((mapping.permissions & access) || (force && access == KERNEL_MM_READ))) {
+            pin_private_fault(operation,vma,mapping.physical_address,access);
             kernel_raw_lock_release(&guard);
             if (!operation->populate) {
                 /* Another CPU may have published this leaf or its parents
@@ -5932,15 +5956,14 @@ static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_op
                 arch_mmu_user_mark_cow_page(&record->space,address)) __builtin_trap();
             if (shared || access != KERNEL_MM_WRITE || arch_mmu_user_cow_snapshot(&record->space,
                 address, &cookie, &old) != ARCH_MMU_STATUS_OK) return KERNEL_MM_STATUS_ADDRESS_SPACE;
-            uint32_t references;
-            if (physical_page_reference_count(allocator, old, &references) != PHYSICAL_PAGE_STATUS_OK)
-                __builtin_trap();
+            uint32_t references=physical_page_cow_borrow(allocator,old);
             if (references == 1) {
                 if (arch_mmu_user_cow_commit(&record->space, address, cookie, KERNEL_MM_NO_PAGE,
                     backend_permissions_from_mm(vma->permissions), &batch) != ARCH_MMU_STATUS_OK)
                     __builtin_trap();
                 struct mm_lazy_page *lazy=lazy_find(record,address);
                 if (lazy) lazy_retire(record,lazy);
+                pin_private_fault(operation,vma,old,access);
                 targets = note_tlb_change_locked(record, &batch, 0);
                 kernel_raw_lock_release(&guard);
                 kernel_lock_scope_release(&vma_guard);
@@ -5949,7 +5972,6 @@ static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_op
                 return KERNEL_MM_STATUS_OK;
             }
             /* COW旧页为只读快照；实际引用覆盖解锁后的复制和竞争者提交。 */
-            if (physical_page_acquire(allocator, old) != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
             if (physical_page_map_owned(allocator, old, &old_pointer) != PHYSICAL_PAGE_STATUS_OK) {
                 physical_page_release(allocator, old);
                 return KERNEL_MM_STATUS_PAGE_ACCESS;
@@ -6096,6 +6118,7 @@ prepare_memory_tables:
                     struct mm_lazy_page *lazy=lazy_find(record,address);
                     if (lazy) { lazy_retire(record,lazy);lazy_retired=1; }
                 }
+                pin_private_fault(operation,vma,replacement,access);
                 replacement = KERNEL_MM_NO_PAGE;
                 if (!fault_batch)
                     targets=note_fault_change_locked(record,&batch,cookie!=0,
@@ -6175,7 +6198,7 @@ static enum kernel_mm_status dispatch_fault(struct mm_operation *operation, uint
 }
 
 static enum kernel_mm_status resolve_user_fault(struct kernel_mm *mm,
-    uint64_t address, uint32_t access, int force)
+    uint64_t address, uint32_t access, int force,struct kernel_mm_user_pin *pin)
 {
     COST_SCOPE(fault_cost, MM_FAULT_TICKS);
     if (!mm || !access || (access & (access - 1)) || (access & ~KERNEL_VMA_ALL_PERMISSIONS))
@@ -6184,7 +6207,7 @@ static enum kernel_mm_status resolve_user_fault(struct kernel_mm *mm,
         return KERNEL_MM_STATUS_NOT_MAPPED;
     int shared = BOAROS_MAX_CPUS > 1 && !force;
     for (;;) {
-        struct mm_operation operation __attribute__((cleanup(mm_operation_end))) = {.shared = shared};
+        struct mm_operation operation __attribute__((cleanup(mm_operation_end))) = {.shared = shared,.fault_pin=pin};
         shared = BOAROS_MAX_CPUS > 1 && !force;
         enum kernel_mm_status status = mm_operation_begin(mm, &operation);
         if (status) return status;
@@ -6223,7 +6246,7 @@ int kernel_mm_remote_transfer(struct kernel_mm *mm, uint64_t address,
         enum kernel_mm_status status;
         for (;;) {
             if (force) {
-                status=resolve_user_fault(mm,current,access,1);
+                status=resolve_user_fault(mm,current,access,1,NULL);
                 if (status) break;
                 status=mm_operation_begin(mm,&operation);
                 if (status) break;
@@ -6237,7 +6260,7 @@ int kernel_mm_remote_transfer(struct kernel_mm *mm, uint64_t address,
             mm_operation_end(&operation);
             if (status!=KERNEL_MM_STATUS_ACCESS && status!=KERNEL_MM_STATUS_NOT_MAPPED &&
                 status!=KERNEL_MM_STATUS_CONFLICT) break;
-            status=resolve_user_fault(mm,current,access,force);
+            status=resolve_user_fault(mm,current,access,force,NULL);
             if (status) break;
         }
         if (status) return status==KERNEL_MM_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EFAULT;
@@ -6340,13 +6363,9 @@ enum kernel_mm_status kernel_mm_prepare_futex(struct kernel_mm *mm,
         /* private身份只依赖存活MM和VA。驻留页沿共同pin协议取得实际owner，
          * 不等待与身份无关的映射gate；缺页/COW仍在发布pin和key前完成。 */
         if (access) {
-            for (;;) {
-                status = kernel_mm_pin_user_page(mm, addresses[pin_index], access, pin);
-                if (status != KERNEL_MM_STATUS_NOT_MAPPED &&
-                    status != KERNEL_MM_STATUS_ACCESS) break;
-                status = kernel_mm_resolve_user_fault(mm, addresses[pin_index], access);
-                if (status) return status;
-            }
+            status=kernel_mm_pin_user_page(mm,addresses[pin_index],access,pin);
+            if (status==KERNEL_MM_STATUS_NOT_MAPPED || status==KERNEL_MM_STATUS_ACCESS)
+                status=kernel_mm_resolve_user_pin(mm,addresses[pin_index],access,pin);
             if (status) return status;
         }
         for (unsigned i = 0; i < count; i++)
@@ -6434,8 +6453,8 @@ static struct kernel_task *fault_actor(struct kernel_mm *mm)
         task_mm->record != mm->record) return 0;
     return task;
 }
-enum kernel_mm_status kernel_mm_resolve_user_fault(struct kernel_mm *mm,
-    uint64_t address, uint32_t access)
+static enum kernel_mm_status resolve_fault_accounted(struct kernel_mm *mm,
+    uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin)
 {
     struct kernel_task *task = kernel_task_current();
     const struct kernel_mm *task_mm = 0;
@@ -6444,11 +6463,27 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(struct kernel_mm *mm,
                      KERNEL_TASK_STATUS_OK ||
         task_mm->record != mm->record) task = 0;
     uint64_t block_reads = task ? kernel_task_read_bytes(task) : 0U;
-    enum kernel_mm_status status = resolve_user_fault(mm, address, access, 0);
+    enum kernel_mm_status status = resolve_user_fault(mm,address,access,0,pin);
     if (status == KERNEL_MM_STATUS_OK && task)
         kernel_task_account_fault(task,
             kernel_task_read_bytes(task) != block_reads);
     return status;
+}
+
+enum kernel_mm_status kernel_mm_resolve_user_fault(struct kernel_mm *mm,uint64_t address,uint32_t access)
+{ return resolve_fault_accounted(mm,address,access,NULL); }
+
+enum kernel_mm_status kernel_mm_resolve_user_pin(struct kernel_mm *mm,uint64_t address,
+    uint32_t access,struct kernel_mm_user_pin *pin)
+{
+    if (!pin) return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    if (pin->registration) __builtin_trap();
+    for (;;) {
+        enum kernel_mm_status status=resolve_fault_accounted(mm,address,access,pin);
+        if (status || pin->registration) return status;
+        status=kernel_mm_pin_user_page(mm,address,access,pin);
+        if (status!=KERNEL_MM_STATUS_NOT_MAPPED && status!=KERNEL_MM_STATUS_ACCESS) return status;
+    }
 }
 
 enum kernel_mm_status kernel_mm_check_task_domain(const struct kernel_mm *mm)

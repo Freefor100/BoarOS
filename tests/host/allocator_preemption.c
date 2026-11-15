@@ -22,11 +22,12 @@ static void *other_object;
 static uint64_t initial_free;
 static void setup(void);
 static int page_address(const void *,uint64_t *);
-static unsigned count_operations, heap_acquires, order_queries;
+static unsigned count_operations, heap_acquires, order_queries, page_acquires;
 void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *,struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_raw_guard *guard)
 {
     if (count_operations && lock==&heap.lock) heap_acquires++;
+    if (count_operations && lock==&allocator.lock) page_acquires++;
     __real_kernel_raw_lock_acquire(lock,guard);
 }
 enum physical_page_status __real_physical_page_allocation_order(
@@ -37,6 +38,24 @@ enum physical_page_status __wrap_physical_page_allocation_order(
     if (count_operations) order_queries++;
     return __real_physical_page_allocation_order(a,address,order);
 }
+static void cow_borrow_case(void)
+{
+    setup();uint64_t page;uint32_t references;
+    assert(!physical_page_allocate(&allocator,&page) && !physical_page_acquire(&allocator,page));
+    page_acquires=0;count_operations=1;
+    references=physical_page_cow_borrow(&allocator,page);
+    count_operations=0;
+    printf("COW snapshot and borrow: allocator protections=%u\n",page_acquires);fflush(stdout);
+    assert(references==2 && page_acquires==1);
+    assert(!physical_page_reference_count(&allocator,page,&references) && references==3);
+    assert(!physical_page_release(&allocator,page) && !physical_page_release(&allocator,page) && !physical_page_release(&allocator,page));
+    assert(!physical_page_allocate(&allocator,&page));
+    assert(physical_page_cow_borrow(&allocator,page)==1);
+    assert(!physical_page_reference_count(&allocator,page,&references) && references==1);
+    assert(!physical_page_release(&allocator,page));
+    assert(physical_page_available(&allocator)==initial_free);
+}
+
 static void operation_count_case(void)
 {
     setup();
@@ -274,6 +293,7 @@ static void irq_restore_case(uintptr_t enabled)
 }
 int main(void)
 {
+    cow_borrow_case();
     operation_count_case();
     unsigned n = page_case(0);
     for (unsigned i = 1; i <= n; i++) page_case(i);

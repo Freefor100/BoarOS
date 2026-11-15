@@ -102,6 +102,11 @@ struct kernel_mm_user_pin {
     uint32_t access;
     struct kernel_page_cache_write_borrow cache_write;
 };
+/* Resolve a missing private page and lend its actual owner at publication;
+ * shared/file writers retain their final permission/alias recheck. */
+enum kernel_mm_status kernel_mm_resolve_user_pin(struct kernel_mm *,uint64_t,
+    uint32_t,struct kernel_mm_user_pin *);
+
 enum kernel_mm_status kernel_mm_pin_user_page(
     const struct kernel_mm *, uint64_t address, uint32_t access,
     struct kernel_mm_user_pin *);

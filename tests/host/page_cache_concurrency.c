@@ -41,6 +41,7 @@ enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t target,uint
     return target<=kernel_time_monotonic_ns()?KERNEL_TIME_STATUS_DEADLINE_PASSED:KERNEL_TIME_STATUS_OK;
 }
 static void cache_raw_observe(struct kernel_raw_lock *);
+static _Thread_local unsigned *allocation_object_locks;
 #ifdef CACHE_MM_CASES
 #include "mm_disk_cases.h"
 /* This cache/MM fixture does not construct asynchronous OFD state. */
@@ -224,6 +225,7 @@ static _Thread_local struct kernel_rwlock *read_inode_lock;
 static _Thread_local struct physical_page_allocator *read_allocator;
 static void cache_raw_observe(struct kernel_raw_lock *lock)
 {
+    if (allocation_object_locks && lock->rank==KERNEL_RAW_RANK_OBJECT) (*allocation_object_locks)++;
     if (observe_cache_group && lock->rank==KERNEL_RAW_RANK_OBJECT) {
         assert(!cache_group_lock || cache_group_lock==lock);
         cache_group_lock=lock;
@@ -4088,6 +4090,15 @@ int main(int argc, char **argv)
     printf("cache sizes: entry=%zu record=%zu request=%zu\n", sizes.entry_bytes, sizes.record_bytes, sizes.request_bytes);
     assert(pages.reclaim_hooks.reclaim && pages.reclaim_hooks.notify && pages.reclaim_hooks.wait &&
         pages.reclaim_hooks.snapshot && pages.reclaim_hooks.context);
+    /* A clean cache above its physical low watermark has no writeback work.
+     * Anonymous page allocation must not enter cache-group state in that case. */
+    unsigned object_locks=0;uint64_t probe_page;
+    allocation_object_locks=&object_locks;
+    assert(!physical_page_allocate(&pages,&probe_page));
+    allocation_object_locks=NULL;
+    printf("clean high-memory allocation: cache object locks=%u\n",object_locks);
+    assert(!object_locks);
+    assert(!physical_page_release(&pages,probe_page));
     assert(kernel_page_cache_init(&cache, &heap, &pages) ==
         KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT);
     if (argc==3) {

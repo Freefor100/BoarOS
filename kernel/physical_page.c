@@ -1566,18 +1566,34 @@ void physical_page_release_batch(struct physical_page_allocator *a,
         physical_page_release_buddy(a, addresses[i], 0U, &work);
 }
 
-static void acquire_page_locked(struct physical_page_allocator *a, uint64_t address,
+static uint32_t *page_references_locked(const struct physical_page_allocator *a,uint64_t address,
+    uint32_t *page,struct page_work *work)
+{
+    if (!physical_page_allocator_is_finalized(a) || !page_lookup_work(a,address,0,page,work))
+        __builtin_trap();
+    struct buddy_owner head={.first=*page,.order=a->metadata[*page].order,.state=BUDDY_ALLOCATED};
+    if (!head_valid(a,&head,work)) __builtin_trap();
+    return &a->metadata[*page].reference_count;
+}
+static void acquire_page_locked(struct physical_page_allocator *a,uint64_t address,
     struct page_work *work)
 {
     uint32_t page;
-    if (!physical_page_allocator_is_finalized(a) ||
-        !page_lookup_work(a, address, 0, &page, work)) __builtin_trap();
-    struct buddy_owner head = {.first=page, .order=0, .state=BUDDY_ALLOCATED};
-    if (!head_valid(a, &head, work) ||
-        a->metadata[page].state != PHYSICAL_PAGE_STATE_ALLOCATED_HEAD ||
-        a->metadata[page].reference_count == UINT32_MAX) __builtin_trap();
-    a->metadata[page].reference_count++;
-    page_written(work);
+    uint32_t *references=page_references_locked(a,address,&page,work);
+    if (a->metadata[page].order || *references==UINT32_MAX) __builtin_trap();
+    (*references)++;page_written(work);
+}
+uint32_t physical_page_cow_borrow(struct physical_page_allocator *a,uint64_t address)
+{
+    PAGE_METADATA_SCOPE(work,a);
+    uint32_t page;
+    uint32_t *references=page_references_locked(a,address,&page,&work);
+    uint32_t count=*references;
+    if (count>1) {
+        if (*references==UINT32_MAX) __builtin_trap();
+        (*references)++;page_written(&work);
+    }
+    return count;
 }
 
 enum physical_page_status physical_page_acquire(struct physical_page_allocator *a,
@@ -1604,12 +1620,8 @@ physical_page_reference_count(const struct physical_page_allocator *a, uint64_t 
 {
     PAGE_METADATA_SCOPE(work, a);
     uint32_t page;
-    if (!physical_page_allocator_is_finalized(a) || !references ||
-        !page_lookup_work(a, address, 0, &page, &work)) __builtin_trap();
-    struct buddy_owner head = {.first=page, .order=a->metadata[page].order, .state=BUDDY_ALLOCATED};
-    if (a->metadata[page].state != PHYSICAL_PAGE_STATE_ALLOCATED_HEAD ||
-        !head_valid(a, &head, &work)) __builtin_trap();
-    *references = a->metadata[page].reference_count;
+    if (!references) __builtin_trap();
+    *references=*page_references_locked(a,address,&page,&work);
     return PHYSICAL_PAGE_STATUS_OK;
 }
 

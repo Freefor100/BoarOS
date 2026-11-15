@@ -652,6 +652,7 @@ int ext4_raw_inode_fill(const char *path, uint32_t *ret_ino,
  * entry has been unlinked while the handle still owns the inode.
  */
 int ext4_fraw_inode_fill(const ext4_file *file, struct ext4_inode *inode);
+int ext4_read_inode(const char *mount,uint32_t inode,struct ext4_inode *snapshot);
 
 /* Submit the held inode's metadata buffer, without draining unrelated files.
  * Caller must have submitted data first and issue the device barrier after. */
@@ -838,12 +839,10 @@ int ext4_create_child(const char *mount, uint32_t parent, const char *name,
     struct ext4_inode *initial,uint32_t uid,uint32_t gid);
 int ext4_unlink_child(const char *mount, uint32_t parent, const char *name,
     bool directory, uint32_t *inode, bool *orphan);
+/* A NULL mode requests only the stable directory-entry inode identity. */
 int ext4_lookup_child(const char *mount_point, uint32_t parent_inode,
                       const char *name, uint32_t name_length,
                       uint32_t *child_inode, uint32_t *child_mode);
-/* Snapshot the child while its checked directory lookup still holds the inode. */
-int ext4_stat_child(const char *mount,uint32_t parent,const char *name,
-    uint32_t length,uint32_t *inode,struct ext4_inode *snapshot);
 int ext4_readlink_inode(const char *mount_point, uint32_t inode_number,
                         char *buffer, size_t capacity, size_t *bytes_read);
 int ext4_fdir_unlink_dentry(const char *path, uint32_t *out_inode);

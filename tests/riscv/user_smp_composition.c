@@ -123,7 +123,7 @@ static void release_read_waiter(void)
     if (!read_waiter || !control || composition_load(&control->read_release)) return;
     KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
     struct kernel_wait_record *wait=kernel_wait_record_of(read_waiter);
-    if (wait->generation==read_wait_generation && wait->phase==KERNEL_WAIT_COMMITTED && !wait->on_cpu) {
+    if (kernel_wait_record_generation(wait)==read_wait_generation && kernel_wait_record_phase(wait)==KERNEL_WAIT_COMMITTED && !wait->on_cpu) {
         /* 资格等待已实际park；release让保留真实pin的读取者继续复制和归还。 */
         composition_store(&control->read_waited,1);
         composition_store(&control->read_release,1);
@@ -139,7 +139,7 @@ static void release_socket_waiter(void)
     KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
     struct kernel_task *task=process_find_identity(tid,KERNEL_PID_TID);check(task!=0);
     struct kernel_wait_record *wait=kernel_wait_record_of(task);
-    if(wait->phase==KERNEL_WAIT_COMMITTED && !wait->on_cpu) {
+    if(kernel_wait_record_phase(wait)==KERNEL_WAIT_COMMITTED && !wait->on_cpu) {
         /* The MM writer also blocks the user controller: the kernel observer releases the real pin. */
         composition_store(&control->socket_waited,1);
         composition_store(&control->socket_release,1);
@@ -689,8 +689,15 @@ enum kernel_mm_status __wrap_kernel_mm_fork(struct kernel_mm *destination,struct
 }
 
 enum kernel_mm_status __real_kernel_mm_resolve_user_fault(struct kernel_mm *,uint64_t,uint32_t);
-enum kernel_mm_status __wrap_kernel_mm_resolve_user_fault(struct kernel_mm *mm,
-    uint64_t address,uint32_t access)
+enum kernel_mm_status __real_kernel_mm_resolve_user_pin(struct kernel_mm *,uint64_t,uint32_t,struct kernel_mm_user_pin *);
+static enum kernel_mm_status composition_resolve_real(struct kernel_mm *mm,uint64_t address,
+    uint32_t access,struct kernel_mm_user_pin *pin)
+{
+    return pin ? __real_kernel_mm_resolve_user_pin(mm,address,access,pin) :
+        __real_kernel_mm_resolve_user_fault(mm,address,access);
+}
+static enum kernel_mm_status composition_resolve(struct kernel_mm *mm,
+    uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin)
 {
     kernel_pid_t tid=0;
     uint64_t page=address&~BOAROS_PAGE_MASK;
@@ -704,7 +711,7 @@ enum kernel_mm_status __wrap_kernel_mm_resolve_user_fault(struct kernel_mm *mm,
     if (!participant) {
         int local_io=reading_task() && address>=read_address && address-read_address<read_size;
         if(local_io)check(kernel_cpu_current()->logical_id==read_hart);
-        enum kernel_mm_status status=__real_kernel_mm_resolve_user_fault(mm,address,access);
+        enum kernel_mm_status status=composition_resolve_real(mm,address,access,pin);
         if(local_io && !status) { check(kernel_cpu_current()->logical_id==read_hart);read_user_faults++; }
         return status;
     }
@@ -726,7 +733,7 @@ enum kernel_mm_status __wrap_kernel_mm_resolve_user_fault(struct kernel_mm *mm,
     }
     int local_io=reading_task() && address>=read_address && address-read_address<read_size;
     if(local_io)check(kernel_cpu_current()->logical_id==read_hart);
-    enum kernel_mm_status status=__real_kernel_mm_resolve_user_fault(mm,address,access);
+    enum kernel_mm_status status=composition_resolve_real(mm,address,access,pin);
     check(status==KERNEL_MM_STATUS_OK);
     uint64_t resolved=fault_race_file
         ? __atomic_fetch_add(&fault_file_resolved,1,__ATOMIC_ACQ_REL)+1
@@ -736,3 +743,8 @@ enum kernel_mm_status __wrap_kernel_mm_resolve_user_fault(struct kernel_mm *mm,
     if(local_io && !status) { check(kernel_cpu_current()->logical_id==read_hart);read_user_faults++; }
     return status;
 }
+enum kernel_mm_status __wrap_kernel_mm_resolve_user_fault(struct kernel_mm *mm,uint64_t address,uint32_t access)
+{ return composition_resolve(mm,address,access,NULL); }
+enum kernel_mm_status __wrap_kernel_mm_resolve_user_pin(struct kernel_mm *mm,uint64_t address,
+    uint32_t access,struct kernel_mm_user_pin *pin)
+{ return composition_resolve(mm,address,access,pin); }

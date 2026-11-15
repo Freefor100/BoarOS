@@ -140,6 +140,10 @@ void physical_page_acquire_batch(struct physical_page_allocator *allocator,
     const uint64_t *addresses, unsigned count);
 
 /* Only finalized order-zero allocations may gain shared owners. */
+/* Caller owns the page through a stable PTE. Return its pre-borrow count;
+ * if shared, acquire the copy-source loan under that same protection. */
+uint32_t physical_page_cow_borrow(struct physical_page_allocator *,uint64_t address);
+
 enum physical_page_status physical_page_acquire(
     struct physical_page_allocator *allocator,
     uint64_t address);

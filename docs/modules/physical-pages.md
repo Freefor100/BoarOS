@@ -56,7 +56,7 @@ metadata 地址，非法地址或 bootstrap 失败不读取 metadata，也不追
 
 finalized 的 order-0 页可用 `physical_page_acquire()` 增加 32 位引用，
 `physical_page_release()` 只在末引用消失时把页归还 buddy；
-`physical_page_reference_count()` 供 COW 和缓存回收判断共享状态。普通零阶页按 PFN 定位元数据，在分配器锁内检查活块头并增减引用；非末引用释放不查询 buddy 祖先，末次释放才进入完整树验证和合并。分配、释放与合并同步维护块头状态和引用数，旧尾记录不能获得活页资格。高阶块仍是单 owner，
+`physical_page_reference_count()` 供缓存回收等调用者查询共享状态。COW使用`physical_page_cow_borrow()`，在同一次分配器保护内读取引用数，并且仅在原引用数大于1时取得复制来源的临时引用；引用数为1时由仍受MM保护的原PTE持有页面，直接恢复写权限。这样不再将引用数查询与来源借用分成两次查找和取锁。普通零阶页按 PFN 定位元数据，在分配器锁内检查活块头并增减引用；非末引用释放不查询 buddy 祖先，末次释放才进入完整树验证和合并。分配、释放与合并同步维护块头状态和引用数，旧尾记录不能获得活页资格。高阶块仍是单 owner，
 不能通过单页 acquire 拆分引用，避免让连续分配的 tail 生命周期失去统一边界。引用达到
 `UINT32_MAX`、对 free/internal/tail 操作或在 bootstrap 阶段 acquire 都是
 不变量错误并触发 fatal trap；合法 acquire/release 只改变引用和最终可用页计数。

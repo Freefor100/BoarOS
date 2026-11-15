@@ -9,7 +9,13 @@
 #include <kernel/credentials.h>
 #include <stdlib.h>
 
-static unsigned stat_lookup_watch,stat_lookup_reads,stat_lookup_opens;
+static unsigned stat_lookup_watch,stat_lookup_reads,stat_lookup_opens,stat_lookup_io_locks;
+void __real_kernel_rwlock_read(struct kernel_rwlock *,struct kernel_lock_guard *);
+void __wrap_kernel_rwlock_read(struct kernel_rwlock *lock,struct kernel_lock_guard *guard)
+{
+    if (stat_lookup_watch && lock->rank==30) stat_lookup_io_locks++;
+    __real_kernel_rwlock_read(lock,guard);
+}
 int __real_ext4_fs_get_inode_ref_read(struct ext4_fs *,uint32_t,struct ext4_inode_ref *);
 int __wrap_ext4_fs_get_inode_ref_read(struct ext4_fs *fs,uint32_t inode,struct ext4_inode_ref *ref)
 {
@@ -31,14 +37,15 @@ static void directory_reuse_case(struct kernel_vfs_path *root)
     assert(!kernel_vfs_create_at(root,root,"reuse-parent/child/file",0600,&f,0));
     assert(!kernel_vfs_close(&f));
     assert(!kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&before));
-    stat_lookup_watch=1;stat_lookup_reads=stat_lookup_opens=0;
+    stat_lookup_watch=1;stat_lookup_reads=stat_lookup_opens=stat_lookup_io_locks=0;
     for(unsigned i=0;i<32;i++) {
         assert(!kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&after));
         assert(after.ino==before.ino && after.mode==before.mode);
     }
     stat_lookup_watch=0;
-    printf("directory reuse: inode reads=%u opens=%u\n",stat_lookup_reads,stat_lookup_opens);
+    printf("directory reuse: inode reads=%u opens=%u permission I/O locks=%u\n",stat_lookup_reads,stat_lookup_opens,stat_lookup_io_locks);
     assert(!stat_lookup_opens && stat_lookup_reads==64);
+    assert(!stat_lookup_io_locks);
     struct kernel_credentials *lower=kernel_credentials_clone(instance->heap,kernel_credentials_current());
     assert(lower);lower->fsuid=70001;lower->fsgid=70001;lower->effective=0;
     const struct kernel_credentials *previous=kernel_credentials_override(lower);
@@ -91,7 +98,11 @@ static void lookup_attributes_case(struct kernel_vfs_path *root)
     size_t written;
     assert(!kernel_vfs_pwrite(&file,0,"live EOF",8,&written) && written==8);
     assert(!kernel_vfs_fstat(&file,&live));
+    stat_lookup_watch=1;stat_lookup_reads=stat_lookup_opens=0;
     assert(!kernel_vfs_stat_at(root,root,"stat-hard",1,&stat));
+    stat_lookup_watch=0;
+    printf("live hard-link stat: inode reads=%u opens=%u\n",stat_lookup_reads,stat_lookup_opens);
+    assert(stat_lookup_reads==2 && !stat_lookup_opens);
     assert(stat.ino==live.ino && stat.size==8 && stat.blocks==live.blocks &&
         stat.mtime.seconds==live.mtime.seconds && stat.mtime.nanoseconds==live.mtime.nanoseconds);
     assert(!kernel_vfs_path_release(&source) && !kernel_vfs_close(&file));
