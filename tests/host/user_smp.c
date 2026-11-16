@@ -404,7 +404,8 @@ enum kernel_scheduler_status scheduler_switch_claimed(struct kernel_task *old,st
     }
     if (local_rotation_active) {
         assert(next!=active->idle && old->wait.on_cpu && !old->ready_node.queued && !old->ready_cpu);
-        if (!old->idle) assert(old->wait.ready_flags==SCHED_READY_LOCAL);
+        if (!old->idle) assert(old->wait.ready_flags==(SCHED_READY_LOCAL |
+            (local_rotation_active==2?SCHED_READY_HEAD:0)));
         if (local_run_required) {
             assert(scheduler_finish_local(active));
             local_run_required=0;
@@ -740,6 +741,69 @@ static void remote_rt_precedence(void)
     puts("PASS remote RT work defers ordinary selection until the last eligible task leaves");
 }
 
+static void busy_rt_reschedule_cases(void)
+{
+    for (unsigned priority=0;priority<=10;priority+=10) {
+        reset_two_queues();active=&cpus[0];
+        { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+          balance_running(2,0,99);balance_running(3,1,priority);
+          if (priority) tasks[3].scheduling.policy=KERNEL_SCHED_RR;
+          tasks[3].scheduling.rr_remaining_ns=11000000;
+          setup_task(1,2,priority);
+          balance_queued(0,3,80);tasks[0].scheduling.policy=KERNEL_SCHED_RR;
+          tasks[0].scheduling.rr_remaining_ns=37000000; }
+        active=&cpus[1];
+        struct kernel_task *next=0;uint64_t deadline;
+        /* In particular, a busy OTHER CPU must not consume the request in
+         * its local-only fast path while the remote RT task remains queued. */
+        assert(!scheduler_select_local(0,0,0,&next,&deadline) && !next);
+        local_rotation_active=2;
+        assert(!scheduler_reschedule(0,0,0));
+        local_rotation_active=0;
+        assert(active->current==&tasks[0] && tasks[0].wait.on_cpu && !tasks[0].ready_cpu &&
+            tasks[0].scheduling.rr_remaining_ns==37000000 &&
+            tasks[3].scheduling.rr_remaining_ns==11000000);
+        assert_ready_owner(&tasks[3],active);assert_ready_owner(&tasks[1],active);
+        if (priority) assert(active->runqueue.heads[priority]==&tasks[3].ready_node &&
+            tasks[3].ready_node.next==&tasks[1].ready_node);
+    }
+    puts("PASS busy RT reschedule: ordinary fast-path defers; real preemption/finish preserves local FIFO and both RR slices");
+
+    reset_two_queues();active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      balance_running(0,0,80);balance_running(3,1,10);
+      tasks[0].cpu_mask=3;tasks[0].arch.user_mode=1;
+      scheduler_user_service_set_locked(&tasks[0],1);
+      scheduler_user_service_set_locked(&tasks[0],0);
+      assert(tasks[0].reservation_cpu==&cpus[0]);
+      kernel_cpu_consume_schedule(&cpus[1]);setup_task(2,1,99); }
+    local_rotation_active=2;
+    assert(!scheduler_reschedule(0,0,0));
+    local_rotation_active=0;
+    assert_ready_owner(&tasks[0],&cpus[0]);
+    assert(!kernel_cpu_schedule_requested(&cpus[1]));
+    active=&cpus[1];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      assert(!ready_best_locked());
+      scheduler_user_reservation_release_locked(&tasks[0]);
+      assert(kernel_cpu_schedule_requested(active) && ready_best_locked()==&tasks[0]); }
+    puts("PASS busy RT reservation: preserve source qualification, then notify a legal busy peer on actual release");
+
+    reset_two_queues();active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      balance_running(2,0,10);balance_running(3,1,10);
+      tasks[2].arch.user_mode=1;
+      balance_queued(0,3,80);
+      assert(!kernel_cpu_schedule_requested(&cpus[1]));
+      /* CPU0's service class now outranks the queued RT80 independently
+       * of its numerical priority; the peer must be notified immediately. */
+      scheduler_user_service_set_locked(&tasks[2],1);
+      assert(kernel_cpu_schedule_requested(&cpus[1])); }
+    active=&cpus[1];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);assert(ready_best_locked()==&tasks[0]); }
+    puts("PASS busy RT service: running CPU0 service qualification redirects blocked RT work to a legal peer");
+}
+
 static void ordinary_local_slice(void)
 {
     const uint32_t slices[]={100000,30000000,100000000};
@@ -763,9 +827,13 @@ static void ordinary_local_slice(void)
 
 int main(int argc,char **argv)
 {
+    if(argc==2&&!strcmp(argv[1],"--rt-balance-only")) {
+        kernel_wait_domain_init();busy_rt_balance_cases();busy_rt_reschedule_cases();
+        local_fifo_cases();reservation_placement_cases();return 0;
+    }
     if(argc==2&&!strcmp(argv[1],"--slice-only")) {kernel_wait_domain_init();ordinary_local_slice();return 0;}
     if (argc==2) {kernel_wait_domain_init();ordinary_local_park();return 0;}
-    assert(!controlled_smp_main());
+    assert(!controlled_smp_main(0,0));
     ordinary_local_park();
     local_fifo_cases();
     ordinary_local_claim();
@@ -774,6 +842,7 @@ int main(int argc,char **argv)
     ordinary_pull();
     ordinary_local_slice();
     remote_rt_precedence();
+    busy_rt_reschedule_cases();
     reservation_placement_cases();
     scheduler = (struct kernel_scheduler){0};
     scheduler.rt_configuration.period_ns = 1000000000;

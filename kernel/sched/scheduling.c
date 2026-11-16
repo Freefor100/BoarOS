@@ -103,6 +103,8 @@ static void finish_service_sample_locked(struct kernel_task *task)
 #endif
 
 #if BOAROS_MAX_CPUS > 1
+static void ready_notify_rt_locked(struct kernel_cpu *source);
+
 static uint32_t effective_cpu_mask(const struct kernel_task *task)
 {
 #if BOAROS_USER_SMP
@@ -139,6 +141,7 @@ void scheduler_user_reservation_release_locked(struct kernel_task *task)
     dequeue_task(&cpu->user_reservations,&task->reservation_node);
     task->reservation_cpu=0;
     kernel_cpu_request_schedule(cpu);
+    if (task->ready_cpu) ready_notify_rt_locked(task->ready_cpu);
 #else
     (void)task;
 #endif
@@ -155,6 +158,7 @@ void scheduler_user_service_set_locked(struct kernel_task *task, int service)
     if (queued) ready_remove_locked(task);
     task->user_service = service != 0;
     if (queued) ready_enqueue_locked(task, 0);
+    else if (task->wait.on_cpu && is_rt(task)) ready_notify_rt_locked(task->cpu);
 #else
     (void)task; (void)service;
 #endif
@@ -508,13 +512,38 @@ static int ready_allowed_on(struct kernel_cpu *cpu, struct kernel_task *task)
     return 1;
 }
 
-static struct kernel_task *ready_pull_locked(struct kernel_cpu *cpu)
+/* A queued RT task can be stranded by a new local predecessor, a priority
+ * change, or the old stack returning after preemption. Keep its FIFO owner
+ * intact and request every legal lower-ranked executor: requests coalesce,
+ * and the common claim below elects one owner even if several CPUs answer. */
+static void ready_notify_rt_locked(struct kernel_cpu *source)
+{
+    if (!source->pullable_ready) return;
+    for (struct kernel_cpu *cpu=scheduler.cpus;cpu;cpu=cpu->scheduler_next) {
+        if (cpu==source) continue;
+        for (struct kernel_sched_node *node=source->runqueue.rt_first;node;node=node->next) {
+            struct kernel_task *task=node->owner;
+            int blocked=!ready_allowed_on(source,task) || placement_preceded(task,source->current) ||
+                (source->runqueue.rt_first!=node && placement_preceded(task,source->runqueue.rt_first->owner));
+#if BOAROS_USER_SMP
+            blocked |= !source->logical_id && scheduler.rt_services.rt_first;
+#endif
+            if (blocked && ready_allowed_on(cpu,task) && placement_class(task,cpu,ready_load(cpu))<2) {
+                kernel_cpu_request_schedule(cpu);
+                break;
+            }
+        }
+    }
+}
+
+static struct kernel_task *ready_pull_locked(struct kernel_cpu *cpu,int busy,unsigned minimum)
 {
     struct kernel_task *best=0;
     for (struct kernel_cpu *other=scheduler.cpus;other;other=other->scheduler_next) {
         if (other==cpu || !other->pullable_ready) continue;
         for (struct kernel_sched_node *node=kernel_sched_pick(&other->runqueue,1);node;node=kernel_sched_next(&other->runqueue,node)) {
-            if (best && node->priority<=(unsigned)best->scheduling.priority) break;
+            if ((busy && node->priority<=minimum) ||
+                (best && node->priority<=(unsigned)best->scheduling.priority)) break;
             struct kernel_task *task=node->owner;
             if (task->wait.on_cpu || task->ready_cpu!=other) __builtin_trap();
             if (ready_allowed_on(cpu,task)) { best=task; break; }
@@ -552,13 +581,15 @@ struct kernel_task *ready_best_locked(void)
     }
 #endif
 #if BOAROS_MAX_CPUS > 1
-    /* 正在运行者的yield只比较本核FIFO；空闲/阻塞后才取异核更高优先级工作。 */
-    if (!cpu->current || cpu->current->idle ||
-        (cpu->current->state!=KERNEL_THREAD_STATE_RUNNING &&
-         cpu->current->state!=KERNEL_THREAD_STATE_READY)) {
-        struct kernel_task *pulled=ready_pull_locked(cpu);
-        if (pulled && (!node || pulled->scheduling.priority>(int)node->priority)) return pulled;
-    }
+    struct kernel_task *current=cpu->current;
+    int busy=current && !current->idle && (current->state==KERNEL_THREAD_STATE_RUNNING ||
+        current->state==KERNEL_THREAD_STATE_READY);
+    unsigned minimum=busy && ready_allowed_on(cpu,current)?(unsigned)current->scheduling.priority:0;
+    /* Busy CPUs only pull strictly higher RT work. Equal-priority yield and
+     * RR expiration still use the local FIFO; idle/blocked CPUs may pull fair
+     * work too. A throttled or disallowed current task is not a competitor. */
+    struct kernel_task *pulled=ready_pull_locked(cpu,busy,minimum);
+    if (pulled && (!node || pulled->scheduling.priority>(int)node->priority)) return pulled;
 #endif
     return node ? node->owner : 0;
 }
@@ -642,6 +673,9 @@ static void ready_enqueue_at_locked(struct kernel_task *task, int flags
     preempt |= is_rt_service(task) && !is_rt_service(target->current);
 #endif
     if (preempt) kernel_cpu_request_schedule(target);
+#if BOAROS_MAX_CPUS > 1
+    if (is_rt(task)) ready_notify_rt_locked(target);
+#endif
 }
 void ready_enqueue_locked(struct kernel_task *task,int flags)
 {
@@ -723,6 +757,12 @@ static struct kernel_task *claim_next_locked(struct kernel_cpu *cpu,
 #endif
     cpu->switch_previous = previous;
     cpu->rotate_other = 0;
+#if BOAROS_MAX_CPUS > 1
+    /* RT claims already hold common control and all run locks. A higher
+     * remote successor can strand an existing local RT head even when the
+     * old task was ordinary and its later enqueue would not rebalance RT. */
+    if (is_rt(next)) ready_notify_rt_locked(cpu);
+#endif
     return next;
 }
 
@@ -921,7 +961,7 @@ int scheduler_select_local(int blocked,int rotate,int voluntary,struct kernel_ta
     {
         KERNEL_RAW_SCOPE(guard,kernel_run_lock(cpu));
         if (!local_queue_eligible(cpu,current,blocked)) return 0;
-        if ((blocked || current->idle) && remote_rt_ready(cpu)) return 0;
+        if (remote_rt_ready(cpu)) return 0;
         struct kernel_sched_node *head=kernel_sched_pick(&cpu->runqueue,1);
         account_cpu(cpu,kernel_time_monotonic_ns());
         if (blocked) {
@@ -1214,12 +1254,20 @@ void scheduler_pi_priority_locked(struct kernel_task *task,unsigned base,unsigne
 #endif
         );
 #if BOAROS_MAX_CPUS > 1
-    if (changed_boost && queued) kernel_cpu_request_schedule(ready_owner);
+    if (changed_boost && queued) {
+        kernel_cpu_request_schedule(ready_owner);
+        if (!move) ready_notify_rt_locked(ready_owner);
+    }
 #else
     if (changed_boost && queued) kernel_cpu_request_schedule(task->cpu?task->cpu:caller);
 #endif
-    if((move || changed_boost) && task->wait.on_cpu)
-        kernel_cpu_request_schedule(task->cpu?task->cpu:caller);
+    if((move || changed_boost) && task->wait.on_cpu) {
+        struct kernel_cpu *owner=task->cpu?task->cpu:caller;
+        kernel_cpu_request_schedule(owner);
+#if BOAROS_MAX_CPUS > 1
+        ready_notify_rt_locked(owner);
+#endif
+    }
 }
 
 static int nice_reduction_allowed(struct kernel_task *target,int nice)

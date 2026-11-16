@@ -11,6 +11,12 @@
 /* The scheduler actors in this model have no ptrace state. */
 uint32_t kernel_ptrace_tracer_tid_locked(const struct kernel_task *task)
 { assert(!task->ptrace);return 0; }
+int kernel_ptrace_group_prepare_locked(struct kernel_task *task,unsigned sig)
+{ (void)sig;assert(!task->ptrace);return 0; }
+int kernel_ptrace_group_stopped_locked(const struct kernel_task *task)
+{ assert(!task->ptrace);return 0; }
+int kernel_ptrace_group_stop(struct kernel_task *task,unsigned sig)
+{ (void)sig;assert(!task->ptrace);return 0; }
 void kernel_ptrace_group_continue_locked(struct kernel_task *task)
 { assert(!task->ptrace); }
 void kernel_ptrace_dispose(struct kernel_task *task)
