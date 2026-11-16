@@ -64,10 +64,10 @@ static void accept_allocation_case(struct kernel_heap *heap,
     struct kernel_open_file_description *listener=NULL,*client=NULL;
     struct kernel_files server_files={0},client_files={0};
     assert(!kernel_files_create(&server_files,heap) && !kernel_files_create(&client_files,heap));
-    assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_UNIX,1,&listener_socket) &&
+    assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_UNIX,1, 0,&listener_socket) &&
         !kernel_socket_bind(listener_socket,&address) && !kernel_socket_listen(listener_socket,1));
     assert(!kernel_open_file_create_socket(heap,listener_socket,2|KERNEL_FILES_O_NONBLOCK,&listener));
-    assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_UNIX,1,&client_socket) &&
+    assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_UNIX,1, 0,&client_socket) &&
         !kernel_socket_connect(client_socket,&address,1));
     assert(!kernel_open_file_create_socket(heap,client_socket,2,&client) &&
         !kernel_files_install_new_owned_at(&client_files,0,0,&client));
@@ -120,7 +120,7 @@ static void accept_failure_cleanup_case(struct kernel_heap *heap,struct kernel_c
     struct kernel_open_file_description *listener=NULL;
     struct kernel_files handle={0};
     assert(!kernel_files_create(&handle,heap));
-    assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_UNIX,1,&socket) &&
+    assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_UNIX,1, 0,&socket) &&
         !kernel_socket_bind(socket,&address) && !kernel_socket_listen(socket,1));
     assert(!kernel_open_file_create_socket(heap,socket,2|KERNEL_FILES_O_NONBLOCK,&listener));
     struct kernel_heap_statistics before,after;
@@ -131,7 +131,7 @@ static void accept_failure_cleanup_case(struct kernel_heap *heap,struct kernel_c
     expect_no_accept_fd(&handle);
     kernel_heap_get_statistics(heap,&after);
     assert(after.live_allocations==before.live_allocations && credential->references==references);
-    assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_UNIX,1,&client) && !kernel_socket_connect(client,&address,1));
+    assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_UNIX,1, 0,&client) && !kernel_socket_connect(client,&address,1));
     struct accept_copy_context copy={.files=&handle,.error=-KERNEL_EFAULT};
     assert(!kernel_files_socket_accept(&handle,listener,KERNEL_FILES_O_CLOEXEC,
         accept_copy_peer,&copy,&result) && result==-KERNEL_EFAULT && copy.calls==1);
@@ -150,12 +150,12 @@ static void socket_creation_case(struct kernel_heap *heap,struct kernel_credenti
     unsigned references=credential->references;
     int64_t result;
     accept_ofd_failure=1;accept_ofd_allocations=0;
-    assert(!kernel_files_socket_create(&handle,KERNEL_SOCKET_AF_UNIX,1,0,&result) &&
+    assert(!kernel_files_socket_create(&handle,KERNEL_SOCKET_AF_UNIX,1, 0,0,&result) &&
         result==-KERNEL_ENOMEM && accept_ofd_allocations==1);
     accept_ofd_failure=0;expect_no_accept_fd(&handle);
     kernel_heap_get_statistics(heap,&after);
     assert(after.live_allocations==before.live_allocations && credential->references==references);
-    assert(!kernel_files_socket_create(&handle,KERNEL_SOCKET_AF_UNIX,1,
+    assert(!kernel_files_socket_create(&handle,KERNEL_SOCKET_AF_UNIX,1, 0,
         KERNEL_FILES_O_NONBLOCK|KERNEL_FILES_O_CLOEXEC,&result) && !result);
     assert(credential->references==references+1 &&
         handle.record->slots[0].flags==KERNEL_FILES_FD_CLOEXEC);

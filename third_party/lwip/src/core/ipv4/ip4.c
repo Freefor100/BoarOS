@@ -417,6 +417,12 @@ ip4_input_accept(struct netif *netif)
   if ((netif_is_up(netif)) && (!ip4_addr_isany_val(*netif_ip4_addr(netif)))) {
     /* unicast to this interface address? */
     if (ip4_addr_eq(ip4_current_dest_addr(), netif_ip4_addr(netif)) ||
+#if BOAROS_LWIP_LINUX_LOOPBACK
+        /* Linux routes the complete 127/8 range locally, including aliases
+         * and subnet broadcasts on lo, which has no Ethernet broadcast flag. */
+        (ip4_addr_isloopback(netif_ip4_addr(netif)) &&
+         ip4_addr_isloopback(ip4_current_dest_addr())) ||
+#endif
         /* or broadcast on this interface network address? */
         ip4_addr_isbroadcast(ip4_current_dest_addr(), netif)
 #if LWIP_NETIF_LOOPBACK && !LWIP_HAVE_LOOPIF
@@ -960,10 +966,12 @@ ip4_output_if_opt_src(struct pbuf *p, const ip4_addr_t *src, const ip4_addr_t *d
 #if CHECKSUM_GEN_IP_INLINE
     chk_sum += iphdr->_len;
 #endif /* CHECKSUM_GEN_IP_INLINE */
-    IPH_OFFSET_SET(iphdr, 0);
+    IPH_OFFSET_SET(iphdr, ((p->flags & PBUF_FLAG_IP4_LOCAL_DF) &&
+                         (!netif->mtu || p->tot_len<=netif->mtu)) ? PP_HTONS(IP_DF) : 0);
     IPH_ID_SET(iphdr, lwip_htons(ip_id));
 #if CHECKSUM_GEN_IP_INLINE
     chk_sum += iphdr->_id;
+    chk_sum += iphdr->_offset;
 #endif /* CHECKSUM_GEN_IP_INLINE */
     ++ip_id;
 
@@ -1030,6 +1038,12 @@ ip4_output_if_opt_src(struct pbuf *p, const ip4_addr_t *src, const ip4_addr_t *d
   }
 #endif /* LWIP_MULTICAST_TX_OPTIONS */
 #endif /* ENABLE_LOOPBACK */
+#if LWIP_MULTICAST_TX_OPTIONS
+  /* TTL zero still permits the local multicast copy, but cannot leave host. */
+  if (ip4_addr_ismulticast(dest) && IPH_TTL(iphdr) == 0) {
+    return ERR_OK;
+  }
+#endif
 #if IP_FRAG
   /* don't fragment if interface has mtu set to 0 [loopif] */
   if (netif->mtu && (p->tot_len > netif->mtu)) {

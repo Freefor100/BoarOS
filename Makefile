@@ -284,6 +284,7 @@ LWIP_SOURCES := \
 	third_party/lwip/src/core/memp.c \
 	third_party/lwip/src/core/netif.c \
 	third_party/lwip/src/core/pbuf.c \
+	third_party/lwip/src/core/raw.c \
 	third_party/lwip/src/core/stats.c \
 	third_party/lwip/src/core/sys.c \
 	third_party/lwip/src/core/tcp.c \

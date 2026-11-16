@@ -83,7 +83,7 @@ static enum kernel_files_status install_socket(
 }
 
 enum kernel_files_status kernel_files_socket_create(
-    struct kernel_files *files, int family, int type, uint32_t flags,
+    struct kernel_files *files, int family, int type, int protocol, uint32_t flags,
     int64_t *linux_result)
 {
     KERNEL_SERVICE_SCOPE(service);
@@ -101,7 +101,7 @@ enum kernel_files_status kernel_files_socket_create(
         return KERNEL_FILES_STATUS_OK;
     }
     struct kernel_files_fd_reservation reservation __attribute__((cleanup(kernel_files_cancel_reservation)))={files,fd};
-    result = kernel_socket_create(files->heap, family, type, &socket);
+    result = kernel_socket_create(files->heap, family, type, protocol, &socket);
     if (result != 0) {
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;

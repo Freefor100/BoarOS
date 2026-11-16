@@ -171,7 +171,7 @@ void kernel_socket_protocol_snapshot(uint64_t values[KERNEL_SOCKET_PROTOCOL_VALU
 void kernel_socket_address_release(struct kernel_socket_address *address);
 struct kernel_socket_peercred { int32_t pid; uint32_t uid, gid; };
 int kernel_socket_peercred(struct kernel_socket *, struct kernel_socket_peercred *);
-int kernel_socket_create(struct kernel_heap *heap, int family, int type,
+int kernel_socket_create(struct kernel_heap *heap, int family, int type, int protocol,
                          struct kernel_socket **owner);
 int kernel_socket_pair(struct kernel_heap *heap, int type,
                        struct kernel_socket **owner_a,
@@ -226,9 +226,18 @@ enum kernel_socket_option {
     KERNEL_SOCKET_TYPE, KERNEL_SOCKET_ERROR, KERNEL_SOCKET_ACCEPTCONN,
     KERNEL_SOCKET_PASSCRED,
     KERNEL_SOCKET_NODELAY, KERNEL_SOCKET_MAXSEG, KERNEL_SOCKET_V6ONLY,
+    KERNEL_SOCKET_BROADCAST, KERNEL_SOCKET_IPV4_TTL, KERNEL_SOCKET_MULTICAST_TTL,
 };
 int kernel_socket_set_option(struct kernel_socket *socket,
                              enum kernel_socket_option option, int value);
+/* Names are kernel strings bounded by IFNAMSIZ. Interface identities are
+ * numeric; these calls do not lend netif storage to the syscall layer. */
+int kernel_socket_set_bound_device(struct kernel_socket *, const char *name);
+/* length supplies user capacity and receives the actual name length. */
+int kernel_socket_get_bound_device(struct kernel_socket *, char name[16], uint32_t *length);
+/* address is network order; index zero selects by address or clears selection. */
+int kernel_socket_set_multicast_interface(struct kernel_socket *, uint32_t index, uint32_t address);
+int kernel_socket_get_multicast_interface(struct kernel_socket *, uint32_t *address);
 /* A write that already waited consumes an AF_UNIX asynchronous peer reset. */
 int kernel_socket_unix_wait_error(struct kernel_socket *socket);
 int kernel_socket_get_option(struct kernel_socket *socket,

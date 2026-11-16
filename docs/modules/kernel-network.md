@@ -28,6 +28,10 @@ socket 的信号驱动通知由 OFD 的 [异步状态](kernel-files.md#信号驱
 
 当前支持 `AF_INET`/`AF_INET6` 的 `SOCK_DGRAM`/`SOCK_STREAM`，`SOCK_CLOEXEC`、`SOCK_NONBLOCK`，UDP bind/getsockname/sendto/recvfrom 和 `SO_RCVTIMEO`，TCP bind/listen/connect/accept，以及连接后的普通读写和就绪。绑定非零低端口（小于 1024）要求当前调用者的 CAP_NET_BIND_SERVICE，端口 0 仍由协议选择临时端口。网卡启停、IPv4 地址/掩码/MTU 和默认网关的实际接口及权限见[网络设备](riscv-virtio-net.md#地址与用户接口)。地址在 syscall 边界使用 RV64 `sockaddr_in`/`sockaddr_in6` 布局；内核地址携带族、16 字节网络序地址、宿主序端口和 scope。官方 loopif 提供 `::1`；IPv6 通配监听默认接收 IPv4，accept 返回映射地址。V6ONLY 在绑定前生效，双栈通配与纯 IPv6/IPv4 的端口交集由非持引用的 endpoint 登记补齐 lwIP TCP bind 的 ANY 检查缺口。登记保留指向自身的前驱链指针，最后关闭可直接摘除。非阻塞、坏 fd/地址/指针和协议错误由固定 Linux 同一 ELF 差分约束。未覆盖的地址族、选项和操作返回明确 errno，不伪造成功。
 
+`AF_INET/SOCK_RAW/IPPROTO_ICMP` 提供 IPv4 ICMP 原始报文接口，创建要求 CAP_NET_RAW。protocol 从系统调用经 FD 创建传给协议后端，不由 socket 类型猜测。发送方提供 ICMP 头和校验和，内核添加 IPv4 头；接收包含完整 IPv4 头，来源端口为零。端口绑定不参与 TCP/UDP 的低端口权限与分配。每个 raw PCB 的回调只观察原包，为自己的接收队列保存独立内容；过滤、队列满或分配失败只影响该接收者，不吞掉其他 raw 接收者或内核 Echo 响应的输入。读写、向量、PEEK/TRUNC、就绪和超时共用现有消息路径，关闭在协议资格下撤销回调和 PCB 后归还接收 owner。DGRAM ping、其他 raw 协议、IP_HDRINCL、PMTU 配置和远端 MTU 缓存尚未接入。
+
+`SO_BROADCAST` 默认关闭，在选定实际 IPv4 出接口后限制广播发送，未许可返回 EACCES；接收广播不要求该选项。`IP_TTL` 控制 IPv4 发包，默认 64；`IP_MULTICAST_TTL` 默认 1，`IP_MULTICAST_IF` 保存组播发送接口与地址，组播 TTL 为零时不向物理接口发送。发送选项不表示已支持组播入组。UDP connect、UDP send 与 raw send 共用出接口和源地址选择，随后使用选定结果发送，不再次路由。`SO_BINDTODEVICE` 保存数值接口索引，影响发送与接收；接口 down 后保留绑定，不静默回退。按固定 Linux，首次绑定允许无 CAP_NET_RAW，已有绑定的修改与解除要求该能力。TCP 更新同时协调所属执行者与四元组索引，监听连接继承实际绑定。
+
 输入地址按 Linux 的有符号 32 位长度校验，bind/connect/sendto 拒绝负值及超过 128 字节的声明，并完整复制声明范围后解析。sendmsg 对空 name、负长度及超过 128 字节的输入使用其独立的规范化规则；先完成 name 复制和 iovec 导入，再解释地址，错误路径保留协议状态和报文队列。
 
 sendmmsg(269)/recvmmsg(243) 使用原生64位 mmsghdr（64字节，msg_len位于偏移56），与单消息入口共用收发核心。整批固定原socket OFD；每条才导入自己的header、iovec和控制区，完成后立即释放消息资源，复制和等待仍在发起CPU。sendmmsg将vlen限制为1024，并在部分发送后停止；recvmmsg保留unsigned vlen，MSG_WAITFORONE在首条完成后启用DONTWAIT。已完成条数优先于后续错误和信号重启，接收的后续非EAGAIN错误留给下一次调用或SO_ERROR。msg_len在协议消费和控制FD安装后输出，输出故障保留这些副作用。recvmmsg的timespec在每条完成后检查并更新，阻塞接收仍由SO_RCVTIMEO约束；仅正条数才输出剩余时间，输出故障返回EFAULT。参数顺序与错误规则依据固定[`net/socket.c`](../../references/linux/net/socket.c)。
@@ -184,6 +188,10 @@ TCP 请求由 syscall 栈持有，OFD 覆盖整个接纳过程；用户页只借
 epoll控制仍在CPU0，等待扫描和事件复制在发起CPU执行，详见[文件接口](kernel-files.md#epoll-事件通知子系统)。独立状态锁维护候选、控制代次、ONESHOT 和扫描引用；目标就绪查询、用户复制、上层通知及等待游标排空在锁外执行。端点通知取得现有队列/节点借用后释放端点锁，因此远端回调与 DEL、MOD、关闭可以交错，实际回调归还前存储保持有效。
 
 ## 验证
+
+`tests/userland/api8.py --program ipv4_abi` 用同一 ELF 对照 Linux 的 raw 创建、五种选项、短缓冲、fault 输出顺序、设备权限与组播源地址。参考内核须启用 NETDEVICES，否则 Linux 自身不提供设备绑定选项。`tests/userland/run.py --workload ipv4_basic` 检查 raw 双接收、PEEK/TRUNC、大包回环和广播许可；`tests/userland/network-external.py --workload ipv4_basic --only both` 使用同一程序和原 BusyBox 进行 TAP 对照，核对线上 TTL、分片、来源、不同设备同端口的 UDP/TCP 隔离及 ping 参数。`--cpus 2` 将实际调用者固定在 CPU1 并检查记录；RV 支持 legacy/modern，LA 使用 modern。原 LA BusyBox 可用显式 `--busybox` 指定静态原 ELF，执行器记录路径与哈希，不替代为另一工具链构建身份。INET TCP 接收当前仍不支持 MSG_WAITALL，这些消费者使用普通短读循环完成精确收包。
+
+`tests/host/network_owner.py --case raw-icmp-owner --case raw-icmp-close --case ipv4-options --sanitize` 以真实协议实现检查独立报文版本、过滤/队列/分配失败、实际回调期间关闭、广播、设备隔离和握手中的绑定继承；`--page-shift 14` 覆盖 LA 页大小。暂停发生在实际过滤回调和协议资格交接处，不以延时猜测交错。
 
 静态/动态 musl 的原生并发短例复用 `tests/userland/run.py --workload smp`。私有 `USER_SMP_COMPOSITION=1` 内核配合 `--observe` 检查每个发起 CPU 的预约、复制、pin 与等待；三项握手分别暂停真实接收预约、发送页 pin 和 epoll 通知借用，核对追加/最后关闭、mprotect 和 DEL 的实际等待及资源归还。正式性能内核关闭这些观察。
 

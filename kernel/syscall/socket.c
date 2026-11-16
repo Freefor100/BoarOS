@@ -37,6 +37,7 @@
 #define LINUX_SOCK_CLOEXEC 02000000
 #define LINUX_IPPROTO_TCP 6
 #define LINUX_IPPROTO_UDP 17
+#define LINUX_IPPROTO_ICMP 1
 #define LINUX_IPPROTO_MAX 263
 #define LINUX_SOCKADDR_STORAGE_SIZE 128
 #define LINUX_SOCKADDR_UN_SIZE 110
@@ -242,6 +243,7 @@ static int socket_option(int level, int name, enum kernel_socket_option *option)
         case 2: *option = KERNEL_SOCKET_REUSEADDR; return 0;
         case 3: *option = KERNEL_SOCKET_TYPE; return 0;
         case 4: *option = KERNEL_SOCKET_ERROR; return 0;
+        case 6: *option = KERNEL_SOCKET_BROADCAST; return 0;
         case 7: *option = KERNEL_SOCKET_SNDBUF; return 0;
         case 8: *option = KERNEL_SOCKET_RCVBUF; return 0;
         case 9: *option = KERNEL_SOCKET_KEEPALIVE; return 0;
@@ -330,6 +332,79 @@ static int filter_sockopt(struct kernel_socket *socket,struct kernel_files *file
     return error;
 }
 
+static int device_sockopt(struct kernel_socket *socket, struct kernel_mm *mm,
+    const struct kernel_syscall_request *request, int get, int32_t length)
+{
+    char device[16] = {0};
+    size_t copied = 0;
+    if (!get) {
+        size_t input = (uint32_t)length < sizeof(device) - 1 ?
+            (uint32_t)length : sizeof(device) - 1;
+        if (input && (kernel_copy_from_user(mm, device, request->arguments[3], input, &copied) !=
+                KERNEL_UACCESS_STATUS_OK || copied != input)) return -KERNEL_EFAULT;
+        return kernel_socket_set_bound_device(socket, device);
+    }
+    uint32_t output = (uint32_t)length;
+    int result = kernel_socket_get_bound_device(socket, device, &output);
+    if (result) return result;
+    if (output && (kernel_copy_to_user(mm, request->arguments[3], device, output, &copied) !=
+            KERNEL_UACCESS_STATUS_OK || copied != output)) return -KERNEL_EFAULT;
+    length = (int32_t)output;
+    if (kernel_copy_to_user(mm, request->arguments[4], &length, sizeof(length), &copied) !=
+            KERNEL_UACCESS_STATUS_OK || copied != sizeof(length)) return -KERNEL_EFAULT;
+    return 0;
+}
+
+/* SOL_IP has byte-sized scalar inputs and publishes optlen before optval.
+ * Its multicast interface also has three native input layouts. */
+static int ipv4_sockopt(struct kernel_socket *socket, struct kernel_mm *mm,
+    const struct kernel_syscall_request *request, int get, int32_t length)
+{
+    int name = (int32_t)request->arguments[2];
+    int value = 0;
+    uint32_t address = 0;
+    size_t copied = 0;
+    enum kernel_socket_option option = name == 2 ?
+        KERNEL_SOCKET_IPV4_TTL : KERNEL_SOCKET_MULTICAST_TTL;
+    if (!get) {
+        if (name == 32) { /* IP_MULTICAST_IF */
+            struct { uint32_t group, address; int32_t index; } selection = {0};
+            if (length < 4) return -KERNEL_EINVAL;
+            size_t input = length >= 12 ? 12U : length >= 8 ? 8U : 4U;
+            void *target = input == 4 ? (void *)&selection.address : (void *)&selection;
+            if (kernel_copy_from_user(mm, target, request->arguments[3], input, &copied) !=
+                    KERNEL_UACCESS_STATUS_OK || copied != input) return -KERNEL_EFAULT;
+            return kernel_socket_set_multicast_interface(socket,
+                (uint32_t)selection.index, selection.address);
+        }
+        if (length >= (int32_t)sizeof(value)) {
+            if (kernel_copy_from_user(mm, &value, request->arguments[3], sizeof(value), &copied) !=
+                    KERNEL_UACCESS_STATUS_OK || copied != sizeof(value)) return -KERNEL_EFAULT;
+        } else if (length) {
+            unsigned char byte;
+            if (kernel_copy_from_user(mm, &byte, request->arguments[3], sizeof(byte), &copied) !=
+                    KERNEL_UACCESS_STATUS_OK || copied != sizeof(byte)) return -KERNEL_EFAULT;
+            value = byte;
+        }
+        if (!length) return -KERNEL_EINVAL;
+        return kernel_socket_set_option(socket, option, value);
+    }
+    int result = name == 32 ? kernel_socket_get_multicast_interface(socket, &address) :
+        kernel_socket_get_option(socket, option, &value);
+    if (result) return result;
+    unsigned char byte = (unsigned char)value;
+    const void *output = name == 32 ? (const void *)&address : (const void *)&value;
+    if (name != 32 && length > 0 && length < (int32_t)sizeof(value) && value >= 0 && value <= 255) {
+        length = 1;
+        output = &byte;
+    } else if (length > (int32_t)sizeof(value)) length = sizeof(value);
+    if (kernel_copy_to_user(mm, request->arguments[4], &length, sizeof(length), &copied) !=
+            KERNEL_UACCESS_STATUS_OK || copied != sizeof(length)) return -KERNEL_EFAULT;
+    if (length && (kernel_copy_to_user(mm, request->arguments[3], output, (uint32_t)length, &copied) !=
+            KERNEL_UACCESS_STATUS_OK || copied != (uint32_t)length)) return -KERNEL_EFAULT;
+    return 0;
+}
+
 static int sockopt(struct kernel_socket *socket, struct kernel_files *files, struct kernel_mm *mm,
                    const struct kernel_syscall_request *request, int get)
 {
@@ -349,6 +424,10 @@ static int sockopt(struct kernel_socket *socket, struct kernel_files *files, str
                 KERNEL_UACCESS_STATUS_OK || copied != sizeof(length)) return -KERNEL_EFAULT;
     }
     if (length < 0) return -KERNEL_EINVAL;
+    if (level == LINUX_SOL_SOCKET && name == 25)
+        return device_sockopt(socket, mm, request, get, length);
+    if (level == 0 && (name == 2 || name == 32 || name == 33))
+        return ipv4_sockopt(socket, mm, request, get, length);
     if(level==LINUX_SOL_SOCKET && (name==26 || name==27 || name==44 || name==50)) {
         /* Classic-program import/export holds separate heap/program owners
          * across user faults. Keep their existing service lifetime. */
@@ -440,6 +519,11 @@ static int socket_creation_error(int family, int type, int protocol)
     if (family != LINUX_AF_UNIX && base_type == LINUX_SOCK_RAW && protocol == 0) {
         return -KERNEL_EPROTONOSUPPORT;
     }
+    if (family == LINUX_AF_INET && base_type == LINUX_SOCK_RAW) {
+        if (protocol != LINUX_IPPROTO_ICMP) return -KERNEL_EPROTONOSUPPORT;
+        return kernel_credentials_capable(kernel_credentials_current(), KERNEL_CAP_NET_RAW) ?
+            0 : -KERNEL_EPERM;
+    }
     if (family != LINUX_AF_UNIX && ((base_type == LINUX_SOCK_STREAM &&
          protocol != 0 && protocol != LINUX_IPPROTO_TCP) ||
         (base_type == LINUX_SOCK_DGRAM &&
@@ -479,7 +563,7 @@ enum kernel_syscall_status syscall_handle_socket(
         return KERNEL_SYSCALL_STATUS_OK;
     }
     if (task_status != KERNEL_TASK_STATUS_OK ||
-        kernel_files_socket_create(files, family, base_type,
+        kernel_files_socket_create(files, family, base_type, protocol,
                                    (uint32_t)type, &decoded->value) !=
             KERNEL_FILES_STATUS_OK)
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;

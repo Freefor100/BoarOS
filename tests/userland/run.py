@@ -17,6 +17,19 @@ sys.path.insert(0,str(ROOT/'tests/diff-abi'))
 import harness
 from arch_profiles import PROFILES
 
+def ipv4_basic_output(raw,cpus=1):
+    records = [line for line in raw.replace('\r', '').splitlines() if line.startswith(('IPV4 CASE ', 'NETWORK PASS ipv4_basic'))]
+    expected = ['IPV4 CASE ' + name + ' PASS' for name in (
+        'raw-two-receivers-peek-trunc', 'raw-large-loopback', 'broadcast-permission-receive')]
+    return (records == expected + ['NETWORK PASS ipv4_basic'] and 'IPV4 FAIL' not in raw and
+        re.findall(r'^IPV4 CALLER cpu=(\d+) cpus=(\d+)$', raw.replace('\r', ''), re.M) ==
+        [('1' if cpus>1 else '0',str(cpus))])
+
+def ipv4_reference_fixture(image,directory):
+    marker=directory/'reference-network-setup';marker.touch()
+    harness.run_logged(['debugfs','-w','-R',f'write "{marker}" /reference-network-setup',str(image)],
+                       directory/'reference-setup.log')
+
 def workload_source(name):
     if name == 'mount_namespace': return ROOT / 'tests/workloads/resource/mount_namespace.c'
     if name == 'bpf_abi': return ROOT / 'tests/workloads/resource/bpf_abi.c'
@@ -439,7 +452,7 @@ def run_loongarch(args):
         for cpus in args.cpus or (1,):
             for memory in args.memory or ('512M','1G'):
                 case=work/(f'{platform}-{memory}'+(f'-{cpus}cpu' if args.cpus else ''));case.mkdir()
-                image=harness.fixture(case,program) if args.workload in ('pipe','event','altstack','queued','posix','futex','mremap','unix_control','unix_seqpacket','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','chroot','proc_thread_resources','clone_resources','pi','futex_vector') else disk(case,program)
+                image=harness.fixture(case,program) if args.workload in ('ipv4_basic','pipe','event','altstack','queued','posix','futex','mremap','unix_control','unix_seqpacket','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','chroot','proc_thread_resources','clone_resources','pi','futex_vector') else disk(case,program)
                 if args.workload=='chroot':chroot_fixture(image,case,'loongarch')
                 kernel=profile.linux_kernel(noswap=args.workload=='madvise') if platform=='linux' else args.kernel or ROOT/profile.kernel
                 snapshot=case/'kernel';shutil.copyfile(kernel,snapshot)
@@ -455,6 +468,7 @@ def run_loongarch(args):
                 passed=not code and ('FUTEX CALLER PASS cases=28' if args.workload=='futex' else 'POSIX END failures=0' if args.workload=='posix' else 'QUEUED END failures=0' if args.workload=='queued' else 'ALTSTACK END 6' if args.workload=='altstack' else 'EPOLL PASS delivery' if args.workload=='epoll' else 'PIPE END 7' if args.workload=='pipe' else 'EVENT END 8' if args.workload=='event' else f'NETWORK PASS {args.workload}') in raw and 'fatal' not in raw and (
                     'Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
                 if digest(program)!=metadata['program_sha256']:raise RuntimeError('ELF changed during comparison')
+                if args.workload=='ipv4_basic':passed=passed and ipv4_basic_output(raw,cpus)
                 if args.workload=='futex':
                     lines,expected=futex_lines(raw,cpus);passed=passed and lines==expected
                 if args.workload=='unix_named':passed=not code and unix_named_output(raw,False) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
@@ -505,7 +519,7 @@ def run_smp(args):
     from user import boot_user,identity
     output=args.output or ROOT/'build/network'/('socket-smp-'+str(time.time_ns()))
     output.mkdir(parents=True,exist_ok=False)
-    compiler=Path('/usr/bin/riscv64-linux-gnu-gcc') if args.libc=='glibc' else ROOT/'build/riscv/musl-root/bin/musl-gcc'
+    compiler=Path('/usr/bin/riscv64-linux-gnu-gcc') if args.libc=='glibc' else Path(os.environ.get('MUSL_CC') or ROOT/'build/riscv/musl-root/bin/musl-gcc')
     program=output/'program'
     compile_command=[str(compiler),*PROFILES['riscv'].musl_flags(compiler),
         *(['-Wl,--dynamic-linker=/lib/ld-musl-riscv64.so.1'] if args.dynamic else ['-static']),*(['-DEVENT_SMOKE=1'] if args.workload=='event' and not args.observe else []),'-O2','-pthread','-Wall','-Wextra','-Werror',
@@ -556,6 +570,7 @@ def run_smp(args):
                     harness.run_logged(['debugfs','-w','-f',str(batch),str(fixture)],folder/'loader.log')
                 for target,kernel in variants:
                     disk=folder/(target+'.img');shutil.copyfile(fixture,disk)
+                    if target=='linux' and args.workload=='ipv4_basic':ipv4_reference_fixture(disk,folder)
                     if target=='boaros' and args.observe:
                         marker=folder/'socket-observer';marker.write_text('private correctness observations\n')
                         batch=folder/'observer.debugfs';batch.write_text(f'write "{marker.resolve()}" /'+('futex-observer' if futex else 'posix-observer' if posix else 'queued-observer' if queued else 'altstack-observer' if altstack else 'event-observer' if event else 'pipe-observer' if pipe else 'socket-observer')+'\n')
@@ -572,6 +587,7 @@ def run_smp(args):
                     if queued:expected=[f'QUEUED THREADS mode={mode} cpus={cpus} OK' for mode in range(4)]+['QUEUED COMPETE OK']+(['QUEUED CONTROL callback-source-exit OK','QUEUED CONTROL prepared-leader-exit OK','QUEUED CONTROL prepared-thread-exec OK'] if target=='boaros' and args.observe and cpus>1 else ['QUEUED CONTROL SKIP'])+['QUEUED END failures=0']
                     if futex:lines,expected=futex_lines(raw,cpus)
                     passed=bool(expected) and lines==expected and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
+                    if args.workload=='ipv4_basic':passed=ipv4_basic_output(raw,cpus) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='interface':passed='NETWORK PASS interface' in raw and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if unix_named:passed=unix_named_output(raw,args.performance) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if unix_control:passed=unix_control_output(raw,args.performance,cpus) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
@@ -662,7 +678,7 @@ def run_smp(args):
 def main(default_arch="riscv"):
     parser=argparse.ArgumentParser(__doc__)
     parser.add_argument('--only',choices=('linux','boaros'))
-    parser.add_argument('--workload',choices=('contract','content','timer','budget','interface','sendfile','admission','unix_sender','unix_named','unix_control','unix_seqpacket','smp','epoll','pipe','event','altstack','queued','posix','futex','mremap','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','chroot','proc_thread_resources','clone_resources','pi','futex_vector'),default='contract')
+    parser.add_argument('--workload',choices=('ipv4_basic','contract','content','timer','budget','interface','sendfile','admission','unix_sender','unix_named','unix_control','unix_seqpacket','smp','epoll','pipe','event','altstack','queued','posix','futex','mremap','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','chroot','proc_thread_resources','clone_resources','pi','futex_vector'),default='contract')
     parser.add_argument('--platform-config',choices=('fixture','official'),default='fixture')
     parser.add_argument('--arch',choices=('riscv','loongarch'),default=default_arch)
     parser.add_argument('--memory',action='append',choices=('512M','1G'))
@@ -681,7 +697,7 @@ def main(default_arch="riscv"):
     if args.dynamic and args.libc=='glibc':parser.error('glibc direct consumer uses the static target toolchain')
     if args.performance and args.arch!='riscv':parser.error('--performance requires the RISC-V SMP runner')
     if args.performance and args.workload not in ('unix_named','unix_control','unix_seqpacket'):parser.error('--performance requires --workload unix_named, unix_control or unix_seqpacket')
-    if (args.workload == 'interface' and args.cpus and max(args.cpus) > 1) or (args.workload in ('unix_named','unix_control','unix_seqpacket','smp','pipe','event','altstack','queued','posix','futex','mremap','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','chroot','proc_thread_resources','clone_resources','pi','futex_vector') and args.arch=='riscv'):
+    if (args.workload in ('interface','ipv4_basic') and args.cpus and max(args.cpus) > 1) or (args.workload in ('unix_named','unix_control','unix_seqpacket','smp','pipe','event','altstack','queued','posix','futex','mremap','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','chroot','proc_thread_resources','clone_resources','pi','futex_vector') and args.arch=='riscv'):
         if args.arch == 'riscv': return run_smp(args)
     if args.arch=='riscv' and args.platform_config=='official' and args.memory and args.memory!=['1G']:
         parser.error('official profile requires 1G')
@@ -690,14 +706,14 @@ def main(default_arch="riscv"):
     work=ROOT/'build/network'/('contract-'+str(time.time_ns()))
     work.mkdir(parents=True)
     program=work/'init'
-    compiler=Path('/usr/bin/riscv64-linux-gnu-gcc') if args.libc=='glibc' else ROOT/'build/riscv/musl-root/bin/musl-gcc'
+    compiler=Path('/usr/bin/riscv64-linux-gnu-gcc') if args.libc=='glibc' else Path(os.environ.get('MUSL_CC') or ROOT/'build/riscv/musl-root/bin/musl-gcc')
     subprocess.run([str(compiler),*PROFILES['riscv'].musl_flags(compiler),'-static','-O2','-pthread','-Wall','-Wextra','-Werror',
                     str(workload_source(args.workload)),'-o',str(program)],check=True)
     image=harness.fixture(work,program)
     metadata={'program_sha256':digest(program),'fixture_sha256':digest(image),'runs':{}}
     variants=[]
     if args.only!='boaros':
-        linux,identity=harness.fixed_linux_image(None)
+        linux,identity=(harness.linux_build(ROOT/'tests/userland/network-linux.config') if args.workload=='ipv4_basic' else harness.fixed_linux_image(None))
         metadata['linux']=identity;variants.append(('linux',linux))
     if args.only!='linux':variants.append(('boaros',args.kernel))
     qemu=os.environ.get('QEMU_RISCV64','qemu-system-riscv64')
@@ -708,6 +724,7 @@ def main(default_arch="riscv"):
         for memory in memories:
             label=name if len(memories)==1 else name+'-'+memory
             disk=work/(label+'.img');shutil.copyfile(image,disk)
+            if name=='linux' and args.workload=='ipv4_basic':ipv4_reference_fixture(disk,work)
             command=[qemu,'-machine','virt','-bios','default','-kernel',str(snapshot),'-m',memory,'-smp','1',
                      '-nographic','-no-reboot','-drive',f'file={disk},if=none,format=raw,id=root',
                      '-device','virtio-blk-device,drive=root,bus=virtio-mmio-bus.0']
@@ -719,6 +736,7 @@ def main(default_arch="riscv"):
             except (RuntimeError,TimeoutError):pass
             raw=log.read_text(errors='replace')
             passed=('POSIX END failures=0' if args.workload=='posix' else 'QUEUED END failures=0' if args.workload=='queued' else 'ALTSTACK END 6' if args.workload=='altstack' else 'EPOLL PASS delivery' if args.workload=='epoll' else 'PIPE END 8' if args.workload=='pipe' else f'NETWORK PASS {args.workload}') in raw
+            if args.workload=='ipv4_basic':passed=passed and ipv4_basic_output(raw)
             if name=='boaros':passed=passed and 'heap-live=0x0; shutting down' in raw and 'exited status=0x0 ' in raw
             metadata['runs'][label]={'passed':passed,'memory':memory,'kernel_sha256':digest(snapshot),'command':command}
             print(name,memory,'PASS' if passed else 'FAIL',work)

@@ -60,7 +60,7 @@ static struct kernel_socket *create_receiver(int type,
     struct kernel_open_file_description **pin)
 {
     int64_t result;
-    assert(!kernel_files_socket_create(&files,KERNEL_SOCKET_AF_NETLINK,type,
+    assert(!kernel_files_socket_create(&files,KERNEL_SOCKET_AF_NETLINK,type, 0,
         KERNEL_FILES_O_NONBLOCK|KERNEL_FILES_O_CLOEXEC,&result) && result==0);
     assert(files.record->slots[0].flags==KERNEL_FILES_FD_CLOEXEC);
     assert(!kernel_files_pin(&files,0,pin,&result) && !result);

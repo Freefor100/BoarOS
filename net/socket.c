@@ -39,6 +39,7 @@
 #include "lwip/priv/tcp_priv.h"
 #include "lwip/timeouts.h"
 #include "lwip/udp.h"
+#include "lwip/raw.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -49,6 +50,7 @@
 #define SOCKET_RAW 3
 #define NETLINK_COOKIE_SIZE 32U
 #define UDP_MAX_PAYLOAD 65507U
+#define RAW_MAX_PAYLOAD 65515U
 #define SOCKET_WRITE_BATCH 4U
 #define SOCKET_WRITE_RETRY_MS 250U
 
@@ -99,6 +101,7 @@ struct kernel_socket {
     unsigned work_flags, pending_live;
     uint8_t pending_ready, destroying;
     struct udp_pcb *udp;
+    struct raw_pcb *raw;
     struct tcp_pcb *tcp;
     struct kernel_socket *peer;
     uint64_t receive_timeout_ns;
@@ -112,6 +115,9 @@ struct kernel_socket {
     uint8_t reuseaddr;
     uint8_t keepalive;
     uint8_t nodelay;
+    uint8_t broadcast, ipv4_ttl, multicast_ttl;
+    uint8_t bound_device, multicast_index;
+    ip_addr_t multicast_source;
     uint32_t rx_bytes;
     uint32_t rx_limit;
     int error;
@@ -292,6 +298,7 @@ static int socket_connection_oriented(const struct kernel_socket *socket)
 { return socket->type == SOCKET_STREAM || socket->type == SOCKET_SEQPACKET; }
 int kernel_socket_preserves_messages(const struct kernel_socket *socket)
 { return socket && (socket->type == SOCKET_DGRAM || socket->type == SOCKET_SEQPACKET ||
+                    socket->type == SOCKET_RAW ||
                     socket->domain == KERNEL_SOCKET_DOMAIN_NETLINK); }
 int kernel_socket_is_stream(const struct kernel_socket *socket)
 { return socket && socket->type == SOCKET_STREAM; }
@@ -1490,7 +1497,53 @@ static uint64_t socket_next_timer_deadline(void)
 static const ip_addr_t *local_ip(const struct kernel_socket *socket)
 {
     if (socket->udp != 0) return &socket->udp->local_ip;
+    if (socket->raw != 0) return &socket->raw->local_ip;
     return socket->tcp != 0 ? &socket->tcp->local_ip : 0;
+}
+static struct ip_pcb *socket_ip_pcb(struct kernel_socket *socket)
+{
+    if(socket->raw)return (struct ip_pcb *)socket->raw;
+    return socket->udp?(struct ip_pcb *)socket->udp:(struct ip_pcb *)socket->tcp;
+}
+
+/* Called with the shared IP/protocol qualification. Explicit interface choice
+ * and broadcast permission apply equally to connected UDP and raw sends. */
+static int datagram_route(struct kernel_socket *socket,const ip_addr_t *remote,
+                         struct netif **selected,const ip_addr_t **source)
+{
+    struct ip_pcb *pcb=socket_ip_pcb(socket);
+    struct netif *interface=NULL;
+    int multicast=IP_IS_V4(remote) && ip_addr_ismulticast(remote);
+    if(pcb->netif_idx)interface=netif_get_by_index(pcb->netif_idx);
+    else if(multicast && socket->multicast_index)
+        interface=netif_get_by_index(socket->multicast_index);
+    else if(IP_IS_V4(remote) && ip4_addr_get_u32(ip_2_ip4(remote))==PP_HTONL(0xffffffffU)) {
+        for(struct netif *n=netif_list;n;n=n->next)
+            if(n->hwaddr_len && netif_is_up(n) && netif_is_link_up(n) &&
+               !ip4_addr_isany_val(*netif_ip4_addr(n)) &&
+               (!interface || netif_get_index(n)<netif_get_index(interface)))interface=n;
+    } else interface=ip_route(&pcb->local_ip,remote);
+    if(!interface || !netif_is_up(interface) || !netif_is_link_up(interface))return -KERNEL_ENETUNREACH;
+    if(IP_IS_V4(remote) && ip_addr_isbroadcast(remote,interface) && !socket->broadcast)
+        return -KERNEL_EACCES;
+    const ip_addr_t *local=&pcb->local_ip;
+    if(ip_addr_isany(local) || ip_addr_ismulticast(local)) {
+        if(multicast && !ip_addr_isany(&socket->multicast_source))local=&socket->multicast_source;
+        else local=ip_netif_get_local_ip(interface,remote);
+    }
+    if(!local)return -KERNEL_ENETUNREACH;
+    if(IP_IS_V4(local) && !ip_addr_isany(local)) {
+        if(ip_addr_ismulticast(local) || ip_2_ip4(local)->addr==PP_HTONL(0xffffffffU))return -KERNEL_EINVAL;
+        /* An indexed IP_MULTICAST_IF may retain any requested address, but
+         * ordinary send still requires a current local source. Lookup may
+         * find another interface; Linux permits that, including 127/8 aliases. */
+        int found=0;
+        for(struct netif *n=netif_list;n;n=n->next)
+            if(netif_ip4_addr(n)->addr==ip_2_ip4(local)->addr ||
+               (ip4_addr_isloopback(ip_2_ip4(local)) && ip4_addr_isloopback(netif_ip4_addr(n)))) {found=1;break;}
+        if(!found)return -KERNEL_ENETUNREACH;
+    }
+    *selected=interface;*source=local;return 0;
 }
 static uint16_t local_port(const struct kernel_socket *socket)
 {
@@ -1666,7 +1719,8 @@ static void tcp_link_loopback_peer(struct tcp_pcb *pcb,unsigned bucket)
     for (struct tcp_pcb *peer=tcp_routes[bucket];peer;peer=peer->boaros_route_next) {
         if (!peer->boaros_loopback || peer->local_port!=pcb->remote_port ||
             peer->remote_port!=pcb->local_port || !ip_addr_cmp(&peer->local_ip,&pcb->remote_ip) ||
-            !ip_addr_cmp(&peer->remote_ip,&pcb->local_ip)) continue;
+            !ip_addr_cmp(&peer->remote_ip,&pcb->local_ip) ||
+            (peer->netif_idx && pcb->netif_idx && peer->netif_idx!=pcb->netif_idx)) continue;
         if (peer->boaros_owner!=pcb->boaros_owner) __builtin_trap();
         if (!peer->boaros_loopback_peer) {
             peer->boaros_loopback_peer=pcb;
@@ -1685,7 +1739,8 @@ static int tcp_route_conflict(const struct tcp_pcb *pcb,const ip_addr_t *local,
     unsigned end=remote?first+1:TCP_ROUTE_BUCKETS;
     for (unsigned i=first;i<end;i++)
         for (const struct tcp_pcb *p=tcp_routes[i];p;p=p->boaros_route_next) {
-            if (p==pcb || p->local_port!=port) continue;
+            if (p==pcb || p->local_port!=port ||
+                (pcb->netif_idx && p->netif_idx && pcb->netif_idx!=p->netif_idx)) continue;
             if (!local) return 1;
             if (remote) {
                 if (p->remote_port==remote_port && ip_addr_cmp(&p->local_ip,local) &&
@@ -1753,6 +1808,7 @@ static int port_conflict(struct kernel_socket *socket, const ip_addr_t *ip,
         if (tcp_socket_cpu(other)) continue; /* Remote TCP tuples are checked by tcp_bind(). */
 #endif
         if (other == socket || other->type != socket->type ||
+            (socket->bound_device && other->bound_device && socket->bound_device!=other->bound_device) ||
             local_port(other) != port || local_ip(other) == 0 ||
             !address_overlap(ip, local_ip(other))) continue;
         if (listening ? other->listening :
@@ -1841,6 +1897,51 @@ static void udp_received(void *context, struct udp_pcb *pcb,
     UDP_STATS_INC(udp.memerr);
     socket_pbuf_free(payload);
     kernel_heap_release(socket->heap,packet);
+}
+
+/* Raw input precedes ICMP processing, which can strip headers and rewrite an
+ * echo request in place. Queue an independent version and leave the original
+ * with IP so other raw endpoints and the ICMP responder still receive it. */
+static u8_t raw_received(void *context,struct raw_pcb *pcb,struct pbuf *input,
+                         const ip_addr_t *peer)
+{
+    struct kernel_socket *socket=context;
+    (void)pcb;
+    struct netif *interface=ip_current_input_netif();
+    struct socket_filter_packet view={.packet=input};
+    struct kernel_bpf_packet filter={.object=&view,.length=input->tot_len,
+        .protocol=0x0800,.ifindex=netif_get_index(interface),
+        .ingress_ifindex=netif_get_index(interface),
+        .packet_type=(input->flags&PBUF_FLAG_LLBCAST)?1:(input->flags&PBUF_FLAG_LLMCAST)?2:0,
+        .hardware_type=interface->hwaddr_len?1:772,
+        .payload_offset=ip_current_header_tot_len()+8U,.network_offset=0,
+        .link_offset=INT32_MIN,.read=socket_filter_read};
+    uint32_t kept=socket_filter_run(socket,&filter);
+    if(!kept)return 0;
+    if(kept>input->tot_len)kept=input->tot_len;
+    uint32_t charge=kept?kept:1U;
+    { SOCKET_ENDPOINT(state,socket);
+      if(socket->destroying || socket->read_closed || charge>socket->rx_limit ||
+         socket->rx_bytes>socket->rx_limit-charge)return 0; }
+    if((network_udp_capacity && !network_udp_capacity(network_context)) ||
+       STATS_GET(mem.used)>MEM_SIZE-(65536U+4096U))return 0;
+    struct socket_packet *packet=NULL;
+    enum kernel_heap_status status=kernel_heap_allocate_zeroed(socket->heap,1,
+        sizeof(*packet),(void **)&packet);
+    if(status==KERNEL_HEAP_STATUS_EMPTY)return 0;
+    if(status!=KERNEL_HEAP_STATUS_OK)__builtin_trap();
+    struct pbuf *copy=pbuf_alloc(PBUF_RAW,(u16_t)kept,PBUF_RAM);
+    if(!copy) {kernel_heap_release(socket->heap,packet);return 0;}
+    if(pbuf_copy_partial(input,copy->payload,(u16_t)kept,0)!=kept)__builtin_trap();
+    packet->payload=copy;
+    address_export(socket,peer,0,&packet->address);
+    { SOCKET_ENDPOINT(state,socket);
+      if(!socket->destroying && !socket->read_closed && charge<=socket->rx_limit &&
+         socket->rx_bytes<=socket->rx_limit-charge) {
+          packet_publish_locked(socket,packet,charge);return 0;
+      } }
+    socket_pbuf_free(copy);kernel_heap_release(socket->heap,packet);
+    return 0;
 }
 
 static err_t tcp_connected(void *context, struct tcp_pcb *pcb, err_t error)
@@ -2002,6 +2103,11 @@ static err_t socket_tcp_accepted(void *context, struct tcp_pcb *pcb,
     child->reuseaddr = listener->reuseaddr;
     child->keepalive = listener->keepalive;
     child->nodelay = listener->nodelay;
+    child->broadcast=listener->broadcast;child->ipv4_ttl=listener->ipv4_ttl;
+    child->multicast_ttl=listener->multicast_ttl;child->bound_device=pcb->netif_idx;
+    child->multicast_index=listener->multicast_index;
+    ip_addr_copy(child->multicast_source,listener->multicast_source);
+    pcb->ttl=IP_IS_V4(&pcb->remote_ip)?child->ipv4_ttl:64;
     child->type = SOCKET_STREAM;
     child->tcp = pcb;
     if (child->nodelay) tcp_nagle_disable(pcb);
@@ -2057,7 +2163,7 @@ static void unix_initialize(struct kernel_socket *socket,struct kernel_heap *hea
     kernel_wait_queue_init(&socket->wait);kernel_wait_queue_init(&socket->async_events);
 }
 
-int kernel_socket_create(struct kernel_heap *heap, int family, int type,
+int kernel_socket_create(struct kernel_heap *heap, int family, int type, int protocol,
                          struct kernel_socket **owner)
 {
     struct kernel_socket *socket = 0;
@@ -2065,7 +2171,8 @@ int kernel_socket_create(struct kernel_heap *heap, int family, int type,
 
     if (heap == 0 || owner == 0 || *owner != 0 ||
         (type != SOCKET_DGRAM && type != SOCKET_STREAM &&
-         !(type == SOCKET_RAW && family == KERNEL_SOCKET_AF_NETLINK) &&
+         !(type == SOCKET_RAW && (family == KERNEL_SOCKET_AF_NETLINK ||
+             (family==KERNEL_SOCKET_AF_INET && protocol==1))) &&
          !(type == SOCKET_SEQPACKET && family == KERNEL_SOCKET_AF_UNIX)) ||
         (family == KERNEL_SOCKET_AF_NETLINK && type != SOCKET_RAW && type != SOCKET_DGRAM) ||
         (family != KERNEL_SOCKET_AF_UNIX && family != KERNEL_SOCKET_AF_INET &&
@@ -2097,15 +2204,20 @@ int kernel_socket_create(struct kernel_heap *heap, int family, int type,
     socket->domain = KERNEL_SOCKET_DOMAIN_INET;
     socket->rx_limit = 65536U;
     socket->tx_limit = 65536U;
+    socket->ipv4_ttl=64;socket->multicast_ttl=1;
     kernel_wait_queue_init(&socket->wait);kernel_wait_queue_init(&socket->async_events);
-    if (type == SOCKET_DGRAM) {
+    if(type==SOCKET_RAW) {
+        socket->raw=raw_new_ip_type(IPADDR_TYPE_V4,(u8_t)protocol);
+        if(socket->raw) {socket->raw->ttl=64;raw_set_multicast_ttl(socket->raw,1);raw_recv(socket->raw,raw_received,socket);}
+    } else if (type == SOCKET_DGRAM) {
         socket->udp = udp_new_ip_type(family == KERNEL_SOCKET_AF_INET ?
                                       IPADDR_TYPE_V4 : IPADDR_TYPE_ANY);
-        if (socket->udp != 0) udp_recv(socket->udp, udp_received, socket);
+        if (socket->udp != 0) {socket->udp->ttl=64;udp_set_multicast_ttl(socket->udp,1);udp_recv(socket->udp, udp_received, socket);}
     } else {
         socket->tcp = tcp_new_ip_type(family == KERNEL_SOCKET_AF_INET ?
                                       IPADDR_TYPE_V4 : IPADDR_TYPE_ANY);
         if (socket->tcp != 0) {
+            socket->tcp->ttl=64;
             tcp_arg(socket->tcp, socket);
             tcp_err(socket->tcp, tcp_failed);
             tcp_recv(socket->tcp, tcp_data_received);
@@ -2113,6 +2225,7 @@ int kernel_socket_create(struct kernel_heap *heap, int family, int type,
         }
     }
     if ((type == SOCKET_DGRAM && socket->udp == 0) ||
+        (type == SOCKET_RAW && socket->raw == 0) ||
         (type == SOCKET_STREAM && socket->tcp == 0)) {
         kernel_socket_protocol_leave(&old_status);
         kernel_heap_release(heap, socket);
@@ -2129,9 +2242,9 @@ int kernel_socket_pair(struct kernel_heap *heap,int type,
 {
     if(!heap || !owner_a || !owner_b || *owner_a || *owner_b)return -KERNEL_EINVAL;
     struct kernel_socket *a=NULL,*b=NULL;
-    int result=kernel_socket_create(heap,KERNEL_SOCKET_AF_UNIX,type,&a);
+    int result=kernel_socket_create(heap,KERNEL_SOCKET_AF_UNIX,type, 0,&a);
     if(result)return result;
-    result=kernel_socket_create(heap,KERNEL_SOCKET_AF_UNIX,type,&b);
+    result=kernel_socket_create(heap,KERNEL_SOCKET_AF_UNIX,type, 0,&b);
     if(result) {kernel_socket_destroy(a);return result;}
     struct kernel_socket_peercred cred=unix_current_cred();
     SOCKET_STATE(state);
@@ -2334,6 +2447,7 @@ void kernel_socket_destroy(struct kernel_socket *socket)
         kernel_heap_release(socket->heap, entry);
     }
     if (socket->udp != 0) udp_remove(socket->udp);
+    if (socket->raw != 0) {raw_recv(socket->raw,NULL,NULL);raw_remove(socket->raw);socket->raw=NULL;}
     if (socket->tcp != 0) {
         if (!socket->listening) {
             tcp_arg(socket->tcp, 0);
@@ -2379,7 +2493,7 @@ int kernel_socket_bind(struct kernel_socket *socket,
     if (socket->domain != KERNEL_SOCKET_DOMAIN_INET) { kernel_socket_protocol_leave(&scope); return -KERNEL_EINVAL; }
     int result = address_import(socket, address, &local, 1);
     if (result != 0) { kernel_socket_protocol_leave(&scope); return result; }
-    int low_port_denied=address->port && address->port<1024 &&
+    int low_port_denied=!socket->raw && address->port && address->port<1024 &&
         !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_NET_BIND_SERVICE);
     if(socket->family==KERNEL_SOCKET_AF_INET6 && low_port_denied) {
         kernel_socket_protocol_leave(&scope);return -KERNEL_EACCES;
@@ -2394,6 +2508,12 @@ int kernel_socket_bind(struct kernel_socket *socket,
 
     if(low_port_denied) {
         kernel_socket_protocol_leave(&scope);return -KERNEL_EACCES;
+    }
+    if(socket->raw) {
+        if(socket->connected) {kernel_socket_protocol_leave(&scope);return -KERNEL_EINVAL;}
+        err_t error=raw_bind(socket->raw,&local);
+        if(!error) {socket->explicit_bind=1;ip_addr_copy(socket->udp_bind_ip,local);}
+        kernel_socket_protocol_leave(&scope);return lwip_error(error);
     }
     if ((socket->udp != 0 && socket->udp->local_port != 0) ||
         (socket->tcp != 0 && socket->tcp->local_port != 0)) { kernel_socket_protocol_leave(&scope); return -KERNEL_EINVAL; }
@@ -2428,7 +2548,9 @@ int kernel_socket_getname(struct kernel_socket *socket,
         *address = socket->saved_local;
         kernel_socket_protocol_leave(&scope); return 0;
     }
-    if (socket->type == SOCKET_DGRAM) {
+    if(socket->raw) {
+        address_export(socket,&socket->raw->local_ip,socket->raw->protocol,address);
+    } else if (socket->type == SOCKET_DGRAM) {
         address_export(socket, &socket->udp->local_ip, socket->udp->local_port, address);
     } else {
         if (socket->tcp == 0) { int result = socket->error != 0 ? socket->error : -KERNEL_ENOTCONN; kernel_socket_protocol_leave(&scope); return result; }
@@ -2451,6 +2573,8 @@ int kernel_socket_getpeer(struct kernel_socket *socket,struct kernel_socket_addr
     }
     KERNEL_IRQ_LOCK_SCOPE(state,socket_endpoint_lock(socket));
     if(!socket->connected)return -KERNEL_ENOTCONN;
+    if(socket->type==SOCKET_RAW && socket->domain==KERNEL_SOCKET_DOMAIN_INET &&
+       !socket->saved_peer.port)return -KERNEL_ENOTCONN;
     if(socket->domain==KERNEL_SOCKET_DOMAIN_UNIX) {
         if(!socket->peer && !socket_connection_oriented(socket))return -KERNEL_ENOTCONN;
         unix_export_locked(socket->peer?socket->peer->unix_name:socket->unix_peer_name,address);
@@ -2522,7 +2646,7 @@ static __attribute__((noinline)) int unix_connect(struct kernel_socket *socket,c
     /* Hold the resolved listener across allocation, then recheck its live state. */
     result=unix_lookup(socket,address,&target);if(result)return result;
     struct kernel_socket *child=NULL;
-    result=kernel_socket_create(socket->heap,KERNEL_SOCKET_AF_UNIX,socket->type,&child);
+    result=kernel_socket_create(socket->heap,KERNEL_SOCKET_AF_UNIX,socket->type, 0,&child);
     if(result) {unix_put(target);return result;}
     struct socket_pending *entry=NULL;
     enum kernel_heap_status status=kernel_heap_allocate_zeroed(socket->heap,1,sizeof(*entry),(void **)&entry);
@@ -2598,6 +2722,26 @@ int kernel_socket_connect(struct kernel_socket *socket,
     err_t error;
     struct kernel_socket_protocol_scope old_status;
     socket_protocol_enter(&old_status,socket);
+    if(socket->raw) {
+        if(address->family==0) {
+            raw_disconnect(socket->raw);
+            if(socket->explicit_bind)ip_addr_copy(socket->raw->local_ip,socket->udp_bind_ip);
+            else ip_addr_set_zero_ip4(&socket->raw->local_ip);
+            {SOCKET_ENDPOINT(state,socket);socket->connected=0;}
+            kernel_socket_protocol_leave(&old_status);return 0;
+        }
+        int result=address_import(socket,address,&remote,0);
+        struct netif *route=NULL;const ip_addr_t *source=NULL;
+        if(!result)result=datagram_route(socket,&remote,&route,&source);
+        if(result) {kernel_socket_protocol_leave(&old_status);return result;}
+        error=raw_connect(socket->raw,&remote);
+        if(!error) {
+            if(ip_addr_isany(&socket->raw->local_ip))ip_addr_copy(socket->raw->local_ip,*source);
+            SOCKET_ENDPOINT(state,socket);socket->connected=1;
+            address_export(socket,&remote,address->port,&socket->saved_peer);
+        }
+        kernel_socket_protocol_leave(&old_status);return lwip_error(error);
+    }
     if (socket->udp != 0) {
         if (address->family == 0) {
             udp_disconnect(socket->udp);
@@ -2613,9 +2757,9 @@ int kernel_socket_connect(struct kernel_socket *socket,
         } else {
             int result = address_import(socket, address, &remote, 0);
             if (result != 0) { kernel_socket_protocol_leave(&old_status); return result; }
-            struct netif *route = ip_route(&socket->udp->local_ip, &remote);
-            const ip_addr_t *source = route != 0 ? ip_netif_get_local_ip(route, &remote) : 0;
-            if (source == 0) { kernel_socket_protocol_leave(&old_status); return -KERNEL_ENETUNREACH; }
+            struct netif *route=NULL;const ip_addr_t *source=NULL;
+            result=datagram_route(socket,&remote,&route,&source);
+            if(result) {kernel_socket_protocol_leave(&old_status);return result;}
             error = udp_connect(socket->udp, &remote, address->port);
             if (error == ERR_OK) {
                 { KERNEL_IRQ_LOCK_SCOPE(state,socket_endpoint_lock(socket));socket->connected=1;
@@ -2634,6 +2778,7 @@ int kernel_socket_connect(struct kernel_socket *socket,
     if (socket->connecting) { int failure = (-KERNEL_EALREADY); kernel_socket_protocol_leave(&old_status); return failure; }
     int result = address_import(socket, address, &remote, 0);
     if (result != 0) { int failure = (result); kernel_socket_protocol_leave(&old_status); return failure; }
+    socket->tcp->ttl=IP_IS_V4(&remote)?socket->ipv4_ttl:64;
     error = tcp_connect(socket->tcp, &remote, address->port, tcp_connected);
     if(error==ERR_OK) {KERNEL_IRQ_LOCK_SCOPE(state,socket_endpoint_lock(socket));socket->connecting=1;}
     if (error == ERR_OK) service_inline(&old_status);
@@ -3112,8 +3257,8 @@ void kernel_socket_abort_read(struct kernel_socket_read_request *request)
 }
 
 enum { SOCKET_WRITE_ACCEPTED=1U, SOCKET_WRITE_DEFERRED=2U };
-enum socket_protocol_operation { SOCKET_PROTOCOL_STREAM, SOCKET_PROTOCOL_UDP_PREPARE,
-    SOCKET_PROTOCOL_UDP_SEND, SOCKET_PROTOCOL_DISPOSE, SOCKET_PROTOCOL_FLUSH };
+enum socket_protocol_operation { SOCKET_PROTOCOL_STREAM, SOCKET_PROTOCOL_DATAGRAM_PREPARE,
+    SOCKET_PROTOCOL_DATAGRAM_SEND, SOCKET_PROTOCOL_DISPOSE, SOCKET_PROTOCOL_FLUSH };
 static int protocol_request(struct kernel_socket_write_request *,enum socket_protocol_operation);
 
 static void socket_link_active_write(struct kernel_socket_write_request *request)
@@ -3436,7 +3581,7 @@ static __attribute__((noinline)) int unix_publish_packet(
     }
     return result;}
 
-static int udp_prepare_payload(struct kernel_socket_write_request *request)
+static int datagram_prepare_payload(struct kernel_socket_write_request *request)
 {
     struct kernel_socket *socket=request->socket;
     ip_addr_t remote;
@@ -3452,7 +3597,8 @@ static int udp_prepare_payload(struct kernel_socket_write_request *request)
             request->inet_destination.scope=ip6_addr_zone(ip_2_ip6(&remote));
         } else __builtin_memcpy(request->inet_destination.bytes,&ip_2_ip4(&remote)->addr,4);
     }
-    request->protocol_payload=pbuf_alloc(PBUF_TRANSPORT,(u16_t)request->payload_size,PBUF_RAM);
+    request->protocol_payload=pbuf_alloc(socket->raw?PBUF_IP:PBUF_TRANSPORT,
+        (u16_t)request->payload_size,PBUF_RAM);
     return request->protocol_payload?0:-KERNEL_ENOMEM;
 }
 
@@ -3490,7 +3636,8 @@ int kernel_socket_packet_prepare(struct kernel_socket_write_request *request,
         } else {
             if(kernel_source && socket->domain==KERNEL_SOCKET_DOMAIN_INET && !destination &&
                 !socket->connected && count<=UINT16_MAX)return -KERNEL_EDESTADDRREQ;
-            if(count>(socket->domain==KERNEL_SOCKET_DOMAIN_INET?UDP_MAX_PAYLOAD:socket->tx_limit-32U) ||
+            if(count>(socket->domain==KERNEL_SOCKET_DOMAIN_INET?
+                (socket->type==SOCKET_RAW?RAW_MAX_PAYLOAD:UDP_MAX_PAYLOAD):socket->tx_limit-32U) ||
                 count>socket->tx_limit)return -KERNEL_EMSGSIZE;
             if(socket->write_closed)return -KERNEL_EPIPE;
             if(socket->domain==KERNEL_SOCKET_DOMAIN_INET && !destination && !socket->connected)return -KERNEL_EDESTADDRREQ;
@@ -3539,8 +3686,8 @@ int kernel_socket_packet_prepare(struct kernel_socket_write_request *request,
     if (request->socket->domain == KERNEL_SOCKET_DOMAIN_INET) {
         if (boaros_lwip_parallel_enabled()) {
             result=network_is_stopping()?
-                -KERNEL_EIO:udp_prepare_payload(request);
-        } else result=protocol_request(request,SOCKET_PROTOCOL_UDP_PREPARE);
+                -KERNEL_EIO:datagram_prepare_payload(request);
+        } else result=protocol_request(request,SOCKET_PROTOCOL_DATAGRAM_PREPARE);
         if(result)goto out;
     } else {
         KERNEL_NO_RECLAIM_IO;
@@ -3609,7 +3756,7 @@ int kernel_socket_packet_write(struct kernel_socket_write_request *request,
         } else if (access != KERNEL_UACCESS_STATUS_OK || copied != count) __builtin_trap();
     }
     if(request->socket->domain==KERNEL_SOCKET_DOMAIN_INET) {
-        result=protocol_request(request,SOCKET_PROTOCOL_UDP_SEND);goto out;
+        result=protocol_request(request,SOCKET_PROTOCOL_DATAGRAM_SEND);goto out;
     }
     result=socket_finish_packet(request,(uint32_t)count,control);
     if(result<0)goto out;
@@ -3971,8 +4118,8 @@ static int execute_protocol_request(struct kernel_socket_write_request *request)
     COST_SCOPE(execution, NETWORK_PROTOCOL_EXEC_TICKS);
     struct kernel_socket *socket=request->socket;
     switch(request->operation) {
-    case SOCKET_PROTOCOL_UDP_PREPARE: return udp_prepare_payload(request);
-    case SOCKET_PROTOCOL_UDP_SEND: {
+    case SOCKET_PROTOCOL_DATAGRAM_PREPARE: return datagram_prepare_payload(request);
+    case SOCKET_PROTOCOL_DATAGRAM_SEND: {
         struct pbuf *payload=request->protocol_payload;
         if(!payload)__builtin_trap();
         ip_addr_t remote={0};
@@ -3985,10 +4132,21 @@ static int execute_protocol_request(struct kernel_socket_write_request *request)
             __builtin_memcpy(ip_2_ip6(&remote)->addr,request->destination->bytes,16);
             ip6_addr_set_zone(ip_2_ip6(&remote),(u8_t)request->destination->scope);
         }
-        err_t error=request->destination?udp_sendto(socket->udp,payload,&remote,request->destination->port)
-                                               :udp_send(socket->udp,payload);
+        if(!request->destination)ip_addr_copy(remote,socket_ip_pcb(socket)->remote_ip);
+        struct netif *route=NULL;const ip_addr_t *source=NULL;
+        int failure=datagram_route(socket,&remote,&route,&source);
+        err_t error=ERR_OK;
+        if(!failure) {
+            struct ip_pcb *pcb=socket_ip_pcb(socket);
+            pcb->ttl=IP_IS_V4(&remote)?socket->ipv4_ttl:64;
+            if(socket->udp)udp_set_multicast_ttl(socket->udp,IP_IS_V4(&remote)?socket->multicast_ttl:1);
+            if(IP_IS_V4(&remote))payload->flags|=PBUF_FLAG_IP4_LOCAL_DF;
+            error=socket->raw?raw_sendto_if_src(socket->raw,payload,&remote,route,source):
+                udp_sendto_if_src(socket->udp,payload,&remote,request->destination?
+                    request->destination->port:socket->udp->remote_port,route,source);
+        }
         socket_pbuf_free(payload);request->protocol_payload=0;
-        return error==ERR_OK?(int)request->payload_size:lwip_error(error);
+        return failure?failure:error==ERR_OK?(int)request->payload_size:lwip_error(error);
     }
     case SOCKET_PROTOCOL_DISPOSE:
         if(!request->protocol_payload)__builtin_trap();
@@ -4065,7 +4223,7 @@ static int protocol_request(struct kernel_socket_write_request *request,enum soc
         result=network_is_stopping() && operation<SOCKET_PROTOCOL_DISPOSE?-KERNEL_EIO:0;
         if(!result)result=execute_protocol_request(request);
         request->segments=0;
-        if(result>=0 && operation!=SOCKET_PROTOCOL_UDP_PREPARE && operation!=SOCKET_PROTOCOL_DISPOSE &&
+        if(result>=0 && operation!=SOCKET_PROTOCOL_DATAGRAM_PREPARE && operation!=SOCKET_PROTOCOL_DISPOSE &&
             !(request->progressed & SOCKET_WRITE_DEFERRED))service_inline(&protocol);
         kernel_socket_protocol_leave(&protocol);return result;
     }
@@ -4230,7 +4388,7 @@ int kernel_socket_set_option(struct kernel_socket *socket,
     struct kernel_socket_protocol_scope saved;
     if(socket->domain==KERNEL_SOCKET_DOMAIN_INET)socket_protocol_enter(&saved,socket);
     int result = 0;
-    struct ip_pcb *pcb = socket->udp != 0 ? (struct ip_pcb *)socket->udp : (struct ip_pcb *)socket->tcp;
+    struct ip_pcb *pcb = socket_ip_pcb(socket);
     switch (option) {
     case KERNEL_SOCKET_REUSEADDR:
     case KERNEL_SOCKET_KEEPALIVE: {
@@ -4241,6 +4399,26 @@ int kernel_socket_set_option(struct kernel_socket *socket,
         if (pcb != 0) { if (value) ip_set_option(pcb, flag); else ip_reset_option(pcb, flag); }
         break;
     }
+    case KERNEL_SOCKET_BROADCAST:
+        {SOCKET_ENDPOINT(state,socket);socket->broadcast=value!=0;}
+        if(pcb) {if(value)ip_set_option(pcb,SOF_BROADCAST);else ip_reset_option(pcb,SOF_BROADCAST);}
+        break;
+    case KERNEL_SOCKET_IPV4_TTL:
+        if(socket->domain!=KERNEL_SOCKET_DOMAIN_INET) {result=-KERNEL_ENOPROTOOPT;break;}
+        if(value==-1)value=64;
+        if(value<1 || value>255) {result=-KERNEL_EINVAL;break;}
+        {SOCKET_ENDPOINT(state,socket);socket->ipv4_ttl=(uint8_t)value;}
+        if(pcb && IP_IS_V4(&pcb->local_ip))pcb->ttl=(u8_t)value;
+        break;
+    case KERNEL_SOCKET_MULTICAST_TTL:
+        if(socket->domain!=KERNEL_SOCKET_DOMAIN_INET) {result=-KERNEL_ENOPROTOOPT;break;}
+        if(socket->type==SOCKET_STREAM) {result=-KERNEL_EINVAL;break;}
+        if(value==-1)value=1;
+        if(value<0 || value>255) {result=-KERNEL_EINVAL;break;}
+        {SOCKET_ENDPOINT(state,socket);socket->multicast_ttl=(uint8_t)value;}
+        if(socket->raw)raw_set_multicast_ttl(socket->raw,(u8_t)value);
+        if(socket->udp)udp_set_multicast_ttl(socket->udp,(u8_t)value);
+        break;
     case KERNEL_SOCKET_NODELAY:
         if (socket->domain != KERNEL_SOCKET_DOMAIN_INET || socket->type != SOCKET_STREAM) { result = -KERNEL_ENOPROTOOPT; break; }
         { KERNEL_IRQ_LOCK_SCOPE(state,socket_endpoint_lock(socket));socket->nodelay = value != 0; }
@@ -4283,6 +4461,15 @@ int kernel_socket_get_option(struct kernel_socket *socket,
     switch (option) {
     case KERNEL_SOCKET_REUSEADDR: *value = socket->reuseaddr; break;
     case KERNEL_SOCKET_KEEPALIVE: *value = socket->keepalive; break;
+    case KERNEL_SOCKET_BROADCAST: *value=socket->broadcast;break;
+    case KERNEL_SOCKET_IPV4_TTL:
+        if(socket->domain!=KERNEL_SOCKET_DOMAIN_INET)result=-KERNEL_ENOPROTOOPT;
+        else *value=socket->ipv4_ttl;
+        break;
+    case KERNEL_SOCKET_MULTICAST_TTL:
+        if(socket->domain!=KERNEL_SOCKET_DOMAIN_INET)result=-KERNEL_ENOPROTOOPT;
+        else *value=socket->multicast_ttl;
+        break;
     case KERNEL_SOCKET_SNDBUF: *value = (int)socket->tx_limit; break;
     case KERNEL_SOCKET_RCVBUF: *value = (int)socket->rx_limit; break;
     case KERNEL_SOCKET_PASSCRED: *value = socket->passcred; break;
@@ -4302,6 +4489,90 @@ int kernel_socket_get_option(struct kernel_socket *socket,
     default: result = -KERNEL_ENOPROTOOPT;
     }
     return result;
+}
+
+int kernel_socket_set_bound_device(struct kernel_socket *socket,const char *name)
+{
+    struct kernel_socket_protocol_scope base;kernel_socket_protocol_enter(&base);
+    struct netif *chosen=NULL;
+    if(name[0]) {
+        for(struct netif *n=netif_list;n;n=n->next) {
+            int loop=n->name[0]=='l' && n->name[1]=='o';
+            if(!__builtin_strcmp(name,loop?"lo":"eth0")) {chosen=n;break;}
+        }
+        if(!chosen) {kernel_socket_protocol_leave(&base);return -KERNEL_ENODEV;}
+    }
+#if BOAROS_USER_SMP
+    struct kernel_socket_protocol_scope remote;
+    unsigned cpu=tcp_socket_cpu(socket);
+    if(cpu)tcp_control_enter(&base,&remote,cpu);
+#endif
+    int result=0;
+    { SOCKET_ENDPOINT(state,socket);
+      if(socket->bound_device &&
+         !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_NET_RAW))result=-KERNEL_EPERM;
+      else socket->bound_device=chosen?netif_get_index(chosen):0; }
+    if(!result) {
+        struct ip_pcb *pcb=socket_ip_pcb(socket);
+#if BOAROS_USER_SMP
+        /* The ingress route index reads netif_idx under this same short lock;
+         * the PCB itself remains protected by its actual protocol owner. */
+        KERNEL_RAW_SCOPE(route_guard,&tcp_route_lock);
+#endif
+        if(pcb)pcb->netif_idx=socket->bound_device;
+    }
+#if BOAROS_USER_SMP
+    if(cpu)tcp_control_leave(&base,&remote);
+#endif
+    kernel_socket_protocol_leave(&base);return result;
+}
+
+int kernel_socket_get_bound_device(struct kernel_socket *socket,char name[16],uint32_t *length)
+{
+    unsigned index;
+    {SOCKET_ENDPOINT(state,socket);index=socket->bound_device;}
+    if(!index) {*length=0;return 0;}
+    if(*length<16)return -KERNEL_EINVAL;
+    struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    struct netif *interface=netif_get_by_index((u8_t)index);
+    int result=-KERNEL_ENODEV;
+    if(interface) {
+        int loop=interface->name[0]=='l' && interface->name[1]=='o';
+        *length=loop?3:5;__builtin_memcpy(name,loop?"lo":"eth0",*length);result=0;
+    }
+    kernel_socket_protocol_leave(&scope);return result;
+}
+
+int kernel_socket_set_multicast_interface(struct kernel_socket *socket,uint32_t index,uint32_t address)
+{
+    if(socket->domain!=KERNEL_SOCKET_DOMAIN_INET)return -KERNEL_ENOPROTOOPT;
+    if(socket->type==SOCKET_STREAM)return -KERNEL_EINVAL;
+    struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    struct netif *interface=NULL;
+    if(index && index<=255U)interface=netif_get_by_index((u8_t)index);
+    else if(!index && address)for(struct netif *n=netif_list;n;n=n->next)
+        if(netif_ip4_addr(n)->addr==address ||
+           ((lwip_ntohl(address)>>24)==127 && n->name[0]=='l' && n->name[1]=='o')) {interface=n;break;}
+    int result=0;
+    if((index || address) && !interface)result=-KERNEL_EADDRNOTAVAIL;
+    if(!result && interface && socket->bound_device && socket->bound_device!=netif_get_index(interface))result=-KERNEL_EINVAL;
+    if(!result) {
+        uint8_t selected=interface?netif_get_index(interface):0;
+        {SOCKET_ENDPOINT(state,socket);socket->multicast_index=selected;
+          ip_addr_set_zero_ip4(&socket->multicast_source);ip_2_ip4(&socket->multicast_source)->addr=address;}
+        if(socket->raw)raw_set_multicast_netif_index(socket->raw,selected);
+        if(socket->udp) {
+            ip4_addr_t source={address};udp_set_multicast_netif_index(socket->udp,selected);
+            udp_set_multicast_netif_addr(socket->udp,&source);
+        }
+    }
+    kernel_socket_protocol_leave(&scope);return result;
+}
+
+int kernel_socket_get_multicast_interface(struct kernel_socket *socket,uint32_t *address)
+{
+    if(socket->domain!=KERNEL_SOCKET_DOMAIN_INET)return -KERNEL_ENOPROTOOPT;
+    SOCKET_ENDPOINT(state,socket);*address=ip_2_ip4(&socket->multicast_source)->addr;return 0;
 }
 void kernel_socket_save_error(struct kernel_socket *socket, int error)
 {

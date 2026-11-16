@@ -1015,7 +1015,7 @@ udp_bind(struct udp_pcb *pcb, const ip_addr_t *ipaddr, u16_t port)
     }
   } else {
     for (ipcb = *udp_port_bucket(port); ipcb != NULL; ipcb = ipcb->next) {
-      if (pcb != ipcb) {
+      if (pcb != ipcb && (!pcb->netif_idx || !ipcb->netif_idx || pcb->netif_idx==ipcb->netif_idx)) {
         /* By default, we don't allow to bind to a port that any other udp
            PCB is already bound to, unless *all* PCBs with that port have the
            REUSEADDR flag set. */
