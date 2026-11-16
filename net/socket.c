@@ -115,7 +115,7 @@ struct kernel_socket {
     int pending_error;
     uint8_t reuseaddr;
     uint8_t keepalive;
-    uint8_t nodelay;
+    uint8_t nodelay, cork;
     uint8_t broadcast, ipv4_ttl, multicast_ttl;
     uint8_t bound_device, multicast_index;
     ip_addr_t multicast_source;
@@ -2107,6 +2107,7 @@ static err_t socket_tcp_accepted(void *context, struct tcp_pcb *pcb,
     child->reuseaddr = listener->reuseaddr;
     child->keepalive = listener->keepalive;
     child->nodelay = listener->nodelay;
+    child->cork = listener->cork;
     child->broadcast=listener->broadcast;child->ipv4_ttl=listener->ipv4_ttl;
     child->multicast_ttl=listener->multicast_ttl;child->bound_device=pcb->netif_idx;
     child->multicast_index=listener->multicast_index;
@@ -2115,6 +2116,7 @@ static err_t socket_tcp_accepted(void *context, struct tcp_pcb *pcb,
     child->type = SOCKET_STREAM;
     child->tcp = pcb;
     if (child->nodelay) tcp_nagle_disable(pcb);
+    pcb->boaros_cork = child->cork;
     child->connected = 1U;
     address_export(child, &pcb->local_ip, pcb->local_port, &child->saved_local);
     address_export(child, &pcb->remote_ip, pcb->remote_port, &child->saved_peer);
@@ -4495,6 +4497,21 @@ int kernel_socket_set_option(struct kernel_socket *socket,
         if(socket->raw)raw_set_multicast_ttl(socket->raw,(u8_t)value);
         if(socket->udp)udp_set_multicast_ttl(socket->udp,(u8_t)value);
         break;
+    case KERNEL_SOCKET_CORK:
+        if (!kernel_socket_is_tcp(socket)) { result = -KERNEL_ENOPROTOOPT; break; }
+        { SOCKET_ENDPOINT(state,socket);socket->cork = value != 0; }
+        if (socket->tcp && !socket->listening) {
+            socket->tcp->boaros_cork = value != 0;
+            if (!value) {
+                socket->tcp->boaros_output_more = 0;
+                socket->tcp->boaros_cork_pending = 0;
+                /* Uncork alone restores normal Minshall. NODELAY additionally
+                 * requests a push, including bytes blocked by the old window. */
+                if (socket->nodelay) boaros_lwip_tcp_push(socket->tcp);
+                tcp_flush_output(socket);
+            }
+        }
+        break;
     case KERNEL_SOCKET_NODELAY:
         if (socket->domain != KERNEL_SOCKET_DOMAIN_INET || socket->type != SOCKET_STREAM) { result = -KERNEL_ENOPROTOOPT; break; }
         { KERNEL_IRQ_LOCK_SCOPE(state,socket_endpoint_lock(socket));socket->nodelay = value != 0; }
@@ -4555,6 +4572,10 @@ int kernel_socket_get_option(struct kernel_socket *socket,
         *value = -socket->pending_error; socket->pending_error = 0;
         break;
     }
+    case KERNEL_SOCKET_CORK:
+        if (!kernel_socket_is_tcp(socket)) result = -KERNEL_ENOPROTOOPT;
+        else *value = socket->cork;
+        break;
     case KERNEL_SOCKET_NODELAY:
         if (socket->domain != KERNEL_SOCKET_DOMAIN_INET || socket->type != SOCKET_STREAM) result = -KERNEL_ENOPROTOOPT;
         else *value = socket->nodelay;

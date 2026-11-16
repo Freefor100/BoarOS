@@ -417,7 +417,7 @@ struct tcp_pcb {
   u32_t snd_sml;
   /* Delayed new short tail, owned and retired with this PCB. */
   u32_t boaros_cork_deadline, boaros_push_seq;
-  u8_t boaros_output_more, boaros_cork_pending, boaros_push_pending;
+  u8_t boaros_output_more, boaros_cork_pending, boaros_push_pending, boaros_cork;
 #ifdef BOAROS_LWIP_TCP_CONTEXT
   struct tcp_pcb *boaros_route_next;
   struct tcp_pcb *boaros_loopback_peer;

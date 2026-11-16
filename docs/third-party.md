@@ -21,7 +21,7 @@ bind/connect 和占用端口，使用真实 lwIP 源码，固定版本不变。
 现在只在成功挂入完整包链后通知；hook 未定义的配置保留原行为。仍固定上述
 上游 commit，验证入口为 `make test-lwip-host` 与双架构真实网络/ABI 回归。
 
-TCP 输出另增加应用级 MORE 模式、PCB 内绝对短尾期限与 push 序号。普通 ACK 输出仍使用默认 Nagle/Minshall，MORE 仅抑制首次发送的未满尾段；重传和控制包不被等待尾段阻塞。BoarOS worker 从同一 PCB 列表查询期限并有预算地推进到期输出，既有 owner 迁移不重置时间；不升级固定 lwIP 版本，也不增加独立计时引用。验证入口与语义边界见[网络模块](modules/kernel-network.md)。
+TCP 输出另增加应用级 MORE 模式、持久 CORK 策略、PCB 内绝对短尾期限与 push 序号。普通 ACK 输出仍使用默认 Nagle/Minshall，MORE 仅抑制首次发送的未满尾段；重传和控制包不被等待尾段阻塞。BoarOS worker 从同一 PCB 列表查询期限并有预算地推进到期输出，既有 owner 迁移不重置时间；不升级固定 lwIP 版本，也不增加独立计时引用。验证入口与语义边界见[网络模块](modules/kernel-network.md)。
 
 ## lwext4
 

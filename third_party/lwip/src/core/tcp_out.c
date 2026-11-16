@@ -1630,7 +1630,7 @@ boaros_lwip_tcp_output_more(struct tcp_pcb *pcb, u8_t more)
     u32_t seq = lwip_ntohl(seg->tcphdr->seqno);
     int pushed = !more && pcb->boaros_push_pending && TCP_SEQ_LT(seq, pcb->boaros_push_seq);
     int retransmit = TCP_SEQ_LT(seq, pcb->snd_nxt);
-    if (!pushed && !retransmit && more && !seg->next && seg->len < tcp_mss(pcb) &&
+    if (!pushed && !retransmit && (more || pcb->boaros_cork) && !seg->next && seg->len < tcp_mss(pcb) &&
         !(pcb->flags & TF_FIN) && !(TCPH_FLAGS(seg->tcphdr) & TCP_SYN)) {
       if (!pcb->boaros_cork_pending) {
         pcb->boaros_cork_pending = 1;

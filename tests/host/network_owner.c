@@ -1233,7 +1233,7 @@ static void tcp_more_contract(void)
     tcp_more_service();CHECK(server->rx_bytes>=mss);
     clock_ns+=200000000;tcp_more_service();tcp_more_read(server,payload,mss+3);
 
-    /* Sequence comparisons and absolute deadlines both survive wraparound. */
+    /* Absolute millisecond deadlines survive clock wraparound. */
     clock_ns=((uint64_t)UINT32_MAX-100)*1000000;
     CHECK(write_buffer(client,"wrap",4,KERNEL_SOCKET_MSG_MORE)==4);
     CHECK(boaros_lwip_tcp_cork_delay(sys_now())==200);
@@ -1245,6 +1245,96 @@ static void tcp_more_contract(void)
     tcp_more_service();kernel_socket_network_purge_orphans();tcp_more_service();
     CHECK(!heap_live && boaros_lwip_tcp_cork_delay(sys_now())==UINT32_MAX);
     puts("PASS TCP MSG_MORE: syscall tail, ordinary ACK policy, full MSS, fixed deadline/wrap, NODELAY push, FIN and timer ownership");
+}
+
+static void tcp_cork_contract(void)
+{
+    struct kernel_socket *listener=NULL,*client=NULL,*server=NULL;
+    connected_pair(&listener,&client,&server);int value;
+    CHECK(!kernel_socket_set_option(client,KERNEL_SOCKET_CORK,1));
+    CHECK(!kernel_socket_get_option(client,KERNEL_SOCKET_CORK,&value) && value==1);
+    CHECK(write_buffer(client,"abc",3,0)==3 && write_buffer(client,"d",1,KERNEL_SOCKET_MSG_MORE)==1);
+    tcp_more_service();CHECK(!server->rx_bytes);
+    {struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+     CHECK(tcp_output(client->tcp)==ERR_OK);kernel_socket_protocol_leave(&scope);}
+    tcp_more_service();CHECK(!server->rx_bytes);
+    clock_ns+=199000000;tcp_more_service();CHECK(!server->rx_bytes);
+    clock_ns+=1000000;tcp_more_service();tcp_more_read(server,"abcd",4);
+    CHECK(!kernel_socket_get_option(client,KERNEL_SOCKET_CORK,&value) && value==1);
+    CHECK(write_buffer(client,"e",1,0)==1);tcp_more_service();CHECK(!server->rx_bytes);
+    CHECK(!kernel_socket_set_option(client,KERNEL_SOCKET_NODELAY,1));
+    tcp_more_service();tcp_more_read(server,"e",1);
+    CHECK(write_buffer(client,"f",1,0)==1);tcp_more_service();CHECK(!server->rx_bytes);
+    CHECK(!kernel_socket_set_option(client,KERNEL_SOCKET_CORK,0));
+    tcp_more_service();tcp_more_read(server,"f",1);
+
+    /* Uncork without NODELAY does not erase an outstanding small segment. */
+    CHECK(!kernel_socket_set_option(client,KERNEL_SOCKET_NODELAY,0));
+    CHECK(write_buffer(client,"r",1,0)==1);tcp_more_service();CHECK(client->tcp->unacked);
+    CHECK(!kernel_socket_set_option(client,KERNEL_SOCKET_CORK,1));
+    CHECK(write_buffer(client,"s",1,0)==1 && !kernel_socket_set_option(client,KERNEL_SOCKET_CORK,0));
+    tcp_more_service();CHECK(server->rx_bytes==1 && client->tcp->unsent);
+    {struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+     tcp_ack_now(server->tcp);CHECK(tcp_output(server->tcp)==ERR_OK);kernel_socket_protocol_leave(&scope);}
+    tcp_more_service();tcp_more_read(server,"rs",2);
+
+    unsigned mss=tcp_mss(client->tcp);static char payload[32768];memset(payload,'m',sizeof(payload));
+    CHECK(mss+1<sizeof(payload) && !kernel_socket_set_option(client,KERNEL_SOCKET_CORK,1));
+    CHECK(write_buffer(client,payload,mss+1,0)==(int)mss+1);tcp_more_service();
+    CHECK(server->rx_bytes==mss && client->tcp->unsent && client->tcp->unsent->len==1);
+    tcp_more_read(server,payload,mss);CHECK(!server->rx_bytes);
+    CHECK(!kernel_socket_set_option(client,KERNEL_SOCKET_CORK,0));tcp_more_service();tcp_more_read(server,payload,1);
+
+    CHECK(!kernel_socket_set_option(client,KERNEL_SOCKET_CORK,1));
+    CHECK(write_buffer(client,"tail",4,0)==4 && write_buffer(server,"q",1,0)==1);
+    tcp_more_service();tcp_more_read(client,"q",1);
+    CHECK(!server->rx_bytes && !server->tcp->unacked && client->tcp->unsent);
+    CHECK(!kernel_socket_set_option(client,KERNEL_SOCKET_CORK,0));tcp_more_service();tcp_more_read(server,"tail",4);
+
+    /* Retransmission is older sequence space, never a withheld new tail. */
+    {struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+     CHECK(tcp_write(client->tcp,"r",1,TCP_WRITE_FLAG_COPY)==ERR_OK && tcp_output(client->tcp)==ERR_OK);
+     CHECK(client->tcp->unacked && !client->tcp->unsent);
+     CHECK(!kernel_socket_set_option(client,KERNEL_SOCKET_CORK,1));
+     CHECK(tcp_write(client->tcp,"tail",4,TCP_WRITE_FLAG_COPY)==ERR_OK);
+     CHECK(tcp_rexmit(client->tcp)==ERR_OK && tcp_output(client->tcp)==ERR_OK);
+     CHECK(client->tcp->unsent && client->tcp->unsent->len==4);
+     kernel_socket_protocol_leave(&scope);}
+    tcp_more_service();CHECK(server->rx_bytes==1);tcp_more_read(server,"r",1);
+    CHECK(!kernel_socket_set_option(client,KERNEL_SOCKET_CORK,0));tcp_more_service();tcp_more_read(server,"tail",4);
+
+    /* A push survives a closed window. MORE overrides it for the application
+     * attempt, but ordinary window-open output can send the combined tail. */
+    CHECK(!kernel_socket_set_option(client,KERNEL_SOCKET_CORK,1));
+    tcpwnd_size_t window=client->tcp->snd_wnd;client->tcp->snd_wnd=0;
+    CHECK(write_buffer(client,"a",1,0)==1 && !kernel_socket_set_option(client,KERNEL_SOCKET_NODELAY,1));
+    CHECK(write_buffer(client,"b",1,KERNEL_SOCKET_MSG_MORE)==1);
+    {struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+     client->tcp->snd_wnd=window;CHECK(boaros_lwip_tcp_output_more(client->tcp,1)==ERR_OK && client->tcp->unsent);
+     CHECK(tcp_output(client->tcp)==ERR_OK && !client->tcp->unsent);
+     kernel_socket_protocol_leave(&scope);}
+    tcp_more_service();tcp_more_read(server,"ab",2);
+
+    /* A full application admission budget must push before waiting for room,
+     * even when CORK and MSG_MORE are both active. */
+    CHECK(!kernel_socket_set_option(client,KERNEL_SOCKET_SNDBUF,0));
+    window=client->tcp->snd_wnd;client->tcp->snd_wnd=0;
+    struct kernel_open_file_description *pin=(void *)client;
+    struct kernel_socket_write_request write={0};kernel_socket_stream_begin(&write,&pin);
+    CHECK(kernel_socket_stream_reserve(&write,4608,KERNEL_SOCKET_MSG_MORE)==4608);
+    CHECK(kernel_socket_stream_commit(&write,payload,4608,KERNEL_SOCKET_MSG_MORE)==4608);
+    CHECK(kernel_socket_stream_reserve(&write,1,KERNEL_SOCKET_MSG_MORE)==-KERNEL_EAGAIN);
+    client->tcp->snd_wnd=window;tcp_more_service();
+    kernel_socket_stream_finish(&write);CHECK(pin==(void *)client);
+    tcp_more_read(server,payload,4608);
+
+    CHECK(write_buffer(client,"abort",5,0)==5);tcp_more_service();CHECK(client->tcp->boaros_cork_pending);
+    {struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+     tcp_abort(client->tcp);CHECK(!client->tcp);kernel_socket_protocol_leave(&scope);}
+    tcp_more_service();CHECK(boaros_lwip_tcp_cork_delay(sys_now())==UINT32_MAX);
+    kernel_socket_destroy(client);kernel_socket_destroy(server);kernel_socket_destroy(listener);
+    tcp_more_service();kernel_socket_network_purge_orphans();tcp_more_service();CHECK(!heap_live);
+    puts("PASS TCP_CORK: persistent tail, deadline, NODELAY/uncork Minshall, MSS, retransmission, window/push, pressure and abort cleanup");
 }
 
 static void tcp_detached_copy(void)
@@ -3545,6 +3635,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "unix-seq-records")) unix_seqpacket_records();
     else if (!strcmp(argv[1], "ipv4-route")) ipv4_route_output();
     else if (!strcmp(argv[1], "tcp-loopback-checksum")) tcp_loopback_checksum();
+    else if (!strcmp(argv[1], "tcp-cork")) tcp_cork_contract();
     else if (!strcmp(argv[1], "tcp-more")) tcp_more_contract();
     else if (!strcmp(argv[1], "tcp-detached")) tcp_detached_copy();
     else if (!strcmp(argv[1], "tcp-reset-receive-retry")) tcp_reset_receive_retry();

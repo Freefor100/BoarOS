@@ -253,6 +253,7 @@ static int socket_option(int level, int name, enum kernel_socket_option *option)
     } else if (level == LINUX_IPPROTO_TCP) {
         if (name == 1) { *option = KERNEL_SOCKET_NODELAY; return 0; }
         if (name == 2) { *option = KERNEL_SOCKET_MAXSEG; return 0; }
+        if (name == 3) { *option = KERNEL_SOCKET_CORK; return 0; }
     } else if (level == 41 && name == 26) {
         *option = KERNEL_SOCKET_V6ONLY; return 0;
     }

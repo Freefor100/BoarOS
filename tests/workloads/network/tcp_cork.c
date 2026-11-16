@@ -103,8 +103,61 @@ static void more(void)
     CHECK(!close(duplicate));receive(p[1],"close",5);char byte;CHECK(!recv(p[1],&byte,1,0) && !close(p[1]));
     puts("CORK CASE shutdown/final close and dup lifetime PASS");
 }
+static int get_option(int fd,int name)
+{ int value=-1;socklen_t size=sizeof(value);CHECK(!getsockopt(fd,IPPROTO_TCP,name,&value,&size) && size==sizeof(value));return value; }
+static void cork(void)
+{
+    int p[2];pair(p);CHECK(!get_option(p[0],TCP_CORK));option(p[0],TCP_CORK,1);
+    int duplicate=dup(p[0]);CHECK(duplicate>=0 && get_option(duplicate,TCP_CORK)==1);
+    CHECK(send(p[0],"a",1,0)==1);quiet(p[1]);
+    CHECK(send(duplicate,"b",1,0)==1);quiet(p[1]);CHECK(get_option(p[0],TCP_CORK)==1);
+    option(duplicate,TCP_CORK,0);receive(p[1],"ab",2);CHECK(!close(duplicate));
+    close_pair(p);puts("CORK CASE persistent setting and shared fd uncork PASS");
+
+    pair(p);option(p[0],TCP_CORK,1);option(p[0],TCP_NODELAY,1);
+    CHECK(send(p[0],"c",1,0)==1);quiet(p[1]);
+    option(p[0],TCP_NODELAY,1);receive(p[1],"c",1);CHECK(get_option(p[0],TCP_CORK)==1);
+    CHECK(send(p[0],"d",1,0)==1);quiet(p[1]);option(p[0],TCP_CORK,0);receive(p[1],"d",1);
+    close_pair(p);puts("CORK CASE CORK precedence and NODELAY explicit push PASS");
+
+    pair(p);option(p[0],TCP_CORK,1);CHECK(send(p[0],"timeout",7,0)==7);quiet(p[1]);
+    receive(p[1],"timeout",7);CHECK(get_option(p[0],TCP_CORK)==1);
+    CHECK(send(p[0],"again",5,0)==5);quiet(p[1]);option(p[0],TCP_CORK,0);receive(p[1],"again",5);
+    close_pair(p);puts("CORK CASE timeout retains option and next tail corks PASS");
+
+    pair(p);option(p[0],TCP_CORK,1);int mss=get_option(p[0],TCP_MAXSEG);CHECK(mss>0);
+    char *bytes=malloc((size_t)mss+1);CHECK(bytes);memset(bytes,'M',(size_t)mss+1);
+    CHECK(send(p[0],bytes,(size_t)mss+1,0)==mss+1);receive(p[1],bytes,(size_t)mss);
+    quiet(p[1]);option(p[0],TCP_CORK,0);receive(p[1],bytes,1);free(bytes);close_pair(p);
+    puts("CORK CASE full MSS passes, ACK does not release partial tail PASS");
+
+    pair(p);option(p[0],TCP_CORK,1);CHECK(send(p[0],"fin",3,0)==3);quiet(p[1]);
+    CHECK(!shutdown(p[0],SHUT_RD));quiet(p[1]);CHECK(!shutdown(p[0],SHUT_WR));
+    receive(p[1],"fin",3);close_pair(p);
+    pair(p);option(p[0],TCP_CORK,1);CHECK(send(p[0],"close",5,0)==5);quiet(p[1]);
+    CHECK(!close(p[0]));receive(p[1],"close",5);char byte;CHECK(!recv(p[1],&byte,1,0) && !close(p[1]));
+    puts("CORK CASE read shutdown preserves tail, write shutdown/final close push PASS");
+
+    for(int family=AF_INET;family<=AF_INET6;family+=AF_INET6-AF_INET) {
+        int listener=socket(family,SOCK_STREAM,0);CHECK(listener>=0);option(listener,TCP_CORK,1);
+        struct sockaddr_storage address={0};socklen_t size;
+        if(family==AF_INET) {
+            struct sockaddr_in *a=(void *)&address;a->sin_family=AF_INET;a->sin_addr.s_addr=htonl(INADDR_LOOPBACK);size=sizeof(*a);
+        } else {
+            struct sockaddr_in6 *a=(void *)&address;a->sin6_family=AF_INET6;a->sin6_addr=in6addr_loopback;size=sizeof(*a);
+        }
+        CHECK(!bind(listener,(void *)&address,size) && !listen(listener,1) && !getsockname(listener,(void *)&address,&size));
+        p[0]=socket(family,SOCK_STREAM,0);CHECK(p[0]>=0 && !connect(p[0],(void *)&address,size));
+        p[1]=accept(listener,NULL,NULL);CHECK(p[1]>=0 && !close(listener) && get_option(p[1],TCP_CORK)==1);
+        CHECK(send(p[1],"inherit",7,0)==7);quiet(p[0]);option(p[1],TCP_CORK,0);receive(p[0],"inherit",7);close_pair(p);
+    }
+    int udp=socket(AF_INET,SOCK_DGRAM,0),one=1;CHECK(udp>=0);
+    CHECK(setsockopt(udp,IPPROTO_TCP,TCP_CORK,&one,sizeof(one))==-1 && errno==ENOPROTOOPT);CHECK(!close(udp));
+    puts("CORK CASE IPv4/IPv6 listener inheritance and non-TCP rejection PASS");
+}
+
 int main(void)
 {
-    setvbuf(stdout,NULL,_IONBF,0);alarm(30);more();
+    setvbuf(stdout,NULL,_IONBF,0);alarm(30);more();cork();
     puts("CORK ALL PASS");if(getpid()==1)reboot(RB_POWER_OFF);return 0;
 }
