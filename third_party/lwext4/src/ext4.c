@@ -130,41 +130,10 @@ static inline void ext4_state_end(struct ext4_state_guard *guard)
 #define EXT4_STATE_READ_SCOPE(name, fs) struct ext4_state_guard name \
     __attribute__((cleanup(ext4_state_end))) = ext4_state_read_begin(fs)
 
-struct ext4_space_guard {
-    struct ext4_fs *serial;
-#if BOAROS_MAX_CPUS > 1
-    struct kernel_raw_guard raw;
-#endif
-};
-static inline void ext4_space_enter(struct ext4_space_guard *guard,struct ext4_fs *fs,bool write)
-{
-    /* A serial backend can keep borrowing its existing STATE qualification.
-     * The parallel port only protects the free/reserved/delayed block tuple. */
-#if BOAROS_MAX_CPUS > 1
-    if (fs->os_locks && fs->os_locks->resource_acquire) {
-        kernel_raw_lock_acquire(&fs->block_space,&guard->raw);
-        return;
-    }
-#endif
-    if (write) ext4_fs_state_lock(fs);
-    else ext4_fs_state_read_lock(fs);
-    guard->serial=fs;
-}
-static inline void ext4_space_leave(struct ext4_space_guard *guard)
-{
-#if BOAROS_MAX_CPUS > 1
-    if (guard->raw.lock) {
-        kernel_raw_lock_release(&guard->raw);
-        return;
-    }
-#endif
-    ext4_fs_state_unlock(guard->serial);
-}
-#define EXT4_SPACE_GUARD(name, fs, write) \
-    struct ext4_space_guard name __attribute__((cleanup(ext4_space_leave)))={0}; \
-    ext4_space_enter(&name,fs,write)
-#define EXT4_SPACE_SCOPE(name, fs) EXT4_SPACE_GUARD(name,fs,true)
-#define EXT4_SPACE_READ_SCOPE(name, fs) EXT4_SPACE_GUARD(name,fs,false)
+/* Only the free/reserved/delayed block tuple is shared here. Its bounded
+ * arithmetic must not acquire the sleeping mount writer, including on UP. */
+#define EXT4_SPACE_SCOPE(name, fs) KERNEL_RAW_SCOPE(name, &(fs)->block_space)
+#define EXT4_SPACE_READ_SCOPE(name, fs) EXT4_SPACE_SCOPE(name, fs)
 
 static inline uint64_t unreserved_blocks(struct ext4_fs *fs)
 {
@@ -193,8 +162,18 @@ static struct ext4_delalloc_chunk *delalloc_find(struct ext4_delalloc *da, uint3
     struct ext4_delalloc_chunk find={.key=key};
     return RB_FIND(ext4_delalloc_tree,&da->tree,&find);
 }
-/* STATE owns the reservation index and aggregate counters. Empty nodes retire
- * here; the actual free is outside STATE and all transaction publication. */
+/* Tree removals have inode-writer or metadata-state exclusion. The separate
+ * drainer only takes ownership of the retired list, never of the tree. The
+ * publisher never dereferences the previous head, which may already be drained. */
+static void delalloc_retire(struct ext4_delalloc *da,struct ext4_delalloc_chunk *chunk)
+{
+    struct ext4_delalloc_chunk *head=__atomic_load_n(&da->retired,__ATOMIC_RELAXED);
+    do { chunk->next=head; }
+    while(!__atomic_compare_exchange_n(&da->retired,&head,chunk,false,
+                                      __ATOMIC_RELEASE,__ATOMIC_RELAXED));
+}
+/* Inode writers exclude prepare/finish; writeback readers serialize under
+ * STATE. Shared space accounting has its own short lock. */
 static uint64_t delalloc_range(struct ext4_delalloc *da,uint64_t first,uint64_t last,bool clear)
 {
     if (first>=last) return 0;
@@ -213,8 +192,7 @@ static uint64_t delalloc_range(struct ext4_delalloc *da,uint64_t first,uint64_t 
             chunk->mask&=~mask;chunk->accepted&=~mask;
             if (!chunk->mask && !chunk->borrowers) {
                 RB_REMOVE(ext4_delalloc_tree,&da->tree,chunk);
-                chunk->next=__atomic_load_n(&da->retired,__ATOMIC_RELAXED);
-                __atomic_store_n(&da->retired,chunk,__ATOMIC_RELAXED);
+                delalloc_retire(da,chunk);
             }
         }
         chunk=next;
@@ -4115,12 +4093,11 @@ static int ext4_zero_file_range(struct ext4_inode_ref *ref,
 
 void ext4_file_drain_reservations(ext4_file *file)
 {
-    /* Empty overwrite batches have no retired reservation storage. The hint
-     * never borrows a node: a nonempty list is still taken under STATE. */
+    /* The hint borrows no node. Exchange transfers the whole list to this
+     * drainer; a concurrent publisher retains its separately linked list. */
     if (!file->delalloc || !__atomic_load_n(&file->delalloc->retired,__ATOMIC_RELAXED))return;
-    struct ext4_delalloc_chunk *retired;
-    { EXT4_STATE_SCOPE(state,&file->mp->fs);
-      retired=__atomic_exchange_n(&file->delalloc->retired,NULL,__ATOMIC_RELAXED); }
+    struct ext4_delalloc_chunk *retired=__atomic_exchange_n(
+        &file->delalloc->retired,NULL,__ATOMIC_ACQUIRE);
     while (retired) {struct ext4_delalloc_chunk *next=retired->next;ext4_free(retired);retired=next;}
 }
 void ext4_file_release_reservations(ext4_file *file,uint64_t size)
@@ -4145,7 +4122,12 @@ int ext4_file_reserve_write(ext4_file *file,uint64_t offset,size_t length,size_t
     if (!file->delalloc || !file->mp->fs.jbd_journal)return ENOTSUP;
     if (file->mp->fs.read_only)return EROFS;
     if (offset>file->fmax || length>file->fmax-offset)return EFBIG;
-    EXT4_MP_LOCK(file->mp);
+    /* The caller's inode I/O writer stabilizes its mapping and reservation
+     * tree. Exclude legacy metadata writers, but let other inode preparations
+     * share this qualification while a mapping read waits for storage. */
+    const struct ext4_lock *locks=file->mp->os_locks;
+    if (locks && locks->read_lock) locks->read_lock(locks->context);
+    else EXT4_MP_LOCK(file->mp);
     struct ext4_fs *fs=&file->mp->fs;
     struct ext4_inode_ref ref;
     bool have_ref=false;
@@ -4276,6 +4258,13 @@ void ext4_file_accept_reservation(ext4_file *file,struct file_write_reservation 
 {
     struct ext4_fs *fs=&file->mp->fs;
     size_t block=fs->bdev->lg_bsize;
+    /* mmap publication holds an inode reader, as does writeback. STATE must
+     * still serialize accepted bits against writeback's mask removal; the
+     * read qualification excludes legacy writers without excluding peers. */
+    const struct ext4_lock *locks=file->mp->os_locks;
+    if (locks && locks->read_lock) locks->read_lock(locks->context);
+    else EXT4_MP_LOCK(file->mp);
+    {
     EXT4_STATE_SCOPE(state,fs);
     for (struct file_write_reservation *change=ticket;change;change=change->next) {
         struct ext4_delalloc_chunk *chunk=change->owner;
@@ -4286,6 +4275,8 @@ void ext4_file_accept_reservation(ext4_file *file,struct file_write_reservation 
         chunk->accepted|=change->mask&chunk->mask&delalloc_mask(0,kept);
         change->committed=true;
     }
+    }
+    EXT4_MP_UNLOCK(file->mp);
 }
 void ext4_file_finish_reservation(ext4_file *file,struct file_write_reservation *ticket,uint64_t start,uint64_t accepted_end)
 {
@@ -4316,12 +4307,8 @@ void ext4_file_finish_reservation(ext4_file *file,struct file_write_reservation 
                 fs->delayed_blocks-=count;
             }
             if (!chunk->mask) {
-                /* A separate worker may drain the retired list without the
-                 * inode writer. Serialize the retirement, not the charge. */
-                EXT4_STATE_SCOPE(state,fs);
                 RB_REMOVE(ext4_delalloc_tree,&file->delalloc->tree,chunk);
-                chunk->next=__atomic_load_n(&file->delalloc->retired,__ATOMIC_RELAXED);
-                __atomic_store_n(&file->delalloc->retired,chunk,__ATOMIC_RELAXED);
+                delalloc_retire(file->delalloc,chunk);
             }
         }
         if (change!=ticket) ext4_free(change);

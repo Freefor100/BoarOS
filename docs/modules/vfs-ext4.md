@@ -276,8 +276,12 @@ ctime与非目录的capability属性删除放在同一undo/日志事务中；成
 `make test-ext4-backend-parallel-host` 使用真实 VFS、后端和 worker，检查第二个线程
 创建失败后的排空与重试、排队块设备同步跨越模式切换，以及同一 inode 表块中两份 FD
 属性修改重叠、一方失败和另一方 checkpoint 后的内容。checkpoint 暂停时，CPU1 的 FD
-查询仍能完成。测试正常卸载后运行 e2fsck；资源端口的等待、重放及最后引用另由
+查询仍能完成。空间准备检查覆盖实际单／双核模式：暂停一个inode的映射读取时，另一inode仍可完成预留和取消；真实ENOSPC及失败前缀归还后计数恢复。mmap读者在旧式挂载writer被占用时仍可接受已固定的ticket。测试正常卸载后运行e2fsck；资源端口的等待、重放及最后引用另由
 `make test-lwext4-port-host` 检查。
+
+延迟分配的空间准备与元数据事务分开处理。调用者持有实际inode的I/O写资格，稳定该inode的映射和预留树；`ext4_file_reserve_write()`只查询已有映射，沿后端读资格进入，保留对旧式元数据writer的排斥，但不同inode的准备可以共享资格。它不在查询时分配磁盘块，也不扩大本次实际接纳的空间额度。空闲、事务预留与延迟分配块数始终由已有`block_space`短保护共同检查和更新，单核也不再为这组有界计数取得挂载writer；分配、块读取及等待在该短保护之外。
+
+mmap接受已有ticket时，ticket保持chunk存活，inode的I/O读资格排除截断、打洞和映射修改；接受位继续由STATE保护，与同样持有inode读资格的writeback对预留位的清除互斥；先取得后端共享读资格，不再把单纯的ticket接受升级为挂载writer。结束ticket仍持有inode的I/O写资格，最后借用结束后才能归还未接受部分。空chunk先从该inode的树摘除，再以原子发布加入退休链；独立drainer通过一次exchange取得整条链并锁外释放。新退休项与已经交给drainer的链分别归属，不通过全挂载状态锁协调内存归还。实际块分配、事务发布、回滚、固定fsync目标及FLUSH规则沿原机制执行。
 
 ## 文件节点与页缓存
 
