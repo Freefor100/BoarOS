@@ -2,6 +2,21 @@
 #include <kernel/errno.h>
 #include <stdint.h>
 
+static uint64_t rr_slice_ns = KERNEL_SCHED_RR_NS;
+
+uint64_t kernel_sched_rr_slice_ns(void)
+{ return __atomic_load_n(&rr_slice_ns, __ATOMIC_ACQUIRE); }
+
+int kernel_sched_rr_slice_set_ms(int64_t milliseconds)
+{
+    if (milliseconds < INT32_MIN || milliseconds > INT32_MAX) return -KERNEL_EINVAL;
+    uint64_t ns = milliseconds <= 0 ? KERNEL_SCHED_RR_NS : (uint64_t)milliseconds * UINT64_C(1000000);
+    /* Existing tasks keep the remainder already charged to them. New tasks
+     * and exhausted slices use the published value, as with Linux's sysctl. */
+    __atomic_store_n(&rr_slice_ns, ns, __ATOMIC_RELEASE);
+    return 0;
+}
+
 /* Linux's per-thread nice weights: equal nice levels receive equal CPU share,
  * while each +1 step reduces weight by approximately 20 percent. */
 static const unsigned nice_weights[40]={
@@ -40,7 +55,7 @@ int kernel_sched_policy_set(struct kernel_sched_policy *state,
     if (priority < 0 || priority > 99 ||
         ((policy != KERNEL_SCHED_FIFO && policy != KERNEL_SCHED_RR) != (priority == 0))) return -KERNEL_EINVAL;
     if (!state->rr_remaining_ns && policy == KERNEL_SCHED_RR)
-        state->rr_remaining_ns = KERNEL_SCHED_RR_NS;
+        state->rr_remaining_ns = kernel_sched_rr_slice_ns();
     state->policy = policy;
     state->priority = priority;
     state->reset_on_fork = reset;
@@ -51,7 +66,7 @@ void kernel_sched_policy_fork(struct kernel_sched_policy *child,
                               const struct kernel_sched_policy *parent)
 {
     *child = *parent;
-    child->rr_remaining_ns = KERNEL_SCHED_RR_NS;
+    child->rr_remaining_ns = kernel_sched_rr_slice_ns();
     child->fair_remainder=child->fair_slice_used=0;
     if (child->reset_on_fork) {
         child->fair_slice_ns=0;
@@ -71,7 +86,7 @@ void kernel_sched_policy_charge(struct kernel_sched_policy *state, uint64_t delt
 
 void kernel_sched_policy_rotate(struct kernel_sched_policy *state)
 {
-    if (state->policy == KERNEL_SCHED_RR) state->rr_remaining_ns = KERNEL_SCHED_RR_NS;
+    if (state->policy == KERNEL_SCHED_RR) state->rr_remaining_ns = kernel_sched_rr_slice_ns();
 }
 
 int kernel_sched_policy_expired(const struct kernel_sched_policy *state)

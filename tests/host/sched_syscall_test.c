@@ -148,6 +148,11 @@ int main(void)
     assert(call(122,0,8,1)==-KERNEL_EFAULT);
     struct {int64_t sec,ns;} interval;
     assert(call(127,0,(uintptr_t)&interval,0)==0 && interval.sec==0 && interval.ns==100000000);
+    assert(!kernel_sched_rr_slice_set_ms(50));
+    assert(!call(127,0,(uintptr_t)&interval,0) && !interval.sec && interval.ns==50000000);
+    assert(!kernel_sched_rr_slice_set_ms(INT32_MAX));
+    assert(!call(127,0,(uintptr_t)&interval,0) && interval.sec==2147483 && interval.ns==647000000);
+    assert(!kernel_sched_rr_slice_set_ms(0));
     assert(call(119,0,1|0x40000000,(uintptr_t)&priority)==0);
     assert(call(120,0,0,0)==(1|0x40000000));
     assert(call(127,0,(uintptr_t)&interval,0)==0 && interval.ns==0);

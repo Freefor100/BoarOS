@@ -158,10 +158,12 @@ enum kernel_syscall_status syscall_handle_sched(
             else if (nr==121) result=sched_copy(caller,request->arguments[1],
                                                &state.priority,sizeof(state.priority),1);
             else {
-                struct { int64_t sec,nsec; } interval={0,
-                    state.policy==KERNEL_SCHED_FIFO ? 0 :
-                    state.policy==KERNEL_SCHED_RR ? KERNEL_SCHED_RR_NS :
-                        kernel_sched_fair_slice(&state)};
+                uint64_t ns=state.policy==KERNEL_SCHED_FIFO ? 0 :
+                    state.policy==KERNEL_SCHED_RR ? kernel_sched_rr_slice_ns() :
+                        kernel_sched_fair_slice(&state);
+                struct { int64_t sec,nsec; } interval={
+                    (int64_t)(ns/UINT64_C(1000000000)),
+                    (int64_t)(ns%UINT64_C(1000000000))};
                 result=sched_copy(caller,request->arguments[1],&interval,sizeof(interval),1);
             }
         }

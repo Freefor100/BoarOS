@@ -55,6 +55,7 @@
 #define PROC_UNPRIVILEGED_BPF_INODE UINT64_C(22)
 #define PROC_HOSTNAME_INODE UINT64_C(23)
 #define PROC_DOMAINNAME_INODE UINT64_C(24)
+#define PROC_RR_TIMESLICE_INODE UINT64_C(25)
 #define PROC_TASK_DIR_KIND 10U
 #define PROC_TID_DIR_KIND 11U
 #define PROC_TID_STAT_KIND 12U
@@ -291,6 +292,8 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
             *inode = PROC_RT_PERIOD_INODE;
         else if (length == 19U && !memcmp(name, "sched_rt_runtime_us", 19U))
             *inode = PROC_RT_RUNTIME_INODE;
+        else if (length == 21U && !memcmp(name, "sched_rr_timeslice_ms", 21U))
+            *inode = PROC_RR_TIMESLICE_INODE;
         else if (length == 7U && !memcmp(name, "pid_max", 7U))
             *inode = PROC_PID_MAX_INODE;
         else if(length==25U && !memcmp(name,"unprivileged_bpf_disabled",25U))
@@ -493,7 +496,7 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
          inode != PROC_UPTIME_INODE && inode != PROC_SELF_INODE && inode != PROC_THREAD_SELF_INODE &&
          inode != PROC_MOUNTS_INODE && inode != PROC_SYS_INODE &&
          inode != PROC_KERNEL_INODE && inode != PROC_RT_PERIOD_INODE &&
-         inode != PROC_RT_RUNTIME_INODE && inode != PROC_PID_MAX_INODE &&
+         inode != PROC_RT_RUNTIME_INODE && inode != PROC_RR_TIMESLICE_INODE && inode != PROC_PID_MAX_INODE &&
          inode != PROC_UNPRIVILEGED_BPF_INODE &&
          inode != PROC_HOSTNAME_INODE && inode != PROC_DOMAINNAME_INODE &&
          inode != PROC_SYSVIPC_INODE && inode != PROC_SYSVIPC_SHM_INODE &&
@@ -555,7 +558,8 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
     if (status != KERNEL_HEAP_STATUS_OK)
         return status == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
     node->generated_control = (inode == PROC_RT_PERIOD_INODE ||
-                              inode == PROC_RT_RUNTIME_INODE || inode==PROC_UNPRIVILEGED_BPF_INODE ||
+                              inode == PROC_RT_RUNTIME_INODE || inode == PROC_RR_TIMESLICE_INODE ||
+                              inode==PROC_UNPRIVILEGED_BPF_INODE ||
                               inode == PROC_HOSTNAME_INODE || inode == PROC_DOMAINNAME_INODE)
         ? KERNEL_VFS_CONTROL_READ | KERNEL_VFS_CONTROL_WRITE : 0;
     if (proc_inode_kind(inode) == PROC_PID_COMM_KIND || proc_inode_kind(inode) == PROC_TID_COMM_KIND) {
@@ -696,12 +700,12 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
         return 1;
     }
     if (directory == PROC_SYS_INODE || directory == PROC_KERNEL_INODE) {
-        if (position > (directory == PROC_SYS_INODE ? 2U : 7U)) return 0;
+        if (position > (directory == PROC_SYS_INODE ? 2U : 8U)) return 0;
         const char *entry = position == 0 ? "." : position == 1 ? ".." :
             directory == PROC_SYS_INODE ? "kernel" : position == 2 ?
             "sched_rt_period_us" : position == 3 ? "sched_rt_runtime_us" :
             position == 4 ? "pid_max" : position == 5 ? "unprivileged_bpf_disabled" :
-            position == 6 ? "hostname" : "domainname";
+            position == 6 ? "hostname" : position == 7 ? "domainname" : "sched_rr_timeslice_ms";
         size_t length = strlen(entry) + 1U;
         if (name_size < length) return -KERNEL_ERANGE;
         memcpy(name, entry, length);
@@ -711,7 +715,7 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
             directory == PROC_SYS_INODE ? PROC_KERNEL_INODE : position == 2 ?
             PROC_RT_PERIOD_INODE : position == 3 ? PROC_RT_RUNTIME_INODE :
             position == 4 ? PROC_PID_MAX_INODE : position == 5 ? PROC_UNPRIVILEGED_BPF_INODE :
-            position == 6 ? PROC_HOSTNAME_INODE : PROC_DOMAINNAME_INODE;
+            position == 6 ? PROC_HOSTNAME_INODE : position == 7 ? PROC_DOMAINNAME_INODE : PROC_RR_TIMESLICE_INODE;
         *type = position < 2 || directory == PROC_SYS_INODE ? 4U : 8U;
         return 1;
     }
@@ -1218,10 +1222,16 @@ static int proc_control(struct kernel_vfs_node *node, int write,
     }
     if (!write) {
         if (*offset) return 0;
-        int64_t period, runtime;
-        kernel_scheduler_rt_bandwidth_get(&period, &runtime);
-        int64_t value = node->inode==PROC_UNPRIVILEGED_BPF_INODE?kernel_bpf_unprivileged_get():
-            node->inode == PROC_RT_RUNTIME_INODE ? runtime : period;
+        int64_t value;
+        if (node->inode == PROC_RR_TIMESLICE_INODE)
+            value = (int64_t)(kernel_sched_rr_slice_ns() / UINT64_C(1000000));
+        else if (node->inode == PROC_UNPRIVILEGED_BPF_INODE)
+            value = kernel_bpf_unprivileged_get();
+        else {
+            int64_t period, runtime;
+            kernel_scheduler_rt_bandwidth_get(&period, &runtime);
+            value = node->inode == PROC_RT_RUNTIME_INODE ? runtime : period;
+        }
         char text[24];
         size_t length = 0;
         if (value < 0) text[length++] = '-';
@@ -1266,6 +1276,8 @@ static int proc_control(struct kernel_vfs_node *node, int write,
     int result;
     if(node->inode==PROC_UNPRIVILEGED_BPF_INODE)
         result=negative || value>2?-KERNEL_EINVAL:kernel_bpf_unprivileged_set((unsigned)value);
+    else if (node->inode == PROC_RR_TIMESLICE_INODE)
+        result = kernel_sched_rr_slice_set_ms(negative ? -(int64_t)value : (int64_t)value);
     else result = kernel_scheduler_rt_bandwidth_set(
         node->inode == PROC_RT_RUNTIME_INODE, negative ? -(int64_t)value : (int64_t)value);
     if (result) return result;

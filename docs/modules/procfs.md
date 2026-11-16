@@ -1,6 +1,6 @@
 # procfs 模块
 
-`fs/procfs.c` 是可动态创建的 VFS 实例。当前提供真实物理页分配器读数的 `meminfo`、单 hart 运行/idle 计时的 `uptime`、进程及线程数字目录、`/proc/self`、`/proc/thread-self` 与进程的 `exe/cwd/root/fd` 对象链接、`/proc/self/mounts` 与 `/proc/mounts`，以及进程 `maps`、`fdinfo`、`comm`、`stat/status` 的真实字段、`/proc/sysvipc/{shm,sem,msg}` 和 `/proc/sys/kernel/sched_rt_period_us`、`sched_rt_runtime_us`、`hostname`、`domainname`、只读的`pid_max`。线程目录提供 `comm`、`stat/status`、`fd/fdinfo`、`exe/cwd/root`、`maps`、`mounts` 和 `ns/{mnt,uts,ipc}`；Linux 全量进程字段与无路径 console 的链接仍待接入。
+`fs/procfs.c` 是可动态创建的 VFS 实例。当前提供真实物理页分配器读数的 `meminfo`、单 hart 运行/idle 计时的 `uptime`、进程及线程数字目录、`/proc/self`、`/proc/thread-self` 与进程的 `exe/cwd/root/fd` 对象链接、`/proc/self/mounts` 与 `/proc/mounts`，以及进程 `maps`、`fdinfo`、`comm`、`stat/status` 的真实字段、`/proc/sysvipc/{shm,sem,msg}` 和 `/proc/sys/kernel/sched_rt_period_us`、`sched_rt_runtime_us`、`sched_rr_timeslice_ms`、`hostname`、`domainname`、只读的`pid_max`。线程目录提供 `comm`、`stat/status`、`fd/fdinfo`、`exe/cwd/root`、`maps`、`mounts` 和 `ns/{mnt,uts,ipc}`；Linux 全量进程字段与无路径 console 的链接仍待接入。
 
 `mount(2)` 的 proc 实例不使用源字符串选择设备；用户态负责创建挂载点。bind、卸载和挂载属性的共同规则见[VFS 挂载说明](vfs-ext4.md)。挂载实例持有根及覆盖路径，最后释放时销毁无 I/O 的 proc 实例。PID 1 及后代退出后的根盘清理从最深子挂载开始拆除；其他命名空间的私有树随进程和命名空间 FD 的最后引用退休。
 
