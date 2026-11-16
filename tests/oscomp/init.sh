@@ -66,6 +66,16 @@ for group in $groups; do
                     /$libc/busybox sh /tmp/boaros-libctest-$libc.sh
                     result=$?
                 fi
+            elif [ "$group" = iozone ]; then
+                # RR时间片是全局参数；结束本组前恢复，策略只由子进程树继承。
+                rr_path=/proc/sys/kernel/sched_rr_timeslice_ms
+                old_rr_ms=$($BB cat "$rr_path") || exit 125
+                trap 'printf "%s\n" "$old_rr_ms" > "$rr_path" || exit 125' EXIT
+                printf '50\n' > "$rr_path" || exit 125
+                /glibc/busybox chrt -r 1 /$libc/busybox sh ./iozone_testcode.sh
+                result=$?
+                printf '%s\n' "$old_rr_ms" > "$rr_path" || exit 125
+                trap - EXIT
             else
                 /$libc/busybox sh ./${group}_testcode.sh
                 result=$?

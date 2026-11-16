@@ -107,6 +107,24 @@ class BootstrapTests(unittest.TestCase):
         self.assertNotIn('BOAROS_RUNTIME_GZIP=',script)
         self.assertNotIn('if [ "$group" = cyclictest',script)
 
+    def test_iozone_rr_is_embedded_in_both_architecture_bootstraps(self):
+        for arch, machine in [('riscv', 243), ('loongarch', 258)]:
+            with self.subTest(arch=arch):
+                result, target = self.generate(arch, machine)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                script = json.loads(target.read_text())['argv'][3]
+                self.assertIn('elif [ "$group" = iozone ]; then', script)
+                self.assertIn('/glibc/busybox chrt -r 1 /$libc/busybox sh ./iozone_testcode.sh', script)
+                # Other groups keep their direct shell entry and the chrt child
+                # replaces itself; it cannot change the bootstrap parent policy.
+                self.assertIn('/$libc/busybox sh ./${group}_testcode.sh', script)
+                self.assertEqual(script.count('chrt -r'), 1)
+                self.assertIn('rr_path=/proc/sys/kernel/sched_rr_timeslice_ms', script)
+                self.assertIn(r'''printf '50\n' > "$rr_path" || exit 125''', script)
+                self.assertIn('old_rr_ms=$($BB cat "$rr_path") || exit 125', script)
+                self.assertIn('trap - EXIT', script)
+                subprocess.run(['sh', '-n', '-c', script], check=True)
+
     def test_rv_bootstrap_does_not_publish_la_runtime(self):
         result,target=self.generate('riscv',243)
         self.assertEqual(result.returncode,0,result.stderr)

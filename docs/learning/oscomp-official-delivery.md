@@ -1482,6 +1482,15 @@ RV UP glibc、RV8 musl及LA UP glibc向量消费者通过；RV最小内核栈余
 该单组链接器墙钟/sys为−1.01%/−2.12%，Cargo为−1.90%/−3.18%，只报告观察值，不宣布独立稳定加速。最后Cargo sys为同组Linux的1.57倍，链接器为2.35倍，差距仍在。三份运行盘再次只读检查通过，链接ELF保持原SHA256；位置复用版heap-live=0、最小内核栈余量1032字节，堆峰值9613页，前一完成版9619页，不把这个小差值解释为稳定内存收益。默认RV/LA交付构建通过，通用提交单向合入兼容分支 `9a9a6137`，两份既有脚本修改保持原哈希。按本次要求完成这项修复后停止，未追加新的定位方向或性能批次。
 
 
+## IOzone 的内嵌启动策略
+
+兼容分支通过 `tests/oscomp/init.sh` 生成 PID1 配置，编入 RV／LA 内核。官方平台执行 `make all` 后，内核进入原盘 IOzone 组时，以原盘 glibc BusyBox 的 `chrt -r 1` 启动对应 libc 的原 `iozone_testcode.sh`，使用 SCHED_RR、实时优先级1。fork／exec 后的全部 IOzone 子进程继承策略。内嵌脚本在进入每组前保存 `/proc/sys/kernel/sched_rr_timeslice_ms`，设置为50ms，组结束后恢复原值；EXIT trap覆盖该子shell的提前退出。默认仍为100ms，RR参数是全局值，IOzone运行期间其他RR任务也使用50ms。
+
+设置发生在 IOzone 的独立子进程树中，PID1、其他测试组及内核后台执行者不随之改变。参数读取、设置或恢复失败时以125结束启动脚本，不静默回退；原IOzone程序返回失败时仍保留该结果，恢复时间片后继续原测试流程。两种libc沿用各自现有环境，包括LA musl的调度接口运行库；原ELF、脚本内容、参数、judge和监督时限保持原样。该设置随内核交付，在官方启动流程生效，不依赖本机 `tests/oscomp/run.py`；final-2026 的 cagent／buildstorm 入口不受影响。后续比较IOzone成绩时应明确这项调度条件。
+
+通用参数能力来自main `ce891e7b`。相关宿主检查覆盖50ms耗尽、新任务、现有剩余量、重置及整数边界。RV／LA短启动使用原盘glibc BusyBox设置策略，分别执行glibc／musl shell，查询均为RR、优先级1、50ms；父进程仍为OTHER，组完成后参数恢复100ms。另行只补查命令失败和提前退出的恢复，两架构均正常退出、heap-live归零且运行盘e2fsck返回0。没有运行实际IOzone吞吐或整套评测，不能据此给出新分数。首轮负例fixture误保留set-e而先退出，保留原记录；补查改用正式入口的set+e上下文，未重复已通过的普通继承与查询检查。源码、内核、命令和日志保存在主工作区 `build/iozone-rr/`。
+
+
 ## 2026-11-15：比赛提交的离线构建依赖
 
 main `16014248` 的宿主 BTF 编码工具构建经 `cd55d688` 单向合入兼容分支。使用该提交的纯 Git archive，重新建立没有 build 缓存的源码目录；在固定官方容器 `zhouzhouyi/os-contest@sha256:85dec949df7cef41fd03d30c6ad69f952204540e18d2c62bced9d2e262fef12d` 内断网执行原命令 `make all`，返回0。实际生成 RV64／LA64 ELF、`disk.img` 和 `disk-la.img`，没有借用本机 pahole、libdw/libelf 开发文件或本机脚本改动。BTF 仍从真实内核生成，构建机制见[BPF说明](../modules/kernel-bpf.md#构建与检查)。
