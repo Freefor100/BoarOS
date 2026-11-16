@@ -173,14 +173,18 @@ int kernel_open_file_supports_epoll(
  * accepted retains the page ref for caller/PTE; rejected consumes it. A copied
  * source is accepted too, then caller returns its extra physical reference. */
 struct kernel_open_file_page_preparation {
-    uint64_t address, index, epoch, size;
+    uint64_t address, index;
+    uint64_t epoch, size; /* Memory-object rollback state; disk epochs belong to the MM caller. */
     uint32_t pending, created;
 };
 int kernel_open_file_prepare_memory_page(struct kernel_open_file_description *,
     uint64_t index, struct kernel_open_file_page_preparation *);
 void kernel_open_file_finish_memory_page(struct kernel_open_file_description *,
     struct kernel_open_file_page_preparation *, int accepted);
-/* 同一准备/接纳契约；disk合法读页已被cache接纳，失败只归还额外页引用。 */
+/* Disk preparation owns a real cache-page reference, not a mapping epoch.
+ * The MM caller captures and rechecks the inode epoch around this operation;
+ * a hint caller only returns the page. Failure never publishes a PTE.
+ * Memory objects keep their separate rollback/finish protocol. */
 int kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *,
     uint64_t index, int read_window, struct kernel_open_file_page_preparation *);
 void kernel_open_file_finish_mapping_page(struct kernel_open_file_description *,

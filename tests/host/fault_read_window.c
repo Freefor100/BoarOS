@@ -293,6 +293,7 @@ static void window_truncate(struct kernel_page_cache *cache,struct kernel_open_f
     reset_window(cache,file);window_get_entered=window_get_resume=0;
     struct window_call call={.file=file,.index=3,.actor=1,.window=1,.post_get=1};pthread_t producer;
     struct kernel_vfs_node *node=kernel_open_file_node(file);
+    assert(!kernel_file_mapping_prepare(node));
     uint64_t before_epoch,epoch;assert(!kernel_file_mapping_epoch(node,&before_epoch));
     assert(!pthread_create(&producer,NULL,window_reader,&call));wait_progress(&window_get_entered,1);
     uint32_t references;
@@ -306,8 +307,12 @@ static void window_truncate(struct kernel_page_cache *cache,struct kernel_open_f
     printf("truncate post-get handshake: error=%d pending=%u original_epoch=%llu final_epoch=%llu final_size=%llu\n",
         call.error,call.prepared.pending,(unsigned long long)before_epoch,(unsigned long long)epoch,
         (unsigned long long)kernel_open_file_size(file));
-    assert(call.error==-KERNEL_EBUSY && !call.prepared.pending && epoch!=before_epoch &&
-        physical_page_available(cache->allocator)==available+1);
+    assert(!call.error && call.prepared.pending && epoch!=before_epoch &&
+        physical_page_available(cache->allocator)==available);
+    /* The borrowed old page is valid storage, but the MM must reject the old
+     * inode epoch before publication. Rejection returns that exact last owner. */
+    kernel_open_file_finish_mapping_page(file,&call.prepared,0);
+    assert(!call.prepared.pending && physical_page_available(cache->allocator)==available+1);
     struct kernel_open_file_page_preparation prepared={0};
     assert(kernel_open_file_prepare_mapping_page(file,3,1,&prepared)==-KERNEL_EFAULT);
     reset_window(cache,file);
@@ -316,7 +321,7 @@ static void window_truncate(struct kernel_page_cache *cache,struct kernel_open_f
     for (size_t i=0;i<37;i++) assert(bytes[i]==0x32);
     for (size_t i=37;i<BOAROS_PAGE_SIZE;i++) assert(!bytes[i]);
     kernel_open_file_finish_mapping_page(file,&prepared,0);demand_idle(cache,0);
-    puts("PASS truncate races a cold window: old epoch rejected, new EOF bounds the window and zeroes the final tail");
+    puts("PASS truncate races a cold window: caller rejects the old epoch and returns its source; new EOF bounds the window and zeroes its tail");
 }
 
 struct window_mm {
@@ -591,10 +596,12 @@ static void window_mm_faultaround_bounds(struct kernel_page_cache *cache,struct 
     struct kernel_mm_mapping mapping;uint64_t next;size_t valid;
     assert(!kernel_page_cache_lookup(cache,&file->file,last+1,&next,&valid) && valid==p);
     assert(!physical_page_release(pages,next));
-    assert(kernel_mm_lookup(&view.mm,base+(last-1)*p,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED &&
-        kernel_mm_lookup(&view.mm,base+(last+1)*p,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    assert(!kernel_mm_lookup(&view.mm,base+(last-1)*p,&mapping) &&
+        !(mapping.permissions&KERNEL_MM_WRITE) &&
+        window_mm_read(&view.mm,view.context,base+(last-1)*p)==0x30+last-1);
+    assert(kernel_mm_lookup(&view.mm,base+(last+1)*p,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
     window_mm_close(&view,pages);demand_idle(cache,0);
-    puts("PASS READY pages before the target and beyond its natural 64 KiB window stay unmapped");
+    puts("PASS READY pages before the target in its natural 64 KiB window map readonly; the next window stays unmapped");
 }
 struct window_mm_read_call { struct window_mm *view; uint64_t address; unsigned done; unsigned char value; };
 static void *window_mm_read_actor(void *argument)

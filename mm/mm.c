@@ -3668,7 +3668,7 @@ static enum kernel_mm_status populate_object_mapping(struct kernel_mm_record *re
         if (!status) {
             KERNEL_RAW_WRITE_SCOPE(raw,&record->metadata);
             if (arch_mmu_user_map_prepared_page(&record->space,address,physical,
-                    backend_permissions_from_mm(plan->permissions),&prepared)) __builtin_trap();
+                    backend_permissions_from_mm(plan->permissions),0,&prepared)) __builtin_trap();
             physical=KERNEL_MM_NO_PAGE;
             targets|=note_tlb_change_locked(record,&batch,0);
             changed=1;
@@ -5639,8 +5639,7 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
             if (lookup_record(record,next,&mapping)!=KERNEL_MM_STATUS_NOT_MAPPED) continue;
             struct kernel_mm_leaf_preparation tables=KERNEL_MM_LEAF_PREPARATION_INIT;
             if (arch_mmu_user_map_prepared_page(&record->space,next,physical,
-                backend_permissions_from_mm(vma->permissions&~KERNEL_MM_WRITE),&tables) ||
-                arch_mmu_user_mark_cow_page(&record->space,next)) __builtin_trap();
+                backend_permissions_from_mm(vma->permissions&~KERNEL_MM_WRITE),1,&tables)) __builtin_trap();
             if (page) {
                 page->address=next;page->physical_address=physical;
                 publish_file_resident(record,page);residents[i-1]=NULL;
@@ -5812,7 +5811,7 @@ prepare_file_tables:
         }
         if (!status && (generation != latest_generation ||
             kernel_file_mapping_epoch(node,&latest) || latest != epoch ||
-            (source.pending && source.epoch != epoch) || offset >= kernel_open_file_size(file)))
+            (!disk && source.pending && source.epoch != epoch) || offset >= kernel_open_file_size(file)))
             status = KERNEL_MM_STATUS_CONFLICT;
     }
     if (status == KERNEL_MM_STATUS_OK && !cookie && !operation->shared)
@@ -5847,10 +5846,8 @@ prepare_file_tables:
         else {
             backend = arch_mmu_user_map_prepared_page(&record->space,address,replacement,
                 backend_permissions_from_mm((!shared && access != KERNEL_MM_WRITE) || (shared && disk) ?
-                    vma->permissions & ~KERNEL_MM_WRITE : vma->permissions),&prepared);
-            /* 只读叶先发布，再标记COW；来源页从未短暂暴露为可写。 */
-            if (!backend && !shared && access != KERNEL_MM_WRITE &&
-                arch_mmu_user_mark_cow_page(&record->space,address)) __builtin_trap();
+                    vma->permissions & ~KERNEL_MM_WRITE : vma->permissions),
+                !shared && access != KERNEL_MM_WRITE,&prepared);
         }
         status = !backend ? KERNEL_MM_STATUS_OK : backend == ARCH_MMU_STATUS_CONFLICT ||
             backend == ARCH_MMU_STATUS_NOT_MAPPED ? KERNEL_MM_STATUS_CONFLICT : KERNEL_MM_STATUS_ADDRESS_SPACE;
@@ -6084,7 +6081,11 @@ static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_op
         if (!source_owner || __atomic_fetch_add(&source_owner->faults, 1, __ATOMIC_RELAXED) == UINT32_MAX) __builtin_trap();
     }
 #if BOAROS_MAX_CPUS > 1
-    if (!operation->populate || !operation->shared || object || elf || current_pins(operation->mm))
+    /* Fresh anonymous pages need no I/O or backing owner after preparation.
+     * Keep the existing shared qualification; allocation pressure releases it
+     * in allocate_fault_page before reclaim can wait for an MM editor. */
+    if (!operation->shared || object || elf || current_pins(operation->mm) ||
+        (!operation->populate && cookie))
 #endif
         mm_operation_release(operation);
     /* The publishing writer also drains retired ELF owners after the fault. */
@@ -6189,9 +6190,7 @@ prepare_memory_tables:
                 if (refill) goto memory_tables_changed;
                 backend = arch_mmu_user_map_prepared_page(&record->space, address, replacement,
                     backend_permissions_from_mm(source_shared ? vma->permissions & ~KERNEL_MM_WRITE :
-                        vma->permissions), &prepared);
-                if (!backend && source_shared && arch_mmu_user_mark_cow_page(&record->space, address))
-                    __builtin_trap();
+                        vma->permissions), source_shared, &prepared);
             }
             status = backend == ARCH_MMU_STATUS_OK ? KERNEL_MM_STATUS_OK :
                 backend == ARCH_MMU_STATUS_CONFLICT || backend == ARCH_MMU_STATUS_NOT_MAPPED ?

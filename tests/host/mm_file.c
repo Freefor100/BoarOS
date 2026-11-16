@@ -44,8 +44,14 @@ enum physical_page_status __real_physical_page_allocate(struct physical_page_all
 enum physical_page_status __wrap_physical_page_allocate(struct physical_page_allocator *a,uint64_t *out)
 {
     if (fail_page && !--fail_page) return PHYSICAL_PAGE_STATUS_EMPTY;
-    enum physical_page_status status=__real_physical_page_allocate(a,out);
     unsigned id=kernel_cpu_current()->hardware_id;
+    struct kernel_lock_guard *held=kernel_io_context_current()->locks;
+    /* Pause the candidate after an actual pressure retry has dropped its
+     * anonymous MM reader, not after every successful page allocation. */
+    if (id==1 && __atomic_load_n(&capture_allocate,__ATOMIC_ACQUIRE) &&
+        held && held->lock->rank==25 && !held->write)
+        return PHYSICAL_PAGE_STATUS_EMPTY;
+    enum physical_page_status status=__real_physical_page_allocate(a,out);
     if (!status && id==1 && !kernel_io_context_current()->locks &&
         __atomic_exchange_n(&capture_allocate,0,__ATOMIC_ACQ_REL)) {
         assert(!kernel_cpu_current()->raw_locks);

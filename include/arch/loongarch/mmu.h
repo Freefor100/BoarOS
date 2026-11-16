@@ -82,7 +82,7 @@ enum arch_mmu_status arch_mmu_user_prepare_move(
 enum arch_mmu_status arch_mmu_user_move_leaf(
     struct arch_mmu_user_space *, uint64_t from, uint64_t to);
 enum arch_mmu_status arch_mmu_user_map_prepared_page(
-    struct arch_mmu_user_space *, uint64_t, uint64_t, uint32_t,
+    struct arch_mmu_user_space *, uint64_t, uint64_t, uint32_t, int cow,
     struct kernel_mm_leaf_preparation *);
 enum arch_mmu_status arch_mmu_user_cow_snapshot(
     struct arch_mmu_user_space *, uint64_t, uint64_t *, uint64_t *);

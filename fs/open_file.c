@@ -1346,28 +1346,14 @@ int kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *f
     struct kernel_vfs_node *node=kernel_open_file_node(file);
     struct kernel_page_cache *cache=kernel_vfs_file_page_cache(&file->file);
     if (!node || !cache) return -KERNEL_EINVAL;
-    uint64_t epoch,size;
-    {
-        KERNEL_LOCK_SCOPE(io); kernel_vfs_node_lock(node,&io,0);
-        int error=kernel_file_mapping_prepare(node);
-        if (error) return error;
-        if (kernel_file_mapping_epoch(node,&epoch)) return -KERNEL_EBUSY;
-        size=kernel_open_file_size(file);
-        if (index>UINT64_MAX/BOAROS_PAGE_SIZE || index*BOAROS_PAGE_SIZE>=size) return -KERNEL_EFAULT;
-    }
-    /* 不能携带inode读资格等CPU0再取得读资格：排队writer会形成等待环。 */
+    /* The MM caller owns its captured inode epoch and validates it again
+     * before publishing a PTE. This layer only materializes a cache page and
+     * transfers one physical reference; WILLNEED needs no mapping epoch. */
     uint64_t address; size_t valid;
     enum kernel_page_cache_status status=disk_fault_page(file,cache,index,&address,&valid,read_window);
     if (status) return status==KERNEL_PAGE_CACHE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM :
-        -KERNEL_EIO;
-    {
-        KERNEL_LOCK_SCOPE(io); kernel_vfs_node_lock(node,&io,0);
-        uint64_t latest;
-        if (kernel_file_mapping_epoch(node,&latest) || latest!=epoch || index*BOAROS_PAGE_SIZE>=kernel_open_file_size(file)) {
-            physical_page_release(cache->allocator,address); return -KERNEL_EBUSY;
-        }
-    }
-    *prepared=(struct kernel_open_file_page_preparation){.address=address,.index=index,.epoch=epoch,.size=size,.pending=1};
+        status==KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE ? -KERNEL_EFAULT : -KERNEL_EIO;
+    *prepared=(struct kernel_open_file_page_preparation){.address=address,.index=index,.pending=1};
     return 0;
 }
 void kernel_open_file_finish_mapping_page(struct kernel_open_file_description *file,

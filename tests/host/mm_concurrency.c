@@ -36,7 +36,7 @@ static uint64_t parallel_address[4];
 static unsigned population_capture, population_entered, population_release;
 static uint64_t population_start;
 static uint64_t batch_test_start;
-static unsigned batch_test_mode, batch_test_prefix, batch_test_syncs, batch_test_full, batch_test_local, batch_test_instructions, batch_test_neighbors;
+static unsigned batch_test_mode, batch_test_prefix, batch_test_syncs, batch_test_full, batch_test_local, batch_test_instructions, batch_test_neighbors, batch_test_neighbor_instructions;
 static void *batch_visible_fault(void *unused);
 static enum kernel_uaccess_status race_status[4];
 void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *, struct kernel_raw_guard *);
@@ -66,7 +66,7 @@ enum physical_page_status __wrap_physical_page_allocate(struct physical_page_all
                 pthread_t peer;
                 assert(!pthread_create(&peer, 0, batch_visible_fault, 0));
                 assert(!pthread_join(peer, 0));
-                assert(done[2] && batch_test_local == 3 && batch_test_neighbors == 2 && batch_test_syncs == 1);
+                assert(done[2] && batch_test_local == 3 && batch_test_neighbors == 2 && batch_test_syncs == 1 && batch_test_neighbor_instructions == 1);
             }
             if (batch_test_mode == 1 || batch_test_mode == 2) return PHYSICAL_PAGE_STATUS_EMPTY;
             fail_batch_access = batch_test_mode == 3;
@@ -81,6 +81,11 @@ enum physical_page_status __wrap_physical_page_allocate(struct physical_page_all
         __atomic_store_n(&population_entered, 1, __ATOMIC_RELEASE);
         while (!__atomic_load_n(&population_release, __ATOMIC_ACQUIRE)) sched_yield();
     }
+    /* Force the real pressure retry to release its MM reader before pausing.
+     * Ordinary successful anonymous preparation now retains that reader. */
+    if (pages == &allocator && id < 4 && held && held->lock->rank == 25 && !held->write &&
+        (__atomic_load_n(&capture_mask,__ATOMIC_ACQUIRE) & (1U << id)))
+        return PHYSICAL_PAGE_STATUS_EMPTY;
     if (pages == &allocator && id < 4 && !kernel_io_context_current()->locks &&
         (__atomic_fetch_and(&capture_mask, ~(1U << id), __ATOMIC_ACQ_REL) & (1U << id))) {
         assert(!kernel_cpu_current()->raw_locks);
@@ -90,7 +95,7 @@ enum physical_page_status __wrap_physical_page_allocate(struct physical_page_all
     enum physical_page_status status = __real_physical_page_allocate(pages, physical);
     if (status == PHYSICAL_PAGE_STATUS_OK && fail_batch_access)
         __atomic_store_n(&fail_access_address, *physical, __ATOMIC_RELEASE);
-    if (status == PHYSICAL_PAGE_STATUS_OK && pages == &allocator && !kernel_io_context_current()->locks &&
+    if (status == PHYSICAL_PAGE_STATUS_OK && pages == &allocator &&
         __atomic_exchange_n(&fail_next_access, 0, __ATOMIC_ACQ_REL))
         __atomic_store_n(&fail_access_address, *physical, __ATOMIC_RELEASE);
     return status;
@@ -132,7 +137,7 @@ void riscv_smp_sync_user(uint32_t targets, uint64_t start, uint64_t length, int 
     if (batch_test_start && kernel_cpu_current()->hardware_id == 2 &&
         (start == batch_test_start + 4 * BOAROS_PAGE_SIZE || start == batch_test_start + 5 * BOAROS_PAGE_SIZE)) {
         assert(batch_test_full == 1 && length == BOAROS_PAGE_SIZE);
-        assert(instructions == (start == batch_test_start + 5 * BOAROS_PAGE_SIZE));
+        assert(!instructions);
         batch_test_neighbors++;
     }
     if (population_start && kernel_cpu_current()->hardware_id == 1 &&
@@ -143,6 +148,19 @@ void riscv_smp_sync_user(uint32_t targets, uint64_t start, uint64_t length, int 
     }
     mm_test_fence(length == BOAROS_PAGE_SIZE ? start : UINT64_MAX, 0);
     if (instructions) mm_test_fence(0, 1);
+}
+void riscv_smp_sync_instructions(uint32_t targets)
+{
+    assert(!(targets & ~1U) && kernel_cpu_current()->preempt_depth);
+    if (batch_test_start && kernel_cpu_current()->hardware_id == 0)
+        batch_test_instructions++;
+    if (batch_test_start && kernel_cpu_current()->hardware_id == 2) {
+        struct kernel_mm_mapping executable;
+        assert(!kernel_mm_lookup(&mm[2],batch_test_start+5*BOAROS_PAGE_SIZE,&executable) &&
+            (executable.permissions & KERNEL_MM_EXECUTE));
+        batch_test_neighbor_instructions++;
+    }
+    mm_test_fence(0,1);
 }
 static void *downgrade(void *unused)
 {
@@ -391,7 +409,7 @@ static void fault_candidates(void)
     pthread_t one, two;
     assert(!pthread_create(&one, 0, race_fault, (void *)(uintptr_t)1));
     assert(!pthread_create(&two, 0, race_fault, (void *)(uintptr_t)2));
-    prepared(1); prepared(2); /* 两个真实快照均已释放gate，尚未发布候选。 */
+    prepared(1); prepared(2); /* 两个真实压力重试均已归还MM读资格，尚未发布候选。 */
     __atomic_store_n(&prepare_release, 1, __ATOMIC_RELEASE);
     assert(!pthread_join(one, 0) && !pthread_join(two, 0));
     assert(!race_status[1] && !race_status[2]);
@@ -638,7 +656,7 @@ static void population_confirmation(void)
         }
         uint64_t baseline = physical_page_available(&allocator);
         batch_test_start = start; batch_test_mode = mode;
-        batch_test_prefix = batch_test_syncs = batch_test_full = batch_test_local = batch_test_instructions = batch_test_neighbors = 0;
+        batch_test_prefix = batch_test_syncs = batch_test_full = batch_test_local = batch_test_instructions = batch_test_neighbors = batch_test_neighbor_instructions = 0;
         int status = kernel_mm_mlock(&mm[0], start, 3 * BOAROS_PAGE_SIZE, 0);
         assert(status == (mode == 2 ? -KERNEL_EAGAIN : mode == 3 ? -KERNEL_ENOMEM : 0));
         assert(batch_test_prefix && batch_test_full == 1);

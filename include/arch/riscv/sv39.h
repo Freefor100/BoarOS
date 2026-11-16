@@ -188,7 +188,7 @@ enum riscv_sv39_status riscv_sv39_user_prepare_move(
 enum riscv_sv39_status riscv_sv39_user_move_leaf(
     struct riscv_sv39_user_space *, uint64_t from, uint64_t to);
 enum riscv_sv39_status riscv_sv39_user_map_prepared_page(
-    struct riscv_sv39_user_space *, uint64_t, uint64_t, uint32_t,
+    struct riscv_sv39_user_space *, uint64_t, uint64_t, uint32_t, int cow,
     struct kernel_mm_leaf_preparation *);
 enum riscv_sv39_status riscv_sv39_user_cow_snapshot(
     struct riscv_sv39_user_space *, uint64_t, uint64_t *, uint64_t *);
