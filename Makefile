@@ -526,7 +526,7 @@ $(BUILD_DIR)/tests/riscv/file_io_smp.o: CPPFLAGS += $(LWEXT4_CPPFLAGS)
 LDFLAGS += -Wl,--wrap=kernel_page_cache_run_cpu0,--wrap=kernel_copy_from_user,--wrap=kernel_copy_to_user,--wrap=riscv_plic_in_interrupt,--wrap=kernel_uaccess_write_cursor_copy,--wrap=kernel_vfs_node_pread_batch
 LDFLAGS += -Wl,--wrap=ext4_file_prepare_write,--wrap=ext4_file_reserve_write,--wrap=ext4_ftruncate,--wrap=ext4_fallocate,--wrap=ext4_file_sync_metadata_prepare
 LDFLAGS += -Wl,--wrap=virtio_split_enqueue
-LDFLAGS += -Wl,--wrap=ext4_lookup_child,--wrap=ext4_create_child,--wrap=ext4_unlink_child,--wrap=ext4_rename_child,--wrap=ext4_dir_entry_next_status
+LDFLAGS += -Wl,--wrap=ext4_lookup_child,--wrap=ext4_create_child,--wrap=ext4_unlink_child,--wrap=ext4_rename_child,--wrap=ext4_dir_iterate
 endif
 $(BUILD_DIR)/tests/riscv/mm_smp.o: CPPFLAGS += -DBOAROS_FILE_IO_SMP_TEST=$(FILE_IO_SMP_TEST)
 $(BUILD_DIR)/tests/riscv/mm_smp.o: CPPFLAGS += -DBOAROS_FILES_SMP_TEST=$(FILES_SMP_TEST) -DBOAROS_SMP_NEGATIVE=$(SMP_NEGATIVE) -DBOAROS_MM_SHARED_TEST=$(MM_SHARED_SMP_TEST) -DBOAROS_MM_FILE_TEST=$(MM_FILE_SMP_TEST)
@@ -1968,6 +1968,10 @@ $(BUILD_DIR)/sync-%.d: ;
 -include $(BUILD_DIR)/wait-native.d $(wildcard $(BUILD_DIR)/sync-*.d)
 
 .PHONY: test-files-concurrency-host
+.PHONY: test-directory-batch-host
+test-directory-batch-host:
+	FILE_IO_DIRECTORIES_ONLY=1 FILE_IO_HOST_TCP=0 sh tests/host/file-io-concurrency.sh
+
 .PHONY: test-file-io-concurrency-host
 test-file-io-concurrency-host:
 	sh tests/host/file-io-concurrency.sh

@@ -471,20 +471,19 @@ uint64_t kernel_vfs_file_size(const struct kernel_vfs_file *file);
 #define KERNEL_VFS_DT_LNK UINT8_C(7)
 #define KERNEL_VFS_DT_SOCK UINT8_C(12)
 
-/*
- * Report the first entry at or after the opaque byte `position` of an open
- * directory.  `next_position` receives the cookie to use for the following
- * entry, and remains valid at EOF (unchanged unless the backend advances it).
- * Return 1 with fields filled, 0 at end of directory, or a negative errno.
- * The position is a backend cookie, not an entry ordinal.
- */
-int kernel_vfs_dir_entry(struct kernel_vfs_file *file,
-                         uint64_t position,
-                         uint64_t *next_position,
-                         uint64_t *inode,
-                         uint8_t *type,
-                         char *name,
-                         size_t name_size);
+/* Bounded kernel-owned linux_dirent64 batch. No user access occurs while the
+ * backend/namespace locks are held. position advances only for packed records,
+ * or to the backend EOF cookie; the caller commits it after copying the batch.
+ * Return 0 at EOF, 1 when full, or a negative errno (possibly after a prefix). */
+struct kernel_vfs_dir_batch {
+    unsigned char *data;
+    size_t capacity, used;
+    uint64_t position;
+};
+int kernel_vfs_read_directory(struct kernel_vfs_file *, struct kernel_vfs_dir_batch *);
+/* Backend sink: 0 rejects a record, 1 accepts, 2 accepts and fills the batch. */
+int kernel_vfs_dir_emit(struct kernel_vfs_dir_batch *, uint64_t next_position,
+    uint64_t inode, uint8_t type, const char *name, size_t name_length);
 
 int kernel_vfs_files_share_node(const struct kernel_vfs_file *left,
                                 const struct kernel_vfs_file *right);

@@ -871,6 +871,15 @@ const ext4_direntry *ext4_dir_entry_next(ext4_dir *dir);
  *        end of directory.
  * @return EOK for an entry or end of directory, otherwise an ext4 error.
  */
+/* Iterate from *position with one inode/block iterator. emit borrows the
+ * name until it returns: 0 rejects, 1 accepts, 2 accepts and stops. No user
+ * memory access or re-entry into lwext4 is permitted from emit. Errors retain
+ * the accepted prefix; *position == UINT64_MAX denotes EOF only. */
+typedef int (*ext4_dir_emit_fn)(void *, uint64_t offset, uint64_t next,
+    uint32_t inode, uint8_t type, const char *name, size_t name_length);
+int ext4_dir_iterate(ext4_file *file, uint64_t *position,
+    ext4_dir_emit_fn emit, void *context);
+
 int ext4_dir_entry_next_status(ext4_dir *dir,
                                ext4_direntry *entry,
                                uint64_t *entry_offset);

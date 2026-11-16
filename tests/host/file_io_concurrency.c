@@ -38,6 +38,7 @@ void mm_test_finish(void);
 void mm_test_activate_task(void);
 extern _Thread_local uint64_t mm_test_context;
 static unsigned watch_memory_staging,memory_staging_calls;
+static _Thread_local unsigned directory_scratch_fail;
 static unsigned memory_lookup_calls;
 enum kernel_page_cache_status __real_kernel_open_file_lookup_page(struct kernel_open_file_description *,uint64_t,uint64_t *,size_t *);
 enum kernel_page_cache_status __wrap_kernel_open_file_lookup_page(struct kernel_open_file_description *file,uint64_t index,uint64_t *page,size_t *valid)
@@ -74,6 +75,7 @@ enum kernel_task_status __real_kernel_task_io_buffer_acquire(struct kernel_task_
 enum kernel_task_status __wrap_kernel_task_io_buffer_acquire(struct kernel_task_io_buffer *buffer,struct physical_page_allocator *allocator)
 {
     if (watch_memory_staging) memory_staging_calls++;
+    if (directory_scratch_fail) return KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE;
     return __real_kernel_task_io_buffer_acquire(buffer,allocator);
 }
 #if !defined(TCP_IO_CASES) && !defined(LOOP_IO_CASES) && !defined(FALLOCATE_SYNC_CASES)
@@ -120,6 +122,8 @@ static void tcp_wait_locking(struct kernel_rwlock *);
 static int tcp_batch_unpinning(struct kernel_mm_user_pin *);
 static void tcp_batch_unpinned(struct kernel_mm_user_pin *);
 #endif
+static struct kernel_wait_queue *directory_offset_queue;
+static unsigned directory_offset_waiting;
 static struct kernel_wait_queue *vmsplice_wait_queue;
 static unsigned vmsplice_wait_registered;
 enum kernel_scheduler_status __real_kernel_wait_prepare(struct kernel_wait_queue *,uint64_t,int,struct kernel_wait_token *);
@@ -131,6 +135,7 @@ enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue
     tcp_wait_preparing(queue);
 #endif
     enum kernel_scheduler_status status=__real_kernel_wait_prepare(queue,deadline,interruptible,token);
+    if (!status && queue==directory_offset_queue) __atomic_store_n(&directory_offset_waiting,1,__ATOMIC_RELEASE);
     if (!status && queue==vmsplice_wait_queue)__atomic_store_n(&vmsplice_wait_registered,1,__ATOMIC_RELEASE);
     if (!status && interruptible && futex_role==1)
         __atomic_store_n(&futex_registered,1,__ATOMIC_RELEASE);
@@ -1484,8 +1489,9 @@ static void directory_eof(struct kernel_heap *heap,struct kernel_vfs_mount *moun
     struct kernel_open_file_description *borrowed=directory;
     struct kernel_files local={0};
     assert(!kernel_files_create(&local,heap) && !kernel_files_install_new_owned_at(&local,0,0,&directory));
-    uint64_t next=UINT64_MAX,ino;uint8_t type;char name[256];
-    assert(!kernel_vfs_dir_entry(&borrowed->file,2,&next,&ino,&type,name,sizeof(name)) && next==2);
+    unsigned char entries[256];
+    struct kernel_vfs_dir_batch batch={.data=entries,.capacity=sizeof(entries),.position=2};
+    assert(!kernel_vfs_read_directory(&borrowed->file,&batch) && batch.position==2 && !batch.used);
     assert(!kernel_files_lseek(&local,0,2,0,&result) && result==2);
     for (unsigned i=0;i<3;i++) {
         assert(!kernel_files_getdents(&local,&mm,0,0x200000,4096,&result) && !result);
@@ -1703,6 +1709,8 @@ static void file_advice_case(struct kernel_heap *heap,struct kernel_vfs_mount *m
     free(bytes);
     puts("PASS file advice: scoped eviction skips readers, NOREUSE preserves hit counts without promotion, RANDOM suppression, doubled SEQUENTIAL windows, independent opens and queued close owners");
 }
+#include "file_io_directory_cases.c"
+
 int main(int argc,char **argv)
 {
     assert(argc==2); setvbuf(stdout,0,_IONBF,0); mm_test_attach(0); mm_test_activate_task();
@@ -1714,7 +1722,8 @@ int main(int argc,char **argv)
     int advice_only=getenv("FILE_IO_ADVICE_ONLY")!=NULL;
     int transfers_only=getenv("FILE_IO_TRANSFERS_ONLY")!=NULL;
     int paths_only=getenv("FILE_IO_PATHS_ONLY")!=NULL;
-    int focused=advice_only || transfers_only || paths_only || getenv("FILE_IO_VECTORS_ONLY")!=NULL;
+    int directories_only=getenv("FILE_IO_DIRECTORIES_ONLY")!=NULL;
+    int focused=directories_only || advice_only || transfers_only || paths_only || getenv("FILE_IO_VECTORS_ONLY")!=NULL;
     if (!focused) {
     borrowed_page_case(&pages);
     namespace_retiring_mount_case(&heap);
@@ -1738,10 +1747,12 @@ int main(int argc,char **argv)
         KERNEL_MM_MAP_FIXED_NOREPLACE,&address));
     assert(!kernel_mm_mmap_anonymous(&mm,0x200000,4*BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,
         KERNEL_MM_MAP_FIXED_NOREPLACE,&address));
-    if (paths_only) {
+    if (paths_only || directories_only) {
         struct kernel_vfs_mount *memory=NULL;
         assert(!kernel_tmpfs_create(&heap,0,"",&memory));
-        pathname_storage_case(&heap,memory);assert(!kernel_vfs_unmount(memory));
+        if (directories_only) { directory_eof(&heap,memory); directory_batch_cases(&heap,memory,0); }
+        else pathname_storage_case(&heap,memory);
+        assert(!kernel_vfs_unmount(memory));
     }
     if (!focused) {
     futex_pin_case();
@@ -1779,7 +1790,8 @@ int main(int argc,char **argv)
     assert(!kernel_block_register(&disk,KERNEL_BLOCK_DEVICE_NUMBER(101)));
     struct kernel_vfs_mount mount={0}; assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,&cache,0));
     assert(!kernel_vfs_start_journal_worker(&mount));
-    if (paths_only) pathname_storage_case(&heap,&mount);
+    if (directories_only) directory_batch_cases(&heap,&mount,1);
+    else if (paths_only) pathname_storage_case(&heap,&mount);
     else if (transfers_only) transfer_cases(&heap,&mount);
     else if (advice_only) file_advice_case(&heap,&mount,&cache);
     else if (focused) synchronous_write_ranges(&heap,&mount);
@@ -1811,6 +1823,7 @@ int main(int argc,char **argv)
     }
     assert(!kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(&cache));
     assert(!kernel_block_unregister(&disk)); assert(!close(image));
+    if (directories_only) mm_test_finish();
     mm_test_context=0; /* 页表最终释放在可信kernel上下文。 */
     assert(!kernel_mm_release(&mm) && !physical_page_release(&pages,kernel.root_address));
     struct kernel_heap_statistics statistics;

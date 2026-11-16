@@ -6837,39 +6837,27 @@ const ext4_direntry *ext4_dir_entry_next(ext4_dir *dir)
     return &dir->de;
 }
 
-int ext4_dir_entry_next_status(ext4_dir *dir,
-                               ext4_direntry *entry,
-                               uint64_t *entry_offset)
+int ext4_dir_iterate(ext4_file *file, uint64_t *position,
+    ext4_dir_emit_fn emit, void *context)
 {
     struct ext4_inode_ref dir_inode;
     struct ext4_dir_iter it = {0};
     uint64_t directory_size;
-    int result = EOK;
-    int finish_result;
+    int result = EOK, finish_result;
 
-    if (dir == 0 || entry == 0 || entry_offset == 0 || dir->f.mp == 0) {
-        return EINVAL;
-    }
-    memset(entry, 0, sizeof(*entry));
-    *entry_offset = UINT64_MAX;
-
-    EXT4_MP_LOCK(dir->f.mp);
-    if (dir->next_off == UINT64_MAX) {
-        EXT4_MP_UNLOCK(dir->f.mp);
+    if (!file || !file->mp || !position || !emit) return EINVAL;
+    EXT4_MP_LOCK(file->mp);
+    if (*position == UINT64_MAX) {
+        EXT4_MP_UNLOCK(file->mp);
         return EOK;
     }
-
-    result = ext4_fs_get_inode_ref_read(&dir->f.mp->fs, dir->f.inode,
-                                   &dir_inode);
+    result = ext4_fs_get_inode_ref_read(&file->mp->fs, file->inode, &dir_inode);
     if (result != EOK) {
-        EXT4_MP_UNLOCK(dir->f.mp);
+        EXT4_MP_UNLOCK(file->mp);
         return result;
     }
-    directory_size = ext4_inode_get_size(&dir_inode.fs->sb,
-                                         dir_inode.inode);
-    /* The iterator already owns this inode snapshot. Publish its size to the
-     * adapter instead of requiring a second stat before every dirent. */
-    dir->f.fsize = directory_size;
+    directory_size = ext4_inode_get_size(&dir_inode.fs->sb, dir_inode.inode);
+    file->fsize = directory_size;
     if (!ext4_inode_is_type(&dir_inode.fs->sb, dir_inode.inode, EXT4_INODE_MODE_DIRECTORY)) {
         result = ENOTDIR;
         goto Finish;
@@ -6878,64 +6866,73 @@ int ext4_dir_entry_next_status(ext4_dir *dir,
         result = ENOENT;
         goto Finish;
     }
-    if (dir->next_off >= directory_size) {
-        dir->next_off = UINT64_MAX;
+    if (*position >= directory_size) {
+        *position = UINT64_MAX;
         goto Finish;
     }
-    result = ext4_dir_iterator_init(&it, &dir_inode, dir->next_off);
-    if (result == EOK && it.curr != 0) {
-        for (;;) {
-            uint64_t current_offset = it.curr_off;
-            uint16_t record_length =
-                ext4_dir_en_get_entry_len(it.curr);
-
-            if (record_length < 8U ||
-                current_offset > UINT64_MAX - record_length ||
-                current_offset > directory_size ||
-                record_length > directory_size - current_offset) {
+    result = ext4_dir_iterator_init(&it, &dir_inode, *position);
+    while (result == EOK && it.curr) {
+        uint64_t offset = it.curr_off;
+        uint16_t length = ext4_dir_en_get_entry_len(it.curr);
+        if (length < 8U || offset > directory_size || length > directory_size - offset) {
+            result = EIO;
+            break;
+        }
+        uint64_t next = offset + length;
+        uint32_t inode = ext4_dir_en_get_inode(it.curr);
+        if (inode) {
+            uint16_t name_length = ext4_dir_en_get_name_len(&dir_inode.fs->sb, it.curr);
+            if (name_length > 255U) {
                 result = EIO;
                 break;
             }
-            dir->next_off = current_offset + record_length;
-            if (ext4_dir_en_get_inode(it.curr) != 0U) {
-                uint16_t name_length =
-                    ext4_dir_en_get_name_len(&dir_inode.fs->sb, it.curr);
-
-                if (name_length > sizeof(entry->name)) {
-                    result = EIO;
-                    break;
-                }
-                entry->inode = ext4_dir_en_get_inode(it.curr);
-                entry->entry_length = record_length;
-                entry->name_length = (uint8_t)name_length;
-                entry->inode_type = ext4_dir_en_get_inode_type(
-                    &dir_inode.fs->sb, it.curr);
-                memcpy(entry->name, it.curr->name, name_length);
-                *entry_offset = current_offset;
-                break;
-            }
-            result = ext4_dir_iterator_next_raw(&it);
-            if (result != EOK || it.curr == 0) {
-                break;
-            }
+            int accepted = emit(context, offset, next, inode,
+                ext4_dir_en_get_inode_type(&dir_inode.fs->sb, it.curr),
+                (const char *)it.curr->name, name_length);
+            if (!accepted) break;
+            *position = next;
+            if (accepted == 2) break;
+        } else {
+            *position = next;
         }
+        result = ext4_dir_iterator_next_raw(&it);
     }
-    if (result == EOK && it.curr == 0) {
-        dir->next_off = UINT64_MAX;
-    }
+    if (result == EOK && !it.curr) *position = UINT64_MAX;
 Finish:
-    if (it.inode_ref != 0) {
+    if (it.inode_ref) {
         finish_result = ext4_dir_iterator_fini(&it);
-        if (result == EOK && finish_result != EOK) {
-            result = finish_result;
-        }
+        if (result == EOK) result = finish_result;
     }
     finish_result = ext4_fs_put_inode_ref(&dir_inode);
-    if (result == EOK && finish_result != EOK) {
-        result = finish_result;
-    }
-    EXT4_MP_UNLOCK(dir->f.mp);
+    if (result == EOK) result = finish_result;
+    EXT4_MP_UNLOCK(file->mp);
     return result;
+}
+
+struct ext4_dir_one {
+    ext4_direntry *entry;
+    uint64_t *offset;
+};
+static int ext4_dir_emit_one(void *context, uint64_t offset, uint64_t next,
+    uint32_t inode, uint8_t type, const char *name, size_t length)
+{
+    struct ext4_dir_one *one = context;
+    one->entry->inode = inode;
+    one->entry->entry_length = (uint16_t)(next - offset);
+    one->entry->name_length = (uint8_t)length;
+    one->entry->inode_type = type;
+    memcpy(one->entry->name, name, length);
+    *one->offset = offset;
+    return 2;
+}
+int ext4_dir_entry_next_status(ext4_dir *dir, ext4_direntry *entry,
+    uint64_t *entry_offset)
+{
+    if (!dir || !entry || !entry_offset) return EINVAL;
+    memset(entry, 0, sizeof(*entry));
+    *entry_offset = UINT64_MAX;
+    struct ext4_dir_one one = {entry, entry_offset};
+    return ext4_dir_iterate(&dir->f, &dir->next_off, ext4_dir_emit_one, &one);
 }
 
 void ext4_dir_entry_rewind(ext4_dir *dir)

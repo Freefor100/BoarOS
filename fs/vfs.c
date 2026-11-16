@@ -5590,23 +5590,59 @@ static void kernel_vfs_try_release_orphan(struct kernel_vfs_node *node)
     instance->ops->release_unlinked(node);
 }
 
-int kernel_vfs_dir_entry(struct kernel_vfs_file *file,
-                         uint64_t position,
-                         uint64_t *next_position,
-                         uint64_t *inode,
-                         uint8_t *type,
-                         char *name,
-                         size_t name_size)
+int kernel_vfs_dir_emit(struct kernel_vfs_dir_batch *batch, uint64_t next_position,
+    uint64_t inode, uint8_t type, const char *name, size_t name_length)
+{
+    size_t length = (19U + name_length + 1U + 7U) & ~(size_t)7U;
+    if (length > batch->capacity - batch->used) return 0;
+    unsigned char *record = batch->data + batch->used;
+    /* Both supported Linux ABIs are little endian; keep the wire format
+     * explicit, including padding, without unaligned native stores. */
+    for (unsigned byte = 0; byte < 8; byte++) {
+        record[byte] = (unsigned char)(inode >> (8U * byte));
+        record[8U + byte] = (unsigned char)(next_position >> (8U * byte));
+    }
+    record[16] = (unsigned char)length;
+    record[17] = (unsigned char)(length >> 8);
+    record[18] = type;
+    memcpy(record + 19, name, name_length);
+    memset(record + 19 + name_length, 0, length - 19 - name_length);
+    batch->used += length;
+    batch->position = next_position;
+    return batch->used == batch->capacity ? 2 : 1;
+}
+
+/* Keep the fallback name buffer off the specialized ext4/tmpfs call stack. */
+static __attribute__((noinline)) int vfs_read_directory_entries(struct kernel_vfs_file *file,
+    struct kernel_vfs_dir_batch *batch, const struct kernel_vfs_backend *ops)
+{
+    for (;;) {
+        char name[256];
+        uint64_t next = batch->position, inode;
+        uint8_t type;
+        int result = ops->dir_entry(file, batch->position, &next,
+            &inode, &type, name, sizeof(name));
+        if (result <= 0) {
+            if (!result) batch->position = next;
+            return result;
+        }
+        if (kernel_vfs_dir_emit(batch, next, inode, type, name, strlen(name)) != 1)
+            return 1;
+    }
+}
+
+int kernel_vfs_read_directory(struct kernel_vfs_file *file,
+    struct kernel_vfs_dir_batch *batch)
 {
     if (!file || !file->mount || !file->mount->private_data) return -KERNEL_EINVAL;
     KERNEL_LOCK_SCOPE(namespace_guard);
-    namespace_node_lock(file->private_data,&namespace_guard,0);
+    namespace_node_lock(file->private_data, &namespace_guard, 0);
     struct kernel_vfs_instance *instance = file->mount->private_data;
-    *next_position = position;
     struct kernel_vfs_node *node = kernel_vfs_file_node(file);
     if (node && node->unlinked && (node->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR)
         return -KERNEL_ENOENT;
-    return instance->ops->dir_entry(file, position, next_position, inode, type, name, name_size);
+    if (instance->ops->read_directory) return instance->ops->read_directory(file, batch);
+    return vfs_read_directory_entries(file, batch, instance->ops);
 }
 
 int kernel_vfs_node_pread(struct kernel_vfs_node *node,
