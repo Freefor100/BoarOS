@@ -1140,7 +1140,27 @@ static void workspace_pool_case(unsigned version)
     assert(!device.active && !device.queue.inflight && !device.batch_claimed && allocations == before);
     for (unsigned i = 0; i < VIRTIO_BLOCK_BATCH_POOL_PAGES; i++) memset(device.batch_memory[i], 0xa7, 4096);
     device.batch_claimed = 255;
-    device.irq_source = 1; wait_irq_device = &device; release_batch_slot = 8;
+    device.irq_source=1;wait_irq_device=&device;release_batch_slot=0;
+    unsigned parks=park_calls;
+    memset(batch_output[0],0xa6,4096);
+    assert(kernel_block_read_batch(&device.block,reads,1,NULL)==KERNEL_BLOCK_STATUS_OK &&
+        reads[0].completed==4096 && reads[0].status==KERNEL_BLOCK_STATUS_OK);
+    assert(device.batch_claimed==255 && allocations==before && park_calls==parks);
+    assert(!memcmp(batch_output[0],sg_disk,4096));
+    sg_fail_sector=0;
+    assert(kernel_block_read_batch(&device.block,reads,1,NULL)==KERNEL_BLOCK_STATUS_IO &&
+        !reads[0].completed && reads[0].status==KERNEL_BLOCK_STATUS_IO);
+    assert(device.batch_claimed==255 && !device.active && !device.queue.inflight && !device.queue.claimed);
+    sg_fail_sector=UINT32_MAX;
+    if (version==2) {
+        sg_used_length=4096; /* Modern completion does not cover its status byte. */
+        assert(kernel_block_read_batch(&device.block,reads,1,NULL)==KERNEL_BLOCK_STATUS_IO &&
+            !reads[0].completed && reads[0].status==KERNEL_BLOCK_STATUS_IO);
+        assert(!device.active && !device.queue.inflight && !device.queue.claimed && device.batch_claimed==255);
+    }
+    for (unsigned i=0;i<VIRTIO_BLOCK_BATCH_POOL_PAGES*4096;i++)
+        assert(((unsigned char *)device.batch_memory[i/4096])[i%4096]==0xa7);
+    release_batch_slot = 8;
     assert(kernel_block_read_batch(&device.block, reads, 2, NULL) == KERNEL_BLOCK_STATUS_OK);
     assert(park_calls == 1 && !release_batch_slot && device.batch_claimed == 127);
     for (unsigned i = 0; i < 7 * VIRTIO_BLOCK_BATCH_WORKSPACE_BYTES; i++)
@@ -1150,7 +1170,7 @@ static void workspace_pool_case(unsigned version)
     assert(allocations == before && !caller.allocation_depth);
     fail_workspace = 0;
     assert(destroy_model(&device) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations == releases);
-    printf("PASS reserved batch workspace transport=%u: allocation denied, full pool waits, other owners intact, one span allocates nothing\n", version);
+    printf("PASS reserved batch workspace transport=%u: allocation denied, multi-span pool waits, independent one-DMA success/error bypass the full pool, owners intact\n", version);
     for (unsigned failure = 1; failure <= 3; failure += 2) {
         device = (struct riscv_virtio_mmio_block){0};
         memset(registers, 0, sizeof(registers));
