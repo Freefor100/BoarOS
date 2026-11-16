@@ -37,21 +37,20 @@
 #include <arch/context.h>
 #include <arch/platform_io.h>
 
-static int64_t sendfile_output(struct kernel_open_file_description **output_owner,
+static int64_t transfer_output(struct kernel_open_file_description **output_owner,
+                               struct kernel_socket_write_request *stream,
                                const void *buffer, size_t size,
                                uint64_t deadline, uint32_t socket_flags)
 {
-    struct kernel_open_file_description *output = *output_owner;
+    struct kernel_open_file_description *output = stream ? stream->pin : *output_owner;
     enum kernel_open_file_kind kind = kernel_open_file_kind(output);
     if (kind == KERNEL_OPEN_FILE_KIND_SOCKET) {
         struct kernel_socket *socket = kernel_open_file_socket(output);
-        struct kernel_socket_write_request request = {0};
-        int tcp = kernel_socket_is_tcp(socket), result;
-        if (tcp) kernel_socket_stream_begin(&request, output_owner);
+        int result;
         for (;;) {
-            if (tcp) {
-                result = kernel_socket_stream_reserve(&request, (uint32_t)size, socket_flags);
-                if (result > 0) result = kernel_socket_stream_commit(&request, buffer, (uint32_t)result, socket_flags);
+            if (stream) {
+                result = kernel_socket_stream_reserve(stream, (uint32_t)size, socket_flags);
+                if (result > 0) result = kernel_socket_stream_commit(stream, buffer, (uint32_t)result, socket_flags);
             } else result = kernel_socket_write_packet_buffer(output_owner, buffer, size, socket_flags);
             if (result != -KERNEL_EAGAIN || (socket_flags & KERNEL_SOCKET_MSG_DONTWAIT)) break;
             uint64_t now = deadline ? kernel_time_monotonic_ns() : 0;
@@ -59,8 +58,7 @@ static int64_t sendfile_output(struct kernel_open_file_description **output_owne
                 kernel_socket_wait_ready(socket, KERNEL_POLLOUT, deadline, socket_flags);
             if (waited != 0) { result = waited; break; }
         }
-        if (tcp) kernel_socket_stream_finish(&request);
-        else if (result == -KERNEL_EPIPE && kernel_socket_is_stream(socket) &&
+        if (!stream && result == -KERNEL_EPIPE && kernel_socket_is_stream(socket) &&
                  !(socket_flags & KERNEL_SOCKET_MSG_NOSIGNAL))
             (void)kernel_signal_send_task(kernel_task_current(), 13U, 0);
         return result;
@@ -73,6 +71,19 @@ static int64_t sendfile_output(struct kernel_open_file_description **output_owne
     } else return -KERNEL_EINVAL;
     if (written > size) __builtin_trap();
     return written != 0U ? (int64_t)written : error;
+}
+
+/* Pipe splice retains its existing fragment-scoped TCP operation. */
+static int64_t sendfile_output(struct kernel_open_file_description **output_owner,
+    const void *buffer, size_t size, uint64_t deadline, uint32_t socket_flags)
+{
+    struct kernel_socket_write_request request = {0};
+    struct kernel_socket_write_request *stream =
+        kernel_socket_is_tcp(kernel_open_file_socket(*output_owner)) ? &request : NULL;
+    if (stream) kernel_socket_stream_begin(stream, output_owner);
+    int64_t result=transfer_output(output_owner,stream,buffer,size,deadline,socket_flags);
+    if (stream) kernel_socket_stream_finish(stream);
+    return result;
 }
 
 static int64_t regular_copy_output(struct kernel_open_file_description *out,
@@ -293,6 +304,14 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
         uint64_t now = kernel_time_monotonic_ns();
         deadline = UINT64_MAX - now < timeout ? UINT64_MAX : now + timeout;
     }
+    struct kernel_socket_write_request request = {0};
+    struct kernel_socket_write_request *stream =
+        kernel_socket_is_tcp(kernel_open_file_socket(output)) ? &request : NULL;
+    /* The syscall owns one active write and OFD pin across source pages.
+     * Each commit still COPYs and attempts output, honoring TCP corking,
+     * without holding a reservation or adding any sendfile-specific output
+     * deferral across the next source read. */
+    if (stream) kernel_socket_stream_begin(stream, output_owner);
     while (total < count) {
         size_t wanted = count - total > capacity
             ? capacity : (size_t)(count - total), available = 0;
@@ -354,13 +373,18 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
             if (direct && source_buffer.allocator) kernel_task_io_buffer_release(&source_buffer);
             break;
         }
-        int64_t sent=sendfile_output(output_owner,staging,available,deadline,socket_flags);
+        /* Reusing registration must not change fragment error delivery: a
+         * later source fragment still observes errors as its own TCP write.
+         * No IO_MORE is used here, so there is no request-local deferral to lose. */
+        if (stream) stream->progressed=0;
+        int64_t sent=transfer_output(output_owner,stream,staging,available,deadline,socket_flags);
         if (direct) kernel_task_io_buffer_release(&source_buffer);
         if (sent < 0) { error = (int)sent; break; }
         if ((uint64_t)sent > available) __builtin_trap();
         total += (uint64_t)sent;
         if ((size_t)sent < available || error != 0) break;
     }
+    if (stream) kernel_socket_stream_finish(stream);
     if (datagram_staging) kernel_heap_release(files->heap, datagram_staging);
     if (source_buffer.allocator) kernel_task_io_buffer_release(&source_buffer);
     kernel_files_size_limit_notify(&size_limit);
