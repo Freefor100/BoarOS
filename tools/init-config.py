@@ -8,9 +8,9 @@ import re
 ROOT = Path(__file__).resolve().parents[1]
 
 def constant(path, name):
-    return int(re.search(r'#define\s+' + name + r'\s+(\d+)U', (ROOT / path).read_text())[1])
+    return int(re.search(r'#define\s+' + name + r'\s+(?:UINT64_C\()?([0-9a-fA-Fx]+)', (ROOT / path).read_text())[1], 0)
 
-def render(config):
+def render(config, page_size=4096):
     if not isinstance(config, dict) or set(config) != {'path', 'argv', 'envp'}:
         raise ValueError('expected exactly path, argv and envp')
     def raw(value):
@@ -21,15 +21,19 @@ def render(config):
     if not path.startswith(b'/') or len(path) >= constant('include/kernel/fs_context.h', 'KERNEL_FS_PATH_MAX'):
         raise ValueError('initial ELF path must be absolute and fit the path limit')
     vectors = []
-    limit = constant('include/kernel/exec_image.h', 'KERNEL_EXEC_STRING_LIMIT')
+    limit = constant('include/kernel/rlimit.h', 'KERNEL_RLIMIT_STACK_DEFAULT') // 4
+    string_limit = constant('include/kernel/exec_image.h', 'KERNEL_EXEC_STRING_PAGES') * page_size
     for key in ('argv', 'envp'):
         value = config[key]
         if not isinstance(value, list) or len(value) > limit // 8:
             raise ValueError('argument/environment vector exceeds exec limit')
-        vectors.append([raw(item) for item in value])
+        vector = [raw(item) for item in value]
+        if any(len(item) >= string_limit for item in vector):
+            raise ValueError('single string exceeds exec limit')
+        vectors.append(vector)
     if not vectors[0]:
         raise ValueError('argv must contain argv[0]')
-    if sum(len(x) + 1 for vector in vectors for x in vector) > limit:
+    if len(path) + 1 + sum(len(x) + 1 + 8 for vector in vectors for x in vector) > limit:
         raise ValueError('strings exceed exec limit')
     def literal(data):
         return '"' + ''.join(f'\\{byte:03o}' for byte in data) + '"'
@@ -46,8 +50,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('input', type=Path)
     parser.add_argument('output', type=Path)
+    parser.add_argument('--page-size', type=int, choices=(4096, 16384), default=4096)
     args = parser.parse_args()
-    result = render(json.loads(args.input.read_text()))
+    result = render(json.loads(args.input.read_text()), args.page_size)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     if not args.output.exists() or args.output.read_text() != result:
         args.output.write_text(result)

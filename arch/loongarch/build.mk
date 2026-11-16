@@ -181,7 +181,7 @@ test-loongarch-fatal: prepare-la-tools
 endif
 
 $(LA_BUILD)/generated/init-config.h: force-init-config $(INIT_CONFIG) tools/init-config.py
-	python3 -B tools/init-config.py $(INIT_CONFIG) $@
+	python3 -B tools/init-config.py $(INIT_CONFIG) $@ --page-size 16384
 $(LA_BUILD)/platform/loongarch_root.o: $(LA_BUILD)/generated/init-config.h $(LA_BUILD)/generated/lock-config.h
 $(LA_BUILD)/platform/loongarch_root.o: LA_CPPFLAGS += -I$(LA_BUILD)/generated
 .PHONY: prepare-la-userland test-root-loongarch
