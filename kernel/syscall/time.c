@@ -22,6 +22,7 @@
 
 #define LINUX_CLOCK_REALTIME 0U
 #define LINUX_CLOCK_MONOTONIC 1U
+#define LINUX_CLOCK_MONOTONIC_RAW 4U
 #define LINUX_CLOCK_REALTIME_COARSE 5U
 #define LINUX_CLOCK_MONOTONIC_COARSE 6U
 #define LINUX_CLOCK_BOOTTIME 7U
@@ -91,6 +92,7 @@ static int syscall_clock_id_coarse(uint64_t clock_id)
 static int syscall_clock_id_valid(uint64_t clock_id)
 {
     return clock_id == LINUX_CLOCK_REALTIME || clock_id == LINUX_CLOCK_MONOTONIC ||
+           clock_id == LINUX_CLOCK_MONOTONIC_RAW ||
            clock_id == LINUX_CLOCK_BOOTTIME ||
            syscall_clock_id_coarse(clock_id);
 }
@@ -153,6 +155,8 @@ enum kernel_syscall_status syscall_handle_clock_gettime(
     case LINUX_CLOCK_REALTIME: nanoseconds = kernel_time_realtime_ns(); break;
     /* No suspend support: boottime has no suspended interval to add. */
     case LINUX_CLOCK_BOOTTIME:
+    /* MONOTONIC has no rate adjustment; RAW shares its counter conversion. */
+    case LINUX_CLOCK_MONOTONIC_RAW:
     case LINUX_CLOCK_MONOTONIC: nanoseconds = kernel_time_monotonic_ns(); break;
     case LINUX_CLOCK_REALTIME_COARSE: nanoseconds = kernel_time_coarse_realtime_ns(); break;
     default: nanoseconds = kernel_time_coarse_monotonic_ns(); break;
@@ -514,7 +518,8 @@ enum kernel_syscall_status syscall_handle_sleep_for(
     uint64_t deadline;
     uint64_t now_ns;
 
-    if (syscall_clock_id_coarse(clock_id) || clock_id == 3U) {
+    if (syscall_clock_id_coarse(clock_id) || clock_id == 3U ||
+        clock_id == LINUX_CLOCK_MONOTONIC_RAW) {
         decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
         decoded->value = -KERNEL_EOPNOTSUPP;
         return KERNEL_SYSCALL_STATUS_OK;

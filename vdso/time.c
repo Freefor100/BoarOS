@@ -32,10 +32,11 @@ static inline int syscall2(long number, long a, long b)
     return (int)arg0;
 }
 
-/* Kernel clock IDs: REALTIME=0, MONOTONIC=1 and the two COARSE clocks=5/6. */
+/* RAW=4 shares the unadjusted MONOTONIC=1 conversion. Neither uses the
+ * software wall-clock offset applied to REALTIME=0 and COARSE=5. */
 static inline int read_clock(int clock, uint64_t *ns)
 {
-    if (clock != 0 && clock != 1 && clock != 5 && clock != 6) return 0;
+    if (clock != 0 && clock != 1 && clock != 4 && clock != 5 && clock != 6) return 0;
     for (;;) {
         uint32_t seq=__atomic_load_n(&__boaros_vvar.sequence,__ATOMIC_ACQUIRE);
         if (seq&1) continue;
@@ -63,7 +64,7 @@ int __vdso_clock_gettime(int clock, struct vdso_timespec *ts)
 
 int __vdso_clock_getres(int clock, struct vdso_timespec *ts)
 {
-    if (clock != 0 && clock != 1 && clock != 5 && clock != 6)
+    if (clock != 0 && clock != 1 && clock != 4 && clock != 5 && clock != 6)
         return syscall2(114, clock, (long)ts);
     if (ts) {
         if (!__atomic_load_n(&__boaros_vvar.multiplier, __ATOMIC_ACQUIRE))

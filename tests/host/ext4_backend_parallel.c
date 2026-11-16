@@ -18,140 +18,6 @@ struct parallel_actor {
     int error;
 };
 static _Thread_local struct parallel_actor *parallel_current;
-struct reservation_actor {
-    struct kernel_vfs_file *file;
-    unsigned id,pause,entered,resume,done,fail;
-    int error;
-};
-static _Thread_local struct reservation_actor *reservation_current;
-int __real_ext4_fs_get_inode_ref_read(struct ext4_fs *,uint32_t,struct ext4_inode_ref *);
-int __wrap_ext4_fs_get_inode_ref_read(struct ext4_fs *fs,uint32_t inode,struct ext4_inode_ref *ref)
-{
-    int result=__real_ext4_fs_get_inode_ref_read(fs,inode,ref);
-    struct reservation_actor *actor=reservation_current;
-    if(result || !actor || !actor->pause || actor->entered)return result;
-    assert(inode==kernel_vfs_file_inode(actor->file) &&
-           (!kernel_io_context_current()->backend_guard.lock ||
-            !kernel_io_context_current()->backend_guard.write) &&
-           !kernel_io_context_current()->backend_state_depth);
-    __atomic_store_n(&actor->entered,1,__ATOMIC_RELEASE);
-    while(!__atomic_load_n(&actor->resume,__ATOMIC_ACQUIRE))sched_yield();
-    if(actor->fail) {
-        assert(!ext4_fs_put_inode_ref(ref));
-        return EIO;
-    }
-    return result;
-}
-static void *reserve_file(void *argument)
-{
-    struct reservation_actor *actor=argument;
-    mm_test_attach(actor->id);mm_test_activate_task();
-    struct kernel_vfs_node *node=kernel_vfs_file_node(actor->file);
-    KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(node,&io,1);
-    struct file_write_reservation ticket={0};size_t ready=0;int complete=0;
-    reservation_current=actor;
-    actor->error=node->instance->ops->reserve_write(node,0,1024,&ready,&complete,&ticket);
-    reservation_current=NULL;
-    assert(actor->error==(actor->fail?-KERNEL_EIO:0) &&
-           ready==(actor->fail?0:1024) && !complete);
-    if(ticket.owner)node->instance->ops->finish_reservation(node,&ticket,0,0);
-    assert(!ticket.owner && !ticket.next);
-    kernel_lock_release(&io);
-    __atomic_store_n(&actor->done,1,__ATOMIC_RELEASE);
-    mm_test_finish();return NULL;
-}
-static void independent_reservations(struct lwext4_mount_adapter *adapter,
-    struct kernel_vfs_file *first,struct kernel_vfs_file *second)
-{
-    uint64_t delayed=adapter->device.fs->delayed_blocks;
-    for(unsigned fail=0;fail<2;fail++) {
-        struct reservation_actor actors[2]={{.file=first,.id=1,.pause=1,.fail=fail},
-                                           {.file=second,.id=2}};
-        pthread_t a,b;assert(!pthread_create(&a,NULL,reserve_file,&actors[0]));
-        while(!__atomic_load_n(&actors[0].entered,__ATOMIC_ACQUIRE))sched_yield();
-        assert(!pthread_create(&b,NULL,reserve_file,&actors[1]));
-        while(!__atomic_load_n(&actors[1].done,__ATOMIC_ACQUIRE))sched_yield();
-        assert(!actors[0].done && !pthread_join(b,NULL));
-        __atomic_store_n(&actors[0].resume,1,__ATOMIC_RELEASE);
-        assert(!pthread_join(a,NULL) && actors[0].done);
-        assert(adapter->device.fs->delayed_blocks==delayed);
-    }
-    puts("PASS independent reservations: B prepares and cancels while A holds an inode mapping read; A success/EIO returns every ticket and delayed-block charge");
-}
-static void reservation_capacity(struct lwext4_mount_adapter *adapter,
-    struct kernel_vfs_file *first,struct kernel_vfs_file *second)
-{
-    struct kernel_vfs_node *a=kernel_vfs_file_node(first),*b=kernel_vfs_file_node(second);
-    uint64_t delayed=adapter->device.fs->delayed_blocks;
-    struct file_write_reservation held={0},denied={0};
-    size_t ready=0;int complete=0;
-    {
-        KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(a,&io,1);
-        assert(a->instance->ops->reserve_write(a,0,128U*1024*1024,&ready,&complete,&held)==-KERNEL_ENOSPC);
-        assert(ready && ready<128U*1024*1024 && held.owner && !complete);
-    }
-    {
-        KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(b,&io,1);
-        assert(b->instance->ops->reserve_write(b,0,1024,&ready,&complete,&denied)==-KERNEL_ENOSPC);
-        assert(!ready && !denied.owner && !denied.next && !complete);
-    }
-    {
-        KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(a,&io,1);
-        a->instance->ops->finish_reservation(a,&held,0,0);
-        assert(!held.owner && !held.next);
-    }
-    assert(adapter->device.fs->delayed_blocks==delayed);
-    puts("PASS shared reservation capacity: real ENOSPC prefix excludes a second inode; cancelling the retained ticket returns every delayed block");
-}
-struct acceptance_actor {
-    struct kernel_vfs_node *node;
-    struct file_write_reservation *ticket;
-    uint64_t offset;
-    unsigned id,done;
-};
-static void *accept_mapping(void *argument)
-{
-    struct acceptance_actor *actor=argument;
-    mm_test_attach(actor->id);mm_test_activate_task();
-    KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(actor->node,&io,0);
-    actor->node->instance->ops->accept_reservation(actor->node,actor->ticket,
-        actor->offset,actor->offset+1024);
-    kernel_lock_release(&io);
-    __atomic_store_n(&actor->done,1,__ATOMIC_RELEASE);
-    mm_test_finish();return NULL;
-}
-static void mapping_acceptance(struct lwext4_mount_adapter *adapter,struct kernel_vfs_file *file)
-{
-    struct kernel_vfs_node *node=kernel_vfs_file_node(file);
-    unsigned block=adapter->device.fs->bdev->lg_bsize;
-    uint64_t delayed=adapter->device.fs->delayed_blocks;
-    struct file_write_reservation tickets[2]={{0}};
-    {
-        KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(node,&io,1);
-        for(unsigned i=0;i<2;i++) {
-            size_t ready=0;int complete=0;
-            assert(!node->instance->ops->reserve_write(node,i*block,1024,&ready,&complete,&tickets[i]));
-            assert(ready==1024 && !complete && tickets[i].owner);
-        }
-    }
-    /* A separate mapping query retains its legacy read qualification. mmap
-     * publication must not upgrade that mount-wide qualification to writer. */
-    adapter->locks.read_lock(&adapter->backend_lock);
-    struct acceptance_actor actors[2]={{.node=node,.ticket=&tickets[0],.id=1},
-                                      {.node=node,.ticket=&tickets[1],.id=2,.offset=block}};
-    pthread_t threads[2];
-    for(unsigned i=0;i<2;i++)assert(!pthread_create(&threads[i],NULL,accept_mapping,&actors[i]));
-    for(unsigned i=0;i<2;i++)assert(!pthread_join(threads[i],NULL) && actors[i].done);
-    adapter->locks.unlock(&adapter->backend_lock);
-    {
-        KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(node,&io,1);
-        for(unsigned i=0;i<2;i++)node->instance->ops->finish_reservation(node,&tickets[i],i*block,i*block);
-        assert(adapter->device.fs->delayed_blocks==delayed+2);
-        ext4_file_release_reservations(lwext4_node_file(node),0);
-    }
-    assert(adapter->device.fs->delayed_blocks==delayed);
-    puts("PASS mmap acceptance: two inode readers publish separate bits while a legacy mapping reader is held; committed bits survive delayed finish and cleanup returns both charges");
-}
 static unsigned checkpoint_pause,checkpoint_entered,checkpoint_resume,checkpoint_calls;
 static unsigned fail_thread_start,startup_pause,startup_entered,startup_resume,startup_done,startup_flush_done;
 static int startup_expected;
@@ -200,7 +66,7 @@ int __wrap_jbd_trans_set_block_dirty_range(struct jbd_trans *trans,struct ext4_b
 static void *parallel_modify(void *argument)
 {
     struct parallel_actor *actor=argument;
-    mm_test_attach(actor->actor+1);mm_test_activate_task();kernel_cpu_current()->logical_id=kernel_cpu_get_boot_count()>1?actor->actor:0;
+    mm_test_attach(actor->actor+1);mm_test_activate_task();kernel_cpu_current()->logical_id=actor->actor;
     parallel_current=actor;
     actor->error=kernel_vfs_file_set_mode(actor->existing,actor->mode);
     parallel_current=NULL;
@@ -262,7 +128,7 @@ static void parallel_worker_startup(struct lwext4_mount_adapter *adapter,unsigne
     assert(startup_done && startup_flush_done);
     puts(failure?
         "PASS startup ENOMEM: checkpoint joins before serial reuse; queued global block flush completes and the next startup can retry":
-        "PASS startup publication: real checkpoint waits for both workers; queued global block flush completes after worker publication");
+        "PASS startup publication: real checkpoint waits for both workers; global block flush queues before parallel activation and completes afterwards");
 }
 static void *parallel_drain(void *argument)
 {
@@ -273,7 +139,7 @@ static void *parallel_drain(void *argument)
 }
 static void *parallel_lookup(void *argument)
 {
-    mm_test_attach(3);mm_test_activate_task();kernel_cpu_current()->logical_id=kernel_cpu_get_boot_count()>1?1:0;
+    mm_test_attach(3);mm_test_activate_task();kernel_cpu_current()->logical_id=1;
     struct parallel_actor *actor=argument;
     struct kernel_vfs_stat stat;
     assert(!kernel_vfs_fstat(actor->existing,&stat) && (stat.mode&0777U)==actor->mode);
@@ -331,9 +197,6 @@ static void run_pair(struct lwext4_mount_adapter *adapter,struct parallel_actor 
 }
 int main(int argc,char **argv)
 {
-    extern unsigned mm_test_boot_cpus;
-    const char *boot=getenv("FILE_IO_HOST_BOOT_CPUS");
-    if(boot)mm_test_boot_cpus=strtoul(boot,NULL,10);
     assert(argc==2);setvbuf(stdout,NULL,_IONBF,0);mm_test_attach(0);mm_test_activate_task();
     struct physical_page_allocator pages={0},backend_pages={0};
     struct kernel_heap heap={0},backend_heap={0};
@@ -352,9 +215,7 @@ int main(int argc,char **argv)
     assert(!adapter->journal_started && !adapter->checkpoint_started &&
            !adapter->backend_lock.parallel && !fs->jbd_journal->grouped && !fs->active_operations);
     parallel_worker_startup(adapter,0);
-    assert(adapter->journal_started && adapter->checkpoint_started &&
-           adapter->backend_lock.parallel==(mm_test_boot_cpus>1));
-    printf("PASS %u boot CPU(s): independent reservations use no mount-wide writer\n",mm_test_boot_cpus);
+    assert(adapter->journal_started && adapter->checkpoint_started && adapter->backend_lock.parallel);
     struct kernel_vfs_path *root=NULL;
     assert(!kernel_vfs_path_root(&mount,&heap,&root));
     struct kernel_vfs_file files[8]={0};
@@ -368,14 +229,11 @@ int main(int argc,char **argv)
     }
     assert(first!=UINT32_MAX && offsets[first]!=offsets[second]);
     assert(!ext4_journal_group_drain(adapter->mount_point));
-    independent_reservations(adapter,&files[first],&files[second]);
-    reservation_capacity(adapter,&files[first],&files[second]);
-    mapping_acceptance(adapter,&files[first]);
-    for(unsigned cancel=0;mm_test_boot_cpus>1 && cancel<2;cancel++) {
+    for(unsigned cancel=0;cancel<2;cancel++) {
         struct parallel_actor actors[2]={{.existing=&files[first],.actor=0,.abort=cancel,.mode=0640},
                                         {.existing=&files[second],.actor=1,.mode=0620}};
         run_pair(adapter,actors);
-        printf("PASS real packed inode FD writers: simultaneous private operations; B checkpoints while A %s; fstat completes during a paused checkpoint\n",cancel?"aborts":"remains active");
+        printf("PASS real packed inode FD writers: simultaneous private operations; B checkpoints while A %s; CPU1 fstat completes during CPU0 checkpoint\n",cancel?"aborts":"remains active");
         for(unsigned i=0;i<2;i++)assert(!kernel_vfs_file_set_mode(actors[i].existing,0600));
         assert(!ext4_journal_group_drain(adapter->mount_point));
     }

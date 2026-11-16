@@ -4,6 +4,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/timerfd.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
 #include <fcntl.h>
@@ -49,6 +50,24 @@ static struct message message(void *data,size_t size,struct iovec *iov)
     return (struct message){.header={.msg_iov=iov,.msg_iovlen=1},.length=0xdeadbeef};
 }
 static void close_pair(int p[2]) { CHECK(!close(p[0]) && !close(p[1])); }
+static void raw_clock_errno(void)
+{
+    struct timespec first,last,resolution;
+    /* The LTP race sampler reads RAW after recvmmsg and then checks errno. */
+    CHECK(receive_many(-1,NULL,0,0,NULL)==-1 && errno==EBADF);
+    CHECK(!clock_gettime(CLOCK_MONOTONIC_RAW,&first) && errno==EBADF);
+    CHECK(!syscall(SYS_clock_gettime,CLOCK_MONOTONIC_RAW,&last) && errno==EBADF);
+    CHECK(first.tv_sec<last.tv_sec || (first.tv_sec==last.tv_sec && first.tv_nsec<=last.tv_nsec));
+    CHECK(!clock_getres(CLOCK_MONOTONIC_RAW,&resolution) && !resolution.tv_sec && resolution.tv_nsec>0);
+    CHECK(!syscall(SYS_clock_getres,CLOCK_MONOTONIC_RAW,NULL));
+    CHECK(syscall(SYS_clock_gettime,CLOCK_MONOTONIC_RAW,(void *)1)==-1 && errno==EFAULT);
+    CHECK(syscall(SYS_clock_getres,CLOCK_MONOTONIC_RAW,(void *)1)==-1 && errno==EFAULT);
+    CHECK(syscall(SYS_clock_nanosleep,CLOCK_MONOTONIC_RAW,0,(void *)1,NULL)==-1 && errno==EOPNOTSUPP);
+    CHECK(timerfd_create(CLOCK_MONOTONIC_RAW,0)==-1 && errno==EINVAL);
+    timer_t timer;
+    CHECK(timer_create(CLOCK_MONOTONIC_RAW,NULL,&timer)==-1 && errno==EOPNOTSUPP);
+    passed("raw-clock-sampler-preserves-receive-errno-query-faults-and-no-timers");
+}
 static void validation(void)
 {
     struct timespec bad={.tv_sec=-1},time={.tv_sec=1,.tv_nsec=123};
@@ -170,6 +189,25 @@ static void timeout_points(void)
     CHECK(receive_many(p[1],m,2,0,&timeout)==1 && timeout.tv_sec==0 && timeout.tv_nsec>0 && timeout.tv_nsec<1000000000);
     close_pair(p);passed("timeout-after-entry-socket-timeout-remaining");
 }
+static void malformed_later_entry(void)
+{
+    for(unsigned mode=0;mode<4;mode++) {
+        int p[2];CHECK(!socketpair(AF_UNIX,SOCK_DGRAM,0,p));
+        char data[2]={0};struct iovec iov[2];struct message m[2];
+        m[0]=message(data,1,&iov[0]);m[1]=message((void *)0xbadadd,SIZE_MAX,&iov[1]);
+        CHECK(send(p[0],"a",1,0)==1 && send(p[0],"b",1,0)==1);
+        if(mode==3)CHECK(!close(p[0]));
+        struct timespec timeout={.tv_sec=mode==2?0:1};
+        long result=receive_many(p[1],m,2,0,mode?&timeout:NULL);
+        CHECK(result==1 && data[0]=='a' && m[0].length==1 && m[1].length==0xdeadbeef);
+        int error=0;socklen_t length=sizeof(error);
+        CHECK(!getsockopt(p[1],SOL_SOCKET,SO_ERROR,&error,&length) && error==(mode==2?0:EINVAL));
+        CHECK(recv(p[1],data+1,1,MSG_DONTWAIT)==1 && data[1]=='b');
+        if(mode!=3)CHECK(!close(p[0]));
+        CHECK(!close(p[1]));
+    }
+    passed("valid-first-invalid-later-length-preserves-count-timeout-and-error");
+}
 static int control_fd(struct msghdr *header)
 {
     int result=-1,credentials=0;
@@ -253,11 +291,12 @@ static void control_output_faults(void)
     }
     CHECK(!close(original) && !munmap(region,(size_t)page*2));close_pair(p);passed("scm-installed-rights-survive-msghdr-msg-len-faults");
 }
-struct blocked_batch { int fd,writing;uint64_t tid;char data[2];long result;int error; };
+struct blocked_batch { int fd,writing,malformed;uint64_t tid;char data[2];long result;int error; };
 static void *blocked_receiver(void *arg)
 {
     struct blocked_batch *batch=arg;struct message m[2];struct iovec iov[2];
     for(int i=0;i<2;i++)m[i]=message(batch->data+i,1,&iov[i]);
+    if(batch->malformed)m[1]=message((void *)0xbadadd,SIZE_MAX,&iov[1]);
     __atomic_store_n(&batch->tid,(uint64_t)syscall(SYS_gettid),__ATOMIC_RELEASE);
     batch->result=batch->writing?send_many(batch->fd,m,2,MSG_NOSIGNAL):receive_many(batch->fd,m,2,0,0);batch->error=errno;
     return 0;
@@ -285,6 +324,20 @@ static void pinned_descriptor(void)
     CHECK(!pthread_join(thread,0) && batch.result==2 && batch.data[0]=='a' && batch.data[1]=='b');
     char byte;CHECK(recv(old[1],&byte,1,MSG_DONTWAIT)==1 && byte=='x');
     close_pair(old);close_pair(replacement);passed("batch-holds-original-ofd-across-fd-replacement");
+}
+static void closed_descriptor_prefix(void)
+{
+    int old[2],replacement[2];
+    CHECK(!socketpair(AF_UNIX,SOCK_DGRAM,0,old) && !socketpair(AF_UNIX,SOCK_DGRAM,0,replacement));
+    struct blocked_batch batch={.fd=old[1],.malformed=1};pthread_t thread;
+    CHECK(!pthread_create(&thread,0,blocked_receiver,&batch));wait_blocked(&batch.tid);
+    CHECK(!close(old[1]) && dup2(replacement[1],old[1])==old[1]);
+    CHECK(send(old[0],"a",1,0)==1 && !pthread_join(thread,0));
+    if(batch.result!=1)fprintf(stderr,"MMSG closed descriptor result=%ld errno=%d first=%d\n",batch.result,batch.error,(unsigned char)batch.data[0]);
+    CHECK(batch.result==1 && batch.data[0]=='a');
+    char byte;CHECK(send(replacement[0],"x",1,0)==1 && recv(old[1],&byte,1,MSG_DONTWAIT)==1 && byte=='x');
+    close_pair(old);close_pair(replacement);
+    passed("closed-fd-original-ofd-invalid-later-entry-preserves-prefix");
 }
 static volatile sig_atomic_t signals_seen;
 static void interrupted(int signal_number)
@@ -315,9 +368,12 @@ static void signal_prefix(void)
     }
     passed("signal-blocked-second-send-receive-prefix-with-and-without-restart");
 }
-int main(void)
+int main(int argc,char **argv)
 {
     setvbuf(stdout,0,_IONBF,0);
+    raw_clock_errno();
+    malformed_later_entry();closed_descriptor_prefix();
+    if(argc==2 && !strcmp(argv[1],"prefix")) { printf("MMSG PASS cases=%u\n",cases);return 0; }
     validation();families();names_peek_trunc();prefix_and_lazy_faults();timeout_points();control_batch();output_faults();vector_limits();control_output_faults();pinned_descriptor();signal_prefix();
     printf("MMSG PASS cases=%u\n",cases);return 0;
 }

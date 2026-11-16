@@ -51,7 +51,7 @@ timerfd 和 POSIX 墙钟索引在各自已有保护内更新，通知和信号�
 
 RV64 和 LA64 的 exec 映射一个只读可执行 ELF 页和紧随其后的只读 `[vvar]` 页。auxv 的 `AT_SYSINFO_EHDR` 指向 ELF 头；三个时间符号 `__vdso_clock_gettime`、`__vdso_clock_getres`、`__vdso_gettimeofday` 分别采用 RV 的 `LINUX_4.15` 与 LA 的 `LINUX_5.10` 版本。信号处理器的返回地址指向同一 ELF 内的 `__vdso_rt_sigreturn`。
 
-REALTIME 和 MONOTONIC 直接读取用户可用的架构计数器，用与 syscall 相同的乘数换算。两种 COARSE 读取 CPU0 最近发布的原子样本；CPU 时钟和其他时钟编号交给 syscall。vDSO 在用户态写出结果，因此错误输出地址按普通用户内存访问处理。乘数在初始化后不变；调钟和时区修改更新共享数据页的序列，vDSO 在同一序列内读取偏移和 counter，发现写者介入则重读。内核 REALTIME 查询同样复查序列。计时中断只更新 coarse 单调样本，不遍历进程。
+REALTIME、MONOTONIC 和 MONOTONIC_RAW 直接读取用户可用的架构计数器，用与 syscall 相同的乘数换算。两种 COARSE 读取 CPU0 最近发布的原子样本；CPU 时钟和其他时钟编号交给 syscall。vDSO 在用户态写出结果，因此错误输出地址按普通用户内存访问处理。乘数在初始化后不变；调钟和时区修改更新共享数据页的序列，vDSO 在同一序列内读取偏移和 counter，发现写者介入则重读。内核 REALTIME 查询同样复查序列。计时中断只更新 coarse 单调样本，不遍历进程。
 
 各 MM 共享一页时钟数据，每个映射 PTE 与 MM 的恢复后备分别持有引用。fork 继承后备，`MADV_DONTNEED` 只丢弃驻留映射；再次访问时，代码从内核 ELF 重新装入，数据重新接入同一时钟页。页表销毁后归还 MM 的后备引用，最后一个 MM 释放时先停止时间写者对该页的访问。
 
@@ -59,9 +59,9 @@ REALTIME 和 MONOTONIC 直接读取用户可用的架构计数器，用与 sysca
 
 ## 消费者与验证
 
-syscall 层的 `clock_gettime(113)`、`clock_getres(114)` 支持 `CLOCK_REALTIME`、`CLOCK_MONOTONIC`、`CLOCK_BOOTTIME`（7）、两种 `COARSE`（5、6）及[进程/线程 CPU 时钟](kernel-accounting.md#cpu-时钟)。系统不支持挂起，因此 BOOTTIME 与 fine MONOTONIC 使用同一计数，分辨率为 1ns；vDSO 将 BOOTTIME 查询交给 syscall。该查询支持不扩展睡眠或定时器可接受的 clockid。未知 clockid 返回 `-EINVAL`。coarse getres 如实返回 10ms，NULL 输出成功，坏输出指针返回 EFAULT。`gettimeofday(169)` 使用 fine realtime；依次写出 timeval 和可选 timezone，后者返回系统保存的 timezone，两字段初始均为零。先前输出已成功时，后续用户地址错误返回 EFAULT 并保留该输出。
+syscall 层的 `clock_gettime(113)`、`clock_getres(114)` 支持 `CLOCK_REALTIME`、`CLOCK_MONOTONIC`、`CLOCK_MONOTONIC_RAW`（4）、`CLOCK_BOOTTIME`（7）、两种 `COARSE`（5、6）及[进程/线程 CPU 时钟](kernel-accounting.md#cpu-时钟)。当前没有 NTP 或其他频率渐进校正，RAW 与 MONOTONIC 使用相同的原始架构计数器换算，运行时墙钟修改不影响二者；RAW 支持查询但不支持睡眠、timerfd 或 POSIX 定时器。系统不支持挂起，因此 BOOTTIME 与 fine MONOTONIC 使用同一计数，分辨率为 1ns；vDSO 将 BOOTTIME 查询交给 syscall。该查询支持不扩展睡眠或定时器可接受的 clockid。未知 clockid 返回 `-EINVAL`。coarse getres 如实返回 10ms，NULL 输出成功，坏输出指针返回 EFAULT。`gettimeofday(169)` 使用 fine realtime；依次写出 timeval 和可选 timezone，后者返回系统保存的 timezone，两字段初始均为零。先前输出已成功时，后续用户地址错误返回 EFAULT 并保留该输出。
 
-`clock_nanosleep(115)` 支持 REALTIME、MONOTONIC、进程 CPU 时钟及编码后的其他线程 CPU 时钟。CPU 睡眠在调用者 CPU 登记和返回，复用 POSIX CPU 期限索引，按目标实际执行时间到期；不建立用户可见 timer ID，也不预留信号队列额度。内建 CLOCK_THREAD_CPUTIME_ID 与 coarse 时钟在读取 timespec 前返回 EOPNOTSUPP，编码后的本线程时钟返回 EINVAL。进程时钟可以由同组其他线程推进；只有睡眠线程且没有其他执行者时，CPU 时间不会因墙钟流逝增加。
+`clock_nanosleep(115)` 支持 REALTIME、MONOTONIC、进程 CPU 时钟及编码后的其他线程 CPU 时钟。CPU 睡眠在调用者 CPU 登记和返回，复用 POSIX CPU 期限索引，按目标实际执行时间到期；不建立用户可见 timer ID，也不预留信号队列额度。内建 CLOCK_THREAD_CPUTIME_ID、MONOTONIC_RAW 与 coarse 时钟在读取 timespec 前返回 EOPNOTSUPP，编码后的本线程时钟返回 EINVAL。进程时钟可以由同组其他线程推进；只有睡眠线程且没有其他执行者时，CPU 时间不会因墙钟流逝增加。
 
 CPU 睡眠对象由调用线程持有，期限检查和取消在共同调度保护内交接；到期直接完成等待，强制退出先摘除期限，再释放请求。目标退出只摘除其期限，不将退出当成到期；后续信号中断取消睡眠。相对睡眠中断报告剩余量，绝对睡眠不改 remaining；相对睡眠重启保留原 CPU 到期期限，绝对睡眠经 stop/continue 后重新读取用户请求。普通墙钟睡眠沿原期限路径。
 

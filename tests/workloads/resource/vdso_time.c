@@ -71,7 +71,7 @@ int main(void)
     int (*res)(clockid_t, struct timespec *) = symbol("__vdso_clock_getres");
     int (*wall)(struct timeval *, struct timezone *) = symbol("__vdso_gettimeofday");
     CHECK(symbol("__vdso_rt_sigreturn"));
-    const clockid_t clocks[] = {CLOCK_REALTIME, CLOCK_MONOTONIC,
+    const clockid_t clocks[] = {CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_MONOTONIC_RAW,
         CLOCK_REALTIME_COARSE, CLOCK_MONOTONIC_COARSE, CLOCK_THREAD_CPUTIME_ID,
         CLOCK_BOOTTIME};
     for (unsigned i = 0; i < sizeof(clocks) / sizeof(clocks[0]); i++) {
