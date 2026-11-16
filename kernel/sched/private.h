@@ -71,7 +71,10 @@ struct kernel_scheduler {
 #endif
 #if BOAROS_USER_SMP
     struct kernel_sched_runqueue rt_services;
-    uint32_t pullable_rt_cpus;
+    /* Queued RT tasks whose requested affinity permits this remote CPU.
+     * RT updates hold common control and every run lock; local selection
+     * reads its own count under the destination run lock. */
+    uint32_t remote_rt_ready_count[BOAROS_MAX_CPUS];
 #endif
     struct kernel_rt_configuration rt_configuration;
     struct kernel_task *exited_head;

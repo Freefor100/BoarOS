@@ -594,6 +594,20 @@ struct kernel_task *ready_best_locked(void)
     return node ? node->owner : 0;
 }
 #if BOAROS_USER_SMP
+static void remote_rt_ready_update(const struct kernel_task *task,
+    const struct kernel_cpu *source,int add)
+{
+    /* Requested affinity stays fixed until dequeue. Effective affinity can
+     * narrow during service/reservation and widen without re-enqueueing, so
+     * retain those conservative hints until the real claim checks it. */
+    uint32_t mask=(task->cpu_mask?task->cpu_mask:1U)&~(1U<<source->logical_id);
+    for (unsigned id=0;id<BOAROS_MAX_CPUS;id++) {
+        if (!(mask&(1U<<id))) continue;
+        uint32_t *count=&scheduler.remote_rt_ready_count[id];
+        if (add) { if (*count==UINT32_MAX) __builtin_trap(); ++*count; }
+        else { if (!*count) __builtin_trap(); --*count; }
+    }
+}
 static void ready_remove_owned(struct kernel_task *task)
 #else
 #define ready_remove_owned ready_remove_locked
@@ -608,11 +622,7 @@ void ready_remove_locked(struct kernel_task *task)
         ((task->cpu_mask ? task->cpu_mask : 1U)&~(1U<<owner->logical_id))) {
         if (!owner->pullable_ready) __builtin_trap();
 #if BOAROS_USER_SMP
-        if (task->ready_node.priority) {
-            if (!owner->pullable_rt) __builtin_trap();
-            if (!--owner->pullable_rt)
-                __atomic_fetch_and(&scheduler.pullable_rt_cpus,~(1U<<owner->logical_id),__ATOMIC_RELAXED);
-        }
+        if (task->ready_node.priority) remote_rt_ready_update(task,owner,0);
         __atomic_store_n(&owner->pullable_ready,owner->pullable_ready-1U,__ATOMIC_RELAXED);
 #else
         owner->pullable_ready--;
@@ -655,8 +665,7 @@ static void ready_enqueue_at_locked(struct kernel_task *task, int flags
         if (target->pullable_ready==UINT32_MAX) __builtin_trap();
 #if BOAROS_USER_SMP
         __atomic_store_n(&target->pullable_ready,target->pullable_ready+1U,__ATOMIC_RELAXED);
-        if (task->ready_node.priority && !target->pullable_rt++)
-            __atomic_fetch_or(&scheduler.pullable_rt_cpus,1U<<target->logical_id,__ATOMIC_RELAXED);
+        if (task->ready_node.priority) remote_rt_ready_update(task,target,1);
 #else
         target->pullable_ready++;
 #endif
@@ -904,7 +913,7 @@ static int remote_rt_ready(const struct kernel_cpu *cpu)
 {
     /* 调用者持目标核锁。RT入队和资格更新持共同控制及所有队列锁，
      * 因此在本次领取前不会悄悄出现可迁移的更高优先级任务。 */
-    return (__atomic_load_n(&scheduler.pullable_rt_cpus,__ATOMIC_RELAXED)&~(1U<<cpu->logical_id))!=0;
+    return scheduler.remote_rt_ready_count[cpu->logical_id]!=0;
 }
 
 /* 空闲核只借实际来源和目标两把队列锁。来源选中前旧栈必已归还；

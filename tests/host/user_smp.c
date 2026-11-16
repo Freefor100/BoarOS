@@ -741,6 +741,42 @@ static void remote_rt_precedence(void)
     puts("PASS remote RT work defers ordinary selection until the last eligible task leaves");
 }
 
+static void remote_rt_affinity(void)
+{
+#if BOAROS_MAX_CPUS > 2
+    reset_two_queues();active=&cpus[2];
+    kernel_cpu_initialize(active,55,0);active->logical_id=2;active->state=KERNEL_CPU_ONLINE;
+    idles[2]=(struct kernel_task){.state=KERNEL_THREAD_STATE_IDLE,.wait.on_cpu=1};
+    active->current=&idles[2];scheduler_cpu_initialize(active,&idles[2],1);
+    active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      balance_running(0,0,99);balance_running(1,1,0);balance_running(2,2,0);
+      balance_queued(3,5,80);balance_queued(4,5,80); }
+    struct kernel_task *next=0;uint64_t deadline;
+    /* CPU1 has no legal RT competitor. It must retain the ordinary local
+     * path without taking common control, even while both RT tasks wait. */
+    active=&cpus[1];local_run_required=1;forbid_cpu0_run=1;
+    assert(scheduler_select_local(0,0,0,&next,&deadline) && !next);
+    local_run_required=forbid_cpu0_run=0;
+    active=&cpus[2];
+    assert(!scheduler_select_local(0,0,0,&next,&deadline));
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);ready_remove_locked(&tasks[3]); }
+    assert(!scheduler_select_local(0,0,0,&next,&deadline));
+    /* A real affinity change removes the old target hint and publishes the
+     * new queue/target set, without leaving CPU2 in common arbitration. */
+    tasks[4].arch.user_mode=1;tasks[4].tid_owned=1;
+    assert(!kernel_task_affinity_set(&tasks[4],0,3));
+    local_run_required=1;forbid_cpu0_run=1;
+    assert(scheduler_select_local(0,0,0,&next,&deadline) && !next);
+    local_run_required=forbid_cpu0_run=0;
+    active=&cpus[1];
+    assert(!scheduler_select_local(0,0,0,&next,&deadline));
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);ready_remove_locked(&tasks[4]); }
+    assert(scheduler_select_local(0,0,0,&next,&deadline) && !next);
+    puts("PASS remote RT affinity: unrelated busy CPU stays local; overlapping hints and affinity replacement retain legal preemption");
+#endif
+}
+
 static void busy_rt_reschedule_cases(void)
 {
     for (unsigned priority=0;priority<=10;priority+=10) {
@@ -828,7 +864,7 @@ static void ordinary_local_slice(void)
 int main(int argc,char **argv)
 {
     if(argc==2&&!strcmp(argv[1],"--rt-balance-only")) {
-        kernel_wait_domain_init();busy_rt_balance_cases();busy_rt_reschedule_cases();
+        kernel_wait_domain_init();busy_rt_balance_cases();busy_rt_reschedule_cases();remote_rt_affinity();
         local_fifo_cases();reservation_placement_cases();return 0;
     }
     if(argc==2&&!strcmp(argv[1],"--slice-only")) {kernel_wait_domain_init();ordinary_local_slice();return 0;}
@@ -842,6 +878,7 @@ int main(int argc,char **argv)
     ordinary_pull();
     ordinary_local_slice();
     remote_rt_precedence();
+    remote_rt_affinity();
     busy_rt_reschedule_cases();
     reservation_placement_cases();
     scheduler = (struct kernel_scheduler){0};

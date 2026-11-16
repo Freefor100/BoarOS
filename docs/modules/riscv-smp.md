@@ -91,7 +91,7 @@ coarse time、load、等待期限和服务轮询。任意 secondary 新增期限
 
 ## 调度与资源
 
-每核 rank42 短锁保护该 CPU 的实际执行队列、运行所有权和旧栈交接；rank40 共同控制锁保护身份、期限和实时资格。每个 READY 任务只有一个内嵌 `ready_node`，尾部 `ready_cpu` 指向其唯一队列 owner；CPU0 实时服务使用同一个节点进入独立服务队列，来源实时保留节点只维护逻辑用户资格。没有全局重复就绪表或逐 CPU 资格节点。新任务与 wake 按有效 affinity、服务与保留资格选择空闲或较轻执行者，只通知该目标；同负载依次优先最后执行 CPU、调用 CPU、较小逻辑 ID。yield/时间片轮转留在本核 FIFO，优先级变更只更新实际 owner；空闲或阻塞的 CPU 可从异核队列取得最高优先级的合格 off-CPU 任务。具体放置与交接见[调度模块](kernel-scheduler.md)。
+每核 rank42 短锁保护该 CPU 的实际执行队列、运行所有权和旧栈交接；rank40 共同控制锁保护身份、期限和实时资格。每个 READY 任务只有一个内嵌 `ready_node`，尾部 `ready_cpu` 指向其唯一队列 owner；CPU0 实时服务使用同一个节点进入独立服务队列，来源实时保留节点只维护逻辑用户资格。没有全局重复就绪表或逐 CPU 资格节点。新任务与 wake 按有效 affinity、服务与保留资格选择空闲或较轻执行者，只通知该目标；同负载依次优先最后执行 CPU、调用 CPU、较小逻辑 ID。yield/时间片轮转留在本核 FIFO，优先级变更只更新实际 owner；空闲或阻塞的 CPU 可从异核队列取得最高优先级的合格 off-CPU 任务。忙核普通选择只在有异核 RT 就绪任务的请求 affinity 包含本核时退回共同仲裁；按目标核维护计数，入队、摘队及 affinity 更新随原有全部队列锁同步，选择不扫描远端队列。服务或来源保留暂时收窄的资格仍在领取时复核，避免保留释放后漏报。具体放置与交接见[调度模块](kernel-scheduler.md)。
 普通创建接口默认CPU0；`kernel_thread_create_joinable_mask()`只供CPU0创建带join owner的受控任务。
 可睡眠的私有准备不取得已发布owner；最终rank40接纳点重查CPU在线状态，失效时锁外回滚且不发布join。
 `kernel_thread_set_cpu_mask()`要求受控任务已BLOCKED、off_cpu且没有runnable/pending成员，否则BUSY。
