@@ -18,7 +18,8 @@ static unsigned first_claimed;
 
 void *sync_test_cpu(void) { return active; }
 void *sync_test_current_task(void) { return active->current; }
-uint64_t kernel_time_monotonic_ns(void) { return 1; }
+static uint64_t scheduler_test_now=1;
+uint64_t kernel_time_monotonic_ns(void) { return scheduler_test_now; }
 #ifndef SMP_TEST_USE_LIFETIME
 void scheduler_task_publish_locked(struct kernel_task *task) { (void)task; assert(0); }
 uint64_t kernel_time_ticks_to_ns(uint64_t ticks) { return ticks; }

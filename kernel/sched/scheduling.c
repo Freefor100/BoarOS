@@ -8,6 +8,10 @@
 #include <kernel/time.h>
 #include <kernel/tick.h>
 
+#if BOAROS_USER_SMP
+#define FAIR_BALANCE_NS UINT64_C(20000000)
+#endif
+
 static struct kernel_sched_runqueue *cpu_queue(struct kernel_cpu *cpu)
 {
 #if BOAROS_MAX_CPUS > 1
@@ -40,11 +44,23 @@ static void enqueue_task(struct kernel_sched_runqueue *queue,struct kernel_sched
     struct kernel_task *task,int head)
 {
     kernel_sched_enqueue(queue,node,task,(unsigned)task->scheduling.priority,head);
+#if BOAROS_USER_SMP
+    if (!node->priority) {
+        node->fair_weight=kernel_sched_weight(&task->scheduling);
+        queue->fair_weight+=node->fair_weight;
+    }
+#endif
     if(task->pi_base_priority)queue->boosted++;
 }
 static void dequeue_task(struct kernel_sched_runqueue *queue,struct kernel_sched_node *node)
 {
     struct kernel_task *task=node->owner;
+#if BOAROS_USER_SMP
+    if (!node->priority) {
+        if (queue->fair_weight<node->fair_weight) __builtin_trap();
+        queue->fair_weight-=node->fair_weight;
+    }
+#endif
     if(task->pi_base_priority){if(!queue->boosted)__builtin_trap();queue->boosted--;}
     kernel_sched_dequeue(queue,node);
 }
@@ -841,6 +857,14 @@ uint64_t scheduler_deadline_locked(struct kernel_cpu *cpu)
         uint64_t fair=used>=slice?1:slice-used;
         if(!delay||fair<delay)delay=fair;
     }
+#if BOAROS_USER_SMP
+    if (cpu->current && !cpu->current->idle && !cpu->current->scheduling.priority &&
+        cpu->runqueue.fair_root && cpu->pullable_ready) {
+        uint64_t now=cpu->rt_bandwidth.last_account_ns;
+        uint64_t balance=cpu->fair_balance_next_ns>now?cpu->fair_balance_next_ns-now:FAIR_BALANCE_NS;
+        if (!delay || balance<delay) delay=balance;
+    }
+#endif
     uint64_t deadline = 0;
     if (delay && kernel_time_is_initialized()) {
         uint64_t now = cpu->rt_bandwidth.last_account_ns;
@@ -956,6 +980,68 @@ static __attribute__((noinline)) int try_pull_ordinary(struct kernel_cpu *cpu,
     return 0;
 }
 
+/* Correct persistent skew without turning every local slice into global
+ * arbitration. A source offers at most one off-CPU task per 20 ms. Pairwise
+ * moves must reduce the weighted load gap by at least one quarter; an equal
+ * 2:1 split is already indivisible and must not bounce a task between CPUs. */
+static uint64_t fair_load(const struct kernel_cpu *cpu)
+{
+    const struct kernel_task *current=cpu->current;
+    return cpu->runqueue.fair_weight+(current && !current->idle &&
+        !current->scheduling.priority &&
+        (current->state==KERNEL_THREAD_STATE_RUNNING || current->state==KERNEL_THREAD_STATE_READY)
+        ? kernel_sched_weight(&current->scheduling):0);
+}
+
+static __attribute__((noinline)) void balance_ordinary(struct kernel_cpu *cpu)
+{
+    if (!__atomic_load_n(&cpu->pullable_ready,__ATOMIC_RELAXED)) return;
+    uint64_t now=kernel_time_monotonic_ns();
+    {
+        KERNEL_RAW_SCOPE(guard,kernel_run_lock(cpu));
+        if (!cpu->runqueue.fair_root || !cpu->pullable_ready ||
+            !local_queue_eligible(cpu,cpu->current,0) || remote_rt_ready(cpu) ||
+            now<cpu->fair_balance_next_ns) return;
+        cpu->fair_balance_next_ns=now+FAIR_BALANCE_NS;
+    }
+    /* Rotate the first destination so a source with several legal affinity
+     * subsets cannot indefinitely prefer the same pair. CPU records persist. */
+    unsigned start=cpu->fair_balance_cursor++%BOAROS_MAX_CPUS;
+    for (unsigned n=0;n<BOAROS_MAX_CPUS;n++) {
+        unsigned id=(start+n)%BOAROS_MAX_CPUS;
+        struct kernel_cpu *target=__atomic_load_n(&scheduler.cpus,__ATOMIC_ACQUIRE);
+        while (target && target->logical_id!=id) target=target->scheduler_next;
+        if (!target || target==cpu || !kernel_cpu_online(target)) continue;
+        struct kernel_raw_lock *one=kernel_run_lock(cpu),*two=kernel_run_lock(target);
+        if (cpu->logical_id>target->logical_id) {one=two;two=kernel_run_lock(cpu);}
+        KERNEL_RAW_SCOPE(first,one);
+        KERNEL_RAW_SCOPE(second,two);
+        if (!local_queue_eligible(cpu,cpu->current,0) || remote_rt_ready(cpu)) return;
+        if (!local_queue_eligible(target,target->current,0) || remote_rt_ready(target)) continue;
+        uint64_t source_load=fair_load(cpu),target_load=fair_load(target);
+        if (source_load<=target_load) continue;
+        uint64_t gap=source_load-target_load,best_gap=gap;
+        struct kernel_task *best=0;
+        for (struct kernel_sched_node *node=kernel_sched_pick(&cpu->runqueue,0);node;
+             node=kernel_sched_next(&cpu->runqueue,node)) {
+            struct kernel_task *task=node->owner;
+            if (!scheduler_local_task(task,target)) continue;
+            if (task->wait.on_cpu || task->ready_cpu!=cpu) __builtin_trap();
+            uint64_t twice=2U*(uint64_t)node->fair_weight;
+            uint64_t after=gap>twice?gap-twice:twice-gap;
+            if (after<best_gap && gap-after>=(gap+3U)/4U) {best=task;best_gap=after;}
+        }
+        if (!best) continue;
+        /* Both clocks and both owners are protected. Preserve lag relative
+         * to min_vruntime, nice, partial slice and task state; never export a
+         * current/returning stack. The destination claims execution later. */
+        ready_remove_owned(best);
+        ready_enqueue_at_locked(best,SCHED_READY_LOCAL,target);
+        kernel_cpu_request_schedule(target); /* Also arm its first fair slice. */
+        return;
+    }
+}
+
 int scheduler_select_local(int blocked,int rotate,int voluntary,struct kernel_task **selected,
                            uint64_t *deadline)
 {
@@ -963,6 +1049,7 @@ int scheduler_select_local(int blocked,int rotate,int voluntary,struct kernel_ta
     struct kernel_task *current=cpu->current;
     *selected=0;
     if (cpu->preempt_depth) return 0;
+    if (!blocked && !current->idle) balance_ordinary(cpu);
     if (blocked || current->idle) {
         int pulled=try_pull_ordinary(cpu,current,blocked,selected,deadline);
         if (pulled) return pulled>0;
@@ -1011,6 +1098,8 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
     uint64_t deadline;
 #if BOAROS_USER_SMP
     struct kernel_task *old=cpu->current,*local;
+    if (check_queues && BOAROS_LOCK_DEBUG && !cpu->preempt_depth && !old->idle)
+        balance_ordinary(cpu);
     if ((!check_queues || !BOAROS_LOCK_DEBUG) && scheduler_select_local(0,rotate_other,voluntary,&local,&deadline)) {
         scheduler_arm_timer(deadline);
         return local?scheduler_switch_claimed(old,local):KERNEL_SCHEDULER_STATUS_OK;
@@ -1306,6 +1395,14 @@ static void sched_commit_locked(struct kernel_task *task,const struct kernel_sch
     }
     if(weight_changed)task->scheduling.fair_remainder=0;
     task->scheduling.policy=updated->policy;
+#if BOAROS_USER_SMP
+    if (task->ready_node.queued && !task->ready_node.priority) {
+        struct kernel_sched_runqueue *queue=ready_queue(task,task->ready_cpu);
+        unsigned weight=kernel_sched_weight(&task->scheduling);
+        queue->fair_weight=queue->fair_weight-task->ready_node.fair_weight+weight;
+        task->ready_node.fair_weight=weight;
+    }
+#endif
     task->scheduling.reset_on_fork=updated->reset_on_fork;
     /* The old execution interval was charged above; changing a request does
      * not replenish its consumed slice or move a queued/PI-boosted task. */
