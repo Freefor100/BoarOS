@@ -21,6 +21,22 @@ int main(void)
     assert(kernel_sched_policy_expired(&rr));
     kernel_sched_policy_rotate(&rr);
     assert(rr.rr_remaining_ns==100*MS);
+    assert(kernel_sched_rr_slice_ns()==100*MS && !kernel_sched_rr_slice_set_ms(50));
+    assert(rr.rr_remaining_ns==100*MS); /* no replacement of an active remainder */
+    kernel_sched_policy_charge(&rr,100*MS);assert(kernel_sched_policy_expired(&rr));
+    kernel_sched_policy_rotate(&rr);assert(rr.rr_remaining_ns==50*MS);
+    kernel_sched_policy_charge(&rr,49*MS);assert(!kernel_sched_policy_expired(&rr));
+    kernel_sched_policy_charge(&rr,MS);assert(kernel_sched_policy_expired(&rr));
+    kernel_sched_policy_fork(&child,&rr);assert(child.rr_remaining_ns==50*MS);
+    struct kernel_sched_policy fresh={0};
+    assert(!kernel_sched_policy_set(&fresh,KERNEL_SCHED_RR,1,0) && fresh.rr_remaining_ns==50*MS);
+    assert(kernel_sched_rr_slice_set_ms(INT64_C(2147483648))==-KERNEL_EINVAL);
+    assert(kernel_sched_rr_slice_set_ms(INT64_C(-2147483649))==-KERNEL_EINVAL);
+    assert(kernel_sched_rr_slice_ns()==50*MS && !kernel_sched_rr_slice_set_ms(0));
+    assert(kernel_sched_rr_slice_ns()==100*MS && !kernel_sched_rr_slice_set_ms(-1));
+    assert(kernel_sched_rr_slice_ns()==100*MS && !kernel_sched_rr_slice_set_ms(INT32_MIN));
+    assert(!kernel_sched_rr_slice_set_ms(INT32_MAX) && kernel_sched_rr_slice_ns()==(uint64_t)INT32_MAX*MS);
+    assert(!kernel_sched_rr_slice_set_ms(0));
     assert(kernel_sched_policy_set(&fifo,1|0x40000000,99,0)==0);
     kernel_sched_policy_fork(&child,&fifo);
     assert(child.policy==0 && child.priority==0 && !child.reset_on_fork);

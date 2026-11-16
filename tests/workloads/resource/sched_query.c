@@ -454,10 +454,62 @@ static void controls(void)
     CHECK(control_nice(0)==0&&attr_get(0).policy==SCHED_OTHER);printf("SCHED-CONTROL END cases=%u\n",cases);
 }
 
+static const char rr_path[]="/proc/sys/kernel/sched_rr_timeslice_ms";
+static void rr_write(const char *value)
+{
+    int fd=open(rr_path,O_WRONLY);CHECK(fd>=0);
+    CHECK(write(fd,value,strlen(value))==(ssize_t)strlen(value)&&!close(fd));
+}
+static long rr_read(void)
+{
+    char text[32]={0};int fd=open(rr_path,O_RDONLY);CHECK(fd>=0);
+    CHECK(read(fd,text,sizeof(text)-1)>0&&!close(fd));return strtol(text,NULL,10);
+}
+static void rr_sysctl(void)
+{
+    long saved=rr_read();CHECK(saved>0);
+    struct attr original=attr_get(0);CHECK(original.policy==SCHED_OTHER);
+    rr_write("50\n");CHECK(rr_read()==50);
+    pid_t child=fork();CHECK(child>=0);
+    if(!child) {
+        policy(0,SCHED_RR,1);
+        struct timespec interval;CHECK(!syscall(SYS_sched_rr_get_interval,0,&interval));
+        CHECK(!interval.tv_sec&&interval.tv_nsec==50000000);
+        struct sched_param param;CHECK(!syscall(SYS_sched_getparam,0,&param)&&param.sched_priority==1);
+        pid_t nested=fork();CHECK(nested>=0);
+        if(!nested){CHECK(syscall(SYS_sched_getscheduler,0)==SCHED_RR);_exit(0);}
+        child_ok(nested);_exit(0);
+    }
+    child_ok(child);CHECK(syscall(SYS_sched_getscheduler,0)==SCHED_OTHER);
+    for(unsigned i=0;i<2;i++) {
+        const char *invalid=i?"x":"2147483648";
+        int fd=open(rr_path,O_WRONLY);CHECK(fd>=0);
+        ERROR(write(fd,invalid,strlen(invalid)),EINVAL);CHECK(!close(fd)&&rr_read()==50);
+    }
+    rr_write("1500");policy(0,SCHED_RR,1);
+    struct timespec interval;CHECK(!syscall(SYS_sched_rr_get_interval,0,&interval));
+    CHECK(interval.tv_sec==1&&interval.tv_nsec==500000000);
+    policy(0,SCHED_OTHER,0);
+    rr_write("2147483647");policy(0,SCHED_RR,1);
+    CHECK(!syscall(SYS_sched_rr_get_interval,0,&interval));
+    CHECK(interval.tv_sec==2147483&&interval.tv_nsec==647000000);
+    policy(0,SCHED_OTHER,0);
+    rr_write("0");CHECK(rr_read()==100);
+    rr_write("-1");CHECK(rr_read()==100);
+    child=fork();CHECK(child>=0);
+    if(!child){CHECK(!setuid(1000));ERROR(open(rr_path,O_WRONLY),EACCES);_exit(0);}
+    child_ok(child);
+    char text[32];snprintf(text,sizeof(text),"%ld",saved);rr_write(text);
+    CHECK(rr_read()==saved);pass("rr-timeslice-global-query-fork-normalization-validation-and-permissions");
+}
+
 int main(int argc,char **argv)
 {
     if(argc==2&&!strcmp(argv[1],"--nice-exec")) {
         CHECK(control_nice(0)==6&&attr_get(0).policy==SCHED_BATCH);control_slice(0,3000000);return 0;
+    }
+    if(argc==2&&!strcmp(argv[1],"--rr-sysctl")) {
+        setvbuf(stdout,0,_IONBF,0);rr_sysctl();return 0;
     }
     host_safe=argc==2&&!strcmp(argv[1],"--host-safe");CHECK(argc==1||host_safe);
     setvbuf(stdout,0,_IONBF,0);alarm(30);page_size=(size_t)sysconf(_SC_PAGESIZE);

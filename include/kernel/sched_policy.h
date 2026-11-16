@@ -46,6 +46,8 @@ struct kernel_rt_configuration {
     uint64_t period_ns;
     int64_t runtime_ns;
 };
+uint64_t kernel_sched_rr_slice_ns(void);
+int kernel_sched_rr_slice_set_ms(int64_t milliseconds);
 unsigned kernel_sched_weight(const struct kernel_sched_policy *);
 uint64_t kernel_sched_fair_delta(struct kernel_sched_policy *,uint64_t actual_ns);
 int kernel_sched_policy_set(struct kernel_sched_policy *state,

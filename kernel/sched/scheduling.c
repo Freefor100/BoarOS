@@ -1254,7 +1254,7 @@ static void sched_commit_locked(struct kernel_task *task,const struct kernel_sch
      * not replenish its consumed slice or move a queued/PI-boosted task. */
     task->scheduling.fair_slice_ns=updated->fair_slice_ns;
     if(updated->policy==KERNEL_SCHED_RR && !task->scheduling.rr_remaining_ns)
-        task->scheduling.rr_remaining_ns=KERNEL_SCHED_RR_NS;
+        task->scheduling.rr_remaining_ns=kernel_sched_rr_slice_ns();
     struct kernel_cpu *cpu=task->cpu?task->cpu:kernel_cpu_current();
 #if BOAROS_MAX_CPUS > 1
     if(task->ready_node.queued)cpu=task->ready_cpu;
