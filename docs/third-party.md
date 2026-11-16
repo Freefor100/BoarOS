@@ -6,8 +6,8 @@
 - 固定版本：`STABLE-2_2_1_RELEASE`，peeled commit `77dcd25a72509eb83f72b033d219b1d40cd8eb95`；`references/sources.tsv` 固定恢复身份，2026-09-27 核对。
 - 导入路径：`third_party/lwip/`，保留 `src/core/`、`src/include/`、官方 Ethernet 入口和 `COPYING`；未导入 socket/netconn API 实现、应用、PPP 和上游具体网卡驱动。
 - 许可证：BSD-3-Clause，原有版权和许可声明保留在每个源码文件及 `COPYING`。
-- 用途：向 BoarOS 的 socket 层提供 IPv4／IPv6 的 UDP 和 TCP 协议实现，使用 NO_SYS raw API。IP 输入、UDP 和网卡由网络执行者服务，已建立的 TCP 连接可分属不同 CPU。
-- 本地修改：IPv4重组增加协议/输入网卡键、重复/重叠/终点校验及按网卡清理，另在 netif/timeouts 增加有预算的轮回入口，旧公开入口保持无限预算包装；mem/memp 增加可选的每次真实归还 hook，netif 增加 loopback 入队 hook。netif 地址设置增加保留既有 PCB 的入口，供 Linux 运行时地址配置使用，原设备移除的 PCB 清理不变。TCP Nagle 使用 Minshall 规则，tcp_pcb 尾部保存新发小包的确认边界，tcp.c/tcp_in.c 初始化、tcp_out.c 在实际成功输出后更新，tcp_priv.h 按序列号判断。对应头文件声明随实现维护；补丁不升级固定版本，其余导入文件保持原版。BoarOS 的 lwIP 配置、端口和 socket 所有权适配位于 `net/` 与 `fs/`，不以 lwIP 的 socket fd 空间代替 BoarOS 文件表。
+- 用途：向 BoarOS 的 socket 层提供 IPv4／IPv6 的 UDP 和 TCP，以及 IPv4 ICMP raw PCB，使用 NO_SYS raw API。IP 输入、UDP、ICMP raw 和网卡由网络执行者服务，已建立的 TCP 连接可分属不同 CPU。RAW、组播发送选项和广播许可由 BoarOS 配置启用；不启用 IGMP 或组播成员管理。
+- 本地修改：IPv4重组增加协议/输入网卡键、重复/重叠/终点校验及按网卡清理，另在 netif/timeouts 增加有预算的轮回入口，旧公开入口保持无限预算包装；mem/memp 增加可选的每次真实归还 hook，netif 增加 loopback 入队 hook。UDP/TCP 端口冲突按实际绑定设备隔离，不同非零接口的相同端口可以独立使用；IPv4 的 Linux 回环配置接纳完整 127/8 别名，并按回环地址和掩码识别子网广播。IPv4 datagram 的最终 pbuf 携带本机 DF 策略：不超过所选接口 MTU 时生成 DF，较大的本机报文仍可分片；IPv6 不使用该标记，IP 头校验和包含实际 offset 字段。组播 TTL 为零时只保留本机回环，不向物理接口发送。netif 地址设置增加保留既有 PCB 的入口，供 Linux 运行时地址配置使用，原设备移除的 PCB 清理不变。TCP Nagle 使用 Minshall 规则，tcp_pcb 尾部保存新发小包的确认边界，tcp.c/tcp_in.c 初始化、tcp_out.c 在实际成功输出后更新，tcp_priv.h 按序列号判断。对应头文件声明随实现维护；补丁不升级固定版本，其余导入文件保持原版。BoarOS 的 lwIP 配置、端口和 socket 所有权适配位于 `net/` 与 `fs/`，不以 lwIP 的 socket fd 空间代替 BoarOS 文件表。
 
 UDP PCB 按本地端口分桶，绑定冲突、临时端口查找和输入分发共用同一索引。IPv4/IPv6 通配、绑定地址、已连接对端和复用规则在桶内匹配。断开自动分配端口的连接时，先从该桶摘除 PCB。
 
@@ -89,6 +89,7 @@ glibc 2.44 作为外部测试输入使用：官方源码归档保存在被忽略
   `third_party/lwext4` 的 `58bcf89a121b72d4fb66334f1693d3b30e4cb9c5` 加本地补丁。
   验证为 `make test-lwext4-cache-host test-lwext4-batch-read-host test-io-sleep-riscv`。
 
+- 无工作区的单输出批读用独立的 1/2/4/8 槽固定栈入口借给同一规划核心，已有工作区直接复用；不使用 VLA，不增加分配，描述符保持到 DMA 结束。
 - 普通文件批读直接借用调用者的 `file_read_workspace`，VFS/lwext4 共用文件区段，
   lwext4/块层共用字节区段；删除每次请求的规划分配和两层转换数组。可见 EOF 独立
   限制，不改变请求长度；短设备完成转为 EIO，各区段保留准确完成量。1/4/8 KiB、

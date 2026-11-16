@@ -65,7 +65,11 @@ ip4_addr_isbroadcast_u32(u32_t addr, const struct netif *netif)
       (addr == IPADDR_ANY)) {
     return 1;
     /* no broadcast support on this network interface? */
-  } else if ((netif->flags & NETIF_FLAG_BROADCAST) == 0) {
+  } else if ((netif->flags & NETIF_FLAG_BROADCAST) == 0
+#if BOAROS_LWIP_LINUX_LOOPBACK
+             && !ip4_addr_isloopback(netif_ip4_addr(netif))
+#endif
+             ) {
     /* the given address cannot be a broadcast address
      * nor can we check against any broadcast addresses */
     return 0;

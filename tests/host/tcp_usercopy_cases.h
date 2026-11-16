@@ -238,9 +238,9 @@ static void tcp_wait_owner_case(struct kernel_heap *heap,int writing)
 {
     struct kernel_socket *listener=0,*client=0,*server=0;
     struct kernel_socket_address address={.family=KERNEL_SOCKET_AF_INET,.port=(uint16_t)(24020+writing),.bytes={127,0,0,1}};
-    assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_INET,1,&listener));
+    assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_INET,1, 0,&listener));
     assert(!kernel_socket_bind(listener,&address) && !kernel_socket_listen(listener,4));
-    assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_INET,1,&client));
+    assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_INET,1, 0,&client));
     int connected=kernel_socket_connect(client,&address,0);
     assert(!connected || connected==-KERNEL_EINPROGRESS);
     for(unsigned i=0;i<8;i++) (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
@@ -387,9 +387,9 @@ static void tcp_read_batch_case(struct kernel_heap *heap)
 {
     struct kernel_socket *listener=0,*client=0,*server=0;
     struct kernel_socket_address address={.family=KERNEL_SOCKET_AF_INET,.port=24030,.bytes={127,0,0,1}};
-    assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_INET,1,&listener));
+    assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_INET,1, 0,&listener));
     assert(!kernel_socket_bind(listener,&address) && !kernel_socket_listen(listener,4));
-    assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_INET,1,&client));
+    assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_INET,1, 0,&client));
     int connected=kernel_socket_connect(client,&address,0);assert(!connected || connected==-KERNEL_EINPROGRESS);
     for(unsigned i=0;i<8;i++) (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
     assert(!kernel_socket_accept(listener,&server, NULL) && !kernel_socket_set_option(client,KERNEL_SOCKET_NODELAY,1));
@@ -568,9 +568,9 @@ static void tcp_nonblock_timeout_case(struct kernel_heap *heap,int unix_socket)
     if(unix_socket) assert(!kernel_socket_pair(heap,1,&client,&server));
     else {
         struct kernel_socket_address address={.family=KERNEL_SOCKET_AF_INET,.port=24040,.bytes={127,0,0,1}};
-        assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_INET,1,&listener));
+        assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_INET,1, 0,&listener));
         assert(!kernel_socket_bind(listener,&address) && !kernel_socket_listen(listener,4));
-        assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_INET,1,&client));
+        assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_INET,1, 0,&client));
         int connected=kernel_socket_connect(client,&address,0);assert(!connected || connected==-KERNEL_EINPROGRESS);
         for(unsigned i=0;i<8;i++) (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
         assert(!kernel_socket_accept(listener,&server, NULL) && !kernel_socket_set_option(client,KERNEL_SOCKET_NODELAY,1));
@@ -626,9 +626,9 @@ static void tcp_usercopy_case(struct kernel_heap *heap)
     kernel_socket_network_initialize();
     struct kernel_socket *listener=0,*client=0,*server=0;
     struct kernel_socket_address address={.family=KERNEL_SOCKET_AF_INET,.port=24011,.bytes={127,0,0,1}};
-    assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_INET,1,&listener));
+    assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_INET,1, 0,&listener));
     assert(!kernel_socket_bind(listener,&address) && !kernel_socket_listen(listener,4));
-    assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_INET,1,&client));
+    assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_INET,1, 0,&client));
     int connected=kernel_socket_connect(client,&address,0);
     assert(!connected || connected==-KERNEL_EINPROGRESS);
     for(unsigned i=0;i<8;i++) (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
@@ -810,9 +810,9 @@ static void tcp_write_batch_case(struct kernel_heap *heap)
     for(unsigned mode=0;mode<6;mode++) {
         struct kernel_socket *listener=NULL,*client=NULL,*server=NULL;
         struct kernel_socket_address address={.family=KERNEL_SOCKET_AF_INET,.port=(uint16_t)(24050+mode),.bytes={127,0,0,1}};
-        assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_INET,1,&listener) &&
+        assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_INET,1, 0,&listener) &&
             !kernel_socket_bind(listener,&address) && !kernel_socket_listen(listener,4) &&
-            !kernel_socket_create(heap,KERNEL_SOCKET_AF_INET,1,&client));
+            !kernel_socket_create(heap,KERNEL_SOCKET_AF_INET,1, 0,&client));
         int connected=kernel_socket_connect(client,&address,0);assert(!connected || connected==-KERNEL_EINPROGRESS);
         for(unsigned i=0;i<8;i++) (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
         assert(!kernel_socket_accept(listener,&server, NULL) && !kernel_socket_set_option(client,KERNEL_SOCKET_NODELAY,1));

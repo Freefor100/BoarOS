@@ -496,8 +496,8 @@ static void stream_copy_probe(void)
             kernel_copy_to_user(&sync_mm, OP_USER, "pin", 3, &copied) == KERNEL_UACCESS_STATUS_OK, 316);
         struct kernel_open_file_description *listener = 0, *client = 0, *reader = 0;
         struct kernel_socket *accepted = 0;
-        check(kernel_files_socket_create(&operation_files, 2, 1, 0, &listener_fd) == KERNEL_FILES_STATUS_OK && listener_fd >= 0 &&
-            kernel_files_socket_create(&operation_files, 2, 1, 0, &send_copy_fd) == KERNEL_FILES_STATUS_OK && send_copy_fd >= 0 &&
+        check(kernel_files_socket_create(&operation_files, 2, 1, 0, 0, &listener_fd) == KERNEL_FILES_STATUS_OK && listener_fd >= 0 &&
+            kernel_files_socket_create(&operation_files, 2, 1, 0, 0, &send_copy_fd) == KERNEL_FILES_STATUS_OK && send_copy_fd >= 0 &&
             kernel_files_pin(&operation_files, listener_fd, &listener, &result) == KERNEL_FILES_STATUS_OK && !result &&
             kernel_files_pin(&operation_files, send_copy_fd, &client, &result) == KERNEL_FILES_STATUS_OK && !result, 317);
         struct kernel_socket *socket = kernel_open_file_socket(client), *listening = kernel_open_file_socket(listener);
@@ -512,7 +512,7 @@ static void stream_copy_probe(void)
         check(send_copy_task->socket_write_request && send_copy_task->socket_write_request->reserved == 3, 321);
         check(kernel_files_close(&operation_files, send_copy_fd, &result) == KERNEL_FILES_STATUS_OK && !result, 322);
         int64_t replacement;
-        check(kernel_files_socket_create(&operation_files, 2, 2, 0, &replacement) == KERNEL_FILES_STATUS_OK && replacement == send_copy_fd, 323);
+        check(kernel_files_socket_create(&operation_files, 2, 2, 0, 0, &replacement) == KERNEL_FILES_STATUS_OK && replacement == send_copy_fd, 323);
         if (send_copy_mode == 1) check(kernel_socket_shutdown(socket, 1) == 0, 324);
         if (send_copy_mode == 2) { check(kernel_mm_munmap(&sync_mm, OP_USER, 4096) == KERNEL_MM_STATUS_OK, 325); }
         check(kernel_wait_queue_wake_all(&send_copy_held) == KERNEL_SCHEDULER_STATUS_OK, 326);

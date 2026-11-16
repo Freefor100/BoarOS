@@ -819,7 +819,8 @@ tcp_bind(struct tcp_pcb *pcb, const ip_addr_t *ipaddr, u16_t port)
 #endif
     for (i = 0; i < max_pcb_list; i++) {
       for (cpcb = *tcp_pcb_lists[i]; cpcb != NULL; cpcb = cpcb->next) {
-        if (cpcb->local_port == port) {
+        if (cpcb->local_port == port &&
+            (!pcb->netif_idx || !cpcb->netif_idx || pcb->netif_idx==cpcb->netif_idx)) {
 #if SO_REUSE
           /* Omit checking for the same port if both pcbs have REUSEADDR set.
              For SO_REUSEADDR, the duplicate-check for a 5-tuple is done in
@@ -975,6 +976,7 @@ tcp_listen_with_backlog_and_err(struct tcp_pcb *pcb, u8_t backlog, err_t *err)
        this port is only used once for every local IP. */
     for (lpcb = tcp_listen_pcbs.listen_pcbs; lpcb != NULL; lpcb = lpcb->next) {
       if ((lpcb->local_port == pcb->local_port) &&
+          (!pcb->netif_idx || !lpcb->netif_idx || pcb->netif_idx==lpcb->netif_idx) &&
           ip_addr_eq(&lpcb->local_ip, &pcb->local_ip)) {
         /* this address/port is already used */
         lpcb = NULL;
@@ -1312,6 +1314,7 @@ tcp_connect(struct tcp_pcb *pcb, const ip_addr_t *ipaddr, u16_t port,
       for (i = 2; i < NUM_TCP_PCB_LISTS; i++) {
         for (cpcb = *tcp_pcb_lists[i]; cpcb != NULL; cpcb = cpcb->next) {
           if ((cpcb->local_port == pcb->local_port) &&
+              (!pcb->netif_idx || !cpcb->netif_idx || pcb->netif_idx==cpcb->netif_idx) &&
               (cpcb->remote_port == port) &&
               ip_addr_eq(&cpcb->local_ip, &pcb->local_ip) &&
               ip_addr_eq(&cpcb->remote_ip, ipaddr)) {

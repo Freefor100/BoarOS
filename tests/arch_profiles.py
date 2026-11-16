@@ -47,6 +47,11 @@ class ArchitectureProfile:
     def rng(self):
         return ('virtio-rng-pci,rng=entropy,addr=9,disable-legacy=on' if self.name=='loongarch'
                 else 'virtio-rng-device,rng=entropy,bus=virtio-mmio-bus.5')
+    def root_poweroff_success(self,text):
+        # An init that calls reboot never reaches the PID1 exit report.
+        # Its consumer must check its own complete result before this cleanup.
+        released=('LA root owners released;' in text and ' heap-live=0' in text) if self.name=='loongarch' else 'BoarOS: task stacks released=' in text
+        return released and 'BoarOS: root owners released; reboot action=poweroff command=\n' in text.replace('\r','') and 'root finish failure' not in text
     def root_success(self,text,status):
         if self.name=='loongarch':
             return f'LA PID 1 exited reason=0x0000000000000001 status=0x{status:016x}' in text and 'LA root owners released' in text

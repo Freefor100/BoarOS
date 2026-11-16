@@ -130,7 +130,6 @@ static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, 
 {
     kernel_assert_can_block();
     COST_SCOPE(acquire_cost, OPERATION_TICKS);
-    uintptr_t irq = arch_interrupt_save();
     struct kernel_io_context *owner = kernel_io_context_current();
     if (!lock || !guard || guard->lock || !lock->waiters.initialized) __builtin_trap();
     /* Held keys increase strictly. The top check also rejects reacquiring
@@ -151,13 +150,16 @@ static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, 
     int busy = lock->writer || lock->pending_head || lock->handoff_owner || (write && lock->readers);
     if (try_only && busy) {
         kernel_raw_lock_release(&metadata);
-        arch_interrupt_restore(irq);
         return 0;
     }
 #if BOAROS_COST_DIAGNOSTICS
     uint64_t grant_ticks;
 #endif
+    uintptr_t irq=metadata.interrupts;
     if (busy) {
+        /* Only the queued path keeps IRQ disabled between metadata scopes.
+         * The uncontended path reuses the raw guard's one IRQ transition. */
+        metadata.interrupts=irq & ~ARCH_INTERRUPT_ENABLE_MASK;
 #if BOAROS_COST_DIAGNOSTICS
         grant_ticks = acquire_waiter(lock, owner, write, &metadata, irq, rank, metric);
 #else
@@ -173,12 +175,15 @@ static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, 
         grant_ticks = kernel_cost_clock();
 #endif
     }
-    kernel_raw_lock_release(&metadata);
     *guard = (struct kernel_lock_guard){lock, owner, owner->locks, write
 #if BOAROS_COST_DIAGNOSTICS
         ,0,0
 #endif
     };
+    /* The raw unlock may enable IRQ/preemption: publish the actual owner
+     * chain first, not in a second surrounding IRQ-disabled region. */
+    owner->locks=guard;
+    kernel_raw_lock_release(&metadata);
 #if BOAROS_COST_DIAGNOSTICS
     uint64_t cost_irq=kernel_cost_lock();
     struct kernel_cost_task *task = kernel_cost_current();
@@ -189,8 +194,7 @@ static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, 
     guard->cost_start = grant_ticks; guard->cost_registered = hold.actor != 0;
     kernel_cost_unlock(cost_irq);
 #endif
-    owner->locks = guard;
-    arch_interrupt_restore(irq);
+    if (busy) arch_interrupt_restore(irq);
     return 1;
 }
 int kernel_rwlock_try_read(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
@@ -204,7 +208,6 @@ void kernel_rwlock_write(struct kernel_rwlock *lock, struct kernel_lock_guard *g
 /* RV/LA 函数体不足 1 KiB；入口对齐避免频繁释放时跨代码页拆分短指令序列。 */
 __attribute__((aligned(1024))) void kernel_lock_release(struct kernel_lock_guard *guard)
 {
-    uintptr_t irq = arch_interrupt_save();
     struct kernel_io_context *owner = kernel_io_context_current();
     if (!guard || !guard->lock || guard->owner != owner || owner->locks != guard)
         __builtin_trap();
@@ -261,15 +264,13 @@ __attribute__((aligned(1024))) void kernel_lock_release(struct kernel_lock_guard
             }
             if (done) { lock->handoff_owner = 0; break; }
             kernel_raw_lock_release(&metadata);
-            /* handoff_owner保留原队列边界；分段之间允许原本开启的中断响应。 */
-            arch_interrupt_restore(irq);
-            irq = arch_interrupt_save();
+            /* handoff_owner keeps the FIFO boundary while raw unlock/lock
+             * restores the caller's IRQ state between bounded segments. */
             kernel_raw_lock_acquire(&lock->metadata, &metadata);
             if (lock->handoff_owner != owner) __builtin_trap();
         }
     }
     kernel_raw_lock_release(&metadata);
-    arch_interrupt_restore(irq);
 #if BOAROS_COST_DIAGNOSTICS
     /* Qualification has ended; observer publication must not extend its hold. */
     kernel_cost_leave_at(&hold,released);

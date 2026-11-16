@@ -21,6 +21,32 @@ static err_t held_completion_tcp_output(struct tcp_pcb *);
 #include "../../kernel/pid.c"
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %s:%d: %s\n", __func__, __LINE__, #x); exit(1); } } while (0)
+static struct {unsigned references,calls;uint32_t keep;} raw_filter_test;
+static pthread_mutex_t raw_gate=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t raw_changed=PTHREAD_COND_INITIALIZER;
+static unsigned raw_pause,raw_filter_entered,raw_close_waiting,raw_resume;
+static _Thread_local unsigned raw_closing_actor;
+static struct kernel_socket *accept_binding_probe;
+static unsigned accept_binding_changed;
+void __wrap_kernel_bpf_program_get(struct kernel_bpf_program *program)
+{CHECK(program==(void *)&raw_filter_test);__atomic_fetch_add(&raw_filter_test.references,1,__ATOMIC_RELAXED);}
+void __wrap_kernel_bpf_program_put(struct kernel_bpf_program *program)
+{CHECK(program==(void *)&raw_filter_test && __atomic_fetch_sub(&raw_filter_test.references,1,__ATOMIC_RELAXED));}
+uint32_t __wrap_kernel_bpf_filter(struct kernel_bpf_program *program,const struct kernel_bpf_packet *packet)
+{
+    CHECK(program==(void *)&raw_filter_test && raw_filter_test.references);
+    CHECK(packet->protocol==0x0800 && packet->network_offset==0 && packet->payload_offset==28 && packet->length>=28);
+    unsigned char header[20];CHECK(!packet->read(packet->object,0,header,sizeof(header)));
+    CHECK(header[0]==0x45 && header[9]==1);
+    raw_filter_test.calls++;
+    CHECK(!pthread_mutex_lock(&raw_gate));
+    if(raw_pause) {
+        raw_filter_entered=1;CHECK(!pthread_cond_broadcast(&raw_changed));
+        while(!raw_resume)CHECK(!pthread_cond_wait(&raw_changed,&raw_gate));
+        raw_pause=0;
+    }
+    CHECK(!pthread_mutex_unlock(&raw_gate));return raw_filter_test.keep;
+}
 struct kernel_raw_lock kernel_wait_domain={.rank=KERNEL_RAW_RANK_SCHEDULER,.initialized=KERNEL_RAW_INITIALIZED};
 static struct kernel_heap test_heap;
 static uint64_t model_pid_bitmap[KERNEL_PID_BITMAP_WORDS(1024)];
@@ -197,6 +223,10 @@ static unsigned handoff_bytes;
 void kernel_rwlock_write(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
 {
     CHECK(!guard->lock);
+    if(raw_closing_actor && lock==&protocol_mutex.lock) {
+        CHECK(!pthread_mutex_lock(&raw_gate));raw_close_waiting=1;
+        CHECK(!pthread_cond_broadcast(&raw_changed) && !pthread_mutex_unlock(&raw_gate));
+    }
     if(lock==&rights_mutex.lock) {
         CHECK(!ordinary_control_no_graph);__atomic_fetch_add(&graph_acquisitions,1,__ATOMIC_RELAXED);
     }
@@ -271,7 +301,12 @@ int kernel_credentials_capable(const struct kernel_credentials *credentials, uns
 enum kernel_signal_status kernel_signal_send_task(struct kernel_task *task, uint32_t signal, kernel_pid_t sender)
 { (void)task; (void)signal; (void)sender; abort(); }
 enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *heap, size_t n, size_t size, void **out)
-{ CHECK(heap == &test_heap); if(heap_fail_after && !--heap_fail_after) { *out=NULL;return KERNEL_HEAP_STATUS_EMPTY; } *out = calloc(n, size); CHECK(*out); heap_last_allocation_size=n*size; ++heap_live; ++heap_allocations; return KERNEL_HEAP_STATUS_OK; }
+{ CHECK(heap == &test_heap);
+  if(accept_binding_probe && size==sizeof(struct kernel_socket)) {
+      struct kernel_socket *listener=accept_binding_probe;accept_binding_probe=NULL;
+      CHECK(!kernel_socket_set_bound_device(listener,"eth0"));accept_binding_changed++;
+  }
+  if(heap_fail_after && !--heap_fail_after) { *out=NULL;return KERNEL_HEAP_STATUS_EMPTY; } *out = calloc(n, size); CHECK(*out); heap_last_allocation_size=n*size; ++heap_live; ++heap_allocations; return KERNEL_HEAP_STATUS_OK; }
 enum kernel_heap_status kernel_heap_allocate(struct kernel_heap *heap, size_t size, void **out)
 { return kernel_heap_allocate_zeroed(heap, 1, size, out); }
 void kernel_heap_release(struct kernel_heap *heap, void *allocation)
@@ -563,11 +598,23 @@ static err_t physical_init(struct netif *interface)
 
 static unsigned char route_frame[128];
 static unsigned route_frame_size;
+static unsigned route_fragments,route_fragment_bytes,route_df_packets,route_validate_packets;
 static err_t route_link_output(struct netif *interface, struct pbuf *packet)
 {
     (void)interface;
     route_frame_size = packet->tot_len < sizeof(route_frame) ? packet->tot_len : sizeof(route_frame);
     CHECK(pbuf_copy_partial(packet, route_frame, route_frame_size, 0) == route_frame_size);
+    if(route_validate_packets && route_frame_size>=34 && route_frame[12]==8 && !route_frame[13]) {
+        unsigned offset=((unsigned)route_frame[20]<<8)|route_frame[21];
+        unsigned total=((unsigned)route_frame[16]<<8)|route_frame[17];
+        unsigned header=(route_frame[14]&15U)*4U;
+        CHECK(header>=20 && header<=60 && route_frame_size>=14+header && !inet_chksum(route_frame+14,header));
+        if(offset&0x4000)route_df_packets++;
+        if(offset&0x3fff) {
+            CHECK(!(offset&0x4000) && total>header);
+            route_fragments++;route_fragment_bytes+=total-header;
+        }
+    }
     return ERR_OK;
 }
 static err_t route_interface_init(struct netif *interface)
@@ -630,14 +677,14 @@ static void tcp_ephemeral_ports(void)
         struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
         tcp_init();kernel_socket_protocol_leave(&scope);
         if(cases[i].occupied) {
-            CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_STREAM,&occupied));
+            CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_STREAM, 0,&occupied));
             local.port=cases[i].occupied;CHECK(!kernel_socket_bind(occupied,&local));local.port=0;
         }
         if(connecting) {
-            CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_STREAM,&listener));
+            CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_STREAM, 0,&listener));
             CHECK(!kernel_socket_bind(listener,&remote) && !kernel_socket_listen(listener,1));
         }
-        CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_STREAM,&endpoint));
+        CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_STREAM, 0,&endpoint));
         if(connecting) {
             int result=kernel_socket_connect(endpoint,&remote,0);
             CHECK(!result || result==-KERNEL_EINPROGRESS);
@@ -672,7 +719,7 @@ static void ipv4_address_shutdown(void)
     CHECK(netif_add(&interface, &local, &mask, &empty, NULL, route_interface_init, ip_input));
     netif_set_up(&interface); netif_set_link_up(&interface);
     struct kernel_socket *socket = NULL;
-    CHECK(!kernel_socket_create(&test_heap, KERNEL_SOCKET_AF_INET, SOCKET_STREAM, &socket));
+    CHECK(!kernel_socket_create(&test_heap, KERNEL_SOCKET_AF_INET, SOCKET_STREAM, 0, &socket));
     socket->connected = 1; socket->tcp->state = ESTABLISHED;
     ip_addr_copy_from_ip4(socket->tcp->local_ip, local);
     IP_ADDR4(&socket->tcp->remote_ip, 10, 77, 0, 1);
@@ -683,7 +730,7 @@ static void ipv4_address_shutdown(void)
     CHECK(!kernel_socket_interface_set_ipv4(name, 0x8916, changed.addr));
     CHECK(socket->tcp && ip4_addr_eq(ip_2_ip4(&socket->tcp->local_ip), &local));
     struct kernel_socket *survivor = NULL;
-    CHECK(!kernel_socket_create(&test_heap, KERNEL_SOCKET_AF_INET, SOCKET_STREAM, &survivor));
+    CHECK(!kernel_socket_create(&test_heap, KERNEL_SOCKET_AF_INET, SOCKET_STREAM, 0, &survivor));
     survivor->connected = 1; survivor->tcp->state = ESTABLISHED;
     ip_addr_copy_from_ip4(survivor->tcp->local_ip, changed);
     IP_ADDR4(&survivor->tcp->remote_ip, 10, 77, 0, 1);
@@ -712,7 +759,7 @@ static void nodelay_pending(unsigned blocked)
     CHECK(netif_add(&network.interface, &local, &mask, &gateway, &network, physical_init, ip_input));
     netif_set_up(&network.interface); netif_set_link_up(&network.interface);
     struct kernel_socket *socket = NULL;
-    CHECK(!kernel_socket_create(&test_heap, KERNEL_SOCKET_AF_INET, SOCKET_STREAM, &socket));
+    CHECK(!kernel_socket_create(&test_heap, KERNEL_SOCKET_AF_INET, SOCKET_STREAM, 0, &socket));
     socket->connected = 1; socket->tcp->state = ESTABLISHED;
     ip_addr_copy_from_ip4(socket->tcp->local_ip, local);
     IP_ADDR4(&socket->tcp->remote_ip, 10, 77, 0, 1);
@@ -872,7 +919,7 @@ static void copy_capacity(unsigned eligible, unsigned gather)
     CHECK(netif_add(&network.interface, &local, &mask, &gateway, &network, physical_init, ip_input));
     netif_set_up(&network.interface); netif_set_link_up(&network.interface);
     struct kernel_socket *socket = NULL;
-    CHECK(kernel_socket_create(&test_heap, KERNEL_SOCKET_AF_INET, SOCKET_STREAM, &socket) == 0);
+    CHECK(kernel_socket_create(&test_heap, KERNEL_SOCKET_AF_INET, SOCKET_STREAM, 0, &socket) == 0);
     /* Establish the transport fixture without a simulated remote handshake;
      * all send admission, protocol output and NIC wait routing remain real. */
     socket->connected = 1; socket->tcp->state = ESTABLISHED;
@@ -948,8 +995,8 @@ static void udp_bind_ownership(void)
     struct kernel_socket *v6=NULL,*v4=NULL;
     struct kernel_socket_address any6={.family=KERNEL_SOCKET_AF_INET6,.port=23001};
     struct kernel_socket_address any4={.family=KERNEL_SOCKET_AF_INET,.port=23001};
-    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET6,SOCKET_DGRAM,&v6));
-    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,&v4));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET6,SOCKET_DGRAM, 0,&v6));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM, 0,&v4));
     CHECK(!kernel_socket_bind(v6,&any6));
     CHECK(kernel_socket_bind(v4,&any4)==-KERNEL_EADDRINUSE);
     CHECK(!kernel_socket_set_option(v4,KERNEL_SOCKET_REUSEADDR,1));
@@ -958,18 +1005,18 @@ static void udp_bind_ownership(void)
     CHECK(!kernel_socket_bind(v4,&any4));
     kernel_socket_destroy(v6);kernel_socket_destroy(v4);
     v6=NULL;v4=NULL;
-    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET6,SOCKET_DGRAM,&v6));
-    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,&v4));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET6,SOCKET_DGRAM, 0,&v6));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM, 0,&v4));
     CHECK(!kernel_socket_set_option(v6,KERNEL_SOCKET_V6ONLY,1));
     CHECK(!kernel_socket_bind(v6,&any6) && !kernel_socket_bind(v4,&any4));
     kernel_socket_destroy(v4);kernel_socket_destroy(v6);
 
     struct kernel_socket *sender=NULL,*receiver=NULL;
     struct kernel_socket_address old={0},unspec={0};
-    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,&sender));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM, 0,&sender));
     CHECK(!kernel_socket_connect(sender,&any4,0) && !kernel_socket_getname(sender,&old) && old.port);
     CHECK(!kernel_socket_connect(sender,&unspec,0));
-    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,&receiver));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM, 0,&receiver));
     CHECK(!kernel_socket_bind(receiver,&old));
     CHECK(!kernel_socket_connect(sender,&old,0));
     CHECK(write_buffer(sender,"x",1,0)==1 && receiver->rx_bytes==1 && !sender->rx_bytes);
@@ -980,7 +1027,7 @@ static void udp_final_payload(void)
 {
     kernel_socket_network_initialize();
     struct kernel_socket *socket=0;
-    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,&socket));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM, 0,&socket));
     struct kernel_open_file_description *owner=(void *)socket;
     char first[]="alpha",second[]="beta";
     struct kernel_uaccess_iovec iov[]={{(uintptr_t)first,5},{(uintptr_t)second,4}};
@@ -1082,7 +1129,7 @@ static void receive_payload(void)
     CHECK(!memcmp(first,"al",2) && !memcmp(second,"phabeta",7) && !receiver->rx_bytes);
     kernel_socket_destroy(sender);kernel_socket_destroy(receiver);receiver=0;
 
-    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,&receiver));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM, 0,&receiver));
     struct pbuf *head=pbuf_alloc(PBUF_RAW,3,PBUF_RAM),*tail=pbuf_alloc(PBUF_RAW,6,PBUF_RAM);
     CHECK(head && tail && pbuf_take(head,"abc",3)==ERR_OK && pbuf_take(tail,"defghi",6)==ERR_OK);
     pbuf_cat(head,tail);
@@ -1101,10 +1148,10 @@ static void receive_payload(void)
 static void connected_pair(struct kernel_socket **listener, struct kernel_socket **client, struct kernel_socket **server)
 {
     struct kernel_socket_address address = {.family = KERNEL_SOCKET_AF_INET, .bytes = {127, 0, 0, 1}};
-    CHECK(kernel_socket_create(&test_heap, KERNEL_SOCKET_AF_INET, SOCKET_STREAM, listener) == 0);
+    CHECK(kernel_socket_create(&test_heap, KERNEL_SOCKET_AF_INET, SOCKET_STREAM, 0, listener) == 0);
     CHECK(kernel_socket_bind(*listener, &address) == 0 && kernel_socket_listen(*listener, 4) == 0);
     CHECK(kernel_socket_getname(*listener, &address) == 0);
-    CHECK(kernel_socket_create(&test_heap, KERNEL_SOCKET_AF_INET, SOCKET_STREAM, client) == 0);
+    CHECK(kernel_socket_create(&test_heap, KERNEL_SOCKET_AF_INET, SOCKET_STREAM, 0, client) == 0);
     int result = kernel_socket_connect(*client, &address, 0);
     CHECK(result == 0 || result == -KERNEL_EINPROGRESS);
     for (unsigned i = 0; i < 8 && !(*client)->connected; ++i)
@@ -1628,9 +1675,9 @@ static void protocol_transaction(void)
 {
     struct kernel_socket *listener=NULL,*client=NULL,*server=NULL;
     struct kernel_socket_address address={.family=KERNEL_SOCKET_AF_INET,.port=23100,.bytes={127,0,0,1}};
-    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_STREAM,&listener));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_STREAM, 0,&listener));
     CHECK(!kernel_socket_bind(listener,&address) && !kernel_socket_listen(listener,4));
-    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_STREAM,&client));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_STREAM, 0,&client));
     int connected=kernel_socket_connect(client,&address,0);
     CHECK(!connected || connected==-KERNEL_EINPROGRESS);
     for(unsigned i=0;i<4;i++) (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
@@ -1765,7 +1812,7 @@ static void endpoint_ownership(void)
      * worker, or final close, actually uses and returns it. */
     for (unsigned final_close = 0; final_close < 2; final_close++) {
         struct kernel_socket *socket = NULL;
-        CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,&socket));
+        CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM, 0,&socket));
         struct pbuf_custom custom = {.custom_free_function=retired_payload_free};
         unsigned char bytes[4] = {'l','o','a','n'}, out[4] = {0};
         struct pbuf *payload = pbuf_alloced_custom(PBUF_RAW,4,PBUF_REF,&custom,bytes,4);
@@ -2070,9 +2117,9 @@ static void remote_protocol_request(unsigned mode)
     if(!mode || mode>=4)connected_pair(&listener,&client,&server);
     else {
         struct kernel_socket_address address={.family=KERNEL_SOCKET_AF_INET,.port=24017,.bytes={127,0,0,1}};
-        CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,&server));
+        CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM, 0,&server));
         CHECK(!kernel_socket_bind(server,&address));
-        CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,&client));
+        CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM, 0,&client));
         CHECK(!kernel_socket_connect(client,&address,0));
         if(mode==2)user_remaining=0;
         if(mode==2 || mode==3) boaros_lwip_ip_init(2);
@@ -2229,7 +2276,7 @@ static void notification_stop_lifetime(void)
 static void stopped_wait_notification(void)
 {
     struct kernel_socket *socket=NULL;
-    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,&socket));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM, 0,&socket));
     struct kernel_wait_node marker={0};stop_probe_queue=&socket->wait;
     socket->wait.head=socket->wait.tail=&marker;
     kernel_socket_network_hooks(NULL,NULL,NULL,NULL);
@@ -2273,7 +2320,7 @@ static struct kernel_socket *named_unix_socket(unsigned type,
     const unsigned char *bytes,unsigned length)
 {
     struct kernel_socket *socket=NULL;
-    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,type,&socket));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,type, 0,&socket));
     struct kernel_socket_address address={.family=KERNEL_SOCKET_AF_UNIX,
         .unix_path=bytes,.unix_length=length};
     CHECK(!kernel_socket_bind(socket,&address));return socket;
@@ -2305,7 +2352,7 @@ static void unix_abstract_names(void)
     struct kernel_socket *b=named_unix_socket(SOCKET_DGRAM,binary,sizeof(binary)-1);
     struct kernel_socket *c=named_unix_socket(SOCKET_DGRAM,full,sizeof(full));
     struct kernel_socket *duplicate=NULL;
-    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_DGRAM,&duplicate));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_DGRAM, 0,&duplicate));
     struct kernel_socket_address address=abstract_address(binary,sizeof(binary));
     CHECK(kernel_socket_bind(duplicate,&address)==-KERNEL_EADDRINUSE);
     address.unix_length=109;CHECK(kernel_socket_bind(duplicate,&address)==-KERNEL_EINVAL);
@@ -2327,7 +2374,7 @@ static void unix_named_stream(void)
     struct kernel_socket *listener=named_unix_socket(SOCKET_STREAM,name,sizeof(name));
     struct kernel_socket *client=NULL,*accepted=NULL;
     CHECK(!kernel_socket_listen(listener,1));
-    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_STREAM,&client));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_STREAM, 0,&client));
     CHECK(!kernel_socket_connect(client,&address,1) && listener->pending_live==1);
     CHECK(kernel_socket_poll(listener,NULL)&KERNEL_POLLIN);
     CHECK(!kernel_socket_accept(listener,&accepted, NULL) && !listener->pending_live);
@@ -2344,11 +2391,11 @@ static void unix_named_stream(void)
 
     listener=named_unix_socket(SOCKET_STREAM,name,sizeof(name));CHECK(!kernel_socket_listen(listener,0));
     client=NULL;accepted=NULL;
-    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_STREAM,&client));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_STREAM, 0,&client));
     CHECK(!kernel_socket_connect(client,&address,1));kernel_socket_destroy(client);
     CHECK(!kernel_socket_accept(listener,&accepted, NULL) && accepted->peer_closed && !accepted->peer);
     CHECK(kernel_socket_receive_ready(accepted));kernel_socket_destroy(accepted);
-    client=NULL;CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_STREAM,&client));
+    client=NULL;CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_STREAM, 0,&client));
     CHECK(!kernel_socket_connect(client,&address,1));kernel_socket_destroy(listener);
     CHECK(!client->peer && client->peer_closed && client->unix_references==1);
     CHECK(write_buffer(client,"x",1,KERNEL_SOCKET_MSG_NOSIGNAL)==-KERNEL_EPIPE);
@@ -2434,7 +2481,7 @@ static void unix_autobind_collision(void)
     kernel_socket_network_initialize();
     const unsigned char collision[]={0,'0','0','0','0','1'};
     struct kernel_socket *reserved=named_unix_socket(SOCKET_DGRAM,collision,sizeof(collision));
-    struct kernel_socket *automatic=NULL;CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_DGRAM,&automatic));
+    struct kernel_socket *automatic=NULL;CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_DGRAM, 0,&automatic));
     struct kernel_socket_address bind={.family=KERNEL_SOCKET_AF_UNIX},actual={0};
     CHECK(!kernel_socket_bind(automatic,&bind));CHECK(!kernel_socket_getname(automatic,&actual));
     CHECK(actual.unix_length==6 && actual.unix_path[0]==0 && memcmp(actual.unix_path,collision,sizeof(collision)));
@@ -2447,7 +2494,7 @@ static void unix_listener_lookup_close(void)
     const unsigned char name[]={0,'l','o','o','k','u','p'};
     struct kernel_socket_address address=abstract_address(name,sizeof(name));
     struct kernel_socket *listener=named_unix_socket(SOCKET_STREAM,name,sizeof(name)),*client=NULL;
-    CHECK(!kernel_socket_listen(listener,1));CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_STREAM,&client));
+    CHECK(!kernel_socket_listen(listener,1));CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_STREAM, 0,&client));
     lookup_close_target=listener;
     CHECK(kernel_socket_connect(client,&address,1)==-KERNEL_ECONNREFUSED);
     CHECK(lookup_close_done==1 && !lookup_close_target && !client->peer && !client->connected && client->unix_references==1);
@@ -2465,7 +2512,7 @@ static void unix_shutdown_states(void)
         if(listener && types[t]==SOCKET_DGRAM)continue;
         for(int how=-1;how<=3;how++) {
             struct kernel_socket *socket=NULL;
-            CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,types[t],&socket));
+            CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,types[t], 0,&socket));
             if(listener) {
                 struct kernel_socket_address address=abstract_address(name,sizeof(name));
                 CHECK(!kernel_socket_bind(socket,&address) && !kernel_socket_listen(socket,1));
@@ -2497,10 +2544,10 @@ static void unix_datagram_read_shutdown(void)
     const unsigned char name[]={0,'s','h','u','t'};
     struct kernel_socket_address address=abstract_address(name,sizeof(name));
     struct kernel_socket *target=NULL,*sender=NULL;
-    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_DGRAM,&target));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_DGRAM, 0,&target));
     CHECK(!kernel_socket_shutdown(target,0) && target->read_closed);
     CHECK(!kernel_socket_bind(target,&address));
-    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_DGRAM,&sender));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_DGRAM, 0,&sender));
     CHECK(!kernel_socket_connect(sender,&address,1));
     CHECK(write_buffer(sender,"x",1,KERNEL_SOCKET_MSG_DONTWAIT)==-KERNEL_EPIPE);
     struct kernel_open_file_description *pin=(void *)sender;char bytes[]="x";
@@ -2509,7 +2556,7 @@ static void unix_datagram_read_shutdown(void)
     CHECK(!target->rx_bytes && !target->unix_reserved && !sender->unix_packets && !sender->tx_reserved);
     kernel_socket_destroy(target);kernel_socket_destroy(sender);CHECK(!heap_live);
     target=named_unix_socket(SOCKET_DGRAM,name,sizeof(name));sender=NULL;
-    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_DGRAM,&sender));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_DGRAM, 0,&sender));
     CHECK(!kernel_socket_connect(sender,&address,1));pin=(void *)sender;read_shutdown_during_copy=target;
     CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,1,KERNEL_SOCKET_MSG_DONTWAIT,NULL, NULL)==-KERNEL_EPIPE);
     CHECK(!read_shutdown_during_copy && pin==(void *)sender && !sender->tx_reserved && !sender->unix_packets &&
@@ -2555,7 +2602,7 @@ static void unix_stream_receive_state(void)
 {
     kernel_socket_network_initialize();
     struct kernel_socket *socket=NULL;
-    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_STREAM,&socket));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_STREAM, 0,&socket));
     struct kernel_open_file_description *pin=(void *)socket;
     struct kernel_socket_read_request request={0};
     for(int nonblocking=0;nonblocking<2;nonblocking++) {
@@ -2586,7 +2633,7 @@ static void unix_space_topology(void)
     const unsigned char an[]={0,'n','o','t','i','f','y','-','a'},bn[]={0,'n','o','t','i','f','y','-','b'};
     struct kernel_socket_address aa=abstract_address(an,sizeof(an)),ba=abstract_address(bn,sizeof(bn)),disconnect={0};
     struct kernel_socket *a=named_unix_socket(SOCKET_DGRAM,an,sizeof(an)),*b=named_unix_socket(SOCKET_DGRAM,bn,sizeof(bn)),*c=NULL;
-    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_DGRAM,&c));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_DGRAM, 0,&c));
     CHECK(!kernel_socket_connect(a,&ba,1) && !kernel_socket_connect(b,&aa,1));
     unsigned before=space_callbacks;
     CHECK(write_buffer(a,"pair",4,0)==4);
@@ -2874,11 +2921,11 @@ static void unix_control_owners(void)
     const unsigned char name[]={0,'g','c','-','p','e','n','d','i','n','g'};
     struct kernel_socket_address address={.family=KERNEL_SOCKET_AF_UNIX,.unix_path=name,.unix_length=sizeof(name)};
     struct kernel_socket *listener=NULL,*client=NULL;
-    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_STREAM,&listener) &&
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_STREAM, 0,&listener) &&
         !kernel_socket_bind(listener,&address) && !kernel_socket_listen(listener,1));
     struct kernel_open_file_description *listener_file=model_socket_file_create(listener);
     CHECK(!kernel_socket_set_option(listener,KERNEL_SOCKET_PASSCRED,1));
-    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_STREAM,&client) && !kernel_socket_connect(client,&address,1));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_STREAM, 0,&client) && !kernel_socket_connect(client,&address,1));
     struct kernel_open_file_description *client_file=model_socket_file_create(client);
     model_send_right(client_file,client_file);model_put(&client_file);retained=heap_live;
     kernel_socket_rights_service();CHECK(heap_live==retained && listener->pending_head && listener->pending_head->child->rights_head && model_uid_account.unix_inflight==1);
@@ -2956,7 +3003,7 @@ static void unix_seqpacket_records(void)
 {
     kernel_socket_network_initialize();
     struct kernel_socket *a=NULL,*b=NULL;
-    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_SEQPACKET,&a));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_SEQPACKET, 0,&a));
     CHECK(kernel_socket_prepare_send(a)==-KERNEL_ENOTCONN);
     struct kernel_open_file_description *pin=(void *)a;struct kernel_socket_read_request read={0};
     struct kernel_socket_message message={0};
@@ -3043,7 +3090,7 @@ static void unix_pending_reset(void)
     for(unsigned t=0;t<2;t++) {
         struct kernel_socket *listener=named_unix_socket(types[t],name,sizeof(name)),*client=NULL;
         CHECK(!kernel_socket_listen(listener,0));
-        CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,types[t],&client));
+        CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,types[t], 0,&client));
         CHECK(!kernel_socket_connect(client,&address,1));
         CHECK(listener->pending_head->child->type==types[t]);
         CHECK(!listener->pending_head->child->packets_head);
@@ -3139,7 +3186,7 @@ static void unix_seqpacket_pending_control(void)
         struct kernel_socket *listener=named_unix_socket(SOCKET_SEQPACKET,name,sizeof(name)),*client=NULL,*child=NULL;
         struct kernel_open_file_description *listener_file=model_socket_file_create(listener);
         CHECK(!kernel_socket_listen(listener,1) && !kernel_socket_set_option(listener,KERNEL_SOCKET_PASSCRED,1));
-        CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_SEQPACKET,&client));
+        CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_UNIX,SOCKET_SEQPACKET, 0,&client));
         CHECK(!kernel_socket_connect(client,&address,1));
         struct kernel_open_file_description *client_file=model_socket_file_create(client);
         model_send_right(client_file,client_file);model_put(&client_file);
@@ -3197,12 +3244,212 @@ static void async_events(void)
     puts("PASS socket async events: accepted datagrams, independent cursors, and Linux UNIX shutdown/close cadence");
 }
 
+static void raw_echo_bytes(unsigned char bytes[64])
+{
+    memset(bytes,0,64);bytes[0]=8;bytes[4]=0x12;bytes[5]=0x34;bytes[7]=1;
+    for(unsigned i=8;i<64;i++)bytes[i]=(unsigned char)i;
+    uint16_t checksum=inet_chksum(bytes,64);memcpy(bytes+2,&checksum,2);
+}
+static void raw_drain(struct kernel_socket *socket)
+{
+    while(socket->packets_head) {
+        struct kernel_open_file_description *pin=(void *)socket;
+        struct kernel_socket_read_request read={0};
+        CHECK(kernel_socket_reserve_read(socket,NULL,&read,&pin,65535,1,NULL)>0);
+        kernel_socket_finish_read(&read,0);CHECK(pin==(void *)socket);
+    }
+}
+static void raw_icmp_owner(void)
+{
+    kernel_socket_network_initialize();
+    struct kernel_socket *a=NULL,*b=NULL;
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_RAW,1,&a));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_RAW,1,&b));
+    raw_filter_test.references=1;raw_filter_test.keep=0;
+    CHECK(!kernel_socket_filter_set(b,(void *)&raw_filter_test));
+    struct kernel_socket_address address={.family=KERNEL_SOCKET_AF_INET,.port=1,.bytes={127,0,0,1}};
+    CHECK(!kernel_socket_connect(a,&address,0));
+    unsigned char echo[64];raw_echo_bytes(echo);
+    CHECK(write_buffer(a,echo,sizeof(echo),0)==64);
+    for(unsigned i=0;i<4;i++)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+    CHECK(raw_filter_test.calls==2 && raw_filter_test.references==1 && !b->rx_bytes);
+    CHECK(a->packets_head && a->packets_tail!=a->packets_head && a->rx_bytes==168);
+    unsigned char request[84],reply[84];
+    CHECK(pbuf_copy_partial(a->packets_head->payload,request,84,0)==84);
+    CHECK(pbuf_copy_partial(a->packets_tail->payload,reply,84,0)==84);
+    CHECK(request[20]==8 && reply[20]==0 && !memcmp(request+20,echo,64));
+    CHECK(request[6]==0x40 && request[7]==0 && request[8]==64 && reply[8]==64);
+    CHECK(!inet_chksum(request,20) && !inet_chksum(reply,20) && !inet_chksum(reply+20,64));
+    struct kernel_open_file_description *pin=(void *)a;
+    struct kernel_socket_read_request read={0};
+    struct kernel_socket_message message={.flags=KERNEL_SOCKET_MSG_PEEK};
+    CHECK(kernel_socket_reserve_read(a,NULL,&read,&pin,4,1,&message)==4);
+    uint32_t length=0;struct kernel_socket_address peer={0};
+    kernel_socket_read_info(&read,&peer,&length);CHECK(length==84 && !peer.port && peer.family==KERNEL_SOCKET_AF_INET);
+    kernel_socket_finish_read(&read,0);CHECK(a->rx_bytes==168 && pin==(void *)a);
+    unsigned char output[84];struct kernel_uaccess_iovec iov={(uintptr_t)output,sizeof(output)};
+    struct kernel_uaccess_iov_cursor cursor={&iov,1,0,0};
+    CHECK(kernel_socket_reserve_read(a,NULL,&read,&pin,84,1,NULL)==84);
+    user_remaining=7;CHECK(kernel_socket_read_user(&read,(void *)a,&cursor)==-KERNEL_EFAULT);
+    kernel_socket_finish_read(&read,1);user_remaining=SIZE_MAX;
+    CHECK(a->rx_bytes==84 && pin==(void *)a);raw_drain(a);
+    heap_fail_after=1;
+    CHECK(write_buffer(a,echo,sizeof(echo),0)==64);
+    for(unsigned i=0;i<4;i++)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+    CHECK(!heap_fail_after && a->rx_bytes==84 && !b->rx_bytes);raw_drain(a);
+    /* A queue with no room drops its own version without preventing the
+     * other raw endpoint or ICMP's automatic Echo Reply. */
+    raw_filter_test.keep=UINT32_MAX;a->rx_limit=1;
+    CHECK(write_buffer(a,echo,sizeof(echo),0)==64);
+    for(unsigned i=0;i<4;i++)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+    CHECK(!a->rx_bytes && b->rx_bytes==168);raw_drain(b);
+    kernel_socket_destroy(a);kernel_socket_destroy(b);
+    CHECK(!raw_filter_test.references && !lwip_stats.memp[MEMP_RAW_PCB]->used);
+    puts("PASS raw ICMP: immutable IPv4 snapshots, independent BPF/queue/OOM drops, PEEK, fault consumption, responder and owners");
+}
+static void *raw_sender_thread(void *argument)
+{
+    unsigned char echo[64];raw_echo_bytes(echo);
+    CHECK(write_buffer(argument,echo,sizeof(echo),0)==64);return NULL;
+}
+static void *raw_closer_thread(void *argument)
+{raw_closing_actor=1;kernel_socket_destroy(argument);return NULL;}
+static void raw_icmp_close(void)
+{
+    kernel_socket_network_initialize();struct kernel_socket *a=NULL,*b=NULL;
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_RAW,1,&a));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_RAW,1,&b));
+    struct kernel_socket_address address={.family=KERNEL_SOCKET_AF_INET,.port=1,.bytes={127,0,0,1}};
+    CHECK(!kernel_socket_connect(a,&address,0));
+    raw_filter_test.references=1;raw_filter_test.keep=UINT32_MAX;
+    CHECK(!kernel_socket_filter_set(b,(void *)&raw_filter_test));raw_pause=1;
+    pthread_t sender,closer;CHECK(!pthread_create(&sender,NULL,raw_sender_thread,a));
+    CHECK(!pthread_mutex_lock(&raw_gate));
+    while(!raw_filter_entered)CHECK(!pthread_cond_wait(&raw_changed,&raw_gate));
+    CHECK(!pthread_mutex_unlock(&raw_gate));
+    CHECK(!pthread_create(&closer,NULL,raw_closer_thread,b));
+    CHECK(!pthread_mutex_lock(&raw_gate));
+    while(!raw_close_waiting)CHECK(!pthread_cond_wait(&raw_changed,&raw_gate));
+    CHECK(raw_filter_test.references==1 && !b->destroying);
+    raw_resume=1;CHECK(!pthread_cond_broadcast(&raw_changed) && !pthread_mutex_unlock(&raw_gate));
+    CHECK(!pthread_join(sender,NULL) && !pthread_join(closer,NULL));
+    CHECK(!raw_filter_test.references);kernel_socket_destroy(a);
+    puts("PASS raw close: stopped in real filter callback, last close waits for protocol and returns packet/program owners");
+}
+static void ipv4_options(void)
+{
+    kernel_socket_network_initialize();struct netif interface={0};
+    route_validate_packets=1;
+    ip4_addr_t local,mask,empty;IP4_ADDR(&local,10,77,0,2);IP4_ADDR(&mask,255,255,255,0);ip4_addr_set_zero(&empty);
+    CHECK(netif_add(&interface,&local,&mask,&empty,NULL,route_interface_init,ip_input));
+    netif_set_up(&interface);netif_set_link_up(&interface);
+    struct kernel_socket *socket=NULL;CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,0,&socket));
+    struct kernel_open_file_description *pin=(void *)socket;
+    char bytes[]="broadcast";struct kernel_uaccess_iovec iov={(uintptr_t)bytes,sizeof(bytes)};
+    struct kernel_socket_address broadcast={.family=KERNEL_SOCKET_AF_INET,.port=23000,.bytes={255,255,255,255}};
+    CHECK(kernel_socket_write_datagram(&pin,(void *)socket,&iov,1,sizeof(bytes),0,&broadcast,NULL)==-KERNEL_EACCES);
+    CHECK(!kernel_socket_set_option(socket,KERNEL_SOCKET_BROADCAST,1));
+    CHECK(!kernel_socket_set_option(socket,KERNEL_SOCKET_IPV4_TTL,37));
+    CHECK(kernel_socket_write_datagram(&pin,(void *)socket,&iov,1,sizeof(bytes),0,&broadcast,NULL)==sizeof(bytes));
+    CHECK(route_frame_size>=42 && route_frame[22]==37 && !memcmp(route_frame,"\xff\xff\xff\xff\xff\xff",6));
+    CHECK(route_frame[20]==0x40 && !route_frame[21] && route_df_packets==1);
+    char name[16]={0};uint32_t length=sizeof(name);
+    CHECK(!kernel_socket_set_bound_device(socket,"eth0") && !kernel_socket_get_bound_device(socket,name,&length));
+    CHECK(length==5 && !strcmp(name,"eth0"));length=5;
+    CHECK(kernel_socket_get_bound_device(socket,name,&length)==-KERNEL_EINVAL);
+    model_credentials.effective=0;
+    CHECK(kernel_socket_set_bound_device(socket,"lo")==-KERNEL_EPERM);
+    CHECK(kernel_socket_set_bound_device(socket,"")==-KERNEL_EPERM);
+    model_credentials.effective=KERNEL_CAP_VALID_MASK;
+    CHECK(!kernel_socket_set_multicast_interface(socket,netif_get_index(&interface),local.addr));
+    CHECK(!kernel_socket_set_option(socket,KERNEL_SOCKET_MULTICAST_TTL,7));
+    struct kernel_socket_address multicast={.family=KERNEL_SOCKET_AF_INET,.port=23000,.bytes={239,1,2,3}};
+    CHECK(kernel_socket_write_datagram(&pin,(void *)socket,&iov,1,sizeof(bytes),0,&multicast,NULL)==sizeof(bytes));
+    CHECK(route_frame[22]==7 && !memcmp(route_frame+26,&local.addr,4));
+    CHECK(!kernel_socket_set_option(socket,KERNEL_SOCKET_MULTICAST_TTL,0));
+    route_frame_size=0;
+    CHECK(kernel_socket_write_datagram(&pin,(void *)socket,&iov,1,sizeof(bytes),0,&multicast,NULL)==sizeof(bytes));
+    CHECK(!route_frame_size);
+    CHECK(!kernel_socket_set_option(socket,KERNEL_SOCKET_MULTICAST_TTL,7));
+    ip4_addr_t nonlocal;IP4_ADDR(&nonlocal,192,0,2,123);
+    CHECK(!kernel_socket_set_multicast_interface(socket,netif_get_index(&interface),nonlocal.addr));
+    CHECK(kernel_socket_write_datagram(&pin,(void *)socket,&iov,1,sizeof(bytes),0,&multicast,NULL)==-KERNEL_ENETUNREACH);
+    CHECK(!kernel_socket_set_multicast_interface(socket,netif_get_index(&interface),local.addr));
+    struct kernel_socket *raw=NULL;
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_RAW,1,&raw));
+    CHECK(!kernel_socket_set_bound_device(raw,"eth0") && !kernel_socket_set_option(raw,KERNEL_SOCKET_BROADCAST,1));
+    CHECK(!kernel_socket_connect(raw,&broadcast,0));
+    unsigned char large[4096]={8};large[4]=1;
+    uint16_t checksum=inet_chksum(large,sizeof(large));memcpy(large+2,&checksum,2);
+    CHECK(write_buffer(raw,large,sizeof(large),0)==sizeof(large));
+    CHECK(route_fragments==3 && route_fragment_bytes==sizeof(large));
+    kernel_socket_destroy(raw);
+    CHECK(!kernel_socket_set_bound_device(socket,"lo"));
+    CHECK(kernel_socket_set_multicast_interface(socket,netif_get_index(&interface),local.addr)==-KERNEL_EINVAL);
+    CHECK(!kernel_socket_set_option(socket,KERNEL_SOCKET_BROADCAST,0));
+    broadcast.bytes[0]=127;broadcast.bytes[1]=broadcast.bytes[2]=broadcast.bytes[3]=255;
+    CHECK(kernel_socket_write_datagram(&pin,(void *)socket,&iov,1,sizeof(bytes),0,&broadcast,NULL)==-KERNEL_EACCES);
+    struct kernel_socket *broadcast_receiver=NULL;
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,0,&broadcast_receiver));
+    struct kernel_socket_address any={.family=KERNEL_SOCKET_AF_INET,.port=23000};
+    CHECK(!kernel_socket_set_bound_device(broadcast_receiver,"lo") && !kernel_socket_bind(broadcast_receiver,&any));
+    CHECK(!kernel_socket_set_option(socket,KERNEL_SOCKET_BROADCAST,1));
+    CHECK(kernel_socket_write_datagram(&pin,(void *)socket,&iov,1,sizeof(bytes),0,&broadcast,NULL)==sizeof(bytes));
+    for(unsigned i=0;i<4;i++)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+    CHECK(broadcast_receiver->rx_bytes==sizeof(bytes));kernel_socket_destroy(broadcast_receiver);
+    /* A selected 127/8 alias is a real source choice, not just a successful
+     * option query. The source stays owned while the packet is emitted. */
+    ip4_addr_t alias;IP4_ADDR(&alias,127,0,0,2);
+    CHECK(!kernel_socket_set_multicast_interface(socket,0,alias.addr));
+    CHECK(kernel_socket_write_datagram(&pin,(void *)socket,&iov,1,sizeof(bytes),0,&multicast,NULL)==sizeof(bytes));
+    for(unsigned i=0;i<4;i++)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+    CHECK(!kernel_socket_set_bound_device(socket,""));
+    model_credentials.effective=0;CHECK(!kernel_socket_set_bound_device(socket,"eth0"));
+    model_credentials.effective=KERNEL_CAP_VALID_MASK;
+    for(int type=SOCKET_STREAM;type<=SOCKET_DGRAM;type++) {
+        struct kernel_socket *a=NULL,*b=NULL,*c=NULL;
+        CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,type,0,&a));
+        CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,type,0,&b));
+        CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,type,0,&c));
+        any.port=(uint16_t)(24000+type);
+        CHECK(!kernel_socket_set_bound_device(a,"lo") && !kernel_socket_set_bound_device(b,"eth0"));
+        CHECK(!kernel_socket_bind(a,&any) && !kernel_socket_bind(b,&any));
+        CHECK(kernel_socket_bind(c,&any)==-KERNEL_EADDRINUSE);
+        CHECK(!kernel_socket_set_bound_device(c,"eth0") && kernel_socket_bind(c,&any)==-KERNEL_EADDRINUSE);
+        if(type==SOCKET_STREAM)CHECK(!kernel_socket_listen(a,1) && !kernel_socket_listen(b,1));
+        kernel_socket_destroy(c);kernel_socket_destroy(b);kernel_socket_destroy(a);
+    }
+    struct kernel_socket *listener=NULL,*client=NULL,*accepted=NULL;
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_STREAM,0,&listener));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_STREAM,0,&client));
+    any=(struct kernel_socket_address){.family=KERNEL_SOCKET_AF_INET,.port=24100,.bytes={127,0,0,1}};
+    CHECK(!kernel_socket_set_bound_device(listener,"lo") && !kernel_socket_bind(listener,&any) && !kernel_socket_listen(listener,1));
+    accept_binding_probe=listener;
+    int connected=kernel_socket_connect(client,&any,0);
+    CHECK(!connected || connected==-KERNEL_EINPROGRESS);
+    for(unsigned i=0;i<8;i++)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+    CHECK(accept_binding_changed==1 && !accept_binding_probe && !kernel_socket_accept(listener,&accepted,NULL));
+    length=16;CHECK(!kernel_socket_get_bound_device(accepted,name,&length) && !strcmp(name,"lo"));
+    CHECK(accepted->bound_device==accepted->tcp->netif_idx && listener->bound_device!=accepted->bound_device);
+    {struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+      if(client->tcp)tcp_abort(client->tcp);
+      if(accepted->tcp)tcp_abort(accepted->tcp);
+      kernel_socket_protocol_leave(&scope);}
+    kernel_socket_destroy(client);kernel_socket_destroy(accepted);kernel_socket_destroy(listener);
+    for(unsigned i=0;i<8;i++)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+    kernel_socket_destroy(socket);etharp_cleanup_netif(&interface);netif_remove(&interface);
+    puts("PASS IPv4 options: physical and lo broadcast permission, TTL on wire, multicast source, stable binding and capability changes");
+}
+
 int main(int argc, char **argv)
 {
     CHECK(argc == 2);
     CHECK(kernel_pid_allocator_init(&model_pid_numbers,model_pid_bitmap,1024)==KERNEL_PID_STATUS_OK);
     CHECK(kernel_pid_publish(&model_pid_registry,&model_pid)==KERNEL_PID_STATUS_OK);
-    if (!strcmp(argv[1], "async-events")) async_events();
+    if (!strcmp(argv[1], "raw-icmp-owner")) raw_icmp_owner();
+    else if (!strcmp(argv[1], "raw-icmp-close")) raw_icmp_close();
+    else if (!strcmp(argv[1], "ipv4-options")) ipv4_options();
+    else if (!strcmp(argv[1], "async-events")) async_events();
     else if (!strcmp(argv[1], "unix-seq-records")) unix_seqpacket_records();
     else if (!strcmp(argv[1], "ipv4-route")) ipv4_route_output();
     else if (!strcmp(argv[1], "tcp-loopback-checksum")) tcp_loopback_checksum();

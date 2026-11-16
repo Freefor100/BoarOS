@@ -43,6 +43,7 @@ SOURCES['ptrace_signal']='resource/ptrace_signal.c'
 SOURCES['process_control']='resource/process_control.c'
 SOURCES['file_flags']='resource/file_flags.c'
 SOURCES['file_ioctl']='resource/fd_events.c'
+SOURCES['ipv4_abi']='network/ipv4_abi.c'
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -127,7 +128,7 @@ def accepted(raw,arch,cpus,target,selected=None):
         if not free or int(free[1],16)<1024:return False
     ends=[line for line in raw.replace('\r','').splitlines() if line.startswith('API8 END ')]
     expected=[f'API8 END /{name} status=0' for name in programs]
-    known={'file_ioctl':['FD-IOCTL PASS'],'process_control':['PROCESS_CONTROL PASS'],'file_flags':['FILE_FLAGS PASS'],'ptrace_signal':['PTRACE SIGNAL suppression reset-mask blocked-replacement siginfo ignored continue-cancels-stop PASS'],'process_memory':['PROCESS_MEMORY PASS'],'personality':['PERSONALITY PASS'],'ptrace':['PTRACE traced-stop memory syscall-info exit PASS'],'ptrace_tools':['PTRACE_TOOLS PASS'],'uts_namespace':['UTS NAMESPACE PASS cases=8'],'ipc_namespace':['IPCNS PASS cases=3'],'async_io':['ASYNC PASS cases=4'],'tty_async':['PTY_RECORD sigio-vhangup-generation 1'],'sched_control':['SCHED-CONTROL END cases=6'],'system_control':['SYSTEM CONTROL PASS cases=5'],'mount_context':['FS-CONTEXT END 9'],'mount_api':['MOUNT-API END 5'],'propagation':['PROP END 9'],'atime':['MOUNT-ATTR END 4'],'memory_advice':['MADVISE END 5'],'fd_events':['FD-EVENTS PASS'],'flock':['FLOCK-PASS'],
+    known={'ipv4_abi':[*(f'IPV4 ABI PASS {name}' for name in ('scalar-options','device-options','multicast-interface','raw-boundaries','permissions')),'IPV4 ABI PASS'],'file_ioctl':['FD-IOCTL PASS'],'process_control':['PROCESS_CONTROL PASS'],'file_flags':['FILE_FLAGS PASS'],'ptrace_signal':['PTRACE SIGNAL suppression reset-mask blocked-replacement siginfo ignored continue-cancels-stop PASS'],'process_memory':['PROCESS_MEMORY PASS'],'personality':['PERSONALITY PASS'],'ptrace':['PTRACE traced-stop memory syscall-info exit PASS'],'ptrace_tools':['PTRACE_TOOLS PASS'],'uts_namespace':['UTS NAMESPACE PASS cases=8'],'ipc_namespace':['IPCNS PASS cases=3'],'async_io':['ASYNC PASS cases=4'],'tty_async':['PTY_RECORD sigio-vhangup-generation 1'],'sched_control':['SCHED-CONTROL END cases=6'],'system_control':['SYSTEM CONTROL PASS cases=5'],'mount_context':['FS-CONTEXT END 9'],'mount_api':['MOUNT-API END 5'],'propagation':['PROP END 9'],'atime':['MOUNT-ATTR END 4'],'memory_advice':['MADVISE END 5'],'fd_events':['FD-EVENTS PASS'],'flock':['FLOCK-PASS'],
            'splice':['SPLICE PASS cases=9'],'file_advice':['ADVICE RESULT cases=3 failures=0'],'copy_range':['COPY_RANGE PASS'],'sched_query':['SCHED-QUERY END cases=7'],
            'icache':[f'ICACHE PASS cpus={cpus}'],
            'vectors_v2':[*(f'VECTORS2 CASE {name} PASS' for name in (

@@ -1450,7 +1450,32 @@ static enum kernel_block_status virtio_block_write_batch_prio(void *context,
 
 static enum kernel_block_status virtio_block_read_batch(void *context,
     struct block_read_span *spans, size_t count, const struct block_read_completion *completion)
-{ return transfer_batch(context, NULL, spans, count, NULL, NULL, NULL, completion, KERNEL_BLOCK_PRIO_HIGH); }
+{
+    struct virtio_block_device *device=context;
+    uint64_t physical;
+    /* One contiguous DMA needs one request owner, not a batch workspace and
+     * another completion queue. The final span completes through the return;
+     * multi-span, fragmented and oversized reads keep the SG pipeline. */
+    if (count==1 && spans[0].size && spans[0].size<=device->max_segment_size &&
+        !(spans[0].offset%VIRTIO_BLOCK_SECTOR_SIZE) &&
+        !(spans[0].size%VIRTIO_BLOCK_SECTOR_SIZE) &&
+        device->dma_address(spans[0].buffer,spans[0].size,&physical)) {
+        enum kernel_block_status result=KERNEL_BLOCK_STATUS_IO;
+        if (begin_call(device,0)) {
+            struct block_request *request=reserve_request_prio(device,KERNEL_BLOCK_PRIO_HIGH);
+            if (request) {
+                result=submit_request(device,request,VIRTIO_BLOCK_REQUEST_IN,
+                    spans[0].offset/VIRTIO_BLOCK_SECTOR_SIZE,physical,(uint32_t)spans[0].size,0);
+                release_request(device,request);
+            }
+            end_call(device,0);
+        }
+        spans[0].status=result;
+        spans[0].completed=result==KERNEL_BLOCK_STATUS_OK?spans[0].size:0;
+        return result;
+    }
+    return transfer_batch(context,NULL,spans,count,NULL,NULL,NULL,completion,KERNEL_BLOCK_PRIO_HIGH);
+}
 
 static enum kernel_block_status virtio_block_write_phase(void *context,
     kernel_block_phase_next_fn next, const void *next_context, const void *first)

@@ -51,6 +51,8 @@ timerfd 和 POSIX 墙钟索引在各自已有保护内更新，通知和信号�
 
 RV64 和 LA64 的 exec 映射一个只读可执行 ELF 页和紧随其后的只读 `[vvar]` 页。auxv 的 `AT_SYSINFO_EHDR` 指向 ELF 头；三个时间符号 `__vdso_clock_gettime`、`__vdso_clock_getres`、`__vdso_gettimeofday` 分别采用 RV 的 `LINUX_4.15` 与 LA 的 `LINUX_5.10` 版本。信号处理器的返回地址指向同一 ELF 内的 `__vdso_rt_sigreturn`。
 
+vDSO 的独立 C 编译规则同样启用 `-fstack-usage`，生成 `vdso/time.su`；内核构建目录的完整栈检查要求该对象有报告。报告缺失是构建覆盖错误，不表示 vDSO ELF 或运行时函数不存在。该编译选项只输出用量记录，不改变 vDSO 的代码或用户态 ABI。
+
 REALTIME、MONOTONIC 和 MONOTONIC_RAW 直接读取用户可用的架构计数器，用与 syscall 相同的乘数换算。两种 COARSE 读取 CPU0 最近发布的原子样本；CPU 时钟和其他时钟编号交给 syscall。vDSO 在用户态写出结果，因此错误输出地址按普通用户内存访问处理。乘数在初始化后不变；调钟和时区修改更新共享数据页的序列，vDSO 在同一序列内读取偏移和 counter，发现写者介入则重读。内核 REALTIME 查询同样复查序列。计时中断只更新 coarse 单调样本，不遍历进程。
 
 各 MM 共享一页时钟数据，每个映射 PTE 与 MM 的恢复后备分别持有引用。fork 继承后备，`MADV_DONTNEED` 只丢弃驻留映射；再次访问时，代码从内核 ELF 重新装入，数据重新接入同一时钟页。页表销毁后归还 MM 的后备引用，最后一个 MM 释放时先停止时间写者对该页的访问。

@@ -537,7 +537,7 @@ enum kernel_files_status kernel_files_close(
 struct kernel_socket_address;
 struct kernel_socket_message;
 enum kernel_files_status kernel_files_socket_create(
-    struct kernel_files *files, int family, int type, uint32_t flags,
+    struct kernel_files *files, int family, int type, int protocol, uint32_t flags,
     int64_t *linux_result);
 
 enum kernel_files_status kernel_files_socketpair_create(

@@ -724,10 +724,10 @@ int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,
         __atomic_store_n(&executor_fairness.read_completed, 1, __ATOMIC_RELEASE);
     return result ? result : injected;
 }
+static _Thread_local unsigned *demand_page_batches;
 #ifndef CACHE_MM_CASES
 static unsigned fail_cache_page, fail_cache_entry;
 static unsigned pause_candidate,candidate_entered,candidate_resume;
-static _Thread_local unsigned *demand_page_batches;
 enum physical_page_status __real_physical_page_allocate(struct physical_page_allocator *, uint64_t *);
 static void pause_cache_allocation(struct physical_page_allocator *pages)
 {
