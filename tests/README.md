@@ -45,3 +45,13 @@ python3 -B tests/cost/io-budget-experiment.py --help
 `make prune-build` 默认删除内核对象、测试 ELF、参考内核、运行盘、日志和实验目录。自动保留的只有仍在使用的已安装工具/SDK、LA RTC 模拟器可执行文件与身份记录，以及尚未提交源码的本地归档；活动 Git worktree 的源码另行保护。工作区内的生成盘和构建目录仍应单独清理，不能因 worktree 被保护就把产物永久保留。
 
 清理前可用 `python3 -B tests/tools/prune-build.py` 查看列表；仅本轮尚在使用的输出才用 `--keep build/<目录>` 明确保留。固定输入由 `references/sources.tsv` 与准备入口重建，旧实验通过 Git 历史查阅。
+
+`tests/userland/run.py --workload sendfile_tcp` 使用真实 AF_INET loopback TCP
+消费 `sendfile`，检查跨页内容、显式/共享 offset、非阻塞短发送后续传、信号、
+复位及最后发送进程退出后的所有权归还。同一连接上的并发 `send/write` 允许
+片段交错但分别核对内容和顺序，并检查非最终关闭、取消后其他持有者继续发送、
+最终 EOF，以及 pipe→TCP `splice` 的短发送、非阻塞与恢复。`--performance` 使用夹具预先写入的
+8 MiB 固定文件，分别以 4 KiB 和 256 KiB 请求发送；接收者逐字节核对后应答，
+固定发送/接收进程的 CPU，并分别记录发送接纳、完整消费和发送者 CPU 时间。
+前后比较应复用同一 ELF/夹具、
+同一 CPU/内存配置并错峰执行；该模式走内核 loopback，不代表物理网卡吞吐。
