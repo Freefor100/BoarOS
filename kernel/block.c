@@ -186,13 +186,12 @@ enum kernel_block_status kernel_block_write_at(
     return disk->write(disk->context, device->start_bytes + offset, buffer, size);
 }
 
-/* 分区转换单独使用本次请求大小的临时向量；整盘与单页缺页读取
- * 不再承担最大批量的栈空间。调用barrier及request owner覆盖驱动完成。 */
-static __attribute__((noinline)) enum kernel_block_status partition_write_batch_prio(
-    struct kernel_block_device *device, const struct kernel_block_span *spans, size_t count,
-    enum kernel_block_priority priority)
+#define PARTITION_SMALL_BATCH 4U
+
+static enum kernel_block_status partition_write_translated(
+    struct kernel_block_device *device, const struct kernel_block_span *spans,
+    struct kernel_block_span *translated, size_t count, enum kernel_block_priority priority)
 {
-    struct kernel_block_span translated[count];
     for (size_t i = 0; i < count; i++) {
         translated[i] = spans[i]; translated[i].offset += device->start_bytes;
     }
@@ -200,6 +199,26 @@ static __attribute__((noinline)) enum kernel_block_status partition_write_batch_
     if (disk->write_batch_prio)
         return disk->write_batch_prio(disk->context, translated, count, priority);
     return disk->write_batch(disk->context, translated, count);
+}
+
+static __attribute__((noinline)) enum kernel_block_status partition_write_batch_large(
+    struct kernel_block_device *device, const struct kernel_block_span *spans, size_t count,
+    enum kernel_block_priority priority)
+{
+    struct kernel_block_span translated[KERNEL_BLOCK_BATCH_MAX];
+    return partition_write_translated(device,spans,translated,count,priority);
+}
+
+/* A 4 KiB fault can split into four 1 KiB filesystem blocks. Keep that path
+ * separate from the maximum batch frame without splitting a driver's batch.
+ * The caller's transfer qualification and request owner cover completion. */
+static __attribute__((noinline)) enum kernel_block_status partition_write_batch_prio(
+    struct kernel_block_device *device, const struct kernel_block_span *spans, size_t count,
+    enum kernel_block_priority priority)
+{
+    if(count>PARTITION_SMALL_BATCH)return partition_write_batch_large(device,spans,count,priority);
+    struct kernel_block_span translated[PARTITION_SMALL_BATCH];
+    return partition_write_translated(device,spans,translated,count,priority);
 }
 
 enum kernel_block_status kernel_block_write_batch_prio(
@@ -388,11 +407,11 @@ static void read_completed(void *context, unsigned index, const struct block_rea
     state->completion->complete(state->completion->context, index, &state->spans[index]);
 }
 
-static __attribute__((noinline)) enum kernel_block_status partition_read_batch(
-    struct kernel_block_device *device, struct block_read_span *spans, size_t count,
+static enum kernel_block_status partition_read_translated(
+    struct kernel_block_device *device, struct block_read_span *spans,
+    struct block_read_span *translated, size_t count,
     const struct block_read_completion *completion)
 {
-    struct block_read_span translated[count];
     for (size_t i = 0; i < count; i++) {
         translated[i] = spans[i]; translated[i].offset += device->start_bytes;
     }
@@ -405,6 +424,23 @@ static __attribute__((noinline)) enum kernel_block_status partition_read_batch(
         spans[i].status = translated[i].status; spans[i].completed = translated[i].completed;
     }
     return result;
+}
+
+static __attribute__((noinline)) enum kernel_block_status partition_read_batch_large(
+    struct kernel_block_device *device, struct block_read_span *spans, size_t count,
+    const struct block_read_completion *completion)
+{
+    struct block_read_span translated[KERNEL_BLOCK_BATCH_MAX];
+    return partition_read_translated(device,spans,translated,count,completion);
+}
+
+static __attribute__((noinline)) enum kernel_block_status partition_read_batch(
+    struct kernel_block_device *device, struct block_read_span *spans, size_t count,
+    const struct block_read_completion *completion)
+{
+    if(count>PARTITION_SMALL_BATCH)return partition_read_batch_large(device,spans,count,completion);
+    struct block_read_span translated[PARTITION_SMALL_BATCH];
+    return partition_read_translated(device,spans,translated,count,completion);
 }
 
 enum kernel_block_status kernel_block_read_batch(struct kernel_block_device *device,

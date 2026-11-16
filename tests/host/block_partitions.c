@@ -120,6 +120,99 @@ static void io_batches(struct kernel_block_device *d, struct kernel_block_device
     assert(block_test_read_bytes-previous_read==1024 && block_test_write_bytes-previous_write==512);
     fail_offset=UINT64_MAX;
 }
+
+static struct {
+    struct kernel_block_device *partition;
+    const struct kernel_block_span *writes;
+    struct block_read_span *reads;
+    size_t count, fail;
+    unsigned calls, notified;
+    enum kernel_block_priority priority;
+} boundary;
+static enum kernel_block_status boundary_write(void *context,const struct kernel_block_span *spans,size_t count)
+{
+    assert(count==boundary.count && boundary.partition->references);
+    boundary.calls++;
+    for(size_t i=0;i<count;i++) {
+        assert(spans[i].offset==boundary.partition->start_bytes+boundary.writes[i].offset &&
+               spans[i].buffer==boundary.writes[i].buffer && spans[i].size==boundary.writes[i].size);
+        if(i==boundary.fail)return KERNEL_BLOCK_STATUS_IO;
+        if(spans[i].size)assert(!wr(context,spans[i].offset,spans[i].buffer,spans[i].size));
+    }
+    return KERNEL_BLOCK_STATUS_OK;
+}
+static enum kernel_block_status boundary_write_prio(void *context,const struct kernel_block_span *spans,
+    size_t count,enum kernel_block_priority priority)
+{
+    assert(priority==boundary.priority);return boundary_write(context,spans,count);
+}
+static void boundary_complete(void *context,unsigned index,const struct block_read_span *span)
+{
+    assert(context==&boundary && index<boundary.count && span==&boundary.reads[index]);
+    assert(!(boundary.notified&(1U<<index)));boundary.notified|=1U<<index;
+    assert(boundary.partition->references && span->offset==index*512U);
+    assert(span->status==(index==boundary.fail?KERNEL_BLOCK_STATUS_IO:KERNEL_BLOCK_STATUS_OK));
+    assert(span->completed==(index==boundary.fail?256:span->size));
+}
+static enum kernel_block_status boundary_read(void *context,struct block_read_span *spans,size_t count,
+    const struct block_read_completion *completion)
+{
+    (void)context;
+    assert(count==boundary.count && boundary.partition->references);
+    boundary.calls++;
+    for(size_t i=0;i<count;i++) {
+        assert(spans[i].offset==boundary.partition->start_bytes+i*512U &&
+               spans[i].buffer==boundary.reads[i].buffer && spans[i].size==boundary.reads[i].size);
+        spans[i].status=i==boundary.fail?KERNEL_BLOCK_STATUS_IO:KERNEL_BLOCK_STATUS_OK;
+        spans[i].completed=i==boundary.fail?256:spans[i].size;
+        if(spans[i].completed)memcpy(spans[i].buffer,disk+spans[i].offset,spans[i].completed);
+        if(completion && i+1<count)completion->complete(completion->context,i,&spans[i]);
+    }
+    return boundary.fail<count?KERNEL_BLOCK_STATUS_IO:KERNEL_BLOCK_STATUS_OK;
+}
+static void partition_batch_boundaries(struct kernel_block_device *d,struct kernel_block_device *p)
+{
+    const unsigned counts[]={1,4,5,KERNEL_BLOCK_BATCH_MAX};
+    unsigned char data[KERNEL_BLOCK_BATCH_MAX][512],out[KERNEL_BLOCK_BATCH_MAX][512];
+    struct kernel_block_span writes[KERNEL_BLOCK_BATCH_MAX],saved[KERNEL_BLOCK_BATCH_MAX];
+    struct block_read_span reads[KERNEL_BLOCK_BATCH_MAX];
+    for(size_t c=0;c<sizeof(counts)/sizeof(counts[0]);c++)for(unsigned failing=0;failing<2;failing++) {
+        size_t count=counts[c];
+        for(size_t i=0;i<count;i++) {
+            memset(data[i],(int)(0x30+i),512);
+            size_t size=count>1 && i==1?0:512;
+            writes[i]=(struct kernel_block_span){i*512U,size?data[i]:NULL,size};
+            reads[i]=(struct block_read_span){.offset=i*512U,.buffer=size?out[i]:NULL,.size=size};
+        }
+        memcpy(saved,writes,count*sizeof(*writes));
+        boundary.partition=p;boundary.count=count;boundary.fail=failing?count/2:SIZE_MAX;
+        /* Do not place the injected partial failure on the empty descriptor. */
+        if(boundary.fail==1)boundary.fail=0;
+        boundary.priority=KERNEL_BLOCK_PRIO_HIGH;boundary.writes=writes;boundary.reads=reads;
+        for(unsigned prioritized=0;prioritized<2;prioritized++) {
+            d->write_batch=boundary_write;d->write_batch_prio=prioritized?boundary_write_prio:NULL;
+            boundary.calls=0;
+            enum kernel_block_status result=kernel_block_write_batch_prio(p,writes,count,boundary.priority);
+            assert(result==(failing?KERNEL_BLOCK_STATUS_IO:KERNEL_BLOCK_STATUS_OK) && boundary.calls==1);
+            assert(!memcmp(writes,saved,count*sizeof(*writes)) && !p->references);
+        }
+        d->read_batch=boundary_read;boundary.calls=boundary.notified=0;
+        const struct block_read_completion completion={boundary_complete,&boundary};
+        uint64_t accounted=block_test_read_bytes;
+        enum kernel_block_status result=kernel_block_read_batch(p,reads,count,&completion);
+        assert(result==(failing?KERNEL_BLOCK_STATUS_IO:KERNEL_BLOCK_STATUS_OK) && boundary.calls==1);
+        assert(boundary.notified==(count==1?0:(1U<<(count-1))-1U) && !p->references);
+        assert(block_test_read_bytes-accounted==(count-(count>1))*512U);
+        for(size_t i=0;i<count;i++) {
+            assert(reads[i].offset==saved[i].offset && reads[i].buffer==(saved[i].size?out[i]:NULL) &&
+                   reads[i].size==saved[i].size && reads[i].completed==(i==boundary.fail?256:reads[i].size) &&
+                   reads[i].status==(i==boundary.fail?KERNEL_BLOCK_STATUS_IO:KERNEL_BLOCK_STATUS_OK));
+            if(reads[i].completed)assert(!memcmp(out[i],disk+p->start_bytes+i*512U,reads[i].completed));
+        }
+    }
+    d->write_batch=NULL;d->write_batch_prio=NULL;d->read_batch=NULL;
+    puts("partition batch boundaries: one submission, priority, immutable offsets, early completion and partial errors passed");
+}
 static void *rmw_thread(void *arg)
 {
     unsigned char data=0x23,scratch[512]; size_t done;
@@ -206,6 +299,7 @@ int main(void)
     assert(!kernel_block_write_bytes(&p[0],3,data,700,scratch,sizeof(scratch),&completed));
     assert(completed==700 && disk[8*512+2]==0 && disk[8*512+3]==0x6a && disk[8*512+703]==0x6a);
     io_batches(&d,&p[0]);
+    partition_batch_boundaries(&d,&p[2]);
     serialized_io(&d,&p[0]);
     assert(!kernel_block_set_read_only(&p[0],1));
     assert(kernel_block_read_only(&p[0]) && !kernel_block_read_only(&d) && !kernel_block_read_only(&p[2]));

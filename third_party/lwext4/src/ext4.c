@@ -4859,76 +4859,27 @@ static void ext4_file_read_completed(void *context, unsigned index, const struct
     ext4_file_read_publish(progress, progress->fragments[part].span);
 }
 
-int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsigned count,
-    struct file_read_workspace *work, uint64_t size_limit, const struct file_read_completion *completion, bool pad_eof)
+struct ext4_file_read_plan {
+    size_t *limits;
+    struct file_read_fragment *fragments;
+    struct block_read_span *reads;
+    unsigned *owners;
+    int *mapping_errors;
+    unsigned capacity;
+    struct file_read_workspace *progress;
+};
+
+static __attribute__((noinline)) int ext4_fpread_planned(const ext4_file *file,
+    struct file_read_span *spans, unsigned count, const struct ext4_file_read_plan *plan,
+    uint64_t size_limit, bool pad_eof)
 {
-    if (!file || !file->mp || count > EXT4_BLOCK_BATCH_MAX || (count && !spans)) return EINVAL;
-    for (unsigned i = 0; i < count; i++) { spans[i].completed = 0; spans[i].error = EINVAL; }
-    uintptr_t descriptors = (uintptr_t)spans, workspace = (uintptr_t)work;
-    if (work && count && (descriptors < workspace ? workspace - descriptors < count * sizeof(*spans) :
-        descriptors - workspace < sizeof(*work))) return EINVAL;
-    uintptr_t first = UINTPTR_MAX, last = 0;
-    for (unsigned i = 0; i < count; i++) {
-        uintptr_t a = (uintptr_t)spans[i].buffer;
-        size_t size = spans[i].size;
-        if (spans[i].offset > UINT64_MAX - size || (size && (!a || size - 1 > UINTPTR_MAX - a)))
-            return spans[i].error = EINVAL;
-        uintptr_t b = (uintptr_t)spans;
-        if (size && (a < b ? b - a < size : a - b < count * sizeof(*spans)))
-            return spans[i].error = EINVAL;
-        if (work && size && (a < workspace ? workspace - a < size : a - workspace < sizeof(*work)))
-            return spans[i].error = EINVAL;
-        if (!size) continue;
-        uintptr_t end = a + size - 1;
-        /* Sorted SG targets lie outside the envelope. Check individual spans
-         * only when a target enters its gaps or overlaps an earlier target. */
-        if (a <= last && end >= first) {
-            for (unsigned j = 0; j < i; j++) {
-                b = (uintptr_t)spans[j].buffer;
-                if (spans[j].size && (a < b ? b - a < size : a - b < spans[j].size))
-                    return spans[i].error = EINVAL;
-            }
-        }
-        if (a < first) first = a;
-        if (end > last) last = end;
-    }
-    for (unsigned i = 0; i < count; i++) spans[i].error = EOK;
-    if (!count) return EOK;
-    if (count > 1 && !work) {
-        for (unsigned i = 0; i < count; i++) spans[i].error = ENOMEM;
-        return ENOMEM;
-    }
-    /* Scalar requests cannot need more fragments than their filesystem
-     * blocks. Bound temporary planning storage by that range (at most eight),
-     * so a one-page ELF fault does not retain an unused eight-slot frame. */
-    unsigned scalar_capacity=1;
-    if (!work) {
-        unsigned bs=ext4_sb_get_block_size(&file->mp->fs.sb);
-        uint64_t blocks=spans[0].size/bs;
-        if(blocks>=8)scalar_capacity=8;
-        else {
-            scalar_capacity=(unsigned)blocks+(unsigned)((spans[0].offset%bs+spans[0].size%bs+bs-1)/bs);
-            if(!scalar_capacity)scalar_capacity=1;
-            if(scalar_capacity>8)scalar_capacity=8;
-        }
-    }
-    size_t scalar_limit;
-    struct file_read_fragment scalar_fragments[scalar_capacity];
-    struct block_read_span scalar_reads[scalar_capacity];
-    unsigned scalar_owners[scalar_capacity];
-    int scalar_mapping_error;
-    size_t *limits = work ? work->limits : &scalar_limit;
-    struct file_read_fragment *fragments = work ? work->fragments : scalar_fragments;
-    struct block_read_span *reads = work ? work->reads : scalar_reads;
-    unsigned *owners = work ? work->owners : scalar_owners;
-    int *mapping_errors = work ? work->mapping_errors : &scalar_mapping_error;
-    unsigned capacity = work ? EXT4_BLOCK_BATCH_MAX : scalar_capacity;
-    struct file_read_workspace *progress = completion && count > 1 ? work : NULL;
-    if (progress) {
-        progress->completion_spans = spans;
-        progress->completion = completion;
-        progress->completion_emitted = 0;
-    }
+    size_t *limits = plan->limits;
+    struct file_read_fragment *fragments = plan->fragments;
+    struct block_read_span *reads = plan->reads;
+    unsigned *owners = plan->owners;
+    int *mapping_errors = plan->mapping_errors;
+    unsigned capacity = plan->capacity;
+    struct file_read_workspace *progress = plan->progress;
     const struct block_read_completion forward = {ext4_file_read_completed, progress};
     const struct ext4_lock *locks = file->mp->os_locks;
     if (locks && locks->read_lock) locks->read_lock(locks->context);
@@ -5095,6 +5046,90 @@ Failed:
     for (unsigned i = 0; i < count; i++) if (!result) result = spans[i].error;
     EXT4_MP_UNLOCK(file->mp);
     return result;
+}
+
+/* Keep small positioned reads off the largest scalar frame. The fixed-size
+ * entry owns its descriptors until the common executor has drained DMA. */
+#define EXT4_SCALAR_READ(capacity) \
+static __attribute__((noinline)) int ext4_fpread_scalar##capacity(const ext4_file *file, \
+    struct file_read_span *span, uint64_t size_limit, bool pad_eof) \
+{ \
+    size_t limit; \
+    struct file_read_fragment fragments[capacity]; \
+    struct block_read_span reads[capacity]; \
+    unsigned owners[capacity]; \
+    int mapping_error; \
+    const struct ext4_file_read_plan plan = { \
+        &limit, fragments, reads, owners, &mapping_error, capacity, NULL \
+    }; \
+    return ext4_fpread_planned(file, span, 1, &plan, size_limit, pad_eof); \
+}
+EXT4_SCALAR_READ(1)
+EXT4_SCALAR_READ(2)
+EXT4_SCALAR_READ(4)
+EXT4_SCALAR_READ(8)
+#undef EXT4_SCALAR_READ
+
+int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsigned count,
+    struct file_read_workspace *work, uint64_t size_limit, const struct file_read_completion *completion, bool pad_eof)
+{
+    if (!file || !file->mp || count > EXT4_BLOCK_BATCH_MAX || (count && !spans)) return EINVAL;
+    for (unsigned i = 0; i < count; i++) { spans[i].completed = 0; spans[i].error = EINVAL; }
+    uintptr_t descriptors = (uintptr_t)spans, workspace = (uintptr_t)work;
+    if (work && count && (descriptors < workspace ? workspace - descriptors < count * sizeof(*spans) :
+        descriptors - workspace < sizeof(*work))) return EINVAL;
+    uintptr_t first = UINTPTR_MAX, last = 0;
+    for (unsigned i = 0; i < count; i++) {
+        uintptr_t a = (uintptr_t)spans[i].buffer;
+        size_t size = spans[i].size;
+        if (spans[i].offset > UINT64_MAX - size || (size && (!a || size - 1 > UINTPTR_MAX - a)))
+            return spans[i].error = EINVAL;
+        uintptr_t b = (uintptr_t)spans;
+        if (size && (a < b ? b - a < size : a - b < count * sizeof(*spans)))
+            return spans[i].error = EINVAL;
+        if (work && size && (a < workspace ? workspace - a < size : a - workspace < sizeof(*work)))
+            return spans[i].error = EINVAL;
+        if (!size) continue;
+        uintptr_t end = a + size - 1;
+        /* Sorted SG targets lie outside the envelope. Check individual spans
+         * only when a target enters its gaps or overlaps an earlier target. */
+        if (a <= last && end >= first) {
+            for (unsigned j = 0; j < i; j++) {
+                b = (uintptr_t)spans[j].buffer;
+                if (spans[j].size && (a < b ? b - a < size : a - b < spans[j].size))
+                    return spans[i].error = EINVAL;
+            }
+        }
+        if (a < first) first = a;
+        if (end > last) last = end;
+    }
+    for (unsigned i = 0; i < count; i++) spans[i].error = EOK;
+    if (!count) return EOK;
+    if (count > 1 && !work) {
+        for (unsigned i = 0; i < count; i++) spans[i].error = ENOMEM;
+        return ENOMEM;
+    }
+    if (work) {
+        struct file_read_workspace *progress = completion && count > 1 ? work : NULL;
+        if (progress) {
+            progress->completion_spans = spans;
+            progress->completion = completion;
+            progress->completion_emitted = 0;
+        }
+        const struct ext4_file_read_plan plan = {
+            work->limits, work->fragments, work->reads, work->owners,
+            work->mapping_errors, EXT4_BLOCK_BATCH_MAX, progress
+        };
+        return ext4_fpread_planned(file, spans, count, &plan, size_limit, pad_eof);
+    }
+    unsigned bs = ext4_sb_get_block_size(&file->mp->fs.sb);
+    uint64_t blocks = spans[0].size / bs;
+    if (blocks < 8)
+        blocks += (spans[0].offset % bs + spans[0].size % bs + bs - 1) / bs;
+    if (blocks <= 1) return ext4_fpread_scalar1(file, spans, size_limit, pad_eof);
+    if (blocks <= 2) return ext4_fpread_scalar2(file, spans, size_limit, pad_eof);
+    if (blocks <= 4) return ext4_fpread_scalar4(file, spans, size_limit, pad_eof);
+    return ext4_fpread_scalar8(file, spans, size_limit, pad_eof);
 }
 
 /* Non-journal writes borrow caller versions until synchronous DMA completes;

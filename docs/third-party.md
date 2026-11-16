@@ -77,6 +77,7 @@ glibc 2.44 作为外部测试输入使用：官方源码归档保存在被忽略
   `third_party/lwext4` 的 `58bcf89a121b72d4fb66334f1693d3b30e4cb9c5` 加本地补丁。
   验证为 `make test-lwext4-cache-host test-lwext4-batch-read-host test-io-sleep-riscv`。
 
+- 无工作区的单输出批读用独立的 1/2/4/8 槽固定栈入口借给同一规划核心，已有工作区直接复用；不使用 VLA，不增加分配，描述符保持到 DMA 结束。
 - 普通文件批读直接借用调用者的 `file_read_workspace`，VFS/lwext4 共用文件区段，
   lwext4/块层共用字节区段；删除每次请求的规划分配和两层转换数组。可见 EOF 独立
   限制，不改变请求长度；短设备完成转为 EIO，各区段保留准确完成量。1/4/8 KiB、

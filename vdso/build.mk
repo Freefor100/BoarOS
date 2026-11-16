@@ -6,7 +6,7 @@ LA_VDSO_LD ?= $(LA_CROSS_COMPILE)ld
 define vdso_build
 $(1)/vdso/time.o: vdso/time.c include/kernel/vdso.h vdso/build.mk
 	@mkdir -p $$(dir $$@)
-	$(2) $(3) -Iinclude -Os -fPIC -ffreestanding -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables -c $$< -o $$@
+	$(2) $(3) -Iinclude -Os -fPIC -ffreestanding -fno-stack-protector -fstack-usage -fno-asynchronous-unwind-tables -fno-unwind-tables -c $$< -o $$@
 $(1)/vdso/sigreturn.o: vdso/sigreturn.S vdso/build.mk
 	@mkdir -p $$(dir $$@)
 	$(2) $(3) -fPIC -c $$< -o $$@
