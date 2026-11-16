@@ -502,7 +502,10 @@ static enum kernel_files_status read_pinned(
     }
     if (kind == KERNEL_OPEN_FILE_KIND_SOCKET) {
         if ((socket_flags & KERNEL_SOCKET_MSG_PEEK) && !socket_message) __builtin_trap();
-        struct kernel_socket_read_request read_request = {0};
+        struct kernel_socket_read_request read_request = {
+            .waitall = (socket_flags & KERNEL_SOCKET_MSG_WAITALL) &&
+                kernel_socket_is_tcp(kernel_open_file_socket(description))
+        };
         int received = 0;
         uint64_t target = 0;
         int timeout_captured = 0;
@@ -519,6 +522,14 @@ static enum kernel_files_status read_pinned(
             *linux_result = 0;
             return KERNEL_FILES_STATUS_OK;
         }
+        if (read_request.waitall && !(socket_flags & KERNEL_SOCKET_MSG_DONTWAIT)) {
+            uint64_t timeout = kernel_socket_receive_timeout(kernel_open_file_socket(description));
+            if (timeout) {
+                uint64_t now = kernel_time_monotonic_ns();
+                target = UINT64_MAX - now < timeout ? UINT64_MAX : now + timeout;
+            }
+            timeout_captured = 1;
+        }
         while (total < count || (message && total == 0)) {
             uint64_t remaining = count - total;
             received = kernel_socket_reserve_read(
@@ -526,7 +537,7 @@ static enum kernel_files_status read_pinned(
                 &read_request, description_owner,
                 remaining > UINT32_MAX ? UINT32_MAX : (uint32_t)remaining,
                 socket_flags & KERNEL_SOCKET_MSG_DONTWAIT, socket_message);
-            if (received == -KERNEL_EAGAIN && total == 0U && !(socket_flags & KERNEL_SOCKET_MSG_DONTWAIT)) {
+            if (received == -KERNEL_EAGAIN && (total == 0U || read_request.waitall) && !(socket_flags & KERNEL_SOCKET_MSG_DONTWAIT)) {
                 /* ready后数据仍可能被另一reader取走，本次调用只取得一次预算。 */
                 if (!timeout_captured) {
                     uint64_t timeout = kernel_socket_receive_timeout(kernel_open_file_socket(description));
@@ -537,7 +548,7 @@ static enum kernel_files_status read_pinned(
                     timeout_captured = 1;
                 }
                 int waited = target && kernel_time_monotonic_ns() >= target ? -KERNEL_EAGAIN :
-                    kernel_socket_wait_ready(kernel_open_file_socket(description), KERNEL_POLLIN, target, socket_flags);
+                    kernel_socket_wait_read(kernel_open_file_socket(description), &read_request, target, socket_flags);
                 if (waited == 0) continue;
                 received = waited;
             }
@@ -549,8 +560,9 @@ static enum kernel_files_status read_pinned(
             KERNEL_FILES_NOTE(files, read_chunks, 1);
             total += kernel_socket_finish_read(&read_request, fault);
             if (fault) { received = -KERNEL_EFAULT; break; }
-            /* 本批已覆盖当时可读前缀；不追读新数据或消费下一次应返回的错误。 */
-            break;
+            /* Ordinary reads stop at the ready prefix. WAITALL releases the
+             * reservation and receive credit before waiting for more data. */
+            if (!read_request.waitall || !received) break;
         }
         *linux_result = total != 0U ? (int64_t)total : received;
         if (*linux_result < 0) KERNEL_FILES_NOTE(files, read_failures, 1);

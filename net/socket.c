@@ -90,6 +90,7 @@ struct kernel_socket {
     struct socket_packet *packets_tail;
     struct socket_packet *retired_head, *retired_tail;
     uint32_t receive_credit;
+    uint64_t receive_sequence;
     struct socket_pending *pending_head;
     struct socket_pending *pending_tail;
     struct kernel_socket_read_request *read_request;
@@ -2855,8 +2856,10 @@ int kernel_socket_accept_check(struct kernel_socket *socket)
     return socket->listening ? 0 : -KERNEL_EINVAL;
 }
 
-int kernel_socket_wait_ready(struct kernel_socket *socket, uint32_t events,
-    uint64_t target_ns, uint32_t flags)
+static int socket_receive_empty(const struct kernel_socket *, int);
+
+static int socket_wait_ready(struct kernel_socket *socket, uint32_t events,
+    uint64_t target_ns, uint32_t flags, struct kernel_socket_read_request *request)
 {
     uint64_t deadline = 0;
     int timed = target_ns == 0;
@@ -2865,6 +2868,14 @@ int kernel_socket_wait_ready(struct kernel_socket *socket, uint32_t events,
         int ready = events == KERNEL_POLLIN && !socket->listening
             ? kernel_socket_receive_ready(socket)
             : (kernel_socket_poll(socket, 0) & (events | KERNEL_POLLERR | KERNEL_POLLHUP)) != 0;
+        if (request && request->peek_offset) {
+            /* Already peeked bytes are still POLLIN, but cannot satisfy this
+             * continuation. A consuming reader invalidates the peek cursor. */
+            ready = !socket->read_request &&
+                (socket->receive_sequence != request->peek_sequence ||
+                 socket->rx_bytes > request->peek_offset ||
+                 socket_receive_empty(socket, 0) != -KERNEL_EAGAIN);
+        }
         if (ready) return (events & KERNEL_POLLOUT) ? kernel_socket_unix_wait_error(socket) : 0;
         if (flags & KERNEL_SOCKET_MSG_DONTWAIT) return -KERNEL_EAGAIN;
         if (!timed) {
@@ -2886,11 +2897,23 @@ int kernel_socket_wait_ready(struct kernel_socket *socket, uint32_t events,
         if (reason == KERNEL_WAIT_TIMEOUT && target_ns && kernel_time_monotonic_ns() >= target_ns)
             return -KERNEL_EAGAIN;
         if (reason == KERNEL_WAIT_SIGNALLED) {
-            if (target_ns) return -KERNEL_EINTR;
+            if (target_ns || (request && request->progressed)) return -KERNEL_EINTR;
             kernel_signal_note_syscall_restart(kernel_task_current());
             return -KERNEL_ERESTARTSYS;
         }
     }
+}
+
+int kernel_socket_wait_ready(struct kernel_socket *socket, uint32_t events,
+    uint64_t target_ns, uint32_t flags)
+{
+    return socket_wait_ready(socket, events, target_ns, flags, NULL);
+}
+
+int kernel_socket_wait_read(struct kernel_socket *socket,
+    struct kernel_socket_read_request *request, uint64_t target_ns, uint32_t flags)
+{
+    return socket_wait_ready(socket, KERNEL_POLLIN, target_ns, flags, request);
 }
 
 /* 无队首数据时的状态；查询不消费错误，reservation入口负责交付。 */
@@ -2954,13 +2977,18 @@ retry:
         socket_state_release(&old_status);
         return -KERNEL_EAGAIN;
     }
+    int continuing_peek = request->waitall && message &&
+        (message->flags & KERNEL_SOCKET_MSG_PEEK);
+    if (!continuing_peek || socket->receive_sequence != request->peek_sequence)
+        request->peek_offset = 0;
+    request->peek_sequence = socket->receive_sequence;
     packet = socket->packets_head;
-    if (packet == 0) {
+    if (packet == 0 || (continuing_peek && request->peek_offset == socket->rx_bytes)) {
         if(message && socket->domain==KERNEL_SOCKET_DOMAIN_UNIX && socket->type==SOCKET_STREAM && socket->connected)
             message->receive_state=KERNEL_SOCKET_RECEIVE_STREAM_EMPTY;
         int result = socket_receive_empty(socket, nonblocking);
         if(message && !result && socket->type==SOCKET_SEQPACKET)message->receive_state=KERNEL_SOCKET_RECEIVE_EOF;
-        if (socket->pending_error) socket->pending_error = 0;
+        if (socket->pending_error && !request->progressed) socket->pending_error = 0;
         socket_state_release(&old_status);
         return result;
     }
@@ -2971,6 +2999,7 @@ retry:
     }
     if (capacity > (uint32_t)__INT_MAX__) capacity = __INT_MAX__;
     uint32_t available = kernel_socket_preserves_messages(socket) ? packet_available(packet) : socket->rx_bytes;
+    if (continuing_peek) available -= request->peek_offset;
     struct socket_packet *control_packet=packet;
     uint32_t control_offset=0;
     if(socket->domain==KERNEL_SOCKET_DOMAIN_UNIX && socket->type==SOCKET_STREAM) {
@@ -3055,6 +3084,7 @@ void kernel_socket_copy_read(const struct kernel_socket_read_request *request,
     if (request->socket == 0 || request->socket->read_request != request ||
         offset > request->bytes || length > request->bytes - offset)
         __builtin_trap();
+    offset += request->peek_offset;
     unsigned char *destination = buffer;
     while (length) {
         if (!packet) __builtin_trap();
@@ -3075,17 +3105,21 @@ int kernel_socket_read_user(struct kernel_socket_read_request *request,
     const struct socket_packet *packet = request->packet;
     if (!request->socket || request->socket->read_request != request || !packet)
         __builtin_trap();
-    uint32_t remaining = request->bytes;
+    uint32_t remaining = request->bytes, skip = request->peek_offset;
+    while (skip && packet && skip >= packet_available(packet)) {
+        skip -= packet_available(packet); packet = packet->next;
+    }
     struct kernel_uaccess_write_cursor pages = {0};
     int result = 0;
     request->completed_bytes = 0;
     /* bytes固定本次借用的队列前缀；后来追加的packet不扩充本次用户复制。 */
     while (remaining) {
         if (!packet) __builtin_trap();
-        uint32_t take = packet_available(packet);
+        uint32_t take = packet_available(packet) - skip;
         if (take > remaining) take = remaining;
         const struct pbuf *part = packet->payload;
-        uint32_t offset = packet->consumed, pending = take;
+        uint32_t offset = packet->consumed + skip, pending = take;
+        skip = 0;
         while (pending) {
             const void *source;
             size_t length = pending, copied = 0;
@@ -3167,6 +3201,7 @@ uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request, i
     if (partial) packet->consumed += partial;
     if (socket->rx_bytes < charge) __builtin_trap();
     socket->rx_bytes -= charge;
+    if (kernel_socket_is_tcp(socket)) socket->receive_sequence += charge;
     if(!peek && request->datagram && socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK) {
         uint32_t memory=packet_charge(retired->length);
         if(socket->netlink_memory<memory)__builtin_trap();
@@ -3208,6 +3243,10 @@ uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request, i
     request->socket = 0;
     wake_socket(socket);
     uint32_t delivered = user_fault && request->datagram ? 0 : bytes;
+    if (request->waitall && delivered) {
+        request->progressed = 1;
+        if (peek) request->peek_offset += delivered;
+    }
     socket_state_release(&scope);
     /* STREAM在载荷actor失败前已经捕获凭据；零字节recv也可接收rights。 */
     if(received && (!message || (!unix_stream &&

@@ -43,6 +43,10 @@ struct kernel_socket_read_request {
     struct kernel_task *task;
     void *packet;
     uint32_t bytes, completed_bytes;
+    /* Per-syscall TCP WAITALL continuation; no reservation survives a wait. */
+    uint64_t peek_sequence;
+    uint32_t peek_offset;
+    uint8_t waitall, progressed;
     int datagram;
     struct kernel_socket_message *message;
     void *peek_control;
@@ -207,6 +211,8 @@ int kernel_socket_read_user(struct kernel_socket_read_request *request,
 uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request,
                                int user_fault);
 void kernel_socket_abort_read(struct kernel_socket_read_request *request);
+int kernel_socket_wait_read(struct kernel_socket *socket,
+    struct kernel_socket_read_request *request, uint64_t target_ns, uint32_t flags);
 int kernel_socket_wait_ready(struct kernel_socket *socket, uint32_t events,
     uint64_t target_ns, uint32_t flags);
 #define KERNEL_SOCKET_MSG_PEEK 0x2U
