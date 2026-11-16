@@ -83,16 +83,24 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
         if (la_timer_interrupt(&elapsed)!=ARCH_TIMER_STATUS_OK) la_virt_fatal("timer interrupt");
 #if BOAROS_MAX_CPUS > 1
         la_smp_timer_seen();
-        if(kernel_cpu_current()->logical_id) {
-            if(kernel_scheduler_on_tick(elapsed)!=KERNEL_SCHEDULER_STATUS_OK)la_virt_fatal("AP scheduler");
-            return;
-        }
 #endif
-        if (elapsed) { kernel_tick_advance(elapsed); kernel_time_update_coarse(); kernel_scheduler_charge_ticks(elapsed,user); }
-        if (kernel_scheduler_expire_deadlines(arch_time_read())!=KERNEL_SCHEDULER_STATUS_OK)
-            la_virt_fatal("timer deadlines");
-        /* 首阶段 UART 未启用外部 IRQ，timer 必须唤醒已经睡眠的输入 owner。 */
-        kernel_console_poll_input();
+        if (elapsed) {
+#if BOAROS_MAX_CPUS > 1
+            if (!kernel_cpu_current()->logical_id)
+#endif
+            { kernel_tick_advance(elapsed); kernel_time_update_coarse(); }
+            /* 全局时间只由 CPU0 推进，各核仍须记入当前任务的 RT watchdog。 */
+            kernel_scheduler_charge_ticks(elapsed,user);
+        }
+#if BOAROS_MAX_CPUS > 1
+        if (!kernel_cpu_current()->logical_id)
+#endif
+        {
+            if (kernel_scheduler_expire_deadlines(arch_time_read())!=KERNEL_SCHEDULER_STATUS_OK)
+                la_virt_fatal("timer deadlines");
+            /* 首阶段 UART 未启用外部 IRQ，timer 必须唤醒已经睡眠的输入 owner。 */
+            kernel_console_poll_input();
+        }
         if (kernel_scheduler_on_tick(elapsed)!=KERNEL_SCHEDULER_STATUS_OK)
             la_virt_fatal("timer scheduler");
         return;

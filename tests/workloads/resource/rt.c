@@ -63,6 +63,14 @@ static void target_limit(void)
 }
 static void prepare_rt(rlim_t soft,rlim_t hard)
 {
+    uint64_t allowed=0;
+    CHECK(syscall(SYS_sched_getaffinity,0,sizeof(allowed),&allowed)>0&&allowed);
+    unsigned cpu=63-__builtin_clzll(allowed),actual=~0U;
+    uint64_t one=UINT64_C(1)<<cpu;
+    /* Force the secondary timer path on SMP instead of relying on placement.
+     * The stop/continue handshake already restricts both tasks to one CPU. */
+    CHECK(!syscall(SYS_sched_setaffinity,0,sizeof(one),&one));
+    CHECK(!syscall(SYS_getcpu,&actual,0,0)&&actual==cpu);
     limit(RLIMIT_CPU,3,3);limit(RLIMIT_RTTIME,soft,hard);
     struct sigaction action={.sa_handler=noted};CHECK(!sigaction(SIGXCPU,&action,0));policy(SCHED_FIFO,10);
 }

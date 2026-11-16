@@ -22,6 +22,7 @@ void *sync_test_cpu(void){return active;}
 void *sync_test_current_task(void){return active->current;}
 void sync_test_current_task_set(void *p){active->current=p;}
 uint64_t kernel_time_monotonic_ns(void){return now;}
+uint64_t kernel_time_ticks_to_ns(uint64_t ticks){return ticks;}
 uint64_t riscv_time_read(void){return now;}
 uint64_t kernel_tick_count(void){tick_reads++;return stamp;}
 uint32_t kernel_time_is_initialized(void){return 1;}

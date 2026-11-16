@@ -7,6 +7,7 @@ for shift in 12 14; do
       -DBOAROS_MAX_CPUS=2 -DBOAROS_PAGE_SHIFT=$shift -ffunction-sections -fdata-sections \
       -Itests/host/sync -idirafter include tests/host/rt_limits.c \
       kernel/sched/core.c kernel/sched/policy.c kernel/sched/runqueue.c kernel/sched/park.c \
+      kernel/sched/accounting.c \
       kernel/cpu.c kernel/raw_lock.c kernel/credentials.c tests/host/sync/notifications.c \
       -Wl,--gc-sections -o build/host/rt-limits/$shift
     build/host/rt-limits/$shift
