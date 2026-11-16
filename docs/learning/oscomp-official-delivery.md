@@ -1510,7 +1510,7 @@ main `16014248` 的宿主 BTF 编码工具构建经 `cd55d688` 单向合入兼�
 
 用户本次平台分项给出：LTP为LA glibc 6319、RV glibc 6444、LA musl 0、RV musl 5932；iperf其余三种架构/libc组合为6分，RV musl为5分。两份下载输出均为1048586字节，末尾明确附有“超过1MB的部分被截断”。它们都在glibc LTP的`cve-2016-7117`期间被截断，不能据下载末尾判定运行停在那里，也不能从它们核实后半程退出或整机终止原因。
 
-RV musl的实际失败项为`REVERSE_TCP`：还未输出连接／吞吐统计，就报告“unable to receive control message … Connection reset by peer”，原脚本输出`end: fail`。前五项均成功。原judge对这五项分别计1，对缺失接收吞吐的REVERSE_TCP计0，复核合计5，与平台一致。其他TCP项的`getsockopt - Protocol not available`警告在成功组合中也存在，不能据此归因本次控制连接重置。原脚本使用常驻`iperf3 -s -D`依次运行六项，REVERSE_TCP紧接REVERSE_UDP；后续定位需保留这一前序关系，不能只运行一个干净服务器上的反向TCP便宣布修复。
+用户确认RV的glibc和musl两组LTP均已完成，LA的glibc LTP没有完成、未进入musl LTP；不能因为下载日志截断而弱化这一实际进度差异。RV musl的实际失败项为`REVERSE_TCP`：还未输出连接／吞吐统计，就报告“unable to receive control message … Connection reset by peer”，原脚本输出`end: fail`。前五项均成功；用户确认另一轮测评中REVERSE_TCP成功，故记录为间歇失败。原judge对这五项分别计1，对缺失接收吞吐的REVERSE_TCP计0，复核合计5，与平台一致。其他TCP项的`getsockopt - Protocol not available`警告在成功组合中也存在，不能据此归因本次控制连接重置。原脚本使用常驻`iperf3 -s -D`依次运行六项，REVERSE_TCP紧接REVERSE_UDP；后续定位需保留这一前序关系，不能只运行一个干净服务器上的反向TCP便宣布修复。
 
 可见阶段使用客户机单调时钟：
 
