@@ -945,7 +945,22 @@ static void run_metadata_readonly_operations(struct kernel_files *files,
         kernel_files_utimensat(files, fs, mm, -1, TEST_USER_PATH, TEST_USER_BUFFER,
                                0, &result) != KERNEL_FILES_STATUS_OK || result != -KERNEL_EINVAL)
         fail_files(551U, -KERNEL_EINVAL, result);
+    if (kernel_files_utimensat(files, fs, mm, -1, 0, TEST_USER_BUFFER,
+                               0, &result) != KERNEL_FILES_STATUS_OK || result != -KERNEL_EBADF)
+        fail_files(560U, -KERNEL_EBADF, result);
+    if (!write_user_bytes(mm, TEST_USER_PATH, "/missing", 9) ||
+        kernel_files_utimensat(files, fs, mm, -1, TEST_USER_PATH, TEST_USER_BUFFER,
+                               0, &result) != KERNEL_FILES_STATUS_OK || result != -KERNEL_ENOENT)
+        fail_files(562U, -KERNEL_ENOENT, result);
+    times[0].nanoseconds = KERNEL_VFS_UTIME_OMIT;
+    times[1].nanoseconds = -1;
+    if (!write_user_bytes(mm, TEST_USER_BUFFER, times, sizeof(times)) ||
+        !write_user_bytes(mm, TEST_USER_PATH, "/data", 6) ||
+        kernel_files_utimensat(files, fs, mm, -1, TEST_USER_PATH, TEST_USER_BUFFER,
+                               0, &result) != KERNEL_FILES_STATUS_OK || result != -KERNEL_EINVAL)
+        fail_files(561U, -KERNEL_EINVAL, result);
     times[0].nanoseconds = 123;
+    times[1].nanoseconds = 1;
     if (!write_user_bytes(mm, TEST_USER_BUFFER, times, sizeof(times)) ||
         kernel_files_utimensat(files, fs, mm, -1, TEST_USER_PATH, TEST_USER_BUFFER,
                                0, &result) != KERNEL_FILES_STATUS_OK || result != -KERNEL_EROFS ||
@@ -1250,6 +1265,12 @@ static void run_mmap_operations(struct kernel_files *files,
         fail_files(64U, 0, -1);
     }
 
+    /* Earlier read faults may have populated ready neighbouring pages.
+     * Discard this leaf before injecting a demanded resident allocation. */
+    if (kernel_mm_madvise(mm, second_address + BOAROS_PAGE_SIZE, BOAROS_PAGE_SIZE, 4) ||
+        kernel_mm_lookup(mm, second_address + BOAROS_PAGE_SIZE, &second_mapping) !=
+            KERNEL_MM_STATUS_NOT_MAPPED)
+        fail_files(341U, KERNEL_MM_STATUS_NOT_MAPPED, -1);
     /* Fault-in allocation failure publishes neither PTE nor provenance. */
     fail_metadata_allocation = 1;
     enum kernel_mm_status resident_status = kernel_mm_resolve_user_fault(
@@ -2467,9 +2488,11 @@ static void run_dup_fcntl_operations(struct kernel_files *files,
         kernel_files_fcntl(files,
                            3,
                            KERNEL_FILES_F_SETFL,
-                           UINT64_C(0x40000),
+                           KERNEL_FILES_O_NOATIME,
                            &result) != KERNEL_FILES_STATUS_OK ||
-        result != -KERNEL_EINVAL ||
+        result != 0 ||
+        kernel_files_fcntl(files, 3, KERNEL_FILES_F_GETFL, 0U, &result) !=
+            KERNEL_FILES_STATUS_OK || result != KERNEL_FILES_O_NOATIME ||
         kernel_files_fcntl(files, 40, KERNEL_FILES_F_GETFD, 0U, &result) !=
             KERNEL_FILES_STATUS_OK ||
         result != -KERNEL_EBADF) {
@@ -2622,6 +2645,7 @@ static void run_fifo_allocation_failure(struct kernel_heap *heap)
     unsigned pending = fail_metadata_allocation; fail_metadata_allocation = 0;
     if (result != -KERNEL_ENOMEM || pending || pipe || node->fifo_pipe)
         fail_files(602U, -KERNEL_ENOMEM, result);
+    uint64_t before_open = physical_page_available(heap->page_allocator);
     if (kernel_pipe_fifo_open(heap, node, 2U, &pipe, &endpoint, &observed))
         fail_files(603U, 0, -1);
     /* FIFO打开只分配元数据，数据页在第一次写入时按需取得。 */
@@ -2634,9 +2658,12 @@ static void run_fifo_allocation_failure(struct kernel_heap *heap)
         node->fifo_pipe != pipe || physical_page_available(heap->page_allocator) != available)
         fail_files(605U, -KERNEL_ENOMEM, written.bytes);
     if (kernel_pipe_write_buffer(pipe,"x",1,2U|KERNEL_PIPE_NONBLOCK,&written) || written.bytes != 1 ||
-        kernel_pipe_release_endpoint(pipe, endpoint) != KERNEL_PIPE_STATUS_OK || node->fifo_pipe ||
-        physical_page_available(heap->page_allocator) != available)
+        kernel_pipe_release_endpoint(pipe, endpoint) != KERNEL_PIPE_STATUS_OK || node->fifo_pipe)
         fail_files(603U, 0, -1);
+    /* Closing releases metadata as well as data, including a heap slab page
+     * when this pipe was its last allocation. Compare matching lifetimes. */
+    if (physical_page_available(heap->page_allocator) != before_open)
+        fail_files(606U, before_open, physical_page_available(heap->page_allocator));
     if (kernel_open_file_release(&file) != KERNEL_OPEN_FILE_STATUS_OK ||
         kernel_vfs_path_release(&root) || kernel_vfs_unmount(mount))
         fail_files(604U, 0, -1);

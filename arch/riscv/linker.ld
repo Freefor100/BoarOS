@@ -1,6 +1,7 @@
 OUTPUT_ARCH(riscv)
 
-KERNEL_VIRTUAL_BASE = 0xffffffff80000000;
+/* Bare module fixtures can link at their physical execution address. */
+PROVIDE(KERNEL_VIRTUAL_BASE = 0xffffffff80000000);
 KERNEL_PHYSICAL_BASE = 0x80200000;
 KERNEL_LOAD_OFFSET = KERNEL_VIRTUAL_BASE - KERNEL_PHYSICAL_BASE;
 

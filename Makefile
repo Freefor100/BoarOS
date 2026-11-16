@@ -523,8 +523,8 @@ endif
 ifeq ($(FILE_IO_SMP_TEST),1)
 OBJECTS += $(BUILD_DIR)/tests/riscv/file_io_smp.o
 $(BUILD_DIR)/tests/riscv/file_io_smp.o: CPPFLAGS += $(LWEXT4_CPPFLAGS)
-LDFLAGS += -Wl,--wrap=kernel_page_cache_run_cpu0,--wrap=kernel_copy_from_user,--wrap=riscv_plic_in_interrupt,--wrap=kernel_uaccess_write_cursor_copy,--wrap=kernel_vfs_node_pread_batch
-LDFLAGS += -Wl,--wrap=ext4_file_prepare_write,--wrap=ext4_ftruncate,--wrap=ext4_fallocate,--wrap=ext4_file_sync_metadata_prepare
+LDFLAGS += -Wl,--wrap=kernel_page_cache_run_cpu0,--wrap=kernel_copy_from_user,--wrap=kernel_copy_to_user,--wrap=riscv_plic_in_interrupt,--wrap=kernel_uaccess_write_cursor_copy,--wrap=kernel_vfs_node_pread_batch
+LDFLAGS += -Wl,--wrap=ext4_file_prepare_write,--wrap=ext4_file_reserve_write,--wrap=ext4_ftruncate,--wrap=ext4_fallocate,--wrap=ext4_file_sync_metadata_prepare
 LDFLAGS += -Wl,--wrap=virtio_split_enqueue
 LDFLAGS += -Wl,--wrap=ext4_lookup_child,--wrap=ext4_create_child,--wrap=ext4_unlink_child,--wrap=ext4_rename_child,--wrap=ext4_dir_entry_next_status
 endif
@@ -892,8 +892,11 @@ $(UACCESS_TEST_KERNEL_RV): $(UACCESS_TEST_OBJECTS) \
 		-Wl,--wrap=kernel_mm_pin_user_page -Wl,-Map,$(BUILD_DIR)/tests/kernel-uaccess-rv.map \
 		-o $@ $(UACCESS_TEST_OBJECTS)
 
+# These two entry points stay in bare physical mode with an identity allocator;
+# static backend/function pointers must name their actual execution addresses.
 $(FILES_TEST_KERNEL_RV): $(FILES_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) \
+		-Wl,--defsym=KERNEL_VIRTUAL_BASE=0x80200000 \
 		-Wl,--wrap=kernel_open_file_prepare_mapping_page \
 		-Wl,--wrap=kernel_open_file_release \
 		-Wl,--wrap=kernel_heap_allocate \
@@ -908,6 +911,7 @@ $(FILES_TEST_KERNEL_RV): $(FILES_TEST_OBJECTS) arch/riscv/linker.ld
 $(FILES_PARTIAL_WRITE_TEST_KERNEL_RV): \
 		$(FILES_PARTIAL_WRITE_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) \
+		-Wl,--defsym=KERNEL_VIRTUAL_BASE=0x80200000 \
 		-Wl,--wrap=kernel_open_file_prepare_mapping_page \
 		-Wl,--wrap=kernel_open_file_release \
 		-Wl,--wrap=kernel_heap_allocate_zeroed \

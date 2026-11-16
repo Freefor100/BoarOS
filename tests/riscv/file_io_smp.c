@@ -47,6 +47,9 @@ static void observe_metadata(ext4_file *file, unsigned operation)
 int __real_ext4_file_prepare_write(ext4_file *,uint64_t,size_t,size_t *,bool *);
 int __wrap_ext4_file_prepare_write(ext4_file *file,uint64_t offset,size_t length,size_t *ready,bool *complete)
 { observe_metadata(file,0); return __real_ext4_file_prepare_write(file,offset,length,ready,complete); }
+int __real_ext4_file_reserve_write(ext4_file *,uint64_t,size_t,size_t *,struct file_write_reservation *);
+int __wrap_ext4_file_reserve_write(ext4_file *file,uint64_t offset,size_t length,size_t *ready,struct file_write_reservation *ticket)
+{ observe_metadata(file,0); return __real_ext4_file_reserve_write(file,offset,length,ready,ticket); }
 int __real_ext4_ftruncate(ext4_file *,uint64_t, uint32_t privilege_mode);
 int __wrap_ext4_ftruncate(ext4_file *file,uint64_t size, uint32_t privilege_mode)
 { observe_metadata(file,1); return __real_ext4_ftruncate(file,size, privilege_mode); }
@@ -97,16 +100,30 @@ enum virtio_status __wrap_virtio_split_enqueue(struct virtio_split_queue *queue,
     }
     return __real_virtio_split_enqueue(queue,transport,head,token,minimum,maximum);
 }
-enum kernel_uaccess_status __real_kernel_uaccess_write_cursor_copy(struct kernel_mm *,
-    struct kernel_uaccess_write_cursor *,uint64_t,const void *,size_t,size_t *);
-enum kernel_uaccess_status __wrap_kernel_uaccess_write_cursor_copy(struct kernel_mm *mm,
-    struct kernel_uaccess_write_cursor *cursor,uint64_t address,const void *source,size_t size,size_t *copied)
+static void observe_user_copy(void)
 {
     if(watch_copy) {
         unsigned cpu=kernel_cpu_current()->logical_id;
         if(cpu!=copy_cpu)riscv_smp_fail("file-io-user-copy-left-caller-hart",cpu);
         local_copies[cpu]++;
     }
+}
+/* Scalar copies call the cursor inside uaccess.c, so ld --wrap cannot see
+ * that internal reference. Observe both external entry points instead. */
+enum kernel_uaccess_status __real_kernel_copy_to_user(struct kernel_mm *,
+    uint64_t,const void *,size_t,size_t *);
+enum kernel_uaccess_status __wrap_kernel_copy_to_user(struct kernel_mm *mm,
+    uint64_t address,const void *source,size_t size,size_t *copied)
+{
+    observe_user_copy();
+    return __real_kernel_copy_to_user(mm,address,source,size,copied);
+}
+enum kernel_uaccess_status __real_kernel_uaccess_write_cursor_copy(struct kernel_mm *,
+    struct kernel_uaccess_write_cursor *,uint64_t,const void *,size_t,size_t *);
+enum kernel_uaccess_status __wrap_kernel_uaccess_write_cursor_copy(struct kernel_mm *mm,
+    struct kernel_uaccess_write_cursor *cursor,uint64_t address,const void *source,size_t size,size_t *copied)
+{
+    observe_user_copy();
     return __real_kernel_uaccess_write_cursor_copy(mm,cursor,address,source,size,copied);
 }
 int __real_kernel_vfs_node_pread_batch(struct kernel_vfs_node *,struct file_read_span *,size_t,struct file_read_workspace *, const struct file_read_completion *);
@@ -307,6 +324,23 @@ static void verify(void *unused)
         virt_uart_puts(" after=");virt_uart_put_hex(after.requests_queued);virt_uart_putc('\n');
     }
     check(local_copies[copy_cpu] && before.requests_queued==after.requests_queued,"file-io-hot-no-cpu0-request");
+    /* A multi-iovec read exercises the retained-cursor entry independently
+     * of the scalar path; neither probe dictates an exact copy count. */
+    struct kernel_uaccess_iovec vectors[2]={{IO_BUFFER,2},{IO_BUFFER+2,2}};
+    check(!kernel_copy_to_user(mm,IO_ANON+1024,vectors,sizeof(vectors),&copied) &&
+        copied==sizeof(vectors),"file-io-hot-vector-ready");
+    unsigned scalar_copies=local_copies[copy_cpu];
+    kernel_page_cache_get_concurrency_state(cache,&before);
+    watch_copy=1;
+    check(!kernel_files_preadv(files,mm,0,IO_ANON+1024,2,0,&result) && result==4,
+        "file-io-hot-local-preadv");
+    watch_copy=0;
+    kernel_page_cache_get_concurrency_state(cache,&after);
+    char vector_bytes[4];
+    check(local_copies[copy_cpu]>scalar_copies && before.requests_queued==after.requests_queued &&
+        !kernel_copy_from_user(mm,vector_bytes,IO_BUFFER,sizeof(vector_bytes),&copied) &&
+        copied==sizeof(vector_bytes) && !memcmp(vector_bytes,"IO00",4),
+        "file-io-hot-vector-no-cpu0-request");
     char zero=0;
     check(!kernel_copy_to_user(mm,IO_ANON,&zero,1,&copied) && copied==1,"file-io-cold-destination-ready");
     int64_t timeout[2]={0,1000};

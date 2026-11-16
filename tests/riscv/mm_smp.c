@@ -1099,6 +1099,9 @@ static void execute(void *unused)
 #endif
     virt_uart_puts("BoarOS: file MM controller/OFD/registration/private mount owners returned\n");
 #endif
+    /* Joined users no longer own VMAs, but idle CPUs may still borrow an
+     * empty root and MM record. Drain those owners before retiring the arena. */
+    riscv_smp_drain_roots();
     physical_page_release(&arena, template_page);
     struct kernel_heap_statistics statistics; kernel_heap_get_statistics(&heap, &statistics);
     virt_uart_puts("BoarOS: MM arena closure live="); virt_uart_put_hex(statistics.live_allocations);
