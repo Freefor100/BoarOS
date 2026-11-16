@@ -14,7 +14,8 @@ struct host_task { struct kernel_task task; unsigned *dispatch; unsigned id; };
 #include <kernel/time.h>
 
 _Thread_local uintptr_t sync_test_irq = 1;
-_Thread_local unsigned sync_test_irq_restores;
+_Thread_local unsigned sync_test_irq_restores, sync_test_irq_saves;
+static _Thread_local struct kernel_lock_guard *publishing_guard;
 static _Thread_local unsigned segment_restores;
 static _Thread_local struct kernel_cpu cpu;
 static void publish_task(struct kernel_cpu *target,struct kernel_task *task) { target->current = task; }
@@ -123,6 +124,9 @@ void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *raw, struct kernel_r
 void __real_kernel_raw_lock_release(struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_release(struct kernel_raw_guard *guard)
 {
+    if (publishing_guard && guard->lock==&lock.metadata)
+        assert(current.io_context.locks==publishing_guard &&
+            publishing_guard->lock==&lock && publishing_guard->owner==&current.io_context);
     if(spin_mode==4 && spin_long_expected && guard->lock==&lock.metadata &&
        host_current.id==0 && lock.writer && lock.writer!=&current.io_context && !lock.pending_head)
         __atomic_store_n(&spin_clock_finish,1,__ATOMIC_RELEASE);
@@ -445,8 +449,15 @@ int main(void)
         sync_test_irq = irq;
         struct kernel_lock_guard guard = {0};
         kernel_rwlock_init(&lock, 10, 1);
+        unsigned saves=sync_test_irq_saves;
+        publishing_guard=&guard;
         assert(kernel_rwlock_try_read(&lock, &guard));
+        publishing_guard=NULL;
+        /* One block-context snapshot and one actual metadata protection. */
+        assert(sync_test_irq_saves==saves+2);
+        saves=sync_test_irq_saves;
         kernel_lock_release(&guard);
+        assert(sync_test_irq_saves==saves+1);
         assert(sync_test_irq == irq && !cpu.raw_locks && !cpu.preempt_depth);
     }
     sync_test_irq = 1;

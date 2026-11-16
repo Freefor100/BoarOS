@@ -109,6 +109,7 @@ COMMITTED任务的模拟backend与生产一样在通知中摘除默认节点，�
 finish每段最多摘16个登记，未借用的小批登记可在同一保护下结束；存在借用才等待归还。
 
 可睡眠RWlock每实例持有rank30内部raw；资格判断与token登记在同一保护下完成，释放raw后等待。
+未竞争的取得与释放由内部raw保存、恢复本核中断状态，不再套一层相同的IRQ区间。取得资格后，在释放raw之前一并发布guard及任务的持锁链；中断恢复时，锁状态与实际owner已完整可见。排队路径仍在各段元数据保护之间保持原IRQ约束，只在既有自旋、等待及最终返回边界恢复调用者状态；分段授予读资格时，raw解锁提供原有的中断响应间隙。
 `kernel_rwlock_try_write()`及mutex包装只尝试取得，不登记等待者；已有读/写owner、pending或handoff均返回忙，guard和IRQ状态保持。它保留相同rank/key、owner与上下文检查，不能用于越过FIFO或在raw内取得任务锁。
 未竞争取得不在热路径栈上构造waiter；慢路径持有其栈waiter至token结束、pending摘除及重新取得对象raw，覆盖通知者的最后访问。
 FIFO先授资格再通知，连续读者按原边界分段，每段最多16个等待者，handoff owner覆盖分段间隙。
