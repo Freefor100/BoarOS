@@ -53,6 +53,7 @@
 #define RAW_MAX_PAYLOAD 65515U
 #define SOCKET_WRITE_BATCH 4U
 #define SOCKET_WRITE_RETRY_MS 250U
+#define SOCKET_RECEIVE_SPARES 8U
 
 struct socket_packet {
     struct socket_packet *next;
@@ -89,6 +90,8 @@ struct kernel_socket {
     struct socket_packet *packets_head;
     struct socket_packet *packets_tail;
     struct socket_packet *retired_head, *retired_tail;
+    struct socket_packet *receive_spares;
+    unsigned receive_spare_count;
     uint32_t receive_credit;
     uint64_t receive_sequence;
     struct socket_pending *pending_head;
@@ -1867,6 +1870,38 @@ static void packet_publish(struct kernel_socket *socket, struct socket_packet *p
     packet_publish_locked(socket,packet,charge);
 }
 
+/* Only the socket's protocol owner touches empty receive nodes. Readers still
+ * retire payload owners under the endpoint lock; reuse starts after pbuf_free,
+ * never while a reserved prefix or a DMA payload can refer to the node. Eight
+ * lazy slots cover short receive bursts and retain at most 1 KiB of slab slots
+ * per active socket. Excess nodes and every node at final close go to the heap. */
+static struct socket_packet *receive_packet_allocate(struct kernel_socket *socket)
+{
+    struct socket_packet *packet=socket->receive_spares;
+    if(packet) {
+        socket->receive_spares=packet->next;
+        socket->receive_spare_count--;
+        *packet=(struct socket_packet){0};
+        return packet;
+    }
+    enum kernel_heap_status status=kernel_heap_allocate_zeroed(socket->heap,1,
+        sizeof(*packet),(void **)&packet);
+    if(status==KERNEL_HEAP_STATUS_EMPTY)return NULL;
+    if(status!=KERNEL_HEAP_STATUS_OK)__builtin_trap();
+    return packet;
+}
+
+static void receive_packet_release(struct kernel_socket *socket,struct socket_packet *packet)
+{
+    if(packet->payload)pbuf_free(packet->payload);
+    packet->payload=NULL;
+    if(!socket->destroying && socket->receive_spare_count<SOCKET_RECEIVE_SPARES) {
+        packet->next=socket->receive_spares;
+        socket->receive_spares=packet;
+        socket->receive_spare_count++;
+    } else kernel_heap_release(socket->heap,packet);
+}
+
 static void udp_received(void *context, struct udp_pcb *pcb,
                          struct pbuf *payload, const ip_addr_t *peer,
                          u16_t port)
@@ -1881,14 +1916,11 @@ static void udp_received(void *context, struct udp_pcb *pcb,
         UDP_STATS_INC(udp.memerr);
         socket_pbuf_free(payload); return;
     }
-    enum kernel_heap_status status =
-        kernel_heap_allocate_zeroed(socket->heap, 1U, sizeof(*packet),
-                                    (void **)&packet);
-    if (status == KERNEL_HEAP_STATUS_EMPTY) {
+    packet=receive_packet_allocate(socket);
+    if (!packet) {
         socket_pbuf_free(payload);
         return;
     }
-    if (status != KERNEL_HEAP_STATUS_OK) __builtin_trap();
     packet->payload = payload;
     address_export(socket, peer, port, &packet->address);
     {
@@ -1899,8 +1931,7 @@ static void udp_received(void *context, struct udp_pcb *pcb,
         }
     }
     UDP_STATS_INC(udp.memerr);
-    socket_pbuf_free(payload);
-    kernel_heap_release(socket->heap,packet);
+    receive_packet_release(socket,packet);
 }
 
 /* Raw input precedes ICMP processing, which can strip headers and rewrite an
@@ -1929,13 +1960,10 @@ static u8_t raw_received(void *context,struct raw_pcb *pcb,struct pbuf *input,
          socket->rx_bytes>socket->rx_limit-charge)return 0; }
     if((network_udp_capacity && !network_udp_capacity(network_context)) ||
        STATS_GET(mem.used)>MEM_SIZE-(65536U+4096U))return 0;
-    struct socket_packet *packet=NULL;
-    enum kernel_heap_status status=kernel_heap_allocate_zeroed(socket->heap,1,
-        sizeof(*packet),(void **)&packet);
-    if(status==KERNEL_HEAP_STATUS_EMPTY)return 0;
-    if(status!=KERNEL_HEAP_STATUS_OK)__builtin_trap();
+    struct socket_packet *packet=receive_packet_allocate(socket);
+    if(!packet)return 0;
     struct pbuf *copy=pbuf_alloc(PBUF_RAW,(u16_t)kept,PBUF_RAM);
-    if(!copy) {kernel_heap_release(socket->heap,packet);return 0;}
+    if(!copy) {receive_packet_release(socket,packet);return 0;}
     if(pbuf_copy_partial(input,copy->payload,(u16_t)kept,0)!=kept)__builtin_trap();
     packet->payload=copy;
     address_export(socket,peer,0,&packet->address);
@@ -1944,7 +1972,7 @@ static u8_t raw_received(void *context,struct raw_pcb *pcb,struct pbuf *input,
          socket->rx_bytes<=socket->rx_limit-charge) {
           packet_publish_locked(socket,packet,charge);return 0;
       } }
-    socket_pbuf_free(copy);kernel_heap_release(socket->heap,packet);
+    receive_packet_release(socket,packet);
     return 0;
 }
 
@@ -1973,7 +2001,6 @@ static err_t tcp_data_received(void *context, struct tcp_pcb *pcb,
 {
     struct kernel_socket *socket = context;
     struct socket_packet *packet = 0;
-    enum kernel_heap_status status;
     (void)pcb;
     if (payload == 0) {
         SOCKET_ENDPOINT(state,socket);socket->peer_closed = 1U;
@@ -1984,10 +2011,8 @@ static err_t tcp_data_received(void *context, struct tcp_pcb *pcb,
     if (error != ERR_OK) return error;
     /* TCP already charged the advertised receive credit, including bytes
      * promised before SO_RCVBUF was lowered. Only real memory can fail here. */
-    status = kernel_heap_allocate_zeroed(socket->heap, 1U, sizeof(*packet),
-                                         (void **)&packet);
-    if (status == KERNEL_HEAP_STATUS_EMPTY) { KERNEL_IRQ_LOCK_SCOPE(state,&socket_state_lock);socket->receive_retry=1; work_remove_locked(&receive_wait, socket); work_add_locked(&receive_wait, socket, receive_generation); return ERR_MEM; }
-    if (status != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    packet=receive_packet_allocate(socket);
+    if (!packet) { KERNEL_IRQ_LOCK_SCOPE(state,&socket_state_lock);socket->receive_retry=1; work_remove_locked(&receive_wait, socket); work_add_locked(&receive_wait, socket, receive_generation); return ERR_MEM; }
     packet->payload = payload;
     if (socket->receive_retry) {
         KERNEL_IRQ_LOCK_SCOPE(state,&socket_state_lock);
@@ -2271,8 +2296,7 @@ static void retire_received(struct kernel_socket *socket)
     int freed = packets != 0;
     while (packets) {
         struct socket_packet *next = packets->next;
-        if (packets->payload) pbuf_free(packets->payload);
-        kernel_heap_release(socket->heap, packets);
+        receive_packet_release(socket,packets);
         packets = next;
     }
     if (freed) receive_capacity();
@@ -2432,6 +2456,12 @@ void kernel_socket_destroy(struct kernel_socket *socket)
       work_remove_locked(&nic_wait,socket);work_remove_locked(&receive_wait,socket); }
     write_retry_disarm(socket);
     retire_received(socket);
+    while(socket->receive_spares) {
+        struct socket_packet *packet=socket->receive_spares;
+        socket->receive_spares=packet->next;
+        kernel_heap_release(socket->heap,packet);
+    }
+    socket->receive_spare_count=0;
     if (!socket->inet_previous || *socket->inet_previous!=socket) __builtin_trap();
     *socket->inet_previous=socket->inet_next;
     if (socket->inet_next) socket->inet_next->inet_previous=socket->inet_previous;

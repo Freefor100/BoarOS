@@ -1983,6 +1983,140 @@ static void retired_payload_free(struct pbuf *payload)
     CHECK(payload && protocol_owner == &test_context && protocol_depth && arch_interrupt_is_enabled());
     retired_payloads++;
 }
+/* Queue more records than the cache can keep. The payload callback is the
+ * ownership observation: empty nodes must not retain payload references. */
+static void receive_node_reuse_udp(void)
+{
+    kernel_socket_network_initialize();
+    struct kernel_socket *socket=NULL;
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,0,&socket));
+    unsigned base=heap_live,returned=retired_payloads;
+    struct pbuf_custom custom[24];unsigned char data[24][4];
+    ip_addr_t peer;IP_ADDR4(&peer,127,0,0,1);
+    struct kernel_socket_protocol_scope scope;
+    struct kernel_open_file_description *pin=(void *)socket;
+    struct kernel_socket_read_request read={0};
+    for(unsigned round=0;round<3;round++) {
+        unsigned allocations=heap_allocations;
+        kernel_socket_protocol_enter(&scope);
+        for(unsigned i=0;i<24;i++) {
+            unsigned length=i%4;
+            memset(data[i],(int)(i+round),sizeof(data[i]));
+            custom[i]=(struct pbuf_custom){.custom_free_function=retired_payload_free};
+            struct pbuf *p=pbuf_alloced_custom(PBUF_RAW,length,PBUF_REF,&custom[i],data[i],4);
+            CHECK(p);udp_received(socket,socket->udp,p,&peer,(u16_t)(24000+i+round));
+            CHECK(p->ref==1);
+        }
+        kernel_socket_protocol_leave(&scope);
+        if(round)CHECK(heap_allocations-allocations==24-SOCKET_RECEIVE_SPARES);
+        for(unsigned i=0;i<24;i++) {
+            unsigned length=i%4,bytes=length>1?1:length;
+            struct kernel_socket_message message={.flags=KERNEL_SOCKET_MSG_PEEK};
+            unsigned charge=socket->rx_bytes;
+            CHECK(kernel_socket_reserve_read(socket,NULL,&read,&pin,1,0,&message)==(int)bytes);
+            CHECK(kernel_socket_finish_read(&read,0)==bytes && socket->rx_bytes==charge);
+            CHECK(kernel_socket_reserve_read(socket,NULL,&read,&pin,1,0,NULL)==(int)bytes);
+            struct kernel_socket_address address;uint32_t actual;
+            kernel_socket_read_info(&read,&address,&actual);
+            CHECK(actual==length && address.port==24000+i+round && address.family==KERNEL_SOCKET_AF_INET);
+            unsigned char out=255;kernel_socket_copy_read(&read,0,&out,bytes);
+            CHECK(!bytes || out==(unsigned char)(i+round));
+            CHECK(kernel_socket_finish_read(&read,0)==bytes);
+        }
+        CHECK(!socket->rx_bytes && !socket->packets_head && retired_payloads==returned);
+        tcp_more_service();
+        CHECK(retired_payloads==returned+24 && !socket->retired_head &&
+              heap_live-base==SOCKET_RECEIVE_SPARES);
+        returned=retired_payloads;
+    }
+    /* A warm endpoint accepts under heap failure, but its UDP byte limit still
+     * drops a complete record and returns its payload, not a truncated record. */
+    kernel_socket_protocol_enter(&scope);
+    socket->rx_limit=1;heap_fail_after=1;
+    for(unsigned i=0;i<3;i++) {
+        custom[i]=(struct pbuf_custom){.custom_free_function=retired_payload_free};
+        struct pbuf *p=pbuf_alloced_custom(PBUF_RAW,1,PBUF_REF,&custom[i],data[i],4);CHECK(p);
+        udp_received(socket,socket->udp,p,&peer,25000+i);
+    }
+    CHECK(heap_fail_after==1 && socket->rx_bytes==1 && retired_payloads==returned+2);
+    heap_fail_after=0;
+    kernel_socket_protocol_leave(&scope);
+    CHECK(kernel_socket_reserve_read(socket,NULL,&read,&pin,1,0,NULL)==1);
+    CHECK(kernel_socket_finish_read(&read,0)==1);
+    kernel_socket_protocol_enter(&scope);
+    custom[3]=(struct pbuf_custom){.custom_free_function=retired_payload_free};
+    struct pbuf *p=pbuf_alloced_custom(PBUF_RAW,1,PBUF_REF,&custom[3],data[3],4);CHECK(p);
+    udp_received(socket,socket->udp,p,&peer,25003);
+    kernel_socket_protocol_leave(&scope);
+    /* Final close sees a live queue, retirement and empty nodes together. */
+    CHECK(socket->packets_head && socket->retired_head && heap_live>base);
+    kernel_socket_destroy(socket);
+    CHECK(!heap_live && retired_payloads==returned+4);
+    socket=NULL;CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,0,&socket));
+    kernel_socket_protocol_enter(&scope);
+    custom[0]=(struct pbuf_custom){.custom_free_function=retired_payload_free};
+    p=pbuf_alloced_custom(PBUF_RAW,1,PBUF_REF,&custom[0],data[0],4);CHECK(p);
+    heap_fail_after=1;udp_received(socket,socket->udp,p,&peer,25004);
+    CHECK(!heap_fail_after && !socket->packets_head && retired_payloads==returned+5);
+    kernel_socket_protocol_leave(&scope);kernel_socket_destroy(socket);CHECK(!heap_live);
+    puts("PASS receive node reuse UDP: bounded burst cache, no pbuf refs, zero/truncated/peek records, source reset, heap failure, byte limit and mixed-owner close");
+}
+
+static void receive_node_reuse_tcp(void)
+{
+    struct kernel_socket *listener=NULL,*client=NULL,*server=NULL;
+    connected_pair(&listener,&client,&server);
+    struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    tcp_nagle_disable(client->tcp);
+    CHECK(write_buffer(client,"abcd",4,0)==4);netif_poll_all();
+    struct kernel_open_file_description *pin=(void *)server;
+    struct kernel_socket_read_request read={0};
+    char data[4]={0};
+    CHECK(kernel_socket_reserve_read(server,NULL,&read,&pin,2,0,NULL)==2);
+    kernel_socket_copy_read(&read,0,data,2);CHECK(!memcmp(data,"ab",2));
+    CHECK(kernel_socket_finish_read(&read,0)==2);
+    retire_received(server);
+    /* Partial consumption returns credit, but cannot recycle a live node. */
+    heap_fail_after=1;CHECK(write_buffer(client,"ef",2,0)==2);netif_poll_all();
+    CHECK(!heap_fail_after && server->receive_retry && server->tcp->refused_data && server->rx_bytes==2);
+    struct pbuf *refused=server->tcp->refused_data;
+    CHECK(refused->ref==1);
+    CHECK(kernel_socket_reserve_read(server,NULL,&read,&pin,2,0,NULL)==2);
+    kernel_socket_copy_read(&read,0,data,2);CHECK(!memcmp(data,"cd",2));
+    CHECK(kernel_socket_finish_read(&read,0)==2);
+    /* The scheduled REAP precedes retry and supplies the node without a timer
+     * or a successful heap allocation. A zero service budget does no work. */
+    kernel_socket_protocol_leave(&scope);
+    heap_fail_after=1;
+    kernel_socket_service_pending((struct kernel_socket_service_budget){0,0,0});
+    CHECK(server->tcp->refused_data==refused && server->rx_bytes==0);
+    for(unsigned i=0;i<8 && server->receive_retry;i++)
+        kernel_socket_service_pending((struct kernel_socket_service_budget){1,0,0});
+    CHECK(heap_fail_after==1 && !server->receive_retry && !server->tcp->refused_data && server->rx_bytes==2);
+    heap_fail_after=0;
+    CHECK(kernel_socket_reserve_read(server,NULL,&read,&pin,2,0,NULL)==2);
+    kernel_socket_copy_read(&read,0,data,2);CHECK(!memcmp(data,"ef",2));
+    CHECK(kernel_socket_finish_read(&read,0)==2);
+    tcp_more_service();
+    /* Repeated actual TCP input consumes no new kernel receive nodes once the
+     * retired node is available. Stream offsets were cleared after partial RX. */
+    unsigned allocations=heap_allocations;
+    for(unsigned i=0;i<16;i++) {
+        CHECK(write_buffer(client,"next",4,0)==4);tcp_more_service();
+        CHECK(kernel_socket_reserve_read(server,NULL,&read,&pin,4,0,NULL)==4);
+        kernel_socket_copy_read(&read,0,data,4);CHECK(!memcmp(data,"next",4));
+        CHECK(kernel_socket_finish_read(&read,0)==4);tcp_more_service();
+    }
+    CHECK(heap_allocations==allocations);
+    kernel_socket_protocol_enter(&scope);
+    if(client->tcp)tcp_abort(client->tcp);
+    if(server->tcp)tcp_abort(server->tcp);
+    kernel_socket_protocol_leave(&scope);
+    kernel_socket_destroy(server);kernel_socket_destroy(client);kernel_socket_destroy(listener);
+    tcp_more_service();CHECK(!heap_live && !receive_wait.head);
+    puts("PASS receive node reuse TCP: partial prefix, refused_data ownership, zero budget, retirement-driven OOM retry, reset offsets and allocation-free steady input");
+}
+
 static void endpoint_ownership(void)
 {
     kernel_socket_network_initialize();
@@ -3675,6 +3809,8 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "concurrent-reservation")) {concurrent_reservation();return 0;}
     else if (!strcmp(argv[1], "protocol-owner")) { protocol_ownership(); return 0; }
     else if (!strcmp(argv[1], "endpoint-owner")) endpoint_ownership();
+    else if (!strcmp(argv[1], "receive-reuse-udp")) receive_node_reuse_udp();
+    else if (!strcmp(argv[1], "receive-reuse-tcp")) receive_node_reuse_tcp();
     else if (!strcmp(argv[1], "receive-chains")) receive_packet_chains();
     else if (!strcmp(argv[1], "receive-prefix")) receive_prefix();
     else if (!strcmp(argv[1], "protocol-transaction")) protocol_transaction();
