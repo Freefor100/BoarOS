@@ -397,7 +397,8 @@ static void *network_context;
 static struct kernel_socket *write_retry_head;
 
 enum { SOCKET_WORK_OUTPUT = 1, SOCKET_WORK_RECEIVE = 2, SOCKET_WORK_REAP = 4,
-       SOCKET_WORK_LISTENER = 8, SOCKET_WORK_PROMOTE = 16, SOCKET_WORK_DEVICE_FAILED = 32 };
+       SOCKET_WORK_LISTENER = 8, SOCKET_WORK_PROMOTE = 16, SOCKET_WORK_DEVICE_FAILED = 32,
+       SOCKET_WORK_PUSH = 64 };
 struct socket_work_queue { struct kernel_socket *head, *tail; unsigned slot; };
 static struct socket_work_queue ready_work, pool_wait = {.slot = 1}, nic_wait = {.slot = 2}, receive_wait = {.slot = 3};
 static uint64_t pool_generation, nic_generation, receive_generation;
@@ -1470,6 +1471,8 @@ static uint64_t socket_next_timer_deadline(void)
     milliseconds = socket_initialized ? sys_timeouts_sleeptime()
                                       : SYS_TIMEOUTS_SLEEPTIME_INFINITE;
     u32_t current_ms = sys_now();
+    u32_t cork_delay = boaros_lwip_tcp_cork_delay(current_ms);
+    if (cork_delay < milliseconds) milliseconds = cork_delay;
     {SOCKET_STATE(state);if(rights_retry_pending) {
         int32_t remaining=(int32_t)(rights_retry_ms-current_ms);
         u32_t retry=remaining<=0?1U:(u32_t)remaining;
@@ -2451,6 +2454,7 @@ void kernel_socket_destroy(struct kernel_socket *socket)
     if (socket->raw != 0) {raw_recv(socket->raw,NULL,NULL);raw_remove(socket->raw);socket->raw=NULL;}
     if (socket->tcp != 0) {
         if (!socket->listening) {
+            boaros_lwip_tcp_push(socket->tcp);
             tcp_arg(socket->tcp, 0);
             tcp_err(socket->tcp, 0);
             tcp_recv(socket->tcp, 0);
@@ -3345,6 +3349,7 @@ static void socket_write_end(struct kernel_socket_write_request *request)
     socket_state_release(&state);
     if(release)unix_storage_free(destination);
 }
+static void socket_tcp_output(struct tcp_pcb *pcb);
 static void tcp_flush_output(struct kernel_socket *socket);
 
 #if BOAROS_USER_SMP
@@ -3928,7 +3933,7 @@ static void tcp_publish_capacity_locked(struct kernel_socket *socket)
             boaros_lwip_tcp_detached_mss(socket->tcp):0,__ATOMIC_RELAXED);
 #endif
 }
-static void socket_tcp_output(struct tcp_pcb *pcb)
+static void socket_tcp_output_mode(struct tcp_pcb *pcb, u8_t more)
 {
     struct kernel_socket *socket=pcb->errf==tcp_failed?pcb->callback_arg:NULL;
     unsigned *blocked=&nic_blocked;
@@ -3937,8 +3942,11 @@ static void socket_tcp_output(struct tcp_pcb *pcb)
     if (owner) blocked=&owner->nic_blocked;
 #endif
     *blocked=0;
-    err_t output = tcp_output(pcb);
+    unsigned was_corked = pcb->boaros_cork_pending;
+    err_t output = boaros_lwip_tcp_output_more(pcb, more);
     if (!socket) return;
+    /* A direct caller may have armed a deadline while the worker was asleep. */
+    if (!was_corked && pcb->boaros_cork_pending) socket_schedule(socket, 0);
     if (pcb->state==TIME_WAIT) { retire_timewait(socket); return; }
     if (output == ERR_MEM) {
         if (*blocked) {
@@ -3949,10 +3957,14 @@ static void socket_tcp_output(struct tcp_pcb *pcb)
     }
 }
 
+/* ACK/input/timer output must not inherit an application's last MSG_MORE. */
+static void socket_tcp_output(struct tcp_pcb *pcb)
+{ socket_tcp_output_mode(pcb, 0); }
+
 static void tcp_flush_output(struct kernel_socket *socket)
 {
     if (socket->tcp && (socket->tcp->unsent || (socket->tcp->flags&TF_ACK_NOW)))
-        socket_tcp_output(socket->tcp);
+        socket_tcp_output_mode(socket->tcp, socket->tcp->boaros_output_more);
 }
 
 void kernel_socket_stream_begin(struct kernel_socket_write_request *request,
@@ -3975,7 +3987,8 @@ int kernel_socket_stream_reserve(struct kernel_socket_write_request *request,
             /* 其他调用者尚未COPY的预约不属于协议积压，运行CPU0不能归还它。
              * 已接纳的deferred前缀和真实协议阻塞仍沿原输出路径推进。 */
             if (!request->socket->tx_budget || (request->progressed & SOCKET_WRITE_DEFERRED))
-                schedule_output=1;
+                schedule_output=SOCKET_WORK_OUTPUT |
+                    (request->progressed ? SOCKET_WORK_PUSH : 0);
             request->progressed &= (uint8_t)~SOCKET_WRITE_DEFERRED;
             error = -KERNEL_EAGAIN; COST_ADD(STREAM_ADMIT_BLOCKED, 1);
         }
@@ -3988,7 +4001,7 @@ int kernel_socket_stream_reserve(struct kernel_socket_write_request *request,
         }
     }
     kernel_irq_lock_release(&irq);
-    if (schedule_output) socket_schedule(request->socket,SOCKET_WORK_OUTPUT);
+    if (schedule_output) socket_schedule(request->socket,schedule_output);
     return error ? error : (int)size;
 }
 void kernel_socket_stream_cancel(struct kernel_socket_write_request *request)
@@ -4062,7 +4075,7 @@ static int stream_copy_owned(struct kernel_socket_write_request *request,
              * segments and publishes only the prefix it could prepare. */
             u16_t accepted = 0;
             u8_t write_flags = TCP_WRITE_FLAG_COPY;
-            if ((flags & KERNEL_SOCKET_IO_MORE) || length < prepared)
+            if ((flags & (KERNEL_SOCKET_IO_MORE | KERNEL_SOCKET_MSG_MORE)) || length < prepared)
                 write_flags |= TCP_WRITE_FLAG_MORE;
             __atomic_fetch_add(&socket_statistics.tcp_write_calls,1,__ATOMIC_RELAXED);
             err_t error;
@@ -4083,12 +4096,18 @@ static int stream_copy_owned(struct kernel_socket_write_request *request,
                 __atomic_fetch_add(&socket_statistics.tcp_written_bytes,accepted,__ATOMIC_RELAXED);
                 write_retry_disarm(socket);
                 total = accepted;
+                socket->tcp->boaros_output_more = !!(flags & KERNEL_SOCKET_MSG_MORE);
+                if (accepted < prepared) {
+                    boaros_lwip_tcp_push(socket->tcp);
+                    *flush = 1;
+                }
             }
             if (error == ERR_MEM) {
                 /* Pool exhaustion still suppresses POLLOUT until release. */
                 write_retry_arm(socket);
                 socket_pool_wait(socket);
                 result = -KERNEL_EAGAIN; *flush = 1;
+                if (total || request->progressed) boaros_lwip_tcp_push(socket->tcp);
             } else result = error==ERR_WOULDBLOCK?-KERNEL_EAGAIN:lwip_error(error);
         }
     }
@@ -4103,6 +4122,7 @@ static int stream_copy_owned(struct kernel_socket_write_request *request,
         } else *flush = 1;
     }
     if (result == -KERNEL_EAGAIN) {
+        if (request->progressed && socket->tcp) boaros_lwip_tcp_push(socket->tcp);
         *flush = 1;
         request->progressed &= (uint8_t)~SOCKET_WRITE_DEFERRED;
         COST_ADD(STREAM_PROTOCOL_BLOCKED, 1);
@@ -4208,7 +4228,9 @@ static int protocol_request(struct kernel_socket_write_request *request,enum soc
             int admit;
             { KERNEL_IRQ_LOCK_SCOPE(state,&socket_state_lock);admit=network_work_queue && !network_stopping &&
                 !tcp_owner_stopping(owner) && tcp_socket_cpu(request->socket)==cpu &&
-                !request->socket->writes_head; }
+                !request->socket->writes_head &&
+                !((request->flags & KERNEL_SOCKET_MSG_MORE) &&
+                  (request->socket->work_flags & SOCKET_WORK_OUTPUT)); }
             if (admit) {
                 int result;
                 if (operation==SOCKET_PROTOCOL_STREAM && kernel_cpu_current()->logical_id!=cpu) {
@@ -4241,7 +4263,9 @@ static int protocol_request(struct kernel_socket_write_request *request,enum soc
             /* 已排队的同流写入不能被越过。COPY 不进入网卡或输入路径；
              * 仅把需要的输出交给原 worker，发送者无须等它返还源码页。 */
             { KERNEL_IRQ_LOCK_SCOPE(state,&socket_state_lock);admit=network_work_queue && !network_stopping &&
-                                        !request->socket->writes_head; }
+                                        !request->socket->writes_head &&
+                !((request->flags & KERNEL_SOCKET_MSG_MORE) &&
+                  (request->socket->work_flags & SOCKET_WORK_OUTPUT)); }
             if (admit) {
                 stream_commit_owned(&request,1,1);
                 request->segments=0;
@@ -4260,6 +4284,18 @@ static int protocol_request(struct kernel_socket_write_request *request,enum soc
 #endif
         int result;
         result=network_is_stopping() && operation<SOCKET_PROTOCOL_DISPOSE?-KERNEL_EIO:0;
+        if (!result && operation==SOCKET_PROTOCOL_STREAM &&
+            (request->flags & KERNEL_SOCKET_MSG_MORE)) {
+            /* A remote COPY can have returned before CPU0 emits it. Complete
+             * that older output decision before installing this send's hint. */
+            unsigned pending;
+            { SOCKET_STATE(state);
+              pending=request->socket->work_flags & (SOCKET_WORK_OUTPUT|SOCKET_WORK_PUSH);
+              request->socket->work_flags &= ~pending; }
+            if ((pending & SOCKET_WORK_PUSH) && request->socket->tcp)
+                boaros_lwip_tcp_push(request->socket->tcp);
+            if (pending & SOCKET_WORK_OUTPUT) tcp_flush_output(request->socket);
+        }
         if(!result)result=execute_protocol_request(request);
         request->segments=0;
         if(result>=0 && operation!=SOCKET_PROTOCOL_DATAGRAM_PREPARE && operation!=SOCKET_PROTOCOL_DISPOSE &&
@@ -4389,6 +4425,7 @@ int kernel_socket_shutdown(struct kernel_socket *socket,int how)
     wake_socket(socket);if(socket->peer)wake_socket(socket->peer);
     socket_state_release(&state);
     if(close_tx && socket->tcp && socket->connected && !socket->listening) {
+        boaros_lwip_tcp_push(socket->tcp);
         err_t error=tcp_shutdown(socket->tcp,0,1);
         if(error!=ERR_OK)result=lwip_error(error);
     }
@@ -4464,6 +4501,7 @@ int kernel_socket_set_option(struct kernel_socket *socket,
         if (socket->tcp != 0 && !socket->listening) {
             if (value) {
                 tcp_nagle_disable(socket->tcp);
+                boaros_lwip_tcp_push(socket->tcp);
                 tcp_flush_output(socket);
             } else tcp_nagle_enable(socket->tcp);
         }
@@ -4911,7 +4949,7 @@ int kernel_socket_work_pending(void)
 {
     if (protocol_current_owner() != kernel_io_context_current() || !protocol_depth) __builtin_trap();
     if (!socket_initialized) return 0;
-    int timer_ready=sys_timeouts_sleeptime()==0;
+    int timer_ready=sys_timeouts_sleeptime()==0 || boaros_lwip_tcp_cork_delay(sys_now())==0;
     SOCKET_STATE(state);
     int runnable = rights_dirty || (rights_retry_pending && (int32_t)(sys_now()-rights_retry_ms)>=0) || ready_work.head || loopback_pending ||
         capacity_ready(&pool_wait,__atomic_load_n(&pool_generation,__ATOMIC_RELAXED)) || capacity_ready(&nic_wait, nic_generation) ||
@@ -4944,12 +4982,12 @@ static unsigned service_ready_socket(unsigned budget,struct socket_work_queue *q
     while(count<budget && count<SOCKET_WRITE_BATCH && socket->writes_head) {
         struct kernel_socket_write_request *request=socket->writes_head;
         if(count && (stopping || request->operation!=SOCKET_PROTOCOL_STREAM ||
-                     (request->flags & KERNEL_SOCKET_IO_MORE)))break;
+                     (request->flags & (KERNEL_SOCKET_IO_MORE|KERNEL_SOCKET_MSG_MORE))))break;
         socket->writes_head=request->next;
         request->next=0;
         requests[count++]=request;
         /* IO_MORE 的前缀不随其他请求的正常末批提前输出。 */
-        if(request->operation!=SOCKET_PROTOCOL_STREAM || (request->flags & KERNEL_SOCKET_IO_MORE))break;
+        if(request->operation!=SOCKET_PROTOCOL_STREAM || (request->flags & (KERNEL_SOCKET_IO_MORE|KERNEL_SOCKET_MSG_MORE)))break;
     }
     /* 就绪链在同一保护内摘除并重新入队，已有的工作通知仍覆盖余项。 */
     if(socket->writes_head)work_add_locked(queue,socket,0);
@@ -4968,6 +5006,8 @@ static unsigned service_ready_socket(unsigned budget,struct socket_work_queue *q
     if (flags) retire_timewait(socket);
     /* 已捕获的OUTPUT属于此前输入/重试；先完成它，再接纳新COPY，
      * 避免旧标记把新请求仍可合批的IO_MORE前缀提前送入协议。 */
+    if ((flags & SOCKET_WORK_PUSH) && socket->tcp && !socket->listening)
+        boaros_lwip_tcp_push(socket->tcp);
     if ((flags & SOCKET_WORK_OUTPUT) && !socket->listening)tcp_flush_output(socket);
     if(count && requests[0]->operation==SOCKET_PROTOCOL_STREAM && !stopping) {
         stream_commit_owned(requests,count,0);
@@ -5005,7 +5045,10 @@ static int tcp_owner_take_input(struct socket_tcp_owner *owner,struct socket_tcp
 
 static uint64_t tcp_owner_deadline(void)
 {
-    uint32_t delay=boaros_lwip_tcp_timers_delay(sys_now());
+    uint32_t now_ms=sys_now();
+    uint32_t delay=boaros_lwip_tcp_timers_delay(now_ms);
+    uint32_t cork_delay=boaros_lwip_tcp_cork_delay(now_ms);
+    if(cork_delay<delay)delay=cork_delay;
     uint64_t deadline=0;
     if (delay==UINT32_MAX) return 0;
     if (!delay) delay=1;
@@ -5034,6 +5077,7 @@ static void tcp_owner_worker(void *arg)
         for (unsigned i=0;i<8 && service_ready_socket(4,&owner->ready,&scope);i++) {}
         if (!stopping) {
             owner->timer_running=1;
+            (void)boaros_lwip_tcp_cork_due(sys_now(),8);
             (void)boaros_lwip_tcp_timers_due(sys_now());
             owner->timer_running=0;
         }
@@ -5216,7 +5260,8 @@ struct kernel_socket_service_result kernel_socket_service_owned(struct kernel_so
     if (loopback_pending && result.packets < budget.packets)
         service_loopback(&result, budget.packets);
     socket_timer_running = 1;
-    result.timers = sys_check_timeouts_budget(budget.timers);
+    result.timers = boaros_lwip_tcp_cork_due(sys_now(),budget.timers);
+    result.timers += sys_check_timeouts_budget(budget.timers-result.timers);
     socket_timer_running = 0;
     result.runnable = kernel_socket_work_pending();
     result.next_deadline = socket_next_timer_deadline();

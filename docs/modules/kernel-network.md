@@ -183,7 +183,7 @@ CPU0已有网络执行者推进收集和退休清理。最后关闭暂时失败�
 
 ## 发起 CPU 与等待寿命
 
-TCP 请求由 syscall 栈持有，OFD 覆盖整个接纳过程；用户页只借到实际 COPY 完成。排队请求使用自己的等待 token，工作链锁内登记、发布结果并定向通知，锁外休眠和结束等待。ACK 和发送额度变化只通知 socket 就绪等待者。归属核的执行者一次从同一 socket 取出至多四个已排队的连续普通发送请求，共用一次输出；每个请求仍占一个服务单元，剩余工作放回队尾。带 IO_MORE 的请求单独处理；先完成此前捕获的 OUTPUT，再接纳新前缀，以免提前发送仍可合并的字节。发送请求本身不安排接收资源和 TIME_WAIT 回收，真实输入和关闭仍负责安排回收。UDP 由调用者在最终 pbuf 中填入载荷，持有 UDP PCB 的协议执行者按请求发送并释放。只有协议内存未启用并行保护时，分配和放弃发送的回收也需要协议资格。UNIX 调用者准备最终 packet，发布前在端点锁内重新核对对端。请求和 OFD 借用一直保留到完成状态发布。
+TCP 请求由 syscall 栈持有，OFD 覆盖整个接纳过程；用户页只借到实际 COPY 完成。排队请求使用自己的等待 token，工作链锁内登记、发布结果并定向通知，锁外休眠和结束等待。ACK 和发送额度变化只通知 socket 就绪等待者。归属核的执行者一次从同一 socket 取出至多四个已排队的连续普通发送请求，共用一次输出；每个请求仍占一个服务单元，剩余工作放回队尾。带 IO_MORE 或用户 MSG_MORE 的请求单独处理；先完成此前捕获的 OUTPUT，再接纳新前缀，以免提前发送仍可合并的字节。发送请求本身不安排接收资源和 TIME_WAIT 回收，真实输入和关闭仍负责安排回收。UDP 由调用者在最终 pbuf 中填入载荷，持有 UDP PCB 的协议执行者按请求发送并释放。只有协议内存未启用并行保护时，分配和放弃发送的回收也需要协议资格。UNIX 调用者准备最终 packet，发布前在端点锁内重新核对对端。请求和 OFD 借用一直保留到完成状态发布。
 
 普通 I/O 与 socket syscall 共用 `kernel_socket_wait_ready`。调用者传入一次捕获的绝对超时，端点锁内检查条件并登记，锁外 park/finish；就绪先于超时判断。接收预约限制读取的原有字节前缀，复制到该前缀末端即停止，锁外复制不读取并发追加修改的尾链接。
 
@@ -352,6 +352,12 @@ TX 的 SG 与复制回退在槽满时都登记 NIC 容量等待。无 indirect �
 ## TCP 发送接纳与复制（2026-10-05）
 
 TCP 默认采用 Nagle 的 Minshall 规则，与固定 Linux `tcp_minshall_check/update` 的边界一致：已经发出的完整 MSS 包不阻止第一个小包，尚未确认的小包会阻止后续小包。PCB 尾部记录最后一个新发小包的结束序列；主动／被动建连初始化该字段，实际输出成功才推进，重传和输出失败保留原值。判断使用 TCP 序列号比较，覆盖 32 位回绕；累计 ACK 越过该边界后解除等待。这样保留小包合并，同时减少整 MSS 在途数据与延迟 ACK 组合产生的等待。
+
+TCP 的 `send/sendto/sendmsg/sendmmsg` 接受用户 `MSG_MORE`，`splice` 的同一提示也沿 TCP COPY 路径生效。它与一次 syscall 内部的 `IO_MORE` 分开：本次应用输出可以暂留尚未发送的 sub-MSS 队尾，完整 MSS、非末段、重传、ACK 和 FIN 仍能前进。它不是持续的协议屏障，后续 ACK 或其他普通输出机会可以释放短尾。无 MORE 且接纳了数据的发送恢复普通 Nagle/Minshall；零长发送和首字节前 fault 不修改此前的提示，已有前缀后的 fault 保留当次提示，空间不足则在等待前显式推送成功前缀。
+
+暂留尾段的绝对毫秒期限保存在 PCB 内，首次阻塞时设为当前时间加 200ms，追加不延后；CPU0 网络执行者和各 TCP owner 的既有等待期限取其最小值，到期在原协议资格内尝试发送。实际到线仍受调度、拥塞/接收窗口和 NIC 容量约束，不承诺 200ms 墙钟内送达。期限随 PCB 迁移，摘链/free 同时结束计时，不新增 timer 对象或 socket 引用。显式 push 保存已经排队的序号边界，窗口和 NIC 重试不能遗失这次推送；不会为了区分新旧字节切开已有尾段。
+
+`tests/host/network_owner.py --case tcp-more` 以冻结时钟检查短尾、MSS、普通输出、期限/溢出、owner 迁移与回收。`tests/workloads/network/tcp_cork.c` 是 Linux/BoarOS 共用 libc 消费者，`tests/userland/tcp-cork.py` 使用已构建的静态程序与内核运行；它核对字节及有限推进，不把 PSH、接收批次或精确墙钟值当作接口保证。语义依据为固定 Linux `f4cdf7ca9a1f` 的 `net/ipv4/tcp.c`（tcp_push、tcp_sendmsg_locked、NODELAY）、`tcp_output.c`（Nagle、probe）与 [tcp(7)](https://man7.org/linux/man-pages/man7/tcp.7.html)。
 
 开启 `TCP_NODELAY` 时先禁用 Nagle，再立即尝试输出已有 unsent 数据。NIC 暂无容量时登记原有 NIC 容量等待，协议内存不足时使用原有 pool 等待；容量事件推动重试，不依赖收到 ACK 或推进定时器。关闭 NODELAY 只恢复 Nagle。用户数据报发送使用任务登记的请求和 iovec cursor，退出清理沿同一请求归还 OFD 和包引用。
 

@@ -298,6 +298,45 @@ boaros_lwip_tcp_context_move_active(struct boaros_lwip_tcp_context *from,
 }
 #endif
 
+/* No separate timer objects or socket references: the active PCB list is the
+ * timer owner. Moving a PCB preserves its absolute, wrap-safe millisecond time. */
+void
+boaros_lwip_tcp_push(struct tcp_pcb *pcb)
+{
+  pcb->boaros_cork_pending = 0;
+  pcb->boaros_output_more = 0;
+  pcb->boaros_push_seq = pcb->snd_lbb;
+  pcb->boaros_push_pending = pcb->unsent != NULL;
+}
+
+u32_t
+boaros_lwip_tcp_cork_delay(u32_t now)
+{
+  u32_t delay = UINT32_MAX;
+  for (struct tcp_pcb *pcb = tcp_active_pcbs; pcb; pcb = pcb->next) {
+    if (!pcb->boaros_cork_pending) continue;
+    s32_t remaining = (s32_t)(pcb->boaros_cork_deadline - now);
+    u32_t value = remaining > 0 ? (u32_t)remaining : 0;
+    if (value < delay) delay = value;
+  }
+  return delay;
+}
+
+unsigned
+boaros_lwip_tcp_cork_due(u32_t now, unsigned budget)
+{
+  unsigned done = 0;
+  for (struct tcp_pcb *pcb = tcp_active_pcbs, *next; pcb && done < budget; pcb = next) {
+    next = pcb->next;
+    if (!pcb->boaros_cork_pending || (s32_t)(pcb->boaros_cork_deadline - now) > 0) continue;
+    boaros_lwip_tcp_push(pcb);
+    /* Use the owner adapter so NIC/pool failure keeps its normal retry owner. */
+    LWIP_HOOK_TCP_OUTPUT_PENDING(pcb);
+    done++;
+  }
+  return done;
+}
+
 /** Free a tcp pcb */
 void
 tcp_free(struct tcp_pcb *pcb)
