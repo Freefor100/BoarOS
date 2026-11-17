@@ -11,7 +11,9 @@
 _Thread_local uintptr_t sync_test_irq=2;
 static _Thread_local struct kernel_cpu cpu={.initialized=KERNEL_CPU_INITIALIZED};
 static struct kernel_task tasks[3];
-static struct kernel_pid identities[3];
+static struct { struct kernel_pid id; struct kernel_pid_binding ancestor; } identities[3];
+static struct kernel_pid_registry root,child={.parent=&root,.depth=1};
+static int signal_sender;
 static struct kernel_heap heap;
 static struct kernel_files files={.heap=&heap};
 static struct kernel_open_file_description *fds[16];
@@ -95,8 +97,8 @@ void kernel_uid_account_mqueue_uncharge(struct kernel_uid_account *a,uint64_t by
 {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(a->mqueue_bytes>=bytes&&a->references>1);a->mqueue_bytes-=bytes;a->references--;}
 enum kernel_task_status kernel_task_files_borrow(struct kernel_task *task,struct kernel_files **out)
 {(void)task;*out=&files;return 0;}
-enum kernel_task_status kernel_task_tgid(const struct kernel_task *task,kernel_pid_t *id)
-{*id=task->tid;return 0;}
+kernel_pid_t kernel_task_identity_user_number(const struct kernel_pid *id)
+{return kernel_pid_number_in(id,cpu.current->group_leader->identities[KERNEL_PID_TGID].identity->registry); }
 struct kernel_open_file_description *kernel_files_hold_fd(struct kernel_files *f,int64_t fd,struct kernel_files_pin_guard *guard)
 {
     if(fd<0||fd>=16||!fds[fd])return 0;
@@ -109,13 +111,12 @@ enum kernel_open_file_status kernel_open_file_release(struct kernel_open_file_de
     if(!__atomic_sub_fetch(&f->references,1,__ATOMIC_ACQ_REL)){assert(!kernel_mqueue_close(f));kernel_heap_release(f->heap,f);}
     return 0;
 }
-void kernel_pid_get(struct kernel_pid *id){assert(cpu.raw_locks&&id->references);id->references++;}
 void kernel_task_identity_put(struct kernel_pid *id)
 {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(id->references>1);id->references--;}
 struct kernel_exec_security *kernel_exec_security_get(struct kernel_exec_security *s){return s;}
 void kernel_exec_security_put(struct kernel_exec_security *s){(void)s;}
 void kernel_signal_mqueue_notify(struct kernel_pid *id,struct kernel_exec_security *exec,int signo,uint64_t value,int32_t sender,uint32_t uid)
-{(void)id;(void)exec;assert(sender>0&&uid==10);signal_count++;signal_number=signo;signal_value=value;}
+{(void)id;(void)exec;assert(uid==10);signal_sender=sender;signal_count++;signal_number=signo;signal_value=value;}
 int kernel_socket_mqueue_cookie_prepare(struct kernel_task *task,int64_t fd,const unsigned char cookie[32],struct kernel_netlink_cookie **out)
 {(void)task;assert(fd==9&&cookie[0]==42);*out=(void *)(uintptr_t)1;if(abandon_cookie)abandon_pause();return 0;}
 void kernel_socket_mqueue_cookie_send(struct kernel_netlink_cookie **owner,unsigned reason)
@@ -202,8 +203,20 @@ static void notifications(void)
     assert(recvq(fd,out,32,0)==2);assert(!notifyq(fd,1,0,0));assert(!sendq(fd,"d",2,0));assert(!q->notification.owner);
     assert(recvq(fd,out,32,0)==2);
     tasks[2].group_leader=&tasks[0];tasks[2].identities[KERNEL_PID_TGID].identity=0;
-    current(2);assert(!notifyq(fd,0,35,91)&&q->notification.owner==&identities[0]);
+    current(2);assert(!notifyq(fd,0,35,91)&&q->notification.owner==&identities[0].id);
     alias=descriptor(q,2);closefd(alias);assert(!q->notification.owner);current(0);
+    char status[128];size_t n;
+    current(1);assert(!notifyq(fd,0,35,91));
+    assert(!kernel_mqueue_queue_read(q,0,status,sizeof(status)-1,&n));status[n]=0;
+    assert(strstr(status,"NOTIFY_PID:1 "));
+    current(2);assert(!kernel_mqueue_queue_read(q,0,status,sizeof(status)-1,&n));status[n]=0;
+    assert(strstr(status,"NOTIFY_PID:42 "));
+    assert(!sendq(fd,"e",2,0)&&signal_sender==0&&recvq(fd,out,32,0)==2);
+    assert(!notifyq(fd,0,35,91));current(1);
+    assert(!kernel_mqueue_queue_read(q,0,status,sizeof(status)-1,&n));status[n]=0;
+    assert(strstr(status,"NOTIFY_PID:0 "));
+    assert(!sendq(fd,"f",2,0)&&signal_sender==42&&recvq(fd,out,32,0)==2);
+    current(0);
     closefd(fd);removeq(q);
 }
 struct worker {int fd,send;int64_t result;char text[32];};
@@ -221,7 +234,7 @@ static void queue_changed(struct kernel_wait_node *node,uint32_t reason,uint64_t
 static void handoff_and_timeout(void)
 {
     struct kernel_mqueue *q=make("handoff",1,32);int fd=descriptor(q,2);pthread_t thread;
-    struct kernel_wait_node poll_node;queue_callbacks=0;
+    struct kernel_wait_node poll_node;queue_callbacks=0;int prior=signal_count;
     kernel_wait_node_init_callback(&poll_node,queue_changed,0);
     kernel_wait_queue_add(&q->waiters,&poll_node);
     struct worker w={.fd=fd};waiting=0;assert(!pthread_create(&thread,0,run_worker,&w));await_waiter();
@@ -231,13 +244,15 @@ static void handoff_and_timeout(void)
     allocation_calls=0;fail_at=1;
     assert(!sendq(fd,"direct",7,1));fail_at=-1;
     assert(!pthread_join(thread,0));
-    assert(w.result==7&&!strcmp(w.text,"direct")&&signal_count==1&&q->notification.owner);
+    assert(w.result==7&&!strcmp(w.text,"direct")&&signal_count==prior&&q->notification.owner);
     assert(queue_callbacks==0);
-    assert(!sendq(fd,"fill",5,0));assert(signal_count==2&&queue_callbacks==1);
+    assert(!sendq(fd,"fill",5,0));assert(signal_count==prior+1&&queue_callbacks==1);
+    assert(!notifyq(fd,0,35,77));
     w=(struct worker){.fd=fd,.send=1,.text="replacement"};waiting=0;
     assert(!pthread_create(&thread,0,run_worker,&w));await_waiter();char out[32];
     assert(recvq(fd,out,32,0)==5&&!strcmp(out,"fill"));assert(!pthread_join(thread,0));assert(!w.result&&queue_callbacks==1);
     assert(recvq(fd,out,32,0)==12&&!strcmp(out,"replacement"));
+    assert(q->notification.owner&&signal_count==prior+1);
     struct{int64_t sec,nsec;} expired={0,0};
     assert(kernel_mqueue_receive(cpu.current,&cpu.current->mm,fd,(uintptr_t)out,32,0,(uintptr_t)&expired)==-KERNEL_ETIMEDOUT);
     forced_reason=KERNEL_WAIT_SIGNALLED;assert(recvq(fd,out,32,0)==-KERNEL_ERESTARTSYS);forced_reason=-1;
@@ -362,13 +377,15 @@ int main(void)
 {
     kernel_wait_domain_init();assert(!kernel_mqueue_init(&heap));
     for(unsigned i=0;i<3;i++){tasks[i].tid=(int32_t)i+1;tasks[i].group_leader=&tasks[i];
-        identities[i].number=(int32_t)i+1;identities[i].references=1;
-        tasks[i].identities[KERNEL_PID_TGID].identity=&identities[i];
+        identities[i].id.number=i==1?1:(int32_t)i+1;identities[i].id.references=1;
+        identities[i].id.registry=i==1?&child:&root;
+        identities[i].ancestor=(struct kernel_pid_binding){.registry=&root,.number=42};
+        tasks[i].identities[KERNEL_PID_TGID].identity=&identities[i].id;
         kernel_wait_record_init(&tasks[i].wait);kernel_wait_node_init(&tasks[i].default_wait_node,&tasks[i]);}
     current(0);scheduler_wait_order();priority_and_lifetime();notifications();handoff_and_timeout();fault_and_quota();namespace_metadata();abandoned_owners_and_allocations();
     ipc_namespace_lifetime();
     assert(!allocations&&!kernel_ipc_namespace_state(kernel_ipc_initial())->mq&&!account.mqueue_bytes&&account.references==1);
-    for(unsigned i=0;i<3;i++)assert(identities[i].references==1&&!tasks[i].mqueue_request);
+    for(unsigned i=0;i<3;i++)assert(identities[i].id.references==1&&!tasks[i].mqueue_request);
     puts("mqueue core: priority/FIFO, segmented payload, quota/name/OFD lifetime, notify, direct handoff, timeout/signal/fault, abandoned import/cookie/wait, allocation cleanup, shutdown PASS");return 0;
 }
 

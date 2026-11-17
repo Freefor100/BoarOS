@@ -74,8 +74,8 @@ maxmsg * (msgsize + 48) + min(maxmsg, 32768) * 48
 触发取消。
 
 信号登记保留实际 TGID 身份和 exec 安全对象；触发时核对执行身份，随后投递
-`SI_MESGQ`，内容为发送者真实 UID、TGID 和完整 `sigval`。身份引用避免 PID
-数字重用后误投递。`SIGEV_THREAD` 使用 libc 的 AF_NETLINK cookie 协议：
+`SI_MESGQ`，内容为发送者真实 UID、登记者 PID 命名空间内的发送者 TGID 和完整 `sigval`。身份引用避免 PID
+数字重用后误投递。队列状态的 `NOTIFY_PID` 按读取者的 PID 命名空间显示；两处对不可见进程均返回 0。`SIGEV_THREAD` 使用 libc 的 AF_NETLINK cookie 协议：
 `sigev_signo` 指定 FD，`sigev_value` 指向 32 字节 cookie。全部用户输入复制后，
 在队列锁外预留 cookie；登记失败取消私有预留，触发发送原因 1，已发布登记的
 删除发送原因 2。通知传输和信号投递均在队列锁外完成。NETLINK cookie 独立持有端点存储；

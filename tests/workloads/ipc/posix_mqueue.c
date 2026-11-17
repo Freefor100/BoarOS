@@ -101,6 +101,49 @@ static void poll_and_fault(void)
 static sigset_t notify_mask;
 static siginfo_t take_signal(void)
 {siginfo_t info;struct timespec timeout={5,0};CHECK(sigtimedwait(&notify_mask,&info,&timeout)==SIGUSR1);return info;}
+struct identity_pair { mqd_t q; int tx,rx,nested; pid_t parent; };
+static long registration_pid(mqd_t q)
+{
+    char buf[128];ssize_t n=pread(q,buf,sizeof(buf)-1,0);
+    CHECK(n>0);buf[n]=0;char *p=strstr(buf,"NOTIFY_PID:");CHECK(p);return strtol(p+11,0,10);
+}
+static void handshake(int fd,int writing)
+{
+    char c='x';CHECK((writing?write(fd,&c,1):read(fd,&c,1))==1);
+}
+static void unexpected_signal(int signo){(void)signo;_exit(1);}
+static int identity_child(void *arg)
+{
+    struct identity_pair *p=arg;
+    if(p->nested){struct sigaction sa={.sa_handler=unexpected_signal};
+        sigemptyset(&sa.sa_mask);CHECK(!sigaction(SIGUSR1,&sa,0));}
+    CHECK(registration_pid(p->q)==(p->nested?0:p->parent));
+    CHECK(!mq_send(p->q,"a",2,0));char out[32];CHECK(mq_receive(p->q,out,sizeof(out),0)==2);
+    struct sigevent ev={.sigev_notify=SIGEV_SIGNAL,.sigev_signo=SIGUSR1};
+    CHECK(!mq_notify(p->q,&ev)&&registration_pid(p->q)==getpid());
+    handshake(p->tx,1);handshake(p->rx,0);
+    siginfo_t si=take_signal();CHECK(si.si_code==SI_MESGQ&&si.si_pid==(p->nested?0:p->parent));
+    CHECK(mq_receive(p->q,out,sizeof(out),0)==2);
+    handshake(p->tx,1);handshake(p->rx,0);
+    CHECK(!mq_send(p->q,"c",2,0));return 0;
+}
+static void identity_pair(int nested)
+{
+    mqd_t q=make(2,32,0);int a[2],b[2];CHECK(!pipe(a)&&!pipe(b));
+    struct sigevent ev={.sigev_notify=SIGEV_SIGNAL,.sigev_signo=SIGUSR1};
+    CHECK(!mq_notify(q,&ev));struct identity_pair p={q,a[1],b[0],nested,getpid()};
+    pid_t child;
+    if(nested){
+        static unsigned char stack[65536] __attribute__((aligned(16)));
+        child=clone(identity_child,stack+sizeof(stack),CLONE_NEWPID|SIGCHLD,&p);
+    }else{child=fork();if(!child)_exit(identity_child(&p));}
+    CHECK(child>0);handshake(a[0],0);CHECK(registration_pid(q)==child);
+    siginfo_t si=take_signal();CHECK(si.si_code==SI_MESGQ&&si.si_pid==child);
+    CHECK(!mq_send(q,"b",2,0));handshake(b[1],1);handshake(a[0],0);
+    CHECK(!mq_notify(q,&ev));handshake(b[1],1);child_done(child);
+    si=take_signal();CHECK(si.si_code==SI_MESGQ&&si.si_pid==child);
+    CHECK(!close(a[0])&&!close(a[1])&&!close(b[0])&&!close(b[1]));removeq(q);
+}
 static void notification_signal(void)
 {
     mqd_t q=make(2,32,O_NONBLOCK);int alias=dup(q);CHECK(alias>=0);
@@ -215,7 +258,9 @@ int main(int argc,char **argv)
     snprintf(queue_name,sizeof(queue_name),"/boaros-mq-%ld",(long)getpid());cleanup();
     if(getpid()==1){CHECK(!mkdir("/proc",0555)||errno==EEXIST);CHECK(!mount("proc","/proc","proc",0,0)||errno==EBUSY);}
     sigemptyset(&notify_mask);sigaddset(&notify_mask,SIGUSR1);CHECK(!pthread_sigmask(SIG_BLOCK,&notify_mask,0));
-    puts("POSIX-MQ BEGIN");abi_priority_flags();poll_and_fault();notification_signal();notification_thread();creation_quota();
+    if(argc==2&&!strcmp(argv[1],"--nested-identity")){identity_pair(1);puts("nested mqueue identity PASS");return 0;}
+    if(argc==2&&!strcmp(argv[1],"--identity")){identity_pair(0);puts("mqueue identity PASS");return 0;}
+    puts("POSIX-MQ BEGIN");identity_pair(0);pass("registration-reader-and-bidirectional-sender-after-exit");abi_priority_flags();poll_and_fault();notification_signal();notification_thread();creation_quota();
     if(argc==1||strcmp(argv[1],"--no-fs"))filesystem_view();
     printf("POSIX-MQ END %u\n",cases);alarm(0);if(getpid()==1){sync();reboot(RB_POWER_OFF);}return 0;
 }

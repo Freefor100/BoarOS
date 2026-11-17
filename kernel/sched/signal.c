@@ -1459,7 +1459,7 @@ void kernel_signal_mqueue_notify(struct kernel_pid *identity,struct kernel_exec_
         if(sig==SIGNAL_KILL) {
             { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
               if(signal_ignored_unblocked(actual,sig,
-                    signal_sender_invisible_locked(kernel_task_current(),actual)))return; }
+                    sender==0))return; }
             process_group_request_exit(actual,KERNEL_THREAD_EXIT_SIGNAL,sig,0);return;
         }
         if(!prepared) {signal_pending_prepare(group,1,actual,heap,&info,1,&p);prepared=1;}
@@ -1472,7 +1472,7 @@ void kernel_signal_mqueue_notify(struct kernel_pid *identity,struct kernel_exec_
             if(actual->exec_security!=security)return;
             struct kernel_task *candidate=0;
             (void)timer_receiver_locked(identity,0,sig,&candidate);
-            if(signal_ignored_unblocked(candidate?candidate:actual,sig,signal_sender_invisible_locked(kernel_task_current(),actual)))return;
+            if(signal_ignored_unblocked(candidate?candidate:actual,sig,sender==0))return;
             int posted=signal_pending_post_locked(group,1,actual,&info,1,&p);
             if(posted)return;
             struct kernel_signal_table *table=signal_table_of(actual);
