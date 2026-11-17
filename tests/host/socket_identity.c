@@ -68,7 +68,7 @@ static void nested_views(struct kernel_task *root)
     assert(kernel_task_lock_owner_user_number(old)==0);
     struct kernel_task replacement={0}; replacement.group_leader=&replacement;
     kernel_pid_t numbers[]={9,old};
-    assert(!process_identity_create_numbers(&replacement,&children[1],0,numbers,2));
+    assert(!process_identity_create_numbers(&replacement,&children[1],0,numbers,2,1));
     {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);process_identity_commit_locked(&replacement);}
     assert(kernel_task_lock_owner_user_number(old)==9 && !kernel_task_identity_user_number(first));
     process_identity_release(&replacement);process_identity_collect();
