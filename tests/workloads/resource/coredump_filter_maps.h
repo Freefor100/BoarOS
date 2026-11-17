@@ -90,3 +90,23 @@ static void filter_huge_checks(void)
  fd=open("/proc/sys/vm/nr_hugepages",O_WRONLY);CHECK(fd>=0);CHECK(write(fd,"0",1)==1);CHECK(!close(fd));
  filter_set(0x33);puts("CORE CASE filter-private-shared-hugetlb PASS");
 }
+static void filter_cold_limit_checks(void)
+{
+ const size_t cold=64*1024*1024,limit=8*1024*1024;
+ char *range=mmap(NULL,cold+3*page,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);CHECK(range!=MAP_FAILED);
+ CHECK(mmap(range,cold,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0)==range);
+ char *hot=range+cold+page;
+ CHECK(mmap(hot,page,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0)==hot);
+ memcpy(hot,"after cold map",15);filter_set(0x33);
+ CHECK(WCOREDUMP(crash(9)));int fd=open("core",O_RDONLY);CHECK(fd>=0);
+ struct stat st;CHECK(!fstat(fd,&st)&&st.st_size<=(off_t)limit);
+ Elf64_Ehdr e;CHECK(read(fd,&e,sizeof e)==sizeof e);unsigned seen=0;
+ for(unsigned i=0;i<e.e_phnum;i++){
+  Elf64_Phdr p;CHECK(pread(fd,&p,sizeof p,e.e_phoff+i*sizeof p)==sizeof p);if(p.p_type!=PT_LOAD)continue;
+  if(p.p_vaddr==(uintptr_t)range){CHECK(p.p_memsz==cold && !p.p_filesz);seen|=1;}
+  if(p.p_vaddr==(uintptr_t)hot){char bytes[15];CHECK(p.p_filesz==page);
+   CHECK(pread(fd,bytes,sizeof bytes,p.p_offset)==sizeof bytes);CHECK(!memcmp(bytes,"after cold map",15));seen|=2;}
+ }
+ CHECK(seen==3);CHECK(!close(fd)&&!unlink("core"));CHECK(!munmap(range,cold+3*page));
+ puts("CORE CASE cold-anonymous-low-limit-later-payload PASS");
+}

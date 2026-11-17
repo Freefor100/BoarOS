@@ -192,8 +192,7 @@ static uint64_t core_map_size(struct kernel_mm *mm,struct kernel_mm_proc_map *ma
         return UINT64_MAX;
     if (map->shared)
         return (filter & (1U << ((!map->file || !stat.nlink) ? 1 : 3))) ? length : 0;
-    if ((filter & 1U) && (map->kind==KERNEL_VMA_KIND_ANONYMOUS || (map->flags & KERNEL_VMA_ANON_HISTORY) ||
-        (map->kind==KERNEL_VMA_KIND_ELF_PRIVATE && !map->file))) return length;
+    if ((filter & 1U) && (map->flags & KERNEL_VMA_ANON_HISTORY)) return length;
     if (!map->file) return 0;
     if (filter & (1U<<2)) return length;
     if ((filter & (1U<<4)) && !map->offset && (map->permissions & KERNEL_MM_READ)) {

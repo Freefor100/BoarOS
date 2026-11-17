@@ -38,7 +38,7 @@ static int crash(int mode)
  if(threaded)CHECK(!pipe(identity));
  pid_t pid=fork();CHECK(pid>=0);
  if(!pid){
-  struct rlimit limit={mode==1?0:mode==5?page:256*1024*1024,RLIM_INFINITY};CHECK(!setrlimit(RLIMIT_CORE,&limit));
+  struct rlimit limit={mode==1?0:mode==5?page:mode==9?8*1024*1024:256*1024*1024,RLIM_INFINITY};CHECK(!setrlimit(RLIMIT_CORE,&limit));
   CHECK(!prctl(PR_SET_DUMPABLE,mode==2?0:1));
   if(mode==4){struct rlimit fsize={0,RLIM_INFINITY};CHECK(!setrlimit(RLIMIT_FSIZE,&fsize));}
   if(mode==0){uint64_t value=0;struct iovec local={&value,sizeof(value)},remote={(void *)&spinning,sizeof(spinning)};
@@ -130,7 +130,7 @@ int main(int argc,char **argv)
  fd=open("core",O_CREAT|O_WRONLY,0644);CHECK(fd>=0);CHECK(write(fd,"retain",6)==6);CHECK(!close(fd));
  CHECK(!WCOREDUMP(crash(0)));CHECK(!stat("core",&st)&&st.st_size==6);CHECK(!unlink("core"));puts("CORE CASE unsafe-mode PASS");
  CHECK(WCOREDUMP(crash(5)));CHECK(!stat("core",&st)&&st.st_size<=(off_t)page);CHECK(!unlink("core"));puts("CORE CASE bounded-prefix PASS");
- filter_map_checks();filter_huge_checks();
+ filter_map_checks();filter_huge_checks();filter_cold_limit_checks();
  CHECK(WCOREDUMP(crash(0)));inspect();
- CHECK(!munmap(memory,page*2));puts("CORE END 13");return 0;
+ CHECK(!munmap(memory,page*2));puts("CORE END 14");return 0;
 }

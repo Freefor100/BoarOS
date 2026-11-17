@@ -2678,6 +2678,8 @@ enum kernel_mm_status kernel_mm_vma_insert_anon(
     vma.kind = KERNEL_VMA_KIND_ANONYMOUS;
     vma.role = role;
     if (role==KERNEL_VMA_ROLE_VVAR) vma.flags|=KERNEL_VMA_DONTDUMP;
+    if (role==KERNEL_VMA_ROLE_STACK || fault_policy==KERNEL_VMA_FAULT_RESIDENT_REQUIRED)
+        vma.flags|=KERNEL_VMA_ANON_HISTORY;
     vma.fault_policy = fault_policy;
     vma.backing = 0;
     status = status_from_vma(kernel_vma_set_insert(record->vmas, &vma));
@@ -2800,7 +2802,9 @@ enum kernel_mm_status kernel_mm_map_elf_source(
         /* Linux padzero creates private anonymous backing for the ELF tail.
          * Our composite source synthesizes it lazily, but even a read may
          * publish its writable private page without a later write fault. */
-        if (run->kind==KERNEL_ELF64_SOURCE_RUN_COMPOSITE)
+        if (run->kind==KERNEL_ELF64_SOURCE_RUN_ZERO)
+            vma.flags |= KERNEL_VMA_ANON_SOURCE;
+        else if (run->kind==KERNEL_ELF64_SOURCE_RUN_COMPOSITE || !kernel_elf64_source_file(source))
             vma.flags |= KERNEL_VMA_ANON_HISTORY;
         vma_status = kernel_vma_set_insert(record->vmas, &vma);
         if (vma_status != KERNEL_VMA_STATUS_OK) {
@@ -6763,13 +6767,17 @@ static __attribute__((noinline)) enum kernel_mm_status associate_anonymous_fault
 static enum kernel_mm_status dispatch_fault(struct mm_operation *operation, uint64_t address,
     uint32_t access, struct fault_vma *view, int force)
 {
-    /* Linux anon_vma presence is sticky across discard, splitting and fork.
-     * Record that association once, not by scanning resident pages at dump time.
-     * Only the first file-private write fault needs a VMA writer; other faults retain
-     * their existing shared MM qualification. Failed allocation may leave the
-     * association, just as anon_vma_prepare does before Linux page allocation. */
-    if (access==KERNEL_MM_WRITE && !(view->vma.flags & KERNEL_VMA_ANON_HISTORY) &&
-        (view->vma.kind==KERNEL_VMA_KIND_FILE_PRIVATE || view->vma.kind==KERNEL_VMA_KIND_ELF_PRIVATE) &&
+    /* A completely cold VMA has no anonymous backing. BoarOS materializes a
+     * private writable zero page even on reads: record the association during
+     * that existing fault, without adding write protection or a second fault.
+     * File mappings instead acquire it on COW. The one-time association is
+     * sticky across discard/split/fork, like Linux anon_vma preparation. */
+    int anonymous=(view->vma.kind==KERNEL_VMA_KIND_ANONYMOUS &&
+        view->vma.role!=KERNEL_VMA_ROLE_VDSO && view->vma.role!=KERNEL_VMA_ROLE_VVAR) ||
+        (view->vma.flags & KERNEL_VMA_ANON_SOURCE);
+    if (!(view->vma.flags & KERNEL_VMA_ANON_HISTORY) &&
+        (anonymous || (access==KERNEL_MM_WRITE &&
+         (view->vma.kind==KERNEL_VMA_KIND_FILE_PRIVATE || view->vma.kind==KERNEL_VMA_KIND_ELF_PRIVATE))) &&
         remote_access_allowed(&view->vma,access,force)) {
         enum kernel_mm_status status=associate_anonymous_fault(operation,address,view);
         if (status) return status;
