@@ -4,6 +4,7 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/uio.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdio.h>
@@ -33,6 +34,27 @@ static unsigned char *map(size_t n,int flags,off_t off)
 {void *p=mmap(0,n,PROT_READ|PROT_WRITE,MAP_ANONYMOUS|MAP_HUGETLB|flags,-1,off);CHECK(p!=MAP_FAILED);CHECK(!((uintptr_t)p&(huge-1)));return p;}
 static void joined(pid_t child,int signal)
 {int s;CHECK(waitpid(child,&s,0)==child);if(signal)CHECK(WIFSIGNALED(s)&&WTERMSIG(s)==signal);else CHECK(WIFEXITED(s)&&!WEXITSTATUS(s));}
+static void pipe_owners(void)
+{
+    int a[2],b[2],d[2];unsigned char out[32],expected[32];
+    unsigned char *p=map(huge,MAP_PRIVATE,0),*window=p+huge/2+7;
+    for(unsigned i=0;i<32;i++)window[i]=expected[i]=(unsigned char)(i+17);
+    CHECK(!pipe(a)&&!pipe(b)&&!pipe(d));
+    struct iovec v={window,32};CHECK(vmsplice(a[1],&v,1,0)==32);
+    pid_t c=fork();CHECK(c>=0);if(!c){window[0]=99;_exit(0);}joined(c,0);
+    CHECK(tee(a[0],b[1],32,0)==32);CHECK(splice(a[0],0,d[1],0,13,0)==13);
+    CHECK(!munmap(p,huge));CHECK(counter("HugePages_Free:")==3);
+    CHECK(read(d[0],out,13)==13&&!memcmp(out,expected,13));
+    CHECK(read(a[0],out,19)==19&&!memcmp(out,expected+13,19));
+    CHECK(splice(b[0],0,d[1],0,32,0)==32);
+    CHECK(read(d[0],out,32)==32&&!memcmp(out,expected,32));
+    for(unsigned i=0;i<2;i++)CHECK(!close(a[i])&&!close(b[i])&&!close(d[i]));
+    CHECK(counter("HugePages_Free:")==4);
+    p=map(huge,MAP_PRIVATE,0);p[huge-page+19]=71;v=(struct iovec){p+huge-page+19,1};
+    CHECK(!pipe(a)&&vmsplice(a[1],&v,1,0)==1);CHECK(!munmap(p,huge));
+    CHECK(counter("HugePages_Free:")==3);CHECK(!close(a[0])&&!close(a[1]));
+    CHECK(counter("HugePages_Free:")==4);pass("pipe-compound-owners");
+}
 int main(void)
 {
     setvbuf(stdout,0,_IONBF,0);page=sysconf(_SC_PAGESIZE);CHECK(page==4096||page==16384);
@@ -63,6 +85,7 @@ int main(void)
     CHECK(!mprotect(p,huge,PROT_READ|PROT_WRITE));p[0]=23;CHECK(!munmap(p,huge));CHECK(counter("HugePages_Free:")==4);pass("protect-unmap-boundaries");
     p=map(huge,MAP_SHARED,huge);p[huge/2+9]=31;c=fork();CHECK(c>=0);if(!c){CHECK(p[huge/2+9]==31);p[huge/2+9]=63;_exit(0);}joined(c,0);CHECK(p[huge/2+9]==63);
     CHECK(!munmap(p,huge));CHECK(counter("HugePages_Free:")==4);pass("shared-fork-offset");
+    pipe_owners();
     free(vec);pool(0);CHECK(!counter("HugePages_Total:")&&!counter("HugePages_Free:"));
     p=map(huge,MAP_PRIVATE|MAP_NORESERVE,0);c=fork();CHECK(c>=0);if(!c){*(volatile unsigned char *)p=1;_exit(4);}joined(c,SIGBUS);CHECK(!munmap(p,huge));pass("noreserve-sigbus");
     printf("HUGETLB END %u\n",cases);return 0;

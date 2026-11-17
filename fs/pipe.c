@@ -85,10 +85,12 @@ int kernel_pipe_set_owner(struct kernel_pipe *pipe, uint32_t uid, uint32_t gid)
     return 0;
 }
 
-static void pipe_release_page(struct kernel_pipe *pipe,void *page)
+static void pipe_release_page(struct kernel_pipe *pipe,void *page,unsigned order)
 {
     uint64_t physical;
-    if (!page || !pipe->heap->physical_address(page,&physical) ||
+    if (!page || !pipe->heap->physical_address(page,&physical) || order>PHYSICAL_PAGE_MAX_ORDER) __builtin_trap();
+    physical &= ~(((uint64_t)BOAROS_PAGE_SIZE<<order)-1);
+    if (order ? physical_page_release_order(pipe->allocator,physical,order) :
         physical_page_release(pipe->allocator,physical)) __builtin_trap();
 }
 
@@ -110,7 +112,7 @@ static enum kernel_pipe_status pipe_destroy(struct kernel_pipe *pipe)
         pipe->fifo_node->fifo_pipe = 0;
     }
     for (uint32_t i=0;i<pipe->ring_size;i++)
-        if (pipe->buffers[i].page) pipe_release_page(pipe,pipe->buffers[i].page);
+        if (pipe->buffers[i].page) pipe_release_page(pipe,pipe->buffers[i].page,pipe->buffers[i].order);
     if (pipe->buffers!=pipe->inline_buffers) kernel_heap_release(pipe->heap,pipe->buffers);
     (void)kernel_uid_account_pipe_pages(pipe->account,pipe->ring_size,0);
     kernel_uid_account_put(pipe->account);
@@ -432,7 +434,7 @@ int kernel_pipe_fifo_open(struct kernel_heap *heap,struct kernel_vfs_node *node,
 static uint32_t next_slot(const struct kernel_pipe *pipe,uint32_t slot)
 { return (slot+1U)&(pipe->ring_size-1U); }
 
-static void *pipe_consume(struct kernel_pipe *pipe, uint64_t count)
+static void *pipe_consume(struct kernel_pipe *pipe, uint64_t count,unsigned *order)
 {
     uint32_t slot = pipe->head;
     void *page=0;
@@ -442,6 +444,7 @@ static void *pipe_consume(struct kernel_pipe *pipe, uint64_t count)
     pipe->bytes -= count;
     if (pipe->buffers[slot].length == 0U) {
         page=pipe->buffers[slot].page;pipe->buffers[slot].page=0;
+        *order=pipe->buffers[slot].order;pipe->buffers[slot].order=0;
         pipe->buffers[slot].offset = 0U;
         pipe->buffers[slot].can_merge=0;
         pipe->head = next_slot(pipe,slot);
@@ -515,7 +518,7 @@ void kernel_pipe_read_finish(struct kernel_pipe_read_borrow *borrow,size_t consu
     size_t left=consumed;
     int wake_writers=0;
     while (left) {
-        void *page=NULL;
+        void *page=NULL;unsigned order=0;
         {
             PIPE_META(guard,pipe);
             if (pipe->read_slot!=pipe->head || !pipe->slots) __builtin_trap();
@@ -529,9 +532,9 @@ void kernel_pipe_read_finish(struct kernel_pipe_read_borrow *borrow,size_t consu
             }
             size_t n=left<pipe->buffers[pipe->head].length?left:pipe->buffers[pipe->head].length;
             if (n==pipe->buffers[pipe->head].length && pipe->slots==pipe->ring_size) wake_writers=1;
-            page=pipe_consume(pipe,n);left-=n;pipe->read_slot=pipe->head;
+            page=pipe_consume(pipe,n,&order);left-=n;pipe->read_slot=pipe->head;
         }
-        if (page) pipe_release_page(pipe,page);
+        if (page) pipe_release_page(pipe,page,order);
     }
     { PIPE_META(guard,pipe);pipe->read_slot=KERNEL_PIPE_NO_SLOT; }
     kernel_lock_release(&borrow->guard);*borrow=(struct kernel_pipe_read_borrow){0};
@@ -584,7 +587,7 @@ int kernel_pipe_write_begin(struct kernel_pipe *pipe,int nonblocking,struct kern
         if (error) return error;
     }
 }
-int kernel_pipe_push_page(struct kernel_pipe_write_borrow *borrow,void *page,size_t offset,size_t length)
+static int pipe_push_order(struct kernel_pipe_write_borrow *borrow,void *page,size_t offset,size_t length,unsigned order)
 {
     struct kernel_pipe *pipe=borrow->pipe;
     if (!pipe || !borrow->guard.lock || !page || !length || length>BOAROS_PAGE_SIZE-offset || !borrow->slots) __builtin_trap();
@@ -592,12 +595,14 @@ int kernel_pipe_push_page(struct kernel_pipe_write_borrow *borrow,void *page,siz
         PIPE_META(guard,pipe);
         if (!pipe->readers) return -KERNEL_EPIPE;
         if (pipe->slots==pipe->ring_size || pipe->buffers[pipe->tail].page) __builtin_trap();
-        pipe->buffers[pipe->tail]=(struct kernel_pipe_buffer){page,(uint16_t)offset,(uint16_t)length,0};
+        pipe->buffers[pipe->tail]=(struct kernel_pipe_buffer){page,(uint16_t)offset,(uint16_t)length,0,(uint8_t)order};
         pipe->tail=next_slot(pipe,pipe->tail);pipe->slots++;pipe->bytes+=length;borrow->slots--;borrow->changed=1;
     }
     pipe_notify(pipe,1,0);
     return 0;
 }
+int kernel_pipe_push_page(struct kernel_pipe_write_borrow *borrow,void *page,size_t offset,size_t length)
+{ return pipe_push_order(borrow,page,offset,length,0); }
 void kernel_pipe_write_finish(struct kernel_pipe_write_borrow *borrow)
 {
     if (!borrow->pipe || !borrow->guard.lock) __builtin_trap();
@@ -644,8 +649,9 @@ int64_t kernel_pipe_link(struct kernel_pipe *in,struct kernel_pipe *out,size_t c
             /* Physical refs have a lower raw rank than endpoint metadata. */
             if (!move) {
                 uint64_t physical;
-                if (!in->heap->physical_address(part.page,&physical) || in->allocator!=out->allocator ||
-                    physical_page_acquire(in->allocator,physical)) __builtin_trap();
+                if (!in->heap->physical_address(part.page,&physical) || in->allocator!=out->allocator) __builtin_trap();
+                physical &= ~(((uint64_t)BOAROS_PAGE_SIZE<<part.order)-1);
+                if (physical_page_acquire_order(in->allocator,physical,part.order)) __builtin_trap();
                 part.can_merge=0;
             }
             int publish=0;
@@ -661,13 +667,14 @@ int64_t kernel_pipe_link(struct kernel_pipe *in,struct kernel_pipe *out,size_t c
                     out->tail=next_slot(out,out->tail);out->slots++;out->bytes+=n;
                     if (consume) {
                         if (move && in->slots==in->ring_size) wake_writers=1;
-                        void *released=pipe_consume(in,n);
-                        if (move && released!=part.page) __builtin_trap();
+                        unsigned released_order=0;
+                        void *released=pipe_consume(in,n,&released_order);
+                        if (move && (released!=part.page || released_order!=part.order)) __builtin_trap();
                     }
                     publish=1;
                 }
             }
-            if (!publish) {if (!move) pipe_release_page(out,part.page);break;}
+            if (!publish) {if (!move) pipe_release_page(out,part.page,part.order);break;}
             total+=n;count-=n;
             if (consume) {index=in->head;remaining=in->slots;}
             else {index=next_slot(in,index);remaining--;}
@@ -705,12 +712,11 @@ int64_t kernel_pipe_vmsplice(struct kernel_pipe *pipe,struct kernel_mm *mm,
         }
         /* The queued reference is independent of the temporary MM pin: unmap,
          * exit and COW can end that mapping while the pipe remains readable. */
-        void *page;
-        if (mm->allocator!=pipe->allocator || physical_page_acquire(pipe->allocator,pin.physical_address) ||
-            physical_page_resolve(pipe->allocator,pin.physical_address,&page)) __builtin_trap();
+        void *page=pin.page;unsigned order=pin.order;
+        if (mm->allocator!=pipe->allocator || physical_page_acquire_order(pipe->allocator,pin.owner_address,order)) __builtin_trap();
         kernel_mm_unpin_user_page(&pin);
-        error=kernel_pipe_push_page(&borrow,page,offset,size);
-        if (error) {pipe_release_page(pipe,page);break;}
+        error=pipe_push_order(&borrow,page,offset,size,order);
+        if (error) {pipe_release_page(pipe,page,order);break;}
         cursor.offset+=size;total+=size;
     }
     kernel_pipe_write_finish(&borrow);
@@ -807,7 +813,7 @@ static enum kernel_pipe_status pipe_write_source_locked(struct kernel_pipe *pipe
             }
             if (allocated || physical_page_resolve(pipe->allocator,physical,&page)) __builtin_trap();
             /* 槽先拥有尚未发布的页；用户fault或最后端点释放都能找到它。 */
-            { PIPE_META(guard,pipe);pipe->buffers[slot].page=page; }
+            { PIPE_META(guard,pipe);pipe->buffers[slot].page=page;pipe->buffers[slot].order=0; }
         }
         unsigned char *destination=pipe->buffers[slot].page+offset;
         size_t done=0; enum kernel_uaccess_status access=KERNEL_UACCESS_STATUS_OK;
@@ -819,9 +825,10 @@ static enum kernel_pipe_status pipe_write_source_locked(struct kernel_pipe *pipe
               pipe->merge_slot=KERNEL_PIPE_NO_SLOT;
               if (!merging) {
                   page=pipe->buffers[slot].page;pipe->buffers[slot].page=0;
+                  pipe->buffers[slot].order=0;
               }
             }
-            if (page) pipe_release_page(pipe,page);
+            if (page) pipe_release_page(pipe,page,0);
             kernel_lock_scope_release(&copy); arch_interrupt_restore(irq);
             if (access!=KERNEL_UACCESS_STATUS_FAULT) return KERNEL_PIPE_STATUS_STATE;
             result->bytes=total ? (int64_t)total : -KERNEL_EFAULT;
