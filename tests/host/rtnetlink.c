@@ -90,6 +90,35 @@ static void route_cases(struct kernel_heap *heap)
     n=exchange(&pin,&request,24,sizeof(response),0);assert(n>20);
     request.header.type=26;request.header.length=28;request.header.sequence++;
     n=exchange(&pin,&request,28,sizeof(response),0);assert(n>=20);
+    /* Point lookup uses the real loopback snapshot and Linux wire framing. */
+    struct { struct route_header h; unsigned char rt[12]; uint16_t len,type; uint32_t dst; } point=
+        {{36,26,5,900,0},{2,32},8,1,0};
+    unsigned char loopaddr[4]={127,0,0,1};__builtin_memcpy(&point.dst,loopaddr,4);
+    n=exchange(&pin,&point,sizeof(point),sizeof(response),0);
+    struct route_header *answer=(void *)response;
+    assert(answer->type==24 && !answer->flags && answer->sequence==900 && answer->port==port);
+    assert(response[16]==2 && response[17]==32 && response[23]==2);
+    unsigned length=answer->length;answer=(void *)(response+route_align(length));
+    assert(answer->type==2 && !*(int32_t *)((unsigned char *)answer+16));
+    assert(n==route_align(length)+36 && !memcmp((unsigned char *)answer+20,&point.h,16));
+    point.h.flags=1;
+    __typeof__(point) batch[2]={point,point};batch[1].h.sequence++;
+    n=exchange(&pin,batch,sizeof(batch),sizeof(response),0);
+    unsigned at=0;
+    for(unsigned i=0;i<2;i++) {
+        answer=(void *)(response+at);assert(answer->type==24 && answer->sequence==900+i);
+        at+=route_align(answer->length);
+    }
+    assert(at==n);
+    point.h.flags=1;point.dst=0;((unsigned char *)&point.dst)[0]=192;((unsigned char *)&point.dst)[3]=1;
+    n=exchange(&pin,&point,sizeof(point),sizeof(response),0);
+    assert(n==56 && *(int32_t *)(response+16)==-KERNEL_ENETUNREACH);
+    point.len=7;n=exchange(&pin,&point,sizeof(point),sizeof(response),0);
+    assert(*(int32_t *)(response+16)==-KERNEL_EINVAL);
+    point.len=8;point.type=3;point.dst=1;n=exchange(&pin,&point,sizeof(point),sizeof(response),0);
+    assert(*(int32_t *)(response+16)==-KERNEL_EOPNOTSUPP);
+    point.type=4;point.dst=9999;n=exchange(&pin,&point,sizeof(point),sizeof(response),0);
+    assert(*(int32_t *)(response+16)==-KERNEL_ENODEV);
     request.header.type=99;request.header.length=16;
     n=exchange(&pin,&request,16,sizeof(response),0);
     assert(n==36 && ((struct route_header *)response)->type==2 && *(int32_t *)(response+16)==-KERNEL_EOPNOTSUPP);

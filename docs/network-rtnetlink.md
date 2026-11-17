@@ -1,4 +1,4 @@
-# 只读 rtnetlink 第一阶段
+# 只读 rtnetlink
 
 ## 支持边界
 
@@ -11,8 +11,20 @@
 - `RTM_GETLINK` 支持 dump，以及按 index / `IFLA_IFNAME` 点查询。
   `AF_PACKET`（真实 `ip link` 使用）、UNSPEC、INET、INET6 均可查询 link。
 - `RTM_GETADDR` / `RTM_GETROUTE` 支持 UNSPEC、IPv4、IPv6 dump。
-  非 dump GETADDR / GETROUTE 明确返回 `NLMSG_ERROR(-EOPNOTSUPP)`；本阶段
-  不宣称支持 `ip route get`、策略路由、增删改、netlink multicast 或用户态单播。
+  非 dump GETADDR 明确返回 `NLMSG_ERROR(-EOPNOTSUPP)`。
+- IPv4 `RTM_GETROUTE` 点查询支持 `ip route get`：本地/loopback、当前直连
+  网段、已配置的默认网关，以及无路由 `ENETUNREACH`。按 snapshot 中的
+  lwIP 接口顺序选择首个 UP、link-up、有地址的匹配接口，不伪造最长前缀 FIB。
+  接受 DST、已配置的 SRC（含 loopback 子网）、OIF 和 UID；OIF 不存在返回
+  ENODEV，不可用返回 ENETUNREACH。显式 OIF 的 off-link 目标仍需设备已配置
+  gateway，否则 ENETUNREACH；不模拟 Linux 可合成的 on-link route。
+  UID 不影响当前无用户策略的选择。
+  `RTM_F_LOOKUP_TABLE` 返回真实 local/main 分类；普通回复是 /32 resolved
+  route，不带 MULTI/DONE，保持 sequence，并支持请求的成功 ACK。
+  非零 IIF、MARK、TOS、额外路由表/header selector、notify、fibmatch、
+  multicast/broadcast 与 IPv6 点查询明确返回 EOPNOTSUPP；未知 attribute
+  不会被忽略后假装按它查询成功。非法前缀长度、attribute 长度返回 EINVAL。
+  不宣称支持策略路由、增删改、netlink multicast 或用户态单播。
 - LINK 导出真实名称、ifindex、硬件类型/MAC、MTU、UP/RUNNING/LOWER_UP、
   operstate。内核没有 qdisc，导出 `noqueue` / txqlen 0，不伪造统计计数。
 - ADDR 导出现有单 IPv4 地址/掩码、广播地址，以及 netif 确实持有的 loopback
@@ -51,7 +63,7 @@ FILE_IO_HOST_SHIFTS='12 14' sh tests/host/netlink-notify.sh
 ```
 
 前者覆盖真实 FD/OFD/socket/heap owner、绑定冲突、三类 dump、sequence、
-MULTI / DONE、错误回显、截断、接收额度与混合 MQ 关闭；后者保留既有 MQ
+MULTI / DONE、点查询/无路由/selector 错误、成功 ACK、错误回显、截断、接收额度与混合 MQ 关闭；后者保留既有 MQ
 RAW/DGRAM、故障、等待/关闭、取消与最终 owner 清零回归。两个入口按 4K/16K
 页配置运行，而不是只测试独立 wire encoder。
 
@@ -74,12 +86,17 @@ LA 内核使用其默认 loongarch unknown-linux-gnu 工具链。
 客户机包含 4 个进程共享同一 netlink socket 发起 dump，检查回复隔离、序列、
 PEEK/TRUNC、错误以及最终 root owner 回收。`--network` 时测试通过现有 ioctl
 配置真实 gateway，然后检查 iproute2 输出确有 Ethernet 和 default route。
+点查询还覆盖接口 down/up、删除/恢复 gateway 后结果立即变化、SRC/OIF、
+非法 source、无网卡的 ENETUNREACH；不从旧 dump 构造持续缓存。
 
 `--ip` 接受未修改的 iproute2 静态 `ip` ELF。6.1.0 的真实 `ip link show`、
 `ip address show`、`ip route show table all`、`ip -6 address show` 和
-`ip -6 route show` 是验收消费者；runner 不仅检查退出码，还拒绝隐藏的
+`ip -6 route show`、`ip route get 127.0.0.1` 是验收消费者；网络场景还运行
+`ip route get 192.0.2.1` 及其 `oif eth0` 变体。runner 不仅检查退出码，还拒绝隐藏的
 `RTNETLINK answers:` / ioctl 错误。内核测试不是吞掉 stderr 的“退出码成功”。
 
 本环境 Linux 宿主创建 `NETLINK_ROUTE` socket 返回 EPERM，未能执行 Linux
-运行时差分，不能把以上验收称为 Linux 差分通过。跨架构专项与真实 iproute2
+运行时差分，不能把以上验收称为 Linux 差分通过。点查询 wire/header/source
+语义核对 Linux v6.1 `net/ipv4/route.c` 的 `inet_rtm_getroute`、`rt_fill_info`
+与 `ip_route_output_key_hash_rcu`；这不是动态差分的替代。跨架构专项与真实 iproute2
 验证独立于该限制；未来有可运行的参考 Linux 后仍应补充差分。

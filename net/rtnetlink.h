@@ -110,6 +110,87 @@ static int route_ipv6(struct route_output *out,const struct route_header *reques
     return route_attribute(out,h,15,(uint32_t[]){255},4) ||
         route_attribute(out,h,1,destination,16) || route_attribute(out,h,4,&s->index,4)?-KERNEL_ENOBUFS:0;
 }
+/* Output lookups only: this is the existing lwIP route selection, not a FIB.
+ * Keep snapshot order (ip4_route uses first matching netif, not longest prefix).
+ * No mutable route/cache object or extra work on the packet path is needed. */
+static int route_lookup(struct route_output *out,const struct route_header *h,
+    const unsigned char *p,size_t size,const struct kernel_socket_interface *ifs,size_t count)
+{
+    uint32_t dst=0,src=0,oif=0,flags=0;int error=0;
+    if(p[0]!=2)return route_error(out,h,p,size,-KERNEL_EOPNOTSUPP);
+    __builtin_memcpy(&flags,p+8,4);
+    if((p[1] && p[1]!=32) || (p[2] && p[2]!=32))error=-KERNEL_EINVAL;
+    /* Input routing, notification and FIB-match need state this kernel lacks. */
+    else if(p[3] || p[4] || p[5] || p[6] || p[7] || (flags&~0x1000U))error=-KERNEL_EOPNOTSUPP;
+    for(size_t at=12;!error && at<size;) {
+        uint16_t length,type;
+        if(size-at<4){error=-KERNEL_EINVAL;break;}
+        __builtin_memcpy(&length,p+at,2);__builtin_memcpy(&type,p+at+2,2);
+        if(length<4 || length>size-at){error=-KERNEL_EINVAL;break;}
+        uint32_t value=0;
+        if(type==1 || type==2 || type==3 || type==4 || type==16 || type==25) {
+            if(length!=8){error=-KERNEL_EINVAL;break;}
+            __builtin_memcpy(&value,p+at+4,4);
+            if(type==1)dst=value;
+            else if(type==2)src=value;
+            else if(type==4)oif=value;
+            else if(type!=25 && value)error=-KERNEL_EOPNOTSUPP;
+            /* UID cannot affect selection: there are no per-user rules. */
+        } else error=-KERNEL_EOPNOTSUPP;
+        size_t step=route_align(length);
+        if(step>size-at) {if(length!=size-at)error=-KERNEL_EINVAL;break;}
+        at+=step;
+    }
+    if(error)return route_error(out,h,p,size,error);
+    const uint8_t *source_bytes=(const uint8_t *)&src;
+    if(src && (!source_bytes[0] || source_bytes[0]>=224))return route_error(out,h,p,size,-KERNEL_EINVAL);
+    const struct kernel_socket_interface *selected=NULL,*fallback=NULL,*loop=NULL,*bound=NULL;
+    int source_ok=!src;
+    for(size_t i=0;i<count;i++) {
+        const struct kernel_socket_interface *s=&ifs[i];
+        if(s->index==oif)bound=s;
+        if(!(s->flags&1) || !s->link_up || !s->address)continue;
+        if(s->address==src || (s->hardware_type==772 && (src&s->netmask)==(s->address&s->netmask)))source_ok=1;
+        if(s->hardware_type==772)loop=s;
+    }
+    if(oif && !bound)return route_error(out,h,p,size,-KERNEL_ENODEV);
+    if(!source_ok)return route_error(out,h,p,size,-KERNEL_ENETUNREACH);
+    if(bound && (!(bound->flags&1) || !bound->link_up || !bound->address))
+        return route_error(out,h,p,size,-KERNEL_ENETUNREACH);
+    if(!dst)dst=src?src:loop?loop->address:0;
+    const uint8_t *bytes=(const uint8_t *)&dst;
+    if(!dst || bytes[0]>=224)return route_error(out,h,p,size,-KERNEL_EOPNOTSUPP);
+    int local=0,gateway=0;
+    for(size_t i=0;i<count;i++) {
+        const struct kernel_socket_interface *s=&ifs[i];
+        if(!(s->flags&1) || !s->link_up || !s->address)continue;
+        if(dst==s->address || (s->hardware_type==772 && (dst&s->netmask)==(s->address&s->netmask))) {
+            selected=s;local=1;break;
+        }
+        if(oif && s!=bound)continue;
+        if(!selected && (dst&s->netmask)==(s->address&s->netmask))selected=s;
+        if(s->default_route)fallback=s;
+    }
+    if(!selected && bytes[0]!=127){selected=fallback;gateway=!!selected;}
+    /* A bound device still needs its configured gateway for off-link IPv4:
+     * etharp_output cannot synthesize an on-link route as Linux can. */
+    if(!selected && bound && bound->gateway && bytes[0]!=127){selected=bound;gateway=1;}
+    if(!selected)return route_error(out,h,p,size,-KERNEL_ENETUNREACH);
+    if(!local && selected->hardware_type!=772 && dst==(selected->address|~selected->netmask))
+        return route_error(out,h,p,size,-KERNEL_EOPNOTSUPP);
+    if(!local && source_bytes[0]==127 && selected->hardware_type!=772)
+        return route_error(out,h,p,size,-KERNEL_EINVAL);
+    uint32_t index=local && loop?loop->index:selected->index;
+    uint32_t preferred=src?src:selected->address,table=(local && (flags&0x1000U))?255:254;
+    unsigned char info[12]={2,32,src?32:0,0,table,0,0,local?2:1,0,2,0,local?128:0};
+    struct route_header *reply=route_message(out,24,0,h->sequence,info,sizeof(info));
+    if(!reply)return -KERNEL_ENOBUFS;
+    if(route_attribute(out,reply,15,&table,4) || route_attribute(out,reply,1,&dst,4) ||
+       route_attribute(out,reply,4,&index,4) ||
+       (src?route_attribute(out,reply,2,&src,4):route_attribute(out,reply,7,&preferred,4)) ||
+       (gateway && route_attribute(out,reply,5,&selected->gateway,4)))return -KERNEL_ENOBUFS;
+    return (h->flags&4)?route_error(out,h,p,size,0):0;
+}
 static int route_request(struct route_output *out,const struct route_header *h,
     const unsigned char *payload,size_t size,const struct kernel_socket_interface *interfaces,size_t count)
 {
@@ -121,8 +202,9 @@ static int route_request(struct route_output *out,const struct route_header *h,
     if(h->type!=18 && h->type!=22 && h->type!=26)error=-KERNEL_EOPNOTSUPP;
     else if(size<(dump?1:minimum))error=-KERNEL_EINVAL;
     else if(payload[0]!=0 && payload[0]!=2 && payload[0]!=10 && !(h->type==18 && payload[0]==17))error=-KERNEL_EAFNOSUPPORT;
-    else if(!dump && h->type!=18)error=-KERNEL_EOPNOTSUPP;
+    else if(!dump && h->type==22)error=-KERNEL_EOPNOTSUPP;
     if(error)return route_error(out,h,payload,size,error);
+    if(!dump && h->type==26)return route_lookup(out,h,payload,size,interfaces,count);
     int32_t index=0;char name[16]={0};
     if(size>=minimum && minimum) {
         if(h->type==18)__builtin_memcpy(&index,payload+4,4);
