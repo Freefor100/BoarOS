@@ -254,6 +254,9 @@ static int socket_option(int level, int name, enum kernel_socket_option *option)
         if (name == 1) { *option = KERNEL_SOCKET_NODELAY; return 0; }
         if (name == 2) { *option = KERNEL_SOCKET_MAXSEG; return 0; }
         if (name == 3) { *option = KERNEL_SOCKET_CORK; return 0; }
+        if (name == 4) { *option = KERNEL_SOCKET_KEEPIDLE; return 0; }
+        if (name == 5) { *option = KERNEL_SOCKET_KEEPINTVL; return 0; }
+        if (name == 6) { *option = KERNEL_SOCKET_KEEPCNT; return 0; }
     } else if (level == 41 && name == 26) {
         *option = KERNEL_SOCKET_V6ONLY; return 0;
     }
@@ -425,6 +428,27 @@ static int sockopt(struct kernel_socket *socket, struct kernel_files *files, str
                 KERNEL_UACCESS_STATUS_OK || copied != sizeof(length)) return -KERNEL_EFAULT;
     }
     if (length < 0) return -KERNEL_EINVAL;
+    /* TCP publishes optlen before touching optval (Linux tcp.c). */
+    int tcp_extended = level == LINUX_IPPROTO_TCP &&
+        (name >= 4 && name <= 6);
+    if (tcp_extended) {
+        if (!kernel_socket_is_tcp(socket))
+            return get || kernel_socket_is_unix(socket) ? -KERNEL_EOPNOTSUPP : -KERNEL_ENOPROTOOPT;
+        if (get) {
+            int value;
+            uint32_t capacity = (uint32_t)length, output = sizeof(value);
+            int error = socket_option(level, name, &option);
+            if (!error) error = kernel_socket_get_option(socket, option, &value);
+            const void *data = &value;
+            if (error) return error;
+            if (output > capacity) output = capacity;
+            if (kernel_copy_to_user(mm, request->arguments[4], &output, sizeof(output), &copied) !=
+                    KERNEL_UACCESS_STATUS_OK || copied != sizeof(output)) return -KERNEL_EFAULT;
+            if (output && (kernel_copy_to_user(mm, request->arguments[3], data, output, &copied) !=
+                    KERNEL_UACCESS_STATUS_OK || copied != output)) return -KERNEL_EFAULT;
+            return 0;
+        }
+    }
     if (level == LINUX_SOL_SOCKET && name == 25)
         return device_sockopt(socket, mm, request, get, length);
     if (level == 0 && (name == 2 || name == 32 || name == 33))

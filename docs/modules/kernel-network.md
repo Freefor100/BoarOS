@@ -425,3 +425,48 @@ socket 持有已校验程序的引用，替换或 detach 在端点锁下交换�
 lwIP 入口传递实际 UDP/TCP PCB，按已登记的 socket 回调识别关联；raw API 调用者的任意 callback_arg 不解释为 socket。TCP SYN_RCVD 在 accept 前借用仍活跃监听 PCB 的关联，已建立连接使用自己的关联；本地快速输出使用同一判断。设备停机及 socket 销毁先解除回调，已执行过滤所借用的程序和包/DMA 引用各自持有到停止使用。
 
 接口、权限、共同执行器和工具入口见 [BPF 模块](kernel-bpf.md)。
+
+### TCP keepalive policy
+
+`TCP_KEEPIDLE`、`TCP_KEEPINTVL`、`TCP_KEEPCNT` 分别以秒、秒、探测次数读写；默认
+7200/75/9，合法范围 1..32767、1..32767、1..127。设置这些值不隐式开启
+`SO_KEEPALIVE`。策略属于共享 socket，dup 共享，listen 转换不丢失，accept 子端点
+继承接受时的值，之后父子各自独立。关闭/错误回收 PCB 后仍可查询策略。
+
+查询仅取 endpoint 锁；设置在既有协议生命周期保护内更新策略和活跃 PCB。
+LISTEN PCB 比活跃 PCB 小，不能写入其 active-only keepalive 字段；在 accept 时安装。
+沿用 lwIP 的 500ms slow timer、最近活动和探测计数，没有新增逐包统计、周期任务或
+独立 socket 定时器。空闲 ESTABLISHED/CLOSE_WAIT 连接在开启 keepalive 后发送探测，
+ACK 恢复活动计时；探测预算耗尽沿现有 timer error 路径返回 ETIMEDOUT。
+这里不承诺与 Linux 精确相同的墙钟探测时刻。
+
+`tests/workloads/network/tcp_keepalive.c` 是 Linux/BoarOS 共用消费者，检查范围、
+短 optlen、错误指针、optlen 先于 optval 发布、dup、IPv4/IPv6 accept 继承及协议错误。
+`tests/userland/tcp-keepalive.py` 接收预构建 kernel/static ELF 做定向 guest 验证。
+`tests/host/tcp-keepalive.sh` 用生产 lwIP 与 socket service、冻结时钟推进现有 timer，
+检查真实探测、禁用状态、超时、策略存续和资源归还（4K/16K 页）。
+Linux 语义参考 [v6.6 tcp.c](https://github.com/torvalds/linux/blob/v6.6/net/ipv4/tcp.c)。
+
+本改动不实现 `TCP_INFO`。仅返回到 snd_mss 的 20-byte 短前缀虽可表达可用字段，
+但 [iperf 3.19](https://github.com/esnet/iperf/blob/3.19/src/tcp_info.c) 在成功返回后
+不检查长度便读取 total_retrans、snd_cwnd、rtt 等字段，会误报；不能把缺失统计填零
+冒充真实测量。扩展该接口需要单独定义真实统计来源和成本，不包含在 keepalive 交付中。
+
+定向验证命令（编译器、QEMU、pahole 由调用者配置，不下载/跑宽泛基线）：
+
+```sh
+cc -O2 -Wall -Wextra -Werror tests/workloads/network/tcp_keepalive.c -o build/keepalive-linux
+build/keepalive-linux
+sh tests/host/tcp-keepalive.sh
+riscv64-buildroot-linux-musl-gcc -static -O2 tests/workloads/network/tcp_keepalive.c -o build/keepalive-rv
+loongarch64-linux-musl-gcc -static -O2 -Wl,-z,max-page-size=16384 tests/workloads/network/tcp_keepalive.c -o build/keepalive-la
+make -j4 SMP=1 SMP_CPUS=2 USER_SMP=1 COST_DIAGNOSTICS=0 all
+make -j4 SMP=1 LA_SMP=1 LA_SMP_CPUS=2 USER_SMP=1 COST_DIAGNOSTICS=0 kernel-la
+python3 tests/userland/tcp-keepalive.py --kernel build/riscv-user-smp/kernel-rv --program build/keepalive-rv --cpus 2
+python3 tests/userland/tcp-keepalive.py --arch loongarch --kernel build/loongarch-smp2/kernel-la --program build/keepalive-la --cpus 2
+```
+
+本次 Linux 同源测试、RV/LA 双核 USER_SMP guest 均 PASS；host Linux 沙箱不允许创建
+AF_UNIX socket，该错误路径在 guest 验证。LA 使用 stock QEMU 10.0.13 的本地临时
+wrapper，仅过滤其不支持的 `-global ls7a_rtc.toy-enabled=on`；不改仓库 harness，
+不据此声称验证 RTC。host 定时器测试不测真实外网丢包、性能或精确墙钟时刻。

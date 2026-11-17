@@ -118,6 +118,7 @@ struct kernel_socket {
     int pending_error;
     uint8_t reuseaddr;
     uint8_t keepalive;
+    uint32_t keep_idle, keep_intvl, keep_cnt;
     uint8_t nodelay, cork;
     uint8_t broadcast, ipv4_ttl, multicast_ttl;
     uint8_t bound_device, multicast_index;
@@ -2131,6 +2132,12 @@ static err_t socket_tcp_accepted(void *context, struct tcp_pcb *pcb,
     child->tx_limit = listener->tx_limit;
     child->reuseaddr = listener->reuseaddr;
     child->keepalive = listener->keepalive;
+    child->keep_idle = listener->keep_idle;
+    child->keep_intvl = listener->keep_intvl;
+    child->keep_cnt = listener->keep_cnt;
+    pcb->keep_idle = child->keep_idle;
+    pcb->keep_intvl = child->keep_intvl;
+    pcb->keep_cnt = child->keep_cnt;
     child->nodelay = listener->nodelay;
     child->cork = listener->cork;
     child->broadcast=listener->broadcast;child->ipv4_ttl=listener->ipv4_ttl;
@@ -2249,6 +2256,9 @@ int kernel_socket_create(struct kernel_heap *heap, int family, int type, int pro
                                       IPADDR_TYPE_V4 : IPADDR_TYPE_ANY);
         if (socket->tcp != 0) {
             socket->tcp->ttl=64;
+            socket->keep_idle=socket->tcp->keep_idle;
+            socket->keep_intvl=socket->tcp->keep_intvl;
+            socket->keep_cnt=socket->tcp->keep_cnt;
             tcp_arg(socket->tcp, socket);
             tcp_err(socket->tcp, tcp_failed);
             tcp_recv(socket->tcp, tcp_data_received);
@@ -4468,6 +4478,26 @@ int kernel_socket_shutdown(struct kernel_socket *socket,int how)
 int kernel_socket_set_option(struct kernel_socket *socket,
                              enum kernel_socket_option option, int value)
 {
+    if (option==KERNEL_SOCKET_KEEPIDLE || option==KERNEL_SOCKET_KEEPINTVL ||
+        option==KERNEL_SOCKET_KEEPCNT) {
+        if (!kernel_socket_is_tcp(socket)) return -KERNEL_ENOPROTOOPT;
+        if (value<1 || value>(option==KERNEL_SOCKET_KEEPCNT?127:32767)) return -KERNEL_EINVAL;
+        struct kernel_socket_protocol_scope protocol;socket_protocol_enter(&protocol,socket);
+        uint32_t converted=option==KERNEL_SOCKET_KEEPCNT?(uint32_t)value:(uint32_t)value*1000U;
+        /* Listen PCBs are smaller than active PCBs. Retain policy on the endpoint
+         * and install it on accepted children, never access an active-only field. */
+        uint32_t *policy=option==KERNEL_SOCKET_KEEPIDLE?&socket->keep_idle:
+            option==KERNEL_SOCKET_KEEPINTVL?&socket->keep_intvl:&socket->keep_cnt;
+        { SOCKET_ENDPOINT(state,socket); *policy=converted; }
+        if (socket->tcp && !socket->listening) {
+            if(option==KERNEL_SOCKET_KEEPIDLE)socket->tcp->keep_idle=converted;
+            else if(option==KERNEL_SOCKET_KEEPINTVL)socket->tcp->keep_intvl=converted;
+            else socket->tcp->keep_cnt=converted;
+        }
+        /* lwIP checks elapsed idle time at its existing slow timer; no new
+         * per-socket timer/worker, and no restart of the last-activity clock. */
+        kernel_socket_protocol_leave(&protocol);return 0;
+    }
     if(option==KERNEL_SOCKET_PASSCRED) {SOCKET_ENDPOINT(state,socket);socket->passcred=value!=0;return 0;}
     if (option==KERNEL_SOCKET_SNDBUF || option==KERNEL_SOCKET_RCVBUF) {
         struct kernel_socket_protocol_scope protocol;
@@ -4572,6 +4602,15 @@ int kernel_socket_set_option(struct kernel_socket *socket,
 int kernel_socket_get_option(struct kernel_socket *socket,
                              enum kernel_socket_option option, int *value)
 {
+    if (option==KERNEL_SOCKET_KEEPIDLE || option==KERNEL_SOCKET_KEEPINTVL ||
+        option==KERNEL_SOCKET_KEEPCNT) {
+        if (!kernel_socket_is_tcp(socket)) return -KERNEL_ENOPROTOOPT;
+        SOCKET_ENDPOINT(state,socket);
+        uint32_t policy=option==KERNEL_SOCKET_KEEPIDLE?socket->keep_idle:
+            option==KERNEL_SOCKET_KEEPINTVL?socket->keep_intvl:socket->keep_cnt;
+        *value=(int)(option==KERNEL_SOCKET_KEEPCNT?policy:policy/1000U);
+        return 0;
+    }
     if (option==KERNEL_SOCKET_TYPE) { *value=socket->type;return 0; }
     if (option==KERNEL_SOCKET_MAXSEG) {
         if(!kernel_socket_is_tcp(socket))return -KERNEL_ENOPROTOOPT;
