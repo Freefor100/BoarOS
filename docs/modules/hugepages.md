@@ -87,3 +87,17 @@ GROWSDOWN 同时请求仍为 EINVAL。huge mmap 的资源核算明确不是 grow
 非固定提示地址和 top-down 搜索均尊重已有 growdown/stack guard 区。
 `tests/host/mm_hugetlb.c` 覆盖提示落入 guard 和位于 mmap ceiling 之上的 stack guard
 向下覆盖候选地址的两种组合，防止只修 syscall 标志而破坏隔离间隔。
+
+### Pipe 消费者与整合回归
+
+pipe buffer 的基本页窗口另带 compound order；vmsplice 独立取得整块 head 引用，tee、
+部分 splice 克隆同一 owner，全 splice 转移 owner，读取、关闭和失败回滚均按 order 归还。
+基本页快路径仍为 order 0，buffer 利用现有 padding，不增加描述符大小，不用复制替代借页。
+最终专项扩为 8 组，新增内部窗口 vmsplice、fork/COW、tee、部分/完整 splice、原映射
+unmap 后读取，以及未读取就 close 的池容量恢复。
+
+独立审查发现 16 KiB host pipe 套件超时，f838aca8 基线同环境通过。最小对照确认新
+Sv39 leaf resolver 的上级索引误随 allocator granule 偏移，与原发布路径不一致，已改回
+一致的 30/21/BOAROS_PAGE_SHIFT。旧对象在 16 KiB snapshot 断言失败，修复后 4/16 KiB
+最小测试及原 pipe 16 KiB 全套退出 0。`mm-base-leaf.sh` 已纳入 `test-hugetlb-host`。
+此 host 模型不是 LA 硬件页表验证；LA 真实 32 MiB 页由专用 guest 另行验证。

@@ -1173,7 +1173,11 @@ static enum riscv_sv39_status resolve_leaf_order(const struct riscv_sv39_user_sp
     if (status) return status;
     for (int level=2; level>=0; level--) {
         if (visits) { (*visits)++; COST_ADD(MPROTECT_PTE_VISITS,1); }
-        *slot=&entries[(v>>(BOAROS_PAGE_SHIFT+9*level)) & RISCV_SV39_INDEX_MASK];
+        /* Match resolve_user_order_slot/install_prepared_leaf exactly. The
+         * host base-page model also exercises 16 KiB allocation granules;
+         * changing its upper-level indices loses already published leaves. */
+        unsigned shift=level==2?30U:level==1?21U:BOAROS_PAGE_SHIFT;
+        *slot=&entries[(v>>shift) & RISCV_SV39_INDEX_MASK];
         uint64_t entry=**slot;
         if (!entry) return RISCV_SV39_STATUS_NOT_MAPPED;
         if (valid_user_leaf_entry(entry) || valid_protected_entry(entry)) {

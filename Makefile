@@ -2402,6 +2402,7 @@ test-huge-riscv: $(BUILD_DIR)/tests/kernel-huge-rv
 
 .PHONY: test-hugetlb-host
 test-hugetlb-host:
+	sh tests/host/mm-base-leaf.sh
 	sh tests/host/hugetlb.sh
 	sh tests/host/mm-hugetlb.sh
 	sh tests/host/proc-hugetlb.sh
