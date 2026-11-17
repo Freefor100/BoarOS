@@ -751,14 +751,9 @@ enum kernel_block_status kernel_block_write_bytes(struct kernel_block_device *de
 static uint32_t mbr_u32(const unsigned char *p)
 { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
 
-int kernel_block_scan_mbr(struct kernel_block_device *device,
-    struct kernel_block_device children[4])
+static int scan_mbr_sector(struct kernel_block_device *device,
+    struct kernel_block_device children[4], const unsigned char sector[512])
 {
-    if (!device || !children || !device->registered || device->parent ||
-        device->logical_block_size != 512) return -KERNEL_EINVAL;
-    unsigned char sector[512];
-    enum kernel_block_status status = kernel_block_read_at(device, 0, sector, sizeof(sector));
-    if (status != KERNEL_BLOCK_STATUS_OK) return -KERNEL_EIO;
     if (sector[510] != 0x55 || sector[511] != 0xaa) return 0;
     uint64_t starts[4] = {0}, sizes[4] = {0};
     for (unsigned i = 0; i < 4; i++) {
@@ -789,4 +784,183 @@ int kernel_block_scan_mbr(struct kernel_block_device *device,
         }
     }
     return 0;
+}
+
+int kernel_block_scan_mbr(struct kernel_block_device *device,
+    struct kernel_block_device children[4])
+{
+    if (!device || !children || !device->registered || device->parent ||
+        device->logical_block_size != 512) return -KERNEL_EINVAL;
+    unsigned char sector[512];
+    enum kernel_block_status status = kernel_block_read_at(device, 0, sector, sizeof(sector));
+    if (status != KERNEL_BLOCK_STATUS_OK) return -KERNEL_EIO;
+    return scan_mbr_sector(device, children, sector);
+}
+
+int kernel_block_scan_partitions(struct kernel_block_device *device,
+    struct kernel_block_device children[KERNEL_BLOCK_GPT_PARTITIONS])
+{
+    if (!device || !children || !device->registered || device->parent ||
+        device->logical_block_size != 512) return -KERNEL_EINVAL;
+    unsigned char sector[512];
+    if (kernel_block_read_at(device, 0, sector, sizeof(sector)) != KERNEL_BLOCK_STATUS_OK)
+        return -KERNEL_EIO;
+    if (sector[510] == 0x55 && sector[511] == 0xaa)
+        for (unsigned i = 0; i < 4; i++)
+            if (sector[446 + i * 16 + 4] == 0xee)
+                /* Recheck the PMBR under GPT's exclusive transfer lock. */
+                return kernel_block_scan_gpt(device, children, KERNEL_BLOCK_GPT_PARTITIONS);
+    return scan_mbr_sector(device, children, sector);
+}
+
+/* GPT discovery is explicit, like MBR discovery: the caller owns unpublished
+ * child storage and the parent lifetime. Never expose half a partition table. */
+#define GPT_ENTRY_LIMIT 128U
+struct gpt_partition { uint64_t first, count; unsigned char guid[16]; };
+struct gpt_header {
+    uint64_t first, last, entries;
+    uint32_t count, size, crc;
+    unsigned char guid[16];
+};
+static uint64_t gpt_u64(const unsigned char *p)
+{ return (uint64_t)mbr_u32(p) | (uint64_t)mbr_u32(p + 4) << 32; }
+static uint32_t gpt_crc(uint32_t crc, const unsigned char *p, size_t size)
+{
+    while (size--) {
+        crc ^= *p++;
+        for (unsigned bit = 0; bit < 8; bit++)
+            crc = (crc >> 1) ^ (UINT32_C(0xedb88320) & (0U - (crc & 1U)));
+    }
+    return crc;
+}
+static int gpt_nonzero(const unsigned char *p, unsigned size)
+{
+    unsigned char bits = 0;
+    while (size--) bits |= *p++;
+    return bits != 0;
+}
+/* The transfer write lock excludes both aligned writers and capacity changes.
+ * Call the backend directly: recursive public read_at would reacquire it. */
+static int gpt_read(struct kernel_block_device *disk, uint64_t lba, unsigned char sector[512])
+{
+    kernel_task_account_read(512);
+    return disk->read(disk->context, lba * 512, sector, 512) == KERNEL_BLOCK_STATUS_OK ? 0 : -KERNEL_EIO;
+}
+static int gpt_copy(struct kernel_block_device *disk, uint64_t where, uint64_t end,
+    struct gpt_header *header, struct gpt_partition parts[KERNEL_BLOCK_GPT_PARTITIONS], size_t slots)
+{
+    unsigned char sector[512];
+    if (gpt_read(disk, where, sector)) return -KERNEL_EIO;
+    if (__builtin_memcmp(sector, "EFI PART", 8) || mbr_u32(sector + 8) != 0x10000 ||
+        mbr_u32(sector + 20) || gpt_u64(sector + 24) != where ||
+        gpt_u64(sector + 32) != (where == 1 ? end : 1)) return -KERNEL_EINVAL;
+    uint32_t size = mbr_u32(sector + 12), crc = mbr_u32(sector + 16);
+    if (size < 92 || size > 512) return -KERNEL_EINVAL;
+    __builtin_memset(sector + 16, 0, 4);
+    if (~gpt_crc(UINT32_MAX, sector, size) != crc) return -KERNEL_EINVAL;
+    header->first = gpt_u64(sector + 40); header->last = gpt_u64(sector + 48);
+    __builtin_memcpy(header->guid, sector + 56, 16);
+    header->entries = gpt_u64(sector + 72); header->count = mbr_u32(sector + 80);
+    header->size = mbr_u32(sector + 84); header->crc = mbr_u32(sector + 88);
+    if (!header->count || header->first > header->last || header->last >= end ||
+        !gpt_nonzero(header->guid, 16)) return -KERNEL_EINVAL;
+    /* Bound boot work independently of untrusted disk fields. Larger entry
+     * layouts can be added without changing the device-number contract. */
+    if (header->count > GPT_ENTRY_LIMIT ||
+        (header->size != 128 && header->size != 256 && header->size != 512)) return -KERNEL_ENOTSUP;
+    uint64_t bytes = (uint64_t)header->count * header->size;
+    uint64_t sectors = (bytes + 511) / 512;
+    uint64_t reserved = sectors < 32 ? 32 : sectors; /* GPT reserves at least 16 KiB. */
+    if (reserved >= end || header->first < 2 + reserved || header->last >= end - reserved ||
+        header->entries < 2 || header->entries >= end || sectors > end - header->entries)
+        return -KERNEL_EINVAL;
+    if (where == 1 ? header->entries + sectors > header->first :
+        header->entries <= header->last) return -KERNEL_EINVAL;
+    __builtin_memset(parts, 0, sizeof(*parts) * KERNEL_BLOCK_GPT_PARTITIONS);
+    crc = UINT32_MAX;
+    for (uint64_t block = 0; block < sectors; block++) {
+        if (gpt_read(disk, header->entries + block, sector)) return -KERNEL_EIO;
+        size_t n = bytes < 512 ? (size_t)bytes : 512;
+        crc = gpt_crc(crc, sector, n); bytes -= n;
+        for (unsigned offset = 0; offset < n; offset += header->size) {
+            const unsigned char *entry = sector + offset;
+            unsigned index = (unsigned)((block * 512 + offset) / header->size);
+            if (!gpt_nonzero(entry, 16)) continue;
+            if (index >= slots) return -KERNEL_ENOSPC;
+            uint64_t first = gpt_u64(entry + 32), last = gpt_u64(entry + 40);
+            if (first < header->first || last > header->last || first > last ||
+                !gpt_nonzero(entry + 16, 16)) return -KERNEL_EINVAL;
+            for (unsigned j = 0; j < index; j++) {
+                if (!parts[j].count) continue;
+                if ((first < parts[j].first + parts[j].count && parts[j].first <= last) ||
+                    !__builtin_memcmp(parts[j].guid, entry + 16, 16)) return -KERNEL_EINVAL;
+            }
+            parts[index].first = first; parts[index].count = last - first + 1;
+            __builtin_memcpy(parts[index].guid, entry + 16, 16);
+        }
+    }
+    return ~crc == header->crc ? 0 : -KERNEL_EINVAL;
+}
+int kernel_block_scan_gpt(struct kernel_block_device *disk,
+    struct kernel_block_device *children, size_t slots)
+{
+    if (!disk || !children || !slots || slots > KERNEL_BLOCK_GPT_PARTITIONS ||
+        !disk->registered || disk->parent || !disk->read || disk->logical_block_size != 512 ||
+        (disk->device_number & 15U)) return -KERNEL_EINVAL;
+    BLOCK_REQUEST(disk);
+    KERNEL_LOCK_SCOPE(transfer); kernel_rwlock_write(&disk->transfer_lock, &transfer);
+    uint64_t bytes = capacity(disk);
+    if (bytes < 68 * 512 || bytes % 512) return -KERNEL_EINVAL;
+    uint64_t end = bytes / 512 - 1;
+    unsigned char sector[512];
+    if (gpt_read(disk, 0, sector)) return -KERNEL_EIO;
+    if (sector[510] != 0x55 || sector[511] != 0xaa) return -KERNEL_EINVAL;
+    unsigned protective = 0;
+    for (unsigned i = 0; i < 4; i++) {
+        const unsigned char *p = sector + 446 + 16 * i;
+        if (!gpt_nonzero(p, 16)) continue;
+        if (p[4] != 0xee) return -KERNEL_ENOTSUP; /* No hybrid MBR. */
+        if (p[0] || mbr_u32(p + 8) != 1 ||
+            mbr_u32(p + 12) != (end > UINT32_MAX ? UINT32_MAX : (uint32_t)end))
+            return -KERNEL_EINVAL;
+        protective++;
+    }
+    if (protective != 1) return -KERNEL_EINVAL;
+    struct gpt_header primary, backup;
+    struct gpt_partition first[KERNEL_BLOCK_GPT_PARTITIONS], second[KERNEL_BLOCK_GPT_PARTITIONS];
+    int a = gpt_copy(disk, 1, end, &primary, first, slots);
+    if (a == -KERNEL_ENOTSUP || a == -KERNEL_ENOSPC) return a;
+    int b = gpt_copy(disk, end, end, &backup, second, slots);
+    if (b == -KERNEL_ENOTSUP || b == -KERNEL_ENOSPC) return b;
+    if (a && b) return a == -KERNEL_EIO || b == -KERNEL_EIO ? -KERNEL_EIO : -KERNEL_EINVAL;
+    if (!a && !b && (primary.first != backup.first || primary.last != backup.last ||
+        primary.count != backup.count || primary.size != backup.size || primary.crc != backup.crc ||
+        __builtin_memcmp(primary.guid, backup.guid, 16) || __builtin_memcmp(first, second, sizeof(first))))
+        return -KERNEL_EINVAL;
+    const struct gpt_partition *parts = a ? second : first;
+    /* Preflight the whole publication under the registry lock. No unregister
+     * rollback can race a consumer acquiring a partially published child. */
+    uintptr_t irq = registry_lock();
+    int error = 0;
+    unsigned used = 0;
+    for (size_t i = 0; i < slots; i++) {
+        if (children[i].registered || children[i].references || children[i].notifications || children[i].claim_owner)
+            error = -KERNEL_EBUSY;
+        if (!parts[i].count) continue;
+        used++;
+        for (struct kernel_block_device *it = registered_devices; it; it = it->registry_next)
+            if (it->device_number == disk->device_number + i + 1) error = -KERNEL_EBUSY;
+    }
+    if (!disk->registered || used > UINT32_MAX - disk->references) error = -KERNEL_EBUSY;
+    if (!error) for (size_t i = 0; i < slots; i++) {
+        if (!parts[i].count) continue;
+        children[i] = (struct kernel_block_device){ .parent = disk,
+            .start_bytes = parts[i].first * 512, .capacity_bytes = parts[i].count * 512,
+            .logical_block_size = 512, .device_number = disk->device_number + i + 1 };
+        prepare_locked(&children[i]); disk->references++;
+        children[i].registry_next = registered_devices; children[i].registered = 1;
+        registered_devices = &children[i];
+    }
+    registry_unlock(irq);
+    return error;
 }

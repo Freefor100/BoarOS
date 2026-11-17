@@ -531,6 +531,12 @@ static void test_real_virtio_block(const void *dtb)
     if (partition_error) fail_block(90, 0, partition_error);
     virt_uart_puts("BoarOS: MBR primary partition I/O and owners passed\n");
 
+    partition_error = test_gpt_partitions(&rw_dev->block);
+    if (partition_error) fail_block(91, 0, partition_error);
+    virt_uart_puts("BoarOS: GPT partition I/O and recovery passed\n");
+    __builtin_memset(buffer, 0, 512);
+    __builtin_memcpy(buffer, "BoarOS-direct-sector-one", 23);
+    if (kernel_block_write_at(&rw_dev->block, 512, buffer, 512)) fail_block(92,0,1);
     test_irq_reads(dtb, &allocator, rw_dev, buffer);
 
     /* Cleanup */

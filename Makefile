@@ -2382,3 +2382,10 @@ test-async-io-host:
 	sh tests/host/async-io.sh
 test-inotify-async-host:
 	sh tests/host/inotify-async.sh
+
+.PHONY: test-gpt-host
+test-gpt-host:
+	@mkdir -p build/host
+	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_gpt.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-gpt
+	build/host/block-gpt build/host/gpt.img
+	python3 tests/host/gpt-blkid.py build/host/gpt.img

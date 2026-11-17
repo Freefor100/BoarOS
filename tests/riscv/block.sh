@@ -82,6 +82,11 @@ run_case()
         echo "missing primary partition contract result" >&2
         exit 1
     fi
+    if ! grep -qxF 'BoarOS: GPT partition I/O and recovery passed' "$output"; then
+        show_output
+        echo "missing GPT partition contract result" >&2
+        exit 1
+    fi
     if grep -qF 'BoarOS: block test failed' "$output"; then
         show_output
         echo "$mode VirtIO block test kernel reported a failed case" >&2

@@ -95,6 +95,14 @@ void __wrap_la_boot_tasks(struct physical_page_allocator *allocator)
         kernel_block_flush(&devices[0].device.block)!=KERNEL_BLOCK_STATUS_OK) la_virt_fatal("PCI write flush");
     if(test_primary_partitions(&devices[0].device.block)) la_virt_fatal("PCI MBR primary partitions");
     la_virt_puts("LA MBR primary partition I/O and owners passed\n");
+    if(test_gpt_partitions(&devices[0].device.block)) la_virt_fatal("PCI GPT partitions");
+    la_virt_puts("LA GPT partition I/O and recovery passed\n");
+    unsigned char restore[512];
+    for(unsigned i=0;i<8;i++) {
+        for(unsigned j=0;j<512;j++) restore[j]=(unsigned char)((i*512+j)%251);
+        if(kernel_block_write_at(&devices[0].device.block,16384+i*512,restore,512))
+            la_virt_fatal("PCI GPT fixture restore");
+    }
     la_virt_puts("LA PCI IRQ hold\n");
     uint64_t ready_deadline=arch_time_read()+la_timer_frequency()*5;
     while(!arch_uart_rx_ready())
