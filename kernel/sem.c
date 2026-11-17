@@ -737,7 +737,7 @@ int64_t kernel_sem_ctl(struct kernel_task *task, struct kernel_mm *mm, int32_t i
         if (num < 0 || (uint32_t)num >= set->nsems) { result = -KERNEL_EINVAL; goto unlock; }
         struct sem_member *member = &set->members[num];
         switch (cmd) {
-        case KERNEL_SEM_GETPID: result = member->pid ? member->pid->number : 0; break;
+        case KERNEL_SEM_GETPID: result = kernel_task_identity_user_number(member->pid); break;
         case KERNEL_SEM_GETVAL: result = member->value; break;
         case KERNEL_SEM_GETNCNT: case KERNEL_SEM_GETZCNT:
             for (struct kernel_sem_request *r = set->head; r; r = r->next) {

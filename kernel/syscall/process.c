@@ -199,7 +199,7 @@ enum kernel_syscall_status syscall_handle_prlimit64(
     }
     target = pid == 0 ? caller :
              pid > 0 && pid <= INT32_MAX
-                 ? kernel_task_find_by_tid((kernel_pid_t)pid) : 0;
+                 ? kernel_task_find_user_tid(caller,(kernel_pid_t)pid) : 0;
     struct kernel_task *lookup __attribute__((cleanup(lookup_end))) = pid > 0 ? target : 0;
     if (target == 0) {
         decoded->value = -KERNEL_ESRCH;
@@ -252,7 +252,7 @@ enum kernel_syscall_status syscall_handle_get_robust_list(
 {
     int32_t pid = (int32_t)(uint32_t)request->arguments[0];
     struct kernel_task *target = pid == 0 ? caller :
-                                 pid > 0 ? kernel_signal_find_by_tid(pid) : 0;
+                                 pid > 0 ? kernel_signal_find_user_tid(pid) : 0;
     struct kernel_mm *mm;
     uint64_t length = 3U * sizeof(uint64_t);
     uint64_t head;
@@ -392,6 +392,15 @@ enum kernel_syscall_status syscall_handle_reboot(struct kernel_task *caller,
     int error=kernel_reboot_decode((uint32_t)request->arguments[0],(uint32_t)request->arguments[1],
         (uint32_t)request->arguments[2],&action);
     if(error){decoded->value=error;return KERNEL_SYSCALL_STATUS_OK;}
+    /* Linux handles a nested PID namespace before importing RESTART2's
+     * machine command. Its successful caller exits only this thread. */
+    { KERNEL_SERVICE_SCOPE(service);
+      int nested=kernel_task_reboot_namespace(caller,action);
+      if(nested) {
+          decoded->value=nested<0?nested:0;
+          if(nested>0)decoded->action=KERNEL_SYSCALL_ACTION_EXIT;
+          return KERNEL_SYSCALL_STATUS_OK;
+      } }
     char command[KERNEL_REBOOT_COMMAND_SIZE]={0};
     if((uint32_t)request->arguments[2]==KERNEL_REBOOT_CMD_RESTART2) {
         struct kernel_mm *mm;size_t length=0;

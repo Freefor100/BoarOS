@@ -314,7 +314,7 @@ RV/LA 的 clone 和 clone3 共用进程创建，支持 CLONE_VM、CLONE_FILES、
 
 `cgroup.procs` 写入 PID（0 为调用进程）原子迁移整个线程组，使用打开 FD 时的凭证检查共同祖先，不能以当前提权身份绕过继承 FD 的权限。已退出 leader 仍有活线程时可以按 TGID 迁移；`cgroup.threads` 和 CLONE_THREAD 只允许同一 domain，不实现 threaded 子树。成员读取使用一次 OFD 快照，按线程组只输出一个 PID，避免逐 PID 扫描全部任务；seek 到 0 重新生成。`/proc/PID/cgroup` 和线程对应文件报告真实路径。退出时撤销活成员计数，未回收 zombie 保留路径引用，删除后显示 ` (deleted)`；最终任务存储回收归还引用。exec 保留执行线程的成员。
 
-多次挂载复用同一个 VFS instance 的 inode/dentry，读写和只读挂载视图共享目录变化；最后卸载不删除层级，关机在所有任务和 VFS owner 退出后检查引用并释放残留目录。当前 `cgroup.controllers` 和 `cgroup.subtree_control` 为空，不提供 CPU、memory、pids、IO 等资源控制器；请求未实现的控制器返回 EINVAL。`cgroup.type` 为 domain，threaded 转换明确拒绝；冻结、kill、cgroup namespace 和层级限制接口未实现。不能把创建进组解释为资源配额或调度隔离。PID/user namespace 的层级编号和 namespace owner 权限也仍未实现。
+多次挂载复用同一个 VFS instance 的 inode/dentry，读写和只读挂载视图共享目录变化；最后卸载不删除层级，关机在所有任务和 VFS owner 退出后检查引用并释放残留目录。当前 `cgroup.controllers` 和 `cgroup.subtree_control` 为空，不提供 CPU、memory、pids、IO 等资源控制器；请求未实现的控制器返回 EINVAL。`cgroup.type` 为 domain，threaded 转换明确拒绝；冻结、kill、cgroup namespace 和层级限制接口未实现。不能把创建进组解释为资源配额或调度隔离。PID namespace 尚未接入任务与用户 ABI；独立的多层编号基础、生命周期及接线边界见 [PID namespace](pid-namespace.md)。user namespace 与 namespace owner 权限仍未实现。
 
 `tests/host/cgroupfs.sh` 检查 4K/16K 后端对象、DAC、解析、失败分配、删除引用和 shutdown；`tests/userland/run.py --workload cgroup` 使用同一用户程序检查多挂载名称缓存、只读视图、首次用户执行的成员、FD/失败路径、zombie、整组迁移、非 leader exec、opener 权限与 ptrace 拒绝路径，同时要求退出时真实 heap/page owner 回到基线。它是功能验收，不是吞吐或延迟收益测量。Linux 对照需要可挂载 cgroup2 的测试环境；没有权限的宿主错误路径检查不能代替特权成功路径。
 

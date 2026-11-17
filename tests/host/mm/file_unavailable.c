@@ -19,6 +19,7 @@ __attribute__((weak)) void kernel_task_current_memory_limits(struct kernel_memor
 { *out = (struct kernel_memory_limits){UINT64_MAX, UINT64_MAX, UINT64_MAX}; }
 #define EXCLUDED(name) void name(void) { mm_file_unavailable(); }
 EXCLUDED(kernel_shm_attachment_close)
+EXCLUDED(kernel_shm_attachment_close_for_task)
 EXCLUDED(kernel_shm_attachment_open)
 EXCLUDED(kernel_shm_attachment_acquire)
 EXCLUDED(kernel_shm_attachment_create)

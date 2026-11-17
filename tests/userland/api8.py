@@ -35,6 +35,19 @@ SOURCES['async_io']='io/async_io.c'
 SOURCES['tty_async']='tty/pty_probe.c'
 SOURCES['uts_namespace']='resource/uts_namespace.c'
 SOURCES['ipc_namespace']='resource/ipc_namespace.c'
+SOURCES['pid_namespace']='resource/pid_namespace.c'
+SOURCES['unix_control']='network/unix_control.c'
+SOURCES['pid_namespace_reboot']='resource/pid_namespace_reboot.c'
+SOURCES['pid_namespace_clocks']='resource/pid_namespace_clocks.c'
+SOURCES['ioprio']='resource/ioprio.c'
+SOURCES['pid_namespace_priority']='resource/pid_namespace_priority.c'
+SOURCES['cgroup']='resource/cgroup.c'
+SOURCES['pid_namespace_cgroup']='resource/pid_namespace_cgroup.c'
+SOURCES['pid_namespace_groups']='resource/pid_namespace_groups.c'
+SOURCES['pid_namespace_ipc']='resource/pid_namespace_ipc.c'
+SOURCES['pid_namespace_socket']='resource/pid_namespace_socket.c'
+SOURCES['pi']='futex/pi.c'
+SOURCES['robust_exec']='futex/robust_exec.c'
 SOURCES['process_memory']='resource/process_memory.c'
 SOURCES['personality']='resource/personality.c'
 SOURCES['ptrace']='resource/ptrace.c'
@@ -123,12 +136,12 @@ def build(args,work):
 
 def accepted(raw,arch,cpus,target,selected=None):
     programs=[name for name in (selected or LEGACY) if name!='icache' or arch=='riscv']
-    if target=='boaros' and arch=='riscv' and ('mount_api' in programs or 'mount_context' in programs or 'system_control' in programs or 'sched_control' in programs or 'async_io' in programs or 'tty_async' in programs or 'uts_namespace' in programs or 'ipc_namespace' in programs or any(p in programs for p in ('ptrace','ptrace_signal','ptrace_tools','process_memory','personality','process_control','file_flags','file_ioctl'))):
+    if target=='boaros' and arch=='riscv' and ('mount_api' in programs or 'mount_context' in programs or 'system_control' in programs or 'sched_control' in programs or 'async_io' in programs or 'tty_async' in programs or 'uts_namespace' in programs or 'ipc_namespace' in programs or 'pid_namespace' in programs or any(p in programs for p in ('ptrace','ptrace_signal','ptrace_tools','process_memory','personality','process_control','file_flags','file_ioctl'))):
         free=re.search(r'task stacks released=0x[0-9a-f]+ min-free=0x([0-9a-f]+)',raw)
         if not free or int(free[1],16)<1024:return False
     ends=[line for line in raw.replace('\r','').splitlines() if line.startswith('API8 END ')]
     expected=[f'API8 END /{name} status=0' for name in programs]
-    known={'ipv4_abi':[*(f'IPV4 ABI PASS {name}' for name in ('scalar-options','device-options','multicast-interface','raw-boundaries','permissions')),'IPV4 ABI PASS'],'file_ioctl':['FD-IOCTL PASS'],'process_control':['PROCESS_CONTROL PASS'],'file_flags':['FILE_FLAGS PASS'],'ptrace_signal':['PTRACE SIGNAL suppression reset-mask blocked-replacement siginfo ignored continue-cancels-stop PASS'],'process_memory':['PROCESS_MEMORY PASS'],'personality':['PERSONALITY PASS'],'ptrace':['PTRACE traced-stop memory syscall-info exit PASS'],'ptrace_tools':['PTRACE_TOOLS PASS'],'uts_namespace':['UTS NAMESPACE PASS cases=8'],'ipc_namespace':['IPCNS PASS cases=3'],'async_io':['ASYNC PASS cases=4'],'tty_async':['PTY_RECORD sigio-vhangup-generation 1'],'sched_control':['SCHED-CONTROL END cases=6'],'system_control':['SYSTEM CONTROL PASS cases=5'],'mount_context':['FS-CONTEXT END 9'],'mount_api':['MOUNT-API END 5'],'propagation':['PROP END 9'],'atime':['MOUNT-ATTR END 4'],'memory_advice':['MADVISE END 5'],'fd_events':['FD-EVENTS PASS'],'flock':['FLOCK-PASS'],
+    known={'pid_namespace_reboot':['PIDNS REBOOT PASS invalid inputs and permission ordering'],'pid_namespace_clocks':['PIDNS CLOCK PASS process thread strict clocks and timer recipient'],'ioprio':['IOPRIO PASS'],'pid_namespace_priority':['PIDNS PRIORITY PASS process and inherited group'],'cgroup':['CGROUP END 5'],'pid_namespace_cgroup':['PIDNS CGROUP PASS current-reader inherited FD and migration'],'pid_namespace_groups':['PIDNS GROUP PASS inherited session tty and async owners'],'pid_namespace_ipc':['PIDNS IPC PASS sem msg shm retained identity exit'],'unix_control':['UNIX-CONTROL CASE credentials-real-ids-peer-snapshot-explicit-permissions PASS','UNIX-CONTROL END 23'],'pid_namespace_socket':['PIDNS SOCKET PASS peercred SCM_CREDENTIALS SCM_RIGHTS exited-owner'],'robust_exec':['ROBUST EXEC PASS nonleader old-TID cleanup'],'pi':['PI END 15'],'ipv4_abi':[*(f'IPV4 ABI PASS {name}' for name in ('scalar-options','device-options','multicast-interface','raw-boundaries','permissions')),'IPV4 ABI PASS'],'file_ioctl':['FD-IOCTL PASS'],'process_control':['PROCESS_CONTROL PASS'],'file_flags':['FILE_FLAGS PASS'],'ptrace_signal':['PTRACE SIGNAL suppression reset-mask blocked-replacement siginfo ignored continue-cancels-stop PASS'],'process_memory':['PROCESS_MEMORY PASS'],'personality':['PERSONALITY PASS'],'ptrace':['PTRACE traced-stop memory syscall-info exit PASS'],'ptrace_tools':['PTRACE_TOOLS PASS'],'uts_namespace':['UTS NAMESPACE PASS cases=8'],'ipc_namespace':['IPCNS PASS cases=3'],'pid_namespace':['PIDNS FD PASS initial-view stable-inode setns inherited-owner'],'async_io':['ASYNC PASS cases=4'],'tty_async':['PTY_RECORD sigio-vhangup-generation 1'],'sched_control':['SCHED-CONTROL END cases=6'],'system_control':['SYSTEM CONTROL PASS cases=5'],'mount_context':['FS-CONTEXT END 9'],'mount_api':['MOUNT-API END 5'],'propagation':['PROP END 9'],'atime':['MOUNT-ATTR END 4'],'memory_advice':['MADVISE END 5'],'fd_events':['FD-EVENTS PASS'],'flock':['FLOCK-PASS'],
            'splice':['SPLICE PASS cases=9'],'file_advice':['ADVICE RESULT cases=3 failures=0'],'copy_range':['COPY_RANGE PASS'],'sched_query':['SCHED-QUERY END cases=7'],
            'icache':[f'ICACHE PASS cpus={cpus}'],
            'vectors_v2':[*(f'VECTORS2 CASE {name} PASS' for name in (

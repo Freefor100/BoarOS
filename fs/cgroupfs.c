@@ -272,9 +272,9 @@ static int control(struct kernel_vfs_node *n,int write,uint64_t *offset,char *by
     *offset+=*count;return 0;
 }
 static int snapshot(struct kernel_vfs_node *n,struct kernel_heap *heap,
-    struct kernel_namespace *ns,char **buffer,size_t *size)
+    struct kernel_namespace *ns,struct kernel_pid_registry *view,char **buffer,size_t *size)
 {
-    (void)ns;unsigned k=kind(n->inode);
+    (void)ns;(void)view;unsigned k=kind(n->inode);
     if(k!=CG_PROCS && k!=CG_THREADS)return -KERNEL_EINVAL;
     return kernel_cgroup_members_snapshot(n->backend_data,k==CG_THREADS,heap,buffer,size);
 }

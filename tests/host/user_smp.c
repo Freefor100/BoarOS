@@ -352,6 +352,15 @@ void user_signal_take_retargeted(struct kernel_task *);
 void user_signal_stop_selection(struct kernel_task *);
 struct kernel_task *process_find_identity(kernel_pid_t pid, enum kernel_pid_role role)
 { (void)role; for (unsigned i=0; i<4; i++) if (tasks[i].tid==pid) return &tasks[i]; return 0; }
+void kernel_cgroup_put(struct kernel_cgroup *group)
+{assert(!group);}
+
+struct kernel_pid_registry *process_pid_active(const struct kernel_task *task)
+{(void)task;return &scheduler.identities;}
+struct kernel_task *process_find_identity_in(kernel_pid_t pid,enum kernel_pid_role role,
+    struct kernel_pid_registry *view)
+{assert(view==&scheduler.identities);return process_find_identity(pid,role);}
+
 struct kernel_task *kernel_task_current(void) { return active->current; }
 void process_identity_commit_locked(struct kernel_task *task)
 { (void)task;assert(!"host actors already own published identities"); }

@@ -5,6 +5,8 @@
 
 #define KERNEL_NS_MNT UINT32_C(0x00020000)
 #define KERNEL_NS_UTS UINT32_C(0x04000000)
+#define KERNEL_NS_PID UINT32_C(0x20000000)
+#define KERNEL_NS_INITIAL_PID_ID UINT64_C(4026531836)
 #define KERNEL_NS_IPC UINT32_C(0x08000000)
 #define KERNEL_NS_INITIAL_UTS_ID UINT64_C(4026531838)
 #define KERNEL_NS_INITIAL_IPC_ID UINT64_C(4026531839)
@@ -22,6 +24,7 @@ struct kernel_namespace {
     void (*destroy)(struct kernel_namespace *);
 };
 
+uint64_t kernel_namespace_allocate_id(void);
 void kernel_namespace_init(struct kernel_namespace *,uint32_t,
     struct kernel_heap *,void (*destroy)(struct kernel_namespace *));
 struct kernel_namespace *kernel_namespace_get(struct kernel_namespace *);

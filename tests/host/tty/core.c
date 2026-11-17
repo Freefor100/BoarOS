@@ -29,6 +29,7 @@ static uint64_t now_ns, fault_address;
 static unsigned char output[65536];
 static size_t output_size, credit = 65536;
 static struct kernel_pid identity = {.number = 7, .references = 1};
+static kernel_pid_t visible_identity=7;
 static struct kernel_credentials credentials = {.effective = KERNEL_CAP_VALID_MASK};
 const struct kernel_credentials *kernel_credentials_current(void) { return &credentials; }
 int kernel_credentials_capable(const struct kernel_credentials *c, unsigned capability)
@@ -516,6 +517,10 @@ int main(void)
            kernel_tty_foreground(tty) == 7);
     int32_t group;
     assert(ioctl_call(0x540f, &group) == 0 && group == 7);
+    visible_identity=0;
+    assert(ioctl_call(0x540f,&group)==0&&!group);
+    assert(ioctl_call(0x5429,&group)==0&&!group);
+    visible_identity=7;
     group = INT32_MAX;
     assert(ioctl_call(0x5410, &group) == -KERNEL_ESRCH);
     assert(kernel_tty_foreground(tty) == 7 && identity.references == 3);
@@ -551,3 +556,9 @@ HOST_WAIT_BOUNDARY(core_, kernel_scheduler_block_current)
 #else
 HOST_WAIT_BOUNDARY(, kernel_scheduler_block_current)
 #endif
+
+kernel_pid_t kernel_task_identity_user_number(const struct kernel_pid *id)
+{ assert(!id||id==&identity);return id?visible_identity:0; }
+
+kernel_pid_t kernel_pid_number_in(const struct kernel_pid *id,const struct kernel_pid_registry *view)
+{ (void)view;return id?id->number:0; }

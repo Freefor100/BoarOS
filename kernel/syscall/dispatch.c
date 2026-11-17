@@ -895,7 +895,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         decoded.action = KERNEL_SYSCALL_ACTION_RETURN;
         switch (request->number) {
         case LINUX_SYSCALL_GETPID:
-            task_status = kernel_task_tgid(caller, &id);
+            task_status = kernel_task_user_tgid(caller, &id);
             if (task_status != KERNEL_TASK_STATUS_OK)
                 return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
             decoded.value = id;
@@ -907,7 +907,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
             decoded.value = id;
             break;
         case LINUX_SYSCALL_GETTID:
-            task_status = kernel_task_tid(caller, &id);
+            task_status = kernel_task_user_tid(caller, &id);
             if (task_status != KERNEL_TASK_STATUS_OK)
                 return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
             decoded.value = id;

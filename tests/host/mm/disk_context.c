@@ -122,6 +122,7 @@ void kernel_mm_unpin_user_pair(struct kernel_mm_user_pin pins[2])
 #endif
 #ifndef MADVISE_REMOVE_CASES
 EXCLUDED(kernel_shm_attachment_close)
+EXCLUDED(kernel_shm_attachment_close_for_task)
 EXCLUDED(kernel_shm_attachment_open)
 EXCLUDED(kernel_shm_attachment_acquire)
 EXCLUDED(kernel_shm_attachment_create)

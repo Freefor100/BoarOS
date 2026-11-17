@@ -1214,7 +1214,7 @@ void kernel_scheduler_prepare_idle_return(void)
 
 static struct kernel_task *sched_target(struct kernel_task *caller, int32_t pid)
 {
-    struct kernel_task *task = pid ? process_find_identity(pid, KERNEL_PID_TID) : caller;
+    struct kernel_task *task = pid ? process_find_identity_in(pid, KERNEL_PID_TID, process_pid_active(caller)) : caller;
     return task && task->accounted && task->arch.user_mode && task->tid_owned ? task : 0;
 }
 
@@ -1523,7 +1523,7 @@ int64_t kernel_task_priority(struct kernel_task *caller,int setting,int32_t whic
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         uid=who?(uint32_t)who:kernel_credentials_task_locked(caller)->uid;
         if(which==1) {
-            group=who>0?kernel_pid_find(&scheduler.identities,who):who?0:process_identity(caller,KERNEL_PID_PGID);
+            group=who>0?kernel_pid_find(process_pid_active(caller),who):who?0:process_identity(caller,KERNEL_PID_PGID);
             if(!group)return -KERNEL_ESRCH;
             kernel_pid_get(group);
         }
@@ -1536,7 +1536,8 @@ int64_t kernel_task_priority(struct kernel_task *caller,int setting,int32_t whic
             struct kernel_task *task=cursor.task;
             if(task->arch.user_mode && task->tid_owned && !task->retirement &&
                 (which==1?process_identity(task,KERNEL_PID_PGID)==group:
-                 kernel_credentials_task_locked(task)->uid==uid)) {
+                 kernel_credentials_task_locked(task)->uid==uid &&
+                 kernel_pid_number_in(process_identity(task,KERNEL_PID_TID),process_pid_active(caller)))) {
                 if(setting) {
                     int error=priority_one_locked(caller,task,nice);
                     if(error)result=error;else if(result==-KERNEL_ESRCH)result=0;

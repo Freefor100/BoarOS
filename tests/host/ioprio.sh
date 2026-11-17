@@ -8,6 +8,6 @@ for shift in 12 14; do
         -DBOAROS_USER_SMP=1 -DBOAROS_PAGE_SHIFT="$shift" -DBOAROS_LOCK_DEBUG=1 \
         -ffunction-sections -fdata-sections -Itests/host/sync -idirafter include \
         -fsanitize=address,undefined tests/host/ioprio.c kernel/raw_lock.c \
-        -Wl,--gc-sections -o "$out/ioprio-$shift"
+        -Wl,--wrap=kernel_raw_lock_release -Wl,--gc-sections -o "$out/ioprio-$shift"
     timeout -k 1s 10s "$out/ioprio-$shift"
 done

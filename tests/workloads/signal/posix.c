@@ -165,7 +165,19 @@ static void stale_and_ignored(void)
     CHECK(error(sigtimedwait(&set,&info,&zero),EAGAIN));
     CHECK(!sigaction(sig,&previous,0));CHECK(sigwaitinfo(&set,&info)==sig&&info.si_code==SI_TIMER);
     CHECK(!remove_timer(id)&&!sigaction(sig,&previous,0));while(sigtimedwait(&set,&info,&zero)>0){}
-    CHECK(!sigprocmask(SIG_SETMASK,&old,0));puts("POSIX CASE stale-ignore-forged OK");
+    CHECK(!sigprocmask(SIG_SETMASK,&old,0));
+    if(getpid()==1) {
+        /* Init's default immunity parks the timer while unblocked. Blocking
+         * alone must make it observable; no handler change or sleep guesses. */
+        struct sigaction dfl={.sa_handler=SIG_DFL},saved;sigemptyset(&dfl.sa_mask);
+        CHECK(!sigaction(sig,&dfl,&saved));CHECK(!create(1,&event,&id));
+        in=setting(clock_ns(1)-1000,1000000);CHECK(!set_timer(id,1,&in,0));deadline_passed();
+        CHECK(!sigprocmask(SIG_BLOCK,&set,&old));
+        CHECK(sigtimedwait(&set,&info,&zero)==sig && info.si_code==SI_TIMER);
+        CHECK(!remove_timer(id));while(sigtimedwait(&set,&info,&zero)>0){}
+        CHECK(!sigprocmask(SIG_SETMASK,&old,0)&&!sigaction(sig,&saved,0));
+    }
+    puts("POSIX CASE stale-ignore-forged OK");
 }
 static int pending_exec_check(int id,int sig)
 {

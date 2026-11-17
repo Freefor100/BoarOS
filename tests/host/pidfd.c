@@ -1,5 +1,6 @@
 /* Real PID/observer/wait implementation; machine switch and heap are seams. */
 #include "../../kernel/sched/pidfd.c"
+#include <kernel/time.h>
 #include <assert.h>
 #include <pthread.h>
 #include <sched.h>
@@ -158,3 +159,6 @@ enum kernel_scheduler_status kernel_wait_backend_switch_locked(struct kernel_tas
     return kernel_wait_backend_switch(task);
 }
 #endif
+
+enum kernel_time_status kernel_time_deadline_from_realtime(uint64_t ns,uint64_t *deadline)
+{(void)ns;(void)deadline;__builtin_trap();}

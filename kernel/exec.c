@@ -83,11 +83,11 @@ enum kernel_exec_status kernel_exec_transaction_cleanup(
     if ((transaction->prepared_files.state == KERNEL_FILES_LIVE ||
          transaction->prepared_files.state == KERNEL_FILES_CLEANUP) &&
         kernel_files_release_for_task(&transaction->prepared_files,
-                                      transaction->files_closer)) failed = 1;
+                                      transaction->cleanup_task)) failed = 1;
     if ((transaction->retired_files.state == KERNEL_FILES_LIVE ||
          transaction->retired_files.state == KERNEL_FILES_CLEANUP) &&
         kernel_files_release_for_task(&transaction->retired_files,
-                                      transaction->files_closer)) failed = 1;
+                                      transaction->cleanup_task)) failed = 1;
     if (kernel_exec_image_cleanup(transaction->heap,
                                   &transaction->image) !=
         KERNEL_EXEC_IMAGE_STATUS_OK) {
@@ -95,7 +95,7 @@ enum kernel_exec_status kernel_exec_transaction_cleanup(
     }
     if (transaction->retired_mm.state == KERNEL_MM_LIVE ||
         transaction->retired_mm.state == KERNEL_MM_CLEANUP) {
-        if (kernel_mm_release(&transaction->retired_mm) !=
+        if (kernel_mm_release_for_task(&transaction->retired_mm,transaction->cleanup_task) !=
             KERNEL_MM_STATUS_OK) {
             failed = 1;
         }

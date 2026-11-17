@@ -292,7 +292,7 @@ enum kernel_signal_status kernel_signal_unshare_for_exec(struct kernel_task *tas
 
 /* Exit notification and zombie retention are separate decisions. */
 int kernel_signal_wants_sigchld(const struct kernel_task *parent);
-int kernel_signal_child_autoreap(const struct kernel_task *parent);
+int kernel_signal_child_autoreap(const struct kernel_task *parent, uint32_t exit_signal);
 
 /* Child state transitions wake wait4 and optionally raise SIGCHLD. */
 void kernel_signal_notify_child_exit(struct kernel_task *child);
@@ -319,7 +319,8 @@ int64_t kernel_signal_send_thread(struct kernel_task *caller,
                                    uint32_t sig,
                                    kernel_pid_t sender_tid);
 
-/* Returns a storage lookup borrow; release with kernel_task_lookup_put(). */
-struct kernel_task *kernel_signal_find_by_tid(kernel_pid_t tid);
+/* Current active PID view; returns a storage borrow released with
+ * kernel_task_lookup_put(). Internal root lookups use scheduler helpers. */
+struct kernel_task *kernel_signal_find_user_tid(kernel_pid_t tid);
 
 #endif

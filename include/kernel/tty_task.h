@@ -32,6 +32,7 @@ void kernel_task_tty_request_clear(struct kernel_task *task,
 void kernel_tty_get(struct kernel_tty *tty);
 void kernel_tty_put(struct kernel_tty *tty);
 uint64_t kernel_tty_rdev(const struct kernel_tty *tty);
+int32_t kernel_tty_foreground_in(const struct kernel_tty *, const struct kernel_pid_registry *);
 int32_t kernel_tty_foreground(const struct kernel_tty *tty);
 void kernel_tty_disassociate(struct kernel_tty *tty, int on_exit);
 void kernel_tty_abort_request(struct kernel_tty_request *request);

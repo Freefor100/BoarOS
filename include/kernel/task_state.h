@@ -217,6 +217,7 @@ struct kernel_task {
     uint32_t fork_no_exec;
     uint32_t session_leader;
     uint32_t group_stopped;
+    uint32_t signal_unkillable; /* group-owned namespace-init disposition policy */
     struct kernel_resource_limits *limits;
     uint64_t rttime_ticks, rttime_stamp;
     uint32_t resource_flags;
@@ -292,6 +293,8 @@ struct kernel_task {
     struct kernel_sched_runqueue *fair_queue;
     uint64_t fair_runtime_seen;
     struct kernel_namespace *uts_namespace, *ipc_namespace;
+    /* NULL means active (owned by the TID identity); an override owns a ref. */
+    struct kernel_pid_registry *pid_for_children;
     struct kernel_ptrace_state *ptrace;
     struct kernel_remote_memory_request *remote_memory_request;
     uint32_t personality;

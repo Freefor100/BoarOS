@@ -4,6 +4,9 @@
 #undef main
 #include <kernel/credentials.h>
 
+/* No namespace shutdown is admitted by this socket-only fixture. */
+void exited_append_locked(struct kernel_task *task) { (void)task; abort(); }
+
 static unsigned accept_ofd_failure,accept_ofd_allocations;
 enum kernel_heap_status __real_kernel_heap_allocate_zeroed(struct kernel_heap *,size_t,size_t,void **);
 enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *heap,
@@ -191,12 +194,76 @@ static void socket_creation_case(struct kernel_heap *heap,struct kernel_credenti
     puts("PASS socket/socketpair: OFD EMPTY before either endpoint publication, flags/credentials and final owners");
 }
 
+/* Real socket snapshot ownership; only the executing task is fixture-selected. */
+static void socket_namespace_case(struct kernel_heap *heap)
+{
+    struct kernel_task *root=kernel_task_current();
+    struct kernel_task children[3];memset(children,0,sizeof(children));
+    struct kernel_pid_allocator numbers[2]={0};
+    struct kernel_pid_registry spaces[2]={0};
+    uint64_t bitmap[2][KERNEL_PID_BITMAP_WORDS(64)]={0};
+    struct { struct kernel_pid id; struct kernel_pid_binding tail[1]; } owners[3];
+    memset(owners,0,sizeof(owners));
+    for(unsigned i=0;i<2;i++) {
+        children[i].magic=KERNEL_THREAD_MAGIC;children[i].state=KERNEL_THREAD_STATE_RUNNING;
+        children[i].cpu=kernel_cpu_current();children[i].group_leader=&children[i];children[i].group_members=1;
+        assert(!kernel_pid_allocator_init(&numbers[i],bitmap[i],64));
+        assert(!kernel_pid_registry_init(&spaces[i],&numbers[i],&scheduler.identities));
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        assert(!kernel_pid_reserve_numbers(&spaces[i],&owners[i].id,sizeof(owners[i]),NULL,0));
+        assert(!kernel_pid_publish_reserved(&owners[i].id));
+        kernel_pid_attach(&children[i].identities[KERNEL_PID_TID],&owners[i].id,KERNEL_PID_TID,&children[i]);
+        kernel_pid_attach(&children[i].identities[KERNEL_PID_TGID],&owners[i].id,KERNEL_PID_TGID,&children[i]);
+    }
+    struct kernel_socket *a=NULL,*b=NULL;struct kernel_socket_peercred cred;
+    kernel_cpu_current()->current=&children[0];
+    assert(!kernel_socket_pair(heap,1,&a,&b));
+    assert(owners[0].id.references==5);
+    assert(!kernel_socket_peercred(a,&cred) && cred.pid==1);
+    kernel_cpu_current()->current=&children[1];
+    assert(!kernel_socket_peercred(a,&cred) && cred.pid==0);
+    kernel_cpu_current()->current=root;
+    kernel_pid_t old=kernel_pid_number_in(&owners[0].id,&scheduler.identities);
+    assert(!kernel_socket_peercred(a,&cred) && cred.pid==old);
+    {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+     kernel_pid_detach(&children[0].identities[KERNEL_PID_TID]);
+     kernel_pid_detach(&children[0].identities[KERNEL_PID_TGID]);
+     kernel_pid_t exact[]={1,old};
+     assert(!kernel_pid_reserve_numbers(&spaces[0],&owners[2].id,sizeof(owners[2]),exact,2));
+     assert(!kernel_pid_publish_reserved(&owners[2].id));
+     kernel_pid_attach(&children[2].identities[KERNEL_PID_TID],&owners[2].id,KERNEL_PID_TID,&children[2]);}
+    assert(owners[0].id.references==3 && owners[2].id.references==2);
+    assert(!kernel_socket_peercred(b,&cred) && cred.pid==old);
+    kernel_socket_destroy(a);kernel_socket_destroy(b);
+    assert(owners[0].id.references==1 && owners[2].id.references==2);
+    {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+     kernel_pid_detach(&children[1].identities[KERNEL_PID_TID]);
+     kernel_pid_detach(&children[1].identities[KERNEL_PID_TGID]);
+     kernel_pid_detach(&children[2].identities[KERNEL_PID_TID]);
+     for(unsigned i=0;i<3;i++)kernel_pid_put(&owners[i].id);
+     unsigned count=0;while(kernel_pid_take_retired(&scheduler.identities))count++;
+     assert(count==3);
+     for(unsigned i=0;i<2;i++){assert(!numbers[i].allocated);kernel_pid_registry_put(&spaces[i]);}
+     count=0;while(kernel_pid_take_retired_namespace(&scheduler.identities))count++;
+     assert(count==2);}
+    puts("PASS real SO_PEERCRED nested/sibling views, detached owner and exact PID reuse, references returned");
+}
+
 int main(int argc,char **argv)
 {
     (void)argv;assert(argc==2);setvbuf(stdout,NULL,_IONBF,0);
     mm_test_attach(0);mm_test_activate_task();
     struct kernel_task *task=kernel_task_current();
     task->tid=1;task->tid_owned=1;task->group_leader=task;task->group_members=1;
+    uint64_t bitmap[KERNEL_PID_BITMAP_WORDS(64)]={0};struct kernel_pid identity={0};
+    assert(!kernel_pid_allocator_init(&scheduler.pid_allocator,bitmap,64));
+    assert(!kernel_pid_registry_init(&scheduler.identities,&scheduler.pid_allocator,NULL));
+    {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+     assert(!kernel_pid_reserve(&scheduler.identities,&identity));
+     assert(!kernel_pid_publish_reserved(&identity));
+     kernel_pid_attach(&task->identities[KERNEL_PID_TID],&identity,KERNEL_PID_TID,task);
+     kernel_pid_attach(&task->identities[KERNEL_PID_TGID],&identity,KERNEL_PID_TGID,task);}
+
     struct physical_page_allocator pages={0};struct kernel_heap heap={0};
     initialize(&pages,&heap,arena,sizeof(arena));
     uint64_t baseline=physical_page_available(&pages);
@@ -210,8 +277,15 @@ int main(int argc,char **argv)
     accept_failure_cleanup_case(&heap,credential);
     assert(credential->references==1);
     socket_creation_case(&heap,credential,&pages);
+    socket_namespace_case(&heap);
     assert(credential->references==1);
     kernel_credentials_override(previous);kernel_credentials_put(credential);
+    {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+     assert(identity.references==3);
+     kernel_pid_detach(&task->identities[KERNEL_PID_TID]);
+     kernel_pid_detach(&task->identities[KERNEL_PID_TGID]);kernel_pid_put(&identity);
+     assert(kernel_pid_take_retired(&scheduler.identities)==&identity);
+     assert(!kernel_pid_take_retired(&scheduler.identities) && !scheduler.pid_allocator.allocated);}
     mm_test_finish();
     struct kernel_heap_statistics statistics;kernel_heap_get_statistics(&heap,&statistics);
     assert(!statistics.live_allocations && !statistics.current_pages &&

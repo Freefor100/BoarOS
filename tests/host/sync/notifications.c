@@ -69,3 +69,18 @@ __attribute__((weak)) void kernel_futex_pi_recalculate_locked(struct kernel_task
 
 __attribute__((weak)) void kernel_futex_pi_abort(struct kernel_task *task)
 { assert(!task->pi_request);abort(); }
+
+/* Identity-only fixtures have no deferred namespace reaper. Tests that drive
+ * cleanup notifications supply a real backend or an explicit observer. */
+__attribute__((weak)) void kernel_scheduler_notify_cleanup(void) { abort(); }
+__attribute__((weak)) enum kernel_scheduler_status kernel_wait_queue_wake_all(struct kernel_wait_queue *queue)
+{ (void)queue; abort(); }
+__attribute__((weak)) void exited_append_locked(struct kernel_task *task)
+{ (void)task; abort(); }
+
+/* Ordinary MM models have no PID role; reject accidental live identity use.
+ * PID-aware fixtures link the production strong implementation instead. */
+__attribute__((weak)) void kernel_task_identity_replace_tgid(struct kernel_pid **owner,const struct kernel_task *task)
+{ assert(!*owner && (!task || !task->identities[KERNEL_PID_TGID].identity)); }
+__attribute__((weak)) kernel_pid_t kernel_task_identity_user_number(const struct kernel_pid *id)
+{ assert(!id);return 0; }

@@ -150,6 +150,8 @@ enum kernel_vma_status kernel_vma_set_fork(
     struct kernel_vma_set **destination);
 
 /* Success clears *set. */
+struct kernel_task;
+enum kernel_vma_status kernel_vma_set_destroy_for_task(struct kernel_vma_set **,const struct kernel_task *);
 enum kernel_vma_status kernel_vma_set_destroy(struct kernel_vma_set **set);
 
 enum kernel_vma_status kernel_vma_set_insert(

@@ -290,6 +290,18 @@ int kernel_task_identity_get(int32_t pid,struct kernel_pid **owner)
     if(!identity)return -KERNEL_ESRCH;
     kernel_pid_get(identity);*owner=identity;return 0;
 }
+void kernel_task_identity_retain(struct kernel_pid *identity)
+{
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    CHECK(identity==&model_pid && identity->references);
+    kernel_pid_get(identity);
+}
+kernel_pid_t kernel_task_identity_user_number(const struct kernel_pid *identity)
+{
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    CHECK(!identity || identity==&model_pid);
+    return kernel_pid_number_in(identity,&model_pid_registry);
+}
 void kernel_task_identity_put(struct kernel_pid *identity)
 {
     CHECK(identity==&model_pid && identity->references>1);
@@ -4559,12 +4571,34 @@ static void ipv6_global(void)
     puts("PASS static global IPv6 arbitrary prefix, DAD, source selection, ND contents, default/withdrawal, DOWN/MTU and failure");
 }
 
+/* This fixture's single process view checks ownership, not namespace
+ * translation (covered by socket_accept_allocation's real identity tree). */
+static void unix_peer_identity(void)
+{
+    kernel_socket_network_initialize();
+    struct kernel_socket *a=NULL,*b=NULL;
+    struct kernel_socket_peercred cred={0};
+    CHECK(!remote_task && model_pid.references==1);
+    remote_task=(void *)&test_context;
+    CHECK(!kernel_socket_pair(&test_heap,SOCKET_STREAM,&a,&b));
+    remote_task=NULL;
+    CHECK(model_pid.references==3 && a->peercred.pid==&model_pid && b->peercred.pid==&model_pid);
+    CHECK(!kernel_socket_peercred(a,&cred) && cred.pid==(int32_t)model_pid.number &&
+        cred.uid==model_credentials.euid && cred.gid==model_credentials.egid);
+    kernel_socket_destroy(a);
+    CHECK(model_pid.references==2 && !kernel_socket_peercred(b,&cred) && cred.pid==(int32_t)model_pid.number);
+    kernel_socket_destroy(b);
+    CHECK(model_pid.references==1 && !heap_live);
+    puts("PASS UNIX peer identity: two snapshot references survive creator context and independent closes return both owners");
+}
+
 int main(int argc, char **argv)
 {
     CHECK(argc == 2);
     CHECK(kernel_pid_allocator_init(&model_pid_numbers,model_pid_bitmap,1024)==KERNEL_PID_STATUS_OK);
     CHECK(kernel_pid_publish(&model_pid_registry,&model_pid)==KERNEL_PID_STATUS_OK);
-    if (!strcmp(argv[1], "raw-icmp-owner")) raw_icmp_owner();
+    if (!strcmp(argv[1], "unix-peer-identity")) unix_peer_identity();
+    else if (!strcmp(argv[1], "raw-icmp-owner")) raw_icmp_owner();
     else if (!strcmp(argv[1], "raw-icmp-close")) raw_icmp_close();
     else if (!strcmp(argv[1], "ipv6-prepare-withdraw")) ipv6_prepare_withdraw();
     else if (!strcmp(argv[1], "ipv6-global")) ipv6_global();

@@ -17,7 +17,7 @@
 
 enum kernel_syscall_status syscall_handle_credentials(struct kernel_task *,const struct kernel_syscall_request *,struct kernel_syscall_result *);
 enum kernel_syscall_status syscall_handle_capset(struct kernel_task *,const struct kernel_syscall_request *,struct kernel_syscall_result *);
-enum kernel_syscall_status syscall_handle_prctl(struct kernel_task *,const struct kernel_syscall_request *,struct kernel_syscall_result *);
+enum kernel_syscall_status syscall_handle_prctl_credentials(struct kernel_task *,const struct kernel_syscall_request *,struct kernel_syscall_result *);
 struct kernel_raw_lock kernel_wait_domain;
 _Thread_local uintptr_t sync_test_irq=1;
 static _Thread_local struct kernel_cpu cpu={.initialized=KERNEL_CPU_INITIALIZED};
@@ -25,6 +25,7 @@ static _Thread_local struct kernel_task *running;
 static struct kernel_task tasks[2];
 static struct kernel_heap heap;
 static unsigned allocated,fail_next,changed;
+static int nested_view;
 static pthread_barrier_t *allocation_barrier;
 static int dumpable=1;
 static uintptr_t user_fault;
@@ -32,8 +33,11 @@ void *sync_test_cpu(void){return &cpu;}
 void *sync_test_current_task(void){return running;}
 void kernel_cpu_flush_notifications(void){assert(!cpu.outbound);}
 struct kernel_task *kernel_task_current(void){return running;}
-struct kernel_task *kernel_task_find_by_tid(kernel_pid_t tid)
-{for(unsigned i=0;i<2;i++)if(tasks[i].tid==tid){tasks[i].storage_borrows++;return &tasks[i];}return 0;}
+struct kernel_task *kernel_task_find_user_tid(struct kernel_task *caller,kernel_pid_t tid)
+{assert(caller==running);for(unsigned i=0;i<2;i++)if((nested_view ? (i==0?1:2) : tasks[i].tid)==tid){tasks[i].storage_borrows++;return &tasks[i];}return 0;}
+enum kernel_task_status kernel_task_user_tid(const struct kernel_task *task,kernel_pid_t *tid)
+{*tid=nested_view?(task==&tasks[0]?1:2):task->tid;return KERNEL_TASK_STATUS_OK;}
+
 void kernel_task_lookup_put(struct kernel_task *t){assert(t->storage_borrows);t->storage_borrows--;}
 void kernel_credentials_changed_locked(struct kernel_task *t,const struct kernel_credentials *old,const struct kernel_credentials *replacement)
 {(void)t;assert(cpu.raw_locks);if(old->euid!=replacement->euid||old->fsuid!=replacement->fsuid)dumpable=0;changed++;}
@@ -61,12 +65,20 @@ enum kernel_uaccess_status kernel_copy_from_user(struct kernel_mm *mm,void *dest
 {(void)mm;return copy_user(dest,(void *)(uintptr_t)src,len,done,0);}
 enum kernel_uaccess_status kernel_copy_to_user(struct kernel_mm *mm,uint64_t dest,const void *src,size_t len,size_t *done)
 {(void)mm;return copy_user((void *)(uintptr_t)dest,src,len,done,1);}
+static unsigned limit_calls;
+int kernel_task_prlimit(struct kernel_task *target,uint32_t resource,
+    const struct kernel_rlimit64 *replacement,struct kernel_rlimit64 *before,int can_raise)
+{
+    (void)replacement;(void)can_raise;assert(resource==7);
+    limit_calls++;*before=(struct kernel_rlimit64){target->tid,target->tid};return 0;
+}
+
 static long call(unsigned nr,uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e)
 {
     struct kernel_syscall_request req={.number=nr,.arguments={a,b,c,d,e}};
     struct kernel_syscall_result result;
-    enum kernel_syscall_status status=nr==90?syscall_handle_capget(running,&req,&result):
-        nr==91?syscall_handle_capset(running,&req,&result):nr==167?syscall_handle_prctl(running,&req,&result):syscall_handle_credentials(running,&req,&result);
+    enum kernel_syscall_status status=nr==261?syscall_handle_prlimit64(running,&req,&result):nr==90?syscall_handle_capget(running,&req,&result):
+        nr==91?syscall_handle_capset(running,&req,&result):nr==167?syscall_handle_prctl_credentials(running,&req,&result):syscall_handle_credentials(running,&req,&result);
     assert(status==KERNEL_SYSCALL_STATUS_OK&&result.action==KERNEL_SYSCALL_ACTION_RETURN);return result.value;
 }
 #define CALL(n,a,b,c) call(n,(uint64_t)(uintptr_t)(a),(uint64_t)(uintptr_t)(b),(uint64_t)(uintptr_t)(c),0,0)
@@ -120,10 +132,30 @@ static void groups(void)
 }
 struct cap_header{uint32_t version;int32_t pid;};
 struct cap_data{uint32_t e,p,i;};
+static void limit_view(void)
+{
+    reset();nested_view=1;limit_calls=0;
+    struct kernel_rlimit64 before={0};
+    assert(!call(261,1,7,0,(uintptr_t)&before,0) && before.current==10 && limit_calls==1);
+    assert(!call(261,2,7,0,(uintptr_t)&before,0) && before.current==11 && limit_calls==2);
+    assert(call(261,10,7,0,(uintptr_t)&before,0)==-KERNEL_ESRCH && limit_calls==2);
+    /* new-limit copy precedes PID lookup; old-limit copy follows the change. */
+    assert(call(261,10,7,UINTPTR_MAX,0,0)==-KERNEL_EFAULT && limit_calls==2);
+    assert(call(261,1,7,0,UINTPTR_MAX,0)==-KERNEL_EFAULT && limit_calls==3);
+    assert(!tasks[0].storage_borrows && !tasks[1].storage_borrows);
+    nested_view=0;
+}
+
 static void caps(void)
 {
     reset();struct cap_header header={0x20080522,0};struct cap_data data[2]={{0}};
     assert(CALL(90,&header,data,0)==0&&data[0].e==UINT32_MAX&&data[1].e==511);
+    nested_view=1;
+    header.pid=1;assert(CALL(90,&header,data,0)==0);
+    assert(CALL(91,&header,data,0)==0);
+    header.pid=10;assert(CALL(90,&header,data,0)==-KERNEL_ESRCH);
+    assert(CALL(91,&header,data,0)==-KERNEL_EPERM);
+    header.pid=0;nested_view=0;
     header.version=0;assert(CALL(91,&header,0,0)==-KERNEL_EINVAL&&header.version==0x20080522);
     header.pid=-1;assert(CALL(91,&header,0,0)==-KERNEL_EPERM);header.pid=0;
     assert(CALL(91,&header,0,0)==-KERNEL_EFAULT);
@@ -284,6 +316,6 @@ static void exec_security_lifetime(void)
 int main(void)
 {
     kernel_raw_lock_init(&kernel_wait_domain,KERNEL_RAW_RANK_SCHEDULER);
-    ids();groups();caps();ownership();concurrent_publication();exec_rules();exec_security_lifetime();reset();
+    ids();groups();caps();limit_view();ownership();concurrent_publication();exec_rules();exec_security_lifetime();reset();
     puts("credentials: IDs, groups, capability/prctl, fault prefixes, account ownership OK");return 0;
 }

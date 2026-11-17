@@ -143,16 +143,16 @@ static struct msg_queue *queue_lookup(int32_t id, int by_slot)
         q = 0;
     return q;
 }
-static void queue_descriptor(const struct msg_queue *q, struct kernel_msqid64_ds *d)
+static void queue_descriptor(const struct msg_queue *q, struct kernel_msqid64_ds *d,struct kernel_pid_registry *view)
 {
     *d = (struct kernel_msqid64_ds){
         .msg_perm = q->permission, .msg_stime = q->stime, .msg_rtime = q->rtime,
         .msg_ctime = q->ctime, .msg_cbytes = q->bytes, .msg_qnum = q->count,
-        .msg_qbytes = q->limit, .msg_lspid = q->spid ? q->spid->number : 0,
-        .msg_lrpid = q->rpid ? q->rpid->number : 0,
+        .msg_qbytes = q->limit, .msg_lspid = view?kernel_pid_number_in(q->spid,view):kernel_task_identity_user_number(q->spid),
+        .msg_lrpid = view?kernel_pid_number_in(q->rpid,view):kernel_task_identity_user_number(q->rpid),
     };
 }
-int kernel_msg_proc_next(struct kernel_namespace *ns, uint32_t *cursor, int32_t *id, struct kernel_msqid64_ds *row)
+int kernel_msg_proc_next(struct kernel_namespace *ns,struct kernel_pid_registry *view, uint32_t *cursor, int32_t *id, struct kernel_msqid64_ds *row)
 {
     struct kernel_msg_table *table=msg_namespace_table(ns,0);
     if(!table)return 0;
@@ -168,7 +168,7 @@ int kernel_msg_proc_next(struct kernel_namespace *ns, uint32_t *cursor, int32_t 
     if (q->removed) __builtin_trap();
     *cursor = (uint32_t)node->key + 1U;
     *id = q->id;
-    queue_descriptor(q, row);
+    queue_descriptor(q, row,view);
     return 1;
 }
 static int permission(const struct msg_queue *q, const struct kernel_credentials *c,
@@ -187,13 +187,13 @@ static struct kernel_pid *pid_set(struct kernel_pid **target, struct kernel_task
      * the executing receiver's TGID. Executing tasks retain their group, and
      * abort must acquire this queue lock before releasing a waiting task. */
     struct kernel_task *identity_task = direct || !task->group_leader ? task : task->group_leader;
-    /* 队列的身份引用保留该数字，不能被其他身份复用；同一发送者或
-     * 接收者继续操作时不必重复进入全局 PID 域。 */
-    if (*target && (*target)->number == identity_task->tid)
-        return 0;
-    KERNEL_RAW_SCOPE(g, &kernel_wait_domain);
+    /* Executing callers and queue-protected sleepers retain their role.
+     * Compare canonical identity, not local/root integers; repeated operations
+     * by the same owner still avoid the global PID domain. */
     struct kernel_pid *pid =
         identity_task->identities[direct ? KERNEL_PID_TID : KERNEL_PID_TGID].identity;
+    if (*target == pid) return 0;
+    KERNEL_RAW_SCOPE(g, &kernel_wait_domain);
     if (!pid)
         __builtin_trap();
     kernel_pid_get(pid);
@@ -779,7 +779,7 @@ int64_t kernel_msg_ctl(struct kernel_task *task, struct kernel_mm *mm, int32_t i
             }
         } else if (cmd != KERNEL_MSG_STAT_ANY && (result = permission(q, c, 4))) {
         } else {
-            queue_descriptor(q, &d);
+            queue_descriptor(q, &d,NULL);
             result = cmd == KERNEL_IPC_STAT ? 0 : q->id;
         }
     }

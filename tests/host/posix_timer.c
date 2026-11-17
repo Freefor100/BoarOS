@@ -18,6 +18,7 @@ static struct kernel_pid_member members[2];
 static uint64_t now_ns;
 static uint64_t wall_offset;
 static unsigned live,ignored,allocation_calls,allocation_fail,cpu_samples;
+static int detach_recipient;
 static uint64_t cpu_user,cpu_kernel;
 static pthread_barrier_t entered,released;
 static _Thread_local int hold_clock;
@@ -39,15 +40,18 @@ void kernel_cpu_flush_notifications(void){assert(!kernel_cpu_current()->outbound
 struct kernel_cpu *riscv_smp_cpu(uint32_t n){assert(!n);return kernel_cpu_current();}
 void kernel_cpu_notify(struct kernel_cpu *cpu,unsigned event){(void)cpu;(void)event;abort();}
 enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t n,size_t size,void **out)
-{assert(h==&heap&&!kernel_cpu_current()->raw_locks);allocation_calls++;if(allocation_fail)return KERNEL_HEAP_STATUS_EMPTY;*out=calloc(n,size);assert(*out);__atomic_fetch_add(&live,1,__ATOMIC_RELAXED);return 0;}
+{assert(h==&heap&&!kernel_cpu_current()->raw_locks);allocation_calls++;if(detach_recipient&&task.storage_borrows){detach_recipient=0;pid.members[KERNEL_PID_TID]=NULL;}if(allocation_fail)return KERNEL_HEAP_STATUS_EMPTY;*out=calloc(n,size);assert(*out);__atomic_fetch_add(&live,1,__ATOMIC_RELAXED);return 0;}
 void kernel_heap_release(struct kernel_heap *h,void *p)
 {assert(h==&heap&&p&&!kernel_cpu_current()->raw_locks);free(p);assert(__atomic_fetch_sub(&live,1,__ATOMIC_RELAXED));}
 void scheduler_task_get_locked(struct kernel_task *t){assert(t==&task);t->storage_borrows++;}
 void scheduler_task_put(struct kernel_task *t){assert(t==&task);KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(t->storage_borrows);t->storage_borrows--;}
 struct kernel_pid *process_identity(const struct kernel_task *t,enum kernel_pid_role role)
 {assert(t==&task&&(role==KERNEL_PID_TID||role==KERNEL_PID_TGID));return &pid;}
-struct kernel_task *process_find_identity(kernel_pid_t n,enum kernel_pid_role role)
-{assert(role==KERNEL_PID_TID);return n==1?&task:0;}
+static struct kernel_pid_registry view;
+struct kernel_pid_registry *process_pid_active(const struct kernel_task *t)
+{assert(t==&task);return &view;}
+struct kernel_task *process_find_identity_in(kernel_pid_t n,enum kernel_pid_role role,struct kernel_pid_registry *v)
+{assert(role==KERNEL_PID_TID&&v==&view);return n==1?&task:0;}
 void kernel_pid_get(struct kernel_pid *p){assert(p==&pid);p->references++;}
 void kernel_task_identity_put(struct kernel_pid *p){assert(p==&pid);KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(p->references>1);p->references--;}
 int scheduler_cpu_clock_resolve(struct kernel_task *t,int32_t c,int strict,struct scheduler_cpu_clock *out)
@@ -155,7 +159,7 @@ static void clear_batch_and_exec(void)
     {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);more=signal_pending_ignore_locked(&task,1,UINT64_C(1)<<9,&p);}
     signal_pending_finish(&p);assert(more&&count()==32);
     {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(!signal_pending_ignore_locked(&task,1,UINT64_C(1)<<9,&p));}
-    signal_pending_finish(&p);ignored=0;kernel_posix_timer_unignore(&task,10);
+    signal_pending_finish(&p);ignored=0;kernel_posix_timer_unignore(&task,0);
     unsigned seen[32]={0};
     for(unsigned i=0;i<32;i++){struct kernel_signal_wait_info out=take(10);assert(out.signal==10&&out.sender<32&&!seen[out.sender]++);}
     assert(!task.group_pending&&count()==32);
@@ -307,9 +311,27 @@ static void queued_periodic_clock_steps(void)
     expire(now_ns+650);out=take(36);assert(out.signal==36&&!out.uid&&remaining(id)==100);
     assert(!kernel_posix_timer_delete(&task,id));finish();
 }
+static void thread_recipient_view(void)
+{
+    init();task.tid=11; /* internal number is not the local recipient TID 1 */
+    struct kernel_posix_event event={.notify=4,.signal=36,.tid=11};
+    int32_t id;struct kernel_posix_timer *timer;
+    assert(kernel_posix_timer_prepare(&task,1,&event,&id,&timer)==-KERNEL_EINVAL);
+    event.tid=1;detach_recipient=1;
+    assert(kernel_posix_timer_prepare(&task,1,&event,&id,&timer)==-KERNEL_EINVAL);
+    assert(!detach_recipient&&!task.storage_borrows&&pid.references==1&&!count());
+    pid.members[KERNEL_PID_TID]=&members[KERNEL_PID_TID];
+    assert(!kernel_posix_timer_prepare(&task,1,&event,&id,&timer));kernel_posix_timer_publish(timer,1);
+    arm(id,now_ns+100,0);expire(now_ns+100);
+    assert(task.signal_pending&&!task.group_pending);
+    struct kernel_signal_wait_info out;struct signal_pending_prepared prepared={0};
+    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);signal_pending_take_locked(&task,0,36,&out,&prepared);}
+    signal_pending_finish(&prepared);assert(out.signal==36&&out.code==-2);
+    assert(!kernel_posix_timer_delete(&task,id));finish();
+}
 int main(void)
 {
-    retired_kernel_worker();rttime_index_only();cpu_sleep_owner();
+    thread_recipient_view();retired_kernel_worker();rttime_index_only();cpu_sleep_owner();
     reservation_and_mixed();stale_and_ignored();clear_batch_and_exec();completion_owner();completion_reset();cpu_thresholds();changed_uid_reservation();
     clock_steps();queued_periodic_clock_steps();
     puts("POSIX native reservation, mixed FIFO, stale generation, ignore phase, completion/delete owner and clock steps passed");return 0;

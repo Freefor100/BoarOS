@@ -20,18 +20,22 @@ void scheduler_task_get_locked(struct kernel_task *task)
     task->storage_borrows++;
 }
 
-struct kernel_task *scheduler_task_lookup_locked(kernel_pid_t number,
-    enum kernel_pid_role role, uint64_t generation)
+struct kernel_task *scheduler_task_lookup_in_locked(struct kernel_pid_registry *view,
+    kernel_pid_t number, enum kernel_pid_role role, uint64_t generation)
 {
     domain_owned();
     if ((unsigned)role >= KERNEL_PID_ROLES) return 0;
-    struct kernel_pid *id = kernel_pid_find(&scheduler.identities, number);
+    struct kernel_pid *id = kernel_pid_find(view, number);
     if (!id || (generation && id->generation != generation)) return 0;
     struct kernel_task *task = id->members[role] ? id->members[role]->task : 0;
     if (!task || !task->accounted || task->retirement) return 0;
     scheduler_task_get_locked(task);
     return task;
 }
+
+struct kernel_task *scheduler_task_lookup_locked(kernel_pid_t number,
+    enum kernel_pid_role role, uint64_t generation)
+{ return scheduler_task_lookup_in_locked(&scheduler.identities,number,role,generation); }
 
 struct kernel_task *scheduler_task_lookup(kernel_pid_t number,
     enum kernel_pid_role role, uint64_t generation)
@@ -40,13 +44,14 @@ struct kernel_task *scheduler_task_lookup(kernel_pid_t number,
     return scheduler_task_lookup_locked(number, role, generation);
 }
 
-struct kernel_task *kernel_task_find_by_tid(kernel_pid_t tid)
+static struct kernel_task *find_tid(struct kernel_task *caller,kernel_pid_t tid)
 {
     struct kernel_task *task;
     int visible;
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        task = scheduler_task_lookup_locked(tid, KERNEL_PID_TID, 0U);
+        task = scheduler_task_lookup_in_locked(caller?process_pid_active(caller):&scheduler.identities,
+            tid, KERNEL_PID_TID, 0U);
         /* 退出线程的 TID 仍供清理者迁移 child_creator；进程身份则需
          * 保留到最后成员离开及父进程 wait，不能按信号可投递性过滤。 */
         visible = task && (task->state != KERNEL_THREAD_STATE_EXITED ||
@@ -55,6 +60,12 @@ struct kernel_task *kernel_task_find_by_tid(kernel_pid_t tid)
     if (task && !visible) scheduler_task_put(task);
     return visible ? task : 0;
 }
+
+struct kernel_task *kernel_task_find_by_tid(kernel_pid_t tid)
+{ return find_tid(0,tid); }
+
+struct kernel_task *kernel_task_find_user_tid(struct kernel_task *caller,kernel_pid_t tid)
+{ return find_tid(caller,tid); }
 
 static void queue_disposal_locked(struct kernel_task *task)
 {
@@ -431,4 +442,32 @@ void scheduler_group_cursor_end(struct scheduler_group_cursor *cursor)
     if (cursor->member_owned) scheduler_task_put(cursor->task);
     if (cursor->leader) scheduler_task_put(cursor->leader);
     *cursor = (struct scheduler_group_cursor){0};
+}
+
+int scheduler_forget_task_locked(struct kernel_task *thread, struct kernel_wait_cursor *cursor)
+{
+    if (thread->deadline_indexed) __builtin_trap();
+    process_identity_release_locked(thread);
+    struct kernel_thread_join *join = thread->join;
+    int notify = 0;
+    if (join) {
+        notify = kernel_wait_cursor_prepare(&join->waiters, cursor);
+        join->task = 0;
+        thread->join = 0;
+    }
+    if (scheduler.init_task == thread) scheduler.init_task = 0;
+    scheduler_task_unlink_locked(thread);
+    return notify;
+}
+
+void scheduler_forget_task(struct kernel_task *thread)
+{
+    struct kernel_wait_cursor cursor;
+    int notify;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        notify = scheduler_forget_task_locked(thread, &cursor);
+    }
+    if (notify) kernel_wait_cursor_wake(&cursor, 1);
+    process_identity_collect();
 }

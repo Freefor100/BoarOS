@@ -402,7 +402,7 @@ enum kernel_syscall_status syscall_handle_sigqueueinfo(struct kernel_task *calle
     info.signal=sig;
     if(thread && (group<=0 || pid<=0)){decoded->value=-KERNEL_EINVAL;return KERNEL_SYSCALL_STATUS_OK;}
     kernel_pid_t self;
-    if(kernel_task_tid(caller,&self)!=KERNEL_TASK_STATUS_OK)return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    if(kernel_task_user_tid(caller,&self)!=KERNEL_TASK_STATUS_OK)return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     if((info.code>=0 || info.code==-6) && pid!=self) {
         decoded->value=-KERNEL_EPERM;return KERNEL_SYSCALL_STATUS_OK;
     }
@@ -438,7 +438,7 @@ enum kernel_syscall_status syscall_handle_signal_send(
         decoded->value = sent < 0 ? sent : sent == 0U ? -KERNEL_ESRCH : 0;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    task_status = kernel_task_tgid(caller, &sender_pid);
+    task_status = kernel_task_user_tgid(caller, &sender_pid);
     if (task_status != KERNEL_TASK_STATUS_OK) {
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }

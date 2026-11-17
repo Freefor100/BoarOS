@@ -1,8 +1,18 @@
 # procfs 模块
 
-`fs/procfs.c` 是可动态创建的 VFS 实例。当前提供真实物理页分配器读数的 `meminfo`、单 hart 运行/idle 计时的 `uptime`、进程及线程数字目录、`/proc/self`、`/proc/thread-self` 与进程的 `exe/cwd/root/fd` 对象链接、`/proc/self/mounts` 与 `/proc/mounts`，以及进程 `maps`、`fdinfo`、`comm`、`stat/status` 的真实字段、`/proc/sysvipc/{shm,sem,msg}` 和 `/proc/sys/kernel/sched_rt_period_us`、`sched_rt_runtime_us`、`sched_rr_timeslice_ms`、`hostname`、`domainname`、只读的`pid_max`。线程目录提供 `comm`、`stat/status`、`fd/fdinfo`、`exe/cwd/root`、`maps`、`mounts` 和 `ns/{mnt,uts,ipc}`；Linux 全量进程字段与无路径 console 的链接仍待接入。
+`fs/procfs.c` 是可动态创建的 VFS 实例。当前提供真实物理页分配器读数的 `meminfo`、单 hart 运行/idle 计时的 `uptime`、进程及线程数字目录、`/proc/self`、`/proc/thread-self` 与进程的 `exe/cwd/root/fd` 对象链接、`/proc/self/mounts` 与 `/proc/mounts`，以及进程 `maps`、`fdinfo`、`comm`、`stat/status` 的真实字段、`/proc/sysvipc/{shm,sem,msg}` 和 `/proc/sys/kernel/sched_rt_period_us`、`sched_rt_runtime_us`、`sched_rr_timeslice_ms`、`hostname`、`domainname`、只读的`pid_max`。线程目录提供 `comm`、`stat/status`、`fd/fdinfo`、`exe/cwd/root`、`maps`、`mounts` 和 `ns/{mnt,uts,ipc,pid,pid_for_children}`；Linux 全量进程字段与无路径 console 的链接仍待接入。
 
 `mount(2)` 的 proc 实例不使用源字符串选择设备；用户态负责创建挂载点。bind、卸载和挂载属性的共同规则见[VFS 挂载说明](vfs-ext4.md)。挂载实例持有根及覆盖路径，最后释放时销毁无 I/O 的 proc 实例。PID 1 及后代退出后的根盘清理从最深子挂载开始拆除；其他命名空间的私有树随进程和命名空间 FD 的最后引用退休。
+
+## PID 挂载视图
+
+每个 proc 实例固定创建者的 active PID namespace，而不是读取者的当前视图。`fsopen("proc")` 在创建配置 FD 时保留该视图，之后的创建、fsmount、bind 及 FD 继承不会替换它；legacy mount 在创建实例时捕获。动态 registry 的引用直到配置 FD 或挂载实例末引用才归还，双退休队列在 identity 锁外回收，初始静态 registry 不增加堆 owner。
+
+路径解析把本地 PID/TID 转为 canonical root 编号及全局 allocation generation，inode 保存后两者。后续 maps、fd、ns、comm 等资源查询继续检查这个 generation、任务资源状态和当前权限，不把 inode 中的编号解释成当前读取者的本地号。根目录和 task 目录按挂载视图的 PID bitmap 枚举，名字与 continuation cookie 使用本地号；不扫描全局任务或逐个遍历祖先。self/thread-self 也按同一挂载转换，读取者不可见时返回 ENOENT。
+
+stat/status 在 identity 锁内捕获 PID/TGID/PPID/PGID/SID 与 tracer 的 TID，外层身份在内层不可见时显示 0。NSpid/NStgid/NSpgid/NSsid 从挂载层列到任务 active 层。pidfd fdinfo 持有原 FD 的真实身份，在挂载视图中显示 Pid 与 NSpid；跨兄弟视图显示单个 0，任务已不存在显示 -1，不能用历史整数重新查找。快照的可睡眠阶段只使用已捕获的 PID 标量；资源引用与权限仍按原 proc 规则复核。
+
+生产查询的 `test-proc-index-host` 覆盖三层与兄弟同号、读取者更换、线程成员过滤、外层/非 leader tracer、旧 role 转移、pidfd 可见/不可见/死亡和挂载最后引用回收。`test-proc-maps-host` 另检查本地目录名/cookie 与 canonical inode 的适配。RV/LA 的 pid_namespace、ptrace、mount_context 程序验证真实初始视图 status/继承 FD/pidfd fdinfo/TracerPid 和挂载路径；受控 host 测试不等同完整 nested guest。CLONE_NEWPID 仍关闭，IPC/cgroup 等独立 PID 输出的迁移与整体开放条件见 [PID namespace](pid-namespace.md)。
 
 生成式普通文件不进入 ext4 页缓存。后端 `snapshot` 返回由 OFD 持有的堆缓冲；第一次非空顺序读取或非零seek形成快照，连续短读、readv和pread复用已生成的内容，seek 到零后释放并在下一次读取重新取值；定位读取偏移与上次读取进度不连续时也重新生成，`SEEK_END` 按固定 Linux 的 seq_file 语义返回 `EINVAL`。用户复制时不持有后端或 inode 锁；只推进已经复制的字节。OFD 末引用释放快照，mount 忙判断覆盖文件及目录引用。`fstat` 中的 size 为零是生成文件的元数据语义，不能由它推断 read EOF。
 
@@ -78,7 +88,7 @@ managed 峰值由分配器在 bootstrap、finalize 与 buddy 成功分配时维�
 
 进程 fdinfo 目录按同一 FD 表枚举并输出 position、flags、mount ID 和 inode。目录及条目同时检查 FSCREDS 进程访问权限和文件 DAC；读取期间持有目标实际 OFD，再复核目标身份与执行安全状态。pidfd 增加 Pid/NSpid，单命名空间中两者相同，目标 TID 已撤下后均为 -1；固定 Linux 的 NSpid 输出还取决于 CONFIG_PID_NS。pidfd 的 FD 链接展示 anon_inode:[pidfd]，getfd 传递实际 OFD，proc 路径重新打开仍返回 ENXIO。文本沿共同生成文件规则，rewind 后重新取值。
 
-`/proc/<pid>/ns/{mnt,uts,ipc}` 与线程目录的对应链接使用 FSCREDS 进程对象权限
+`/proc/<pid>/ns/{mnt,uts,ipc,pid,pid_for_children}` 与线程目录的对应链接使用 FSCREDS 进程对象权限
 检查，`readlink` 分别显示稳定的 `mnt:[id]`、`uts:[id]`、`ipc:[id]`。普通打开与
 `/proc/self/fd` 重新打开使用共同 namespace FD 实现：inode 对应 namespace ID，
 `fstatfs` 报告 NSFS，`NS_GET_NSTYPE` 返回实际 CLONE_NEWNS、CLONE_NEWUTS 或

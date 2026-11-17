@@ -10,6 +10,7 @@ __attribute__((weak)) void kernel_task_current_memory_limits(struct kernel_memor
 #define EXCLUDED(name) void name(void) { mm_test_unavailable(); }
 #ifndef MM_TEST_SYSV_SHM
 EXCLUDED(kernel_shm_attachment_close)
+EXCLUDED(kernel_shm_attachment_close_for_task)
 EXCLUDED(kernel_shm_attachment_open)
 #endif
 EXCLUDED(kernel_elf64_source_release)

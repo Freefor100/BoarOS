@@ -183,7 +183,7 @@ int64_t kernel_pidfd_open(struct kernel_task *caller,int32_t number,uint32_t fla
     struct kernel_pid *id __attribute__((cleanup(kernel_task_identity_end)))=0;
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-        id=kernel_pid_find(&scheduler.identities,number);
+        id=kernel_pid_find(process_pid_active(caller),number);
         if(!id || !id->members[KERNEL_PID_TID]) { id=0;return -KERNEL_ESRCH; }
         kernel_pid_get(id);
         if(!(flags&PIDFD_THREAD) && !id->members[KERNEL_PID_TGID])return -KERNEL_ENOENT;
@@ -242,7 +242,7 @@ int kernel_pidfd_signal_target(struct kernel_task *caller,int32_t fd,uint32_t fl
 {
     KERNEL_SERVICE_SCOPE(service);
     if((flags&~7U) || (flags && (flags&(flags-1U))))return -KERNEL_EINVAL;
-    struct kernel_pid *id=0;
+    struct kernel_pid *id __attribute__((cleanup(kernel_task_identity_end)))=0;
     unsigned scope=1;
     if(fd==-10000 || fd==-10001) {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
@@ -260,8 +260,14 @@ int kernel_pidfd_signal_target(struct kernel_task *caller,int32_t fd,uint32_t fl
         if(!id)return -KERNEL_EBADF;
         {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);kernel_pid_get(id);}
     }
+    /* A transferred FD preserves identity but does not grant permission to
+     * signal an ancestor or sibling PID namespace (Linux access_pidfd_pidns). */
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        if (!kernel_pid_number_in(id,process_pid_active(caller))) return -KERNEL_EINVAL;
+    }
     if(flags)scope=flags==1?0:flags==2?1:2;
-    *owner=id;*selected_scope=scope;return 0;
+    *owner=id;id=0;*selected_scope=scope;return 0;
 }
 int64_t kernel_pidfd_send(struct kernel_task *caller,struct kernel_pid *id,unsigned scope,
     uint32_t signal,const struct kernel_signal_wait_info *info)

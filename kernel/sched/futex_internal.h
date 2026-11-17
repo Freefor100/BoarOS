@@ -133,7 +133,7 @@ struct kernel_futex_pi_state {
     struct kernel_futex_pi_state *hash_next, *owner_previous, *owner_next;
     struct kernel_task *owner;
     struct kernel_futex_pi_request *head, *tail;
-    uint32_t references, attached, word_tid, needs_fixup;
+    uint32_t references, attached, needs_fixup;
 };
 struct kernel_futex_pi_request {
     struct kernel_futex_pi_request *previous, *next;

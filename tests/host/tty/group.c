@@ -14,6 +14,9 @@ struct kernel_pid *process_identity(const struct kernel_task *task, enum kernel_
     return task->identities[role].identity;
 }
 
+struct kernel_pid_registry *process_pid_active(const struct kernel_task *task)
+{ struct kernel_pid *id=task->identities[KERNEL_PID_TID].identity; return id?id->registry:&scheduler.identities; }
+
 int main(void)
 {
     kernel_cpu_initialize(&cpu, 7, 0);
@@ -21,8 +24,7 @@ int main(void)
     struct kernel_pid_allocator numbers = {0};
     uint64_t bitmap[KERNEL_PID_BITMAP_WORDS(32)];
     assert(kernel_pid_allocator_init(&numbers, bitmap, 32) == KERNEL_PID_STATUS_OK);
-    scheduler.identities.numbers = &numbers;
-    scheduler.identities.next_generation = 1;
+    assert(!kernel_pid_registry_init(&scheduler.identities,&numbers,NULL));
     struct kernel_pid sid = {0}, foreign_sid = {0}, group = {0};
     assert(kernel_pid_publish(&scheduler.identities, &sid) == KERNEL_PID_STATUS_OK);
     assert(kernel_pid_publish(&scheduler.identities, &foreign_sid) == KERNEL_PID_STATUS_OK);
@@ -40,17 +42,44 @@ int main(void)
     assert(kernel_task_tty_find_group(&caller, group.number, &found) == 0 && found == &group);
     assert(group.references == references + 1);
     kernel_pid_put(found);
-    kernel_pid_detach(&same.identities[KERNEL_PID_PGID]);
     kernel_pid_attach(&foreign.identities[KERNEL_PID_PGID], &group, KERNEL_PID_PGID, &foreign);
+    kernel_pid_detach(&same.identities[KERNEL_PID_PGID]);
     kernel_pid_attach(&same.identities[KERNEL_PID_TID], &group, KERNEL_PID_TID, &same);
     assert(kernel_task_tty_find_group(&caller, group.number, &found) == -KERNEL_EPERM && !found);
     kernel_pid_detach(&foreign.identities[KERNEL_PID_PGID]);
     assert(kernel_task_tty_find_group(&caller, group.number, &found) == 0 && found == &group);
     kernel_pid_put(found);
-    kernel_pid_detach(&same.identities[KERNEL_PID_TID]);
     kernel_pid_attach(&foreign.identities[KERNEL_PID_TID], &group, KERNEL_PID_TID, &foreign);
+    kernel_pid_detach(&same.identities[KERNEL_PID_TID]);
     assert(kernel_task_tty_find_group(&caller, group.number, &found) == -KERNEL_EPERM && !found);
     kernel_pid_detach(&foreign.identities[KERNEL_PID_TID]);
+    struct kernel_pid_registry views[2]={0};struct kernel_pid_allocator alloc[2]={0};
+    uint64_t bits[2][KERNEL_PID_BITMAP_WORDS(32)]={0};
+    struct {struct kernel_pid id;struct kernel_pid_binding ancestor;} ids[2]={0};
+    struct kernel_task actors[2]={0};
+    for(unsigned i=0;i<2;i++){
+        assert(!kernel_pid_allocator_init(&alloc[i],bits[i],32));
+        assert(!kernel_pid_registry_init(&views[i],&alloc[i],&scheduler.identities));
+        kernel_pid_t requested[]={1,(kernel_pid_t)(7+i)};
+        assert(!kernel_pid_reserve_numbers(&views[i],&ids[i].id,sizeof(ids[i]),requested,2));
+        assert(!kernel_pid_publish_reserved(&ids[i].id));
+        kernel_pid_attach(&actors[i].identities[KERNEL_PID_TID],&ids[i].id,KERNEL_PID_TID,&actors[i]);
+        kernel_pid_attach(&actors[i].identities[KERNEL_PID_PGID],&ids[i].id,KERNEL_PID_PGID,&actors[i]);
+        kernel_pid_attach(&actors[i].identities[KERNEL_PID_SID],&sid,KERNEL_PID_SID,&actors[i]);
+    }
+    for(unsigned i=0;i<2;i++){
+        assert(!kernel_task_tty_find_group(&actors[i],1,&found)&&found==&ids[i].id);kernel_pid_put(found);
+        assert(kernel_task_tty_find_group(&actors[i],(kernel_pid_t)(8-i),&found)==-KERNEL_ESRCH);
+    }
+    assert(!kernel_task_tty_find_group(&caller,7,&found)&&found==&ids[0].id);kernel_pid_put(found);
+    for(unsigned i=0;i<2;i++){
+        kernel_pid_detach(&actors[i].identities[KERNEL_PID_TID]);
+        kernel_pid_detach(&actors[i].identities[KERNEL_PID_PGID]);
+        kernel_pid_detach(&actors[i].identities[KERNEL_PID_SID]);kernel_pid_put(&ids[i].id);
+    }
+    while(kernel_pid_take_retired(&scheduler.identities)){}
+    for(unsigned i=0;i<2;i++)kernel_pid_registry_put(&views[i]);
+    while(kernel_pid_take_retired_namespace(&scheduler.identities)){}
     kernel_pid_detach(&caller.identities[KERNEL_PID_SID]);
     kernel_pid_detach(&same.identities[KERNEL_PID_SID]);
     kernel_pid_detach(&foreign.identities[KERNEL_PID_SID]);
@@ -59,5 +88,7 @@ int main(void)
     kernel_pid_put(&sid);
     kernel_pid_put(&foreign_sid);
     assert(!numbers.allocated);
+    while(kernel_pid_take_retired(&scheduler.identities)){}
+    assert(!scheduler.identities.retired&&!scheduler.identities.retired_namespaces);
     puts("TTY group host: actual identity lookup/status/PID fallback/owned lookup refs pass");
 }

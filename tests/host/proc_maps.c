@@ -11,6 +11,9 @@ static int stat_error, allocation_fail;
 static int fdinfo_pid = 42;
 static int thread_exiting;
 static struct kernel_heap heap;
+static struct kernel_pid_registry view_a,view_b;
+static struct procfs_mount proc={.pid_view=&view_a};
+static struct kernel_vfs_instance instance={.backend_data=&proc};
 static struct kernel_fs_context fs;
 static struct kernel_pid retained_pid;
 static unsigned pid_puts;
@@ -77,17 +80,72 @@ int kernel_proc_next_fd(kernel_pid_t pid, uint64_t identity, int after, int *fd)
   if (after < 1023) { *fd = 1023; return 0; } return -KERNEL_ENOENT; }
 int kernel_proc_next_process(kernel_pid_t after, kernel_pid_t *pid, uint64_t *identity)
 { (void)after; (void)pid; (void)identity; abort(); }
-int kernel_proc_fdinfo_snapshot(kernel_pid_t pid,uint64_t identity,int fd,
+int kernel_proc_fdinfo_snapshot_in(struct kernel_pid_registry *view,kernel_pid_t pid,uint64_t identity,int fd,
     struct kernel_proc_fdinfo *info)
 {
+    (void)view;
     assert(pid==42 && identity==17 && fd==9);
     *info=(struct kernel_proc_fdinfo){.position=99,.flags=02000002,.mount_id=12,
         .inode=7,.pidfd=1,.pid=fdinfo_pid};
     return 0;
 }
 
+/* Directory adapter fixture: query semantics are exercised separately against
+ * production scheduler identities by proc_index.c. */
+int kernel_proc_view_lookup(struct kernel_pid_registry *view, kernel_pid_t number,
+    kernel_pid_t group, uint64_t generation, int thread, kernel_pid_t *canonical, uint64_t *out)
+{
+    assert(view==&view_a || view==&view_b);
+    if(thread) {
+        assert(view==&view_a && group==42 && generation==17);
+        if(number!=3)return -KERNEL_ENOENT;
+        *canonical=43;*out=18;return 0;
+    }
+    assert(!group && !generation);
+    if(number!=1)return -KERNEL_ENOENT;
+    *canonical=view==&view_a?42:43;*out=view==&view_a?17:18;return 0;
+}
+int kernel_proc_view_next(struct kernel_pid_registry *view, kernel_pid_t after,
+    kernel_pid_t group, uint64_t generation, int thread, kernel_pid_t *number,
+    kernel_pid_t *canonical, uint64_t *out)
+{
+    *number=thread?3:1;
+    return after>=*number?-KERNEL_ENOENT:
+        kernel_proc_view_lookup(view,*number,group,generation,thread,canonical,out);
+}
+static void directory_views(void)
+{
+    struct procfs_mount other={.pid_view=&view_b};
+    struct kernel_vfs_instance second={.backend_data=&other};
+    uint64_t first,second_inode,next,ino;uint32_t mode;uint8_t type;char name[24];
+    assert(!proc_lookup(&instance,PROC_ROOT_INODE,"1",1,&first,&mode));
+    assert(!proc_lookup(&second,PROC_ROOT_INODE,"1",1,&second_inode,&mode));
+    assert(proc_inode_pid(first)==42 && proc_inode_identity(first)==17);
+    assert(proc_inode_pid(second_inode)==43 && first!=second_inode);
+    assert(proc_lookup(&instance,PROC_ROOT_INODE,"42",2,&ino,&mode)==-KERNEL_ENOENT);
+    struct kernel_vfs_node root={.inode=PROC_ROOT_INODE,.instance=&instance};
+    struct kernel_vfs_file file={.private_data=&root};
+    assert(proc_dir_entry(&file,10,&next,&ino,&type,name,sizeof(name))==1);
+    assert(!strcmp(name,"1") && next==11 && ino==first);
+    assert(!proc_dir_entry(&file,next,&next,&ino,&type,name,sizeof(name)));
+    root.inode=proc_pid_inode(42,17,PROC_TASK_DIR_KIND);
+    assert(!proc_lookup(&instance,root.inode,"3",1,&first,&mode));
+    assert(proc_inode_pid(first)==43 && proc_inode_identity(first)==18);
+    assert(proc_dir_entry(&file,2,&next,&ino,&type,name,sizeof(name))==1);
+    assert(!strcmp(name,"3") && next==5 && ino==first);
+    assert(!proc_dir_entry(&file,next,&next,&ino,&type,name,sizeof(name)));
+    puts("PASS procfs fixed-view directory adapter: local names/cookies, canonical inode generations and thread lookup");
+}
+
+enum kernel_open_file_kind kernel_open_file_kind(const struct kernel_open_file_description *file)
+{(void)file; return KERNEL_OPEN_FILE_KIND_REGULAR;}
+int kernel_open_file_pseudo_stat(const struct kernel_open_file_description *file,struct kernel_vfs_stat *stat)
+{(void)file;(void)stat;abort();}
+const char *kernel_bpf_fd_name(const struct kernel_open_file_description *file)
+{(void)file;abort();}
 int main(void)
 {
+    directory_views();
     for (unsigned i = 0; i < 6; i++) fixture[i] = (struct kernel_mm_proc_map){
         .start = 0x100000ULL + i * 0x10000ULL, .end = 0x101000ULL + i * 0x10000ULL,
         .permissions = KERNEL_MM_READ | KERNEL_MM_WRITE };
@@ -98,7 +156,7 @@ int main(void)
     fixture[3].permissions = 0;
     fixture[4].shared = 1;
     fixture[5].file = (void *)(uintptr_t)1; fixture[5].offset = 0x12345000;
-    struct kernel_vfs_node node = {.inode = proc_pid_inode(42, 17, PROC_PID_MAPS_KIND)};
+    struct kernel_vfs_node node = {.instance=&instance,.inode = proc_pid_inode(42, 17, PROC_PID_MAPS_KIND)};
     assert(!proc_inode_is_thread(node.inode));
     uint64_t identity; assert(!proc_inode_identity_current(node.inode, &identity) && identity == 17);
     uint64_t directory = proc_pid_inode(42, 17, PROC_PID_DIR_KIND), inode, next;
@@ -111,6 +169,11 @@ int main(void)
     assert(!strcmp(name, "maps") && next == 11 && inode == node.inode && type == 8);
     assert(proc_dir_entry(&dir, next, &next, &inode, &type, name, sizeof(name))==1);
     assert(!strcmp(name,"fdinfo") && type==4);
+    const char *tail_names[]={"ns","mountinfo","comm","cgroup","coredump_filter"};
+    for(unsigned i=0;i<5;i++) {
+        assert(proc_dir_entry(&dir,next,&next,&inode,&type,name,sizeof(name))==1);
+        assert(!strcmp(name,tail_names[i]));
+    }
     assert(!proc_dir_entry(&dir,next,&next,&inode,&type,name,sizeof(name)));
     uint64_t thread_dir = proc_pid_inode(43, 18, PROC_TID_DIR_KIND);
     const char *thread_names[] = {"stat", "status", "exe", "cwd", "root", "maps", "fd", "fdinfo"};

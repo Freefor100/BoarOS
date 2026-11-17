@@ -250,7 +250,7 @@ static void cleanup_transaction(void)
     assert(!kernel_vfs_pwrite(&file->file,0,bytes,sizeof(bytes),&written) && written==sizeof(bytes));
     struct kernel_exec_transaction transaction={.heap=&heap,.state=KERNEL_EXEC_TRANSACTION_PREPARING};
     transaction.retired_files.state=KERNEL_FILES_LIVE;
-    transaction.files_closer=&files_closer;
+    transaction.cleanup_task=&files_closer;
     files_cleanup_failures=1;
     assert(!kernel_elf64_source_create(&heap,&file,BOAROS_PAGE_SIZE,KERNEL_ELF64_MACHINE_RISCV,
         &transaction.executable_source) && !file);

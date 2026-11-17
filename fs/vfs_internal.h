@@ -121,9 +121,11 @@ int kernel_vfs_file_generated(const struct kernel_vfs_file *file);
 int kernel_vfs_check_io_domain(const struct kernel_vfs_node *,const struct kernel_heap *,
     const struct physical_page_allocator *);
 struct kernel_namespace;
+struct kernel_pid_registry;
 int kernel_vfs_file_snapshot(const struct kernel_vfs_file *file,
                              struct kernel_heap *heap,
                              struct kernel_namespace *ipc_namespace,
+                             struct kernel_pid_registry *pid_view,
                              char **buffer, size_t *length);
 
 struct kernel_page_cache_dirty *kernel_vfs_node_dirty_pages(struct kernel_vfs_node *node);

@@ -3,6 +3,7 @@
 #include "../../kernel/sched/pidfd.c"
 #include "../../fs/record_lock.h"
 #include "../../fs/vfs_internal.h"
+#include <kernel/time.h>
 #include <assert.h>
 #include <pthread.h>
 #include <sched.h>
@@ -59,7 +60,7 @@ struct kernel_exec_security *kernel_exec_security_get(struct kernel_exec_securit
 void kernel_exec_security_put(struct kernel_exec_security *s)
 {if(s){assert(s==security && security_refs && !cpu.preempt_depth);security_refs--;}}
 int kernel_credentials_may_access_locked(const struct kernel_task *from,const struct kernel_task *to,int fs)
-{assert(from==&caller && to==&subject && !fs && cpu.raw_locks);return !deny_access;}
+{assert(from==running && to==&subject && !fs && cpu.raw_locks);return !deny_access;}
 void kernel_rwlock_init(struct kernel_rwlock *lock,uint32_t rank,uintptr_t key)
 {*lock=(struct kernel_rwlock){.rank=rank,.key=key};}
 enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t count,size_t size,void **out)
@@ -91,6 +92,10 @@ void kernel_task_identity_put(struct kernel_pid *id)
 {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);kernel_pid_put(id);}
 struct kernel_pid *process_identity(const struct kernel_task *task,enum kernel_pid_role role)
 {return task->identities[role].identity;}
+struct kernel_pid_registry *process_pid_active(const struct kernel_task *task)
+{ struct kernel_pid *id=process_identity(task,KERNEL_PID_TID);return id?id->registry:&scheduler.identities; }
+struct kernel_pid *kernel_procfs_process_identity(const struct kernel_vfs_file *file)
+{ return file->private_data; }
 struct kernel_wait_record *kernel_wait_record_of(struct kernel_task *task){return &task->wait;}
 struct kernel_wait_node *kernel_wait_default_node(struct kernel_task *task){return &task->default_wait_node;}
 struct kernel_task *kernel_wait_current_task(void){return running;}
@@ -241,6 +246,104 @@ static void reserved_cloexec_case(void)
     assert(!kernel_files_close_range(files,1,3,0,&caller));
     assert(files->record->statistics.current_open_fds==1 && files->record->statistics.close_on_exec_fds==baseline_cloexec);
 }
+static struct kernel_pid *namespace_identity(struct kernel_pid_registry *space,struct kernel_task *task)
+{
+    struct kernel_pid *id=calloc(1,kernel_pid_storage_size(space));assert(id);
+    assert(!kernel_pid_reserve_numbers(space,id,kernel_pid_storage_size(space),&(kernel_pid_t){1},1));
+    assert(!kernel_pid_publish_reserved(id));
+    kernel_pid_attach(&task->identities[KERNEL_PID_TID],id,KERNEL_PID_TID,task);
+    kernel_pid_attach(&task->identities[KERNEL_PID_TGID],id,KERNEL_PID_TGID,task);
+    task->tid=kernel_pid_number_in(id,&scheduler.identities);task->tid_owned=1;
+    task->group_leader=task;return id;
+}
+static void signal_target_result(struct kernel_task *task,int fd,int expected,struct kernel_pid *identity)
+{
+    struct kernel_pid *id=NULL;unsigned scope=99;
+    int result=kernel_pidfd_signal_target(task,fd,0,&id,&scope);
+    assert(result==expected);
+    if(!result){assert(id==identity && scope==1);kernel_task_identity_put(id);}
+    else assert(!id && scope==99);
+}
+static void namespace_case(void)
+{
+    uint64_t bits[3][1];struct kernel_pid_allocator numbers[3]={0};
+    struct kernel_pid_registry a={0},b={0};
+    for(unsigned i=0;i<3;i++)assert(!kernel_pid_allocator_init(&numbers[i],bits[i],64));
+    assert(!kernel_pid_registry_init(&scheduler.identities,&numbers[0],NULL));
+    assert(!kernel_pid_registry_init(&a,&numbers[1],&scheduler.identities));
+    assert(!kernel_pid_registry_init(&b,&numbers[2],&scheduler.identities));
+    struct kernel_task sibling={.magic=KERNEL_THREAD_MAGIC,.arch.user_mode=1,.limits=&limits};
+    struct kernel_task replacement={.magic=KERNEL_THREAD_MAGIC,.arch.user_mode=1,.limits=&limits};
+    sibling.state=replacement.state=KERNEL_THREAD_STATE_RUNNING;
+    sibling.fs=replacement.fs=caller.fs;
+    struct kernel_pid *root=namespace_identity(&scheduler.identities,&caller);
+    struct kernel_pid *left=namespace_identity(&a,&subject);
+    struct kernel_pid *right=namespace_identity(&b,&sibling);
+    assert(left->number==1 && right->number==1 && subject.tid!=sibling.tid);
+    subject.exec_security=security;
+    struct kernel_open_file_description *source=NULL;
+    assert(!kernel_heap_allocate_zeroed(&heap,1,sizeof(*source),(void **)&source));
+    source->heap=&heap;source->references=1;source->kind=KERNEL_OPEN_FILE_KIND_REGULAR;source->offset=91;
+    assert(!kernel_files_install_new_owned_at(&subject.files,7,0,&source));
+    int leftfd=kernel_pidfd_open(&caller,subject.tid,0),rootfd=kernel_pidfd_open(&caller,caller.tid,0);
+    assert(leftfd==0 && rootfd==1);
+    /* Actual fork-copy shares OFDs, but not namespace authority. */
+    assert(!kernel_files_fork(&sibling.files,&caller.files));
+    running=&sibling;cpu.current=&sibling;
+    signal_target_result(&sibling,leftfd,-KERNEL_EINVAL,NULL);
+    signal_target_result(&sibling,rootfd,-KERNEL_EINVAL,NULL);
+    int local=kernel_pidfd_open(&sibling,1,0);assert(local==2);
+    signal_target_result(&sibling,local,0,right);
+    int copied=kernel_pidfd_getfd(&sibling,leftfd,7,0);assert(copied==3);
+    assert(sibling.files.record->slots[copied].description==subject.files.record->slots[7].description);
+    struct kernel_pid *invalid=NULL;unsigned invalid_scope=99;
+    assert(kernel_pidfd_signal_target(&sibling,-1,0,&invalid,&invalid_scope)==-KERNEL_EBADF);
+    assert(kernel_pidfd_signal_target(&sibling,-1,3,&invalid,&invalid_scope)==-KERNEL_EINVAL);
+    assert(!invalid && invalid_scope==99);
+    assert(kernel_pidfd_open(&sibling,subject.tid,0)==-KERNEL_ESRCH);
+    /* Transfer the real root OFD through production pin/install operations. */
+    running=&caller;cpu.current=&caller;
+    struct kernel_open_file_description *transferred=NULL;int64_t error=0;
+    assert(!kernel_files_pin(&caller.files,rootfd,&transferred,&error) && !error);
+    assert(!kernel_files_install_shared_acquired_at(&subject.files,5,0,&transferred) && !transferred);
+    running=&subject;cpu.current=&subject;
+    signal_target_result(&subject,5,-KERNEL_EINVAL,NULL);
+    running=&caller;cpu.current=&caller;
+    signal_target_result(&caller,leftfd,0,left);
+    /* Keep old FD owners across role removal and exact local-number reuse. */
+    kernel_pid_detach(&subject.identities[KERNEL_PID_TID]);
+    kernel_pid_detach(&subject.identities[KERNEL_PID_TGID]);
+    struct kernel_pid *fresh=namespace_identity(&a,&replacement);
+    assert(fresh->number==left->number && fresh->generation!=left->generation);
+    assert(kernel_pidfd_number(caller.files.record->slots[leftfd].description)==-1);
+    struct kernel_pid *retained=NULL;int nonblock;
+    assert(!kernel_pidfd_wait_target(&sibling.files,leftfd,&retained,&nonblock) && retained==left);
+    kernel_task_identity_put(retained);
+    signal_target_result(&sibling,leftfd,-KERNEL_EINVAL,NULL);
+    assert(!kernel_files_create(&replacement.files,&heap));
+    running=&replacement;cpu.current=&replacement;
+    int freshfd=kernel_pidfd_open(&replacement,1,0);assert(freshfd==0);
+    signal_target_result(&replacement,freshfd,0,fresh);
+    running=&caller;cpu.current=&caller;
+    assert(!kernel_files_release(&replacement.files));
+    assert(!kernel_files_release(&sibling.files));
+    assert(!kernel_files_release(&subject.files));
+    assert(!kernel_files_release(&caller.files));
+    struct kernel_task *tasks[]={&caller,&sibling,&replacement};
+    for(unsigned i=0;i<3;i++)for(unsigned role=0;role<2;role++)kernel_pid_detach(&tasks[i]->identities[role]);
+    kernel_pid_put(root);kernel_pid_put(left);kernel_pid_put(right);kernel_pid_put(fresh);
+    struct kernel_pid *dead;unsigned retired=0;
+    while((dead=kernel_pid_take_retired(&scheduler.identities))){free(dead);retired++;}
+    assert(retired==4 && !numbers[0].allocated && !numbers[1].allocated && !numbers[2].allocated);
+    kernel_pid_registry_put(&a);kernel_pid_registry_put(&b);
+    assert(scheduler.identities.references==1 && !kernel_pid_take_retired(&scheduler.identities));
+    assert(kernel_pid_take_retired_namespace(&scheduler.identities));
+    assert(kernel_pid_take_retired_namespace(&scheduler.identities));
+    assert(!kernel_pid_take_retired_namespace(&scheduler.identities));
+    assert(!allocations && !task_borrows && !credential_refs && !security_refs && !cpu.preempt_depth);
+    puts("PASS pidfd namespace: real FD fork/transfer, sibling same number, ancestor rejection, owner exit/reuse and reference return");
+}
+
 int main(int argc,char **argv)
 {
     assert(argc==2);running=&caller;cpu.current=&caller;cpu.logical_id=1;
@@ -249,15 +352,16 @@ int main(int argc,char **argv)
     kernel_raw_lock_init(&caller.files_access,KERNEL_RAW_RANK_TASK_FILES);
     kernel_raw_lock_init(&subject.files_access,KERNEL_RAW_RANK_TASK_FILES);
     caller.magic=KERNEL_THREAD_MAGIC;caller.state=KERNEL_THREAD_STATE_RUNNING;caller.arch.user_mode=1;
-    caller.fs.state=KERNEL_FS_CONTEXT_LIVE;caller.fs.heap=&heap;caller.fs.record=(void *)(uintptr_t)1;
+    caller.fs.state=KERNEL_FS_CONTEXT_LIVE;caller.fs.heap=&heap;caller.fs.record=(void *)(uintptr_t)1;caller.fs.namespace=(void *)(uintptr_t)2;
     caller.limits=&limits;limits.values[KERNEL_RLIMIT_NOFILE].current=1024;
     assert(!kernel_files_create(&caller.files,&heap) && !kernel_files_create(&subject.files,&heap));
+    if(!strcmp(argv[1],"namespace")){namespace_case();return 0;}
     uint64_t bitmap[1];struct kernel_pid_allocator numbers={0};struct kernel_pid identity={0};
     assert(!kernel_pid_allocator_init(&numbers,bitmap,1));scheduler.identities.numbers=&numbers;scheduler.identities.next_generation=1;
     assert(!kernel_pid_publish(&scheduler.identities,&identity));
     kernel_pid_attach(&subject.identities[KERNEL_PID_TID],&identity,KERNEL_PID_TID,&subject);
     kernel_pid_attach(&subject.identities[KERNEL_PID_TGID],&identity,KERNEL_PID_TGID,&subject);
-    subject.group_leader=&subject;subject.group_members=1;subject.exec_security=security;
+    subject.group_leader=subject.group_next=subject.group_previous=&subject;subject.group_members=1;subject.exec_security=security;
     struct kernel_open_file_description *source=0;
     assert(!kernel_heap_allocate_zeroed(&heap,1,sizeof(*source),(void **)&source));
     source->heap=&heap;source->references=1;source->kind=KERNEL_OPEN_FILE_KIND_REGULAR;source->offset=91;
@@ -320,3 +424,13 @@ enum kernel_scheduler_status kernel_wait_backend_switch_locked(struct kernel_tas
     return kernel_wait_backend_switch(task);
 }
 #endif
+
+enum kernel_time_status kernel_time_deadline_from_realtime(uint64_t ns,uint64_t *deadline)
+{(void)ns;(void)deadline;__builtin_trap();}
+
+void process_pid_reaper_disable_locked(struct kernel_task *task)
+{ assert(!process_pid_active(task)->parent); }
+int kernel_wait_backend_lock_local(const struct kernel_wait_token *token,struct kernel_raw_guard *guard,int domain)
+{(void)token;(void)guard;(void)domain;__builtin_trap();}
+void kernel_run_set_acquire(struct kernel_run_set *set){(void)set;__builtin_trap();}
+void kernel_run_set_release(struct kernel_run_set *set){(void)set;__builtin_trap();}

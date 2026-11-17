@@ -14,6 +14,14 @@ _Thread_local uintptr_t sync_test_irq = 2;
 static _Thread_local struct kernel_cpu cpu = {.initialized = KERNEL_CPU_INITIALIZED};
 static struct kernel_task task[4];
 static struct kernel_pid pid[4];
+static struct kernel_pid_registry root_pid_view;
+kernel_pid_t kernel_task_identity_user_number(const struct kernel_pid *p)
+{
+    struct kernel_pid *self=cpu.current->identities[KERNEL_PID_TGID].identity;
+    if(!self)self=cpu.current->group_leader->identities[KERNEL_PID_TGID].identity;
+    return kernel_pid_number_in(p,self->registry);
+}
+
 static struct kernel_heap heap;
 static unsigned allocations;
 static _Thread_local int fail_at = -1;
@@ -193,12 +201,12 @@ void kernel_uaccess_write_cursor_finish(struct kernel_uaccess_write_cursor *curs
     assert(active_output == cursor);
     active_output = 0;
 }
-void kernel_pid_get(struct kernel_pid *p)
+void __wrap_kernel_pid_get(struct kernel_pid *p)
 {
     assert(cpu.raw_locks && cpu.raw_locks->lock == &kernel_wait_domain && p && p->references);
     p->references++;
 }
-void kernel_pid_put(struct kernel_pid *p)
+void __wrap_kernel_pid_put(struct kernel_pid *p)
 {
     assert(cpu.raw_locks && cpu.raw_locks->lock == &kernel_wait_domain && p && p->references > 1);
     p->references--;
@@ -861,14 +869,14 @@ static void proc_rows(void)
     rm(second);
     unsigned before = allocations;
     uint32_t cursor = 0; int32_t id; struct kernel_msqid64_ds row;
-    assert(kernel_msg_proc_next(kernel_ipc_initial(),&cursor, &id, &row) && id == first);
+    assert(kernel_msg_proc_next(kernel_ipc_initial(),NULL,&cursor, &id, &row) && id == first);
     assert(row.msg_perm.uid == cred.euid && row.msg_perm.gid == cred.egid &&
         row.msg_perm.mode == 0600 && row.msg_cbytes == 4 && row.msg_qnum == 1 &&
         row.msg_lspid == pid[0].number && row.msg_stime == 1);
-    assert(before == allocations && !kernel_msg_proc_next(kernel_ipc_initial(),&cursor, &id, &row));
+    assert(before == allocations && !kernel_msg_proc_next(kernel_ipc_initial(),NULL,&cursor, &id, &row));
     rm(first);
     assert(row.msg_cbytes == 4 && row.msg_qnum == 1); /* A row owns no live queue data. */
-    cursor = 0; assert(!kernel_msg_proc_next(kernel_ipc_initial(),&cursor, &id, &row));
+    cursor = 0; assert(!kernel_msg_proc_next(kernel_ipc_initial(),NULL,&cursor, &id, &row));
     clean();
     puts("PASS proc queue rows use real metadata, skip removed slots and retain no owners");
 }
@@ -881,7 +889,7 @@ static void namespace_isolation(void)
     host_ipc_namespace=left;
     unsigned empty=allocations;uint32_t cursor=0;int32_t id;struct kernel_msqid64_ds row;
     assert(kernel_msg_get(cpu.current,123,0)==-KERNEL_ENOENT);
-    assert(!kernel_msg_proc_next(left,&cursor,&id,&row)&&allocations==empty);
+    assert(!kernel_msg_proc_next(left,NULL,&cursor,&id,&row)&&allocations==empty);
     struct kernel_msginfo info;assert(!ctl(0,KERNEL_MSG_INFO,&info));
     assert(!info.msgpool&&!info.msgmap&&!info.msgtql&&allocations==empty);
     allocation_calls=0;fail_at=0;
@@ -895,12 +903,37 @@ static void namespace_isolation(void)
     assert(ctl(first,KERNEL_IPC_STAT,&row)==-KERNEL_EINVAL);
     int second=(int)kernel_msg_get(cpu.current,123,KERNEL_IPC_CREAT|0600);
     assert(second==first&&statq(second).msg_qnum==0);
-    cursor=0;assert(kernel_msg_proc_next(left,&cursor,&id,&row)&&row.msg_qnum==1);
+    cursor=0;assert(kernel_msg_proc_next(left,NULL,&cursor,&id,&row)&&row.msg_qnum==1);
     kernel_namespace_put(left);
     assert(held->removed&&!held->table->queues&&!held->table->messages&&!held->table->bytes);
     queue_put(held);kernel_namespace_put(right);host_ipc_namespace=0;
     assert(allocations==before);
     puts("PASS namespace isolation, lazy empty lookup and old queue/table lifetime");
+}
+static void pid_views(void)
+{
+    struct kernel_pid_registry inner={.depth=1,.parent=&root_pid_view},sibling={.depth=1,.parent=&root_pid_view};
+    struct {struct kernel_pid id;struct kernel_pid_binding ancestor;} owner={
+        .id={.number=11,.references=1,.registry=&inner},.ancestor={.registry=&root_pid_view,.number=101}};
+    struct kernel_pid observer={.number=11,.references=1,.registry=&sibling};
+    task[0].identities[KERNEL_PID_TGID].identity=&owner.id;
+    task[1].identities[KERNEL_PID_TGID].identity=&observer;
+    current(0);int q=kernel_msg_get(cpu.current,0,0600);assert(q>=0);struct packet p={.type=1};
+    assert(!send(q,&p,0,0));assert(statq(q).msg_lspid==11);
+    current(1);assert(statq(q).msg_lspid==0);
+    uint32_t cursor=0;int32_t row_id;struct kernel_msqid64_ds row;
+    assert(kernel_msg_proc_next(kernel_ipc_initial(),&root_pid_view,&cursor,&row_id,&row)&&row_id==q&&row.msg_lspid==101);
+    cursor=0;assert(kernel_msg_proc_next(kernel_ipc_initial(),&inner,&cursor,&row_id,&row)&&row.msg_lspid==11);
+
+    current(2);assert(statq(q).msg_lspid==101);
+    task[0].identities[KERNEL_PID_TGID].identity=&pid[0];
+    assert(statq(q).msg_lspid==101 && owner.id.references==2);
+    task[1].identities[KERNEL_PID_TGID].identity=&pid[1];current(1);
+    /* New sender root TID11 equals old sender's leaf11, not its identity. */
+    assert(!send(q,&p,0,0));assert(statq(q).msg_lspid==11 && owner.id.references==1);
+    assert(!recv(q,&p,0,0,0));assert(statq(q).msg_lrpid==11);
+    rm(q);current(0);
+    puts("PASS msg PID views and canonical owner replacement despite equal leaf/root numbers");
 }
 int main(void)
 {
@@ -910,6 +943,7 @@ int main(void)
     for (unsigned i = 0; i < 4; i++) {
         pid[i].number = (int)i + 10;
         pid[i].references = 1;
+        pid[i].registry = &root_pid_view;
         task[i].tid = pid[i].number;
         task[i].identities[KERNEL_PID_TGID].identity = &pid[i];
         task[i].identities[KERNEL_PID_TID].identity = &pid[i];
@@ -929,6 +963,7 @@ int main(void)
     quota();
     proc_rows();
     namespace_isolation();
+    pid_views();
     clean();
     assert(!kernel_ipc_initial_shutdown());
     assert(!allocations);
