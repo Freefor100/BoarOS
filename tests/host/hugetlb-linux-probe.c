@@ -26,18 +26,22 @@ static void probe(const char *name,int flags,int fd,off_t off,size_t size,void *
     int result=p==MAP_FAILED?errno:0;
     printf("%s=%d\n",name,result);
     if(expected>=0 && result!=expected)failures++;
-    if(p!=MAP_FAILED && munmap(p,(size+huge_size-1)&~(huge_size-1)))failures++;
+    size_t unmap_size=(flags&MAP_HUGETLB)?(size+huge_size-1)&~(huge_size-1):size;
+    if(p!=MAP_FAILED && munmap(p,unmap_size))failures++;
 }
 int main(int argc,char **argv)
 {
     huge_size=argc>1?strtoull(argv[1],0,0):2097152;
     if(!huge_size || (huge_size&(huge_size-1)))return 2;
     long base=sysconf(_SC_PAGESIZE);
+    unsigned shift=0;for(size_t n=huge_size;n>1;n>>=1)shift++;
     int flags=MAP_PRIVATE|MAP_ANONYMOUS|MAP_HUGETLB;
     int fd=open("/dev/zero",O_RDWR);
     if(fd<0)return 2;
     probe("reserved",flags,-1,0,base,0,-1); /* Pool-dependent. */
     probe("private-noreserve",flags|MAP_NORESERVE,-1,0,base,0,0);
+    probe("native-size",flags|MAP_NORESERVE|(shift<<26),-1,0,base,0,0);
+    probe("size-without-hugetlb",MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE|(17U<<26),-1,0,base,0,0);
     probe("shared-noreserve",MAP_SHARED|MAP_ANONYMOUS|MAP_HUGETLB|MAP_NORESERVE,-1,0,base,0,0);
     probe("base-offset",flags|MAP_NORESERVE,-1,base,base,0,EINVAL);
     probe("huge-offset",flags|MAP_NORESERVE,-1,huge_size,base,0,0);
