@@ -52,6 +52,8 @@ enum kernel_vma_kind {
     KERNEL_VMA_KIND_FILE_SHARED,
     KERNEL_VMA_KIND_SYSV_SHM,
     KERNEL_VMA_KIND_OBJECT_SHARED,
+    KERNEL_VMA_KIND_HUGETLB_PRIVATE,
+    KERNEL_VMA_KIND_HUGETLB_SHARED,
 };
 
 enum kernel_vma_role {
@@ -73,6 +75,7 @@ enum kernel_vma_fault_policy {
     KERNEL_VMA_FAULT_ANON_SHARED,
     KERNEL_VMA_FAULT_FILE_SHARED,
     KERNEL_VMA_FAULT_OBJECT_SHARED,
+    KERNEL_VMA_FAULT_HUGETLB,
 };
 
 /* A value copy; callers must not retain backing as a standalone owner. */
@@ -229,4 +232,8 @@ enum kernel_vma_status kernel_vma_set_trim_end(
     uint64_t old_end,
     uint64_t new_end);
 
+/* Fork's unpublished child replaces an inherited backing identity without
+ * changing ranges or taking ownership of either object. */
+enum kernel_vma_status kernel_vma_set_rebind_backing(struct kernel_vma_set *,
+    const void *old_backing, void *new_backing);
 #endif
