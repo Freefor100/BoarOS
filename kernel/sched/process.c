@@ -82,6 +82,7 @@
 #define LINUX_CLONE_SIGHAND UINT64_C(0x800)
 #define LINUX_CLONE_CLEAR_SIGHAND UINT64_C(0x100000000)
 #define LINUX_CLONE_VFORK UINT64_C(0x4000)
+#define LINUX_CLONE_SYSVSEM UINT64_C(0x40000)
 #define LINUX_CLONE_THREAD UINT64_C(0x10000)
 #define LINUX_CLONE_SETTLS UINT64_C(0x80000)
 #define LINUX_CLONE_PARENT_SETTID UINT64_C(0x100000)
@@ -3284,7 +3285,7 @@ enum kernel_task_status kernel_task_fs_context_borrow(
  * access qualification gives pidfd readers one combined FS/UTS/IPC/PID view. */
 static void install_namespaces(struct kernel_task *task,struct kernel_fs_context *fs,
     struct kernel_namespace **uts,struct kernel_namespace **ipc,struct kernel_pid_registry *pid,
-    int detach_sem,int shared_paths)
+    int detach_sem,int shared_paths,int fresh_pid)
 {
     struct kernel_fs_context previous={0};
     struct kernel_namespace *old_uts=0,*old_ipc=0;
@@ -3296,29 +3297,58 @@ static void install_namespaces(struct kernel_task *task,struct kernel_fs_context
             else kernel_fs_context_exchange(&task->fs,fs,&previous);
         }
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-        if(pid && process_pid_children_install_locked(task,pid))__builtin_trap();
+        if(fresh_pid) {
+            /* The caller just created this child of its active namespace;
+             * transfer the only reference, without a redundant get/put. */
+            task->pid_for_children=pid;
+        } else if(pid && process_pid_children_install_locked(task,pid))__builtin_trap();
         if(*uts){old_uts=task->uts_namespace;task->uts_namespace=*uts;*uts=0;}
         if(*ipc){old_ipc=task->ipc_namespace;task->ipc_namespace=*ipc;*ipc=0;}
     }
     if(previous.state==KERNEL_FS_CONTEXT_LIVE && kernel_fs_context_release(&previous))__builtin_trap();
     kernel_namespace_put(old_uts);kernel_namespace_put(old_ipc);
-    if(pid)process_identity_collect();
+    if(pid && !fresh_pid)process_identity_collect();
+}
+int process_unshare_namespaces(struct kernel_task *task,uint64_t flags)
+{
+    const uint64_t namespaces=KERNEL_NS_MNT|KERNEL_NS_UTS|KERNEL_NS_IPC|KERNEL_NS_PID;
+    if(flags&~(LINUX_CLONE_FS|LINUX_CLONE_THREAD|namespaces|LINUX_CLONE_SYSVSEM))return -KERNEL_EINVAL;
+    if(!flags)return 0;
+    /* In the pinned Linux ksys_unshare NEWPID alone does not imply THREAD. */
+    if(flags&LINUX_CLONE_THREAD) {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        if(task->group_leader->group_members!=1)return -KERNEL_EINVAL;
+    }
+    int denied=(flags&namespaces) &&
+        !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN);
+    struct kernel_fs_context fs={0};struct kernel_namespace *uts=0,*ipc=0;
+    struct kernel_pid_registry *pid=NULL;int error=0;
+    /* NEWNS copies even exclusive FS state before the namespace privilege
+     * check. On denial prepare only the FS record, never the mount tree. */
+    if(denied && (flags&KERNEL_NS_MNT)) {
+        enum kernel_fs_context_status status=kernel_fs_context_fork(&fs,&task->fs);
+        if(status)error=status==KERNEL_FS_CONTEXT_STATUS_NO_MEMORY?-KERNEL_ENOMEM:-KERNEL_EINVAL;
+    } else if(flags&(LINUX_CLONE_FS|KERNEL_NS_MNT))
+        error=kernel_fs_context_prepare_unshare(&fs,&task->fs,!!(flags&KERNEL_NS_MNT));
+    if(!error && denied)error=-KERNEL_EPERM;
+    if(!error && (flags&KERNEL_NS_UTS))error=kernel_uts_clone(task->uts_namespace,task->files.heap,&uts);
+    if(!error && (flags&KERNEL_NS_IPC))error=kernel_ipc_namespace_create(task->files.heap,&ipc);
+    if(!error && (flags&KERNEL_NS_PID)) {
+        /* The running caller owns its active identity throughout unshare. */
+        struct kernel_pid_registry *active=process_pid_active(task);
+        if(!active || task->pid_for_children)error=-KERNEL_EINVAL;
+        else if(active->depth==KERNEL_PID_NAMESPACE_MAX_DEPTH)error=-KERNEL_ENOSPC;
+        else error=process_pid_namespace_create(active,&scheduler.identity_heap,&pid);
+    }
+    if(!error)install_namespaces(task,&fs,&uts,&ipc,pid,!!(flags&(KERNEL_NS_IPC|LINUX_CLONE_SYSVSEM)),0,pid!=NULL);
+    if(fs.state==KERNEL_FS_CONTEXT_LIVE && kernel_fs_context_release(&fs))__builtin_trap();
+    kernel_namespace_put(uts);kernel_namespace_put(ipc);return error;
 }
 int kernel_task_unshare_namespaces(struct kernel_task *task,uint64_t flags)
 {
-    const uint64_t supported=LINUX_CLONE_FS|KERNEL_NS_MNT|KERNEL_NS_UTS|KERNEL_NS_IPC|UINT64_C(0x40000);
-    if(flags&~supported)return -KERNEL_EINVAL;
-    if(!flags)return 0;
-    if((flags&(KERNEL_NS_MNT|KERNEL_NS_UTS|KERNEL_NS_IPC)) &&
-        !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN))return -KERNEL_EPERM;
-    struct kernel_fs_context fs={0};struct kernel_namespace *uts=0,*ipc=0;int error=0;
-    if(flags&(LINUX_CLONE_FS|KERNEL_NS_MNT))
-        error=kernel_fs_context_prepare_unshare(&fs,&task->fs,!!(flags&KERNEL_NS_MNT));
-    if(!error && (flags&KERNEL_NS_UTS))error=kernel_uts_clone(task->uts_namespace,task->files.heap,&uts);
-    if(!error && (flags&KERNEL_NS_IPC))error=kernel_ipc_namespace_create(task->files.heap,&ipc);
-    if(!error)install_namespaces(task,&fs,&uts,&ipc,NULL,!!(flags&(KERNEL_NS_IPC|UINT64_C(0x40000))),0);
-    if(fs.state==KERNEL_FS_CONTEXT_LIVE && kernel_fs_context_release(&fs))__builtin_trap();
-    kernel_namespace_put(uts);kernel_namespace_put(ipc);return error;
+    /* Keep public PID creation disabled until the nested guest ABI is ready. */
+    if(flags&(KERNEL_NS_PID|LINUX_CLONE_THREAD))return -KERNEL_EINVAL;
+    return process_unshare_namespaces(task,flags);
 }
 int kernel_task_setns(struct kernel_task *task,int32_t fd,uint32_t type)
 {
@@ -3351,7 +3381,7 @@ int kernel_task_setns(struct kernel_task *task,int32_t fd,uint32_t type)
     int shared_paths=(mask&KERNEL_NS_MNT) && (mask&~KERNEL_NS_MNT);
     if(!error && next[0])error=kernel_fs_context_prepare_namespace(&fs,&task->fs,
         (struct kernel_mount_namespace *)next[0],shared_paths);
-    if(!error)install_namespaces(task,&fs,&next[1],&next[2],pid,!!(mask&KERNEL_NS_IPC),shared_paths);
+    if(!error)install_namespaces(task,&fs,&next[1],&next[2],pid,!!(mask&KERNEL_NS_IPC),shared_paths,0);
     if(fs.state==KERNEL_FS_CONTEXT_LIVE && kernel_fs_context_release(&fs))__builtin_trap();
     for(unsigned i=0;i<4;i++)kernel_namespace_put(next[i]);
     return error;

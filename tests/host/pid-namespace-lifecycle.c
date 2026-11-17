@@ -241,6 +241,8 @@ static void heap_namespace_case(struct kernel_task *parent)
     assert(!scheduler.identities.retired && !scheduler.identities.retired_namespaces);
 }
 
+#include "pid_namespace_unshare.h"
+
 int main(void)
 {
     kernel_cpu_initialize(&cpu, 0, NULL);
@@ -256,6 +258,7 @@ int main(void)
     assert(!kernel_pid_registry_init(&sibling, &sibling_numbers, &scheduler.identities));
     struct kernel_task init = {0}, child_init = {0}, ordinary = {0}, failed = {0};
     publish(&init, NULL); cpu.current = &init;
+    unshare_case(&init);
     assert(init.signal_unkillable);
     assert(init.tid == 1 && process_pid_active(&init) == &scheduler.identities);
     /* NEWPID owns its destination; failure must not install a for-children

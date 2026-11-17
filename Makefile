@@ -2457,7 +2457,7 @@ test-pid-namespace-lifecycle-host:
 	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=4 \
 		-DBOAROS_PAGE_SHIFT=$$shift -ffunction-sections -fdata-sections \
 		-Itests/host/sync -idirafter include -fsanitize=address,undefined \
-		tests/host/pid-namespace-lifecycle.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/sched/process.c kernel/pid.c kernel/namespace.c \
+		tests/host/pid-namespace-lifecycle.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/sched/process.c kernel/pid.c kernel/namespace.c kernel/credentials.c kernel/uts.c kernel/ipc_namespace.c -DBOAROS_UTS_MACHINE=\"host\" \
 		kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c \
 		-Wl,--gc-sections -o build/host/pid-namespace-lifecycle-$$shift; \
 	build/host/pid-namespace-lifecycle-$$shift; done
