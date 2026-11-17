@@ -161,6 +161,8 @@ TRACE 在启用 `PTRACE_O_TRACESECCOMP` 的跟踪关系中产生 SECCOMP 事件�
 包含停止期间 TSYNC 发布的策略。重检 TRACE 只放行一次，不重复事件；
 ERRNO/TRAP/KILL 的较高优先级仍然生效。跟踪者把调用号改为负数时跳过执行，
 保留它设置的返回寄存器，且清除 restart block；致命恢复也不会执行调用。
+TRACE 将 `restart_syscall` 改为其他调用时终结原来的 timeout block，避免
+后续信号再改写替代调用的结果和 PC；未改号则保留它以继续原等待。
 普通 SECCOMP 事件恢复的附带信号不作为信号交付注入。实际 syscall-enter
 BPF 观测位于过滤及重检之后，使用最终调用号和参数。
 
@@ -209,7 +211,9 @@ clone 发布和非组长 exec；可交给同一 `tests/userland/seccomp.py` 启�
 `tests/workloads/seccomp/trace.c` 覆盖事件数据及截短复制、ENTRY/SECCOMP/EXIT
 顺序、改号与参数、二次 TRACE、较高优先级动作、负调用号/内部 restart 数值、
 后续信号 PC、事件中修改恢复 PC、LA 原始参数槽、致命停止的零写副作用、
-停止期间 TSYNC、fork 继承及 exec。BPF 观测直接检查改号后的 enter 参数及
+停止期间 TSYNC、fork 继承及 exec、事件中 DETACH 和 tracer 退出（包括
+EXITKILL 零写副作用）。nanosleep/FUTEX_WAIT 的 STOP/CONT 用例同时检查
+restart_syscall 改号成功后的信号 PC/a0 和未改号时继续原等待。BPF 观测直接检查改号后的 enter 参数及
 拒绝路径不产生 enter。Linux 宿主禁止
 ptrace 时只运行无跟踪者行为并明确跳过事件用例；RV/LA guest 执行事件路径。
 

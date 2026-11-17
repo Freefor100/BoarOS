@@ -97,6 +97,14 @@ int main(void)
     assert(result.action==KERNEL_SYSCALL_ACTION_RETURN_FINAL);
     trace_mode=1;request.number=172;trace_calls=0;
     assert(!kernel_seccomp_check(parent,&request,&result)&&request.number==173&&trace_calls==1);
+    for(unsigned k=0;k<2;k++) {
+        parent->syscall_restart.kind=kinds[k];request.number=128;
+        assert(!kernel_seccomp_check(parent,&request,&result)&&request.number==173);
+        assert(parent->syscall_restart.kind==KERNEL_SYSCALL_RESTART_NONE);
+        trace_mode=3;parent->syscall_restart.kind=kinds[k];request.number=128;
+        assert(!kernel_seccomp_check(parent,&request,&result)&&request.number==128);
+        assert(parent->syscall_restart.kind==kinds[k]);trace_mode=1;
+    }
     struct kernel_bpf_classic_insn changed[]={I(0x20,0,0,0),I(0x15,0,1,173),I(0x06,0,0,0x50000|13),I(0x06,0,0,0x7fff0000)};
     assert(!attach(parent,changed,4));request.number=172;trace_calls=0;
     assert(kernel_seccomp_check(parent,&request,&result)==1&&result.value==-13&&trace_calls==1);

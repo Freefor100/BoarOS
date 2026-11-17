@@ -266,6 +266,11 @@ static int check(struct kernel_task *task,struct kernel_syscall_request *request
             result->action=KERNEL_SYSCALL_ACTION_RETURN_FINAL;
             return 1;
         }
+        /* The saved timeout belongs to restart_syscall, not to a replacement
+         * operation. Keeping it would let a later signal rewrite that completed
+         * operation's return value/PC. An unchanged restart still needs it. */
+        if (data.nr==128 && (int32_t)request->number!=128)
+            kernel_signal_clear_syscall_restart(task);
         /* The tracer can change the number/arguments and TSYNC can publish a
          * stronger chain while stopped. Re-read both; a second TRACE is allow,
          * not a recursive event, but every stronger action still takes effect. */

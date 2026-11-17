@@ -111,6 +111,7 @@ static void trace_case(unsigned mode)
 #endif
     CHECK(!ptrace(PTRACE_SETREGSET,p,(void *)1,&iov));
     if(mode==6){CHECK(!kill(p,SIGKILL));joined(p,SIGKILL);return;}
+    if(mode==13){CHECK(!ptrace(PTRACE_DETACH,p,0,0));joined(p,0);return;}
     CHECK(!ptrace(PTRACE_CONT,p,0,(void *)(uintptr_t)(mode==7?SIGUSR1:0)));
     if(mode==11) {
         for(;;) {
@@ -285,6 +286,79 @@ static void trace_pc(void)
 static void trace_pc(void){puts("SECCOMP TRACE target PC SKIP host architecture");}
 #endif
 
+static void trace_restart(void)
+{
+    mkdir("/proc",0755);if(access("/proc/self/stat",R_OK))CHECK(!mount("proc","/proc","proc",0,0));
+    for(unsigned kind=0;kind<4;kind++) {
+        pid_t parent=getpid(),p=fork();CHECK(p>=0);
+        if(!p) {
+            pid_t me=getpid();if(ptrace(PTRACE_TRACEME,0,0,0)){if(initial_mode&&errno==EPERM)_exit(77);CHECK(0);}
+            struct sigaction sa={.sa_sigaction=restart_handler,.sa_flags=SA_SIGINFO};CHECK(!sigaction(SIGUSR1,&sa,0));
+            nnp();deny(SYS_restart_syscall,SECCOMP_RET_TRACE|42);CHECK(!kill(me,SIGSTOP));
+            struct timespec duration={kind<2?60:1,0};int word=0;
+            long r=(kind&1)?syscall(SYS_futex,&word,FUTEX_WAIT,0,&duration,0,0):syscall(SYS_nanosleep,&duration,0);
+            if(kind<2)CHECK(r==parent);
+            else if(kind&1)CHECK(r==-1&&errno==ETIMEDOUT);
+            else CHECK(r==0);
+            CHECK(!notify_call(me)&&restart_notified);_exit(0);
+        }
+        int s;CHECK(waitpid(p,&s,0)==p);
+        if(WIFEXITED(s)&&WEXITSTATUS(s)==77){puts("SECCOMP TRACE restart rewrite SKIP host policy");continue;}
+        CHECK(WIFSTOPPED(s));CHECK(!ptrace(PTRACE_SETOPTIONS,p,0,(void *)PTRACE_O_TRACESECCOMP));
+        CHECK(!ptrace(PTRACE_CONT,p,0,0));wait_sleeping(p);CHECK(!kill(p,SIGSTOP));
+        CHECK(waitpid(p,&s,0)==p&&WIFSTOPPED(s)&&WSTOPSIG(s)==SIGSTOP);
+        CHECK(!ptrace(PTRACE_CONT,p,0,(void *)SIGSTOP));
+        CHECK(waitpid(p,&s,0)==p&&WIFSTOPPED(s)&&WSTOPSIG(s)==SIGSTOP);
+        CHECK(!kill(p,SIGCONT));CHECK(!ptrace(PTRACE_CONT,p,0,0));
+        for(;;) {
+            CHECK(waitpid(p,&s,0)==p&&WIFSTOPPED(s));
+            if((s>>16)==7)break;
+            CHECK(WSTOPSIG(s)==SIGCONT);CHECK(!ptrace(PTRACE_CONT,p,0,(void *)SIGCONT));
+        }
+        struct trace_info info={0};CHECK(ptrace(PTRACE_GET_SYSCALL_INFO,p,(void *)sizeof(info),&info)==84);
+        CHECK(info.nr==SYS_restart_syscall);
+        uint64_t reg[64]={0};struct iovec iov={reg,sizeof(reg)};CHECK(!ptrace(PTRACE_GETREGSET,p,(void *)1,&iov));
+        if(kind<2)reg[nr_index()]=SYS_getppid;
+        CHECK(!ptrace(PTRACE_SETREGSET,p,(void *)1,&iov));
+        CHECK(!ptrace(PTRACE_CONT,p,0,0));
+        CHECK(waitpid(p,&s,0)==p&&WIFSTOPPED(s)&&WSTOPSIG(s)==SIGUSR1);
+        CHECK(!ptrace(PTRACE_CONT,p,0,(void *)SIGUSR1));joined(p,0);
+    }
+    puts("SECCOMP TRACE restart rewritten success/later signal checks complete");
+}
+
+static void trace_tracer_exit(int exitkill)
+{
+    int bytes[2],identity[2];CHECK(!pipe(bytes)&&!pipe(identity));
+    CHECK(!prctl(PR_SET_CHILD_SUBREAPER,1));pid_t tracer=fork();CHECK(tracer>=0);
+    if(!tracer) {
+        close(bytes[0]);close(identity[0]);pid_t target=fork();CHECK(target>=0);
+        if(!target) {
+            close(identity[1]);pid_t me=getpid();
+            if(ptrace(PTRACE_TRACEME,0,0,0)){if(initial_mode&&errno==EPERM)_exit(77);CHECK(0);}
+            nnp();deny(SYS_getpid,SECCOMP_RET_TRACE|42);CHECK(!kill(me,SIGSTOP));
+            CHECK(syscall(SYS_getpid,bytes[1],"x",1)==1);_exit(0);
+        }
+        CHECK(write(identity[1],&target,sizeof(target))==sizeof(target));close(identity[1]);
+        int status;CHECK(waitpid(target,&status,0)==target);
+        if(WIFEXITED(status)&&WEXITSTATUS(status)==77)_exit(77);
+        CHECK(WIFSTOPPED(status));CHECK(!ptrace(PTRACE_SETOPTIONS,target,0,
+            (void *)(uintptr_t)(PTRACE_O_TRACESECCOMP|(exitkill?PTRACE_O_EXITKILL:0))));
+        CHECK(!ptrace(PTRACE_CONT,target,0,0));
+        CHECK(waitpid(target,&status,0)==target&&WIFSTOPPED(status)&&(status>>16)==7);
+        uint64_t reg[64]={0};struct iovec iov={reg,sizeof(reg)};CHECK(!ptrace(PTRACE_GETREGSET,target,(void *)1,&iov));
+        reg[nr_index()]=SYS_write;CHECK(!ptrace(PTRACE_SETREGSET,target,(void *)1,&iov));
+        _exit(0); /* Exit itself releases the event; no CONT or DETACH. */
+    }
+    close(bytes[1]);close(identity[1]);pid_t target;CHECK(read(identity[0],&target,sizeof(target))==sizeof(target));close(identity[0]);
+    int status;CHECK(waitpid(tracer,&status,0)==tracer&&WIFEXITED(status));
+    if(WEXITSTATUS(status)==77)puts("SECCOMP TRACE tracer exit SKIP host policy");
+    else {CHECK(WEXITSTATUS(status)==0);joined(target,exitkill?SIGKILL:0);
+        char byte;CHECK(read(bytes[0],&byte,1)==(exitkill?0:1));
+        puts(exitkill?"SECCOMP TRACE EXITKILL zero write effect PASS":"SECCOMP TRACE tracer exit resumes selected syscall PASS");}
+    close(bytes[0]);CHECK(!prctl(PR_SET_CHILD_SUBREAPER,0));
+}
+
 int main(int argc,char **argv)
 {
     if(argc>1&&!strcmp(argv[1],"trace-exec")){CHECK(syscall(SYS_getpid)>0);return 0;}
@@ -299,6 +373,6 @@ int main(int argc,char **argv)
     trace_case(12);
 #endif
     puts("SECCOMP TRACE event/recheck/skip/priority/fatal PASS");
-    trace_sync();trace_order();trace_write(0);trace_write(1);trace_pc();
+    trace_sync();trace_order();trace_write(0);trace_write(1);trace_pc();trace_restart();trace_case(13);trace_tracer_exit(0);trace_tracer_exit(1);
     puts("SECCOMP ALL PASS");if(getpid()==1)reboot(RB_POWER_OFF);return 0;
 }
