@@ -4,10 +4,6 @@
 #undef main
 #include <kernel/credentials.h>
 
-/* This socket fixture owns no SysV mappings. */
-void kernel_shm_attachment_close_for_task(struct kernel_shm_attachment *a,const struct kernel_task *t)
-{(void)a;(void)t;abort();}
-
 /* No namespace shutdown is admitted by this socket-only fixture. */
 void exited_append_locked(struct kernel_task *task) { (void)task; abort(); }
 
