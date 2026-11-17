@@ -2390,3 +2390,12 @@ test-gpt-host:
 	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_gpt.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-gpt
 	build/host/block-gpt build/host/gpt.img
 	python3 tests/host/gpt-blkid.py build/host/gpt.img
+.PHONY: test-huge-riscv test-mm-huge-host
+test-mm-huge-host:
+	sh tests/host/mm-huge.sh
+
+$(BUILD_DIR)/tests/kernel-huge-rv: $(filter-out $(BUILD_DIR)/tests/riscv/sv39_main.o,$(SV39_TEST_OBJECTS)) $(BUILD_DIR)/tests/riscv/huge_main.o arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -o $@ $(filter %.o,$^)
+
+test-huge-riscv: $(BUILD_DIR)/tests/kernel-huge-rv
+	QEMU_RISCV64=$(QEMU_RISCV64) HUGE_TEST_KERNEL_RV=$< sh tests/riscv/huge.sh

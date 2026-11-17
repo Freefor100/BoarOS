@@ -68,10 +68,8 @@ MM 退休批次可携带整块 head/order 与普通页表页；混合批次使�
 保留原有 release-batch 快路径。`finish_tlb_change()` 仍先完成本地/远端翻译同步，
 再统一归还所有权，不能在同步前释放整块，也不能把一个大页展开成多条 tail 归还。
 
-这只是物理所有权基础，不启用 `MAP_HUGETLB`。当前用户页表、VMA、用户访问 pin、
-COW 和远端 TLB 退休链仍以基本页为单位；接入大叶时须让映射和临时 pin 都持有整块
-owner，保留大页内偏移，并在远端失效及所有 pin 归还之后释放末引用。显式大页的
-池预留/容量、对齐、权限、fork 与区域编辑语义也尚未实现，不能以连续基本页替代。
+这不是 `MAP_HUGETLB` 用户接口完成。双架构大叶与整块 pin/退休消费者的阶段状态见
+[显式大页](hugepages.md)；hstate 预留、VMA 与 syscall 接入仍未开放，不能以连续基本页替代。
 引用达到 `UINT32_MAX`、对 free/internal/tail 操作或在 bootstrap 阶段 acquire 都是
 不变量错误并触发 fatal trap；合法 acquire/release 只改变引用和最终可用页计数。
 `physical_page_acquire_batch()` 和 `physical_page_release_batch()` 在一次分配器锁内分别取得或归还至多 16 个零阶引用。同一物理地址可出现多次，每项各归还一个引用；末引用仍执行与单页释放相同的祖先、块头和空闲链校验及合并。
