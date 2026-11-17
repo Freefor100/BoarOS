@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 extern _Thread_local uint64_t mm_test_context;
 void mm_test_attach(unsigned);
 static unsigned char pool[8*1024*1024] __attribute__((aligned(16384)));
@@ -18,6 +19,16 @@ void mm_test_fence(uint64_t address,int instructions)
 {(void)address;instruction_fences+=!!instructions;__atomic_thread_fence(__ATOMIC_SEQ_CST);}
 static void *access_page(uint64_t p){return (void *)(uintptr_t)p;}
 static int address_of(const void *p,uint64_t *a){*a=(uintptr_t)p;return 1;}
+static pthread_barrier_t core_barrier;
+static void rendezvous(void)
+{ int rc=pthread_barrier_wait(&core_barrier);assert(!rc||rc==PTHREAD_BARRIER_SERIAL_THREAD); }
+static void *remote_borrower(void *opaque)
+{
+    struct kernel_mm *mm=opaque;
+    assert(kernel_mm_core_remote_begin(mm));rendezvous();rendezvous();
+    kernel_mm_core_remote_end(mm);rendezvous();rendezvous();
+    assert(!kernel_mm_core_remote_begin(mm));rendezvous();return NULL;
+}
 int main(void)
 {
     mm_test_attach(0);
@@ -36,8 +47,29 @@ int main(void)
     uint64_t address,context;assert(!kernel_mm_context(&mm,&context));mm_test_context=context;
     assert(!kernel_mm_mmap_anonymous(&mm,0x40000,2*BOAROS_PAGE_SIZE,
         KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&address));
+    pthread_t borrower;assert(!pthread_barrier_init(&core_barrier,NULL,2));
+    assert(!pthread_create(&borrower,NULL,remote_borrower,&mm));
+    rendezvous();assert(!kernel_mm_core_begin(&mm));rendezvous();rendezvous();
+    assert(kernel_mm_core_begin(&mm));rendezvous();rendezvous();
+    assert(!pthread_join(borrower,NULL));kernel_mm_core_end(&mm);
+    assert(!pthread_barrier_destroy(&core_barrier));
+    assert(kernel_mm_core_remote_begin(&mm));
+    assert(!kernel_mm_core_begin(&mm));
+    kernel_mm_core_remote_end(&mm);
+    assert(kernel_mm_core_begin(&mm));
+    assert(!kernel_mm_core_remote_begin(&mm));
+    assert(!kernel_mm_core_begin(&mm));
+    kernel_mm_core_end(&mm);
+    assert(kernel_mm_core_remote_begin(&mm));
+    kernel_mm_core_remote_end(&mm);
+    puts("MM core excludes active/new remote borrowers and releases admission");
     unsigned char value=41,got=0;size_t copied;
     assert(!kernel_mm_remote_transfer(&mm,address,&value,1,1,0,&copied)&&copied==1);
+    struct kernel_mm_user_pin pending_write={0};
+    assert(!kernel_mm_pin_user_page(&mm,address,KERNEL_MM_WRITE,&pending_write));
+    assert(!kernel_mm_core_begin(&mm));
+    kernel_mm_unpin_user_page(&pending_write);
+    assert(kernel_mm_core_begin(&mm));kernel_mm_core_end(&mm);
     assert(!kernel_mm_mprotect(&mm,address,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_EXECUTE));
     assert(!kernel_mm_fork(&child,&mm));
     assert(kernel_mm_remote_transfer(&child,address,&value,1,1,0,&copied)==-KERNEL_EFAULT&&!copied);

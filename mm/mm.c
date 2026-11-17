@@ -135,6 +135,7 @@ struct kernel_mm_record {
     uint64_t futex_id;
     uint32_t references;
     uint32_t users;
+    uint32_t core_remote; /* high bit: dump owner, low bits: remote writers */
     struct kernel_raw_rwlock metadata;
     uint64_t access_pins, write_pins;
     struct kernel_rwlock operations;
@@ -6742,6 +6743,39 @@ static enum kernel_mm_status resolve_user_fault(struct kernel_mm *mm,
             (huge_vma(&view.vma) && kernel_io_context_current()->user_pins)) return status;
         fault_retry(operation.record, address);
     }
+}
+
+#define MM_CORE_ACTIVE UINT32_C(0x80000000)
+int kernel_mm_core_begin(struct kernel_mm *mm)
+{
+    struct kernel_mm_record *record;
+    if (resolve_record(mm,&record) || mm->state!=KERNEL_MM_LIVE) return 0;
+    { KERNEL_RAW_READ_SCOPE(raw,&record->metadata);
+      if (record->write_pins) return 0; }
+    uint32_t expected=0;
+    return __atomic_compare_exchange_n(&record->core_remote,&expected,MM_CORE_ACTIVE,
+        0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);
+}
+void kernel_mm_core_end(struct kernel_mm *mm)
+{
+    if (__atomic_exchange_n(&mm->record->core_remote,0,__ATOMIC_RELEASE)!=MM_CORE_ACTIVE)
+        __builtin_trap();
+}
+int kernel_mm_core_remote_begin(struct kernel_mm *mm)
+{
+    struct kernel_mm_record *record=mm->record;
+    uint32_t old=__atomic_load_n(&record->core_remote,__ATOMIC_ACQUIRE);
+    do {
+        if (old&MM_CORE_ACTIVE) return 0;
+        if (old==MM_CORE_ACTIVE-1) __builtin_trap();
+    } while (!__atomic_compare_exchange_n(&record->core_remote,&old,old+1,
+                 1,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE));
+    return 1;
+}
+void kernel_mm_core_remote_end(struct kernel_mm *mm)
+{
+    uint32_t old=__atomic_fetch_sub(&mm->record->core_remote,1,__ATOMIC_RELEASE);
+    if (!old || (old&MM_CORE_ACTIVE)) __builtin_trap();
 }
 
 /* Both debugger and process_vm use the existing fault and actual-page borrow.

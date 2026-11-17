@@ -2612,6 +2612,7 @@ static void kernel_thread_finish(
         switch_to_fatal_idle(status);
     }
 
+    if (current->arch.user_mode) process_core_rendezvous(current);
     if (current->arch.user_mode) ptrace_begin_exit(current,user_wait_status(completion));
     process_begin_exit(current, completion);
     /* Undo is visible before publishing exit or waking a child-TID joiner. */

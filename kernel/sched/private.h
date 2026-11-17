@@ -190,6 +190,7 @@ kernel_pid_t process_identity_number(const struct kernel_task *task, enum kernel
 uint64_t process_identity_generation(const struct kernel_task *task);
 void process_group_initialize(struct kernel_task *task);
 int process_core_dump(struct kernel_task *, unsigned);
+void process_core_rendezvous(struct kernel_task *);
 void process_group_request_exit(struct kernel_task *task,
                                 enum kernel_thread_exit_reason reason,
                                 uint64_t status, uint64_t detail);

@@ -37,13 +37,15 @@ def workload_source(name):
     return ROOT / ({'futex_vector':'tests/workloads/futex/vector.c','pi':'tests/workloads/futex/pi.c','mount_bind':'tests/workloads/resource/mount_bind.c','mount_move':'tests/workloads/resource/mount_move.c','exec_capacity':'tests/workloads/resource/exec_capacity.c','execveat':'tests/workloads/resource/execveat.c','chroot':'tests/workloads/resource/chroot.c','proc_thread_resources':'tests/workloads/resource/proc_thread_resources.c','core_dump':'tests/workloads/resource/core_dump.c','cgroup':'tests/workloads/resource/cgroup.c','clone_resources':'tests/workloads/resource/clone_resources.c','remount':'tests/workloads/resource/remount.c','mount_attributes':'tests/workloads/resource/mount_attributes.c','shm_query':'tests/workloads/resource/shm_query.c','shm_lock':'tests/workloads/resource/shm_lock.c','madvise':'tests/workloads/resource/madvise.c','acl':'tests/workloads/resource/acl.c','vdso_dontneed':'tests/workloads/resource/vdso_dontneed.c','kcmp':'tests/workloads/resource/kcmp.c','ioprio':'tests/workloads/resource/ioprio.c','memlock':'tests/workloads/resource/memlock.c','pidfd':'tests/workloads/resource/pidfd.c','nproc':'tests/workloads/resource/nproc.c','rt':'tests/workloads/resource/rt.c','cpu':'tests/workloads/resource/cpu.c','ipc_proc':'tests/workloads/ipc/proc_sysvipc.c','memory':'tests/workloads/resource/memory.c','mremap':'tests/workloads/mremap/caller.c','futex':'tests/workloads/futex/caller.c','posix':'tests/workloads/signal/posix.c','queued':'tests/workloads/signal/queued.c','altstack':'tests/workloads/signal/altstack.c','event':'tests/workloads/event/caller.c','pipe':'tests/workloads/pipe/caller.c','epoll':'tests/workloads/epoll/delivery.c'}.get(name,f'tests/workloads/network/{name}.c'))
 
 def core_dump_extract(image,folder):
-    core=folder/'core.elf'
-    subprocess.run(['debugfs','-R',f'dump /core-test/core {core}',str(image)],
-                   stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True)
-    with (folder/'core-readelf.log').open('w') as log:
-        subprocess.run(['readelf','-h','-l','-n',str(core)],stdout=log,stderr=subprocess.STDOUT,check=True)
-    if 'NT_PRSTATUS' not in (folder/'core-readelf.log').read_text():
-        raise RuntimeError('core lacks native PRSTATUS')
+    for name,expected in (('core',1),('core-threads',2)):
+        core=folder/(name+'.elf')
+        subprocess.run(['debugfs','-R',f'dump /core-test/{name} {core}',str(image)],
+                       stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True)
+        logpath=folder/(name+'-readelf.log')
+        with logpath.open('w') as log:
+            subprocess.run(['readelf','-h','-l','-n',str(core)],stdout=log,stderr=subprocess.STDOUT,check=True)
+        if logpath.read_text().count('NT_PRSTATUS')!=expected:
+            raise RuntimeError(f'{name} lacks {expected} native PRSTATUS notes')
 
 def sendfile_tcp_output(raw,performance):
     lines=raw.replace('\r','').splitlines()

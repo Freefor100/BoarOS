@@ -20,7 +20,7 @@
 
 用户返回直接观察线程及组 pending 中未屏蔽的位；没有可交付信号、故障、退出请求或临时掩码恢复时立即返回，不取得锁；完整事件交付保留独立调用边界，使其临时载荷和保存寄存器留在有事件的路径。两架构返回尾先完成信号选择与重启决定，只有实际构造 handler 帧时才查询 MM；普通返回、忽略和重启不借用未使用的 MM。等待者的 wait_mask 不参与交付判断，被屏蔽的信号仍留给 sigtimedwait。需要处理事件时在调度 raw 内重取位与载荷；并发新增信号仍通过既有通知请求返回检查。
 
-默认动作包括忽略、继续、停止、终止和core动作；单线程且独占 MM 时支持下述初始 ELF core 文件；wait 状态反映实际是否写出转储头与 notes，不能把收到 core 信号当作成功。SIGCONT 清除所有 pending stop 信号并恢复 stopped task；发送任一 stop 信号清除 pending SIGCONT。这些取消规则不依赖信号是否被阻塞。孤儿停止组的退出/reparent 事件发送 SIGHUP 后 SIGCONT；SI_KERNEL=128 同时贯通 sigtimedwait 与 SA_SIGINFO 用户帧。已孤儿组的默认 TSTP/TTIN/TTOU 不再停止任务，SIGSTOP 不受此规则影响。
+默认动作包括忽略、继续、停止、终止和core动作；MM 的所有执行者属于同一线程组时支持下述 ELF core 文件；wait 状态反映实际是否写出转储头与 notes，不能把收到 core 信号当作成功。SIGCONT 清除所有 pending stop 信号并恢复 stopped task；发送任一 stop 信号清除 pending SIGCONT。这些取消规则不依赖信号是否被阻塞。孤儿停止组的退出/reparent 事件发送 SIGHUP 后 SIGCONT；SI_KERNEL=128 同时贯通 sigtimedwait 与 SA_SIGINFO 用户帧。已孤儿组的默认 TSTP/TTIN/TTOU 不再停止任务，SIGSTOP 不受此规则影响。
 
 SIGCHLD 的默认忽略不同于显式 SIG_IGN：默认仍保留 zombie 供 wait4 回收；显式 SIG_IGN 或 SA_NOCLDWAIT 在全组退出资源清理完成后自动回收。SA_NOCLDWAIT 不抑制退出通知，包括被阻塞的默认 SIGCHLD；SA_NOCLDSTOP 单独控制 stop/continue 通知。默认 SIGCHLD 被阻塞时，停止和继续也进入 pending，显式 SIG_IGN 则不进入。清理失败保留 task/owner，由 cleanup context 重试，不能丢失父进程的唤醒。kill 使用组 pending，tkill/tgkill 与同步产生的 SIGPIPE 使用线程 pending；SIGKILL 和默认致命动作终止全组。用户发送（含 signal=0）按调用者 real/effective UID 与目标 real/saved UID、CAP_KILL 判断；同线程组以及同 session 的 SIGCONT 保留对应许可。进程组内至少一个目标获准即成功，只有存在目标且全部无权限时返回 EPERM。内核产生的 TTY、故障和定时器事件沿其原有来源递送。 指定 PID/TID 的进程定向发送，授权和 UID 计费使用原目标线程；共享队列归组容器，唤醒者另行选择。线程用原始 syscall 改成不同身份时，也不会把这三个对象的身份混用。
 
@@ -161,18 +161,26 @@ FP/LSX/LASX记录、pending异常、首用与宽度升级和owner切换见[LA浮
 `tests/workloads/signal/altstack.c`对照两架构Linux，覆盖登记ABI、嵌套、普通栈溢出、坏备用栈、可读无效与不可读恢复字段、fork/vfork/线程及非组长exec。LA在激活FPU/LSX/LASX后，另检查4KiB备用栈上的实际帧（FPU 880、LSX 1136、LASX 1648字节）及不足该宽度一帧的边界，父进程先取得成功构帧记录，再判定后续SIGSEGV。RV观察构建记录各在线核的构帧和sigreturn；复用composition的真实页pin暂停点检查mprotect已park等待，以及munmap返回后物理页仍由pin保活，再放行复制。共同状态检查入口为`make test-signal-stack-host`（4/16KiB页）；真实多核入口复用`tests/userland/run.py --workload altstack --observe`。
 
 
-## 初始 ELF core 文件
+## ELF core 文件与线程组退出
 
-默认 core 动作在释放 MM 前同步写当前目录的 `core`，不经过用户 FD 表。文件提供目标架构的 ELF64 `ET_CORE`、崩溃线程整数 `NT_PRSTATUS`，以及保留起址、大小和读写执行权限的 `PT_LOAD`。`MADV_DONTDUMP` 和 vvar 区域只保留映射描述、不输出内容。只在异常退出执行这一流程，普通 syscall/调度不新增状态或分配。
+默认 core 动作在释放 MM 前同步写当前目录的 `core`，不经过用户 FD 表。文件提供目标架构的 ELF64 `ET_CORE`、每个停驻线程的整数 `NT_PRSTATUS`（崩溃线程在先），以及保留起址、大小和读写执行权限的 `PT_LOAD`。`MADV_DONTDUMP` 和 vvar 区域只保留映射描述、不输出内容。只在异常退出执行这一流程，普通 syscall/调度不新增扫描或分配；线程组长仅保留一个空 session 指针。
 
 仅 `PR_GET_DUMPABLE == 1`、CORE 软限额至少一个基页且 FSIZE 非零时尝试。输出逐段受两个软限额最小值限制；文件过小、目录不可写、空间不足或 I/O 失败不阻止进程退出，已写前缀可能保留。拒绝 symlink、非普通文件、多硬链接、非当前 fsuid 拥有或模式不为 0600 的文件；通过检查后才截断旧文件。新建模式为 0600。成功形成 notes 后才报告 WCOREDUMP/CLD_DUMPED，后续数据失败可能留下不完整 core，与成功完成全部 payload 不等价。
 
 逐页复用一个任务 scratch 页；没有整份地址空间复制。匿名非驻留页不触发缺页分配，全零页以文件空洞表达，结束时扩展逻辑大小。映射快照持有文件引用，所有正常错误路径关闭文件、释放 scratch 和快照引用。
 
+崩溃 owner 在 scheduler wait domain 中同时发布 session 和 group-exiting，禁止新的 clone/exec 发布。现有终止路径打断同组成员的可中断等待、停止态和远端用户执行；每个成员到达退出边界后保存自己的整数寄存器，再等待 owner 结束。这个边界早于 ptrace exit 通知、robust futex、clear_child_tid 和 MM 释放，因此不会用“其他线程已经销毁后的地址空间”冒充完整线程快照。线程从不同 CPU 逐个停驻，并非保证所有寄存器属于同一个硬件时刻；只有全部成员停驻后才枚举映射并输出内存。
+
+停驻最多等待 5 秒，超时或任何准备/写出失败均撤销 session、唤醒已经停驻的线程继续原来的致命退出。等待者只检查组长上的 session 身份，不在释放后解引用 session。notes 存储按本次线程数分配，结束统一释放；没有每次调度的冻结检查或常驻 worker。
+
+开始读取前，MM 拒绝仍持有用户写 pin 或在途 `process_vm_*` borrower 的转储。远程借用与 dump 使用一个原子排他登记；转储期间新 `process_vm_*` 请求返回 ESRCH，在途请求使本次 dump 放弃而不是等待。借用在 syscall 的正常与异常 abort 路径归还。当前有 tracer 或正在访问 tracee 的线程组不转储，session 存续期间拒绝新 ptrace attach，避免寄存器和远程写的另一个 owner 跨睡眠修改现场。
+
 此阶段不是完整 Linux core 支持：
 
-- 只接受线程组唯一成员且 MM live-user 数为 1；多线程或跨进程 CLONE_VM 共享 MM 不写文件。后续需要全 MM 执行者停驻协议，登记崩溃 owner，冻结所有线程寄存器并阻止新 clone/exec，确认旧 CPU 已交出用户执行资格，再采集每个线程 notes。不能仅杀掉其他线程后声称保留了它们崩溃时的状态。
-- 当前输出除 DONTDUMP/vvar 外的映射内容，尚无 Linux 默认 `coredump_filter=0x33` 的文件映射选择、可配置过滤器、`core_pattern`/pipe helper。没有 NT_FILE、AUXV、浮点/SIMD notes；PRSTATUS 的 CPU times 未填充。调试器需要另行加载对应可执行文件，本阶段不能声称完整线程或浮点状态。
+- 支持组长或非组长崩溃，以及同组 blocked/running 成员。仍拒绝跨进程 CLONE_VM/vfork 共享 MM、已经进入资源清理的成员和上述 ptrace 情形。跨组共享 MM 需要独立的 MM 执行者索引及终止/恢复协议，不能把不属于致命信号目标组的进程直接杀掉。
+- 当前输出除 DONTDUMP/vvar 外的映射内容，尚无 Linux 默认 `coredump_filter=0x33` 的文件映射选择、可配置过滤器、`core_pattern`/pipe helper。没有 NT_FILE、AUXV、浮点/SIMD notes；PRSTATUS 的 CPU times 未填充。调试器需要另行加载对应可执行文件，本阶段不能声称浮点或完整 Linux 调试信息。
 - 其他进程对共享文件页的写入与 core 读取可交错，没有把全系统共享内存冻结。恶意同 UID 进程对输出文件的并发修改也不由此机制防护。
 
-定向入口是 `tests/userland/run.py --only boaros --workload core_dump --arch riscv|loongarch --cpus N --memory 512M --kernel ...`。测试核对内容、权限、DONTDUMP、限额、dumpable、链接安全和旧文件替换；双线程案例只允许完整多线程 notes 或完全拒绝，不能产生单线程伪快照。runner 导出 `core.elf` 并运行宿主 `readelf -h -l -n`。
+定向入口是 `tests/userland/run.py --only boaros --workload core_dump --arch riscv|loongarch --cpus N --memory 512M --kernel ...`。测试核对内容、权限、DONTDUMP、限额、dumpable、链接安全和旧文件替换；双线程案例严格要求两份不同 TID 的 notes 和非零 PC/SP，分别覆盖 pipe 阻塞、用户态运行和非组长崩溃，并检查写文件失败后退出及跨组 CLONE_VM 拒绝。runner 导出 `core.elf`、`core-threads.elf`，对两个文件运行宿主 `readelf -h -l -n` 并检查 notes 数量。`tests/host/mm-remote.sh` 用两线程握手检查在途远程借用、新借用、写 pin 和释放后的重新接纳（4K/16K）。
+
+调试时将对应 workload ELF 与 core 一同交给目标 GDB，例如 `riscv64-linux-gdb program core-threads.elf`，再执行 `info threads` 与 `thread apply all info registers pc sp`。RV 已用现有 GDB 直接识别两条线程及寄存器。LA 输出符合 Linux 的 480 字节 PRSTATUS；本环境 GDB 16.3 的旧 BFD 只接受 472 字节，原始 core 会报找不到通用寄存器。这是上游记录的 [LoongArch PRSTATUS 长度问题](https://sourceware.org/pipermail/binutils/2025-November/145528.html)，需要包含该修正的 debugger；不能为适配旧工具删去 Linux ABI 字段。LA guest 已检查两线程寄存器，readelf 能解析 notes，但本环境没有完成原始 LA core 的 GDB 消费验证。宿主 Linux 能验证双线程 SIGABRT 退出，但不会生成 core，故没有正向 Linux 文件内容对照。

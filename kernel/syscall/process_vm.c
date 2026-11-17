@@ -7,6 +7,7 @@
 
 struct kernel_remote_memory_request {
     struct kernel_mm remote;
+    int remote_registered;
     struct kernel_heap *heap;
     struct kernel_uaccess_iov_snapshot local_iov, remote_iov;
     struct kernel_task_io_buffer scratch;
@@ -16,6 +17,9 @@ int kernel_remote_memory_abort(struct kernel_task *task)
 {
     struct kernel_remote_memory_request *call=task->remote_memory_request;
     if (!call) return 0;
+    if (call->remote_registered) {
+        kernel_mm_core_remote_end(&call->remote);call->remote_registered=0;
+    }
     if (call->scratch.allocator) kernel_task_io_buffer_release(&call->scratch);
     kernel_uaccess_iov_cleanup(&call->remote_iov,call->heap);
     kernel_uaccess_iov_cleanup(&call->local_iov,call->heap);
@@ -80,6 +84,8 @@ static int64_t transfer(struct kernel_task *caller,const struct kernel_syscall_r
     if (result || !call->remote_iov.total) goto out;
     result=kernel_task_remote_mm_acquire((int32_t)request->arguments[0],&call->remote);
     if (result) goto out;
+    if (!kernel_mm_core_remote_begin(&call->remote)) { result=-KERNEL_ESRCH;goto out; }
+    call->remote_registered=1;
     if (kernel_task_io_buffer_acquire(&call->scratch,mm->allocator)) {
         result=-KERNEL_ENOMEM;goto out;
     }
