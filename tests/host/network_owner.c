@@ -22,7 +22,7 @@ static err_t held_completion_tcp_output(struct tcp_pcb *, u8_t);
 #include "../../kernel/pid.c"
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %s:%d: %s\n", __func__, __LINE__, #x); exit(1); } } while (0)
-static struct {unsigned references,calls;uint32_t keep;} raw_filter_test;
+static struct {unsigned references,calls;uint32_t keep;} raw_filter_test,mld_filter_test[2];
 static pthread_mutex_t raw_gate=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t raw_changed=PTHREAD_COND_INITIALIZER;
 static unsigned raw_pause,raw_filter_entered,raw_close_waiting,raw_resume;
@@ -30,11 +30,19 @@ static _Thread_local unsigned raw_closing_actor;
 static struct kernel_socket *accept_binding_probe;
 static unsigned accept_binding_changed;
 void __wrap_kernel_bpf_program_get(struct kernel_bpf_program *program)
-{CHECK(program==(void *)&raw_filter_test);__atomic_fetch_add(&raw_filter_test.references,1,__ATOMIC_RELAXED);}
+{for(unsigned i=0;i<2;i++)if(program==(void *)&mld_filter_test[i]){mld_filter_test[i].references++;return;}
+ CHECK(program==(void *)&raw_filter_test);__atomic_fetch_add(&raw_filter_test.references,1,__ATOMIC_RELAXED);}
 void __wrap_kernel_bpf_program_put(struct kernel_bpf_program *program)
-{CHECK(program==(void *)&raw_filter_test && __atomic_fetch_sub(&raw_filter_test.references,1,__ATOMIC_RELAXED));}
+{for(unsigned i=0;i<2;i++)if(program==(void *)&mld_filter_test[i]){CHECK(mld_filter_test[i].references--);return;}
+ CHECK(program==(void *)&raw_filter_test && __atomic_fetch_sub(&raw_filter_test.references,1,__ATOMIC_RELAXED));}
 uint32_t __wrap_kernel_bpf_filter(struct kernel_bpf_program *program,const struct kernel_bpf_packet *packet)
 {
+    for(unsigned i=0;i<2;i++)if(program==(void *)&mld_filter_test[i]) {
+        CHECK(mld_filter_test[i].references && packet->protocol==0x86dd && packet->payload_offset==8 && packet->length==24);
+        unsigned char data[16];CHECK(!packet->read(packet->object,8,data,16));
+        for(unsigned j=0;j<16;j++)CHECK(data[j]==(unsigned char)((j+8)*13));
+        mld_filter_test[i].calls++;return mld_filter_test[i].keep;
+    }
     CHECK(program==(void *)&raw_filter_test && raw_filter_test.references);
     CHECK(packet->protocol==0x0800 && packet->network_offset==0 && packet->payload_offset==28 && packet->length>=28);
     unsigned char header[20];CHECK(!packet->read(packet->object,0,header,sizeof(header)));
@@ -166,7 +174,7 @@ static unsigned heap_live, dma_eligible, nic_full, copy_attempts, copied_packets
 static void (*heap_release_once)(void *);
 static uint64_t clock_ns = 1000000000ULL;
 static unsigned char captured[1536],captured_dad_target[16];
-static unsigned captured_dad_packets,captured_router_probes;
+static unsigned captured_dad_packets,captured_router_probes,captured_non_mld_packets;
 static unsigned fixed_random;
 static uint32_t random_value;
 
@@ -421,6 +429,12 @@ int virtio_net_send_copy(struct virtio_net_device *device, uint32_t size,
     if (nic_full) return -KERNEL_EAGAIN;
     CHECK(size <= sizeof(captured) && copy(context, captured, size));
     captured_size = size;
+    unsigned icmp_at=0;
+    if(size>54 && captured[12]==0x86 && captured[13]==0xdd) {
+        if(captured[20]==58)icmp_at=54;
+        else if(size>62 && captured[20]==0 && captured[54]==58 && captured[55]==0)icmp_at=62;
+    }
+    if(!icmp_at || captured[icmp_at]<130 || captured[icmp_at]>132)captured_non_mld_packets++;
     if(size>=78 && captured[12]==0x86 && captured[13]==0xdd && captured[20]==58 && captured[54]==135 &&
        !memcmp(captured+22,(unsigned char[16]){0},16)) {
         memcpy(captured_dad_target,captured+62,16);captured_dad_packets++;
@@ -3773,13 +3787,15 @@ static void ipv4_options(void)
     puts("PASS IPv4 options: physical and lo broadcast permission, TTL on wire, multicast source, stable binding and capability changes");
 }
 
+static struct pbuf *last_ipv6_ingress;
 static void ipv6_inject_protocol(struct netif *n,const ip6_addr_t *src,const ip6_addr_t *dst,
                         const unsigned char *body,unsigned length,unsigned protocol,unsigned checksum)
 {
     static const unsigned char mac[6]={0x52,0x55,0,0,0,2};
     struct pbuf *p=pbuf_alloc(PBUF_RAW,(u16_t)(54+length),PBUF_RAM);CHECK(p);
     unsigned char *bytes=p->payload;memset(bytes,0,54+length);
-    memcpy(bytes,n->hwaddr,6);memcpy(bytes+6,mac,6);bytes[12]=0x86;bytes[13]=0xdd;
+    memcpy(bytes,n->hwaddr,6);if(ip6_addr_ismulticast(dst)){bytes[0]=bytes[1]=0x33;memcpy(bytes+2,(const unsigned char *)dst->addr+12,4);}
+    memcpy(bytes+6,mac,6);bytes[12]=0x86;bytes[13]=0xdd;
     bytes[14]=0x60;bytes[18]=length>>8;bytes[19]=length;bytes[20]=protocol;bytes[21]=255;
     memcpy(bytes+22,src->addr,16);memcpy(bytes+38,dst->addr,16);memcpy(bytes+54,body,length);
     CHECK(!pbuf_remove_header(p,54));
@@ -3787,7 +3803,7 @@ static void ipv6_inject_protocol(struct netif *n,const ip6_addr_t *src,const ip6
     if(checksum==1)sum^=0x1234;
     if(checksum==2 && protocol==17 && !sum)sum=0xffff;
     memcpy(bytes+54+(protocol==17?6:2),&sum,2);
-    CHECK(!pbuf_add_header(p,54));CHECK(ethernet_input(p,n)==ERR_OK);
+    CHECK(!pbuf_add_header(p,54));last_ipv6_ingress=p;CHECK(ethernet_input(p,n)==ERR_OK);
 }
 static void ipv6_inject(struct netif *n,const ip6_addr_t *src,const ip6_addr_t *dst,
                         const unsigned char *body,unsigned length)
@@ -3799,7 +3815,8 @@ static void ra_wire(struct netif *n,const ip6_addr_t *src,const ip6_addr_t *dst,
 {
     unsigned ext=fragment==2?16:fragment?8:0,total=54+ext+length;
     unsigned char bytes[1024]={0};CHECK(total<=sizeof(bytes));
-    memcpy(bytes,n->hwaddr,6);memcpy(bytes+6,(unsigned char[]){0x52,0x55,0,0,0,2},6);
+    memcpy(bytes,n->hwaddr,6);if(ip6_addr_ismulticast(dst)){bytes[0]=bytes[1]=0x33;memcpy(bytes+2,(const unsigned char *)dst->addr+12,4);}
+    memcpy(bytes+6,(unsigned char[]){0x52,0x55,0,0,0,2},6);
     bytes[12]=0x86;bytes[13]=0xdd;bytes[14]=0x60;
     bytes[18]=(ext+length)>>8;bytes[19]=ext+length;bytes[20]=fragment?44:58;bytes[21]=hop;
     memcpy(bytes+22,src->addr,16);memcpy(bytes+38,dst->addr,16);
@@ -4041,6 +4058,145 @@ static void ipv6_ra(void)
     puts("PASS RA full-wire preflight/checksum/fragments, L/A, DAD, lifetimes, bounded coexistence, MTU and teardown");
 }
 
+static struct kernel_socket *mld_socket(unsigned port)
+{
+    struct kernel_socket *s=NULL;CHECK(!kernel_socket_create(&test_heap,10,SOCKET_DGRAM,0,&s));
+    CHECK(!kernel_socket_set_option(s,KERNEL_SOCKET_REUSEADDR,1));
+    struct kernel_socket_address any={.family=10,.port=port};CHECK(!kernel_socket_bind(s,&any));return s;
+}
+static void ipv6_mld(void)
+{
+    kernel_socket_network_initialize();
+    struct virtio_net_device device={.mac={0x52,0x54,0,0x12,0x34,0x56}};
+    struct kernel_network network={.device=&device};struct netif *n=&network.interface;
+    ip4_addr_t local={lwip_htonl(0x0a4d0002)},mask={lwip_htonl(0xffffff00)},zero={0};
+    CHECK(netif_add(n,&local,&mask,&zero,&network,interface_init,ethernet_input));
+    netif_create_ip6_linklocal_address(n,1);netif_set_up(n);netif_set_link_up(n);
+    for(unsigned tick=0;tick<3;tick++)nd6_tmr();
+    ip6_addr_t peer,group;CHECK(ip6addr_aton("fe80::2",&peer) && ip6addr_aton("ff02::1234",&group));
+    ip6_addr_assign_zone(&peer,IP6_UNICAST,n);ip6_addr_assign_zone(&group,IP6_MULTICAST,n);
+    unsigned index=netif_get_index(n);
+    struct kernel_socket *a=mld_socket(19300),*b=mld_socket(19300);
+    CHECK(!kernel_socket_ipv6_membership(a,(void *)group.addr,index,0));
+    CHECK(kernel_socket_ipv6_membership(a,(void *)group.addr,index,0)==-KERNEL_EADDRINUSE);
+    CHECK(mld6_lookfor_group(n,&group));
+    unsigned char body[24]={0x4b,0x65,0x4b,0x64,0,24};
+    for(unsigned i=8;i<sizeof(body);i++)body[i]=(unsigned char)(i*13);
+    ipv6_inject_protocol(n,&peer,&group,body,sizeof(body),17,2);
+    CHECK(a->rx_bytes==16 && b->rx_bytes==16);
+    CHECK(a->packets_head->payload==last_ipv6_ingress && a->packets_head->payload==b->packets_head->payload && a->packets_head->payload->ref==2 &&
+      a->packets_head->consumed==8 && b->packets_head->consumed==8 && a->packets_head->payload->tot_len==24);
+    struct pbuf *shared=a->packets_head->payload;
+    unsigned char output[16]={0};struct kernel_open_file_description *pin=(void *)a;
+    struct kernel_socket_read_request read={0};struct kernel_socket_message peek={.flags=KERNEL_SOCKET_MSG_PEEK};
+    CHECK(kernel_socket_reserve_read(a,NULL,&read,&pin,4,0,&peek)==4);
+    uint32_t actual;struct kernel_socket_address source;
+    kernel_socket_read_info(&read,&source,&actual);CHECK(actual==16 && source.port==19301 && source.scope==index);
+    kernel_socket_copy_read(&read,0,output,4);CHECK(!memcmp(output,body+8,4));kernel_socket_finish_read(&read,0);
+    CHECK(a->rx_bytes==16 && shared->ref==2);
+    CHECK(kernel_socket_reserve_read(a,NULL,&read,&pin,4,0,NULL)==4);
+    kernel_socket_copy_read(&read,0,output,4);CHECK(!memcmp(output,body+8,4));kernel_socket_finish_read(&read,0);
+    CHECK(!a->rx_bytes && b->rx_bytes==16);tcp_more_service();CHECK(shared->ref==1);
+    raw_drain(b);tcp_more_service();
+    CHECK(!kernel_socket_set_option(b,KERNEL_SOCKET_IPV6_MULTICAST_ALL,0));
+    ipv6_inject_protocol(n,&peer,&group,body,sizeof(body),17,2);CHECK(a->rx_bytes==16 && !b->rx_bytes);raw_drain(a);tcp_more_service();
+    CHECK(!kernel_socket_ipv6_membership(b,(void *)group.addr,index,0));
+    CHECK(!kernel_socket_ipv6_membership(a,(void *)group.addr,index,1));
+    CHECK(!kernel_socket_set_option(a,KERNEL_SOCKET_IPV6_MULTICAST_ALL,0));
+    ipv6_inject_protocol(n,&peer,&group,body,sizeof(body),17,2);CHECK(!a->rx_bytes && b->rx_bytes==16);raw_drain(b);tcp_more_service();
+    CHECK(!kernel_socket_ipv6_membership(b,(void *)group.addr,index,1));CHECK(!mld6_lookfor_group(n,&group));
+    ipv6_inject_protocol(n,&peer,&group,body,sizeof(body),17,2);CHECK(!a->rx_bytes && !b->rx_bytes);
+    CHECK(!kernel_socket_ipv6_membership(a,(void *)group.addr,index,0));
+    CHECK(!kernel_socket_ipv6_membership(b,(void *)group.addr,index,0));
+    /* Per-recipient BPF lengths are metadata; one immutable UDP pbuf survives. */
+    for(unsigned i=0;i<2;i++)mld_filter_test[i].references=1;
+    mld_filter_test[0].keep=11;mld_filter_test[1].keep=15;
+    CHECK(!kernel_socket_filter_set(a,(void *)&mld_filter_test[0]));CHECK(!kernel_socket_filter_set(b,(void *)&mld_filter_test[1]));
+    ipv6_inject_protocol(n,&peer,&group,body,sizeof(body),17,2);
+    CHECK(a->rx_bytes==3 && b->rx_bytes==7 && a->packets_head->payload==last_ipv6_ingress && a->packets_head->payload==b->packets_head->payload);
+    CHECK(a->packets_head->length==11 && b->packets_head->length==15 && a->packets_head->payload->tot_len==24);
+    pin=(void *)b;CHECK(kernel_socket_reserve_read(b,NULL,&read,&pin,16,0,NULL)==7);
+    kernel_socket_copy_read(&read,0,output,7);CHECK(!memcmp(output,body+8,7));kernel_socket_finish_read(&read,0);raw_drain(a);tcp_more_service();
+    mld_filter_test[0].keep=1;mld_filter_test[1].keep=UINT32_MAX;
+    ipv6_inject_protocol(n,&peer,&group,body,sizeof(body),17,2);
+    CHECK(a->rx_bytes==1 && b->rx_bytes==16 && a->packets_head->length==8 && a->packets_head->consumed==8);
+    pin=(void *)a;CHECK(kernel_socket_reserve_read(a,NULL,&read,&pin,16,0,NULL)==0);
+    kernel_socket_read_info(&read,&source,&actual);CHECK(!actual);kernel_socket_finish_read(&read,0);raw_drain(b);tcp_more_service();
+    mld_filter_test[0].keep=0;mld_filter_test[1].keep=UINT32_MAX;
+    ipv6_inject_protocol(n,&peer,&group,body,sizeof(body),17,2);CHECK(!a->rx_bytes && b->rx_bytes==16);raw_drain(b);tcp_more_service();
+    mld_filter_test[0].keep=UINT32_MAX;a->rx_limit=1;
+    ipv6_inject_protocol(n,&peer,&group,body,sizeof(body),17,2);CHECK(!a->rx_bytes && b->rx_bytes==16);raw_drain(b);tcp_more_service();a->rx_limit=65536;
+    /* Connected source and bound-interface selection still precede fanout. */
+    struct kernel_socket *c=NULL,*d=mld_socket(19300);
+    CHECK(!kernel_socket_create(&test_heap,10,SOCKET_DGRAM,0,&c));CHECK(!kernel_socket_set_option(c,KERNEL_SOCKET_REUSEADDR,1));
+    struct kernel_socket_address group_bind={.family=10,.port=19300,.scope=index};memcpy(group_bind.bytes,group.addr,16);
+    CHECK(!kernel_socket_bind(c,&group_bind));
+    struct kernel_socket_address remote={.family=10,.scope=index,.port=19302};memcpy(remote.bytes,peer.addr,16);
+    CHECK(!kernel_socket_connect(c,&remote,0));CHECK(!kernel_socket_set_bound_device(d,"lo"));
+    uint32_t multicast_index;
+    CHECK(kernel_socket_set_ipv6_multicast_interface(d,257)==-KERNEL_ENODEV);
+    CHECK(kernel_socket_set_ipv6_multicast_interface(d,index)==-KERNEL_EINVAL);
+    CHECK(!kernel_socket_get_ipv6_multicast_interface(d,&multicast_index) && !multicast_index);
+    CHECK(!kernel_socket_set_ipv6_multicast_interface(d,d->bound_device));
+    CHECK(!kernel_socket_set_ipv6_multicast_interface(d,0));
+    ipv6_inject_protocol(n,&peer,&group,body,sizeof(body),17,2);CHECK(!c->rx_bytes && !d->rx_bytes);raw_drain(a);raw_drain(b);tcp_more_service();
+    body[1]++;ipv6_inject_protocol(n,&peer,&group,body,sizeof(body),17,2);CHECK(c->rx_bytes==16 && !d->rx_bytes);
+    raw_drain(a);raw_drain(b);raw_drain(c);tcp_more_service();kernel_socket_destroy(c);kernel_socket_destroy(d);
+    /* Closing one member with a queued shared payload neither drops the other
+     * member's data nor leaves the interface subscribed after the last close. */
+    body[1]--;ipv6_inject_protocol(n,&peer,&group,body,sizeof(body),17,2);
+    shared=b->packets_head->payload;CHECK(shared==a->packets_head->payload && shared->ref==2);
+    pin=(void *)b;CHECK(kernel_socket_reserve_read(b,NULL,&read,&pin,16,0,NULL)==16);
+    /* Deterministic interleaving: B owns an active read request while A's
+     * queue and subscription are destroyed, then B performs the real copy. */
+    kernel_socket_destroy(a);CHECK(shared->ref==1 && mld6_lookfor_group(n,&group));
+    kernel_socket_copy_read(&read,0,output,16);CHECK(!memcmp(output,body+8,16));kernel_socket_finish_read(&read,0);
+    kernel_socket_destroy(b);CHECK(!mld6_lookfor_group(n,&group));
+    CHECK(!mld_filter_test[0].references && !mld_filter_test[1].references);
+    /* MTU below the IPv6 minimum destroys device aggregate memberships,
+     * but keeps socket records. Old owners cannot release a new generation. */
+    a=mld_socket(19300);b=mld_socket(19300);
+    CHECK(!kernel_socket_ipv6_membership(a,(void *)group.addr,index,0));
+    CHECK(!kernel_socket_ipv6_membership(b,(void *)group.addr,index,0));
+    CHECK(!kernel_socket_interface_set_mtu((char[16]){"eth0"},1200));
+    CHECK(!netif_mld6_data(n) && a->ipv6_members && !a->ipv6_members->active &&
+      b->ipv6_members && !b->ipv6_members->active);
+    CHECK(kernel_socket_ipv6_membership(a,(void *)group.addr,index,0)==-KERNEL_EADDRINUSE);
+    CHECK(!kernel_socket_interface_set_mtu((char[16]){"eth0"},1500));
+    for(unsigned tick=0;tick<4;tick++)nd6_tmr();
+    CHECK(!mld6_lookfor_group(n,&group));
+    ipv6_inject_protocol(n,&peer,&group,body,sizeof(body),17,2);
+    CHECK(!a->rx_bytes && !b->rx_bytes);
+    c=mld_socket(19300);
+    CHECK(!kernel_socket_ipv6_membership(c,(void *)group.addr,index,0));
+    CHECK(mld6_lookfor_group(n,&group)->use==1);
+    CHECK(!kernel_socket_ipv6_membership(a,(void *)group.addr,index,1));
+    kernel_socket_destroy(b);
+    CHECK(mld6_lookfor_group(n,&group)->use==1);
+    ipv6_inject_protocol(n,&peer,&group,body,sizeof(body),17,2);
+    CHECK(c->rx_bytes==16);raw_drain(c);raw_drain(a);tcp_more_service();
+    kernel_socket_destroy(a);kernel_socket_destroy(c);
+    CHECK(!mld6_lookfor_group(n,&group));
+    /* DAD cannot advance until its solicited-node membership is actually
+     * admitted. Exhaust the fixed pool, then return it and observe recovery. */
+    void *held[MEMP_NUM_MLD6_GROUP];unsigned used=0;
+    while(used<MEMP_NUM_MLD6_GROUP && (held[used]=memp_malloc(MEMP_MLD6_GROUP)))used++;
+    CHECK(used && used<MEMP_NUM_MLD6_GROUP);
+    ip6_addr_t pending;CHECK(ip6addr_aton("2001:db8:55::55",&pending));
+    CHECK(!kernel_socket_ipv6_address(index,(void *)pending.addr,64,0));
+    unsigned dad=captured_dad_packets;
+    for(unsigned tick=0;tick<3;tick++)nd6_tmr();
+    CHECK(netif_ip6_addr_state(n,1)==IP6_ADDR_TENTATIVE && !n->ip6_mld_joined[1] && captured_dad_packets==dad);
+    for(unsigned i=0;i<used;i++)memp_free(MEMP_MLD6_GROUP,held[i]);
+    nd6_tmr();CHECK(n->ip6_mld_joined[1] && captured_dad_packets==dad+1 &&
+      !memcmp(captured_dad_target,pending.addr,16));
+    for(unsigned tick=0;tick<3;tick++)nd6_tmr();
+    CHECK(ip6_addr_ispreferred(netif_ip6_addr_state(n,1)));
+    CHECK(!kernel_socket_ipv6_address(index,(void *)pending.addr,64,1));
+    netif_poll_all();nd6_cleanup_netif(n);netif_remove(n);CHECK(!heap_live);
+    puts("PASS MLD Ethernet multicast join/leave, ALL, immutable fanout, BPF lengths, peer/device selection, PEEK/truncation and close owners");
+}
+
 static void ipv6_prepare_withdraw(void)
 {
     kernel_socket_network_initialize();boaros_lwip_ip_init(2);
@@ -4177,9 +4333,9 @@ static void ipv6_linklocal(void)
     ip6_addr_t any;ip6_addr_set_zero(&any);
     ip6_addr_set_solicitednode(&dst,netif_ip6_addr(n,0)->addr[3]);
     ip6_addr_assign_zone(&dst,IP6_MULTICAST,n);
-    unsigned sent=copied_packets;
+    unsigned sent=captured_non_mld_packets;
     ipv6_inject(n,&any,&dst,ns,24);
-    CHECK(ip6_addr_isduplicated(netif_ip6_addr_state(n,0)) && copied_packets==sent);
+    CHECK(ip6_addr_isduplicated(netif_ip6_addr_state(n,0)) && captured_non_mld_packets==sent);
     netif_poll_all();nd6_cleanup_netif(n);netif_remove(n);
     CHECK(!heap_live);
     puts("PASS Ethernet IPv6 DAD, duplicate rejection, scoped bind, ND/echo contents, MTU and device failure");
@@ -4415,6 +4571,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "ipv6-source-prefix")) ipv6_source_prefix();
     else if (!strcmp(argv[1], "ipv6-linklocal")) ipv6_linklocal();
     else if (!strcmp(argv[1], "ipv6-ra")) ipv6_ra();
+    else if (!strcmp(argv[1], "ipv6-mld")) ipv6_mld();
     else if (!strcmp(argv[1], "ipv4-options")) ipv4_options();
     else if (!strcmp(argv[1], "async-events")) async_events();
     else if (!strcmp(argv[1], "unix-seq-records")) unix_seqpacket_records();

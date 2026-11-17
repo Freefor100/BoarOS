@@ -80,7 +80,7 @@ void nd6_reachability_hint(const ip6_addr_t *ip6addr);
 #endif /* LWIP_ND6_TCP_REACHABILITY_HINTS */
 void nd6_cleanup_netif(struct netif *netif);
 #if LWIP_IPV6_MLD
-void nd6_adjust_mld_membership(struct netif *netif, s8_t addr_idx, u8_t new_state);
+err_t nd6_adjust_mld_membership(struct netif *netif, s8_t addr_idx, u8_t new_state);
 #endif /* LWIP_IPV6_MLD */
 void nd6_restart_netif(struct netif *netif);
 
