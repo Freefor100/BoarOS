@@ -3299,8 +3299,8 @@ static int ext4_rename_lookup(struct ext4_inode_ref *parent, const char *name,
 	return ext4_result(r, ext4_dir_destroy_result(parent, &result));
 }
 
-int ext4_link_child(const char *mount_point, uint32_t source_inode,
-                   uint32_t parent_inode, const char *name, uint32_t length)
+static int ext4_link_child_mode(const char *mount_point, uint32_t source_inode,
+                   uint32_t parent_inode, const char *name, uint32_t length, bool tmpfile)
 {
     if (!mount_point) return EINVAL;
     struct ext4_mountpoint *mp = ext4_get_mount(mount_point);
@@ -3322,8 +3322,16 @@ int ext4_link_child(const char *mount_point, uint32_t source_inode,
     if (ext4_inode_is_type(ext4_fs_super(fs), source.inode, EXT4_INODE_MODE_DIRECTORY)) {
         r = EPERM; goto Put;
     }
-    /* A removed inode cannot be resurrected; tmpfile is not this API. */
-    if (!ext4_inode_get_links_cnt(source.inode)) { r = ENOENT; goto Put; }
+    /* Only the VFS-owned, unpublished tmpfile entry point may link zero links. */
+    bool unpublished = !ext4_inode_get_links_cnt(source.inode);
+    if (unpublished != tmpfile) { r = ENOENT; goto Put; }
+    if (unpublished) {
+        bool present = false;
+        r = ext4_orphan_contains(fs, source_inode, &present);
+        if (r != EOK || !present) { if (!r) r = EUCLEAN; goto Put; }
+        r = ext4_orphan_prepare_change(&source);
+        if (r != EOK) goto Put;
+    }
     if (ext4_inode_get_links_cnt(source.inode) >= EXT4_LINK_MAX) { r = EMLINK; goto Put; }
     r = ext4_fs_get_inode_ref(fs, parent_inode, &parent);
     if (r != EOK) goto Put;
@@ -3338,6 +3346,11 @@ int ext4_link_child(const char *mount_point, uint32_t source_inode,
     if (r != EOK) goto Put;
     ext4_fs_inode_links_count_inc(&source);
     source.dirty = true;
+    if (unpublished) {
+        r = ext4_orphan_remove(&source);
+        if (r != EOK) goto Put;
+        ext4_inode_set_del_time(source.inode, 0);
+    }
     ext4_touch_inode(mp, &source, EXT4_TIME_CTIME, NULL);
     ext4_touch_inode(mp, &parent, EXT4_TIME_MTIME | EXT4_TIME_CTIME, NULL);
 Put:
@@ -3350,6 +3363,14 @@ Unlock:
     EXT4_MP_UNLOCK(mp);
     return r;
 }
+
+int ext4_link_child(const char *mount, uint32_t source, uint32_t parent,
+                    const char *name, uint32_t length)
+{ return ext4_link_child_mode(mount, source, parent, name, length, false); }
+
+int ext4_tmpfile_link_child(const char *mount, uint32_t source, uint32_t parent,
+                            const char *name, uint32_t length)
+{ return ext4_link_child_mode(mount, source, parent, name, length, true); }
 
 static int ext4_rename_ancestry(struct ext4_fs *fs, uint32_t source, uint32_t current)
 {
@@ -6246,6 +6267,52 @@ int ext4_create_child(const char *mount, uint32_t parent, const char *name,
     }
     if (result == EOK && output) *output = file;
     else if (file.mp) result = ext4_result(result, ext4_fclose(&file));
+    EXT4_MP_UNLOCK(mp);
+    return result;
+}
+
+/* Allocate an anonymous regular inode directly: no transient directory name,
+ * lookup, or unlink. Enrollment and allocation share one journal operation. */
+int ext4_tmpfile_child(const char *mount, uint32_t parent, uint32_t mode,
+    ext4_file *output, struct ext4_inode *initial, uint32_t uid, uint32_t gid)
+{
+    struct ext4_mountpoint *mp = ext4_get_mount(mount);
+    if (!mp || !parent || !output || (mode & 0170000U) != 0100000U) return EINVAL;
+    EXT4_MP_LOCK(mp);
+    struct ext4_inode_ref directory = {0}, ref = {0};
+    ext4_file file = {0};
+    int result = !mp->fs.jbd_journal ? ENOTSUP : ext4_trans_start(mp);
+    if (result) goto Unlock;
+    result = ext4_fs_get_inode_ref_read(&mp->fs, parent, &directory);
+    if (!result && !ext4_inode_is_type(ext4_fs_super(&mp->fs), directory.inode,
+                                      EXT4_INODE_MODE_DIRECTORY)) result = ENOTDIR;
+    if (!result && !ext4_inode_get_links_cnt(directory.inode)) result = ENOENT;
+    bool nodump = !result && ext4_inode_has_flag(directory.inode, EXT4_INODE_FLAG_NODUMP);
+    if (directory.block.data) result = ext4_result(result, ext4_fs_put_inode_ref(&directory));
+    if (!result) result = ext4_fs_alloc_inode(&mp->fs, &ref, EXT4_DE_REG_FILE, parent, "", 0);
+    if (!result) {
+        ext4_fs_inode_blocks_init(&mp->fs, &ref);
+        ext4_inode_set_mode_initial(&ref, mode);
+        ext4_inode_set_uid(ref.inode, uid);
+        ext4_inode_set_gid(ref.inode, gid);
+        if (nodump) ext4_inode_set_flag(ref.inode, EXT4_INODE_FLAG_NODUMP);
+        ext4_touch_inode(mp, &ref, EXT4_TIME_ATIME | EXT4_TIME_MTIME | EXT4_TIME_CTIME, NULL);
+        result = ext4_orphan_add(&ref);
+        if (!result) {
+            file.mp = mp; file.inode = ref.index; file.flags = O_RDWR;
+            file.fmax = ext4_inode_max_size(&mp->fs, ref.inode);
+            if (initial) {
+                size_t bytes = ext4_get16(ext4_fs_super(&mp->fs), inode_size);
+                if (bytes > sizeof(*initial)) bytes = sizeof(*initial);
+                memcpy(initial, ref.inode, bytes);
+                memset((uint8_t *)initial + bytes, 0, sizeof(*initial) - bytes);
+            }
+        }
+        result = ext4_result(result, ext4_fs_put_inode_ref(&ref));
+    }
+    result = ext4_trans_finish(mp, result);
+    if (!result) *output = file;
+Unlock:
     EXT4_MP_UNLOCK(mp);
     return result;
 }

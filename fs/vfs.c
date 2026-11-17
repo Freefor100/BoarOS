@@ -2677,9 +2677,10 @@ static void dentry_release(struct kernel_vfs_dentry **owner)
             KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
             if (!entry->references) __builtin_trap();
             if (__atomic_fetch_sub(&entry->references,1,__ATOMIC_ACQ_REL)!=1) return;
-            /* Anonymous dentries are owned by their paths but have no name index. */
+            /* Anonymous dentries have no name index. O_TMPFILE retains a
+             * parent only for display/ancestry, not directory lookup. */
             if (entry->previous) unregister_path(entry);
-            else if (!entry->detached || entry->parent) __builtin_trap();
+            else if (!entry->detached) __builtin_trap();
         }
         struct kernel_vfs_dentry *parent=entry->parent;
         if (kernel_vfs_close(&entry->file)) __builtin_trap();
@@ -2745,7 +2746,8 @@ static int path_wrap(struct kernel_vfs_mount *mount,struct kernel_vfs_dentry *en
     return result;
 }
 
-int kernel_vfs_attach_unnamed_path(struct kernel_vfs_file *file,const char *name)
+static int attach_unnamed_path_at(struct kernel_vfs_file *file,const char *name,
+    struct kernel_vfs_dentry *parent)
 {
     struct kernel_vfs_node *node=kernel_vfs_file_node(file);
     if (!node || !node->unlinked || file->path) return -KERNEL_EINVAL;
@@ -2774,10 +2776,17 @@ int kernel_vfs_attach_unnamed_path(struct kernel_vfs_file *file,const char *name
         entry->file.mount=&instance->backend_mount;
         entry->file.location_owner=0;
     }
+    if (parent) {
+        if (dentry_acquire(parent)) __builtin_trap();
+        entry->parent=parent;
+    }
     int result=path_wrap(file->mount,entry,&file->path);
     dentry_release(&entry);
     return result;
 }
+
+int kernel_vfs_attach_unnamed_path(struct kernel_vfs_file *file,const char *name)
+{ return attach_unnamed_path_at(file,name,NULL); }
 
 int kernel_vfs_path_root(struct kernel_vfs_mount *mount,struct kernel_heap *heap,struct kernel_vfs_path **owner)
 {
@@ -3073,13 +3082,14 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
     if (!start || !root || !path || !request || !file || file->state || file->private_data || file->path ||
         !start->file.mount || !start->file.mount->private_data) return -KERNEL_EINVAL;
     unsigned flags=request->flags;
+    int temporary=!!(flags & KERNEL_VFS_OPEN_TMPFILE);
     int create=!!(flags & KERNEL_VFS_OPEN_CREATE);
     int exclusive=create && (flags & KERNEL_VFS_OPEN_EXCLUSIVE);
     int follow=!!(flags & KERNEL_VFS_OPEN_FOLLOW);
     int result;
     {
         VFS_PATH_WALK(walk,start,root);
-        walk.final_write=create;
+        walk.final_write=create || temporary;
         walk.resolve=request->resolve;
         if (opened) walk.pathless_link=&opened->pathless_link;
         struct kernel_vfs_path *resolved=NULL;
@@ -3090,6 +3100,29 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
         if (result) goto Complete;
         if (((struct kernel_vfs_instance *)resolved->file.mount->private_data)->quiescing)
             result=-KERNEL_EIO;
+        else if (temporary) {
+            struct kernel_vfs_instance *instance=resolved->file.mount->private_data;
+            if ((resolved->file.mode & KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFDIR) result=-KERNEL_ENOTDIR;
+            else if (kernel_vfs_mount_is_readonly(resolved->file.mount)) result=-KERNEL_EROFS;
+            else if ((result=directory_mutation_allowed(resolved,NULL))) {}
+            else if (!instance->ops->tmpfile) result=-KERNEL_EOPNOTSUPP;
+            else {
+                result=instance->ops->tmpfile(resolved->file.mount,kernel_vfs_path_inode(resolved),
+                    KERNEL_VFS_S_IFREG|(request->mode&07777U),file,request->umask);
+                if (!result) {
+                    struct kernel_vfs_node *node=file->private_data;
+                    node->unlinked=1;
+                    node->tmpfile_linkable=!(flags & KERNEL_VFS_OPEN_EXCLUSIVE);
+                    char name[22];size_t pos=sizeof(name)-1;name[pos]=0;
+                    uint64_t inode=node->inode;
+                    do { name[--pos]=(char)('0'+inode%10);inode/=10; } while (inode);
+                    name[--pos]='#';
+                    result=attach_unnamed_path_at(file,name+pos,resolved->dentry);
+                    if (result && kernel_vfs_close(file)) __builtin_trap();
+                    if (!result && opened) opened->created=1;
+                }
+            }
+        }
         else if (!missing[0]) {
             if (create && path[strlen(path)-1U]=='/') result=-KERNEL_EISDIR;
             else if (exclusive) result=-KERNEL_EEXIST;
@@ -4324,10 +4357,14 @@ int kernel_vfs_link_at(struct kernel_vfs_path *source,
         struct kernel_vfs_node *node = source->file.private_data;
         namespace_inode_lock(node, &inode_guard);
         /* dentry 可已摘除但 inode 仍有别名；只有最后链接消失才禁止复活。 */
-        result = node->unlinked ? -KERNEL_ENOENT :
-            (kernel_vfs_node_attributes(node)&KERNEL_VFS_INODE_PROTECTED) ? -KERNEL_EPERM :
-            instance->ops->link(instance, node->inode,
-                               kernel_vfs_path_inode(parent), name);
+        if (node->unlinked && (!node->tmpfile_linkable || !instance->ops->link_tmpfile)) result=-KERNEL_ENOENT;
+        else if (kernel_vfs_node_attributes(node)&KERNEL_VFS_INODE_PROTECTED) result=-KERNEL_EPERM;
+        else {
+            result=node->unlinked ? instance->ops->link_tmpfile(instance,node->inode,
+                    kernel_vfs_path_inode(parent),name) :
+                instance->ops->link(instance,node->inode,kernel_vfs_path_inode(parent),name);
+            if (!result) { node->unlinked=0; node->tmpfile_linkable=0; }
+        }
     }
     if (!result) {
         notify_inode(instance,kernel_vfs_path_inode(source),VFS_NOTIFY_ATTRIB,0,NULL,0);

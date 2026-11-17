@@ -836,6 +836,11 @@ int ext4_fopen_inode(ext4_file *file, const char *mount_point,
  * are caller scratch filled before releasing the new inode reference, not a
  * disk/checksum image. Discard them on failure; a successful result remains
  * provisional until an outer transaction accepts it. */
+int ext4_tmpfile_child(const char *mount, uint32_t parent, uint32_t mode,
+    ext4_file *output, struct ext4_inode *initial, uint32_t uid, uint32_t gid);
+/* Only for the VFS's live linkable temporary inode, never arbitrary unlinked files. */
+int ext4_tmpfile_link_child(const char *mount, uint32_t source, uint32_t parent,
+    const char *name, uint32_t length);
 int ext4_create_child(const char *mount, uint32_t parent, const char *name,
     uint32_t mode, uint32_t device, const char *target, ext4_file *output,
     struct ext4_inode *initial,uint32_t uid,uint32_t gid);

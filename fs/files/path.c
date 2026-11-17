@@ -55,15 +55,16 @@ static int validate_open_flags(uint64_t flags, uint64_t mode, uint64_t resolve,
 {
     const uint64_t write_flags = LINUX_O_CREAT | LINUX_O_TRUNC |
                                  LINUX_O_APPEND | LINUX_O_EXCL;
-    uint64_t unsupported_flags =
-        LINUX_O_DIRECT |
-        (LINUX_O_TMPFILE & ~LINUX_O_DIRECTORY);
+    uint64_t unsupported_flags = LINUX_O_DIRECT;
     uint64_t known_flags = LINUX_O_ACCMODE | write_flags | LINUX_O_NOCTTY |
-        unsupported_flags | LINUX_O_NOATIME | LINUX_O_NONBLOCK | LINUX_O_DIRECTORY |
+        unsupported_flags | LINUX_O_TMPFILE | LINUX_O_NOATIME | LINUX_O_NONBLOCK | LINUX_O_DIRECTORY |
         LINUX_O_NOFOLLOW |
         LINUX_O_LARGEFILE | LINUX_O_CLOEXEC | LINUX_O_SYNC | LINUX_O_PATH;
     uint64_t access_mode = flags & LINUX_O_ACCMODE;
 
+    if ((flags & (LINUX_O_TMPFILE & ~LINUX_O_DIRECTORY)) &&
+        (!(flags & LINUX_O_DIRECTORY) || !access_mode || (flags & LINUX_O_CREAT)))
+        return -KERNEL_EINVAL;
     if (strict) {
         uint64_t tmpfile = flags & (LINUX_O_TMPFILE & ~LINUX_O_DIRECTORY);
         int create = !!(flags & LINUX_O_CREAT) || tmpfile;
@@ -79,7 +80,8 @@ static int validate_open_flags(uint64_t flags, uint64_t mode, uint64_t resolve,
             ((flags & LINUX_O_PATH) && (flags & ~path_flags)))
             return -KERNEL_EINVAL;
     }
-    if ((!strict && access_mode == 3U) || (flags & ~known_flags) != 0U) {
+    if ((!strict && access_mode == 3U &&
+         !(flags & (LINUX_O_TMPFILE & ~LINUX_O_DIRECTORY))) || (flags & ~known_flags) != 0U) {
         return -KERNEL_EINVAL;
     }
     if ((flags & LINUX_O_DIRECTORY) != 0U && (flags & LINUX_O_CREAT) != 0U) {
@@ -293,7 +295,10 @@ static enum kernel_files_status files_open(
     if (flags & LINUX_O_DIRECTORY) request.flags |= KERNEL_VFS_OPEN_DIRECTORY;
     if (flags & LINUX_O_NOFOLLOW) request.flags &= ~KERNEL_VFS_OPEN_FOLLOW;
     if (flags & LINUX_O_PATH) request.flags |= KERNEL_VFS_OPEN_PATH_ONLY;
-    else if (flags & LINUX_O_CREAT) {
+    else if (flags & (LINUX_O_TMPFILE & ~LINUX_O_DIRECTORY)) {
+        request.flags |= KERNEL_VFS_OPEN_TMPFILE;
+        if (flags & LINUX_O_EXCL) request.flags |= KERNEL_VFS_OPEN_EXCLUSIVE;
+    } else if (flags & LINUX_O_CREAT) {
         request.flags |= KERNEL_VFS_OPEN_CREATE;
         if (flags & LINUX_O_EXCL) {
             request.flags |= KERNEL_VFS_OPEN_EXCLUSIVE;

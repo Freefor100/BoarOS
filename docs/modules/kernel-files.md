@@ -180,7 +180,7 @@ OFD pin 覆盖可能缺页睡眠的复制。`make test-record-lock-riscv` 用同
 
 `openat2(437)` 导入 24 字节的 `open_how`，接受全零的扩展尾部，单独校验 flags、mode 和 resolve。它与 `openat` 共用打开及创建路径。解析器在跨越挂载点（包括 bind）、跟随符号链接或 proc 对象链接时检查对应限制；`RESOLVE_BENEATH` 拒绝逃出起点，`RESOLVE_IN_ROOT` 将绝对路径、绝对链接和根处的 `..` 限制在起点。发生挂载拓扑或目录父链变化时，受限查找可返回 `EAGAIN`，调用方可用相同约束重试。`OPENAT2_REGULAR` 在打开设备或 FIFO 之前要求最终对象为普通文件。
 
-现有路径索引命中后仍需后端复核，`RESOLVE_CACHED` 返回 `EAGAIN`，应用可去掉该位重试并保留其他解析限制。`O_TMPFILE`、`O_DIRECT` 和 `O_EMPTYPATH` 仍返回 `EOPNOTSUPP`。`tests/userland/openat2.c` 检查参数、受限创建、bind 挂载和 proc 链接。
+现有路径索引命中后仍需后端复核，`RESOLVE_CACHED` 返回 `EAGAIN`，应用可去掉该位重试并保留其他解析限制。`O_DIRECT` 和 `O_EMPTYPATH` 仍返回 `EOPNOTSUPP`。`O_TMPFILE` 支持 tmpfs 和启用 journal 的 ext4；其他后端仍返回 `EOPNOTSUPP`。`tests/userland/openat2.c` 检查参数、受限创建、bind 挂载和 proc 链接。
 
 `getcwd` 返回包含 NUL 的字节数；用户缓冲不足为 `ERANGE`，已断开的 cwd 为 `ENOENT`。仍连接在命名空间但位于新root之外的cwd，raw syscall返回`(unreachable)`前缀及命名空间绝对路径；libc据此处理ENOENT。proc cwd/exe/fd/maps的展示保留根外及摘树对象的绝对名称和删除后缀，实际对象链接跟随仍持有真实路径，不依赖这些展示文本。删除目录后，其持有者仍可对 `.` 打开/统计、经 `..` 访问父目录、通过 `fchdir` 切回；不能在已删除目录中新建名字。改名会更新所有持有同一目录项的 cwd/OFD 所观察到的父链。fork 独立复制 fs record，进程形式和线程形式的 `CLONE_FS` 都共享它；切换 cwd 先取得新引用再替换，失败不改变原目录。
 
@@ -708,3 +708,13 @@ RV64／LA64 使用 `inotify_init1`、`inotify_add_watch` 和 `inotify_rm_watch`�
 直接探针见 [inotify.c](../../tests/workloads/fs/inotify.c)，覆盖目录事件、事件消费、溢出和卸载。
 `sh tests/host/inotify-async.sh` 检查入队/合并/溢出/忽略的通知次数，以及回调期间并发关闭
 后继 mark 和 group 的交错。
+
+### O_TMPFILE 匿名文件
+
+`openat(dirfd, ".", O_TMPFILE | O_RDWR, mode)` 直接分配链接数为 0 的普通 inode，不先生成临时名称再 unlink。目录写入/搜索权限、只读挂载、umask、默认 ACL 和创建身份沿用普通创建路径。文件可读写、映射、dup；最后引用释放后回收。ext4 在创建事务中加入持久 orphan，首次发布在同一事务中建立目录项并移除 orphan，因此恢复不依赖内存中的临时名字。无 journal 的 ext4 不支持此操作。
+
+非 `O_EXCL` 文件可通过 `linkat(fd, "", dirfd, name, AT_EMPTY_PATH)` 或跟随 `/proc/self/fd/N` 发布。`O_EXCL` 禁止发布；首次发布后再删除最后一个链接，不能借旧 fd 复活。首次发布复用 inode 与页缓存，不复制内容；发布与正常 namespace 操作使用已有目录/inode 锁。tmpfs 首次发布不重复收取 inode 配额。proc fd 链接显示原创建目录下的 `#inode (deleted)` 匿名路径。
+
+定向验证：`tests/host/tmpfile.sh` 覆盖 tmpfs 4 KiB/16 KiB、inode 配额及分配失败回滚；`tests/host/lwext4-tmpfile.sh` 覆盖 orphan_file/legacy orphan、事务回滚、最后关闭和崩溃恢复。`tests/userland/tmpfile.c` 同源运行于 Linux 和 BoarOS，覆盖发布、拒绝复活、并发发布、权限、fd 耗尽和映射生命周期；guest 还覆盖只读挂载、跨挂载和不支持后端。`tests/userland/tmpfile.py --arch riscv|loongarch --kernel KERNEL --program STATIC_ELF [--cpus 2]` 运行定向 QEMU 契约并执行离线 fsck。Linux 宿主若不能切换 uid，可设 `TMPFILE_SKIP_UID=1`，该项明确打印跳过；guest 不设置此变量。此验证不是全量兼容性或性能结论。
+
+语义依据：[Linux open(2)](https://man7.org/linux/man-pages/man2/open.2.html) 与 [link(2)](https://man7.org/linux/man-pages/man2/link.2.html)。

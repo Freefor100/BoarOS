@@ -83,6 +83,7 @@ struct kernel_vfs_node {
     uint32_t exec_users;
     uint8_t closed;
     uint8_t unlinked;
+    uint8_t tmpfile_linkable; /* Only a never-published, non-exclusive tmpfile may gain its first name. */
     uint8_t retired;
     uint8_t generated_control, control_write_prefix;
 #if BOAROS_COST_DIAGNOSTICS
@@ -245,6 +246,9 @@ struct kernel_vfs_backend {
         uint64_t parent_inode, const char *path,
         uint32_t mode,
         struct kernel_vfs_file *file, uint32_t umask);
+    int (*tmpfile)(struct kernel_vfs_mount *, uint64_t parent_inode, uint32_t mode,
+        struct kernel_vfs_file *, uint32_t umask);
+    int (*link_tmpfile)(struct kernel_vfs_instance *, uint64_t inode, uint64_t parent, const char *name);
     /* The backend takes mutation qualification only when it publishes atime. */
     void (*accessed)(struct kernel_vfs_file *file);
     int (*modified)(struct kernel_vfs_file *file,
