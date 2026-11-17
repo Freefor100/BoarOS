@@ -333,6 +333,7 @@ netif_add(struct netif *netif,
     netif->ip6_addr_state[i] = IP6_ADDR_INVALID;
 #ifdef BOAROS_LWIP_STATIC_IPV6
     netif->ip6_configured[i] = 0;
+    netif->ip6_created[i] = netif->ip6_updated[i] = 0;
     netif->ip6_prefix[i] = 128;
 #endif
 #if LWIP_IPV6_ADDRESS_LIFETIMES
@@ -1459,6 +1460,11 @@ netif_ip6_addr_set_parts(struct netif *netif, s8_t addr_idx, u32_t i0, u32_t i1,
   ip6_addr_copy(*ip_2_ip6(&old_addr), *netif_ip6_addr(netif, addr_idx));
   IP_SET_TYPE_VAL(old_addr, IPADDR_TYPE_V6);
 
+#ifdef BOAROS_LWIP_STATIC_IPV6
+  if (ip6_addr_isinvalid(netif_ip6_addr_state(netif,addr_idx)))
+    netif->ip6_created[addr_idx] = boaros_lwip_centiseconds();
+  netif->ip6_updated[addr_idx] = boaros_lwip_centiseconds();
+#endif
   /* address is actually being changed? */
   if ((ip_2_ip6(&old_addr)->addr[0] != i0) || (ip_2_ip6(&old_addr)->addr[1] != i1) ||
       (ip_2_ip6(&old_addr)->addr[2] != i2) || (ip_2_ip6(&old_addr)->addr[3] != i3)) {

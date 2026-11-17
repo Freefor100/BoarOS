@@ -97,7 +97,7 @@ static err_t ipv6_output(struct netif *interface,struct pbuf *p,const ip6_addr_t
     /* IPv6 cannot use a sub-1280 link. Check before neighbor queue admission,
      * otherwise an oversized unresolved datagram would falsely succeed. */
     if (interface->mtu<1280) return ERR_RTE;
-    if (p->tot_len>interface->mtu) return ERR_BUF;
+    if (p->tot_len>netif_mtu6(interface)) return ERR_BUF;
     const struct ip6_hdr *header=p->payload;
     ip6_addr_t source;ip6_addr_copy_from_packed(source,header->src);
     /* Loopback is host-local even when an explicit device or /0 route would

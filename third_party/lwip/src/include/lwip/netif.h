@@ -285,6 +285,8 @@ struct netif {
   /* Protocol-owner configuration, withdrawn on DOWN or sub-1280 MTU. */
   u8_t ip6_configured[LWIP_IPV6_NUM_ADDRESSES];
   u8_t ip6_prefix[LWIP_IPV6_NUM_ADDRESSES];
+  u32_t ip6_created[LWIP_IPV6_NUM_ADDRESSES];
+  u32_t ip6_updated[LWIP_IPV6_NUM_ADDRESSES];
   ip6_addr_t ip6_gateway;
 #endif
   /** The state of each IPv6 address (Tentative, Preferred, etc).

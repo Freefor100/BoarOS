@@ -1,6 +1,7 @@
 #ifndef BOAROS_LWIP_HOOKS_H
 #define BOAROS_LWIP_HOOKS_H
 #include <stdint.h>
+uint32_t boaros_lwip_centiseconds(void);
 struct boaros_lwip_tcp_context;
 struct ip_addr;
 struct ip6_addr;

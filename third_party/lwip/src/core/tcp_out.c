@@ -62,6 +62,7 @@
 
 #include "lwip/opt.h"
 #include "lwip/sys.h"
+#include "lwip/nd6.h"
 #include <kernel/cost.h>
 
 #if LWIP_TCP /* don't build if not configured for use in lwipopts.h */
@@ -85,6 +86,7 @@
 #include "lwip/ip6_addr.h"
 #if LWIP_TCP_TIMESTAMPS
 #include "lwip/sys.h"
+#include "lwip/nd6.h"
 #endif
 
 #include <string.h>
@@ -1528,6 +1530,26 @@ tcp_build_wnd_scale_option(u32_t *opts)
 }
 #endif
 
+/* Re-evaluate IPv6 PMTU for queued and retransmitted data. A router's
+ * changed MTU must not strand segments made before the advertisement. */
+static int tcp_output_segment_busy(const struct tcp_seg *seg);
+static err_t
+tcp_ipv6_resize_head(struct tcp_pcb *pcb, struct netif *netif)
+{
+  struct tcp_seg *head = pcb->unsent;
+  if (head && head->len && IP_IS_V6(&pcb->remote_ip)) {
+    u16_t mss = tcp_eff_send_mss_netif(pcb->mss,netif,&pcb->remote_ip);
+    u16_t options = LWIP_TCP_OPT_LENGTH_SEGMENT(head->flags,pcb);
+    if (mss <= options) return ERR_RTE;
+    mss -= options;
+    if (head->len > mss) {
+      if (tcp_output_segment_busy(head)) return ERR_MEM;
+      return tcp_split_unsent_seg(pcb,mss);
+    }
+  }
+  return ERR_OK;
+}
+
 /**
  * @ingroup tcp_raw
  * Find out what we can send and send it
@@ -1607,6 +1629,10 @@ boaros_lwip_tcp_output_more(struct tcp_pcb *pcb, u8_t more)
     }
   }
 
+  err = tcp_ipv6_resize_head(pcb,netif);
+  if (err != ERR_OK) return err;
+  seg = pcb->unsent;
+
   /* Handle the current segment not fitting within the window */
   if (lwip_ntohl(seg->tcphdr->seqno) - pcb->lastack + seg->len > wnd) {
     /* We need to start the persistent timer when the next unsent segment does not fit
@@ -1683,7 +1709,11 @@ boaros_lwip_tcp_output_more(struct tcp_pcb *pcb, u8_t more)
       return err;
     }
 #ifdef BOAROS_LWIP_TCP_INFO
-    pcb->boaros_pmtu = netif->mtu;
+    {
+      BOAROS_LWIP_IP_SCOPE(ip);
+      pcb->boaros_pmtu = IP_IS_V6(&pcb->remote_ip) ?
+        nd6_get_destination_mtu(ip_2_ip6(&pcb->remote_ip),netif) : netif->mtu;
+    }
     if (seg->len) {
       pcb->boaros_last_sent = tcp_ticks;
       pcb->boaros_data_out++;
@@ -1746,6 +1776,8 @@ boaros_lwip_tcp_output_more(struct tcp_pcb *pcb, u8_t more)
     } else {
       tcp_seg_free(seg);
     }
+    err = tcp_ipv6_resize_head(pcb,netif);
+    if (err != ERR_OK) return err;
     seg = pcb->unsent;
   }
 #if TCP_OVERSIZE

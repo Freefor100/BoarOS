@@ -278,6 +278,10 @@ struct kernel_wait_queue *kernel_socket_wait_queue(struct kernel_socket *socket)
 void kernel_socket_expire_timers(void);
 int kernel_socket_loopback_flags(const char name[16], uint16_t *flags);
 int kernel_socket_set_loopback_flags(const char name[16], uint16_t flags);
+struct kernel_socket_ipv6_address {
+    uint8_t address[16], prefix, flags, present;
+    uint32_t valid, preferred, created, updated;
+};
 struct kernel_socket_interface {
     char name[16];
     uint32_t index, address, netmask, mtu;
@@ -286,7 +290,13 @@ struct kernel_socket_interface {
     uint32_t gateway;
     int default_route, ipv6_present, link_up;
     uint8_t ipv6_address[16], ipv6_flags;
-    struct { uint8_t address[16],prefix,flags; } ipv6_static[2];
+    union {
+        struct kernel_socket_ipv6_address ipv6_addresses[4];
+        /* Compatibility name for the two reserved manual address slots. */
+        struct kernel_socket_ipv6_address ipv6_static[4];
+    };
+    struct { uint8_t address[16], prefix, present; uint32_t lifetime; } ipv6_prefixes[5];
+    struct { uint8_t address[16], preference, present; uint32_t lifetime; } ipv6_routers[3];
     uint8_t ipv6_gateway[16];
 };
 int kernel_socket_interface_get(const char name[16], struct kernel_socket_interface *snapshot);

@@ -63,16 +63,21 @@ static unsigned route_prefix(uint32_t mask)
 static int route_address(struct route_output *out,const struct route_header *request,
     const struct kernel_socket_interface *s,unsigned family,int slot)
 {
-    if(family==10 && (slot<0?!s->ipv6_present:!s->ipv6_static[slot].flags))return 0;
+    if(family==10 && (slot<0?!s->ipv6_present:!s->ipv6_addresses[slot].present))return 0;
     if(family==2 && !s->address)return 0;
     uint8_t address[16]={0};size_t size=family==10?16:4;
-    if(family==10)__builtin_memcpy(address,slot<0?s->ipv6_address:s->ipv6_static[slot].address,16);else __builtin_memcpy(address,&s->address,4);
+    if(family==10)__builtin_memcpy(address,slot<0?s->ipv6_address:s->ipv6_addresses[slot].address,16);else __builtin_memcpy(address,&s->address,4);
     struct { uint8_t family,prefix,flags,scope; uint32_t index; } info=
-        {family,family==10?(slot<0?(s->hardware_type==772?128:64):s->ipv6_static[slot].prefix):route_prefix(s->netmask),
-         family==10?(slot<0?s->ipv6_flags:s->ipv6_static[slot].flags):128,s->hardware_type==772?254:(family==10 && slot<0?253:0),s->index};
+        {family,family==10?(slot<0?(s->hardware_type==772?128:64):s->ipv6_addresses[slot].prefix):route_prefix(s->netmask),
+         family==10?(slot<0?s->ipv6_flags:s->ipv6_addresses[slot].flags):128,s->hardware_type==772?254:(family==10 && slot<0?253:0),s->index};
     struct route_header *h=route_message(out,20,2,request->sequence,&info,sizeof(info));
     if(!h)return -KERNEL_ENOBUFS;
     if(route_attribute(out,h,1,address,size) || route_attribute(out,h,2,address,size))return -KERNEL_ENOBUFS;
+    if(family==10 && slot>=0) {
+        const struct kernel_socket_ipv6_address *a=&s->ipv6_addresses[slot];
+        uint32_t cacheinfo[4]={a->preferred,a->valid,a->created,a->updated};
+        if(route_attribute(out,h,6,cacheinfo,sizeof(cacheinfo)))return -KERNEL_ENOBUFS;
+    }
     if(family==2) {
         size_t n=0;while(n<15 && s->name[n])n++;
         if(route_attribute(out,h,3,s->name,n+1))return -KERNEL_ENOBUFS;
@@ -121,19 +126,19 @@ static int route_ipv6(struct route_output *out,const struct route_header *reques
 static int route_static_ipv6(struct route_output *out,const struct route_header *request,
     const struct kernel_socket_interface *s)
 {
-    for(unsigned i=0;i<2;i++) {
-        if(!s->ipv6_static[i].flags || (s->ipv6_static[i].flags&(64|8)))continue;
+    for(unsigned i=0;i<4;i++) {
+        if(!s->ipv6_addresses[i].present || (s->ipv6_addresses[i].flags&(64|8)))continue;
         for(unsigned local=0;local<2;local++) {
-            if(!local && !(s->flags&1))continue;
-            if(!local && i && s->ipv6_static[0].flags && !(s->ipv6_static[0].flags&(64|8)) &&
-               s->ipv6_static[0].prefix==s->ipv6_static[i].prefix) {
-                unsigned bits=s->ipv6_static[i].prefix,bytes=bits/8,tail=bits%8;
-                if(!__builtin_memcmp(s->ipv6_static[0].address,s->ipv6_static[i].address,bytes) &&
-                   (!tail || !((s->ipv6_static[0].address[bytes]^s->ipv6_static[i].address[bytes])&(255U<<(8-tail)))))continue;
+            if(!local && (!(s->flags&1) || !(s->ipv6_addresses[i].flags&128)))continue;
+            if(!local && i && s->ipv6_addresses[0].flags && !(s->ipv6_addresses[0].flags&(64|8)) &&
+               s->ipv6_addresses[0].prefix==s->ipv6_addresses[i].prefix) {
+                unsigned bits=s->ipv6_addresses[i].prefix,bytes=bits/8,tail=bits%8;
+                if(!__builtin_memcmp(s->ipv6_addresses[0].address,s->ipv6_addresses[i].address,bytes) &&
+                   (!tail || !((s->ipv6_addresses[0].address[bytes]^s->ipv6_addresses[i].address[bytes])&(255U<<(8-tail)))))continue;
             }
-            uint8_t prefix=local?128:s->ipv6_static[i].prefix;
+            uint8_t prefix=local?128:s->ipv6_addresses[i].prefix;
             uint8_t info[12]={10,prefix,0,0,local?255:254,2,0,local?2:1};
-            uint8_t destination[16];__builtin_memcpy(destination,s->ipv6_static[i].address,16);
+            uint8_t destination[16];__builtin_memcpy(destination,s->ipv6_addresses[i].address,16);
             for(unsigned byte=0;byte<16;byte++) {
                 unsigned bits=prefix>byte*8?prefix-byte*8:0;
                 if(bits<8)destination[byte]&=bits?(uint8_t)(255U<<(8-bits)):0;
@@ -151,6 +156,32 @@ static int route_static_ipv6(struct route_output *out,const struct route_header 
     return !h || route_attribute(out,h,15,(uint32_t[]){254},4) ||
         route_attribute(out,h,5,s->ipv6_gateway,16) || route_attribute(out,h,4,&s->index,4) ||
         route_attribute(out,h,6,(uint32_t[]){1024},4)?-KERNEL_ENOBUFS:0;
+}
+/* RA on-link prefixes are independent of SLAAC addresses: an A-only PIO
+ * creates an address/local route, never an implied connected /64. */
+static int route_ra_ipv6(struct route_output *out,const struct route_header *request,
+    const struct kernel_socket_interface *s)
+{
+    if(!(s->flags&1) || !s->link_up)return 0;
+    for(unsigned kind=0;kind<2;kind++)for(unsigned i=0;i<(kind?3U:5U);i++) {
+        if(kind?!s->ipv6_routers[i].present:!s->ipv6_prefixes[i].present)continue;
+        uint8_t prefix=kind?0:s->ipv6_prefixes[i].prefix;
+        uint8_t info[12]={10,prefix,0,0,254,9,0,1};
+        const uint8_t *address=kind?s->ipv6_routers[i].address:s->ipv6_prefixes[i].address;
+        uint32_t lifetime=kind?s->ipv6_routers[i].lifetime:s->ipv6_prefixes[i].lifetime;
+        struct route_header *h=route_message(out,24,2,request->sequence,info,sizeof(info));
+        if(!h || route_attribute(out,h,15,(uint32_t[]){254},4) ||
+           route_attribute(out,h,kind?5:1,address,16) || route_attribute(out,h,4,&s->index,4) ||
+           route_attribute(out,h,6,(uint32_t[]){kind?2048:256},4))return -KERNEL_ENOBUFS;
+        /* Linux IPv6 dumps expose remaining USER_HZ (100) ticks through
+         * RTA_CACHEINFO, clamped to signed INT_MAX; zero means no expiry. */
+        uint32_t expires=lifetime==UINT32_MAX?0:
+            lifetime>21474836U?2147483647U:lifetime*100U;
+        uint32_t cacheinfo[8]={0,0,expires,0,0,0,0,0};
+        if(route_attribute(out,h,12,cacheinfo,sizeof(cacheinfo)))return -KERNEL_ENOBUFS;
+        if(kind && route_attribute(out,h,20,&s->ipv6_routers[i].preference,1))return -KERNEL_ENOBUFS;
+    }
+    return 0;
 }
 /* Output lookups only: this is the existing lwIP route selection, not a FIB.
  * Keep snapshot order (ip4_route uses first matching netif, not longest prefix).
@@ -273,7 +304,7 @@ static int route_request(struct route_output *out,const struct route_header *h,
             if(payload[0]!=10)error=route_address(out,h,s,2,-1);
             if(!error && payload[0]!=2) {
                 error=route_address(out,h,s,10,-1);
-                for(unsigned slot=0;!error && slot<2;slot++)error=route_address(out,h,s,10,(int)slot);
+                for(unsigned slot=0;!error && slot<4;slot++)error=route_address(out,h,s,10,(int)slot);
             }
         } else {
             if(payload[0]!=10) {
@@ -283,6 +314,7 @@ static int route_request(struct route_output *out,const struct route_header *h,
             if(!error && payload[0]!=2) {
                 error=route_ipv6(out,h,s);
                 if(!error)error=route_static_ipv6(out,h,s);
+                if(!error)error=route_ra_ipv6(out,h,s);
             }
         }
         if(error)return error;

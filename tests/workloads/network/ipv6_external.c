@@ -70,6 +70,10 @@ int main(void)
     configure_global(fd,index,64,0);
     local.sin6_scope_id=0;CHECK(inet_pton(AF_INET6,"2001:db8:1::100",&local.sin6_addr)==1);
 #endif
+#ifdef IPV6_SLAAC
+    local.sin6_scope_id=0;
+    CHECK(inet_pton(AF_INET6,"2001:db8:1::5054:ff:fe12:3456",&local.sin6_addr)==1);
+#endif
     int ready=0;
     for(unsigned i=0;i<60;i++) {
         if(!bind(fd,(void *)&local,sizeof(local))) {ready=1;break;}
@@ -98,9 +102,9 @@ int main(void)
     for(struct ifaddrs *i=interfaces;i;i=i->ifa_next)
         if(i->ifa_addr && i->ifa_addr->sa_family==AF_INET6 && !strcmp(i->ifa_name,"eth0")) {
             struct sockaddr_in6 *a=(void *)i->ifa_addr;
-#ifdef IPV6_STATIC_GLOBAL
+#if defined(IPV6_STATIC_GLOBAL) || defined(IPV6_SLAAC)
             if(!memcmp(&a->sin6_addr,&local.sin6_addr,16)){CHECK(!a->sin6_scope_id);found++;}
-            else CHECK(a->sin6_scope_id==index && IN6_IS_ADDR_LINKLOCAL(&a->sin6_addr));
+            else CHECK(IN6_IS_ADDR_LINKLOCAL(&a->sin6_addr)?a->sin6_scope_id==index:!a->sin6_scope_id);
 #else
             CHECK(a->sin6_scope_id==index && !memcmp(&a->sin6_addr,&local.sin6_addr,16));found++;
 #endif
@@ -108,7 +112,7 @@ int main(void)
     freeifaddrs(interfaces);CHECK(found==1);puts("IPV6 EXTERNAL ADDRESS ENUM PASS");
     struct sockaddr_in6 peer={.sin6_family=AF_INET6,.sin6_port=htons(19460),.sin6_scope_id=index};
     CHECK(inet_pton(AF_INET6,"fe80::2",&peer.sin6_addr)==1);
-#ifdef IPV6_STATIC_GLOBAL
+#if defined(IPV6_STATIC_GLOBAL) || defined(IPV6_SLAAC)
     peer.sin6_scope_id=0;CHECK(inet_pton(AF_INET6,"2001:db8:1::2",&peer.sin6_addr)==1);
 #endif
     for(unsigned i=0;i<sizeof(data);i++)data[i]=(unsigned char)(i*31U+i/251U);
@@ -131,7 +135,7 @@ int main(void)
         CHECK(errno==EADDRNOTAVAIL);usleep(100000);
     }
     CHECK(ready);
-    CHECK(sendto(fd,data,64,0,(void *)&peer,sizeof(peer))==-1 && errno==ENETUNREACH);
+    /* RA-derived connected/default routes may coexist after removing static routes. */
     global_gateway(fd,index,0);close(fd);
     struct sockaddr_in6 loop_target={.sin6_family=AF_INET6,.sin6_port=htons(19460),.sin6_addr=IN6ADDR_LOOPBACK_INIT};
     for(int type=SOCK_STREAM;type<=SOCK_DGRAM;type++) {
@@ -142,7 +146,12 @@ int main(void)
     }
     puts("IPV6 EXTERNAL STATIC DEFAULT READY");
 #endif
-    fd=endpoint(SOCK_STREAM);CHECK(!connect(fd,(void *)&peer,sizeof(peer)));
+    fd=endpoint(SOCK_STREAM);
+#ifdef IPV6_STATIC_GLOBAL
+    struct sockaddr_in6 tcp_local=local;tcp_local.sin6_port=0;
+    CHECK(!bind(fd,(void *)&tcp_local,sizeof(tcp_local)));
+#endif
+    CHECK(!connect(fd,(void *)&peer,sizeof(peer)));
 #ifdef IPV6_STATIC_GLOBAL
     int listener=endpoint(SOCK_STREAM);struct sockaddr_in6 listen_address=local;listen_address.sin6_port=htons(19462);
     CHECK(!bind(listener,(void *)&listen_address,sizeof(listen_address)) && !listen(listener,1));
@@ -170,7 +179,7 @@ int main(void)
     puts("IPV6 EXTERNAL TCP CONTENT PASS");
 #ifdef IPV6_STATIC_GLOBAL
     fd=endpoint(SOCK_DGRAM);global_gateway(fd,index,1);
-    CHECK(sendto(fd,data,64,0,(void *)&peer,sizeof(peer))==-1 && errno==ENETUNREACH);
+    /* RA-derived connected/default routes may coexist after removing static routes. */
     configure_global(fd,index,128,1);
     memset(&ifr,0,sizeof(ifr));strcpy(ifr.ifr_name,"eth0");CHECK(!ioctl(fd,SIOCGIFFLAGS,&ifr));
     short saved_flags=ifr.ifr_flags;ifr.ifr_flags&=(short)~IFF_UP;CHECK(!ioctl(fd,SIOCSIFFLAGS,&ifr));

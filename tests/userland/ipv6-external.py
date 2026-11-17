@@ -21,6 +21,7 @@ p.add_argument('--kernel',type=Path,required=True)
 p.add_argument('--program',type=Path,required=True)
 p.add_argument('--qemu')
 p.add_argument('--global-address',action='store_true',help='static /64 UDP then /128/default-gateway TCP workload')
+p.add_argument('--slaac',action='store_true',help='RA/SLAAC generated global address workload')
 p.add_argument('--cpus',type=int,default=1)
 a=p.parse_args();profile=PROFILES[a.arch]
 (ROOT/'build').mkdir(exist_ok=True)
@@ -33,8 +34,8 @@ def checksum(data):
     while value>>16:value=(value&65535)+(value>>16)
     return (~value)&65535
 def injected_udp(data,mode):
-    src=socket.inet_pton(socket.AF_INET6,'2001:db8:1::2' if a.global_address else 'fe80::2')
-    dst=socket.inet_pton(socket.AF_INET6,'2001:db8:1::100' if a.global_address else 'fe80::5054:ff:fe12:3456')
+    src=socket.inet_pton(socket.AF_INET6,'2001:db8:1::2' if (a.global_address or a.slaac) else 'fe80::2')
+    dst=socket.inet_pton(socket.AF_INET6,'2001:db8:1::5054:ff:fe12:3456' if a.slaac else '2001:db8:1::100' if a.global_address else 'fe80::5054:ff:fe12:3456')
     udp=struct.pack('!HHHH',19460,19461,len(data)+8,0)+data
     value=checksum(src+dst+struct.pack('!I3xB',len(udp),17)+udp) or 65535
     if mode=='zero':value=0
@@ -42,6 +43,25 @@ def injected_udp(data,mode):
     udp=udp[:6]+struct.pack('!H',value)+udp[8:]
     ip=struct.pack('!IHBB',6<<28,len(udp),17,64)+src+dst
     frame=bytes.fromhex('52540012345652550000000286dd')+ip+udp
+    return struct.pack('!I',len(frame))+frame
+def injected_ra(mode):
+    src=socket.inet_pton(socket.AF_INET6,'fe80::2')
+    dst=socket.inet_pton(socket.AF_INET6,'ff02::1')
+    # Every rejected RA attempts a visible MTU change. The later 1452-byte
+    # UDP exchange proves none committed, not merely that ingress survived.
+    body=struct.pack('!BBHBBHII',134,0,0,64,0,1800,0,0)+struct.pack('!BBHI',5,1,0,1280)
+    if mode=='tail':body+=bytes([99,0])
+    if mode=='source':src=socket.inet_pton(socket.AF_INET6,'2001:db8:1::2')
+    value=checksum(src+dst+struct.pack('!I3xB',len(body),58)+body)
+    if mode=='checksum':value^=0x1234
+    body=body[:2]+struct.pack('!H',value)+body[4:]
+    protocol=58
+    if mode in ('atomic','atomic-options'):
+        extension=(bytes([58,0])+bytes(6)) if mode=='atomic-options' else b''
+        body=struct.pack('!BBHI',60 if extension else 58,0,0,0x12345678)+extension+body
+        protocol=44
+    ip=struct.pack('!IHBB',6<<28,len(body),protocol,254 if mode=='hop' else 255)+src+dst
+    frame=bytes.fromhex('33330000000152550000000286dd')+ip+body
     return struct.pack('!I',len(frame))+frame
 def udp(s,injector):
     channel,_=injector.accept()
@@ -53,7 +73,7 @@ def udp(s,injector):
                 # Same ingress channel orders both malformed packets before
                 # the valid response, so the guest receive is a strict barrier.
                 bad=bytes([data[0]^255])+data[1:]
-                channel.sendall(injected_udp(bad,'zero')+injected_udp(bad,'bad')+injected_udp(data,'valid'))
+                channel.sendall((b''.join(injected_ra(mode) for mode in ('tail','source','hop','checksum','atomic','atomic-options')) if a.slaac else b'')+injected_udp(bad,'zero')+injected_udp(bad,'bad')+injected_udp(data,'valid'))
             else:s.sendto(data,peer)
 def tcp(s):
     stream,peer=s.accept()
@@ -70,7 +90,7 @@ qemu=a.qemu or os.environ.get('QEMU_RISCV64' if a.arch=='riscv' else 'QEMU_LOONG
 command=profile.boot(qemu,a.kernel.resolve(),'512M');command[command.index('-smp')+1]=str(a.cpus)
 command+=['-drive',f'file={disk},if=none,format=raw,id=root','-device',profile.block('modern')]
 device='virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1' if a.arch=='riscv' else 'virtio-net-pci,netdev=n0,addr=2,disable-legacy=on'
-command+=['-netdev',('user,id=n0,ipv6=on,ipv6-prefix=2001:db8:1::,ipv6-prefixlen=64,ipv6-host=2001:db8:1::2' if a.global_address else 'user,id=n0,ipv6=on,ipv6-prefix=fe80::,ipv6-prefixlen=64,ipv6-host=fe80::2'),'-device',device+',mac=52:54:00:12:34:56']
+command+=['-netdev',('user,id=n0,ipv6=on,ipv6-prefix=2001:db8:1::,ipv6-prefixlen=64,ipv6-host=2001:db8:1::2' if (a.global_address or a.slaac) else 'user,id=n0,ipv6=on,ipv6-prefix=fe80::,ipv6-prefixlen=64,ipv6-host=fe80::2'),'-device',device+',mac=52:54:00:12:34:56']
 if a.arch=='riscv':command+=['-global','virtio-mmio.force-legacy=false']
 log=work/'guest.log'
 def identity(path):

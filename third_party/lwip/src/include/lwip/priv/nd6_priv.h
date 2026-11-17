@@ -102,6 +102,7 @@ struct nd6_prefix_list_entry {
   ip6_addr_t prefix;
   struct netif *netif;
   u32_t invalidation_timer; /* in seconds */
+  u8_t prefix_length;
 };
 
 struct nd6_router_list_entry {

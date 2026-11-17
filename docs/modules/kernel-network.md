@@ -345,26 +345,34 @@ reset确认；设备失败不等于DMA停止，TX在途owner与RX借用一律保
 
 TX 使用 indirect 表借用每包最多两段镜像内 payload，其余回退复制，用户接收仍复制。IPv4 外部应用测试入口见 `tests/userland/network-external.py`；默认网关可由已实现的 IPv4 配置接口设置。内核不提供 DHCP/DNS/TLS 服务，用户态协议库与内核网络能力分别评价。
 
-### Ethernet IPv6 静态配置与通信
+### Ethernet IPv6 静态配置、RA/SLAAC 与通信
 
 eth0 从设备 MAC 派生 `fe80::/64` 地址，使用已有 ND 定时器执行 DAD（重复地址检测），不增加 worker、轮询器或新缓存。DAD 完成前不能绑定地址；收到指向 tentative 地址的 solicited-node NS 或 all-nodes NA 会标记重复，不能以未验证的地址发送普通包。链路本地 bind 要求有效 scope/interface index，也可由 SO_BINDTODEVICE 提供；bind 的显式 scope 同时选择绑定设备，非法 index 返回 ENODEV，未配置或尚未可用的本地地址返回 EADDRNOTAVAIL。connect 的显式 scope 与已绑定设备冲突返回 EINVAL，sendto 则优先使用已绑定设备。rtnetlink GETADDR 显示实际地址、tentative/dadfailed 状态，GETROUTE dump 显示可用地址的本地及链路路由；IPv6 单条 route lookup 与 netlink 修改仍明确返回 EOPNOTSUPP。
 
-已支持真实 Ethernet 上 IPv6 TCP/UDP、ND 的 NS/NA 与 ICMPv6 echo responder。通过 AF_INET6 socket 的 SIOCSIFADDR/SIOCDIFADDR（Linux `in6_ifreq`）配置/删除静态单播地址，前缀 0–128；保留自动 link-local 槽位，另有两个静态地址槽位，满时返回 ENOBUFS。新地址必须完成 DAD。管理 DOWN 期间可添加永久地址，其 DAD 等到 UP 才进行；MTU<1280 时添加返回 EINVAL。当前静态地址配置限 Ethernet，不修改 `lo`。SIOCADDRT/SIOCDELRT 使用 Linux `in6_rtmsg`，支持唯一 IPv6 default gateway（metric 0/1024）；connected route 按实际地址前缀选择最长匹配，不再套用 lwIP 的隐含 /64 或 IPv4 default。源选择比较真实公共前缀并限制到源地址前缀，只有完整 128 位相等才当作本地地址完全匹配；配置、网关与前缀随 netif 生命周期，使用已有协议所有权，不引入动态 FIB、worker 或每包配置分配。非默认手工路由、source route、非支持 metric/flags 明确返回 EOPNOTSUPP。单独删除地址清理 ND/PMTU，但不偷偷删除已配置 default，也不修改既有 socket 的绑定或同步 abort TCP；重新添加同地址并完成 DAD 后既有 TCP 可以继续。最终输出拒绝失效源和任何物理出口的 `::1` 源/目的；显式设备或 /0/default 不得绕过 loopback 边界。未实现 SLAAC、IPv6 raw/ping socket 或 MLD 组播成员管理；不发送 Router Solicitation，忽略 Router Advertisement/Redirect。ND 所需组播不是应用组播订阅支持。IPv6 不进行发送分片或分片重组；atomic fragment（offset=0 且 M=0）可通过已有输入路径。UDP 超所选链路/路径 MTU 返回 EMSGSIZE，IPv6 零 checksum 与错误 checksum 丢弃，IPv4 的零 UDP checksum 规则不变。
+已支持真实 Ethernet 上 IPv6 TCP/UDP、ND 的 NS/NA 与 ICMPv6 echo responder。通过 AF_INET6 socket 的 SIOCSIFADDR/SIOCDIFADDR（Linux `in6_ifreq`）配置/删除静态单播地址，前缀 0–128；保留自动 link-local 槽位，另有两个静态地址槽位，满时返回 ENOBUFS。新地址必须完成 DAD。管理 DOWN 期间可添加永久地址，其 DAD 等到 UP 才进行；MTU<1280 时添加返回 EINVAL。当前静态地址配置限 Ethernet，不修改 `lo`。SIOCADDRT/SIOCDELRT 使用 Linux `in6_rtmsg`，支持唯一 IPv6 default gateway（metric 0/1024）；connected route 按实际地址前缀选择最长匹配，不再套用 lwIP 的隐含 /64 或 IPv4 default。源选择比较真实公共前缀并限制到源地址前缀，只有完整 128 位相等才当作本地地址完全匹配；配置、网关与前缀随 netif 生命周期，使用已有协议所有权，不引入动态 FIB、worker 或每包配置分配。非默认手工路由、source route、非支持 metric/flags 明确返回 EOPNOTSUPP。单独删除地址清理 ND/PMTU，但不偷偷删除已配置 default，也不修改既有 socket 的绑定或同步 abort TCP；重新添加同地址并完成 DAD 后既有 TCP 可以继续。最终输出拒绝失效源和任何物理出口的 `::1` 源/目的；显式设备或 /0/default 不得绕过 loopback 边界。提供下述 RA/SLAAC；未实现 IPv6 raw/ping socket 或 MLD 组播成员管理，忽略 Redirect、RIO、RDNSS/DHCPv6，不提供 Linux accept_ra/sysctl 配置面。ND 所需组播不是应用组播订阅支持。IPv6 不进行发送分片或分片重组；atomic fragment（offset=0 且 M=0）可通过普通输入路径，但任何含 Fragment Header 的 ND 报文按 RFC6980 丢弃，包括其后还有扩展头的情形。UDP 超所选链路/路径 MTU 返回 EMSGSIZE，IPv6 零 checksum 与错误 checksum 丢弃，IPv4 的零 UDP checksum 规则不变。
 
-接口管理 DOWN 删除静态 IPv6 地址/default、撤链路本地地址并清理 ND；UP 只自动重建链路本地地址并重新 DAD。carrier 暂时断开不等同管理 DOWN。运行时 MTU 变更清理该接口 ND 队列及目的 PMTU 缓存；低于 1280 删除静态 IPv6 地址/default 并停止该接口 IPv6 收发，恢复后只自动重建 link-local；这对应 Linux 默认 keep_addr_on_down=0，不支持地址保留 sysctl。最终 Ethernet IPv6 输出再次校验源地址可用性，防已绑定 socket 或延迟 ND 报文跨越地址失效继续使用旧源。UDP 与可能携带扩展头的非直接 TCP/ICMPv6 接收共用原有预算，保留控制报文余量。
+接口管理 DOWN 删除静态/动态 IPv6 地址/default、撤链路本地地址并清理 ND；UP 自动重建链路本地地址、重新 DAD 并发 RS，动态配置只能重新从 RA 学习。carrier 暂时断开不等同管理 DOWN。运行时 MTU 变更清理该接口 ND 队列及目的 PMTU 缓存；低于 1280 删除静态 IPv6 地址/default 并停止该接口 IPv6 收发，恢复后自动重建 link-local 并重新发 RS；这对应 Linux 默认 keep_addr_on_down=0，不支持地址保留 sysctl。最终 Ethernet IPv6 输出再次校验源地址可用性，防已绑定 socket 或延迟 ND 报文跨越地址失效继续使用旧源。UDP 与可能携带扩展头的非直接 TCP/ICMPv6 接收共用原有预算，保留控制报文余量。
+
+RA 在完整 Ethernet/IPv6/ICMPv6 校验后处理：来源必须 link-local、Hop Limit255、Code0，先扫描全部 option 边界和固定长度，再修改任何地址、路由或 MTU；未知合法 option（包括跨 pbuf 的长 option）跳过。同链路恶意但格式合法的 RA 仍可改变网络状态，本实现不是认证或 RA Guard。
+
+固定资源复用现有 ND 表与一秒定时器：两个静态槽、两个独立 SLAAC 槽、五个 L prefix 和三个 RA default router，不驱逐静态地址给自动配置让位。L 支持0–128任意前缀，A仅支持/64并从MAC派生IID；二者独立，A-only不生成隐含 connected route。静态同址不转换为动态。默认路由优先显式静态（metric1024），否则在RA（metric2048）内按邻居可达状态与router preference选择；始终先最长 connected prefix。NUD有限探测失败后保留广告寿命，但将邻居降级、清等待包/目的cache并停止空闲重试；活router优先，新实际发送或新RA才重新开启有限探测。该固定策略不是完整Linux FIB或多策略路由。
+
+SLAAC valid/preferred lifetime按RFC4862更新：preferred归零立即deprecated；两小时下限只保护已有地址valid，不保护L prefix或默认路由；无限值不递减。到期撤地址而保留绑定PCB，清ND排队及目的cache，最终输出仍拒绝失效源。RA MTU仅接受1280至物理MTU，可下降也可恢复；清旧PMTU并在TCP发送既有unsent/retransmit前按当前有效MSS切分，保留对端MSS限制。RA的hop-limit/reachable/retrans参数本阶段仍使用本地固定策略。
 
 定向验证：
 
 ```sh
-python3 tests/host/network_owner.py --case ipv6-global --case ipv6-linklocal --page-shift 12
-python3 tests/host/network_owner.py --case ipv6-global --case ipv6-linklocal --page-shift 14
+python3 tests/host/network_owner.py --case ipv6-ra --case ipv6-global --case ipv6-linklocal --page-shift 12
+python3 tests/host/network_owner.py --case ipv6-ra --case ipv6-global --case ipv6-linklocal --page-shift 14
+python3 tests/host/tcp-ipv6-mtu.py --page-shift 12
+sh tests/host/rtnetlink-ipv6-ra.sh
 python3 tests/userland/ipv6-external.py --arch riscv --cpus 4 --kernel <kernel> --program <ipv6_external ELF>
 python3 tests/userland/ipv6-external.py --arch loongarch --cpus 2 --kernel <kernel> --program <ipv6_external ELF> --qemu <qemu>
 ```
 
-静态 global 验证复用下列 runner 的 `--global-address`，ELF 编译增加 `-DIPV6_STATIC_GLOBAL`：先以 `2001:db8:1::100/64` 完成 UDP，再改 /128 验证没有路由时失败，增加 `fe80::2` default 后通过 TCP，删除 default 后再次不可达并清理地址。
+静态 global 验证复用下列 runner 的 `--global-address`，ELF 编译增加 `-DIPV6_STATIC_GLOBAL`：先以 `2001:db8:1::100/64` 完成 UDP，再改 /128并增加 `fe80::2` static default通过TCP；删除/重加绑定地址保持TCP并清理静态配置。RA路由可同时存在，删除static default不再假定必然不可达。SLAAC用 `--slaac` 配合 `-DIPV6_SLAAC`，不调用地址配置ioctl，由真实slirp RA生成全局地址并通信；注入畸形尾option、错误source/hop/checksum、atomic及atomic+options RA，后续1452字节UDP证明非法MTU更新未生效。
 
-ELF 来源 `tests/workloads/network/ipv6_external.c`，以目标 musl 静态编译（LA 链接页对齐 16384）。外部 runner 显式配置 QEMU slirp 的 IPv6 prefix/host 为 `fe80::/64`、`fe80::2`，由独立宿主 IPv6 TCP/UDP socket 验证内容，不是 guest 的 `::1` 回环。UDP 检查 64/1232/1452 字节内容、peer/scope、1453 字节错误边界；TCP 检查 64 KiB 全内容和半关闭/EOF。QEMU Ethernet 注入通道依次送零 checksum、错误 checksum 和正确响应，以正确响应作为处理顺序屏障。host 用例另外覆盖 DAD 冲突、地址失效、ND 队列清理、MTU 恢复、RA 不安装路由和设备失败。`ipv6-prepare-withdraw` 在真实 parallel prepare 与 commit 之间撤销并释放模型接口，验证准备阶段仅保存数值 scope、提交阶段持协议资格查找接口，并完整归还 payload/request/pin；真实 NIC stop 另外先 drain 活动调用者。每次外部运行保存命令和 kernel/program SHA256 manifest，并在结束时再次核对身份。测试不声称公网、Linux TAP 差分、实板或性能收益。
+ELF 来源 `tests/workloads/network/ipv6_external.c`，以目标 musl 静态编译（LA 链接页对齐 16384）。外部 runner 显式配置 QEMU slirp 的 IPv6 prefix/host 为 `fe80::/64`、`fe80::2`，由独立宿主 IPv6 TCP/UDP socket 验证内容，不是 guest 的 `::1` 回环。UDP 检查 64/1232/1452 字节内容、peer/scope、1453 字节错误边界；TCP 检查 64 KiB 全内容和半关闭/EOF。QEMU Ethernet 注入通道依次送零 checksum、错误 checksum 和正确响应，以正确响应作为处理顺序屏障。host 用例另外覆盖 DAD 冲突、地址失效、ND 队列清理、MTU 恢复、RA完整预检、L/A独立、寿命与路由到期和设备失败。`ipv6-prepare-withdraw` 在真实 parallel prepare 与 commit 之间撤销并释放模型接口，验证准备阶段仅保存数值 scope、提交阶段持协议资格查找接口，并完整归还 payload/request/pin；真实 NIC stop 另外先 drain 活动调用者。每次外部运行保存命令和 kernel/program SHA256 manifest，并在结束时再次核对身份。测试不声称公网、Linux TAP 差分、实板或性能收益。
 
 Linux ioctl/DOWN/MTU/删除匹配参考 [Linux v6.12 addrconf.c](https://github.com/torvalds/linux/blob/v6.12/net/ipv6/addrconf.c)、[route.c](https://github.com/torvalds/linux/blob/v6.12/net/ipv6/route.c)。本环境不具备 Linux NET_ADMIN/TAP，未执行 namespace 配置差分。
 

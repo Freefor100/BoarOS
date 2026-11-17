@@ -27,10 +27,12 @@
 #define IP_DEFAULT_TTL 64
 #define LWIP_IPV6 1
 #define LWIP_IPV6_MLD 0
-#define LWIP_IPV6_AUTOCONFIG 0
-/* Addresses and the default gateway are configured explicitly, not by RA. */
-#define LWIP_IPV6_SEND_ROUTER_SOLICIT 0
-#define BOAROS_LWIP_NO_ROUTER_DISCOVERY 1
+#define LWIP_IPV6_AUTOCONFIG 1
+#define LWIP_IPV6_NUM_ADDRESSES 5
+#define BOAROS_LWIP_STATIC_IP6_SLOTS 2
+/* Reuse the bounded ND tables and timer for host router discovery. */
+#define LWIP_IPV6_SEND_ROUTER_SOLICIT 1
+#define BOAROS_LWIP_NO_REDIRECT 1
 #define BOAROS_LWIP_STATIC_IPV6 1
 #define LWIP_IPV6_REASS 0
 #define LWIP_IPV6_FRAG 0

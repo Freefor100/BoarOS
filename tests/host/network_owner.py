@@ -12,7 +12,7 @@ cases = ('async-events', 'ipv4-address-shutdown', 'ipv4-route', 'unix-shutdown-s
 cases += ('tcp-quota-notify', 'remote-quota-notify', 'remote-batch-writers', 'remote-direct', 'queued-completion')
 cases += ('tcp-loopback-checksum', 'tcp-detached', 'tcp-input-output', 'tcp-reset-receive-retry', 'raw-tcp-ingress')
 cases += ('tcp-more', 'tcp-cork', 'receive-reuse-udp', 'receive-reuse-tcp')
-cases += ('ipv6-source-prefix', 'ipv6-global', 'ipv6-prepare-withdraw', 'ipv6-linklocal', 'raw-icmp-owner', 'raw-icmp-close', 'ipv4-options')
+cases += ('ipv6-ra', 'ipv6-source-prefix', 'ipv6-global', 'ipv6-prepare-withdraw', 'ipv6-linklocal', 'raw-icmp-owner', 'raw-icmp-close', 'ipv4-options')
 parser.add_argument('--case', choices=(*cases, 'all'), action='append', help='repeat to share one host build; default: all')
 parser.add_argument('--sanitize', action='store_true')
 parser.add_argument('--page-shift', type=int, choices=(12, 14), default=12)

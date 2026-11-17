@@ -343,7 +343,7 @@ ip6_select_source_address(struct netif *netif, const ip6_addr_t *dest)
     if (cand_bits == 128) {
       return netif_ip_addr6(netif, i);
     }
-    if (netif->ip6_configured[i] && cand_bits > netif->ip6_prefix[i])
+    if ((netif->ip6_configured[i] || !netif_ip6_addr_isstatic(netif,i)) && cand_bits > netif->ip6_prefix[i])
       cand_bits = netif->ip6_prefix[i];
 #else
     cand_bits = ip6_addr_net_zoneless_eq(cand_addr, dest);
@@ -527,6 +527,7 @@ ip6_input(struct pbuf *p, struct netif *inp)
   struct netif *netif;
   const u8_t *nexth;
   u16_t hlen, hlen_tot; /* the current header length */
+  u8_t had_fragment = 0;
 #if 0 /*IP_ACCEPT_LINK_LAYER_ADDRESSING*/
   @todo
   int check_ip_src=1;
@@ -979,6 +980,7 @@ netif_found:
     case IP6_NEXTH_FRAGMENT:
     {
       struct ip6_frag_hdr *frag_hdr;
+      had_fragment = 1;
       LWIP_DEBUGF(IP6_DEBUG, ("ip6_input: packet with Fragment header\n"));
 
       frag_hdr = (struct ip6_frag_hdr *)p->payload;
@@ -1097,6 +1099,11 @@ options_done:
 #endif /* LWIP_TCP */
 #if LWIP_ICMP6
     case IP6_NEXTH_ICMP6:
+      /* RFC 6980 includes atomic fragments and extension headers following
+       * the fragment header. Never pass fragmented ND to the state machine. */
+      if (had_fragment && p->tot_len && pbuf_get_at(p,0)>=133 && pbuf_get_at(p,0)<=137) {
+        pbuf_free(p);IP6_STATS_INC(ip6.drop);break;
+      }
       icmp6_input(p, inp);
       break;
 #endif /* LWIP_ICMP */

@@ -3,6 +3,7 @@
 
 #include "lwip/sys.h"
 #include "lwip/tcp.h"
+#include "lwip/nd6.h"
 #include "boaros_lwip.h"
 
 #include <stdint.h>
@@ -107,6 +108,11 @@ void boaros_lwip_ip_unlock(struct kernel_lock_guard *guard)
 #else
     (void)guard;
 #endif
+}
+
+uint32_t boaros_lwip_centiseconds(void)
+{
+    return (uint32_t)(kernel_time_monotonic_ns() / UINT64_C(10000000));
 }
 
 u32_t sys_now(void)
@@ -224,7 +230,7 @@ int boaros_lwip_ip6_prefix_bits(const ip6_addr_t *a,const ip6_addr_t *b)
 }
 int boaros_lwip_ip6_onlink(struct netif *n,const ip6_addr_t *destination)
 {
-    int best=-1;
+    int best=nd6_onlink_prefix_length(n,destination);
     if(ip6_addr_islinklocal(destination))return 64;
     for(unsigned i=0;i<LWIP_IPV6_NUM_ADDRESSES;i++) {
         if(!ip6_addr_isvalid(netif_ip6_addr_state(n,i)))continue;
@@ -239,7 +245,7 @@ int boaros_lwip_ip6_onlink(struct netif *n,const ip6_addr_t *destination)
 }
 struct netif *boaros_lwip_ip6_route(const ip6_addr_t *source,const ip6_addr_t *destination)
 {
-    struct netif *best=NULL,*fallback=NULL;int length=-1;
+    struct netif *best=NULL,*fallback=NULL,*advertised=NULL;int length=-1;
     for(struct netif *n=netif_list;n;n=n->next) {
         if(!netif_is_up(n) || !netif_is_link_up(n) || (n->hwaddr_len && n->mtu<1280))continue;
         int source_ok=ip6_addr_isany(source),global=0;
@@ -253,6 +259,7 @@ struct netif *boaros_lwip_ip6_route(const ip6_addr_t *source,const ip6_addr_t *d
         int prefix=boaros_lwip_ip6_onlink(n,destination);
         if(prefix>length){best=n;length=prefix;}
         if(global && !ip6_addr_isany(&n->ip6_gateway))fallback=n;
+        else if(global && nd6_default_gateway(n))advertised=n;
     }
-    return best?best:fallback;
+    return best?best:fallback?fallback:advertised;
 }

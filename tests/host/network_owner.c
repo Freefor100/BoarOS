@@ -9,6 +9,7 @@
 #include <kernel/wait_internal.h>
 #include "lwip/inet_chksum.h"
 #include "lwip/tcp.h"
+#include "lwip/priv/nd6_priv.h"
 static err_t copy_capacity_tcp_writev(struct tcp_pcb *,
     const struct kernel_socket_write_segment *,unsigned,u16_t,u8_t,u16_t *);
 static err_t held_completion_tcp_output(struct tcp_pcb *, u8_t);
@@ -164,7 +165,8 @@ static unsigned unix_credit_copy_observed;
 static unsigned heap_live, dma_eligible, nic_full, copy_attempts, copied_packets, segment_attempts, captured_size;
 static void (*heap_release_once)(void *);
 static uint64_t clock_ns = 1000000000ULL;
-static unsigned char captured[1536];
+static unsigned char captured[1536],captured_dad_target[16];
+static unsigned captured_dad_packets,captured_router_probes;
 static unsigned fixed_random;
 static uint32_t random_value;
 
@@ -419,6 +421,13 @@ int virtio_net_send_copy(struct virtio_net_device *device, uint32_t size,
     if (nic_full) return -KERNEL_EAGAIN;
     CHECK(size <= sizeof(captured) && copy(context, captured, size));
     captured_size = size;
+    if(size>=78 && captured[12]==0x86 && captured[13]==0xdd && captured[20]==58 && captured[54]==135 &&
+       !memcmp(captured+22,(unsigned char[16]){0},16)) {
+        memcpy(captured_dad_target,captured+62,16);captured_dad_packets++;
+    }
+    if(size>=78 && captured[12]==0x86 && captured[13]==0xdd && captured[20]==58 && captured[54]==135 &&
+       !memcmp(captured+62,(unsigned char[16]){0xfe,0x80,0,0,0,0,0,0,0,0,0,0,0,0,0,2},16) &&
+       memcmp(captured+22,(unsigned char[16]){0},16))captured_router_probes++;
     ++copied_packets;
     return 0;
 }
@@ -3783,6 +3792,255 @@ static void ipv6_inject_protocol(struct netif *n,const ip6_addr_t *src,const ip6
 static void ipv6_inject(struct netif *n,const ip6_addr_t *src,const ip6_addr_t *dst,
                         const unsigned char *body,unsigned length)
 { ipv6_inject_protocol(n,src,dst,body,length,58,2); }
+/* Every RA below enters through Ethernet and the IPv6/ICMPv6 checksum path.
+ * Fragment and chained-pbuf cases deliberately keep the wire headers intact. */
+static void ra_wire(struct netif *n,const ip6_addr_t *src,const ip6_addr_t *dst,
+    const unsigned char *body,unsigned length,unsigned hop,unsigned bad,unsigned fragment,unsigned chained)
+{
+    unsigned ext=fragment==2?16:fragment?8:0,total=54+ext+length;
+    unsigned char bytes[1024]={0};CHECK(total<=sizeof(bytes));
+    memcpy(bytes,n->hwaddr,6);memcpy(bytes+6,(unsigned char[]){0x52,0x55,0,0,0,2},6);
+    bytes[12]=0x86;bytes[13]=0xdd;bytes[14]=0x60;
+    bytes[18]=(ext+length)>>8;bytes[19]=ext+length;bytes[20]=fragment?44:58;bytes[21]=hop;
+    memcpy(bytes+22,src->addr,16);memcpy(bytes+38,dst->addr,16);
+    if(fragment)bytes[54]=fragment==2?60:58;
+    if(fragment==2)bytes[62]=58;
+    memcpy(bytes+54+ext,body,length);
+    struct pbuf *check=pbuf_alloc(PBUF_RAW,(u16_t)length,PBUF_RAM);CHECK(check);
+    memcpy(check->payload,body,length);
+    uint16_t sum=ip6_chksum_pseudo(check,58,(u16_t)length,src,dst);pbuf_free(check);
+    if(bad)sum^=0x1234;
+    memcpy(bytes+56+ext,&sum,2);
+    unsigned first=chained?75:total;CHECK(first<=total);
+    struct pbuf *p=pbuf_alloc(PBUF_RAW,(u16_t)first,PBUF_RAM);CHECK(p);memcpy(p->payload,bytes,first);
+    if(first<total){struct pbuf *tail=pbuf_alloc(PBUF_RAW,(u16_t)(total-first),PBUF_RAM);CHECK(tail);
+      memcpy(tail->payload,bytes+first,total-first);pbuf_cat(p,tail);}
+    CHECK(ethernet_input(p,n)==ERR_OK);
+}
+static void ra_put32(unsigned char *p,uint32_t value)
+{p[0]=value>>24;p[1]=value>>16;p[2]=value>>8;p[3]=value;}
+static void ra_pio(unsigned char *p,const char *prefix,unsigned bits,unsigned flags,uint32_t valid,uint32_t preferred)
+{
+    memset(p,0,32);p[0]=3;p[1]=4;p[2]=bits;p[3]=flags;
+    ra_put32(p+4,valid);ra_put32(p+8,preferred);
+    ip6_addr_t address;CHECK(ip6addr_aton(prefix,&address));memcpy(p+16,address.addr,16);
+}
+struct ra_state {
+    struct nd6_router_list_entry routers[LWIP_ND6_NUM_ROUTERS];
+    struct nd6_prefix_list_entry prefixes[LWIP_ND6_NUM_PREFIXES];
+    struct nd6_neighbor_cache_entry neighbors[LWIP_ND6_NUM_NEIGHBORS];
+    struct nd6_destination_cache_entry destinations[LWIP_ND6_NUM_DESTINATIONS];
+    ip_addr_t addresses[LWIP_IPV6_NUM_ADDRESSES];
+    uint32_t valid[LWIP_IPV6_NUM_ADDRESSES],preferred[LWIP_IPV6_NUM_ADDRESSES];
+    uint8_t states[LWIP_IPV6_NUM_ADDRESSES];uint16_t mtu;uint8_t solicit;
+};
+static void ra_snapshot(struct netif *n,struct ra_state *s)
+{
+    memset(s,0,sizeof(*s));memcpy(s->routers,default_router_list,sizeof(s->routers));
+    memcpy(s->prefixes,prefix_list,sizeof(s->prefixes));memcpy(s->neighbors,neighbor_cache,sizeof(s->neighbors));
+    memcpy(s->destinations,destination_cache,sizeof(s->destinations));
+    memcpy(s->addresses,n->ip6_addr,sizeof(s->addresses));memcpy(s->states,n->ip6_addr_state,sizeof(s->states));
+    memcpy(s->valid,n->ip6_addr_valid_life,sizeof(s->valid));memcpy(s->preferred,n->ip6_addr_pref_life,sizeof(s->preferred));
+    s->mtu=netif_mtu6(n);s->solicit=n->rs_count;
+}
+static void ra_rejected(struct netif *n,const ip6_addr_t *source,const ip6_addr_t *dest,
+    const unsigned char *ra,unsigned length,unsigned hop,unsigned bad,unsigned fragment)
+{
+    struct ra_state before,after;ra_snapshot(n,&before);uint32_t memory=lwip_stats.mem.used;
+    ra_wire(n,source,dest,ra,length,hop,bad,fragment,0);ra_snapshot(n,&after);
+    CHECK(!memcmp(&before,&after,sizeof(before)));CHECK(lwip_stats.mem.used==memory);
+}
+static void ipv6_ra(void)
+{
+    kernel_socket_network_initialize();
+    struct virtio_net_device device={.mac={0x52,0x54,0,0x12,0x34,0x56}};
+    struct kernel_network network={.device=&device};struct netif *n=&network.interface;
+    ip4_addr_t local={lwip_htonl(0x0a4d0002)},mask={lwip_htonl(0xffffff00)},zero={0};
+    CHECK(netif_add(n,&local,&mask,&zero,&network,interface_init,ethernet_input));
+    netif_create_ip6_linklocal_address(n,1);netif_set_up(n);netif_set_link_up(n);
+    for(unsigned i=0;i<3;i++)nd6_tmr();
+    CHECK(ip6_addr_ispreferred(netif_ip6_addr_state(n,0)));
+    ip6_addr_t peer,dst,global,a,b;CHECK(ip6addr_aton("fe80::2",&peer));ip6_addr_assign_zone(&peer,IP6_UNICAST,n);
+    CHECK(ip6addr_aton("ff02::1",&dst));ip6_addr_assign_zone(&dst,IP6_MULTICAST,n);
+    CHECK(ip6addr_aton("2001:db8:99::2",&global));
+    unsigned char ra[256]={134,0,0,0,64,0,0,60};
+    ra_pio(ra+16,"2001:db8:1::",64,0xc0,10000,9000);
+    ra[48]=5;ra[49]=1;ra_put32(ra+52,1300);
+    ra_rejected(n,&peer,&dst,ra,56,254,0,0);
+    ra_rejected(n,&global,&dst,ra,56,255,0,0);
+    ra_rejected(n,&peer,&dst,ra,56,255,1,0);
+    ra[1]=1;ra_rejected(n,&peer,&dst,ra,56,255,0,0);ra[1]=0;
+    ra_rejected(n,&peer,&dst,ra,15,255,0,0);
+    ra[56]=254;ra_rejected(n,&peer,&dst,ra,57,255,0,0);
+    ra[57]=0;ra_rejected(n,&peer,&dst,ra,58,255,0,0);
+    ra[57]=2;ra_rejected(n,&peer,&dst,ra,64,255,0,0);
+    ra_rejected(n,&peer,&dst,ra,56,255,0,1);
+    ra_rejected(n,&peer,&dst,ra,56,255,0,2);
+    ra_rejected(n,netif_ip6_addr(n,0),&dst,ra,56,255,0,0);
+    ra[49]=2;ra_rejected(n,&peer,&dst,ra,64,255,0,0);ra[49]=1;
+    ra[17]=3;ra_rejected(n,&peer,&dst,ra,56,255,0,0);ra[17]=4;
+    ra[56]=1;ra[57]=1;memset(ra+58,0,6);ra[58]=0x33;
+    ra_rejected(n,&peer,&dst,ra,64,255,0,0);
+    /* A new zero-lifetime prefix must not allocate a SLAAC slot. */
+    unsigned char empty[48]={134};ra_pio(empty+16,"2001:db8:8::",64,0x40,0,0);
+    ra_wire(n,&peer,&dst,empty,sizeof(empty),255,0,0,0);
+    CHECK(ip6_addr_isinvalid(netif_ip6_addr_state(n,3)));
+    /* Valid unknown option > the old RA scratch buffer, split across pbufs. */
+    memset(ra+56,0,128);ra[56]=254;ra[57]=16;
+    ra_wire(n,&peer,&dst,ra,184,255,0,0,1);
+    CHECK(netif_mtu6(n)==1300 && nd6_default_gateway(n));
+    CHECK(ip6_addr_istentative(netif_ip6_addr_state(n,3)) && netif_ip6_addr_valid_life(n,3)==10000);
+    CHECK(ip6_addr_isinvalid(netif_ip6_addr_state(n,1)) && ip6_addr_isinvalid(netif_ip6_addr_state(n,2)));
+    CHECK(ip6addr_aton("2001:db8:1::777",&a));CHECK(nd6_onlink_prefix_length(n,&a)==64);
+    for(unsigned i=0;i<3;i++)nd6_tmr();
+    CHECK(ip6_addr_ispreferred(netif_ip6_addr_state(n,3)));
+    /* MTU restoration is not restricted to monotonically decreasing values. */
+    ra_put32(ra+52,1500);ra_wire(n,&peer,&dst,ra,56,255,0,0,0);CHECK(netif_mtu6(n)==1500);
+    /* A-only creates an address, not a connected /64 route. */
+    ra_pio(ra+16,"2001:db8:2::",64,0x40,9000,8000);
+    ra_wire(n,&peer,&dst,ra,48,255,0,0,0);CHECK(ip6_addr_istentative(netif_ip6_addr_state(n,4)));
+    CHECK(ip6addr_aton("2001:db8:2::777",&b));CHECK(nd6_onlink_prefix_length(n,&b)==-1);
+    /* L-only arbitrary prefix and neither-flag update do not create addresses. */
+    ra_pio(ra+16,"2001:db8:3:abcd::",80,0x80,40,30);ra_wire(n,&peer,&dst,ra,48,255,0,0,0);
+    CHECK(ip6addr_aton("2001:db8:3:abcd::77",&b));CHECK(nd6_onlink_prefix_length(n,&b)==80);
+    ra_pio(ra+16,"2001:db8:3:abcd::",80,0,0,0);ra_wire(n,&peer,&dst,ra,48,255,0,0,0);
+    CHECK(nd6_onlink_prefix_length(n,&b)==80);
+    /* preferred > valid invalidates the whole PIO, even L-only. The RA
+     * router lifetime may refresh, but address and prefix lifetimes cannot. */
+    for(unsigned flags=0x80;flags<=0xc0;flags+=0x40) {
+        struct nd6_prefix_list_entry saved[LWIP_ND6_NUM_PREFIXES];
+        memcpy(saved,prefix_list,sizeof(saved));
+        uint32_t valid=netif_ip6_addr_valid_life(n,3),preferred=netif_ip6_addr_pref_life(n,3);
+        ra_pio(ra+16,"2001:db8:1::",64,flags,10,11);ra_wire(n,&peer,&dst,ra,48,255,0,0,0);
+        CHECK(!memcmp(saved,prefix_list,sizeof(saved)) && netif_ip6_addr_valid_life(n,3)==valid &&
+          netif_ip6_addr_pref_life(n,3)==preferred);
+    }
+    /* Router and L route lifetimes have NO address two-hour floor. */
+    ra[6]=ra[7]=0;ra_pio(ra+16,"2001:db8:1::",64,0xc0,0,0);
+    ra_wire(n,&peer,&dst,ra,48,255,0,0,0);
+    CHECK(!nd6_default_gateway(n) && nd6_onlink_prefix_length(n,&a)==-1);
+    CHECK(netif_ip6_addr_valid_life(n,3)==7200 && ip6_addr_isdeprecated(netif_ip6_addr_state(n,3)));
+    ra_wire(n,&peer,&dst,ra,48,255,0,0,0);CHECK(netif_ip6_addr_valid_life(n,3)==7200);
+    nd6_tmr();ra_wire(n,&peer,&dst,ra,48,255,0,0,0);CHECK(netif_ip6_addr_valid_life(n,3)==7199);
+    /* Invalid preferred lifetime ignored; infinite values never decrement. */
+    ra_pio(ra+16,"2001:db8:1::",64,0x40,10,11);ra_wire(n,&peer,&dst,ra,48,255,0,0,0);
+    CHECK(netif_ip6_addr_valid_life(n,3)==7199);
+    ra_pio(ra+16,"2001:db8:1::",64,0xc0,UINT32_MAX,UINT32_MAX);ra[7]=1;
+    ra_wire(n,&peer,&dst,ra,48,255,0,0,0);nd6_tmr();
+    CHECK(!nd6_default_gateway(n) && netif_ip6_addr_valid_life(n,3)==UINT32_MAX &&
+      netif_ip6_addr_pref_life(n,3)==UINT32_MAX && nd6_onlink_prefix_length(n,&a)==64);
+    /* Same-router RA completes a previously unresolved next hop and must
+     * release the old queued datagram exactly once, not discard it. */
+    {
+        unsigned char advertise[24]={134,0,0,0,64,0,0,60,0,0,0,0,0,0,0,0,1,1,0x52,0x55,0,0,0,2};
+        ra_wire(n,&peer,&dst,advertise,16,255,0,0,0);
+        struct kernel_socket *sender=NULL;CHECK(!kernel_socket_create(&test_heap,10,SOCKET_DGRAM,0,&sender));
+        struct kernel_socket_address source={.family=10},target={.family=10,.port=19225};
+        memcpy(source.bytes,netif_ip6_addr(n,3)->addr,16);memcpy(target.bytes,global.addr,16);
+        CHECK(!kernel_socket_bind(sender,&source));
+        struct kernel_open_file_description *pin=(void *)sender;
+        struct kernel_uaccess_iovec iov={(uintptr_t)"queued-ra",9};
+        netif_poll_all();uint32_t memory=lwip_stats.mem.used;unsigned live=heap_live;
+        CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,9,0,&target,NULL)==9);
+        CHECK(lwip_stats.memp[MEMP_ND6_QUEUE]->used==1 && !sender->tx_reserved);
+        unsigned packets=copied_packets;
+        ra_wire(n,&peer,&dst,advertise,sizeof(advertise),255,0,0,0);
+        CHECK(copied_packets==packets+1 && captured_size==71 && captured[20]==17 &&
+          !memcmp(captured+62,"queued-ra",9) && !memcmp(captured,advertise+18,6));
+        CHECK(!lwip_stats.memp[MEMP_ND6_QUEUE]->used && lwip_stats.mem.used==memory && heap_live==live);
+        packets=copied_packets;ra_wire(n,&peer,&dst,advertise,sizeof(advertise),255,0,0,0);
+        CHECK(copied_packets==packets && !lwip_stats.memp[MEMP_ND6_QUEUE]->used);
+        advertise[7]=0;ra_wire(n,&peer,&dst,advertise,sizeof(advertise),255,0,0,0);
+        kernel_socket_destroy(sender);
+    }
+    /* A real output packet selects static default first, then RA after delete;
+     * withdrawing the RA clears the cached gateway for this same destination. */
+    unsigned char router[24]={134,0,0,0,64,0,0,60,0,0,0,0,0,0,0,0,1,1,0x52,0x55,0,0,0,2};
+    ra_wire(n,&peer,&dst,router,sizeof(router),255,0,0,0);
+    ip6_addr_t manual;CHECK(ip6addr_aton("fe80::10",&manual));ip6_addr_assign_zone(&manual,IP6_UNICAST,n);
+    CHECK(!kernel_socket_ipv6_gateway(netif_get_index(n),(void *)manual.addr,0));
+    struct kernel_socket *routed=NULL;CHECK(!kernel_socket_create(&test_heap,10,SOCKET_DGRAM,0,&routed));
+    struct kernel_socket_address route_source={.family=10},route_dest={.family=10,.port=19224};
+    memcpy(route_source.bytes,netif_ip6_addr(n,3)->addr,16);memcpy(route_dest.bytes,global.addr,16);
+    CHECK(!kernel_socket_bind(routed,&route_source));
+    struct kernel_open_file_description *route_pin=(void *)routed;
+    struct kernel_uaccess_iovec route_iov={(uintptr_t)"route",5};
+    CHECK(kernel_socket_write_datagram(&route_pin,NULL,&route_iov,1,5,0,&route_dest,NULL)==5);
+    unsigned found=0;
+    for(unsigned i=0;i<LWIP_ND6_NUM_DESTINATIONS;i++)if(ip6_addr_zoneless_eq(&destination_cache[i].destination_addr,&global)) {
+        CHECK(ip6_addr_zoneless_eq(&destination_cache[i].next_hop_addr,&manual));found++;
+    }
+    CHECK(found==1 && lwip_stats.memp[MEMP_ND6_QUEUE]->used);
+    CHECK(!kernel_socket_ipv6_gateway(netif_get_index(n),(void *)manual.addr,2));
+    CHECK(!lwip_stats.memp[MEMP_ND6_QUEUE]->used);
+    CHECK(kernel_socket_write_datagram(&route_pin,NULL,&route_iov,1,5,0,&route_dest,NULL)==5);
+    CHECK(captured_size==67 && captured[20]==17 && !memcmp(captured+62,"route",5) &&
+      !memcmp(captured,(unsigned char[]){0x52,0x55,0,0,0,2},6));
+    found=0;for(unsigned i=0;i<LWIP_ND6_NUM_DESTINATIONS;i++)
+      if(ip6_addr_zoneless_eq(&destination_cache[i].destination_addr,&global)) {
+        CHECK(ip6_addr_zoneless_eq(&destination_cache[i].next_hop_addr,&peer));found++;
+      }
+    CHECK(found==1);
+    /* A high-preference router that exhausts real NUD probes cannot keep a
+     * destination cache pinned while a lower-preference reachable peer exists. */
+    ip6_addr_t lower;CHECK(ip6addr_aton("fe80::3",&lower));ip6_addr_assign_zone(&lower,IP6_UNICAST,n);
+    unsigned char low_router[24];memcpy(low_router,router,sizeof(router));low_router[5]=0x18;low_router[23]=3;
+    router[5]=0x08;ra_wire(n,&peer,&dst,router,sizeof(router),255,0,0,0);
+    ra_wire(n,&lower,&dst,low_router,sizeof(low_router),255,0,0,0);
+    CHECK(kernel_socket_write_datagram(&route_pin,NULL,&route_iov,1,5,0,&route_dest,NULL)==5);
+    CHECK(captured_size==67 && !memcmp(captured,router+18,6));
+    struct nd6_neighbor_cache_entry *high=NULL;
+    for(unsigned i=0;i<LWIP_ND6_NUM_NEIGHBORS;i++)
+      if(neighbor_cache[i].netif==n && ip6_addr_zoneless_eq(&neighbor_cache[i].next_hop_address,&peer))high=&neighbor_cache[i];
+    CHECK(high && high->isrouter);high->state=ND6_PROBE;high->counter.probes_sent=LWIP_ND6_MAX_MULTICAST_SOLICIT-1;
+    unsigned probes=captured_router_probes;nd6_tmr();CHECK(captured_router_probes==probes+1);
+    nd6_tmr();CHECK(high->state==ND6_INCOMPLETE && high->counter.probes_sent>LWIP_ND6_MAX_MULTICAST_SOLICIT);
+    uint32_t exhausted=high->counter.probes_sent;probes=captured_router_probes;
+    CHECK(kernel_socket_write_datagram(&route_pin,NULL,&route_iov,1,5,0,&route_dest,NULL)==5);
+    CHECK(captured_size==67 && captured[20]==17 && !memcmp(captured,low_router+18,6) && !memcmp(captured+62,"route",5));
+    for(unsigned tick=0;tick<10;tick++)nd6_tmr();
+    CHECK(high->counter.probes_sent==exhausted && captured_router_probes==probes);
+    low_router[7]=0;ra_wire(n,&lower,&dst,low_router,sizeof(low_router),255,0,0,0);
+    router[7]=0;ra_wire(n,&peer,&dst,router,sizeof(router),255,0,0,0);
+    CHECK(kernel_socket_write_datagram(&route_pin,NULL,&route_iov,1,5,0,&route_dest,NULL)==-KERNEL_ENETUNREACH);
+    kernel_socket_destroy(routed);
+    /* Exhausted SLAAC slots must leave both manual slots available. */
+    ra_pio(ra+16,"2001:db8:4::",64,0x40,500,400);ra_wire(n,&peer,&dst,ra,48,255,0,0,0);
+    CHECK(ip6_addr_isinvalid(netif_ip6_addr_state(n,1)) && ip6_addr_isinvalid(netif_ip6_addr_state(n,2)));
+    CHECK(ip6addr_aton("2001:db8:4::5054:ff:fe12:3456",&b));
+    CHECK(!kernel_socket_ipv6_address(netif_get_index(n),(const uint8_t *)b.addr,64,0));
+    ra_wire(n,&peer,&dst,ra,48,255,0,0,0);
+    CHECK(n->ip6_configured[1] && netif_ip6_addr_isstatic(n,1));
+    /* Existing address natural expiry preserves bound PCB, clears queued ND. */
+    for(unsigned i=0;i<3;i++)nd6_tmr();
+    struct kernel_socket *socket=NULL;CHECK(!kernel_socket_create(&test_heap,10,SOCKET_DGRAM,0,&socket));
+    struct kernel_socket_address bound={.family=10,.port=19222};memcpy(bound.bytes,netif_ip6_addr(n,4)->addr,16);
+    CHECK(!kernel_socket_bind(socket,&bound));struct udp_pcb *pcb=socket->udp;
+    struct kernel_socket_address remote={.family=10,.port=19223,.scope=netif_get_index(n)};
+    CHECK(ip6addr_aton("fe80::dead",&b));memcpy(remote.bytes,b.addr,16);
+    struct kernel_open_file_description *pin=(void *)socket;struct kernel_uaccess_iovec iov={(uintptr_t)"expire",6};
+    CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,6,0,&remote,NULL)==6);
+    CHECK(lwip_stats.memp[MEMP_ND6_QUEUE]->used);
+    netif_ip6_addr_set_valid_life(n,4,1);nd6_tmr();
+    CHECK(!lwip_stats.memp[MEMP_ND6_QUEUE]->used);
+    CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,6,0,&remote,NULL)==-KERNEL_ENETUNREACH);
+    CHECK(ip6_addr_isinvalid(netif_ip6_addr_state(n,4)) && socket->udp==pcb && !socket->pending_error);
+    kernel_socket_destroy(socket);
+    ra_pio(ra+16,"2001:db8:2::",64,0x40,100,90);ra_wire(n,&peer,&dst,ra,48,255,0,0,0);
+    CHECK(ip6_addr_istentative(netif_ip6_addr_state(n,4)));
+    unsigned char duplicate[24]={136};memcpy(duplicate+8,netif_ip6_addr(n,4)->addr,16);
+    ipv6_inject(n,&peer,&dst,duplicate,sizeof(duplicate));
+    CHECK(ip6_addr_isduplicated(netif_ip6_addr_state(n,4)));
+    CHECK(!kernel_socket_interface_set_flags((char[16]){"eth0"},0));
+    CHECK(!nd6_default_gateway(n) && nd6_onlink_prefix_length(n,&a)==-1);
+    for(unsigned i=0;i<LWIP_IPV6_NUM_ADDRESSES;i++)CHECK(ip6_addr_isinvalid(netif_ip6_addr_state(n,i)));
+    CHECK(!kernel_socket_interface_set_flags((char[16]){"eth0"},1));
+    CHECK(ip6_addr_istentative(netif_ip6_addr_state(n,0)));
+    CHECK(!kernel_socket_interface_set_mtu((char[16]){"eth0"},1200));ra_rejected(n,&peer,&dst,ra,48,255,0,0);
+    netif_poll_all();nd6_cleanup_netif(n);netif_remove(n);CHECK(!heap_live);
+    puts("PASS RA full-wire preflight/checksum/fragments, L/A, DAD, lifetimes, bounded coexistence, MTU and teardown");
+}
+
 static void ipv6_prepare_withdraw(void)
 {
     kernel_socket_network_initialize();boaros_lwip_ip_init(2);
@@ -3845,8 +4103,8 @@ static void ipv6_linklocal(void)
     address.scope=netif_get_index(n);CHECK(kernel_socket_bind(socket,&address)==-KERNEL_EADDRNOTAVAIL);
     for(unsigned i=0;i<3;i++)nd6_tmr();
     CHECK(ip6_addr_ispreferred(netif_ip6_addr_state(n,0)));
-    CHECK(captured_size>=78 && captured[12]==0x86 && captured[13]==0xdd && captured[54]==135);
-    CHECK(!memcmp(captured+62,expected,16)); /* DAD target is actual eth0 address. */
+    CHECK(captured_dad_packets);
+    CHECK(!memcmp(captured_dad_target,expected,16)); /* DAD target is actual eth0 address. */
     CHECK(!kernel_socket_bind(socket,&address));
     char bound[16]={0};uint32_t bound_length=sizeof(bound);
     CHECK(!kernel_socket_get_bound_device(socket,bound,&bound_length) && !strcmp(bound,"eth0"));
@@ -3880,13 +4138,13 @@ static void ipv6_linklocal(void)
     ipv6_inject_protocol(n,&peer,&dst,datagram,sizeof(datagram),17,1);CHECK(!socket->rx_bytes);
     ipv6_inject_protocol(n,&peer,&dst,datagram,sizeof(datagram),17,2);CHECK(socket->rx_bytes==8);
     raw_drain(socket);CHECK(!socket->rx_bytes);
-    /* Unsolicited RA cannot introduce routes, prefixes or hidden MTU state. */
-    unsigned char ra[24]={134,0,0,0,64,0,0,60};
+    /* Malformed unsolicited RA cannot introduce routes or hidden MTU state. */
+    unsigned char ra[25]={134,0,0,0,64,0,0,60};
     ra[16]=5;ra[17]=1;ra[22]=5;ra[23]=20; /* advertised MTU 1300 */
     ipv6_inject(n,&peer,&dst,ra,sizeof(ra));
     CHECK(nd6_find_route(&peer)==NULL && netif_mtu6(n)==1500);
     struct kernel_socket_address remote={.family=10,.port=19460,.scope=netif_get_index(n)};
-    memcpy(remote.bytes,peer.addr,16);
+    memcpy(remote.bytes,peer.addr,16);remote.bytes[15]^=4; /* Unknown neighbor exercises ND queue withdrawal. */
     struct kernel_open_file_description *pin=(void *)socket;
     unsigned char content[1400]={1};struct kernel_uaccess_iovec iov={(uintptr_t)content,sizeof(content)};
     CHECK(!kernel_socket_interface_set_mtu((char[16]){"eth0"},1300));
@@ -3922,7 +4180,7 @@ static void ipv6_linklocal(void)
     unsigned sent=copied_packets;
     ipv6_inject(n,&any,&dst,ns,24);
     CHECK(ip6_addr_isduplicated(netif_ip6_addr_state(n,0)) && copied_packets==sent);
-    nd6_cleanup_netif(n);netif_remove(n);
+    netif_poll_all();nd6_cleanup_netif(n);netif_remove(n);
     CHECK(!heap_live);
     puts("PASS Ethernet IPv6 DAD, duplicate rejection, scoped bind, ND/echo contents, MTU and device failure");
 }
@@ -3962,7 +4220,7 @@ static void ipv6_source_prefix(void)
     CHECK(!kernel_socket_ipv6_address(netif_get_index(n),(void *)b.addr,64,0));
     for(unsigned tick=0;tick<3;tick++)nd6_tmr();
     CHECK(ip6_addr_eq(ip_2_ip6(ip6_select_source_address(n,&destination)),&b));
-    nd6_cleanup_netif(n);netif_remove(n);CHECK(!heap_live);
+    netif_poll_all();nd6_cleanup_netif(n);netif_remove(n);CHECK(!heap_live);
     puts("PASS IPv6 source selection: same IID in a different prefix is not an exact address match");
 }
 static void ipv6_global(void)
@@ -4061,6 +4319,7 @@ static void ipv6_global(void)
           !memcmp(captured+38,peer.addr,16) && !memcmp(captured+62,content,64));
     kernel_socket_destroy(ll_source);
     remote.scope=0;
+    gateway.addr[3]^=lwip_htonl(4); /* Unresolved gateway verifies queue invalidation on removal. */
     CHECK(kernel_socket_ipv6_gateway(0,(void *)gateway.addr,0)==-KERNEL_EINVAL);
     CHECK(!kernel_socket_ipv6_gateway(index,(void *)gateway.addr,0));
     CHECK(ip6_route(&any,&off)==n);ipv6_no_loopback_egress(n);
@@ -4155,6 +4414,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "ipv6-global")) ipv6_global();
     else if (!strcmp(argv[1], "ipv6-source-prefix")) ipv6_source_prefix();
     else if (!strcmp(argv[1], "ipv6-linklocal")) ipv6_linklocal();
+    else if (!strcmp(argv[1], "ipv6-ra")) ipv6_ra();
     else if (!strcmp(argv[1], "ipv4-options")) ipv4_options();
     else if (!strcmp(argv[1], "async-events")) async_events();
     else if (!strcmp(argv[1], "unix-seq-records")) unix_seqpacket_records();
