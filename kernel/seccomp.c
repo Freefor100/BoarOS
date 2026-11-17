@@ -236,7 +236,8 @@ static int check(struct kernel_task *task,struct kernel_syscall_request *request
         if (request->number==63 || request->number==64 || request->number==93 || request->number==139) return 0;
         kernel_seccomp_terminate(9,0);
     }
-    struct kernel_seccomp_data data={.nr=(int32_t)request->number,
+    uint64_t original_nr=request->number;
+    struct kernel_seccomp_data data={.nr=(int32_t)original_nr,
 #if defined(__loongarch__)
         .arch=UINT32_C(0xc0000102),
 #else
@@ -269,7 +270,7 @@ static int check(struct kernel_task *task,struct kernel_syscall_request *request
         /* The saved timeout belongs to restart_syscall, not to a replacement
          * operation. Keeping it would let a later signal rewrite that completed
          * operation's return value/PC. An unchanged restart still needs it. */
-        if (data.nr==128 && (int32_t)request->number!=128)
+        if (original_nr==128 && request->number!=128)
             kernel_signal_clear_syscall_restart(task);
         /* The tracer can change the number/arguments and TSYNC can publish a
          * stronger chain while stopped. Re-read both; a second TRACE is allow,

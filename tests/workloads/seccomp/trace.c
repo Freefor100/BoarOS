@@ -289,15 +289,16 @@ static void trace_pc(void){puts("SECCOMP TRACE target PC SKIP host architecture"
 static void trace_restart(void)
 {
     mkdir("/proc",0755);if(access("/proc/self/stat",R_OK))CHECK(!mount("proc","/proc","proc",0,0));
-    for(unsigned kind=0;kind<4;kind++) {
+    for(unsigned kind=0;kind<6;kind++) {
         pid_t parent=getpid(),p=fork();CHECK(p>=0);
         if(!p) {
             pid_t me=getpid();if(ptrace(PTRACE_TRACEME,0,0,0)){if(initial_mode&&errno==EPERM)_exit(77);CHECK(0);}
             struct sigaction sa={.sa_sigaction=restart_handler,.sa_flags=SA_SIGINFO};CHECK(!sigaction(SIGUSR1,&sa,0));
             nnp();deny(SYS_restart_syscall,SECCOMP_RET_TRACE|42);CHECK(!kill(me,SIGSTOP));
-            struct timespec duration={kind<2?60:1,0};int word=0;
+            struct timespec duration={(kind<2||kind>=4)?60:1,0};int word=0;
             long r=(kind&1)?syscall(SYS_futex,&word,FUTEX_WAIT,0,&duration,0,0):syscall(SYS_nanosleep,&duration,0);
             if(kind<2)CHECK(r==parent);
+            else if(kind>=4)CHECK(r==-1&&errno==ENOSYS);
             else if(kind&1)CHECK(r==-1&&errno==ETIMEDOUT);
             else CHECK(r==0);
             CHECK(!notify_call(me)&&restart_notified);_exit(0);
@@ -319,6 +320,7 @@ static void trace_restart(void)
         CHECK(info.nr==SYS_restart_syscall);
         uint64_t reg[64]={0};struct iovec iov={reg,sizeof(reg)};CHECK(!ptrace(PTRACE_GETREGSET,p,(void *)1,&iov));
         if(kind<2)reg[nr_index()]=SYS_getppid;
+        if(kind>=4)reg[nr_index()]=UINT64_C(0x100000000)+SYS_restart_syscall;
         CHECK(!ptrace(PTRACE_SETREGSET,p,(void *)1,&iov));
         CHECK(!ptrace(PTRACE_CONT,p,0,0));
         CHECK(waitpid(p,&s,0)==p&&WIFSTOPPED(s)&&WSTOPSIG(s)==SIGUSR1);

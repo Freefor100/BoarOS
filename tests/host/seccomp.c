@@ -29,6 +29,7 @@ int kernel_ptrace_seccomp(struct kernel_task *task,struct kernel_syscall_request
 {
     (void)task;assert(data==42);trace_calls++;
     if (trace_mode==1) request->number=173;
+    if (trace_mode==4) request->number=UINT64_C(0x100000080);
     if (trace_mode==2) {request->number=(uint64_t)-1;result->value=-512;}
     return trace_mode!=0;
 }
@@ -103,7 +104,10 @@ int main(void)
         assert(parent->syscall_restart.kind==KERNEL_SYSCALL_RESTART_NONE);
         trace_mode=3;parent->syscall_restart.kind=kinds[k];request.number=128;
         assert(!kernel_seccomp_check(parent,&request,&result)&&request.number==128);
-        assert(parent->syscall_restart.kind==kinds[k]);trace_mode=1;
+        assert(parent->syscall_restart.kind==kinds[k]);
+        trace_mode=4;request.number=128;
+        assert(!kernel_seccomp_check(parent,&request,&result)&&request.number==UINT64_C(0x100000080));
+        assert(parent->syscall_restart.kind==KERNEL_SYSCALL_RESTART_NONE);trace_mode=1;
     }
     struct kernel_bpf_classic_insn changed[]={I(0x20,0,0,0),I(0x15,0,1,173),I(0x06,0,0,0x50000|13),I(0x06,0,0,0x7fff0000)};
     assert(!attach(parent,changed,4));request.number=172;trace_calls=0;
