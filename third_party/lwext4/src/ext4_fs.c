@@ -93,6 +93,7 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 	TAILQ_INIT(&fs->pending_inode_goals);
 	fs->super_replay_required = false;
 	fs->journaled_session = false;
+	fs->nojournal_error = EOK;
 
 	fs->read_only = read_only;
 
@@ -145,6 +146,12 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 
 	/*Validate FS*/
 	tmp = ext4_get16(ext4_fs_super(fs), state);
+    /* Without a journal there is no replay that can repair anonymous inode
+     * ownership or partial namespace metadata before writes resume. */
+    if (!fs->read_only && !ext4_sb_feature_com(ext4_fs_super(fs),EXT4_FCOM_HAS_JOURNAL) &&
+        (!(tmp & EXT4_SUPERBLOCK_STATE_VALID_FS) || (tmp & EXT4_SUPERBLOCK_STATE_ERROR_FS))) {
+        return EUCLEAN;
+    }
 	if (tmp & EXT4_SUPERBLOCK_STATE_ERROR_FS)
 		ext4_dbg(DEBUG_FS, DBG_WARN
 				"last umount error: superblock fs_error flag\n");
@@ -197,6 +204,8 @@ int ext4_fs_fini(struct ext4_fs *fs)
 {
 	ext4_assert(fs);
 	if (fs->super_replay_required) return EUCLEAN;
+    int error=__atomic_load_n(&fs->nojournal_error,__ATOMIC_ACQUIRE);
+    if (error) return error;
 	/* Journal stop commits and checkpoints the final superblock itself. */
 	if (fs->journaled_session || fs->read_only) {
 		ext4_orphan_index_fini(fs);
@@ -204,11 +213,14 @@ int ext4_fs_fini(struct ext4_fs *fs)
 		return EOK;
 	}
 
-	/*Set superblock state*/
-	ext4_set16(ext4_fs_super(fs), state, EXT4_SUPERBLOCK_STATE_VALID_FS);
-
-	int r = ext4_sb_write(fs->bdev, ext4_fs_super(fs));
+    if (ext4_get16(&fs->sb,state)&EXT4_SUPERBLOCK_STATE_ERROR_FS) return EUCLEAN;
+    /* Do not publish a clean in-memory state if the metadata write failed. */
+    struct ext4_sblock clean=fs->sb;
+    ext4_set16(&clean,state,EXT4_SUPERBLOCK_STATE_VALID_FS);
+    int r=ext4_sb_write(fs->bdev,&clean);
+    if (r) __atomic_store_n(&fs->nojournal_error,r,__ATOMIC_RELEASE);
 	if (r == EOK) {
+        fs->sb=clean;
 		ext4_orphan_index_fini(fs);
 		free_inode_locations(fs);
 	}

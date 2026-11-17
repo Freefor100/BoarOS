@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-case "${1:-all}" in all|ownership|truncate|extent|prepend|extent-lookup|direct-reuse|nojournal-direct) ;; *) echo 'usage: lwext4-metadata.sh [all|ownership|truncate|extent|prepend|extent-lookup|direct-reuse|nojournal-direct]' >&2; exit 2;; esac
+case "${1:-all}" in all|ownership|truncate|extent|prepend|extent-lookup|direct-reuse|nojournal-direct|nojournal-orphan-probe) ;; *) echo 'usage: lwext4-metadata.sh [all|ownership|truncate|extent|prepend|extent-lookup|direct-reuse|nojournal-direct|nojournal-orphan-probe]' >&2; exit 2;; esac
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT HUP INT TERM
@@ -15,6 +15,41 @@ ${HOST_CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror \
     -I"$root/third_party/lwext4/include" -idirafter "$root/include" \
     "$root"/third_party/lwext4/src/*.c "$root/tests/host/lwext4_metadata.c" \
     "$root/tests/host/block_fault.c" "$root/kernel/block.c" "$root/tests/host/block_runtime.c" "$root/kernel/raw_lock.c" "$root/tests/host/sync/notifications.c" -I"$root/tests/host/block_model" -pthread -o "$work/probe"
+if [ "${1:-all}" = nojournal-orphan-probe ]; then
+    for block in 1024 4096; do
+        truncate -s 32M "$work/orphan.img"
+        mkfs.ext4 -q -F -b "$block" -O ^has_journal "$work/orphan.img"
+        : > "$work/empty"
+        debugfs -w -R "write $work/empty /pending-nojournal" "$work/orphan.img" > "$work/seed.log" 2>&1
+        timeout 30 "$work/probe" "$work/orphan.img" nojournal-clean-remount
+        timeout 30 "$work/probe" "$work/orphan.img" nojournal-orphan-crash
+        result=0; e2fsck -fn "$work/orphan.img" > "$work/crash-fsck.log" 2>&1 || result=$?
+        [ "$result" = 4 ] && grep -q 'zero dtime' "$work/crash-fsck.log" && grep -q 'Inode bitmap differences' "$work/crash-fsck.log"
+        cat "$work/crash-fsck.log"
+        timeout 30 "$work/probe" "$work/orphan.img" nojournal-reject
+        timeout 30 "$work/probe" "$work/orphan.img" nojournal-orphan-reopen
+        dumpe2fs -h "$work/orphan.img" 2>/dev/null | grep -E 'Filesystem state:[[:space:]]+not clean$'
+        result=0; e2fsck -fn "$work/orphan.img" > "$work/reopen-fsck.log" 2>&1 || result=$?
+        [ "$result" = 4 ] && grep -q 'zero dtime' "$work/reopen-fsck.log" && grep -q 'Inode bitmap differences' "$work/reopen-fsck.log"
+        cat "$work/reopen-fsck.log"
+        result=0; e2fsck -fy "$work/orphan.img" > "$work/repair.log" 2>&1 || result=$?
+        [ "$result" = 1 ] || { cat "$work/repair.log"; exit 1; }
+        check_fs "$work/orphan.img"
+        timeout 30 "$work/probe" "$work/orphan.img" seed
+        timeout 30 "$work/probe" "$work/orphan.img" nojournal-direct
+        check_fs "$work/orphan.img"
+        cp "$work/orphan.img" "$work/clean-failure.img"
+        timeout 30 "$work/probe" "$work/clean-failure.img" nojournal-clean-write-error
+        timeout 30 "$work/probe" "$work/clean-failure.img" nojournal-reject
+        cp "$work/orphan.img" "$work/failure.img"
+        timeout 30 "$work/probe" "$work/failure.img" nojournal-metadata-error
+        timeout 30 "$work/probe" "$work/failure.img" nojournal-reject
+        debugfs -w -R 'set_super_value state 3' "$work/orphan.img" > "$work/error-bit.log" 2>&1
+        timeout 30 "$work/probe" "$work/orphan.img" nojournal-reject
+        timeout 30 "$work/probe" "$work/orphan.img" nojournal-orphan-reopen
+    done
+    exit 0
+fi
 if [ "${1:-all}" = nojournal-direct ]; then
     for block in 1024 4096; do
         truncate -s 32M "$work/direct.img"

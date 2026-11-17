@@ -189,7 +189,8 @@ static int mount_error(const struct lwext4_mount_adapter *adapter)
     int error=__atomic_load_n(&adapter->mount_error,__ATOMIC_ACQUIRE);
     if (error) return error;
     struct ext4_fs *fs = adapter->device.fs;
-    return fs && fs->jbd_journal ? __atomic_load_n(&fs->jbd_journal->error,__ATOMIC_ACQUIRE) : EOK;
+    return !fs ? EOK : fs->jbd_journal ? __atomic_load_n(&fs->jbd_journal->error,__ATOMIC_ACQUIRE) :
+        __atomic_load_n(&fs->nojournal_error,__ATOMIC_ACQUIRE);
 }
 
 static void journal_wake(struct kernel_wait_queue *queue)

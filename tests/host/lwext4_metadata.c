@@ -1,3 +1,4 @@
+#include <ext4_orphan.h>
 /* Live-inode explicit timestamps and actual ext4 allocation statistics. */
 #include "block_fault.h"
 #include "lwext4_operation.h"
@@ -3457,6 +3458,64 @@ static void verify_direct_metadata_reuse(struct ext4_fs *fs,unsigned fault)
     CHECK(ext4_fclose(&file)==EOK);
 }
 
+/* Probe the existing no-journal crash boundary before exposing tmpfiles. */
+static void nojournal_orphan_crash(struct ext4_fs *fs)
+{
+    CHECK(!fs->jbd_journal);
+    /* Preseeded externally: open/write/unlink are already supported by VFS. */
+    ext4_file file={0};CHECK(ext4_fopen(&file,"/pending-nojournal","r+")==EOK);
+    uint32_t inode=0;bool orphan=false;
+    CHECK(ext4_unlink_child("/",EXT4_INODE_ROOT_INDEX,"pending-nojournal",false,&inode,&orphan)==EOK);
+    CHECK(orphan && inode==file.inode);
+    unsigned char bytes[4096];memset(bytes,0x73,sizeof(bytes));
+    struct file_write_span span={.buffer=bytes,.size=sizeof(bytes)};
+    CHECK(ext4_fpwrite_direct(&file,&span)==EOK && span.written==sizeof(bytes));
+    CHECK(ext4_cache_flush("/")==EOK && ext4_blockdev_flush(fs->bdev)==EOK);
+    printf("PROBE durable nojournal unlinked inode=%u with 4096 data bytes; simulated power loss before final owner cleanup\n",inode);
+    CHECK(fault_block_crash(&disk)==0);
+}
+static void nojournal_orphan_reopen(struct ext4_fs *fs)
+{
+    CHECK(!fs->jbd_journal);
+    uint32_t inode;
+    CHECK(ext4_orphan_recover("/")==EOK);
+    CHECK(ext4_orphan_peek(fs,&inode)==EOK && !inode);
+    CHECK(fs->read_only && ext4_remount("/",false)==EUCLEAN && fs->read_only);
+    puts("PASS dirty nojournal read-only inspection cannot remount writable or falsely repair orphans");
+}
+
+static void nojournal_metadata_error(struct ext4_fs *fs)
+{
+    CHECK(!fs->jbd_journal);
+    ext4_file file;CHECK(ext4_fopen(&file,"/file","r+")==EOK);
+    CHECK(ext4_blockdev_flush(fs->bdev)==EOK);
+    disk.fail_write=disk.writes+1;
+    CHECK(ext4_mode_set("/file",0600)==EIO);
+    CHECK(fs->nojournal_error==EIO);disk.fail_write=0;
+    uint64_t writes=disk.writes;
+    CHECK(ext4_remount("/",true)==EIO && ext4_umount("/")==EIO);
+    struct file_write_span span={.buffer="x",.size=1};
+    CHECK(ext4_fpwrite_direct(&file,&span)==EIO && !span.written);
+    CHECK(disk.writes==writes);
+    struct ext4_sblock disk_sb;CHECK(ext4_sb_read(fs->bdev,&disk_sb)==EOK);
+    CHECK(!(ext4_get16(&disk_sb,state)&EXT4_SUPERBLOCK_STATE_VALID_FS));
+    CHECK(fault_block_crash(&disk)==0);
+    puts("PASS nojournal metadata EIO: mutation/remount/unmount refuse retry-clean, on-disk state remains dirty");
+}
+
+static void nojournal_clean_write_error(struct ext4_fs *fs)
+{
+    CHECK(!fs->jbd_journal);
+    CHECK(ext4_blockdev_flush(fs->bdev)==EOK);
+    disk.fail_write=disk.writes+1;
+    CHECK(ext4_umount("/")==EIO && fs->nojournal_error==EIO);
+    CHECK(!(ext4_get16(&fs->sb,state)&EXT4_SUPERBLOCK_STATE_VALID_FS));
+    disk.fail_write=0;uint64_t writes=disk.writes;
+    CHECK(ext4_umount("/")==EIO && disk.writes==writes);
+    CHECK(fault_block_crash(&disk)==0);
+    puts("PASS failed clean superblock publication leaves dirty memory and blocks retry-clean");
+}
+
 static void allocation_locality_test(struct ext4_fs *fs)
 {
     struct ext4_sblock *sb = &fs->sb;
@@ -3503,8 +3562,13 @@ int main(int argc,char **argv)
     struct ext4_blockdev_iface iface={.open=dev_open,.close=dev_open,.bread=dev_read,.bwrite=dev_write,.flush=dev_flush,.ph_bsize=512,.ph_bcnt=disk.device.capacity_bytes/512,.ph_bbuf=scratch};
     struct ext4_blockdev dev={.bdif=&iface,.part_size=disk.device.capacity_bytes};
     CHECK(ext4_device_register(&dev,"metadata")==EOK);
-    bool readonly=!strcmp(argv[2],"owner-ro") || !strcmp(argv[2],"readonly") || !strcmp(argv[2],"stats-ro") || !strcmp(argv[2],"read-stats");
-    CHECK(ext4_mount("metadata","/",readonly)==EOK);
+    bool readonly=!strcmp(argv[2],"nojournal-orphan-reopen") || !strcmp(argv[2],"owner-ro") || !strcmp(argv[2],"readonly") || !strcmp(argv[2],"stats-ro") || !strcmp(argv[2],"read-stats");
+    int mounted=ext4_mount("metadata","/",readonly);
+    if (!strcmp(argv[2],"nojournal-reject")) {
+        CHECK(mounted==EUCLEAN && disk.writes==0);
+        fault_block_close(&disk);puts("PASS dirty/error nojournal writable mount rejected without writes");return 0;
+    }
+    CHECK(mounted==EOK);
     if(ext4_sb_feature_com(&dev.fs->sb,EXT4_FCOM_HAS_JOURNAL)) {
         CHECK(ext4_recover("/")==EOK);CHECK(ext4_journal_start("/")==EOK);CHECK(ext4_orphan_recover("/")==EOK);
     }
@@ -3521,6 +3585,19 @@ int main(int argc,char **argv)
     }
     else if(!strcmp(argv[2],"verify-direct-metadata-reuse")) verify_direct_metadata_reuse(dev.fs,argc>3?strtoul(argv[3],NULL,10):0);
     else if(!strcmp(argv[2],"nojournal-direct"))nojournal_direct_file(dev.fs);
+    else if(!strcmp(argv[2],"nojournal-clean-write-error")){nojournal_clean_write_error(dev.fs);return 0;}
+    else if(!strcmp(argv[2],"nojournal-clean-remount")) {
+        CHECK(!dev.fs->jbd_journal && ext4_remount("/",true)==EOK && dev.fs->read_only);
+        CHECK(ext4_remount("/",false)==EOK && !dev.fs->read_only);
+        uint16_t state=ext4_get16(&dev.fs->sb,state);
+        ext4_set16(&dev.fs->sb,state,state|EXT4_SUPERBLOCK_STATE_ERROR_FS);
+        CHECK(ext4_remount("/",true)==EUCLEAN && ext4_fs_fini(dev.fs)==EUCLEAN);
+        ext4_set16(&dev.fs->sb,state,state);
+        puts("PASS clean nojournal transitions remain available; live error bit cannot become clean");
+    }
+    else if(!strcmp(argv[2],"nojournal-metadata-error")){nojournal_metadata_error(dev.fs);return 0;}
+    else if(!strcmp(argv[2],"nojournal-orphan-crash")){nojournal_orphan_crash(dev.fs);return 0;}
+    else if(!strcmp(argv[2],"nojournal-orphan-reopen"))nojournal_orphan_reopen(dev.fs);
     else if(!strcmp(argv[2],"seed"))seed();
     else if(!strcmp(argv[2],"operation-context"))operation_context_test(dev.fs);
 #ifdef TEST_OPERATION_LIFECYCLE

@@ -65,6 +65,8 @@ struct ext4_fs {
 	bool read_only;
 	bool super_replay_required;
 	bool journaled_session;
+	/* Failed nonjournal metadata writeback cannot be cleared by unmount. */
+	int nojournal_error;
 
 	struct ext4_blockdev *bdev;
 	struct ext4_sblock sb;

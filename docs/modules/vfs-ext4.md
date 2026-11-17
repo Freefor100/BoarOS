@@ -2,6 +2,18 @@
 
 本文描述当前根文件系统的稳定接口和 lwext4 私有适配。第三方版本与许可证见[第三方代码](../third-party.md)。
 
+## 无 journal 的恢复门禁
+
+原 superblock 为 dirty 或带 ERROR_FS 的无 journal 镜像不能直接可写挂载或从
+只读 remount 为可写，返回 EUCLEAN。校验有效的镜像仍可只读检查，离线 fsck
+修复后恢复写入。干净镜像及 journal replay 路径不受该门禁影响。
+无 journal bcache 写回的设备错误锁存为本次挂载错误；后续变更、cache writeback、
+remount/unmount 不得靠重试将不确定状态标 clean。最终 clean superblock 写失败
+也不发布 clean 内存状态。此保护不提供多块 metadata 崩溃原子性；尤其无 barrier
+时，marker 写完成不是任意掉电顺序的证明。
+
+测试及尚未开放的 create/O_TMPFILE 发布机制见[无日志创建安全预审](../nojournal-create-safety.md)。
+
 ## 普通文件直接 I/O
 
 启用 journal 的 ext4 接纳 `O_DIRECT` 与 `F_SETFL`，包括 `O_TMPFILE`。

@@ -1201,6 +1201,8 @@ static int ext4_umount_locked(const char *mount_point)
 	struct ext4_mountpoint *mp = ext4_get_mount(mount_point);
 	if (!mp) return ENODEV;
 	if (mp->fs.active_operations) return EBUSY;
+    int nojournal_error=__atomic_load_n(&mp->fs.nojournal_error,__ATOMIC_ACQUIRE);
+    if (nojournal_error) return nojournal_error;
 	int r = EOK;
 	if (mp->fs.jbd_journal && !mp->journal_stopped)
 		r = ext4_orphan_recover(mount_point);
@@ -1243,10 +1245,17 @@ int ext4_remount(const char *mount_point, bool read_only)
     if (!mp) return ENOENT;
     EXT4_MP_LOCK(mp);
     int result=EOK;
+    bool nojournal_publication=false;
     struct ext4_fs *fs=&mp->fs;
     if (fs->active_operations) { result=EBUSY; goto Finish; }
+    result=__atomic_load_n(&fs->nojournal_error,__ATOMIC_ACQUIRE);
+    if (result) goto Finish;
     if (fs->read_only==read_only) goto Finish;
     if (read_only) {
+        if (!ext4_sb_feature_com(&fs->sb,EXT4_FCOM_HAS_JOURNAL) &&
+            (ext4_get16(&fs->sb,state)&EXT4_SUPERBLOCK_STATE_ERROR_FS)) {
+            result=EUCLEAN;goto Finish;
+        }
         /* journal_stop checkpoints and flushes the clean superblock before
          * releasing the session. No fallible teardown follows publication. */
         result=ext4_block_cache_flush(fs->bdev);
@@ -1254,6 +1263,7 @@ int ext4_remount(const char *mount_point, bool read_only)
         if (!result && !ext4_sb_feature_com(&fs->sb,EXT4_FCOM_HAS_JOURNAL)) {
             struct ext4_sblock clean=fs->sb;
             ext4_set16(&clean,state,EXT4_SUPERBLOCK_STATE_VALID_FS);
+            nojournal_publication=true;
             result=ext4_sb_write(fs->bdev,&clean);
             if (!result) result=ext4_blockdev_flush(fs->bdev);
             if (!result) fs->sb=clean;
@@ -1261,6 +1271,11 @@ int ext4_remount(const char *mount_point, bool read_only)
         if (!result) fs->read_only=true;
     } else {
         bool required_read_only=false;
+        uint16_t state=ext4_get16(&fs->sb,state);
+        if (!ext4_sb_feature_com(&fs->sb,EXT4_FCOM_HAS_JOURNAL) &&
+            (!(state & EXT4_SUPERBLOCK_STATE_VALID_FS) || (state & EXT4_SUPERBLOCK_STATE_ERROR_FS))) {
+            result=EUCLEAN;goto Finish;
+        }
         result=ext4_fs_check_features(fs,&required_read_only);
         if (!result && required_read_only) result=EROFS;
         if (result) goto Finish;
@@ -1271,6 +1286,7 @@ int ext4_remount(const char *mount_point, bool read_only)
         } else {
             struct ext4_sblock dirty=fs->sb;
             ext4_set16(&dirty,state,ext4_get16(&dirty,state)&~EXT4_SUPERBLOCK_STATE_VALID_FS);
+            nojournal_publication=true;
             result=ext4_sb_write(fs->bdev,&dirty);
             if (!result) result=ext4_blockdev_flush(fs->bdev);
             if (!result) fs->sb=dirty;
@@ -1278,6 +1294,8 @@ int ext4_remount(const char *mount_point, bool read_only)
         if (result) fs->read_only=true;
     }
 Finish:
+    if (result && nojournal_publication)
+        __atomic_store_n(&fs->nojournal_error,result,__ATOMIC_RELEASE);
     EXT4_MP_UNLOCK(mp);
     return result;
 }
@@ -1935,6 +1953,8 @@ static int ext4_trans_start_mode(struct ext4_mountpoint *mp __unused, bool wait 
 {
     if (!mp) return ENOENT;
     if (mp->fs.super_replay_required) return EUCLEAN;
+    int nojournal_error=__atomic_load_n(&mp->fs.nojournal_error,__ATOMIC_ACQUIRE);
+    if (nojournal_error) return nojournal_error;
     if (mp->fs.read_only) return EROFS;
     struct ext4_operation *operation = ext4_current_operation(&mp->fs);
 #if CONFIG_JOURNALING_ENABLE
