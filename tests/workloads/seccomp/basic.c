@@ -300,6 +300,18 @@ static void trap_ptrace(void)
             CHECK(0);
         }
         CHECK(!syscall(SYS_kill,me,SIGSTOP));trap_setup();
+        struct sock_filter original[]={
+            BPF_STMT(BPF_LD|BPF_W|BPF_ABS,0),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,SYS_getpid,0,3),
+            BPF_STMT(BPF_LD|BPF_W|BPF_ABS,16),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,1234,1,0),
+            BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_KILL_PROCESS),
+            BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ALLOW)};
+#if defined(__riscv) || defined(__loongarch__)
+        CHECK(!install(original,sizeof(original)/sizeof(original[0])));
+#else
+        (void)original;
+#endif
         long ret=ip_call(1234);
 #if defined(__riscv) || defined(__loongarch__)
         CHECK(ret==1234);
@@ -313,6 +325,27 @@ static void trap_ptrace(void)
         puts("SECCOMP TRAP ptrace SKIP host policy");return;
     }
     CHECK(WIFSTOPPED(status)&&WSTOPSIG(status)==SIGSTOP);
+    CHECK(!ptrace(PTRACE_SETOPTIONS,p,0,(void *)PTRACE_O_TRACESYSGOOD));
+    int entry_seen=0;
+    for(unsigned i=0;i<32;i++) {
+        CHECK(!ptrace(PTRACE_SYSCALL,p,0,0));
+        CHECK(waitpid(p,&status,0)==p&&WIFSTOPPED(status)&&WSTOPSIG(status)==(SIGTRAP|0x80));
+        uint64_t registers[64]={0};struct iovec regs={registers,sizeof(registers)};
+        CHECK(!ptrace(PTRACE_GETREGSET,p,(void *)1,&regs));
+#if defined(__riscv)
+        if(registers[17]!=SYS_getpid)continue;
+        CHECK(registers[0]==(uintptr_t)seccomp_call_after);
+        registers[10]=9876; /* Linux syscall arguments/rollback use orig_a0. */
+#elif defined(__loongarch__)
+        if(registers[11]!=SYS_getpid)continue;
+        CHECK(registers[33]==(uintptr_t)seccomp_call_after&&registers[32]==1234);
+        registers[4]=9876; /* Keep the separately writable orig_a0 unchanged. */
+#else
+        if(registers[15]!=SYS_getpid)continue;
+#endif
+        CHECK(!ptrace(PTRACE_SETREGSET,p,(void *)1,&regs));entry_seen=1;break;
+    }
+    CHECK(entry_seen);
     CHECK(!ptrace(PTRACE_CONT,p,0,0));
     CHECK(waitpid(p,&status,0)==p&&WIFSTOPPED(status)&&WSTOPSIG(status)==SIGSYS);
     siginfo_t info;CHECK(!ptrace(PTRACE_GETSIGINFO,p,0,&info));
