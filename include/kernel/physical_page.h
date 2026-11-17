@@ -158,6 +158,10 @@ enum physical_page_status physical_page_acquire(
  * buddy head and order must match its allocation. A tail is never a separate
  * owner. Each acquired or borrowed reference is returned with release_order
  * using the same head/order; release_allocation may discover that order.
+ * Caller must already hold a stable reference, or hold the mapping lock
+ * protecting a reference, throughout acquire/borrow. An address/order pair
+ * alone is not an ownership token: allocator locking cannot prevent ABA when
+ * a stale address has been freed and reused for another allocation.
  * No page-table mapping is installed, and no allocation is split here. */
 enum physical_page_status physical_page_acquire_order(
     struct physical_page_allocator *, uint64_t address, uint32_t order);
