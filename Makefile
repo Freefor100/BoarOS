@@ -313,7 +313,7 @@ COMMON_C_SOURCES := \
 	kernel/bpf/btf.c kernel/bpf/trace.c kernel/bpf/info.c \
 	kernel/elf_image.c \
 	kernel/exec_image.c \
-	mm/mm.c \
+	mm/hugetlb.c mm/mm.c \
 	mm/uaccess.c \
 	drivers/serial/ns16550.c \
 	drivers/virtio/block.c \
@@ -1836,7 +1836,7 @@ test-mm-pin-host:
 		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include \
 		tests/host/mm_pin.c tests/host/mm/unavailable.c tests/host/mm/context.c \
 		kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c \
-		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
+		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/hugetlb.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
 		-Wl,--gc-sections,--wrap=kernel_mm_pin_user_page,--wrap=kernel_raw_lock_acquire,--wrap=physical_page_resolve -o build/host/mm/pin
 	build/host/mm/pin
 
@@ -1851,7 +1851,7 @@ test-mm-concurrency-host:
 		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include \
 		tests/host/mm_concurrency.c tests/host/mm/unavailable.c tests/host/mm/context.c \
 		kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c \
-		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
+		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/hugetlb.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
 		-Wl,--gc-sections,--wrap=physical_page_allocate,--wrap=kernel_raw_lock_acquire -o build/host/mm/concurrency
 	timeout 30s build/host/mm/concurrency
 	sh tests/host/mm-activity.sh
@@ -1876,7 +1876,7 @@ test-mm-shared-concurrency-host:
 		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include \
 		tests/host/mm_shared.c tests/host/mm/unavailable.c tests/host/mm/context.c \
 		kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c \
-		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
+		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/hugetlb.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
 		-Wl,--gc-sections,--wrap=kernel_memory_object_prepare_page -o build/host/mm/shared
 	timeout 30s build/host/mm/shared
 
@@ -1897,7 +1897,7 @@ test-mm-file-concurrency-host:
 		tests/host/mm_file.c tests/host/mm/context.c tests/host/mm/file_unavailable.c \
 		fs/vfs.c kernel/posix_acl.c fs/tmpfs.c fs/open_file.c fs/block_file.c kernel/block.c fs/file_mapping.c fs/record_lock.c fs/flock.c kernel/namespace.c \
 		kernel/cpu.c kernel/raw_lock.c kernel/credentials.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c \
-		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
+		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/hugetlb.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
 		-Wl,--gc-sections,--wrap=kernel_lock_release,--wrap=kernel_open_file_prepare_mapping_page,--wrap=kernel_memory_object_prepare_page,--wrap=kernel_rwlock_write,--wrap=physical_page_allocate,--wrap=kernel_heap_allocate_zeroed -o build/host/mm/file-concurrency
 	timeout 30s build/host/mm/file-concurrency
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections \
@@ -1905,10 +1905,10 @@ test-mm-file-concurrency-host:
 		tests/host/mm_file_single_wait.c tests/host/mm/context.c tests/host/mm/file_unavailable.c \
 		fs/vfs.c kernel/posix_acl.c fs/tmpfs.c fs/open_file.c fs/block_file.c kernel/block.c fs/file_mapping.c fs/record_lock.c fs/flock.c kernel/namespace.c \
 		kernel/cpu.c kernel/raw_lock.c kernel/credentials.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c \
-		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
+		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/hugetlb.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
 		-Wl,--gc-sections,--wrap=kernel_open_file_prepare_mapping_page,--wrap=kernel_rwlock_read,--wrap=kernel_rwlock_try_read -o build/host/mm/file-single-wait
 	timeout 30s build/host/mm/file-single-wait
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DMM_TEST_ELF_SOURCE=1 -Itests/host/mm -Itests/host/sync -idirafter include tests/host/mm_source_release.c kernel/read_source.c kernel/elf64.c kernel/elf64_source.c kernel/namespace.c tests/host/mm/context.c tests/host/mm/file_unavailable.c fs/vfs.c kernel/posix_acl.c fs/tmpfs.c fs/open_file.c fs/block_file.c kernel/block.c fs/file_mapping.c fs/record_lock.c fs/flock.c kernel/cpu.c kernel/raw_lock.c kernel/credentials.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c -Wl,--gc-sections,--wrap=kernel_open_file_release,--wrap=kernel_vfs_close,--wrap=kernel_file_mapping_drain,--wrap=kernel_heap_release,--wrap=kernel_vma_set_backing_in_use,--wrap=physical_page_allocate,--wrap=kernel_vfs_file_mincore_allowed,--wrap=kernel_open_file_prepare_mapping_page,--wrap=kernel_lock_release,--wrap=kernel_elf64_source_page -o build/host/mm/source-release
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DMM_TEST_ELF_SOURCE=1 -Itests/host/mm -Itests/host/sync -idirafter include tests/host/mm_source_release.c kernel/read_source.c kernel/elf64.c kernel/elf64_source.c kernel/namespace.c tests/host/mm/context.c tests/host/mm/file_unavailable.c fs/vfs.c kernel/posix_acl.c fs/tmpfs.c fs/open_file.c fs/block_file.c kernel/block.c fs/file_mapping.c fs/record_lock.c fs/flock.c kernel/cpu.c kernel/raw_lock.c kernel/credentials.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/hugetlb.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c -Wl,--gc-sections,--wrap=kernel_open_file_release,--wrap=kernel_vfs_close,--wrap=kernel_file_mapping_drain,--wrap=kernel_heap_release,--wrap=kernel_vma_set_backing_in_use,--wrap=physical_page_allocate,--wrap=kernel_vfs_file_mincore_allowed,--wrap=kernel_open_file_prepare_mapping_page,--wrap=kernel_lock_release,--wrap=kernel_elf64_source_page -o build/host/mm/source-release
 	timeout 30s build/host/mm/source-release
 
 .PHONY: test-allocator-concurrency-host
@@ -2124,7 +2124,7 @@ test-user-smp-host:
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -Itests/host/sync -idirafter include tests/host/user_smp.c tests/host/user_stop.c kernel/signal_pending.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/sched/lifetime.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release,--wrap=kernel_scheduler_wake_signal,--wrap=kernel_wait_backend_quiesce -o build/host/user-smp
 	build/host/user-smp
 	python3 -B tests/smp/test_user.py
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -DREMOTE_USER_CASE=1 -Itests/host/mm -Itests/host/sync -idirafter include tests/host/mm_activity.c tests/host/mm/unavailable.c tests/host/mm/context.c kernel/sched/proc.c kernel/sched/accounting.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c -Wl,--gc-sections,--wrap=riscv_sv39_user_detach_range,--wrap=physical_page_allocate,--wrap=physical_page_map_owned -o build/host/mm/remote-user
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -DREMOTE_USER_CASE=1 -Itests/host/mm -Itests/host/sync -idirafter include tests/host/mm_activity.c tests/host/mm/unavailable.c tests/host/mm/context.c kernel/sched/proc.c kernel/sched/accounting.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/hugetlb.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c -Wl,--gc-sections,--wrap=riscv_sv39_user_detach_range,--wrap=physical_page_allocate,--wrap=physical_page_map_owned -o build/host/mm/remote-user
 	timeout 30s build/host/mm/remote-user
 
 .PHONY: test-user-smp-riscv
@@ -2399,3 +2399,9 @@ $(BUILD_DIR)/tests/kernel-huge-rv: $(filter-out $(BUILD_DIR)/tests/riscv/sv39_ma
 
 test-huge-riscv: $(BUILD_DIR)/tests/kernel-huge-rv
 	QEMU_RISCV64=$(QEMU_RISCV64) HUGE_TEST_KERNEL_RV=$< sh tests/riscv/huge.sh
+
+.PHONY: test-hugetlb-host
+test-hugetlb-host:
+	sh tests/host/hugetlb.sh
+	sh tests/host/mm-hugetlb.sh
+	sh tests/host/proc-hugetlb.sh

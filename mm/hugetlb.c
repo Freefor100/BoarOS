@@ -187,6 +187,16 @@ enum kernel_hugetlb_status kernel_hstate_destroy(struct kernel_hstate **owner)
     if (physical_page_allocator_clear_compound_recycler(h->allocator,h)) __builtin_trap();
     *owner=NULL;kernel_heap_release(h->heap,h);return KERNEL_HUGETLB_OK;
 }
+enum kernel_hugetlb_status kernel_hstate_shutdown(struct physical_page_allocator *a)
+{
+    struct kernel_hstate *h=NULL;
+    enum kernel_hugetlb_status status=kernel_hstate_get(a,&h);
+    if (status==KERNEL_HUGETLB_NOT_FOUND) return KERNEL_HUGETLB_OK;
+    if (status) return status;
+    /* Shutdown owns the registry exclusively after users and callbacks stop. */
+    kernel_hstate_put(h);
+    return kernel_hstate_destroy(&h);
+}
 void kernel_hstate_snapshot(struct kernel_hstate *h,struct kernel_hstate_snapshot *out)
 {
     KERNEL_RAW_SCOPE(guard,&h->allocator->lock);

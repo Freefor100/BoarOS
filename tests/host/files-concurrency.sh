@@ -19,7 +19,7 @@ for shift in ${FILES_HOST_SHIFTS:-12 14}; do
         tests/host/files_concurrency.c tests/host/mm/context.c tests/host/mm/disk_context.c \
         kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/accounting.c kernel/sched/park.c \
         kernel/physical_page.c kernel/credentials.c kernel/posix_acl.c mm/heap.c mm/memory_object.c \
-        mm/mm.c mm/vma.c mm/uaccess.c arch/riscv/sv39.c \
+        mm/hugetlb.c mm/mm.c mm/vma.c mm/uaccess.c arch/riscv/sv39.c \
         "$build_dir/table-$shift.o" fs/files/path.c fs/files/metadata.c fs/fs_context.c kernel/namespace.c fs/open_file.c fs/async_io.c fs/block_file.c fs/loop.c fs/disk_mount.c fs/pipe.c fs/vfs.c fs/tmpfs.c fs/file_mapping.c \
         fs/record_lock.c fs/flock.c fs/page_cache.c fs/ext4_backend.c fs/fat32.c fs/lwext4_port.c \
         kernel/block.c third_party/lwext4/src/*.c \

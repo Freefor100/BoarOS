@@ -1,3 +1,4 @@
+#include <kernel/hugetlb.h>
 #include <kernel/bpf.h>
 #include <kernel/reboot.h>
 #include <kernel/console.h>
@@ -165,6 +166,7 @@ static int release_root(void)
         if(virtio_pci_block_destroy(device)!=VIRTIO_BLOCK_DRIVER_STATUS_OK) return -KERNEL_EIO;
         root.count--;
     }
+    if (kernel_hstate_shutdown(root.heap.page_allocator)) return -KERNEL_EBUSY;
     struct kernel_heap_statistics stats; kernel_heap_get_statistics(&root.heap,&stats);
     uint64_t available=physical_page_available(root.heap.page_allocator);
     if(stats.live_allocations || stats.current_pages || available!=root.baseline || pci_host_claimed(la_virt_pci_host())) {

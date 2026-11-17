@@ -11,7 +11,7 @@ for cpus in ${MM_ACTIVITY_CPUS:-2 4}; do
         -Itests/host/mm -Itests/host/sync -idirafter include \
         tests/host/mm_activity.c tests/host/mm/unavailable.c tests/host/mm/context.c \
         kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c \
-        kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c "$source" mm/uaccess.c arch/riscv/sv39.c \
+        kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/hugetlb.c "$source" mm/uaccess.c arch/riscv/sv39.c \
         -Wl,--gc-sections -o "$out/activity$cpus"
     timeout 30s "$out/activity$cpus"
 done

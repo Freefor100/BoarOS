@@ -31,6 +31,9 @@ enum kernel_hugetlb_status kernel_hstate_grow(struct kernel_hstate *, uint64_t c
 /* Releases only unreserved free blocks; actual number removed is returned. */
 uint64_t kernel_hstate_shrink(struct kernel_hstate *, uint64_t count);
 enum kernel_hugetlb_status kernel_hstate_destroy(struct kernel_hstate **);
+/* Final allocator teardown only: all users, map callbacks and proc readers must
+ * be quiesced. Rejects live map/pin owners rather than hiding a cleanup leak. */
+enum kernel_hugetlb_status kernel_hstate_shutdown(struct physical_page_allocator *);
 void kernel_hstate_snapshot(struct kernel_hstate *, struct kernel_hstate_snapshot *);
 /* Construction reserves all slots against already held contiguous capacity,
  * unless noreserve. A private fork uses CHILD and gets no parent reservation.
