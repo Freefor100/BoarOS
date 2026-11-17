@@ -13,4 +13,8 @@ for shift in 12 14; do
     kernel/bpf/classic.c -Wl,--gc-sections -fsanitize=address,undefined \
     -o build/host/seccomp-sync-$shift
   build/host/seccomp-sync-$shift
+  cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=$shift \
+    -fsanitize=address,undefined -fno-omit-frame-pointer \
+    -Itests/host/sync -idirafter include tests/host/ptrace_restart.c -o build/host/ptrace-restart-$shift
+  build/host/ptrace-restart-$shift
 done

@@ -203,6 +203,7 @@ static void syscall_stop(struct kernel_task *t,unsigned op,struct arch_trap_fram
 {
     if (!state(t)) return;
     unsigned sig;
+    uint64_t original_nr=0;
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         struct kernel_ptrace_state *s=t->ptrace;
@@ -219,8 +220,10 @@ static void syscall_stop(struct kernel_task *t,unsigned op,struct arch_trap_fram
     }
     if (op==1) {
 #if defined(BOAROS_ARCH_LOONGARCH)
+        original_nr=frame->regs[11];
         frame->era+=4;
 #else
+        original_nr=frame->a7;
         frame->sepc+=4;
 #endif
     }
@@ -228,9 +231,11 @@ static void syscall_stop(struct kernel_task *t,unsigned op,struct arch_trap_fram
     if (signal) (void)kernel_signal_send_ptrace_syscall(t,signal);
     if (op==1) {
 #if defined(BOAROS_ARCH_LOONGARCH)
+        kernel_signal_retire_replaced_restart(t,original_nr,frame->regs[11]);
         frame->era-=4;
         frame->regs[4]=t->ptrace->original_arg;
 #else
+        kernel_signal_retire_replaced_restart(t,original_nr,frame->a7);
         frame->sepc-=4;
         frame->a0=t->ptrace->original_arg;
 #endif
