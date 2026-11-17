@@ -447,10 +447,9 @@ ACK 恢复活动计时；探测预算耗尽沿现有 timer error 路径返回 ET
 检查真实探测、禁用状态、超时、策略存续和资源归还（4K/16K 页）。
 Linux 语义参考 [v6.6 tcp.c](https://github.com/torvalds/linux/blob/v6.6/net/ipv4/tcp.c)。
 
-本改动不实现 `TCP_INFO`。仅返回到 snd_mss 的 20-byte 短前缀虽可表达可用字段，
-但 [iperf 3.19](https://github.com/esnet/iperf/blob/3.19/src/tcp_info.c) 在成功返回后
-不检查长度便读取 total_retrans、snd_cwnd、rtt 等字段，会误报；不能把缺失统计填零
-冒充真实测量。扩展该接口需要单独定义真实统计来源和成本，不包含在 keepalive 交付中。
+Keepalive 与 `TCP_INFO` 分开交付。曾评估仅到 snd_mss 的 20-byte 前缀，但
+iperf 成功后不检查返回长度便读取后续统计，不能将这种短返回当作完整消费者兼容。
+当前统计接口与边界见下面的 TCP_INFO 小节。
 
 定向验证命令（编译器、QEMU、pahole 由调用者配置，不下载/跑宽泛基线）：
 
@@ -470,3 +469,72 @@ python3 tests/userland/tcp-keepalive.py --arch loongarch --kernel build/loongarc
 AF_UNIX socket，该错误路径在 guest 验证。LA 使用 stock QEMU 10.0.13 的本地临时
 wrapper，仅过滤其不支持的 `-global ls7a_rtc.toy-enabled=on`；不改仓库 harness，
 不据此声称验证 RTC。host 定时器测试不测真实外网丢包、性能或精确墙钟时刻。
+
+### TCP_INFO：真实状态与消费者范围
+
+返回 Linux ABI 前 232 字节，直到偏移 228 的 `tcpi_snd_wnd`，不是只返回经典
+104 字节。`optlen` 返回 `min(用户容量,232)`，剩余用户缓冲区不写；负长度、错误
+指针、optlen 先写以及只读选项的 set 错误，使用同源 Linux/BoarOS 用例核对。
+232 字节之后的新 Linux 字段尚未提供，依赖它们的消费者必须检查返回长度。
+依据为 [Linux v6.6 tcp_info](https://github.com/torvalds/linux/blob/v6.6/include/uapi/linux/tcp.h)
+及 [tcp_get_info](https://github.com/torvalds/linux/blob/v6.6/net/ipv4/tcp.c)。
+
+- 状态、拥塞恢复状态、MSS、窗口缩放、RTO、persist/keepalive 探测、窗口与发送阈值
+  来自真实 PCB；listen 仅访问小 PCB 公共字段，unacked/sacked 按 Linux 别名报告
+  可 accept 的子连接数和 backlog。cwnd/ssthresh 从字节除以 MSS 转为整段，不能表达
+  小于一个 MSS 的余量。接收窗口阈值/空间报告固定接收容量，不伪装成 Linux 自动调优。
+- total_retrans、bytes_retrans 只在成功交付 IP 输出路径后计数，失败入队、重传准备、
+  新发 SYN 都不冒充重传。segment 的既有 flags 和一个 payload-prefix 长度记录真实
+  发送历史，分段传递、尾部追加新数据及一字节 persist probe 都保留正确字节边界。
+  这是协议输出记账，不保证物理网卡或远端实际收到了包；下层拒绝不计入输出统计，
+  与 Linux 在 queue_xmit 前记部分计数的错误路径不完全相同。
+- bytes_acked/received 跟随确认/接收序列推进，包含 FIN；active SYN 在 bytes_acked
+  中计 1，passive SYN-ACK 不计。segs/data_segs、已确认段数和接收乱序包计数来自事件。
+  unacked/lost/retrans/notsent 在查询时遍历现有队列；RTO 仅在已有恢复事件中批量标记
+  待重传段，不增加正常逐包队列遍历。
+- RTT、RTT variance、min RTT、最近数据/ACK 时间复用 lwIP 的 500ms TCP 时钟。
+  短连接可能得到 RTT=0；这代表现有估计的量化值，不能据此判断真实延迟为零。
+  不为 TCP_INFO 新增逐包高精度时钟读取或 RTT 算法；无 RTT 样本时 min_rtt 为
+  UINT32_MAX。跨 owner 迁移同步重基时间字段；PCB 释放前保存快照，释放后查询
+  不读悬空指针，时间年龄通过查询时单调时钟继续增长。
+- 0 的明确含义：没有启用的 SACK scoreboard/FACK、ECN、DSACK、发送端乱序检测，
+  对应字段为 0；未实现的接收 RTT、delivery-rate、busy/rwnd/sndbuf chronograph
+  采样为 0，**不是测得零速率或零繁忙时间**。app_limited 位也未采样。
+  last_ack_sent 与 Linux 一样不记录、为 0；pacing/max_pacing 为 UINT64_MAX，表示
+  未限速，而不是零速率。rcv_mss 是按序接纳的新数据段的最大观察值，未见数据时为 0，
+  不是 Linux 的启发式初始 MSS。PMTU 是最近成功数据/SYN 输出所选接口 MTU；
+  本栈不因此新增路径 MTU 探测。无记录时为 0，不伪造默认路径测量。
+
+最低成本的不可省记账是事件整数加法/已有时钟值存储，持有现有协议 owner，
+无新增原子计数、锁、worker、逐包分配或周期任务。PCB 保存累计值，socket 保存
+末次 232-byte 快照以覆盖错误回调先于/晚于 PCB 释放的不同路径。这里不声称通过
+性能基准；内存和事件成本是支持可靠接口所需的显式取舍。
+
+验证入口：
+
+```sh
+cc -O2 -Wall -Wextra -Werror tests/workloads/network/tcp_info.c -o build/tcp-info-linux
+build/tcp-info-linux
+sh tests/host/tcp-info.sh
+# 和 keepalive 相同的 static 交叉编译与双核 USER_SMP kernel 构建参数
+python3 tests/userland/tcp-info.py --kernel build/riscv-user-smp/kernel-rv --program build/tcp-info-rv --cpus 2
+python3 tests/userland/tcp-info.py --arch loongarch --kernel build/loongarch-smp2/kernel-la --program build/tcp-info-la --cpus 2
+# 将 tests/workloads/network/tcp_info_iperf.c 编为对应架构的 static driver
+python3 tests/userland/tcp-info-iperf.py --kernel build/riscv-user-smp/kernel-rv --program build/iperf-init-rv --iperf "$IPERF_RV" --cpus 2
+```
+
+host 用实际 lwIP 输出回调验证失败/成功、两次 persist probe、重传、分段、追加新数据、
+ACK/字节、owner 迁移、退役后查询及资源回收（4K/16K 页）。同源 libc 用例检查 SYN/FIN
+字节规则、232-byte 的 snd_wnd、状态、backlog、长度和 fault ordering。
+实际 RV iperf3 3.13（SHA256 `8a87cda6b79966699bc68c72894288ba9aa4a5d44dc0036cfb257a4a4d73860b`）
+做双端 guest loopback 32768-byte 功能传输；解析两端 JSON、核对字节和真实读取的
+retransmits/cwnd/snd_wnd，并要求无 TCP_INFO 错误及干净关机。不把吞吐、零 RTT 或
+iperf CPU 百分比作为性能结论。没有 LA iperf 二进制，本次 LA 只覆盖同源 syscall
+用例；stock QEMU 的 RTC 参数过滤限制同 keepalive。
+
+补充定向回归：`ASAN_OPTIONS=detect_leaks=0 python3 -B tests/host/network_owner.py
+--case tcp-detached --case tcp-batch --case tcp-more --case tcp-cork --case timewait-timer
+--case tcp-batch-error --sanitize`。当前沙箱不支持 LeakSanitizer 的线程枚举，明确关闭
+LSan，仍运行 ASan/UBSan；分配归还由上述 host 计数断言独立验证。64-bit host 配置
+测得 tcp_pcb 从 320 增至 408 字节，tcp_seg 仍为 32 字节（新 prefix 长度落在原 padding）。
+这些是结构大小检查，不是性能基准。

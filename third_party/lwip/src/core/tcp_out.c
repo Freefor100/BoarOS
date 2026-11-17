@@ -161,6 +161,9 @@ tcp_ip_output(const struct tcp_pcb *pcb, struct pbuf *p, struct netif *netif,
   int local_result;
   if (boaros_lwip_parallel_enabled() && pcb && pcb->boaros_owner &&
       boaros_lwip_tcp_local_output(pcb, p, netif, src, dst, &local_result)) {
+#ifdef BOAROS_LWIP_TCP_INFO
+    if (local_result == ERR_OK && pcb->state != LISTEN) LWIP_CONST_CAST(struct tcp_pcb *, pcb)->boaros_segs_out++;
+#endif
     return (err_t)local_result;
   }
 #endif
@@ -176,6 +179,9 @@ tcp_ip_output(const struct tcp_pcb *pcb, struct pbuf *p, struct netif *netif,
   err_t result = ip_output_if(p, src, dst, pcb ? pcb->ttl : TCP_TTL,
                               pcb ? pcb->tos : 0, IP_PROTO_TCP, netif);
   NETIF_RESET_HINTS(netif);
+#ifdef BOAROS_LWIP_TCP_INFO
+  if (pcb && pcb->state != LISTEN && result == ERR_OK) LWIP_CONST_CAST(struct tcp_pcb *, pcb)->boaros_segs_out++;
+#endif
   return result;
 }
 
@@ -206,6 +212,9 @@ tcp_alloc_segment(struct pbuf *p, u8_t optlen, u8_t optflags)
     return NULL;
   }
   seg->flags = optflags;
+#ifdef BOAROS_LWIP_TCP_INFO
+  seg->boaros_sent_bytes = 0;
+#endif
   seg->next = NULL;
   seg->p = p;
   LWIP_ASSERT("p->tot_len >= optlen", p->tot_len >= optlen);
@@ -1202,6 +1211,11 @@ tcp_split_unsent_seg(struct tcp_pcb *pcb, u16_t split)
     goto memerr;
   }
 
+#ifdef BOAROS_LWIP_TCP_INFO
+  seg->boaros_sent_bytes = useg->boaros_sent_bytes > split ? useg->boaros_sent_bytes - split : 0;
+  if (seg->boaros_sent_bytes) seg->flags |= useg->flags & (TF_SEG_RETRANSMITTED | TF_SEG_SENT | TF_SEG_LOST);
+  useg->boaros_sent_bytes = LWIP_MIN(useg->boaros_sent_bytes, split);
+#endif
 #if TCP_CHECKSUM_ON_COPY
   seg->chksum = chksum;
   seg->chksum_swapped = chksum_swapped;
@@ -1663,6 +1677,21 @@ boaros_lwip_tcp_output_more(struct tcp_pcb *pcb, u8_t more)
       tcp_set_flags(pcb, TF_NAGLEMEMERR);
       return err;
     }
+#ifdef BOAROS_LWIP_TCP_INFO
+    pcb->boaros_pmtu = netif->mtu;
+    if (seg->len) {
+      pcb->boaros_last_sent = tcp_ticks;
+      pcb->boaros_data_out++;
+      pcb->boaros_bytes_sent += seg->len;
+    }
+    if ((seg->flags & TF_SEG_SENT) || seg->boaros_sent_bytes) {
+      pcb->boaros_bytes_retrans += LWIP_MIN(seg->boaros_sent_bytes, seg->len);
+      pcb->boaros_total_retrans++;
+      seg->flags |= TF_SEG_RETRANSMITTED;
+    }
+    seg->flags = (seg->flags | TF_SEG_SENT) & (u8_t)~TF_SEG_LOST;
+    seg->boaros_sent_bytes = seg->len;
+#endif
 #if TCP_OVERSIZE_DBGCHECK
     seg->oversize_left = 0;
 #endif /* TCP_OVERSIZE_DBGCHECK */
@@ -1819,6 +1848,9 @@ tcp_output_segment(struct tcp_seg *seg, struct tcp_pcb *pcb, struct netif *netif
 #else /* TCP_CALCULATE_EFF_SEND_MSS */
     mss = tcp_mss_limit(pcb);
 #endif /* TCP_CALCULATE_EFF_SEND_MSS */
+#ifdef BOAROS_LWIP_TCP_INFO
+    pcb->boaros_advmss = mss;
+#endif
     *opts = TCP_BUILD_MSS_OPTION(mss);
     opts += 1;
   }
@@ -1967,6 +1999,10 @@ tcp_rexmit_rto_prepare(struct tcp_pcb *pcb)
     LWIP_DEBUGF(TCP_RTO_DEBUG, ("tcp_rexmit_rto: segment busy\n"));
     return ERR_VAL;
   }
+#ifdef BOAROS_LWIP_TCP_INFO
+  for (struct tcp_seg *lost = pcb->unacked; lost != NULL; lost = lost->next)
+    lost->flags |= TF_SEG_LOST;
+#endif
   /* concatenate unsent queue after unacked queue */
   seg->next = pcb->unsent;
 #if TCP_OVERSIZE_DBGCHECK
@@ -2056,6 +2092,9 @@ tcp_rexmit(struct tcp_pcb *pcb)
     return ERR_VAL;
   }
 
+#ifdef BOAROS_LWIP_TCP_INFO
+  seg->flags |= TF_SEG_LOST;
+#endif
   /* Move the first unacked segment to the unsent queue */
   /* Keep the unsent queue sorted. */
   pcb->unacked = seg->next;
@@ -2554,6 +2593,22 @@ tcp_zero_window_probe(struct tcp_pcb *pcb)
   tcp_output_fill_options(pcb, p, 0, 0);
 
   err = tcp_output_control_segment(pcb, p, &pcb->local_ip, &pcb->remote_ip);
+#ifdef BOAROS_LWIP_TCP_INFO
+  if (err == ERR_OK) {
+    if (len) {
+      pcb->boaros_data_out++;
+      pcb->boaros_bytes_sent++;
+      pcb->boaros_last_sent = tcp_ticks;
+    }
+    if ((seg->flags & TF_SEG_SENT) || seg->boaros_sent_bytes) {
+      pcb->boaros_total_retrans++;
+      pcb->boaros_bytes_retrans += len;
+      seg->flags |= TF_SEG_RETRANSMITTED;
+    }
+    if (is_fin) seg->flags |= TF_SEG_SENT;
+    if (len && !seg->boaros_sent_bytes) seg->boaros_sent_bytes = 1;
+  }
+#endif
 
   LWIP_DEBUGF(TCP_DEBUG, ("tcp_zero_window_probe: seqno %"U32_F
                           " ackno %"U32_F" err %d.\n",
