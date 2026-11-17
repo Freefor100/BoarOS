@@ -1369,8 +1369,24 @@ static void nojournal_direct_file(struct ext4_fs *fs)
     memset(data,0x61,4*block);
     struct file_write_span span={.offset=0,.buffer=data,.size=512};
     CHECK(ext4_fpwrite_direct(&file,&span)==EOK && span.written==512 && ext4_fsize(&file)==512);
+    /* Hold the old EOF block across a discontiguous DIRECT extension. Its
+     * dirty nonzero tail must be synchronously zeroed on media, not merely
+     * changed in bcache until this external reference is returned. */
+    struct ext4_inode_ref tail_ref;ext4_fsblk_t tail_physical;
+    CHECK(ext4_fs_get_inode_ref(fs,file.inode,&tail_ref)==EOK);
+    CHECK(ext4_fs_get_inode_dblk_idx(&tail_ref,0,&tail_physical,true)==EOK && tail_physical);
+    CHECK(ext4_fs_put_inode_ref(&tail_ref)==EOK);
+    struct ext4_block tail=EXT4_BLOCK_ZERO();CHECK(ext4_block_get(fs->bdev,&tail,tail_physical)==EOK);
+    ext4_block_payload_write(tail.payload);memset(tail.data+512,0x77,block-512);ext4_bcache_set_dirty(tail.buf);
+    CHECK(ext4_block_flush_buf(fs->bdev,tail.buf)==EOK);
+    CHECK(ext4_cache_write_back("/",true)==EOK);
     memset(data,0x63,4*block);span=(struct file_write_span){.offset=2*block,.buffer=data,.size=block};
     CHECK(ext4_fpwrite_direct(&file,&span)==EOK && span.written==block && ext4_fsize(&file)==3*block);
+    CHECK(ext4_blocks_get_direct(fs->bdev,readback,tail_physical,1)==EOK);
+    for(unsigned i=0;i<block;i++)CHECK(readback[i]==(i<512?0x61:0));
+    CHECK(!ext4_bcache_test_flag(tail.buf,BC_DIRTY));
+    CHECK(ext4_block_set(fs->bdev,&tail)==EOK);
+    CHECK(ext4_cache_write_back("/",false)==EOK);
     size_t done;CHECK(ext4_fpread(&file,0,readback,4*block,&done)==EOK && done==3*block);
     for(unsigned i=0;i<done;i++)CHECK(readback[i]==(i<512?0x61:i<2*block?0:0x63));
     struct ext4_inode_ref ref;ext4_fsblk_t physical;

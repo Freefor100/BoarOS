@@ -3984,9 +3984,9 @@ static int ext4_flush_fblock_range(struct ext4_blockdev *bdev,
 	return EOK;
 }
 
-static int ext4_zero_allocated_eof_tail(struct ext4_inode_ref *ref,
+static int ext4_zero_allocated_eof_tail_mode(struct ext4_inode_ref *ref,
 					uint64_t old_size,
-					uint64_t visible_end)
+					uint64_t visible_end, bool synchronous)
 {
 	uint32_t block_size = ext4_sb_get_block_size(ext4_fs_super(ref->fs));
 	uint32_t offset = (uint32_t)(old_size % block_size);
@@ -4007,8 +4007,13 @@ static int ext4_zero_allocated_eof_tail(struct ext4_inode_ref *ref,
 	if (r != EOK || !fblock)
 		return r;
 
+	if (synchronous)
+		return ext4_trans_write_data_sync(ref->fs->bdev,fblock,offset,NULL,length,false);
 	return ext4_zero_fblock_range(ref, fblock, offset, length);
 }
+static int ext4_zero_allocated_eof_tail(struct ext4_inode_ref *ref,
+    uint64_t old_size,uint64_t visible_end)
+{ return ext4_zero_allocated_eof_tail_mode(ref,old_size,visible_end,false); }
 
 static int ext4_ftruncate_no_lock(ext4_file *file, uint64_t size, uint32_t privilege_mode)
 {
@@ -5367,7 +5372,7 @@ Retry:
         /* The supplied block already includes the zero gap after old EOF. */
         if (!covers_eof && span->offset > old_size && old_size % block_size) {
             r = ext4_direct_write_flush(&ref, file, direct, &range, range_next);
-            if (!r) r = ext4_zero_allocated_eof_tail(&ref, old_size, span->offset);
+            if (!r) r = ext4_zero_allocated_eof_tail_mode(&ref, old_size, span->offset, synchronous);
         }
         size_t consumed = 0;
 		while (consumed < span->size && !r) {

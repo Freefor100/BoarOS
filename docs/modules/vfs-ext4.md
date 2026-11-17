@@ -14,6 +14,8 @@
 无 journal 数据使用显式同步入口 `ext4_fpwrite_direct`，不伪造 retain 回调，
 不将数据留在 lwext4 bcache 后就报告完成。完整块直接借用已稳定的调用者内存，
 部分块只构造一个块的 RMW 镜像；多块沿用最多 128 KiB 的批量提交。
+跨旧 EOF 暴露的已分配零尾同样同步完成，即使库调用者启用了显式延迟 bcache；
+不能仅把零尾留 dirty 而完成后续 DIRECT 扩展。
 旧 dirty bcache 数据在提交前排空；设备错误后撤销受影响 bcache 版本，旧持有者
 归还时不能把 preimage 写回覆盖已完成扇区。先前已完成批次保留精确 written/EOF，
 失败批次的新分配由既有逆序 extent 清理释放，失败覆盖可留下设备已完成前缀，
@@ -56,7 +58,8 @@ truncate/短读、F_SETFL、O_TMPFILE、sendfile/splice 及退出清理/fsck。
 
 无 journal 验证：`sh tests/host/lwext4-metadata.sh nojournal-direct` 覆盖
 1 KiB/4 KiB 块的真实数据写入、EOF 零填充、洞、先写首扇区再 EIO、旧 dirty
-版本退役、失败分配清理、重试及第二批失败后的精确 128 KiB 前缀，并运行 fsck。
+版本退役、失败分配清理、重试及第二批失败后的精确 128 KiB 前缀，并运行 fsck。另在旧 EOF 外写入非零介质字节、保留 bcache 引用且开启显式延迟
+writeback 后扩展，归还引用前直接读取介质验证零尾，不用缓存读冒充设备完成。
 `FILE_IO_NOJOURNAL=1 FILE_IO_HOST_MKFS_ARGS='-O ^has_journal' FILE_IO_HOST_TCP=0 FILE_IO_DIRECT_ONLY=1 sh tests/host/file-io-concurrency.sh`
 用预置文件覆盖 4 KiB/16 KiB 页缓存与 truncate 竞争。
 客户机程序加 `-DBOAROS_NOJOURNAL_DIRECT`，runner 加 `--nojournal`，在 RV/LA
