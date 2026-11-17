@@ -1260,6 +1260,35 @@ static void sendfile_pipe_case(struct kernel_heap *heap,struct kernel_vfs_mount 
     puts("PASS sendfile source-page borrow: unaligned cross-page pipe content, sparse zero bytes and explicit offset");
 }
 
+/* Exercise the actual atomic publication used by F_SETFL at a deterministic
+ * post-route/pre-copy boundary. This ext4 fixture tests request snapshots;
+ * legal FAT open/F_SETFL admission is covered by the FAT syscall guest. */
+static struct kernel_open_file_description *copy_flags_source,*copy_flags_target;
+static unsigned copy_flags_pause,copy_flags_resume;
+enum kernel_page_cache_status __real_kernel_page_cache_get_batch(
+    struct kernel_page_cache *,const struct kernel_vfs_file *,uint64_t,
+    struct kernel_page_cache_read_page *,size_t,int);
+enum kernel_page_cache_status __wrap_kernel_page_cache_get_batch(
+    struct kernel_page_cache *cache,const struct kernel_vfs_file *file,uint64_t first,
+    struct kernel_page_cache_read_page *pages,size_t count,int no_reuse)
+{
+    enum kernel_page_cache_status result=__real_kernel_page_cache_get_batch(cache,file,first,pages,count,no_reuse);
+    if (copy_flags_source && file==&copy_flags_source->file &&
+        !__atomic_exchange_n(&copy_flags_pause,1,__ATOMIC_ACQ_REL)) {
+        while (!__atomic_load_n(&copy_flags_resume,__ATOMIC_ACQUIRE)) sched_yield();
+    }
+    return result;
+}
+static void *publish_copy_flags(void *argument)
+{
+    (void)argument;
+    while (!__atomic_load_n(&copy_flags_pause,__ATOMIC_ACQUIRE)) sched_yield();
+    kernel_open_file_set_status_flags(copy_flags_source,KERNEL_FILES_O_DIRECT);
+    kernel_open_file_set_status_flags(copy_flags_target,KERNEL_FILES_O_DIRECT);
+    __atomic_store_n(&copy_flags_resume,1,__ATOMIC_RELEASE);
+    return NULL;
+}
+
 static void cached_copy_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
 {
     struct kernel_files local={0};
@@ -1277,16 +1306,23 @@ static void cached_copy_case(struct kernel_heap *heap,struct kernel_vfs_mount *m
     struct kernel_open_file_description *src=in,*dst=out;
     assert(!kernel_files_install_new_owned_at(&local,0,0,&in));
     assert(!kernel_files_install_new_owned_at(&local,1,0,&out));
+    copy_flags_source=src;copy_flags_target=dst;copy_flags_pause=copy_flags_resume=0;
+    pthread_t publisher;assert(!pthread_create(&publisher,NULL,publish_copy_flags,NULL));
     watch_memory_staging=1;memory_staging_calls=0;
     assert(!kernel_files_copy_range(&local,&mm,0,0,1,0,sizeof(data),0,&result) &&
         result==sizeof(data)-19);
     watch_memory_staging=0;
+    assert(!pthread_join(publisher,NULL) && copy_flags_pause && copy_flags_resume);
+    assert((kernel_open_file_flags(src)&KERNEL_FILES_O_DIRECT) &&
+        (kernel_open_file_flags(dst)&KERNEL_FILES_O_DIRECT));
+    copy_flags_source=copy_flags_target=NULL;
+    kernel_open_file_set_status_flags(src,0);kernel_open_file_set_status_flags(dst,0);
     assert(src->offset==sizeof(data) && dst->offset==sizeof(data)+18);
     assert(!kernel_vfs_pread(&dst->file,37,actual,sizeof(data)-19,&done,NULL) &&
         done==sizeof(data)-19 && !memcmp(actual,data+19,done));
     assert(!memory_staging_calls && "cached file copy must not stage the payload");
     assert(!kernel_files_release(&local));
-    puts("PASS cached file copy: cross-page data, EOF and offsets without payload staging");
+    puts("PASS cached file copy: concurrent DIRECT publication retains request snapshot, data/EOF/offsets without staging");
 }
 
 static void vector_boundaries(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
