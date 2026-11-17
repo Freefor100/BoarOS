@@ -1,4 +1,5 @@
 #include <kernel/seccomp.h>
+#include <kernel/ptrace.h>
 #include <kernel/credentials.h>
 #include <kernel/signal.h>
 #include <kernel/errno.h>
@@ -11,6 +12,7 @@
 #define RET_KILL_THREAD UINT32_C(0)
 #define RET_TRAP UINT32_C(0x00030000)
 #define RET_ERRNO UINT32_C(0x00050000)
+#define RET_TRACE UINT32_C(0x7ff00000)
 #define RET_ALLOW UINT32_C(0x7fff0000)
 #define ACTION UINT32_C(0xffff0000)
 #define PATH_MAX 32768U
@@ -25,7 +27,7 @@ struct kernel_seccomp_filter {
 static int action_supported(uint32_t action)
 {
     return action==RET_KILL_PROCESS || action==RET_KILL_THREAD ||
-        action==RET_TRAP || action==RET_ERRNO || action==RET_ALLOW;
+        action==RET_TRAP || action==RET_ERRNO || action==RET_TRACE || action==RET_ALLOW;
 }
 
 int kernel_seccomp_validate(const struct kernel_bpf_classic_insn *insns,
@@ -46,8 +48,8 @@ int kernel_seccomp_validate(const struct kernel_bpf_classic_insn *insns,
             return -KERNEL_EOPNOTSUPP;
         case 0x06:
             switch (i->k&ACTION) {
-            case 0x7fc00000:case 0x7ff00000:case 0x7ffc0000:
-                return -KERNEL_EOPNOTSUPP; /* USER_NOTIF, TRACE, LOG */
+            case 0x7fc00000:case 0x7ffc0000:
+                return -KERNEL_EOPNOTSUPP; /* USER_NOTIF, LOG */
             default: break; /* Unknown actions deliberately fail closed at run time. */
             }
             break;
@@ -227,8 +229,8 @@ void kernel_seccomp_release(struct kernel_task *task)
     }
 }
 
-int kernel_seccomp_check(struct kernel_task *task,const struct kernel_syscall_request *request,
-    struct kernel_syscall_result *result)
+static int check(struct kernel_task *task,struct kernel_syscall_request *request,
+    struct kernel_syscall_result *result,int retrace)
 {
     if (__atomic_load_n(&task->seccomp_mode,__ATOMIC_ACQUIRE)==1) {
         if (request->number==63 || request->number==64 || request->number==93 || request->number==139) return 0;
@@ -251,6 +253,23 @@ int kernel_seccomp_check(struct kernel_task *task,const struct kernel_syscall_re
     }
     switch (verdict&ACTION) {
     case RET_ALLOW:return 0;
+    case RET_TRACE:
+        if (retrace) return 0;
+        if (!kernel_ptrace_seccomp(task,request,result,verdict&0xffff)) {
+            kernel_signal_clear_syscall_restart(task);
+            result->action=KERNEL_SYSCALL_ACTION_RETURN_FINAL;
+            result->value=-KERNEL_ENOSYS;
+            return 1;
+        }
+        if ((int32_t)request->number<0) {
+            kernel_signal_clear_syscall_restart(task);
+            result->action=KERNEL_SYSCALL_ACTION_RETURN_FINAL;
+            return 1;
+        }
+        /* The tracer can change the number/arguments and TSYNC can publish a
+         * stronger chain while stopped. Re-read both; a second TRACE is allow,
+         * not a recursive event, but every stronger action still takes effect. */
+        return check(task,request,result,1);
     case RET_TRAP:
         kernel_signal_clear_syscall_restart(task);
         kernel_signal_force_seccomp(task,data.instruction_pointer,data.nr,data.arch,verdict&0xffff);
@@ -267,3 +286,7 @@ int kernel_seccomp_check(struct kernel_task *task,const struct kernel_syscall_re
     default:kernel_seccomp_terminate(31,1);
     }
 }
+
+int kernel_seccomp_check(struct kernel_task *task,struct kernel_syscall_request *request,
+    struct kernel_syscall_result *result)
+{ return check(task,request,result,0); }

@@ -139,21 +139,30 @@ FILTER。STRICT 只允许 `read/write/exit/rt_sigreturn`，其他调用直接以
 终止当前线程（不是整个线程组，也不执行被拒绝调用）。FILTER 安装需要
 `no_new_privs` 或 CAP_SYS_ADMIN；模式不能关闭或互相转换，过滤链只能追加。
 
-FILTER 支持常量返回 ALLOW、ERRNO、TRAP、KILL_THREAD、KILL_PROCESS。
+FILTER 支持常量返回 ALLOW、ERRNO、TRAP、TRACE、KILL_THREAD、KILL_PROCESS。
 ERRNO 数据截到 Linux 的 4095 上限，并直接返回用户态；即使值为 512 等
 内核 restart 编码，也不能触发自动重启；拒绝调用同时终结待处理的
 restart block，避免稍后的信号交付改写已完成调用的返回值和 PC。多个过滤器按有符号 action 优先级选择，
 同优先级保留最新过滤器的数据。未知 action 在最终选中时按 Linux 终止整个
-线程组，不能当 ALLOW。已知但尚未实现的 TRACE、LOG、USER_NOTIF，以及
+线程组，不能当 ALLOW。已知但尚未实现的 LOG、USER_NOTIF，以及
 动态 `RET A`，在安装时返回 `EOPNOTSUPP`，并不冒充完整 Linux FILTER 支持。
 安装 flags 支持 TSYNC；NEW_LISTENER、TSYNC_ESRCH 等其余位返回 `EINVAL`；
-GET_ACTION_AVAIL 只对上述五种 action 成功，GET_NOTIF_SIZES 尚不支持。
+GET_ACTION_AVAIL 只对上述六种 action 成功，GET_NOTIF_SIZES 尚不支持。
 
 TRAP 不执行系统调用，向触发线程强制投递 SIGSYS/SYS_SECCOMP，携带完整的
 调用号、AUDIT_ARCH、恢复 PC 及低 16 位策略数据（si_errno）。RV64/LA64 的
 a0 恢复到原始参数，处理器可在 ucontext 中写入模拟返回值；阻塞或忽略 SIGSYS
 不能绕过默认致命动作。复用同步信号槽，不为每次 TRAP 分配队列；ptrace 的
 信号交付停止可检查、编辑或抑制该信号，不能使已跳过的系统调用执行。
+
+TRACE 在启用 `PTRACE_O_TRACESECCOMP` 的跟踪关系中产生 SECCOMP 事件，
+消息为低 16 位策略数据；无跟踪者或未启用该选项时返回 ENOSYS。恢复后从
+真实寄存器重新读取调用号、原始 a0、其余参数和 PC，并重新检查最新过滤链，
+包含停止期间 TSYNC 发布的策略。重检 TRACE 只放行一次，不重复事件；
+ERRNO/TRAP/KILL 的较高优先级仍然生效。跟踪者把调用号改为负数时跳过执行，
+保留它设置的返回寄存器，且清除 restart block；致命恢复也不会执行调用。
+普通 SECCOMP 事件恢复的附带信号不作为信号交付注入。实际 syscall-enter
+BPF 观测位于过滤及重检之后，使用最终调用号和参数。
 
 程序最多 4096 条指令，链路径上限 32768（每个旧过滤器额外计 4 条）。复用
 已有 cBPF 的前向控制流、除数、移位及 scratch 初始化验证；seccomp 另限制
@@ -162,7 +171,7 @@ BPF 的网络字节序/包元数据解释路径，也不解引用用户参数中
 
 两个架构均在 ptrace syscall-enter 改号之后构造请求，并在公共 dispatcher
 的身份快速路径之前过滤；输入包含调用号、AUDIT_ARCH、恢复 PC 和完整六个
-64 位参数。未启用线程仅多一个 mode 判断；启用线程只遍历不可变链，不在
+64 位参数。未启用线程仅多一个 mode 判断；非 TRACE 事件的启用路径只遍历不可变链，不在
 每次调用分配、取全局锁或更新引用计数。fork/clone 共享链引用，exec（包括
 非 leader exec）保留当前线程自己的策略，无 TSYNC 的追加不改变兄弟线程；失败
 clone 与退出均在任务最终销毁时归还引用。KILL_THREAD 使用独立的线程终止
@@ -197,6 +206,13 @@ finish 后的终止窗口，以及并行安装。fixture 替换机器等待边�
 clone/exec 的所有失败阶段。Linux/BoarOS 同源 `tests/workloads/seccomp/tsync.c`
 覆盖线程组传播、失败 TID、无部分修改、STRICT 兄弟线程、并行安装、
 clone 发布和非组长 exec；可交给同一 `tests/userland/seccomp.py` 启动。
+`tests/workloads/seccomp/trace.c` 覆盖事件数据及截短复制、ENTRY/SECCOMP/EXIT
+顺序、改号与参数、二次 TRACE、较高优先级动作、负调用号/内部 restart 数值、
+后续信号 PC、事件中修改恢复 PC、LA 原始参数槽、致命停止的零写副作用、
+停止期间 TSYNC、fork 继承及 exec。BPF 观测直接检查改号后的 enter 参数及
+拒绝路径不产生 enter。Linux 宿主禁止
+ptrace 时只运行无跟踪者行为并明确跳过事件用例；RV/LA guest 执行事件路径。
+
 
 ## 双架构 ABI 差分入口
 

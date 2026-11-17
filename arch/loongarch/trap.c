@@ -137,7 +137,6 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
         struct kernel_syscall_request request={.number=frame->regs[11],.user_sp=frame->regs[3],.instruction_pointer=frame->era+4};
         for (unsigned i=0;i<6;i++) request.arguments[i]=frame->regs[4+i];
         struct kernel_syscall_result result;
-        kernel_bpf_trace_enter(caller,request.number,request.arguments);
         if (kernel_syscall_dispatch(caller,&request,&result)!=KERNEL_SYSCALL_STATUS_OK) la_virt_fatal("syscall dispatch");
         switch (result.action) {
         case KERNEL_SYSCALL_ACTION_EXIT_GROUP: kernel_user_group_exit(KERNEL_THREAD_EXIT_SYSCALL,result.value,0);

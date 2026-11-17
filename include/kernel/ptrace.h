@@ -11,6 +11,12 @@ struct kernel_ptrace_notice {
 struct kernel_signal_wait_info;
 struct kernel_task;
 int64_t kernel_ptrace_request(struct kernel_task *,uint64_t,int32_t,uint64_t,uint64_t);
+struct kernel_syscall_request;
+struct kernel_syscall_result;
+/* Returns zero without an enabled tracer. Otherwise reloads the request;
+ * negative nr skips execution with result->value as the final raw return. */
+int kernel_ptrace_seccomp(struct kernel_task *,struct kernel_syscall_request *,
+    struct kernel_syscall_result *,uint16_t);
 int kernel_ptrace_syscall_enter(struct kernel_task *,struct arch_trap_frame *);
 void kernel_ptrace_syscall_exit(struct kernel_task *,struct arch_trap_frame *,uint64_t);
 int kernel_ptrace_stop_requested(struct kernel_task *);

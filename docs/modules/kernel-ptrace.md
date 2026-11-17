@@ -21,7 +21,13 @@ LA64 基础浮点写入保留各向量寄存器的高位。`PEEKUSER` 与 `POKEU
 
 `PEEKTEXT` 和 `PEEKDATA` 的原始系统调用把机器字复制到 data 指针并返回零；libc 的 ptrace 包装返回读取的机器字。`POKETEXT` 和 `POKEDATA` 使用传入的机器字更新目标。停止期间的访问固定目标的执行状态，私有映射的写入使用 COW，写入可执行页后发布指令缓存。映射与页所有权见 [内存管理](kernel-mm.md)。
 
-单步、硬件断点和 seccomp 事件均超出此接口当前支持的跟踪范围。
+`PTRACE_O_TRACESECCOMP` 允许 FILTER TRACE 触发事件 7，`GETEVENTMSG` 返回
+策略数据。`GET_SYSCALL_INFO` 此时返回 SECCOMP 阶段（op=3，完整大小 84
+字节），不依赖 TRACESYSGOOD；参数 a0 使用原始槽。系统调用正常恢复后重新
+过滤；负调用号跳过时普通 a0 是跟踪者指定的返回值。过滤与 restart 规则见
+[系统调用](kernel-syscall.md#seccomp-系统调用过滤)。
+
+单步和硬件断点超出此接口当前支持的跟踪范围。
 
 ## 直接消费者与工具
 

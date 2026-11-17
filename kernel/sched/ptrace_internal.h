@@ -3,7 +3,7 @@
 #include <kernel/ptrace.h>
 #include <kernel/signal.h>
 #include <kernel/credentials.h>
-enum trace_event { TRACE_FORK=1,TRACE_VFORK,TRACE_CLONE,TRACE_EXEC,TRACE_VFORK_DONE,TRACE_EXIT,TRACE_STOP=128 };
+enum trace_event { TRACE_FORK=1,TRACE_VFORK,TRACE_CLONE,TRACE_EXEC,TRACE_VFORK_DONE,TRACE_EXIT,TRACE_SECCOMP,TRACE_STOP=128 };
 enum { TRACE_RUNNING,TRACE_PARKING,TRACE_STOPPED,TRACE_LISTENING,TRACE_FINAL };
 enum { TRACE_WAIT_STOP=4,TRACE_WAIT_FINAL };
 /* Each indexed child belongs to exactly one tracer TID. All links and stop

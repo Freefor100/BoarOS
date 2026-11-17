@@ -23,6 +23,15 @@ void kernel_signal_clear_syscall_restart(struct kernel_task *task)
 {task->syscall_restart=(struct kernel_syscall_restart_state){0};}
 void kernel_signal_force_seccomp(struct kernel_task *task,uint64_t pc,int32_t nr,uint32_t arch,uint16_t error)
 {assert(task&&pc==0x12345678&&nr==172&&arch==0xc00000f3&&error==123);}
+static int trace_mode,trace_calls;
+int kernel_ptrace_seccomp(struct kernel_task *task,struct kernel_syscall_request *request,
+    struct kernel_syscall_result *result,uint16_t data)
+{
+    (void)task;assert(data==42);trace_calls++;
+    if (trace_mode==1) request->number=173;
+    if (trace_mode==2) {request->number=(uint64_t)-1;result->value=-512;}
+    return trace_mode!=0;
+}
 #ifndef SECCOMP_SCHEDULER_FIXTURE
 int64_t kernel_seccomp_install(struct kernel_task *task,struct kernel_seccomp_filter *f,uint32_t flags)
 {return kernel_seccomp_attach_locked(task,f,flags);}
@@ -78,7 +87,20 @@ int main(void)
     assert(kernel_seccomp_check(parent,&request,&result)==1&&result.value==321);
     assert(parent->syscall_restart.kind==KERNEL_SYSCALL_RESTART_NONE);
     kernel_seccomp_release(parent);
-    ret[0].k=0x7ff00000;assert(attach(parent,ret,1)==-KERNEL_EOPNOTSUPP);
+    parent->seccomp_mode=0;
+    ret[0].k=0x7ff00000|42;assert(!attach(parent,ret,1));
+    parent->syscall_restart.kind=KERNEL_SYSCALL_RESTART_NANOSLEEP;
+    assert(kernel_seccomp_check(parent,&request,&result)==1&&result.value==-KERNEL_ENOSYS);
+    assert(!parent->syscall_restart.kind&&trace_calls==1);
+    trace_mode=2;
+    assert(kernel_seccomp_check(parent,&request,&result)==1&&result.value==-512);
+    assert(result.action==KERNEL_SYSCALL_ACTION_RETURN_FINAL);
+    trace_mode=1;request.number=172;trace_calls=0;
+    assert(!kernel_seccomp_check(parent,&request,&result)&&request.number==173&&trace_calls==1);
+    struct kernel_bpf_classic_insn changed[]={I(0x20,0,0,0),I(0x15,0,1,173),I(0x06,0,0,0x50000|13),I(0x06,0,0,0x7fff0000)};
+    assert(!attach(parent,changed,4));request.number=172;trace_calls=0;
+    assert(kernel_seccomp_check(parent,&request,&result)==1&&result.value==-13&&trace_calls==1);
+    kernel_seccomp_release(parent);parent->seccomp_mode=0;
     ret[0].code=0x16;assert(attach(parent,ret,1)==-KERNEL_EOPNOTSUPP);assert(!live);
     struct kernel_bpf_classic_insn *large=calloc(4096,sizeof(*large));
     large[4095]=(struct kernel_bpf_classic_insn)I(0x06,0,0,0x7fff0000);

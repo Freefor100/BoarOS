@@ -18,7 +18,7 @@ uint32_t kernel_seccomp_run(const struct kernel_bpf_classic_insn *, uint32_t,
     const struct kernel_seccomp_data *);
 int64_t kernel_seccomp_set(struct kernel_task *, uint32_t, uint32_t, uint64_t);
 int64_t kernel_seccomp_syscall(struct kernel_task *, uint32_t, uint32_t, uint64_t);
-int kernel_seccomp_check(struct kernel_task *, const struct kernel_syscall_request *,
+int kernel_seccomp_check(struct kernel_task *, struct kernel_syscall_request *,
     struct kernel_syscall_result *);
 /* Installation serializes with group publication and exec credential capture.
  * The prepared node stays caller-owned on failure; publication consumes it. */

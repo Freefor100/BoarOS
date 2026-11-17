@@ -270,7 +270,6 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
             },
         };
         struct kernel_syscall_result result;
-        kernel_bpf_trace_enter(caller,(int32_t)request.number,request.arguments);
 #if BOAROS_USER_SMP
         kernel_cpu_current()->syscall_dispatches++;
 #endif

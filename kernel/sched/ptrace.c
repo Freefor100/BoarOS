@@ -1,6 +1,7 @@
 #include "private.h"
 #include "ptrace_internal.h"
 #include <kernel/errno.h>
+#include <kernel/syscall.h>
 #include <kernel/uaccess.h>
 #include <string.h>
 
@@ -9,7 +10,7 @@ enum { TRACEME=0,PEEKTEXT=1,PEEKDATA,PEEKUSER,POKETEXT,POKEDATA,POKEUSER,CONT,KI
     GETREGSET,SETREGSET,SEIZE,INTERRUPT,LISTEN,GETSIGMASK=0x420a,SETSIGMASK,
     GET_SYSCALL_INFO=0x420e };
 #define EXITKILL (1U<<20)
-#define VALID_OPTIONS (EXITKILL|127U)
+#define VALID_OPTIONS (EXITKILL|255U)
 #define STOP_STATUS(signal,event) ((event)<<16|(signal)<<8|0x7fU)
 
 static struct kernel_ptrace_state *state(const struct kernel_task *t)
@@ -241,6 +242,45 @@ static void syscall_stop(struct kernel_task *t,unsigned op,struct arch_trap_fram
 #endif
     }
 }
+int kernel_ptrace_seccomp(struct kernel_task *t,struct kernel_syscall_request *request,
+    struct kernel_syscall_result *result,uint16_t data)
+{
+    unsigned options;
+    if (!tracing(t,&options) || !(options&(1U<<TRACE_SECCOMP))) return 0;
+    struct arch_trap_frame *frame=(void *)(t->stack_high-sizeof(*frame));
+    t->ptrace->original_arg=request->arguments[0];
+#if defined(BOAROS_ARCH_LOONGARCH)
+    frame->era+=4;
+    frame->regs[4]=(uint64_t)-KERNEL_ENOSYS;
+#else
+    frame->sepc+=4;
+    frame->a0=(uint64_t)-KERNEL_ENOSYS;
+#endif
+    (void)stop(t,STOP_STATUS(5,TRACE_SECCOMP),data,3,0);
+    int terminated;
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        terminated=t->terminate_requested;
+    }
+    uint32_t arch;
+    arch_ptrace_syscall(frame,&arch,&request->user_sp,&request->number,request->arguments);
+    result->value=(int64_t)request->arguments[0];
+    request->arguments[0]=t->ptrace->original_arg;
+    request->instruction_pointer=arch_frame_pc(frame);
+#if defined(BOAROS_ARCH_LOONGARCH)
+    frame->era-=4;
+    if ((int32_t)request->number>=0) frame->regs[4]=request->arguments[0];
+#else
+    frame->sepc-=4;
+    if ((int32_t)request->number>=0) frame->a0=request->arguments[0];
+#endif
+    if (terminated) {
+        /* Fatal event resume cannot perform a tracer-selected operation. */
+        request->number=(uint64_t)-1;
+        result->value=-KERNEL_ENOSYS;
+    }
+    return 1;
+}
 int kernel_ptrace_syscall_enter(struct kernel_task *t,struct arch_trap_frame *f)
 {
     /* An attach can race the last user-return check, including return from
@@ -458,17 +498,16 @@ static int regset(struct kernel_task *caller,struct kernel_task *t,unsigned note
 static int64_t syscall_info(struct kernel_task *caller,struct kernel_task *t,uint64_t size,uint64_t data)
 {
     struct {
-        uint8_t op,pad[3]; uint32_t arch; uint64_t pc,sp,nr,args[6];
+        uint8_t op,pad[3]; uint32_t arch; uint64_t pc,sp,nr,args[6]; uint32_t ret_data;
     } info={.op=t->ptrace->operation};
     struct arch_trap_frame *f=(void *)(t->stack_high-sizeof(*f));
     info.pc=arch_frame_pc(f);
     arch_ptrace_syscall(f,&info.arch,&info.sp,&info.nr,info.args);
     size_t actual=24;
-    if (info.op==1) {
-#if defined(BOAROS_ARCH_LOONGARCH)
+    if (info.op==1 || info.op==3) {
         info.args[0]=t->ptrace->original_arg;
-#endif
-        actual=80;
+        info.ret_data=(uint32_t)t->ptrace->message;
+        actual=info.op==3?84:80;
     }
     else if (info.op==2) {
         info.nr=info.args[0];
