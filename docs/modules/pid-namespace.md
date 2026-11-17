@@ -157,6 +157,8 @@ proc 快照在锁内固定 registry，再在锁外分配小型 nsfs bridge。bri
 
 `/proc/PID/ns/pid` 取 active，`pid_for_children` 取后续子进程目标；两者返回相同 nsfs 类型 `CLONE_NEWPID` 和 `pid:[inode]` 名称。按仓库固定 Linux commit f4cdf7ca 的 pidns_for_children_get，尚无 child_reaper 的 for-children 仍可取得 namespace FD；其目标身份和存储引用保持有效。这与较旧 Linux v6.12 的检查不同，不混用版本语义。proc 使用同一次多类型快照，并在锁外分配后复查任务代际、MM、安全状态和访问凭据。死亡 namespace 的 FD 仍保留存储，setns 不复活它，随后 clone admission 返回 ENOMEM。当前用户只能取得初始 namespace FD；嵌套所有权和死亡状态由生产函数 host fixture 验证。
 
+命名空间 FD 上的 `NS_GET_PARENT` 只返回调用者 active PID namespace 或其后代中的父 namespace，返回的只读 FD 设置 FD_CLOEXEC；目标没有父或父不可见时为 EPERM。四个 `NS_GET_{PID,TGID}_{FROM,IN}_PIDNS` ioctl 均以数值 TID 为参数，不传用户指针：FROM 从 FD 视图查线程并投影至调用者视图，IN 方向相反；TGID 返回该线程所属组的编号。线程查找与编号投影在同一身份锁内完成，目标已摘除或在结果视图不可见返回 ESRCH，非 PID 类型 FD 返回 EINVAL。
+
 pidfd_open 的数字现在按调用者 active namespace 查找。pidfd_send_signal 在取得 FD 身份后、导入用户 siginfo 前检查 namespace 关系：仅同层或发送者为祖先时允许，继承或 SCM_RIGHTS 不赋予向祖先/兄弟发送的权力，失败为 EINVAL；随后仍走原信号权限和角色存续检查。该限制也覆盖 proc 进程目录 FD。getfd 不套用 send 的层级限制，继续沿真实身份、凭据、MM 和 files 复核。pidfd setns 使用保留身份的 canonical root 编号与 generation 取得 namespace 快照，不把 leaf number 当作 root 重新解析。
 
 `tests/host/pidfd_files.c` 通过生产 FD 表 fork、pin/install 转交和 pidfd 实现检查兄弟同号、外层 FD 拒绝、合法祖先访问、跨兄弟 getfd、退出后编号复用和最后引用归还；调度及 OFD 最终析构仍是 fixture 接缝。proc-index 检查实际 nested namespace 快照的 canonical 适配与已退出身份拒绝，未执行完整 nested setns 安装。RV/LA 的 pid_namespace 使用真实 fork/SCM_RIGHTS 传 pidfd 并做 signal 0 与 fdinfo 检查，仍仅初始 PID namespace；native Linux 的 fsopen/setns 权限拒绝单独报告，不算成功。完整 nested guest 和后续剩余资源边界仍不可省略。

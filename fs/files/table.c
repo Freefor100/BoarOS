@@ -30,6 +30,42 @@
 #define LINUX_O_LARGEFILE UINT64_C(00100000)
 #define LINUX_O_CLOEXEC UINT64_C(02000000)
 
+static int namespace_ioctl(struct kernel_files *files, struct kernel_open_file_description *file,
+    uint32_t command, uint64_t argument)
+{
+    if (kernel_open_file_flags(file) & 010000000U) return -KERNEL_EBADF;
+    struct kernel_namespace *ns = kernel_namespace_file(file);
+    switch (command) {
+    case 0xb702U: { /* NS_GET_PARENT */
+        struct kernel_namespace *parent = NULL;
+        int error = kernel_pidns_parent(ns, &parent);
+        if (error) return error;
+        uint32_t fd;
+        if (kernel_files_find_free_fd(files, &fd, &error)) __builtin_trap();
+        if (!error) {
+            struct kernel_files_fd_reservation reservation
+                __attribute__((cleanup(kernel_files_cancel_reservation))) = {files, fd};
+            struct kernel_open_file_description *owner = NULL;
+            error = kernel_namespace_open(parent, files->heap, 0, &owner);
+            if (!error) {
+                if (kernel_files_install_new_owned_at(files, fd, KERNEL_FILES_FD_CLOEXEC, &owner))
+                    __builtin_trap();
+                reservation.files = NULL;
+                error = (int)fd;
+            }
+        }
+        kernel_namespace_put(parent);
+        return error;
+    }
+    case 0xb703U: return ns->type; /* NS_GET_NSTYPE */
+    case 0x8004b706U: return kernel_pidns_translate(ns, (int32_t)argument, 1, 0);
+    case 0x8004b707U: return kernel_pidns_translate(ns, (int32_t)argument, 1, 1);
+    case 0x8004b708U: return kernel_pidns_translate(ns, (int32_t)argument, 0, 0);
+    case 0x8004b709U: return kernel_pidns_translate(ns, (int32_t)argument, 0, 1);
+    default: return -KERNEL_ENOTTY;
+    }
+}
+
 enum kernel_files_status kernel_files_ioctl(
     struct kernel_files *files, struct kernel_mm *mm, int64_t fd,
     uint64_t command, uint64_t argument, int64_t *linux_result)
@@ -74,8 +110,7 @@ enum kernel_files_status kernel_files_ioctl(
             *linux_result=kernel_copy_to_user(mm,argument,&value,sizeof(value),&copied) || copied!=sizeof(value)?-KERNEL_EFAULT:0;
         }
     } else if (description->kind==KERNEL_OPEN_FILE_KIND_NAMESPACE)
-        *linux_result=(kernel_open_file_flags(description)&010000000U)?-KERNEL_EBADF:
-            command==0xb703U?(int64_t)kernel_namespace_file(description)->type:-KERNEL_ENOTTY; /* NS_GET_NSTYPE */
+        *linux_result = namespace_ioctl(files, description, command, argument);
     else *linux_result = description->block ? kernel_block_file_ioctl(files, &description, mm, command, argument) :
         description->device && description->device->ioctl
         ? description->device->ioctl(description->device_instance, kernel_task_current(), files, &description, mm, command, argument) : -KERNEL_ENOTTY;

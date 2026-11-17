@@ -14,7 +14,7 @@ fi
 set --
 for symbol in $(sed -n 's/^EXCLUDED(\([^)]*\)).*/\1/p' tests/host/file_io_excluded.c); do
     if [ "${FILE_IO_HOST_IDENTITY:-0}" = 1 ]; then
-        case "$symbol" in kernel_task_identity_*|kernel_pid_get) continue;; esac
+        case "$symbol" in kernel_task_identity_*|kernel_pidns_*|kernel_pid_get) continue;; esac
     fi
     if [ "${FILE_IO_HOST_TCP:-1}" = 1 ]; then
         case "$symbol" in kernel_socket_*|kernel_time_deadline_from_monotonic) continue;; esac

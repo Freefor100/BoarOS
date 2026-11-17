@@ -243,6 +243,70 @@ static void heap_namespace_case(struct kernel_task *parent)
 
 #include "pid_namespace_unshare.h"
 
+/* The same local TID is used by successive nonleaders with different root
+ * numbers. A retained namespace is a view, not a cached task identity. */
+struct translation_case {
+    pthread_barrier_t barrier;
+    struct kernel_namespace *space;
+    struct kernel_task *caller;
+};
+static void *translate_reader(void *opaque)
+{
+    struct translation_case *c = opaque;
+    kernel_cpu_initialize(&cpu, 1, NULL); cpu.current = c->caller;
+    for (int i = 0; i < 32; ++i) {
+        pthread_barrier_wait(&c->barrier);
+        assert(kernel_pidns_translate(c->space, 7, 1, 0) == 42 + i%2);
+        assert(kernel_pidns_translate(c->space, 7, 1, 1) == 41);
+        pthread_barrier_wait(&c->barrier);
+        /* The writer now detaches the TID. Only its old value or ESRCH is legal. */
+        int n = kernel_pidns_translate(c->space, 7, 1, 0);
+        assert(n == 42 + i%2 || n == -KERNEL_ESRCH);
+        pthread_barrier_wait(&c->barrier);
+        assert(kernel_pidns_translate(c->space, 7, 1, 1) == -KERNEL_ESRCH);
+        pthread_barrier_wait(&c->barrier);
+    }
+    return NULL;
+}
+static void translate_case(struct kernel_task *root, struct kernel_task *child)
+{
+    struct translation_case c = {.caller=root};
+    scheduler.initialized = KERNEL_SCHEDULER_INITIALIZED;
+    struct kernel_namespace *parent = NULL, *none = NULL;
+    assert(!process_pid_namespace_snapshot(process_pid_active(child), &scheduler.identity_heap, &c.space));
+    assert(!kernel_pidns_parent(c.space, &parent) && parent->id == KERNEL_NS_INITIAL_PID_ID);
+    assert(kernel_pidns_parent(parent, &none) == -KERNEL_EPERM && !none);
+    assert(kernel_pidns_translate(c.space, 1, 1, 0) == 41);
+    assert(kernel_pidns_translate(c.space, 41, 0, 0) == 1);
+    assert(kernel_pidns_translate(c.space, 1, 0, 0) == -KERNEL_ESRCH);
+    cpu.current = child;
+    assert(kernel_pidns_parent(c.space, &none) == -KERNEL_EPERM && !none);
+    assert(kernel_pidns_translate(parent, 1, 1, 0) == -KERNEL_ESRCH);
+    cpu.current = root;
+    pthread_t reader;
+    assert(!pthread_barrier_init(&c.barrier,NULL,2));
+    assert(!pthread_create(&reader,NULL,translate_reader,&c));
+    for (int i = 0; i < 32; ++i) {
+        struct kernel_task thread = {.group_leader = child};
+        kernel_pid_t requested[] = {7, 42 + i%2};
+        assert(!process_identity_create_numbers(&thread, child, 1, requested, 2, 1));
+        {
+            KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+            assert(!process_identity_admit_locked(&thread));
+            process_identity_commit_locked(&thread);
+        }
+        assert(kernel_pidns_translate(c.space, requested[1], 0, 1) == 1);
+        pthread_barrier_wait(&c.barrier);
+        pthread_barrier_wait(&c.barrier);
+        release(&thread);
+        pthread_barrier_wait(&c.barrier);
+        pthread_barrier_wait(&c.barrier);
+    }
+    assert(!pthread_join(reader,NULL)); assert(!pthread_barrier_destroy(&c.barrier));
+    kernel_namespace_put(parent); kernel_namespace_put(c.space);
+    scheduler.initialized = 0;
+}
+
 int main(void)
 {
     kernel_cpu_initialize(&cpu, 0, NULL);
@@ -304,6 +368,7 @@ int main(void)
             assert(process_pid_reaper_locked(process_pid_active(&fresh)) == &fresh);
             assert(process_pid_children_locked(&fresh) == process_pid_active(&fresh));
         }
+        translate_case(&init, &fresh);
         struct kernel_task nested = {0};
         assert(!process_identity_create_new_namespace(&nested, &fresh, NULL, 0, 0));
         {

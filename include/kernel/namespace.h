@@ -31,6 +31,9 @@ struct kernel_namespace *kernel_namespace_get(struct kernel_namespace *);
 void kernel_namespace_put(struct kernel_namespace *);
 int kernel_namespace_open(struct kernel_namespace *,struct kernel_heap *,uint32_t,
     struct kernel_open_file_description **);
+/* Snapshot owner pins the registry and its immutable ancestor chain. */
+int kernel_pidns_parent(struct kernel_namespace *, struct kernel_namespace **);
+int kernel_pidns_translate(struct kernel_namespace *, int32_t tid, int from_fd, int tgid);
 /* Borrowed under an existing OFD owner. */
 struct kernel_namespace *kernel_namespace_file(const struct kernel_open_file_description *);
 

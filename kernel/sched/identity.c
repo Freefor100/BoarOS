@@ -154,6 +154,33 @@ struct kernel_task *process_find_identity_in(kernel_pid_t number, enum kernel_pi
 struct kernel_task *process_find_identity(kernel_pid_t number, enum kernel_pid_role role)
 { return process_find_identity_in(number, role, &scheduler.identities); }
 
+int kernel_pidns_parent(struct kernel_namespace *ns, struct kernel_namespace **owner)
+{
+    struct kernel_pid_registry *space = process_pid_namespace_registry(ns);
+    if (!space) return -KERNEL_EINVAL;
+    struct kernel_pid_registry *parent = space->parent;
+    struct kernel_pid_registry *active = process_pid_active(kernel_task_current());
+    for (struct kernel_pid_registry *p = parent; p; p = p->parent)
+        if (p == active) return process_pid_namespace_snapshot(parent, ns->heap, owner);
+    return -KERNEL_EPERM;
+}
+
+int kernel_pidns_translate(struct kernel_namespace *ns, int32_t tid, int from_fd, int tgid)
+{
+    struct kernel_pid_registry *space = process_pid_namespace_registry(ns);
+    if (!space) return -KERNEL_EINVAL;
+    struct kernel_task *caller = kernel_task_current();
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    struct kernel_pid_registry *active = process_pid_active(caller);
+    /* Resolve a current TID even for TGID queries. Keep lookup and projection
+     * in one identity-domain read across reap, reuse and group-leader exec. */
+    struct kernel_task *target = process_find_identity_in(tid, KERNEL_PID_TID,
+        from_fd ? space : active);
+    int result = kernel_pid_number_in(process_identity(target, tgid ? KERNEL_PID_TGID : KERNEL_PID_TID),
+        from_fd ? active : space);
+    return result ? result : -KERNEL_ESRCH;
+}
+
 void process_identity_sync_locked(struct kernel_task *task)
 {
     task->tid = process_identity_number(task, KERNEL_PID_TID);
