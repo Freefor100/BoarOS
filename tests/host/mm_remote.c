@@ -29,6 +29,22 @@ static void *remote_borrower(void *opaque)
     kernel_mm_core_remote_end(mm);rendezvous();rendezvous();
     assert(!kernel_mm_core_remote_begin(mm));rendezvous();return NULL;
 }
+struct shared_writer { struct kernel_mm *mm; uint64_t address; };
+static void *write_shared_alias(void *opaque)
+{
+    struct shared_writer *writer=opaque;
+    mm_test_attach(1);
+    assert(!kernel_mm_context(writer->mm,&mm_test_context));
+    rendezvous();
+    /* A different MM can still write the shared physical storage. The
+     * target's dump gate is not a lock on every alias of that storage. */
+    assert(kernel_mm_core_remote_begin(writer->mm));
+    unsigned char value=22;size_t copied;
+    assert(!kernel_mm_remote_transfer(writer->mm,writer->address,&value,1,1,0,&copied)&&copied==1);
+    assert(!kernel_mm_remote_transfer(writer->mm,writer->address+BOAROS_PAGE_SIZE,&value,1,1,0,&copied)&&copied==1);
+    kernel_mm_core_remote_end(writer->mm);
+    rendezvous();mm_test_context=0;return NULL;
+}
 int main(void)
 {
     mm_test_attach(0);
@@ -71,7 +87,30 @@ int main(void)
     kernel_mm_unpin_user_page(&pending_write);
     assert(kernel_mm_core_begin(&mm));kernel_mm_core_end(&mm);
     assert(!kernel_mm_mprotect(&mm,address,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_EXECUTE));
+    uint64_t shared_address;
+    assert(!kernel_mm_mmap_anonymous(&mm,0x100000,2*BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED|KERNEL_MM_MAP_SHARED,&shared_address));
+    unsigned char initial=11;
+    assert(!kernel_mm_remote_transfer(&mm,shared_address,&initial,1,1,0,&copied)&&copied==1);
+    assert(!kernel_mm_remote_transfer(&mm,shared_address+BOAROS_PAGE_SIZE,&initial,1,1,0,&copied)&&copied==1);
     assert(!kernel_mm_fork(&child,&mm));
+    assert(mm.record!=child.record);
+    assert(kernel_mm_core_begin(&mm));
+    unsigned char first=0,last=0;
+    assert(!kernel_mm_remote_transfer(&mm,shared_address,&first,1,0,1,&copied)&&copied==1);
+    struct shared_writer writer={&child,shared_address};
+    assert(!pthread_barrier_init(&core_barrier,NULL,2));
+    assert(!pthread_create(&borrower,NULL,write_shared_alias,&writer));
+    rendezvous();rendezvous();
+    assert(!kernel_mm_remote_transfer(&mm,shared_address+BOAROS_PAGE_SIZE,&last,1,0,1,&copied)&&copied==1);
+    assert(!pthread_join(borrower,NULL));assert(!pthread_barrier_destroy(&core_barrier));
+    unsigned char first_after=0;
+    assert(!kernel_mm_remote_transfer(&mm,shared_address,&first_after,1,0,1,&copied)&&copied==1);
+    assert(first_after==22); /* Both pages really alias the writer's MM. */
+    assert(first==11&&last==22); /* This pair never existed simultaneously. */
+    assert(!kernel_mm_core_remote_begin(&mm));
+    kernel_mm_core_end(&mm);
+    puts("MM core shared aliases remain live; sequential copies are not a global snapshot");
     assert(kernel_mm_remote_transfer(&child,address,&value,1,1,0,&copied)==-KERNEL_EFAULT&&!copied);
     unsigned fences=instruction_fences;value=73;
     assert(!kernel_mm_remote_transfer(&child,address,&value,1,1,1,&copied)&&copied==1);

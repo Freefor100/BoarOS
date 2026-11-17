@@ -243,7 +243,9 @@ int process_core_dump(struct kernel_task *task,unsigned signal)
             if (offset>limit || BOAROS_PAGE_SIZE>limit-offset) goto out;
             size_t copied=0;
             /* Debugger read preserves protection bits and handles PROT_NONE.
-             * Inaccessible backing (e.g. a truncated file) is an ELF hole. */
+             * Inaccessible backing (e.g. a truncated file) is an ELF hole.
+             * Another MM may still write shared backing during this copy;
+             * the group rendezvous does not promise a global snapshot. */
             memset(scratch.data,0,BOAROS_PAGE_SIZE);
             unsigned char resident=1;unsigned completed=0;
             if (map->kind==KERNEL_VMA_KIND_ANONYMOUS)
