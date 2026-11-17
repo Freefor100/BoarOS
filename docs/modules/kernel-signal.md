@@ -171,7 +171,7 @@ FP/LSX/LASX记录、pending异常、首用与宽度升级和owner切换见[LA浮
 
 崩溃 owner 在 scheduler wait domain 中同时发布 session 和 group-exiting，禁止新的 clone/exec 发布。现有终止路径打断同组成员的可中断等待、停止态和远端用户执行；每个成员到达退出边界后保存自己的整数寄存器，再等待 owner 结束。这个边界早于 ptrace exit 通知、robust futex、clear_child_tid 和 MM 释放，因此不会用“其他线程已经销毁后的地址空间”冒充完整线程快照。线程从不同 CPU 逐个停驻，并非保证所有寄存器属于同一个硬件时刻；只有全部成员停驻后才枚举映射并输出内存。
 
-停驻最多等待 5 秒，超时或任何准备/写出失败均撤销 session、唤醒已经停驻的线程继续原来的致命退出。等待者只检查组长上的 session 身份，不在释放后解引用 session。notes 存储按本次线程数分配，结束统一释放；没有每次调度的冻结检查或常驻 worker。
+停驻最多等待 5 秒，超时或任何准备/写出失败均撤销 session、唤醒已经停驻的线程继续原来的致命退出。等待者只检查组长上的 session 身份，不在释放后解引用 session。到达通知仅唤醒 owner，已停驻线程使用独立的结束队列，避免每到达一个成员就反复唤醒其他成员。notes 存储按本次线程数分配，结束统一释放；没有每次调度的冻结检查或常驻 worker。
 
 开始读取前，MM 拒绝仍持有用户写 pin 或在途 `process_vm_*` borrower 的转储。远程借用与 dump 使用一个原子排他登记；转储期间新 `process_vm_*` 请求返回 ESRCH，在途请求使本次 dump 放弃而不是等待。借用在 syscall 的正常与异常 abort 路径归还。当前有 tracer 或正在访问 tracee 的线程组不转储，session 存续期间拒绝新 ptrace attach，避免寄存器和远程写的另一个 owner 跨睡眠修改现场。
 
@@ -181,6 +181,6 @@ FP/LSX/LASX记录、pending异常、首用与宽度升级和owner切换见[LA浮
 - 当前输出除 DONTDUMP/vvar 外的映射内容，尚无 Linux 默认 `coredump_filter=0x33` 的文件映射选择、可配置过滤器、`core_pattern`/pipe helper。没有 NT_FILE、AUXV、浮点/SIMD notes；PRSTATUS 的 CPU times 未填充。调试器需要另行加载对应可执行文件，本阶段不能声称浮点或完整 Linux 调试信息。
 - 其他进程对共享文件页的写入与 core 读取可交错，没有把全系统共享内存冻结。恶意同 UID 进程对输出文件的并发修改也不由此机制防护。
 
-定向入口是 `tests/userland/run.py --only boaros --workload core_dump --arch riscv|loongarch --cpus N --memory 512M --kernel ...`。测试核对内容、权限、DONTDUMP、限额、dumpable、链接安全和旧文件替换；双线程案例严格要求两份不同 TID 的 notes 和非零 PC/SP，分别覆盖 pipe 阻塞、用户态运行和非组长崩溃，并检查写文件失败后退出及跨组 CLONE_VM 拒绝。单线程转储前执行成功的 process_vm 读写及 EFAULT 路径，检查它们归还远程登记后仍能转储。runner 导出 `core.elf`、`core-threads.elf`，对两个文件运行宿主 `readelf -h -l -n` 并检查 notes 数量。`tests/host/mm-remote.sh` 用两线程握手检查在途远程借用、新借用、写 pin 和释放后的重新接纳（4K/16K）。
+定向入口是 `tests/userland/run.py --only boaros --workload core_dump --arch riscv|loongarch --cpus N --memory 512M --kernel ...`。测试核对内容、权限、DONTDUMP、限额、dumpable、链接安全和旧文件替换；多线程案例严格要求对应成员数的不同 TID notes 和非零 PC/SP，分别覆盖双线程 pipe 阻塞、四线程用户态运行和双线程非组长崩溃，并检查写文件失败后退出及跨组 CLONE_VM 拒绝。单线程转储前执行成功的 process_vm 读写及 EFAULT 路径，检查它们归还远程登记后仍能转储。runner 导出 `core.elf`、`core-threads.elf`，对两个文件运行宿主 `readelf -h -l -n` 并检查 notes 数量。`tests/host/mm-remote.sh` 用两线程握手检查在途远程借用、新借用、写 pin 和释放后的重新接纳（4K/16K）。
 
 调试时将对应 workload ELF 与 core 一同交给目标 GDB，例如 `riscv64-linux-gdb program core-threads.elf`，再执行 `info threads` 与 `thread apply all info registers pc sp`。RV 已用现有 GDB 直接识别两条线程及寄存器。LA 输出符合 Linux 的 480 字节 PRSTATUS；本环境 GDB 16.3 的旧 BFD 只接受 472 字节，原始 core 会报找不到通用寄存器。这是上游记录的 [LoongArch PRSTATUS 长度问题](https://sourceware.org/pipermail/binutils/2025-November/145528.html)，需要包含该修正的 debugger；不能为适配旧工具删去 Linux ABI 字段。LA guest 已检查两线程寄存器，readelf 能解析 notes，但本环境没有完成原始 LA core 的 GDB 消费验证。宿主 Linux 能验证双线程 SIGABRT 退出，但不会生成 core，故没有正向 Linux 文件内容对照。

@@ -33,6 +33,7 @@ _Static_assert(sizeof(struct core_status)==112,"Linux prstatus prefix");
  * clear_child_tid writes happen afterwards. Nothing is added to switch paths. */
 struct process_core_session {
     struct kernel_task *owner;
+    struct kernel_wait_queue arrivals;
     uint32_t count, arrived;
     unsigned signal;
     size_t notesize;
@@ -86,7 +87,7 @@ void process_core_rendezvous(struct kernel_task *task)
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         session->arrived++;
     }
-    (void)kernel_wait_queue_wake_all(&leader->group_wait_queue);
+    (void)kernel_wait_queue_wake_one(&session->arrivals);
     while (core_pending(leader,session)) {
         enum kernel_wait_wake_reason reason;
         if (KERNEL_WAIT_RECHECK(&leader->group_wait_queue,0,0,&reason,
@@ -124,6 +125,7 @@ static struct process_core_session *core_freeze(struct kernel_task *task,unsigne
     size_t notesize=20+((sizeof(struct core_status)+arch_ptrace_regset_size(1)+4+7)&~(size_t)7);
     if (!count || count>(SIZE_MAX-sizeof(*session))/notesize ||
         kernel_heap_allocate_zeroed(task->files.heap,1,sizeof(*session)+count*notesize,(void **)&session)) return 0;
+    kernel_wait_queue_init(&session->arrivals);
     session->owner=task;session->count=count;session->signal=signal;session->notesize=notesize;
     core_note(task,signal,session->notes);session->arrived=1;
     {
@@ -152,7 +154,7 @@ static struct process_core_session *core_freeze(struct kernel_task *task,unsigne
     if (kernel_time_deadline_from_monotonic(kernel_time_monotonic_ns()+UINT64_C(5000000000),&deadline)) goto failed;
     while (core_arriving(session)) {
         enum kernel_wait_wake_reason reason;
-        if (KERNEL_WAIT_RECHECK(&leader->group_wait_queue,deadline,0,&reason,core_arriving(session)) ||
+        if (KERNEL_WAIT_RECHECK(&session->arrivals,deadline,0,&reason,core_arriving(session)) ||
             kernel_time_monotonic_ns()>=kernel_time_ticks_to_ns(deadline)) goto failed;
     }
     return session;

@@ -20,18 +20,18 @@
 #define CHECK(x) do {if(!(x)){printf("CORE FAIL line=%d errno=%d\n",__LINE__,errno);exit(1);}}while(0)
 static char *memory;static size_t page;static pid_t crashed_pid;
 static int ready[2],hold[2],identity[2];
-static int thread_mode;static pid_t crashed_thread;
+static int thread_mode;static pid_t crashed_threads[3];static unsigned peer_count;
 static volatile uint64_t spinning;
 static void *other_thread(void *unused)
 { (void)unused;char c;pid_t tid=(pid_t)syscall(SYS_gettid);
  CHECK(write(identity[1],&tid,sizeof(tid))==sizeof(tid));
  CHECK(write(ready[1],"R",1)==1);
  if(thread_mode==7)raise(SIGABRT);
- if(thread_mode==6)for(;;)spinning++;
+ if(thread_mode==6)for(;;)__asm__ volatile("" ::: "memory");
  CHECK(read(hold[0],&c,1)==1);return NULL; }
 static int crash(int mode)
 {
- int threaded=mode==3||mode==6||mode==7;
+ int threaded=mode==3||mode==6||mode==7;peer_count=mode==6?3:1;
  if(threaded)CHECK(!pipe(identity));
  pid_t pid=fork();CHECK(pid>=0);
  if(!pid){
@@ -43,13 +43,14 @@ static int crash(int mode)
    CHECK(process_vm_writev(getpid(),&local,1,&remote,1,0)==sizeof(value));
    remote.iov_base=memory;errno=0;CHECK(process_vm_writev(getpid(),&local,1,&remote,1,0)==-1&&errno==EFAULT);
   }
-  if(threaded){thread_mode=mode;pthread_t t;CHECK(!pipe(ready)&&!pipe(hold));CHECK(!pthread_create(&t,NULL,other_thread,NULL));char c;CHECK(read(ready[0],&c,1)==1);}
+  if(threaded){thread_mode=mode;pthread_t t[3];CHECK(!pipe(ready)&&!pipe(hold));
+   for(unsigned i=0;i<peer_count;i++){CHECK(!pthread_create(&t[i],NULL,other_thread,NULL));char c;CHECK(read(ready[0],&c,1)==1);}}
   if(mode==7)for(;;)pause();
   raise(SIGABRT);_exit(99);
  }
  crashed_pid=pid;
  int status;CHECK(waitpid(pid,&status,0)==pid && WIFSIGNALED(status) && WTERMSIG(status)==SIGABRT);
- if(threaded){CHECK(read(identity[0],&crashed_thread,sizeof(crashed_thread))==sizeof(crashed_thread));CHECK(!close(identity[0])&&!close(identity[1]));}
+ if(threaded){for(unsigned i=0;i<peer_count;i++)CHECK(read(identity[0],&crashed_threads[i],sizeof(pid_t))==sizeof(pid_t));CHECK(!close(identity[0])&&!close(identity[1]));}
  return status;
 }
 static void inspect(void)
@@ -90,7 +91,7 @@ int main(void)
  CHECK(WCOREDUMP(crash(0)));inspect();puts("CORE CASE replace PASS");
  CHECK(!unlink("core"));
  /* Each live TID must have a distinct register note, including when the
-  * nonleader is the crashing task or its sibling was running on another CPU. */
+  * nonleader is the crashing task or three siblings were running on other CPUs. */
  for(int mode=3;mode<=7;mode++){if(mode==4||mode==5)continue;
   CHECK(WCOREDUMP(crash(mode)));
   int fd2=open("core",O_RDONLY);CHECK(fd2>=0);Elf64_Ehdr e;CHECK(read(fd2,&e,sizeof(e))==sizeof(e));unsigned notes=0,seen=0;
@@ -98,7 +99,7 @@ int main(void)
    if(p.p_type==PT_NOTE)for(uint64_t at=p.p_offset;at<p.p_offset+p.p_filesz;){Elf64_Nhdr n;CHECK(pread(fd2,&n,sizeof(n),at)==sizeof(n));
     if(n.n_type==NT_PRSTATUS){unsigned char desc[512];CHECK(n.n_descsz<=sizeof(desc));CHECK(pread(fd2,desc,n.n_descsz,at+12+((n.n_namesz+3)&~3U))==n.n_descsz);
      int32_t tid;uint16_t sig;memcpy(&tid,desc+32,4);memcpy(&sig,desc+12,2);CHECK(sig==SIGABRT);
-     unsigned bit=tid==crashed_pid?1:tid==crashed_thread?2:0;CHECK(bit&&!(seen&bit));seen|=bit;notes++;
+     unsigned bit=tid==crashed_pid?1:0;for(unsigned j=0;j<peer_count;j++)if(tid==crashed_threads[j])bit=2U<<j;CHECK(bit&&!(seen&bit));seen|=bit;notes++;
 #if defined(__riscv)
      uint64_t pc,sp;memcpy(&pc,desc+112,8);memcpy(&sp,desc+128,8);CHECK(pc&&sp);
 #elif defined(__loongarch__)
@@ -106,7 +107,7 @@ int main(void)
 #endif
     }
     at+=12+((n.n_namesz+3)&~3U)+((n.n_descsz+3)&~3U);}}
-  CHECK(notes==2&&seen==3);CHECK(!close(fd2));
+  CHECK(notes==peer_count+1&&seen==((1U<<(peer_count+1))-1));CHECK(!close(fd2));
   if(mode==7)CHECK(!rename("core","core-threads"));else CHECK(!unlink("core"));
  }
  CHECK(!symlink("target","core"));CHECK(!WCOREDUMP(crash(3)));CHECK(access("target",F_OK)<0);CHECK(!unlink("core"));
