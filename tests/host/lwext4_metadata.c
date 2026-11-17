@@ -3352,14 +3352,16 @@ static void direct_metadata_reuse(struct ext4_fs *fs,unsigned fault)
     free(actual);free(direct_reuse.bytes);direct_reuse_goal=0;checkpoint_watch_block=0;
     printf("PASS direct reuse: directory metadata LBA=%llu freed, quarantine blocked in-flight checkpoint reuse, same LBA became direct file data without old overwrite\n",(unsigned long long)old);
 }
-static void verify_direct_metadata_reuse(unsigned fault)
+static void verify_direct_metadata_reuse(struct ext4_fs *fs,unsigned fault)
 {
     CHECK(ext4_inode_exist("/direct-old-directory",EXT4_DE_DIR)==ENOENT);
     ext4_file file;CHECK(ext4_fopen(&file,"/direct-reused-file","r")==EOK);
     if (fault && fault!=4) CHECK(ext4_fsize(&file)==0);
     else {
         unsigned char bytes[4096];size_t done=0;
-        CHECK(ext4_fpread(&file,0,bytes,sizeof(bytes),&done)==EOK && done);
+        size_t blocksize=fs->bdev->lg_bsize;
+        CHECK(blocksize<=sizeof(bytes) && ext4_fsize(&file)==blocksize);
+        CHECK(ext4_fpread(&file,0,bytes,sizeof(bytes),&done)==EOK && done==blocksize);
         for(size_t i=0;i<done;i++) CHECK(bytes[i]==0x63);
     }
     CHECK(ext4_fclose(&file)==EOK);
@@ -3427,7 +3429,7 @@ int main(int argc,char **argv)
         unsigned fault=argc>3?strtoul(argv[3],NULL,10):0;
         direct_metadata_reuse(dev.fs,fault);if(fault)return 0;
     }
-    else if(!strcmp(argv[2],"verify-direct-metadata-reuse")) verify_direct_metadata_reuse(argc>3?strtoul(argv[3],NULL,10):0);
+    else if(!strcmp(argv[2],"verify-direct-metadata-reuse")) verify_direct_metadata_reuse(dev.fs,argc>3?strtoul(argv[3],NULL,10):0);
     else if(!strcmp(argv[2],"seed"))seed();
     else if(!strcmp(argv[2],"operation-context"))operation_context_test(dev.fs);
 #ifdef TEST_OPERATION_LIFECYCLE
