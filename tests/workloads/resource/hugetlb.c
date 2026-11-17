@@ -42,6 +42,13 @@ int main(void)
     printf("HUGETLB BEGIN page=%zu huge=%zu\n",page,huge);
     pool(0);CHECK(!counter("HugePages_Total:"));
     errno=0;CHECK(mmap(0,huge,3,MAP_PRIVATE|MAP_ANONYMOUS|MAP_HUGETLB,-1,0)==MAP_FAILED&&errno==ENOMEM);
+    errno=0;CHECK(mmap(0,huge,PROT_READ|PROT_WRITE,
+        MAP_PRIVATE|MAP_ANONYMOUS|MAP_HUGETLB|MAP_GROWSDOWN|MAP_NORESERVE,-1,0)==MAP_FAILED&&errno==EINVAL);
+    unsigned char *stack=mmap(0,4*page,PROT_READ|PROT_WRITE,
+        MAP_PRIVATE|MAP_ANONYMOUS|MAP_GROWSDOWN,-1,0);
+    CHECK(stack!=MAP_FAILED);stack[0]=17;stack[4*page-1]=29;
+    CHECK(stack[0]==17&&stack[4*page-1]==29);CHECK(!munmap(stack,4*page));
+    pass("growsdown-flag-isolation");
     pool(4);CHECK(counter("HugePages_Total:")==4&&counter("HugePages_Free:")==4);pass("real-pool");
     unsigned char *p=map(huge,MAP_PRIVATE,0);CHECK(counter("HugePages_Rsvd:")==1);
     unsigned char *vec=calloc(huge/page,1);CHECK(vec);CHECK(!mincore(p,huge,vec));

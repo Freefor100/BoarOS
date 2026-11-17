@@ -59,10 +59,10 @@ def main():
             result = subprocess.run(boot, stdin=subprocess.DEVNULL, stdout=log,
                                     stderr=subprocess.STDOUT, timeout=a.timeout)
         raw = (a.output / 'guest.log').read_text().replace('\r', '')
-        cases = ('real-pool', 'fault-offset-mincore', 'private-fork-cow',
+        cases = ('growsdown-flag-isolation', 'real-pool', 'fault-offset-mincore', 'private-fork-cow',
                  'protect-unmap-boundaries', 'shared-fork-offset', 'noreserve-sigbus')
         markers = [line for line in raw.splitlines() if line.startswith(('HUGETLB CASE ', 'HUGETLB END ', 'HUGETLB FAIL '))]
-        expected = [f'HUGETLB CASE {name} PASS' for name in cases] + ['HUGETLB END 6']
+        expected = [f'HUGETLB CASE {name} PASS' for name in cases] + ['HUGETLB END 7']
         passed = result.returncode == 0 and markers == expected and profile.root_success(raw, 0)
         metadata.update(status='passed' if passed else 'failed', returncode=result.returncode,
                         markers=markers, root_cleanup=profile.root_success(raw, 0))
