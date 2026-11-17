@@ -132,6 +132,44 @@ LA 的 rt_sigaction(134)/rt_sigreturn(139) 已接入共用信号策略；trap从
 扩展见[信号模块](kernel-signal.md)。真实静态musl pthread取消使用这一返回路径；
 FP/SIMD、动态musl与备用信号栈已接入；各接口的扩展边界见对应模块，未知syscall返回ENOSYS。
 
+### seccomp 系统调用过滤
+
+`seccomp(277)` 与 `PR_SET_SECCOMP`/`PR_GET_SECCOMP` 提供线程级 STRICT 和
+FILTER。STRICT 只允许 `read/write/exit/rt_sigreturn`，其他调用直接以 SIGKILL
+终止当前线程（不是整个线程组，也不执行被拒绝调用）。FILTER 安装需要
+`no_new_privs` 或 CAP_SYS_ADMIN；模式不能关闭或互相转换，过滤链只能追加。
+
+FILTER 首阶段支持常量返回 ALLOW、ERRNO、KILL_THREAD、KILL_PROCESS。
+ERRNO 数据截到 Linux 的 4095 上限；多个过滤器按有符号 action 优先级选择，
+同优先级保留最新过滤器的数据。未知 action 在最终选中时按 Linux 终止整个
+线程组，不能当 ALLOW。已知但尚未实现的 TRAP、TRACE、LOG、USER_NOTIF，以及
+动态 `RET A`，在安装时返回 `EOPNOTSUPP`，并不冒充完整 Linux FILTER 支持。
+所有非零安装 flags（包括 TSYNC、NEW_LISTENER）返回 `EINVAL`；
+GET_ACTION_AVAIL 只对上述四种 action 成功，GET_NOTIF_SIZES 尚不支持。
+
+程序最多 4096 条指令，链路径上限 32768（每个旧过滤器额外计 4 条）。复用
+已有 cBPF 的前向控制流、除数、移位及 scratch 初始化验证；seccomp 另限制
+输入为 64 字节 `seccomp_data` 的本机字节序、四字节对齐读取，不经过 socket
+BPF 的网络字节序/包元数据解释路径，也不解引用用户参数中的指针。
+
+两个架构均在 ptrace syscall-enter 改号之后构造请求，并在公共 dispatcher
+的身份快速路径之前过滤；输入包含调用号、AUDIT_ARCH、恢复 PC 和完整六个
+64 位参数。未启用线程仅多一个 mode 判断；启用线程只遍历不可变链，不在
+每次调用分配、取全局锁或更新引用计数。fork/clone 共享链引用，exec（包括
+非 leader exec）保留当前线程自己的策略，追加过滤器不改变兄弟线程；失败
+clone 与退出均在任务最终销毁时归还引用。KILL_THREAD 使用独立的线程终止
+入口，避免普通致命信号的整组退出语义。
+
+语义核对依据 Linux v6.12 `kernel/seccomp.c` 与官方
+[Seccomp BPF 文档](https://docs.kernel.org/userspace-api/seccomp_filter.html)。
+`tests/workloads/seccomp/basic.c` 是 Linux/BoarOS 同源用例，覆盖安装错误、
+权限、参数/PC、组合优先级、ptrace 改号、fork/exec、线程独立性、线程/整组
+终止与 STRICT；受宿主策略限制的 STRICT/ptrace 会明确报告跳过。
+信号用例覆盖 handler 内过滤与 STRICT 下的 rt_sigreturn；阻塞 syscall 被
+信号中断后的自动重启路径尚未进行动态定向验证，不能将其计为已通过。
+`tests/userland/seccomp.py` 使用已编译 ELF 与内核在两架构启动；
+`make test-seccomp-host` 直接验证生产解释器、校验器、安装 OOM 与共享链释放。
+
 ## 双架构 ABI 差分入口
 
 `make test-diff-abi-riscv` 与 `make test-diff-abi-loongarch` 共用完整案例、严格记录

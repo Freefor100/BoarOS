@@ -41,6 +41,7 @@
 
 #include "../exec_internal.h"
 #include "private.h"
+#include <kernel/seccomp.h>
 #include "ptrace_internal.h"
 #include <kernel/remote_memory.h>
 
@@ -866,6 +867,7 @@ enum kernel_scheduler_status arch_process_clone_current(
         return finish_clone_failure(child,io_result,linux_result,KERNEL_SCHEDULER_STATUS_OK);
     child->personality=parent->personality;
     child->no_new_privs=parent->no_new_privs;
+    kernel_seccomp_clone(child,parent);
     child->arch.user_mode = 1U;
     child->state = KERNEL_THREAD_STATE_EXITED;
     child->completion.kind = KERNEL_THREAD_KIND_USER;
@@ -3168,4 +3170,20 @@ unsigned kernel_task_fs_group_users(struct kernel_task *task,
         member = member->group_next;
     } while (member && member != task);
     return count;
+}
+
+void kernel_seccomp_terminate(unsigned signal,int group)
+{
+#if BOAROS_USER_SMP
+    if (!kernel_scheduler_user_service_active()) kernel_scheduler_enter_user_service();
+#endif
+    struct kernel_task *task=kernel_task_current();
+    struct kernel_thread_completion completion={.kind=KERNEL_THREAD_KIND_USER,
+        .reason=KERNEL_THREAD_EXIT_SIGNAL,.tid=task->tid,.tgid=task->group_leader->tid,
+        .status=signal};
+    int single;
+    {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);single=task->group_leader->group_members==1;}
+    if (signal==31 && (group || single)) completion.detail=process_core_dump(task,signal);
+    if (group) process_group_request_exit(task,completion.reason,signal,completion.detail);
+    kernel_thread_finish(&completion);
 }

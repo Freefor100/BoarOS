@@ -259,6 +259,7 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
         struct kernel_syscall_request request = {
             .number = frame->a7,
             .user_sp = frame->sp,
+            .instruction_pointer = frame->sepc+4,
             .arguments = {
                 frame->a0,
                 frame->a1,

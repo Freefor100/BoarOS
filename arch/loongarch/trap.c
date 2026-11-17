@@ -134,7 +134,7 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
            kernel_cpu_current()->current!=caller)la_virt_fatal("syscall owner");
         if (__atomic_load_n(&caller->ptrace, __ATOMIC_ACQUIRE) &&
             !kernel_ptrace_syscall_enter(caller, frame)) return;
-        struct kernel_syscall_request request={.number=frame->regs[11],.user_sp=frame->regs[3]};
+        struct kernel_syscall_request request={.number=frame->regs[11],.user_sp=frame->regs[3],.instruction_pointer=frame->era+4};
         for (unsigned i=0;i<6;i++) request.arguments[i]=frame->regs[4+i];
         struct kernel_syscall_result result;
         kernel_bpf_trace_enter(caller,request.number,request.arguments);
