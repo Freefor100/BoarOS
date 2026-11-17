@@ -9,6 +9,7 @@
 
 #define RET_KILL_PROCESS UINT32_C(0x80000000)
 #define RET_KILL_THREAD UINT32_C(0)
+#define RET_TRAP UINT32_C(0x00030000)
 #define RET_ERRNO UINT32_C(0x00050000)
 #define RET_ALLOW UINT32_C(0x7fff0000)
 #define ACTION UINT32_C(0xffff0000)
@@ -24,7 +25,7 @@ struct kernel_seccomp_filter {
 static int action_supported(uint32_t action)
 {
     return action==RET_KILL_PROCESS || action==RET_KILL_THREAD ||
-        action==RET_ERRNO || action==RET_ALLOW;
+        action==RET_TRAP || action==RET_ERRNO || action==RET_ALLOW;
 }
 
 int kernel_seccomp_validate(const struct kernel_bpf_classic_insn *insns,
@@ -45,8 +46,8 @@ int kernel_seccomp_validate(const struct kernel_bpf_classic_insn *insns,
             return -KERNEL_EOPNOTSUPP;
         case 0x06:
             switch (i->k&ACTION) {
-            case 0x00030000:case 0x7fc00000:case 0x7ff00000:case 0x7ffc0000:
-                return -KERNEL_EOPNOTSUPP; /* TRAP, USER_NOTIF, TRACE, LOG */
+            case 0x7fc00000:case 0x7ff00000:case 0x7ffc0000:
+                return -KERNEL_EOPNOTSUPP; /* USER_NOTIF, TRACE, LOG */
             default: break; /* Unknown actions deliberately fail closed at run time. */
             }
             break;
@@ -205,6 +206,13 @@ int kernel_seccomp_check(struct kernel_task *task,const struct kernel_syscall_re
     }
     switch (verdict&ACTION) {
     case RET_ALLOW:return 0;
+    case RET_TRAP:
+        kernel_signal_clear_syscall_restart(task);
+        kernel_signal_force_seccomp(task,data.instruction_pointer,data.nr,data.arch,verdict&0xffff);
+        result->action=KERNEL_SYSCALL_ACTION_RETURN_FINAL;
+        /* Linux RV64/LA64 syscall_rollback restores orig_a0; no syscall ran. */
+        result->value=(int64_t)request->arguments[0];
+        return 1;
     case RET_ERRNO:
         kernel_signal_clear_syscall_restart(task);
         result->action=KERNEL_SYSCALL_ACTION_RETURN_FINAL;

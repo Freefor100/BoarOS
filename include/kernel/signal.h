@@ -57,6 +57,7 @@ struct kernel_signal_wait_info {
             };
         };
         uint64_t address;
+        struct { uint64_t call_address; int32_t syscall; uint32_t arch; };
         uint8_t payload[112];
     };
 };
@@ -126,10 +127,13 @@ struct kernel_signal_fault {
     uint32_t signal;
     int32_t code;
     uint64_t address;
+    int32_t error, syscall;
+    uint32_t arch;
 };
 /* Current-thread synchronous exception; no allocation, delivered on user return. */
 void kernel_signal_force_fault(struct kernel_task *task, uint32_t signal,
     int32_t code, uint64_t address);
+void kernel_signal_force_seccomp(struct kernel_task *, uint64_t, int32_t, uint32_t, uint16_t);
 
 struct kernel_signal_delivery {
     struct kernel_signal_wait_info info;

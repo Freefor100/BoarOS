@@ -204,16 +204,16 @@ static void ptrace_rewrite(void)
     CHECK(!ptrace(PTRACE_SETREGSET,p,(void *)1,&regs));CHECK(!ptrace(PTRACE_CONT,p,0,0));joined(p,0);
 }
 extern char seccomp_call_after[];
-static __attribute__((noinline)) long ip_call(void)
+static __attribute__((noinline)) long ip_call(long input)
 {
 #if defined(__riscv)
-    register long a __asm__("a0");register long n __asm__("a7")=SYS_getpid;
-    __asm__ volatile("ecall\n.global seccomp_call_after\nseccomp_call_after:" : "=r"(a) : "r"(n) : "memory");
+    register long a __asm__("a0")=input;register long n __asm__("a7")=SYS_getpid;
+    __asm__ volatile("ecall\n.global seccomp_call_after\nseccomp_call_after:" : "+r"(a) : "r"(n) : "memory");
 #elif defined(__loongarch__)
-    register long a __asm__("$a0");register long n __asm__("$a7")=SYS_getpid;
-    __asm__ volatile("syscall 0\n.global seccomp_call_after\nseccomp_call_after:" : "=r"(a) : "r"(n) : "memory");
+    register long a __asm__("$a0")=input;register long n __asm__("$a7")=SYS_getpid;
+    __asm__ volatile("syscall 0\n.global seccomp_call_after\nseccomp_call_after:" : "+r"(a) : "r"(n) : "memory");
 #else
-    long a;
+    (void)input;long a;
     __asm__ volatile("syscall\n.global seccomp_call_after\nseccomp_call_after:" : "=a"(a) : "a"((long)SYS_getpid) : "memory","rcx","r11");
 #endif
     return a;
@@ -230,7 +230,95 @@ static void instruction_pointer(void)
         BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ERRNO|E2BIG),
         BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_KILL_PROCESS),
         BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ALLOW)};
-    CHECK(!install(f,sizeof(f)/sizeof(f[0])));CHECK(ip_call()==-E2BIG);
+    CHECK(!install(f,sizeof(f)/sizeof(f[0])));CHECK(ip_call(0)==-E2BIG);
+}
+
+static volatile sig_atomic_t trapped;
+static long trap_input;
+static void trap_handler(int sig,siginfo_t *info,void *context)
+{
+    ucontext_t *uc=context;
+    CHECK(sig==SIGSYS&&info->si_signo==SIGSYS&&info->si_code==1);
+    CHECK(info->si_errno==0xabcd&&info->si_syscall==SYS_getpid);
+    CHECK(info->si_call_addr==(void *)seccomp_call_after);
+#if defined(__riscv)
+    CHECK(info->si_arch==AUDIT_ARCH_RISCV64);
+    CHECK(uc->uc_mcontext.__gregs[0]==(uintptr_t)seccomp_call_after);
+    CHECK((long)uc->uc_mcontext.__gregs[10]==trap_input);
+    uc->uc_mcontext.__gregs[10]=7654;
+#elif defined(__loongarch__)
+    CHECK(info->si_arch==AUDIT_ARCH_LOONGARCH64);
+    CHECK(uc->uc_mcontext.__pc==(uintptr_t)seccomp_call_after);
+    CHECK((long)uc->uc_mcontext.__gregs[4]==trap_input);
+    uc->uc_mcontext.__gregs[4]=7654;
+#else
+    CHECK(info->si_arch==AUDIT_ARCH_X86_64);
+    CHECK(uc->uc_mcontext.gregs[REG_RIP]==(greg_t)(uintptr_t)seccomp_call_after);
+    CHECK(uc->uc_mcontext.gregs[REG_RAX]==SYS_getpid);
+    uc->uc_mcontext.gregs[REG_RAX]=7654;
+#endif
+    trapped++;
+}
+static void trap_setup(void)
+{
+    nnp();struct sigaction sa={.sa_sigaction=trap_handler,.sa_flags=SA_SIGINFO|SA_RESTART};
+    CHECK(!sigaction(SIGSYS,&sa,0));
+    deny(SYS_getpid,SECCOMP_RET_TRAP|0xabcd);
+}
+static void trap_return(void)
+{
+    trap_setup();
+    /* TRAP wins over ERRNO. Neither orig_a0 nor filter errno is a kernel restart. */
+    deny(SYS_getpid,SECCOMP_RET_ERRNO|EPERM);
+    trap_input=1234;CHECK(ip_call(trap_input)==7654&&trapped==1);
+    trap_input=-512;CHECK(ip_call(trap_input)==7654&&trapped==2);
+    deny(SYS_getppid,SECCOMP_RET_ERRNO|512);
+    errno=0;CHECK(syscall(SYS_getppid)==-1&&errno==512);
+}
+static void trap_blocked(void)
+{
+    trap_setup();sigset_t mask;sigemptyset(&mask);sigaddset(&mask,SIGSYS);
+    CHECK(!sigprocmask(SIG_BLOCK,&mask,0));ip_call(0);CHECK(0);
+}
+static void trap_ignored(void)
+{trap_setup();CHECK(signal(SIGSYS,SIG_IGN)!=SIG_ERR);ip_call(0);CHECK(0);}
+
+static void *trap_worker(void *unused)
+{(void)unused;trap_return();return 0;}
+static void trap_thread(void)
+{
+    pthread_t t;CHECK(!pthread_create(&t,0,trap_worker,0));
+    CHECK(!pthread_join(t,0));CHECK(syscall(SYS_getpid)>0&&trapped==2);
+}
+static void trap_ptrace(void)
+{
+    pid_t p=fork();CHECK(p>=0);
+    if(!p) {
+        pid_t me=getpid();
+        if(ptrace(PTRACE_TRACEME,0,0,0)) {
+            if(initial_mode&&errno==EPERM)_exit(77);
+            CHECK(0);
+        }
+        CHECK(!syscall(SYS_kill,me,SIGSTOP));trap_setup();
+        long ret=ip_call(1234);
+#if defined(__riscv) || defined(__loongarch__)
+        CHECK(ret==1234);
+#else
+        CHECK(ret==SYS_getpid);
+#endif
+        CHECK(!trapped);_exit(0);
+    }
+    int status;CHECK(waitpid(p,&status,0)==p);
+    if(WIFEXITED(status)&&WEXITSTATUS(status)==77) {
+        puts("SECCOMP TRAP ptrace SKIP host policy");return;
+    }
+    CHECK(WIFSTOPPED(status)&&WSTOPSIG(status)==SIGSTOP);
+    CHECK(!ptrace(PTRACE_CONT,p,0,0));
+    CHECK(waitpid(p,&status,0)==p&&WIFSTOPPED(status)&&WSTOPSIG(status)==SIGSYS);
+    siginfo_t info;CHECK(!ptrace(PTRACE_GETSIGINFO,p,0,&info));
+    CHECK(info.si_signo==SIGSYS&&info.si_code==1&&info.si_errno==0xabcd);
+    CHECK(info.si_syscall==SYS_getpid&&info.si_call_addr==(void *)seccomp_call_after);
+    CHECK(!ptrace(PTRACE_CONT,p,0,0));joined(p,0);
 }
 
 extern char seccomp_notify_after[];
@@ -276,21 +364,40 @@ static void wait_sleeping(pid_t p)
     }
     CHECK(0);
 }
+
+static volatile sig_atomic_t restart_trapped;
+static void restart_trap_handler(int sig,siginfo_t *info,void *context)
+{
+    ucontext_t *uc=context;
+    CHECK(sig==SIGSYS&&info->si_code==1&&info->si_errno==0x55a);
+    CHECK(info->si_syscall==SYS_restart_syscall);
+#if defined(__riscv)
+    uc->uc_mcontext.__gregs[10]=(unsigned long)-512;
+#elif defined(__loongarch__)
+    uc->uc_mcontext.__gregs[4]=(unsigned long)-512;
+#else
+    uc->uc_mcontext.gregs[REG_RAX]=-512;
+#endif
+    restart_trapped=1;
+}
 static void restart_rejected(void)
 {
     mkdir("/proc",0755);
     /* Do not mount over Linux's existing procfs, including unprivileged runs. */
     if(access("/proc/self/stat",R_OK))CHECK(!mount("proc","/proc","proc",0,0));
-    for(unsigned timed_futex=0;timed_futex<2;timed_futex++) {
+    for(unsigned mode=0;mode<4;mode++) {
         pid_t p=fork();CHECK(p>=0);
         if(!p) {
             pid_t me=getpid();struct sigaction sa={.sa_sigaction=restart_handler,.sa_flags=SA_SIGINFO};
             CHECK(!sigaction(SIGUSR1,&sa,0));nnp();
-            deny(SYS_restart_syscall,SECCOMP_RET_ERRNO|512);
+            if(mode>=2) {
+                sa.sa_sigaction=restart_trap_handler;CHECK(!sigaction(SIGSYS,&sa,0));
+            }
+            deny(SYS_restart_syscall,mode>=2?(SECCOMP_RET_TRAP|0x55a):(SECCOMP_RET_ERRNO|512));
             struct timespec duration={60,0};int word=0;errno=0;
-            long ret=timed_futex?syscall(SYS_futex,&word,FUTEX_WAIT,0,&duration,0,0):
+            long ret=(mode&1)?syscall(SYS_futex,&word,FUTEX_WAIT,0,&duration,0,0):
                 syscall(SYS_nanosleep,&duration,0);
-            CHECK(ret==-1&&errno==512);
+            CHECK(ret==-1&&errno==512&&restart_trapped==(mode>=2));
             /* A rejected restart must not corrupt a later signal's PC or a0. */
             CHECK(!notify_call(me)&&restart_notified);_exit(0);
         }
@@ -305,6 +412,7 @@ int main(int argc,char **argv)
     if(argc>1&&!strcmp(argv[1],"exec")){CHECK(prctl(PR_GET_SECCOMP)==2);CHECK(syscall(SYS_getpid)==-1&&errno==EACCES);return 0;}
     setvbuf(stdout,0,_IONBF,0);alarm(40);self=argv[0];initial_mode=prctl(PR_GET_SECCOMP);
     child_case(restart_rejected,0);puts("SECCOMP rejected restart state/PC PASS");
+    child_case(trap_return,0);child_case(trap_thread,0);child_case(trap_ptrace,0);child_case(trap_blocked,SIGSYS);child_case(trap_ignored,SIGSYS);puts("SECCOMP TRAP metadata/return/forced PASS");
     child_case(errors,0);puts("SECCOMP errors PASS");
     child_case(permission,0);child_case(precedence,0);puts("SECCOMP inheritance/precedence PASS");
     child_case(instruction_pointer,0);child_case(ptrace_rewrite,0);puts("SECCOMP PC/ptrace checks complete");child_case(arguments,0);puts("SECCOMP arguments PASS");child_case(kill_thread,SIGSYS);puts("SECCOMP kill-thread PASS");child_case(kill_process,SIGSYS);puts("SECCOMP kill-process PASS");child_case(unknown,SIGSYS);puts("SECCOMP unknown PASS");

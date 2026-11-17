@@ -21,6 +21,8 @@ enum kernel_uaccess_status kernel_copy_from_user(struct kernel_mm *mm,void *to,u
 void kernel_seccomp_terminate(unsigned signal,int group){signal_seen=signal;group_seen=group;longjmp(killed,1);}
 void kernel_signal_clear_syscall_restart(struct kernel_task *task)
 {task->syscall_restart=(struct kernel_syscall_restart_state){0};}
+void kernel_signal_force_seccomp(struct kernel_task *task,uint64_t pc,int32_t nr,uint32_t arch,uint16_t error)
+{assert(task&&pc==0x12345678&&nr==172&&arch==0xc00000f3&&error==123);}
 static void *alloc(void *h,size_t n){void *p=0;return kernel_heap_allocate(h,n,&p)?0:p;}
 static void drop(void *h,void *p){kernel_heap_release(h,p);}
 #define I(c,jt,jf,k) {c,jt,jf,k}
@@ -64,7 +66,13 @@ int main(void)
     if(!setjmp(killed)){kernel_seccomp_check(child,&request,&result);assert(0);}assert(signal_seen==31&&group_seen==1);
     kernel_seccomp_release(parent);assert(live==2);kernel_seccomp_release(child);assert(!live);
     parent->seccomp_mode=0;
-    ret[0].k=0x30000;assert(attach(parent,ret,1)==-KERNEL_EOPNOTSUPP);
+    ret[0].k=0x30000|123;assert(!attach(parent,ret,1));
+    parent->syscall_restart.kind=KERNEL_SYSCALL_RESTART_NANOSLEEP;
+    request.instruction_pointer=0x12345678;request.arguments[0]=321;
+    assert(kernel_seccomp_check(parent,&request,&result)==1&&result.value==321);
+    assert(parent->syscall_restart.kind==KERNEL_SYSCALL_RESTART_NONE);
+    kernel_seccomp_release(parent);
+    ret[0].k=0x7ff00000;assert(attach(parent,ret,1)==-KERNEL_EOPNOTSUPP);
     ret[0].code=0x16;assert(attach(parent,ret,1)==-KERNEL_EOPNOTSUPP);assert(!live);
     struct kernel_bpf_classic_insn *large=calloc(4096,sizeof(*large));
     large[4095]=(struct kernel_bpf_classic_insn)I(0x06,0,0,0x7fff0000);

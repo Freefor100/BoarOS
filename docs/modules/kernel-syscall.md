@@ -139,15 +139,21 @@ FILTER。STRICT 只允许 `read/write/exit/rt_sigreturn`，其他调用直接以
 终止当前线程（不是整个线程组，也不执行被拒绝调用）。FILTER 安装需要
 `no_new_privs` 或 CAP_SYS_ADMIN；模式不能关闭或互相转换，过滤链只能追加。
 
-FILTER 首阶段支持常量返回 ALLOW、ERRNO、KILL_THREAD、KILL_PROCESS。
+FILTER 支持常量返回 ALLOW、ERRNO、TRAP、KILL_THREAD、KILL_PROCESS。
 ERRNO 数据截到 Linux 的 4095 上限，并直接返回用户态；即使值为 512 等
 内核 restart 编码，也不能触发自动重启；拒绝调用同时终结待处理的
 restart block，避免稍后的信号交付改写已完成调用的返回值和 PC。多个过滤器按有符号 action 优先级选择，
 同优先级保留最新过滤器的数据。未知 action 在最终选中时按 Linux 终止整个
-线程组，不能当 ALLOW。已知但尚未实现的 TRAP、TRACE、LOG、USER_NOTIF，以及
+线程组，不能当 ALLOW。已知但尚未实现的 TRACE、LOG、USER_NOTIF，以及
 动态 `RET A`，在安装时返回 `EOPNOTSUPP`，并不冒充完整 Linux FILTER 支持。
 所有非零安装 flags（包括 TSYNC、NEW_LISTENER）返回 `EINVAL`；
-GET_ACTION_AVAIL 只对上述四种 action 成功，GET_NOTIF_SIZES 尚不支持。
+GET_ACTION_AVAIL 只对上述五种 action 成功，GET_NOTIF_SIZES 尚不支持。
+
+TRAP 不执行系统调用，向触发线程强制投递 SIGSYS/SYS_SECCOMP，携带完整的
+调用号、AUDIT_ARCH、恢复 PC 及低 16 位策略数据（si_errno）。RV64/LA64 的
+a0 恢复到原始参数，处理器可在 ucontext 中写入模拟返回值；阻塞或忽略 SIGSYS
+不能绕过默认致命动作。复用同步信号槽，不为每次 TRAP 分配队列；ptrace 的
+信号交付停止可检查、编辑或抑制该信号，不能使已跳过的系统调用执行。
 
 程序最多 4096 条指令，链路径上限 32768（每个旧过滤器额外计 4 条）。复用
 已有 cBPF 的前向控制流、除数、移位及 scratch 初始化验证；seccomp 另限制
@@ -167,9 +173,10 @@ clone 与退出均在任务最终销毁时归还引用。KILL_THREAD 使用独�
 `tests/workloads/seccomp/basic.c` 是 Linux/BoarOS 同源用例，覆盖安装错误、
 权限、参数/PC、组合优先级、ptrace 改号、fork/exec、线程独立性、线程/整组
 终止与 STRICT；受宿主策略限制的 STRICT/ptrace 会明确报告跳过。
-信号用例覆盖 handler 内过滤、STRICT 下的 rt_sigreturn，以及相对 nanosleep
-和限时 FUTEX_WAIT 经 STOP/CONT 后 restart_syscall 被拒绝、后续信号的
-恢复 PC/a0。其他阻塞 syscall 的自动重启路径尚未进行动态定向验证。
+信号用例覆盖 TRAP 元数据、返回寄存器、线程隔离、阻塞/忽略和 ptrace 抑制，
+以及 handler 内过滤、STRICT 下的 rt_sigreturn、相对 nanosleep 与限时
+FUTEX_WAIT 经 STOP/CONT 后 restart_syscall 被拒绝和后续信号的恢复 PC/a0。
+其他阻塞 syscall 的自动重启路径尚未进行动态定向验证。
 `tests/userland/seccomp.py` 使用已编译 ELF 与内核在两架构启动；
 `make test-seccomp-host` 直接验证生产解释器、校验器、安装 OOM 与共享链释放。
 
