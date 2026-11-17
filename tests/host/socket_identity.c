@@ -50,6 +50,9 @@ static void nested_views(struct kernel_task *root)
     cpus[0].current=&children[0];struct kernel_pid *first=NULL,*second=NULL;
     assert(!kernel_task_identity_get_user(1,&first) && first==process_identity(&children[0],KERNEL_PID_TID));
     assert(kernel_task_identity_user_number(first)==1);
+    assert(kernel_task_lock_owner_user_number(children[0].tid)==1);
+    assert(kernel_task_lock_owner_user_number(children[1].tid)==0);
+    assert(kernel_task_lock_owner_user_number(-1)==-1);
     assert(kernel_task_identity_get_user(children[1].tid,&second)==-KERNEL_ESRCH && !second);
     cpus[0].current=&children[1];
     assert(!kernel_task_identity_get_user(1,&second) && second!=first);
@@ -60,6 +63,16 @@ static void nested_views(struct kernel_task *root)
     kernel_pid_t old=children[0].tid;
     process_identity_release(&children[0]);process_identity_collect();
     assert(kernel_task_identity_user_number(first)==old && !first->members[KERNEL_PID_TID]);
+    assert(kernel_task_lock_owner_user_number(old)==old);
+    cpus[0].current=&children[1];
+    assert(kernel_task_lock_owner_user_number(old)==0);
+    struct kernel_task replacement={0}; replacement.group_leader=&replacement;
+    kernel_pid_t numbers[]={9,old};
+    assert(!process_identity_create_numbers(&replacement,&children[1],0,numbers,2));
+    {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);process_identity_commit_locked(&replacement);}
+    assert(kernel_task_lock_owner_user_number(old)==9 && !kernel_task_identity_user_number(first));
+    process_identity_release(&replacement);process_identity_collect();
+    cpus[0].current=root;
     kernel_task_identity_put(first);kernel_task_identity_put(second);
     process_identity_release(&children[1]);process_identity_collect();
     {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);

@@ -56,6 +56,7 @@ EXCLUDED(scheduler_task_put)
 EXCLUDED(scheduler_task_lookup_locked)
 /* Message-credential ownership is exercised by the UNIX control fixture. */
 EXCLUDED(kernel_task_identity_get)
+EXCLUDED(kernel_task_lock_owner_user_number)
 EXCLUDED(kernel_task_identity_retain)
 EXCLUDED(kernel_task_identity_put)
 EXCLUDED(kernel_signal_sigio)

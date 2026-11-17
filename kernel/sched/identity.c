@@ -402,6 +402,17 @@ kernel_pid_t kernel_task_identity_user_number(const struct kernel_pid *id)
     return kernel_pid_number_in(id,process_pid_active(kernel_task_current()));
 }
 
+kernel_pid_t kernel_task_lock_owner_user_number(kernel_pid_t number)
+{
+    if (number <= 0) return number; /* OFD locks have no process owner. */
+    struct kernel_pid_registry *view = process_pid_active(kernel_task_current());
+    if (view == &scheduler.identities) return number;
+    /* A shared file table may outlive the original locker. Linux translates
+     * the current binding of its saved integer, including after reuse. */
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    return kernel_pid_number_in(kernel_pid_find(&scheduler.identities, number), view);
+}
+
 void kernel_task_identity_replace_tgid(struct kernel_pid **owner,const struct kernel_task *task)
 {
     struct kernel_pid *id=process_identity(task,KERNEL_PID_TGID);

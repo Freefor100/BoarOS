@@ -60,6 +60,8 @@ void kernel_task_identity_replace_tgid(struct kernel_pid **,const struct kernel_
 int kernel_task_identity_get_user(int32_t number,struct kernel_pid **owner);
 /* Caller retains identity; immutable historical mapping, invisible becomes 0. */
 kernel_pid_t kernel_task_identity_user_number(const struct kernel_pid *);
+/* POSIX record locks store a root number, not a retained identity. */
+kernel_pid_t kernel_task_lock_owner_user_number(kernel_pid_t);
 void kernel_task_identity_retain(struct kernel_pid *);
 void kernel_task_identity_put(struct kernel_pid *);
 
