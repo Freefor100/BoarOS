@@ -1,6 +1,7 @@
 /* 数字物理地址0的owner与空候选必须可区分；映射回独立宿主pool。 */
 #include <kernel/mm_backend.h>
 #include <kernel/heap.h>
+#include <kernel/vma.h>
 #include <kernel/hugetlb.h>
 #include <kernel/uaccess.h>
 #include <assert.h>
@@ -55,8 +56,18 @@ int main(void)
  struct arch_mmu_user_space space={0};struct kernel_mm parent={0},child={0};
  assert(!arch_mmu_user_space_init(&space,&pages,&kernel));assert(!kernel_mm_create(&parent,&space));assert(!kernel_mm_vma_enable(&parent,&heap));
  assert(!kernel_mm_brk_initialize(&parent,0x10000,0x20000));
+ assert(!kernel_mm_mmap_base_initialize(&parent,64*HUGE));
  struct kernel_hstate *h;assert(!kernel_hstate_get_or_create(&heap,&pages,9,&h));assert(!kernel_hstate_resize(h,3));
- uint64_t a;assert(!kernel_mm_mmap_hugetlb(&parent,HUGE,HUGE,3,KERNEL_MM_MAP_FIXED,0,0,&a)&&a==HUGE);
+ uint64_t a,stack;
+ assert(!kernel_mm_mmap_anonymous(&parent,16*HUGE+4096,4096,3,KERNEL_MM_MAP_FIXED|KERNEL_MM_MAP_GROWSDOWN,&stack));
+ assert(!kernel_mm_mmap_hugetlb(&parent,15*HUGE,HUGE,3,0,0,0,&a));assert(a!=15*HUGE);
+ assert(!kernel_mm_munmap(&parent,a,HUGE));assert(!kernel_mm_munmap(&parent,stack,4096));
+ assert(!kernel_mm_mmap_hugetlb(&parent,0,HUGE,3,0,0,0,&a));uint64_t ceiling=a+HUGE;
+ assert(!kernel_mm_munmap(&parent,a,HUGE));
+ assert(!kernel_mm_mmap_anonymous(&parent,ceiling+4096,4096,3,KERNEL_MM_MAP_FIXED|KERNEL_MM_MAP_GROWSDOWN,&stack));
+ assert(!kernel_mm_mmap_hugetlb(&parent,0,HUGE,3,0,0,0,&a));assert(a+HUGE<=stack-KERNEL_VMA_STACK_GUARD_PAGES*BOAROS_PAGE_SIZE);
+ assert(!kernel_mm_munmap(&parent,a,HUGE));assert(!kernel_mm_munmap(&parent,stack,4096));
+ assert(!kernel_mm_mmap_hugetlb(&parent,HUGE,HUGE,3,KERNEL_MM_MAP_FIXED,0,0,&a)&&a==HUGE);
  struct kernel_hstate_snapshot snap;kernel_hstate_snapshot(h,&snap);assert(snap.reserved==1&&snap.free==3);
  put(&parent,HUGE+12345,42);assert(get(&parent,HUGE+12345)==42);
  unsigned char resident[16];unsigned scanned=0;

@@ -79,3 +79,11 @@ DONTNEED、NORESERVE 与最终回收。专项 guest runner 为 `tests/userland/h
   parent COW 重试时不死锁，解除 pin 后成功；3 次 fork/子 COW 与整大页区间部分 unmap
   检查实际池守恒。超容量映射失败不消耗预留，shutdown 空池重复调用不泄漏。
 - 这些注入不是完整的多 CPU guest 时序证明；fork 与 revoke 的强制并发 guest 尚未覆盖。
+
+### 与 GROWSDOWN 的组合
+
+整合基线 a79797f0 后，匿名基本页的 GROWSDOWN 继续由原路径处理；HUGETLB 与
+GROWSDOWN 同时请求仍为 EINVAL。huge mmap 的资源核算明确不是 growdown 数据类，
+非固定提示地址和 top-down 搜索均尊重已有 growdown/stack guard 区。
+`tests/host/mm_hugetlb.c` 覆盖提示落入 guard 和位于 mmap ceiling 之上的 stack guard
+向下覆盖候选地址的两种组合，防止只修 syscall 标志而破坏隔离间隔。

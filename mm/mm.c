@@ -4965,22 +4965,30 @@ enum kernel_mm_status kernel_mm_mmap_hugetlb(struct kernel_mm *mm,
         hint&=~mask;
         int overlaps=1;
         if (hint>=ARCH_MMU_HUGE_SIZE && hint<record->mmap_base && length<=record->mmap_base-hint &&
-            !kernel_vma_set_overlaps(record->vmas,hint,hint+length,&overlaps) && !overlaps) start=hint;
+            !kernel_vma_set_overlaps(record->vmas,hint,hint+length,&overlaps) && !overlaps) {
+            struct kernel_vma next;
+            enum kernel_vma_status found=kernel_vma_set_next(record->vmas,hint+length,&next);
+            uint64_t gap=KERNEL_VMA_STACK_GUARD_PAGES*BOAROS_PAGE_SIZE;
+            uint64_t boundary=found?record->mmap_base:kernel_vma_grows_down(&next)?
+                (next.start>gap?next.start-gap:0):next.start;
+            if (hint+length<=boundary) start=hint;
+        }
         if (!start) {
             uint64_t upper=record->mmap_base & ~mask;
             for (uint32_t i=kernel_vma_set_count(record->vmas);i>0;) {
                 struct kernel_vma v;
                 if (kernel_vma_set_get_at(record->vmas,--i,&v)) __builtin_trap();
-                if (v.start>=upper) continue;
                 if (upper>=length && upper-length>=v.end && upper-length>=ARCH_MMU_HUGE_SIZE) { start=upper-length;break; }
-                if (v.start<upper) upper=v.start & ~mask;
+                uint64_t gap=KERNEL_VMA_STACK_GUARD_PAGES*BOAROS_PAGE_SIZE;
+                uint64_t boundary=kernel_vma_grows_down(&v)?(v.start>gap?v.start-gap:0):v.start;
+                if (boundary<upper) upper=boundary & ~mask;
             }
             if (!start && upper>=length && upper-length>=ARCH_MMU_HUGE_SIZE) start=upper-length;
         }
         if (!start) return KERNEL_MM_STATUS_NO_MEMORY;
     }
     uint64_t end=start+length;
-    if (!may_map_memory(record,start,end,normalized,shared,flags&KERNEL_MM_MAP_FIXED))
+    if (!may_map_memory(record,start,end,normalized,shared,flags&KERNEL_MM_MAP_FIXED,0))
         return KERNEL_MM_STATUS_NO_MEMORY;
     enum kernel_mm_status locked=admit_mapping_lock(record,start,end,flags);
     if (locked) return locked;
