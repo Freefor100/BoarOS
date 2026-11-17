@@ -12,11 +12,20 @@
 #define CHECK(x) do {if(!(x)){fprintf(stderr,"DIRECT FILE FAIL %d: %s errno=%d\n",__LINE__,#x,errno);exit(1);}}while(0)
 #define FAIL(e,x) do {errno=0;CHECK((x)==-1&&errno==(e));}while(0)
 static unsigned char data[32768] __attribute__((aligned(16384)));
+static int open_direct_file(const char *dir,const char *name)
+{
+#ifdef BOAROS_NOJOURNAL_DIRECT
+    char path[512];CHECK(snprintf(path,sizeof(path),"%s/%s",dir,name)<(int)sizeof(path));
+    return open(path,O_RDWR|O_DIRECT);
+#else
+    (void)name;return open(dir,O_TMPFILE|O_RDWR|O_DIRECT,0600);
+#endif
+}
 int main(int argc,char **argv)
 {
     setbuf(stdout,NULL);const char *dir=argc>1?argv[1]:"/";
     size_t page=sysconf(_SC_PAGESIZE);CHECK(page<=16384);
-    int fd=open(dir,O_TMPFILE|O_RDWR|O_DIRECT,0600);CHECK(fd>=0);
+    int fd=open_direct_file(dir,"direct-input");CHECK(fd>=0);
     memset(data,0x41,sizeof(data));
     int probe=argc>2&&!strcmp(argv[2],"--probe-alignment");
     if (probe) {
@@ -49,7 +58,7 @@ int main(int argc,char **argv)
     CHECK(!fcntl(copy,F_SETFL,flags&~O_DIRECT));CHECK(!(fcntl(fd,F_GETFL)&O_DIRECT));
     CHECK(pwrite(fd,"z",1,0)==1);CHECK(!fcntl(copy,F_SETFL,flags));
     CHECK(pread(fd,data,512,0)==512&&data[0]=='z');
-    int target=open(dir,O_TMPFILE|O_RDWR|O_DIRECT,0600);CHECK(target>=0);
+    int target=open_direct_file(dir,"direct-output");CHECK(target>=0);
     off_t position=0;CHECK(sendfile(target,fd,&position,page)==(ssize_t)page&&position==(off_t)page);
     CHECK(pread(target,data,page,0)==(ssize_t)page&&data[0]=='z');
     int pipefd[2];CHECK(!pipe(pipefd));position=0;

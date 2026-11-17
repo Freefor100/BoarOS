@@ -1334,7 +1334,9 @@ static void ext4_direct_case(struct kernel_heap *heap,struct kernel_vfs_mount *m
 {
     struct kernel_open_file_description *file=NULL;
     int error;
-    assert(!kernel_open_file_create_mode(heap,mount,"/direct-file",0600,&file,&error) && !error);
+    if (getenv("FILE_IO_NOJOURNAL")) {
+        assert(!kernel_open_file_create(heap,mount,"/direct-file",&file,&error) && !error);
+    } else assert(!kernel_open_file_create_mode(heap,mount,"/direct-file",0600,&file,&error) && !error);
     file->open_flags=2|KERNEL_FILES_O_DIRECT;
     assert(kernel_vfs_direct_alignment(&file->file)==512);
     assert(!kernel_vfs_file_acquire_write(&file->file));
@@ -1352,7 +1354,8 @@ static void ext4_direct_case(struct kernel_heap *heap,struct kernel_vfs_mount *m
     assert(!kernel_vfs_direct_pread(&file->file,BOAROS_PAGE_SIZE,data,sizeof(data),&done) && done==sizeof(data));
     for (unsigned i=0;i<sizeof(data);i++) assert(!data[i]);
     ext4_direct_truncate_race(&file->file);
-    assert(!kernel_open_file_release(&file) && !kernel_vfs_unlink(mount,"/direct-file"));
+    assert(!kernel_open_file_release(&file));
+    if (!getenv("FILE_IO_NOJOURNAL")) assert(!kernel_vfs_unlink(mount,"/direct-file"));
     puts("PASS ext4 direct: growth, dirty cached owner handoff, sparse media read, no VFS cache residency and queued truncate after closed epoch");
 }
 

@@ -7,7 +7,20 @@
 启用 journal 的 ext4 接纳 `O_DIRECT` 与 `F_SETFL`，包括 `O_TMPFILE`。
 读写按设备扇区校验 offset、用户地址及每段 iovec 长度；合法对齐的扩展、洞和
 跨 EOF 写入走现有 extent 分配事务，不以拒绝扩展或全文件 fsync 替代。
-未启用 journal 的 ext4 暂不开放这项能力；tmpfs 和 FAT 的资格由各自后端决定。
+未启用 journal 的 ext4 也允许已有普通文件的 `O_DIRECT`/`F_SETFL`；
+其 namespace create 与 `O_TMPFILE` 仍沿用已有的 `EOPNOTSUPP` 限制，不能据此
+宣称 no-journal namespace 功能完整。tmpfs 和 FAT 的资格由各自后端决定。
+
+无 journal 数据使用显式同步入口 `ext4_fpwrite_direct`，不伪造 retain 回调，
+不将数据留在 lwext4 bcache 后就报告完成。完整块直接借用已稳定的调用者内存，
+部分块只构造一个块的 RMW 镜像；多块沿用最多 128 KiB 的批量提交。
+旧 dirty bcache 数据在提交前排空；设备错误后撤销受影响 bcache 版本，旧持有者
+归还时不能把 preimage 写回覆盖已完成扇区。先前已完成批次保留精确 written/EOF，
+失败批次的新分配由既有逆序 extent 清理释放，失败覆盖可留下设备已完成前缀，
+不假装事务回滚。无 journal 路径由挂载串行资格稳定 extent，VFS 映射 epoch、
+脏页回写和 truncate mutation 资格与 journal 路径相同；不需要 ordered 全局锁。
+这不提供 journal 的崩溃原子性：元数据介质错误或突然断电仍可能需要 fsck 修复，
+没有新增每次 DIRECT 的 fsync 或 FLUSH，也没有吞吐提升的测量结论。
 
 VFS 先暂存用户输入并释放 pin，再持 inode mutation 资格关闭共享映射 epoch，
 撤销相交别名并回写相交整页。ext4 后端接纳写事务后，按稳定 inode 的物理 extent
@@ -41,9 +54,20 @@ ordered 数据保留独立完成标志与引用。范围提交依次处理 commi
 `tests/userland/direct-file.py` 覆盖 RV/LA 的共享 mmap 同文件输入输出、EFAULT 后继续、
 truncate/短读、F_SETFL、O_TMPFILE、sendfile/splice 及退出清理/fsck。
 
+无 journal 验证：`sh tests/host/lwext4-metadata.sh nojournal-direct` 覆盖
+1 KiB/4 KiB 块的真实数据写入、EOF 零填充、洞、先写首扇区再 EIO、旧 dirty
+版本退役、失败分配清理、重试及第二批失败后的精确 128 KiB 前缀，并运行 fsck。
+`FILE_IO_NOJOURNAL=1 FILE_IO_HOST_MKFS_ARGS='-O ^has_journal' FILE_IO_HOST_TCP=0 FILE_IO_DIRECT_ONLY=1 sh tests/host/file-io-concurrency.sh`
+用预置文件覆盖 4 KiB/16 KiB 页缓存与 truncate 竞争。
+客户机程序加 `-DBOAROS_NOJOURNAL_DIRECT`，runner 加 `--nojournal`，在 RV/LA
+双核验证已有文件上的同文件 mmap 输入输出、短 EOF、EFAULT、扩展/洞和 transfer；
+该 fixture 移除 journal 时同时移除依赖它的 orphan_file 特性，验证后运行 fsck，
+并通过独立 debugfs dump 比对两个保留文件的完整字节和精确大小。
+
 Linux 语义参考 v6.12 `fs/ext4/file.c` 的 DIO 接纳、扩展锁定与回退路径。
-当前宿主只有 overlayfs，其直接 I/O 对齐和短读实测与本契约不一致；这不是 Linux ext4
-动态对照通过。可用 `direct-file <目录> --probe-alignment` 打印宿主对齐结果，不能
+此前 overlayfs 的直接 I/O 对齐和短读实测与本契约不一致；无 journal 本轮宿主
+`CapEff=0`、`/tmp` 为 tmpfs，不能建立真实 Linux ext4 挂载进行动态差分；这些均不算
+Linux ext4 动态对照通过。可用 `direct-file <目录> --probe-alignment` 打印宿主对齐结果，不能
 用它代替真实 Linux ext4 设备的差分或断电验证。
 
 ## 通用边界

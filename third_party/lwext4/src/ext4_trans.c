@@ -124,8 +124,21 @@ int ext4_trans_block_get(struct ext4_blockdev *bdev,
 int ext4_trans_write_data_batch(struct ext4_blockdev *bdev,
     struct kernel_block_span *spans, unsigned count)
 {
+    int checked=ext4_blocks_check_batch(bdev,spans,count);
+    if (checked || !count) return checked;
+    /* Drain older nonjournal data before exposing a possibly partial device
+     * write. On error retire cached preimages: they must neither hide a
+     * completed prefix nor be written back over it later. */
+    for (unsigned i=0;i<count;i++) for (uint32_t j=0;j<spans[i].size/bdev->lg_bsize;j++) {
+        int r=ext4_block_flush_lba(bdev,spans[i].offset/bdev->lg_bsize+j);
+        if (r) return r;
+    }
     int r = ext4_blocks_set_batch(bdev, spans, count);
-    if (r) return r;
+    if (r) {
+        for (unsigned i=0;i<count;i++) ext4_bcache_invalidate_lba(bdev->bc,
+            spans[i].offset/bdev->lg_bsize,spans[i].size/bdev->lg_bsize);
+        return r;
+    }
     for (unsigned i = 0; i < count; i++) for (uint32_t j = 0; j < spans[i].size / bdev->lg_bsize; j++) {
         struct ext4_block cached = EXT4_BLOCK_ZERO();
         struct ext4_buf *old = ext4_bcache_find_get(bdev->bc, &cached, spans[i].offset / bdev->lg_bsize + j, NULL);
@@ -141,9 +154,9 @@ int ext4_trans_write_data_batch(struct ext4_blockdev *bdev,
     }
     return r;
 }
-int ext4_trans_write_data(struct ext4_blockdev *bdev, uint64_t lba,
+static int write_data(struct ext4_blockdev *bdev, uint64_t lba,
 	uint32_t offset, const void *data, uint32_t length, bool initialize,
-	const struct file_data_source *source)
+	const struct file_data_source *source, bool synchronous)
 {
 #if CONFIG_JOURNALING_ENABLE
 	if (bdev->fs && bdev->fs->jbd_journal && ext4_current_trans(bdev->fs))
@@ -152,7 +165,7 @@ int ext4_trans_write_data(struct ext4_blockdev *bdev, uint64_t lba,
 #endif
 	/* Standalone non-journal users may explicitly request deferred bcache
 	 * writes. The VFS supplies stable sources and writes directly instead. */
-	if (source && source->retain) {
+	if (synchronous || (source && source->retain)) {
         if (!offset && length == bdev->lg_bsize && data) {
             struct kernel_block_span span = {lba * bdev->lg_bsize, data, bdev->lg_bsize};
             return ext4_trans_write_data_batch(bdev, &span, 1);
@@ -174,7 +187,11 @@ int ext4_trans_write_data(struct ext4_blockdev *bdev, uint64_t lba,
 			}
 			payload = assembled;
 		}
-		if (!r) r = ext4_blocks_set_direct(bdev, payload, lba, 1);
+        if (!r && old) r=ext4_block_flush_buf(bdev,old);
+        if (!r) {
+            r=ext4_blocks_set_direct(bdev,payload,lba,1);
+            if (r) ext4_bcache_invalidate_lba(bdev->bc,lba,1);
+        }
 		if (!r && old) {
 			/* An explicitly held standalone bcache reference sees the new
 			 * contents too; no stale dirty version may overwrite direct DMA. */
@@ -202,6 +219,17 @@ int ext4_trans_write_data(struct ext4_blockdev *bdev, uint64_t lba,
 	else memset(block.data + offset, 0, length);
 	ext4_bcache_set_dirty(block.buf);
 	return ext4_block_set(bdev, &block);
+}
+
+int ext4_trans_write_data(struct ext4_blockdev *bdev, uint64_t lba,
+    uint32_t offset, const void *data, uint32_t length, bool initialize,
+    const struct file_data_source *source)
+{ return write_data(bdev,lba,offset,data,length,initialize,source,false); }
+int ext4_trans_write_data_sync(struct ext4_blockdev *bdev, uint64_t lba,
+    uint32_t offset, const void *data, uint32_t length, bool initialize)
+{
+    if (bdev->fs && bdev->fs->jbd_journal) return EINVAL;
+    return write_data(bdev,lba,offset,data,length,initialize,NULL,true);
 }
 
 int ext4_trans_try_revoke_block(struct ext4_blockdev *bdev __unused,

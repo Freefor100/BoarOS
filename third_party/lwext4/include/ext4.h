@@ -230,6 +230,8 @@ int ext4_file_set_owner(ext4_file *file, uint32_t uid, uint32_t gid, uint32_t pr
  * offset/size advance file size and completion. An ordinary buffer (empty source)
  * is copied into a private version. */
 int ext4_fpwrite_batch(ext4_file *file, struct file_write_span *spans, unsigned count);
+/* Synchronous no-journal data path; caller storage is never retained. */
+int ext4_fpwrite_direct(ext4_file *file, struct file_write_span *span);
 int ext4_fpwrite(ext4_file *file, uint64_t offset, const void *buffer, size_t size, size_t *written);
 int ext4_file_sync_metadata_mode(ext4_file *file, bool data_only);
 /* Flush non-grouped metadata synchronously, or capture and request one fixed
