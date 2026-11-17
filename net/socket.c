@@ -1562,6 +1562,8 @@ static int socket_ip_route(struct kernel_socket *socket,const ip_addr_t *remote,
     if(!local)return -KERNEL_ENETUNREACH;
     if(IP_IS_V6(remote)) {
         const ip6_addr_t *dst=ip_2_ip6(remote),*src=ip_2_ip6(local);
+        if(interface->hwaddr_len && (ip6_addr_isloopback(src) || ip6_addr_isloopback(dst)))
+            return -KERNEL_ENETUNREACH;
         if(!ip6_addr_ismulticast(dst) && !ip6_addr_islinklocal(dst) &&
            ip6_addr_isloopback(src) && !ip6_addr_isloopback(dst))
             return -KERNEL_ENETUNREACH;
@@ -2909,7 +2911,7 @@ int kernel_socket_connect(struct kernel_socket *socket,
     if (socket->connecting) { int failure = (-KERNEL_EALREADY); kernel_socket_protocol_leave(&old_status); return failure; }
     int result = address_import(socket, address, &remote, SOCKET_ADDRESS_CONNECT);
     if (result != 0) { int failure = (result); kernel_socket_protocol_leave(&old_status); return failure; }
-    if (IP_IS_V6(&remote) && ip6_addr_islinklocal(ip_2_ip6(&remote))) {
+    if (IP_IS_V6(&remote)) {
         struct netif *route=NULL;const ip_addr_t *source=NULL;
         result=socket_ip_route(socket,&remote,&route,&source);
         if (result) {kernel_socket_protocol_leave(&old_status);return result;}
@@ -5664,7 +5666,8 @@ void kernel_socket_network_failed(uint32_t address)
                 if (local_address==address) socket_schedule(s,SOCKET_WORK_DEVICE_FAILED);
             } else if (failed && s->saved_local.family==KERNEL_SOCKET_AF_INET6) {
                 for(unsigned i=0;i<LWIP_IPV6_NUM_ADDRESSES;i++)
-                    if(!__builtin_memcmp(s->saved_local.bytes,netif_ip6_addr(failed,i)->addr,16) &&
+                    if((i==0 || failed->ip6_configured[i]) && !ip6_addr_isany(netif_ip6_addr(failed,i)) &&
+                       !__builtin_memcmp(s->saved_local.bytes,netif_ip6_addr(failed,i)->addr,16) &&
                        (!s->saved_local.scope || s->saved_local.scope==netif_get_index(failed))) {
                         socket_schedule(s,SOCKET_WORK_DEVICE_FAILED);break;
                     }
@@ -5674,9 +5677,9 @@ void kernel_socket_network_failed(uint32_t address)
 #endif
         const ip_addr_t *local = local_ip(s);
         int affected = local && IP_IS_V4(local) && ip4_addr_get_u32(ip_2_ip4(local)) == address;
-        if (!affected && local && IP_IS_V6(local) && failed)
+        if (!affected && local && IP_IS_V6(local) && !ip_addr_isany(local) && failed)
             for(unsigned i=0;i<LWIP_IPV6_NUM_ADDRESSES;i++)
-                if(ip6_addr_eq(ip_2_ip6(local),netif_ip6_addr(failed,i))){affected=1;break;}
+                if((i==0 || failed->ip6_configured[i]) && ip6_addr_eq(ip_2_ip6(local),netif_ip6_addr(failed,i))){affected=1;break;}
         if (!affected && s->udp && s->connected) {
             /* Connected UDP may still bind ANY; classify before carrier removal. */
             struct netif *route = ip_route(&s->udp->local_ip,&s->udp->remote_ip);
@@ -5765,7 +5768,8 @@ int kernel_socket_ipv6_gateway(uint32_t index,const uint8_t bytes[16],int remove
             if(remove) {
                 if(ip6_addr_isany(&n->ip6_gateway) || (remove==2 && !ip6_addr_eq(&gateway,&n->ip6_gateway)))result=-KERNEL_ESRCH;
                 else {nd6_cleanup_netif(n);ip6_addr_set_zero(&n->ip6_gateway);result=0;}
-            } else if(!n->hwaddr_len || !netif_is_up(n) || n->mtu<1280 || ip6_addr_isany(&gateway) ||
+            } else if(!netif_is_up(n))result=-KERNEL_ENETDOWN;
+            else if(!n->hwaddr_len || n->mtu<1280 || ip6_addr_isany(&gateway) ||
                 ip6_addr_ismulticast(&gateway) || ip6_addr_isloopback(&gateway) ||
                 ip6_addr_isipv4mappedipv6(&gateway) || boaros_lwip_ip6_onlink(n,&gateway)<0)result=-KERNEL_ENETUNREACH;
             else {

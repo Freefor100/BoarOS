@@ -347,10 +347,10 @@ ip6_select_source_address(struct netif *netif, const ip6_addr_t *dest)
       cand_bits = netif->ip6_prefix[i];
 #else
     cand_bits = ip6_addr_net_zoneless_eq(cand_addr, dest);
-#endif
     if (cand_bits && ip6_addr_nethost_eq(cand_addr, dest)) {
       return netif_ip_addr6(netif, i); /* Rule 1 */
     }
+#endif
     if ((best_addr == NULL) || /* no alternative yet */
         ((cand_scope < best_scope) && (cand_scope >= dest_scope)) ||
         ((cand_scope > best_scope) && (best_scope < dest_scope)) || /* Rule 2 */

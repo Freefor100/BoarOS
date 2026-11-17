@@ -100,6 +100,9 @@ static err_t ipv6_output(struct netif *interface,struct pbuf *p,const ip6_addr_t
     if (p->tot_len>interface->mtu) return ERR_BUF;
     const struct ip6_hdr *header=p->payload;
     ip6_addr_t source;ip6_addr_copy_from_packed(source,header->src);
+    /* Loopback is host-local even when an explicit device or /0 route would
+     * otherwise select Ethernet. Enforce this for TCP and queued output too. */
+    if(ip6_addr_isloopback(&source) || ip6_addr_isloopback(destination))return ERR_RTE;
     /* A queued packet can outlive MTU/address withdrawal and renewed DAD.
      * Only DAD itself may leave with the unspecified source. */
     if (!ip6_addr_isany(&source)) {

@@ -76,6 +76,24 @@ int main(void)
         CHECK(errno==EADDRNOTAVAIL);usleep(100000);
     }
     CHECK(ready);puts("IPV6 EXTERNAL DAD READY");
+#ifdef IPV6_STATIC_GLOBAL
+    struct in6_request alternate={.prefix=64,.index=(int)index};
+    CHECK(inet_pton(AF_INET6,"2001:db8:2::456",&alternate.address)==1);
+    CHECK(!ioctl(fd,SIOCSIFADDR,&alternate));
+    struct sockaddr_in6 alt_local={.sin6_family=AF_INET6,.sin6_addr=alternate.address};
+    int alt=endpoint(SOCK_DGRAM);ready=0;
+    for(unsigned i=0;i<60;i++) {
+        if(!bind(alt,(void *)&alt_local,sizeof(alt_local))){ready=1;break;}
+        CHECK(errno==EADDRNOTAVAIL);usleep(100000);
+    }
+    CHECK(ready);close(alt);alt=endpoint(SOCK_DGRAM);
+    struct sockaddr_in6 alt_peer={.sin6_family=AF_INET6,.sin6_port=htons(19460)};
+    CHECK(inet_pton(AF_INET6,"2001:db8:2::100",&alt_peer.sin6_addr)==1);
+    CHECK(!connect(alt,(void *)&alt_peer,sizeof(alt_peer)));
+    struct sockaddr_in6 chosen={0};socklen_t chosen_size=sizeof(chosen);
+    CHECK(!getsockname(alt,(void *)&chosen,&chosen_size) && !memcmp(&chosen.sin6_addr,&alternate.address,16));
+    close(alt);CHECK(!ioctl(fd,0x8936,&alternate));puts("IPV6 EXTERNAL SOURCE PREFIX PASS");
+#endif
     struct ifaddrs *interfaces=NULL;CHECK(!getifaddrs(&interfaces));unsigned found=0;
     for(struct ifaddrs *i=interfaces;i;i=i->ifa_next)
         if(i->ifa_addr && i->ifa_addr->sa_family==AF_INET6 && !strcmp(i->ifa_name,"eth0")) {
@@ -115,6 +133,13 @@ int main(void)
     CHECK(ready);
     CHECK(sendto(fd,data,64,0,(void *)&peer,sizeof(peer))==-1 && errno==ENETUNREACH);
     global_gateway(fd,index,0);close(fd);
+    struct sockaddr_in6 loop_target={.sin6_family=AF_INET6,.sin6_port=htons(19460),.sin6_addr=IN6ADDR_LOOPBACK_INIT};
+    for(int type=SOCK_STREAM;type<=SOCK_DGRAM;type++) {
+        int blocked=endpoint(type);CHECK(!setsockopt(blocked,SOL_SOCKET,SO_BINDTODEVICE,"eth0",5));
+        if(type==SOCK_STREAM)CHECK(connect(blocked,(void *)&loop_target,sizeof(loop_target))==-1 && errno==ENETUNREACH);
+        else CHECK(sendto(blocked,data,64,0,(void *)&loop_target,sizeof(loop_target))==-1 && errno==ENETUNREACH);
+        close(blocked);
+    }
     puts("IPV6 EXTERNAL STATIC DEFAULT READY");
 #endif
     fd=endpoint(SOCK_STREAM);CHECK(!connect(fd,(void *)&peer,sizeof(peer)));
@@ -146,7 +171,13 @@ int main(void)
 #ifdef IPV6_STATIC_GLOBAL
     fd=endpoint(SOCK_DGRAM);global_gateway(fd,index,1);
     CHECK(sendto(fd,data,64,0,(void *)&peer,sizeof(peer))==-1 && errno==ENETUNREACH);
-    configure_global(fd,index,128,1);close(fd);puts("IPV6 EXTERNAL STATIC CLEANUP PASS");
+    configure_global(fd,index,128,1);
+    memset(&ifr,0,sizeof(ifr));strcpy(ifr.ifr_name,"eth0");CHECK(!ioctl(fd,SIOCGIFFLAGS,&ifr));
+    short saved_flags=ifr.ifr_flags;ifr.ifr_flags&=(short)~IFF_UP;CHECK(!ioctl(fd,SIOCSIFFLAGS,&ifr));
+    struct in6_route down_route={.flags=3,.index=(int)index};CHECK(inet_pton(AF_INET6,"fe80::2",&down_route.gateway)==1);
+    CHECK(ioctl(fd,0x890b,&down_route)==-1 && errno==ENETDOWN);
+    ifr.ifr_flags=saved_flags;CHECK(!ioctl(fd,SIOCSIFFLAGS,&ifr));
+    close(fd);puts("IPV6 EXTERNAL STATIC CLEANUP PASS");
 #endif
     puts("IPV6 EXTERNAL ALL PASS");
     if(getpid()==1) {sync();reboot(RB_POWER_OFF);}

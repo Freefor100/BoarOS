@@ -3927,6 +3927,44 @@ static void ipv6_linklocal(void)
     puts("PASS Ethernet IPv6 DAD, duplicate rejection, scoped bind, ND/echo contents, MTU and device failure");
 }
 
+static void ipv6_no_loopback_egress(struct netif *n)
+{
+    struct kernel_socket_address target={.family=10,.port=19460};target.bytes[15]=1;
+    unsigned sent=copied_packets,queued=lwip_stats.memp[MEMP_ND6_QUEUE]->used;
+    for(int type=SOCKET_STREAM;type<=SOCKET_DGRAM;type++) {
+        struct kernel_socket *s=NULL;CHECK(!kernel_socket_create(&test_heap,10,type,0,&s));
+        CHECK(!kernel_socket_set_bound_device(s,"eth0"));
+        if(type==SOCKET_STREAM)CHECK(kernel_socket_connect(s,&target,1)==-KERNEL_ENETUNREACH);
+        else {
+            struct kernel_open_file_description *pin=(void *)s;struct kernel_uaccess_iovec iov={(uintptr_t)"x",1};
+            CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,1,0,&target,NULL)==-KERNEL_ENETUNREACH);
+        }
+        kernel_socket_destroy(s);
+    }
+    struct pbuf *p=pbuf_alloc(PBUF_RAW,48,PBUF_RAM);CHECK(p);memset(p->payload,0,48);
+    struct ip6_hdr *header=p->payload;ip6_addr_t loop;CHECK(ip6addr_aton("::1",&loop));
+    memcpy(&header->src,netif_ip6_addr(n,1)->addr,16);
+    CHECK(ipv6_output(n,p,&loop)==ERR_RTE);
+    memcpy(&header->src,loop.addr,16);CHECK(ipv6_output(n,p,netif_ip6_addr(n,1))==ERR_RTE);pbuf_free(p);
+    CHECK(copied_packets==sent && lwip_stats.memp[MEMP_ND6_QUEUE]->used==queued);
+}
+static void ipv6_source_prefix(void)
+{
+    kernel_socket_network_initialize();
+    struct virtio_net_device device={.mac={0x52,0x54,0,0x12,0x34,0x56}};
+    struct kernel_network network={.device=&device};struct netif *n=&network.interface;
+    ip4_addr_t zero={0};CHECK(netif_add(n,&zero,&zero,&zero,&network,interface_init,ethernet_input));
+    netif_set_up(n);netif_set_link_up(n);
+    ip6_addr_t a,b,destination;
+    CHECK(ip6addr_aton("2001:db8:1::123",&a) && ip6addr_aton("2001:db8:2::456",&b) &&
+          ip6addr_aton("2001:db8:2::123",&destination));
+    CHECK(!kernel_socket_ipv6_address(netif_get_index(n),(void *)a.addr,64,0));
+    CHECK(!kernel_socket_ipv6_address(netif_get_index(n),(void *)b.addr,64,0));
+    for(unsigned tick=0;tick<3;tick++)nd6_tmr();
+    CHECK(ip6_addr_eq(ip_2_ip6(ip6_select_source_address(n,&destination)),&b));
+    nd6_cleanup_netif(n);netif_remove(n);CHECK(!heap_live);
+    puts("PASS IPv6 source selection: same IID in a different prefix is not an exact address match");
+}
 static void ipv6_global(void)
 {
     kernel_socket_network_initialize();
@@ -3936,6 +3974,16 @@ static void ipv6_global(void)
     CHECK(netif_add(n,&local,&mask,&zero,&network,interface_init,ethernet_input));
     netif_create_ip6_linklocal_address(n,1);netif_set_up(n);netif_set_link_up(n);
     unsigned index=netif_get_index(n);for(unsigned i=0;i<3;i++)nd6_tmr();
+    struct kernel_socket *wildcard=NULL,*lo_only=NULL;
+    CHECK(!kernel_socket_create(&test_heap,10,SOCKET_DGRAM,0,&wildcard));
+    CHECK(!kernel_socket_set_option(wildcard,KERNEL_SOCKET_V6ONLY,1));
+    CHECK(!kernel_socket_create(&test_heap,10,SOCKET_DGRAM,0,&lo_only));
+    struct kernel_socket_address wildcard_address={.family=10};
+    CHECK(!kernel_socket_bind(wildcard,&wildcard_address));
+    wildcard_address.bytes[15]=1;CHECK(!kernel_socket_bind(lo_only,&wildcard_address));
+    kernel_socket_network_failed(local.addr);
+    CHECK(!wildcard->error && !wildcard->pending_error && !lo_only->error && !lo_only->pending_error);
+    kernel_socket_destroy(wildcard);kernel_socket_destroy(lo_only);
     ip6_addr_t a,b,peer,off,gateway,any;ip6_addr_set_zero(&any);
     CHECK(ip6addr_aton("2001:db8:1:2:1000::1",&a));
     CHECK(ip6addr_aton("2001:db8:1:2:2000::1",&b));
@@ -4015,7 +4063,7 @@ static void ipv6_global(void)
     remote.scope=0;
     CHECK(kernel_socket_ipv6_gateway(0,(void *)gateway.addr,0)==-KERNEL_EINVAL);
     CHECK(!kernel_socket_ipv6_gateway(index,(void *)gateway.addr,0));
-    CHECK(ip6_route(&any,&off)==n);
+    CHECK(ip6_route(&any,&off)==n);ipv6_no_loopback_egress(n);
     memcpy(remote.bytes,off.addr,16);
     CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,64,0,&remote,NULL)==64);
     CHECK(captured[54]==135 && !memcmp(captured+62,gateway.addr,16));
@@ -4044,6 +4092,7 @@ static void ipv6_global(void)
     kernel_socket_network_failed(local.addr);CHECK(socket->pending_error==-KERNEL_EIO);kernel_socket_destroy(socket);
     CHECK(!kernel_socket_interface_set_flags((char[16]){"eth0"},0));
     CHECK(!n->ip6_configured[1] && !n->ip6_configured[2] && ip6_addr_isany(&n->ip6_gateway));
+    CHECK(kernel_socket_ipv6_gateway(index,(void *)gateway.addr,0)==-KERNEL_ENETDOWN);
     CHECK(!kernel_socket_ipv6_address(index,(void *)a.addr,128,0));
     for(unsigned i=0;i<3;i++)nd6_tmr();
     CHECK(ip6_addr_istentative(netif_ip6_addr_state(n,1)) && !netif_is_up(n));
@@ -4069,6 +4118,7 @@ static void ipv6_global(void)
         unsigned prefix=prefixes[k];
         CHECK(!kernel_socket_ipv6_address(index,(void *)a.addr,prefix,0));
         for(unsigned tick=0;tick<3;tick++)nd6_tmr();
+        if(!prefix)ipv6_no_loopback_egress(n);
         ip6_addr_t target;ip6_addr_copy(target,a);
         ((unsigned char *)target.addr)[15]^=1;
         CHECK((ip6_route(&any,&target)==n)==(prefix<128));
@@ -4103,6 +4153,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "raw-icmp-close")) raw_icmp_close();
     else if (!strcmp(argv[1], "ipv6-prepare-withdraw")) ipv6_prepare_withdraw();
     else if (!strcmp(argv[1], "ipv6-global")) ipv6_global();
+    else if (!strcmp(argv[1], "ipv6-source-prefix")) ipv6_source_prefix();
     else if (!strcmp(argv[1], "ipv6-linklocal")) ipv6_linklocal();
     else if (!strcmp(argv[1], "ipv4-options")) ipv4_options();
     else if (!strcmp(argv[1], "async-events")) async_events();
