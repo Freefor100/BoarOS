@@ -1463,6 +1463,27 @@ int kernel_vfs_reuse_block_tree(uint64_t device,const char *type,int read_only,i
     }
     return 1;
 }
+/* cgroup2 has one hierarchy and one live inode/dentry cache across mounts.
+ * Independent instances would leave positive names stale after another mount
+ * removed and recreated a group. Mount views retain their own mount flags. */
+int kernel_vfs_reuse_cgroup_tree(struct kernel_heap *heap,
+    uint64_t origin,struct kernel_vfs_path **owner)
+{
+    KERNEL_SERVICE_SCOPE(service);
+    KERNEL_LOCK_SCOPE(topology);mount_topology_lock(&topology);
+    for(struct kernel_vfs_instance *i=active_instances;i;i=i->active_next) {
+        if(!i->ops->type || strcmp(i->ops->type,"cgroup2"))continue;
+        if(i->quiescing || !i->views)return -KERNEL_EBUSY;
+        struct kernel_vfs_mount *copy=NULL;
+        int error=clone_one_view(i->views,NULL,0,&copy);
+        if(error)return error;
+        error=kernel_vfs_detach_created_mount(copy,heap,origin,owner);
+        if(error){discard_staged_mount(copy);return error;}
+        copy->propagation_staged=0;
+        return 0;
+    }
+    return 1;
+}
 int kernel_vfs_clone_tree(struct kernel_vfs_path *source,int recursive,struct kernel_vfs_path **owner)
 {
     KERNEL_LOCK_SCOPE(topology);mount_topology_lock(&topology);
@@ -5870,8 +5891,16 @@ int kernel_vfs_file_control(const struct kernel_vfs_file *file, int write,
     return instance->ops->control(node, write, offset, buffer, size, count);
 }
 
+int kernel_vfs_file_control_open_credentials(const struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_node *node=kernel_vfs_file_node(file);
+    return node && node->instance->ops->control_open_credentials;
+}
+
 int kernel_vfs_file_control_permission(const struct kernel_vfs_file *file, int write)
 {
+    /* kernfs delegation uses the opener credentials in the write operation. */
+    if (kernel_vfs_file_control_open_credentials(file)) return 0;
     struct kernel_vfs_node *node = kernel_vfs_file_node(file);
     if (!kernel_vfs_file_is_control(file,write)) return -KERNEL_EINVAL;
     const struct kernel_vfs_backend *ops = node->instance->ops;

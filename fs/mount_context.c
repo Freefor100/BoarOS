@@ -1,4 +1,5 @@
 #include "mount_context.h"
+#include "cgroup_internal.h"
 #include "vfs_internal.h"
 #include "open_file_internal.h"
 #include "char_device_internal.h"
@@ -28,7 +29,7 @@ int kernel_mount_type_supported(const char *type)
 {
     return !strcmp(type,"tmpfs") || !strcmp(type,"ext4") || !strcmp(type,"vfat") ||
         !strcmp(type,"devpts") || !strcmp(type,"proc") || !strcmp(type,"mqueue") ||
-        !strcmp(type,"bpf") || !strcmp(type,"tracefs") || !strcmp(type,"sysfs");
+        !strcmp(type,"bpf") || !strcmp(type,"tracefs") || !strcmp(type,"sysfs") || !strcmp(type,"cgroup2");
 }
 void kernel_mount_discard(struct kernel_vfs_path **owner)
 {
@@ -72,9 +73,24 @@ int kernel_mount_create(const struct kernel_fs_context *fs,const struct kernel_m
             return error;
         }
     }
+    if(!strcmp(p->type,"cgroup2")) {
+        int reused=kernel_vfs_reuse_cgroup_tree(fs->heap,
+            kernel_fs_context_namespace_id(fs),owner);
+        if(reused<0)return reused;
+        if(!reused){
+            struct kernel_vfs_mount *mount=kernel_vfs_path_mount(*owner);
+            mount->read_only=!!(p->flags&1U);mount->nosuid=!!(p->flags&2U);
+            mount->nodev=!!(p->flags&4U);mount->noexec=!!(p->flags&8U);
+            mount->silent=!!(p->flags&32768U);mount->atime_policy=kernel_vfs_atime_policy(p->flags,0,0);
+            int error=kernel_vfs_change_propagation(*owner,UINT64_C(262144),0);
+            if(error)kernel_mount_discard(owner);
+            return error;
+        }
+    }
     struct kernel_vfs_mount *mount=NULL;
     const struct kernel_credentials *previous=kernel_credentials_override(creator);
     int error=disk?kernel_vfs_disk_create(fs->heap,device,p->flags&1U,p->source,p->type,&mount):
+        !strcmp(p->type,"cgroup2")?kernel_cgroup_mount(fs->heap,p->flags&1U,&mount):
         !strcmp(p->type,"bpf")?kernel_bpffs_mount(fs->heap,p->flags&1U,&mount):
         !strcmp(p->type,"tracefs")?kernel_tracefs_mount(fs->heap,p->flags&1U,&mount):
         !strcmp(p->type,"sysfs")?kernel_sysfs_mount(fs->heap,p->flags&1U,&mount):

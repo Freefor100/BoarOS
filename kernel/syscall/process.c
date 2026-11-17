@@ -325,6 +325,7 @@ void syscall_decode_clone(const struct kernel_syscall_request *request,
                          struct kernel_syscall_result *decoded)
 {
     uint64_t flags = request->arguments[0];
+    decoded->clone_cgroup_fd = -1;
     const uint64_t thread_required = UINT64_C(0x100) | UINT64_C(0x800) | UINT64_C(0x10000);
     const uint64_t thread_optional = LINUX_CLONE_PTRACE | LINUX_CLONE_UNTRACED |
         LINUX_CLONE_FS | LINUX_CLONE_FILES | UINT64_C(0x80001000) |
@@ -469,10 +470,7 @@ enum kernel_syscall_status syscall_handle_clone3(struct kernel_task *caller,
     if ((args.flags & UINT64_C(0x1000)) && (args.flags & UINT64_C(0x100000)) && args.pidfd==args.parent_tid) {
         decoded->value=-KERNEL_EINVAL; return KERNEL_SYSCALL_STATUS_OK;
     }
-    if (args.flags & UINT64_C(0x200000000)) {
-        decoded->value=-KERNEL_EOPNOTSUPP; return KERNEL_SYSCALL_STATUS_OK;
-    }
-    struct kernel_syscall_request legacy={.arguments={args.flags|args.exit_signal}};
+    struct kernel_syscall_request legacy={.arguments={(args.flags & ~UINT64_C(0x200000000))|args.exit_signal}};
     syscall_decode_clone(&legacy,decoded);
     if (decoded->action == KERNEL_SYSCALL_ACTION_CLONE) {
         if (args.set_tid_size) {
@@ -491,7 +489,8 @@ enum kernel_syscall_status syscall_handle_clone3(struct kernel_task *caller,
              * zero retains automatic allocation. Never reread the user array. */
             decoded->value=requested_tid;
         }
-        request->arguments[0]=legacy.arguments[0];
+        decoded->clone_cgroup_fd = (args.flags & UINT64_C(0x200000000)) ? (int32_t)args.cgroup : -1;
+        request->arguments[0]=args.flags|args.exit_signal;
         request->arguments[1]=args.stack ? args.stack+args.stack_size : 0;
         request->arguments[2]=args.parent_tid;
         request->arguments[3]=args.tls;

@@ -151,6 +151,8 @@ struct kernel_vfs_backend {
     /* Existing positive dentries are authoritative: all name changes use VFS
      * parent qualification and update its index before releasing it. */
     bool owns_dentry_names;
+    /* Control writes authorize with the OFD opener, not current credentials. */
+    bool control_open_credentials;
     int (*check_domain)(const struct kernel_vfs_node *, const struct kernel_heap *,
         const struct physical_page_allocator *);
     int (*error)(struct kernel_vfs_instance *instance);

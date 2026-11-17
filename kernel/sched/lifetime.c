@@ -1,3 +1,4 @@
+#include "../../fs/cgroup_internal.h"
 #include "private.h"
 #include <kernel/seccomp.h>
 #include <kernel/ptrace.h>
@@ -209,6 +210,10 @@ void scheduler_task_collect(void)
         /* Discovery and all storage borrows have ended. Like Linux sighand,
          * dispositions retain their identity through zombie/reap, then leave
          * with the container; queue quiescence and page disposal stay outside raw. */
+        if (task->cgroup) {
+            kernel_cgroup_put(task->cgroup);
+            task->cgroup=0;
+        }
         if (task->signal_table_address && kernel_signal_release_table(task)) __builtin_trap();
         kernel_ptrace_dispose(task);
         kernel_seccomp_release(task);

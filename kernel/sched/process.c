@@ -1,4 +1,5 @@
 #include "../../fs/files/private.h"
+#include "../../fs/cgroup_internal.h"
 #include "../../fs/open_file_internal.h"
 #include <kernel/reboot.h>
 #include <kernel/namespace.h>
@@ -784,6 +785,9 @@ static enum kernel_scheduler_status finish_clone_failure(
     return scheduler_failure;
 }
 
+static void clone_cgroup_end(struct kernel_cgroup **group)
+{ if (*group) kernel_cgroup_put(*group); }
+
 enum kernel_scheduler_status arch_process_clone_current(
     const struct arch_trap_frame *parent_frame,
     uint64_t flags,
@@ -793,6 +797,7 @@ enum kernel_scheduler_status arch_process_clone_current(
     uint64_t child_tid,
     uint64_t pidfd_address,
     int32_t requested_tid,
+    int32_t cgroup_fd,
     int64_t *linux_result)
 {
     struct kernel_task *parent;
@@ -1031,6 +1036,19 @@ enum kernel_scheduler_status arch_process_clone_current(
 #if BOAROS_COST_DIAGNOSTICS
     kernel_cost_inherit(&child->cost, &parent->cost);
 #endif
+    struct kernel_cgroup *destination __attribute__((cleanup(clone_cgroup_end))) = 0;
+    if (cgroup_fd >= 0) {
+        struct kernel_open_file_description *file = 0;
+        int64_t error = 0;
+        enum kernel_files_status pinned = kernel_files_pin(&parent->files,cgroup_fd,&file,&error);
+        if (pinned != KERNEL_FILES_STATUS_OK) error = -KERNEL_EBADF;
+        if (!error) error = kernel_cgroup_from_file(file,&destination);
+        if (file && kernel_open_file_release(&file)) __builtin_trap();
+        if (error) {
+            (void)kernel_mm_remove_user(&child->mm);
+            return finish_clone_failure(child,error,linux_result,KERNEL_SCHEDULER_STATUS_OK);
+        }
+    }
     unsigned trace_event=0;
     int rejected;
     for (;;) {
@@ -1042,7 +1060,14 @@ enum kernel_scheduler_status arch_process_clone_current(
         struct kernel_task *leader = parent->group_leader;
         rejected = kernel_reboot_requested_locked() || parent->retirement || parent->terminate_requested ||
                    leader->group_exiting || leader->group_execing;
-        if (rejected) break;
+        if (rejected) { rejected = -KERNEL_EAGAIN; break; }
+        if (destination) {
+            struct kernel_cgroup *source = parent->cgroup ? parent->cgroup : kernel_cgroup_root();
+            rejected = !destination->linked ? -KERNEL_ENODEV :
+                kernel_cgroup_permission(source,destination,kernel_credentials_current());
+            if (!rejected && thread_clone && source != destination) rejected = -KERNEL_EOPNOTSUPP;
+            if (rejected) break;
+        }
         /* Attach may race the fallible allocations above. Choose the child
          * trace link at publication, outside-lock allocation only if needed. */
         int event = ptrace_clone_locked(parent, child, flags);
@@ -1054,6 +1079,13 @@ enum kernel_scheduler_status arch_process_clone_current(
                 return finish_clone_failure(child, -KERNEL_ENOMEM, linux_result, KERNEL_SCHEDULER_STATUS_OK);
             }
             continue;
+        }
+        /* Membership and PID publication are one transaction. No child can
+         * run in its parent's group before an INTO_CGROUP migration. */
+        struct kernel_cgroup *chosen = destination ? destination : parent->cgroup;
+        if (chosen && chosen != kernel_cgroup_root()) {
+            child->cgroup = kernel_cgroup_get(chosen);
+            chosen->members++;
         }
         trace_event = (unsigned)event;
         memcpy(child->comm, parent->comm, sizeof(child->comm));
@@ -1094,7 +1126,7 @@ enum kernel_scheduler_status arch_process_clone_current(
     }
     if (rejected) {
         (void)kernel_mm_remove_user(&child->mm);
-        return finish_clone_failure(child, -KERNEL_EAGAIN, linux_result, KERNEL_SCHEDULER_STATUS_OK);
+        return finish_clone_failure(child, rejected, linux_result, KERNEL_SCHEDULER_STATUS_OK);
     }
     if (flags & LINUX_CLONE_PARENT_SETTID) {
         size_t copied;
@@ -2539,6 +2571,10 @@ static void process_begin_exit(struct kernel_task *current,
 {
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        if (current->cgroup) {
+            if (!current->cgroup->members) __builtin_trap();
+            current->cgroup->members--;
+        }
         if (kernel_wait_record_phase(&current->wait) != KERNEL_WAIT_FINISHED || current->wait.nodes || kernel_wait_record_borrows(&current->wait))
             __builtin_trap();
         current->proc_exiting = 1;

@@ -357,7 +357,7 @@ COMMON_C_SOURCES := \
 	fs/vfs.c \
 	fs/file_mapping.c \
 	fs/procfs.c \
-	fs/bpffs.c fs/tracefs.c fs/sysfs.c \
+	fs/bpffs.c fs/tracefs.c fs/sysfs.c fs/cgroupfs.c \
 	fs/tmpfs.c \
 	fs/disk_mount.c \
 	fs/fat32.c \
@@ -375,7 +375,7 @@ COMMON_C_SOURCES := \
 	kernel/random.c \
 	kernel/log.c \
 	kernel/blake2s.c \
-	kernel/sched/core.c \
+	kernel/sched/core.c kernel/sched/cgroup.c \
 	kernel/sched/policy.c \
 	kernel/sched/runqueue.c \
 	kernel/sched/scheduling.c kernel/sched/accounting.c kernel/sched/cpu_clock.c \

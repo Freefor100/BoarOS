@@ -60,6 +60,7 @@ struct kernel_proc_process_snapshot {
  * PID generation and may write names only within their own thread group. */
 void kernel_task_comm_get(struct kernel_task *, char name[16]);
 void kernel_task_comm_set(struct kernel_task *, const char name[16]);
+int kernel_proc_cgroup(int32_t,uint64_t,int,struct kernel_heap *,char **,size_t *);
 int kernel_proc_comm(kernel_pid_t, uint64_t identity, int thread,
                      char name[16], int writing);
 
