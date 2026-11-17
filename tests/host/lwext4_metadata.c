@@ -43,6 +43,21 @@ uint32_t __wrap_ext4_crc32c(uint32_t crc, const void *data, uint32_t bytes)
     return __real_ext4_crc32c(crc,data,bytes);
 }
 #endif
+static uint32_t direct_reuse_inode;
+static ext4_fsblk_t direct_reuse_goal;
+#ifdef TEST_DIRECT_REUSE_GOAL
+int __real_ext4_balloc_alloc_blocks(struct ext4_inode_ref *,ext4_fsblk_t,uint32_t,ext4_fsblk_t *,uint32_t *);
+int __wrap_ext4_balloc_alloc_blocks(struct ext4_inode_ref *ref,ext4_fsblk_t goal,
+    uint32_t maximum,ext4_fsblk_t *block,uint32_t *count)
+{
+    /* Choose a real allocator goal, never override its bitmap/quarantine result. */
+    if (direct_reuse_goal && ref->index==direct_reuse_inode) goal=direct_reuse_goal;
+    return __real_ext4_balloc_alloc_blocks(ref,goal,maximum,block,count);
+}
+#endif
+
+static uint64_t direct_partial_sector=UINT64_MAX;
+static unsigned direct_partial_writes;
 static struct fault_block disk;
 static unsigned allocations, fail_allocation, reads, fail_read, live_allocations;
 static size_t denied_block_buffer_size;
@@ -106,6 +121,11 @@ static int dev_write(struct ext4_blockdev *b,const void *p,uint64_t n,uint32_t c
     }
     if(write_interleave){void (*hook)(void)=write_interleave;write_interleave=NULL;hook();}
     if (n <= forbidden_lba && forbidden_lba < n+c) forbidden_writes++;
+    if (n==direct_partial_sector) {
+        CHECK(c>1);direct_partial_sector=UINT64_MAX;direct_partial_writes++;
+        CHECK(kernel_block_write_at(&disk.device,n*512,p,512)==KERNEL_BLOCK_STATUS_OK);
+        return EIO; /* The completed sector cannot be rolled back by the caller. */
+    }
     int result=kernel_block_write_at(&disk.device,n*512,p,(size_t)c*512) == KERNEL_BLOCK_STATUS_OK ? EOK : EIO;
     independent_boundary();
     return result;
@@ -3214,6 +3234,137 @@ static void allocation_capacity_test(struct ext4_fs *fs)
     puts("PASS directory capacity floors, scarce-space fallback, ENOSPC, parent-group exhaustion and abort counters");
 }
 
+static struct {
+    struct ext4_fs *fs;
+    ext4_file file;
+    ext4_fsblk_t old;
+    unsigned char *bytes;
+    unsigned checkpoint_probe,fault;
+} direct_reuse;
+static ext4_fsblk_t direct_file_block(struct ext4_fs *fs,uint32_t inode)
+{
+    struct ext4_inode_ref ref;ext4_fsblk_t block;
+    CHECK(ext4_fs_get_inode_ref_read(fs,inode,&ref)==EOK);
+    CHECK(ext4_fs_get_inode_dblk_idx(&ref,0,&block,false)==EOK);
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+    return block;
+}
+static void direct_during_old_checkpoint(void)
+{
+    struct ext4_fs *fs=direct_reuse.fs;
+    struct jbd_journal *journal=fs->jbd_journal;
+    CHECK(journal->checkpointing && journal->checkpointing->sequence==1);
+    /* Free while the old metadata phase already owns its immutable DMA
+     * source. The new revoke must not mutate that in-flight source. */
+    uint32_t removed;bool orphan;
+    CHECK(ext4_unlink_child("/",EXT4_INODE_ROOT_INDEX,"direct-old-directory",true,&removed,&orphan)==EOK);
+    CHECK(orphan && ext4_orphan_free("/",removed)==EOK);
+    struct jbd_revoke_rec *revoke=RB_ROOT(&journal->running->revoke_root);
+    while (revoke && revoke->lba!=direct_reuse.old)
+        revoke=direct_reuse.old<revoke->lba?RB_LEFT(revoke,revoke_node):RB_RIGHT(revoke,revoke_node);
+    CHECK(revoke && quarantine_blocks_reuse(fs,direct_reuse.old,false));
+    CHECK(ext4_journal_group_commit("/",true)==EOK);
+    CHECK(journal->durable_sequence==2 && !journal->checkpoint_sequence);
+    CHECK(quarantine_blocks_reuse(fs,direct_reuse.old,false));
+    size_t written=0;
+    CHECK(ext4_fpwrite(&direct_reuse.file,0,direct_reuse.bytes,fs->bdev->lg_bsize,&written)==EOK);
+    CHECK(written==fs->bdev->lg_bsize);
+    CHECK(direct_file_block(fs,direct_reuse.file.inode)!=direct_reuse.old);
+    CHECK(ext4_fdata_complete(&direct_reuse.file,0,written)==EOK);
+    CHECK(quarantine_blocks_reuse(fs,direct_reuse.old,false));
+    direct_reuse.checkpoint_probe++;
+    if (direct_reuse.fault==1) disk.fail_write=disk.writes+1;
+}
+static void direct_metadata_reuse(struct ext4_fs *fs,unsigned fault)
+{
+    CHECK(fault<=4);
+    struct ext4_journal_runtime runtime={.now_ns=group_clock,.wait=namespace_wait};
+    CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
+    struct jbd_journal *journal=fs->jbd_journal;
+    CHECK(ext4_dir_mk("/direct-old-directory")==EOK);
+    uint32_t old_inode;struct ext4_inode raw;
+    CHECK(ext4_raw_inode_fill("/direct-old-directory",&old_inode,&raw)==EOK);
+    ext4_fsblk_t old=direct_file_block(fs,old_inode);CHECK(old);
+    CHECK(ext4_fopen(&direct_reuse.file,"/direct-reused-file","w+")==EOK);
+    CHECK(ext4_journal_group_commit("/",true)==EOK);
+    CHECK(journal->durable_sequence && !journal->checkpoint_sequence);
+    bool old_metadata=false;struct jbd_buf *buffer;struct jbd_trans *transaction;
+    TAILQ_FOREACH(transaction,&journal->cp_queue,trans_node)
+        TAILQ_FOREACH(buffer,&transaction->buf_queue,buf_node)
+            if (buffer->block.lb_id==old) old_metadata=true;
+    CHECK(old_metadata);
+    /* Select the old metadata phase before freeing; its device callback
+     * performs the actual unlink/commit and competing DIRECT request. */
+    direct_reuse.fs=fs;direct_reuse.old=old;direct_reuse.fault=fault;
+    direct_reuse.bytes=malloc(fs->bdev->lg_bsize);CHECK(direct_reuse.bytes);
+    memset(direct_reuse.bytes,0x44,fs->bdev->lg_bsize);
+    direct_reuse_inode=direct_reuse.file.inode;direct_reuse_goal=old;
+    checkpoint_watch_block=fs->bdev->lg_bsize;checkpoint_homes[0]=old;
+    write_interleave=direct_during_old_checkpoint;
+    int result=ext4_journal_group_checkpoint("/");
+    CHECK(direct_reuse.checkpoint_probe==1 && !write_interleave);
+    if (fault==1) {
+        CHECK(result==EIO && journal->error==EIO);
+        CHECK(quarantine_blocks_reuse(fs,old,false));
+        size_t written=99;
+        CHECK(ext4_fpwrite(&direct_reuse.file,0,direct_reuse.bytes,fs->bdev->lg_bsize,&written)==EIO && !written);
+        CHECK(fault_block_crash(&disk)==0);
+        puts("PASS direct reuse: failed old checkpoint retains quarantine and rejects new data");
+        return;
+    }
+    CHECK(result==EOK && journal->checkpoint_sequence==1);
+    CHECK(checkpoint_home_writes[0]>0); /* Old home DMA really ran after free. */
+    CHECK(quarantine_blocks_reuse(fs,old,false));
+    CHECK(ext4_journal_group_checkpoint("/")==EOK);
+    CHECK(!quarantine_blocks_reuse(fs,old,false));
+    CHECK(ext4_ftruncate(&direct_reuse.file,0,UINT32_MAX)==EOK);
+    memset(direct_reuse.bytes,0x63,fs->bdev->lg_bsize);size_t written=0;
+    CHECK(ext4_fpwrite(&direct_reuse.file,0,direct_reuse.bytes,fs->bdev->lg_bsize,&written)==EOK && written==fs->bdev->lg_bsize);
+    CHECK(direct_file_block(fs,direct_reuse.file.inode)==old);
+    if (fault==2) direct_partial_sector=old*fs->bdev->lg_bsize/512;
+    uint64_t flushes=disk.flushes;
+    result=ext4_fdata_complete(&direct_reuse.file,0,written);
+    CHECK(disk.flushes==flushes);
+    if (fault==2) {
+        CHECK(result==EIO && journal->error==EIO && direct_partial_writes==1);
+        unsigned char partial[512];
+        CHECK(kernel_block_read_at(&disk.device,old*fs->bdev->lg_bsize,partial,sizeof(partial))==KERNEL_BLOCK_STATUS_OK);
+        for(unsigned i=0;i<sizeof(partial);i++) CHECK(partial[i]==0x63);
+        CHECK(ext4_fdata_complete(&direct_reuse.file,0,written)==EIO);
+        CHECK(fault_block_crash(&disk)==0);
+        puts("PASS direct reuse: new-data write failure retains owners, no false completion");
+        return;
+    }
+    CHECK(result==EOK);
+    if (fault==3 || fault==4) {
+        if (fault==4) CHECK(ext4_journal_group_commit("/",true)==EOK);
+        CHECK(fault_block_crash(&disk)==0);
+        printf("PASS direct reuse: crash after %s preserves only durable metadata/data\n",fault==3?"data completion":"commit before checkpoint");
+        return;
+    }
+    unsigned char *actual=malloc(written);CHECK(actual);
+    CHECK(ext4_blocks_get_direct(fs->bdev,actual,old,1)==EOK && !memcmp(actual,direct_reuse.bytes,written));
+    unsigned home_writes=checkpoint_home_writes[0];
+    CHECK(ext4_journal_group_drain("/")==EOK);
+    CHECK(checkpoint_home_writes[0]==home_writes);
+    CHECK(ext4_blocks_get_direct(fs->bdev,actual,old,1)==EOK && !memcmp(actual,direct_reuse.bytes,written));
+    CHECK(ext4_fclose(&direct_reuse.file)==EOK);
+    free(actual);free(direct_reuse.bytes);direct_reuse_goal=0;checkpoint_watch_block=0;
+    printf("PASS direct reuse: directory metadata LBA=%llu freed, quarantine blocked in-flight checkpoint reuse, same LBA became direct file data without old overwrite\n",(unsigned long long)old);
+}
+static void verify_direct_metadata_reuse(unsigned fault)
+{
+    CHECK(ext4_inode_exist("/direct-old-directory",EXT4_DE_DIR)==ENOENT);
+    ext4_file file;CHECK(ext4_fopen(&file,"/direct-reused-file","r")==EOK);
+    if (fault && fault!=4) CHECK(ext4_fsize(&file)==0);
+    else {
+        unsigned char bytes[4096];size_t done=0;
+        CHECK(ext4_fpread(&file,0,bytes,sizeof(bytes),&done)==EOK && done);
+        for(size_t i=0;i<done;i++) CHECK(bytes[i]==0x63);
+    }
+    CHECK(ext4_fclose(&file)==EOK);
+}
+
 static void allocation_locality_test(struct ext4_fs *fs)
 {
     struct ext4_sblock *sb = &fs->sb;
@@ -3272,6 +3423,11 @@ int main(int argc,char **argv)
         extent_read_failure(&dev,!strcmp(argv[2],"extent-read-error"),argc>3?strtoul(argv[3],NULL,10):0);
     else if(!strcmp(argv[2],"extent-lookup")){extent_lookup_checksums(&dev);}
     else if(!strcmp(argv[2],"extent-range")){public_batch_ranges(&dev);public_batch_boundaries(&dev);extent_range(&dev);legacy_range(&dev);legacy_leaf_batch(&dev);legacy_chain_abort(&dev);range_abort(&dev);unwritten_range_abort(&dev);fragmented_range(&dev);}
+    else if(!strcmp(argv[2],"direct-metadata-reuse")) {
+        unsigned fault=argc>3?strtoul(argv[3],NULL,10):0;
+        direct_metadata_reuse(dev.fs,fault);if(fault)return 0;
+    }
+    else if(!strcmp(argv[2],"verify-direct-metadata-reuse")) verify_direct_metadata_reuse(argc>3?strtoul(argv[3],NULL,10):0);
     else if(!strcmp(argv[2],"seed"))seed();
     else if(!strcmp(argv[2],"operation-context"))operation_context_test(dev.fs);
 #ifdef TEST_OPERATION_LIFECYCLE

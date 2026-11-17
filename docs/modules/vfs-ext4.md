@@ -31,7 +31,13 @@ ordered 数据保留独立完成标志与引用。范围提交依次处理 commi
 验证入口：`JOURNAL_TEST_CASE=direct-ordered sh tests/host/lwext4-journal.sh` 检查
 真实 extent 消费者、三代同 LBA、反序 phase 设备、DMA 期间并发替换、故障后的
 停止提交与崩溃恢复；`FILE_IO_HOST_TCP=0 FILE_IO_DIRECT_ONLY=1 sh tests/host/file-io-concurrency.sh`
-检查 VFS dirty-cache 交接、扩展和洞。`tests/workloads/io/direct-file.c` 与
+检查 VFS dirty-cache 交接、扩展和洞。
+`sh tests/host/lwext4-metadata.sh direct-reuse` 在真实旧目录 metadata checkpoint DMA
+已经选中后执行删除、revoke 和竞争 DIRECT 分配，核对 quarantine 在旧 checkpoint
+及释放事务 checkpoint 结束前不允许同 LBA 复用，随后实际复用该 LBA 并检查旧版本
+不会覆盖新数据。覆盖旧 checkpoint 写失败、新数据只完成首扇区即失败，以及 data
+完成后、commit 后 checkpoint 前的模拟断电恢复和 fsck。测试只选择 allocator 的 goal，
+不绕过真实分配位图、quarantine 或 extent 映射。`tests/workloads/io/direct-file.c` 与
 `tests/userland/direct-file.py` 覆盖 RV/LA 的共享 mmap 同文件输入输出、EFAULT 后继续、
 truncate/短读、F_SETFL、O_TMPFILE、sendfile/splice 及退出清理/fsck。
 
