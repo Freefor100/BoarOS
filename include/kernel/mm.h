@@ -24,6 +24,7 @@ struct kernel_futex_key;
 #define KERNEL_MM_MAP_FIXED (UINT32_C(1) << 0U)
 #define KERNEL_MM_MAP_FIXED_NOREPLACE (UINT32_C(1) << 1U)
 #define KERNEL_MM_MAP_SHARED (UINT32_C(1) << 2U)
+#define KERNEL_MM_MAP_GROWSDOWN (UINT32_C(1) << 4U)
 #define KERNEL_MM_MAP_LOCKED (UINT32_C(1) << 3U)
 
 enum kernel_mm_status {
@@ -330,6 +331,8 @@ enum kernel_mm_status kernel_mm_mprotect(
     uint32_t permissions);
 
 /* READ_IMPLIES_EXEC adds execute only to VMAs which permit it. */
+enum kernel_mm_status kernel_mm_mprotect_growdown(struct kernel_mm *,
+    uint64_t, uint64_t, uint32_t, int);
 enum kernel_mm_status kernel_mm_mprotect_personality(struct kernel_mm *,
     uint64_t address, uint64_t length, uint32_t permissions, int read_implies_exec);
 

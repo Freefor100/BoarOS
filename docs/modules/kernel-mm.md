@@ -50,7 +50,9 @@ process_vm 按 REALCREDS、dumpable 和 CAP_SYS_PTRACE 检查目标。两个 iov
 
 mincore 每页输出最低位的驻留状态，查询本身不装入页面。MM raw 内查询已有页面归属，包含 PROT_NONE 页面；没有 PTE 时查询内存对象或已完成装入的文件缓存。一次最多处理 16 页，任务 I/O 工作区保存结果，用户输出在 MM 保护外完成。文件来源借用覆盖锁外权限和缓存查询，恢复 MM 资格后核对 VMA 代次；截断、解除映射和最终关闭沿原来源退休协议等待借用结束。文件所有者、CAP_FOWNER 或有当前写权限的调用者可见真实状态，其余调用者按 Linux 获得全 1；匿名映射直接返回真实状态。VMA 空洞返回 ENOMEM，之前完整输出的前缀保留。
 
-直接检查使用 `tests/workloads/resource/memlock.c` 和 `tests/host/mm-resource-limits.sh`；前者与固定 Linux 运行相同 ELF，后者检查映射接纳、计数、部分修改和物理分配失败。通用 MAP_GROWSDOWN 仍在后续范围。
+直接检查使用 `tests/workloads/resource/memlock.c` 和 `tests/host/mm-resource-limits.sh`；前者与固定 Linux 运行相同 ELF，后者检查映射接纳、计数、部分修改和物理分配失败。显式 `MAP_GROWSDOWN` 采用同一增长路径，仅接受私有匿名映射；增长标志独立于主栈角色，保留普通 mmap 的 `/proc/maps` 身份。VMA 拆分、fork 与合并保留该标志，固定普通映射替换则撤销它。增长按目标片段大小检查 RLIMIT_STACK、总地址空间与锁页限额，不按普通可写数据计费；非 fixed 地址选择避开已有增长映射下方的 256 页 guard gap。`PROT_GROWSDOWN` 在一次独占 MM 操作内定位当前片段并修改至其下边界，不改变普通 mprotect 的并发路径。
+
+`tests/userland/growdown.c` 是 Linux/BoarOS 同源行为检查；`growdown.py` 使用已有 ABI fixture 与启动器，覆盖错误组合、实际缺页增长、fork、保护拆分、孔洞再增长、guard/限额和固定替换。生产 MM host 用例还检查资源归还与两种页大小的 VMA 计费/选址。
 
 ## madvise 与共享段锁定
 

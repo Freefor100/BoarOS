@@ -22,7 +22,8 @@ void kernel_vma_set_clear_locks(struct kernel_vma_set *);
 #define KERNEL_VMA_WIPEONFORK 8U
 #define KERNEL_VMA_DONTDUMP 16U
 #define KERNEL_VMA_RANDOM_READ 32U
-#define KERNEL_VMA_ALL_FLAGS 63U
+#define KERNEL_VMA_GROWSDOWN 64U
+#define KERNEL_VMA_ALL_FLAGS 127U
 uint64_t kernel_vma_set_data_bytes(const struct kernel_vma_set *set);
 int kernel_vma_is_data(const struct kernel_vma *vma);
 
@@ -91,6 +92,11 @@ struct kernel_vma {
      * The MM backing OFD owns the counter until all such VMAs are gone. */
     uint64_t *shared_write_bytes;
 };
+
+static inline int kernel_vma_grows_down(const struct kernel_vma *vma)
+{
+    return vma->role == KERNEL_VMA_ROLE_STACK || (vma->flags & KERNEL_VMA_GROWSDOWN);
+}
 
 /*
  * A prepared edit reserves every descriptor it can need without changing the

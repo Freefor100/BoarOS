@@ -80,6 +80,30 @@ static void *lock_admission_actor(void *argument)
 }
 static enum kernel_mm_status map(uint64_t at,uint64_t len,uint32_t prot,uint32_t flags)
 { uint64_t out=0; return kernel_mm_mmap_anonymous(&mm,at,len,prot,KERNEL_MM_MAP_FIXED|flags,&out); }
+static _Thread_local int pause_growth;
+static atomic_int growth_entered,growth_resume,growth_second_done;
+static uint64_t growth_address;
+static int growth_results[2];
+enum kernel_vma_status __real_kernel_vma_set_next(const struct kernel_vma_set *,uint64_t,struct kernel_vma *);
+enum kernel_vma_status __wrap_kernel_vma_set_next(const struct kernel_vma_set *set,uint64_t address,struct kernel_vma *out)
+{
+    enum kernel_vma_status status=__real_kernel_vma_set_next(set,address,out);
+    if(pause_growth && address==growth_address) {
+        pause_growth=0;atomic_store(&growth_entered,1);
+        while(!atomic_load(&growth_resume)) sched_yield();
+    }
+    return status;
+}
+static void *growth_actor(void *argument)
+{
+    unsigned id=(unsigned)(uintptr_t)argument;
+    mm_test_attach(id+1);
+    assert(!kernel_mm_context(&mm,&mm_test_context));
+    pause_growth=id==0;
+    growth_results[id]=kernel_mm_resolve_user_fault(&mm,growth_address,KERNEL_MM_WRITE);
+    if(id==1)atomic_store(&growth_second_done,1);
+    return NULL;
+}
 static uint64_t test_detached;
 static uint64_t test_reclaim(uint64_t target)
 { return kernel_mm_reclaim_lazy(&pages,target,&test_detached); }
@@ -743,7 +767,13 @@ int main(void)
     assert(!kernel_mm_brk(&mm,0x10000,&result));
 
     const uint64_t top=UINT64_C(0x4000000);
-    assert(!kernel_mm_vma_insert_anon(&mm,top-2*P,top,RW,KERNEL_VMA_ROLE_STACK,KERNEL_VMA_FAULT_DEMAND_ZERO));
+    for (unsigned explicit=0; explicit<2; explicit++) {
+    if (explicit) {
+        limits.data_soft=1;
+        CHECK(!map(top-2*P,2*P,RW,KERNEL_MM_MAP_GROWSDOWN));
+        limits.data_soft=UINT64_MAX;
+        CHECK(map(top, P, RW, KERNEL_MM_MAP_GROWSDOWN|KERNEL_MM_MAP_SHARED)==KERNEL_MM_STATUS_INVALID_ARGUMENT);
+    } else assert(!kernel_mm_vma_insert_anon(&mm,top-2*P,top,RW,KERNEL_VMA_ROLE_STACK,KERNEL_VMA_FAULT_DEMAND_ZERO));
     stack_limit=2*P;
     assert(!kernel_mm_mprotect(&mm,top-P,P,KERNEL_MM_READ));
     CHECK(!kernel_mm_resolve_user_fault(&mm,top-3*P,KERNEL_MM_WRITE));
@@ -780,9 +810,42 @@ int main(void)
     uint64_t stack_pages=physical_page_available(&pages);
     CHECK(!kernel_mm_resolve_user_fault(&mm,top-UINT64_C(9)*1024*1024,KERNEL_MM_WRITE));
     CHECK(stack_pages-physical_page_available(&pages)<=4);
-    CHECK(!kernel_mm_vma_lookup(&mm,top-UINT64_C(9)*1024*1024,&vma) && vma.role==KERNEL_VMA_ROLE_STACK);
+    CHECK(!kernel_mm_vma_lookup(&mm,top-UINT64_C(9)*1024*1024,&vma) && kernel_vma_grows_down(&vma));
     assert(!kernel_mm_munmap(&mm,top-UINT64_C(9)*1024*1024,UINT64_C(9)*1024*1024-4*P));
     stack_limit=UINT64_MAX;
+    if (explicit) {
+        CHECK(vma.role==KERNEL_VMA_ROLE_MMAP);
+        struct kernel_mm grown_child={0};
+        CHECK(!kernel_mm_fork(&grown_child,&mm));
+        CHECK(!kernel_mm_resolve_user_fault(&grown_child,top-5*P,KERNEL_MM_WRITE));
+        CHECK(!kernel_mm_vma_lookup(&grown_child,top-5*P,&vma) && kernel_vma_grows_down(&vma));
+        CHECK(kernel_mm_vma_lookup(&mm,top-5*P,&vma)==KERNEL_MM_STATUS_NOT_MAPPED);
+        CHECK(!kernel_mm_release(&grown_child));
+        CHECK(!map(top-4*P,4*P,RW,0));
+        CHECK(kernel_mm_resolve_user_fault(&mm,top-5*P,KERNEL_MM_WRITE)==KERNEL_MM_STATUS_NOT_MAPPED);
+    }
+    CHECK(!kernel_mm_munmap(&mm,top-4*P,4*P));
+    }
+    uint64_t automatic=0;
+    CHECK(!kernel_mm_mmap_anonymous(&mm,0,P,RW,KERNEL_MM_MAP_GROWSDOWN,&automatic));
+    CHECK(!kernel_mm_vma_lookup(&mm,automatic,&vma)&&kernel_vma_grows_down(&vma)&&vma.role==KERNEL_VMA_ROLE_MMAP);
+    CHECK(!kernel_mm_munmap(&mm,automatic,P));
+    CHECK(!map(top-P,P,RW,KERNEL_MM_MAP_GROWSDOWN));
+    growth_address=top-2*P;
+    pthread_t growth_threads[2];unsigned growth_parked=mm_test_parked(2);
+    assert(!pthread_create(&growth_threads[0],NULL,growth_actor,(void *)(uintptr_t)0));
+    while(!atomic_load(&growth_entered))sched_yield();
+    assert(!pthread_create(&growth_threads[1],NULL,growth_actor,(void *)(uintptr_t)1));
+    while(!atomic_load(&growth_second_done) && mm_test_parked(2)==growth_parked)sched_yield();
+    CHECK(!atomic_load(&growth_second_done));
+    atomic_store(&growth_resume,1);
+    assert(!pthread_join(growth_threads[0],NULL)&&!pthread_join(growth_threads[1],NULL));
+    CHECK(!growth_results[0]&&!growth_results[1]);
+    CHECK(!kernel_mm_vma_lookup(&mm,growth_address,&vma)&&vma.start==growth_address&&vma.end==top);
+    CHECK(!kernel_mm_mprotect_growdown(&mm,top-P,P,KERNEL_MM_READ,0));
+    CHECK(kernel_mm_resolve_user_fault(&mm,top-3*P,KERNEL_MM_WRITE)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(!kernel_mm_munmap(&mm,top-2*P,2*P));
+    assert(!kernel_mm_vma_insert_anon(&mm,top-4*P,top,RW,KERNEL_VMA_ROLE_STACK,KERNEL_VMA_FAULT_DEMAND_ZERO));
     /* 独立共享对象阻止VMA合并，验证一次保护不按碎片数重复完成TLB。 */
     for (unsigned i=0;i<32;i++) {
         assert(!map(BASE+i*P,P,RW,KERNEL_MM_MAP_SHARED));

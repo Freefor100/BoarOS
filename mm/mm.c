@@ -3261,7 +3261,7 @@ static int may_expand_current(const struct kernel_mm_record *record,
 
 /* MAP_FIXED按全部被覆盖字节抵扣扩张量，保留Linux的检查时点。 */
 static int may_map_memory(const struct kernel_mm_record *record,
-    uint64_t start, uint64_t end, uint32_t permissions, int shared, int replace)
+    uint64_t start, uint64_t end, uint32_t permissions, int shared, int replace, int grows_down)
 {
     uint64_t covered = 0;
     struct kernel_vma vma;
@@ -3274,7 +3274,8 @@ static int may_map_memory(const struct kernel_mm_record *record,
         covered += high - low;
     }
     vma = (struct kernel_vma){.permissions = permissions,
-        .kind = shared ? KERNEL_VMA_KIND_ANON_SHARED : KERNEL_VMA_KIND_ANONYMOUS};
+        .kind = shared ? KERNEL_VMA_KIND_ANON_SHARED : KERNEL_VMA_KIND_ANONYMOUS,
+        .flags = grows_down ? KERNEL_VMA_GROWSDOWN : 0};
     return may_expand_current(record, &vma, end - start - covered);
 }
 
@@ -3328,12 +3329,14 @@ static enum kernel_mm_status mm_mmap_anonymous_impl(
         !normalize_user_permissions(permissions, &normalized) ||
         (flags & ~(KERNEL_MM_MAP_FIXED |
                    KERNEL_MM_MAP_FIXED_NOREPLACE |
-                   KERNEL_MM_MAP_SHARED | KERNEL_MM_MAP_LOCKED)) != 0U ||
+                   KERNEL_MM_MAP_SHARED | KERNEL_MM_MAP_LOCKED | KERNEL_MM_MAP_GROWSDOWN)) != 0U ||
         (flags & (KERNEL_MM_MAP_FIXED |
                   KERNEL_MM_MAP_FIXED_NOREPLACE)) ==
             (KERNEL_MM_MAP_FIXED | KERNEL_MM_MAP_FIXED_NOREPLACE)) {
         return KERNEL_MM_STATUS_INVALID_ARGUMENT;
     }
+    if ((flags & KERNEL_MM_MAP_GROWSDOWN) && (flags & KERNEL_MM_MAP_SHARED))
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
     if (length == 0U) {
         return KERNEL_MM_STATUS_INVALID_ARGUMENT;
     }
@@ -3390,7 +3393,7 @@ static enum kernel_mm_status mm_mmap_anonymous_impl(
         }
     }
     end = start + aligned_length;
-    if (!may_map_memory(record, start, end, normalized, flags & KERNEL_MM_MAP_SHARED, flags & KERNEL_MM_MAP_FIXED))
+    if (!may_map_memory(record, start, end, normalized, flags & KERNEL_MM_MAP_SHARED, flags & KERNEL_MM_MAP_FIXED, flags & KERNEL_MM_MAP_GROWSDOWN))
         return KERNEL_MM_STATUS_NO_MEMORY;
     status = admit_mapping_lock(record, start, end, flags);
     if (status) return status;
@@ -3418,7 +3421,8 @@ static enum kernel_mm_status mm_mmap_anonymous_impl(
     vma = (struct kernel_vma){
         .start = start,
         .end = end,
-        .flags = mapping_lock_flags(record, flags),
+        .flags = mapping_lock_flags(record, flags) |
+            ((flags & KERNEL_MM_MAP_GROWSDOWN) ? KERNEL_VMA_GROWSDOWN : 0),
         .backing_offset = 0U,
         .permissions = normalized,
         .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS,
@@ -3704,7 +3708,7 @@ static enum kernel_mm_status commit_file_mapping(
 
     record = plan.record;
     if (!may_map_memory(record, plan.start, plan.end, plan.permissions,
-                        flags & KERNEL_MM_MAP_SHARED, flags & KERNEL_MM_MAP_FIXED)) return KERNEL_MM_STATUS_NO_MEMORY;
+                        flags & KERNEL_MM_MAP_SHARED, flags & KERNEL_MM_MAP_FIXED, 0)) return KERNEL_MM_STATUS_NO_MEMORY;
     status = admit_mapping_lock(record, plan.start, plan.end, flags);
     if (status) return status;
     int object=kernel_open_file_kind(*file)==KERNEL_OPEN_FILE_KIND_BPF;
@@ -3959,7 +3963,7 @@ enum kernel_mm_status kernel_mm_shmat(
         }
     }
     end = start + aligned_length;
-    if (!may_map_memory(record, start, end, normalized, 1, flags & KERNEL_SHM_REMAP)) return KERNEL_MM_STATUS_NO_MEMORY;
+    if (!may_map_memory(record, start, end, normalized, 1, flags & KERNEL_SHM_REMAP, 0)) return KERNEL_MM_STATUS_NO_MEMORY;
     status = admit_mapping_lock(record, start, end, (flags & KERNEL_SHM_REMAP) ? KERNEL_MM_MAP_FIXED : 0);
     if (status) return status;
     if (kernel_shm_attachment_create(segment, start, end, 0, &attachment) !=
@@ -4936,12 +4940,14 @@ enum kernel_mm_status kernel_mm_mmap_anonymous(struct kernel_mm *mm,
         !normalize_user_permissions(permissions, &normalized) ||
         (flags & ~(KERNEL_MM_MAP_FIXED |
                    KERNEL_MM_MAP_FIXED_NOREPLACE |
-                   KERNEL_MM_MAP_SHARED | KERNEL_MM_MAP_LOCKED)) != 0U ||
+                   KERNEL_MM_MAP_SHARED | KERNEL_MM_MAP_LOCKED | KERNEL_MM_MAP_GROWSDOWN)) != 0U ||
         (flags & (KERNEL_MM_MAP_FIXED |
                   KERNEL_MM_MAP_FIXED_NOREPLACE)) ==
             (KERNEL_MM_MAP_FIXED | KERNEL_MM_MAP_FIXED_NOREPLACE)) {
         return KERNEL_MM_STATUS_INVALID_ARGUMENT;
     }
+    if ((flags & KERNEL_MM_MAP_GROWSDOWN) && (flags & KERNEL_MM_MAP_SHARED))
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
     if (length == 0U) return KERNEL_MM_STATUS_INVALID_ARGUMENT;
     if (!align_mapping_length(length, &aligned_length)) return KERNEL_MM_STATUS_NO_MEMORY;
 
@@ -5018,7 +5024,7 @@ enum kernel_mm_status kernel_mm_mmap_anonymous(struct kernel_mm *mm,
     }
 
     uint64_t end = start + aligned_length;
-    if (!may_map_memory(record, start, end, normalized, 0, 0)) {
+    if (!may_map_memory(record, start, end, normalized, 0, 0, flags & KERNEL_MM_MAP_GROWSDOWN)) {
         kernel_lock_release(&vma_guard);
         return KERNEL_MM_STATUS_NO_MEMORY;
     }
@@ -5030,7 +5036,8 @@ enum kernel_mm_status kernel_mm_mmap_anonymous(struct kernel_mm *mm,
 
     struct kernel_vma vma = {
         .start = start, .end = end,
-        .flags = mapping_lock_flags(record, flags),
+        .flags = mapping_lock_flags(record, flags) |
+            ((flags & KERNEL_MM_MAP_GROWSDOWN) ? KERNEL_VMA_GROWSDOWN : 0),
         .backing_offset = 0U, .permissions = normalized,
         .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS,
         .kind = KERNEL_VMA_KIND_ANONYMOUS, .role = KERNEL_VMA_ROLE_MMAP,
@@ -5163,6 +5170,45 @@ static enum kernel_mm_status mprotect_addition(struct kernel_mm *mm,uint64_t add
     return status;
 }
 #endif
+
+/* PROT_GROWSDOWN changes the containing stack fragment down to its current
+ * start. Serialize lookup and edit together; normal mprotect keeps its range
+ * concurrency and this uncommon operation adds no cost to that path. */
+enum kernel_mm_status kernel_mm_mprotect_growdown(struct kernel_mm *mm,
+    uint64_t address, uint64_t length, uint32_t permissions, int read_implies_exec)
+{
+    uint32_t normalized;
+    uint64_t aligned_length;
+    if ((address & BOAROS_PAGE_MASK) || !normalize_user_permissions(permissions, &normalized))
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    if (!length) return mm_mprotect_impl(mm,address,length,permissions);
+    if (!align_mapping_length(length,&aligned_length) ||
+        address > ARCH_MMU_USER_LIMIT-aligned_length) return KERNEL_MM_STATUS_NO_MEMORY;
+    MM_OPERATION(mm);
+    close_pins(&operation, 0);
+    struct kernel_vma vma;
+    enum kernel_vma_status found=kernel_vma_set_lookup(operation.record->vmas,address,&vma);
+    if (found==KERNEL_VMA_STATUS_NOT_FOUND)
+        found=kernel_vma_set_next(operation.record->vmas,address,&vma);
+    if (found==KERNEL_VMA_STATUS_NOT_FOUND) return KERNEL_MM_STATUS_NOT_MAPPED;
+    if (found) return status_from_vma(found);
+    if (vma.start >= address+aligned_length) return KERNEL_MM_STATUS_NOT_MAPPED;
+    if (!kernel_vma_grows_down(&vma)) return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    uint64_t end=address+aligned_length;
+    address=vma.start;
+    if (!read_implies_exec || !(permissions & KERNEL_MM_READ) || (permissions & KERNEL_MM_EXECUTE))
+        return mm_mprotect_impl(mm,address,end-address,permissions);
+    while (address < end) {
+        if (kernel_vma_set_lookup(operation.record->vmas,address,&vma)) return KERNEL_MM_STATUS_NOT_MAPPED;
+        uint64_t finish=vma.end < end ? vma.end : end;
+        uint32_t effective=permissions;
+        if (vma.maximum_permissions & KERNEL_MM_EXECUTE) effective |= KERNEL_MM_EXECUTE;
+        enum kernel_mm_status status=mm_mprotect_impl(mm,address,finish-address,effective);
+        if (status) return status;
+        address=finish;
+    }
+    return KERNEL_MM_STATUS_OK;
+}
 
 enum kernel_mm_status kernel_mm_mprotect_personality(struct kernel_mm *mm,
     uint64_t address, uint64_t length, uint32_t permissions, int read_implies_exec)
@@ -5914,7 +5960,7 @@ static __attribute__((noinline)) enum kernel_mm_status grow_fault_stack(struct k
     kernel_rwlock_write(&record->vma_lock, &vma_guard);
     uint64_t page = address & ~BOAROS_PAGE_MASK;
     if (kernel_vma_set_next(record->vmas, page, &vma) ||
-        vma.role != KERNEL_VMA_ROLE_STACK || !(vma.permissions & access) ||
+        !kernel_vma_grows_down(&vma) || !(vma.permissions & access) ||
         vma.end - page > kernel_task_current_stack_limit() ||
         !may_expand_current(record, &vma, vma.start - page) ||
         ((vma.flags & KERNEL_VMA_LOCKED) && !may_lock_memory(record, vma.start - page))) {
@@ -5932,7 +5978,7 @@ static __attribute__((noinline)) enum kernel_mm_status grow_fault_stack(struct k
     enum kernel_vma_status prev_status = kernel_vma_set_previous(record->vmas, page, &previous);
     if (prev_status != KERNEL_VMA_STATUS_OK && prev_status != KERNEL_VMA_STATUS_NOT_FOUND)
         __builtin_trap();
-    if (prev_status == KERNEL_VMA_STATUS_OK && previous.role != KERNEL_VMA_ROLE_STACK &&
+    if (prev_status == KERNEL_VMA_STATUS_OK && !kernel_vma_grows_down(&previous) &&
         (previous.permissions & (KERNEL_MM_READ | KERNEL_MM_WRITE | KERNEL_MM_EXECUTE)) &&
         page - previous.end < KERNEL_VMA_STACK_GUARD_PAGES * BOAROS_PAGE_SIZE) {
         kernel_lock_release(&vma_guard);

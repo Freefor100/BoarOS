@@ -92,6 +92,15 @@ int main(void)
     assert(!kernel_vma_set_trim_end(set,P,4*P,2*P));usage(set,1,1);
     assert(!kernel_vma_set_trim_end(set,P,2*P,P));usage(set,0,0);
     assert(!kernel_vma_set_destroy(&set));
+    assert(!kernel_vma_set_create(&heap,&set));
+    v=(struct kernel_vma){.start=1024*P,.end=1028*P,.permissions=3,.maximum_permissions=7,
+        .kind=KERNEL_VMA_KIND_ANONYMOUS,.role=KERNEL_VMA_ROLE_MMAP,
+        .fault_policy=KERNEL_VMA_FAULT_DEMAND_ZERO,.flags=KERNEL_VMA_GROWSDOWN};
+    assert(!kernel_vma_set_insert(set,&v));usage(set,4,0);
+    assert(!kernel_vma_set_find_topdown_gap(set,1023*P,P,1028*P,P,&gap)&&gap==767*P);
+    assert(!kernel_vma_set_find_topdown_gap(set,0,P,900*P,P,&gap)&&gap==767*P);
+    assert(!kernel_vma_set_find_topdown_gap(set,767*P,P,1028*P,P,&gap)&&gap==767*P);
+    assert(!kernel_vma_set_destroy(&set));
     /* Writable object VMAs retain MAYWRITE across mprotect. Splits, duplicate
      * mappings and fork charge exact virtual bytes; removal balances them. */
     uint64_t writable=0;
