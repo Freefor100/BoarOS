@@ -46,6 +46,8 @@ enum physical_page_status signal_owner_unexpected_resolve(const struct physical_
 { (void)allocator;(void)address;(void)page;abort(); }
 #include <assert.h>
 #include <pthread.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <stdio.h>
 
 extern void signal_owner_bind_cpu(struct kernel_cpu *);
@@ -529,6 +531,13 @@ void signal_owner_cases(unsigned *lock_calls)
     assert(!kernel_signal_child_autoreap(&leader,10));
     draining.shutdown_reaper=&leader;
     assert(kernel_signal_child_autoreap(&leader,10));
+    leader.signal_table_address=0; /* Private default dispositions are lazy. */
+    kernel_signal_ignore_sigchld(&leader);
+    assert(!leader.signal_table_address && kernel_signal_child_autoreap(&leader,17));
+    leader.signal_table_address=(uintptr_t)&table;
+    pid_t corrupt=fork();assert(corrupt>=0);
+    if(!corrupt){table.magic=0;kernel_signal_ignore_sigchld(&leader);_exit(0);}
+    int status;assert(waitpid(corrupt,&status,0)==corrupt && WIFSIGNALED(status) && WTERMSIG(status)==SIGILL);
     draining.shutdown_reaper=&member;
     assert(!kernel_signal_child_autoreap(&leader,10));
     draining.shutdown_reaper=NULL;

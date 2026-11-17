@@ -950,11 +950,13 @@ int kernel_signal_wants_sigchld(const struct kernel_task *parent)
 }
 
 /* Namespace teardown runs on the cleanup worker after the final init thread
- * has left. Clone has already provided a shared signal table; no allocation
- * or user-context admission is appropriate here. */
+ * has left. Private default dispositions have no table and no live receiver;
+ * shutdown_reaper already selects autoreap. Preserve the update when a
+ * table does exist, since another process may share those dispositions. */
 void kernel_signal_ignore_sigchld(struct kernel_task *task)
 {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    if (!task->signal_table_address) return;
     struct kernel_signal_table *table = signal_table_of(task);
     if (!table) __builtin_trap();
     table->actions[16].handler = KERNEL_SIGNAL_IGN;
