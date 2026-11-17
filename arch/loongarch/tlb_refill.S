@@ -9,6 +9,9 @@ la_tlb_refill:
     beqz $t0, .Lmissing
     lddir $t0, $t0, 1
     beqz $t0, .Lmissing
+    /* LDDIR preserves a PMD huge descriptor for LDPTE: the two loads
+     * construct its 16 MiB EntryLo halves and set PS, or select 16 KiB
+     * for an ordinary leaf. Do not treat the huge result as a table PA. */
     ldpte $t0, 0
     ldpte $t0, 1
     b .Lfill
