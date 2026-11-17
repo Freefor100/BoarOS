@@ -47,6 +47,9 @@ enum kernel_hugetlb_status kernel_hugetlb_map_fork(struct kernel_hugetlb_map *,
  * Shared munmap does not delete backing slots; release its actual map owner. */
 enum kernel_hugetlb_status kernel_hugetlb_map_unmap(struct kernel_hugetlb_map *,
     uint64_t first, uint64_t end);
+/* Read-only shared-cache residency snapshot; caller holds a stable map owner.
+ * Does not fault, acquire a data owner, or report private PTE residency. */
+int kernel_hugetlb_map_resident(struct kernel_hugetlb_map *, uint64_t index);
 /* Non-owner descendants explicitly revoked by a reserve owner's failed COW
  * must stay fault-ineligible. Caller first withdraws PTEs and confirms TLB/pins. */
 enum kernel_hugetlb_status kernel_hugetlb_map_revoke(struct kernel_hugetlb_map *, uint64_t index);

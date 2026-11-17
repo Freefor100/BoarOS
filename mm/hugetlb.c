@@ -278,6 +278,12 @@ enum kernel_hugetlb_status kernel_hugetlb_map_unmap(struct kernel_hugetlb_map *m
     }
     return KERNEL_HUGETLB_OK;
 }
+int kernel_hugetlb_map_resident(struct kernel_hugetlb_map *m,uint64_t index)
+{
+    if (!m || index>=m->count || m->mode!=KERNEL_HUGETLB_SHARED) return 0;
+    KERNEL_RAW_SCOPE(guard,&m->h->allocator->lock);
+    return m->slots[index].state==SLOT_USED && m->slots[index].adopted;
+}
 enum kernel_hugetlb_status kernel_hugetlb_map_revoke(struct kernel_hugetlb_map *m,uint64_t index)
 {
     if (!m || m->mode!=KERNEL_HUGETLB_CHILD || index>=m->count) return KERNEL_HUGETLB_INVALID;

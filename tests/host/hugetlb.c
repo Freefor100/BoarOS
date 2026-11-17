@@ -147,16 +147,22 @@ int main(void)
 
     struct kernel_hugetlb_map *shared=NULL,*shared_fork=NULL;
     assert(!kernel_hugetlb_map_create(h,1,KERNEL_HUGETLB_SHARED,0,&shared));
+    assert(!kernel_hugetlb_map_resident(shared,0));
+    assert(!kernel_hugetlb_map_resident(shared,1));
     assert(!kernel_hugetlb_map_fork(shared,&shared_fork) && shared==shared_fork);
     struct kernel_hugetlb_claim a={0},b={0};
     assert(!kernel_hugetlb_fault_begin(shared,0,0,&a));
     assert(!kernel_hugetlb_fault_begin(shared_fork,0,0,&b));
     assert(a.physical_address==b.physical_address);
     uint64_t cache=a.physical_address;
+    assert(!kernel_hugetlb_map_resident(shared,0));
     kernel_hugetlb_fault_finish(&a,0);kernel_hugetlb_fault_finish(&b,1);
     assert(!physical_page_reference_count(&allocator,cache,&refs) && refs==2);
     assert(!kernel_hugetlb_map_unmap(shared,0,1));
     physical_page_release_order(&allocator,cache,order);
+    assert(!physical_page_reference_count(&allocator,cache,&refs) && refs==1);
+    assert(kernel_hugetlb_map_resident(shared,0));
+    assert(!physical_page_reference_count(&allocator,cache,&refs) && refs==1);
     struct kernel_futex_key key={.kind=KERNEL_FUTEX_KEY_SHARED_HUGETLB,
         .identity=(uintptr_t)shared,.offset=BOAROS_PAGE_SIZE+4,.hugetlb_map=shared};
     futex_key_hold(&key); /* MM publishes an owning key while VMA is stable. */
