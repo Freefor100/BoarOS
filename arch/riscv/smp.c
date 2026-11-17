@@ -1,3 +1,4 @@
+#include <arch/riscv/vector.h>
 #include <arch/riscv/smp.h>
 #if BOAROS_MAX_CPUS > 1
 #include <arch/riscv/direct_map.h>
@@ -229,6 +230,7 @@ void riscv_smp_secondary_high(void)
     if (riscv_sv39_switch_satp(state->launch.final)) riscv_smp_fail("secondary-satp", -1);
     kernel_cpu_secondary_attach(cpu, (uintptr_t)state->stack,
                                (uintptr_t)state->stack + sizeof(state->stack));
+    if (!riscv_vector_check_hart()) riscv_smp_fail("incompatible-vector-VLEN", -1);
     uintptr_t mask = 0x6000U, clean = 0x4000U;
     asm volatile("csrc sstatus, %0; csrs sstatus, %1; csrsi sie, 2"
                  :: "r"(mask), "r"(clean) : "memory");

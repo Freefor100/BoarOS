@@ -1,3 +1,6 @@
+#if defined(__riscv)
+#include <arch/riscv/vector.h>
+#endif
 #include "private.h"
 #include "ptrace_internal.h"
 #include <kernel/errno.h>
@@ -479,6 +482,9 @@ static int copy_word_range(struct kernel_task *caller,void *buffer,uint64_t addr
 
 static int regset(struct kernel_task *caller,struct kernel_task *t,unsigned note,uint64_t address,int writing)
 {
+#if defined(__riscv)
+    if(note==RISCV_VECTOR_NOTE)return riscv_vector_ptrace(caller,t,address,writing);
+#endif
     struct {uint64_t base,length;} iov;
     int error=copy_word_range(caller,&iov,address,sizeof(iov),1);
     if (error) return error;

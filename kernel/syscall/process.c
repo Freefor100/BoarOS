@@ -1,3 +1,6 @@
+#if defined(__riscv)
+#include <arch/riscv/vector.h>
+#endif
 #include <kernel/credentials.h>
 #include <kernel/seccomp.h>
 #include <kernel/scheduler.h>
@@ -45,6 +48,13 @@ enum kernel_syscall_status syscall_handle_prctl(
     struct kernel_syscall_result *decoded)
 {
     uint32_t option = (uint32_t)request->arguments[0];
+#if defined(__riscv)
+    if(option==69 || option==70) {
+        decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value=riscv_vector_control(caller,option,request->arguments[1]);
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+#endif
     if (option==21U || option==22U) {
         decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
         decoded->value=option==21U ? __atomic_load_n(&caller->seccomp_mode,__ATOMIC_ACQUIRE) :

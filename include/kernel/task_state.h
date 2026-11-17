@@ -44,6 +44,7 @@ struct kernel_futex_pi_state;
 struct kernel_futex_pi_request;
 struct kernel_futex_request;
 struct kernel_ptrace_state;
+struct riscv_vector_state;
 struct kernel_remote_memory_request;
 
 enum kernel_thread_state {
@@ -248,6 +249,10 @@ struct kernel_task {
     struct kernel_files files;
     struct kernel_fs_context fs;
     struct arch_fpu_state fpu;
+#if !defined(BOAROS_ARCH_LOONGARCH)
+    struct riscv_vector_state *vector;
+    uint32_t vector_control;
+#endif
     struct kernel_mm mm;
     struct kernel_exec_transaction *exec_transaction;
     struct arch_switch_context context;

@@ -1,3 +1,4 @@
+#include <arch/riscv/vector.h>
 #include <arch/riscv/uaccess.h>
 #include <kernel/accounting.h>
 #include <kernel/cost.h>
@@ -398,7 +399,9 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
         switch (frame->scause) {
         case 0: case 4: case 6: signal = 7U; code = 1; break;
         case 1: case 5: case 7: signal = 11U; code = 2; break;
-        case 2: signal = 4U; code = 1; break;
+        case 2:
+            if (riscv_vector_first_use(frame)) return;
+            signal = 4U; code = 1; break;
         case 3: signal = 5U; code = 1; break;
         case 18:
             if (frame->stval == 2 || frame->stval == 3) { signal = 11U; code = 10; }
@@ -442,8 +445,8 @@ void riscv_trap_return_prepare(struct riscv_trap_frame *frame)
     /* 切换、信号恢复和exec可改变实际FS；旧trap快照不能把Dirty写回已保存状态。 */
     uint64_t live_status;
     __asm__ volatile("csrr %0, sstatus" : "=r"(live_status));
-    frame->sstatus = (frame->sstatus & ~RISCV_SSTATUS_FS_MASK) |
-                     (live_status & RISCV_SSTATUS_FS_MASK);
+    frame->sstatus = (frame->sstatus & ~(RISCV_SSTATUS_FS_MASK | RISCV_SSTATUS_VS_MASK)) |
+                     (live_status & (RISCV_SSTATUS_FS_MASK | RISCV_SSTATUS_VS_MASK));
     if (!(frame->sstatus & RISCV_SSTATUS_SPP)) kernel_cpu_account_user_return();
 }
 
