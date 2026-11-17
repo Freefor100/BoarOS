@@ -869,7 +869,9 @@ enum kernel_scheduler_status arch_process_clone_current(
         arch_frame_pc(parent_frame) > UINT64_MAX - 4U) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
-    if ((flags & LINUX_CLONE_NEWPID) && thread_clone) {
+    /* Only the running caller can change its for-children override. Reject a
+     * split thread group before allocating a task or charging RLIMIT_NPROC. */
+    if (thread_clone && ((flags & LINUX_CLONE_NEWPID) || parent->pid_for_children)) {
         *linux_result = -KERNEL_EINVAL;
         return KERNEL_SCHEDULER_STATUS_OK;
     }
