@@ -25,7 +25,7 @@ struct kernel_hstate {
 };
 struct kernel_hugetlb_map {
     struct kernel_hstate *h;
-    uint64_t count, lineage;
+    uint64_t count, lineage, resident;
     uint32_t references, mode, noreserve, registrations, mapping_borrows;
     struct huge_slot slots[];
 };
@@ -288,6 +288,11 @@ enum kernel_hugetlb_status kernel_hugetlb_map_unmap(struct kernel_hugetlb_map *m
     }
     return KERNEL_HUGETLB_OK;
 }
+uint64_t kernel_hugetlb_map_resident_pages(struct kernel_hugetlb_map *m)
+{
+    KERNEL_RAW_SCOPE(guard,&m->h->allocator->lock);
+    return m->resident << m->h->order;
+}
 int kernel_hugetlb_map_resident(struct kernel_hugetlb_map *m,uint64_t index)
 {
     if (!m || index>=m->count || m->mode!=KERNEL_HUGETLB_SHARED) return 0;
@@ -354,7 +359,7 @@ void kernel_hugetlb_fault_finish(struct kernel_hugetlb_claim *claim,int accepted
         slot->pending--;
         if (accepted) {
             slot->state=SLOT_USED;
-            if (claim->shared) slot->adopted=1;
+            if (claim->shared && !slot->adopted) { slot->adopted=1;m->resident++; }
         } else if (!claim->shared) {
             put_locked(h,find(h,claim->physical_address));
             if (!claim->cow) slot->state=SLOT_AVAILABLE;

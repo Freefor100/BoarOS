@@ -137,7 +137,8 @@ static int vma_valid(const struct kernel_vma *vma)
     if ((vma->maximum_permissions & ~KERNEL_VMA_ALL_PERMISSIONS) ||
         (vma->permissions & KERNEL_VMA_ALL_PERMISSIONS & ~vma->maximum_permissions))
         return 0;
-    if (vma->kind != KERNEL_VMA_KIND_SYSV_SHM && vma->shm_attachment)
+    if (vma->kind != KERNEL_VMA_KIND_SYSV_SHM &&
+        vma->kind != KERNEL_VMA_KIND_HUGETLB_SHARED && vma->shm_attachment)
         return 0;
     if (vma->kind == KERNEL_VMA_KIND_ANONYMOUS &&
         (vma->backing_offset != 0U || vma->backing != 0 ||
@@ -203,7 +204,8 @@ static int can_merge(const struct kernel_vma *left,
         left->maximum_permissions != right->maximum_permissions) {
         return 0;
     }
-    if (left->kind == KERNEL_VMA_KIND_SYSV_SHM ||
+    if (left->shm_attachment || right->shm_attachment ||
+        left->kind == KERNEL_VMA_KIND_SYSV_SHM ||
         right->kind == KERNEL_VMA_KIND_SYSV_SHM) {
         return 0;
     }

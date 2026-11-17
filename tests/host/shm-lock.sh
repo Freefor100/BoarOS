@@ -8,7 +8,7 @@ for shift in ${SHM_LOCK_HOST_SHIFTS:-12 14}; do
         -Itests/host/mm -Itests/host/sync -idirafter include \
         tests/host/shm_lock.c tests/host/mm/context.c kernel/credentials.c mm/shm.c kernel/namespace.c kernel/ipc_namespace.c \
         kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c \
-        kernel/physical_page.c mm/heap.c mm/memory_object.c \
+        kernel/physical_page.c mm/heap.c mm/memory_object.c mm/hugetlb.c \
         -Wl,--gc-sections,--wrap=kernel_heap_allocate_zeroed,--wrap=kernel_memory_object_create -o "$output/shm-lock-$shift"
     timeout 15s "$output/shm-lock-$shift"
 done

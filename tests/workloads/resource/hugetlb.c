@@ -1,6 +1,8 @@
 /* Run only in a disposable guest: deliberately changes its native huge pool. */
 #define _GNU_SOURCE
 #include <sys/mman.h>
+#include <sys/shm.h>
+#include <sys/ipc.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -55,6 +57,38 @@ static void pipe_owners(void)
     CHECK(counter("HugePages_Free:")==3);CHECK(!close(a[0])&&!close(a[1]));
     CHECK(counter("HugePages_Free:")==4);pass("pipe-compound-owners");
 }
+static void sysv_huge(void)
+{
+    int id=shmget(IPC_PRIVATE,huge+1,SHM_HUGETLB|0600);CHECK(id>=0);
+    CHECK(counter("HugePages_Rsvd:")==2);
+    struct shmid_ds ds;CHECK(!shmctl(id,IPC_STAT,&ds)&&ds.shm_segsz==huge+1&&!ds.shm_nattch);
+    unsigned char *a=shmat(id,0,0),*b=shmat(id,0,0);CHECK(a!=(void *)-1&&b!=(void *)-1&&a!=b);
+    CHECK(!((uintptr_t)a&(huge-1))&&!((uintptr_t)b&(huge-1)));
+    CHECK(counter("HugePages_Rsvd:")==2);
+    a[page+13]=41;a[2*huge-1]=83;CHECK(b[page+13]==41&&b[2*huge-1]==83);
+    CHECK(counter("HugePages_Free:")==2&&!counter("HugePages_Rsvd:"));
+    pid_t c=fork();CHECK(c>=0);if(!c){CHECK(!shmctl(id,IPC_STAT,&ds)&&ds.shm_nattch==4);b[page+13]=62;CHECK(!shmdt(a)&&!shmdt(b));_exit(0);}joined(c,0);
+    CHECK(a[page+13]==62&&!shmctl(id,IPC_STAT,&ds)&&ds.shm_nattch==2);
+    CHECK(!shmctl(id,IPC_RMID,0));
+    unsigned char *ro=shmat(id,0,SHM_RDONLY);CHECK(ro!=(void *)-1&&ro[page+13]==62);
+    ERROR(mprotect(ro,2*huge,PROT_READ|PROT_WRITE),EACCES);
+    ERROR(munmap(a+page,page),EINVAL);
+    CHECK(!mprotect(a+huge,huge,PROT_READ));
+    CHECK(!shmdt(a)&&!shmdt(b));CHECK(counter("HugePages_Free:")==2);
+    CHECK(!shmdt(ro));CHECK(counter("HugePages_Free:")==4&&!counter("HugePages_Rsvd:"));
+    ERROR(shmctl(id,IPC_STAT,&ds),EINVAL);
+    id=shmget(IPC_PRIVATE,1,SHM_HUGETLB|0600);CHECK(id>=0);CHECK(counter("HugePages_Rsvd:")==1);
+    CHECK(!shmctl(id,IPC_RMID,0)&&!counter("HugePages_Rsvd:"));
+    pass("sysv-huge-owners");
+}
+static void sysv_noreserve(void)
+{
+    int id=shmget(IPC_PRIVATE,1,SHM_HUGETLB|SHM_NORESERVE|0600);CHECK(id>=0);
+    unsigned char *p=shmat(id,0,0);CHECK(p!=(void *)-1);
+    CHECK(!shmctl(id,IPC_RMID,0));
+    pid_t c=fork();CHECK(c>=0);if(!c){*(volatile unsigned char *)p=1;_exit(4);}joined(c,SIGBUS);
+    CHECK(!shmdt(p));pass("sysv-noreserve-sigbus");
+}
 int main(void)
 {
     setvbuf(stdout,0,_IONBF,0);page=sysconf(_SC_PAGESIZE);CHECK(page==4096||page==16384);
@@ -86,7 +120,9 @@ int main(void)
     p=map(huge,MAP_SHARED,huge);p[huge/2+9]=31;c=fork();CHECK(c>=0);if(!c){CHECK(p[huge/2+9]==31);p[huge/2+9]=63;_exit(0);}joined(c,0);CHECK(p[huge/2+9]==63);
     CHECK(!munmap(p,huge));CHECK(counter("HugePages_Free:")==4);pass("shared-fork-offset");
     pipe_owners();
+    sysv_huge();
     free(vec);pool(0);CHECK(!counter("HugePages_Total:")&&!counter("HugePages_Free:"));
     p=map(huge,MAP_PRIVATE|MAP_NORESERVE,0);c=fork();CHECK(c>=0);if(!c){*(volatile unsigned char *)p=1;_exit(4);}joined(c,SIGBUS);CHECK(!munmap(p,huge));pass("noreserve-sigbus");
+    sysv_noreserve();
     printf("HUGETLB END %u\n",cases);return 0;
 }

@@ -1358,6 +1358,7 @@ static void drain_huge_maps(struct kernel_mm_record *record,int unused_only)
                 if (kernel_vma_set_get_at(record->vmas,i,&v)) __builtin_trap();
                 if (v.backing!=entry->map) continue;
                 used=1;
+                if (v.kind == KERNEL_VMA_KIND_HUGETLB_SHARED) break;
                 uint64_t first=v.backing_offset/ARCH_MMU_HUGE_SIZE;
                 uint64_t end=first+(v.end-v.start)/ARCH_MMU_HUGE_SIZE;
                 if (first<cursor || end>entry->pages) __builtin_trap();
@@ -3983,6 +3984,9 @@ static enum kernel_mm_status mm_munmap_impl(
     return KERNEL_MM_STATUS_OK;
 }
 
+static enum kernel_mm_status mmap_hugetlb(struct kernel_mm *, uint64_t, uint64_t,
+    uint32_t, uint32_t, int, int, uint64_t *, struct kernel_shm_segment *, uint32_t);
+
 enum kernel_mm_status kernel_mm_shmat(
     struct kernel_mm *mm,
     struct kernel_shm_segment *segment,
@@ -3993,6 +3997,15 @@ enum kernel_mm_status kernel_mm_shmat(
 {
     KERNEL_SERVICE_SCOPE(service);
     KERNEL_NO_RECLAIM_IO;
+    if (segment && segment->hugetlb) {
+        uint32_t map_flags = 0;
+        if (hint) {
+            if (flags & KERNEL_SHM_RND) hint &= ~BOAROS_PAGE_MASK;
+            map_flags = (flags & KERNEL_SHM_REMAP) ? KERNEL_MM_MAP_FIXED : KERNEL_MM_MAP_FIXED_NOREPLACE;
+        } else if (flags & KERNEL_SHM_REMAP) return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+        return mmap_hugetlb(mm, hint, segment->aligned_size, permissions, map_flags,
+            1, 0, out_address, segment, flags);
+    }
     struct kernel_mm_record *record;
     struct kernel_vma vma;
     struct kernel_vma_edit edit;
@@ -4936,9 +4949,10 @@ static void prepare_huge_registration(struct mm_huge_map *entry)
         .owner=entry,.revoke=revoke_huge_child};
 }
 
-enum kernel_mm_status kernel_mm_mmap_hugetlb(struct kernel_mm *mm,
+static enum kernel_mm_status mmap_hugetlb(struct kernel_mm *mm,
     uint64_t hint,uint64_t length,uint32_t permissions,uint32_t flags,
-    int shared,int noreserve,uint64_t *address)
+    int shared,int noreserve,uint64_t *address, struct kernel_shm_segment *segment,
+    uint32_t shm_flags)
 {
     KERNEL_NO_RECLAIM_IO;
     uint32_t normalized;
@@ -4993,23 +5007,39 @@ enum kernel_mm_status kernel_mm_mmap_hugetlb(struct kernel_mm *mm,
         return KERNEL_MM_STATUS_NO_MEMORY;
     enum kernel_mm_status locked=admit_mapping_lock(record,start,end,flags);
     if (locked) return locked;
-    struct kernel_hstate *h;
-    enum kernel_hugetlb_status hs=kernel_hstate_get_or_create(record->vma_heap,mm->allocator,ARCH_MMU_HUGE_ORDER,&h);
-    if (hs) return huge_status(hs);
-    struct mm_huge_map *entry;
-    if (kernel_heap_allocate_zeroed(record->vma_heap,1,sizeof(*entry),(void **)&entry)) {
-        kernel_hstate_put(h);return KERNEL_MM_STATUS_NO_MEMORY;
+    struct kernel_shm_attachment *attachment
+        __attribute__((cleanup(kernel_shm_attachment_release))) = 0;
+    if (segment && kernel_shm_attachment_create(segment,start,end,0,&attachment))
+        return KERNEL_MM_STATUS_NO_MEMORY;
+    struct mm_huge_map *entry = 0;
+    if (segment) {
+        for (entry=record->huge_maps; entry; entry=entry->next)
+            if (entry->map==segment->hugetlb) break;
     }
-    hs=kernel_hugetlb_map_create(h,length/ARCH_MMU_HUGE_SIZE,
-        shared?KERNEL_HUGETLB_SHARED:KERNEL_HUGETLB_PRIVATE,noreserve,&entry->map);
-    kernel_hstate_put(h);
-    if (hs) { kernel_heap_release(record->vma_heap,entry);return huge_status(hs); }
-    entry->pages=length/ARCH_MMU_HUGE_SIZE;entry->mm=*mm;
-    prepare_huge_registration(entry);
+    int new_entry = !entry;
+    if (new_entry) {
+        if (kernel_heap_allocate_zeroed(record->vma_heap,1,sizeof(*entry),(void **)&entry))
+            return KERNEL_MM_STATUS_NO_MEMORY;
+        enum kernel_hugetlb_status hs = KERNEL_HUGETLB_OK;
+        if (segment) {
+            entry->map=segment->hugetlb;
+            kernel_hugetlb_map_acquire(entry->map);
+        } else {
+            struct kernel_hstate *h = 0;
+            hs=kernel_hstate_get_or_create(record->vma_heap,mm->allocator,ARCH_MMU_HUGE_ORDER,&h);
+            if (!hs) hs=kernel_hugetlb_map_create(h,length/ARCH_MMU_HUGE_SIZE,
+                shared?KERNEL_HUGETLB_SHARED:KERNEL_HUGETLB_PRIVATE,noreserve,&entry->map);
+            if (h) kernel_hstate_put(h);
+        }
+        if (hs) { kernel_heap_release(record->vma_heap,entry);return huge_status(hs); }
+        entry->pages=length/ARCH_MMU_HUGE_SIZE;entry->mm=*mm;
+        prepare_huge_registration(entry);
+    }
     struct kernel_vma v={.start=start,.end=end,.permissions=normalized,
-        .maximum_permissions=KERNEL_VMA_ALL_PERMISSIONS,
+        .maximum_permissions=KERNEL_VMA_ALL_PERMISSIONS &
+            ((shm_flags & KERNEL_SHM_RDONLY) ? ~KERNEL_MM_WRITE : KERNEL_VMA_ALL_PERMISSIONS),
         .kind=shared?KERNEL_VMA_KIND_HUGETLB_SHARED:KERNEL_VMA_KIND_HUGETLB_PRIVATE,
-        .role=KERNEL_VMA_ROLE_MMAP,.fault_policy=KERNEL_VMA_FAULT_HUGETLB,.backing=entry->map,
+        .role=segment?KERNEL_VMA_ROLE_SYSV_SHM:KERNEL_VMA_ROLE_MMAP,.shm_attachment=attachment,.fault_policy=KERNEL_VMA_FAULT_HUGETLB,.backing=entry->map,
         .flags=mapping_lock_flags(record,flags)};
     enum kernel_mm_status status;
     if (flags&KERNEL_MM_MAP_FIXED) {
@@ -5019,10 +5049,13 @@ enum kernel_mm_status kernel_mm_mmap_hugetlb(struct kernel_mm *mm,
         if (!status) status=status_from_vma(kernel_vma_set_commit_edit(record->vmas,&edit));
     } else status=status_from_vma(kernel_vma_set_insert(record->vmas,&v));
     if (status) {
-        kernel_hugetlb_map_release(&entry->map);kernel_heap_release(record->vma_heap,entry);return status;
+        if (new_entry) { kernel_hugetlb_map_release(&entry->map);kernel_heap_release(record->vma_heap,entry); }
+        return status;
     }
-    entry->next=record->huge_maps;record->huge_maps=entry;
-    if (kernel_hugetlb_mapping_register(&entry->registration,0)) __builtin_trap();
+    if (new_entry) {
+        entry->next=record->huge_maps;record->huge_maps=entry;
+        if (kernel_hugetlb_mapping_register(&entry->registration,0)) __builtin_trap();
+    }
     drain_shared_anon(record,1);
     (void)drain_file_sources(record,1);(void)drain_elf_sources(record,1);
     *address=start;
@@ -5030,6 +5063,13 @@ enum kernel_mm_status kernel_mm_mmap_hugetlb(struct kernel_mm *mm,
     mm_operation_end(&operation);
     if (policy==KERNEL_VMA_LOCKED) (void)populate_locked(mm,start,end);
     return KERNEL_MM_STATUS_OK;
+}
+
+enum kernel_mm_status kernel_mm_mmap_hugetlb(struct kernel_mm *mm,
+    uint64_t hint,uint64_t length,uint32_t permissions,uint32_t flags,
+    int shared,int noreserve,uint64_t *address)
+{
+    return mmap_hugetlb(mm,hint,length,permissions,flags,shared,noreserve,address,0,0);
 }
 
 /* 复制期间不能迁移或借用CPU0时，退休来源留在MM；真实用户返回前

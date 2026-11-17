@@ -2405,6 +2405,7 @@ test-hugetlb-host:
 	sh tests/host/mm-base-leaf.sh
 	sh tests/host/hugetlb.sh
 	sh tests/host/mm-hugetlb.sh
+	sh tests/host/shm-hugetlb.sh
 	sh tests/host/proc-hugetlb.sh
 
 .PHONY: test-seccomp-host

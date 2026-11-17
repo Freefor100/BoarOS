@@ -26,7 +26,7 @@ def main():
     p.add_argument('--qemu', required=True)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--memory', default='768M')
-    p.add_argument('--shm-flags-only', action='store_true', help='test unsupported SysV huge creation and key lookup only')
+    p.add_argument('--shm-flags-only', action='store_true', help='test SysV huge-size flags and key lookup only')
     p.add_argument('--timeout', type=int, default=120)
     a = p.parse_args()
     a.output.mkdir(parents=True, exist_ok=False)
@@ -34,8 +34,6 @@ def main():
     program = a.output / 'init'
     source = ROOT / ('tests/workloads/resource/shm_huge_flags.c' if a.shm_flags_only else 'tests/workloads/resource/hugetlb.c')
     command = [a.cc, '-static', '-O2', '-Wall', '-Wextra', '-Werror']
-    if a.shm_flags_only:
-        command += ['-DBOAROS_EXPECT_NO_SHM_HUGETLB']
     if a.arch == 'loongarch':
         command += ['-Wl,-z,max-page-size=16384']
     command += [str(source), '-o', str(program)]
@@ -63,7 +61,7 @@ def main():
                                     stderr=subprocess.STDOUT, timeout=a.timeout)
         raw = (a.output / 'guest.log').read_text().replace('\r', '')
         cases = ('growsdown-flag-isolation', 'real-pool', 'fault-offset-mincore', 'private-fork-cow',
-                 'protect-unmap-boundaries', 'shared-fork-offset', 'pipe-compound-owners', 'noreserve-sigbus')
+                 'protect-unmap-boundaries', 'shared-fork-offset', 'pipe-compound-owners', 'sysv-huge-owners', 'noreserve-sigbus', 'sysv-noreserve-sigbus')
         markers = [line for line in raw.splitlines() if line.startswith(('HUGETLB CASE ', 'HUGETLB END ', 'HUGETLB FAIL '))]
         expected = [f'HUGETLB CASE {name} PASS' for name in cases] + [f'HUGETLB END {len(cases)}']
         if a.shm_flags_only:

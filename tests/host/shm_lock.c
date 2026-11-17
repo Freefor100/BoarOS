@@ -70,18 +70,6 @@ static struct kernel_credentials *user(uint32_t uid,uint32_t euid)
 }
 static void check_locked(int id,int expected)
 { struct kernel_shmid64_ds ds;assert(!ctl(id,KERNEL_IPC_STAT,&ds));assert(!!(ds.shm_perm.mode&KERNEL_SHM_LOCKED)==expected); }
-static void huge_flags(void)
-{
-    int32_t id=-1,existing=-1;
-    assert(kernel_shm_get(0,0,1,KERNEL_SHM_HUGETLB|0600,&id)==-KERNEL_ENOSYS&&id==-1);
-    assert(kernel_shm_get(0,123,1,KERNEL_SHM_HUGETLB|0600,&id)==-KERNEL_ENOENT);
-    assert(!kernel_shm_get(0,123,1,KERNEL_IPC_CREAT|0600,&existing));
-    assert(!kernel_shm_get(0,123,0,KERNEL_SHM_HUGETLB|0600,&id)&&id==existing);
-    assert(kernel_shm_get(0,123,0,KERNEL_SHM_HUGETLB|KERNEL_IPC_CREAT|KERNEL_IPC_EXCL|0600,&id)==-KERNEL_EEXIST);
-    assert(kernel_shm_get(0,123,2,KERNEL_SHM_HUGETLB|0600,&id)==-KERNEL_EINVAL);
-    assert(!ctl(existing,KERNEL_IPC_RMID,0));
-    puts("SHM_HUGETLB fail-closed creation and existing-key lookup passed");
-}
 static void lifecycle(void)
 {
     struct kernel_credentials *a=user(1000,1001),*b=user(1000,1001),*other=user(1002,1003);
@@ -264,7 +252,6 @@ int main(void)
     if(status){fprintf(stderr,"SHM_LOCK expected=0 actual=%d\n",status);return 1;}
     assert(!ctl(id,KERNEL_SHM_UNLOCK,0)&&!ctl(id,KERNEL_IPC_RMID,0));
     queries();
-    huge_flags();
     lifecycle();
     namespace_lifetime();
     assert(!kernel_ipc_initial_shutdown());
