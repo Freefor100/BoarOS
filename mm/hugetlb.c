@@ -351,6 +351,55 @@ void kernel_hugetlb_fault_finish(struct kernel_hugetlb_claim *claim,int accepted
     }
     *claim=(struct kernel_hugetlb_claim){0};kernel_hugetlb_map_release(&m);
 }
+enum kernel_hugetlb_status kernel_hugetlb_discard_begin(struct kernel_hugetlb_map *m,
+    uint64_t index,uint64_t address,int exclusive,struct kernel_hugetlb_discard_claim *claim)
+{
+    if (!m || !claim || claim->map || index>=m->count || m->mode==KERNEL_HUGETLB_SHARED)
+        return KERNEL_HUGETLB_INVALID;
+    struct kernel_hstate *h=m->h;uint32_t refs;
+    /* Caller owns the still-published PTE and forbids concurrent acquisition in
+     * exclusive mode, so the ref1 result cannot grow before custody transfer. */
+    if (physical_page_reference_count(h->allocator,address,&refs)) return KERNEL_HUGETLB_INVALID;
+    exclusive=exclusive && refs==1;
+    KERNEL_RAW_SCOPE(guard,&h->allocator->lock);
+    struct huge_slot *slot=&m->slots[index];struct huge_block *b=find(h,address);
+    if (!b || b->free || slot->state!=SLOT_USED) return KERNEL_HUGETLB_INVALID;
+    if (slot->pending || (m->lineage && h->closing_lineage==m->lineage)) return KERNEL_HUGETLB_BUSY;
+    int reserve=!m->noreserve && !exclusive;
+    if (reserve && h->free<=h->reserved) return KERNEL_HUGETLB_BUSY;
+    if (reserve) h->reserved++;
+    slot->pending++;acquire_locked(m);
+    *claim=(struct kernel_hugetlb_discard_claim){m,index,address,(uint32_t)exclusive,(uint32_t)reserve};
+    return KERNEL_HUGETLB_OK;
+}
+void kernel_hugetlb_discard_finish(struct kernel_hugetlb_discard_claim *claim,int accepted)
+{
+    if (!claim || !claim->map) __builtin_trap();
+    struct kernel_hugetlb_map *m=claim->map;struct kernel_hstate *h=m->h;
+    int transferred=0;
+    if (accepted && claim->exclusive) {
+        uint32_t refs;
+        if (physical_page_reference_count(h->allocator,claim->physical_address,&refs) || refs!=1) __builtin_trap();
+    }
+    {
+        KERNEL_RAW_SCOPE(guard,&h->allocator->lock);
+        struct huge_slot *slot=&m->slots[claim->index];
+        if (slot->state!=SLOT_USED || slot->pending!=1 || slot->reserved) __builtin_trap();
+        slot->pending--;
+        if (accepted) {
+            if (claim->exclusive) {
+                put_locked(h,find(h,claim->physical_address));transferred=1;
+            }
+            slot->state=SLOT_AVAILABLE;
+            if (!m->noreserve) {
+                slot->reserved=1;
+                if (!claim->reserved) h->reserved++;
+            }
+        } else if (claim->reserved) h->reserved--;
+    }
+    if (accepted && !transferred) physical_page_release_order(h->allocator,claim->physical_address,h->order);
+    *claim=(struct kernel_hugetlb_discard_claim){0};kernel_hugetlb_map_release(&m);
+}
 enum kernel_hugetlb_status kernel_hugetlb_discard(struct kernel_hugetlb_map *m,
     uint64_t index,uint64_t address)
 {

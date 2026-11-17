@@ -85,6 +85,22 @@ enum kernel_hugetlb_status kernel_hugetlb_fault_begin(struct kernel_hugetlb_map 
  * routine returns it and restores a consumed reservation atomically with pool
  * custody. Call only after MM publication/revalidation, outside MM raw locks. */
 void kernel_hugetlb_fault_finish(struct kernel_hugetlb_claim *, int accepted);
+/* Two-phase DONTNEED: begin precedes PTE withdrawal and holds the slot/map.
+ * Caller holds MM writer qualification throughout; exclusive additionally means
+ * pin admission is closed/drained and no new owner can be acquired through the
+ * old PTE until finish. begin verifies ref1, otherwise reserves extra capacity.
+ * BUSY changes nothing. finish accepted consumes exactly the detached PTE owner
+ * after TLB invalidation; rejected retains it and rolls back the preflight.
+ * Successful begin makes finish infallible under this ownership contract. */
+struct kernel_hugetlb_discard_claim {
+    struct kernel_hugetlb_map *map;
+    uint64_t index, physical_address;
+    uint32_t exclusive, reserved;
+};
+enum kernel_hugetlb_status kernel_hugetlb_discard_begin(struct kernel_hugetlb_map *,
+    uint64_t index, uint64_t physical_address, int exclusive,
+    struct kernel_hugetlb_discard_claim *);
+void kernel_hugetlb_discard_finish(struct kernel_hugetlb_discard_claim *, int accepted);
 /* Restore a private DONTNEED slot using a real detached reference after TLB
  * invalidation. A sole reference is transferred directly to free-pool custody.
  * With remaining pins/aliases restoration needs additional unreserved capacity;
