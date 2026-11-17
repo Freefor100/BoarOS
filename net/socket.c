@@ -1560,8 +1560,22 @@ static int socket_ip_route(struct kernel_socket *socket,const ip_addr_t *remote,
         else local=ip_netif_get_local_ip(interface,remote);
     }
     if(!local)return -KERNEL_ENETUNREACH;
+    if(IP_IS_V6(remote)) {
+        const ip6_addr_t *dst=ip_2_ip6(remote),*src=ip_2_ip6(local);
+        if(!ip6_addr_ismulticast(dst) && !ip6_addr_islinklocal(dst) &&
+           ip6_addr_isloopback(src) && !ip6_addr_isloopback(dst))
+            return -KERNEL_ENETUNREACH;
+        int valid=0;
+        for(unsigned i=0;i<LWIP_IPV6_NUM_ADDRESSES;i++)
+            if(ip6_addr_isvalid(netif_ip6_addr_state(interface,i)) &&
+               ip6_addr_zoneless_eq(src,netif_ip6_addr(interface,i)))valid=1;
+        if(!valid)return -KERNEL_ENETUNREACH;
+        if(!ip6_addr_has_scope(dst,IP6_UNKNOWN) &&
+           boaros_lwip_ip6_onlink(interface,dst)<0 && ip6_addr_isany(&interface->ip6_gateway))
+            return -KERNEL_ENETUNREACH;
+    }
     if(IP_IS_V6(remote) && ip6_addr_islinklocal(ip_2_ip6(remote)) &&
-        (!IP_IS_V6(local) || !ip6_addr_islinklocal(ip_2_ip6(local))))return -KERNEL_ENETUNREACH;
+        (!IP_IS_V6(local) || ip6_addr_isloopback(ip_2_ip6(local))))return -KERNEL_ENETUNREACH;
     if(IP_IS_V4(local) && !ip_addr_isany(local)) {
         if(ip_addr_ismulticast(local) || ip_2_ip4(local)->addr==PP_HTONL(0xffffffffU))return -KERNEL_EINVAL;
         /* An indexed IP_MULTICAST_IF may retain any requested address, but
@@ -5122,6 +5136,7 @@ static void fast_loopback_refresh(struct netif *netif)
 }
 #endif
 
+static void ipv6_withdraw(struct netif *);
 static void socket_set_interface_up(struct netif *netif,int up)
 {
     if (!!netif_is_up(netif)==!!up) return;
@@ -5129,6 +5144,11 @@ static void socket_set_interface_up(struct netif *netif,int up)
     fast_loopback_revoke(netif);
 #endif
     if (netif->hwaddr_len) {
+        if(!up) {
+            ipv6_withdraw(netif);
+            __builtin_memset(netif->ip6_configured,0,sizeof(netif->ip6_configured));
+            ip6_addr_set_zero(&netif->ip6_gateway);
+        }
         if (!up) {
             nd6_cleanup_netif(netif);
             netif_ip6_addr_set_state(netif,0,IP6_ADDR_INVALID);
@@ -5642,17 +5662,21 @@ void kernel_socket_network_failed(uint32_t address)
             if (!offset || !__builtin_memcmp(s->saved_local.bytes,mapped,sizeof(mapped))) {
                 __builtin_memcpy(&local_address,s->saved_local.bytes+offset,sizeof(local_address));
                 if (local_address==address) socket_schedule(s,SOCKET_WORK_DEVICE_FAILED);
-            } else if (failed && s->saved_local.family==KERNEL_SOCKET_AF_INET6 &&
-                !__builtin_memcmp(s->saved_local.bytes,netif_ip6_addr(failed,0)->addr,16) &&
-                s->saved_local.scope==netif_get_index(failed))
-                socket_schedule(s,SOCKET_WORK_DEVICE_FAILED);
+            } else if (failed && s->saved_local.family==KERNEL_SOCKET_AF_INET6) {
+                for(unsigned i=0;i<LWIP_IPV6_NUM_ADDRESSES;i++)
+                    if(!__builtin_memcmp(s->saved_local.bytes,netif_ip6_addr(failed,i)->addr,16) &&
+                       (!s->saved_local.scope || s->saved_local.scope==netif_get_index(failed))) {
+                        socket_schedule(s,SOCKET_WORK_DEVICE_FAILED);break;
+                    }
+            }
             continue;
         }
 #endif
         const ip_addr_t *local = local_ip(s);
         int affected = local && IP_IS_V4(local) && ip4_addr_get_u32(ip_2_ip4(local)) == address;
         if (!affected && local && IP_IS_V6(local) && failed)
-            affected=ip6_addr_eq(ip_2_ip6(local),netif_ip6_addr(failed,0));
+            for(unsigned i=0;i<LWIP_IPV6_NUM_ADDRESSES;i++)
+                if(ip6_addr_eq(ip_2_ip6(local),netif_ip6_addr(failed,i))){affected=1;break;}
         if (!affected && s->udp && s->connected) {
             /* Connected UDP may still bind ANY; classify before carrier removal. */
             struct netif *route = ip_route(&s->udp->local_ip,&s->udp->remote_ip);
@@ -5675,6 +5699,87 @@ void kernel_socket_network_failed(uint32_t address)
     socket_device_failed = 0;
     kernel_socket_protocol_leave(&saved);
 }
+int kernel_socket_family(const struct kernel_socket *s) {return s->family;}
+static void ipv6_withdraw(struct netif *n)
+{
+    for(unsigned i=1;i<LWIP_IPV6_NUM_ADDRESSES;i++)
+        if(n->ip6_configured[i])netif_ip6_addr_set_state_preserve_pcbs(n,i,IP6_ADDR_INVALID);
+}
+int kernel_socket_ipv6_address(uint32_t index,const uint8_t bytes[16],uint32_t prefix,int remove)
+{
+    if(prefix>128)return -KERNEL_EINVAL;
+    if(!index || index>UINT8_MAX)return -KERNEL_ENODEV;
+    ip6_addr_t address;__builtin_memcpy(address.addr,bytes,16);ip6_addr_clear_zone(&address);
+    /* Link-local provisioning remains owned by DAD startup; multicast, mapped
+     * and loopback configuration need different semantics, never fake success. */
+    if(ip6_addr_isany(&address) || ip6_addr_ismulticast(&address) ||
+       ip6_addr_islinklocal(&address) || ip6_addr_isloopback(&address) ||
+       ip6_addr_isipv4mappedipv6(&address))return -KERNEL_EINVAL;
+    struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    struct netif *n=netif_get_by_index(index);int result=-KERNEL_ENODEV;
+    if(n) {
+        if(!n->hwaddr_len)result=-KERNEL_EOPNOTSUPP;
+        else if(n->mtu<1280 && !remove)result=-KERNEL_EINVAL;
+        else {
+            int found=-1,free_slot=-1;
+            for(unsigned i=1;i<LWIP_IPV6_NUM_ADDRESSES;i++) {
+                if(n->ip6_configured[i] && ip6_addr_zoneless_eq(&address,netif_ip6_addr(n,i)))found=(int)i;
+                if(!n->ip6_configured[i] && free_slot<0)free_slot=(int)i;
+            }
+            if(remove) {
+                result=-KERNEL_EADDRNOTAVAIL;
+                if(found>=0 && n->ip6_prefix[found]==prefix) {
+                    nd6_cleanup_netif(n);n->ip6_configured[found]=0;
+                    netif_ip6_addr_set_state_preserve_pcbs(n,found,IP6_ADDR_INVALID);
+                    ip6_addr_t zero={0};netif_ip6_addr_set(n,found,&zero);
+                    result=0;
+                }
+            } else if(found>=0)result=-KERNEL_EEXIST;
+            else if(free_slot<0)result=-KERNEL_ENOBUFS;
+            else {
+                nd6_cleanup_netif(n);
+                n->ip6_prefix[free_slot]=(uint8_t)prefix;n->ip6_configured[free_slot]=1;
+                netif_ip6_addr_set(n,free_slot,&address);
+                netif_ip6_addr_set_state(n,free_slot,IP6_ADDR_TENTATIVE);
+                result=0;
+            }
+        }
+    }
+    kernel_socket_protocol_leave(&scope);return result;
+}
+int kernel_socket_ipv6_gateway(uint32_t index,const uint8_t bytes[16],int remove)
+{
+    if(index>UINT8_MAX)return -KERNEL_ENODEV;
+    ip6_addr_t gateway;__builtin_memcpy(gateway.addr,bytes,16);ip6_addr_clear_zone(&gateway);
+    if(!remove && !index && ip6_addr_islinklocal(&gateway))return -KERNEL_EINVAL;
+    struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    struct netif *n=index?netif_get_by_index(index):NULL;int result=remove?-KERNEL_ESRCH:-KERNEL_ENETUNREACH;
+    if(index && !n)result=-KERNEL_ENODEV;
+    else {
+        if(!n)for(struct netif *p=netif_list;p;p=p->next) {
+            if(remove && !ip6_addr_isany(&p->ip6_gateway)){n=p;break;}
+            if(!remove && !ip6_addr_islinklocal(&gateway) && boaros_lwip_ip6_onlink(p,&gateway)>=0){n=p;break;}
+        }
+        if(n) {
+            ip6_addr_assign_zone(&gateway,IP6_UNICAST,n);
+            if(remove) {
+                if(ip6_addr_isany(&n->ip6_gateway) || (remove==2 && !ip6_addr_eq(&gateway,&n->ip6_gateway)))result=-KERNEL_ESRCH;
+                else {nd6_cleanup_netif(n);ip6_addr_set_zero(&n->ip6_gateway);result=0;}
+            } else if(!n->hwaddr_len || !netif_is_up(n) || n->mtu<1280 || ip6_addr_isany(&gateway) ||
+                ip6_addr_ismulticast(&gateway) || ip6_addr_isloopback(&gateway) ||
+                ip6_addr_isipv4mappedipv6(&gateway) || boaros_lwip_ip6_onlink(n,&gateway)<0)result=-KERNEL_ENETUNREACH;
+            else {
+                result=0;
+                for(struct netif *p=netif_list;p;p=p->next)
+                    if(!ip6_addr_isany(&p->ip6_gateway))result=-KERNEL_EEXIST;
+                for(unsigned i=0;i<LWIP_IPV6_NUM_ADDRESSES;i++)
+                    if(ip6_addr_zoneless_eq(&gateway,netif_ip6_addr(n,i)))result=-KERNEL_EINVAL;
+                if(!result){nd6_cleanup_netif(n);ip6_addr_copy(n->ip6_gateway,gateway);}
+            }
+        }
+    }
+    kernel_socket_protocol_leave(&scope);return result;
+}
 static void interface_snapshot(struct netif *n, struct kernel_socket_interface *s)
 {
     *s = (struct kernel_socket_interface){0};
@@ -5692,6 +5797,15 @@ static void interface_snapshot(struct netif *n, struct kernel_socket_interface *
         s->ipv6_flags=128 | ((ip6_addr_istentative(state) || ip6_addr_isduplicated(state))?64:0) |
             (ip6_addr_isduplicated(state)?8:0) | (ip6_addr_isdeprecated(state)?32:0);
     }
+    _Static_assert(LWIP_IPV6_NUM_ADDRESSES==3,"snapshot address capacity");
+    for(unsigned i=1;i<LWIP_IPV6_NUM_ADDRESSES;i++)if(n->ip6_configured[i]) {
+        __builtin_memcpy(s->ipv6_static[i-1].address,netif_ip6_addr(n,i)->addr,16);
+        s->ipv6_static[i-1].prefix=n->ip6_prefix[i];
+        unsigned st=netif_ip6_addr_state(n,i);
+        s->ipv6_static[i-1].flags=128 | (!ip6_addr_isvalid(st)?64:0) |
+            (ip6_addr_isduplicated(st)?8:0);
+    }
+    __builtin_memcpy(s->ipv6_gateway,n->ip6_gateway.addr,16);
     s->hardware_type = loop ? 772 : 1;
     s->link_up = !!netif_is_link_up(n);
     if (netif_is_up(n)) s->flags |= 1;
@@ -5828,6 +5942,11 @@ int kernel_socket_interface_set_mtu(const char name[16], int32_t mtu)
 #if LWIP_ND6_ALLOW_RA_UPDATES
                     n->mtu6=next;
 #endif
+                    if (next<1280) {
+                        ipv6_withdraw(n);
+                        __builtin_memset(n->ip6_configured,0,sizeof(n->ip6_configured));
+                        ip6_addr_set_zero(&n->ip6_gateway);
+                    }
                     if (next<1280) netif_ip6_addr_set_state(n,0,IP6_ADDR_INVALID);
                     else if (ip6_addr_isinvalid(netif_ip6_addr_state(n,0)))
                         netif_create_ip6_linklocal_address(n,1);

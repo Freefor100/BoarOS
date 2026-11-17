@@ -3,8 +3,12 @@
 #include <stdint.h>
 struct boaros_lwip_tcp_context;
 struct ip_addr;
-struct kernel_lock_guard;
+struct ip6_addr;
 struct netif;
+int boaros_lwip_ip6_prefix_bits(const struct ip6_addr *,const struct ip6_addr *);
+int boaros_lwip_ip6_onlink(struct netif *,const struct ip6_addr *);
+struct netif *boaros_lwip_ip6_route(const struct ip6_addr *,const struct ip6_addr *);
+struct kernel_lock_guard;
 struct pbuf;
 struct tcp_pcb;
 struct udp_pcb;

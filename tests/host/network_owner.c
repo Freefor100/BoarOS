@@ -3927,6 +3927,173 @@ static void ipv6_linklocal(void)
     puts("PASS Ethernet IPv6 DAD, duplicate rejection, scoped bind, ND/echo contents, MTU and device failure");
 }
 
+static void ipv6_global(void)
+{
+    kernel_socket_network_initialize();
+    struct virtio_net_device device={.mac={0x52,0x54,0,0x12,0x34,0x56}};
+    struct kernel_network network={.device=&device};struct netif *n=&network.interface;
+    ip4_addr_t local={lwip_htonl(0x0a4d0002)},mask={lwip_htonl(0xffffff00)},zero={0};
+    CHECK(netif_add(n,&local,&mask,&zero,&network,interface_init,ethernet_input));
+    netif_create_ip6_linklocal_address(n,1);netif_set_up(n);netif_set_link_up(n);
+    unsigned index=netif_get_index(n);for(unsigned i=0;i<3;i++)nd6_tmr();
+    ip6_addr_t a,b,peer,off,gateway,any;ip6_addr_set_zero(&any);
+    CHECK(ip6addr_aton("2001:db8:1:2:1000::1",&a));
+    CHECK(ip6addr_aton("2001:db8:1:2:2000::1",&b));
+    CHECK(ip6addr_aton("2001:db8:1:2:2000::2",&peer));
+    CHECK(ip6addr_aton("2001:db8:99::2",&off));
+    CHECK(ip6addr_aton("fe80::2",&gateway));ip6_addr_assign_zone(&gateway,IP6_UNICAST,n);
+    const uint32_t bad_indices[]={0,255,256,257,UINT32_MAX};
+    for(unsigned i=0;i<sizeof(bad_indices)/sizeof(bad_indices[0]);i++) {
+        CHECK(kernel_socket_ipv6_address(bad_indices[i],(void *)a.addr,80,0)==-KERNEL_ENODEV);
+        if(bad_indices[i])CHECK(kernel_socket_ipv6_gateway(bad_indices[i],(void *)gateway.addr,0)==-KERNEL_ENODEV);
+    }
+    CHECK(kernel_socket_ipv6_address(index,(void *)a.addr,129,0)==-KERNEL_EINVAL);
+    CHECK(!kernel_socket_ipv6_address(index,(void *)a.addr,80,0));
+    CHECK(!kernel_socket_ipv6_address(index,(void *)b.addr,80,0));
+    CHECK(kernel_socket_ipv6_address(index,(void *)a.addr,80,0)==-KERNEL_EEXIST);
+    CHECK(kernel_socket_ipv6_address(index,(void *)peer.addr,80,0)==-KERNEL_ENOBUFS);
+    struct kernel_socket *socket=NULL;CHECK(!kernel_socket_create(&test_heap,10,SOCKET_DGRAM,0,&socket));
+    struct kernel_socket_address bindaddr={.family=10,.port=19461};memcpy(bindaddr.bytes,b.addr,16);
+    CHECK(kernel_socket_bind(socket,&bindaddr)==-KERNEL_EADDRNOTAVAIL);
+    CHECK(ip6_route(&any,&peer)==NULL);
+    for(unsigned i=0;i<3;i++)nd6_tmr();
+    CHECK(ip6_route(&any,&peer)==n && ip6_route(&any,&off)==NULL);
+    /* Route choice is longest-prefix, not netif insertion order or IPv4's
+     * default interface. The second real netif advertises a shorter /64. */
+    struct kernel_network other={.device=&device};struct netif *n2=&other.interface;
+    CHECK(netif_add(n2,&local,&mask,&zero,&other,interface_init,ethernet_input));
+    netif_set_up(n2);netif_set_link_up(n2);
+    CHECK(!kernel_socket_ipv6_address(netif_get_index(n2),(void *)a.addr,64,0));
+    for(unsigned i=0;i<3;i++)nd6_tmr();
+    netif_set_default(n2);
+    CHECK(ip6_route(&any,&peer)==n && ip6_route(&any,&off)==NULL);
+    nd6_cleanup_netif(n2);netif_set_default(NULL);netif_remove(n2);
+    CHECK(ip6_addr_eq(ip_2_ip6(ip6_select_source_address(n,&peer)),&b));
+    CHECK(!kernel_socket_bind(socket,&bindaddr));
+    struct kernel_socket_interface view;CHECK(!kernel_socket_interface_index(index,&view));
+    CHECK(view.ipv6_static[0].flags==128 && view.ipv6_static[1].flags==128);
+    unsigned char dump[4096];struct route_output encoded={.data=dump,.capacity=sizeof(dump)};
+    struct {struct route_header h;unsigned char family;} request={{17,26,0x301,99,0},10};
+    CHECK(!route_encode(&encoded,&request,17,&view,1));
+    unsigned routes=0,globals=0;
+    for(size_t at=0;at<encoded.used;) {
+        struct route_header *h=(void *)(dump+at);CHECK(h->sequence==99 && h->length>=16);
+        if(h->type==24) {unsigned char *info=(void *)(h+1);CHECK(info[0]==10);routes++;if(info[1]==80)globals++;}
+        at+=route_align(h->length);
+    }
+    CHECK(routes==6 && globals==2);
+    struct kernel_open_file_description *pin=(void *)socket;
+    unsigned char content[64];for(unsigned i=0;i<64;i++)content[i]=(unsigned char)(i*11);
+    struct kernel_uaccess_iovec iov={(uintptr_t)content,64};
+    struct kernel_socket_address remote={.family=10,.port=19460};memcpy(remote.bytes,peer.addr,16);
+    CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,64,0,&remote,NULL)==64);
+    CHECK(lwip_stats.memp[MEMP_ND6_QUEUE]->used==1);
+    CHECK(captured[54]==135 && !memcmp(captured+62,peer.addr,16));
+    unsigned char na[32]={136,0,0,0,0x60};memcpy(na+8,peer.addr,16);
+    na[24]=2;na[25]=1;memcpy(na+26,(unsigned char[]){0x52,0x55,0,0,0,2},6);
+    ipv6_inject(n,&peer,&b,na,sizeof(na));
+    CHECK(captured_size==126 && captured[20]==17 && !memcmp(captured+22,b.addr,16) &&
+          !memcmp(captured+38,peer.addr,16) && !memcmp(captured+62,content,64));
+    CHECK(!lwip_stats.memp[MEMP_ND6_QUEUE]->used);
+    CHECK(kernel_socket_ipv6_gateway(index+256,(void *)gateway.addr,0)==-KERNEL_ENODEV);
+    /* Explicit GUA source may reach a scoped link-local peer on this NIC. */
+    memcpy(remote.bytes,gateway.addr,16);remote.scope=index;
+    CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,64,0,&remote,NULL)==64);
+    CHECK(captured[54]==135 && !memcmp(captured+62,gateway.addr,16));
+    memcpy(na+8,gateway.addr,16);ipv6_inject(n,&gateway,&b,na,sizeof(na));
+    CHECK(captured_size==126 && captured[20]==17 && !memcmp(captured+22,b.addr,16) &&
+          !memcmp(captured+38,gateway.addr,16) && !memcmp(captured+62,content,64));
+    struct kernel_socket *ll_source=NULL;CHECK(!kernel_socket_create(&test_heap,10,SOCKET_DGRAM,0,&ll_source));
+    struct kernel_socket_address ll_bind={.family=10,.scope=index};memcpy(ll_bind.bytes,netif_ip6_addr(n,0)->addr,16);
+    CHECK(!kernel_socket_bind(ll_source,&ll_bind));struct kernel_open_file_description *ll_pin=(void *)ll_source;
+    memcpy(remote.bytes,peer.addr,16);remote.scope=0;
+    CHECK(kernel_socket_write_datagram(&ll_pin,NULL,&iov,1,64,0,&remote,NULL)==64);
+    /* The existing ND neighbor can be reused; the wire source stays explicit. */
+    CHECK(captured_size==126 && captured[20]==17 && !memcmp(captured+22,ll_bind.bytes,16) &&
+          !memcmp(captured+38,peer.addr,16) && !memcmp(captured+62,content,64));
+    kernel_socket_destroy(ll_source);
+    remote.scope=0;
+    CHECK(kernel_socket_ipv6_gateway(0,(void *)gateway.addr,0)==-KERNEL_EINVAL);
+    CHECK(!kernel_socket_ipv6_gateway(index,(void *)gateway.addr,0));
+    CHECK(ip6_route(&any,&off)==n);
+    memcpy(remote.bytes,off.addr,16);
+    CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,64,0,&remote,NULL)==64);
+    CHECK(captured[54]==135 && !memcmp(captured+62,gateway.addr,16));
+    CHECK(!kernel_socket_ipv6_gateway(index,(void *)gateway.addr,2));
+    CHECK(!lwip_stats.memp[MEMP_ND6_QUEUE]->used && ip6_route(&any,&off)==NULL);
+    CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,64,0,&remote,NULL)==-KERNEL_ENETUNREACH);
+    CHECK(!kernel_socket_ipv6_gateway(index,(void *)gateway.addr,0));
+    struct kernel_socket *bound_tcp=NULL;CHECK(!kernel_socket_create(&test_heap,10,SOCKET_STREAM,0,&bound_tcp));
+    struct kernel_socket_address tcp_address=bindaddr;tcp_address.port++;
+    CHECK(!kernel_socket_bind(bound_tcp,&tcp_address));struct tcp_pcb *saved_tcp=bound_tcp->tcp;
+    CHECK(kernel_socket_ipv6_address(index,(void *)b.addr,64,1)==-KERNEL_EADDRNOTAVAIL);
+    CHECK(!kernel_socket_ipv6_address(index,(void *)b.addr,80,1));
+    CHECK(!ip6_addr_isany(&n->ip6_gateway));
+    CHECK(bound_tcp->tcp==saved_tcp && !bound_tcp->error && ip6_addr_eq(ip_2_ip6(&saved_tcp->local_ip),&b));
+    kernel_socket_destroy(bound_tcp);
+    CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,64,0,&remote,NULL)==-KERNEL_ENETUNREACH);
+    CHECK(!kernel_socket_ipv6_address(index,(void *)b.addr,80,0));
+    /* Simultaneous DAD NS must fail a global address as well as link-local. */
+    ip6_addr_t solicited;ip6_addr_set_solicitednode(&solicited,b.addr[3]);ip6_addr_assign_zone(&solicited,IP6_MULTICAST,n);
+    unsigned char ns[24]={135};memcpy(ns+8,b.addr,16);
+    ipv6_inject(n,&any,&solicited,ns,sizeof(ns));
+    CHECK(ip6_addr_isduplicated(netif_ip6_addr_state(n,2)));
+    CHECK(!kernel_socket_interface_index(index,&view) && view.ipv6_static[1].flags==(128|64|8));
+    CHECK(!kernel_socket_ipv6_address(index,(void *)b.addr,80,1));
+    CHECK(!kernel_socket_ipv6_address(index,(void *)b.addr,80,0));for(unsigned i=0;i<3;i++)nd6_tmr();
+    kernel_socket_network_failed(local.addr);CHECK(socket->pending_error==-KERNEL_EIO);kernel_socket_destroy(socket);
+    CHECK(!kernel_socket_interface_set_flags((char[16]){"eth0"},0));
+    CHECK(!n->ip6_configured[1] && !n->ip6_configured[2] && ip6_addr_isany(&n->ip6_gateway));
+    CHECK(!kernel_socket_ipv6_address(index,(void *)a.addr,128,0));
+    for(unsigned i=0;i<3;i++)nd6_tmr();
+    CHECK(ip6_addr_istentative(netif_ip6_addr_state(n,1)) && !netif_is_up(n));
+    CHECK(!kernel_socket_interface_set_flags((char[16]){"eth0"},1));
+    for(unsigned i=0;i<3;i++)nd6_tmr();
+    CHECK(ip6_addr_ispreferred(netif_ip6_addr_state(n,1)));
+    CHECK(!kernel_socket_ipv6_address(index,(void *)a.addr,128,1));
+    CHECK(!kernel_socket_ipv6_address(index,(void *)a.addr,64,0));
+    CHECK(!kernel_socket_ipv6_address(index,(void *)b.addr,64,0));
+    for(unsigned i=0;i<3;i++)nd6_tmr();
+    CHECK(!kernel_socket_interface_index(index,&view));encoded.used=0;
+    CHECK(!route_encode(&encoded,&request,17,&view,1));routes=0;
+    for(size_t at=0;at<encoded.used;) {struct route_header *h=(void *)(dump+at);if(h->type==24)routes++;at+=route_align(h->length);}
+    CHECK(routes==5); /* one shared connected /64, two local /128s */
+    CHECK(!kernel_socket_ipv6_address(index,(void *)a.addr,64,1));CHECK(ip6_route(&any,&peer)==n);
+    CHECK(!kernel_socket_interface_set_mtu((char[16]){"eth0"},1200));
+    CHECK(!n->ip6_configured[1]);
+    CHECK(kernel_socket_ipv6_address(index,(void *)a.addr,80,0)==-KERNEL_EINVAL);
+    CHECK(!kernel_socket_interface_set_mtu((char[16]){"eth0"},1500));
+    CHECK(!n->ip6_configured[1]);
+    const unsigned prefixes[]={0,63,64,65,127,128};
+    for(unsigned k=0;k<sizeof(prefixes)/sizeof(prefixes[0]);k++) {
+        unsigned prefix=prefixes[k];
+        CHECK(!kernel_socket_ipv6_address(index,(void *)a.addr,prefix,0));
+        for(unsigned tick=0;tick<3;tick++)nd6_tmr();
+        ip6_addr_t target;ip6_addr_copy(target,a);
+        ((unsigned char *)target.addr)[15]^=1;
+        CHECK((ip6_route(&any,&target)==n)==(prefix<128));
+        if(prefix) {
+            ip6_addr_copy(target,a);unsigned bit=prefix-1;
+            ((unsigned char *)target.addr)[bit/8]^=(unsigned char)(128U>>(bit%8));
+            CHECK(ip6_route(&any,&target)==NULL);
+        }
+        CHECK(!kernel_socket_ipv6_address(index,(void *)a.addr,prefix,1));
+    }
+    ip6_addr_t ula;CHECK(ip6addr_aton("fd00:1234::1",&ula));
+    CHECK(!kernel_socket_ipv6_address(index,(void *)ula.addr,64,0));
+    CHECK(!kernel_socket_ipv6_address(index,(void *)a.addr,80,0));
+    for(unsigned tick=0;tick<3;tick++)nd6_tmr();
+    CHECK(ip6_addr_eq(ip_2_ip6(ip6_select_source_address(n,&peer)),&a));
+    CHECK(ip6_addr_eq(ip_2_ip6(ip6_select_source_address(n,&ula)),&ula));
+    struct kernel_socket *wrong=NULL;CHECK(!kernel_socket_create(&test_heap,10,SOCKET_DGRAM,0,&wrong));
+    CHECK(!kernel_socket_set_bound_device(wrong,"lo"));struct kernel_open_file_description *wrong_pin=(void *)wrong;
+    memcpy(remote.bytes,a.addr,16);
+    CHECK(kernel_socket_write_datagram(&wrong_pin,NULL,&iov,1,64,0,&remote,NULL)==-KERNEL_ENETUNREACH);
+    kernel_socket_destroy(wrong);
+    nd6_cleanup_netif(n);netif_remove(n);CHECK(!heap_live);
+    puts("PASS static global IPv6 arbitrary prefix, DAD, source selection, ND contents, default/withdrawal, DOWN/MTU and failure");
+}
+
 int main(int argc, char **argv)
 {
     CHECK(argc == 2);
@@ -3935,6 +4102,7 @@ int main(int argc, char **argv)
     if (!strcmp(argv[1], "raw-icmp-owner")) raw_icmp_owner();
     else if (!strcmp(argv[1], "raw-icmp-close")) raw_icmp_close();
     else if (!strcmp(argv[1], "ipv6-prepare-withdraw")) ipv6_prepare_withdraw();
+    else if (!strcmp(argv[1], "ipv6-global")) ipv6_global();
     else if (!strcmp(argv[1], "ipv6-linklocal")) ipv6_linklocal();
     else if (!strcmp(argv[1], "ipv4-options")) ipv4_options();
     else if (!strcmp(argv[1], "async-events")) async_events();

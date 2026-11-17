@@ -281,6 +281,12 @@ struct netif {
 #if LWIP_IPV6
   /** Array of IPv6 addresses for this netif. */
   ip_addr_t ip6_addr[LWIP_IPV6_NUM_ADDRESSES];
+#ifdef BOAROS_LWIP_STATIC_IPV6
+  /* Protocol-owner configuration, withdrawn on DOWN or sub-1280 MTU. */
+  u8_t ip6_configured[LWIP_IPV6_NUM_ADDRESSES];
+  u8_t ip6_prefix[LWIP_IPV6_NUM_ADDRESSES];
+  ip6_addr_t ip6_gateway;
+#endif
   /** The state of each IPv6 address (Tentative, Preferred, etc).
    * @see ip6_addr.h */
   u8_t ip6_addr_state[LWIP_IPV6_NUM_ADDRESSES];
@@ -539,6 +545,7 @@ void netif_ip6_addr_set(struct netif *netif, s8_t addr_idx, const ip6_addr_t *ad
 void netif_ip6_addr_set_parts(struct netif *netif, s8_t addr_idx, u32_t i0, u32_t i1, u32_t i2, u32_t i3);
 #define netif_ip6_addr_state(netif, i)  ((netif)->ip6_addr_state[i])
 void netif_ip6_addr_set_state(struct netif* netif, s8_t addr_idx, u8_t state);
+void netif_ip6_addr_set_state_preserve_pcbs(struct netif *netif, s8_t addr_idx, u8_t state);
 s8_t netif_get_ip6_addr_match(struct netif *netif, const ip6_addr_t *ip6addr);
 void netif_create_ip6_linklocal_address(struct netif *netif, u8_t from_mac_48bit);
 err_t netif_add_ip6_address(struct netif *netif, const ip6_addr_t *ip6addr, s8_t *chosen_idx);

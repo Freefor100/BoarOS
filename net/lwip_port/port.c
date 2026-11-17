@@ -207,3 +207,52 @@ int boaros_lwip_tcp_ingress_filter(struct tcp_pcb *pcb,struct pbuf *p,struct net
     return !protocol_hooks.tcp_ingress_filter ||
         protocol_hooks.tcp_ingress_filter(pcb,p,input,ipv6,network,network_length,header);
 }
+
+/* Fixed-size interface configuration, under the existing shared IP ownership.
+ * No separate FIB allocation or per-packet configuration snapshot is needed. */
+int boaros_lwip_ip6_prefix_bits(const ip6_addr_t *a,const ip6_addr_t *b)
+{
+    const unsigned char *x=(const void *)a->addr,*y=(const void *)b->addr;
+    unsigned bits=0;
+    for(unsigned i=0;i<16;i++) {
+        unsigned v=x[i]^y[i];
+        if(!v){bits+=8;continue;}
+        for(unsigned mask=128;!(v&mask);mask>>=1)bits++;
+        break;
+    }
+    return (int)bits;
+}
+int boaros_lwip_ip6_onlink(struct netif *n,const ip6_addr_t *destination)
+{
+    int best=-1;
+    if(ip6_addr_islinklocal(destination))return 64;
+    for(unsigned i=0;i<LWIP_IPV6_NUM_ADDRESSES;i++) {
+        if(!ip6_addr_isvalid(netif_ip6_addr_state(n,i)))continue;
+        const ip6_addr_t *a=netif_ip6_addr(n,i);
+        unsigned prefix=n->ip6_configured[i]?n->ip6_prefix[i]:128;
+        if(ip6_addr_islinklocal(a))continue;
+        int bits=boaros_lwip_ip6_prefix_bits(a,destination);
+        if(bits==128)return 128;
+        if(bits>=(int)prefix && (int)prefix>best)best=(int)prefix;
+    }
+    return best;
+}
+struct netif *boaros_lwip_ip6_route(const ip6_addr_t *source,const ip6_addr_t *destination)
+{
+    struct netif *best=NULL,*fallback=NULL;int length=-1;
+    for(struct netif *n=netif_list;n;n=n->next) {
+        if(!netif_is_up(n) || !netif_is_link_up(n) || (n->hwaddr_len && n->mtu<1280))continue;
+        int source_ok=ip6_addr_isany(source),global=0;
+        for(unsigned i=0;i<LWIP_IPV6_NUM_ADDRESSES;i++) {
+            if(!ip6_addr_isvalid(netif_ip6_addr_state(n,i)))continue;
+            const ip6_addr_t *a=netif_ip6_addr(n,i);
+            if(ip6_addr_zoneless_eq(a,source))source_ok=1;
+            if(!ip6_addr_islinklocal(a) && !ip6_addr_isloopback(a))global=1;
+        }
+        if(!source_ok)continue;
+        int prefix=boaros_lwip_ip6_onlink(n,destination);
+        if(prefix>length){best=n;length=prefix;}
+        if(global && !ip6_addr_isany(&n->ip6_gateway))fallback=n;
+    }
+    return best?best:fallback;
+}

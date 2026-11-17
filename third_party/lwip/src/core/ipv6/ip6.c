@@ -94,6 +94,12 @@ ip6_route(const ip6_addr_t *src, const ip6_addr_t *dest)
 
   LWIP_ASSERT_CORE_LOCKED();
 
+#ifdef BOAROS_LWIP_STATIC_IPV6
+  if (!ip6_addr_has_scope(dest, IP6_UNKNOWN) && !ip6_addr_has_scope(src, IP6_UNICAST) &&
+      !ip6_addr_isloopback(src)) {
+    return boaros_lwip_ip6_route(src, dest);
+  }
+#endif
   /* If single netif configuration, fast return. */
   if ((netif_list != NULL) && (netif_list->next == NULL)) {
     if (!netif_is_up(netif_list) || !netif_is_link_up(netif_list) ||
@@ -263,7 +269,7 @@ ip6_route(const ip6_addr_t *src, const ip6_addr_t *dest)
  * - Rules 4, 5, 5.5: not applicable
  * - Rule 6: not implemented
  * - Rule 7: not applicable
- * - Rule 8: limited to "prefer /64 subnet match over non-match"
+ * - Rule 8: full common prefix, capped at the configured source prefix.
  *
  * For Rule 2, we deliberately deviate from RFC 6724 Sec. 3.1 by considering
  * ULAs to be of smaller scope than global addresses, to avoid that a preferred
@@ -329,10 +335,19 @@ ip6_select_source_address(struct netif *netif, const ip6_addr_t *dest)
       cand_scope = IP6_MULTICAST_SCOPE_RESERVEDF;
     }
     cand_pref = ip6_addr_ispreferred(netif_ip6_addr_state(netif, i));
-    /* @todo compute the actual common bits, for longest matching prefix. */
+    /* Prefer the common prefix within the configured source subnet. */
     /* We cannot count on the destination address having a proper zone
      * assignment, so do not compare zones in this case. */
-    cand_bits = ip6_addr_net_zoneless_eq(cand_addr, dest); /* just 1 or 0 for now */
+#ifdef BOAROS_LWIP_STATIC_IPV6
+    cand_bits = (u8_t)boaros_lwip_ip6_prefix_bits(cand_addr, dest);
+    if (cand_bits == 128) {
+      return netif_ip_addr6(netif, i);
+    }
+    if (netif->ip6_configured[i] && cand_bits > netif->ip6_prefix[i])
+      cand_bits = netif->ip6_prefix[i];
+#else
+    cand_bits = ip6_addr_net_zoneless_eq(cand_addr, dest);
+#endif
     if (cand_bits && ip6_addr_nethost_eq(cand_addr, dest)) {
       return netif_ip_addr6(netif, i); /* Rule 1 */
     }

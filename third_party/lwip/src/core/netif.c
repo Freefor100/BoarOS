@@ -331,11 +331,18 @@ netif_add(struct netif *netif,
   for (i = 0; i < LWIP_IPV6_NUM_ADDRESSES; i++) {
     ip_addr_set_zero_ip6(&netif->ip6_addr[i]);
     netif->ip6_addr_state[i] = IP6_ADDR_INVALID;
+#ifdef BOAROS_LWIP_STATIC_IPV6
+    netif->ip6_configured[i] = 0;
+    netif->ip6_prefix[i] = 128;
+#endif
 #if LWIP_IPV6_ADDRESS_LIFETIMES
     netif->ip6_addr_valid_life[i] = IP6_ADDR_LIFE_STATIC;
     netif->ip6_addr_pref_life[i] = IP6_ADDR_LIFE_STATIC;
 #endif /* LWIP_IPV6_ADDRESS_LIFETIMES */
   }
+#ifdef BOAROS_LWIP_STATIC_IPV6
+  ip6_addr_set_zero(&netif->ip6_gateway);
+#endif
   netif->output_ip6 = netif_null_output_ip6;
 #endif /* LWIP_IPV6 */
   NETIF_SET_CHECKSUM_CTRL(netif, NETIF_CHECKSUM_ENABLE_ALL);
@@ -1497,8 +1504,8 @@ netif_ip6_addr_set_parts(struct netif *netif, s8_t addr_idx, u32_t i0, u32_t i1,
  * @param addr_idx index of the IPv6 address
  * @param state the new IPv6 address state
  */
-void
-netif_ip6_addr_set_state(struct netif *netif, s8_t addr_idx, u8_t state)
+static void
+netif_ip6_addr_set_state_mode(struct netif *netif, s8_t addr_idx, u8_t state, int preserve_pcbs)
 {
   u8_t old_state;
   LWIP_ASSERT_CORE_LOCKED();
@@ -1521,7 +1528,7 @@ netif_ip6_addr_set_state(struct netif *netif, s8_t addr_idx, u8_t state)
 
     if (old_valid && !new_valid) {
       /* address about to be removed by setting invalid */
-      netif_do_ip_addr_changed(netif_ip_addr6(netif, addr_idx), NULL);
+      if (!preserve_pcbs) netif_do_ip_addr_changed(netif_ip_addr6(netif, addr_idx), NULL);
       /* @todo: remove mib2 ip6 entries? */
     }
     netif->ip6_addr_state[addr_idx] = state;
@@ -1553,6 +1560,13 @@ netif_ip6_addr_set_state(struct netif *netif, s8_t addr_idx, u8_t state)
               addr_idx, netif->name[0], netif->name[1], ip6addr_ntoa(netif_ip6_addr(netif, addr_idx)),
               netif_ip6_addr_state(netif, addr_idx)));
 }
+
+void netif_ip6_addr_set_state(struct netif *netif,s8_t index,u8_t state)
+{ netif_ip6_addr_set_state_mode(netif,index,state,0); }
+/* Address configuration must not abort established connections or rewrite
+ * bound sources. Device removal still invokes the original PCB cleanup. */
+void netif_ip6_addr_set_state_preserve_pcbs(struct netif *netif,s8_t index,u8_t state)
+{ netif_ip6_addr_set_state_mode(netif,index,state,1); }
 
 /**
  * Checks if a specific local address is present on the netif and returns its

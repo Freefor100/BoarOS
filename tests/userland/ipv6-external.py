@@ -20,6 +20,7 @@ p.add_argument('--arch',choices=PROFILES,default='riscv')
 p.add_argument('--kernel',type=Path,required=True)
 p.add_argument('--program',type=Path,required=True)
 p.add_argument('--qemu')
+p.add_argument('--global-address',action='store_true',help='static /64 UDP then /128/default-gateway TCP workload')
 p.add_argument('--cpus',type=int,default=1)
 a=p.parse_args();profile=PROFILES[a.arch]
 (ROOT/'build').mkdir(exist_ok=True)
@@ -32,8 +33,8 @@ def checksum(data):
     while value>>16:value=(value&65535)+(value>>16)
     return (~value)&65535
 def injected_udp(data,mode):
-    src=socket.inet_pton(socket.AF_INET6,'fe80::2')
-    dst=socket.inet_pton(socket.AF_INET6,'fe80::5054:ff:fe12:3456')
+    src=socket.inet_pton(socket.AF_INET6,'2001:db8:1::2' if a.global_address else 'fe80::2')
+    dst=socket.inet_pton(socket.AF_INET6,'2001:db8:1::100' if a.global_address else 'fe80::5054:ff:fe12:3456')
     udp=struct.pack('!HHHH',19460,19461,len(data)+8,0)+data
     value=checksum(src+dst+struct.pack('!I3xB',len(udp),17)+udp) or 65535
     if mode=='zero':value=0
@@ -69,7 +70,7 @@ qemu=a.qemu or os.environ.get('QEMU_RISCV64' if a.arch=='riscv' else 'QEMU_LOONG
 command=profile.boot(qemu,a.kernel.resolve(),'512M');command[command.index('-smp')+1]=str(a.cpus)
 command+=['-drive',f'file={disk},if=none,format=raw,id=root','-device',profile.block('modern')]
 device='virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1' if a.arch=='riscv' else 'virtio-net-pci,netdev=n0,addr=2,disable-legacy=on'
-command+=['-netdev','user,id=n0,ipv6=on,ipv6-prefix=fe80::,ipv6-prefixlen=64,ipv6-host=fe80::2','-device',device+',mac=52:54:00:12:34:56']
+command+=['-netdev',('user,id=n0,ipv6=on,ipv6-prefix=2001:db8:1::,ipv6-prefixlen=64,ipv6-host=2001:db8:1::2' if a.global_address else 'user,id=n0,ipv6=on,ipv6-prefix=fe80::,ipv6-prefixlen=64,ipv6-host=fe80::2'),'-device',device+',mac=52:54:00:12:34:56']
 if a.arch=='riscv':command+=['-global','virtio-mmio.force-legacy=false']
 log=work/'guest.log'
 def identity(path):
@@ -96,6 +97,7 @@ for name,path in [('kernel',a.kernel),('program',a.program)]:
 text=log.read_text()
 if 'IPV6 EXTERNAL ALL PASS' not in text or 'IPV6 EXTERNAL FAIL' in text or not profile.root_poweroff_success(text):
     raise RuntimeError(f'incomplete IPv6 external contract or cleanup: {log}')
+if a.global_address and 'IPV6 EXTERNAL STATIC CLEANUP PASS' not in text:raise RuntimeError('static global cleanup not complete')
 manifest['passed']=True
 (work/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
 disk.unlink();print(f'PASS external IPv6 {a.arch} cpus={a.cpus}: {log}')

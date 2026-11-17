@@ -570,7 +570,7 @@ nd6_input(struct pbuf *p, struct netif *inp)
   }
   case ICMP6_TYPE_RA: /* Router Advertisement. */
   {
-#ifdef BOAROS_LWIP_LINKLOCAL_ONLY
+#ifdef BOAROS_LWIP_NO_ROUTER_DISCOVERY
     /* Do not install invisible default routes/prefixes in link-local mode. */
     pbuf_free(p);
     return;
@@ -827,7 +827,7 @@ nd6_input(struct pbuf *p, struct netif *inp)
   }
   case ICMP6_TYPE_RD: /* Redirect */
   {
-#ifdef BOAROS_LWIP_LINKLOCAL_ONLY
+#ifdef BOAROS_LWIP_NO_ROUTER_DISCOVERY
     pbuf_free(p);
     return;
 #endif
@@ -1667,6 +1667,9 @@ nd6_clear_destination_cache(void)
 static int
 nd6_is_prefix_in_netif(const ip6_addr_t *ip6addr, struct netif *netif)
 {
+#ifdef BOAROS_LWIP_STATIC_IPV6
+  return boaros_lwip_ip6_onlink(netif, ip6addr) >= 0;
+#else
   s8_t i;
 
   /* Check to see if the address matches an on-link prefix. */
@@ -1689,6 +1692,7 @@ nd6_is_prefix_in_netif(const ip6_addr_t *ip6addr, struct netif *netif)
     }
   }
   return 0;
+#endif
 }
 
 /**
@@ -2018,6 +2022,11 @@ nd6_get_next_hop_entry(const ip6_addr_t *ip6addr, struct netif *netif)
         /* Destination in local link. */
         dest->pmtu = netif_mtu6(netif);
         ip6_addr_copy(dest->next_hop_addr, dest->destination_addr);
+#ifdef BOAROS_LWIP_STATIC_IPV6
+      } else if (!ip6_addr_isany(&netif->ip6_gateway)) {
+        dest->pmtu = netif_mtu6(netif);
+        ip6_addr_copy(dest->next_hop_addr, netif->ip6_gateway);
+#endif
 #ifdef LWIP_HOOK_ND6_GET_GW
       } else if ((next_hop_addr = LWIP_HOOK_ND6_GET_GW(netif, ip6addr)) != NULL) {
         /* Next hop for destination provided by hook function. */

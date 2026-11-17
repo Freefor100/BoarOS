@@ -27,10 +27,11 @@
   不宣称支持策略路由、增删改、netlink multicast 或用户态单播。
 - LINK 导出真实名称、ifindex、硬件类型/MAC、MTU、UP/RUNNING/LOWER_UP、
   operstate。内核没有 qdisc，导出 `noqueue` / txqlen 0，不伪造统计计数。
-- ADDR 导出现有单 IPv4 地址/掩码、广播地址，以及 netif 确实持有的 loopback
-  IPv6 `::1`。没有配置的 Ethernet IPv6 地址不会凭空出现在结果里。
-- ROUTE 导出现有 IPv4 直连网段、本地地址、IPv6 loopback 及实际配置的
-  唯一 IPv4 default gateway。没有 gateway 时不输出默认路由。
+- ADDR 导出现有单 IPv4 地址/掩码、广播地址，以及 netif 确实持有的 IPv6
+  loopback、link-local 与最多两个静态地址；包含真实前缀和 tentative/dadfailed。
+- ROUTE 导出现有 IPv4 直连网段、本地地址与唯一 IPv4 default，以及 IPv6
+  本地/connected 路由和显式 IPv6 default gateway。IPv6 相同 connected prefix
+  去重，tentative/duplicate 地址不生成可用路由，没有 gateway 时不输出默认路由。
   不把 Linux 的任意 FIB / namespace / rule / 多地址模型假装为已有能力。
 
 回复使用四字节对齐并清零 padding，保持请求 sequence；dump 项标记 MULTI，
