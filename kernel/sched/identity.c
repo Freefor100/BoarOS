@@ -257,21 +257,12 @@ int process_identity_admit_locked(const struct kernel_task *task)
     return 0;
 }
 
-enum kernel_pid_status process_identity_create_numbers(struct kernel_task *task,
-    struct kernel_task *parent, int thread_clone, const kernel_pid_t *requests, size_t count, int may_set_tid)
+/* Consume the caller's namespace reference (the permanent root needs none). */
+static enum kernel_pid_status reserve_identity(struct kernel_task *task,
+    int thread_clone, struct kernel_pid_registry *space,
+    const kernel_pid_t *requests, size_t count, int may_set_tid)
 {
-    if (count > KERNEL_PID_NAMESPACE_MAX_DEPTH || (count && !requests)) return KERNEL_PID_STATUS_INVALID;
-    struct kernel_pid_registry *space;
-    int pinned = 0;
-    {
-        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        space = parent ? process_pid_children_locked(parent) : &scheduler.identities;
-        if (!space || (thread_clone && space != process_pid_active(parent)))
-            return KERNEL_PID_STATUS_INVALID;
-        if (count > space->depth + 1U) return KERNEL_PID_STATUS_INVALID;
-        if (space != &scheduler.identities) { kernel_pid_registry_get(space); pinned = 1; }
-    }
-    struct kernel_pid *id = 0;
+    struct kernel_pid *id = NULL;
     process_identity_collect();
     size_t size = kernel_pid_storage_size(space);
     enum kernel_pid_status status = KERNEL_PID_STATUS_NO_MEMORY;
@@ -289,7 +280,7 @@ enum kernel_pid_status process_identity_create_numbers(struct kernel_task *task,
         }
     }
 unpin:
-    if (pinned) {
+    if (space != &scheduler.identities) {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         kernel_pid_registry_put(space);
     }
@@ -298,6 +289,47 @@ unpin:
         process_identity_collect(); /* A shutdown may be waiting for this reservation. */
     }
     return status;
+}
+
+enum kernel_pid_status process_identity_create_numbers(struct kernel_task *task,
+    struct kernel_task *parent, int thread_clone, const kernel_pid_t *requests, size_t count, int may_set_tid)
+{
+    if (count > KERNEL_PID_NAMESPACE_MAX_DEPTH || (count && !requests)) return KERNEL_PID_STATUS_INVALID;
+    struct kernel_pid_registry *space;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        space = parent ? process_pid_children_locked(parent) : &scheduler.identities;
+        if (!space || (thread_clone && space != process_pid_active(parent)) ||
+            count > space->depth + 1U) return KERNEL_PID_STATUS_INVALID;
+        if (space != &scheduler.identities) kernel_pid_registry_get(space);
+    }
+    return reserve_identity(task, thread_clone, space, requests, count, may_set_tid);
+}
+
+enum kernel_pid_status process_identity_create_new_namespace(struct kernel_task *task,
+    struct kernel_task *parent, const kernel_pid_t *requests, size_t count, int may_set_tid)
+{
+    struct kernel_pid_registry *base, *space = NULL;
+    if (!parent || count > KERNEL_PID_NAMESPACE_MAX_DEPTH || (count && !requests))
+        return KERNEL_PID_STATUS_INVALID;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        base = process_pid_active(parent);
+        if (!base || base != process_pid_children_locked(parent) || count > base->depth + 2U)
+            return KERNEL_PID_STATUS_INVALID;
+        if (base->depth == KERNEL_PID_NAMESPACE_MAX_DEPTH) return KERNEL_PID_STATUS_DEPTH_LIMIT;
+        if (base != &scheduler.identities) kernel_pid_registry_get(base);
+    }
+    int error = process_pid_namespace_create(base, &scheduler.identity_heap, &space);
+    if (base != &scheduler.identities) {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        kernel_pid_registry_put(base);
+    }
+    if (error) {
+        process_identity_collect();
+        return KERNEL_PID_STATUS_NO_MEMORY;
+    }
+    return reserve_identity(task, 0, space, requests, count, may_set_tid);
 }
 
 enum kernel_pid_status process_identity_create(struct kernel_task *task,

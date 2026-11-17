@@ -18,7 +18,7 @@ enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *heap,
     size_t count, size_t size, void **owner)
 {
     (void)heap; assert(!cpu.raw_locks);
-    if(fail_allocation) { fail_allocation=0; return KERNEL_HEAP_STATUS_EMPTY; }
+    if(fail_allocation && !--fail_allocation) return KERNEL_HEAP_STATUS_EMPTY;
     *owner = calloc(count, size); if (!*owner) return KERNEL_HEAP_STATUS_EMPTY;
     __atomic_fetch_add(&allocations,1,__ATOMIC_RELAXED); return KERNEL_HEAP_STATUS_OK;
 }
@@ -258,6 +258,79 @@ int main(void)
     publish(&init, NULL); cpu.current = &init;
     assert(init.signal_unkillable);
     assert(init.tid == 1 && process_pid_active(&init) == &scheduler.identities);
+    /* NEWPID owns its destination; failure must not install a for-children
+     * override or leave an ancestor reservation behind. */
+    {
+        struct kernel_task fresh = {0};
+        kernel_pid_t ids[] = {1, 41};
+        unsigned refs = scheduler.identities.references, live = allocations;
+        for (unsigned fail = 1; fail <= 2; ++fail) {
+            fail_allocation = fail;
+            assert(process_identity_create_new_namespace(&fresh, &init,
+                ids, 2, 1) == KERNEL_PID_STATUS_NO_MEMORY);
+            assert(allocations == live && scheduler.identities.references == refs);
+        }
+        ids[1] = 1;
+        assert(process_identity_create_new_namespace(&fresh, &init,
+            ids, 2, 1) == KERNEL_PID_STATUS_EXISTS);
+        assert(allocations == live && scheduler.identities.references == refs);
+        ids[1] = 41;
+        assert(!process_identity_create_new_namespace(&fresh, &init, ids, 2, 1));
+        struct kernel_pid_registry *space = process_pid_active(&fresh);
+        assert(space->parent == process_pid_active(&init) && fresh.tid == 41);
+        {
+            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+            assert(process_pid_children_locked(&init) == &scheduler.identities);
+            assert(kernel_pid_find(&scheduler.identities, 41) == NULL);
+            assert(!process_identity_admit_locked(&fresh));
+            kernel_pid_registry_disable(space);
+            assert(process_identity_admit_locked(&fresh) == -KERNEL_ENOMEM);
+        }
+        release(&fresh);
+        assert(allocations == live && scheduler.identities.references == refs);
+        assert(scheduler.pid_allocator.allocated == 1);
+        assert(process_identity_create_new_namespace(&fresh, &init, ids, 2, 0) ==
+               KERNEL_PID_STATUS_PERMISSION);
+        assert(allocations == live && scheduler.identities.references == refs);
+        fresh.group_leader = &fresh; fresh.parent = &init;
+        assert(!process_identity_create_new_namespace(&fresh, &init, ids, 2, 1));
+        {
+            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+            assert(!process_identity_admit_locked(&fresh));
+            process_identity_commit_locked(&fresh);
+            assert(process_pid_reaper_locked(process_pid_active(&fresh)) == &fresh);
+            assert(process_pid_children_locked(&fresh) == process_pid_active(&fresh));
+        }
+        struct kernel_task nested = {0};
+        assert(!process_identity_create_new_namespace(&nested, &fresh, NULL, 0, 0));
+        {
+            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+            kernel_pid_registry_disable(process_pid_active(&fresh));
+            assert(process_identity_admit_locked(&nested) == -KERNEL_ENOMEM);
+        }
+        release(&nested); release(&fresh);
+        assert(allocations == live && scheduler.identities.references == refs);
+    }
+    {
+        struct kernel_task *chain = calloc(KERNEL_PID_NAMESPACE_MAX_DEPTH, sizeof(*chain));
+        assert(chain);
+        struct kernel_task *parent = &init;
+        unsigned live = allocations, refs = scheduler.identities.references;
+        for (unsigned depth = 0; depth < KERNEL_PID_NAMESPACE_MAX_DEPTH; ++depth) {
+            struct kernel_task *task = &chain[depth];
+            task->parent = parent; task->group_leader = task;
+            assert(!process_identity_create_new_namespace(task, parent, NULL, 0, 0));
+            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+            assert(!process_identity_admit_locked(task));
+            process_identity_commit_locked(task);
+            parent = task;
+        }
+        assert(process_identity_create_new_namespace(&failed, parent, NULL, 0, 0) ==
+               KERNEL_PID_STATUS_DEPTH_LIMIT);
+        for (unsigned n = KERNEL_PID_NAMESPACE_MAX_DEPTH; n; --n) release(&chain[n-1]);
+        free(chain);
+        assert(allocations == live && scheduler.identities.references == refs);
+    }
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         assert(process_pid_reaper_locked(&scheduler.identities) == &init);
@@ -265,6 +338,7 @@ int main(void)
         assert(process_pid_active(&init) == &scheduler.identities);
         assert(process_pid_children_locked(&init) == &child);
     }
+    assert(process_identity_create_new_namespace(&failed, &init, NULL, 0, 0) == KERNEL_PID_STATUS_INVALID);
     /* A new namespace cannot begin with a requested non-init TID. Failure must
      * release the prepared heap object and the temporary namespace reference. */
     assert(process_identity_create_numbers(&failed, &init, 0, (kernel_pid_t[]){2}, 1, 1) == KERNEL_PID_STATUS_INVALID);

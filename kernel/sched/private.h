@@ -188,6 +188,7 @@ struct kernel_pid_registry *process_pid_namespace_registry(struct kernel_namespa
 struct kernel_pid_registry *process_pid_active(const struct kernel_task *);
 struct kernel_pid_registry *process_pid_children_locked(const struct kernel_task *);
 int process_pid_children_check_locked(struct kernel_task *, struct kernel_pid_registry *);
+int process_clone_admit(struct kernel_task *, struct kernel_task *, uint64_t flags);
 int process_pid_children_install_locked(struct kernel_task *, struct kernel_pid_registry *);
 struct kernel_task *process_pid_reaper_locked(struct kernel_pid_registry *);
 int process_identity_admit_locked(const struct kernel_task *);
@@ -196,6 +197,8 @@ struct kernel_task *process_pid_namespace_kill_target_locked(struct kernel_pid_r
 int process_pid_namespace_defer_locked(struct kernel_task *);
 void kernel_signal_ignore_sigchld(struct kernel_task *);
 
+enum kernel_pid_status process_identity_create_new_namespace(struct kernel_task *,
+    struct kernel_task *, const kernel_pid_t *, size_t, int may_set_tid);
 enum kernel_pid_status process_identity_create_numbers(struct kernel_task *,
     struct kernel_task *, int, const kernel_pid_t *, size_t, int may_set_tid);
 enum kernel_pid_status process_identity_create(struct kernel_task *task,

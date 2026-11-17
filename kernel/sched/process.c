@@ -76,6 +76,7 @@
 #define LINUX_CLONE_FS UINT64_C(0x200)
 #define LINUX_CLONE_NEWNS UINT64_C(0x20000)
 #define LINUX_CLONE_NEWUTS UINT64_C(0x04000000)
+#define LINUX_CLONE_NEWPID UINT64_C(0x20000000)
 #define LINUX_CLONE_NEWIPC UINT64_C(0x08000000)
 #define LINUX_CLONE_FILES UINT64_C(0x400)
 #define LINUX_CLONE_SIGHAND UINT64_C(0x800)
@@ -696,6 +697,18 @@ struct kernel_namespace *kernel_task_ipc_namespace(void)
     if(task && task->arch.user_mode && !task->ipc_namespace)__builtin_trap();
     return task && task->ipc_namespace?task->ipc_namespace:kernel_ipc_initial();
 }
+/* A successful quota charge belongs to child, including on later errors:
+ * the common clone unwind releases it with the other child resources. */
+int process_clone_admit(struct kernel_task *child, struct kernel_task *parent, uint64_t flags)
+{
+    int error = kernel_nproc_acquire(child, parent);
+    if (error) return error;
+    if ((flags & (LINUX_CLONE_NEWNS | LINUX_CLONE_NEWUTS | LINUX_CLONE_NEWIPC | LINUX_CLONE_NEWPID)) &&
+        !kernel_credentials_capable(kernel_credentials_current(), KERNEL_CAP_SYS_ADMIN))
+        return -KERNEL_EPERM;
+    return 0;
+}
+
 static int clone_namespaces(struct kernel_task *child,struct kernel_task *parent,uint64_t flags)
 {
     if(!parent->uts_namespace || !parent->ipc_namespace)__builtin_trap();
@@ -855,12 +868,10 @@ enum kernel_scheduler_status arch_process_clone_current(
         arch_frame_pc(parent_frame) > UINT64_MAX - 4U) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
-    if ((flags & (LINUX_CLONE_NEWNS|LINUX_CLONE_NEWUTS|LINUX_CLONE_NEWIPC)) &&
-        !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN)) {
-        *linux_result=-KERNEL_EPERM;
+    if ((flags & LINUX_CLONE_NEWPID) && thread_clone) {
+        *linux_result = -KERNEL_EINVAL;
         return KERNEL_SCHEDULER_STATUS_OK;
     }
-
     status = allocate_task_pages(&child);
     if (status == KERNEL_SCHEDULER_STATUS_NO_MEMORY) {
         *linux_result = -KERNEL_ENOMEM;
@@ -874,7 +885,7 @@ enum kernel_scheduler_status arch_process_clone_current(
         kernel_credentials_clone(parent->files.heap,parent->credentials);
     if (!child->credentials)
         return finish_clone_failure(child,-KERNEL_ENOMEM,linux_result,KERNEL_SCHEDULER_STATUS_OK);
-    int admitted=kernel_nproc_acquire(child,parent);
+    int admitted=process_clone_admit(child,parent,flags);
     if(admitted)return finish_clone_failure(child,admitted,linux_result,KERNEL_SCHEDULER_STATUS_OK);
     child->limits=thread_clone?kernel_resource_limits_get(parent->limits):
         kernel_resource_limits_create(parent->limits->heap,parent->limits);
@@ -965,19 +976,22 @@ enum kernel_scheduler_status arch_process_clone_current(
         may_set_tid = kernel_credentials_capable(cred, KERNEL_CAP_SYS_ADMIN) ||
                       kernel_credentials_capable(cred, KERNEL_CAP_CHECKPOINT_RESTORE);
     }
-    pid_status = process_identity_create_numbers(child, parent, thread_clone,
-        requested_tids, requested_count, may_set_tid);
+    pid_status = (flags & LINUX_CLONE_NEWPID)
+        ? process_identity_create_new_namespace(child, parent, requested_tids, requested_count, may_set_tid)
+        : process_identity_create_numbers(child, parent, thread_clone, requested_tids, requested_count, may_set_tid);
     if (pid_status != KERNEL_PID_STATUS_OK) {
         return finish_clone_failure(
             child,
             pid_status == KERNEL_PID_STATUS_PERMISSION ? -KERNEL_EPERM :
             pid_status == KERNEL_PID_STATUS_EXISTS ? -KERNEL_EEXIST :
+            pid_status == KERNEL_PID_STATUS_DEPTH_LIMIT ? -KERNEL_ENOSPC :
             pid_status == KERNEL_PID_STATUS_INVALID ? -KERNEL_EINVAL :
             pid_status == KERNEL_PID_STATUS_EXHAUSTED ? -KERNEL_EAGAIN : -KERNEL_ENOMEM,
             linux_result,
             (pid_status == KERNEL_PID_STATUS_NO_MEMORY || pid_status == KERNEL_PID_STATUS_PERMISSION ||
              pid_status == KERNEL_PID_STATUS_EXHAUSTED || pid_status == KERNEL_PID_STATUS_EXISTS ||
-             pid_status == KERNEL_PID_STATUS_INVALID || pid_status == KERNEL_PID_STATUS_NAMESPACE_DEAD)
+             pid_status == KERNEL_PID_STATUS_INVALID || pid_status == KERNEL_PID_STATUS_DEPTH_LIMIT ||
+             pid_status == KERNEL_PID_STATUS_NAMESPACE_DEAD)
                 ? KERNEL_SCHEDULER_STATUS_OK
                 : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
     }

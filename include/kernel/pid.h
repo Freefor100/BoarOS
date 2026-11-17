@@ -19,6 +19,7 @@ enum kernel_pid_status {
     KERNEL_PID_STATUS_NAMESPACE_DEAD,
     KERNEL_PID_STATUS_NO_MEMORY,
     KERNEL_PID_STATUS_PERMISSION,
+    KERNEL_PID_STATUS_DEPTH_LIMIT,
 };
 
 struct kernel_pid_allocator {

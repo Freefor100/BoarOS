@@ -27,7 +27,7 @@
 
 ### 2. 已接入的 active/for-children 与剩余 syscall 工作
 
-active 直接由 TID 身份取得，非 leader exec 的旧容器必要时从转移后的 TGID 取得，不另存一份可漂移的任务 active 指针。`pid_for_children` 为 NULL 时表示 active；只有覆盖时才持有额外 registry 引用，资源退出时归还。内部安装函数仅允许自身或后代，不改变调用者 active。创建先固定目标引用、按实际深度在锁外准备身份存储，再预留全部编号；普通线程必须与 parent active 相同。内部 `task->tid` 仍是初始层编号，不能直接用作未来 namespace 用户输出。
+active 直接由 TID 身份取得，非 leader exec 的旧容器必要时从转移后的 TGID 取得，不另存一份可漂移的任务 active 指针。`pid_for_children` 为 NULL 时表示 active；只有覆盖时才持有额外 registry 引用，资源退出时归还。内部安装函数仅允许自身或后代，不改变调用者 active。普通 clone 固定 for-children 目标，线程要求其与 active 相同。调度器内部的新建路径要求 active 与 for-children 一致，固定该父层后在锁外准备独立子层，以子层为目标预留编号，不修改父任务。预留成功后身份持有子层；失败归还准备引用和各层编号。最终发布仍在身份锁内复查祖先是否接受创建。公开 clone/unshare 尚不接受 NEWPID。内部 `task->tid` 仍是初始层编号，不能直接用作未来 namespace 用户输出。
 
 setns 已使用 namespace FD 或 pidfd 的 PID 快照，与 MNT/UTS/IPC 一起准备、验证后原子安装；unshare 的 PID 创建标志仍拒绝。任务出生后的 active PID namespace 不改变。`unshare(CLONE_NEWPID)` 和 `setns` 只更新后续子进程的目标；不能修改调用者 getpid/gettid。setns 仅允许 active 的自身或后代视图，不允许进入祖先或兄弟；校验失败时 namespace 集合不部分安装。`CLONE_THREAD` 必须留在同一 active namespace，不能把共享线程组拆到不同视图。
 
