@@ -92,8 +92,12 @@ static void point_contract(void)
     else {
         uint32_t local=((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr.s_addr;
         char text[INET_ADDRSTRLEN];CHECK(inet_ntop(AF_INET,&local,text,sizeof(text)));lookup(fd,text,0,0,0);
-        uint32_t peer=htonl((ntohl(local)&0xffffff00U)|2U);CHECK(inet_ntop(AF_INET,&peer,text,sizeof(text)));
-        lookup(fd,text,0,0,0);CHECK(!route_attr(RTA_GATEWAY));
+        CHECK(!ioctl(control,SIOCGIFINDEX,&ifr));unsigned eth_index=ifr.ifr_ifindex;
+        uint32_t peer=htonl((ntohl(local)&0xffffff00U)|3U);CHECK(peer!=local);
+        CHECK(inet_ntop(AF_INET,&peer,text,sizeof(text)));
+        lookup(fd,text,0,0,0);
+        CHECK(((struct rtmsg *)(buffer+16))->rtm_type==RTN_UNICAST);
+        CHECK(route_attr(RTA_OIF)==eth_index && route_attr(RTA_PREFSRC)==local && !route_attr(RTA_GATEWAY));
         lookup(fd,"192.0.2.1",RTA_SRC,htonl(0x7f000001),EINVAL);
         lookup(fd,"192.0.2.1",0,0,0);CHECK(route_attr(RTA_GATEWAY));
         lookup(fd,"192.0.2.1",RTA_SRC,local,0);CHECK(route_attr(RTA_SRC)==local);
