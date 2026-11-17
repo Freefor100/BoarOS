@@ -86,8 +86,8 @@ direct I/O 和失效缓存。每个错误出口重开 epoch；输出在开放后
 映射同一文件造成自锁。已独立 COW 的私有页不被撤销。直接读取也执行该协议，防止
 读取脏共享映射之前的磁盘版本。这里不改变 FLUSH；O_DIRECT 不等于持久化承诺。
 
-ext4（包括 journal 数据 owner）、tmpfs 仍明确拒绝普通文件 O_DIRECT；FAT 的资格
-不推广到其他后端。原始块设备 O_DIRECT 的范围见[块设备](riscv-virtio-block.md)。
+FAT 的资格不推广到其他后端；启用 journal 的 ext4 使用独立的
+[ordered 数据完成路径](vfs-ext4.md#普通文件直接-io)，tmpfs 仍明确拒绝普通文件 O_DIRECT。原始块设备 O_DIRECT 的范围见[块设备](riscv-virtio-block.md)。
 
 定向验证入口：`tests/host/fat32.sh` 的 4 KiB/16 KiB 页、1/8 扇区簇组合和故障注入；
 `tests/userland/fat32.c` 与 `tests/userland/fat32-user.py` 的 RV/LA 双核用户态测试。

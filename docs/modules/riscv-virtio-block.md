@@ -177,4 +177,4 @@ IRQ 启用后的读取 fixture 检查两个真实任务的内容、两个新增�
 真实延迟完成、睡眠及唤醒由上面的 NBD 用例检查。2026-10-10 的 case47 旧记录
 缺少 IRQ 等计数，不能据此唯一归因；原内核和输出保留。
 
-O_TMPFILE 整合回归：以 `-DBOAROS_BLOCK_DIRECT_ONLY` 编译 `tests/userland/tmpfile.c` 并使用 `tests/userland/tmpfile.py` 运行，额外覆盖 tmpfs/ext4 的 `O_TMPFILE|O_DIRECT`（open/openat2）拒绝、匿名 FD 的 F_SETFL 拒绝后 flags 不变、正常写入及发布，以及普通文件 `O_DIRECT|O_TRUNC` 拒绝后内容长度不变。未定义该宏时仍保留原 Linux 对照程序。
+O_TMPFILE 整合回归：以 `-DBOAROS_DIRECT_CAPABILITIES` 编译 `tests/userland/tmpfile.c` 并使用 `tests/userland/tmpfile.py` 运行，额外覆盖 ext4 的 `O_TMPFILE|O_DIRECT` 接纳，以及 tmpfs 的该组合（open/openat2）拒绝、匿名 FD 的 F_SETFL 拒绝后 flags 不变、正常写入及发布，以及普通文件 `O_DIRECT|O_TRUNC` 拒绝后内容长度不变。未定义该宏时仍保留原 Linux 对照程序。

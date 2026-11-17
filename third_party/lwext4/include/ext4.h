@@ -637,6 +637,8 @@ uint64_t ext4_ftell(ext4_file *file);
  *
  * @return  File size. */
 uint64_t ext4_fsize(ext4_file *file);
+/* Complete accepted ordered data for mapped bytes, without durability. */
+int ext4_fdata_complete(ext4_file *file, uint64_t offset, size_t size);
 
 
 /**@brief Get inode of file/directory/link.

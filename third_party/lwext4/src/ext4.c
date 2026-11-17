@@ -4840,6 +4840,49 @@ int ext4_fread(ext4_file *file, void *buf, size_t size, size_t *rcnt)
     EXT4_MP_UNLOCK(file->mp);
     return result;
 }
+int ext4_fdata_complete(ext4_file *file,uint64_t offset,size_t size)
+{
+    if (!file || !file->mp || offset>UINT64_MAX-size) return EINVAL;
+    struct ext4_fs *fs=&file->mp->fs;
+    if (!size || !fs->jbd_journal) return EOK;
+    EXT4_MP_LOCK(file->mp);
+    int result;
+    if (ext4_operation_depth(fs)) {result=EBUSY;goto Exit;}
+Retry:
+    result=ext4_trans_start(file->mp);
+    if (result) goto Exit;
+    result=ext4_operation_require_resource(fs,EXT4_RESOURCE_INODE,file->inode);
+    if (!result) {
+        struct ext4_inode_ref ref;
+        result=ext4_fs_get_inode_ref_read(fs,file->inode,&ref);
+        if (!result) {
+            uint64_t end=offset+size;
+            uint64_t eof=ext4_inode_get_size(ext4_fs_super(fs),ref.inode);
+            if (end>eof) end=eof;
+            unsigned block=fs->bdev->lg_bsize;
+            uint64_t logical=offset/block,limit=end/block+!!(end%block);
+            while (!result && logical<limit) {
+                struct ext4_inode_block_range range={0};
+                uint64_t remaining=limit-logical;
+                result=ext4_fs_get_inode_dblk_range(&ref,logical,
+                    remaining>UINT32_MAX?UINT32_MAX:remaining,false,&range);
+                if (result) break;
+                if (!range.count) __builtin_trap();
+                if (range.block && !range.unwritten)
+                    result=jbd_journal_complete_data(fs->jbd_journal,range.block,range.count);
+                logical+=range.count;
+            }
+            int cleanup=ext4_fs_put_inode_ref(&ref);
+            if (!result) result=cleanup;
+        }
+    }
+    result=ext4_trans_finish(file->mp,result);
+    if (result==EAGAIN && ext4_operation_resource_retry(fs)) goto Retry;
+Exit:
+    EXT4_MP_UNLOCK(file->mp);
+    return result;
+}
+
 int ext4_fpread(const ext4_file *file, uint64_t offset, void *buf, size_t size, size_t *rcnt)
 {
     if (!rcnt) return EINVAL;

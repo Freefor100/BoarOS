@@ -2860,6 +2860,34 @@ static int ext4_backend_writeback(struct kernel_vfs_node *node,
     return lwext4_error(result);
 }
 
+static size_t ext4_backend_direct_alignment(struct kernel_vfs_node *node)
+{
+    struct lwext4_mount_adapter *adapter=lwext4_instance(node->instance);
+    return adapter->device.fs->jbd_journal?adapter->device.bdif->ph_bsize:0;
+}
+static uint64_t ext4_backend_direct_limit(struct kernel_vfs_node *node)
+{ return node->max_size; }
+
+static int ext4_backend_direct_io(struct kernel_vfs_node *node,uint64_t offset,
+    void *buffer,size_t size,int writing,size_t *done)
+{
+    *done=0;
+    int result=0;
+    if (writing>0) {
+        struct file_write_span span={.offset=offset,.buffer=buffer,.size=size};
+        result=ext4_backend_writeback(node,&span,1);
+        uint64_t accepted=ext4_fsize(lwext4_node_file(node));
+        if (accepted>node->size) __atomic_store_n(&node->size,accepted,__ATOMIC_RELEASE);
+        if (result) return result;
+        size=span.written;
+    }
+    result=lwext4_error(ext4_fdata_complete(lwext4_node_file(node),offset,size));
+    if (result) return result;
+    if (!writing) return ext4_backend_pread(node,offset,buffer,size,done);
+    if (writing>0) *done=size;
+    return 0;
+}
+
 static int ext4_backend_error(struct kernel_vfs_instance *instance)
 { return instance->quiescing ? -KERNEL_EIO : lwext4_error(mount_error(lwext4_instance(instance))); }
 static int ext4_backend_root(struct kernel_vfs_instance *instance, uint64_t *inode, uint32_t *mode)
@@ -3108,5 +3136,8 @@ static void initialize_backend(void)
     ops->read_directory = ext4_backend_read_directory;
     ops->pread = ext4_backend_pread;
     ops->writeback = ext4_backend_writeback;
+    ops->direct_io = ext4_backend_direct_io;
+    ops->direct_alignment = ext4_backend_direct_alignment;
+    ops->direct_write_limit = ext4_backend_direct_limit;
     __atomic_store_n(&ext4_backend.pread_batch,ext4_backend_pread_batch,__ATOMIC_RELEASE);
 }

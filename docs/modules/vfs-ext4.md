@@ -2,6 +2,44 @@
 
 本文描述当前根文件系统的稳定接口和 lwext4 私有适配。第三方版本与许可证见[第三方代码](../third-party.md)。
 
+## 普通文件直接 I/O
+
+启用 journal 的 ext4 接纳 `O_DIRECT` 与 `F_SETFL`，包括 `O_TMPFILE`。
+读写按设备扇区校验 offset、用户地址及每段 iovec 长度；合法对齐的扩展、洞和
+跨 EOF 写入走现有 extent 分配事务，不以拒绝扩展或全文件 fsync 替代。
+未启用 journal 的 ext4 暂不开放这项能力；tmpfs 和 FAT 的资格由各自后端决定。
+
+VFS 先暂存用户输入并释放 pin，再持 inode mutation 资格关闭共享映射 epoch，
+撤销相交别名并回写相交整页。ext4 后端接纳写事务后，按稳定 inode 的物理 extent
+完成已有 ordered 数据；读也先完成该范围，再从设备读取（洞返回零）。操作结束失效
+VFS clean cache 并重开 epoch，用户输出在 epoch 开放后复制。同文件 mmap 作为
+输入或输出不会带着 pin 等待自己的映射撤销。
+
+ordered 数据保留独立完成标志与引用。范围提交依次处理 committing、sealed、running
+中的旧到新版本，不把同一 LBA 的不同版本放入可乱序完成的同一设备 phase。
+快照引用保护 DMA 期间被 accept 替换的 running 记录；设备完成后发布的标志让
+读取选择介质而非旧 journal image，也让后续 commit 跳过已提交数据。
+普通 commit 保留 ordered 与第一段日志的原合批；两次 FLUSH 和 durable/checkpoint
+推进规则不变。设备错误发布 sticky journal error，停止继续提交并保留恢复 owner；
+已经接纳的大小和内容变化不伪装回滚，不确定的直接写入不报告为成功字节。
+
+这是绕 VFS 页缓存的直接 I/O，不是零复制：写入仍可能在 journal 中暂存整块数据，
+用户读写保留有界暂存。ordered 设备阶段共用一个睡眠锁，范围排空可阻塞无关 inode
+的该阶段；不持 STATE 做设备 I/O，不跨后续日志和 FLUSH 持此锁。不声明吞吐收益，
+`O_DIRECT` 本身不承诺持久化，也不自动请求 fsync。
+
+验证入口：`JOURNAL_TEST_CASE=direct-ordered sh tests/host/lwext4-journal.sh` 检查
+真实 extent 消费者、三代同 LBA、反序 phase 设备、DMA 期间并发替换、故障后的
+停止提交与崩溃恢复；`FILE_IO_HOST_TCP=0 FILE_IO_DIRECT_ONLY=1 sh tests/host/file-io-concurrency.sh`
+检查 VFS dirty-cache 交接、扩展和洞。`tests/workloads/io/direct-file.c` 与
+`tests/userland/direct-file.py` 覆盖 RV/LA 的共享 mmap 同文件输入输出、EFAULT 后继续、
+truncate/短读、F_SETFL、O_TMPFILE、sendfile/splice 及退出清理/fsck。
+
+Linux 语义参考 v6.12 `fs/ext4/file.c` 的 DIO 接纳、扩展锁定与回退路径。
+当前宿主只有 overlayfs，其直接 I/O 对齐和短读实测与本契约不一致；这不是 Linux ext4
+动态对照通过。可用 `direct-file <目录> --probe-alignment` 打印宿主对齐结果，不能
+用它代替真实 Linux ext4 设备的差分或断电验证。
+
 ## 通用边界
 
 `include/kernel/block.h` 定义同步块设备（支持读与可选写），`include/kernel/vfs.h` 定义 mount/file 对象以及根挂载、open/create、pread/pwrite、ftruncate、mkdir、unlink、rmdir、close、unmount、`kernel_vfs_fstat()` 与 `kernel_vfs_mount_is_readonly()` 查询。VFS 对外返回负 Linux errno；lwext4 的结构、全局设备名和正值 errno 不泄漏到调用者。当前有独立的 ext4、FAT32/VFAT、tmpfs、proc 和 devpts 实例；lwext4 共用 heap binding 按实例引用计数维护，每实例携带自己的锁上下文；进程 fd/open-file-description 位于独立的[文件资源层](kernel-files.md)，每个挂载命名空间持有自己的挂载视图树；命名空间修改使用可睡眠 mutex，inode、OFD 与后端各自同步。

@@ -17,8 +17,12 @@ static void child_ok(pid_t p){int status;CHECK(waitpid(p,&status,0)==p&&WIFEXITE
 static void run(const char *directory,const char *label)
 {
     int d=open(directory,O_RDONLY|O_DIRECTORY);CHECK(d>=0);
-#ifdef BOAROS_BLOCK_DIRECT_ONLY
-    /* BoarOS currently exposes direct I/O only on block devices. */
+#ifdef BOAROS_DIRECT_CAPABILITIES
+    if (!strcmp(label,"ext4")) {
+        int direct=openat(d,".",O_TMPFILE|O_RDWR|O_DIRECT,0600);CHECK(direct>=0);
+        CHECK(!close(direct));
+    } else {
+    /* tmpfs has no device-backed direct I/O capability. */
     FAIL(EINVAL,openat(d,".",O_TMPFILE|O_RDWR|O_DIRECT,0600));
     struct {unsigned long long flags,mode,resolve;} direct_how={O_TMPFILE|O_RDWR|O_DIRECT,0600,0};
     FAIL(EINVAL,syscall(SYS_openat2,d,".",&direct_how,sizeof(direct_how)));
@@ -31,6 +35,7 @@ static void run(const char *directory,const char *label)
     FAIL(EINVAL,openat(d,"direct-rejected",O_RDWR|O_DIRECT|O_TRUNC));
     struct stat retained;CHECK(!fstat(probe,&retained)&&retained.st_size==4);
     CHECK(!close(probe)&&!unlinkat(d,"direct-rejected",0));
+    }
 #endif
 
     FAIL(EINVAL,openat(d,".",O_TMPFILE|O_RDONLY,0600));
