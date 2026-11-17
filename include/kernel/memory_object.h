@@ -76,6 +76,11 @@ void kernel_memory_object_discard_new_page(
  * A successful lookup owns one page reference; a hole never allocates. */
 enum kernel_memory_object_status kernel_memory_object_find_page(
     struct kernel_memory_object *object, uint64_t page_index, uint64_t *physical_address);
+/* Allocate zeroed backing for [first,last) page indices atomically. Existing
+ * content is retained; failure releases only this request's private pages.
+ * The file mutation owner excludes size changes and mapping publication. */
+enum kernel_memory_object_status kernel_memory_object_preallocate(
+    struct kernel_memory_object *, uint64_t first, uint64_t last);
 void kernel_memory_object_truncate(struct kernel_memory_object *object, uint64_t size);
 /* The mutation owner has stopped affected mapping publication and invalidated
  * PTEs. Remove full backing pages; clear only retained boundary fragments. */

@@ -76,17 +76,21 @@ static size_t bucket_for(uint64_t index, size_t bucket_count)
 }
 
 static enum kernel_memory_object_status grow_buckets(
-    struct kernel_memory_object *object)
+    struct kernel_memory_object *object, size_t pages)
 {
     struct kernel_memory_object_page **buckets;
     size_t capacity;
     enum kernel_heap_status status;
 
-    if (__atomic_load_n(&object->page_count, __ATOMIC_RELAXED) / 2U < object->bucket_count)
+    if (pages / 2U < object->bucket_count)
         return KERNEL_MEMORY_OBJECT_OK;
     if (object->bucket_count > SIZE_MAX / 2U / sizeof(*buckets))
         return KERNEL_MEMORY_OBJECT_NO_MEMORY;
-    capacity = object->bucket_count * 2U;
+    capacity = object->bucket_count;
+    do {
+        if (capacity > SIZE_MAX / 2U / sizeof(*buckets)) return KERNEL_MEMORY_OBJECT_NO_MEMORY;
+        capacity *= 2U;
+    } while (pages / 2U >= capacity);
     status = kernel_heap_allocate_zeroed(object->heap, capacity,
                                          sizeof(*buckets), (void **)&buckets);
     if (status == KERNEL_HEAP_STATUS_EMPTY)
@@ -204,17 +208,58 @@ void kernel_memory_object_release(struct kernel_memory_object **object)
     kernel_heap_release(owner->heap, owner);
 }
 
+/* The caller owns object->lock; the returned page has one backing reference
+ * and a budget charge but is not yet visible in the page index. A get caller
+ * also requests its returned pin before the cross-object budget admission. */
+static enum kernel_memory_object_status allocate_backing(struct kernel_memory_object *object,
+    uint64_t page_index, int pin, struct kernel_memory_object_page **out)
+{
+    struct kernel_memory_object_page *page;
+    enum kernel_heap_status heap_status;
+    enum physical_page_status page_status;
+    void *bytes;
+    if (object->budget && object->budget->limit && __atomic_load_n(&object->budget->used, __ATOMIC_ACQUIRE) >= object->budget->limit)
+        return KERNEL_MEMORY_OBJECT_NO_SPACE;
+    heap_status = kernel_heap_allocate_zeroed(object->heap, 1U,
+                                               sizeof(*page), (void **)&page);
+    if (heap_status == KERNEL_HEAP_STATUS_EMPTY)
+        return KERNEL_MEMORY_OBJECT_NO_MEMORY;
+    if (heap_status != KERNEL_HEAP_STATUS_OK)
+        return KERNEL_MEMORY_OBJECT_STATE;
+    page_status = physical_page_allocate(object->allocator,
+                                         &page->physical_address);
+    if (page_status != PHYSICAL_PAGE_STATUS_OK) {
+        kernel_heap_release(object->heap, page);
+        return page_status == PHYSICAL_PAGE_STATUS_EMPTY
+                   ? KERNEL_MEMORY_OBJECT_NO_MEMORY
+                   : KERNEL_MEMORY_OBJECT_STATE;
+    }
+    if (physical_page_resolve(object->allocator, page->physical_address,
+                              &bytes) != PHYSICAL_PAGE_STATUS_OK)
+        __builtin_trap();
+    memset(bytes, 0, BOAROS_PAGE_SIZE);
+    if (pin && physical_page_acquire(object->allocator,page->physical_address)) __builtin_trap();
+    /* Charge only the actual zeroed backing, including private range staging. */
+    if (object->budget && !charge(&object->budget->used, object->budget->limit)) {
+        if (pin) physical_page_release(object->allocator,page->physical_address);
+        physical_page_release(object->allocator, page->physical_address);
+        kernel_heap_release(object->heap, page);
+        return KERNEL_MEMORY_OBJECT_NO_SPACE;
+    }
+    if (!charge(&object->allocator->shared_anon_pages, 0)) __builtin_trap();
+    page->index = page_index;
+    *out=page;
+    return KERNEL_MEMORY_OBJECT_OK;
+}
+
 static enum kernel_memory_object_status get_page(
     struct kernel_memory_object *object, uint64_t page_index,
     uint64_t *physical_address, int *created, int preparing)
 {
     KERNEL_NO_RECLAIM_IO;
     struct kernel_memory_object_page *page;
-    enum kernel_heap_status heap_status;
-    enum physical_page_status page_status;
     enum kernel_memory_object_status status;
     size_t bucket;
-    void *bytes;
 
     if (object == 0 || physical_address == 0 || created == 0 ||
         __atomic_load_n(&object->references, __ATOMIC_ACQUIRE) == 0U) return KERNEL_MEMORY_OBJECT_STATE;
@@ -238,39 +283,13 @@ static enum kernel_memory_object_status get_page(
         *created = 0;
         return KERNEL_MEMORY_OBJECT_OK;
     }
-    if (object->budget && object->budget->limit && __atomic_load_n(&object->budget->used, __ATOMIC_ACQUIRE) >= object->budget->limit)
+    if (object->budget && object->budget->limit &&
+        __atomic_load_n(&object->budget->used,__ATOMIC_ACQUIRE)>=object->budget->limit)
         return KERNEL_MEMORY_OBJECT_NO_SPACE;
-    status = grow_buckets(object);
+    status = grow_buckets(object,object->page_count);
     if (status != KERNEL_MEMORY_OBJECT_OK) return status;
-    heap_status = kernel_heap_allocate_zeroed(object->heap, 1U,
-                                               sizeof(*page), (void **)&page);
-    if (heap_status == KERNEL_HEAP_STATUS_EMPTY)
-        return KERNEL_MEMORY_OBJECT_NO_MEMORY;
-    if (heap_status != KERNEL_HEAP_STATUS_OK)
-        return KERNEL_MEMORY_OBJECT_STATE;
-    page_status = physical_page_allocate(object->allocator,
-                                         &page->physical_address);
-    if (page_status != PHYSICAL_PAGE_STATUS_OK) {
-        kernel_heap_release(object->heap, page);
-        return page_status == PHYSICAL_PAGE_STATUS_EMPTY
-                   ? KERNEL_MEMORY_OBJECT_NO_MEMORY
-                   : KERNEL_MEMORY_OBJECT_STATE;
-    }
-    if (physical_page_resolve(object->allocator, page->physical_address,
-                              &bytes) != PHYSICAL_PAGE_STATUS_OK)
-        __builtin_trap();
-    memset(bytes, 0, BOAROS_PAGE_SIZE);
-    if (physical_page_acquire(object->allocator, page->physical_address) !=
-        PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
-    /* 先完成私有的object/PTE页引用准备，再CAS竞争跨对象预算；失败归还两份。 */
-    if (object->budget && !charge(&object->budget->used, object->budget->limit)) {
-        physical_page_release(object->allocator, page->physical_address);
-        physical_page_release(object->allocator, page->physical_address);
-        kernel_heap_release(object->heap, page);
-        return KERNEL_MEMORY_OBJECT_NO_SPACE;
-    }
-    if (!charge(&object->allocator->shared_anon_pages, 0)) __builtin_trap();
-    page->index = page_index;
+    status = allocate_backing(object,page_index,1,&page);
+    if (status != KERNEL_MEMORY_OBJECT_OK) return status;
     page->preparations = preparing != 0;
     page->publication = preparing ? PAGE_PREPARING : PAGE_DIRECT;
     bucket = bucket_for(page_index, object->bucket_count);
@@ -280,6 +299,54 @@ static enum kernel_memory_object_status get_page(
     *physical_address = page->physical_address;
     *created = 1;
     return KERNEL_MEMORY_OBJECT_OK;
+}
+
+/* Publish the range once, rather than get/pin/unpin and relock each page.
+ * Staged nodes use their normal next pointer, so rollback needs no side array.
+ * Existing pages are never zeroed, copied, or enrolled in rollback. */
+enum kernel_memory_object_status kernel_memory_object_preallocate(
+    struct kernel_memory_object *object,uint64_t first,uint64_t last)
+{
+    KERNEL_NO_RECLAIM_IO;
+    if (!object || first>=last || !__atomic_load_n(&object->references,__ATOMIC_ACQUIRE))
+        return KERNEL_MEMORY_OBJECT_STATE;
+    KERNEL_LOCK_SCOPE(guard);
+    kernel_mutex_lock(&object->lock,&guard);
+    struct kernel_memory_object_page *staged=NULL;
+    size_t added=0;int pending=0;
+    enum kernel_memory_object_status status=KERNEL_MEMORY_OBJECT_OK;
+    for (uint64_t index=first;index<last;index++) {
+        struct kernel_memory_object_page *page=object->buckets[bucket_for(index,object->bucket_count)];
+        while (page && page->index!=index) page=page->next;
+        if (page) { pending |= page->publication==PAGE_PREPARING; continue; }
+        status=allocate_backing(object,index,0,&page);
+        if (status) break;
+        page->next=staged;staged=page;added++;
+    }
+    if (!status) status=grow_buckets(object,object->page_count+added);
+    while (staged) {
+        struct kernel_memory_object_page *page=staged;staged=page->next;
+        if (status) {
+            unaccount_page(object);
+            if (physical_page_release(object->allocator,page->physical_address)) __builtin_trap();
+            kernel_heap_release(object->heap,page);
+        } else {
+            size_t bucket=bucket_for(page->index,object->bucket_count);
+            page->publication=PAGE_DIRECT;
+            page->next=object->buckets[bucket];object->buckets[bucket]=page;
+        }
+    }
+    if (!status) {
+        __atomic_fetch_add(&object->page_count,added,__ATOMIC_RELEASE);
+        /* A successful reservation adopts any already prepared backing too. */
+        if (pending) for (uint64_t index=first;index<last;index++) {
+            struct kernel_memory_object_page *page=object->buckets[bucket_for(index,object->bucket_count)];
+            while (page && page->index!=index) page=page->next;
+            if (!page) __builtin_trap();
+            if (page->publication==PAGE_PREPARING) page->publication=PAGE_ADOPTED;
+        }
+    }
+    return status;
 }
 
 enum kernel_memory_object_status kernel_memory_object_get_page(
