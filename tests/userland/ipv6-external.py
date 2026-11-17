@@ -2,6 +2,9 @@
 """Real Ethernet IPv6 through QEMU slirp to separate host TCP/UDP sockets."""
 import argparse
 import concurrent.futures
+import hashlib
+import json
+import subprocess
 import os
 from pathlib import Path
 import socket
@@ -69,17 +72,30 @@ device='virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1' if a.arch=='riscv' el
 command+=['-netdev','user,id=n0,ipv6=on,ipv6-prefix=fe80::,ipv6-prefixlen=64,ipv6-host=fe80::2','-device',device+',mac=52:54:00:12:34:56']
 if a.arch=='riscv':command+=['-global','virtio-mmio.force-legacy=false']
 log=work/'guest.log'
+def identity(path):
+    path=Path(path).resolve()
+    with path.open('rb') as stream:sha=hashlib.file_digest(stream,'sha256').hexdigest()
+    return {'path':str(path),'sha256':sha}
+manifest={'source_commit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
+          'source_dirty':bool(subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True)),
+          'arch':a.arch,'cpus':a.cpus,'kernel':identity(a.kernel),'program':identity(a.program)}
 with socket.socket(socket.AF_INET,socket.SOCK_STREAM) as injector, socket.socket(socket.AF_INET6,socket.SOCK_DGRAM) as d, socket.socket(socket.AF_INET6,socket.SOCK_STREAM) as s:
     injector.bind(('127.0.0.1',0));injector.listen(1);injector.settimeout(45)
     command+=['-chardev',f'socket,id=inject,host=127.0.0.1,port={injector.getsockname()[1]}',
               '-object','filter-redirector,id=inject-rx,netdev=n0,queue=tx,indev=inject']
     for sock in (d,s):sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);sock.bind(('::1',19460));sock.settimeout(45)
     s.listen(1)
+    manifest['command']=command
+    (work/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         jobs=[pool.submit(udp,d,injector),pool.submit(tcp,s)]
         harness.run_logged(command,log,timeout=70)
         for job in jobs:job.result()
+for name,path in [('kernel',a.kernel),('program',a.program)]:
+    if identity(path)!=manifest[name]:raise RuntimeError(name+' changed during validation')
 text=log.read_text()
 if 'IPV6 EXTERNAL ALL PASS' not in text or 'IPV6 EXTERNAL FAIL' in text or not profile.root_poweroff_success(text):
     raise RuntimeError(f'incomplete IPv6 external contract or cleanup: {log}')
+manifest['passed']=True
+(work/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
 disk.unlink();print(f'PASS external IPv6 {a.arch} cpus={a.cpus}: {log}')

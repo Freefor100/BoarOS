@@ -362,7 +362,7 @@ python3 tests/userland/ipv6-external.py --arch riscv --cpus 4 --kernel <kernel> 
 python3 tests/userland/ipv6-external.py --arch loongarch --cpus 2 --kernel <kernel> --program <ipv6_external ELF> --qemu <qemu>
 ```
 
-ELF 来源 `tests/workloads/network/ipv6_external.c`，以目标 musl 静态编译（LA 链接页对齐 16384）。外部 runner 显式配置 QEMU slirp 的 IPv6 prefix/host 为 `fe80::/64`、`fe80::2`，由独立宿主 IPv6 TCP/UDP socket 验证内容，不是 guest 的 `::1` 回环。UDP 检查 64/1232/1452 字节内容、peer/scope、1453 字节错误边界；TCP 检查 64 KiB 全内容和半关闭/EOF。QEMU Ethernet 注入通道依次送零 checksum、错误 checksum 和正确响应，以正确响应作为处理顺序屏障。host 用例另外覆盖 DAD 冲突、地址失效、ND 队列清理、MTU 恢复、RA 不安装路由和设备失败。测试不声称公网、Linux TAP 差分、实板或性能收益。
+ELF 来源 `tests/workloads/network/ipv6_external.c`，以目标 musl 静态编译（LA 链接页对齐 16384）。外部 runner 显式配置 QEMU slirp 的 IPv6 prefix/host 为 `fe80::/64`、`fe80::2`，由独立宿主 IPv6 TCP/UDP socket 验证内容，不是 guest 的 `::1` 回环。UDP 检查 64/1232/1452 字节内容、peer/scope、1453 字节错误边界；TCP 检查 64 KiB 全内容和半关闭/EOF。QEMU Ethernet 注入通道依次送零 checksum、错误 checksum 和正确响应，以正确响应作为处理顺序屏障。host 用例另外覆盖 DAD 冲突、地址失效、ND 队列清理、MTU 恢复、RA 不安装路由和设备失败。`ipv6-prepare-withdraw` 在真实 parallel prepare 与 commit 之间撤销并释放模型接口，验证准备阶段仅保存数值 scope、提交阶段持协议资格查找接口，并完整归还 payload/request/pin；真实 NIC stop 另外先 drain 活动调用者。每次外部运行保存命令和 kernel/program SHA256 manifest，并在结束时再次核对身份。测试不声称公网、Linux TAP 差分、实板或性能收益。
 
 语义参考：[Linux ipv6(7)](https://www.man7.org/linux/man-pages/man7/ipv6.7.html)、[RFC 4862 §5.4](https://www.rfc-editor.org/rfc/rfc4862.html#section-5.4)、[RFC 8200 §8.1](https://www.rfc-editor.org/rfc/rfc8200.html#section-8.1)。
 

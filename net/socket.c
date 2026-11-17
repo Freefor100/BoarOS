@@ -383,7 +383,10 @@ static int address_import(const struct kernel_socket *socket,
                     address->scope!=socket->bound_device)return -KERNEL_EINVAL;
                 if (use!=SOCKET_ADDRESS_SEND && ip6_addr_islinklocal(ip_2_ip6(ip)) && !index)
                     return -KERNEL_EINVAL;
-                if (index>255U || (index && !netif_get_by_index((u8_t)index)))
+                /* SEND preparation runs on the caller with only its endpoint
+                 * lock. Keep this a value snapshot; owner-side routing checks
+                 * interface existence after copying, under protocol ownership. */
+                if (index>255U || (use!=SOCKET_ADDRESS_SEND && index && !netif_get_by_index((u8_t)index)))
                     return binding?-KERNEL_ENODEV:-KERNEL_ENETUNREACH;
                 ip6_addr_set_zone(ip_2_ip6(ip), (u8_t)index);
             }

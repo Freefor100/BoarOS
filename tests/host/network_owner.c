@@ -72,6 +72,13 @@ static struct {
 static _Thread_local struct kernel_io_context test_context;
 _Thread_local uintptr_t network_host_irq = RISCV_SSTATUS_SIE;
 _Thread_local unsigned network_host_irq_saves,network_host_irq_restores;
+static unsigned scoped_lookup_contract;
+struct netif *__real_netif_get_by_index(u8_t index);
+struct netif *__wrap_netif_get_by_index(u8_t index)
+{
+    if(scoped_lookup_contract)CHECK(protocol_current_owner()==kernel_io_context_current());
+    return __real_netif_get_by_index(index);
+}
 static unsigned heap_allocations,protocol_services,allow_ofd_release,heap_fail_after;
 static size_t heap_last_allocation_size;
 static unsigned space_callbacks;
@@ -3776,6 +3783,49 @@ static void ipv6_inject_protocol(struct netif *n,const ip6_addr_t *src,const ip6
 static void ipv6_inject(struct netif *n,const ip6_addr_t *src,const ip6_addr_t *dst,
                         const unsigned char *body,unsigned length)
 { ipv6_inject_protocol(n,src,dst,body,length,58,2); }
+static void ipv6_prepare_withdraw(void)
+{
+    kernel_socket_network_initialize();boaros_lwip_ip_init(2);
+    CHECK(boaros_lwip_parallel_enabled() && !protocol_current_owner());
+    struct kernel_network *network=calloc(1,sizeof(*network));CHECK(network);
+    struct virtio_net_device device={.mac={0x52,0x54,0,0x12,0x34,0x56}};
+    network->device=&device;
+    ip4_addr_t local={lwip_htonl(0x0a4d0002)},mask={lwip_htonl(0xffffff00)},zero={0};
+    struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    CHECK(netif_add(&network->interface,&local,&mask,&zero,network,interface_init,ethernet_input));
+    netif_set_up(&network->interface);netif_set_link_up(&network->interface);
+    unsigned index=netif_get_index(&network->interface);
+    kernel_socket_protocol_leave(&scope);
+    struct kernel_socket *socket=NULL;CHECK(!kernel_socket_create(&test_heap,10,SOCKET_DGRAM,0,&socket));
+    struct kernel_socket_address remote={.family=10,.port=19460,.scope=index,.bytes={0xfe,0x80}};
+    remote.bytes[15]=2;
+    uint32_t memory=lwip_stats.mem.used;unsigned live=heap_live;
+    scoped_lookup_contract=1;
+    for(unsigned removed=0;removed<2;removed++) {
+        struct kernel_open_file_description *pin=(void *)socket;
+        struct kernel_socket_write_request request={0};
+        /* The actual parallel prepare API must only capture numeric scope,
+         * even if an interface with that index has already disappeared. */
+        CHECK(!protocol_current_owner());
+        CHECK(!kernel_socket_packet_prepare(&request,&pin,4,0,&remote,1,NULL));
+        CHECK(!pin && request.protocol_payload && request.active_previous &&
+            request.inet_destination.scope==index && lwip_stats.mem.used>memory);
+        if(!removed) {
+            /* Deterministic prepare -> withdraw -> commit interleaving. The
+             * modeled interface owner withdraws under protocol protection;
+             * freeing it catches retained pointers with ASan. Real NIC stop
+             * additionally drains active caller pins before netif removal. */
+            kernel_socket_protocol_enter(&scope);
+            netif_remove(&network->interface);free(network);network=NULL;
+            kernel_socket_protocol_leave(&scope);
+        }
+        CHECK(kernel_socket_packet_write(&request,NULL,NULL,"wire",NULL,NULL)==-KERNEL_ENETUNREACH);
+        CHECK(pin==(void *)socket && !request.protocol_payload && !request.active_previous &&
+            !socket->tx_reserved && lwip_stats.mem.used==memory && heap_live==live);
+    }
+    scoped_lookup_contract=0;kernel_socket_destroy(socket);CHECK(!heap_live);
+    puts("PASS parallel IPv6 prepare captures scope without netif lookup; withdrawal before commit returns owners and payload");
+}
 static void ipv6_linklocal(void)
 {
     kernel_socket_network_initialize();
@@ -3884,6 +3934,7 @@ int main(int argc, char **argv)
     CHECK(kernel_pid_publish(&model_pid_registry,&model_pid)==KERNEL_PID_STATUS_OK);
     if (!strcmp(argv[1], "raw-icmp-owner")) raw_icmp_owner();
     else if (!strcmp(argv[1], "raw-icmp-close")) raw_icmp_close();
+    else if (!strcmp(argv[1], "ipv6-prepare-withdraw")) ipv6_prepare_withdraw();
     else if (!strcmp(argv[1], "ipv6-linklocal")) ipv6_linklocal();
     else if (!strcmp(argv[1], "ipv4-options")) ipv4_options();
     else if (!strcmp(argv[1], "async-events")) async_events();
