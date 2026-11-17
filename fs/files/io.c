@@ -355,6 +355,41 @@ enum kernel_files_status kernel_files_syncfs(struct kernel_files *files,
     return kernel_files_release_io(files, &description, KERNEL_FILES_STATUS_OK);
 }
 
+static enum kernel_files_status direct_read(struct kernel_files *files,struct kernel_mm *mm,
+    struct kernel_open_file_description *description,struct kernel_uaccess_iov_cursor *cursor,
+    uint64_t request,uint64_t position,int advance,int64_t *result)
+{
+    size_t align=kernel_vfs_direct_alignment(&description->file);
+    if (position>=kernel_open_file_size(description)) { *result=0;return 0; }
+    if (!align || position%align || request%align) { *result=-KERNEL_EINVAL;return 0; }
+    struct kernel_uaccess_iov_cursor check=*cursor;
+    uint64_t left=request;
+    while (left) {
+        uint64_t address;size_t n=kernel_uaccess_iov_span(&check,left,&address);
+        if (!n || address%align || n%align) { *result=-KERNEL_EINVAL;return 0; }
+        check.offset+=n;left-=n;
+    }
+    struct kernel_task_io_buffer staging={0};
+    if (kernel_task_io_buffer_acquire(&staging,mm->allocator)) { *result=-KERNEL_ENOMEM;return 0; }
+    uint64_t total=0;int error=0;
+    while (total<request) {
+        size_t n=request-total,done=0,copied=0;
+        if (n>BOAROS_PAGE_SIZE) n=BOAROS_PAGE_SIZE;
+        error=kernel_vfs_direct_pread(&description->file,position+total,staging.data,n,&done);
+        enum kernel_uaccess_status access=KERNEL_UACCESS_STATUS_OK;
+        if (done) access=kernel_copy_to_user_iov(mm,cursor,staging.data,done,&copied);
+        total+=copied;
+        if (advance && copied && kernel_open_file_advance(description,copied)) __builtin_trap();
+        KERNEL_FILES_NOTE(files,read_chunks,1);
+        if (access) { error=-KERNEL_EFAULT;break; }
+        if (error || done<n) break;
+    }
+    kernel_task_io_buffer_release(&staging);
+    KERNEL_FILES_NOTE(files,bytes_read,total);
+    *result=total?(int64_t)total:error;
+    return 0;
+}
+
 /* 缓存批次只覆盖剩余需求；复制前已经结束存储锁，整个批次的成功页都有独立引用。 */
 static enum kernel_files_status disk_read(
     struct kernel_files *files, struct kernel_mm *mm,
@@ -363,6 +398,8 @@ static enum kernel_files_status disk_read(
     uint64_t position, int advance, int64_t *linux_result
     )
 {
+    if (kernel_open_file_flags(description)&KERNEL_FILES_O_DIRECT)
+        return direct_read(files,mm,description,cursor,request,position,advance,linux_result);
     struct kernel_page_cache *cache=kernel_open_file_page_cache(description);
     uint64_t total = 0;
     int error = 0, done = 0;
@@ -976,6 +1013,10 @@ static enum kernel_files_status pread_iov_pinned(
                   ? KERNEL_FILES_MAX_RW_COUNT
                   : count;
     position = (uint64_t)offset;
+    if (kernel_open_file_flags(description)&KERNEL_FILES_O_DIRECT) {
+        struct kernel_uaccess_iov_cursor direct_cursor={iov,iov_count,0,0};
+        return direct_read(files,mm,description,&direct_cursor,request,position,0,linux_result);
+    }
     file_size = kernel_open_file_size(description);
     if (position >= file_size) {
         *linux_result = 0;
@@ -1132,8 +1173,8 @@ static enum kernel_files_status regular_write_request(
     uint64_t offset=positioned?requested_offset:kernel_open_file_offset(description);
     struct kernel_vfs_size_limit size_limit={.maximum=kernel_task_current_fsize_limit()};
     struct kernel_vfs_user_write_result completed={0};
-    int error=kernel_vfs_write_user(&description->file,mm,iov,iov_count,
-        (size_t)count,offset,append,&size_limit,&completed);
+    int error=kernel_vfs_write_user_mode(&description->file,mm,iov,iov_count,
+        (size_t)count,offset,append,!!(options->flags&KERNEL_FILES_O_DIRECT),&size_limit,&completed);
     kernel_files_size_limit_notify(&size_limit);
     if ((completed.access!=KERNEL_UACCESS_STATUS_OK &&
          completed.access!=KERNEL_UACCESS_STATUS_FAULT) || completed.written>count)

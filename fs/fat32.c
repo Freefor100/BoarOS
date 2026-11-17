@@ -16,6 +16,8 @@ struct fat_inode {
     uint64_t id, entry, parent, first_slot;
     uint32_t first, tail, clusters, size, mode, handles;
     uint32_t cursor, cursor_index;
+    uint64_t prepared_end;
+    uint64_t direct_limit; /* Linux FAT mmu_private: initialized allocation frontier. */
     uint8_t slots, linked, measured, times_dirty;
     struct kernel_vfs_timespec atime, mtime, ctime;
     struct fat_inode *retired_next;
@@ -444,6 +446,7 @@ static int record_inode(struct fat_mount *m, uint64_t parent, const struct fat_r
         i->first_slot = record->first_slot; i->slots = record->slots; i->linked = 1;
         i->first = ((uint32_t)le16(record->raw + 20) << 16) | le16(record->raw + 26);
         i->first &= 0x0fffffff; i->size = le32(record->raw + 28);
+        i->direct_limit = i->size;
         i->mode = (record->raw[11] & 16 ? KERNEL_VFS_S_IFDIR : KERNEL_VFS_S_IFREG) | 0777;
         if (record->raw[11] & 1) i->mode &= ~0222U;
         if (record->raw[11] & 16) i->size = 0;
@@ -910,6 +913,14 @@ static int dir_entry(struct kernel_vfs_file *file, uint64_t pos, uint64_t *next,
         *type = (i->mode & KERNEL_VFS_S_IFMT) >> 12; return 1;
     }
 }
+static size_t direct_alignment(struct kernel_vfs_node *node)
+{ return fm(node->instance)->sector_size; }
+static uint64_t direct_write_limit(struct kernel_vfs_node *node)
+{
+    struct fat_mount *m=fm(node->instance);
+    KERNEL_LOCK_SCOPE(g); kernel_mutex_lock(&m->metadata,&g);
+    return fi(node)->direct_limit;
+}
 static int pread_inode(struct kernel_vfs_node *node, uint64_t offset, void *buffer, size_t size, size_t *read)
 {
     struct fat_mount *m = fm(node->instance); struct fat_inode *i = fi(node); *read = 0;
@@ -929,7 +940,7 @@ static int prepare_write(struct kernel_vfs_node *node, uint64_t offset, size_t s
     uint64_t end = offset + size, before = node->size;
     if (!size) return 0;
     r = measure(m, i); if (r) return r;
-    if (end > before) *complete = 1;
+    if (end > before) { *complete = 1; i->prepared_end=end; }
     r = grow_chain(m, i, (end + m->cluster_size - 1) / m->cluster_size);
     if (r && r != -KERNEL_ENOSPC) return r;
     uint64_t available = (uint64_t)i->clusters * m->cluster_size;
@@ -939,6 +950,8 @@ static int prepare_write(struct kernel_vfs_node *node, uint64_t offset, size_t s
         int zero = zero_range(m, i, before, offset < available ? offset : available);
         if (zero) { *ready = 0; return zero; }
     }
+    if (*ready && offset + *ready > i->direct_limit)
+        i->direct_limit = (offset + *ready + m->sector_size - 1) & ~((uint64_t)m->sector_size - 1);
     int stored = store_inode(m, i);
     return stored ? stored : r;
 }
@@ -966,6 +979,8 @@ static int complete_write(struct kernel_vfs_node *node)
     KERNEL_LOCK_SCOPE(g); kernel_mutex_lock(&m->metadata, &g);
     r = fat_error(node->instance); if (r) return r;
     i->size = node->size;
+    if (i->prepared_end>i->size) i->direct_limit=i->size;
+    i->prepared_end=0;
     r = trim_chain(m, i, ((uint64_t)i->size + m->cluster_size - 1) / m->cluster_size);
     return r ? r : store_inode(m, i);
 }
@@ -996,7 +1011,7 @@ static int truncate_inode(struct kernel_vfs_node *node, uint64_t size, uint64_t 
     if (!size) i->first = 0;
     r = store_inode(m, i);
     if (r) { i->first = first; i->size = old; return r; }
-    *actual = size; *changed = 1;
+    *actual = size; *changed = 1; i->direct_limit = size;
     i->first = first;
     return trim_chain(m, i, needed);
 }
@@ -1258,6 +1273,7 @@ static const struct kernel_vfs_backend fat_ops = {
     .error = fat_error, .root = root, .lookup = lookup, .entry_name = entry_name, .open = open_inode, .close_node = close_node,
     .create = create, .mkdir = mkdir_inode, .unlink = unlink_file, .rmdir = rmdir_inode,
     .rename = rename_inode, .release_unlinked = release_unlinked, .dir_entry = dir_entry,
+    .direct_alignment=direct_alignment, .direct_write_limit=direct_write_limit,
     .pread = pread_inode, .prepare_write = prepare_write, .complete_write = complete_write,
     .writeback = writeback, .truncate = truncate_inode, .block_device = block_device,
     .writeback_allowed = writeback_allowed, .stat = stat_inode, .statfs = statfs,

@@ -87,7 +87,7 @@ flush仍同步实际后备对象，解绑与自动清理沿设备使用者和在
 
 `O_DIRECT` 可以在块设备打开时指定，也可以通过 `F_SETFL` 在共享 OFD 上切换。非空 I/O 的偏移、有效总长度以及每个非空 iovec 的地址和长度必须按设备逻辑扇区对齐，否则在提交设备请求前返回 `EINVAL`。此路径直接使用无页缓存的 block 后端，每次最多提交一个架构页的连续数据，而不是逐扇区重复请求；有界 staging buffer 隔离用户缺页与 DMA 生命周期，并非零复制。源复制故障仅提交已复制的完整扇区，保持完成前缀，不为不完整扇区执行 RMW。`O_DIRECT` 不隐含持久化，只有同步标志或显式同步才执行 FLUSH。
 
-普通和 direct 块设备 FD 使用同一无缓存后端及传输锁，因此不存在两套块设备缓存的相互失效问题。loop 的后备普通文件仍遵循该文件系统缓存规则；这不等于 `LOOP_SET_DIRECT_IO` 或普通文件 direct I/O。通过 raw 设备修改已挂载文件系统不保证与其文件缓存一致，调用者应使用未挂载的私有设备，不能把 direct 当作绕过挂载一致性约束的办法。普通 ext4/tmpfs/FAT 文件仍拒绝 `O_DIRECT`：后续需要独立的数据直传接口、脏页写回及共享映射失效/重缺页协议，不能简单绕开页缓存。Linux 对齐依据为 `block/fops.c:blkdev_dio_invalid` 与 block iterator 对齐检查。
+普通和 direct 块设备 FD 使用同一无缓存后端及传输锁，因此不存在两套块设备缓存的相互失效问题。loop 的后备普通文件仍遵循该文件系统缓存规则；这不等于 `LOOP_SET_DIRECT_IO` 或普通文件 direct I/O。通过 raw 设备修改已挂载文件系统不保证与其文件缓存一致，调用者应使用未挂载的私有设备，不能把 direct 当作绕过挂载一致性约束的办法。普通 ext4/tmpfs 文件仍拒绝 `O_DIRECT`；FAT 的 direct 与扩展回退见 [FAT 模块](fat32.md)：后续需要独立的数据直传接口、脏页写回及共享映射失效/重缺页协议，不能简单绕开页缓存。Linux 对齐依据为 `block/fops.c:blkdev_dio_invalid` 与 block iterator 对齐检查。
 
 聚焦 host 入口为 `FILE_IO_HOST_TCP=0 FILE_IO_BLOCK_ONLY=1 sh tests/host/file-io-concurrency.sh`，覆盖真实 OFD flags、对齐与向量拒绝、故障前缀、普通/direct 交替和块层并发序列。`tests/workloads/io/direct-block.c` 使用未挂载的临时 loop 设备；`tests/userland/direct-block.py` 使用已构建 RV/LA 内核和静态 ELF，检查数据及退出回收。Linux 可将同一程序显式指向一次性私有 block 设备；普通文件的 direct 对齐规则随后端不同，不能替代 Linux block 对照。 本次验证通过 host 4 KiB/16 KiB 页模型及 RV/LA 双核 guest 的上述定向检查；环境没有可用私有 Linux block 设备，Linux block 动态差分尚未完成，不据普通文件测试宣称其已通过。
 

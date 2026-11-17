@@ -99,7 +99,10 @@ static int64_t regular_copy_output(struct kernel_open_file_description *out,
         error=kernel_vfs_file_modified(&out->file,position,0);
         if (error) return error;
     }
-    error=pages?kernel_vfs_pwrite_cached(&out->file,position,pages,source_offset,allowed,&written):
+    if (kernel_open_file_flags(out)&KERNEL_FILES_O_DIRECT) {
+        if (pages) __builtin_trap();
+        error=kernel_vfs_pwrite_direct(&out->file,position,buffer,allowed,&written,&operation);
+    } else error=pages?kernel_vfs_pwrite_cached(&out->file,position,pages,source_offset,allowed,&written):
         kernel_vfs_pwrite(&out->file,position,buffer,allowed,&written);
     if (written>allowed) __builtin_trap();
     /* sendfile still attempts the suffix at the size limit after accepting
@@ -178,7 +181,7 @@ static int64_t regular_file_copy(struct kernel_mm *mm,
     int synchronous=!!(flags&KERNEL_FILES_O_DSYNC);
     int datasync=(flags&KERNEL_FILES_O_SYNC)!=KERNEL_FILES_O_SYNC;
     struct kernel_page_cache *cache=kernel_open_file_page_cache(input);
-    if (cache && !kernel_open_file_memory_backed(input) &&
+    if (cache && !((flags|kernel_open_file_flags(input))&KERNEL_FILES_O_DIRECT) && !kernel_open_file_memory_backed(input) &&
         !kernel_vfs_files_share_node(&input->file,&output->file) && !(sync_each && synchronous)) {
         int64_t copied=regular_cached_copy(input,output,cache,start,out_start,count,limit);
         if (copied>0 && synchronous) {
@@ -279,7 +282,8 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
         return result;
     }
     int datagram=kernel_socket_preserves_messages(kernel_open_file_socket(output));
-    int direct=output->kind==KERNEL_OPEN_FILE_KIND_SOCKET && !datagram;
+    int direct=output->kind==KERNEL_OPEN_FILE_KIND_SOCKET && !datagram &&
+        !(kernel_open_file_flags(input)&KERNEL_FILES_O_DIRECT);
     struct kernel_task_io_buffer source_buffer = {0};
     if (!direct && !datagram && kernel_task_io_buffer_acquire(&source_buffer, mm->allocator) != KERNEL_TASK_STATUS_OK)
         return -KERNEL_ENOMEM;
@@ -600,7 +604,7 @@ static int read_transfer_page(struct kernel_open_file_description *file,struct k
     uint64_t position,size_t wanted,void **page,size_t *offset,size_t *done,int *miss)
 {
     *done=0;*offset=0;*miss=0;
-    if (file->kind==KERNEL_OPEN_FILE_KIND_REGULAR) {
+    if (file->kind==KERNEL_OPEN_FILE_KIND_REGULAR && !(kernel_open_file_flags(file)&KERNEL_FILES_O_DIRECT)) {
         uint64_t physical=0;size_t valid=0;
         enum kernel_page_cache_status status;
         if (kernel_open_file_memory_backed(file)) {
@@ -635,13 +639,14 @@ static int read_transfer_page(struct kernel_open_file_description *file,struct k
         *done=valid-*offset;if (*done>wanted) *done=wanted;
         return 0;
     }
-    if (!file->block && file->kind!=KERNEL_OPEN_FILE_KIND_GENERATED &&
+    if (!file->block && file->kind!=KERNEL_OPEN_FILE_KIND_REGULAR && file->kind!=KERNEL_OPEN_FILE_KIND_GENERATED &&
         !(file->device && file->device->splice_read && file->device->read)) return -KERNEL_EINVAL;
     if (file->kind == KERNEL_OPEN_FILE_KIND_GENERATED && kernel_vfs_file_control_prefix(&file->file))
         return -KERNEL_EINVAL;
     int error=new_transfer_page(pipe,page);
     if (error) return error;
-    if (file->block) error=kernel_block_file_pread(file,position,*page,wanted,done);
+    if (file->kind==KERNEL_OPEN_FILE_KIND_REGULAR) error=kernel_open_file_pread(file,position,*page,wanted,done);
+    else if (file->block) error=kernel_block_file_pread(file,position,*page,wanted,done);
     else if (file->kind==KERNEL_OPEN_FILE_KIND_GENERATED && kernel_vfs_file_is_control(&file->file,0)) {
         error=kernel_vfs_file_control_permission(&file->file,0);
         if (!error) error=kernel_vfs_file_control(&file->file,0,&position,*page,wanted,done);

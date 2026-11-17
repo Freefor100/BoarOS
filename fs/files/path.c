@@ -341,10 +341,11 @@ static enum kernel_files_status files_open(
         (!(flags & LINUX_O_PATH) && object_type != KERNEL_VFS_S_IFREG && object_type != KERNEL_VFS_S_IFDIR))
         kernel_service_scope_begin(&service);
     if (flags & LINUX_O_PATH) goto Finish_open;
-    /* Only raw block OFDs currently have an uncached data path. Reject before
-     * truncation or device/FIFO open; regular files need coherent cache and
-     * mapping invalidation before direct I/O can be exposed. */
-    if ((flags & LINUX_O_DIRECT) && object_type != KERNEL_VFS_S_IFBLK) {
+    /* Require an actual backend data path before truncation or device open.
+     * FAT supplies a coherency-qualified direct path with explicit growth
+     * fallback; other regular backends must not silently ignore the flag. */
+    if ((flags & LINUX_O_DIRECT) && object_type != KERNEL_VFS_S_IFBLK &&
+        !kernel_vfs_direct_alignment(&description->file)) {
         kernel_files_queue_description(files, description);
         (void)kernel_files_drain_file_cleanup(files);
         *linux_result = -KERNEL_EINVAL;

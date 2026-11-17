@@ -122,7 +122,9 @@ static int backing_transfer(struct loop_device *loop,int writing,uint64_t positi
         KERNEL_LOCK_SCOPE(operation);
         kernel_vfs_file_write_lock(&loop->backing->file,&operation);
         error=kernel_vfs_file_modified(&loop->backing->file,offset,0);
-        if (!error) error=kernel_vfs_pwrite(&loop->backing->file,offset,buffer,size,done);
+        if (!error) error=(kernel_open_file_flags(loop->backing)&KERNEL_FILES_O_DIRECT) ?
+            kernel_vfs_pwrite_direct(&loop->backing->file,offset,buffer,size,done,&operation) :
+            kernel_vfs_pwrite(&loop->backing->file,offset,buffer,size,done);
     }
     return error?error:*done==size?0:-KERNEL_EIO;
 }

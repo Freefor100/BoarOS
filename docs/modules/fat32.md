@@ -67,3 +67,32 @@ e2fsck 与 fsck.fat。启动使用普通 VirtIO 块设备和串口，程序不�
 
 介质范围为 FAT32。FAT12/16、exFAT、额外挂载选项、硬链接及符号链接的后续需求维护在
 [开发路线](../goals.md)。官方磁盘布局及工具交付属于兼容分支的启动配置。
+
+## O_DIRECT 的真实范围
+
+FAT 普通文件允许 open/F_SETFL 的 `O_DIRECT`，共享 OFD 的切换立即影响后续请求。
+读取及已初始化分配范围内的覆盖写，通过 FAT 簇链直接提交块后端，不填充文件页缓存；
+每个有界 staging 批次至多一个架构页，不是零复制。地址、长度和偏移要求逻辑扇区
+对齐，EOF 可以产生短读。只读、限额、追加定位与权限检查仍走共同 VFS。
+
+写入超过初始化分配前沿时，按 Linux FAT 的 `mmu_private` 分支回退到已有 buffered
+扩展路径，完成后同步写回相交整页并失效；该回退允许普通 buffered 写的非对齐输入。
+不能把这种扩展称为全程绕缓存。同步回写失败不把不确定的缓存接纳量报告为成功，
+已发生的文件大小/内容变化不伪装回滚。截断和未完成扩展收回分配前沿。
+
+一致性由同 inode 的写操作门和映射 epoch 保证：输入先复制并释放用户 pin，再关闭
+新映射发布、撤销相交共享映射并排空 pin、回写相交整页，最后在 inode 写保护中提交
+direct I/O 和失效缓存。每个错误出口重开 epoch；输出在开放后复制，避免用户缓冲本身
+映射同一文件造成自锁。已独立 COW 的私有页不被撤销。直接读取也执行该协议，防止
+读取脏共享映射之前的磁盘版本。这里不改变 FLUSH；O_DIRECT 不等于持久化承诺。
+
+ext4（包括 journal 数据 owner）、tmpfs 仍明确拒绝普通文件 O_DIRECT；FAT 的资格
+不推广到其他后端。原始块设备 O_DIRECT 的范围见[块设备](riscv-virtio-block.md)。
+
+定向验证入口：`tests/host/fat32.sh` 的 4 KiB/16 KiB 页、1/8 扇区簇组合和故障注入；
+`tests/userland/fat32.c` 与 `tests/userland/fat32-user.py` 的 RV/LA 双核用户态测试。
+覆盖 dirty mmap、同文件 mmap 输入/输出、跨 EOF/短读、非对齐回退、EFAULT 后继续操作，
+以及关闭 epoch 时真正排队的 truncate、写回失败后的 epoch 恢复。未做性能收益声明。
+Linux 行为依据为 v6.12 `fs/fat/inode.c:fat_direct_IO`、`mm/filemap.c` 与
+`fs/libfs.c:direct_write_fallback`。当前环境没有可挂载的 Linux FAT 私有设备，真实 FAT
+动态差分尚未完成；源码对照和 BoarOS guest 通过不替代这项验证。

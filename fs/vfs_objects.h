@@ -271,6 +271,9 @@ struct kernel_vfs_backend {
         uint8_t *type,
         char *name,
         size_t name_size);
+    /* Nonzero alignment advertises real synchronous file-data direct I/O. */
+    size_t (*direct_alignment)(struct kernel_vfs_node *);
+    uint64_t (*direct_write_limit)(struct kernel_vfs_node *);
     int (*pread)(struct kernel_vfs_node *node,
         uint64_t offset,
         void *buffer,

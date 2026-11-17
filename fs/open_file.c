@@ -1476,6 +1476,8 @@ int kernel_open_file_pread(struct kernel_open_file_description *file,
         return kernel_block_file_pread(file, offset, buffer, size, bytes_read);
     if (!open_file_live(file)) return -KERNEL_EINVAL;
     if (bytes_read) *bytes_read = 0;
+    if (kernel_open_file_flags(file)&KERNEL_FILES_O_DIRECT)
+        return kernel_vfs_direct_pread(&file->file,offset,buffer,size,bytes_read);
     if (size) kernel_open_file_read_begin(file, offset);
     struct kernel_vfs_read_options options={.no_reuse=kernel_open_file_read_no_reuse(file)};
     int result = kernel_vfs_pread(&file->file, offset, buffer, size, bytes_read, &options);
