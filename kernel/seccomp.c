@@ -179,8 +179,13 @@ int64_t kernel_seccomp_attach_locked(struct kernel_task *task,
         for(;peer!=task;peer=peer->group_next) {
             if(!sync_member(peer,task))continue;
             if(peer->seccomp_mode && (peer->seccomp_mode!=2 ||
-                !ancestor(peer->seccomp_filter,task->seccomp_filter)))
-                return peer->tid?peer->tid:-KERNEL_ESRCH;
+                !ancestor(peer->seccomp_filter,task->seccomp_filter))) {
+                /* The caller holds the identity domain throughout TSYNC. */
+                struct kernel_pid *caller=task->identities[KERNEL_PID_TID].identity;
+                kernel_pid_t failed=kernel_pid_number_in(
+                    peer->identities[KERNEL_PID_TID].identity,caller?caller->registry:NULL);
+                return failed?failed:-KERNEL_ESRCH;
+            }
         }
     }
     filter->path_count=path;filter->previous=task->seccomp_filter;

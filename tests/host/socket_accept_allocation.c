@@ -4,6 +4,10 @@
 #undef main
 #include <kernel/credentials.h>
 
+/* This socket fixture owns no SysV mappings. */
+void kernel_shm_attachment_close_for_task(struct kernel_shm_attachment *a,const struct kernel_task *t)
+{(void)a;(void)t;abort();}
+
 /* No namespace shutdown is admitted by this socket-only fixture. */
 void exited_append_locked(struct kernel_task *task) { (void)task; abort(); }
 
@@ -214,7 +218,23 @@ static void socket_namespace_case(struct kernel_heap *heap)
         assert(!kernel_pid_publish_reserved(&owners[i].id));
         kernel_pid_attach(&children[i].identities[KERNEL_PID_TID],&owners[i].id,KERNEL_PID_TID,&children[i]);
         kernel_pid_attach(&children[i].identities[KERNEL_PID_TGID],&owners[i].id,KERNEL_PID_TGID,&children[i]);
+        children[i].tid=kernel_pid_number_in(&owners[i].id,&scheduler.identities);
+        children[i].tid_owned=1;
     }
+    struct kernel_socket *nl[2]={0};struct kernel_socket_address address[2]={{0},{0}};
+    for(unsigned i=0;i<2;i++) {
+        kernel_cpu_current()->current=&children[i];
+        assert(!kernel_socket_create(heap,KERNEL_SOCKET_AF_NETLINK,3,0,&nl[i]));
+        address[i].family=KERNEL_SOCKET_AF_NETLINK;
+        assert(!kernel_socket_bind(nl[i],&address[i]));
+        assert(!kernel_socket_getname(nl[i],&address[i]));
+    }
+    assert(address[0].scope==1&&address[1].scope&&address[1].scope!=1);
+    kernel_cpu_current()->current=root;
+    struct kernel_socket_address inherited={0};
+    assert(!kernel_socket_getname(nl[0],&inherited)&&inherited.scope==1);
+    kernel_socket_destroy(nl[0]);kernel_socket_destroy(nl[1]);
+    puts("PASS netlink nested TGID autobind, sibling collision and inherited address stability");
     struct kernel_socket *a=NULL,*b=NULL;struct kernel_socket_peercred cred;
     kernel_cpu_current()->current=&children[0];
     assert(!kernel_socket_pair(heap,1,&a,&b));

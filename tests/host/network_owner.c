@@ -385,7 +385,7 @@ enum kernel_scheduler_status kernel_wait_node_remove_sync(struct kernel_wait_nod
 }
 /* Abstract endpoint cases must never fabricate a pathname identity. Real VFS
  * socket inode lookup, permissions and unlink are checked by the VFS suite. */
-enum kernel_task_status kernel_task_tgid(const struct kernel_task *task,kernel_pid_t *pid)
+enum kernel_task_status kernel_task_user_tgid(const struct kernel_task *task,kernel_pid_t *pid)
 { CHECK(task);*pid=model_pid.number;return KERNEL_TASK_STATUS_OK; }
 enum kernel_task_status kernel_task_fs_context_borrow(const struct kernel_task *task,
     const struct kernel_fs_context **fs)

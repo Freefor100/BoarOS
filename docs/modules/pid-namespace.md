@@ -77,6 +77,16 @@ host 的真实三层身份/lifetime/scheduler、proc MM 取得及 kcmp 兄弟 re
 
 异步来源尤其要查清“何时、在哪个视图生成整数”。已经排入队列的 `si_pid` 不能在接收时误当成当前全局 PID 查找；用户提供的 siginfo 也不能不分来源地重写。
 
+### Perf、seccomp 与 netlink 的身份边界
+
+perf_event_open 的非负 PID 按调用者 active 视图解析 TID，0 选择调用者；查到的 task storage borrow 仍由 event 持有至销毁。后续 trace 计数比较真实 task，不拿历史 PID 重查，所以号码复用不会把旧 event 绑定到新任务。原 capability、CPU、属性和 FD 错误检查顺序不变，内部 trace common.pid 与 BPF current_pid_tgid 仍用 root 身份。
+
+seccomp TSYNC 在原身份锁保护的失败分支，将首个不兼容线程的 TID 转为调用者视图；无法解析时为 ESRCH。成功安装/广播、过滤器引用和 exec 等待事务不变，不给正常 syscall 过滤增加转换。netlink 自动绑定只用调用者本地 TGID 作为首选 portid，碰撞仍在 socket registry 锁内选择其他地址；一旦绑定，portid 是 socket 地址，继承 FD、换观察者或进程退出都不触发 PID 翻译或重绑定。显式 portid 不作 PID 查找。
+
+固定 Linux 来源是 [events/core.c](https://raw.githubusercontent.com/torvalds/linux/f4cdf7ca9a1fdcca413157df19753f388a5a224e/kernel/events/core.c) 的 find_lively_task_by_vpid、[seccomp.c](https://raw.githubusercontent.com/torvalds/linux/f4cdf7ca9a1fdcca413157df19753f388a5a224e/kernel/seccomp.c) 的 seccomp_can_sync_threads，以及 [af_netlink.c](https://raw.githubusercontent.com/torvalds/linux/f4cdf7ca9a1fdcca413157df19753f388a5a224e/net/netlink/af_netlink.c) 的 netlink_autobind。
+
+Host 检查 perf lookup 边界本地/内部号不同、重新映射后旧 event 仍持原 task、并发 close 与正在执行的程序；其 task 查找是受控模型。TSYNC 用生产转换/过滤器并保留真实 pthread 安装与 exec 交错。socket fixture 用真实 sibling registry/生产 TGID helper/socket binding 验证两个本地 PID1 的地址冲突和继承地址不变。native `unshare -Urpf ... --seccomp-only` 三轮实际返回本地失败 TID；当前环境 RAW/DGRAM netlink socket 均 EPERM，完整 `--nested` 不计通过，独立 net namespace 重试亦未消除限制。RV4/LA2 在初始 PID namespace 跑实际 netlink 与 TSYNC 程序；完整 nested guest 仍待开放前验收，CLONE_NEWPID 保持关闭。
+
 ### Namespace reboot 隔离
 
 reboot 的权限、magic 和动作校验仍在 syscall 边界执行。有效请求先区分 active PID namespace：初始层沿原全局 machine reboot 路径；nested 层只记录本层最终退出信号、借用其 init task 并提交可信 SIGKILL 等价的 group-exit，不触及全局 reboot 状态。restart/restart2 对外层父报告 SIGHUP，halt/poweroff 报告 SIGINT；发起者按 Linux do_exit(0) 选择单线程退出，不改成任意调用者的 exit_group。RESTART2 的 machine 字符串只在初始层导入，nested 请求不因坏字符串指针返回 EFAULT。

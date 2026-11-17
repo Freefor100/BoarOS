@@ -2504,7 +2504,7 @@ static uint32_t netlink_next_port=0x80000000U;
 static int netlink_bind(struct kernel_socket *socket,uint32_t port,int automatic)
 {
     kernel_pid_t pid=0;
-    if(!port && kernel_task_current())(void)kernel_task_tgid(kernel_task_current(),&pid);
+    if(!port && kernel_task_current())(void)kernel_task_user_tgid(kernel_task_current(),&pid);
     uint32_t preferred=(uint32_t)pid;
     SOCKET_STATE(state);
     if(socket->netlink_port)return automatic || !port || socket->netlink_port==port?0:-KERNEL_EINVAL;
