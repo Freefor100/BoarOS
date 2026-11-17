@@ -2461,3 +2461,12 @@ test-pid-namespace-lifecycle-host:
 		kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c \
 		-Wl,--gc-sections -o build/host/pid-namespace-lifecycle-$$shift; \
 	build/host/pid-namespace-lifecycle-$$shift; done
+
+.PHONY: test-clone3-import-host
+test-clone3-import-host:
+	@mkdir -p build/host
+	@cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_MAX_CPUS=4 -DBOAROS_PAGE_SHIFT=12 \
+		-ffunction-sections -fdata-sections -Itests/host/sync -idirafter include \
+		-fsanitize=address,undefined tests/host/clone3-import.c kernel/syscall/process.c \
+		-Wl,--gc-sections -o build/host/clone3-import
+	@build/host/clone3-import

@@ -280,19 +280,24 @@ struct kernel_pid *kernel_pid_next_published(struct kernel_pid_registry *registr
     }
 }
 
-enum kernel_pid_status kernel_pid_reserve_numbers(struct kernel_pid_registry *registry,
-    struct kernel_pid *prepared, size_t storage_size, const kernel_pid_t *requests, size_t count)
+static enum kernel_pid_status reserve_numbers(struct kernel_pid_registry *registry,
+    struct kernel_pid *prepared, size_t storage_size, const kernel_pid_t *requests, size_t count,
+    int task_identity, int may_set_tid)
 {
     if (!registry || !prepared || storage_size < kernel_pid_storage_size(registry) ||
         count > registry->depth + 1U || (count && !requests)) return KERNEL_PID_STATUS_INVALID;
     if (prepared->registry || prepared->published || prepared->references) return KERNEL_PID_STATUS_STATE;
     struct kernel_pid_registry *root = registry_root(registry);
-    enum kernel_pid_status admitted = kernel_pid_registry_admit(registry);
-    if (admitted) return admitted;
+
     if (!root->next_generation) return KERNEL_PID_STATUS_STATE;
     if (root->next_generation > KERNEL_PID_GENERATION_MAX) return KERNEL_PID_STATUS_EXHAUSTED;
-    for (size_t i = 0; i < count; i++)
-        if (requests[i] <= 0) return KERNEL_PID_STATUS_INVALID;
+    const struct kernel_pid_registry *level = registry;
+    for (size_t i = 0; i < count; i++, level = level->parent) {
+        if (requests[i] <= 0 || (uint32_t)requests[i] > level->numbers->limit)
+            return KERNEL_PID_STATUS_INVALID;
+        /* Today all levels have the initial user namespace as owner. */
+        if (task_identity && !may_set_tid) return KERNEL_PID_STATUS_PERMISSION;
+    }
     size_t reserved = 0;
     enum kernel_pid_status status = KERNEL_PID_STATUS_OK;
     prepared->registry = registry;
@@ -306,7 +311,12 @@ enum kernel_pid_status kernel_pid_reserve_numbers(struct kernel_pid_registry *re
             *binding = (struct kernel_pid_binding){.registry = r, .number = number};
         }
         reserved++;
+        if (task_identity && r->accepting && !r->child_reaper && number != 1) {
+            status = KERNEL_PID_STATUS_INVALID;
+            break;
+        }
     }
+    if (!status) status = kernel_pid_registry_admit(registry);
     if (status) {
         struct kernel_pid_registry *r = registry;
         for (size_t i = 0; i < reserved; i++, r = r->parent)
@@ -319,6 +329,14 @@ enum kernel_pid_status kernel_pid_reserve_numbers(struct kernel_pid_registry *re
     if (registry->managed) kernel_pid_registry_get(registry);
     return KERNEL_PID_STATUS_OK;
 }
+
+enum kernel_pid_status kernel_pid_reserve_task_numbers(struct kernel_pid_registry *registry,
+    struct kernel_pid *prepared, size_t bytes, const kernel_pid_t *requests, size_t count, int may_set_tid)
+{ return reserve_numbers(registry, prepared, bytes, requests, count, 1, may_set_tid); }
+
+enum kernel_pid_status kernel_pid_reserve_numbers(struct kernel_pid_registry *registry,
+    struct kernel_pid *prepared, size_t bytes, const kernel_pid_t *requests, size_t count)
+{ return reserve_numbers(registry, prepared, bytes, requests, count, 0, 0); }
 
 enum kernel_pid_status kernel_pid_reserve_number(struct kernel_pid_registry *registry,
     struct kernel_pid *prepared, kernel_pid_t requested)

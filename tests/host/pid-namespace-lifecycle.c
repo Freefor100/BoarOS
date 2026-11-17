@@ -267,22 +267,27 @@ int main(void)
     }
     /* A new namespace cannot begin with a requested non-init TID. Failure must
      * release the prepared heap object and the temporary namespace reference. */
-    assert(process_identity_create_number(&failed, &init, 0, 2) == KERNEL_PID_STATUS_INVALID);
+    assert(process_identity_create_numbers(&failed, &init, 0, (kernel_pid_t[]){2}, 1, 1) == KERNEL_PID_STATUS_INVALID);
     assert(!child_numbers.allocated && allocations == 1);
     assert(process_identity_create(&failed, &init, 1) == KERNEL_PID_STATUS_INVALID);
     kernel_pid_t conflict[] = {1, 1}, requested[] = {1, 23};
-    assert(process_identity_create_numbers(&failed, &init, 0, conflict, 2) == KERNEL_PID_STATUS_EXISTS);
+    fail_allocation = 1;
+    assert(process_identity_create(&failed, &init, 0) == KERNEL_PID_STATUS_NO_MEMORY);
+    kernel_pid_t outside[] = {1, 65}, invalid_inner[] = {65, 23};
+    assert(process_identity_create_numbers(&failed,&init,0,outside,2,0)==KERNEL_PID_STATUS_PERMISSION);
+    assert(process_identity_create_numbers(&failed,&init,0,invalid_inner,2,0)==KERNEL_PID_STATUS_INVALID);
+    assert(process_identity_create_numbers(&failed,&init,0,outside,2,1)==KERNEL_PID_STATUS_INVALID);
+    assert(process_identity_create_numbers(&failed, &init, 0, conflict, 2, 1) == KERNEL_PID_STATUS_EXISTS);
     assert(!child_numbers.allocated && allocations == 1);
     child_init.group_leader = &child_init; child_init.parent = &init;
     child_init.group_members=1;child_init.magic=KERNEL_THREAD_MAGIC;child_init.arch.user_mode=1;
-    assert(!process_identity_create_numbers(&child_init, &init, 0, requested, 2));
+    assert(!process_identity_create_numbers(&child_init, &init, 0, requested, 2, 1));
+    /* All requested ranges precede the first allocation: the already held
+     * local 1 must not hide the out-of-range outer request. */
+    assert(process_identity_create_numbers(&failed,&init,0,outside,2,1)==KERNEL_PID_STATUS_INVALID);
     struct kernel_task before_init = {0};
-    assert(!process_identity_create(&before_init, &init, 0));
-    {
-        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        assert(process_identity_admit_locked(&before_init) == -KERNEL_ENOMEM);
-    }
-    release(&before_init);
+    assert(process_identity_create(&before_init, &init, 0) == KERNEL_PID_STATUS_INVALID);
+    assert(child_numbers.allocated == 1 && scheduler.pid_allocator.allocated == 2);
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         assert(!process_identity_admit_locked(&child_init));
@@ -309,6 +314,40 @@ int main(void)
         assert(process_find_identity_in(1,KERNEL_PID_TID,&child)==&child_init);
         assert(!process_find_identity_in(23,KERNEL_PID_TID,&child));
         assert(kernel_pid_number_in(id,process_pid_active(&init))==23);
+    }
+    /* A third level accepts complete or partial inner-first requests. Errors
+     * in an outer level must not consume the leaf's unpublished init slot. */
+    {
+        struct kernel_pid_registry *leaf = NULL;
+        struct kernel_task grand = {0}, other = {0};
+        assert(!process_pid_namespace_create(&child, &scheduler.identity_heap, &leaf));
+        {
+            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+            assert(!process_pid_children_install_locked(&child_init, leaf));
+        }
+        kernel_pid_t vector[] = {1, 17, 23};
+        assert(process_identity_create_numbers(&grand,&child_init,0,vector,3,1)==KERNEL_PID_STATUS_EXISTS);
+        assert(!leaf->numbers->allocated && child.numbers->allocated==1);
+        vector[2]=45;
+        grand.group_leader=&grand; grand.parent=&child_init;
+        assert(!process_identity_create_numbers(&grand,&child_init,0,vector,3,1));
+        {
+            KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+            assert(!process_identity_admit_locked(&grand));
+            process_identity_commit_locked(&grand);
+        }
+        assert(grand.tid==45 && process_identity(&grand,KERNEL_PID_TID)->number==1);
+        assert(kernel_pid_number_in(process_identity(&grand,KERNEL_PID_TID),&child)==17);
+        vector[0]=9;
+        assert(!process_identity_create_numbers(&other,&grand,0,vector,1,1));
+        assert(process_identity(&other,KERNEL_PID_TID)->number==9 && other.tid>0);
+        release(&other); release(&grand);
+        {
+            KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+            assert(!process_pid_children_install_locked(&child_init,&child));
+            kernel_pid_registry_put(leaf);
+        }
+        process_identity_collect();
     }
     struct kernel_pid *outer_group = process_identity(&init, KERNEL_PID_PGID);
     struct kernel_pid *outer_session = process_identity(&init, KERNEL_PID_SID);

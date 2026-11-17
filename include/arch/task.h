@@ -36,6 +36,9 @@ static inline uintptr_t arch_frame_pc(const struct arch_trap_frame *s) { return 
 static inline uintptr_t arch_frame_task(const struct arch_trap_frame *s) { return s->kernel_tp; }
 #endif
 struct arch_fpu_state *arch_process_fpu_borrow_current(void);
+struct kernel_syscall_request;
+enum kernel_scheduler_status kernel_clone3_current(const struct arch_trap_frame *,
+    struct kernel_task *, const struct kernel_syscall_request *, int64_t *);
 enum kernel_scheduler_status arch_process_clone_current(
-    const struct arch_trap_frame *, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, int32_t, int32_t, int64_t *);
+    const struct arch_trap_frame *, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, const int32_t *, size_t, int32_t, int64_t *);
 #endif

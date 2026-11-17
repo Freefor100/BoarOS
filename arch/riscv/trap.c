@@ -301,7 +301,11 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
             if(kernel_task_current()->ptrace)kernel_ptrace_syscall_exit(kernel_task_current(),frame,request.number);
             return;
         }
-        if (result.action == KERNEL_SYSCALL_ACTION_CLONE) {
+        if (result.action == KERNEL_SYSCALL_ACTION_CLONE3) {
+            enum kernel_scheduler_status status = kernel_clone3_current(frame, caller, &request, &result.value);
+            if (status != KERNEL_SCHEDULER_STATUS_OK) riscv_scheduler_fatal(frame, status);
+            result.action = KERNEL_SYSCALL_ACTION_RETURN;
+        } else if (result.action == KERNEL_SYSCALL_ACTION_CLONE) {
             enum kernel_scheduler_status scheduler_status =
                 riscv_process_clone_current(
                     frame,
@@ -310,9 +314,8 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
                     request.arguments[2],
                     request.arguments[3],
                     request.arguments[4],
-                    request.number == 435U ? request.arguments[5] : request.arguments[2],
-                    (int32_t)result.value,
-                    result.clone_cgroup_fd,
+                    request.arguments[2], NULL, 0,
+                    -1,
                     &result.value);
 
             if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) {

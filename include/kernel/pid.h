@@ -17,6 +17,8 @@ enum kernel_pid_status {
     KERNEL_PID_STATUS_STATE,
     KERNEL_PID_STATUS_EXISTS,
     KERNEL_PID_STATUS_NAMESPACE_DEAD,
+    KERNEL_PID_STATUS_NO_MEMORY,
+    KERNEL_PID_STATUS_PERMISSION,
 };
 
 struct kernel_pid_allocator {
@@ -127,6 +129,8 @@ size_t kernel_pid_storage_size(const struct kernel_pid_registry *);
 kernel_pid_t kernel_pid_number_in(const struct kernel_pid *, const struct kernel_pid_registry *);
 /* Exact requests use clone3 leaf-to-root order; omitted entries are automatic.
  * Complete storage includes the ancestor tail reported by storage_size. */
+enum kernel_pid_status kernel_pid_reserve_task_numbers(struct kernel_pid_registry *,
+    struct kernel_pid *, size_t storage_size, const kernel_pid_t *, size_t count, int may_set_tid);
 enum kernel_pid_status kernel_pid_reserve_numbers(struct kernel_pid_registry *,
     struct kernel_pid *, size_t storage_size, const kernel_pid_t *, size_t count);
 

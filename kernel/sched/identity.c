@@ -258,10 +258,9 @@ int process_identity_admit_locked(const struct kernel_task *task)
 }
 
 enum kernel_pid_status process_identity_create_numbers(struct kernel_task *task,
-    struct kernel_task *parent, int thread_clone, const kernel_pid_t *requests, size_t count)
+    struct kernel_task *parent, int thread_clone, const kernel_pid_t *requests, size_t count, int may_set_tid)
 {
-    if (count > 32 || (count && !requests)) return KERNEL_PID_STATUS_INVALID;
-    kernel_pid_t requested = count ? requests[0] : 0;
+    if (count > KERNEL_PID_NAMESPACE_MAX_DEPTH || (count && !requests)) return KERNEL_PID_STATUS_INVALID;
     struct kernel_pid_registry *space;
     int pinned = 0;
     {
@@ -269,20 +268,18 @@ enum kernel_pid_status process_identity_create_numbers(struct kernel_task *task,
         space = parent ? process_pid_children_locked(parent) : &scheduler.identities;
         if (!space || (thread_clone && space != process_pid_active(parent)))
             return KERNEL_PID_STATUS_INVALID;
+        if (count > space->depth + 1U) return KERNEL_PID_STATUS_INVALID;
         if (space != &scheduler.identities) { kernel_pid_registry_get(space); pinned = 1; }
     }
     struct kernel_pid *id = 0;
     process_identity_collect();
     size_t size = kernel_pid_storage_size(space);
-    enum kernel_pid_status status = KERNEL_PID_STATUS_EXHAUSTED;
+    enum kernel_pid_status status = KERNEL_PID_STATUS_NO_MEMORY;
     if (kernel_heap_allocate_zeroed(&scheduler.identity_heap, 1, size,
                                     (void **)&id) != KERNEL_HEAP_STATUS_OK) goto unpin;
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        if (space->parent && !space->child_reaper && requested > 1) {
-            status = kernel_pid_registry_admit(space);
-            if (!status) status = KERNEL_PID_STATUS_INVALID;
-        } else status = kernel_pid_reserve_numbers(space, id, size, requests, count);
+        status = kernel_pid_reserve_task_numbers(space, id, size, requests, count, may_set_tid);
         if (status == KERNEL_PID_STATUS_OK) {
             kernel_pid_attach(&task->identities[KERNEL_PID_TID], id, KERNEL_PID_TID, task);
             if (!thread_clone)
@@ -303,16 +300,9 @@ unpin:
     return status;
 }
 
-enum kernel_pid_status process_identity_create_number(struct kernel_task *task,
-    struct kernel_task *parent, int thread_clone, kernel_pid_t requested)
-{
-    return process_identity_create_numbers(task, parent, thread_clone,
-        requested ? &requested : NULL, requested ? 1 : 0);
-}
-
 enum kernel_pid_status process_identity_create(struct kernel_task *task,
     struct kernel_task *parent, int thread_clone)
-{ return process_identity_create_number(task, parent, thread_clone, 0); }
+{ return process_identity_create_numbers(task, parent, thread_clone, NULL, 0, 0); }
 
 void process_identity_commit_locked(struct kernel_task *task)
 {

@@ -815,7 +815,7 @@ enum kernel_scheduler_status arch_process_clone_current(
     uint64_t tls,
     uint64_t child_tid,
     uint64_t pidfd_address,
-    int32_t requested_tid,
+    const int32_t *requested_tids, size_t requested_count,
     int32_t cgroup_fd,
     int64_t *linux_result)
 {
@@ -959,15 +959,24 @@ enum kernel_scheduler_status arch_process_clone_current(
                     : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
         }
     }
-    pid_status = process_identity_create_number(child, parent, thread_clone, requested_tid);
+    int may_set_tid = 0;
+    if (requested_count) {
+        const struct kernel_credentials *cred = kernel_credentials_current();
+        may_set_tid = kernel_credentials_capable(cred, KERNEL_CAP_SYS_ADMIN) ||
+                      kernel_credentials_capable(cred, KERNEL_CAP_CHECKPOINT_RESTORE);
+    }
+    pid_status = process_identity_create_numbers(child, parent, thread_clone,
+        requested_tids, requested_count, may_set_tid);
     if (pid_status != KERNEL_PID_STATUS_OK) {
         return finish_clone_failure(
             child,
+            pid_status == KERNEL_PID_STATUS_PERMISSION ? -KERNEL_EPERM :
             pid_status == KERNEL_PID_STATUS_EXISTS ? -KERNEL_EEXIST :
             pid_status == KERNEL_PID_STATUS_INVALID ? -KERNEL_EINVAL :
             pid_status == KERNEL_PID_STATUS_EXHAUSTED ? -KERNEL_EAGAIN : -KERNEL_ENOMEM,
             linux_result,
-            (pid_status == KERNEL_PID_STATUS_EXHAUSTED || pid_status == KERNEL_PID_STATUS_EXISTS ||
+            (pid_status == KERNEL_PID_STATUS_NO_MEMORY || pid_status == KERNEL_PID_STATUS_PERMISSION ||
+             pid_status == KERNEL_PID_STATUS_EXHAUSTED || pid_status == KERNEL_PID_STATUS_EXISTS ||
              pid_status == KERNEL_PID_STATUS_INVALID || pid_status == KERNEL_PID_STATUS_NAMESPACE_DEAD)
                 ? KERNEL_SCHEDULER_STATUS_OK
                 : KERNEL_SCHEDULER_STATUS_INVALID_STATE);

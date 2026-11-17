@@ -197,9 +197,7 @@ int process_pid_namespace_defer_locked(struct kernel_task *);
 void kernel_signal_ignore_sigchld(struct kernel_task *);
 
 enum kernel_pid_status process_identity_create_numbers(struct kernel_task *,
-    struct kernel_task *, int, const kernel_pid_t *, size_t);
-enum kernel_pid_status process_identity_create_number(struct kernel_task *,
-    struct kernel_task *, int, kernel_pid_t);
+    struct kernel_task *, int, const kernel_pid_t *, size_t, int may_set_tid);
 enum kernel_pid_status process_identity_create(struct kernel_task *task,
     struct kernel_task *parent, int thread_clone);
 void process_identity_release(struct kernel_task *task);

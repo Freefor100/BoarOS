@@ -798,8 +798,10 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
             syscall_decode_clone(request, &decoded);
         }
     } else if (request->number == 435U) {
-        if (syscall_handle_clone3(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
-            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        /* The trap owns the frame. Import clone3 and consume its snapshot in
+         * one slow-path call, after the usual seccomp and trace entry. */
+        decoded.action = KERNEL_SYSCALL_ACTION_CLONE3;
+        decoded.value = 0;
     } else if (request->number == LINUX_SYSCALL_WAIT4) {
         decoded.action = KERNEL_SYSCALL_ACTION_WAIT4;
         decoded.value = 0;

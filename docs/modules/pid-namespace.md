@@ -33,7 +33,7 @@ setns 已使用 namespace FD 或 pidfd 的 PID 快照，与 MNT/UTS/IPC 一起�
 
 当前没有 user namespace；第一阶段 owner 固定为初始 user namespace，并沿现有凭据检查 CAP_SYS_ADMIN。以后加入 user namespace 时，创建/setns/指定 TID 的权限必须按被修改的每一层 owner 计算，不能用“有效 uid 为 0”替代。clone3 在调用核一次导入数组，再检查大小、每层范围、权限和 init 是否存在，不在发布时重读用户指针。
 
-scheduler 的 `process_identity_create_numbers` 已直接消费内核持有的 leaf-to-root 数组，按实际目标深度一次预留；scalar 创建只调用同一函数，不另维护一套规则。生产 fixture 检查 `[1, 23]` 得到本层 init=1、初始层 TID=23，以及祖先冲突后本层编号回滚。**clone3 syscall 仍只支持当前初始层的一个元素**。后续导入多层数组时，建议仅在多元素请求时准备 clone 专用拥有者，沿两种架构 action 消费/失败路径统一释放；不要把 parser 局部栈数组指针带出函数，也不要为所有 syscall 或所有任务常驻 32 个 TID。普通 clone 和单元素请求可保留无额外分配的路径。
+clone3 的专用 trap action 在 seccomp 和 syscall trace 进入检查后，单次导入参数与最多 32 个从内向外的指定 TID，在同一栈帧内调用任务创建。普通 clone 和其他 syscall 不携带数组；没有额外堆对象。目标深度限制实际请求数。每个请求层先检查编号范围，再检查该层 owner 对应的 capability；已有单一初始 user namespace 时复用一次凭据检查结果。全部指定层合法后才逐层占号，无 reaper 的活动层只能预留 1；中途失败归还全部已占号码。发布前仍在身份锁内重查关闭状态。真实 guest 目前仅能调用初始层，不能将多层 fixture 当作已开放嵌套 namespace。
 
 新 namespace 的第一个进程必须为本层 1；尚无 init 时请求非 1 不能成功。基础层只负责占号，不推断哪个任务是 init，此约束必须与 child_reaper 的安装放在同一个发布事务里。`CLONE_PARENT`、线程/信号表共享冲突、深度上限和 clone3 请求数组长度应对照固定 Linux fork 路径检查。
 
