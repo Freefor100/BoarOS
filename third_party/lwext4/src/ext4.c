@@ -1217,7 +1217,17 @@ static int ext4_umount_locked(const char *mount_point)
 	if (r != EOK) return r;
 	if (!mp->fs.read_only) {
 		r = ext4_blockdev_flush(mp->fs.bdev);
-		if (r != EOK) return r;
+        if (r != EOK) {
+            if (!ext4_sb_feature_com(&mp->fs.sb,EXT4_FCOM_HAS_JOURNAL)) {
+                /* The clean superblock write completed, but durability did
+                 * not. Keep this mounted owner failed; no extra FLUSH or
+                 * retry can turn the uncertain session back into writable. */
+                __atomic_store_n(&mp->fs.nojournal_error,r,__ATOMIC_RELEASE);
+                ext4_set16(&mp->fs.sb,state,ext4_get16(&mp->fs.sb,state)&
+                    ~EXT4_SUPERBLOCK_STATE_VALID_FS);
+            }
+            return r;
+        }
 	}
 	r = ext4_block_fini(mp->fs.bdev);
 	if (r != EOK) return r;

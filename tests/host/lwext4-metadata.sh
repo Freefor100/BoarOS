@@ -38,6 +38,9 @@ if [ "${1:-all}" = nojournal-orphan-probe ]; then
         timeout 30 "$work/probe" "$work/orphan.img" seed
         timeout 30 "$work/probe" "$work/orphan.img" nojournal-direct
         check_fs "$work/orphan.img"
+        cp "$work/orphan.img" "$work/flush-failure.img"
+        timeout 30 "$work/probe" "$work/flush-failure.img" nojournal-clean-flush-error
+        timeout 30 "$work/probe" "$work/flush-failure.img" nojournal-reject
         cp "$work/orphan.img" "$work/clean-failure.img"
         timeout 30 "$work/probe" "$work/clean-failure.img" nojournal-clean-write-error
         timeout 30 "$work/probe" "$work/clean-failure.img" nojournal-reject

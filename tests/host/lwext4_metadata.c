@@ -3516,6 +3516,24 @@ static void nojournal_clean_write_error(struct ext4_fs *fs)
     puts("PASS failed clean superblock publication leaves dirty memory and blocks retry-clean");
 }
 
+static void nojournal_clean_flush_error(struct ext4_fs *fs)
+{
+    CHECK(!fs->jbd_journal);
+    ext4_file file;CHECK(ext4_fopen(&file,"/file","r+")==EOK);
+    CHECK(ext4_blockdev_flush(fs->bdev)==EOK);
+    disk.fail_flush=disk.flushes+1;
+    CHECK(ext4_umount("/")==EIO);
+    CHECK(fs->nojournal_error==EIO);
+    CHECK(!(ext4_get16(&fs->sb,state)&EXT4_SUPERBLOCK_STATE_VALID_FS));
+    disk.fail_flush=0;uint64_t writes=disk.writes,flushes=disk.flushes;
+    struct file_write_span span={.buffer="x",.size=1};
+    CHECK(ext4_fpwrite_direct(&file,&span)==EIO && !span.written);
+    CHECK(ext4_remount("/",true)==EIO && ext4_remount("/",false)==EIO);
+    CHECK(ext4_umount("/")==EIO && disk.writes==writes && disk.flushes==flushes);
+    CHECK(fault_block_crash(&disk)==0);
+    puts("PASS final nojournal FLUSH failure: clean memory revoked, error sticky, no mutation/remount/retry-clean");
+}
+
 static void allocation_locality_test(struct ext4_fs *fs)
 {
     struct ext4_sblock *sb = &fs->sb;
@@ -3585,6 +3603,7 @@ int main(int argc,char **argv)
     }
     else if(!strcmp(argv[2],"verify-direct-metadata-reuse")) verify_direct_metadata_reuse(dev.fs,argc>3?strtoul(argv[3],NULL,10):0);
     else if(!strcmp(argv[2],"nojournal-direct"))nojournal_direct_file(dev.fs);
+    else if(!strcmp(argv[2],"nojournal-clean-flush-error")){nojournal_clean_flush_error(dev.fs);return 0;}
     else if(!strcmp(argv[2],"nojournal-clean-write-error")){nojournal_clean_write_error(dev.fs);return 0;}
     else if(!strcmp(argv[2],"nojournal-clean-remount")) {
         CHECK(!dev.fs->jbd_journal && ext4_remount("/",true)==EOK && dev.fs->read_only);
@@ -3705,6 +3724,7 @@ int main(int argc,char **argv)
     }
     else CHECK(!"unknown mode");
     CHECK(ext4_umount("/")==EOK);
+    if(!strcmp(argv[2],"nojournal-orphan-reopen")) CHECK(!disk.writes && !disk.flushes);
     if(!strcmp(argv[2],"group-ordered-retire-batch"))
         CHECK(!retired_account.bytes && retired_account.references==1 && !live_allocations);
     if(!strncmp(argv[2],"extent-read-",12) || !strncmp(argv[2],"extent-prepend",14))CHECK(!live_allocations);

@@ -35,7 +35,11 @@
 
 当前挂载的 bcache 写回发生设备错误后锁存 `nojournal_error`，后续 mutation、
 cache writeback、remount/umount 不得以重试把不确定元数据标 clean。最终 clean
-superblock 写入失败时不发布 clean 内存状态。journal 会话不走这条保护；普通
+superblock 写入失败时不发布 clean 内存状态；其后既有最终设备 FLUSH 失败也
+锁存错误并撤销内存 clean，后续操作不能靠重试继续写入。没有增加 FLUSH。
+故障模型中失败 FLUSH 后 crash 恢复为此前持久的 dirty 状态；真实设备报错可能
+已持久化任意前缀，不能保证盘上必为 dirty，也不能据此宣称自动崩溃恢复安全。
+journal 会话不走这条保护；普通
 DIRECT 设备数据错误若原有 extent 清理成功，并不自动等同于 metadata 错误。
 
 这是一项保守兼容性变化：本实现不具备离线 fsck 的扫描修复能力，故不再允许
