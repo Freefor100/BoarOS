@@ -6713,7 +6713,7 @@ enum kernel_mm_status kernel_mm_proc_maps_snapshot(const struct kernel_mm *mm,
             if (kernel_vma_set_get_at(record->vmas, i, &vma)) __builtin_trap();
             struct kernel_mm_proc_map *row = &data[i];
             *row = (struct kernel_mm_proc_map){ .start = vma.start, .end = vma.end,
-                .permissions = vma.permissions, .role = vma.role,
+                .permissions = vma.permissions, .flags = vma.flags, .kind = vma.kind, .role = vma.role,
                 .shared = vma.kind == KERNEL_VMA_KIND_FILE_SHARED ||
                     vma.kind == KERNEL_VMA_KIND_ANON_SHARED ||
                     vma.kind == KERNEL_VMA_KIND_SYSV_SHM ||

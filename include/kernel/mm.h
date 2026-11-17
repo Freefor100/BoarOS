@@ -376,7 +376,8 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm);
 uint64_t kernel_mm_peak_resident_pages(const struct kernel_mm *mm);
 struct kernel_mm_proc_map {
     uint64_t start, end, offset;
-    uint32_t permissions;
+    uint32_t permissions, flags;
+    enum kernel_vma_kind kind;
     enum kernel_vma_role role;
     unsigned shared;
     struct kernel_open_file_description *file;
