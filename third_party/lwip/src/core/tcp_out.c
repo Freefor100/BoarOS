@@ -1234,7 +1234,7 @@ tcp_split_unsent_seg(struct tcp_pcb *pcb, u16_t split)
   successfully because we are modifying the original segment */
   pbuf_realloc(useg->p, useg->p->tot_len - remainder);
   useg->len -= remainder;
-  TCPH_SET_FLAG(useg->tcphdr, split_flags);
+  TCPH_FLAGS_SET(useg->tcphdr, split_flags);
 #if TCP_OVERSIZE_DBGCHECK
   /* By trimming, realloc may have actually shrunk the pbuf, so clear oversize_left */
   useg->oversize_left = 0;
