@@ -29,6 +29,9 @@ enum kernel_task_status kernel_task_mm_borrow_mutable(struct kernel_task *task,s
     if(!status)*mm=(struct kernel_mm *)bound;
     return status;
 }
+/* This fixture opens ordinary OFDs but never registers asynchronous signals. */
+void kernel_open_file_async_close(struct kernel_open_file_description *file)
+{ assert(file && !file->async_io); }
 static unsigned char pool[16*1024*1024] __attribute__((aligned(16384)));
 static struct physical_page_allocator pages;
 static struct kernel_heap heap;
@@ -37,7 +40,6 @@ static uint64_t memlock_limit=UINT64_MAX;
 uint64_t kernel_task_current_memlock_limit(void) { return memlock_limit; }
 static void *access(uint64_t p) { return (void *)(uintptr_t)p; }
 static int address_of(const void *p,uint64_t *out) { *out=(uintptr_t)p; return 1; }
-void mm_test_fence(uint64_t address,int instructions) { (void)address;(void)instructions; }
 static void opened(struct kernel_vfs_mount *mount,const char *name,unsigned mode,
                    struct kernel_open_file_description **file)
 {int error;assert(!kernel_open_file_create_mode(&heap,mount,name,mode,file,&error)&&!error);}
@@ -288,8 +290,6 @@ static void mount_views(struct kernel_vfs_mount *mount)
     assert(!kernel_vfs_path_release(&bound)&&!kernel_vfs_path_release(&source)&&!kernel_vfs_path_release(&covered));
     assert(!kernel_vfs_path_release(&root));
 }
-void kernel_page_cache_put_batch(struct kernel_page_cache *cache,struct kernel_page_cache_read_page *pages,size_t count)
-{ (void)cache;(void)pages;(void)count;__builtin_trap(); }
 static _Thread_local unsigned delayed_constructor;
 static unsigned constructor_entered,constructor_release,constructor_done,publish_during_snapshot;
 static unsigned publish_sync_calls[3];

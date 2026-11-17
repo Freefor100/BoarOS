@@ -147,7 +147,7 @@ void mm_test_fence(uint64_t address, int instructions)
 void riscv_smp_sync_user(uint32_t targets,uint64_t address,uint64_t size,int instructions)
 { (void)targets; (void)size; mm_test_fence(address,instructions); }
 #endif
-#ifndef FILE_IO_CASES
+#if !defined(FILE_IO_CASES) && !defined(MM_TEST_EPOLL)
 EXCLUDED(kernel_epoll_notify_file_release)
 EXCLUDED(kernel_epoll_destroy)
 #endif
@@ -161,3 +161,4 @@ EXCLUDED(kernel_pipe_release_endpoint)
 EXCLUDED(kernel_pipe_destroy)
 #endif
 EXCLUDED(kernel_bpf_mmap_page)
+EXCLUDED(kernel_bpf_mmap_begin)
