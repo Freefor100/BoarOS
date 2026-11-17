@@ -15,6 +15,8 @@
 | `tests/diff-abi/shm.c` | 针对固定 Linux 参考内核的双侧差分 ABI 测试 |
 | `tests/userland/sysv_shm.h` | 真实 musl 用户态多进程 fork 与读写一致性验证 |
 
+创建 `SHM_HUGETLB` 段尚未实现，当前明确返回 `ENOSYS`，不会静默退回基页。已有 key 的查找仍先执行大小、权限及 `CREAT|EXCL` 检查，不因该创建标志改变语义。匿名 `MAP_HUGETLB` 的支持不代表 SysV SHM 已有大页后备。
+
 ## 核心不变量与生命周期
 
 1. **唯一段所有权与统一后备对象**：

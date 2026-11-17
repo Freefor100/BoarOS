@@ -209,6 +209,12 @@ int kernel_shm_get(struct kernel_task *caller, int32_t key, uint64_t size,
         arch_interrupt_restore(irq);
         return -KERNEL_EINVAL;
     }
+    /* This creator has no huge-page backing yet. Do not silently publish a
+     * base-page segment; existing-key lookups above ignore creation flags. */
+    if (shmflg & KERNEL_SHM_HUGETLB) {
+        arch_interrupt_restore(irq);
+        return -KERNEL_ENOSYS;
+    }
     uint64_t aligned_size = (size + BOAROS_PAGE_SIZE - 1U) & ~BOAROS_PAGE_MASK;
 
     /* Allocate new slot */

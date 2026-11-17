@@ -6,6 +6,8 @@
 
 #include <kernel/ipc.h>
 
+#define KERNEL_SHM_HUGETLB 04000
+
 #define KERNEL_SHM_RDONLY 010000
 #define KERNEL_SHM_RND    020000
 #define KERNEL_SHM_REMAP  040000
