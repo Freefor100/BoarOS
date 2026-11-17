@@ -188,10 +188,10 @@ enum kernel_syscall_status syscall_handle_prctl_credentials(struct kernel_task *
     }
     case 38:
         if(a!=1||b||c||d)return KERNEL_SYSCALL_STATUS_OK;
-        {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);caller->no_new_privs=1;}
+        {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);__atomic_store_n(&caller->no_new_privs,1,__ATOMIC_RELEASE);}
         decoded->value=0;return KERNEL_SYSCALL_STATUS_OK;
     case 39:
-        if(!(a|b|c|d))decoded->value=!!caller->no_new_privs;
+        if(!(a|b|c|d))decoded->value=!!__atomic_load_n(&caller->no_new_privs,__ATOMIC_ACQUIRE);
         return KERNEL_SYSCALL_STATUS_OK;
     case 47:
         if(a==4){if(b|c|d)return KERNEL_SYSCALL_STATUS_OK;break;}

@@ -364,7 +364,7 @@ int ptrace_clone_locked(struct kernel_task *p,struct kernel_task *c,uint64_t fla
 static int exec_busy(struct kernel_task *t)
 {
     KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-    return !t->proc_exiting && !t->retirement && kernel_task_ptrace_exec_busy_locked(t);
+    return !t->proc_exiting && !t->retirement && kernel_task_exec_busy_locked(t);
 }
 
 static int attach(struct kernel_task *caller,struct kernel_task *target,int32_t requested_tid,uint64_t request,uint64_t addr,uint64_t data)
@@ -399,7 +399,7 @@ static int attach(struct kernel_task *caller,struct kernel_task *target,int32_t 
                 !t->arch.user_mode || t->proc_exiting || !t->group_leader ||
                 t->group_leader->core_session) return -KERNEL_EPERM;
             if (tracer->proc_exiting) return self?0:-KERNEL_EPERM;
-            if (self || !kernel_task_ptrace_exec_busy_locked(t)) {
+            if (self || !kernel_task_exec_busy_locked(t)) {
                 if (self) {
                     if ((kernel_credentials_task_locked(t)->permitted&~cred->permitted) &&
                         !kernel_credentials_capable(cred,KERNEL_CAP_SYS_PTRACE)) return -KERNEL_EPERM;

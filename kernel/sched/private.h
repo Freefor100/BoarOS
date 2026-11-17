@@ -130,6 +130,8 @@ static inline enum kernel_scheduler_status scheduler_failure(void)
  * under the same domain as discovery and lasts through task_put(). */
 struct kernel_task *scheduler_task_lookup_locked(kernel_pid_t, enum kernel_pid_role, uint64_t);
 struct kernel_task *scheduler_task_lookup(kernel_pid_t, enum kernel_pid_role, uint64_t);
+/* Shared exec credential/image exclusion; scheduler domain held. */
+int kernel_task_exec_busy_locked(struct kernel_task *);
 void scheduler_task_get_locked(struct kernel_task *);
 void scheduler_task_put(struct kernel_task *);
 static inline void scheduler_task_borrow_end(struct kernel_task **task)

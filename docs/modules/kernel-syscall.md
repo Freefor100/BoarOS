@@ -146,7 +146,7 @@ restart block，避免稍后的信号交付改写已完成调用的返回值和 
 同优先级保留最新过滤器的数据。未知 action 在最终选中时按 Linux 终止整个
 线程组，不能当 ALLOW。已知但尚未实现的 TRACE、LOG、USER_NOTIF，以及
 动态 `RET A`，在安装时返回 `EOPNOTSUPP`，并不冒充完整 Linux FILTER 支持。
-所有非零安装 flags（包括 TSYNC、NEW_LISTENER）返回 `EINVAL`；
+安装 flags 支持 TSYNC；NEW_LISTENER、TSYNC_ESRCH 等其余位返回 `EINVAL`；
 GET_ACTION_AVAIL 只对上述五种 action 成功，GET_NOTIF_SIZES 尚不支持。
 
 TRAP 不执行系统调用，向触发线程强制投递 SIGSYS/SYS_SECCOMP，携带完整的
@@ -164,9 +164,22 @@ BPF 的网络字节序/包元数据解释路径，也不解引用用户参数中
 的身份快速路径之前过滤；输入包含调用号、AUDIT_ARCH、恢复 PC 和完整六个
 64 位参数。未启用线程仅多一个 mode 判断；启用线程只遍历不可变链，不在
 每次调用分配、取全局锁或更新引用计数。fork/clone 共享链引用，exec（包括
-非 leader exec）保留当前线程自己的策略，追加过滤器不改变兄弟线程；失败
+非 leader exec）保留当前线程自己的策略，无 TSYNC 的追加不改变兄弟线程；失败
 clone 与退出均在任务最终销毁时归还引用。KILL_THREAD 使用独立的线程终止
 入口，避免普通致命信号的整组退出语义。
+
+TSYNC 在调度域内先检查所有未退出线程，再一次提交全部叶指针和调用者的
+no_new_privs。目标必须尚未启用过滤，或持有调用者当前链的同一节点/祖先；
+指令相同但独立安装的节点不算祖先。不能同步时返回失败线程的正 TID，
+不安装调用者的新过滤器，也不改变其他线程。路径超限、复制或分配失败同样
+没有部分修改。每条旧链都仍由新链持有，启用线程只需 acquire 读取叶指针，
+不增加逐调用引用或全局锁；未启用线程只做 relaxed mode 读取。
+
+clone 准备资源后，在发布线程/进程的同一临界区继承最新过滤链和
+no_new_privs，避免准备期间的 TSYNC 被旧快照覆盖。TSYNC 等待已经开始的
+exec 凭据决策结束，普通信号延后交付；组退出或成功 exec 可以直接取消该
+等待，使退出线程不会反过来阻塞 exec。借用目标线程覆盖等待队列寿命。
+只在安装与生命周期交接取调度锁，不暂停整个线程组执行已进入的 syscall。
 
 语义核对依据 Linux v6.12 `kernel/seccomp.c` 与官方
 [Seccomp BPF 文档](https://docs.kernel.org/userspace-api/seccomp_filter.html)。
@@ -178,7 +191,12 @@ clone 与退出均在任务最终销毁时归还引用。KILL_THREAD 使用独�
 FUTEX_WAIT 经 STOP/CONT 后 restart_syscall 被拒绝和后续信号的恢复 PC/a0。
 其他阻塞 syscall 的自动重启路径尚未进行动态定向验证。
 `tests/userland/seccomp.py` 使用已编译 ELF 与内核在两架构启动；
-`make test-seccomp-host` 直接验证生产解释器、校验器、安装 OOM 与共享链释放。
+`make test-seccomp-host` 验证生产解释器、安装 OOM、祖先链和共享引用；
+生产调度安装与 exec 状态检查另覆盖准备前、复查后至 park、COMMITTED、
+finish 后的终止窗口，以及并行安装。fixture 替换机器等待边界，不代表真实
+clone/exec 的所有失败阶段。Linux/BoarOS 同源 `tests/workloads/seccomp/tsync.c`
+覆盖线程组传播、失败 TID、无部分修改、STRICT 兄弟线程、并行安装、
+clone 发布和非组长 exec；可交给同一 `tests/userland/seccomp.py` 启动。
 
 ## 双架构 ABI 差分入口
 

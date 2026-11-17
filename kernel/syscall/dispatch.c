@@ -885,7 +885,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
     COST_SCOPE(syscall_cost, OPERATION_TICKS);
     COST_ADD(OPERATIONS, 1);
 #endif
-    if (caller->seccomp_mode && kernel_seccomp_check(caller,request,result))
+    if (__atomic_load_n(&caller->seccomp_mode,__ATOMIC_RELAXED) && kernel_seccomp_check(caller,request,result))
         return KERNEL_SYSCALL_STATUS_OK;
     /* 身份查询只读取调用线程的现有身份，直接完成这组标量调用，
      * 避免经过业务分发表后再次分发。权限/身份读取仍由原操作负责。 */

@@ -265,6 +265,7 @@ struct kernel_task {
     const struct kernel_credentials *credentials_override;
     uint32_t no_new_privs;
     uint32_t seccomp_mode;
+    uint32_t seccomp_exec_waiting; /* scheduler-domain protected, fatal-only wait */
     struct kernel_seccomp_filter *seccomp_filter;
     struct kernel_exec_security *exec_security;
     struct kernel_socket_call *socket_call;

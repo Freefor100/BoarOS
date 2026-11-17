@@ -122,21 +122,17 @@ static int copy_in(struct kernel_task *task,void *to,uint64_t from,size_t size)
 int64_t kernel_seccomp_set(struct kernel_task *task,uint32_t mode,uint32_t flags,uint64_t address)
 {
     if (mode!=1 && mode!=2) return -KERNEL_EINVAL;
-    if (flags || (task->seccomp_mode && task->seccomp_mode!=mode)) return -KERNEL_EINVAL;
+    if (flags & ~1U || (mode==1 && flags)) return -KERNEL_EINVAL;
     if (mode==1) {
         if (address) return -KERNEL_EINVAL;
-        task->seccomp_mode=1;
-        return 0;
+        return kernel_seccomp_install(task,0,0);
     }
-    if (!task->no_new_privs &&
+    if (!__atomic_load_n(&task->no_new_privs,__ATOMIC_RELAXED) &&
         !kernel_credentials_capable(task->credentials,KERNEL_CAP_SYS_ADMIN)) return -KERNEL_EACCES;
     struct { uint16_t count; uint16_t pad[3]; uint64_t instructions; } program;
     int error=copy_in(task,&program,address,sizeof(program));
     if (error) return error;
     if (!program.count || program.count>KERNEL_BPF_CLASSIC_MAX_INSNS) return -KERNEL_EINVAL;
-    uint32_t path=program.count;
-    if (task->seccomp_filter) path+=task->seccomp_filter->path_count+4;
-    if (path>PATH_MAX) return -KERNEL_ENOMEM;
     struct kernel_heap *heap=task->files.heap;
     struct kernel_seccomp_filter *filter=allocate(heap,sizeof(*filter)+program.count*sizeof(filter->instructions[0]));
     if (!filter) return -KERNEL_ENOMEM;
@@ -146,12 +142,61 @@ int64_t kernel_seccomp_set(struct kernel_task *task,uint32_t mode,uint32_t flags
         error=kernel_seccomp_validate(filter->instructions,program.count,&env);
     }
     if (error) {release(heap,filter);return error;}
-    filter->heap=heap;filter->references=1;filter->count=program.count;filter->path_count=path;
-    /* This running task is the only writer (TSYNC is not exposed). Transfer
-     * its old-chain reference into the immutable new node, without ref churn. */
-    filter->previous=task->seccomp_filter;
-    task->seccomp_filter=filter;
-    task->seccomp_mode=2;
+    filter->heap=heap;filter->references=1;filter->count=program.count;
+    int64_t result=kernel_seccomp_install(task,filter,flags);
+    if(result) release(heap,filter);
+    return result;
+}
+
+static int ancestor(struct kernel_seccomp_filter *parent,struct kernel_seccomp_filter *child)
+{
+    if(!parent)return 1;
+    for(;child;child=child->previous)if(child==parent)return 1;
+    return 0;
+}
+static int sync_member(const struct kernel_task *task,const struct kernel_task *caller)
+{ return task!=caller && !task->proc_exiting; }
+
+/* The scheduler domain protects all leaf writers and group/exec publication.
+ * Every replacement is a descendant of the old leaf. Thus a running task's
+ * old snapshot stays reachable without a read-side lock or reference update. */
+int64_t kernel_seccomp_attach_locked(struct kernel_task *task,
+    struct kernel_seccomp_filter *filter,uint32_t flags)
+{
+    uint32_t mode=filter?2:1;
+    if(task->seccomp_mode && task->seccomp_mode!=mode)return -KERNEL_EINVAL;
+    if(!filter) {
+        __atomic_store_n(&task->seccomp_mode,1,__ATOMIC_RELEASE);
+        return 0;
+    }
+    uint32_t path=filter->count;
+    if(task->seccomp_filter)path+=task->seccomp_filter->path_count+4;
+    if(path>PATH_MAX)return -KERNEL_ENOMEM;
+    if(flags&1) {
+        struct kernel_task *peer=task->group_next;
+        for(;peer!=task;peer=peer->group_next) {
+            if(!sync_member(peer,task))continue;
+            if(peer->seccomp_mode && (peer->seccomp_mode!=2 ||
+                !ancestor(peer->seccomp_filter,task->seccomp_filter)))
+                return peer->tid?peer->tid:-KERNEL_ESRCH;
+        }
+    }
+    filter->path_count=path;filter->previous=task->seccomp_filter;
+    __atomic_store_n(&task->seccomp_filter,filter,__ATOMIC_RELEASE);
+    __atomic_store_n(&task->seccomp_mode,2,__ATOMIC_RELEASE);
+    if(flags&1) {
+        for(struct kernel_task *peer=task->group_next;peer!=task;peer=peer->group_next) {
+            if(!sync_member(peer,task))continue;
+            struct kernel_seccomp_filter *old=peer->seccomp_filter;
+            if(__atomic_fetch_add(&filter->references,1,__ATOMIC_RELAXED)==UINT32_MAX)__builtin_trap();
+            if(task->no_new_privs)__atomic_store_n(&peer->no_new_privs,1,__ATOMIC_RELEASE);
+            __atomic_store_n(&peer->seccomp_filter,filter,__ATOMIC_RELEASE);
+            __atomic_store_n(&peer->seccomp_mode,2,__ATOMIC_RELEASE);
+            /* Compatibility proves the new path retains this ancestor. Never
+             * allocate/free or run fallible operations after first publication. */
+            if(old && __atomic_fetch_sub(&old->references,1,__ATOMIC_ACQ_REL)<=1)__builtin_trap();
+        }
+    }
     return 0;
 }
 
@@ -185,7 +230,7 @@ void kernel_seccomp_release(struct kernel_task *task)
 int kernel_seccomp_check(struct kernel_task *task,const struct kernel_syscall_request *request,
     struct kernel_syscall_result *result)
 {
-    if (task->seccomp_mode==1) {
+    if (__atomic_load_n(&task->seccomp_mode,__ATOMIC_ACQUIRE)==1) {
         if (request->number==63 || request->number==64 || request->number==93 || request->number==139) return 0;
         kernel_seccomp_terminate(9,0);
     }
@@ -198,7 +243,7 @@ int kernel_seccomp_check(struct kernel_task *task,const struct kernel_syscall_re
         .instruction_pointer=request->instruction_pointer};
     for (unsigned i=0;i<6;i++) data.args[i]=request->arguments[i];
     uint32_t verdict=RET_ALLOW;
-    for (struct kernel_seccomp_filter *f=task->seccomp_filter;f;f=f->previous) {
+    for (struct kernel_seccomp_filter *f=__atomic_load_n(&task->seccomp_filter,__ATOMIC_ACQUIRE);f;f=f->previous) {
         uint32_t value=kernel_seccomp_run(f->instructions,f->count,&data);
         /* Signed action ordering gives KILL_PROCESS highest precedence. Equal
          * priority preserves data from the most recently installed filter. */

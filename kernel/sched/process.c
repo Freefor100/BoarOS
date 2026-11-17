@@ -314,6 +314,7 @@ static void request_thread_termination_locked(struct kernel_task *task)
         else ready_enqueue_locked(task, 0);
     }
     ptrace_terminate_locked(task);
+    kernel_seccomp_abort_wait_locked(task);
     kernel_wait_interrupt_locked(task);
 }
 
@@ -871,8 +872,6 @@ enum kernel_scheduler_status arch_process_clone_current(
     if(io_result)
         return finish_clone_failure(child,io_result,linux_result,KERNEL_SCHEDULER_STATUS_OK);
     child->personality=parent->personality;
-    child->no_new_privs=parent->no_new_privs;
-    kernel_seccomp_clone(child,parent);
     child->arch.user_mode = 1U;
     child->state = KERNEL_THREAD_STATE_EXITED;
     child->completion.kind = KERNEL_THREAD_KIND_USER;
@@ -1087,6 +1086,10 @@ enum kernel_scheduler_status arch_process_clone_current(
             child->cgroup = kernel_cgroup_get(chosen);
             chosen->members++;
         }
+        /* A sibling TSYNC may have committed while clone prepared resources.
+         * Snapshot policy at the same point that makes the child discoverable. */
+        child->no_new_privs=parent->no_new_privs;
+        kernel_seccomp_clone(child,parent);
         trace_event = (unsigned)event;
         memcpy(child->comm, parent->comm, sizeof(child->comm));
         if(pidfd.files) kernel_pidfd_install_clone_locked(&pidfd);

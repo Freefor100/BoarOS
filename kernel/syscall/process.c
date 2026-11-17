@@ -47,7 +47,7 @@ enum kernel_syscall_status syscall_handle_prctl(
     uint32_t option = (uint32_t)request->arguments[0];
     if (option==21U || option==22U) {
         decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
-        decoded->value=option==21U ? caller->seccomp_mode :
+        decoded->value=option==21U ? __atomic_load_n(&caller->seccomp_mode,__ATOMIC_ACQUIRE) :
             kernel_seccomp_set(caller,(uint32_t)request->arguments[1],0,
                 (uint32_t)request->arguments[1]==1 ? 0 : request->arguments[2]);
         return KERNEL_SYSCALL_STATUS_OK;
