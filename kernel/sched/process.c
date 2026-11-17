@@ -3311,13 +3311,14 @@ static void install_namespaces(struct kernel_task *task,struct kernel_fs_context
     kernel_namespace_put(old_uts);kernel_namespace_put(old_ipc);
     if(pid && !fresh_pid)process_identity_collect();
 }
-int process_unshare_namespaces(struct kernel_task *task,uint64_t flags)
+int kernel_task_unshare_namespaces(struct kernel_task *task,uint64_t flags)
 {
     const uint64_t namespaces=KERNEL_NS_MNT|KERNEL_NS_UTS|KERNEL_NS_IPC|KERNEL_NS_PID;
     if(flags&~(LINUX_CLONE_FS|LINUX_CLONE_THREAD|namespaces|LINUX_CLONE_SYSVSEM))return -KERNEL_EINVAL;
     if(!flags)return 0;
     /* In the pinned Linux ksys_unshare NEWPID alone does not imply THREAD. */
     if(flags&LINUX_CLONE_THREAD) {
+        if(!(flags&KERNEL_NS_PID))return -KERNEL_EINVAL; /* No standalone thread unshare. */
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         if(task->group_leader->group_members!=1)return -KERNEL_EINVAL;
     }
@@ -3345,12 +3346,6 @@ int process_unshare_namespaces(struct kernel_task *task,uint64_t flags)
     if(!error)install_namespaces(task,&fs,&uts,&ipc,pid,!!(flags&(KERNEL_NS_IPC|LINUX_CLONE_SYSVSEM)),0,pid!=NULL);
     if(fs.state==KERNEL_FS_CONTEXT_LIVE && kernel_fs_context_release(&fs))__builtin_trap();
     kernel_namespace_put(uts);kernel_namespace_put(ipc);return error;
-}
-int kernel_task_unshare_namespaces(struct kernel_task *task,uint64_t flags)
-{
-    /* Keep public PID creation disabled until the nested guest ABI is ready. */
-    if(flags&(KERNEL_NS_PID|LINUX_CLONE_THREAD))return -KERNEL_EINVAL;
-    return process_unshare_namespaces(task,flags);
 }
 int kernel_task_setns(struct kernel_task *task,int32_t fd,uint32_t type)
 {

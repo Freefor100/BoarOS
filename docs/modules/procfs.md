@@ -12,7 +12,7 @@
 
 stat/status 在 identity 锁内捕获 PID/TGID/PPID/PGID/SID 与 tracer 的 TID，外层身份在内层不可见时显示 0。NSpid/NStgid/NSpgid/NSsid 从挂载层列到任务 active 层。pidfd fdinfo 持有原 FD 的真实身份，在挂载视图中显示 Pid 与 NSpid；跨兄弟视图显示单个 0，任务已不存在显示 -1，不能用历史整数重新查找。快照的可睡眠阶段只使用已捕获的 PID 标量；资源引用与权限仍按原 proc 规则复核。
 
-生产查询的 `test-proc-index-host` 覆盖三层与兄弟同号、读取者更换、线程成员过滤、外层/非 leader tracer、旧 role 转移、pidfd 可见/不可见/死亡和挂载最后引用回收。`test-proc-maps-host` 另检查本地目录名/cookie 与 canonical inode 的适配。RV/LA 的 pid_namespace、ptrace、mount_context 程序验证真实初始视图 status/继承 FD/pidfd fdinfo/TracerPid 和挂载路径；受控 host 测试不等同完整 nested guest。CLONE_NEWPID 仍关闭，IPC/cgroup 等独立 PID 输出的迁移与整体开放条件见 [PID namespace](pid-namespace.md)。
+生产查询的 `test-proc-index-host` 覆盖三层与兄弟同号、读取者更换、线程成员过滤、外层/非 leader tracer、旧 role 转移、pidfd 可见/不可见/死亡和挂载最后引用回收。`test-proc-maps-host` 另检查本地目录名/cookie 与 canonical inode 的适配。RV/LA 的 pid_namespace、ptrace、mount_context 程序验证真实初始视图 status/继承 FD/pidfd fdinfo/TracerPid 和挂载路径；受控 host 测试不等同完整 nested guest。嵌套创建与 IPC/cgroup 等独立 PID 输出见 [PID namespace](pid-namespace.md)。
 
 生成式普通文件不进入 ext4 页缓存。后端 `snapshot` 返回由 OFD 持有的堆缓冲；第一次非空顺序读取或非零seek形成快照，连续短读、readv和pread复用已生成的内容，seek 到零后释放并在下一次读取重新取值；定位读取偏移与上次读取进度不连续时也重新生成，`SEEK_END` 按固定 Linux 的 seq_file 语义返回 `EINVAL`。用户复制时不持有后端或 inode 锁；只推进已经复制的字节。OFD 末引用释放快照，mount 忙判断覆盖文件及目录引用。`fstat` 中的 size 为零是生成文件的元数据语义，不能由它推断 read EOF。
 

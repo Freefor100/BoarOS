@@ -180,7 +180,6 @@ void kernel_proc_task_update_comm(struct kernel_task *task);
 void scheduler_wake_task(struct kernel_task *thread, uint32_t reason);
 /* Creation/snapshot callers retain the source registry across sleeping allocation.
  * Returned registry owners are put under the identity lock, then collected. */
-int process_unshare_namespaces(struct kernel_task *, uint64_t);
 int process_pid_namespace_create(struct kernel_pid_registry *, struct kernel_heap *,
     struct kernel_pid_registry **);
 int process_pid_namespace_snapshot(struct kernel_pid_registry *, struct kernel_heap *,
