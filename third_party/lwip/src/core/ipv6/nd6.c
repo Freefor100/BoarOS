@@ -105,7 +105,9 @@ static netif_addr_idx_t nd6_cached_destination_index;
 /* Multicast address holder. */
 static ip6_addr_t multicast_address;
 
+#if LWIP_IPV6_SEND_ROUTER_SOLICIT
 static u8_t nd6_tmr_rs_reduction;
+#endif
 
 /* Static buffer to parse RA packet options */
 union ra_options {
@@ -508,11 +510,11 @@ nd6_input(struct pbuf *p, struct netif *inp)
       for (i = 0; i < LWIP_IPV6_NUM_ADDRESSES; ++i) {
         if (!ip6_addr_isinvalid(netif_ip6_addr_state(inp, i)) &&
             ip6_addr_eq(&target_address, netif_ip6_addr(inp, i))) {
-          /* Send a NA back so that the sender does not use this address. */
-          nd6_send_na(inp, netif_ip6_addr(inp, i), ND6_FLAG_OVERRIDE | ND6_SEND_FLAG_ALLNODES_DEST);
           if (ip6_addr_istentative(netif_ip6_addr_state(inp, i))) {
-            /* We shouldn't use this address either. */
+            /* RFC 4862 5.4.3: a tentative address cannot advertise itself. */
             nd6_duplicate_addr_detected(inp, i);
+          } else {
+            nd6_send_na(inp, netif_ip6_addr(inp, i), ND6_FLAG_OVERRIDE | ND6_SEND_FLAG_ALLNODES_DEST);
           }
         }
       }
@@ -568,6 +570,11 @@ nd6_input(struct pbuf *p, struct netif *inp)
   }
   case ICMP6_TYPE_RA: /* Router Advertisement. */
   {
+#ifdef BOAROS_LWIP_LINKLOCAL_ONLY
+    /* Do not install invisible default routes/prefixes in link-local mode. */
+    pbuf_free(p);
+    return;
+#endif
     struct ra_header *ra_hdr;
     u8_t *buffer; /* Used to copy options. */
     u16_t offset;
@@ -820,6 +827,10 @@ nd6_input(struct pbuf *p, struct netif *inp)
   }
   case ICMP6_TYPE_RD: /* Redirect */
   {
+#ifdef BOAROS_LWIP_LINKLOCAL_ONLY
+    pbuf_free(p);
+    return;
+#endif
     struct redirect_header *redir_hdr;
     struct lladdr_option *lladdr_opt;
     ip6_addr_t destination_address, target_address;
@@ -2465,6 +2476,7 @@ nd6_adjust_mld_membership(struct netif *netif, s8_t addr_idx, u8_t new_state)
 void
 nd6_restart_netif(struct netif *netif)
 {
+  LWIP_UNUSED_ARG(netif);
 #if LWIP_IPV6_SEND_ROUTER_SOLICIT
   /* Send Router Solicitation messages (see RFC 4861, ch. 6.3.7). */
   netif->rs_count = LWIP_ND6_MAX_MULTICAST_SOLICIT;

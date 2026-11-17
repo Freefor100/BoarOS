@@ -3757,6 +3757,126 @@ static void ipv4_options(void)
     puts("PASS IPv4 options: physical and lo broadcast permission, TTL on wire, multicast source, stable binding and capability changes");
 }
 
+static void ipv6_inject_protocol(struct netif *n,const ip6_addr_t *src,const ip6_addr_t *dst,
+                        const unsigned char *body,unsigned length,unsigned protocol,unsigned checksum)
+{
+    static const unsigned char mac[6]={0x52,0x55,0,0,0,2};
+    struct pbuf *p=pbuf_alloc(PBUF_RAW,(u16_t)(54+length),PBUF_RAM);CHECK(p);
+    unsigned char *bytes=p->payload;memset(bytes,0,54+length);
+    memcpy(bytes,n->hwaddr,6);memcpy(bytes+6,mac,6);bytes[12]=0x86;bytes[13]=0xdd;
+    bytes[14]=0x60;bytes[18]=length>>8;bytes[19]=length;bytes[20]=protocol;bytes[21]=255;
+    memcpy(bytes+22,src->addr,16);memcpy(bytes+38,dst->addr,16);memcpy(bytes+54,body,length);
+    CHECK(!pbuf_remove_header(p,54));
+    uint16_t sum=checksum?ip6_chksum_pseudo(p,(u8_t)protocol,(u16_t)length,src,dst):0;
+    if(checksum==1)sum^=0x1234;
+    if(checksum==2 && protocol==17 && !sum)sum=0xffff;
+    memcpy(bytes+54+(protocol==17?6:2),&sum,2);
+    CHECK(!pbuf_add_header(p,54));CHECK(ethernet_input(p,n)==ERR_OK);
+}
+static void ipv6_inject(struct netif *n,const ip6_addr_t *src,const ip6_addr_t *dst,
+                        const unsigned char *body,unsigned length)
+{ ipv6_inject_protocol(n,src,dst,body,length,58,2); }
+static void ipv6_linklocal(void)
+{
+    kernel_socket_network_initialize();
+    struct virtio_net_device device={.mac={0x52,0x54,0,0x12,0x34,0x56}};
+    struct kernel_network network={.device=&device};struct netif *n=&network.interface;
+    ip4_addr_t local={lwip_htonl(0x0a4d0002)},mask={lwip_htonl(0xffffff00)},zero={0};
+    CHECK(netif_add(n,&local,&mask,&zero,&network,interface_init,ethernet_input));
+    netif_create_ip6_linklocal_address(n,1);netif_set_up(n);netif_set_link_up(n);
+    struct kernel_socket_interface view;CHECK(!kernel_socket_interface_index(netif_get_index(n),&view));
+    CHECK(view.ipv6_present && view.ipv6_flags==(128|64));
+    const unsigned char expected[16]={0xfe,0x80,0,0,0,0,0,0,0x50,0x54,0,0xff,0xfe,0x12,0x34,0x56};
+    CHECK(!memcmp(view.ipv6_address,expected,16));
+    struct kernel_socket *socket=NULL;CHECK(!kernel_socket_create(&test_heap,10,SOCKET_DGRAM,0,&socket));
+    struct kernel_socket_address address={.family=10};memcpy(address.bytes,expected,16);
+    CHECK(kernel_socket_bind(socket,&address)==-KERNEL_EINVAL);
+    address.scope=254;CHECK(kernel_socket_bind(socket,&address)==-KERNEL_ENODEV);
+    address.scope=netif_get_index(n);CHECK(kernel_socket_bind(socket,&address)==-KERNEL_EADDRNOTAVAIL);
+    for(unsigned i=0;i<3;i++)nd6_tmr();
+    CHECK(ip6_addr_ispreferred(netif_ip6_addr_state(n,0)));
+    CHECK(captured_size>=78 && captured[12]==0x86 && captured[13]==0xdd && captured[54]==135);
+    CHECK(!memcmp(captured+62,expected,16)); /* DAD target is actual eth0 address. */
+    CHECK(!kernel_socket_bind(socket,&address));
+    char bound[16]={0};uint32_t bound_length=sizeof(bound);
+    CHECK(!kernel_socket_get_bound_device(socket,bound,&bound_length) && !strcmp(bound,"eth0"));
+    struct kernel_socket *scoped=NULL;CHECK(!kernel_socket_create(&test_heap,10,SOCKET_DGRAM,0,&scoped));
+    struct kernel_socket_address remote_scope=address;remote_scope.bytes[15]^=1;
+    remote_scope.scope=0;CHECK(kernel_socket_connect(scoped,&remote_scope,0)==-KERNEL_EINVAL);
+    remote_scope.scope=254;CHECK(kernel_socket_connect(scoped,&remote_scope,0)==-KERNEL_ENETUNREACH);
+    CHECK(!kernel_socket_set_bound_device(scoped,"lo"));
+    remote_scope.scope=netif_get_index(n);CHECK(kernel_socket_connect(scoped,&remote_scope,0)==-KERNEL_EINVAL);
+    struct kernel_open_file_description *scope_pin=(void *)scoped;
+    struct kernel_uaccess_iovec scope_iov={(uintptr_t)"x",1};
+    CHECK(kernel_socket_write_datagram(&scope_pin,NULL,&scope_iov,1,1,0,&remote_scope,NULL)==-KERNEL_ENETUNREACH);
+    CHECK(!kernel_socket_bind(scoped,&address));
+    bound_length=sizeof(bound);CHECK(!kernel_socket_get_bound_device(scoped,bound,&bound_length) && !strcmp(bound,"eth0"));
+    kernel_socket_destroy(scoped);
+    ip6_addr_t peer,dst;IP6_ADDR(&peer,lwip_htonl(0xfe800000),0,0,lwip_htonl(2));
+    ip6_addr_assign_zone(&peer,IP6_UNICAST,n);ip6_addr_copy(dst,*netif_ip6_addr(n,0));
+    unsigned char ns[32]={135,0,0,0};memcpy(ns+8,expected,16);
+    ns[24]=1;ns[25]=1;memcpy(ns+26,(unsigned char[]){0x52,0x55,0,0,0,2},6);
+    ipv6_inject(n,&peer,&dst,ns,sizeof(ns));
+    CHECK(captured_size>=86 && captured[54]==136 && !memcmp(captured+38,peer.addr,16));
+    unsigned char echo[40]={128,0,0,0,0x12,0x34,0,1};
+    for(unsigned i=8;i<sizeof(echo);i++)echo[i]=(unsigned char)(i*19);
+    ipv6_inject(n,&peer,&dst,echo,sizeof(echo));
+    CHECK(captured_size==94 && captured[54]==129 && !memcmp(captured+58,echo+4,36));
+    CHECK(!memcmp(captured+22,expected,16) && !memcmp(captured+38,peer.addr,16));
+    CHECK(!kernel_socket_interface_index(netif_get_index(n),&view) && view.ipv6_flags==128);
+    unsigned char datagram[16]={0x4c,0x04,0,0,0,16,0,0,1,2,3,4,5,6,7,8};
+    datagram[2]=local_port(socket)>>8;datagram[3]=local_port(socket);
+    ipv6_inject_protocol(n,&peer,&dst,datagram,sizeof(datagram),17,0);CHECK(!socket->rx_bytes);
+    ipv6_inject_protocol(n,&peer,&dst,datagram,sizeof(datagram),17,1);CHECK(!socket->rx_bytes);
+    ipv6_inject_protocol(n,&peer,&dst,datagram,sizeof(datagram),17,2);CHECK(socket->rx_bytes==8);
+    raw_drain(socket);CHECK(!socket->rx_bytes);
+    /* Unsolicited RA cannot introduce routes, prefixes or hidden MTU state. */
+    unsigned char ra[24]={134,0,0,0,64,0,0,60};
+    ra[16]=5;ra[17]=1;ra[22]=5;ra[23]=20; /* advertised MTU 1300 */
+    ipv6_inject(n,&peer,&dst,ra,sizeof(ra));
+    CHECK(nd6_find_route(&peer)==NULL && netif_mtu6(n)==1500);
+    struct kernel_socket_address remote={.family=10,.port=19460,.scope=netif_get_index(n)};
+    memcpy(remote.bytes,peer.addr,16);
+    struct kernel_open_file_description *pin=(void *)socket;
+    unsigned char content[1400]={1};struct kernel_uaccess_iovec iov={(uintptr_t)content,sizeof(content)};
+    CHECK(!kernel_socket_interface_set_mtu((char[16]){"eth0"},1300));
+    CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,sizeof(content),0,&remote,NULL)==-KERNEL_EMSGSIZE);
+    CHECK(!kernel_socket_interface_set_mtu((char[16]){"eth0"},1500));
+    CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,sizeof(content),0,&remote,NULL)==sizeof(content));
+    CHECK(lwip_stats.memp[MEMP_ND6_QUEUE]->used==1);
+    CHECK(!kernel_socket_interface_set_mtu((char[16]){"eth0"},1200));
+    CHECK(!lwip_stats.memp[MEMP_ND6_QUEUE]->used);
+    iov.length=64;
+    CHECK(!kernel_socket_interface_index(netif_get_index(n),&view) && !view.ipv6_present);
+    CHECK(!kernel_socket_interface_set_mtu((char[16]){"eth0"},1500));
+    CHECK(ip6_addr_istentative(netif_ip6_addr_state(n,0)));
+    CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,64,0,&remote,NULL)==-KERNEL_ENETUNREACH);
+    /* An NA for a tentative address must fail DAD, not make it bindable. */
+    unsigned char na[32]={136,0,0,0,0x60,0,0,0};memcpy(na+8,expected,16);
+    na[24]=2;na[25]=1;memcpy(na+26,ns+26,6);
+    IP6_ADDR(&dst,lwip_htonl(0xff020000),0,0,lwip_htonl(1));
+    ip6_addr_assign_zone(&dst,IP6_MULTICAST,n);
+    ipv6_inject(n,&peer,&dst,na,sizeof(na));
+    CHECK(ip6_addr_isduplicated(netif_ip6_addr_state(n,0)));
+    CHECK(!kernel_socket_interface_index(netif_get_index(n),&view) && (view.ipv6_flags==(128|64|8)));
+    CHECK(kernel_socket_write_datagram(&pin,NULL,&iov,1,64,0,&remote,NULL)==-KERNEL_ENETUNREACH);
+    kernel_socket_network_failed(local.addr);CHECK(socket->pending_error==-KERNEL_EIO);
+    kernel_socket_destroy(socket);
+    CHECK(!kernel_socket_interface_set_flags((char[16]){"eth0"},0));
+    CHECK(ip6_addr_isinvalid(netif_ip6_addr_state(n,0)));
+    CHECK(!kernel_socket_interface_set_flags((char[16]){"eth0"},1));
+    CHECK(ip6_addr_istentative(netif_ip6_addr_state(n,0)));
+    ip6_addr_t any;ip6_addr_set_zero(&any);
+    ip6_addr_set_solicitednode(&dst,netif_ip6_addr(n,0)->addr[3]);
+    ip6_addr_assign_zone(&dst,IP6_MULTICAST,n);
+    unsigned sent=copied_packets;
+    ipv6_inject(n,&any,&dst,ns,24);
+    CHECK(ip6_addr_isduplicated(netif_ip6_addr_state(n,0)) && copied_packets==sent);
+    nd6_cleanup_netif(n);netif_remove(n);
+    CHECK(!heap_live);
+    puts("PASS Ethernet IPv6 DAD, duplicate rejection, scoped bind, ND/echo contents, MTU and device failure");
+}
+
 int main(int argc, char **argv)
 {
     CHECK(argc == 2);
@@ -3764,6 +3884,7 @@ int main(int argc, char **argv)
     CHECK(kernel_pid_publish(&model_pid_registry,&model_pid)==KERNEL_PID_STATUS_OK);
     if (!strcmp(argv[1], "raw-icmp-owner")) raw_icmp_owner();
     else if (!strcmp(argv[1], "raw-icmp-close")) raw_icmp_close();
+    else if (!strcmp(argv[1], "ipv6-linklocal")) ipv6_linklocal();
     else if (!strcmp(argv[1], "ipv4-options")) ipv4_options();
     else if (!strcmp(argv[1], "async-events")) async_events();
     else if (!strcmp(argv[1], "unix-seq-records")) unix_seqpacket_records();

@@ -63,12 +63,13 @@ static unsigned route_prefix(uint32_t mask)
 static int route_address(struct route_output *out,const struct route_header *request,
     const struct kernel_socket_interface *s,unsigned family)
 {
-    if(family==10 && !s->ipv6_loopback)return 0;
+    if(family==10 && !s->ipv6_present)return 0;
     if(family==2 && !s->address)return 0;
     uint8_t address[16]={0};size_t size=family==10?16:4;
-    if(family==10)address[15]=1;else __builtin_memcpy(address,&s->address,4);
+    if(family==10)__builtin_memcpy(address,s->ipv6_address,16);else __builtin_memcpy(address,&s->address,4);
     struct { uint8_t family,prefix,flags,scope; uint32_t index; } info=
-        {family,family==10?128:route_prefix(s->netmask),128,s->hardware_type==772?254:0,s->index};
+        {family,family==10?(s->hardware_type==772?128:64):route_prefix(s->netmask),
+         family==10?s->ipv6_flags:128,s->hardware_type==772?254:(family==10?253:0),s->index};
     struct route_header *h=route_message(out,20,2,request->sequence,&info,sizeof(info));
     if(!h)return -KERNEL_ENOBUFS;
     if(route_attribute(out,h,1,address,size) || route_attribute(out,h,2,address,size))return -KERNEL_ENOBUFS;
@@ -102,12 +103,19 @@ static int route_entry(struct route_output *out,const struct route_header *reque
 static int route_ipv6(struct route_output *out,const struct route_header *request,
     const struct kernel_socket_interface *s)
 {
-    if(!s->ipv6_loopback)return 0;
+    if(!s->ipv6_present || (s->ipv6_flags&(64|8)))return 0;
     uint8_t info[12]={10,128,0,0,255,2,0,2};
-    uint8_t destination[16]={0};destination[15]=1;
+    uint8_t destination[16];__builtin_memcpy(destination,s->ipv6_address,16);
     struct route_header *h=route_message(out,24,2,request->sequence,info,sizeof(info));
     if(!h)return -KERNEL_ENOBUFS;
-    return route_attribute(out,h,15,(uint32_t[]){255},4) ||
+    if(route_attribute(out,h,15,(uint32_t[]){255},4) ||
+        route_attribute(out,h,1,destination,16) || route_attribute(out,h,4,&s->index,4))return -KERNEL_ENOBUFS;
+    if(s->hardware_type==772 || !(s->flags&1))return 0;
+    info[1]=64;info[4]=254;info[7]=1;
+    __builtin_memset(destination+8,0,8);
+    h=route_message(out,24,2,request->sequence,info,sizeof(info));
+    if(!h)return -KERNEL_ENOBUFS;
+    return route_attribute(out,h,15,(uint32_t[]){254},4) ||
         route_attribute(out,h,1,destination,16) || route_attribute(out,h,4,&s->index,4)?-KERNEL_ENOBUFS:0;
 }
 /* Output lookups only: this is the existing lwIP route selection, not a FIB.

@@ -60,7 +60,7 @@ core stop 遇到 CPU lease、RX loan 或未归还 TX owner 返回 EBUSY，reset 
 
 默认 `eth0` 为 10.77.0.2/24、MTU 1500，MAC 来自设备。构建参数 `NET_IPV4` 和
 `NET_NETMASK` 写入独立生成配置；未配置默认网关。bind 接受真实本地地址，路由
-由 netif 决定；保留 IPv6 loopback 与双栈监听，不宣称外部 IPv6、公网或 DNS/TLS。
+由 netif 决定；保留 IPv6 loopback 与双栈监听。外部 IPv6 现提供 MAC 派生的链路本地地址、ND/DAD 和 TCP/UDP，范围、生命周期与验证见[Ethernet IPv6](kernel-network.md#ethernet-ipv6-链路本地通信)，不宣称公网或内核 DNS/TLS 服务。
 
 `SIOCGIFFLAGS/SIOCSIFFLAGS` 查询并控制 UP/DOWN；`SIOCGIFADDR/NETMASK/HWADDR/MTU/INDEX/NAME/CONF`
 输出实际接口快照，RV64/LA64 ifreq/ifconf 为 40/16 字节。`SIOCSIFADDR`、

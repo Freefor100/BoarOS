@@ -28,6 +28,9 @@
 #define LWIP_IPV6 1
 #define LWIP_IPV6_MLD 0
 #define LWIP_IPV6_AUTOCONFIG 0
+/* This stage provides link-local connectivity, not router discovery. */
+#define LWIP_IPV6_SEND_ROUTER_SOLICIT 0
+#define BOAROS_LWIP_LINKLOCAL_ONLY 1
 #define LWIP_IPV6_REASS 0
 #define LWIP_IPV6_FRAG 0
 #define LWIP_TCP 1

@@ -298,6 +298,7 @@ LWIP_SOURCES := \
 	third_party/lwip/src/core/ipv4/ip4.c \
 	third_party/lwip/src/core/ipv4/ip4_addr.c \
 	third_party/lwip/src/core/ipv4/ip4_frag.c \
+	third_party/lwip/src/core/ipv6/ethip6.c \
 	third_party/lwip/src/core/ipv6/icmp6.c \
 	third_party/lwip/src/core/ipv6/ip6.c \
 	third_party/lwip/src/core/ipv6/ip6_addr.c \

@@ -343,7 +343,28 @@ reset确认；设备失败不等于DMA停止，TX在途owner与RX借用一律保
 已完成owner在worker归还。接口查询来自真实netif，DOWN撤下RUNNING。
 详细预算、寄存器、失败与验证命令见[网卡模块](riscv-virtio-net.md)。
 
-TX 使用 indirect 表借用每包最多两段镜像内 payload，其余回退复制，用户接收仍复制。外部应用测试入口见 `tests/userland/network-external.py`。当前没有外部 IPv6、DHCP/DNS/TLS 或默认网关。
+TX 使用 indirect 表借用每包最多两段镜像内 payload，其余回退复制，用户接收仍复制。IPv4 外部应用测试入口见 `tests/userland/network-external.py`；默认网关可由已实现的 IPv4 配置接口设置。内核不提供 DHCP/DNS/TLS 服务，用户态协议库与内核网络能力分别评价。
+
+### Ethernet IPv6 链路本地通信
+
+eth0 从设备 MAC 派生 `fe80::/64` 地址，使用已有 ND 定时器执行 DAD（重复地址检测），不增加 worker、轮询器或新缓存。DAD 完成前不能绑定地址；收到指向 tentative 地址的 solicited-node NS 或 all-nodes NA 会标记重复，不能以未验证的地址发送普通包。链路本地 bind 要求有效 scope/interface index，也可由 SO_BINDTODEVICE 提供；bind 的显式 scope 同时选择绑定设备，非法 index 返回 ENODEV，未配置或尚未可用的本地地址返回 EADDRNOTAVAIL。connect 的显式 scope 与已绑定设备冲突返回 EINVAL，sendto 则优先使用已绑定设备。rtnetlink GETADDR 显示实际地址、tentative/dadfailed 状态，GETROUTE dump 显示可用地址的本地及链路路由；IPv6 单条 route lookup、地址/路由修改仍未实现。
+
+已支持真实 Ethernet 上 IPv6 TCP/UDP、ND 的 NS/NA 与 ICMPv6 echo responder。此阶段限定链路本地通信，不发送 Router Solicitation，忽略 Router Advertisement/Redirect，未实现全局地址配置、SLAAC、IPv6 默认路由、IPv6 raw/ping socket 或 MLD 组播成员管理。ND 所需组播不是应用组播订阅支持。IPv6 不进行发送分片或分片重组；atomic fragment（offset=0 且 M=0）可通过已有输入路径。UDP 超所选链路/路径 MTU 返回 EMSGSIZE，IPv6 零 checksum 与错误 checksum 丢弃，IPv4 的零 UDP checksum 规则不变。
+
+接口管理 DOWN 撤链路本地地址并清理 ND，UP 后重新 DAD；carrier 暂时断开不等同管理 DOWN。运行时 MTU 变更清理该接口 ND 队列及目的 PMTU 缓存；低于 1280 撤 IPv6 地址并停止该接口 IPv6 收发，恢复后重新 DAD。最终 Ethernet IPv6 输出再次校验源地址可用性，防已绑定 socket 或延迟 ND 报文跨越地址失效继续使用旧源。UDP 与可能携带扩展头的非直接 TCP/ICMPv6 接收共用原有预算，保留控制报文余量。
+
+定向验证：
+
+```sh
+python3 tests/host/network_owner.py --case ipv6-linklocal --page-shift 12
+python3 tests/host/network_owner.py --case ipv6-linklocal --page-shift 14
+python3 tests/userland/ipv6-external.py --arch riscv --cpus 4 --kernel <kernel> --program <ipv6_external ELF>
+python3 tests/userland/ipv6-external.py --arch loongarch --cpus 2 --kernel <kernel> --program <ipv6_external ELF> --qemu <qemu>
+```
+
+ELF 来源 `tests/workloads/network/ipv6_external.c`，以目标 musl 静态编译（LA 链接页对齐 16384）。外部 runner 显式配置 QEMU slirp 的 IPv6 prefix/host 为 `fe80::/64`、`fe80::2`，由独立宿主 IPv6 TCP/UDP socket 验证内容，不是 guest 的 `::1` 回环。UDP 检查 64/1232/1452 字节内容、peer/scope、1453 字节错误边界；TCP 检查 64 KiB 全内容和半关闭/EOF。QEMU Ethernet 注入通道依次送零 checksum、错误 checksum 和正确响应，以正确响应作为处理顺序屏障。host 用例另外覆盖 DAD 冲突、地址失效、ND 队列清理、MTU 恢复、RA 不安装路由和设备失败。测试不声称公网、Linux TAP 差分、实板或性能收益。
+
+语义参考：[Linux ipv6(7)](https://www.man7.org/linux/man-pages/man7/ipv6.7.html)、[RFC 4862 §5.4](https://www.rfc-editor.org/rfc/rfc4862.html#section-5.4)、[RFC 8200 §8.1](https://www.rfc-editor.org/rfc/rfc8200.html#section-8.1)。
 
 TX 的 SG 与复制回退在槽满时都登记 NIC 容量等待。无 indirect 特性或 pbuf 链
 不满足 SG 条件时，复制发送返回 `EAGAIN` 仍属于 NIC 槽不足，不能落入协议池

@@ -610,7 +610,9 @@ ip6_input(struct pbuf *p, struct netif *inp)
        * (for Neighbor discovery). */
       netif = NULL;
       for (i = 0; i < LWIP_IPV6_NUM_ADDRESSES; i++) {
-        if (ip6_addr_isvalid(netif_ip6_addr_state(inp, i)) &&
+        /* Tentative addresses must hear competing DAD solicitations too. */
+        if ((ip6_addr_isvalid(netif_ip6_addr_state(inp, i)) ||
+             ip6_addr_istentative(netif_ip6_addr_state(inp, i))) &&
             ip6_addr_solicitednode_eq(ip6_current_dest_addr(), netif_ip6_addr(inp, i))) {
           netif = inp;
           LWIP_DEBUGF(IP6_DEBUG, ("ip6_input: solicited node packet accepted on interface %c%c\n",
