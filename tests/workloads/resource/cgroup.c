@@ -10,6 +10,9 @@
 #include <sys/mount.h>
 #include <sys/mman.h>
 #include <sys/ptrace.h>
+#include <sys/prctl.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -35,6 +38,14 @@ static int contains(int parent,pid_t id)
 }
 static void location(const char *expected)
 { char b[4096];int fd=open("/proc/self",O_RDONLY|O_DIRECTORY);CHECK(fd>=0);contents_at(fd,"cgroup",b,sizeof(b));CHECK(!close(fd));CHECK(!strcmp(b,expected)); }
+static void deny_syscall(unsigned number,unsigned error)
+{
+    struct sock_filter f[]={BPF_STMT(BPF_LD|BPF_W|BPF_ABS,0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,number,0,1),
+        BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ERRNO|error),BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ALLOW)};
+    struct sock_fprog p={.len=4,.filter=f};
+    CHECK(!syscall(SYS_seccomp,SECCOMP_SET_MODE_FILTER,0,&p));
+}
 static pid_t into(int fd)
 { struct args a={.flags=UINT64_C(0x200000000),.signal=SIGCHLD,.cgroup=(unsigned)fd};return syscall(435,&a,sizeof(a)); }
 static void wait_ok(pid_t child)
@@ -103,6 +114,15 @@ int main(int argc,char **argv)
     struct args bad={.flags=UINT64_C(0x200001000),.signal=SIGCHLD,.cgroup=(unsigned)a,.pidfd=1};
     errno=0;CHECK(syscall(435,&bad,sizeof(bad))==-1&&errno==EFAULT);CHECK(!contains(a,getpid()));
     CHECK(!mkdirat(dir,"dead",0755));int dead=openat(dir,"dead",O_PATH|O_DIRECTORY);CHECK(dead>=0);CHECK(!unlinkat(dir,"dead",AT_REMOVEDIR));errno=0;CHECK(into(dead)==-1&&errno==ENOENT);CHECK(!close(dead));
+    child=fork();CHECK(child>=0);
+    if(!child){
+        CHECK(!prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0));deny_syscall(SYS_getppid,EPERM);
+        errno=0;CHECK(into(procs)==-1&&errno==EBADF);
+        pid_t filtered=into(a);CHECK(filtered>=0);
+        if(!filtered){location("0::/boaros-test/a\n");errno=0;CHECK(syscall(SYS_getppid)==-1&&errno==EPERM);_exit(0);}
+        wait_ok(filtered);deny_syscall(435,EACCES);errno=0;CHECK(into(a)==-1&&errno==EACCES);_exit(0);
+    }
+    wait_ok(child);CHECK(!contains(a,child));
     puts("CGROUP CASE fd-and-rollback PASS");
     child=fork();CHECK(child>=0);
     if (!child) {
