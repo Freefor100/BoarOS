@@ -63,6 +63,11 @@ finalized 的 order-0 页可用 `physical_page_acquire()` 增加 32 位引用，
 独立引用。`physical_page_allocate_contiguous()` 仍交付已拆成独立 order-0 owner 的
 页面，与整块共享是两个不同契约。整块引用不增加每个尾页的元数据操作或引用计数。
 
+MM 退休批次可携带整块 head/order 与普通页表页；混合批次使用
+`physical_page_release_order_batch()` 在一次 allocator 保护内归还。普通基页批次
+保留原有 release-batch 快路径。`finish_tlb_change()` 仍先完成本地/远端翻译同步，
+再统一归还所有权，不能在同步前释放整块，也不能把一个大页展开成多条 tail 归还。
+
 这只是物理所有权基础，不启用 `MAP_HUGETLB`。当前用户页表、VMA、用户访问 pin、
 COW 和远端 TLB 退休链仍以基本页为单位；接入大叶时须让映射和临时 pin 都持有整块
 owner，保留大页内偏移，并在远端失效及所有 pin 归还之后释放末引用。显式大页的

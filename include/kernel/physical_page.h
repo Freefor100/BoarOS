@@ -142,6 +142,12 @@ unsigned physical_page_allocate_batch(struct physical_page_allocator *,
 void physical_page_release_batch(struct physical_page_allocator *allocator,
     const uint64_t *addresses, unsigned count);
 
+/* Mixed-order finalized owners, one allocator critical section. Every address
+ * is an owned head and each byte-sized order must exactly match its allocation.
+ * Repeated heads consume separate owned references, as with release_batch. */
+void physical_page_release_order_batch(struct physical_page_allocator *,
+    const uint64_t *addresses, const uint8_t *orders, unsigned count);
+
 void physical_page_acquire_batch(struct physical_page_allocator *allocator,
     const uint64_t *addresses, unsigned count);
 

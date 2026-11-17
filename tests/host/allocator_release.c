@@ -1,4 +1,5 @@
 #include <kernel/heap.h>
+#include <kernel/mm_retire.h>
 #include <kernel/sync.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
@@ -166,6 +167,18 @@ static void invalid_release(unsigned int which, uint64_t page, void *object)
 {
     uint32_t references;
     switch (which) {
+    case 30: {
+        uint8_t order = 0;
+        physical_page_release_order_batch(&allocator, &page, &order, 1); break;
+    }
+    case 31: {
+        uint8_t order = PHYSICAL_PAGE_MAX_ORDER + 1;
+        physical_page_release_order_batch(&allocator, &page, &order, 1); break;
+    }
+    case 32: {
+        struct kernel_mm_retirement batch = {0};
+        kernel_mm_retirement_add_order(&batch, page, 1, 1); break;
+    }
     case 0: physical_page_release_order(&allocator, page, 0); break;
     case 1: physical_page_release_order(&allocator, page + BOAROS_PAGE_SIZE, 1); break;
     case 2: physical_page_release_order(&allocator, page, 1);
@@ -554,6 +567,32 @@ static void test_batch_allocation(void)
     assert(!physical_page_allocator_clear_reclaimer(&allocator));
 }
 
+static void test_compound_retirement(void)
+{
+    setup();
+    uint64_t initial = physical_page_available(&allocator), block, table;
+    struct kernel_mm_retirement batch = {0};
+    assert(!physical_page_allocate_order(&allocator, 4, &block));
+    assert(!physical_page_allocate(&allocator, &table));
+    /* A pin outlives two aliases that transfer owners to the retire batch. */
+    assert(!physical_page_acquire_order(&allocator, block, 4));
+    assert(!physical_page_acquire_order(&allocator, block, 4));
+    kernel_mm_retirement_add_order(&batch, block, 4, 0);
+    kernel_mm_retirement_add(&batch, table, 1);
+    kernel_mm_retirement_add_order(&batch, block, 4, 0);
+    assert(batch.count == 3 && batch.nonleaf && batch.compound);
+    assert(physical_page_available(&allocator) == initial - 17);
+    /* Simulate the caller's completed invalidation before returning owners. */
+    kernel_mm_retirement_release(&allocator, &batch);
+    uint32_t refs;
+    assert(!batch.count && !batch.nonleaf && !batch.compound);
+    assert(!physical_page_reference_count(&allocator, block, &refs) && refs == 1);
+    assert(physical_page_available(&allocator) == initial - 16);
+    assert(!physical_page_release_order(&allocator, block, 4));
+    assert(physical_page_available(&allocator) == initial);
+    assert(!physical_page_allocator_audit(&allocator));
+}
+
 static void test_compound_references(void)
 {
     setup();
@@ -588,12 +627,13 @@ int main(void)
 {
     struct rlimit limit = {0, 0};
     assert(setrlimit(RLIMIT_CORE, &limit) == 0);
+    test_compound_retirement();
     test_compound_references();
     test_no_sleep_allocation();
     test_batch_allocation();
     test_legal_release_is_silent();
     test_retired_payload_is_not_owner();
-    for (unsigned int i = 0; i < 30; i++) {
+    for (unsigned int i = 0; i < 33; i++) {
         int output[2];
         char diagnostic[2048];
         size_t length = 0U;

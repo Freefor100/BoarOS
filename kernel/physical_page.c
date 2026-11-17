@@ -1612,6 +1612,24 @@ void physical_page_release_batch(struct physical_page_allocator *a,
         physical_page_release_buddy(a, addresses[i], 0U, &work);
 }
 
+void physical_page_release_order_batch(struct physical_page_allocator *a,
+    const uint64_t *addresses, const uint8_t *orders, unsigned count)
+{
+    if (!count) return;
+    if (!addresses || !orders || count > PHYSICAL_PAGE_REFERENCE_BATCH_MAX)
+        __builtin_trap();
+    PAGE_METADATA_SCOPE(work, a);
+    if (!allocator_initialized(a) || !physical_page_allocator_is_finalized(a))
+        physical_page_release_fatal(a, addresses[0], orders[0],
+                                    "allocator-state", addresses[0]);
+    for (unsigned i = 0; i < count; i++) {
+        if (orders[i] > PHYSICAL_PAGE_MAX_ORDER)
+            physical_page_release_fatal(a, addresses[i], orders[i],
+                                        "order-range", addresses[i]);
+        physical_page_release_buddy(a, addresses[i], orders[i], &work);
+    }
+}
+
 static uint32_t *page_references_locked(const struct physical_page_allocator *a,uint64_t address,
     uint32_t *page,struct page_work *work)
 {

@@ -2053,7 +2053,7 @@ static void finish_tlb_change(struct kernel_mm_record *record,
     if (batch->count) {
         _Static_assert(KERNEL_MM_RETIRE_CAPACITY <= PHYSICAL_PAGE_REFERENCE_BATCH_MAX,
                        "one allocator guard per retirement batch");
-        physical_page_release_batch(record->space.allocator, batch->pages, batch->count);
+        kernel_mm_retirement_release(record->space.allocator, batch);
         KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
         if (!record->pending_retirement) __builtin_trap();
         record->pending_retirement--;
