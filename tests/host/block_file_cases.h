@@ -234,6 +234,62 @@ static void raw_kernel_prefix_case(struct kernel_open_file_description *file, st
     assert(kernel_open_file_offset(file) == before_offset && file->block->references == before_references);
     puts("PASS kernel/user block byte prefixes: second-sector read/write/RMW errors retain confirmed 3 bytes; aligned callbacks remain batched");
 }
+static void raw_direct_case(struct kernel_files *files, struct kernel_fs_context *fs,
+    struct raw_test_disk *disk)
+{
+    int64_t result; size_t done;
+    unsigned char bytes[1024]; memset(bytes, 0xb7, sizeof(bytes));
+    assert(!kernel_copy_to_user(&mm, 0x200800, bytes, sizeof(bytes), &done));
+    /* Real path opening, rather than manually setting an OFD private flag. */
+    assert(!kernel_files_openat(files, fs, &mm, -100, 0x200000,
+        2 | KERNEL_FILES_O_DIRECT, 0, &result) && result >= 0);
+    int fd = (int)result;
+    assert(!kernel_files_fcntl(files, fd, KERNEL_FILES_F_GETFL, 0, &result) &&
+        (result & KERNEL_FILES_O_DIRECT));
+    unsigned reads = disk->reads, writes = disk->writes;
+    assert(!kernel_files_pwrite(files, &mm, fd, 0x200800, 1024, 0, &result) && result == 1024);
+    assert(disk->reads == reads && disk->writes == writes + 1);
+    assert(!memcmp(bytes, disk->bytes, sizeof(bytes)));
+    assert(!kernel_files_pread(files, &mm, fd, 0x200c00, 1024, 0, &result) && result == 1024);
+    assert(!kernel_copy_from_user(&mm, bytes, 0x200c00, sizeof(bytes), &done));
+    assert(!memcmp(bytes, disk->bytes, sizeof(bytes)));
+    reads = disk->reads; writes = disk->writes;
+    assert(!kernel_files_pwrite(files, &mm, fd, 0x200801, 512, 0, &result) && result == -KERNEL_EINVAL);
+    assert(!kernel_files_pwrite(files, &mm, fd, 0x200800, 511, 0, &result) && result == -KERNEL_EINVAL);
+    assert(!kernel_files_pread(files, &mm, fd, 0x200800, 512, 1, &result) && result == -KERNEL_EINVAL);
+    struct kernel_uaccess_iovec vectors[2] = {{0x200800, 256}, {0x200900, 256}};
+    assert(!kernel_copy_to_user(&mm, 0x200400, vectors, sizeof(vectors), &done));
+    assert(!kernel_files_readv(files, &mm, fd, 0x200400, 2, &result) && result == -KERNEL_EINVAL);
+    assert(disk->reads == reads && disk->writes == writes);
+    /* Fault after one complete sector: never issue an RMW for the missing
+     * source, and preserve the completed prefix and positioned OFD offset. */
+    uint64_t end = 0x200000 + 4 * BOAROS_PAGE_SIZE;
+    assert(!kernel_copy_to_user(&mm, end - 512, bytes, 512, &done));
+    writes = disk->writes; reads = disk->reads;
+    assert(!kernel_files_pwrite(files, &mm, fd, end - 512, 1024, 2048, &result) && result == 512);
+    assert(disk->writes == writes + 1 && disk->reads == reads);
+    assert(!kernel_files_pwrite(files, &mm, fd, end, 512, 2048, &result) && result == -KERNEL_EFAULT);
+    assert(disk->writes == writes + 1 && disk->reads == reads);
+    assert(!kernel_files_pread(files, &mm, fd, 0x200801, 0, 0, &result) && result == 0);
+    assert(!kernel_files_fcntl(files, fd, KERNEL_FILES_F_SETFL, 0, &result) && !result);
+    assert(!kernel_files_pwrite(files, &mm, fd, 0x200801, 1, 1, &result) && result == 1);
+    assert(!kernel_files_fcntl(files, fd, KERNEL_FILES_F_SETFL, KERNEL_FILES_O_DIRECT, &result) && !result);
+    assert(!kernel_files_pwrite(files, &mm, fd, 0x200801, 1, 1, &result) && result == -KERNEL_EINVAL);
+    assert(!kernel_files_close(files, fd, &result) && !result);
+    assert(!kernel_copy_to_user(&mm, 0x200000, "/direct-regular", 16, &done));
+    assert(!kernel_files_openat(files, fs, &mm, -100, 0x200000, 0102, 0600, &result) && result >= 0);
+    fd = (int)result;
+    assert(!kernel_files_write(files, &mm, fd, 0x200800, 1, &result) && result == 1);
+    assert(!kernel_files_fcntl(files, fd, KERNEL_FILES_F_SETFL, KERNEL_FILES_O_DIRECT, &result) && result == -KERNEL_EINVAL);
+    assert(!kernel_files_openat(files, fs, &mm, -100, 0x200000,
+        2 | 01000 | KERNEL_FILES_O_DIRECT, 0, &result) && result == -KERNEL_EINVAL);
+    assert(!kernel_files_pread(files, &mm, fd, 0x200800, 1, 0, &result) && result == 1);
+    assert(!kernel_files_close(files, fd, &result) && !result);
+    KERNEL_FS_PATHS(paths, fs);
+    assert(!kernel_vfs_unlink(kernel_vfs_path_mount(paths.root), "/direct-regular"));
+    assert(!kernel_copy_to_user(&mm, 0x200000, "/raw-block", 11, &done));
+    puts("PASS raw O_DIRECT: open/status toggle, aligned batched uncached I/O, scalar/vector rejection before device submission");
+}
 static void raw_block_case(struct kernel_heap *heap, struct kernel_vfs_mount *mount)
 {
     struct raw_test_disk disk = {0};
@@ -266,6 +322,8 @@ static void raw_block_case(struct kernel_heap *heap, struct kernel_vfs_mount *mo
     assert(!kernel_open_file_release(&node));
     assert(!kernel_copy_to_user(&mm, 0x200000, "/raw-block", 11, &done) && done == 11);
     assert(!kernel_files_openat(&local, &local_fs, &mm, -100, 0x200000, 2, 0, &result) && result == 0);
+    raw_direct_case(&local, &local_fs, &disk);
+    memset(disk.bytes, 0x3c, sizeof(disk.bytes));
     assert(device.open_count == 1 && device.references == 1);
     assert(!kernel_files_dup(&local, 0, &result) && result == 1);
     assert(!kernel_files_fork(&child, &local) && device.open_count == 1 && device.references == 1);
@@ -329,7 +387,8 @@ static void raw_block_case(struct kernel_heap *heap, struct kernel_vfs_mount *mo
     assert(!kernel_files_pread(&local, &mm, 0, 0x200200, 1, -1, &result) && result == -KERNEL_EINVAL);
     assert(!kernel_files_ioctl(&local, &mm, 0, 0x1277, 0x200500, &result) && result == -KERNEL_EOPNOTSUPP);
     assert(!kernel_files_ioctl(&local, &mm, 0, 0x9999, 0, &result) && result == -KERNEL_ENOTTY);
-    assert(!kernel_files_openat(&local, &local_fs, &mm, -100, 0x200000, 00040000, 0, &result) && result == -KERNEL_ENOTSUP);
+    assert(!kernel_files_openat(&local, &local_fs, &mm, -100, 0x200000, KERNEL_FILES_O_DIRECT, 0, &result) && result == 5);
+    assert(!kernel_files_close(&local, 5, &result) && !result);
     assert(!kernel_files_openat(&local, &local_fs, &mm, -100, 0x200000, 2 | KERNEL_FILES_O_SYNC, 0, &result) && result == 5);
     unsigned before_flush = disk.flushes;
     assert(!kernel_files_pwrite(&local, &mm, 5, 0x200200, 1, 0, &result) && result == 1 && disk.flushes == before_flush + 1);

@@ -85,7 +85,13 @@ flush仍同步实际后备对象，解绑与自动清理沿设备使用者和在
 
 块节点打开先按调用者 fs IDs 和节点权限判断，已打开 OFD 保留原读写权利。`BLKROSET`、`BLKBSZSET`、`BLKFLSBUF` 在读取用户参数之前检查当前调用者的 CAP_SYS_ADMIN，缺少时按固定 Linux 返回 EACCES。loop 的 SET_STATUS/SET_STATUS64/SET_CAPACITY 则允许“原 OFD 有写打开权利”或 CAP_SYS_ADMIN；两者都没有时为 EPERM。绑定、解绑和 control 操作继续按具体设备打开及操作规则处理。
 
-块设备 ioctl 支持 `BLKGETSIZE`（512 字节扇区数）、`BLKGETSIZE64`（字节数）、`BLKSSZGET`、`BLKROGET/SET`、`BLKBSZGET/SET` 和 `BLKFLSBUF`。软件块大小是设备共享状态，只接受不小于逻辑扇区、介于 512 和架构页大小之间的 2 的幂；设置时需要已有独占资格或临时 claim。只读状态下仍允许以 `O_WRONLY/O_RDWR` 打开；新旧 OFD 的实际写入均返回 EPERM。fsync、fdatasync、`O_SYNC/O_DSYNC` 和 `BLKFLSBUF` 调用同一真实设备 flush；`BLKFLSBUF` 先持有挂载根路径并同步该设备上的文件系统，将缓存的文件数据和元数据交给设备。错误如实返回。没有裸设备缓存需要清除。mmap、`O_DIRECT`、discard、secure discard 和 zeroout 当前明确不支持。
+`O_DIRECT` 可以在块设备打开时指定，也可以通过 `F_SETFL` 在共享 OFD 上切换。非空 I/O 的偏移、有效总长度以及每个非空 iovec 的地址和长度必须按设备逻辑扇区对齐，否则在提交设备请求前返回 `EINVAL`。此路径直接使用无页缓存的 block 后端，每次最多提交一个架构页的连续数据，而不是逐扇区重复请求；有界 staging buffer 隔离用户缺页与 DMA 生命周期，并非零复制。源复制故障仅提交已复制的完整扇区，保持完成前缀，不为不完整扇区执行 RMW。`O_DIRECT` 不隐含持久化，只有同步标志或显式同步才执行 FLUSH。
+
+普通和 direct 块设备 FD 使用同一无缓存后端及传输锁，因此不存在两套块设备缓存的相互失效问题。loop 的后备普通文件仍遵循该文件系统缓存规则；这不等于 `LOOP_SET_DIRECT_IO` 或普通文件 direct I/O。通过 raw 设备修改已挂载文件系统不保证与其文件缓存一致，调用者应使用未挂载的私有设备，不能把 direct 当作绕过挂载一致性约束的办法。普通 ext4/tmpfs/FAT 文件仍拒绝 `O_DIRECT`：后续需要独立的数据直传接口、脏页写回及共享映射失效/重缺页协议，不能简单绕开页缓存。Linux 对齐依据为 `block/fops.c:blkdev_dio_invalid` 与 block iterator 对齐检查。
+
+聚焦 host 入口为 `FILE_IO_HOST_TCP=0 FILE_IO_BLOCK_ONLY=1 sh tests/host/file-io-concurrency.sh`，覆盖真实 OFD flags、对齐与向量拒绝、故障前缀、普通/direct 交替和块层并发序列。`tests/workloads/io/direct-block.c` 使用未挂载的临时 loop 设备；`tests/userland/direct-block.py` 使用已构建 RV/LA 内核和静态 ELF，检查数据及退出回收。Linux 可将同一程序显式指向一次性私有 block 设备；普通文件的 direct 对齐规则随后端不同，不能替代 Linux block 对照。 本次验证通过 host 4 KiB/16 KiB 页模型及 RV/LA 双核 guest 的上述定向检查；环境没有可用私有 Linux block 设备，Linux block 动态差分尚未完成，不据普通文件测试宣称其已通过。
+
+块设备 ioctl 支持 `BLKGETSIZE`（512 字节扇区数）、`BLKGETSIZE64`（字节数）、`BLKSSZGET`、`BLKROGET/SET`、`BLKBSZGET/SET` 和 `BLKFLSBUF`。软件块大小是设备共享状态，只接受不小于逻辑扇区、介于 512 和架构页大小之间的 2 的幂；设置时需要已有独占资格或临时 claim。只读状态下仍允许以 `O_WRONLY/O_RDWR` 打开；新旧 OFD 的实际写入均返回 EPERM。fsync、fdatasync、`O_SYNC/O_DSYNC` 和 `BLKFLSBUF` 调用同一真实设备 flush；`BLKFLSBUF` 先持有挂载根路径并同步该设备上的文件系统，将缓存的文件数据和元数据交给设备。错误如实返回。没有裸设备缓存需要清除。mmap、discard、secure discard 和 zeroout 当前明确不支持。
 
 `kernel_block_flush()` 表示设备持久化边界。块设备显式声明 UNKNOWN、WRITETHROUGH 或 WRITEBACK；未知能力且没有 flush 回调返回 UNSUPPORTED，只有声明 write-through 的设备可以省略 flush。VirtIO 协商 `VIRTIO_BLK_F_FLUSH`（bit 9），发送独立的 type 4 请求，只有 header/status 两个描述符，不带数据。未协商 CONFIG_WCE，因此 FLUSH 存在表示 writeback，缺失表示 write-through；驱动不修改缓存模式。该规则依据固定 Linux `references/linux/drivers/block/virtio_blk.c` 的 `virtblk_get_cache_mode()`（`f4cdf7ca9a1fdcca413157df19753f388a5a224e`）与 QEMU `references/qemu/hw/block/virtio-blk.c`（v11.1.0，`84f07211cc5b4fc6a371559bf8a5de4fb068e648`）。设备错误和超时保持所属状态，flush 请求单独计数。
 
@@ -170,3 +176,5 @@ IRQ 启用后的读取 fixture 检查两个真实任务的内容、两个新增�
 收割会确认设备中断，PLIC 可以一次也未进入，因此不能要求快请求必须产生 IRQ。
 真实延迟完成、睡眠及唤醒由上面的 NBD 用例检查。2026-10-10 的 case47 旧记录
 缺少 IRQ 等计数，不能据此唯一归因；原内核和输出保留。
+
+O_TMPFILE 整合回归：以 `-DBOAROS_BLOCK_DIRECT_ONLY` 编译 `tests/userland/tmpfile.c` 并使用 `tests/userland/tmpfile.py` 运行，额外覆盖 tmpfs/ext4 的 `O_TMPFILE|O_DIRECT`（open/openat2）拒绝、匿名 FD 的 F_SETFL 拒绝后 flags 不变、正常写入及发布，以及普通文件 `O_DIRECT|O_TRUNC` 拒绝后内容长度不变。未定义该宏时仍保留原 Linux 对照程序。

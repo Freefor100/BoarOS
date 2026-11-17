@@ -55,9 +55,9 @@ static int validate_open_flags(uint64_t flags, uint64_t mode, uint64_t resolve,
 {
     const uint64_t write_flags = LINUX_O_CREAT | LINUX_O_TRUNC |
                                  LINUX_O_APPEND | LINUX_O_EXCL;
-    uint64_t unsupported_flags = LINUX_O_DIRECT;
+    uint64_t unsupported_flags = 0;
     uint64_t known_flags = LINUX_O_ACCMODE | write_flags | LINUX_O_NOCTTY |
-        unsupported_flags | LINUX_O_TMPFILE | LINUX_O_NOATIME | LINUX_O_NONBLOCK | LINUX_O_DIRECTORY |
+        LINUX_O_DIRECT | LINUX_O_TMPFILE | LINUX_O_NOATIME | LINUX_O_NONBLOCK | LINUX_O_DIRECTORY |
         LINUX_O_NOFOLLOW |
         LINUX_O_LARGEFILE | LINUX_O_CLOEXEC | LINUX_O_SYNC | LINUX_O_PATH;
     uint64_t access_mode = flags & LINUX_O_ACCMODE;
@@ -109,6 +109,7 @@ int kernel_files_open_pty_peer(struct kernel_files *files, struct kernel_task *c
     if (flags & LINUX_O_PATH) flags &= LINUX_O_PATH | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW | LINUX_O_CLOEXEC;
     int error = validate_open_flags(flags, 0, 0, 0, &fd_flags);
     if (error) return error;
+    if (flags & LINUX_O_DIRECT) return -KERNEL_EINVAL;
     if (kernel_files_find_free_fd(files, &fd, &error) != KERNEL_FILES_STATUS_OK) __builtin_trap();
     if (error) return error;
     struct kernel_files_fd_reservation reservation __attribute__((cleanup(kernel_files_cancel_reservation))) = {files, fd};
@@ -340,6 +341,15 @@ static enum kernel_files_status files_open(
         (!(flags & LINUX_O_PATH) && object_type != KERNEL_VFS_S_IFREG && object_type != KERNEL_VFS_S_IFDIR))
         kernel_service_scope_begin(&service);
     if (flags & LINUX_O_PATH) goto Finish_open;
+    /* Only raw block OFDs currently have an uncached data path. Reject before
+     * truncation or device/FIFO open; regular files need coherent cache and
+     * mapping invalidation before direct I/O can be exposed. */
+    if ((flags & LINUX_O_DIRECT) && object_type != KERNEL_VFS_S_IFBLK) {
+        kernel_files_queue_description(files, description);
+        (void)kernel_files_drain_file_cleanup(files);
+        *linux_result = -KERNEL_EINVAL;
+        return KERNEL_FILES_STATUS_OK;
+    }
     if (special_link) {
         if ((flags & LINUX_O_NOATIME) && !kernel_open_file_noatime_allowed(description)) {
             kernel_files_queue_description(files,description);

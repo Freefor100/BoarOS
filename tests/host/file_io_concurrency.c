@@ -1719,11 +1719,12 @@ int main(int argc,char **argv)
     struct kernel_heap heap={0},backend_heap={0};
     initialize(&pages,&heap,arena,sizeof(arena)); initialize(&backend_pages,&backend_heap,backend,sizeof(backend));
     uint64_t baseline=physical_page_available(&pages),backend_baseline=physical_page_available(&backend_pages);
+    int block_only=getenv("FILE_IO_BLOCK_ONLY")!=NULL;
     int advice_only=getenv("FILE_IO_ADVICE_ONLY")!=NULL;
     int transfers_only=getenv("FILE_IO_TRANSFERS_ONLY")!=NULL;
     int paths_only=getenv("FILE_IO_PATHS_ONLY")!=NULL;
     int directories_only=getenv("FILE_IO_DIRECTORIES_ONLY")!=NULL;
-    int focused=directories_only || advice_only || transfers_only || paths_only || getenv("FILE_IO_VECTORS_ONLY")!=NULL;
+    int focused=block_only || directories_only || advice_only || transfers_only || paths_only || getenv("FILE_IO_VECTORS_ONLY")!=NULL;
     if (!focused) {
     borrowed_page_case(&pages);
     namespace_retiring_mount_case(&heap);
@@ -1747,10 +1748,11 @@ int main(int argc,char **argv)
         KERNEL_MM_MAP_FIXED_NOREPLACE,&address));
     assert(!kernel_mm_mmap_anonymous(&mm,0x200000,4*BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,
         KERNEL_MM_MAP_FIXED_NOREPLACE,&address));
-    if (paths_only || directories_only) {
+    if (paths_only || directories_only || block_only) {
         struct kernel_vfs_mount *memory=NULL;
         assert(!kernel_tmpfs_create(&heap,0,"",&memory));
-        if (directories_only) { directory_eof(&heap,memory); directory_batch_cases(&heap,memory,0); }
+        if (block_only) raw_block_case(&heap,memory);
+        else if (directories_only) { directory_eof(&heap,memory); directory_batch_cases(&heap,memory,0); }
         else pathname_storage_case(&heap,memory);
         assert(!kernel_vfs_unmount(memory));
     }
@@ -1790,7 +1792,8 @@ int main(int argc,char **argv)
     assert(!kernel_block_register(&disk,KERNEL_BLOCK_DEVICE_NUMBER(101)));
     struct kernel_vfs_mount mount={0}; assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,&cache,0));
     assert(!kernel_vfs_start_journal_worker(&mount));
-    if (directories_only) directory_batch_cases(&heap,&mount,1);
+    if (block_only) { /* Raw device contracts ran against the private registered device. */ }
+    else if (directories_only) directory_batch_cases(&heap,&mount,1);
     else if (paths_only) pathname_storage_case(&heap,&mount);
     else if (transfers_only) transfer_cases(&heap,&mount);
     else if (advice_only) file_advice_case(&heap,&mount,&cache);

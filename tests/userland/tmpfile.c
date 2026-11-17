@@ -17,6 +17,22 @@ static void child_ok(pid_t p){int status;CHECK(waitpid(p,&status,0)==p&&WIFEXITE
 static void run(const char *directory,const char *label)
 {
     int d=open(directory,O_RDONLY|O_DIRECTORY);CHECK(d>=0);
+#ifdef BOAROS_BLOCK_DIRECT_ONLY
+    /* BoarOS currently exposes direct I/O only on block devices. */
+    FAIL(EINVAL,openat(d,".",O_TMPFILE|O_RDWR|O_DIRECT,0600));
+    struct {unsigned long long flags,mode,resolve;} direct_how={O_TMPFILE|O_RDWR|O_DIRECT,0600,0};
+    FAIL(EINVAL,syscall(SYS_openat2,d,".",&direct_how,sizeof(direct_how)));
+    int probe=openat(d,".",O_TMPFILE|O_RDWR,0600);CHECK(probe>=0);
+    int original=fcntl(probe,F_GETFL);CHECK(original>=0);
+    FAIL(EINVAL,fcntl(probe,F_SETFL,original|O_DIRECT));
+    CHECK(fcntl(probe,F_GETFL)==original);
+    CHECK(write(probe,"kept",4)==4);
+    CHECK(!linkat(probe,"",d,"direct-rejected",AT_EMPTY_PATH));
+    FAIL(EINVAL,openat(d,"direct-rejected",O_RDWR|O_DIRECT|O_TRUNC));
+    struct stat retained;CHECK(!fstat(probe,&retained)&&retained.st_size==4);
+    CHECK(!close(probe)&&!unlinkat(d,"direct-rejected",0));
+#endif
+
     FAIL(EINVAL,openat(d,".",O_TMPFILE|O_RDONLY,0600));
     FAIL(EINVAL,openat(d,".",O_TMPFILE|O_CREAT|O_RDWR,0600));
     FAIL(ENOENT,openat(d,"missing",O_TMPFILE|O_RDWR,0600));

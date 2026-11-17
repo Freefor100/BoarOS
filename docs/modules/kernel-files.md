@@ -180,7 +180,7 @@ OFD pin 覆盖可能缺页睡眠的复制。`make test-record-lock-riscv` 用同
 
 `openat2(437)` 导入 24 字节的 `open_how`，接受全零的扩展尾部，单独校验 flags、mode 和 resolve。它与 `openat` 共用打开及创建路径。解析器在跨越挂载点（包括 bind）、跟随符号链接或 proc 对象链接时检查对应限制；`RESOLVE_BENEATH` 拒绝逃出起点，`RESOLVE_IN_ROOT` 将绝对路径、绝对链接和根处的 `..` 限制在起点。发生挂载拓扑或目录父链变化时，受限查找可返回 `EAGAIN`，调用方可用相同约束重试。`OPENAT2_REGULAR` 在打开设备或 FIFO 之前要求最终对象为普通文件。
 
-现有路径索引命中后仍需后端复核，`RESOLVE_CACHED` 返回 `EAGAIN`，应用可去掉该位重试并保留其他解析限制。`O_DIRECT` 和 `O_EMPTYPATH` 仍返回 `EOPNOTSUPP`。`O_TMPFILE` 支持 tmpfs 和启用 journal 的 ext4；其他后端仍返回 `EOPNOTSUPP`。`tests/userland/openat2.c` 检查参数、受限创建、bind 挂载和 proc 链接。
+现有路径索引命中后仍需后端复核，`RESOLVE_CACHED` 返回 `EAGAIN`，应用可去掉该位重试并保留其他解析限制。`O_EMPTYPATH` 仍返回 `EOPNOTSUPP`。`O_TMPFILE` 支持 tmpfs 和启用 journal 的 ext4；其他后端仍返回 `EOPNOTSUPP`。`O_DIRECT` 仅支持块设备，普通文件（包括匿名临时文件）返回 `EINVAL`，具体语义见[块设备模块](riscv-virtio-block.md#用户态块设备)。`tests/userland/openat2.c` 检查参数、受限创建、bind 挂载和 proc 链接。
 
 `getcwd` 返回包含 NUL 的字节数；用户缓冲不足为 `ERANGE`，已断开的 cwd 为 `ENOENT`。仍连接在命名空间但位于新root之外的cwd，raw syscall返回`(unreachable)`前缀及命名空间绝对路径；libc据此处理ENOENT。proc cwd/exe/fd/maps的展示保留根外及摘树对象的绝对名称和删除后缀，实际对象链接跟随仍持有真实路径，不依赖这些展示文本。删除目录后，其持有者仍可对 `.` 打开/统计、经 `..` 访问父目录、通过 `fchdir` 切回；不能在已删除目录中新建名字。改名会更新所有持有同一目录项的 cwd/OFD 所观察到的父链。fork 独立复制 fs record，进程形式和线程形式的 `CLONE_FS` 都共享它；切换 cwd 先取得新引用再替换，失败不改变原目录。
 

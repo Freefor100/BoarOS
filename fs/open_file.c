@@ -1176,7 +1176,7 @@ int kernel_open_file_noatime_allowed(const struct kernel_open_file_description *
 void kernel_open_file_set_status_flags(struct kernel_open_file_description *file, uint32_t flags)
 {
     if (!open_file_live(file)) __builtin_trap();
-    const uint32_t mask=00002000U | 00004000U | 00020000U | 01000000U;
+    const uint32_t mask=00002000U | 00004000U | 00020000U | KERNEL_FILES_O_DIRECT | 01000000U;
     uint32_t old=__atomic_load_n(&file->open_flags, __ATOMIC_RELAXED);
     while (!__atomic_compare_exchange_n(&file->open_flags, &old,
         (old & ~mask) | (flags & mask), 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
