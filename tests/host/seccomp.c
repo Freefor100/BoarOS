@@ -19,6 +19,8 @@ int kernel_credentials_capable(const struct kernel_credentials *c,uint32_t cap){
 enum kernel_uaccess_status kernel_copy_from_user(struct kernel_mm *mm,void *to,uint64_t from,size_t n,size_t *copied)
 {(void)mm;if(from<4096){*copied=0;return KERNEL_UACCESS_STATUS_FAULT;}memcpy(to,(void *)(uintptr_t)from,n);*copied=n;return 0;}
 void kernel_seccomp_terminate(unsigned signal,int group){signal_seen=signal;group_seen=group;longjmp(killed,1);}
+void kernel_signal_clear_syscall_restart(struct kernel_task *task)
+{task->syscall_restart=(struct kernel_syscall_restart_state){0};}
 static void *alloc(void *h,size_t n){void *p=0;return kernel_heap_allocate(h,n,&p)?0:p;}
 static void drop(void *h,void *p){kernel_heap_release(h,p);}
 #define I(c,jt,jf,k) {c,jt,jf,k}
@@ -44,7 +46,18 @@ int main(void)
     ret[0].k=0x50000|17;assert(!attach(parent,ret,1));assert(live==2);
     struct kernel_syscall_request request={.number=172};struct kernel_syscall_result result;
     assert(kernel_seccomp_check(parent,&request,&result)==1&&result.value==-17);
+    assert(result.action==KERNEL_SYSCALL_ACTION_RETURN_FINAL);
     assert(!kernel_seccomp_check(child,&request,&result));
+    const unsigned kinds[]={KERNEL_SYSCALL_RESTART_NANOSLEEP,KERNEL_SYSCALL_RESTART_FUTEX_TIMED};
+    const unsigned errors[]={1,512,513,514,516};
+    for(unsigned k=0;k<2;k++)for(unsigned e=0;e<5;e++) {
+        parent->syscall_restart.kind=kinds[k];
+        ret[0].k=0x50000|errors[e];assert(!attach(parent,ret,1));
+        assert(kernel_seccomp_check(parent,&request,&result)==1);
+        assert(result.action==KERNEL_SYSCALL_ACTION_RETURN_FINAL&&result.value==-(int)errors[e]);
+        assert(parent->syscall_restart.kind==KERNEL_SYSCALL_RESTART_NONE);
+    }
+    ret[0].k=0x50000|17;assert(!attach(parent,ret,1));
     ret[0].k=0x12340000;assert(!attach(parent,ret,1));
     assert(kernel_seccomp_check(parent,&request,&result)==1&&result.value==-17);
     assert(!attach(child,ret,1));

@@ -18,6 +18,11 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <ucontext.h>
+#include <fcntl.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+#include <linux/futex.h>
 #define CHECK(x) do {if(!(x)){fprintf(stderr,"SECCOMP FAIL %d: %s errno=%d\n",__LINE__,#x,errno);exit(1);}}while(0)
 static const char *self;
 static int initial_mode;
@@ -74,6 +79,12 @@ static void precedence(void)
     deny(SYS_getpid,0x12340000); /* ERRNO precedes unknown action before fail-closed decoding. */
     deny(SYS_getpid,SECCOMP_RET_ALLOW);
     CHECK(syscall(SYS_getpid)==-1&&errno==EACCES);
+    /* Filter errno is user policy, never an internal restart request. */
+    const unsigned restart_codes[]={512,513,514,516};
+    for(unsigned i=0;i<sizeof(restart_codes)/sizeof(restart_codes[0]);i++) {
+        deny(SYS_getppid,SECCOMP_RET_ERRNO|restart_codes[i]);
+        errno=0;CHECK(syscall(SYS_getppid)==-1&&errno==(int)restart_codes[i]);
+    }
     deny(SYS_getppid,SECCOMP_RET_ERRNO|65535);
     CHECK(syscall(SYS_getppid)==-1&&errno==4095);
     deny(SYS_gettid,SECCOMP_RET_ERRNO);
@@ -221,11 +232,79 @@ static void instruction_pointer(void)
         BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ALLOW)};
     CHECK(!install(f,sizeof(f)/sizeof(f[0])));CHECK(ip_call()==-E2BIG);
 }
+
+extern char seccomp_notify_after[];
+static volatile sig_atomic_t restart_notified;
+static void restart_handler(int sig,siginfo_t *info,void *context)
+{
+    (void)info;ucontext_t *uc=context;CHECK(sig==SIGUSR1);
+#if defined(__riscv)
+    CHECK(uc->uc_mcontext.__gregs[0]==(uintptr_t)seccomp_notify_after);
+    CHECK(!uc->uc_mcontext.__gregs[10]);
+#elif defined(__loongarch__)
+    CHECK(uc->uc_mcontext.__pc==(uintptr_t)seccomp_notify_after);
+    CHECK(!uc->uc_mcontext.__gregs[4]);
+#else
+    CHECK(uc->uc_mcontext.gregs[REG_RIP]==(greg_t)(uintptr_t)seccomp_notify_after);
+    CHECK(!uc->uc_mcontext.gregs[REG_RAX]);
+#endif
+    restart_notified=1;
+}
+static __attribute__((noinline)) long notify_call(long pid)
+{
+#if defined(__riscv)
+    register long a __asm__("a0")=pid,b __asm__("a1")=SIGUSR1,n __asm__("a7")=SYS_kill;
+    __asm__ volatile("ecall\n.global seccomp_notify_after\nseccomp_notify_after:" : "+r"(a) : "r"(b),"r"(n) : "memory");
+#elif defined(__loongarch__)
+    register long a __asm__("$a0")=pid,b __asm__("$a1")=SIGUSR1,n __asm__("$a7")=SYS_kill;
+    __asm__ volatile("syscall 0\n.global seccomp_notify_after\nseccomp_notify_after:" : "+r"(a) : "r"(b),"r"(n) : "memory");
+#else
+    long a;
+    __asm__ volatile("syscall\n.global seccomp_notify_after\nseccomp_notify_after:" : "=a"(a) : "a"((long)SYS_kill),"D"(pid),"S"((long)SIGUSR1) : "memory","rcx","r11");
+#endif
+    return a;
+}
+static void wait_sleeping(pid_t p)
+{
+    char path[64],text[512];snprintf(path,sizeof(path),"/proc/%d/stat",p);
+    for(unsigned i=0;i<100000;i++) {
+        int fd=open(path,O_RDONLY);CHECK(fd>=0);
+        ssize_t n=read(fd,text,sizeof(text)-1);CHECK(n>0);close(fd);text[n]=0;
+        char *end=strrchr(text,')');CHECK(end);
+        if(end[2]=='S')return;
+        CHECK(end[2]!='Z');sched_yield();
+    }
+    CHECK(0);
+}
+static void restart_rejected(void)
+{
+    mkdir("/proc",0755);
+    /* Do not mount over Linux's existing procfs, including unprivileged runs. */
+    if(access("/proc/self/stat",R_OK))CHECK(!mount("proc","/proc","proc",0,0));
+    for(unsigned timed_futex=0;timed_futex<2;timed_futex++) {
+        pid_t p=fork();CHECK(p>=0);
+        if(!p) {
+            pid_t me=getpid();struct sigaction sa={.sa_sigaction=restart_handler,.sa_flags=SA_SIGINFO};
+            CHECK(!sigaction(SIGUSR1,&sa,0));nnp();
+            deny(SYS_restart_syscall,SECCOMP_RET_ERRNO|512);
+            struct timespec duration={60,0};int word=0;errno=0;
+            long ret=timed_futex?syscall(SYS_futex,&word,FUTEX_WAIT,0,&duration,0,0):
+                syscall(SYS_nanosleep,&duration,0);
+            CHECK(ret==-1&&errno==512);
+            /* A rejected restart must not corrupt a later signal's PC or a0. */
+            CHECK(!notify_call(me)&&restart_notified);_exit(0);
+        }
+        wait_sleeping(p);CHECK(!kill(p,SIGSTOP));int status;
+        CHECK(waitpid(p,&status,WUNTRACED)==p&&WIFSTOPPED(status));
+        CHECK(!kill(p,SIGCONT));joined(p,0);
+    }
+}
 int main(int argc,char **argv)
 {
     if(argc>1&&!strcmp(argv[1],"exec-thread")){CHECK(prctl(PR_GET_SECCOMP)==2);CHECK(syscall(SYS_getpid)==-1&&errno==EAGAIN);return 0;}
     if(argc>1&&!strcmp(argv[1],"exec")){CHECK(prctl(PR_GET_SECCOMP)==2);CHECK(syscall(SYS_getpid)==-1&&errno==EACCES);return 0;}
     setvbuf(stdout,0,_IONBF,0);alarm(40);self=argv[0];initial_mode=prctl(PR_GET_SECCOMP);
+    child_case(restart_rejected,0);puts("SECCOMP rejected restart state/PC PASS");
     child_case(errors,0);puts("SECCOMP errors PASS");
     child_case(permission,0);child_case(precedence,0);puts("SECCOMP inheritance/precedence PASS");
     child_case(instruction_pointer,0);child_case(ptrace_rewrite,0);puts("SECCOMP PC/ptrace checks complete");child_case(arguments,0);puts("SECCOMP arguments PASS");child_case(kill_thread,SIGSYS);puts("SECCOMP kill-thread PASS");child_case(kill_process,SIGSYS);puts("SECCOMP kill-process PASS");child_case(unknown,SIGSYS);puts("SECCOMP unknown PASS");

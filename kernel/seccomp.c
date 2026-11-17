@@ -1,5 +1,6 @@
 #include <kernel/seccomp.h>
 #include <kernel/credentials.h>
+#include <kernel/signal.h>
 #include <kernel/errno.h>
 #include <kernel/heap.h>
 #include <kernel/syscall.h>
@@ -205,7 +206,8 @@ int kernel_seccomp_check(struct kernel_task *task,const struct kernel_syscall_re
     switch (verdict&ACTION) {
     case RET_ALLOW:return 0;
     case RET_ERRNO:
-        result->action=KERNEL_SYSCALL_ACTION_RETURN;
+        kernel_signal_clear_syscall_restart(task);
+        result->action=KERNEL_SYSCALL_ACTION_RETURN_FINAL;
         result->value=-(int64_t)((verdict&0xffff)>4095?4095:verdict&0xffff);
         return 1;
     case RET_KILL_THREAD:kernel_seccomp_terminate(31,0);

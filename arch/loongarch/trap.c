@@ -174,11 +174,11 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
             kernel_bpf_trace_exit(kernel_task_current(),frame->regs[11],(int64_t)frame->regs[4]);
             if(kernel_task_current()->ptrace)kernel_ptrace_syscall_exit(kernel_task_current(),frame,request.number);
             return;
-        case KERNEL_SYSCALL_ACTION_RETURN: break;
+        case KERNEL_SYSCALL_ACTION_RETURN: case KERNEL_SYSCALL_ACTION_RETURN_FINAL: break;
         default: la_virt_fatal("unsupported internal syscall action");
         }
         kernel_bpf_trace_exit(kernel_task_current(),request.number,result.value);
-        if (result.value==-KERNEL_ERESTARTSYS) {
+        if (result.action!=KERNEL_SYSCALL_ACTION_RETURN_FINAL && result.value==-KERNEL_ERESTARTSYS) {
             if(caller->ptrace) {
                 uint64_t argument=frame->regs[4];
                 frame->regs[4]=(uint64_t)result.value;frame->era+=4;
