@@ -13,20 +13,23 @@
 #include <unistd.h>
 #include <string.h>
 #include <sched.h>
+#include <ucontext.h>
 #define CHECK(x) do {if(!(x)){fprintf(stderr,"SECCOMP FAIL %d: %s errno=%d\n",__LINE__,#x,errno);_exit(1);}}while(0)
 static const char *self;
 static int initial_mode;
 static void nnp(void){CHECK(!prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0));}
-static long filter(long nr,unsigned err,unsigned flags)
+static long filter_action(long nr,unsigned action,unsigned flags)
 {
     struct sock_filter insns[]={
         BPF_STMT(BPF_LD|BPF_W|BPF_ABS,0),
         BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,nr,0,1),
-        BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ERRNO|err),
+        BPF_STMT(BPF_RET|BPF_K,action),
         BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ALLOW)};
     struct sock_fprog p={4,insns};
     return syscall(SYS_seccomp,SECCOMP_SET_MODE_FILTER,flags,&p);
 }
+static long filter(long nr,unsigned err,unsigned flags)
+{return filter_action(nr,SECCOMP_RET_ERRNO|err,flags);}
 static void denied(long nr,int error)
 {errno=0;CHECK(syscall(nr)==-1&&errno==error);}
 struct worker {int ready[2],go[2];pthread_t thread;int mode,tid,nnp_before;};
@@ -37,6 +40,7 @@ static void *worker(void *opaque)
     if(w->mode==1){nnp();CHECK(!filter(SYS_getppid,EBUSY,0));}
     CHECK(write(w->ready[1],"r",1)==1);
     char command;CHECK(read(w->go[0],&command,1)==1);
+    if(command=='t'){nnp();CHECK(!filter_action(SYS_getpid,SECCOMP_RET_TRAP|321,SECCOMP_FILTER_FLAG_TSYNC));}
     if(command=='s'||command=='e'){nnp();CHECK(!filter(SYS_getpid,EACCES,SECCOMP_FILTER_FLAG_TSYNC));}
     if(command=='e'){char *args[]={(char *)self,"--exec-check",0};execv(self,args);CHECK(0);}
     if(command=='c'||command=='s') {
@@ -157,6 +161,28 @@ static void clone_publication(void)
     }
     close(clone_gate[0]);close(clone_gate[1]);
 }
+
+static volatile sig_atomic_t trap_seen;
+static void sync_trap_handler(int sig,siginfo_t *info,void *context)
+{
+    CHECK(sig==SIGSYS&&info->si_code==1&&info->si_errno==321&&info->si_syscall==SYS_getpid);
+    ucontext_t *uc=context;
+#if defined(__riscv)
+    uc->uc_mcontext.__gregs[10]=765;
+#elif defined(__loongarch__)
+    uc->uc_mcontext.__gregs[4]=765;
+#else
+    uc->uc_mcontext.gregs[REG_RAX]=765;
+#endif
+    trap_seen=1;
+}
+static void trap_propagation(void)
+{
+    struct sigaction sa={.sa_sigaction=sync_trap_handler,.sa_flags=SA_SIGINFO};
+    CHECK(!sigaction(SIGSYS,&sa,0));struct worker w;start(&w,0);finish(&w,'t');
+    trap_seen=0;CHECK(syscall(SYS_getpid)==765&&trap_seen);
+    CHECK(prctl(PR_GET_NO_NEW_PRIVS,0,0,0,0)==1);
+}
 static void run(void (*test)(void),const char *name)
 {
     pid_t p=fork();CHECK(p>=0);if(!p){test();_exit(0);}
@@ -170,6 +196,7 @@ int main(int argc,char **argv)
     }
     self=argv[0];initial_mode=prctl(PR_GET_SECCOMP);
     setvbuf(stdout,0,_IONBF,0);alarm(40);
+    run(trap_propagation,"TRAP-thread-propagation");
     run(propagation,"NNP/thread/fork");
     run(failure,"failure-TID/all-or-none/exit");
     run(identical_not_ancestor,"identical-independent-chains");
