@@ -59,6 +59,9 @@ int main(void)
     assert(!riscv_sv39_page_table_init(&table,&allocator));table.state=ARCH_MMU_STATE_ACTIVE;
     uint64_t baseline=physical_page_available(&allocator);
     assert(!arch_mmu_user_space_init(&space,&allocator,&table));assert(!kernel_mm_create(&mm,&space));
+    assert(kernel_mm_coredump_filter_get(&mm)==0x33);
+    kernel_mm_coredump_filter_set(&mm,0xffff);assert(kernel_mm_coredump_filter_get(&mm)==0x1ff);
+    kernel_mm_coredump_filter_set(&mm,0x12);
     assert(!kernel_mm_vma_enable(&mm,&heap));assert(!kernel_mm_brk_initialize(&mm,0x10000,0x20000));
     uint64_t address,context;assert(!kernel_mm_context(&mm,&context));mm_test_context=context;
     assert(!kernel_mm_mmap_anonymous(&mm,0x40000,2*BOAROS_PAGE_SIZE,
@@ -81,6 +84,8 @@ int main(void)
     puts("MM core excludes active/new remote borrowers and releases admission");
     unsigned char value=41,got=0;size_t copied;
     assert(!kernel_mm_remote_transfer(&mm,address,&value,1,1,0,&copied)&&copied==1);
+    struct kernel_vma history;
+    assert(!kernel_mm_vma_lookup(&mm,address,&history));assert(!(history.flags & KERNEL_VMA_ANON_HISTORY));
     struct kernel_mm_user_pin pending_write={0};
     assert(!kernel_mm_pin_user_page(&mm,address,KERNEL_MM_WRITE,&pending_write));
     assert(!kernel_mm_core_begin(&mm));
@@ -95,6 +100,9 @@ int main(void)
     assert(!kernel_mm_remote_transfer(&mm,shared_address+BOAROS_PAGE_SIZE,&initial,1,1,0,&copied)&&copied==1);
     assert(!kernel_mm_fork(&child,&mm));
     assert(mm.record!=child.record);
+    assert(kernel_mm_coredump_filter_get(&child)==0x12);
+    kernel_mm_coredump_filter_set(&child,0x33);assert(kernel_mm_coredump_filter_get(&mm)==0x12);
+    assert(!kernel_mm_vma_lookup(&child,address,&history));assert(!(history.flags & KERNEL_VMA_ANON_HISTORY));
     assert(kernel_mm_core_begin(&mm));
     unsigned char first=0,last=0;
     assert(!kernel_mm_remote_transfer(&mm,shared_address,&first,1,0,1,&copied)&&copied==1);
@@ -138,7 +146,9 @@ int main(void)
     unsigned char bytes[8]={0};
     assert(kernel_mm_remote_transfer(&mm,0x40000+2*BOAROS_PAGE_SIZE-4,bytes,8,0,0,&copied)==-KERNEL_EFAULT&&copied==4);
     assert(!kernel_io_context_current()->user_pins);
-    assert(!kernel_mm_acquire(&owner,&mm));mm_test_context=0;assert(!kernel_mm_release(&mm));
+    assert(!kernel_mm_acquire(&owner,&mm));
+    kernel_mm_coredump_filter_set(&owner,0x44);assert(kernel_mm_coredump_filter_get(&mm)==0x44);
+    mm_test_context=0;assert(!kernel_mm_release(&mm));
     assert(!kernel_mm_remote_transfer(&owner,0x40000,&got,1,0,0,&copied)&&got==41);
     assert(!kernel_mm_release(&child)&&!kernel_mm_release(&owner));
     assert(physical_page_available(&allocator)==baseline&&!physical_page_allocator_audit(&allocator));

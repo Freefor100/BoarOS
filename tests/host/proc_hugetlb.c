@@ -16,6 +16,10 @@ void kernel_hstate_snapshot(struct kernel_hstate *h,struct kernel_hstate_snapsho
 { assert(h==(void *)&pool_tag && acquired);*out=huge_model; }
 enum kernel_hugetlb_status kernel_hstate_resize(struct kernel_hstate *h,uint64_t count)
 { assert(h==(void *)&pool_tag && acquired);huge_model.total=huge_model.free=huge_model.persistent=count>4?4:count;return count>4?KERNEL_HUGETLB_NO_MEMORY:0; }
+#ifndef PROC_FILTER_PROVIDER
+int kernel_proc_coredump_filter(kernel_pid_t p,uint64_t i,int t,unsigned *v,int w)
+{(void)p;(void)i;(void)t;(void)v;(void)w;abort();}
+#endif
 int kernel_proc_comm(kernel_pid_t p,uint64_t i,int t,char n[16],int w)
 {(void)p;(void)i;(void)t;(void)n;(void)w;abort();}
 struct kernel_namespace *kernel_task_uts_namespace(void){abort();}
@@ -33,6 +37,7 @@ int kernel_proc_fdinfo_access(kernel_pid_t p,uint64_t i){(void)p;(void)i;abort()
 int kernel_proc_same_group(kernel_pid_t p,uint64_t i,int t){(void)p;(void)i;(void)t;abort();}
 int kernel_vfs_dac_permission(uint32_t m,uint32_t u,uint32_t g,unsigned a,const struct kernel_credentials *c)
 {(void)m;(void)u;(void)g;(void)a;(void)c;abort();}
+#ifndef PROC_HUGE_NO_MAIN
 int main(void)
 {
     uint64_t inode;uint32_t mode;
@@ -56,3 +61,5 @@ int main(void)
     assert(!acquired);
     puts("proc huge pool: path, EUID permissions, zero-without-create, actual partial growth and parse verified");
 }
+
+#endif
