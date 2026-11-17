@@ -6750,8 +6750,7 @@ int kernel_mm_core_begin(struct kernel_mm *mm)
 {
     struct kernel_mm_record *record;
     if (resolve_record(mm,&record) || mm->state!=KERNEL_MM_LIVE) return 0;
-    { KERNEL_RAW_READ_SCOPE(raw,&record->metadata);
-      if (record->write_pins) return 0; }
+    if (pin_state_read(&record->write_pins)) return 0;
     uint32_t expected=0;
     return __atomic_compare_exchange_n(&record->core_remote,&expected,MM_CORE_ACTIVE,
         0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);
