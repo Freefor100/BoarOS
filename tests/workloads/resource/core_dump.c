@@ -22,7 +22,7 @@
 #include <sys/uio.h>
 #define CHECK(x) do {if(!(x)){printf("CORE FAIL line=%d errno=%d\n",__LINE__,errno);exit(1);}}while(0)
 static char *memory;static size_t page;static pid_t crashed_pid;
-static int ready[2],hold[2],identity[2];
+static int ready[2],hold[2],identity[2],creator_gate[2];
 static int thread_mode;static pid_t crashed_threads[3];static unsigned peer_count;
 static volatile uint64_t spinning;
 static void *other_thread(void *unused)
@@ -32,7 +32,7 @@ static void *other_thread(void *unused)
  if(thread_mode==7)raise(SIGABRT);
  if(thread_mode==6)for(;;)__asm__ volatile("" ::: "memory");
  CHECK(read(hold[0],&c,1)==1);return NULL; }
-static int crash(int mode)
+static pid_t spawn_crash(int mode)
 {
  int threaded=mode==3||mode==6||mode==7;peer_count=mode==6?3:1;
  if(threaded)CHECK(!pipe(identity));
@@ -49,13 +49,20 @@ static int crash(int mode)
   if(threaded){thread_mode=mode;pthread_t t[3];CHECK(!pipe(ready)&&!pipe(hold));
    for(unsigned i=0;i<peer_count;i++){CHECK(!pthread_create(&t[i],NULL,other_thread,NULL));char c;CHECK(read(ready[0],&c,1)==1);}}
   if(mode==7)for(;;)pause();
+  if(mode==3 && creator_gate[0]>=0){char go;CHECK(read(creator_gate[0],&go,1)==1); }
   raise(SIGABRT);_exit(99);
  }
- crashed_pid=pid;
+ return pid;
+}
+static int collect_crash(pid_t pid,int mode)
+{
+ int threaded=mode==3||mode==6||mode==7;crashed_pid=pid;
  int status;CHECK(waitpid(pid,&status,0)==pid && WIFSIGNALED(status) && WTERMSIG(status)==SIGABRT);
  if(threaded){for(unsigned i=0;i<peer_count;i++)CHECK(read(identity[0],&crashed_threads[i],sizeof(pid_t))==sizeof(pid_t));CHECK(!close(identity[0])&&!close(identity[1]));}
  return status;
 }
+static int crash(int mode)
+{ return collect_crash(spawn_crash(mode),mode); }
 static void inspect(void)
 {
  int fd=open("core",O_RDONLY);CHECK(fd>=0);struct stat st;CHECK(!fstat(fd,&st));CHECK((st.st_mode&0777)==0600);
@@ -77,6 +84,17 @@ static void inspect(void)
   if(p.p_type==PT_LOAD && (uintptr_t)(memory+page)>=p.p_vaddr&&(uintptr_t)(memory+page)<p.p_vaddr+p.p_memsz){CHECK(p.p_filesz==0);hidden=1;}
  }
  CHECK(note&&mapping&&hidden);CHECK(!close(fd));
+}
+/* Keep this creator alive while its child dumps. PRSTATUS records its TID
+ * for the crashed leader and every peer, unlike the getppid() interface. */
+static pid_t fork_tid;
+static void *departing_creator(void *arg)
+{ *(pid_t *)arg=spawn_crash(3);return NULL; }
+static void *threaded_creator(void *arg)
+{
+ fork_tid=(pid_t)syscall(SYS_gettid);
+ *(int *)arg=crash(7);
+ return NULL;
 }
 static int shared_mm_crash(void *unused)
 { (void)unused;syscall(SYS_tgkill,syscall(SYS_getpid),syscall(SYS_gettid),SIGABRT);_exit(99); }
@@ -102,12 +120,28 @@ int main(int argc,char **argv)
  /* Each live TID must have a distinct register note, including when the
   * nonleader is the crashing task or three siblings were running on other CPUs. */
  for(int mode=3;mode<=7;mode++){if(mode==4||mode==5)continue;
-  CHECK(WCOREDUMP(crash(mode)));
+  int status;
+  if(mode==7){pthread_t creator;CHECK(!pthread_create(&creator,NULL,threaded_creator,&status));
+   CHECK(!pthread_join(creator,NULL)&&fork_tid!=getpid());}
+  else if(mode==3){
+   pid_t child;pthread_t creator;CHECK(!pipe(creator_gate));
+   CHECK(!pthread_create(&creator,NULL,departing_creator,&child)&&!pthread_join(creator,NULL));
+   /* pthread_join observes clear_child_tid, which may precede reparenting.
+    * The leader becomes eligible for a thread-only wait only after transfer. */
+   pid_t result;
+   do {result=waitpid(child,NULL,WNOHANG|__WNOTHREAD);
+    if(result<0){CHECK(errno==ECHILD);sched_yield();}}while(result<0);
+   CHECK(result==0&&write(creator_gate[1],"G",1)==1);fork_tid=getpid();status=collect_crash(child,mode);
+   CHECK(!close(creator_gate[0])&&!close(creator_gate[1]));creator_gate[0]=-1;
+  }else {fork_tid=(pid_t)syscall(SYS_gettid);status=crash(mode);}
+  CHECK(WCOREDUMP(status));
   int fd2=open("core",O_RDONLY);CHECK(fd2>=0);Elf64_Ehdr e;CHECK(read(fd2,&e,sizeof(e))==sizeof(e));unsigned notes=0,seen=0;
   for(unsigned i=0;i<e.e_phnum;i++){Elf64_Phdr p;CHECK(pread(fd2,&p,sizeof(p),e.e_phoff+i*sizeof(p))==sizeof(p));
    if(p.p_type==PT_NOTE)for(uint64_t at=p.p_offset;at<p.p_offset+p.p_filesz;){Elf64_Nhdr n;CHECK(pread(fd2,&n,sizeof(n),at)==sizeof(n));
     if(n.n_type==NT_PRSTATUS){unsigned char desc[512];CHECK(n.n_descsz<=sizeof(desc));CHECK(pread(fd2,desc,n.n_descsz,at+12+((n.n_namesz+3)&~3U))==n.n_descsz);
      int32_t tid;uint16_t sig;memcpy(&tid,desc+32,4);memcpy(&sig,desc+12,2);CHECK(sig==SIGABRT);
+     int32_t ids[3];memcpy(ids,desc+36,sizeof(ids));
+     CHECK(ids[0]==fork_tid&&ids[1]==getpgrp()&&ids[2]==getsid(0));
      unsigned bit=tid==crashed_pid?1:0;for(unsigned j=0;j<peer_count;j++)if(tid==crashed_threads[j])bit=2U<<j;CHECK(bit&&!(seen&bit));seen|=bit;notes++;
 #if defined(__riscv)
      uint64_t pc,sp;memcpy(&pc,desc+112,8);memcpy(&sp,desc+128,8);CHECK(pc&&sp);

@@ -50,10 +50,14 @@ static size_t core_note(struct kernel_task *task,unsigned signal,unsigned char *
     status.info[0]=(int32_t)signal;status.signal=(uint16_t)signal;
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-        status.blocked=task->signal_blocked;status.pid=task->tid;
-        status.ppid=task->parent?task->parent->tid:0;
-        status.pgrp=process_identity_number(task,KERNEL_PID_PGID);
-        status.sid=process_identity_number(task,KERNEL_PID_SID);
+        struct kernel_pid_registry *view=process_pid_active(task);
+        status.blocked=task->signal_blocked;
+        status.pid=kernel_pid_number_in(process_identity(task,KERNEL_PID_TID),view);
+        /* Linux records the real parent's TID, not getppid()'s TGID.
+         * All threads inherit this relationship from their group. */
+        status.ppid=kernel_pid_number_in(task->group_leader->child_creator,view);
+        status.pgrp=kernel_pid_number_in(process_identity(task,KERNEL_PID_PGID),view);
+        status.sid=kernel_pid_number_in(process_identity(task,KERNEL_PID_SID),view);
     }
     uint64_t original=0,regs[45]={0};
     arch_ptrace_regset(task,1,regs,&original,0);
