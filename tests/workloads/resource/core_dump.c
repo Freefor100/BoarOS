@@ -16,6 +16,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #define CHECK(x) do {if(!(x)){printf("CORE FAIL line=%d errno=%d\n",__LINE__,errno);exit(1);}}while(0)
 static char *memory;static size_t page;static pid_t crashed_pid;
 static int ready[2],hold[2],identity[2];
@@ -37,6 +38,11 @@ static int crash(int mode)
   struct rlimit limit={mode==1?0:mode==5?page:32*1024*1024,RLIM_INFINITY};CHECK(!setrlimit(RLIMIT_CORE,&limit));
   CHECK(!prctl(PR_SET_DUMPABLE,mode==2?0:1));
   if(mode==4){struct rlimit fsize={0,RLIM_INFINITY};CHECK(!setrlimit(RLIMIT_FSIZE,&fsize));}
+  if(mode==0){uint64_t value=0;struct iovec local={&value,sizeof(value)},remote={(void *)&spinning,sizeof(spinning)};
+   CHECK(process_vm_readv(getpid(),&local,1,&remote,1,0)==sizeof(value));
+   CHECK(process_vm_writev(getpid(),&local,1,&remote,1,0)==sizeof(value));
+   remote.iov_base=memory;errno=0;CHECK(process_vm_writev(getpid(),&local,1,&remote,1,0)==-1&&errno==EFAULT);
+  }
   if(threaded){thread_mode=mode;pthread_t t;CHECK(!pipe(ready)&&!pipe(hold));CHECK(!pthread_create(&t,NULL,other_thread,NULL));char c;CHECK(read(ready[0],&c,1)==1);}
   if(mode==7)for(;;)pause();
   raise(SIGABRT);_exit(99);
