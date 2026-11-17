@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include <kernel/hugetlb.h>
+#include "../../kernel/sched/futex_internal.h"
 #include <kernel/heap.h>
 #include <kernel/sync.h>
 #include <assert.h>
@@ -7,6 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+/* Non-hugetlb key branches are deliberately unreachable in this harness. */
+int kernel_vfs_node_acquire(struct kernel_vfs_node *node) { (void)node;abort(); }
+int kernel_vfs_node_release(struct kernel_vfs_node **owner) { (void)owner;abort(); }
 void mm_test_attach(unsigned);
 void kernel_console_putc(char c) { fputc(c,stderr); }
 void mm_test_fence(uint64_t address,int instructions) { (void)address;(void)instructions; }
@@ -133,8 +137,24 @@ int main(void)
     assert(!physical_page_reference_count(&allocator,cache,&refs) && refs==2);
     assert(!kernel_hugetlb_map_unmap(shared,0,1));
     physical_page_release_order(&allocator,cache,order);
-    kernel_hugetlb_map_release(&shared);assert(snapshot(h).free==2);
-    kernel_hugetlb_map_release(&shared_fork);assert(snapshot(h).free==3);
+    struct kernel_futex_key key={.kind=KERNEL_FUTEX_KEY_SHARED_HUGETLB,
+        .identity=(uintptr_t)shared,.offset=BOAROS_PAGE_SIZE+4,.hugetlb_map=shared};
+    futex_key_hold(&key); /* MM publishes an owning key while VMA is stable. */
+    struct kernel_futex_key queued=key;
+    futex_key_hold(&queued); /* requeue/PI state copy gets a distinct reference. */
+    assert(futex_key_equal(&key,&queued));
+    struct kernel_futex_key different=key;different.offset+=4;
+    assert(!futex_key_equal(&key,&different));
+    different=key;different.kind=KERNEL_FUTEX_KEY_PRIVATE;
+    assert(!futex_key_equal(&key,&different));
+    kernel_hugetlb_map_release(&shared);
+    kernel_hugetlb_map_release(&shared_fork);
+    assert(snapshot(h).free==2 && snapshot(h).maps==1);
+    futex_key_release(&key);
+    assert(!key.identity && !key.hugetlb_map && key.kind==KERNEL_FUTEX_KEY_PRIVATE);
+    assert(snapshot(h).free==2 && snapshot(h).maps==1);
+    futex_key_release(&queued);
+    assert(snapshot(h).free==3 && !snapshot(h).maps);
 
     assert(!kernel_hugetlb_map_create(h,2,KERNEL_HUGETLB_PRIVATE,0,&parallel_map));
     assert(!pthread_barrier_init(&gate,NULL,2));pthread_t threads[2];

@@ -3,6 +3,7 @@
 #include "private.h"
 #include <kernel/errno.h>
 #include <kernel/memory_object.h>
+#include <kernel/hugetlb.h>
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
 #define FUTEX_BUCKETS 256U
@@ -56,6 +57,8 @@ static inline void futex_key_release(struct kernel_futex_key *key)
         kernel_memory_object_release(&key->shared_object);
     else if (key->kind == KERNEL_FUTEX_KEY_SHARED_FILE &&
              kernel_vfs_node_release(&key->file_node)) __builtin_trap();
+    else if (key->kind == KERNEL_FUTEX_KEY_SHARED_HUGETLB)
+        kernel_hugetlb_map_release(&key->hugetlb_map);
     *key = (struct kernel_futex_key){0};
 }
 
@@ -65,6 +68,8 @@ static inline void futex_key_hold(const struct kernel_futex_key *key)
         kernel_memory_object_acquire(key->shared_object)) __builtin_trap();
     if (key->kind == KERNEL_FUTEX_KEY_SHARED_FILE &&
         kernel_vfs_node_acquire(key->file_node)) __builtin_trap();
+    if (key->kind == KERNEL_FUTEX_KEY_SHARED_HUGETLB)
+        kernel_hugetlb_map_acquire(key->hugetlb_map);
 }
 
 static inline int64_t futex_prepare(struct kernel_task *task,
