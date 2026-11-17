@@ -4732,6 +4732,7 @@ static void tcp_info_snapshot(const struct tcp_pcb *pcb, struct kernel_socket_tc
     info->snd_mss=tcp_mss(pcb);info->rcv_mss=pcb->boaros_rcv_mss;
     for(const struct tcp_seg *seg=pcb->unacked;seg;seg=seg->next) {
         info->unacked++;if(seg->flags&TF_SEG_RETRANSMITTED)info->retrans++;
+        if(seg->flags&TF_SEG_LOST)info->lost++;
     }
     for(const struct tcp_seg *seg=pcb->unsent;seg;seg=seg->next) {
         info->notsent_bytes+=seg->len-seg->boaros_sent_bytes;

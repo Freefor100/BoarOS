@@ -1158,6 +1158,11 @@ tcp_split_unsent_seg(struct tcp_pcb *pcb, u16_t split)
   LWIP_DEBUGF(TCP_QLEN_DEBUG, ("tcp_enqueue: split_unsent_seg: %u\n", (unsigned int)pcb->snd_queuelen));
 
   optflags = useg->flags;
+#ifdef BOAROS_LWIP_TCP_INFO
+  /* The fresh remainder must not inherit history through option flags.
+   * Restore telemetry below only for its actually transmitted prefix. */
+  optflags &= (u8_t)~(TF_SEG_SENT | TF_SEG_RETRANSMITTED | TF_SEG_LOST);
+#endif
 #if TCP_CHECKSUM_ON_COPY
   /* Remove since checksum is not stored until after tcp_create_segment() */
   optflags &= ~TF_SEG_DATA_CHECKSUMMED;
@@ -1689,7 +1694,7 @@ boaros_lwip_tcp_output_more(struct tcp_pcb *pcb, u8_t more)
       pcb->boaros_total_retrans++;
       seg->flags |= TF_SEG_RETRANSMITTED;
     }
-    seg->flags = (seg->flags | TF_SEG_SENT) & (u8_t)~TF_SEG_LOST;
+    seg->flags |= TF_SEG_SENT; /* loss remains declared until this sequence is ACKed */
     seg->boaros_sent_bytes = seg->len;
 #endif
 #if TCP_OVERSIZE_DBGCHECK

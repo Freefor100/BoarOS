@@ -263,7 +263,7 @@ struct tcp_seg {
   u8_t  chksum_swapped;
 #endif /* TCP_CHECKSUM_ON_COPY */
   u8_t  flags;
-#define TF_SEG_LOST             (u8_t)0x80U /* queued by retransmission recovery */
+#define TF_SEG_LOST             (u8_t)0x80U /* declared lost; retained through retransmit until ACK */
 #define TF_SEG_SENT             (u8_t)0x40U /* successful initial output */
 #define TF_SEG_RETRANSMITTED    (u8_t)0x20U /* successful retransmit, for TCP_INFO */
 #define TF_SEG_OPTS_MSS         (u8_t)0x01U /* Include MSS option (only used in SYN segments) */

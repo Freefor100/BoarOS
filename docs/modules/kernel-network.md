@@ -491,7 +491,8 @@ wrapper，仅过滤其不支持的 `-global ls7a_rtc.toy-enabled=on`；不改仓
 - bytes_acked/received 跟随确认/接收序列推进，包含 FIN；active SYN 在 bytes_acked
   中计 1，passive SYN-ACK 不计。segs/data_segs、已确认段数和接收乱序包计数来自事件。
   unacked/lost/retrans/notsent 在查询时遍历现有队列；RTO 仅在已有恢复事件中批量标记
-  待重传段，不增加正常逐包队列遍历。
+  待重传段，不增加正常逐包队列遍历。LOST 是尚未确认序列的丢失标记，成功重发
+  后仍保留；重传在途同时计 lost/retrans，再次丢失后仅计 lost，ACK 归还段后两者清零。
 - RTT、RTT variance、min RTT、最近数据/ACK 时间复用 lwIP 的 500ms TCP 时钟。
   短连接可能得到 RTT=0；这代表现有估计的量化值，不能据此判断真实延迟为零。
   不为 TCP_INFO 新增逐包高精度时钟读取或 RTT 算法；无 RTT 样本时 min_rtt 为

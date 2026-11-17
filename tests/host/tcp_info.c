@@ -65,20 +65,39 @@ static void info_case(struct kernel_socket *client,struct kernel_socket *server)
     kernel_socket_protocol_enter(&scope);
     pcb->persist_backoff=0;
     assert(tcp_output(pcb)==ERR_OK && wire_packets==3);
-    assert(tcp_rexmit(pcb)==ERR_OK && tcp_output(pcb)==ERR_OK && wire_packets==4);
-    assert(tcp_rexmit_rto_prepare(pcb)==ERR_OK);
+    kernel_socket_protocol_leave(&scope);
+    assert(!kernel_socket_tcp_info(client,&after) && after.unacked==1 && !after.lost && after.retrans==1);
+    kernel_socket_protocol_enter(&scope);
+    assert(tcp_rexmit(pcb)==ERR_OK);
+    kernel_socket_protocol_leave(&scope);
+    assert(!kernel_socket_tcp_info(client,&after) && after.unacked==1 && after.lost==1 && !after.retrans);
+    kernel_socket_protocol_enter(&scope);
+    assert(tcp_output(pcb)==ERR_OK && wire_packets==4);
+    kernel_socket_protocol_leave(&scope);
+    assert(!kernel_socket_tcp_info(client,&after) && after.unacked==1 && after.lost==1 && after.retrans==1);
+    kernel_socket_protocol_enter(&scope);
+    assert(tcp_rexmit_rto_prepare(pcb)==ERR_OK); /* loss of the retransmission */
     assert(tcp_split_unsent_seg(pcb,32)==ERR_OK);
     assert(tcp_write(pcb,bytes,16,TCP_WRITE_FLAG_COPY)==ERR_OK); /* append fresh data behind retransmission prefix */
+    /* Split the appended fresh suffix from the retransmitted tail. The raw
+     * split API works on the head; temporarily exclude its preceding segment. */
+    struct tcp_seg *head=pcb->unsent;pcb->unsent=head->next;
+    assert(tcp_split_unsent_seg(pcb,32)==ERR_OK);
+    head->next=pcb->unsent;pcb->unsent=head;
+    assert(head->next->next && !head->next->next->boaros_sent_bytes &&
+        !(head->next->next->flags&(TF_SEG_SENT|TF_SEG_RETRANSMITTED|TF_SEG_LOST)));
     wire_fail=1;assert(tcp_output(pcb)==ERR_MEM && wire_packets==4);
     kernel_socket_protocol_leave(&scope);
-    assert(!kernel_socket_tcp_info(client,&after) && after.total_retrans==3 && after.bytes_sent-before.bytes_sent==130 && after.bytes_retrans==66 && after.unacked==2 && after.lost==2 && after.notsent_bytes==16);
+    assert(!kernel_socket_tcp_info(client,&after) && after.total_retrans==3 && after.bytes_sent-before.bytes_sent==130 && after.bytes_retrans==66 && after.unacked==2 && after.lost==2 && !after.retrans && after.notsent_bytes==16);
     kernel_socket_protocol_enter(&scope);wire_fail=0;
     pcb->local_ip=local;pcb->remote_ip=remote;pcb->netif_idx=index;
     assert(tcp_output(pcb)==ERR_OK);netif_remove(&blackhole);
-    kernel_socket_protocol_leave(&scope);service();
+    kernel_socket_protocol_leave(&scope);
+    assert(!kernel_socket_tcp_info(client,&after) && after.unacked==3 && after.lost==2 && after.retrans==2 && !after.notsent_bytes);
+    service();
     kernel_socket_protocol_enter(&scope);tcp_ack_now(peer);assert(tcp_output(peer)==ERR_OK);kernel_socket_protocol_leave(&scope);service();
-    assert(!kernel_socket_tcp_info(client,&after) && after.total_retrans==5 && !after.unacked && !after.retrans && after.bytes_acked-before.bytes_acked==80 && after.bytes_retrans==130);
-    assert(!kernel_socket_tcp_info(server,&after) && after.bytes_received==80 && after.rcv_mss==48);
+    assert(!kernel_socket_tcp_info(client,&after) && after.total_retrans==5 && !after.unacked && !after.lost && !after.retrans && after.bytes_acked-before.bytes_acked==80 && after.bytes_retrans==130);
+    assert(!kernel_socket_tcp_info(server,&after) && after.bytes_received==80 && after.rcv_mss==32);
     puts("PASS TCPINFO actual failed/successful output probes split append retransmission ACK bytes queues migration");
 }
 static void keepalive_case(struct kernel_heap *heap)
