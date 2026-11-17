@@ -1090,6 +1090,33 @@ static void test_contiguous_pages_have_independent_owners(void)
         fail_page(114U,PHYSICAL_PAGE_STATUS_OK,PHYSICAL_PAGE_STATUS_STATE);
 }
 
+static void test_compound_block_references(void)
+{
+    struct physical_page_allocator allocator;
+    uint64_t bootstrap, base, available;
+    uint32_t count;
+    enum physical_page_status status = init_coalescing_buddy(&allocator, &bootstrap);
+    if (status) fail_page(115U, PHYSICAL_PAGE_STATUS_OK, status);
+    available = physical_page_available(&allocator);
+    status = physical_page_allocate_order(&allocator, 2, &base);
+    if (status || physical_page_cow_borrow_order(&allocator, base, 2) != 1 ||
+        physical_page_acquire_order(&allocator, base, 2) ||
+        physical_page_cow_borrow_order(&allocator, base, 2) != 2 ||
+        physical_page_reference_count(&allocator, base, &count) || count != 3 ||
+        physical_page_allocator_audit(&allocator))
+        fail_page(116U, PHYSICAL_PAGE_STATUS_OK, PHYSICAL_PAGE_STATUS_STATE);
+    if (physical_page_release_order(&allocator, base, 2) ||
+        physical_page_release_allocation(&allocator, base) != 2 ||
+        physical_page_available(&allocator) != available - 4 ||
+        physical_page_reference_count(&allocator, base, &count) || count != 1)
+        fail_page(117U, PHYSICAL_PAGE_STATUS_OK, PHYSICAL_PAGE_STATUS_STATE);
+    if (physical_page_release_order(&allocator, base, 2) ||
+        physical_page_available(&allocator) != available ||
+        physical_page_allocator_audit(&allocator) ||
+        physical_page_release(&allocator, bootstrap))
+        fail_page(118U, PHYSICAL_PAGE_STATUS_OK, PHYSICAL_PAGE_STATUS_STATE);
+}
+
 void run_physical_page_tests(void)
 {
     test_aligns_allocates_and_reports_exhaustion();
@@ -1109,4 +1136,5 @@ void run_physical_page_tests(void)
     test_finalized_order_zero_reference_counts();
     test_finalized_allocator_reclaims_once_and_guards_recursion();
     test_contiguous_pages_have_independent_owners();
+    test_compound_block_references();
 }

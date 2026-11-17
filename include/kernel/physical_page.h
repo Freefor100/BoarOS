@@ -145,7 +145,7 @@ void physical_page_release_batch(struct physical_page_allocator *allocator,
 void physical_page_acquire_batch(struct physical_page_allocator *allocator,
     const uint64_t *addresses, unsigned count);
 
-/* Only finalized order-zero allocations may gain shared owners. */
+/* Finalized order-zero references retain their page-only contract. */
 /* Caller owns the page through a stable PTE. Return its pre-borrow count;
  * if shared, acquire the copy-source loan under that same protection. */
 uint32_t physical_page_cow_borrow(struct physical_page_allocator *,uint64_t address);
@@ -153,6 +153,19 @@ uint32_t physical_page_cow_borrow(struct physical_page_allocator *,uint64_t addr
 enum physical_page_status physical_page_acquire(
     struct physical_page_allocator *allocator,
     uint64_t address);
+
+/* Whole-allocation references for compound backing. address must be the live
+ * buddy head and order must match its allocation. A tail is never a separate
+ * owner. Each acquired or borrowed reference is returned with release_order
+ * using the same head/order; release_allocation may discover that order.
+ * No page-table mapping is installed, and no allocation is split here. */
+enum physical_page_status physical_page_acquire_order(
+    struct physical_page_allocator *, uint64_t address, uint32_t order);
+/* Like cow_borrow, but the retained source is the entire compound allocation.
+ * A return of one does not acquire a second reference. The caller must keep
+ * its original owner and serialize changes to the associated mapping. */
+uint32_t physical_page_cow_borrow_order(
+    struct physical_page_allocator *, uint64_t address, uint32_t order);
 
 enum physical_page_status physical_page_reference_count(
     const struct physical_page_allocator *allocator,
