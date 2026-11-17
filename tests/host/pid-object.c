@@ -101,8 +101,32 @@ static void published_iteration(void)
 }
 
 /* Releasing a task must not recycle numbers owned by another role or a pin. */
+static void exact_reservation(void)
+{
+    uint64_t bitmap[1];
+    struct kernel_pid_allocator numbers = {0};
+    struct kernel_pid_registry registry = {.numbers=&numbers,.next_generation=1};
+    struct kernel_pid a={0},b={0},bad={0};
+    assert(kernel_pid_allocator_init(&numbers,bitmap,64)==KERNEL_PID_STATUS_OK);
+    assert(kernel_pid_reserve_number(&registry,&a,42)==KERNEL_PID_STATUS_OK);
+    assert(a.number==42 && numbers.cursor==0 && numbers.allocated==1);
+    assert(!kernel_pid_find(&registry,42));
+    assert(kernel_pid_reserve_number(&registry,&b,42)==KERNEL_PID_STATUS_EXISTS);
+    assert(kernel_pid_reserve_number(&registry,&bad,65)==KERNEL_PID_STATUS_INVALID);
+    assert(kernel_pid_reserve_number(&registry,&bad,-1)==KERNEL_PID_STATUS_INVALID);
+    assert(!b.registry && !bad.registry && registry.next_generation==2);
+    assert(kernel_pid_publish_reserved(&a)==KERNEL_PID_STATUS_OK);
+    assert(kernel_pid_reserve_number(&registry,&b,42)==KERNEL_PID_STATUS_EXISTS);
+    kernel_pid_put(&a); assert(!numbers.allocated);
+    assert(kernel_pid_take_retired(&registry)==&a);
+    assert(kernel_pid_reserve_number(&registry,&b,42)==KERNEL_PID_STATUS_OK);
+    assert(b.generation==2); kernel_pid_put(&b);
+    assert(kernel_pid_take_retired(&registry)==&b && !numbers.allocated);
+}
+
 int main(void)
 {
+    exact_reservation();
     struct rlimit limit = {0}; assert(setrlimit(RLIMIT_CORE, &limit) == 0);
     encoding_boundaries();
     published_iteration();

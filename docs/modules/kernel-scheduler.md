@@ -308,7 +308,11 @@ SETTLS写r2/TP、child stack写r3/SP、返回a0=0并使ERA前进4字节。LA已�
 
 用户多核下，调用线程在当前核导入 clone3 参数，准备子任务栈页、凭据、文件表和 MM。CPU0 映射内核栈窗口后在新栈建立首次返回的寄存器现场。普通 fork 在父 MM 写资格内排空写 pin 并提交 COW，父映射含 SysV 附件时在 CPU0 更新段的附着计数。CPU0 继承控制终端，在同一次调度锁保护下发布子进程身份、pidfd、组与亲子关系，并按继承的亲和性选择就绪队列。子任务在实际运行核处理首次返回和 CHILD_SETTID。只读的资源限额、PGID、SID 和 robust-list 查询在调用核取得受保护的快照。
 
-RV/LA 的 clone 和 clone3 共用进程创建，支持 CLONE_VM、CLONE_FILES、CLONE_FS、CLONE_IO，以及共享 VM 时的 CLONE_SIGHAND 和可选 CLONE_VFORK；线程要求 VM/SIGHAND/THREAD，FILES 和 FS 按标志选择。CHILD_SETTID/CHILD_CLEARTID、SETTLS/PARENT_SETTID 与 CLONE_SYSVSEM 沿实际标志处理。clone3 检查结构长度、扩展字节和子栈范围，再转换成共同创建参数；CLONE_CLEAR_SIGHAND 在独立信号表中重置子进程处理动作，不能与 CLONE_SIGHAND 同用。指定 PID 数组、cgroup 和其他未接入的资源组合返回 ENOTSUP。CLONE_SYSVSEM 的最后共享者退出补偿见[SysV信号量](sysv-sem.md)。
+RV/LA 的 clone 和 clone3 共用进程创建，支持 CLONE_VM、CLONE_FILES、CLONE_FS、CLONE_IO，以及共享 VM 时的 CLONE_SIGHAND 和可选 CLONE_VFORK；线程要求 VM/SIGHAND/THREAD，FILES 和 FS 按标志选择。CHILD_SETTID/CHILD_CLEARTID、SETTLS/PARENT_SETTID 与 CLONE_SYSVSEM 沿实际标志处理。clone3 检查结构长度、扩展字节和子栈范围，再转换成共同创建参数；CLONE_CLEAR_SIGHAND 在独立信号表中重置子进程处理动作，不能与 CLONE_SIGHAND 同用。指定 TID 数组支持当前唯一 PID namespace 的一个元素：编号必须在 `[1, /proc/sys/kernel/pid_max)`，要求有效 CAP_SYS_ADMIN 或 CAP_CHECKPOINT_RESTORE；超出命名空间深度返回 EINVAL，已占用编号返回 EEXIST。导入后沿共同创建路径在身份锁内预留编号，使用同一 bitmap 覆盖未发布预留与已发布身份，不推进自动分配游标；失败释放预留，成功与亲子关系一起发布。不新增每任务存储或另一个编号表。cgroup 和其他未接入的资源组合仍返回 ENOTSUP。CLONE_SYSVSEM 的最后共享者退出补偿见[SysV信号量](sysv-sem.md)。
+
+`CLONE_INTO_CGROUP` 尚不能安全实现：当前没有 cgroup v2 文件对象、任务成员关系和控制器。需要先提供可引用的 cgroup 目录 FD、委派及迁移权限检查、域与 threaded 模式检查、离线/删除状态和迁移序列化，再将成员预留及控制器准入纳入 clone 的准备、提交与失败回滚。子任务必须在首次 runnable 前属于目标组，不能以 fork 后移动或仅接受标志代替。PID/user namespace 的层级编号与 namespace owner 权限也仍未实现。
+
+`tests/workloads/resource/clone_resources.c` 的 exact-tid 用例检查指定编号成功、存活期间冲突、坏 pidfd 输出后编号复用，以及仅 CAP_CHECKPOINT_RESTORE 和无相应 capability 的差异；`test-pid-object-host` 检查未发布预留的冲突与释放代际。复用 `tests/userland/run.py --workload clone_resources`，Linux 参考需具备上述 capability 并在初始 PID namespace 中运行。
 
 `ioprio_set/get` 支持按线程、进程组和真实 UID 设置或查询优先级；RT 设置检查 CAP_SYS_ADMIN/CAP_SYS_NICE。首次设置时按需分配块 I/O 优先级上下文；CLONE_IO 共享已经存在的对象，父线程没有对象时子线程也从空状态开始。普通 fork 对已设置的优先级生成独立副本，exec 保留执行线程的对象，退出与创建失败归还真实引用。未显式设置时，集合查询按基础策略派生RT/BE/IDLE类，并用(nice+20)/5得到默认级别；单进程原始查询保留NONE。KCMP_IO 比较该对象，包括两个空对象相等；它与每任务持锁和用户页借用的 `kernel_io_context` 分开。固定 Linux 的 `ioprio_set(USER, 0)` 按数值 UID 0 匹配，而 `get(USER, 0)` 查询调用者的真实 UID。当前块队列仍按需求 I/O 和后台回收类别服务，尚未按用户设置的 I/O 优先级调度请求。
 

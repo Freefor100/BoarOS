@@ -14,6 +14,7 @@ enum kernel_pid_status {
     KERNEL_PID_STATUS_EXHAUSTED,
     KERNEL_PID_STATUS_NOT_ALLOCATED,
     KERNEL_PID_STATUS_STATE,
+    KERNEL_PID_STATUS_EXISTS,
 };
 
 struct kernel_pid_allocator {
@@ -81,6 +82,8 @@ _Static_assert(KERNEL_PID_GENERATION_MAX <= (UINT64_MAX >> 2U),
  * Final put retires storage and leaves heap disposal to the caller. */
 enum kernel_pid_status kernel_pid_reserve(struct kernel_pid_registry *registry,
                                          struct kernel_pid *prepared);
+enum kernel_pid_status kernel_pid_reserve_number(struct kernel_pid_registry *,
+    struct kernel_pid *, kernel_pid_t requested);
 enum kernel_pid_status kernel_pid_publish_reserved(struct kernel_pid *prepared);
 enum kernel_pid_status kernel_pid_publish(struct kernel_pid_registry *registry,
                                           struct kernel_pid *prepared);

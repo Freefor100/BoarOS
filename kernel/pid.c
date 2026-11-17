@@ -160,22 +160,38 @@ struct kernel_pid *kernel_pid_next_published(struct kernel_pid_registry *registr
     }
 }
 
-enum kernel_pid_status kernel_pid_reserve(struct kernel_pid_registry *registry,
-                                          struct kernel_pid *prepared)
+enum kernel_pid_status kernel_pid_reserve_number(struct kernel_pid_registry *registry,
+    struct kernel_pid *prepared, kernel_pid_t requested)
 {
     if (!registry || !prepared || prepared->registry || prepared->published || !registry->next_generation)
         return KERNEL_PID_STATUS_STATE;
     if (registry->next_generation > KERNEL_PID_GENERATION_MAX)
         return KERNEL_PID_STATUS_EXHAUSTED;
-    kernel_pid_t number;
-    enum kernel_pid_status status = kernel_pid_allocate(registry->numbers, &number);
-    if (status != KERNEL_PID_STATUS_OK) return status;
+    kernel_pid_t number = requested;
+    if (requested) {
+        struct kernel_pid_allocator *a = registry->numbers;
+        if (!valid_allocator(a)) return KERNEL_PID_STATUS_STATE;
+        if (requested < 0 || (uint32_t)requested > a->limit) return KERNEL_PID_STATUS_INVALID;
+        uint32_t index = (uint32_t)requested - 1U;
+        if (a->bitmap[index >> 6] & pid_mask(index)) return KERNEL_PID_STATUS_EXISTS;
+        /* Exact allocation shares the bitmap with automatic and unpublished
+         * reservations. It does not move the cyclic allocation cursor. */
+        a->bitmap[index >> 6] |= pid_mask(index);
+        a->allocated++;
+    } else {
+        enum kernel_pid_status status = kernel_pid_allocate(registry->numbers, &number);
+        if (status != KERNEL_PID_STATUS_OK) return status;
+    }
     prepared->number = number;
     prepared->generation = registry->next_generation++;
     prepared->references = 1;
     prepared->registry = registry;
     return KERNEL_PID_STATUS_OK;
 }
+
+enum kernel_pid_status kernel_pid_reserve(struct kernel_pid_registry *registry,
+    struct kernel_pid *prepared)
+{ return kernel_pid_reserve_number(registry, prepared, 0); }
 
 enum kernel_pid_status kernel_pid_publish_reserved(struct kernel_pid *prepared)
 {
