@@ -567,6 +567,47 @@ static void test_batch_allocation(void)
     assert(!physical_page_allocator_clear_reclaimer(&allocator));
 }
 
+struct recycle_test { uint64_t head; unsigned calls, retained; };
+static int retain_compound(void *context, uint64_t head, uint32_t order)
+{
+    struct recycle_test *test=context;
+    test->calls++;
+    if (head!=test->head) return 0;
+    assert(order==4 && !test->retained);
+    test->retained=1;
+    return 1;
+}
+static void test_compound_recycler(void)
+{
+    setup();
+    uint64_t initial=physical_page_available(&allocator), other, single;
+    struct recycle_test test={0};
+    assert(!physical_page_allocate_order(&allocator,4,&test.head));
+    struct physical_page_compound_recycler hooks={&test,retain_compound};
+    assert(!physical_page_allocator_set_compound_recycler(&allocator,&hooks));
+    assert(physical_page_allocator_set_compound_recycler(&allocator,&hooks)==PHYSICAL_PAGE_STATUS_STATE);
+    assert(physical_page_allocator_clear_compound_recycler(&allocator,&allocator)==PHYSICAL_PAGE_STATUS_STATE);
+    assert(!physical_page_allocate(&allocator,&single));
+    assert(!physical_page_release(&allocator,single) && !test.calls);
+    assert(!physical_page_acquire_order(&allocator,test.head,4));
+    assert(!physical_page_release_order(&allocator,test.head,4) && !test.calls);
+    assert(physical_page_release_allocation(&allocator,test.head)==4 && test.retained);
+    uint32_t refs;
+    assert(!physical_page_reference_count(&allocator,test.head,&refs) && refs==1);
+    assert(physical_page_available(&allocator)==initial-16);
+    assert(!physical_page_allocate_order(&allocator,2,&other));
+    assert(!physical_page_release_order(&allocator,other,2) && test.calls==2);
+    /* Pool transfers its sole reference without adding a hidden COW owner. */
+    test.retained=0;
+    assert(physical_page_cow_borrow_order(&allocator,test.head,4)==1);
+    const uint8_t orders[]={4};
+    physical_page_release_order_batch(&allocator,&test.head,orders,1);
+    assert(test.retained && test.calls==3);
+    assert(!physical_page_allocator_clear_compound_recycler(&allocator,&test));
+    assert(!physical_page_release_order(&allocator,test.head,4));
+    assert(physical_page_available(&allocator)==initial && !physical_page_allocator_audit(&allocator));
+}
+
 static void test_compound_retirement(void)
 {
     setup();
@@ -627,6 +668,7 @@ int main(void)
 {
     struct rlimit limit = {0, 0};
     assert(setrlimit(RLIMIT_CORE, &limit) == 0);
+    test_compound_recycler();
     test_compound_retirement();
     test_compound_references();
     test_no_sleep_allocation();
