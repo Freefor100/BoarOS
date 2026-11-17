@@ -44,6 +44,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "rtnetlink.h"
+
 #define SOCKET_DGRAM 2
 #define SOCKET_STREAM 1
 #define SOCKET_SEQPACKET 5
@@ -158,7 +160,8 @@ struct kernel_socket {
     struct kernel_socket *gc_next, *gc_work;
     uint32_t gc_inflight;
     unsigned gc_mark, passcred;
-    uint32_t netlink_references, netlink_memory;
+    uint32_t netlink_references, netlink_memory, netlink_port;
+    struct kernel_socket *netlink_next;
 #if BOAROS_USER_SMP
     unsigned tcp_cpu;
     uint16_t tcp_prepare_mss;
@@ -2393,6 +2396,36 @@ static __attribute__((noinline)) void unix_destroy(struct kernel_socket *socket)
     unix_put(socket);
 }
 
+/* Binding is control-plane only. Registry ownership never nests endpoint locks. */
+static struct kernel_socket *netlink_ports;
+static uint32_t netlink_next_port=0x80000000U;
+static int netlink_bind(struct kernel_socket *socket,uint32_t port,int automatic)
+{
+    kernel_pid_t pid=0;
+    if(!port && kernel_task_current())(void)kernel_task_tgid(kernel_task_current(),&pid);
+    uint32_t preferred=(uint32_t)pid;
+    SOCKET_STATE(state);
+    if(socket->netlink_port)return automatic || !port || socket->netlink_port==port?0:-KERNEL_EINVAL;
+    uint32_t selected=port?port:preferred;
+    for(;;) {
+        int used=!selected;
+        for(struct kernel_socket *p=netlink_ports;p;p=p->netlink_next)
+            if(p->netlink_port==selected) {used=1;break;}
+        if(!used)break;
+        if(port)return -KERNEL_EADDRINUSE;
+        selected=netlink_next_port++;
+        if(!netlink_next_port)netlink_next_port=0x80000000U;
+    }
+    socket->netlink_port=selected;socket->netlink_next=netlink_ports;netlink_ports=socket;
+    return 0;
+}
+static void netlink_unbind(struct kernel_socket *socket)
+{
+    SOCKET_STATE(state);
+    struct kernel_socket **p=&netlink_ports;
+    while(*p && *p!=socket)p=&(*p)->netlink_next;
+    if(*p)*p=socket->netlink_next;
+}
 static int netlink_put_locked(struct kernel_socket *socket)
 {
     if(!socket->netlink_references)__builtin_trap();
@@ -2414,13 +2447,15 @@ static void netlink_storage_free(struct kernel_socket *socket)
 }
 static void netlink_destroy(struct kernel_socket *socket)
 {
+    netlink_unbind(socket);
     SOCKET_ENDPOINT(state,socket);
     if(socket->destroying || socket->read_request || socket->active_writes)__builtin_trap();
     socket->destroying=1;
     struct socket_packet *packets=socket->packets_head;
     /* Pending registrations keep their own charges and storage references. */
-    uint64_t queued_memory=(uint64_t)(socket->rx_bytes/NETLINK_COOKIE_SIZE)*packet_charge(NETLINK_COOKIE_SIZE);
-    if(socket->rx_bytes%NETLINK_COOKIE_SIZE || socket->netlink_memory<queued_memory)__builtin_trap();
+    uint64_t queued_memory=0;
+    for(struct socket_packet *p=packets;p;p=p->next)queued_memory+=packet_charge(p->length);
+    if(socket->netlink_memory<queued_memory)__builtin_trap();
     socket->netlink_memory-=(uint32_t)queued_memory;
     socket->packets_head=socket->packets_tail=NULL;socket->rx_bytes=0;
     socket_state_release(&state);
@@ -2531,7 +2566,12 @@ void kernel_socket_destroy(struct kernel_socket *socket)
 int kernel_socket_bind(struct kernel_socket *socket,
                        const struct kernel_socket_address *address)
 {
-    if(socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK)return -KERNEL_EOPNOTSUPP;
+    if(socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK) {
+        if(!address || address->family!=KERNEL_SOCKET_AF_NETLINK)return -KERNEL_EINVAL;
+        uint32_t groups;__builtin_memcpy(&groups,address->bytes,4);
+        if(groups)return -KERNEL_EOPNOTSUPP;
+        return netlink_bind(socket,address->scope,0);
+    }
     if(socket->domain==KERNEL_SOCKET_DOMAIN_UNIX) {
         KERNEL_LOCK_SCOPE(control);unix_control_acquire(&control);return unix_bind(socket,address);
     }
@@ -2584,7 +2624,8 @@ int kernel_socket_getname(struct kernel_socket *socket,
 {
     if(socket && socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK) {
         if(!address)return -KERNEL_EINVAL;
-        *address=(struct kernel_socket_address){.family=KERNEL_SOCKET_AF_NETLINK};return 0;
+        SOCKET_STATE(state);
+        *address=(struct kernel_socket_address){.family=KERNEL_SOCKET_AF_NETLINK,.scope=socket->netlink_port};return 0;
     }
     if(socket && socket->domain==KERNEL_SOCKET_DOMAIN_UNIX) {
         SOCKET_STATE(state);unix_export_locked(socket->unix_name,address);return 0;
@@ -3697,7 +3738,16 @@ int kernel_socket_packet_prepare(struct kernel_socket_write_request *request,
 {
     if(!request || !pin_owner || !*pin_owner)__builtin_trap();
     struct kernel_socket *socket=kernel_open_file_socket(*pin_owner);
-    if(socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK)return -KERNEL_EOPNOTSUPP;
+    if(socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK) {
+        if(destination) {
+            uint32_t groups;__builtin_memcpy(&groups,destination->bytes,4);
+            if(destination->family!=KERNEL_SOCKET_AF_NETLINK)return -KERNEL_EINVAL;
+            if(destination->scope || groups)return -KERNEL_EPERM;
+        }
+        if(count>4096)return -KERNEL_EMSGSIZE;
+        if(message && (message->control || message->credentials))return -KERNEL_EINVAL;
+        int error=netlink_bind(socket,0,1);if(error)return error;
+    }
     struct kernel_socket_control **control=message?&message->control:&request->automatic_control;
     int result=0,credentials=0;
     int hold_unix_peer=socket->domain==KERNEL_SOCKET_DOMAIN_UNIX &&
@@ -3737,6 +3787,9 @@ int kernel_socket_packet_prepare(struct kernel_socket_write_request *request,
                 request->inet_destination=inet_destination;
                 request->destination=&request->inet_destination;
             }
+            request->payload_size=count;request->flags=flags;
+        } else if(socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK) {
+            socket_write_begin(request,pin_owner,0);
             request->payload_size=count;request->flags=flags;
         } else if(hold_unix_peer) {
             /* Connected admission, peer borrowing and quota share this state. */
@@ -3815,6 +3868,50 @@ static __attribute__((noinline)) int socket_finish_packet(
     return result;
 }
 
+#define ROUTE_SNAPSHOT_MAX 16U
+#define ROUTE_RESPONSE_MAX 16384U
+static int route_snapshot(struct kernel_socket_interface *,size_t *);
+static int netlink_send(struct kernel_socket_write_request *request)
+{
+    struct kernel_socket *socket=request->socket;
+    if(request->payload_size<sizeof(struct route_header))return (int)request->payload_size;
+    struct kernel_socket_interface interfaces[ROUTE_SNAPSHOT_MAX];size_t count=0;
+    int result=route_snapshot(interfaces,&count);if(result)return result;
+    struct socket_packet *packet=NULL;
+    KERNEL_NO_RECLAIM_IO;
+    enum kernel_heap_status status=kernel_heap_allocate_zeroed(socket->heap,1,
+        sizeof(*packet)+ROUTE_RESPONSE_MAX,(void **)&packet);
+    if(status!=KERNEL_HEAP_STATUS_OK) {
+        if(status!=KERNEL_HEAP_STATUS_EMPTY)__builtin_trap();
+        return -KERNEL_ENOMEM;
+    }
+    struct route_output out={.data=packet->data,.capacity=ROUTE_RESPONSE_MAX,.port=socket->netlink_port};
+    result=route_encode(&out,((struct socket_packet *)request->packet)->data,request->payload_size,interfaces,count);
+    if(!result && out.used) {
+        /* Queue only exact-sized storage: quota tracks the allocation, not
+         * a small payload retained in the maximum-size encoding workspace. */
+        struct socket_packet *exact=NULL;
+        status=kernel_heap_allocate_zeroed(socket->heap,1,sizeof(*exact)+out.used,(void **)&exact);
+        if(status!=KERNEL_HEAP_STATUS_OK) {
+            if(status!=KERNEL_HEAP_STATUS_EMPTY)__builtin_trap();
+            kernel_heap_release(socket->heap,packet);return -KERNEL_ENOMEM;
+        }
+        __builtin_memcpy(exact->data,packet->data,out.used);
+        kernel_heap_release(socket->heap,packet);packet=exact;
+        packet->length=(uint32_t)out.used;
+        packet->address.family=KERNEL_SOCKET_AF_NETLINK;
+        uint32_t charge=packet_charge(packet->length);
+        SOCKET_ENDPOINT(state,socket);
+        if(charge>socket->rx_limit || socket->netlink_memory>socket->rx_limit-charge)result=-KERNEL_ENOBUFS;
+        else {
+            socket->netlink_memory+=charge;
+            packet_publish_locked(socket,packet,packet->length);packet=NULL;
+        }
+    }
+    if(packet)kernel_heap_release(socket->heap,packet);
+    return result?result:(int)request->payload_size;
+}
+
 int kernel_socket_packet_write(struct kernel_socket_write_request *request,
     struct kernel_mm *mm,struct kernel_uaccess_iov_cursor *cursor,
     const void *kernel_buffer,int *user_fault,struct kernel_socket_message *message)
@@ -3843,6 +3940,9 @@ int kernel_socket_packet_write(struct kernel_socket_write_request *request,
     }
     if(request->socket->domain==KERNEL_SOCKET_DOMAIN_INET) {
         result=protocol_request(request,SOCKET_PROTOCOL_DATAGRAM_SEND);goto out;
+    }
+    if(request->socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK) {
+        result=netlink_send(request);goto out;
     }
     result=socket_finish_packet(request,(uint32_t)count,control);
     if(result<0)goto out;
@@ -5441,11 +5541,25 @@ static void interface_snapshot(struct netif *n, struct kernel_socket_interface *
     s->netmask = netif_ip4_netmask(n)->addr; s->mtu = loop && n->mtu == 0 ? 65536U : n->mtu;
     s->gateway = netif_ip4_gw(n)->addr;
     s->default_route = n == netif_default && s->gateway != 0;
+    s->ipv6_loopback = loop && ip6_addr_isloopback(netif_ip6_addr(n,0)) &&
+        ip6_addr_isvalid(netif_ip6_addr_state(n,0));
     s->hardware_type = loop ? 772 : 1;
+    s->link_up = !!netif_is_link_up(n);
     if (netif_is_up(n)) s->flags |= 1;
     if (netif_is_up(n) && netif_is_link_up(n)) s->flags |= 0x40;
     s->flags |= loop ? 8 : 0x1002;
     if (!loop) __builtin_memcpy(s->mac, n->hwaddr, 6);
+}
+static int route_snapshot(struct kernel_socket_interface *interfaces,size_t *count)
+{
+    KERNEL_SERVICE_SCOPE(service);
+    kernel_socket_network_initialize();
+    struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    for(struct netif *n=netif_list;n;n=n->next) {
+        if(*count==ROUTE_SNAPSHOT_MAX) {kernel_socket_protocol_leave(&scope);return -KERNEL_ENOBUFS;}
+        interface_snapshot(n,&interfaces[(*count)++]);
+    }
+    kernel_socket_protocol_leave(&scope);return 0;
 }
 int kernel_socket_interface_index(uint32_t index, struct kernel_socket_interface *s)
 {

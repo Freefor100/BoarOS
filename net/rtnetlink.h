@@ -1,0 +1,177 @@
+/* Read-only rtnetlink wire encoder. The caller owns a coherent interface
+ * snapshot and bounded response storage; no protocol objects escape it. */
+#ifndef BOAROS_RTNETLINK_H
+#define BOAROS_RTNETLINK_H
+struct route_header { uint32_t length; uint16_t type, flags; uint32_t sequence, port; };
+struct route_output { unsigned char *data; size_t used, capacity; uint32_t port; };
+static size_t route_align(size_t n) { return (n+3U)&~(size_t)3U; }
+static void *route_append(struct route_output *out,size_t n)
+{
+    size_t aligned=route_align(n);
+    if(aligned>out->capacity-out->used)return NULL;
+    void *p=out->data+out->used;__builtin_memset(p,0,aligned);out->used+=aligned;return p;
+}
+static struct route_header *route_message(struct route_output *out,uint16_t type,
+    uint16_t flags,uint32_t sequence,const void *payload,size_t size)
+{
+    struct route_header *h=route_append(out,sizeof(*h)+size);if(!h)return NULL;
+    *h=(struct route_header){sizeof(*h)+(uint32_t)size,type,flags,sequence,out->port};
+    if(size)__builtin_memcpy(h+1,payload,size);
+    return h;
+}
+static int route_attribute(struct route_output *out,struct route_header *h,
+    uint16_t type,const void *data,size_t size)
+{
+    uint16_t *a=route_append(out,size+4);if(!a)return -KERNEL_ENOBUFS;
+    a[0]=(uint16_t)(size+4);a[1]=type;__builtin_memcpy(a+2,data,size);
+    h->length=(uint32_t)(out->used-((unsigned char *)h-out->data));return 0;
+}
+static int route_error(struct route_output *out,const struct route_header *request,
+    const void *data,size_t size,int error)
+{
+    size_t echo=error?size:0;
+    struct route_header *h=route_message(out,2,0,request->sequence,NULL,0);
+    if(!h)return -KERNEL_ENOBUFS;
+    unsigned char *p=route_append(out,4+sizeof(*request)+echo);if(!p)return -KERNEL_ENOBUFS;
+    __builtin_memcpy(p,&error,4);__builtin_memcpy(p+4,request,sizeof(*request));
+    if(echo)__builtin_memcpy(p+4+sizeof(*request),data,echo);
+    h->length=(uint32_t)(sizeof(*h)+4+sizeof(*request)+echo);return 0;
+}
+static int route_link(struct route_output *out,const struct route_header *request,
+    const struct kernel_socket_interface *s,int dump)
+{
+    struct { uint8_t family,pad; uint16_t type; int32_t index; uint32_t flags,change; } info=
+        {0,0,s->hardware_type,(int32_t)s->index,s->flags|(s->link_up?0x10000U:0),0};
+    struct route_header *h=route_message(out,16,dump?2:0,request->sequence,&info,sizeof(info));
+    if(!h)return -KERNEL_ENOBUFS;
+    size_t name=0;while(name<sizeof(s->name) && s->name[name])name++;
+    if(name==sizeof(s->name))return -KERNEL_EINVAL;
+    uint8_t state=(s->flags&8)?0:((s->flags&0x40)?6:2);
+    uint8_t broadcast[6];__builtin_memset(broadcast,s->hardware_type==772?0:255,6);
+    if(route_attribute(out,h,3,s->name,name+1) || route_attribute(out,h,4,&s->mtu,4) ||
+       route_attribute(out,h,1,s->mac,6) || route_attribute(out,h,2,broadcast,6) ||
+       route_attribute(out,h,16,&state,1) || route_attribute(out,h,13,(uint32_t[]){0},4) ||
+       route_attribute(out,h,6,"noqueue",8))return -KERNEL_ENOBUFS;
+    return 0;
+}
+static unsigned route_prefix(uint32_t mask)
+{
+    const uint8_t *p=(const uint8_t *)&mask;unsigned bits=0;
+    for(unsigned i=0;i<4;i++)for(unsigned b=128;b;b>>=1) {if(!(p[i]&b))return bits;bits++;}
+    return bits;
+}
+static int route_address(struct route_output *out,const struct route_header *request,
+    const struct kernel_socket_interface *s,unsigned family)
+{
+    if(family==10 && !s->ipv6_loopback)return 0;
+    if(family==2 && !s->address)return 0;
+    uint8_t address[16]={0};size_t size=family==10?16:4;
+    if(family==10)address[15]=1;else __builtin_memcpy(address,&s->address,4);
+    struct { uint8_t family,prefix,flags,scope; uint32_t index; } info=
+        {family,family==10?128:route_prefix(s->netmask),128,s->hardware_type==772?254:0,s->index};
+    struct route_header *h=route_message(out,20,2,request->sequence,&info,sizeof(info));
+    if(!h)return -KERNEL_ENOBUFS;
+    if(route_attribute(out,h,1,address,size) || route_attribute(out,h,2,address,size))return -KERNEL_ENOBUFS;
+    if(family==2) {
+        size_t n=0;while(n<15 && s->name[n])n++;
+        if(route_attribute(out,h,3,s->name,n+1))return -KERNEL_ENOBUFS;
+        if(s->hardware_type!=772) { uint32_t broadcast=s->address|~s->netmask;
+            if(route_attribute(out,h,4,&broadcast,4))return -KERNEL_ENOBUFS; }
+    }
+    return 0;
+}
+static int route_entry(struct route_output *out,const struct route_header *request,
+    const struct kernel_socket_interface *s,unsigned kind)
+{
+    /* Existing IPv4 direct-subnet selection and one configured default gateway. */
+    if(!s->address)return 0;
+    if(kind==1 && !s->default_route)return 0;
+    unsigned local=kind==2 || (kind==0 && s->hardware_type==772);
+    if(kind==2 && s->hardware_type==772)return 0;
+    uint32_t table=local?255:254;
+    struct { uint8_t family,dst,src,tos,table,protocol,scope,type; uint32_t flags; } info=
+        {2,kind==1?0:kind==2?32:route_prefix(s->netmask),0,0,table,2,local?254:kind==1?0:253,local?2:1,0};
+    uint32_t destination=kind==2?s->address:s->address&s->netmask;
+    struct route_header *h=route_message(out,24,2,request->sequence,&info,sizeof(info));
+    if(!h)return -KERNEL_ENOBUFS;
+    if(route_attribute(out,h,15,&table,4) || route_attribute(out,h,4,&s->index,4))return -KERNEL_ENOBUFS;
+    if(kind==1) {if(route_attribute(out,h,5,&s->gateway,4))return -KERNEL_ENOBUFS;}
+    else if(route_attribute(out,h,1,&destination,4) || route_attribute(out,h,7,&s->address,4))return -KERNEL_ENOBUFS;
+    return 0;
+}
+static int route_ipv6(struct route_output *out,const struct route_header *request,
+    const struct kernel_socket_interface *s)
+{
+    if(!s->ipv6_loopback)return 0;
+    uint8_t info[12]={10,128,0,0,255,2,0,2};
+    uint8_t destination[16]={0};destination[15]=1;
+    struct route_header *h=route_message(out,24,2,request->sequence,info,sizeof(info));
+    if(!h)return -KERNEL_ENOBUFS;
+    return route_attribute(out,h,15,(uint32_t[]){255},4) ||
+        route_attribute(out,h,1,destination,16) || route_attribute(out,h,4,&s->index,4)?-KERNEL_ENOBUFS:0;
+}
+static int route_request(struct route_output *out,const struct route_header *h,
+    const unsigned char *payload,size_t size,const struct kernel_socket_interface *interfaces,size_t count)
+{
+    if(!(h->flags&1))return 0;
+    if(h->type<16)return (h->flags&4)?route_error(out,h,payload,size,0):0;
+    int dump=(h->flags&0x300)==0x300,error=0;
+    size_t minimum=h->type==18?16:h->type==22?8:h->type==26?12:0;
+    /* Legacy dump callers (including iproute2) send only rtgenmsg. */
+    if(h->type!=18 && h->type!=22 && h->type!=26)error=-KERNEL_EOPNOTSUPP;
+    else if(size<(dump?1:minimum))error=-KERNEL_EINVAL;
+    else if(payload[0]!=0 && payload[0]!=2 && payload[0]!=10 && !(h->type==18 && payload[0]==17))error=-KERNEL_EAFNOSUPPORT;
+    else if(!dump && h->type!=18)error=-KERNEL_EOPNOTSUPP;
+    if(error)return route_error(out,h,payload,size,error);
+    int32_t index=0;char name[16]={0};
+    if(size>=minimum && minimum) {
+        if(h->type==18)__builtin_memcpy(&index,payload+4,4);
+        size_t offset=minimum;
+        while(offset<size) {
+            if(size-offset<4)return route_error(out,h,payload,size,-KERNEL_EINVAL);
+            uint16_t length,type;__builtin_memcpy(&length,payload+offset,2);__builtin_memcpy(&type,payload+offset+2,2);
+            if(length<4 || length>size-offset)return route_error(out,h,payload,size,-KERNEL_EINVAL);
+            if(h->type==18 && type==3) {
+                if(length<=4 || length>20 || payload[offset+length-1])return route_error(out,h,payload,size,-KERNEL_EINVAL);
+                __builtin_memcpy(name,payload+offset+4,length-4);
+            }
+            offset+=route_align(length);
+        }
+    }
+    if(!dump && index<=0 && !name[0])return route_error(out,h,payload,size,-KERNEL_EINVAL);
+    int found=0;
+    for(size_t i=0;i<count;i++) {
+        const struct kernel_socket_interface *s=&interfaces[i];
+        if(!dump && ((index>0 && s->index!=(uint32_t)index) || (name[0] && __builtin_strcmp(name,s->name))))continue;
+        found=1;
+        if(h->type==18)error=route_link(out,h,s,dump);
+        else if(h->type==22) {
+            if(payload[0]!=10)error=route_address(out,h,s,2);
+            if(!error && payload[0]!=2)error=route_address(out,h,s,10);
+        } else {
+            if(payload[0]!=10) {
+                error=route_entry(out,h,s,0);if(!error)error=route_entry(out,h,s,1);
+                if(!error)error=route_entry(out,h,s,2);
+            }
+            if(!error && payload[0]!=2)error=route_ipv6(out,h,s);
+        }
+        if(error)return error;
+    }
+    if(!dump && !found)return route_error(out,h,payload,size,-KERNEL_ENODEV);
+    if(dump)return route_message(out,3,2,h->sequence,(int32_t[]){0},4)?0:-KERNEL_ENOBUFS;
+    return (h->flags&4)?route_error(out,h,payload,size,0):0;
+}
+static int route_encode(struct route_output *out,const void *data,size_t size,
+    const struct kernel_socket_interface *interfaces,size_t count)
+{
+    size_t offset=0;
+    while(size-offset>=sizeof(struct route_header)) {
+        struct route_header h;__builtin_memcpy(&h,(const unsigned char *)data+offset,sizeof(h));
+        if(h.length<sizeof(h) || h.length>size-offset)break; /* Linux drops malformed tail. */
+        int error=route_request(out,&h,(const unsigned char *)data+offset+sizeof(h),h.length-sizeof(h),interfaces,count);
+        if(error)return error;
+        size_t step=route_align(h.length);if(step>size-offset)break;offset+=step;
+    }
+    return 0;
+}
+#endif

@@ -268,7 +268,7 @@ struct kernel_socket_interface {
     uint16_t flags, hardware_type;
     uint8_t mac[6];
     uint32_t gateway;
-    int default_route;
+    int default_route, ipv6_loopback, link_up;
 };
 int kernel_socket_interface_get(const char name[16], struct kernel_socket_interface *snapshot);
 int kernel_socket_interface_index(uint32_t index, struct kernel_socket_interface *snapshot);
