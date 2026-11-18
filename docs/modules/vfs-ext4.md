@@ -2,6 +2,28 @@
 
 本文描述当前根文件系统的稳定接口和 lwext4 私有适配。第三方版本与许可证见[第三方代码](../third-party.md)。
 
+## 普通文件直接 I/O
+
+启用日志的 ext4 支持普通文件和 `O_TMPFILE` 使用 `O_DIRECT`，也可以通过
+`F_SETFL` 切换。按设备逻辑扇区检查文件偏移、用户缓冲区地址和各向量长度。
+对齐的扩展写沿用 extent 分配事务，读取文件空洞返回零。
+
+VFS 先暂存用户输入并归还用户页引用。文件写操作锁保护相交的共享映射撤销、
+脏页写回、设备操作和缓存失效，期间暂停新映射发布。恢复映射发布后再复制用户
+输出，输入和输出均可以映射同一文件。
+
+已接纳的日志数据按物理块范围从旧到新提交。设备阶段持有不可变的数据版本，
+完成后记录结果，提交事务时跳过已经发送的数据。同一设备上这些范围的数据阶段
+通过一把可睡眠的锁顺序执行。日志提交仍按原有规则请求两次设备持久化，
+`O_DIRECT` 本身只等待数据操作完成。设备错误保留尚待恢复的版本并停止提交。
+
+`JOURNAL_TEST_CASE=direct-ordered sh tests/host/lwext4-journal.sh` 检查同一物理块
+的多代数据、提交时的并发替换及 I/O 故障。`sh tests/host/lwext4-metadata.sh direct-reuse`
+检查正在写回的旧目录块在释放事务完成前禁止复用、复用后的读写及断电恢复。
+`FILE_IO_HOST_TCP=0 FILE_IO_DIRECT_ONLY=1 sh tests/host/file-io-concurrency.sh` 检查
+映射和数据写回交接。`tests/userland/direct-file.py` 用实际 RV64 或 LA64 内核运行
+普通文件直读写、扩展、故障、映射和文件传输。
+
 ## 通用边界
 
 `include/kernel/block.h` 定义同步块设备（支持读与可选写），`include/kernel/vfs.h` 定义 mount/file 对象以及根挂载、open/create、pread/pwrite、ftruncate、mkdir、unlink、rmdir、close、unmount、`kernel_vfs_fstat()` 与 `kernel_vfs_mount_is_readonly()` 查询。VFS 对外返回负 Linux errno；lwext4 的结构、全局设备名和正值 errno 不泄漏到调用者。当前有独立的 ext4、FAT32/VFAT、tmpfs、proc 和 devpts 实例；lwext4 共用 heap binding 按实例引用计数维护，每实例携带自己的锁上下文；进程 fd/open-file-description 位于独立的[文件资源层](kernel-files.md)，每个挂载命名空间持有自己的挂载视图树；命名空间修改使用可睡眠 mutex，inode、OFD 与后端各自同步。

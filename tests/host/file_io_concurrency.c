@@ -1289,6 +1289,73 @@ static void *publish_copy_flags(void *argument)
     return NULL;
 }
 
+static unsigned ext4_direct_paused,ext4_direct_resume;
+static void ext4_direct_pause(void *owner,struct kernel_vfs_node *node,uint64_t first,uint64_t last)
+{
+    (void)owner;(void)node;(void)first;(void)last;
+    __atomic_store_n(&ext4_direct_paused,1,__ATOMIC_RELEASE);
+    while (!__atomic_load_n(&ext4_direct_resume,__ATOMIC_ACQUIRE)) sched_yield();
+}
+static void ext4_direct_truncated(void *owner,struct kernel_vfs_node *node,uint64_t size)
+{(void)owner;(void)node;(void)size;}
+static void *ext4_direct_reader(void *file)
+{
+    mm_test_attach(1);unsigned char data[512];size_t done;
+    assert(!kernel_vfs_direct_pread(file,0,data,sizeof(data),&done) && done==sizeof(data));
+    assert(data[0]=='B');for(unsigned i=1;i<sizeof(data);i++) assert(data[i]==0x61);
+    return NULL;
+}
+static void *ext4_direct_truncater(void *file)
+{mm_test_attach(2);assert(!kernel_vfs_ftruncate(file,0));return NULL;}
+static void ext4_direct_truncate_race(struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_node *node=kernel_vfs_file_node(file);
+    assert(!kernel_file_mapping_prepare(node));
+    struct kernel_file_mapping mapping={.node=node,.owner=file,
+        .truncate=ext4_direct_truncated,.invalidate_range=ext4_direct_pause};
+    assert(!kernel_file_mapping_register(&mapping));
+    ext4_direct_paused=ext4_direct_resume=0;pthread_t reader,truncater;
+    assert(!pthread_create(&reader,NULL,ext4_direct_reader,file));
+    while (!__atomic_load_n(&ext4_direct_paused,__ATOMIC_ACQUIRE)) sched_yield();
+    uint64_t epoch;assert(kernel_file_mapping_epoch(node,&epoch)==-KERNEL_EBUSY);
+    assert(!pthread_create(&truncater,NULL,ext4_direct_truncater,file));
+    int waiting=0;
+    while (!waiting) {
+        KERNEL_RAW_SCOPE(guard,&node->write_operation.lock.metadata);
+        waiting=node->write_operation.lock.pending_head!=NULL;
+    }
+    __atomic_store_n(&ext4_direct_resume,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(reader,NULL) && !pthread_join(truncater,NULL));
+    assert(!kernel_file_mapping_epoch(node,&epoch));kernel_file_mapping_unregister(&mapping);
+    assert(!node->size);
+}
+
+static void ext4_direct_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
+{
+    struct kernel_open_file_description *file=NULL;
+    int error;
+    assert(!kernel_open_file_create_mode(heap,mount,"/direct-file",0600,&file,&error) && !error);
+    file->open_flags=2|KERNEL_FILES_O_DIRECT;
+    assert(kernel_vfs_direct_alignment(&file->file)==512);
+    assert(!kernel_vfs_file_acquire_write(&file->file));
+    unsigned char data[512] __attribute__((aligned(512)));
+    memset(data,0x61,sizeof(data));size_t done=0;
+    {KERNEL_LOCK_SCOPE(operation);kernel_vfs_file_write_lock(&file->file,&operation);
+    assert(!kernel_vfs_pwrite_direct(&file->file,0,data,sizeof(data),&done,&operation) && done==sizeof(data));}
+    assert(!kernel_vfs_pwrite(&file->file,0,"B",1,&done) && done==1);
+    assert(!kernel_vfs_direct_pread(&file->file,0,data,sizeof(data),&done) && done==sizeof(data) && data[0]=='B');
+    assert(!kernel_page_cache_resident(kernel_open_file_page_cache(file),&file->file,0));
+    memset(data,0x63,sizeof(data));
+    {KERNEL_LOCK_SCOPE(operation);kernel_vfs_file_write_lock(&file->file,&operation);
+    assert(!kernel_vfs_pwrite_direct(&file->file,2*BOAROS_PAGE_SIZE,data,sizeof(data),&done,&operation) && done==sizeof(data));}
+    memset(data,0x7f,sizeof(data));
+    assert(!kernel_vfs_direct_pread(&file->file,BOAROS_PAGE_SIZE,data,sizeof(data),&done) && done==sizeof(data));
+    for (unsigned i=0;i<sizeof(data);i++) assert(!data[i]);
+    ext4_direct_truncate_race(&file->file);
+    assert(!kernel_open_file_release(&file) && !kernel_vfs_unlink(mount,"/direct-file"));
+    puts("PASS ext4 direct: growth, dirty cached owner handoff, sparse media read, no VFS cache residency and queued truncate after closed epoch");
+}
+
 static void cached_copy_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
 {
     struct kernel_files local={0};
@@ -1758,9 +1825,10 @@ int main(int argc,char **argv)
     int block_only=getenv("FILE_IO_BLOCK_ONLY")!=NULL;
     int advice_only=getenv("FILE_IO_ADVICE_ONLY")!=NULL;
     int transfers_only=getenv("FILE_IO_TRANSFERS_ONLY")!=NULL;
+    int direct_only=getenv("FILE_IO_DIRECT_ONLY")!=NULL;
     int paths_only=getenv("FILE_IO_PATHS_ONLY")!=NULL;
     int directories_only=getenv("FILE_IO_DIRECTORIES_ONLY")!=NULL;
-    int focused=block_only || directories_only || advice_only || transfers_only || paths_only || getenv("FILE_IO_VECTORS_ONLY")!=NULL;
+    int focused=direct_only || block_only || directories_only || advice_only || transfers_only || paths_only || getenv("FILE_IO_VECTORS_ONLY")!=NULL;
     if (!focused) {
     borrowed_page_case(&pages);
     namespace_retiring_mount_case(&heap);
@@ -1831,6 +1899,7 @@ int main(int argc,char **argv)
     if (block_only) { /* Raw device contracts ran against the private registered device. */ }
     else if (directories_only) directory_batch_cases(&heap,&mount,1);
     else if (paths_only) pathname_storage_case(&heap,&mount);
+    else if (direct_only) ext4_direct_case(&heap,&mount);
     else if (transfers_only) transfer_cases(&heap,&mount);
     else if (advice_only) file_advice_case(&heap,&mount,&cache);
     else if (focused) synchronous_write_ranges(&heap,&mount);

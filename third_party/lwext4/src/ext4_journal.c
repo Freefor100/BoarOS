@@ -793,7 +793,7 @@ static void jbd_ordered_phase(struct jbd_trans *trans, struct jbd_io_phase *phas
 {
     struct jbd_data *data;
     TAILQ_FOREACH(data, &trans->data_queue, node)
-        jbd_phase_add(trans->journal, phase, &data->io, data->block.data,
+        if (!__atomic_load_n(&data->completed,__ATOMIC_ACQUIRE)) jbd_phase_add(trans->journal, phase, &data->io, data->block.data,
             data->block.lb_id, 0, trans->journal->block_size);
 }
 /**@brief  helper functions to calculate
@@ -1555,6 +1555,7 @@ int jbd_journal_start(struct jbd_fs *jbd_fs,
 	int r;
 	struct ext4_fs *fs = jbd_fs->inode_ref.fs;
 	memset(journal, 0, sizeof(*journal));
+    kernel_mutex_init(&journal->ordered_io,39,(uintptr_t)journal);
 	if (fs->read_only)
 		return EROFS;
 	r = jbd_check_features(jbd_fs);
@@ -1900,7 +1901,7 @@ bool jbd_journal_borrow_data(struct ext4_fs *fs, ext4_fsblk_t lba,
     }
     if (!data) data = jbd_trans_find_data(journal->committing, lba);
     if (!data) data = jbd_trans_find_data(journal->failed_trans, lba);
-    if (!data) return false;
+    if (!data || (__atomic_load_n(&data->completed,__ATOMIC_ACQUIRE) && !jbd_journal_error(journal))) return false;
     borrow->data = data->block.data;
     if (data->image) {
         borrow->payload = &data->image->payload;
@@ -1928,9 +1929,57 @@ static void jbd_data_release_source(struct jbd_data *data)
 
 static void jbd_data_free(struct jbd_data *data)
 {
-    jbd_data_release_source(data);
-    jbd_image_free(data->image);
-    jbd_free(data);
+    jbd_data_put(data);
+}
+
+/* Ordered versions are submitted oldest first. A snapshot reference keeps
+ * replaced running records alive without holding STATE across device I/O. */
+static unsigned jbd_range_data(struct jbd_trans *trans,ext4_fsblk_t first,
+    uint32_t count,struct jbd_data **data,unsigned used,unsigned capacity)
+{
+    if (!trans) return used;
+    struct jbd_data key={.block.lb_id=first};
+    struct jbd_data *entry=RB_NFIND(jbd_data_tree,&trans->data_root,&key);
+    while (entry && entry->block.lb_id-first<count && used<capacity) {
+        if (!__atomic_load_n(&entry->completed,__ATOMIC_ACQUIRE)) {
+            unsigned old=__atomic_fetch_add(&entry->references,1,__ATOMIC_RELAXED);
+            if (!old || old==UINT32_MAX) __builtin_trap();
+            data[used++]=entry;
+        }
+        entry=RB_NEXT(jbd_data_tree,&trans->data_root,entry);
+    }
+    return used;
+}
+int jbd_journal_complete_data(struct jbd_journal *journal,ext4_fsblk_t first,uint32_t count)
+{
+    if (!count) return EOK;
+    if (first>UINT64_MAX-count) return EINVAL;
+    KERNEL_LOCK_SCOPE(io); kernel_mutex_lock(&journal->ordered_io,&io);
+    for (;;) {
+        struct jbd_data *data[16];
+        unsigned used=0;
+        {
+            JBD_STATE_SCOPE(journal);
+            if (jbd_journal_error(journal)) return jbd_journal_error(journal);
+            used=jbd_range_data(journal->committing,first,count,data,used,16);
+            struct jbd_trans *trans;
+            TAILQ_FOREACH(trans,&journal->sealed_queue,trans_node) {
+                if (used) break;
+                used=jbd_range_data(trans,first,count,data,0,16);
+            }
+            if (!used) used=jbd_range_data(journal->running,first,count,data,0,16);
+        }
+        if (!used) return EOK;
+        struct jbd_io_phase phase={0};
+        for (unsigned i=0;i<used;i++) jbd_phase_add(journal,&phase,&data[i]->io,
+            data[i]->block.data,data[i]->block.lb_id,0,journal->block_size);
+        int error=ext4_blocks_set_phase(journal->jbd_fs->bdev,phase.first);
+        if (error) __atomic_store_n(&journal->error,error,__ATOMIC_RELEASE);
+        else for (unsigned i=0;i<used;i++)
+            __atomic_store_n(&data[i]->completed,true,__ATOMIC_RELEASE);
+        for (unsigned i=0;i<used;i++) jbd_data_put(data[i]);
+        if (error) return error;
+    }
 }
 
 enum { JBD_METADATA_NONE, JBD_METADATA_CHECK, JBD_METADATA_FLUSH };
@@ -1941,6 +1990,9 @@ int jbd_trans_write_data(struct jbd_trans *trans, ext4_fsblk_t lba,
 {
 	struct jbd_journal *journal = trans->journal;
 	struct ext4_blockdev *bdev = journal->jbd_fs->bdev;
+    /* Accepted versions can have an independent device borrower. Updates
+     * must prepare a private record and replace it at acceptance. */
+    if (trans->sequence || trans->frozen) __builtin_trap();
 	if (jbd_journal_error(journal) || trans->error)
 		return jbd_journal_error(journal) ? jbd_journal_error(journal) : trans->error;
 	if (source && (!!source->retain != !!source->release || !!source->retain != !!source->bytes))
@@ -1957,6 +2009,7 @@ int jbd_trans_write_data(struct jbd_trans *trans, ext4_fsblk_t lba,
 		data = jbd_alloc(journal, sizeof(*data));
 		if (!data) return ENOMEM;
 		data->block.lb_id = lba;
+        data->references = 1;
 		if (journal->grouped && stable) {
 			/* No home read or write is needed for this private payload.
 			 * Check old metadata ownership once per operation at prepare. */
@@ -2008,6 +2061,7 @@ int jbd_trans_write_data(struct jbd_trans *trans, ext4_fsblk_t lba,
 		data->image = image;
 		data->block.data = image->data;
 	}
+	data->completed = false;
 	if (fresh) {
 		RB_INSERT(jbd_data_tree, &trans->data_root, data);
 		TAILQ_INSERT_TAIL(&trans->data_queue, data, node);
@@ -2040,9 +2094,19 @@ static void jbd_trans_release_data(struct jbd_trans *trans)
 static int jbd_trans_write_ordered(struct jbd_trans *trans)
 {
     COST_PHASE_SCOPE(data_only, 1);
+    struct jbd_journal *journal=trans->journal;
+    KERNEL_LOCK_SCOPE(io); kernel_mutex_lock(&journal->ordered_io,&io);
+    if (jbd_journal_error(journal)) return jbd_journal_error(journal);
     struct jbd_io_phase phase = {0};
     jbd_ordered_phase(trans, &phase);
-    return ext4_blocks_set_phase(trans->journal->jbd_fs->bdev, phase.first);
+    int error=phase.first?ext4_blocks_set_phase(journal->jbd_fs->bdev,phase.first):EOK;
+    if (error) __atomic_store_n(&journal->error,error,__ATOMIC_RELEASE);
+    else {
+        struct jbd_data *data;
+        TAILQ_FOREACH(data,&trans->data_queue,node)
+            __atomic_store_n(&data->completed,true,__ATOMIC_RELEASE);
+    }
+    return error;
 }
 
 /**@brief  Add block to a transaction and mark it dirty.
@@ -2609,10 +2673,20 @@ static uint32_t jbd_wire_next(struct jbd_trans *trans, unsigned *used)
     return (uint32_t)block;
 }
 
-static int jbd_submit_phase(struct jbd_trans *trans, struct jbd_io_phase *phase)
+static int jbd_submit_phase(struct jbd_trans *trans, struct jbd_io_phase *phase,
+    struct kernel_lock_guard *ordered)
 {
     int result = ext4_blocks_set_phase(trans->journal->jbd_fs->bdev, phase->first);
     *phase = (struct jbd_io_phase){0};
+    if (ordered->lock) {
+        if (result) __atomic_store_n(&trans->journal->error,result,__ATOMIC_RELEASE);
+        else {
+            struct jbd_data *data;
+            TAILQ_FOREACH(data,&trans->data_queue,node)
+                __atomic_store_n(&data->completed,true,__ATOMIC_RELEASE);
+        }
+        kernel_lock_release(ordered);
+    }
     return result;
 }
 
@@ -2625,8 +2699,12 @@ static int jbd_encode_submit(struct jbd_trans *trans)
     uint8_t *wire = journal->commit_image->data;
     unsigned used = 0;
     struct ext4_block_write control_io;
+    KERNEL_LOCK_SCOPE(ordered);
+    kernel_mutex_lock(&journal->ordered_io,&ordered);
+    if (jbd_journal_error(journal)) return jbd_journal_error(journal);
     struct jbd_io_phase phase = {0};
-    jbd_ordered_phase(trans, &phase);
+    jbd_ordered_phase(trans,&phase);
+    if (!phase.first) kernel_lock_release(&ordered);
     struct jbd_buf *first = TAILQ_FIRST(&trans->buf_queue);
     uint32_t checksum = EXT4_CRC32_INIT;
     unsigned tail = jbd_has_csum(&fs->sb) ? sizeof(struct jbd_block_tail) : 0;
@@ -2671,7 +2749,7 @@ static int jbd_encode_submit(struct jbd_trans *trans)
             if (jb->escaped) {
                 /* End the descriptor's actual DMA borrow before overwriting
                  * its image. The accepted payload remains immutable. */
-                result = jbd_submit_phase(trans, &phase);
+                result = jbd_submit_phase(trans, &phase, &ordered);
                 if (result) return result;
                 memcpy(wire, payload, journal->block_size);
                 ((struct jbd_bhdr *)wire)->magic = 0;
@@ -2680,17 +2758,17 @@ static int jbd_encode_submit(struct jbd_trans *trans)
             jbd_phase_add(journal, &phase, &jb->home_io, payload,
                 journal->log_map[jb->jbd_lba], 0, journal->block_size);
             if (jb->escaped) {
-                result = jbd_submit_phase(trans, &phase);
+                result = jbd_submit_phase(trans, &phase, &ordered);
                 if (result) return result;
             }
         }
-        result = jbd_submit_phase(trans, &phase);
+        result = jbd_submit_phase(trans, &phase, &ordered);
         if (result) return result;
         first = next;
     }
     /* Ordered-only groups also need to finish borrowing the work sources. */
     if (phase.first) {
-        result = jbd_submit_phase(trans, &phase);
+        result = jbd_submit_phase(trans, &phase, &ordered);
         if (result) return result;
     }
     struct jbd_revoke_rec *revoke = RB_MIN(jbd_revoke_tree, &trans->revoke_root);
@@ -2713,7 +2791,7 @@ static int jbd_encode_submit(struct jbd_trans *trans)
         jbd_meta_csum_set(fs, (struct jbd_bhdr *)wire);
         jbd_phase_add(journal, &phase, &control_io, wire,
             journal->log_map[address], 0, journal->block_size);
-        result = jbd_submit_phase(trans, &phase);
+        result = jbd_submit_phase(trans, &phase, &ordered);
         if (result) return result;
     }
     {
@@ -3370,9 +3448,12 @@ int jbd_journal_retire_stage(struct jbd_journal *journal,
         JBD_STATE_SCOPE(journal);
         trans=stage==JBD_JOURNAL_COMMIT?journal->committing:journal->checkpointing;
         if (!trans) return error;
-        if (error && !jbd_journal_error(journal)) {
-            journal->failed_trans=trans;
-            __atomic_store_n(&journal->error,error,__ATOMIC_RELEASE);
+        if (error) {
+            /* The data phase can publish its sticky error before returning
+             * its commit owner here. Preserve that owner's recovery lifetime. */
+            if (!journal->failed_trans) journal->failed_trans=trans;
+            if (!jbd_journal_error(journal))
+                __atomic_store_n(&journal->error,error,__ATOMIC_RELEASE);
         }
         /* An uncertain device completion retains its data and recovery
          * owners. Neither stage advances on the other stage's error. */

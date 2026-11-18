@@ -17,6 +17,22 @@ truncate -s 32M "$work/base.img"
 mkfs.ext4 -q -F -b 1024 "$work/base.img"
 printf 'Old data' > "$work/data"
 debugfs -w -R "write $work/data /probe" "$work/base.img" >/dev/null 2>&1
+if [ "${JOURNAL_TEST_CASE:-}" = direct-ordered ]; then
+    for block in 1024 4096; do
+        truncate -s 32M "$work/direct-base.img"
+        mkfs.ext4 -q -F -b "$block" "$work/direct-base.img"
+        debugfs -w -R "write $work/data /probe" "$work/direct-base.img" >/dev/null 2>&1
+        for fault in 0 1 2 3; do
+            cp "$work/direct-base.img" "$work/direct.img"
+            timeout 30 "$work/probe" "$work/direct.img" direct-ordered "$fault"
+            if [ "$fault" -ne 0 ]; then
+                timeout 30 "$work/probe" "$work/direct.img" recover-crash 79
+            fi
+            e2fsck -fn "$work/direct.img" > "$work/direct-fsck.log" 2>&1 || { cat "$work/direct-fsck.log"; exit 1; }
+        done
+    done
+    exit 0
+fi
 for block in 1024 4096; do
     truncate -s "$((block * 32768))" "$work/uuid-base.img"
     mkfs.ext4 -q -F -b "$block" "$work/uuid-base.img"

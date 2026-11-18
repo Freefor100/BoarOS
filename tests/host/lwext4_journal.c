@@ -169,6 +169,118 @@ static void resource_accept_data(struct jbd_journal *journal, ext4_fsblk_t home,
     CHECK(jbd_trans_prepare_operation(operation) == EOK);
     CHECK(jbd_journal_accept(journal, operation, 0) == EOK);
 }
+static uint64_t direct_home;
+static unsigned direct_home_writes;
+#ifdef TEST_JBD_CREDIT_PARALLEL
+static unsigned direct_paused,direct_resume;
+static struct {struct jbd_journal *journal;struct resource_source *old,*replacement;ext4_fsblk_t home;} direct_replace;
+static void *replace_direct_owner(void *argument)
+{
+    (void)argument;
+    while (!__atomic_load_n(&direct_paused,__ATOMIC_ACQUIRE)) sched_yield();
+    resource_accept_data(direct_replace.journal,direct_replace.home,direct_replace.replacement,false);
+    CHECK(direct_replace.old->references==1); /* The pending DMA still borrows it. */
+    __atomic_store_n(&direct_resume,1,__ATOMIC_RELEASE);
+    return NULL;
+}
+#endif
+static int reverse_data_phase(struct ext4_blockdev *dev,const struct ext4_block_write *first)
+{
+    const struct ext4_block_write *entries[128];unsigned count=0;
+    for (const struct ext4_block_write *entry=first;entry;entry=entry->next) {
+        CHECK(count<128);entries[count++]=entry;
+    }
+    while (count) {
+        const struct ext4_block_write *entry=entries[--count];
+        if (entry->offset==direct_home) {
+#ifdef TEST_JBD_CREDIT_PARALLEL
+            if (direct_replace.journal && direct_home_writes==2) {
+                __atomic_store_n(&direct_paused,1,__ATOMIC_RELEASE);
+                while (!__atomic_load_n(&direct_resume,__ATOMIC_ACQUIRE)) sched_yield();
+            }
+#endif
+            direct_home_writes++;
+        }
+        CHECK(!(entry->offset%512) && !(entry->size%512));
+        int error=write_device(dev,entry->data,entry->offset/512,entry->size/512);
+        if (error) return error;
+    }
+    return EOK;
+}
+static void direct_ordered_data(struct ext4_blockdev *dev,struct jbd_journal *journal,
+    ext4_file *file,ext4_fsblk_t home,unsigned fault)
+{
+    dev->fs->jbd_journal=journal;
+#ifdef TEST_JBD_CREDIT_PARALLEL
+    const struct ext4_lock locks={.state_lock=credit_state_lock,
+        .state_read_lock=credit_state_lock,.state_unlock=credit_state_unlock};
+    dev->fs->os_locks=&locks;
+#endif
+    CHECK(jbd_journal_group_init(journal,4*1024*1024)==EOK);
+    struct resource_source source[4]={0};
+    for (unsigned i=0;i<3;i++) {
+        source[i].data=calloc(1,64*1024);CHECK(source[i].data);
+        memset(source[i].data,'A'+i,journal->block_size);
+        resource_accept_data(journal,home,&source[i],false);
+        if (i<2) CHECK(jbd_journal_freeze(journal)==EOK);
+        if (!i) CHECK(jbd_journal_select_stage(journal,JBD_JOURNAL_COMMIT)==JBD_JOURNAL_COMMIT);
+    }
+#ifdef TEST_JBD_CREDIT_PARALLEL
+    pthread_t replacer;
+    if (!fault) {
+        source[3].data=calloc(1,64*1024);CHECK(source[3].data);
+        memset(source[3].data,'D',journal->block_size);
+        direct_replace=(__typeof__(direct_replace)){journal,&source[2],&source[3],home};
+        direct_paused=direct_resume=0;
+        CHECK(!pthread_create(&replacer,NULL,replace_direct_owner,NULL));
+    }
+#endif
+    direct_home=home*dev->lg_bsize;direct_home_writes=0;
+    dev->bdif->bwrite_phase=reverse_data_phase;
+    uint64_t flushes=disk.flushes;
+    if (fault) disk.fail_write=disk.writes+fault;
+    int result=ext4_fdata_complete(file,0,8);
+    if (fault) {
+        CHECK(result==EIO && journal->error==EIO);
+        for (unsigned i=0;i<3;i++) CHECK(source[i].references==1);
+        unsigned writes=direct_home_writes;
+        CHECK(jbd_journal_complete_data(journal,home,1)==EIO);
+        CHECK(jbd_journal_submit(journal)==EIO);
+        CHECK(direct_home_writes==writes && disk.flushes==flushes);
+        CHECK(fault_block_crash(&disk)==0);
+        puts("PASS direct ordered failure: sticky error prevents resubmission or durability success");
+        return;
+    }
+    unsigned expected_writes=3;unsigned char expected='C';
+#ifdef TEST_JBD_CREDIT_PARALLEL
+    CHECK(!pthread_join(replacer,NULL));direct_replace.journal=NULL;
+    CHECK(direct_paused && direct_resume && !source[2].references);
+    expected_writes=4;expected='D';
+#endif
+    CHECK(result==EOK && direct_home_writes==expected_writes && disk.flushes==flushes);
+    CHECK(!journal->durable_sequence && !journal->checkpoint_sequence);
+    struct jbd_data_borrow borrow={0};
+    CHECK(!jbd_journal_borrow_data(dev->fs,home,&borrow));
+    unsigned char data[8];size_t done=0;
+    CHECK(ext4_fpread(file,0,data,sizeof(data),&done)==EOK && done==sizeof(data));
+    for (unsigned i=0;i<sizeof(data);i++) CHECK(data[i]==expected);
+    CHECK(jbd_journal_freeze(journal)==EOK);
+    do {
+        CHECK(jbd_journal_submit(journal)==EOK);
+        CHECK(jbd_journal_retire_stage(journal,JBD_JOURNAL_COMMIT,EOK)==EOK);
+    } while (jbd_journal_select_stage(journal,JBD_JOURNAL_COMMIT)==JBD_JOURNAL_COMMIT);
+    CHECK(direct_home_writes==expected_writes);
+    journal->checkpoint_target=journal->durable_sequence;
+    while (jbd_journal_select_stage(journal,JBD_JOURNAL_CHECKPOINT)==JBD_JOURNAL_CHECKPOINT) {
+        CHECK(jbd_journal_checkpoint(journal)==EOK);
+        CHECK(jbd_journal_retire_stage(journal,JBD_JOURNAL_CHECKPOINT,EOK)==EOK);
+    }
+    for (unsigned i=0;i<4;i++) {CHECK(!source[i].references);free(source[i].data);}
+    close_normal_journal(dev,journal);
+    CHECK(fault_block_crash(&disk)==0);
+    puts("PASS direct ordered extent consumer: three versions, reversed phase completion, media reads, no added FLUSH or commit rewrite, owners returned");
+}
+
 static void resource_reclaim(struct ext4_blockdev *dev, struct jbd_journal *journal,
     ext4_fsblk_t home)
 {
@@ -1355,6 +1467,10 @@ int main(int argc, char **argv)
     }
     CHECK(jbd_journal_start(&jfs, &journal) == EOK);
     CHECK(ext4_block_cache_write_back(&dev, 1) == EOK);
+    if (!strcmp(argv[2], "direct-ordered")) {
+        direct_ordered_data(&dev,&journal,&file,home,argc>3?(unsigned)atoi(argv[3]):0);
+        return 0;
+    }
     if (!strcmp(argv[2], "resource-admission")) {
         resource_admission(&dev, &journal, &file, home, argc > 3 ? (unsigned)atoi(argv[3]) : 0);
         return 0;

@@ -3520,15 +3520,17 @@ static int direct_transfer(struct kernel_vfs_file *file,uint64_t offset,
     error=kernel_page_cache_writeback_range_borrowing(cache,node,first,last,operation);
     kernel_vfs_node_lock(node,&io,1);
     if (!error) {
-        if (writing>0) {
+        if (node->instance->ops->direct_io)
+            error=node->instance->ops->direct_io(node,offset,buffer,size,writing,done);
+        else if (writing>0) {
             struct file_write_span span={.offset=offset,.buffer=buffer,.size=size};
             error=node->instance->ops->writeback(node,&span,1);
             *done=span.written;
-            if (*done && offset+*done>node->size) {
-                __atomic_store_n(&node->size,offset+*done,__ATOMIC_RELEASE);
-                file->size=node->size;
-            }
         } else if (!writing) error=node->instance->ops->pread(node,offset,buffer,size,done);
+        if (writing>0 && *done && offset+*done>node->size) {
+            __atomic_store_n(&node->size,offset+*done,__ATOMIC_RELEASE);
+            file->size=node->size;
+        }
         /* Even an error may have changed media. No clean cached preimage may
          * survive and later hide a device-completed prefix. */
         kernel_page_cache_invalidate_range(cache,node,first,last);
@@ -3540,7 +3542,7 @@ static int direct_transfer(struct kernel_vfs_file *file,uint64_t offset,
 int kernel_vfs_direct_pread(struct kernel_vfs_file *file,uint64_t offset,
     void *buffer,size_t size,size_t *done)
 {
-    KERNEL_SERVICE_SCOPE(service);
+    KERNEL_SERVICE_SCOPE_IF(service,kernel_vfs_namespace_requires_cpu0(file->mount));
     *done=0;
     size_t align=kernel_vfs_direct_alignment(file);
     if (!align || offset>INT64_MAX || size>INT64_MAX-offset) return -KERNEL_EINVAL;

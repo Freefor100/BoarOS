@@ -99,8 +99,6 @@ FD 仍按后备普通文件的文件系统规则读写。`O_DIRECT` 的块设备
 对齐、故障前缀和 splice 中途切换状态标志。`tests/userland/direct-block.py` 运行
 `tests/workloads/io/direct-block.c` 的静态 ELF，使用私有 VirtIO 盘和 loop 设备。
 同一 ELF 可以接受 Linux 上未挂载的私有块设备路径，检查对齐、盘尾截断和共享 OFD。
-以 `-DBOAROS_BLOCK_DIRECT_ONLY` 编译 `tests/userland/tmpfile.c` 后可用
-`tests/userland/tmpfile.py` 检查匿名临时文件与普通文件打开的拒绝路径。
 
 块设备 ioctl 支持 `BLKGETSIZE`（512 字节扇区数）、`BLKGETSIZE64`（字节数）、`BLKSSZGET`、`BLKROGET/SET`、`BLKBSZGET/SET` 和 `BLKFLSBUF`。软件块大小是设备共享状态，只接受不小于逻辑扇区、介于 512 和架构页大小之间的 2 的幂；设置时需要已有独占资格或临时 claim。只读状态下仍允许以 `O_WRONLY/O_RDWR` 打开；新旧 OFD 的实际写入均返回 EPERM。fsync、fdatasync、`O_SYNC/O_DSYNC` 和 `BLKFLSBUF` 调用同一真实设备 flush；`BLKFLSBUF` 先持有挂载根路径并同步该设备上的文件系统，将缓存的文件数据和元数据交给设备。错误如实返回。没有裸设备缓存需要清除。mmap、discard、secure discard 和 zeroout 当前明确不支持。
 

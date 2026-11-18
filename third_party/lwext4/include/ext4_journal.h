@@ -48,6 +48,7 @@ extern "C" {
 #include <ext4_journal_memory.h>
 #include <misc/queue.h>
 #include <misc/tree.h>
+#include <kernel/sync.h>
 
 struct jbd_fs {
 	struct ext4_blockdev *bdev;
@@ -91,6 +92,10 @@ struct jbd_buf {
 struct jbd_source;
 /* File payload belongs to the transaction but is never a log record. */
 struct jbd_data {
+	/* Accepted payloads are immutable. Only ordered_io publishes completion;
+	 * readers observe it atomically, snapshots may outlive their list owner. */
+	unsigned references;
+	bool completed;
 	struct ext4_block block;
 	struct jbd_image *image;
 	struct jbd_source *source;
@@ -160,6 +165,8 @@ struct jbd_trans {
 };
 
 struct jbd_journal {
+	/* Device data ordering, independent of log durability and STATE. */
+	struct kernel_mutex ordered_io;
 	/* Last durable commit, and sticky session error owned by this journal. */
 	uint32_t committed_id;
 	int error;
@@ -233,6 +240,9 @@ struct jbd_data_borrow {
 };
 bool jbd_journal_borrow_data(struct ext4_fs *, ext4_fsblk_t, struct jbd_data_borrow *);
 void jbd_journal_release_borrow(struct jbd_data_borrow *);
+void jbd_data_put(struct jbd_data *);
+/* Caller stabilizes the mapped inode; this completes data, not a barrier. */
+int jbd_journal_complete_data(struct jbd_journal *, ext4_fsblk_t, uint32_t);
 int jbd_trans_revoke_block(struct jbd_trans *trans,
 			   ext4_fsblk_t lba);
 int jbd_trans_try_revoke_block(struct jbd_trans *trans,
