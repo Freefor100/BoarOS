@@ -57,6 +57,36 @@ def core_dump_extract(image,folder):
         if logpath.read_text().count('NT_PRSTATUS')!=expected:
             raise RuntimeError(f'{name} lacks {expected} native PRSTATUS notes')
 
+def sendfile_tcp_output(raw,performance):
+    lines=raw.replace('\r','').splitlines()
+    resources=re.findall(r'^SENDFILE-TCP RESOURCE fd_before=(\d+) fd_after=(\d+)$',raw.replace('\r',''),re.M)
+    if len(resources)!=1 or resources[0][0]!=resources[0][1]:return False
+    if lines.count('NETWORK PASS sendfile_tcp')!=1:return False
+    if performance:
+        metrics=re.findall(r'^SENDFILE-TCP PERF chunk=(\d+) bytes=(\d+) accepted_ns=(\d+) complete_ns=(\d+) sender_cpu_ns=(\d+) sender_cpu=(\d+) receiver_cpu=(\d+)$',raw.replace('\r',''),re.M)
+        return (len(metrics)==2 and all(int(row[0])==chunk and int(row[1])==8388608 and
+            0<int(row[2])<=int(row[3]) and int(row[4])>0 for row,chunk in zip(metrics,(4096,262144))))
+    cases=[line for line in lines if line.startswith('SENDFILE-TCP CASE ')]
+    return cases==[f'SENDFILE-TCP CASE {name} PASS' for name in (
+        'content-offset-eof','nonblocking-short-resume','signal-before-progress',
+        'signal-after-prefix','reset-after-prefix','cancel-last-sender','shutdown-no-progress','sparse-memory-source',
+        'concurrent-send-write','cancel-shared-sender','pipe-to-tcp-splice')]
+
+
+def sendfile_tcp_fixture(image,directory):
+    data=directory/'sendfile-tcp-data'
+    # Fixed bytes, generated outside the measured program and identical in
+    # every kernel's cloned image. The reader validates every received byte.
+    block=bytes(range(251))*4096
+    with data.open('wb') as stream:
+        left=8*1024*1024
+        while left:
+            size=min(left,len(block));stream.write(block[:size]);left-=size
+    batch=directory/'sendfile-tcp-data.debugfs'
+    batch.write_text(f'write "{data.resolve()}" /sendfile-tcp-data\n')
+    harness.run_logged(['debugfs','-w','-f',str(batch),str(image)],directory/'sendfile-tcp-data-install.log')
+
+
 def futex_lines(raw,cpus):
     names=['abi','atomics']+[f'compare-{cmp}-old-{value}' for cmp in range(6) for value in (-1,0,1)]+['requeue-near','requeue-offset','wake-zero','wake-negative','wake-both','shared','robust']
     expected=[f'FUTEX CALLER CPUS {cpus}',*[f'FUTEX CASE {name} PASS' for name in names],*[f'FUTEX CPU {cpu} PASS' for cpu in range(cpus)],'FUTEX CASE caller-cpus PASS','FUTEX CALLER PASS cases=28']
@@ -599,9 +629,10 @@ def run_smp(args):
                 fixture=harness.fixture(folder,program)
                 if args.workload=='chroot':chroot_fixture(fixture,folder,'riscv')
                 if args.performance:
-                    marker=folder/'performance';marker.write_text('fixed named AF_UNIX performance workload\n')
+                    marker=folder/'performance';marker.write_text('fixed network performance workload\n')
                     batch=folder/'performance.debugfs';batch.write_text(f'write "{marker.resolve()}" /performance\n')
                     harness.run_logged(['debugfs','-w','-f',str(batch),str(fixture)],folder/'performance-install.log')
+                    if args.workload=='sendfile_tcp':sendfile_tcp_fixture(fixture,folder)
                 if args.dynamic:
                     loader=ROOT/'build/riscv/musl-root/lib/libc.so'
                     batch=folder/'loader.debugfs';batch.write_text(f'mkdir /lib\nwrite "{loader}" /lib/ld-musl-riscv64.so.1\nset_inode_field /lib/ld-musl-riscv64.so.1 mode 0100755\n')
@@ -627,6 +658,7 @@ def run_smp(args):
                     passed=bool(expected) and lines==expected and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='ipv4_basic':passed=ipv4_basic_output(raw,cpus) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='interface':passed='NETWORK PASS interface' in raw and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
+                    if args.workload=='sendfile_tcp':passed=sendfile_tcp_output(raw,args.performance) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if unix_named:passed=unix_named_output(raw,args.performance) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if unix_control:passed=unix_control_output(raw,args.performance,cpus) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if unix_seqpacket:passed=unix_seqpacket_output(raw,args.performance,cpus) and (target=='linux' or unix_seqpacket_owners(raw,'riscv'))
@@ -723,13 +755,13 @@ def run_smp(args):
 def main(default_arch="riscv"):
     parser=argparse.ArgumentParser(__doc__)
     parser.add_argument('--only',choices=('linux','boaros'))
-    parser.add_argument('--workload',choices=('ipv4_basic','contract','content','timer','budget','interface','sendfile','admission','unix_sender','unix_named','unix_control','unix_seqpacket','smp','epoll','pipe','event','altstack','queued','posix','futex','mremap','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','exec_capacity','core_dump','chroot','proc_thread_resources','clone_resources','pi','futex_vector'),default='contract')
+    parser.add_argument('--workload',choices=('ipv4_basic','contract','content','timer','budget','interface','sendfile','sendfile_tcp','admission','unix_sender','unix_named','unix_control','unix_seqpacket','smp','epoll','pipe','event','altstack','queued','posix','futex','mremap','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','exec_capacity','core_dump','chroot','proc_thread_resources','clone_resources','pi','futex_vector'),default='contract')
     parser.add_argument('--platform-config',choices=('fixture','official'),default='fixture')
     parser.add_argument('--arch',choices=('riscv','loongarch'),default=default_arch)
     parser.add_argument('--memory',action='append',choices=('512M','1G'))
     parser.add_argument('--kernel',type=Path)
     parser.add_argument('--cpus',action='append',type=int,choices=(1,2,4))
-    parser.add_argument('--performance',action='store_true',help='run fixed AF_UNIX traffic via /performance')
+    parser.add_argument('--performance',action='store_true',help='run fixed network traffic via /performance')
     parser.add_argument('--dynamic',action='store_true')
     parser.add_argument('--libc',choices=('musl','glibc'),default='musl')
     parser.add_argument('--observe',action='store_true')
@@ -741,8 +773,8 @@ def main(default_arch="riscv"):
         args.only = 'boaros'
     if args.dynamic and args.libc=='glibc':parser.error('glibc direct consumer uses the static target toolchain')
     if args.performance and args.arch!='riscv':parser.error('--performance requires the RISC-V SMP runner')
-    if args.performance and args.workload not in ('unix_named','unix_control','unix_seqpacket'):parser.error('--performance requires --workload unix_named, unix_control or unix_seqpacket')
-    if (args.workload in ('interface','ipv4_basic') and args.cpus and max(args.cpus) > 1) or (args.workload in ('unix_named','unix_control','unix_seqpacket','smp','pipe','event','altstack','queued','posix','futex','mremap','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','exec_capacity','core_dump','chroot','proc_thread_resources','clone_resources','pi','futex_vector') and args.arch=='riscv'):
+    if args.performance and args.workload not in ('unix_named','unix_control','unix_seqpacket','sendfile_tcp'):parser.error('--performance requires --workload unix_named, unix_control, unix_seqpacket or sendfile_tcp')
+    if (args.workload in ('interface','ipv4_basic') and args.cpus and max(args.cpus) > 1) or (args.workload in ('sendfile_tcp','unix_named','unix_control','unix_seqpacket','smp','pipe','event','altstack','queued','posix','futex','mremap','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','exec_capacity','core_dump','chroot','proc_thread_resources','clone_resources','pi','futex_vector') and args.arch=='riscv'):
         if args.arch == 'riscv': return run_smp(args)
     if args.arch=='riscv' and args.platform_config=='official' and args.memory and args.memory!=['1G']:
         parser.error('official profile requires 1G')
