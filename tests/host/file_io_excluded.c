@@ -13,6 +13,7 @@ EXCLUDED(kernel_socket_copy_read)
 EXCLUDED(kernel_socket_read_user)
 EXCLUDED(kernel_socket_abort_read)
 EXCLUDED(kernel_socket_wait_ready)
+EXCLUDED(kernel_socket_wait_read)
 #endif
 EXCLUDED(kernel_socket_discard_receive)
 #ifndef TCP_IO_CASES

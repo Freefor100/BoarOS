@@ -752,6 +752,7 @@ static enum kernel_syscall_status socket_message_pinned(
     uint32_t allowed=KERNEL_SOCKET_MSG_DONTWAIT | (writing?KERNEL_SOCKET_MSG_NOSIGNAL:
         KERNEL_SOCKET_MSG_TRUNC|UINT32_C(0x40000000)|KERNEL_SOCKET_MSG_PEEK);
     if (writing && batch) allowed|=KERNEL_SOCKET_MSG_EOR;
+    if (!writing && kernel_socket_is_tcp(socket)) allowed |= KERNEL_SOCKET_MSG_WAITALL;
     if (seqpacket)
         allowed |= writing?(KERNEL_SOCKET_MSG_EOR|KERNEL_SOCKET_MSG_MORE):KERNEL_SOCKET_MSG_WAITALL;
     if(!writing && kernel_socket_is_netlink(socket))
@@ -1079,7 +1080,7 @@ enum kernel_syscall_status syscall_handle_socket_operation(
         uint32_t flags = (uint32_t)request->arguments[3];
         data_call.message.flags=flags;
         uint32_t allowed=KERNEL_SOCKET_MSG_DONTWAIT | KERNEL_SOCKET_MSG_TRUNC | KERNEL_SOCKET_MSG_PEEK;
-        if (kernel_socket_is_seqpacket(socket)) allowed|=KERNEL_SOCKET_MSG_WAITALL;
+        if (kernel_socket_is_seqpacket(socket) || kernel_socket_is_tcp(socket)) allowed|=KERNEL_SOCKET_MSG_WAITALL;
         if (kernel_socket_is_netlink(socket))allowed|=KERNEL_SOCKET_MSG_WAITALL|KERNEL_SOCKET_MSG_NOSIGNAL;
         if (flags & ~allowed) {
             result=kernel_socket_prepare_receive(socket);
