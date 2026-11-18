@@ -82,7 +82,7 @@ static int destroy_devices(struct riscv_root_boot *root)
     while (root->device_count) {
         struct riscv_virtio_mmio_block *device =
             riscv_root_boot_device(root, root->device_count - 1U);
-        for (unsigned p = 0; p < 4; p++) {
+        for (unsigned p = 0; p < KERNEL_BLOCK_GPT_PARTITIONS; p++) {
             struct kernel_block_device *child = &root->partitions[root->device_count - 1U][p];
             if (child->registered && kernel_block_unregister(child))
                 return RISCV_VIRTIO_MMIO_BLOCK_STATUS_STATE;
@@ -333,7 +333,7 @@ enum riscv_root_boot_status riscv_root_boot_start_with_irq(
                 failure = RISCV_ROOT_BOOT_STATUS_DEVICE;
                 goto fail;
             }
-            if (kernel_block_scan_mbr(&device->block, root->partitions[root->device_count - 1U])) {
+            if (kernel_block_scan_partitions(&device->block, root->partitions[root->device_count - 1U])) {
                 failure = RISCV_ROOT_BOOT_STATUS_DEVICE;
                 goto fail;
             }

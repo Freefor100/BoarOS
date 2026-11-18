@@ -2,6 +2,7 @@
 #define BOAROS_TEST_BLOCK_PARTITIONS_H
 #include <kernel/block.h>
 #include <kernel/errno.h>
+#include "gpt_fixture.h"
 
 /* The vectors and DMA targets stay outside the task stack on both test
  * architectures. Each call keeps this workspace until the real I/O returns. */
