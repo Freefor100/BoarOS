@@ -4253,26 +4253,40 @@ enum kernel_mm_status kernel_mm_shmdt(struct kernel_mm *mm, uint64_t address)
     return KERNEL_MM_STATUS_OK;
 }
 
+static uint32_t protection_for_leaf(struct kernel_mm_record *record, uint64_t leaf, uint32_t permissions)
+{
+    if (!(permissions & KERNEL_MM_WRITE)) return permissions;
+    struct mm_file_resident *resident=find_file_resident(record,leaf);
+    if (resident) {
+        COST_ADD(MPROTECT_RESIDENT_VISITS, 1);
+        if (kernel_page_cache_alias_active(&resident->alias)) permissions&=~KERNEL_MM_WRITE;
+    }
+    return permissions;
+}
+
 static enum kernel_mm_status protect_vma_pages(struct kernel_mm_record *record,
     const struct kernel_vma_edit *edit)
 {
     uint64_t address = edit->start, end = edit->end;
     uint32_t normalized = edit->permissions;
-    enum arch_mmu_status backend_status;
     uint64_t cursor = address, leaf;
     int touched=0;
-    for (;;) {
+    if (end-address==BOAROS_PAGE_SIZE) {
+        /* One base page cannot cover a large leaf. The backend performs the
+         * lookup and update together and reports a hole without a fence. */
         KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
-        backend_status=arch_mmu_user_next_owned(&record->space,&cursor,end,&leaf);
-        if (backend_status != ARCH_MMU_STATUS_OK) break;
+        uint32_t leaf_permissions=protection_for_leaf(record,address,normalized);
+        enum arch_mmu_status status=arch_mmu_user_protect_resident_page(&record->space,address,
+            backend_permissions_from_mm(leaf_permissions));
+        if (status && status!=ARCH_MMU_STATUS_NOT_MAPPED) __builtin_trap();
+        touched=!status;
+    } else for (;;) {
+        KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
+        enum arch_mmu_status status=arch_mmu_user_next_owned(&record->space,&cursor,end,&leaf);
+        if (status==ARCH_MMU_STATUS_NOT_MAPPED) break;
+        if (status) __builtin_trap();
         touched=1;
-        uint32_t leaf_permissions = normalized;
-        struct mm_file_resident *resident = find_file_resident(record, leaf);
-        if (resident) {
-            COST_ADD(MPROTECT_RESIDENT_VISITS, 1);
-            if (kernel_page_cache_alias_active(&resident->alias))
-                leaf_permissions &= ~KERNEL_MM_WRITE;
-        }
+        uint32_t leaf_permissions=protection_for_leaf(record,leaf,normalized);
         struct kernel_mm_leaf snapshot;
         if (arch_mmu_user_leaf_snapshot(&record->space,leaf,&snapshot)) __builtin_trap();
         if (snapshot.order) {
@@ -4282,7 +4296,6 @@ static enum kernel_mm_status protect_vma_pages(struct kernel_mm_record *record,
         } else if (arch_mmu_user_protect_owned_page(&record->space, leaf,
                 backend_permissions_from_mm(leaf_permissions))) __builtin_trap();
     }
-    if (backend_status != ARCH_MMU_STATUS_NOT_MAPPED) __builtin_trap();
     if (touched) {
         struct kernel_mm_retirement batch={0};
         uint32_t targets;
@@ -5950,11 +5963,8 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
         if (!source && record->resident_capacity-record->resident_count<slots)
             slots=record->resident_capacity-record->resident_count;
         if (!slots) return end;
-        for(uint64_t next=first;next<limit;next+=BOAROS_PAGE_SIZE) {
-            struct kernel_mm_mapping mapping;
-            if (lookup_record(record,next,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED)
-                selected|=1U<<((next-first)>>BOAROS_PAGE_SHIFT);
-        }
+        if (arch_mmu_user_empty_window(&record->space,first,
+            (limit-first)>>BOAROS_PAGE_SHIFT,&selected)) return end;
     }
     if (!selected) return end;
     uint64_t refs[KERNEL_PAGE_CACHE_READY_WINDOW];
@@ -5980,11 +5990,11 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
             struct mm_file_resident *page=residents[i];
             uint64_t physical=refs[i++];
             if (!source && (!page || record->resident_count==record->resident_capacity)) continue;
-            struct kernel_mm_mapping mapping;
-            if (lookup_record(record,next,&mapping)!=KERNEL_MM_STATUS_NOT_MAPPED) continue;
             struct kernel_mm_leaf_preparation tables=KERNEL_MM_LEAF_PREPARATION_INIT;
-            if (arch_mmu_user_map_prepared_page(&record->space,next,physical,
-                backend_permissions_from_mm(vma->permissions&~KERNEL_MM_WRITE),1,&tables)) __builtin_trap();
+            enum arch_mmu_status status=arch_mmu_user_map_prepared_page(&record->space,next,physical,
+                backend_permissions_from_mm(vma->permissions&~KERNEL_MM_WRITE),1,&tables);
+            if (status==ARCH_MMU_STATUS_CONFLICT || status==ARCH_MMU_STATUS_NEED_TABLES) continue;
+            if (status) __builtin_trap();
             if (page) {
                 page->address=next;page->physical_address=physical;
                 publish_file_resident(record,page);residents[i-1]=NULL;
@@ -6161,48 +6171,38 @@ prepare_file_tables:
     }
     if (status == KERNEL_MM_STATUS_OK && !cookie && !operation->shared)
         status = reserve_file_residents(record,record->resident_count + 1);
-    if (status == KERNEL_MM_STATUS_OK && !cookie) {
-        int refill = 0;
+    if (status == KERNEL_MM_STATUS_OK) {
+        enum arch_mmu_status backend;
         {
             KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
-            struct kernel_mm_mapping mapping;
-            enum kernel_mm_status current=lookup_record(record,address,&mapping);
-            if (current==KERNEL_MM_STATUS_NOT_MAPPED) {
-                if (arch_mmu_user_leaf_missing(&record->space,address,&missing)) __builtin_trap();
-                for (unsigned i=0;i<2;i++)
-                    if ((missing & (1U<<i)) && prepared.tables[i]==KERNEL_MM_NO_PAGE) refill=1;
-            } else status=current==KERNEL_MM_STATUS_OK?KERNEL_MM_STATUS_CONFLICT:current;
+            if (!cookie && record->resident_count == record->resident_capacity)
+                backend = ARCH_MMU_STATUS_CONFLICT;
+            else if (cookie) backend = arch_mmu_user_cow_commit(&record->space,address,cookie,replacement,
+                backend_permissions_from_mm(vma->permissions),&batch);
+            else {
+                backend = arch_mmu_user_map_prepared_page(&record->space,address,replacement,
+                    backend_permissions_from_mm((!shared && access != KERNEL_MM_WRITE) || (shared && disk) ?
+                        vma->permissions & ~KERNEL_MM_WRITE : vma->permissions),
+                    !shared && access != KERNEL_MM_WRITE,&prepared);
+                missing = prepared.table_mask;
+            }
+            if (!backend) {
+                struct mm_file_resident *page = resident ? resident : find_file_resident(record,address);
+                if (!page) __builtin_trap();
+                page->address=address; page->physical_address=replacement;
+                page->private=!shared && access==KERNEL_MM_WRITE;
+                if (resident) { publish_file_resident(record,resident); resident=0; }
+            }
         }
-        if (refill) {
-            /* truncate可撤掉相邻文件的最后一叶，VMA代次不会因此改变。
-             * 保留来源/数据页和已有表页，只在锁外补这次walk真正缺的槽。 */
+        if (backend == ARCH_MMU_STATUS_NEED_TABLES) {
+            /* truncate may retire a neighbouring mapping's last table without
+             * changing our VMA. Keep our data and allocate only missing tables. */
             kernel_lock_release(&inode);
             mm_operation_release(operation);
             goto prepare_file_tables;
         }
-    }
-    if (status == KERNEL_MM_STATUS_OK) {
-        KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
-        enum arch_mmu_status backend;
-        if (!cookie && record->resident_count == record->resident_capacity)
-            backend = ARCH_MMU_STATUS_CONFLICT;
-        else if (cookie) backend = arch_mmu_user_cow_commit(&record->space,address,cookie,replacement,
-            backend_permissions_from_mm(vma->permissions),&batch);
-        else {
-            backend = arch_mmu_user_map_prepared_page(&record->space,address,replacement,
-                backend_permissions_from_mm((!shared && access != KERNEL_MM_WRITE) || (shared && disk) ?
-                    vma->permissions & ~KERNEL_MM_WRITE : vma->permissions),
-                !shared && access != KERNEL_MM_WRITE,&prepared);
-        }
         status = !backend ? KERNEL_MM_STATUS_OK : backend == ARCH_MMU_STATUS_CONFLICT ||
             backend == ARCH_MMU_STATUS_NOT_MAPPED ? KERNEL_MM_STATUS_CONFLICT : KERNEL_MM_STATUS_ADDRESS_SPACE;
-        if (status == KERNEL_MM_STATUS_OK) {
-            struct mm_file_resident *page = resident ? resident : find_file_resident(record,address);
-            if (!page) __builtin_trap();
-            page->address=address; page->physical_address=replacement;
-            page->private=!shared && access==KERNEL_MM_WRITE;
-            if (resident) { publish_file_resident(record,resident); resident=0; }
-        }
     }
     if (status == KERNEL_MM_STATUS_OK) {
         uint64_t begin=address,end=address+BOAROS_PAGE_SIZE;
@@ -6516,7 +6516,6 @@ prepare_memory_tables:
         KERNEL_LOCK_SCOPE(vma_guard);
         if (operation->shared)
             kernel_rwlock_read(&record->vma_lock, &vma_guard);
-        struct kernel_mm_mapping current;
         KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
         uint64_t latest_epoch=0;
         if (memory_fault_view_changed(record,address,view) ||
@@ -6526,16 +6525,15 @@ prepare_memory_tables:
             enum arch_mmu_status backend;
             if (cookie) backend = arch_mmu_user_cow_commit(&record->space, address, cookie,
                 replacement, backend_permissions_from_mm(vma->permissions), &batch);
-            else if (lookup_record(record, address, &current) != KERNEL_MM_STATUS_NOT_MAPPED)
-                backend = ARCH_MMU_STATUS_CONFLICT;
             else {
-                if (arch_mmu_user_leaf_missing(&record->space,address,&missing)) __builtin_trap();
-                for (unsigned i=0;i<2;i++)
-                    if ((missing & (1U<<i)) && prepared.tables[i]==KERNEL_MM_NO_PAGE) refill=1;
-                if (refill) goto memory_tables_changed;
                 backend = arch_mmu_user_map_prepared_page(&record->space, address, replacement,
                     backend_permissions_from_mm(source_shared ? vma->permissions & ~KERNEL_MM_WRITE :
                         vma->permissions), source_shared, &prepared);
+                missing = prepared.table_mask;
+                if (backend == ARCH_MMU_STATUS_NEED_TABLES) {
+                    refill = 1;
+                    goto memory_tables_changed;
+                }
             }
             status = backend == ARCH_MMU_STATUS_OK ? KERNEL_MM_STATUS_OK :
                 backend == ARCH_MMU_STATUS_CONFLICT || backend == ARCH_MMU_STATUS_NOT_MAPPED ?
@@ -6569,8 +6567,7 @@ memory_tables_changed:
         }
         /* Without Svvptc a new non-leaf needs full walk-cache invalidation;
          * replaced COW owners always remain until actual sync completes. */
-        int nonleaf = missing && ((missing & 1U && prepared.tables[0] == KERNEL_MM_NO_PAGE) ||
-            (missing & 2U && prepared.tables[1] == KERNEL_MM_NO_PAGE));
+        int nonleaf = missing != 0;
 #if BOAROS_MAX_CPUS > 1
         if (operation->populate && operation->shared && !cookie && !nonleaf &&
             vma->kind == KERNEL_VMA_KIND_ANONYMOUS && !(vma->permissions & KERNEL_MM_EXECUTE)) {

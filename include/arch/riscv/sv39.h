@@ -31,6 +31,7 @@ enum riscv_sv39_status {
     RISCV_SV39_STATUS_CONFLICT,
     RISCV_SV39_STATUS_STATE,
     RISCV_SV39_STATUS_NOT_MAPPED,
+    RISCV_SV39_STATUS_NEED_TABLES,
 };
 
 enum riscv_sv39_page_table_state {
@@ -221,6 +222,8 @@ enum riscv_sv39_status riscv_sv39_user_protect_owned_range(
     uint64_t start,
     uint64_t end,
     uint32_t permissions);
+enum riscv_sv39_status riscv_sv39_user_protect_resident_page(
+    struct riscv_sv39_user_space *, uint64_t, uint32_t);
 
 
 
@@ -267,6 +270,8 @@ enum riscv_sv39_status riscv_sv39_user_space_destroy(
 
 enum riscv_sv39_status riscv_sv39_user_leaf_snapshot(const struct riscv_sv39_user_space *,
     uint64_t, struct kernel_mm_leaf *);
+enum riscv_sv39_status riscv_sv39_user_empty_window(const struct riscv_sv39_user_space *,
+    uint64_t, unsigned, unsigned *);
 enum riscv_sv39_status riscv_sv39_user_leaf_missing_order(struct riscv_sv39_user_space *,
     uint64_t, uint32_t, unsigned *);
 enum riscv_sv39_status riscv_sv39_user_map_prepared_order(struct riscv_sv39_user_space *,

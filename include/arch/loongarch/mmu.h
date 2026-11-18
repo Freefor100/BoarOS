@@ -24,6 +24,7 @@ enum arch_mmu_status {
     ARCH_MMU_STATUS_CONFLICT,
     ARCH_MMU_STATUS_STATE,
     ARCH_MMU_STATUS_NOT_MAPPED,
+    ARCH_MMU_STATUS_NEED_TABLES,
 };
 
 enum arch_mmu_page_table_state {
@@ -76,6 +77,8 @@ struct arch_mmu_mapping {
  * MM metadata protection; the result does not itself acquire ownership. */
 enum arch_mmu_status arch_mmu_user_leaf_snapshot(
     const struct arch_mmu_user_space *, uint64_t, struct kernel_mm_leaf *);
+enum arch_mmu_status arch_mmu_user_empty_window(const struct arch_mmu_user_space *,
+    uint64_t, unsigned, unsigned *);
 enum arch_mmu_status arch_mmu_user_leaf_missing_order(
     struct arch_mmu_user_space *, uint64_t, uint32_t, unsigned *);
 /* Only orders 0/11. Entire-leaf aligned VA/PA; success consumes one data
@@ -181,6 +184,8 @@ enum arch_mmu_status arch_mmu_user_protect_owned_range(
     uint64_t start,
     uint64_t end,
     uint32_t permissions);
+enum arch_mmu_status arch_mmu_user_protect_resident_page(
+    struct arch_mmu_user_space *, uint64_t, uint32_t);
 
 
 
