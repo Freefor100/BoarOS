@@ -1,3 +1,4 @@
+#include "../../fs/cgroup_internal.h"
 #include <kernel/bpf.h>
 #include "init-config.h"
 #include <arch/riscv/direct_map.h>
@@ -234,6 +235,7 @@ enum riscv_root_boot_status riscv_root_boot_cleanup(
     }
     if (riscv_uart_tty_stop(&root->uart)) cleanup_failed = 1;
     if (root->heap.page_allocator && kernel_bpf_shutdown(&root->heap)) cleanup_failed = 1;
+    if (root->heap.page_allocator && kernel_cgroup_shutdown(&root->heap)) cleanup_failed = 1;
     if (root->heap.page_allocator == 0) {
         cleanup_failed = 1;
     } else {
@@ -644,6 +646,7 @@ enum riscv_root_boot_status riscv_root_boot_finish(
     if (!error) kernel_page_cache_stop_worker(&root->page_cache);
     if (error == 0) error = kernel_vfs_unmount(&root->mount);
     if (error == 0) error = kernel_bpf_shutdown(&root->heap);
+    if (error == 0) error = kernel_cgroup_shutdown(&root->heap);
     if (error != 0) {
         root->finish_failure = RISCV_ROOT_FINISH_UNMOUNT;
         root->finish_error = error;

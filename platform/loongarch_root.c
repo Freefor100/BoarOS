@@ -1,3 +1,4 @@
+#include "../fs/cgroup_internal.h"
 #include <kernel/hugetlb.h>
 #include <kernel/bpf.h>
 #include <kernel/reboot.h>
@@ -154,6 +155,7 @@ static int release_root(void)
     int mq_final=kernel_mqueue_shutdown();if(mq_final)return mq_final;
     int ipc_final=kernel_ipc_initial_shutdown();if(ipc_final)return ipc_final;
     int bpf_final=kernel_bpf_shutdown(&root.heap);if(bpf_final)return bpf_final;
+    int cgroup_final=kernel_cgroup_shutdown(&root.heap);if(cgroup_final)return cgroup_final;
     if((root.cache.state==KERNEL_PAGE_CACHE_LIVE || root.cache.state==KERNEL_PAGE_CACHE_CLEANUP) &&
        kernel_page_cache_destroy(&root.cache)!=KERNEL_PAGE_CACHE_STATUS_OK) return -KERNEL_EIO;
     while(root.count) {

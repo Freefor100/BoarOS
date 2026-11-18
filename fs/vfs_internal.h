@@ -12,6 +12,7 @@
 extern struct kernel_raw_lock kernel_vfs_state_lock;
 struct kernel_fs_context;
 struct kernel_vfs_path;
+int kernel_vfs_reuse_cgroup_tree(struct kernel_heap *,uint64_t,struct kernel_vfs_path **);
 int kernel_vfs_reuse_block_tree(uint64_t,const char *,int,int,struct kernel_heap *,uint64_t,struct kernel_vfs_path **);
 
 size_t kernel_fs_context_pivot_publish(const struct kernel_fs_context *,struct kernel_vfs_path *,struct kernel_vfs_path *);
@@ -110,6 +111,7 @@ int kernel_vfs_node_pread(struct kernel_vfs_node *node,
                           size_t *bytes_read);
 int kernel_vfs_file_is_control(const struct kernel_vfs_file *file,int write);
 size_t kernel_vfs_file_control_prefix(const struct kernel_vfs_file *file);
+int kernel_vfs_file_control_open_credentials(const struct kernel_vfs_file *);
 int kernel_vfs_file_control_permission(const struct kernel_vfs_file *file, int write);
 int kernel_vfs_file_control(const struct kernel_vfs_file *file, int write,
     uint64_t *offset, char *buffer, size_t size, size_t *count);

@@ -1091,6 +1091,17 @@ int kernel_files_description_writable(
     return 0;
 }
 
+static int control_write_as_opener(struct kernel_open_file_description *description,
+    uint64_t *offset, char *buffer, size_t size, size_t *accepted)
+{
+    int opener_credentials = kernel_vfs_file_control_open_credentials(&description->file);
+    const struct kernel_credentials *previous = opener_credentials ?
+        kernel_credentials_override(description->credentials) : 0;
+    int error = kernel_vfs_file_control(&description->file,1,offset,buffer,size,accepted);
+    if (opener_credentials) kernel_credentials_override(previous);
+    return error;
+}
+
 static enum kernel_files_status control_write(
     struct kernel_files *files, struct kernel_mm *mm,
     struct kernel_open_file_description *description,
@@ -1116,7 +1127,7 @@ static enum kernel_files_status control_write(
             if (access != KERNEL_UACCESS_STATUS_OK && !error) return KERNEL_FILES_STATUS_STATE;
             if (!error && copied != imported) return KERNEL_FILES_STATUS_STATE;
             uint64_t offset = kernel_open_file_offset(description);
-            if (!error) error = kernel_vfs_file_control(&description->file, 1, &offset, buffer, imported, &accepted);
+            if (!error) error = control_write_as_opener(description, &offset, buffer, imported, &accepted);
             if (error) { *linux_result = total ? (int64_t)total : error; return KERNEL_FILES_STATUS_OK; }
             if (accepted != imported) return KERNEL_FILES_STATUS_STATE;
             total += segment;
@@ -1149,7 +1160,7 @@ static enum kernel_files_status control_write(
         return KERNEL_FILES_STATUS_OK;
     }
     uint64_t offset = positioned ? requested_offset : kernel_open_file_offset(description);
-    result = kernel_vfs_file_control(&description->file, 1, &offset,
+    result = control_write_as_opener(description, &offset,
         buffer, (size_t)count, &accepted);
     kernel_heap_release(files->heap, buffer);
     if (result) { *linux_result = result; return KERNEL_FILES_STATUS_OK; }

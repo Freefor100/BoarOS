@@ -111,9 +111,11 @@ enum kernel_user_return_work {
     KERNEL_USER_RETURN_SIGNAL = 2U,
 };
 
+struct kernel_cgroup;
 struct kernel_task {
     struct arch_thread_state arch;
     struct kernel_cpu *cpu;
+    struct kernel_cgroup *cgroup; /* NULL is root; membership owns one reference. */
     uint64_t magic;
     uint64_t physical_address;
     uint64_t stack_physical_address;
