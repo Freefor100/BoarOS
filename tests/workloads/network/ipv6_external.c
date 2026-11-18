@@ -75,7 +75,9 @@ int main(void)
     CHECK(inet_pton(AF_INET6,"2001:db8:1::5054:ff:fe12:3456",&local.sin6_addr)==1);
 #endif
     int ready=0;
-    for(unsigned i=0;i<60;i++) {
+    /* Router discovery follows link-local DAD. The selected SLAAC address
+     * must also complete DAD before bind succeeds. */
+    for(unsigned i=0;i<120;i++) {
         if(!bind(fd,(void *)&local,sizeof(local))) {ready=1;break;}
         CHECK(errno==EADDRNOTAVAIL);usleep(100000);
     }
