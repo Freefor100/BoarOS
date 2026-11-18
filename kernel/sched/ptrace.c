@@ -154,10 +154,28 @@ void kernel_ptrace_switch_notify(struct kernel_ptrace_notice *n)
     scheduler_task_put(n->child); scheduler_task_put(n->tracer);
 }
 
+static int prepare_stop_locked(struct kernel_task *t,unsigned status,uint64_t message,
+    unsigned operation,const struct kernel_signal_wait_info *info,
+    const struct kernel_pid *message_pid,struct kernel_wait_token token)
+{
+    struct kernel_ptrace_state *s=t->ptrace;
+    int park=s->tracer && !t->proc_exiting && (!t->terminate_requested || status>>16==TRACE_EXIT);
+    if (park) {
+        s->token=token; s->phase=TRACE_PARKING;
+        s->message=message_pid ? (uint32_t)kernel_pid_number_in(message_pid,process_pid_active(s->tracer)) : message;
+        s->operation=operation; s->status=status; s->resume_signal=0;
+        s->why=(status>>16==TRACE_STOP || (!info && s->group_signal &&
+            (status>>8)==s->group_signal)) ? 5 : 4;
+        s->info=info ? *info : (struct kernel_signal_wait_info){.signal=(status>>8&255)==133 ? 5 : (status>>8)&255,
+            .code=(int32_t)(status>>8),.sender=(uint32_t)kernel_pid_number_in(process_identity(t,KERNEL_PID_TID),process_pid_active(t)),.uid=kernel_credentials_task_locked(t)->uid};
+    }
+    return park;
+}
+
 /* Only the tracee owns this stack. The token pins execution here until the
  * tracer releases the stop; fatal wakeups wait for an in-flight memory copy. */
 static unsigned stop(struct kernel_task *t,unsigned status,uint64_t message,unsigned operation,
-    struct kernel_signal_wait_info *info)
+    struct kernel_signal_wait_info *info,const struct kernel_pid *message_pid)
 {
     struct kernel_wait_token token;
     if (kernel_wait_prepare(0,0,0,&token)) __builtin_trap();
@@ -165,15 +183,7 @@ static unsigned stop(struct kernel_task *t,unsigned status,uint64_t message,unsi
     int park;
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-        park=s->tracer && !t->proc_exiting && (!t->terminate_requested || status>>16==TRACE_EXIT);
-        if (park) {
-            s->token=token; s->phase=TRACE_PARKING; s->message=message;
-            s->operation=operation; s->status=status; s->resume_signal=0;
-            s->why=(status>>16==TRACE_STOP || (!info && s->group_signal &&
-                (status>>8)==s->group_signal)) ? 5 : 4;
-            s->info=info ? *info : (struct kernel_signal_wait_info){.signal=(status>>8&255)==133 ? 5 : (status>>8)&255,
-                .code=(int32_t)(status>>8),.sender=(uint32_t)t->tid,.uid=kernel_credentials_task_locked(t)->uid};
-        }
+        park=prepare_stop_locked(t,status,message,operation,info,message_pid,token);
     }
     if (!park) {
         if (kernel_wait_finish(&token)) __builtin_trap();
@@ -231,7 +241,7 @@ static void syscall_stop(struct kernel_task *t,unsigned op,struct arch_trap_fram
         frame->sepc+=4;
 #endif
     }
-    unsigned signal=stop(t,STOP_STATUS(sig,0),op,sig==133?op:0,0);
+    unsigned signal=stop(t,STOP_STATUS(sig,0),op,sig==133?op:0,0,NULL);
     if (signal) (void)kernel_signal_send_ptrace_syscall(t,signal);
     if (op==1) {
 #if defined(BOAROS_ARCH_LOONGARCH)
@@ -259,7 +269,7 @@ int kernel_ptrace_seccomp(struct kernel_task *t,struct kernel_syscall_request *r
     frame->sepc+=4;
     frame->a0=(uint64_t)-KERNEL_ENOSYS;
 #endif
-    (void)stop(t,STOP_STATUS(5,TRACE_SECCOMP),data,3,0);
+    (void)stop(t,STOP_STATUS(5,TRACE_SECCOMP),data,3,0,NULL);
     int terminated;
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
@@ -307,7 +317,7 @@ void kernel_ptrace_user_return(struct kernel_task *t,struct arch_trap_frame *f)
             status=t->ptrace->pending; t->ptrace->pending=0;
             group=t->ptrace->group_pending;
         }
-        if (status) stop(t,status,0,0,0);
+        if (status) stop(t,status,0,0,0,NULL);
         else if (group) kernel_signal_ptrace_group_stop(t,group);
         else break;
     }
@@ -320,7 +330,7 @@ uint32_t kernel_ptrace_signal(struct kernel_task *t,struct kernel_signal_wait_in
         if (!t->ptrace->tracer) return info->signal;
         t->ptrace->delivery_active=1; t->ptrace->delivery_continued=0;
     }
-    unsigned result=stop(t,STOP_STATUS(info->signal,0),0,0,info);
+    unsigned result=stop(t,STOP_STATUS(info->signal,0),0,0,info,NULL);
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         t->ptrace->delivery_active=result>=19 && result<=22;
@@ -367,7 +377,7 @@ int kernel_ptrace_group_stop(struct kernel_task *t,unsigned sig)
         if (!t->ptrace->group_signal) return 1; /* CONT beat publication. */
         event=t->ptrace->seized?TRACE_STOP:0;
     }
-    stop(t,STOP_STATUS(sig,event),0,0,0);
+    stop(t,STOP_STATUS(sig,event),0,0,0,NULL);
     return 1;
 }
 void kernel_ptrace_group_continue_locked(struct kernel_task *t)
@@ -382,8 +392,22 @@ void ptrace_event(struct kernel_task *t,unsigned event,uint64_t message)
 {
     unsigned options;
     if (tracing(t,&options) && (options&(1U<<event)))
-        stop(t,STOP_STATUS(5,event),message,0,0);
+        stop(t,STOP_STATUS(5,event),message,0,0,NULL);
 }
+void ptrace_event_pid(struct kernel_task *t,unsigned event,const struct kernel_pid *identity)
+{
+    unsigned options;
+    if (tracing(t,&options) && (options&(1U<<event)))
+        stop(t,STOP_STATUS(5,event),0,0,NULL,identity);
+}
+
+uint32_t kernel_ptrace_exec_old_tid(struct kernel_task *t)
+{
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    struct kernel_task *observer=state(t) && t->ptrace->tracer ? t->ptrace->tracer : t->group_leader->parent;
+    return kernel_pid_number_in(process_identity(t,KERNEL_PID_TID),process_pid_active(observer));
+}
+
 void kernel_ptrace_exec(struct kernel_task *t,uint32_t old_tid)
 {
     unsigned options;
@@ -423,7 +447,9 @@ static int attach(struct kernel_task *caller,struct kernel_task *target,int32_t 
     if (self) {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         struct kernel_pid *creator=t->group_leader->child_creator;
-        tracer=creator?scheduler_task_lookup_locked(creator->number,KERNEL_PID_TID,creator->generation):0;
+        tracer=creator && creator->members[KERNEL_PID_TID] ? creator->members[KERNEL_PID_TID]->task : NULL;
+        if(tracer && (!tracer->accounted || tracer->retirement))tracer=NULL;
+        if(tracer)scheduler_task_get_locked(tracer);
         if (!tracer && t->group_leader->parent) {
             tracer=t->group_leader->parent; scheduler_task_get_locked(tracer);
         }
@@ -442,7 +468,7 @@ static int attach(struct kernel_task *caller,struct kernel_task *target,int32_t 
         {
             KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
             const struct kernel_credentials *cred=kernel_credentials_task_locked(tracer);
-            if ((!self && t->tid!=requested_tid) || t->retirement) return -KERNEL_ESRCH;
+            if ((!self && kernel_pid_number_in(process_identity(t,KERNEL_PID_TID),process_pid_active(caller))!=requested_tid) || t->retirement) return -KERNEL_ESRCH;
             if (t->ptrace->tracer || t->group_leader==tracer->group_leader ||
                 !t->arch.user_mode || t->proc_exiting || !t->group_leader ||
                 t->group_leader->core_session) return -KERNEL_EPERM;
@@ -546,8 +572,14 @@ static int64_t stopped_request(struct kernel_task *caller,struct kernel_task *t,
         if (request==SETSIGMASK) {
             int err=copy_word_range(caller,&word,data,8,1);
             if (err) return err;
-            KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-            t->signal_blocked=word&~KERNEL_SIGNAL_UNBLOCKABLE_MASK; t->signal_restore_mask=0;
+            {
+                KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+                t->signal_restore_mask=0;
+            }
+            /* Use the common mask transition: shared pending signals may need
+             * retargeting and immune-init timers may become observable. */
+            if(kernel_signal_update_blocked(t,2,&word,NULL)!=KERNEL_SIGNAL_STATUS_OK)
+                __builtin_trap();
             return 0;
         }
         {
@@ -581,14 +613,21 @@ static int64_t stopped_request(struct kernel_task *caller,struct kernel_task *t,
 int64_t kernel_ptrace_request(struct kernel_task *caller,uint64_t request,int32_t tid,uint64_t addr,uint64_t data)
 {
     if (request==TRACEME) return attach(caller,0,tid,request,addr,data);
-    SCHEDULER_TASK_BORROW(t,scheduler_task_lookup(tid,KERNEL_PID_TID,0));
+    SCHEDULER_TASK_BORROW(t,NULL);
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        t=process_find_identity_in(tid,KERNEL_PID_TID,process_pid_active(caller));
+        if(t && t->accounted && !t->retirement)scheduler_task_get_locked(t);
+        else t=NULL;
+    }
     if (!t) return -KERNEL_ESRCH;
     if (request==ATTACH || request==SEIZE) return attach(caller,t,tid,request,addr,data);
     struct kernel_ptrace_state *s=state(t);
     const struct kernel_credentials *detached=0;
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-        if (!s || s->tracer!=caller || t->proc_exiting) return -KERNEL_ESRCH;
+        if (!s || s->tracer!=caller || t->proc_exiting ||
+            kernel_pid_number_in(process_identity(t,KERNEL_PID_TID),process_pid_active(caller))!=tid) return -KERNEL_ESRCH;
         if (request==INTERRUPT) {
             if (!s->seized) return -KERNEL_EIO;
             request_stop_locked(t,STOP_STATUS(5,TRACE_STOP)); return 0;
@@ -610,7 +649,7 @@ int64_t kernel_ptrace_request(struct kernel_task *caller,uint64_t request,int32_
         case CONT: case SYSCALL: case DETACH:
             if (data>64) return -KERNEL_EIO;
             s->resume_signal=(unsigned)data; s->syscalls=request==SYSCALL;
-            s->resume_sender=process_identity_number(caller,KERNEL_PID_TGID);
+            s->resume_sender=kernel_pid_number_in(process_identity(caller,KERNEL_PID_TID),process_pid_active(t));
             s->resume_uid=kernel_credentials_task_locked(caller)->uid;
             if (request==DETACH) detached=unlink_locked(t);
             resume_locked(s); break;

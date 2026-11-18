@@ -7,6 +7,9 @@
 #include <kernel/ipc_namespace.h>
 #include <stdlib.h>
 
+/* No namespace shutdown is admitted by this MM-only fixture. */
+void exited_append_locked(struct kernel_task *task) {(void)task;abort();}
+
 #define REMOVE_BASE UINT64_C(0x700000)
 #define REMOVE_ALIAS UINT64_C(0x800000)
 #define REMOVE_PRIVATE UINT64_C(0x900000)
@@ -282,8 +285,8 @@ static void remove_sysv_case(struct kernel_heap *heap,struct physical_page_alloc
 {
     assert(!kernel_shm_init(heap,pages));int32_t id;uint64_t address,alias;
     assert(!kernel_shm_get(0,0,3*BOAROS_PAGE_SIZE,0600,&id));
-    assert(!kernel_shm_at_mm(&mm,1,id,REMOVE_BASE,0,&address));
-    assert(!kernel_shm_at_mm(&mm,1,id,REMOVE_ALIAS,0,&alias));
+    assert(!kernel_shm_at_mm(&mm,NULL,id,REMOVE_BASE,0,&address));
+    assert(!kernel_shm_at_mm(&mm,NULL,id,REMOVE_ALIAS,0,&alias));
     remove_store(&mm,address+BOAROS_PAGE_SIZE,0x69);
     assert(remove_byte(&mm,alias+BOAROS_PAGE_SIZE)==0x69);
     struct kernel_mm child={0};assert(!kernel_mm_fork(&child,&mm));

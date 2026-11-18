@@ -5924,12 +5924,13 @@ int kernel_vfs_file_generated(const struct kernel_vfs_file *file)
 int kernel_vfs_file_snapshot(const struct kernel_vfs_file *file,
                              struct kernel_heap *heap,
                              struct kernel_namespace *ipc_namespace,
+                             struct kernel_pid_registry *pid_view,
                              char **buffer, size_t *length)
 {
     if (!kernel_vfs_file_generated(file) || !heap || !buffer || *buffer ||
         !length) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = file->mount->private_data;
-    return instance->ops->snapshot(file->private_data, heap, ipc_namespace, buffer, length);
+    return instance->ops->snapshot(file->private_data, heap, ipc_namespace, pid_view, buffer, length);
 }
 
 int kernel_vfs_node_writeback(struct kernel_vfs_node *node,

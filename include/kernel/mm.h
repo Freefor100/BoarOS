@@ -386,6 +386,9 @@ enum kernel_mm_status kernel_mm_shmdt(
     uint64_t address);
 
 /* Success consumes one reference; last-reference cleanup can retain VFS owners. */
+struct kernel_task;
+/* Cleanup workers preserve the initiating task for VMA close accounting. */
+enum kernel_mm_status kernel_mm_release_for_task(struct kernel_mm *,const struct kernel_task *);
 enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm);
 
 /* MM句柄owner覆盖此无等待快照；保护页仍占用RSS，高水位跨unmap保留。 */

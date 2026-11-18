@@ -42,5 +42,6 @@ int64_t kernel_msg_receive(struct kernel_task *, struct kernel_mm *, int32_t id,
 void kernel_msg_abort(struct kernel_task *);
 /* Slot cursor starts at zero. Copy one live row under index/object protection;
  * the returned descriptor owns no queue, PID, message or wait references. */
-int kernel_msg_proc_next(struct kernel_namespace *,uint32_t *cursor, int32_t *id, struct kernel_msqid64_ds *row);
+struct kernel_pid_registry;
+int kernel_msg_proc_next(struct kernel_namespace *,struct kernel_pid_registry *,uint32_t *cursor, int32_t *id, struct kernel_msqid64_ds *row);
 #endif

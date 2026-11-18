@@ -59,7 +59,7 @@ int kernel_task_tty_find_group(struct kernel_task *task, kernel_pid_t number,
                                struct kernel_pid **out)
 {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-    struct kernel_pid *group = kernel_pid_find(&scheduler.identities, number);
+    struct kernel_pid *group = kernel_pid_find(process_pid_active(task), number);
     *out = 0;
     if (!group)
         return -KERNEL_ESRCH;

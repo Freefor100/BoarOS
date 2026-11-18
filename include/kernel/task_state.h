@@ -256,6 +256,8 @@ struct kernel_task {
     struct kernel_thread_completion completion;
     struct kernel_files files;
     struct kernel_fs_context fs;
+    /* NULL means active (owned by the TID identity); an override owns a ref. */
+    struct kernel_pid_registry *pid_for_children;
     struct arch_fpu_state fpu;
     struct kernel_mm mm;
     struct kernel_exec_transaction *exec_transaction;
@@ -293,6 +295,7 @@ struct kernel_task {
 #if !defined(BOAROS_ARCH_LOONGARCH)
     uint8_t vector_control;
 #endif
+    uint8_t signal_unkillable; /* group-owned namespace-init disposition policy */
     struct kernel_mqueue_request *mqueue_request;
     struct kernel_io_priority_context *io_priority;
     struct kernel_files_change *files_change;

@@ -90,6 +90,16 @@ struct socket_ipv6_member {
     uint8_t index;
     uint8_t active; /* Owns a reference in the current IPv6 netif generation. */
 };
+struct unix_credentials {
+    struct kernel_pid *pid;
+    uint32_t uid,gid;
+};
+static void unix_cred_release(struct unix_credentials *cred)
+{
+    if(cred->pid)kernel_task_identity_put(cred->pid);
+    cred->pid=NULL;
+}
+
 struct kernel_socket {
     struct kernel_heap *heap;
     struct kernel_raw_lock endpoint_lock;
@@ -164,7 +174,7 @@ struct kernel_socket {
     struct kernel_socket *unix_peers, *unix_peer_next, **unix_peer_previous;
     struct kernel_wait_node unix_space;
     unsigned unix_space_wait;
-    struct kernel_socket_peercred peercred;
+    struct unix_credentials peercred;
     struct kernel_socket_control *rights_head;
     struct kernel_open_file_description *gc_file;
     struct kernel_socket *gc_next, *gc_work;
@@ -1233,6 +1243,7 @@ static int unix_put_locked(struct kernel_socket *socket)
 static void unix_storage_free(struct kernel_socket *socket)
 {
     unix_name_put(socket->unix_name);
+    unix_cred_release(&socket->peercred);
     kernel_heap_release(socket->heap,socket);
 }
 static void unix_put(struct kernel_socket *socket)
@@ -1243,15 +1254,20 @@ static void unix_put(struct kernel_socket *socket)
     kernel_irq_lock_release(&state);
     if(release)unix_storage_free(socket);
 }
-static struct kernel_socket_peercred unix_current_cred(void)
+static struct unix_credentials unix_current_cred(void)
 {
     const struct kernel_credentials *cred=kernel_credentials_current();
-    kernel_pid_t pid=0;struct kernel_task *task=kernel_task_current();
-    if(task && kernel_task_tgid(task,&pid)!=KERNEL_TASK_STATUS_OK)__builtin_trap();
-    return (struct kernel_socket_peercred){.pid=(int32_t)pid,.uid=cred->euid,.gid=cred->egid};
+    struct kernel_pid *pid=NULL;
+    if(kernel_task_current() && kernel_task_identity_get(0,&pid))__builtin_trap();
+    return (struct unix_credentials){.pid=pid,.uid=cred->euid,.gid=cred->egid};
 }
 int kernel_socket_peercred(struct kernel_socket *socket,struct kernel_socket_peercred *cred)
-{ SOCKET_ENDPOINT(state,socket);*cred=socket->peercred;return 0; }
+{
+    SOCKET_ENDPOINT(state,socket);
+    *cred=(struct kernel_socket_peercred){.pid=kernel_task_identity_user_number(socket->peercred.pid),
+        .uid=socket->peercred.uid,.gid=socket->peercred.gid};
+    return 0;
+}
 static unsigned unix_name_hash(const unsigned char *name,unsigned length,unsigned type)
 {
     uint32_t hash=type;
@@ -2196,7 +2212,7 @@ static err_t socket_tcp_accepted(void *context, struct tcp_pcb *pcb,
       child->send_timeout_ns=listener->send_timeout_ns; }
     child->listener = listener; child->pending_ready = 1;
     child->heap = listener->heap;
-    child->peercred=(struct kernel_socket_peercred){.uid=UINT32_MAX,.gid=UINT32_MAX};
+    child->peercred=(struct unix_credentials){.uid=UINT32_MAX,.gid=UINT32_MAX};
     child->family = listener->family;
     child->v6only = listener->v6only;
     child->rx_limit = listener->rx_limit;
@@ -2268,7 +2284,7 @@ static void unix_initialize(struct kernel_socket *socket,struct kernel_heap *hea
     socket->heap=heap;socket->type=(uint8_t)type;socket->family=KERNEL_SOCKET_AF_UNIX;
     socket->domain=KERNEL_SOCKET_DOMAIN_UNIX;socket->unix_references=1;
     {KERNEL_LOCK_SCOPE(gc);rights_acquire(&gc);socket->gc_next=unix_sockets;unix_sockets=socket;}
-    socket->rx_limit=socket->tx_limit=212992;socket->peercred=(struct kernel_socket_peercred){.uid=UINT32_MAX,.gid=UINT32_MAX};
+    socket->rx_limit=socket->tx_limit=212992;socket->peercred=(struct unix_credentials){.uid=UINT32_MAX,.gid=UINT32_MAX};
     kernel_wait_queue_init(&socket->wait);kernel_wait_queue_init(&socket->async_events);
 }
 
@@ -2301,10 +2317,10 @@ int kernel_socket_create(struct kernel_heap *heap, int family, int type, int pro
         socket->heap=heap;socket->type=(uint8_t)type;socket->family=(uint8_t)family;
         socket->domain=KERNEL_SOCKET_DOMAIN_NETLINK;socket->netlink_references=1;
         socket->rx_limit=socket->tx_limit=212992;
-        socket->peercred=(struct kernel_socket_peercred){.uid=UINT32_MAX,.gid=UINT32_MAX};
+        socket->peercred=(struct unix_credentials){.uid=UINT32_MAX,.gid=UINT32_MAX};
         kernel_wait_queue_init(&socket->wait);kernel_wait_queue_init(&socket->async_events);*owner=socket;return 0;
     }
-    socket->peercred=(struct kernel_socket_peercred){.uid=UINT32_MAX,.gid=UINT32_MAX};
+    socket->peercred=(struct unix_credentials){.uid=UINT32_MAX,.gid=UINT32_MAX};
     kernel_socket_protocol_enter(&old_status);
     kernel_socket_network_initialize();
     socket->heap = heap;
@@ -2359,7 +2375,8 @@ int kernel_socket_pair(struct kernel_heap *heap,int type,
     if(result)return result;
     result=kernel_socket_create(heap,KERNEL_SOCKET_AF_UNIX,type, 0,&b);
     if(result) {kernel_socket_destroy(a);return result;}
-    struct kernel_socket_peercred cred=unix_current_cred();
+    struct unix_credentials cred=unix_current_cred();
+    if(cred.pid)kernel_task_identity_retain(cred.pid);
     SOCKET_STATE(state);
     a->connected=b->connected=1;a->peercred=b->peercred=cred;
     unix_link_peer_locked(a,b);unix_link_peer_locked(b,a);
@@ -2472,7 +2489,7 @@ static uint32_t netlink_next_port=0x80000000U;
 static int netlink_bind(struct kernel_socket *socket,uint32_t port,int automatic)
 {
     kernel_pid_t pid=0;
-    if(!port && kernel_task_current())(void)kernel_task_tgid(kernel_task_current(),&pid);
+    if(!port && kernel_task_current())(void)kernel_task_user_tgid(kernel_task_current(),&pid);
     uint32_t preferred=(uint32_t)pid;
     SOCKET_STATE(state);
     if(socket->netlink_port)return automatic || !port || socket->netlink_port==port?0:-KERNEL_EINVAL;
@@ -2816,7 +2833,8 @@ static __attribute__((noinline)) int unix_connect(struct kernel_socket *socket,c
     enum kernel_heap_status status=kernel_heap_allocate_zeroed(socket->heap,1,sizeof(*entry),(void **)&entry);
     if(status!=KERNEL_HEAP_STATUS_OK) {unix_put(target);kernel_socket_destroy(child);return -KERNEL_ENOMEM;}
     uint64_t deadline=unix_deadline(socket);
-    struct kernel_socket_peercred cred=unix_current_cred();
+    struct unix_credentials cred __attribute__((cleanup(unix_cred_release)))=unix_current_cred();
+    struct unix_credentials retired __attribute__((cleanup(unix_cred_release)))={0};
     for(;;) {
         KERNEL_LOCK_SCOPE(gc);rights_acquire(&gc);
         SOCKET_STATE(state);
@@ -2833,7 +2851,9 @@ static __attribute__((noinline)) int unix_connect(struct kernel_socket *socket,c
             child->unix_name=target->unix_name;unix_name_get_locked(child->unix_name);
             child->unix_path=child->unix_name->path;
             child->passcred=target->passcred;
-            child->peercred=cred;socket->peercred=target->peercred;
+            child->peercred=cred;cred.pid=NULL;
+            retired=socket->peercred;socket->peercred=target->peercred;
+            if(socket->peercred.pid)kernel_task_identity_retain(socket->peercred.pid);
             child->connected=socket->connected=1;socket->peer_closed=0;
             unix_link_peer_locked(socket,child);unix_link_peer_locked(child,socket);
             child->listener=target;child->pending_ready=1;entry->child=child;
@@ -2852,12 +2872,13 @@ int kernel_socket_listen(struct kernel_socket *socket, int backlog)
 {
     if(socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK)return -KERNEL_EOPNOTSUPP;
     if(socket->domain==KERNEL_SOCKET_DOMAIN_UNIX) {
-        struct kernel_socket_peercred cred=unix_current_cred();
+        struct unix_credentials cred __attribute__((cleanup(unix_cred_release)))=unix_current_cred();
+        struct unix_credentials retired __attribute__((cleanup(unix_cred_release)))={0};
         SOCKET_STATE(state);
         if(!socket_connection_oriented(socket))return -KERNEL_EOPNOTSUPP;
         if(!socket->unix_name || socket->connected)return -KERNEL_EINVAL;
         socket->listening=1;socket->unix_backlog=(unsigned)backlog>4096U?4096U:(unsigned)backlog;
-        socket->peercred=cred;wake_socket(socket);return 0;
+        retired=socket->peercred;socket->peercred=cred;cred.pid=NULL;wake_socket(socket);return 0;
     }
     struct kernel_socket_protocol_scope scope; socket_protocol_enter(&scope,socket);
     err_t error = ERR_OK;

@@ -74,8 +74,8 @@ int64_t kernel_bpf_perf_open(struct kernel_task *task,uint64_t address,
     struct kernel_task *target=NULL;
     if(pid!=-1){
         kernel_pid_t tid;
-        if(pid==0){if(kernel_task_tid(task,&tid))__builtin_trap();pid=(int32_t)tid;}
-        target=kernel_task_find_by_tid(pid);
+        if(pid==0){if(kernel_task_user_tid(task,&tid))__builtin_trap();pid=(int32_t)tid;}
+        target=kernel_task_find_user_tid(task,pid);
         if(!target)return -KERNEL_ESRCH;
         if(!kernel_task_has_user_context(target)){error=-KERNEL_ESRCH;goto target_error;}
     }

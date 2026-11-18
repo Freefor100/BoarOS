@@ -23,6 +23,7 @@
    - 普通段使用 `struct kernel_memory_object` 提供基页后备；大页段使用 `kernel_hugetlb_map` 的共享后备，复用匿名共享大页的真实高阶物理页和 PMD 叶，不创建普通页伪装大页。两者均按需缺页。
    - 段所有权由内核段表统一管理，MM registry 持有后备对象引用，同一 MM 的同一大页段只登记一次，多个附加复用；每次逻辑附加另有 `kernel_shm_attachment` owner，持有后备引用、固定 shmid 身份和原始起止地址。VMA 片段拥有 attachment 引用。
    - `shmat` 给 MM registry 新取得的内存对象引用先由局部 owner 持有，再移动给 registry；分配或映射失败只消费临时 owner，不改变段表引用。
+   - cpid/lpid 保留规范 TGID 身份，syscall 按当前读取者 PID namespace 输出，proc 按 OFD 打开时保留的 PID namespace 输出；退出与数字复用不改变旧 owner。异步 MM/VMA 销毁显式携带操作主体，不能记为 cleanup worker。共享 MM 非最后引用释放不更新 lpid；fork 的 VMA open 记录父任务。身份及锁外回收契约见 [PID namespace](pid-namespace.md#sysv-ipc-的-pid-身份与读取者视图)。
 2. **段标识符与代次序列隔离**：
    - 最大段数量由 `KERNEL_SHMMNI`（128）固定。
    - `shmid = slot_index + seq * KERNEL_SHMMNI`。

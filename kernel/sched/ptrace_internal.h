@@ -21,6 +21,8 @@ struct kernel_ptrace_state {
 int ptrace_clone_prepare(struct kernel_task *);
 int ptrace_clone_locked(struct kernel_task *,struct kernel_task *,uint64_t);
 void ptrace_event(struct kernel_task *,unsigned,uint64_t);
+/* Caller retains the identity through a possibly sleeping event stop. */
+void ptrace_event_pid(struct kernel_task *,unsigned,const struct kernel_pid *);
 void ptrace_begin_exit(struct kernel_task *,uint32_t);
 void ptrace_terminate_locked(struct kernel_task *);
 int ptrace_publish_final_locked(struct kernel_task *,struct kernel_ptrace_notice *);

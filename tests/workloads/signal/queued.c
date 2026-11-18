@@ -119,8 +119,47 @@ static void reserved_numbers(void)
 #include "queued_threads.h"
 #include "queued_lifecycle.h"
 #include "queued_control.h"
+/* Run only as the real guest PID 1, not as a normal native process. */
+static volatile sig_atomic_t init_handled;
+static void init_handler(int sig) { if(sig==SIGUSR1)init_handled++; }
+static void init_signal_policy(void)
+{
+    CHECK(getpid()==1);
+    CHECK(!kill(1,SIGTERM));
+    CHECK(!kill(1,SIGKILL));
+    CHECK(!syscall(SYS_tgkill,1,syscall(SYS_gettid),SIGSTOP));
+    struct sigaction action={.sa_handler=init_handler},old_action;
+    sigemptyset(&action.sa_mask);
+    CHECK(!sigaction(SIGUSR1,&action,&old_action));
+    CHECK(!kill(1,SIGUSR1) && init_handled==1);
+    CHECK(!sigaction(SIGUSR1,&old_action,NULL));
+    sigset_t set,old,pending_set;sigemptyset(&set);sigaddset(&set,SIGTERM);
+    CHECK(!sigprocmask(SIG_BLOCK,&set,&old));
+    CHECK(!kill(1,SIGTERM));
+    CHECK(!sigpending(&pending_set) && sigismember(&pending_set,SIGTERM)==1);
+    siginfo_t info;struct timespec zero={0};
+    CHECK(sigtimedwait(&set,&info,&zero)==SIGTERM && info.si_pid==1);
+    CHECK(!kill(1,SIGTERM));
+    CHECK(!sigprocmask(SIG_SETMASK,&old,NULL));
+    CHECK(!sigpending(&pending_set) && !sigismember(&pending_set,SIGTERM));
+    pid_t child=fork();CHECK(child>=0);
+    if(!child)_exit(kill(getppid(),SIGKILL)?91:0);
+    if(child>0){int status;CHECK(waitpid(child,&status,0)==child && !status);}
+    puts("QUEUED INIT defaults-handlers-blocked-child-kill PASS");
+}
+static pthread_t init_leader;
+static void *init_exec_worker(void *unused)
+{
+    (void)unused;if(pthread_join(init_leader,NULL))_exit(92);
+    execl("/init","/init","--init-policy-exec",(char *)NULL);_exit(93);
+}
+
 int main(int argc,char **argv)
 {
+    if(argc==2 && !strcmp(argv[1],"--init-policy-exec")){
+        setvbuf(stdout,0,_IONBF,0);init_signal_policy();
+        printf("QUEUED INIT nonleader-exec PASS\nQUEUED END failures=%u\n",failures);return failures?1:0;
+    }
     if(argc>1&&!strcmp(argv[1],"--queued-tid-exec"))return queued_tid_exec_check(argc,argv);
     if(argc>1&&!strcmp(argv[1],"--queued-exec"))return queued_exec_check(argc,argv);
     setvbuf(stdout,0,_IONBF,0);alarm(15);
@@ -131,6 +170,12 @@ int main(int argc,char **argv)
     FILE *selection=fopen("/queued-select","r");if(selection){char name[16]={0};fscanf(selection,"%15s",name);fclose(selection);
         if(!strcmp(name,"fatal"))queued_fatal();else if(!strcmp(name,"times"))queued_child_times();else if(!strcmp(name,"life"))queued_lifecycle();else CHECK(0);
         printf("QUEUED END failures=%u\n",failures);return failures?1:0;}
+    if(getpid()==1)init_signal_policy();
     queued_observe();pending();payload();import_bounds();send_limits();reserved_numbers();signal_fd_cases();queued_threads();queued_lifecycle();queued_child_times();queued_fatal();queued_competition();queued_control_cases();queued_observe_finish();
+    if(getpid()==1 && !failures){
+        pthread_t worker;init_leader=pthread_self();
+        CHECK(!pthread_create(&worker,NULL,init_exec_worker,NULL));
+        if(!failures)pthread_exit(NULL);
+    }
     printf("QUEUED END failures=%u\n",failures);return failures?1:0;
 }

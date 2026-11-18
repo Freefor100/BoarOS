@@ -52,6 +52,14 @@ struct mount_arguments {
     char target[KERNEL_FS_PATH_MAX];
     struct kernel_mount_parameters parameters;
 };
+static void mount_arguments_initialize(struct mount_arguments *storage)
+{
+    storage->parameters.type[0]=storage->parameters.options[0]=storage->parameters.source[0]=0;
+    storage->parameters.ipc_namespace=NULL;
+    /* Legacy mount chooses the caller view at creation, unlike fsopen's
+     * retained view. Heap contents are not guaranteed to start at zero. */
+    storage->parameters.pid_view=NULL;
+}
 static __attribute__((noinline)) int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context *fs,
                       const struct kernel_syscall_request *request)
 {
@@ -65,8 +73,7 @@ static __attribute__((noinline)) int mount_filesystem(struct kernel_mm *mm, cons
     if(allocation!=KERNEL_HEAP_STATUS_OK)
         return allocation==KERNEL_HEAP_STATUS_EMPTY?-KERNEL_ENOMEM:-KERNEL_EIO;
     char *target=storage->target,*source_name=storage->parameters.source,*type=storage->parameters.type,*options=storage->parameters.options;
-    type[0]=options[0]=source_name[0]=0;
-    storage->parameters.ipc_namespace=NULL;
+    mount_arguments_initialize(storage);
     int result;
     if (request->arguments[2]) {
         result=import_string(mm,(flags&(LINUX_MS_BIND|LINUX_MS_MOVE))?target:type,

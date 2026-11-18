@@ -69,7 +69,7 @@ static void namespaces_and_quota(struct kernel_heap *heap,struct kernel_hstate *
  host_ipc_namespace=left;int32_t id,other,rejected=-1;uint64_t a;
  assert(!kernel_shm_get(0,321,KERNEL_SHMMAX,KERNEL_IPC_CREAT|KERNEL_SHM_HUGETLB|KERNEL_SHM_NORESERVE|0600,&id));
  assert(kernel_shm_get(0,0,1,0600,&rejected)==-KERNEL_ENOSPC);
- assert(!kernel_shm_at_mm(mm,123,id,0,0,&a));put(mm,a,61);
+ assert(!kernel_shm_at_mm(mm,NULL,id,0,0,&a));put(mm,a,61);
  assert(!ctl(id,KERNEL_IPC_RMID,0));
  assert(kernel_shm_get(0,0,1,0600,&rejected)==-KERNEL_ENOSPC);
  host_ipc_namespace=right;
@@ -114,14 +114,14 @@ int main(void)
  assert(kernel_shm_get(0,0,1,KERNEL_SHM_HUGETLB|0600,&rejected)==-KERNEL_ENOMEM&&!fail_allocation&&rejected==-1);stats(h,3,1,1);
  for(unsigned failure=1;failure<=2;failure++) {
    fail_allocation=failure;
-   assert(kernel_shm_at_mm(&parent,123,id,HUGE,0,&a)==-KERNEL_ENOMEM&&!fail_allocation);
+   assert(kernel_shm_at_mm(&parent,NULL,id,HUGE,0,&a)==-KERNEL_ENOMEM&&!fail_allocation);
    assert(!ctl(id,KERNEL_IPC_STAT,&ds)&&!ds.shm_nattch);stats(h,3,1,1);
  }
 
- assert(kernel_shm_at_mm(&parent,123,id,HUGE+4096,0,&a)==-KERNEL_EINVAL);
- assert(!kernel_shm_at_mm(&parent,123,id,HUGE+1,KERNEL_SHM_RND,&a)&&a==HUGE);stats(h,3,1,1);
- assert(!kernel_shm_at_mm(&parent,123,id,3*HUGE,0,&b));stats(h,3,1,1);
- assert(!kernel_shm_at_mm(&parent,123,id,3*HUGE,KERNEL_SHM_REMAP,&b));
+ assert(kernel_shm_at_mm(&parent,NULL,id,HUGE+4096,0,&a)==-KERNEL_EINVAL);
+ assert(!kernel_shm_at_mm(&parent,NULL,id,HUGE+1,KERNEL_SHM_RND,&a)&&a==HUGE);stats(h,3,1,1);
+ assert(!kernel_shm_at_mm(&parent,NULL,id,3*HUGE,0,&b));stats(h,3,1,1);
+ assert(!kernel_shm_at_mm(&parent,NULL,id,3*HUGE,KERNEL_SHM_REMAP,&b));
  assert(!ctl(id,KERNEL_IPC_STAT,&ds)&&ds.shm_nattch==2);stats(h,3,1,1);
  put(&parent,a+12345,42);assert(get(&parent,b+12345)==42);stats(h,2,0,1);
  struct kernel_mm_user_pin pin={0};assert(!kernel_mm_pin_user_page(&parent,a+12345,KERNEL_MM_READ,&pin));
@@ -129,14 +129,14 @@ int main(void)
  struct kernel_shm_info info;assert(!ctl(0,KERNEL_SHM_INFO,&info)&&info.used_ids==1&&info.shm_tot==1&&info.shm_rss==512);
  assert(!kernel_mm_fork(&child,&parent));put(&child,b+12345,99);assert(get(&parent,a+12345)==99);
  assert(!ctl(id,KERNEL_IPC_STAT,&ds)&&ds.shm_nattch==4);
- assert(!ctl(id,KERNEL_IPC_RMID,0));assert(!kernel_shm_at_mm(&parent,123,id,5*HUGE,KERNEL_SHM_RDONLY,&b));
+ assert(!ctl(id,KERNEL_IPC_RMID,0));assert(!kernel_shm_at_mm(&parent,NULL,id,5*HUGE,KERNEL_SHM_RDONLY,&b));
  assert(kernel_mm_mprotect(&parent,b,HUGE,KERNEL_MM_READ|KERNEL_MM_WRITE)==KERNEL_MM_STATUS_ACCESS);
  assert(!kernel_shm_dt_mm(&parent,a));assert(!kernel_shm_dt_mm(&parent,3*HUGE));assert(!kernel_shm_dt_mm(&parent,b));stats(h,2,0,1);
  assert(!kernel_mm_release(&child));child=(struct kernel_mm){0};stats(h,3,0,0);
  assert(ctl(id,KERNEL_IPC_STAT,&ds)==-KERNEL_EINVAL);
  /* Creation reserves; unattached RMID and namespace destruction release it. */
  id=create(HUGE+1,0);stats(h,3,2,1);assert(!ctl(id,KERNEL_IPC_RMID,0));stats(h,3,0,0);
- id=create(4*HUGE,KERNEL_SHM_NORESERVE);assert(!kernel_shm_at_mm(&parent,123,id,0,0,&a));stats(h,3,0,1);
+ id=create(4*HUGE,KERNEL_SHM_NORESERVE);assert(!kernel_shm_at_mm(&parent,NULL,id,0,0,&a));stats(h,3,0,1);
  for(unsigned i=0;i<3;i++)put(&parent,a+i*HUGE,10+i);
  assert(kernel_mm_resolve_user_fault(&parent,a+3*HUGE,KERNEL_MM_WRITE)==KERNEL_MM_STATUS_BUS_FAULT);
  assert(!ctl(id,KERNEL_IPC_RMID,0));assert(!kernel_shm_dt_mm(&parent,a));stats(h,3,0,0);

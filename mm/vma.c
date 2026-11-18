@@ -520,7 +520,7 @@ enum kernel_vma_status kernel_vma_set_fork(
     return status;
 }
 
-enum kernel_vma_status kernel_vma_set_destroy(struct kernel_vma_set **set)
+enum kernel_vma_status kernel_vma_set_destroy_for_task(struct kernel_vma_set **set,const struct kernel_task *task)
 {
     struct kernel_vma_set *working;
 
@@ -532,7 +532,7 @@ enum kernel_vma_status kernel_vma_set_destroy(struct kernel_vma_set **set)
         for (uint32_t i = 0; i < working->count; i++) {
             const struct kernel_vma *entry=&working->entries[i];
             account_shared_write(entry,entry->end-entry->start,0);
-            if (entry->shm_attachment) kernel_shm_attachment_close(entry->shm_attachment);
+            if (entry->shm_attachment) kernel_shm_attachment_close_for_task(entry->shm_attachment,task);
         }
         kernel_heap_release(working->heap, working->entries);
         working->entries = 0;
@@ -1131,3 +1131,6 @@ enum kernel_vma_status kernel_vma_set_trim_end(
     set->generation++;
     return KERNEL_VMA_STATUS_OK;
 }
+
+enum kernel_vma_status kernel_vma_set_destroy(struct kernel_vma_set **set)
+{ return kernel_vma_set_destroy_for_task(set,kernel_task_current()); }

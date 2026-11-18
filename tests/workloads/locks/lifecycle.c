@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sched.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -107,6 +108,33 @@ static void shared_table_test(void)
     check(close(fd) == 0 && close(other) == 0, "shared close");
 }
 
+static int set_shared_lock(void *arg)
+{
+    struct flock lock = write_lock(40);
+    return fcntl(*(int *)arg, F_SETLK, &lock) < 0;
+}
+
+static void historical_owner_test(int initial_view)
+{
+    int fd = open(path, O_RDWR), status;
+    check(fd >= 0, "shared locker open");
+    char *stack = malloc(65536);
+    check(stack != NULL, "shared locker stack");
+    pid_t child = clone(set_shared_lock, stack + 65536, CLONE_FILES | SIGCHLD, &fd);
+    check(child > 0 && waitpid(child, &status, 0) == child &&
+          WIFEXITED(status) && !WEXITSTATUS(status), "reap shared locker");
+    free(stack);
+    struct flock lock = write_lock(40);
+    check(!fcntl(fd, F_OFD_GETLK, &lock) && lock.l_type == F_WRLCK &&
+          lock.l_pid == (initial_view ? child : 0), "exited locker in caller view");
+    lock = write_lock(41);
+    check(!fcntl(fd, F_OFD_SETLK, &lock), "OFD holder");
+    lock = write_lock(41);
+    check(!fcntl(fd, F_GETLK, &lock) && lock.l_type == F_WRLCK &&
+          lock.l_pid == -1, "OFD conflict has no PID");
+    check(!close(fd), "release shared locks");
+}
+
 static void reused_fd_test(void)
 {
     held_fd = open(path, O_RDWR);
@@ -206,6 +234,7 @@ int main(void)
     path = getenv("LOCK_TEST_PATH");
     if (!path) path = "/lockdata";
     shared_table_test();
+    historical_owner_test(1);
     reused_fd_test();
     reused_traditional_fd_test();
     forced_exit_test();

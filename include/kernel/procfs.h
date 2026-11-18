@@ -9,6 +9,9 @@ struct kernel_vfs_file;
 struct kernel_pid;
 
 /* The caller owns an unattached mount until attach succeeds. */
+struct kernel_pid_registry;
+int kernel_procfs_create_in(struct kernel_heap *, uint64_t,
+    struct kernel_pid_registry *, struct kernel_vfs_mount **);
 int kernel_procfs_create(struct kernel_heap *heap, uint64_t flags,
                          struct kernel_vfs_mount **owner);
 int kernel_procfs_is_mount(const struct kernel_vfs_mount *mount);

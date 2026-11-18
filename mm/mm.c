@@ -4670,7 +4670,7 @@ enum kernel_mm_status kernel_mm_activate(const struct kernel_mm *next,uint64_t k
 enum kernel_mm_status kernel_mm_activate_for_task(const struct kernel_mm *next,uint64_t kernel_context)
 { return activate_mm(next,kernel_context,1); }
 
-enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
+enum kernel_mm_status kernel_mm_release_for_task(struct kernel_mm *mm,const struct kernel_task *task)
 {
     KERNEL_NO_RECLAIM_IO;
     struct kernel_mm_record *record;
@@ -4763,7 +4763,7 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
         record->resident_buckets = 0;
         record->resident_capacity = 0;
         if (record->vmas != 0) {
-            vma_status = kernel_vma_set_destroy(&record->vmas);
+            vma_status = kernel_vma_set_destroy_for_task(&record->vmas,task);
             if (vma_status != KERNEL_VMA_STATUS_OK) {
                 return KERNEL_MM_STATUS_STATE;
             }
@@ -7854,3 +7854,6 @@ int kernel_mm_mincore(struct kernel_mm *mm, uint64_t address, unsigned count,
     }
     return 0;
 }
+
+enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
+{ return kernel_mm_release_for_task(mm,kernel_task_current()); }

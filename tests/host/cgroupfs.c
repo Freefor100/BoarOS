@@ -26,7 +26,7 @@ static void text(struct kernel_vfs_mount *m,uint64_t dir,const char *name,const 
     struct kernel_vfs_node *node=f.private_data;
     assert(node->max_size==UINT64_MAX);
     if(!(node->generated_control&KERNEL_VFS_CONTROL_READ)){
-        char *data=NULL;size_t size=0;assert(!ops(m)->snapshot(node,&heap,NULL,&data,&size));
+        char *data=NULL;size_t size=0;assert(!ops(m)->snapshot(node,&heap,NULL,NULL,&data,&size));
         assert(size==strlen(expected)&&!memcmp(data,expected,size));
         kernel_heap_release(&heap,data);close_file(&f);return;
     }

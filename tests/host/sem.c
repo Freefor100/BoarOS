@@ -14,6 +14,14 @@ _Thread_local uintptr_t sync_test_irq = 2;
 static _Thread_local struct kernel_cpu cpu = {.initialized = KERNEL_CPU_INITIALIZED};
 static struct kernel_task task[4];
 static struct kernel_pid pid[4];
+static struct kernel_pid_registry root_pid_view;
+kernel_pid_t kernel_task_identity_user_number(const struct kernel_pid *p)
+{
+    struct kernel_pid *self=cpu.current->identities[KERNEL_PID_TGID].identity;
+    if(!self)self=cpu.current->group_leader->identities[KERNEL_PID_TGID].identity;
+    return kernel_pid_number_in(p,self->registry);
+}
+
 static struct kernel_heap heap;
 static unsigned allocations;
 static _Thread_local int fail_at = -1;
@@ -92,12 +100,12 @@ enum kernel_uaccess_status kernel_copy_to_user(struct kernel_mm *m, uint64_t d, 
 {
     return kernel_copy_from_user(m, (void *)(uintptr_t)d, (uintptr_t)s, n, c);
 }
-void kernel_pid_get(struct kernel_pid *p)
+void __wrap_kernel_pid_get(struct kernel_pid *p)
 {
     assert(cpu.raw_locks && cpu.raw_locks->lock == &kernel_wait_domain && p && p->references);
     p->references++;
 }
-void kernel_pid_put(struct kernel_pid *p)
+void __wrap_kernel_pid_put(struct kernel_pid *p)
 {
     assert(cpu.raw_locks && cpu.raw_locks->lock == &kernel_wait_domain && p && p->references > 1);
     p->references--;
@@ -551,6 +559,23 @@ static void initial_shutdown(void)
     assert(!kernel_ipc_initial_shutdown());
     puts("PASS initial shutdown rejects live refs without mutation and releases real tables/sets");
 }
+static void pid_views(void)
+{
+    struct kernel_pid_registry inner={.depth=1,.parent=&root_pid_view},sibling={.depth=1,.parent=&root_pid_view};
+    struct {struct kernel_pid id;struct kernel_pid_binding ancestor;} owner={
+        .id={.number=1,.references=1,.registry=&inner},.ancestor={.registry=&root_pid_view,.number=101}};
+    struct kernel_pid observer={.number=1,.references=1,.registry=&sibling};
+    task[0].identities[KERNEL_PID_TGID].identity=&owner.id;
+    task[1].identities[KERNEL_PID_TGID].identity=&observer;
+    current(0);int id=kernel_sem_get(cpu.current,0,1,0600);assert(id>=0);
+    assert(!ctl(id,0,KERNEL_SEM_SETVAL,3));assert(ctl(id,0,KERNEL_SEM_GETPID,0)==1);
+    current(1);assert(ctl(id,0,KERNEL_SEM_GETPID,0)==0);
+    current(2);assert(ctl(id,0,KERNEL_SEM_GETPID,0)==101);
+    task[0].identities[KERNEL_PID_TGID].identity=&pid[0];
+    assert(ctl(id,0,KERNEL_SEM_GETPID,0)==101 && owner.id.references==2);
+    rm(id);assert(owner.id.references==1);task[1].identities[KERNEL_PID_TGID].identity=&pid[1];current(0);
+    puts("PASS sem PID views ancestor/sibling and retained former owner (modeled roles, production mapping)");
+}
 int main(int argc,char **argv)
 {
     kernel_wait_domain_init();
@@ -560,6 +585,7 @@ int main(int argc,char **argv)
         kernel_raw_lock_init(&task[i].files_access,KERNEL_RAW_RANK_TASK_FILES);
         pid[i].number = (int)i + 10;
         pid[i].references = 1;
+        pid[i].registry = &root_pid_view;
         task[i].identities[KERNEL_PID_TGID].identity = &pid[i];
         task[i].group_leader = &task[i];
     }
@@ -577,6 +603,7 @@ int main(int argc,char **argv)
     forced_exit();
     proc_rows();
     namespace_isolation();
+    pid_views();
     for (unsigned i = 0; i < 4; i++)
         assert(pid[i].references == 1);
     assert(!sem_namespace_table(kernel_ipc_initial(),0)->sets && !sem_namespace_table(kernel_ipc_initial(),0)->members && allocations==1);

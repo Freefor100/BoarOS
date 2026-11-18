@@ -2092,9 +2092,9 @@ test-proc-index-host:
 
 test-sched-concurrency-host:
 	@mkdir -p build/host
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sched_concurrency.c tests/host/signal_owner.c kernel/signal_pending.c kernel/reboot.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/seccomp.c kernel/sched/cgroup.c fs/cgroupfs.c kernel/sched/seccomp.c kernel/sched/lifetime.c kernel/sched/ptrace.c kernel/sched/identity.c kernel/sched/process.c kernel/pid.c kernel/sched/futex_pi.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_sched_policy_charge,--wrap=kernel_sched_policy_set,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release -o build/host/sched-concurrency
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sched_concurrency.c tests/host/signal_owner.c tests/host/pid_namespace_shutdown.c kernel/namespace.c kernel/signal_pending.c kernel/reboot.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/seccomp.c kernel/sched/cgroup.c kernel/sched/seccomp.c fs/cgroupfs.c kernel/sched/lifetime.c tests/host/pid_namespace_ptrace.c kernel/sched/exec.c kernel/sched/proc.c kernel/sched/identity.c kernel/pid.c kernel/sched/futex_pi.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_sched_policy_charge,--wrap=kernel_sched_policy_set,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release -o build/host/sched-concurrency
 	build/host/sched-concurrency
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/process_child_links.c kernel/cpu.c kernel/raw_lock.c -Wl,--gc-sections -o build/host/process-child-links
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/process_child_links.c kernel/sched/identity.c kernel/pid.c kernel/cpu.c kernel/raw_lock.c -Wl,--gc-sections -o build/host/process-child-links
 	build/host/process-child-links
 
 test-riscv: test-scheduler-handoff-riscv
@@ -2452,3 +2452,43 @@ test-riscv-vector-host:
 		build/host/riscv-vector-$$shift; \
 	done
 	python3 -B tests/host/smp_dtb_test.py
+
+.PHONY: test-pid-namespace-host
+test-pid-namespace-host:
+	@mkdir -p build/host
+	@set -e; for shift in 12 14; do \
+	cc -std=c11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=$$shift \
+		-idirafter include -fsanitize=address,undefined tests/host/pid-namespace.c \
+		kernel/pid.c -o build/host/pid-namespace-$$shift; \
+	build/host/pid-namespace-$$shift; done
+
+.PHONY: test-pid-namespace-concurrency-host
+test-pid-namespace-concurrency-host:
+	@mkdir -p build/host
+	@set -e; for shift in 12 14; do \
+	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -pthread -DBOAROS_PAGE_SHIFT=$$shift \
+		-DBOAROS_MAX_CPUS=4 -DBOAROS_LOCK_DEBUG=1 -Itests/host/sync -idirafter include \
+		-fsanitize=address,undefined tests/host/pid-namespace-concurrency.c \
+		kernel/pid.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c -o build/host/pid-namespace-concurrency-$$shift; \
+	build/host/pid-namespace-concurrency-$$shift; done
+
+.PHONY: test-pid-namespace-lifecycle-host
+test-pid-namespace-lifecycle-host:
+	@mkdir -p build/host
+	@set -e; for shift in 12 14; do \
+	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=4 \
+		-DBOAROS_PAGE_SHIFT=$$shift -ffunction-sections -fdata-sections \
+		-Itests/host/sync -idirafter include -fsanitize=address,undefined \
+		tests/host/pid-namespace-lifecycle.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/sched/process.c kernel/pid.c kernel/namespace.c kernel/credentials.c kernel/uts.c kernel/ipc_namespace.c -DBOAROS_UTS_MACHINE=\"host\" \
+		kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c \
+		-Wl,--gc-sections -o build/host/pid-namespace-lifecycle-$$shift; \
+	build/host/pid-namespace-lifecycle-$$shift; done
+
+.PHONY: test-clone3-import-host
+test-clone3-import-host:
+	@mkdir -p build/host
+	@cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_MAX_CPUS=4 -DBOAROS_PAGE_SHIFT=12 \
+		-ffunction-sections -fdata-sections -Itests/host/sync -idirafter include \
+		-fsanitize=address,undefined tests/host/clone3-import.c kernel/syscall/process.c \
+		-Wl,--gc-sections -o build/host/clone3-import
+	@build/host/clone3-import

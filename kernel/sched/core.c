@@ -932,8 +932,8 @@ enum kernel_scheduler_status kernel_scheduler_init(
     scheduler.load_ticks = 0;
     for (unsigned i = 0; i < 3; i++) scheduler.loads[i] = 0;
     scheduler.allocator = allocator;
-    scheduler.identities.numbers = &scheduler.pid_allocator;
-    scheduler.identities.next_generation = 1U;
+    if (kernel_pid_registry_init(&scheduler.identities, &scheduler.pid_allocator, NULL)
+            != KERNEL_PID_STATUS_OK) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     if (kernel_heap_init(&scheduler.identity_heap, allocator, identity_heap_address)
             != KERNEL_HEAP_STATUS_OK) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     scheduler.kernel_context = kernel_context;
@@ -1441,34 +1441,6 @@ void scheduler_task_disposal_notify(void)
 {
     KERNEL_IRQ_SCOPE(disposal_irq);
     (void)kernel_wait_queue_wake_all(&scheduler.cleanup_queue);
-}
-
-int scheduler_forget_task_locked(struct kernel_task *thread, struct kernel_wait_cursor *cursor)
-{
-    if (thread->deadline_indexed) __builtin_trap();
-    process_identity_release_locked(thread);
-    struct kernel_thread_join *join = thread->join;
-    int notify = 0;
-    if (join) {
-        notify = kernel_wait_cursor_prepare(&join->waiters, cursor);
-        join->task = 0;
-        thread->join = 0;
-    }
-    if (scheduler.init_task == thread) scheduler.init_task = 0;
-    scheduler_task_unlink_locked(thread);
-    return notify;
-}
-
-void scheduler_forget_task(struct kernel_task *thread)
-{
-    struct kernel_wait_cursor cursor;
-    int notify;
-    {
-        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        notify = scheduler_forget_task_locked(thread, &cursor);
-    }
-    if (notify) kernel_wait_cursor_wake(&cursor, 1);
-    process_identity_collect();
 }
 
 void kernel_scheduler_system_statistics(uint64_t loads[3], uint16_t *tasks)

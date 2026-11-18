@@ -21,8 +21,14 @@ int scheduler_cpu_clock_resolve(struct kernel_task *caller,int32_t clock,int str
     enum kernel_pid_role role=thread?KERNEL_PID_TID:KERNEL_PID_TGID;
     KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
     struct kernel_pid *identity;
-    if(!number || (!thread&&!strict&&number==caller->tid))identity=process_identity(caller,role);
-    else identity=kernel_pid_find(&scheduler.identities,number);
+    if(!number)identity=process_identity(caller,role);
+    else {
+        identity=kernel_pid_find(process_pid_active(caller),number);
+        /* Only gettime accepts the calling nonleader TID as a process clock.
+         * Compare the resolved identity, never the internal root integer. */
+        if(!thread&&!strict&&identity==process_identity(caller,KERNEL_PID_TID))
+            identity=process_identity(caller,KERNEL_PID_TGID);
+    }
     struct kernel_task *target=identity&&identity->members[role]?identity->members[role]->task:0;
     if(!target || (thread&&(target->group_leader!=caller->group_leader||!thread_clock_visible(target))))return -KERNEL_EINVAL;
     kernel_pid_get(identity);*out=(struct scheduler_cpu_clock){identity,kind,(uint32_t)thread};return 0;

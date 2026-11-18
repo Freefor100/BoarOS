@@ -35,6 +35,7 @@ LA的259仍返回`ENOSYS`。这些入口的直接消费者可用`python3 tests/u
 - `KERNEL_SYSCALL_ACTION_EXIT`：以 `value` 作为退出状态终止当前用户任务。
 - `KERNEL_SYSCALL_ACTION_EXEC`：新映像已经准备完成；不推进旧 `sepc`，由 scheduler 切换 MM 并重建 Trap Frame。
 - `KERNEL_SYSCALL_ACTION_CLONE`：参数符合当前支持的进程/线程 clone 子集；架构 Trap 层把完整寄存器快照交给进程层构造任务。
+- `KERNEL_SYSCALL_ACTION_CLONE3`：两架构共用 clone3 专属处理，在持有寄存器快照的调用内导入参数和指定 TID 数组并同步消费。
 - `KERNEL_SYSCALL_ACTION_WAIT4`：参数保持 Linux ABI 形态，由 scheduler 完成选择、阻塞、唤醒与 zombie 回收。
 - `KERNEL_SYSCALL_ACTION_WAITID`：参数保持 Linux ABI 形态（支持 which, upid, infop, options, rusage），由 scheduler 完成选择、阻塞、唤醒与事件消费/zombie 回收。
 - `KERNEL_SYSCALL_ACTION_YIELD`：忽略无参数调用的残留寄存器，由 scheduler 把当前任务排到其优先级队尾，再按优先级与实时预算资格重选。

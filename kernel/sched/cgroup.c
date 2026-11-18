@@ -25,7 +25,7 @@ int kernel_cgroup_move(struct kernel_cgroup *destination, int32_t tid, int threa
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         if (!destination->linked) return -KERNEL_ENODEV;
-        struct kernel_task *task = tid ? process_find_identity(tid,KERNEL_PID_TID) : kernel_task_current();
+        struct kernel_task *task = tid ? process_find_identity_in(tid,KERNEL_PID_TID,process_pid_active(kernel_task_current())) : kernel_task_current();
         if (!task || !task->accounted || task->retirement || !task->group_leader) return -KERNEL_ESRCH;
         if (!thread) task = task->group_leader;
         /* kernfs authorizes the selected leader even when only another
@@ -71,6 +71,8 @@ static struct kernel_task *representative(struct kernel_task *task, int threads)
 int kernel_cgroup_members_snapshot(struct kernel_cgroup *group, int threads,
     struct kernel_heap *heap, char **buffer, size_t *length)
 {
+    /* The executing reader retains its active view across heap preparation. */
+    struct kernel_pid_registry *view=process_pid_active(kernel_task_current());
     size_t capacity = 0;
     for (;;) {
         {
@@ -92,7 +94,9 @@ int kernel_cgroup_members_snapshot(struct kernel_cgroup *group, int threads,
                 struct kernel_task *member=representative(task,threads);
                 if (!member || membership(member)!=group) continue;
                 if (rows==capacity) {error=-KERNEL_EAGAIN;break;}
-                uint32_t pid=threads?member->tid:member->group_leader->tid;
+                /* Translate under the identity lock and format after releasing it. */
+                uint32_t pid=(uint32_t)kernel_pid_number_in(process_identity(member,
+                    threads?KERNEL_PID_TID:KERNEL_PID_TGID),view);
                 memcpy(data+rows*12,&pid,sizeof(pid));
                 rows++;
             }

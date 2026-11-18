@@ -32,6 +32,7 @@ int kernel_ptrace_group_stop(struct kernel_task *,unsigned);
 void kernel_ptrace_group_continue_locked(struct kernel_task *);
 void kernel_signal_notify_tracer(struct kernel_task *,struct kernel_task *,int why,int status);
 int kernel_ptrace_exec_unsafe(struct kernel_task *);
+uint32_t kernel_ptrace_exec_old_tid(struct kernel_task *);
 void kernel_ptrace_exec(struct kernel_task *,uint32_t old_tid);
 uint32_t kernel_ptrace_tracer_tid_locked(const struct kernel_task *);
 #endif

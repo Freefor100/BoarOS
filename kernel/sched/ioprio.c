@@ -121,7 +121,11 @@ int64_t kernel_ioprio_call(struct kernel_task *caller,int setting,int32_t which,
     }
     if(which==1) {
         if(who<0)return -KERNEL_ESRCH;
-        SCHEDULER_TASK_BORROW(borrow,who?scheduler_task_lookup(who,KERNEL_PID_TID,0):0);
+        SCHEDULER_TASK_BORROW(borrow,0);
+        if(who) {
+            KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+            borrow=scheduler_task_lookup_in_locked(process_pid_active(caller),who,KERNEL_PID_TID,0);
+        }
         struct kernel_task *target=who?borrow:caller;
         if(!target)return -KERNEL_ESRCH;
         if(setting)return change_one(caller,target,(uint16_t)priority);
@@ -135,7 +139,7 @@ int64_t kernel_ioprio_call(struct kernel_task *caller,int setting,int32_t which,
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         if(which==2) {
             if(who<0)return -KERNEL_ESRCH;
-            group=who?kernel_pid_find(&scheduler.identities,who):process_identity(caller,KERNEL_PID_PGID);
+            group=who?kernel_pid_find(process_pid_active(caller),who):process_identity(caller,KERNEL_PID_PGID);
             if(!group)return -KERNEL_ESRCH;
             kernel_pid_get(group);
         } else {
@@ -154,7 +158,8 @@ int64_t kernel_ioprio_call(struct kernel_task *caller,int setting,int32_t which,
             struct kernel_task *task=cursor.task;
             match=task->arch.user_mode && task->tid_owned && !task->retirement &&
                 (which==2?process_identity(task,KERNEL_PID_PGID)==group:
-                          kernel_credentials_task_locked(task)->uid==uid);
+                          kernel_credentials_task_locked(task)->uid==uid &&
+                          kernel_pid_number_in(process_identity(task,KERNEL_PID_TID),process_pid_active(caller)));
             if(match && !setting)value=effective_locked(task);
         }
         if(match) {

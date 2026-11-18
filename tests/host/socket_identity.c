@@ -5,6 +5,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 struct kernel_scheduler scheduler;
 struct kernel_raw_lock kernel_wait_domain;
@@ -34,6 +35,53 @@ static void publish(struct kernel_task *task, struct kernel_task *parent, int th
     process_identity_commit_locked(task);
 }
 
+static void nested_views(struct kernel_task *root)
+{
+    struct kernel_pid_allocator alloc[2]={0};uint64_t bits[2][KERNEL_PID_BITMAP_WORDS(64)]={0};
+    struct kernel_pid_registry spaces[2]={0};struct kernel_task children[2];
+    memset(children,0,sizeof(children));
+    for(unsigned i=0;i<2;i++) {
+        assert(!kernel_pid_allocator_init(&alloc[i],bits[i],64));
+        assert(!kernel_pid_registry_init(&spaces[i],&alloc[i],&scheduler.identities));
+        {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);assert(!process_pid_children_install_locked(root,&spaces[i]));}
+        publish(&children[i],root,0);
+    }
+    {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);assert(!process_pid_children_install_locked(root,&scheduler.identities));}
+    cpus[0].current=&children[0];struct kernel_pid *first=NULL,*second=NULL;
+    assert(!kernel_task_identity_get_user(1,&first) && first==process_identity(&children[0],KERNEL_PID_TID));
+    assert(kernel_task_identity_user_number(first)==1);
+    assert(kernel_task_lock_owner_user_number(children[0].tid)==1);
+    assert(kernel_task_lock_owner_user_number(children[1].tid)==0);
+    assert(kernel_task_lock_owner_user_number(-1)==-1);
+    assert(kernel_task_identity_get_user(children[1].tid,&second)==-KERNEL_ESRCH && !second);
+    cpus[0].current=&children[1];
+    assert(!kernel_task_identity_get_user(1,&second) && second!=first);
+    assert(kernel_task_identity_user_number(first)==0 && kernel_task_identity_user_number(second)==1);
+    cpus[0].current=root;
+    assert(kernel_task_identity_user_number(first)==children[0].tid &&
+        kernel_task_identity_user_number(second)==children[1].tid);
+    kernel_pid_t old=children[0].tid;
+    process_identity_release(&children[0]);process_identity_collect();
+    assert(kernel_task_identity_user_number(first)==old && !first->members[KERNEL_PID_TID]);
+    assert(kernel_task_lock_owner_user_number(old)==old);
+    cpus[0].current=&children[1];
+    assert(kernel_task_lock_owner_user_number(old)==0);
+    struct kernel_task replacement={0}; replacement.group_leader=&replacement;
+    kernel_pid_t numbers[]={9,old};
+    assert(!process_identity_create_numbers(&replacement,&children[1],0,numbers,2,1));
+    {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);process_identity_commit_locked(&replacement);}
+    assert(kernel_task_lock_owner_user_number(old)==9 && !kernel_task_identity_user_number(first));
+    process_identity_release(&replacement);process_identity_collect();
+    cpus[0].current=root;
+    kernel_task_identity_put(first);kernel_task_identity_put(second);
+    process_identity_release(&children[1]);process_identity_collect();
+    {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+     for(unsigned i=0;i<2;i++){assert(!alloc[i].allocated && spaces[i].references==1);kernel_pid_registry_put(&spaces[i]);}
+     unsigned retired=0;while(kernel_pid_take_retired_namespace(&scheduler.identities))retired++;
+     assert(retired==2 && !kernel_pid_take_retired(&scheduler.identities));}
+    puts("PASS socket identity nested caller views, sibling same PID and retained exited sender mapping");
+}
+
 int main(void)
 {
     active = &cpus[0];
@@ -41,8 +89,7 @@ int main(void)
     kernel_raw_lock_init(&kernel_wait_domain, KERNEL_RAW_RANK_SCHEDULER);
     uint64_t bitmap[2];
     assert(!kernel_pid_allocator_init(&scheduler.pid_allocator, bitmap, 128));
-    scheduler.identities = (struct kernel_pid_registry){
-        .numbers = &scheduler.pid_allocator, .next_generation = 1};
+    assert(!kernel_pid_registry_init(&scheduler.identities, &scheduler.pid_allocator, NULL));
     struct kernel_task leader = {0}, thread = {0}, remote = {0};
     publish(&leader, NULL, 0); publish(&thread, &leader, 1); publish(&remote, NULL, 0);
     cpus[0].current = &thread; cpus[1].current = &remote;
@@ -86,10 +133,12 @@ int main(void)
     assert(after_exit->members[KERNEL_PID_TID]->task == &replacement);
     kernel_task_identity_put(after_exit); after_exit = NULL;
     process_identity_release(&replacement);
+    nested_views(&leader);
     cpus[0].current = NULL;
     assert(kernel_task_identity_get(0, &owner) == -KERNEL_ESRCH && !owner);
     process_identity_release(&leader); process_identity_release(&remote);
     process_identity_collect();
     assert(!allocated && !scheduler.pid_allocator.allocated);
+    assert(scheduler.identities.references == 1);
     puts("PASS socket identity: caller CPU/TGID, explicit TID, private/missing PID, retained exit owner and final refs");
 }

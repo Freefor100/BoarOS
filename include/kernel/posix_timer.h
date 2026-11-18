@@ -24,6 +24,7 @@ uint64_t kernel_posix_timer_deadline(void);
 void kernel_posix_timer_expire(uint64_t);
 void kernel_posix_timer_clock_changed(void);
 void kernel_posix_timer_changed(void);
+/* sig==0 reconsiders parked init timers after a mask change. */
 void kernel_posix_timer_unignore(struct kernel_task *,unsigned);
 void kernel_posix_timers_exec(struct kernel_task *);
 void kernel_posix_timers_exit(struct kernel_task *);

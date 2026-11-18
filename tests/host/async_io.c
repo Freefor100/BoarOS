@@ -15,8 +15,11 @@ static _Thread_local struct kernel_io_context io;
 struct kernel_scheduler scheduler={.initialized=KERNEL_SCHEDULER_INITIALIZED};
 static struct kernel_heap heap;
 static struct kernel_credentials credentials={.uid=17,.euid=29};
-static struct kernel_pid identities[2]={{.number=41,.references=1},{.number=42,.references=1}};
+static struct kernel_pid_registry root_view,inner_view={.depth=1,.parent=&root_view},sibling_view={.depth=1,.parent=&root_view};
+static struct kernel_pid_registry *observer=&root_view;
+static struct kernel_pid identities[2]={{.number=41,.references=1,.registry=&root_view},{.number=42,.references=1,.registry=&root_view}};
 static struct kernel_pid_member members[2];
+static struct kernel_pid *extra_lookup;
 static unsigned allocations,allocation_failure,signals,signal_hold,signal_entered,signal_release;
 static unsigned closing,closed;
 static int delivered_fd,delivered_type;
@@ -34,8 +37,11 @@ enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t
 {assert(h==&heap&&!cpu.raw_locks);if(allocation_failure)return KERNEL_HEAP_STATUS_EMPTY;*p=calloc(n,z);assert(*p);allocations++;return 0;}
 void kernel_heap_release(struct kernel_heap *h,void *p)
 {assert(h==&heap&&p&&!cpu.raw_locks&&allocations);allocations--;free(p);}
-int kernel_task_identity_get(int32_t number,struct kernel_pid **out)
-{*out=NULL;for(unsigned i=0;i<2;i++)if(identities[i].number==number){kernel_task_identity_retain(&identities[i]);*out=&identities[i];return 0;}return -KERNEL_ESRCH;}
+int kernel_task_identity_get_user(int32_t number,struct kernel_pid **out)
+{*out=NULL;
+ if(extra_lookup&&kernel_pid_number_in(extra_lookup,observer)==number){kernel_task_identity_retain(extra_lookup);*out=extra_lookup;return 0;}
+ for(unsigned i=0;i<2;i++)if(kernel_pid_number_in(&identities[i],observer)==number){kernel_task_identity_retain(&identities[i]);*out=&identities[i];return 0;}
+ return -KERNEL_ESRCH;}
 void kernel_task_identity_retain(struct kernel_pid *id)
 {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);assert(id->references);id->references++;}
 void kernel_task_identity_put(struct kernel_pid *id)
@@ -132,5 +138,29 @@ int main(void)
     assert(!pthread_join(sending,NULL)&&!pthread_join(closing_thread,NULL));
     assert(closed&&!file.async_io&&!allocations&&identities[0].references==1&&identities[1].references==1);
     assert(!kernel_wait_queue_close(&pipe.async_events)&&!kernel_wait_queue_destroy(&pipe.async_events));
+    struct {struct kernel_pid id;struct kernel_pid_binding ancestor;} child={
+        .id={.number=1,.references=1,.registry=&inner_view},
+        .ancestor={.number=41,.registry=&root_view}};
+    child.id.members[KERNEL_PID_TGID]=&members[0];
+    struct kernel_open_file_description retained={.heap=&heap,.references=1,.kind=KERNEL_OPEN_FILE_KIND_PIPE};
+    struct kernel_async_io *ctx=get_context(&retained);assert(ctx);
+    observer=&inner_view;extra_lookup=&child.id;
+    assert(!kernel_open_file_async_fcntl(&retained,KERNEL_FILES_F_SETOWN,1,NULL));
+    observer=&root_view;
+    assert(kernel_open_file_async_fcntl(&retained,KERNEL_FILES_F_GETOWN,0,NULL)==41);
+    observer=&inner_view;
+    assert(kernel_open_file_async_fcntl(&retained,KERNEL_FILES_F_GETOWN,0,NULL)==1);
+    struct {int32_t type,pid;} viewed={0};
+    assert(!kernel_open_file_async_fcntl(&retained,KERNEL_FILES_F_GETOWN_EX,(uintptr_t)&viewed,(void *)1)&&viewed.type==1&&viewed.pid==1);
+    observer=&sibling_view;
+    assert(!kernel_open_file_async_fcntl(&retained,KERNEL_FILES_F_GETOWN,0,NULL));
+    assert(!kernel_open_file_async_fcntl(&retained,KERNEL_FILES_F_GETOWN_EX,(uintptr_t)&viewed,(void *)1)&&viewed.type==1&&!viewed.pid);
+    observer=&root_view;child.id.members[KERNEL_PID_TGID]=NULL;
+    assert(!kernel_open_file_async_fcntl(&retained,KERNEL_FILES_F_GETOWN,0,NULL));
+    assert(ctx->owner==&child.id && ctx->owner!=&identities[0]);
+    kernel_open_file_async_close(&retained);extra_lookup=NULL;assert(child.id.references==1&&!allocations);
     puts("PASS async OFD: owner/signum, allocation rollback, saved fd, pipe direction, and close/callback drain");
 }
+
+kernel_pid_t kernel_task_identity_user_number(const struct kernel_pid *id)
+{ return kernel_pid_number_in(id,observer); }

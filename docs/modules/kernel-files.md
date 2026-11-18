@@ -138,7 +138,7 @@ DONTNEED 先尝试范围写回接纳，不执行 fsync、不等待日志 durable
 
 ## 传统与 OFD 记录锁
 
-`fs/record_lock.c` 为每个活 VFS inode 维护按有符号闭区间排序、带子树最大终点的 AVL 树和等待队列；冲突查询、同 owner 区间合并、分拆预留和批量摘除都按该树的相关范围搜索，不遍历 owner 在其他 inode 上的锁。每个锁节点同时挂在 owner 的侵入式链上，供关闭时定向释放；批量摘除通过 AVL 子树合并恢复平衡。长度为零延伸到 `INT64_MAX`，负长度向文件前方锁定，锁可以超过 EOF。`fs/files/locks.c` 导入 RV64 `struct flock` 并分派 `F_GETLK/F_SETLK/F_SETLKW` 与 `F_OFD_GETLK/F_OFD_SETLK/F_OFD_SETLKW`；标量 `fcntl` 命令仍走原入口。区间转换、读写权限、`l_pid`、坏指针和溢出错误按固定 Linux `references/linux/fs/locks.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 核对。
+`fs/record_lock.c` 为每个活 VFS inode 维护按有符号闭区间排序、带子树最大终点的 AVL 树和等待队列；冲突查询、同 owner 区间合并、分拆预留和批量摘除都按该树的相关范围搜索，不遍历 owner 在其他 inode 上的锁。每个锁节点同时挂在 owner 的侵入式链上，供关闭时定向释放；批量摘除通过 AVL 子树合并恢复平衡。长度为零延伸到 `INT64_MAX`，负长度向文件前方锁定，锁可以超过 EOF。`fs/files/locks.c` 导入 RV64 `struct flock` 并分派 `F_GETLK/F_SETLK/F_SETLKW` 与 `F_OFD_GETLK/F_OFD_SETLK/F_OFD_SETLKW`；标量 `fcntl` 命令仍走原入口。传统锁只保存设置者当时的根 TGID：冲突查询在初始 PID 命名空间原样报告，即使设置者已退出；其他视图按查询时的根编号绑定翻译，不可见为 0，OFD 锁为 -1。区间转换、读写权限、`l_pid`、坏指针和溢出错误按固定 Linux `references/linux/fs/locks.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 核对。
 
 错误检查先 pin fd，再导入 `flock`，最后检查对象是否支持记录锁。坏 fd 返回
 `EBADF`；有效 TTY 或 pipe fd 的坏指针返回 `EFAULT`，不被对象类型错误遮蔽。

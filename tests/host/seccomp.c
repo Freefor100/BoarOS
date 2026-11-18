@@ -121,7 +121,13 @@ int main(void)
     kernel_seccomp_release(parent);assert(!live);free(large);
     struct kernel_task *third=calloc(1,sizeof(*third));
     parent->seccomp_mode=child->seccomp_mode=0;
-    parent->tid=1;child->tid=2;third->tid=3;
+    parent->tid=101;child->tid=102;third->tid=103;
+    struct kernel_pid_registry space={.depth=1},sibling={.depth=1};
+    struct kernel_pid ids[3]={{.registry=&space,.number=1},
+        {.registry=&space,.number=2},{.registry=&space,.number=3}};
+    parent->identities[KERNEL_PID_TID].identity=&ids[0];
+    child->identities[KERNEL_PID_TID].identity=&ids[1];
+    third->identities[KERNEL_PID_TID].identity=&ids[2];
     parent->group_next=child;child->group_next=third;third->group_next=parent;
     parent->group_leader=child->group_leader=third->group_leader=parent;
     ret[0]=(struct kernel_bpf_classic_insn)I(0x06,0,0,0x7fff0000);
@@ -130,6 +136,9 @@ int main(void)
     struct kernel_seccomp_filter *saved=parent->seccomp_filter,*divergent=child->seccomp_filter;
     ret[0].k=0x50000|33;
     assert(attach_flags(parent,ret,1,1)==2);
+    ids[1].registry=&sibling;
+    assert(attach_flags(parent,ret,1,1)==-KERNEL_ESRCH);
+    ids[1].registry=&space;
     assert(parent->seccomp_filter==saved&&child->seccomp_filter==divergent);
     assert(!third->seccomp_mode&&!third->seccomp_filter&&!child->no_new_privs&&live==2);
     kernel_seccomp_release(child);child->seccomp_mode=0;

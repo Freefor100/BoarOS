@@ -163,7 +163,7 @@ FP/LSX/LASX记录、pending异常、首用与宽度升级和owner切换见[LA浮
 
 ## ELF core 文件与线程组退出
 
-默认 core 动作在释放 MM 前同步写当前目录的 `core`，不经过用户 FD 表。文件提供目标架构的 ELF64 `ET_CORE`、每个停驻线程的整数 `NT_PRSTATUS`（崩溃线程在先），以及保留起址、大小和读写执行权限的 `PT_LOAD`。`MADV_DONTDUMP` 和 vvar 区域只保留映射描述、不输出内容；与 Linux 一致，vDSO 是始终输出的例外。只在异常退出执行这一流程，普通 syscall/调度不新增扫描或分配；线程组长仅保留一个空 session 指针。
+默认 core 动作在释放 MM 前同步写当前目录的 `core`，不经过用户 FD 表。文件提供目标架构的 ELF64 `ET_CORE`、每个停驻线程的整数 `NT_PRSTATUS`（崩溃线程在先，线程、实际父线程、进程组与会话编号使用转储者的活动 PID 视图），以及保留起址、大小和读写执行权限的 `PT_LOAD`。`MADV_DONTDUMP` 和 vvar 区域只保留映射描述、不输出内容；与 Linux 一致，vDSO 是始终输出的例外。只在异常退出执行这一流程，普通 syscall/调度不新增扫描或分配；线程组长仅保留一个空 session 指针。
 
 仅 `PR_GET_DUMPABLE == 1`、CORE 软限额至少一个基页且 FSIZE 非零时尝试。输出逐段受两个软限额最小值限制；文件过小、目录不可写、空间不足或 I/O 失败不阻止进程退出，已写前缀可能保留。拒绝 symlink、非普通文件、多硬链接、非当前 fsuid 拥有或模式不为 0600 的文件；通过检查后才截断旧文件。新建模式为 0600。成功形成 notes 后才报告 WCOREDUMP/CLD_DUMPED，后续数据失败可能留下不完整 core，与成功完成全部 payload 不等价。
 

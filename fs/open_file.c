@@ -5,6 +5,7 @@
 #include "open_file_internal.h"
 #include <kernel/namespace.h>
 #include <kernel/procfs.h>
+#include <kernel/proc_task.h>
 #include <kernel/ipc_namespace.h>
 #include "block_file_internal.h"
 #include "record_lock.h"
@@ -288,8 +289,10 @@ static void initialize_path_description(struct kernel_open_file_description *fil
     kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
     if (file->kind!=KERNEL_OPEN_FILE_KIND_PATH && kernel_vfs_file_generated(&file->file))
         file->kind = KERNEL_OPEN_FILE_KIND_GENERATED;
-    if (file->kind==KERNEL_OPEN_FILE_KIND_GENERATED && kernel_procfs_ipc_file(&file->file))
+    if (file->kind==KERNEL_OPEN_FILE_KIND_GENERATED && kernel_procfs_ipc_file(&file->file)) {
         file->ipc_proc_namespace=kernel_namespace_get(kernel_task_ipc_namespace());
+        file->ipc_proc_pid_view=kernel_proc_view_acquire();
+    }
     file->observed_writeback_error = kernel_vfs_error_sequence(&file->file);
     file->credentials = kernel_credentials_get(kernel_credentials_current());
 }
@@ -1027,6 +1030,7 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
             file->vfs_closed = 1U;
         }
     }
+    if(file->ipc_proc_namespace)kernel_proc_view_release(file->ipc_proc_pid_view);
     kernel_namespace_put(file->ipc_proc_namespace);
     kernel_credentials_put(file->credentials);
     kernel_heap_release(file->heap, file);
@@ -1119,6 +1123,7 @@ int kernel_open_file_generate(struct kernel_open_file_description *file)
         return -KERNEL_EINVAL;
     if (file->generated_ready) return 0;
     int result = kernel_vfs_file_snapshot(&file->file,file->heap,file->ipc_proc_namespace,
+                                           file->ipc_proc_namespace?file->ipc_proc_pid_view:NULL,
                                            &file->generated_data,
                                            &file->generated_length);
     if (result) {

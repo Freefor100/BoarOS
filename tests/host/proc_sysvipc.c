@@ -30,9 +30,9 @@ static int next(uint32_t *cursor, int32_t *id, struct kernel_ipc64_perm *p)
         .uid = 1001, .gid = 1002, .cuid = 1003, .cgid = 1004};
     return 1;
 }
-int kernel_msg_proc_next(struct kernel_namespace *ns,uint32_t *cursor, int32_t *id, struct kernel_msqid64_ds *row)
+int kernel_msg_proc_next(struct kernel_namespace *ns,struct kernel_pid_registry *view,uint32_t *cursor, int32_t *id, struct kernel_msqid64_ds *row)
 {
-    assert(ns==&ipc_namespace);
+    assert(ns==&ipc_namespace&&!view);
     *row = (struct kernel_msqid64_ds){.msg_cbytes = 123, .msg_qnum = 7,
         .msg_lspid = 44, .msg_lrpid = 55, .msg_stime = 111, .msg_rtime = 222, .msg_ctime = 333};
     return next(cursor, id, &row->msg_perm);
@@ -43,9 +43,9 @@ int kernel_sem_proc_next(struct kernel_namespace *ns,uint32_t *cursor, int32_t *
     *row = (struct kernel_semid64_ds){.sem_nsems = 9, .sem_otime = 222, .sem_ctime = 333};
     return next(cursor, id, &row->sem_perm);
 }
-int kernel_shm_proc_next(struct kernel_namespace *ns,uint32_t *cursor, int32_t *id, struct kernel_shmid64_ds *row, uint64_t *rss)
+int kernel_shm_proc_next(struct kernel_namespace *ns,struct kernel_pid_registry *view,uint32_t *cursor, int32_t *id, struct kernel_shmid64_ds *row, uint64_t *rss)
 {
-    assert(ns==&ipc_namespace);
+    assert(ns==&ipc_namespace&&!view);
     *row = (struct kernel_shmid64_ds){.shm_segsz = 123456, .shm_nattch = 2,
         .shm_cpid = 44, .shm_lpid = 55, .shm_atime = 111, .shm_dtime = 222, .shm_ctime = 333};
     *rss = BOAROS_PAGE_SIZE;
@@ -85,8 +85,8 @@ int kernel_vfs_publish_node(struct kernel_vfs_mount *mount,struct kernel_vfs_nod
 }
 static void namespace_directories(void)
 {
-    const char *const names[]={"mnt","uts","ipc"};
-    const uint32_t types[]={KERNEL_NS_MNT,KERNEL_NS_UTS,KERNEL_NS_IPC};
+    const char *const names[]={"mnt","uts","ipc","pid","pid_for_children"};
+    const uint32_t types[]={KERNEL_NS_MNT,KERNEL_NS_UTS,KERNEL_NS_IPC,KERNEL_NS_PID,KERNEL_NS_PID|KERNEL_PROC_PID_FOR_CHILDREN};
     struct kernel_vfs_instance instance={.heap=&heap};
     struct kernel_vfs_mount mount={.private_data=&instance};
     for(unsigned thread=0;thread<2;thread++) {
@@ -95,11 +95,11 @@ static void namespace_directories(void)
             proc_thread_resource_inode(pid,identity,PROC_PID_NS_DIR_KIND,0) :
             proc_pid_inode(pid,identity,PROC_PID_NS_DIR_KIND)};
         struct kernel_vfs_file file={.private_data=&directory};
-        for(unsigned i=0;i<3;i++) {
+        for(unsigned i=0;i<5;i++) {
             uint64_t inode,next,looked;uint8_t type;char name[24];uint32_t mode;
             assert(proc_dir_entry(&file,i+2,&next,&inode,&type,name,sizeof(name))==1);
             assert(type==10 && next==i+3 && !strcmp(name,names[i]));
-            assert(!proc_lookup(0,directory.inode,name,3,&looked,&mode) && looked==inode);
+            assert(!proc_lookup(0,directory.inode,name,strlen(name),&looked,&mode) && looked==inode);
             assert(proc_namespace_type(proc_inode_kind(inode))==types[i]);
             assert(proc_inode_is_thread(inode)==(int)thread && proc_inode_identity(inode)==identity);
             assert(mode==(KERNEL_VFS_S_IFLNK|0777U));
@@ -112,9 +112,17 @@ static void namespace_directories(void)
             assert(!opened.private_data && !allocations);
         }
         uint64_t next,inode;uint8_t type;char name[24];
-        assert(!proc_dir_entry(&file,5,&next,&inode,&type,name,sizeof(name)));
+        assert(!proc_dir_entry(&file,7,&next,&inode,&type,name,sizeof(name)));
     }
 }
+int kernel_proc_view_lookup(struct kernel_pid_registry *view, kernel_pid_t number,
+    kernel_pid_t group, uint64_t generation, int thread, kernel_pid_t *canonical, uint64_t *out)
+{ (void)view; (void)number; (void)group; (void)generation; (void)thread; (void)canonical; (void)out; abort(); }
+int kernel_proc_view_next(struct kernel_pid_registry *view, kernel_pid_t after,
+    kernel_pid_t group, uint64_t generation, int thread, kernel_pid_t *number,
+    kernel_pid_t *canonical, uint64_t *out)
+{ (void)view; (void)after; (void)group; (void)generation; (void)thread; (void)number; (void)canonical; (void)out; abort(); }
+
 int main(void)
 {
     namespace_directories();
@@ -145,7 +153,7 @@ int main(void)
     const uint64_t inodes[] = {PROC_SYSVIPC_SHM_INODE, PROC_SYSVIPC_SEM_INODE, PROC_SYSVIPC_MSG_INODE};
     for (unsigned i = 0; i < 3; i++) {
         char *text = 0; size_t length = 0;
-        assert(!proc_sysvipc_snapshot(inodes[i], &ipc_namespace,&heap, &text, &length));
+        assert(!proc_sysvipc_snapshot(inodes[i], &ipc_namespace,NULL,&heap, &text, &length));
         assert(length == strlen(text) && allocations == 1);
         char *line = strchr(text, '\n') + 1;
         int key, id; unsigned mode_value;
@@ -167,16 +175,16 @@ int main(void)
         }
         kernel_heap_release(&heap, text);
         rows = 200;
-        text = 0; assert(!proc_sysvipc_snapshot(inodes[i], &ipc_namespace,&heap, &text, &length));
+        text = 0; assert(!proc_sysvipc_snapshot(inodes[i], &ipc_namespace,NULL,&heap, &text, &length));
         unsigned lines = 0; for (char *p = text; *p; p++) lines += *p == '\n';
         assert(lines == rows + 1 && allocations == 1); kernel_heap_release(&heap, text);
         for (unsigned failed = 1; failed <= 2; failed++) {
             fail_at = failed; allocation_calls = 0; text = 0;
-            assert(proc_sysvipc_snapshot(inodes[i], &ipc_namespace,&heap, &text, &length) == -KERNEL_ENOMEM);
+            assert(proc_sysvipc_snapshot(inodes[i], &ipc_namespace,NULL,&heap, &text, &length) == -KERNEL_ENOMEM);
             assert(!text && !allocations);
         }
         fail_at = 0; rows = 0; text = 0;
-        assert(!proc_sysvipc_snapshot(inodes[i], &ipc_namespace,&heap, &text, &length));
+        assert(!proc_sysvipc_snapshot(inodes[i], &ipc_namespace,NULL,&heap, &text, &length));
         assert(strchr(text, '\n') == text + length - 1); kernel_heap_release(&heap, text);
         rows = 1;
     }

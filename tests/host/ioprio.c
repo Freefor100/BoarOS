@@ -33,13 +33,22 @@ enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t
 }
 void kernel_heap_release(struct kernel_heap *h,void *p)
 {assert(h==&heap && p && !cpu.raw_locks && allocations);allocations--;free(p);}
-struct kernel_task *scheduler_task_lookup(kernel_pid_t pid,enum kernel_pid_role role,uint64_t generation)
+static _Thread_local int lookup_pause;
+struct kernel_task *scheduler_task_lookup_in_locked(struct kernel_pid_registry *view,kernel_pid_t pid,enum kernel_pid_role role,uint64_t generation)
 {
-    assert(pid==42 && role==KERNEL_PID_TID && !generation);
+    assert(cpu.raw_locks && view==&scheduler.identities && pid==42 && role==KERNEL_PID_TID && !generation);
     __atomic_add_fetch(&borrows,1,__ATOMIC_RELAXED);
+    lookup_pause=1;return &target;
+}
+void __real_kernel_raw_lock_release(struct kernel_raw_guard *);
+void __wrap_kernel_raw_lock_release(struct kernel_raw_guard *guard)
+{
+    __real_kernel_raw_lock_release(guard);
+    if(!lookup_pause)return;
+    lookup_pause=0;assert(!cpu.raw_locks);
     assert(!pthread_mutex_lock(&gate));lookup_ready=1;assert(!pthread_cond_broadcast(&event));
     while(!lookup_continue)assert(!pthread_cond_wait(&event,&gate));
-    assert(!pthread_mutex_unlock(&gate));return &target;
+    assert(!pthread_mutex_unlock(&gate));
 }
 void scheduler_task_put(struct kernel_task *task)
 {assert(task==&target && __atomic_sub_fetch(&borrows,1,__ATOMIC_RELAXED)>=0);}
@@ -50,6 +59,10 @@ struct kernel_pid *process_identity(const struct kernel_task *task,enum kernel_p
 {(void)task;(void)role;return 0;}
 struct kernel_pid *kernel_pid_find(struct kernel_pid_registry *r,kernel_pid_t pid)
 {(void)r;(void)pid;return 0;}
+struct kernel_pid_registry *process_pid_active(const struct kernel_task *task)
+{(void)task;return &scheduler.identities;}
+kernel_pid_t kernel_pid_number_in(const struct kernel_pid *id,const struct kernel_pid_registry *view)
+{(void)id;(void)view;return 0;}
 void kernel_pid_get(struct kernel_pid *id){(void)id;abort();}
 void kernel_task_identity_put(struct kernel_pid *id){(void)id;abort();}
 static void *query(void *unused)

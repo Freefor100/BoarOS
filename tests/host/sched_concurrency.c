@@ -29,6 +29,8 @@ static _Thread_local unsigned cleanup_domain_entry, complete_disposal_at;
 static void complete_held_disposal(void);
 static unsigned accounting_progress_check,accounting_lock_attempt,accounting_finished,accounting_go;
 void signal_owner_cases(unsigned *lock_calls);
+void pid_namespace_shutdown_cases(void);
+extern struct kernel_task *pid_namespace_disposal_target;
 void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *, struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock, struct kernel_raw_guard *guard)
 {
@@ -126,7 +128,11 @@ enum physical_page_status physical_page_release(struct physical_page_allocator *
 {
     (void)a;
     assert(!active_cpu->raw_locks);
-    if (disposal_target) assert(address == disposal_target->physical_address && !disposal_target->storage_borrows);
+    if (pid_namespace_disposal_target) {
+        assert(address==pid_namespace_disposal_target->physical_address);
+        assert(pid_namespace_disposal_target->retirement==3 && !pid_namespace_disposal_target->storage_borrows);
+        pid_namespace_disposal_target=NULL;
+    } else if (disposal_target) assert(address == disposal_target->physical_address && !disposal_target->storage_borrows);
     else {
         assert(address >= 4096 && address <= 3*4096);
         struct kernel_task *task = &tasks[address/4096 - 1];
@@ -428,6 +434,7 @@ static void group_exit_work(void)
             kernel_wait_queue_init(&tasks[i].group_wait_queue);
         }
         leader->group_members = members;
+        leader->tid=1;leader->completion.tid=73;leader->completion.tgid=73;
         {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
             for (unsigned i = 0; i < members; i++) scheduler_task_publish_locked(&tasks[i]);
@@ -445,6 +452,7 @@ static void group_exit_work(void)
         group_lock_calls = 0;
         process_group_request_exit(&tasks[members - 1], KERNEL_THREAD_EXIT_SYSCALL, 42, 0);
         assert(leader->group_exiting && leader->completion.status == 42);
+        assert(leader->completion.tid==1 && leader->completion.tgid==1);
         /* Work may grow with members, but must not borrow64 unrelated tasks.
          * This is an upper bound, not an exact private lock-call count. */
         assert(group_lock_calls <= 32 * members);
@@ -951,6 +959,15 @@ static void nice_permissions(void)
     tasks[0]=tasks[1]=(struct kernel_task){.magic=KERNEL_THREAD_MAGIC,.accounted=1,.tid_owned=1};
     for(unsigned i=0;i<2;i++){tasks[i].arch.user_mode=1;tasks[i].cpu=&cpus[0];tasks[i].credentials=i?&other:&caller;}
     tasks[0].limits=&limited;tasks[1].limits=&permitted;
+    uint64_t bitmap[KERNEL_PID_BITMAP_WORDS(8)]={0};
+    struct kernel_pid_allocator allocator={0};struct kernel_pid ids[2]={0};
+    assert(!kernel_pid_allocator_init(&allocator,bitmap,8));
+    assert(!kernel_pid_registry_init(&scheduler.identities,&allocator,NULL));
+    for(unsigned i=0;i<2;i++) {
+        assert(!kernel_pid_reserve(&scheduler.identities,&ids[i]));
+        kernel_pid_attach(&tasks[i].identities[KERNEL_PID_TID],&ids[i],KERNEL_PID_TID,&tasks[i]);
+    }
+
     assert(kernel_task_priority(&tasks[0],0,0,0,0)==20);
     assert(!kernel_task_priority(&tasks[0],1,0,0,5));
     assert(kernel_task_priority(&tasks[0],1,0,0,0)==-KERNEL_EACCES);
@@ -989,6 +1006,9 @@ static void nice_permissions(void)
         virtual_before+kernel_sched_fair_delta(&old,123456));
     tasks[0].wait.on_cpu=0;cpus[0].accounting_owner=0;
     assert(!tasks[0].storage_borrows&&!tasks[1].storage_borrows);
+    for(unsigned i=0;i<2;i++){kernel_pid_detach(&tasks[i].identities[KERNEL_PID_TID]);kernel_pid_put(&ids[i]);}
+    assert(kernel_pid_take_retired(&scheduler.identities));assert(kernel_pid_take_retired(&scheduler.identities));
+    assert(!kernel_pid_take_retired(&scheduler.identities));kernel_pid_registry_put(&scheduler.identities);
     puts("nice: real UID sets, per-target limits, partial success and privilege passed");
 }
 
@@ -1144,6 +1164,7 @@ int main(int argc,char **argv)
     event_claim_handoff();
     signal_owner_cases(&group_lock_calls);
     group_exit_work();
+    pid_namespace_shutdown_cases();
     concurrent_retirement(2);
     concurrent_retirement(4);
     concurrent_exit_claim(2);

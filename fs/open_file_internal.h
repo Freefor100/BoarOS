@@ -27,7 +27,10 @@ struct kernel_open_file_description {
     uint64_t offset;
     uint64_t observed_writeback_error;
     uint64_t observed_mount_error;
-    uint64_t proc_identity;
+    union {
+        uint64_t proc_identity; /* Pathless socket/namespace inode, never a generated file. */
+        struct kernel_pid_registry *ipc_proc_pid_view; /* Valid iff ipc_proc_namespace != NULL. */
+    };
     uint32_t open_flags;
     uint32_t references;
     struct kernel_async_io *async_io; /* On demand; shared by all OFD aliases. */

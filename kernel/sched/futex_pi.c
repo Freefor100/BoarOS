@@ -6,6 +6,14 @@
 
 #define PI_CHAIN_LIMIT 1024U
 
+/* The shared word has no namespace tag. Like Linux task_pid_vnr(), every
+ * translation uses the actor executing this operation, including requeue. */
+static uint32_t pi_tid_in(const struct kernel_task *task,const struct kernel_task *actor)
+{
+    return (uint32_t)kernel_pid_number_in(process_identity(task,KERNEL_PID_TID),
+        process_pid_active(actor));
+}
+
 static void waiter_remove(struct kernel_futex_pi_request *request)
 {
     struct kernel_futex_pi_state *state=request->state;
@@ -151,7 +159,6 @@ static struct kernel_task *handoff(struct kernel_futex_pi_state *state,int fixup
     struct kernel_task *old=owner_set(state,next->task);
     state->needs_fixup=(unsigned)fixup;
     __atomic_store_n(&next->granted,fixup?2U:1U,__ATOMIC_RELEASE);
-    if(!fixup)state->word_tid=(uint32_t)next->task->tid;
     (void)kernel_wait_notify_locked(&next->token,KERNEL_WAIT_WOKEN);
     return old;
 }
@@ -214,9 +221,9 @@ static int fixup_dead_owner(struct kernel_futex_pi_request *request,enum kernel_
         struct kernel_futex_pi_state *state=request->state;
         if(state->owner!=request->task || !state->needs_fixup)__builtin_trap();
         uint32_t value=__atomic_load_n(word,__ATOMIC_ACQUIRE);
-        uint32_t next=(uint32_t)request->task->tid|FUTEX_WAITERS|FUTEX_OWNER_DIED;
+        uint32_t next=pi_tid_in(request->task,request->task)|FUTEX_WAITERS|FUTEX_OWNER_DIED;
         if(!__atomic_compare_exchange_n(word,&value,next,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST))result=-KERNEL_EAGAIN;
-        else {state->word_tid=(uint32_t)request->task->tid;state->needs_fixup=0;request->granted=1;}
+        else {state->needs_fixup=0;request->granted=1;}
     }
     release_preparation(request);
     return result;
@@ -239,29 +246,30 @@ static int wait_exiting_owner(struct kernel_futex_pi_request *request)
 }
 enum pi_action { AGAIN,ALLOCATE,EXITING,WAITING,FINISHED };
 static struct kernel_futex_pi_state *state_attach(struct kernel_futex_pi_request *request,
-    struct futex_bucket *bucket,struct kernel_task *owner,uint32_t tid)
+    struct futex_bucket *bucket,struct kernel_task *owner)
 {
     struct kernel_futex_pi_state *state=request->candidate;
     request->candidate=0;request->state=state;
     state->key=request->key;request->key=(struct kernel_futex_key){0};
     state->bucket=bucket;state->hash_next=bucket->pi_states;
     __atomic_store_n(&bucket->pi_states,state,__ATOMIC_RELEASE);
-    state->attached=1;state->word_tid=tid;
+    state->attached=1;
     (void)owner_set(state,owner);return state;
 }
 /* 普通LOCK与代理重排共用用户字/owner接纳，实际受益线程是request->task。 */
 static enum pi_action claim_locked(struct kernel_futex_pi_request *request,
-    struct futex_bucket *bucket,uint32_t *word,int mixed,int try_only,int force_state,int *result)
+    struct futex_bucket *bucket,uint32_t *word,struct kernel_task *actor,
+    int mixed,int try_only,int force_state,int *result)
 {
     struct kernel_task *task=request->task;
-    uint32_t value=__atomic_load_n(word,__ATOMIC_ACQUIRE),tid=(uint32_t)task->tid;
+    uint32_t value=__atomic_load_n(word,__ATOMIC_ACQUIRE),tid=pi_tid_in(task,actor);
     struct kernel_futex_pi_state *state=state_find(bucket,&request->key);
     if((value&FUTEX_TID_MASK)==tid)*result=-KERNEL_EDEADLK;
     else if(mixed)*result=-KERNEL_EINVAL;
     else if(state) {
         uint32_t owner=value&FUTEX_TID_MASK;
-        if(!state->owner || (owner!=state->word_tid &&
-           !((state->needs_fixup || state->owner->futex_exit_state==1) && !owner && (value&FUTEX_OWNER_DIED))))*result=-KERNEL_EINVAL;
+        if(!state->owner || (owner!=pi_tid_in(state->owner,actor) &&
+           !(!owner && (value&FUTEX_OWNER_DIED))))*result=-KERNEL_EINVAL;
         else if(try_only)*result=-KERNEL_EAGAIN;
         else if(cycle(state->owner,task))*result=-KERNEL_EDEADLK;
         else if(!__atomic_compare_exchange_n(word,&value,value|FUTEX_WAITERS,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST))return AGAIN;
@@ -270,11 +278,11 @@ static enum pi_action claim_locked(struct kernel_futex_pi_request *request,
         if(force_state && !request->candidate)return ALLOCATE;
         uint32_t next=(value&FUTEX_OWNER_DIED)|tid|(force_state?FUTEX_WAITERS:0);
         if(!__atomic_compare_exchange_n(word,&value,next,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST))return AGAIN;
-        if(force_state)(void)state_attach(request,bucket,task,tid);
+        if(force_state)(void)state_attach(request,bucket,task);
     } else {
         uint32_t desired=value|FUTEX_WAITERS;
         if(!__atomic_compare_exchange_n(word,&value,desired,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST))return AGAIN;
-        struct kernel_task *owner=scheduler_task_lookup_locked((int32_t)(value&FUTEX_TID_MASK),KERNEL_PID_TID,0);
+        struct kernel_task *owner=scheduler_task_lookup_in_locked(process_pid_active(actor),(int32_t)(value&FUTEX_TID_MASK),KERNEL_PID_TID,0);
         request->exiting=owner;
         if(!owner || owner->futex_exit_state==2) {
             if(__atomic_load_n(word,__ATOMIC_ACQUIRE)!=desired)return AGAIN;
@@ -284,7 +292,7 @@ static enum pi_action claim_locked(struct kernel_futex_pi_request *request,
         else if(try_only)*result=-KERNEL_EAGAIN;
         else if(cycle(owner,task))*result=-KERNEL_EDEADLK;
         else if(!request->candidate)return ALLOCATE;
-        else {(void)state_attach(request,bucket,owner,value&FUTEX_TID_MASK);return WAITING;}
+        else {(void)state_attach(request,bucket,owner);return WAITING;}
     }
     return FINISHED;
 }
@@ -316,7 +324,9 @@ static int pi_unlock(struct kernel_futex_pi_request *request,enum kernel_schedul
 {
     uint32_t value;size_t copied;
     if(kernel_copy_from_user(&request->task->mm,&value,request->address,sizeof(value),&copied) || copied!=sizeof(value))return -KERNEL_EFAULT;
-    if((value&FUTEX_TID_MASK)!=(uint32_t)request->task->tid)return -KERNEL_EPERM;
+    kernel_pid_t self;
+    if(kernel_task_user_tid(request->task,&self)!=KERNEL_TASK_STATUS_OK)__builtin_trap();
+    if((value&FUTEX_TID_MASK)!=(uint32_t)self)return -KERNEL_EPERM;
     int result=prepare_word(request,status);
     if(result || *status)return result;
     struct futex_bucket *bucket=futex_bucket(&request->key);
@@ -332,7 +342,7 @@ static int pi_unlock(struct kernel_futex_pi_request *request,enum kernel_schedul
         if(mixed || (state && state->owner!=request->task))result=-KERNEL_EINVAL;
         else if(actual!=value)result=-KERNEL_EAGAIN;
         else {
-            uint32_t next=state && state->head ? FUTEX_WAITERS|(uint32_t)state->head->task->tid:0;
+            uint32_t next=state && state->head ? FUTEX_WAITERS|pi_tid_in(state->head->task,request->task):0;
             if(!__atomic_compare_exchange_n(word,&actual,next,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST))result=-KERNEL_EAGAIN;
             else if(state) {
                 state_get(state);request->state=state;
@@ -385,7 +395,7 @@ int64_t kernel_futex_pi(struct kernel_task *task,uint64_t address,uint32_t opera
 #endif
         {
             KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
-            action=claim_locked(&request,bucket,request_word(&request),mixed,command==8,0,&result);
+            action=claim_locked(&request,bucket,request_word(&request),task,mixed,command==8,0,&result);
             if(action==WAITING) {
                 if(waiter_order==UINT64_MAX)__builtin_trap();
                 request.order=++waiter_order;
@@ -623,7 +633,7 @@ int64_t kernel_futex_cmp_requeue_pi(struct kernel_task *task,uint64_t address,
                 if(node->queue==&buckets[0]->waiters && entry->pi->requeue_stage==1) {
                     struct kernel_futex_pi_request *request=entry->pi;
                     request->candidate=call.candidate;call.candidate=0;
-                    enum pi_action action=claim_locked(request,buckets[1],request_word(&call),
+                    enum pi_action action=claim_locked(request,buckets[1],request_word(&call),task,
                         target_mixed,0,move_count!=0,&result);
                     call.candidate=request->candidate;request->candidate=0;
                     if(request->exiting) {

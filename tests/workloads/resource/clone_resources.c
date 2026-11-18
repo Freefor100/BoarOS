@@ -342,6 +342,13 @@ static void clone3_tid_case(void)
     wanted[0]=getpid();errno=0;CHECK(syscall(435,&args,sizeof(args))==-1 && errno==EEXIST);
     wanted[0]=available;args.set_tid_size=2;
     errno=0;CHECK(syscall(435,&args,sizeof(args))==-1 && errno==EINVAL);
+    long page=sysconf(_SC_PAGESIZE); CHECK(page>0);
+    char *boundary=mmap(NULL,2*page,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    CHECK(boundary!=MAP_FAILED && !mprotect(boundary+page,page,PROT_NONE));
+    args.set_tid=(uintptr_t)(boundary+page-sizeof(int32_t));
+    errno=0;CHECK(syscall(435,&args,sizeof(args))==-1 && errno==EFAULT);
+    CHECK(!munmap(boundary,2*page));
+    args.set_tid=(uintptr_t)wanted;
     args.set_tid_size=1;
     /* Failed user output must return the unpublished exact PID for reuse. */
     args.flags=0x1000;args.pidfd=1;

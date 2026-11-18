@@ -539,6 +539,7 @@ def run_loongarch(args):
                 passed=not code and ('FUTEX CALLER PASS cases=28' if args.workload=='futex' else 'POSIX END failures=0' if args.workload=='posix' else 'QUEUED END failures=0' if args.workload=='queued' else 'ALTSTACK END 6' if args.workload=='altstack' else 'EPOLL PASS delivery' if args.workload=='epoll' else 'PIPE END 7' if args.workload=='pipe' else 'EVENT END 8' if args.workload=='event' else f'NETWORK PASS {args.workload}') in raw and 'fatal' not in raw and (
                     'Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
                 if digest(program)!=metadata['program_sha256']:raise RuntimeError('ELF changed during comparison')
+                if args.workload=='queued' and platform=='boaros':passed=passed and raw.count('QUEUED INIT defaults-handlers-blocked-child-kill PASS')==2 and raw.count('QUEUED INIT nonleader-exec PASS')==1
                 if args.workload=='ipv4_basic':passed=passed and ipv4_basic_output(raw,cpus)
                 if args.workload=='futex':
                     lines,expected=futex_lines(raw,cpus);passed=passed and lines==expected
@@ -663,7 +664,7 @@ def run_smp(args):
                     if altstack:
                         lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('ALTSTACK CASE ') or line.startswith('ALTSTACK END ')]
                         expected[-2]='ALTSTACK CASE copy-races '+('OK' if target=='boaros' and args.observe and cpus>1 else 'SKIP')
-                    if queued:expected=[f'QUEUED THREADS mode={mode} cpus={cpus} OK' for mode in range(4)]+['QUEUED COMPETE OK']+(['QUEUED CONTROL callback-source-exit OK','QUEUED CONTROL prepared-leader-exit OK','QUEUED CONTROL prepared-thread-exec OK'] if target=='boaros' and args.observe and cpus>1 else ['QUEUED CONTROL SKIP'])+['QUEUED END failures=0']
+                    if queued:expected=['QUEUED INIT defaults-handlers-blocked-child-kill PASS']+[f'QUEUED THREADS mode={mode} cpus={cpus} OK' for mode in range(4)]+['QUEUED COMPETE OK']+(['QUEUED CONTROL callback-source-exit OK','QUEUED CONTROL prepared-leader-exit OK','QUEUED CONTROL prepared-thread-exec OK'] if target=='boaros' and args.observe and cpus>1 else ['QUEUED CONTROL SKIP'])+['QUEUED INIT defaults-handlers-blocked-child-kill PASS','QUEUED INIT nonleader-exec PASS','QUEUED END failures=0']
                     if futex:lines,expected=futex_lines(raw,cpus)
                     passed=bool(expected) and lines==expected and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='ipv4_basic':passed=ipv4_basic_output(raw,cpus) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
@@ -824,6 +825,7 @@ def main(default_arch="riscv"):
             except (RuntimeError,TimeoutError):pass
             raw=log.read_text(errors='replace')
             passed=('POSIX END failures=0' if args.workload=='posix' else 'QUEUED END failures=0' if args.workload=='queued' else 'ALTSTACK END 6' if args.workload=='altstack' else 'EPOLL PASS delivery' if args.workload=='epoll' else 'PIPE END 8' if args.workload=='pipe' else f'NETWORK PASS {args.workload}') in raw
+            if args.workload=='queued':passed=passed and raw.count('QUEUED INIT defaults-handlers-blocked-child-kill PASS')==2 and raw.count('QUEUED INIT nonleader-exec PASS')==1
             if args.workload=='ipv4_basic':passed=passed and ipv4_basic_output(raw)
             if name=='boaros':passed=passed and 'heap-live=0x0; shutting down' in raw and 'exited status=0x0 ' in raw
             metadata['runs'][label]={'passed':passed,'memory':memory,'kernel_sha256':digest(snapshot),'command':command}
