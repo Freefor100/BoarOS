@@ -37,16 +37,15 @@ static void fault(uint32_t signal, int32_t code, uint64_t address)
 { kernel_signal_force_fault(kernel_task_current(),signal,code,address); }
 static int read_instruction(struct kernel_mm *mm,uint64_t pc,uint32_t *instruction)
 {
-    struct kernel_mm_mapping mapping;void *page;
+    struct kernel_mm_user_pin pin={0};
     if((pc&3) || kernel_user_range_check(pc,sizeof(*instruction))!=KERNEL_UACCESS_STATUS_OK)return 0;
-    enum kernel_mm_status status=kernel_mm_lookup(mm,pc,&mapping);
-    if(status==KERNEL_MM_STATUS_NOT_MAPPED || status==KERNEL_MM_STATUS_ADDRESS_SPACE)return 0;
+    /* Resident-only EXEC qualification neither faults nor grants data READ. */
+    enum kernel_mm_status status=kernel_mm_try_pin_user_page(mm,pc,KERNEL_MM_EXECUTE,&pin);
+    if(status==KERNEL_MM_STATUS_NOT_MAPPED || status==KERNEL_MM_STATUS_ACCESS ||
+        status==KERNEL_MM_STATUS_CONFLICT)return 0;
     if(status!=KERNEL_MM_STATUS_OK)la_virt_fatal("instruction MM owner");
-    if((mapping.permissions&(KERNEL_MM_USER|KERNEL_MM_EXECUTE))!=(KERNEL_MM_USER|KERNEL_MM_EXECUTE))return 0;
-    /* 已取指的页驻留且 trap 中不切换；以 EXEC 资格借用 owner，不放宽数据 READ。 */
-    if(physical_page_resolve(mm->allocator,mapping.physical_address&~BOAROS_PAGE_MASK,&page)!=PHYSICAL_PAGE_STATUS_OK)
-        la_virt_fatal("instruction page owner");
-    memcpy(instruction,(unsigned char *)page+(pc&BOAROS_PAGE_MASK),sizeof(*instruction));
+    memcpy(instruction,(unsigned char *)pin.page+(pc&BOAROS_PAGE_MASK),sizeof(*instruction));
+    kernel_mm_unpin_user_page(&pin);
     return 1;
 }
 void la_trap_dispatch(struct arch_trap_frame *frame)

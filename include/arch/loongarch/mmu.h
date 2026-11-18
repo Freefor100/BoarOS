@@ -7,6 +7,7 @@
 #include <kernel/physical_page.h>
 #include <kernel/mm_retire.h>
 #include <kernel/mm_prepare.h>
+#include <kernel/mm_leaf.h>
 #include <kernel/page.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -68,6 +69,24 @@ struct arch_mmu_mapping {
     uint64_t physical_address;
     uint32_t permissions;
 };
+/* Native PMD leaves are 32 MiB (two 16 MiB EntryLo halves). */
+#define ARCH_MMU_HUGE_ORDER 11U
+#define ARCH_MMU_HUGE_SIZE (UINT64_C(1) << 25)
+/* Snapshot includes PROT_NONE and accepts an interior byte VA. Caller holds
+ * MM metadata protection; the result does not itself acquire ownership. */
+enum arch_mmu_status arch_mmu_user_leaf_snapshot(
+    const struct arch_mmu_user_space *, uint64_t, struct kernel_mm_leaf *);
+enum arch_mmu_status arch_mmu_user_leaf_missing_order(
+    struct arch_mmu_user_space *, uint64_t, uint32_t, unsigned *);
+/* Only orders 0/11. Entire-leaf aligned VA/PA; success consumes one data
+ * owner and only the published prepared tables. Failure consumes neither.
+ * No allocation/reclaim occurs here; caller publishes TLB changes. */
+enum arch_mmu_status arch_mmu_user_map_prepared_order(
+    struct arch_mmu_user_space *, uint64_t, uint64_t, uint32_t, int, uint32_t,
+    struct kernel_mm_leaf_preparation *);
+enum arch_mmu_status arch_mmu_user_cow_commit_order(
+    struct arch_mmu_user_space *, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t,
+    struct kernel_mm_retirement *);
 enum arch_mmu_status arch_mmu_user_detach_range(
     struct arch_mmu_user_space *, uint64_t start, uint64_t end,
     struct kernel_mm_detach_cursor *, struct kernel_mm_retirement *,
@@ -137,8 +156,10 @@ enum arch_mmu_status arch_mmu_user_lookup(
 
 /*
  * Removes owned leaves in [start, end).  The caller must establish that this
- * is the active address space before relying on the local TLB flush.  A
- * release is fail-stop. All owners are released before this call returns.
+ * is the only CPU accessing this address space before relying on local TLB
+ * invalidation. Shared live MMs must use detach_range and deferred retirement.
+ * Partial large leaves are rejected before mutation. A release is fail-stop;
+ * all transferred owners are released before this call returns.
  */
 enum arch_mmu_status arch_mmu_user_unmap_owned_range(
     struct arch_mmu_user_space *space,

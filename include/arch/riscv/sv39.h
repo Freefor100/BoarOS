@@ -8,6 +8,7 @@
 #include <kernel/physical_page.h>
 #include <kernel/mm_retire.h>
 #include <kernel/mm_prepare.h>
+#include <kernel/mm_leaf.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -264,4 +265,12 @@ enum riscv_sv39_status riscv_sv39_user_space_move(
 enum riscv_sv39_status riscv_sv39_user_space_destroy(
     struct riscv_sv39_user_space *space);
 
+enum riscv_sv39_status riscv_sv39_user_leaf_snapshot(const struct riscv_sv39_user_space *,
+    uint64_t, struct kernel_mm_leaf *);
+enum riscv_sv39_status riscv_sv39_user_leaf_missing_order(struct riscv_sv39_user_space *,
+    uint64_t, uint32_t, unsigned *);
+enum riscv_sv39_status riscv_sv39_user_map_prepared_order(struct riscv_sv39_user_space *,
+    uint64_t, uint64_t, uint32_t, int, uint32_t, struct kernel_mm_leaf_preparation *);
+enum riscv_sv39_status riscv_sv39_user_cow_commit_order(struct riscv_sv39_user_space *,
+    uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, struct kernel_mm_retirement *);
 #endif

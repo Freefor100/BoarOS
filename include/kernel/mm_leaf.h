@@ -1,0 +1,19 @@
+#ifndef BOAROS_KERNEL_MM_LEAF_H
+#define BOAROS_KERNEL_MM_LEAF_H
+#include <stdint.h>
+#include <kernel/page.h>
+/* Snapshot while the caller holds the MM metadata qualification. The PTE owns
+ * exactly one reference to physical_address at order, including PROT_NONE.
+ * Snapshot values are not references: retain the existing owner before dropping
+ * qualification, and compare cookie before publishing a replacement. */
+struct kernel_mm_leaf {
+    uint64_t virtual_address;  /* aligned leaf start, not the queried address */
+    uint64_t physical_address; /* aligned buddy head, never an interior page */
+    uint64_t cookie;           /* architecture PTE identity under MM locking */
+    uint32_t permissions;     /* effective ARCH_MMU_* flags; zero for PROT_NONE */
+    uint32_t order;           /* number of base-page address bits in this leaf */
+    uint32_t cow;
+};
+static inline uint64_t kernel_mm_leaf_size(const struct kernel_mm_leaf *leaf)
+{ return (uint64_t)BOAROS_PAGE_SIZE << leaf->order; }
+#endif

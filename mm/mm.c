@@ -1792,12 +1792,13 @@ static enum kernel_mm_status lookup_record(
     uint64_t virtual_address,
     struct kernel_mm_mapping *mapping)
 {
-    struct arch_mmu_mapping riscv_mapping;
+    struct kernel_mm_leaf riscv_mapping;
     enum arch_mmu_status backend_status;
-    backend_status = arch_mmu_user_lookup(&record->space,
+    backend_status = arch_mmu_user_leaf_snapshot(&record->space,
                                          virtual_address,
                                          &riscv_mapping);
-    if (backend_status == ARCH_MMU_STATUS_NOT_MAPPED) {
+    if (backend_status == ARCH_MMU_STATUS_NOT_MAPPED ||
+        (backend_status == ARCH_MMU_STATUS_OK && !riscv_mapping.permissions)) {
         return KERNEL_MM_STATUS_NOT_MAPPED;
     }
     if (backend_status != ARCH_MMU_STATUS_OK) {
@@ -1805,7 +1806,8 @@ static enum kernel_mm_status lookup_record(
                    ? KERNEL_MM_STATUS_INVALID_ARGUMENT
                    : KERNEL_MM_STATUS_ADDRESS_SPACE;
     }
-    mapping->physical_address = riscv_mapping.physical_address;
+    mapping->physical_address = riscv_mapping.physical_address + virtual_address - riscv_mapping.virtual_address;
+    mapping->order = riscv_mapping.order;
     mapping->permissions = 0U;
     if ((riscv_mapping.permissions & ARCH_MMU_READ) != 0U) {
         mapping->permissions |= KERNEL_MM_READ;
@@ -1839,12 +1841,12 @@ static enum kernel_mm_status remote_lookup_record(struct kernel_mm_record *recor
 {
     enum kernel_mm_status status = lookup_record(record,address,mapping);
     if (status != KERNEL_MM_STATUS_NOT_MAPPED) return status;
-    uint64_t physical; int cow;
-    enum arch_mmu_status found = arch_mmu_user_owned_snapshot(&record->space,
-        address & ~BOAROS_PAGE_MASK,&physical,&cow);
+    struct kernel_mm_leaf leaf;
+    enum arch_mmu_status found = arch_mmu_user_leaf_snapshot(&record->space,address,&leaf);
     if (found == ARCH_MMU_STATUS_NOT_MAPPED) return KERNEL_MM_STATUS_NOT_MAPPED;
     if (found) return KERNEL_MM_STATUS_ADDRESS_SPACE;
-    mapping->physical_address=physical+(address & BOAROS_PAGE_MASK);
+    mapping->physical_address=leaf.physical_address+address-leaf.virtual_address;
+    mapping->order=leaf.order;
     mapping->permissions=KERNEL_MM_USER;
     return KERNEL_MM_STATUS_OK;
 }
@@ -2317,10 +2319,11 @@ static inline enum kernel_mm_status lookup_user_mapping(const struct kernel_mm_r
 }
 
 static __attribute__((always_inline)) inline void register_user_pin(const struct kernel_mm *mm,
-    struct kernel_mm_record *record,uint64_t physical,void *pointer,uint32_t access,
+    struct kernel_mm_record *record,uint64_t physical,uint32_t order,void *pointer,uint32_t access,
     struct kernel_mm_user_pin *pin)
 {
-    if (physical_page_acquire(mm->allocator, physical) != PHYSICAL_PAGE_STATUS_OK)
+    uint64_t head=physical & ~(((uint64_t)BOAROS_PAGE_SIZE<<order)-1);
+    if (physical_page_acquire_order(mm->allocator, head, order) != PHYSICAL_PAGE_STATUS_OK)
         __builtin_trap();
     if (pin_count_add(&record->access_pins) == UINT32_MAX) __builtin_trap();
 #if BOAROS_COST_DIAGNOSTICS
@@ -2333,6 +2336,7 @@ static __attribute__((always_inline)) inline void register_user_pin(const struct
     pin->owner_next=owner->user_pins; pin->owner_previous=&owner->user_pins;
     if (pin->owner_next) pin->owner_next->owner_previous=&pin->owner_next;
     pin->page=pointer; pin->physical_address=physical; pin->access=access;
+    pin->owner_address=head; pin->order=order;
     owner->user_pins = pin;
 }
 
@@ -2351,17 +2355,19 @@ static __attribute__((always_inline)) inline enum kernel_mm_status pin_mapping(c
         if (!remote_access_allowed(&vma,access,1)) return KERNEL_MM_STATUS_ACCESS;
         status=remote_lookup_record(record,address,&mapping);
         if (!status && access == KERNEL_MM_WRITE) {
-            uint64_t physical; int cow;
-            if (arch_mmu_user_owned_snapshot(&record->space,address & ~BOAROS_PAGE_MASK,&physical,&cow))
+            struct kernel_mm_leaf leaf;
+            if (arch_mmu_user_leaf_snapshot(&record->space,address,&leaf))
                 return KERNEL_MM_STATUS_ADDRESS_SPACE;
-            if (cow) return KERNEL_MM_STATUS_ACCESS;
+            if (leaf.cow) return KERNEL_MM_STATUS_ACCESS;
         }
     } else status=lookup_user_mapping(record,address,access,&mapping);
     if (status != KERNEL_MM_STATUS_OK) return status;
     uint64_t physical = mapping.physical_address & ~BOAROS_PAGE_MASK;
     /* permission许可和取得实际页引用不能被撤映射插入。 */
-    if (physical_page_map_owned(mm->allocator, physical, &pointer) !=
+    uint64_t head=physical & ~(((uint64_t)BOAROS_PAGE_SIZE<<mapping.order)-1);
+    if (physical_page_map_owned(mm->allocator, head, &pointer) !=
         PHYSICAL_PAGE_STATUS_OK) return KERNEL_MM_STATUS_PAGE_ACCESS;
+    pointer=(unsigned char *)pointer+(physical-head);
     if (cache_write) {
         struct mm_file_resident *resident=find_file_resident(record,address&~BOAROS_PAGE_MASK);
         if (resident && kernel_page_cache_alias_active(&resident->alias)) {
@@ -2370,7 +2376,7 @@ static __attribute__((always_inline)) inline enum kernel_mm_status pin_mapping(c
             if (admitted) __builtin_trap();
         }
     }
-    register_user_pin(mm,record,physical,pointer,access,pin);
+    register_user_pin(mm,record,physical,mapping.order,pointer,access,pin);
     return KERNEL_MM_STATUS_OK;
 }
 
@@ -2388,7 +2394,7 @@ static __attribute__((always_inline)) inline void pin_private_fault(struct mm_op
     void *pointer;
     if (physical_page_map_owned(record->space.allocator,physical&~BOAROS_PAGE_MASK,&pointer))
         __builtin_trap();
-    register_user_pin(operation->mm,record,physical&~BOAROS_PAGE_MASK,pointer,access,operation->fault_pin);
+    register_user_pin(operation->mm,record,physical&~BOAROS_PAGE_MASK,0,pointer,access,operation->fault_pin);
 }
 
 static inline enum kernel_mm_status pin_user_prefix(const struct kernel_mm *mm,
@@ -2483,10 +2489,13 @@ static inline void unpin_user_pages(struct kernel_mm_user_pin *pins,unsigned cou
     /* The pin owns this reference independently of the current PTE. Drain
      * waits for completed access; allocator return needs no MM qualification. */
     if (count==1) {
-        if (physical_page_release(mm->allocator,pins[0].physical_address)) __builtin_trap();
+        if (physical_page_release_order(mm->allocator,pins[0].owner_address,pins[0].order)) __builtin_trap();
     } else {
-        const uint64_t physical[]={pins[0].physical_address,pins[1].physical_address};
-        physical_page_release_batch(mm->allocator,physical,2);
+        const uint64_t physical[]={pins[0].owner_address,pins[1].owner_address};
+        if (pins[0].order || pins[1].order) {
+            const uint8_t orders[]={(uint8_t)pins[0].order,(uint8_t)pins[1].order};
+            physical_page_release_order_batch(mm->allocator,physical,orders,2);
+        } else physical_page_release_batch(mm->allocator,physical,2);
     }
     for (unsigned i=count;i>0;) {
         struct kernel_mm_user_pin *pin=&pins[--i];
@@ -6460,12 +6469,13 @@ enum kernel_mm_status kernel_mm_try_futex_read(struct kernel_mm *mm, uint64_t ad
         return KERNEL_MM_STATUS_CONFLICT;
     if (status) return status;
     void *page;
-    if (physical_page_map_owned(mm->allocator, mapping.physical_address & ~BOAROS_PAGE_MASK,
+    uint64_t head=mapping.physical_address & ~(((uint64_t)BOAROS_PAGE_SIZE<<mapping.order)-1);
+    if (physical_page_map_owned(mm->allocator, head,
         &page) != PHYSICAL_PAGE_STATUS_OK) return KERNEL_MM_STATUS_PAGE_ACCESS;
     /* 整次读在PTE稳定资格内完成；PTE的物理owner覆盖它，不借出指针或pin。
      * 调用者的桶操作继续串行比较值与登记，private key只依赖MM和VA。 */
     *value = __atomic_load_n((const uint32_t *)((const unsigned char *)page +
-        (address & BOAROS_PAGE_MASK)), __ATOMIC_ACQUIRE);
+        (mapping.physical_address-head)), __ATOMIC_ACQUIRE);
     return KERNEL_MM_STATUS_OK;
 }
 

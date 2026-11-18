@@ -22,6 +22,10 @@
 #define arch_mmu_status riscv_sv39_status
 #define arch_mmu_user_discard_owned_page riscv_sv39_user_discard_owned_page
 #define arch_mmu_user_lookup riscv_sv39_user_lookup
+#define arch_mmu_user_leaf_snapshot riscv_sv39_user_leaf_snapshot
+#define arch_mmu_user_leaf_missing_order riscv_sv39_user_leaf_missing_order
+#define arch_mmu_user_map_prepared_order riscv_sv39_user_map_prepared_order
+#define arch_mmu_user_cow_commit_order riscv_sv39_user_cow_commit_order
 #define arch_mmu_user_map_cow_page riscv_sv39_user_map_cow_page
 #define arch_mmu_user_map_owned_page riscv_sv39_user_map_owned_page
 #define arch_mmu_user_map_zeroed_page riscv_sv39_user_map_zeroed_page
@@ -50,6 +54,8 @@
 #define ARCH_MMU_FORK_SKIP RISCV_SV39_FORK_SKIP
 #define ARCH_MMU_EXECUTE RISCV_SV39_EXECUTE
 #define ARCH_MMU_PAGE_SIZE RISCV_SV39_PAGE_SIZE_4K
+#define ARCH_MMU_HUGE_ORDER 9U
+#define ARCH_MMU_HUGE_SIZE RISCV_SV39_PAGE_SIZE_2M
 #define ARCH_MMU_READ RISCV_SV39_READ
 #define ARCH_MMU_STATUS_CONFLICT RISCV_SV39_STATUS_CONFLICT
 #define ARCH_MMU_STATUS_INVALID RISCV_SV39_STATUS_INVALID

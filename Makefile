@@ -2399,3 +2399,14 @@ test-gpt-host:
 .PHONY: test-seccomp-host
 test-seccomp-host:
 	sh tests/host/seccomp.sh
+
+.PHONY: test-huge-riscv test-mm-huge-host
+test-mm-huge-host:
+	sh tests/host/mm-base-leaf.sh
+	sh tests/host/mm-huge.sh
+
+$(BUILD_DIR)/tests/kernel-huge-rv: $(filter-out $(BUILD_DIR)/tests/riscv/sv39_main.o,$(SV39_TEST_OBJECTS)) $(BUILD_DIR)/tests/riscv/huge_main.o arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -o $@ $(filter %.o,$^)
+
+test-huge-riscv: $(BUILD_DIR)/tests/kernel-huge-rv
+	QEMU_RISCV64=$(QEMU_RISCV64) HUGE_TEST_KERNEL_RV=$< sh tests/riscv/huge.sh

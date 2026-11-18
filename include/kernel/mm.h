@@ -79,7 +79,7 @@ enum kernel_mm_status kernel_mm_check_files_domain(const struct kernel_mm *, con
 
 struct kernel_mm_mapping {
     uint64_t physical_address;
-    uint32_t permissions;
+    uint32_t permissions, order;
 };
 
 /* resident片段的实际页owner；caller的LIVE MM句柄须保持到unpin。
@@ -99,8 +99,9 @@ struct kernel_mm_user_pin {
     struct kernel_mm_user_pin *owner_next;
     struct kernel_mm_user_pin **owner_previous;
     void *page;
-    uint64_t physical_address;
-    uint32_t access;
+    uint64_t physical_address; /* addressed base-page PA, preserves futex identity */
+    uint64_t owner_address;    /* compound buddy head retained until unpin */
+    uint32_t access, order;
     struct kernel_page_cache_write_borrow cache_write;
 };
 /* Resolve a missing private page and lend its actual owner at publication;

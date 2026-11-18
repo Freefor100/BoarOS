@@ -1,6 +1,7 @@
 #include <arch/mmu.h>
 #include <platform/loongarch_virt.h>
 #include <arch/task.h>
+#include <string.h>
 void la_stack_window_contract(struct physical_page_allocator *a)
 {
     uint64_t before=physical_page_available(a),first,second;
@@ -107,10 +108,125 @@ static void detach_interleaving_contract(struct physical_page_allocator *allocat
     }
     la_virt_puts("LA detach concurrent neighbor and retired/replaced parent passed\n");
 }
+static void huge_check(int condition, unsigned stage)
+{
+    if (condition) return;
+    la_virt_puts("LA huge stage="); la_virt_hex(stage); la_virt_puts("\n");
+    la_virt_fatal("huge leaf contract");
+}
+static int huge_share(void *context, uint64_t address)
+{ (void)context; (void)address; return ARCH_MMU_FORK_SHARED; }
+static int huge_skip(void *context, uint64_t address)
+{ (void)context; (void)address; return ARCH_MMU_FORK_SKIP; }
+static void huge_leaf_contract(struct physical_page_allocator *allocator,
+    const struct arch_mmu_page_table *kernel)
+{
+    const uint64_t size = ARCH_MMU_HUGE_SIZE, address = size * 4;
+    const uint32_t order = ARCH_MMU_HUGE_ORDER, pages = 1U << order;
+    uint64_t before = physical_page_available(allocator), physical, replacement;
+    struct arch_mmu_user_space parent = {0}, child = {0}, shared = {0}, skipped = {0};
+    struct kernel_mm_leaf_preparation prepared = KERNEL_MM_LEAF_PREPARATION_INIT;
+    struct kernel_mm_leaf leaf, original;
+    struct arch_mmu_mapping mapping;
+    unsigned missing;
+    huge_check(!arch_mmu_user_space_init(&parent, allocator, kernel) &&
+        !physical_page_allocate_order(allocator, order, &physical), 1);
+    memset(la_virt_page_access(physical), 0x4b, size);
+    huge_check(arch_mmu_user_map_owned_page(&parent, address, physical, 3) == ARCH_MMU_STATUS_INVALID, 2);
+    huge_check(!arch_mmu_user_leaf_missing_order(&parent, address, order, &missing) && missing == 1, 3);
+    huge_check(!physical_page_allocate(allocator, &prepared.tables[0]), 4);
+    memset(la_virt_page_access(prepared.tables[0]), 0, BOAROS_PAGE_SIZE);
+    huge_check(!arch_mmu_user_map_prepared_order(&parent, address, physical, 3, 0, order, &prepared) &&
+        prepared.tables[0] == KERNEL_MM_NO_PAGE && parent.table_pages == 2 && parent.leaf_pages == pages, 5);
+    huge_check(arch_mmu_user_leaf_missing_order(&parent, address, 9, &missing) == ARCH_MMU_STATUS_INVALID &&
+        arch_mmu_user_leaf_missing(&parent, address, &missing) == ARCH_MMU_STATUS_CONFLICT &&
+        arch_mmu_user_map_prepared_order(&parent, address, physical + BOAROS_PAGE_SIZE, 3, 0, order, &prepared) == ARCH_MMU_STATUS_INVALID &&
+        arch_mmu_user_map_prepared_order(&parent, address, physical, 3, 0, order, &prepared) == ARCH_MMU_STATUS_CONFLICT &&
+        prepared.tables[0] == KERNEL_MM_NO_PAGE && parent.table_pages == 2, 29);
+    huge_check(!arch_mmu_user_leaf_snapshot(&parent, address + size - 1, &original) &&
+        original.virtual_address == address && original.physical_address == physical && original.order == order, 6);
+    huge_check(!arch_mmu_user_lookup(&parent, address + size - 1, &mapping) &&
+        mapping.physical_address == physical + size - 1, 7);
+    uint64_t cursor = address + BOAROS_PAGE_SIZE, found;
+    huge_check(!arch_mmu_user_next_owned(&parent, &cursor, address + size, &found) &&
+        found == address && cursor == address + size, 8);
+    huge_check(arch_mmu_user_protect_owned_range(&parent, address + BOAROS_PAGE_SIZE, address + size, 0) == ARCH_MMU_STATUS_INVALID &&
+        arch_mmu_user_unmap_owned_range(&parent, address, address + size - BOAROS_PAGE_SIZE) == ARCH_MMU_STATUS_INVALID &&
+        arch_mmu_user_protect_owned_page(&parent, address, 0) != ARCH_MMU_STATUS_OK &&
+        !arch_mmu_user_leaf_snapshot(&parent, address, &leaf) && leaf.cookie == original.cookie, 9);
+    struct kernel_mm_detach_cursor rejected_cursor = {0};
+    struct kernel_mm_retirement rejected_batch = {0};
+    huge_check(arch_mmu_user_detach_range(&parent, address + BOAROS_PAGE_SIZE, address + size,
+        &rejected_cursor, &rejected_batch, NULL, NULL) == ARCH_MMU_STATUS_INVALID &&
+        !rejected_cursor.phase && !rejected_batch.count, 30);
+    huge_check(!arch_mmu_user_map_zeroed_page(&parent, address + size, 3), 10);
+    huge_check(arch_mmu_user_leaf_missing_order(&parent, address + size, order, &missing) == ARCH_MMU_STATUS_CONFLICT, 31);
+    /* The refill must cover BOTH EntryLo halves, the last byte, and then
+     * return to a base-page translation without retaining a huge PS. */
+    uint64_t old_context = arch_mmu_current_context();
+    huge_check(!arch_mmu_switch_context(parent.root_address), 11);
+    volatile unsigned char *v = (volatile unsigned char *)(uintptr_t)address;
+    huge_check(v[0] == 0x4b && v[size/2] == 0x4b && v[size-1] == 0x4b, 12);
+    v[0] = 0x11; v[size/2] = 0x22; v[size-1] = 0x33; v[size] = 0x44;
+    arch_mmu_flush_all();
+    huge_check(v[size] == 0x44 && v[size-1] == 0x33 && v[0] == 0x11 && v[size/2] == 0x22, 13);
+    huge_check(!arch_mmu_switch_context(old_context), 14);
+    huge_check(!arch_mmu_user_space_fork(&shared, &parent, huge_share, NULL) &&
+        !arch_mmu_user_leaf_snapshot(&shared, address, &leaf) && !leaf.cow && (leaf.permissions & ARCH_MMU_WRITE), 15);
+    huge_check(!arch_mmu_user_space_fork(&skipped, &parent, huge_skip, NULL) &&
+        !skipped.leaf_pages && skipped.table_pages == 1 && !arch_mmu_user_space_destroy(&skipped) &&
+        !arch_mmu_user_space_destroy(&shared), 16);
+    huge_check(!arch_mmu_user_space_fork(&child, &parent, NULL, NULL) &&
+        parent.cow_pages == pages + 1 && child.cow_pages == pages + 1, 17);
+    huge_check(!arch_mmu_user_protect_owned_range(&child, address, address + size, 0) &&
+        child.protected_pages == pages && !arch_mmu_user_leaf_snapshot(&child, address + size/2, &leaf) &&
+        leaf.cow && !leaf.permissions && arch_mmu_user_lookup(&child, address, &mapping) == ARCH_MMU_STATUS_NOT_MAPPED, 18);
+    huge_check(!arch_mmu_user_protect_owned_range(&child, address, address + size, 3) &&
+        !arch_mmu_user_leaf_snapshot(&child, address, &leaf) && leaf.cow && !(leaf.permissions & ARCH_MMU_WRITE), 19);
+    huge_check(!physical_page_acquire_order(allocator, physical, order) &&
+        !physical_page_allocate_order(allocator, order, &replacement), 20);
+    memcpy(la_virt_page_access(replacement), la_virt_page_access(physical), size);
+    ((unsigned char *)la_virt_page_access(replacement))[size/2] = 0x55;
+    huge_check(!arch_mmu_switch_context(child.root_address) && v[size/2] == 0x22, 32);
+    struct kernel_mm_retirement batch = {0};
+    huge_check(arch_mmu_user_cow_commit(&child, address, leaf.cookie, replacement, 3, &batch) == ARCH_MMU_STATUS_INVALID &&
+        arch_mmu_user_cow_commit_order(&child, address, leaf.cookie ^ 1, replacement, 3, order, &batch) == ARCH_MMU_STATUS_CONFLICT &&
+        !batch.count, 21);
+    huge_check(!arch_mmu_user_cow_commit_order(&child, address, leaf.cookie, replacement, 3, order, &batch) &&
+        batch.count == 1 && batch.orders[0] == order && batch.pages[0] == physical, 22);
+    arch_mmu_sync_user(0, address, size, 0);
+    huge_check(v[size/2] == 0x55 && v[size-1] == 0x33 &&
+        !arch_mmu_switch_context(old_context), 33);
+    kernel_mm_retirement_release(allocator, &batch);
+    uint32_t refs;
+    huge_check(!physical_page_reference_count(allocator, physical, &refs) && refs == 2 &&
+        !physical_page_release_order(allocator, physical, order), 23);
+    huge_check(!arch_mmu_user_leaf_snapshot(&parent, address, &leaf) &&
+        !arch_mmu_user_cow_commit_order(&parent, address, leaf.cookie, KERNEL_MM_NO_PAGE, 3, order, &batch) &&
+        !batch.count && parent.cow_pages == 1, 24);
+    huge_check(!physical_page_acquire_order(allocator, replacement, order), 25);
+    uint64_t before_detach = physical_page_available(allocator);
+    struct kernel_mm_detach_cursor detach = {0};
+    enum arch_mmu_status status;
+    do {
+        status = arch_mmu_user_detach_range(&child, address, address + size, &detach, &batch, NULL, NULL);
+        huge_check(status == ARCH_MMU_STATUS_OK || status == ARCH_MMU_STATUS_NOT_MAPPED, 26);
+        arch_mmu_sync_user(0, address, size, 0);
+        kernel_mm_retirement_release(allocator, &batch);
+    } while (status == ARCH_MMU_STATUS_OK);
+    huge_check(physical_page_available(allocator) == before_detach &&
+        !physical_page_reference_count(allocator, replacement, &refs) && refs == 1 &&
+        ((unsigned char *)la_virt_page_access(replacement))[size-1] == 0x33, 27);
+    huge_check(!physical_page_release_order(allocator, replacement, order) &&
+        !arch_mmu_user_space_destroy(&child) && !arch_mmu_user_space_destroy(&parent) &&
+        physical_page_available(allocator) == before && !physical_page_allocator_audit(allocator), 28);
+    la_virt_puts("LA huge PMD halves/refill/fork/COW/protect/pin/retire passed\n");
+}
 void la_mmu_contract(struct physical_page_allocator *allocator)
 {
     uint64_t before=physical_page_available(allocator);
     struct arch_mmu_page_table kernel={.allocator=allocator,.state=ARCH_MMU_STATE_ACTIVE};
+    huge_leaf_contract(allocator,&kernel);
     detach_range_contract(allocator,&kernel);
     detach_interleaving_contract(allocator,&kernel);
     struct arch_mmu_user_space parent={0}, child={0};
