@@ -401,14 +401,21 @@ static enum kernel_files_status disk_read(
     if (kernel_open_file_flags(description)&KERNEL_FILES_O_DIRECT)
         return direct_read(files,mm,description,cursor,request,position,advance,linux_result);
     struct kernel_page_cache *cache=kernel_open_file_page_cache(description);
+    struct kernel_vfs_node *node=kernel_open_file_node(description);
     uint64_t total = 0;
     int error = 0, done = 0;
     enum kernel_files_status status = KERNEL_FILES_STATUS_OK;
     while (total < request && !done) {
+        /* As in kernel_vfs_pread, this snapshot only sizes the demand. The
+         * cache still revalidates every requested page against live EOF. */
+        uint64_t end=kernel_vfs_node_size(node);
+        if (position>=end) break;
+        uint64_t remaining=request-total;
+        if (remaining>end-position) remaining=end-position;
         uint64_t batch_start=position;
         int cache_miss=0;
         size_t start = position & BOAROS_PAGE_MASK;
-        size_t count = (start + request - total + BOAROS_PAGE_MASK) >> BOAROS_PAGE_SHIFT;
+        size_t count = (start + remaining + BOAROS_PAGE_MASK) >> BOAROS_PAGE_SHIFT;
         if (count > KERNEL_PAGE_CACHE_READ_BATCH_MAX) count = KERNEL_PAGE_CACHE_READ_BATCH_MAX;
         struct kernel_page_cache_read_page pages[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
         enum kernel_page_cache_status loaded;
