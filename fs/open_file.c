@@ -1466,21 +1466,28 @@ enum kernel_page_cache_status kernel_open_file_alias_attach(
         physical_address, alias, owner, virtual_address, rearm);
 }
 
-int kernel_open_file_pread(struct kernel_open_file_description *file,
-                           uint64_t offset,
-                           void *buffer,
-                           size_t size,
-                           size_t *bytes_read)
+int kernel_open_file_pread_mode(struct kernel_open_file_description *file,
+    uint64_t offset, void *buffer, size_t size, uint32_t status_flags, size_t *bytes_read)
 {
-    if (open_file_live(file) && file->block)
-        return kernel_block_file_pread(file, offset, buffer, size, kernel_open_file_flags(file), bytes_read);
     if (!open_file_live(file)) return -KERNEL_EINVAL;
-    if (bytes_read) *bytes_read = 0;
+    size_t ignored;
+    if (!bytes_read) bytes_read=&ignored;
+    *bytes_read=0;
+    if (file->block)
+        return kernel_block_file_pread(file,offset,buffer,size,status_flags,bytes_read);
+    if (status_flags&KERNEL_FILES_O_DIRECT)
+        return kernel_vfs_direct_pread(&file->file,offset,buffer,size,bytes_read);
     if (size) kernel_open_file_read_begin(file, offset);
     struct kernel_vfs_read_options options={.no_reuse=kernel_open_file_read_no_reuse(file)};
     int result = kernel_vfs_pread(&file->file, offset, buffer, size, bytes_read, &options);
-    if (bytes_read) kernel_open_file_read_progress(file, offset, *bytes_read, options.cache_miss);
+    kernel_open_file_read_progress(file, offset, *bytes_read, options.cache_miss);
     return result;
+}
+
+int kernel_open_file_pread(struct kernel_open_file_description *file,
+    uint64_t offset, void *buffer, size_t size, size_t *bytes_read)
+{
+    return kernel_open_file_pread_mode(file,offset,buffer,size,kernel_open_file_flags(file),bytes_read);
 }
 
 int kernel_open_file_sync_range(struct kernel_open_file_description *file,

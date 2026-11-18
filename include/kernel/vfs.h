@@ -389,6 +389,9 @@ int kernel_vfs_pwrite(struct kernel_vfs_file *file,
                       size_t *bytes_written);
 
 struct kernel_uaccess_iovec;
+size_t kernel_vfs_direct_alignment(struct kernel_vfs_file *);
+int kernel_vfs_pwrite_direct(struct kernel_vfs_file *,uint64_t,const void *,size_t,size_t *,const struct kernel_lock_guard *);
+int kernel_vfs_direct_pread(struct kernel_vfs_file *,uint64_t,void *,size_t,size_t *);
 struct kernel_vfs_user_write_result {
     uint64_t end_offset;
     size_t written, chunks;
@@ -397,10 +400,14 @@ struct kernel_vfs_user_write_result {
 /* 调用者持file/MM/iovec owner，iovec已导入并完成区间校验；
  * 保持整个请求写操作门，直接填入最终页。
  * 用户fault保留已提交前缀，内部uaccess错误单独报告，不转换为磁盘I/O错误。 */
-int kernel_vfs_write_user(struct kernel_vfs_file *,struct kernel_mm *,
+int kernel_vfs_write_user_mode(struct kernel_vfs_file *,struct kernel_mm *,
     const struct kernel_uaccess_iovec *,size_t iov_count,size_t count,
-    uint64_t offset,int append,struct kernel_vfs_size_limit *,
+    uint64_t offset,int append,int direct,struct kernel_vfs_size_limit *,
     struct kernel_vfs_user_write_result *);
+
+int kernel_vfs_write_user(struct kernel_vfs_file *,struct kernel_mm *,
+    const struct kernel_uaccess_iovec *,size_t,size_t,uint64_t,int,
+    struct kernel_vfs_size_limit *,struct kernel_vfs_user_write_result *);
 
 #define KERNEL_VFS_FALLOC_KEEP_SIZE 1U
 #define KERNEL_VFS_FALLOC_PUNCH_HOLE 2U

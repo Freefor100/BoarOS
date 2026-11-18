@@ -114,16 +114,17 @@ static int backing_transfer(struct loop_device *loop,int writing,uint64_t positi
     uint64_t offset=loop->info.offset+position;
     int error;
     if (writing && (loop->info.flags&KERNEL_LOOP_READ_ONLY)) return -KERNEL_EROFS;
-    if (loop->backing->kind==KERNEL_OPEN_FILE_KIND_BLOCK) {
-        error=writing?kernel_block_file_pwrite(loop->backing,offset,buffer,size,status_flags,done):
-            kernel_block_file_pread(loop->backing,offset,buffer,size,status_flags,done);
-    } else if (!writing)
-        error=kernel_open_file_pread(loop->backing,offset,buffer,size,done);
+    if (!writing)
+        error=kernel_open_file_pread_mode(loop->backing,offset,buffer,size,status_flags,done);
+    else if (loop->backing->kind==KERNEL_OPEN_FILE_KIND_BLOCK)
+        error=kernel_block_file_pwrite(loop->backing,offset,buffer,size,status_flags,done);
     else {
         KERNEL_LOCK_SCOPE(operation);
         kernel_vfs_file_write_lock(&loop->backing->file,&operation);
         error=kernel_vfs_file_modified(&loop->backing->file,offset,0);
-        if (!error) error=kernel_vfs_pwrite(&loop->backing->file,offset,buffer,size,done);
+        if (!error) error=(status_flags&KERNEL_FILES_O_DIRECT) ?
+            kernel_vfs_pwrite_direct(&loop->backing->file,offset,buffer,size,done,&operation) :
+            kernel_vfs_pwrite(&loop->backing->file,offset,buffer,size,done);
     }
     return error?error:*done==size?0:-KERNEL_EIO;
 }

@@ -3486,6 +3486,110 @@ int kernel_vfs_check_write_limit(struct kernel_vfs_size_limit *limit,
     return 0;
 }
 
+size_t kernel_vfs_direct_alignment(struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_node *node=kernel_vfs_file_node(file);
+    return node && (node->mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFREG &&
+        node->instance->ops->direct_alignment ?
+        node->instance->ops->direct_alignment(node) : 0;
+}
+
+/* No user mapping or pin may be held here: revocation can wait for those
+ * pins, including a caller whose buffer maps this same inode. */
+static int direct_transfer(struct kernel_vfs_file *file,uint64_t offset,
+    void *buffer,size_t size,int writing,size_t *done,
+    const struct kernel_lock_guard *operation)
+{
+    struct kernel_vfs_node *node=file->private_data;
+    struct kernel_page_cache *cache=node->instance->page_cache;
+    *done=0;
+    if (!operation || !operation->lock) {
+        operation=kernel_io_context_current()->locks;
+        while (operation && operation->lock!=&node->write_operation.lock)
+            operation=operation->previous;
+        if (!operation || !operation->write) __builtin_trap();
+    }
+    KERNEL_LOCK_SCOPE(io); kernel_vfs_node_lock(node,&io,1);
+    int error=kernel_file_mapping_prepare(node);
+    if (error) return error;
+    kernel_file_mapping_close(node);
+    kernel_lock_release(&io);
+    uint64_t first=offset&~BOAROS_PAGE_MASK;
+    uint64_t last=(offset+size+BOAROS_PAGE_MASK)&~BOAROS_PAGE_MASK;
+    kernel_file_mapping_invalidate_range(node,first,last);
+    error=kernel_page_cache_writeback_range_borrowing(cache,node,first,last,operation);
+    kernel_vfs_node_lock(node,&io,1);
+    if (!error) {
+        if (writing>0) {
+            struct file_write_span span={.offset=offset,.buffer=buffer,.size=size};
+            error=node->instance->ops->writeback(node,&span,1);
+            *done=span.written;
+            if (*done && offset+*done>node->size) {
+                __atomic_store_n(&node->size,offset+*done,__ATOMIC_RELEASE);
+                file->size=node->size;
+            }
+        } else if (!writing) error=node->instance->ops->pread(node,offset,buffer,size,done);
+        /* Even an error may have changed media. No clean cached preimage may
+         * survive and later hide a device-completed prefix. */
+        kernel_page_cache_invalidate_range(cache,node,first,last);
+    }
+    kernel_file_mapping_open(node);
+    return error;
+}
+
+int kernel_vfs_direct_pread(struct kernel_vfs_file *file,uint64_t offset,
+    void *buffer,size_t size,size_t *done)
+{
+    KERNEL_SERVICE_SCOPE(service);
+    *done=0;
+    size_t align=kernel_vfs_direct_alignment(file);
+    if (!align || offset>INT64_MAX || size>INT64_MAX-offset) return -KERNEL_EINVAL;
+    if (!size) return 0;
+    KERNEL_LOCK_SCOPE(operation); kernel_vfs_file_write_lock(file,&operation);
+    if (offset>=kernel_vfs_node_size(file->private_data)) return 0;
+    if (offset%align || size%align) return -KERNEL_EINVAL;
+    return direct_transfer(file,offset,buffer,size,0,done,&operation);
+}
+
+static int direct_write_source(struct kernel_vfs_file *file,uint64_t offset,
+    struct kernel_vfs_write_source *source,size_t size,size_t *written)
+{
+    struct kernel_vfs_node *node=file->private_data;
+    size_t alignment=kernel_vfs_direct_alignment(file);
+    if (!alignment || offset%alignment || size%alignment) return -KERNEL_EINVAL;
+    /* Kernel/pipe/loop owners already lend stable bytes through synchronous
+     * completion. Only faultable user mappings need the bounded staging copy. */
+    if (!source->mm)
+        return direct_transfer(file,offset,(void *)source->data,size,1,written,source->operation);
+    size_t remaining=size;
+    struct kernel_uaccess_iov_cursor check=source->user;
+    while (source->mm && remaining) {
+        uint64_t address;size_t n=kernel_uaccess_iov_span(&check,remaining,&address);
+        if (!n || address%alignment || n%alignment) return -KERNEL_EINVAL;
+        check.offset+=n;remaining-=n;
+    }
+    unsigned char *staging;
+    if (kernel_heap_allocate(node->instance->heap,BOAROS_PAGE_SIZE,(void **)&staging)) return -KERNEL_ENOMEM;
+    int error=0;
+    while (*written<size) {
+        size_t n=size-*written,copied=0,done=0;
+        if (n>BOAROS_PAGE_SIZE) n=BOAROS_PAGE_SIZE;
+        while (copied<n) {
+            struct kernel_vfs_write_view view={0};
+            if (!kernel_vfs_write_source_prepare(source,n-copied,&view)) break;
+            kernel_vfs_write_source_copy_view(source,staging+copied,&view);
+            copied+=view.size;
+            kernel_vfs_write_source_finish(source,&view);
+        }
+        copied-=copied%alignment;
+        if (copied) error=direct_transfer(file,offset+*written,staging,copied,1,&done,source->operation);
+        *written+=done;
+        if (error || source->access || done<n) break;
+    }
+    kernel_heap_release(node->instance->heap,staging);
+    return error;
+}
+
 /* 写入口持有整次请求的rank15；内部来源循环只借用同一个owner。 */
 static int vfs_write_source_locked(struct kernel_vfs_file *file,uint64_t offset,
     struct kernel_vfs_write_source *source,size_t size,
@@ -3531,9 +3635,24 @@ static int vfs_write_source_locked(struct kernel_vfs_file *file,uint64_t offset,
     }
     if (node->file_seals&KERNEL_SEAL_WRITES) return -KERNEL_EPERM;
     kernel_lock_release(&node_guard);
-    result = node->memory
+    int direct=0;
+    if (source->direct && node->instance->ops->direct_write_limit) {
+        uint64_t frontier=node->instance->ops->direct_write_limit(node);
+        direct=offset<=frontier && size<=frontier-offset;
+    }
+    result = direct ? direct_write_source(file,offset,source,size,&written) : node->memory
         ? memory_write_source(node,offset,source,size,&written)
         : kernel_page_cache_write_source(node->instance->page_cache,file,offset,source,size,&written);
+    if (source->direct && !direct && written) {
+        size_t ignored;
+        int flush=direct_transfer(file,offset,NULL,written,-1,&ignored,source->operation);
+        if (flush) {
+            /* Linux direct_write_fallback does not count uncertain buffered
+             * completion or advance the OFD, although inode/cache changes stay. */
+            kernel_vfs_notify_file(file,VFS_NOTIFY_MODIFY);
+            written=0; result=flush;
+        }
+    }
     file->size = node->size;
     *bytes_written = written;
     if (written) kernel_vfs_notify_file(file,VFS_NOTIFY_MODIFY);
@@ -3590,6 +3709,14 @@ int kernel_vfs_pwrite(struct kernel_vfs_file *file,uint64_t offset,
     return pwrite_source(file,offset,&source,size,bytes_written);
 }
 
+int kernel_vfs_pwrite_direct(struct kernel_vfs_file *file,uint64_t offset,
+    const void *buffer,size_t size,size_t *written,const struct kernel_lock_guard *operation)
+{
+    struct kernel_vfs_write_source source={.data=buffer,.direct=1,.operation=operation};
+    VFS_TEMPORARY_WRITER(writer,file);
+    return vfs_write_source_locked(file,offset,&source,size,NULL,written);
+}
+
 int kernel_vfs_pwrite_cached(struct kernel_vfs_file *file,uint64_t offset,
     const struct kernel_page_cache_read_page *pages,size_t source_offset,size_t size,size_t *written)
 {
@@ -3597,9 +3724,9 @@ int kernel_vfs_pwrite_cached(struct kernel_vfs_file *file,uint64_t offset,
     return pwrite_source(file,offset,&source,size,written);
 }
 
-int kernel_vfs_write_user(struct kernel_vfs_file *file,struct kernel_mm *mm,
+int kernel_vfs_write_user_mode(struct kernel_vfs_file *file,struct kernel_mm *mm,
     const struct kernel_uaccess_iovec *iov,size_t iov_count,size_t count,
-    uint64_t offset,int append,struct kernel_vfs_size_limit *limit,
+    uint64_t offset,int append,int direct,struct kernel_vfs_size_limit *limit,
     struct kernel_vfs_user_write_result *result)
 {
     if (!file || file->state!=VFS_FILE_STATE_LIVE || !file->private_data ||
@@ -3616,13 +3743,19 @@ int kernel_vfs_write_user(struct kernel_vfs_file *file,struct kernel_mm *mm,
         offset=node->size;
         result->end_offset=offset;
     }
-    struct kernel_vfs_write_source source={.mm=mm,.user={iov,iov_count,0,0}};
+    struct kernel_vfs_write_source source={.mm=mm,.user={iov,iov_count,0,0},.direct=direct,.operation=&operation};
     int error=vfs_write_source_locked(file,offset,&source,count,limit,&result->written);
     result->end_offset=offset+result->written;
     result->access=source.access;
     result->chunks=source.chunks;
     return error;
 }
+
+int kernel_vfs_write_user(struct kernel_vfs_file *file,struct kernel_mm *mm,
+    const struct kernel_uaccess_iovec *iov,size_t iov_count,size_t count,
+    uint64_t offset,int append,struct kernel_vfs_size_limit *limit,
+    struct kernel_vfs_user_write_result *result)
+{ return kernel_vfs_write_user_mode(file,mm,iov,iov_count,count,offset,append,0,limit,result); }
 
 static int ftruncate_borrowing(struct kernel_vfs_file *,uint64_t,
     const struct kernel_lock_guard *,struct kernel_vfs_size_limit *);

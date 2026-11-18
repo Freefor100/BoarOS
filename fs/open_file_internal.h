@@ -14,6 +14,9 @@ struct kernel_block_device;
 struct kernel_async_io;
 struct kernel_namespace;
 
+int kernel_open_file_pread_mode(struct kernel_open_file_description *file,
+    uint64_t offset, void *buffer, size_t size, uint32_t status_flags, size_t *bytes_read);
+
 struct kernel_open_file_description {
     struct kernel_vfs_file file;
     struct kernel_open_file_description *cleanup_next;

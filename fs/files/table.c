@@ -1104,7 +1104,8 @@ enum kernel_files_status kernel_files_fcntl(
             file->file.private_data && !kernel_vfs_file_noappend_allowed(&file->file)) *result=-KERNEL_EPERM;
         else if((argument&KERNEL_FILES_O_NOATIME) && !(kernel_open_file_flags(file)&KERNEL_FILES_O_NOATIME) &&
             !kernel_open_file_noatime_allowed(file))*result=-KERNEL_EPERM;
-        else if((argument&KERNEL_FILES_O_DIRECT) && file->kind!=KERNEL_OPEN_FILE_KIND_BLOCK)
+        else if((argument&KERNEL_FILES_O_DIRECT) && file->kind!=KERNEL_OPEN_FILE_KIND_BLOCK &&
+            !kernel_vfs_direct_alignment(&file->file))
             *result=-KERNEL_EINVAL;
         else *result=kernel_open_file_async_flags(file,(int)fd,(uint32_t)argument);
         return 0;
