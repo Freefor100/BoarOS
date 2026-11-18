@@ -278,13 +278,26 @@ struct kernel_wait_queue *kernel_socket_wait_queue(struct kernel_socket *socket)
 void kernel_socket_expire_timers(void);
 int kernel_socket_loopback_flags(const char name[16], uint16_t *flags);
 int kernel_socket_set_loopback_flags(const char name[16], uint16_t flags);
+struct kernel_socket_ipv6_address {
+    uint8_t address[16], prefix, flags, present;
+    uint32_t valid, preferred, created, updated;
+};
 struct kernel_socket_interface {
     char name[16];
     uint32_t index, address, netmask, mtu;
     uint16_t flags, hardware_type;
     uint8_t mac[6];
     uint32_t gateway;
-    int default_route, ipv6_loopback, link_up;
+    int default_route, ipv6_present, link_up;
+    uint8_t ipv6_address[16], ipv6_flags;
+    union {
+        struct kernel_socket_ipv6_address ipv6_addresses[4];
+        /* Compatibility name for the two reserved manual address slots. */
+        struct kernel_socket_ipv6_address ipv6_static[4];
+    };
+    struct { uint8_t address[16], prefix, present; uint32_t lifetime; } ipv6_prefixes[5];
+    struct { uint8_t address[16], preference, present; uint32_t lifetime; } ipv6_routers[3];
+    uint8_t ipv6_gateway[16];
 };
 int kernel_socket_interface_get(const char name[16], struct kernel_socket_interface *snapshot);
 int kernel_socket_interface_index(uint32_t index, struct kernel_socket_interface *snapshot);
@@ -292,6 +305,9 @@ int kernel_socket_interface_nth(uint32_t ordinal, struct kernel_socket_interface
 int kernel_socket_interface_set_flags(const char name[16], uint16_t flags);
 int kernel_socket_interface_set_ipv4(const char name[16], uint32_t command, uint32_t value);
 int kernel_socket_interface_set_mtu(const char name[16], int32_t mtu);
+int kernel_socket_family(const struct kernel_socket *);
+int kernel_socket_ipv6_address(uint32_t,const uint8_t[16],uint32_t,int);
+int kernel_socket_ipv6_gateway(uint32_t,const uint8_t[16],int);
 int kernel_socket_default_route(const char *name, uint32_t gateway, int remove);
 void kernel_socket_network_initialize(void);
 void kernel_socket_network_purge_orphans(void);

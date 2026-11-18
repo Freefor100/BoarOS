@@ -94,6 +94,12 @@ ip6_route(const ip6_addr_t *src, const ip6_addr_t *dest)
 
   LWIP_ASSERT_CORE_LOCKED();
 
+#ifdef BOAROS_LWIP_STATIC_IPV6
+  if (!ip6_addr_has_scope(dest, IP6_UNKNOWN) && !ip6_addr_has_scope(src, IP6_UNICAST) &&
+      !ip6_addr_isloopback(src)) {
+    return boaros_lwip_ip6_route(src, dest);
+  }
+#endif
   /* If single netif configuration, fast return. */
   if ((netif_list != NULL) && (netif_list->next == NULL)) {
     if (!netif_is_up(netif_list) || !netif_is_link_up(netif_list) ||
@@ -263,7 +269,7 @@ ip6_route(const ip6_addr_t *src, const ip6_addr_t *dest)
  * - Rules 4, 5, 5.5: not applicable
  * - Rule 6: not implemented
  * - Rule 7: not applicable
- * - Rule 8: limited to "prefer /64 subnet match over non-match"
+ * - Rule 8: full common prefix, capped at the configured source prefix.
  *
  * For Rule 2, we deliberately deviate from RFC 6724 Sec. 3.1 by considering
  * ULAs to be of smaller scope than global addresses, to avoid that a preferred
@@ -329,13 +335,22 @@ ip6_select_source_address(struct netif *netif, const ip6_addr_t *dest)
       cand_scope = IP6_MULTICAST_SCOPE_RESERVEDF;
     }
     cand_pref = ip6_addr_ispreferred(netif_ip6_addr_state(netif, i));
-    /* @todo compute the actual common bits, for longest matching prefix. */
+    /* Prefer the common prefix within the configured source subnet. */
     /* We cannot count on the destination address having a proper zone
      * assignment, so do not compare zones in this case. */
-    cand_bits = ip6_addr_net_zoneless_eq(cand_addr, dest); /* just 1 or 0 for now */
+#ifdef BOAROS_LWIP_STATIC_IPV6
+    cand_bits = (u8_t)boaros_lwip_ip6_prefix_bits(cand_addr, dest);
+    if (cand_bits == 128) {
+      return netif_ip_addr6(netif, i);
+    }
+    if ((netif->ip6_configured[i] || !netif_ip6_addr_isstatic(netif,i)) && cand_bits > netif->ip6_prefix[i])
+      cand_bits = netif->ip6_prefix[i];
+#else
+    cand_bits = ip6_addr_net_zoneless_eq(cand_addr, dest);
     if (cand_bits && ip6_addr_nethost_eq(cand_addr, dest)) {
       return netif_ip_addr6(netif, i); /* Rule 1 */
     }
+#endif
     if ((best_addr == NULL) || /* no alternative yet */
         ((cand_scope < best_scope) && (cand_scope >= dest_scope)) ||
         ((cand_scope > best_scope) && (best_scope < dest_scope)) || /* Rule 2 */
@@ -512,6 +527,7 @@ ip6_input(struct pbuf *p, struct netif *inp)
   struct netif *netif;
   const u8_t *nexth;
   u16_t hlen, hlen_tot; /* the current header length */
+  u8_t had_fragment = 0;
 #if 0 /*IP_ACCEPT_LINK_LAYER_ADDRESSING*/
   @todo
   int check_ip_src=1;
@@ -610,7 +626,9 @@ ip6_input(struct pbuf *p, struct netif *inp)
        * (for Neighbor discovery). */
       netif = NULL;
       for (i = 0; i < LWIP_IPV6_NUM_ADDRESSES; i++) {
-        if (ip6_addr_isvalid(netif_ip6_addr_state(inp, i)) &&
+        /* Tentative addresses must hear competing DAD solicitations too. */
+        if ((ip6_addr_isvalid(netif_ip6_addr_state(inp, i)) ||
+             ip6_addr_istentative(netif_ip6_addr_state(inp, i))) &&
             ip6_addr_solicitednode_eq(ip6_current_dest_addr(), netif_ip6_addr(inp, i))) {
           netif = inp;
           LWIP_DEBUGF(IP6_DEBUG, ("ip6_input: solicited node packet accepted on interface %c%c\n",
@@ -962,6 +980,7 @@ netif_found:
     case IP6_NEXTH_FRAGMENT:
     {
       struct ip6_frag_hdr *frag_hdr;
+      had_fragment = 1;
       LWIP_DEBUGF(IP6_DEBUG, ("ip6_input: packet with Fragment header\n"));
 
       frag_hdr = (struct ip6_frag_hdr *)p->payload;
@@ -1080,6 +1099,11 @@ options_done:
 #endif /* LWIP_TCP */
 #if LWIP_ICMP6
     case IP6_NEXTH_ICMP6:
+      /* RFC 6980 includes atomic fragments and extension headers following
+       * the fragment header. Never pass fragmented ND to the state machine. */
+      if (had_fragment && p->tot_len && pbuf_get_at(p,0)>=133 && pbuf_get_at(p,0)<=137) {
+        pbuf_free(p);IP6_STATS_INC(ip6.drop);break;
+      }
       icmp6_input(p, inp);
       break;
 #endif /* LWIP_ICMP */

@@ -11,6 +11,7 @@
 #include <kernel/page.h>
 #include "net-config.h"
 #include "lwip/etharp.h"
+#include "lwip/ethip6.h"
 #include "lwip/ip4_frag.h"
 #include "lwip/netif.h"
 #include "lwip/pbuf.h"
@@ -91,6 +92,28 @@ static err_t link_output(struct netif *interface, struct pbuf *p)
     if (result == -KERNEL_EAGAIN) { kernel_socket_network_blocked(); return ERR_MEM; }
     return result >= 0 ? ERR_OK : result == -KERNEL_EMSGSIZE ? ERR_BUF : ERR_IF;
 }
+static err_t ipv6_output(struct netif *interface,struct pbuf *p,const ip6_addr_t *destination)
+{
+    /* IPv6 cannot use a sub-1280 link. Check before neighbor queue admission,
+     * otherwise an oversized unresolved datagram would falsely succeed. */
+    if (interface->mtu<1280) return ERR_RTE;
+    if (p->tot_len>netif_mtu6(interface)) return ERR_BUF;
+    const struct ip6_hdr *header=p->payload;
+    ip6_addr_t source;ip6_addr_copy_from_packed(source,header->src);
+    /* Loopback is host-local even when an explicit device or /0 route would
+     * otherwise select Ethernet. Enforce this for TCP and queued output too. */
+    if(ip6_addr_isloopback(&source) || ip6_addr_isloopback(destination))return ERR_RTE;
+    /* A queued packet can outlive MTU/address withdrawal and renewed DAD.
+     * Only DAD itself may leave with the unspecified source. */
+    if (!ip6_addr_isany(&source)) {
+        int valid=0;
+        for (unsigned i=0;i<LWIP_IPV6_NUM_ADDRESSES;i++)
+            if (ip6_addr_isvalid(netif_ip6_addr_state(interface,i)) &&
+                ip6_addr_zoneless_eq(&source,netif_ip6_addr(interface,i))) {valid=1;break;}
+        if (!valid) return ERR_RTE;
+    }
+    return ethip6_output(interface,p,destination);
+}
 static err_t interface_init(struct netif *interface)
 {
     struct kernel_network *n = interface->state;
@@ -98,7 +121,8 @@ static err_t interface_init(struct netif *interface)
     interface->hwaddr_len = 6; memcpy(interface->hwaddr, n->device->mac, 6);
     interface->mtu = 1500;
     interface->flags = NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP | NETIF_FLAG_ETHERNET;
-    interface->output = etharp_output; interface->linkoutput = link_output;
+    interface->output = etharp_output; interface->output_ip6 = ipv6_output;
+    interface->linkoutput = link_output;
     return ERR_OK;
 }
 static unsigned pool_used(void)
@@ -191,14 +215,19 @@ static void input_frame(struct kernel_network *n, struct virtio_net_frame *frame
 {
     struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
     const unsigned char *data = frame->data;
-    int udp = frame->size >= 34 && data[12] == 8 && data[13] == 0 && data[23] == 17;
+    int budgeted = (frame->size >= 34 && data[12] == 8 && data[13] == 0 && data[23] == 17) ||
+        /* Extension-header traffic is conservatively budgeted too: it may
+         * terminate in UDP. Direct TCP/ICMPv6 retain the control reserve. */
+        (frame->size >= 54 && data[12] == 0x86 && data[13] == 0xdd &&
+         data[20] != 6 && data[20] != 58);
     int address_ok = frame->size >= 14 &&
         ((!memcmp(data, n->device->mac, 6)) || (data[0] & 1));
     /* 预算检查包含即将持有的版本，不能先吃掉控制余量再等待完整重组。 */
     unsigned loaned = virtio_net_get_progress(n->device).loaned;
     unsigned loans = loaned < 32 ? 1 : 0;
     unsigned pool = loans ? 0 : (frame->size + PBUF_POOL_BUFSIZE - 1) / PBUF_POOL_BUFSIZE;
-    if (!address_ok || (udp && !udp_capacity_after(loaned, loans, pool))) goto dropped;
+    if (!address_ok || (frame->size>=14 && data[12]==0x86 && data[13]==0xdd && n->interface.mtu<1280) ||
+        (budgeted && !udp_capacity_after(loaned, loans, pool))) goto dropped;
     struct pbuf *p;
     if (!virtio_net_lend(n->device, frame->buffer)) {
         struct network_rx *rx = &n->rx[frame->buffer];
@@ -287,6 +316,8 @@ int kernel_network_start(struct kernel_network **owner, struct kernel_heap *heap
             kernel_socket_protocol_leave(&saved); (void)kernel_network_stop(owner); return -KERNEL_ENOMEM;
         }
         n->attached = 1;
+        /* DAD publishes the MAC-derived address only after neighbor probing. */
+        netif_create_ip6_linklocal_address(&n->interface, 1);
         netif_set_up(&n->interface);
         if (virtio_net_get_progress(device).link_up) netif_set_link_up(&n->interface);
         netif_set_default(&n->interface);

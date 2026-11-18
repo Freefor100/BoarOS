@@ -388,6 +388,10 @@ udp_input(struct pbuf *p, struct netif *inp)
       } else
 #endif /* LWIP_UDPLITE */
       {
+        /* RFC 8200: ordinary IPv6 UDP cannot omit its checksum. */
+        if (ip_current_is_v6() && udphdr->chksum == 0) {
+          goto chkerr;
+        }
         if (udphdr->chksum != 0) {
           if (ip_chksum_pseudo(p, IP_PROTO_UDP, p->tot_len,
                                ip_current_src_addr(),

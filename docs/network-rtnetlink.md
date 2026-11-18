@@ -27,10 +27,11 @@
   不宣称支持策略路由、增删改、netlink multicast 或用户态单播。
 - LINK 导出真实名称、ifindex、硬件类型/MAC、MTU、UP/RUNNING/LOWER_UP、
   operstate。内核没有 qdisc，导出 `noqueue` / txqlen 0，不伪造统计计数。
-- ADDR 导出现有单 IPv4 地址/掩码、广播地址，以及 netif 确实持有的 loopback
-  IPv6 `::1`。没有配置的 Ethernet IPv6 地址不会凭空出现在结果里。
-- ROUTE 导出现有 IPv4 直连网段、本地地址、IPv6 loopback 及实际配置的
-  唯一 IPv4 default gateway。没有 gateway 时不输出默认路由。
+- ADDR 导出现有单 IPv4 地址/掩码、广播地址，以及 netif 确实持有的 IPv6
+  loopback、link-local、两个静态与两个SLAAC地址；包含真实前缀、tentative/dadfailed/deprecated，动态地址不标PERMANENT，IFA_CACHEINFO反映剩余寿命和创建/更新时间。
+- ROUTE 导出现有 IPv4 直连网段、本地地址与唯一 IPv4 default，以及 IPv6
+  本地/connected 路由、显式 IPv6 default gateway以及RA的L前缀/默认路由（protocol9、metric2048、PREF、CACHEINFO的100Hz到期时间）；静态default为metric1024，A-only地址仅导出local /128，不虚构connected。IPv6 相同 connected prefix
+  去重，tentative/duplicate 地址不生成可用路由，没有 gateway 时不输出默认路由。
   不把 Linux 的任意 FIB / namespace / rule / 多地址模型假装为已有能力。
 
 回复使用四字节对齐并清零 padding，保持请求 sequence；dump 项标记 MULTI，
@@ -44,7 +45,7 @@ payload。短正文/非法 attribute 返回 EINVAL，找不到 link 返回 ENODE
 随后释放协议对象保护并编码回复。排队的是不可变字节，不保存 netif 指针，不在
 普通 TCP/UDP 数据路径添加统计、缓存失效或新锁。
 
-当前已有接口数量很小，使用显式上限：16 个 snapshot、4096-byte 请求、
+当前已有接口数量很小，使用显式上限：在既有编码堆工作区尾部放置16 个 snapshot、4096-byte 请求、
 16384-byte 编码空间。超限返回 EMSGSIZE / ENOBUFS，不截断成“成功的完整 dump”。
 一次 send 的所有消息回复在一个 datagram 内原子排队，因此不会 interleave；
 MULTI / DONE 可以处于同一 datagram。消费端仍须按 nlmsg_len 迭代。
