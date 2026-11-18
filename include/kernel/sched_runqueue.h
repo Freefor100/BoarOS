@@ -1,6 +1,12 @@
 #ifndef BOAROS_KERNEL_SCHED_RUNQUEUE_H
 #define BOAROS_KERNEL_SCHED_RUNQUEUE_H
 #include <kernel/avl.h>
+#include <kernel/cpu_config.h>
+#if BOAROS_USER_SMP
+struct kernel_fair_link {
+    struct kernel_fair_link *next,*previous;
+};
+#endif
 /* One node belongs to either the RT FIFO or the fair tree, never both.
  * The owning CPU run lock (UP: scheduler domain) protects either index. */
 struct kernel_sched_node {
@@ -10,12 +16,18 @@ struct kernel_sched_node {
     };
     void *owner;
     unsigned priority,queued;
+#if BOAROS_USER_SMP
+    unsigned fair_weight; /* Snapshot while queued, including a later nice/PI change. */
+#endif
 };
 struct kernel_sched_runqueue {
     struct kernel_sched_node *rt_first,*rt_last;
     struct kernel_sched_node *heads[100],*tails[100];
     struct kernel_avl_node *fair_root;
     uint64_t min_vruntime;
+#if BOAROS_USER_SMP
+    uint64_t fair_weight;
+#endif
     unsigned boosted,count;
 };
 void kernel_sched_enqueue(struct kernel_sched_runqueue *,struct kernel_sched_node *,void *,unsigned,int);

@@ -66,6 +66,11 @@ struct kernel_cpu {
      * narrow it further, so a positive count still requires the real check. */
     uint32_t pullable_ready;
 #if BOAROS_USER_SMP
+    struct kernel_fair_link fair_candidates;
+    uint64_t fair_balance_next_ns;
+    unsigned fair_balance_cursor;
+#endif
+#if BOAROS_USER_SMP
     uint32_t pullable_rt;
 #endif
     uint64_t ipi_sent, ipi_received, rfence_requests;

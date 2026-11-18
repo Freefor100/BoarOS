@@ -8,7 +8,7 @@ struct kernel_raw_lock kernel_wait_domain __attribute__((weak));
 _Thread_local uintptr_t sync_test_irq;
 static _Thread_local struct kernel_cpu *active;
 static struct kernel_cpu cpus[BOAROS_MAX_CPUS];
-static struct kernel_task idles[BOAROS_MAX_CPUS], tasks[BOAROS_MAX_CPUS>4?BOAROS_MAX_CPUS:4];
+static struct kernel_task idles[BOAROS_MAX_CPUS], tasks[BOAROS_MAX_CPUS>5?BOAROS_MAX_CPUS:5];
 static pthread_barrier_t gate;
 static struct kernel_task *selected[BOAROS_MAX_CPUS];
 static unsigned deliveries;
@@ -17,7 +17,8 @@ static unsigned first_claimed;
 
 void *sync_test_cpu(void) { return active; }
 void *sync_test_current_task(void) { return active->current; }
-uint64_t kernel_time_monotonic_ns(void) { return 1; }
+static uint64_t scheduler_test_now=1;
+uint64_t kernel_time_monotonic_ns(void) { return scheduler_test_now; }
 #ifndef SMP_TEST_USE_LIFETIME
 void scheduler_task_publish_locked(struct kernel_task *task) { (void)task; assert(0); }
 #endif
