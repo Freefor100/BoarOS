@@ -333,6 +333,9 @@ netif_add(struct netif *netif,
     netif->ip6_addr_state[i] = IP6_ADDR_INVALID;
 #ifdef BOAROS_LWIP_STATIC_IPV6
     netif->ip6_configured[i] = 0;
+#if LWIP_IPV6_MLD
+    netif->ip6_mld_joined[i] = 0;
+#endif
     netif->ip6_created[i] = netif->ip6_updated[i] = 0;
     netif->ip6_prefix[i] = 128;
 #endif
@@ -825,6 +828,7 @@ netif_remove(struct netif *netif)
   }
 #if LWIP_IPV6_MLD
   /* stop MLD processing */
+  boaros_lwip_netif_removed(netif);
   mld6_stop(netif);
 #endif /* LWIP_IPV6_MLD */
 #endif /* LWIP_IPV6 */
@@ -1528,7 +1532,7 @@ netif_ip6_addr_set_state_mode(struct netif *netif, s8_t addr_idx, u8_t state, in
 #if LWIP_IPV6_MLD
     /* Reevaluate solicited-node multicast group membership. */
     if (netif->flags & NETIF_FLAG_MLD6) {
-      nd6_adjust_mld_membership(netif, addr_idx, state);
+      if(nd6_adjust_mld_membership(netif, addr_idx, state)!=ERR_OK && state!=IP6_ADDR_TENTATIVE)return;
     }
 #endif /* LWIP_IPV6_MLD */
 

@@ -201,6 +201,10 @@ int boaros_lwip_tcp_conflict(const struct tcp_pcb *pcb, const struct ip_addr *lo
     const struct ip_addr *remote, uint16_t remote_port)
 { return protocol_hooks.tcp_conflict ? protocol_hooks.tcp_conflict(pcb,local,local_port,remote,remote_port) : 0; }
 
+void boaros_lwip_netif_removed(struct netif *n)
+{if(protocol_hooks.netif_removed)protocol_hooks.netif_removed(n);}
+int boaros_lwip_udp_multicast_receive(struct udp_pcb *pcb,struct pbuf *p,struct netif *n,const void *header,uint16_t length,uint16_t port)
+{return protocol_hooks.udp_multicast_receive?protocol_hooks.udp_multicast_receive(pcb,p,n,header,length,port):0;}
 int boaros_lwip_udp_ingress_filter(struct udp_pcb *pcb,struct pbuf *p,struct netif *input,
     int ipv6,const void *network,uint16_t network_length,uint16_t header)
 {
@@ -245,6 +249,22 @@ int boaros_lwip_ip6_onlink(struct netif *n,const ip6_addr_t *destination)
 }
 struct netif *boaros_lwip_ip6_route(const ip6_addr_t *source,const ip6_addr_t *destination)
 {
+    if(ip6_addr_ismulticast(destination)) {
+        struct netif *chosen=NULL;
+        for(struct netif *n=netif_list;n;n=n->next) {
+            if(!netif_is_up(n) || !netif_is_link_up(n) || (n->hwaddr_len && n->mtu<1280) ||
+               (ip6_addr_has_zone(destination) && !ip6_addr_test_zone(destination,n)))continue;
+            if(ip6_addr_ismulticast_iflocal(destination) && n->hwaddr_len)continue;
+            int valid=0;
+            for(unsigned i=0;i<LWIP_IPV6_NUM_ADDRESSES;i++)
+                if(ip6_addr_isvalid(netif_ip6_addr_state(n,i)) &&
+                   (ip6_addr_isany(source) || ip6_addr_zoneless_eq(source,netif_ip6_addr(n,i))))valid=1;
+            if(!valid)continue;
+            if(n==netif_default)return n;
+            if(!chosen || (!chosen->hwaddr_len && n->hwaddr_len))chosen=n;
+        }
+        return chosen;
+    }
     struct netif *best=NULL,*fallback=NULL,*advertised=NULL;int length=-1;
     for(struct netif *n=netif_list;n;n=n->next) {
         if(!netif_is_up(n) || !netif_is_link_up(n) || (n->hwaddr_len && n->mtu<1280))continue;

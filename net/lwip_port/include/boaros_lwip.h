@@ -2,6 +2,7 @@
 #define BOAROS_LWIP_HOOKS_H
 #include <stdint.h>
 uint32_t boaros_lwip_centiseconds(void);
+int boaros_lwip_ip6_mld_valid_header(void);
 struct boaros_lwip_tcp_context;
 struct ip_addr;
 struct ip6_addr;
@@ -14,6 +15,8 @@ struct pbuf;
 struct tcp_pcb;
 struct udp_pcb;
 struct boaros_lwip_hooks {
+    void (*netif_removed)(struct netif *);
+    int (*udp_multicast_receive)(struct udp_pcb *,struct pbuf *,struct netif *,const void *,uint16_t,uint16_t);
     int (*udp_ingress_filter)(struct udp_pcb *,struct pbuf *,struct netif *,int,const void *,uint16_t,uint16_t);
     int (*tcp_ingress_filter)(struct tcp_pcb *,struct pbuf *,struct netif *,int,const void *,uint16_t,uint16_t);
     void (*tcp_output)(struct tcp_pcb *);
@@ -31,6 +34,8 @@ struct boaros_lwip_hooks {
     void (*pcb_forget)(struct tcp_pcb *);
     int (*tcp_conflict)(const struct tcp_pcb *, const struct ip_addr *, uint16_t, const struct ip_addr *, uint16_t);
 };
+void boaros_lwip_netif_removed(struct netif *);
+int boaros_lwip_udp_multicast_receive(struct udp_pcb *,struct pbuf *,struct netif *,const void *,uint16_t,uint16_t);
 int boaros_lwip_udp_ingress_filter(struct udp_pcb *,struct pbuf *,struct netif *,int,const void *,uint16_t,uint16_t);
 int boaros_lwip_tcp_ingress_filter(struct tcp_pcb *,struct pbuf *,struct netif *,int,const void *,uint16_t,uint16_t);
 void boaros_lwip_set_hooks(const struct boaros_lwip_hooks *hooks);

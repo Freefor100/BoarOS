@@ -95,6 +95,7 @@ ip6_route(const ip6_addr_t *src, const ip6_addr_t *dest)
   LWIP_ASSERT_CORE_LOCKED();
 
 #ifdef BOAROS_LWIP_STATIC_IPV6
+  if(ip6_addr_ismulticast(dest))return boaros_lwip_ip6_route(src,dest);
   if (!ip6_addr_has_scope(dest, IP6_UNKNOWN) && !ip6_addr_has_scope(src, IP6_UNICAST) &&
       !ip6_addr_isloopback(src)) {
     return boaros_lwip_ip6_route(src, dest);
@@ -527,7 +528,7 @@ ip6_input(struct pbuf *p, struct netif *inp)
   struct netif *netif;
   const u8_t *nexth;
   u16_t hlen, hlen_tot; /* the current header length */
-  u8_t had_fragment = 0;
+  u8_t had_fragment = 0, mld_router_alert = 0;
 #if 0 /*IP_ACCEPT_LINK_LAYER_ADDRESSING*/
   @todo
   int check_ip_src=1;
@@ -603,6 +604,7 @@ ip6_input(struct pbuf *p, struct netif *inp)
 
   /* current header pointer. */
   ip_data.current_ip6_header = ip6hdr;
+  ip_data.current_mld_valid_header = 0;
 
   /* In netif, used in case we need to send ICMPv6 packets back. */
   ip_data.current_netif = inp;
@@ -740,6 +742,9 @@ netif_found:
       LWIP_DEBUGF(IP6_DEBUG, ("ip6_input: packet with Hop-by-Hop options header\n"));
 
       /* Get and check the header length, while staying in packet bounds. */
+      if(p->len<8) {
+        pbuf_free(p);IP6_STATS_INC(ip6.lenerr);IP6_STATS_INC(ip6.drop);goto ip6_input_cleanup;
+      }
       hbh_hdr = (struct ip6_hbh_hdr *)p->payload;
 
       /* Get next header type. */
@@ -768,6 +773,12 @@ netif_found:
         s32_t opt_dlen = 0;
 
         opt_hdr = (struct ip6_opt_hdr *)((u8_t *)hbh_hdr + opt_offset);
+        if(IP6_OPT_TYPE(opt_hdr)!=IP6_PAD1_OPTION &&
+           (opt_offset+2>hlen || opt_offset+2+IP6_OPT_DLEN(opt_hdr)>hlen)) {
+          pbuf_free(p);IP6_STATS_INC(ip6.lenerr);IP6_STATS_INC(ip6.drop);goto ip6_input_cleanup;
+        }
+        if(IP6_OPT_TYPE(opt_hdr)==IP6_ROUTER_ALERT_OPTION && IP6_OPT_DLEN(opt_hdr)==2 &&
+           !((u8_t *)opt_hdr)[2] && !((u8_t *)opt_hdr)[3])mld_router_alert=1;
 
         switch (IP6_OPT_TYPE(opt_hdr)) {
         /* @todo: process IPV6 Hop-by-Hop option data */
@@ -830,6 +841,9 @@ netif_found:
       struct ip6_opt_hdr *opt_hdr;
       LWIP_DEBUGF(IP6_DEBUG, ("ip6_input: packet with Destination options header\n"));
 
+      if(p->len<8) {
+        pbuf_free(p);IP6_STATS_INC(ip6.lenerr);IP6_STATS_INC(ip6.drop);goto ip6_input_cleanup;
+      }
       dest_hdr = (struct ip6_dest_hdr *)p->payload;
 
       /* Get next header type. */
@@ -857,6 +871,10 @@ netif_found:
         s32_t opt_dlen = 0;
 
         opt_hdr = (struct ip6_opt_hdr *)((u8_t *)dest_hdr + opt_offset);
+        if(IP6_OPT_TYPE(opt_hdr)!=IP6_PAD1_OPTION &&
+           (opt_offset+2>hlen || opt_offset+2+IP6_OPT_DLEN(opt_hdr)>hlen)) {
+          pbuf_free(p);IP6_STATS_INC(ip6.lenerr);IP6_STATS_INC(ip6.drop);goto ip6_input_cleanup;
+        }
 
         switch (IP6_OPT_TYPE(opt_hdr))
         {
@@ -1104,6 +1122,7 @@ options_done:
       if (had_fragment && p->tot_len && pbuf_get_at(p,0)>=133 && pbuf_get_at(p,0)<=137) {
         pbuf_free(p);IP6_STATS_INC(ip6.drop);break;
       }
+      ip_data.current_mld_valid_header=mld_router_alert && !had_fragment && IP6H_HOPLIM(ip6hdr)==1;
       icmp6_input(p, inp);
       break;
 #endif /* LWIP_ICMP */
@@ -1136,6 +1155,7 @@ ip6_input_cleanup:
   ip_data.current_netif = NULL;
   ip_data.current_input_netif = NULL;
   ip_data.current_ip6_header = NULL;
+  ip_data.current_mld_valid_header = 0;
   ip_data.current_ip_header_tot_len = 0;
   ip6_addr_set_zero(ip6_current_src_addr());
   ip6_addr_set_zero(ip6_current_dest_addr());
@@ -1283,6 +1303,9 @@ ip6_output_if_src(struct pbuf *p, const ip6_addr_t *src, const ip6_addr_t *dest,
   }
 #endif /* LWIP_MULTICAST_TX_OPTIONS */
 #endif /* ENABLE_LOOPBACK */
+  /* Hop limit zero and interface-local multicast may reach local members,
+   * but must never be emitted onto Ethernet. */
+  if(ip6_addr_ismulticast(dest) && (!IP6H_HOPLIM(ip6hdr) || ip6_addr_ismulticast_iflocal(dest)))return ERR_OK;
 #if LWIP_IPV6_FRAG
   /* don't fragment if interface has mtu set to 0 [loopif] */
   if (netif_mtu6(netif) && (p->tot_len > nd6_get_destination_mtu(dest, netif))) {
@@ -1517,3 +1540,6 @@ ip6_debug_print(struct pbuf *p)
 #endif /* IP6_DEBUG */
 
 #endif /* LWIP_IPV6 */
+
+int boaros_lwip_ip6_mld_valid_header(void)
+{return ip_data.current_mld_valid_header;}

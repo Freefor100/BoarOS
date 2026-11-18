@@ -1013,6 +1013,9 @@ nd6_tmr(void)
         } else if (netif_is_up(netif) && netif_is_link_up(netif)) {
           /* tentative: set next state by increasing by one */
           netif_ip6_addr_set_state(netif, i, addr_state + 1);
+          /* A failed solicited-node admission must not advance DAD or send
+           * probes whose conflicting replies the host cannot receive. */
+          if(netif_ip6_addr_state(netif,i)!=addr_state+1)continue;
           /* Send a NS for this address. Use the unspecified address as source
            * address in all cases (RFC 4862 Sec. 5.4.2), not in the least
            * because as it is, we only consider multicast replies for DAD. */
@@ -2304,29 +2307,23 @@ nd6_cleanup_netif(struct netif *netif)
  * @param addr_idx The index of the address.
  * @param new_state The new (IP6_ADDR_) state for the address.
  */
-void
+err_t
 nd6_adjust_mld_membership(struct netif *netif, s8_t addr_idx, u8_t new_state)
 {
-  u8_t old_state, old_member, new_member;
-
-  old_state = netif_ip6_addr_state(netif, addr_idx);
-
-  /* Determine whether we were, and should be, a member of the solicited-node
-   * multicast group for this address. For tentative addresses, the group is
-   * not joined until the address enters the TENTATIVE_1 (or VALID) state. */
-  old_member = (old_state != IP6_ADDR_INVALID && old_state != IP6_ADDR_DUPLICATED && old_state != IP6_ADDR_TENTATIVE);
-  new_member = (new_state != IP6_ADDR_INVALID && new_state != IP6_ADDR_DUPLICATED && new_state != IP6_ADDR_TENTATIVE);
-
-  if (old_member != new_member) {
+  u8_t new_member = new_state != IP6_ADDR_INVALID && new_state != IP6_ADDR_DUPLICATED;
+  /* Join as soon as an address becomes tentative, not on its first timer.
+   * Track the actual reference so allocation failure cannot become false DAD
+   * success, nor can an application leave consume the address's reference. */
+  if (netif->ip6_mld_joined[addr_idx] != new_member) {
     ip6_addr_set_solicitednode(&multicast_address, netif_ip6_addr(netif, addr_idx)->addr[3]);
     ip6_addr_assign_zone(&multicast_address, IP6_MULTICAST, netif);
-
-    if (new_member) {
-      mld6_joingroup_netif(netif, &multicast_address);
-    } else {
-      mld6_leavegroup_netif(netif, &multicast_address);
-    }
+    if(new_member) {
+      err_t error=mld6_joingroup_netif(netif,&multicast_address);
+      if(error!=ERR_OK)return error;
+    } else mld6_leavegroup_netif_force(netif,&multicast_address);
+    netif->ip6_mld_joined[addr_idx]=new_member;
   }
+  return ERR_OK;
 }
 #endif /* LWIP_IPV6_MLD */
 

@@ -128,6 +128,7 @@ struct ip_globals
 #if LWIP_IPV6
   /** Header of the input IPv6 packet currently being processed. */
   struct ip6_hdr *current_ip6_header;
+  u8_t current_mld_valid_header;
 #endif /* LWIP_IPV6 */
   /** Total header length of current_ip4/6_header (i.e. after this, the UDP/TCP header starts) */
   u16_t current_ip_header_tot_len;

@@ -347,7 +347,7 @@ TX 使用 indirect 表借用每包最多两段镜像内 payload，其余回退�
 
 eth0 从设备 MAC 派生 `fe80::/64` 地址，使用已有 ND 定时器执行 DAD（重复地址检测），不增加 worker、轮询器或新缓存。DAD 完成前不能绑定地址；收到指向 tentative 地址的 solicited-node NS 或 all-nodes NA 会标记重复，不能以未验证的地址发送普通包。链路本地 bind 要求有效 scope/interface index，也可由 SO_BINDTODEVICE 提供；bind 的显式 scope 同时选择绑定设备，非法 index 返回 ENODEV，未配置或尚未可用的本地地址返回 EADDRNOTAVAIL。connect 的显式 scope 与已绑定设备冲突返回 EINVAL，sendto 则优先使用已绑定设备。rtnetlink GETADDR 显示实际地址、tentative/dadfailed 状态，GETROUTE dump 显示可用地址的本地及链路路由；IPv6 单条 route lookup 与 netlink 修改仍明确返回 EOPNOTSUPP。
 
-已支持真实 Ethernet 上 IPv6 TCP/UDP、ND 的 NS/NA 与 ICMPv6 echo responder。通过 AF_INET6 socket 的 SIOCSIFADDR/SIOCDIFADDR（Linux `in6_ifreq`）配置/删除静态单播地址，前缀 0–128；保留自动 link-local 槽位，另有两个静态地址槽位，满时返回 ENOBUFS。新地址必须完成 DAD。管理 DOWN 期间可添加永久地址，其 DAD 等到 UP 才进行；MTU<1280 时添加返回 EINVAL。当前静态地址配置限 Ethernet，不修改 `lo`。SIOCADDRT/SIOCDELRT 使用 Linux `in6_rtmsg`，支持唯一 IPv6 default gateway（metric 0/1024）；connected route 按实际地址前缀选择最长匹配，不再套用 lwIP 的隐含 /64 或 IPv4 default。源选择比较真实公共前缀并限制到源地址前缀，只有完整 128 位相等才当作本地地址完全匹配；配置、网关与前缀随 netif 生命周期，使用已有协议所有权，不引入动态 FIB、worker 或每包配置分配。非默认手工路由、source route、非支持 metric/flags 明确返回 EOPNOTSUPP。单独删除地址清理 ND/PMTU，但不偷偷删除已配置 default，也不修改既有 socket 的绑定或同步 abort TCP；重新添加同地址并完成 DAD 后既有 TCP 可以继续。最终输出拒绝失效源和任何物理出口的 `::1` 源/目的；显式设备或 /0/default 不得绕过 loopback 边界。提供下述 RA/SLAAC；未实现 IPv6 raw/ping socket 或 MLD 组播成员管理，忽略 Redirect、RIO、RDNSS/DHCPv6，不提供 Linux accept_ra/sysctl 配置面。ND 所需组播不是应用组播订阅支持。IPv6 不进行发送分片或分片重组；atomic fragment（offset=0 且 M=0）可通过普通输入路径，但任何含 Fragment Header 的 ND 报文按 RFC6980 丢弃，包括其后还有扩展头的情形。UDP 超所选链路/路径 MTU 返回 EMSGSIZE，IPv6 零 checksum 与错误 checksum 丢弃，IPv4 的零 UDP checksum 规则不变。
+已支持真实 Ethernet 上 IPv6 TCP/UDP、ND 的 NS/NA 与 ICMPv6 echo responder。通过 AF_INET6 socket 的 SIOCSIFADDR/SIOCDIFADDR（Linux `in6_ifreq`）配置/删除静态单播地址，前缀 0–128；保留自动 link-local 槽位，另有两个静态地址槽位，满时返回 ENOBUFS。新地址必须完成 DAD。管理 DOWN 期间可添加永久地址，其 DAD 等到 UP 才进行；MTU<1280 时添加返回 EINVAL。当前静态地址配置限 Ethernet，不修改 `lo`。SIOCADDRT/SIOCDELRT 使用 Linux `in6_rtmsg`，支持唯一 IPv6 default gateway（metric 0/1024）；connected route 按实际地址前缀选择最长匹配，不再套用 lwIP 的隐含 /64 或 IPv4 default。源选择比较真实公共前缀并限制到源地址前缀，只有完整 128 位相等才当作本地地址完全匹配；配置、网关与前缀随 netif 生命周期，使用已有协议所有权，不引入动态 FIB、worker 或每包配置分配。非默认手工路由、source route、非支持 metric/flags 明确返回 EOPNOTSUPP。单独删除地址清理 ND/PMTU，但不偷偷删除已配置 default，也不修改既有 socket 的绑定或同步 abort TCP；重新添加同地址并完成 DAD 后既有 TCP 可以继续。最终输出拒绝失效源和任何物理出口的 `::1` 源/目的；显式设备或 /0/default 不得绕过 loopback 边界。提供下述 RA/SLAAC；未实现 IPv6 raw/ping socket、MLDv2 或 SSM，忽略 Redirect、RIO、RDNSS/DHCPv6，不提供 Linux accept_ra/sysctl 配置面。应用 ASM 组播订阅见下节。IPv6 不进行发送分片或分片重组；atomic fragment（offset=0 且 M=0）可通过普通输入路径，但任何含 Fragment Header 的 ND 报文按 RFC6980 丢弃，包括其后还有扩展头的情形。UDP 超所选链路/路径 MTU 返回 EMSGSIZE，IPv6 零 checksum 与错误 checksum 丢弃，IPv4 的零 UDP checksum 规则不变。
 
 接口管理 DOWN 删除静态/动态 IPv6 地址/default、撤链路本地地址并清理 ND；UP 自动重建链路本地地址、重新 DAD 并发 RS，动态配置只能重新从 RA 学习。carrier 暂时断开不等同管理 DOWN。运行时 MTU 变更清理该接口 ND 队列及目的 PMTU 缓存；低于 1280 删除静态 IPv6 地址/default 并停止该接口 IPv6 收发，恢复后自动重建 link-local 并重新发 RS；这对应 Linux 默认 keep_addr_on_down=0，不支持地址保留 sysctl。最终 Ethernet IPv6 输出再次校验源地址可用性，防已绑定 socket 或延迟 ND 报文跨越地址失效继续使用旧源。UDP 与可能携带扩展头的非直接 TCP/ICMPv6 接收共用原有预算，保留控制报文余量。
 
@@ -570,3 +570,53 @@ iperf CPU 百分比作为性能结论。没有 LA iperf 二进制，本次 LA �
 LSan，仍运行 ASan/UBSan；分配归还由上述 host 计数断言独立验证。64-bit host 配置
 测得 tcp_pcb 从 320 增至 408 字节，tcp_seg 仍为 32 字节（新 prefix 长度落在原 padding）。
 这些是结构大小检查，不是性能基准。
+
+
+### IPv6 ASM UDP / MLDv1
+
+提供 `IPV6_JOIN_GROUP`/`IPV6_LEAVE_GROUP`（20 字节 `ipv6_mreq`）、
+`IPV6_MULTICAST_IF`/`HOPS`/`LOOP`/`ALL`。普通 UDP 入组不要求管理员权限。
+显式索引检查完整 32 位值，不截断成 lwIP 的 8 位索引；索引零入组只选择一个接口，
+离组零索引删除该 socket 第一个匹配成员，不重新选路。同 socket 重复入组返回
+EADDRINUSE，无成员离组返回 EADDRNOTAVAIL；最后一个 open-file 引用关闭时自动离组。
+默认 MULTICAST_ALL=1，匹配地址、端口、设备和 connected peer 的 socket 可接收主机已加入的组；
+ALL=0 还要求该 socket 自己的成员记录。它不使网卡接受主机未加入的任意组。
+
+组引用按接口聚合，应用成员和 solicited-node/DAD 成员各有独立引用，应用离组不撤销 DAD。
+最多 64 个聚合组，新应用组在已有 48 个聚合组时返回 ENOBUFS，为 ND 留出容量；
+每 socket 最多 32 个成员。MAC filter 回调失败会回滚入组，普通离组失败保留记录；
+最终关闭和接口销毁必须释放软件资源。生产 virtio 尚未协商 CTRL_RX/CTRL_VQ，
+没有声称实现硬件组表或 ALLMULTI 控制，接收后由 IPv6 成员表进行软件准入。
+外部验收依赖已测 QEMU virtio-net 默认接收模式，不保证任意 virtio 或物理网卡默认接收全部组播。
+接口 DOWN/link-down 暂停 MLD 控制包，UP 后恢复报告。MTU<1280 撤销 IPv6 聚合组，
+保留 socket 成员记录但将其聚合引用标为已退役；恢复 MTU 不自动恢复旧应用组，
+须先 LEAVE 再 JOIN（旧记录直接 JOIN 仍 EADDRINUSE）。旧成员离组/关闭不消费恢复后新成员的引用。
+接口删除清理成员记录，
+不把旧成员继承给随后复用的索引。loopback 成员只用于本地交付，不发送 MLD 控制包。
+
+入站 UDP 组播只保留原 ingress pbuf，各目标队列持有独立引用、offset 和 BPF 截断长度，
+逐目标执行 BPF 与匹配，先发布的读者不会看到后续目标修改共享数据。正常内核 socket
+fanout 不复制 payload；原始 lwIP 回调的兼容分支保留独立副本。IPv4 原有 fanout 不变。
+PEEK、短读、TRUNC、关闭和错误释放沿各目标队列处理。MLD 仅在有待报告成员时安排
+一个 100ms owner timeout，静止状态不增加永久 10Hz 扫描，也不增加 worker。
+
+MLDv1 接收验证 Hop Limit=1、Router Alert=0、link-local 源、组/目的地址关系和完整 checksum；
+含 Fragment Header 的 MLD 不接收。按 RFC2710 忽略 Code/Reserved 和合法尾部扩展，
+不把 MLDv2 宣称为已支持。Query 的零响应上限立即报告，合法 Report 抑制同组待发报告。
+Done 发往 ff02::2，payload 保留原组且 checksum 使用实际目的地址。
+没有可用 link-local 源时只允许严格识别的 MLD bootstrap 以 :: 发出；接收 :: 源 MLD 丢弃。
+发送 HOPS=0 或 interface-local 组不进入物理出口，LOOP 控制本地副本。
+
+验证入口：`tests/host/network_owner.py --case ipv6-mld`（可加 `--page-shift 14 --sanitize`）、
+`tests/host/mld-protocol.py`、`tests/host/ipv6-multicast-sockopt.py`。
+`tests/userland/ipv6-multicast.py --arch riscv|loongarch --cpus N --kernel ... --program ...`
+与 `tests/workloads/network/ipv6_multicast.c` 配套，外部 peer 经 QEMU Ethernet 注入组播及 Query，
+逐字节核对 257 字节内容和抓包中的 Report/Done、Router Alert、目的 MAC、Hop Limit、checksum；
+阶段 barrier 校验多 socket 引用及最后离组。runner 保存 kernel/program SHA256、guest log 和 pcap。
+这是 slirp/filter 注入验证，不是 TAP/物理交换机验证；Linux 行为依据源码及可用 syscall probe，
+未做需要 NET_ADMIN 的 Linux network namespace 差分。仍不支持 MLDv2/SSM、IPv6 分片重组或组播路由。
+
+协议依据：[RFC2710](https://www.rfc-editor.org/rfc/rfc2710)、
+[RFC3590](https://www.rfc-editor.org/rfc/rfc3590)；ABI/成员语义对照
+[Linux v6.12 mcast.c](https://github.com/torvalds/linux/blob/v6.12/net/ipv6/mcast.c) 和
+[ipv6_sockglue.c](https://github.com/torvalds/linux/blob/v6.12/net/ipv6/ipv6_sockglue.c)。

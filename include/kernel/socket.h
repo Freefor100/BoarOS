@@ -234,6 +234,7 @@ enum kernel_socket_option {
     KERNEL_SOCKET_NODELAY, KERNEL_SOCKET_CORK, KERNEL_SOCKET_MAXSEG, KERNEL_SOCKET_V6ONLY,
     KERNEL_SOCKET_KEEPIDLE, KERNEL_SOCKET_KEEPINTVL, KERNEL_SOCKET_KEEPCNT,
     KERNEL_SOCKET_BROADCAST, KERNEL_SOCKET_IPV4_TTL, KERNEL_SOCKET_MULTICAST_TTL,
+    KERNEL_SOCKET_IPV6_MULTICAST_HOPS, KERNEL_SOCKET_IPV6_MULTICAST_LOOP, KERNEL_SOCKET_IPV6_MULTICAST_ALL,
 };
 /* Linux TCP_INFO ABI through snd_wnd (232 bytes). */
 struct kernel_socket_tcp_info {
@@ -259,6 +260,9 @@ int kernel_socket_set_bound_device(struct kernel_socket *, const char *name);
 /* length supplies user capacity and receives the actual name length. */
 int kernel_socket_get_bound_device(struct kernel_socket *, char name[16], uint32_t *length);
 /* address is network order; index zero selects by address or clears selection. */
+int kernel_socket_ipv6_membership(struct kernel_socket *, const uint8_t[16], uint32_t, int);
+int kernel_socket_set_ipv6_multicast_interface(struct kernel_socket *, uint32_t);
+int kernel_socket_get_ipv6_multicast_interface(struct kernel_socket *, uint32_t *);
 int kernel_socket_set_multicast_interface(struct kernel_socket *, uint32_t index, uint32_t address);
 int kernel_socket_get_multicast_interface(struct kernel_socket *, uint32_t *address);
 /* A write that already waited consumes an AF_UNIX asynchronous peer reset. */

@@ -292,6 +292,9 @@ struct netif {
   /** The state of each IPv6 address (Tentative, Preferred, etc).
    * @see ip6_addr.h */
   u8_t ip6_addr_state[LWIP_IPV6_NUM_ADDRESSES];
+#if LWIP_IPV6_MLD
+  u8_t ip6_mld_joined[LWIP_IPV6_NUM_ADDRESSES];
+#endif
 #if LWIP_IPV6_ADDRESS_LIFETIMES
   /** Remaining valid and preferred lifetime of each IPv6 address, in seconds.
    * For valid lifetimes, the special value of IP6_ADDR_LIFE_STATIC (0)

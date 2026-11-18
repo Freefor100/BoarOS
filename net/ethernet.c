@@ -103,9 +103,25 @@ static err_t ipv6_output(struct netif *interface,struct pbuf *p,const ip6_addr_t
     /* Loopback is host-local even when an explicit device or /0 route would
      * otherwise select Ethernet. Enforce this for TCP and queued output too. */
     if(ip6_addr_isloopback(&source) || ip6_addr_isloopback(destination))return ERR_RTE;
-    /* A queued packet can outlive MTU/address withdrawal and renewed DAD.
-     * Only DAD itself may leave with the unspecified source. */
-    if (!ip6_addr_isany(&source)) {
+    /* Unspecified source is only for DAD and RFC3590 MLD bootstrap. Ordinary
+     * queued/application packets must retain an available local source. */
+    if(ip6_addr_isany(&source)) {
+        int bootstrap=IP6H_NEXTH(header)==58 && IP6H_HOPLIM(header)==255 &&
+            p->tot_len>=64 && pbuf_get_at(p,40)==135 && !pbuf_get_at(p,41) &&
+            ip6_addr_issolicitednode(destination);
+        if(!bootstrap && IP6H_NEXTH(header)==0 && IP6H_HOPLIM(header)==1 && p->tot_len>=72) {
+            unsigned char options[8];ip6_addr_t group;
+            static const unsigned char mld_alert[8]={58,0,5,2,0,0,1,0};
+            pbuf_copy_partial(p,options,8,40);pbuf_copy_partial(p,group.addr,16,56);ip6_addr_clear_zone(&group);
+            unsigned type=pbuf_get_at(p,48);
+            bootstrap=!memcmp(options,mld_alert,8) && !pbuf_get_at(p,49) &&
+                ip6_addr_ismulticast(&group) && ip6_addr_multicast_scope(&group)>1 &&
+                !ip6_addr_isallnodes_linklocal(&group) &&
+                ((type==131 && ip6_addr_zoneless_eq(&group,destination)) ||
+                 (type==132 && ip6_addr_isallrouters_linklocal(destination)));
+        }
+        if(!bootstrap)return ERR_RTE;
+    } else {
         int valid=0;
         for (unsigned i=0;i<LWIP_IPV6_NUM_ADDRESSES;i++)
             if (ip6_addr_isvalid(netif_ip6_addr_state(interface,i)) &&
@@ -120,7 +136,7 @@ static err_t interface_init(struct netif *interface)
     interface->name[0] = 'e'; interface->name[1] = 't';
     interface->hwaddr_len = 6; memcpy(interface->hwaddr, n->device->mac, 6);
     interface->mtu = 1500;
-    interface->flags = NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP | NETIF_FLAG_ETHERNET;
+    interface->flags = NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP | NETIF_FLAG_ETHERNET | NETIF_FLAG_MLD6;
     interface->output = etharp_output; interface->output_ip6 = ipv6_output;
     interface->linkoutput = link_output;
     return ERR_OK;

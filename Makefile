@@ -303,6 +303,7 @@ LWIP_SOURCES := \
 	third_party/lwip/src/core/ipv6/ip6.c \
 	third_party/lwip/src/core/ipv6/ip6_addr.c \
 	third_party/lwip/src/core/ipv6/nd6.c \
+	third_party/lwip/src/core/ipv6/mld6.c \
 	net/lwip_port/port.c
 
 CPU_C_SOURCES := kernel/cpu.c kernel/raw_lock.c

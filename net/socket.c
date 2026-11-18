@@ -33,6 +33,7 @@
 #include "lwip/ip_addr.h"
 #include "lwip/netif.h"
 #include "lwip/nd6.h"
+#include "lwip/mld6.h"
 #include "lwip/priv/nd6_priv.h"
 #include "lwip/pbuf.h"
 #include "lwip/sys.h"
@@ -83,6 +84,12 @@ struct kernel_socket_name {
     struct kernel_vfs_path *path;
     unsigned char bytes[];
 };
+struct socket_ipv6_member {
+    struct socket_ipv6_member *next;
+    ip6_addr_t group;
+    uint8_t index;
+    uint8_t active; /* Owns a reference in the current IPv6 netif generation. */
+};
 struct kernel_socket {
     struct kernel_heap *heap;
     struct kernel_raw_lock endpoint_lock;
@@ -124,6 +131,8 @@ struct kernel_socket {
     uint32_t retired_info_ms;
     uint8_t nodelay, cork;
     uint8_t broadcast, ipv4_ttl, multicast_ttl;
+    uint8_t ipv6_multicast_index, ipv6_multicast_hops, ipv6_multicast_loop, ipv6_multicast_all;
+    struct socket_ipv6_member *ipv6_members;
     uint8_t bound_device, multicast_index;
     ip_addr_t multicast_source;
     uint32_t rx_bytes;
@@ -271,6 +280,7 @@ static int socket_ingress_filter(struct kernel_socket *socket,struct pbuf *p,str
     return 1;
 }
 
+static void socket_ipv6_members_release(struct kernel_socket *);
 static void udp_received(void *,struct udp_pcb *,struct pbuf *,const ip_addr_t *,u16_t);
 static void tcp_failed(void *,err_t);
 static void socket_tcp_info_retire(struct tcp_pcb *);
@@ -1543,6 +1553,8 @@ static int socket_ip_route(struct kernel_socket *socket,const ip_addr_t *remote,
     if(pcb->netif_idx)interface=netif_get_by_index(pcb->netif_idx);
     else if(multicast && socket->multicast_index)
         interface=netif_get_by_index(socket->multicast_index);
+    else if(IP_IS_V6(remote) && ip_addr_ismulticast(remote) && socket->ipv6_multicast_index)
+        interface=netif_get_by_index(socket->ipv6_multicast_index);
     else if(IP_IS_V4(remote) && ip4_addr_get_u32(ip_2_ip4(remote))==PP_HTONL(0xffffffffU)) {
         for(struct netif *n=netif_list;n;n=n->next)
             if(n->hwaddr_len && netif_is_up(n) && netif_is_link_up(n) &&
@@ -1560,6 +1572,7 @@ static int socket_ip_route(struct kernel_socket *socket,const ip_addr_t *remote,
     if(!local)return -KERNEL_ENETUNREACH;
     if(IP_IS_V6(remote)) {
         const ip6_addr_t *dst=ip_2_ip6(remote),*src=ip_2_ip6(local);
+        if(ip6_addr_has_zone(dst) && !ip6_addr_test_zone(dst,interface))return -KERNEL_ENETUNREACH;
         if(interface->hwaddr_len && (ip6_addr_isloopback(src) || ip6_addr_isloopback(dst)))
             return -KERNEL_ENETUNREACH;
         if(!ip6_addr_ismulticast(dst) && !ip6_addr_islinklocal(dst) &&
@@ -1570,7 +1583,7 @@ static int socket_ip_route(struct kernel_socket *socket,const ip_addr_t *remote,
             if(ip6_addr_isvalid(netif_ip6_addr_state(interface,i)) &&
                ip6_addr_zoneless_eq(src,netif_ip6_addr(interface,i)))valid=1;
         if(!valid)return -KERNEL_ENETUNREACH;
-        if(!ip6_addr_has_scope(dst,IP6_UNKNOWN) &&
+        if(!ip6_addr_ismulticast(dst) && !ip6_addr_has_scope(dst,IP6_UNKNOWN) &&
            boaros_lwip_ip6_onlink(interface,dst)<0 && ip6_addr_isany(&interface->ip6_gateway) && !nd6_default_gateway(interface))
             return -KERNEL_ENETUNREACH;
     }
@@ -1907,12 +1920,21 @@ static void packet_publish(struct kernel_socket *socket, struct socket_packet *p
     packet_publish_locked(socket,packet,charge);
 }
 
+static struct socket_packet *udp_packet_allocate(struct kernel_socket *socket)
+{
+    struct socket_packet *packet;
+    enum kernel_heap_status status = kernel_heap_allocate_zeroed(socket->heap,
+        1U, sizeof(*packet), (void **)&packet);
+    if (status == KERNEL_HEAP_STATUS_EMPTY) return NULL;
+    if (status != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    return packet;
+}
+
 static void udp_received(void *context, struct udp_pcb *pcb,
                          struct pbuf *payload, const ip_addr_t *peer,
                          u16_t port)
 {
     struct kernel_socket *socket = context;
-    struct socket_packet *packet = 0;
     (void)pcb;
     uint32_t charge = payload->tot_len ? payload->tot_len : 1U;
     /* 接收队列不能占尽共享协议堆：给下一条最大 UDP 和 TCP 控制报文留空间。 */
@@ -1921,14 +1943,11 @@ static void udp_received(void *context, struct udp_pcb *pcb,
         UDP_STATS_INC(udp.memerr);
         socket_pbuf_free(payload); return;
     }
-    enum kernel_heap_status status =
-        kernel_heap_allocate_zeroed(socket->heap, 1U, sizeof(*packet),
-                                    (void **)&packet);
-    if (status == KERNEL_HEAP_STATUS_EMPTY) {
+    struct socket_packet *packet = udp_packet_allocate(socket);
+    if (!packet) {
         socket_pbuf_free(payload);
         return;
     }
-    if (status != KERNEL_HEAP_STATUS_OK) __builtin_trap();
     packet->payload = payload;
     address_export(socket, peer, port, &packet->address);
     {
@@ -1941,6 +1960,44 @@ static void udp_received(void *context, struct udp_pcb *pcb,
     UDP_STATS_INC(udp.memerr);
     socket_pbuf_free(payload);
     kernel_heap_release(socket->heap,packet);
+}
+
+/* UDP multicast keeps one immutable pbuf including its UDP header. Each
+ * queue owns a reference, a separate logical end (BPF snap length), and offset.
+ * Publishing one recipient never mutates storage another CPU may be reading. */
+static int socket_udp_multicast_receive(struct udp_pcb *pcb,struct pbuf *p,struct netif *input,
+    const void *network,uint16_t network_length,uint16_t port)
+{
+    if(pcb->recv!=udp_received)return 0;
+    struct kernel_socket *socket=pcb->recv_arg;
+    int member=socket->ipv6_multicast_all;
+    for(struct socket_ipv6_member *m=socket->ipv6_members;!member && m;m=m->next)
+        if(m->active && m->index==netif_get_index(input) && ip6_addr_zoneless_eq(&m->group,ip6_current_dest_addr()))member=1;
+    if(!member)return 1;
+    struct socket_filter_packet view={p,network,network_length};
+    struct kernel_bpf_packet filter={.object=&view,.length=p->tot_len,.protocol=0x86dd,
+        .ifindex=netif_get_index(input),.ingress_ifindex=netif_get_index(input),.packet_type=2,
+        .hardware_type=input->hwaddr_len?1:772,.payload_offset=8,
+        .network_offset=network_length?-(int32_t)network_length:INT32_MIN,
+        .link_offset=INT32_MIN,.read=socket_filter_read};
+    uint32_t kept=socket_filter_run(socket,&filter);
+    if(!kept)return 1;
+    if(kept<8)kept=8;
+    if(kept>p->tot_len)kept=p->tot_len;
+    uint32_t charge=kept>8?kept-8:1;
+    if((network_udp_capacity && !network_udp_capacity(network_context)) ||
+       STATS_GET(mem.used)>MEM_SIZE-(65536U+4096U))return 1;
+    struct socket_packet *packet = udp_packet_allocate(socket);
+    if (!packet) return 1;
+    packet->length=kept;packet->consumed=8;pbuf_ref(p);packet->payload=p;
+    address_export(socket,ip_current_src_addr(),port,&packet->address);
+    {SOCKET_ENDPOINT(state,socket);
+      if(charge<=socket->rx_limit && socket->rx_bytes<=socket->rx_limit-charge) {
+        packet_publish_locked(socket,packet,charge);return 1;
+      }}
+    socket_pbuf_free(p);
+    kernel_heap_release(socket->heap,packet);
+    return 1;
 }
 
 /* Raw input precedes ICMP processing, which can strip headers and rewrite an
@@ -2257,6 +2314,7 @@ int kernel_socket_create(struct kernel_heap *heap, int family, int type, int pro
     socket->rx_limit = 65536U;
     socket->tx_limit = 65536U;
     socket->ipv4_ttl=64;socket->multicast_ttl=1;
+    socket->ipv6_multicast_hops=1;socket->ipv6_multicast_loop=1;socket->ipv6_multicast_all=1;
     kernel_wait_queue_init(&socket->wait);kernel_wait_queue_init(&socket->async_events);
     if(type==SOCKET_RAW) {
         socket->raw=raw_new_ip_type(IPADDR_TYPE_V4,(u8_t)protocol);
@@ -2512,6 +2570,7 @@ void kernel_socket_destroy(struct kernel_socket *socket)
       work_remove_locked(socket_ready_queue(socket),socket);work_remove_locked(&pool_wait,socket);
       work_remove_locked(&nic_wait,socket);work_remove_locked(&receive_wait,socket); }
     write_retry_disarm(socket);
+    socket_ipv6_members_release(socket);
     retire_received(socket);
     if (!socket->inet_previous || *socket->inet_previous!=socket) __builtin_trap();
     *socket->inet_previous=socket->inet_next;
@@ -2600,6 +2659,7 @@ int kernel_socket_bind(struct kernel_socket *socket,
         kernel_socket_protocol_leave(&scope);return -KERNEL_EACCES;
     }
     if (!ip_addr_isany(&local) &&
+        !(socket->type==SOCKET_DGRAM && IP_IS_V6(&local) && ip6_addr_ismulticast(ip_2_ip6(&local))) &&
         !(IP_IS_V4(&local) ? ip4_addr_isloopback(ip_2_ip4(&local)) : ip6_addr_isloopback(ip_2_ip6(&local)))) {
         int found = 0;
         for (struct netif *n = netif_list; n; n = n->next) {
@@ -3054,7 +3114,7 @@ int kernel_socket_receive_ready(struct kernel_socket *socket)
 
 static uint32_t packet_available(const struct socket_packet *packet)
 {
-    return packet->payload ? packet->payload->tot_len - packet->consumed : packet->length - packet->consumed;
+    return (packet->payload && !packet->length?packet->payload->tot_len:packet->length)-packet->consumed;
 }
 
 int kernel_socket_reserve_read(struct kernel_socket *socket,
@@ -3181,8 +3241,7 @@ void kernel_socket_read_info(const struct kernel_socket_read_request *request,
             else *address=(struct kernel_socket_address){0};
         } else *address=packet->address;
     }
-    if (length != 0) *length = packet->payload != 0 ? (uint32_t)(packet->payload->tot_len - packet->consumed)
-                                                  : packet->length - packet->consumed;
+    if (length != 0) *length = packet_available(packet);
 }
 
 void kernel_socket_copy_read(const struct kernel_socket_read_request *request,
@@ -4369,7 +4428,11 @@ static int execute_protocol_request(struct kernel_socket_write_request *request)
         if(!failure) {
             struct ip_pcb *pcb=socket_ip_pcb(socket);
             pcb->ttl=IP_IS_V4(&remote)?socket->ipv4_ttl:64;
-            if(socket->udp)udp_set_multicast_ttl(socket->udp,IP_IS_V4(&remote)?socket->multicast_ttl:1);
+            if(socket->udp) {
+                udp_set_multicast_ttl(socket->udp,IP_IS_V4(&remote)?socket->multicast_ttl:socket->ipv6_multicast_hops);
+                if(IP_IS_V6(&remote) && socket->ipv6_multicast_loop)socket->udp->flags|=UDP_FLAGS_MULTICAST_LOOP;
+                else socket->udp->flags&=(uint8_t)~UDP_FLAGS_MULTICAST_LOOP;
+            }
             if(IP_IS_V4(&remote))payload->flags|=PBUF_FLAG_IP4_LOCAL_DF;
             error=socket->raw?raw_sendto_if_src(socket->raw,payload,&remote,route,source):
                 udp_sendto_if_src(socket->udp,payload,&remote,request->destination?
@@ -4677,6 +4740,18 @@ int kernel_socket_set_option(struct kernel_socket *socket,
         {SOCKET_ENDPOINT(state,socket);socket->ipv4_ttl=(uint8_t)value;}
         if(pcb && IP_IS_V4(&pcb->local_ip))pcb->ttl=(u8_t)value;
         break;
+    case KERNEL_SOCKET_IPV6_MULTICAST_HOPS:
+    case KERNEL_SOCKET_IPV6_MULTICAST_LOOP:
+    case KERNEL_SOCKET_IPV6_MULTICAST_ALL:
+        if(socket->family!=KERNEL_SOCKET_AF_INET6) {result=-KERNEL_ENOPROTOOPT;break;}
+        if(option==KERNEL_SOCKET_IPV6_MULTICAST_HOPS && socket->type==SOCKET_STREAM) {result=-KERNEL_ENOPROTOOPT;break;}
+        if(option==KERNEL_SOCKET_IPV6_MULTICAST_HOPS && (value< -1 || value>255)) {result=-KERNEL_EINVAL;break;}
+        if(option==KERNEL_SOCKET_IPV6_MULTICAST_LOOP && value!=0 && value!=1) {result=-KERNEL_EINVAL;break;}
+        {SOCKET_ENDPOINT(state,socket);
+          if(option==KERNEL_SOCKET_IPV6_MULTICAST_HOPS)socket->ipv6_multicast_hops=value<0?1:(uint8_t)value;
+          else if(option==KERNEL_SOCKET_IPV6_MULTICAST_LOOP)socket->ipv6_multicast_loop=!!value;
+          else socket->ipv6_multicast_all=!!value;}
+        break;
     case KERNEL_SOCKET_MULTICAST_TTL:
         if(socket->domain!=KERNEL_SOCKET_DOMAIN_INET) {result=-KERNEL_ENOPROTOOPT;break;}
         if(socket->type==SOCKET_STREAM) {result=-KERNEL_EINVAL;break;}
@@ -4856,6 +4931,13 @@ int kernel_socket_get_option(struct kernel_socket *socket,
         if(socket->domain!=KERNEL_SOCKET_DOMAIN_INET)result=-KERNEL_ENOPROTOOPT;
         else *value=socket->ipv4_ttl;
         break;
+    case KERNEL_SOCKET_IPV6_MULTICAST_HOPS:
+    case KERNEL_SOCKET_IPV6_MULTICAST_LOOP:
+    case KERNEL_SOCKET_IPV6_MULTICAST_ALL:
+        if(socket->family!=KERNEL_SOCKET_AF_INET6)result=-KERNEL_ENOPROTOOPT;
+        else *value=option==KERNEL_SOCKET_IPV6_MULTICAST_HOPS?socket->ipv6_multicast_hops:
+            option==KERNEL_SOCKET_IPV6_MULTICAST_LOOP?socket->ipv6_multicast_loop:socket->ipv6_multicast_all;
+        break;
     case KERNEL_SOCKET_MULTICAST_TTL:
         if(socket->domain!=KERNEL_SOCKET_DOMAIN_INET)result=-KERNEL_ENOPROTOOPT;
         else *value=socket->multicast_ttl;
@@ -4935,6 +5017,88 @@ int kernel_socket_get_bound_device(struct kernel_socket *socket,char name[16],ui
         *length=loop?3:5;__builtin_memcpy(name,loop?"lo":"eth0",*length);result=0;
     }
     kernel_socket_protocol_leave(&scope);return result;
+}
+
+static void socket_ipv6_members_release(struct kernel_socket *socket)
+{
+    while(socket->ipv6_members) {
+        struct socket_ipv6_member *m=socket->ipv6_members;socket->ipv6_members=m->next;
+        struct netif *n=netif_get_by_index(m->index);
+        if(n && m->active)mld6_leavegroup_netif_force(n,&m->group);
+        kernel_heap_release(socket->heap,m);
+    }
+}
+static void socket_ipv6_netif_removed(struct netif *n)
+{
+    /* Called under shared protocol qualification before mld6_stop/free.
+     * Numeric interface reuse must never transfer an old socket's membership. */
+    for(struct kernel_socket *s=inet_sockets;s;s=s->inet_next) {
+        struct socket_ipv6_member **link=&s->ipv6_members;
+        while(*link) {
+            struct socket_ipv6_member *m=*link;
+            if(m->index!=netif_get_index(n)){link=&m->next;continue;}
+            *link=m->next;kernel_heap_release(s->heap,m);
+        }
+    }
+}
+int kernel_socket_ipv6_membership(struct kernel_socket *socket,const uint8_t bytes[16],uint32_t index,int remove)
+{
+    if(socket->family!=KERNEL_SOCKET_AF_INET6)return -KERNEL_ENOPROTOOPT;
+    if(socket->type!=SOCKET_DGRAM)return -KERNEL_EPROTO;
+    ip6_addr_t group;__builtin_memcpy(group.addr,bytes,16);ip6_addr_clear_zone(&group);
+    if(!ip6_addr_ismulticast(&group))return -KERNEL_EINVAL;
+    struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    struct socket_ipv6_member **link=&socket->ipv6_members;unsigned count=0;int result=0;
+    for(;*link;link=&(*link)->next) {
+        struct socket_ipv6_member *m=*link;count++;
+        if((!index || index==m->index) && ip6_addr_zoneless_eq(&group,&m->group)) {
+            if(!remove){result=-KERNEL_EADDRINUSE;goto out;}
+            struct netif *n=netif_get_by_index(m->index);
+            err_t error=n && m->active?mld6_leavegroup_netif(n,&m->group):ERR_OK;
+            if(error!=ERR_OK){result=lwip_error(error);goto out;}
+            *link=m->next;kernel_heap_release(socket->heap,m);goto out;
+        }
+    }
+    if(remove){result=-KERNEL_EADDRNOTAVAIL;goto out;}
+    if(index>UINT8_MAX){result=-KERNEL_ENODEV;goto out;}
+    struct netif *n=index?netif_get_by_index((uint8_t)index):ip6_route(IP6_ADDR_ANY6,&group);
+    if(!n){result=-KERNEL_ENODEV;goto out;}
+    if(n->hwaddr_len && n->mtu<1280){result=-KERNEL_ENODEV;goto out;}
+    if(count>=32){result=-KERNEL_ENOBUFS;goto out;}
+    ip6_addr_assign_zone(&group,IP6_MULTICAST,n);
+    if(!mld6_lookfor_group(n,&group)) {
+        unsigned groups=0;
+        for(struct netif *p=netif_list;p;p=p->next)
+            for(struct mld_group *g=netif_mld6_data(p);g;g=g->next)groups++;
+        /* Leave room for solicited-node address groups, including concurrent
+         * DAD. This is admission control, never an eviction of another owner. */
+        if(groups>=48){result=-KERNEL_ENOBUFS;goto out;}
+    }
+    struct socket_ipv6_member *m=NULL;
+    enum kernel_heap_status status=kernel_heap_allocate_zeroed(socket->heap,1,sizeof(*m),(void **)&m);
+    if(status!=KERNEL_HEAP_STATUS_OK){result=-KERNEL_ENOBUFS;goto out;}
+    err_t error=mld6_joingroup_netif(n,&group);
+    if(error!=ERR_OK){kernel_heap_release(socket->heap,m);result=lwip_error(error);goto out;}
+    m->group=group;m->index=netif_get_index(n);m->active=1;m->next=socket->ipv6_members;socket->ipv6_members=m;
+out:
+    kernel_socket_protocol_leave(&scope);return result;
+}
+int kernel_socket_set_ipv6_multicast_interface(struct kernel_socket *socket,uint32_t index)
+{
+    if(socket->family!=KERNEL_SOCKET_AF_INET6 || socket->type==SOCKET_STREAM)return -KERNEL_ENOPROTOOPT;
+    if(index>UINT8_MAX)return -KERNEL_ENODEV;
+    struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    int result=0;
+    if(index && !netif_get_by_index((uint8_t)index))result=-KERNEL_ENODEV;
+    else {SOCKET_ENDPOINT(state,socket);
+      if(index && socket->bound_device && index!=socket->bound_device)result=-KERNEL_EINVAL;
+      else socket->ipv6_multicast_index=(uint8_t)index;}
+    kernel_socket_protocol_leave(&scope);return result;
+}
+int kernel_socket_get_ipv6_multicast_interface(struct kernel_socket *socket,uint32_t *index)
+{
+    if(socket->family!=KERNEL_SOCKET_AF_INET6)return -KERNEL_ENOPROTOOPT;
+    SOCKET_ENDPOINT(state,socket);*index=socket->ipv6_multicast_index;return 0;
 }
 
 int kernel_socket_set_multicast_interface(struct kernel_socket *socket,uint32_t index,uint32_t address)
@@ -5182,6 +5346,7 @@ void kernel_socket_network_initialize(void)
             .tcp_output = socket_tcp_output, .work = protocol_work_ready, .capacity = protocol_capacity,
             .timewait_free = protocol_timewait_free, .tcp_info_retire = socket_tcp_info_retire,
             .udp_ingress_filter = socket_udp_ingress_filter, .tcp_ingress_filter = socket_tcp_ingress_filter,
+            .udp_multicast_receive=socket_udp_multicast_receive,.netif_removed=socket_ipv6_netif_removed,
 #if BOAROS_USER_SMP
             .tcp_context = tcp_context, .tcp_dispatch = tcp_dispatch,
             .pcb_forget = tcp_pcb_forget, .tcp_conflict = tcp_route_conflict,
@@ -5958,9 +6123,18 @@ int kernel_socket_interface_set_mtu(const char name[16], int32_t mtu)
                         ipv6_withdraw(n);
                         __builtin_memset(n->ip6_configured,0,sizeof(n->ip6_configured));
                         ip6_addr_set_zero(&n->ip6_gateway);
+                        netif_ip6_addr_set_state(n,0,IP6_ADDR_INVALID);
+                        /* IPv6 device teardown, unlike ordinary link DOWN:
+                         * retain socket records, but retire their aggregate
+                         * references. A later old LEAVE must not consume a new
+                         * socket's membership after IPv6 is recreated. */
+                        for(struct kernel_socket *s=inet_sockets;s;s=s->inet_next)
+                            for(struct socket_ipv6_member *m=s->ipv6_members;m;m=m->next)
+                                if(m->index==netif_get_index(n))m->active=0;
+                        mld6_stop(n);
+                        __builtin_memset(n->ip6_mld_joined,0,sizeof(n->ip6_mld_joined));
                     }
-                    if (next<1280) netif_ip6_addr_set_state(n,0,IP6_ADDR_INVALID);
-                    else if (ip6_addr_isinvalid(netif_ip6_addr_state(n,0))) {
+                    if (next>=1280 && ip6_addr_isinvalid(netif_ip6_addr_state(n,0))) {
                         netif_create_ip6_linklocal_address(n,1);
                         nd6_restart_netif(n);
                     }
