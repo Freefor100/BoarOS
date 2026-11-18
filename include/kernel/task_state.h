@@ -143,9 +143,16 @@ struct kernel_task {
     struct kernel_sched_node reservation_node;
     struct kernel_cpu *reservation_cpu;
     uint32_t user_slice_expired;
-    struct kernel_fair_link fair_candidate;
 #endif
     unsigned accounted;
+#if BOAROS_MAX_CPUS > 1
+    union {
+        struct kernel_sched_rt_candidate rt_candidate;
+#if BOAROS_USER_SMP
+        struct kernel_fair_link fair_candidate;
+#endif
+    };
+#endif
 #if BOAROS_USER_SMP && BOAROS_COST_DIAGNOSTICS
     uint64_t service_started_ticks, service_running_ns;
 #endif

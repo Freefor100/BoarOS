@@ -154,6 +154,9 @@ static void finish_service_sample_locked(struct kernel_task *task)
 #endif
 
 #if BOAROS_MAX_CPUS > 1
+static void ready_notify_rt_locked(struct kernel_cpu *source);
+static void ready_rt_eligibility_locked(struct kernel_task *task);
+
 static uint32_t effective_cpu_mask(const struct kernel_task *task)
 {
 #if BOAROS_USER_SMP
@@ -190,6 +193,10 @@ void scheduler_user_reservation_release_locked(struct kernel_task *task)
     dequeue_task(&cpu->user_reservations,&task->reservation_node);
     task->reservation_cpu=0;
     kernel_cpu_request_schedule(cpu);
+    if (task->ready_cpu && !task->user_service && is_rt(task)) {
+        ready_rt_eligibility_locked(task);
+        ready_notify_rt_locked(task->ready_cpu);
+    }
 #else
     (void)task;
 #endif
@@ -206,6 +213,7 @@ void scheduler_user_service_set_locked(struct kernel_task *task, int service)
     if (queued) ready_remove_locked(task);
     task->user_service = service != 0;
     if (queued) ready_enqueue_locked(task, 0);
+    else if (task->wait.on_cpu && is_rt(task)) ready_notify_rt_locked(task->cpu);
 #else
     (void)task; (void)service;
 #endif
@@ -560,19 +568,185 @@ static int ready_allowed_on(struct kernel_cpu *cpu, struct kernel_task *task)
     return 1;
 }
 
-static struct kernel_task *ready_pull_locked(struct kernel_cpu *cpu)
+/* High priority sorts first. Earlier FIFO insertion sorts first within
+ * a priority, including explicit head insertion after preemption. */
+#define RT_ORDER_BITS 57U
+#define RT_ORDER_MIDDLE (UINT64_C(1) << (RT_ORDER_BITS - 1))
+
+static void rt_index_order(struct kernel_sched_runqueue *queue,
+    struct kernel_sched_rt_candidate *entry,unsigned priority,int head)
+{
+    uint64_t sequence=++queue->rt_sequence;
+    if (sequence>=RT_ORDER_MIDDLE) __builtin_trap();
+    entry->node.key=((100U-(uint64_t)priority)<<RT_ORDER_BITS) |
+        (head?RT_ORDER_MIDDLE-sequence:RT_ORDER_MIDDLE+sequence);
+}
+
+static uint32_t rt_subtree_mask(const struct kernel_avl_node *node)
+{
+    return node?((const struct kernel_sched_rt_candidate *)node)->subtree_eligibility:0;
+}
+
+static void rt_update_mask(struct kernel_avl_node *node)
+{
+    struct kernel_sched_rt_candidate *entry=(void *)node;
+    entry->subtree_eligibility=entry->eligibility |
+        rt_subtree_mask(node->left) | rt_subtree_mask(node->right);
+}
+
+static void rt_index_set(struct kernel_sched_runqueue *queue,
+    struct kernel_sched_rt_candidate *entry,uint32_t eligibility)
+{
+    if (entry->eligibility)
+        queue->rt_remote=kernel_avl_remove_node_augmented(queue->rt_remote,&entry->node,rt_update_mask);
+    entry->eligibility=eligibility;
+    entry->node.left=entry->node.right=0;
+    if (eligibility) {
+        entry->node.height=1;
+        entry->subtree_eligibility=eligibility;
+        queue->rt_remote=kernel_avl_insert_node_augmented(queue->rt_remote,&entry->node,rt_update_mask);
+    }
+}
+
+/* Follow the lower-bound path. At each step a matching node or a
+ * matching right subtree can replace the previous, later fallback.
+ * After following the bound, the fallback subtree needs only a
+ * leftmost-match descent. Neither walk needs to inspect its peers. */
+static struct kernel_avl_node *rt_find(struct kernel_avl_node *node,uint64_t first,uint32_t mask)
+{
+    struct kernel_avl_node *best=0,*suffix=0;
+    while (rt_subtree_mask(node)&mask) {
+        if (node->key<first) {
+            node=node->right;
+            continue;
+        }
+        const struct kernel_sched_rt_candidate *entry=(const void *)node;
+        if (entry->eligibility&mask) {
+            best=node;
+            suffix=0;
+        } else if (rt_subtree_mask(node->right)&mask) {
+            best=0;
+            suffix=node->right;
+        }
+        node=node->left;
+    }
+    while (suffix) {
+        const struct kernel_sched_rt_candidate *entry=(const void *)suffix;
+        if (rt_subtree_mask(suffix->left)&mask) suffix=suffix->left;
+        else if (entry->eligibility&mask) return suffix;
+        else suffix=suffix->right;
+    }
+    return best;
+}
+
+static struct kernel_sched_rt_candidate *rt_index_pick(const struct kernel_sched_runqueue *queue,
+    uint64_t first,unsigned minimum,uint32_t mask)
+{
+    struct kernel_avl_node *node=rt_find(queue->rt_remote,first,mask);
+    uint64_t end=(100U-(uint64_t)minimum)<<RT_ORDER_BITS;
+    return node && node->key<end ? (void *)node : 0;
+}
+
+/* Eligibility bit sets, one bit per CPU in each eight-bit lane. The
+ * reservation threshold applies only to users; throttling may admit PI. */
+#define RT_REMOTE_KERNEL 8
+#define RT_REMOTE_PI 16
+
+static void ready_rt_index_locked(struct kernel_task *task,uint32_t eligibility)
+{
+    if (task->rt_candidate.eligibility==eligibility) return;
+    struct kernel_cpu *source=task->ready_cpu;
+#if BOAROS_USER_SMP
+    uint32_t old_mask=task->rt_candidate.eligibility&0xffU,new_mask=eligibility&0xffU;
+    uint32_t changed=old_mask^new_mask;
+    for (struct kernel_cpu *cpu=scheduler.cpus;cpu;cpu=cpu->scheduler_next) {
+        uint32_t bit=1U<<cpu->logical_id;
+        if (!(changed&bit)) continue;
+        if (new_mask&bit) {
+            if (cpu->remote_rt_ready==UINT32_MAX) __builtin_trap();
+            cpu->remote_rt_ready++;
+        } else {
+            if (!cpu->remote_rt_ready) __builtin_trap();
+            cpu->remote_rt_ready--;
+        }
+    }
+#endif
+    rt_index_set(&source->runqueue,&task->rt_candidate,eligibility);
+}
+
+static void ready_rt_eligibility_locked(struct kernel_task *task)
+{
+    uint32_t mask=effective_cpu_mask(task)&~(1U<<task->ready_cpu->logical_id);
+    uint32_t eligibility=mask;
+#if BOAROS_USER_SMP
+    if (!task->arch.user_mode) eligibility|=mask<<RT_REMOTE_KERNEL;
+#endif
+    if (task->pi_base_priority) eligibility|=eligibility<<RT_REMOTE_PI;
+    ready_rt_index_locked(task,eligibility);
+}
+
+static struct kernel_task *ready_rt_on(struct kernel_cpu *target,struct kernel_cpu *source,
+    unsigned minimum,uint64_t first)
+{
+    if (!source->runqueue.rt_remote) return 0;
+    int eligible=rt_eligible(target);
+    uint32_t mask=1U<<target->logical_id;
+    if (!eligible) mask<<=RT_REMOTE_PI;
+    struct kernel_sched_rt_candidate *best;
+#if BOAROS_USER_SMP
+    struct kernel_sched_node *reserved=kernel_sched_pick(&target->user_reservations,eligible);
+    if (reserved && reserved->priority>minimum) {
+        /* An RT user reservation fixes its owner to this CPU while queued
+         * for user execution, so the same owner cannot be a remote rival. */
+        best=rt_index_pick(&source->runqueue,first,reserved->priority,mask);
+        if (!best) best=rt_index_pick(&source->runqueue,first,minimum,mask<<RT_REMOTE_KERNEL);
+    } else
+#endif
+        best=rt_index_pick(&source->runqueue,first,minimum,mask);
+    if (!best) return 0;
+    struct kernel_task *task=(void *)((char *)best - offsetof(struct kernel_task,rt_candidate));
+    if (task->wait.on_cpu || task->ready_cpu!=source || !ready_allowed_on(target,task))
+        __builtin_trap();
+    return task;
+}
+
+/* The local head is the only queued RT task that may advance immediately
+ * on this source. Keeping its queue position avoids evicting it needlessly. */
+static void ready_notify_rt_locked(struct kernel_cpu *source)
+{
+    if (!source->runqueue.rt_remote) return;
+    struct kernel_task *head=source->runqueue.rt_first->owner;
+    int head_can_run=ready_allowed_on(source,head) && !placement_preceded(head,source->current);
+#if BOAROS_USER_SMP
+    head_can_run &= source->logical_id || !scheduler.rt_services.rt_first;
+#endif
+    uint64_t first=head_can_run?head->rt_candidate.node.key+1U:0;
+    for (struct kernel_cpu *cpu=scheduler.cpus;cpu;cpu=cpu->scheduler_next) {
+        if (cpu==source || !kernel_cpu_online(cpu)) continue;
+        struct kernel_task *task=ready_rt_on(cpu,source,0,first);
+        if (task && placement_class(task,cpu,ready_load(cpu))<2)
+            kernel_cpu_request_schedule(cpu);
+    }
+}
+
+static struct kernel_task *ready_pull_locked(struct kernel_cpu *cpu,int busy,unsigned minimum)
 {
     struct kernel_task *best=0;
     for (struct kernel_cpu *other=scheduler.cpus;other;other=other->scheduler_next) {
         if (other==cpu || !other->pullable_ready) continue;
-        for (struct kernel_sched_node *node=kernel_sched_pick(&other->runqueue,1);node;node=kernel_sched_next(&other->runqueue,node)) {
-            if (best && node->priority<=(unsigned)best->scheduling.priority) break;
-            struct kernel_task *task=node->owner;
-            if (task->wait.on_cpu || task->ready_cpu!=other) __builtin_trap();
-            if (ready_allowed_on(cpu,task)) { best=task; break; }
+        struct kernel_task *rt=ready_rt_on(cpu,other,minimum,0);
+        if (rt) {
+            best=rt;
+            minimum=rt->scheduling.priority;
+        } else if (!busy && !minimum && !best) {
+            for (struct kernel_sched_node *node=kernel_sched_pick(&other->runqueue,0);node;
+                 node=kernel_sched_next(&other->runqueue,node)) {
+                struct kernel_task *task=node->owner;
+                if (task->wait.on_cpu || task->ready_cpu!=other) __builtin_trap();
+                if (ready_allowed_on(cpu,task)) { best=task; break; }
+            }
         }
     }
-    /* 只借用候选；claim在同一调度域内摘除原owner，再取得执行owner。 */
     return best;
 }
 #endif
@@ -604,13 +778,15 @@ struct kernel_task *ready_best_locked(void)
     }
 #endif
 #if BOAROS_MAX_CPUS > 1
-    /* 正在运行者的yield只比较本核FIFO；空闲/阻塞后才取异核更高优先级工作。 */
-    if (!cpu->current || cpu->current->idle ||
-        (cpu->current->state!=KERNEL_THREAD_STATE_RUNNING &&
-         cpu->current->state!=KERNEL_THREAD_STATE_READY)) {
-        struct kernel_task *pulled=ready_pull_locked(cpu);
-        if (pulled && (!node || pulled->scheduling.priority>(int)node->priority)) return pulled;
-    }
+    struct kernel_task *current=cpu->current;
+    int busy=current && !current->idle && (current->state==KERNEL_THREAD_STATE_RUNNING ||
+        current->state==KERNEL_THREAD_STATE_READY);
+    unsigned minimum=busy && ready_allowed_on(cpu,current)?(unsigned)current->scheduling.priority:0;
+    if (node && node->priority>minimum) minimum=node->priority;
+    /* Busy CPUs only pull strictly higher RT work. Equal-priority yield
+     * and RR expiration still use the local FIFO. */
+    struct kernel_task *pulled=ready_pull_locked(cpu,busy,minimum);
+    if (pulled && (!node || pulled->scheduling.priority>(int)node->priority)) return pulled;
 #endif
     return node ? node->owner : 0;
 }
@@ -625,20 +801,18 @@ void ready_remove_locked(struct kernel_task *task)
     if (!task->ready_cpu || !task->ready_node.queued) __builtin_trap();
     struct kernel_cpu *owner=task->ready_cpu;
     struct kernel_sched_runqueue *queue=ready_queue(task,owner);
-    if (queue==&owner->runqueue &&
-        ((task->cpu_mask ? task->cpu_mask : 1U)&~(1U<<owner->logical_id))) {
-        if (!owner->pullable_ready) __builtin_trap();
+    if (queue==&owner->runqueue) {
+        if (task->ready_node.priority) ready_rt_index_locked(task,0);
+        if ((task->cpu_mask ? task->cpu_mask : 1U)&~(1U<<owner->logical_id)) {
+            if (!owner->pullable_ready) __builtin_trap();
 #if BOAROS_USER_SMP
-        if (task->ready_node.priority) {
-            if (!owner->pullable_rt) __builtin_trap();
-            if (!--owner->pullable_rt)
-                __atomic_fetch_and(&scheduler.pullable_rt_cpus,~(1U<<owner->logical_id),__ATOMIC_RELAXED);
-        }
-        if (task->fair_candidate.next) fair_list_remove(&task->fair_candidate);
-        __atomic_store_n(&owner->pullable_ready,owner->pullable_ready-1U,__ATOMIC_RELAXED);
+            if (!task->ready_node.priority && task->fair_candidate.next)
+                fair_list_remove(&task->fair_candidate);
+            __atomic_store_n(&owner->pullable_ready,owner->pullable_ready-1U,__ATOMIC_RELAXED);
 #else
-        owner->pullable_ready--;
+            owner->pullable_ready--;
 #endif
+        }
     }
     dequeue_task(queue,&task->ready_node);
     task->ready_cpu=0;
@@ -670,6 +844,10 @@ static void ready_enqueue_at_locked(struct kernel_task *task, int flags
     fair_place(task,target);
     struct kernel_sched_runqueue *queue=ready_queue(task,target);
     enqueue_task(queue,&task->ready_node,task,flags&SCHED_READY_HEAD);
+    if (queue==&target->runqueue && task->ready_node.priority) {
+        rt_index_order(queue,&task->rt_candidate,task->ready_node.priority,flags&SCHED_READY_HEAD);
+        ready_rt_eligibility_locked(task);
+    }
     /* Requested masks change only after dequeue. Unlike effective affinity,
      * these do not change when an outstanding RT reservation is released. */
     if (queue==&target->runqueue &&
@@ -679,8 +857,6 @@ static void ready_enqueue_at_locked(struct kernel_task *task, int flags
         if (!task->ready_node.priority && !task->user_service)
             fair_list_append(&target->fair_candidates,&task->fair_candidate);
         __atomic_store_n(&target->pullable_ready,target->pullable_ready+1U,__ATOMIC_RELAXED);
-        if (task->ready_node.priority && !target->pullable_rt++)
-            __atomic_fetch_or(&scheduler.pullable_rt_cpus,1U<<target->logical_id,__ATOMIC_RELAXED);
 #else
         target->pullable_ready++;
 #endif
@@ -697,6 +873,9 @@ static void ready_enqueue_at_locked(struct kernel_task *task, int flags
     preempt |= is_rt_service(task) && !is_rt_service(target->current);
 #endif
     if (preempt) kernel_cpu_request_schedule(target);
+#if BOAROS_MAX_CPUS > 1
+    if (is_rt(task)) ready_notify_rt_locked(target);
+#endif
 }
 void ready_enqueue_locked(struct kernel_task *task,int flags)
 {
@@ -778,6 +957,9 @@ static struct kernel_task *claim_next_locked(struct kernel_cpu *cpu,
 #endif
     cpu->switch_previous = previous;
     cpu->rotate_other = 0;
+#if BOAROS_MAX_CPUS > 1
+    if (is_rt(next)) ready_notify_rt_locked(cpu);
+#endif
     return next;
 }
 
@@ -927,7 +1109,7 @@ static int remote_rt_ready(const struct kernel_cpu *cpu)
 {
     /* 调用者持目标核锁。RT入队和资格更新持共同控制及所有队列锁，
      * 因此在本次领取前不会悄悄出现可迁移的更高优先级任务。 */
-    return (__atomic_load_n(&scheduler.pullable_rt_cpus,__ATOMIC_RELAXED)&~(1U<<cpu->logical_id))!=0;
+    return cpu->remote_rt_ready!=0;
 }
 
 /* 空闲核只借实际来源和目标两把队列锁。来源选中前旧栈必已归还；
@@ -946,8 +1128,7 @@ static __attribute__((noinline)) int try_pull_ordinary(struct kernel_cpu *cpu,
             KERNEL_RAW_SCOPE(second,two);
             if (!local_queue_eligible(cpu,current,blocked) || remote_rt_ready(cpu)) return -1;
             if (cpu->runqueue.count || (blocked && current->wait.ready_pending)) return 0;
-            for (struct kernel_sched_node *node=kernel_sched_pick(&source->runqueue,1);node;node=kernel_sched_next(&source->runqueue,node)) {
-                if (node->priority) continue;
+            for (struct kernel_sched_node *node=kernel_sched_pick(&source->runqueue,0);node;node=kernel_sched_next(&source->runqueue,node)) {
                 if (!ready_allowed_on(cpu,node->owner)) continue;
                 if (!scheduler_local_task(node->owner,cpu)) return -1;
                 next=node->owner;
@@ -1068,7 +1249,7 @@ int scheduler_select_local(int blocked,int rotate,int voluntary,struct kernel_ta
     {
         KERNEL_RAW_SCOPE(guard,kernel_run_lock(cpu));
         if (!local_queue_eligible(cpu,current,blocked)) return 0;
-        if ((blocked || current->idle) && remote_rt_ready(cpu)) return 0;
+        if (remote_rt_ready(cpu)) return 0;
         struct kernel_sched_node *head=kernel_sched_pick(&cpu->runqueue,1);
         account_cpu(cpu,kernel_time_monotonic_ns());
         if (blocked) {
@@ -1273,7 +1454,10 @@ int kernel_task_affinity_set(struct kernel_task *caller, int32_t pid, uint64_t m
             scheduler_user_reservation_release_locked(task);
         task->cpu_mask = requested;
         if (queued) ready_enqueue_locked(task, 0);
-        if (task->wait.on_cpu) kernel_cpu_request_schedule(task->cpu);
+        if (task->wait.on_cpu) {
+            kernel_cpu_request_schedule(task->cpu);
+            if (is_rt(task)) ready_notify_rt_locked(task->cpu);
+        }
     }
 #endif
     return 0;
@@ -1363,12 +1547,24 @@ void scheduler_pi_priority_locked(struct kernel_task *task,unsigned base,unsigne
 #endif
         );
 #if BOAROS_MAX_CPUS > 1
-    if (changed_boost && queued) kernel_cpu_request_schedule(ready_owner);
+    if (changed_boost && queued) {
+        kernel_cpu_request_schedule(ready_owner);
+        if (!move) {
+            if (task->ready_node.priority && ready_queue(task,ready_owner)==&ready_owner->runqueue)
+                ready_rt_eligibility_locked(task);
+            ready_notify_rt_locked(ready_owner);
+        }
+    }
 #else
     if (changed_boost && queued) kernel_cpu_request_schedule(task->cpu?task->cpu:caller);
 #endif
-    if((move || changed_boost) && task->wait.on_cpu)
-        kernel_cpu_request_schedule(task->cpu?task->cpu:caller);
+    if((move || changed_boost) && task->wait.on_cpu) {
+        struct kernel_cpu *owner=task->cpu?task->cpu:caller;
+        kernel_cpu_request_schedule(owner);
+#if BOAROS_MAX_CPUS > 1
+        ready_notify_rt_locked(owner);
+#endif
+    }
 }
 
 static int nice_reduction_allowed(struct kernel_task *target,int nice)

@@ -7,6 +7,12 @@ struct kernel_fair_link {
     struct kernel_fair_link *next,*previous;
 };
 #endif
+#if BOAROS_MAX_CPUS > 1
+struct kernel_sched_rt_candidate {
+    struct kernel_avl_node node;
+    uint32_t eligibility,subtree_eligibility;
+};
+#endif
 /* One node belongs to either the RT FIFO or the fair tree, never both.
  * The owning CPU run lock (UP: scheduler domain) protects either index. */
 struct kernel_sched_node {
@@ -15,7 +21,7 @@ struct kernel_sched_node {
         struct kernel_avl_node fair;
     };
     void *owner;
-    unsigned priority,queued;
+    uint8_t priority,queued;
 #if BOAROS_USER_SMP
     unsigned fair_weight; /* Snapshot while queued, including a later nice/PI change. */
 #endif
@@ -27,6 +33,10 @@ struct kernel_sched_runqueue {
     uint64_t min_vruntime;
 #if BOAROS_USER_SMP
     uint64_t fair_weight;
+#endif
+#if BOAROS_MAX_CPUS > 1
+    struct kernel_avl_node *rt_remote;
+    uint64_t rt_sequence;
 #endif
     unsigned boosted,count;
 };

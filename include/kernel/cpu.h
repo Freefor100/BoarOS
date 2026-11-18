@@ -71,7 +71,7 @@ struct kernel_cpu {
     unsigned fair_balance_cursor;
 #endif
 #if BOAROS_USER_SMP
-    uint32_t pullable_rt;
+    uint32_t remote_rt_ready;
 #endif
     uint64_t ipi_sent, ipi_received, rfence_requests;
 #if BOAROS_USER_SMP

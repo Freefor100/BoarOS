@@ -2106,10 +2106,17 @@ test-socket-protocol-host:
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -include sys/types.h -include limits.h -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -DSOCKET_PROTOCOL_CASES -Itests/host/sync -idirafter include -idirafter net/lwip_port/include -idirafter third_party/lwip/src/include tests/host/user_smp.c tests/host/user_stop.c kernel/signal_pending.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/seccomp.c kernel/sched/seccomp.c kernel/sched/lifetime.c kernel/sched/policy.c kernel/sched/runqueue.c third_party/lwip/src/core/ip.c third_party/lwip/src/core/stats.c -Wl,--gc-sections,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release,--wrap=kernel_scheduler_wake_signal,--wrap=kernel_wait_backend_quiesce,--wrap=kernel_rwlock_write,--wrap=kernel_rwlock_try_write -o $(or $(SOCKET_PROTOCOL_HOST_BUILD),build/host/socket-protocol)/scope
 	$(or $(SOCKET_PROTOCOL_HOST_BUILD),build/host/socket-protocol)/scope
 
-.PHONY: user-smp-host test-user-smp-fair-host
+USER_SMP_HOST_BUILD = cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=$(1) -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -Itests/host/sync -idirafter include tests/host/user_smp.c tests/host/user_stop.c kernel/signal_pending.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/seccomp.c kernel/sched/seccomp.c kernel/sched/lifetime.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release,--wrap=kernel_scheduler_wake_signal,--wrap=kernel_wait_backend_quiesce -o $(2)
+
+.PHONY: user-smp-host test-user-smp-fair-host test-user-smp-rt-host
 user-smp-host:
 	@mkdir -p build/host
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -Itests/host/sync -idirafter include tests/host/user_smp.c tests/host/user_stop.c kernel/signal_pending.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/seccomp.c kernel/sched/seccomp.c kernel/sched/lifetime.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release,--wrap=kernel_scheduler_wake_signal,--wrap=kernel_wait_backend_quiesce -o build/host/user-smp
+	$(call USER_SMP_HOST_BUILD,2,build/host/user-smp)
+
+test-user-smp-rt-host:
+	@mkdir -p build/host
+	$(call USER_SMP_HOST_BUILD,4,build/host/user-smp-rt)
+	build/host/user-smp-rt --rt-balance-only
 
 test-user-smp-fair-host: user-smp-host
 	build/host/user-smp --fair-balance-only
@@ -2131,6 +2138,16 @@ $(FAIR_BALANCE_ELF): tests/workloads/smp/fair_balance.c $(MUSL_STAMP)
 test-user-smp-fair-riscv: $(FAIR_BALANCE_ELF)
 	$(MAKE) kernel-rv-user-smp
 	python3 -B tests/smp/fair_balance.py --kernel $(USER_SMP_BUILD)/kernel-rv --program $(FAIR_BALANCE_ELF) --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE)
+
+.PHONY: test-user-smp-rt-riscv
+RT_BALANCE_ELF := $(USER_SMP_BUILD)/rt-balance-rv
+$(RT_BALANCE_ELF): tests/workloads/smp/rt_balance.c $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -o $@ $<
+
+test-user-smp-rt-riscv: $(RT_BALANCE_ELF)
+	$(MAKE) kernel-rv-user-smp
+	python3 -B tests/smp/rt_balance.py --kernel $(USER_SMP_BUILD)/kernel-rv --program $(RT_BALANCE_ELF) --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE)
 
 .PHONY: test-user-smp-riscv
 USER_SMP_ELF := build/riscv-user-smp$(SMP_BUILD_SUFFIX)/user-smp-rv
