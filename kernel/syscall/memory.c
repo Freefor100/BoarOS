@@ -19,6 +19,7 @@
 #define LINUX_PROT_READ UINT64_C(0x1)
 #define LINUX_PROT_WRITE UINT64_C(0x2)
 #define LINUX_PROT_EXEC UINT64_C(0x4)
+#define LINUX_PROT_GROWSDOWN UINT64_C(0x01000000)
 #define LINUX_MAP_PRIVATE UINT64_C(0x2)
 #define LINUX_MAP_SHARED UINT64_C(0x1)
 #define LINUX_MAP_TYPE_MASK UINT64_C(0xf)
@@ -39,7 +40,7 @@
 #define LINUX_MAP_KNOWN_FLAGS                                             \
     (LINUX_MAP_TYPE_MASK | LINUX_MAP_FIXED | LINUX_MAP_ANONYMOUS |       \
      LINUX_MAP_DENYWRITE | LINUX_MAP_EXECUTABLE | LINUX_MAP_NORESERVE |  \
-     LINUX_MAP_POPULATE | LINUX_MAP_STACK |                               \
+     LINUX_MAP_POPULATE | LINUX_MAP_STACK | LINUX_MAP_GROWSDOWN |           \
      LINUX_MAP_FIXED_NOREPLACE | LINUX_MAP_LEGACY_EXTRA | LINUX_MAP_LOCKED)
 #define LINUX_MAP_NORESERVE UINT64_C(0x4000)
 #define LINUX_MAP_STACK UINT64_C(0x20000)
@@ -134,8 +135,9 @@ enum kernel_syscall_status syscall_handle_mmap(
         type_error = -KERNEL_EINVAL;
     else if (!request->arguments[1])
         type_error = -KERNEL_EINVAL;
-    else if (!type_error && (flags & LINUX_MAP_GROWSDOWN))
-        type_error = -KERNEL_EOPNOTSUPP;
+    else if (!type_error && (flags & LINUX_MAP_GROWSDOWN) &&
+        (!(flags & LINUX_MAP_ANONYMOUS) || mapping_type != LINUX_MAP_PRIVATE))
+        type_error = -KERNEL_EINVAL;
     /* Legacy mmap ignores extension flags; SHARED_VALIDATE rejects them. */
     if (mapping_type == LINUX_MAP_SHARED_VALIDATE)
         flags = (flags & ~LINUX_MAP_TYPE_MASK) | LINUX_MAP_SHARED;
@@ -145,6 +147,7 @@ enum kernel_syscall_status syscall_handle_mmap(
         mm_flags = KERNEL_MM_MAP_FIXED_NOREPLACE;
     }
     if (flags & LINUX_MAP_LOCKED) mm_flags |= KERNEL_MM_MAP_LOCKED;
+    if (flags & LINUX_MAP_GROWSDOWN) mm_flags |= KERNEL_MM_MAP_GROWSDOWN;
     if ((flags & LINUX_MAP_TYPE_MASK) == LINUX_MAP_SHARED)
         mm_flags |= KERNEL_MM_MAP_SHARED;
     if (kernel_task_mm_borrow_mutable(caller, &mm) !=
@@ -335,7 +338,7 @@ enum kernel_syscall_status syscall_handle_mprotect(
 
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     if ((protections & ~(LINUX_PROT_READ | LINUX_PROT_WRITE |
-                         LINUX_PROT_EXEC)) != 0U) {
+                         LINUX_PROT_EXEC | LINUX_PROT_GROWSDOWN)) != 0U) {
         decoded->value = -KERNEL_EINVAL;
         return KERNEL_SYSCALL_STATUS_OK;
     }
@@ -343,7 +346,8 @@ enum kernel_syscall_status syscall_handle_mprotect(
         KERNEL_TASK_STATUS_OK) {
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
-    status = kernel_mm_mprotect_personality(mm,
+    status = ((protections & LINUX_PROT_GROWSDOWN) ?
+        kernel_mm_mprotect_growdown : kernel_mm_mprotect_personality)(mm,
                                 request->arguments[0],
                                 request->arguments[1],
                                 mm_permissions_from_linux(protections),

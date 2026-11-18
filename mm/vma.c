@@ -46,7 +46,7 @@ uint64_t kernel_vma_set_total_bytes(const struct kernel_vma_set *set)
 
 static int private_data_mapping(const struct kernel_vma *vma)
 {
-    return vma->role != KERNEL_VMA_ROLE_STACK &&
+    return !kernel_vma_grows_down(vma) &&
         (vma->kind == KERNEL_VMA_KIND_ANONYMOUS ||
          vma->kind == KERNEL_VMA_KIND_FILE_PRIVATE ||
          vma->kind == KERNEL_VMA_KIND_ELF_PRIVATE);
@@ -596,6 +596,12 @@ enum kernel_vma_status kernel_vma_set_backing_in_use(
     return KERNEL_VMA_STATUS_OK;
 }
 
+static uint64_t unmapped_start(const struct kernel_vma *vma)
+{
+    uint64_t gap = KERNEL_VMA_STACK_GUARD_PAGES * BOAROS_PAGE_SIZE;
+    return kernel_vma_grows_down(vma) ? (vma->start > gap ? vma->start-gap : 0) : vma->start;
+}
+
 enum kernel_vma_status kernel_vma_set_find_topdown_gap(
     const struct kernel_vma_set *set,
     uint64_t hint,
@@ -618,12 +624,17 @@ enum kernel_vma_status kernel_vma_set_find_topdown_gap(
                                 hint + length,
                                 &conflict) == KERNEL_VMA_STATUS_OK &&
         conflict == 0) {
-        *address = hint;
-        return KERNEL_VMA_STATUS_OK;
+        uint32_t next = lower_bound(set, hint + length);
+        if (next == set->count || hint + length <= unmapped_start(&set->entries[next])) {
+            *address = hint;
+            return KERNEL_VMA_STATUS_OK;
+        }
     }
 
     cursor = upper;
     index = lower_bound(set, upper);
+    if (index < set->count && unmapped_start(&set->entries[index]) < cursor)
+        cursor = unmapped_start(&set->entries[index]);
     while (index > 0U) {
         const struct kernel_vma *entry = &set->entries[index - 1U];
         uint64_t gap_start;
@@ -637,8 +648,8 @@ enum kernel_vma_status kernel_vma_set_find_topdown_gap(
             *address = cursor - length;
             return KERNEL_VMA_STATUS_OK;
         }
-        if (entry->start < cursor) {
-            cursor = entry->start;
+        if (unmapped_start(entry) < cursor) {
+            cursor = unmapped_start(entry);
         }
     }
     if (cursor >= lower && cursor - lower >= length) {
