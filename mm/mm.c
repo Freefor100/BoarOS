@@ -127,6 +127,7 @@ struct kernel_mm_record {
     uint64_t futex_id;
     uint32_t references;
     uint32_t users;
+    uint32_t core_remote; /* high bit: dump owner, low bits: remote writers */
     struct kernel_raw_rwlock metadata;
     uint64_t access_pins, write_pins;
     struct kernel_rwlock operations;
@@ -6355,6 +6356,38 @@ static enum kernel_mm_status resolve_user_fault(struct kernel_mm *mm,
     }
 }
 
+#define MM_CORE_ACTIVE UINT32_C(0x80000000)
+int kernel_mm_core_begin(struct kernel_mm *mm)
+{
+    struct kernel_mm_record *record;
+    if (resolve_record(mm,&record) || mm->state!=KERNEL_MM_LIVE) return 0;
+    if (pin_state_read(&record->write_pins)) return 0;
+    uint32_t expected=0;
+    return __atomic_compare_exchange_n(&record->core_remote,&expected,MM_CORE_ACTIVE,
+        0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);
+}
+void kernel_mm_core_end(struct kernel_mm *mm)
+{
+    if (__atomic_exchange_n(&mm->record->core_remote,0,__ATOMIC_RELEASE)!=MM_CORE_ACTIVE)
+        __builtin_trap();
+}
+int kernel_mm_core_remote_begin(struct kernel_mm *mm)
+{
+    struct kernel_mm_record *record=mm->record;
+    uint32_t old=__atomic_load_n(&record->core_remote,__ATOMIC_ACQUIRE);
+    do {
+        if (old&MM_CORE_ACTIVE) return 0;
+        if (old==MM_CORE_ACTIVE-1) __builtin_trap();
+    } while (!__atomic_compare_exchange_n(&record->core_remote,&old,old+1,
+                 1,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE));
+    return 1;
+}
+void kernel_mm_core_remote_end(struct kernel_mm *mm)
+{
+    uint32_t old=__atomic_fetch_sub(&mm->record->core_remote,1,__ATOMIC_RELEASE);
+    if (!old || (old&MM_CORE_ACTIVE)) __builtin_trap();
+}
+
 /* Both debugger and process_vm use the existing fault and actual-page borrow.
  * No source pin survives into a destination fault; executable bytes are
  * published only after the data stores and before returning to userland. */
@@ -6713,7 +6746,7 @@ enum kernel_mm_status kernel_mm_proc_maps_snapshot(const struct kernel_mm *mm,
             if (kernel_vma_set_get_at(record->vmas, i, &vma)) __builtin_trap();
             struct kernel_mm_proc_map *row = &data[i];
             *row = (struct kernel_mm_proc_map){ .start = vma.start, .end = vma.end,
-                .permissions = vma.permissions, .role = vma.role,
+                .permissions = vma.permissions, .flags = vma.flags, .kind = vma.kind, .role = vma.role,
                 .shared = vma.kind == KERNEL_VMA_KIND_FILE_SHARED ||
                     vma.kind == KERNEL_VMA_KIND_ANON_SHARED ||
                     vma.kind == KERNEL_VMA_KIND_SYSV_SHM ||

@@ -376,7 +376,8 @@ void kernel_user_group_exit(enum kernel_thread_exit_reason reason,
     if (kernel_task_has_user_context(kernel_task_current()) && !kernel_scheduler_user_service_active())
         kernel_scheduler_enter_user_service();
 #endif
-    process_group_request_exit(kernel_cpu_current()->current, reason, status, detail);
+    if (reason == KERNEL_THREAD_EXIT_SYSCALL)
+        process_group_request_exit(kernel_cpu_current()->current, reason, status, detail);
     kernel_user_thread_exit(reason, status, detail);
 }
 
@@ -2383,9 +2384,8 @@ static uint32_t user_wait_status(
         return 9U; /* SIGKILL */
     }
     if (completion->reason == KERNEL_THREAD_EXIT_SIGNAL) {
-        /* A core-producing default action does not mean a dump was written.
-         * BoarOS has no core writer; Linux sets bit 7 only after a dump. */
-        return (uint32_t)completion->status & UINT32_C(0x7f);
+        return ((uint32_t)completion->status & UINT32_C(0x7f)) |
+            (completion->detail ? UINT32_C(0x80) : 0);
     }
     return fault_wait_status(completion->status);
 }
@@ -2574,6 +2574,7 @@ static void kernel_thread_finish(
         switch_to_fatal_idle(status);
     }
 
+    if (current->arch.user_mode) process_core_rendezvous(current);
     if (current->arch.user_mode) ptrace_begin_exit(current,user_wait_status(completion));
     process_begin_exit(current, completion);
     /* Undo is visible before publishing exit or waking a child-TID joiner. */
@@ -2675,6 +2676,10 @@ void kernel_user_thread_exit(
     if (kernel_cpu_current()->current == 0 ||
         kernel_cpu_current()->current->arch.user_mode != 1U) {
         switch_to_fatal_idle(KERNEL_SCHEDULER_STATUS_INVALID_STATE);
+    }
+    if (reason == KERNEL_THREAD_EXIT_SIGNAL && detail) {
+        detail = process_core_dump(kernel_cpu_current()->current, (unsigned)status);
+        completion.detail = detail;
     }
     completion.tid = kernel_cpu_current()->current->tid;
     completion.tgid = kernel_cpu_current()->current->group_leader->tid;

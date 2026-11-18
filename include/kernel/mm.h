@@ -129,6 +129,15 @@ void kernel_mm_unpin_user_pair(struct kernel_mm_user_pin pins[2]);
 int kernel_mm_remote_transfer(struct kernel_mm *, uint64_t address, void *buffer,
     size_t length, int writing, int force, size_t *copied);
 
+/* Fatal-exit caller has stopped every MM user. Fail rather than overlap an
+ * existing remote writer; subsequent ptrace/process_vm writes are rejected. */
+int kernel_mm_core_begin(struct kernel_mm *);
+void kernel_mm_core_end(struct kernel_mm *);
+/* Pair around a process_vm request while its independent MM owner lives.
+ * Exceptional syscall exit must end this registration before releasing MM. */
+int kernel_mm_core_remote_begin(struct kernel_mm *);
+void kernel_mm_core_remote_end(struct kernel_mm *);
+
 /* Source owner and handle remain stable through this non-sleeping acquire.
  * Success creates another independently owned reference to the same MM. */
 enum kernel_mm_status kernel_mm_acquire(
@@ -376,7 +385,8 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm);
 uint64_t kernel_mm_peak_resident_pages(const struct kernel_mm *mm);
 struct kernel_mm_proc_map {
     uint64_t start, end, offset;
-    uint32_t permissions;
+    uint32_t permissions, flags;
+    enum kernel_vma_kind kind;
     enum kernel_vma_role role;
     unsigned shared;
     struct kernel_open_file_description *file;

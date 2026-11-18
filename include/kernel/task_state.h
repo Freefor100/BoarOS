@@ -210,6 +210,7 @@ struct kernel_task {
     struct kernel_pid *child_creator;
     uint32_t terminate_requested;
     uint32_t proc_exiting;
+    struct process_core_session *core_session; /* leader-owned, fatal exit only */
     uint32_t group_exiting;
     uint32_t group_execing;
     uint32_t fork_no_exec;

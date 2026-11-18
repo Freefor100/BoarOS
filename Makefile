@@ -389,6 +389,7 @@ COMMON_C_SOURCES := \
 	kernel/sched/kcmp.c \
 	kernel/sched/exec.c \
 	kernel/sched/process.c \
+	kernel/sched/coredump.c \
 	kernel/sched/ptrace.c \
 	kernel/sched/proc.c \
 	kernel/sched/signal.c \

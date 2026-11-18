@@ -401,7 +401,8 @@ static int attach(struct kernel_task *caller,struct kernel_task *target,int32_t 
             const struct kernel_credentials *cred=kernel_credentials_task_locked(tracer);
             if ((!self && t->tid!=requested_tid) || t->retirement) return -KERNEL_ESRCH;
             if (t->ptrace->tracer || t->group_leader==tracer->group_leader ||
-                !t->arch.user_mode || t->proc_exiting || !t->group_leader) return -KERNEL_EPERM;
+                !t->arch.user_mode || t->proc_exiting || !t->group_leader ||
+                t->group_leader->core_session) return -KERNEL_EPERM;
             if (tracer->proc_exiting) return self?0:-KERNEL_EPERM;
             if (self || !kernel_task_ptrace_exec_busy_locked(t)) {
                 if (self) {
