@@ -16,9 +16,13 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <sys/resource.h>
+#include <signal.h>
 void mm_test_attach(unsigned);
 extern _Thread_local uint64_t mm_test_context;
-static unsigned char pool[8*1024*1024] __attribute__((aligned(4096)));
+static unsigned char pool[8*1024*1024] __attribute__((aligned(BOAROS_PAGE_SIZE)));
 static struct physical_page_allocator pages;
 static struct kernel_heap heap;
 static struct arch_mmu_page_table kernel;
@@ -282,8 +286,23 @@ static void cleanup_transaction(void)
     assert(!stats.live_allocations && !stats.current_pages && physical_page_available(&pages)==before);
     puts("exec actual cleanup: image released, failed source/OFD retained, heap owners cleared and retry completed");
 }
+static void rejected_disk_cache_entry(void)
+{
+    /* The shared VFS link closure must not turn excluded disk work into a
+     * successful no-op. A native child keeps the expected abort isolated. */
+    pid_t child=fork();assert(child>=0);
+    if(!child) {
+        struct rlimit limit={0,0};if(setrlimit(RLIMIT_CORE,&limit))_exit(2);
+        kernel_page_cache_invalidate_range(NULL,NULL,0,1);
+        _exit(1);
+    }
+    int status;assert(waitpid(child,&status,0)==child);
+    assert(WIFSIGNALED(status) && WTERMSIG(status)==SIGABRT);
+    puts("ELF fixture: excluded disk-cache invalidation abort verified");
+}
 int main(void)
 {
+    rejected_disk_cache_entry();
     mm_test_attach(0);
     struct boot_memory_layout layout={0}; layout.usable_count=1;
     layout.usable[0].base=(uintptr_t)pool; layout.usable[0].size=sizeof(pool);
