@@ -1,3 +1,6 @@
+#include <arch/riscv/vector.h>
+#include <kernel/task_state.h>
+#include <kernel/heap.h>
 #include <kernel/vdso.h>
 #include <arch/riscv/signal.h>
 #include <arch/riscv/fpu.h>
@@ -87,9 +90,44 @@ static const uint32_t signal_gpr_offsets[32] = {
     RISCV_TRAP_FRAME_T6,
 };
 
-static void riscv_signal_bad_frame(void)
+static _Noreturn void riscv_signal_bad_frame(void)
 {
     kernel_user_group_exit(KERNEL_THREAD_EXIT_SIGNAL, 11U, 1U);
+}
+
+/* Linux's extension list advances by record size; register data comes from
+ * datap, which may be relocated independently. Repeated known records are
+ * legal and the last image wins. Keep one temporary bank until the whole
+ * list is readable, so user faults cannot publish a partial running image. */
+static struct riscv_vector_state *signal_vector_snapshot(struct kernel_task *task,
+    struct kernel_mm *mm,uint64_t base,const struct riscv_linux_mcontext *context)
+{
+    struct riscv_vector_state *image=0;
+    uint32_t hdr[2]={context->fp.reserved[1],context->fp.reserved[2]};
+    size_t bytes=32*riscv_vector_vlenb,copied;
+    uint64_t cursor=base+RISCV_SIGNAL_FRAME_SIZE-8;
+    if(context->fp.reserved[0])goto bad;
+    while(hdr[0] || hdr[1]) {
+        uint64_t v[6];
+        if(!task->vector || hdr[0]!=RISCV_VECTOR_MAGIC || hdr[1]!=56+bytes ||
+            cursor>UINT64_MAX-hdr[1]-8 ||
+            kernel_copy_from_user(mm,v,cursor+8,48,&copied) || copied!=48)goto bad;
+        if(!image) {
+            if(kernel_heap_allocate_nosleep(task->vector->heap,sizeof(*image)+bytes,(void **)&image))goto bad;
+            image->heap=task->vector->heap;
+            image->vlenb=riscv_vector_vlenb;
+        }
+        /* vlenb is a read-only hardware property, not a copy-length input.
+         * Linux restores the writable CSRs and always transfers runtime size. */
+        memcpy(image,v,32);
+        if(kernel_copy_from_user(mm,image->regs,v[5],bytes,&copied) || copied!=bytes)goto bad;
+        cursor+=hdr[1];
+        if(kernel_copy_from_user(mm,hdr,cursor,8,&copied) || copied!=8)goto bad;
+    }
+    return image;
+bad:
+    if(image)kernel_heap_release(image->heap,image);
+    riscv_signal_bad_frame();
 }
 
 static void riscv_signal_build_frame(
@@ -111,10 +149,12 @@ static void riscv_signal_build_frame(
     uint64_t vdso;
     size_t copied;
 
-    if (top < RISCV_SIGNAL_FRAME_SIZE) {
+    size_t vector_bytes=task->vector ? 32*riscv_vector_vlenb : 0;
+    size_t frame_size=RISCV_SIGNAL_FRAME_SIZE+(vector_bytes ? 64+vector_bytes : 0);
+    if (top < frame_size) {
         riscv_signal_bad_frame();
     }
-    user_sp = (top - RISCV_SIGNAL_FRAME_SIZE) & ~UINT64_C(15);
+    user_sp = (top - frame_size) & ~UINT64_C(15);
     if (!kernel_signal_stack_frame_valid(&saved_stack, frame->sp, delivery->flags,
                                           user_sp, top)) riscv_signal_bad_frame();
     memset(&data, 0, sizeof(data));
@@ -135,12 +175,27 @@ static void riscv_signal_build_frame(
     }
     riscv_fpu_state_save(fpu);
     memcpy(data.context.fp.registers, fpu->regs, sizeof(fpu->regs));
+    if(vector_bytes) {
+        riscv_vector_save(task);
+        data.context.fp.reserved[1]=RISCV_VECTOR_MAGIC;
+        data.context.fp.reserved[2]=(uint32_t)(56+vector_bytes);
+    }
     fcsr = (uint32_t)fpu->fcsr;
     memcpy(data.context.fp.registers + 256U, &fcsr, sizeof(fcsr));
     if (kernel_copy_to_user(mm, user_sp + RISCV_SIGNAL_MCONTEXT_OFFSET,
                              &data.context, sizeof(data.context), &copied) !=
             KERNEL_UACCESS_STATUS_OK || copied != sizeof(data.context)) {
         riscv_signal_bad_frame();
+    }
+    if(vector_bytes) {
+        uint64_t v[6];
+        memcpy(v,task->vector,40);
+        v[5]=user_sp+RISCV_SIGNAL_FRAME_SIZE+48;
+        uint64_t end=0;
+        if(kernel_copy_to_user(mm,user_sp+RISCV_SIGNAL_FRAME_SIZE,v,48,&copied) || copied!=48 ||
+           kernel_copy_to_user(mm,v[5],task->vector->regs,vector_bytes,&copied) || copied!=vector_bytes ||
+           kernel_copy_to_user(mm,v[5]+vector_bytes,&end,8,&copied) || copied!=8)
+            riscv_signal_bad_frame();
     }
     if (kernel_mm_vdso_address(mm, &vdso) != KERNEL_MM_STATUS_OK ||
         vdso > UINT64_MAX - KERNEL_VDSO_RESTORER_OFFSET) {
@@ -224,15 +279,17 @@ void riscv_signal_restore_current(struct riscv_trap_frame *frame)
             KERNEL_UACCESS_STATUS_OK || copied != sizeof(context)) {
         riscv_signal_bad_frame();
     }
-    /* No vector/extended context is enabled. Linux requires reserved
-     * words to remain zero when no extension record follows. */
-    if (context.fp.reserved[0] != 0U || context.fp.reserved[1] != 0U ||
-        context.fp.reserved[2] != 0U) {
-        riscv_signal_bad_frame();
-    }
+    struct riscv_vector_state *vector=signal_vector_snapshot(task,mm,frame->sp,&context);
     if (kernel_signal_update_blocked(task, LINUX_SIG_SETMASK, &saved.mask, 0) !=
         KERNEL_SIGNAL_STATUS_OK) {
+        if(vector)kernel_heap_release(vector->heap,vector);
         riscv_signal_bad_frame();
+    }
+    if(vector) {
+        struct riscv_vector_state *old=task->vector;
+        task->vector=vector;
+        riscv_vector_restore(task);
+        kernel_heap_release(old->heap,old);
     }
     kernel_signal_clear_syscall_restart(task);
     /* Linux ignores readable but invalid restoration settings. Evaluate

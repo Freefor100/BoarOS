@@ -456,7 +456,7 @@ static enum kernel_elf_image_status prepare_stack_layout(
     total_bytes = string_bytes + random_bytes;
     table_words = 1U + (uint64_t)layout->argument_count + 1U +
                   (uint64_t)layout->environment_count + 1U +
-                  2U * (17U + KERNEL_HAS_VDSO_ELF);
+                  2U * (17U + KERNEL_HAS_VDSO_ELF + ARCH_ELF_AUX_EXTRA);
     if (table_words > UINT64_MAX / sizeof(uint64_t)) {
         return KERNEL_ELF_IMAGE_STATUS_STACK_LIMIT;
     }
@@ -670,6 +670,9 @@ static enum kernel_elf_image_status build_stack(
     POPULATE_AUXILIARY(8U, 0U);
     POPULATE_AUXILIARY(9U, layout->main_entry);
     POPULATE_AUXILIARY(16U, ARCH_ELF_HWCAP);
+#if ARCH_ELF_AUX_EXTRA
+    POPULATE_AUXILIARY(51U, ARCH_ELF_MINSIGSTKSZ);
+#endif
     POPULATE_AUXILIARY(17U, KERNEL_ELF_CLKTCK);
     POPULATE_AUXILIARY(11U, layout->uid);
     POPULATE_AUXILIARY(12U, layout->euid);

@@ -1239,7 +1239,7 @@ enum dtb_status dtb_read_irq_info(const void *dtb, uint64_t boot_hart,
     return status;
 }
 
-static int isa_has_svvptc(const unsigned char *isa,uint32_t length)
+static int isa_has_extension(const unsigned char *isa,uint32_t length,int vector)
 {
     if (length<4 || isa[0]!='r' || isa[1]!='v' || isa[2]!='6' || isa[3]!='4') return 0;
     uint32_t i=4;
@@ -1254,6 +1254,10 @@ static int isa_has_svvptc(const unsigned char *isa,uint32_t length)
                 i++;
                 while (i<length && isa[i]>='0' && isa[i]<='9') i++;
             }
+        }
+        if (vector) {
+            if (!multi && isa[begin]=='v' && (i==begin+1 || isa[begin+1]=='1')) return 1;
+            continue;
         }
         if (!multi || i-begin<6 ||
             !bytes_equal_string(isa+begin,6,"svvptc")) continue;
@@ -1350,20 +1354,24 @@ static enum dtb_status read_cpu_info(const void *dtb,uint64_t boot_hart,
                     node->reg_length != ac * 4) return DTB_STATUS_INVALID;
                 uint64_t hart = read_cells(node->reg, ac);
                 if (!boot_only || hart==boot_hart) {
-                    int supported=0;
+                    int supported=0, vector=0;
                     if (node->extensions) {
                         if (!string_list_contains(node->extensions,node->extensions_length,
-                                "svvptc",&supported)) return DTB_STATUS_INVALID;
+                                "svvptc",&supported) ||
+                            !string_list_contains(node->extensions,node->extensions_length,
+                                "v",&vector)) return DTB_STATUS_INVALID;
                     } else if (node->isa) {
                         if (!property_value_is_one_string(node->isa,node->isa_length))
                             return DTB_STATUS_INVALID;
-                        supported=isa_has_svvptc(node->isa,node->isa_length-1);
+                        supported=isa_has_extension(node->isa,node->isa_length-1,0);
+                        vector=isa_has_extension(node->isa,node->isa_length-1,1);
                     }
-                    uint32_t features=supported?DTB_CPU_MMU_SVVPTC:0;
+                    uint32_t features=(supported?DTB_CPU_MMU_SVVPTC:0) |
+                        (vector?DTB_CPU_ISA_V:0);
                     for (uint32_t i=0;i<result.count;i++)
                         if (result.hart_ids[i]==hart) return DTB_STATUS_INVALID;
                     if (result.count==DTB_MAX_CPUS) return DTB_STATUS_UNSUPPORTED;
-                    result.mmu_features=result.count ? result.mmu_features&features : features;
+                    result.features=result.count ? result.features&features : features;
                     result.hart_ids[result.count++]=hart;
                 }
             }
@@ -1398,6 +1406,6 @@ enum dtb_status dtb_read_boot_cpu_features(const void *dtb,uint64_t boot_hart,ui
     if (!features) return DTB_STATUS_INVALID;
     struct dtb_cpu_info info;
     enum dtb_status status=read_cpu_info(dtb,boot_hart,&info,1);
-    if (!status) *features=info.mmu_features;
+    if (!status) *features=info.features;
     return status;
 }

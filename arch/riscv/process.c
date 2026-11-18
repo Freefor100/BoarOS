@@ -1,3 +1,4 @@
+#include <arch/riscv/vector.h>
 #include <arch/riscv/process.h>
 #include <arch/riscv/fpu.h>
 #include <arch/riscv/thread.h>
@@ -15,6 +16,8 @@ enum kernel_scheduler_status riscv_process_prepare_clone(
 
     if ((uintptr_t)frame < child->stack_low)
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+    if (riscv_vector_clone(child,parent))
+        return KERNEL_SCHEDULER_STATUS_NO_MEMORY;
     riscv_fpu_state_save(&parent->fpu);
     child->fpu = parent->fpu;
     *frame = *parent_frame;
@@ -37,6 +40,7 @@ void riscv_process_prepare_initial(struct kernel_task *task, uintptr_t entry,
     struct riscv_trap_frame *frame = (struct riscv_trap_frame *)(
         task->stack_high - sizeof(*frame));
 
+    if(!task->vector_control)task->vector_control=2;
     memset(frame, 0, sizeof(*frame));
     frame->sp = stack;
     frame->tp = tls;
@@ -50,6 +54,7 @@ void riscv_process_prepare_initial(struct kernel_task *task, uintptr_t entry,
 void riscv_process_prepare_exec(struct kernel_task *task, uintptr_t entry,
                                 uintptr_t stack, uintptr_t tls)
 {
+    riscv_vector_exec(task);
     riscv_process_prepare_initial(task, entry, stack, tls);
     riscv_fpu_reset_current(&task->fpu);
 }

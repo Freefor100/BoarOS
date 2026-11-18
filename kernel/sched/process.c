@@ -1,3 +1,6 @@
+#if defined(__riscv)
+#include <arch/riscv/vector.h>
+#endif
 #include "../../fs/files/private.h"
 #include "../../fs/cgroup_internal.h"
 #include "../../fs/open_file_internal.h"
@@ -1016,9 +1019,10 @@ enum kernel_scheduler_status arch_process_clone_current(
                                          (flags & LINUX_CLONE_SETTLS) != 0U,
                                          tls);
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
-        return finish_clone_failure(
-            child, -KERNEL_EAGAIN, linux_result,
-            KERNEL_SCHEDULER_STATUS_INVALID_STATE);
+        return finish_clone_failure(child,
+            status == KERNEL_SCHEDULER_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EAGAIN,
+            linux_result, status == KERNEL_SCHEDULER_STATUS_NO_MEMORY ?
+                KERNEL_SCHEDULER_STATUS_OK : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
     }
 
     if (pidfd.files) {
@@ -2093,6 +2097,9 @@ static void switch_to_fatal_idle(enum kernel_scheduler_status status)
         }
         kernel_cpu_current()->current = kernel_cpu_current()->idle;
         arch_fpu_switch(0, &kernel_cpu_current()->idle->fpu);
+#if defined(__riscv)
+        riscv_vector_restore(kernel_cpu_current()->idle);
+#endif
         arch_context_switch(&kernel_cpu_current()->discard_context,
                              &kernel_cpu_current()->idle->context);
     }
@@ -2660,6 +2667,9 @@ static void kernel_thread_finish(
 #endif
     scheduler_arm_timer(next_deadline);
     arch_fpu_switch(0, &next->fpu);
+#if defined(__riscv)
+    riscv_vector_restore(next);
+#endif
     scheduler_cpu_time_switch(current, next);
     arch_context_switch(&kernel_cpu_current()->discard_context, &next->context);
     kernel_scheduler_switch_finish();

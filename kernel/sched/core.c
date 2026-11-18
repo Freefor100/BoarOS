@@ -1,3 +1,6 @@
+#if defined(__riscv)
+#include <arch/riscv/vector.h>
+#endif
 #include <arch/task.h>
 #include <arch/context.h>
 #include <kernel/files.h>
@@ -570,6 +573,9 @@ enum kernel_scheduler_status scheduler_switch_claimed(
     kernel_cost_switch(&previous->cost, &next->cost);
 #endif
     arch_fpu_switch(&previous->fpu, &next->fpu);
+#if defined(__riscv)
+    riscv_vector_switch(previous,next);
+#endif
     /* 新栈完成handoff；raw已释放，IRQ仍关闭，旧任务尚不能再次运行/回收。 */
     scheduler_cpu_time_switch(previous, next);
     arch_context_switch(&previous->context, &next->context);

@@ -1,3 +1,6 @@
+#if defined(__riscv)
+#include <arch/riscv/vector.h>
+#endif
 #include "../../fs/cgroup_internal.h"
 #include "private.h"
 #include <kernel/seccomp.h>
@@ -210,6 +213,9 @@ void scheduler_task_collect(void)
         /* Discovery and all storage borrows have ended. Like Linux sighand,
          * dispositions retain their identity through zombie/reap, then leave
          * with the container; queue quiescence and page disposal stay outside raw. */
+#if defined(__riscv)
+        riscv_vector_release(task);
+#endif
         if (task->cgroup) {
             kernel_cgroup_put(task->cgroup);
             task->cgroup=0;

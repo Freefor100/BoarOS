@@ -456,6 +456,7 @@ RV_C_SOURCES := \
 	arch/riscv/exec.c \
 	arch/riscv/process.c \
 	arch/riscv/ptrace.c \
+	arch/riscv/vector.c \
 	arch/riscv/mm.c \
 	arch/riscv/uaccess.c \
 	arch/riscv/root_boot.c \
@@ -480,6 +481,7 @@ ASM_SOURCES := \
 	arch/riscv/secondary.S \
 	arch/riscv/context_switch.S \
 	arch/riscv/fpu.S \
+	arch/riscv/vector_state.S \
 	arch/riscv/trap_entry.S \
 	arch/riscv/user_copy.S \
 	arch/riscv/signal_trampoline.S
@@ -496,6 +498,10 @@ endif
 OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(C_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
+ifeq ($(RISCV_VECTOR_OOM_FIXTURE),1)
+OBJECTS += $(BUILD_DIR)/tests/riscv/vector_oom.o
+LDFLAGS += -Wl,--wrap=riscv_vector_clone,--wrap=riscv_vector_first_use,--wrap=kernel_heap_allocate_zeroed_nosleep
+endif
 ifeq ($(USER_SMP_COMPOSITION),1)
 OBJECTS += $(BUILD_DIR)/tests/riscv/user_smp_composition.o
 LDFLAGS += -Wl,--wrap=kernel_pipe_readv,--wrap=kernel_pipe_writev,--wrap=kernel_open_file_poll,--wrap=kernel_event_fd_io,--wrap=syscall_handle_timerfd,--wrap=kernel_timer_fd_expire
@@ -2434,3 +2440,15 @@ test-hugetlb-host:
 	sh tests/host/hugetlb.sh
 	sh tests/host/mm-hugetlb.sh
 	sh tests/host/proc-hugetlb.sh
+
+.PHONY: test-riscv-vector-host
+test-riscv-vector-host:
+	mkdir -p build/host
+	@set -e; for shift in 12 14; do \
+		$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -Werror \
+		-ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=$$shift -DBOAROS_MAX_CPUS=1 \
+		-Itests/host/sync -idirafter include tests/host/riscv_vector.c arch/riscv/vector.c \
+		-Wl,--gc-sections -o build/host/riscv-vector-$$shift; \
+		build/host/riscv-vector-$$shift; \
+	done
+	python3 -B tests/host/smp_dtb_test.py

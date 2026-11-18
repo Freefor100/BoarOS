@@ -44,6 +44,7 @@ struct kernel_futex_pi_state;
 struct kernel_futex_pi_request;
 struct kernel_futex_request;
 struct kernel_ptrace_state;
+struct riscv_vector_state;
 struct kernel_remote_memory_request;
 
 enum kernel_thread_state {
@@ -258,6 +259,10 @@ struct kernel_task {
     struct arch_fpu_state fpu;
     struct kernel_mm mm;
     struct kernel_exec_transaction *exec_transaction;
+#if !defined(BOAROS_ARCH_LOONGARCH)
+    /* This pointer fits the alignment gap before the switch context on RV64. */
+    struct riscv_vector_state *vector;
+#endif
     struct arch_switch_context context;
 #if BOAROS_COST_DIAGNOSTICS
     struct kernel_cost_task cost;
@@ -285,6 +290,9 @@ struct kernel_task {
      * FD槽由各表raw保护，FS发布由VFS状态保护，其余身份由调度域保护。 */
     struct kernel_raw_lock files_access;
     uint8_t exit_signal;
+#if !defined(BOAROS_ARCH_LOONGARCH)
+    uint8_t vector_control;
+#endif
     struct kernel_mqueue_request *mqueue_request;
     struct kernel_io_priority_context *io_priority;
     struct kernel_files_change *files_change;
