@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-case "${1:-all}" in all|ownership|truncate|extent|prepend|extent-lookup|nojournal-orphan-probe|direct-reuse) ;; *) echo 'usage: lwext4-metadata.sh [all|ownership|truncate|extent|prepend|extent-lookup|nojournal-orphan-probe|direct-reuse]' >&2; exit 2;; esac
+case "${1:-all}" in all|ownership|truncate|extent|prepend|extent-lookup|nojournal-orphan-probe|direct-reuse|nojournal-direct) ;; *) echo 'usage: lwext4-metadata.sh [all|ownership|truncate|extent|prepend|extent-lookup|nojournal-orphan-probe|direct-reuse|nojournal-direct]' >&2; exit 2;; esac
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT HUP INT TERM
@@ -15,6 +15,20 @@ ${HOST_CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror \
     -I"$root/third_party/lwext4/include" -idirafter "$root/include" \
     "$root"/third_party/lwext4/src/*.c "$root/tests/host/lwext4_metadata.c" \
     "$root/tests/host/block_fault.c" "$root/kernel/block.c" "$root/tests/host/block_runtime.c" "$root/kernel/raw_lock.c" "$root/tests/host/sync/notifications.c" -I"$root/tests/host/block_model" -pthread -o "$work/probe"
+if [ "${1:-all}" = nojournal-direct ]; then
+    for block in 1024 4096; do
+        truncate -s 32M "$work/direct.img"
+        mkfs.ext4 -q -F -b "$block" -O ^has_journal "$work/direct.img"
+        timeout 30 "$work/probe" "$work/direct.img" seed
+        cp "$work/direct.img" "$work/seed.img"
+        for mode in nojournal-direct direct-data-batch direct-data-error direct-range-error direct-full-leaf-error extent-middle-oom; do
+            cp "$work/seed.img" "$work/direct.img"
+            timeout 30 "$work/probe" "$work/direct.img" "$mode"
+            check_fs "$work/direct.img"
+        done
+    done
+    exit 0
+fi
 if [ "${1:-all}" = direct-reuse ]; then
     for block in 1024 4096; do
         truncate -s 32M "$work/direct-base.img"

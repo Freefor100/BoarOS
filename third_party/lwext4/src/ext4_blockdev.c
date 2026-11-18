@@ -469,8 +469,8 @@ int ext4_blocks_set_direct(struct ext4_blockdev *bdev, const void *buf,
 	return ext4_bdif_bwrite(bdev, buf, pba, pb_cnt * cnt);
 }
 
-int ext4_blocks_set_batch(struct ext4_blockdev *bdev,
-	struct kernel_block_span *spans, unsigned count)
+int ext4_blocks_check_batch(struct ext4_blockdev *bdev,
+	const struct kernel_block_span *spans, unsigned count)
 {
 	if (!bdev || !bdev->bdif || count > EXT4_BLOCK_BATCH_MAX ||
 	    (count && !spans) || !bdev->bdif->ph_bsize || !bdev->lg_bsize ||
@@ -490,7 +490,13 @@ int ext4_blocks_set_batch(struct ext4_blockdev *bdev,
 			if (spans[i].offset < spans[j].offset + spans[j].size &&
 			    spans[j].offset < spans[i].offset + spans[i].size) return EINVAL;
 	}
-	if (!count) return EOK;
+    return EOK;
+}
+int ext4_blocks_set_batch(struct ext4_blockdev *bdev,
+    struct kernel_block_span *spans,unsigned count)
+{
+    int checked=ext4_blocks_check_batch(bdev,spans,count);
+    if (checked || !count) return checked;
 	if (!bdev->bdif->bwrite_batch) {
 		for (unsigned i = 0; i < count; i++) {
 			int r = ext4_bdif_bwrite(bdev, spans[i].buffer,

@@ -195,6 +195,8 @@ int ext4_blocks_set_phase(struct ext4_blockdev *bdev,
 	const struct ext4_block_write *first);
 /* At most EXT4_BLOCK_BATCH_MAX disjoint whole-block byte ranges relative to the
  * filesystem. Borrows caller storage; all offsets are restored before return. */
+int ext4_blocks_check_batch(struct ext4_blockdev *bdev,
+    const struct kernel_block_span *spans,unsigned count);
 int ext4_blocks_set_batch(struct ext4_blockdev *bdev,
 	struct kernel_block_span *spans, unsigned count);
 

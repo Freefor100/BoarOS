@@ -47,6 +47,10 @@ for shift in ${FILE_IO_HOST_SHIFTS:-12 14}; do
         -Wl,--wrap=kernel_page_cache_get_batch,--wrap=kernel_vfs_sync_range_borrowing,--wrap=kernel_mm_try_futex_read -o "$build_dir/concurrency-$shift"
     truncate -s 32M "$build_dir/image-$shift.img"
     mkfs.ext4 -q -F -b "${FILE_IO_HOST_BLOCK_SIZE:-4096}" ${FILE_IO_HOST_MKFS_ARGS:-} "$build_dir/image-$shift.img"
+    if [ "${FILE_IO_NOJOURNAL:-0}" = 1 ]; then
+        : > "$build_dir/empty"
+        debugfs -w -R "write $build_dir/empty /direct-file" "$build_dir/image-$shift.img" >/dev/null 2>&1
+    fi
     timeout 30s "$build_dir/concurrency-$shift" "$build_dir/image-$shift.img"
     e2fsck -fn "$build_dir/image-$shift.img" > "$build_dir/fsck-$shift.log" 2>&1
 done

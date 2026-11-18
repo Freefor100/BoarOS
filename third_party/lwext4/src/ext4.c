@@ -4013,9 +4013,9 @@ static int ext4_flush_fblock_range(struct ext4_blockdev *bdev,
 	return EOK;
 }
 
-static int ext4_zero_allocated_eof_tail(struct ext4_inode_ref *ref,
+static int ext4_zero_allocated_eof_tail_mode(struct ext4_inode_ref *ref,
 					uint64_t old_size,
-					uint64_t visible_end)
+					uint64_t visible_end, bool synchronous)
 {
 	uint32_t block_size = ext4_sb_get_block_size(ext4_fs_super(ref->fs));
 	uint32_t offset = (uint32_t)(old_size % block_size);
@@ -4036,8 +4036,13 @@ static int ext4_zero_allocated_eof_tail(struct ext4_inode_ref *ref,
 	if (r != EOK || !fblock)
 		return r;
 
+	if (synchronous)
+		return ext4_trans_write_data_sync(ref->fs->bdev,fblock,offset,NULL,length,false);
 	return ext4_zero_fblock_range(ref, fblock, offset, length);
 }
+static int ext4_zero_allocated_eof_tail(struct ext4_inode_ref *ref,
+    uint64_t old_size,uint64_t visible_end)
+{ return ext4_zero_allocated_eof_tail_mode(ref,old_size,visible_end,false); }
 
 static int ext4_ftruncate_no_lock(ext4_file *file, uint64_t size, uint32_t privilege_mode)
 {
@@ -5283,7 +5288,7 @@ static int ext4_direct_write_flush(struct ext4_inode_ref *ref, ext4_file *file,
     return r;
 }
 
-static int ext4_write_spans(ext4_file *file, struct file_write_span *spans, unsigned count)
+static int ext4_write_spans(ext4_file *file, struct file_write_span *spans, unsigned count, bool synchronous)
 {
 	if (!file || !file->mp || count > EXT4_BLOCK_BATCH_MAX || (count && !spans)) return EINVAL;
 	for (unsigned i = 0; i < count; i++) spans[i].written = 0;
@@ -5370,7 +5375,7 @@ Retry:
         }
     }
     struct ext4_direct_write_batch *direct = NULL;
-    if (!journal && blocks > 1 && source_count) {
+    if (!journal && blocks > 1 && (source_count || synchronous)) {
         direct = ext4_calloc(1, sizeof(*direct));
         if (!direct) r = ENOMEM;
     }
@@ -5396,7 +5401,7 @@ Retry:
         /* The supplied block already includes the zero gap after old EOF. */
         if (!covers_eof && span->offset > old_size && old_size % block_size) {
             r = ext4_direct_write_flush(&ref, file, direct, &range, range_next);
-            if (!r) r = ext4_zero_allocated_eof_tail(&ref, old_size, span->offset);
+            if (!r) r = ext4_zero_allocated_eof_tail_mode(&ref, old_size, span->offset, synchronous);
         }
         size_t consumed = 0;
 		while (consumed < span->size && !r) {
@@ -5440,7 +5445,7 @@ Retry:
                     input -= offset; data_offset = 0; data_length = block_size;
                 }
             }
-            bool queued = direct && !data_offset && data_length == block_size && span->source.retain;
+            bool queued = direct && !data_offset && data_length == block_size && (span->source.retain || synchronous);
             if (queued) {
                 unsigned n = direct->count;
                 bool merge = n && direct->logical[n-1].span == span &&
@@ -5464,8 +5469,9 @@ Retry:
                 if (!r) direct->bytes += block_size;
             } else {
                 r = ext4_direct_write_flush(&ref, file, direct, &range, range_next);
-                if (!r) r = ext4_trans_write_data(fs->bdev, physical, data_offset,
-                    input, data_length, allocated, &span->source);
+                if (!r) r = synchronous
+                    ? ext4_trans_write_data_sync(fs->bdev, physical, data_offset, input, data_length, allocated)
+                    : ext4_trans_write_data(fs->bdev, physical, data_offset, input, data_length, allocated, &span->source);
             }
 			if (r) break;
             consumed += length;
@@ -5516,13 +5522,13 @@ int ext4_fwrite(ext4_file *file, const void *buffer, size_t size, size_t *writte
 	if (!file || !file->mp) return EINVAL;
 	EXT4_MP_LOCK(file->mp);
 	struct file_write_span span = {.offset=file->fpos, .buffer=buffer, .size=size};
-	int r = ext4_write_spans(file, &span, 1);
+	int r = ext4_write_spans(file, &span, 1, false);
 	if (written) *written = span.written;
 	EXT4_MP_UNLOCK(file->mp);
 	return r;
 }
 
-int ext4_fpwrite_batch(ext4_file *file, struct file_write_span *spans, unsigned count)
+static int ext4_fpwrite_batch_mode(ext4_file *file, struct file_write_span *spans, unsigned count, bool synchronous)
 {
 	if (!file || !file->mp) return EINVAL;
 	EXT4_MP_LOCK(file->mp);
@@ -5533,7 +5539,7 @@ int ext4_fpwrite_batch(ext4_file *file, struct file_write_span *spans, unsigned 
         local = *file;
         initial_size = file->fsize;
     }
-    int r = ext4_write_spans(&local, spans, count);
+    int r = ext4_write_spans(&local, spans, count, synchronous);
     ext4_file_drain_reservations(file);
     {
         EXT4_STATE_SCOPE(state, &file->mp->fs);
@@ -5543,6 +5549,17 @@ int ext4_fpwrite_batch(ext4_file *file, struct file_write_span *spans, unsigned 
     }
 	EXT4_MP_UNLOCK(file->mp);
 	return r;
+}
+
+int ext4_fpwrite_batch(ext4_file *file, struct file_write_span *spans, unsigned count)
+{ return ext4_fpwrite_batch_mode(file, spans, count, false); }
+
+/* Nonjournal synchronous storage is borrowed only until device completion.
+ * Journal users need the ordered-owner completion protocol instead. */
+int ext4_fpwrite_direct(ext4_file *file, struct file_write_span *span)
+{
+    if (!file || !file->mp || file->mp->fs.jbd_journal) return EINVAL;
+    return ext4_fpwrite_batch_mode(file, span, 1, true);
 }
 
 int ext4_fpwrite(ext4_file *file, uint64_t offset, const void *buffer, size_t size, size_t *written)

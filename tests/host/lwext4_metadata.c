@@ -1340,6 +1340,96 @@ static void direct_data_batch(struct ext4_fs *fs,bool fail)
     printf("nonjournal stable batch block=%u failed=%d: 128KiB vectors, exact prefix/EOF, held cache coherent, failed mappings released\n",fs->bdev->lg_bsize,fail);
 }
 
+
+/* A real partial device write, not a fail-before-submission stub. */
+static int nojournal_partial_batch(struct ext4_blockdev *bdev,
+    const struct kernel_block_span *spans,unsigned count)
+{
+    CHECK(count && spans[0].size>=512);
+    CHECK(dev_write(bdev,spans[0].buffer,spans[0].offset/512,1)==EOK);
+    return EIO;
+}
+static unsigned nojournal_batches;
+static int nojournal_second_batch(struct ext4_blockdev *bdev,
+    const struct kernel_block_span *spans,unsigned count)
+{
+    if (++nojournal_batches==2) return EIO;
+    for(unsigned i=0;i<count;i++) {
+        int r=dev_write(bdev,spans[i].buffer,spans[i].offset/512,spans[i].size/512);
+        if(r)return r;
+    }
+    return EOK;
+}
+static void nojournal_direct_file(struct ext4_fs *fs)
+{
+    CHECK(!fs->jbd_journal);
+    unsigned block=fs->bdev->lg_bsize;
+    unsigned char *data=malloc(4*block),*readback=malloc(4*block);CHECK(data && readback);
+    ext4_file file;CHECK(ext4_fopen(&file,"/file","r+")==EOK);
+    CHECK(ext4_ftruncate(&file,0,UINT32_MAX)==EOK);
+    memset(data,0x61,4*block);
+    struct file_write_span span={.offset=0,.buffer=data,.size=512};
+    CHECK(ext4_fpwrite_direct(&file,&span)==EOK && span.written==512 && ext4_fsize(&file)==512);
+    /* Hold the old EOF block across a discontiguous DIRECT extension. Its
+     * dirty nonzero tail must be synchronously zeroed on media, not merely
+     * changed in bcache until this external reference is returned. */
+    struct ext4_inode_ref tail_ref;ext4_fsblk_t tail_physical;
+    CHECK(ext4_fs_get_inode_ref(fs,file.inode,&tail_ref)==EOK);
+    CHECK(ext4_fs_get_inode_dblk_idx(&tail_ref,0,&tail_physical,true)==EOK && tail_physical);
+    CHECK(ext4_fs_put_inode_ref(&tail_ref)==EOK);
+    struct ext4_block tail=EXT4_BLOCK_ZERO();CHECK(ext4_block_get(fs->bdev,&tail,tail_physical)==EOK);
+    ext4_block_payload_write(tail.payload);memset(tail.data+512,0x77,block-512);ext4_bcache_set_dirty(tail.buf);
+    CHECK(ext4_block_flush_buf(fs->bdev,tail.buf)==EOK);
+    CHECK(ext4_cache_write_back("/",true)==EOK);
+    memset(data,0x63,4*block);span=(struct file_write_span){.offset=2*block,.buffer=data,.size=block};
+    CHECK(ext4_fpwrite_direct(&file,&span)==EOK && span.written==block && ext4_fsize(&file)==3*block);
+    CHECK(ext4_blocks_get_direct(fs->bdev,readback,tail_physical,1)==EOK);
+    for(unsigned i=0;i<block;i++)CHECK(readback[i]==(i<512?0x61:0));
+    CHECK(!ext4_bcache_test_flag(tail.buf,BC_DIRTY));
+    CHECK(ext4_block_set(fs->bdev,&tail)==EOK);
+    CHECK(ext4_cache_write_back("/",false)==EOK);
+    size_t done;CHECK(ext4_fpread(&file,0,readback,4*block,&done)==EOK && done==3*block);
+    for(unsigned i=0;i<done;i++)CHECK(readback[i]==(i<512?0x61:i<2*block?0:0x63));
+    struct ext4_inode_ref ref;ext4_fsblk_t physical;
+    CHECK(ext4_fs_get_inode_ref(fs,file.inode,&ref)==EOK);
+    CHECK(ext4_fs_get_inode_dblk_idx(&ref,2,&physical,true)==EOK && physical);
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+    struct ext4_block held=EXT4_BLOCK_ZERO();CHECK(ext4_block_get(fs->bdev,&held,physical)==EOK);
+    /* Standalone retained dirty preimage must be drained before the direct
+     * write and detached after its error, even while this reference survives. */
+    ext4_block_payload_write(held.payload);memset(held.data,0x64,block);ext4_bcache_set_dirty(held.buf);
+    memset(data,0x65,block);span=(struct file_write_span){.offset=2*block,.buffer=data,.size=block};
+    fs->bdev->bdif->bwrite_batch=nojournal_partial_batch;
+    CHECK(ext4_fpwrite_direct(&file,&span)==EIO && !span.written && ext4_fsize(&file)==3*block);
+    fs->bdev->bdif->bwrite_batch=NULL;
+    CHECK(ext4_block_set(fs->bdev,&held)==EOK);
+    CHECK(ext4_fpread(&file,2*block,readback,block,&done)==EOK && done==block);
+    for(unsigned i=0;i<block;i++)CHECK(readback[i]==(i<512?0x65:0x64));
+    /* Failed newly allocated mapping is not exposed as initialized data. */
+    span=(struct file_write_span){.offset=4*block,.buffer=data,.size=block};
+    fs->bdev->bdif->bwrite_batch=nojournal_partial_batch;
+    CHECK(ext4_fpwrite_direct(&file,&span)==EIO && !span.written && ext4_fsize(&file)==3*block);
+    fs->bdev->bdif->bwrite_batch=NULL;
+    CHECK(ext4_fs_get_inode_ref(fs,file.inode,&ref)==EOK);
+    CHECK(ext4_fs_get_inode_dblk_idx(&ref,4,&physical,true)==EOK && !physical);
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+    span=(struct file_write_span){.offset=4*block,.buffer=data,.size=512};
+    CHECK(ext4_fpwrite_direct(&file,&span)==EOK && span.written==512);
+    CHECK(ext4_fpread(&file,3*block,readback,2*block,&done)==EOK && done==block+512);
+    for(unsigned i=0;i<done;i++)CHECK(readback[i]==(i<block?0:0x65));
+    CHECK(ext4_ftruncate(&file,0,UINT32_MAX)==EOK);
+    unsigned char *large=malloc(262144);CHECK(large);memset(large,0x79,262144);
+    span=(struct file_write_span){.offset=0,.buffer=large,.size=262144};
+    nojournal_batches=0;fs->bdev->bdif->bwrite_batch=nojournal_second_batch;
+    CHECK(ext4_fpwrite_direct(&file,&span)==EIO && span.written==131072 && ext4_fsize(&file)==131072);
+    CHECK(nojournal_batches==2);fs->bdev->bdif->bwrite_batch=NULL;
+    CHECK(ext4_fpread(&file,0,large,262144,&done)==EOK && done==131072);
+    for(size_t i=0;i<done;i++)CHECK(large[i]==0x79);
+    free(large);
+    CHECK(ext4_fclose(&file)==EOK);free(data);free(readback);
+    printf("PASS nojournal direct block=%u: growth, sparse/EOF zeroing, partial failed media write, dirty preimage retirement, failed extent release and retry\n",block);
+}
+
 static void group_partial_owner(struct ext4_fs *fs, bool failed)
 {
     struct ext4_journal_runtime runtime={.now_ns=group_clock};
@@ -3526,6 +3616,7 @@ int main(int argc,char **argv)
         direct_metadata_reuse(dev.fs,fault);if(fault)return 0;
     }
     else if(!strcmp(argv[2],"verify-direct-metadata-reuse")) verify_direct_metadata_reuse(dev.fs,argc>3?strtoul(argv[3],NULL,10):0);
+    else if(!strcmp(argv[2],"nojournal-direct"))nojournal_direct_file(dev.fs);
     else if(!strcmp(argv[2],"seed"))seed();
     else if(!strcmp(argv[2],"operation-context"))operation_context_test(dev.fs);
 #ifdef TEST_OPERATION_LIFECYCLE

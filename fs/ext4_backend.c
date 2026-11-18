@@ -2864,7 +2864,7 @@ static int ext4_backend_writeback(struct kernel_vfs_node *node,
 static size_t ext4_backend_direct_alignment(struct kernel_vfs_node *node)
 {
     struct lwext4_mount_adapter *adapter=lwext4_instance(node->instance);
-    return adapter->device.fs->jbd_journal?adapter->device.bdif->ph_bsize:0;
+    return adapter->device.bdif->ph_bsize;
 }
 static uint64_t ext4_backend_direct_limit(struct kernel_vfs_node *node)
 { return node->max_size; }
@@ -2876,10 +2876,16 @@ static int ext4_backend_direct_io(struct kernel_vfs_node *node,uint64_t offset,
     int result=0;
     if (writing>0) {
         struct file_write_span span={.offset=offset,.buffer=buffer,.size=size};
-        result=ext4_backend_writeback(node,&span,1);
+        bool journal=lwext4_instance(node->instance)->device.fs->jbd_journal!=NULL;
+        result=journal?ext4_backend_writeback(node,&span,1):
+            lwext4_error(ext4_fpwrite_direct(lwext4_node_file(node),&span));
         uint64_t accepted=ext4_fsize(lwext4_node_file(node));
         if (accepted>node->size) __atomic_store_n(&node->size,accepted,__ATOMIC_RELEASE);
-        if (result) return result;
+        if (result) {
+            /* Without rollback, completed earlier batches remain visible. */
+            if (!journal) *done=span.written;
+            return result;
+        }
         size=span.written;
     }
     result=lwext4_error(ext4_fdata_complete(lwext4_node_file(node),offset,size));

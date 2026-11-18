@@ -4,8 +4,8 @@
 
 ## 普通文件直接 I/O
 
-启用日志的 ext4 支持普通文件和 `O_TMPFILE` 使用 `O_DIRECT`，也可以通过
-`F_SETFL` 切换。按设备逻辑扇区检查文件偏移、用户缓冲区地址和各向量长度。
+ext4 普通文件可在打开时指定 `O_DIRECT`，也可通过 `F_SETFL` 切换。
+启用日志的 ext4 同时支持匿名临时文件 `O_TMPFILE` 的直接 I/O。按设备逻辑扇区检查文件偏移、用户缓冲区地址和各向量长度。
 对齐的扩展写沿用 extent 分配事务，读取文件空洞返回零。
 
 VFS 先暂存用户输入并归还用户页引用。文件写操作锁保护相交的共享映射撤销、
@@ -17,12 +17,22 @@ VFS 先暂存用户输入并归还用户页引用。文件写操作锁保护相�
 通过一把可睡眠的锁顺序执行。日志提交仍按原有规则请求两次设备持久化，
 `O_DIRECT` 本身只等待数据操作完成。设备错误保留尚待恢复的版本并停止提交。
 
+无日志的 ext4 按同步块 I/O 完成数据写入。完整块直接引用本次请求的稳定缓冲区，
+部分块在内核中组装。提交前排空相交的旧脏块，设备失败后撤销旧缓存，防止它覆盖
+已写入的前缀。扩展前同步清零旧 EOF 所在块中即将可见的尾部。已完成的批次保留
+字节计数和文件大小，未完成的新增 extent 交给原有清理过程处理。无日志卷的
+修复要求见下文的挂载及错误处理规则。
+
 `JOURNAL_TEST_CASE=direct-ordered sh tests/host/lwext4-journal.sh` 检查同一物理块
 的多代数据、提交时的并发替换及 I/O 故障。`sh tests/host/lwext4-metadata.sh direct-reuse`
 检查正在写回的旧目录块在释放事务完成前禁止复用、复用后的读写及断电恢复。
 `FILE_IO_HOST_TCP=0 FILE_IO_DIRECT_ONLY=1 sh tests/host/file-io-concurrency.sh` 检查
 映射和数据写回交接。`tests/userland/direct-file.py` 用实际 RV64 或 LA64 内核运行
 普通文件直读写、扩展、故障、映射和文件传输。
+
+`sh tests/host/lwext4-metadata.sh nojournal-direct` 对 1 KiB 和 4 KiB 文件系统块测试
+旧 EOF 尾部、设备错误及失败分配的回收。`tests/userland/direct-file.py --nojournal`
+使用预置文件，退出后通过 debugfs 核对文件的完整内容与大小。
 
 ## 通用边界
 
