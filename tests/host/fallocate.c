@@ -156,6 +156,30 @@ static void expect_bytes(struct kernel_vfs_file *file,const unsigned char *expec
         offset+=chunk;
     }
 }
+static void symlink_creation(struct kernel_vfs_mount *mount)
+{
+    struct lwext4_mount_adapter *adapter=lwext4_instance(mount->private_data);
+    struct kernel_vfs_path *root=NULL;
+    const char target[]="absent-target", *name="/creation-link";
+    assert(!kernel_vfs_path_root(mount,adapter->instance.heap,&root));
+    struct kernel_vfs_statfs before,after;
+    assert(!kernel_vfs_mount_statfs(mount,&before));
+    int result=kernel_vfs_symlink_at(root,root,target,name);
+    if (adapter->device.fs->jbd_journal) {
+        char buf[sizeof(target)]; size_t n=0;
+        assert(!result && !kernel_vfs_readlink_at(root,root,name,buf,sizeof(buf),&n));
+        assert(n==sizeof(target)-1 && !memcmp(buf,target,n));
+        assert(!kernel_vfs_unlink_at(root,root,name,0));
+    } else {
+        struct kernel_vfs_stat st;
+        assert(result==-KERNEL_EOPNOTSUPP);
+        /* Following a dangling symlink would also give ENOENT. */
+        assert(kernel_vfs_stat_at(root,root,name,0,&st)==-KERNEL_ENOENT);
+        assert(!kernel_vfs_mount_statfs(mount,&after));
+        assert(after.free_inodes==before.free_inodes && after.free_blocks==before.free_blocks);
+    }
+    assert(!kernel_vfs_path_release(&root));
+}
 static int create_file(struct kernel_vfs_mount *mount,const char *name,uint32_t mode,struct kernel_vfs_file *file)
 {
     struct lwext4_mount_adapter *adapter=lwext4_instance(mount->private_data);
@@ -1706,6 +1730,7 @@ int main(int argc,char **argv)
         .capacity_bytes=stat.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
     struct kernel_vfs_mount mount={0}; assert(!kernel_vfs_mount_ext4(&mount,&device,
         !strncmp(argv[2],"namespace-",10)?&heap:&backend_heap,&cache,0));
+    if (!strcmp(argv[2],"ext4-symlink-create")) {symlink_creation(&mount);goto mounted_done;}
     if (!strcmp(argv[2],"delalloc")) {delayed_allocation(&cache,&mount);goto mounted_done;}
     if (!strcmp(argv[2],"vfs-socket")) {vfs_socket_paths(&mount);goto mounted_done;}
     if (!strcmp(argv[2],"credential-race")) {credential_namespace_race(&mount);goto mounted_done;}
@@ -1741,6 +1766,7 @@ int main(int argc,char **argv)
             large,!strcmp(argv[2],"reserved-zero-error"));
         goto mounted_done;
     }
+    symlink_creation(&mount);
     basic_ranges(&cache,&mount); pending_truncate(&mount);
     if (lwext4_instance(mount.private_data)->device.fs->jbd_journal) rollback_ranges(&mount);
     else nonjournal_failure(&mount);
@@ -1751,6 +1777,7 @@ int main(int argc,char **argv)
 #endif
 mounted_done:
     assert(!kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(&cache) && !close(image_fd));
+    if (!strcmp(argv[2],"ext4-symlink-create")) goto audit;
     struct kernel_vfs_mount *memory=NULL; struct kernel_vfs_file unsupported={0};
     assert(!kernel_tmpfs_create(&heap,0,NULL,&memory));
 #ifdef CACHE_MM_CASES
@@ -1767,6 +1794,7 @@ mounted_done:
         KERNEL_VFS_FALLOC_PUNCH_HOLE,0,4096));
     assert(!kernel_vfs_file_block_device(&unsupported));
     assert(!kernel_vfs_close(&unsupported) && !kernel_vfs_unmount(memory));
+audit:
     assert(!physical_page_allocator_audit(&pages) && physical_page_available(&pages)==baseline);
     struct kernel_heap_statistics stats;
     if (!strncmp(argv[2],"namespace-",10)) {

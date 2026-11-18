@@ -12,6 +12,7 @@ remount/unmount 不得靠重试将不确定状态标 clean。最终 clean superb
 也不发布 clean 内存状态。此保护不提供多块 metadata 崩溃原子性；尤其无 barrier
 时，marker 写完成不是任意掉电顺序的证明。
 
+可写无 journal 挂载允许操作已有普通文件，但 VFS 新建 inode（包括目录、符号链接、特殊文件及 O_TMPFILE）返回 EOPNOTSUPP。
 测试及尚未开放的 create/O_TMPFILE 发布机制见[无日志创建安全预审](../nojournal-create-safety.md)。
 
 ## 普通文件直接 I/O

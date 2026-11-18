@@ -2168,6 +2168,8 @@ static int namespace_acl_encode(struct kernel_heap *heap,const void *acl,size_t 
 }
 static int namespace_create_execute(struct lwext4_mount_adapter *adapter,struct namespace_create *request)
 {
+    /* Creating an inode and publishing its final state needs journal rollback. */
+    if (!adapter->device.fs->jbd_journal) return ENOTSUP;
     struct kernel_vfs_node *parent=kernel_vfs_node_pin(&adapter->instance,request->parent);
     if (!parent) return EIO;
     uint32_t mode=request->mode|request->type;
@@ -2261,6 +2263,7 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
     if (adapter->instance.read_only) {
         return -KERNEL_EROFS;
     }
+    /* Reject before allocating an unopened file owner. */
     if (!adapter->device.fs->jbd_journal) return -KERNEL_EOPNOTSUPP;
     heap_status = kernel_heap_allocate_zeroed(adapter->instance.heap,
                                               1U,
@@ -2580,7 +2583,6 @@ static int ext4_backend_mkdir(struct kernel_vfs_mount *mount,
         return -KERNEL_EROFS;
     }
 
-    if (!adapter->device.fs->jbd_journal) return -KERNEL_EOPNOTSUPP;
     struct namespace_create request={.mount=adapter->mount_point,.parent=parent_inode,.path=path,.mode=mode&07777U,.type=KERNEL_VFS_S_IFDIR,.umask=umask};
     result=namespace_create_execute(adapter,&request);
     if (result != EOK) return lwext4_error(result);
@@ -3042,7 +3044,6 @@ static int ext4_backend_mknod(struct kernel_vfs_instance *instance,
 {
     if (!parent_inode || parent_inode > UINT32_MAX) return -KERNEL_EOVERFLOW;
     struct lwext4_mount_adapter *adapter = lwext4_instance(instance);
-    if (!adapter->device.fs->jbd_journal) return -KERNEL_EOPNOTSUPP;
     struct namespace_create request = {.mount=adapter->mount_point, .parent=parent_inode,
         .path=name, .type=type, .mode=mode & 07777U, .device=device,.umask=umask};
     return lwext4_error(namespace_create_execute(adapter,&request));
