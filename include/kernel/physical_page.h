@@ -31,6 +31,18 @@ struct physical_page_reclaim_hooks {
     void *context;
 };
 
+/* Optional native huge-pool custody transfer. retain_last runs only for a
+ * validated high-order head's final reference, under allocator->lock. It must
+ * not allocate, sleep, call allocator APIs or acquire another lock. Return one
+ * to take that existing reference (count remains one, block stays allocated),
+ * or zero to return an unmanaged block to buddy. No tail storage is touched.
+ * The owner keeps context alive until every managed block/pending preparation
+ * is removed and clear succeeds. Its ledger uses this same allocator lock. */
+struct physical_page_compound_recycler {
+    void *context;
+    int (*retain_last)(void *, uint64_t head, uint32_t order);
+};
+
 /* Byte capacities; references and mappings never multiply owned storage. */
 struct kernel_memory_statistics {
     uint64_t total, free, available, cached, shared, buffers;
@@ -53,6 +65,7 @@ struct physical_page_range {
 struct physical_page_allocator {
     struct kernel_raw_lock lock;
     struct physical_page_reclaim_hooks reclaim_hooks;
+    struct physical_page_compound_recycler compound_recycler;
     /* Optional anonymous-page reclaim, installed when MADV_FREE first has work. */
     uint64_t (*lazy_reclaim)(struct physical_page_allocator *, uint64_t, uint64_t *);
     uint64_t shared_anon_pages;
@@ -106,6 +119,13 @@ enum physical_page_status physical_page_allocator_set_reclaimer(
 
 enum physical_page_status physical_page_allocator_clear_reclaimer(
     struct physical_page_allocator *allocator);
+
+enum physical_page_status physical_page_allocator_set_compound_recycler(
+    struct physical_page_allocator *, const struct physical_page_compound_recycler *);
+/* Caller first removes all managed blocks under the shared allocator lock.
+ * A mismatched owner cannot clear another pool's recycler. */
+enum physical_page_status physical_page_allocator_clear_compound_recycler(
+    struct physical_page_allocator *, void *expected_context);
 
 enum physical_page_status physical_page_allocate(
     struct physical_page_allocator *allocator,

@@ -1,4 +1,5 @@
 #include "private.h"
+#include <arch/mmu.h>
 
 #include <kernel/errno.h>
 #include <kernel/bpf.h>
@@ -29,6 +30,8 @@
 #define LINUX_MAP_GROWSDOWN UINT64_C(0x100)
 #define LINUX_MAP_LOCKED UINT64_C(0x2000)
 #define LINUX_MAP_HUGETLB UINT64_C(0x40000)
+#define LINUX_MAP_HUGE_SHIFT 26U
+#define LINUX_MAP_HUGE_MASK UINT64_C(0x3f)
 #define LINUX_MAP_DENYWRITE UINT64_C(0x800)
 #define LINUX_MAP_POPULATE UINT64_C(0x8000)
 #define LINUX_MAP_NONBLOCK UINT64_C(0x10000)
@@ -104,7 +107,7 @@ enum kernel_syscall_status syscall_handle_mmap(
     struct kernel_open_file_description *file = 0;
     uint64_t protections = request->arguments[2];
     uint64_t flags = request->arguments[3];
-    uint64_t mapped_address;
+    uint64_t mapped_address, mapped_length=request->arguments[1];
     uint32_t mm_flags = 0U;
     int64_t linux_result;
     enum kernel_mm_status status;
@@ -129,15 +132,20 @@ enum kernel_syscall_status syscall_handle_mmap(
         (flags & ~LINUX_MAP_KNOWN_FLAGS)) {
         type_error = -KERNEL_EOPNOTSUPP;
     }
-    /* No huge-page hstate exists here. Linux rejects unknown huge sizes before
-     * do_mmap; accepting ordinary pages would silently change the contract. */
-    if (flags & LINUX_MAP_HUGETLB)
-        type_error = -KERNEL_EINVAL;
-    else if (!request->arguments[1])
-        type_error = -KERNEL_EINVAL;
+    if (flags & LINUX_MAP_HUGETLB) {
+        if (!(flags & LINUX_MAP_ANONYMOUS)) type_error=-KERNEL_EINVAL;
+        else {
+            unsigned shift=(flags>>LINUX_MAP_HUGE_SHIFT)&LINUX_MAP_HUGE_MASK;
+            if ((shift && shift!=BOAROS_PAGE_SHIFT+ARCH_MMU_HUGE_ORDER) ||
+                (request->arguments[5] & (ARCH_MMU_HUGE_SIZE-1)) ||
+                (flags & LINUX_MAP_GROWSDOWN)) type_error=-KERNEL_EINVAL;
+            mapped_length=(mapped_length+ARCH_MMU_HUGE_SIZE-1)&~(ARCH_MMU_HUGE_SIZE-1);
+            if (!mapped_length) type_error=-KERNEL_EINVAL;
+        }
+    } else if (!mapped_length) type_error=-KERNEL_EINVAL;
     else if (!type_error && (flags & LINUX_MAP_GROWSDOWN) &&
         (!(flags & LINUX_MAP_ANONYMOUS) || mapping_type != LINUX_MAP_PRIVATE))
-        type_error = -KERNEL_EINVAL;
+        type_error=-KERNEL_EINVAL;
     /* Legacy mmap ignores extension flags; SHARED_VALIDATE rejects them. */
     if (mapping_type == LINUX_MAP_SHARED_VALIDATE)
         flags = (flags & ~LINUX_MAP_TYPE_MASK) | LINUX_MAP_SHARED;
@@ -162,7 +170,14 @@ enum kernel_syscall_status syscall_handle_mmap(
         if ((protections & LINUX_PROT_READ) &&
             (caller->personality & KERNEL_PERSONALITY_READ_IMPLIES_EXEC))
             protections |= LINUX_PROT_EXEC;
-        status = kernel_mm_mmap_anonymous(
+        /* Linux uses HUGETLB_ANONHUGE_INODE here, not the SHM_HUGETLB
+         * creator that requires CAP_IPC_LOCK/hugetlb_shm_group membership. */
+        if (flags & LINUX_MAP_HUGETLB)
+            status=kernel_mm_mmap_hugetlb(mm,request->arguments[0],mapped_length,
+                mm_permissions_from_linux(protections),mm_flags,
+                (flags & LINUX_MAP_TYPE_MASK)==LINUX_MAP_SHARED,
+                !!(flags & LINUX_MAP_NORESERVE),&mapped_address);
+        else status = kernel_mm_mmap_anonymous(
             mm,
             request->arguments[0],
             request->arguments[1],
@@ -275,7 +290,7 @@ enum kernel_syscall_status syscall_handle_mmap(
      * leaves the mapping and any completed resident prefix intact. */
     if (!status && (flags & LINUX_MAP_POPULATE) && !(flags & LINUX_MAP_NONBLOCK))
         (void)kernel_mm_populate(mm,mapped_address,mapped_address+
-            ((request->arguments[1]+BOAROS_PAGE_MASK)&~BOAROS_PAGE_MASK),0);
+            ((mapped_length+BOAROS_PAGE_MASK)&~BOAROS_PAGE_MASK),0);
     decoded->value = status == KERNEL_MM_STATUS_OK
                          ? (int64_t)mapped_address
                          : mmap_error(status);

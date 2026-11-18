@@ -25,6 +25,7 @@ void scheduler_pi_priority_locked(struct kernel_task *t,unsigned base,unsigned i
 void kernel_heap_release(struct kernel_heap *h,void *p){(void)h;(void)p;abort();}
 int kernel_vfs_node_release(struct kernel_vfs_node **p){(void)p;abort();}
 void kernel_memory_object_release(struct kernel_memory_object **p){(void)p;abort();}
+void kernel_hugetlb_map_release(struct kernel_hugetlb_map **p){(void)p;abort();}
 void kernel_mm_unpin_user_page(struct kernel_mm_user_pin *p){(void)p;abort();}
 static void *depart(void *unused)
 {

@@ -30,6 +30,27 @@ LA 的 `LDDIR`/`LDPTE` 路径直接支持大叶；一个 32 MiB PMD 覆盖两个
 - LA 的 `tests/loongarch/mmu.c` 使用实际的 32 MiB PMD，检查两半、末尾地址、
   fork、写时复制、pin 和退役。
 
-这一层提供物理页分配、页表和用户 pin 的所有权。通过内核接口发布大叶时，
-pipe 对 vmsplice 窗口持有整块复合页引用，tee 和部分 splice 继续共享该所有权，
-完整 splice 移交引用。显式大页 mmap 的容量管理和 ABI 由大页池与 VMA 层提供。
+## 映射与容量
+
+匿名映射通过 `MAP_HUGETLB` 使用本架构的大页尺寸。SysV `SHM_HUGETLB`
+共用高阶物理页池，段、附加和映射各自持有后备对象。[SysV 共享内存](sysv-shm.md)。
+
+`/proc/sys/vm/nr_hugepages` 设置持续大页容量，初始为零。`/proc/meminfo` 报告
+总量、空闲、预留、临时超额和页大小。池扩张受可分配连续物理页限制，缩减时仍在
+使用的页归还后释放。预留对应实际可用于缺页的大页。
+
+共享映射复用后备槽，fork 的共享子映射使用同一个对象。私有映射的初始预留由
+创建者持有。无法取得私有写时复制所需的额外页时，预留持有者可以撤销未持有
+预留的子映射，在用户 pin 和 TLB 同步结束后原地升级。没有预留的映射缺页时若没有
+可用物理页，收到 SIGBUS。共享 futex 等待持有映射对象，直到等待退出。
+
+大页的地址和区间修改以原生页大小为边界。非固定地址选择避开向下增长区域的保护
+间隔。私有 `MADV_DONTNEED` 先取得恢复预留所需的容量，再让 PTE 退出。
+共享 `MADV_DONTNEED` 撤销当前地址空间内的叶，其他映射仍可访问后备，`mincore`
+可以观察共享槽的驻留。暂未提供 hugetlbfs、多种 hstate、透明大页或大页 mremap。
+
+`make test-hugetlb-host` 检查物理池、预留、并发挂接、futex、proc 接口及 SysV
+段生命周期。`tests/userland/hugetlb.py` 在 RV64 或 LA64 内核上检查匿名私有和
+共享映射、实际缺页、写时复制、映射边界、pipe 页引用、SysV 附加和 SIGBUS。
+
+[Linux 大页预留语义](https://docs.kernel.org/mm/hugetlbfs_reserv.html)。

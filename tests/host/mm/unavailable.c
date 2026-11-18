@@ -8,8 +8,10 @@ __attribute__((weak)) uint64_t kernel_task_current_stack_limit(void) { return UI
 __attribute__((weak)) void kernel_task_current_memory_limits(struct kernel_memory_limits *out)
 { *out = (struct kernel_memory_limits){UINT64_MAX, UINT64_MAX, UINT64_MAX}; }
 #define EXCLUDED(name) void name(void) { mm_test_unavailable(); }
+#ifndef MM_TEST_SYSV_SHM
 EXCLUDED(kernel_shm_attachment_close)
 EXCLUDED(kernel_shm_attachment_open)
+#endif
 EXCLUDED(kernel_elf64_source_release)
 EXCLUDED(kernel_elf64_source_acquire)
 EXCLUDED(kernel_elf64_source_page)
@@ -50,11 +52,13 @@ EXCLUDED(kernel_file_mapping_wait)
 EXCLUDED(kernel_file_mapping_stop)
 EXCLUDED(kernel_file_mapping_drain)
 EXCLUDED(kernel_tmpfs_check_domain)
+#ifndef MM_TEST_SYSV_SHM
 EXCLUDED(kernel_shm_attachment_acquire)
 EXCLUDED(kernel_shm_attachment_create)
 struct kernel_shm_attachment;
 void kernel_shm_attachment_release(struct kernel_shm_attachment **owner)
 { if (owner && *owner) mm_test_unavailable(); }
+#endif
 
 EXCLUDED(kernel_file_mapping_prepare)
 

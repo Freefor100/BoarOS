@@ -6,6 +6,11 @@
 
 #include <kernel/ipc.h>
 
+#define KERNEL_SHM_HUGETLB 04000
+#define KERNEL_SHM_NORESERVE 010000
+#define KERNEL_SHM_HUGE_SHIFT 26U
+#define KERNEL_SHM_HUGE_MASK 63U
+
 #define KERNEL_SHM_RDONLY 010000
 #define KERNEL_SHM_RND    020000
 #define KERNEL_SHM_REMAP  040000
@@ -67,6 +72,7 @@ _Static_assert(sizeof(struct kernel_shm_info) == 48 &&
 struct kernel_namespace;
 struct kernel_shm_table;
 struct kernel_memory_object;
+struct kernel_hugetlb_map;
 struct kernel_uid_account;
 
 struct kernel_shm_segment {
@@ -78,6 +84,7 @@ struct kernel_shm_segment {
     uint64_t size;
     uint64_t aligned_size;
     struct kernel_memory_object *memory;
+    struct kernel_hugetlb_map *hugetlb;
     struct kernel_uid_account *lock_account;
     uint64_t nattch;
     uint32_t attachments;
@@ -102,6 +109,7 @@ struct kernel_shm_attachment {
     struct kernel_namespace *namespace;
     struct kernel_shm_segment *segment;
     struct kernel_memory_object *memory;
+    struct kernel_hugetlb_map *hugetlb;
     uint64_t start, end;
     uint64_t file_identity;
     int32_t shmid;

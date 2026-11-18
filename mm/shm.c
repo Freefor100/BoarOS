@@ -1,4 +1,6 @@
 #include <kernel/credentials.h>
+#include <kernel/hugetlb.h>
+#include <kernel/mm_backend.h>
 #include <kernel/shm.h>
 #include <kernel/ipc_namespace.h>
 #include <kernel/heap.h>
@@ -23,6 +25,7 @@ struct kernel_shm_table {
     struct kernel_heap *heap;
     struct physical_page_allocator *allocator;
     struct kernel_namespace *namespace;
+    uint64_t total_pages;
     int initialized;
 };
 
@@ -64,6 +67,12 @@ static void shm_descriptor(const struct kernel_shm_segment *seg, struct kernel_s
     };
 }
 
+static uint64_t shm_resident_pages(const struct kernel_shm_segment *seg)
+{
+    return seg->hugetlb ? kernel_hugetlb_map_resident_pages(seg->hugetlb) :
+        kernel_memory_object_resident_pages(seg->memory);
+}
+
 int kernel_shm_proc_next(struct kernel_namespace *ns, uint32_t *cursor, int32_t *id,
                          struct kernel_shmid64_ds *row, uint64_t *rss)
 {
@@ -75,7 +84,7 @@ int kernel_shm_proc_next(struct kernel_namespace *ns, uint32_t *cursor, int32_t 
         if (!seg->active) continue;
         *id = seg->shmid;
         shm_descriptor(seg, row);
-        *rss = kernel_memory_object_resident_pages(seg->memory) * BOAROS_PAGE_SIZE;
+        *rss = shm_resident_pages(seg) * BOAROS_PAGE_SIZE;
         arch_interrupt_restore(irq);
         return 1;
     }
@@ -125,7 +134,9 @@ static void kernel_shm_destroy_segment_locked(struct kernel_shm_segment *seg)
     if (!seg->active) {
         return;
     }
+    seg->table->total_pages -= (seg->size + BOAROS_PAGE_MASK) >> BOAROS_PAGE_SHIFT;
     shm_unlock(seg);
+    if (seg->hugetlb) kernel_hugetlb_map_release(&seg->hugetlb);
     if (seg->memory != 0) {
         kernel_memory_object_release(&seg->memory);
         seg->memory = 0;
@@ -211,6 +222,25 @@ int kernel_shm_get(struct kernel_task *caller, int32_t key, uint64_t size,
     }
     uint64_t aligned_size = (size + BOAROS_PAGE_SIZE - 1U) & ~BOAROS_PAGE_MASK;
 
+    uint64_t charged_pages = aligned_size >> BOAROS_PAGE_SHIFT;
+    if (charged_pages > KERNEL_SHMALL - table->total_pages) {
+        arch_interrupt_restore(irq);
+        return -KERNEL_ENOSPC;
+    }
+    if (shmflg & KERNEL_SHM_HUGETLB) {
+        unsigned shift = ((uint32_t)shmflg >> KERNEL_SHM_HUGE_SHIFT) & KERNEL_SHM_HUGE_MASK;
+        if (shift && shift != BOAROS_PAGE_SHIFT + ARCH_MMU_HUGE_ORDER) {
+            arch_interrupt_restore(irq);return -KERNEL_EINVAL;
+        }
+        const struct kernel_credentials *cred = kernel_credentials_current();
+        /* Initial hugetlb_shm_group is root; no mutable sysctl yet. */
+        if (!kernel_credentials_capable(cred, KERNEL_CAP_IPC_LOCK) &&
+            !kernel_credentials_in_group(cred, 0)) {
+            arch_interrupt_restore(irq);return -KERNEL_EPERM;
+        }
+        aligned_size = (size + ARCH_MMU_HUGE_SIZE - 1) & ~(ARCH_MMU_HUGE_SIZE - 1);
+    }
+
     /* Allocate new slot */
     int slot_idx = -1;
     for (uint32_t i = 0U; i < KERNEL_SHMMNI; i++) {
@@ -226,14 +256,27 @@ int kernel_shm_get(struct kernel_task *caller, int32_t key, uint64_t size,
 
     struct kernel_shm_segment *new_seg = &table->segments[slot_idx];
     struct kernel_memory_object *mem = 0;
-    enum kernel_memory_object_status mem_status =
-        kernel_memory_object_create(table->heap, table->allocator, &mem);
-    if (mem_status != KERNEL_MEMORY_OBJECT_OK) {
-        arch_interrupt_restore(irq);
-        return mem_status == KERNEL_MEMORY_OBJECT_NO_MEMORY ? -KERNEL_ENOMEM
-                                                            : -KERNEL_ENOSPC;
+    struct kernel_hugetlb_map *hugetlb = 0;
+    if (shmflg & KERNEL_SHM_HUGETLB) {
+        struct kernel_hstate *h = 0;
+        enum kernel_hugetlb_status status = kernel_hstate_get_or_create(table->heap,
+            table->allocator, ARCH_MMU_HUGE_ORDER, &h);
+        if (!status) status = kernel_hugetlb_map_create(h,
+            aligned_size / ARCH_MMU_HUGE_SIZE, KERNEL_HUGETLB_SHARED,
+            !!(shmflg & KERNEL_SHM_NORESERVE), &hugetlb);
+        if (h) kernel_hstate_put(h);
+        if (status) {
+            arch_interrupt_restore(irq);return -KERNEL_ENOMEM;
+        }
+    } else {
+        enum kernel_memory_object_status status =
+            kernel_memory_object_create(table->heap, table->allocator, &mem);
+        if (status != KERNEL_MEMORY_OBJECT_OK) {
+            arch_interrupt_restore(irq);
+            return status == KERNEL_MEMORY_OBJECT_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_ENOSPC;
+        }
+        kernel_memory_object_set_mapping_size(mem, aligned_size);
     }
-    kernel_memory_object_set_mapping_size(mem, aligned_size);
 
     int32_t shmid = slot_idx + (int32_t)new_seg->seq * (int32_t)KERNEL_SHMMNI;
     new_seg->shmid = shmid;
@@ -241,6 +284,8 @@ int kernel_shm_get(struct kernel_task *caller, int32_t key, uint64_t size,
     new_seg->size = size;
     new_seg->aligned_size = aligned_size;
     new_seg->memory = mem;
+    new_seg->hugetlb = hugetlb;
+    table->total_pages += charged_pages;
     new_seg->lock_account = 0;
     new_seg->nattch = 0;
     new_seg->attachments = 0;
@@ -361,6 +406,7 @@ static void attachment_valid(const struct kernel_shm_attachment *attachment)
         !attachment->segment || !attachment->segment->active ||
         attachment->segment->shmid != attachment->shmid ||
         attachment->segment->memory != attachment->memory ||
+        attachment->segment->hugetlb != attachment->hugetlb ||
         !attachment->segment->attachments) __builtin_trap();
 }
 
@@ -371,7 +417,7 @@ enum kernel_shm_status kernel_shm_attachment_create(
 {
     struct kernel_shm_attachment *attachment = 0;
     uintptr_t irq = arch_interrupt_save();
-    if (!owner || *owner || !segment || !segment->active || !segment->memory ||
+    if (!owner || *owner || !segment || !segment->active || (!segment->memory && !segment->hugetlb) ||
         start >= end || segment->attachments == UINT32_MAX ||
         (source && (source->segment != segment || !source->file_identity)) ||
         (!source && !next_shm_file_identity)) __builtin_trap();
@@ -382,10 +428,11 @@ enum kernel_shm_status kernel_shm_attachment_create(
         if (status != KERNEL_HEAP_STATUS_EMPTY) __builtin_trap();
         return KERNEL_SHM_STATUS_NO_MEMORY;
     }
-    if (kernel_memory_object_acquire(segment->memory) != KERNEL_MEMORY_OBJECT_OK)
+    if (segment->hugetlb) kernel_hugetlb_map_acquire(segment->hugetlb);
+    if (segment->memory && kernel_memory_object_acquire(segment->memory) != KERNEL_MEMORY_OBJECT_OK)
         __builtin_trap();
     *attachment = (struct kernel_shm_attachment){
-        .heap = segment->table->heap, .namespace=kernel_namespace_get(segment->namespace), .segment = segment, .memory = segment->memory,
+        .heap = segment->table->heap, .namespace=kernel_namespace_get(segment->namespace), .segment = segment, .memory = segment->memory, .hugetlb = segment->hugetlb,
         .start = start, .end = end, .shmid = segment->shmid, .references = 1,
         .file_identity = source ? source->file_identity : next_shm_file_identity++,
     };
@@ -416,7 +463,8 @@ void kernel_shm_attachment_release(struct kernel_shm_attachment **owner)
     if (--attachment->references == 0) {
         namespace=attachment->namespace;
         struct kernel_shm_segment *segment = attachment->segment;
-        kernel_memory_object_release(&attachment->memory);
+        if (attachment->memory) kernel_memory_object_release(&attachment->memory);
+        if (attachment->hugetlb) kernel_hugetlb_map_release(&attachment->hugetlb);
         segment->attachments--;
         kernel_heap_release(attachment->heap, attachment);
         if (!segment->nattch && !segment->attachments && segment->marked_for_deletion)
@@ -497,8 +545,8 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
                 result = i;
                 if (pure_cmd == KERNEL_SHM_INFO) {
                     snapshot.usage.used_ids++;
-                    snapshot.usage.shm_tot += seg->aligned_size >> BOAROS_PAGE_SHIFT;
-                    snapshot.usage.shm_rss += kernel_memory_object_resident_pages(seg->memory);
+                    snapshot.usage.shm_tot += (seg->size + BOAROS_PAGE_MASK) >> BOAROS_PAGE_SHIFT;
+                    snapshot.usage.shm_rss += shm_resident_pages(seg);
                 }
             }
             if (pure_cmd == KERNEL_IPC_INFO) {
@@ -555,6 +603,13 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
         if(!kernel_credentials_capable(cred,KERNEL_CAP_IPC_LOCK) &&
             (cred->euid!=seg->uid && cred->euid!=seg->cuid)) {
             arch_interrupt_restore(irq);return -KERNEL_EPERM;
+        }
+        if (pure_cmd == KERNEL_SHM_LOCK && !kernel_task_current_memlock_limit()) {
+            arch_interrupt_restore(irq);return -KERNEL_EPERM;
+        }
+        /* Huge pages cannot swap; Linux does not set SHM_LOCKED or charge UID. */
+        if (seg->hugetlb) {
+            *out_result=0;arch_interrupt_restore(irq);return 0;
         }
         if(pure_cmd==KERNEL_SHM_LOCK) {
             uint64_t limit=kernel_task_current_memlock_limit();

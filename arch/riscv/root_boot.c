@@ -12,6 +12,7 @@
 #include <kernel/files.h>
 #include <kernel/fs_context.h>
 #include <kernel/mm.h>
+#include <kernel/hugetlb.h>
 #include <kernel/mm_backend.h>
 #include <arch/riscv/smp.h>
 #include <kernel/open_file.h>
@@ -672,6 +673,13 @@ enum riscv_root_boot_status riscv_root_boot_finish(
     if (cpu->borrowed_mm_allocator && kernel_mm_activate(NULL,cpu->borrowed_mm_kernel_context))
         __builtin_trap();
 #endif
+    error=(int)kernel_hstate_shutdown(root->heap.page_allocator);
+    if (error) {
+        root->finish_failure=RISCV_ROOT_FINISH_HEAP_BASELINE;root->finish_error=error;
+        kernel_heap_get_statistics(&root->heap,heap_statistics);
+        *available_pages=physical_page_available(root->heap.page_allocator);
+        return RISCV_ROOT_BOOT_STATUS_CLEANUP;
+    }
     kernel_heap_get_statistics(&root->heap, heap_statistics);
     *available_pages = physical_page_available(root->heap.page_allocator);
     if (heap_statistics->live_allocations != 0U ||

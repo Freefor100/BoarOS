@@ -1,5 +1,7 @@
 #include "vfs_objects.h"
 #include <kernel/credentials.h>
+#include <kernel/hugetlb.h>
+#include <arch/mmu.h>
 #include <kernel/bpf.h>
 
 #include <arch/context.h>
@@ -56,6 +58,8 @@
 #define PROC_HOSTNAME_INODE UINT64_C(23)
 #define PROC_DOMAINNAME_INODE UINT64_C(24)
 #define PROC_RR_TIMESLICE_INODE UINT64_C(25)
+#define PROC_VM_INODE UINT64_C(26)
+#define PROC_NR_HUGEPAGES_INODE UINT64_C(27)
 #define PROC_TASK_DIR_KIND 10U
 #define PROC_TID_DIR_KIND 11U
 #define PROC_TID_STAT_KIND 12U
@@ -282,9 +286,15 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
         return 0;
     }
     if (parent == PROC_SYS_INODE) {
-        if (length != 6U || memcmp(name, "kernel", 6U)) return -KERNEL_ENOENT;
-        *inode = PROC_KERNEL_INODE;
+        if (length==6U && !memcmp(name,"kernel",6U)) *inode=PROC_KERNEL_INODE;
+        else if (length==2U && !memcmp(name,"vm",2U)) *inode=PROC_VM_INODE;
+        else return -KERNEL_ENOENT;
         *mode = KERNEL_VFS_S_IFDIR | 0555U;
+        return 0;
+    }
+    if (parent==PROC_VM_INODE) {
+        if (length!=12U || memcmp(name,"nr_hugepages",12U)) return -KERNEL_ENOENT;
+        *inode=PROC_NR_HUGEPAGES_INODE; *mode=KERNEL_VFS_S_IFREG|0644U;
         return 0;
     }
     if (parent == PROC_KERNEL_INODE) {
@@ -495,7 +505,8 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
     if ((inode != PROC_ROOT_INODE && inode != PROC_MEMINFO_INODE &&
          inode != PROC_UPTIME_INODE && inode != PROC_SELF_INODE && inode != PROC_THREAD_SELF_INODE &&
          inode != PROC_MOUNTS_INODE && inode != PROC_SYS_INODE &&
-         inode != PROC_KERNEL_INODE && inode != PROC_RT_PERIOD_INODE &&
+         inode != PROC_KERNEL_INODE && inode != PROC_VM_INODE &&
+         inode != PROC_NR_HUGEPAGES_INODE && inode != PROC_RT_PERIOD_INODE &&
          inode != PROC_RT_RUNTIME_INODE && inode != PROC_RR_TIMESLICE_INODE && inode != PROC_PID_MAX_INODE &&
          inode != PROC_UNPRIVILEGED_BPF_INODE &&
          inode != PROC_HOSTNAME_INODE && inode != PROC_DOMAINNAME_INODE &&
@@ -527,7 +538,8 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
           proc_inode_kind(inode) != PROC_PID_NS_DIR_KIND &&
           !proc_namespace_type(proc_inode_kind(inode)) &&
           !(inode >= (UINT64_C(1)<<30U) && proc_inode_kind(inode)==PROC_PID_FDINFO_KIND))) ||
-        ((inode == PROC_ROOT_INODE || inode == PROC_SYSVIPC_INODE || inode == PROC_NET_INODE) &&
+        ((inode == PROC_ROOT_INODE || inode == PROC_SYSVIPC_INODE || inode == PROC_NET_INODE ||
+          inode == PROC_SYS_INODE || inode == PROC_KERNEL_INODE || inode == PROC_VM_INODE) &&
          (mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) ||
         ((inode == PROC_SELF_INODE || inode == PROC_THREAD_SELF_INODE || inode == PROC_MOUNTS_INODE) &&
          (mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFLNK) ||
@@ -535,7 +547,7 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
          (mode & KERNEL_VFS_S_IFMT) !=
             (proc_kind_mode(proc_inode_kind(inode)) & KERNEL_VFS_S_IFMT)) ||
         ((inode == PROC_MEMINFO_INODE || inode == PROC_UPTIME_INODE ||
-          inode == PROC_PID_MAX_INODE || inode == PROC_SYSVIPC_SHM_INODE ||
+          inode == PROC_PID_MAX_INODE || inode == PROC_NR_HUGEPAGES_INODE || inode == PROC_SYSVIPC_SHM_INODE ||
           inode == PROC_SYSVIPC_SEM_INODE || inode == PROC_SYSVIPC_MSG_INODE ||
           inode == PROC_NET_ROUTE_INODE || inode == PROC_HOSTNAME_INODE ||
           inode == PROC_DOMAINNAME_INODE) &&
@@ -559,7 +571,7 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
         return status == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
     node->generated_control = (inode == PROC_RT_PERIOD_INODE ||
                               inode == PROC_RT_RUNTIME_INODE || inode == PROC_RR_TIMESLICE_INODE ||
-                              inode==PROC_UNPRIVILEGED_BPF_INODE ||
+                              inode==PROC_UNPRIVILEGED_BPF_INODE || inode==PROC_NR_HUGEPAGES_INODE ||
                               inode == PROC_HOSTNAME_INODE || inode == PROC_DOMAINNAME_INODE)
         ? KERNEL_VFS_CONTROL_READ | KERNEL_VFS_CONTROL_WRITE : 0;
     if (proc_inode_kind(inode) == PROC_PID_COMM_KIND || proc_inode_kind(inode) == PROC_TID_COMM_KIND) {
@@ -590,7 +602,8 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
 
 static int proc_permission(struct kernel_vfs_node *node,const struct kernel_credentials *cred,unsigned mask)
 {
-    if (node->inode == PROC_HOSTNAME_INODE || node->inode == PROC_DOMAINNAME_INODE) {
+    if (node->inode == PROC_HOSTNAME_INODE || node->inode == PROC_DOMAINNAME_INODE ||
+        node->inode == PROC_NR_HUGEPAGES_INODE) {
         /* sysctl table permissions use effective UID and grant no DAC bypass. */
         unsigned granted = cred->euid == 0 ? 6U : 4U;
         return mask & ~granted & 7U ? -KERNEL_EACCES : 0;
@@ -699,10 +712,24 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
         *type = position < 2U ? 4U : 8U;
         return 1;
     }
-    if (directory == PROC_SYS_INODE || directory == PROC_KERNEL_INODE) {
-        if (position > (directory == PROC_SYS_INODE ? 2U : 8U)) return 0;
-        const char *entry = position == 0 ? "." : position == 1 ? ".." :
-            directory == PROC_SYS_INODE ? "kernel" : position == 2 ?
+    if (directory==PROC_VM_INODE || directory==PROC_SYS_INODE) {
+        unsigned last=directory==PROC_VM_INODE?2U:3U;
+        if (position>last) return 0;
+        const char *entry=position==0?".":position==1?"..":
+            directory==PROC_VM_INODE?"nr_hugepages":position==2?"kernel":"vm";
+        size_t length=strlen(entry)+1;
+        if (name_size<length) return -KERNEL_ERANGE;
+        memcpy(name,entry,length); *next_position=position+1;
+        *inode=position==0?directory:position==1?
+            (directory==PROC_VM_INODE?PROC_SYS_INODE:PROC_ROOT_INODE):
+            directory==PROC_VM_INODE?PROC_NR_HUGEPAGES_INODE:
+            position==2?PROC_KERNEL_INODE:PROC_VM_INODE;
+        *type=directory==PROC_VM_INODE && position==2?8U:4U;
+        return 1;
+    }
+    if (directory == PROC_KERNEL_INODE) {
+        if (position > 8U) return 0;
+        const char *entry = position == 0 ? "." : position == 1 ? ".." : position == 2 ?
             "sched_rt_period_us" : position == 3 ? "sched_rt_runtime_us" :
             position == 4 ? "pid_max" : position == 5 ? "unprivileged_bpf_disabled" :
             position == 6 ? "hostname" : position == 7 ? "domainname" : "sched_rr_timeslice_ms";
@@ -710,13 +737,11 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
         if (name_size < length) return -KERNEL_ERANGE;
         memcpy(name, entry, length);
         *next_position = position + 1U;
-        *inode = position == 0 ? directory : position == 1 ?
-            (directory == PROC_SYS_INODE ? PROC_ROOT_INODE : PROC_SYS_INODE) :
-            directory == PROC_SYS_INODE ? PROC_KERNEL_INODE : position == 2 ?
+        *inode = position == 0 ? directory : position == 1 ? PROC_SYS_INODE : position == 2 ?
             PROC_RT_PERIOD_INODE : position == 3 ? PROC_RT_RUNTIME_INODE :
             position == 4 ? PROC_PID_MAX_INODE : position == 5 ? PROC_UNPRIVILEGED_BPF_INODE :
             position == 6 ? PROC_HOSTNAME_INODE : position == 7 ? PROC_DOMAINNAME_INODE : PROC_RR_TIMESLICE_INODE;
-        *type = position < 2 || directory == PROC_SYS_INODE ? 4U : 8U;
+        *type = position < 2 ? 4U : 8U;
         return 1;
     }
     if (directory != PROC_ROOT_INODE &&
@@ -1173,6 +1198,19 @@ static unsigned proc_digit(unsigned char c)
            c >= 'A' && c <= 'F' ? c - 'A' + 10U : 16U;
 }
 
+static int proc_huge_snapshot(struct physical_page_allocator *allocator,
+    struct kernel_hstate_snapshot *snapshot)
+{
+    *snapshot=(struct kernel_hstate_snapshot){.order=ARCH_MMU_HUGE_ORDER};
+    struct kernel_hstate *state=NULL;
+    enum kernel_hugetlb_status status=kernel_hstate_get(allocator,&state);
+    if (status==KERNEL_HUGETLB_NOT_FOUND) return 0;
+    if (status) return -KERNEL_EIO;
+    kernel_hstate_snapshot(state,snapshot);
+    kernel_hstate_put(state);
+    return 0;
+}
+
 static int proc_control(struct kernel_vfs_node *node, int write,
     uint64_t *offset, char *buffer, size_t size, size_t *count)
 {
@@ -1223,7 +1261,12 @@ static int proc_control(struct kernel_vfs_node *node, int write,
     if (!write) {
         if (*offset) return 0;
         int64_t value;
-        if (node->inode == PROC_RR_TIMESLICE_INODE)
+        if (node->inode==PROC_NR_HUGEPAGES_INODE) {
+            struct kernel_hstate_snapshot snapshot;
+            int error=proc_huge_snapshot(node->instance->heap->page_allocator,&snapshot);
+            if (error) return error;
+            value=(int64_t)snapshot.persistent;
+        } else if (node->inode == PROC_RR_TIMESLICE_INODE)
             value = (int64_t)(kernel_sched_rr_slice_ns() / UINT64_C(1000000));
         else if (node->inode == PROC_UNPRIVILEGED_BPF_INODE)
             value = kernel_bpf_unprivileged_get();
@@ -1272,9 +1315,22 @@ static int proc_control(struct kernel_vfs_node *node, int write,
     }
     if (position < limit && buffer[position] != ' ' &&
         buffer[position] != '\t' && buffer[position] != '\n') return -KERNEL_EINVAL;
-    if (value > (negative ? UINT64_C(2147483648) : INT32_MAX)) return -KERNEL_EINVAL;
+    if (node->inode!=PROC_NR_HUGEPAGES_INODE &&
+        value > (negative ? UINT64_C(2147483648) : INT32_MAX)) return -KERNEL_EINVAL;
     int result;
-    if(node->inode==PROC_UNPRIVILEGED_BPF_INODE)
+    if (node->inode==PROC_NR_HUGEPAGES_INODE) {
+        if (negative) return -KERNEL_EINVAL;
+        struct kernel_hstate *state=NULL;
+        struct kernel_heap *heap=node->instance->heap;
+        enum kernel_hugetlb_status status=kernel_hstate_get_or_create(heap,heap->page_allocator,
+            ARCH_MMU_HUGE_ORDER,&state);
+        if (status) return status==KERNEL_HUGETLB_NO_MEMORY?-KERNEL_ENOMEM:-KERNEL_EIO;
+        status=kernel_hstate_resize(state,value);
+        kernel_hstate_put(state);
+        /* Linux reports the attainable pool via the next read, not a false
+         * allocation guarantee when physical fragmentation limits growth. */
+        result=status==KERNEL_HUGETLB_OK || status==KERNEL_HUGETLB_NO_MEMORY?0:-KERNEL_EINVAL;
+    } else if(node->inode==PROC_UNPRIVILEGED_BPF_INODE)
         result=negative || value>2?-KERNEL_EINVAL:kernel_bpf_unprivileged_set((unsigned)value);
     else if (node->inode == PROC_RR_TIMESLICE_INODE)
         result = kernel_sched_rr_slice_set_ms(negative ? -(int64_t)value : (int64_t)value);
@@ -2037,7 +2093,7 @@ static int proc_snapshot(struct kernel_vfs_node *node, struct kernel_heap *heap,
         node->inode != PROC_UPTIME_INODE &&
         node->inode != PROC_PID_MAX_INODE) return -KERNEL_EINVAL;
     char *data = 0;
-    enum kernel_heap_status status = kernel_heap_allocate(heap, 512U,
+    enum kernel_heap_status status = kernel_heap_allocate(heap, 1024U,
                                                            (void **)&data);
     if (status != KERNEL_HEAP_STATUS_OK)
         return status == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
@@ -2056,6 +2112,16 @@ static int proc_snapshot(struct kernel_vfs_node *node, struct kernel_heap *heap,
             memory.writeback, 0, 0, 0};
         for (unsigned i = 0; i < sizeof(bytes) / sizeof(bytes[0]); i++)
             used += append_kib(data + used, names[i], bytes[i]);
+        struct kernel_hstate_snapshot huge;
+        int error=proc_huge_snapshot(heap->page_allocator,&huge);
+        if (error) { kernel_heap_release(heap,data); return error; }
+        const char *huge_names[]={"HugePages_Total: ","HugePages_Free:  ","HugePages_Rsvd:  ","HugePages_Surp:  "};
+        const uint64_t counts[]={huge.total,huge.free,huge.reserved,huge.surplus};
+        for (unsigned i=0;i<4;i++) {
+            size_t n=strlen(huge_names[i]); memcpy(data+used,huge_names[i],n); used+=n;
+            used+=decimal(data+used,counts[i]); data[used++]='\n';
+        }
+        used+=append_kib(data+used,"Hugepagesize:    ",ARCH_MMU_HUGE_SIZE);
     } else if (node->inode == PROC_PID_MAX_INODE) {
         used = decimal(data, kernel_proc_pid_max());
         data[used++] = '\n';

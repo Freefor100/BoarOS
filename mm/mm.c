@@ -1,6 +1,7 @@
 #include <kernel/vdso.h>
 #include <kernel/bpf.h>
 #include <kernel/mm_backend.h>
+#include <kernel/hugetlb.h>
 #include <kernel/rlimit.h>
 #include <kernel/cpu.h>
 #include <kernel/elf64_source.h>
@@ -65,6 +66,13 @@ struct kernel_mm_file_source {
     int draining;
 };
 
+struct mm_huge_map {
+    struct mm_huge_map *next;
+    struct kernel_hugetlb_map *map;
+    struct kernel_mm mm; /* registration-borrowed view; not a cyclic MM owner */
+    uint64_t pages, fork_epoch;
+    struct kernel_hugetlb_mapping registration;
+};
 struct kernel_mm_shared_anon {
     struct kernel_mm_shared_anon *next;
     struct kernel_memory_object *object;
@@ -156,6 +164,7 @@ struct kernel_mm_record {
     struct kernel_heap *vma_heap;
     struct kernel_mm_file_source *file_sources;
     _Atomic(struct kernel_mm_file_source *) retired_file_sources;
+    struct mm_huge_map *huge_maps, *retired_huge_maps;
     struct kernel_mm_shared_anon *shared_anon;
     struct kernel_mm_shared_anon *retired_shared_anon;
     struct mm_file_mapping *file_mappings;
@@ -1324,9 +1333,83 @@ static enum kernel_mm_status clone_file_sources(
     return KERNEL_MM_STATUS_OK;
 }
 
+static void prepare_huge_registration(struct mm_huge_map *);
+static int huge_vma(const struct kernel_vma *v)
+{ return v->kind==KERNEL_VMA_KIND_HUGETLB_PRIVATE || v->kind==KERNEL_VMA_KIND_HUGETLB_SHARED; }
+static enum kernel_mm_status huge_status(enum kernel_hugetlb_status status)
+{
+    switch(status) {
+    case KERNEL_HUGETLB_OK: return KERNEL_MM_STATUS_OK;
+    case KERNEL_HUGETLB_NO_MEMORY: return KERNEL_MM_STATUS_NO_MEMORY;
+    case KERNEL_HUGETLB_BUS: return KERNEL_MM_STATUS_BUS_FAULT;
+    case KERNEL_HUGETLB_BUSY: return KERNEL_MM_STATUS_CONFLICT;
+    default: return KERNEL_MM_STATUS_STATE;
+    }
+}
+static void drain_huge_maps(struct kernel_mm_record *record,int unused_only)
+{
+    struct mm_huge_map **link=&record->huge_maps;
+    while (*link) {
+        struct mm_huge_map *entry=*link;
+        uint64_t cursor=0; int used=0;
+        if (unused_only && record->vmas) {
+            for (uint32_t i=0;i<kernel_vma_set_count(record->vmas);i++) {
+                struct kernel_vma v;
+                if (kernel_vma_set_get_at(record->vmas,i,&v)) __builtin_trap();
+                if (v.backing!=entry->map) continue;
+                used=1;
+                if (v.kind == KERNEL_VMA_KIND_HUGETLB_SHARED) break;
+                uint64_t first=v.backing_offset/ARCH_MMU_HUGE_SIZE;
+                uint64_t end=first+(v.end-v.start)/ARCH_MMU_HUGE_SIZE;
+                if (first<cursor || end>entry->pages) __builtin_trap();
+                if (kernel_hugetlb_map_unmap(entry->map,cursor,first)) __builtin_trap();
+                cursor=end;
+            }
+        }
+        if (kernel_hugetlb_map_unmap(entry->map,cursor,entry->pages)) __builtin_trap();
+        if (used) { link=&entry->next; continue; }
+        *link=entry->next;
+        kernel_hugetlb_mapping_stop(&entry->registration);
+        if (record->stage==KERNEL_MM_RECORD_LIVE && kernel_lock_held(&record->operations,1)) {
+            entry->next=record->retired_huge_maps;record->retired_huge_maps=entry;
+        } else {
+            kernel_hugetlb_mapping_drain(&entry->registration);
+            kernel_hugetlb_map_release(&entry->map);
+            kernel_heap_release(record->vma_heap,entry);
+        }
+    }
+}
+static enum kernel_mm_status clone_huge_maps(const struct kernel_mm_record *source,
+    struct kernel_mm_record *child,uint64_t record_address)
+{
+    for (struct mm_huge_map *entry=source->huge_maps;entry;entry=entry->next) {
+        int used;
+        if (kernel_vma_set_backing_in_use(child->vmas,entry->map,&used)) __builtin_trap();
+        if (!used) continue;
+        struct mm_huge_map *copy;
+        if (kernel_heap_allocate_zeroed(child->vma_heap,1,sizeof(*copy),(void **)&copy))
+            return KERNEL_MM_STATUS_NO_MEMORY;
+        enum kernel_hugetlb_status hs=kernel_hugetlb_map_fork(entry->map,&copy->map);
+        if (hs) { kernel_heap_release(child->vma_heap,copy); return huge_status(hs); }
+        copy->pages=entry->pages;
+        copy->mm=(struct kernel_mm){.allocator=source->space.allocator,.record=child,
+            .record_page_address=record_address,.state=KERNEL_MM_LIVE};
+        if (copy->map!=entry->map && kernel_vma_set_rebind_backing(child->vmas,entry->map,copy->map))
+            __builtin_trap();
+        prepare_huge_registration(copy);
+        if (kernel_hugetlb_map_epoch(entry->map,&copy->fork_epoch)) {
+            kernel_hugetlb_map_release(&copy->map);kernel_heap_release(child->vma_heap,copy);
+            return KERNEL_MM_STATUS_CONFLICT;
+        }
+        copy->next=child->huge_maps;child->huge_maps=copy;
+    }
+    return KERNEL_MM_STATUS_OK;
+}
+
 static void drain_shared_anon(struct kernel_mm_record *record,
                               int unused_only)
 {
+    drain_huge_maps(record,unused_only);
     struct kernel_mm_shared_anon **link = &record->shared_anon;
 
     while (*link != 0) {
@@ -1419,7 +1502,7 @@ static int fork_leaf_action(void *context, uint64_t virtual_address)
     if (status == KERNEL_VMA_STATUS_NOT_FOUND) return 0;
     if (status != KERNEL_VMA_STATUS_OK) __builtin_trap();
     if (vma.flags & (KERNEL_VMA_DONTFORK | KERNEL_VMA_WIPEONFORK)) return ARCH_MMU_FORK_SKIP;
-    return vma.role == KERNEL_VMA_ROLE_VVAR || vma.kind == KERNEL_VMA_KIND_ANON_SHARED ||
+    return vma.kind==KERNEL_VMA_KIND_HUGETLB_SHARED || vma.role == KERNEL_VMA_ROLE_VVAR || vma.kind == KERNEL_VMA_KIND_ANON_SHARED ||
            vma.kind == KERNEL_VMA_KIND_FILE_SHARED ||
            vma.kind == KERNEL_VMA_KIND_SYSV_SHM ||
            vma.kind == KERNEL_VMA_KIND_OBJECT_SHARED ? ARCH_MMU_FORK_SHARED : ARCH_MMU_FORK_PRIVATE;
@@ -1575,7 +1658,8 @@ static enum kernel_mm_status mm_fork_impl(
                        : status;
         }
     }
-    status = clone_shared_anon(source_record, destination_record);
+    status = clone_huge_maps(source_record,destination_record,record_page_address);
+    if (status==KERNEL_MM_STATUS_OK) status = clone_shared_anon(source_record, destination_record);
     if (status == KERNEL_MM_STATUS_OK)
         status = clone_file_sources(source_record, destination_record);
     if (status != KERNEL_MM_STATUS_OK) {
@@ -1733,6 +1817,12 @@ static enum kernel_mm_status mm_fork_impl(
 #endif
         destination_record->brk_initialized =
             source_record->brk_initialized;
+        for (struct mm_huge_map *entry=destination_record->huge_maps;entry;entry=entry->next) {
+            if (kernel_hugetlb_mapping_register(&entry->registration,entry->fork_epoch)) {
+                backend_status=ARCH_MMU_STATUS_CONFLICT;
+                goto fork_failed;
+            }
+        }
         for (struct kernel_mm_shared_anon *entry=destination_record->shared_anon;entry;entry=entry->next) {
             if (kernel_memory_object_mapping_register(&entry->registration,entry->fork_epoch)) {
                 /* 已关闭的对象不能接纳刚复制的旧叶；child尚未发布，撤掉它
@@ -1754,6 +1844,7 @@ static enum kernel_mm_status mm_fork_impl(
         return KERNEL_MM_STATUS_OK;
     }
 
+fork_failed:
     fork_file_guards_end(&files);
     failure = fork_status_from_backend(backend_status);
     destination_record->stage = KERNEL_MM_RECORD_VMAS_CLEANUP;
@@ -1831,7 +1922,7 @@ static int remote_access_allowed(const struct kernel_vma *vma, uint32_t access, 
     if (vma->permissions & access) return 1;
     if (!force || !(vma->maximum_permissions & access)) return 0;
     if (access == KERNEL_MM_READ) return 1;
-    return (vma->kind == KERNEL_VMA_KIND_ANONYMOUS ||
+    return (vma->kind == KERNEL_VMA_KIND_HUGETLB_PRIVATE || vma->kind == KERNEL_VMA_KIND_ANONYMOUS ||
             vma->kind == KERNEL_VMA_KIND_FILE_PRIVATE ||
             vma->kind == KERNEL_VMA_KIND_ELF_PRIVATE) &&
            vma->role != KERNEL_VMA_ROLE_VVAR && vma->role != KERNEL_VMA_ROLE_VDSO;
@@ -2142,10 +2233,18 @@ static void mm_operation_end(struct mm_operation *operation)
         int may_close = kernel_io_context_current()->user_pins == NULL;
         struct kernel_mm_file_source *files=may_close ? take_ready_file_sources(record) : NULL;
         struct kernel_mm_elf_source *elfs=may_close ? take_ready_elf_sources(record) : NULL;
+        struct mm_huge_map *huge=record->retired_huge_maps;
+        record->retired_huge_maps=0;
         struct kernel_mm_shared_anon *shared=record->retired_shared_anon;
         record->retired_shared_anon=0;
         mm_operation_release(operation);
         drain_retired_residents(record,residents);
+        while (huge) {
+            struct mm_huge_map *entry=huge;huge=entry->next;
+            kernel_hugetlb_mapping_drain(&entry->registration);
+            kernel_hugetlb_map_release(&entry->map);
+            kernel_heap_release(record->vma_heap,entry);
+        }
         while (shared) {
             struct kernel_mm_shared_anon *entry=shared;shared=entry->next;
             kernel_memory_object_mapping_drain(&entry->registration);
@@ -3884,6 +3983,9 @@ static enum kernel_mm_status mm_munmap_impl(
     return KERNEL_MM_STATUS_OK;
 }
 
+static enum kernel_mm_status mmap_hugetlb(struct kernel_mm *, uint64_t, uint64_t,
+    uint32_t, uint32_t, int, int, uint64_t *, struct kernel_shm_segment *, uint32_t);
+
 enum kernel_mm_status kernel_mm_shmat(
     struct kernel_mm *mm,
     struct kernel_shm_segment *segment,
@@ -3894,6 +3996,15 @@ enum kernel_mm_status kernel_mm_shmat(
 {
     KERNEL_SERVICE_SCOPE(service);
     KERNEL_NO_RECLAIM_IO;
+    if (segment && segment->hugetlb) {
+        uint32_t map_flags = 0;
+        if (hint) {
+            if (flags & KERNEL_SHM_RND) hint &= ~BOAROS_PAGE_MASK;
+            map_flags = (flags & KERNEL_SHM_REMAP) ? KERNEL_MM_MAP_FIXED : KERNEL_MM_MAP_FIXED_NOREPLACE;
+        } else if (flags & KERNEL_SHM_REMAP) return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+        return mmap_hugetlb(mm, hint, segment->aligned_size, permissions, map_flags,
+            1, 0, out_address, segment, flags);
+    }
     struct kernel_mm_record *record;
     struct kernel_vma vma;
     struct kernel_vma_edit edit;
@@ -4150,7 +4261,13 @@ static enum kernel_mm_status protect_vma_pages(struct kernel_mm_record *record,
             if (kernel_page_cache_alias_active(&resident->alias))
                 leaf_permissions &= ~KERNEL_MM_WRITE;
         }
-        if (arch_mmu_user_protect_owned_page(&record->space, leaf,
+        struct kernel_mm_leaf snapshot;
+        if (arch_mmu_user_leaf_snapshot(&record->space,leaf,&snapshot)) __builtin_trap();
+        if (snapshot.order) {
+            if (leaf<address || leaf+kernel_mm_leaf_size(&snapshot)>end ||
+                arch_mmu_user_protect_owned_range(&record->space,leaf,leaf+kernel_mm_leaf_size(&snapshot),
+                    backend_permissions_from_mm(leaf_permissions))) __builtin_trap();
+        } else if (arch_mmu_user_protect_owned_page(&record->space, leaf,
                 backend_permissions_from_mm(leaf_permissions))) __builtin_trap();
     }
     if (backend_status != ARCH_MMU_STATUS_NOT_MAPPED) __builtin_trap();
@@ -4586,8 +4703,8 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
         KERNEL_LOCK_SCOPE(retire);
         kernel_rwlock_write(&record->operations,&retire);
         if (pin_state_read(&record->access_pins) || pin_state_read(&record->write_pins) || mm_active_cpus(record) ||
-            record->pending_retirement || record->retired_file_mappings || record->retired_shared_anon) __builtin_trap();
-        if (record->vmas == 0 && record->shared_anon == 0 &&
+            record->pending_retirement || record->retired_file_mappings || record->retired_shared_anon || record->retired_huge_maps) __builtin_trap();
+        if (record->vmas == 0 && !record->huge_maps && record->shared_anon == 0 &&
             record->file_sources == 0 &&
             record->elf_sources == 0 && record->executable_file == 0 &&
             !record->retired_file_sources && !record->retired_elf_sources) {
@@ -4793,6 +4910,166 @@ static enum kernel_mm_status mm_ranges_operation_begin(const struct kernel_mm *m
     struct mm_operation operation __attribute__((cleanup(mm_operation_end))) = {0}; \
     enum kernel_mm_status op_status = mm_ranges_operation_begin((mm_), (address_), (length_), 0, 0, &operation, &mm_service); \
     if (op_status != KERNEL_MM_STATUS_OK) return op_status
+
+static enum kernel_hugetlb_status revoke_huge_child(void *owner,
+    struct kernel_hugetlb_map *map,uint64_t index,uint64_t physical)
+{
+    struct mm_huge_map *entry=owner;
+    if (entry->map!=map) __builtin_trap();
+    if (current_pins(&entry->mm)) return KERNEL_HUGETLB_BUSY;
+    struct mm_operation operation __attribute__((cleanup(mm_operation_end)))={0};
+    enum kernel_mm_status status=mm_operation_begin(&entry->mm,&operation);
+    if (status) return status==KERNEL_MM_STATUS_CONFLICT?KERNEL_HUGETLB_BUSY:KERNEL_HUGETLB_OK;
+    struct kernel_mm_record *record=operation.record;
+    uint64_t offset=index*ARCH_MMU_HUGE_SIZE;
+    if (!record->vmas) return KERNEL_HUGETLB_OK;
+    for (uint32_t i=0;i<kernel_vma_set_count(record->vmas);i++) {
+        struct kernel_vma v;
+        if (kernel_vma_set_get_at(record->vmas,i,&v)) __builtin_trap();
+        if (v.backing!=map || offset<v.backing_offset || offset-v.backing_offset>=v.end-v.start) continue;
+        uint64_t address=v.start+offset-v.backing_offset;
+        struct kernel_mm_leaf leaf;
+        {
+            KERNEL_RAW_READ_SCOPE(raw,&record->metadata);
+            enum arch_mmu_status found=arch_mmu_user_leaf_snapshot(&record->space,address,&leaf);
+            if (found==ARCH_MMU_STATUS_NOT_MAPPED) continue;
+            if (found) __builtin_trap();
+            if (leaf.physical_address!=physical) continue;
+        }
+        close_record_pins(record,0);operation.pins_closed=1;
+        if (unmap_space_range(record,address,address+ARCH_MMU_HUGE_SIZE)) __builtin_trap();
+        if (kernel_hugetlb_map_revoke(map,index)) __builtin_trap();
+    }
+    return KERNEL_HUGETLB_OK;
+}
+static void prepare_huge_registration(struct mm_huge_map *entry)
+{
+    entry->registration=(struct kernel_hugetlb_mapping){.map=entry->map,
+        .owner=entry,.revoke=revoke_huge_child};
+}
+
+static enum kernel_mm_status mmap_hugetlb(struct kernel_mm *mm,
+    uint64_t hint,uint64_t length,uint32_t permissions,uint32_t flags,
+    int shared,int noreserve,uint64_t *address, struct kernel_shm_segment *segment,
+    uint32_t shm_flags)
+{
+    KERNEL_NO_RECLAIM_IO;
+    uint32_t normalized;
+    uint64_t mask=ARCH_MMU_HUGE_SIZE-1;
+    if (!address || !length || (shared!=0 && shared!=1) || (noreserve!=0 && noreserve!=1) ||
+        !normalize_user_permissions(permissions,&normalized) ||
+        (flags & ~(KERNEL_MM_MAP_FIXED|KERNEL_MM_MAP_FIXED_NOREPLACE|KERNEL_MM_MAP_LOCKED|KERNEL_MM_MAP_SHARED)) ||
+        ((flags & KERNEL_MM_MAP_FIXED) && (flags & KERNEL_MM_MAP_FIXED_NOREPLACE)))
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    if (length>UINT64_MAX-mask) return KERNEL_MM_STATUS_NO_MEMORY;
+    length=(length+mask)&~mask;
+    MM_RANGE_OPERATION(mm,hint,(flags&KERNEL_MM_MAP_FIXED)?length:0);
+    struct kernel_mm_record *record=operation.record;
+    if (!record->vmas || !record->vma_heap) return KERNEL_MM_STATUS_STATE;
+    uint64_t start=0;
+    if (flags&(KERNEL_MM_MAP_FIXED|KERNEL_MM_MAP_FIXED_NOREPLACE)) {
+        if ((hint&mask) || hint<ARCH_MMU_HUGE_SIZE || length>ARCH_MMU_USER_LIMIT-hint || hint>=ARCH_MMU_USER_LIMIT)
+            return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+        start=hint;
+        int overlaps;
+        if ((flags&KERNEL_MM_MAP_FIXED_NOREPLACE) &&
+            (kernel_vma_set_overlaps(record->vmas,start,start+length,&overlaps) || overlaps))
+            return KERNEL_MM_STATUS_CONFLICT;
+    } else {
+        hint&=~mask;
+        int overlaps=1;
+        if (hint>=ARCH_MMU_HUGE_SIZE && hint<record->mmap_base && length<=record->mmap_base-hint &&
+            !kernel_vma_set_overlaps(record->vmas,hint,hint+length,&overlaps) && !overlaps) {
+            struct kernel_vma next;
+            enum kernel_vma_status found=kernel_vma_set_next(record->vmas,hint+length,&next);
+            uint64_t gap=KERNEL_VMA_STACK_GUARD_PAGES*BOAROS_PAGE_SIZE;
+            uint64_t boundary=found?record->mmap_base:kernel_vma_grows_down(&next)?
+                (next.start>gap?next.start-gap:0):next.start;
+            if (hint+length<=boundary) start=hint;
+        }
+        if (!start) {
+            uint64_t upper=record->mmap_base & ~mask;
+            for (uint32_t i=kernel_vma_set_count(record->vmas);i>0;) {
+                struct kernel_vma v;
+                if (kernel_vma_set_get_at(record->vmas,--i,&v)) __builtin_trap();
+                if (upper>=length && upper-length>=v.end && upper-length>=ARCH_MMU_HUGE_SIZE) { start=upper-length;break; }
+                uint64_t gap=KERNEL_VMA_STACK_GUARD_PAGES*BOAROS_PAGE_SIZE;
+                uint64_t boundary=kernel_vma_grows_down(&v)?(v.start>gap?v.start-gap:0):v.start;
+                if (boundary<upper) upper=boundary & ~mask;
+            }
+            if (!start && upper>=length && upper-length>=ARCH_MMU_HUGE_SIZE) start=upper-length;
+        }
+        if (!start) return KERNEL_MM_STATUS_NO_MEMORY;
+    }
+    uint64_t end=start+length;
+    if (!may_map_memory(record,start,end,normalized,shared,flags&KERNEL_MM_MAP_FIXED,0))
+        return KERNEL_MM_STATUS_NO_MEMORY;
+    enum kernel_mm_status locked=admit_mapping_lock(record,start,end,flags);
+    if (locked) return locked;
+    struct kernel_shm_attachment *attachment
+        __attribute__((cleanup(kernel_shm_attachment_release))) = 0;
+    if (segment && kernel_shm_attachment_create(segment,start,end,0,&attachment))
+        return KERNEL_MM_STATUS_NO_MEMORY;
+    struct mm_huge_map *entry = 0;
+    if (segment) {
+        for (entry=record->huge_maps; entry; entry=entry->next)
+            if (entry->map==segment->hugetlb) break;
+    }
+    int new_entry = !entry;
+    if (new_entry) {
+        if (kernel_heap_allocate_zeroed(record->vma_heap,1,sizeof(*entry),(void **)&entry))
+            return KERNEL_MM_STATUS_NO_MEMORY;
+        enum kernel_hugetlb_status hs = KERNEL_HUGETLB_OK;
+        if (segment) {
+            entry->map=segment->hugetlb;
+            kernel_hugetlb_map_acquire(entry->map);
+        } else {
+            struct kernel_hstate *h = 0;
+            hs=kernel_hstate_get_or_create(record->vma_heap,mm->allocator,ARCH_MMU_HUGE_ORDER,&h);
+            if (!hs) hs=kernel_hugetlb_map_create(h,length/ARCH_MMU_HUGE_SIZE,
+                shared?KERNEL_HUGETLB_SHARED:KERNEL_HUGETLB_PRIVATE,noreserve,&entry->map);
+            if (h) kernel_hstate_put(h);
+        }
+        if (hs) { kernel_heap_release(record->vma_heap,entry);return huge_status(hs); }
+        entry->pages=length/ARCH_MMU_HUGE_SIZE;entry->mm=*mm;
+        prepare_huge_registration(entry);
+    }
+    struct kernel_vma v={.start=start,.end=end,.permissions=normalized,
+        .maximum_permissions=KERNEL_VMA_ALL_PERMISSIONS &
+            ((shm_flags & KERNEL_SHM_RDONLY) ? ~KERNEL_MM_WRITE : KERNEL_VMA_ALL_PERMISSIONS),
+        .kind=shared?KERNEL_VMA_KIND_HUGETLB_SHARED:KERNEL_VMA_KIND_HUGETLB_PRIVATE,
+        .role=segment?KERNEL_VMA_ROLE_SYSV_SHM:KERNEL_VMA_ROLE_MMAP,.shm_attachment=attachment,.fault_policy=KERNEL_VMA_FAULT_HUGETLB,.backing=entry->map,
+        .flags=mapping_lock_flags(record,flags)};
+    enum kernel_mm_status status;
+    if (flags&KERNEL_MM_MAP_FIXED) {
+        struct kernel_vma_edit edit;
+        status=status_from_vma(kernel_vma_set_prepare_replace(record->vmas,start,end,&v,&edit));
+        if (!status) status=unmap_space_range(record,start,end);
+        if (!status) status=status_from_vma(kernel_vma_set_commit_edit(record->vmas,&edit));
+    } else status=status_from_vma(kernel_vma_set_insert(record->vmas,&v));
+    if (status) {
+        if (new_entry) { kernel_hugetlb_map_release(&entry->map);kernel_heap_release(record->vma_heap,entry); }
+        return status;
+    }
+    if (new_entry) {
+        entry->next=record->huge_maps;record->huge_maps=entry;
+        if (kernel_hugetlb_mapping_register(&entry->registration,0)) __builtin_trap();
+    }
+    drain_shared_anon(record,1);
+    (void)drain_file_sources(record,1);(void)drain_elf_sources(record,1);
+    *address=start;
+    uint32_t policy=v.flags & KERNEL_VMA_LOCK_MASK;
+    mm_operation_end(&operation);
+    if (policy==KERNEL_VMA_LOCKED) (void)populate_locked(mm,start,end);
+    return KERNEL_MM_STATUS_OK;
+}
+
+enum kernel_mm_status kernel_mm_mmap_hugetlb(struct kernel_mm *mm,
+    uint64_t hint,uint64_t length,uint32_t permissions,uint32_t flags,
+    int shared,int noreserve,uint64_t *address)
+{
+    return mmap_hugetlb(mm,hint,length,permissions,flags,shared,noreserve,address,0,0);
+}
 
 /* 复制期间不能迁移或借用CPU0时，退休来源留在MM；真实用户返回前
  * 已结束所有offset/pin资格，再归还同一份来源owner。 */
@@ -5436,6 +5713,7 @@ int kernel_mm_mremap(struct kernel_mm *mm, uint64_t old_address,
     struct kernel_vma source;
     if (old_address >= ARCH_MMU_USER_LIMIT ||
         kernel_vma_set_lookup(record->vmas, old_address, &source)) return -KERNEL_EFAULT;
+    if (huge_vma(&source)) return -KERNEL_EOPNOTSUPP;
     if (!old_size && source.kind != KERNEL_VMA_KIND_ANON_SHARED &&
         source.kind != KERNEL_VMA_KIND_FILE_SHARED && source.kind != KERNEL_VMA_KIND_SYSV_SHM &&
         source.kind != KERNEL_VMA_KIND_OBJECT_SHARED)
@@ -6321,10 +6599,150 @@ static void fault_retry(struct kernel_mm_record *record, uint64_t address)
     (void)address;
 #endif
 }
+static enum kernel_mm_status huge_fault(struct mm_operation *operation,uint64_t address,
+    uint32_t access,const struct fault_vma *view,int force)
+{
+    struct kernel_mm_record *record=operation->record;
+    const struct kernel_vma *v=&view->vma;
+    if (operation->shared || !huge_vma(v)) __builtin_trap();
+    if (!remote_access_allowed(v,access,force)) return KERNEL_MM_STATUS_ACCESS;
+    uint64_t base=address & ~(ARCH_MMU_HUGE_SIZE-1);
+    uint64_t index=(v->backing_offset+base-v->start)/ARCH_MMU_HUGE_SIZE;
+    struct kernel_hugetlb_map *map=v->backing;
+    struct kernel_mm_leaf old={0};
+    int cow=0, borrowed=0;
+    unsigned missing=0;
+    struct kernel_mm_retirement batch={0};
+    uint32_t targets=0;
+    {
+        KERNEL_RAW_WRITE_SCOPE(raw,&record->metadata);
+        enum arch_mmu_status found=arch_mmu_user_leaf_snapshot(&record->space,address,&old);
+        if (!found) {
+            if (old.order!=ARCH_MMU_HUGE_ORDER || old.virtual_address!=base) return KERNEL_MM_STATUS_ADDRESS_SPACE;
+            if ((old.permissions & access) || (force && access==KERNEL_MM_READ)) {
+                if (operation->fault_pin) {
+                    enum kernel_mm_status pinned=pin_mapping(operation->mm,record,address,access,operation->fault_pin,0,force);
+                    if (pinned) return pinned;
+                }
+                arch_mmu_flush_all();
+                return KERNEL_MM_STATUS_OK;
+            }
+            if (v->kind!=KERNEL_VMA_KIND_HUGETLB_PRIVATE || access!=KERNEL_MM_WRITE)
+                return KERNEL_MM_STATUS_ACCESS;
+            if (force && !old.cow) {
+                if (arch_mmu_user_mark_cow_page(&record->space,base) ||
+                    arch_mmu_user_leaf_snapshot(&record->space,address,&old)) __builtin_trap();
+            }
+            if (!old.cow) return KERNEL_MM_STATUS_ACCESS;
+            if (!operation->pins_closed) {
+                kernel_raw_lock_release(&raw);
+                if (current_pins(operation->mm)) return KERNEL_MM_STATUS_CONFLICT;
+                close_record_pins(record,0);operation->pins_closed=1;
+                return huge_fault(operation,address,access,view,force);
+            }
+            cow=1;
+            uint32_t refs=physical_page_cow_borrow_order(record->space.allocator,old.physical_address,old.order);
+            if (refs==1) {
+                if (arch_mmu_user_cow_commit_order(&record->space,base,old.cookie,KERNEL_MM_NO_PAGE,
+                    backend_permissions_from_mm(v->permissions),old.order,&batch)) __builtin_trap();
+                if (operation->fault_pin && pin_mapping(operation->mm,record,address,access,operation->fault_pin,0,force)) __builtin_trap();
+                targets=note_tlb_change_locked(record,&batch,0);
+                kernel_raw_lock_release(&raw);
+                finish_tlb_change(record,&batch,targets,base,ARCH_MMU_HUGE_SIZE,0);
+                return KERNEL_MM_STATUS_OK;
+            }
+            borrowed=1;
+        } else if (found==ARCH_MMU_STATUS_NOT_MAPPED) {
+            if (arch_mmu_user_leaf_missing_order(&record->space,base,ARCH_MMU_HUGE_ORDER,&missing))
+                return KERNEL_MM_STATUS_ADDRESS_SPACE;
+        } else return KERNEL_MM_STATUS_ADDRESS_SPACE;
+    }
+    struct kernel_hugetlb_claim claim={0};
+    enum kernel_hugetlb_status hs=kernel_hugetlb_fault_begin(map,index,cow,&claim);
+    if (hs==KERNEL_HUGETLB_REVOKE_CHILDREN) {
+        kernel_hugetlb_map_acquire(map);
+        if (operation->pins_closed) {
+            { KERNEL_RAW_WRITE_SCOPE(raw,&record->metadata);pin_admission_open(record); }
+            operation->pins_closed=0;wake_pin_waiters(record);
+        }
+        mm_operation_release(operation);
+        hs=kernel_hugetlb_revoke_children(map,index,old.physical_address);
+        enum kernel_mm_status retry=KERNEL_MM_STATUS_CONFLICT;
+        if (hs==KERNEL_HUGETLB_OK && !current_pins(operation->mm) &&
+            !mm_operation_begin(operation->mm,operation)) {
+            struct fault_vma fresh;
+            if (!read_fault_vma(operation,address,&fresh) && fresh.vma.backing==map &&
+                fresh.vma.kind==KERNEL_VMA_KIND_HUGETLB_PRIVATE &&
+                (fresh.vma.backing_offset+base-fresh.vma.start)/ARCH_MMU_HUGE_SIZE==index &&
+                remote_access_allowed(&fresh.vma,access,force)) {
+                close_record_pins(record,0);operation->pins_closed=1;
+                physical_page_release_order(record->space.allocator,old.physical_address,old.order);
+                borrowed=0;
+                KERNEL_RAW_WRITE_SCOPE(raw,&record->metadata);
+                struct kernel_mm_leaf now;
+                if (!arch_mmu_user_leaf_snapshot(&record->space,base,&now) &&
+                    now.cookie==old.cookie && now.physical_address==old.physical_address && now.cow) {
+                    uint32_t refs=physical_page_cow_borrow_order(record->space.allocator,now.physical_address,now.order);
+                    if (refs==1) {
+                        if (arch_mmu_user_cow_commit_order(&record->space,base,now.cookie,KERNEL_MM_NO_PAGE,
+                            backend_permissions_from_mm(fresh.vma.permissions),now.order,&batch)) __builtin_trap();
+                        if (operation->fault_pin && pin_mapping(operation->mm,record,address,access,operation->fault_pin,0,force)) __builtin_trap();
+                        targets=note_tlb_change_locked(record,&batch,0);
+                        kernel_raw_lock_release(&raw);
+                        finish_tlb_change(record,&batch,targets,base,ARCH_MMU_HUGE_SIZE,0);
+                        retry=KERNEL_MM_STATUS_OK;
+                    } else physical_page_release_order(record->space.allocator,now.physical_address,now.order);
+                }
+            }
+        }
+        if (borrowed) physical_page_release_order(operation->mm->allocator,old.physical_address,old.order);
+        kernel_hugetlb_map_release(&map);
+        return hs==KERNEL_HUGETLB_OK || hs==KERNEL_HUGETLB_BUSY ? retry : huge_status(hs);
+    }
+    enum kernel_mm_status status=huge_status(hs);
+    struct kernel_mm_leaf_preparation prepared=KERNEL_MM_LEAF_PREPARATION_INIT;
+    if (!status && cow) {
+        void *from,*to;
+        if (physical_page_map_owned(record->space.allocator,old.physical_address,&from) ||
+            physical_page_map_owned(record->space.allocator,claim.physical_address,&to)) __builtin_trap();
+        memcpy(to,from,ARCH_MMU_HUGE_SIZE);
+    }
+    for (unsigned i=0;i<2 && !status;i++) if (missing&(1U<<i)) {
+        if (physical_page_allocate_order_nosleep(record->space.allocator,0,&prepared.tables[i])) {
+            status=KERNEL_MM_STATUS_NO_MEMORY;break;
+        }
+        void *table;
+        if (physical_page_map_owned(record->space.allocator,prepared.tables[i],&table)) __builtin_trap();
+        clear_page(table);
+    }
+    if (!status) {
+        KERNEL_RAW_WRITE_SCOPE(raw,&record->metadata);
+        enum arch_mmu_status published=cow ?
+            arch_mmu_user_cow_commit_order(&record->space,base,old.cookie,claim.physical_address,
+                backend_permissions_from_mm(v->permissions),ARCH_MMU_HUGE_ORDER,&batch) :
+            arch_mmu_user_map_prepared_order(&record->space,base,claim.physical_address,
+                backend_permissions_from_mm(v->permissions),0,ARCH_MMU_HUGE_ORDER,&prepared);
+        if (published) status=published==ARCH_MMU_STATUS_CONFLICT?KERNEL_MM_STATUS_CONFLICT:KERNEL_MM_STATUS_ADDRESS_SPACE;
+        else {
+            if (operation->fault_pin && pin_mapping(operation->mm,record,address,access,operation->fault_pin,0,force)) __builtin_trap();
+            targets=note_fault_change_locked(record,&batch,cow,(v->permissions&KERNEL_MM_EXECUTE)!=0);
+        }
+    }
+    if (!status) finish_fault_change(record,&batch,targets,base,ARCH_MMU_HUGE_SIZE,cow,(v->permissions&KERNEL_MM_EXECUTE)!=0);
+    for (unsigned i=0;i<2;i++) if (prepared.tables[i]!=KERNEL_MM_NO_PAGE)
+        physical_page_release(record->space.allocator,prepared.tables[i]);
+    if (claim.map) kernel_hugetlb_fault_finish(&claim,!status);
+    if (borrowed) physical_page_release_order(record->space.allocator,old.physical_address,old.order);
+    return status;
+}
+
 static enum kernel_mm_status dispatch_fault(struct mm_operation *operation, uint64_t address,
     uint32_t access, const struct fault_vma *view, int force)
 {
     switch (view->vma.kind) {
+    case KERNEL_VMA_KIND_HUGETLB_PRIVATE:
+    case KERNEL_VMA_KIND_HUGETLB_SHARED:
+        return huge_fault(operation,address,access,view,force);
     case KERNEL_VMA_KIND_OBJECT_SHARED:
         return mapped_object_fault(operation, address, access, &view->vma);
     case KERNEL_VMA_KIND_FILE_SHARED:
@@ -6349,7 +6767,7 @@ static enum kernel_mm_status resolve_user_fault(struct kernel_mm *mm,
         shared = BOAROS_MAX_CPUS > 1 && !force;
         enum kernel_mm_status status = mm_operation_begin(mm, &operation);
         if (status) return status;
-        struct fault_vma view;
+        struct fault_vma view={0};
         status = read_fault_vma(&operation, address, &view);
         if (status == KERNEL_MM_STATUS_NOT_MAPPED && operation.record->vmas) {
             if (operation.shared) {
@@ -6358,8 +6776,10 @@ static enum kernel_mm_status resolve_user_fault(struct kernel_mm *mm,
             }
             status = grow_fault_stack(operation.record, address, access, &view.vma, &view.generation);
         }
+        if (!status && huge_vma(&view.vma) && operation.shared) { shared=0;continue; }
         if (!status) status = dispatch_fault(&operation, address, access, &view, force);
-        if (status != KERNEL_MM_STATUS_CONFLICT || current_pins(mm)) return status;
+        if (status != KERNEL_MM_STATUS_CONFLICT || current_pins(mm) ||
+            (huge_vma(&view.vma) && kernel_io_context_current()->user_pins)) return status;
         fault_retry(operation.record, address);
     }
 }
@@ -6499,6 +6919,8 @@ enum kernel_mm_status kernel_mm_try_futex_pin(struct kernel_mm *mm,uint64_t addr
             actual.identity=(uintptr_t)kernel_open_file_node(vma.backing);
         } else if(vma.kind==KERNEL_VMA_KIND_ANON_SHARED || vma.kind==KERNEL_VMA_KIND_SYSV_SHM) {
             actual.kind=KERNEL_FUTEX_KEY_SHARED_MEMORY;actual.identity=(uintptr_t)vma.backing;
+        } else if(vma.kind==KERNEL_VMA_KIND_HUGETLB_SHARED) {
+            actual.kind=KERNEL_FUTEX_KEY_SHARED_HUGETLB;actual.identity=(uintptr_t)vma.backing;
         }
         if(actual.kind!=KERNEL_FUTEX_KEY_PRIVATE)actual.offset=vma.backing_offset+address-vma.start;
         if(actual.kind!=key->kind || actual.identity!=key->identity || actual.offset!=key->offset)
@@ -6605,6 +7027,11 @@ enum kernel_mm_status kernel_mm_prepare_futex(struct kernel_mm *mm,
                 if (!object || kernel_memory_object_acquire(object)) __builtin_trap();
                 key->kind = KERNEL_FUTEX_KEY_SHARED_MEMORY;
                 key->shared_object = object; key->identity = (uintptr_t)object;
+            } else if (vma->kind==KERNEL_VMA_KIND_HUGETLB_SHARED) {
+                struct kernel_hugetlb_map *map=vma->backing;
+                kernel_hugetlb_map_acquire(map);
+                key->kind=KERNEL_FUTEX_KEY_SHARED_HUGETLB;
+                key->hugetlb_map=map;key->identity=(uintptr_t)map;
             }
             if (key->kind != KERNEL_FUTEX_KEY_PRIVATE)
                 key->offset = vma->backing_offset + addresses[i] - vma->start;
@@ -6757,6 +7184,7 @@ enum kernel_mm_status kernel_mm_proc_maps_snapshot(const struct kernel_mm *mm,
             *row = (struct kernel_mm_proc_map){ .start = vma.start, .end = vma.end,
                 .permissions = vma.permissions, .flags = vma.flags, .kind = vma.kind, .role = vma.role,
                 .shared = vma.kind == KERNEL_VMA_KIND_FILE_SHARED ||
+                    vma.kind == KERNEL_VMA_KIND_HUGETLB_SHARED ||
                     vma.kind == KERNEL_VMA_KIND_ANON_SHARED ||
                     vma.kind == KERNEL_VMA_KIND_SYSV_SHM ||
                     vma.kind == KERNEL_VMA_KIND_OBJECT_SHARED };
@@ -6825,6 +7253,10 @@ static int populate_range(struct kernel_mm *mm, uint64_t start, uint64_t end,
         struct fault_vma view;
         enum kernel_mm_status status = read_fault_vma(&operation, start, &view);
         if (status) return -KERNEL_ENOMEM;
+        if (huge_vma(&view.vma) && operation.shared) {
+            mm_operation_end(&operation);operation.shared=0;
+            if (mm_operation_begin(mm,&operation) || read_fault_vma(&operation,start,&view)) return -KERNEL_EAGAIN;
+        }
         const struct kernel_vma *vma = &view.vma;
         if (locked_only && (vma->flags & KERNEL_VMA_LOCK_MASK) != KERNEL_VMA_LOCKED) {
             start = vma->end < end ? vma->end : end;
@@ -6857,7 +7289,7 @@ static int populate_range(struct kernel_mm *mm, uint64_t start, uint64_t end,
                 status == KERNEL_MM_STATUS_ACCESS ? -KERNEL_EINVAL : -KERNEL_EFAULT;
         }
         if (task) kernel_task_account_fault(task, kernel_task_read_bytes(task) != block_reads);
-        start += BOAROS_PAGE_SIZE;
+        start=huge_vma(vma) ? (start & ~(ARCH_MMU_HUGE_SIZE-1))+ARCH_MMU_HUGE_SIZE : start+BOAROS_PAGE_SIZE;
         /* 有界借用允许已排队的VMA writer推进，不逐页排入FIFO。 */
         if (++pages == KERNEL_MM_RETIRE_CAPACITY || start >= vma->end) {
             mm_operation_end(&operation); pages = 0;
@@ -7077,6 +7509,48 @@ static int advise_free(struct mm_operation *operation,const struct kernel_vma *v
     return error;
 }
 
+/* Reserve replacement capacity before detaching; never turn failed advice into
+ * data loss. The token consumes precisely the old PTE reference after sync. */
+static int advise_huge_discard(struct mm_operation *op,const struct kernel_vma *v,
+    uint64_t start,uint64_t end)
+{
+    struct kernel_mm_record *r=op->record;
+    if ((start|end)&(ARCH_MMU_HUGE_SIZE-1)) return -KERNEL_EINVAL;
+    if (current_pins(op->mm)) return -KERNEL_EAGAIN;
+    if (!op->pins_closed) { close_record_pins(r,0);op->pins_closed=1; }
+    if (v->kind==KERNEL_VMA_KIND_HUGETLB_SHARED)
+        return unmap_space_range(r,start,end)?-KERNEL_EAGAIN:0;
+    for (uint64_t va=start;va<end;va+=ARCH_MMU_HUGE_SIZE) {
+        struct kernel_mm_leaf leaf;
+        { KERNEL_RAW_READ_SCOPE(raw,&r->metadata);
+          enum arch_mmu_status st=arch_mmu_user_leaf_snapshot(&r->space,va,&leaf);
+          if (st==ARCH_MMU_STATUS_NOT_MAPPED) continue;
+          if (st || leaf.order!=ARCH_MMU_HUGE_ORDER) __builtin_trap(); }
+        struct kernel_hugetlb_discard_claim claim={0};
+        enum kernel_hugetlb_status hs=kernel_hugetlb_discard_begin(v->backing,
+            (v->backing_offset+va-v->start)/ARCH_MMU_HUGE_SIZE,leaf.physical_address,1,&claim);
+        if (hs) return hs==KERNEL_HUGETLB_BUSY?-KERNEL_EAGAIN:-KERNEL_ENOMEM;
+        struct kernel_mm_detach_cursor cursor={0};
+        enum arch_mmu_status st;
+        unsigned detached=0;
+        do {
+            struct kernel_mm_retirement batch={0};uint32_t targets;
+            { KERNEL_RAW_WRITE_SCOPE(raw,&r->metadata);
+              st=arch_mmu_user_detach_range(&r->space,va,va+ARCH_MMU_HUGE_SIZE,&cursor,&batch,0,0);
+              if (st!=ARCH_MMU_STATUS_OK && st!=ARCH_MMU_STATUS_NOT_MAPPED) __builtin_trap();
+              for (unsigned i=0;i<batch.count;i++) if (batch.orders[i]) {
+                  if (detached++ || batch.pages[i]!=leaf.physical_address || batch.orders[i]!=leaf.order) __builtin_trap();
+                  --batch.count;batch.pages[i]=batch.pages[batch.count];batch.orders[i]=batch.orders[batch.count];--i;
+              }
+              targets=note_tlb_change_locked(r,&batch,0); }
+            finish_tlb_change(r,&batch,targets,batch.nonleaf?0:va,batch.nonleaf?UINT64_MAX:ARCH_MMU_HUGE_SIZE,0);
+        } while (st==ARCH_MMU_STATUS_OK);
+        if (!detached) __builtin_trap();
+        kernel_hugetlb_discard_finish(&claim,1);
+    }
+    return 0;
+}
+
 int kernel_mm_madvise(struct kernel_mm *mm, uint64_t address, uint64_t length, int32_t advice)
 {
     int fork_policy = advice == KERNEL_MM_ADVICE_DONTFORK || advice == KERNEL_MM_ADVICE_DOFORK ||
@@ -7109,9 +7583,13 @@ int kernel_mm_madvise(struct kernel_mm *mm, uint64_t address, uint64_t length, i
         if (status) __builtin_trap();
         uint64_t finish = vma.end < end ? vma.end : end;
         int error = 0;
+        if (huge_vma(&vma) && (address&(ARCH_MMU_HUGE_SIZE-1))) return -KERNEL_EINVAL;
+        if (huge_vma(&vma) && advice!=KERNEL_MM_ADVICE_DONTNEED &&
+            (finish&(ARCH_MMU_HUGE_SIZE-1))) return -KERNEL_EINVAL;
         if (advice == KERNEL_MM_ADVICE_DONTNEED) {
             if (vma.flags & KERNEL_VMA_LOCKED) return -KERNEL_EINVAL;
-            if (unmap_space_range(record, address, finish)) __builtin_trap();
+            if (huge_vma(&vma)) error=advise_huge_discard(&operation,&vma,address,finish & ~(ARCH_MMU_HUGE_SIZE-1));
+            else if (unmap_space_range(record, address, finish)) __builtin_trap();
         } else if (advice == KERNEL_MM_ADVICE_WILLNEED)
             error = advise_file(&operation, &vma, address, &finish, &budget);
         else if (advice == KERNEL_MM_ADVICE_REMOVE)
@@ -7291,6 +7769,9 @@ int kernel_mm_mincore(struct kernel_mm *mm, uint64_t address, unsigned count,
             if (status != ARCH_MMU_STATUS_OK && status != ARCH_MMU_STATUS_NOT_MAPPED) __builtin_trap();
             present = status == ARCH_MMU_STATUS_OK;
         }
+        if (!present && vma.kind==KERNEL_VMA_KIND_HUGETLB_SHARED)
+            present=kernel_hugetlb_map_resident(vma.backing,
+                (vma.backing_offset+address-vma.start)/ARCH_MMU_HUGE_SIZE);
         if (file || object) {
             if (borrow && (*borrow == UINT32_MAX || ++*borrow == 0)) __builtin_trap();
             if (object && kernel_memory_object_acquire(object)) __builtin_trap();

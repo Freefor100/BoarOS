@@ -126,18 +126,19 @@ static int vma_valid(const struct kernel_vma *vma)
 {
     if (vma == 0 || vma->start >= vma->end ||
         vma->kind < KERNEL_VMA_KIND_ANONYMOUS ||
-        vma->kind > KERNEL_VMA_KIND_OBJECT_SHARED ||
+        vma->kind > KERNEL_VMA_KIND_HUGETLB_SHARED ||
         vma->role < KERNEL_VMA_ROLE_NONE ||
         vma->role > KERNEL_VMA_ROLE_SYSV_SHM ||
         vma->fault_policy < KERNEL_VMA_FAULT_RESIDENT_REQUIRED ||
-        vma->fault_policy > KERNEL_VMA_FAULT_OBJECT_SHARED) {
+        vma->fault_policy > KERNEL_VMA_FAULT_HUGETLB) {
         return 0;
     }
     if ((vma->flags & ~KERNEL_VMA_ALL_FLAGS) || (vma->flags & KERNEL_VMA_LOCK_MASK) == KERNEL_VMA_LOCK_ONFAULT) return 0;
     if ((vma->maximum_permissions & ~KERNEL_VMA_ALL_PERMISSIONS) ||
         (vma->permissions & KERNEL_VMA_ALL_PERMISSIONS & ~vma->maximum_permissions))
         return 0;
-    if (vma->kind != KERNEL_VMA_KIND_SYSV_SHM && vma->shm_attachment)
+    if (vma->kind != KERNEL_VMA_KIND_SYSV_SHM &&
+        vma->kind != KERNEL_VMA_KIND_HUGETLB_SHARED && vma->shm_attachment)
         return 0;
     if (vma->kind == KERNEL_VMA_KIND_ANONYMOUS &&
         (vma->backing_offset != 0U || vma->backing != 0 ||
@@ -179,6 +180,11 @@ static int vma_valid(const struct kernel_vma *vma)
         (!vma->backing || vma->fault_policy != KERNEL_VMA_FAULT_OBJECT_SHARED ||
          (vma->backing_offset & BOAROS_PAGE_MASK) ||
          vma->backing_offset > UINT64_MAX - (vma->end - vma->start))) return 0;
+    if (vma->kind==KERNEL_VMA_KIND_HUGETLB_PRIVATE || vma->kind==KERNEL_VMA_KIND_HUGETLB_SHARED) {
+        if (!vma->backing || vma->fault_policy!=KERNEL_VMA_FAULT_HUGETLB ||
+            ((vma->start|vma->end|vma->backing_offset)&(ARCH_MMU_HUGE_SIZE-1)) ||
+            vma->backing_offset>UINT64_MAX-(vma->end-vma->start)) return 0;
+    }
     return 1;
 }
 
@@ -198,7 +204,8 @@ static int can_merge(const struct kernel_vma *left,
         left->maximum_permissions != right->maximum_permissions) {
         return 0;
     }
-    if (left->kind == KERNEL_VMA_KIND_SYSV_SHM ||
+    if (left->shm_attachment || right->shm_attachment ||
+        left->kind == KERNEL_VMA_KIND_SYSV_SHM ||
         right->kind == KERNEL_VMA_KIND_SYSV_SHM) {
         return 0;
     }
@@ -602,6 +609,30 @@ static uint64_t unmapped_start(const struct kernel_vma *vma)
     return kernel_vma_grows_down(vma) ? (vma->start > gap ? vma->start-gap : 0) : vma->start;
 }
 
+enum kernel_vma_status kernel_vma_set_rebind_backing(struct kernel_vma_set *set,
+    const void *old, void *replacement)
+{
+    if (!set_valid(set) || !old || !replacement || set->generation==UINT64_MAX)
+        return KERNEL_VMA_STATUS_INVALID_ARGUMENT;
+    for (uint32_t i=0;i<set->count;i++) if (set->entries[i].backing==old)
+        set->entries[i].backing=replacement;
+    set->generation++;
+    return KERNEL_VMA_STATUS_OK;
+}
+static int huge_edit_aligned(const struct kernel_vma_set *set,uint64_t start,uint64_t end)
+{
+    if (!((start|end)&(ARCH_MMU_HUGE_SIZE-1))) return 1;
+    for (uint32_t i=0;i<set->count;i++) {
+        const struct kernel_vma *v=&set->entries[i];
+        if (v->start>=end) break;
+        if (v->end<=start || (v->kind!=KERNEL_VMA_KIND_HUGETLB_PRIVATE &&
+            v->kind!=KERNEL_VMA_KIND_HUGETLB_SHARED)) continue;
+        if ((start>v->start && (start&(ARCH_MMU_HUGE_SIZE-1))) ||
+            (end<v->end && (end&(ARCH_MMU_HUGE_SIZE-1)))) return 0;
+    }
+    return 1;
+}
+
 enum kernel_vma_status kernel_vma_set_find_topdown_gap(
     const struct kernel_vma_set *set,
     uint64_t hint,
@@ -676,6 +707,7 @@ static enum kernel_vma_status reserve_edit_capacity(
     uint64_t end,
     int replacement)
 {
+    if (!huge_edit_aligned(set,start,end)) return KERNEL_VMA_STATUS_INVALID_ARGUMENT;
     uint32_t required = set->count;
     uint32_t extra = (uint32_t)split_needed(set, start) +
                      (uint32_t)split_needed(set, end);
@@ -880,6 +912,7 @@ enum kernel_vma_status kernel_vma_set_prepare_mprotect(
     edit->set = 0;
     if (!set_valid(set) || start >= end)
         return KERNEL_VMA_STATUS_INVALID_ARGUMENT;
+    if (!huge_edit_aligned(set,start,end)) return KERNEL_VMA_STATUS_INVALID_ARGUMENT;
     uint32_t index = lower_bound(set, start);
     if (index && set->entries[index - 1].end > start) index--;
     uint32_t first_split = 0;

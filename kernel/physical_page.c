@@ -355,6 +355,7 @@ enum physical_page_status physical_page_allocator_init(
 
     kernel_raw_lock_init(&result.lock, KERNEL_RAW_RANK_PAGE);
     result.reclaim_hooks = (struct physical_page_reclaim_hooks){0};
+    result.compound_recycler = (struct physical_page_compound_recycler){0};
     result.lazy_reclaim = 0;
     result.shared_anon_pages = 0;
     result.buffer_bytes = 0;
@@ -1454,6 +1455,11 @@ static __attribute__((noinline)) uint32_t physical_page_release_owner(struct phy
         page_written(work);
         return order;
     }
+    if (order && a->compound_recycler.retain_last) {
+        int retained=a->compound_recycler.retain_last(a->compound_recycler.context,address,order);
+        if (retained != 0 && retained != 1) __builtin_trap();
+        if (retained) return order;
+    }
     uint64_t pages = order_page_count(order);
     if (a->available_pages > a->total_pages ||
         pages > a->total_pages - a->available_pages)
@@ -1699,6 +1705,27 @@ physical_page_reference_count(const struct physical_page_allocator *a, uint64_t 
     uint32_t page;
     if (!references) __builtin_trap();
     *references=*page_references_locked(a,address,&page,&work);
+    return PHYSICAL_PAGE_STATUS_OK;
+}
+
+enum physical_page_status physical_page_allocator_set_compound_recycler(
+    struct physical_page_allocator *a, const struct physical_page_compound_recycler *recycler)
+{
+    if (!physical_page_allocator_is_finalized(a) || !recycler ||
+        !recycler->context || !recycler->retain_last) return PHYSICAL_PAGE_STATUS_INVALID;
+    KERNEL_RAW_SCOPE(guard,&a->lock);
+    if (a->compound_recycler.retain_last) return PHYSICAL_PAGE_STATUS_STATE;
+    a->compound_recycler=*recycler;
+    return PHYSICAL_PAGE_STATUS_OK;
+}
+enum physical_page_status physical_page_allocator_clear_compound_recycler(
+    struct physical_page_allocator *a, void *context)
+{
+    if (!physical_page_allocator_is_finalized(a) || !context) return PHYSICAL_PAGE_STATUS_INVALID;
+    KERNEL_RAW_SCOPE(guard,&a->lock);
+    if (!a->compound_recycler.retain_last || a->compound_recycler.context!=context)
+        return PHYSICAL_PAGE_STATUS_STATE;
+    a->compound_recycler=(struct physical_page_compound_recycler){0};
     return PHYSICAL_PAGE_STATUS_OK;
 }
 

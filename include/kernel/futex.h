@@ -8,20 +8,27 @@ struct kernel_task;
 struct kernel_mm;
 struct kernel_memory_object;
 struct kernel_vfs_node;
+struct kernel_hugetlb_map;
 
 enum kernel_futex_key_kind {
     KERNEL_FUTEX_KEY_PRIVATE = 0,
     KERNEL_FUTEX_KEY_SHARED_MEMORY,
     KERNEL_FUTEX_KEY_SHARED_FILE,
+    KERNEL_FUTEX_KEY_SHARED_HUGETLB,
 };
 
-/* 排队者持有后备引用；身份、映射与所需用户字pin在同一 MM operation 内取得。 */
+/* 排队者持有后备引用；身份、映射与所需用户字pin在同一 MM operation 内取得。
+ * Shared hugetlb identity is the stable map object, not a physical huge-page
+ * head. offset is a byte offset in that map (including split-VMA backing_offset).
+ * The MM must acquire the map while its VMA owner is still protected, so queued
+ * waiters keep the identity alive across unmap and prevent pointer-reuse ABA. */
 struct kernel_futex_key {
     uint64_t identity;
     uint64_t offset;
     union {
         struct kernel_memory_object *shared_object;
         struct kernel_vfs_node *file_node;
+        struct kernel_hugetlb_map *hugetlb_map;
     };
     enum kernel_futex_key_kind kind;
 };
