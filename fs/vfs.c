@@ -3684,7 +3684,10 @@ static int fallocate_borrowing(struct kernel_vfs_file *file, unsigned mode,
     }
     int modified=kernel_vfs_file_modified(file,offset,0);
     if (modified) return modified;
-    if (!mode && end > old_size && limit && end > limit->maximum) {
+    /* shmem validates reservations beyond EOF against FSIZE even KEEP_SIZE;
+     * disk allocation retains the existing size-changing-only check. */
+    if ((!mode || (node->memory && mode==KERNEL_VFS_FALLOC_KEEP_SIZE)) &&
+        end > old_size && limit && end > limit->maximum) {
         limit->exceeded = 1;
         return -KERNEL_EFBIG;
     }

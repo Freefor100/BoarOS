@@ -597,23 +597,32 @@ static int read_directory(struct kernel_vfs_file *file, struct kernel_vfs_dir_ba
 
 static int truncate_inode(struct kernel_vfs_node *n,uint64_t size,uint64_t *actual,int *changed)
 {
-    struct tmp_inode *i=ti(n); kernel_memory_object_truncate(i->memory,size);
+    struct tmp_inode *i=ti(n);
+    /* Growth retains KEEP_SIZE reservations beyond the new EOF. */
+    if (size<=i->size) kernel_memory_object_truncate(i->memory,size);
     if (i->capability) remove_attribute(tm(n->instance),i,i->capability);
     i->mode=n->mode=kernel_vfs_write_mode(n->mode,n->gid);
     struct kernel_vfs_timespec time=now();
     KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
     i->size=size; i->ctime=i->mtime=time; *actual=size; *changed=1; return 0;
 }
-static int punch_inode(struct kernel_vfs_node *n,unsigned mode,uint64_t offset,
+static int fallocate_inode(struct kernel_vfs_node *n,unsigned mode,uint64_t offset,
     uint64_t length,uint64_t *actual,int *changed)
 {
     struct tmp_inode *i=ti(n);
     *actual=i->size; *changed=0;
-    if (mode != (KERNEL_VFS_FALLOC_KEEP_SIZE | KERNEL_VFS_FALLOC_PUNCH_HOLE))
-        return -KERNEL_EOPNOTSUPP;
     uint64_t end=offset+length;
-    if (end>i->size) end=i->size;
-    if (offset<end) kernel_memory_object_punch(i->memory,offset,end);
+    if (mode == (KERNEL_VFS_FALLOC_KEEP_SIZE | KERNEL_VFS_FALLOC_PUNCH_HOLE)) {
+        /* KEEP_SIZE reservations can also lie beyond EOF. */
+        kernel_memory_object_punch(i->memory,offset,end);
+    } else if (!mode || mode==KERNEL_VFS_FALLOC_KEEP_SIZE) {
+        enum kernel_memory_object_status status=kernel_memory_object_preallocate(i->memory,
+            offset>>BOAROS_PAGE_SHIFT,((end-1)>>BOAROS_PAGE_SHIFT)+1);
+        if (status) return status==KERNEL_MEMORY_OBJECT_NO_SPACE ? -KERNEL_ENOSPC :
+            status==KERNEL_MEMORY_OBJECT_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+        if (!mode && end>i->size) i->size=end;
+    } else return -KERNEL_EOPNOTSUPP;
+    *actual=i->size;
     struct kernel_vfs_timespec time=now();
     KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
     i->ctime=i->mtime=time; *changed=1;
@@ -793,7 +802,7 @@ static const struct kernel_vfs_backend tmp_ops = {
     .create=create, .tmpfile=tmpfile_inode, .link_tmpfile=link_tmpfile, .mkdir=mkdir, .symlink=symlink, .mknod=mknod_node, .readlink=readlink,
     .unlink=unlink_file, .rmdir=rmdir, .release_unlinked=release_unlinked, .link=link_inode,
     .rename=rename_inode, .stat=stat_inode, .statfs=statfs, .read_directory=read_directory,
-    .truncate=truncate_inode, .fallocate=punch_inode, .pread=pread_inode,
+    .truncate=truncate_inode, .fallocate=fallocate_inode, .pread=pread_inode,
     .memory_written=memory_written, .set_times=set_times, .set_mode=set_mode, .set_owner=set_owner,
     .get_flags=get_flags,.set_flags=set_flags,
     .accessed=accessed, .modified=modified, .killpriv=killpriv, .writeback_allowed=no_writeback,

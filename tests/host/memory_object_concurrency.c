@@ -247,6 +247,50 @@ static void punch(void)
     assert(budget.used==2&&kernel_memory_object_resident_pages(objects[0])==2);
     kernel_memory_object_release(&objects[0]);assert(!budget.used&&!pages.shared_anon_pages);
 }
+static void *reserve_range(void *arg)
+{
+    unsigned id=(unsigned)(uintptr_t)arg;mm_test_attach(id+1);
+    barrier(&start);
+    results[id]=kernel_memory_object_preallocate(objects[0],id*16,id*16+32);
+    return NULL;
+}
+static void concurrent_reservations(void)
+{
+    assert(!kernel_memory_object_create(&heap,&pages,&objects[0]));
+    budget=(struct kernel_memory_budget){.limit=48};kernel_memory_object_set_budget(objects[0],&budget);
+    assert(!pthread_barrier_init(&start,NULL,3));pthread_t workers[2];
+    uint64_t before=data_allocations;
+    for(unsigned i=0;i<2;i++)assert(!pthread_create(&workers[i],NULL,reserve_range,(void *)(uintptr_t)i));
+    barrier(&start);
+    for(unsigned i=0;i<2;i++)assert(!pthread_join(workers[i],NULL)&&!results[i]);
+    assert(budget.used==48&&kernel_memory_object_resident_pages(objects[0])==48);
+    assert(data_allocations-before==48);
+    kernel_memory_object_release(&objects[0]);assert(!budget.used&&!pages.shared_anon_pages);
+    assert(!pthread_barrier_destroy(&start));
+}
+static void reservations(void)
+{
+    assert(!kernel_memory_object_create(&heap,&pages,&objects[0]));
+    uint64_t baseline=physical_page_available(&pages);
+    /* Forty staged pages succeed; the final single table allocation fails. */
+    fail_heap=41;
+    assert(kernel_memory_object_preallocate(objects[0],0,40)==KERNEL_MEMORY_OBJECT_NO_MEMORY);
+    assert(!kernel_memory_object_resident_pages(objects[0])&&!pages.shared_anon_pages);
+    assert(physical_page_available(&pages)==baseline);
+    uint64_t page;int created;
+    assert(!kernel_memory_object_prepare_page(objects[0],7,&page,&created)&&created);
+    ((unsigned char *)access(page))[3]=0x59;
+    assert(!kernel_memory_object_preallocate(objects[0],0,40));
+    /* Rejected mapping preparation cannot undo successful preallocation. */
+    kernel_memory_object_finish_page(objects[0],7,page,0);
+    assert(kernel_memory_object_resident_pages(objects[0])==40);
+    assert(!kernel_memory_object_find_page(objects[0],7,&page));
+    assert(((unsigned char *)access(page))[3]==0x59&&!physical_page_release(&pages,page));
+    uint64_t before_allocations=allocations,before_pages=data_allocations;
+    assert(!kernel_memory_object_preallocate(objects[0],0,40));
+    assert(allocations==before_allocations&&data_allocations==before_pages);
+    kernel_memory_object_release(&objects[0]);assert(!pages.shared_anon_pages);
+}
 int main(void)
 {
     mm_test_attach(0);
@@ -260,6 +304,7 @@ int main(void)
     for(actors=2;actors<=4;actors+=2) {
         parallel_pages(1); parallel_pages(0); references(); preparations(0); preparations(1);
     }
+    concurrent_reservations();reservations();
     sequential();punch();
     struct kernel_heap_statistics s; kernel_heap_get_statistics(&heap,&s);
     assert(!s.live_allocations && !s.current_pages && physical_page_available(&pages)==baseline);
