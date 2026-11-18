@@ -1,4 +1,5 @@
 #include <kernel/credentials.h>
+#include <kernel/seccomp.h>
 #include <kernel/scheduler.h>
 #include "private.h"
 #include <kernel/namespace.h>
@@ -43,6 +44,13 @@ enum kernel_syscall_status syscall_handle_prctl(
     struct kernel_syscall_result *decoded)
 {
     uint32_t option = (uint32_t)request->arguments[0];
+    if (option==21U || option==22U) {
+        decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value=option==21U ? __atomic_load_n(&caller->seccomp_mode,__ATOMIC_ACQUIRE) :
+            kernel_seccomp_set(caller,(uint32_t)request->arguments[1],0,
+                (uint32_t)request->arguments[1]==1 ? 0 : request->arguments[2]);
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
     if (option != 1U && option != 2U && option != 15U && option != 16U &&
         option != 36U && option != 37U)
         return syscall_handle_prctl_credentials(caller, request, decoded);

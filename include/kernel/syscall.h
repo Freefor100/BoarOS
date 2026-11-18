@@ -22,12 +22,15 @@ enum kernel_syscall_action {
     KERNEL_SYSCALL_ACTION_YIELD,
     KERNEL_SYSCALL_ACTION_SIGNAL_RETURN,
     KERNEL_SYSCALL_ACTION_EXIT_GROUP,
+    /* Filter results are user-visible even if they equal an internal restart code. */
+    KERNEL_SYSCALL_ACTION_RETURN_FINAL,
 };
 
 struct kernel_syscall_request {
     uint64_t number;
     uint64_t arguments[KERNEL_SYSCALL_ARGUMENT_COUNT];
     uint64_t user_sp;
+    uint64_t instruction_pointer;
 };
 
 struct kernel_syscall_result {

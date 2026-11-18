@@ -309,7 +309,7 @@ LWIP_SOURCES := \
 CPU_C_SOURCES := kernel/cpu.c kernel/raw_lock.c
 COMMON_C_SOURCES := \
 	$(CPU_C_SOURCES) \
-	kernel/bpf/vm.c kernel/bpf/verify.c kernel/bpf/classic.c \
+	kernel/seccomp.c kernel/sched/seccomp.c kernel/bpf/vm.c kernel/bpf/verify.c kernel/bpf/classic.c \
 	kernel/bpf/maps.c kernel/bpf/ringbuf.c kernel/bpf/objects.c \
 	kernel/bpf/syscall.c kernel/bpf/program.c kernel/bpf/runtime.c \
 	kernel/bpf/btf.c kernel/bpf/trace.c kernel/bpf/info.c \
@@ -2030,7 +2030,7 @@ test-scheduler-stack-slots-host:
 test-scheduler-handoff-host: test-scheduler-stack-slots-host
 	@mkdir -p build/host
 	@set -e; for shift in 12 14; do \
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/sync -idirafter include tests/host/sched_handoff.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/core.c kernel/sched/process.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=scheduler_switch_claimed,--wrap=kernel_raw_lock_acquire,--wrap=kernel_wait_backend_quiesce -o build/host/scheduler-handoff-$$shift; \
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/sync -idirafter include tests/host/sched_handoff.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/core.c kernel/sched/process.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/seccomp.c kernel/sched/seccomp.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=scheduler_switch_claimed,--wrap=kernel_raw_lock_acquire,--wrap=kernel_wait_backend_quiesce -o build/host/scheduler-handoff-$$shift; \
 		build/host/scheduler-handoff-$$shift; \
 	done
 
@@ -2086,7 +2086,7 @@ test-proc-index-host:
 
 test-sched-concurrency-host:
 	@mkdir -p build/host
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sched_concurrency.c tests/host/signal_owner.c kernel/signal_pending.c kernel/reboot.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/sched/lifetime.c kernel/sched/ptrace.c kernel/sched/identity.c kernel/sched/process.c kernel/pid.c kernel/sched/futex_pi.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_sched_policy_charge,--wrap=kernel_sched_policy_set,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release -o build/host/sched-concurrency
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sched_concurrency.c tests/host/signal_owner.c kernel/signal_pending.c kernel/reboot.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/seccomp.c kernel/sched/seccomp.c kernel/sched/lifetime.c kernel/sched/ptrace.c kernel/sched/identity.c kernel/sched/process.c kernel/pid.c kernel/sched/futex_pi.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_sched_policy_charge,--wrap=kernel_sched_policy_set,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release -o build/host/sched-concurrency
 	build/host/sched-concurrency
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/process_child_links.c kernel/cpu.c kernel/raw_lock.c -Wl,--gc-sections -o build/host/process-child-links
 	build/host/process-child-links
@@ -2103,13 +2103,13 @@ run-user-smp-riscv: kernel-rv-user-smp
 .PHONY: test-socket-protocol-host
 test-socket-protocol-host:
 	@mkdir -p $(or $(SOCKET_PROTOCOL_HOST_BUILD),build/host/socket-protocol)
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -include sys/types.h -include limits.h -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -DSOCKET_PROTOCOL_CASES -Itests/host/sync -idirafter include -idirafter net/lwip_port/include -idirafter third_party/lwip/src/include tests/host/user_smp.c tests/host/user_stop.c kernel/signal_pending.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/sched/lifetime.c kernel/sched/policy.c kernel/sched/runqueue.c third_party/lwip/src/core/ip.c third_party/lwip/src/core/stats.c -Wl,--gc-sections,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release,--wrap=kernel_scheduler_wake_signal,--wrap=kernel_wait_backend_quiesce,--wrap=kernel_rwlock_write,--wrap=kernel_rwlock_try_write -o $(or $(SOCKET_PROTOCOL_HOST_BUILD),build/host/socket-protocol)/scope
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -include sys/types.h -include limits.h -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -DSOCKET_PROTOCOL_CASES -Itests/host/sync -idirafter include -idirafter net/lwip_port/include -idirafter third_party/lwip/src/include tests/host/user_smp.c tests/host/user_stop.c kernel/signal_pending.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/seccomp.c kernel/sched/seccomp.c kernel/sched/lifetime.c kernel/sched/policy.c kernel/sched/runqueue.c third_party/lwip/src/core/ip.c third_party/lwip/src/core/stats.c -Wl,--gc-sections,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release,--wrap=kernel_scheduler_wake_signal,--wrap=kernel_wait_backend_quiesce,--wrap=kernel_rwlock_write,--wrap=kernel_rwlock_try_write -o $(or $(SOCKET_PROTOCOL_HOST_BUILD),build/host/socket-protocol)/scope
 	$(or $(SOCKET_PROTOCOL_HOST_BUILD),build/host/socket-protocol)/scope
 
 .PHONY: user-smp-host test-user-smp-fair-host
 user-smp-host:
 	@mkdir -p build/host
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -Itests/host/sync -idirafter include tests/host/user_smp.c tests/host/user_stop.c kernel/signal_pending.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/sched/lifetime.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release,--wrap=kernel_scheduler_wake_signal,--wrap=kernel_wait_backend_quiesce -o build/host/user-smp
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -Itests/host/sync -idirafter include tests/host/user_smp.c tests/host/user_stop.c kernel/signal_pending.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/seccomp.c kernel/sched/seccomp.c kernel/sched/lifetime.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release,--wrap=kernel_scheduler_wake_signal,--wrap=kernel_wait_backend_quiesce -o build/host/user-smp
 
 test-user-smp-fair-host: user-smp-host
 	build/host/user-smp --fair-balance-only
@@ -2395,3 +2395,7 @@ test-gpt-host:
 	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_gpt.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-gpt
 	build/host/block-gpt build/host/gpt.img
 	python3 tests/host/gpt-blkid.py build/host/gpt.img
+
+.PHONY: test-seccomp-host
+test-seccomp-host:
+	sh tests/host/seccomp.sh

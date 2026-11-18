@@ -1,6 +1,8 @@
 #include "private.h"
 
 #include <kernel/cost.h>
+#include <kernel/seccomp.h>
+#include <kernel/task_state.h>
 #include <kernel/errno.h>
 #include <kernel/pidfd.h>
 #include <kernel/kcmp.h>
@@ -204,7 +206,11 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
     struct kernel_syscall_result *result)
 {
     struct kernel_syscall_result decoded;
-    if (request->number == 280U) {
+    if (request->number == 277U) {
+        decoded.action=KERNEL_SYSCALL_ACTION_RETURN;
+        decoded.value=kernel_seccomp_syscall(caller,(uint32_t)request->arguments[0],
+            (uint32_t)request->arguments[1],request->arguments[2]);
+    } else if (request->number == 280U) {
         decoded.action=KERNEL_SYSCALL_ACTION_RETURN;
         decoded.value=kernel_bpf_syscall(caller,(uint32_t)request->arguments[0],request->arguments[1],(uint32_t)request->arguments[2]);
     } else if (request->number == 241U) {
@@ -879,6 +885,9 @@ enum kernel_syscall_status kernel_syscall_dispatch(
     COST_SCOPE(syscall_cost, OPERATION_TICKS);
     COST_ADD(OPERATIONS, 1);
 #endif
+    if (__atomic_load_n(&caller->seccomp_mode,__ATOMIC_RELAXED) && kernel_seccomp_check(caller,request,result))
+        return KERNEL_SYSCALL_STATUS_OK;
+    kernel_bpf_trace_enter(caller,(int32_t)request->number,request->arguments);
     /* 身份查询只读取调用线程的现有身份，直接完成这组标量调用，
      * 避免经过业务分发表后再次分发。权限/身份读取仍由原操作负责。 */
     if (request->number >= LINUX_SYSCALL_GETPID &&

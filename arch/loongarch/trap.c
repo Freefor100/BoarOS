@@ -135,10 +135,9 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
            kernel_cpu_current()->current!=caller)la_virt_fatal("syscall owner");
         if (__atomic_load_n(&caller->ptrace, __ATOMIC_ACQUIRE) &&
             !kernel_ptrace_syscall_enter(caller, frame)) return;
-        struct kernel_syscall_request request={.number=frame->regs[11],.user_sp=frame->regs[3]};
+        struct kernel_syscall_request request={.number=frame->regs[11],.user_sp=frame->regs[3],.instruction_pointer=frame->era+4};
         for (unsigned i=0;i<6;i++) request.arguments[i]=frame->regs[4+i];
         struct kernel_syscall_result result;
-        kernel_bpf_trace_enter(caller,request.number,request.arguments);
         if (kernel_syscall_dispatch(caller,&request,&result)!=KERNEL_SYSCALL_STATUS_OK) la_virt_fatal("syscall dispatch");
         switch (result.action) {
         case KERNEL_SYSCALL_ACTION_EXIT_GROUP: kernel_user_group_exit(KERNEL_THREAD_EXIT_SYSCALL,result.value,0);
@@ -175,11 +174,11 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
             kernel_bpf_trace_exit(kernel_task_current(),frame->regs[11],(int64_t)frame->regs[4]);
             if(kernel_task_current()->ptrace)kernel_ptrace_syscall_exit(kernel_task_current(),frame,request.number);
             return;
-        case KERNEL_SYSCALL_ACTION_RETURN: break;
+        case KERNEL_SYSCALL_ACTION_RETURN: case KERNEL_SYSCALL_ACTION_RETURN_FINAL: break;
         default: la_virt_fatal("unsupported internal syscall action");
         }
         kernel_bpf_trace_exit(kernel_task_current(),request.number,result.value);
-        if (result.value==-KERNEL_ERESTARTSYS) {
+        if (result.action!=KERNEL_SYSCALL_ACTION_RETURN_FINAL && result.value==-KERNEL_ERESTARTSYS) {
             if(caller->ptrace) {
                 uint64_t argument=frame->regs[4];
                 frame->regs[4]=(uint64_t)result.value;frame->era+=4;

@@ -257,7 +257,7 @@ enum kernel_exec_status kernel_task_exec_finish(
     return KERNEL_EXEC_STATUS_OK;
 }
 
-int kernel_task_ptrace_exec_busy_locked(struct kernel_task *task)
+int kernel_task_exec_busy_locked(struct kernel_task *task)
 {
     if(!kernel_raw_lock_owned(&kernel_wait_domain))__builtin_trap();
     if(task->proc_exiting || !task->exec_transaction)return 0;

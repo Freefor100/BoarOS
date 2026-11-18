@@ -259,6 +259,7 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
         struct kernel_syscall_request request = {
             .number = frame->a7,
             .user_sp = frame->sp,
+            .instruction_pointer = frame->sepc+4,
             .arguments = {
                 frame->a0,
                 frame->a1,
@@ -269,7 +270,6 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
             },
         };
         struct kernel_syscall_result result;
-        kernel_bpf_trace_enter(caller,(int32_t)request.number,request.arguments);
 #if BOAROS_USER_SMP
         kernel_cpu_current()->syscall_dispatches++;
 #endif
@@ -363,11 +363,12 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
             if(kernel_task_current()->ptrace)kernel_ptrace_syscall_exit(kernel_task_current(),frame,request.number);
             return;
         }
-        if (result.action != KERNEL_SYSCALL_ACTION_RETURN) {
+        if (result.action != KERNEL_SYSCALL_ACTION_RETURN &&
+            result.action != KERNEL_SYSCALL_ACTION_RETURN_FINAL) {
             riscv_trap_fatal(frame);
         }
         kernel_bpf_trace_exit(kernel_task_current(),(int32_t)request.number,result.value);
-        if (result.value == -KERNEL_ERESTARTSYS) {
+        if (result.action != KERNEL_SYSCALL_ACTION_RETURN_FINAL && result.value == -KERNEL_ERESTARTSYS) {
             if(caller->ptrace) {
                 uint64_t argument=frame->a0;
                 frame->a0=(uint64_t)result.value;frame->sepc+=4;

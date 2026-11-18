@@ -2054,9 +2054,9 @@ void kernel_signal_restore_temporary_mask(
     }
 }
 
-void kernel_signal_force_fault(struct kernel_task *task, uint32_t sig,
-    int32_t code, uint64_t address)
+static void signal_force_sync(struct kernel_task *task, struct kernel_signal_fault fault)
 {
+    uint32_t sig = fault.signal;
     if (task != kernel_cpu_current()->current || !signal_dispatchable(task) ||
         !sig || sig > KERNEL_SIGNAL_COUNT || task->signal_fault.signal) __builtin_trap();
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
@@ -2068,10 +2068,23 @@ void kernel_signal_force_fault(struct kernel_task *task, uint32_t sig,
         if (table) table->actions[sig - 1] = (struct kernel_signal_action){0};
         task->signal_blocked &= ~mask;
     }
-    task->signal_fault = (struct kernel_signal_fault){sig, code, address};
+    task->signal_fault = fault;
 #if BOAROS_USER_SMP
     scheduler_signal_request_locked(task);
 #endif
+}
+
+void kernel_signal_force_fault(struct kernel_task *task, uint32_t sig,
+    int32_t code, uint64_t address)
+{
+    signal_force_sync(task,(struct kernel_signal_fault){
+        .signal=sig,.code=code,.address=address});
+}
+void kernel_signal_force_seccomp(struct kernel_task *task, uint64_t address,
+    int32_t syscall, uint32_t arch, uint16_t error)
+{
+    signal_force_sync(task,(struct kernel_signal_fault){
+        .signal=31,.code=1,.address=address,.error=error,.syscall=syscall,.arch=arch});
 }
 
 static inline int signal_return_work(const struct kernel_task *task)
@@ -2140,7 +2153,9 @@ static __attribute__((noinline)) enum kernel_signal_select_result signal_select_
                 } else {
                     if(fault.signal) {
                         task->signal_fault=(struct kernel_signal_fault){0};
-                        *info=(struct kernel_signal_wait_info){.signal=sig,.code=fault.code,.address=fault.address};
+                        *info=(struct kernel_signal_wait_info){.signal=sig,.code=fault.code,
+                            .error=fault.error,.call_address=fault.address,
+                            .syscall=fault.syscall,.arch=fault.arch};
                     } else signal_pending_take_locked(shared?leader:task,shared,sig,info,&p);
                     if (info->signal && !trace_signal && action.handler!=KERNEL_SIGNAL_DFL &&
                         action.handler!=KERNEL_SIGNAL_IGN)
