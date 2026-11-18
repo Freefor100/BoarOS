@@ -2133,9 +2133,11 @@ static int apply_namespace_create(void *context)
         if (result) return result;
         memset(file, 0, sizeof(*file));
     }
-    int result=ext4_create_child(request->mount, request->parent, request->path,
+    int result=request->path ? ext4_create_child(request->mount, request->parent, request->path,
         request->mode | request->type, request->device, request->target, file,
-        request->initial, request->uid, request->gid);
+        request->initial, request->uid, request->gid) :
+        ext4_tmpfile_child(request->mount, request->parent, request->mode | request->type,
+            file, request->initial, request->uid, request->gid);
     if (!result && request->access_acl)
         result=ext4_file_set_acl(file,EXT4_XATTR_INDEX_POSIX_ACL_ACCESS,
             request->access_acl,request->access_size,false,false,0);
@@ -2229,11 +2231,13 @@ static int apply_namespace_rename(void *context)
     return ext4_rename_child(request->mount,request->old_parent,request->old_name,strlen(request->old_name),
         request->new_parent,request->new_name,strlen(request->new_name),request->flags,&request->result);
 }
-struct namespace_link { const char *mount,*name;uint32_t source,parent; };
+struct namespace_link { const char *mount,*name;uint32_t source,parent; bool tmpfile; };
 static int apply_namespace_link(void *context)
 {
     struct namespace_link *request=context;
-    return ext4_link_child(request->mount,request->source,request->parent,request->name,strlen(request->name));
+    return request->tmpfile ?
+        ext4_tmpfile_link_child(request->mount,request->source,request->parent,request->name,strlen(request->name)) :
+        ext4_link_child(request->mount,request->source,request->parent,request->name,strlen(request->name));
 }
 
 
@@ -2248,7 +2252,7 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
     int result;
 
     if (mount == 0 || mount->state != VFS_MOUNT_STATE_LIVE ||
-        mount->private_data == 0 || path == 0 || !parent_inode || parent_inode > UINT32_MAX ||
+        mount->private_data == 0 || !parent_inode || parent_inode > UINT32_MAX ||
         file == 0 || file->state != VFS_FILE_STATE_EMPTY ||
         file->private_data != 0) {
         return -KERNEL_EINVAL;
@@ -2292,8 +2296,13 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
     node->attributes=ext4_inode_get_flags(&initial)&KERNEL_VFS_INODE_ATTRIBUTES;
     initialize_times(node, adapter, &initial);
     ((struct lwext4_node *)node)->capability_absent=1;
+    node->unlinked = path == NULL;
     return kernel_vfs_publish_node(mount, node, file, 1);
 }
+
+static int ext4_backend_tmpfile(struct kernel_vfs_mount *mount, uint64_t parent,
+    uint32_t mode, struct kernel_vfs_file *file, uint32_t umask)
+{ return ext4_backend_create(mount, parent, NULL, mode, file, umask); }
 
 static int time_access_needed(const struct lwext4_node *node, struct ext4_timestamp now,unsigned policy)
 {
@@ -3027,7 +3036,16 @@ static int ext4_backend_link(struct kernel_vfs_instance *instance,
 {
     if (source > UINT32_MAX || parent > UINT32_MAX) return -KERNEL_EINVAL;
     const char *mount=lwext4_instance(instance)->mount_point;
-    struct namespace_link request={mount,name,source,parent};
+    struct namespace_link request={mount,name,source,parent,false};
+    return lwext4_error(ext4_metadata_execute(mount,apply_namespace_link,&request));
+}
+
+static int ext4_backend_link_tmpfile(struct kernel_vfs_instance *instance,
+    uint64_t source, uint64_t parent, const char *name)
+{
+    if (source > UINT32_MAX || parent > UINT32_MAX) return -KERNEL_EINVAL;
+    const char *mount=lwext4_instance(instance)->mount_point;
+    struct namespace_link request={mount,name,source,parent,true};
     return lwext4_error(ext4_metadata_execute(mount,apply_namespace_link,&request));
 }
 
@@ -3064,6 +3082,7 @@ static void initialize_backend(void)
     ops->mknod = ext4_backend_mknod;
     ops->rename = ext4_backend_rename;
     ops->link = ext4_backend_link;
+    ops->link_tmpfile = ext4_backend_link_tmpfile;
     ops->unmount = ext4_backend_unmount;
     ops->prepare_unmount = ext4_backend_prepare_unmount;
     ops->remount = ext4_backend_remount;
@@ -3079,6 +3098,7 @@ static void initialize_backend(void)
     ops->killpriv=ext4_backend_killpriv;
     ops->open = ext4_backend_open;
     ops->create = ext4_backend_create;
+    ops->tmpfile = ext4_backend_tmpfile;
     ops->accessed = ext4_backend_accessed;
     ops->modified = ext4_backend_modified;
     ops->stat = ext4_backend_stat;

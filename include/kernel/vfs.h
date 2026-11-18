@@ -217,6 +217,7 @@ enum kernel_vfs_open_flags {
     KERNEL_VFS_OPEN_REGULAR = 1U << 6,
     KERNEL_VFS_OPEN_NOATIME = 1U << 7,
     KERNEL_VFS_OPEN_APPEND = 1U << 8,
+    KERNEL_VFS_OPEN_TMPFILE = 1U << 9,
 };
 enum kernel_vfs_resolve_flags {
     KERNEL_VFS_RESOLVE_NO_XDEV = 1U << 0,
