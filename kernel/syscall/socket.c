@@ -430,16 +430,21 @@ static int sockopt(struct kernel_socket *socket, struct kernel_files *files, str
     if (length < 0) return -KERNEL_EINVAL;
     /* TCP publishes optlen before touching optval (Linux tcp.c). */
     int tcp_extended = level == LINUX_IPPROTO_TCP &&
-        (name >= 4 && name <= 6);
+        ((name >= 4 && name <= 6) || name == 11);
     if (tcp_extended) {
         if (!kernel_socket_is_tcp(socket))
             return get || kernel_socket_is_unix(socket) ? -KERNEL_EOPNOTSUPP : -KERNEL_ENOPROTOOPT;
         if (get) {
-            int value;
-            uint32_t capacity = (uint32_t)length, output = sizeof(value);
-            int error = socket_option(level, name, &option);
-            if (!error) error = kernel_socket_get_option(socket, option, &value);
-            const void *data = &value;
+            int value,error;struct kernel_socket_tcp_info info;
+            uint32_t capacity = (uint32_t)length, output;
+            const void *data;
+            if(name==11) {
+                error=kernel_socket_tcp_info(socket,&info);data=&info;output=sizeof(info);
+            } else {
+                error=socket_option(level,name,&option);
+                if(!error)error=kernel_socket_get_option(socket,option,&value);
+                data=&value;output=sizeof(value);
+            }
             if (error) return error;
             if (output > capacity) output = capacity;
             if (kernel_copy_to_user(mm, request->arguments[4], &output, sizeof(output), &copied) !=
@@ -448,6 +453,13 @@ static int sockopt(struct kernel_socket *socket, struct kernel_files *files, str
                     KERNEL_UACCESS_STATUS_OK || copied != output)) return -KERNEL_EFAULT;
             return 0;
         }
+    }
+    if(level==LINUX_IPPROTO_TCP && name==11) {
+        int value;
+        if(length<(int32_t)sizeof(value))return -KERNEL_EINVAL;
+        if(kernel_copy_from_user(mm,&value,request->arguments[3],sizeof(value),&copied)!=
+            KERNEL_UACCESS_STATUS_OK || copied!=sizeof(value))return -KERNEL_EFAULT;
+        return -KERNEL_ENOPROTOOPT;
     }
     if (level == LINUX_SOL_SOCKET && name == 25)
         return device_sockopt(socket, mm, request, get, length);

@@ -175,6 +175,8 @@ void boaros_lwip_loopback_publish(struct netif *netif)
 { if (protocol_hooks.loopback_publish) protocol_hooks.loopback_publish(netif); }
 void boaros_lwip_capacity_available(int pool)
 { if (protocol_hooks.capacity) protocol_hooks.capacity(pool); }
+void boaros_lwip_tcp_info_retire(struct tcp_pcb *pcb)
+{ if(protocol_hooks.tcp_info_retire)protocol_hooks.tcp_info_retire(pcb); }
 void boaros_lwip_tcp_timewait_free(struct tcp_pcb *pcb)
 { if (protocol_hooks.timewait_free) protocol_hooks.timewait_free(pcb); }
 struct boaros_lwip_tcp_context *boaros_lwip_tcp_context_lookup(void)

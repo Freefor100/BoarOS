@@ -23,6 +23,11 @@ bind/connect 和占用端口，使用真实 lwIP 源码，固定版本不变。
 
 TCP 输出另增加应用级 MORE 模式、持久 CORK 策略、PCB 内绝对短尾期限与 push 序号。普通 ACK 输出仍使用默认 Nagle/Minshall，MORE 仅抑制首次发送的未满尾段；重传和控制包不被等待尾段阻塞。BoarOS worker 只将已暂留的 PCB 按期限排队并有预算地推进到期输出，既有 owner 迁移不重置时间；不升级固定 lwIP 版本，也不增加独立计时引用。验证入口与语义边界见[网络模块](modules/kernel-network.md)。
 
+TCP_INFO 另在 `BOAROS_LWIP_TCP_INFO` 下增加成功输出/接收/确认事件记账、segment
+已发送 payload 前缀、owner 时间重基和释放前快照 hook。累计重传不使用会重置的
+nrtx，原始 SYN、输出失败、分段与追加数据分别处理；复用旧 TCP 时钟，不引入
+逐包读钟或新定时任务。字段语义、零值和精度边界见[网络模块](modules/kernel-network.md)。
+
 ## lwext4
 
 - 上游地址：<https://github.com/gkostka/lwext4>

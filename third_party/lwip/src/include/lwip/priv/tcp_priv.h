@@ -263,12 +263,18 @@ struct tcp_seg {
   u8_t  chksum_swapped;
 #endif /* TCP_CHECKSUM_ON_COPY */
   u8_t  flags;
+#define TF_SEG_LOST             (u8_t)0x80U /* declared lost; retained through retransmit until ACK */
+#define TF_SEG_SENT             (u8_t)0x40U /* successful initial output */
+#define TF_SEG_RETRANSMITTED    (u8_t)0x20U /* successful retransmit, for TCP_INFO */
 #define TF_SEG_OPTS_MSS         (u8_t)0x01U /* Include MSS option (only used in SYN segments) */
 #define TF_SEG_OPTS_TS          (u8_t)0x02U /* Include timestamp option. */
 #define TF_SEG_DATA_CHECKSUMMED (u8_t)0x04U /* ALL data (not the header) is
                                                checksummed into 'chksum' */
 #define TF_SEG_OPTS_WND_SCALE   (u8_t)0x08U /* Include WND SCALE option (only used in SYN segments) */
 #define TF_SEG_OPTS_SACK_PERM   (u8_t)0x10U /* Include SACK Permitted option (only used in SYN segments) */
+#ifdef BOAROS_LWIP_TCP_INFO
+  u16_t boaros_sent_bytes; /* successful payload prefix, including persist probes */
+#endif
   struct tcp_hdr *tcphdr;  /* the TCP header */
 };
 

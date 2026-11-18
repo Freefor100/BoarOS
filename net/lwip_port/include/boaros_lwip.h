@@ -16,6 +16,7 @@ struct boaros_lwip_hooks {
     void (*loopback_publish)(struct netif *);
     void (*capacity)(int);
     void (*timewait_free)(struct tcp_pcb *);
+    void (*tcp_info_retire)(struct tcp_pcb *);
     struct boaros_lwip_tcp_context *(*tcp_context)(void);
     int (*tcp_dispatch)(struct pbuf *, struct netif *, const struct ip_addr *, const struct ip_addr *);
     /* Before adding the IP header, with the TCP owner held. The hook must
@@ -33,6 +34,7 @@ void boaros_lwip_work_ready(void);
 void boaros_lwip_loopback_publish(struct netif *);
 void boaros_lwip_capacity_available(int pool);
 void boaros_lwip_tcp_timewait_free(struct tcp_pcb *pcb);
+void boaros_lwip_tcp_info_retire(struct tcp_pcb *pcb);
 struct boaros_lwip_tcp_context *boaros_lwip_tcp_context_lookup(void);
 int boaros_lwip_tcp_dispatch(struct pbuf *, struct netif *, const struct ip_addr *, const struct ip_addr *);
 int boaros_lwip_tcp_local_output(const struct tcp_pcb *, struct pbuf *, struct netif *,

@@ -235,6 +235,22 @@ enum kernel_socket_option {
     KERNEL_SOCKET_KEEPIDLE, KERNEL_SOCKET_KEEPINTVL, KERNEL_SOCKET_KEEPCNT,
     KERNEL_SOCKET_BROADCAST, KERNEL_SOCKET_IPV4_TTL, KERNEL_SOCKET_MULTICAST_TTL,
 };
+/* Linux TCP_INFO ABI through snd_wnd (232 bytes). */
+struct kernel_socket_tcp_info {
+    uint8_t state, ca_state, retransmits, probes, backoff, options, scales, flags;
+    uint32_t rto_us, ato_us, snd_mss, rcv_mss;
+    uint32_t unacked, sacked, lost, retrans, fackets;
+    uint32_t last_data_sent, last_ack_sent, last_data_recv, last_ack_recv;
+    uint32_t pmtu, rcv_ssthresh, rtt_us, rttvar_us, snd_ssthresh, snd_cwnd;
+    uint32_t advmss, reordering, rcv_rtt_us, rcv_space, total_retrans;
+    uint64_t pacing_rate, max_pacing_rate, bytes_acked, bytes_received;
+    uint32_t segs_out, segs_in, notsent_bytes, min_rtt_us, data_segs_in, data_segs_out;
+    uint64_t delivery_rate, busy_time, rwnd_limited, sndbuf_limited;
+    uint32_t delivered, delivered_ce;
+    uint64_t bytes_sent, bytes_retrans;
+    uint32_t dsack_dups, reord_seen, rcv_ooopack, snd_wnd;
+};
+int kernel_socket_tcp_info(struct kernel_socket *, struct kernel_socket_tcp_info *);
 int kernel_socket_set_option(struct kernel_socket *socket,
                              enum kernel_socket_option option, int value);
 /* Names are kernel strings bounded by IFNAMSIZ. Interface identities are

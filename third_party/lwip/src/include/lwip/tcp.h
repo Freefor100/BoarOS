@@ -299,6 +299,17 @@ struct tcp_pcb {
   u8_t last_timer;
   u32_t tmr;
 
+#ifdef BOAROS_LWIP_TCP_INFO
+  /* Event accounting uses the existing coarse TCP clock, never a new clock read. */
+  u32_t boaros_total_retrans;
+  u32_t boaros_segs_in, boaros_segs_out, boaros_data_in, boaros_data_out;
+  u32_t boaros_delivered, boaros_ooopack, boaros_min_rtt;
+  u64_t boaros_bytes_acked, boaros_bytes_received, boaros_bytes_sent, boaros_bytes_retrans;
+  u32_t boaros_last_sent, boaros_last_recv, boaros_last_ack;
+  u16_t boaros_rcv_mss, boaros_advmss, boaros_pmtu;
+  u8_t boaros_rto_retries, boaros_rto_backoff;
+#endif
+
   /* receiver variables */
   u32_t rcv_nxt;   /* next seqno expected */
   tcpwnd_size_t rcv_wnd;   /* receiver window available */

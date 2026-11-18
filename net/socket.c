@@ -116,6 +116,8 @@ struct kernel_socket {
     uint8_t reuseaddr;
     uint8_t keepalive;
     uint32_t keep_idle, keep_intvl, keep_cnt;
+    struct kernel_socket_tcp_info retired_info;
+    uint32_t retired_info_ms;
     uint8_t nodelay, cork;
     uint8_t broadcast, ipv4_ttl, multicast_ttl;
     uint8_t bound_device, multicast_index;
@@ -266,6 +268,7 @@ static int socket_ingress_filter(struct kernel_socket *socket,struct pbuf *p,str
 
 static void udp_received(void *,struct udp_pcb *,struct pbuf *,const ip_addr_t *,u16_t);
 static void tcp_failed(void *,err_t);
+static void socket_tcp_info_retire(struct tcp_pcb *);
 static err_t socket_tcp_accepted(void *,struct tcp_pcb *,err_t);
 
 static struct kernel_socket *tcp_filter_socket(const struct tcp_pcb *pcb)
@@ -1444,6 +1447,7 @@ static void retire_timewait(struct kernel_socket *socket)
     struct tcp_pcb *pcb = socket->tcp;
     if (!pcb || socket->listening || pcb->state != TIME_WAIT) return;
     /* 释放 hook 也走这里：只清借用与回调，不重入 raw API 或销毁堆 owner。 */
+    socket_tcp_info_retire(pcb);
     pcb->callback_arg = 0; pcb->errf = 0;
     pcb->recv = 0; pcb->sent = 0; pcb->poll = 0; pcb->pollinterval = 0;
     pcb->connected = 0;
@@ -4569,6 +4573,96 @@ int kernel_socket_set_option(struct kernel_socket *socket,
     return result;
 }
 
+/* Called only while the PCB's protocol owner is held. Queue-derived statistics
+ * are sampled on query/retirement, never by walking queues on normal packets. */
+static void tcp_info_snapshot(const struct tcp_pcb *pcb, struct kernel_socket_tcp_info *info)
+{
+    static const uint8_t states[]={7,10,2,3,1,4,5,8,9,11,6};
+    *info=(struct kernel_socket_tcp_info){.pacing_rate=UINT64_MAX,.max_pacing_rate=UINT64_MAX};
+    if((unsigned)pcb->state>=sizeof(states))__builtin_trap();
+    info->state=states[pcb->state];
+    if(pcb->state==LISTEN)return;
+    info->ca_state=(pcb->flags&TF_RTO)?4:(pcb->flags&TF_INFR)?3:pcb->dupacks?1:0;
+    info->retransmits=pcb->boaros_rto_retries;
+    info->backoff=pcb->persist_backoff?(uint8_t)(pcb->persist_backoff-1):pcb->boaros_rto_backoff;
+    info->probes=pcb->persist_backoff?pcb->persist_probe:pcb->keep_cnt_sent;
+#if LWIP_TCP_TIMESTAMPS
+    if(pcb->flags&TF_TIMESTAMP)info->options|=1;
+#endif
+#if LWIP_TCP_SACK_OUT
+    if(pcb->flags&TF_SACK)info->options|=2;
+#endif
+#if LWIP_WND_SCALE
+    if(pcb->flags&TF_WND_SCALE) {
+        info->options|=4;info->scales=(uint8_t)(pcb->snd_scale|(pcb->rcv_scale<<4));
+    }
+#endif
+    info->rto_us=(uint32_t)pcb->rto*TCP_SLOW_INTERVAL*1000U;
+    info->ato_us=TCP_FAST_INTERVAL*1000U;
+    info->snd_mss=tcp_mss(pcb);info->rcv_mss=pcb->boaros_rcv_mss;
+    for(const struct tcp_seg *seg=pcb->unacked;seg;seg=seg->next) {
+        info->unacked++;if(seg->flags&TF_SEG_RETRANSMITTED)info->retrans++;
+        if(seg->flags&TF_SEG_LOST)info->lost++;
+    }
+    for(const struct tcp_seg *seg=pcb->unsent;seg;seg=seg->next) {
+        info->notsent_bytes+=seg->len-seg->boaros_sent_bytes;
+        if(seg->flags&TF_SEG_SENT) {
+            info->unacked++;if(seg->flags&TF_SEG_LOST)info->lost++;
+        }
+    }
+    info->last_data_sent=(tcp_ticks-pcb->boaros_last_sent)*TCP_SLOW_INTERVAL;
+    info->last_data_recv=(tcp_ticks-pcb->boaros_last_recv)*TCP_SLOW_INTERVAL;
+    info->last_ack_recv=(tcp_ticks-pcb->boaros_last_ack)*TCP_SLOW_INTERVAL;
+    info->pmtu=pcb->boaros_pmtu;
+    info->rcv_ssthresh=info->rcv_space=pcb->boaros_rcv_capacity;
+    info->rtt_us=(uint32_t)pcb->sa*TCP_SLOW_INTERVAL*1000U/8U;
+    info->rttvar_us=(uint32_t)pcb->sv*TCP_SLOW_INTERVAL*1000U/4U;
+    if(info->snd_mss) {
+        info->snd_ssthresh=pcb->ssthresh/info->snd_mss;
+        info->snd_cwnd=pcb->cwnd/info->snd_mss;
+    }
+    info->advmss=pcb->boaros_advmss;info->reordering=3;
+    info->total_retrans=pcb->boaros_total_retrans;
+    info->bytes_acked=pcb->boaros_bytes_acked;info->bytes_received=pcb->boaros_bytes_received;
+    info->segs_in=pcb->boaros_segs_in;info->segs_out=pcb->boaros_segs_out;
+    info->data_segs_in=pcb->boaros_data_in;info->data_segs_out=pcb->boaros_data_out;
+    info->bytes_sent=pcb->boaros_bytes_sent;info->bytes_retrans=pcb->boaros_bytes_retrans;
+    info->min_rtt_us=pcb->boaros_min_rtt;info->delivered=pcb->boaros_delivered;
+    info->rcv_ooopack=pcb->boaros_ooopack;info->snd_wnd=pcb->snd_wnd;
+    /* No rate/chronograph sampling, ECN/DSACK processing, or sender reorder
+     * detection is enabled; their fields remain zero, not measured results. */
+    /* No SACK scoreboard, FACK, or receive-side RTT estimator in this stack.
+     * last_ack_sent is also unrecorded (Linux keeps this ABI field zero). */
+}
+static void socket_tcp_info_retire(struct tcp_pcb *pcb)
+{
+    if(pcb->errf!=tcp_failed || !pcb->callback_arg)return;
+    struct kernel_socket *socket=pcb->callback_arg;
+    tcp_info_snapshot(pcb,&socket->retired_info);
+    socket->retired_info.state=7;
+    socket->retired_info_ms=sys_now();
+}
+int kernel_socket_tcp_info(struct kernel_socket *socket, struct kernel_socket_tcp_info *info)
+{
+    if(!kernel_socket_is_tcp(socket))return -KERNEL_ENOPROTOOPT;
+    _Static_assert(sizeof(*info)==232,"Linux TCP_INFO through snd_wnd");
+    _Static_assert(offsetof(struct kernel_socket_tcp_info,total_retrans)==100,"Linux total_retrans offset");
+    _Static_assert(offsetof(struct kernel_socket_tcp_info,snd_wnd)==228,"Linux snd_wnd offset");
+    struct kernel_socket_protocol_scope protocol;socket_protocol_enter(&protocol,socket);
+    if(socket->tcp) {
+        tcp_info_snapshot(socket->tcp,info);
+        if(socket->listening) {
+            info->unacked=socket->pending_live;
+            info->sacked=((struct tcp_pcb_listen *)socket->tcp)->backlog;
+        }
+    } else {
+        *info=socket->retired_info;info->state=7;
+        uint32_t elapsed=sys_now()-socket->retired_info_ms;
+        info->last_data_sent+=elapsed;info->last_data_recv+=elapsed;info->last_ack_recv+=elapsed;
+    }
+    kernel_socket_protocol_leave(&protocol);return 0;
+}
+
 int kernel_socket_get_option(struct kernel_socket *socket,
                              enum kernel_socket_option option, int *value)
 {
@@ -4909,7 +5003,7 @@ void kernel_socket_network_initialize(void)
     if (!socket_initialized) {
         const struct boaros_lwip_hooks hooks = {
             .tcp_output = socket_tcp_output, .work = protocol_work_ready, .capacity = protocol_capacity,
-            .timewait_free = protocol_timewait_free,
+            .timewait_free = protocol_timewait_free, .tcp_info_retire = socket_tcp_info_retire,
             .udp_ingress_filter = socket_udp_ingress_filter, .tcp_ingress_filter = socket_tcp_ingress_filter,
 #if BOAROS_USER_SMP
             .tcp_context = tcp_context, .tcp_dispatch = tcp_dispatch,

@@ -322,6 +322,11 @@ boaros_lwip_tcp_context_move_active(struct boaros_lwip_tcp_context *from,
   pcb->listener = NULL;
 #endif
   pcb->tmr += to->ticks - from->ticks;
+#ifdef BOAROS_LWIP_TCP_INFO
+  pcb->boaros_last_sent += to->ticks - from->ticks;
+  pcb->boaros_last_recv += to->ticks - from->ticks;
+  pcb->boaros_last_ack += to->ticks - from->ticks;
+#endif
   if (pcb->rttest) {
     pcb->rttest += to->ticks - from->ticks;
     if (!pcb->rttest) pcb->rttest = 1;
@@ -403,6 +408,9 @@ tcp_free(struct tcp_pcb *pcb)
 {
   LWIP_ASSERT("tcp_free: LISTEN", pcb->state != LISTEN);
   LWIP_ASSERT("tcp_free: pending cork deadline", !pcb->boaros_cork_pending);
+#ifdef BOAROS_LWIP_TCP_INFO
+  boaros_lwip_tcp_info_retire(pcb);
+#endif
 #ifdef BOAROS_LWIP_TCP_CONTEXT
   if (pcb->boaros_owner) boaros_lwip_tcp_pcb_forget(pcb);
 #endif
@@ -1578,6 +1586,9 @@ tcp_slowtmr_start:
               u8_t backoff_idx = LWIP_MIN(pcb->nrtx, sizeof(tcp_backoff) - 1);
               int calc_rto = ((pcb->sa >> 3) + pcb->sv) << tcp_backoff[backoff_idx];
               pcb->rto = (s16_t)LWIP_MIN(calc_rto, 0x7FFF);
+#ifdef BOAROS_LWIP_TCP_INFO
+              pcb->boaros_rto_backoff = tcp_backoff[backoff_idx];
+#endif
             }
 
             /* Reset the retransmission timer. */
@@ -1597,6 +1608,9 @@ tcp_slowtmr_start:
 
             /* The following needs to be called AFTER cwnd is set to one
                mss - STJ */
+#ifdef BOAROS_LWIP_TCP_INFO
+            if (pcb->boaros_rto_retries != 255) pcb->boaros_rto_retries++;
+#endif
             tcp_rexmit_rto_commit(pcb);
           }
         }
@@ -2201,6 +2215,10 @@ tcp_alloc(u8_t prio)
     pcb->rtime = -1;
     pcb->cwnd = 1;
     pcb->tmr = tcp_ticks;
+#ifdef BOAROS_LWIP_TCP_INFO
+    pcb->boaros_last_sent = pcb->boaros_last_recv = pcb->boaros_last_ack = tcp_ticks;
+    pcb->boaros_min_rtt = 0xffffffffU;
+#endif
     pcb->last_timer = tcp_timer_ctr;
 
     /* RFC 5681 recommends setting ssthresh arbitrarily high and gives an example
