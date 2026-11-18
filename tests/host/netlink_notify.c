@@ -71,10 +71,10 @@ static struct kernel_socket *create_receiver(int type,
     struct kernel_socket_address address={0};
     assert(!kernel_socket_getname(socket,&address) && address.family==KERNEL_SOCKET_AF_NETLINK &&
         !address.scope && !address.port);
-    assert(kernel_socket_bind(socket,&address)==-KERNEL_EOPNOTSUPP &&
+    assert(!kernel_socket_bind(socket,&address) &&
         kernel_socket_connect(socket,&address,0)==-KERNEL_EOPNOTSUPP &&
         kernel_socket_shutdown(socket,2)==-KERNEL_EOPNOTSUPP);
-    assert(kernel_socket_write_packet_buffer(pin,"route",5,0)==-KERNEL_EOPNOTSUPP);
+    assert(kernel_socket_write_packet_buffer(pin,"route",5,0)==5);
     assert(!(kernel_socket_poll(socket,NULL)&KERNEL_POLLIN));
     return socket;
 }
