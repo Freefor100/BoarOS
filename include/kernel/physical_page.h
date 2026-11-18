@@ -142,10 +142,16 @@ unsigned physical_page_allocate_batch(struct physical_page_allocator *,
 void physical_page_release_batch(struct physical_page_allocator *allocator,
     const uint64_t *addresses, unsigned count);
 
+/* Mixed-order finalized owners, one allocator critical section. Every address
+ * is an owned head and each byte-sized order must exactly match its allocation.
+ * Repeated heads consume separate owned references, as with release_batch. */
+void physical_page_release_order_batch(struct physical_page_allocator *,
+    const uint64_t *addresses, const uint8_t *orders, unsigned count);
+
 void physical_page_acquire_batch(struct physical_page_allocator *allocator,
     const uint64_t *addresses, unsigned count);
 
-/* Only finalized order-zero allocations may gain shared owners. */
+/* Finalized order-zero references retain their page-only contract. */
 /* Caller owns the page through a stable PTE. Return its pre-borrow count;
  * if shared, acquire the copy-source loan under that same protection. */
 uint32_t physical_page_cow_borrow(struct physical_page_allocator *,uint64_t address);
@@ -153,6 +159,23 @@ uint32_t physical_page_cow_borrow(struct physical_page_allocator *,uint64_t addr
 enum physical_page_status physical_page_acquire(
     struct physical_page_allocator *allocator,
     uint64_t address);
+
+/* Whole-allocation references for compound backing. address must be the live
+ * buddy head and order must match its allocation. A tail is never a separate
+ * owner. Each acquired or borrowed reference is returned with release_order
+ * using the same head/order; release_allocation may discover that order.
+ * Caller must already hold a stable reference, or hold the mapping lock
+ * protecting a reference, throughout acquire/borrow. An address/order pair
+ * alone is not an ownership token: allocator locking cannot prevent ABA when
+ * a stale address has been freed and reused for another allocation.
+ * No page-table mapping is installed, and no allocation is split here. */
+enum physical_page_status physical_page_acquire_order(
+    struct physical_page_allocator *, uint64_t address, uint32_t order);
+/* Like cow_borrow, but the retained source is the entire compound allocation.
+ * A return of one does not acquire a second reference. The caller must keep
+ * its original owner and serialize changes to the associated mapping. */
+uint32_t physical_page_cow_borrow_order(
+    struct physical_page_allocator *, uint64_t address, uint32_t order);
 
 enum physical_page_status physical_page_reference_count(
     const struct physical_page_allocator *allocator,

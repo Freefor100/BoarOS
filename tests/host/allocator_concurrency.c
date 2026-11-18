@@ -176,6 +176,26 @@ static void hook_lifetime(void)
     assert(!pthread_barrier_destroy(&hook_entered) && !pthread_barrier_destroy(&hook_continue));
     puts("allocator remote notification survives concurrent hook detach; final context owner returned");
 }
+static uint64_t compound;
+static void *compound_worker(void *argument)
+{
+    unsigned id = (unsigned)(uintptr_t)argument;
+    kernel_cpu_initialize(&cpu, id, &io);
+    assert(!physical_page_acquire_order(&allocator, compound, 4));
+    barrier();
+    /* The original mapping can disappear while remote consumers own pins. */
+    if (!id) assert(!physical_page_release_order(&allocator, compound, 4));
+    barrier();
+    uint32_t refs;
+    assert(!physical_page_reference_count(&allocator, compound, &refs));
+    assert(refs == thread_count);
+    for (unsigned i = 0; i < 16 * BOAROS_PAGE_SIZE; i++)
+        assert(((unsigned char *)(uintptr_t)compound)[i] == 0x6b);
+    barrier();
+    assert(!physical_page_release_order(&allocator, compound, 4));
+    return NULL;
+}
+
 static void run(unsigned threads)
 {
     thread_count = threads;
@@ -193,6 +213,14 @@ static void run(unsigned threads)
     assert(physical_page_allocate(&allocator, &shared) == 0);
     assert(pthread_barrier_init(&gate, 0, thread_count) == 0);
     pthread_t ids[4];
+    uint64_t before_compound = physical_page_available(&allocator);
+    assert(!physical_page_allocate_order(&allocator, 4, &compound));
+    memset((void *)(uintptr_t)compound, 0x6b, 16 * BOAROS_PAGE_SIZE);
+    for (unsigned i = 0; i < threads; i++)
+        assert(!pthread_create(&ids[i], NULL, compound_worker, (void *)(uintptr_t)i));
+    for (unsigned i = 0; i < threads; i++) assert(!pthread_join(ids[i], NULL));
+    assert(physical_page_available(&allocator) == before_compound);
+    assert(!physical_page_allocator_audit(&allocator));
     for (unsigned i = 0; i < threads; i++) assert(pthread_create(&ids[i], 0, worker, (void *)(uintptr_t)i) == 0);
     for (unsigned i = 0; i < threads; i++) assert(pthread_join(ids[i], 0) == 0);
     assert(pthread_barrier_destroy(&gate) == 0);

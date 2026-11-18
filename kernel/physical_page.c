@@ -765,7 +765,7 @@ static int head_valid(const struct physical_page_allocator *a, const struct budd
     if (owner->state == BUDDY_INTERNAL)
         return m->state == PHYSICAL_PAGE_STATE_INTERNAL && !m->reference_count;
     return owner->state == BUDDY_ALLOCATED && m->state == PHYSICAL_PAGE_STATE_ALLOCATED_HEAD &&
-           m->reference_count && (!owner->order || m->reference_count == 1);
+           m->reference_count;
 }
 
 static int free_head_plain(const struct physical_page_allocator *a, uint32_t page, uint32_t order,
@@ -1612,6 +1612,24 @@ void physical_page_release_batch(struct physical_page_allocator *a,
         physical_page_release_buddy(a, addresses[i], 0U, &work);
 }
 
+void physical_page_release_order_batch(struct physical_page_allocator *a,
+    const uint64_t *addresses, const uint8_t *orders, unsigned count)
+{
+    if (!count) return;
+    if (!addresses || !orders || count > PHYSICAL_PAGE_REFERENCE_BATCH_MAX)
+        __builtin_trap();
+    PAGE_METADATA_SCOPE(work, a);
+    if (!allocator_initialized(a) || !physical_page_allocator_is_finalized(a))
+        physical_page_release_fatal(a, addresses[0], orders[0],
+                                    "allocator-state", addresses[0]);
+    for (unsigned i = 0; i < count; i++) {
+        if (orders[i] > PHYSICAL_PAGE_MAX_ORDER)
+            physical_page_release_fatal(a, addresses[i], orders[i],
+                                        "order-range", addresses[i]);
+        physical_page_release_buddy(a, addresses[i], orders[i], &work);
+    }
+}
+
 static uint32_t *page_references_locked(const struct physical_page_allocator *a,uint64_t address,
     uint32_t *page,struct page_work *work)
 {
@@ -1621,19 +1639,21 @@ static uint32_t *page_references_locked(const struct physical_page_allocator *a,
     if (!head_valid(a,&head,work)) __builtin_trap();
     return &a->metadata[*page].reference_count;
 }
-static void acquire_page_locked(struct physical_page_allocator *a,uint64_t address,
-    struct page_work *work)
+static void acquire_order_locked(struct physical_page_allocator *a,uint64_t address,
+    uint32_t order, struct page_work *work)
 {
     uint32_t page;
     uint32_t *references=page_references_locked(a,address,&page,work);
-    if (a->metadata[page].order || *references==UINT32_MAX) __builtin_trap();
+    if (a->metadata[page].order != order || *references==UINT32_MAX) __builtin_trap();
     (*references)++;page_written(work);
 }
-uint32_t physical_page_cow_borrow(struct physical_page_allocator *a,uint64_t address)
+uint32_t physical_page_cow_borrow_order(struct physical_page_allocator *a,
+    uint64_t address, uint32_t order)
 {
     PAGE_METADATA_SCOPE(work,a);
     uint32_t page;
     uint32_t *references=page_references_locked(a,address,&page,&work);
+    if (a->metadata[page].order != order) __builtin_trap();
     uint32_t count=*references;
     if (count>1) {
         if (*references==UINT32_MAX) __builtin_trap();
@@ -1642,11 +1662,22 @@ uint32_t physical_page_cow_borrow(struct physical_page_allocator *a,uint64_t add
     return count;
 }
 
+uint32_t physical_page_cow_borrow(struct physical_page_allocator *a, uint64_t address)
+{ return physical_page_cow_borrow_order(a, address, 0); }
+
+enum physical_page_status physical_page_acquire_order(struct physical_page_allocator *a,
+    uint64_t address, uint32_t order)
+{
+    PAGE_METADATA_SCOPE(work, a);
+    acquire_order_locked(a, address, order, &work);
+    return PHYSICAL_PAGE_STATUS_OK;
+}
+
 enum physical_page_status physical_page_acquire(struct physical_page_allocator *a,
                                                 uint64_t address)
 {
     PAGE_METADATA_SCOPE(work, a);
-    acquire_page_locked(a, address, &work);
+    acquire_order_locked(a, address, 0, &work);
     return PHYSICAL_PAGE_STATUS_OK;
 }
 
@@ -1657,7 +1688,7 @@ void physical_page_acquire_batch(struct physical_page_allocator *a,
     if (!addresses || count > PHYSICAL_PAGE_REFERENCE_BATCH_MAX) __builtin_trap();
     PAGE_METADATA_SCOPE(work, a);
     for (unsigned i = 0; i < count; i++)
-        acquire_page_locked(a, addresses[i], &work);
+        acquire_order_locked(a, addresses[i], 0, &work);
 }
 
 enum physical_page_status

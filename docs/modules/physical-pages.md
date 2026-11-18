@@ -7,7 +7,7 @@
 | 文件 | 当前职责 |
 |---|---|
 | `include/kernel/page.h` | 从构建目标导出页大小和掩码 |
-| `include/kernel/physical_page.h`、`kernel/physical_page.c` | 管理显式分配器对象、bootstrap→buddy 状态迁移、单页共享引用、连续页所有权、压力回收入口和计数 |
+| `include/kernel/physical_page.h`、`kernel/physical_page.c` | 管理显式分配器对象、bootstrap→buddy 状态迁移、单页与整块共享引用、连续页所有权、压力回收入口和计数 |
 | `tests/riscv/physical_page_cases.c` | 验证 bootstrap 兼容、buddy split/coalesce、所有权状态和耗尽语义 |
 | `tests/riscv/physical_page_main.c`、`tests/riscv/page.sh` | 构建并运行独立的 QEMU 聚焦测试内核 |
 | `tests/host/allocator_release.c` | 独立子进程验证非法释放 fatal 和各 guard 的失败诊断 |
@@ -56,9 +56,23 @@ metadata 地址，非法地址或 bootstrap 失败不读取 metadata，也不追
 
 finalized 的 order-0 页可用 `physical_page_acquire()` 增加 32 位引用，
 `physical_page_release()` 只在末引用消失时把页归还 buddy；
-`physical_page_reference_count()` 供缓存回收等调用者查询共享状态。COW使用`physical_page_cow_borrow()`，在同一次分配器保护内读取引用数，并且仅在原引用数大于1时取得复制来源的临时引用；引用数为1时由仍受MM保护的原PTE持有页面，直接恢复写权限。这样不再将引用数查询与来源借用分成两次查找和取锁。普通零阶页按 PFN 定位元数据，在分配器锁内检查活块头并增减引用；非末引用释放不查询 buddy 祖先，末次释放才进入完整树验证和合并。分配、释放与合并同步维护块头状态和引用数，旧尾记录不能获得活页资格。高阶块仍是单 owner，
-不能通过单页 acquire 拆分引用，避免让连续分配的 tail 生命周期失去统一边界。引用达到
-`UINT32_MAX`、对 free/internal/tail 操作或在 bootstrap 阶段 acquire 都是
+`physical_page_reference_count()` 供缓存回收等调用者查询共享状态。COW使用`physical_page_cow_borrow()`，在同一次分配器保护内读取引用数，并且仅在原引用数大于1时取得复制来源的临时引用；引用数为1时由仍受MM保护的原PTE持有页面，直接恢复写权限。这样不再将引用数查询与来源借用分成两次查找和取锁。普通零阶页按 PFN 定位元数据，在分配器锁内检查活块头并增减引用；非末引用释放不查询 buddy 祖先，末次释放才进入完整树验证和合并。分配、释放与合并同步维护块头状态和引用数，旧尾记录不能获得活页资格。高阶块可用 `physical_page_acquire_order()` 取得整个 buddy 分配的引用，
+`physical_page_cow_borrow_order()` 在一次保护内查询并按需保留整个复制来源。
+两者都校验块头和确切 order；每次借用以同一块头和 order 归还，只有末引用消失
+才归还全部物理页。单页 acquire/COW 接口仍只接受 order-0，不能取得高阶 tail 的
+独立引用。`physical_page_allocate_contiguous()` 仍交付已拆成独立 order-0 owner 的
+页面，与整块共享是两个不同契约。整块引用不增加每个尾页的元数据操作或引用计数。
+
+MM 退休批次可携带整块 head/order 与普通页表页；混合批次使用
+`physical_page_release_order_batch()` 在一次 allocator 保护内归还。普通基页批次
+保留原有 release-batch 快路径。`finish_tlb_change()` 仍先完成本地/远端翻译同步，
+再统一归还所有权，不能在同步前释放整块，也不能把一个大页展开成多条 tail 归还。
+
+这只是物理所有权基础，不启用 `MAP_HUGETLB`。当前用户页表、VMA、用户访问 pin、
+COW 和远端 TLB 退休链仍以基本页为单位；接入大叶时须让映射和临时 pin 都持有整块
+owner，保留大页内偏移，并在远端失效及所有 pin 归还之后释放末引用。显式大页的
+池预留/容量、对齐、权限、fork 与区域编辑语义也尚未实现，不能以连续基本页替代。
+引用达到 `UINT32_MAX`、对 free/internal/tail 操作或在 bootstrap 阶段 acquire 都是
 不变量错误并触发 fatal trap；合法 acquire/release 只改变引用和最终可用页计数。
 `physical_page_acquire_batch()` 和 `physical_page_release_batch()` 在一次分配器锁内分别取得或归还至多 16 个零阶引用。同一物理地址可出现多次，每项各归还一个引用；末引用仍执行与单页释放相同的祖先、块头和空闲链校验及合并。
 
@@ -134,7 +148,7 @@ make test-riscv
 
 聚焦测试保留原有区间、耗尽、绑定、映射和失败输出契约，并覆盖 bootstrap owner/
 recycled/tail 导入、metadata 扣除、order 对齐、强制 split 与多级 coalesce、finalize
-失败保留，以及 finalized resolve 拒绝空闲页。测试还覆盖 order-0 多引用、末引用归还、
+失败保留，以及 finalized resolve 拒绝空闲页。测试还覆盖 order-0 与高阶整块多引用、COW 来源借用、末引用归还、
 合法 owner 的释放和压力回收的单次重试；非法释放由独立 fatal-path 测试验证，不再注入
 人工释放失败。
 
