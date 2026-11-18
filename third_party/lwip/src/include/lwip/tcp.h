@@ -415,6 +415,10 @@ struct tcp_pcb {
 #endif
   /* End sequence of the last newly transmitted sub-MSS data segment. */
   u32_t snd_sml;
+  /* Delayed new short tail, owned and retired with this PCB. */
+  u32_t boaros_cork_deadline, boaros_push_seq;
+  u8_t boaros_output_more, boaros_cork_pending, boaros_push_pending, boaros_cork;
+  struct tcp_pcb *boaros_cork_prev, *boaros_cork_next;
 #ifdef BOAROS_LWIP_TCP_CONTEXT
   struct tcp_pcb *boaros_route_next;
   struct tcp_pcb *boaros_loopback_peer;
@@ -451,6 +455,16 @@ err_t lwip_tcp_event(void *arg, struct tcp_pcb *pcb,
 #endif /* LWIP_EVENT_API */
 
 /* Application program's interface: */
+/* MORE is an output hint, not persistent TCP_CORK: ACK-driven tcp_output()
+ * uses the ordinary policy. A queued application output retains its hint. */
+err_t boaros_lwip_tcp_output_more(struct tcp_pcb *pcb, u8_t more);
+void boaros_lwip_tcp_push(struct tcp_pcb *pcb);
+void boaros_lwip_tcp_cork_arm(struct tcp_pcb *pcb);
+void boaros_lwip_tcp_cork_cancel(struct tcp_pcb *pcb);
+int boaros_lwip_tcp_cork_ready(void);
+u32_t boaros_lwip_tcp_cork_delay(u32_t now);
+unsigned boaros_lwip_tcp_cork_due(unsigned budget);
+
 struct tcp_pcb * tcp_new     (void);
 struct tcp_pcb * tcp_new_ip_type (u8_t type);
 

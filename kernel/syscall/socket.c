@@ -253,6 +253,7 @@ static int socket_option(int level, int name, enum kernel_socket_option *option)
     } else if (level == LINUX_IPPROTO_TCP) {
         if (name == 1) { *option = KERNEL_SOCKET_NODELAY; return 0; }
         if (name == 2) { *option = KERNEL_SOCKET_MAXSEG; return 0; }
+        if (name == 3) { *option = KERNEL_SOCKET_CORK; return 0; }
     } else if (level == 41 && name == 26) {
         *option = KERNEL_SOCKET_V6ONLY; return 0;
     }
@@ -752,7 +753,7 @@ static enum kernel_syscall_status socket_message_pinned(
     uint32_t allowed=KERNEL_SOCKET_MSG_DONTWAIT | (writing?KERNEL_SOCKET_MSG_NOSIGNAL:
         KERNEL_SOCKET_MSG_TRUNC|UINT32_C(0x40000000)|KERNEL_SOCKET_MSG_PEEK);
     if (writing && batch) allowed|=KERNEL_SOCKET_MSG_EOR;
-    if (!writing && kernel_socket_is_tcp(socket)) allowed |= KERNEL_SOCKET_MSG_WAITALL;
+    if (kernel_socket_is_tcp(socket)) allowed |= writing?KERNEL_SOCKET_MSG_MORE:KERNEL_SOCKET_MSG_WAITALL;
     if (seqpacket)
         allowed |= writing?(KERNEL_SOCKET_MSG_EOR|KERNEL_SOCKET_MSG_MORE):KERNEL_SOCKET_MSG_WAITALL;
     if(!writing && kernel_socket_is_netlink(socket))
@@ -1049,6 +1050,7 @@ enum kernel_syscall_status syscall_handle_socket_operation(
     case 206: { /* sendto / send */
         uint32_t flags = (uint32_t)request->arguments[3];
         uint32_t allowed=KERNEL_SOCKET_MSG_DONTWAIT | KERNEL_SOCKET_MSG_NOSIGNAL;
+        if (kernel_socket_is_tcp(socket)) allowed|=KERNEL_SOCKET_MSG_MORE;
         if (kernel_socket_is_seqpacket(socket)) allowed|=KERNEL_SOCKET_MSG_EOR|KERNEL_SOCKET_MSG_MORE;
         if ((flags & ~allowed) && !kernel_socket_is_seqpacket(socket)) { result = -KERNEL_EOPNOTSUPP; break; }
         const struct kernel_socket_address *destination = 0;

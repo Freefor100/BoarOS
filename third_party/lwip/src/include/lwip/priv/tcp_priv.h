@@ -328,10 +328,14 @@ union tcp_listen_pcbs_t { /* List of all TCP PCBs in LISTEN state. */
 };
 #define NUM_TCP_PCB_LISTS_NO_TIME_WAIT  3
 #define NUM_TCP_PCB_LISTS               4
+struct boaros_lwip_cork_queue {
+  struct tcp_pcb *head, *tail;
+};
 #ifdef BOAROS_LWIP_TCP_CONTEXT
 struct boaros_lwip_tcp_context {
   union tcp_listen_pcbs_t listening;
   struct tcp_pcb *bound, *active, *timewait, *input;
+  struct boaros_lwip_cork_queue corks;
   struct tcp_pcb **lists[NUM_TCP_PCB_LISTS];
   u32_t ticks, timer_deadline, initial_sequence, ooseq_seen;
   u16_t local_port;

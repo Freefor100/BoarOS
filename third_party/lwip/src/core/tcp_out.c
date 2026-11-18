@@ -61,6 +61,7 @@
  */
 
 #include "lwip/opt.h"
+#include "lwip/sys.h"
 #include <kernel/cost.h>
 
 #if LWIP_TCP /* don't build if not configured for use in lwipopts.h */
@@ -1517,7 +1518,7 @@ tcp_build_wnd_scale_option(u32_t *opts)
  *         another err_t on error
  */
 err_t
-tcp_output(struct tcp_pcb *pcb)
+boaros_lwip_tcp_output_more(struct tcp_pcb *pcb, u8_t more)
 {
   struct tcp_seg *seg, *useg;
   u32_t wnd, snd_nxt;
@@ -1626,9 +1627,20 @@ tcp_output(struct tcp_pcb *pcb)
      *   either seg->next != NULL or pcb->unacked == NULL;
      *   RST is no sent using tcp_write/tcp_output.
      */
-    if ((tcp_do_output_nagle(pcb) == 0) &&
-        ((pcb->flags & (TF_NAGLEMEMERR | TF_FIN)) == 0)) {
-      break;
+    int hold_tail = (more || pcb->boaros_cork) && !seg->next && seg->len < tcp_mss(pcb) &&
+                    !(pcb->flags & TF_FIN) && !(TCPH_FLAGS(seg->tcphdr) & TCP_SYN);
+    if (hold_tail || ((pcb->flags & (TF_NODELAY | TF_NAGLEMEMERR | TF_FIN)) == 0 &&
+                      !tcp_do_output_nagle(pcb))) {
+      u32_t seq = lwip_ntohl(seg->tcphdr->seqno);
+      int pushed = !more && pcb->boaros_push_pending && TCP_SEQ_LT(seq, pcb->boaros_push_seq);
+      if (!pushed && !TCP_SEQ_LT(seq, pcb->snd_nxt)) {
+        if (hold_tail) {
+          boaros_lwip_tcp_cork_arm(pcb);
+          /* A withheld data tail must not withhold a window update or an ACK. */
+          if (pcb->flags & TF_ACK_NOW) return tcp_send_empty_ack(pcb);
+        }
+        break;
+      }
     }
 #if TCP_CWND_DEBUG
     LWIP_DEBUGF(TCP_CWND_DEBUG, ("tcp_output: snd_wnd %"TCPWNDSIZE_F", cwnd %"TCPWNDSIZE_F", wnd %"U32_F", effwnd %"U32_F", seq %"U32_F", ack %"U32_F", i %"S16_F"\n",
@@ -1665,6 +1677,8 @@ tcp_output(struct tcp_pcb *pcb)
       }
       pcb->snd_nxt = snd_nxt;
     }
+    if (pcb->boaros_push_pending && TCP_SEQ_GEQ(pcb->snd_nxt, pcb->boaros_push_seq))
+      pcb->boaros_push_pending = 0;
     /* put segment on unacknowledged list if length > 0 */
     if (TCP_TCPLEN(seg) > 0) {
       seg->next = NULL;
@@ -1706,8 +1720,15 @@ tcp_output(struct tcp_pcb *pcb)
 #endif /* TCP_OVERSIZE */
 
 output_done:
+  if (pcb->unsent == NULL && pcb->boaros_cork_pending) boaros_lwip_tcp_cork_cancel(pcb);
   tcp_clear_flags(pcb, TF_NAGLEMEMERR);
   return ERR_OK;
+}
+
+err_t
+tcp_output(struct tcp_pcb *pcb)
+{
+  return boaros_lwip_tcp_output_more(pcb, 0);
 }
 
 /** Check if a segment's pbufs are used by someone else than TCP.
