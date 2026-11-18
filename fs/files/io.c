@@ -1110,11 +1110,15 @@ static enum kernel_files_status control_write(
 {
     size_t prefix = kernel_vfs_file_control_prefix(&description->file);
     if (prefix) {
-        /* seq_file writes have no pwrite operation. Each writev component
-         * invokes the legacy write callback independently; ignored tail bytes
+        /* Bounded legacy writers opt into pwrite explicitly (seq_file comm
+         * does not). Each writev component invokes its callback independently;
+         * ignored tail bytes
          * must not be faulted in, even though the whole component is consumed. */
-        if (positioned) { *linux_result = -KERNEL_ESPIPE; return KERNEL_FILES_STATUS_OK; }
-        char buffer[16];
+        if (positioned && !(prefix & KERNEL_VFS_CONTROL_PREFIX_POSITIONED)) {
+            *linux_result = -KERNEL_ESPIPE; return KERNEL_FILES_STATUS_OK;
+        }
+        prefix &= ~KERNEL_VFS_CONTROL_PREFIX_POSITIONED;
+        char buffer[35];
         if (prefix >= sizeof(buffer)) __builtin_trap();
         uint64_t total = 0;
         for (size_t i = 0; i < iov_count; i++) {
@@ -1126,7 +1130,7 @@ static enum kernel_files_status control_write(
             int error = access == KERNEL_UACCESS_STATUS_FAULT ? -KERNEL_EFAULT : 0;
             if (access != KERNEL_UACCESS_STATUS_OK && !error) return KERNEL_FILES_STATUS_STATE;
             if (!error && copied != imported) return KERNEL_FILES_STATUS_STATE;
-            uint64_t offset = kernel_open_file_offset(description);
+            uint64_t offset = positioned ? requested_offset : kernel_open_file_offset(description);
             if (!error) error = control_write_as_opener(description, &offset, buffer, imported, &accepted);
             if (error) { *linux_result = total ? (int64_t)total : error; return KERNEL_FILES_STATUS_OK; }
             if (accepted != imported) return KERNEL_FILES_STATUS_STATE;
@@ -1835,7 +1839,9 @@ static enum kernel_files_status writev_request(
         (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EVENTFD || kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_TIMERFD || kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SIGNALFD) ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET ||
-        (description->kind == KERNEL_OPEN_FILE_KIND_GENERATED && kernel_vfs_file_control_prefix(&description->file)))) {
+        (description->kind == KERNEL_OPEN_FILE_KIND_GENERATED &&
+         kernel_vfs_file_control_prefix(&description->file) &&
+         !(kernel_vfs_file_control_prefix(&description->file) & KERNEL_VFS_CONTROL_PREFIX_POSITIONED)))) {
         *linux_result = -KERNEL_ESPIPE;
         goto out;
     }

@@ -1,5 +1,8 @@
 #define _GNU_SOURCE
 #include <sys/mman.h>
+#include <sys/mount.h>
+#include <sys/auxv.h>
+#include <sys/shm.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -35,7 +38,7 @@ static int crash(int mode)
  if(threaded)CHECK(!pipe(identity));
  pid_t pid=fork();CHECK(pid>=0);
  if(!pid){
-  struct rlimit limit={mode==1?0:mode==5?page:32*1024*1024,RLIM_INFINITY};CHECK(!setrlimit(RLIMIT_CORE,&limit));
+  struct rlimit limit={mode==1?0:mode==5?page:mode==9?8*1024*1024:256*1024*1024,RLIM_INFINITY};CHECK(!setrlimit(RLIMIT_CORE,&limit));
   CHECK(!prctl(PR_SET_DUMPABLE,mode==2?0:1));
   if(mode==4){struct rlimit fsize={0,RLIM_INFINITY};CHECK(!setrlimit(RLIMIT_FSIZE,&fsize));}
   if(mode==0){uint64_t value=0;struct iovec local={&value,sizeof(value)},remote={(void *)&spinning,sizeof(spinning)};
@@ -77,9 +80,15 @@ static void inspect(void)
 }
 static int shared_mm_crash(void *unused)
 { (void)unused;syscall(SYS_tgkill,syscall(SYS_getpid),syscall(SYS_gettid),SIGABRT);_exit(99); }
-int main(void)
+#include "coredump_filter_maps.h"
+#include "coredump_filter_proc.h"
+int main(int argc,char **argv)
 {
- setbuf(stdout,NULL);page=(size_t)sysconf(_SC_PAGESIZE);CHECK(!mkdir("core-test",0700));CHECK(!chdir("core-test"));
+ setbuf(stdout,NULL);page=(size_t)sysconf(_SC_PAGESIZE);
+ if(argc==1){CHECK(!mkdir("/proc",0555)||errno==EEXIST);if(access("/proc/meminfo",R_OK))CHECK(!mount("proc","/proc","proc",0,0));}
+ if(filter_proc_exec_check(argc,argv))return 0;
+ filter_proc_checks();if(argc==2&&!strcmp(argv[1],"--filter-proc-only"))return 0;
+ CHECK(!mkdir("core-test",0700));CHECK(!chdir("core-test"));
  memory=mmap(NULL,page*2,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);CHECK(memory!=MAP_FAILED);
  memcpy(memory,"core marker 123",16);CHECK(!mprotect(memory,page,PROT_READ));CHECK(!madvise(memory+page,page,MADV_DONTDUMP));
  CHECK(WCOREDUMP(crash(0)));inspect();puts("CORE CASE image PASS");
@@ -121,6 +130,7 @@ int main(void)
  fd=open("core",O_CREAT|O_WRONLY,0644);CHECK(fd>=0);CHECK(write(fd,"retain",6)==6);CHECK(!close(fd));
  CHECK(!WCOREDUMP(crash(0)));CHECK(!stat("core",&st)&&st.st_size==6);CHECK(!unlink("core"));puts("CORE CASE unsafe-mode PASS");
  CHECK(WCOREDUMP(crash(5)));CHECK(!stat("core",&st)&&st.st_size<=(off_t)page);CHECK(!unlink("core"));puts("CORE CASE bounded-prefix PASS");
+ filter_map_checks();filter_huge_checks();filter_cold_limit_checks();
  CHECK(WCOREDUMP(crash(0)));inspect();
- CHECK(!munmap(memory,page*2));puts("CORE END 10");return 0;
+ CHECK(!munmap(memory,page*2));puts("CORE END 14");return 0;
 }

@@ -507,6 +507,7 @@ enum kernel_vma_status kernel_vma_set_fork(
             struct kernel_vma *entry = &working->entries[working->count++];
             *entry = source->entries[index];
             entry->flags &= ~KERNEL_VMA_LOCK_MASK;
+            if (entry->flags & KERNEL_VMA_WIPEONFORK) entry->flags &= ~KERNEL_VMA_ANON_HISTORY;
             if (entry->shm_attachment) kernel_shm_attachment_open(entry->shm_attachment);
             account_bytes(&working->usage, entry, entry->end - entry->start, 1);
             account_shared_write(entry,entry->end-entry->start,1);
@@ -1085,6 +1086,17 @@ enum kernel_vma_status kernel_vma_set_lookup(
     }
     *vma = set->entries[index - 1U];
     return KERNEL_VMA_STATUS_OK;
+}
+
+void kernel_vma_set_mark_anonymous(struct kernel_vma_set *set, uint64_t address)
+{
+    uint32_t index=lower_bound(set,address+1);
+    if (!index || address>=set->entries[index-1].end) __builtin_trap();
+    if (!(set->entries[index-1].flags & KERNEL_VMA_ANON_HISTORY)) {
+        if (set->generation==UINT64_MAX) __builtin_trap();
+        set->entries[index-1].flags |= KERNEL_VMA_ANON_HISTORY;
+        set->generation++;
+    }
 }
 
 enum kernel_vma_status kernel_vma_set_trim_end(

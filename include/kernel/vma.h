@@ -23,7 +23,11 @@ void kernel_vma_set_clear_locks(struct kernel_vma_set *);
 #define KERNEL_VMA_DONTDUMP 16U
 #define KERNEL_VMA_RANDOM_READ 32U
 #define KERNEL_VMA_GROWSDOWN 64U
-#define KERNEL_VMA_ALL_FLAGS 127U
+#define KERNEL_VMA_ANON_HISTORY 128U /* established private backing (including anonymous read faults); survives DONTNEED */
+#define KERNEL_VMA_ANON_SOURCE 256U /* lazy ELF zero-fill, not file-backed */
+#define KERNEL_VMA_ALL_FLAGS 511U
+/* Caller holds the VMA writer qualification; no allocation or range split. */
+void kernel_vma_set_mark_anonymous(struct kernel_vma_set *, uint64_t address);
 uint64_t kernel_vma_set_data_bytes(const struct kernel_vma_set *set);
 int kernel_vma_is_data(const struct kernel_vma *vma);
 

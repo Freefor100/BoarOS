@@ -84,6 +84,8 @@
 #define PROC_TID_COMM_KIND 22U
 #define PROC_PID_CGROUP_KIND 23U
 #define PROC_TID_CGROUP_KIND 24U
+#define PROC_PID_FILTER_KIND 25U
+#define PROC_FILTER_BITS 0x306U
 #define PROC_CGROUP_BITS 0x304U
 #define PROC_COMM_BITS 0x302U
 #define PROC_NS_DIR_BITS 0x100U
@@ -127,6 +129,9 @@ static uint64_t proc_pid_inode_fd(kernel_pid_t pid, uint64_t identity,
 static uint64_t proc_pid_inode(kernel_pid_t pid, uint64_t identity,
                                uint8_t kind)
 {
+    if (kind == PROC_PID_FILTER_KIND)
+        return proc_pid_inode_fd(pid, identity, PROC_PID_MOUNTS_KIND,
+            PROC_FILTER_BITS);
     if (kind == PROC_PID_CGROUP_KIND || kind == PROC_TID_CGROUP_KIND)
         return proc_pid_inode_fd(pid, identity, PROC_PID_MOUNTS_KIND,
             PROC_CGROUP_BITS | (kind == PROC_TID_CGROUP_KIND));
@@ -178,6 +183,7 @@ static uint8_t proc_inode_kind(uint64_t inode)
         if(encoded==PROC_UTS_NS_BITS)return PROC_PID_UTS_NS_KIND;
         if(encoded==PROC_IPC_NS_BITS)return PROC_PID_IPC_NS_KIND;
         if(encoded==PROC_MOUNTINFO_BITS)return PROC_PID_MOUNTINFO_KIND;
+        if(encoded==PROC_FILTER_BITS)return PROC_PID_FILTER_KIND;
         if(encoded==PROC_CGROUP_BITS)return (inode & (UINT64_C(1)<<16U)) ? PROC_TID_CGROUP_KIND : PROC_PID_CGROUP_KIND;
         if(encoded==PROC_COMM_BITS)return (inode & (UINT64_C(1)<<16U)) ? PROC_TID_COMM_KIND : PROC_PID_COMM_KIND;
     }
@@ -201,7 +207,7 @@ static uint32_t proc_kind_mode(uint8_t kind)
     if (kind == PROC_PID_EXE_KIND || kind == PROC_PID_CWD_KIND ||
         kind == PROC_PID_ROOT_KIND || kind == PROC_PID_FD_LINK_KIND || proc_namespace_type(kind))
         return KERNEL_VFS_S_IFLNK | 0777U;
-    return KERNEL_VFS_S_IFREG | ((kind == PROC_PID_COMM_KIND || kind == PROC_TID_COMM_KIND) ? 0644U : 0444U);
+    return KERNEL_VFS_S_IFREG | ((kind == PROC_PID_COMM_KIND || kind == PROC_TID_COMM_KIND || kind == PROC_PID_FILTER_KIND) ? 0644U : 0444U);
 }
 
 static int proc_inode_is_thread(uint64_t inode)
@@ -412,6 +418,8 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
             kind = PROC_PID_STAT_KIND;
         else if (length == 6U && !memcmp(name, "status", length))
             kind = PROC_PID_STATUS_KIND;
+        else if (length == 15U && !memcmp(name, "coredump_filter", length))
+            kind = PROC_PID_FILTER_KIND;
         else if (length == 6U && !memcmp(name, "cgroup", length))
             kind = PROC_PID_CGROUP_KIND;
         else if (length == 4U && !memcmp(name, "comm", length))
@@ -541,6 +549,7 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
           proc_inode_kind(inode) != PROC_TID_DIR_KIND &&
           proc_inode_kind(inode) != PROC_TID_STAT_KIND &&
           proc_inode_kind(inode) != PROC_TID_STATUS_KIND &&
+          proc_inode_kind(inode) != PROC_PID_FILTER_KIND &&
           proc_inode_kind(inode) != PROC_PID_CGROUP_KIND &&
           proc_inode_kind(inode) != PROC_TID_CGROUP_KIND &&
           proc_inode_kind(inode) != PROC_PID_COMM_KIND &&
@@ -586,6 +595,10 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
                               inode==PROC_UNPRIVILEGED_BPF_INODE || inode==PROC_NR_HUGEPAGES_INODE ||
                               inode == PROC_HOSTNAME_INODE || inode == PROC_DOMAINNAME_INODE)
         ? KERNEL_VFS_CONTROL_READ | KERNEL_VFS_CONTROL_WRITE : 0;
+    if (proc_inode_kind(inode) == PROC_PID_FILTER_KIND) {
+        node->generated_control = KERNEL_VFS_CONTROL_READ | KERNEL_VFS_CONTROL_WRITE;
+        node->control_write_prefix = 34 | KERNEL_VFS_CONTROL_PREFIX_POSITIONED;
+    }
     if (proc_inode_kind(inode) == PROC_PID_COMM_KIND || proc_inode_kind(inode) == PROC_TID_COMM_KIND) {
         node->generated_control = KERNEL_VFS_CONTROL_WRITE;
         node->control_write_prefix = 15;
@@ -858,7 +871,7 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
             *type = 4U;
             return 1;
         }
-        if (position > 15U) return 0;
+        if (position > 16U) return 0;
         const char *entry = position == 0U ? "." :
                             position == 1U ? ".." :
                             position == 2U ? "exe" :
@@ -867,7 +880,7 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
                             position == 5U ? "mounts" :
                             position == 6U ? "stat" :
                             position == 7U ? "status" : position == 8U ? "fd" :
-                            position == 9U ? "task" : position==10U?"maps":position==11U?"fdinfo":position==12U?"ns":position==13U?"mountinfo":position==14U?"comm":"cgroup";
+                            position == 9U ? "task" : position==10U?"maps":position==11U?"fdinfo":position==12U?"ns":position==13U?"mountinfo":position==14U?"comm":position==15U?"cgroup":"coredump_filter";
         if (name_size < strlen(entry) + 1U) return -KERNEL_ERANGE;
         strcpy(name, entry);
         *next_position = position + 1U;
@@ -882,7 +895,7 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
                      position == 7U ? PROC_PID_STATUS_KIND :
                      position == 8U ? PROC_PID_FD_DIR_KIND :
                      position == 9U ? PROC_TASK_DIR_KIND : position==10U?PROC_PID_MAPS_KIND:
-                     position==11U?PROC_PID_FDINFO_DIR_KIND:position==12U?PROC_PID_NS_DIR_KIND:position==13U?PROC_PID_MOUNTINFO_KIND:position==14U?PROC_PID_COMM_KIND:PROC_PID_CGROUP_KIND);
+                     position==11U?PROC_PID_FDINFO_DIR_KIND:position==12U?PROC_PID_NS_DIR_KIND:position==13U?PROC_PID_MOUNTINFO_KIND:position==14U?PROC_PID_COMM_KIND:position==15U?PROC_PID_CGROUP_KIND:PROC_PID_FILTER_KIND);
         *type = position < 2U || position == 8U || position == 9U || position==11U || position==12U ? 4U :
                 position >= 5U ? 8U : 10U;
         return 1;
@@ -1223,9 +1236,55 @@ static int proc_huge_snapshot(struct physical_page_allocator *allocator,
     return 0;
 }
 
+/* Linux v6.15 kstrtouint_from_user: bounded import, base zero, optional
+ * plus/newline, embedded NUL, and 64-bit parse before unsigned-int range. */
+static int proc_filter_parse(const char *buffer, size_t size, unsigned *value)
+{
+    char text[35];
+    if (size > 34) size = 34;
+    memcpy(text, buffer, size); text[size] = 0;
+    const char *p = text;
+    if (*p == '+') p++;
+    unsigned base = 10;
+    if (*p == '0') {
+        base = 8;
+        if ((p[1] == 'x' || p[1] == 'X') && proc_digit(p[2]) < 16) { base = 16; p += 2; }
+    }
+    uint64_t result = 0; unsigned digits = 0; int overflow = 0;
+    while (proc_digit(*p) < base) {
+        unsigned digit = proc_digit(*p++); digits++;
+        if (result > (UINT64_MAX - digit) / base) overflow = 1;
+        result = result * base + digit;
+    }
+    if (overflow) return -KERNEL_ERANGE;
+    if (!digits) return -KERNEL_EINVAL;
+    if (*p == '\n') p++;
+    if (*p) return -KERNEL_EINVAL;
+    if (result > UINT32_MAX) return -KERNEL_ERANGE;
+    *value = (unsigned)result;
+    return 0;
+}
+
 static int proc_control(struct kernel_vfs_node *node, int write,
     uint64_t *offset, char *buffer, size_t size, size_t *count)
 {
+    if (proc_inode_kind(node->inode) == PROC_PID_FILTER_KIND) {
+        unsigned value = 0; *count = 0;
+        int error = write ? proc_filter_parse(buffer, size, &value) : 0;
+        if (error) return error;
+        int result = kernel_proc_coredump_filter(proc_inode_pid(node->inode),
+            proc_inode_identity(node->inode), proc_inode_is_thread(node->inode), &value, write);
+        if (result < 0) return result;
+        if (write) { *count = size; return 0; }
+        if (!result || *offset >= 9) return 0;
+        char text[9];
+        for (unsigned i = 0; i < 8; i++) text[i] = "0123456789abcdef"[(value >> ((7-i)*4)) & 15];
+        text[8] = '\n';
+        size_t length = 9 - (size_t)*offset;
+        if (length > size) length = size;
+        memcpy(buffer, text + *offset, length); *offset += length; *count = length;
+        return 0;
+    }
     if (proc_inode_kind(node->inode) == PROC_PID_COMM_KIND || proc_inode_kind(node->inode) == PROC_TID_COMM_KIND) {
         if (!write || size > 15U) return -KERNEL_EINVAL;
         char name[16] = {0};

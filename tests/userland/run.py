@@ -47,9 +47,12 @@ def cgroup_output(raw):
 def core_dump_output(raw):
     cases = ('image', 'limit', 'dumpable', 'symlink', 'hardlink', 'replace',
              'threads-blocked-running-nonleader-failure', 'fsize', 'unsafe-mode',
-             'bounded-prefix')
-    lines = [line for line in raw.splitlines() if line.startswith('CORE ')]
-    return lines == [*(f'CORE CASE {case} PASS' for case in cases), 'CORE END 10']
+             'bounded-prefix', 'filter-categories-headers-cow-discard-vdso',
+             'filter-private-shared-hugetlb', 'cold-anonymous-low-limit-later-payload')
+    lines = [line for line in raw.splitlines()
+             if line.startswith(('CORE CASE ', 'CORE END ', 'CORE coredump_filter '))]
+    return lines == ['CORE coredump_filter proc PASS',
+                     *(f'CORE CASE {case} PASS' for case in cases), 'CORE END 14']
 
 
 def core_dump_extract(image,folder):

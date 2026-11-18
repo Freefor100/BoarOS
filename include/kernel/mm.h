@@ -132,6 +132,8 @@ int kernel_mm_remote_transfer(struct kernel_mm *, uint64_t address, void *buffer
 
 /* Fatal-exit caller has stopped every MM user. Fail rather than overlap an
  * existing remote writer; subsequent ptrace/process_vm writes are rejected. */
+unsigned kernel_mm_coredump_filter_get(const struct kernel_mm *);
+void kernel_mm_coredump_filter_set(struct kernel_mm *, unsigned);
 int kernel_mm_core_begin(struct kernel_mm *);
 void kernel_mm_core_end(struct kernel_mm *);
 /* Pair around a process_vm request while its independent MM owner lives.
@@ -389,7 +391,7 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm);
 /* MM句柄owner覆盖此无等待快照；保护页仍占用RSS，高水位跨unmap保留。 */
 uint64_t kernel_mm_peak_resident_pages(const struct kernel_mm *mm);
 struct kernel_mm_proc_map {
-    uint64_t start, end, offset;
+    uint64_t start, end, offset, dump_size;
     uint32_t permissions, flags;
     enum kernel_vma_kind kind;
     enum kernel_vma_role role;

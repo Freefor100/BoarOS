@@ -135,6 +135,7 @@ struct kernel_mm_record {
     uint64_t futex_id;
     uint32_t references;
     uint32_t users;
+    uint32_t coredump_filter; /* MM-owned: CLONE_VM shares; fork/exec copy */
     uint32_t core_remote; /* high bit: dump owner, low bits: remote writers */
     struct kernel_raw_rwlock metadata;
     uint64_t access_pins, write_pins;
@@ -589,6 +590,7 @@ enum kernel_mm_status kernel_mm_create(
     if (!record->futex_id) return abandon_unresolved_record(mm, allocator,
         record_page_address, KERNEL_MM_STATUS_NO_MEMORY);
     record->references = 1U;
+    record->coredump_filter = 0x33U;
     kernel_raw_rwlock_init(&record->metadata, KERNEL_RAW_RANK_MM);
     kernel_rwlock_init(&record->operations, 25, (uintptr_t)record);
     kernel_rwlock_init(&record->vma_lock, 31, (uintptr_t)record);
@@ -1619,6 +1621,7 @@ static enum kernel_mm_status mm_fork_impl(
     if (!destination_record->futex_id) return abandon_unresolved_record(destination,
         source->allocator, record_page_address, KERNEL_MM_STATUS_NO_MEMORY);
     destination_record->references = 1U;
+    destination_record->coredump_filter = kernel_mm_coredump_filter_get(source);
     kernel_raw_rwlock_init(&destination_record->metadata, KERNEL_RAW_RANK_MM);
     kernel_rwlock_init(&destination_record->operations, 25, (uintptr_t)destination_record);
     kernel_rwlock_init(&destination_record->vma_lock, 31, (uintptr_t)destination_record);
@@ -2674,6 +2677,8 @@ enum kernel_mm_status kernel_mm_vma_insert_anon(
     vma.kind = KERNEL_VMA_KIND_ANONYMOUS;
     vma.role = role;
     if (role==KERNEL_VMA_ROLE_VVAR) vma.flags|=KERNEL_VMA_DONTDUMP;
+    if (role==KERNEL_VMA_ROLE_STACK || fault_policy==KERNEL_VMA_FAULT_RESIDENT_REQUIRED)
+        vma.flags|=KERNEL_VMA_ANON_HISTORY;
     vma.fault_policy = fault_policy;
     vma.backing = 0;
     status = status_from_vma(kernel_vma_set_insert(record->vmas, &vma));
@@ -2793,6 +2798,13 @@ enum kernel_mm_status kernel_mm_map_elf_source(
             .backing = source,
         };
 
+        /* Linux padzero creates private anonymous backing for the ELF tail.
+         * Our composite source synthesizes it lazily, but even a read may
+         * publish its writable private page without a later write fault. */
+        if (run->kind==KERNEL_ELF64_SOURCE_RUN_ZERO)
+            vma.flags |= KERNEL_VMA_ANON_SOURCE;
+        else if (run->kind==KERNEL_ELF64_SOURCE_RUN_COMPOSITE || !kernel_elf64_source_file(source))
+            vma.flags |= KERNEL_VMA_ANON_HISTORY;
         vma_status = kernel_vma_set_insert(record->vmas, &vma);
         if (vma_status != KERNEL_VMA_STATUS_OK) {
             status = status_from_vma(vma_status);
@@ -6736,9 +6748,39 @@ static enum kernel_mm_status huge_fault(struct mm_operation *operation,uint64_t 
     return status;
 }
 
-static enum kernel_mm_status dispatch_fault(struct mm_operation *operation, uint64_t address,
-    uint32_t access, const struct fault_vma *view, int force)
+/* Keep the one-time VMA editor off the nested file/page fault stack. */
+static __attribute__((noinline)) enum kernel_mm_status associate_anonymous_fault(
+    struct mm_operation *operation,uint64_t address,struct fault_vma *view)
 {
+    struct kernel_mm_record *record=operation->record;
+    KERNEL_LOCK_SCOPE(vma_guard);
+    if (operation->shared) kernel_rwlock_write(&record->vma_lock,&vma_guard);
+    if (kernel_vma_set_generation(record->vmas)!=view->generation)
+        return KERNEL_MM_STATUS_CONFLICT;
+    kernel_vma_set_mark_anonymous(record->vmas,address);
+    view->vma.flags |= KERNEL_VMA_ANON_HISTORY;
+    view->generation=kernel_vma_set_generation(record->vmas);
+    return KERNEL_MM_STATUS_OK;
+}
+
+static enum kernel_mm_status dispatch_fault(struct mm_operation *operation, uint64_t address,
+    uint32_t access, struct fault_vma *view, int force)
+{
+    /* A completely cold VMA has no anonymous backing. BoarOS materializes a
+     * private writable zero page even on reads: record the association during
+     * that existing fault, without adding write protection or a second fault.
+     * File mappings instead acquire it on COW. The one-time association is
+     * sticky across discard/split/fork, like Linux anon_vma preparation. */
+    int anonymous=(view->vma.kind==KERNEL_VMA_KIND_ANONYMOUS &&
+        view->vma.role!=KERNEL_VMA_ROLE_VDSO && view->vma.role!=KERNEL_VMA_ROLE_VVAR) ||
+        (view->vma.flags & KERNEL_VMA_ANON_SOURCE);
+    if (!(view->vma.flags & KERNEL_VMA_ANON_HISTORY) &&
+        (anonymous || (access==KERNEL_MM_WRITE &&
+         (view->vma.kind==KERNEL_VMA_KIND_FILE_PRIVATE || view->vma.kind==KERNEL_VMA_KIND_ELF_PRIVATE))) &&
+        remote_access_allowed(&view->vma,access,force)) {
+        enum kernel_mm_status status=associate_anonymous_fault(operation,address,view);
+        if (status) return status;
+    }
     switch (view->vma.kind) {
     case KERNEL_VMA_KIND_HUGETLB_PRIVATE:
     case KERNEL_VMA_KIND_HUGETLB_SHARED:
@@ -6782,6 +6824,15 @@ static enum kernel_mm_status resolve_user_fault(struct kernel_mm *mm,
             (huge_vma(&view.vma) && kernel_io_context_current()->user_pins)) return status;
         fault_retry(operation.record, address);
     }
+}
+
+unsigned kernel_mm_coredump_filter_get(const struct kernel_mm *mm)
+{
+    return mm && mm->record ? __atomic_load_n(&mm->record->coredump_filter,__ATOMIC_RELAXED) : 0;
+}
+void kernel_mm_coredump_filter_set(struct kernel_mm *mm,unsigned value)
+{
+    __atomic_store_n(&mm->record->coredump_filter,value & 0x1ffU,__ATOMIC_RELAXED);
 }
 
 #define MM_CORE_ACTIVE UINT32_C(0x80000000)

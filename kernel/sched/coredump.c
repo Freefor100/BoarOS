@@ -175,6 +175,36 @@ static int core_write(struct kernel_vfs_file *file,uint64_t *offset,
     return !error && done==size;
 }
 
+/* Snapshot each decision once: neither a racing proc write nor inode metadata
+ * changes may make ELF p_filesz disagree with the emitted page range. */
+static uint64_t core_map_size(struct kernel_mm *mm,struct kernel_mm_proc_map *map,unsigned filter)
+{
+    uint64_t length=map->end-map->start;
+    /* Linux always_dump_vma exempts vDSO even from MADV_DONTDUMP. */
+    if (map->role==KERNEL_VMA_ROLE_VDSO) return length;
+    if ((map->flags & KERNEL_VMA_DONTDUMP) || map->role==KERNEL_VMA_ROLE_VVAR) return 0;
+    if (map->kind==KERNEL_VMA_KIND_HUGETLB_PRIVATE)
+        return (filter & (1U<<5)) ? length : 0;
+    if (map->kind==KERNEL_VMA_KIND_HUGETLB_SHARED)
+        return (filter & (1U<<6)) ? length : 0;
+    struct kernel_vfs_stat stat={0};
+    if (map->file && kernel_vfs_fstat((struct kernel_vfs_file *)kernel_open_file_vfs_borrow(map->file),&stat))
+        return UINT64_MAX;
+    if (map->shared)
+        return (filter & (1U << ((!map->file || !stat.nlink) ? 1 : 3))) ? length : 0;
+    if ((filter & 1U) && (map->flags & KERNEL_VMA_ANON_HISTORY)) return length;
+    if (!map->file) return 0;
+    if (filter & (1U<<2)) return length;
+    if ((filter & (1U<<4)) && !map->offset && (map->permissions & KERNEL_MM_READ)) {
+        if (stat.mode & 0111U) return BOAROS_PAGE_SIZE;
+        unsigned char magic[4]={0};size_t copied=0;
+        if (!kernel_mm_remote_transfer(mm,map->start,magic,sizeof(magic),0,1,&copied) &&
+            copied==sizeof(magic) && magic[0]==0x7f && magic[1]=='E' && magic[2]=='L' && magic[3]=='F')
+            return BOAROS_PAGE_SIZE;
+    }
+    return 0;
+}
+
 int process_core_dump(struct kernel_task *task,unsigned signal)
 {
     struct kernel_rlimit64 core, fsize;
@@ -197,6 +227,11 @@ int process_core_dump(struct kernel_task *task,unsigned signal)
     struct kernel_task_io_buffer scratch={0};
     if (!remote_locked || kernel_mm_proc_maps_snapshot(&task->mm,heap,&maps,&count)) goto out;
     if (count>=65534 || kernel_task_io_buffer_acquire(&scratch,task->mm.allocator)) goto out;
+    unsigned filter=kernel_mm_coredump_filter_get(&task->mm);
+    for (uint32_t i=0;i<count;i++) {
+        maps[i].dump_size=core_map_size(&task->mm,&maps[i],filter);
+        if (maps[i].dump_size==UINT64_MAX) goto out;
+    }
     size_t notesize=session->count*session->notesize;
     struct core_header header={.ident={0x7f,'E','L','F',2,1,1},.type=4,
         .machine=ARCH_ELF_MACHINE,.version=1,.phoff=64,.ehsize=64,
@@ -224,7 +259,7 @@ int process_core_dump(struct kernel_task *task,unsigned signal)
     uint64_t next=dataoff;
     for (uint32_t i=0;i<count;i++) {
         struct kernel_mm_proc_map *map=&maps[i];
-        uint64_t bytes=(map->flags&KERNEL_VMA_DONTDUMP) || map->role==KERNEL_VMA_ROLE_VVAR ? 0 : map->end-map->start;
+        uint64_t bytes=map->dump_size;
         if (bytes>UINT64_MAX-next) goto out;
         ph=(struct kernel_elf64_program_header){.type=1,
             .flags=((map->permissions&KERNEL_MM_READ)?4U:0U)|
@@ -238,8 +273,7 @@ int process_core_dump(struct kernel_task *task,unsigned signal)
     dumped=1;offset=dataoff;
     for (uint32_t i=0;i<count;i++) {
         struct kernel_mm_proc_map *map=&maps[i];
-        if ((map->flags&KERNEL_VMA_DONTDUMP) || map->role==KERNEL_VMA_ROLE_VVAR) continue;
-        for (uint64_t address=map->start;address<map->end;address+=BOAROS_PAGE_SIZE) {
+        for (uint64_t address=map->start;address<map->start+map->dump_size;address+=BOAROS_PAGE_SIZE) {
             if (offset>limit || BOAROS_PAGE_SIZE>limit-offset) goto out;
             size_t copied=0;
             /* Debugger read preserves protection bits and handles PROT_NONE.

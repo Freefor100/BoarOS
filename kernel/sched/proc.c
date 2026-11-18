@@ -106,6 +106,24 @@ int kernel_proc_comm(kernel_pid_t pid, uint64_t identity, int thread,
     return 0;
 }
 
+/* Identity and MM publication/release share wait_domain. The mask accessors
+ * are nonblocking atomics; no task or MM pointer survives this scope. */
+int kernel_proc_coredump_filter(kernel_pid_t pid, uint64_t identity, int thread,
+    unsigned *value, int writing)
+{
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    enum kernel_pid_role role = thread ? KERNEL_PID_TID : KERNEL_PID_TGID;
+    struct kernel_task *task = process_find_identity(pid, role);
+    struct kernel_pid *id = task ? process_identity(task, role) : 0;
+    if (!id || id->generation != identity || !task->accounted || task->retirement)
+        return -KERNEL_ESRCH;
+    if (task->proc_exiting || task->mm.state != KERNEL_MM_LIVE)
+        return writing ? -KERNEL_ESRCH : 0;
+    if (writing) kernel_mm_coredump_filter_set(&task->mm, *value);
+    else *value = kernel_mm_coredump_filter_get(&task->mm);
+    return 1;
+}
+
 void kernel_proc_task_update_comm(struct kernel_task *task)
 {
     struct kernel_vfs_path *path = 0;

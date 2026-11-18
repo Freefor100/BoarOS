@@ -110,6 +110,8 @@ int kernel_vfs_node_pread(struct kernel_vfs_node *node,
                           size_t size,
                           size_t *bytes_read);
 int kernel_vfs_file_is_control(const struct kernel_vfs_file *file,int write);
+/* Bounded legacy writes may opt into pwrite; low seven bits are import size. */
+#define KERNEL_VFS_CONTROL_PREFIX_POSITIONED 0x80U
 size_t kernel_vfs_file_control_prefix(const struct kernel_vfs_file *file);
 int kernel_vfs_file_control_open_credentials(const struct kernel_vfs_file *);
 int kernel_vfs_file_control_permission(const struct kernel_vfs_file *file, int write);

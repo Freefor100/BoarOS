@@ -499,6 +499,28 @@ static void remote_memory_owner_case(void)
     puts("PASS remote memory REALCREDS, dumpable, capability, captured old MM and returned task owners");
 }
 
+static unsigned filter_mask=0x33;
+unsigned kernel_mm_coredump_filter_get(const struct kernel_mm *mm)
+{assert(mm==&tasks[1].mm);return filter_mask;}
+void kernel_mm_coredump_filter_set(struct kernel_mm *mm,unsigned value)
+{assert(mm==&tasks[1].mm);filter_mask=value&0x1ff;}
+static void filter_case(void)
+{
+ setup();unsigned value=0;
+ tasks[1].mm.state=KERNEL_MM_LIVE;
+ assert(kernel_proc_coredump_filter(2,ids[1].generation,0,&value,0)==1&&value==0x33);
+ value=0xffff;assert(kernel_proc_coredump_filter(2,ids[1].generation,0,&value,1)==1&&filter_mask==511);
+ assert(kernel_proc_coredump_filter(2,ids[1].generation+1,0,&value,0)==-KERNEL_ESRCH);
+ tasks[1].proc_exiting=1;
+ assert(!kernel_proc_coredump_filter(2,ids[1].generation,0,&value,0));
+ assert(kernel_proc_coredump_filter(2,ids[1].generation,0,&value,1)==-KERNEL_ESRCH);
+ tasks[1].proc_exiting=0;tasks[1].mm.state=KERNEL_MM_RELEASED;
+ assert(!kernel_proc_coredump_filter(2,ids[1].generation,0,&value,0));
+ tasks[1].retirement=1;
+ assert(kernel_proc_coredump_filter(2,ids[1].generation,0,&value,0)==-KERNEL_ESRCH);
+ borrows_returned();puts("PASS coredump_filter identity/MM lifetime and no-MM EOF/ESRCH");
+}
+
 static void comm_case(void)
 {
     setup(); active->current = &tasks[1];
@@ -535,7 +557,7 @@ int main(int argc, char **argv)
 {
     active = &cpus[0]; kernel_cpu_initialize(active, 0, 0); kernel_cpu_initialize(&cpus[1], 1, 0);
     kernel_raw_lock_init(&kernel_wait_domain, KERNEL_RAW_RANK_SCHEDULER);
-    if (argc > 1 && !strcmp(argv[1], "comm")) comm_case();
+    if (argc > 1 && !strcmp(argv[1], "comm")) {comm_case();filter_case();}
     else if (argc > 1 && !strcmp(argv[1], "remote-mm")) remote_memory_owner_case();
     else if (argc > 1 && !strcmp(argv[1], "snapshot")) snapshot_case();
     else {lookup_cases();access_case();maps_access_cases();memory_owner_case();thread_resources_case();namespace_handles_case();}

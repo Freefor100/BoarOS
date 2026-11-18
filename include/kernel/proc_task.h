@@ -61,6 +61,8 @@ struct kernel_proc_process_snapshot {
 void kernel_task_comm_get(struct kernel_task *, char name[16]);
 void kernel_task_comm_set(struct kernel_task *, const char name[16]);
 int kernel_proc_cgroup(int32_t,uint64_t,int,struct kernel_heap *,char **,size_t *);
+/* 1: live MM, 0: read EOF (no MM), negative: Linux errno. */
+int kernel_proc_coredump_filter(kernel_pid_t, uint64_t, int, unsigned *, int);
 int kernel_proc_comm(kernel_pid_t, uint64_t identity, int thread,
                      char name[16], int writing);
 
