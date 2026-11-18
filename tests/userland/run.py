@@ -31,6 +31,7 @@ def ipv4_reference_fixture(image,directory):
                        directory/'reference-setup.log')
 
 def workload_source(name):
+    if name == 'exec_capacity': return ROOT / 'tests/workloads/resource/exec_capacity.c'
     if name == 'mount_namespace': return ROOT / 'tests/workloads/resource/mount_namespace.c'
     if name == 'bpf_abi': return ROOT / 'tests/workloads/resource/bpf_abi.c'
     if name == 'vdso_time': return ROOT / 'tests/workloads/resource/vdso_time.c'
@@ -329,6 +330,17 @@ def mount_namespace_output(raw):
         'MOUNTNS CASE clone-flags-shared-fs-permissions PASS',
         'MOUNTNS END 2',
     ]
+EXEC_CAPACITY_CASES=('large-argv-env','default-exact','default-over','stack-quarter-exact',
+ 'stack-quarter-over','floor-exact','floor-over','ceiling-exact','ceiling-over',
+ 'single-argv-exact','single-argv-over','single-env-exact','single-env-over',
+ 'many-empty-pointers','pointer-space-over','large-then-efault','execveat-large',
+ 'script-exact-original-pointers','script-over')
+
+def exec_capacity_output(raw):
+    lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('EXEC-CAP ')]
+    return lines==[f'EXEC-CAP CASE {name} PASS' for name in EXEC_CAPACITY_CASES]+[f'EXEC-CAP END {len(EXEC_CAPACITY_CASES)}']
+
+
 def execveat_output(raw):
     lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('EXECVEAT ')]
     return lines==[*(f'EXECVEAT CASE {name} PASS' for name in EXECVEAT_CASES),'EXECVEAT END cases=12 failures=0']
@@ -452,7 +464,7 @@ def run_loongarch(args):
         for cpus in args.cpus or (1,):
             for memory in args.memory or ('512M','1G'):
                 case=work/(f'{platform}-{memory}'+(f'-{cpus}cpu' if args.cpus else ''));case.mkdir()
-                image=harness.fixture(case,program) if args.workload in ('ipv4_basic','pipe','event','altstack','queued','posix','futex','mremap','unix_control','unix_seqpacket','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','chroot','proc_thread_resources','clone_resources','pi','futex_vector') else disk(case,program)
+                image=harness.fixture(case,program) if args.workload in ('ipv4_basic','pipe','event','altstack','queued','posix','futex','mremap','unix_control','unix_seqpacket','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','exec_capacity','chroot','proc_thread_resources','clone_resources','pi','futex_vector') else disk(case,program)
                 if args.workload=='chroot':chroot_fixture(image,case,'loongarch')
                 kernel=profile.linux_kernel(noswap=args.workload=='madvise') if platform=='linux' else args.kernel or ROOT/profile.kernel
                 snapshot=case/'kernel';shutil.copyfile(kernel,snapshot)
@@ -485,6 +497,7 @@ def run_loongarch(args):
                 if args.workload=='chroot':passed=not code and chroot_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
                 if args.workload=='proc_thread_resources':passed=not code and proc_thread_resources_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
                 if args.workload=='clone_resources':passed=not code and clone_resources_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+                if args.workload=='exec_capacity':passed=not code and exec_capacity_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
                 if args.workload=='execveat':passed=not code and execveat_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
                 if args.workload=='mount_attributes':passed=not code and mount_attributes_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
                 if args.workload=='shm_query':passed=not code and shm_query_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
@@ -609,6 +622,7 @@ def run_smp(args):
                     if args.workload=='chroot':passed=not record['returncode'] and chroot_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='proc_thread_resources':passed=not record['returncode'] and proc_thread_resources_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='clone_resources':passed=not record['returncode'] and clone_resources_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
+                    if args.workload=='exec_capacity':passed=not record['returncode'] and exec_capacity_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='execveat':passed=not record['returncode'] and execveat_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='mount_attributes':passed=not record['returncode'] and mount_attributes_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='shm_query':passed=not record['returncode'] and shm_query_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
@@ -627,7 +641,7 @@ def run_smp(args):
                         cleanup = (target=='linux' or profile.root_success(raw,0) or
                                    profile.root_poweroff_success(raw))
                         passed = not record['returncode'] and rt_output(raw) and cleanup
-                    if target=='boaros' and args.workload in ('nproc','rt','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','chroot','proc_thread_resources','clone_resources','pi','futex_vector'):
+                    if target=='boaros' and args.workload in ('nproc','rt','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','exec_capacity','chroot','proc_thread_resources','clone_resources','pi','futex_vector'):
                         online=[int(v) for v in re.findall(r'^BoarOS: SMP online logical=(\d+) hart=0x[0-9a-f]+\r?$',raw,re.M)]
                         passed=passed and online==list(range(1,cpus))
                     if args.workload=='ipc_proc':passed=not record['returncode'] and ipc_proc_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
@@ -635,7 +649,7 @@ def run_smp(args):
                     if sysv_sem:passed=sysv_sem_output(raw,cpus) and (target=='linux' or unix_seqpacket_owners(raw,'riscv'))
                     if mremap:passed=mremap_output(raw,cpus) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     observations=None
-                    if target=='boaros' and args.observe and not pipe and not event and not altstack and not queued and not posix and not futex and not mremap and not unix_named and not unix_control and not unix_seqpacket and not sysv_sem and not sysv_msg and not memory_workload and not cpu_workload and args.workload not in ('ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','chroot','proc_thread_resources','clone_resources','pi','futex_vector'):
+                    if target=='boaros' and args.observe and not pipe and not event and not altstack and not queued and not posix and not futex and not mremap and not unix_named and not unix_control and not unix_seqpacket and not sysv_sem and not sysv_msg and not memory_workload and not cpu_workload and args.workload not in ('ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','exec_capacity','chroot','proc_thread_resources','clone_resources','pi','futex_vector'):
                         matches=re.findall(r'SOCKET caller cpu=(0x[0-9a-f]+) operations=(0x[0-9a-f]+) copy-bytes=(0x[0-9a-f]+) pins=(0x[0-9a-f]+) waits=(0x[0-9a-f]+)',raw)
                         observations=[[int(value,16) for value in row] for row in matches]
                         active=[row for row in observations if row[0]<cpus]
@@ -685,7 +699,7 @@ def run_smp(args):
 def main(default_arch="riscv"):
     parser=argparse.ArgumentParser(__doc__)
     parser.add_argument('--only',choices=('linux','boaros'))
-    parser.add_argument('--workload',choices=('ipv4_basic','contract','content','timer','budget','interface','sendfile','admission','unix_sender','unix_named','unix_control','unix_seqpacket','smp','epoll','pipe','event','altstack','queued','posix','futex','mremap','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','chroot','proc_thread_resources','clone_resources','pi','futex_vector'),default='contract')
+    parser.add_argument('--workload',choices=('ipv4_basic','contract','content','timer','budget','interface','sendfile','admission','unix_sender','unix_named','unix_control','unix_seqpacket','smp','epoll','pipe','event','altstack','queued','posix','futex','mremap','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','exec_capacity','chroot','proc_thread_resources','clone_resources','pi','futex_vector'),default='contract')
     parser.add_argument('--platform-config',choices=('fixture','official'),default='fixture')
     parser.add_argument('--arch',choices=('riscv','loongarch'),default=default_arch)
     parser.add_argument('--memory',action='append',choices=('512M','1G'))
@@ -704,7 +718,7 @@ def main(default_arch="riscv"):
     if args.dynamic and args.libc=='glibc':parser.error('glibc direct consumer uses the static target toolchain')
     if args.performance and args.arch!='riscv':parser.error('--performance requires the RISC-V SMP runner')
     if args.performance and args.workload not in ('unix_named','unix_control','unix_seqpacket'):parser.error('--performance requires --workload unix_named, unix_control or unix_seqpacket')
-    if (args.workload in ('interface','ipv4_basic') and args.cpus and max(args.cpus) > 1) or (args.workload in ('unix_named','unix_control','unix_seqpacket','smp','pipe','event','altstack','queued','posix','futex','mremap','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','chroot','proc_thread_resources','clone_resources','pi','futex_vector') and args.arch=='riscv'):
+    if (args.workload in ('interface','ipv4_basic') and args.cpus and max(args.cpus) > 1) or (args.workload in ('unix_named','unix_control','unix_seqpacket','smp','pipe','event','altstack','queued','posix','futex','mremap','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','exec_capacity','chroot','proc_thread_resources','clone_resources','pi','futex_vector') and args.arch=='riscv'):
         if args.arch == 'riscv': return run_smp(args)
     if args.arch=='riscv' and args.platform_config=='official' and args.memory and args.memory!=['1G']:
         parser.error('official profile requires 1G')

@@ -32,6 +32,8 @@ struct kernel_exec_transaction {
     char *string_bytes;
     size_t string_size;
     size_t string_capacity;
+    size_t string_limit;
+    size_t vector_limit;
     struct kernel_exec_string *arguments;
     size_t argument_count;
     size_t argument_capacity;
