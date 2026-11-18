@@ -5340,6 +5340,13 @@ static int set_file_times(struct kernel_vfs_file *file,struct kernel_vfs_path *p
 {
     KERNEL_SERVICE_SCOPE_IF(service, file && kernel_vfs_namespace_requires_cpu0(file->mount));
     if (!file || !file->mount || !file->mount->private_data) return -KERNEL_EINVAL;
+    /* Match vfs_utimes: lookup errors precede timestamp validation, but
+     * malformed nanoseconds precede mount writability and ownership. */
+    if (times) for (unsigned i = 0; i < 2; i++) {
+        int64_t nsec = times[i].nanoseconds;
+        if (nsec != KERNEL_VFS_UTIME_NOW && nsec != KERNEL_VFS_UTIME_OMIT &&
+            (nsec < 0 || nsec >= 1000000000)) return -KERNEL_EINVAL;
+    }
     VFS_FILE_MUTATION_SCOPE(mutation,file);
     KERNEL_LOCK_SCOPE(namespace_guard);
     namespace_node_lock(file->private_data,&namespace_guard,1);
