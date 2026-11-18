@@ -441,12 +441,14 @@ enum kernel_syscall_status syscall_handle_clone3(struct kernel_task *caller,
         ((args.flags & UINT64_C(0x200000000)) && (size < sizeof(args) || args.cgroup > INT32_MAX))) {
         decoded->value=-KERNEL_EINVAL; return KERNEL_SYSCALL_STATUS_OK;
     }
+    int32_t requested_tid = 0;
     if (args.set_tid) {
-        uint32_t requested[32];
+        int32_t requested[32];
         size_t count=(size_t)args.set_tid_size*sizeof(requested[0]);
         if (kernel_copy_from_user(mm,requested,args.set_tid,count,&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=count) {
             decoded->value=-KERNEL_EFAULT; return KERNEL_SYSCALL_STATUS_OK;
         }
+        requested_tid = requested[0];
     }
     if ((args.flags & UINT64_C(0xff)) || (args.flags & UINT64_C(0x400000)) ||
         ((args.flags & UINT64_C(0x18000)) && args.exit_signal) ||
@@ -458,12 +460,28 @@ enum kernel_syscall_status syscall_handle_clone3(struct kernel_task *caller,
     if ((args.flags & UINT64_C(0x1000)) && (args.flags & UINT64_C(0x100000)) && args.pidfd==args.parent_tid) {
         decoded->value=-KERNEL_EINVAL; return KERNEL_SYSCALL_STATUS_OK;
     }
-    if (args.set_tid || (args.flags & UINT64_C(0x200000000))) {
+    if (args.flags & UINT64_C(0x200000000)) {
         decoded->value=-KERNEL_EOPNOTSUPP; return KERNEL_SYSCALL_STATUS_OK;
     }
     struct kernel_syscall_request legacy={.arguments={args.flags|args.exit_signal}};
     syscall_decode_clone(&legacy,decoded);
     if (decoded->action == KERNEL_SYSCALL_ACTION_CLONE) {
+        if (args.set_tid_size) {
+            if (args.set_tid_size != 1 || requested_tid <= 0 ||
+                (uint32_t)requested_tid >= kernel_proc_pid_max()) {
+                decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+                decoded->value=-KERNEL_EINVAL; return KERNEL_SYSCALL_STATUS_OK;
+            }
+            const struct kernel_credentials *credentials = kernel_credentials_current();
+            if (!kernel_credentials_capable(credentials,KERNEL_CAP_SYS_ADMIN) &&
+                !kernel_credentials_capable(credentials,KERNEL_CAP_CHECKPOINT_RESTORE)) {
+                decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+                decoded->value=-KERNEL_EPERM; return KERNEL_SYSCALL_STATUS_OK;
+            }
+            /* CLONE action value is the already imported requested identity;
+             * zero retains automatic allocation. Never reread the user array. */
+            decoded->value=requested_tid;
+        }
         request->arguments[0]=legacy.arguments[0];
         request->arguments[1]=args.stack ? args.stack+args.stack_size : 0;
         request->arguments[2]=args.parent_tid;

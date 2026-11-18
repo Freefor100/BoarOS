@@ -790,6 +790,7 @@ enum kernel_scheduler_status arch_process_clone_current(
     uint64_t tls,
     uint64_t child_tid,
     uint64_t pidfd_address,
+    int32_t requested_tid,
     int64_t *linux_result)
 {
     struct kernel_task *parent;
@@ -933,14 +934,14 @@ enum kernel_scheduler_status arch_process_clone_current(
                     : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
         }
     }
-    pid_status = process_identity_create(child, parent, thread_clone);
+    pid_status = process_identity_create_number(child, parent, thread_clone, requested_tid);
     if (pid_status != KERNEL_PID_STATUS_OK) {
         return finish_clone_failure(
             child,
-            pid_status == KERNEL_PID_STATUS_EXHAUSTED
-                ? -KERNEL_EAGAIN : -KERNEL_ENOMEM,
+            pid_status == KERNEL_PID_STATUS_EXISTS ? -KERNEL_EEXIST :
+            pid_status == KERNEL_PID_STATUS_EXHAUSTED ? -KERNEL_EAGAIN : -KERNEL_ENOMEM,
             linux_result,
-            pid_status == KERNEL_PID_STATUS_EXHAUSTED
+            (pid_status == KERNEL_PID_STATUS_EXHAUSTED || pid_status == KERNEL_PID_STATUS_EXISTS)
                 ? KERNEL_SCHEDULER_STATUS_OK
                 : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
     }

@@ -54,8 +54,8 @@ void process_identity_sync_locked(struct kernel_task *task)
     task->tid_owned = task->tid != 0;
 }
 
-enum kernel_pid_status process_identity_create(struct kernel_task *task,
-    struct kernel_task *parent, int thread_clone)
+enum kernel_pid_status process_identity_create_number(struct kernel_task *task,
+    struct kernel_task *parent, int thread_clone, kernel_pid_t requested)
 {
     struct kernel_pid *id = 0;
     process_identity_collect();
@@ -65,7 +65,7 @@ enum kernel_pid_status process_identity_create(struct kernel_task *task,
     enum kernel_pid_status status;
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        status = kernel_pid_reserve(&scheduler.identities, id);
+        status = kernel_pid_reserve_number(&scheduler.identities, id, requested);
         if (status == KERNEL_PID_STATUS_OK) {
             kernel_pid_attach(&task->identities[KERNEL_PID_TID], id, KERNEL_PID_TID, task);
             if (!thread_clone) {
@@ -80,6 +80,10 @@ enum kernel_pid_status process_identity_create(struct kernel_task *task,
     (void)parent; /* Group/session roles are joined at actual publication. */
     return status;
 }
+
+enum kernel_pid_status process_identity_create(struct kernel_task *task,
+    struct kernel_task *parent, int thread_clone)
+{ return process_identity_create_number(task, parent, thread_clone, 0); }
 
 void process_identity_commit_locked(struct kernel_task *task)
 {

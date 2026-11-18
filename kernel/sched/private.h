@@ -171,6 +171,8 @@ void process_identity_release_locked(struct kernel_task *);
 void kernel_proc_task_update_comm(struct kernel_task *task);
 
 void scheduler_wake_task(struct kernel_task *thread, uint32_t reason);
+enum kernel_pid_status process_identity_create_number(struct kernel_task *,
+    struct kernel_task *, int, kernel_pid_t);
 enum kernel_pid_status process_identity_create(struct kernel_task *task,
     struct kernel_task *parent, int thread_clone);
 void process_identity_release(struct kernel_task *task);
