@@ -65,6 +65,8 @@ struct ext4_fs {
 	bool read_only;
 	bool super_replay_required;
 	bool journaled_session;
+	/* Failed nonjournal metadata writeback cannot be cleared by unmount. */
+	int nojournal_error;
 
 	struct ext4_blockdev *bdev;
 	struct ext4_sblock sb;
@@ -297,6 +299,9 @@ void ext4_fs_inode_blocks_init(struct ext4_fs *fs,
  * @return Error code
  */
 int ext4_fs_put_inode_ref(struct ext4_inode_ref *ref);
+
+/* Stage changed inode bytes and their checksum while keeping the reference. */
+int ext4_fs_stage_inode_ref(struct ext4_inode_ref *ref);
 
 /**@brief Convert filetype to inode mode.
  * @param filetype File type

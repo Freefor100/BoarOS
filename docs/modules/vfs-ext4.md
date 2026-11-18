@@ -813,6 +813,17 @@ orphan 宿主测试另外检查 258 条混合记录、热查询零分配和零�
 
 ## 显式元数据与统计
 
+无日志 ext4 的可写挂载要求磁盘状态为 clean 且没有错误位。只读检查保留原标记，
+未经离线 `e2fsck` 修复的卷也不能从只读重挂为可写。无日志元数据写回或最终设备
+FLUSH 失败后，当前挂载保留错误及其资源，拒绝继续修改和通过重试发布 clean。
+
+干净无日志卷上的符号链接先分配未命名 inode，初始化所有者、模式、链接计数和目标，
+完成目标数据与本次 inode／分配元数据的设备写入后，才加入父目录。发布前可证明未
+链接的失败归还 inode 和数据块；目录可能已经写入时保留 inode，由离线检查确定
+实际状态。这里保证提交顺序，断电后的多块原子性仍依赖日志。相关故障检查入口为
+`sh tests/host/lwext4-operation.sh nojournal-symlink` 和
+`sh tests/host/lwext4-metadata.sh nojournal-orphan-probe`。
+
 `kernel_vfs_file_set_times/path_set_times` 以活 inode 为目标，`ext4_file_set_times` 在单个 journal 事务内修改选定字段并记录同步依赖；成功发布仅覆盖所选运行时字段，OMIT 保留尚未写回的值。两项 OMIT 不产生 I/O；其他修改要求可用 realtime，时间未初始化明确返回 `EIO`。128 字节 inode 仅秒精度；扩展 inode 保存纳秒，超出或等于时间范围端点时按 Linux `timestamp_truncate` 将纳秒置零。事务准备 ENOMEM 可回滚，关键 journal/write/flush 失败由 mount 保留并停止修改。
 
 `kernel_vfs_mount_statfs` 使用 `ext4_mount_point_stats` 的 superblock 分配计数、UUID 和真实 overhead。首次成功统计校验块组及 journal inode，计算首数据块、super/GDT/预留 GDT、两种 bitmap、inode table 和 journal 长度，缓存静态开销，成本 O(块组数)；后续查询 O(1) 读取动态计数。当前无在线 resize，故无几何缓存失效协议；BIGALLOC 与外部 journal 不在支持范围。META_BG 主描述符取所在 meta group 的首组，sparse_super2 按备份组字段处理，组数扣除 first_data_block。

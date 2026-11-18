@@ -483,6 +483,15 @@ void ext4_bcache_scope_track(struct ext4_buf *buf)
     buf->writeback_scope=scope;buf->writeback_next=scope->head;scope->head=buf;
     buf->refctr++;
 }
+int ext4_bcache_scope_flush(struct ext4_bcache *bc, struct ext4_writeback_scope *scope)
+{
+    for (struct ext4_buf *buf = scope->head; buf; buf = buf->writeback_next) {
+        int result = ext4_block_flush_buf(bc->bdev, buf);
+        if (result) return result;
+    }
+    return EOK;
+}
+
 int ext4_bcache_scope_end(struct ext4_bcache *bc, struct ext4_writeback_scope *scope)
 {
     int result=EOK;

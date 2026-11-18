@@ -234,6 +234,8 @@ enum ext4_bcache_read_state {
 void ext4_bcache_scope_track(struct ext4_buf *buf);
 void ext4_bcache_scope_begin(struct ext4_bcache *bc,
                              struct ext4_writeback_scope *scope);
+/* Submit the current buffers of a serialized writeback scope, keeping its loans. */
+int ext4_bcache_scope_flush(struct ext4_bcache *bc, struct ext4_writeback_scope *scope);
 int ext4_bcache_scope_end(struct ext4_bcache *bc,
                           struct ext4_writeback_scope *scope);
 
