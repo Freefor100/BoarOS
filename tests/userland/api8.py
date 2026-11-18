@@ -50,6 +50,7 @@ SOURCES['pid_namespace_groups']='resource/pid_namespace_groups.c'
 SOURCES['pid_namespace_ipc']='resource/pid_namespace_ipc.c'
 SOURCES['pid_namespace_socket']='resource/pid_namespace_socket.c'
 SOURCES['pi']='futex/pi.c'
+SOURCES['robust_exec_mutex']='futex/robust_exec_mutex.c'
 SOURCES['robust_exec']='futex/robust_exec.c'
 SOURCES['process_memory']='resource/process_memory.c'
 SOURCES['personality']='resource/personality.c'
@@ -68,7 +69,7 @@ def build(args,work):
     profile=PROFILES[args.arch]
     musl=ROOT/('build/riscv-user-smp4/riscv/musl-root' if args.arch=='riscv'
                else 'build/loongarch/musl-root')
-    compiler=(Path('/usr/bin/riscv64-linux-gnu-gcc') if args.arch=='riscv'
+    compiler=(Path(shutil.which('riscv64-linux-gnu-gcc') or '/usr/bin/riscv64-linux-gnu-gcc') if args.arch=='riscv'
               else ROOT/'build/tools/loongarch/bin/loongarch64-unknown-linux-gnu-gcc')
     if args.libc=='musl':compiler=musl/'bin/musl-gcc'
     env=os.environ.copy()
@@ -146,7 +147,7 @@ def accepted(raw,arch,cpus,target,selected=None):
     expected=[f'API8 END /{name} status=0' for name in programs]
     known={'nsfs_pid':['NSFS PID PASS scalar TID TGID reap and errno'],
            'pid_namespace_creation':['PIDNS DRAIN PASS external tracer owns member wait before namespace init completion','PIDNS CREATE PASS unshare stable caller, three-level set_tid, pidfd wait, dead child namespace'],
-           'pid_namespace_misc':['PIDNS MISC PASS netlink inherited port and TSYNC failed TID'],'pid_namespace_reboot':['PIDNS REBOOT PASS invalid inputs and permission ordering'],'pid_namespace_clocks':['PIDNS CLOCK PASS process thread strict clocks and timer recipient'],'ioprio':['IOPRIO PASS'],'pid_namespace_priority':['PIDNS PRIORITY PASS process and inherited group'],'cgroup':['CGROUP END 5'],'pid_namespace_cgroup':['PIDNS CGROUP PASS current-reader inherited FD and migration'],'pid_namespace_groups':['PIDNS GROUP PASS inherited session tty and async owners'],'pid_namespace_ipc':['PIDNS IPC PASS sem msg shm retained identity exit'],'unix_control':['UNIX-CONTROL CASE credentials-real-ids-peer-snapshot-explicit-permissions PASS','UNIX-CONTROL END 23'],'pid_namespace_socket':['PIDNS SOCKET PASS peercred SCM_CREDENTIALS SCM_RIGHTS exited-owner'],'robust_exec':['ROBUST EXEC PASS nonleader old-TID cleanup'],'pi':['PI END 15'],'ipv4_abi':[*(f'IPV4 ABI PASS {name}' for name in ('scalar-options','device-options','multicast-interface','raw-boundaries','permissions')),'IPV4 ABI PASS'],'file_ioctl':['FD-IOCTL PASS'],'process_control':['PROCESS_CONTROL PASS'],'file_flags':['FILE_FLAGS PASS'],'ptrace_signal':['PTRACE SIGNAL suppression reset-mask blocked-replacement siginfo ignored continue-cancels-stop PASS'],'process_memory':['PROCESS_MEMORY PASS'],'personality':['PERSONALITY PASS'],'ptrace':['PTRACE traced-stop memory syscall-info exit PASS'],'ptrace_tools':['PTRACE_TOOLS PASS'],'uts_namespace':['UTS NAMESPACE PASS cases=8'],'ipc_namespace':['IPCNS PASS cases=3'],'pid_namespace':['PIDNS FD PASS initial-view stable-inode setns inherited-owner'],'async_io':['ASYNC PASS cases=4'],'tty_async':['PTY_RECORD sigio-vhangup-generation 1'],'sched_control':['SCHED-CONTROL END cases=6'],'system_control':['SYSTEM CONTROL PASS cases=5'],'mount_context':['FS-CONTEXT END 9'],'mount_api':['MOUNT-API END 5'],'propagation':['PROP END 9'],'atime':['MOUNT-ATTR END 4'],'memory_advice':['MADVISE END 5'],'fd_events':['FD-EVENTS PASS'],'flock':['FLOCK-PASS'],
+           'pid_namespace_misc':['PIDNS MISC PASS netlink inherited port and TSYNC failed TID'],'pid_namespace_reboot':['PIDNS REBOOT PASS invalid inputs and permission ordering'],'pid_namespace_clocks':['PIDNS CLOCK PASS process thread strict clocks and timer recipient'],'ioprio':['IOPRIO PASS'],'pid_namespace_priority':['PIDNS PRIORITY PASS process and inherited group'],'cgroup':['CGROUP END 5'],'pid_namespace_cgroup':['PIDNS CGROUP PASS current-reader inherited FD and migration'],'pid_namespace_groups':['PIDNS GROUP PASS inherited session tty and async owners'],'pid_namespace_ipc':['PIDNS IPC PASS sem msg shm retained identity exit'],'unix_control':['UNIX-CONTROL CASE credentials-real-ids-peer-snapshot-explicit-permissions PASS','UNIX-CONTROL END 23'],'pid_namespace_socket':['PIDNS SOCKET PASS peercred SCM_CREDENTIALS SCM_RIGHTS exited-owner'],'robust_exec_mutex':['ROBUST QUEUED PASS 4','ROBUST MUTEX PASS 8: nonleader exec owner dead'],'robust_exec':['ROBUST EXEC PASS nonleader old-TID cleanup'],'pi':['PI END 15'],'ipv4_abi':[*(f'IPV4 ABI PASS {name}' for name in ('scalar-options','device-options','multicast-interface','raw-boundaries','permissions')),'IPV4 ABI PASS'],'file_ioctl':['FD-IOCTL PASS'],'process_control':['PROCESS_CONTROL PASS'],'file_flags':['FILE_FLAGS PASS'],'ptrace_signal':['PTRACE SIGNAL suppression reset-mask blocked-replacement siginfo ignored continue-cancels-stop PASS'],'process_memory':['PROCESS_MEMORY PASS'],'personality':['PERSONALITY PASS'],'ptrace':['PTRACE traced-stop memory syscall-info exit PASS'],'ptrace_tools':['PTRACE_TOOLS PASS'],'uts_namespace':['UTS NAMESPACE PASS cases=8'],'ipc_namespace':['IPCNS PASS cases=3'],'pid_namespace':['PIDNS FD PASS initial-view stable-inode setns inherited-owner'],'async_io':['ASYNC PASS cases=4'],'tty_async':['PTY_RECORD sigio-vhangup-generation 1'],'sched_control':['SCHED-CONTROL END cases=6'],'system_control':['SYSTEM CONTROL PASS cases=5'],'mount_context':['FS-CONTEXT END 9'],'mount_api':['MOUNT-API END 5'],'propagation':['PROP END 9'],'atime':['MOUNT-ATTR END 4'],'memory_advice':['MADVISE END 5'],'fd_events':['FD-EVENTS PASS'],'flock':['FLOCK-PASS'],
            'splice':['SPLICE PASS cases=9'],'file_advice':['ADVICE RESULT cases=3 failures=0'],'copy_range':['COPY_RANGE PASS'],'sched_query':['SCHED-QUERY END cases=7'],
            'icache':[f'ICACHE PASS cpus={cpus}'],
            'vectors_v2':[*(f'VECTORS2 CASE {name} PASS' for name in (
@@ -178,6 +179,8 @@ def main():
     args=parser.parse_args()
     if args.dynamic and args.libc!='musl':parser.error('--dynamic requires musl')
     args.programs=tuple(name for name in dict.fromkeys(args.program or LEGACY) if name!='icache' or args.arch=='riscv')
+    if 'robust_exec_mutex' in args.programs and (args.only != 'boaros' or args.libc != 'glibc'):
+        parser.error('robust_exec_mutex guest policy requires --only boaros --libc glibc; for native Linux use --expect-retained')
     profile=PROFILES[args.arch]
     work=(args.output or ROOT/'build/api8'/str(time.time_ns())).resolve()
     work.mkdir(parents=True,exist_ok=False)
