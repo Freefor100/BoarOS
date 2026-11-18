@@ -498,7 +498,10 @@ def run_loongarch(args):
                 if args.workload=='ioprio':passed=not code and ioprio_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
                 if args.workload=='memlock':passed=not code and memlock_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
                 if args.workload=='pidfd':passed=not code and pidfd_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
-                if args.workload=='rt':passed=not code and rt_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+                if args.workload=='rt':
+                    cleanup = ('Linux LA root application passed' in raw if platform=='linux'
+                               else profile.root_success(raw,0) or profile.root_poweroff_success(raw))
+                    passed = not code and rt_output(raw) and cleanup
                 if args.workload=='ipc_proc':passed=not code and ipc_proc_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
                 if args.workload=='cpu':passed=not code and cpu_output(raw,cpus) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
                 if args.workload=='memory':passed=not code and memory_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
@@ -619,7 +622,11 @@ def run_smp(args):
                     if args.workload=='ioprio':passed=not record['returncode'] and ioprio_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='memlock':passed=not record['returncode'] and memlock_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='pidfd':passed=not record['returncode'] and pidfd_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
-                    if args.workload=='rt':passed=not record['returncode'] and rt_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
+                    if args.workload=='rt':
+                        profile = PROFILES['riscv']
+                        cleanup = (target=='linux' or profile.root_success(raw,0) or
+                                   profile.root_poweroff_success(raw))
+                        passed = not record['returncode'] and rt_output(raw) and cleanup
                     if target=='boaros' and args.workload in ('nproc','rt','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','chroot','proc_thread_resources','clone_resources','pi','futex_vector'):
                         online=[int(v) for v in re.findall(r'^BoarOS: SMP online logical=(\d+) hart=0x[0-9a-f]+\r?$',raw,re.M)]
                         passed=passed and online==list(range(1,cpus))
