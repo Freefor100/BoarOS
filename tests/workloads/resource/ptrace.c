@@ -24,6 +24,41 @@ __asm__(".pushsection .text\n.balign 8\n.global ptrace_old,ptrace_new\n"
 #endif
 #if defined(__riscv) || defined(__loongarch__)
 extern int ptrace_old(void),ptrace_new(void);
+
+static void syscall_original_argument(void)
+{
+    int fd = open("/tmp/ptrace-original-arg", O_RDWR | O_CREAT | O_EXCL, 0600);
+    CHECK(fd >= 0 && !unlink("/tmp/ptrace-original-arg"));
+    pid_t child = fork();
+    CHECK(child >= 0);
+    if (!child) {
+        CHECK(!ptrace(PTRACE_TRACEME, 0, 0, 0));
+        CHECK(!syscall(SYS_kill, getpid(), SIGSTOP));
+        _exit(syscall(SYS_write, fd, "x", 1) == 1 ? 0 : 10);
+    }
+    int status;
+    CHECK(waitpid(child, &status, 0) == child && WIFSTOPPED(status));
+    CHECK(!ptrace(PTRACE_SETOPTIONS, child, 0, (void *)PTRACE_O_TRACESYSGOOD));
+    CHECK(!ptrace(PTRACE_SYSCALL, child, 0, 0));
+    CHECK(waitpid(child, &status, 0) == child && WIFSTOPPED(status) &&
+          WSTOPSIG(status) == (SIGTRAP | 128));
+    uint64_t info[10] = {0};
+    CHECK(syscall(SYS_ptrace, 0x420e, child, sizeof(info), info) == 80 &&
+          (uint8_t)info[0] == 1 && info[3] == SYS_write && info[4] == (uint64_t)fd);
+    uint64_t registers[64];
+    struct iovec regs = {registers, sizeof(registers)};
+    CHECK(!ptrace(PTRACE_GETREGSET, child, (void *)1, &regs));
+#if defined(__riscv)
+    registers[10] = (uint64_t)-1;
+#else
+    registers[4] = (uint64_t)-1;
+#endif
+    CHECK(!ptrace(PTRACE_SETREGSET, child, (void *)1, &regs));
+    CHECK(!ptrace(PTRACE_CONT, child, 0, 0));
+    char saved;
+    CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
+    CHECK(pread(fd, &saved, 1, 0) == 1 && saved == 'x' && !close(fd));
+}
 #endif
 static void kill_before_write(void)
 {
@@ -260,6 +295,9 @@ int main(void)
     final_wait_ownership();
     continue_before_listen();
     kill_before_write();
+#if defined(__riscv) || defined(__loongarch__)
+    syscall_original_argument();
+#endif
     tracer_death(0);
     tracer_death(PTRACE_O_EXITKILL);
     puts("PTRACE traced-stop memory syscall-info exit PASS");

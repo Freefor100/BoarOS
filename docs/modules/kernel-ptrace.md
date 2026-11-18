@@ -12,7 +12,9 @@ RV64 和 LA64 提供 Linux `ptrace(117)`。跟踪关系绑定线程。被跟踪�
 
 ## 寄存器与内存
 
-`GETREGSET` 和 `SETREGSET` 接受 `NT_PRSTATUS` 和 `NT_PRFPREG`。RV64 整数布局为 PC 后跟 x1 至 x31。LA64 整数布局含 32 个通用寄存器、原始参数 a0、ERA、BADV 和 ABI 保留区。LA64 基础浮点写入保留各向量寄存器的高位。`PEEKUSER` 与 `POKEUSER` 在 LA64 接受原生索引 0 至 34，RV64 对这两项请求返回 EIO。
+`GETREGSET` 和 `SETREGSET` 接受 `NT_PRSTATUS` 和 `NT_PRFPREG`。RV64 整数布局为 PC 后跟 x1 至 x31。LA64 整数布局含 32 个通用寄存器、原始参数 a0、ERA、BADV 和 ABI 保留区。系统调用入口停止后，实际参数及 seccomp 使用原始 a0；修改普通 a0 不替换该参数。
+LA64 可单独修改 regset 的原始 a0 槽，RV64 的整数 regset 不暴露该槽；出口停止仍可修改 a0 返回值。
+LA64 基础浮点写入保留各向量寄存器的高位。`PEEKUSER` 与 `POKEUSER` 在 LA64 接受原生索引 0 至 34，RV64 对这两项请求返回 EIO。
 
 `PEEKTEXT` 和 `PEEKDATA` 的原始系统调用把机器字复制到 data 指针并返回零；libc 的 ptrace 包装返回读取的机器字。`POKETEXT` 和 `POKEDATA` 使用传入的机器字更新目标。停止期间的访问固定目标的执行状态，私有映射的写入使用 COW，写入可执行页后发布指令缓存。映射与页所有权见 [内存管理](kernel-mm.md)。
 

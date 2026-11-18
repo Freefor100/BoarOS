@@ -232,6 +232,7 @@ static void syscall_stop(struct kernel_task *t,unsigned op,struct arch_trap_fram
         frame->regs[4]=t->ptrace->original_arg;
 #else
         frame->sepc-=4;
+        frame->a0=t->ptrace->original_arg;
 #endif
     }
 }
