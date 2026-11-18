@@ -105,8 +105,17 @@ static void names(struct kernel_vfs_mount *mount, struct kernel_vfs_path *root)
         assert(!kernel_vfs_create(mount,path,0666,&a) && !kernel_vfs_close(&a));
     }
     assert(!kernel_vfs_open(mount,"/second/moved directory",&a));
-    uint64_t pos=0,next,id; uint8_t type; char name[256]; unsigned entries=0;
-    while(kernel_vfs_dir_entry(&a,pos,&next,&id,&type,name,sizeof(name))>0) { assert(next>pos);pos=next;entries++; }
+    unsigned char records[1024]; unsigned entries=0;
+    struct kernel_vfs_dir_batch batch={.data=records,.capacity=sizeof(records)};
+    int status;
+    do {
+        batch.used=0;
+        status=kernel_vfs_read_directory(&a,&batch); assert(status>=0);
+        for (size_t at=0;at<batch.used;) {
+            size_t length=(size_t)records[at+16]|((size_t)records[at+17]<<8);
+            assert(length>=24 && length<=batch.used-at);at+=length;entries++;
+        }
+    } while(status);
     assert(entries==42 && !kernel_vfs_close(&a));
     assert(!kernel_vfs_create(mount,"/old",0666,&a) && !kernel_vfs_create(mount,"/dest",0666,&b));
     assert(!kernel_vfs_pwrite(&a,0,"old",3,&done) && done==3);

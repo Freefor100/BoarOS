@@ -16,6 +16,21 @@ case 格式为 `backend:operation:completion:files:bytes_per_file:request_bytes`
 
 正式比较显式传入 `--baseline` 与 `--variant label=kernel`；`--program` 可复用同一个 ELF。runner 记录每文件实际字节、校验和、同步、请求时间、进程 CPU、亲和性与资源归还，检查正常退出及文件系统。双 CPU 与主机线程绑定依照实际 USER_SMP 配置设置。
 
+### 目录枚举
+
+`tests/workloads/fs/getdents_batch.c` 接受 `DIRECTORY ENTRIES BUFFER_BYTES ROUNDS [prepare]`。
+`prepare` 仅用于空目录中创建固定编号文件并同步，准备与一遍预热均不计时；计时窗口仅包含
+rewind、getdents64 与名称唯一性核对。输出实际 entries、返回 bytes、syscall 次数、wall_ns
+和 process cpu_ns。这明确是暖目录，不得当作冷盘结果。示例输入为 4096 项、4096/32768 字节
+buffer、相同 rounds；32 字节 buffer 每次只容纳一项，是不能摊薄 iterator/usercopy 的对照。
+同一 ELF、目录镜像、页大小与总枚举项数分别运行基线和候选，比较 entries/s 与 CPU ns/entry。
+另行诊断时可统计 `ext4_dir_iterator_init`、inode-ref 获取及 `kernel_copy_to_user` 次数；正式计时
+关闭诊断。并发写者的创建/删除延迟应单独观察，不能以枚举加速掩盖批次锁延长的代价。
+
+IOzone 以文件内容读写为负载，不覆盖目录枚举，不能拿其分数证明 getdents 改进。它在这里仅
+作为无关数据路径的回退对照：保持原 IOzone ELF、文件/record 大小、并发进程数与 fsync 选项
+一致，读写/重读/重写分别报告，不将写入返回与持久化完成合并，也不并行运行两个版本。
+
 ## 网络
 
 `tests/cost/network-budget-experiment.py` 使用 `tests/workloads/network/tcp-budget.c`，覆盖 loopback/TAP、阻塞/非阻塞、收发、bulk、请求响应与混合控制连接。普通接口的默认预算为 `w8-p4-m2`：8 MSS 窗口与发送缓冲、4 倍协议池、2 倍协议堆；回环连接另用 8192 字节 MSS 与 32768 字节窗口。PCB 容量不随候选增加。

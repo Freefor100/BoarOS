@@ -163,13 +163,7 @@ static int ext4_backend_unlink(struct kernel_vfs_mount *mount,
 static int ext4_backend_rmdir(struct kernel_vfs_mount *mount,
                          uint64_t parent_inode, const char *path);
 static void ext4_backend_release_unlinked(struct kernel_vfs_node *node);
-static int ext4_backend_dir_entry(struct kernel_vfs_file *file,
-                         uint64_t position,
-                         uint64_t *next_position,
-                         uint64_t *inode,
-                         uint8_t *type,
-                         char *name,
-                         size_t name_size);
+static int ext4_backend_read_directory(struct kernel_vfs_file *, struct kernel_vfs_dir_batch *);
 static int ext4_backend_pread(struct kernel_vfs_node *node,
                           uint64_t offset,
                           void *buffer,
@@ -2727,70 +2721,31 @@ out:
 
 }
 
-static int ext4_backend_dir_entry(struct kernel_vfs_file *file,
-                         uint64_t position,
-                         uint64_t *next_position,
-                         uint64_t *inode,
-                         uint8_t *type,
-                         char *name,
-                         size_t name_size)
+static int ext4_backend_emit(void *context, uint64_t offset, uint64_t next,
+    uint32_t inode, uint8_t type, const char *name, size_t length)
 {
-    struct kernel_vfs_node *node;
-    ext4_dir directory;
-    uint64_t entry_offset;
-    uint64_t start;
-    int result;
-    size_t name_length;
+    struct kernel_vfs_dir_batch *batch = context;
+    /* A seek need not point exactly at a record boundary. */
+    if (offset < batch->position) return 1;
+    return kernel_vfs_dir_emit(batch, next, inode, dirent_type_from_ext4(type), name, length);
+}
 
-    if (file == 0 || file->private_data == 0 || next_position == 0 ||
-        inode == 0 || type == 0 || name == 0 || name_size == 0U ||
-        file->state != VFS_FILE_STATE_LIVE) {
-        return -KERNEL_EINVAL;
-    }
-    node = file->private_data;
+static int ext4_backend_read_directory(struct kernel_vfs_file *file,
+    struct kernel_vfs_dir_batch *batch)
+{
+    struct kernel_vfs_node *node = file->private_data;
     KERNEL_LOCK_SCOPE(node_guard);
     kernel_vfs_node_lock(node, &node_guard, 0);
-    if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) {
-        return -KERNEL_ENOTDIR;
+    if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) return -KERNEL_ENOTDIR;
+    ext4_file directory = *lwext4_node_file(node);
+    uint64_t position = batch->position & ~UINT64_C(3);
+    int result = ext4_dir_iterate(&directory, &position, ext4_backend_emit, batch);
+    if (result != EOK) return lwext4_error(result);
+    if (position == UINT64_MAX) {
+        batch->position = directory.fsize;
+        return 0;
     }
-    *next_position = position;
-    start = position & ~UINT64_C(3);
-    directory.f = (*lwext4_node_file(node));
-    directory.next_off = start;
-    for (;;) {
-        result = ext4_dir_entry_next_status(&directory,
-                                            &directory.de,
-                                            &entry_offset);
-        if (result != EOK) {
-            return lwext4_error(result);
-        }
-        if (entry_offset == UINT64_MAX) {
-            *next_position = directory.f.fsize;
-            return 0;
-        }
-        if (entry_offset < position) {
-            if (directory.next_off <= entry_offset ||
-                directory.next_off == UINT64_MAX) {
-                return -KERNEL_EIO;
-            }
-            continue;
-        }
-        name_length = directory.de.name_length;
-        if (name_length >= name_size) {
-            return -KERNEL_ENAMETOOLONG;
-        }
-        memcpy(name, directory.de.name, name_length);
-        name[name_length] = '\0';
-        *inode = directory.de.inode;
-        *type = dirent_type_from_ext4(directory.de.inode_type);
-        *next_position = directory.next_off;
-        if (entry_offset >= directory.f.fsize || *next_position <= entry_offset ||
-            *next_position > directory.f.fsize ||
-            *next_position == UINT64_MAX) {
-            return -KERNEL_EIO;
-        }
-        return 1;
-    }
+    return 1;
 }
 
 static int ext4_backend_pread(struct kernel_vfs_node *node,
@@ -3130,7 +3085,7 @@ static void initialize_backend(void)
     ops->unlink = ext4_backend_unlink;
     ops->rmdir = ext4_backend_rmdir;
     ops->release_unlinked = ext4_backend_release_unlinked;
-    ops->dir_entry = ext4_backend_dir_entry;
+    ops->read_directory = ext4_backend_read_directory;
     ops->pread = ext4_backend_pread;
     ops->writeback = ext4_backend_writeback;
     __atomic_store_n(&ext4_backend.pread_batch,ext4_backend_pread_batch,__ATOMIC_RELEASE);

@@ -556,20 +556,26 @@ static int statfs(struct kernel_vfs_mount *mount, struct kernel_vfs_statfs *s)
         .inodes=m->inode_limit,.free_inodes=m->inode_limit ? m->inode_limit-m->inode_count : 0,
         .fsid=m->instance.backend_mount.id,.name_length=255,.flags=m->instance.read_only ? 1 : 0}; return 0;
 }
-static int dir_entry(struct kernel_vfs_file *f,uint64_t pos,uint64_t *next,uint64_t *id,
-                       uint8_t *type,char *name,size_t capacity)
+static int read_directory(struct kernel_vfs_file *file, struct kernel_vfs_dir_batch *batch)
 {
-    struct kernel_vfs_node *n=f->private_data; struct tmp_inode *i=ti(n);
-    if((i->mode & KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFDIR) return -KERNEL_ENOTDIR;
-    if(pos<2) { if(capacity<3) return -KERNEL_ENAMETOOLONG; strcpy(name,pos ? ".." : ".");
-        *id=pos ? i->parent : i->number; *next=pos+1; *type=4; return 1; }
-    struct tmp_entry key = {.cookie = pos};
-    struct tmp_entry *best = RB_NFIND(tmp_cookie_tree, &i->cookies, &key);
-    if(!best) return 0;
-    if(best->name_length>=capacity) return -KERNEL_ENAMETOOLONG;
-    strcpy(name,best->name); *id=best->inode->number; *next=best->cookie+1;
-    *type=(best->inode->mode & KERNEL_VFS_S_IFMT)>>12; return 1;
+    struct tmp_inode *directory = ti(file->private_data);
+    if ((directory->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) return -KERNEL_ENOTDIR;
+    while (batch->position < 2) {
+        uint64_t position = batch->position;
+        if (kernel_vfs_dir_emit(batch, position + 1,
+            position ? directory->parent : directory->number, KERNEL_VFS_DT_DIR,
+            position ? ".." : ".", position ? 2 : 1) != 1) return 1;
+    }
+    struct tmp_entry key = {.cookie = batch->position};
+    struct tmp_entry *entry = RB_NFIND(tmp_cookie_tree, &directory->cookies, &key);
+    for (; entry; entry = RB_NEXT(tmp_cookie_tree, &directory->cookies, entry)) {
+        if (kernel_vfs_dir_emit(batch, entry->cookie + 1, entry->inode->number,
+            (entry->inode->mode & KERNEL_VFS_S_IFMT) >> 12,
+            entry->name, entry->name_length) != 1) return 1;
+    }
+    return 0;
 }
+
 static int truncate_inode(struct kernel_vfs_node *n,uint64_t size,uint64_t *actual,int *changed)
 {
     struct tmp_inode *i=ti(n); kernel_memory_object_truncate(i->memory,size);
@@ -767,7 +773,7 @@ static const struct kernel_vfs_backend tmp_ops = {
     .error=error, .root=root, .lookup=lookup, .open=open_inode, .close_node=close_node,
     .create=create, .mkdir=mkdir, .symlink=symlink, .mknod=mknod_node, .readlink=readlink,
     .unlink=unlink_file, .rmdir=rmdir, .release_unlinked=release_unlinked, .link=link_inode,
-    .rename=rename_inode, .stat=stat_inode, .statfs=statfs, .dir_entry=dir_entry,
+    .rename=rename_inode, .stat=stat_inode, .statfs=statfs, .read_directory=read_directory,
     .truncate=truncate_inode, .fallocate=punch_inode, .pread=pread_inode,
     .memory_written=memory_written, .set_times=set_times, .set_mode=set_mode, .set_owner=set_owner,
     .get_flags=get_flags,.set_flags=set_flags,

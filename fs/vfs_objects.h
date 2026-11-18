@@ -259,6 +259,7 @@ struct kernel_vfs_backend {
     int (*rmdir)(struct kernel_vfs_mount *mount,
         uint64_t parent_inode, const char *path);
     void (*release_unlinked)(struct kernel_vfs_node *node);
+    int (*read_directory)(struct kernel_vfs_file *, struct kernel_vfs_dir_batch *);
     int (*dir_entry)(struct kernel_vfs_file *file,
         uint64_t position,
         uint64_t *next_position,

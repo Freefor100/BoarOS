@@ -492,7 +492,7 @@ GDT 与 inode 的成功校验绑定块数据的实际 payload 版本。每个 pa
 只读挂载下，所有上述修改操作直接返回 `-EROFS`。
 unmount 在仍有 open file 或路径引用时返回 `-EBUSY`。末节点 `ext4_fclose` 失败把 node 转移到 mount cleanup 链，卸载重试同一个 handle；测试注入路径末引用和重复 inode 合并两种 close 失败并确认都被实际重试。非法引用或释放顺序触发 fatal，合法 heap/page 释放不返回可重试状态。
 
-当前 VFS 同时服务 ELF 随机读、进程文件表和文件私有缺页，但仍不是完整 Linux VFS：已支持硬链接、tmpfs 和多 ext4 挂载；仍没有负目录项缓存；后台写回按阈值和压力触发，顺序小读在实际冷缺失后启动有界预读，大批读取和纯热读跳过预测。`kernel_vfs_path` 持有 mount/inode 与父目录项引用；`ext4_lookup_child` 按父目录 inode 查找。统一逐分量解析处理 `.`、`..`、相对/绝对符号链接、尾斜线和最多 40 次展开；open/stat 的尾斜线按目录查找，mkdir/unlink/rmdir/symlink 保留不跟随的最终目录项语义。创建允许缺失的最终分量，直接把已持有的父 inode 与名称交给后端。open 与 stat 的单路径输入复用调用任务已有的一页 I/O 工作区，输入导入和路径解析结束后归还借用，后续设备打开或数据 I/O 不占用这份路径借用。用户输入/符号链接展开限制为 4096 字节；已存在的长父链不占短相对输入额度，255 字节组件可用于修改。路径对象释放不依赖原始绝对路径仍存在。该规则依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`fs/namei.c`](../../references/linux/fs/namei.c)。fs context 和目录 fd 直接持有解析起点；绝对路径忽略 dirfd，删除或改名不会把旧引用重定向到同名新 inode。目录支持打开与按后端 cookie 查询（`kernel_vfs_dir_entry`），会返回真实的 `.`/`..` 条目；每次查询从传入的 ext4 字节位置开始，而不是从目录起点重走，顺序枚举的条目访问为 O(N)。适配层把 lwext4 的正 errno 与 EOF 分开，再向文件资源层返回负 Linux errno。页缓存只保存普通文件内容；进程层只持有 VFS mount/file 抽象，lwext4 handle 没有泄露到 task 或 syscall ABI。
+当前 VFS 同时服务 ELF 随机读、进程文件表和文件私有缺页，但仍不是完整 Linux VFS：已支持硬链接、tmpfs 和多 ext4 挂载；仍没有负目录项缓存；后台写回按阈值和压力触发，顺序小读在实际冷缺失后启动有界预读，大批读取和纯热读跳过预测。`kernel_vfs_path` 持有 mount/inode 与父目录项引用；`ext4_lookup_child` 按父目录 inode 查找。统一逐分量解析处理 `.`、`..`、相对/绝对符号链接、尾斜线和最多 40 次展开；open/stat 的尾斜线按目录查找，mkdir/unlink/rmdir/symlink 保留不跟随的最终目录项语义。创建允许缺失的最终分量，直接把已持有的父 inode 与名称交给后端。open 与 stat 的单路径输入复用调用任务已有的一页 I/O 工作区，输入导入和路径解析结束后归还借用，后续设备打开或数据 I/O 不占用这份路径借用。用户输入/符号链接展开限制为 4096 字节；已存在的长父链不占短相对输入额度，255 字节组件可用于修改。路径对象释放不依赖原始绝对路径仍存在。该规则依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`fs/namei.c`](../../references/linux/fs/namei.c)。fs context 和目录 fd 直接持有解析起点；绝对路径忽略 dirfd，删除或改名不会把旧引用重定向到同名新 inode。目录支持打开与按后端 cookie 批量查询（`kernel_vfs_read_directory`），会返回真实的 `.`/`..` 条目；每次查询从传入的 ext4 字节位置开始，而不是从目录起点重走，顺序枚举的条目访问为 O(N)。适配层把 lwext4 的正 errno 与 EOF 分开，再向文件资源层返回负 Linux errno。页缓存只保存普通文件内容；进程层只持有 VFS mount/file 抽象，lwext4 handle 没有泄露到 task 或 syscall ABI。
 
 目录游标设计依据固定 Linux 快照 `f4cdf7ca9a1f`：[`fs/readdir.c`](../../references/linux/fs/readdir.c)
 的 `iterate_dir()` 在每次枚举前后同步 open file 的 `f_pos` 与 `dir_context.pos`，`filldir64()`
@@ -502,11 +502,33 @@ unmount 在仍有 open file 或路径引用时返回 `-EBUSY`。末节点 `ext4_
 不透明恢复值，而不能固化为条目序号。BoarOS 当前线性 ext4 适配器返回记录结束的字节位置；
 文件资源层将该值放进 OFD offset 和 `linux_dirent64.d_off`，只有完整 usercopy 后才提交。
 
-`ext4_dir_entry_next_status()` 是当前适配器的错误保留入口：一次调用从 `next_off` 定位并推进
-一个或多个物理记录，同一次 inode 读取同时取得实际目录尺寸并发布给适配层，省去每条记录前的重复 stat。inode 为零的目录尾记录不会被误判为 EOF；返回 `UINT64_MAX` 只表示真实结束。
-`kernel_vfs_dir_entry()` 对任意 seek 位置向前对齐到 4 字节边界并规范化到下一个记录，因而保存的
-cookie 可以交给 `lseek`/`telldir`/`seekdir` 恢复。OFD 持有位置，所以独立 open 的游标独立，dup/fork
-共享游标；目录节点本身不保存可变遍历状态。
+`ext4_dir_iterate()` 在有界批次内持有一份 inode 引用与目录 block iterator，顺序推进并将
+名称直接借给内核记录打包函数；不再为每项重新打开 iterator、读取 inode 或复制到第二份名称缓冲。
+inode 为零的物理记录被跳过，只有真实结束才产生 EOF。旧 lwext4 单项消费者仍通过同一个
+iterator 实现读取一项。ext4 的记录结束字节位置继续作为 cookie；seek 后从该位置重新建立
+iterator，状态不跨批次持有。tmpfs 同样每批只查一次 cookie tree，然后顺序前进。
+
+文件资源层借用任务已保留的一页 I/O 工作区，每批最多一页；短请求或页面分配失败使用
+280 字节栈内小批次。namespace/inode/backend 锁仅覆盖打包，不跨 usercopy；OFD offset lock
+覆盖整次 syscall，因此 dup/fork 与并发 seek 不会消费同一位置。复制失败按已完整复制的
+记录边界计算返回长度并提交最后一个完整 cookie，部分记录留给重试；后端错误保留完成前缀，
+EOF cookie 只有整批复制成功后才提交。批次之间允许目录变更，不持有可失效的后端指针。
+这将目录锁的持有单位从单项改为最多一页，减少重复准备和 usercopy，但不改变原 ext4
+全局锁或持久化机制。`make test-directory-batch-host` 检查两种页大小、边界/故障前缀、共享
+OFD 及目录变更交错。`tests/workloads/fs/getdents_contract.c` 是独立用户态契约，覆盖 ext4/tmpfs
+跨批次长名称、EOF、短缓冲/cookie、真实不可访问页故障以及 dup/fork/独立 open 位置；将它编译成
+目标架构的静态 ELF 后，通过正常内核启动，避开综合内核测试的前置测例：
+
+```sh
+python3 -B tests/userland/getdents.py --arch riscv --kernel kernel-rv \
+  --program build/getdents/contract-rv --output build/getdents/guest-rv
+python3 -B tests/userland/getdents.py --arch loongarch --kernel kernel-la \
+  --program build/getdents/contract-la --output build/getdents/guest-la
+```
+
+`--qemu` 可指定模拟器，输出目录须不存在；runner 同时检查完整结果、init 成功退出、root owner
+回收与 e2fsck。该契约不比较时间戳，LA 不要求 patched RTC model。吞吐与写者延迟仍需在独占
+测量窗口另行对照。
 
 ## 当前成本边界
 
