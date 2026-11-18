@@ -62,9 +62,22 @@ enum kernel_files_status kernel_block_file_io(struct kernel_open_file_descriptio
     if (count > KERNEL_FILES_MAX_RW_COUNT) count = KERNEL_FILES_MAX_RW_COUNT;
     size_t sector = device->logical_block_size;
     if (!sector || sector > SIZE_MAX - BOAROS_PAGE_SIZE) { *result = -KERNEL_EINVAL; return 0; }
+    uint32_t flags = kernel_open_file_flags(file);
+    int direct = !!(flags & KERNEL_FILES_O_DIRECT);
+    if (direct) {
+        if (sector > BOAROS_PAGE_SIZE || offset % sector || count % sector) { *result = -KERNEL_EINVAL; return 0; }
+        uint64_t remaining = count;
+        for (size_t i = 0; i < iov_count && remaining; ++i) {
+            uint64_t length = iov[i].length < remaining ? iov[i].length : remaining;
+            if (length && (iov[i].base % sector || length % sector)) {
+                *result = -KERNEL_EINVAL; return 0;
+            }
+            remaining -= length;
+        }
+    }
     unsigned char *buffer = 0;
     enum kernel_heap_status allocation = kernel_heap_allocate(file->heap,
-        BOAROS_PAGE_SIZE + sector, (void **)&buffer);
+        BOAROS_PAGE_SIZE + (direct ? 0 : sector), (void **)&buffer);
     if (allocation) {
         if (allocation != KERNEL_HEAP_STATUS_EMPTY) return KERNEL_FILES_STATUS_STATE;
         *result = -KERNEL_ENOMEM; return 0;
@@ -74,19 +87,31 @@ enum kernel_files_status kernel_block_file_io(struct kernel_open_file_descriptio
     int error = 0;
     while (total < count) {
         size_t amount = count - total < BOAROS_PAGE_SIZE ? count - total : BOAROS_PAGE_SIZE;
-        /* A backend error reports no accepted bytes for this sector; use a
-         * sector boundary so earlier successful sectors remain observable. */
+        /* Buffered RMW keeps sector-granular completion. Direct requests
+         * batch a full page and retain only earlier completed requests when
+         * the backend cannot report a partial completion for this batch. */
         size_t boundary = sector - (offset + total) % sector;
-        if (amount > boundary) amount = boundary;
+        if (!direct && amount > boundary) amount = boundary;
         size_t copied = 0, completed = 0;
         enum kernel_uaccess_status access = KERNEL_UACCESS_STATUS_OK;
         if (writing) {
             access = kernel_copy_from_user_iov(mm, &cursor, buffer, amount, &copied);
-            if (copied) error = block_error(kernel_block_write_bytes(device, offset + total,
-                buffer, copied, buffer + BOAROS_PAGE_SIZE, sector, &completed));
+            /* Faulting direct writes must not turn an incomplete source sector
+             * into a read/modify/write. Submit only the complete copied prefix.
+             * The bounded staging buffer is not a cache and retains no user
+             * mapping or DMA ownership after the synchronous request. */
+            size_t accepted = direct ? copied - copied % sector : copied;
+            if (accepted && direct) {
+                error = block_error(kernel_block_write_at(device, offset + total, buffer, accepted));
+                if (!error) completed = accepted;
+            } else if (accepted) error = block_error(kernel_block_write_bytes(device, offset + total,
+                buffer, accepted, buffer + BOAROS_PAGE_SIZE, sector, &completed));
             total += completed;
         } else {
-            error = block_error(kernel_block_read_bytes(device, offset + total, buffer,
+            if (direct) {
+                error = block_error(kernel_block_read_at(device, offset + total, buffer, amount));
+                if (!error) completed = amount;
+            } else error = block_error(kernel_block_read_bytes(device, offset + total, buffer,
                 amount, buffer + BOAROS_PAGE_SIZE, sector, &completed));
             if (completed) {
                 access = kernel_copy_to_user_iov(mm, &cursor, buffer, completed, &copied);
@@ -100,14 +125,14 @@ enum kernel_files_status kernel_block_file_io(struct kernel_open_file_descriptio
     kernel_heap_release(file->heap, buffer);
     if (!positioned) file->offset += total;
     *result = total ? (int64_t)total : error;
-    if (writing && total && (kernel_open_file_flags(file) & KERNEL_FILES_O_DSYNC)) {
+    if (writing && total && (flags & KERNEL_FILES_O_DSYNC)) {
         error = kernel_block_file_sync(file);
         if (error) *result = error;
     }
     return KERNEL_FILES_STATUS_OK;
 }
 int kernel_block_file_pread(struct kernel_open_file_description *file, uint64_t offset,
-    void *buffer, size_t size, size_t *completed)
+    void *buffer, size_t size, uint32_t status_flags, size_t *completed)
 {
     *completed = 0;
     uint64_t capacity = __atomic_load_n(&file->block->capacity_bytes, __ATOMIC_ACQUIRE);
@@ -116,6 +141,12 @@ int kernel_block_file_pread(struct kernel_open_file_description *file, uint64_t 
     if (!size) return 0;
     void *scratch = 0;
     size_t sector = file->block->logical_block_size;
+    if (status_flags & KERNEL_FILES_O_DIRECT) {
+        if (!sector || offset % sector || size % sector) return -KERNEL_EINVAL;
+        int error = block_error(kernel_block_read_at(file->block, offset, buffer, size));
+        if (!error) *completed = size;
+        return error;
+    }
     enum kernel_heap_status allocation = kernel_heap_allocate(file->heap, sector, &scratch);
     if (allocation) return allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
     int error = block_error(kernel_block_read_bytes(file->block, offset, buffer, size, scratch, sector, completed));
@@ -123,7 +154,7 @@ int kernel_block_file_pread(struct kernel_open_file_description *file, uint64_t 
     return error;
 }
 int kernel_block_file_pwrite(struct kernel_open_file_description *file, uint64_t offset,
-    const void *buffer, size_t size, size_t *completed)
+    const void *buffer, size_t size, uint32_t status_flags, size_t *completed)
 {
     *completed = 0;
     if (!kernel_open_file_writable(file)) return -KERNEL_EBADF;
@@ -133,6 +164,12 @@ int kernel_block_file_pwrite(struct kernel_open_file_description *file, uint64_t
     if (size > capacity - offset) size = capacity - offset;
     void *scratch = 0;
     size_t sector = file->block->logical_block_size;
+    if (status_flags & KERNEL_FILES_O_DIRECT) {
+        if (!sector || offset % sector || size % sector) return -KERNEL_EINVAL;
+        int error = block_error(kernel_block_write_at(file->block, offset, buffer, size));
+        if (!error) *completed = size;
+        return error;
+    }
     enum kernel_heap_status allocation = kernel_heap_allocate(file->heap, sector, &scratch);
     if (allocation) return allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
     int error = block_error(kernel_block_write_bytes(file->block, offset, buffer, size, scratch, sector, completed));

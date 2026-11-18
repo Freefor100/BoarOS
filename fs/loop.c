@@ -108,16 +108,17 @@ static enum kernel_block_status block_status(int error)
         error==-KERNEL_EROFS?KERNEL_BLOCK_STATUS_READ_ONLY:KERNEL_BLOCK_STATUS_IO;
 }
 static int backing_transfer(struct loop_device *loop,int writing,uint64_t position,
-    void *buffer,size_t size,size_t *done)
+    void *buffer,size_t size,uint32_t status_flags,size_t *done)
 {
     *done=0;
     uint64_t offset=loop->info.offset+position;
     int error;
-    if (!writing)
+    if (writing && (loop->info.flags&KERNEL_LOOP_READ_ONLY)) return -KERNEL_EROFS;
+    if (loop->backing->kind==KERNEL_OPEN_FILE_KIND_BLOCK) {
+        error=writing?kernel_block_file_pwrite(loop->backing,offset,buffer,size,status_flags,done):
+            kernel_block_file_pread(loop->backing,offset,buffer,size,status_flags,done);
+    } else if (!writing)
         error=kernel_open_file_pread(loop->backing,offset,buffer,size,done);
-    else if (loop->info.flags&KERNEL_LOOP_READ_ONLY) return -KERNEL_EROFS;
-    else if (loop->backing->kind==KERNEL_OPEN_FILE_KIND_BLOCK)
-        error=kernel_block_file_pwrite(loop->backing,offset,buffer,size,done);
     else {
         KERNEL_LOCK_SCOPE(operation);
         kernel_vfs_file_write_lock(&loop->backing->file,&operation);
@@ -129,16 +130,17 @@ static int backing_transfer(struct loop_device *loop,int writing,uint64_t positi
 static int backing_io(struct loop_device *loop,struct loop_request *request)
 {
     if (request->operation==LOOP_FLUSH) return backing_sync(loop);
+    uint32_t status_flags=kernel_open_file_flags(loop->backing);
     size_t done;
     if (request->operation==LOOP_READ || request->operation==LOOP_WRITE)
         return backing_transfer(loop,request->operation==LOOP_WRITE,request->offset,
-            request->buffer,request->size,&done);
+            request->buffer,request->size,status_flags,&done);
     int result=0;
     if (request->operation==LOOP_READ_BATCH) {
         for (size_t i=0;i<request->batch.count;i++) {
             struct block_read_span *span=&request->batch.reads[i];
             int error=span->size?backing_transfer(loop,0,span->offset,span->buffer,
-                span->size,&span->completed):0;
+                span->size,status_flags,&span->completed):0;
             if (!span->size) span->completed=0;
             span->status=block_status(error);
             if (!result) result=error;
@@ -147,7 +149,7 @@ static int backing_io(struct loop_device *loop,struct loop_request *request)
         for (size_t i=0;i<request->batch.count && !result;i++) {
             const struct kernel_block_span *span=&request->batch.writes[i];
             if (span->size) result=backing_transfer(loop,1,span->offset,
-                (void *)span->buffer,span->size,&done);
+                (void *)span->buffer,span->size,status_flags,&done);
         }
     } else __builtin_trap();
     return result;

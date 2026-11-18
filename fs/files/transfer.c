@@ -573,7 +573,7 @@ static int new_transfer_page(struct kernel_pipe *pipe,void **page)
 /* Regular sources lend their real cached/memory page. Other read_iter-style
  * sources fill the final pipe page; no user address or second staging copy. */
 static int read_transfer_page(struct kernel_open_file_description *file,struct kernel_pipe *pipe,
-    uint64_t position,size_t wanted,void **page,size_t *offset,size_t *done,int *miss)
+    uint64_t position,size_t wanted,void **page,size_t *offset,size_t *done,int *miss,uint32_t status_flags)
 {
     *done=0;*offset=0;*miss=0;
     if (file->kind==KERNEL_OPEN_FILE_KIND_REGULAR) {
@@ -617,7 +617,7 @@ static int read_transfer_page(struct kernel_open_file_description *file,struct k
         return -KERNEL_EINVAL;
     int error=new_transfer_page(pipe,page);
     if (error) return error;
-    if (file->block) error=kernel_block_file_pread(file,position,*page,wanted,done);
+    if (file->block) error=kernel_block_file_pread(file,position,*page,wanted,status_flags,done);
     else if (file->kind==KERNEL_OPEN_FILE_KIND_GENERATED && kernel_vfs_file_is_control(&file->file,0)) {
         error=kernel_vfs_file_control_permission(&file->file,0);
         if (!error) error=kernel_vfs_file_control(&file->file,0,&position,*page,wanted,done);
@@ -629,7 +629,7 @@ static int read_transfer_page(struct kernel_open_file_description *file,struct k
             memcpy(*page,file->generated_data+position,*done);
         }
     } else if (file->device && file->device->splice_read && file->device->read)
-        error=file->device->read(file->device_instance,kernel_task_current(),kernel_open_file_flags(file),*page,wanted,done);
+        error=file->device->read(file->device_instance,kernel_task_current(),status_flags,*page,wanted,done);
     else error=-KERNEL_EINVAL;
     if (!*done) release_transfer_page(pipe,*page);
     return error;
@@ -717,8 +717,9 @@ static int64_t file_into_pipe(struct kernel_open_file_description **input,
         if(position_owner.lock)kernel_lock_release(&position_owner);
         kernel_pipe_write_finish(&borrow);return error;
     }
+    uint32_t status_flags=kernel_open_file_flags(file);
     if (file->kind==KERNEL_OPEN_FILE_KIND_REGULAR) {
-        kernel_vfs_file_accessed(&file->file,kernel_open_file_flags(file));kernel_open_file_read_begin(file,*position);
+        kernel_vfs_file_accessed(&file->file,status_flags);kernel_open_file_read_begin(file,*position);
     }
     while (total<count && borrow.slots) {
         void *page=NULL;size_t offset,done;int miss;
@@ -726,7 +727,7 @@ static int64_t file_into_pipe(struct kernel_open_file_description **input,
         size_t capacity=file->kind==KERNEL_OPEN_FILE_KIND_REGULAR?
             BOAROS_PAGE_SIZE-(*position&BOAROS_PAGE_MASK):BOAROS_PAGE_SIZE;
         if(wanted>capacity)wanted=capacity;
-        error=read_transfer_page(file,pipe,*position,wanted,&page,&offset,&done,&miss);
+        error=read_transfer_page(file,pipe,*position,wanted,&page,&offset,&done,&miss,status_flags);
         if (!done) break;
         int submitted=kernel_pipe_push_page(&borrow,page,offset,done);
         if (submitted) {release_transfer_page(pipe,page);error=submitted;break;}
@@ -758,8 +759,9 @@ static int64_t pipe_into_file(struct kernel_open_file_description *input,
     int error=signed_transfer_range(*position,count),sync_error=0;
     uint64_t total=0,start=*position;
     struct kernel_vfs_size_limit limit={.maximum=kernel_task_current_fsize_limit()};
+    uint32_t status_flags=kernel_open_file_flags(file);
     uint32_t socket_flags=(flags&SPLICE_MORE)?KERNEL_SOCKET_MSG_MORE:0;
-    if(kernel_open_file_flags(file)&KERNEL_FILES_O_NONBLOCK)socket_flags|=KERNEL_SOCKET_MSG_DONTWAIT;
+    if(status_flags&KERNEL_FILES_O_NONBLOCK)socket_flags|=KERNEL_SOCKET_MSG_DONTWAIT;
     uint64_t deadline=0;
     if(file->kind==KERNEL_OPEN_FILE_KIND_SOCKET) {
         uint64_t timeout=kernel_socket_send_timeout(kernel_open_file_socket(file)),now=kernel_time_monotonic_ns();
@@ -791,7 +793,7 @@ static int64_t pipe_into_file(struct kernel_open_file_description *input,
         } else if(file->kind==KERNEL_OPEN_FILE_KIND_REGULAR)
             written=regular_copy_output(file,data,NULL,0,length,*position,&limit,total==0);
         else if(file->block) {
-            size_t done=0;error=kernel_block_file_pwrite(file,*position,data,length,&done);
+            size_t done=0;error=kernel_block_file_pwrite(file,*position,data,length,status_flags,&done);
             written=done?(int64_t)done:error;
         } else written=sendfile_output(output,data,length,deadline,socket_flags);
         if(written<0){error=(int)written;break;}
@@ -802,8 +804,8 @@ static int64_t pipe_into_file(struct kernel_open_file_description *input,
     }
     if(staging)kernel_heap_release(file->heap,staging);
     if(total && error==-KERNEL_ERESTARTSYS)kernel_signal_clear_syscall_restart(kernel_task_current());
-    if(total && (kernel_open_file_flags(file)&KERNEL_FILES_O_DSYNC)) {
-        int datasync=(kernel_open_file_flags(file)&KERNEL_FILES_O_SYNC)!=KERNEL_FILES_O_SYNC;
+    if(total && (status_flags&KERNEL_FILES_O_DSYNC)) {
+        int datasync=(status_flags&KERNEL_FILES_O_SYNC)!=KERNEL_FILES_O_SYNC;
         if(file->kind==KERNEL_OPEN_FILE_KIND_REGULAR)
             sync_error=kernel_vfs_sync_range_borrowing(&file->file,*position-total,*position,datasync,
                 &file->observed_writeback_error,NULL);

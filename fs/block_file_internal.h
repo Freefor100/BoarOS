@@ -8,8 +8,10 @@ struct kernel_uaccess_iovec;
 int kernel_block_file_open(struct kernel_open_file_description *, uint64_t number, uint32_t flags);
 void kernel_block_file_close(struct kernel_open_file_description *);
 int kernel_block_file_sync(struct kernel_open_file_description *);
-int kernel_block_file_pwrite(struct kernel_open_file_description *, uint64_t, const void *, size_t, size_t *);
-int kernel_block_file_pread(struct kernel_open_file_description *, uint64_t, void *, size_t, size_t *);
+int kernel_block_file_pwrite(struct kernel_open_file_description *, uint64_t, const void *, size_t,
+    uint32_t status_flags, size_t *);
+int kernel_block_file_pread(struct kernel_open_file_description *, uint64_t, void *, size_t,
+    uint32_t status_flags, size_t *);
 /* The caller validates numeric user ranges before dispatching this view. */
 enum kernel_files_status kernel_block_file_io(struct kernel_open_file_description *,
     struct kernel_mm *, const struct kernel_uaccess_iovec *, size_t, uint64_t,

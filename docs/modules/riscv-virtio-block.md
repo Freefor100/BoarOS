@@ -85,7 +85,24 @@ flush仍同步实际后备对象，解绑与自动清理沿设备使用者和在
 
 块节点打开先按调用者 fs IDs 和节点权限判断，已打开 OFD 保留原读写权利。`BLKROSET`、`BLKBSZSET`、`BLKFLSBUF` 在读取用户参数之前检查当前调用者的 CAP_SYS_ADMIN，缺少时按固定 Linux 返回 EACCES。loop 的 SET_STATUS/SET_STATUS64/SET_CAPACITY 则允许“原 OFD 有写打开权利”或 CAP_SYS_ADMIN；两者都没有时为 EPERM。绑定、解绑和 control 操作继续按具体设备打开及操作规则处理。
 
-块设备 ioctl 支持 `BLKGETSIZE`（512 字节扇区数）、`BLKGETSIZE64`（字节数）、`BLKSSZGET`、`BLKROGET/SET`、`BLKBSZGET/SET` 和 `BLKFLSBUF`。软件块大小是设备共享状态，只接受不小于逻辑扇区、介于 512 和架构页大小之间的 2 的幂；设置时需要已有独占资格或临时 claim。只读状态下仍允许以 `O_WRONLY/O_RDWR` 打开；新旧 OFD 的实际写入均返回 EPERM。fsync、fdatasync、`O_SYNC/O_DSYNC` 和 `BLKFLSBUF` 调用同一真实设备 flush；`BLKFLSBUF` 先持有挂载根路径并同步该设备上的文件系统，将缓存的文件数据和元数据交给设备。错误如实返回。没有裸设备缓存需要清除。mmap、`O_DIRECT`、discard、secure discard 和 zeroout 当前明确不支持。
+`O_DIRECT` 可以在块设备打开时指定，也可以通过 `F_SETFL` 在共享打开文件描述（OFD）
+上切换。一次读写或 splice 使用同一份状态标志。用户读写的偏移、有效总长度以及每个非空
+iovec 的地址和长度按设备逻辑扇区对齐。有效请求每次最多提交一个架构页，经过临时内核
+缓冲区完成用户复制和设备传输。用户源缺页时只提交已复制的完整扇区，保留设备确认的
+前缀。`O_SYNC`、`O_DSYNC` 和显式同步操作可以请求设备持久化。
+
+普通和 direct 块设备 FD 共用无页缓存的块层路径和传输锁。loop 上的 direct 块设备
+FD 仍按后备普通文件的文件系统规则读写。`O_DIRECT` 的块设备支持范围是未挂载设备，
+已挂载文件系统独立管理其缓存。普通文件支持情况见[文件模块](kernel-files.md)。
+
+`FILE_IO_HOST_TCP=0 FILE_IO_BLOCK_ONLY=1 sh tests/host/file-io-concurrency.sh` 检查
+对齐、故障前缀和 splice 中途切换状态标志。`tests/userland/direct-block.py` 运行
+`tests/workloads/io/direct-block.c` 的静态 ELF，使用私有 VirtIO 盘和 loop 设备。
+同一 ELF 可以接受 Linux 上未挂载的私有块设备路径，检查对齐、盘尾截断和共享 OFD。
+以 `-DBOAROS_BLOCK_DIRECT_ONLY` 编译 `tests/userland/tmpfile.c` 后可用
+`tests/userland/tmpfile.py` 检查匿名临时文件与普通文件打开的拒绝路径。
+
+块设备 ioctl 支持 `BLKGETSIZE`（512 字节扇区数）、`BLKGETSIZE64`（字节数）、`BLKSSZGET`、`BLKROGET/SET`、`BLKBSZGET/SET` 和 `BLKFLSBUF`。软件块大小是设备共享状态，只接受不小于逻辑扇区、介于 512 和架构页大小之间的 2 的幂；设置时需要已有独占资格或临时 claim。只读状态下仍允许以 `O_WRONLY/O_RDWR` 打开；新旧 OFD 的实际写入均返回 EPERM。fsync、fdatasync、`O_SYNC/O_DSYNC` 和 `BLKFLSBUF` 调用同一真实设备 flush；`BLKFLSBUF` 先持有挂载根路径并同步该设备上的文件系统，将缓存的文件数据和元数据交给设备。错误如实返回。没有裸设备缓存需要清除。mmap、discard、secure discard 和 zeroout 当前明确不支持。
 
 `kernel_block_flush()` 表示设备持久化边界。块设备显式声明 UNKNOWN、WRITETHROUGH 或 WRITEBACK；未知能力且没有 flush 回调返回 UNSUPPORTED，只有声明 write-through 的设备可以省略 flush。VirtIO 协商 `VIRTIO_BLK_F_FLUSH`（bit 9），发送独立的 type 4 请求，只有 header/status 两个描述符，不带数据。未协商 CONFIG_WCE，因此 FLUSH 存在表示 writeback，缺失表示 write-through；驱动不修改缓存模式。该规则依据固定 Linux `references/linux/drivers/block/virtio_blk.c` 的 `virtblk_get_cache_mode()`（`f4cdf7ca9a1fdcca413157df19753f388a5a224e`）与 QEMU `references/qemu/hw/block/virtio-blk.c`（v11.1.0，`84f07211cc5b4fc6a371559bf8a5de4fb068e648`）。设备错误和超时保持所属状态，flush 请求单独计数。
 
