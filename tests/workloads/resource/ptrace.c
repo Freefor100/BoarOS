@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <sys/stat.h>
 #include <signal.h>
 #include <stdio.h>
@@ -11,6 +12,7 @@
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 #define CHECK(test) do { if (!(test)) { dprintf(2,"PTRACE FAIL line=%d errno=%d %s\n",__LINE__,errno,#test); _exit(1); } } while(0)
 static volatile long word = 73;
@@ -58,6 +60,71 @@ static void syscall_original_argument(void)
     char saved;
     CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
     CHECK(pread(fd, &saved, 1, 0) == 1 && saved == 'x' && !close(fd));
+}
+
+static void wait_for_sleep(pid_t child)
+{
+    char path[64], stat[512];
+    CHECK(snprintf(path, sizeof(path), "/proc/%d/stat", child) > 0);
+    for (unsigned attempt = 0; attempt < 100000; attempt++) {
+        int fd = open(path, O_RDONLY);
+        CHECK(fd >= 0);
+        ssize_t bytes = read(fd, stat, sizeof(stat) - 1);
+        CHECK(bytes > 0 && !close(fd));
+        stat[bytes] = 0;
+        char *state = strrchr(stat, ')');
+        CHECK(state && state[1] == ' ' && state[2] != 'Z');
+        if (state[2] == 'S') return;
+        sched_yield();
+    }
+    CHECK(0);
+}
+
+static void replaced_restart(void)
+{
+    pid_t parent = getpid(), child = fork();
+    CHECK(child >= 0);
+    if (!child) {
+        CHECK(!ptrace(PTRACE_TRACEME, 0, 0, 0));
+        CHECK(!syscall(SYS_kill, getpid(), SIGSTOP));
+        struct timespec duration = {.tv_sec = 3};
+        CHECK(syscall(SYS_nanosleep, &duration, NULL) == parent);
+        CHECK(syscall(SYS_restart_syscall) == -1 && (errno == ENOSYS || errno == EINTR));
+        _exit(0);
+    }
+    int status;
+    CHECK(waitpid(child, &status, 0) == child && WIFSTOPPED(status));
+    CHECK(!ptrace(PTRACE_SETOPTIONS, child, 0, (void *)PTRACE_O_TRACESYSGOOD));
+    CHECK(!ptrace(PTRACE_CONT, child, 0, 0));
+    wait_for_sleep(child);
+    CHECK(!kill(child, SIGSTOP));
+    CHECK(waitpid(child, &status, 0) == child && WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP);
+    CHECK(!ptrace(PTRACE_CONT, child, 0, (void *)SIGSTOP));
+    CHECK(waitpid(child, &status, 0) == child && WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP);
+    CHECK(!kill(child, SIGCONT) && !ptrace(PTRACE_SYSCALL, child, 0, 0));
+    for (;;) {
+        CHECK(waitpid(child, &status, 0) == child && WIFSTOPPED(status));
+        if (WSTOPSIG(status) == (SIGTRAP | 128)) {
+            uint64_t info[10] = {0};
+            CHECK(syscall(SYS_ptrace, 0x420e, child, sizeof(info), info) > 0);
+            if ((uint8_t)info[0] == 1 && info[3] == SYS_restart_syscall) break;
+            CHECK(!ptrace(PTRACE_SYSCALL, child, 0, 0));
+        } else {
+            CHECK(WSTOPSIG(status) == SIGCONT);
+            CHECK(!ptrace(PTRACE_SYSCALL, child, 0, (void *)SIGCONT));
+        }
+    }
+    uint64_t registers[64];
+    struct iovec regs = {registers, sizeof(registers)};
+    CHECK(!ptrace(PTRACE_GETREGSET, child, (void *)1, &regs));
+#if defined(__riscv)
+    registers[17] = SYS_getppid;
+#else
+    registers[11] = SYS_getppid;
+#endif
+    CHECK(!ptrace(PTRACE_SETREGSET, child, (void *)1, &regs));
+    CHECK(!ptrace(PTRACE_CONT, child, 0, 0));
+    CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
 }
 #endif
 static void kill_before_write(void)
@@ -297,6 +364,7 @@ int main(void)
     kill_before_write();
 #if defined(__riscv) || defined(__loongarch__)
     syscall_original_argument();
+    replaced_restart();
 #endif
     tracer_death(0);
     tracer_death(PTRACE_O_EXITKILL);
