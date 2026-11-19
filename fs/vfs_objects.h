@@ -128,6 +128,7 @@ struct kernel_vfs_path {
     struct kernel_vfs_mount *mounted_here;
     uint32_t references;
     uint8_t transient; /* Resolver-owned component storage, never published. */
+    bool borrow_mount; /* Lifetime covered by a resolver input path. */
 };
 
 struct kernel_vfs_rename_result {

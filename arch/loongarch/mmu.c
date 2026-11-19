@@ -748,9 +748,11 @@ enum arch_mmu_status arch_mmu_user_detach_range(
                 if (!(old&PTE_PRESENT) || (!(old&PTE_NONE) && !s->leaf_pages) || s->table_pages<3 ||
                     ((old&PTE_NONE) && !s->protected_pages) || ((old&PTE_COW) && !s->cow_pages)) return ARCH_MMU_STATUS_STATE;
                 uint64_t physical=old & PTE_ADDRESS;
+#if BOAROS_LOCK_DEBUG
                 void *owned;
                 if (physical_page_map_owned(s->allocator,physical,&owned)!=PHYSICAL_PAGE_STATUS_OK)
                     return ARCH_MMU_STATUS_STATE;
+#endif
                 /* resident必须在身份仍属于这个PTE时解绑；释放仍由MM在raw外完成。 */
                 if (before_detach) before_detach(owner,address,physical);
                 __atomic_store_n(&leaves[l],0,__ATOMIC_RELEASE);

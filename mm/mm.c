@@ -3306,42 +3306,61 @@ static enum kernel_mm_status unmap_space_range(
     if (start<ARCH_MMU_PAGE_SIZE) start=ARCH_MMU_PAGE_SIZE;
     struct kernel_mm_detach_cursor cursor={0};
     enum arch_mmu_status status;
+    enum { DETACH_CHUNKS_PER_LOCK = 2, DETACH_CHUNKS_LARGE = 8 };
+    struct kernel_mm_retirement local[DETACH_CHUNKS_PER_LOCK];
+    struct kernel_mm_retirement *batches = local;
+    unsigned capacity = DETACH_CHUNKS_PER_LOCK;
+#if BOAROS_MAX_CPUS > 1
+    if (end - start >= 32U * BOAROS_PAGE_SIZE) {
+        void *storage;
+        if (!kernel_heap_allocate_nosleep(record->vma_heap,
+            DETACH_CHUNKS_LARGE * sizeof(*batches), &storage)) {
+            batches = storage;
+            capacity = DETACH_CHUNKS_LARGE;
+        }
+    }
+#endif
     do {
-        enum { DETACH_CHUNKS_PER_SYNC = 2 };
-        struct kernel_mm_retirement batches[DETACH_CHUNKS_PER_SYNC] = {0};
         struct mm_unmap_residents residents={.record=record};
         uint32_t targets = 0;
-        unsigned count = 0;
+        unsigned count = 0, publications = 0;
         int nonleaf = 0;
         uint64_t last_end = 0;
-        /* Keep each metadata section bounded. Every chunk publishes its own
-         * generation and samples joining CPUs before releasing protection. */
-        for (unsigned i = 0; i < DETACH_CHUNKS_PER_SYNC; i++) {
-            struct kernel_mm_retirement *batch = &batches[count];
-            {
-                KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
+        for (unsigned first = 0; first < capacity; first += DETACH_CHUNKS_PER_LOCK) {
+            /* Each short section has its own publication. CPUs joining between
+             * sections can cache later leaves and must be included again. */
+            unsigned before = count;
+            KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
+            for (unsigned i = 0; i < DETACH_CHUNKS_PER_LOCK; i++) {
+                struct kernel_mm_retirement *batch = &batches[count];
+                batch->count = batch->nonleaf = batch->compound = 0;
                 status = arch_mmu_user_detach_range(&record->space, start, end,
                     &cursor, batch, unmap_resident_before_pte, &residents);
-                if (batch->count) targets |= note_tlb_change_locked(record, batch, 0);
+                if (status!=ARCH_MMU_STATUS_OK && status!=ARCH_MMU_STATUS_NOT_MAPPED) __builtin_trap();
+                if (batch->count) {
+                    nonleaf |= batch->nonleaf;
+                    last_end = residents.last + ((uint64_t)BOAROS_PAGE_SIZE <<
+                        batch->orders[batch->count - 1]);
+                    count++;
+                }
+                if (status == ARCH_MMU_STATUS_NOT_MAPPED) break;
             }
-            if (status!=ARCH_MMU_STATUS_OK && status!=ARCH_MMU_STATUS_NOT_MAPPED) __builtin_trap();
-            if (batch->count) {
-                nonleaf |= batch->nonleaf;
-                last_end = residents.last + ((uint64_t)BOAROS_PAGE_SIZE <<
-                    batch->orders[batch->count - 1]);
-                count++;
+            if (count != before) {
+                targets |= note_tlb_change_locked(record, &batches[before], 0);
+                publications++;
+#if BOAROS_COST_DIAGNOSTICS
+                for (unsigned i = before + 1; i < count; i++)
+                    record->retired_pages += batches[i].count;
+#endif
             }
             if (status == ARCH_MMU_STATUS_NOT_MAPPED) break;
-            /* Preserve a precise local fence for an isolated base leaf. */
-            if (count && !nonleaf && last_end - residents.first == BOAROS_PAGE_SIZE)
-                break;
         }
         if (count) {
             sync_tlb_change(targets, nonleaf ? 0 : residents.first,
                 nonleaf ? UINT64_MAX : last_end - residents.first, 0);
             for (unsigned i = 0; i < count; i++)
                 kernel_mm_retirement_release(record->space.allocator, &batches[i]);
-            retirement_complete(record, count);
+            retirement_complete(record, publications);
         }
         if (residents.lazy_removed) lazy_drain(record);
         while (residents.removed) {
@@ -3350,6 +3369,7 @@ static enum kernel_mm_status unmap_space_range(
             retire_file_resident(record,page);
         }
     } while (status==ARCH_MMU_STATUS_OK);
+    if (batches != local) kernel_heap_release(record->vma_heap, batches);
     return KERNEL_MM_STATUS_OK;
 }
 
@@ -6070,7 +6090,8 @@ static enum kernel_mm_status mapped_object_fault(struct mm_operation *operation,
 static __attribute__((noinline)) uint64_t map_file_neighbours(
     struct kernel_mm_record *record,struct kernel_open_file_description *file,
     struct kernel_elf64_source *source,const struct kernel_vma *vma,
-    uint64_t address,uint64_t *begin)
+    uint64_t address,uint64_t *begin,
+    const struct kernel_mm_retirement *batch,uint32_t *targets)
 {
     uint64_t end=address+BOAROS_PAGE_SIZE;
     uint64_t first=address&~UINT64_C(65535),limit=first+65536;
@@ -6123,6 +6144,9 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
             if (address < *begin) *begin = address;
             if (address + BOAROS_PAGE_SIZE > end) end = address + BOAROS_PAGE_SIZE;
         }
+        if (installed && targets)
+            *targets = note_fault_change_locked(record,batch,0,
+                (vma->permissions & KERNEL_MM_EXECUTE) != 0);
     }
     unsigned unused = 0, i = 0;
     for (unsigned bits = ready, index = 0; bits; bits >>= 1, index++) {
@@ -6371,8 +6395,9 @@ prepare_file_tables:
     if (status == KERNEL_MM_STATUS_OK) {
         uint64_t begin=address,end=address+BOAROS_PAGE_SIZE;
         if (map_neighbours)
-            end = map_file_neighbours(record,file,NULL,vma,address,&begin);
-        if (defer_sync) {
+            end = map_file_neighbours(record,file,NULL,vma,address,&begin,
+                &batch,defer_sync ? &targets : NULL);
+        if (defer_sync && end - begin == BOAROS_PAGE_SIZE) {
             KERNEL_RAW_WRITE_SCOPE(raw,&record->metadata);
             targets=note_fault_change_locked(record,&batch,0,instructions);
         }
@@ -6888,10 +6913,12 @@ memory_tables_changed:
     if (status == KERNEL_MM_STATUS_OK) {
         uint64_t begin=address,end=address+BOAROS_PAGE_SIZE;
         if (fault_batch) {
-            end=map_file_neighbours(record,NULL,source,vma,address,&begin);
-            KERNEL_RAW_WRITE_SCOPE(raw,&record->metadata);
-            targets=note_fault_change_locked(record,&batch,0,
-                (vma->permissions&KERNEL_MM_EXECUTE)!=0);
+            end=map_file_neighbours(record,NULL,source,vma,address,&begin,&batch,&targets);
+            if (end - begin == BOAROS_PAGE_SIZE) {
+                KERNEL_RAW_WRITE_SCOPE(raw,&record->metadata);
+                targets=note_fault_change_locked(record,&batch,0,
+                    (vma->permissions&KERNEL_MM_EXECUTE)!=0);
+            }
         }
         /* Without Svvptc a new non-leaf needs full walk-cache invalidation;
          * replaced COW owners always remain until actual sync completes. */

@@ -1056,6 +1056,22 @@ static int ext4_link(struct ext4_mountpoint *mp, struct ext4_inode_ref *parent,
 	return r;
 }
 
+static void ext4_unlink_update_links(struct ext4_mountpoint *mp,
+    struct ext4_inode_ref *parent, struct ext4_inode_ref *child)
+{
+	if (ext4_inode_is_type(ext4_fs_super(&mp->fs), child->inode,
+			      EXT4_INODE_MODE_DIRECTORY)) {
+		ext4_fs_inode_links_count_dec(parent);
+		parent->dirty = true;
+	}
+	ext4_touch_inode(mp, parent, EXT4_TIME_MTIME | EXT4_TIME_CTIME, NULL);
+	ext4_touch_inode(mp, child, EXT4_TIME_CTIME, NULL);
+	if (ext4_inode_get_links_cnt(child->inode)) {
+		ext4_fs_inode_links_count_dec(child);
+		child->dirty = true;
+	}
+}
+
 static int ext4_unlink(struct ext4_mountpoint *mp,
 		       struct ext4_inode_ref *parent,
 		       struct ext4_inode_ref *child, const char *name,
@@ -1075,22 +1091,7 @@ static int ext4_unlink(struct ext4_mountpoint *mp,
 	if (rc != EOK)
 		return rc;
 
-	bool is_dir = ext4_inode_is_type(ext4_fs_super(&mp->fs), child->inode,
-					 EXT4_INODE_MODE_DIRECTORY);
-
-	/* If directory - handle links from parent */
-	if (is_dir) {
-		ext4_fs_inode_links_count_dec(parent);
-		parent->dirty = true;
-	}
-
-    ext4_touch_inode(mp, parent, EXT4_TIME_MTIME | EXT4_TIME_CTIME, NULL);
-    ext4_touch_inode(mp, child, EXT4_TIME_CTIME, NULL);
-	if (ext4_inode_get_links_cnt(child->inode)) {
-		ext4_fs_inode_links_count_dec(child);
-		child->dirty = true;
-	}
-
+	ext4_unlink_update_links(mp, parent, child);
 	return EOK;
 }
 
@@ -3749,6 +3750,7 @@ static int ext4_unlink_dentry_core(struct ext4_mountpoint *mp, uint32_t parent_i
 	int len;
 	struct ext4_inode_ref child = {0};
 	struct ext4_inode_ref parent = {0};
+	struct ext4_dir_search_result found = {0};
 
 	if (!mp)
 		return ENOENT;
@@ -3758,14 +3760,39 @@ static int ext4_unlink_dentry_core(struct ext4_mountpoint *mp, uint32_t parent_i
 
 	EXT4_MP_LOCK(mp);
     bool private_refs = ext4_current_trans(&mp->fs) != NULL;
+    bool reuse_dirent = parent_inode && private_refs;
     size_t prefix = parent_inode ? 0 : strlen(mp->name);
-    r = ext4_open_relative(NULL, mp, parent_inode ? parent_inode : EXT4_INODE_ROOT_INDEX,
-        path + prefix, O_RDONLY, EXT4_DE_UNKNOWN, NULL, &name_off, &child, &parent);
-    if (r != EOK) { EXT4_MP_UNLOCK(mp); return r; }
-    name_off += prefix;
+    if (reuse_dirent) {
+        /* The caller owns the private metadata operation and the parent
+         * namespace. Resolve and keep its writable dirent through removal. */
+        if (mp->fs.super_replay_required) {
+            EXT4_MP_UNLOCK(mp);
+            return EUCLEAN;
+        }
+        r = ext4_trans_start(mp);
+        if (r != EOK) goto PutRefs;
+        r = ext4_fs_get_inode_ref(&mp->fs, parent_inode, &parent);
+        if (r != EOK) goto Finish;
+        if (!ext4_inode_get_links_cnt(parent.inode) ||
+            !ext4_inode_is_type(&mp->fs.sb, parent.inode, EXT4_INODE_MODE_DIRECTORY)) {
+            r = ext4_inode_get_links_cnt(parent.inode) ? ENOTDIR : ENOENT;
+            goto Finish;
+        }
+        len = strlen(path);
+        r = ext4_dir_find_entry(&found, &parent, path, len, true);
+        if (r != EOK) goto Finish;
+        r = ext4_fs_get_inode_ref(&mp->fs, ext4_dir_en_get_inode(found.dentry), &child);
+        if (r != EOK) goto Finish;
+    } else {
+        r = ext4_open_relative(NULL, mp, parent_inode ? parent_inode : EXT4_INODE_ROOT_INDEX,
+            path + prefix, O_RDONLY, EXT4_DE_UNKNOWN, NULL, &name_off, &child, &parent);
+        if (r != EOK) { EXT4_MP_UNLOCK(mp); return r; }
+        path += name_off + prefix;
+        len = ext4_path_check(path, &is_goal);
+        r = ext4_trans_start(mp);
+        if (r != EOK) goto PutRefs;
+    }
     child_inode = child.index;
-    r = ext4_trans_start(mp);
-    if (r != EOK) goto PutRefs;
     /* Lookup precedes an independent operation's begin. Upgrade its existing
      * accepted loans in place; an outer operation already owns private refs. */
     if (!private_refs) {
@@ -3784,14 +3811,10 @@ static int ext4_unlink_dentry_core(struct ext4_mountpoint *mp, uint32_t parent_i
         if (r != EOK) goto Finish;
     }
 
-	/*Set path*/
-	path += name_off;
-
-	len = ext4_path_check(path, &is_goal);
-
-	/*Unlink from parent*/
-	r = ext4_unlink(mp, &parent, &child, path, len);
+	r = reuse_dirent ? ext4_dir_remove_found(&parent, &found) :
+        ext4_dir_remove_entry(&parent, path, len);
 	if (r == EOK) {
+		ext4_unlink_update_links(mp, &parent, &child);
 		if (allow_directory) {
 			ext4_inode_set_links_cnt(child.inode, 0);
 			child.dirty = true;
@@ -3805,8 +3828,9 @@ static int ext4_unlink_dentry_core(struct ext4_mountpoint *mp, uint32_t parent_i
 	}
 
 Finish:
-    r = ext4_result(r, ext4_fs_put_inode_ref(&child));
-    r = ext4_result(r, ext4_fs_put_inode_ref(&parent));
+    if (found.block.lb_id) r = ext4_result(r, ext4_dir_destroy_result(&parent, &found));
+    if (child.block.data) r = ext4_result(r, ext4_fs_put_inode_ref(&child));
+    if (parent.block.data) r = ext4_result(r, ext4_fs_put_inode_ref(&parent));
     r = ext4_trans_finish(mp, r);
     EXT4_MP_UNLOCK(mp);
     return r;

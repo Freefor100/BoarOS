@@ -1288,11 +1288,11 @@ enum riscv_sv39_status riscv_sv39_user_detach_range(
         if (boundary) return boundary;
         cursor->address=start; cursor->phase=1;
     }
+    uint64_t *root;
+    enum riscv_sv39_status status=resolve_runtime_table(s->allocator,s->root_address,&root);
+    if (status) return status;
     unsigned visits=0;
     while (visits<16 && batch->count<=KERNEL_MM_RETIRE_CAPACITY-3) {
-        uint64_t *root;
-        enum riscv_sv39_status status=resolve_runtime_table(s->allocator,s->root_address,&root);
-        if (status) return status;
         if (cursor->phase==2) {
             unsigned r=cursor->middle_address>>30;
             /* Another disjoint range may have retired or replaced this
@@ -1360,9 +1360,11 @@ enum riscv_sv39_status riscv_sv39_user_detach_range(
                         (protected && !s->protected_pages) || (cow && !s->cow_pages) || s->table_pages<3)
                         return RISCV_SV39_STATUS_STATE;
                     uint64_t physical=entry_address(old);
+#if BOAROS_LOCK_DEBUG
                     void *owned;
                     if (physical_page_map_owned(s->allocator,physical,&owned)!=PHYSICAL_PAGE_STATUS_OK)
                         return RISCV_SV39_STATUS_STATE;
+#endif
                     /* resident必须在身份仍属于这个PTE时解绑；释放仍由MM在raw外完成。 */
                     if (before_detach) before_detach(owner,address,physical);
                     __atomic_store_n(&leaves[l],0,__ATOMIC_RELEASE);

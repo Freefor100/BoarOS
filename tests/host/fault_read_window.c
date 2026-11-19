@@ -218,10 +218,6 @@ static void window_errors(struct kernel_page_cache *cache,struct kernel_open_fil
     assert(kernel_open_file_prepare_mapping_page(file,0,1,&prepared)==-KERNEL_EIO && !prepared.pending);
     reset_window(cache,file);source_error=-KERNEL_ENOMEM;
     assert(kernel_open_file_prepare_mapping_page(file,0,1,&prepared)==-KERNEL_ENOMEM && !prepared.pending);
-    reset_window(cache,file);fail_workspace_allocation=1;
-    assert(!kernel_open_file_prepare_mapping_page(file,0,1,&prepared) && !fail_workspace_allocation);
-    assert(source_reads==1);
-    kernel_open_file_finish_mapping_page(file,&prepared,0);
     for (unsigned point=1;point<=BOAROS_PAGE_CACHE_READAHEAD_PAGES+3U;point++) {
         reset_window(cache,file);disk_fail_page=point;
         assert(!kernel_open_file_prepare_mapping_page(file,0,1,&prepared));
@@ -235,7 +231,7 @@ static void window_errors(struct kernel_page_cache *cache,struct kernel_open_fil
         disk_fail_heap=0;
         finish_window(cache,file,&prepared);
     }
-    puts("PASS fault window EIO: bad neighbour stays local, target/global errors propagate; workspace/page/entry OOM preserves scalar demand");
+    puts("PASS fault window EIO: bad neighbour stays local, target/global errors propagate; page/entry OOM preserves scalar demand");
 }
 
 static void window_policy(struct kernel_page_cache *cache,struct kernel_open_file_description *file)
@@ -272,6 +268,28 @@ static void *window_reader(void *argument)
     call->error=kernel_open_file_prepare_mapping_page(call->file,call->index,call->window,&call->prepared);
     window_allocate_actor=0;
     __atomic_store_n(&call->done,1,__ATOMIC_RELEASE);return NULL;
+}
+
+static void window_workspace_oom(struct kernel_page_cache *cache,struct kernel_open_file_description *file)
+{
+    if (BOAROS_PAGE_CACHE_READAHEAD_PAGES < 2) return;
+    reset_window(cache,file);
+    window_allocate_entered=window_allocate_resume=0;
+    struct window_call owner={.file=file,.actor=1,.window=1,.race=1};
+    pthread_t loader;
+    assert(!pthread_create(&loader,NULL,window_reader,&owner));
+    wait_progress(&window_allocate_entered,1);
+    /* The paused demand owns the idle workspace. This disjoint demand
+     * must allocate its own control area or make scalar progress. */
+    struct kernel_open_file_page_preparation prepared={0};
+    fail_workspace_allocation=1;
+    assert(!kernel_open_file_prepare_mapping_page(file,24,1,&prepared) && !fail_workspace_allocation);
+    assert(source_reads==1 && *(unsigned char *)access_page(prepared.address)==0x30+24);
+    finish_window(cache,file,&prepared);
+    __atomic_store_n(&window_allocate_resume,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(loader,NULL) && !owner.error);
+    finish_window(cache,file,&owner.prepared);
+    puts("PASS fault workspace OOM while another demand holds the reusable area");
 }
 
 static void window_neighbour_loading(struct kernel_page_cache *cache,struct kernel_open_file_description *file)
@@ -987,6 +1005,7 @@ int main(int argc,char **argv)
     cold_window(&cache,file,KERNEL_PAGE_CACHE_FAULT_EXEC_AHEAD);
     exec_read_around(&cache,file);
     window_errors(&cache,file);
+    window_workspace_oom(&cache,file);
     window_policy(&cache,file);
     window_loading(&cache,file);
     window_neighbour_loading(&cache,file);

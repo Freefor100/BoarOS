@@ -776,6 +776,18 @@ int main(void)
     CHECK(kernel_mm_lookup(&mm,BASE+23*P,&unmap_last)==KERNEL_MM_STATUS_NOT_MAPPED);
     CHECK(!kernel_mm_lookup(&mm,BASE+24*P,&unmap_last));
     CHECK(!kernel_mm_munmap(&mm,BASE+24*P,P));
+    assert(!map(BASE,81*P,RW,0));
+    for (unsigned i=0;i<81;i++) assert(!kernel_mm_resolve_user_fault(&mm,BASE+i*P,KERNEL_MM_WRITE));
+    assert(!kernel_mm_lookup(&mm,BASE,&unmap_first) && !kernel_mm_lookup(&mm,BASE+79*P,&unmap_last));
+    unmap_owners[0]=unmap_first.physical_address;
+    unmap_owners[1]=unmap_last.physical_address;
+    unmap_fences=0;
+    CHECK(!kernel_mm_munmap(&mm,BASE,80*P));
+    CHECK(unmap_fences==1);
+    unmap_owners[0]=0;
+    CHECK(kernel_mm_lookup(&mm,BASE+79*P,&unmap_last)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(!kernel_mm_lookup(&mm,BASE+80*P,&unmap_last));
+    CHECK(!kernel_mm_munmap(&mm,BASE+80*P,P));
     /* Fork policy controls actual child leaves and refs, not just a VMA flag. */
     assert(!map(BASE,4*P,RW,0));
     struct kernel_mm_mapping fork_page, original_page;

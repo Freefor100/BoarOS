@@ -14,6 +14,7 @@ static struct {
     bool active;
     uint32_t parent, child;
     unsigned parent_gets, child_gets, parent_puts, child_puts;
+    unsigned searches, writable_searches;
 } unlink_ref;
 
 static bool create_ref_inode(uint32_t inode)
@@ -69,6 +70,10 @@ int __wrap_ext4_dir_find_entry(struct ext4_dir_search_result *result, struct ext
 {
     if (create_ref.active && strlen(create_ref.name) == length && !memcmp(create_ref.name, name, length))
         create_ref.searches++;
+    if (unlink_ref.active && parent->index == unlink_ref.parent) {
+        unlink_ref.searches++;
+        if (write) unlink_ref.writable_searches++;
+    }
     return __real_ext4_dir_find_entry(result, parent, name, length, write);
 }
 
@@ -313,6 +318,8 @@ static void unlink_ref_test(struct ext4_fs *fs)
                 unlink_ref.parent_gets, unlink_ref.parent_puts, unlink_ref.child_gets, unlink_ref.child_puts);
         CHECK(unlink_ref.parent_gets == 1 && unlink_ref.child_gets == 1 &&
             unlink_ref.parent_puts == 1 && unlink_ref.child_puts == 1);
+        if (outer && !(i & 1))
+            CHECK(unlink_ref.searches == 1 && unlink_ref.writable_searches == 1);
         if (outer) CHECK(ext4_transaction_end("/") == EOK);
         struct ext4_inode raw;
         CHECK(ext4_fraw_inode_fill(&file, &raw) == EOK && !ext4_inode_get_links_cnt(&raw));
