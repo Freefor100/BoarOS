@@ -1,9 +1,8 @@
-# Local snapshots of specifications, source trees, board documents, rules,
-# harnesses, and public tests. Keep only the restoration metadata in Git.
+# Local reference material and downloaded inputs.
 /references/*
 !/references/README.md
-!/references/fetch.sh
 !/references/sources.tsv
+/sdcard/
 
 # Kernel and userspace build outputs.
 /build/

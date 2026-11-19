@@ -1,161 +1,17 @@
-# 第三方代码
+# 第三方组件
 
-## lwIP
+BoarOS 采用 GPL-2.0-only。随仓库分发的第三方代码和归档保留上游版权及许可声明。
 
-- 上游地址：<https://github.com/lwip-tcpip/lwip>（Savannah 上游的官方镜像）。
-- 固定版本：`STABLE-2_2_1_RELEASE`，peeled commit `77dcd25a72509eb83f72b033d219b1d40cd8eb95`；`references/sources.tsv` 固定恢复身份，2026-09-27 核对。
-- 导入路径：`third_party/lwip/`，保留 `src/core/`、`src/include/`、官方 Ethernet 入口和 `COPYING`；未导入 socket/netconn API 实现、应用、PPP 和上游具体网卡驱动。
-- 许可证：BSD-3-Clause，原有版权和许可声明保留在每个源码文件及 `COPYING`。
-- 用途：向 BoarOS 的 socket 层提供 IPv4／IPv6 的 UDP 和 TCP，以及 IPv4 ICMP raw PCB，使用 NO_SYS raw API。IP 输入、UDP、ICMP raw 和网卡由网络执行者服务，已建立的 TCP 连接可分属不同 CPU。RAW、组播发送选项和广播许可由 BoarOS 配置启用；不启用 IGMP 或组播成员管理。
-- 本地修改：IPv6 无 MLD 时允许 tentative 地址接收 solicited-node DAD NS，tentative 地址不发送 NA；显式静态配置模式忽略 RA/Redirect，关闭 RS 时保持无未使用变量的编译。IPv6 netif 保存固定槽位前缀和独立 default gateway，路由/ND 使用真实前缀，源选择计算公共前缀。UDP 输入拒绝 IPv6 零 checksum，IPv4 行为不变。IPv4重组增加协议/输入网卡键、重复/重叠/终点校验及按网卡清理，另在 netif/timeouts 增加有预算的轮回入口，旧公开入口保持无限预算包装；mem/memp 增加可选的每次真实归还 hook，netif 增加 loopback 入队 hook。UDP/TCP 端口冲突按实际绑定设备隔离，不同非零接口的相同端口可以独立使用；IPv4 的 Linux 回环配置接纳完整 127/8 别名，并按回环地址和掩码识别子网广播。IPv4 datagram 的最终 pbuf 携带本机 DF 策略：不超过所选接口 MTU 时生成 DF，较大的本机报文仍可分片；IPv6 不使用该标记，IP 头校验和包含实际 offset 字段。组播 TTL 为零时只保留本机回环，不向物理接口发送。netif 地址设置增加保留既有 PCB 的入口，供 Linux 运行时地址配置使用，原设备移除的 PCB 清理不变。TCP Nagle 使用 Minshall 规则，tcp_pcb 尾部保存新发小包的确认边界，tcp.c/tcp_in.c 初始化、tcp_out.c 在实际成功输出后更新，tcp_priv.h 按序列号判断。对应头文件声明随实现维护；补丁不升级固定版本，其余导入文件保持原版。BoarOS 的 lwIP 配置、端口和 socket 所有权适配位于 `net/` 与 `fs/`，不以 lwIP 的 socket fd 空间代替 BoarOS 文件表。
+| 组件 | 来源与版本 | 用途 | 许可位置 |
+|---|---|---|---|
+| lwIP | [STABLE-2_2_1_RELEASE](https://github.com/lwip-tcpip/lwip/tree/STABLE-2_2_1_RELEASE) | 提供网络协议实现，BoarOS 维护套接字、等待和多核接入，见[网络模块](modules/kernel-network.md) | [BSD-3-Clause](../third_party/lwip/COPYING) |
+| lwext4 | [上游版本 `58bcf89`](https://github.com/gkostka/lwext4/tree/58bcf89a121b72d4fb66334f1693d3b30e4cb9c5) | 提供 ext4 磁盘格式基础，BoarOS 在其上实现事务、缓存和并发适配，见[文件系统模块](modules/vfs-ext4.md) | [上游许可证](../third_party/lwext4/LICENSE) |
+| BLAKE2s | [Linux 的通用 BLAKE2s 实现](https://github.com/torvalds/linux/blob/f4cdf7ca9a1fdcca413157df19753f388a5a224e/lib/crypto/blake2s.c) | 内核随机数发生器使用的混种函数 | [源码中的 GPL-2.0 或 MIT 声明](../kernel/blake2s.c) |
+| pahole 1.28、elfutils 0.192 | [dwarves 发布页](https://fedorapeople.org/~acme/dwarves/)、[elfutils 项目](https://sourceware.org/elfutils/) | 离线生成 BPF 类型格式（BPF Type Format，BTF），见[构建说明](modules/kernel-bpf.md#构建与检查) | `third_party/sources/` 原始归档内的许可文件 |
 
-UDP PCB 按本地端口分桶，绑定冲突、临时端口查找和输入分发共用同一索引。IPv4/IPv6 通配、绑定地址、已连接对端和复用规则在桶内匹配。断开自动分配端口的连接时，先从该桶摘除 PCB。
-
-TCP 临时端口分配在自增前判断范围上界，允许随机初值取上界，并在下一次分配时
-回绕到范围起点，避免首次 bind/connect 把 0 当作端口耗尽；占用端口仍按实际 PCB
-列表跳过。现有 `tests/host/network_owner.py --case controls` 覆盖随机上界、上界前值、
-bind/connect 和占用端口，使用真实 lwIP 源码，固定版本不变。
-
-2026-10-08 核对并补齐回环通知接线：端口已定义
-`LWIP_HOOK_NETIF_LOOPBACK_QUEUED`，导入的 `netif_loop_output()` 原先没有调用。
-现在只在成功挂入完整包链后通知；hook 未定义的配置保留原行为。仍固定上述
-上游 commit，验证入口为 `make test-lwip-host` 与双架构真实网络/ABI 回归。
-
-TCP 输出另增加应用级 MORE 模式、持久 CORK 策略、PCB 内绝对短尾期限与 push 序号。普通 ACK 输出仍使用默认 Nagle/Minshall，MORE 仅抑制首次发送的未满尾段；重传和控制包不被等待尾段阻塞。BoarOS worker 只将已暂留的 PCB 按期限排队并有预算地推进到期输出，既有 owner 迁移不重置时间；不升级固定 lwIP 版本，也不增加独立计时引用。验证入口与语义边界见[网络模块](modules/kernel-network.md)。
-
-TCP_INFO 另在 `BOAROS_LWIP_TCP_INFO` 下增加成功输出/接收/确认事件记账、segment
-已发送 payload 前缀、owner 时间重基和释放前快照 hook。累计重传不使用会重置的
-nrtx，原始 SYN、输出失败、分段与追加数据分别处理；复用旧 TCP 时钟，不引入
-逐包读钟或新定时任务。字段语义、零值和精度边界见[网络模块](modules/kernel-network.md)。
-
-## lwext4
-
-- 上游地址：<https://github.com/gkostka/lwext4>
-- 固定版本：`58bcf89a121b72d4fb66334f1693d3b30e4cb9c5`
-- 导入路径：`third_party/lwext4/`
-- GDT/inode 与 orphan 的 CRC 计算通过只读归一化原语跳过 checksum 字段，不再
-  临时改写输入；CRC32C 使用4 KiB 对齐的 8 KiB 只读 slicing-by-8 表，保留种子、分段更新和校验语义。
-  每批先读取四个 64 位输入，再合并八字节查表结果，降低串行依赖；小范围和尾部仍准确处理。
-  raw inode 输出直接复制实际前缀，只清零磁盘格式中缺失的后缀。
-  `make test-lwext4-checksum-host` 保护并发读者、只读输入、CRC 参考与格式边界。
-  固定来源和反例见[时间戳背景](learning/file-timestamps.md#共享读取中的-checksum-计算2026-10-08)。
-- 导入内容：`include/`、`src/`、`LICENSE`、`README.md`、`CHANGELOG`
-- 通用侵入式树头 `include/misc/tree.h` 同时供 tmpfs 使用；删除其未使用的
-  `ext4_config.h` 包含，避免通用内存文件和 MM 构建依赖磁盘文件系统配置。
-- 许可证：`src/ext4_extent.c` 和 `src/ext4_xattr.c` 为 GPL-2.0-or-later，其余导入源码为 BSD-3-Clause；上游说明组合后的库受 GPLv2 约束。
-- 用途：在 BoarOS 自有 VFS 与块设备接口之后提供 ext2/3/4 磁盘格式实现。
-- 本地修改：初始导入提交不修改上游源码；后续补全现代 superblock 中 `s_checksum_seed` 等字段的磁盘布局，识别 `metadata_csum_seed`，并让 bitmap、group descriptor、inode、directory、extent 与 xattr 的 metadata checksum 使用规范选择的种子；目录适配另加 `ext4_dir_iterate()` 有界批次与其单项入口 `ext4_dir_entry_next_status()`，复用 inode/block iterator 并区分 EOF、inode-zero 尾记录与块/格式错误。文件适配允许在按 inode extent/legacy mapping 计算的 maxbytes 内 seek 到 EOF 之后、精确分配逻辑块、对 hole 合成零，并以 sparse 方式执行写入和向上截断；legacy maxbytes 取间接指针树、`ext4_lblk_t`/哨兵及 inode 块计数容量的交集，不让大块文件系统的 64-bit offset 缩窄回绕到低逻辑块。新块初始化失败撤销 exact mapping；fallocate 预留真实 unwritten extent、部分块清零与完整块打洞维护分配计数，合并检查初始化状态，unwritten conversion 以 ordered data 版本与调用者数据在同一私有操作中提交；索引空间不足时清零当前 unwritten extent 后原位初始化，释放块的 quarantine 同时覆盖即时提交与组提交。时间戳适配新增 mount 可选 realtime callback 和 live-inode touch，支持受 inode_size/extra_isize 约束的 signed epoch/纳秒编码、relatime、创建与父目录修改；即时 block-cache flush 传播 errno，失败缓冲由 mount 保留 dirty owner；文件写入/截断按操作固定并提交修改缓冲集合，防止分配中途 I/O 失败失去块 owner，也避免排空无关历史脏数据。保留 JBD2 journal 与 superblock 自身原有的独立校验算法。所有权适配新增live-inode chown，修正UID/GID的low/high 16位编码；内部xattr路径修正缺失inline属性区、删除finder、共享EA块复制的校验和/扇区计数、inode删除时的引用归还及失败释放，用于在同一事务删除capability。内核构建profile启用journal/replay与该内部xattr路径，并关闭mkfs、debug/assert；按已打开inode提供用户xattr操作并复用私有事务回滚，文件capability用于exec；ACL另列缺口；BoarOS 的 heap、块设备、VFS 和负 errno 适配位于 `kernel/` 与 `fs/`，不暴露 lwext4 类型。
-
-- 日志与恢复修改：加入设备 flush 回调、ordered data、元数据修改前的缓冲引用与 before-image、文件数据私有替换版本、嵌套事务错误传播、checksum v2/v3/revoke 校验、checkpoint 后持久回收日志空间和 sticky journal 错误。superblock 更新进入日志，受限启动允许由合法 redo 修复扇区撕裂的 superblock。新增 `ext4_orphan.c` 支持 orphan_file/传统链，完整校验后维护运行时成员、位置与空槽索引；私有事务 undo 同步恢复内存索引，热查询不再遍历磁盘记录；`ext4_truncate.c` 按实际 extent/间接块映射分批回收；公开修改入口接入持久 orphan 生命周期。块组读取不再隐式初始化位图，块与 inode 分配分别准备所需位图；新 inode 逐槽清零并事务更新已用范围，不在一次私有操作内清零整张 lazy inode table，也不提前设置 ITABLE_ZEROED；bitmap/inode/directory/extent 校验失败明确返回错误，索引目录不会静默降级后改写损坏元数据。extent 树读取失败按 get 的成功状态归还引用，不用预先填写的块号判断 owner，避免 OOM 后释放 NULL buffer。恢复测试与承诺范围见 [VFS 模块](modules/vfs-ext4.md)。
-- 挂载重配置新增 `ext4_remount()`：保留活文件句柄，在结束旧日志会话或启动新会话后改变后端只读状态；特性拒绝、资源失败和不确定 I/O 分别由 VFS 适配处理，机制与验证见 [VFS 模块](modules/vfs-ext4.md)。
-
-BoarOS 采用 GPL-2.0-only；仓库根目录 `LICENSE` 保存完整许可证文本，第三方文件保留各自的上游版权与许可声明。
-
-后续引入第三方代码时继续记录名称、上游地址、版本、SPDX 许可证、导入路径、用途和本地修改。来源或许可证不清楚时不导入；外部源码与本地适配尽量分开提交。
-
-比赛规则、公开测例、Harness、编译器、QEMU 和固件是外部构建或测试输入，不属于项目源码。影响复现时在相关文档中记录版本。
-
-- lwext4 rename 扩展提供 parent-inode/name 接口，原子维护两侧目录项、HTree checksum、`..`、链接数和覆盖 orphan；空目录检查校验记录边界与 checksum。路径分量扫描补齐 255 字节名称的分隔符边界。验证入口为 `make test-lwext4-rename-host`，未升级上游固定 commit。
-
-- 显式时间扩展提供 `ext4_file_set_times` 位掩码事务接口，沿用 inode 真实字段、错误 owner 和同步依赖；时间范围端点按 Linux 清零纳秒。统计扩展返回校验后的 metadata/journal overhead、保留块及 UUID，静态开销按 mount 缓存，动态分配数读真实 superblock。修正 first_data_block 组边界、META_BG 主描述符定位和 sparse_super2 备份组判断；`make test-lwext4-metadata-host` 验证几何、OOM、I/O、损坏和 e2fsck。
-
-SQLite 3.53.4 作为固定外部测试构建输入使用：官方 amalgamation 压缩包保存在被忽略的 `references/sqlite/`，来源和 SHA-256 由 `references/sources.tsv` 固定；构建时在 `build/riscv/sqlite/` 解包，未把 SQLite 源码导入 Git，也未对上游源码作本地修改。其发布声明为 public domain；用途是验证原生 Unix VFS、记录锁与回滚日志持久性，见[程序环境](modules/program-environment.md)。
-
-glibc 2.44 作为外部测试输入使用：官方源码归档保存在被忽略的 `references/glibc/`，来源和 SHA-256 由 `references/sources.tsv` 固定；RV64 loader/libc 直接取自宿主 GNU 交叉工具链，并由 `tests/userland/glibc/inputs.json` 的 SHA-256 固定，未导入 Git 或修改。相关源码按 LGPL-2.1-or-later 发布，归档含 `COPYING.LIB` 和 `LICENSES`；本仓库新增的探针只测试其原生启动、TLS、pthread、信号与退出路径，见[程序环境](modules/program-environment.md)。
-
-- 并发读取扩展：bcache 索引、引用、LRU、dirty 链及唯一 loading 生产者由每实例 raw 锁保护；候选分配后重查，I/O/等待/释放在锁外。等待回调重查装入状态并登记，保留挂载读锁对当前 journal 版本的借用，回收取得写锁。上游固定版本和磁盘格式不变，验证由 cache/batch/file-I/O 并发回归覆盖。
-- 单 hart 可睡眠扩展：mount 读写锁、任务 transaction owner、纯定位 `ext4_fpread`、同块 loading 等待、RELATIME 无副作用读预检；orphan/journal/恢复/卸载统一独占。生产 owner 检查不依赖可关闭的 debug assert。写事务仍单 owner 且保持日志格式与提交顺序，未升级上游版本；验证见 `test-io-sleep-riscv` 与 `test-lwext4-recovery-host`。
-- 多实例扩展：锁回调显式携带 context，BoarOS 适配按实例登记名称、块设备、锁和错误 owner；公共堆绑定按引用计数维护。新增固定源 inode 的硬链接事务入口，同步目录项、链接数和时间戳；最后链接才进入 orphan 生命周期。验证为 `test-lwext4-instances-host` 与扩展的 `test-lwext4-rename-host`，上游 commit 不变。
-- 异步日志扩展：操作级私有 undo/资源预留、mount running group、不可变元数据版本、借用 VFS 稳定页的 ordered data、与 checkpoint 共用 after 版本的日志 payload；commit/checkpoint 各有独立 worker 和明确的选择、退休阶段；有预算的日志映射、未提交 home writeback 禁止、释放块/inode quarantine、full/data 同步目标与版本 checkpoint。完整 metadata 执行入口在外层硬预算拒绝后先回滚，再等待旧 checkpoint 重做，覆盖 namespace 与删除外部 capability EA 的 chown；嵌套操作、真实分配或 I/O 错误不独立重试。保持现有磁盘格式和 ordered/log/commit 屏障，未启用 ASYNC_COMMIT 特性，也未升级上游。旧“即时提交”描述仅适用于未启用组引擎的路径；生产 journal mount 使用组提交。实际 1/4KiB 引擎、RV64 IRQ/lifecycle、完整恢复及原消费者验收见 [VFS模块](modules/vfs-ext4.md)。 日志保留额度与分配者计量分开：外部稳定页只由原 owner 计实际存储，日志自有活动分配通过可保活回调归属后备域；空闲复用与实际释放分别归还活动计量和本地额度。
-
-## BLAKE2s
-
-- 固定来源：`references/linux/lib/crypto/blake2s.c`，Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
-- 本地路径：`kernel/blake2s.c`、`include/kernel/blake2s.h`；保留 Jason A. Donenfeld 的版权与 `GPL-2.0 OR MIT` 声明，项目按 GPL-2.0 使用。
-- 用途与修改：移植为无动态分配的便携 BLAKE2s-256 混种接口，去除 Linux 专用调用约定；中间状态显式清除。ChaCha20 fast-key-erasure 契约另对照同版本 `drivers/char/random.c`，密钥更新材料不返回给调用者。
-- 验证：`make test-random-host` 比较已知向量、分块边界与旧输出预测下一密钥的回归；确定性向量不证明熵源质量。
-
-- lwext4 批量只读扩展：`ext4_fpread_batch` 在 mount read lock 下按真实 inode 映射处理
-  洞、EOF 与块内片段；普通文件数据先查当前事务版本，其余物理区间经
-  `ext4_blockdev_read_batch` 直接读入调用者的目标，不建立第二份普通数据缓存。
-  元数据的 `ext4_block_get_batch` 保留共享 loading，并先完成本批新读再等待其他
-  loading，避免重叠批次互等。每项保留独立错误和成功字节前缀；设备侧最多八项
-  并保留 DMA owner 至返回。未升级上游，来源仍为
-  `third_party/lwext4` 的 `58bcf89a121b72d4fb66334f1693d3b30e4cb9c5` 加本地补丁。
-  验证为 `make test-lwext4-cache-host test-lwext4-batch-read-host test-io-sleep-riscv`。
-
-- 无工作区的单输出批读用独立的 1/2/4/8 槽固定栈入口借给同一规划核心，已有工作区直接复用；不使用 VLA，不增加分配，描述符保持到 DMA 结束。
-- 普通文件批读直接借用调用者的 `file_read_workspace`，VFS/lwext4 共用文件区段，
-  lwext4/块层共用字节区段；删除每次请求的规划分配和两层转换数组。可见 EOF 独立
-  限制，不改变请求长度；短设备完成转为 EIO，各区段保留准确完成量。1/4/8 KiB、
-  extent/传统映射的零分配、并发工作区、别名、OOM 与错误测试见批读宿主入口。
-
-- 写入空间准备在复制前提交真实 unwritten extent，复用已有映射并返回可接纳前缀，
-  不提前发布 EOF。传统间接指针格式先清零新块，以已有 orphan 和完成接口保护
-  已接纳数据及未用尾部；实际映射的分步回收也适用于无 journal 的同尺寸截断。
-  内核接纳、失败 owner 与验证入口见 [VFS/ext4](modules/vfs-ext4.md#文件节点与页缓存)。
-
-- 深层 extent 截断纠错：删除叶节点后上移时，用既有 `ext4_ext_drop_refs` 释放内部
-  索引引用，先重算脏块 checksum，再归还引用。原路径直接 `ext4_block_set` 清掉块号，
-  后续查找会返回 EUCLEAN；1/4 KiB 的真实深层树、跨进程重启与最终截零由
-  `make test-lwext4-deep-truncate-host` 保护，未改变日志版本或持久化屏障。
-
-- lwIP TIME_WAIT 释放边界增加可选 `LWIP_HOOK_TCP_TIMEWAIT_FREE`：主动池回收在
-  remove 将状态改为 CLOSED 之前通知；slow timer 在摘链后、free 前通知。BoarOS
-  端口只清除仍匹配的 socket 借用与回调，不重入 raw API 或改变协议计时，避免把
-  PCB 生命周期交给受预算限制的普通工作队列。仍固定 2.2.1，验证见网络模块。
-
-
-## LA 静态用户程序构建输入
-
-GNU 工具包和运行时固定于 `references/toolchains/`：Loongson
-2025.08.08 发布包及 Arch 的 RV GCC16.2.1/binutils2.47/glibc2.44/API7.2 包。
-只用于被忽略的宿主构建环境和用户程序 fixture，不导入内核源码；保留原包
-许可证与文件内容，GNU profile 的原二进制身份不变。上游 URL/SHA-256 归
-`references/sources.tsv`，用法见[程序环境](modules/program-environment.md)。
-
-GCC15.1.0 原官方 archive 固定于 `references/sources.tsv` 的 `gcc/gcc-15.1.0.tar.xz`；
-构建时从归档原样解包源码，许可见归档内的 `COPYING3`，目标运行库
-适用 `COPYING.RUNTIME` 的 GCC Runtime Library Exception3.1。仅构建 C/LP64S runtime，
-未导入 Git 或改动 GCC源码。musl1.2.5 仍使用既有固定归档（MIT）；原 BusyBox1.33.1
-使用 `tests/userland/inventory/inputs.json` 中 `b5ec6ef8497e1818cbdec3b54bb722f036e57972`
-和原完整配置（GPLv2，原 `LICENSE`）。LA构建只改变目标编译/静态链接环境，未裁剪
-applet或改上游源码；UAPI来自固定 Linux v6.6 archive 的LA导出。工具和原程序身份
-由 `prepare-la-userland` 保存，验收范围见[LA模块](modules/loongarch-boot.md)。
-
-- lwext4空索引目录纠错：通过已验证HTree root的层级和块引用区分inner node
-  与leaf，避免无metadata checksum的空leaf被误解为坏node。保留结构/记录/
-  checksum失败状态，固定上游commit不变；验证`make test-lwext4-dir-empty-host`。
-
-## attr与libcap验证工具
-
-原版getfattr／setfattr来自attr 2.5.2，getcap／setcap来自libcap 2.76，固定官方归档和
-SHA256集中在`references/sources.tsv`的`xattr-tools/`条目。两项目分别按其GPL-2.0-or-later
-和BSD-3-Clause OR GPL-2.0-only双许可分发。兼容分支的离线构建脚本生成两架构静态工具，
-只装入独立验证盘；attr以libgen.h提供musl的basename声明，保留原工具操作和参数。
-
-## BPF 用户工具与构建依赖
-
-内核 BTF 编码使用 pahole（dwarves）1.28 及 elfutils 0.192。原样源码归档随仓库保存在
-`third_party/sources/`，来源及 SHA-256 统一记录于 `references/sources.tsv` 的 `pahole/`
-条目；dwarves 发布包已经包含其 libbpf 源码。构建时对 elfutils 的 CSR 和行表查询结果指针
-补充 `const`，兼容新 glibc 保留输入限定符的 bsearch/memchr；补丁位于
-`tools/pahole-elfutils-const.patch`，不改变查询或 BTF 行为。pahole 采用 GPL-2.0-only，内含 libbpf
-采用 LGPL-2.1 OR BSD-2-Clause；本次使用的 elfutils 库采用 GPL-2.0-or-later OR
-LGPL-3.0-or-later，完整许可证保留在原归档中。这些源码只编译成宿主工具，不编入内核。
-默认构建离线生成所需静态库和 pahole，不要求系统安装 libdw、libelf 或 libbpf 开发包；
-构建方式见 [BPF 模块](modules/kernel-bpf.md#构建与检查)。
-
-BPF 内核实现为 BoarOS 公共 C 代码，Linux UAPI 与行为依据来自已固定的 `references/linux`。该源码的 bpftool（GPL-2.0-only）和 libbpf（LGPL-2.1 OR BSD-2-Clause）只交叉构建到测试客户机；上游代码保持原样。lwIP 本地增加 UDP/TCP 接收过滤 hook，在协议状态改变前执行 socket 程序，不改变 lwIP 的来源版本或许可。
-
-bpftrace 0.27.1 及其固定 libbpf 子模块、LLVM/Clang 23.1.4、BCC、cereal、elfutils 和 zlib 的归档 URL、revision 与 SHA-256 集中于 `references/sources.tsv` 的 `bpf/` 项。bpftrace/BCC 使用 Apache-2.0，LLVM 使用 Apache-2.0 WITH LLVM-exception，cereal 使用 BSD-3-Clause，elfutils 的 libelf 使用 LGPL-3.0-or-later（其他工具依上游 GPL 条款），zlib 使用 Zlib 许可。构建保留归档内的 LICENSE/COPYING 和声明，工具及运行库留在忽略的构建缓存，不导入内核第三方目录。构建、Linux 同输入对照与客户机运行方法见 [BPF 模块](modules/kernel-bpf.md#构建与检查)。
+外部规范和用于开发的上游源码见[参考资料](../references/README.md)。模块文档解释本地适配的设计，变更沿 Git 历史追查。
 
 ## strace 验证工具
 
-strace 7.3 作为原版外部用户程序构建输入，官方发布归档及 SHA-256 固定于
-`references/sources.tsv` 的 `strace/` 条目。`tools/build-strace.py` 保留归档、原样源码和
-两架构静态 musl 构建缓存于被忽略的 `build/tools/strace-7.3/`；不修改上游源码，
-也不替换其 ptrace、寄存器或远端内存访问逻辑。strace 本体采用 LGPL-2.1-or-later，
-测试套件采用 GPL-2.0-or-later；bundled Linux UAPI 保留 GPL-2.0 WITH Linux-syscall-note
-声明。构建仅显式关闭可选调用栈展开和跨 ABI personalities，目标架构的普通系统调用
-跟踪保持原实现。许可证全文随归档及原样解包的源码缓存保留。
+[strace 7.3](https://github.com/strace/strace/releases/tag/v7.3) 用于验证 RISC-V 和 LoongArch 的进程跟踪接口。
+构建入口为 [tools/build-strace.py](../tools/build-strace.py)，许可见原发布包。

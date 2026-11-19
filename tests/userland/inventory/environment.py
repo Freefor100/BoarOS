@@ -85,12 +85,11 @@ def prepare(output=DEFAULT, uapi="runtime"):
         revision = source_identity['revision']
         row = reference(source_identity['archive_reference'], 'file')
         source_identity = dict(source_identity, archive_url=row[2], archive_sha256=row[4])
-        # Reuse the reference restorer's checksum and atomic-download contract.
-        selected = output / 'uapi-source.tsv'
-        selected.write_text('\t'.join(row) + '\n')
-        run([ROOT / 'references/fetch.sh', '--manifest', selected],
-            output / 'restore-linux-6.6.log')
         archive = ROOT / 'references' / row[1]
+        if not archive.is_file():
+            raise FileNotFoundError(f'Download {row[2]} to {archive}')
+        if sha(archive) != row[4]:
+            raise RuntimeError(f'Linux 6.6 build archive checksum differs: {archive}')
         linux = output / 'linux-6.6'
         output = output / 'busybox-environment'
         output.mkdir(exist_ok=True)
