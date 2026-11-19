@@ -1,25 +1,17 @@
 # 用户程序构建环境
 
-`tests/userland/inventory/environment.py` 为完整上游程序准备 RISC-V Linux
-UAPI 与现有 musl 1.2.5 工具链。它不修改 BusyBox 源码或关闭 applet，
+`tests/userland/inventory/environment.py` 为完整上游程序准备 RISC-V Linux 用户空间应用程序接口
+（Userspace Application Programming Interface，UAPI）头文件和 musl 1.2.5 工具链。它不修改 BusyBox 源码或关闭 applet，
 也不把宿主 glibc 头加入交叉编译器搜索路径。
 
-## 入口与固定来源
+## 构建入口
 
-- `prepare()` 导出 `references/linux` 固定 commit
-  `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `ARCH=riscv headers_install`。
-  默认目录为 `build/program-environment/linux-uapi/include`，供 libc-test 等程序使用。
-- `prepare(uapi='busybox')` 通过 `inputs.json` 的 `archive_reference` 引用 `references/sources.tsv` 的固定官方 Linux v6.6 archive
-  导出完整旧 UAPI。v6.6 对应 commit
-  `ffc253263a1375a65fa6c9f62a893e9767fbebfa`，archive SHA-256 为
-  `d926a06c63dd8ac7df3f86ee1ffc2ce2a3b81a2d168484e76b5b389aba8e56d0`。
-  来源为 `https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.tar.xz`；
-  2026-09-16 核对官方 `sha256sums.asc` 与 Torvalds Git 的 peeled tag。
-  该环境位于 `build/program-environment/busybox-environment/`。
-- `build_busybox()` 从 `inputs.json` 选择固定 BusyBox 源码与配置，以 Git archive
-  提取，再用 musl 静态链接。固定比赛 commit
-  `b5ec6ef8497e1818cbdec3b54bb722f036e57972` 包含 BusyBox 1.33.1；
-  原 `config/busybox-config-riscv64` 启用 398 applets。
+- `prepare()` 从 `references/linux` 导出 RISC-V UAPI 头文件，供 libc-test 等程序使用。
+- `prepare(uapi='busybox')` 从 [Linux v6.6 源码归档](https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.tar.xz)
+  导出旧版头文件。将归档放到 `references/linux-uapi/linux-6.6.tar.xz`。
+  这版头文件保留 BusyBox 1.33.1 的 `tc` 所需的队列规则定义。
+- `build_busybox()` 从 [程序输入配置](../../tests/userland/inventory/inputs.json)
+  选择 BusyBox 源码和配置，再用 musl 静态链接。
 
 两个 `prepare` 结果都返回 `include`、`cflags`、工具与源码身份、头文件树哈希。
 调用方必须使用返回的完整 `cflags`；目前由 `-idirafter` 添加目标 UAPI，
@@ -77,17 +69,14 @@ musl `/init`。它从 `/work/tools.conf` 读取客体内编译器、汇编器绝
 先验证并解包固定 Alpine v3.22 riscv64 APK 闭包到忽略的
 `build/offline-c/alpine-tree/`，再要求五阶段全部退出 0、产物齐全且哈希
 双侧一致、运行输出逐字节匹配；缺少固定编译器输入即失败。
-`OFFLINE_C_LINUX_KERNEL` 可指向由固定 Linux commit
-`f4cdf7ca9a1fdcca413157df19753f388a5a224e` 构建且有 `identity.json`
-的缓存 Image；不指定时 runner 按固定资料构建。`make prepare-offline-c-toolchain`
-单独重建编译器树。`references/sources.tsv` 对以下16个APK 固定逐项完整 URL
-和 SHA-256，各包核对日期随清单维护；准备脚本逐项校验 archive 哈希、
-`.PKGINFO` 的名称/版本/架构/许可和缓存树内容，不修改上游包。
+`OFFLINE_C_LINUX_KERNEL` 可指定已有的对照 Linux 内核。未指定时沿用对照构建入口。
+`make prepare-offline-c-toolchain` 单独准备编译器树，所需的 Alpine 包由
+[构建输入清单](../../references/sources.tsv)提供。
 
 runner 从同一稀疏 ext4 fixture 建立 Linux 与 BoarOS 的独立原始镜像，
 复制时保留空洞，避免为零区分配和写入宿主空间；QEMU 启动前同步 fixture
 与各副本，使镜像准备的写回成本单独计入准备阶段。预同步不代替客体块驱动
-当前30秒的有限请求期限，也不改变镜像内容、后续 journal 重放及产物比较
+对普通块读写的 30 秒请求期限，也不改变镜像内容、后续 journal 重放及产物比较
 规则。runner 记录副本的逻辑/占用字节和复制同步耗时供本次诊断，不设墙钟
 性能门槛。
 
@@ -119,24 +108,23 @@ python3 tests/userland/inventory/run.py --suite libc \
   --require-pass --output build/socket-program-check
 ```
 
-此入口使用固定 `references/oscomp-testsuits` commit
-`8b58dd16d26d30f7c74d48d5832d870d3051b703` 的未修改源码，
+源码版本由[程序输入配置](../../tests/userland/inventory/inputs.json)选择，
 同一 ELF 分别在固定 Linux 与 BoarOS 的独立镜像执行，并要求原始输出、退出状态与
 环境准备同时通过。复用已核验的构建缓存时可加 `--reuse-builds`。
 
 ## SQLite 日志与 NBD 故障入口
 
-`references/sqlite/sqlite-amalgamation-3530400.zip` 是官方 SQLite 3.53.4 amalgamation，`references/sources.tsv` 固定下载 URL、2026-09-27 访问日期及 SHA-256 `1e71ddf93849c6a6ecf58b827c0692073d2dd7ee40196158068f7b29f422e87d`。构建直接解包到 `build/riscv/sqlite/`，不修改上游源码；复用 musl 1.2.5 工具链，保留线程支持、WAL 编译能力及原生 Unix VFS。回滚负载实际检查版本、`THREADSAFE=1`、VFS 名和 `journal_mode=DELETE`、`locking_mode=NORMAL`、`mmap_size=0`、`synchronous=EXTRA/FULL` 返回值。静态与动态 CLI 的可执行文件由同一固定源码编译。
+将官方 [SQLite 3.53.4 源码包](https://www.sqlite.org/2026/sqlite-amalgamation-3530400.zip) 放入 `references/sqlite/`。构建直接解包到 `build/riscv/sqlite/`，不修改上游源码；复用 musl 1.2.5 工具链，保留线程支持、WAL 编译能力及原生 Unix VFS。回滚负载实际检查版本、`THREADSAFE=1`、VFS 名和 `journal_mode=DELETE`、`locking_mode=NORMAL`、`mmap_size=0`、`synchronous=EXTRA/FULL` 返回值。静态与动态 CLI 的可执行文件由同一固定源码编译。
 
-`make test-sqlite-rollback-riscv` 在真实 U-mode 覆盖建表、提交/回滚、独立进程 writer 冲突、未提交大事务进程直接退出后的同次启动 hot journal 恢复、关闭重开，以及两种 CLI 对同盘数据库的 `integrity_check`。`make test-sqlite-nbd-riscv` 把同一负载接入宿主 C NBD 服务。`make test-sqlite-recovery-riscv` 以同一静态 ELF 在固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 与 BoarOS 执行 setup/mutate/recover；BoarOS 的 `EXTRA`、`FULL`、热日志与已确认提交路径经 NBD 重启两次，并用 `e2fsck -fn` 核对 ext4。小缓存 24 行事务制造 journal spill；恢复程序逐字节检查每行值、整事务状态和 `integrity_check`。
+`make test-sqlite-rollback-riscv` 在真实 U-mode 覆盖建表、提交/回滚、独立进程 writer 冲突、未提交大事务进程直接退出后的同次启动 hot journal 恢复、关闭重开，以及两种 CLI 对同盘数据库的 `integrity_check`。`make test-sqlite-nbd-riscv` 把同一负载接入宿主 C NBD 服务。`make test-sqlite-recovery-riscv` 以同一静态 ELF 在对照 Linux 与 BoarOS 执行 setup/mutate/recover；BoarOS 的 `EXTRA`、`FULL`、热日志与已确认提交路径经 NBD 重启两次，并用 `e2fsck -fn` 核对 ext4。小缓存 24 行事务制造 journal spill；恢复程序逐字节检查每行值、整事务状态和 `integrity_check`。
 
 `make test-sqlite-wal-riscv` 用同一静态 ELF、官方 Unix VFS、`journal_mode=WAL`、`locking_mode=NORMAL`、`mmap_size=0` 和 `synchronous=FULL` 分别在上述固定 Linux 与 BoarOS 启动两次。首次启动核对版本与 PRAGMA、独立进程 writer 竞争、先后提交及另一进程持有未提交事务直接退出；关闭重开与第二次启动都检查三条已提交记录、未提交记录缺席和 `integrity_check`。该入口证明普通多进程 WAL 的组合 ABI，不替代 NBD 断电故障矩阵或实板持久性验证。
 
 `make test-sqlite-wal-recovery-riscv` 与 `make test-sqlite-wal-recovery-matrix-riscv` 复用回滚日志的同一静态 ELF 和 NBD runner，通过客体 `/journal` 选择 WAL；启动核对实际 `journal_mode`，分别执行 EXTRA/FULL 正常事务、未关闭进程的 hot 状态、已确认提交、FULL 写/flush 失败及逐事件断电/错误矩阵。断电先冻结 NBD，再终止 QEMU，从稳定镜像启动新客体恢复两次，并运行 `e2fsck -fn`。恢复检查整事务旧值或新值、已确认提交保留新值、`integrity_check`；此入口仍只证明隔离镜像上的既定故障模型。
 
-SQLite 大事务需要 Unix VFS 探测临时目录。固定 `build/riscv/sqlite/sqlite-amalgamation-3530400/sqlite3.c::unixTempFileDir` 用 `access(path, W_OK|X_OK)`；固定 `references/musl/musl-1.2.5.tar.gz`（SHA-256 `a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4`）将其转为 RV64 `faccessat` syscall 48。BoarOS 之前返回 `ENOSYS`，使 SQLite 在 journal spill 时返回 `SQLITE_IOERR_GETTEMPPATH`。当前按调用线程真实 UID/GID、补充组和 capability 检查目录搜索与最终对象权限，再判断最终挂载是否只读；普通文件执行仍要求相应执行位。`tests/diff-abi/access.c` 用固定 Linux 同一 ELF 验证该 raw ABI 的路径、mode 和 fault 边界。
+SQLite 大事务需要 Unix VFS 探测临时目录。固定 `build/riscv/sqlite/sqlite-amalgamation-3530400/sqlite3.c::unixTempFileDir` 用 `access(path, W_OK|X_OK)`；musl 1.2.5将其转为 RV64 `faccessat` syscall 48。BoarOS 之前返回 `ENOSYS`，使 SQLite 在 journal spill 时返回 `SQLITE_IOERR_GETTEMPPATH`。当前按调用线程真实 UID/GID、补充组和 capability 检查目录搜索与最终对象权限，再判断最终挂载是否只读；普通文件执行仍要求相应执行位。`tests/diff-abi/access.c` 用固定 Linux 同一 ELF 验证该 raw ABI 的路径、mode 和 fault 边界。
 
-`tests/host/nbd_fault.c` 经 Unix socket 给 QEMU 提供 fixed-newstyle、simple replies 的 READ/WRITE/FLUSH/DISC，只宣告 `HAS_FLAGS|SEND_FLUSH`。`tests/host/block_fault.c` 是 512 字节原子写、易失可见内容、稳定镜像的真实故障模型；只有成功 FLUSH 承诺此前事件持久化。`make test-nbd-host` 检查握手、读写、写/flush 失败和丢失、部分保存、反序保存。`make test-sqlite-recovery-matrix-riscv` 使用串口与宿主信号握手，仅对 SQLite 事务内的 NBD 事件编号，逐个注入写/flush 错误和断电位置；断电先冻结服务，再杀 QEMU，从同一稳定初态恢复。断电切点的事件上限由与该次运行相同的 none/odd/reverse 持久化策略分别探测；默认策略探针只用于写/flush 故障点，不能把它的事件数借给其他策略。2026-09-27 的 DELETE 小事务有 100 次写和 47 次 flush；441 个断电组合与逐位置 147 个写/flush 失败均通过。QEMU 基线为本地 `references/qemu/` commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`，执行环境为 QEMU 11.1.1。这些入口使用隔离镜像，成功后清理一次性目录；未确认提交只允许完整旧值或完整新值，已确认提交必须保留新值。不证明实板持久性。
+`tests/host/nbd_fault.c` 经 Unix socket 给 QEMU 提供 fixed-newstyle、simple replies 的 READ/WRITE/FLUSH/DISC，只宣告 `HAS_FLAGS|SEND_FLUSH`。`tests/host/block_fault.c` 是 512 字节原子写、易失可见内容、稳定镜像的真实故障模型；只有成功 FLUSH 承诺此前事件持久化。`make test-nbd-host` 检查握手、读写、写/flush 失败和丢失、部分保存、反序保存。`make test-sqlite-recovery-matrix-riscv` 使用串口与宿主信号握手，仅对 SQLite 事务内的 NBD 事件编号，逐个注入写/flush 错误和断电位置；断电先冻结服务，再杀 QEMU，从同一稳定初态恢复。断电切点的事件上限由与该次运行相同的 none/odd/reverse 持久化策略分别探测；默认策略探针只用于写/flush 故障点，不能把它的事件数借给其他策略。2026-09-27 的 DELETE 小事务有 100 次写和 47 次 flush；441 个断电组合与逐位置 147 个写/flush 失败均通过。这些入口使用隔离镜像，成功后清理一次性目录；未确认提交只允许完整旧值或完整新值，已确认提交必须保留新值。不证明实板持久性。
 
 ## glibc 独立矩阵
 

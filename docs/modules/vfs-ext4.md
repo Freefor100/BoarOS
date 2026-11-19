@@ -129,7 +129,7 @@ tmpfs与ext4以inode为单位执行POSIX ACL权限判断。目录修改与默认
 创建时持有父目录默认ACL快照，用请求mode计算访问ACL，再与目录项一起发布。
 ext4在同一元数据操作中更新ACL和mode，用户态格式与磁盘上的短／长ACL项在后端转换；
 tmpfs在发布前准备属性，inode直接持有访问ACL与默认ACL各自的属性对象。
-真实 libacl 消费者见 [acl_lib.c](../../tests/workloads/resource/acl_lib.c)，覆盖具名用户、组、mask、chmod、默认 ACL 继承及重启读回；它同时调用带 libacl 的 LTP `acl1`。库源码和测例源码版本及校验见 [sources.tsv](../../references/sources.tsv)。在各自独立的构建目录中，交叉编译 attr 2.5.2 和 acl 2.3.2 时均使用 `--host=目标三元组 --disable-shared --enable-static --disable-nls`，分别执行 `make libattr.la`、`make libacl.la`；配置 acl 时以 `CPPFLAGS=-Iattr构建目录/include`、`LDFLAGS=-Lattr构建目录/.libs` 找到真实 attr 头文件和静态库。RV 使用 `riscv64-linux-gnu-gcc`；LA 使用 `build/tools/loongarch/bin/loongarch64-unknown-linux-gnu-gcc` 和对应目标三元组。
+真实 libacl 消费者见 [acl_lib.c](../../tests/workloads/resource/acl_lib.c)，覆盖具名用户、组、mask、chmod、默认 ACL 继承及重启读回；它同时调用带 libacl 的 LTP `acl1`。构建输入见 [sources.tsv](../../references/sources.tsv)。在各自独立的构建目录中，交叉编译 attr 2.5.2 和 acl 2.3.2 时均使用 `--host=目标三元组 --disable-shared --enable-static --disable-nls`，分别执行 `make libattr.la`、`make libacl.la`；配置 acl 时以 `CPPFLAGS=-Iattr构建目录/include`、`LDFLAGS=-Lattr构建目录/.libs` 找到真实 attr 头文件和静态库。RV 使用 `riscv64-linux-gnu-gcc`；LA 使用 `build/tools/loongarch/bin/loongarch64-unknown-linux-gnu-gcc` 和对应目标三元组。
 
 已准备目标架构静态 BusyBox、上述库构建目录及启用 `CONFIG_EXT4_FS_POSIX_ACL` 的参考 Linux 后，运行：
 

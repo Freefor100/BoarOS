@@ -3,8 +3,7 @@
 `make test-diff-abi-riscv` 将同一个无 libc raw-syscall ELF `/init` 分别交给
 Linux 与 BoarOS 生产内核。两次 QEMU system 均为 `virt`、一个 hart、512 MiB，
 使用同一 raw whole-disk ext4 fixture 的独立可写副本。Linux 内核来自
-`references/linux`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`，
-版本由 `references/sources.tsv` 的唯一 Linux 项提供；没有写死 reference 输出。
+`references/linux`，对照版本由[构建输入清单](../../references/sources.tsv)选择。
 Linux 原有源码许可证见 `references/linux/COPYING`，构建产物位于被忽略的
 `build/diff-abi/`，不复制 Linux 源码进入 BoarOS。
 
@@ -62,8 +61,6 @@ fixture 内 `/dev/console` 是由 debugfs 创建的字符设备 inode，用于 L
 `rt_controls.c` 自建独立 proc 挂载；配置用例退出前恢复预算，后续策略测试不依赖残留状态。
 Linux 配置启用 HWRNG、SYSCTL/PROC_SYSCTL；随机字节仅验证契约，不逐字比较或以不同输出证明熵。
 
-最终内核 SHA-256 `be5ca22629c904a427241b0f92e9d561d0312952e787ab75870ec4beae0143b3`，
-用户 ELF `eea74172f0571c6347005b554e73b54b2d76256af550e9b3bc5506a4f99bb306`。
 并发运行恢复矩阵和程序清单时，默认 60 秒总预算曾在第一个 session 分组后耗尽；
 同一内核/ELF 的 180 秒预算复跑输出完整 END 1000、heap-live=0 并逐条一致。
 独立 105 条 session 窄测也通过，未据超时末条记录推断内核死锁。
