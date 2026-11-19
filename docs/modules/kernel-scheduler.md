@@ -55,13 +55,13 @@ RV、LA 用户多核共用同一调度器。每核 rank42 保护实际就绪队�
 
 身份、期限索引及跨核策略使用 rank40 调度短锁；普通任务的本地运行记账、无期限等待的阻塞提交、READY 发布和领取使用实际运行队列的 rank42 保护。等待节点链、游标、退休后继、关闭与借用计数由每个实际队列的 rank45 短锁保护；heap10→physical20、对象内部30→调度40→运行队列42→等待队列45是raw锁序。双队列迁移按地址顺序取得保护，锁内不通知任务。raw不跨架构切换，不允许调度、分配、I/O、用户复制或外部回调。
 同一 API 按 CPU 数编译：UP 关闭中断、保持抢占嵌套并使用编译器屏障，SMP 另以 acquire/release 原子操作互斥。
-`LOCK_DEBUG=1` 开启递归扫描和等级审计，默认关闭；持有链始终保留，用于禁止等待、嵌套恢复和最外层解锁后的通知发布。pthread 宿主夹具明确使用 SMP 配置，`test-sync-host` 覆盖 UP/SMP 与锁调试的四种组合。
+`LOCK_DEBUG=1` 开启 raw guard 的归属、锁字、递归和等级审计，默认关闭。持有链始终保留，用于禁止等待、嵌套恢复和最外层解锁后的通知发布。`test-sync-host` 覆盖 UP/SMP 与锁调试的四种组合。
 
 短对象保护按实际访问者选择：`KERNEL_TASK_LOCK_SCOPE` 用于只由任务修改的 ext4
 缓冲元数据，`KERNEL_IRQ_LOCK_SCOPE` 用于任务和设备中断共享的 VirtIO 请求状态。
 默认 UP 构建中，前者通过抢占深度和编译器屏障排除其他任务，保留原中断状态；
 后者再关闭本地中断。UP 的互斥由抢占深度提供，检查嵌套归还并禁止阻塞，无需读写对象锁字。
-SMP、锁调试或成本诊断构建直接使用完整 raw 实现，保留持有链和对象初始化检查，递归及等级审计由 `LOCK_DEBUG` 开启。调度器和分配器继续使用原 raw
+SMP、锁调试或成本诊断构建使用带持有链的 raw 实现。锁对象在初始化时检查参数，进入和退出临界区的完整性审计由 `LOCK_DEBUG` 控制。调度器和分配器继续使用原 raw
 持有链；`test-lwext4-exclusion-host` 检查四种 UP/SMP、debug 组合及真实共享更新。
 
 任务表、身份角色、父子/组成员关系、join及退出队列也使用该调度域；私有准备和资源清理在锁外。
@@ -135,10 +135,7 @@ RV、LA 的用户任务按实际 affinity 在各 CPU 执行；默认交付仍单
 内核 worker 使用 OTHER，普通策略按下述公平进度与请求量子选择后继。FIFO/RR 的用户优先级为 1–99，数值越大越优先；FIFO 不因 tick 同级轮转，RR 默认每片 100ms，可通过 `/proc/sys/kernel/sched_rr_timeslice_ms` 设置全局毫秒值；零或负值恢复默认，输入范围为有符号32位整数。修改不替换任务尚未耗尽的剩余量，后续轮换与新建任务使用新值，`sched_rr_get_interval` 查询当前配置并返回规范化 timespec。时间片按实际在 CPU 上运行的纳秒扣除。更高优先级抢占、阻塞和 yield 不重新赠送 RR 时间片；耗尽后才重装。唤醒及策略修改标记 need_resched，在 IRQ 或返回用户态的安全边界切换。降优先级排到新级队首，升优先级排队尾，同级修改保留位置；高优先级抢占的当前任务回原级队首。
 
 挑选、摘队列与取得on_cpu执行owner在同一个短锁发布点完成，普通切换与退出复用该入口；锁外才切换架构状态，旧owner仍由新栈交接释放。未使用的拆分pop入口已删除。
-yield、预算tick与普通tick在同一次决策raw内完成队列校验、运行记账、挑选和最早期限计算，
-释放raw后才调用timer backend；切换、阻塞和退出也按这个顺序提交硬件事件。
-普通tick只在CPU0推进load采样余量，不为未到采样期的事件额外取锁。
-到采样期才借任务分段遍历，遍历前检查和决策时重查分别保留。无效队列不消费待调度请求。
+yield、预算 tick 与普通 tick 在决策保护内完成运行记账、挑选和最早期限计算，释放后调用 timer backend。生产入口核对本核任务归属及运行状态，用户缺页还核对活动 MM。任务资源、栈和队列端点的周期性审计由 `LOCK_DEBUG` 控制，创建和退出等生命周期边界仍执行完整校验。普通 tick 只在 CPU0 推进负载采样余量，到期后才借任务分段遍历。
 
 ready 节点独立于 cleanup 链，各 CPU 执行队列维护自己的优先级排序双链与遍历视图，100 个等级各存 head/tail；同级插入、OTHER 尾追加、删除和选取均 O(1)，新增空的中间等级最多扫描 99 个等级，不扫描任务数。RT 被节流时只取 OTHER 队首；没有 OTHER 则 idle，不能借机运行已耗尽的 RT。
 
@@ -191,7 +188,7 @@ sched_setparam/setscheduler/getparam/getscheduler、priority_min/max、rr_get_in
 
 RTPRIO、RTTIME限额属于线程组共享的资源记录，普通fork复制、线程clone共享，exec保留。没有CAP_SYS_NICE时，调度修改先满足同属主规则；进入或切换RT策略要求目标组的RTPRIO软值非零，提升优先级可使用目标软值或保留已经取得的更高RT优先级。降低优先级和退出RT沿Linux规则处理；清除RESET_ON_FORK仍需CAP_SYS_NICE。资源数值不裁成99，实际FIFO/RR优先级范围仍为1～99。
 
-RTTIME对每线程连续RT执行计量。各CPU的timer tick仅在当前用户线程运行FIFO/RR且软限额有限时推进watchdog；普通优先级任务在读取全局tick前跳过watchdog调用。同一全局tick跨核只计一次。超过按100Hz向上取整的软／硬阈值后，线程进入现有CPU timer活动索引，由CPU0检查并向线程组发送SIGXCPU，软限额增加1,000,000us，或在硬限额到达时发送SIGKILL。仅有RTTIME待检查的条目不采样完整CPU clock；普通trap不新增watchdog锁或采样。
+RTTIME 对每线程连续 RT 执行计量。空闲 tick 更新本核计数，procfs 汇总原子快照。普通优先级任务读取已发布的有效优先级后直接退出 watchdog 入口。有效优先级为正的用户线程进入调度域，按锁内实际优先级和有限软限额推进 watchdog。同一全局 tick 跨核只计一次。超过按 100 Hz 向上取整的软／硬阈值后，线程进入现有 CPU timer 活动索引，由 CPU0 检查并向线程组发送 SIGXCPU，软限额增加 1,000,000 µs，或在硬限额到达时发送 SIGKILL。仅有 RTTIME 待检查的条目跳过完整 CPU clock 采样。
 
 连续计数在调度器确定任务带着BLOCKED或STOPPED状态离开CPU时清零。计数为零时不写RTTIME计数或资源标记；待检查标记只会在非零计数后发布。已经退出RT策略或把限额改为无限的任务仍按历史计数清理，并移除仅由RTTIME产生的CPU timer索引。PREPARED通知、COMMITTED后在切换前收到通知、停止后在切离前收到SIGCONT，以及抢占、yield、迁移、CPU0服务和RT带宽节流都保留计数；此时状态已经或仍为READY，未完成一次睡眠/停止。直接host检查以手动tick覆盖跨CPU去重、软硬阈值及三种等待交错，真实消费者通过父子握手确认阻塞后继续执行。
 

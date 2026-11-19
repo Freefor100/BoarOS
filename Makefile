@@ -2036,10 +2036,10 @@ test-scheduler-stack-slots-host:
 .PHONY: test-scheduler-handoff-host
 test-scheduler-handoff-host: test-scheduler-stack-slots-host
 	@mkdir -p build/host
-	@set -e; for shift in 12 14; do \
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/sync -idirafter include tests/host/sched_handoff.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/core.c kernel/sched/process.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/seccomp.c kernel/sched/cgroup.c fs/cgroupfs.c kernel/sched/seccomp.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=scheduler_switch_claimed,--wrap=kernel_raw_lock_acquire,--wrap=kernel_wait_backend_quiesce -o build/host/scheduler-handoff-$$shift; \
-		build/host/scheduler-handoff-$$shift; \
-	done
+	@set -e; for shift in 12 14; do for debug in 0 1; do \
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_LOCK_DEBUG=$$debug -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/sync -idirafter include tests/host/sched_handoff.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/core.c kernel/sched/process.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/seccomp.c kernel/sched/cgroup.c fs/cgroupfs.c kernel/sched/seccomp.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=scheduler_switch_claimed,--wrap=kernel_raw_lock_acquire,--wrap=kernel_wait_backend_quiesce -o build/host/scheduler-handoff-$$shift-$$debug; \
+		build/host/scheduler-handoff-$$shift-$$debug; \
+	done; done
 
 .PHONY: test-posix-timer-host
 test-posix-timer-host:

@@ -379,6 +379,7 @@ int main(int argc,char **argv)
     scheduler_rearm_timer();assert(timer_request==73);
     { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);deadline_index_remove(&peer);peer.wait.deadline=0; }
     scheduler_rearm_timer();assert(!timer_request);
+#if BOAROS_LOCK_DEBUG
     /* Reject a candidate that would otherwise preempt: neither deferred nor
      * ordinary validation failure may consume an existing request or owner. */
     for (unsigned deferred = 0; deferred < 2; deferred++) {
@@ -394,6 +395,7 @@ int main(int argc,char **argv)
         assert(!cpu.raw_locks && cpu.preempt_depth == deferred && !sync_test_irq);
         if (deferred) kernel_preempt_enable();
     }
+#endif
     clear_owned_page_case();
     private_storage_case();
     join_cursor_lifetime_case();

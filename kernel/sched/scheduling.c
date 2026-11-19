@@ -1301,7 +1301,7 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
         {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
             KERNEL_RUN_SET(runs);
-            if (check_queues) {
+            if (BOAROS_LOCK_DEBUG && check_queues) {
                 enum kernel_scheduler_status status = validate_queues_locked();
                 if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
             }
@@ -1319,7 +1319,7 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
     {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     KERNEL_RUN_SET(runs);
-    if (check_queues) {
+    if (BOAROS_LOCK_DEBUG && check_queues) {
         enum kernel_scheduler_status status = validate_queues_locked();
         if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     }

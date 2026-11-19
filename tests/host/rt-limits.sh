@@ -9,6 +9,6 @@ for shift in 12 14; do
       kernel/sched/core.c kernel/sched/policy.c kernel/sched/runqueue.c kernel/sched/park.c \
       kernel/sched/accounting.c \
       kernel/cpu.c kernel/raw_lock.c kernel/credentials.c tests/host/sync/notifications.c \
-      -Wl,--gc-sections -o build/host/rt-limits/$shift
+      -Wl,--gc-sections,--wrap=kernel_raw_lock_acquire -o build/host/rt-limits/$shift
     build/host/rt-limits/$shift
 done

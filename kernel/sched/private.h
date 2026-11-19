@@ -287,6 +287,17 @@ enum kernel_scheduler_status release_after_create_failure(
 enum kernel_scheduler_status validate_current(void);
 /* CPU obtained at this IRQ-off entry; never retain it across switch/sleep. */
 enum kernel_scheduler_status validate_current_on_cpu(struct kernel_cpu *cpu);
+static inline enum kernel_scheduler_status check_running_on_cpu(struct kernel_cpu *cpu)
+{
+    if (BOAROS_LOCK_DEBUG) return validate_current_on_cpu(cpu);
+    const struct kernel_task *task=cpu->current;
+    if (!task || arch_current_thread_get()!=task || task->magic!=KERNEL_THREAD_MAGIC)
+        return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+    if (task->idle ? task!=cpu->idle || task->state!=KERNEL_THREAD_STATE_IDLE :
+                    task->state!=KERNEL_THREAD_STATE_RUNNING)
+        return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+    return KERNEL_SCHEDULER_STATUS_OK;
+}
 enum kernel_task_status validate_task_resource_borrow(
     const struct kernel_task *task);
 void wake_waiting_parent(struct kernel_task *child);

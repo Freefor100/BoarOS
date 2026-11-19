@@ -412,9 +412,10 @@ enum kernel_mm_status kernel_scheduler_resolve_current_user_fault(
      * 当前执行owner固定的task/MM，不把CPU借用带入缺页服务。 */
     struct kernel_cpu *cpu = kernel_cpu_current();
     struct kernel_task *current = cpu->current;
-    if (validate_current_on_cpu(cpu) != KERNEL_SCHEDULER_STATUS_OK ||
+    if (check_running_on_cpu(cpu) != KERNEL_SCHEDULER_STATUS_OK ||
         current == cpu->idle || current->state != KERNEL_THREAD_STATE_RUNNING ||
-        current->arch.user_mode != 1U) {
+        current->arch.user_mode != 1U || current->mm.state != KERNEL_MM_LIVE ||
+        cpu->active_mm_record != current->mm.record) {
         return KERNEL_MM_STATUS_STATE;
     }
     return kernel_mm_resolve_owned_user_fault(&current->mm,current,virtual_address,access);
