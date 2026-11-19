@@ -2,7 +2,6 @@
 """Diagnostic RV/LA projection of the fixed scripts, judges and postwork."""
 import argparse
 from datetime import datetime, timezone
-import hashlib
 import importlib
 import importlib.util
 import json
@@ -18,16 +17,12 @@ ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import local_disks
+from local_disks import sha
 from prepare import DEFAULT_LTP_CASE_TIMEOUT
 REF = ROOT / 'references/oscomp-autotest'
 GROUPS = ['basic', 'busybox', 'cyclictest', 'iozone', 'iperf', 'libcbench',
           'libctest', 'lmbench', 'lua', 'netperf', 'ltp']
 ARCH_KEYS = {'riscv': 'rv', 'loongarch': 'la'}
-
-
-def sha(path):
-    with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
 def output(args, cwd=ROOT):

@@ -1,7 +1,6 @@
 """Run unchanged final-2026 public rootfs scripts and their upstream judges."""
 import argparse
 from datetime import datetime, timezone
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,7 +10,7 @@ import sys
 import tempfile
 import time
 
-from local_disks import copy_disk_image
+from local_disks import copy_disk_image, sha
 from prepare import DEFAULT_LTP_CASE_TIMEOUT
 
 ROOT=Path(__file__).resolve().parents[2]
@@ -23,10 +22,6 @@ from sdcard import directory as sdcard_directory
 
 GROUPS=('cagent','buildstorm')
 TAGS={'riscv':'rv','loongarch':'la'}
-
-def sha(path):
-    with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream,'sha256').hexdigest()
 
 def save(path,value):
     path.write_text(json.dumps(value,indent=2)+'\n')

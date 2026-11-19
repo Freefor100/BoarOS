@@ -24,8 +24,11 @@ INPUTS = json.loads((HERE / 'inputs.json').read_text())
 
 
 def sha(path):
+    digest = hashlib.sha256()
     with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 @contextmanager
@@ -81,7 +84,7 @@ def fixed_source(cache):
             raise RuntimeError('tracked e2fsprogs archive checksum differs: ' + str(archive))
         if not source.exists():
             with tarfile.open(archive) as content:
-                content.extractall(cache, filter='data')
+                content.extractall(cache)
         apply_portability_patch(source)
     return source
 
