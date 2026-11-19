@@ -14,7 +14,7 @@
 | 决赛 | [`final-2026` 分支](https://github.com/oscomp/testsuits-for-oskernel/tree/final-2026) | `sdcard/final-2026/sdcard-rv-pub.img`、`sdcard/final-2026/sdcard-la-pub.img` |
 
 把下载的原盘解压一次即可。普通诊断从原盘建立可写运行副本。本地
-`make test-oscomp-official` 以只读方式挂载原盘，并为每个客体创建独立的
+初赛入口 `make test-oscomp-pre` 以只读方式挂载原盘，并为每个客体创建独立的
 QEMU 写时复制镜像（QEMU Copy-On-Write version 2，QCOW2）。虚拟机只写改动块，
 本地打包的启动器负责创建写入层，沿用原框架的构建、测试顺序和判分。
 
@@ -32,10 +32,10 @@ init.json和头文件；`INIT_CONFIG_RV`/`INIT_CONFIG_LA`独立覆盖，显式�
 挂载本架构原盘的独立副本。
 
 ```sh
-make run-oscomp-final-2026 OSCOMP_FINAL_ARCH=both
+make test-oscomp-final
 
 python3 -B tests/oscomp/run.py --profile final-2026 --arch both \
-  --images-dir /path/to/archives \
+  --images-dir /path/to/images \
   --host-vcpu-cpus 8,9,10,11,12,13,14,15 --host-io-cpu 0
 ```
 
@@ -167,7 +167,8 @@ LoongArch 的发布版 musl 有四个调度函数直接返回 `ENOSYS`。工具�
 make all
 make test-oscomp-host
 make test-oscomp-compat
-make test-oscomp-official
+make test-oscomp-pre
+make test-oscomp-final
 ```
 
 本地诊断允许选择架构和组，例如

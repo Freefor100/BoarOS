@@ -95,7 +95,8 @@ RISC-V 和 LoongArch 各自处理启动、异常入口、上下文切换和页�
 make all
 make test-oscomp-host
 make test-oscomp-compat      # 本地双架构诊断
-make test-oscomp-official    # 固定官方容器与原 Harness
+make test-oscomp-pre         # 初赛，使用官方容器和评测框架
+make test-oscomp-final       # 决赛，运行 CAgent 和 BuildStorm
 
 # 使用通用 PID 1 配置构建
 make all INIT_CONFIG=config/init.json

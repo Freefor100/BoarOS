@@ -690,9 +690,6 @@ OSCOMP_LOCAL_CACHE ?= build/tools/oscomp-local
 OSCOMP_LOCAL_ARGS = --cache '$(OSCOMP_LOCAL_CACHE)'
 OSCOMP_FINAL_IMAGES ?=
 OSCOMP_FINAL_ARCH ?= both
-.PHONY: run-oscomp-final-2026
-run-oscomp-final-2026:
-	python3 -B tests/oscomp/run.py --profile final-2026 --arch '$(OSCOMP_FINAL_ARCH)' $(if $(OSCOMP_FINAL_IMAGES),--images-dir '$(OSCOMP_FINAL_IMAGES)')
 all: prepare-oscomp-local-riscv prepare-oscomp-local-loongarch
 OSCOMP_CASE := build/riscv/oscomp/case
 OSCOMP_INIT := $(BUILD_DIR)/oscomp/init.json
@@ -1859,7 +1856,8 @@ test-virtio-block-host:
 test-lwext4-dir-empty-host:
 	python3 -B tests/userland/lwext4-dir-empty-host.py --sanitize
 
-.PHONY: test-oscomp-host test-oscomp-riscv test-oscomp-loongarch test-oscomp-compat test-oscomp-official test-oscomp-supervisor-riscv test-oscomp-supervisor-loongarch
+.PHONY: test-oscomp-host test-oscomp-riscv test-oscomp-loongarch test-oscomp-compat \
+	test-oscomp-pre test-oscomp-final test-oscomp-supervisor-riscv test-oscomp-supervisor-loongarch
 
 test-oscomp-host:
 	python3 -B -m unittest discover -s tests/oscomp -p 'test_*.py'
@@ -1887,8 +1885,11 @@ test-oscomp-loongarch:
 test-oscomp-compat:
 	python3 -B tests/oscomp/run.py --arch both
 
-test-oscomp-official:
+test-oscomp-pre:
 	python3 -B tests/oscomp/official.py
+
+test-oscomp-final:
+	python3 -B tests/oscomp/run.py --profile final-2026 --arch '$(OSCOMP_FINAL_ARCH)' $(if $(OSCOMP_FINAL_IMAGES),--images-dir '$(OSCOMP_FINAL_IMAGES)')
 
 .PHONY: test-sync-host
 test-sync-host:
