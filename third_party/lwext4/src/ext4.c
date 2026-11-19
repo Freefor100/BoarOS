@@ -2640,6 +2640,7 @@ static int ext4_reclaim_orphan(struct ext4_mountpoint *mp, uint32_t index,
 			       bool release_inode)
 {
 	bool done = false;
+	bool expand = release_inode;
 	int r;
 	if (!mp->fs.jbd_journal) return EOK;
 	if (jbd_journal_error(mp->fs.jbd_journal)) return jbd_journal_error(mp->fs.jbd_journal);
@@ -2655,6 +2656,7 @@ static int ext4_reclaim_orphan(struct ext4_mountpoint *mp, uint32_t index,
 	 * 才在trans_start等待，普通操作不排空整个挂载点。 */
 	do {
 		done = false;
+		bool expanded = false;
 		struct ext4_inode_ref ref;
 		r = ext4_trans_start(mp);
 		if (r != EOK) return r;
@@ -2673,7 +2675,7 @@ static int ext4_reclaim_orphan(struct ext4_mountpoint *mp, uint32_t index,
 		}
 		/* The truncate/unlink already passed permission checks. A surviving
 		 * descriptor may since have set immutable or append-only. */
-		r = ext4_inode_truncate_step(&ref, &done);
+		r = ext4_inode_truncate_orphan_step(&ref, &done, expand ? &expanded : NULL);
         if (r == EOK && done && dead && !release_inode)
             r = ext4_orphan_mark_truncate(&ref, false);
 		if (r == EOK && done && (!dead || release_inode))
@@ -2682,6 +2684,12 @@ static int ext4_reclaim_orphan(struct ext4_mountpoint *mp, uint32_t index,
 FinishWindow:
 		r = ext4_trans_finish(mp, r);
 		if (r == EAGAIN && ext4_operation_resource_retry(&mp->fs)) {
+			done = false;
+			continue;
+		}
+		if (expanded && (r == ENOMEM || r == ENOSPC) &&
+		    ext4_operation_aborted(&mp->fs) && !jbd_journal_error(mp->fs.jbd_journal)) {
+			expand = false;
 			done = false;
 			continue;
 		}

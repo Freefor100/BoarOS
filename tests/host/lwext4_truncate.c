@@ -1,6 +1,7 @@
 /* Restartable reclamation after the final i_size is already durable. */
 #include "block_fault.h"
 #include <ext4.h>
+#include <ext4_balloc.h>
 #include <ext4_bcache.h>
 #include <ext4_blockdev.h>
 #include <ext4_errno.h>
@@ -18,6 +19,26 @@
 static struct fault_block disk;
 static unsigned event, cut;
 static bool reorder;
+
+#if TEST_TRUNCATE_FALLBACK
+static int reclaim_injected_error;
+static unsigned expanded_attempts, narrow_attempts;
+int __real_ext4_balloc_free_blocks(struct ext4_inode_ref *, ext4_fsblk_t, uint32_t);
+int __wrap_ext4_balloc_free_blocks(struct ext4_inode_ref *ref, ext4_fsblk_t first,
+                                 uint32_t count)
+{
+    int result = __real_ext4_balloc_free_blocks(ref, first, count);
+    if (!reclaim_injected_error || result != EOK) return result;
+    /* Fail after allocating quarantine and changing the private bitmap. */
+    if (count > 32) {
+        expanded_attempts++;
+        return reclaim_injected_error;
+    }
+    narrow_attempts++;
+    return EOK;
+}
+#endif
+
 static void boundary(void)
 {
     if (++event != cut) return;
@@ -105,8 +126,8 @@ static bool step(struct ext4_fs *fs)
     CHECK(ext4_fs_get_inode_ref(fs, ino, &ref) == EOK);
     uint64_t target = ext4_inode_get_size(&fs->sb, ref.inode);
     uint64_t before = ext4_inode_get_blocks_count(&fs->sb, ref.inode);
-    bool done = false;
-    CHECK(ext4_inode_truncate_step(&ref, &done) == EOK);
+    bool done = false, expanded;
+    CHECK(ext4_inode_truncate_orphan_step(&ref, &done, &expanded) == EOK);
     CHECK(ext4_inode_get_size(&fs->sb, ref.inode) == target);
     if (!done) CHECK(ext4_inode_get_blocks_count(&fs->sb, ref.inode) < before);
     if (done) {
@@ -230,9 +251,10 @@ int main(int argc, char **argv)
         return 0;
     }
     uint64_t target = strtoull(argv[3], NULL, 10);
-    bool unlink = !strcmp(argv[4], "unlinked");
+    bool dense_unlinked = !strcmp(argv[4], "unlinked-dense");
+    bool unlink = dense_unlinked || !strcmp(argv[4], "unlinked");
     if (!strcmp(argv[2], "prepare")) {
-        prepare(dev.fs, target, strcmp(argv[4], "dense") != 0, unlink);
+        prepare(dev.fs, target, !dense_unlinked && strcmp(argv[4], "dense") != 0, unlink);
         CHECK(fault_block_crash(&disk) == 0);
         return 0;
     }
@@ -245,7 +267,19 @@ int main(int argc, char **argv)
         CHECK(fault_block_crash(&disk) == 0);
         return 0;
     }
-    for (unsigned limit = 0; !step(dev.fs); ++limit) CHECK(limit < 1000);
+#if TEST_TRUNCATE_FALLBACK
+    if (!strcmp(argv[2], "memory") || !strcmp(argv[2], "space")) {
+        uint32_t inode;
+        CHECK(dense_unlinked && !target && ext4_orphan_peek(dev.fs, &inode) == EOK && inode);
+        reclaim_injected_error = !strcmp(argv[2], "memory") ? ENOMEM : ENOSPC;
+        CHECK(ext4_orphan_free("/", inode) == EOK);
+        CHECK(expanded_attempts == 1 && narrow_attempts == 3);
+        printf("PASS: %u-byte dense unlink reclaimed after %s fallback\n", dev.lg_bsize, argv[2]);
+    } else
+#endif
+    {
+        for (unsigned limit = 0; !step(dev.fs); ++limit) CHECK(limit < 1000);
+    }
     verify(dev.fs, target, unlink);
     CHECK(ext4_journal_stop("/") == EOK);
     CHECK(ext4_umount("/") == EOK);

@@ -122,10 +122,12 @@ static int legacy_tail(struct ext4_inode_ref *ref, uint64_t keep, bool *changed)
     return EOK;
 }
 
-int ext4_inode_truncate_step(struct ext4_inode_ref *ref, bool *done)
+int ext4_inode_truncate_orphan_step(struct ext4_inode_ref *ref, bool *done,
+                                  bool *expanded)
 {
     if (!ref || !ref->fs || !ref->inode || !done) return EINVAL;
     *done = false;
+    if (expanded) *expanded = false;
     struct ext4_fs *fs = ref->fs;
     struct ext4_sblock *sb = ext4_fs_super(fs);
     if (fs->read_only) return EROFS;
@@ -161,18 +163,9 @@ int ext4_inode_truncate_step(struct ext4_inode_ref *ref, bool *done)
 #if CONFIG_EXTENT_ENABLE && CONFIG_EXTENTS_ENABLE
     if (ext4_inode_has_flag(ref->inode, EXT4_INODE_FLAG_EXTENTS)) {
         if (!ext4_sb_feature_incom(sb, EXT4_FINCOM_EXTENTS)) return EUCLEAN;
-        ext4_lblk_t last = 0;
-        bool found;
-        int r = ext4_extent_last_block(ref, &last, &found);
-        if (r != EOK) return r;
-        if (!found || last < keep) { *done = true; return EOK; }
-        uint64_t first = last >= TRUNCATE_BATCH - 1 ? last - (TRUNCATE_BATCH - 1) : 0;
-        if (first < keep) first = keep;
-        r = ext4_extent_remove_space(ref, (ext4_lblk_t)first, last);
-        /* The search proved that last was the highest mapped block. If
-         * this window started at keep, no tail can remain after success. */
-        if (r == EOK && first == keep) *done = true;
-        return r;
+        if (!fs->jbd_journal || type != EXT4_INODE_MODE_FILE || target ||
+            ext4_inode_get_links_cnt(ref->inode)) expanded = NULL;
+        return ext4_extent_remove_tail(ref, keep, TRUNCATE_BATCH, expanded, done);
     }
 #endif
     for (unsigned i = 0; i < TRUNCATE_BATCH; ++i) {
@@ -182,4 +175,9 @@ int ext4_inode_truncate_step(struct ext4_inode_ref *ref, bool *done)
         if (!changed) { *done = true; break; }
     }
     return EOK;
+}
+
+int ext4_inode_truncate_step(struct ext4_inode_ref *ref, bool *done)
+{
+    return ext4_inode_truncate_orphan_step(ref, done, NULL);
 }

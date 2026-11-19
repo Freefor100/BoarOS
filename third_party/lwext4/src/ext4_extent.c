@@ -1016,28 +1016,6 @@ err:
 	return ret;
 }
 
-/* Find the highest allocated logical block without scanning sparse holes. */
-int ext4_extent_last_block(struct ext4_inode_ref *inode_ref,
-                           ext4_lblk_t *last, bool *found)
-{
-    struct ext4_extent_path *path = NULL;
-    int r = ext4_find_extent(inode_ref, EXT_MAX_BLOCKS, &path, 0);
-    if (r != EOK) return r;
-    int depth = ext_depth(inode_ref->inode);
-    struct ext4_extent *extent = path[depth].extent;
-    *found = extent != NULL;
-    if (extent) {
-        uint64_t end = (uint64_t)to_le32(extent->first_block) +
-                       ext4_ext_get_actual_len(extent);
-        if (!ext4_ext_get_actual_len(extent) || !end || end - 1 > EXT_MAX_BLOCKS)
-            r = EUCLEAN;
-        else *last = (ext4_lblk_t)(end - 1);
-    }
-    ext4_ext_drop_refs(inode_ref, path, 0);
-    ext4_free(path);
-    return r;
-}
-
 static void ext4_ext_init_header(struct ext4_inode_ref *inode_ref,
 				 struct ext4_extent_header *eh, int32_t depth)
 {
@@ -1811,17 +1789,20 @@ static bool ext4_ext_more_to_rm(struct ext4_extent_path *path, ext4_lblk_t to)
 static ext4_lblk_t
 ext4_ext_next_allocated_block(struct ext4_extent_path *path);
 
-int ext4_extent_remove_space(struct ext4_inode_ref *inode_ref, ext4_lblk_t from,
-			     ext4_lblk_t to)
+/* Takes ownership of any prepared path, which may already cover from. */
+static int ext4_extent_remove_space_path(struct ext4_inode_ref *inode_ref,
+    ext4_lblk_t from, ext4_lblk_t to, struct ext4_extent_path *path,
+    bool at_start)
 {
-	struct ext4_extent_path *path = NULL;
 	int ret = EOK;
 	int32_t depth = ext_depth(inode_ref->inode);
 	int32_t i;
 
-	ret = ext4_find_extent(inode_ref, from, &path, 0);
-	if (ret != EOK)
-		goto out;
+	if (!at_start) {
+		ret = ext4_find_extent(inode_ref, from, &path, 0);
+		if (ret != EOK)
+			goto out;
+	}
 
 	if (!path[depth].extent) {
 		ret = EOK;
@@ -2004,8 +1985,63 @@ int ext4_extent_remove_space(struct ext4_inode_ref *inode_ref, ext4_lblk_t from,
 out:
 	ext4_ext_drop_refs(inode_ref, path, 0);
 	ext4_free(path);
-	path = NULL;
 	return ret;
+}
+
+int ext4_extent_remove_space(struct ext4_inode_ref *inode_ref, ext4_lblk_t from,
+                            ext4_lblk_t to)
+{
+    return ext4_extent_remove_space_path(inode_ref, from, to, NULL, false);
+}
+
+#define EXT4_UNLINK_EXTENT_RUN 256U
+
+int ext4_extent_remove_tail(struct ext4_inode_ref *inode_ref, uint64_t keep,
+    uint32_t window, bool *expanded, bool *done)
+{
+    struct ext4_extent_path *path = NULL;
+    int result = ext4_find_extent(inode_ref, EXT_MAX_BLOCKS, &path, 0);
+    if (result != EOK) return result;
+
+    struct ext4_extent *extent = path[ext_depth(inode_ref->inode)].extent;
+    if (!extent) { *done = true; goto Release; }
+    uint32_t length = ext4_ext_get_actual_len(extent);
+    uint64_t start = to_le32(extent->first_block);
+    uint64_t end = start + length;
+    if (!length || end - 1 > EXT_MAX_BLOCKS) { result = EUCLEAN; goto Release; }
+    if (end <= keep) { *done = true; goto Release; }
+
+    uint64_t first = end > window ? end - window : 0;
+    if (first < keep) first = keep;
+    if (expanded && first > start && first > keep) {
+        struct ext4_fs *fs = inode_ref->fs;
+        ext4_fsblk_t physical = ext4_ext_pblock(extent) + length - 1;
+        if (physical >= fs->bdev->lg_bcnt) { result = EUCLEAN; goto Release; }
+        /* A longer run still updates one bitmap under one block-group
+         * qualification. Do not add more extent records or groups to the
+         * ordinary window. The journal bounds each revoke lookup's lock hold. */
+        uint32_t run = ext4_fs_addr_to_idx_bg(ext4_fs_super(fs), physical) + 1;
+        if (run > EXT4_UNLINK_EXTENT_RUN) run = EXT4_UNLINK_EXTENT_RUN;
+        if (run > length) run = length;
+        uint64_t candidate = end - run;
+        if (candidate < keep) candidate = keep;
+        if (candidate < first) {
+            first = candidate;
+            *expanded = true;
+        }
+    }
+
+    /* The highest extent already owns the writable path for a single-extent
+     * tail. A wider logical window can reuse the allocation for its rewalk. */
+    result = ext4_extent_remove_space_path(inode_ref, (ext4_lblk_t)first,
+        (ext4_lblk_t)(end - 1), path, first >= start);
+    if (result == EOK && first == keep) *done = true;
+    return result;
+
+Release:
+    ext4_ext_drop_refs(inode_ref, path, 0);
+    ext4_free(path);
+    return result;
 }
 
 static int ext4_ext_split_extent_at(struct ext4_inode_ref *inode_ref,

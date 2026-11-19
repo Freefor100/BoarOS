@@ -16,4 +16,10 @@
  * together, so the current tree is the restart position after a power cut. */
 int ext4_inode_truncate_step(struct ext4_inode_ref *inode, bool *done);
 
+/* The final unlinked owner may reclaim a longer extent run in one group.
+ * A non-NULL expanded enables the larger run and reports whether it was used.
+ * After a rolled-back resource error the caller can retry without expansion. */
+int ext4_inode_truncate_orphan_step(struct ext4_inode_ref *inode, bool *done,
+                                  bool *expanded);
+
 #endif
