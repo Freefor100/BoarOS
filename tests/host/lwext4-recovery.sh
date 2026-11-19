@@ -11,7 +11,36 @@ ${HOST_CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror \
     -I"$root/third_party/lwext4/include" -idirafter "$root/include" \
     "$root"/third_party/lwext4/src/*.c "$root/tests/host/lwext4_recovery.c" \
     "$root/tests/host/block_fault.c" "$root/kernel/block.c" "$root/tests/host/block_runtime.c" "$root/kernel/raw_lock.c" "$root/tests/host/sync/notifications.c" -I"$root/tests/host/block_model" -pthread -o "$work/probe"
+closed_delete_replay() {
+    for features in '^orphan_file' orphan_file; do
+        for type in file dir; do
+            truncate -s 32M "$work/delete-base.img"
+            mkfs.ext4 -q -F -b "$1" -O "$features" "$work/delete-base.img"
+            timeout 30 "$work/probe" "$work/delete-base.img" delete-prepare "$type"
+            for mode in delete-immediate delete-grouped; do
+                cp "$work/delete-base.img" "$work/delete.img"
+                events=$(timeout 30 "$work/probe" "$work/delete.img" "$mode" "$type")
+                test "$events" -gt 0
+                for reorder in 0 1; do
+                    event=1
+                    while [ "$event" -le "$events" ]; do
+                        cp "$work/delete-base.img" "$work/delete-cut.img"
+                        status=0
+                        timeout 30 "$work/probe" "$work/delete-cut.img" "$mode" "$type" "$event" "$reorder" || status=$?
+                        test "$status" -eq 75
+                        timeout 30 "$work/probe" "$work/delete-cut.img" delete-check "$type"
+                        e2fsck -fn "$work/delete-cut.img" > "$work/delete-fsck.log" 2>&1 || { cat "$work/delete-fsck.log"; exit 1; }
+                        event=$((event+1))
+                    done
+                done
+                printf 'PASS: %s-byte %s %s %s, %s interrupted commits replayed\n' "$1" "$features" "$type" "$mode" "$((events*2))"
+            done
+        done
+    done
+}
 for blocksize in 1024 4096; do
+    closed_delete_replay "$blocksize"
+    if [ "${1:-all}" = closed-delete ]; then continue; fi
     truncate -s 32M "$work/base.img"
     mkfs.ext4 -q -F -b "$blocksize" "$work/base.img"
     cp "$work/base.img" "$work/owner.img"

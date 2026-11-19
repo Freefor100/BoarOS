@@ -4195,7 +4195,8 @@ int kernel_vfs_close(struct kernel_vfs_file *file)
     }
     node = file->private_data;
     KERNEL_LOCK_SCOPE(mutation);
-    if (file->write_lease || node->unlinked) kernel_vfs_mutation_lock(file->mount,&mutation);
+    if (file->write_lease || (node->unlinked && !node->retired))
+        kernel_vfs_mutation_lock(file->mount,&mutation);
     if (file->path && kernel_vfs_path_release(&file->path) != 0)
         __builtin_trap();
     {
@@ -4214,7 +4215,7 @@ int kernel_vfs_close(struct kernel_vfs_file *file)
         }
         if (node->open_files == 0U) __builtin_trap();
         node->open_files--;
-        if (!node->open_files && node->unlinked)
+        if (!node->open_files && node->unlinked && !node->retired)
             notify_inode(node->instance,node->inode,VFS_NOTIFY_DELETE_SELF,0,NULL,0);
     }
     adapter = file->mount->private_data;
@@ -4222,7 +4223,7 @@ int kernel_vfs_close(struct kernel_vfs_file *file)
         return -KERNEL_EIO;
     }
 
-    if (node->unlinked) {
+    if (node->unlinked && !node->retired) {
         KERNEL_LOCK_SCOPE(namespace_guard);
         if (!namespace_is_parallel(node->instance))
             kernel_vfs_namespace_lock(node->mount, &namespace_guard);
@@ -4520,6 +4521,21 @@ static int special_last_component(const char *path)
 static int rename_parent(struct kernel_vfs_path *, struct kernel_vfs_path *,
     const char *, struct kernel_vfs_path **, char [256], int *, int *, struct vfs_path_walk *);
 
+/* Both the visible name and the inode writer remain qualified through removal.
+ * Any other path, cache entry, or live open description must own a reference.
+ * Inotify marks use the inode number directly and take the ordinary path. */
+static bool unlink_exclusive(struct kernel_vfs_path *path, struct kernel_vfs_node *node)
+{
+    if (!kernel_lock_held(&node->io_lock, 1) || node->open_files != 1 ||
+        node->exec_users || node->write_openers ||
+        __atomic_load_n(&node->instance->notify_ops, __ATOMIC_ACQUIRE)) return false;
+    struct kernel_vfs_dentry *entry = path->dentry;
+    KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
+    return __atomic_load_n(&path->references, __ATOMIC_ACQUIRE) == 1 &&
+        __atomic_load_n(&entry->references, __ATOMIC_ACQUIRE) == 1U + entry->cached &&
+        __atomic_load_n(&node->references, __ATOMIC_ACQUIRE) == 1 && !entry->mountpoints;
+}
+
 int kernel_vfs_unlink_at(struct kernel_vfs_path *start,
                          struct kernel_vfs_path *root, const char *input,
                          int directory)
@@ -4570,10 +4586,18 @@ int kernel_vfs_unlink_at(struct kernel_vfs_path *start,
         result = -KERNEL_ENOTDIR;
     else if (kernel_vfs_mount_is_readonly(parent->file.mount)) result = -KERNEL_EROFS;
     else {
-        namespace_inode_lock(path->file.private_data, &inode_guard);
+        struct kernel_vfs_node *node = path->file.private_data;
+        const struct kernel_vfs_backend *ops = node->instance->ops;
+        namespace_inode_lock(node, &inode_guard);
         result = directory_mutation_allowed(parent,path);
-        if (!result) result = directory ? vfs_rmdir_raw(parent->file.mount, kernel_vfs_path_inode(parent), name)
-                           : vfs_unlink_raw(parent->file.mount, kernel_vfs_path_inode(parent), name);
+        if (!result) {
+            uint64_t directory_inode = kernel_vfs_path_inode(parent);
+            if (ops->remove_resolved)
+                result = ops->remove_resolved(parent->file.mount, directory_inode, name,
+                    node, directory, unlink_exclusive(path, node));
+            else result = directory ? vfs_rmdir_raw(parent->file.mount, directory_inode, name)
+                                    : vfs_unlink_raw(parent->file.mount, directory_inode, name);
+        }
     }
     if (!result) {
         {
@@ -4581,7 +4605,8 @@ int kernel_vfs_unlink_at(struct kernel_vfs_path *start,
             if (detach_path(path->dentry)) __builtin_trap();
         }
         struct kernel_vfs_node *node=path->file.private_data;
-        if (!directory) notify_inode(node->instance,node->inode,VFS_NOTIFY_ATTRIB,0,NULL,0);
+        if (!directory && !node->retired)
+            notify_inode(node->instance,node->inode,VFS_NOTIFY_ATTRIB,0,NULL,0);
         notify_child(parent,name,VFS_NOTIFY_DELETE|(directory?VFS_NOTIFY_ISDIR:0));
     }
 Finish:

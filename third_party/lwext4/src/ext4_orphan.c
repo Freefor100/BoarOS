@@ -348,6 +348,11 @@ static int check_inode_number(struct ext4_fs *fs, uint32_t ino, bool special)
     return EOK;
 }
 
+int ext4_orphan_check_user_inode(struct ext4_fs *fs, uint32_t inode)
+{
+    return check_inode_number(fs, inode, false);
+}
+
 static int check_allocated(struct ext4_fs *fs, uint32_t ino, bool special)
 {
     int r=check_inode_number(fs,ino,special);

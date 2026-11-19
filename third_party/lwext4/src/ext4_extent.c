@@ -876,6 +876,28 @@ static int ext4_ext_check_root(struct ext4_inode_ref *inode_ref)
     return EOK;
 }
 
+bool ext4_extent_small_root(struct ext4_inode_ref *ref, uint32_t limit, uint32_t *group)
+{
+    struct ext4_extent_header *header = ext_inode_hdr(ref->inode);
+    unsigned count = to_le16(header->entries_count);
+    if (ext_depth(ref->inode) || count > 1 || ext4_ext_check_root(ref)) return false;
+
+    struct ext4_sblock *sb = ext4_fs_super(ref->fs);
+    uint64_t blocks = ext4_inode_get_blocks_count(sb, ref->inode);
+    if (!count) return !blocks;
+    struct ext4_extent *extent = EXT_FIRST_EXTENT(header);
+    uint32_t length = ext4_ext_get_actual_len(extent);
+    ext4_fsblk_t first = ext4_ext_pblock(extent);
+    if (extent->first_block || !length || length > limit || !first ||
+        first + length > ref->fs->bdev->lg_bcnt ||
+        blocks != (uint64_t)length * (ref->fs->bdev->lg_bsize / EXT4_INODE_BLOCK_SIZE))
+        return false;
+    uint32_t first_group = ext4_balloc_get_bgid_of_block(sb, first);
+    if (first_group != ext4_balloc_get_bgid_of_block(sb, first + length - 1)) return false;
+    *group = first_group;
+    return true;
+}
+
 /* Query borrows only the current tree block. Keep the next sibling's logical
  * boundary as a value before returning its parent; holes need no ancestor path.
  * The caller's inode qualification stabilizes topology across these borrows. */

@@ -51,6 +51,8 @@ extern "C" {
 void ext4_extent_tree_init(struct ext4_inode_ref *inode_ref);
 int ext4_extent_remove_tail(struct ext4_inode_ref *inode_ref, uint64_t keep,
     uint32_t window, bool *expanded, bool *done);
+/* The group defaults to the caller's group for an empty extent root. */
+bool ext4_extent_small_root(struct ext4_inode_ref *inode, uint32_t limit, uint32_t *group);
 
 
 struct ext4_inode_block_range;

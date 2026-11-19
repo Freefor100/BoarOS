@@ -267,6 +267,11 @@ struct kernel_vfs_backend {
         uint64_t parent_inode, const char *path);
     int (*rmdir)(struct kernel_vfs_mount *mount,
         uint64_t parent_inode, const char *path);
+    /* Namespace and target I/O qualifications protect the resolved identity.
+     * Exclusive means the operation and the name cache own the only dentry
+     * references and its embedded file owns the target's only node reference. */
+    int (*remove_resolved)(struct kernel_vfs_mount *, uint64_t parent_inode,
+        const char *name, struct kernel_vfs_node *target, bool directory, bool exclusive);
     void (*release_unlinked)(struct kernel_vfs_node *node);
     int (*read_directory)(struct kernel_vfs_file *, struct kernel_vfs_dir_batch *);
     int (*dir_entry)(struct kernel_vfs_file *file,

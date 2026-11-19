@@ -214,6 +214,74 @@ static void grouped_remove(struct ext4_blockdev *dev)
 
 static uint64_t sync_goal_now(void *unused) { (void)unused; return 0; }
 
+static void closed_delete_retired(void *context)
+{
+    bool *retired = context;
+    CHECK(!*retired);
+    *retired = true;
+}
+
+static void closed_delete(struct ext4_blockdev *dev, const char *mode, bool directory)
+{
+    ext4_file file;
+    if (!strcmp(mode, "delete-prepare")) {
+        if (directory) CHECK(ext4_dir_mk("/victim") == EOK);
+        else {
+            size_t wrote;
+            CHECK(ext4_fopen(&file, "/victim", "w+") == EOK);
+            CHECK(ext4_fwrite(&file, payload, sizeof(payload), &wrote) == EOK && wrote == sizeof(payload));
+            CHECK(ext4_fclose(&file) == EOK);
+        }
+        CHECK(ext4_journal_stop("/") == EOK && ext4_umount("/") == EOK);
+        return;
+    }
+    if (!strcmp(mode, "delete-check")) {
+        if (directory) {
+            ext4_dir dir;
+            int result = ext4_dir_open(&dir, "/victim");
+            CHECK(result == EOK || result == ENOENT);
+            if (result == EOK) CHECK(ext4_dir_close(&dir) == EOK);
+        } else {
+            int result = ext4_fopen(&file, "/victim", "r");
+            CHECK(result == EOK || result == ENOENT);
+            if (result == EOK) {
+                char bytes[sizeof(payload)]; size_t got;
+                CHECK(ext4_fread(&file, bytes, sizeof(bytes), &got) == EOK);
+                CHECK(got == sizeof(payload) && !memcmp(bytes, payload, got));
+                CHECK(ext4_fclose(&file) == EOK);
+            }
+        }
+        uint32_t inode;
+        storage_lock(&lock_depth);
+        CHECK(ext4_orphan_peek(dev->fs, &inode) == EOK && !inode);
+        storage_unlock(&lock_depth);
+        CHECK(ext4_journal_stop("/") == EOK && ext4_umount("/") == EOK);
+        return;
+    }
+
+    bool grouped = !strcmp(mode, "delete-grouped");
+    CHECK(grouped || !strcmp(mode, "delete-immediate"));
+    if (grouped) {
+        struct ext4_journal_runtime runtime = {.now_ns = sync_goal_now};
+        CHECK(ext4_journal_group_enable("/", &runtime, 4 * 1024 * 1024) == EOK);
+    }
+    uint32_t inode;
+    CHECK(ext4_lookup_child("/", EXT4_INODE_ROOT_INDEX, "victim", 6, &inode, NULL) == EOK);
+    CHECK(ext4_orphan_check_user_inode(dev->fs, EXT4_INODE_ROOT_INDEX) == EUCLEAN);
+    uint32_t journal = ext4_get32(&dev->fs->sb, journal_inode_number);
+    uint32_t orphan_file = ext4_get32(&dev->fs->sb, orphan_file_inum);
+    CHECK(!journal || ext4_orphan_check_user_inode(dev->fs, journal) == EUCLEAN);
+    CHECK(!orphan_file || ext4_orphan_check_user_inode(dev->fs, orphan_file) == EUCLEAN);
+    bool orphan, retired = false;
+    CHECK(ext4_unlink_child_resolved("/", EXT4_INODE_ROOT_INDEX, "victim", directory,
+        inode, &orphan, closed_delete_retired, &retired) == EOK && retired && !orphan);
+    if (grouped) CHECK(ext4_journal_group_drain("/") == EOK);
+    else CHECK(ext4_journal_stop("/") == EOK);
+    CHECK(ext4_lookup_child("/", EXT4_INODE_ROOT_INDEX, "victim", 6, &inode, NULL) == ENOENT);
+    printf("%u\n", event);
+    CHECK(fault_block_crash(&disk) == 0);
+}
+
 static unsigned sync_goal_failures;
 static void expect_sync_goal(ext4_file *file, bool data, uint64_t expected,
                              const char *reason)
@@ -434,6 +502,13 @@ int main(int argc, char **argv)
     CHECK(ext4_mount_setup_locks("/", &storage_locks) == EOK);
     CHECK(ext4_journal_start("/") == EOK);
     event = 0;
+    if (!strncmp(argv[2], "delete-", 7)) {
+        CHECK(argc >= 4);
+        if (argc > 4) cut = (unsigned)strtoul(argv[4], NULL, 10);
+        if (argc > 5) reorder = atoi(argv[5]);
+        closed_delete(&dev, argv[2], !strcmp(argv[3], "dir"));
+        return 0;
+    }
     if (!strcmp(argv[2], "sync-goals")) {
         sync_goals(&dev);
         CHECK(ext4_umount("/") == EOK);

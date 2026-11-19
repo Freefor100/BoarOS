@@ -852,6 +852,11 @@ int ext4_create_child(const char *mount, uint32_t parent, const char *name,
     struct ext4_inode *initial,uint32_t uid,uint32_t gid);
 int ext4_unlink_child(const char *mount, uint32_t parent, const char *name,
     bool directory, uint32_t *inode, bool *orphan);
+/* Remove only the resolved inode. A callback also certifies that the target
+ * has no outside users; on direct reclaim call it before releasing the block
+ * group qualification. It must publish retirement without starting I/O. */
+int ext4_unlink_child_resolved(const char *mount, uint32_t parent, const char *name,
+    bool directory, uint32_t target, bool *orphan, void (*retire)(void *), void *context);
 /* A NULL mode requests only the stable directory-entry inode identity. */
 int ext4_lookup_child(const char *mount_point, uint32_t parent_inode,
                       const char *name, uint32_t name_length,

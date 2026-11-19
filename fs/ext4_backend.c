@@ -316,19 +316,25 @@ static int journal_await_start(struct lwext4_mount_adapter *adapter,int checkpoi
         if(kernel_wait_park(&token,&reason) || kernel_wait_finish(&token))__builtin_trap();
     }
 }
+static void retire_freed_inode(struct lwext4_mount_adapter *adapter, uint32_t inode,
+    struct kernel_vfs_node *live)
+{
+    KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
+    if (live) live->unlinked = live->retired = 1;
+    /* 失败 close 的旧 handle 不再进入 inode 索引。真正释放 inode 时
+     * 同时退休它的待清理状态，不能在该 inode 复用后再截断新所有者。 */
+    for (struct kernel_vfs_node *node = adapter->instance.cleanup_nodes; node; node = node->next) {
+        if (node->inode == inode) {
+            ((struct lwext4_node *)node)->write_completion = 0;
+            node->retired = 1;
+        }
+    }
+}
+
 static int free_orphan_inode(struct lwext4_mount_adapter *adapter,uint32_t inode)
 {
     int result=ext4_orphan_free(adapter->mount_point,inode);
-    if (!result) {
-        /* 失败 close 的旧 handle 不再进入 inode 索引。真正释放 inode 时
-         * 同时退休它的待清理状态，不能在该 inode 复用后再截断新所有者。 */
-        KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
-        for (struct kernel_vfs_node *node=adapter->instance.cleanup_nodes;node;node=node->next)
-            if (node->inode==inode) {
-                ((struct lwext4_node *)node)->write_completion=0;
-                node->retired=1;
-            }
-    }
+    if (!result) retire_freed_inode(adapter, inode, NULL);
     return result;
 }
 
@@ -2695,6 +2701,33 @@ static int ext4_backend_rmdir(struct kernel_vfs_mount *mount,
     return 0;
 }
 
+static void retire_resolved_inode(void *context)
+{
+    struct kernel_vfs_node *node = context;
+    /* Acceptance still holds the inode's allocation group. A new incarnation
+     * cannot borrow the old VFS node after checkpoint releases quarantine. */
+    retire_freed_inode(lwext4_instance(node->instance), node->inode, node);
+}
+
+static int ext4_backend_remove_resolved(struct kernel_vfs_mount *mount,
+    uint64_t parent, const char *name, struct kernel_vfs_node *node,
+    bool directory, bool exclusive)
+{
+    struct lwext4_mount_adapter *adapter = mount->private_data;
+    if (!parent || parent > UINT32_MAX || !node->inode || node->inode > UINT32_MAX ||
+        node->instance != &adapter->instance || node->unlinked || node->retired)
+        return -KERNEL_EINVAL;
+    struct lwext4_node *target = (struct lwext4_node *)node;
+    bool orphan;
+    if (target->delalloc.blocks || target->write_completion) exclusive = false;
+    int result = ext4_unlink_child_resolved(adapter->mount_point, parent, name,
+        directory, node->inode, &orphan, exclusive ? retire_resolved_inode : NULL, node);
+    /* VFS still owns the target through its dentry. If it or another path is
+     * kept, the normal final close owns reclaim and any cleanup retry. */
+    if (result == EOK && orphan) node->unlinked = 1;
+    return lwext4_error(result);
+}
+
 static void ext4_backend_release_unlinked(struct kernel_vfs_node *node)
 {
     struct kernel_vfs_node *temp;
@@ -3177,6 +3210,7 @@ static void initialize_backend(void)
     ops->mkdir = ext4_backend_mkdir;
     ops->unlink = ext4_backend_unlink;
     ops->rmdir = ext4_backend_rmdir;
+    ops->remove_resolved = ext4_backend_remove_resolved;
     ops->release_unlinked = ext4_backend_release_unlinked;
     ops->read_directory = ext4_backend_read_directory;
     ops->pread = ext4_backend_pread;

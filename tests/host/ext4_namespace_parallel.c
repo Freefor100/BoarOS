@@ -746,6 +746,7 @@ int main(int argc,char **argv)
                                         {.parent=directories[same[1]],.root=root,.actor=1}};
     run_pair(adapter,same_actors,1,0);
     puts("PASS real same-group create: independent parents pass VFS, allocation qualification queues the second operation");
+    orphan_closed_case(adapter,root);
     orphan_normal_order_case(adapter,directories[same[0]],root);
     orphan_snapshot_case(adapter,directories[same[0]],directories[same[1]],root);
     namespace_reuse_loop_case(adapter,directories[different[0]],directories[different[1]],root);
