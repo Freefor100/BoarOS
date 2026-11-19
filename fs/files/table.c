@@ -881,14 +881,15 @@ enum kernel_files_status kernel_files_find_two_free_fds(
 {
     int value;
     enum kernel_files_status status=kernel_files_find_free_fd(files, first, &value);
-    *result=value;
-    if (status || value) return status;
-    status=kernel_files_find_free_fd(files, second, &value);
-    *result=value;
-    if (status || *result) {
-        struct kernel_files_fd_reservation reservation={files,*first};
-        kernel_files_cancel_reservation(&reservation);
+    if (status) return status;
+    if (!value) {
+        status=kernel_files_find_free_fd(files, second, &value);
+        if (status || value) {
+            struct kernel_files_fd_reservation reservation={files,*first};
+            kernel_files_cancel_reservation(&reservation);
+        }
     }
+    if (!status) *result=value;
     return status;
 }
 
@@ -1013,7 +1014,7 @@ enum kernel_files_status kernel_files_pipe2(
         if (cleanup_status != KERNEL_FILES_STATUS_OK) {
             return cleanup_status;
         }
-        *linux_result = result;
+        if (status == KERNEL_FILES_STATUS_OK) *linux_result = result;
         return status;
     }
 
@@ -1085,7 +1086,8 @@ enum kernel_files_status kernel_files_memfd(struct kernel_files *files,const cha
 {
     uint32_t fd; int error;
     enum kernel_files_status status=kernel_files_find_free_fd(files,&fd,&error);
-    if (status || error) { *result=error; return status; }
+    if (status) return status;
+    if (error) { *result=error; return KERNEL_FILES_STATUS_OK; }
     KERNEL_FILES_RESERVATION_SCOPE(reservation);
     reservation.files=files;reservation.fd=fd;
     struct kernel_open_file_description *file=NULL;
