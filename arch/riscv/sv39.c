@@ -865,6 +865,7 @@ enum riscv_sv39_status riscv_sv39_user_space_init(
 
     result.allocator = allocator;
     result.root_address = root_address;
+    result.root_entries = user_root;
     result.table_pages = 1U;
     result.leaf_pages = 0U;
     result.protected_pages = 0U;
@@ -905,12 +906,7 @@ static enum riscv_sv39_status resolve_user_order_slot(
     int allocated_level1 = 0;
     enum riscv_sv39_status status;
 
-    status = resolve_runtime_table(space->allocator,
-                                   space->root_address,
-                                   &root);
-    if (status != RISCV_SV39_STATUS_OK) {
-        return status;
-    }
+    root = space->root_entries;
     root_entry = &root[(virtual_address >> 30U) & RISCV_SV39_INDEX_MASK];
     if (*root_entry == 0U) {
         status = allocate_runtime_table(space,
@@ -1169,9 +1165,8 @@ static enum riscv_sv39_status resolve_leaf_order(const struct riscv_sv39_user_sp
 {
     if (!s || v >= RISCV_SV39_USER_LIMIT) return RISCV_SV39_STATUS_INVALID;
     if (s->state != RISCV_SV39_USER_SPACE_LIVE) return RISCV_SV39_STATUS_STATE;
-    uint64_t *entries;
-    enum riscv_sv39_status status = resolve_runtime_table(s->allocator,s->root_address,&entries);
-    if (status) return status;
+    uint64_t *entries = s->root_entries;
+    enum riscv_sv39_status status;
     for (int level=2; level>=0; level--) {
         if (visits) { (*visits)++; COST_ADD(MPROTECT_PTE_VISITS,1); }
         /* Match resolve_user_order_slot/install_prepared_leaf exactly. The
@@ -1288,9 +1283,8 @@ enum riscv_sv39_status riscv_sv39_user_detach_range(
         if (boundary) return boundary;
         cursor->address=start; cursor->phase=1;
     }
-    uint64_t *root;
-    enum riscv_sv39_status status=resolve_runtime_table(s->allocator,s->root_address,&root);
-    if (status) return status;
+    uint64_t *root = s->root_entries;
+    enum riscv_sv39_status status;
     unsigned visits=0;
     while (visits<16 && batch->count<=KERNEL_MM_RETIRE_CAPACITY-3) {
         if (cursor->phase==2) {
@@ -1483,9 +1477,8 @@ enum riscv_sv39_status riscv_sv39_user_leaf_missing_order(struct riscv_sv39_user
     if ((order != 0 && order != 9) || !s || s->state != RISCV_SV39_USER_SPACE_LIVE || !mask ||
         address < BOAROS_PAGE_SIZE || address >= RISCV_SV39_USER_LIMIT ||
         (address & (((uint64_t)BOAROS_PAGE_SIZE<<order)-1))) return RISCV_SV39_STATUS_INVALID;
-    uint64_t *root, *middle;
-    enum riscv_sv39_status status = resolve_runtime_table(s->allocator, s->root_address, &root);
-    if (status != RISCV_SV39_STATUS_OK) return status;
+    uint64_t *root = s->root_entries, *middle;
+    enum riscv_sv39_status status;
     uint64_t r = root[(address >> 30) & RISCV_SV39_INDEX_MASK];
     if (!r) { *mask = order ? 1 : 3; return RISCV_SV39_STATUS_OK; }
     if (!valid_nonleaf_entry(r)) return RISCV_SV39_STATUS_STATE;
@@ -1507,9 +1500,8 @@ static enum riscv_sv39_status install_prepared_leaf(struct riscv_sv39_user_space
     if (!s || s->state != RISCV_SV39_USER_SPACE_LIVE || !prepared ||
         address < BOAROS_PAGE_SIZE || address >= RISCV_SV39_USER_LIMIT ||
         (address & BOAROS_PAGE_MASK)) return RISCV_SV39_STATUS_INVALID;
-    uint64_t *root, *middle, *leaves;
-    enum riscv_sv39_status status = resolve_runtime_table(s->allocator, s->root_address, &root);
-    if (status != RISCV_SV39_STATUS_OK) return status;
+    uint64_t *root = s->root_entries, *middle, *leaves;
+    enum riscv_sv39_status status;
     unsigned r = (address >> 30) & RISCV_SV39_INDEX_MASK;
     unsigned m = (address >> 21) & RISCV_SV39_INDEX_MASK;
     unsigned l = (address >> BOAROS_PAGE_SHIFT) & RISCV_SV39_INDEX_MASK;
@@ -1690,9 +1682,8 @@ enum riscv_sv39_status riscv_sv39_user_next_owned(struct riscv_sv39_user_space *
     if (!s || !cursor || !address || s->state != RISCV_SV39_USER_SPACE_LIVE ||
         *cursor > end || end > RISCV_SV39_USER_LIMIT || ((*cursor | end) & BOAROS_PAGE_MASK)) return RISCV_SV39_STATUS_INVALID;
     if (*cursor == end) return RISCV_SV39_STATUS_NOT_MAPPED;
-    uint64_t *root, *middle, *leaves;
-    enum riscv_sv39_status status = resolve_runtime_table(s->allocator, s->root_address, &root);
-    if (status != RISCV_SV39_STATUS_OK) return status;
+    uint64_t *root = s->root_entries, *middle, *leaves;
+    enum riscv_sv39_status status;
     unsigned first_r = *cursor >> 30, first_m = (*cursor >> 21) & RISCV_SV39_INDEX_MASK;
     unsigned first_l = (*cursor >> BOAROS_PAGE_SHIFT) & RISCV_SV39_INDEX_MASK;
     for (unsigned r = first_r; r < 256 && ((uint64_t)r << 30) < end; r++) {
@@ -1914,12 +1905,7 @@ static enum riscv_sv39_status invalidate_owned_range(
     uint32_t level0_index;
     enum riscv_sv39_status status;
 
-    status = resolve_runtime_table(space->allocator,
-                                   space->root_address,
-                                   &root);
-    if (status != RISCV_SV39_STATUS_OK) {
-        __builtin_trap();
-    }
+    root = space->root_entries;
     for (root_index = 0U;
          root_index < RISCV_SV39_USER_ROOT_ENTRIES;
          root_index++) {
@@ -2017,12 +2003,7 @@ static enum riscv_sv39_status release_invalidated_range(
     uint32_t level0_index;
     enum riscv_sv39_status status;
 
-    status = resolve_runtime_table(space->allocator,
-                                   space->root_address,
-                                   &root);
-    if (status != RISCV_SV39_STATUS_OK) {
-        __builtin_trap();
-    }
+    root = space->root_entries;
     for (root_index = 0U;
          root_index < RISCV_SV39_USER_ROOT_ENTRIES;
          root_index++) {
@@ -2241,12 +2222,7 @@ enum riscv_sv39_status riscv_sv39_user_protect_owned_range(
         (active_pages != 0U || protected_pages != 0U)) {
         riscv_mmu_sync_instructions();
     }
-    status = resolve_runtime_table(space->allocator,
-                                   space->root_address,
-                                   &root);
-    if (status != RISCV_SV39_STATUS_OK) {
-        return status;
-    }
+    root = space->root_entries;
     for (root_index = 0U;
          root_index < RISCV_SV39_USER_ROOT_ENTRIES;
          root_index++) {
@@ -2446,19 +2422,13 @@ static enum riscv_sv39_status init_forked_user_space(
     const struct riscv_sv39_user_space *source)
 {
     struct riscv_sv39_user_space result = {0};
-    uint64_t *source_root;
+    uint64_t *source_root = source->root_entries;
     uint64_t *destination_root;
     uint64_t root_address;
     uint32_t index;
     enum physical_page_status page_status;
     enum riscv_sv39_status status;
 
-    status = resolve_runtime_table(source->allocator,
-                                   source->root_address,
-                                   &source_root);
-    if (status != RISCV_SV39_STATUS_OK) {
-        return status;
-    }
     page_status = physical_page_allocate(source->allocator, &root_address);
     if (page_status == PHYSICAL_PAGE_STATUS_EMPTY) {
         return RISCV_SV39_STATUS_NO_MEMORY;
@@ -2484,6 +2454,7 @@ static enum riscv_sv39_status init_forked_user_space(
     }
     result.allocator = source->allocator;
     result.root_address = root_address;
+    result.root_entries = destination_root;
     result.table_pages = 1U;
     result.leaf_pages = 0U;
     result.protected_pages = 0U;
@@ -2622,12 +2593,7 @@ enum riscv_sv39_status riscv_sv39_user_space_fork_prepare(
     if (status != RISCV_SV39_STATUS_OK) {
         return status;
     }
-    status = resolve_runtime_table(source->allocator,
-                                   source->root_address,
-                                   &root);
-    if (status != RISCV_SV39_STATUS_OK) {
-        return status;
-    }
+    root = source->root_entries;
     for (root_index = 0U;
          root_index < RISCV_SV39_USER_ROOT_ENTRIES;
          root_index++) {
@@ -2699,6 +2665,7 @@ enum riscv_sv39_status riscv_sv39_user_space_move(
     *destination = *source;
     source->allocator = 0;
     source->root_address = 0U;
+    source->root_entries = NULL;
     source->table_pages = 0U;
     source->leaf_pages = 0U;
     source->protected_pages = 0U;
@@ -2855,7 +2822,7 @@ enum riscv_sv39_status riscv_sv39_user_space_destroy(
         }
     }
     if (space->table_pages == 0U) {
-        if (space->root_address != 0U || space->leaf_pages != 0U ||
+        if (space->root_address != 0U || space->root_entries || space->leaf_pages != 0U ||
             space->protected_pages != 0U ||
             space->cow_pages != 0U) {
             return RISCV_SV39_STATUS_STATE;
@@ -2864,12 +2831,7 @@ enum riscv_sv39_status riscv_sv39_user_space_destroy(
         space->state = RISCV_SV39_USER_SPACE_DESTROYED;
         return RISCV_SV39_STATUS_OK;
     }
-    status = resolve_runtime_table(space->allocator,
-                                   space->root_address,
-                                   &root);
-    if (status != RISCV_SV39_STATUS_OK) {
-        __builtin_trap();
-    }
+    root = space->root_entries;
 
     uint32_t references;
     if (physical_page_reference_count(space->allocator,space->root_address,&references))
@@ -2902,6 +2864,7 @@ enum riscv_sv39_status riscv_sv39_user_space_destroy(
 
     space->allocator = 0;
     space->root_address = 0U;
+    space->root_entries = NULL;
     space->table_pages = 0U;
     space->leaf_pages = 0U;
     space->protected_pages = 0U;

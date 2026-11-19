@@ -165,6 +165,7 @@ struct kernel_mm_record {
     uint64_t vvar_page;
 #endif
     uint32_t brk_initialized;
+    uint32_t recent_fault_vma;
     struct arch_mmu_user_space space;
     struct kernel_vma_set *vmas;
     struct kernel_heap *vma_heap;
@@ -2408,10 +2409,8 @@ static enum kernel_mm_status read_fault_vma(struct mm_operation *operation,
         view->range_edit_generation =
             __atomic_load_n(&record->range_edit_generation, __ATOMIC_ACQUIRE);
     }
-    enum kernel_vma_status found = kernel_vma_set_lookup(record->vmas, address, &view->vma);
-    if (found) return status_from_vma(found);
-    view->generation = kernel_vma_set_generation(record->vmas);
-    return KERNEL_MM_STATUS_OK;
+    return status_from_vma(kernel_vma_set_lookup_recent(record->vmas, address,
+        &record->recent_fault_vma, &view->vma, &view->generation));
 }
 /* 在MM raw内登记并复查，解锁后park；末次pin归还也以该锁同步登记后wake。
  * 注册owner由局部token持有，退出函数前finish，不携带裸队列游标。 */
@@ -4415,40 +4414,45 @@ static enum kernel_mm_status protect_vma_pages(struct kernel_mm_record *record,
 {
     uint64_t address = edit->start, end = edit->end;
     uint32_t normalized = edit->permissions;
-    uint64_t cursor = address, leaf;
-    int touched=0;
+    struct kernel_mm_retirement batch;
+    batch.count = 0;
+    uint32_t targets;
+    int instructions = (normalized & KERNEL_MM_EXECUTE) != 0;
     if (end-address==BOAROS_PAGE_SIZE) {
         /* One base page cannot cover a large leaf. The backend performs the
-         * lookup and update together and reports a hole without a fence. */
+         * lookup and update together and reports a hole without a fence.
+         * Capture the invalidation targets before dropping this guard. */
         KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
         uint32_t leaf_permissions=protection_for_leaf(record,address,normalized);
         enum arch_mmu_status status=arch_mmu_user_protect_resident_page(&record->space,address,
             backend_permissions_from_mm(leaf_permissions));
-        if (status && status!=ARCH_MMU_STATUS_NOT_MAPPED) __builtin_trap();
-        touched=!status;
-    } else for (;;) {
-        KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
-        enum arch_mmu_status status=arch_mmu_user_next_owned(&record->space,&cursor,end,&leaf);
-        if (status==ARCH_MMU_STATUS_NOT_MAPPED) break;
+        if (status==ARCH_MMU_STATUS_NOT_MAPPED) return KERNEL_MM_STATUS_OK;
         if (status) __builtin_trap();
-        touched=1;
-        uint32_t leaf_permissions=protection_for_leaf(record,leaf,normalized);
-        struct kernel_mm_leaf snapshot;
-        if (arch_mmu_user_leaf_snapshot(&record->space,leaf,&snapshot)) __builtin_trap();
-        if (snapshot.order) {
-            if (leaf<address || leaf+kernel_mm_leaf_size(&snapshot)>end ||
-                arch_mmu_user_protect_owned_range(&record->space,leaf,leaf+kernel_mm_leaf_size(&snapshot),
+        targets=note_tlb_change_locked(record,&batch,instructions);
+    } else {
+        uint64_t cursor = address, leaf;
+        int touched=0;
+        for (;;) {
+            KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
+            enum arch_mmu_status status=arch_mmu_user_next_owned(&record->space,&cursor,end,&leaf);
+            if (status==ARCH_MMU_STATUS_NOT_MAPPED) break;
+            if (status) __builtin_trap();
+            touched=1;
+            uint32_t leaf_permissions=protection_for_leaf(record,leaf,normalized);
+            struct kernel_mm_leaf snapshot;
+            if (arch_mmu_user_leaf_snapshot(&record->space,leaf,&snapshot)) __builtin_trap();
+            if (snapshot.order) {
+                if (leaf<address || leaf+kernel_mm_leaf_size(&snapshot)>end ||
+                    arch_mmu_user_protect_owned_range(&record->space,leaf,leaf+kernel_mm_leaf_size(&snapshot),
+                        backend_permissions_from_mm(leaf_permissions))) __builtin_trap();
+            } else if (arch_mmu_user_protect_owned_page(&record->space, leaf,
                     backend_permissions_from_mm(leaf_permissions))) __builtin_trap();
-        } else if (arch_mmu_user_protect_owned_page(&record->space, leaf,
-                backend_permissions_from_mm(leaf_permissions))) __builtin_trap();
+        }
+        if (!touched) return KERNEL_MM_STATUS_OK;
+        KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
+        targets=note_tlb_change_locked(record,&batch,instructions);
     }
-    if (touched) {
-        struct kernel_mm_retirement batch={0};
-        uint32_t targets;
-        { KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
-          targets=note_tlb_change_locked(record,&batch,(normalized & KERNEL_MM_EXECUTE)!=0); }
-        finish_tlb_change(record,&batch,targets,address,end-address,(normalized & KERNEL_MM_EXECUTE)!=0);
-    }
+    finish_tlb_change(record,&batch,targets,address,end-address,instructions);
     return KERNEL_MM_STATUS_OK;
 }
 static enum kernel_mm_status protect_vma_range(
@@ -6084,6 +6088,16 @@ static enum kernel_mm_status mapped_object_fault(struct mm_operation *operation,
     return status ? status : (mapping.permissions & access) ? KERNEL_MM_STATUS_OK : KERNEL_MM_STATUS_ACCESS;
 }
 
+static uint64_t file_fault_window(const struct kernel_vma *vma, uint64_t address,
+    uint64_t *end)
+{
+    const uint64_t span = KERNEL_PAGE_CACHE_READY_WINDOW * BOAROS_PAGE_SIZE;
+    uint64_t first = address & ~(span - 1);
+    uint64_t limit = first + span;
+    *end = limit < vma->end ? limit : vma->end;
+    return first > vma->start ? first : vma->start;
+}
+
 /* The fault owns the actual source and MM qualification. Borrow ready pages
  * once, prepare optional resident records outside metadata, then publish the
  * bounded same-leaf batch under one metadata protection. */
@@ -6094,9 +6108,7 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
     const struct kernel_mm_retirement *batch,uint32_t *targets)
 {
     uint64_t end=address+BOAROS_PAGE_SIZE;
-    uint64_t first=address&~UINT64_C(65535),limit=first+65536;
-    if (first<vma->start) first=vma->start;
-    if (limit>vma->end) limit=vma->end;
+    uint64_t limit, first=file_fault_window(vma,address,&limit);
     unsigned selected=0,slots=KERNEL_PAGE_CACHE_READY_WINDOW;
     {
         KERNEL_RAW_READ_SCOPE(raw,&record->metadata);
@@ -7113,6 +7125,66 @@ static __attribute__((noinline)) enum kernel_mm_status associate_anonymous_fault
     return KERNEL_MM_STATUS_OK;
 }
 
+/* The continuous read gate keeps the source live. Its executable lease
+ * excludes file writes and resize while cache references become PTE owners. */
+static __attribute__((noinline)) int try_elf_ready_fault(struct mm_operation *operation,
+    uint64_t address, const struct fault_vma *view)
+{
+    struct kernel_mm_record *record = operation->record;
+    const struct kernel_vma *vma = &view->vma;
+    struct kernel_elf64_source *source = vma->backing;
+    struct kernel_open_file_description *file = kernel_elf64_source_file(source);
+    if (!file || !kernel_open_file_vfs_borrow(file)->exec_lease) return 0;
+
+    address &= ~BOAROS_PAGE_MASK;
+    uint64_t limit, first = file_fault_window(vma,address,&limit);
+    unsigned demand = 1U << ((address-first) >> BOAROS_PAGE_SHIFT);
+    unsigned selected, missing;
+    {
+        struct kernel_mm_leaf leaf;
+        KERNEL_RAW_READ_SCOPE(raw, &record->metadata);
+        if (arch_mmu_user_leaf_probe(&record->space,address,&leaf,&missing) !=
+                ARCH_MMU_STATUS_NOT_MAPPED || missing ||
+            arch_mmu_user_empty_window(&record->space,first,
+                (limit-first) >> BOAROS_PAGE_SHIFT,&selected) || !(selected & demand))
+            return 0;
+    }
+
+    uint64_t refs[KERNEL_PAGE_CACHE_READY_WINDOW];
+    unsigned ready = kernel_elf64_source_acquire_ready(source,
+        vma->backing_offset + (first-vma->start),selected,refs,KERNEL_PAGE_CACHE_READY_WINDOW);
+    if (!ready) return 0;
+
+    unsigned installed = 0;
+    uint32_t targets = 0;
+    int instructions = (vma->permissions & KERNEL_MM_EXECUTE) != 0;
+    struct kernel_mm_retirement batch;
+    batch.count = batch.nonleaf = batch.compound = 0;
+    if (ready & demand) {
+        KERNEL_LOCK_SCOPE(vma_guard);
+        kernel_rwlock_read(&record->vma_lock,&vma_guard);
+        KERNEL_RAW_WRITE_SCOPE(raw, &record->metadata);
+        if (kernel_vma_set_generation(record->vmas) == view->generation &&
+            !fault_range_claimed(record,first,limit)) {
+            installed = arch_mmu_user_map_owned_window(&record->space,first,ready,refs,
+                backend_permissions_from_mm(vma->permissions & ~KERNEL_MM_WRITE));
+            if (installed) targets = note_fault_change_locked(record,&batch,0,instructions);
+        }
+    }
+    if (installed != ready) {
+        unsigned index = 0, unused = 0;
+        for (unsigned bits = ready; bits; bits &= bits-1) {
+            if (!(installed & (bits & -bits))) refs[unused++] = refs[index];
+            ++index;
+        }
+        physical_page_release_batch(record->space.allocator,refs,unused);
+    }
+    if (installed)
+        finish_fault_change(record,&batch,targets,installed == demand ? address : first,
+            installed == demand ? BOAROS_PAGE_SIZE : limit-first,0,instructions);
+    return !!(installed & demand);
+}
+
 static enum kernel_mm_status dispatch_fault(struct mm_operation *operation, uint64_t address,
     uint32_t access, struct fault_vma *view, int force)
 {
@@ -7140,6 +7212,12 @@ static enum kernel_mm_status dispatch_fault(struct mm_operation *operation, uint
     case KERNEL_VMA_KIND_FILE_SHARED:
     case KERNEL_VMA_KIND_FILE_PRIVATE:
         return mapped_file_fault(operation, address, access, view, force);
+    case KERNEL_VMA_KIND_ELF_PRIVATE:
+        if (operation->shared && !force && !operation->populate && !operation->fault_pin &&
+            access != KERNEL_MM_WRITE && (view->vma.permissions & access) &&
+            !(view->vma.flags & KERNEL_VMA_RANDOM_READ) && try_elf_ready_fault(operation,address,view))
+            return KERNEL_MM_STATUS_OK;
+        return memory_fault(operation, address, access, view, force);
     default:
         return memory_fault(operation, address, access, view, force);
     }

@@ -163,6 +163,10 @@ enum kernel_vma_status kernel_vma_set_lookup(
     const struct kernel_vma_set *set,
     uint64_t virtual_address,
     struct kernel_vma *vma);
+/* Caller holds the mapping-set protection and provides a per-space index. */
+enum kernel_vma_status kernel_vma_set_lookup_recent(
+    const struct kernel_vma_set *, uint64_t address, uint32_t *slot,
+    struct kernel_vma *, uint64_t *generation);
 
 int kernel_vma_set_has_shm(const struct kernel_vma_set *, uint64_t start, uint64_t length);
 int kernel_vma_set_range_is_anonymous(const struct kernel_vma_set *, uint64_t start, uint64_t end);

@@ -1181,23 +1181,39 @@ enum kernel_vma_status kernel_vma_set_commit_edit(
     return KERNEL_VMA_STATUS_OK;
 }
 
-enum kernel_vma_status kernel_vma_set_lookup(
-    const struct kernel_vma_set *set,
-    uint64_t virtual_address,
-    struct kernel_vma *vma)
+static inline uint32_t containing_index(const struct kernel_vma_set *set, uint64_t address)
 {
-    uint32_t index;
+    uint32_t index = lower_bound(set, address + (address != UINT64_MAX));
+    return index && address < set->entries[index-1].end ? index-1 : set->count;
+}
 
-    if (!set_valid(set) || vma == 0) {
-        return KERNEL_VMA_STATUS_INVALID_ARGUMENT;
+enum kernel_vma_status kernel_vma_set_lookup(
+    const struct kernel_vma_set *set, uint64_t virtual_address, struct kernel_vma *vma)
+{
+    if (!set_valid(set) || !vma) return KERNEL_VMA_STATUS_INVALID_ARGUMENT;
+    uint32_t index = containing_index(set, virtual_address);
+    if (index == set->count) return KERNEL_VMA_STATUS_NOT_FOUND;
+    *vma = set->entries[index];
+    return KERNEL_VMA_STATUS_OK;
+}
+
+enum kernel_vma_status kernel_vma_set_lookup_recent(
+    const struct kernel_vma_set *set, uint64_t address, uint32_t *slot,
+    struct kernel_vma *vma, uint64_t *generation)
+{
+    if (!set_valid(set)) return KERNEL_VMA_STATUS_INVALID_ARGUMENT;
+    uint32_t previous = __atomic_load_n(slot, __ATOMIC_RELAXED);
+    uint32_t index = previous;
+    /* The caller stabilizes the array. A stale index after an insertion or
+     * split may point elsewhere, so always test the current interval. */
+    if (index >= set->count || address < set->entries[index].start ||
+        address >= set->entries[index].end) {
+        index = containing_index(set, address);
+        if (index == set->count) return KERNEL_VMA_STATUS_NOT_FOUND;
+        if (index != previous) __atomic_store_n(slot, index, __ATOMIC_RELAXED);
     }
-    index = lower_bound(set, virtual_address +
-                        (virtual_address != UINT64_MAX ? 1U : 0U));
-    if (index == 0U ||
-        virtual_address >= set->entries[index - 1U].end) {
-        return KERNEL_VMA_STATUS_NOT_FOUND;
-    }
-    *vma = set->entries[index - 1U];
+    *vma = set->entries[index];
+    *generation = set->generation;
     return KERNEL_VMA_STATUS_OK;
 }
 

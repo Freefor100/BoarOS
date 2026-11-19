@@ -1936,10 +1936,12 @@ static size_t load_read_pages(struct kernel_page_cache *cache, struct kernel_vfs
             enum kernel_page_cache_status statuses[READ_INDEX_BATCH];
             for (size_t i = first; i < end; i++) {
                 struct kernel_page_cache_entry *entry = entries[i];
-                size_t valid = entry_valid_bytes(entry);
+                struct kernel_page_cache_read_page *output = outputs ? outputs[i] : NULL;
+                bool early = (progress.completed & (UINT32_C(1) << i)) != 0;
+                size_t valid = !early || output ? entry_valid_bytes(entry) : 0;
                 enum kernel_page_cache_status status;
                 /* This producer has finished all callbacks and drained DMA. */
-                if (progress.completed & (UINT32_C(1) << i))
+                if (early)
                     status = (enum kernel_page_cache_status)(
                         __atomic_load_n(&entry->load_status, __ATOMIC_RELAXED) & ~CACHE_LOAD_EARLY);
                 else {
@@ -1947,12 +1949,12 @@ static size_t load_read_pages(struct kernel_page_cache *cache, struct kernel_vfs
                     status = read_page_result(&spans[i], valid);
                 }
                 statuses[i-first] = status;
-                if (outputs) {
-                    outputs[i]->status = status;
+                if (output) {
+                    output->status = status;
                     if (!status) {
-                        outputs[i]->entry = entry;
-                        outputs[i]->physical_address = entry->physical_address;
-                        outputs[i]->valid_bytes = valid;
+                        output->entry = entry;
+                        output->physical_address = entry->physical_address;
+                        output->valid_bytes = valid;
                     }
                 }
             }
@@ -1967,7 +1969,7 @@ static size_t load_read_pages(struct kernel_page_cache *cache, struct kernel_vfs
                 struct kernel_page_cache_entry *entry = entries[i];
                 enum kernel_page_cache_status status = statuses[i-first];
                 failed += status != 0;
-                if (status || !outputs) entry_return(entry);
+                if (status || !outputs || !outputs[i]) entry_return(entry);
                 if (!(progress.completed & (UINT32_C(1) << i))) cache_wake(&entry->ready);
                 if (status && !entry_users(entry) && !entry_retired(entry)) {
                     remove_entry(cache, entry); clean = 1;
@@ -2332,7 +2334,7 @@ const void *kernel_page_cache_read_data(const struct kernel_page_cache_read_page
 }
 
 static enum kernel_page_cache_status get_batch(struct kernel_page_cache *,
-    const struct kernel_vfs_file *,uint64_t,struct kernel_page_cache_read_page *,size_t,int,int);
+    const struct kernel_vfs_file *,uint64_t,struct kernel_page_cache_read_page *,size_t,int,int,bool);
 
 static enum kernel_page_cache_status get_page(
     struct kernel_page_cache *cache, const struct kernel_vfs_file *file,
@@ -2341,12 +2343,12 @@ static enum kernel_page_cache_status get_page(
 {
     if (!physical_address || !valid_bytes) return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
     struct kernel_page_cache_read_page page = {0};
-    enum kernel_page_cache_status status = get_batch(cache,file,page_index,&page,1,no_reuse,read_window);
+    enum kernel_page_cache_status status = get_batch(cache,file,page_index,&page,1,no_reuse,read_window,true);
     if (!status) {
-        if (physical_page_acquire(cache->allocator, page.physical_address)) __builtin_trap();
+        if (page.entry && physical_page_acquire(cache->allocator, page.physical_address)) __builtin_trap();
         *physical_address = page.physical_address;
         *valid_bytes = page.valid_bytes;
-        kernel_page_cache_put_batch(cache, &page, 1);
+        if (page.entry) kernel_page_cache_put_batch(cache, &page, 1);
     }
     return status;
 }
@@ -2409,7 +2411,12 @@ static void commit_read_batch(void *argument)
                 if (candidate) { candidate->cleanup_next=discard;discard=candidate; }
             } else if (candidate) {
                 prepare_entry_publication(candidate,KERNEL_PAGE_CACHE_STATUS_BUSY);
-                loads[ready]=candidate;spans[ready]=spans[i];outputs[ready]=&pages[i];ready++;
+                loads[ready]=candidate;
+                spans[ready]=spans[i];
+                /* Speculative neighbors keep the producer borrow through
+                 * DMA completion. Only demand results transfer that borrow. */
+                outputs[ready]=request->required<0 || i==(size_t)request->required ? &pages[i] : NULL;
+                ready++;
             } else {
                 if (!allocation) __builtin_trap();
                 pages[i].status=allocation;
@@ -2554,7 +2561,7 @@ struct cache_read_batch_request {
     bool demand_missing;
 };
 
-static int read_cached_batch(struct cache_read_batch_request *request)
+static int read_cached_batch(struct cache_read_batch_request *request, bool take_physical)
 {
     struct kernel_page_cache *cache=request->cache;
     struct kernel_vfs_node *node=request->node;
@@ -2594,7 +2601,12 @@ static int read_cached_batch(struct cache_read_batch_request *request)
                 continue;
             }
             size_t valid=size-offset<BOAROS_PAGE_SIZE?size-offset:BOAROS_PAGE_SIZE;
-            take_read_page_borrow(cache,entry,&page->physical_address,&page->valid_bytes,&page->entry,valid,request->no_reuse);
+            /* Scalar mapping readers need a physical reference. READY
+             * entries are stable under the index guard until it is taken. */
+            if (take_physical)
+                take_read_page(cache,entry,&page->physical_address,&page->valid_bytes,valid,request->no_reuse);
+            else
+                take_read_page_borrow(cache,entry,&page->physical_address,&page->valid_bytes,&page->entry,valid,request->no_reuse);
             page->status=KERNEL_PAGE_CACHE_STATUS_OK;
         }
         if (retry) {
@@ -2731,8 +2743,6 @@ scalar:
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
     if (required>=0) {
         *demand=request->pages[required];
-        request->pages[required].status=KERNEL_PAGE_CACHE_STATUS_NOT_FOUND;
-        kernel_page_cache_put_batch(cache,request->pages,window);
         request->first=demand_first;
         request->pages=demand;request->count=demand_count;
         if (demand->status==KERNEL_PAGE_CACHE_STATUS_NO_MEMORY) {
@@ -2749,8 +2759,11 @@ scalar:
 
 static enum kernel_page_cache_status get_batch(
     struct kernel_page_cache *cache, const struct kernel_vfs_file *file, uint64_t first,
-    struct kernel_page_cache_read_page *pages, size_t count, int no_reuse,int read_window)
+    struct kernel_page_cache_read_page *pages, size_t count, int no_reuse,int read_window,bool take_physical)
 {
+    /* A direct physical result is valid only for a scalar call. The fast
+     * scan can roll back entry borrows when a later slot needs a retry. */
+    if (take_physical && count != 1) __builtin_trap();
     struct kernel_vfs_node *node=kernel_vfs_file_node(file);
     if (!cache_live(cache) || !node || count > KERNEL_PAGE_CACHE_READ_BATCH_MAX ||
         (count && (!pages || first > UINT64_MAX >> BOAROS_PAGE_SHIFT ||
@@ -2766,7 +2779,7 @@ static enum kernel_page_cache_status get_batch(
     struct cache_read_batch_request request = {cache,file,node,first,pages,count,no_reuse,read_window,false};
     /* local首个缺页后交给inode资格下的重查，不重复预扫整批。remote须先
      * 取出全部热页：尚未执行的CPU0请求被取消时，后部成功项也继续有效。 */
-    if (read_cached_batch(&request)) {
+    if (read_cached_batch(&request,take_physical)) {
         prepare_read_batch(&request);
         request_return(cache->record);
     }
@@ -2782,7 +2795,7 @@ static enum kernel_page_cache_status get_batch(
 enum kernel_page_cache_status kernel_page_cache_get_batch(
     struct kernel_page_cache *cache,const struct kernel_vfs_file *file,uint64_t first,
     struct kernel_page_cache_read_page *pages,size_t count,int no_reuse)
-{ return get_batch(cache,file,first,pages,count,no_reuse,0); }
+{ return get_batch(cache,file,first,pages,count,no_reuse,0,false); }
 
 static void resize_apply(struct kernel_page_cache_resize *,uint64_t);
 static int write_admission(struct kernel_page_cache *cache,struct kernel_vfs_node *node);

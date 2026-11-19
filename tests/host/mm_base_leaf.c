@@ -9,9 +9,15 @@ static unsigned char pool[16 * 1024 * 1024] __attribute__((aligned(4096)));
 static struct physical_page_allocator pages;
 static struct arch_mmu_page_table kernel;
 static unsigned access_calls, fences;
+static uint64_t observed_root = UINT64_MAX;
+static unsigned root_accesses;
 void mm_test_fence(uint64_t,int);
 static void *access(uint64_t physical)
-{ access_calls++; return physical < sizeof(pool) ? pool + physical : 0; }
+{
+    access_calls++;
+    if (physical == observed_root) root_accesses++;
+    return physical < sizeof(pool) ? pool + physical : 0;
+}
 void riscv_smp_sync_user(uint32_t targets,uint64_t address,uint64_t size,int instructions)
 { (void)targets;(void)size;mm_test_fence(address,instructions); }
 void riscv_smp_sync_instructions(uint32_t targets)
@@ -47,6 +53,7 @@ int main(void)
  for(unsigned i=0;i<2;i++)if(missing&(1U<<i))prepared.tables[i]=allocate();
  assert(!arch_mmu_user_map_prepared_page(&space,va,data,ARCH_MMU_READ|ARCH_MMU_WRITE,0,&prepared));
  assert(prepared.table_mask==missing && space.table_pages>table_pages);
+ observed_root=space.root_address;
  struct kernel_mm_leaf leaf;assert(!arch_mmu_user_leaf_snapshot(&space,va+37,&leaf));
  assert(leaf.virtual_address==va&&leaf.physical_address==data&&!leaf.order);
  struct arch_mmu_mapping mapping;assert(!arch_mmu_user_lookup(&space,va+37,&mapping)&&mapping.physical_address==data+37);
@@ -55,6 +62,8 @@ int main(void)
  table_pages=space.table_pages;
  assert(!arch_mmu_user_map_prepared_page(&space,va+BOAROS_PAGE_SIZE,next,ARCH_MMU_READ,0,&prepared));
  assert(!prepared.table_mask && space.table_pages==table_pages);
+ assert(!root_accesses && "live lookup and publication must reuse the owned root mapping");
+ observed_root=UINT64_MAX;
  assert(!arch_mmu_user_protect_owned_page(&space,va+BOAROS_PAGE_SIZE,0));
  assert(arch_mmu_user_protect_resident_page(&space,va+2*BOAROS_PAGE_SIZE,0)==ARCH_MMU_STATUS_NOT_MAPPED);
  assert(!arch_mmu_user_protect_resident_page(&space,va+BOAROS_PAGE_SIZE,ARCH_MMU_READ));

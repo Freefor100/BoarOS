@@ -61,6 +61,8 @@ enum riscv_sv39_user_space_state {
 struct riscv_sv39_user_space {
     struct physical_page_allocator *allocator;
     uint64_t root_address;
+    /* The address space owns this root and its direct mapping until teardown. */
+    uint64_t *root_entries;
     uint32_t table_pages;
     uint32_t leaf_pages;
     uint32_t protected_pages;

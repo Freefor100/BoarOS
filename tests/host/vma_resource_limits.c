@@ -71,13 +71,20 @@ int main(void)
     assert(!kernel_vma_set_insert(set,&v));
     v.start=5*P;v.end=6*P;assert(!kernel_vma_set_insert(set,&v));
     usage(set,5,5);assert(kernel_vma_set_count(set)==1&&kernel_vma_set_locked_bytes(set)==5*P);
+    uint32_t recent=0;
+    uint64_t generation;
+    assert(!kernel_vma_set_lookup_recent(set,5*P,&recent,&inherited,&generation));
+    assert(inherited.permissions==3 && generation==kernel_vma_set_generation(set));
     /* 替换跨过旧范围尾部，保留左侧不同分类的片段；插入合并只新增本次字节。 */
     v.start=2*P;v.end=7*P;v.permissions=1;v.flags=0;
     assert(!kernel_vma_set_prepare_replace(set,v.start,v.end,&v,&edit)&&
         !kernel_vma_set_commit_edit(set,&edit));
+    assert(!kernel_vma_set_lookup_recent(set,5*P,&recent,&inherited,&generation));
+    assert(recent==1 && inherited.permissions==1 && generation==kernel_vma_set_generation(set));
     usage(set,6,1);assert(kernel_vma_set_locked_bytes(set)==P);
     assert(kernel_vma_set_insert(set,&v)==KERNEL_VMA_STATUS_CONFLICT);usage(set,6,1);
     assert(!kernel_vma_set_trim_end(set,2*P,7*P,4*P));usage(set,3,1);
+    assert(kernel_vma_set_lookup_recent(set,5*P,&recent,&inherited,&generation)==KERNEL_VMA_STATUS_NOT_FOUND);
     assert(kernel_vma_set_locked_bytes(set)==P);
     uint64_t gap;
     assert(!kernel_vma_set_find_topdown_gap(set,0,0,P,P,&gap)&&!gap);
