@@ -156,7 +156,9 @@ int main(void)
     unsigned fatal_cases = 0;
     for (unsigned which = 0; which < 13; which++) {
 #if !BOAROS_LOCK_DEBUG
-        if (which == 6 || (which == 0 && BOAROS_MAX_CPUS > 1)) continue;
+        /* Misusing raw guards is audited in the diagnostic build. The
+         * independent sleep/preemption contracts remain checked here. */
+        if (which != 4 && which != 7 && which != 8 && which != 9) continue;
 #endif
         fatal_cases++;
         pid_t child = fork(); assert(child >= 0);
