@@ -4616,7 +4616,7 @@ int ext4_file_complete_write(ext4_file *file)
     ext4_assert(file && file->mp);
     EXT4_MP_LOCK(file->mp);
     struct ext4_fs *fs=&file->mp->fs;
-Retry:
+Retry:;
     int r=EOK;
     if (fs->jbd_journal) {
         bool present;

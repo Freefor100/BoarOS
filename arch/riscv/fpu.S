@@ -4,9 +4,18 @@
     .section .text, "ax", @progbits
     .align 2
 
-    /* The kernel march excludes F/D; these two functions are the only
-     * code allowed to touch the FP unit. */
+    /* Keep floating-point instructions local to the state routines. Older
+     * assemblers can encode them without a per-region architecture option. */
+#ifdef BOAROS_RISCV_AS_EXTENSIONS
     .option arch, +f, +d
+#else
+    .macro fsd reg, address
+    .insn s 0x27, 3, \reg, \address
+    .endm
+    .macro fld reg, address
+    .insn i 0x07, 3, \reg, \address
+    .endm
+#endif
 
 /* void riscv_fpu_state_save(struct riscv_fpu_state *state)
  *

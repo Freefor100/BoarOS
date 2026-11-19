@@ -231,9 +231,21 @@ ROOT_BOOT_CLEANUP_TEST_KERNEL_RV := \
 # Both target spellings must receive the same generated header dependencies.
 DEP_TARGET_FLAGS = -MQ '$(abspath $@)' -MQ '$(patsubst $(CURDIR)/%,%,$(abspath $@))'
 
-ARCH_FLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany
+RISCV_MARCH := $(shell \
+	if printf '%s\n' 'void probe(void) { __asm__ volatile("csrr a0, sstatus\n\tfence.i" ::: "a0"); }' | \
+		$(CC) -march=rv64imac_zicsr_zifencei -mabi=lp64 -x c -c -o /dev/null - >/dev/null 2>&1; then \
+		printf '%s' rv64imac_zicsr_zifencei; \
+	else \
+		printf '%s' rv64imac; \
+	fi)
+ARCH_FLAGS := -march=$(RISCV_MARCH) -mabi=lp64 -mcmodel=medany
+RISCV_AS_EXTENSIONS := $(shell \
+	printf '%s\n' '.option arch,+f,+d,+v' 'fld f0,0(a0)' 'vs8r.v v0,(t0)' | \
+		$(CC) $(ARCH_FLAGS) -x assembler -c -o /dev/null - >/dev/null 2>&1 && \
+		printf '%s' -DBOAROS_RISCV_AS_EXTENSIONS=1)
 CPPFLAGS := -DBOAROS_LOCK_DEBUG=$(LOCK_DEBUG) -DBOAROS_COST_DIAGNOSTICS=$(COST_DIAGNOSTICS) -Iinclude -DBOAROS_PAGE_SHIFT=12 \
 	-DBOAROS_UTS_MACHINE=\"riscv64\"
+CPPFLAGS += $(RISCV_AS_EXTENSIONS)
 CPPFLAGS += -DBOAROS_MAX_CPUS=$(CPU_CAPACITY)
 CPPFLAGS += -DBOAROS_USER_SMP=$(USER_SMP)
 CPPFLAGS += -DBOAROS_USER_SMP_COMPOSITION=$(USER_SMP_COMPOSITION)

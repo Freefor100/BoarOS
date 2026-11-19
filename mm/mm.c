@@ -520,7 +520,8 @@ static void clear_page(void *pointer)
          * block zeroing. These are complete blocks inside the owned page. */
         for (size_t offset = 0; offset < BOAROS_PAGE_SIZE; offset += 64) {
             void *block = (unsigned char *)pointer + offset;
-            __asm__ volatile(".option push\n.option arch,+zicboz\ncbo.zero (%0)\n.option pop"
+            /* cbo.zero has immediate 4 and no destination register. */
+            __asm__ volatile(".insn i 0x0f, 2, zero, %0, 4"
                 : : "r"(block) : "memory");
         }
         return;
@@ -2613,7 +2614,7 @@ static inline enum kernel_mm_status pin_user_prefix(const struct kernel_mm *mm,
     if (mm->state != KERNEL_MM_LIVE) return KERNEL_MM_STATUS_STATE;
     enum kernel_mm_status status = resolve_record(mm, &record);
     if (status != KERNEL_MM_STATUS_OK) return status;
-retry:
+retry:;
     KERNEL_RAW_READ_SCOPE(guard, &record->metadata);
     int closed = pin_admission_closed(record);
     if (closed == 1 || (closed == 2 && (access & KERNEL_MM_WRITE))) {
