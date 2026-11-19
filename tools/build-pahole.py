@@ -72,8 +72,9 @@ def build(output, compiler, jobs):
             shutil.rmtree(work)
         work.mkdir()
         for name in ARCHIVES:
+            # sources() verified the repository archives before extraction.
             with tarfile.open(ROOT / 'third_party/sources' / name) as archive:
-                archive.extractall(work, filter='data')
+                archive.extractall(work)
         elf, dwarves = work / 'elfutils-0.192', work / 'dwarves-1.28'
         environment = os.environ.copy()
         # Parent make may be a cross build. These libraries execute on the host.

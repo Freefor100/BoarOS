@@ -236,14 +236,18 @@ ROOT_BOOT_CLEANUP_TEST_KERNEL_RV := \
 # Both target spellings must receive the same generated header dependencies.
 DEP_TARGET_FLAGS = -MQ '$(abspath $@)' -MQ '$(patsubst $(CURDIR)/%,%,$(abspath $@))'
 
-RISCV_MARCH := $(shell \
+RISCV_EXPLICIT_MARCH := rv64imac_zicsr_zifencei
+RISCV_MARCH_FLAGS := $(shell \
 	if printf '%s\n' 'void probe(void) { __asm__ volatile("csrr a0, sstatus\n\tfence.i" ::: "a0"); }' | \
-		$(CC) -march=rv64imac_zicsr_zifencei -mabi=lp64 -x c -c -o /dev/null - >/dev/null 2>&1; then \
-		printf '%s' rv64imac_zicsr_zifencei; \
+		$(CC) -march=$(RISCV_EXPLICIT_MARCH) -mabi=lp64 -x c -c -o /dev/null - >/dev/null 2>&1; then \
+		printf '%s' -march=$(RISCV_EXPLICIT_MARCH); \
+	elif printf '%s\n' 'csrr a0, sstatus' 'fence.i' | \
+		$(CC) -march=rv64imac -Wa,-march=$(RISCV_EXPLICIT_MARCH) -mabi=lp64 -x assembler -c -o /dev/null - >/dev/null 2>&1; then \
+		printf '%s' '-march=rv64imac -Wa,-march=$(RISCV_EXPLICIT_MARCH)'; \
 	else \
-		printf '%s' rv64imac; \
+		printf '%s' -march=rv64imac; \
 	fi)
-ARCH_FLAGS := -march=$(RISCV_MARCH) -mabi=lp64 -mcmodel=medany
+ARCH_FLAGS := $(RISCV_MARCH_FLAGS) -mabi=lp64 -mcmodel=medany
 RISCV_AS_EXTENSIONS := $(shell \
 	printf '%s\n' '.option arch,+f,+d,+v' 'fld f0,0(a0)' 'vs8r.v v0,(t0)' | \
 		$(CC) $(ARCH_FLAGS) -x assembler -c -o /dev/null - >/dev/null 2>&1 && \

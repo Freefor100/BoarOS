@@ -28,7 +28,8 @@ make run-riscv QEMU_RISCV64=qemu-system-riscv64
 
 构建时会检查编译器和汇编器是否接受 `rv64imac_zicsr_zifencei`。早期工具链使用
 `rv64imac`，其指令集定义已包含控制与状态寄存器访问及 `FENCE.I` 指令。浮点和向量
-现场代码也能使用旧汇编器生成同一组指令。
+现场代码也能使用旧汇编器生成同一组指令。旧编译器搭配新汇编器时，构建会向汇编器
+单独传入显式的扩展名。
 
 RV 的 vDSO 是用户态共享 ELF，链接时还需要 `riscv64-linux-gnu-ld` 或 `riscv64-linux-musl-ld`。可以通过 `RV_VDSO_LD=/path/to/ld` 选择。内核和 vDSO 对象仍由原交叉 GCC 编译。LA 默认使用其交叉工具链的链接器。
 
