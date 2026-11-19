@@ -1886,10 +1886,10 @@ test-oscomp-compat:
 	python3 -B tests/oscomp/run.py --arch both
 
 test-oscomp-pre:
-	python3 -B tests/oscomp/official.py
+	python3 -B tests/oscomp/pre.py
 
 test-oscomp-final:
-	python3 -B tests/oscomp/run.py --profile final-2026 --arch '$(OSCOMP_FINAL_ARCH)' $(if $(OSCOMP_FINAL_IMAGES),--images-dir '$(OSCOMP_FINAL_IMAGES)')
+	python3 -B tests/oscomp/final.py --arch '$(OSCOMP_FINAL_ARCH)' $(if $(OSCOMP_FINAL_IMAGES),--images-dir '$(OSCOMP_FINAL_IMAGES)')
 
 .PHONY: test-sync-host
 test-sync-host:

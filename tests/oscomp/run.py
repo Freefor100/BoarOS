@@ -293,8 +293,8 @@ def main():
     args = ap.parse_args()
     if args.profile == 'final-2026':
         if args.groups not in ('all','cagent','buildstorm'):ap.error('unknown final-2026 group')
-        import final2026
-        return final2026.main(args)
+        import final
+        return final.main(args)
     if args.groups in ('cagent','buildstorm'):ap.error('select --profile final-2026 for these groups')
     if args.host_vcpu_cpus is not None or args.host_io_cpu is not None or args.keep_disks:
         ap.error('these options require --profile final-2026')

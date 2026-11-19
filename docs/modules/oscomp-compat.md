@@ -34,7 +34,7 @@ init.json和头文件；`INIT_CONFIG_RV`/`INIT_CONFIG_LA`独立覆盖，显式�
 ```sh
 make test-oscomp-final
 
-python3 -B tests/oscomp/run.py --profile final-2026 --arch both \
+python3 -B tests/oscomp/final.py --arch both \
   --images-dir /path/to/images \
   --host-vcpu-cpus 8,9,10,11,12,13,14,15 --host-io-cpu 0
 ```
@@ -182,5 +182,5 @@ make test-oscomp-final
 和资源归还要依据实际关机及设备收尾记录判断。无法观察到停止原因时标为未知。
 
 日志、镜像与结果表都在被忽略的 `build/` 下。采集器发生改动后，可以运行
-`python3 -B tests/oscomp/official.py --collect-existing build/某次运行`，从同一次运行
+`python3 -B tests/oscomp/pre.py --collect-existing build/某次运行`，从同一次运行
 的固定输入身份、原任务输出和生命周期记录重新生成报告。

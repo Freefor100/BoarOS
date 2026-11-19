@@ -241,23 +241,27 @@ class ReportTests(unittest.TestCase):
 
 class Final2026Tests(unittest.TestCase):
     def test_cli_preserves_the_profile_failure_exit_code(self):
-        import final2026
+        import final
         import runpy
-        with patch.object(final2026,'main',return_value=1), patch.object(sys,'argv',
+        with patch.object(final, 'main', return_value=1) as start:
+            self.assertEqual(final.cli(['--arch', 'riscv', '--groups', 'buildstorm']), 1)
+            args = start.call_args.args[0]
+            self.assertEqual((args.arch, args.groups), ('riscv', 'buildstorm'))
+        with patch.object(final,'main',return_value=1), patch.object(sys,'argv',
                 [str(HERE/'run.py'),'--profile','final-2026']):
             with self.assertRaises(SystemExit) as exited:
                 runpy.run_path(str(HERE/'run.py'),run_name='__main__')
         self.assertEqual(exited.exception.code,1)
 
     def test_outer_timeout_is_incomplete_not_a_failed_compile(self):
-        import final2026
+        import final
         records=[{'completed':True,'functional_success':True},
                  {'completed':False,'functional_success':False}]
-        self.assertEqual(final2026.run_status(records),'incomplete')
+        self.assertEqual(final.run_status(records),'incomplete')
         records[1]['completed']=True
-        self.assertEqual(final2026.run_status(records),'completed-with-failures')
+        self.assertEqual(final.run_status(records),'completed-with-failures')
         records[1]['functional_success']=True
-        self.assertEqual(final2026.run_status(records),'passed')
+        self.assertEqual(final.run_status(records),'passed')
 
     def test_preliminary_images_can_be_selected_from_another_directory(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -269,28 +273,28 @@ class Final2026Tests(unittest.TestCase):
                 runner.validate(('loongarch',), images)
 
     def test_final_disk_is_a_writable_copy_of_the_raw_input(self):
-        import final2026
+        import final
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             original, target = root / 'sdcard-rv-pub.img', root / 'root.img'
             data = b'public journal bytes' + bytes(1024 * 1024) + b'end'
             original.write_bytes(data)
-            final2026.copy_disk_image(original, target, sparse=True)
+            final.copy_disk_image(original, target, sparse=True)
             self.assertEqual(target.read_bytes(), data)
             target.write_bytes(b'guest writes')
             self.assertEqual(original.read_bytes(), data)
 
     def test_version_check_does_not_count_as_a_successful_build(self):
-        import final2026
+        import final
         cases=[{'name':'buildstorm env toolchain','pass':1},
                {'name':'buildstorm env minibuild','pass':0},
                {'name':'buildstorm compile ok','pass':0},
                {'name':'buildstorm compile time','pass':0}]
         reports={'buildstorm':{'cases':cases}}
-        self.assertFalse(final2026.functional_success(reports,['buildstorm']))
+        self.assertFalse(final.functional_success(reports,['buildstorm']))
         for case in cases:case['pass']=1
         cases[-1]['pass']=0
-        self.assertTrue(final2026.functional_success(reports,['buildstorm']))
+        self.assertTrue(final.functional_success(reports,['buildstorm']))
 
 if __name__ == '__main__':
     unittest.main()

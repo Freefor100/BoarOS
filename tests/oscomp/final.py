@@ -1,4 +1,5 @@
 """Run unchanged final-2026 public rootfs scripts and their upstream judges."""
+import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -191,3 +192,23 @@ def main(args):
         report.update(status='runner-error',error=str(error))
         raise
     finally:save(directory/'report.json',report)
+
+
+def cli(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--arch', choices=(*TAGS, 'both'), default='both')
+    parser.add_argument('--groups', choices=('all', *GROUPS), default='all')
+    parser.add_argument('--images-dir', type=Path, help='default: sdcard/final-2026/')
+    parser.add_argument('--output', type=Path)
+    parser.add_argument('--diagnostic-timeout', type=int, help='outer timeout in seconds (default: none)')
+    parser.add_argument('--host-vcpu-cpus', help='one distinct host CPU per guest CPU')
+    parser.add_argument('--host-io-cpu', type=int, help='host CPU for QEMU main and I/O threads')
+    parser.add_argument('--keep-disks', action='store_true', help='retain checked runtime images')
+    parser.add_argument('--qemu-riscv', default=os.environ.get('QEMU_RISCV64', 'qemu-system-riscv64'))
+    parser.add_argument('--qemu-loongarch', default=os.environ.get('QEMU_LOONGARCH64', 'build/qemu-la-rtc/qemu-system-loongarch64'))
+    parser.set_defaults(case_timeout=DEFAULT_LTP_CASE_TIMEOUT, diagnostic_exclude=[])
+    return main(parser.parse_args(argv))
+
+
+if __name__ == '__main__':
+    sys.exit(cli())

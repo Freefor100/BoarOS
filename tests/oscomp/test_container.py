@@ -12,7 +12,7 @@ HERE = Path(__file__).resolve().parent
 
 class ContainerTests(unittest.TestCase):
     def module(self):
-        path = HERE / 'official.py'
+        path = HERE / 'pre.py'
         self.assertTrue(path.is_file(), 'official container entry is missing')
         spec = importlib.util.spec_from_file_location('official_runner', path)
         result = importlib.util.module_from_spec(spec)
@@ -129,8 +129,8 @@ class ContainerTests(unittest.TestCase):
         self.module()
         temp = tempfile.TemporaryDirectory(); self.addCleanup(temp.cleanup)
         log = Path(temp.name) / 'serial.log'; log.write_text('')
-        code = ('import sys;sys.path.insert(0,sys.argv[1]);import official;'
-                'print(len(official.local.judge(__import__("pathlib").Path(sys.argv[2]),{})))')
+        code = ('import sys;sys.path.insert(0,sys.argv[1]);import pre;'
+                'print(len(pre.local.judge(__import__("pathlib").Path(sys.argv[2]),{})))')
         result = subprocess.run(['python3', '-B', '-c', code, str(HERE), str(log)],
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)

@@ -287,7 +287,7 @@ def collect_results(directory, report):
 
 
 def main():
-    parser = argparse.ArgumentParser(__doc__)
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path)
     parser.add_argument('--images-dir', type=Path, help='preliminary raw disks; default sdcard/pre-20250615/')
     parser.add_argument('--observe-only', type=Path, help='read only the owned running container lifecycle')
@@ -355,7 +355,7 @@ def main():
         print('Running committed source', report['source']['commit'], 'with local root disk overlays:', directory, flush=True)
         stage = 'official-harness'
         observer_log = (directory / 'observer.log').open('wb')
-        observer = subprocess.Popen([sys.executable, '-B', str(HERE / 'official.py'), '--observe-only', str(directory)],
+        observer = subprocess.Popen([sys.executable, '-B', str(Path(__file__).resolve()), '--observe-only', str(directory)],
                                     stdout=observer_log, stderr=subprocess.STDOUT)
         observer_log.close()
         with (directory / 'harness.log').open('wb') as output:
