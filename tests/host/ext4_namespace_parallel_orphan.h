@@ -14,9 +14,16 @@ static void orphan_normal_order_case(struct lwext4_mount_adapter *adapter,
             static const char payload[4096]="retained unlinked data";
             size_t written;
             assert(!kernel_vfs_pwrite(&file,0,payload,sizeof(payload),&written) && written==sizeof(payload));
-            /* A journal drain does not submit the file's delayed dirty pages. */
-            uint64_t observed=kernel_vfs_error_sequence(&file);
-            assert(!kernel_vfs_sync(&file,0,&observed));
+            if (worker_mode) {
+                uint64_t observed=kernel_vfs_error_sequence(&file);
+                assert(!kernel_vfs_sync(&file,0,&observed));
+            } else {
+                /* The manual journal model drives its own progress. Submit
+                 * delayed data before draining the accepted metadata. */
+                assert(!kernel_page_cache_writeback_range(adapter->instance.page_cache,
+                    kernel_vfs_file_node(&file),0,UINT64_MAX));
+                assert(!ext4_journal_group_drain(adapter->mount_point));
+            }
             adapter->locks.read_lock(adapter->locks.context);
             struct ext4_inode_ref ref;
             assert(!ext4_fs_get_inode_ref(adapter->device.fs,inode,&ref) &&
