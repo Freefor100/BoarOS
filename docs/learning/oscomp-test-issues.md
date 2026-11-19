@@ -1,375 +1,104 @@
-# OSComp 评测输入、调用与测例问题
+# OSComp 测例与环境问题
 
-本文集中记录固定发布盘中的程序问题、调用方式、版本预期和判分差异，以及当前处理。
-输入版本、下载地址与校验集中在 [inputs.json](../../tests/oscomp/inputs.json)；当前输入为
-pre-20250615，盘内 LTP 报告版本为 20240524。运行和交付方式见
-[兼容模块](../modules/oscomp-compat.md)，实际得分见[官方交付结果](oscomp-official-delivery.md)。
+我按程序启动、测例准备、接口调用和原判分四个边界定位异常。先确认程序走到了哪一步，
+再检查该步实际使用的可执行文件、运行库、参数和返回值。必要时在 Linux 上运行同一
+可执行文件和运行库，区分发布输入、内核行为与判分问题。
 
-## 文档入口
+旧盘为 pre-20250615，其中 Linux 测试项目（Linux Test Project，LTP）版本为 20240524。
+固定输入见 [旧盘清单](../../tests/oscomp/inputs.json) 和
+[final-2026 清单](../../tests/oscomp/inputs-final-2026.json)。
+现行启动和监督方式见[评测环境适配](../modules/oscomp-compat.md)。逐次执行的串口、
+耗时、原判分和输入身份保存在 `build/`。
 
-以下五份正文只在 `oscomp-compat` 维护：
+## 测例启动与准备
 
-| 文档 | 阅读用途 |
-|---|---|
-| [双架构原评测运行与评分](../modules/oscomp-compat.md) | 构建、官方双盘、启动、工具、运行时适配和监督入口 |
-| [输入、失败与证据](oscomp-compat-baseline.md) | 原盘、运行库、Linux 对照及历次完整运行的具体归因 |
-| [完整评测的得分、耗时与 LTP 能力分析](oscomp-ltp-analysis.md) | 完整组成本、LTP 细项、存储修复、lmbench 和预算取舍 |
-| [官方双架构交付与原程序结果](oscomp-official-delivery.md) | 固定官方容器、原 QEMU 参数下的定向得分、耗时与磁盘检查 |
-| 本文 | 测例、发布程序、调用和判分问题的集中索引及处理依据 |
-
-兼容分支另有四份数据附件：`oscomp-dual-official-results.tsv`、
-`oscomp-rv-five-results.tsv`、`oscomp-libctest-original-failures.tsv` 和
-`data-path-controlled-delay.tsv`。正文负责解释结论，附件保留数值。
-
-## 发布程序与版本预期
-
-### final-2026：公开盘日志恢复与 BuildStorm 管道 ioctl
-
-输入和版本集中在 [`inputs-final-2026.json`](../../tests/oscomp/inputs-final-2026.json)，
-与此前 pre-20250615 分开维护。RV、LA 两张公开盘各为14 GiB，带 `needs_recovery`。
-直接使用公开盘副本启动时，两架构均在根盘挂载阶段失败，尚未进入 CAgent 或 BuildStorm。
-LA 返回 `EUCLEAN`（117）；RV 最终显示清理失败，调试器确认其保存的原始失败是挂载。
-Linux `e2fsck -E journal_only -p` 能正常重放副本日志，随后同一 BoarOS 内核可以挂载并执行
-两题。首次诊断的解压模板与原压缩包未修改，宿主恢复后的成绩与原盘启动失败分开记录。
-
-根因已定位到 `jbd_extract_block_tag`：它额外要求描述符中的可选UUID等于日志超级块UUID。
-公开盘中该描述符字段为全零，而超级块UUID是真实文件系统UUID，因此合法记录被拒绝。
-固定Linux恢复代码按SAME_UUID决定是否跳过16字节，不比较其中内容；日志写入使用的
-`j_uuid`与日志超级块校验种子不是同一项约束。main现已去掉错误的相等检查，保留长度、
-LAST_TAG、目标范围以及描述符／数据／提交的校验和。1/4KiB块短例同时检查合法零／不同UUID
-可以恢复，损坏记录仍被拒绝。机制见[日志恢复](../modules/vfs-ext4.md)。
-
-恢复后的两架构均通过 Rust/Cargo 版本检查，但最小构建、tg-xtask 预构建及正式构建失败。
-正式构建均退出101、产物0字节。盘内同版本 Rust 源码显示：
-`Child::wait_with_output` → `sys/process/unix/common.rs::read_output` →
-`FileDesc::set_nonblocking` → `ioctl(pipefd, FIONBIO, &one)`。
-BoarOS `kernel_files_ioctl` 未实现这项通用命令，普通管道落入 `ENOTTY`（25）；
-工具链在 `process.rs:2454` 对双管道收集结果调用 `unwrap()`，因此 panic。
-这是内核 ioctl 缺口，不是缺库，也不是编译耗时超限。管道本身已有通过F_SETFL设置非阻塞的
-能力；main现已在设备分派前接入通用FIONBIO，只原子更新OFD的NONBLOCK位。
-用户参数按四字节整数读取，保留别名共享、其他状态位与EFAULT副作用；RV、LA短例及
-同一RV ELF的固定Linux对照通过。工具链和原测试脚本保持原样。
-
-取消外层诊断时限后，RV在正式编译中出现内核异常返回循环：七核空闲，另一核持续停在
-`riscv_trap_return`，返回帧已经被保存成内核返回尾部的PC和SP。根因是`getrandom`
-临时开中断后，直接用入口保存值恢复；RV的低层restore与固定Linux相同，只按保存值
-重新开启SIE，要求调用时中断已关闭。保存值为零时，这次调用没有关闭实际SIE，IPI或timer
-可在`sscratch`已经写入用户入口标记的窗口打断，覆盖原用户帧。main现已在结束随机数据
-操作后先关闭中断，再恢复入口状态。原宿主夹具把restore模拟成赋值，未覆盖RV的约定；
-修正夹具后，旧代码直接失败，修复代码通过4/16KiB页的正常、信号及复制失败前缀检查，
-RV单核及八核真实调用正常退出。这里修复的是执行错误，不把未完成编译折算成吞吐结果。
-
-修复后的原RV BuildStorm已经完整通过；两架构耗时与自动分见交付结果。RV整轮最低栈
-余量808字节，低于1024字节目标，本次没有溢出，仍作为独立未达项保留。
-
-自有LA RNG辅助短例（`tests/userland/rng.py`，并非原盘题目）的无固件种子SIGSEGV现已
-定位：共同ELF构帧在`kernel_random_available()==false`时省略了`AT_RANDOM`。PID 1可在
-RNG worker取得材料前启动，glibc在`__libc_start_main+0x11c`（PC `0x120000f9c`）
-解引用空`_dl_random`，BADV为零。实际设备DTB的属性位置及GDB改写前后寄存器均核对一致，
-不是辅助用例改错DTB或寄存器；不经GDB的host构帧反例也直接复现缺项。
-main已改为每次exec使用现有生成器提供16字节`AT_RANDOM`，与Linux早期exec的处理一致；
-这不提供可信熵、不设置ready，不放开安全`getrandom`等待。修复后同一glibc探针保留原有
-种子控制，n/a/d/s四个短例均正常退出，分别覆盖设备就绪、缺设备、延迟输入及在途停止；
-真实owner检查通过。原盘BuildStorm保留固件种子，已有成绩不为此重复运行。
-
-本分支原判分脚本还有三处解释边界：CAgent 十项全部取得时间奖励时合计199.1分，
-不是 README 声称的200分；BuildStorm 在正式编译失败时仍给版本检查8分，
-与 README 的“编不出则本题0分”文字不一致；README 要求八核，而 BuildStorm judge 的
-LA 核数告警期望值是12。本次按 README 使用八核，不修改判分脚本，不折算正式比赛总成绩。
-具体结果见[本次公开盘运行](oscomp-official-delivery.md#final-2026-公开盘首次运行)。
-
-### BusyBox 定向属性检查的 shell 与交互要求
-
-LA 原盘的 `sh` 是 hush，不支持 `set -u`；同一 ELF 在固定 Linux 上也对
-`set -eu` 报 `invalid option`。属性检查脚本使用它支持的 `set -e`。
-检查 immutable 文件的删除拒绝时须调用 `rm -f`：普通 `rm` 在终端输入可用时会先询问
-是否删除写保护文件，隐藏 stderr 只会隐藏提示，仍会等待输入。RV 的固定 Linux 对照
-也出现这次等待。使用 `-f` 跳过交互后，原程序仍实际调用删除并得到权限拒绝；
-RV、LA 的 ext4/tmpfs 检查均通过。这里只调整自有定向脚本，原 ELF 与评测脚本保持原样。
-
-### acl1：发布程序未包含 ACL 测试
-
-两架构、两种 libc 的原 `acl1` 都输出 `The acl library was missing upon compilation.`，
-退出 32，没有执行 ACL 操作，也没有 LTP Summary；原 judge 计为 0/0。
-因此它不能反映内核 ACL 实现。ACL 权限、继承和属性语义由同一 ELF 的
-Linux／BoarOS 直接消费者检查，原程序保持原样。
-
-固定 LTP 源码在未定义 `HAVE_LIBACL` 时编译上述提示分支，以便缺少这项可选依赖的环境
-仍能构建 LTP，并在执行时明确报告该测试不可用；发布 ELF 的动态依赖也只有 libc，没有
-libacl。完整分支是 NFSv4 测试目录中的 ACL 辅助程序，使用 POSIX ACL 接口，直接使用文件和目录两个参数，
-并通过 `user1`～`user5`、`grp1`～`grp5` 及 601～605 的数字身份进行检查。
-原评测脚本对测试目录中的可执行文件直接无参调用；两架构原根盘均没有
-`/etc/passwd` 和 `/etc/group`。因此另建有效消费者时，需要同时提供目标文件、
-目录和对应身份；运行时补库也无法把现有桩变成完整程序。
-完整源码打印自己的 `ACL TESTS RESULTS`，而原 judge 读取 LTP `Summary:`，
-两者的结果格式也需要分别解释。[固定源码](https://github.com/linux-test-project/ltp/blob/20240524/testcases/network/nfsv4/acl/acl1.c)
-
-真实程序另以 libacl 2.3.2 和 attr 2.5.2 静态构建，并在独立盘中提供参数及测试身份。
-RV、LA 分别使用同一 ELF 对照 Linux 与 BoarOS，`acl1` 均输出 15 passed、0 failed；
-附加消费者验证用户／组权限、mask、chmod 和默认 ACL 继承，两次启动检查 ext4 重启读回。
-该源码无论结果如何都返回 1，因此按原输出区分结果。此定向结果与原发布程序 0/0 分开记录；
-复现入口见[真实 libacl 消费者](../modules/vfs-ext4.md#通用边界)。
-
-### LA glibc setxattr01：clone3 的 CLONE_CLEAR_SIGHAND 缺口（已修复）
-
-本次原程序在准备阶段报告 `mkfs.ext4 does not exist` 并以 TCONF 退出。
-该 LTP 版本通过 `system("mkfs.ext4 >/dev/null 2>&1")` 的退出状态 127 得出这一提示；
-同次启动中随后执行的 LA musl 原程序成功运行 mke2fs 并进入测例主体。
-针对相同环境的短诊断中，`/bin/sh` 与 `/bin/mkfs.ext4` 的执行权限检查均成功，
-直接 `fork`／`exec` 能运行 mkfs；原 glibc 的 `system("exit 0")` 返回 127，errno 为 95。
-
-原 LA glibc 的 `posix_spawn` 反汇编显示，它以
-`CLONE_CLEAR_SIGHAND|CLONE_VM|CLONE_VFORK` 调用 `clone3`；该组合的直接 syscall
-同样返回 `EOPNOTSUPP`（95）。当时的内核没有接纳 `CLONE_CLEAR_SIGHAND`，
-而这版 glibc 仅在 `EINVAL` 或 `ENOSYS` 时尝试旧入口。这是进程接口缺口，
-并非格式化工具缺失或 ACL 测例失败。
-
-内核现已在子进程独立信号表中实现该标志：保留被忽略的信号、重置其他处理动作，
-并清除动作 flags 和 mask。修复后使用原 LA glibc ELF、原工具和原 judge 重跑，
-成功格式化并挂载 scratch，九项全部通过，退出 0，得分 **9/9**，耗时 6.531 秒。
-[固定 LTP 工具探测](https://github.com/linux-test-project/ltp/blob/20240524/lib/tst_supported_fs_types.c)
-
-### basic/brk：发布 ELF 截断了返回地址
-
-raw `brk(0)` 返回当前堆顶地址。原 RV ELF 在 syscall 后执行 `sext.w a0,a0`，
-LA ELF 执行 `slli.w a0,a0,0`，都只保留低 32 位再符号扩展。随后程序拿这个截断地址
-加 64 请求扩展，已经偏离真实堆顶，两个增长断言失败。因此原四配置均为 **1/3**。
-
-固定源码的包装器声明与发布 ELF 的这段指令不同，归因以实际运行字节为准。
-此前独立修正诊断已验证恢复完整返回宽度后为 3/3；默认评测保留原 ELF 和原分数。
-两架构原指令、地址观测和输入哈希见
-[basic 与运行时差异](oscomp-compat-baseline.md#basic的90分与原musl调度接口差异)。
-
-### epoll_ctl04：旧测例只接受 EINVAL，新嵌套检查先返回 ELOOP
-
-测例先建立五层 epoll，再添加第六层。LTP 20240524 只接受 `EINVAL=22`。
-Linux 的 `f2e467a48287` 提前检查向上的嵌套深度，从 6.17-rc 起该输入先得到
-`ELOOP=40`。LTP 上游随后提交 `e84f0689`，同时接受 EINVAL、ELOOP；该修正于
-2025-08-14 合入。
-
-当前 BoarOS 与固定 Linux 对照均为：
-
-| 输入 | 可见结果 |
-|---|---|
-| 五层嵌套 | 成功 |
-| 增加第六层 | ELOOP |
-| 自己监听自己 | EINVAL |
-| 多个 epoll 构成环 | ELOOP |
-
-默认继续执行原 `epoll_ctl04`，保留其 TFAIL 和 **0/1** 判分；内核保留 ELOOP。
-共同 ABI 回归在 [selected.c](../../tests/diff-abi/selected.c) 的 `epoll_nesting()`。
-依据：[旧测例](https://github.com/linux-test-project/ltp/blob/20240524/testcases/kernel/syscalls/epoll_ctl/epoll_ctl04.c)、
-[LTP 修正](https://github.com/linux-test-project/ltp/commit/e84f0689cf7a8a77478a0e70aa62560f66c3bceb)、
-[Linux 修改](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=f2e467a48287c868818085aa35389a224d226732)。
-
-### LA 原 musl mremap06：4 KiB 拆分粒度与 16 KiB 页不匹配
-
-原ELF把 `MMAP_GRANULARITY` 编译为4096，第一次请求搬移 `base+4096` 到 `base+12288`。当前LA使用16384字节页，两地址均未页对齐。相同原ELF、原libc在固定16KiB Linux上也在首次mremap报TBROK；实际调用参数与反汇编一致。按两端参数检查，该请求属于EINVAL；原程序未打印errno，调查未捕获raw返回寄存器。
-
-对应LTP头在有 `HAVE_SYS_SHM_H` 时选 `SHMLBA`，否则用 `getpagesize()`；固定musl 1.2.5通用头的SHMLBA为4096。原ELF的常量与此前者一致，官方构建config.h未取得，因此归因以产物与实测参数为准。原libc的mremap正确传递第五参数，getpagesize从运行时数据取值，本次没有证明它返回错误。
-
-保留原输入、对齐语义和原judge的0/1；其余三个组合为3/3。具体得分和耗时见[mremap结果](oscomp-ltp-analysis.md#mremap-常用范围与线程-proc-查询)，原ELF、同输入Linux输出和参数见`build/mremap-proc-20261023/la-original-mremap06.md`。[固定头文件](https://github.com/linux-test-project/ltp/blob/20240524/include/lapi/mmap.h)
-
-### mremap05：内容错误分支仍打印 TPASS
-
-固定20240524源码的 `test_mremap()` 在成功返回目标地址后检查首字节；内容不符时仍调用 `tst_resm(TPASS, ... "value failed")`。因此其7条TPASS和退出0并不独立证明搬移内容正确。当前保留原ELF和judge，内容、源/目标子范围及共享/COW行为由[共同ABI短例](../../tests/diff-abi/mremap.c)实际检查。[固定源码](https://github.com/linux-test-project/ltp/blob/20240524/testcases/kernel/syscalls/mremap/mremap05.c)
-
-### musl 信号等待：库重试 EINTR，测例等待它返回 EINTR
-
-`sigtimedwait01`、`sigwaitinfo01`的[首项](https://github.com/linux-test-project/ltp/blob/20240524/libs/libltpsigwait/sigwait.c#L12)使用空等待集合，要求SIGUSR1打断调用并返回EINTR。原musl库收到syscall的`-EINTR`后会重新调用；空集合没有可成功取走的匹配信号，于是反复等待，最后由LTP的30秒watchdog结束。
-
-原RV库标注musl1.2.0、LA库为1.2.5，两份原库反汇编均确认该重试。固定Linux使用同一原ELF和原libc，两个架构均得到：glibc分别11/11、9/9通过，musl各30秒后以0通过、1个TBROK（运行超时）结束。BoarOS的直接syscall对照覆盖空集合与SA_RESTART，返回EINTR的行为与Linux相同。
-
-当前沿用原输入和原judge计分。调整这一差异应落在测试调用方式或显式libc接口适配；原结果、运行身份与短回归见[CPU定时器与信号等待](oscomp-official-delivery.md#cpu-间隔定时器与信号等待)。
-
-## I/O测量工具与调用口径
-
-- 四actor负载按实际在线CPU轮转绑定，并逐角色输出、核对affinity；旧工具最多选择两个CPU的结果不能用来证明四CPU扩展。宿主RV vCPU通过QMP/GDB按logical CPU映射，不能固定把QMP index0或hart0当CPU0。
-- `/proc`的挂载与卸载跟实际消费者配对：原版consumer的`cost_init()`挂载后由协调脚本卸载；纯native正式窗口不挂不卸；带`/observe`的data-path观察窗口主动挂载，结果读出后严格卸载。没有挂载时的EINVAL不能用`|| true`变成成功。
-- 原版iozone普通read方法的`-e`把末尾fsync计入该方法；stdio fread的`-e`路径是fflush，二者分列。auto与native不含同步的冷热读另列。工具与参数说明见[本轮测量](data-path-budget-experiments.md#2026-10-30接纳等待稳定快照合批与物理扇区-rmw)，内核性能变化在实验文档记录。
-- 10月31日单核IOzone短批的通用`cost_consumer`摘要沿用了自动项模板：`argv`仍写4 MiB/1 KiB自动项，`elf_sha256`也不是本次执行的原IOzone，`throughput_methods`为空。冻结的cases文件和每次原输出均为`./iozone -i 0 -i 1 -i 2 -r 64k -s 16m -e`，数值行确认16384/64和六项方法；封存输入盘SHA及从盘提取的两种原ELF校验通过。派生分析据实际命令、原数值列和真实ELF身份修正标签，原rows保留错误字段，未放宽程序成功或内容检查。该问题属于测量记录工具；候选运行的原程序吞吐下降继续单列，具体归因见全链路研究，见[单核候选结果](data-path-budget-experiments.md#2026-10-31单核接纳通知候选未通过性能验收)。
-
-- native I/O的WINDOW完成吞吐包含逐字节读取校验或逐块写入数据生成；单次SAMPLE与WINDOW计时范围不同。缓冲区对齐也与原IOzone不同。其分段和真实ELF请求形状统一见[单核全链路研究](data-path-budget-experiments.md#2026-10-31单核-io-全链路研究)，不能把该吞吐直接当成内核裸传输速度。
-
-## 原脚本调用与判分差异
-
-| 项目 | 具体问题与影响 | 当前处理 |
+| 项目 | 如何判断原因 | 处理 |
 |---|---|---|
-| 六项 socket LTP 的临时复核入口 | 10月24日10:36的临时包装只生成了选择性 init，随后直接复制默认交付内核，漏掉用该 init 重建内核的步骤。保留的 `probe-rv/init.json`、`probe-la/init.json` 均只执行六项 LTP；实际内核仍内嵌默认组脚本，因此先进入 basic、busybox、cyclictest、iozone。此前关于过滤锚点失效的归因有误。 | 在 LTP 前停止两个客体；该尝试没有 LTP 结果、得分或超时记录，临时运行盘已删除。此前10:21按选择性 init 重建后取得的原程序结果有效。选择性运行须把生成的 init 传给内核构建，并核对实际启动内核身份；只生成 JSON 不改变已编译内核。记录见 `build/unix-named-20261024/original-refinement/aborted.json`。 |
-| iozone 向量 I/O | 原命令 `./iozone -t 4 -i 11 -i 12 -r 1k -s 1m` 请求 pwritev/preadv，发布二进制却报 `Selected test not available on the version`，随后输出默认 initial writers/rewriters。 | 保留原命令；分析按实际输出判断。该次运行只证明默认写入路径完成，向量能力由独立 ABI 和原 preadv/pwritev 测例验证。 原 judge 仍把回退的两项 Max 结果计入分数。额外 `-e` 试验同样把 read 末尾 fsync 纳入方法计时，首次 read 不能按纯数据吞吐解释；计时源码与得分对应见[iozone 分项分析](oscomp-iozone-analysis.md#覆盖与评分)。 |
-| libc-test 脚本 | `run-static.sh`、`run-dynamic.sh` 没有 shebang；原 LA musl BusyBox 在固定 Linux 也拒绝直接执行，后面的程序尚未开始。 | 临时外层脚本用该 libc 自己的 BusyBox `sh` 显式解释这两行；内层列表和参数原样执行。 |
-| BusyBox 的 `kill 10` | judge 的固定清单要求此标签，发布 `busybox_cmd.txt` 实际执行 `sh -c 'sleep 5' & ./busybox kill $!`，成功标签按整行输出。judge 另补的 `kill 10` 因无对应标签得零。 | 保留原脚本和 judge；**54/55** 的差额按标签错位解释，后台 PID 的实际 kill 单列。 |
-| LTP 旧 API 输出 | `ftest01/05`、`inode02`、`hackbench`、`mremap01～05`、`getgroups01`、`sigaltstack01`、`signalfd01/signalfd4_01/signalfd4_02`、`sendmsg01`、`mlockall01`等会输出TPASS，部分正常退出，但没有现代 `Summary:`；原 judge 只从 Summary 累计 passed，记 **0/0**。 | 结果中同时列功能输出和原判分。`getgroups01` 四配置均输出4条TPASS、退出0，原judge各记0/0；两架构ftest的实际内容与磁盘一致性已通过。`sendmsg01` 的glibc正常完成和musl中止均记0/0、0分，逐配置输出及耗时见[控制消息原程序结果](oscomp-ltp-analysis.md#unix-控制消息与-inet-peek-原程序结果)。 |
-| LTP 的 `FAIL LTP CASE … : 0` | 原脚本对每个返回码统一打印这行，名字中的 FAIL 也出现在成功退出时。 | 判读末尾状态及 Summary；保留原结束行作为 judge 的当前测例边界。 |
+| `acl1` | 原发布文件仅包含可选访问控制列表（Access Control List，ACL）依赖不可用时的提示分支。固定 LTP 源码在未定义 `HAVE_LIBACL` 时构建此分支，程序输出 `The acl library was missing upon compilation.`，退出 32。 | 保留原文件。要执行完整测试，需用 libacl 重新构建，并提供文件、目录及指定的数字用户和组。原盘直接无参执行也无法满足这些前提。完整测试打印 `ACL TESTS RESULTS`，判读应结合实际输出。见[固定源码](https://github.com/linux-test-project/ltp/blob/20240524/testcases/network/nfsv4/acl/acl1.c)。 |
+| `setxattr01` 在 LoongArch glibc 上提示缺少 `mkfs.ext4` | 同环境直接启动 `mkfs.ext4` 成功，但 `system("exit 0")` 也返回 127。跟踪 glibc 的 `posix_spawn` 可见其 `clone3` 请求包含 `CLONE_CLEAR_SIGHAND`，旧内核返回 `EOPNOTSUPP`（95），该库仅在收到 `EINVAL` 或 `ENOSYS` 时回退。 | 通用内核已实现子进程信号动作重置语义，原测例无需修改。 |
+| 使用 `getpwnam("nobody")` 的测例 | `access01`、`mkdir02`、`readlink01`、`pidfd_send_signal02`、`pidfd_getfd02`、`mlock02`、`mlock202`、`shmctl02`、`mount03`、`mq_open01`、`mq_unlink01` 依赖原盘账户数据库。缺少 `/etc/passwd` 时，准备阶段在目标操作前结束。 | 保留原盘。验证数字身份相关权限时，使用明确创建测试账户的独立运行环境。 |
+| glibc 的 `float_*` | 线程取消或退出时，glibc 需要 `libgcc_s.so.1` 展开线程栈。缺少这一库时可在日志中看到加载失败。 | 归为该运行库配置缺失。 |
+| LoongArch 原盘的动态程序 | 加载器路径取自程序的 `PT_INTERP` 段。glibc 的 `/lib64/ld-linux-loongarch-lp64d.so.1` 和 musl 的 `/lib64/ld-musl-loongarch-lp64d.so.1` 须指向原盘对应的加载器。固定 Linux 下缺同名链接也会在执行阶段失败。 | 启动脚本按发布盘清单创建实际路径链接。 |
+| LoongArch musl 调度包装 | 原库的四个调度函数直接返回 `ENOSYS`。捕获系统调用可核对这些包装没有进入内核。 | 由[动态共享对象适配](../modules/oscomp-compat.md#调度适配)接入原生系统调用。 |
+| libc-test 的脚本解释器 | 发布的 `run-static.sh` 和 `run-dynamic.sh` 无解释器声明行。LoongArch 原 musl BusyBox 直接执行时也会在 Linux 上失败。 | 临时外层脚本改用原盘对应的 BusyBox `sh` 显式调用两行，保留内层脚本和参数。 |
+| `eventfd01/02` | 测例在依赖准备阶段读取 Linux 内核配置，缺少 `CONFIG_EVENTFD` 的配置信息时以 `TBROK` 停止。 | 判读时标记准备失败，实际事件描述符接口由进入系统调用的程序验证。 |
+| `readahead01` | 测例通过 `tst_fd_next()` 构造多类文件描述符。构造器因接口或事件源不可用而跳过时，对应文件描述符尚未传给 `readahead`。 | 先按[固定构造器](https://github.com/linux-test-project/ltp/blob/20240524/lib/tst_fd.c)和当前日志区分准备、跳过及实际断言，再核对当前内核能力。 |
 
-iozone 的完整命令核对见[原脚本对照](oscomp-compat-baseline.md#2026-10-17-cpu0-存储分批与同步等待集成)。
-其余脚本适配机制和重建入口见[兼容模块](../modules/oscomp-compat.md#原盘bootstrap与监督)。
+### final-2026 的根盘和构建输出管道
 
-## 为什么有些项目会一直等
+发布的 ext4 根盘曾在日志重放时被拒绝。顺着挂载错误追到 `jbd_extract_block_tag`，
+发现旧实现额外要求描述符中可选的通用唯一标识符（Universally Unique Identifier，UUID）
+等于日志超级块中的值。发布盘的可选字段为全零。Linux 恢复路径根据标志跳过该字段，
+按日志校验和验证记录。通用实现已按该格式处理，发布盘副本可由内核直接重放。
 
-原 `ltp_testcode.sh` 遍历 `ltp/testcases/bin/*`，对每个普通文件直接执行 `"$file"`，
-没有使用 LTP 的 runtest 分组来建立控制器、管道、参数和配套服务。目录中也存放测试
-辅助程序；这些程序的调用方负责提供输入或结束它们。
+BuildStorm 的 Rust 工具链曾在准备阶段中止。沿 `Child::wait_with_output`
+追到 `ioctl(pipefd, FIONBIO, &one)`，当时普通管道返回 `ENOTTY`（25），库随后
+因未能启用非阻塞读取而退出。通用文件描述符分派已接入 `FIONBIO`，该调用更新共享打开
+文件描述（Open File Description，OFD）的非阻塞标志。构建产物与工具链版本检查应分别判读。
 
-| 代表项目 | 正常调用所需条件 | 当前处理 |
-|---|---|---|
-| `cgroup_fj_proc`、`cpuctl_fj_cpu-hog`、`cpuset_*`、`memcg_test_2/4`、`pids_task2` | 父控制器通过信号、FIFO 或终止动作驱动；部分 worker 本来就持续施压。 | 共享跳过表过滤原脚本的直接无参数调用，控制器入口继续执行。 |
-| `cpuhotplug_do_*_loop`、`fork_exec_loop`、`fs_racer_*.sh` | 热插拔、freezer 或 racer 控制器负责运行时间和结束。 | 同上。 |
-| `doio` | `iogen` 提供结构化标准输入。 | 过滤单独执行。 |
-| `shell_pipe01.sh`、`tst_hexdump`、`timed_forkbomb` | 分别需要上游管道、输入及 EOF、控制器启动令牌。 | 过滤单独执行。 |
-| `pthserv`、`ftp-download-stress02-rmt.sh` | 对应客户端／服务端、持续时间与结束控制。 | 过滤单独执行。 |
-| `netstress` | 默认作为 server，`-l` 才选择 client；`server_run()` 持续循环 accept，需要客户端产生负载、控制程序结束服务端。历史无参数运行等待约 300 秒，得零。 | 共享跳过表过滤独立无参数调用，原因是 `controller-client-and-termination-required`；配对网络测试继续由其控制程序运行。 |
+### 启动时设备未完成 FLUSH
 
-逐名来源和原因以 [ltp-skips.tsv](../../tests/oscomp/ltp-skips.tsv) 为准。
-netstress 的默认模式见[固定源码](https://github.com/linux-test-project/ltp/blob/20240524/testcases/network/netstress/netstress.c)。
-跳过表在启动前匹配测例名称。默认 120 秒的单例监督负责终止已经启动且超时的测例。
+两架构平台日志中的 `block queue fault reason=timeout` 来自旧块设备驱动。
+等待对象是请求类型 4，即要求设备将先前写入推进至持久存储的 `FLUSH`。故障时设备状态
+仍为初始化值，完成环未前进，驱动在 30 秒时复位设备，随后根文件系统挂载失败。
+日志证明了请求未交付完成。宿主同步延迟和设备推进停滞均缺少足以区分的宿主侧记录。
 
-## 运行库和原盘依赖
+现行驱动继续等待设备结果，按周期报告仍未完成。分析新日志时，先对照请求状态、完成环和
+根盘挂载记录，若能访问宿主，再核对后备文件的同步完成和虚拟设备进展。驱动策略见
+[VirtIO 块设备](../modules/riscv-virtio-block.md)。
 
-| 项目 | 已确认归因 | 当前状态／具体依据 |
-|---|---|---|
-| glibc `float_*` 的线程退出／取消 | 完整旧日志已有 `libgcc_s.so.1` 缺失；glibc 需要它展开线程栈，缺库会 abort。 | 属于原盘依赖。musl 的 SIGSEGV 单独保留归因；见[慢项分类](oscomp-ltp-analysis.md#慢项与超时分类)。 |
-| LA musl 的四个 `sched_*` 函数 | 原 libc 直接返回 ENOSYS，尚未进入内核；对应上游 musl 的接口语义取舍。 | 默认 LA musl 通过调度 DSO 调用真实 Linux syscall，原 cyclictest 已获得样本；见[运行时接入](oscomp-compat-baseline.md#默认make-all接入la-linux调度运行时)。 |
-| 原 musl `sendmsg01` 的非法控制指针 | RV 原 libc 的 `sendmsg` 包装器先复制 msghdr，再从 `msg_control` 复制控制区到栈，随后才调用 syscall。反汇编中 `0x435bc` 读取控制指针、`0x435d0` 调用 `memcpy`，到 `0x43640` 才装入 syscall 号211并于 `0x43644` 调用 `__syscall_cp`；因此非法控制指针可在进入 sendmsg 的 ecall 前触发用户态 SIGSEGV。 | RV／LA 原musl在该分项均收到SIGSEGV并中止，具体计数和耗时见[原程序结果](oscomp-ltp-analysis.md#unix-控制消息与-inet-peek-原程序结果)。当前指令级证据来自RV原库，保存在 `build/unix-scm-20261024/original-linux-rv-musl-sendmsg01/musl-sendmsg.asm`；固定Linux以同一原RV ELF和原libc复现14条TPASS，随后在第15项收到SIGSEGV、2条TBROK、退出2；运行盘检查为0。记录为 `pristine-serial.log`、`pristine-result.json`。LA本轮有同类原程序输出，未另作原LA库的指令级归因。保留原ELF、libc和原judge。 |
-| RV 原静态 glibc 的 clock 测试 | malloc 初始化遇 getrandom/EAGAIN 后把 errno 留到 main；后续 clock 调用成功，原断言仍看到旧 errno。 | 当前启动种子在运行测例前完成随机源初始化；指令级对照见[errno 来源](oscomp-compat-baseline.md#rv静态clock_gettime的errno来源)。 |
-| `mkdir02/readlink01/access01/pidfd_send_signal02/pidfd_getfd02/mlock02/mlock202/shmctl02/mount03/mq_open01/mq_unlink01` 的用户数据库 | 固定输入根盘缺少 `/etc/passwd`，`getpwnam("nobody")` 返回ENOENT，准备阶段结束。 | 原`mkdir02/readlink01`未进入GID/SGID继承、root/nobody读取主体；10月24日`access01`四配置也在`access01.c:275`报TBROK，原judge各为0/1。真实UID/GID切换、capset与DAC现已实现，数字身份的同ELF短例和musl/glibc消费者已通过；本轮`pidfd_send_signal02.c:78`、`pidfd_getfd02.c:52`四配置也在此准备阶段报TBROK；pidfd的数字身份与已有FD权限另由同ELF直接消费者验证。锁页批次的`mlock02.c:89`、`mlock202.c:88`四配置也因nobody缺失退出2，原judge各0/1；数字UID的锁页额度和capability豁免另由直接程序验证。`shmctl02.c:113`四配置同样在getpwnam(nobody)结束，原judge各0/1；SHM_LOCK/UNLOCK的数字身份、owner与额度由8项直接消费者验证。挂载属性批次的`mount03.c:193`四配置也在同一步退出2，各0/1，尚未进入NODEV/NOEXEC等属性分项；12组数字身份/挂载消费者另与Linux同ELF通过。MQ批次中`mq_open01.c:195`、`mq_unlink01.c:68`四配置也在getpwnam(nobody)报TBROK，原judge分别0/3、0/1，尚未进入MQ主体；mq_open01另在清理阶段报告SIGSEGV：固定源码的qname仍为NULL，cleanup在初始队列unlink报ENOENT后调用mq_unlink(qname)，两种libc均会在syscall前读名称首字节；这条NULL清理路径与日志吻合，未采集fault PC，实际故障指令仍未定位。数字身份的MQ创建、权限和unlink寿命另与固定Linux同ELF验证。原盘仍保持原账户输入。原程序得分与耗时见[凭据与权限结果](oscomp-ltp-analysis.md#可变凭据与权限原程序结果)。 |
-| `mincore01` 的栈限额准备 | 历史版本将主线程栈硬限额固定为 8 MiB，原程序将其设为 10 MiB 时返回 EPERM，后续分项没有执行。 | 用户栈现按 `RLIMIT_STACK` 和相邻映射按需增长。2026-11-01 原四配置均执行全部 4 项、4 条 TPASS、退出 0、无超时；原 judge 因旧程序没有 `Summary:` 仍记 0/0。详见[原程序结果](oscomp-ltp-analysis.md#用户栈限额修复后的-mincore01)。 |
-| `pidfd_getfd01` 的 kcmp 比较助手 | 原先`include/lapi/kcmp.h:36`的`kcmp(272)`返回ENOSYS，LTP将程序记为TCONF；六类kcmp已实现。 | 2026-10-25原四配置均已进入主体，`pidfd_getfd01.c:69`通过，原judge各1/1。共享OFD、offset、CLOEXEC、真实内容与REALCREDS权限同时由数字身份短例覆盖；见[本批结果](oscomp-ltp-analysis.md#共享mm锁页与kcmp原程序结果2026-10-25)。 |
-| `kcmp03` 的clone前置能力（已解决） | 四分项依次请求独立CLONE_VM、CLONE_FS、CLONE_IO、CLONE_SYSVSEM。相关clone和KCMP_IO现已接入。 | 原程序在RV／LA、glibc／musl四配置均4/4；此前的2/4、3/4是旧内核结果。I/O优先级状态与块设备服务策略的边界见[调度模块](../modules/kernel-scheduler.md#clone-与-vfork)。 |
-| 自有差分使用的LA musl vfork | 固定musl1.2.5的`src/process/vfork.c`在LA无专属汇编的配置中执行`clone(SIGCHLD,0)`；反汇编为a7=220、a0=17，实际采用独立MM。 | 直接消费者使用独立子栈及显式`CLONE_VM|CLONE_VFORK|SIGCHLD`验证共享关系，固定Linux与BoarOS均10/10；两种libc运行同一源码。线程撤号另等PIDFD_THREAD的HUP再检查ESRCH，覆盖pthread_join完成后TID仍短暂存在的Linux交错。原LTP结果按其实际clone输入另列。 |
-| 自有 LA glibc 备用栈短例 | `pthread_attr_setstack` 检查及两项帧宽度检查在固定 Linux、修复前后 BoarOS 均失败；程序只打印 errno，未打印 pthread 接口直接返回的错误编号。 | 相同输入在固定 Linux 也失败，不作为本次 clone3 回归。LA musl 备用栈短例通过；上述检查的具体原因待独立定位。 |
-| `eventfd01/02` 的Kconfig输入 | 原ELF请求`CONFIG_EVENTFD`，LTP在解析Linux `.config`时TBROK，退出2；当前启动环境没有该配置文件。 | 四配置均未进入主体，原judge为0/0。eventfd接口差分及原eventfd2测例通过；逐程序得分/耗时见[eventfd与timerfd结果](data-path-budget-experiments.md#eventfd与timerfd2026-10-22)。 |
-| `futex_waitv01/02/03` 的内核版本检查 | 四配置均在 `tst_test.c:913` 因要求Linux版本至少5.16而TCONF、退出32；BoarOS的uname release是`0.1.0-boaros-dev`。 | waitv入口已实现，但这批原程序未调用它，原judge各0/0、0分。保留原ELF、参数和版本身份；直接同ELF检查覆盖实际入口、队列、超时及退出。详见[本批结果](oscomp-ltp-analysis.md#futex多地址等待与pi重排原程序结果2026-10-25)。 |
-| `getdents01` 的四种入口 | 旧 getdents syscall 在两种架构上无入口，部分 libc 也没有导出相应 wrapper；这些分项记 TCONF。 | 四配置共七条 TCONF；有效 getdents64 分项通过。对应分项、得分和时间见[目录与路径结果](oscomp-official-delivery.md#目录与路径当前结果)。 |
-| RV 原 musl 的浮点 ABI 标注 | 原测例标注double-float ABI，原libc标注soft-float；设置`LTP_TIMEOUT_MUL=0.1`时观察到异常巨大时限。 | 信号等待的正式复核沿用未设置该变量的默认30秒；该原输入差异独立于EINTR重试，保留在定向运行记录。 |
-| libc-test 的部分共同失败 | 固定 Linux 上同一原 ELF 也失败，例如缺 UTF-8 locale、glibc 的 ERE 扩展与原断言预期不同。 | 逐项 Linux/BoarOS 输出见[对照附件](oscomp-libctest-original-failures.tsv)及[具体触发条件](oscomp-compat-baseline.md#rv静态clock_gettime的errno来源)。 |
+## 实际调用与错误归属
 
-## 内核语义与错误分类
+- **`basic/brk`。** 发布的可执行文件把系统调用返回的 64 位堆顶截断为低 32 位再符号扩展。
+  核对返回寄存器与下一次请求地址即可确认两次扩展请求实际使用了截断值。原文件和判分保留。
+- **`epoll_ctl04`。** 固定 LTP 只接受 `EINVAL`。较新的 Linux 会先检查向上嵌套深度，
+  第六层返回 `ELOOP`，BoarOS 使用同一错误顺序。LTP 上游已[同时接受两种错误](https://github.com/linux-test-project/ltp/commit/e84f0689cf7a8a77478a0e70aa62560f66c3bceb)。
+- **LoongArch musl `mremap06`。** 发布文件以 4 KiB 为拆分步长，在 16 KiB 页系统上
+  传入未对齐的源和目标地址。同一文件在 16 KiB 页 Linux 上也在第一次搬移报告 `TBROK`。
+- **`sigtimedwait01`、`sigwaitinfo01`。** 测例要求信号打断空集合上的等待并返回
+  `EINTR`。原 musl 的包装会重试；空集合始终无法取得信号，因此等待可能持续到内部监督到期。
+- **原 musl `sendmsg01`。** 对 RISC-V 原库的反汇编显示，包装先从用户的
+  `msg_control` 复制数据，再进入系统调用。非法指针可在用户态触发 `SIGSEGV`，
+  同一原文件和库在 Linux 上表现一致。
+- **`cve-2016-7117`。** 原日志把 `EINVAL` 记在 `recvmmsg` 上。逐项追踪显示，
+  描述符并发关闭时接收调用实际返回 `EBADF`。紧接着的
+  `clock_gettime(CLOCK_MONOTONIC_RAW)` 在旧内核上返回 `EINVAL`，覆盖了线程的
+  `errno`。通用时钟查询已补齐，判读同类日志时应分别观察两个系统调用结果。
+- **RISC-V 原静态 glibc 时钟断言。** 若时钟调用已返回成功，继续追踪 `errno` 的
+  首次写入。已定位的一种情况是 `malloc` 初始化在进入 `main` 前调用
+  `getrandom` 得到 `EAGAIN`，之后成功的时钟调用保留了这个旧值。旧盘启动先完成
+  随机源初始化。
 
-### socketpair01：创建阶段错误分类（已修复）
+### 间歇性的 RISC-V musl 反向 TCP 失败
 
-此前四个架构/libc组合的原 `socketpair01` 均为6/10、退出1：一项期望 EAFNOSUPPORT(97)、三项期望 EPROTONOSUPPORT(93)，实际均为 EOPNOTSUPP(95)。这是当时内核的错误分类缺口，[上轮得分、耗时和原始结果](oscomp-ltp-analysis.md#unix-seqpacket-接入后的-socket-原程序结果)继续保留。main 基线 `f0943f2` 已有相同的非 UNIX family 提前返回行为，源码说明它早于 SEQPACKET 接入；该历史运行没有另用旧核重跑。
+原 `iperf3` 常驻服务端依次处理六项。`REVERSE_TCP` 紧接 `REVERSE_UDP`，
+失败现场在输出传输统计前报告控制连接重置，另一次平台运行该项成功。成功配置也会输出
+个别不支持的套接字选项警告。复查时应保持同一服务端和前序测试，观察控制连接何时关闭；
+目前只确认了失败所在阶段。
 
-当前 `kernel/syscall/socket.c` 已让 socket 和 socketpair 共用 family/type/protocol 创建校验，区分创建失败与不支持配对操作。固定 `references/linux/net/socket.c` 的 `__sys_socketpair` 先预留两个 FD、逐个写入用户输出，再创建 socket，最后调用协议的 `ops->socketpair`；当前文件表事务采用这一顺序，失败时归还预留 FD，并保留已经写入用户空间的输出前缀。不能创建的地址族或协议保留对应创建错误，能够创建而不支持配对的 INET TCP/UDP 请求仍返回 EOPNOTSUPP。
+## 监督与判分
 
-修复后保留同一批原 ELF、原断言和原 judge，四配置均为10/10、退出0，无 TFAIL、TBROK、TCONF 或超时，见[本轮分项得分与耗时](oscomp-ltp-analysis.md#sysv-信号量与-socketpair-错误分类修复后的原程序结果)。
+旧 LTP 入口直接遍历可执行目录，其中也包含需要控制器、管道、终止信号或配套服务的辅助
+程序。例如 `netstress` 无参数默认作为服务端等待连接，`doio` 需要 `iogen` 提供
+结构化输入。适配器依据[跳过表](../../tests/oscomp/ltp-skips.tsv)过滤缺前提的直接调用，
+配套控制器仍能启动它们。`fs_fill` 按整轮评测预算排除，该负载执行实际填盘、空间耗尽和
+清理。
 
-### semctl03：libc 变体主动跳过两项 EFAULT
+逐例监督从每个测试启动计时，原评测框架的整机预算从虚拟机启动计时。平台下载的日志
+可能有大小截断。要判断某项正在运行、已经结束或从未进入，需结合完整串口、脚本结束标记
+和虚拟机生命周期。下载文本的最后一行只确定可见范围。
 
-原 `semctl03` 在四配置均为6/8、退出0、两条 TCONF。固定源码的测试表把 GETALL、IPC_SET 的非法 union 参数列为 EFAULT；`verify_semctl()` 遇到 `tc->error == EFAULT && tv->semctl == libc_semctl` 时直接输出 `EFAULT is skipped for libc variant` 并返回，不执行该分项的 semctl 调用。libc 和原始 syscall 两种变体合计八项，因此 libc 变体的这两项记 TCONF，其余六项实际通过。
-
-依据：[固定 semctl03 源码](https://github.com/oscomp/testsuits-for-oskernel/blob/8b58dd16d26d30f7c74d48d5832d870d3051b703/ltp-full-20240524/testcases/kernel/syscalls/ipc/semctl/semctl03.c)。本轮原输出与原 judge 的6/8继续保留，见[分项结果](oscomp-ltp-analysis.md#sysv-信号量与-socketpair-错误分类修复后的原程序结果)；这两项跳过由程序的上述条件直接触发，不据此推断环境或内核缺口，也不把独立故障检查的通过数补入原程序分数。
-
-### readahead01：被测FD创建阶段的跳过
-
-2026-11-12四组合均15条TPASS、8条TCONF、退出0；原judge为15/23。
-这些TCONF发生在LTP的`tst_fd_next()`准备被测FD时，尚未调用对应FD的readahead：
-fanotify_init、userfaultfd、io_uring_setup、fsopen、fspick、open_tree和memfd_secret返回ENOSYS。
-perf_event_open请求`PERF_TYPE_SOFTWARE/PERF_COUNT_SW_CPU_CLOCK`，当前事件源未实现，返回ENOENT。
-这是内核现有接口／事件支持范围，不是缺库、缺用户数据库，也不是已执行的readahead断言失败。
-固定来源见[LTP 20240524的FD构造器](https://raw.githubusercontent.com/linux-test-project/ltp/20240524/lib/tst_fd.c)。
-
-已创建的O_PATH、目录、/dev/zero、管道、UNIX/INET socket、epoll、eventfd、signalfd、timerfd、
-inotify及BPF map分别返回原程序期望的错误；普通可读文件的实际装入、范围回收及引用归还由直接消费者验证。
-原结果和耗时见[本批七项结果](oscomp-ltp-analysis.md#向量按次选项与文件建议原程序2026-11-12)。
-
-## fs_fill：评测预算取舍
-
-`fs_fill` 的两个细项已经通过，相关磁盘检查正常。它以三名 writer 分别执行向量和
-4KiB 小写入填盘；近期原 RV/glibc 为 270.703 秒，LA/musl 为 199.273 秒，各得
-2 个原始分。历史每架构两种 libc 合计占 RV 约 578 秒、LA 约 444 秒。
-
-经用户确认，默认评测在共享跳过表中加入 `fs_fill`，原因是 `evaluation-time-budget`，
-覆盖 RV/LA 的 glibc/musl。仍保留完整原始 ELF，存储专项回归直接运行它。工作量、
-校验和修复及测量见[fs_fill 成本分析](oscomp-ltp-analysis.md#fs_fill-的工作量内核成本与优化)。
-
-当前表共36个名字：35个按控制器、输入或配套端点等调用条件过滤，1个 `fs_fill`
-按预算跳过。两张固定盘每架构各匹配 glibc 36项、musl 33项。匹配时适配器返回125，
-控制台原因取自对应条目的reason；原judge对跳过项记零。
-
-当前内核能力与后续实现方向仍由 [goals](../goals.md) 和各模块维护。例如
-O_DIRECT等缺口按内核能力处理；CPU-time sleep及RLIMIT_CPU已接入，当前机制见[时钟模块](../modules/kernel-time.md)。POSIX timer已支持的四类时钟及其余时钟缺口见[原程序结果](oscomp-ltp-analysis.md#posix-定时器原程序四类时钟完成版)。对应实际失败和
-已修复语义见[原程序结果](oscomp-official-delivery.md)。
-
-## madvise建议、SHM查询与参考配置
-
-| 项目 | 实际问题 | 当前状态／依据 |
-|---|---|---|
-| `madvise01`的扩展建议 | 10月25日原程序中五种基础操作及DONTFORK/DOFORK、WIPEONFORK/KEEPONFORK通过；其余11种建议返回EINVAL，原程序记TCONF。 | 当时四配置各9/20，见[原结果](oscomp-ltp-analysis.md#madvise与shm锁定原程序结果2026-10-25)。之后实现 REMOVE 和匿名 FREE；原程序定向重跑四配置均 **11/20**，11项通过、9项TCONF，FREE实际通过。DONTDUMP/DODUMP随后已接入VMA策略，但尚无core文件写出；KSM/大页、COLD/PAGEOUT仍是功能缺口。本轮不重跑原madvise01，保留上述历史得分。 |
-| `madvise02`的WILLNEED/EBADF项 | 固定源码`tcases_filter()`因历史swap-prefetch变更主动将该条标为skip，与这次实际syscall结果无关。 | 四配置12/13。另有FREE、KSM、WIPEONFORK等负向输入得到EINVAL；这些TPASS仅验证该输入的错误，不表示正向操作已实现。[固定源码](https://github.com/linux-test-project/ltp/blob/20240524/testcases/kernel/syscalls/madvise/madvise02.c)。 |
-| 自有WILLNEED对照的swap配置 | 固定Linux在CONFIG_SWAP=n时对普通匿名/纯BSS的WILLNEED返回EBADF；LA原platform参考为SWAP=y，RV及BoarOS无swap，首次LA对照因此结果不同。 | madvise消费者使用独立`platform-noswap`的16 KiB LA参考缓存，保留原platform。不是替换官方libc/ELF，也不改变原测例判分。真实文件缓存装入、无PTE与最后unmap/close握手另有直接检查。 |
-| `shmctl01`的枚举前置查询 | 原先在`get_shm_idx_from_id()`的SHM_INFO(14)返回EINVAL；INFO/STAT/ANY和最高槽返回值已接入。 | 第一阶段四配置均进入主体并12/12通过；包含20个子进程的附加、解除和fork统计。STAT_ANY及槽复用另由直接消费者验证，见[本阶段结果](oscomp-ltp-analysis.md#fork策略与shm查询原程序结果2026-10-25)。[固定源码](https://github.com/linux-test-project/ltp/blob/20240524/testcases/kernel/syscalls/ipc/shmctl/shmctl01.c)。 |
-
-补齐 FREE 后的原 `madvise01` 定向运行保留原 ELF、参数和 judge：RV glibc／musl
-分别耗时 0.197／0.114 秒，LA glibc／musl 分别耗时 0.174／0.104 秒。四项均退出 0、
-无超时，根盘及第二盘各分区的八次检查全部正常。
-
-`shmctl02`的nobody输入问题统一列于前面的运行库和原盘依赖表。普通映射DONTNEED、私有COW与共享后备内容由直接程序验证；vDSO 的 DONTNEED 已支持重新装入信号返回代码，两架构单核及多核短例覆盖重装与实际信号返回。
-
-## 原盘futex覆盖范围
-
-2026-10-25核对RV/LA、glibc/musl四份发布目录：均有普通WAIT/WAKE、CMP_REQUEUE、BITSET和waitv程序，没有独立的LOCK_PI／UNLOCK_PI测例。因此原`futex_wait01/wake01/cmp_requeue01`的17/17用于普通路径回归；新增PI mutex的功能依据来自两架构直接程序、libc的PTHREAD_PRIO_INHERIT消费者及固定Linux差分。原ELF与判分保持原样，结果见[本批futex结果](oscomp-ltp-analysis.md#pi-mutex接入后的原futex短例2026-10-25)。该批未实现的waitv已在后续多地址等待阶段接入，原程序的版本检查结果见上表。
-
-## 自有挂载命名空间差分夹具的根挂载
-
-API8 的 LA Linux 参考原先从 initramfs 启动，将 ext4 挂在 `/root`，再由监督程序
-chroot 后执行消费者。`setns` 加入挂载命名空间时，固定 Linux 的 `mntns_install`
-会把进程根切到该命名空间的根挂载，即 initramfs，而不是先前的 ext4 chroot。
-因此传播消费者在 setns 后访问 `/mp/...` 得到 ENOENT；这属于本地差分夹具的
-根挂载模型不一致，不是 BoarOS 挂载传播错误，也不是官方 LTP 输入问题。
-
-API8 现统一使用 `root=/dev/vda init=/supervisor` 直接从 ext4 根盘启动两架构的
-Linux 参考，复用既有 `ROOT_DIRECT_FILESYSTEM` 监督入口。使用同一 ELF 的
-九项传播消费者已在两架构 Linux 与 BoarOS 通过，包含命名空间切换及源任务退出后
-通过保留的命名空间 FD 加入。原评测 ELF、libc、输入盘、judge 和监督参数未修改；
-此处调整仅用于自有 API8 功能差分。
-
-### mountinfo FD 的根路径捕获时机：现有内核语义缺口
-
-固定 Linux 的 `fs/proc_namespace.c` 在打开 mountinfo 时持有目标的 namespace/root，
-rewind 重新遍历挂载时仍使用该根。BoarOS 当前沿生成文件机制在首次读取及 rewind 时
-取得目标的当前根，因此跨 pivot/chroot 使用旧 FD 的结果并不完全相同。这是内核现有
-语义缺口，不应分类为发布输入或 Linux 参考环境错误；当前边界见[procfs说明](../modules/procfs.md)。
-
-本轮 pivot 消费者使用新打开的 mountinfo FD 验证切换后的根和挂载树；新 FD 的同 ELF
-对照通过，不表示旧 FD 的打开时根语义已经实现。官方 ELF、盘和 judge 未修改。
-
-## 自有调度查询差分夹具的并发假设
-
-`sched_getattr` 的固定 Linux 实现仅在 RCU 读侧保护目标寿命，依次读取策略、RESET_ON_FORK、实时优先级；与另一线程修改策略并发时，各字段可来自不同更新。LA glibc 的自有消费者曾因只接受两种完整组合而失败，实际读到 FIFO／优先级21／RESET_ON_FORK=1。
-
-夹具现在以用户态更新版本和明确握手检查稳定窗口；查询跨越更新时，Linux 检查字段的合法来源，BoarOS 仍始终检查身份保护内的完整快照。固定Linux同ELF对照七项通过，Linux有307次混合快照，BoarOS为0。这是自有夹具的假设修正，不属于原LTP发布输入。固定源码路径为`kernel/sched/syscalls.c`中的`sched_getattr`及`__sched_setscheduler`。
-
-另一个假设是`pthread_join`返回后旧TID立即从PID索引消失。Linux可先通过clear_child_tid唤醒join，再撤下身份；夹具改为有界等待该身份结束，已有快照仍严格核对。相关功能结果与性能见[本批记录](cpu-accounting-cost.md#单一就绪队列与-rv-八核la-四核2026-11-04)。
-
-### 原RV glibc IOzone在通用main版本标识下的准备失败（2026-11-11）
-
-本次临时32/128MiB工作盘直接使用官方`/glibc/iozone`及原loader；通用main返回`uname.release=0.1.0-boaros-dev`，原glibc loader因要求Linux 4.15而打印`FATAL: kernel too old`，IOzone main尚未执行。compat当前已有`4.15.0`标识。有限性能对照对双方统一应用该既有compat常量后，原glibc/musl四个IOzone窗口均正常执行；没有改原ELF或libc，不分类为文件I/O错误。专用标识与输入身份见[本次数据路径记录](data-path-budget-experiments.md#2026-11-11共同路径候选与文件网络归因)。
-
-
-### 本地namespace并发fixture：旧分配尺寸握手失效（2026-11-14）
-
-这不是盘内原程序失败。`tests/host/namespace_cases.h`的pause=2按
-`sizeof(kernel_vfs_path)+5`拦截分配，但现有path_wrap已把dentry／name分离，只申请
-`sizeof(path)`，lookup线程成功退出后，控制线程仍等待永远不会置位的entered[0]。
-当前缓存回收版及采用旧VFS/page-cache源码的同fixture对照，都在第407行同点超时；
-该结果未记为内核通过，也不归因到本次transient owner或退休队列改动。
-测试回调已同步现有umask参数及字段名；本批没有重写这份旧握手。
-
-本批实际验收由真实分配耗尽、只读／可写缓存、无设备I/O回收及lazy-detach交错覆盖。
-源码副本、命令和两个线程回溯在主工作区`build/host/namespace-metadata-review/`，
-直接验证记录在`build/host/cache-metadata-review/validation.txt`。
-
-
-### 本地orphan fixture把日志排空等同于脏页写回（2026-11-15）
-
-`tests/host/ext4_namespace_parallel_orphan.h` 的 `orphan_normal_order_case`
-在 `kernel_vfs_pwrite` 后只调用 `ext4_journal_group_drain`，随后要求磁盘inode已有
-allocated blocks。当前普通写首先进入页缓存和delalloc，日志排空并不负责将这些脏页
-写入后端，因而第20行断言可在没有分配磁盘块时失败。这是自有fixture未建立检查前提，
-不属于官方盘输入；没有以放宽断言或伪造blocks掩盖。
-
-本批未将这份全量orphan用例记为通过，也未扩展成整套回归。直接属性生命周期用例显式
-完成页缓存写回，再排空日志，分别核对延迟预留、实际分配及truncate后的blocks，已通过。
-原失败保留于主工作区 `build/stat-read-round/stat-red.log`；旧fixture后续应通过其实际
-写回入口建立已分配状态，再继续原有orphan及资源归还检查。
+- **LTP 标记。** 旧程序可打印 `TPASS` 而没有 `Summary:`，原判分只汇总后者。
+  `FAIL LTP CASE … : 0` 是脚本的统一结束行，末尾 0 表示程序退出成功。
+  `mremap05` 有一条内容不符分支也会打印 `TPASS`，内容应另行验证。
+- **BusyBox `kill 10`。** 判分清单要求此标签，发布脚本实际执行
+  `sh -c 'sleep 5' & ./busybox kill $!` 并按整行输出。缺标签与信号发送结果应分别判读。
+- **IOzone。** 原判分使用多进程方法中的 `Max`，即最快子进程速率；自动模式的各方法
+  不进入同一计分公式。前者受提前停止影响，分析整组吞吐时需检查逐进程计入字节和共同
+  计时区间。发布文件对 `-i 11 -i 12` 报不支持并回退普通初写和重写，这两项仍可能
+  进入判分。带 `-e` 的诊断应分别核对普通读取的 `fsync` 与标准输入输出库读取的
+  `fflush` 是否落在方法计时内。定位数据和设备等待的方法见
+  [文件系统说明](../modules/vfs-ext4.md#区分提前停止读取和同步)。
+- **final-2026。** CAgent 的项目时间奖励合计可为 199.1 分，BuildStorm 构建失败时
+  原脚本仍可给工具链检查分。发布说明要求八核，BuildStorm 判分脚本的 LoongArch
+  核数告警采用 12 核判断。报告按原判分程序实际行为和发布配置分别说明。

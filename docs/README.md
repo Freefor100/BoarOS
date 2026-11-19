@@ -13,7 +13,7 @@
 | **[工具链与环境](toolchain.md)** | 交叉编译器与模拟器环境 | GCC 工具链版本、QEMU 模拟器环境、目标依赖准备指南 |
 | **[开发路线与能力现状](goals.md)** | 内核演进与功能支持 | 系统调用覆盖、应用生态支持、正在进行中的特性与已知瓶颈 |
 | **[第三方组件说明](third-party.md)** | 依赖引入与开源许可 | 外部开源组件（lwIP、lwext4 等）的来源与授权协议 |
-| **[官方评测兼容](modules/oscomp-compat.md)** | 双架构交付与原程序运行 | 启动配置、原输入、监督及判分；[结果记录](learning/oscomp-compat-baseline.md)与[测例问题](learning/oscomp-test-issues.md) |
+| **[官方评测兼容](modules/oscomp-compat.md)** | 双架构交付与原程序运行 | 启动配置、原输入、监督及判分；[测例问题](learning/oscomp-test-issues.md) |
 
 ---
 

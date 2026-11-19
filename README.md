@@ -105,7 +105,7 @@ make kernel-rv-user-smp SMP_CPUS=8
 make kernel-la LA_SMP=1 LA_SMP_CPUS=8
 ```
 
-官方输入、运行参数、分数与未完成项目维护在[兼容记录](docs/learning/oscomp-compat-baseline.md)。主线功能记录不等同于原评测全部通过；本分支的 LA 调度适配 DSO 不属于 main 默认运行环境。
+固定输入、启动与监督规则见[评测环境适配](docs/modules/oscomp-compat.md)，发布盘和判分问题见[测例问题](docs/learning/oscomp-test-issues.md)。
 
 ### 3. 一键运行与体验
 
