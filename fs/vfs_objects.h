@@ -212,10 +212,9 @@ struct kernel_vfs_backend {
      * NULL denotes a memory-only backend without persistent metadata. */
     void (*sync_prepare)(struct kernel_vfs_node *node, int data_only,
                          struct kernel_vfs_sync_request *request);
-    /* Publishes metadata failures on their affected inode before returning.
-     * NULL denotes a memory-only backend without persistent writeback. */
-    int (*sync_filesystem)(struct kernel_vfs_instance *instance,
-                           struct kernel_vfs_node *root);
+    /* Synchronizes the instance owned by the view. NULL denotes a backend
+     * without persistent writeback. */
+    int (*sync_filesystem)(struct kernel_vfs_mount *mount);
     int (*flush)(struct kernel_vfs_instance *instance);
     int (*symlink)(struct kernel_vfs_instance *instance, uint64_t parent_inode, const char *target, const char *path);
     int (*mknod)(struct kernel_vfs_instance *instance, uint64_t parent_inode, const char *path,
@@ -314,6 +313,7 @@ int kernel_vfs_inode_times_allowed(struct kernel_vfs_node *, const struct kernel
 void kernel_vfs_creation_identity(uint32_t parent_mode, uint32_t parent_gid,
     uint32_t *mode, uint32_t *uid, uint32_t *gid);
 void kernel_vfs_record_writeback_error(struct kernel_vfs_node *node, int error);
+void kernel_vfs_record_mount_writeback_error(struct kernel_vfs_mount *mount, int error);
 int kernel_vfs_attach_unnamed_path(struct kernel_vfs_file *, const char *name);
 int kernel_vfs_publish_node(struct kernel_vfs_mount *mount, struct kernel_vfs_node *node,
     struct kernel_vfs_file *file, int creating);

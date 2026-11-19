@@ -948,12 +948,12 @@ static void run_writeback_regression(struct kernel_vfs_mount *mount,
         kernel_vfs_close(&second)) fail_vfs(75, 0, -1);
 }
 
-static int (*sync_probe_original)(struct kernel_vfs_instance *, struct kernel_vfs_node *);
+static int (*sync_probe_original)(struct kernel_vfs_mount *);
 static unsigned sync_probe_calls;
-static int sync_probe_backend(struct kernel_vfs_instance *instance, struct kernel_vfs_node *root)
+static int sync_probe_backend(struct kernel_vfs_mount *mount)
 {
     sync_probe_calls++;
-    return sync_probe_original(instance, root);
+    return sync_probe_original(mount);
 }
 
 static void run_mount_sync_regression(struct kernel_vfs_mount *mount,

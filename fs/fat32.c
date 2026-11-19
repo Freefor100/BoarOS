@@ -1154,8 +1154,8 @@ static int flush(struct kernel_vfs_instance *instance)
     }
     return flush_locked(m);
 }
-static int sync_filesystem(struct kernel_vfs_instance *instance, struct kernel_vfs_node *root_node)
-{ (void)root_node; return flush(instance); }
+static int sync_filesystem(struct kernel_vfs_mount *mount)
+{ return flush(mount->private_data); }
 static void sync_prepare(struct kernel_vfs_node *node, int data_only, struct kernel_vfs_sync_request *request)
 {
     (void)data_only;

@@ -907,16 +907,12 @@ int kernel_vfs_sync_block_device(struct kernel_block_device *device)
     if (!selected) { kernel_task_lock_release(&irq); return 0; }
     if (selected->instance.quiescing) { kernel_task_lock_release(&irq); return -KERNEL_EBUSY; }
     struct kernel_vfs_mount *view=selected->instance.views;
-    if (!view || !view->references || view->references==UINT32_MAX) {
+    if (!view || kernel_vfs_mount_view_acquire_locked(view)) {
         kernel_task_lock_release(&irq);return -KERNEL_EBUSY;
     }
-    view->references++;
     kernel_task_lock_release(&irq);
-    struct kernel_vfs_path *root=NULL;
-    int result=kernel_vfs_path_root(view,selected->instance.heap,&root);
+    int result=kernel_vfs_sync_mount(view,NULL);
     kernel_vfs_mount_view_release(view);
-    if (!result) result=kernel_vfs_sync_mount(root->file.mount,NULL);
-    if (root && kernel_vfs_path_release(&root)) __builtin_trap();
     return result;
 }
 
@@ -3058,16 +3054,15 @@ static int ext4_backend_flush(struct kernel_vfs_instance *instance)
     return status == KERNEL_BLOCK_STATUS_OK ? 0 :
         status == KERNEL_BLOCK_STATUS_UNSUPPORTED ? -KERNEL_ENOTSUP : -KERNEL_EIO;
 }
-static int ext4_backend_sync_filesystem(struct kernel_vfs_instance *instance,
-                                        struct kernel_vfs_node *root)
+static int ext4_backend_sync_filesystem(struct kernel_vfs_mount *mount)
 {
-    struct lwext4_mount_adapter *adapter = lwext4_instance(instance);
+    struct lwext4_mount_adapter *adapter = lwext4_instance(mount->private_data);
     int result = writeback_mount_times(adapter, true);
     /* Timestamp failures have already been published on the affected inode. */
     if (result != EOK) return lwext4_error(result);
     result = ext4_filesystem_sync_metadata(adapter->mount_point);
     if (result == EOK && !adapter->device.fs->jbd_journal) result = block_flush(&adapter->device);
-    if (result != EOK) kernel_vfs_record_writeback_error(root, lwext4_error(result));
+    if (result != EOK) kernel_vfs_record_mount_writeback_error(mount, lwext4_error(result));
     return lwext4_error(result);
 }
 static int ext4_backend_symlink(struct kernel_vfs_instance *instance,

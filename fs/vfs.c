@@ -5200,17 +5200,34 @@ int kernel_vfs_node_writeback_allowed(const struct kernel_vfs_node *node)
     return node != 0 && node->instance->ops->writeback_allowed(node->instance);
 }
 
-void kernel_vfs_record_writeback_error(struct kernel_vfs_node *node, int error)
+static void record_writeback_error(struct kernel_vfs_instance *instance,
+                                   struct kernel_vfs_node *node, int error)
 {
-    KERNEL_TASK_LOCK_SCOPE(guard, &node->instance->error_lock);
-    node->writeback_error = error;
-    node->writeback_error_sequence++;
-    if (node->writeback_error_sequence == 0) __builtin_trap();
+    KERNEL_TASK_LOCK_SCOPE(guard, &instance->error_lock);
+    if (node) {
+        node->writeback_error = error;
+        if (++node->writeback_error_sequence == 0) __builtin_trap();
+    }
     /* 内存不足不是已发生的设备写回失败，不污染后续独立打开的错误游标。 */
     if (error == -KERNEL_EIO || error == -KERNEL_ENOSPC) {
-        node->instance->writeback_error = error;
-        if (++node->instance->writeback_error_sequence == 0) __builtin_trap();
+        instance->writeback_error = error;
+        if (++instance->writeback_error_sequence == 0) __builtin_trap();
     }
+}
+
+void kernel_vfs_record_writeback_error(struct kernel_vfs_node *node, int error)
+{
+    record_writeback_error(node->instance, node, error);
+}
+
+void kernel_vfs_record_mount_writeback_error(struct kernel_vfs_mount *mount, int error)
+{
+    KERNEL_LOCK_SCOPE(namespace_guard);
+    kernel_vfs_namespace_lock(mount, &namespace_guard);
+    /* The mount reference protects an already published root dentry. A sync
+     * error needs a filesystem error cursor even if no root has been opened. */
+    struct kernel_vfs_dentry *root = mount->root_dentry;
+    record_writeback_error(mount->private_data, root ? root->file.private_data : NULL, error);
 }
 
 uint64_t kernel_vfs_mount_error_sequence(const struct kernel_vfs_mount *mount)
@@ -5263,15 +5280,17 @@ static int snapshot_sync_nodes(struct kernel_vfs_instance *instance,
 
 int kernel_vfs_sync_mount(struct kernel_vfs_mount *mount, uint64_t *observed_error)
 {
-    KERNEL_SERVICE_SCOPE(service);
     if (!mount || mount->state != VFS_MOUNT_STATE_LIVE || !mount->private_data)
         return -KERNEL_EBADF;
-    VFS_MUTATION_SCOPE(configuration,mount);
     struct kernel_vfs_instance *instance = mount->private_data;
-    struct kernel_vfs_path *root __attribute__((cleanup(release_path_pin))) = 0;
+    KERNEL_SERVICE_SCOPE_IF(service, instance->ops->sync_filesystem &&
+        instance->ops->file_operation_execution == KERNEL_VFS_EXECUTION_CPU0);
+    KERNEL_LOCK_SCOPE(configuration);
     struct sync_nodes snapshot __attribute__((cleanup(release_sync_nodes))) = {0};
-    int result = kernel_vfs_path_root(mount, instance->heap, &root);
-    if (result) goto observe;
+    int result = 0;
+    if (!instance->page_cache && !instance->ops->sync_filesystem) goto observe;
+    kernel_vfs_mutation_lock(mount, &configuration);
+    if (instance->quiescing) { result = -KERNEL_EIO; goto observe; }
     if (instance->read_only) goto observe;
     result = snapshot_sync_nodes(instance, &snapshot);
     if (result) goto observe;
@@ -5283,7 +5302,7 @@ int kernel_vfs_sync_mount(struct kernel_vfs_mount *mount, uint64_t *observed_err
     }
     /* 捕获此前数据交接与namespace修改的durable目标一次，不等待checkpoint。 */
     if (instance->ops->sync_filesystem) {
-        int error = instance->ops->sync_filesystem(instance, root->file.private_data);
+        int error = instance->ops->sync_filesystem(mount);
         if (error && !result) result = error;
     } else if (instance->page_cache) __builtin_trap();
 observe:
@@ -5378,7 +5397,6 @@ static void sync_instances_without_array(uint64_t limit)
 }
 void kernel_vfs_sync_all(struct kernel_vfs_path *root)
 {
-    KERNEL_SERVICE_SCOPE(service);
     if (!root || !root->references) return;
     struct kernel_heap *heap=((struct kernel_vfs_instance *)root->file.mount->private_data)->heap;
     uint64_t limit=0;size_t capacity=0;
