@@ -1890,10 +1890,6 @@ test-oscomp-compat:
 test-oscomp-official:
 	python3 -B tests/oscomp/official.py
 
-.PHONY: prepare-oscomp-inputs
-prepare-oscomp-inputs:
-	python3 -B tests/oscomp/assets.py
-
 .PHONY: test-sync-host
 test-sync-host:
 	@mkdir -p build/host

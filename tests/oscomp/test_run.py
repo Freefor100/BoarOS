@@ -1,8 +1,6 @@
 """Report failures and combined scores from the real fixed upstream judge."""
 import importlib.util
 import errno
-import gzip
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -261,36 +259,26 @@ class Final2026Tests(unittest.TestCase):
         records[1]['functional_success']=True
         self.assertEqual(final2026.run_status(records),'passed')
 
-    def test_new_images_cannot_silently_select_the_legacy_run(self):
-        import subprocess
-        result=subprocess.run([sys.executable,str(HERE/'run.py'),'--images-dir','/unused'],
-                              capture_output=True,text=True)
-        self.assertEqual(result.returncode,2)
-        self.assertIn('require --profile final-2026',result.stderr)
+    def test_preliminary_images_can_be_selected_from_another_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            images = Path(temporary)
+            (images / 'sdcard-rv.img').touch()
+            inputs = runner.validate(('riscv',), images)
+            self.assertEqual(Path(inputs['images_directory']), images.resolve())
+            with self.assertRaises(FileNotFoundError):
+                runner.validate(('loongarch',), images)
 
-    def test_public_image_bytes_and_original_archive_are_preserved(self):
+    def test_final_disk_is_a_writable_copy_of_the_raw_input(self):
         import final2026
         with tempfile.TemporaryDirectory() as temporary:
-            root=Path(temporary);archive=root/'public.img.gz';target=root/'root.img'
-            data=b'public journal bytes'+bytes(1024*1024)+b'end'
-            archive.write_bytes(gzip.compress(data))
-            before=archive.read_bytes()
-            facts={'archive_sha256':hashlib.sha256(before).hexdigest(),
-                   'image_sha256':hashlib.sha256(data).hexdigest(),'image_bytes':len(data)}
-            final2026.unpack_image(archive,target,facts)
-            self.assertEqual(target.read_bytes(),data)
-            self.assertEqual(archive.read_bytes(),before)
-
-    def test_bad_image_digest_is_not_published_or_silently_repaired(self):
-        import final2026
-        with tempfile.TemporaryDirectory() as temporary:
-            root=Path(temporary);archive=root/'public.img.gz';target=root/'root.img'
-            archive.write_bytes(gzip.compress(b'bad data'))
-            facts={'archive_sha256':hashlib.sha256(archive.read_bytes()).hexdigest(),
-                   'image_sha256':'0'*64,'image_bytes':8}
-            with self.assertRaises(ValueError):final2026.unpack_image(archive,target,facts)
-            self.assertFalse(target.exists())
-            self.assertFalse(target.with_suffix('.partial').exists())
+            root = Path(temporary)
+            original, target = root / 'sdcard-rv-pub.img', root / 'root.img'
+            data = b'public journal bytes' + bytes(1024 * 1024) + b'end'
+            original.write_bytes(data)
+            final2026.copy_disk_image(original, target, sparse=True)
+            self.assertEqual(target.read_bytes(), data)
+            target.write_bytes(b'guest writes')
+            self.assertEqual(original.read_bytes(), data)
 
     def test_version_check_does_not_count_as_a_successful_build(self):
         import final2026

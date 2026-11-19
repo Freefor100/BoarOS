@@ -1,6 +1,5 @@
 """Run unchanged final-2026 public rootfs scripts and their upstream judges."""
 from datetime import datetime, timezone
-import gzip
 import hashlib
 import json
 import os
@@ -11,6 +10,7 @@ import sys
 import tempfile
 import time
 
+from local_disks import copy_disk_image
 from prepare import DEFAULT_LTP_CASE_TIMEOUT
 
 ROOT=Path(__file__).resolve().parents[2]
@@ -18,6 +18,7 @@ HERE=Path(__file__).resolve().parent
 sys.path.insert(0,str(ROOT/'tests'))
 from arch_profiles import PROFILES
 from qemu_thread_affinity import host_cpu_selection, pin_qemu_threads
+from sdcard import directory as sdcard_directory
 
 GROUPS=('cagent','buildstorm')
 TAGS={'riscv':'rv','loongarch':'la'}
@@ -26,37 +27,8 @@ def sha(path):
     with Path(path).open('rb') as stream:
         return hashlib.file_digest(stream,'sha256').hexdigest()
 
-def default_image_directory():
-    common=subprocess.check_output(['git','rev-parse','--path-format=absolute','--git-common-dir'],
-                                   cwd=ROOT,text=True).strip()
-    return Path(common).parent/'download'
-
 def save(path,value):
     path.write_text(json.dumps(value,indent=2)+'\n')
-
-def unpack_image(archive,target,facts):
-    """Verify and unpack directly into a private run disk; never repair input."""
-    if target.exists():raise FileExistsError(target)
-    if sha(archive)!=facts['archive_sha256']:raise ValueError('public archive digest differs: '+str(archive))
-    partial=target.with_suffix('.partial')
-    if partial.exists():raise FileExistsError(partial)
-    digest=hashlib.sha256();size=0
-    try:
-        with gzip.open(archive,'rb') as source,partial.open('xb') as output:
-            while block:=source.read(4*1024*1024):
-                size+=len(block)
-                if size>facts['image_bytes']:raise ValueError('public image exceeds declared size')
-                digest.update(block)
-                if block==bytes(len(block)):output.seek(len(block),1)
-                else:output.write(block)
-            output.truncate(size);output.flush();os.fsync(output.fileno())
-        if size!=facts['image_bytes'] or digest.hexdigest()!=facts['image_sha256']:
-            raise ValueError('public image digest or size differs: '+str(archive))
-        partial.chmod(0o600);partial.rename(target)
-    finally:partial.unlink(missing_ok=True)
-    return {'archive':str(archive),'archive_sha256':facts['archive_sha256'],
-            'image_sha256':digest.hexdigest(),'image_bytes':size,
-            'preparation':'verified gzip decode; no host journal replay or filesystem edits'}
 
 def functional_success(reports,groups):
     for group in groups:
@@ -77,7 +49,7 @@ def judge_reports(raw,groups,suite):
     for group in groups:
         judge=suite/'judge'/f'judge_{group}-glibc.py'
         result=subprocess.run([sys.executable,str(judge)],input=raw,text=True,capture_output=True,check=True)
-        reports[group]={'cases':json.loads(result.stdout),'notes':result.stderr,'judge_sha256':sha(judge)}
+        reports[group]={'cases':json.loads(result.stdout),'notes':result.stderr}
     return reports
 
 def build(architectures,groups,directory):
@@ -177,17 +149,20 @@ def main(args):
     if budget<0:raise ValueError('budget must be nonnegative')
     directory=(args.output or ROOT/'build'/('oscomp-final-2026-'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S'))).resolve()
     if not directory.is_relative_to(ROOT/'build'):raise ValueError('outputs must be under build/')
-    directory.mkdir(parents=True,exist_ok=False)
     suite=ROOT/'references/oscomp-testsuits'
-    manifest=json.loads((HERE/'inputs-final-2026.json').read_text())
+    for group in groups:
+        judge=suite/'judge'/f'judge_{group}-glibc.py'
+        if not judge.is_file():
+            raise FileNotFoundError(f'Use the final-2026 checkout for {judge}')
     revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=suite,text=True).strip()
-    dirty=subprocess.check_output(['git','status','--porcelain'],cwd=suite,text=True).strip()
-    if revision!=manifest['commit'] or dirty:raise ValueError('final-2026 source identity or clean worktree differs')
-    images=(args.images_dir or default_image_directory()).resolve()
-    for arch in architectures:
-        archive=images/manifest['architectures'][arch]['archive']
-        if not archive.is_file():raise FileNotFoundError(archive)
-    report={'profile':'final-2026','kind':'local-diagnostic','inputs':manifest,'selected_groups':groups,
+    if subprocess.check_output(['git','status','--porcelain','--','judge'],cwd=suite,text=True).strip():
+        raise ValueError('commit local changes to the final-2026 judges before using them')
+    images=(args.images_dir or sdcard_directory('final-2026')).resolve()
+    disks={arch:images/f'sdcard-{TAGS[arch]}-pub.img' for arch in architectures}
+    for disk in disks.values():
+        if not disk.is_file():raise FileNotFoundError(f'Extract the release disk to {disk}')
+    directory.mkdir(parents=True,exist_ok=False)
+    report={'profile':'final-2026','kind':'local-diagnostic','testsuite_commit':revision,'selected_groups':groups,
             'guest_cpus':8,'guest_memory':'8G','timeout_seconds':budget,'architectures':{},'status':'preparing',
             'kernel_commit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
             'kernel_dirty':subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True),
@@ -198,9 +173,10 @@ def main(args):
         for arch in architectures:(directory/TAGS[arch]).mkdir()
         report['build_command']=build(architectures,groups,directory)
         for arch in architectures:
-            facts=manifest['architectures'][arch];work=directory/TAGS[arch]
+            work=directory/TAGS[arch]
             print('Preparing original public disk:',arch,flush=True)
-            report['architectures'][arch]={'input':unpack_image(images/facts['archive'],work/'root.img',facts)}
+            copy_disk_image(disks[arch], work/'root.img', sparse=True)
+            report['architectures'][arch]={'root_image':str(disks[arch])}
         save(directory/'identity.json',report)
         for arch in architectures:
             report['status']='running';save(directory/'report.json',report)

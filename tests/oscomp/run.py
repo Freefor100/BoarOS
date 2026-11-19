@@ -34,21 +34,18 @@ def output(args, cwd=ROOT):
     return subprocess.check_output(args, cwd=cwd, text=True).strip()
 
 
-def validate(verify_assets=False, architectures=('riscv', 'loongarch')):
-    identity = json.loads((HERE / 'inputs.json').read_text())
-    if output(['git', 'remote', 'get-url', 'origin'], REF) != identity['autotest_url']:
-        raise RuntimeError('autotest origin differs')
-    if output(['git', 'rev-parse', 'HEAD'], REF) != identity['autotest_commit'] or output(['git', 'status', '--porcelain'], REF):
-        raise RuntimeError('autotest identity or clean worktree differs')
+def validate(architectures=('riscv', 'loongarch'), images_dir=None):
+    inputs = json.loads((HERE / 'inputs.json').read_text())
+    inputs['autotest_commit'] = output(['git', 'rev-parse', 'HEAD'], REF)
+    if output(['git', 'status', '--porcelain', '--', 'kernel'], REF):
+        raise RuntimeError('commit local changes to the evaluation framework before using it')
+    images = Path(images_dir or local_disks.sdcard_directory(inputs['release'])).resolve()
     for arch in architectures:
-        image = REF / identity['architectures'][arch]['image']
+        image = images / inputs['architectures'][arch]['image']
         if not image.is_file():
-            raise RuntimeError('release image is missing: ' + str(image))
-    if verify_assets:
-        for name, expected in identity['assets'].items():
-            if not (REF / name).is_file() or sha(REF / name) != expected:
-                raise RuntimeError('missing or altered release asset: ' + name)
-    return identity
+            raise FileNotFoundError(f'Extract the release disk to {image}')
+    inputs['images_directory'] = str(images)
+    return inputs
 
 
 class ReportJob:
@@ -281,11 +278,10 @@ def main():
     ap.add_argument('--profile', choices=('pre-20250615','final-2026'), default='pre-20250615')
     ap.add_argument('--arch', choices=tuple(ARCH_KEYS) + ('both',), default='both')
     ap.add_argument('--output', type=Path, default=None)
-    ap.add_argument('--verify-inputs', action='store_true')
     ap.add_argument('--diagnostic-timeout', type=int,
                     help='optional external time limit in seconds; final-2026 defaults to none (0)')
     ap.add_argument('--groups', choices=tuple(GROUPS) + ('all', 'benchmarks', 'environment','cagent','buildstorm'), default='all')
-    ap.add_argument('--images-dir', type=Path, help='final-2026 archives; default main worktree download/')
+    ap.add_argument('--images-dir', type=Path, help='directory with the selected profile disks; default sdcard/<profile>/')
     ap.add_argument('--host-vcpu-cpus', help='final-2026: one distinct host CPU per vCPU')
     ap.add_argument('--host-io-cpu', type=int, help='final-2026: host CPU for QEMU main/I/O')
     ap.add_argument('--keep-disks', action='store_true', help='final-2026: retain checked runtime images')
@@ -300,7 +296,7 @@ def main():
         import final2026
         return final2026.main(args)
     if args.groups in ('cagent','buildstorm'):ap.error('select --profile final-2026 for these groups')
-    if args.images_dir is not None or args.host_vcpu_cpus is not None or args.host_io_cpu is not None or args.keep_disks:
+    if args.host_vcpu_cpus is not None or args.host_io_cpu is not None or args.keep_disks:
         ap.error('these options require --profile final-2026')
     architectures = tuple(ARCH_KEYS) if args.arch == 'both' else (args.arch,)
     directory = args.output.resolve() if args.output else ROOT / 'build' / ('oscomp-diagnostic-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f'))
@@ -321,11 +317,12 @@ def main():
         'rng_added': False, 'architectures': {}, 'baseline_completed': False}
     stage = 'preparation'
     try:
-        identity = validate(args.verify_inputs, architectures)
+        identity = validate(architectures, args.images_dir)
+        images = Path(identity['images_directory'])
         config_path = REF / 'kernel/judge/config.json'
         config = json.loads(config_path.read_text())
         budget = args.diagnostic_timeout if args.diagnostic_timeout is not None else config.get('qemu.timeout', 60)
-        report.update(inputs=identity, release_assets_verified_this_run=args.verify_inputs,
+        report.update(inputs=identity,
                       config=config, config_sha256=sha(config_path), timeout_seconds=budget)
         build, environment, configs = diagnostic_build(architectures, selected, args.case_timeout, args.diagnostic_exclude)
         subprocess.run(build, cwd=ROOT, env=environment, check=True)
@@ -335,12 +332,12 @@ def main():
             facts = identity['architectures'][arch]
             kernel = target / facts['kernel']; shutil.copyfile(ROOT / facts['kernel'], kernel)
             assets = local_disks.prepare_assets(args.local_cache, arch)
-            disk, scratch = local_disks.prepare_run(REF, assets, target, arch)
+            disk, scratch = local_disks.prepare_run(images, assets, target, arch)
             qemu = args.qemu_riscv if arch == 'riscv' else args.qemu_loongarch
             executable = Path(shutil.which(qemu) or qemu).resolve(strict=True)
             base = ROOT / ('build/riscv' if arch == 'riscv' else 'build/loongarch') / 'oscomp'
             command = boot_command(arch, str(executable), kernel, disk, scratch, config)
-            entry = {'kernel_sha256': sha(kernel), 'fixture_sha256': sha(disk), 'boot_count': 1,
+            entry = {'kernel_sha256': sha(kernel), 'root_image': str(images / facts['image']), 'boot_count': 1,
                 'backing_preparation': 'written-and-synced',
                 'init_config_path': str(configs[arch]), 'init_config_sha256': sha(ROOT / configs[arch]),
                 'case_sha256': sha(base / 'case'),
@@ -348,7 +345,7 @@ def main():
                 'qemu_sha256': sha(executable), 'qemu_mode': oct(executable.stat().st_mode & 0o777),
                 'qemu_selected_path': qemu, 'qemu_resolved_path': str(executable),
                 'disk_profile': identity['local_profile']['name'],
-                'extra_disk': {'path': str(scratch), 'sha256': sha(scratch), **identity['local_disk']},
+                'extra_disk': {'path': str(scratch), **identity['local_disk']},
                 'filesystem_tools': json.loads((assets / 'identity.json').read_text())}
             entry['runtime_compatibility'] = runtime_info(base)
             for name in ('init.sh', 'ltp-hook.sh', 'libctest-hook.sh', 'ltp-case.sh', 'ltp-skips.tsv'):

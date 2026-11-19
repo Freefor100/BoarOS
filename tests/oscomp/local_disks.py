@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import shutil
 import struct
+import sys
 import subprocess
 import tarfile
 import tempfile
@@ -16,6 +17,9 @@ import zlib
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / 'tests'))
+from sdcard import directory as sdcard_directory
+
 INPUTS = json.loads((HERE / 'inputs.json').read_text())
 
 
@@ -37,9 +41,9 @@ def sync(path):
         os.fsync(stream.fileno())
 
 
-def copy_disk_image(source, destination):
-    # Allocate independent host extents and complete writes before guest timing.
-    subprocess.run(['cp', '--reflink=never', '--sparse=never', str(source), str(destination)], check=True)
+def copy_disk_image(source, destination, *, sparse=False):
+    mode = 'always' if sparse else 'never'
+    subprocess.run(['cp', '--reflink=never', f'--sparse={mode}', str(source), str(destination)], check=True)
     sync(destination)
 
 
@@ -294,9 +298,11 @@ def prepare_delivery(assets, destination, arch):
     return destination
 
 
-def prepare_run(reference, assets, destination, arch):
-    reference, assets, destination = Path(reference).resolve(), Path(assets).resolve(), Path(destination).resolve()
-    root_source = reference / INPUTS['architectures'][arch]['image']
+def prepare_run(images, assets, destination, arch):
+    images, assets, destination = Path(images).resolve(), Path(assets).resolve(), Path(destination).resolve()
+    root_source = images / INPUTS['architectures'][arch]['image']
+    if not root_source.is_file():
+        raise FileNotFoundError(root_source)
     sources = [root_source, assets / 'delivery-template.img']
     root, scratch = destination / 'root.img', destination / 'scratch.img'
     if any(path == source or (path.exists() and os.path.samefile(path, source))
@@ -325,7 +331,7 @@ def main():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument('--arch', choices=('riscv', 'loongarch'), required=True)
     parser.add_argument('--cache', type=Path, default=Path(os.environ.get('OSCOMP_LOCAL_CACHE', ROOT / 'build/tools/oscomp-local')))
-    parser.add_argument('--reference', type=Path, default=ROOT / 'references/oscomp-autotest')
+    parser.add_argument('--images-dir', type=Path, help='preliminary raw disks; default sdcard/pre-20250615/')
     parser.add_argument('--output', type=Path)
     parser.add_argument('--qemu')
     parser.add_argument('--kernel', type=Path)
@@ -344,7 +350,8 @@ def main():
         (ROOT / 'build').mkdir(exist_ok=True)
         args.output = Path(tempfile.mkdtemp(prefix='oscomp-' + args.arch + '-run.', dir=ROOT / 'build'))
     if args.output:
-        root, scratch = prepare_run(args.reference, assets, args.output, args.arch)
+        images = args.images_dir or sdcard_directory(INPUTS['release'])
+        root, scratch = prepare_run(images, assets, args.output, args.arch)
         if args.qemu:
             command = [args.qemu, '-machine', 'virt', '-m', args.memory, '-smp', '1',
                        '-kernel', str(args.kernel), '-nographic', '-no-reboot']

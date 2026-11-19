@@ -3,18 +3,23 @@
 `oscomp-compat` 在通用内核之上提供双架构评测启动配置、原程序监督和判分入口。
 发布盘、运行库及判分的已知问题见[测例问题](../learning/oscomp-test-issues.md)。
 
-## 固定输入与入口
+## 原盘和评测框架
 
-`tests/oscomp/inputs.json`固定pre-20250615原RV/LA盘和压缩包SHA-256，以及
-`references/oscomp-autotest` commit `d1bb3a3c4b27274e196a2648518525c1a304e339`。
-原盘只读保留，运行使用独立副本；`--verify-inputs`显式复查全部四个资产。
-新机器显式make prepare-oscomp-inputs恢复固定Harness及SHA绑定资产；普通运行缺失
-或身份错误直接失败，不暗中下载替代输入。gzip输入缓存位于build/tools/oscomp，
-命中核对解压内容、权限和链接，既有pruner保留该可复用工具输入。
-两套镜像自己的musl/glibc和原程序原样执行，不以本机独立验收runtime替换它们。
+两套原盘放在主工作区下被 Git 忽略的 `sdcard/`。下载入口由
+[testsuits-for-oskernel](https://github.com/oscomp/testsuits-for-oskernel) 提供。
 
-官方容器按输入清单中的镜像摘要选择。确定模拟器版本时，读取实际镜像内的可执行文件；
-同一镜像标签、Dockerfile 或宿主安装的版本均不足以标识本次运行。
+| 使用阶段 | 对应上游 | 本地解压后的文件 |
+|---|---|---|
+| 初赛 | [`pre-2025` 分支](https://github.com/oscomp/testsuits-for-oskernel/tree/pre-2025)，[`pre-20250615` 发布](https://github.com/oscomp/testsuits-for-oskernel/releases/tag/pre-20250615) | `sdcard/pre-20250615/sdcard-rv.img`、`sdcard/pre-20250615/sdcard-la.img` |
+| 决赛 | [`final-2026` 分支](https://github.com/oscomp/testsuits-for-oskernel/tree/final-2026) | `sdcard/final-2026/sdcard-rv-pub.img`、`sdcard/final-2026/sdcard-la-pub.img` |
+
+把下载的原盘解压一次即可。普通诊断从原盘建立可写运行副本。本地
+`make test-oscomp-official` 以只读方式挂载原盘，并为每个客体创建独立的
+QEMU 写时复制镜像（QEMU Copy-On-Write version 2，QCOW2）。虚拟机只写改动块，
+本地打包的启动器负责创建写入层，沿用原框架的构建、测试顺序和判分。
+
+将初赛评测框架放在 `references/oscomp-autotest/`，决赛判分仓库检出
+`final-2026` 后放在 `references/oscomp-testsuits/`。需要另选盘目录时使用 `--images-dir`。
 
 默认`make all`离线生成kernel-rv/kernel-la/disk.img/disk-la.img。RV/LA分别生成整数raw supervisor、
 init.json和头文件；`INIT_CONFIG_RV`/`INIT_CONFIG_LA`独立覆盖，显式共同
@@ -23,12 +28,8 @@ init.json和头文件；`INIT_CONFIG_RV`/`INIT_CONFIG_LA`独立覆盖，显式�
 
 ## final-2026 可选入口
 
-`final-2026` 使用公开的Debian根文件系统，运行glibc的CAgent和BuildStorm，
-与默认pre-20250615入口分开选择。输入归档名、解压后大小、SHA256、源码版本与脚本身份
-集中在 [`inputs-final-2026.json`](../../tests/oscomp/inputs-final-2026.json)。
-两份压缩包分别对应RV和LA，每台虚拟机只挂自己的一张根盘。
-默认从主工作区的`download/`读取`sdcard-rv-pub.img.gz`和`sdcard-la-pub.img.gz`；
-在兼容分支工作区运行时也使用该目录，可通过下面的参数指定其他位置。
+`final-2026` 使用公开的 Debian 根文件系统运行 CAgent 和 BuildStorm。每台虚拟机
+挂载本架构原盘的独立副本。
 
 ```sh
 make run-oscomp-final-2026 OSCOMP_FINAL_ARCH=both
@@ -38,7 +39,7 @@ python3 -B tests/oscomp/run.py --profile final-2026 --arch both \
   --host-vcpu-cpus 8,9,10,11,12,13,14,15 --host-io-cpu 0
 ```
 
-入口校验压缩包和原始镜像，直接解压成各自的运行副本，不调用宿主日志重放或修复工具。
+入口复制原盘，由客体处理盘上的日志恢复。
 内核通过 `INIT_CONFIG_RV/LA` 分别构建RV八核、LA八核版本，使用8 GiB内存；
 默认单核交付物和旧评测配置不被替换。启动使用盘内`/glibc/busybox`准备proc、sysfs、
 devpts、共享内存目录和回环接口，再用盘内bash/sh运行原脚本。
@@ -59,7 +60,8 @@ devpts、共享内存目录和回环接口，再用盘内bash/sh运行原脚本�
 
 默认 `make all` 在固定官方容器内完全离线构建两套内核和额外磁盘：RV 使用
 `disk.img`，LA 使用 `disk-la.img`。原 Harness 已支持将它们作为第二块磁盘：
-RV 先复制成 `disk-rv.img`，LA 直接使用 `disk-la.img`；QEMU 命令不增加 RNG。
+平台原流程将 RV 辅助盘复制成 `disk-rv.img`，本地容器直接使用该次构建生成的
+`disk.img`。LoongArch 使用 `disk-la.img`。
 每块盘均为 2304 MiB 的 MBR 磁盘，固定布局由 `tests/oscomp/inputs.json` 维护。
 
 | 分区 | 起点 / 容量 | 格式与用途 |
@@ -68,8 +70,7 @@ RV 先复制成 `disk-rv.img`，LA 直接使用 `disk-la.img`；QEMU 命令不�
 | `/dev/vdb2` | 129 MiB / 64 MiB | FAT32，512 字节簇，`/dev/vda2` 指向此设备 |
 | `/dev/vdb3` | 193 MiB / 2048 MiB | 4 KiB ext4，LTP 可重新格式化的 scratch |
 
-固定 e2fsprogs 源归档随仓库保存在 `third_party/sources/`，URL、版本和 SHA-256
-集中维护于输入清单。构建使用官方容器已有的 RV/LA musl 交叉编译器，生成静态
+e2fsprogs 源归档随仓库保存在 `third_party/sources/`，来源见[第三方组件](../third-party.md)。构建使用官方容器已有的 RV/LA musl 交叉编译器，生成静态
 ELF EXEC、LP64D 工具；LA LOAD 段符合 16 KiB 页对齐。宿主 `mke2fs` 和 `e2fsck`
 由同一源码构建，FAT32 由该固定容器的 dosfstools 创建。缓存位于
 `build/tools/oscomp-local/`，`OSCOMP_LOCAL_CACHE` 可另选路径；检查编译器、libc、
@@ -79,7 +80,7 @@ ELF EXEC、LP64D 工具；LA LOAD 段符合 16 KiB 页对齐。宿主 `mke2fs` �
 
 移植补丁只让 e2fsprogs 的 `is_before_linux_ver` 将 UTS version `#1 BoarOS`
 识别为未知 Linux 年代，避免把自身 release 当作旧 Linux 而生成 revision 0。
-真实 Linux 的版本判断保持；补丁及目标源码的前后 SHA-256 均在输入清单核对。
+真实 Linux 继续使用原有版本判断。
 `/bin/mke2fs`、`mkfs.ext2`、`mkfs.ext3`、`mkfs.ext4` 均链接真实上游工具，原参数
 直接传入，配置使用原版 `mke2fs.conf`。
 
@@ -163,7 +164,6 @@ LoongArch 的发布版 musl 有四个调度函数直接返回 `ENOSYS`。工具�
 ## 运行与结果判读
 
 ```sh
-make prepare-oscomp-inputs
 make all
 make test-oscomp-host
 make test-oscomp-compat

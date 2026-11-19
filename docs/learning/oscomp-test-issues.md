@@ -4,11 +4,9 @@
 再检查该步实际使用的可执行文件、运行库、参数和返回值。必要时在 Linux 上运行同一
 可执行文件和运行库，区分发布输入、内核行为与判分问题。
 
-旧盘为 pre-20250615，其中 Linux 测试项目（Linux Test Project，LTP）版本为 20240524。
-固定输入见 [旧盘清单](../../tests/oscomp/inputs.json) 和
-[final-2026 清单](../../tests/oscomp/inputs-final-2026.json)。
-现行启动和监督方式见[评测环境适配](../modules/oscomp-compat.md)。逐次执行的串口、
-耗时、原判分和输入身份保存在 `build/`。
+初赛盘为 pre-20250615，其中 Linux 测试项目（Linux Test Project，LTP）版本为 20240524。
+原盘位置、启动和监督方式见[评测环境适配](../modules/oscomp-compat.md)。
+逐次执行的串口、耗时和原判分保存在 `build/`。
 
 ## 测例启动与准备
 

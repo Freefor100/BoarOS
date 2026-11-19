@@ -1,7 +1,7 @@
 """Container submission must be a clean committed snapshot and pin its image."""
 import importlib.util
-import gzip
-import hashlib
+import ast
+import zipfile
 from pathlib import Path
 import subprocess
 import tempfile
@@ -135,21 +135,23 @@ class ContainerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), '22')
 
-    def test_gzip_cache_rejects_changed_contents_and_permissions(self):
+    def test_local_harness_stages_overlays_without_touching_the_judge(self):
         module = self.module()
-        temp = tempfile.TemporaryDirectory(); self.addCleanup(temp.cleanup)
-        root = Path(temp.name); source = root / 'disk.img'
-        source.write_bytes(b'fixed original image bytes')
-        expected = hashlib.sha256(source.read_bytes()).hexdigest()
-        cached = module.gzip_asset(source, expected, root / 'cache')
-        self.assertEqual(gzip.decompress(cached.read_bytes()), b'fixed original image bytes')
-        self.assertEqual(module.gzip_asset(source, expected, root / 'cache'), cached)
-        cached.chmod(0o600)
-        with self.assertRaisesRegex(RuntimeError, 'identity'):
-            module.gzip_asset(source, expected, root / 'cache')
-        cached.chmod(0o644); cached.write_bytes(gzip.compress(b'changed bytes'))
-        with self.assertRaisesRegex(RuntimeError, 'identity'):
-            module.gzip_asset(source, expected, root / 'cache')
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'kernel.zip'
+            module.package_harness(path)
+            with zipfile.ZipFile(path) as archive:
+                run = archive.read('run.py').decode()
+                qemu = archive.read('run_qemu.py').decode().split('def run_qemu(job,', 1)[1]
+                ast.parse(run)
+                ast.parse(archive.read('run_qemu.py'))
+                for arch in ('rv', 'la'):
+                    self.assertIn(f'/coursegrader/sdcard/sdcard-{arch}.img sdcard-{arch}.qcow2', run)
+                    self.assertIn(f'"sdcard-{arch}.qcow2", "os_serial_out_{arch}.txt"', run)
+                self.assertNotIn('.img.gz', run + qemu)
+                self.assertEqual(qemu.count('format=qcow2,id=x0'), 3)
+                self.assertIn('file=disk.img,if=none,format=raw,id=x1', qemu)
+                self.assertEqual(archive.read('postwork.py'), (module.REF / 'kernel/postwork.py').read_bytes())
 
 
 if __name__ == '__main__':

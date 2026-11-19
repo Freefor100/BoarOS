@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Run the unchanged fixed Docker Harness against a clean committed snapshot."""
+"""Run the official Docker framework with local copy-on-write root disks."""
 import argparse
 from datetime import datetime, timezone
-import gzip
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -16,7 +16,10 @@ import tarfile
 import time
 import zipfile
 
-import run as local
+# The upstream framework also ships a run.py. Load the local runner by path.
+local_spec = importlib.util.spec_from_file_location('boaros_oscomp_runner', Path(__file__).with_name('run.py'))
+local = importlib.util.module_from_spec(local_spec)
+local_spec.loader.exec_module(local)
 
 ROOT, HERE, REF = local.ROOT, local.HERE, local.REF
 
@@ -42,28 +45,38 @@ def snapshot_source(repository, destination):
     return identity
 
 
-def gzip_asset(source, expected, cache):
-    cache.mkdir(parents=True, exist_ok=True)
-    target = cache / (source.name + '.gz')
-    if target.exists():
-        digest = hashlib.sha256()
-        with gzip.open(target, 'rb') as stream:
-            for block in iter(lambda: stream.read(1024 * 1024), b''): digest.update(block)
-        if digest.hexdigest() != expected or target.is_symlink() or target.stat().st_mode & 0o777 != 0o644:
-            raise RuntimeError('compressed cache identity differs: ' + str(target))
-        return target
-    temporary = target.with_suffix('.tmp')
-    digest = hashlib.sha256()
-    try:
-        with source.open('rb') as stream, temporary.open('wb') as output:
-            with gzip.GzipFile(filename='', mode='wb', fileobj=output, compresslevel=1, mtime=0) as compressed:
-                for block in iter(lambda: stream.read(1024 * 1024), b''):
-                    digest.update(block); compressed.write(block)
-        if digest.hexdigest() != expected: raise RuntimeError('original release content differs')
-        temporary.chmod(0o644); temporary.replace(target)
-    finally:
-        temporary.unlink(missing_ok=True)
-    return target
+def package_harness(destination):
+    files = local.output(['git', 'ls-files', 'kernel'], REF).splitlines()
+    with zipfile.ZipFile(destination, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+        for file in files:
+            name = str(Path(file).relative_to('kernel'))
+            if name.endswith('.pyc'):
+                continue
+            if name not in ('run.py', 'run_qemu.py'):
+                archive.write(REF / file, name)
+                continue
+            source = (REF / file).read_text()
+            if name == 'run.py':
+                for arch in ('rv', 'la'):
+                    original = f'''logexec(f"cp {{config['testcase_dir']}}/sdcard-{arch}.img.gz sdcard-{arch}.img.gz")'''
+                    overlay = f'qemu-img create -q -f qcow2 -F raw -b /coursegrader/sdcard/sdcard-{arch}.img sdcard-{arch}.qcow2'
+                    if original not in source:
+                        raise RuntimeError(f'Upstream root disk setup changed: {arch}')
+                    source = source.replace(original, f'logexec("{overlay}")')
+                    source = source.replace(f'"sdcard-{arch}.img", "os_serial_out_{arch}.txt"',
+                                            f'"sdcard-{arch}.qcow2", "os_serial_out_{arch}.txt"')
+            else:
+                for command in ('    subprocess.check_output("gzip -d sdcard-rv.img.gz", shell=True)\n',
+                                '    subprocess.run("gzip -df sdcard-la.img.gz", shell=True)\n'):
+                    if command not in source:
+                        raise RuntimeError('Upstream root disk decompression changed')
+                    source = source.replace(command, '')
+                before, active = source.split('def run_qemu(job,', 1)
+                active = active.replace('file={fs},if=none,format=raw,id=x0', 'file={fs},if=none,format=qcow2,id=x0')
+                active = active.replace('        os.system("cp disk.img disk-rv.img")\n', '')
+                active = active.replace('file=disk-rv.img,if=none', 'file=disk.img,if=none')
+                source = before + 'def run_qemu(job,' + active
+            archive.writestr(name, source)
 
 
 def capture_container_identity(reference, directory):
@@ -219,7 +232,6 @@ def collect_results(directory, report):
     (directory / 'original-job.json').write_text(json.dumps(original, indent=2) + '\n')
     failure = harness_error_stage(original)
     if failure: raise RuntimeError('original Harness returned ' + original['verdict'])
-    local.validate(False)
     lifecycle = json.loads((directory / 'lifecycle.json').read_text()) if (directory / 'lifecycle.json').is_file() else {}
     if lifecycle and (lifecycle.get('reference') != report['container']['reference'] or
                       lifecycle.get('source_commit') != report['source']['commit']):
@@ -281,11 +293,12 @@ def collect_results(directory, report):
 def main():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--images-dir', type=Path, help='preliminary raw disks; default sdcard/pre-20250615/')
     parser.add_argument('--observe-only', type=Path, help='read only the owned running container lifecycle')
     parser.add_argument('--collect-existing', type=Path, help='reclassify one completed original run without booting again')
     args = parser.parse_args()
     if args.observe_only or args.collect_existing:
-        if args.output or (args.observe_only and args.collect_existing): parser.error('choose one operation')
+        if args.output or args.images_dir or (args.observe_only and args.collect_existing): parser.error('choose one operation')
         directory = (args.observe_only or args.collect_existing).resolve()
         if not directory.is_relative_to(ROOT / 'build') or not (directory / 'identity.json').is_file():
             parser.error('existing run must have its frozen identity under build/')
@@ -305,7 +318,7 @@ def main():
     if directory.exists() or not directory.is_relative_to(ROOT / 'build'):
         parser.error('output must be a new directory under build/')
     directory.mkdir(parents=True)
-    report = {'kind': 'official-container-supervised-compatibility', 'started_utc': datetime.now(timezone.utc).isoformat(),
+    report = {'kind': 'official-container-local-root-overlays', 'started_utc': datetime.now(timezone.utc).isoformat(),
         'baseline_established': False, 'program_matrix_passed': False,
         'supervision': {'case_timeout_seconds': local.DEFAULT_LTP_CASE_TIMEOUT, 'term_grace_seconds': 2,
                         'skip_table_sha256': local.sha(HERE / 'ltp-skips.tsv'), 'diagnostic_exclusions': []},
@@ -314,7 +327,7 @@ def main():
     stage = 'preparation'; name = 'boaros-oscomp-' + directory.name.removeprefix('oscomp-official-')
     reference = None; observer = None
     try:
-        identity = local.validate(True)
+        identity = local.validate(images_dir=args.images_dir)
         report['inputs'] = identity
         reference = require_digest(identity['container']['reference'])
         submit = directory / 'submit'
@@ -325,17 +338,10 @@ def main():
         config = json.loads((data / 'config.json').read_text())
         if (config.get('qemu.smp'), config.get('qemu.mem'), config.get('qemu.timeout')) != (1, '1G', 3600):
             raise RuntimeError('fixed official CPU/RAM/budget configuration differs')
-        cache = ROOT / 'build/tools/oscomp'
-        for arch in ('rv', 'la'):
-            asset = 'sdcard-' + arch + '.img'
-            compressed = gzip_asset(REF / asset, identity['assets'][asset], cache)
-            subprocess.run(['cp', '--reflink=auto', str(compressed), str(data / compressed.name)], check=True)
+        images = Path(identity['images_directory'])
         cg = directory / 'cg'; cg.mkdir()
         harness = cg / 'kernel.zip'
-        files = local.output(['git', 'ls-files', 'kernel'], REF).splitlines()
-        with zipfile.ZipFile(harness, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
-            for file in files:
-                archive.write(REF / file, str(Path(file).relative_to('kernel')))
+        package_harness(harness)
         report.update(harness_zip_sha256=local.sha(harness), config=config,
                       config_sha256=local.sha(data / 'config.json'))
         hooks = directory / 'hooks'; hooks.mkdir()
@@ -343,11 +349,14 @@ def main():
         command = ['docker', 'run', '--rm', '--name', name, '--cidfile', str(directory / 'container.cid'), '--network', 'none',
             '-v', str(submit) + ':/coursegrader/submit', '-v', str(data) + ':/coursegrader/testdata',
             '-v', str(cg) + ':/cg:ro', '-v', str(hooks) + ':/mnt/cghook']
+        for arch in identity['architectures'].values():
+            image = images / arch['image']
+            command += ['-v', f'{image.resolve()}:/coursegrader/sdcard/{image.name}:ro']
         for key, value in build_env.items(): command += ['-e', key + '=' + value]
         command += [reference, 'python3', '/cg/kernel.zip']
         report.update(container_command=command, build_environment=build_env)
         (directory / 'identity.json').write_text(json.dumps(report, indent=2) + '\n')
-        print('Running unchanged Docker Harness; supervised compatibility baseline:', directory, flush=True)
+        print('Running official Docker framework with local root disk overlays:', directory, flush=True)
         stage = 'official-harness'
         observer_log = (directory / 'observer.log').open('wb')
         observer = subprocess.Popen([sys.executable, '-B', str(HERE / 'official.py'), '--observe-only', str(directory)],

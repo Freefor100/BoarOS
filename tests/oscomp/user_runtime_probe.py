@@ -186,7 +186,7 @@ def main():
     report={'kind':'repaired-user-runtime-diagnostic','official':False,
             'kernel_commit':scoring.output(['git','rev-parse','HEAD']),
             'kernel_dirty':scoring.output(['git','status','--porcelain']),
-            'source_inputs':scoring.validate(False,names),'release_assets_verified_this_run':False,
+            'source_inputs':scoring.validate(names),
             'architectures':{},'complete':False}
     report['diagnostic_sources']={str(path.relative_to(ROOT)):digest(path) for path in
         [Path(__file__),HERE/'sched_compat.c',HERE/'sched_compat_probe.c',HERE/'user_runtime_driver.c',
