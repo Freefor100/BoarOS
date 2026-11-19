@@ -1727,7 +1727,9 @@ static void group_source_budget(struct ext4_fs *fs, bool failed)
      * Aborting a private operation must leave the accepted blocks readable. */
     CHECK(jbd_journal_new_trans(journal, &operation) == EOK); CHECK(operation);
     CHECK(jbd_trans_write_data(operation,homes[0],0,page.bytes,block,false,&source)==EOK);
+    CHECK(journal->ordered_trees==2);
     jbd_journal_free_trans(journal,operation,true);
+    CHECK(journal->ordered_trees==1);
     for (unsigned i=1;i<3;i++) {
         CHECK(jbd_journal_new_trans(journal, &operation) == EOK); CHECK(operation);
         CHECK(jbd_trans_write_data(operation,homes[i],0,page.bytes+i*block,block,false,&source)==EOK);
@@ -1775,6 +1777,8 @@ static void group_data_error(struct ext4_fs *fs, bool fail_flush)
         owned_page_release(&pages[i]);
         if (i<2) CHECK(jbd_journal_freeze(journal)==EOK);
         if (!i) CHECK(jbd_journal_select(journal) && journal->committing);
+        /* The fourth operation joins the third tree in the running group. */
+        CHECK(journal->ordered_trees==(i<3 ? i+1 : 3));
     }
     CHECK(journal->running && journal->sealed_count==1 && journal->committing);
     if (fail_flush) disk.fail_flush=disk.flushes+1;

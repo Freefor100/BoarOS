@@ -233,12 +233,17 @@ static enum arch_mmu_status walk_leaf(const struct arch_mmu_user_space *space,
         current = table(s, *entry);
     }
 }
-enum arch_mmu_status arch_mmu_user_leaf_snapshot(const struct arch_mmu_user_space *s,
-    uint64_t v, struct kernel_mm_leaf *out)
+enum arch_mmu_status arch_mmu_user_leaf_probe(const struct arch_mmu_user_space *s,
+    uint64_t v, struct kernel_mm_leaf *out, unsigned *missing_tables)
 {
     if (!out) return ARCH_MMU_STATUS_INVALID;
     uint64_t *slot; uint32_t order;
     enum arch_mmu_status status = walk_leaf(s, v, &slot, &order);
+    if (missing_tables) {
+        if (status==ARCH_MMU_STATUS_NOT_MAPPED)
+            *missing_tables=order==2*HUGE_ORDER ? 3 : order==HUGE_ORDER ? 2 : 0;
+        else if (status==ARCH_MMU_STATUS_OK) *missing_tables=0;
+    }
     if (status) return status;
     *out = (struct kernel_mm_leaf){
         .virtual_address = v & ~(leaf_size(order) - 1),
@@ -247,6 +252,10 @@ enum arch_mmu_status arch_mmu_user_leaf_snapshot(const struct arch_mmu_user_spac
         .cow = !!(*slot & PTE_COW)};
     return ARCH_MMU_STATUS_OK;
 }
+
+enum arch_mmu_status arch_mmu_user_leaf_snapshot(const struct arch_mmu_user_space *s,
+    uint64_t v, struct kernel_mm_leaf *out)
+{ return arch_mmu_user_leaf_probe(s,v,out,NULL); }
 
 enum arch_mmu_status arch_mmu_user_empty_window(const struct arch_mmu_user_space *s,
     uint64_t address, unsigned count, unsigned *empty)
@@ -303,8 +312,7 @@ static enum arch_mmu_status install_prepared_leaf(struct arch_mmu_user_space *s,
         return ARCH_MMU_STATUS_NEED_TABLES;
     }
     if (!middle_address) return ARCH_MMU_STATUS_INVALID;
-    uint32_t actual;
-    if ((missing & 1) && (physical_page_allocation_order(s->allocator, middle_address, &actual) || actual))
+    if ((missing & 1) && !physical_page_owned_order(s->allocator, middle_address, 0))
         return ARCH_MMU_STATUS_INVALID;
     uint64_t *middle = table(s, middle_address), *slot;
     uint64_t leaf_address = 0;
@@ -319,7 +327,7 @@ static enum arch_mmu_status install_prepared_leaf(struct arch_mmu_user_space *s,
         }
         if (!leaf_address || leaf_address == middle_address)
             return ARCH_MMU_STATUS_INVALID;
-        if ((missing & 2) && (physical_page_allocation_order(s->allocator, leaf_address, &actual) || actual))
+        if ((missing & 2) && !physical_page_owned_order(s->allocator, leaf_address, 0))
             return ARCH_MMU_STATUS_INVALID;
         slot = &table(s, leaf_address)[(v >> 14) & (ENTRIES - 1)];
     }
@@ -348,8 +356,8 @@ enum arch_mmu_status arch_mmu_user_map_prepared_order(struct arch_mmu_user_space
 {
     if (!live(s) || !supported_order(order) || (permissions & ~7U) || !physical ||
         physical > PTE_ADDRESS || (physical & (leaf_size(order) - 1))) return ARCH_MMU_STATUS_INVALID;
-    uint32_t actual, pages = 1U << order;
-    if (physical_page_allocation_order(s->allocator, physical, &actual) || actual != order)
+    uint32_t pages = 1U << order;
+    if (!physical_page_owned_order(s->allocator, physical, order))
         return ARCH_MMU_STATUS_INVALID;
     if ((permissions ? s->leaf_pages : s->protected_pages) > UINT32_MAX - pages ||
         (cow && s->cow_pages > UINT32_MAX - pages)) return ARCH_MMU_STATUS_STATE;
@@ -406,13 +414,15 @@ enum arch_mmu_status arch_mmu_user_cow_commit_order(struct arch_mmu_user_space *
     if (actual_order != order) return ARCH_MMU_STATUS_INVALID;
     if (actual != cookie) return ARCH_MMU_STATUS_CONFLICT;
     if (!(actual & PTE_COW)) return ARCH_MMU_STATUS_NOT_MAPPED;
-    uint32_t pages = 1U << order, references;
+    uint32_t pages = 1U << order;
     if (s->cow_pages < pages) return ARCH_MMU_STATUS_STATE;
-    if (physical_page_reference_count(s->allocator, physical, &references)) return ARCH_MMU_STATUS_STATE;
-    if (replacement == KERNEL_MM_NO_PAGE && references != 1) return ARCH_MMU_STATUS_CONFLICT;
-    if (replacement != KERNEL_MM_NO_PAGE &&
-        (physical_page_allocation_order(s->allocator, replacement, &actual_order) || actual_order != order))
+    if (replacement == KERNEL_MM_NO_PAGE) {
+        uint32_t references;
+        if (physical_page_reference_count(s->allocator, physical, &references)) return ARCH_MMU_STATUS_STATE;
+        if (references != 1) return ARCH_MMU_STATUS_CONFLICT;
+    } else if (!physical_page_owned_order(s->allocator, replacement, order)) {
         return ARCH_MMU_STATUS_INVALID;
+    }
     if ((actual & PTE_NONE) && permissions) {
         if (s->protected_pages < pages || s->leaf_pages > UINT32_MAX-pages) return ARCH_MMU_STATUS_STATE;
         s->protected_pages -= pages; s->leaf_pages += pages;
@@ -479,18 +489,101 @@ enum arch_mmu_status arch_mmu_user_owned_snapshot(struct arch_mmu_user_space *s,
     return ARCH_MMU_STATUS_OK;
 }
 
-enum arch_mmu_status arch_mmu_user_mark_cow_page(struct arch_mmu_user_space *s, uint64_t v)
+static enum arch_mmu_status mark_cow_leaf(struct arch_mmu_user_space *s,
+    uint64_t *slot, uint32_t order)
 {
-    uint64_t *slot; uint32_t order;
-    enum arch_mmu_status status = walk_leaf(s, v, &slot, &order);
-    if (status) return status;
-    if (v & (leaf_size(order)-1)) return ARCH_MMU_STATUS_INVALID;
     if (*slot & PTE_COW) return ARCH_MMU_STATUS_OK;
     uint32_t pages = 1U << order;
     if (s->cow_pages > UINT32_MAX-pages) return ARCH_MMU_STATUS_STATE;
     __atomic_store_n(slot, (*slot | PTE_COW) & ~PTE_DIRTY, __ATOMIC_RELEASE);
     s->cow_pages += pages; return ARCH_MMU_STATUS_OK;
 }
+
+enum arch_mmu_status arch_mmu_user_mark_cow_page(struct arch_mmu_user_space *s, uint64_t v)
+{
+    uint64_t *slot; uint32_t order;
+    enum arch_mmu_status status = walk_leaf(s, v, &slot, &order);
+    if (status) return status;
+    if (v & (leaf_size(order)-1)) return ARCH_MMU_STATUS_INVALID;
+    return mark_cow_leaf(s, slot, order);
+}
+
+/* The child tree is still private. Bound both table walks and permission
+ * writes per MM metadata critical section, even if the leaf table is dense. */
+enum arch_mmu_status arch_mmu_user_fork_commit_window(
+    struct arch_mmu_user_space *parent, const struct arch_mmu_user_space *child,
+    uint64_t first, uint64_t *next, int (*policy)(void *, uint64_t), void *context,
+    int *changed)
+{
+    uint64_t *child_slot, *parent_slot = NULL;
+    uint32_t child_order, parent_order = 0;
+    enum arch_mmu_status result = walk_leaf(child, first, &child_slot, &child_order);
+    if (result) return result;
+    unsigned count = 1;
+    uint64_t stride = BOAROS_PAGE_SIZE;
+    if (child_order) stride = ARCH_MMU_HUGE_SIZE;
+    else {
+        count = (ARCH_MMU_HUGE_SIZE - (first & (ARCH_MMU_HUGE_SIZE-1))) / BOAROS_PAGE_SIZE;
+        if (count > 16) count = 16;
+    }
+    for (unsigned i = 0; i < count; i++) {
+        uint64_t entry = child_slot[i], address = first + i * stride;
+        if (!entry) continue;
+        if (!((entry & PTE_PRESENT) && (child_order || !(entry & PTE_HUGE)))) return ARCH_MMU_STATUS_STATE;
+        if (policy && policy(context, address) != ARCH_MMU_FORK_PRIVATE) continue;
+        if (!parent_slot) {
+            result = walk_leaf(parent, address, &parent_slot, &parent_order);
+            if (result || parent_order != child_order) return ARCH_MMU_STATUS_STATE;
+            parent_slot -= i;
+        }
+        uint64_t *slot = parent_slot + i;
+        if (!((*slot & PTE_PRESENT) && (parent_order || !(*slot & PTE_HUGE))) ||
+            (*slot & PTE_ADDRESS) != (entry & PTE_ADDRESS))
+            return ARCH_MMU_STATUS_STATE;
+        if (!(*slot & PTE_COW)) {
+            result = mark_cow_leaf(parent, slot, parent_order);
+            if (result) return result;
+            *changed = 1;
+        }
+    }
+    *next = first + count * stride;
+    return ARCH_MMU_STATUS_OK;
+}
+
+unsigned arch_mmu_user_map_owned_window(struct arch_mmu_user_space *s, uint64_t address,
+    unsigned pages, const uint64_t *physical, uint32_t permissions)
+{
+    if (!pages) return 0;
+    unsigned slots = (ARCH_MMU_HUGE_SIZE - (address & (ARCH_MMU_HUGE_SIZE-1))) / BOAROS_PAGE_SIZE;
+    if ((address & BOAROS_PAGE_MASK) || address < BOAROS_PAGE_SIZE ||
+        (slots < 32 && (pages >> slots)))
+        __builtin_trap();
+    uint64_t *slot;
+    uint32_t order;
+    enum arch_mmu_status result = walk_leaf(s, address, &slot, &order);
+    if (result && result != ARCH_MMU_STATUS_NOT_MAPPED) __builtin_trap();
+    if (order) return 0;
+    unsigned installed = 0, count = 0;
+    for (unsigned index = 0; pages; pages >>= 1, index++) {
+        if (!(pages & 1)) continue;
+        uint64_t p = *physical++;
+        if (slot[index]) continue;
+        if ((p & BOAROS_PAGE_MASK) || !p || p > PTE_ADDRESS || (permissions & ~7U))
+            __builtin_trap();
+        if ((permissions ? s->leaf_pages : s->protected_pages) >= UINT32_MAX-count ||
+            s->cow_pages >= UINT32_MAX-count) __builtin_trap();
+        uint64_t entry = encode(p, permissions, 1);
+        __atomic_store_n(&slot[index], entry, __ATOMIC_RELEASE);
+        installed |= 1U << index;
+        count++;
+    }
+    if (permissions) s->leaf_pages += count;
+    else s->protected_pages += count;
+    s->cow_pages += count;
+    resident_peak(s);
+    return installed;
+}
+
 enum arch_mmu_status arch_mmu_user_space_init(struct arch_mmu_user_space *s,
     struct physical_page_allocator *a, const struct arch_mmu_page_table *kernel)
 {
@@ -581,11 +674,13 @@ enum arch_mmu_status arch_mmu_user_detach_range(
 {
     if (!s || s->state != ARCH_MMU_USER_SPACE_LIVE || !cursor || !batch || start>end ||
         end>ARCH_MMU_USER_LIMIT || ((start|end)&BOAROS_PAGE_MASK)) return ARCH_MMU_STATUS_INVALID;
-    enum arch_mmu_status checked = whole_leaf_range(s, start, end);
-    if (checked) return checked;
     const uint64_t leaf_span=UINT64_C(1)<<25, middle_span=UINT64_C(1)<<36;
     if (cursor->phase==3 || start==end) return ARCH_MMU_STATUS_NOT_MAPPED;
-    if (!cursor->phase) { cursor->address=start; cursor->phase=1; }
+    if (!cursor->phase) {
+        enum arch_mmu_status checked = whole_leaf_range(s, start, end);
+        if (checked) return checked;
+        cursor->address=start; cursor->phase=1;
+    }
     /* MM metadata protection keeps these table pages owned for this call;
      * detached pages are not released until after the caller drops it. */
     uint64_t *root=table(s,s->root_address), *middle=0, *leaves=0;
@@ -631,7 +726,8 @@ enum arch_mmu_status arch_mmu_user_detach_range(
         } else if (middle[m] & PTE_HUGE) {
             uint64_t old = middle[m], physical = old & PTE_ADDRESS;
             unsigned pages = 1U << HUGE_ORDER;
-            if (!(old & PTE_PRESENT) || (physical & (HUGE_SIZE-1)) ||
+            if ((address & (HUGE_SIZE-1)) || end-address<HUGE_SIZE ||
+                !(old & PTE_PRESENT) || (physical & (HUGE_SIZE-1)) ||
                 ((old & PTE_NONE) ? s->protected_pages : s->leaf_pages) < pages ||
                 ((old & PTE_COW) && s->cow_pages < pages)) return ARCH_MMU_STATUS_STATE;
             if (before_detach) before_detach(owner, address, physical);

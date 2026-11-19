@@ -1284,7 +1284,7 @@ static enum dtb_status read_cpu_info(const void *dtb,uint64_t boot_hart,
     struct cpu_node {
         uint32_t address_cells, seen;
         const unsigned char *reg, *isa, *extensions;
-        uint32_t reg_length, isa_length, extensions_length;
+        uint32_t reg_length, isa_length, extensions_length, cboz_bytes;
         unsigned enabled, cpus, cpu, cpu_named;
     } stack[DTB_DISCOVERY_MAX_DEPTH];
     struct dtb_cpu_info result = {0};
@@ -1342,6 +1342,10 @@ static enum dtb_status read_cpu_info(const void *dtb,uint64_t boot_hart,
                 bit=16;node->isa=value;node->isa_length=len;
             } else if (bytes_equal_string(name,nl,"riscv,isa-extensions")) {
                 bit=32;node->extensions=value;node->extensions_length=len;
+            } else if (depth == 3 && stack[1].cpus &&
+                       bytes_equal_string(name,nl,"riscv,cboz-block-size")) {
+                bit = 64;
+                if (len == 4) node->cboz_bytes = read_be32(value);
             }
             if (bit && (node->seen & bit)) return DTB_STATUS_INVALID;
             node->seen |= bit;
@@ -1354,12 +1358,15 @@ static enum dtb_status read_cpu_info(const void *dtb,uint64_t boot_hart,
                     node->reg_length != ac * 4) return DTB_STATUS_INVALID;
                 uint64_t hart = read_cells(node->reg, ac);
                 if (!boot_only || hart==boot_hart) {
-                    int supported=0, vector=0;
+                    int supported=0, vector=0, zicboz=0;
                     if (node->extensions) {
                         if (!string_list_contains(node->extensions,node->extensions_length,
                                 "svvptc",&supported) ||
                             !string_list_contains(node->extensions,node->extensions_length,
-                                "v",&vector)) return DTB_STATUS_INVALID;
+                                "v",&vector) ||
+                            (node->cboz_bytes == 64 &&
+                             !string_list_contains(node->extensions, node->extensions_length,
+                                 "zicboz", &zicboz))) return DTB_STATUS_INVALID;
                     } else if (node->isa) {
                         if (!property_value_is_one_string(node->isa,node->isa_length))
                             return DTB_STATUS_INVALID;
@@ -1367,7 +1374,7 @@ static enum dtb_status read_cpu_info(const void *dtb,uint64_t boot_hart,
                         vector=isa_has_extension(node->isa,node->isa_length-1,1);
                     }
                     uint32_t features=(supported?DTB_CPU_MMU_SVVPTC:0) |
-                        (vector?DTB_CPU_ISA_V:0);
+                        (vector?DTB_CPU_ISA_V:0) | (zicboz?DTB_CPU_ZICBOZ_64:0);
                     for (uint32_t i=0;i<result.count;i++)
                         if (result.hart_ids[i]==hart) return DTB_STATUS_INVALID;
                     if (result.count==DTB_MAX_CPUS) return DTB_STATUS_UNSUPPORTED;

@@ -417,9 +417,7 @@ enum kernel_mm_status kernel_scheduler_resolve_current_user_fault(
         current->arch.user_mode != 1U) {
         return KERNEL_MM_STATUS_STATE;
     }
-    return kernel_mm_resolve_user_fault(&current->mm,
-                                        virtual_address,
-                                        access);
+    return kernel_mm_resolve_owned_user_fault(&current->mm,current,virtual_address,access);
 }
 
 static enum kernel_scheduler_status validate_child_endpoints(

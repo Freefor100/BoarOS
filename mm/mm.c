@@ -143,6 +143,11 @@ struct kernel_mm_record {
     struct kernel_rwlock vma_lock;
     struct kernel_wait_queue range_changed;
     struct kernel_mm_range_claim *range_claims;
+    uint64_t range_edit_generation;
+#if !defined(BOAROS_ARCH_LOONGARCH)
+    uint64_t last_anonymous_write;
+    int anonymous_write_direction;
+#endif
     struct kernel_wait_queue pins_changed;
     uint32_t active_cpus, pending_retirement,borrowed_cpus;
     uint64_t tlb_generation, instruction_generation;
@@ -172,7 +177,7 @@ struct kernel_mm_record {
     struct mm_file_mapping *retired_file_mappings;
     struct mm_file_resident *file_residents;
     struct mm_file_resident *retired_file_residents;
-    uint64_t cache_gate_generation;
+    uint64_t cache_gate_progress; /* Release generation, with low bit set for queued retries. */
     struct mm_file_resident *cache_retry_head;
     uint64_t resident_probes;
     struct mm_file_resident **resident_buckets;
@@ -508,6 +513,18 @@ static void finish_handle(struct kernel_mm *mm, enum kernel_mm_state state)
 
 static void clear_page(void *pointer)
 {
+#if defined(__riscv)
+    if (riscv_mmu_cboz64 && !((uintptr_t)pointer & 63)) {
+        /* Only a common, explicitly advertised 64-byte granule enables
+         * block zeroing. These are complete blocks inside the owned page. */
+        for (size_t offset = 0; offset < BOAROS_PAGE_SIZE; offset += 64) {
+            void *block = (unsigned char *)pointer + offset;
+            __asm__ volatile(".option push\n.option arch,+zicboz\ncbo.zero (%0)\n.option pop"
+                : : "r"(block) : "memory");
+        }
+        return;
+    }
+#endif
     memset(pointer, 0, BOAROS_PAGE_SIZE);
 }
 
@@ -765,19 +782,27 @@ static void publish_file_resident(struct kernel_mm_record *record,
     record->file_residents = page;
 }
 
-/* 只遍历真实登记的重试借用，不扫描MM/来源；gate释放后通知缓存。 */
+#define MM_CACHE_RETRY_QUEUED UINT64_C(1)
+#define MM_CACHE_GATE_STEP UINT64_C(2)
+
+/* Gate release and retry registration share a single atomic word. Only a
+ * release that observes registered work needs the short metadata guard. */
 static void mm_gate_release(struct kernel_mm_record *record,struct kernel_lock_guard *guard)
 {
     if (!guard->lock) return;
     int indexed = record->resident_capacity != 0;
     kernel_lock_release(guard);
     if (!indexed) return;
+    uint64_t progress = __atomic_fetch_add(&record->cache_gate_progress,
+        MM_CACHE_GATE_STEP, __ATOMIC_ACQ_REL);
+    if (progress > UINT64_MAX - MM_CACHE_GATE_STEP) __builtin_trap();
+    if (!(progress & MM_CACHE_RETRY_QUEUED)) return;
     struct mm_file_resident *pending;
     {
         KERNEL_RAW_WRITE_SCOPE(metadata, &record->metadata);
-        if (record->cache_gate_generation==UINT64_MAX) __builtin_trap();
-        record->cache_gate_generation++;
         pending=record->cache_retry_head; record->cache_retry_head=0;
+        __atomic_fetch_and(&record->cache_gate_progress, ~MM_CACHE_RETRY_QUEUED,
+            __ATOMIC_RELAXED);
     }
     while (pending) {
         struct mm_file_resident *page=pending;
@@ -801,8 +826,11 @@ static void defer_cache_rearm(struct mm_file_resident *page,uint64_t generation)
     int queued=0;
     {
         KERNEL_RAW_WRITE_SCOPE(metadata, &record->metadata);
+        uint64_t expected = __atomic_load_n(&record->cache_gate_progress, __ATOMIC_RELAXED);
         if (record->stage==KERNEL_MM_RECORD_LIVE && kernel_page_cache_alias_active(&page->alias) &&
-            generation==record->cache_gate_generation && !page->cache_retry_registered) {
+            generation==(expected & ~MM_CACHE_RETRY_QUEUED) && !page->cache_retry_registered &&
+            __atomic_compare_exchange_n(&record->cache_gate_progress, &expected,
+                expected | MM_CACHE_RETRY_QUEUED, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
             page->cache_retry_registered=1; page->cache_retry_next=record->cache_retry_head;
             record->cache_retry_head=page; queued=1;
         }
@@ -850,10 +878,20 @@ static void unindex_file_resident(struct kernel_mm_record *record,
 static void forget_file_residents(struct kernel_mm_record *record)
 {
     while (record->file_residents) {
-        struct mm_file_resident *page = record->file_residents;
-        { KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
-          unindex_file_resident(record, page); }
-        retire_file_resident(record, page);
+        struct mm_file_resident *detached[KERNEL_MM_RETIRE_CAPACITY];
+        unsigned count = 0;
+        {
+            KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
+            while (record->file_residents && count < KERNEL_MM_RETIRE_CAPACITY) {
+                struct mm_file_resident *page = record->file_residents;
+                unindex_file_resident(record, page);
+                detached[count++] = page;
+            }
+        }
+        /* Cache detachment and any final reference release stay outside MM
+         * metadata. Pending alias borrowers still own their callbacks. */
+        for (unsigned i = 0; i < count; ++i)
+            retire_file_resident(record, detached[i]);
     }
 }
 
@@ -864,8 +902,8 @@ static int rearm_shared_file_alias(void *owner, uint64_t address)
     struct mm_gate_scope operation __attribute__((cleanup(mm_gate_scope_end)))={.record=record};
     if (!kernel_lock_held(&record->operations,1)) {
         int background=kernel_io_context_current()->background_reclaim;
-        uint64_t generation;
-        { KERNEL_RAW_WRITE_SCOPE(metadata, &record->metadata); generation=record->cache_gate_generation; }
+        uint64_t generation = __atomic_load_n(&record->cache_gate_progress, __ATOMIC_ACQUIRE) &
+            ~MM_CACHE_RETRY_QUEUED;
         if (background || kernel_io_context_current()->user_pins) {
             if (!kernel_rwlock_try_write(&record->operations,&operation.guard)) {
                 if (background) defer_cache_rearm(page,generation);
@@ -1051,12 +1089,10 @@ static void drain_file_registrations(struct kernel_mm_record *record,
         int used = 0;
         for (struct kernel_mm_file_source *source = record->file_sources;
              unused_only && source != 0; source = source->next) {
-            if (kernel_open_file_node(source->file) != entry->registration.node)
-                continue;
-            if (kernel_vma_set_backing_in_use(record->vmas, source->file,
-                                               &used) != KERNEL_VMA_STATUS_OK)
-                __builtin_trap();
-            if (used) break;
+            if (kernel_open_file_node(source->file) == entry->registration.node) {
+                used = 1;
+                break;
+            }
         }
         if (used) {
             link = &entry->next;
@@ -1123,9 +1159,8 @@ static enum kernel_mm_status drain_file_sources(
     int unused_only)
 {
     struct kernel_mm_file_source **link = &record->file_sources;
-    int invalid=0,defer=kernel_lock_held(&record->operations,1);
-
-    drain_file_registrations(record, unused_only);
+    if (unused_only && !record->vmas) return KERNEL_MM_STATUS_STATE;
+    int defer = kernel_lock_held(&record->operations, 1);
 
     while (*link != 0) {
         struct kernel_mm_file_source *source = *link;
@@ -1133,15 +1168,9 @@ static enum kernel_mm_status drain_file_sources(
 
         if (!unused_only && source->operations) __builtin_trap();
         if (source->file != 0) {
-            if (unused_only != 0) {
-                if (record->vmas == 0 ||
-                    kernel_vma_set_backing_in_use(record->vmas,
-                                                  source->file,
-                                                  &in_use) !=
-                        KERNEL_VMA_STATUS_OK) {
-                    invalid=1; break;
-                }
-            }
+            if (unused_only && kernel_vma_set_backing_in_use(record->vmas,
+                    source->file, &in_use) != KERNEL_VMA_STATUS_OK)
+                __builtin_trap();
             if (in_use != 0) {
                 link = &source->next;
                 continue;
@@ -1151,8 +1180,10 @@ static enum kernel_mm_status drain_file_sources(
         source->draining=1;
         source->next=record->retired_file_sources; record->retired_file_sources=source;
     }
+    /* Active sources are now exactly those with VMAs. The retired chain
+     * still owns its OFDs until registration callbacks have stopped. */
+    drain_file_registrations(record, unused_only);
     int failed=release_file_sources(record,defer ? NULL : take_ready_file_sources(record));
-    if (invalid) return KERNEL_MM_STATUS_STATE;
     return failed != 0 ? KERNEL_MM_STATUS_CLEANUP_REQUIRED
                        : KERNEL_MM_STATUS_OK;
 }
@@ -1494,20 +1525,48 @@ static enum kernel_mm_status mutable_vma_record(
     struct kernel_mm *mm,
     struct kernel_mm_record **record);
 
-static int fork_leaf_action(void *context, uint64_t virtual_address)
-{
-    const struct kernel_vma_set *vmas = context;
-    struct kernel_vma vma;
-    enum kernel_vma_status status = kernel_vma_set_lookup(
-        vmas, virtual_address, &vma);
+/* Fork holds the parent's MM edit qualification throughout both page-table
+ * passes. Adjacent leaves can use the same VMA decision until its end. */
+struct fork_policy_cursor {
+    const struct kernel_vma_set *vmas;
+    uint64_t start, end;
+    int action;
+};
 
-    if (status == KERNEL_VMA_STATUS_NOT_FOUND) return 0;
+static int fork_vma_action(const struct kernel_vma *vma)
+{
+    if (vma->flags & (KERNEL_VMA_DONTFORK | KERNEL_VMA_WIPEONFORK))
+        return ARCH_MMU_FORK_SKIP;
+    /* A private file VMA first acquires anonymous history before a write
+     * (including a debugger write) can publish private bytes. Until then
+     * the child's inherited OFD can fault the clean contents back in. */
+    if (vma->kind == KERNEL_VMA_KIND_FILE_PRIVATE &&
+        vma->fault_policy == KERNEL_VMA_FAULT_FILE_PRIVATE &&
+        !(vma->flags & KERNEL_VMA_ANON_HISTORY))
+        return ARCH_MMU_FORK_SKIP;
+    if (vma->role == KERNEL_VMA_ROLE_VVAR ||
+        vma->kind == KERNEL_VMA_KIND_HUGETLB_SHARED ||
+        vma->kind == KERNEL_VMA_KIND_ANON_SHARED ||
+        vma->kind == KERNEL_VMA_KIND_FILE_SHARED ||
+        vma->kind == KERNEL_VMA_KIND_SYSV_SHM ||
+        vma->kind == KERNEL_VMA_KIND_OBJECT_SHARED)
+        return ARCH_MMU_FORK_SHARED;
+    return ARCH_MMU_FORK_PRIVATE;
+}
+
+static int fork_leaf_action(void *context, uint64_t address)
+{
+    struct fork_policy_cursor *cursor = context;
+    if (address >= cursor->start && address < cursor->end)
+        return cursor->action;
+    struct kernel_vma vma;
+    enum kernel_vma_status status = kernel_vma_set_lookup(cursor->vmas, address, &vma);
+    if (status == KERNEL_VMA_STATUS_NOT_FOUND) return ARCH_MMU_FORK_PRIVATE;
     if (status != KERNEL_VMA_STATUS_OK) __builtin_trap();
-    if (vma.flags & (KERNEL_VMA_DONTFORK | KERNEL_VMA_WIPEONFORK)) return ARCH_MMU_FORK_SKIP;
-    return vma.kind==KERNEL_VMA_KIND_HUGETLB_SHARED || vma.role == KERNEL_VMA_ROLE_VVAR || vma.kind == KERNEL_VMA_KIND_ANON_SHARED ||
-           vma.kind == KERNEL_VMA_KIND_FILE_SHARED ||
-           vma.kind == KERNEL_VMA_KIND_SYSV_SHM ||
-           vma.kind == KERNEL_VMA_KIND_OBJECT_SHARED ? ARCH_MMU_FORK_SHARED : ARCH_MMU_FORK_PRIVATE;
+    cursor->start = vma.start;
+    cursor->end = vma.end;
+    cursor->action = fork_vma_action(&vma);
+    return cursor->action;
 }
 
 struct fork_file_guards {
@@ -1692,15 +1751,15 @@ static enum kernel_mm_status mm_fork_impl(
             destination_record->file_mappings = prepared;
         }
     }
-    uint32_t inherited_residents = 0;
-    for (struct mm_file_resident *page = source_record->file_residents; page; page = page->next)
-        if (!source_record->vmas || fork_leaf_action(source_record->vmas,page->address) != ARCH_MMU_FORK_SKIP)
-            inherited_residents++;
-    if (status == KERNEL_MM_STATUS_OK)
-        status = reserve_file_residents(destination_record, inherited_residents);
+    struct fork_policy_cursor policy = {.vmas = source_record->vmas};
+    size_t inherited_residents = 0;
+    struct mm_file_resident *residents = NULL;
+    struct mm_file_resident **tail = &residents;
+    /* Classify each resident once. The copies have no alias or PTE to
+     * retire yet, so allocation failure can release the staging list. */
     for (struct mm_file_resident *page = source_record->file_residents;
          page != 0 && status == KERNEL_MM_STATUS_OK; page = page->next) {
-        if (source_record->vmas && fork_leaf_action(source_record->vmas, page->address) == ARCH_MMU_FORK_SKIP)
+        if (source_record->vmas && fork_leaf_action(&policy, page->address) == ARCH_MMU_FORK_SKIP)
             continue;
         struct mm_file_resident *copy;
         enum kernel_heap_status hs = kernel_heap_allocate_zeroed(
@@ -1714,12 +1773,25 @@ static enum kernel_mm_status mm_fork_impl(
         copy->alias=(struct kernel_page_cache_alias){0};
         copy->clone_source = page;
         copy->cache_retry_registered=0; copy->cache_retry_next=0;
-        { KERNEL_RAW_WRITE_SCOPE(guard, &destination_record->metadata);
-          publish_file_resident(destination_record, copy); }
+        copy->next = NULL;
+        *tail = copy;
+        tail = &copy->next;
+        inherited_residents++;
+    }
+    if (status == KERNEL_MM_STATUS_OK)
+        status = reserve_file_residents(destination_record, inherited_residents);
+    while (residents) {
+        struct mm_file_resident *copy = residents;
+        residents = copy->next;
+        /* The child record is still private to this fork. */
+        if (status == KERNEL_MM_STATUS_OK)
+            publish_file_resident(destination_record, copy);
+        else
+            kernel_heap_release(destination_record->vma_heap, copy);
     }
     for (struct mm_lazy_page *page=source_record->lazy_pages;
          page && status==KERNEL_MM_STATUS_OK;page=page->next) {
-        if (source_record->vmas && fork_leaf_action(source_record->vmas,page->address)==ARCH_MMU_FORK_SKIP)
+        if (source_record->vmas && fork_leaf_action(&policy,page->address)==ARCH_MMU_FORK_SKIP)
             continue;
         struct mm_lazy_page *copy;
         enum kernel_heap_status hs=lazy_reserve(destination_record,destination_record->lazy_count+1);
@@ -1765,26 +1837,30 @@ static enum kernel_mm_status mm_fork_impl(
         return status;
     }
     backend_status = arch_mmu_user_space_fork_prepare(&destination_record->space,
-        &source_record->space, source_record->vmas ? fork_leaf_action : 0, source_record->vmas);
+        &source_record->space, source_record->vmas ? fork_leaf_action : 0, &policy);
     if (backend_status == ARCH_MMU_STATUS_OK) {
         uint64_t cursor = 0, address;
-        /* child尚未发布，遍历私有树不持MM raw；每次只提交一个父叶。 */
+        int changed = 0;
+        /* Search sparse holes in the private child tree outside the parent
+         * lock, then update a bounded window from both leaf tables. */
         while ((backend_status = arch_mmu_user_next_owned(&destination_record->space,
             &cursor, ARCH_MMU_USER_LIMIT, &address)) == ARCH_MMU_STATUS_OK) {
-            /* 按VMA语义分类，不能把合法shared/protected页当作私有COW。 */
-            if (source_record->vmas && fork_leaf_action(source_record->vmas, address) != ARCH_MMU_FORK_PRIVATE) continue;
             KERNEL_RAW_WRITE_SCOPE(guard, &source_record->metadata);
-            if (arch_mmu_user_mark_cow_page(&source_record->space, address) !=
-                ARCH_MMU_STATUS_OK) __builtin_trap();
+            if (arch_mmu_user_fork_commit_window(&source_record->space,
+                &destination_record->space, address, &cursor,
+                source_record->vmas ? fork_leaf_action : NULL, &policy, &changed))
+                __builtin_trap();
         }
         if (backend_status != ARCH_MMU_STATUS_NOT_MAPPED) __builtin_trap();
-        struct kernel_mm_retirement batch = {0};
-        uint32_t targets;
-        {
-            KERNEL_RAW_WRITE_SCOPE(guard, &source_record->metadata);
-            targets = note_tlb_change_locked(source_record, &batch, 0);
+        if (changed) {
+            struct kernel_mm_retirement batch = {0};
+            uint32_t targets;
+            {
+                KERNEL_RAW_WRITE_SCOPE(guard, &source_record->metadata);
+                targets = note_tlb_change_locked(source_record, &batch, 0);
+            }
+            finish_tlb_change(source_record, &batch, targets, 0, UINT64_MAX, 0);
         }
-        finish_tlb_change(source_record, &batch, targets, 0, UINT64_MAX, 0);
         backend_status = ARCH_MMU_STATUS_OK;
     }
     if (backend_status == ARCH_MMU_STATUS_OK) {
@@ -1881,10 +1957,14 @@ enum kernel_mm_status kernel_mm_move(
     return KERNEL_MM_STATUS_OK;
 }
 
-static enum kernel_mm_status lookup_record(
+_Static_assert(ARCH_MMU_READ == KERNEL_MM_READ && ARCH_MMU_WRITE == KERNEL_MM_WRITE &&
+    ARCH_MMU_EXECUTE == KERNEL_MM_EXECUTE && ARCH_MMU_USER == KERNEL_MM_USER,
+    "leaf permissions use the MM bit layout");
+
+static enum kernel_mm_status lookup_record_mode(
     const struct kernel_mm_record *record,
     uint64_t virtual_address,
-    struct kernel_mm_mapping *mapping)
+    struct kernel_mm_mapping *mapping, int force)
 {
     struct kernel_mm_leaf riscv_mapping;
     enum arch_mmu_status backend_status;
@@ -1892,7 +1972,7 @@ static enum kernel_mm_status lookup_record(
                                          virtual_address,
                                          &riscv_mapping);
     if (backend_status == ARCH_MMU_STATUS_NOT_MAPPED ||
-        (backend_status == ARCH_MMU_STATUS_OK && !riscv_mapping.permissions)) {
+        (backend_status == ARCH_MMU_STATUS_OK && !riscv_mapping.permissions && !force)) {
         return KERNEL_MM_STATUS_NOT_MAPPED;
     }
     if (backend_status != ARCH_MMU_STATUS_OK) {
@@ -1902,21 +1982,13 @@ static enum kernel_mm_status lookup_record(
     }
     mapping->physical_address = riscv_mapping.physical_address + virtual_address - riscv_mapping.virtual_address;
     mapping->order = riscv_mapping.order;
-    mapping->permissions = 0U;
-    if ((riscv_mapping.permissions & ARCH_MMU_READ) != 0U) {
-        mapping->permissions |= KERNEL_MM_READ;
-    }
-    if ((riscv_mapping.permissions & ARCH_MMU_WRITE) != 0U) {
-        mapping->permissions |= KERNEL_MM_WRITE;
-    }
-    if ((riscv_mapping.permissions & ARCH_MMU_EXECUTE) != 0U) {
-        mapping->permissions |= KERNEL_MM_EXECUTE;
-    }
-    if ((riscv_mapping.permissions & ARCH_MMU_USER) != 0U) {
-        mapping->permissions |= KERNEL_MM_USER;
-    }
+    mapping->permissions = riscv_mapping.permissions ? riscv_mapping.permissions : KERNEL_MM_USER;
     return KERNEL_MM_STATUS_OK;
 }
+
+static enum kernel_mm_status lookup_record(const struct kernel_mm_record *record,
+    uint64_t address, struct kernel_mm_mapping *mapping)
+{ return lookup_record_mode(record,address,mapping,0); }
 
 /* FOLL_FORCE grants data access through VM_MAY*, never a writable shared
  * mapping. Readonly private stores still resolve COW before borrowing a page. */
@@ -1932,17 +2004,33 @@ static int remote_access_allowed(const struct kernel_vma *vma, uint32_t access, 
 }
 static enum kernel_mm_status remote_lookup_record(struct kernel_mm_record *record,
     uint64_t address, struct kernel_mm_mapping *mapping)
+{ return lookup_record_mode(record,address,mapping,1); }
+
+/* One metadata-qualified walk returns the real leaf or the preparation hint.
+ * Keep only snapshot values if the caller has to drop the qualification. */
+static enum kernel_mm_status fault_lookup_leaf(struct kernel_mm_record *record,
+    uint64_t address, int force, struct kernel_mm_leaf *leaf, unsigned *missing)
 {
-    enum kernel_mm_status status = lookup_record(record,address,mapping);
-    if (status != KERNEL_MM_STATUS_NOT_MAPPED) return status;
-    struct kernel_mm_leaf leaf;
-    enum arch_mmu_status found = arch_mmu_user_leaf_snapshot(&record->space,address,&leaf);
+    enum arch_mmu_status found = arch_mmu_user_leaf_probe(&record->space,address,leaf,missing);
     if (found == ARCH_MMU_STATUS_NOT_MAPPED) return KERNEL_MM_STATUS_NOT_MAPPED;
     if (found) return KERNEL_MM_STATUS_ADDRESS_SPACE;
-    mapping->physical_address=leaf.physical_address+address-leaf.virtual_address;
-    mapping->order=leaf.order;
-    mapping->permissions=KERNEL_MM_USER;
+    if (!leaf->permissions && !force)
+        return leaf->order ? KERNEL_MM_STATUS_ADDRESS_SPACE : KERNEL_MM_STATUS_NOT_MAPPED;
     return KERNEL_MM_STATUS_OK;
+}
+
+static int fault_cow_source(struct kernel_mm_record *record, uint64_t address,
+    const struct kernel_mm_leaf *leaf, int force, uint64_t *cookie, uint64_t *physical)
+{
+    if (force) {
+        /* Debugger writes can change a non-COW leaf before borrowing it. */
+        if (arch_mmu_user_mark_cow_page(&record->space,address)) __builtin_trap();
+        return arch_mmu_user_cow_snapshot(&record->space,address,cookie,physical)==ARCH_MMU_STATUS_OK;
+    }
+    if (leaf->order || !leaf->cow) return 0;
+    *cookie=leaf->cookie;
+    *physical=leaf->physical_address;
+    return 1;
 }
 
 /* 文件来源登记、resident和alias由writer维护；缺页初查共享VMA资格。
@@ -1983,7 +2071,7 @@ static int mm_range_claim_try_acquire(struct kernel_mm_record *record,
             return 0;
     }
     claim->next = record->range_claims;
-    record->range_claims = claim;
+    __atomic_store_n(&record->range_claims,claim,__ATOMIC_RELEASE);
     return 1;
 }
 
@@ -2006,7 +2094,7 @@ static void mm_range_claim_acquire(struct kernel_mm_record *record,
             }
             if (!conflict) {
                 claim->next = record->range_claims;
-                record->range_claims = claim;
+                __atomic_store_n(&record->range_claims,claim,__ATOMIC_RELEASE);
                 return;
             }
             if (kernel_wait_prepare(&record->range_changed, 0, 0, &token) !=
@@ -2026,10 +2114,19 @@ static void mm_range_claim_release(struct kernel_mm_record *record,
         struct kernel_mm_range_claim **curr = &record->range_claims;
         while (*curr && *curr != claim)
             curr = &(*curr)->next;
-        if (*curr == claim)
-            *curr = claim->next;
+        if (*curr != claim) __builtin_trap();
+        if (curr == &record->range_claims)
+            __atomic_store_n(&record->range_claims,claim->next,__ATOMIC_RELEASE);
         else
-            __builtin_trap();
+            *curr = claim->next;
+        /* Faults can reuse a VMA snapshot while retaining the MM read gate.
+         * The generation covers edits whose claims ended before publication. */
+        uint64_t generation = __atomic_load_n(&record->range_edit_generation, __ATOMIC_RELAXED);
+        if (generation == UINT64_MAX) __builtin_trap();
+        __atomic_store_n(&record->range_edit_generation, generation + 1, __ATOMIC_RELEASE);
+        /* Both range wait paths register while holding metadata. A later
+         * registrant rechecks the list after this removal. */
+        if (!kernel_wait_queue_registrations(&record->range_changed)) return;
     }
     KERNEL_IRQ_SCOPE(irq);
     enum kernel_scheduler_status status = kernel_wait_queue_wake_all(&record->range_changed);
@@ -2041,6 +2138,10 @@ static enum kernel_mm_status mm_wait_range_claim(struct kernel_mm_record *record
     const struct kernel_mm *mm, uint64_t address)
 {
     for (;;) {
+        /* The optimistic test observes only emptiness, never a stack node.
+         * Publication still validates the address against live claims. */
+        if (!__atomic_load_n(&record->range_claims,__ATOMIC_ACQUIRE))
+            return KERNEL_MM_STATUS_OK;
         struct kernel_wait_token token = {0};
         {
             KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
@@ -2090,20 +2191,6 @@ static void mm_operation_unclaim_range(struct mm_operation *operation)
     operation->range_claimed = 0;
 }
 
-static int mm_range_is_pure_anonymous(const struct kernel_vma_set *set, uint64_t start, uint64_t end)
-{
-    if (!set) return 1;
-    uint32_t count = kernel_vma_set_count(set);
-    for (uint32_t i = 0; i < count; i++) {
-        struct kernel_vma vma;
-        if (kernel_vma_set_get_at(set, i, &vma)) __builtin_trap();
-        if (vma.end <= start) continue;
-        if (vma.start >= end) break;
-        if (vma.kind != KERNEL_VMA_KIND_ANONYMOUS)
-            return 0;
-    }
-    return 1;
-}
 #endif
 static uint32_t note_tlb_change_locked(struct kernel_mm_record *record,
     const struct kernel_mm_retirement *batch, int instructions)
@@ -2139,21 +2226,30 @@ static uint32_t note_fault_change_locked(struct kernel_mm_record *record,
 #endif
     return note_tlb_change_locked(record, batch, instructions);
 }
+static void sync_tlb_change(uint32_t targets, uint64_t address,
+    uint64_t size, int instructions)
+{
+    COST_SCOPE(sync_cost, MM_SYNC_TICKS);
+    arch_mmu_sync_user(targets, address, size, instructions);
+}
+
+static void retirement_complete(struct kernel_mm_record *record, unsigned batches)
+{
+    KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
+    if (record->pending_retirement < batches) __builtin_trap();
+    record->pending_retirement -= batches;
+}
+
 static void finish_tlb_change(struct kernel_mm_record *record,
     struct kernel_mm_retirement *batch, uint32_t targets, uint64_t address,
     uint64_t size, int instructions)
 {
-    {
-        COST_SCOPE(sync_cost, MM_SYNC_TICKS);
-        arch_mmu_sync_user(targets, address, size, instructions);
-    }
+    sync_tlb_change(targets, address, size, instructions);
     if (batch->count) {
         _Static_assert(KERNEL_MM_RETIRE_CAPACITY <= PHYSICAL_PAGE_REFERENCE_BATCH_MAX,
                        "one allocator guard per retirement batch");
         kernel_mm_retirement_release(record->space.allocator, batch);
-        KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
-        if (!record->pending_retirement) __builtin_trap();
-        record->pending_retirement--;
+        retirement_complete(record, 1);
     }
 }
 static void finish_fault_change(struct kernel_mm_record *record,
@@ -2293,6 +2389,7 @@ static enum kernel_mm_status mm_operation_begin(const struct kernel_mm *mm,
 struct fault_vma {
     struct kernel_vma vma;
     uint64_t generation;
+    uint64_t range_edit_generation;
 };
 
 /* A file or ELF registration cannot disappear while the MM gate is held.
@@ -2308,6 +2405,8 @@ static enum kernel_mm_status read_fault_vma(struct mm_operation *operation,
         enum kernel_mm_status status = mm_wait_range_claim(record, operation->mm, address);
         if (status) return status;
         kernel_rwlock_read(&record->vma_lock, &vma_guard);
+        view->range_edit_generation =
+            __atomic_load_n(&record->range_edit_generation, __ATOMIC_ACQUIRE);
     }
     enum kernel_vma_status found = kernel_vma_set_lookup(record->vmas, address, &view->vma);
     if (found) return status_from_vma(found);
@@ -3180,11 +3279,14 @@ static enum kernel_mm_status mutable_vma_record(
 struct mm_unmap_residents {
     struct kernel_mm_record *record;
     struct mm_file_resident *removed;
+    uint64_t first, last;
     int lazy_removed;
 };
 static void unmap_resident_before_pte(void *owner,uint64_t address,uint64_t physical)
 {
     struct mm_unmap_residents *residents=owner;
+    if (!residents->first) residents->first = address;
+    residents->last = address;
     struct mm_lazy_page *lazy=lazy_find(residents->record,address);
     if (lazy) {
         if (lazy->physical!=physical) __builtin_trap();
@@ -3205,18 +3307,42 @@ static enum kernel_mm_status unmap_space_range(
     struct kernel_mm_detach_cursor cursor={0};
     enum arch_mmu_status status;
     do {
-        struct kernel_mm_retirement batch={0};
+        enum { DETACH_CHUNKS_PER_SYNC = 2 };
+        struct kernel_mm_retirement batches[DETACH_CHUNKS_PER_SYNC] = {0};
         struct mm_unmap_residents residents={.record=record};
-        uint32_t targets;
-        {
-            KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
-            status=arch_mmu_user_detach_range(&record->space,start,end,&cursor,&batch,
-                unmap_resident_before_pte,&residents);
+        uint32_t targets = 0;
+        unsigned count = 0;
+        int nonleaf = 0;
+        uint64_t last_end = 0;
+        /* Keep each metadata section bounded. Every chunk publishes its own
+         * generation and samples joining CPUs before releasing protection. */
+        for (unsigned i = 0; i < DETACH_CHUNKS_PER_SYNC; i++) {
+            struct kernel_mm_retirement *batch = &batches[count];
+            {
+                KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
+                status = arch_mmu_user_detach_range(&record->space, start, end,
+                    &cursor, batch, unmap_resident_before_pte, &residents);
+                if (batch->count) targets |= note_tlb_change_locked(record, batch, 0);
+            }
             if (status!=ARCH_MMU_STATUS_OK && status!=ARCH_MMU_STATUS_NOT_MAPPED) __builtin_trap();
-            targets=batch.count?note_tlb_change_locked(record,&batch,0):0;
+            if (batch->count) {
+                nonleaf |= batch->nonleaf;
+                last_end = residents.last + ((uint64_t)BOAROS_PAGE_SIZE <<
+                    batch->orders[batch->count - 1]);
+                count++;
+            }
+            if (status == ARCH_MMU_STATUS_NOT_MAPPED) break;
+            /* Preserve a precise local fence for an isolated base leaf. */
+            if (count && !nonleaf && last_end - residents.first == BOAROS_PAGE_SIZE)
+                break;
         }
-        if (batch.count) finish_tlb_change(record,&batch,targets,
-            batch.nonleaf?0:start,batch.nonleaf?UINT64_MAX:end-start,0);
+        if (count) {
+            sync_tlb_change(targets, nonleaf ? 0 : residents.first,
+                nonleaf ? UINT64_MAX : last_end - residents.first, 0);
+            for (unsigned i = 0; i < count; i++)
+                kernel_mm_retirement_release(record->space.allocator, &batches[i]);
+            retirement_complete(record, count);
+        }
         if (residents.lazy_removed) lazy_drain(record);
         while (residents.removed) {
             struct mm_file_resident *page=residents.removed;
@@ -5392,7 +5518,7 @@ enum kernel_mm_status kernel_mm_munmap(struct kernel_mm *mm, uint64_t address, u
     {
         struct kernel_lock_guard vma_guard = {0};
         kernel_rwlock_read(&record->vma_lock, &vma_guard);
-        pure_anon = mm_range_is_pure_anonymous(record->vmas, address, end);
+        pure_anon = kernel_vma_set_range_is_anonymous(record->vmas, address, end);
         kernel_lock_release(&vma_guard);
     }
     if (!pure_anon) {
@@ -5426,20 +5552,6 @@ enum kernel_mm_status kernel_mm_munmap(struct kernel_mm *mm, uint64_t address, u
 #endif
 }
 #if BOAROS_MAX_CPUS > 1
-static int anonymous_permission_addition(struct kernel_vma_set *set,
-    uint64_t start,uint64_t end,uint32_t permissions,int *unchanged)
-{
-    *unchanged=1;
-    while (start<end) {
-        struct kernel_vma vma;
-        if (kernel_vma_set_lookup(set,start,&vma) ||
-            vma.kind!=KERNEL_VMA_KIND_ANONYMOUS ||
-            (vma.permissions & ~permissions)) return 0;
-        if (vma.permissions!=permissions) *unchanged=0;
-        start=vma.end<end?vma.end:end;
-    }
-    return 1;
-}
 /* Adding anonymous access does not revoke any pin or replace a source.
  * The range claim excludes overlapping edits and fault publication, while
  * unrelated faults keep their shared MM ownership. */
@@ -5452,28 +5564,35 @@ static enum kernel_mm_status mprotect_addition(struct kernel_mm *mm,uint64_t add
     if (status) { *handled=1;return status; }
     struct kernel_mm_record *record=operation.record;
     uint64_t end=address+length;
-    int unchanged,eligible;
-    {
-        KERNEL_LOCK_SCOPE(vma);
-        kernel_rwlock_read(&record->vma_lock,&vma);
-        eligible=anonymous_permission_addition(record->vmas,address,end,permissions,&unchanged);
-        if (eligible && unchanged) { *handled=1;return KERNEL_MM_STATUS_OK; }
-    }
-    if (!eligible) return KERNEL_MM_STATUS_OK;
-    status=mm_operation_claim_range(&operation,address,end);
-    if (status) { *handled=1;return status; }
-    struct kernel_vma_edit edit={0};
-    {
-        KERNEL_LOCK_SCOPE(vma);
+    int unchanged;
+    KERNEL_LOCK_SCOPE(vma);
+    kernel_rwlock_read(&record->vma_lock,&vma);
+    if (!kernel_vma_set_permission_addition(record->vmas,address,end,permissions,&unchanged))
+        return KERNEL_MM_STATUS_OK;
+    if (unchanged) { *handled=1;return KERNEL_MM_STATUS_OK; }
+
+    if (kernel_rwlock_try_upgrade(&vma) &&
+        mm_range_claim_try_acquire(record,&operation.claim,address,end)) {
+        operation.range_claimed=1;
+    } else {
+        /* Dropping VMA before a range wait lets the existing claimant finish.
+         * A queued writer keeps its place when the read guard cannot upgrade. */
+        uint64_t generation=kernel_vma_set_generation(record->vmas);
+        kernel_lock_release(&vma);
+        status=mm_operation_claim_range(&operation,address,end);
+        if (status) { *handled=1;return status; }
         kernel_rwlock_write(&record->vma_lock,&vma);
-        if (!anonymous_permission_addition(record->vmas,address,end,permissions,&unchanged))
+        if (kernel_vma_set_generation(record->vmas)!=generation &&
+            !kernel_vma_set_permission_addition(record->vmas,address,end,permissions,&unchanged))
             return KERNEL_MM_STATUS_OK;
-        *handled=1;
-        if (unchanged) return KERNEL_MM_STATUS_OK;
-        status=status_from_vma(kernel_vma_set_prepare_mprotect(record->vmas,
-            address,end,permissions,&edit));
-        if (edit.set && kernel_vma_set_commit_edit(record->vmas,&edit)) __builtin_trap();
     }
+    *handled=1;
+    if (unchanged) return KERNEL_MM_STATUS_OK;
+    struct kernel_vma_edit edit={0};
+    status=status_from_vma(kernel_vma_set_prepare_mprotect(record->vmas,
+        address,end,permissions,&edit));
+    if (edit.set && kernel_vma_set_commit_edit(record->vmas,&edit)) __builtin_trap();
+    kernel_lock_release(&vma);
     if (edit.set) {
         enum kernel_mm_status published=protect_vma_pages(record,&edit);
         if (published) return published;
@@ -5973,44 +6092,54 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
         kernel_page_cache_acquire_ready(kernel_open_file_page_cache(file),
             kernel_open_file_vfs_borrow(file),offset>>BOAROS_PAGE_SHIFT,selected,refs,slots);
     if (!ready) return end;
-    struct mm_file_resident *residents[KERNEL_PAGE_CACHE_READY_WINDOW]={0};
-    unsigned count=0;
-    for(unsigned bits=ready;bits;bits&=bits-1) count++;
-    if (!source) for(unsigned i=0;i<count;i++) {
-        enum kernel_heap_status status=kernel_heap_allocate_zeroed_nosleep(record->vma_heap,
-            1,sizeof(*residents[i]),(void **)&residents[i]);
-        if (status==KERNEL_HEAP_STATUS_EMPTY) break;
-        if (status) __builtin_trap();
-    }
-    {
-        KERNEL_RAW_WRITE_SCOPE(raw,&record->metadata);
-        unsigned i=0;
-        for(uint64_t next=first;ready;ready>>=1,next+=BOAROS_PAGE_SIZE) {
-            if (!(ready&1)) continue;
-            struct mm_file_resident *page=residents[i];
-            uint64_t physical=refs[i++];
-            if (!source && (!page || record->resident_count==record->resident_capacity)) continue;
-            struct kernel_mm_leaf_preparation tables=KERNEL_MM_LEAF_PREPARATION_INIT;
-            enum arch_mmu_status status=arch_mmu_user_map_prepared_page(&record->space,next,physical,
-                backend_permissions_from_mm(vma->permissions&~KERNEL_MM_WRITE),1,&tables);
-            if (status==ARCH_MMU_STATUS_CONFLICT || status==ARCH_MMU_STATUS_NEED_TABLES) continue;
-            if (status) __builtin_trap();
+    void *residents[KERNEL_PAGE_CACHE_READY_WINDOW] = {0};
+    unsigned count = 0;
+    for (unsigned bits = ready; bits; bits &= bits - 1) count++;
+    unsigned allocated = source ? count : kernel_heap_allocate_zeroed_batch_nosleep(
+        record->vma_heap, count, sizeof(struct mm_file_resident), residents);
+    unsigned installed = 0;
+    if (allocated) {
+        KERNEL_RAW_WRITE_SCOPE(raw, &record->metadata);
+        unsigned capacity = source ? allocated : record->resident_capacity - record->resident_count;
+        if (capacity > allocated) capacity = allocated;
+        unsigned unprepared = ready;
+        /* Drop the unprepared suffix of the packed reference vector. */
+        for (unsigned i = 0; i < capacity; i++) unprepared &= unprepared - 1;
+        installed = arch_mmu_user_map_owned_window(&record->space, first, ready ^ unprepared, refs,
+            backend_permissions_from_mm(vma->permissions & ~KERNEL_MM_WRITE));
+        unsigned i = 0;
+        for (unsigned bits = ready, index = 0; bits; bits >>= 1, index++) {
+            if (!(bits & 1)) continue;
+            struct mm_file_resident *page = residents[i];
+            uint64_t physical = refs[i++];
+            if (!(installed & (1U << index))) continue;
+            uint64_t address = first + (uint64_t)index * BOAROS_PAGE_SIZE;
             if (page) {
-                page->address=next;page->physical_address=physical;
-                publish_file_resident(record,page);residents[i-1]=NULL;
+                page->address = address;
+                page->physical_address = physical;
+                publish_file_resident(record, page);
+                residents[i-1] = NULL;
             }
-            refs[i-1]=KERNEL_MM_NO_PAGE;
-            if (next<*begin) *begin=next;
-            if (next+BOAROS_PAGE_SIZE>end) end=next+BOAROS_PAGE_SIZE;
+            if (address < *begin) *begin = address;
+            if (address + BOAROS_PAGE_SIZE > end) end = address + BOAROS_PAGE_SIZE;
         }
     }
-    unsigned unused=0;
-    for(unsigned i=0;i<count;i++) {
-        if (refs[i]!=KERNEL_MM_NO_PAGE) refs[unused++]=refs[i];
-        if (residents[i]) kernel_heap_release(record->vma_heap,residents[i]);
+    unsigned unused = 0, i = 0;
+    for (unsigned bits = ready, index = 0; bits; bits >>= 1, index++) {
+        if (!(bits & 1)) continue;
+        if (!(installed & (1U << index))) refs[unused++] = refs[i];
+        if (residents[i]) kernel_heap_release(record->vma_heap, residents[i]);
+        i++;
     }
     physical_page_release_batch(record->space.allocator,refs,unused);
     return end;
+}
+
+static int file_fault_read_window(const struct kernel_vma *vma, uint32_t access)
+{
+    if (vma->flags&KERNEL_VMA_RANDOM_READ) return KERNEL_PAGE_CACHE_FAULT_SINGLE;
+    return access==KERNEL_MM_EXECUTE ? KERNEL_PAGE_CACHE_FAULT_EXEC_AHEAD :
+        KERNEL_PAGE_CACHE_FAULT_READ_AHEAD;
 }
 
 /* File-map preparation is independent of ELF/anonymous faults. Keep its
@@ -6037,7 +6166,8 @@ static __attribute__((noinline)) enum kernel_mm_status mapped_file_fault(struct 
     uint64_t cookie = 0, old = KERNEL_MM_NO_PAGE, replacement = KERNEL_MM_NO_PAGE;
     struct kernel_open_file_page_preparation source = {0};
     struct kernel_mm_leaf_preparation prepared = KERNEL_MM_LEAF_PREPARATION_INIT;
-    struct kernel_mm_retirement batch = {0};
+    struct kernel_mm_retirement batch;
+    batch.count = batch.nonleaf = batch.compound = 0;
     struct mm_file_resident *resident = 0;
     void *old_bytes = 0, *copy = 0;
     unsigned missing = 0;
@@ -6048,6 +6178,26 @@ static __attribute__((noinline)) enum kernel_mm_status mapped_file_fault(struct 
     int shared = vma->kind == KERNEL_VMA_KIND_FILE_SHARED;
     int disk = !kernel_open_file_memory_backed(file);
     enum kernel_mm_status status = KERNEL_MM_STATUS_OK;
+    /* A missing private disk leaf does not access mutable inode contents
+     * here. The cache admits the read against current EOF, and publication
+     * still takes inode I/O qualification and rechecks the captured epoch. */
+    if (disk && !shared && !force && access != KERNEL_MM_WRITE &&
+        !kernel_file_mapping_epoch(node, &epoch) && offset < kernel_vfs_node_size(node)) {
+        int absent;
+        {
+            struct kernel_mm_leaf leaf;
+            KERNEL_RAW_READ_SCOPE(guard, &record->metadata);
+            absent = fault_lookup_leaf(record,address,0,&leaf,&missing) == KERNEL_MM_STATUS_NOT_MAPPED;
+        }
+        if (absent) {
+#if BOAROS_MAX_CPUS > 1
+            if (operation->shared && !missing &&
+                kernel_open_file_try_prepare_disk_mapping_page(file,offset >> BOAROS_PAGE_SHIFT,&source))
+                replacement = source.address;
+#endif
+            goto prepare_page;
+        }
+    }
     if (!fault_inode_lock(operation, node, &inode)) {
         status = KERNEL_MM_STATUS_CONFLICT;
         goto finish;
@@ -6061,15 +6211,15 @@ static __attribute__((noinline)) enum kernel_mm_status mapped_file_fault(struct 
     }
     if (offset >= kernel_open_file_size(file)) { status = KERNEL_MM_STATUS_BUS_FAULT; goto finish; }
     {
-        struct kernel_mm_mapping mapping;
+        struct kernel_mm_leaf leaf;
         KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
-        status = force ? remote_lookup_record(record,address,&mapping) : lookup_record(record,address,&mapping);
+        status = fault_lookup_leaf(record,address,force,&leaf,&missing);
         if (status == KERNEL_MM_STATUS_OK && shared && disk && access==KERNEL_MM_WRITE) {
             kernel_raw_lock_release(&guard);
             status=cached_write_fault(operation,file,vma,address,generation,&inode);
             goto finish;
         }
-        if (status == KERNEL_MM_STATUS_OK && ((mapping.permissions & access) || (force && access == KERNEL_MM_READ))) {
+        if (status == KERNEL_MM_STATUS_OK && ((leaf.permissions & access) || (force && access == KERNEL_MM_READ))) {
             kernel_raw_lock_release(&guard);
             if (!operation->populate) {
                 arch_mmu_flush_all();
@@ -6078,10 +6228,8 @@ static __attribute__((noinline)) enum kernel_mm_status mapped_file_fault(struct 
             goto finish;
         }
         if (status == KERNEL_MM_STATUS_OK) {
-            if (force && access == KERNEL_MM_WRITE && !shared &&
-                arch_mmu_user_mark_cow_page(&record->space,address)) __builtin_trap();
             if (shared || access != KERNEL_MM_WRITE ||
-                arch_mmu_user_cow_snapshot(&record->space,address,&cookie,&old) != ARCH_MMU_STATUS_OK) {
+                !fault_cow_source(record,address,&leaf,force,&cookie,&old)) {
                 status = KERNEL_MM_STATUS_ADDRESS_SPACE;
                 goto finish;
             }
@@ -6098,16 +6246,18 @@ static __attribute__((noinline)) enum kernel_mm_status mapped_file_fault(struct 
             }
             if (physical_page_map_owned(allocator,old,&old_bytes)) __builtin_trap();
         } else if (status == KERNEL_MM_STATUS_NOT_MAPPED) {
-            if (arch_mmu_user_leaf_missing(&record->space,address,&missing)) __builtin_trap();
             status = KERNEL_MM_STATUS_OK;
         } else goto finish;
     }
+prepare_page:
     /* 来源引用覆盖inode/对象/预算；解锁后不保存registry节点或PTE指针。 */
-    kernel_lock_release(&inode);
+    kernel_lock_scope_release(&inode);
+    if (source.pending && !kernel_heap_allocate_zeroed_nosleep(record->vma_heap,
+        1,sizeof(*resident),(void **)&resident)) goto prepare_file_tables;
     if (operation->guard.lock) mm_operation_release(operation);
-    if (!cookie) {
+    if (!cookie && !source.pending) {
         int error = kernel_open_file_prepare_mapping_page(file,offset >> BOAROS_PAGE_SHIFT,
-            !(vma->flags&KERNEL_VMA_RANDOM_READ),&source);
+            file_fault_read_window(vma,access),&source);
         status = !error ? KERNEL_MM_STATUS_OK : error == -KERNEL_EBUSY ? KERNEL_MM_STATUS_CONFLICT :
             error == -KERNEL_ENOMEM ? KERNEL_MM_STATUS_NO_MEMORY : KERNEL_MM_STATUS_BUS_FAULT;
         if (status == KERNEL_MM_STATUS_OK) {
@@ -6140,7 +6290,8 @@ prepare_file_tables:
      * Shared aliases and COW replacement retain the exclusive operation. */
     operation->shared = !shared && !cookie;
 
-    enum kernel_mm_status gate_status = mm_operation_lock(operation);
+    enum kernel_mm_status gate_status = operation->guard.lock ? KERNEL_MM_STATUS_OK :
+        mm_operation_lock(operation);
     if (gate_status != KERNEL_MM_STATUS_OK) status = gate_status;
     if (!gate_status && operation->shared) {
         int full;
@@ -6171,7 +6322,18 @@ prepare_file_tables:
     }
     if (status == KERNEL_MM_STATUS_OK && !cookie && !operation->shared)
         status = reserve_file_residents(record,record->resident_count + 1);
+    int map_neighbours = 0, defer_sync = 0;
+    int instructions = (vma->permissions & KERNEL_MM_EXECUTE) != 0;
     if (status == KERNEL_MM_STATUS_OK) {
+        map_neighbours = !cookie && disk && !shared && !force && !operation->populate &&
+            access != KERNEL_MM_WRITE && !(vma->flags & KERNEL_VMA_RANDOM_READ) &&
+            kernel_open_file_speculative_read_allowed(file);
+#if defined(BOAROS_ARCH_LOONGARCH)
+        defer_sync = map_neighbours;
+#else
+        /* A new RV data leaf changes no tracked invalidation generation. */
+        defer_sync = map_neighbours && instructions;
+#endif
         enum arch_mmu_status backend;
         {
             KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
@@ -6192,6 +6354,8 @@ prepare_file_tables:
                 page->address=address; page->physical_address=replacement;
                 page->private=!shared && access==KERNEL_MM_WRITE;
                 if (resident) { publish_file_resident(record,resident); resident=0; }
+                if (!defer_sync)
+                    targets=note_fault_change_locked(record,&batch,cookie!=0,instructions);
             }
         }
         if (backend == ARCH_MMU_STATUS_NEED_TABLES) {
@@ -6206,16 +6370,14 @@ prepare_file_tables:
     }
     if (status == KERNEL_MM_STATUS_OK) {
         uint64_t begin=address,end=address+BOAROS_PAGE_SIZE;
-        if (!cookie && disk && !shared && !force && !operation->populate &&
-            access != KERNEL_MM_WRITE && !(vma->flags & KERNEL_VMA_RANDOM_READ) &&
-            kernel_open_file_speculative_read_allowed(file))
+        if (map_neighbours)
             end = map_file_neighbours(record,file,NULL,vma,address,&begin);
-        {
+        if (defer_sync) {
             KERNEL_RAW_WRITE_SCOPE(raw,&record->metadata);
-            targets=note_fault_change_locked(record,&batch,cookie!=0,(vma->permissions&KERNEL_MM_EXECUTE)!=0);
+            targets=note_fault_change_locked(record,&batch,0,instructions);
         }
         finish_fault_change(record,&batch,targets,missing?0:begin,
-            missing?UINT64_MAX:end-begin,cookie!=0,(vma->permissions & KERNEL_MM_EXECUTE)!=0);
+            missing?UINT64_MAX:end-begin,cookie!=0,instructions);
         if (source.pending) {
             kernel_open_file_finish_mapping_page(file,&source,1);
             if (!shared && access==KERNEL_MM_WRITE) physical_page_release(allocator,source.address);
@@ -6296,13 +6458,20 @@ static __attribute__((noinline)) enum kernel_mm_status grow_fault_stack(struct k
     kernel_lock_release(&vma_guard);
     *result=vma;*epoch=generation;return KERNEL_MM_STATUS_OK;
 }
+/* The raw metadata guard stabilizes the range-claim list. */
+static int fault_range_claimed(struct kernel_mm_record *record, uint64_t first, uint64_t end)
+{
+    for (struct kernel_mm_range_claim *c=record->range_claims;c;c=c->next)
+        if (c->start < end && c->end > first) return 1;
+    return 0;
+}
+
 /* The caller holds VMA qualification and raw metadata through publication.
  * Only anonymous mappings accept an unrelated edit under a new generation. */
 static __attribute__((noinline)) int memory_fault_view_changed(struct kernel_mm_record *record,
     uint64_t address, const struct fault_vma *view)
 {
-    for (struct kernel_mm_range_claim *c=record->range_claims;c;c=c->next)
-        if (address>=c->start && address<c->end) return 1;
+    if (fault_range_claimed(record, address, address+1)) return 1;
     if (kernel_vma_set_generation(record->vmas) == view->generation) return 0;
     const struct kernel_vma *original = &view->vma;
     struct kernel_vma latest;
@@ -6312,6 +6481,102 @@ static __attribute__((noinline)) int memory_fault_view_changed(struct kernel_mm_
         latest.end != original->end || latest.permissions != original->permissions ||
         latest.role != original->role || latest.fault_policy != original->fault_policy;
 }
+
+/* With a continuous MM read gate, VMA writers that can change this anonymous
+ * address must hold a range claim. Nonfixed anonymous mmap only inserts into
+ * holes and anonymous-history marking does not change the fault's access.
+ * Judge both live claims and completed edits under the PTE publication guard. */
+static int anonymous_fault_view_current(struct kernel_mm_record *record,
+    uint64_t first, uint64_t end, const struct fault_vma *view)
+{
+    return view->vma.kind == KERNEL_VMA_KIND_ANONYMOUS &&
+        __atomic_load_n(&record->range_edit_generation, __ATOMIC_RELAXED) ==
+            view->range_edit_generation &&
+        !fault_range_claimed(record, first, end);
+}
+
+#if !defined(BOAROS_ARCH_LOONGARCH)
+#define ANONYMOUS_WRITE_WINDOW 8U
+#define ANONYMOUS_WRITE_WINDOW_MAX 16U
+_Static_assert(ANONYMOUS_WRITE_WINDOW_MAX <= PHYSICAL_PAGE_ALLOCATION_BATCH_MAX &&
+    ARCH_MMU_HUGE_SIZE % (ANONYMOUS_WRITE_WINDOW_MAX * BOAROS_PAGE_SIZE) == 0,
+    "speculative writes must fit one allocation batch and one leaf table");
+
+struct anonymous_write_window {
+    uint64_t first, end;
+    uint64_t pages[ANONYMOUS_WRITE_WINDOW_MAX];
+    unsigned mask, demand, installed;
+    int direction;
+};
+
+/* The demand lookup already holds metadata. Candidate contents carry no
+ * page-table pointer across allocation or a concurrent range edit. */
+static void select_anonymous_write_window(struct kernel_mm_record *record,
+    const struct fault_vma *view, uint64_t address, struct anonymous_write_window *window)
+{
+    const struct kernel_vma *vma = &view->vma;
+    const uint64_t page = BOAROS_PAGE_SIZE;
+    uint64_t previous = record->last_anonymous_write;
+    if (previous < vma->start || previous >= vma->end) return;
+    int direction = address == previous + page ? 1 : address + page == previous ? -1 : 0;
+    if (!direction) return;
+
+    /* A fault beyond the previous boundary confirms the direction. Align
+     * the batch to keep widely spaced writes from prefilling both windows. */
+    window->direction = direction;
+    uint64_t span = page * (record->anonymous_write_direction == direction ?
+        ANONYMOUS_WRITE_WINDOW_MAX : ANONYMOUS_WRITE_WINDOW);
+    uint64_t base = address & ~(span-1);
+    uint64_t first = direction > 0 ? address : (base > vma->start ? base : vma->start);
+    uint64_t end = direction < 0 ? address + page :
+        (base + span < vma->end ? base + span : vma->end);
+    unsigned empty, slot = (address-first)/page, demand = 1U << slot;
+    if (end-first == page || !anonymous_fault_view_current(record,first,end,view) ||
+        arch_mmu_user_empty_window(&record->space,first,(end-first)/page,&empty) ||
+        !(empty & demand) || empty == demand) return;
+    window->first = first;
+    window->end = end;
+    window->demand = slot;
+    window->mask = empty;
+}
+
+static __attribute__((noinline)) int allocate_anonymous_write_window(
+    struct physical_page_allocator *allocator, struct anonymous_write_window *window,
+    uint64_t *replacement)
+{
+    if (physical_page_available(allocator) <= physical_page_total(allocator) / 128 + 64)
+        return 0;
+    unsigned count = 0;
+    for (unsigned bits = window->mask; bits; bits &= bits-1) ++count;
+    unsigned prepared = physical_page_allocate_batch(allocator, window->pages, count);
+    if (prepared != count) {
+        physical_page_release_batch(allocator, window->pages, prepared);
+        return 0;
+    }
+    unsigned index = 0;
+    for (unsigned bits = window->mask; bits; bits &= bits-1) {
+        void *mapped;
+        if (physical_page_map_owned(allocator, window->pages[index], &mapped)) __builtin_trap();
+        clear_page(mapped);
+        if ((bits & -bits) == (1U << window->demand)) *replacement = window->pages[index];
+        ++index;
+    }
+    return count;
+}
+
+static void release_unused_anonymous_neighbours(struct physical_page_allocator *allocator,
+    struct anonymous_write_window *window)
+{
+    unsigned unused = 0, index = 0;
+    for (unsigned bits = window->mask; bits; bits &= bits-1) {
+        if (!((window->installed | (1U << window->demand)) & (bits & -bits)))
+            window->pages[unused++] = window->pages[index];
+        ++index;
+    }
+    physical_page_release_batch(allocator, window->pages, unused);
+    window->mask = 0;
+}
+#endif
 
 static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_operation *operation,
     uint64_t address, uint32_t access, const struct fault_vma *view, int force)
@@ -6340,20 +6605,25 @@ static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_op
 #if BOAROS_COST_DIAGNOSTICS
     unsigned prepared_count = 0;
 #endif
-#if BOAROS_MAX_CPUS > 1
-    uint32_t targets;
-#else
-    uint32_t targets=0;
-#endif
-    struct kernel_mm_retirement batch = {0};
+    uint32_t targets = 0;
+    /* Retirement slots are initialized by append. A new translation leaves
+     * the batch empty and must not clear those slots on every first fault. */
+    struct kernel_mm_retirement batch;
+    batch.count = batch.nonleaf = batch.compound = 0;
     struct kernel_mm_leaf_preparation prepared = KERNEL_MM_LEAF_PREPARATION_INIT;
+#if !defined(BOAROS_ARCH_LOONGARCH)
+    struct anonymous_write_window window;
+    window.mask = window.installed = 0;
+    window.direction = 0;
+    int track_anonymous_write = 0;
+#endif
     {
-        struct kernel_mm_mapping mapping;
+        struct kernel_mm_leaf leaf;
         KERNEL_LOCK_SCOPE(vma_guard);
         KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
-        status = force ? remote_lookup_record(record,address,&mapping) : lookup_record(record,address,&mapping);
-        if (status == KERNEL_MM_STATUS_OK && ((mapping.permissions & access) || (force && access == KERNEL_MM_READ))) {
-            pin_private_fault(operation,vma,mapping.physical_address,access);
+        status = fault_lookup_leaf(record,address,force,&leaf,&missing);
+        if (status == KERNEL_MM_STATUS_OK && ((leaf.permissions & access) || (force && access == KERNEL_MM_READ))) {
+            pin_private_fault(operation,vma,leaf.physical_address+address-leaf.virtual_address,access);
             kernel_raw_lock_release(&guard);
             if (!operation->populate) {
                 /* Another CPU may have published this leaf or its parents
@@ -6364,7 +6634,8 @@ static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_op
             return KERNEL_MM_STATUS_OK;
         }
         if (status == KERNEL_MM_STATUS_OK) {
-            if (operation->shared && access==KERNEL_MM_WRITE) {
+            if (operation->shared && access==KERNEL_MM_WRITE &&
+                !anonymous_fault_view_current(record, address, address+1, view)) {
                 /* A single-owner COW page can be upgraded without copying.
                  * Its saved VMA still needs the same publication check as
                  * a prepared page, including a concurrent mprotect upgrade. */
@@ -6373,14 +6644,13 @@ static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_op
                 kernel_raw_rwlock_write_acquire(&record->metadata,&guard);
                 if (memory_fault_view_changed(record,address,view))
                     return KERNEL_MM_STATUS_CONFLICT;
-                status=force?remote_lookup_record(record,address,&mapping):lookup_record(record,address,&mapping);
-                if (status!=KERNEL_MM_STATUS_OK || (mapping.permissions&access))
+                status=fault_lookup_leaf(record,address,force,&leaf,&missing);
+                if (status!=KERNEL_MM_STATUS_OK || (leaf.permissions&access))
                     return KERNEL_MM_STATUS_CONFLICT;
             }
-            if (force && access == KERNEL_MM_WRITE && !shared &&
-                arch_mmu_user_mark_cow_page(&record->space,address)) __builtin_trap();
-            if (shared || access != KERNEL_MM_WRITE || arch_mmu_user_cow_snapshot(&record->space,
-                address, &cookie, &old) != ARCH_MMU_STATUS_OK) return KERNEL_MM_STATUS_ADDRESS_SPACE;
+            if (shared || access != KERNEL_MM_WRITE ||
+                !fault_cow_source(record,address,&leaf,force,&cookie,&old))
+                return KERNEL_MM_STATUS_ADDRESS_SPACE;
             uint32_t references=physical_page_cow_borrow(allocator,old);
             if (references == 1) {
                 if (arch_mmu_user_cow_commit(&record->space, address, cookie, KERNEL_MM_NO_PAGE,
@@ -6389,11 +6659,20 @@ static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_op
                 struct mm_lazy_page *lazy=lazy_find(record,address);
                 if (lazy) lazy_retire(record,lazy);
                 pin_private_fault(operation,vma,old,access);
+#if defined(BOAROS_ARCH_LOONGARCH)
                 targets = note_tlb_change_locked(record, &batch, 0);
+#endif
                 kernel_raw_lock_release(&guard);
                 kernel_lock_scope_release(&vma_guard);
                 if (lazy) lazy_drain(record);
+#if defined(BOAROS_ARCH_LOONGARCH)
                 finish_tlb_change(record, &batch, targets, address, BOAROS_PAGE_SIZE,0);
+#else
+                /* The PTE still refers to the same page. Remote read-only
+                 * translations can retry through the already-writable case. */
+                if (batch.count) __builtin_trap();
+                sync_tlb_change(0, address, BOAROS_PAGE_SIZE, 0);
+#endif
                 return KERNEL_MM_STATUS_OK;
             }
             /* COW旧页为只读快照；实际引用覆盖解锁后的复制和竞争者提交。 */
@@ -6405,8 +6684,15 @@ static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_op
             if (!shared && !elf && vma->role != KERNEL_VMA_ROLE_VDSO &&
                 vma->role != KERNEL_VMA_ROLE_VVAR &&
                 vma->fault_policy != KERNEL_VMA_FAULT_DEMAND_ZERO) return status;
-            if (arch_mmu_user_leaf_missing(&record->space, address, &missing) != ARCH_MMU_STATUS_OK)
-                return KERNEL_MM_STATUS_ADDRESS_SPACE;
+#if !defined(BOAROS_ARCH_LOONGARCH)
+            track_anonymous_write = operation->shared && access == KERNEL_MM_WRITE &&
+                vma->kind == KERNEL_VMA_KIND_ANONYMOUS && !operation->populate &&
+                !operation->fault_pin && !force && riscv_mmu_svvptc &&
+                !(vma->permissions & KERNEL_MM_EXECUTE) &&
+                !(vma->flags & (KERNEL_VMA_RANDOM_READ | KERNEL_VMA_LOCK_MASK));
+            if (track_anonymous_write && !missing)
+                select_anonymous_write_window(record,view,address,&window);
+#endif
         } else return status;
     }
     /* VMA注册覆盖此处取得实际后备owner；放gate后不再借用registry节点。 */
@@ -6426,11 +6712,10 @@ static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_op
         if (!source_owner || __atomic_fetch_add(&source_owner->faults, 1, __ATOMIC_RELAXED) == UINT32_MAX) __builtin_trap();
     }
 #if BOAROS_MAX_CPUS > 1
-    /* Fresh anonymous pages need no I/O or backing owner after preparation.
-     * Keep the existing shared qualification; allocation pressure releases it
-     * in allocate_fault_page before reclaim can wait for an MM editor. */
-    if (!operation->shared || object || elf || current_pins(operation->mm) ||
-        (!operation->populate && cookie))
+    /* An anonymous zero-fill or COW copy needs no backing I/O. The borrowed
+     * COW page owns the source; allocation pressure releases the shared gate
+     * before reclaim can wait for an MM editor. */
+    if (!operation->shared || object || elf || current_pins(operation->mm))
 #endif
         mm_operation_release(operation);
     /* The publishing writer also drains retired ELF owners after the fault. */
@@ -6438,7 +6723,7 @@ static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_op
     if (source) {
         enum kernel_elf64_source_status result = kernel_elf64_source_page(source, allocator,
             vma->backing_offset + address - vma->start, &replacement, &source_shared,
-            !(vma->flags&KERNEL_VMA_RANDOM_READ));
+            file_fault_read_window(vma,access));
         status = !result ? KERNEL_MM_STATUS_OK : result == KERNEL_ELF64_SOURCE_STATUS_NO_MEMORY ?
             KERNEL_MM_STATUS_NO_MEMORY : result == KERNEL_ELF64_SOURCE_STATUS_IO ?
             KERNEL_MM_STATUS_BUS_FAULT : result == KERNEL_ELF64_SOURCE_STATUS_CLEANUP_REQUIRED ?
@@ -6476,6 +6761,15 @@ static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_op
         status = KERNEL_MM_STATUS_OK;
 #endif
     } else {
+#if !defined(BOAROS_ARCH_LOONGARCH)
+        int allocated = window.mask && operation->guard.lock ?
+            allocate_anonymous_write_window(allocator,&window,&replacement) : 0;
+        if (allocated) {
+            status = KERNEL_MM_STATUS_OK;
+            MM_DIAGNOSTIC(prepared_count += allocated);
+        } else {
+            window.mask = 0;
+#endif
         status = allocate_fault_page(operation, &replacement, &new_pointer);
         if (status == KERNEL_MM_STATUS_OK) {
             MM_DIAGNOSTIC(prepared_count++);
@@ -6491,6 +6785,9 @@ static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_op
                 }
             }
         }
+#if !defined(BOAROS_ARCH_LOONGARCH)
+        }
+#endif
     }
 prepare_memory_tables:
     for (unsigned i = 0; i < 2 && status == KERNEL_MM_STATUS_OK; i++) if ((missing & (1U << i)) && prepared.tables[i] == KERNEL_MM_NO_PAGE) {
@@ -6498,9 +6795,10 @@ prepare_memory_tables:
         status = allocate_fault_page(operation, &prepared.tables[i], &pointer);
         if (status == KERNEL_MM_STATUS_OK) { clear_page(pointer); MM_DIAGNOSTIC(prepared_count++); }
     }
+    int continuous_gate = operation->guard.lock != NULL;
     enum kernel_mm_status gate_status =
 #if BOAROS_MAX_CPUS > 1
-        operation->guard.lock ? KERNEL_MM_STATUS_OK :
+        continuous_gate ? KERNEL_MM_STATUS_OK :
 #endif
         mm_operation_lock(operation);
     if (gate_status != KERNEL_MM_STATUS_OK) status = gate_status;
@@ -6511,14 +6809,23 @@ prepare_memory_tables:
     int fault_batch=source && source_shared && access!=KERNEL_MM_WRITE && !force &&
         !operation->populate && !(vma->flags&KERNEL_VMA_RANDOM_READ);
     if (status == KERNEL_MM_STATUS_OK) {
-        /* Keep this qualification through the raw publication: a complete
-         * anonymous unmap can remove its range claim before we get the raw. */
         KERNEL_LOCK_SCOPE(vma_guard);
-        if (operation->shared)
-            kernel_rwlock_read(&record->vma_lock, &vma_guard);
-        KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
+        struct kernel_raw_guard guard __attribute__((cleanup(kernel_raw_scope_release))) = {0};
+        int current_view = 0;
+        if (operation->shared && continuous_gate &&
+            vma->kind == KERNEL_VMA_KIND_ANONYMOUS) {
+            kernel_raw_rwlock_write_acquire(&record->metadata, &guard);
+            current_view = anonymous_fault_view_current(record, address, address+1, view);
+            if (!current_view) kernel_raw_lock_release(&guard);
+        }
+        if (!current_view) {
+            /* A dropped MM gate or completed range edit needs the current VMA. */
+            if (operation->shared)
+                kernel_rwlock_read(&record->vma_lock, &vma_guard);
+            kernel_raw_rwlock_write_acquire(&record->metadata, &guard);
+        }
         uint64_t latest_epoch=0;
-        if (memory_fault_view_changed(record,address,view) ||
+        if ((!current_view && memory_fault_view_changed(record,address,view)) ||
             (object && (kernel_memory_object_epoch(object,&latest_epoch) || latest_epoch!=object_epoch)))
             status = KERNEL_MM_STATUS_CONFLICT;
         else {
@@ -6526,6 +6833,15 @@ prepare_memory_tables:
             if (cookie) backend = arch_mmu_user_cow_commit(&record->space, address, cookie,
                 replacement, backend_permissions_from_mm(vma->permissions), &batch);
             else {
+#if !defined(BOAROS_ARCH_LOONGARCH)
+                if (window.mask && current_view && anonymous_fault_view_current(record,
+                    window.first,window.end,view))
+                    window.installed = riscv_sv39_user_map_zero_window(&record->space,
+                        window.first,window.mask,window.pages,
+                        backend_permissions_from_mm(vma->permissions),window.demand);
+                if (window.installed) backend = ARCH_MMU_STATUS_OK;
+                else
+#endif
                 backend = arch_mmu_user_map_prepared_page(&record->space, address, replacement,
                     backend_permissions_from_mm(source_shared ? vma->permissions & ~KERNEL_MM_WRITE :
                         vma->permissions), source_shared, &prepared);
@@ -6539,6 +6855,15 @@ prepare_memory_tables:
                 backend == ARCH_MMU_STATUS_CONFLICT || backend == ARCH_MMU_STATUS_NOT_MAPPED ?
                 KERNEL_MM_STATUS_CONFLICT : KERNEL_MM_STATUS_ADDRESS_SPACE;
             if (status == KERNEL_MM_STATUS_OK) {
+#if !defined(BOAROS_ARCH_LOONGARCH)
+                if (current_view && track_anonymous_write) {
+                    record->last_anonymous_write = address;
+                    record->anonymous_write_direction = window.direction;
+                    if (window.installed && window.installed == window.mask)
+                        record->last_anonymous_write = window.direction > 0 ?
+                            window.end-BOAROS_PAGE_SIZE : window.first;
+                }
+#endif
                 if (cookie) {
                     struct mm_lazy_page *lazy=lazy_find(record,address);
                     if (lazy) { lazy_retire(record,lazy);lazy_retired=1; }
@@ -6553,6 +6878,9 @@ prepare_memory_tables:
     }
     if (lazy_retired) lazy_drain(record);
 memory_tables_changed:
+#if !defined(BOAROS_ARCH_LOONGARCH)
+    if (window.mask) release_unused_anonymous_neighbours(allocator,&window);
+#endif
     if (refill) {
         mm_operation_release(operation);
         goto prepare_memory_tables;
@@ -6752,10 +7080,8 @@ static __attribute__((noinline)) enum kernel_mm_status associate_anonymous_fault
     struct kernel_mm_record *record=operation->record;
     KERNEL_LOCK_SCOPE(vma_guard);
     if (operation->shared) kernel_rwlock_write(&record->vma_lock,&vma_guard);
-    if (kernel_vma_set_generation(record->vmas)!=view->generation)
+    if (!kernel_vma_set_mark_anonymous(record->vmas,address,view->generation,&view->vma))
         return KERNEL_MM_STATUS_CONFLICT;
-    kernel_vma_set_mark_anonymous(record->vmas,address);
-    view->vma.flags |= KERNEL_VMA_ANON_HISTORY;
     view->generation=kernel_vma_set_generation(record->vmas);
     return KERNEL_MM_STATUS_OK;
 }
@@ -7100,14 +7426,8 @@ static struct kernel_task *fault_actor(struct kernel_mm *mm)
     return task;
 }
 static enum kernel_mm_status resolve_fault_accounted(struct kernel_mm *mm,
-    uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin)
+    uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin, struct kernel_task *task)
 {
-    struct kernel_task *task = kernel_task_current();
-    const struct kernel_mm *task_mm = 0;
-    if (!mm || !task || !kernel_task_has_user_context(task) ||
-        kernel_task_mm_borrow(task, &task_mm) !=
-                     KERNEL_TASK_STATUS_OK ||
-        task_mm->record != mm->record) task = 0;
     uint64_t block_reads = task ? kernel_task_read_bytes(task) : 0U;
     enum kernel_mm_status status = resolve_user_fault(mm,address,access,0,pin);
     if (status == KERNEL_MM_STATUS_OK && task)
@@ -7117,7 +7437,11 @@ static enum kernel_mm_status resolve_fault_accounted(struct kernel_mm *mm,
 }
 
 enum kernel_mm_status kernel_mm_resolve_user_fault(struct kernel_mm *mm,uint64_t address,uint32_t access)
-{ return resolve_fault_accounted(mm,address,access,NULL); }
+{ return resolve_fault_accounted(mm,address,access,NULL,fault_actor(mm)); }
+
+enum kernel_mm_status kernel_mm_resolve_owned_user_fault(struct kernel_mm *mm,
+    struct kernel_task *task,uint64_t address,uint32_t access)
+{ return resolve_fault_accounted(mm,address,access,NULL,task); }
 
 enum kernel_mm_status kernel_mm_resolve_user_pin(struct kernel_mm *mm,uint64_t address,
     uint32_t access,struct kernel_mm_user_pin *pin)
@@ -7125,7 +7449,7 @@ enum kernel_mm_status kernel_mm_resolve_user_pin(struct kernel_mm *mm,uint64_t a
     if (!pin) return KERNEL_MM_STATUS_INVALID_ARGUMENT;
     if (pin->registration) __builtin_trap();
     for (;;) {
-        enum kernel_mm_status status=resolve_fault_accounted(mm,address,access,pin);
+        enum kernel_mm_status status=resolve_fault_accounted(mm,address,access,pin,fault_actor(mm));
         if (status || pin->registration) return status;
         status=kernel_mm_pin_user_page(mm,address,access,pin);
         if (status!=KERNEL_MM_STATUS_NOT_MAPPED && status!=KERNEL_MM_STATUS_ACCESS) return status;

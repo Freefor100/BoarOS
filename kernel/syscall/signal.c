@@ -96,7 +96,6 @@ enum kernel_syscall_status syscall_handle_rt_sigaction(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
-    KERNEL_SERVICE_SCOPE(service);
     uint32_t sig = (uint32_t)request->arguments[0];
     uint64_t input = request->arguments[1];
     uint64_t output = request->arguments[2];
@@ -125,6 +124,7 @@ enum kernel_syscall_status syscall_handle_rt_sigaction(
         }
     }
     if (input != 0U) {
+        KERNEL_SERVICE_SCOPE(service);
         status = kernel_signal_set_action(caller, sig, &action, &old_action);
     } else status = kernel_signal_get_action(caller, sig, &old_action);
     if (status != KERNEL_SIGNAL_STATUS_OK) return signal_result(status, decoded);
@@ -143,7 +143,6 @@ enum kernel_syscall_status syscall_handle_rt_sigprocmask(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
-    KERNEL_SERVICE_SCOPE(service);
     uint32_t how = (uint32_t)request->arguments[0];
     uint64_t input = request->arguments[1];
     uint64_t output = request->arguments[2];
@@ -187,7 +186,6 @@ enum kernel_syscall_status syscall_handle_rt_sigpending(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
-    KERNEL_SERVICE_SCOPE(service);
     struct kernel_mm *mm;
     uint64_t pending;
     enum kernel_uaccess_status copy_status;

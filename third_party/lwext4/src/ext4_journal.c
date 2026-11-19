@@ -1888,7 +1888,8 @@ bool jbd_journal_borrow_data(struct ext4_fs *fs, ext4_fsblk_t lba,
 {
     *borrow = (struct jbd_data_borrow){0};
     struct jbd_journal *journal = fs->jbd_journal;
-    if (!journal) return false;
+    if (!journal || !__atomic_load_n(&journal->ordered_trees, __ATOMIC_ACQUIRE))
+        return false;
     JBD_STATE_READ_SCOPE(journal);
     struct jbd_data *data = jbd_trans_find_data(ext4_current_trans(fs), lba);
     if (!data) data = jbd_trans_find_data(journal->running, lba);
@@ -2063,6 +2064,9 @@ int jbd_trans_write_data(struct jbd_trans *trans, ext4_fsblk_t lba,
 	}
 	data->completed = false;
 	if (fresh) {
+		if (!trans->ordered_count &&
+		    __atomic_fetch_add(&journal->ordered_trees, 1, __ATOMIC_ACQ_REL) == UINT32_MAX)
+			__builtin_trap();
 		RB_INSERT(jbd_data_tree, &trans->data_root, data);
 		TAILQ_INSERT_TAIL(&trans->data_queue, data, node);
 		trans->ordered_count++;
@@ -2079,6 +2083,8 @@ static struct jbd_data *jbd_trans_detach_data(struct jbd_trans *trans)
     if (!!first!=!!trans->ordered_count || !!first!=!RB_EMPTY(&trans->data_root)) __builtin_trap();
     TAILQ_INIT(&trans->data_queue);
     RB_INIT(&trans->data_root);
+    if (first && !__atomic_fetch_sub(&trans->journal->ordered_trees, 1, __ATOMIC_ACQ_REL))
+        __builtin_trap();
     return first;
 }
 
@@ -3211,6 +3217,9 @@ int jbd_journal_accept_state_held(struct jbd_journal *journal, struct jbd_trans 
 				running->data_cnt++;
 			}
 		}
+		/* Moving into an empty running tree transfers the existing count.
+		 * Two populated trees become one only after all records have moved. */
+		bool merge_data_trees = running->ordered_count && operation->ordered_count;
 		TAILQ_FOREACH_SAFE(data, &operation->data_queue, node, next_data) {
 			TAILQ_REMOVE(&operation->data_queue, data, node);
 			RB_REMOVE(jbd_data_tree, &operation->data_root, data);
@@ -3223,6 +3232,9 @@ int jbd_journal_accept_state_held(struct jbd_journal *journal, struct jbd_trans 
 			RB_INSERT(jbd_data_tree, &running->data_root, data);
 			TAILQ_INSERT_TAIL(&running->data_queue, data, node);
 		}
+		if (merge_data_trees &&
+		    __atomic_fetch_sub(&journal->ordered_trees, 1, __ATOMIC_ACQ_REL) < 2)
+			__builtin_trap();
 		struct jbd_revoke_rec *rec, *next_rec;
 		RB_FOREACH_SAFE(rec, jbd_revoke_tree, &operation->revoke_root, next_rec) {
 			RB_REMOVE(jbd_revoke_tree, &operation->revoke_root, rec);

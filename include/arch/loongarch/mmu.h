@@ -77,6 +77,8 @@ struct arch_mmu_mapping {
  * MM metadata protection; the result does not itself acquire ownership. */
 enum arch_mmu_status arch_mmu_user_leaf_snapshot(
     const struct arch_mmu_user_space *, uint64_t, struct kernel_mm_leaf *);
+enum arch_mmu_status arch_mmu_user_leaf_probe(
+    const struct arch_mmu_user_space *, uint64_t, struct kernel_mm_leaf *, unsigned *missing_tables);
 enum arch_mmu_status arch_mmu_user_empty_window(const struct arch_mmu_user_space *,
     uint64_t, unsigned, unsigned *);
 enum arch_mmu_status arch_mmu_user_leaf_missing_order(
@@ -116,6 +118,15 @@ enum arch_mmu_status arch_mmu_user_next_owned(
     struct arch_mmu_user_space *, uint64_t *, uint64_t end, uint64_t *);
 enum arch_mmu_status arch_mmu_user_owned_snapshot(
     struct arch_mmu_user_space *, uint64_t, uint64_t *, int *);
+/* Fork window starts on an inherited leaf of an unpublished child. Parent
+ * metadata is held by the caller. Return the first address beyond the window. */
+enum arch_mmu_status arch_mmu_user_fork_commit_window(
+    struct arch_mmu_user_space *, const struct arch_mmu_user_space *, uint64_t, uint64_t *,
+    int (*)(void *, uint64_t), void *, int *changed);
+/* One base-leaf table. Transfer owned base-page references for returned
+ * bits only, consuming the packed vector in increasing selected-bit order. */
+unsigned arch_mmu_user_map_owned_window(struct arch_mmu_user_space *, uint64_t,
+    unsigned, const uint64_t *, uint32_t);
 enum arch_mmu_status arch_mmu_user_mark_cow_page(struct arch_mmu_user_space *, uint64_t);
 enum arch_mmu_status arch_mmu_user_space_fork_prepare(
     struct arch_mmu_user_space *, struct arch_mmu_user_space *,

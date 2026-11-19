@@ -335,8 +335,8 @@ size_t kernel_fs_context_pivot_publish(const struct kernel_fs_context *fs,
             /* The initial root was borrowed from the boot owner. Once it is
              * an ordinary child, its connection needs an independent owner. */
             struct kernel_vfs_mount *mount=kernel_vfs_path_mount(old);
-            if(mount->references==UINT32_MAX)__builtin_trap();
-            mount->references++;mount->external_owner=1;ns->copied_tree=1;
+            if(kernel_vfs_mount_view_acquire_locked(mount))__builtin_trap();
+            mount->external_owner=1;ns->copied_tree=1;
         }
         if(kernel_vfs_path_acquire(next))__builtin_trap();
         ns->top=next;count++;

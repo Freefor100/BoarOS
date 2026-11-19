@@ -3413,6 +3413,10 @@ static void caller_metadata_owners(struct kernel_page_cache *cache, const char *
     unsigned char bytes[BOAROS_PAGE_SIZE]; memset(bytes,0x53,sizeof(bytes)); size_t done;
     assert(!kernel_vfs_pwrite(&unrelated,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
     uint64_t error=0; assert(!kernel_vfs_sync(&unrelated,0,&error));
+    /* Reclaim positive names while the file handles still own their paths.
+     * After close, the retired data page must be the unrelated inode's
+     * final owner for this regression to exercise deferred final close. */
+    (void)kernel_vfs_reclaim_clean(backend_heap.page_allocator,UINT64_MAX);
     assert(!kernel_vfs_close(&unrelated) && other->cache_pages.rbh_root);
     struct kernel_vfs_instance *instance=mount.private_data;
     const struct kernel_vfs_backend *backend=instance->ops;

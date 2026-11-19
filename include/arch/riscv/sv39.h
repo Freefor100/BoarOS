@@ -18,6 +18,7 @@
 #define RISCV_SV39_USER_LIMIT (UINT64_C(1) << 38U)
 /* Boot publishes the intersection for the harts that will execute userspace. */
 extern unsigned riscv_mmu_svvptc;
+extern unsigned riscv_mmu_cboz64;
 
 #define RISCV_SV39_READ (UINT32_C(1) << 0U)
 #define RISCV_SV39_WRITE (UINT32_C(1) << 1U)
@@ -202,6 +203,18 @@ enum riscv_sv39_status riscv_sv39_user_next_owned(
     struct riscv_sv39_user_space *, uint64_t *, uint64_t end, uint64_t *);
 enum riscv_sv39_status riscv_sv39_user_owned_snapshot(
     struct riscv_sv39_user_space *, uint64_t, uint64_t *, int *);
+/* Fork window starts on an inherited leaf of an unpublished child. Parent
+ * metadata is held by the caller. Return the first address beyond the window. */
+enum riscv_sv39_status riscv_sv39_user_fork_commit_window(
+    struct riscv_sv39_user_space *, const struct riscv_sv39_user_space *, uint64_t, uint64_t *,
+    int (*)(void *, uint64_t), void *, int *changed);
+/* One base-leaf table. Transfer owned base-page references for returned
+ * bits only, consuming the packed vector in increasing selected-bit order. */
+unsigned riscv_sv39_user_map_owned_window(struct riscv_sv39_user_space *, uint64_t,
+    unsigned, const uint64_t *, uint32_t);
+/* Publish the window only if its required demand slot is still empty. */
+unsigned riscv_sv39_user_map_zero_window(struct riscv_sv39_user_space *, uint64_t,
+    unsigned, const uint64_t *, uint32_t, unsigned required_slot);
 enum riscv_sv39_status riscv_sv39_user_mark_cow_page(
     struct riscv_sv39_user_space *, uint64_t);
 enum riscv_sv39_status riscv_sv39_user_space_fork_prepare(
@@ -270,6 +283,8 @@ enum riscv_sv39_status riscv_sv39_user_space_destroy(
 
 enum riscv_sv39_status riscv_sv39_user_leaf_snapshot(const struct riscv_sv39_user_space *,
     uint64_t, struct kernel_mm_leaf *);
+enum riscv_sv39_status riscv_sv39_user_leaf_probe(const struct riscv_sv39_user_space *,
+    uint64_t, struct kernel_mm_leaf *, unsigned *missing_tables);
 enum riscv_sv39_status riscv_sv39_user_empty_window(const struct riscv_sv39_user_space *,
     uint64_t, unsigned, unsigned *);
 enum riscv_sv39_status riscv_sv39_user_leaf_missing_order(struct riscv_sv39_user_space *,

@@ -14,6 +14,9 @@ struct kernel_mm_leaf {
     uint32_t order;           /* number of base-page address bits in this leaf */
     uint32_t cow;
 };
+/* A leaf probe also states which parents are missing for a base-page install:
+ * bit 0 is the middle table, bit 1 the leaf table. Present or PROT_NONE leaves
+ * have no missing parents. The mask is a preparation hint, not a reference. */
 static inline uint64_t kernel_mm_leaf_size(const struct kernel_mm_leaf *leaf)
 { return (uint64_t)BOAROS_PAGE_SIZE << leaf->order; }
 #endif

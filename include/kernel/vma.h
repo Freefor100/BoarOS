@@ -26,8 +26,9 @@ void kernel_vma_set_clear_locks(struct kernel_vma_set *);
 #define KERNEL_VMA_ANON_HISTORY 128U /* established private backing (including anonymous read faults); survives DONTNEED */
 #define KERNEL_VMA_ANON_SOURCE 256U /* lazy ELF zero-fill, not file-backed */
 #define KERNEL_VMA_ALL_FLAGS 511U
-/* Caller holds the VMA writer qualification; no allocation or range split. */
-void kernel_vma_set_mark_anonymous(struct kernel_vma_set *, uint64_t address);
+/* The VMA writer is held. Revalidate the fault snapshot and mark private backing. */
+int kernel_vma_set_mark_anonymous(struct kernel_vma_set *, uint64_t address,
+    uint64_t generation, struct kernel_vma *snapshot);
 uint64_t kernel_vma_set_data_bytes(const struct kernel_vma_set *set);
 int kernel_vma_is_data(const struct kernel_vma *vma);
 
@@ -164,6 +165,9 @@ enum kernel_vma_status kernel_vma_set_lookup(
     struct kernel_vma *vma);
 
 int kernel_vma_set_has_shm(const struct kernel_vma_set *, uint64_t start, uint64_t length);
+int kernel_vma_set_range_is_anonymous(const struct kernel_vma_set *, uint64_t start, uint64_t end);
+int kernel_vma_set_permission_addition(const struct kernel_vma_set *, uint64_t start,
+    uint64_t end, uint32_t permissions, int *unchanged);
 uint32_t kernel_vma_set_count(const struct kernel_vma_set *set);
 
 enum kernel_vma_status kernel_vma_set_get_at(

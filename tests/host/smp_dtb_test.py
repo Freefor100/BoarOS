@@ -13,7 +13,7 @@ class CpuInfo(C.Structure):
     _fields_ = [("hart_ids", C.c_uint64 * 8), ("count", C.c_uint32), ("features", C.c_uint32)]
 
 
-def blob(cpus, cells=1, parent_status=None, extensions=None, isa=None):
+def blob(cpus, cells=1, parent_status=None, extensions=None, isa=None, zero_blocks=None):
     strings, body, offsets = bytearray(), bytearray(), {}
     word = lambda value: struct.pack(">I", value)
 
@@ -54,6 +54,8 @@ def blob(cpus, cells=1, parent_status=None, extensions=None, isa=None):
             prop("riscv,isa-extensions", extensions[hart])
         if isa and hart in isa:
             prop("riscv,isa", isa[hart])
+        if zero_blocks and hart in zero_blocks:
+            prop("riscv,cboz-block-size", word(zero_blocks[hart]))
         if status:
             prop("status", status)
         end()
@@ -112,6 +114,11 @@ def main():
         assert run([cpu(0),cpu(1)],extensions={0:both,1:feature})[1].features==1
         assert run([cpu(0),(1,b"disabled\0",None,False)],extensions={0:both})[1].features==3
         assert run([cpu(0)],extensions={0:feature},isa={0:b"rv64imafdcv\0"})[1].features==1
+        cboz = {0:b"i\0zicboz\0", 1:b"i\0zicboz\0"}
+        assert run([cpu(0), cpu(1)], extensions=cboz, zero_blocks={0:64, 1:64})[1].features == 4
+        assert run([cpu(0), cpu(1)], extensions=cboz, zero_blocks={0:64, 1:128})[1].features == 0
+        assert run([cpu(0)], extensions={0:b"i\0"}, zero_blocks={0:64})[1].features == 0
+        assert run([cpu(0)], extensions=cboz)[1].features == 0
         boot_features=C.CDLL(str(lib)).dtb_read_boot_cpu_features
         boot_features.argtypes=[C.c_void_p,C.c_uint64,C.POINTER(C.c_uint32)]
         data=C.create_string_buffer(blob([cpu(i) for i in range(10)],extensions={3:feature}))

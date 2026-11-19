@@ -22,7 +22,10 @@ typedef uint64_t (*physical_page_reclaim_fn)(void *context,
 struct kernel_memory_statistics;
 struct physical_page_reclaim_hooks {
     physical_page_reclaim_fn reclaim;
-    void (*notify)(void *);
+    void (*notify)(void *, uint64_t available_pages);
+    /* Optional filter under allocator->lock. Read only, no locks or waits.
+     * Allocation failure still captures the hooks for actual reclaim. */
+    int (*wants_notification)(void *, uint64_t available_pages);
     void (*wait)(void *);
     void (*snapshot)(void *, struct kernel_memory_statistics *);
     uint32_t *(*depth)(void);
@@ -217,6 +220,10 @@ enum physical_page_status physical_page_allocation_order(
     const struct physical_page_allocator *allocator,
     uint64_t address,
     uint32_t *order);
+
+/* The caller owns a live head reference with stable allocation metadata. */
+int physical_page_owned_order(const struct physical_page_allocator *,
+    uint64_t address, uint32_t order);
 
 /* The caller must own an allocated page; this validates only address history. */
 /* 内部持有者访问：调用者须已持有覆盖此次使用的页、页表或 pin 引用。

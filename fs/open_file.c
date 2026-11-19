@@ -1339,7 +1339,7 @@ static inline __attribute__((always_inline)) enum kernel_page_cache_status disk_
 {
     uint32_t policy=__atomic_load_n(&file->read_advice,__ATOMIC_RELAXED);
     return kernel_page_cache_get_for_fault(cache,&file->file,index,address,valid,
-        read_window && !(policy&(KERNEL_READ_RANDOM|KERNEL_READ_NOREUSE)),
+        policy&(KERNEL_READ_RANDOM|KERNEL_READ_NOREUSE) ? KERNEL_PAGE_CACHE_FAULT_SINGLE : read_window,
         !!(policy&KERNEL_READ_NOREUSE));
 }
 
@@ -1361,6 +1361,20 @@ int kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *f
     *prepared=(struct kernel_open_file_page_preparation){.address=address,.index=index,.pending=1};
     return 0;
 }
+
+/* The caller holds a live disk OFD. This path never starts or waits for I/O. */
+int kernel_open_file_try_prepare_disk_mapping_page(struct kernel_open_file_description *file,
+    uint64_t index, struct kernel_open_file_page_preparation *prepared)
+{
+    uint32_t policy=__atomic_load_n(&file->read_advice,__ATOMIC_RELAXED);
+    uint64_t address;
+    size_t valid;
+    if (kernel_page_cache_lookup_ready(kernel_vfs_file_page_cache(&file->file),
+        &file->file,index,&address,&valid,!!(policy&KERNEL_READ_NOREUSE))) return 0;
+    *prepared=(struct kernel_open_file_page_preparation){.address=address,.index=index,.pending=1};
+    return 1;
+}
+
 void kernel_open_file_finish_mapping_page(struct kernel_open_file_description *file,
     struct kernel_open_file_page_preparation *prepared,int accepted)
 {

@@ -2915,8 +2915,7 @@ static int ext4_backend_readlink(struct kernel_vfs_node *node, char *buffer, siz
 {
     KERNEL_LOCK_SCOPE(inode_guard);
     kernel_vfs_node_lock(node,&inode_guard,0);
-    return lwext4_error(ext4_readlink_inode(lwext4_instance(node->instance)->mount_point,
-        node->inode,buffer,size,count));
+    return lwext4_error(ext4_fpread(lwext4_node_file(node), 0, buffer, size, count));
 }
 static int ext4_backend_truncate(struct kernel_vfs_node *node, uint64_t size, uint64_t *actual, int *changed)
 {

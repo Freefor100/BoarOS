@@ -892,6 +892,7 @@ static void kernel_main_high(void)
     kernel_cpu_boot_rebind();
     riscv_vector_boot(boot_features);
     riscv_mmu_svvptc=!!(boot_features&DTB_CPU_MMU_SVVPTC);
+    riscv_mmu_cboz64=!!(boot_features&DTB_CPU_ZICBOZ_64);
     virt_uart_puts("BoarOS: MMU Svvptc=");virt_uart_put_hex(riscv_mmu_svvptc);virt_uart_putc('\n');
 #if BOAROS_MAX_CPUS > 1
     kernel_cpu_set_boot_count(boot_cpus.count);

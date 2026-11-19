@@ -168,6 +168,11 @@ enum kernel_page_cache_status kernel_page_cache_get(
     size_t *valid_bytes);
 /* A cold demand may synchronously fill bounded neighbours. Only the target
  * page result is returned; hot/loading pages retain the scalar path. */
+enum kernel_page_cache_fault_window {
+    KERNEL_PAGE_CACHE_FAULT_SINGLE,
+    KERNEL_PAGE_CACHE_FAULT_READ_AHEAD,
+    KERNEL_PAGE_CACHE_FAULT_EXEC_AHEAD,
+};
 enum kernel_page_cache_status kernel_page_cache_get_for_fault(
     struct kernel_page_cache *,const struct kernel_vfs_file *,uint64_t,
     uint64_t *,size_t *,int read_window,int no_reuse);
@@ -204,6 +209,10 @@ enum kernel_page_cache_status kernel_page_cache_lookup(
     uint64_t page_index,
     uint64_t *physical_address,
     size_t *valid_bytes);
+enum kernel_page_cache_status kernel_page_cache_lookup_ready(
+    struct kernel_page_cache *cache, const struct kernel_vfs_file *file,
+    uint64_t page_index, uint64_t *physical_address, size_t *valid_bytes,
+    int no_reuse);
 
 /* Selected bits are offsets from first. Returned bits identify READY pages;
  * addresses are packed in increasing index order, one physical owner per bit. */

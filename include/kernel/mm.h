@@ -371,6 +371,11 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(
     uint64_t virtual_address,
     uint32_t access);
 
+struct kernel_task;
+/* The scheduler has validated the running user and supplied its owned MM. */
+enum kernel_mm_status kernel_mm_resolve_owned_user_fault(struct kernel_mm *,
+    struct kernel_task *, uint64_t virtual_address, uint32_t access);
+
 /* SysV shared memory attach and detach */
 struct kernel_shm_segment;
 enum kernel_mm_status kernel_mm_shmat(
@@ -386,7 +391,6 @@ enum kernel_mm_status kernel_mm_shmdt(
     uint64_t address);
 
 /* Success consumes one reference; last-reference cleanup can retain VFS owners. */
-struct kernel_task;
 /* Cleanup workers preserve the initiating task for VMA close accounting. */
 enum kernel_mm_status kernel_mm_release_for_task(struct kernel_mm *,const struct kernel_task *);
 enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm);

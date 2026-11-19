@@ -21,6 +21,7 @@ struct kernel_vma_set {
     uint32_t capacity;
     uint64_t generation;
     struct vma_usage usage;
+    unsigned deferred_merge;
 };
 
 static int set_valid(const struct kernel_vma_set *set)
@@ -95,20 +96,6 @@ uint64_t kernel_vma_set_locked_bytes(const struct kernel_vma_set *set)
 {
     if (!set_valid(set)) __builtin_trap();
     return set->usage.locked;
-}
-
-uint64_t kernel_vma_set_locked_range(const struct kernel_vma_set *set, uint64_t start, uint64_t end)
-{
-    uint64_t bytes = 0;
-    for (uint32_t i = 0; i < set->count; i++) {
-        const struct kernel_vma *v = &set->entries[i];
-        if (v->start >= end) break;
-        if (v->end <= start || !(v->flags & KERNEL_VMA_LOCKED)) continue;
-        uint64_t a = v->start > start ? v->start : start;
-        uint64_t b = v->end < end ? v->end : end;
-        bytes += b - a;
-    }
-    return bytes;
 }
 
 static void merge_all(struct kernel_vma_set *set);
@@ -236,6 +223,28 @@ static uint32_t lower_bound(const struct kernel_vma_set *set,
     return low;
 }
 
+static uint32_t first_overlap(const struct kernel_vma_set *set, uint64_t start)
+{
+    uint32_t index = lower_bound(set, start);
+    if (index && set->entries[index - 1].end > start) index--;
+    return index;
+}
+
+uint64_t kernel_vma_set_locked_range(const struct kernel_vma_set *set, uint64_t start, uint64_t end)
+{
+    if (!set->usage.locked || start >= end) return 0;
+    uint64_t bytes = 0;
+    for (uint32_t i = first_overlap(set, start);
+         i < set->count && set->entries[i].start < end; i++) {
+        const struct kernel_vma *v = &set->entries[i];
+        if (!(v->flags & KERNEL_VMA_LOCKED)) continue;
+        uint64_t a = v->start > start ? v->start : start;
+        uint64_t b = v->end < end ? v->end : end;
+        bytes += b - a;
+    }
+    return bytes;
+}
+
 /* The caller holds the MM operation lock. Include the interval containing
  * start, then walk only the sorted entries overlapping the requested range. */
 int kernel_vma_set_has_shm(const struct kernel_vma_set *set,
@@ -244,11 +253,41 @@ int kernel_vma_set_has_shm(const struct kernel_vma_set *set,
     if (!set || !length || start >= ARCH_MMU_USER_LIMIT ||
         length > ARCH_MMU_USER_LIMIT - start) return 0;
     uint64_t end = start + length;
-    uint32_t index = lower_bound(set, start);
-    if (index && set->entries[index - 1].end > start) index--;
-    for (; index < set->count && set->entries[index].start < end; index++)
+    for (uint32_t index = first_overlap(set, start);
+         index < set->count && set->entries[index].start < end; index++)
         if (set->entries[index].shm_attachment) return 1;
     return 0;
+}
+
+/* Holes carry no backing and do not require exclusive MM operation access. */
+int kernel_vma_set_range_is_anonymous(const struct kernel_vma_set *set,
+                                      uint64_t start, uint64_t end)
+{
+    if (!set || start >= end) return 1;
+    if (!set_valid(set)) __builtin_trap();
+    for (uint32_t index = first_overlap(set, start);
+         index < set->count && set->entries[index].start < end; index++)
+        if (set->entries[index].kind != KERNEL_VMA_KIND_ANONYMOUS) return 0;
+    return 1;
+}
+
+/* Caller holds the VMA qualification. The ordered array needs one seek
+ * even when a permission increase spans many existing fragments. */
+int kernel_vma_set_permission_addition(const struct kernel_vma_set *set,
+    uint64_t start, uint64_t end, uint32_t permissions, int *unchanged)
+{
+    *unchanged=1;
+    if (!set_valid(set) || start>=end) return 0;
+    uint32_t index=first_overlap(set,start);
+    while (start<end) {
+        if (index==set->count) return 0;
+        const struct kernel_vma *vma=&set->entries[index++];
+        if (vma->start>start || vma->kind!=KERNEL_VMA_KIND_ANONYMOUS ||
+            (vma->permissions & ~permissions)) return 0;
+        if (vma->permissions!=permissions) *unchanged=0;
+        start=vma->end;
+    }
+    return 1;
 }
 
 uint32_t kernel_vma_set_count(const struct kernel_vma_set *set)
@@ -439,11 +478,13 @@ static enum kernel_vma_status split_at(struct kernel_vma_set *set,
     return KERNEL_VMA_STATUS_OK;
 }
 
-static void merge_all(struct kernel_vma_set *set)
+/* Only entries inside the edit and the two adjacent boundaries can have
+ * become mergeable. Compact the unaffected suffix once if a merge succeeds. */
+static void merge_window(struct kernel_vma_set *set, uint32_t first, uint32_t end)
 {
-    if (!set->count) return;
-    uint32_t output=0;
-    for (uint32_t index=1;index<set->count;index++) {
+    if (end-first<2) return;
+    uint32_t output=first;
+    for (uint32_t index=first+1;index<end;index++) {
         COST_ADD(VMA_MERGE,1);
         if (can_merge(&set->entries[output],&set->entries[index])) {
             set->entries[output].end=set->entries[index].end;
@@ -457,7 +498,14 @@ static void merge_all(struct kernel_vma_set *set)
             }
         }
     }
-    set->count=output+1;
+    move_entries(set,output+1,end,set->count-end);
+    set->count-=end-output-1;
+}
+
+static void merge_all(struct kernel_vma_set *set)
+{
+    merge_window(set,0,set->count);
+    set->deferred_merge=0;
 }
 
 enum kernel_vma_status kernel_vma_set_create(
@@ -615,19 +663,22 @@ enum kernel_vma_status kernel_vma_set_rebind_backing(struct kernel_vma_set *set,
 {
     if (!set_valid(set) || !old || !replacement || set->generation==UINT64_MAX)
         return KERNEL_VMA_STATUS_INVALID_ARGUMENT;
-    for (uint32_t i=0;i<set->count;i++) if (set->entries[i].backing==old)
+    for (uint32_t i=0;i<set->count;i++) {
+        if (set->entries[i].backing!=old) continue;
         set->entries[i].backing=replacement;
+        set->deferred_merge=1;
+    }
     set->generation++;
     return KERNEL_VMA_STATUS_OK;
 }
 static int huge_edit_aligned(const struct kernel_vma_set *set,uint64_t start,uint64_t end)
 {
     if (!((start|end)&(ARCH_MMU_HUGE_SIZE-1))) return 1;
-    for (uint32_t i=0;i<set->count;i++) {
+    for (uint32_t i=first_overlap(set,start);i<set->count;i++) {
         const struct kernel_vma *v=&set->entries[i];
         if (v->start>=end) break;
-        if (v->end<=start || (v->kind!=KERNEL_VMA_KIND_HUGETLB_PRIVATE &&
-            v->kind!=KERNEL_VMA_KIND_HUGETLB_SHARED)) continue;
+        if (v->kind!=KERNEL_VMA_KIND_HUGETLB_PRIVATE &&
+            v->kind!=KERNEL_VMA_KIND_HUGETLB_SHARED) continue;
         if ((start>v->start && (start&(ARCH_MMU_HUGE_SIZE-1))) ||
             (end<v->end && (end&(ARCH_MMU_HUGE_SIZE-1)))) return 0;
     }
@@ -753,10 +804,19 @@ enum kernel_vma_status kernel_vma_set_prepare_replace(
     if (set->generation == UINT64_MAX) {
         return KERNEL_VMA_STATUS_STATE;
     }
-    status = reserve_edit_capacity(set,
-                                   start,
-                                   end,
-                                   replacement != 0);
+    if (replacement) {
+        status = reserve_edit_capacity(set, start, end, 1);
+    } else {
+        if (!huge_edit_aligned(set, start, end)) return KERNEL_VMA_STATUS_INVALID_ARGUMENT;
+        uint32_t first = first_overlap(set, start);
+        /* Only punching the middle of one VMA increases the final count. */
+        status = KERNEL_VMA_STATUS_OK;
+        if (first < set->count && start > set->entries[first].start &&
+            end < set->entries[first].end) {
+            if (set->count == UINT32_MAX) return KERNEL_VMA_STATUS_NO_MEMORY;
+            status = reserve_entries(set, set->count + 1U);
+        }
+    }
     if (status != KERNEL_VMA_STATUS_OK) {
         return status;
     }
@@ -779,11 +839,7 @@ static int range_is_covered(const struct kernel_vma_set *set,
                             uint64_t end)
 {
     uint64_t cursor = start;
-    uint32_t index = lower_bound(set, start);
-
-    if (index > 0U && set->entries[index - 1U].end > start) {
-        index--;
-    }
+    uint32_t index = first_overlap(set, start);
     while (index < set->count && cursor < end) {
         COST_ADD(VMA_COVERAGE, 1);
         if (set->entries[index].start > cursor ||
@@ -879,8 +935,7 @@ enum kernel_vma_status kernel_vma_set_prepare_protect(
     if (!range_is_covered(set, start, end)) {
         return KERNEL_VMA_STATUS_NOT_FOUND;
     }
-    uint32_t first = lower_bound(set, start);
-    if (first && set->entries[first - 1].end > start) first--;
+    uint32_t first = first_overlap(set, start);
     for (uint32_t index = first; index < set->count && set->entries[index].start < end; index++) {
         COST_ADD(VMA_PERMISSION, 1);
         if (permissions & KERNEL_VMA_ALL_PERMISSIONS & ~set->entries[index].maximum_permissions)
@@ -914,8 +969,7 @@ enum kernel_vma_status kernel_vma_set_prepare_mprotect(
     if (!set_valid(set) || start >= end)
         return KERNEL_VMA_STATUS_INVALID_ARGUMENT;
     if (!huge_edit_aligned(set,start,end)) return KERNEL_VMA_STATUS_INVALID_ARGUMENT;
-    uint32_t index = lower_bound(set, start);
-    if (index && set->entries[index - 1].end > start) index--;
+    uint32_t index = first_overlap(set, start);
     uint32_t first_split = 0;
     uint64_t data = set->usage.data;
     struct kernel_memory_limits limits;
@@ -989,6 +1043,59 @@ enum kernel_vma_status kernel_vma_set_prepare_flags(struct kernel_vma_set *set,
     return KERNEL_VMA_STATUS_OK;
 }
 
+static enum kernel_vma_status remove_range(struct kernel_vma_set *set,
+    uint64_t start, uint64_t end)
+{
+    uint32_t first = first_overlap(set, start);
+    uint32_t last = lower_bound(set, end);
+    if (first == last) return KERNEL_VMA_STATUS_OK;
+
+    int keep_left = set->entries[first].start < start;
+    int keep_right = set->entries[last - 1].end > end;
+    uint32_t output = first + keep_left + keep_right;
+    uint32_t remaining = set->count - last;
+    if (output > set->capacity || remaining > set->capacity - output)
+        return KERNEL_VMA_STATUS_STATE;
+
+    struct kernel_vma right;
+    if (keep_right) {
+        right = set->entries[last - 1];
+        if (right.kind != KERNEL_VMA_KIND_ANONYMOUS) {
+            uint64_t delta = end - right.start;
+            if (right.backing_offset > UINT64_MAX - delta)
+                return KERNEL_VMA_STATUS_STATE;
+            right.backing_offset += delta;
+        }
+        right.start = end;
+    }
+
+    /* Retain the split/close hooks, which also publish SysV SHM times and
+     * the last operator. Only the movement of VMA entries is coalesced. */
+    if (keep_left && set->entries[first].shm_attachment)
+        kernel_shm_attachment_open(set->entries[first].shm_attachment);
+    if (keep_right && right.shm_attachment)
+        kernel_shm_attachment_open(right.shm_attachment);
+
+    struct vma_usage usage = set->usage;
+    for (uint32_t i = first; i < last; i++) {
+        const struct kernel_vma *entry = &set->entries[i];
+        COST_ADD(VMA_EDITED, 1);
+        uint64_t a = entry->start > start ? entry->start : start;
+        uint64_t b = entry->end < end ? entry->end : end;
+        account_bytes(&usage, entry, b - a, 0);
+        account_shared_write(entry, b - a, 0);
+        if (entry->shm_attachment)
+            kernel_shm_attachment_close(entry->shm_attachment);
+    }
+    if (keep_left) set->entries[first].end = start;
+    /* Move the unaffected suffix once, even when both boundaries split. */
+    move_entries(set, output, last, remaining);
+    if (keep_right) set->entries[output - 1] = right;
+    set->count = output + remaining;
+    set->usage = usage;
+    return KERNEL_VMA_STATUS_OK;
+}
+
 enum kernel_vma_status kernel_vma_set_commit_edit(
     struct kernel_vma_set *set,
     const struct kernel_vma_edit *edit)
@@ -1011,6 +1118,13 @@ enum kernel_vma_status kernel_vma_set_commit_edit(
          edit->replacement.start != edit->start ||
          edit->replacement.end != edit->end)) {
         return KERNEL_VMA_STATUS_STATE;
+    }
+    if (edit->kind == KERNEL_VMA_EDIT_REMOVE) {
+        status = remove_range(set, edit->start, edit->end);
+        if (status != KERNEL_VMA_STATUS_OK) return status;
+        if (set->deferred_merge) merge_all(set);
+        set->generation++;
+        return KERNEL_VMA_STATUS_OK;
     }
     status = split_at(set, edit->start);
     if (status != KERNEL_VMA_STATUS_OK) {
@@ -1037,8 +1151,7 @@ enum kernel_vma_status kernel_vma_set_commit_edit(
     } else {
         /* mmap holds file/object admission until publication. On replacement the
          * new charge precedes retirement; the old PTEs are already revoked. */
-        if (edit->kind==KERNEL_VMA_EDIT_REPLACE)
-            account_shared_write(&edit->replacement,edit->end-edit->start,1);
+        account_shared_write(&edit->replacement,edit->end-edit->start,1);
         for (index = first; index < last; index++) {
             const struct kernel_vma *entry=&set->entries[index];
             uint64_t bytes=entry->end-entry->start;
@@ -1052,17 +1165,17 @@ enum kernel_vma_status kernel_vma_set_commit_edit(
                      last,
                      set->count - last);
         set->count -= last - first;
-        if (edit->kind == KERNEL_VMA_EDIT_REPLACE) {
-            status = insert_entry(set, &edit->replacement);
-            if (status != KERNEL_VMA_STATUS_OK) {
-                account_shared_write(&edit->replacement,edit->end-edit->start,0);
-                return KERNEL_VMA_STATUS_STATE;
-            }
-            account_bytes(&usage, &edit->replacement,
-                edit->replacement.end - edit->replacement.start, 1);
+        status = insert_entry(set, &edit->replacement);
+        if (status != KERNEL_VMA_STATUS_OK) {
+            account_shared_write(&edit->replacement,edit->end-edit->start,0);
+            return KERNEL_VMA_STATUS_STATE;
         }
+        account_bytes(&usage, &edit->replacement, edit->end - edit->start, 1);
     }
-    merge_all(set);
+    if (set->deferred_merge)
+        merge_all(set);
+    else if (edit->kind != KERNEL_VMA_EDIT_REPLACE)
+        merge_window(set,first ? first-1 : 0,last<set->count ? last+1 : last);
     set->usage = usage;
     set->generation++;
     return KERNEL_VMA_STATUS_OK;
@@ -1088,15 +1201,38 @@ enum kernel_vma_status kernel_vma_set_lookup(
     return KERNEL_VMA_STATUS_OK;
 }
 
-void kernel_vma_set_mark_anonymous(struct kernel_vma_set *set, uint64_t address)
+int kernel_vma_set_mark_anonymous(struct kernel_vma_set *set, uint64_t address,
+    uint64_t generation, struct kernel_vma *snapshot)
 {
     uint32_t index=lower_bound(set,address+1);
-    if (!index || address>=set->entries[index-1].end) __builtin_trap();
-    if (!(set->entries[index-1].flags & KERNEL_VMA_ANON_HISTORY)) {
+    if (!index || address>=set->entries[index-1].end) {
+        if (generation==set->generation) __builtin_trap();
+        return 0;
+    }
+    struct kernel_vma *entry=&set->entries[index-1];
+    /* A change to another range or another fault marking the same VMA
+     * need not send this fault through MM admission and lookup again.
+     * No page or backing borrow has been started from this view yet. */
+    if (generation!=set->generation &&
+        (entry->start!=snapshot->start || entry->end!=snapshot->end ||
+         entry->backing_offset!=snapshot->backing_offset ||
+         entry->permissions!=snapshot->permissions ||
+         entry->maximum_permissions!=snapshot->maximum_permissions ||
+         entry->kind!=snapshot->kind || entry->role!=snapshot->role ||
+         entry->fault_policy!=snapshot->fault_policy ||
+         ((entry->flags^snapshot->flags)&~KERNEL_VMA_ANON_HISTORY) ||
+         entry->backing!=snapshot->backing || entry->shm_attachment!=snapshot->shm_attachment ||
+         entry->shared_write_bytes!=snapshot->shared_write_bytes)) return 0;
+    if (!(entry->flags & KERNEL_VMA_ANON_HISTORY)) {
         if (set->generation==UINT64_MAX) __builtin_trap();
-        set->entries[index-1].flags |= KERNEL_VMA_ANON_HISTORY;
+        entry->flags |= KERNEL_VMA_ANON_HISTORY;
+        if ((index>1 && can_merge(entry-1,entry)) ||
+            (index<set->count && can_merge(entry,entry+1)))
+            set->deferred_merge=1;
         set->generation++;
     }
+    snapshot->flags |= KERNEL_VMA_ANON_HISTORY;
+    return 1;
 }
 
 enum kernel_vma_status kernel_vma_set_trim_end(

@@ -122,6 +122,15 @@ static void private_case(void)
     struct kernel_mm_mapping p,s;
     assert(!kernel_mm_lookup(&parent,address,&p) && !kernel_mm_lookup(&parent,0x40000,&s) &&
         p.physical_address==s.physical_address && !(p.permissions&KERNEL_MM_WRITE));
+    struct kernel_mm clean_child = {0};
+    uint64_t child_context;
+    assert(!kernel_mm_fork(&clean_child, &parent));
+    assert(kernel_mm_lookup(&clean_child, address, &s) == KERNEL_MM_STATUS_NOT_MAPPED);
+    assert(!kernel_mm_context(&clean_child, &child_context));
+    mm_test_context = child_context;
+    assert(read_byte(&clean_child, address) == read_byte(&clean_child, 0x40000));
+    mm_test_context = roots[1];
+    assert(!kernel_mm_release(&clean_child));
     assert(!kernel_copy_to_user(&parent,address,&value,1,&done) && done==1 && read_byte(&parent,0x40000)!=value);
     value=0x55; assert(!kernel_copy_to_user(&parent,address+2*BOAROS_PAGE_SIZE+100,&value,1,&done));
     assert(!kernel_mm_mprotect(&parent,address,BOAROS_PAGE_SIZE,0));
@@ -297,11 +306,13 @@ static void adjacent_table_removal(void)
         }
         (void)read_byte(&parent,base);
         struct kernel_vma before,after;
-        assert(!kernel_mm_vma_lookup(&parent,target,&before));
         memset(entered,0,sizeof(entered)); resume=0;
         capture=kind==2?2:0; capture_allocate=kind<2;
         pthread_t worker;
         assert(!pthread_create(&worker,0,fault,(void *)(uintptr_t)1)); ready(1);
+        /* The first anonymous fault can mark its VMA before it parks.
+         * Compare the two sides of the truncate itself. */
+        assert(!kernel_mm_vma_lookup(&parent,target,&before));
         assert(!kernel_vfs_ftruncate(&controller->file,0));
         assert(!kernel_mm_vma_lookup(&parent,target,&after) && !memcmp(&before,&after,sizeof(before)));
         struct kernel_mm_mapping mapping;

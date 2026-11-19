@@ -109,9 +109,9 @@ uintptr_t sync_test_stack(void) { return cpu.current->stack_high - 16; }
 uint64_t kernel_time_monotonic_ns(void) { return 1; }
 uint64_t kernel_time_ticks_to_ns(uint64_t ticks) { return ticks; }
 uint32_t kernel_time_is_initialized(void) { return 1; }
-enum kernel_mm_status kernel_mm_resolve_user_fault(struct kernel_mm *mm,
+enum kernel_mm_status kernel_mm_resolve_owned_user_fault(struct kernel_mm *mm, struct kernel_task *task,
                                                    uint64_t address, uint32_t access)
-{ (void)mm; (void)address; (void)access; __builtin_trap(); /* Rejected kernel caller cannot enter MM. */ }
+{ (void)mm; (void)task; (void)address; (void)access; __builtin_trap(); /* Rejected kernel caller cannot enter MM. */ }
 uint64_t riscv_time_read(void) { return 1; }
 enum riscv_timer_status riscv_timer_set_scheduler_deadline(uint64_t deadline)
 { assert(!cpu.raw_locks);timer_request=deadline;return RISCV_TIMER_STATUS_NOT_STARTED; }

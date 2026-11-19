@@ -177,6 +177,9 @@ struct jbd_journal {
 	struct ext4_block_write *checkpoint_io;
 	TAILQ_HEAD(jbd_sealed_queue, jbd_trans) sealed_queue;
 	unsigned sealed_count, checkpoint_count, log_reserved;
+	/* Nonempty ordered-data trees, including private and failed transactions.
+	 * Zero lets a reader rule out an overlay without entering journal STATE. */
+	unsigned ordered_trees;
 	uint64_t checkpoint_target;
 	bool grouped;
 	/* Transaction lists own each range through abort or checkpoint. These

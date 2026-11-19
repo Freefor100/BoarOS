@@ -118,6 +118,59 @@ int main(void)
         !kernel_vma_set_commit_edit(set,&edit)&&writable==5*P);
     assert(!kernel_vma_set_destroy(&copy)&&writable==2*P);
     assert(!kernel_vma_set_destroy(&set)&&!writable);
+    assert(!kernel_vma_set_create(&heap,&set));
+    v=(struct kernel_vma){.start=8*P,.end=12*P,.backing_offset=2*P,.permissions=3,
+        .maximum_permissions=7,.kind=KERNEL_VMA_KIND_FILE_PRIVATE,.role=KERNEL_VMA_ROLE_MMAP,
+        .fault_policy=KERNEL_VMA_FAULT_FILE_PRIVATE,.backing=&backing,.flags=KERNEL_VMA_LOCKED};
+    assert(!kernel_vma_set_insert(set,&v));
+    v.start=14*P;v.end=15*P;
+    assert(!kernel_vma_set_insert(set,&v));
+    assert(kernel_vma_set_range_is_anonymous(set,12*P,14*P));
+    assert(!kernel_vma_set_range_is_anonymous(set,9*P,10*P));
+    assert(!kernel_vma_set_prepare_replace(set,9*P,11*P,NULL,&edit));
+    assert(!kernel_vma_set_commit_edit(set,&edit));
+    usage(set,3,3);
+    assert(kernel_vma_set_locked_range(set,9*P,14*P)==P);
+    assert(!kernel_vma_set_lookup(set,8*P,&inherited)&&inherited.backing_offset==2*P);
+    assert(kernel_vma_set_lookup(set,9*P,&inherited)==KERNEL_VMA_STATUS_NOT_FOUND);
+    assert(!kernel_vma_set_lookup(set,11*P,&inherited)&&inherited.backing_offset==5*P);
+    assert(!kernel_vma_set_lookup(set,14*P,&inherited)&&inherited.backing_offset==2*P);
+    assert(!kernel_vma_set_destroy(&set));
+    assert(!kernel_vma_set_create(&heap,&set));
+    v=(struct kernel_vma){.start=P,.end=2*P,.permissions=3,.maximum_permissions=7,
+        .kind=KERNEL_VMA_KIND_ANONYMOUS,.role=KERNEL_VMA_ROLE_MMAP,
+        .fault_policy=KERNEL_VMA_FAULT_DEMAND_ZERO};
+    assert(!kernel_vma_set_insert(set,&v));
+    uint64_t initial_generation=kernel_vma_set_generation(set);
+    struct kernel_vma snapshot, simultaneous;
+    assert(!kernel_vma_set_lookup(set,P,&snapshot));
+    simultaneous=snapshot;
+    v.start=3*P;v.end=4*P;
+    assert(!kernel_vma_set_insert(set,&v));
+    assert(kernel_vma_set_mark_anonymous(set,P,initial_generation,&snapshot));
+    assert(snapshot.flags & KERNEL_VMA_ANON_HISTORY);
+    uint64_t marked_generation=kernel_vma_set_generation(set);
+    assert(kernel_vma_set_mark_anonymous(set,P,initial_generation,&simultaneous));
+    assert(simultaneous.flags & KERNEL_VMA_ANON_HISTORY);
+    assert(kernel_vma_set_generation(set)==marked_generation);
+    int unchanged;
+    assert(!kernel_vma_set_permission_addition(set,P,4*P,3,&unchanged));
+    v.start=2*P;v.end=3*P;
+    assert(!kernel_vma_set_insert(set,&v));
+    assert(kernel_vma_set_permission_addition(set,P,4*P,3,&unchanged) && unchanged);
+    v.start=6*P;v.end=7*P;
+    assert(!kernel_vma_set_insert(set,&v));
+    assert(!kernel_vma_set_lookup(set,2*P,&simultaneous));
+    assert(kernel_vma_set_mark_anonymous(set,2*P,kernel_vma_set_generation(set),&simultaneous));
+    /* Marking made two old fragments mergeable. An edit elsewhere must
+     * still coalesce them on the next successful edit. */
+    assert(!kernel_vma_set_prepare_protect(set,6*P,7*P,1,&edit));
+    assert(!kernel_vma_set_commit_edit(set,&edit));
+    assert(!kernel_vma_set_lookup(set,P,&simultaneous) && simultaneous.end==4*P);
+    assert(!kernel_vma_set_prepare_protect(set,P,2*P,1,&edit)&&
+        !kernel_vma_set_commit_edit(set,&edit));
+    assert(!kernel_vma_set_mark_anonymous(set,P,marked_generation,&snapshot));
+    assert(!kernel_vma_set_destroy(&set));
     struct kernel_heap_statistics stats;kernel_heap_get_statistics(&heap,&stats);
     assert(!stats.live_allocations&&!stats.current_pages&&physical_page_available(&pages)==baseline);
     assert(!physical_page_allocator_audit(&pages));

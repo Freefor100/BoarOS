@@ -67,6 +67,8 @@ handler与sigtimedwait取得同一规范记录，用户输出在消费之后发�
 
 ## SMP上的状态和执行位置
 
+`rt_sigprocmask` 在调用线程所在核读写该线程的屏蔽集合，`rt_sigpending` 在同一位置取得待决集合快照。两者都复用信号状态的调度保护。仅查询处理动作的 `rt_sigaction` 也在调用核完成；安装新动作仍进入 CPU0 服务区，处理共享信号表和待决信号的变化。
+
 RV USER_SMP中的普通信号在实际执行线程所在CPU递送。pending及其来源、共享disposition、blocked和SA_RESETHAND的修改由调度raw保护。未被跟踪的线程在同一保护内取走pending、复制完整action、记录恢复mask、设置handler期间的屏蔽位并重置一次性动作；锁外只使用线程栈上的delivery快照，后续rt_sigaction替换保留新动作。被跟踪的线程先取走pending并完成原生定时器记录，再在锁外进入信号递送停点；tracer可抑制、替换信号或修改完整siginfo。恢复后重新读取最终信号的action，仅实际递送的handler提交mask和SA_RESETHAND；重新被屏蔽的信号带完整载荷放回原线程或组队列。已忽略的信号仍可被tracer观察，SIGKILL绕过递送停点。rt_sigaction的旧动作和新动作在同一提交点交换，fork复制与exec重置同样使用该保护。
 
 构造信号帧、用户复制、寄存器/FPU恢复由当前线程执行。任务执行所有权持有本线程存储、MM及disposition表引用；uaccess借用实际物理页，缺页和等待沿共同MM路径处理。调度raw不跨用户复制、缺页或等待。sigreturn完整导入并检查用户上下文后，在短锁内恢复mask，再更新本线程寄存器和FPU。

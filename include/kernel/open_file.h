@@ -187,6 +187,8 @@ void kernel_open_file_finish_memory_page(struct kernel_open_file_description *,
  * Memory objects keep their separate rollback/finish protocol. */
 int kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *,
     uint64_t index, int read_window, struct kernel_open_file_page_preparation *);
+int kernel_open_file_try_prepare_disk_mapping_page(struct kernel_open_file_description *,
+    uint64_t index, struct kernel_open_file_page_preparation *);
 void kernel_open_file_finish_mapping_page(struct kernel_open_file_description *,
     struct kernel_open_file_page_preparation *, int accepted);
 enum kernel_open_file_status kernel_open_file_check_mapping_domain(

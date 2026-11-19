@@ -301,6 +301,38 @@ static void try_write_busy(void)
         assert(sync_test_irq == irq && !current.io_context.locks);
     }
 }
+
+static void try_upgrade_read(void)
+{
+    pthread_t thread;
+    struct kernel_lock_guard guard = {0};
+    kernel_rwlock_init(&lock, 10, 1);
+    kernel_rwlock_read(&lock, &guard);
+    try_mode = try_entered = try_leave = 0;
+    assert(!pthread_create(&thread, NULL, try_owner, NULL));
+    while (!__atomic_load_n(&try_entered, __ATOMIC_ACQUIRE)) sched_yield();
+    assert(!kernel_rwlock_try_upgrade(&guard));
+    assert(!guard.write && lock.readers == 2);
+    __atomic_store_n(&try_leave, 1, __ATOMIC_RELEASE);
+    assert(!pthread_join(thread, NULL));
+
+    entered[1] = leave[1] = parked[1] = granted[1] = count = 0;
+    assert(!pthread_create(&thread, NULL, worker, (void *)(uintptr_t)1));
+    queued(1);
+    assert(!kernel_rwlock_try_upgrade(&guard));
+    assert(!guard.write && lock.readers == 1 && !entered[1]);
+    __atomic_store_n(&leave[1], 1, __ATOMIC_RELEASE);
+    kernel_lock_release(&guard);
+    assert(!pthread_join(thread, NULL));
+    assert(entered[1] && !lock.waiters.registrations && !lock.waiters.borrows);
+
+    kernel_rwlock_read(&lock, &guard);
+    assert(kernel_rwlock_try_upgrade(&guard));
+    assert(guard.write && lock.writer == &current.io_context && !lock.readers);
+    assert(current.io_context.locks == &guard && sync_test_irq && !cpu.raw_locks);
+    kernel_lock_release(&guard);
+    assert(!lock.writer && !current.io_context.locks);
+}
 static void *spin_waiter(void *unused)
 {
     (void)unused;initialize(1);host_current.dispatch=&ready;spin_clock_reads=0;
@@ -445,6 +477,7 @@ int main(void)
     kernel_wait_domain_init();
     fatal_cases();
     try_write_busy();
+    try_upgrade_read();
     for (unsigned irq = 0; irq < 2; irq++) {
         sync_test_irq = irq;
         struct kernel_lock_guard guard = {0};

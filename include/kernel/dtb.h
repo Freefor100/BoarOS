@@ -11,6 +11,7 @@
 #define DTB_MAX_CPUS 8U
 #define DTB_CPU_MMU_SVVPTC UINT32_C(1)
 #define DTB_CPU_ISA_V UINT32_C(2)
+#define DTB_CPU_ZICBOZ_64 UINT32_C(4)
 
 struct dtb_cpu_info {
     uint64_t hart_ids[DTB_MAX_CPUS];
