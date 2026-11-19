@@ -197,6 +197,8 @@ int ext4_mount_setup_inode_observer(const char *mount_point,
 #define EXT4_TIME_MTIME 2U
 #define EXT4_TIME_CTIME 4U
 #define EXT4_TIME_RELATIME 8U
+/* A prior read found expired relatime. The writer still rechecks. */
+#define EXT4_TIME_RELATIME_CHECKED 16U
 int ext4_mount_setup_clock(const char *mount_point, ext4_clock_read clock);
 /* Read the mount clock without inode lookup or a metadata transaction. */
 bool ext4_file_read_clock(const ext4_file *file, struct ext4_timestamp *now);
@@ -230,6 +232,8 @@ int ext4_file_set_owner(ext4_file *file, uint32_t uid, uint32_t gid, uint32_t pr
  * offset/size advance file size and completion. An ordinary buffer (empty source)
  * is copied into a private version. */
 int ext4_fpwrite_batch(ext4_file *file, struct file_write_span *spans, unsigned count);
+/* Synchronous no-journal data path; caller storage is never retained. */
+int ext4_fpwrite_direct(ext4_file *file, struct file_write_span *span);
 int ext4_fpwrite(ext4_file *file, uint64_t offset, const void *buffer, size_t size, size_t *written);
 int ext4_file_sync_metadata_mode(ext4_file *file, bool data_only);
 /* Flush non-grouped metadata synchronously, or capture and request one fixed
@@ -637,6 +641,8 @@ uint64_t ext4_ftell(ext4_file *file);
  *
  * @return  File size. */
 uint64_t ext4_fsize(ext4_file *file);
+/* Complete accepted ordered data for mapped bytes, without durability. */
+int ext4_fdata_complete(ext4_file *file, uint64_t offset, size_t size);
 
 
 /**@brief Get inode of file/directory/link.
@@ -836,11 +842,21 @@ int ext4_fopen_inode(ext4_file *file, const char *mount_point,
  * are caller scratch filled before releasing the new inode reference, not a
  * disk/checksum image. Discard them on failure; a successful result remains
  * provisional until an outer transaction accepts it. */
+int ext4_tmpfile_child(const char *mount, uint32_t parent, uint32_t mode,
+    ext4_file *output, struct ext4_inode *initial, uint32_t uid, uint32_t gid);
+/* Only for the VFS's live linkable temporary inode, never arbitrary unlinked files. */
+int ext4_tmpfile_link_child(const char *mount, uint32_t source, uint32_t parent,
+    const char *name, uint32_t length);
 int ext4_create_child(const char *mount, uint32_t parent, const char *name,
     uint32_t mode, uint32_t device, const char *target, ext4_file *output,
     struct ext4_inode *initial,uint32_t uid,uint32_t gid);
 int ext4_unlink_child(const char *mount, uint32_t parent, const char *name,
     bool directory, uint32_t *inode, bool *orphan);
+/* Remove only the resolved inode. A callback also certifies that the target
+ * has no outside users; on direct reclaim call it before releasing the block
+ * group qualification. It must publish retirement without starting I/O. */
+int ext4_unlink_child_resolved(const char *mount, uint32_t parent, const char *name,
+    bool directory, uint32_t target, bool *orphan, void (*retire)(void *), void *context);
 /* A NULL mode requests only the stable directory-entry inode identity. */
 int ext4_lookup_child(const char *mount_point, uint32_t parent_inode,
                       const char *name, uint32_t name_length,
@@ -871,6 +887,15 @@ const ext4_direntry *ext4_dir_entry_next(ext4_dir *dir);
  *        end of directory.
  * @return EOK for an entry or end of directory, otherwise an ext4 error.
  */
+/* Iterate from *position with one inode/block iterator. emit borrows the
+ * name until it returns: 0 rejects, 1 accepts, 2 accepts and stops. No user
+ * memory access or re-entry into lwext4 is permitted from emit. Errors retain
+ * the accepted prefix; *position == UINT64_MAX denotes EOF only. */
+typedef int (*ext4_dir_emit_fn)(void *, uint64_t offset, uint64_t next,
+    uint32_t inode, uint8_t type, const char *name, size_t name_length);
+int ext4_dir_iterate(ext4_file *file, uint64_t *position,
+    ext4_dir_emit_fn emit, void *context, bool *atime_current);
+
 int ext4_dir_entry_next_status(ext4_dir *dir,
                                ext4_direntry *entry,
                                uint64_t *entry_offset);

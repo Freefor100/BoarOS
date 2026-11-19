@@ -7,7 +7,7 @@
 - 导入路径：`third_party/lwip/`，保留 `src/core/`、`src/include/`、官方 Ethernet 入口和 `COPYING`；未导入 socket/netconn API 实现、应用、PPP 和上游具体网卡驱动。
 - 许可证：BSD-3-Clause，原有版权和许可声明保留在每个源码文件及 `COPYING`。
 - 用途：向 BoarOS 的 socket 层提供 IPv4／IPv6 的 UDP 和 TCP，以及 IPv4 ICMP raw PCB，使用 NO_SYS raw API。IP 输入、UDP、ICMP raw 和网卡由网络执行者服务，已建立的 TCP 连接可分属不同 CPU。RAW、组播发送选项和广播许可由 BoarOS 配置启用；不启用 IGMP 或组播成员管理。
-- 本地修改：IPv4重组增加协议/输入网卡键、重复/重叠/终点校验及按网卡清理，另在 netif/timeouts 增加有预算的轮回入口，旧公开入口保持无限预算包装；mem/memp 增加可选的每次真实归还 hook，netif 增加 loopback 入队 hook。UDP/TCP 端口冲突按实际绑定设备隔离，不同非零接口的相同端口可以独立使用；IPv4 的 Linux 回环配置接纳完整 127/8 别名，并按回环地址和掩码识别子网广播。IPv4 datagram 的最终 pbuf 携带本机 DF 策略：不超过所选接口 MTU 时生成 DF，较大的本机报文仍可分片；IPv6 不使用该标记，IP 头校验和包含实际 offset 字段。组播 TTL 为零时只保留本机回环，不向物理接口发送。netif 地址设置增加保留既有 PCB 的入口，供 Linux 运行时地址配置使用，原设备移除的 PCB 清理不变。TCP Nagle 使用 Minshall 规则，tcp_pcb 尾部保存新发小包的确认边界，tcp.c/tcp_in.c 初始化、tcp_out.c 在实际成功输出后更新，tcp_priv.h 按序列号判断。对应头文件声明随实现维护；补丁不升级固定版本，其余导入文件保持原版。BoarOS 的 lwIP 配置、端口和 socket 所有权适配位于 `net/` 与 `fs/`，不以 lwIP 的 socket fd 空间代替 BoarOS 文件表。
+- 本地修改：IPv6 无 MLD 时允许 tentative 地址接收 solicited-node DAD NS，tentative 地址不发送 NA；显式静态配置模式忽略 RA/Redirect，关闭 RS 时保持无未使用变量的编译。IPv6 netif 保存固定槽位前缀和独立 default gateway，路由/ND 使用真实前缀，源选择计算公共前缀。UDP 输入拒绝 IPv6 零 checksum，IPv4 行为不变。IPv4重组增加协议/输入网卡键、重复/重叠/终点校验及按网卡清理，另在 netif/timeouts 增加有预算的轮回入口，旧公开入口保持无限预算包装；mem/memp 增加可选的每次真实归还 hook，netif 增加 loopback 入队 hook。UDP/TCP 端口冲突按实际绑定设备隔离，不同非零接口的相同端口可以独立使用；IPv4 的 Linux 回环配置接纳完整 127/8 别名，并按回环地址和掩码识别子网广播。IPv4 datagram 的最终 pbuf 携带本机 DF 策略：不超过所选接口 MTU 时生成 DF，较大的本机报文仍可分片；IPv6 不使用该标记，IP 头校验和包含实际 offset 字段。组播 TTL 为零时只保留本机回环，不向物理接口发送。netif 地址设置增加保留既有 PCB 的入口，供 Linux 运行时地址配置使用，原设备移除的 PCB 清理不变。TCP Nagle 使用 Minshall 规则，tcp_pcb 尾部保存新发小包的确认边界，tcp.c/tcp_in.c 初始化、tcp_out.c 在实际成功输出后更新，tcp_priv.h 按序列号判断。对应头文件声明随实现维护；补丁不升级固定版本，其余导入文件保持原版。BoarOS 的 lwIP 配置、端口和 socket 所有权适配位于 `net/` 与 `fs/`，不以 lwIP 的 socket fd 空间代替 BoarOS 文件表。
 
 UDP PCB 按本地端口分桶，绑定冲突、临时端口查找和输入分发共用同一索引。IPv4/IPv6 通配、绑定地址、已连接对端和复用规则在桶内匹配。断开自动分配端口的连接时，先从该桶摘除 PCB。
 
@@ -20,6 +20,13 @@ bind/connect 和占用端口，使用真实 lwIP 源码，固定版本不变。
 `LWIP_HOOK_NETIF_LOOPBACK_QUEUED`，导入的 `netif_loop_output()` 原先没有调用。
 现在只在成功挂入完整包链后通知；hook 未定义的配置保留原行为。仍固定上述
 上游 commit，验证入口为 `make test-lwip-host` 与双架构真实网络/ABI 回归。
+
+TCP 输出另增加应用级 MORE 模式、持久 CORK 策略、PCB 内绝对短尾期限与 push 序号。普通 ACK 输出仍使用默认 Nagle/Minshall，MORE 仅抑制首次发送的未满尾段；重传和控制包不被等待尾段阻塞。BoarOS worker 只将已暂留的 PCB 按期限排队并有预算地推进到期输出，既有 owner 迁移不重置时间；不升级固定 lwIP 版本，也不增加独立计时引用。验证入口与语义边界见[网络模块](modules/kernel-network.md)。
+
+TCP_INFO 另在 `BOAROS_LWIP_TCP_INFO` 下增加成功输出/接收/确认事件记账、segment
+已发送 payload 前缀、owner 时间重基和释放前快照 hook。累计重传不使用会重置的
+nrtx，原始 SYN、输出失败、分段与追加数据分别处理；复用旧 TCP 时钟，不引入
+逐包读钟或新定时任务。字段语义、零值和精度边界见[网络模块](modules/kernel-network.md)。
 
 ## lwext4
 
@@ -37,7 +44,7 @@ bind/connect 和占用端口，使用真实 lwIP 源码，固定版本不变。
   `ext4_config.h` 包含，避免通用内存文件和 MM 构建依赖磁盘文件系统配置。
 - 许可证：`src/ext4_extent.c` 和 `src/ext4_xattr.c` 为 GPL-2.0-or-later，其余导入源码为 BSD-3-Clause；上游说明组合后的库受 GPLv2 约束。
 - 用途：在 BoarOS 自有 VFS 与块设备接口之后提供 ext2/3/4 磁盘格式实现。
-- 本地修改：初始导入提交不修改上游源码；后续补全现代 superblock 中 `s_checksum_seed` 等字段的磁盘布局，识别 `metadata_csum_seed`，并让 bitmap、group descriptor、inode、directory、extent 与 xattr 的 metadata checksum 使用规范选择的种子；目录适配另加 `ext4_dir_entry_next_status()` 和原始记录推进入口，以区分 EOF、inode-zero 尾记录与块/格式错误。文件适配允许在按 inode extent/legacy mapping 计算的 maxbytes 内 seek 到 EOF 之后、精确分配逻辑块、对 hole 合成零，并以 sparse 方式执行写入和向上截断；legacy maxbytes 取间接指针树、`ext4_lblk_t`/哨兵及 inode 块计数容量的交集，不让大块文件系统的 64-bit offset 缩窄回绕到低逻辑块。新块初始化失败撤销 exact mapping；fallocate 预留真实 unwritten extent、部分块清零与完整块打洞维护分配计数，合并检查初始化状态，unwritten conversion 以 ordered data 版本与调用者数据在同一私有操作中提交；索引空间不足时清零当前 unwritten extent 后原位初始化，释放块的 quarantine 同时覆盖即时提交与组提交。时间戳适配新增 mount 可选 realtime callback 和 live-inode touch，支持受 inode_size/extra_isize 约束的 signed epoch/纳秒编码、relatime、创建与父目录修改；即时 block-cache flush 传播 errno，失败缓冲由 mount 保留 dirty owner；文件写入/截断按操作固定并提交修改缓冲集合，防止分配中途 I/O 失败失去块 owner，也避免排空无关历史脏数据。保留 JBD2 journal 与 superblock 自身原有的独立校验算法。所有权适配新增live-inode chown，修正UID/GID的low/high 16位编码；内部xattr路径修正缺失inline属性区、删除finder、共享EA块复制的校验和/扇区计数、inode删除时的引用归还及失败释放，用于在同一事务删除capability。内核构建profile启用journal/replay与该内部xattr路径，并关闭mkfs、debug/assert；按已打开inode提供用户xattr操作并复用私有事务回滚，文件capability用于exec；ACL另列缺口；BoarOS 的 heap、块设备、VFS 和负 errno 适配位于 `kernel/` 与 `fs/`，不暴露 lwext4 类型。
+- 本地修改：初始导入提交不修改上游源码；后续补全现代 superblock 中 `s_checksum_seed` 等字段的磁盘布局，识别 `metadata_csum_seed`，并让 bitmap、group descriptor、inode、directory、extent 与 xattr 的 metadata checksum 使用规范选择的种子；目录适配另加 `ext4_dir_iterate()` 有界批次与其单项入口 `ext4_dir_entry_next_status()`，复用 inode/block iterator 并区分 EOF、inode-zero 尾记录与块/格式错误。文件适配允许在按 inode extent/legacy mapping 计算的 maxbytes 内 seek 到 EOF 之后、精确分配逻辑块、对 hole 合成零，并以 sparse 方式执行写入和向上截断；legacy maxbytes 取间接指针树、`ext4_lblk_t`/哨兵及 inode 块计数容量的交集，不让大块文件系统的 64-bit offset 缩窄回绕到低逻辑块。新块初始化失败撤销 exact mapping；fallocate 预留真实 unwritten extent、部分块清零与完整块打洞维护分配计数，合并检查初始化状态，unwritten conversion 以 ordered data 版本与调用者数据在同一私有操作中提交；索引空间不足时清零当前 unwritten extent 后原位初始化，释放块的 quarantine 同时覆盖即时提交与组提交。时间戳适配新增 mount 可选 realtime callback 和 live-inode touch，支持受 inode_size/extra_isize 约束的 signed epoch/纳秒编码、relatime、创建与父目录修改；即时 block-cache flush 传播 errno，失败缓冲由 mount 保留 dirty owner；文件写入/截断按操作固定并提交修改缓冲集合，防止分配中途 I/O 失败失去块 owner，也避免排空无关历史脏数据。保留 JBD2 journal 与 superblock 自身原有的独立校验算法。所有权适配新增live-inode chown，修正UID/GID的low/high 16位编码；内部xattr路径修正缺失inline属性区、删除finder、共享EA块复制的校验和/扇区计数、inode删除时的引用归还及失败释放，用于在同一事务删除capability。内核构建profile启用journal/replay与该内部xattr路径，并关闭mkfs、debug/assert；按已打开inode提供用户xattr操作并复用私有事务回滚，文件capability用于exec；ACL另列缺口；BoarOS 的 heap、块设备、VFS 和负 errno 适配位于 `kernel/` 与 `fs/`，不暴露 lwext4 类型。
 
 - 日志与恢复修改：加入设备 flush 回调、ordered data、元数据修改前的缓冲引用与 before-image、文件数据私有替换版本、嵌套事务错误传播、checksum v2/v3/revoke 校验、checkpoint 后持久回收日志空间和 sticky journal 错误。superblock 更新进入日志，受限启动允许由合法 redo 修复扇区撕裂的 superblock。新增 `ext4_orphan.c` 支持 orphan_file/传统链，完整校验后维护运行时成员、位置与空槽索引；私有事务 undo 同步恢复内存索引，热查询不再遍历磁盘记录；`ext4_truncate.c` 按实际 extent/间接块映射分批回收；公开修改入口接入持久 orphan 生命周期。块组读取不再隐式初始化位图，块与 inode 分配分别准备所需位图；新 inode 逐槽清零并事务更新已用范围，不在一次私有操作内清零整张 lazy inode table，也不提前设置 ITABLE_ZEROED；bitmap/inode/directory/extent 校验失败明确返回错误，索引目录不会静默降级后改写损坏元数据。extent 树读取失败按 get 的成功状态归还引用，不用预先填写的块号判断 owner，避免 OOM 后释放 NULL buffer。恢复测试与承诺范围见 [VFS 模块](modules/vfs-ext4.md)。
 - 挂载重配置新增 `ext4_remount()`：保留活文件句柄，在结束旧日志会话或启动新会话后改变后端只读状态；特性拒绝、资源失败和不确定 I/O 分别由 VFS 适配处理，机制与验证见 [VFS 模块](modules/vfs-ext4.md)。

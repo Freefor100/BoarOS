@@ -408,6 +408,50 @@ static enum kernel_heap_status allocate_small(struct kernel_heap *heap,
     }
 }
 
+unsigned kernel_heap_allocate_zeroed_batch_nosleep(struct kernel_heap *heap,
+    unsigned count, size_t size, void **out)
+{
+    uint32_t class_index;
+    if (!heap_initialized(heap) || !out || !size || count > 16 ||
+        !small_class_for_size(size, &class_index)) __builtin_trap();
+    unsigned allocated = 0;
+    struct kernel_slab *prepared = NULL;
+    while (allocated < count) {
+        {
+            KERNEL_RAW_SCOPE(guard, &heap->lock);
+            if (prepared) {
+                partial_insert(heap, prepared);
+                statistics_add_pages(heap, 0U);
+                prepared = NULL;
+            }
+            while (allocated < count) {
+                struct kernel_slab *slab = heap->partial_slabs[class_index];
+                if (!slab) break;
+                if (slab_allocate_slot(heap, slab, class_index, &out[allocated]))
+                    __builtin_trap();
+                heap->statistics.allocation_calls++;
+                allocated++;
+            }
+        }
+        if (allocated == count) break;
+        enum kernel_heap_status status = slab_create(heap, class_index, &prepared, 1);
+        if (status == KERNEL_HEAP_STATUS_EMPTY) {
+            KERNEL_RAW_SCOPE(guard, &heap->lock);
+            heap->statistics.allocation_calls++;
+            heap->statistics.allocation_failures++;
+            COST_ADD(HEAP_FAILURES, 1);
+            break;
+        }
+        if (status) __builtin_trap();
+    }
+    for (unsigned i = 0; i < allocated; i++) memset(out[i], 0, size);
+    COST_ADD(HEAP_CALLS, allocated + (allocated != count));
+    COST_ADD(HEAP_REQUESTED, size * (allocated + (allocated != count)));
+    COST_ADD(HEAP_ACCEPTED, size * allocated);
+    COST_IO_ADD(6, size * allocated);
+    return allocated;
+}
+
 static int allocation_order_for_size(size_t size, uint32_t *order)
 {
     uint64_t pages;

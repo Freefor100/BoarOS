@@ -212,6 +212,42 @@ static void lookup_attributes_case(struct kernel_vfs_path *root)
     for(unsigned i=0;i<4;i++) assert(!kernel_vfs_unlink_at(root,root,names[i],0));
     puts("PASS final stat reuses one directory/inode lookup without opening the child; symlink, trailing slash and live hard-link attributes preserved");
 }
+
+static void directory_eof_case(struct kernel_vfs_path *root)
+{
+    struct kernel_vfs_file dir = {0}, child = {0};
+    const struct kernel_vfs_open_request request = {.flags=KERNEL_VFS_OPEN_DIRECTORY};
+    assert(!kernel_vfs_mkdir_at(root,root,"enumerated",0700,0));
+    assert(!kernel_vfs_open_at(root,root,"enumerated",&request,&dir,NULL));
+    struct kernel_vfs_stat stat;
+    assert(!kernel_vfs_fstat(&dir,&stat));
+    unsigned char records[512];
+    struct kernel_vfs_dir_batch batch = {.data=records,.capacity=sizeof(records)};
+    assert(!kernel_vfs_read_directory(&dir,&batch,NULL) && batch.used);
+    uint64_t original_eof = batch.position;
+    assert(original_eof==stat.size);
+    batch.used=0;
+    stat_lookup_watch=1;stat_lookup_reads=0;
+    assert(!kernel_vfs_read_directory(&dir,&batch,NULL) && !batch.used);
+    stat_lookup_watch=0;
+    assert(!stat_lookup_reads && "unchanged directory EOF should reuse accepted inode size");
+
+    char name[244];
+    memset(name,'n',sizeof(name)-1);
+    for (unsigned i=0;i<32;i++) {
+        snprintf(name+sizeof(name)-3,3,"%02u",i);
+        assert(!kernel_vfs_create_at(dir.path,root,name,0600,&child,0));
+        assert(!kernel_vfs_close(&child));
+    }
+    assert(kernel_vfs_read_directory(&dir,&batch,NULL)>=0 && batch.used && batch.position>original_eof);
+    for (unsigned i=0;i<32;i++) {
+        snprintf(name+sizeof(name)-3,3,"%02u",i);
+        assert(!kernel_vfs_unlink_at(dir.path,root,name,0));
+    }
+    assert(!kernel_vfs_close(&dir));
+    assert(!kernel_vfs_unlink_at(root,root,"enumerated",1));
+    puts("PASS directory EOF reuses accepted size and observes subsequent growth");
+}
 static void inode_attribute_lifecycle(struct lwext4_mount_adapter *adapter,struct kernel_vfs_path *root)
 {
     struct kernel_vfs_file file={0};struct kernel_vfs_path *path=NULL;
@@ -400,8 +436,8 @@ static void parallel_worker_startup(struct lwext4_mount_adapter *adapter,unsigne
     assert(!pthread_create(&flushing,NULL,parallel_startup_flush,adapter));
     for(;;) {
         unsigned waiting;
-        {KERNEL_RAW_SCOPE(guard,&adapter->instance.namespace_lock.lock.metadata);
-         waiting=adapter->instance.namespace_lock.lock.pending_head!=NULL;}
+        {KERNEL_RAW_SCOPE(guard,&adapter->instance.reconfiguration.metadata);
+         waiting=adapter->instance.reconfiguration.pending_head!=NULL;}
         if(waiting)break;
         assert(!__atomic_load_n(&startup_flush_done,__ATOMIC_ACQUIRE));
         sched_yield();
@@ -674,6 +710,7 @@ int main(int argc,char **argv)
         rename_order_case(adapter,root);rename_order_directory_case(adapter,root);
         rename_inode_case(adapter,root);goto Finish;}
     lookup_attributes_case(root);
+    directory_eof_case(root);
     if (getenv("EXT4_NAMESPACE_STAT_ONLY")) goto Finish;
     worker_notification_case(adapter,root);
     rename_order_case(adapter,root);
@@ -709,6 +746,7 @@ int main(int argc,char **argv)
                                         {.parent=directories[same[1]],.root=root,.actor=1}};
     run_pair(adapter,same_actors,1,0);
     puts("PASS real same-group create: independent parents pass VFS, allocation qualification queues the second operation");
+    orphan_closed_case(adapter,root);
     orphan_normal_order_case(adapter,directories[same[0]],root);
     orphan_snapshot_case(adapter,directories[same[0]],directories[same[1]],root);
     namespace_reuse_loop_case(adapter,directories[different[0]],directories[different[1]],root);

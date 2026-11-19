@@ -168,6 +168,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[2],"abort")) {
             jbd_journal_free_trans(&journal,tx,true);
             struct jbd_data_borrow borrow = {0};
+            CHECK(journal.ordered_trees==0);
             CHECK(!jbd_journal_borrow_data(dev.fs,home,&borrow) && block.data[0] == old_first);
             CHECK(ext4_fpread(&file,0,&actual,1,&read) == EOK && read == 1 && actual == 'O');
             CHECK(ext4_block_set(&dev,&block) == EOK);
@@ -189,6 +190,7 @@ int main(int argc, char **argv)
             CHECK(r == EIO && journal.error == EIO && journal.start == start && journal.committed_id == tid);
             CHECK(journal.failed_trans == tx);
             struct jbd_data_borrow borrow = {0};
+            CHECK(journal.ordered_trees==1);
             CHECK(jbd_journal_borrow_data(dev.fs,home,&borrow));
             const unsigned char *pending = borrow.data;
             CHECK(pending[0]=='D' && tx->ordered_count==1);
@@ -202,7 +204,7 @@ int main(int argc, char **argv)
             CHECK(fault_block_crash(&disk) == 0);
             return 0;
         }
-        CHECK(r == EOK);
+        CHECK(r == EOK && journal.ordered_trees==0);
         CHECK(log_writes == ((data_only || access_only) ? 0 : 2));
         if (data_only || access_only) CHECK(journal.committed_id == tid);
         if (access_only) {

@@ -303,22 +303,24 @@ LWIP_SOURCES := \
 	third_party/lwip/src/core/ipv4/ip4.c \
 	third_party/lwip/src/core/ipv4/ip4_addr.c \
 	third_party/lwip/src/core/ipv4/ip4_frag.c \
+	third_party/lwip/src/core/ipv6/ethip6.c \
 	third_party/lwip/src/core/ipv6/icmp6.c \
 	third_party/lwip/src/core/ipv6/ip6.c \
 	third_party/lwip/src/core/ipv6/ip6_addr.c \
 	third_party/lwip/src/core/ipv6/nd6.c \
+	third_party/lwip/src/core/ipv6/mld6.c \
 	net/lwip_port/port.c
 
 CPU_C_SOURCES := kernel/cpu.c kernel/raw_lock.c
 COMMON_C_SOURCES := \
 	$(CPU_C_SOURCES) \
-	kernel/bpf/vm.c kernel/bpf/verify.c kernel/bpf/classic.c \
+	kernel/seccomp.c kernel/sched/seccomp.c kernel/bpf/vm.c kernel/bpf/verify.c kernel/bpf/classic.c \
 	kernel/bpf/maps.c kernel/bpf/ringbuf.c kernel/bpf/objects.c \
 	kernel/bpf/syscall.c kernel/bpf/program.c kernel/bpf/runtime.c \
 	kernel/bpf/btf.c kernel/bpf/trace.c kernel/bpf/info.c \
 	kernel/elf_image.c \
 	kernel/exec_image.c \
-	mm/mm.c \
+	mm/hugetlb.c mm/mm.c \
 	mm/uaccess.c \
 	drivers/serial/ns16550.c \
 	drivers/virtio/block.c \
@@ -362,7 +364,7 @@ COMMON_C_SOURCES := \
 	fs/vfs.c \
 	fs/file_mapping.c \
 	fs/procfs.c \
-	fs/bpffs.c fs/tracefs.c fs/sysfs.c \
+	fs/bpffs.c fs/tracefs.c fs/sysfs.c fs/cgroupfs.c \
 	fs/tmpfs.c \
 	fs/disk_mount.c \
 	fs/fat32.c \
@@ -380,7 +382,7 @@ COMMON_C_SOURCES := \
 	kernel/random.c \
 	kernel/log.c \
 	kernel/blake2s.c \
-	kernel/sched/core.c \
+	kernel/sched/core.c kernel/sched/cgroup.c \
 	kernel/sched/policy.c \
 	kernel/sched/runqueue.c \
 	kernel/sched/scheduling.c kernel/sched/accounting.c kernel/sched/cpu_clock.c \
@@ -392,6 +394,7 @@ COMMON_C_SOURCES := \
 	kernel/sched/kcmp.c \
 	kernel/sched/exec.c \
 	kernel/sched/process.c \
+	kernel/sched/coredump.c \
 	kernel/sched/ptrace.c \
 	kernel/sched/proc.c \
 	kernel/sched/signal.c \
@@ -458,6 +461,7 @@ RV_C_SOURCES := \
 	arch/riscv/exec.c \
 	arch/riscv/process.c \
 	arch/riscv/ptrace.c \
+	arch/riscv/vector.c \
 	arch/riscv/mm.c \
 	arch/riscv/uaccess.c \
 	arch/riscv/root_boot.c \
@@ -482,6 +486,7 @@ ASM_SOURCES := \
 	arch/riscv/secondary.S \
 	arch/riscv/context_switch.S \
 	arch/riscv/fpu.S \
+	arch/riscv/vector_state.S \
 	arch/riscv/trap_entry.S \
 	arch/riscv/user_copy.S \
 	arch/riscv/signal_trampoline.S
@@ -498,6 +503,10 @@ endif
 OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(C_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
+ifeq ($(RISCV_VECTOR_OOM_FIXTURE),1)
+OBJECTS += $(BUILD_DIR)/tests/riscv/vector_oom.o
+LDFLAGS += -Wl,--wrap=riscv_vector_clone,--wrap=riscv_vector_first_use,--wrap=kernel_heap_allocate_zeroed_nosleep
+endif
 ifeq ($(USER_SMP_COMPOSITION),1)
 OBJECTS += $(BUILD_DIR)/tests/riscv/user_smp_composition.o
 LDFLAGS += -Wl,--wrap=kernel_pipe_readv,--wrap=kernel_pipe_writev,--wrap=kernel_open_file_poll,--wrap=kernel_event_fd_io,--wrap=syscall_handle_timerfd,--wrap=kernel_timer_fd_expire
@@ -507,6 +516,7 @@ LDFLAGS += -Wl,--wrap=syscall_handle_posix_timer,--wrap=posix_timer_record_compl
 LDFLAGS += -Wl,--wrap=kernel_signal_stack_prepare,--wrap=riscv_signal_restore_current
 LDFLAGS += -Wl,--wrap=kernel_socket_reserve_read,--wrap=kernel_socket_stream_reserve,--wrap=kernel_socket_write_datagram,--wrap=kernel_socket_write_unix,--wrap=kernel_socket_wait_ready,--wrap=kernel_socket_service_owned,--wrap=kernel_copy_from_user,--wrap=kernel_wait_cursor_wake,--wrap=kernel_wait_backend_quiesce
 LDFLAGS += -Wl,--wrap=ns16550_stop_report,--wrap=scheduler_group_usage_snapshot,--wrap=virtio_split_enqueue
+LDFLAGS += -Wl,--wrap=kernel_mm_resolve_owned_user_fault
 LDFLAGS += -Wl,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_mm_munmap,--wrap=kernel_open_file_prepare_mapping_page,--wrap=kernel_vfs_node_pread_batch,--wrap=riscv_smp_sync_user,--wrap=kernel_wait_park,--wrap=kernel_copy_to_user,--wrap=kernel_mm_resolve_user_fault,--wrap=kernel_mm_resolve_user_pin,--wrap=virt_uart_puts,--wrap=kernel_tty_service_output,--wrap=kernel_mm_pin_user_page,--wrap=kernel_uaccess_write_cursor_copy,--wrap=kernel_mm_fork
 endif
 ifeq ($(SMP_TEST),1)
@@ -531,7 +541,7 @@ $(BUILD_DIR)/tests/riscv/file_io_smp.o: CPPFLAGS += $(LWEXT4_CPPFLAGS)
 LDFLAGS += -Wl,--wrap=kernel_page_cache_run_cpu0,--wrap=kernel_copy_from_user,--wrap=riscv_plic_in_interrupt,--wrap=kernel_uaccess_write_cursor_copy,--wrap=kernel_vfs_node_pread_batch
 LDFLAGS += -Wl,--wrap=ext4_file_prepare_write,--wrap=ext4_ftruncate,--wrap=ext4_fallocate,--wrap=ext4_file_sync_metadata_prepare
 LDFLAGS += -Wl,--wrap=virtio_split_enqueue
-LDFLAGS += -Wl,--wrap=ext4_lookup_child,--wrap=ext4_create_child,--wrap=ext4_unlink_child,--wrap=ext4_rename_child,--wrap=ext4_dir_entry_next_status
+LDFLAGS += -Wl,--wrap=ext4_lookup_child,--wrap=ext4_create_child,--wrap=ext4_unlink_child_resolved,--wrap=ext4_rename_child,--wrap=ext4_dir_iterate
 endif
 $(BUILD_DIR)/tests/riscv/mm_smp.o: CPPFLAGS += -DBOAROS_FILE_IO_SMP_TEST=$(FILE_IO_SMP_TEST)
 $(BUILD_DIR)/tests/riscv/mm_smp.o: CPPFLAGS += -DBOAROS_FILES_SMP_TEST=$(FILES_SMP_TEST) -DBOAROS_SMP_NEGATIVE=$(SMP_NEGATIVE) -DBOAROS_MM_SHARED_TEST=$(MM_SHARED_SMP_TEST) -DBOAROS_MM_FILE_TEST=$(MM_FILE_SMP_TEST)
@@ -1912,7 +1922,7 @@ test-file-mapping-concurrency-host:
 		cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections \
 		-DBOAROS_PAGE_SHIFT=$$shift -Itests/host/mm -Itests/host/sync -idirafter include \
 		tests/host/memory_file_source.c tests/host/mm/context.c tests/host/mm/file_unavailable.c \
-		fs/vfs.c kernel/credentials.c kernel/posix_acl.c fs/tmpfs.c fs/open_file.c fs/block_file.c kernel/block.c fs/file_mapping.c fs/record_lock.c fs/flock.c \
+		fs/vfs.c kernel/credentials.c kernel/posix_acl.c fs/tmpfs.c fs/open_file.c fs/block_file.c kernel/block.c fs/file_mapping.c fs/record_lock.c fs/flock.c kernel/namespace.c \
 		kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c \
 		kernel/physical_page.c mm/heap.c mm/memory_object.c \
 		-Wl,--gc-sections,--wrap=kernel_heap_allocate_zeroed -o build/host/mm/file-source-$$shift; \
@@ -1937,7 +1947,7 @@ test-mm-pin-host:
 		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include \
 		tests/host/mm_pin.c tests/host/mm/unavailable.c tests/host/mm/context.c \
 		kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c \
-		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
+		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/hugetlb.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
 		-Wl,--gc-sections,--wrap=kernel_mm_pin_user_page,--wrap=kernel_raw_lock_acquire,--wrap=physical_page_resolve -o build/host/mm/pin
 	build/host/mm/pin
 
@@ -1952,7 +1962,7 @@ test-mm-concurrency-host:
 		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include \
 		tests/host/mm_concurrency.c tests/host/mm/unavailable.c tests/host/mm/context.c \
 		kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c \
-		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
+		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/hugetlb.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
 		-Wl,--gc-sections,--wrap=physical_page_allocate,--wrap=kernel_raw_lock_acquire -o build/host/mm/concurrency
 	timeout 30s build/host/mm/concurrency
 	sh tests/host/mm-activity.sh
@@ -1977,7 +1987,7 @@ test-mm-shared-concurrency-host:
 		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include \
 		tests/host/mm_shared.c tests/host/mm/unavailable.c tests/host/mm/context.c \
 		kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c \
-		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
+		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/hugetlb.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
 		-Wl,--gc-sections,--wrap=kernel_memory_object_prepare_page -o build/host/mm/shared
 	timeout 30s build/host/mm/shared
 
@@ -1998,7 +2008,7 @@ test-mm-file-concurrency-host:
 		tests/host/mm_file.c tests/host/mm/context.c tests/host/mm/file_unavailable.c \
 		fs/vfs.c kernel/posix_acl.c fs/tmpfs.c fs/open_file.c fs/block_file.c kernel/block.c fs/file_mapping.c fs/record_lock.c fs/flock.c kernel/namespace.c \
 		kernel/cpu.c kernel/raw_lock.c kernel/credentials.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c \
-		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
+		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/hugetlb.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
 		-Wl,--gc-sections,--wrap=kernel_lock_release,--wrap=kernel_open_file_prepare_mapping_page,--wrap=kernel_memory_object_prepare_page,--wrap=kernel_rwlock_write,--wrap=physical_page_allocate,--wrap=kernel_heap_allocate_zeroed -o build/host/mm/file-concurrency
 	timeout 30s build/host/mm/file-concurrency
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections \
@@ -2006,10 +2016,10 @@ test-mm-file-concurrency-host:
 		tests/host/mm_file_single_wait.c tests/host/mm/context.c tests/host/mm/file_unavailable.c \
 		fs/vfs.c kernel/posix_acl.c fs/tmpfs.c fs/open_file.c fs/block_file.c kernel/block.c fs/file_mapping.c fs/record_lock.c fs/flock.c kernel/namespace.c \
 		kernel/cpu.c kernel/raw_lock.c kernel/credentials.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c \
-		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
+		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/hugetlb.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
 		-Wl,--gc-sections,--wrap=kernel_open_file_prepare_mapping_page,--wrap=kernel_rwlock_read,--wrap=kernel_rwlock_try_read -o build/host/mm/file-single-wait
 	timeout 30s build/host/mm/file-single-wait
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DMM_TEST_ELF_SOURCE=1 -Itests/host/mm -Itests/host/sync -idirafter include tests/host/mm_source_release.c kernel/read_source.c kernel/elf64.c kernel/elf64_source.c kernel/namespace.c tests/host/mm/context.c tests/host/mm/file_unavailable.c fs/vfs.c kernel/posix_acl.c fs/tmpfs.c fs/open_file.c fs/block_file.c kernel/block.c fs/file_mapping.c fs/record_lock.c fs/flock.c kernel/cpu.c kernel/raw_lock.c kernel/credentials.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c -Wl,--gc-sections,--wrap=kernel_open_file_release,--wrap=kernel_vfs_close,--wrap=kernel_file_mapping_drain,--wrap=kernel_heap_release,--wrap=kernel_vma_set_backing_in_use,--wrap=physical_page_allocate,--wrap=kernel_vfs_file_mincore_allowed,--wrap=kernel_open_file_prepare_mapping_page,--wrap=kernel_lock_release,--wrap=kernel_elf64_source_page -o build/host/mm/source-release
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DMM_TEST_ELF_SOURCE=1 -Itests/host/mm -Itests/host/sync -idirafter include tests/host/mm_source_release.c kernel/read_source.c kernel/elf64.c kernel/elf64_source.c kernel/namespace.c tests/host/mm/context.c tests/host/mm/file_unavailable.c fs/vfs.c kernel/posix_acl.c fs/tmpfs.c fs/open_file.c fs/block_file.c kernel/block.c fs/file_mapping.c fs/record_lock.c fs/flock.c kernel/cpu.c kernel/raw_lock.c kernel/credentials.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/hugetlb.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c -Wl,--gc-sections,--wrap=kernel_open_file_release,--wrap=kernel_vfs_close,--wrap=kernel_file_mapping_drain,--wrap=kernel_heap_release,--wrap=kernel_vma_set_backing_in_use,--wrap=physical_page_allocate,--wrap=kernel_vfs_file_mincore_allowed,--wrap=kernel_open_file_prepare_mapping_page,--wrap=kernel_lock_release,--wrap=kernel_elf64_source_page -o build/host/mm/source-release
 	timeout 30s build/host/mm/source-release
 
 .PHONY: test-allocator-concurrency-host
@@ -2070,6 +2080,10 @@ $(BUILD_DIR)/sync-%.d: ;
 -include $(BUILD_DIR)/wait-native.d $(wildcard $(BUILD_DIR)/sync-*.d)
 
 .PHONY: test-files-concurrency-host
+.PHONY: test-directory-batch-host
+test-directory-batch-host:
+	FILE_IO_DIRECTORIES_ONLY=1 FILE_IO_HOST_TCP=0 sh tests/host/file-io-concurrency.sh
+
 .PHONY: test-file-io-concurrency-host
 test-file-io-concurrency-host:
 	sh tests/host/file-io-concurrency.sh
@@ -2128,10 +2142,10 @@ test-scheduler-stack-slots-host:
 .PHONY: test-scheduler-handoff-host
 test-scheduler-handoff-host: test-scheduler-stack-slots-host
 	@mkdir -p build/host
-	@set -e; for shift in 12 14; do \
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/sync -idirafter include tests/host/sched_handoff.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/core.c kernel/sched/process.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=scheduler_switch_claimed,--wrap=kernel_raw_lock_acquire,--wrap=kernel_wait_backend_quiesce -o build/host/scheduler-handoff-$$shift; \
-		build/host/scheduler-handoff-$$shift; \
-	done
+	@set -e; for shift in 12 14; do for debug in 0 1; do \
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_LOCK_DEBUG=$$debug -DBOAROS_PAGE_SHIFT=$$shift -Itests/host/sync -idirafter include tests/host/sched_handoff.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/core.c kernel/sched/process.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/seccomp.c kernel/sched/cgroup.c fs/cgroupfs.c kernel/sched/seccomp.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=scheduler_switch_claimed,--wrap=kernel_raw_lock_acquire,--wrap=kernel_wait_backend_quiesce -o build/host/scheduler-handoff-$$shift-$$debug; \
+		build/host/scheduler-handoff-$$shift-$$debug; \
+	done; done
 
 .PHONY: test-posix-timer-host
 test-posix-timer-host:
@@ -2185,9 +2199,9 @@ test-proc-index-host:
 
 test-sched-concurrency-host:
 	@mkdir -p build/host
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sched_concurrency.c tests/host/signal_owner.c kernel/signal_pending.c kernel/reboot.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/sched/lifetime.c kernel/sched/ptrace.c kernel/sched/identity.c kernel/sched/process.c kernel/pid.c kernel/sched/futex_pi.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_sched_policy_charge,--wrap=kernel_sched_policy_set,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release -o build/host/sched-concurrency
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sched_concurrency.c tests/host/signal_owner.c tests/host/pid_namespace_shutdown.c kernel/namespace.c kernel/signal_pending.c kernel/reboot.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/park.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/seccomp.c kernel/sched/cgroup.c kernel/sched/seccomp.c fs/cgroupfs.c kernel/sched/lifetime.c tests/host/pid_namespace_ptrace.c kernel/sched/exec.c kernel/sched/proc.c kernel/sched/identity.c kernel/pid.c kernel/sched/futex_pi.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_sched_policy_charge,--wrap=kernel_sched_policy_set,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release -o build/host/sched-concurrency
 	build/host/sched-concurrency
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/process_child_links.c kernel/cpu.c kernel/raw_lock.c -Wl,--gc-sections -o build/host/process-child-links
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/process_child_links.c kernel/sched/identity.c kernel/pid.c kernel/cpu.c kernel/raw_lock.c -Wl,--gc-sections -o build/host/process-child-links
 	build/host/process-child-links
 
 test-riscv: test-scheduler-handoff-riscv
@@ -2202,17 +2216,51 @@ run-user-smp-riscv: kernel-rv-user-smp
 .PHONY: test-socket-protocol-host
 test-socket-protocol-host:
 	@mkdir -p $(or $(SOCKET_PROTOCOL_HOST_BUILD),build/host/socket-protocol)
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -include sys/types.h -include limits.h -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -DSOCKET_PROTOCOL_CASES -Itests/host/sync -idirafter include -idirafter net/lwip_port/include -idirafter third_party/lwip/src/include tests/host/user_smp.c tests/host/user_stop.c kernel/signal_pending.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/sched/lifetime.c kernel/sched/policy.c kernel/sched/runqueue.c third_party/lwip/src/core/ip.c third_party/lwip/src/core/stats.c -Wl,--gc-sections,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release,--wrap=kernel_scheduler_wake_signal,--wrap=kernel_wait_backend_quiesce,--wrap=kernel_rwlock_write,--wrap=kernel_rwlock_try_write -o $(or $(SOCKET_PROTOCOL_HOST_BUILD),build/host/socket-protocol)/scope
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -include sys/types.h -include limits.h -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -DSOCKET_PROTOCOL_CASES -Itests/host/sync -idirafter include -idirafter net/lwip_port/include -idirafter third_party/lwip/src/include tests/host/user_smp.c tests/host/user_stop.c kernel/signal_pending.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/seccomp.c kernel/sched/seccomp.c kernel/sched/lifetime.c kernel/sched/policy.c kernel/sched/runqueue.c third_party/lwip/src/core/ip.c third_party/lwip/src/core/stats.c -Wl,--gc-sections,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release,--wrap=kernel_scheduler_wake_signal,--wrap=kernel_wait_backend_quiesce,--wrap=kernel_rwlock_write,--wrap=kernel_rwlock_try_write -o $(or $(SOCKET_PROTOCOL_HOST_BUILD),build/host/socket-protocol)/scope
 	$(or $(SOCKET_PROTOCOL_HOST_BUILD),build/host/socket-protocol)/scope
 
-test-user-smp-host:
+USER_SMP_HOST_BUILD = cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=$(1) -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -Itests/host/sync -idirafter include tests/host/user_smp.c tests/host/user_stop.c kernel/signal_pending.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/seccomp.c kernel/sched/seccomp.c kernel/sched/lifetime.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release,--wrap=kernel_scheduler_wake_signal,--wrap=kernel_wait_backend_quiesce -o $(2)
+
+.PHONY: user-smp-host test-user-smp-fair-host test-user-smp-rt-host
+user-smp-host:
+	@mkdir -p build/host
+	$(call USER_SMP_HOST_BUILD,2,build/host/user-smp)
+
+test-user-smp-rt-host:
+	@mkdir -p build/host
+	$(call USER_SMP_HOST_BUILD,4,build/host/user-smp-rt)
+	build/host/user-smp-rt --rt-balance-only
+
+test-user-smp-fair-host: user-smp-host
+	build/host/user-smp --fair-balance-only
+
+test-user-smp-host: user-smp-host
 	@mkdir -p build/host/mm
 	$(MAKE) test-service-scope-host
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -Itests/host/sync -idirafter include tests/host/user_smp.c tests/host/user_stop.c kernel/signal_pending.c kernel/credentials.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/accounting.c kernel/rlimit.c kernel/sched/lifetime.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_raw_lock_acquire,--wrap=kernel_raw_lock_release,--wrap=kernel_scheduler_wake_signal,--wrap=kernel_wait_backend_quiesce -o build/host/user-smp
 	build/host/user-smp
 	python3 -B tests/smp/test_user.py
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -DREMOTE_USER_CASE=1 -Itests/host/mm -Itests/host/sync -idirafter include tests/host/mm_activity.c tests/host/mm/unavailable.c tests/host/mm/context.c kernel/sched/proc.c kernel/sched/accounting.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c -Wl,--gc-sections,--wrap=riscv_sv39_user_detach_range,--wrap=physical_page_allocate,--wrap=physical_page_map_owned -o build/host/mm/remote-user
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=2 -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_USER_SMP=1 -DREMOTE_USER_CASE=1 -Itests/host/mm -Itests/host/sync -idirafter include tests/host/mm_activity.c tests/host/mm/unavailable.c tests/host/mm/context.c kernel/sched/proc.c kernel/sched/accounting.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/hugetlb.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c -Wl,--gc-sections,--wrap=riscv_sv39_user_detach_range,--wrap=physical_page_allocate,--wrap=physical_page_map_owned -o build/host/mm/remote-user
 	timeout 30s build/host/mm/remote-user
+
+.PHONY: test-user-smp-fair-riscv
+FAIR_BALANCE_ELF := $(USER_SMP_BUILD)/fair-balance-rv
+$(FAIR_BALANCE_ELF): tests/workloads/smp/fair_balance.c $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -o $@ $<
+
+test-user-smp-fair-riscv: $(FAIR_BALANCE_ELF)
+	$(MAKE) kernel-rv-user-smp
+	python3 -B tests/smp/fair_balance.py --kernel $(USER_SMP_BUILD)/kernel-rv --program $(FAIR_BALANCE_ELF) --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE)
+
+.PHONY: test-user-smp-rt-riscv
+RT_BALANCE_ELF := $(USER_SMP_BUILD)/rt-balance-rv
+$(RT_BALANCE_ELF): tests/workloads/smp/rt_balance.c $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -o $@ $<
+
+test-user-smp-rt-riscv: $(RT_BALANCE_ELF)
+	$(MAKE) kernel-rv-user-smp
+	python3 -B tests/smp/rt_balance.py --kernel $(USER_SMP_BUILD)/kernel-rv --program $(RT_BALANCE_ELF) --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE)
 
 .PHONY: test-user-smp-riscv
 USER_SMP_ELF := build/riscv-user-smp$(SMP_BUILD_SUFFIX)/user-smp-rv
@@ -2470,3 +2518,84 @@ test-async-io-host:
 	sh tests/host/async-io.sh
 test-inotify-async-host:
 	sh tests/host/inotify-async.sh
+
+.PHONY: test-gpt-host
+test-gpt-host:
+	@mkdir -p build/host
+	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_gpt.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-gpt
+	build/host/block-gpt build/host/gpt.img
+	python3 tests/host/gpt-blkid.py build/host/gpt.img
+
+.PHONY: test-seccomp-host
+test-seccomp-host:
+	sh tests/host/seccomp.sh
+
+.PHONY: test-huge-riscv test-mm-huge-host
+test-mm-huge-host:
+	sh tests/host/mm-base-leaf.sh
+	sh tests/host/mm-huge.sh
+
+$(BUILD_DIR)/tests/kernel-huge-rv: $(filter-out $(BUILD_DIR)/tests/riscv/sv39_main.o,$(SV39_TEST_OBJECTS)) $(BUILD_DIR)/tests/riscv/huge_main.o arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -o $@ $(filter %.o,$^)
+
+test-huge-riscv: $(BUILD_DIR)/tests/kernel-huge-rv
+	QEMU_RISCV64=$(QEMU_RISCV64) HUGE_TEST_KERNEL_RV=$< sh tests/riscv/huge.sh
+
+.PHONY: test-hugetlb-host
+test-hugetlb-host:
+	sh tests/host/shm-hugetlb.sh
+	sh tests/host/hugetlb.sh
+	sh tests/host/mm-hugetlb.sh
+	sh tests/host/proc-hugetlb.sh
+
+.PHONY: test-riscv-vector-host
+test-riscv-vector-host:
+	mkdir -p build/host
+	@set -e; for shift in 12 14; do \
+		$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -Werror \
+		-ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=$$shift -DBOAROS_MAX_CPUS=1 \
+		-Itests/host/sync -idirafter include tests/host/riscv_vector.c arch/riscv/vector.c \
+		-Wl,--gc-sections -o build/host/riscv-vector-$$shift; \
+		build/host/riscv-vector-$$shift; \
+	done
+	python3 -B tests/host/smp_dtb_test.py
+
+.PHONY: test-pid-namespace-host
+test-pid-namespace-host:
+	@mkdir -p build/host
+	@set -e; for shift in 12 14; do \
+	cc -std=c11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=$$shift \
+		-idirafter include -fsanitize=address,undefined tests/host/pid-namespace.c \
+		kernel/pid.c -o build/host/pid-namespace-$$shift; \
+	build/host/pid-namespace-$$shift; done
+
+.PHONY: test-pid-namespace-concurrency-host
+test-pid-namespace-concurrency-host:
+	@mkdir -p build/host
+	@set -e; for shift in 12 14; do \
+	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -pthread -DBOAROS_PAGE_SHIFT=$$shift \
+		-DBOAROS_MAX_CPUS=4 -DBOAROS_LOCK_DEBUG=1 -Itests/host/sync -idirafter include \
+		-fsanitize=address,undefined tests/host/pid-namespace-concurrency.c \
+		kernel/pid.c kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c -o build/host/pid-namespace-concurrency-$$shift; \
+	build/host/pid-namespace-concurrency-$$shift; done
+
+.PHONY: test-pid-namespace-lifecycle-host
+test-pid-namespace-lifecycle-host:
+	@mkdir -p build/host
+	@set -e; for shift in 12 14; do \
+	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -pthread -DBOAROS_MAX_CPUS=4 \
+		-DBOAROS_PAGE_SHIFT=$$shift -ffunction-sections -fdata-sections \
+		-Itests/host/sync -idirafter include -fsanitize=address,undefined \
+		tests/host/pid-namespace-lifecycle.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/sched/process.c kernel/pid.c kernel/namespace.c kernel/credentials.c kernel/uts.c kernel/ipc_namespace.c -DBOAROS_UTS_MACHINE=\"host\" \
+		kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c \
+		-Wl,--gc-sections -o build/host/pid-namespace-lifecycle-$$shift; \
+	build/host/pid-namespace-lifecycle-$$shift; done
+
+.PHONY: test-clone3-import-host
+test-clone3-import-host:
+	@mkdir -p build/host
+	@cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_MAX_CPUS=4 -DBOAROS_PAGE_SHIFT=12 \
+		-ffunction-sections -fdata-sections -Itests/host/sync -idirafter include \
+		-fsanitize=address,undefined tests/host/clone3-import.c kernel/syscall/process.c \
+		-Wl,--gc-sections -o build/host/clone3-import
+	@build/host/clone3-import

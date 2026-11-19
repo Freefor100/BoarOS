@@ -96,7 +96,6 @@ enum kernel_syscall_status syscall_handle_rt_sigaction(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
-    KERNEL_SERVICE_SCOPE(service);
     uint32_t sig = (uint32_t)request->arguments[0];
     uint64_t input = request->arguments[1];
     uint64_t output = request->arguments[2];
@@ -125,6 +124,7 @@ enum kernel_syscall_status syscall_handle_rt_sigaction(
         }
     }
     if (input != 0U) {
+        KERNEL_SERVICE_SCOPE(service);
         status = kernel_signal_set_action(caller, sig, &action, &old_action);
     } else status = kernel_signal_get_action(caller, sig, &old_action);
     if (status != KERNEL_SIGNAL_STATUS_OK) return signal_result(status, decoded);
@@ -143,7 +143,6 @@ enum kernel_syscall_status syscall_handle_rt_sigprocmask(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
-    KERNEL_SERVICE_SCOPE(service);
     uint32_t how = (uint32_t)request->arguments[0];
     uint64_t input = request->arguments[1];
     uint64_t output = request->arguments[2];
@@ -187,7 +186,6 @@ enum kernel_syscall_status syscall_handle_rt_sigpending(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
-    KERNEL_SERVICE_SCOPE(service);
     struct kernel_mm *mm;
     uint64_t pending;
     enum kernel_uaccess_status copy_status;
@@ -402,7 +400,7 @@ enum kernel_syscall_status syscall_handle_sigqueueinfo(struct kernel_task *calle
     info.signal=sig;
     if(thread && (group<=0 || pid<=0)){decoded->value=-KERNEL_EINVAL;return KERNEL_SYSCALL_STATUS_OK;}
     kernel_pid_t self;
-    if(kernel_task_tid(caller,&self)!=KERNEL_TASK_STATUS_OK)return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    if(kernel_task_user_tid(caller,&self)!=KERNEL_TASK_STATUS_OK)return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     if((info.code>=0 || info.code==-6) && pid!=self) {
         decoded->value=-KERNEL_EPERM;return KERNEL_SYSCALL_STATUS_OK;
     }
@@ -438,7 +436,7 @@ enum kernel_syscall_status syscall_handle_signal_send(
         decoded->value = sent < 0 ? sent : sent == 0U ? -KERNEL_ESRCH : 0;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    task_status = kernel_task_tgid(caller, &sender_pid);
+    task_status = kernel_task_user_tgid(caller, &sender_pid);
     if (task_status != KERNEL_TASK_STATUS_OK) {
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }

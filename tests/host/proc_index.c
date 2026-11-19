@@ -20,6 +20,7 @@ static struct kernel_credentials namespace_credentials;
 static uint64_t bitmap[2];
 static unsigned all_steps, ancestry_steps;
 static int invalidate_ancestry, reset_actions, replace_mm;
+static struct kernel_task *snapshot_group_change;
 static unsigned maps_mm_refs, maps_file_refs, maps_calls;
 static pthread_barrier_t action_barrier;
 static struct kernel_signal_table actions;
@@ -42,6 +43,14 @@ struct kernel_task *scheduler_task_lookup(kernel_pid_t tid,enum kernel_pid_role 
        !task->accounted || task->retirement)return 0;
     scheduler_task_get_locked(task);return task;
 }
+struct kernel_task *kernel_task_find_user_tid(struct kernel_task *caller,kernel_pid_t tid)
+{
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    struct kernel_task *task=process_find_identity_in(tid,KERNEL_PID_TID,process_pid_active(caller));
+    if(!task || !task->accounted || task->retirement)return NULL;
+    scheduler_task_get_locked(task);return task;
+}
+
 void scheduler_task_put(struct kernel_task *task)
 {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
@@ -97,7 +106,12 @@ int scheduler_task_descends_from(struct kernel_task *task, const struct kernel_t
 uint64_t kernel_signal_pending_count_locked(const struct kernel_task *t) { (void)t;assert(active->raw_locks); return 0; }
 struct kernel_tty *kernel_task_controlling_tty(const struct kernel_task *task)
 {
-    (void)task;
+    if (snapshot_group_change) {
+        assert(!active->raw_locks && task->storage_borrows);
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        snapshot_group_change->group_leader=snapshot_group_change;
+        snapshot_group_change=NULL;
+    }
     if (replace_mm) {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         tasks[1].mm.record = (void *)(uintptr_t)2; replace_mm = 0;
@@ -111,7 +125,7 @@ struct kernel_tty *kernel_task_controlling_tty(const struct kernel_task *task)
     return 0;
 }
 uint64_t kernel_tty_rdev(const struct kernel_tty *tty) { (void)tty; return 0; }
-int32_t kernel_tty_foreground(const struct kernel_tty *tty) { (void)tty; return -1; }
+int32_t kernel_tty_foreground_in(const struct kernel_tty *tty,const struct kernel_pid_registry *view) { (void)tty; (void)view; return -1; }
 void scheduler_usage_snapshot(const struct kernel_task *task, int thread, struct kernel_task_usage *usage)
 { (void)task; (void)thread; *usage = (struct kernel_task_usage){0}; }
 enum kernel_mm_status kernel_mm_proc_memory_snapshot(const struct kernel_mm *mm, struct kernel_mm_proc_memory *result)
@@ -132,7 +146,7 @@ static void setup(void)
     scheduler = (struct kernel_scheduler){0};
     memset(tasks, 0, sizeof(tasks)); memset(ids, 0, sizeof(ids));
     assert(kernel_pid_allocator_init(&scheduler.pid_allocator, bitmap, 128) == KERNEL_PID_STATUS_OK);
-    scheduler.identities = (struct kernel_pid_registry){.numbers = &scheduler.pid_allocator, .next_generation = 1};
+    assert(!kernel_pid_registry_init(&scheduler.identities,&scheduler.pid_allocator,NULL));
     for (unsigned i = 0; i < 6; i++) {
         struct kernel_task *task = &tasks[i];
         kernel_raw_lock_init(&task->files_access,KERNEL_RAW_RANK_TASK_FILES);
@@ -152,6 +166,7 @@ static void setup(void)
         kernel_pid_attach(&task->identities[KERNEL_PID_TID], &ids[i], KERNEL_PID_TID, task);
         kernel_pid_attach(&task->identities[KERNEL_PID_TGID], &ids[i], KERNEL_PID_TGID, task);
     }
+    scheduler.identities.child_reaper=&ids[0];
     /* Task 3 is a member of task 2; task 4 is outside init's ancestry. */
     kernel_pid_detach(&tasks[2].identities[KERNEL_PID_TGID]);
     tasks[2].limits=tasks[1].limits;
@@ -232,21 +247,24 @@ static void thread_resources_case(void)
 }
 static void namespace_handles_case(void)
 {
-    const uint32_t mask=KERNEL_NS_MNT|KERNEL_NS_UTS|KERNEL_NS_IPC;
+    const uint32_t mask=KERNEL_NS_MNT|KERNEL_NS_UTS|KERNEL_NS_IPC|KERNEL_NS_PID;
     for(namespace_change=0;namespace_change<=4;namespace_change++) {
         setup();active->current=&tasks[1];
-        struct kernel_namespace *owners[3]={0};
+        struct kernel_namespace *owners[4]={0};
         namespace_credentials=*kernel_credentials_initial();
         int error=kernel_proc_namespaces_handle(2,ids[1].generation,mask,1,owners);
         if(namespace_change) {
             assert(error==(namespace_change>=3 ? -KERNEL_ENOENT : -KERNEL_EACCES));
-            assert(!owners[0]&&!owners[1]&&!owners[2]);
+            assert(!owners[0]&&!owners[1]&&!owners[2]&&!owners[3]);
         } else {
             assert(!error);
             for(unsigned i=0;i<3;i++) {
                 assert(owners[i]==&namespaces[1][i] && owners[i]->references==2);
                 kernel_namespace_put(owners[i]);
             }
+            assert(process_pid_namespace_registry(owners[3])==&scheduler.identities);
+            assert(owners[3]->id==KERNEL_NS_INITIAL_PID_ID);
+            kernel_namespace_put(owners[3]);
             struct kernel_namespace *thread=0;
             assert(!kernel_proc_namespace_handle(3,ids[2].generation|KERNEL_PROC_THREAD_TARGET,KERNEL_NS_UTS,&thread));
             assert(thread==&namespaces[2][1]);kernel_namespace_put(thread);
@@ -257,17 +275,42 @@ static void namespace_handles_case(void)
         borrows_returned();tasks[1].credentials=kernel_credentials_initial();active->current=0;
     }
     namespace_change=0;
+    setup();active->current=&tasks[1];
+    struct kernel_pid_registry *child=NULL;
+    assert(!process_pid_namespace_create(&scheduler.identities,&scheduler.identity_heap,&child));
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        assert(!process_pid_children_install_locked(&tasks[1],child));
+    }
+    struct kernel_namespace *pidns=NULL;
+    uint32_t child_refs=child->references;
+    assert(!kernel_proc_namespace_handle(2,ids[1].generation,
+        KERNEL_NS_PID|KERNEL_PROC_PID_FOR_CHILDREN,&pidns));
+    assert(!child->child_reaper && process_pid_namespace_registry(pidns)==child);
+    assert(pidns->id==child->namespace_id && child->references==child_refs+1);
+    kernel_namespace_put(pidns);pidns=NULL;
+    assert(child->references==child_refs);
+    assert(!kernel_proc_namespace_handle(2,ids[1].generation,KERNEL_NS_PID,&pidns));
+    assert(process_pid_namespace_registry(pidns)==&scheduler.identities);
+    kernel_namespace_put(pidns);
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        assert(!process_pid_children_install_locked(&tasks[1],&scheduler.identities));
+        kernel_pid_registry_put(child);
+    }
+    process_identity_collect();
+    assert(!scheduler.identities.retired_namespaces);
     setup();active->current=&tasks[0];
     struct kernel_credentials from=*kernel_credentials_initial(),to=from;
     from.uid=from.euid=from.suid=to.uid=to.euid=to.suid=to.fsuid=1000;
     from.gid=from.egid=from.sgid=to.gid=to.egid=to.sgid=to.fsgid=1000;
     from.fsuid=from.fsgid=2000;from.effective=from.permitted=to.effective=to.permitted=0;
     tasks[0].credentials=&from;tasks[1].credentials=&to;
-    struct kernel_namespace *owners[3]={0};
+    struct kernel_namespace *owners[4]={0};
     assert(!kernel_proc_namespaces_handle(2,ids[1].generation,KERNEL_NS_UTS,0,owners));
     kernel_namespace_put(owners[1]);owners[1]=0;
     assert(kernel_proc_namespaces_handle(2,ids[1].generation,KERNEL_NS_UTS,1,owners)==-KERNEL_EACCES);
-    assert(!owners[0]&&!owners[1]&&!owners[2]);borrows_returned();
+    assert(!owners[0]&&!owners[1]&&!owners[2]&&!owners[3]);borrows_returned();
     tasks[0].credentials=tasks[1].credentials=kernel_credentials_initial();active->current=0;
     puts("PASS proc combined MNT/UTS/IPC owner snapshot, selected TID, REALCREDS/FSCREDS, changed MM/credentials/PID identity/exit and returned references");
 }
@@ -379,7 +422,7 @@ enum kernel_mm_status kernel_mm_acquire(struct kernel_mm *out, const struct kern
 }
 enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
 {
-    assert(!active->raw_locks && maps_mm_refs && mm->record == (void *)(uintptr_t)1);
+    assert(!active->raw_locks && maps_mm_refs && (mm->record == (void *)(uintptr_t)1 || mm->record == (void *)0x111 || mm->record == (void *)0x222 || mm->record == (void *)0x333));
     maps_mm_refs--; mm->state = KERNEL_MM_RELEASED; return 0;
 }
 enum kernel_open_file_status kernel_open_file_release(struct kernel_open_file_description **file)
@@ -499,6 +542,28 @@ static void remote_memory_owner_case(void)
     puts("PASS remote memory REALCREDS, dumpable, capability, captured old MM and returned task owners");
 }
 
+static unsigned filter_mask=0x33;
+unsigned kernel_mm_coredump_filter_get(const struct kernel_mm *mm)
+{assert(mm==&tasks[1].mm);return filter_mask;}
+void kernel_mm_coredump_filter_set(struct kernel_mm *mm,unsigned value)
+{assert(mm==&tasks[1].mm);filter_mask=value&0x1ff;}
+static void filter_case(void)
+{
+ setup();unsigned value=0;
+ tasks[1].mm.state=KERNEL_MM_LIVE;
+ assert(kernel_proc_coredump_filter(2,ids[1].generation,0,&value,0)==1&&value==0x33);
+ value=0xffff;assert(kernel_proc_coredump_filter(2,ids[1].generation,0,&value,1)==1&&filter_mask==511);
+ assert(kernel_proc_coredump_filter(2,ids[1].generation+1,0,&value,0)==-KERNEL_ESRCH);
+ tasks[1].proc_exiting=1;
+ assert(!kernel_proc_coredump_filter(2,ids[1].generation,0,&value,0));
+ assert(kernel_proc_coredump_filter(2,ids[1].generation,0,&value,1)==-KERNEL_ESRCH);
+ tasks[1].proc_exiting=0;tasks[1].mm.state=KERNEL_MM_RELEASED;
+ assert(!kernel_proc_coredump_filter(2,ids[1].generation,0,&value,0));
+ tasks[1].retirement=1;
+ assert(kernel_proc_coredump_filter(2,ids[1].generation,0,&value,0)==-KERNEL_ESRCH);
+ borrows_returned();puts("PASS coredump_filter identity/MM lifetime and no-MM EOF/ESRCH");
+}
+
 static void comm_case(void)
 {
     setup(); active->current = &tasks[1];
@@ -531,14 +596,161 @@ static void comm_case(void)
     puts("PASS comm current/selected thread, same-group update, generation, zombie and retirement");
 }
 
+static void view_task_create(struct kernel_task *task, struct kernel_task *parent,
+    struct kernel_pid_registry *space, int thread)
+{
+    *task=(struct kernel_task){.accounted=1,.arch.user_mode=1,
+        .parent=thread?NULL:parent,.limits=parent->limits,.group_members=1,
+        .state=KERNEL_THREAD_STATE_READY};
+    kernel_raw_lock_init(&task->files_access,KERNEL_RAW_RANK_TASK_FILES);
+    task->uts_namespace=&namespaces[1][1];task->ipc_namespace=&namespaces[1][2];
+    task->group_leader=thread?parent:task;
+    task->group_next=task->group_previous=task;
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      assert(!process_pid_children_install_locked(parent,space)); }
+    assert(!process_identity_create(task,parent,thread));
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      assert(!process_identity_admit_locked(task));
+      process_identity_commit_locked(task);
+      assert(!process_pid_children_install_locked(parent,process_pid_active(parent))); }
+}
+static void namespace_views_case(void)
+{
+    setup();active->current=&tasks[0];
+    uint32_t root_refs=scheduler.identities.references;
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      kernel_pid_attach(&tasks[0].identities[KERNEL_PID_PGID],&ids[0],KERNEL_PID_PGID,&tasks[0]);
+      kernel_pid_attach(&tasks[0].identities[KERNEL_PID_SID],&ids[0],KERNEL_PID_SID,&tasks[0]); }
+    struct kernel_pid_registry *a=NULL,*b=NULL,*deep=NULL;
+    assert(!process_pid_namespace_create(&scheduler.identities,&scheduler.identity_heap,&a));
+    assert(!process_pid_namespace_create(&scheduler.identities,&scheduler.identity_heap,&b));
+    assert(!process_pid_namespace_create(a,&scheduler.identity_heap,&deep));
+    struct kernel_task inner,sibling,nested,worker;
+    view_task_create(&inner,&tasks[0],a,0);
+    view_task_create(&sibling,&tasks[0],b,0);
+    view_task_create(&nested,&inner,deep,0);
+    view_task_create(&worker,&inner,a,1);
+    struct kernel_mm remote={0};
+    inner.mm=(struct kernel_mm){.state=KERNEL_MM_LIVE,.record=(void *)0x111};
+    sibling.mm=(struct kernel_mm){.state=KERNEL_MM_LIVE,.record=(void *)0x222};
+    nested.mm=(struct kernel_mm){.state=KERNEL_MM_LIVE,.record=(void *)0x333};
+    active->current=&inner;
+    assert(!kernel_task_remote_mm_acquire(1,&remote) && remote.record==inner.mm.record);
+    assert(!kernel_mm_release(&remote));remote=(struct kernel_mm){0};
+    assert(!kernel_task_remote_mm_acquire(2,&remote) && remote.record==nested.mm.record);
+    assert(!kernel_mm_release(&remote));remote=(struct kernel_mm){0};
+    assert(kernel_task_remote_mm_acquire(sibling.tid,&remote)==-KERNEL_ESRCH);
+    active->current=&sibling;
+    assert(!kernel_task_remote_mm_acquire(1,&remote) && remote.record==sibling.mm.record);
+    assert(!kernel_mm_release(&remote));remote=(struct kernel_mm){0};
+    assert(kernel_task_remote_mm_acquire(2,&remote)==-KERNEL_ESRCH);
+    active->current=&nested;
+    assert(!kernel_task_remote_mm_acquire(1,&remote) && remote.record==nested.mm.record);
+    assert(!kernel_mm_release(&remote));remote=(struct kernel_mm){0};
+    inner.mm=(struct kernel_mm){0};sibling.mm=(struct kernel_mm){0};nested.mm=(struct kernel_mm){0};
+    active->current=&tasks[0];
+    kernel_pid_t canonical,number,tgid,tid;uint64_t generation;
+    assert(!kernel_proc_view_lookup(a,1,0,0,0,&canonical,&generation) && canonical==inner.tid);
+    assert(!kernel_proc_view_lookup(b,1,0,0,0,&canonical,&generation) && canonical==sibling.tid);
+    assert(kernel_proc_view_lookup(deep,inner.tid,0,0,0,&canonical,&generation)==-KERNEL_ENOENT);
+    assert(!kernel_proc_view_next(a,0,0,0,0,&number,&canonical,&generation) && number==1 && canonical==inner.tid);
+    assert(!kernel_proc_view_next(a,1,0,0,0,&number,&canonical,&generation) && number==2 && canonical==nested.tid);
+    assert(kernel_proc_view_next(a,2,0,0,0,&number,&canonical,&generation)==-KERNEL_ENOENT);
+    assert(!kernel_proc_view_next(a,1,inner.tid,process_identity_generation(&inner),1,
+        &number,&canonical,&generation) && number==3 && canonical==worker.tid);
+    assert(kernel_proc_view_lookup(a,3,sibling.tid,process_identity_generation(&sibling),1,
+        &canonical,&generation)==-KERNEL_ENOENT);
+    active->current=&inner;
+    struct kernel_pid_registry *mount_view=kernel_proc_view_acquire();
+    assert(mount_view==a);
+    unsigned retained_refs=a->references;
+    kernel_proc_view_retain(mount_view);assert(a->references==retained_refs+1);
+    kernel_proc_view_release(mount_view);assert(a->references==retained_refs);
+    assert(!kernel_proc_view_self(mount_view,&tgid,&tid) && tgid==1 && tid==1);
+    active->current=&sibling; /* inherited mount does not adopt the reader */
+    assert(kernel_proc_view_self(mount_view,&tgid,&tid)==-KERNEL_ENOENT);
+    assert(!kernel_proc_view_lookup(mount_view,1,0,0,0,&canonical,&generation) && canonical==inner.tid);
+    strcpy(inner.comm,"inner");strcpy(sibling.comm,"sibling");char comm[16]={0};
+    assert(!kernel_proc_comm(canonical,generation,0,comm,0) && !strcmp(comm,"inner"));
+    assert(kernel_proc_comm(canonical,generation,0,comm,1)==-KERNEL_EINVAL);
+    assert(!strcmp(inner.comm,"inner") && !strcmp(sibling.comm,"sibling"));
+    struct kernel_ptrace_state trace={.tracer=&tasks[0]};inner.ptrace=&trace;
+    struct kernel_proc_process_snapshot snap;
+    assert(!kernel_proc_snapshot_in(a,inner.tid,process_identity_generation(&inner),0,&snap));
+    assert(snap.pid==1 && snap.ppid==0 && snap.tracer_pid==0 && !snap.process_group && !snap.session_id);
+    assert(snap.namespace_count==1 && snap.namespace_ids[0][KERNEL_PID_TID]==1);
+    kernel_credentials_put(snap.credentials);
+    trace.tracer=&worker;
+    assert(!kernel_proc_snapshot_in(a,inner.tid,process_identity_generation(&inner),0,&snap));
+    assert(snap.tracer_pid==3);kernel_credentials_put(snap.credentials);
+    assert(!kernel_proc_snapshot_in(&scheduler.identities,nested.tid,process_identity_generation(&nested),0,&snap));
+    assert(snap.namespace_count==3 && snap.namespace_ids[0][KERNEL_PID_TID]==nested.tid &&
+        snap.namespace_ids[1][KERNEL_PID_TID]==2 && snap.namespace_ids[2][KERNEL_PID_TID]==1);
+    assert(snap.namespace_ids[0][KERNEL_PID_PGID]==1 && !snap.namespace_ids[1][KERNEL_PID_PGID]);
+    kernel_credentials_put(snap.credentials);
+    assert(kernel_proc_snapshot_in(b,nested.tid,process_identity_generation(&nested),0,&snap)==-KERNEL_ENOENT);
+    snapshot_group_change=&worker;
+    assert(!kernel_proc_snapshot_in(a,worker.tid,process_identity(&worker,KERNEL_PID_TID)->generation,1,&snap));
+    assert(worker.group_leader==&worker && snap.pid==3 && snap.tgid==1 &&
+        snap.namespace_ids[0][KERNEL_PID_TGID]==1 && !inner.storage_borrows && !worker.storage_borrows);
+    kernel_credentials_put(snap.credentials);
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);worker.group_leader=&inner; }
+    struct kernel_namespace *ns_owners[4]={0};
+    struct kernel_pid *ns_identity=process_identity(&inner,KERNEL_PID_TID);
+    kernel_task_identity_retain(ns_identity);
+    assert(ns_identity->number==1 && inner.tid!=1);
+    assert(!kernel_proc_namespaces_identity_handle(ns_identity,KERNEL_NS_PID|KERNEL_NS_UTS|KERNEL_NS_IPC,ns_owners));
+    assert(ns_owners[1]==inner.uts_namespace && ns_owners[2]==inner.ipc_namespace &&
+        process_pid_namespace_registry(ns_owners[3])==a);
+    for(unsigned i=0;i<4;i++){kernel_namespace_put(ns_owners[i]);ns_owners[i]=NULL;}
+    struct kernel_proc_fdinfo info={0};
+    struct kernel_pid *retained=process_identity(&nested,KERNEL_PID_TID);
+    kernel_task_identity_retain(retained);
+    proc_pidfd_numbers(retained,&scheduler.identities,&info);
+    assert(info.pid==nested.tid && info.namespace_count==3 && info.namespace_ids[1]==2 && info.namespace_ids[2]==1);
+    proc_pidfd_numbers(retained,a,&info);
+    assert(info.pid==2 && info.namespace_count==2 && info.namespace_ids[1]==1);
+    proc_pidfd_numbers(retained,b,&info);
+    assert(info.pid==0 && !info.namespace_count);
+    /* A read opened before role transfer cannot report the stale task. */
+    uint64_t old=process_identity_generation(&inner);
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      kernel_pid_transfer(&inner.identities[KERNEL_PID_TGID],&worker.identities[KERNEL_PID_TGID],&worker); }
+    assert(proc_task_snapshot(&inner,old,0,&snap,a)==-KERNEL_ENOENT);
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      kernel_pid_transfer(&worker.identities[KERNEL_PID_TGID],&inner.identities[KERNEL_PID_TGID],&inner); }
+    inner.ptrace=NULL;
+    active->current=&tasks[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      kernel_pid_registry_disable(a);kernel_pid_registry_disable(b);kernel_pid_registry_disable(deep);
+      process_identity_release_locked(&worker);process_identity_release_locked(&nested);
+      process_identity_release_locked(&inner);process_identity_release_locked(&sibling);
+      kernel_pid_registry_put(deep);kernel_pid_registry_put(a);kernel_pid_registry_put(b); }
+    assert(kernel_proc_namespaces_identity_handle(ns_identity,KERNEL_NS_PID,ns_owners)==-KERNEL_ENOENT);
+    assert(!ns_owners[0] && !ns_owners[1] && !ns_owners[2] && !ns_owners[3]);
+    kernel_task_identity_put(ns_identity);
+    proc_pidfd_numbers(retained,a,&info);
+    assert(info.pid==-1 && !info.namespace_count);
+    kernel_task_identity_put(retained);
+    process_identity_collect();
+    assert(mount_view->references==1 && !mount_view->numbers->allocated && !mount_view->accepting);
+    assert(kernel_proc_view_next(mount_view,0,0,0,0,&number,&canonical,&generation)==-KERNEL_ENOENT);
+    kernel_proc_view_release(mount_view);
+    assert(scheduler.identities.references==root_refs && !scheduler.identities.retired && !scheduler.identities.retired_namespaces);
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      kernel_pid_detach(&tasks[0].identities[KERNEL_PID_PGID]);kernel_pid_detach(&tasks[0].identities[KERNEL_PID_SID]); }
+    borrows_returned();active->current=NULL;
+    puts("PASS proc fixed mount view: nested/sibling same PID, thread membership, inherited reader, TracerPid TID, namespace columns, role transfer and dead mount owner reclamation");
+}
+
 int main(int argc, char **argv)
 {
     active = &cpus[0]; kernel_cpu_initialize(active, 0, 0); kernel_cpu_initialize(&cpus[1], 1, 0);
     kernel_raw_lock_init(&kernel_wait_domain, KERNEL_RAW_RANK_SCHEDULER);
-    if (argc > 1 && !strcmp(argv[1], "comm")) comm_case();
+    if (argc > 1 && !strcmp(argv[1], "comm")) {comm_case();filter_case();}
     else if (argc > 1 && !strcmp(argv[1], "remote-mm")) remote_memory_owner_case();
     else if (argc > 1 && !strcmp(argv[1], "snapshot")) snapshot_case();
-    else {lookup_cases();access_case();maps_access_cases();memory_owner_case();thread_resources_case();namespace_handles_case();}
+    else {namespace_views_case();lookup_cases();access_case();maps_access_cases();memory_owner_case();thread_resources_case();namespace_handles_case();}
     for(unsigned i=0;i<6;i++)kernel_exec_security_put(tasks[i].exec_security);
     return 0;
 }

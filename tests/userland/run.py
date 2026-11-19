@@ -31,10 +31,70 @@ def ipv4_reference_fixture(image,directory):
                        directory/'reference-setup.log')
 
 def workload_source(name):
+    if name == 'cgroup': return ROOT / 'tests/workloads/resource/cgroup.c'
+    if name == 'core_dump': return ROOT / 'tests/workloads/resource/core_dump.c'
+    if name == 'exec_capacity': return ROOT / 'tests/workloads/resource/exec_capacity.c'
     if name == 'mount_namespace': return ROOT / 'tests/workloads/resource/mount_namespace.c'
     if name == 'bpf_abi': return ROOT / 'tests/workloads/resource/bpf_abi.c'
     if name == 'vdso_time': return ROOT / 'tests/workloads/resource/vdso_time.c'
     return ROOT / ({'futex_vector':'tests/workloads/futex/vector.c','pi':'tests/workloads/futex/pi.c','mount_bind':'tests/workloads/resource/mount_bind.c','mount_move':'tests/workloads/resource/mount_move.c','execveat':'tests/workloads/resource/execveat.c','chroot':'tests/workloads/resource/chroot.c','proc_thread_resources':'tests/workloads/resource/proc_thread_resources.c','clone_resources':'tests/workloads/resource/clone_resources.c','remount':'tests/workloads/resource/remount.c','mount_attributes':'tests/workloads/resource/mount_attributes.c','shm_query':'tests/workloads/resource/shm_query.c','shm_lock':'tests/workloads/resource/shm_lock.c','madvise':'tests/workloads/resource/madvise.c','acl':'tests/workloads/resource/acl.c','vdso_dontneed':'tests/workloads/resource/vdso_dontneed.c','kcmp':'tests/workloads/resource/kcmp.c','ioprio':'tests/workloads/resource/ioprio.c','memlock':'tests/workloads/resource/memlock.c','pidfd':'tests/workloads/resource/pidfd.c','nproc':'tests/workloads/resource/nproc.c','rt':'tests/workloads/resource/rt.c','cpu':'tests/workloads/resource/cpu.c','ipc_proc':'tests/workloads/ipc/proc_sysvipc.c','memory':'tests/workloads/resource/memory.c','mremap':'tests/workloads/mremap/caller.c','futex':'tests/workloads/futex/caller.c','posix':'tests/workloads/signal/posix.c','queued':'tests/workloads/signal/queued.c','altstack':'tests/workloads/signal/altstack.c','event':'tests/workloads/event/caller.c','pipe':'tests/workloads/pipe/caller.c','epoll':'tests/workloads/epoll/delivery.c'}.get(name,f'tests/workloads/network/{name}.c'))
+
+def cgroup_output(raw):
+    lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('CGROUP ')]
+    return lines==['CGROUP CASE '+name+' PASS' for name in ('hierarchy','atomic-clone-exit','fd-and-rollback','group-migration-inheritance','delegation-opener')]+['CGROUP END 5']
+
+
+def core_dump_output(raw):
+    cases = ('image', 'limit', 'dumpable', 'symlink', 'hardlink', 'replace',
+             'threads-blocked-running-nonleader-failure', 'fsize', 'unsafe-mode',
+             'bounded-prefix', 'filter-categories-headers-cow-discard-vdso',
+             'filter-private-shared-hugetlb', 'cold-anonymous-low-limit-later-payload')
+    lines = [line for line in raw.splitlines()
+             if line.startswith(('CORE CASE ', 'CORE END ', 'CORE coredump_filter '))]
+    return lines == ['CORE coredump_filter proc PASS',
+                     *(f'CORE CASE {case} PASS' for case in cases), 'CORE END 14']
+
+
+def core_dump_extract(image,folder):
+    for name,expected in (('core',1),('core-threads',2)):
+        core=folder/(name+'.elf')
+        subprocess.run(['debugfs','-R',f'dump /core-test/{name} {core}',str(image)],
+                       stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True)
+        logpath=folder/(name+'-readelf.log')
+        with logpath.open('w') as log:
+            subprocess.run(['readelf','-h','-l','-n',str(core)],stdout=log,stderr=subprocess.STDOUT,check=True)
+        if logpath.read_text().count('NT_PRSTATUS')!=expected:
+            raise RuntimeError(f'{name} lacks {expected} native PRSTATUS notes')
+
+def sendfile_tcp_output(raw,performance):
+    lines=raw.replace('\r','').splitlines()
+    resources=re.findall(r'^SENDFILE-TCP RESOURCE fd_before=(\d+) fd_after=(\d+)$',raw.replace('\r',''),re.M)
+    if len(resources)!=1 or resources[0][0]!=resources[0][1]:return False
+    if lines.count('NETWORK PASS sendfile_tcp')!=1:return False
+    if performance:
+        metrics=re.findall(r'^SENDFILE-TCP PERF chunk=(\d+) bytes=(\d+) accepted_ns=(\d+) complete_ns=(\d+) sender_cpu_ns=(\d+) sender_cpu=(\d+) receiver_cpu=(\d+)$',raw.replace('\r',''),re.M)
+        return (len(metrics)==2 and all(int(row[0])==chunk and int(row[1])==8388608 and
+            0<int(row[2])<=int(row[3]) and int(row[4])>0 for row,chunk in zip(metrics,(4096,262144))))
+    cases=[line for line in lines if line.startswith('SENDFILE-TCP CASE ')]
+    return cases==[f'SENDFILE-TCP CASE {name} PASS' for name in (
+        'content-offset-eof','nonblocking-short-resume','signal-before-progress',
+        'signal-after-prefix','reset-after-prefix','cancel-last-sender','shutdown-no-progress','sparse-memory-source',
+        'concurrent-send-write','cancel-shared-sender','pipe-to-tcp-splice')]
+
+
+def sendfile_tcp_fixture(image,directory):
+    data=directory/'sendfile-tcp-data'
+    # Fixed bytes, generated outside the measured program and identical in
+    # every kernel's cloned image. The reader validates every received byte.
+    block=bytes(range(251))*4096
+    with data.open('wb') as stream:
+        left=8*1024*1024
+        while left:
+            size=min(left,len(block));stream.write(block[:size]);left-=size
+    batch=directory/'sendfile-tcp-data.debugfs'
+    batch.write_text(f'write "{data.resolve()}" /sendfile-tcp-data\n')
+    harness.run_logged(['debugfs','-w','-f',str(batch),str(image)],directory/'sendfile-tcp-data-install.log')
+
 
 def futex_lines(raw,cpus):
     names=['abi','atomics']+[f'compare-{cmp}-old-{value}' for cmp in range(6) for value in (-1,0,1)]+['requeue-near','requeue-offset','wake-zero','wake-negative','wake-both','shared','robust']
@@ -55,7 +115,7 @@ def mremap_output(raw,cpus):
 
 def clone_resources_output(raw):
     lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('CLONE-RES ')]
-    return lines==['CLONE-RES CASE thread-files-fs PASS','CLONE-RES CASE process-vm-files-exec PASS','CLONE-RES CASE clear-sighand PASS','CLONE-RES CASE clone3 PASS','CLONE-RES CASE pidfd PASS','CLONE-RES END 5']
+    return lines==['CLONE-RES CASE thread-files-fs PASS','CLONE-RES CASE process-vm-files-exec PASS','CLONE-RES CASE clear-sighand PASS','CLONE-RES exact-tid OK','CLONE-RES CASE clone3 PASS','CLONE-RES CASE pidfd PASS','CLONE-RES END 5']
 
 
 def proc_thread_resources_output(raw):
@@ -329,6 +389,17 @@ def mount_namespace_output(raw):
         'MOUNTNS CASE clone-flags-shared-fs-permissions PASS',
         'MOUNTNS END 2',
     ]
+EXEC_CAPACITY_CASES=('large-argv-env','default-exact','default-over','stack-quarter-exact',
+ 'stack-quarter-over','floor-exact','floor-over','ceiling-exact','ceiling-over',
+ 'single-argv-exact','single-argv-over','single-env-exact','single-env-over',
+ 'many-empty-pointers','pointer-space-over','large-then-efault','execveat-large',
+ 'script-exact-original-pointers','script-over')
+
+def exec_capacity_output(raw):
+    lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('EXEC-CAP ')]
+    return lines==[f'EXEC-CAP CASE {name} PASS' for name in EXEC_CAPACITY_CASES]+[f'EXEC-CAP END {len(EXEC_CAPACITY_CASES)}']
+
+
 def execveat_output(raw):
     lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('EXECVEAT ')]
     return lines==[*(f'EXECVEAT CASE {name} PASS' for name in EXECVEAT_CASES),'EXECVEAT END cases=12 failures=0']
@@ -452,7 +523,7 @@ def run_loongarch(args):
         for cpus in args.cpus or (1,):
             for memory in args.memory or ('512M','1G'):
                 case=work/(f'{platform}-{memory}'+(f'-{cpus}cpu' if args.cpus else ''));case.mkdir()
-                image=harness.fixture(case,program) if args.workload in ('ipv4_basic','pipe','event','altstack','queued','posix','futex','mremap','unix_control','unix_seqpacket','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','chroot','proc_thread_resources','clone_resources','pi','futex_vector') else disk(case,program)
+                image=harness.fixture(case,program) if args.workload in ('ipv4_basic','pipe','event','altstack','queued','posix','futex','mremap','unix_control','unix_seqpacket','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','exec_capacity','core_dump','cgroup','chroot','proc_thread_resources','clone_resources','pi','futex_vector') else disk(case,program)
                 if args.workload=='chroot':chroot_fixture(image,case,'loongarch')
                 kernel=profile.linux_kernel(noswap=args.workload=='madvise') if platform=='linux' else args.kernel or ROOT/profile.kernel
                 snapshot=case/'kernel';shutil.copyfile(kernel,snapshot)
@@ -468,6 +539,7 @@ def run_loongarch(args):
                 passed=not code and ('FUTEX CALLER PASS cases=28' if args.workload=='futex' else 'POSIX END failures=0' if args.workload=='posix' else 'QUEUED END failures=0' if args.workload=='queued' else 'ALTSTACK END 6' if args.workload=='altstack' else 'EPOLL PASS delivery' if args.workload=='epoll' else 'PIPE END 7' if args.workload=='pipe' else 'EVENT END 8' if args.workload=='event' else f'NETWORK PASS {args.workload}') in raw and 'fatal' not in raw and (
                     'Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
                 if digest(program)!=metadata['program_sha256']:raise RuntimeError('ELF changed during comparison')
+                if args.workload=='queued' and platform=='boaros':passed=passed and raw.count('QUEUED INIT defaults-handlers-blocked-child-kill PASS')==2 and raw.count('QUEUED INIT nonleader-exec PASS')==1
                 if args.workload=='ipv4_basic':passed=passed and ipv4_basic_output(raw,cpus)
                 if args.workload=='futex':
                     lines,expected=futex_lines(raw,cpus);passed=passed and lines==expected
@@ -485,6 +557,9 @@ def run_loongarch(args):
                 if args.workload=='chroot':passed=not code and chroot_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
                 if args.workload=='proc_thread_resources':passed=not code and proc_thread_resources_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
                 if args.workload=='clone_resources':passed=not code and clone_resources_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+                if args.workload=='cgroup':passed=not code and cgroup_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+                if args.workload=='core_dump':passed=not code and core_dump_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+                if args.workload=='exec_capacity':passed=not code and exec_capacity_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
                 if args.workload=='execveat':passed=not code and execveat_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
                 if args.workload=='mount_attributes':passed=not code and mount_attributes_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
                 if args.workload=='shm_query':passed=not code and shm_query_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
@@ -498,7 +573,10 @@ def run_loongarch(args):
                 if args.workload=='ioprio':passed=not code and ioprio_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
                 if args.workload=='memlock':passed=not code and memlock_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
                 if args.workload=='pidfd':passed=not code and pidfd_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
-                if args.workload=='rt':passed=not code and rt_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
+                if args.workload=='rt':
+                    cleanup = ('Linux LA root application passed' in raw if platform=='linux'
+                               else profile.root_success(raw,0) or profile.root_poweroff_success(raw))
+                    passed = not code and rt_output(raw) and cleanup
                 if args.workload=='ipc_proc':passed=not code and ipc_proc_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
                 if args.workload=='cpu':passed=not code and cpu_output(raw,cpus) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
                 if args.workload=='memory':passed=not code and memory_output(raw) and ('Linux LA root application passed' in raw if platform=='linux' else profile.root_success(raw,0))
@@ -511,6 +589,7 @@ def run_loongarch(args):
                 print(platform,memory,'PASS' if passed else 'FAIL',work,flush=True)
                 if not passed:print('\n'.join(raw.splitlines()[-20:]));return 1
                 with (case/'fsck.log').open('w') as log:subprocess.run(['e2fsck','-fn',str(image)],stdout=log,stderr=subprocess.STDOUT,check=True)
+                if args.workload=='core_dump':core_dump_extract(image,case)
                 image.unlink();snapshot.unlink()
     return 0
 
@@ -561,9 +640,10 @@ def run_smp(args):
                 fixture=harness.fixture(folder,program)
                 if args.workload=='chroot':chroot_fixture(fixture,folder,'riscv')
                 if args.performance:
-                    marker=folder/'performance';marker.write_text('fixed named AF_UNIX performance workload\n')
+                    marker=folder/'performance';marker.write_text('fixed network performance workload\n')
                     batch=folder/'performance.debugfs';batch.write_text(f'write "{marker.resolve()}" /performance\n')
                     harness.run_logged(['debugfs','-w','-f',str(batch),str(fixture)],folder/'performance-install.log')
+                    if args.workload=='sendfile_tcp':sendfile_tcp_fixture(fixture,folder)
                 if args.dynamic:
                     loader=ROOT/'build/riscv/musl-root/lib/libc.so'
                     batch=folder/'loader.debugfs';batch.write_text(f'mkdir /lib\nwrite "{loader}" /lib/ld-musl-riscv64.so.1\nset_inode_field /lib/ld-musl-riscv64.so.1 mode 0100755\n')
@@ -584,11 +664,12 @@ def run_smp(args):
                     if altstack:
                         lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('ALTSTACK CASE ') or line.startswith('ALTSTACK END ')]
                         expected[-2]='ALTSTACK CASE copy-races '+('OK' if target=='boaros' and args.observe and cpus>1 else 'SKIP')
-                    if queued:expected=[f'QUEUED THREADS mode={mode} cpus={cpus} OK' for mode in range(4)]+['QUEUED COMPETE OK']+(['QUEUED CONTROL callback-source-exit OK','QUEUED CONTROL prepared-leader-exit OK','QUEUED CONTROL prepared-thread-exec OK'] if target=='boaros' and args.observe and cpus>1 else ['QUEUED CONTROL SKIP'])+['QUEUED END failures=0']
+                    if queued:expected=['QUEUED INIT defaults-handlers-blocked-child-kill PASS']+[f'QUEUED THREADS mode={mode} cpus={cpus} OK' for mode in range(4)]+['QUEUED COMPETE OK']+(['QUEUED CONTROL callback-source-exit OK','QUEUED CONTROL prepared-leader-exit OK','QUEUED CONTROL prepared-thread-exec OK'] if target=='boaros' and args.observe and cpus>1 else ['QUEUED CONTROL SKIP'])+['QUEUED INIT defaults-handlers-blocked-child-kill PASS','QUEUED INIT nonleader-exec PASS','QUEUED END failures=0']
                     if futex:lines,expected=futex_lines(raw,cpus)
                     passed=bool(expected) and lines==expected and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='ipv4_basic':passed=ipv4_basic_output(raw,cpus) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='interface':passed='NETWORK PASS interface' in raw and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
+                    if args.workload=='sendfile_tcp':passed=sendfile_tcp_output(raw,args.performance) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if unix_named:passed=unix_named_output(raw,args.performance) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if unix_control:passed=unix_control_output(raw,args.performance,cpus) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if unix_seqpacket:passed=unix_seqpacket_output(raw,args.performance,cpus) and (target=='linux' or unix_seqpacket_owners(raw,'riscv'))
@@ -606,6 +687,9 @@ def run_smp(args):
                     if args.workload=='chroot':passed=not record['returncode'] and chroot_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='proc_thread_resources':passed=not record['returncode'] and proc_thread_resources_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='clone_resources':passed=not record['returncode'] and clone_resources_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
+                    if args.workload=='cgroup':passed=not record['returncode'] and cgroup_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
+                    if args.workload=='core_dump':passed=not record['returncode'] and core_dump_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
+                    if args.workload=='exec_capacity':passed=not record['returncode'] and exec_capacity_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='execveat':passed=not record['returncode'] and execveat_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='mount_attributes':passed=not record['returncode'] and mount_attributes_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='shm_query':passed=not record['returncode'] and shm_query_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
@@ -619,8 +703,12 @@ def run_smp(args):
                     if args.workload=='ioprio':passed=not record['returncode'] and ioprio_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='memlock':passed=not record['returncode'] and memlock_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     if args.workload=='pidfd':passed=not record['returncode'] and pidfd_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
-                    if args.workload=='rt':passed=not record['returncode'] and rt_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
-                    if target=='boaros' and args.workload in ('nproc','rt','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','chroot','proc_thread_resources','clone_resources','pi','futex_vector'):
+                    if args.workload=='rt':
+                        profile = PROFILES['riscv']
+                        cleanup = (target=='linux' or profile.root_success(raw,0) or
+                                   profile.root_poweroff_success(raw))
+                        passed = not record['returncode'] and rt_output(raw) and cleanup
+                    if target=='boaros' and args.workload in ('nproc','rt','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','exec_capacity','core_dump','cgroup','chroot','proc_thread_resources','clone_resources','pi','futex_vector'):
                         online=[int(v) for v in re.findall(r'^BoarOS: SMP online logical=(\d+) hart=0x[0-9a-f]+\r?$',raw,re.M)]
                         passed=passed and online==list(range(1,cpus))
                     if args.workload=='ipc_proc':passed=not record['returncode'] and ipc_proc_output(raw) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
@@ -628,7 +716,7 @@ def run_smp(args):
                     if sysv_sem:passed=sysv_sem_output(raw,cpus) and (target=='linux' or unix_seqpacket_owners(raw,'riscv'))
                     if mremap:passed=mremap_output(raw,cpus) and (target=='linux' or PROFILES['riscv'].root_success(raw,0))
                     observations=None
-                    if target=='boaros' and args.observe and not pipe and not event and not altstack and not queued and not posix and not futex and not mremap and not unix_named and not unix_control and not unix_seqpacket and not sysv_sem and not sysv_msg and not memory_workload and not cpu_workload and args.workload not in ('ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','chroot','proc_thread_resources','clone_resources','pi','futex_vector'):
+                    if target=='boaros' and args.observe and not pipe and not event and not altstack and not queued and not posix and not futex and not mremap and not unix_named and not unix_control and not unix_seqpacket and not sysv_sem and not sysv_msg and not memory_workload and not cpu_workload and args.workload not in ('ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','exec_capacity','core_dump','cgroup','chroot','proc_thread_resources','clone_resources','pi','futex_vector'):
                         matches=re.findall(r'SOCKET caller cpu=(0x[0-9a-f]+) operations=(0x[0-9a-f]+) copy-bytes=(0x[0-9a-f]+) pins=(0x[0-9a-f]+) waits=(0x[0-9a-f]+)',raw)
                         observations=[[int(value,16) for value in row] for row in matches]
                         active=[row for row in observations if row[0]<cpus]
@@ -667,6 +755,7 @@ def run_smp(args):
                     print(target,cpus,memory,'PASS' if passed else 'FAIL',output,flush=True)
                     if not passed:raise RuntimeError('socket SMP stream or owner cleanup failed: '+str(folder))
                     with (folder/(target+'-fsck.log')).open('w') as log:subprocess.run(['e2fsck','-fn',str(disk)],stdout=log,stderr=subprocess.STDOUT,check=True)
+                    if args.workload=='core_dump':core_dump_extract(disk,folder)
                     disk.unlink()
                 fixture.unlink()
         report['status']='passed'
@@ -678,13 +767,13 @@ def run_smp(args):
 def main(default_arch="riscv"):
     parser=argparse.ArgumentParser(__doc__)
     parser.add_argument('--only',choices=('linux','boaros'))
-    parser.add_argument('--workload',choices=('ipv4_basic','contract','content','timer','budget','interface','sendfile','admission','unix_sender','unix_named','unix_control','unix_seqpacket','smp','epoll','pipe','event','altstack','queued','posix','futex','mremap','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','chroot','proc_thread_resources','clone_resources','pi','futex_vector'),default='contract')
+    parser.add_argument('--workload',choices=('ipv4_basic','contract','content','timer','budget','interface','sendfile','sendfile_tcp','admission','unix_sender','unix_named','unix_control','unix_seqpacket','smp','epoll','pipe','event','altstack','queued','posix','futex','mremap','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','exec_capacity','core_dump','cgroup','chroot','proc_thread_resources','clone_resources','pi','futex_vector'),default='contract')
     parser.add_argument('--platform-config',choices=('fixture','official'),default='fixture')
     parser.add_argument('--arch',choices=('riscv','loongarch'),default=default_arch)
     parser.add_argument('--memory',action='append',choices=('512M','1G'))
     parser.add_argument('--kernel',type=Path)
     parser.add_argument('--cpus',action='append',type=int,choices=(1,2,4))
-    parser.add_argument('--performance',action='store_true',help='run fixed AF_UNIX traffic via /performance')
+    parser.add_argument('--performance',action='store_true',help='run fixed network traffic via /performance')
     parser.add_argument('--dynamic',action='store_true')
     parser.add_argument('--libc',choices=('musl','glibc'),default='musl')
     parser.add_argument('--observe',action='store_true')
@@ -696,8 +785,8 @@ def main(default_arch="riscv"):
         args.only = 'boaros'
     if args.dynamic and args.libc=='glibc':parser.error('glibc direct consumer uses the static target toolchain')
     if args.performance and args.arch!='riscv':parser.error('--performance requires the RISC-V SMP runner')
-    if args.performance and args.workload not in ('unix_named','unix_control','unix_seqpacket'):parser.error('--performance requires --workload unix_named, unix_control or unix_seqpacket')
-    if (args.workload in ('interface','ipv4_basic') and args.cpus and max(args.cpus) > 1) or (args.workload in ('unix_named','unix_control','unix_seqpacket','smp','pipe','event','altstack','queued','posix','futex','mremap','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','chroot','proc_thread_resources','clone_resources','pi','futex_vector') and args.arch=='riscv'):
+    if args.performance and args.workload not in ('unix_named','unix_control','unix_seqpacket','sendfile_tcp'):parser.error('--performance requires --workload unix_named, unix_control, unix_seqpacket or sendfile_tcp')
+    if (args.workload in ('interface','ipv4_basic') and args.cpus and max(args.cpus) > 1) or (args.workload in ('sendfile_tcp','unix_named','unix_control','unix_seqpacket','smp','pipe','event','altstack','queued','posix','futex','mremap','sysv_sem','sysv_msg','memory','cpu','ipc_proc','rt','nproc','pidfd','memlock','acl','vdso_dontneed','bpf_abi','vdso_time','kcmp','ioprio','madvise','shm_lock','shm_query','mount_attributes','remount','mount_bind','mount_move','mount_namespace','execveat','exec_capacity','core_dump','cgroup','chroot','proc_thread_resources','clone_resources','pi','futex_vector') and args.arch=='riscv'):
         if args.arch == 'riscv': return run_smp(args)
     if args.arch=='riscv' and args.platform_config=='official' and args.memory and args.memory!=['1G']:
         parser.error('official profile requires 1G')
@@ -736,6 +825,7 @@ def main(default_arch="riscv"):
             except (RuntimeError,TimeoutError):pass
             raw=log.read_text(errors='replace')
             passed=('POSIX END failures=0' if args.workload=='posix' else 'QUEUED END failures=0' if args.workload=='queued' else 'ALTSTACK END 6' if args.workload=='altstack' else 'EPOLL PASS delivery' if args.workload=='epoll' else 'PIPE END 8' if args.workload=='pipe' else f'NETWORK PASS {args.workload}') in raw
+            if args.workload=='queued':passed=passed and raw.count('QUEUED INIT defaults-handlers-blocked-child-kill PASS')==2 and raw.count('QUEUED INIT nonleader-exec PASS')==1
             if args.workload=='ipv4_basic':passed=passed and ipv4_basic_output(raw)
             if name=='boaros':passed=passed and 'heap-live=0x0; shutting down' in raw and 'exited status=0x0 ' in raw
             metadata['runs'][label]={'passed':passed,'memory':memory,'kernel_sha256':digest(snapshot),'command':command}

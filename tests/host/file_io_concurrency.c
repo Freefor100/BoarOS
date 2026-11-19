@@ -38,6 +38,7 @@ void mm_test_finish(void);
 void mm_test_activate_task(void);
 extern _Thread_local uint64_t mm_test_context;
 static unsigned watch_memory_staging,memory_staging_calls;
+static _Thread_local unsigned directory_scratch_fail;
 static unsigned memory_lookup_calls;
 enum kernel_page_cache_status __real_kernel_open_file_lookup_page(struct kernel_open_file_description *,uint64_t,uint64_t *,size_t *);
 enum kernel_page_cache_status __wrap_kernel_open_file_lookup_page(struct kernel_open_file_description *file,uint64_t index,uint64_t *page,size_t *valid)
@@ -74,6 +75,7 @@ enum kernel_task_status __real_kernel_task_io_buffer_acquire(struct kernel_task_
 enum kernel_task_status __wrap_kernel_task_io_buffer_acquire(struct kernel_task_io_buffer *buffer,struct physical_page_allocator *allocator)
 {
     if (watch_memory_staging) memory_staging_calls++;
+    if (directory_scratch_fail) return KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE;
     return __real_kernel_task_io_buffer_acquire(buffer,allocator);
 }
 #if !defined(TCP_IO_CASES) && !defined(LOOP_IO_CASES) && !defined(FALLOCATE_SYNC_CASES)
@@ -120,6 +122,8 @@ static void tcp_wait_locking(struct kernel_rwlock *);
 static int tcp_batch_unpinning(struct kernel_mm_user_pin *);
 static void tcp_batch_unpinned(struct kernel_mm_user_pin *);
 #endif
+static struct kernel_wait_queue *directory_offset_queue;
+static unsigned directory_offset_waiting;
 static struct kernel_wait_queue *vmsplice_wait_queue;
 static unsigned vmsplice_wait_registered;
 enum kernel_scheduler_status __real_kernel_wait_prepare(struct kernel_wait_queue *,uint64_t,int,struct kernel_wait_token *);
@@ -131,6 +135,7 @@ enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue
     tcp_wait_preparing(queue);
 #endif
     enum kernel_scheduler_status status=__real_kernel_wait_prepare(queue,deadline,interruptible,token);
+    if (!status && queue==directory_offset_queue) __atomic_store_n(&directory_offset_waiting,1,__ATOMIC_RELEASE);
     if (!status && queue==vmsplice_wait_queue)__atomic_store_n(&vmsplice_wait_registered,1,__ATOMIC_RELEASE);
     if (!status && interruptible && futex_role==1)
         __atomic_store_n(&futex_registered,1,__ATOMIC_RELEASE);
@@ -1255,6 +1260,105 @@ static void sendfile_pipe_case(struct kernel_heap *heap,struct kernel_vfs_mount 
     puts("PASS sendfile source-page borrow: unaligned cross-page pipe content, sparse zero bytes and explicit offset");
 }
 
+/* Exercise the actual atomic publication used by F_SETFL at a deterministic
+ * post-route/pre-copy boundary. This ext4 fixture tests request snapshots;
+ * legal FAT open/F_SETFL admission is covered by the FAT syscall guest. */
+static struct kernel_open_file_description *copy_flags_source,*copy_flags_target;
+static unsigned copy_flags_pause,copy_flags_resume;
+enum kernel_page_cache_status __real_kernel_page_cache_get_batch(
+    struct kernel_page_cache *,const struct kernel_vfs_file *,uint64_t,
+    struct kernel_page_cache_read_page *,size_t,int);
+enum kernel_page_cache_status __wrap_kernel_page_cache_get_batch(
+    struct kernel_page_cache *cache,const struct kernel_vfs_file *file,uint64_t first,
+    struct kernel_page_cache_read_page *pages,size_t count,int no_reuse)
+{
+    enum kernel_page_cache_status result=__real_kernel_page_cache_get_batch(cache,file,first,pages,count,no_reuse);
+    if (copy_flags_source && file==&copy_flags_source->file &&
+        !__atomic_exchange_n(&copy_flags_pause,1,__ATOMIC_ACQ_REL)) {
+        while (!__atomic_load_n(&copy_flags_resume,__ATOMIC_ACQUIRE)) sched_yield();
+    }
+    return result;
+}
+static void *publish_copy_flags(void *argument)
+{
+    (void)argument;
+    while (!__atomic_load_n(&copy_flags_pause,__ATOMIC_ACQUIRE)) sched_yield();
+    kernel_open_file_set_status_flags(copy_flags_source,KERNEL_FILES_O_DIRECT);
+    kernel_open_file_set_status_flags(copy_flags_target,KERNEL_FILES_O_DIRECT);
+    __atomic_store_n(&copy_flags_resume,1,__ATOMIC_RELEASE);
+    return NULL;
+}
+
+static unsigned ext4_direct_paused,ext4_direct_resume;
+static void ext4_direct_pause(void *owner,struct kernel_vfs_node *node,uint64_t first,uint64_t last)
+{
+    (void)owner;(void)node;(void)first;(void)last;
+    __atomic_store_n(&ext4_direct_paused,1,__ATOMIC_RELEASE);
+    while (!__atomic_load_n(&ext4_direct_resume,__ATOMIC_ACQUIRE)) sched_yield();
+}
+static void ext4_direct_truncated(void *owner,struct kernel_vfs_node *node,uint64_t size)
+{(void)owner;(void)node;(void)size;}
+static void *ext4_direct_reader(void *file)
+{
+    mm_test_attach(1);unsigned char data[512];size_t done;
+    assert(!kernel_vfs_direct_pread(file,0,data,sizeof(data),&done) && done==sizeof(data));
+    assert(data[0]=='B');for(unsigned i=1;i<sizeof(data);i++) assert(data[i]==0x61);
+    return NULL;
+}
+static void *ext4_direct_truncater(void *file)
+{mm_test_attach(2);assert(!kernel_vfs_ftruncate(file,0));return NULL;}
+static void ext4_direct_truncate_race(struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_node *node=kernel_vfs_file_node(file);
+    assert(!kernel_file_mapping_prepare(node));
+    struct kernel_file_mapping mapping={.node=node,.owner=file,
+        .truncate=ext4_direct_truncated,.invalidate_range=ext4_direct_pause};
+    assert(!kernel_file_mapping_register(&mapping));
+    ext4_direct_paused=ext4_direct_resume=0;pthread_t reader,truncater;
+    assert(!pthread_create(&reader,NULL,ext4_direct_reader,file));
+    while (!__atomic_load_n(&ext4_direct_paused,__ATOMIC_ACQUIRE)) sched_yield();
+    uint64_t epoch;assert(kernel_file_mapping_epoch(node,&epoch)==-KERNEL_EBUSY);
+    assert(!pthread_create(&truncater,NULL,ext4_direct_truncater,file));
+    int waiting=0;
+    while (!waiting) {
+        KERNEL_RAW_SCOPE(guard,&node->write_operation.lock.metadata);
+        waiting=node->write_operation.lock.pending_head!=NULL;
+    }
+    __atomic_store_n(&ext4_direct_resume,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(reader,NULL) && !pthread_join(truncater,NULL));
+    assert(!kernel_file_mapping_epoch(node,&epoch));kernel_file_mapping_unregister(&mapping);
+    assert(!node->size);
+}
+
+static void ext4_direct_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
+{
+    struct kernel_open_file_description *file=NULL;
+    int error;
+    if (getenv("FILE_IO_NOJOURNAL")) {
+        assert(!kernel_open_file_create(heap,mount,"/direct-file",&file,&error) && !error);
+    } else assert(!kernel_open_file_create_mode(heap,mount,"/direct-file",0600,&file,&error) && !error);
+    file->open_flags=2|KERNEL_FILES_O_DIRECT;
+    assert(kernel_vfs_direct_alignment(&file->file)==512);
+    assert(!kernel_vfs_file_acquire_write(&file->file));
+    unsigned char data[512] __attribute__((aligned(512)));
+    memset(data,0x61,sizeof(data));size_t done=0;
+    {KERNEL_LOCK_SCOPE(operation);kernel_vfs_file_write_lock(&file->file,&operation);
+    assert(!kernel_vfs_pwrite_direct(&file->file,0,data,sizeof(data),&done,&operation) && done==sizeof(data));}
+    assert(!kernel_vfs_pwrite(&file->file,0,"B",1,&done) && done==1);
+    assert(!kernel_vfs_direct_pread(&file->file,0,data,sizeof(data),&done) && done==sizeof(data) && data[0]=='B');
+    assert(!kernel_page_cache_resident(kernel_open_file_page_cache(file),&file->file,0));
+    memset(data,0x63,sizeof(data));
+    {KERNEL_LOCK_SCOPE(operation);kernel_vfs_file_write_lock(&file->file,&operation);
+    assert(!kernel_vfs_pwrite_direct(&file->file,2*BOAROS_PAGE_SIZE,data,sizeof(data),&done,&operation) && done==sizeof(data));}
+    memset(data,0x7f,sizeof(data));
+    assert(!kernel_vfs_direct_pread(&file->file,BOAROS_PAGE_SIZE,data,sizeof(data),&done) && done==sizeof(data));
+    for (unsigned i=0;i<sizeof(data);i++) assert(!data[i]);
+    ext4_direct_truncate_race(&file->file);
+    assert(!kernel_open_file_release(&file));
+    if (!getenv("FILE_IO_NOJOURNAL")) assert(!kernel_vfs_unlink(mount,"/direct-file"));
+    puts("PASS ext4 direct: growth, dirty cached owner handoff, sparse media read, no VFS cache residency and queued truncate after closed epoch");
+}
+
 static void cached_copy_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
 {
     struct kernel_files local={0};
@@ -1272,16 +1376,23 @@ static void cached_copy_case(struct kernel_heap *heap,struct kernel_vfs_mount *m
     struct kernel_open_file_description *src=in,*dst=out;
     assert(!kernel_files_install_new_owned_at(&local,0,0,&in));
     assert(!kernel_files_install_new_owned_at(&local,1,0,&out));
+    copy_flags_source=src;copy_flags_target=dst;copy_flags_pause=copy_flags_resume=0;
+    pthread_t publisher;assert(!pthread_create(&publisher,NULL,publish_copy_flags,NULL));
     watch_memory_staging=1;memory_staging_calls=0;
     assert(!kernel_files_copy_range(&local,&mm,0,0,1,0,sizeof(data),0,&result) &&
         result==sizeof(data)-19);
     watch_memory_staging=0;
+    assert(!pthread_join(publisher,NULL) && copy_flags_pause && copy_flags_resume);
+    assert((kernel_open_file_flags(src)&KERNEL_FILES_O_DIRECT) &&
+        (kernel_open_file_flags(dst)&KERNEL_FILES_O_DIRECT));
+    copy_flags_source=copy_flags_target=NULL;
+    kernel_open_file_set_status_flags(src,0);kernel_open_file_set_status_flags(dst,0);
     assert(src->offset==sizeof(data) && dst->offset==sizeof(data)+18);
     assert(!kernel_vfs_pread(&dst->file,37,actual,sizeof(data)-19,&done,NULL) &&
         done==sizeof(data)-19 && !memcmp(actual,data+19,done));
     assert(!memory_staging_calls && "cached file copy must not stage the payload");
     assert(!kernel_files_release(&local));
-    puts("PASS cached file copy: cross-page data, EOF and offsets without payload staging");
+    puts("PASS cached file copy: concurrent DIRECT publication retains request snapshot, data/EOF/offsets without staging");
 }
 
 static void vector_boundaries(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
@@ -1484,8 +1595,9 @@ static void directory_eof(struct kernel_heap *heap,struct kernel_vfs_mount *moun
     struct kernel_open_file_description *borrowed=directory;
     struct kernel_files local={0};
     assert(!kernel_files_create(&local,heap) && !kernel_files_install_new_owned_at(&local,0,0,&directory));
-    uint64_t next=UINT64_MAX,ino;uint8_t type;char name[256];
-    assert(!kernel_vfs_dir_entry(&borrowed->file,2,&next,&ino,&type,name,sizeof(name)) && next==2);
+    unsigned char entries[256];
+    struct kernel_vfs_dir_batch batch={.data=entries,.capacity=sizeof(entries),.position=2};
+    assert(!kernel_vfs_read_directory(&borrowed->file,&batch,NULL) && batch.position==2 && !batch.used);
     assert(!kernel_files_lseek(&local,0,2,0,&result) && result==2);
     for (unsigned i=0;i<3;i++) {
         assert(!kernel_files_getdents(&local,&mm,0,0x200000,4096,&result) && !result);
@@ -1703,6 +1815,8 @@ static void file_advice_case(struct kernel_heap *heap,struct kernel_vfs_mount *m
     free(bytes);
     puts("PASS file advice: scoped eviction skips readers, NOREUSE preserves hit counts without promotion, RANDOM suppression, doubled SEQUENTIAL windows, independent opens and queued close owners");
 }
+#include "file_io_directory_cases.c"
+
 int main(int argc,char **argv)
 {
     assert(argc==2); setvbuf(stdout,0,_IONBF,0); mm_test_attach(0); mm_test_activate_task();
@@ -1711,10 +1825,13 @@ int main(int argc,char **argv)
     struct kernel_heap heap={0},backend_heap={0};
     initialize(&pages,&heap,arena,sizeof(arena)); initialize(&backend_pages,&backend_heap,backend,sizeof(backend));
     uint64_t baseline=physical_page_available(&pages),backend_baseline=physical_page_available(&backend_pages);
+    int block_only=getenv("FILE_IO_BLOCK_ONLY")!=NULL;
     int advice_only=getenv("FILE_IO_ADVICE_ONLY")!=NULL;
     int transfers_only=getenv("FILE_IO_TRANSFERS_ONLY")!=NULL;
+    int direct_only=getenv("FILE_IO_DIRECT_ONLY")!=NULL;
     int paths_only=getenv("FILE_IO_PATHS_ONLY")!=NULL;
-    int focused=advice_only || transfers_only || paths_only || getenv("FILE_IO_VECTORS_ONLY")!=NULL;
+    int directories_only=getenv("FILE_IO_DIRECTORIES_ONLY")!=NULL;
+    int focused=direct_only || block_only || directories_only || advice_only || transfers_only || paths_only || getenv("FILE_IO_VECTORS_ONLY")!=NULL;
     if (!focused) {
     borrowed_page_case(&pages);
     namespace_retiring_mount_case(&heap);
@@ -1738,10 +1855,13 @@ int main(int argc,char **argv)
         KERNEL_MM_MAP_FIXED_NOREPLACE,&address));
     assert(!kernel_mm_mmap_anonymous(&mm,0x200000,4*BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,
         KERNEL_MM_MAP_FIXED_NOREPLACE,&address));
-    if (paths_only) {
+    if (paths_only || directories_only || block_only) {
         struct kernel_vfs_mount *memory=NULL;
         assert(!kernel_tmpfs_create(&heap,0,"",&memory));
-        pathname_storage_case(&heap,memory);assert(!kernel_vfs_unmount(memory));
+        if (block_only) raw_block_case(&heap,memory);
+        else if (directories_only) { directory_eof(&heap,memory); directory_batch_cases(&heap,memory,0); }
+        else pathname_storage_case(&heap,memory);
+        assert(!kernel_vfs_unmount(memory));
     }
     if (!focused) {
     futex_pin_case();
@@ -1779,7 +1899,10 @@ int main(int argc,char **argv)
     assert(!kernel_block_register(&disk,KERNEL_BLOCK_DEVICE_NUMBER(101)));
     struct kernel_vfs_mount mount={0}; assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,&cache,0));
     assert(!kernel_vfs_start_journal_worker(&mount));
-    if (paths_only) pathname_storage_case(&heap,&mount);
+    if (block_only) { /* Raw device contracts ran against the private registered device. */ }
+    else if (directories_only) directory_batch_cases(&heap,&mount,1);
+    else if (paths_only) pathname_storage_case(&heap,&mount);
+    else if (direct_only) ext4_direct_case(&heap,&mount);
     else if (transfers_only) transfer_cases(&heap,&mount);
     else if (advice_only) file_advice_case(&heap,&mount,&cache);
     else if (focused) synchronous_write_ranges(&heap,&mount);
@@ -1811,6 +1934,7 @@ int main(int argc,char **argv)
     }
     assert(!kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(&cache));
     assert(!kernel_block_unregister(&disk)); assert(!close(image));
+    if (directories_only) mm_test_finish();
     mm_test_context=0; /* 页表最终释放在可信kernel上下文。 */
     assert(!kernel_mm_release(&mm) && !physical_page_release(&pages,kernel.root_address));
     struct kernel_heap_statistics statistics;

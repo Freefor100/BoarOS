@@ -37,16 +37,15 @@ static void fault(uint32_t signal, int32_t code, uint64_t address)
 { kernel_signal_force_fault(kernel_task_current(),signal,code,address); }
 static int read_instruction(struct kernel_mm *mm,uint64_t pc,uint32_t *instruction)
 {
-    struct kernel_mm_mapping mapping;void *page;
+    struct kernel_mm_user_pin pin={0};
     if((pc&3) || kernel_user_range_check(pc,sizeof(*instruction))!=KERNEL_UACCESS_STATUS_OK)return 0;
-    enum kernel_mm_status status=kernel_mm_lookup(mm,pc,&mapping);
-    if(status==KERNEL_MM_STATUS_NOT_MAPPED || status==KERNEL_MM_STATUS_ADDRESS_SPACE)return 0;
+    /* Resident-only EXEC qualification neither faults nor grants data READ. */
+    enum kernel_mm_status status=kernel_mm_try_pin_user_page(mm,pc,KERNEL_MM_EXECUTE,&pin);
+    if(status==KERNEL_MM_STATUS_NOT_MAPPED || status==KERNEL_MM_STATUS_ACCESS ||
+        status==KERNEL_MM_STATUS_CONFLICT)return 0;
     if(status!=KERNEL_MM_STATUS_OK)la_virt_fatal("instruction MM owner");
-    if((mapping.permissions&(KERNEL_MM_USER|KERNEL_MM_EXECUTE))!=(KERNEL_MM_USER|KERNEL_MM_EXECUTE))return 0;
-    /* 已取指的页驻留且 trap 中不切换；以 EXEC 资格借用 owner，不放宽数据 READ。 */
-    if(physical_page_resolve(mm->allocator,mapping.physical_address&~BOAROS_PAGE_MASK,&page)!=PHYSICAL_PAGE_STATUS_OK)
-        la_virt_fatal("instruction page owner");
-    memcpy(instruction,(unsigned char *)page+(pc&BOAROS_PAGE_MASK),sizeof(*instruction));
+    memcpy(instruction,(unsigned char *)pin.page+(pc&BOAROS_PAGE_MASK),sizeof(*instruction));
+    kernel_mm_unpin_user_page(&pin);
     return 1;
 }
 void la_trap_dispatch(struct arch_trap_frame *frame)
@@ -83,16 +82,24 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
         if (la_timer_interrupt(&elapsed)!=ARCH_TIMER_STATUS_OK) la_virt_fatal("timer interrupt");
 #if BOAROS_MAX_CPUS > 1
         la_smp_timer_seen();
-        if(kernel_cpu_current()->logical_id) {
-            if(kernel_scheduler_on_tick(elapsed)!=KERNEL_SCHEDULER_STATUS_OK)la_virt_fatal("AP scheduler");
-            return;
-        }
 #endif
-        if (elapsed) { kernel_tick_advance(elapsed); kernel_time_update_coarse(); kernel_scheduler_charge_ticks(elapsed,user); }
-        if (kernel_scheduler_expire_deadlines(arch_time_read())!=KERNEL_SCHEDULER_STATUS_OK)
-            la_virt_fatal("timer deadlines");
-        /* 首阶段 UART 未启用外部 IRQ，timer 必须唤醒已经睡眠的输入 owner。 */
-        kernel_console_poll_input();
+        if (elapsed) {
+#if BOAROS_MAX_CPUS > 1
+            if (!kernel_cpu_current()->logical_id)
+#endif
+            { kernel_tick_advance(elapsed); kernel_time_update_coarse(); }
+            /* 全局时间只由 CPU0 推进，各核仍须记入当前任务的 RT watchdog。 */
+            kernel_scheduler_charge_ticks(elapsed,user);
+        }
+#if BOAROS_MAX_CPUS > 1
+        if (!kernel_cpu_current()->logical_id)
+#endif
+        {
+            if (kernel_scheduler_expire_deadlines(arch_time_read())!=KERNEL_SCHEDULER_STATUS_OK)
+                la_virt_fatal("timer deadlines");
+            /* 首阶段 UART 未启用外部 IRQ，timer 必须唤醒已经睡眠的输入 owner。 */
+            kernel_console_poll_input();
+        }
         if (kernel_scheduler_on_tick(elapsed)!=KERNEL_SCHEDULER_STATUS_OK)
             la_virt_fatal("timer scheduler");
         return;
@@ -127,10 +134,9 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
            kernel_cpu_current()->current!=caller)la_virt_fatal("syscall owner");
         if (__atomic_load_n(&caller->ptrace, __ATOMIC_ACQUIRE) &&
             !kernel_ptrace_syscall_enter(caller, frame)) return;
-        struct kernel_syscall_request request={.number=frame->regs[11],.user_sp=frame->regs[3]};
+        struct kernel_syscall_request request={.number=frame->regs[11],.user_sp=frame->regs[3],.instruction_pointer=frame->era+4};
         for (unsigned i=0;i<6;i++) request.arguments[i]=frame->regs[4+i];
         struct kernel_syscall_result result;
-        kernel_bpf_trace_enter(caller,request.number,request.arguments);
         if (kernel_syscall_dispatch(caller,&request,&result)!=KERNEL_SYSCALL_STATUS_OK) la_virt_fatal("syscall dispatch");
         switch (result.action) {
         case KERNEL_SYSCALL_ACTION_EXIT_GROUP: kernel_user_group_exit(KERNEL_THREAD_EXIT_SYSCALL,result.value,0);
@@ -138,12 +144,14 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
         case KERNEL_SYSCALL_ACTION_YIELD:
             if (kernel_scheduler_yield_current()!=KERNEL_SCHEDULER_STATUS_OK) la_virt_fatal("yield");
             result.value=0; break;
+        case KERNEL_SYSCALL_ACTION_CLONE3:
+            if (kernel_clone3_current(frame,caller,&request,&result.value)!=KERNEL_SCHEDULER_STATUS_OK)
+                la_virt_fatal("clone3");
+            break;
         case KERNEL_SYSCALL_ACTION_CLONE:
             /* LA syscall ABI 的 child_tid/TLS 顺序与通用 clone 接口相反。 */
             if (arch_process_clone_current(frame,request.arguments[0],request.arguments[1],
-                request.arguments[2],request.number==435U?request.arguments[3]:request.arguments[4],
-                request.number==435U?request.arguments[4]:request.arguments[3],
-                request.number==435U?request.arguments[5]:request.arguments[2],&result.value)!=KERNEL_SCHEDULER_STATUS_OK)
+                request.arguments[2],request.arguments[4],request.arguments[3],request.arguments[2],NULL,0,-1,&result.value)!=KERNEL_SCHEDULER_STATUS_OK)
                 la_virt_fatal("clone");
             break;
         case KERNEL_SYSCALL_ACTION_WAIT4:
@@ -167,11 +175,11 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
             kernel_bpf_trace_exit(kernel_task_current(),frame->regs[11],(int64_t)frame->regs[4]);
             if(kernel_task_current()->ptrace)kernel_ptrace_syscall_exit(kernel_task_current(),frame,request.number);
             return;
-        case KERNEL_SYSCALL_ACTION_RETURN: break;
+        case KERNEL_SYSCALL_ACTION_RETURN: case KERNEL_SYSCALL_ACTION_RETURN_FINAL: break;
         default: la_virt_fatal("unsupported internal syscall action");
         }
         kernel_bpf_trace_exit(kernel_task_current(),request.number,result.value);
-        if (result.value==-KERNEL_ERESTARTSYS) {
+        if (result.action!=KERNEL_SYSCALL_ACTION_RETURN_FINAL && result.value==-KERNEL_ERESTARTSYS) {
             if(caller->ptrace) {
                 uint64_t argument=frame->regs[4];
                 frame->regs[4]=(uint64_t)result.value;frame->era+=4;

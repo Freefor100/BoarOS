@@ -71,7 +71,7 @@ enum kernel_syscall_status syscall_handle_capget(struct kernel_task *caller,
         return KERNEL_SYSCALL_STATUS_OK;
     }
     struct kernel_task *target __attribute__((cleanup(capability_target_end))) =
-        pid ? kernel_task_find_by_tid(pid) : 0;
+        pid ? kernel_task_find_user_tid(caller,pid) : 0;
     if (pid && !target) {
         decoded->value = -KERNEL_ESRCH;
         return KERNEL_SYSCALL_STATUS_OK;
@@ -118,7 +118,11 @@ enum kernel_syscall_status syscall_handle_capset(struct kernel_task *caller,
     }
     if(kernel_copy_from_user(mm,&pid,header+4,sizeof(pid),&copied)!=KERNEL_UACCESS_STATUS_OK||copied!=sizeof(pid))
         return KERNEL_SYSCALL_STATUS_OK;
-    if(pid&&pid!=caller->tid){decoded->value=-KERNEL_EPERM;return KERNEL_SYSCALL_STATUS_OK;}
+    if(pid) {
+        kernel_pid_t caller_tid;
+        if(kernel_task_user_tid(caller,&caller_tid)!=KERNEL_TASK_STATUS_OK)__builtin_trap();
+        if(pid!=caller_tid){decoded->value=-KERNEL_EPERM;return KERNEL_SYSCALL_STATUS_OK;}
+    }
     size_t bytes=words*sizeof(input[0]);
     if(kernel_copy_from_user(mm,input,data,bytes,&copied)!=KERNEL_UACCESS_STATUS_OK||copied!=bytes)
         return KERNEL_SYSCALL_STATUS_OK;

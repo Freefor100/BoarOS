@@ -6,6 +6,11 @@
 
 #include <kernel/ipc.h>
 
+#define KERNEL_SHM_HUGETLB 04000
+#define KERNEL_SHM_NORESERVE 010000
+#define KERNEL_SHM_HUGE_SHIFT 26U
+#define KERNEL_SHM_HUGE_MASK 63U
+
 #define KERNEL_SHM_RDONLY 010000
 #define KERNEL_SHM_RND    020000
 #define KERNEL_SHM_REMAP  040000
@@ -67,6 +72,7 @@ _Static_assert(sizeof(struct kernel_shm_info) == 48 &&
 struct kernel_namespace;
 struct kernel_shm_table;
 struct kernel_memory_object;
+struct kernel_hugetlb_map;
 struct kernel_uid_account;
 
 struct kernel_shm_segment {
@@ -78,14 +84,15 @@ struct kernel_shm_segment {
     uint64_t size;
     uint64_t aligned_size;
     struct kernel_memory_object *memory;
+    struct kernel_hugetlb_map *hugetlb;
     struct kernel_uid_account *lock_account;
     uint64_t nattch;
     uint32_t attachments;
     int64_t atime;
     int64_t dtime;
     int64_t ctime;
-    int32_t cpid;
-    int32_t lpid;
+    struct kernel_pid *cpid;
+    struct kernel_pid *lpid;
     uint32_t mode;
     uint32_t uid;
     uint32_t gid;
@@ -102,6 +109,7 @@ struct kernel_shm_attachment {
     struct kernel_namespace *namespace;
     struct kernel_shm_segment *segment;
     struct kernel_memory_object *memory;
+    struct kernel_hugetlb_map *hugetlb;
     uint64_t start, end;
     uint64_t file_identity;
     int32_t shmid;
@@ -132,7 +140,7 @@ int kernel_shm_get(struct kernel_task *caller, int32_t key, uint64_t size,
 
 int kernel_shm_at(struct kernel_task *caller, int32_t shmid, uint64_t shmaddr,
                   int32_t shmflg, uint64_t *out_attached_addr);
-int kernel_shm_at_mm(struct kernel_mm *mm, int32_t caller_pid, int32_t shmid, uint64_t shmaddr,
+int kernel_shm_at_mm(struct kernel_mm *mm, struct kernel_task *caller, int32_t shmid, uint64_t shmaddr,
                      int32_t shmflg, uint64_t *out_attached_addr);
 
 int kernel_shm_dt(struct kernel_task *caller, uint64_t shmaddr);
@@ -152,11 +160,13 @@ void kernel_shm_attachment_acquire(struct kernel_shm_attachment *attachment);
 void kernel_shm_attachment_release(struct kernel_shm_attachment **owner);
 /* Only committed VMA descriptors contribute to nattch. These cannot sleep. */
 void kernel_shm_attachment_open(struct kernel_shm_attachment *attachment);
+void kernel_shm_attachment_close_for_task(struct kernel_shm_attachment *,const struct kernel_task *);
 void kernel_shm_attachment_close(struct kernel_shm_attachment *attachment);
 
 /* CPU0 namespace caller, as with shmget/shmctl. Includes attached RMID segments;
  * rss is resident bytes, copied while the segment's memory owner is stable. */
-int kernel_shm_proc_next(struct kernel_namespace *,uint32_t *cursor, int32_t *id,
+struct kernel_pid_registry;
+int kernel_shm_proc_next(struct kernel_namespace *,struct kernel_pid_registry *,uint32_t *cursor, int32_t *id,
                          struct kernel_shmid64_ds *row, uint64_t *rss);
 
 #endif /* BOAROS_KERNEL_SHM_H */

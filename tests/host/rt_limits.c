@@ -15,6 +15,7 @@ static struct kernel_cpu *active;
 static struct kernel_task task,peer,idles[2];
 static struct kernel_credentials caller_cred,target_cred;
 static struct kernel_resource_limits limits;
+static struct kernel_pid_registry test_pids;
 static uint64_t now,stamp;
 static unsigned checks,failed,index_updates,resource_updates,tick_reads;
 #define CHECK(x) do {checks++;if(!(x)){fprintf(stderr,"RT HOST FAIL line=%d %s\n",__LINE__,#x);failed++;}} while(0)
@@ -22,13 +23,18 @@ void *sync_test_cpu(void){return active;}
 void *sync_test_current_task(void){return active->current;}
 void sync_test_current_task_set(void *p){active->current=p;}
 uint64_t kernel_time_monotonic_ns(void){return now;}
+uint64_t kernel_time_ticks_to_ns(uint64_t ticks){return ticks;}
 uint64_t riscv_time_read(void){return now;}
 uint64_t kernel_tick_count(void){tick_reads++;return stamp;}
 uint32_t kernel_time_is_initialized(void){return 1;}
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t ns,uint64_t *out){*out=ns;return 0;}
 enum riscv_timer_status riscv_timer_set_scheduler_deadline(uint64_t v){(void)v;return RISCV_TIMER_STATUS_NOT_STARTED;}
 struct kernel_task *deadline_index_first(void){return 0;}
-struct kernel_task *process_find_identity(int32_t pid,enum kernel_pid_role role){assert(role==KERNEL_PID_TID);return pid==2?&peer:0;}
+struct kernel_pid_registry *process_pid_active(const struct kernel_task *caller)
+{ assert(caller==&task);return &test_pids; }
+struct kernel_task *process_find_identity_in(kernel_pid_t pid,enum kernel_pid_role role,
+    struct kernel_pid_registry *registry)
+{ assert(registry==&test_pids && role==KERNEL_PID_TID);return pid==2?&peer:NULL; }
 void scheduler_task_publish_locked(struct kernel_task *p){assert(!p->accounted);p->accounted=1;}
 void scheduler_cpu_timer_update_locked(struct kernel_task *p,unsigned thread)
 {assert(active->raw_locks&&thread==1);index_updates++;p->cpu_timer_index[thread].indexed=!!(p->resource_flags&KERNEL_RESOURCE_RTTIME_DUE);}
@@ -70,14 +76,29 @@ static void permission(void)
     CHECK(!kernel_task_sched_set(&task,2,1,4,0));target_cred.uid=target_cred.euid=1002;
     CHECK(kernel_task_sched_set(&task,2,1,3,0)==-KERNEL_EPERM);
 }
+static unsigned measure_ticks,tick_domain_entries;
+void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *,struct kernel_raw_guard *);
+void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_raw_guard *guard)
+{
+    if (measure_ticks && lock==&kernel_wait_domain) tick_domain_entries++;
+    __real_kernel_raw_lock_acquire(lock,guard);
+}
 static void tick_accounting(void)
 {
     setup();limits.values[KERNEL_RLIMIT_RTTIME]=(struct kernel_rlimit64){30000,80000};
+    measure_ticks=1;tick_domain_entries=0;
     stamp=10;kernel_scheduler_charge_ticks(1,1);CHECK(!task.rttime_ticks&&!index_updates);
-    CHECK(!tick_reads);
+    CHECK(!tick_reads && !tick_domain_entries);
+    active=&cpus[1];
+    kernel_scheduler_charge_ticks(3,0);
+    CHECK(cpus[1].idle_ticks==3 && !tick_domain_entries);
+    active=&cpus[0];
+    measure_ticks=0;
     CHECK(!kernel_sched_policy_set(&task.scheduling,1,10,0));
+    measure_ticks=1;
     kernel_scheduler_charge_ticks(1,1);CHECK(task.rttime_ticks==1&&task.rttime_stamp==10&&!index_updates);
-    CHECK(tick_reads==1);
+    CHECK(tick_reads==1 && tick_domain_entries==1);
+    measure_ticks=0;
     kernel_scheduler_charge_ticks(1,0);CHECK(task.rttime_ticks==1);
     active=&cpus[1];cpus[0].current=&idles[0];cpus[1].current=&task;task.cpu=active;
     kernel_scheduler_charge_ticks(1,1);CHECK(task.rttime_ticks==1);

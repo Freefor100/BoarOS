@@ -352,6 +352,15 @@ void user_signal_take_retargeted(struct kernel_task *);
 void user_signal_stop_selection(struct kernel_task *);
 struct kernel_task *process_find_identity(kernel_pid_t pid, enum kernel_pid_role role)
 { (void)role; for (unsigned i=0; i<4; i++) if (tasks[i].tid==pid) return &tasks[i]; return 0; }
+void kernel_cgroup_put(struct kernel_cgroup *group)
+{assert(!group);}
+
+struct kernel_pid_registry *process_pid_active(const struct kernel_task *task)
+{(void)task;return &scheduler.identities;}
+struct kernel_task *process_find_identity_in(kernel_pid_t pid,enum kernel_pid_role role,
+    struct kernel_pid_registry *view)
+{assert(view==&scheduler.identities);return process_find_identity(pid,role);}
+
 struct kernel_task *kernel_task_current(void) { return active->current; }
 void process_identity_commit_locked(struct kernel_task *task)
 { (void)task;assert(!"host actors already own published identities"); }
@@ -404,7 +413,9 @@ enum kernel_scheduler_status scheduler_switch_claimed(struct kernel_task *old,st
     }
     if (local_rotation_active) {
         assert(next!=active->idle && old->wait.on_cpu && !old->ready_node.queued && !old->ready_cpu);
-        if (!old->idle) assert(old->wait.ready_flags==SCHED_READY_LOCAL);
+        if (!old->idle && local_rotation_active==1) assert(old->wait.ready_flags==SCHED_READY_LOCAL);
+        if (!old->idle && local_rotation_active==2)
+            assert(old->wait.ready_flags==(SCHED_READY_HEAD|SCHED_READY_LOCAL));
         if (local_run_required) {
             assert(scheduler_finish_local(active));
             local_run_required=0;
@@ -458,6 +469,7 @@ static void *end_service_borrow(void *unused)
     return 0;
 }
 static unsigned stop_armed, stop_guard_left, stop_claimed;
+static struct kernel_task *fair_affinity_at_unlock;
 void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *,struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_raw_guard *guard)
 {
@@ -488,7 +500,17 @@ void __wrap_kernel_raw_lock_release(struct kernel_raw_guard *guard)
     int early=local_park_token && local_park_case==2 && active==&cpus[1] &&
         guard->lock==kernel_run_lock(active) &&
         kernel_wait_record_phase(&local_park_token->task->wait)==KERNEL_WAIT_COMMITTED;
+    struct kernel_task *change=fair_affinity_at_unlock;
+    if (change && guard->lock==kernel_run_lock(&cpus[0]))
+        fair_affinity_at_unlock=0;
+    else change=0;
     __real_kernel_raw_lock_release(guard);
+    if (change) {
+        unsigned required=local_run_required;
+        local_run_required=0;
+        assert(!kernel_task_affinity_set(change,0,1));
+        local_run_required=required;
+    }
     if (early) local_park_wake();
 #ifdef SOCKET_PROTOCOL_CASES
     if (drain) shard_drain_queued_writer();
@@ -740,6 +762,105 @@ static void remote_rt_precedence(void)
     puts("PASS remote RT work defers ordinary selection until the last eligible task leaves");
 }
 
+static void remote_rt_affinity(void)
+{
+#if BOAROS_MAX_CPUS > 2
+    reset_two_queues();active=&cpus[2];
+    kernel_cpu_initialize(active,55,0);active->logical_id=2;active->state=KERNEL_CPU_ONLINE;
+    idles[2]=(struct kernel_task){.state=KERNEL_THREAD_STATE_IDLE,.wait.on_cpu=1};
+    active->current=&idles[2];scheduler_cpu_initialize(active,&idles[2],1);
+    active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      balance_running(0,0,99);balance_running(1,1,0);balance_running(2,2,0);
+      balance_queued(3,5,80);balance_queued(4,5,80); }
+    struct kernel_task *next=0;uint64_t deadline;
+    /* CPU1 has no legal RT competitor. It must retain the ordinary local
+     * path without taking common control, even while both RT tasks wait. */
+    active=&cpus[1];local_run_required=1;forbid_cpu0_run=1;
+    assert(scheduler_select_local(0,0,0,&next,&deadline) && !next);
+    local_run_required=forbid_cpu0_run=0;
+    active=&cpus[2];
+    assert(!scheduler_select_local(0,0,0,&next,&deadline));
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);ready_remove_locked(&tasks[3]); }
+    assert(!scheduler_select_local(0,0,0,&next,&deadline));
+    /* A real affinity change removes the old target hint and publishes the
+     * new queue/target set, without leaving CPU2 in common arbitration. */
+    tasks[4].arch.user_mode=1;tasks[4].tid_owned=1;
+    assert(!kernel_task_affinity_set(&tasks[4],0,3));
+    local_run_required=1;forbid_cpu0_run=1;
+    assert(scheduler_select_local(0,0,0,&next,&deadline) && !next);
+    local_run_required=forbid_cpu0_run=0;
+    active=&cpus[1];
+    assert(!scheduler_select_local(0,0,0,&next,&deadline));
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);ready_remove_locked(&tasks[4]); }
+    assert(scheduler_select_local(0,0,0,&next,&deadline) && !next);
+    puts("PASS remote RT affinity: unrelated busy CPU stays local; overlapping hints and affinity replacement retain legal preemption");
+#endif
+}
+
+static void busy_rt_reschedule_cases(void)
+{
+    for (unsigned priority=0;priority<=10;priority+=10) {
+        reset_two_queues();active=&cpus[0];
+        { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+          balance_running(2,0,99);balance_running(3,1,priority);
+          if (priority) tasks[3].scheduling.policy=KERNEL_SCHED_RR;
+          tasks[3].scheduling.rr_remaining_ns=11000000;
+          setup_task(1,2,priority);
+          balance_queued(0,3,80);tasks[0].scheduling.policy=KERNEL_SCHED_RR;
+          tasks[0].scheduling.rr_remaining_ns=37000000; }
+        active=&cpus[1];
+        struct kernel_task *next=0;uint64_t deadline;
+        /* In particular, a busy OTHER CPU must not consume the request in
+         * its local-only fast path while the remote RT task remains queued. */
+        assert(!scheduler_select_local(0,0,0,&next,&deadline) && !next);
+        local_rotation_active=2;
+        assert(!scheduler_reschedule(0,0,0));
+        local_rotation_active=0;
+        assert(active->current==&tasks[0] && tasks[0].wait.on_cpu && !tasks[0].ready_cpu &&
+            tasks[0].scheduling.rr_remaining_ns==37000000 &&
+            tasks[3].scheduling.rr_remaining_ns==11000000);
+        assert_ready_owner(&tasks[3],active);assert_ready_owner(&tasks[1],active);
+        if (priority) assert(active->runqueue.heads[priority]==&tasks[3].ready_node &&
+            tasks[3].ready_node.next==&tasks[1].ready_node);
+    }
+    puts("PASS busy RT reschedule: ordinary fast-path defers; real preemption/finish preserves local FIFO and both RR slices");
+
+    reset_two_queues();active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      balance_running(0,0,80);balance_running(3,1,10);
+      tasks[0].cpu_mask=3;tasks[0].arch.user_mode=1;
+      scheduler_user_service_set_locked(&tasks[0],1);
+      scheduler_user_service_set_locked(&tasks[0],0);
+      assert(tasks[0].reservation_cpu==&cpus[0]);
+      kernel_cpu_consume_schedule(&cpus[1]);setup_task(2,1,99); }
+    local_rotation_active=2;
+    assert(!scheduler_reschedule(0,0,0));
+    local_rotation_active=0;
+    assert_ready_owner(&tasks[0],&cpus[0]);
+    assert(!kernel_cpu_schedule_requested(&cpus[1]));
+    active=&cpus[1];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      assert(!ready_best_locked());
+      scheduler_user_reservation_release_locked(&tasks[0]);
+      assert(kernel_cpu_schedule_requested(active) && ready_best_locked()==&tasks[0]); }
+    puts("PASS busy RT reservation: preserve source qualification, then notify a legal busy peer on actual release");
+
+    reset_two_queues();active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      balance_running(2,0,10);balance_running(3,1,10);
+      tasks[2].arch.user_mode=1;
+      balance_queued(0,3,80);
+      assert(!kernel_cpu_schedule_requested(&cpus[1]));
+      /* CPU0's service class now outranks the queued RT80 independently
+       * of its numerical priority; the peer must be notified immediately. */
+      scheduler_user_service_set_locked(&tasks[2],1);
+      assert(kernel_cpu_schedule_requested(&cpus[1])); }
+    active=&cpus[1];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);assert(ready_best_locked()==&tasks[0]); }
+    puts("PASS busy RT service: running CPU0 service qualification redirects blocked RT work to a legal peer");
+}
+
 static void ordinary_local_slice(void)
 {
     const uint32_t slices[]={100000,30000000,100000000};
@@ -761,11 +882,250 @@ static void ordinary_local_slice(void)
     puts("PASS ordinary local selection rotates at each thread's short/long fair slice");
 }
 
+static void fair_enqueue(struct kernel_task *task,unsigned mask,int nice,uint64_t lag)
+{
+    *task=(struct kernel_task){.accounted=1,.cpu_mask=mask,.cpu=active,
+        .state=KERNEL_THREAD_STATE_READY,.fair_queue=&active->runqueue};
+    task->scheduling.nice=nice;
+    task->ready_node.fair.key=active->runqueue.min_vruntime+lag;
+    ready_enqueue_locked(task,SCHED_READY_LOCAL);
+}
+static void fair_queued(unsigned index,unsigned mask,int nice,uint64_t lag)
+{
+    fair_enqueue(&tasks[index],mask,nice,lag);
+}
+static void fair_select_unchanged(void)
+{
+    struct kernel_task *next=0;uint64_t deadline;
+    local_run_required=1;
+    assert(scheduler_select_local(0,0,0,&next,&deadline) && !next);
+    local_run_required=0;
+}
+static void *fair_parallel_select(void *argument)
+{
+    unsigned id=(uintptr_t)argument;
+    active=&cpus[id];sync_test_irq=0;
+    int result=pthread_barrier_wait(&gate);
+    assert(!result || result==PTHREAD_BARRIER_SERIAL_THREAD);
+    uint64_t deadline;
+    assert(scheduler_select_local(0,0,id==1,&selected[id],&deadline));
+    return 0;
+}
+static void fair_parallel_handoff(void)
+{
+    for (unsigned round=0;round<32;round++) {
+        scheduler_test_now=1;reset_two_queues();active=&cpus[0];
+        { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+          balance_running(3,0,0);balance_running(4,1,0);
+          fair_queued(0,3,0,2000000);fair_queued(1,3,0,3000000); }
+        pthread_t actors[2];
+        assert(!pthread_barrier_init(&gate,0,2));
+        local_run_required=1;
+        for (unsigned i=0;i<2;i++)assert(!pthread_create(&actors[i],0,fair_parallel_select,(void *)(uintptr_t)i));
+        for (unsigned i=0;i<2;i++)assert(!pthread_join(actors[i],0));
+        local_run_required=0;assert(!pthread_barrier_destroy(&gate));
+        active=&cpus[1];
+        if (!selected[1]) {
+            uint64_t deadline;
+            assert(scheduler_select_local(0,0,1,&selected[1],&deadline));
+        }
+        assert(selected[1]==&tasks[0] && tasks[0].wait.on_cpu && !tasks[0].ready_node.queued &&
+            !tasks[0].ready_cpu && tasks[0].cpu==active && active->current==&tasks[0]);
+        assert(!selected[0] && tasks[3].wait.on_cpu && cpus[0].current==&tasks[3]);
+        /* The old destination stack stays owned until the real finish path;
+         * it must not be made stealable by the balancing publication. */
+        assert(tasks[4].wait.on_cpu && tasks[4].wait.ready_pending && !tasks[4].ready_node.queued);
+        assert(scheduler_finish_local(active));assert_ready_owner(&tasks[4],active);
+        assert_ready_owner(&tasks[1],&cpus[0]);
+    }
+    puts("PASS fair pair transfer races destination selection: one execution owner and delayed old-stack release");
+}
+
+static void ordinary_busy_balance(void)
+{
+    scheduler_test_now=1;
+    reset_two_queues();active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      balance_running(3,0,0);balance_running(4,1,0);
+      cpus[0].runqueue.min_vruntime=100000000;cpus[1].runqueue.min_vruntime=500000000;
+      fair_queued(0,3,0,2000000);fair_queued(1,3,0,3000000);
+      tasks[0].scheduling.fair_slice_used=123; }
+    fair_select_unchanged();
+    assert_ready_owner(&tasks[0],&cpus[1]);assert_ready_owner(&tasks[1],&cpus[0]);
+    assert(tasks[0].ready_node.fair.key==502000000 && tasks[0].scheduling.fair_slice_used==123);
+    assert(tasks[3].wait.on_cpu && tasks[3].cpu==&cpus[0] && tasks[4].wait.on_cpu &&
+        tasks[4].cpu==&cpus[1] && kernel_cpu_schedule_requested(&cpus[1]));
+    puts("PASS fair busy balance: 3:1 becomes 2:2 without moving either running stack; lag and partial slice survive");
+
+    reset_two_queues();active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      balance_running(3,0,0);balance_running(4,1,0);tasks[4].scheduling.nice=19;
+      fair_queued(0,3,0,2000000); }
+    active=&cpus[1];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);fair_queued(1,3,19,3000000); }
+    active=&cpus[0];fair_select_unchanged();
+    assert_ready_owner(&tasks[0],&cpus[1]);assert_ready_owner(&tasks[1],&cpus[1]);
+    puts("PASS fair busy balance: equal task counts but unequal nice weights rebalance");
+
+    reset_two_queues();active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      balance_running(3,0,0);balance_running(4,1,0);tasks[4].scheduling.nice=19;
+      for (unsigned i=0;i<3;i++)fair_queued(i,3,0,2000000+i); }
+    fair_select_unchanged();
+    assert(cpus[0].runqueue.count==2 && cpus[1].runqueue.count==1);
+    fair_select_unchanged();scheduler_test_now+=19999999;fair_select_unchanged();
+    assert(cpus[0].runqueue.count==2 && cpus[1].runqueue.count==1);
+    scheduler_test_now++;fair_select_unchanged();
+    assert(cpus[0].runqueue.count==1 && cpus[1].runqueue.count==2);
+    puts("PASS fair busy balance: at most one transfer per 20 ms, then continued convergence");
+
+    reset_two_queues();active=&cpus[1];
+    balance_running(3,1,0);balance_running(4,0,0);
+    forbid_cpu0_run=1;
+    fair_select_unchanged();
+    forbid_cpu0_run=0;
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);fair_queued(0,2,0,2000000); }
+    forbid_cpu0_run=1;
+    fair_select_unchanged();
+    forbid_cpu0_run=0;
+    assert_ready_owner(&tasks[0],&cpus[1]);
+    puts("PASS running alone or with a pinned peer does not acquire a destination lock");
+
+    for (unsigned mode=0;mode<4;mode++) {
+        scheduler_test_now=1;reset_two_queues();active=&cpus[0];
+        { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+          balance_running(3,0,0);balance_running(4,1,mode==2?40:0);
+          if(mode==3){tasks[4].arch.user_mode=1;tasks[4].user_service=1;}
+          fair_queued(0,mode==1?1:3,0,2000000);
+          if(mode)fair_queued(1,mode==1?1:3,0,3000000); }
+        fair_select_unchanged();scheduler_test_now+=20000000;fair_select_unchanged();
+        assert_ready_owner(&tasks[0],&cpus[0]);
+        if(mode)assert_ready_owner(&tasks[1],&cpus[0]);
+        assert(!cpus[1].runqueue.count);
+    }
+    puts("PASS fair busy balance: indivisible 2:1, affinity, RT and service qualification prevent invalid transfers");
+    scheduler_test_now=1;
+    reset_two_queues();active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      balance_running(3,0,0);balance_running(4,1,0);
+      fair_queued(0,3,0,2000000); }
+    tasks[0].arch.user_mode=1;tasks[0].tid_owned=1;
+    uint64_t key=tasks[0].ready_node.fair.key;
+    struct kernel_sched_attr attr={.size=56,.policy=KERNEL_SCHED_OTHER,.nice=19};
+    assert(!kernel_task_sched_setattr(&tasks[0],0,&attr));
+    assert(cpus[0].runqueue.fair_weight==15 && tasks[0].ready_node.fair.key==key);
+    attr.policy=KERNEL_SCHED_IDLE;
+    assert(!kernel_task_sched_setattr(&tasks[0],0,&attr));
+    assert(cpus[0].runqueue.fair_weight==3 && tasks[0].ready_node.fair.key==key);
+    attr.policy=KERNEL_SCHED_FIFO;attr.priority=40;
+    assert(!kernel_task_sched_setattr(&tasks[0],0,&attr));
+    assert(!cpus[0].runqueue.fair_weight && tasks[0].ready_node.priority==40);
+    attr.policy=KERNEL_SCHED_OTHER;attr.priority=0;attr.nice=0;
+    assert(!kernel_task_sched_setattr(&tasks[0],0,&attr));
+    assert(cpus[0].runqueue.fair_weight==1024 && !tasks[0].ready_node.priority);
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);ready_remove_locked(&tasks[0]); }
+    assert(!cpus[0].runqueue.fair_weight);
+    puts("PASS fair queued load follows actual nice/IDLE/RT policy changes without corrupting the virtual-runtime tree");
+}
+
+static void fair_long_queue(void)
+{
+    static struct kernel_task pinned[128], light[24], arrivals[32];
+    scheduler_test_now=1;
+    reset_two_queues();active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      balance_running(3,0,0);balance_running(4,1,0);
+      for (unsigned i=0;i<sizeof(pinned)/sizeof(*pinned);i++)
+          fair_enqueue(&pinned[i],1,19,2000000+i);
+      fair_queued(0,3,0,3000000); }
+    fair_select_unchanged();
+    assert_ready_owner(&tasks[0],&cpus[1]);
+    for (unsigned i=0;i<sizeof(pinned)/sizeof(*pinned);i++)
+        assert_ready_owner(&pinned[i],&cpus[0]);
+
+    scheduler_test_now=1;
+    reset_two_queues();active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      balance_running(3,0,0);balance_running(4,1,0);
+      for (unsigned i=0;i<sizeof(light)/sizeof(*light);i++)
+          fair_enqueue(&light[i],3,19,2000000+i);
+      fair_queued(0,3,0,3000000); }
+    /* Only the heavier candidate can reduce the weight gap enough. More
+     * light arrivals must not stop a continuously queued task being found. */
+    for (unsigned round=0;round<sizeof(arrivals)/sizeof(*arrivals) &&
+         tasks[0].ready_cpu==&cpus[0];round++) {
+        fair_select_unchanged();
+        { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+          fair_enqueue(&arrivals[round],3,19,2000000-round); }
+        scheduler_test_now+=20000000;
+    }
+    assert_ready_owner(&tasks[0],&cpus[1]);
+    assert(cpus[1].runqueue.count==1);
+    puts("PASS fair busy balance: long pinned queue and useful work behind unsuitable migratable tasks");
+}
+
+static void fair_affinity_during_balance(void)
+{
+    scheduler_test_now=1;
+    reset_two_queues();active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      balance_running(3,0,0);balance_running(4,1,0);
+      fair_queued(0,3,0,2000000);fair_queued(1,3,0,3000000);
+      tasks[0].arch.user_mode=1;tasks[0].tid_owned=1; }
+    fair_affinity_at_unlock=&tasks[0];
+    fair_select_unchanged();
+    assert(!fair_affinity_at_unlock && tasks[0].cpu_mask==1);
+    assert_ready_owner(&tasks[0],&cpus[0]);assert_ready_owner(&tasks[1],&cpus[1]);
+    puts("PASS fair busy balance: narrowing a READY task's affinity before transfer preserves the source owner");
+}
+
+static void busy_rt_long_queue(void)
+{
+    static struct kernel_task queued[128];
+    reset_two_queues();active=&cpus[0];
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        balance_running(2,0,99);balance_running(3,1,10);
+        for (unsigned i=0;i<sizeof(queued)/sizeof(*queued);i++) {
+            queued[i]=(struct kernel_task){.accounted=1,.cpu_mask=i%2?1:5,.cpu=&cpus[0],
+                .state=KERNEL_THREAD_STATE_READY};
+            assert(!kernel_sched_policy_set(&queued[i].scheduling,KERNEL_SCHED_FIFO,90,0));
+            ready_enqueue_locked(&queued[i],SCHED_READY_LOCAL);
+        }
+        balance_queued(0,3,80);
+        tasks[1]=(struct kernel_task){.accounted=1,.cpu_mask=3,.cpu=&cpus[0],
+            .state=KERNEL_THREAD_STATE_READY};
+        assert(!kernel_sched_policy_set(&tasks[1].scheduling,KERNEL_SCHED_FIFO,80,0));
+        ready_enqueue_locked(&tasks[1],SCHED_READY_HEAD|SCHED_READY_LOCAL);
+    }
+    /* Target claims the newest explicit head of priority 80 even though
+     * the source has a long prefix of ineligible priority-90 tasks. */
+    active=&cpus[1];
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    assert(ready_best_locked()==&tasks[1]);
+    ready_remove_locked(&tasks[1]);
+    assert(ready_best_locked()==&tasks[0]);
+    puts("PASS busy RT pull: a long ineligible prefix preserves explicit head insertion and same-priority FIFO");
+}
+
 int main(int argc,char **argv)
 {
+    if (argc==2 && !strcmp(argv[1],"--rt-balance-only")) {
+        kernel_wait_domain_init();busy_rt_balance_cases();busy_rt_reschedule_cases();
+        remote_rt_affinity();busy_rt_long_queue();local_fifo_cases();reservation_placement_cases();
+#if BOAROS_MAX_CPUS >= 4
+        busy_rt_concurrent_claim();
+        busy_rt_new_predecessor();
+#endif
+        return 0;
+    }
+    if(argc==2&&!strcmp(argv[1],"--fair-balance-only")) {
+        kernel_wait_domain_init();fair_long_queue();ordinary_busy_balance();
+        fair_affinity_during_balance();fair_parallel_handoff();return 0;
+    }
     if(argc==2&&!strcmp(argv[1],"--slice-only")) {kernel_wait_domain_init();ordinary_local_slice();return 0;}
     if (argc==2) {kernel_wait_domain_init();ordinary_local_park();return 0;}
-    assert(!controlled_smp_main());
+    assert(!controlled_smp_main(0,0));
     ordinary_local_park();
     local_fifo_cases();
     ordinary_local_claim();
@@ -773,7 +1133,14 @@ int main(int argc,char **argv)
     ordinary_wake_after_affinity_change();
     ordinary_pull();
     ordinary_local_slice();
+    ordinary_busy_balance();
+    fair_long_queue();
+    fair_affinity_during_balance();
+    fair_parallel_handoff();
     remote_rt_precedence();
+    busy_rt_reschedule_cases();
+    remote_rt_affinity();
+    busy_rt_long_queue();
     reservation_placement_cases();
     scheduler = (struct kernel_scheduler){0};
     scheduler.rt_configuration.period_ns = 1000000000;

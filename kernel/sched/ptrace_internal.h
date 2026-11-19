@@ -3,7 +3,7 @@
 #include <kernel/ptrace.h>
 #include <kernel/signal.h>
 #include <kernel/credentials.h>
-enum trace_event { TRACE_FORK=1,TRACE_VFORK,TRACE_CLONE,TRACE_EXEC,TRACE_VFORK_DONE,TRACE_EXIT,TRACE_STOP=128 };
+enum trace_event { TRACE_FORK=1,TRACE_VFORK,TRACE_CLONE,TRACE_EXEC,TRACE_VFORK_DONE,TRACE_EXIT,TRACE_SECCOMP,TRACE_STOP=128 };
 enum { TRACE_RUNNING,TRACE_PARKING,TRACE_STOPPED,TRACE_LISTENING,TRACE_FINAL };
 enum { TRACE_WAIT_STOP=4,TRACE_WAIT_FINAL };
 /* Each indexed child belongs to exactly one tracer TID. All links and stop
@@ -21,6 +21,8 @@ struct kernel_ptrace_state {
 int ptrace_clone_prepare(struct kernel_task *);
 int ptrace_clone_locked(struct kernel_task *,struct kernel_task *,uint64_t);
 void ptrace_event(struct kernel_task *,unsigned,uint64_t);
+/* Caller retains the identity through a possibly sleeping event stop. */
+void ptrace_event_pid(struct kernel_task *,unsigned,const struct kernel_pid *);
 void ptrace_begin_exit(struct kernel_task *,uint32_t);
 void ptrace_terminate_locked(struct kernel_task *);
 int ptrace_publish_final_locked(struct kernel_task *,struct kernel_ptrace_notice *);

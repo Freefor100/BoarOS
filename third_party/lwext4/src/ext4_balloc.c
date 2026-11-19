@@ -372,13 +372,9 @@ int ext4_balloc_free_blocks(struct ext4_inode_ref *inode_ref,
 		bg_first++;
 	}
 
-	uint32_t i;
-	for (i = 0;i < blk_cnt;i++) {
-		rc = ext4_trans_try_revoke_block(fs->bdev, start_block + i);
-		if (rc != EOK)
-			return rc;
-
-	}
+	if (rc != EOK) return rc;
+	rc = ext4_trans_try_revoke_range(fs->bdev, start_block, blk_cnt);
+	if (rc != EOK) return rc;
 
 	if (!fs->jbd_journal) ext4_bcache_invalidate_lba(fs->bdev->bc, start_block, blk_cnt);
 	/*All blocks should be released*/

@@ -13,7 +13,62 @@ ${HOST_CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror \
     third_party/lwext4/src/*.c tests/host/lwext4_metadata.c \
     tests/host/block_fault.c kernel/block.c tests/host/block_runtime.c kernel/raw_lock.c \
     tests/host/sync/notifications.c -Itests/host/block_model -pthread -o "$work/probe"
+nojournal_symlink_cases() {
+    block=$1
+    for fault in 1 2 3; do
+        image="$work/nojournal-symlink-$block-$fault.img"
+        truncate -s 32M "$image"
+        mkfs.ext4 -q -F -b "$block" -O ^has_journal "$image"
+        log="$work/nojournal-symlink-$block-$fault"
+        "$work/probe" "$image" nojournal-symlink-fault "$fault" > "$log.log"
+        cat "$log.log"
+        if [ "$fault" -eq 1 ]; then
+            e2fsck -fn "$image" > "$log-fsck.log" 2>&1
+            rm "$image"
+            continue
+        fi
+        inode=$(sed -n 's/.*inode=\([0-9]*\) retained.*/\1/p' "$log.log")
+        test -n "$inode"
+        "$work/probe" "$image" nojournal-reject
+        "$work/probe" "$image" nojournal-orphan-reopen
+        LC_ALL=C debugfs -R "testi <$inode>" "$image" > "$log-inode-bitmap.log" 2>&1
+        grep -F "Inode $inode is marked in use" "$log-inode-bitmap.log"
+        LC_ALL=C debugfs -R 'stat /ordered-link' "$image" > "$log-path.log" 2>&1
+        if [ "$fault" -eq 2 ]; then
+            grep -F "File not found" "$log-path.log"
+        else
+            grep -E "^Inode: $inode[[:space:]]+Type: symlink" "$log-path.log"
+            grep -E 'User:[[:space:]]+70001[[:space:]]+Group:[[:space:]]+80002' "$log-path.log"
+            grep -F 'Links: 1 ' "$log-path.log"
+            LC_ALL=C debugfs -R 'cat /ordered-link' "$image" > "$log-target" 2> "$log-target.log"
+            test "$(cat "$log-target")" = long-symlink-target-with-its-own-data-block-and-a-detectable-write-payload
+        fi
+        status=0
+        LC_ALL=C e2fsck -fn "$image" > "$log-fsck.log" 2>&1 || status=$?
+        if [ "$fault" -eq 2 ]; then
+            test "$status" -eq 4
+            grep -F "Unattached inode $inode" "$log-fsck.log"
+        else
+            test "$status" -eq 0 || test "$status" -eq 4
+        fi
+        repaired="$log-repaired.img"
+        cp "$image" "$repaired"
+        status=0
+        e2fsck -fy "$repaired" > "$log-repair.log" 2>&1 || status=$?
+        test "$status" -eq 0 || test "$status" -eq 1
+        "$work/probe" "$repaired" nojournal-clean-remount
+        e2fsck -fn "$repaired" > "$log-repaired-fsck.log" 2>&1
+        rm "$image" "$repaired"
+        printf 'PASS symlink fault block=%s fault=%s; repaired image remounts and passes e2fsck\n' "$block" "$fault"
+    done
+}
+
+if [ "${1:-}" = nojournal-symlink ]; then
+    for block in 1024 4096; do nojournal_symlink_cases "$block"; done
+    exit 0
+fi
 for block in 1024 4096; do
+    nojournal_symlink_cases "$block"
     for journal in journal nonjournal; do
         image="$work/$block-$journal.img"
         features=has_journal

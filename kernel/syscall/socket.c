@@ -253,6 +253,10 @@ static int socket_option(int level, int name, enum kernel_socket_option *option)
     } else if (level == LINUX_IPPROTO_TCP) {
         if (name == 1) { *option = KERNEL_SOCKET_NODELAY; return 0; }
         if (name == 2) { *option = KERNEL_SOCKET_MAXSEG; return 0; }
+        if (name == 3) { *option = KERNEL_SOCKET_CORK; return 0; }
+        if (name == 4) { *option = KERNEL_SOCKET_KEEPIDLE; return 0; }
+        if (name == 5) { *option = KERNEL_SOCKET_KEEPINTVL; return 0; }
+        if (name == 6) { *option = KERNEL_SOCKET_KEEPCNT; return 0; }
     } else if (level == 41 && name == 26) {
         *option = KERNEL_SOCKET_V6ONLY; return 0;
     }
@@ -405,6 +409,58 @@ static int ipv4_sockopt(struct kernel_socket *socket, struct kernel_mm *mm,
     return 0;
 }
 
+/* Linux IPv6 uses int scalar inputs (not SOL_IP's byte form), with a
+ * common initial int read even for membership requests. NULL scalar input
+ * means zero; memberships still import the complete ipv6_mreq afterward. */
+static int ipv6_multicast_sockopt(struct kernel_socket *socket, struct kernel_mm *mm,
+    const struct kernel_syscall_request *request, int get)
+{
+    int name=(int32_t)request->arguments[2];
+    int32_t length=(int32_t)request->arguments[4];
+    size_t copied=0;
+    if(!get && length<0)return -KERNEL_EINVAL;
+    if(kernel_socket_family(socket)!=KERNEL_SOCKET_AF_INET6)
+        return get || kernel_socket_is_unix(socket)?-KERNEL_EOPNOTSUPP:-KERNEL_ENOPROTOOPT;
+    enum kernel_socket_option option=name==18?KERNEL_SOCKET_IPV6_MULTICAST_HOPS:
+        name==19?KERNEL_SOCKET_IPV6_MULTICAST_LOOP:KERNEL_SOCKET_IPV6_MULTICAST_ALL;
+    int value=0;
+    if(get) {
+        if(kernel_copy_from_user(mm,&length,request->arguments[4],sizeof(length),&copied)!=
+                KERNEL_UACCESS_STATUS_OK || copied!=sizeof(length))return -KERNEL_EFAULT;
+        if(name==20 || name==21)return -KERNEL_ENOPROTOOPT;
+        int result;
+        if(name==17) {
+            uint32_t index=0;
+            result=kernel_socket_get_ipv6_multicast_interface(socket,&index);
+            value=(int32_t)index;
+        } else result=kernel_socket_get_option(socket,option,&value);
+        if(result)return result;
+        /* min_t(unsigned int, sizeof(int), len), including negative len. */
+        uint32_t output=(uint32_t)length<sizeof(value)?(uint32_t)length:sizeof(value);
+        if(kernel_copy_to_user(mm,request->arguments[4],&output,sizeof(output),&copied)!=
+                KERNEL_UACCESS_STATUS_OK || copied!=sizeof(output))return -KERNEL_EFAULT;
+        if(output && (kernel_copy_to_user(mm,request->arguments[3],&value,output,&copied)!=
+                KERNEL_UACCESS_STATUS_OK || copied!=output))return -KERNEL_EFAULT;
+        return 0;
+    }
+    if(request->arguments[3] && length>=(int32_t)sizeof(value) &&
+       (kernel_copy_from_user(mm,&value,request->arguments[3],sizeof(value),&copied)!=
+            KERNEL_UACCESS_STATUS_OK || copied!=sizeof(value)))return -KERNEL_EFAULT;
+    if(name==20 || name==21) {
+        struct { uint8_t address[16];uint32_t index; } membership;
+        _Static_assert(sizeof(membership)==20,"Linux ipv6_mreq layout");
+        if(length<(int32_t)sizeof(membership))return -KERNEL_EINVAL;
+        if(kernel_socket_is_tcp(socket))return -KERNEL_EPROTO;
+        if(kernel_copy_from_user(mm,&membership,request->arguments[3],sizeof(membership),&copied)!=
+                KERNEL_UACCESS_STATUS_OK || copied!=sizeof(membership))return -KERNEL_EFAULT;
+        return kernel_socket_ipv6_membership(socket,membership.address,membership.index,name==21);
+    }
+    if((name==17 || name==18) && kernel_socket_is_stream(socket))return -KERNEL_ENOPROTOOPT;
+    if(length<(int32_t)sizeof(value))return -KERNEL_EINVAL;
+    if(name==17)return kernel_socket_set_ipv6_multicast_interface(socket,(uint32_t)value);
+    return kernel_socket_set_option(socket,option,value);
+}
+
 static int sockopt(struct kernel_socket *socket, struct kernel_files *files, struct kernel_mm *mm,
                    const struct kernel_syscall_request *request, int get)
 {
@@ -419,11 +475,46 @@ static int sockopt(struct kernel_socket *socket, struct kernel_files *files, str
                 (name == LINUX_SO_RCVTIMEO || name == LINUX_SO_SNDTIMEO);
     int peercred = get && level == LINUX_SOL_SOCKET && name == LINUX_SO_PEERCRED;
     enum kernel_socket_option option = KERNEL_SOCKET_TYPE;
+    if(level==41 && ((name>=17 && name<=21) || name==29))
+        return ipv6_multicast_sockopt(socket,mm,request,get);
     if (get) {
         if (kernel_copy_from_user(mm, &length, request->arguments[4], sizeof(length), &copied) !=
                 KERNEL_UACCESS_STATUS_OK || copied != sizeof(length)) return -KERNEL_EFAULT;
     }
     if (length < 0) return -KERNEL_EINVAL;
+    /* TCP publishes optlen before touching optval (Linux tcp.c). */
+    int tcp_extended = level == LINUX_IPPROTO_TCP &&
+        ((name >= 4 && name <= 6) || name == 11);
+    if (tcp_extended) {
+        if (!kernel_socket_is_tcp(socket))
+            return get || kernel_socket_is_unix(socket) ? -KERNEL_EOPNOTSUPP : -KERNEL_ENOPROTOOPT;
+        if (get) {
+            int value,error;struct kernel_socket_tcp_info info;
+            uint32_t capacity = (uint32_t)length, output;
+            const void *data;
+            if(name==11) {
+                error=kernel_socket_tcp_info(socket,&info);data=&info;output=sizeof(info);
+            } else {
+                error=socket_option(level,name,&option);
+                if(!error)error=kernel_socket_get_option(socket,option,&value);
+                data=&value;output=sizeof(value);
+            }
+            if (error) return error;
+            if (output > capacity) output = capacity;
+            if (kernel_copy_to_user(mm, request->arguments[4], &output, sizeof(output), &copied) !=
+                    KERNEL_UACCESS_STATUS_OK || copied != sizeof(output)) return -KERNEL_EFAULT;
+            if (output && (kernel_copy_to_user(mm, request->arguments[3], data, output, &copied) !=
+                    KERNEL_UACCESS_STATUS_OK || copied != output)) return -KERNEL_EFAULT;
+            return 0;
+        }
+    }
+    if(level==LINUX_IPPROTO_TCP && name==11) {
+        int value;
+        if(length<(int32_t)sizeof(value))return -KERNEL_EINVAL;
+        if(kernel_copy_from_user(mm,&value,request->arguments[3],sizeof(value),&copied)!=
+            KERNEL_UACCESS_STATUS_OK || copied!=sizeof(value))return -KERNEL_EFAULT;
+        return -KERNEL_ENOPROTOOPT;
+    }
     if (level == LINUX_SOL_SOCKET && name == 25)
         return device_sockopt(socket, mm, request, get, length);
     if (level == 0 && (name == 2 || name == 32 || name == 33))
@@ -752,6 +843,7 @@ static enum kernel_syscall_status socket_message_pinned(
     uint32_t allowed=KERNEL_SOCKET_MSG_DONTWAIT | (writing?KERNEL_SOCKET_MSG_NOSIGNAL:
         KERNEL_SOCKET_MSG_TRUNC|UINT32_C(0x40000000)|KERNEL_SOCKET_MSG_PEEK);
     if (writing && batch) allowed|=KERNEL_SOCKET_MSG_EOR;
+    if (kernel_socket_is_tcp(socket)) allowed |= writing?KERNEL_SOCKET_MSG_MORE:KERNEL_SOCKET_MSG_WAITALL;
     if (seqpacket)
         allowed |= writing?(KERNEL_SOCKET_MSG_EOR|KERNEL_SOCKET_MSG_MORE):KERNEL_SOCKET_MSG_WAITALL;
     if(!writing && kernel_socket_is_netlink(socket))
@@ -1048,6 +1140,7 @@ enum kernel_syscall_status syscall_handle_socket_operation(
     case 206: { /* sendto / send */
         uint32_t flags = (uint32_t)request->arguments[3];
         uint32_t allowed=KERNEL_SOCKET_MSG_DONTWAIT | KERNEL_SOCKET_MSG_NOSIGNAL;
+        if (kernel_socket_is_tcp(socket)) allowed|=KERNEL_SOCKET_MSG_MORE;
         if (kernel_socket_is_seqpacket(socket)) allowed|=KERNEL_SOCKET_MSG_EOR|KERNEL_SOCKET_MSG_MORE;
         if ((flags & ~allowed) && !kernel_socket_is_seqpacket(socket)) { result = -KERNEL_EOPNOTSUPP; break; }
         const struct kernel_socket_address *destination = 0;
@@ -1079,7 +1172,7 @@ enum kernel_syscall_status syscall_handle_socket_operation(
         uint32_t flags = (uint32_t)request->arguments[3];
         data_call.message.flags=flags;
         uint32_t allowed=KERNEL_SOCKET_MSG_DONTWAIT | KERNEL_SOCKET_MSG_TRUNC | KERNEL_SOCKET_MSG_PEEK;
-        if (kernel_socket_is_seqpacket(socket)) allowed|=KERNEL_SOCKET_MSG_WAITALL;
+        if (kernel_socket_is_seqpacket(socket) || kernel_socket_is_tcp(socket)) allowed|=KERNEL_SOCKET_MSG_WAITALL;
         if (kernel_socket_is_netlink(socket))allowed|=KERNEL_SOCKET_MSG_WAITALL|KERNEL_SOCKET_MSG_NOSIGNAL;
         if (flags & ~allowed) {
             result=kernel_socket_prepare_receive(socket);

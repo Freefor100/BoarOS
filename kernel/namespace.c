@@ -5,13 +5,20 @@
 #include "../fs/open_file_internal.h"
 #include "../fs/char_device_internal.h"
 
-void kernel_namespace_init(struct kernel_namespace *ns,uint32_t type,
-    struct kernel_heap *heap,void (*destroy)(struct kernel_namespace *))
+uint64_t kernel_namespace_allocate_id(void)
 {
     static uint64_t next_id=UINT64_C(4026531840);
     uint64_t id=__atomic_fetch_add(&next_id,1,__ATOMIC_RELAXED);
-    if (!id || id==UINT64_MAX || !heap || !destroy ||
-        (type!=KERNEL_NS_MNT && type!=KERNEL_NS_UTS && type!=KERNEL_NS_IPC))
+    if (!id || id==UINT64_MAX) __builtin_trap();
+    return id;
+}
+
+void kernel_namespace_init(struct kernel_namespace *ns,uint32_t type,
+    struct kernel_heap *heap,void (*destroy)(struct kernel_namespace *))
+{
+    uint64_t id=kernel_namespace_allocate_id();
+    if (!heap || !destroy ||
+        (type!=KERNEL_NS_MNT && type!=KERNEL_NS_UTS && type!=KERNEL_NS_IPC && type!=KERNEL_NS_PID))
         __builtin_trap();
     *ns=(struct kernel_namespace){.references=1,.type=type,.id=id,.heap=heap,
         .destroy=destroy};

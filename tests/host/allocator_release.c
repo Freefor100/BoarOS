@@ -1,4 +1,5 @@
 #include <kernel/heap.h>
+#include <kernel/mm_retire.h>
 #include <kernel/sync.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
@@ -166,6 +167,18 @@ static void invalid_release(unsigned int which, uint64_t page, void *object)
 {
     uint32_t references;
     switch (which) {
+    case 30: {
+        uint8_t order = 0;
+        physical_page_release_order_batch(&allocator, &page, &order, 1); break;
+    }
+    case 31: {
+        uint8_t order = PHYSICAL_PAGE_MAX_ORDER + 1;
+        physical_page_release_order_batch(&allocator, &page, &order, 1); break;
+    }
+    case 32: {
+        struct kernel_mm_retirement batch = {0};
+        kernel_mm_retirement_add_order(&batch, page, 1, 1); break;
+    }
     case 0: physical_page_release_order(&allocator, page, 0); break;
     case 1: physical_page_release_order(&allocator, page + BOAROS_PAGE_SIZE, 1); break;
     case 2: physical_page_release_order(&allocator, page, 1);
@@ -254,6 +267,16 @@ static void invalid_release(unsigned int which, uint64_t page, void *object)
         assert(0);
         break;
     }
+    case 24: physical_page_acquire_order(&allocator, page, 0); break;
+    case 25: physical_page_acquire_order(&allocator, page + BOAROS_PAGE_SIZE, 1); break;
+    case 26:
+        ((struct test_page_metadata *)allocator.metadata)[test_page_index(page)].reference_count = UINT32_MAX;
+        physical_page_acquire_order(&allocator, page, 1); break;
+    case 27: physical_page_cow_borrow_order(&allocator, page, 0); break;
+    case 28: physical_page_cow_borrow(&allocator, page); break;
+    case 29:
+        physical_page_release_order(&allocator, page, 1);
+        physical_page_acquire_order(&allocator, page, 1); break;
     case 13: physical_page_acquire(&allocator, page); break;
     case 14: {
         uint64_t single;
@@ -377,7 +400,7 @@ static void check_release_diagnostic(unsigned int which, const char *diagnostic,
     };
     uint64_t address;
 
-    if (cases[which].reason == 0) {
+    if (which >= sizeof(cases)/sizeof(cases[0]) || cases[which].reason == 0) {
         return;
     }
     if (diagnostic_field(diagnostic, cases[which].reason) == 0) {
@@ -544,15 +567,115 @@ static void test_batch_allocation(void)
     assert(!physical_page_allocator_clear_reclaimer(&allocator));
 }
 
+struct recycle_test { uint64_t head; unsigned calls, retained; };
+static int retain_compound(void *context, uint64_t head, uint32_t order)
+{
+    struct recycle_test *test=context;
+    test->calls++;
+    if (head!=test->head) return 0;
+    assert(order==4 && !test->retained);
+    test->retained=1;
+    return 1;
+}
+static void test_compound_recycler(void)
+{
+    setup();
+    uint64_t initial=physical_page_available(&allocator), other, single;
+    struct recycle_test test={0};
+    assert(!physical_page_allocate_order(&allocator,4,&test.head));
+    struct physical_page_compound_recycler hooks={&test,retain_compound};
+    assert(!physical_page_allocator_set_compound_recycler(&allocator,&hooks));
+    assert(physical_page_allocator_set_compound_recycler(&allocator,&hooks)==PHYSICAL_PAGE_STATUS_STATE);
+    assert(physical_page_allocator_clear_compound_recycler(&allocator,&allocator)==PHYSICAL_PAGE_STATUS_STATE);
+    assert(!physical_page_allocate(&allocator,&single));
+    assert(!physical_page_release(&allocator,single) && !test.calls);
+    assert(!physical_page_acquire_order(&allocator,test.head,4));
+    assert(!physical_page_release_order(&allocator,test.head,4) && !test.calls);
+    assert(physical_page_release_allocation(&allocator,test.head)==4 && test.retained);
+    uint32_t refs;
+    assert(!physical_page_reference_count(&allocator,test.head,&refs) && refs==1);
+    assert(physical_page_available(&allocator)==initial-16);
+    assert(!physical_page_allocate_order(&allocator,2,&other));
+    assert(!physical_page_release_order(&allocator,other,2) && test.calls==2);
+    /* Pool transfers its sole reference without adding a hidden COW owner. */
+    test.retained=0;
+    assert(physical_page_cow_borrow_order(&allocator,test.head,4)==1);
+    const uint8_t orders[]={4};
+    physical_page_release_order_batch(&allocator,&test.head,orders,1);
+    assert(test.retained && test.calls==3);
+    assert(!physical_page_allocator_clear_compound_recycler(&allocator,&test));
+    assert(!physical_page_release_order(&allocator,test.head,4));
+    assert(physical_page_available(&allocator)==initial && !physical_page_allocator_audit(&allocator));
+}
+
+static void test_compound_retirement(void)
+{
+    setup();
+    uint64_t initial = physical_page_available(&allocator), block, table;
+    struct kernel_mm_retirement batch = {0};
+    assert(!physical_page_allocate_order(&allocator, 4, &block));
+    assert(!physical_page_allocate(&allocator, &table));
+    /* A pin outlives two aliases that transfer owners to the retire batch. */
+    assert(!physical_page_acquire_order(&allocator, block, 4));
+    assert(!physical_page_acquire_order(&allocator, block, 4));
+    kernel_mm_retirement_add_order(&batch, block, 4, 0);
+    kernel_mm_retirement_add(&batch, table, 1);
+    kernel_mm_retirement_add_order(&batch, block, 4, 0);
+    assert(batch.count == 3 && batch.nonleaf && batch.compound);
+    assert(physical_page_available(&allocator) == initial - 17);
+    /* Simulate the caller's completed invalidation before returning owners. */
+    kernel_mm_retirement_release(&allocator, &batch);
+    uint32_t refs;
+    assert(!batch.count && !batch.nonleaf && !batch.compound);
+    assert(!physical_page_reference_count(&allocator, block, &refs) && refs == 1);
+    assert(physical_page_available(&allocator) == initial - 16);
+    assert(!physical_page_release_order(&allocator, block, 4));
+    assert(physical_page_available(&allocator) == initial);
+    assert(!physical_page_allocator_audit(&allocator));
+}
+
+static void test_compound_references(void)
+{
+    setup();
+    uint64_t initial = physical_page_available(&allocator);
+    for (unsigned order = 0; order <= 5; order++) {
+        uint64_t address;
+        uint32_t count, actual;
+        assert(!physical_page_allocate_order(&allocator, order, &address));
+        uint64_t remaining = initial - (UINT64_C(1) << order);
+        assert(physical_page_available(&allocator) == remaining);
+        assert(physical_page_cow_borrow_order(&allocator, address, order) == 1);
+        assert(!physical_page_reference_count(&allocator, address, &count) && count == 1);
+        assert(!physical_page_acquire_order(&allocator, address, order));
+        assert(!physical_page_reference_count(&allocator, address, &count) && count == 2);
+        assert(physical_page_cow_borrow_order(&allocator, address, order) == 2);
+        assert(!physical_page_reference_count(&allocator, address, &count) && count == 3);
+        assert(!physical_page_allocator_audit(&allocator));
+        /* Mapping and COW source are separate whole-block owners. Neither
+         * dropping the mapping nor dropping a source pin releases tail pages. */
+        assert(!physical_page_release_order(&allocator, address, order));
+        assert(physical_page_release_allocation(&allocator, address) == order);
+        assert(physical_page_available(&allocator) == remaining);
+        assert(!physical_page_allocation_order(&allocator, address, &actual) && actual == order);
+        assert(!physical_page_reference_count(&allocator, address, &count) && count == 1);
+        assert(!physical_page_release_order(&allocator, address, order));
+        assert(physical_page_available(&allocator) == initial);
+        assert(!physical_page_allocator_audit(&allocator));
+    }
+}
+
 int main(void)
 {
     struct rlimit limit = {0, 0};
     assert(setrlimit(RLIMIT_CORE, &limit) == 0);
+    test_compound_recycler();
+    test_compound_retirement();
+    test_compound_references();
     test_no_sleep_allocation();
     test_batch_allocation();
     test_legal_release_is_silent();
     test_retired_payload_is_not_owner();
-    for (unsigned int i = 0; i < 24; i++) {
+    for (unsigned int i = 0; i < 33; i++) {
         int output[2];
         char diagnostic[2048];
         size_t length = 0U;

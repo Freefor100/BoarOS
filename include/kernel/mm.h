@@ -24,6 +24,7 @@ struct kernel_futex_key;
 #define KERNEL_MM_MAP_FIXED (UINT32_C(1) << 0U)
 #define KERNEL_MM_MAP_FIXED_NOREPLACE (UINT32_C(1) << 1U)
 #define KERNEL_MM_MAP_SHARED (UINT32_C(1) << 2U)
+#define KERNEL_MM_MAP_GROWSDOWN (UINT32_C(1) << 4U)
 #define KERNEL_MM_MAP_LOCKED (UINT32_C(1) << 3U)
 
 enum kernel_mm_status {
@@ -78,7 +79,7 @@ enum kernel_mm_status kernel_mm_check_files_domain(const struct kernel_mm *, con
 
 struct kernel_mm_mapping {
     uint64_t physical_address;
-    uint32_t permissions;
+    uint32_t permissions, order;
 };
 
 /* resident片段的实际页owner；caller的LIVE MM句柄须保持到unpin。
@@ -98,8 +99,9 @@ struct kernel_mm_user_pin {
     struct kernel_mm_user_pin *owner_next;
     struct kernel_mm_user_pin **owner_previous;
     void *page;
-    uint64_t physical_address;
-    uint32_t access;
+    uint64_t physical_address; /* addressed base-page PA, preserves futex identity */
+    uint64_t owner_address;    /* compound buddy head retained until unpin */
+    uint32_t access, order;
     struct kernel_page_cache_write_borrow cache_write;
 };
 /* Resolve a missing private page and lend its actual owner at publication;
@@ -127,6 +129,17 @@ void kernel_mm_unpin_user_pair(struct kernel_mm_user_pin pins[2]);
  * COW without changing VMA/PTE permissions. Errors retain the true prefix. */
 int kernel_mm_remote_transfer(struct kernel_mm *, uint64_t address, void *buffer,
     size_t length, int writing, int force, size_t *copied);
+
+/* Fatal-exit caller has stopped every MM user. Fail rather than overlap an
+ * existing remote writer; subsequent ptrace/process_vm writes are rejected. */
+unsigned kernel_mm_coredump_filter_get(const struct kernel_mm *);
+void kernel_mm_coredump_filter_set(struct kernel_mm *, unsigned);
+int kernel_mm_core_begin(struct kernel_mm *);
+void kernel_mm_core_end(struct kernel_mm *);
+/* Pair around a process_vm request while its independent MM owner lives.
+ * Exceptional syscall exit must end this registration before releasing MM. */
+int kernel_mm_core_remote_begin(struct kernel_mm *);
+void kernel_mm_core_remote_end(struct kernel_mm *);
 
 /* Source owner and handle remain stable through this non-sleeping acquire.
  * Success creates another independently owned reference to the same MM. */
@@ -288,6 +301,10 @@ enum kernel_mm_status kernel_mm_mmap_anonymous(
     uint32_t flags,
     uint64_t *address);
 
+enum kernel_mm_status kernel_mm_mmap_hugetlb(struct kernel_mm *,
+    uint64_t hint, uint64_t length, uint32_t permissions, uint32_t flags,
+    int shared, int noreserve, uint64_t *address);
+
 /* Side-effect-free validation; success does not reserve the chosen range. */
 enum kernel_mm_status kernel_mm_validate_file_private_mapping(
     struct kernel_mm *mm,
@@ -330,6 +347,8 @@ enum kernel_mm_status kernel_mm_mprotect(
     uint32_t permissions);
 
 /* READ_IMPLIES_EXEC adds execute only to VMAs which permit it. */
+enum kernel_mm_status kernel_mm_mprotect_growdown(struct kernel_mm *,
+    uint64_t, uint64_t, uint32_t, int);
 enum kernel_mm_status kernel_mm_mprotect_personality(struct kernel_mm *,
     uint64_t address, uint64_t length, uint32_t permissions, int read_implies_exec);
 
@@ -352,6 +371,11 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(
     uint64_t virtual_address,
     uint32_t access);
 
+struct kernel_task;
+/* The scheduler has validated the running user and supplied its owned MM. */
+enum kernel_mm_status kernel_mm_resolve_owned_user_fault(struct kernel_mm *,
+    struct kernel_task *, uint64_t virtual_address, uint32_t access);
+
 /* SysV shared memory attach and detach */
 struct kernel_shm_segment;
 enum kernel_mm_status kernel_mm_shmat(
@@ -367,13 +391,16 @@ enum kernel_mm_status kernel_mm_shmdt(
     uint64_t address);
 
 /* Success consumes one reference; last-reference cleanup can retain VFS owners. */
+/* Cleanup workers preserve the initiating task for VMA close accounting. */
+enum kernel_mm_status kernel_mm_release_for_task(struct kernel_mm *,const struct kernel_task *);
 enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm);
 
 /* MM句柄owner覆盖此无等待快照；保护页仍占用RSS，高水位跨unmap保留。 */
 uint64_t kernel_mm_peak_resident_pages(const struct kernel_mm *mm);
 struct kernel_mm_proc_map {
-    uint64_t start, end, offset;
-    uint32_t permissions;
+    uint64_t start, end, offset, dump_size;
+    uint32_t permissions, flags;
+    enum kernel_vma_kind kind;
     enum kernel_vma_role role;
     unsigned shared;
     struct kernel_open_file_description *file;

@@ -6,6 +6,7 @@
 #endif
 void *block_model_cpu(void);
 static inline void *arch_current_cpu_get(void) { return block_model_cpu(); }
+static inline void *arch_current_thread_get(void) { return 0; }
 /* Standalone block fixtures execute host threads, without guest interrupts.
  * Device exclusion is provided by block_runtime.c's blocking mutex model. */
 static inline uintptr_t arch_interrupt_save(void) { return 0; }

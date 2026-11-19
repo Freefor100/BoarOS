@@ -17,7 +17,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 
 调用者是 scheduler 当前不透明 task，供依赖任务身份或资源的系统调用取得明确上下文；通用解码层不从 RISC-V `tp` 隐式寻找 current。请求包含系统调用号和六个 64 位参数。结果动作定义在公共头中：
 
-当前分派覆盖RV的257个编号、LA的254个编号；这表示入口已接入，各接口的具体支持范围见对应模块。
+当前分派覆盖RV的258个编号、LA的255个编号；这表示入口已接入，各接口的具体支持范围见对应模块。
 `vhangup(58)` 提供有权限的控制终端挂断，旧实例失效而设备保持可重新打开；具体行为见[终端模块](kernel-tty.md)。`fcntl` 的异步 owner、所选信号和 `O_ASYNC` 见[文件接口](kernel-files.md)及[信号模块](kernel-signal.md#sigio-异步-io-通知)。
 
 
@@ -35,6 +35,7 @@ LA的259仍返回`ENOSYS`。这些入口的直接消费者可用`python3 tests/u
 - `KERNEL_SYSCALL_ACTION_EXIT`：以 `value` 作为退出状态终止当前用户任务。
 - `KERNEL_SYSCALL_ACTION_EXEC`：新映像已经准备完成；不推进旧 `sepc`，由 scheduler 切换 MM 并重建 Trap Frame。
 - `KERNEL_SYSCALL_ACTION_CLONE`：参数符合当前支持的进程/线程 clone 子集；架构 Trap 层把完整寄存器快照交给进程层构造任务。
+- `KERNEL_SYSCALL_ACTION_CLONE3`：两架构共用 clone3 专属处理，在持有寄存器快照的调用内导入参数和指定 TID 数组并同步消费。
 - `KERNEL_SYSCALL_ACTION_WAIT4`：参数保持 Linux ABI 形态，由 scheduler 完成选择、阻塞、唤醒与 zombie 回收。
 - `KERNEL_SYSCALL_ACTION_WAITID`：参数保持 Linux ABI 形态（支持 which, upid, infop, options, rusage），由 scheduler 完成选择、阻塞、唤醒与事件消费/zombie 回收。
 - `KERNEL_SYSCALL_ACTION_YIELD`：忽略无参数调用的残留寄存器，由 scheduler 把当前任务排到其优先级队尾，再按优先级与实时预算资格重选。
@@ -83,7 +84,7 @@ LA的259仍返回`ENOSYS`。这些入口的直接消费者可用`python3 tests/u
 - `mremap` 编号为 216，按五个原生64位参数调整普通匿名/文件映射，成功返回新地址。支持缩小、原地扩大、MAYMOVE与FIXED搬移，保留COW、共享后备与文件偏移，操作在发起CPU执行；涉及SysV附件的撤销部分沿CPU0执行规则。错误、副作用及未实现模式统一见[MM范围迁移](kernel-mm.md#mremap-区间调整与搬移)。
 - `clone` 编号为 220。支持 SIGCHLD fork/vfork 和 VM/FS/FILES/SIGHAND/THREAD 共享线程形态；进程形态接受 CHILD_SETTID、CHILD_CLEARTID 及 CLONE_FS，线程形态接受 SETTLS、PARENT_SETTID、CHILD_SETTID、CHILD_CLEARTID、SYSVSEM、DETACHED 位。RISC-V 参数顺序为 flags/stack/parent_tid/tls/child_tid。非法 flag 依赖返回 EINVAL，未支持的合法资源组合返回 ENOTSUP；资源、vfork 致命取消、发布和回滚契约见[调度模块](kernel-scheduler.md)。
 - `execve` 编号为 221，准备并提交 RISC-V `ET_EXEC`/`ET_DYN` 映像及非递归 `PT_INTERP` source；成功不返回，失败返回负 Linux errno。路径、解释器、提交点和资源保持规则见[进程映像替换模块](kernel-exec.md)。
-- `mmap` 编号为 222，当前接受 anonymous 或可读普通文件的 `MAP_PRIVATE/MAP_SHARED/MAP_SHARED_VALIDATE`，以及任意 `PROT_NONE/R/W/X` 组合。其中匿名映射接受 PRIVATE/SHARED；SHARED_VALIDATE 用于文件映射。普通 hint、`MAP_FIXED`、`MAP_FIXED_NOREPLACE`、`MAP_STACK` 和 `MAP_NORESERVE` 已实现；fixed-noreplace 冲突返回 `-EEXIST`，地址空间/metadata 不足返回 `-ENOMEM`。文件映射要求有效且非 `O_WRONLY` 的 fd 与页对齐 offset；零长度、非法 fixed 地址、offset 溢出与 fixed-noreplace 冲突在可读性检查前返回各自错误，不可读 OFD 才返回 `-EACCES`。两类拒绝都会释放 syscall 临时 pin 且不提交 VMA。成功后由 MM 独立持有 OFD，所以 close fd 不撤销映射；`MAP_SHARED` 文件写权限与后续 mprotect 升级受初始 OFD 权限约束，`MAP_POPULATE` 接受按需缺页的尽力填充语义；传统映射忽略未知扩展位，文件 SHARED_VALIDATE 对未知扩展返回 `EOPNOTSUPP`。未对齐 offset 或同时指定两种 fixed 模式返回 `EINVAL`，当前无巨大页 hstate，`MAP_HUGETLB` 返回 `EINVAL`，`MAP_GROWSDOWN` 返回 `EOPNOTSUPP`；MAP_LOCKED、ONFAULT、MAP_POPULATE/NONBLOCK的实际预装与计费见[MM模块](kernel-mm.md)；anonymous fd 参数按 Linux 语义忽略。
+- `mmap` 编号为 222，当前接受 anonymous 或可读普通文件的 `MAP_PRIVATE/MAP_SHARED/MAP_SHARED_VALIDATE`，以及任意 `PROT_NONE/R/W/X` 组合。其中匿名映射接受 PRIVATE/SHARED；SHARED_VALIDATE 用于文件映射。普通 hint、`MAP_FIXED`、`MAP_FIXED_NOREPLACE`、`MAP_STACK` 和 `MAP_NORESERVE` 已实现；fixed-noreplace 冲突返回 `-EEXIST`，地址空间/metadata 不足返回 `-ENOMEM`。文件映射要求有效且非 `O_WRONLY` 的 fd 与页对齐 offset；零长度、非法 fixed 地址、offset 溢出与 fixed-noreplace 冲突在可读性检查前返回各自错误，不可读 OFD 才返回 `-EACCES`。两类拒绝都会释放 syscall 临时 pin 且不提交 VMA。成功后由 MM 独立持有 OFD，所以 close fd 不撤销映射；`MAP_SHARED` 文件写权限与后续 mprotect 升级受初始 OFD 权限约束，`MAP_POPULATE` 接受按需缺页的尽力填充语义；传统映射忽略未知扩展位，文件 SHARED_VALIDATE 对未知扩展返回 `EOPNOTSUPP`。未对齐 offset 或同时指定两种 fixed 模式返回 `EINVAL`，当前无巨大页 hstate，`MAP_HUGETLB` 返回 `EINVAL`，`MAP_GROWSDOWN` 接受私有匿名映射，shared/file 组合返回 `EINVAL`，具体增长和 `PROT_GROWSDOWN` 规则见 MM 模块；MAP_LOCKED、ONFAULT、MAP_POPULATE/NONBLOCK的实际预装与计费见[MM模块](kernel-mm.md)；anonymous fd 参数按 Linux 语义忽略。
 - `mprotect` 编号为 226，要求页对齐起点，整个非空范围必须已有 VMA；洞返回 `-ENOMEM`。长度 0 成功。`PROT_NONE` 保留 resident 内容，恢复权限后内容仍在；RISC-V 仅写请求被规范化为 RW。
 - `waitid` 编号为 95，支持 `P_ALL/P_PID/P_PGID/P_PIDFD`，`WEXITED/WSTOPPED/WCONTINUED/WNOHANG/WNOWAIT` 及 `__WNOTHREAD/__WCLONE/__WALL` 标志。P_PIDFD 持有实际 pidfd 身份；NONBLOCK 目标尚无事件返回 EAGAIN，显式 WNOHANG 返回空信息。waitid/wait4 在调用开始时持有 PID/进程组 identity，阻塞期间 setpgid 或数字重用不改变等待目标。事件先于用户态复制消费（WNOWAIT 保持事件未消费并保留 zombie）；退出事件支持 NULL infop，EFAULT 不回滚已消费事件。有事件时先输出 rusage，再输出 siginfo 六个定义字段；EINVAL、ECHILD、中断和无事件也写六个零字段，保留 siginfo padding 与其余字段，rusage 保持原值。siginfo 复制失败以 EFAULT 覆盖原错误。wait claim 与任务借用覆盖输出过程，归还 claim 时唤醒排队的父线程。
 - `getrusage(165)` 支持 SELF、THREAD、CHILDREN，字段、单位和退出归并见[资源记账](kernel-accounting.md)。
@@ -92,7 +93,7 @@ LA的259仍返回`ENOSYS`。这些入口的直接消费者可用`python3 tests/u
 - `prctl(167)` 支持线程名称、父线程死亡信号、subreaper，以及 capability bounding 查询／删除、KEEP_CAPS、securebits、ambient、NO_NEW_PRIVS 和 GET/SET_DUMPABLE。名称与proc交互见[procfs](procfs.md)，父子关系与继承见[调度模块](kernel-scheduler.md)。bounding 删除保留现有 E/P/I，锁定的 securebits 不能解锁；NNP 只能置1且不替换凭据对象。dumpable 修改共享 MM 的状态，设置只接受0或1。
 - `personality(92)` 按低 32 位解释参数，`0xffffffff` 查询原值，设置成功返回原值。支持 PER_LINUX 域与 ADDR_NO_RANDOMIZE、READ_IMPLIES_EXEC、UNAME26、STICKY_TIMEOUTS；其他域或标志返回 EOPNOTSUPP，保留原状态。状态属于调用线程，fork/clone 继承，线程随后独立修改。成功 exec 保留标志；实际生效的 set-ID 文件模式仅清除 ADDR_NO_RANDOMIZE 与 READ_IMPLIES_EXEC，失败 exec 不变。UNAME26 仅投影调用者的 uname release（5.19.0-boaros 为 2.6.79-boaros），不修改 UTS namespace。STICKY_TIMEOUTS 使原生 ppoll/pselect6 保留用户 timeout，包括 EINTR 返回；地址布局及隐含执行权限见[MM](kernel-mm.md)。直接消费者为 `tests/workloads/resource/personality.c`。
 - `prlimit64(261)`及 RV64 的原生 `getrlimit(163)`、`setrlimit(164)` 支持 Linux 0–15 全部限额的记录、查询和设置。两种结构均为两个 64 位无符号限额；LA64 不提供旧 163/164 入口。限额由线程组共享，fork复制，exec和组长替换保留；pid0选择自身，正pid选择可查询任务所属组，包含未回收zombie。新值先导入，权限、实际硬限额比较、旧值快照及更新在同一任务状态锁内完成，再输出旧值；输出EFAULT保留已提交的新值。旧 getrlimit 先校验 resource 后输出，旧 setrlimit 先导入再校验，坏指针与无效 resource 同时出现时分别返回 EINVAL 和 EFAULT。软值不得超过硬值，NOFILE硬限额受1024个fd容量约束；STACK默认软限额8MiB、硬限额无限，实际增长受软限额和地址空间约束。CORE默认0/无限，FSIZE、AS和DATA默认无限/无限；AS/DATA的映射、精确brk与主栈增长接纳见[MM](kernel-mm.md)。NPROC默认4096，MEMLOCK默认8MiB，MSGQUEUE默认819200，NICE/RTPRIO默认0，RSS/LOCKS/RTTIME默认无限；每项的执行约束在对应模块维护，记录可查询不代表某项子系统已接入执行。未知resource返回EINVAL。
-- CORE当前提供状态管理，core文件写出另列能力缺口；wait状态仅在实际生成转储后才含core位。FSIZE在用户文件操作接纳处执行，短写、SIGXFSZ和后台写回边界见[文件接口](kernel-files.md#描述符-writewritev-与文件修改)。
+- CORE 提供状态管理及[线程组 ELF core 写出](kernel-signal.md#elf-core-文件与线程组退出)；wait状态仅在实际生成转储后才含core位。FSIZE在用户文件操作接纳处执行，短写、SIGXFSZ和后台写回边界见[文件接口](kernel-files.md#描述符-writewritev-与文件修改)。
 - `kill`/`tkill`/`tgkill` 编号为 129/130/131，按进程、线程或 TGID+TID 发送标准信号；`rt_sigsuspend`/`rt_sigaction`/`rt_sigprocmask`/`rt_sigpending` 编号为 133/134/135/136，`rt_sigreturn` 为 139，均采用 8 字节有效 signal set。公共用户返回尾负责默认动作、handler frame、stop/continue 和已登记 syscall 类别的 `SA_RESTART`；只有接入该框架的阻塞 syscall 才会在 sigreturn 后重执行，其他调用返回自身规定的 `-EINTR`，细节见[内核信号模块](kernel-signal.md)。
 - `restart_syscall` 编号为 128，当前用于 nanosleep 和带超时 FUTEX_WAIT 的绝对 deadline 重启；它不是可由用户任意伪造的通用成功存根。
 - RISC-V 使用 asm-generic syscall 编号，没有独立 dup2；musl 经 dup3 实现相应调用。编号 33 是 mknodat，支持普通文件、字符／块节点和 FIFO 创建。
@@ -131,6 +132,92 @@ LA 的 rt_sigaction(134)/rt_sigreturn(139) 已接入共用信号策略；trap从
 解码并由LA后端恢复ERA/GPR和mask。完整整数frame、privileged状态边界和未支持
 扩展见[信号模块](kernel-signal.md)。真实静态musl pthread取消使用这一返回路径；
 FP/SIMD、动态musl与备用信号栈已接入；各接口的扩展边界见对应模块，未知syscall返回ENOSYS。
+
+### seccomp 系统调用过滤
+
+`seccomp(277)` 与 `PR_SET_SECCOMP`/`PR_GET_SECCOMP` 提供线程级 STRICT 和
+FILTER。STRICT 只允许 `read/write/exit/rt_sigreturn`，其他调用直接以 SIGKILL
+终止当前线程（不是整个线程组，也不执行被拒绝调用）。FILTER 安装需要
+`no_new_privs` 或 CAP_SYS_ADMIN；模式不能关闭或互相转换，过滤链只能追加。
+
+FILTER 支持常量返回 ALLOW、ERRNO、TRAP、TRACE、KILL_THREAD、KILL_PROCESS。
+ERRNO 数据截到 Linux 的 4095 上限，并直接返回用户态；即使值为 512 等
+内核 restart 编码，也不能触发自动重启；拒绝调用同时终结待处理的
+restart block，避免稍后的信号交付改写已完成调用的返回值和 PC。多个过滤器按有符号 action 优先级选择，
+同优先级保留最新过滤器的数据。未知 action 在最终选中时按 Linux 终止整个
+线程组，不能当 ALLOW。已知但尚未实现的 LOG、USER_NOTIF，以及
+动态 `RET A`，在安装时返回 `EOPNOTSUPP`，并不冒充完整 Linux FILTER 支持。
+安装 flags 支持 TSYNC；NEW_LISTENER、TSYNC_ESRCH 等其余位返回 `EINVAL`；
+GET_ACTION_AVAIL 只对上述六种 action 成功，GET_NOTIF_SIZES 尚不支持。
+
+TRAP 不执行系统调用，向触发线程强制投递 SIGSYS/SYS_SECCOMP，携带完整的
+调用号、AUDIT_ARCH、恢复 PC 及低 16 位策略数据（si_errno）。RV64/LA64 的
+a0 恢复到原始参数，处理器可在 ucontext 中写入模拟返回值；阻塞或忽略 SIGSYS
+不能绕过默认致命动作。复用同步信号槽，不为每次 TRAP 分配队列；ptrace 的
+信号交付停止可检查、编辑或抑制该信号，不能使已跳过的系统调用执行。
+
+TRACE 在启用 `PTRACE_O_TRACESECCOMP` 的跟踪关系中产生 SECCOMP 事件，
+消息为低 16 位策略数据；无跟踪者或未启用该选项时返回 ENOSYS。恢复后从
+真实寄存器重新读取调用号、原始 a0、其余参数和 PC，并重新检查最新过滤链，
+包含停止期间 TSYNC 发布的策略。重检 TRACE 只放行一次，不重复事件；
+ERRNO/TRAP/KILL 的较高优先级仍然生效。跟踪者把调用号改为负数时跳过执行，
+保留它设置的返回寄存器，且清除 restart block；致命恢复也不会执行调用。
+TRACE 将 `restart_syscall` 改为其他调用时终结原来的 timeout block，避免
+后续信号再改写替代调用的结果和 PC；未改号则保留它以继续原等待。
+普通 SECCOMP 事件恢复的附带信号不作为信号交付注入。实际 syscall-enter
+BPF 观测位于过滤及重检之后，使用最终调用号和参数。
+
+程序最多 4096 条指令，链路径上限 32768（每个旧过滤器额外计 4 条）。复用
+已有 cBPF 的前向控制流、除数、移位及 scratch 初始化验证；seccomp 另限制
+输入为 64 字节 `seccomp_data` 的本机字节序、四字节对齐读取，不经过 socket
+BPF 的网络字节序/包元数据解释路径，也不解引用用户参数中的指针。
+
+两个架构均在 ptrace syscall-enter 改号之后构造请求，并在公共 dispatcher
+的身份快速路径之前过滤；输入包含调用号、AUDIT_ARCH、恢复 PC 和完整六个
+64 位参数。未启用线程仅多一个 mode 判断；非 TRACE 事件的启用路径只遍历不可变链，不在
+每次调用分配、取全局锁或更新引用计数。fork/clone 共享链引用，exec（包括
+非 leader exec）保留当前线程自己的策略，无 TSYNC 的追加不改变兄弟线程；失败
+clone 与退出均在任务最终销毁时归还引用。KILL_THREAD 使用独立的线程终止
+入口，避免普通致命信号的整组退出语义。
+
+TSYNC 在调度域内先检查所有未退出线程，再一次提交全部叶指针和调用者的
+no_new_privs。目标必须尚未启用过滤，或持有调用者当前链的同一节点/祖先；
+指令相同但独立安装的节点不算祖先。不能同步时返回失败线程的正 TID，
+不安装调用者的新过滤器，也不改变其他线程。路径超限、复制或分配失败同样
+没有部分修改。每条旧链都仍由新链持有，启用线程只需 acquire 读取叶指针，
+不增加逐调用引用或全局锁；未启用线程只做 relaxed mode 读取。
+
+clone 准备资源后，在发布线程/进程的同一临界区继承最新过滤链和
+no_new_privs，避免准备期间的 TSYNC 被旧快照覆盖。TSYNC 等待已经开始的
+exec 凭据决策结束，普通信号延后交付；组退出或成功 exec 可以直接取消该
+等待，使退出线程不会反过来阻塞 exec。借用目标线程覆盖等待队列寿命。
+只在安装与生命周期交接取调度锁，不暂停整个线程组执行已进入的 syscall。
+
+语义核对依据 Linux v6.12 `kernel/seccomp.c` 与官方
+[Seccomp BPF 文档](https://docs.kernel.org/userspace-api/seccomp_filter.html)。
+`tests/workloads/seccomp/basic.c` 是 Linux/BoarOS 同源用例，覆盖安装错误、
+权限、参数/PC、组合优先级、ptrace 改号、fork/exec、线程独立性、线程/整组
+终止与 STRICT；受宿主策略限制的 STRICT/ptrace 会明确报告跳过。
+信号用例覆盖 TRAP 元数据、返回寄存器、线程隔离、阻塞/忽略和 ptrace 抑制，
+以及 handler 内过滤、STRICT 下的 rt_sigreturn、相对 nanosleep 与限时
+FUTEX_WAIT 经 STOP/CONT 后 restart_syscall 被拒绝和后续信号的恢复 PC/a0。
+其他阻塞 syscall 的自动重启路径尚未进行动态定向验证。
+`tests/userland/seccomp.py` 使用已编译 ELF 与内核在两架构启动；
+`make test-seccomp-host` 验证生产解释器、安装 OOM、祖先链和共享引用；
+生产调度安装与 exec 状态检查另覆盖准备前、复查后至 park、COMMITTED、
+finish 后的终止窗口，以及并行安装。fixture 替换机器等待边界，不代表真实
+clone/exec 的所有失败阶段。Linux/BoarOS 同源 `tests/workloads/seccomp/tsync.c`
+覆盖线程组传播、失败 TID、无部分修改、STRICT 兄弟线程、并行安装、
+clone 发布和非组长 exec；可交给同一 `tests/userland/seccomp.py` 启动。
+`tests/workloads/seccomp/trace.c` 覆盖事件数据及截短复制、ENTRY/SECCOMP/EXIT
+顺序、改号与参数、二次 TRACE、较高优先级动作、负调用号/内部 restart 数值、
+后续信号 PC、事件中修改恢复 PC、LA 原始参数槽、致命停止的零写副作用、
+停止期间 TSYNC、fork 继承及 exec、事件中 DETACH 和 tracer 退出（包括
+EXITKILL 零写副作用）。nanosleep/FUTEX_WAIT 的 STOP/CONT 用例同时检查
+restart_syscall 改号成功后的信号 PC/a0 和未改号时继续原等待。BPF 观测直接检查改号后的 enter 参数及
+拒绝路径不产生 enter。Linux 宿主禁止
+ptrace 时只运行无跟踪者行为并明确跳过事件用例；RV/LA guest 执行事件路径。
+
 
 ## 双架构 ABI 差分入口
 

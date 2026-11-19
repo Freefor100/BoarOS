@@ -41,6 +41,12 @@ int ext4_orphan_prepare_change(struct ext4_inode_ref *inode);
 int ext4_orphan_mark_truncate(struct ext4_inode_ref *, bool pending);
 int ext4_orphan_add(struct ext4_inode_ref *inode);
 int ext4_orphan_remove(struct ext4_inode_ref *inode);
+/* Apply the same geometry and reserved-inode checks when an operation
+ * reclaims its target without publishing an orphan record. */
+int ext4_orphan_check_user_inode(struct ext4_fs *fs, uint32_t inode);
+/* Final zero-link reclaim. The caller has retired mappings and must abort
+ * this operation on error. The writable inode bitmap verifies allocation. */
+int ext4_orphan_remove_and_free(struct ext4_inode_ref *);
 
 /* Change only the in-memory superblock marker. Clearing requires no remaining
  * orphan records; returns ENOTEMPTY otherwise. The caller journals the change.

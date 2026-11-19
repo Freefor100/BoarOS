@@ -1,4 +1,8 @@
+#if defined(__riscv)
+#include <arch/riscv/vector.h>
+#endif
 #include <kernel/credentials.h>
+#include <kernel/seccomp.h>
 #include <kernel/scheduler.h>
 #include "private.h"
 #include <kernel/namespace.h>
@@ -29,6 +33,7 @@ static void lookup_end(struct kernel_task **task)
 #define LINUX_CLONE_FS UINT64_C(0x200)
 #define LINUX_CLONE_FILES UINT64_C(0x400)
 #define LINUX_CLONE_SIGHAND UINT64_C(0x800)
+#define LINUX_CLONE_THREAD UINT64_C(0x10000)
 #define LINUX_CLONE_CLEAR_SIGHAND UINT64_C(0x100000000)
 #define LINUX_CLONE_PTRACE UINT64_C(0x2000)
 #define LINUX_CLONE_VFORK UINT64_C(0x4000)
@@ -43,6 +48,20 @@ enum kernel_syscall_status syscall_handle_prctl(
     struct kernel_syscall_result *decoded)
 {
     uint32_t option = (uint32_t)request->arguments[0];
+#if defined(__riscv)
+    if(option==69 || option==70) {
+        decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value=riscv_vector_control(caller,option,request->arguments[1]);
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+#endif
+    if (option==21U || option==22U) {
+        decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value=option==21U ? __atomic_load_n(&caller->seccomp_mode,__ATOMIC_ACQUIRE) :
+            kernel_seccomp_set(caller,(uint32_t)request->arguments[1],0,
+                (uint32_t)request->arguments[1]==1 ? 0 : request->arguments[2]);
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
     if (option != 1U && option != 2U && option != 15U && option != 16U &&
         option != 36U && option != 37U)
         return syscall_handle_prctl_credentials(caller, request, decoded);
@@ -180,7 +199,7 @@ enum kernel_syscall_status syscall_handle_prlimit64(
     }
     target = pid == 0 ? caller :
              pid > 0 && pid <= INT32_MAX
-                 ? kernel_task_find_by_tid((kernel_pid_t)pid) : 0;
+                 ? kernel_task_find_user_tid(caller,(kernel_pid_t)pid) : 0;
     struct kernel_task *lookup __attribute__((cleanup(lookup_end))) = pid > 0 ? target : 0;
     if (target == 0) {
         decoded->value = -KERNEL_ESRCH;
@@ -233,7 +252,7 @@ enum kernel_syscall_status syscall_handle_get_robust_list(
 {
     int32_t pid = (int32_t)(uint32_t)request->arguments[0];
     struct kernel_task *target = pid == 0 ? caller :
-                                 pid > 0 ? kernel_signal_find_by_tid(pid) : 0;
+                                 pid > 0 ? kernel_signal_find_user_tid(pid) : 0;
     struct kernel_mm *mm;
     uint64_t length = 3U * sizeof(uint64_t);
     uint64_t head;
@@ -325,6 +344,7 @@ void syscall_decode_clone(const struct kernel_syscall_request *request,
 
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     if ((flags & ~LINUX_CLONE_KNOWN_FLAGS) != 0U ||
+        ((flags & KERNEL_NS_PID) && (flags & LINUX_CLONE_THREAD)) ||
         ((flags & LINUX_CLONE_NEWNS) && (flags & (LINUX_CLONE_FS | UINT64_C(0x10000)))) ||
         ((flags & UINT64_C(0x401000)) == UINT64_C(0x401000)) ||
         ((flags & UINT64_C(0x10000)) && !(flags & UINT64_C(0x800))) ||
@@ -345,7 +365,7 @@ void syscall_decode_clone(const struct kernel_syscall_request *request,
     }
     /* A fork child owns its private child-TID store and exit clear. */
     uint64_t process_flags = flags & ~(LINUX_CLONE_PTRACE | LINUX_CLONE_UNTRACED |
-        LINUX_CLONE_SIGNAL_MASK | LINUX_CLONE_FS | LINUX_CLONE_FILES | LINUX_CLONE_CLEAR_SIGHAND | LINUX_CLONE_NEWNS | KERNEL_NS_UTS | KERNEL_NS_IPC | UINT64_C(0x80001000) |
+        LINUX_CLONE_SIGNAL_MASK | LINUX_CLONE_FS | LINUX_CLONE_FILES | LINUX_CLONE_CLEAR_SIGHAND | LINUX_CLONE_NEWNS | KERNEL_NS_UTS | KERNEL_NS_IPC | KERNEL_NS_PID | UINT64_C(0x80001000) |
         UINT64_C(0x40000) | UINT64_C(0x80000) | UINT64_C(0x100000) |
         LINUX_CLONE_CHILD_SETTID | LINUX_CLONE_CHILD_CLEARTID);
     if (process_flags != 0 && process_flags != LINUX_CLONE_VM &&
@@ -372,6 +392,15 @@ enum kernel_syscall_status syscall_handle_reboot(struct kernel_task *caller,
     int error=kernel_reboot_decode((uint32_t)request->arguments[0],(uint32_t)request->arguments[1],
         (uint32_t)request->arguments[2],&action);
     if(error){decoded->value=error;return KERNEL_SYSCALL_STATUS_OK;}
+    /* Linux handles a nested PID namespace before importing RESTART2's
+     * machine command. Its successful caller exits only this thread. */
+    { KERNEL_SERVICE_SCOPE(service);
+      int nested=kernel_task_reboot_namespace(caller,action);
+      if(nested) {
+          decoded->value=nested<0?nested:0;
+          if(nested>0)decoded->action=KERNEL_SYSCALL_ACTION_EXIT;
+          return KERNEL_SYSCALL_STATUS_OK;
+      } }
     char command[KERNEL_REBOOT_COMMAND_SIZE]={0};
     if((uint32_t)request->arguments[2]==KERNEL_REBOOT_CMD_RESTART2) {
         struct kernel_mm *mm;size_t length=0;
@@ -408,13 +437,15 @@ enum kernel_syscall_status syscall_handle_setns(struct kernel_task *caller,
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
-enum kernel_syscall_status syscall_handle_clone3(struct kernel_task *caller,
-    struct kernel_syscall_request *request, struct kernel_syscall_result *decoded)
+struct clone3_args {
+    uint64_t flags, pidfd, child_tid, parent_tid, exit_signal;
+    uint64_t stack, stack_size, tls, set_tid, set_tid_size, cgroup;
+};
+
+static enum kernel_syscall_status import_clone3(struct kernel_task *caller,
+    const struct kernel_syscall_request *request, struct kernel_syscall_result *decoded,
+    struct clone3_args *args, int32_t *requested)
 {
-    struct clone3_args {
-        uint64_t flags, pidfd, child_tid, parent_tid, exit_signal;
-        uint64_t stack, stack_size, tls, set_tid, set_tid_size, cgroup;
-    } args = {0};
     const uint64_t address = request->arguments[0], size = request->arguments[1];
     size_t copied;
     struct kernel_mm *mm;
@@ -423,8 +454,8 @@ enum kernel_syscall_status syscall_handle_clone3(struct kernel_task *caller,
     if (size < 64U) { decoded->value = -KERNEL_EINVAL; return KERNEL_SYSCALL_STATUS_OK; }
     if (kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK)
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-    size_t length = size < sizeof(args) ? (size_t)size : sizeof(args);
-    for (uint64_t offset=sizeof(args); offset<size;) {
+    size_t length = size < sizeof(*args) ? (size_t)size : sizeof(*args);
+    for (uint64_t offset=sizeof(*args); offset<size;) {
         unsigned char tail[64];
         size_t count = size-offset < sizeof(tail) ? (size_t)(size-offset) : sizeof(tail);
         if (address > UINT64_MAX-offset || kernel_copy_from_user(mm,tail,address+offset,count,&copied) != KERNEL_UACCESS_STATUS_OK || copied != count) {
@@ -433,45 +464,53 @@ enum kernel_syscall_status syscall_handle_clone3(struct kernel_task *caller,
         for(size_t i=0;i<count;i++) if(tail[i]) { decoded->value=-KERNEL_E2BIG; return KERNEL_SYSCALL_STATUS_OK; }
         offset+=count;
     }
-    if (kernel_copy_from_user(mm, &args, address, length, &copied) != KERNEL_UACCESS_STATUS_OK || copied != length) {
+    if (kernel_copy_from_user(mm, args, address, length, &copied) != KERNEL_UACCESS_STATUS_OK || copied != length) {
         decoded->value = -KERNEL_EFAULT; return KERNEL_SYSCALL_STATUS_OK;
     }
-    if (args.set_tid_size > 32U || (!!args.set_tid != !!args.set_tid_size) ||
-        (args.exit_signal & ~UINT64_C(0xff)) ||
-        ((args.flags & UINT64_C(0x200000000)) && (size < sizeof(args) || args.cgroup > INT32_MAX))) {
+    if (args->set_tid_size > KERNEL_PID_NAMESPACE_MAX_DEPTH || (!!args->set_tid != !!args->set_tid_size) ||
+        (args->exit_signal & ~UINT64_C(0xff)) ||
+        ((args->flags & UINT64_C(0x200000000)) && (size < sizeof(*args) || args->cgroup > INT32_MAX))) {
         decoded->value=-KERNEL_EINVAL; return KERNEL_SYSCALL_STATUS_OK;
     }
-    if (args.set_tid) {
-        uint32_t requested[32];
-        size_t count=(size_t)args.set_tid_size*sizeof(requested[0]);
-        if (kernel_copy_from_user(mm,requested,args.set_tid,count,&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=count) {
+    if (args->set_tid) {
+        size_t count=(size_t)args->set_tid_size*sizeof(requested[0]);
+        if (kernel_copy_from_user(mm,requested,args->set_tid,count,&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=count) {
             decoded->value=-KERNEL_EFAULT; return KERNEL_SYSCALL_STATUS_OK;
         }
     }
-    if ((args.flags & UINT64_C(0xff)) || (args.flags & UINT64_C(0x400000)) ||
-        ((args.flags & UINT64_C(0x18000)) && args.exit_signal) ||
-        ((args.flags & UINT64_C(0x100000800)) == UINT64_C(0x100000800)) ||
-        ((args.stack == 0) != (args.stack_size == 0)) ||
-        (args.stack && kernel_user_range_check(args.stack,args.stack_size) != KERNEL_UACCESS_STATUS_OK)) {
+    if ((args->flags & UINT64_C(0xff)) || (args->flags & UINT64_C(0x400000)) ||
+        ((args->flags & UINT64_C(0x18000)) && args->exit_signal) ||
+        ((args->flags & UINT64_C(0x100000800)) == UINT64_C(0x100000800)) ||
+        ((args->stack == 0) != (args->stack_size == 0)) ||
+        (args->stack && kernel_user_range_check(args->stack,args->stack_size) != KERNEL_UACCESS_STATUS_OK)) {
         decoded->value=-KERNEL_EINVAL; return KERNEL_SYSCALL_STATUS_OK;
     }
-    if ((args.flags & UINT64_C(0x1000)) && (args.flags & UINT64_C(0x100000)) && args.pidfd==args.parent_tid) {
+    if ((args->flags & UINT64_C(0x1000)) && (args->flags & UINT64_C(0x100000)) && args->pidfd==args->parent_tid) {
         decoded->value=-KERNEL_EINVAL; return KERNEL_SYSCALL_STATUS_OK;
     }
-    if (args.set_tid || (args.flags & UINT64_C(0x200000000))) {
-        decoded->value=-KERNEL_EOPNOTSUPP; return KERNEL_SYSCALL_STATUS_OK;
-    }
-    struct kernel_syscall_request legacy={.arguments={args.flags|args.exit_signal}};
+    struct kernel_syscall_request legacy={.arguments={(args->flags & ~UINT64_C(0x200000000))|args->exit_signal}};
     syscall_decode_clone(&legacy,decoded);
-    if (decoded->action == KERNEL_SYSCALL_ACTION_CLONE) {
-        request->arguments[0]=legacy.arguments[0];
-        request->arguments[1]=args.stack ? args.stack+args.stack_size : 0;
-        request->arguments[2]=args.parent_tid;
-        request->arguments[3]=args.tls;
-        request->arguments[4]=args.child_tid;
-        request->arguments[5]=args.pidfd;
-    }
     return KERNEL_SYSCALL_STATUS_OK;
+}
+
+/* The array lives until clone finishes, including preparation retries. Neither
+ * legacy clone nor unrelated syscalls carry the array in their stack frame. */
+enum kernel_scheduler_status kernel_clone3_current(const struct arch_trap_frame *frame,
+    struct kernel_task *caller, const struct kernel_syscall_request *request, int64_t *result)
+{
+    struct kernel_syscall_result decoded;
+    struct clone3_args args = {0};
+    int32_t requested[KERNEL_PID_NAMESPACE_MAX_DEPTH];
+    if (import_clone3(caller, request, &decoded, &args, requested))
+        return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
+    if (decoded.action != KERNEL_SYSCALL_ACTION_CLONE) {
+        *result = decoded.value;
+        return KERNEL_SCHEDULER_STATUS_OK;
+    }
+    int32_t cgroup_fd = args.flags & UINT64_C(0x200000000) ? (int32_t)args.cgroup : -1;
+    return arch_process_clone_current(frame, args.flags | args.exit_signal, args.stack + args.stack_size,
+        args.parent_tid, args.tls, args.child_tid, args.pidfd, requested, args.set_tid_size,
+        cgroup_fd, result);
 }
 
 enum kernel_syscall_status syscall_handle_setpgid(struct kernel_task *caller,

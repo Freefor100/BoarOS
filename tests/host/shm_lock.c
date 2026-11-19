@@ -1,5 +1,6 @@
 /* Real SHM storage and UID accounts; only task identity and user copies are modeled. */
 #include <kernel/shm.h>
+#include "../../kernel/sched/private.h"
 #include <kernel/credentials.h>
 #include <kernel/errno.h>
 #include <kernel/heap.h>
@@ -16,6 +17,8 @@
 #define IPC_FIXTURE_SHM
 #include "ipc_namespace_fixture.h"
 void mm_test_attach(unsigned);
+static struct kernel_task *identity_caller;
+struct kernel_task *__wrap_kernel_task_current(void) {return identity_caller;}
 static unsigned char pool[16*1024*1024] __attribute__((aligned(16384)));
 static struct physical_page_allocator pages;
 static struct kernel_heap heap;
@@ -220,10 +223,10 @@ static void namespace_lifetime(void)
     assert(kernel_shm_get(0,321,BOAROS_PAGE_SIZE,KERNEL_IPC_CREAT|0600,&first)==-KERNEL_ENOMEM);
     assert(!kernel_ipc_namespace_state(left)->shm);
     assert(!kernel_shm_get(0,321,BOAROS_PAGE_SIZE,KERNEL_IPC_CREAT|0600,&first));
-    assert(!kernel_shm_at_mm((struct kernel_mm *)1,123,first,0,0,&address));
+    assert(!kernel_shm_at_mm((struct kernel_mm *)1,NULL,first,0,0,&address));
     struct kernel_shm_attachment *old=mapped[0];assert(old&&old->namespace==left);
     assert(!ctl(first,KERNEL_IPC_RMID,0));
-    assert(!kernel_shm_at_mm((struct kernel_mm *)1,123,first,0,0,&address));
+    assert(!kernel_shm_at_mm((struct kernel_mm *)1,NULL,first,0,0,&address));
     assert(mapped[1]->segment==old->segment&&old->segment->nattch==2);
     host_ipc_namespace=right;
     assert(!kernel_shm_get(0,321,BOAROS_PAGE_SIZE,KERNEL_IPC_CREAT|0600,&second)&&second==first);
@@ -241,6 +244,64 @@ static void namespace_lifetime(void)
     kernel_heap_get_statistics(&heap,&after);assert(before.live_allocations==after.live_allocations);
     puts("SHM namespace isolation, RMID reattach and old attachment/fork identity PASS");
 }
+static void pid_views(void)
+{
+    struct kernel_task actors[4];memset(actors,0,sizeof(actors));
+    struct {struct kernel_pid id;struct kernel_pid_binding ancestor;} owners[4];memset(owners,0,sizeof(owners));
+    struct kernel_pid_allocator numbers[2]={0};struct kernel_pid_registry spaces[2]={0};
+    uint64_t root_bits[KERNEL_PID_BITMAP_WORDS(64)]={0},bits[2][KERNEL_PID_BITMAP_WORDS(64)]={0};
+    assert(!kernel_pid_allocator_init(&scheduler.pid_allocator,root_bits,64));
+    assert(!kernel_pid_registry_init(&scheduler.identities,&scheduler.pid_allocator,NULL));
+    for(unsigned i=0;i<2;i++){
+        assert(!kernel_pid_allocator_init(&numbers[i],bits[i],64));
+        assert(!kernel_pid_registry_init(&spaces[i],&numbers[i],&scheduler.identities));
+    }
+    for(unsigned i=0;i<3;i++){
+        actors[i].group_leader=&actors[i];
+        KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+        assert(!kernel_pid_reserve_numbers(i?&spaces[i-1]:&scheduler.identities,&owners[i].id,sizeof(owners[i]),NULL,0));
+        assert(!kernel_pid_publish_reserved(&owners[i].id));
+        kernel_pid_attach(&actors[i].identities[KERNEL_PID_TID],&owners[i].id,KERNEL_PID_TID,&actors[i]);
+        kernel_pid_attach(&actors[i].identities[KERNEL_PID_TGID],&owners[i].id,KERNEL_PID_TGID,&actors[i]);
+    }
+    identity_caller=&actors[1];int id=segment(BOAROS_PAGE_SIZE);struct kernel_shmid64_ds row;
+    assert(!ctl(id,KERNEL_IPC_STAT,&row)&&row.shm_cpid==1&&!row.shm_lpid);
+    identity_caller=&actors[2];uint64_t address=0;
+    assert(!kernel_shm_at_mm((struct kernel_mm *)1,identity_caller,id,0,0,&address));
+    assert(!ctl(id,KERNEL_IPC_STAT,&row)&&!row.shm_cpid&&row.shm_lpid==1);
+    uint32_t cursor=0;int32_t row_id;uint64_t rss;
+    assert(kernel_shm_proc_next(kernel_ipc_initial(),&spaces[0],&cursor,&row_id,&row,&rss)&&row_id==id&&row.shm_cpid==1&&!row.shm_lpid);
+    cursor=0;assert(kernel_shm_proc_next(kernel_ipc_initial(),&scheduler.identities,&cursor,&row_id,&row,&rss)&&row.shm_cpid==2&&row.shm_lpid==3);
+
+    identity_caller=&actors[1];assert(!ctl(id,KERNEL_IPC_STAT,&row)&&row.shm_cpid==1&&!row.shm_lpid);
+    identity_caller=&actors[0];
+    kernel_pid_t old=kernel_pid_number_in(&owners[1].id,&scheduler.identities);
+    assert(!ctl(id,KERNEL_IPC_STAT,&row)&&row.shm_cpid==old&&row.shm_lpid==3);
+    /* An asynchronous cleanup worker must account the departing actor. */
+    kernel_shm_attachment_close_for_task(mapped[0],&actors[1]);mapped[0]=NULL;
+    assert(!ctl(id,KERNEL_IPC_STAT,&row)&&row.shm_lpid==old&&!row.shm_nattch);
+    assert(owners[1].id.references==5&&owners[2].id.references==3);
+    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+     kernel_pid_detach(&actors[1].identities[KERNEL_PID_TID]);
+     kernel_pid_detach(&actors[1].identities[KERNEL_PID_TGID]);
+     kernel_pid_t exact[]={1,old};
+     assert(!kernel_pid_reserve_numbers(&spaces[0],&owners[3].id,sizeof(owners[3]),exact,2));
+     assert(!kernel_pid_publish_reserved(&owners[3].id));
+     kernel_pid_attach(&actors[3].identities[KERNEL_PID_TID],&owners[3].id,KERNEL_PID_TID,&actors[3]);}
+    assert(!ctl(id,KERNEL_IPC_STAT,&row)&&row.shm_cpid==old&&row.shm_lpid==old);
+    assert(owners[1].id.references==3&&owners[3].id.references==2);
+    assert(!ctl(id,KERNEL_IPC_RMID,NULL)&&owners[1].id.references==1);
+    identity_caller=NULL;
+    {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
+     for(unsigned i=0;i<4;i++)for(unsigned role=0;role<KERNEL_PID_ROLES;role++)
+         if(actors[i].identities[role].identity)kernel_pid_detach(&actors[i].identities[role]);
+     for(unsigned i=0;i<4;i++)kernel_pid_put(&owners[i].id);
+     unsigned n=0;while(kernel_pid_take_retired(&scheduler.identities))n++;assert(n==4);
+     for(unsigned i=0;i<2;i++){assert(!numbers[i].allocated);kernel_pid_registry_put(&spaces[i]);}
+     n=0;while(kernel_pid_take_retired_namespace(&scheduler.identities))n++;assert(n==2);
+     assert(!scheduler.pid_allocator.allocated);}
+    puts("SHM production PID identities ancestor/sibling/reuse and cleanup actor owner PASS");
+}
 int main(void)
 {
     mm_test_attach(0);
@@ -251,6 +312,7 @@ int main(void)
     int status=ctl(id,KERNEL_SHM_LOCK,0);
     if(status){fprintf(stderr,"SHM_LOCK expected=0 actual=%d\n",status);return 1;}
     assert(!ctl(id,KERNEL_SHM_UNLOCK,0)&&!ctl(id,KERNEL_IPC_RMID,0));
+    pid_views();
     queries();
     lifecycle();
     namespace_lifetime();

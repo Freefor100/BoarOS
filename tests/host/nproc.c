@@ -1,6 +1,7 @@
 #include "../../kernel/sched/private.h"
 #include <kernel/credentials.h>
 #include <kernel/errno.h>
+#include <kernel/namespace.h>
 #include <assert.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -13,6 +14,7 @@ struct kernel_raw_lock kernel_wait_domain={.rank=KERNEL_RAW_RANK_SCHEDULER,.init
 static struct kernel_heap heap;
 static unsigned live;
 void *sync_test_cpu(void){return &cpu;}
+void *sync_test_current_task(void){return cpu.current;}
 void kernel_cpu_flush_notifications(void){assert(!cpu.outbound);}
 enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t n,size_t size,void **out)
 {assert(h==&heap&&!cpu.raw_locks);*out=calloc(n,size);assert(*out);__atomic_add_fetch(&live,1,__ATOMIC_RELAXED);return 0;}
@@ -51,6 +53,24 @@ static void boundary(void)
     {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);scheduler_task_unlink_locked(&child);assert(parent.credentials->account->processes==1);scheduler_task_retire_locked(&child);}
     assert(child.retirement==2&&child.storage_borrows==1&&parent.credentials->account->processes==1);
     finish(&child);finish(&parent);assert(!live);
+}
+static void namespace_admission(void)
+{
+    struct kernel_task parent, child;
+    make_task(&parent,1008,1); make_task(&child,1008,1);
+    scheduler.initialized=KERNEL_SCHEDULER_INITIALIZED; cpu.current=&parent;
+    assert(!kernel_nproc_acquire(&parent,0));
+    const uint64_t flags[]={KERNEL_NS_PID,KERNEL_NS_UTS,KERNEL_NS_IPC,KERNEL_NS_MNT};
+    for(unsigned i=0;i<sizeof(flags)/sizeof(flags[0]);i++) {
+        parent.limits->values[KERNEL_RLIMIT_NPROC].current=1;
+        assert(process_clone_admit(&child,&parent,flags[i])==-KERNEL_EAGAIN);
+        assert(parent.credentials->account->processes==1 && !child.resource_flags);
+        parent.limits->values[KERNEL_RLIMIT_NPROC].current=2;
+        assert(process_clone_admit(&child,&parent,flags[i])==-KERNEL_EPERM);
+        release_charge(&child);
+        assert(parent.credentials->account->processes==1 && !child.resource_flags);
+    }
+    cpu.current=NULL; scheduler.initialized=0; finish(&child); finish(&parent); assert(!live);
 }
 static void exemptions(void)
 {
@@ -101,4 +121,4 @@ static void concurrent(void)
     assert(parent.credentials->account->processes==1);finish(&parent);assert(!live);assert(!pthread_barrier_destroy(&gate));
 }
 int main(void)
-{boundary();exemptions();transfer();concurrent();puts("NPROC quota/zombie/logical-reap/borrow/root/caps/UID-transfer/exec/concurrent/owners PASS");}
+{boundary();namespace_admission();exemptions();transfer();concurrent();puts("NPROC quota/zombie/logical-reap/borrow/root/caps/UID-transfer/exec/concurrent/owners PASS");}

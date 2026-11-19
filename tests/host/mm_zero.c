@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 void mm_test_attach(unsigned);
-static unsigned char pool[4 * 1024 * 1024] __attribute__((aligned(4096)));
+static unsigned char pool[1024 * BOAROS_PAGE_SIZE] __attribute__((aligned(BOAROS_PAGE_SIZE)));
 static struct physical_page_allocator pages;
 static struct arch_mmu_page_table kernel;
 static unsigned access_calls, fences;
@@ -169,11 +169,16 @@ int main(void)
     uint64_t baseline = physical_page_available(&pages) + 1;
     struct arch_mmu_user_space parent = {0}, child = {0};
     assert(!arch_mmu_user_space_init(&parent, &pages, &kernel));
+    struct kernel_mm_leaf leaf;
+    unsigned missing;
+    assert(arch_mmu_user_leaf_probe(&parent,0x40000,&leaf,&missing)==ARCH_MMU_STATUS_NOT_MAPPED && missing==3);
     struct kernel_mm_leaf_preparation prepared = KERNEL_MM_LEAF_PREPARATION_INIT;
     prepared.tables[0] = 0; prepared.tables[1] = allocate();
     uint64_t data = allocate();
     assert(!arch_mmu_user_map_prepared_page(&parent, 0x40000, data,
         ARCH_MMU_READ | ARCH_MMU_WRITE, 0, &prepared));
+    assert(arch_mmu_user_leaf_probe(&parent,0x200000,&leaf,&missing)==ARCH_MMU_STATUS_NOT_MAPPED && missing==2);
+    assert(arch_mmu_user_leaf_probe(&parent,0x40000+BOAROS_PAGE_SIZE,&leaf,&missing)==ARCH_MMU_STATUS_NOT_MAPPED && !missing);
     assert(prepared.tables[0] == KERNEL_MM_NO_PAGE && prepared.tables[1] == KERNEL_MM_NO_PAGE);
     struct arch_mmu_mapping mapping;
     assert(!arch_mmu_user_lookup(&parent, 0x40000, &mapping) && mapping.physical_address == data);
@@ -182,31 +187,35 @@ int main(void)
     uint64_t cow_page=allocate();
     struct kernel_mm_leaf_preparation cow_tables=KERNEL_MM_LEAF_PREPARATION_INIT;
     unsigned cow_before=access_calls;
-    assert(!arch_mmu_user_map_prepared_page(&parent,0x41000,cow_page,
+    const uint64_t next_page = 0x40000 + BOAROS_PAGE_SIZE;
+    assert(!arch_mmu_user_map_prepared_page(&parent,next_page,cow_page,
         ARCH_MMU_READ|ARCH_MMU_WRITE,1,&cow_tables));
     unsigned cow_accesses=access_calls-cow_before;
-    assert(parent.cow_pages==1 && !arch_mmu_user_lookup(&parent,0x41000,&mapping) &&
+    assert(parent.cow_pages==1 && !arch_mmu_user_lookup(&parent,next_page,&mapping) &&
         !(mapping.permissions&ARCH_MMU_WRITE));
     uint64_t prepared_cookie,prepared_physical;
-    assert(!arch_mmu_user_cow_snapshot(&parent,0x41000,&prepared_cookie,&prepared_physical) && prepared_physical==cow_page);
-    assert(arch_mmu_user_map_prepared_page(&parent,0x41000,cow_page,
+    assert(!arch_mmu_user_cow_snapshot(&parent,next_page,&prepared_cookie,&prepared_physical) && prepared_physical==cow_page);
+    assert(!arch_mmu_user_leaf_probe(&parent,next_page,&leaf,&missing) && !missing &&
+        leaf.cow && leaf.cookie==prepared_cookie && leaf.physical_address==cow_page);
+    assert(arch_mmu_user_map_prepared_page(&parent,next_page,cow_page,
         ARCH_MMU_READ,1,&cow_tables)==ARCH_MMU_STATUS_CONFLICT && parent.cow_pages==1);
     struct kernel_mm_retirement cow_retired={0};
-    assert(!arch_mmu_user_cow_commit(&parent,0x41000,prepared_cookie,KERNEL_MM_NO_PAGE,
+    assert(!arch_mmu_user_cow_commit(&parent,next_page,prepared_cookie,KERNEL_MM_NO_PAGE,
         ARCH_MMU_READ|ARCH_MMU_WRITE,&cow_retired));
     assert(!cow_retired.count && !parent.cow_pages &&
-        !arch_mmu_user_lookup(&parent,0x41000,&mapping) && (mapping.permissions&ARCH_MMU_WRITE));
+        !arch_mmu_user_lookup(&parent,next_page,&mapping) && (mapping.permissions&ARCH_MMU_WRITE));
     printf("prepared COW page: direct physical accesses=%u; conflict and last-owner upgrade retain exact owners\n",cow_accesses);
-    detach(&parent,0x41000,0x42000,1);
+    detach(&parent,next_page,next_page + BOAROS_PAGE_SIZE,1);
     const uint64_t far = UINT64_C(0x1000000000);
     assert(!arch_mmu_user_map_zeroed_page(&parent,far,ARCH_MMU_READ|ARCH_MMU_WRITE));
     assert(!arch_mmu_user_protect_owned_page(&parent,far,0));
+    assert(!arch_mmu_user_leaf_probe(&parent,far,&leaf,&missing) && !missing && !leaf.permissions);
     uint64_t cursor = 0x40000, found;
-    assert(!arch_mmu_user_next_owned(&parent,&cursor,0x41000,&found) && found==0x40000);
+    assert(!arch_mmu_user_next_owned(&parent,&cursor,next_page,&found) && found==0x40000);
     unsigned before = access_calls;
-    assert(arch_mmu_user_next_owned(&parent,&cursor,0x41000,&found)==ARCH_MMU_STATUS_NOT_MAPPED &&
+    assert(arch_mmu_user_next_owned(&parent,&cursor,next_page,&found)==ARCH_MMU_STATUS_NOT_MAPPED &&
            access_calls==before);
-    cursor = 0x41000; before = access_calls;
+    cursor = next_page; before = access_calls;
     assert(arch_mmu_user_next_owned(&parent,&cursor,far,&found)==ARCH_MMU_STATUS_NOT_MAPPED &&
            cursor==far && access_calls-before<=3); /* 不进入 end 外的驻留子树。 */
     assert(!arch_mmu_user_next_owned(&parent,&cursor,far+BOAROS_PAGE_SIZE,&found) && found==far);

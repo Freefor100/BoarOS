@@ -6,6 +6,10 @@
 #include <pthread.h>
 /* These fixtures supply tmpfs/disk objects. A real procfs implementation, when
  * linked, overrides classification; selecting IPC without it is a fixture bug. */
+__attribute__((weak)) struct kernel_pid_registry *kernel_proc_view_acquire(void)
+{ assert(!"PID view is outside this fixture");return NULL; }
+__attribute__((weak)) void kernel_proc_view_release(struct kernel_pid_registry *view)
+{ (void)view;assert(!"PID view is outside this fixture"); }
 __attribute__((weak)) int kernel_procfs_ipc_file(const struct kernel_vfs_file *file)
 { (void)file;return 0; }
 __attribute__((weak)) struct kernel_namespace *kernel_task_ipc_namespace(void)

@@ -5,8 +5,10 @@
 
 #define KERNEL_MOUNT_OPTIONS_MAX 2048U
 struct kernel_namespace;
+struct kernel_pid_registry;
 struct kernel_mount_parameters {
     struct kernel_namespace *ipc_namespace;
+    struct kernel_pid_registry *pid_view;
     char type[64],source[KERNEL_FS_PATH_MAX],options[KERNEL_MOUNT_OPTIONS_MAX];
     uint64_t flags,mask;
 };

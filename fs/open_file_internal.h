@@ -14,6 +14,9 @@ struct kernel_block_device;
 struct kernel_async_io;
 struct kernel_namespace;
 
+int kernel_open_file_pread_mode(struct kernel_open_file_description *file,
+    uint64_t offset, void *buffer, size_t size, uint32_t status_flags, size_t *bytes_read);
+
 struct kernel_open_file_description {
     struct kernel_vfs_file file;
     struct kernel_open_file_description *cleanup_next;
@@ -24,7 +27,10 @@ struct kernel_open_file_description {
     uint64_t offset;
     uint64_t observed_writeback_error;
     uint64_t observed_mount_error;
-    uint64_t proc_identity;
+    union {
+        uint64_t proc_identity; /* Pathless socket/namespace inode, never a generated file. */
+        struct kernel_pid_registry *ipc_proc_pid_view; /* Valid iff ipc_proc_namespace != NULL. */
+    };
     uint32_t open_flags;
     uint32_t references;
     struct kernel_async_io *async_io; /* On demand; shared by all OFD aliases. */

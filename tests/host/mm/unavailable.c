@@ -8,8 +8,11 @@ __attribute__((weak)) uint64_t kernel_task_current_stack_limit(void) { return UI
 __attribute__((weak)) void kernel_task_current_memory_limits(struct kernel_memory_limits *out)
 { *out = (struct kernel_memory_limits){UINT64_MAX, UINT64_MAX, UINT64_MAX}; }
 #define EXCLUDED(name) void name(void) { mm_test_unavailable(); }
+#ifndef MM_TEST_SYSV_SHM
 EXCLUDED(kernel_shm_attachment_close)
+EXCLUDED(kernel_shm_attachment_close_for_task)
 EXCLUDED(kernel_shm_attachment_open)
+#endif
 EXCLUDED(kernel_elf64_source_release)
 EXCLUDED(kernel_elf64_source_acquire)
 EXCLUDED(kernel_elf64_source_page)
@@ -28,6 +31,7 @@ EXCLUDED(kernel_task_account_fault)
 EXCLUDED(kernel_vfs_node_lock)
 EXCLUDED(kernel_vfs_node_try_read)
 EXCLUDED(kernel_vfs_node_attributes)
+EXCLUDED(kernel_vfs_node_size)
 EXCLUDED(kernel_open_file_size)
 EXCLUDED(kernel_open_file_memory_backed)
 EXCLUDED(kernel_open_file_get_page_for_fault)
@@ -50,17 +54,20 @@ EXCLUDED(kernel_file_mapping_wait)
 EXCLUDED(kernel_file_mapping_stop)
 EXCLUDED(kernel_file_mapping_drain)
 EXCLUDED(kernel_tmpfs_check_domain)
+#ifndef MM_TEST_SYSV_SHM
 EXCLUDED(kernel_shm_attachment_acquire)
 EXCLUDED(kernel_shm_attachment_create)
 struct kernel_shm_attachment;
 void kernel_shm_attachment_release(struct kernel_shm_attachment **owner)
 { if (owner && *owner) mm_test_unavailable(); }
+#endif
 
 EXCLUDED(kernel_file_mapping_prepare)
 
 EXCLUDED(kernel_open_file_vfs_borrow)
 EXCLUDED(kernel_open_file_page_cache)
 EXCLUDED(kernel_open_file_prepare_mapping_page)
+EXCLUDED(kernel_open_file_try_prepare_disk_mapping_page)
 EXCLUDED(kernel_open_file_finish_mapping_page)
 EXCLUDED(kernel_open_file_check_mapping_domain)
 EXCLUDED(kernel_page_cache_alias_drain)
@@ -80,6 +87,7 @@ EXCLUDED(kernel_vfs_file_mincore_allowed)
 EXCLUDED(kernel_vfs_file_memory)
 EXCLUDED(kernel_page_cache_resident)
 EXCLUDED(kernel_page_cache_lookup)
+EXCLUDED(kernel_page_cache_lookup_ready)
 EXCLUDED(kernel_page_cache_acquire_ready)
 EXCLUDED(kernel_open_file_speculative_read_allowed)
 

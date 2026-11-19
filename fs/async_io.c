@@ -90,7 +90,7 @@ static int owner_number(const struct kernel_async_io *async)
     enum kernel_pid_role role=async->owner_type==0?KERNEL_PID_TID:
         async->owner_type==1?KERNEL_PID_TGID:KERNEL_PID_PGID;
     KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-    return async->owner->members[role]?async->owner->number:0;
+    return async->owner->members[role]?kernel_task_identity_user_number(async->owner):0;
 }
 
 static void replace_owner(struct kernel_async_io *async,struct kernel_pid *owner,int type)
@@ -128,7 +128,7 @@ int64_t kernel_open_file_async_fcntl(struct kernel_open_file_description *file,u
     if (command==KERNEL_FILES_F_SETOWN || command==KERNEL_FILES_F_SETOWN_EX) {
         struct kernel_pid *owner=NULL;
         if (number) {
-            int error=kernel_task_identity_get(number,&owner);
+            int error=kernel_task_identity_get_user(number,&owner);
             if (error) return error;
         }
         KERNEL_LOCK_SCOPE(configure);kernel_mutex_lock(&async->configure,&configure);

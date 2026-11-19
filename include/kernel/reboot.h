@@ -16,6 +16,10 @@ enum kernel_reboot_action {
     KERNEL_REBOOT_POWER_OFF,
 };
 
+struct kernel_task;
+/* 0: initial namespace; 1: nested request consumed; negative: error. */
+int kernel_task_reboot_namespace(struct kernel_task *,enum kernel_reboot_action);
+
 /* Capability checking precedes this decoder in the syscall layer. */
 int kernel_reboot_decode(uint32_t magic1, uint32_t magic2, uint32_t command,
                          enum kernel_reboot_action *action);

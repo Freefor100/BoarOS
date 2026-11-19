@@ -225,7 +225,11 @@ static void local_user_copy(int fd)
     CHECK(tail>=0 && write(tail,"short file",10)==10 && !fsync(tail));
     CHECK(!posix_fadvise(tail,0,0,POSIX_FADV_DONTNEED));
     unsigned char *mapped=mmap(NULL,page,PROT_READ,MAP_PRIVATE,tail,0);
-    CHECK(mapped!=MAP_FAILED && !memcmp(mapped,"short file",10));
+    unsigned char resident, eof[32];
+    CHECK(mapped!=MAP_FAILED && !mincore(mapped,page,&resident) && !(resident&1));
+    CHECK(lseek(tail,10,SEEK_SET)==10 && read(tail,eof,sizeof(eof))==0 && lseek(tail,0,SEEK_CUR)==10);
+    CHECK(!mincore(mapped,page,&resident) && !(resident&1));
+    CHECK(!memcmp(mapped,"short file",10));
     for(size_t i=10;i<page;i++)CHECK(!mapped[i]);
     unsigned char *suffix=malloc(page);CHECK(suffix);memset(suffix,0xa7,page);
     CHECK(pread(tail,suffix,page,0)==10 && !memcmp(suffix,"short file",10));

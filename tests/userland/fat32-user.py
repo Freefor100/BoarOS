@@ -10,6 +10,7 @@ import re
 import shutil
 import struct
 import subprocess
+import zlib
 
 from arch_profiles import PROFILES
 
@@ -40,6 +41,7 @@ def main():
     parser.add_argument('--kernel', type=Path)
     parser.add_argument('--qemu')
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--gpt', action='store_true', help='boot-discover GPT partition 2 instead of MBR')
     parser.add_argument('--storage-cost', action='store_true', help='prepare loop backing and validate the fixed storage-path workload')
     parser.add_argument('--prepare-only', action='store_true', help='save preboot images for matched kernel comparisons')
     parser.add_argument('--cpus', type=int, choices=(1, 2, 4), default=1)
@@ -76,10 +78,32 @@ def main():
                      b'\xfe\xff\xff', 2048, 64 * MIB // 512)
     mbr[510:512] = b'\x55\xaa'
     with disk.open('wb') as stream, partition.open('rb') as source:
-        stream.truncate(65 * MIB)
+        stream.truncate((66 if args.gpt else 65) * MIB)
         stream.write(mbr)
         stream.seek(MIB)
         shutil.copyfileobj(source, stream)
+    if args.gpt:
+        # Independent Python/zlib fixture: primary and backup GPT, sparse slot 2.
+        end = 66 * MIB // 512 - 1
+        table = bytearray(128 * 128)
+        table[128:144] = bytes.fromhex('28732ac11ff8d211ba4b00a0c93ec93b')
+        table[144:160] = bytes.fromhex('102030405060708090a0b0c0d0e0f001')
+        struct.pack_into('<QQ', table, 160, 2048, 2048 + 64 * MIB // 512 - 1)
+        pmbr = bytearray(512)
+        struct.pack_into('<B3sB3sII', pmbr, 446, 0, b'\x00\x02\x00', 0xee,
+                         b'\xff\xff\xff', 1, end)
+        pmbr[510:512] = b'\x55\xaa'
+        with disk.open('r+b') as stream:
+            stream.write(pmbr)
+            for here, other, entries in ((1, end, 2), (end, 1, end - 32)):
+                header = bytearray(512)
+                struct.pack_into('<8sIIIIQQQQ16sQIII', header, 0, b'EFI PART', 0x10000,
+                                 92, 0, 0, here, other, 34, end - 33,
+                                 bytes.fromhex('112233445566778899aabbccddeeff00'),
+                                 entries, 128, 128, zlib.crc32(table))
+                struct.pack_into('<I', header, 16, zlib.crc32(header[:92]))
+                stream.seek(here * 512); stream.write(header)
+                stream.seek(entries * 512); stream.write(table)
     command = [qemu]
     if args.arch == 'riscv':
         command += ['-machine', 'virt', '-bios', 'default']
@@ -93,7 +117,7 @@ def main():
                 'program': str(program), 'program_sha256': digest(program),
                 'qemu': qemu, 'qemu_sha256': digest(qemu),
                 'qemu_version': subprocess.check_output([qemu, '--version'], text=True).splitlines()[0],
-                'command': command, 'storage_cost': args.storage_cost,
+                'command': command, 'gpt': args.gpt, 'storage_cost': args.storage_cost,
                 'root_image_sha256': digest(root), 'second_image_sha256': digest(disk)}
     identity_path = output / 'identity.json'
     identity_path.write_text(json.dumps(identity, indent=2) + '\n')
@@ -119,7 +143,11 @@ def main():
     execute(['e2fsck', '-fn', root], output / 'root.fsck.log')
     with disk.open('rb') as source, partition.open('wb') as target:
         source.seek(MIB)
-        shutil.copyfileobj(source, target)
+        remaining = 64 * MIB
+        while remaining:
+            block = source.read(min(remaining, MIB))
+            if not block: raise RuntimeError("short partition image")
+            target.write(block); remaining -= len(block)
     execute(['fsck.fat', '-vn', partition], output / 'fat.fsck.log')
     if args.storage_cost:
         loop_result = output / 'loop-result.img'

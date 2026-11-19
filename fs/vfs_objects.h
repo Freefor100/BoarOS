@@ -83,6 +83,7 @@ struct kernel_vfs_node {
     uint32_t exec_users;
     uint8_t closed;
     uint8_t unlinked;
+    uint8_t tmpfile_linkable; /* Only a never-published, non-exclusive tmpfile may gain its first name. */
     uint8_t retired;
     uint8_t generated_control, control_write_prefix;
 #if BOAROS_COST_DIAGNOSTICS
@@ -113,6 +114,7 @@ struct kernel_vfs_dentry {
     uint32_t mountpoints;
     char *name;
     struct kernel_vfs_dentry *index_left, *index_right;
+    struct kernel_vfs_dentry *lookup_hint; /* Weak, protected by VFS state. */
     uint8_t index_height;
     char initial_name[];
 };
@@ -127,6 +129,7 @@ struct kernel_vfs_path {
     struct kernel_vfs_mount *mounted_here;
     uint32_t references;
     uint8_t transient; /* Resolver-owned component storage, never published. */
+    bool borrow_mount; /* Lifetime covered by a resolver input path. */
 };
 
 struct kernel_vfs_rename_result {
@@ -150,6 +153,8 @@ struct kernel_vfs_backend {
     /* Existing positive dentries are authoritative: all name changes use VFS
      * parent qualification and update its index before releasing it. */
     bool owns_dentry_names;
+    /* Control writes authorize with the OFD opener, not current credentials. */
+    bool control_open_credentials;
     int (*check_domain)(const struct kernel_vfs_node *, const struct kernel_heap *,
         const struct physical_page_allocator *);
     int (*error)(struct kernel_vfs_instance *instance);
@@ -173,7 +178,7 @@ struct kernel_vfs_backend {
     /* Generated files return an owned, single-read-epoch snapshot. The OFD
      * releases it and creates a new one after seek to offset zero. */
     int (*snapshot)(struct kernel_vfs_node *node, struct kernel_heap *heap,
-        struct kernel_namespace *ipc_namespace, char **buffer, size_t *length);
+        struct kernel_namespace *ipc_namespace, struct kernel_pid_registry *pid_view, char **buffer, size_t *length);
     /* Controls use a complete kernel buffer and return the new position,
      * which can differ from old position + accepted bytes. The files layer
      * commits that position only after successful user copying. */
@@ -207,10 +212,9 @@ struct kernel_vfs_backend {
      * NULL denotes a memory-only backend without persistent metadata. */
     void (*sync_prepare)(struct kernel_vfs_node *node, int data_only,
                          struct kernel_vfs_sync_request *request);
-    /* Publishes metadata failures on their affected inode before returning.
-     * NULL denotes a memory-only backend without persistent writeback. */
-    int (*sync_filesystem)(struct kernel_vfs_instance *instance,
-                           struct kernel_vfs_node *root);
+    /* Synchronizes the instance owned by the view. NULL denotes a backend
+     * without persistent writeback. */
+    int (*sync_filesystem)(struct kernel_vfs_mount *mount);
     int (*flush)(struct kernel_vfs_instance *instance);
     int (*symlink)(struct kernel_vfs_instance *instance, uint64_t parent_inode, const char *target, const char *path);
     int (*mknod)(struct kernel_vfs_instance *instance, uint64_t parent_inode, const char *path,
@@ -245,8 +249,13 @@ struct kernel_vfs_backend {
         uint64_t parent_inode, const char *path,
         uint32_t mode,
         struct kernel_vfs_file *file, uint32_t umask);
+    int (*tmpfile)(struct kernel_vfs_mount *, uint64_t parent_inode, uint32_t mode,
+        struct kernel_vfs_file *, uint32_t umask);
+    int (*link_tmpfile)(struct kernel_vfs_instance *, uint64_t inode, uint64_t parent, const char *name);
     /* The backend takes mutation qualification only when it publishes atime. */
     void (*accessed)(struct kernel_vfs_file *file);
+    /* A directory scan observed expired relatime. Recheck before publishing. */
+    void (*accessed_after_relatime)(struct kernel_vfs_file *file);
     int (*modified)(struct kernel_vfs_file *file,
         uint64_t offset, int append);
     int (*stat)(const struct kernel_vfs_file *file,
@@ -258,7 +267,13 @@ struct kernel_vfs_backend {
         uint64_t parent_inode, const char *path);
     int (*rmdir)(struct kernel_vfs_mount *mount,
         uint64_t parent_inode, const char *path);
+    /* Namespace and target I/O qualifications protect the resolved identity.
+     * Exclusive means the operation and the name cache own the only dentry
+     * references and its embedded file owns the target's only node reference. */
+    int (*remove_resolved)(struct kernel_vfs_mount *, uint64_t parent_inode,
+        const char *name, struct kernel_vfs_node *target, bool directory, bool exclusive);
     void (*release_unlinked)(struct kernel_vfs_node *node);
+    int (*read_directory)(struct kernel_vfs_file *, struct kernel_vfs_dir_batch *);
     int (*dir_entry)(struct kernel_vfs_file *file,
         uint64_t position,
         uint64_t *next_position,
@@ -266,6 +281,11 @@ struct kernel_vfs_backend {
         uint8_t *type,
         char *name,
         size_t name_size);
+    /* Nonzero alignment advertises real synchronous file-data direct I/O. */
+    size_t (*direct_alignment)(struct kernel_vfs_node *);
+    /* Closed mapping epoch; direction is read=0, write=1, drain-only=-1. */
+    int (*direct_io)(struct kernel_vfs_node *,uint64_t,void *,size_t,int,size_t *);
+    uint64_t (*direct_write_limit)(struct kernel_vfs_node *);
     int (*pread)(struct kernel_vfs_node *node,
         uint64_t offset,
         void *buffer,
@@ -298,6 +318,7 @@ int kernel_vfs_inode_times_allowed(struct kernel_vfs_node *, const struct kernel
 void kernel_vfs_creation_identity(uint32_t parent_mode, uint32_t parent_gid,
     uint32_t *mode, uint32_t *uid, uint32_t *gid);
 void kernel_vfs_record_writeback_error(struct kernel_vfs_node *node, int error);
+void kernel_vfs_record_mount_writeback_error(struct kernel_vfs_mount *mount, int error);
 int kernel_vfs_attach_unnamed_path(struct kernel_vfs_file *, const char *name);
 int kernel_vfs_publish_node(struct kernel_vfs_mount *mount, struct kernel_vfs_node *node,
     struct kernel_vfs_file *file, int creating);

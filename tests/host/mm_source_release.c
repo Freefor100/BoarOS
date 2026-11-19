@@ -36,7 +36,7 @@ static unsigned elf_pin_prepare, elf_releases;
 static uint64_t self_pin_address;
 static int mincore_result;
 static unsigned mincore_completed;
-static _Thread_local unsigned forbid_backing_scans;
+static _Thread_local unsigned forbid_backing_scans, backing_scans;
 static void outside_gate(void);
 static void publish(unsigned *flag) { __atomic_store_n(flag,1,__ATOMIC_RELEASE); }
 static void await(unsigned *flag) { while (!__atomic_load_n(flag,__ATOMIC_ACQUIRE)) sched_yield(); }
@@ -76,6 +76,7 @@ enum kernel_vma_status __real_kernel_vma_set_backing_in_use(const struct kernel_
 enum kernel_vma_status __wrap_kernel_vma_set_backing_in_use(const struct kernel_vma_set *set,const void *backing,int *used)
 {
     assert(!forbid_backing_scans && "unchanged VMA borrow must not scan backing membership");
+    backing_scans++;
     return __real_kernel_vma_set_backing_in_use(set,backing,used);
 }
 enum physical_page_status __real_physical_page_allocate(struct physical_page_allocator *,uint64_t *);
@@ -313,7 +314,9 @@ int main(void)
     forbid_backing_scans=0;
 
     struct kernel_open_file_description *file=map_file("/unmap",0x40000);
+    backing_scans=0;
     close_caller(&file); assert(!kernel_mm_munmap(&mm,0x40000,BOAROS_PAGE_SIZE) && last_releases==1 && !watched);
+    assert(backing_scans==2 && "each of the two active OFDs needs one VMA membership check");
     file=map_file("/replace",0x40000); close_caller(&file);
     assert(!kernel_mm_mmap_anonymous(&mm,0x40000,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,
         KERNEL_MM_MAP_FIXED,&address) && last_releases==2 && !watched);

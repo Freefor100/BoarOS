@@ -351,7 +351,7 @@ udp_input(struct pbuf *p, struct netif *inp)
   } else {
 #if LWIP_IPV6
     if (ip_current_is_v6()) {
-      for_us = netif_get_ip6_addr_match(inp, ip6_current_dest_addr()) >= 0;
+      for_us = ip6_addr_ismulticast(ip6_current_dest_addr()) || netif_get_ip6_addr_match(inp, ip6_current_dest_addr()) >= 0;
     }
 #endif /* LWIP_IPV6 */
 #if LWIP_IPV4
@@ -388,6 +388,10 @@ udp_input(struct pbuf *p, struct netif *inp)
       } else
 #endif /* LWIP_UDPLITE */
       {
+        /* RFC 8200: ordinary IPv6 UDP cannot omit its checksum. */
+        if (ip_current_is_v6() && udphdr->chksum == 0) {
+          goto chkerr;
+        }
         if (udphdr->chksum != 0) {
           if (ip_chksum_pseudo(p, IP_PROTO_UDP, p->tot_len,
                                ip_current_src_addr(),
@@ -398,6 +402,27 @@ udp_input(struct pbuf *p, struct netif *inp)
       }
     }
 #endif /* CHECKSUM_CHECK_UDP */
+    if(ip_current_is_v6() && ip6_addr_ismulticast(ip6_current_dest_addr())) {
+      /* All local and connected-peer predicates apply to each recipient.
+       * Socket targets share immutable storage with independent BPF limits;
+       * raw lwIP callbacks retain their legacy private mutable payload. */
+      const void *network=(const unsigned char *)ip_next_header_ptr()-ip_current_header_tot_len();
+      for(struct udp_pcb *target=*udp_port_bucket(dest);target;target=target->next) {
+        if(target->local_port!=dest || !udp_input_local_match(target,inp,broadcast))continue;
+        if((target->flags&UDP_FLAGS_CONNECTED) && (target->remote_port!=src ||
+           (!ip_addr_isany_val(target->remote_ip) && !ip_addr_eq(&target->remote_ip,ip_current_src_addr()))))continue;
+        if(boaros_lwip_udp_multicast_receive(target,p,inp,network,ip_current_header_tot_len(),src))continue;
+        if(target->recv) {
+          struct pbuf *copy=pbuf_clone(PBUF_RAW,PBUF_POOL,p);
+          if(copy) {
+            if(boaros_lwip_udp_ingress_filter(target,copy,inp,1,network,ip_current_header_tot_len(),UDP_HLEN) &&
+               !pbuf_remove_header(copy,UDP_HLEN))target->recv(target->recv_arg,target,copy,ip_current_src_addr(),src);
+            else pbuf_free(copy);
+          }
+        }
+      }
+      pbuf_free(p);goto end;
+    }
     if (pcb && !boaros_lwip_udp_ingress_filter(pcb,p,inp,ip_current_is_v6(),
         ((const unsigned char *)ip_next_header_ptr()-ip_current_header_tot_len()),ip_current_header_tot_len(),UDP_HLEN)) {
       pbuf_free(p);

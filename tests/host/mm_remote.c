@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 extern _Thread_local uint64_t mm_test_context;
 void mm_test_attach(unsigned);
 static unsigned char pool[8*1024*1024] __attribute__((aligned(16384)));
@@ -18,6 +19,32 @@ void mm_test_fence(uint64_t address,int instructions)
 {(void)address;instruction_fences+=!!instructions;__atomic_thread_fence(__ATOMIC_SEQ_CST);}
 static void *access_page(uint64_t p){return (void *)(uintptr_t)p;}
 static int address_of(const void *p,uint64_t *a){*a=(uintptr_t)p;return 1;}
+static pthread_barrier_t core_barrier;
+static void rendezvous(void)
+{ int rc=pthread_barrier_wait(&core_barrier);assert(!rc||rc==PTHREAD_BARRIER_SERIAL_THREAD); }
+static void *remote_borrower(void *opaque)
+{
+    struct kernel_mm *mm=opaque;
+    assert(kernel_mm_core_remote_begin(mm));rendezvous();rendezvous();
+    kernel_mm_core_remote_end(mm);rendezvous();rendezvous();
+    assert(!kernel_mm_core_remote_begin(mm));rendezvous();return NULL;
+}
+struct shared_writer { struct kernel_mm *mm; uint64_t address; };
+static void *write_shared_alias(void *opaque)
+{
+    struct shared_writer *writer=opaque;
+    mm_test_attach(1);
+    assert(!kernel_mm_context(writer->mm,&mm_test_context));
+    rendezvous();
+    /* A different MM can still write the shared physical storage. The
+     * target's dump gate is not a lock on every alias of that storage. */
+    assert(kernel_mm_core_remote_begin(writer->mm));
+    unsigned char value=22;size_t copied;
+    assert(!kernel_mm_remote_transfer(writer->mm,writer->address,&value,1,1,0,&copied)&&copied==1);
+    assert(!kernel_mm_remote_transfer(writer->mm,writer->address+BOAROS_PAGE_SIZE,&value,1,1,0,&copied)&&copied==1);
+    kernel_mm_core_remote_end(writer->mm);
+    rendezvous();mm_test_context=0;return NULL;
+}
 int main(void)
 {
     mm_test_attach(0);
@@ -32,14 +59,82 @@ int main(void)
     assert(!riscv_sv39_page_table_init(&table,&allocator));table.state=ARCH_MMU_STATE_ACTIVE;
     uint64_t baseline=physical_page_available(&allocator);
     assert(!arch_mmu_user_space_init(&space,&allocator,&table));assert(!kernel_mm_create(&mm,&space));
+    assert(kernel_mm_coredump_filter_get(&mm)==0x33);
+    kernel_mm_coredump_filter_set(&mm,0xffff);assert(kernel_mm_coredump_filter_get(&mm)==0x1ff);
+    kernel_mm_coredump_filter_set(&mm,0x12);
     assert(!kernel_mm_vma_enable(&mm,&heap));assert(!kernel_mm_brk_initialize(&mm,0x10000,0x20000));
     uint64_t address,context;assert(!kernel_mm_context(&mm,&context));mm_test_context=context;
     assert(!kernel_mm_mmap_anonymous(&mm,0x40000,2*BOAROS_PAGE_SIZE,
         KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&address));
+    struct kernel_vma cold;
+    assert(!kernel_mm_vma_lookup(&mm,address,&cold));assert(!(cold.flags & KERNEL_VMA_ANON_HISTORY));
+    uint64_t read_first;
+    assert(!kernel_mm_mmap_anonymous(&mm,0x300000,BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&read_first));
+    unsigned char zero=1;size_t read_count;
+    assert(!kernel_mm_remote_transfer(&mm,read_first,&zero,1,0,0,&read_count)&&!zero&&read_count==1);
+    assert(!kernel_mm_vma_lookup(&mm,read_first,&cold));assert(cold.flags & KERNEL_VMA_ANON_HISTORY);
+    /* A write pin succeeds directly after the read: no new write fault/COW. */
+    struct kernel_mm_user_pin direct_write={0};
+    assert(!kernel_mm_pin_user_page(&mm,read_first,KERNEL_MM_WRITE,&direct_write));
+    kernel_mm_unpin_user_page(&direct_write);
+    assert(!kernel_mm_madvise(&mm,read_first,BOAROS_PAGE_SIZE,KERNEL_MM_ADVICE_DONTNEED));
+    assert(!kernel_mm_vma_lookup(&mm,read_first,&cold));assert(cold.flags & KERNEL_VMA_ANON_HISTORY);
+    assert(!kernel_mm_madvise(&mm,read_first,BOAROS_PAGE_SIZE,KERNEL_MM_ADVICE_WIPEONFORK));
+    pthread_t borrower;assert(!pthread_barrier_init(&core_barrier,NULL,2));
+    assert(!pthread_create(&borrower,NULL,remote_borrower,&mm));
+    rendezvous();assert(!kernel_mm_core_begin(&mm));rendezvous();rendezvous();
+    assert(kernel_mm_core_begin(&mm));rendezvous();rendezvous();
+    assert(!pthread_join(borrower,NULL));kernel_mm_core_end(&mm);
+    assert(!pthread_barrier_destroy(&core_barrier));
+    assert(kernel_mm_core_remote_begin(&mm));
+    assert(!kernel_mm_core_begin(&mm));
+    kernel_mm_core_remote_end(&mm);
+    assert(kernel_mm_core_begin(&mm));
+    assert(!kernel_mm_core_remote_begin(&mm));
+    assert(!kernel_mm_core_begin(&mm));
+    kernel_mm_core_end(&mm);
+    assert(kernel_mm_core_remote_begin(&mm));
+    kernel_mm_core_remote_end(&mm);
+    puts("MM core excludes active/new remote borrowers and releases admission");
     unsigned char value=41,got=0;size_t copied;
     assert(!kernel_mm_remote_transfer(&mm,address,&value,1,1,0,&copied)&&copied==1);
+    struct kernel_vma history;
+    assert(!kernel_mm_vma_lookup(&mm,address,&history));assert(history.flags & KERNEL_VMA_ANON_HISTORY);
+    struct kernel_mm_user_pin pending_write={0};
+    assert(!kernel_mm_pin_user_page(&mm,address,KERNEL_MM_WRITE,&pending_write));
+    assert(!kernel_mm_core_begin(&mm));
+    kernel_mm_unpin_user_page(&pending_write);
+    assert(kernel_mm_core_begin(&mm));kernel_mm_core_end(&mm);
     assert(!kernel_mm_mprotect(&mm,address,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_EXECUTE));
+    uint64_t shared_address;
+    assert(!kernel_mm_mmap_anonymous(&mm,0x100000,2*BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED|KERNEL_MM_MAP_SHARED,&shared_address));
+    unsigned char initial=11;
+    assert(!kernel_mm_remote_transfer(&mm,shared_address,&initial,1,1,0,&copied)&&copied==1);
+    assert(!kernel_mm_remote_transfer(&mm,shared_address+BOAROS_PAGE_SIZE,&initial,1,1,0,&copied)&&copied==1);
     assert(!kernel_mm_fork(&child,&mm));
+    assert(!kernel_mm_vma_lookup(&child,read_first,&cold));assert(!(cold.flags & KERNEL_VMA_ANON_HISTORY));
+    assert(mm.record!=child.record);
+    assert(kernel_mm_coredump_filter_get(&child)==0x12);
+    kernel_mm_coredump_filter_set(&child,0x33);assert(kernel_mm_coredump_filter_get(&mm)==0x12);
+    assert(!kernel_mm_vma_lookup(&child,address,&history));assert(history.flags & KERNEL_VMA_ANON_HISTORY);
+    assert(kernel_mm_core_begin(&mm));
+    unsigned char first=0,last=0;
+    assert(!kernel_mm_remote_transfer(&mm,shared_address,&first,1,0,1,&copied)&&copied==1);
+    struct shared_writer writer={&child,shared_address};
+    assert(!pthread_barrier_init(&core_barrier,NULL,2));
+    assert(!pthread_create(&borrower,NULL,write_shared_alias,&writer));
+    rendezvous();rendezvous();
+    assert(!kernel_mm_remote_transfer(&mm,shared_address+BOAROS_PAGE_SIZE,&last,1,0,1,&copied)&&copied==1);
+    assert(!pthread_join(borrower,NULL));assert(!pthread_barrier_destroy(&core_barrier));
+    unsigned char first_after=0;
+    assert(!kernel_mm_remote_transfer(&mm,shared_address,&first_after,1,0,1,&copied)&&copied==1);
+    assert(first_after==22); /* Both pages really alias the writer's MM. */
+    assert(first==11&&last==22); /* This pair never existed simultaneously. */
+    assert(!kernel_mm_core_remote_begin(&mm));
+    kernel_mm_core_end(&mm);
+    puts("MM core shared aliases remain live; sequential copies are not a global snapshot");
     assert(kernel_mm_remote_transfer(&child,address,&value,1,1,0,&copied)==-KERNEL_EFAULT&&!copied);
     unsigned fences=instruction_fences;value=73;
     assert(!kernel_mm_remote_transfer(&child,address,&value,1,1,1,&copied)&&copied==1);
@@ -67,7 +162,9 @@ int main(void)
     unsigned char bytes[8]={0};
     assert(kernel_mm_remote_transfer(&mm,0x40000+2*BOAROS_PAGE_SIZE-4,bytes,8,0,0,&copied)==-KERNEL_EFAULT&&copied==4);
     assert(!kernel_io_context_current()->user_pins);
-    assert(!kernel_mm_acquire(&owner,&mm));mm_test_context=0;assert(!kernel_mm_release(&mm));
+    assert(!kernel_mm_acquire(&owner,&mm));
+    kernel_mm_coredump_filter_set(&owner,0x44);assert(kernel_mm_coredump_filter_get(&mm)==0x44);
+    mm_test_context=0;assert(!kernel_mm_release(&mm));
     assert(!kernel_mm_remote_transfer(&owner,0x40000,&got,1,0,0,&copied)&&got==41);
     assert(!kernel_mm_release(&child)&&!kernel_mm_release(&owner));
     assert(physical_page_available(&allocator)==baseline&&!physical_page_allocator_audit(&allocator));

@@ -355,6 +355,41 @@ enum kernel_files_status kernel_files_syncfs(struct kernel_files *files,
     return kernel_files_release_io(files, &description, KERNEL_FILES_STATUS_OK);
 }
 
+static enum kernel_files_status direct_read(struct kernel_files *files,struct kernel_mm *mm,
+    struct kernel_open_file_description *description,struct kernel_uaccess_iov_cursor *cursor,
+    uint64_t request,uint64_t position,int advance,int64_t *result)
+{
+    size_t align=kernel_vfs_direct_alignment(&description->file);
+    if (position>=kernel_open_file_size(description)) { *result=0;return 0; }
+    if (!align || position%align || request%align) { *result=-KERNEL_EINVAL;return 0; }
+    struct kernel_uaccess_iov_cursor check=*cursor;
+    uint64_t left=request;
+    while (left) {
+        uint64_t address;size_t n=kernel_uaccess_iov_span(&check,left,&address);
+        if (!n || address%align || n%align) { *result=-KERNEL_EINVAL;return 0; }
+        check.offset+=n;left-=n;
+    }
+    struct kernel_task_io_buffer staging={0};
+    if (kernel_task_io_buffer_acquire(&staging,mm->allocator)) { *result=-KERNEL_ENOMEM;return 0; }
+    uint64_t total=0;int error=0;
+    while (total<request) {
+        size_t n=request-total,done=0,copied=0;
+        if (n>BOAROS_PAGE_SIZE) n=BOAROS_PAGE_SIZE;
+        error=kernel_vfs_direct_pread(&description->file,position+total,staging.data,n,&done);
+        enum kernel_uaccess_status access=KERNEL_UACCESS_STATUS_OK;
+        if (done) access=kernel_copy_to_user_iov(mm,cursor,staging.data,done,&copied);
+        total+=copied;
+        if (advance && copied && kernel_open_file_advance(description,copied)) __builtin_trap();
+        KERNEL_FILES_NOTE(files,read_chunks,1);
+        if (access) { error=-KERNEL_EFAULT;break; }
+        if (error || done<n) break;
+    }
+    kernel_task_io_buffer_release(&staging);
+    KERNEL_FILES_NOTE(files,bytes_read,total);
+    *result=total?(int64_t)total:error;
+    return 0;
+}
+
 /* 缓存批次只覆盖剩余需求；复制前已经结束存储锁，整个批次的成功页都有独立引用。 */
 static enum kernel_files_status disk_read(
     struct kernel_files *files, struct kernel_mm *mm,
@@ -363,15 +398,24 @@ static enum kernel_files_status disk_read(
     uint64_t position, int advance, int64_t *linux_result
     )
 {
+    if (kernel_open_file_flags(description)&KERNEL_FILES_O_DIRECT)
+        return direct_read(files,mm,description,cursor,request,position,advance,linux_result);
     struct kernel_page_cache *cache=kernel_open_file_page_cache(description);
+    struct kernel_vfs_node *node=kernel_open_file_node(description);
     uint64_t total = 0;
     int error = 0, done = 0;
     enum kernel_files_status status = KERNEL_FILES_STATUS_OK;
     while (total < request && !done) {
+        /* As in kernel_vfs_pread, this snapshot only sizes the demand. The
+         * cache still revalidates every requested page against live EOF. */
+        uint64_t end=kernel_vfs_node_size(node);
+        if (position>=end) break;
+        uint64_t remaining=request-total;
+        if (remaining>end-position) remaining=end-position;
         uint64_t batch_start=position;
         int cache_miss=0;
         size_t start = position & BOAROS_PAGE_MASK;
-        size_t count = (start + request - total + BOAROS_PAGE_MASK) >> BOAROS_PAGE_SHIFT;
+        size_t count = (start + remaining + BOAROS_PAGE_MASK) >> BOAROS_PAGE_SHIFT;
         if (count > KERNEL_PAGE_CACHE_READ_BATCH_MAX) count = KERNEL_PAGE_CACHE_READ_BATCH_MAX;
         struct kernel_page_cache_read_page pages[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
         enum kernel_page_cache_status loaded;
@@ -502,7 +546,10 @@ static enum kernel_files_status read_pinned(
     }
     if (kind == KERNEL_OPEN_FILE_KIND_SOCKET) {
         if ((socket_flags & KERNEL_SOCKET_MSG_PEEK) && !socket_message) __builtin_trap();
-        struct kernel_socket_read_request read_request = {0};
+        struct kernel_socket_read_request read_request = {
+            .waitall = (socket_flags & KERNEL_SOCKET_MSG_WAITALL) &&
+                kernel_socket_is_tcp(kernel_open_file_socket(description))
+        };
         int received = 0;
         uint64_t target = 0;
         int timeout_captured = 0;
@@ -519,6 +566,14 @@ static enum kernel_files_status read_pinned(
             *linux_result = 0;
             return KERNEL_FILES_STATUS_OK;
         }
+        if (read_request.waitall && !(socket_flags & KERNEL_SOCKET_MSG_DONTWAIT)) {
+            uint64_t timeout = kernel_socket_receive_timeout(kernel_open_file_socket(description));
+            if (timeout) {
+                uint64_t now = kernel_time_monotonic_ns();
+                target = UINT64_MAX - now < timeout ? UINT64_MAX : now + timeout;
+            }
+            timeout_captured = 1;
+        }
         while (total < count || (message && total == 0)) {
             uint64_t remaining = count - total;
             received = kernel_socket_reserve_read(
@@ -526,7 +581,7 @@ static enum kernel_files_status read_pinned(
                 &read_request, description_owner,
                 remaining > UINT32_MAX ? UINT32_MAX : (uint32_t)remaining,
                 socket_flags & KERNEL_SOCKET_MSG_DONTWAIT, socket_message);
-            if (received == -KERNEL_EAGAIN && total == 0U && !(socket_flags & KERNEL_SOCKET_MSG_DONTWAIT)) {
+            if (received == -KERNEL_EAGAIN && (total == 0U || read_request.waitall) && !(socket_flags & KERNEL_SOCKET_MSG_DONTWAIT)) {
                 /* ready后数据仍可能被另一reader取走，本次调用只取得一次预算。 */
                 if (!timeout_captured) {
                     uint64_t timeout = kernel_socket_receive_timeout(kernel_open_file_socket(description));
@@ -537,7 +592,7 @@ static enum kernel_files_status read_pinned(
                     timeout_captured = 1;
                 }
                 int waited = target && kernel_time_monotonic_ns() >= target ? -KERNEL_EAGAIN :
-                    kernel_socket_wait_ready(kernel_open_file_socket(description), KERNEL_POLLIN, target, socket_flags);
+                    kernel_socket_wait_read(kernel_open_file_socket(description), &read_request, target, socket_flags);
                 if (waited == 0) continue;
                 received = waited;
             }
@@ -549,8 +604,9 @@ static enum kernel_files_status read_pinned(
             KERNEL_FILES_NOTE(files, read_chunks, 1);
             total += kernel_socket_finish_read(&read_request, fault);
             if (fault) { received = -KERNEL_EFAULT; break; }
-            /* 本批已覆盖当时可读前缀；不追读新数据或消费下一次应返回的错误。 */
-            break;
+            /* Ordinary reads stop at the ready prefix. WAITALL releases the
+             * reservation and receive credit before waiting for more data. */
+            if (!read_request.waitall || !received) break;
         }
         *linux_result = total != 0U ? (int64_t)total : received;
         if (*linux_result < 0) KERNEL_FILES_NOTE(files, read_failures, 1);
@@ -964,6 +1020,10 @@ static enum kernel_files_status pread_iov_pinned(
                   ? KERNEL_FILES_MAX_RW_COUNT
                   : count;
     position = (uint64_t)offset;
+    if (kernel_open_file_flags(description)&KERNEL_FILES_O_DIRECT) {
+        struct kernel_uaccess_iov_cursor direct_cursor={iov,iov_count,0,0};
+        return direct_read(files,mm,description,&direct_cursor,request,position,0,linux_result);
+    }
     file_size = kernel_open_file_size(description);
     if (position >= file_size) {
         *linux_result = 0;
@@ -1038,6 +1098,17 @@ int kernel_files_description_writable(
     return 0;
 }
 
+static int control_write_as_opener(struct kernel_open_file_description *description,
+    uint64_t *offset, char *buffer, size_t size, size_t *accepted)
+{
+    int opener_credentials = kernel_vfs_file_control_open_credentials(&description->file);
+    const struct kernel_credentials *previous = opener_credentials ?
+        kernel_credentials_override(description->credentials) : 0;
+    int error = kernel_vfs_file_control(&description->file,1,offset,buffer,size,accepted);
+    if (opener_credentials) kernel_credentials_override(previous);
+    return error;
+}
+
 static enum kernel_files_status control_write(
     struct kernel_files *files, struct kernel_mm *mm,
     struct kernel_open_file_description *description,
@@ -1046,11 +1117,15 @@ static enum kernel_files_status control_write(
 {
     size_t prefix = kernel_vfs_file_control_prefix(&description->file);
     if (prefix) {
-        /* seq_file writes have no pwrite operation. Each writev component
-         * invokes the legacy write callback independently; ignored tail bytes
+        /* Bounded legacy writers opt into pwrite explicitly (seq_file comm
+         * does not). Each writev component invokes its callback independently;
+         * ignored tail bytes
          * must not be faulted in, even though the whole component is consumed. */
-        if (positioned) { *linux_result = -KERNEL_ESPIPE; return KERNEL_FILES_STATUS_OK; }
-        char buffer[16];
+        if (positioned && !(prefix & KERNEL_VFS_CONTROL_PREFIX_POSITIONED)) {
+            *linux_result = -KERNEL_ESPIPE; return KERNEL_FILES_STATUS_OK;
+        }
+        prefix &= ~KERNEL_VFS_CONTROL_PREFIX_POSITIONED;
+        char buffer[35];
         if (prefix >= sizeof(buffer)) __builtin_trap();
         uint64_t total = 0;
         for (size_t i = 0; i < iov_count; i++) {
@@ -1062,8 +1137,8 @@ static enum kernel_files_status control_write(
             int error = access == KERNEL_UACCESS_STATUS_FAULT ? -KERNEL_EFAULT : 0;
             if (access != KERNEL_UACCESS_STATUS_OK && !error) return KERNEL_FILES_STATUS_STATE;
             if (!error && copied != imported) return KERNEL_FILES_STATUS_STATE;
-            uint64_t offset = kernel_open_file_offset(description);
-            if (!error) error = kernel_vfs_file_control(&description->file, 1, &offset, buffer, imported, &accepted);
+            uint64_t offset = positioned ? requested_offset : kernel_open_file_offset(description);
+            if (!error) error = control_write_as_opener(description, &offset, buffer, imported, &accepted);
             if (error) { *linux_result = total ? (int64_t)total : error; return KERNEL_FILES_STATUS_OK; }
             if (accepted != imported) return KERNEL_FILES_STATUS_STATE;
             total += segment;
@@ -1096,7 +1171,7 @@ static enum kernel_files_status control_write(
         return KERNEL_FILES_STATUS_OK;
     }
     uint64_t offset = positioned ? requested_offset : kernel_open_file_offset(description);
-    result = kernel_vfs_file_control(&description->file, 1, &offset,
+    result = control_write_as_opener(description, &offset,
         buffer, (size_t)count, &accepted);
     kernel_heap_release(files->heap, buffer);
     if (result) { *linux_result = result; return KERNEL_FILES_STATUS_OK; }
@@ -1120,8 +1195,8 @@ static enum kernel_files_status regular_write_request(
     uint64_t offset=positioned?requested_offset:kernel_open_file_offset(description);
     struct kernel_vfs_size_limit size_limit={.maximum=kernel_task_current_fsize_limit()};
     struct kernel_vfs_user_write_result completed={0};
-    int error=kernel_vfs_write_user(&description->file,mm,iov,iov_count,
-        (size_t)count,offset,append,&size_limit,&completed);
+    int error=kernel_vfs_write_user_mode(&description->file,mm,iov,iov_count,
+        (size_t)count,offset,append,!!(options->flags&KERNEL_FILES_O_DIRECT),&size_limit,&completed);
     kernel_files_size_limit_notify(&size_limit);
     if ((completed.access!=KERNEL_UACCESS_STATUS_OK &&
          completed.access!=KERNEL_UACCESS_STATUS_FAULT) || completed.written>count)
@@ -1771,7 +1846,9 @@ static enum kernel_files_status writev_request(
         (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EVENTFD || kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_TIMERFD || kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SIGNALFD) ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET ||
-        (description->kind == KERNEL_OPEN_FILE_KIND_GENERATED && kernel_vfs_file_control_prefix(&description->file)))) {
+        (description->kind == KERNEL_OPEN_FILE_KIND_GENERATED &&
+         kernel_vfs_file_control_prefix(&description->file) &&
+         !(kernel_vfs_file_control_prefix(&description->file) & KERNEL_VFS_CONTROL_PREFIX_POSITIONED)))) {
         *linux_result = -KERNEL_ESPIPE;
         goto out;
     }
@@ -2010,17 +2087,10 @@ enum kernel_files_status kernel_files_getdents(
     int64_t *linux_result)
 {
     struct kernel_open_file_description *description;
-    unsigned char record[(19U + 256U + 7U) & ~(size_t)7U];
-    /* Fill the name directly in the outgoing dirent. Keeping a second
-     * 256-byte copy consumes the single-page task stack on ext4 faults. */
-    char *name = (char *)&record[19];
-    uint64_t inode;
-    uint8_t type;
-    uint64_t request;
-    uint64_t total = 0U;
-    uint64_t position;
-    uint64_t next_position;
-    int fill_result;
+    unsigned char small[(19U + 256U + 7U) & ~(size_t)7U];
+    struct kernel_task_io_buffer scratch = {0};
+    uint64_t request, total = 0;
+    enum kernel_files_status status = KERNEL_FILES_STATUS_OK;
 
     if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
@@ -2052,93 +2122,86 @@ enum kernel_files_status kernel_files_getdents(
     KERNEL_SERVICE_SCOPE_IF(service, kernel_vfs_namespace_requires_cpu0(description->file.mount));
     KERNEL_LOCK_SCOPE(offset_guard);
     kernel_mutex_lock(&description->offset_lock, &offset_guard);
-    kernel_vfs_file_accessed(&description->file,kernel_open_file_flags(description));
-    /* The descriptor offset is the backend cookie for the next record. */
-    position = kernel_open_file_offset(description);
+    uint32_t open_flags = kernel_open_file_flags(description);
+    const uint32_t *access_flags = &open_flags;
+    /* Reuse the task's retained I/O page, not a page on the single-page
+     * kernel stack. Allocation failure falls back to the same bounded path. */
+    size_t capacity = sizeof(small);
+    unsigned char *data = small;
+    if (request > capacity &&
+        kernel_task_io_buffer_acquire(&scratch, mm->allocator) == KERNEL_TASK_STATUS_OK) {
+        data = scratch.data;
+        capacity = BOAROS_PAGE_SIZE;
+    }
     do {
-        size_t name_length;
-        size_t record_length;
-        size_t copied = 0U;
-        uint16_t reported_length;
-        uint16_t little;
-        uint64_t cookie;
-        enum kernel_uaccess_status access_status;
-
-        fill_result = kernel_vfs_dir_entry(&description->file,
-                                           position,
-                                           &next_position,
-                                           &inode,
-                                           &type,
-                                           name,
-                                           256U);
-        if (fill_result == 0) {
-            if (kernel_open_file_seek(description, next_position) !=
-                KERNEL_OPEN_FILE_STATUS_OK) {
-                return KERNEL_FILES_STATUS_STATE;
-            }
+        uint64_t remaining = request - total;
+        struct kernel_vfs_dir_batch batch = {
+            .data = data,
+            .capacity = remaining < capacity ? (size_t)remaining : capacity,
+            .position = kernel_open_file_offset(description),
+        };
+        int fill_result = kernel_vfs_read_directory(&description->file, &batch, access_flags);
+        access_flags = NULL;
+        size_t copied = 0, complete = 0;
+        uint64_t position = kernel_open_file_offset(description);
+        enum kernel_uaccess_status access = KERNEL_UACCESS_STATUS_OK;
+        /* Drop all namespace/backend locks before faulting user memory.
+         * offset_lock still serializes dup/fork readers and directory seeks. */
+        if (batch.used)
+            access = kernel_copy_to_user(mm, user_buffer + total, data, batch.used, &copied);
+        if ((access != KERNEL_UACCESS_STATUS_OK && access != KERNEL_UACCESS_STATUS_FAULT) ||
+            copied > batch.used || (!access && copied != batch.used)) {
+            status = KERNEL_FILES_STATUS_STATE;
             break;
         }
-        if (fill_result < 0) {
-            /* Linux returns a completed prefix when a later directory
-             * record fails; the failing record remains the next cookie. */
-            *linux_result = total != 0U ? (int64_t)total : fill_result;
-            KERNEL_FILES_NOTE(files, bytes_read, total);
-            return KERNEL_FILES_STATUS_OK;
-        }
-        name_length = strlen(name);
-        record_length = (19U + name_length + 1U + 7U) & ~(size_t)7U;
-        if ((uint64_t)record_length > request - total) {
-            /* Linux answers EINVAL when nothing fits at all. */
-            *linux_result = total == 0U ? -KERNEL_EINVAL : (int64_t)total;
-            KERNEL_FILES_NOTE(files, bytes_read, total);
-            return KERNEL_FILES_STATUS_OK;
-        }
-        reported_length = (uint16_t)record_length;
-        little = 1;
-        if (*(unsigned char *)&little) {
-            /* Little-endian host byte order for the fixed fields. */
-            memcpy(&record[0], &inode, sizeof(inode));
-            cookie = next_position;
-            memcpy(&record[8], &cookie, sizeof(cookie));
+        if (access == KERNEL_UACCESS_STATUS_OK) {
+            complete = batch.used;
+            position = batch.position;
         } else {
-            for (uint8_t byte = 0U; byte < 8U; byte++) {
-                record[byte] =
-                    (unsigned char)((inode >> (8U * byte)) & 0xffU);
-                record[8U + byte] =
-                    (unsigned char)((next_position >> (8U * byte)) &
-                                    0xffU);
+            /* A fault can split any record. Only complete records count;
+             * the failed record's cookie is retried even if bytes escaped. */
+            while (complete < copied) {
+                size_t length = (size_t)data[complete + 16] | ((size_t)data[complete + 17] << 8);
+                if (length > copied - complete) break;
+                position = 0;
+                for (unsigned byte = 0; byte < 8; byte++)
+                    position |= (uint64_t)data[complete + 8 + byte] << (8U * byte);
+                complete += length;
             }
         }
-        memcpy(&record[16], &reported_length, sizeof(reported_length));
-        record[18] = type;
-        record[19U + name_length] = '\0';
-        for (size_t pad = 19U + name_length + 1U; pad < record_length;
-             pad++) {
-            record[pad] = 0U;
+        if (kernel_open_file_seek(description, position) != KERNEL_OPEN_FILE_STATUS_OK) {
+            status = KERNEL_FILES_STATUS_STATE;
+            break;
         }
-
-        access_status = kernel_copy_to_user(mm,
-                                            user_buffer + total,
-                                            record,
-                                            record_length,
-                                            &copied);
-        if (access_status == KERNEL_UACCESS_STATUS_FAULT ||
-            copied != record_length) {
-            *linux_result = total == 0U ? -KERNEL_EFAULT : (int64_t)total;
-            KERNEL_FILES_NOTE(files, bytes_read, total);
-            return KERNEL_FILES_STATUS_OK;
+        total += complete;
+        if (access == KERNEL_UACCESS_STATUS_FAULT) {
+            *linux_result = total ? (int64_t)total : -KERNEL_EFAULT;
+            break;
         }
-        total += record_length;
-        position = next_position;
-        if (kernel_open_file_seek(description, position) !=
-            KERNEL_OPEN_FILE_STATUS_OK) {
-            return KERNEL_FILES_STATUS_STATE;
+        if (fill_result <= 0) {
+            *linux_result = total ? (int64_t)total : fill_result;
+            if (!fill_result) kernel_vfs_notify_file(&description->file, VFS_NOTIFY_ACCESS);
+            break;
+        }
+        if (!batch.used) {
+            *linux_result = total ? (int64_t)total : -KERNEL_EINVAL;
+            break;
+        }
+        if (total == request) {
+            *linux_result = (int64_t)total;
+            kernel_vfs_notify_file(&description->file, VFS_NOTIFY_ACCESS);
+            break;
+        }
+        /* A short user buffer ends the call. A full scratch batch instead
+         * continues from the last accepted opaque cookie, never from zero. */
+        if (remaining <= capacity || request - total < 24U) {
+            *linux_result = (int64_t)total;
+            break;
         }
     } while (total < request);
+    if (scratch.allocator) kernel_task_io_buffer_release(&scratch);
     KERNEL_FILES_NOTE(files, bytes_read, total);
-    *linux_result = (int64_t)total;
-    kernel_vfs_notify_file(&description->file,VFS_NOTIFY_ACCESS);
-    return KERNEL_FILES_STATUS_OK;
+    return status;
 }
 
 #if BOAROS_COST_DIAGNOSTICS

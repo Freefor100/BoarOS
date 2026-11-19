@@ -173,6 +173,7 @@ struct boaros_lwip_tcp_context boaros_lwip_tcp_default_context;
 #define tcp_port      (boaros_lwip_tcp_context_current()->local_port)
 #define tcp_timer     (boaros_lwip_tcp_context_current()->timer)
 #define tcp_timer_ctr (boaros_lwip_tcp_context_current()->timer_ctr)
+#define tcp_corks     (boaros_lwip_tcp_context_current()->corks)
 #else
 /* Last local TCP port and coarse-grained timer tick. */
 static u16_t tcp_port = TCP_LOCAL_PORT_RANGE_START;
@@ -199,6 +200,7 @@ u8_t tcp_active_pcbs_changed;
 /** Timer counter to handle calling slow-timer from tcp_tmr() */
 static u8_t tcp_timer;
 static u8_t tcp_timer_ctr;
+static struct boaros_lwip_cork_queue tcp_corks;
 #endif
 static u16_t tcp_new_port(void);
 
@@ -220,6 +222,37 @@ tcp_init(void)
   tcp_port = TCP_ENSURE_LOCAL_PORT_RANGE(LWIP_RAND());
 #endif /* LWIP_RAND */
 #endif
+}
+
+/* The owner holds every PCB on this queue. New deadlines normally append;
+ * a PCB arriving from another owner can have an earlier absolute deadline. */
+static void
+tcp_cork_insert(struct boaros_lwip_cork_queue *queue, struct tcp_pcb *pcb)
+{
+  struct tcp_pcb *prev = queue->tail;
+  struct tcp_pcb *next = NULL;
+  while (prev && (s32_t)(pcb->boaros_cork_deadline - prev->boaros_cork_deadline) < 0) {
+    next = prev;
+    prev = prev->boaros_cork_prev;
+  }
+  pcb->boaros_cork_prev = prev;
+  pcb->boaros_cork_next = next;
+  if (prev) prev->boaros_cork_next = pcb;
+  else queue->head = pcb;
+  if (next) next->boaros_cork_prev = pcb;
+  else queue->tail = pcb;
+}
+
+static void
+tcp_cork_remove(struct boaros_lwip_cork_queue *queue, struct tcp_pcb *pcb)
+{
+  struct tcp_pcb *prev = pcb->boaros_cork_prev;
+  struct tcp_pcb *next = pcb->boaros_cork_next;
+  if (prev) prev->boaros_cork_next = next;
+  else queue->head = next;
+  if (next) next->boaros_cork_prev = prev;
+  else queue->tail = prev;
+  pcb->boaros_cork_prev = pcb->boaros_cork_next = NULL;
 }
 
 #ifdef BOAROS_LWIP_TCP_CONTEXT
@@ -280,11 +313,20 @@ boaros_lwip_tcp_context_move_active(struct boaros_lwip_tcp_context *from,
   LWIP_ASSERT("migrating PCB is absent from its owner", *link == pcb);
   *link = pcb->next;
   from->active_changed = 1;
+  if (pcb->boaros_cork_pending) {
+    tcp_cork_remove(&from->corks, pcb);
+    tcp_cork_insert(&to->corks, pcb);
+  }
 #if LWIP_CALLBACK_API || TCP_LISTEN_BACKLOG
   /* Handshake and backlog credit no longer use the listener. */
   pcb->listener = NULL;
 #endif
   pcb->tmr += to->ticks - from->ticks;
+#ifdef BOAROS_LWIP_TCP_INFO
+  pcb->boaros_last_sent += to->ticks - from->ticks;
+  pcb->boaros_last_recv += to->ticks - from->ticks;
+  pcb->boaros_last_ack += to->ticks - from->ticks;
+#endif
   if (pcb->rttest) {
     pcb->rttest += to->ticks - from->ticks;
     if (!pcb->rttest) pcb->rttest = 1;
@@ -298,11 +340,77 @@ boaros_lwip_tcp_context_move_active(struct boaros_lwip_tcp_context *from,
 }
 #endif
 
+void
+boaros_lwip_tcp_cork_arm(struct tcp_pcb *pcb)
+{
+  if (!pcb->boaros_cork_pending) {
+    pcb->boaros_cork_deadline = sys_now() + 200;
+    tcp_cork_insert(&tcp_corks, pcb);
+    pcb->boaros_cork_pending = 1;
+  }
+}
+
+void
+boaros_lwip_tcp_cork_cancel(struct tcp_pcb *pcb)
+{
+  if (pcb->boaros_cork_pending) {
+    tcp_cork_remove(&tcp_corks, pcb);
+    pcb->boaros_cork_pending = 0;
+  }
+}
+
+void
+boaros_lwip_tcp_push(struct tcp_pcb *pcb)
+{
+  boaros_lwip_tcp_cork_cancel(pcb);
+  pcb->boaros_output_more = 0;
+  pcb->boaros_push_seq = pcb->snd_lbb;
+  pcb->boaros_push_pending = pcb->unsent != NULL;
+}
+
+int
+boaros_lwip_tcp_cork_ready(void)
+{
+  const struct tcp_pcb *first = tcp_corks.head;
+  return first && (s32_t)(first->boaros_cork_deadline - sys_now()) <= 0;
+}
+
+u32_t
+boaros_lwip_tcp_cork_delay(u32_t now)
+{
+  const struct tcp_pcb *first = tcp_corks.head;
+  if (!first) return UINT32_MAX;
+  s32_t remaining = (s32_t)(first->boaros_cork_deadline - now);
+  return remaining > 0 ? (u32_t)remaining : 0;
+}
+
+unsigned
+boaros_lwip_tcp_cork_due(unsigned budget)
+{
+  struct boaros_lwip_cork_queue *queue = &tcp_corks;
+  if (!budget || !queue->head) return 0;
+  u32_t now = sys_now();
+  unsigned done = 0;
+  while (queue->head && done < budget) {
+    struct tcp_pcb *pcb = queue->head;
+    if ((s32_t)(pcb->boaros_cork_deadline - now) > 0) break;
+    boaros_lwip_tcp_push(pcb);
+    /* Output may retire the PCB. Re-read the owned queue for the next tail. */
+    LWIP_HOOK_TCP_OUTPUT_PENDING(pcb);
+    done++;
+  }
+  return done;
+}
+
 /** Free a tcp pcb */
 void
 tcp_free(struct tcp_pcb *pcb)
 {
   LWIP_ASSERT("tcp_free: LISTEN", pcb->state != LISTEN);
+  LWIP_ASSERT("tcp_free: pending cork deadline", !pcb->boaros_cork_pending);
+#ifdef BOAROS_LWIP_TCP_INFO
+  boaros_lwip_tcp_info_retire(pcb);
+#endif
 #ifdef BOAROS_LWIP_TCP_CONTEXT
   if (pcb->boaros_owner) boaros_lwip_tcp_pcb_forget(pcb);
 #endif
@@ -1478,6 +1586,9 @@ tcp_slowtmr_start:
               u8_t backoff_idx = LWIP_MIN(pcb->nrtx, sizeof(tcp_backoff) - 1);
               int calc_rto = ((pcb->sa >> 3) + pcb->sv) << tcp_backoff[backoff_idx];
               pcb->rto = (s16_t)LWIP_MIN(calc_rto, 0x7FFF);
+#ifdef BOAROS_LWIP_TCP_INFO
+              pcb->boaros_rto_backoff = tcp_backoff[backoff_idx];
+#endif
             }
 
             /* Reset the retransmission timer. */
@@ -1497,6 +1608,9 @@ tcp_slowtmr_start:
 
             /* The following needs to be called AFTER cwnd is set to one
                mss - STJ */
+#ifdef BOAROS_LWIP_TCP_INFO
+            if (pcb->boaros_rto_retries != 255) pcb->boaros_rto_retries++;
+#endif
             tcp_rexmit_rto_commit(pcb);
           }
         }
@@ -2101,6 +2215,10 @@ tcp_alloc(u8_t prio)
     pcb->rtime = -1;
     pcb->cwnd = 1;
     pcb->tmr = tcp_ticks;
+#ifdef BOAROS_LWIP_TCP_INFO
+    pcb->boaros_last_sent = pcb->boaros_last_recv = pcb->boaros_last_ack = tcp_ticks;
+    pcb->boaros_min_rtt = 0xffffffffU;
+#endif
     pcb->last_timer = tcp_timer_ctr;
 
     /* RFC 5681 recommends setting ssthresh arbitrarily high and gives an example
@@ -2336,6 +2454,8 @@ tcp_pcb_purge(struct tcp_pcb *pcb)
       pcb->state != LISTEN) {
 
     LWIP_DEBUGF(TCP_DEBUG, ("tcp_pcb_purge\n"));
+
+    boaros_lwip_tcp_cork_cancel(pcb);
 
     tcp_backlog_accepted(pcb);
 

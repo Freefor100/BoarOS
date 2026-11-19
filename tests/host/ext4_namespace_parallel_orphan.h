@@ -1,6 +1,74 @@
 #include <ext4_block_group.h>
 #include <ext4_orphan.h>
 
+static unsigned observe_unlink, orphan_adds, direct_frees;
+static int fail_direct_free;
+int __real_ext4_orphan_add(struct ext4_inode_ref *);
+int __wrap_ext4_orphan_add(struct ext4_inode_ref *ref)
+{
+    if (observe_unlink) orphan_adds++;
+    return __real_ext4_orphan_add(ref);
+}
+int __real_ext4_fs_free_inode(struct ext4_inode_ref *);
+int __wrap_ext4_fs_free_inode(struct ext4_inode_ref *ref)
+{
+    int result = __real_ext4_fs_free_inode(ref);
+    if (observe_unlink && !orphan_adds) {
+        direct_frees++;
+        if (fail_direct_free && !result) return fail_direct_free;
+    }
+    return result;
+}
+
+static void orphan_closed_case(struct lwext4_mount_adapter *adapter,
+    struct kernel_vfs_path *root)
+{
+    struct kernel_vfs_file file = {0};
+    const int faults[] = {0, ENOMEM, ENOSPC, EIO};
+    for (unsigned i = 0; i < sizeof(faults) / sizeof(*faults); ++i) {
+        assert(!kernel_vfs_create_at(root, root, "closed-victim", 0600, &file, 0));
+        assert(!kernel_vfs_close(&file));
+        orphan_adds = direct_frees = 0;
+        observe_unlink = 1; fail_direct_free = faults[i];
+        assert(!kernel_vfs_unlink_at(root, root, "closed-victim", 0));
+        observe_unlink = fail_direct_free = 0;
+        assert(direct_frees == 1 && orphan_adds == !!faults[i]);
+    }
+
+    assert(!kernel_vfs_mkdir_at(root, root, "ownerless-dir", 0700, 0));
+    orphan_adds = direct_frees = 0; observe_unlink = 1;
+    assert(!kernel_vfs_unlink_at(root, root, "ownerless-dir", 1));
+    observe_unlink = 0;
+    assert(direct_frees == 1 && !orphan_adds);
+
+    struct kernel_vfs_path *path = NULL;
+    assert(!kernel_vfs_create_at(root, root, "held-victim", 0600, &file, 0));
+    assert(!kernel_vfs_close(&file));
+    assert(!kernel_vfs_path_lookup(root, "held-victim", 11, &path));
+    uint32_t inode = kernel_vfs_path_inode(path);
+    orphan_adds = direct_frees = 0; observe_unlink = 1;
+    assert(!kernel_vfs_unlink_at(root, root, "held-victim", 0));
+    observe_unlink = 0;
+    assert(!direct_frees && orphan_adds == 1);
+    bool present;
+    assert(!ext4_orphan_contains(adapter->device.fs, inode, &present) && present);
+    assert(!kernel_vfs_path_open(path, &file) && !kernel_vfs_close(&file));
+    assert(!kernel_vfs_path_release(&path));
+    assert(!ext4_orphan_contains(adapter->device.fs, inode, &present) && !present);
+
+    assert(!kernel_vfs_create_at(root, root, "dirty-victim", 0600, &file, 0));
+    assert(!kernel_vfs_file_acquire_write(&file));
+    size_t written;
+    assert(!kernel_vfs_pwrite(&file, 0, "dirty", 5, &written) && written == 5);
+    struct kernel_vfs_node *node = kernel_vfs_file_node(&file);
+    assert(!kernel_vfs_close(&file) && node->open_files == 1 && node->references > 1);
+    orphan_adds = direct_frees = 0; observe_unlink = 1;
+    assert(!kernel_vfs_unlink_at(root, root, "dirty-victim", 0));
+    observe_unlink = 0;
+    assert(!direct_frees && orphan_adds == 1);
+    puts("PASS closed unlink/rmdir: one operation, injected rollback, held path and cached data");
+}
+
 static void orphan_normal_order_case(struct lwext4_mount_adapter *adapter,
     struct kernel_vfs_path *parent,struct kernel_vfs_path *root)
 {
@@ -14,9 +82,16 @@ static void orphan_normal_order_case(struct lwext4_mount_adapter *adapter,
             static const char payload[4096]="retained unlinked data";
             size_t written;
             assert(!kernel_vfs_pwrite(&file,0,payload,sizeof(payload),&written) && written==sizeof(payload));
-            /* A journal drain does not submit the file's delayed dirty pages. */
-            uint64_t observed=kernel_vfs_error_sequence(&file);
-            assert(!kernel_vfs_sync(&file,0,&observed));
+            if (worker_mode) {
+                uint64_t observed=kernel_vfs_error_sequence(&file);
+                assert(!kernel_vfs_sync(&file,0,&observed));
+            } else {
+                /* The manual journal model drives its own progress. Submit
+                 * delayed data before draining the accepted metadata. */
+                assert(!kernel_page_cache_writeback_range(adapter->instance.page_cache,
+                    kernel_vfs_file_node(&file),0,UINT64_MAX));
+                assert(!ext4_journal_group_drain(adapter->mount_point));
+            }
             adapter->locks.read_lock(adapter->locks.context);
             struct ext4_inode_ref ref;
             assert(!ext4_fs_get_inode_ref(adapter->device.fs,inode,&ref) &&
@@ -99,7 +174,7 @@ static void orphan_snapshot_case(struct lwext4_mount_adapter *adapter,
     assert(!kernel_vfs_create_at(first,root,"orphan-victim",0600,&file,0));
     unsigned per_group=ext4_get32(&fs->sb,inodes_per_group);
     uint32_t group=(kernel_vfs_file_inode(&file)-1)/per_group;
-    assert(group==(kernel_vfs_path_inode(second)-1)/per_group && !kernel_vfs_close(&file));
+    assert(group==(kernel_vfs_path_inode(second)-1)/per_group);
     adapter->locks.read_lock(adapter->locks.context);
     struct ext4_block_group_ref descriptor;
     assert(!ext4_fs_get_block_group_ref(fs,group,&descriptor));
@@ -133,7 +208,7 @@ static void orphan_snapshot_case(struct lwext4_mount_adapter *adapter,
             actors[0].result,actors[1].result,group,actors[0].group_guard!=NULL);
     assert(!actors[0].result && !actors[1].result && actors[0].group_guard);
     assert((kernel_vfs_file_inode(&actors[1].created)-1)/per_group==group);
-    assert(!kernel_vfs_close(&actors[1].created) &&
+    assert(!kernel_vfs_close(&file) && !kernel_vfs_close(&actors[1].created) &&
            !kernel_vfs_unlink_at(second,root,"after-gdt",0) &&
            !ext4_journal_group_drain(adapter->mount_point));
     puts("PASS orphan allocation check: GDT and inode bitmap share group qualification; same-group create queues instead of false EUCLEAN");

@@ -10,7 +10,8 @@ import harness
 from arch_profiles import PROFILES
 from cost.cost_fixture import FrozenFixture
 from qemu_thread_affinity import host_cpu_selection,pin_qemu_threads,host_cpu_topology
-MQ_CASES=('native64-libc-priority-fifo-segments-ofd-flags-timeout',
+MQ_CASES=('registration-reader-and-bidirectional-sender-after-exit',
+ 'native64-libc-priority-fifo-segments-ofd-flags-timeout',
  'poll-epoll-stat-write-mmap-usercopy',
  'signal-real-sender-value64-childclose-owner-anyfd-none-single-registration',
  'libc-sigev-thread-callback-and-removed-cookie',
@@ -93,7 +94,7 @@ def main():
     perf.wait(timeout=10)
  raw=(out/'boot.log').read_text(errors='replace').replace('\r','');prefix='POSIX-MQ ' if a.case=='mqueue' else 'PIPE-CAPACITY '
  rows=[l for l in raw.splitlines() if l.startswith(prefix)]
- expected=(['POSIX-MQ BEGIN',*[f'POSIX-MQ CASE {name} PASS' for name in MQ_CASES],'POSIX-MQ END 6'] if a.case=='mqueue' else ['PIPE-CAPACITY PASS '+name for name in PIPE_CASES])
+ expected=(['POSIX-MQ BEGIN',*[f'POSIX-MQ CASE {name} PASS' for name in MQ_CASES],'POSIX-MQ END 7'] if a.case=='mqueue' else ['PIPE-CAPACITY PASS '+name for name in PIPE_CASES])
  metrics=[]
  if a.case=='cost':
   rows=[line for line in raw.splitlines() if line.startswith('MQPIPE ')]
@@ -109,7 +110,7 @@ def main():
   expected=names
   passed=code==0 and len(rows)==len(names)+2 and rows[0].startswith(f"MQPIPE BEGIN version=1 mode={a.cost_mode} profile={configuration['profile']} cpus={a.cpus} ") and rows[-1]==expected_end and [m['name'] for m in metrics]==names and all(m['wall_ns']>0 and m['cpu_ns']>0 for m in metrics) and sum(m['checks'] for m in metrics)==checks
  else:passed=code==0 and rows==expected
- if a.system=='boaros':passed=passed and profile.root_success(raw,0)
+ if a.system=='boaros':passed=passed and (profile.root_poweroff_success(raw) if a.case=='mqueue' else profile.root_success(raw,0))
  fsck=None
  if passed:
   with (out/'fsck.log').open('w') as log:fsck=subprocess.run(['e2fsck','-fn',str(disk)],stdout=log,stderr=subprocess.STDOUT).returncode

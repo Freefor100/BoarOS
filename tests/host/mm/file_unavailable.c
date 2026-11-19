@@ -19,6 +19,7 @@ __attribute__((weak)) void kernel_task_current_memory_limits(struct kernel_memor
 { *out = (struct kernel_memory_limits){UINT64_MAX, UINT64_MAX, UINT64_MAX}; }
 #define EXCLUDED(name) void name(void) { mm_file_unavailable(); }
 EXCLUDED(kernel_shm_attachment_close)
+EXCLUDED(kernel_shm_attachment_close_for_task)
 EXCLUDED(kernel_shm_attachment_open)
 EXCLUDED(kernel_shm_attachment_acquire)
 EXCLUDED(kernel_shm_attachment_create)
@@ -49,12 +50,23 @@ EXCLUDED(kernel_socket_rights_changed)
 EXCLUDED(kernel_pidfd_close)
 EXCLUDED(kernel_pipe_release_endpoint)
 EXCLUDED(kernel_pipe_destroy)
+/* Direct-write/fallocate code is linked by shared VFS routines, but this
+ * tmpfs-only fixture never owns a disk cache. Reject accidental entry. */
+struct kernel_page_cache;
+struct kernel_vfs_node;
+void kernel_page_cache_invalidate_range(struct kernel_page_cache *cache,
+    struct kernel_vfs_node *node,uint64_t start,uint64_t end)
+{
+    (void)cache;(void)node;(void)start;(void)end;
+    mm_file_unavailable();
+}
 EXCLUDED(kernel_page_cache_truncate)
 EXCLUDED(kernel_page_cache_writeback_range_borrowing)
 EXCLUDED(kernel_page_cache_get)
 EXCLUDED(kernel_page_cache_get_for_fault)
 EXCLUDED(kernel_page_cache_get_batch)
 EXCLUDED(kernel_page_cache_lookup)
+EXCLUDED(kernel_page_cache_lookup_ready)
 EXCLUDED(kernel_page_cache_acquire_ready)
 EXCLUDED(kernel_page_cache_resident)
 EXCLUDED(kernel_page_cache_alias_attach)
@@ -84,6 +96,7 @@ EXCLUDED(kernel_page_cache_cancel_readahead)
 EXCLUDED(kernel_page_cache_accept_mapping_write)
 EXCLUDED(kernel_page_cache_finish_mapping_write)
 EXCLUDED(kernel_page_cache_writeback)
+EXCLUDED(kernel_page_cache_pin_dirty_nodes)
 #ifndef MM_TEST_BPF
 EXCLUDED(kernel_bpf_mmap_page)
 #endif

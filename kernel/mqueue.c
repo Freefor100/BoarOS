@@ -574,7 +574,7 @@ static void message_dequeue(struct kernel_mqueue_request *r)
     }
     q->count--;q->bytes-=r->message->size;
 }
-static int message_publish(struct kernel_mqueue_request *sender,struct mq_notification *notification)
+static int message_publish(struct kernel_mqueue_request *sender)
 {
     struct kernel_mqueue *q=sender->queue;
     int enqueued=!q->recv_head;
@@ -582,7 +582,18 @@ static int message_publish(struct kernel_mqueue_request *sender,struct mq_notifi
         struct kernel_mqueue_request *receiver=q->recv_head;
         receiver->message=sender->message;sender->message=0;request_complete(receiver);
     }else{
-        if(!q->count&&q->notification.owner){*notification=q->notification;q->notification=(struct mq_notification){0};}
+        if(!q->count&&q->notification.owner){
+            sender->outgoing=q->notification;
+            q->notification=(struct mq_notification){0};
+            sender->outgoing_reason=1;
+            if(sender->outgoing.type==0){
+                /* Snapshot on the publishing task, not the eventual cleanup
+                 * executor. The registration pins the receiving PID view. */
+                struct kernel_pid *id=sender->task->group_leader->identities[KERNEL_PID_TGID].identity;
+                sender->sender_tgid=kernel_pid_number_in(id,sender->outgoing.owner->registry);
+                sender->sender_uid=kernel_credentials_current()->uid;
+            }
+        }
         message_enqueue(sender);
     }
     q->mtime=q->ctime=mq_now();
@@ -598,8 +609,6 @@ int64_t kernel_mqueue_send(struct kernel_task *task,struct kernel_mm *mm,int64_t
     if((r->file->open_flags&3U)!=1&&(r->file->open_flags&3U)!=2){error=-KERNEL_EBADF;goto done;}
     if(size>r->queue->msgsize){error=-KERNEL_EMSGSIZE;goto done;}
     r->deadline=deadline;r->timed=abstime!=0;error=message_import(r,mm,data,size,priority);if(error)goto done;
-    if(kernel_task_tgid(task,&r->sender_tgid))__builtin_trap();
-    r->sender_uid=kernel_credentials_current()->uid;r->outgoing_reason=1;
     struct kernel_wait_cursor cursor={0};int notify=0;
     for(;;){
       { KERNEL_RAW_SCOPE(g,&r->queue->lock);
@@ -607,7 +616,7 @@ int64_t kernel_mqueue_send(struct kernel_task *task,struct kernel_mm *mm,int64_t
             if(!r->queue->recv_head&&!r->priority&&!priority_find(r->queue,priority))error=2;
             else{
                 /* Direct delivery wakes its receiver; queue readiness is unchanged. */
-                if(message_publish(r,&r->outgoing))
+                if(message_publish(r))
                     notify=kernel_wait_cursor_prepare(&r->queue->waiters,&cursor);
                 error=0;
             }
@@ -832,7 +841,7 @@ static size_t append_decimal(char *buffer,size_t at,uint64_t value,unsigned widt
 int kernel_mqueue_queue_read(struct kernel_mqueue *q,uint64_t offset,void *buffer,size_t size,size_t *read)
 {
     char text[128];uint64_t bytes,pid,type,signo;
-    {KERNEL_RAW_SCOPE(g,&q->lock);bytes=q->bytes;pid=q->notification.owner?(uint32_t)q->notification.owner->number:0;
+    {KERNEL_RAW_SCOPE(g,&q->lock);bytes=q->bytes;pid=q->notification.owner?(uint32_t)kernel_task_identity_user_number(q->notification.owner):0;
      type=q->notification.owner?(uint32_t)q->notification.type:0;
      signo=q->notification.owner&&!q->notification.type?(uint32_t)q->notification.signal:0;
      q->atime=mq_now();}

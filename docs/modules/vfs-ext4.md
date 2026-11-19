@@ -2,6 +2,38 @@
 
 本文描述当前根文件系统的稳定接口和 lwext4 私有适配。第三方版本与许可证见[第三方代码](../third-party.md)。
 
+## 普通文件直接 I/O
+
+ext4 普通文件可在打开时指定 `O_DIRECT`，也可通过 `F_SETFL` 切换。
+启用日志的 ext4 同时支持匿名临时文件 `O_TMPFILE` 的直接 I/O。按设备逻辑扇区检查文件偏移、用户缓冲区地址和各向量长度。
+对齐的扩展写沿用 extent 分配事务，读取文件空洞返回零。
+
+VFS 先暂存用户输入并归还用户页引用。文件写操作锁保护相交的共享映射撤销、
+脏页写回、设备操作和缓存失效，期间暂停新映射发布。恢复映射发布后再复制用户
+输出，输入和输出均可以映射同一文件。
+
+已接纳的日志数据按物理块范围从旧到新提交。设备阶段持有不可变的数据版本，
+完成后记录结果，提交事务时跳过已经发送的数据。同一设备上这些范围的数据阶段
+通过一把可睡眠的锁顺序执行。日志提交仍按原有规则请求两次设备持久化，
+`O_DIRECT` 本身只等待数据操作完成。设备错误保留尚待恢复的版本并停止提交。
+
+无日志的 ext4 按同步块 I/O 完成数据写入。完整块直接引用本次请求的稳定缓冲区，
+部分块在内核中组装。提交前排空相交的旧脏块，设备失败后撤销旧缓存，防止它覆盖
+已写入的前缀。扩展前同步清零旧 EOF 所在块中即将可见的尾部。已完成的批次保留
+字节计数和文件大小，未完成的新增 extent 交给原有清理过程处理。无日志卷的
+修复要求见下文的挂载及错误处理规则。
+
+`JOURNAL_TEST_CASE=direct-ordered sh tests/host/lwext4-journal.sh` 检查同一物理块
+的多代数据、提交时的并发替换及 I/O 故障。`sh tests/host/lwext4-metadata.sh direct-reuse`
+检查正在写回的旧目录块在释放事务完成前禁止复用、复用后的读写及断电恢复。
+`FILE_IO_HOST_TCP=0 FILE_IO_DIRECT_ONLY=1 sh tests/host/file-io-concurrency.sh` 检查
+映射和数据写回交接。`tests/userland/direct-file.py` 用实际 RV64 或 LA64 内核运行
+普通文件直读写、扩展、故障、映射和文件传输。
+
+`sh tests/host/lwext4-metadata.sh nojournal-direct` 对 1 KiB 和 4 KiB 文件系统块测试
+旧 EOF 尾部、设备错误及失败分配的回收。`tests/userland/direct-file.py --nojournal`
+使用预置文件，退出后通过 debugfs 核对文件的完整内容与大小。
+
 ## 通用边界
 
 `include/kernel/block.h` 定义同步块设备（支持读与可选写），`include/kernel/vfs.h` 定义 mount/file 对象以及根挂载、open/create、pread/pwrite、ftruncate、mkdir、unlink、rmdir、close、unmount、`kernel_vfs_fstat()` 与 `kernel_vfs_mount_is_readonly()` 查询。VFS 对外返回负 Linux errno；lwext4 的结构、全局设备名和正值 errno 不泄漏到调用者。当前有独立的 ext4、FAT32/VFAT、tmpfs、proc 和 devpts 实例；lwext4 共用 heap binding 按实例引用计数维护，每实例携带自己的锁上下文；进程 fd/open-file-description 位于独立的[文件资源层](kernel-files.md)，每个挂载命名空间持有自己的挂载视图树；命名空间修改使用可睡眠 mutex，inode、OFD 与后端各自同步。
@@ -10,7 +42,15 @@
 `fs/vfs.c` 管理路径身份、引用、执行/写租约、记录锁和缓存；
 `fs/file_mapping.c` 管理 inode–MM 登记、借用游标和文件代次。
 
-路径属性查询与open共用最终对象解析，直接复用名称索引中的真实dentry/inode。没有活对象时才查目录并建立节点；ext4打开inode时一并导入mode、owner和group，不先单独读取子inode的mode再打开同一inode。活ext4节点同时保存从已校验inode导入的基本属性，stat按下述修改代次复用，合入当前大小、延迟分配块数及待发布时间戳。路径搜索直接复用已有目录命名空间读资格检查mode、owner和ACL，因为chmod、chown及ACL修改都持有对应写资格，不再每个分量叠加一次inode I/O锁。ACL读取错误仍返回原错误；没有目录资格的独立查询及proc等动态权限后端保留原I/O保护。目录搜索权限仍先检查，已保留路径和挂载点仍解析真实视图，需要跟随的符号链接继续展开目标。stat/access 的最终路径存储归本次查询调用者，持有真实目录项及挂载引用直到属性和权限检查结束，不为这份不逃逸的路径创建、登记再销毁堆对象；OFD、cwd 或显式路径查询仍取得持久路径 owner。
+路径属性查询与open共用最终对象解析，直接复用名称索引中的真实dentry/inode。没有活对象时才查目录并建立节点；ext4打开inode时一并导入mode、owner和group，不先单独读取子inode的mode再打开同一inode。活ext4节点同时保存从已校验inode导入的基本属性，stat按下述修改代次复用，合入当前大小、延迟分配块数及待发布时间戳。路径搜索复用目录命名空间读资格检查mode、owner和ACL，因为chmod、chown及ACL修改都持有对应写资格。ACL读取错误仍返回原错误。没有目录资格的独立查询及proc等动态权限后端保留原I/O保护。路径解析检查每一级目录搜索权限，解析覆盖挂载并按请求跟随符号链接。临时分量始终持有目录项引用。起始路径或根路径已持有同一挂载时，临时分量借用这份挂载引用，跨到其他视图时取得自身引用。stat/access 的终点和普通 unlink 的目标可使用调用期存储。OFD、cwd 或显式路径查询取得可独立存活的持久路径。
+
+`statx`、`openat` 和 `readlinkat` 共用的目录项索引直接比较路径分量的地址和长度，只有建立目录项时才复制名称。同一前缀的长短名称仍分别匹配。路径遍历只越过一次连续分隔符，展开符号链接时仍保留原始后缀及末尾斜杠规则。
+
+父目录项在同一份 VFS 状态保护内记住最近一次命中的子项。重复访问公共路径前缀可直接比较该名称，未命中走原名称树。摘除或改名先清除原父目录的提示，提示不另持引用。目录搜索权限、覆盖挂载及后端错误仍按实际路径检查。
+
+命中真实目录项但未找到持久路径包装时，沿用同一次挂载位置索引的未命中结果。候选在保护外分配，发布时重新检查位置索引和挂载关闭状态，复用其他查找或挂载操作已建立的位置。
+
+路径遍历器的栈上临时路径从不登记到挂载视图索引，其引用计数由当前调用直接维护。真实目录项与挂载视图仍持引用。挂载视图的非末次归还只更新原子引用字，最后一次归还仍在 VFS 状态锁内重新核对引用、摘索引并移交退休所有权，因此挂载查询、拓扑发布和懒卸载仍共享原保护。
 
 基本属性与时间共用实际元数据操作的staged-inode记录和真实节点引用。dirty inode进入已有操作记录时登记修改者，外层接纳或回滚完成后，在原时间状态短保护内使旧属性失效；非journal失败可能已有完成前缀，因此失败也失效。登记分配失败时立即使已修改节点的旧属性失效，不能依赖一份未成功建立的完成记录。相同操作已经持有的节点直接复用，不反复查inode索引和借还引用。最后关闭、unlink、namespace修改、写回及范围修改均经过同一记录，结束实际借用后释放节点。
 
@@ -283,7 +323,7 @@ ctime与非目录的capability属性删除放在同一undo/日志事务中；成
 
 VFS 以文件系统实例与后端 inode 标识为活节点身份，普通文件、目录和字符节点都持有引用计数 node；路径对象另持有父目录项身份和一份活 inode 引用。实例按 inode 建立 AVL 索引，链接嵌在 node 内，查找与增删为 O(log N)，无需另分配索引对象。注册链保留全实例枚举顺序，末引用通过反向链接直接摘链；索引和注册链只借用节点，不增加引用。查询在短 IRQ 保护内完成，需跨等待的调用者在离开保护前取得自己的节点引用。磁盘 inode 复用只替换索引中的退休或已关闭节点，旧节点继续由其实际文件和缓存 owner 持有。独立 open file description 各自保存 offset，但同一 inode 指向共享 node。文件大小通过 `kernel_vfs_file_size()` 实时查询所属 node 的实时大小，确保写入或截断后各共享描述符观察到一致的文件长度。
 
-ext4 的普通文件 stat 取得 inode I/O 读资格，将磁盘属性与实时 EOF 合成一次快照；readlink 保留对应读资格。
+ext4 的普通文件 stat 取得 inode I/O 读资格，将磁盘属性与实时 EOF 合成一次快照。readlinkat 在路径解析完成后复用线程的路径缓冲页接收链接内容。ext4 持有链接 inode 的 I/O 读资格，从存活的文件句柄按偏移 0 读取，覆盖 inode 内联和数据块存储的链接。
 目录 stat 直接复制所借用的稳定 inode，不阻止后续修改。目录 nlink、FD 时间和权限修改由后端
 inode 修改资格串行，私有版本接纳后才替换可见 payload；复制完成的旧快照继续有效。
 FD 属性修改仍持有 VFS I/O 写资格，保护共享 handle 及缓存 mode；目录名称修改使用前述目录资格，仅在 link 源、删除或真正覆盖目标需要协调退休时取得 VFS I/O 写资格。直接端口回归另检查同一 inode 表块的记录合并。
@@ -336,16 +376,13 @@ journal 路径已包含持久化屏障，不额外发设备 flush；无 journal 
 
 日志请求、checkpoint 请求和进度等待队列随挂载实例一起初始化，同步推进日志与后台 worker 共用这些队列。后台线程启动只建立执行者，不重置等待关系；受限日志预算在前台同步推进旧组后也可正常发布进度。
 
-lwext4 块缓存保留目标作用于闲置缓冲，默认 8 项；正在装入、被调用者或日志借用的块另持真实引用。miss 在短保护下按闲置 LRU 选择释放者，日志版本的 home 缓冲仍计入原日志内存预算。批量借用归还和并发 miss 可短时超过闲置目标，内存压力沿现有回收入口处理。将日志借用计入闲置目标会使其占满名额，导致根目录和父目录反复驱逐、读盘。
+BoarOS 挂载 ext4 后，将 lwext4 块缓存的闲置载荷保留目标设为可管理物理内存的 1/256，下限为 128 千二进制字节（kibibyte，KiB），上限为 8 兆二进制字节（mebibyte，MiB）。正在装入或被借用的块由实际使用者持有。缓存未命中时，回收者从闲置列表中选择最久未使用的块（Least Recently Used，LRU）。内存压力下可以独立回收闲置干净块，日志持有的块版本仍计入日志内存预算。
 
 ## 挂载范围与全局同步
 
-`kernel_vfs_sync_mount()`在 CPU0 执行范围内借用共享重配置资格，再取得根路径owner，按注册时增减的节点计数准备快照容量，
-再在短发布保护区遍历一次并引用全部活节点；容量不足时先重新准备，不能漏掉新增节点。
-节点在取得inode锁和睡眠前已被钉住，调用结束统一归还。逐个交接普通文件页缓存后，
-后端捕获挂载durable目标一次；并发新修改不不断推进该目标。journal保留ordered-data、
-日志与commit的既有屏障，syncfs不要求checkpoint全部完成；无journal则写回全部块缓存
-并执行设备FLUSH。文件被unlink或最后fd关闭，不会从本次已捕获的节点集合消失。
+`kernel_vfs_sync_mount()` 取得挂载重配置的共享资格和根路径引用。页缓存从已排队的脏索引节点中取得该文件系统实例的快照，快照内每个索引节点具有独立引用。前八个引用使用栈内数组。数组容量不足时，调用者在缓存保护外扩大数组，再重新取得快照。
+
+调用者逐个提交快照内文件的脏页，后端随后捕获一次挂载持久化目标。日志文件系统保留数据先于元数据提交的顺序，等待提交达到该目标。无日志文件系统写回块缓存后执行设备刷新（Flush）。删除目录项或关闭描述符时，快照内的独立引用继续保护相应的索引节点。
 
 全局sync先捕获已发布挂载的根路径引用，释放发布保护后进行I/O；额外引用阻止卸载。
 挂载数组OOM时，按入口时的挂载身份上界逐个重新查找并取得引用，跨等待不保留裸树指针。
@@ -359,6 +396,8 @@ lwext4 块缓存保留目标作用于闲置缓冲，默认 8 项；正在装入�
 验证入口是文件／VFS fixture、`tests/diff-abi/sync.c`及真实musl的`tests/userland/sync.h`。
 
 ## lwext4 配置和生命周期
+
+ext4 文件读取先确认物理块是否有尚未写回的事务数据版本。日志记录有序数据树的非空数量。私有事务插入第一条数据前就登记，两个非空树合入同一运行组时合并计数，摘除整棵树后释放其计数。查询读到零时可直接检查块缓存并读取设备；有树时在日志状态保护内检查私有、运行、封存、提交及失败的事务，取得实际载荷引用后再复制。事务出错后保留的数据仍可读。
 
 内核编译 lwext4 journal/replay、orphan 和分批截断路径，启用按实际inode执行的xattr操作供用户属性、exec及清除文件特权使用；关闭debug/assert和mkfs，并把 malloc/calloc/realloc/free 绑定到当前内核堆。用户属性入口见[共同文件接口](kernel-files.md#扩展属性)，ACL另列能力缺口。生产根盘使用 raw whole-disk ext4。块层在整盘登记后扫描 MBR 四主分区，ext4 后端直接访问所选设备的相对偏移；分区平移、父盘引用和物理 I/O 锁由块层维护。
 
@@ -457,6 +496,8 @@ checkpoint 合并另检查 1–3 组不产生 I/O、第四组合并同一 home �
 
 unlink 将最后一个链接摘除与持久 orphan 记录放在同一事务；缩小文件先在操作中登记最终 size 与 orphan，再由 `ext4_truncate.c` 每事务最多释放 32 个尾部数据块及已空的索引路径。意图与回收可以合入同一运行组，也可以按 journal FIFO 跨组提交；普通 truncate/unlink 按真实预算、日志空间或复用压力选择归还资源的提交或 checkpoint，释放范围继续由 quarantine 保留。无 orphan 的新建、同尺寸截断和扩展不启动回收事务。恢复根据实际映射查找尾部，支持稀疏 extent 和三级间接块；最后删除 orphan 记录与释放无链接 inode 在同一事务完成。正常运行时仍打开的无链接 inode 保持内容，重启后回收。`sh tests/host/lwext4-orphan.sh` 包含不同 orphan_file 块的两个真实调用上下文交错、另一操作接纳后本操作 abort、传统链及满文件回退、损坏与日志错误恢复；`sh tests/host/lwext4-operation.sh` 检查调用者上下文、计数增量及父组分配。
 
+extent 回收搜索得到的最高逻辑块落在最后一个窗口时，在该事务内完成尾部释放和最终 inode 收尾。零链接 inode 的最终事务先修改 orphan 记录，再在实际可写的 inode 位图上核对校验和及分配位，清位、更新组描述符和计数。位图或后续写入出错时，事务一并撤销 orphan 修改。
+
 支持有界的 JBD2 checksum v2/v3、32/64-bit revoke；异步 commit、未知必需特性和旧 CRC32 journal 格式明确拒绝。已提交事务的损坏不能当作未提交尾部丢弃。只读脏日志、恢复 I/O 错误或损坏均拒绝开放用户访问。失败的日志/挂载 owner 保留到重启；普通合法内存释放不建立重试链。挂载准备阶段的 ENOMEM/ENOSPC 与关键 I/O 错误分开：资源不足保留可恢复的准备状态，后续 cleanup 可继续恢复并卸载，不能永久锁住 heap binding。
 已有路径先逐分量取得目录项和 inode 身份，再用 ext4_fopen_inode 按 inode 打开，并把本次已读 inode 的权限和时间属性返回适配层。新建由 ext4_create_child 接收已解析的父 inode、名称、模式及最终 UID/GID，在同一操作内完成目录链接与初始属性；不先创建 root 文件再补 chown。新 inode 的实际引用用于设备/链接初始化及 handle 填充，最终归还时生成校验和。新建空文件满足 O_TRUNC，已有文件走正常截断。
 普通文件随机写入与追加先进入页缓存；append 以共享 node 的逻辑 EOF 为起点并推进实际接收字节。定向写回通过 `ext4_fpwrite_batch` 的独立区间提交脏范围，等待事务预算时不会被其他任务改变共享 handle 的 offset。lwext4 的 `SEEK_SET` 允许定位到 EOF 后，磁盘逻辑块只在写回时按数据范围分配；新分配的部分块先清零，旧 EOF 块尾清零，完整中间 hole 保持未映射。底层部分写失败不缩小缓存已经接收的逻辑长度，整段脏范围由页缓存保留供重试。`st_blocks` 报实际已分配存储，不由逻辑大小猜测；检查磁盘块生命周期的测试需先同步。
@@ -485,14 +526,14 @@ GDT 与 inode 的成功校验绑定块数据的实际 payload 版本。每个 pa
 只读借用能看到本事务已有的私有版本，但不自行创建私有块或将未修改的payload标成原地可写。事务私有版本在修改期间不复用校验，接纳发布时清空布局与位图，新旧读者各自持有自己的版本；abort不修改已接纳版本。原地写资格在暴露字节前永久禁用该版本的布局，即使旧读者随后设置一个验证位，也不能重新启用复用。淘汰、块复用和journal image复用均重新开始校验。目录叶、HTree索引和extent树块在同一payload保存一次成功校验，键区分块类型、所属inode及generation；不能编码完整键的inode继续实际校验。extent树节点的magic、深度、条目数量及边界仍逐次核对，稳定版本只省去重复CRC。写资格同时关闭目录校验复用。64位payload头为72字节；不分配另一份数据。
 
 目录修改由父 inode 和单个名称定位；`kernel_vfs_unlink` 保留 Linux 打开后删除的对象语义：
-- `kernel_vfs_unlink` 在需要时先从挂载的 orphan 记录池预留一个回收记录，再调用 `ext4_unlink_child` 从父目录中立即移除目标目录项；后续对原路径的 `open` 立即返回 `-ENOENT`，并在同名路径重新创建时分配独立全新 inode。没有现存 node 的文件也使用这份预留记录，因而 orphan 回收失败时由 mount 单独持有。
+- `kernel_vfs_unlink` 从挂载的 orphan 记录池预留回收记录，再调用 `ext4_unlink_child` 从父目录摘下目标。在已有私有元数据事务中，后端取得可写目录项并持有到删除，复用同一查询结果更新目录块。后续对原路径的 `open` 返回 `-ENOENT`，同名重建使用独立 inode。没有现存 node 时，orphan 回收失败由挂载持有预留记录并重试。
 - 若目标文件当前仍处于打开状态（`node->open_files > 0`），VFS 标记 `node->unlinked = 1`，旧 open 描述符（包括只读/读写 OFD 以及正在运行的源映射 ELF 可执行文件）保留底层 inode 数据与有效物理块，继续正常执行 `read/write/fstat` 与缺页加载（demand fault）；
 - 只有当最后一个打开描述符与执行租约释放（`node->open_files == 0 && node->exec_users == 0`）时，VFS 才通过专有的 `kernel_vfs_try_release_orphan` 驱动物理存储释放。该过程先持有临时节点引用并安全使页缓存失效，再在扁平调用栈上调用 `ext4_orphan_free` 截断释放底层 inode，最后标记 `node->retired = 1`。通用的 `kernel_vfs_node_release` 仅负责内存节点对象的生命周期，绝不隐式或嵌套调用 `ext4_orphan_free`，避免双重释放与页缓存回收深度嵌套额外消耗任务栈；若底层释放失败，节点转移至 `adapter->cleanup_nodes`，由 mount 保留唯一重试 owner，绝不重新指向 file。若文件在 unlink 时没有现存 node，则使用预留记录直接调用 orphan free；失败后记录留在 mount 链，路径仍保持已删除。
 由于 lwext4 的 `ext4_dir_rm` 会递归删除非空目录，`kernel_vfs_rmdir` 通过带目录标志的 `ext4_unlink_child` 只摘目标目录项；后端 `ext4_dir_check_empty` 校验目录记录和 checksum、跳过 `.`/`..` 并拒绝非空目录。被持有的目录 inode 延至最后引用释放才回收；同名重建得到不同 inode，旧路径对象仍可查询零链接状态。目录项 checksum 在设置 inode 字段后计算，卸载后的 `e2fsck -fn` 验证磁盘结构。
 只读挂载下，所有上述修改操作直接返回 `-EROFS`。
 unmount 在仍有 open file 或路径引用时返回 `-EBUSY`。末节点 `ext4_fclose` 失败把 node 转移到 mount cleanup 链，卸载重试同一个 handle；测试注入路径末引用和重复 inode 合并两种 close 失败并确认都被实际重试。非法引用或释放顺序触发 fatal，合法 heap/page 释放不返回可重试状态。
 
-当前 VFS 同时服务 ELF 随机读、进程文件表和文件私有缺页，但仍不是完整 Linux VFS：已支持硬链接、tmpfs 和多 ext4 挂载；仍没有负目录项缓存；后台写回按阈值和压力触发，顺序小读在实际冷缺失后启动有界预读，大批读取和纯热读跳过预测。`kernel_vfs_path` 持有 mount/inode 与父目录项引用；`ext4_lookup_child` 按父目录 inode 查找。统一逐分量解析处理 `.`、`..`、相对/绝对符号链接、尾斜线和最多 40 次展开；open/stat 的尾斜线按目录查找，mkdir/unlink/rmdir/symlink 保留不跟随的最终目录项语义。创建允许缺失的最终分量，直接把已持有的父 inode 与名称交给后端。open 与 stat 的单路径输入复用调用任务已有的一页 I/O 工作区，输入导入和路径解析结束后归还借用，后续设备打开或数据 I/O 不占用这份路径借用。用户输入/符号链接展开限制为 4096 字节；已存在的长父链不占短相对输入额度，255 字节组件可用于修改。路径对象释放不依赖原始绝对路径仍存在。该规则依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`fs/namei.c`](../../references/linux/fs/namei.c)。fs context 和目录 fd 直接持有解析起点；绝对路径忽略 dirfd，删除或改名不会把旧引用重定向到同名新 inode。目录支持打开与按后端 cookie 查询（`kernel_vfs_dir_entry`），会返回真实的 `.`/`..` 条目；每次查询从传入的 ext4 字节位置开始，而不是从目录起点重走，顺序枚举的条目访问为 O(N)。适配层把 lwext4 的正 errno 与 EOF 分开，再向文件资源层返回负 Linux errno。页缓存只保存普通文件内容；进程层只持有 VFS mount/file 抽象，lwext4 handle 没有泄露到 task 或 syscall ABI。
+当前 VFS 同时服务 ELF 随机读、进程文件表和文件私有缺页，但仍不是完整 Linux VFS：已支持硬链接、tmpfs 和多 ext4 挂载；仍没有负目录项缓存；后台写回按阈值和压力触发，顺序小读在实际冷缺失后启动有界预读，大批读取和纯热读跳过预测。`kernel_vfs_path` 持有 mount/inode 与父目录项引用；`ext4_lookup_child` 按父目录 inode 查找。统一逐分量解析处理 `.`、`..`、相对/绝对符号链接、尾斜线和最多 40 次展开；open/stat 的尾斜线按目录查找，mkdir/unlink/rmdir/symlink 保留不跟随的最终目录项语义。创建允许缺失的最终分量，直接把已持有的父 inode 与名称交给后端。open 与 stat 的单路径输入复用调用任务已有的一页 I/O 工作区，输入导入和路径解析结束后归还借用，后续设备打开或数据 I/O 不占用这份路径借用。用户输入/符号链接展开限制为 4096 字节；已存在的长父链不占短相对输入额度，255 字节组件可用于修改。路径对象释放不依赖原始绝对路径仍存在。该规则依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`fs/namei.c`](../../references/linux/fs/namei.c)。fs context 和目录 fd 直接持有解析起点；绝对路径忽略 dirfd，删除或改名不会把旧引用重定向到同名新 inode。目录支持打开与按后端 cookie 批量查询（`kernel_vfs_read_directory`），会返回真实的 `.`/`..` 条目；每次查询从传入的 ext4 字节位置开始，而不是从目录起点重走，顺序枚举的条目访问为 O(N)。适配层把 lwext4 的正 errno 与 EOF 分开，再向文件资源层返回负 Linux errno。页缓存只保存普通文件内容；进程层只持有 VFS mount/file 抽象，lwext4 handle 没有泄露到 task 或 syscall ABI。
 
 目录游标设计依据固定 Linux 快照 `f4cdf7ca9a1f`：[`fs/readdir.c`](../../references/linux/fs/readdir.c)
 的 `iterate_dir()` 在每次枚举前后同步 open file 的 `f_pos` 与 `dir_context.pos`，`filldir64()`
@@ -502,11 +543,35 @@ unmount 在仍有 open file 或路径引用时返回 `-EBUSY`。末节点 `ext4_
 不透明恢复值，而不能固化为条目序号。BoarOS 当前线性 ext4 适配器返回记录结束的字节位置；
 文件资源层将该值放进 OFD offset 和 `linux_dirent64.d_off`，只有完整 usercopy 后才提交。
 
-`ext4_dir_entry_next_status()` 是当前适配器的错误保留入口：一次调用从 `next_off` 定位并推进
-一个或多个物理记录，同一次 inode 读取同时取得实际目录尺寸并发布给适配层，省去每条记录前的重复 stat。inode 为零的目录尾记录不会被误判为 EOF；返回 `UINT64_MAX` 只表示真实结束。
-`kernel_vfs_dir_entry()` 对任意 seek 位置向前对齐到 4 字节边界并规范化到下一个记录，因而保存的
-cookie 可以交给 `lseek`/`telldir`/`seekdir` 恢复。OFD 持有位置，所以独立 open 的游标独立，dup/fork
-共享游标；目录节点本身不保存可变遍历状态。
+`ext4_dir_iterate()` 在有界批次内持有一份 inode 引用与目录 block iterator，顺序推进并将
+名称直接借给内核记录打包函数；不再为每项重新打开 iterator、读取 inode 或复制到第二份名称缓冲。
+inode 为零的物理记录被跳过，只有真实结束才产生 EOF。旧 lwext4 单项消费者仍通过同一个
+iterator 实现读取一项。ext4 的记录结束字节位置继续作为 cookie；seek 后从该位置重新建立
+iterator，状态不跨批次持有。tmpfs 同样每批只查一次 cookie tree，然后顺序前进。
+
+用户调用 `getdents64` 时，首次 ext4 批次用迭代器已经取得的目录索引节点核对相对访问时间（Relative Access Time，relatime）。如果访问时间仍有效，枚举后直接复制目录记录。需要更新时间时，释放目录读取保护后，由原访问时间更新路径重查并提交。
+
+文件资源层借用任务已保留的一页 I/O 工作区，每批最多一页；短请求或页面分配失败使用
+280 字节栈内小批次。namespace/inode/backend 锁仅覆盖打包，不跨 usercopy；OFD offset lock
+覆盖整次 syscall，因此 dup/fork 与并发 seek 不会消费同一位置。复制失败按已完整复制的
+记录边界计算返回长度并提交最后一个完整 cookie，部分记录留给重试；后端错误保留完成前缀，
+EOF cookie 只有整批复制成功后才提交。批次之间允许目录变更，不持有可失效的后端指针。
+这将目录锁的持有单位从单项改为最多一页，减少重复准备和 usercopy，但不改变原 ext4
+全局锁或持久化机制。`make test-directory-batch-host` 检查两种页大小、边界/故障前缀、共享
+OFD 及目录变更交错。`tests/workloads/fs/getdents_contract.c` 是独立用户态契约，覆盖 ext4/tmpfs
+跨批次长名称、EOF、短缓冲/cookie、真实不可访问页故障以及 dup/fork/独立 open 位置；将它编译成
+目标架构的静态 ELF 后，通过正常内核启动，避开综合内核测试的前置测例：
+
+```sh
+python3 -B tests/userland/getdents.py --arch riscv --kernel kernel-rv \
+  --program build/getdents/contract-rv --output build/getdents/guest-rv
+python3 -B tests/userland/getdents.py --arch loongarch --kernel kernel-la \
+  --program build/getdents/contract-la --output build/getdents/guest-la
+```
+
+`--qemu` 可指定模拟器，输出目录须不存在；runner 同时检查完整结果、init 成功退出、root owner
+回收与 e2fsck。该契约不比较时间戳，LA 不要求 patched RTC model。吞吐与写者延迟仍需在独占
+测量窗口另行对照。
 
 ## 当前成本边界
 
@@ -781,7 +846,7 @@ orphan 宿主测试另外检查 258 条混合记录、热查询零分配和零�
 
 挂载内以 `(parent identity, name)` 复用活路径对象，root 也只有一个活身份；inode 节点独立于名字。注册链只借用对象，OFD、fs context 和解析过程拥有引用，最后一个引用释放时摘除注册并迭代释放父链。路径内置的 inode handle 不再持有自身路径，避免循环引用；打开文件持路径引用且独立保留 node，因此关闭时可先释放路径再减少自身 open_files。
 
-`kernel_vfs_*_at()` 使用持有引用的 start/root 对象，修改传入父 inode 和单个名称；已解析父目录不会因改名而变为同名新对象。活路径和 inode 使用弱 AVL 索引，查找与发布由状态短保护同步，目录并发规则见前文。没有负目录项缓存。目录枚举读取真实 inode 大小，打开后扩展目录不会漏掉新块。
+`kernel_vfs_*_at()` 使用持有引用的 start/root 对象，修改传入父 inode 和单个名称；已解析父目录不会因改名而变为同名新对象。活路径和 inode 使用弱 AVL 索引。目录项命中时在一次状态锁内取得路径引用并检查是否覆盖了挂载，跨挂载时仍进入相应挂载。已有路径打开直接借用目录项所持的 inode，目录并发规则见前文。没有负目录项缓存。目录枚举读取真实 inode 大小，打开后扩展目录不会漏掉新块。
 
 `ext4_rename_child()` 以父 inode 和名称为入口，调用者持有相关目录和拓扑的 namespace 资格。有按对象资源回调时，先用稳定只读引用发现父、源与覆盖目标，检查类型、目标空目录和祖先关系；再按 inode 号取得完整已知对象的修改资格，将原引用升级到当前操作的私有版本，核对最新链接状态。无该回调的串行后端资格覆盖发现与修改，首次直接取得可写 inode 引用，不再先借用只读记录后重复查找并升级。namespace 资格贯穿这些等待，目录名称和父关系沿用首次查询结果。这样跨目录往返和低 inode 号的源文件都按同一资源顺序进入修改，祖先 inode 采用只读引用。首次源目录项查找保留本事务私有叶的实际引用，删除直接消费已找到的记录，不再重复完整查找和叶校验。同父目录插入可能重排或分裂源叶，因此删除前在已持叶上按记录边界重新定位名称并核对 inode；只有源项已移出该叶时才释放引用并完整查找新叶。跨父目录插入不改变源叶。普通按名删除与 rename 共用记录删除、前项合并及 checksum 更新实现。随后在同一个事务里处理 `..`、父目录 nlink、时间与覆盖目标的持久 orphan。VFS 在调用前从源路径所属堆预留新名并取得父引用；替换、失败及最后释放都向该同一堆归还名称。成功后在状态短保护内替换 source 的 parent/name 并断开 target。无失败后的内存分配，也不会将已打开的 target 换成 source。rmdir 同样用检查 checksum 和记录边界的空目录扫描，损坏目录返回校验错误。HTree 根升层及内部结点分裂共用扣除 checksum 尾部后的容量，目录索引项与尾部校验值各占自己的空间。
 
@@ -790,6 +855,17 @@ orphan 宿主测试另外检查 258 条混合记录、热查询零分配和零�
 本阶段历史验证记录曾位于 `build/namespace-host-final.log`（32 组、620 次断电/重排、3004 个分配失败点）与 `build/namespace-final-regression.log`（RISC-V 全套、真实 musl/pthread、297 条 Linux 差分、988 个函数栈界；最大单函数 1952 字节）；日志已按本地构建清理策略删除。
 
 ## 显式元数据与统计
+
+无日志 ext4 的可写挂载要求磁盘状态为 clean 且没有错误位。只读检查保留原标记，
+未经离线 `e2fsck` 修复的卷也不能从只读重挂为可写。无日志元数据写回或最终设备
+FLUSH 失败后，当前挂载保留错误及其资源，拒绝继续修改和通过重试发布 clean。
+
+干净无日志卷上的符号链接先分配未命名 inode，初始化所有者、模式、链接计数和目标，
+完成目标数据与本次 inode／分配元数据的设备写入后，才加入父目录。发布前可证明未
+链接的失败归还 inode 和数据块；目录可能已经写入时保留 inode，由离线检查确定
+实际状态。这里保证提交顺序，断电后的多块原子性仍依赖日志。相关故障检查入口为
+`sh tests/host/lwext4-operation.sh nojournal-symlink` 和
+`sh tests/host/lwext4-metadata.sh nojournal-orphan-probe`。
 
 `kernel_vfs_file_set_times/path_set_times` 以活 inode 为目标，`ext4_file_set_times` 在单个 journal 事务内修改选定字段并记录同步依赖；成功发布仅覆盖所选运行时字段，OMIT 保留尚未写回的值。两项 OMIT 不产生 I/O；其他修改要求可用 realtime，时间未初始化明确返回 `EIO`。128 字节 inode 仅秒精度；扩展 inode 保存纳秒，超出或等于时间范围端点时按 Linux `timestamp_truncate` 将纳秒置零。事务准备 ENOMEM 可回滚，关键 journal/write/flush 失败由 mount 保留并停止修改。
 
@@ -957,6 +1033,8 @@ make test-mm-disk-smp-userland-riscv INIT_CONFIG=config/init.json \
 ```
 
 每个页缓存实例拥有一个主线程，上述多 CPU 配置另有一个写回线程。线程运行期间借用 cache/record，调用者在 stop/join 返回后归还它们。根盘运行期启动、用户磁盘挂载时创建，所属实例卸载前停止并回收。空闲低/高水位为受管页 2%/4%，脏页启动/停止为 10%/5%，小配置至少一页且阈值严格有序。没有周期清脏。分配器和持锁路径只为脏页发布回收请求；低水位先回收无别名/额外引用的干净页，worker 再写回合格脏页；仅脏阈值触发则保留清洁缓存。
+
+普通物理页分配完成后，分配器在同一次短保护内捕获剩余页数。缓存组干净且余量高于低水位时，跳过写回组的临时引用和通知。确有脏页或低水位时，通知持有实际组引用，在锁外使用这份余量快照。分配失败仍保留真实回收钩子的借用，主动发布脏页的路径也继续独立通知。
 
 干净回收在缓存互斥内选择候选，并在该 inode 的索引短锁内核对借用及别名、摘除可回收项，锁外归还物理页。注册表遍历锁只保护缓存寿命，锁序为后端 40 → 聚合遍历 41 → 缓存元数据 45；元数据锁忙时等待其完成，不能将竞争当成 OOM。已持同级或更高资格时跳过，避免自身重入。持聚合锁时只归还页，不执行 entry/node 的最终关闭；退休元数据由 worker 在离开该保护后释放，避免回收路径反向进入后端。脏页按本节开头的 inode 队列选择。
 
@@ -1225,7 +1303,11 @@ checksum 更新，使下一轮合法查找返回 EUCLEAN。`make test-lwext4-dee
 
 ## 文件缺页的同步批量装入
 
-磁盘文件映射缺页及 ELF 的完整 FILE 页复用需求批读。目标页确实缺失、缓存未停止且物理页高于压力线时，从目标向文件末端有界装入最多一个已配置预读窗口，默认 64 KiB；该窗口是文件缓存范围，不额外安装用户 PTE。每次缺页仍重新核对目标 VMA、权限、文件映射代次和 EOF。复合 ELF 页、匿名页、普通标量取页和热命中保持原处理。
+磁盘文件映射缺页及 ELF 的完整 FILE 页复用需求批读。目标页确实缺失、缓存未停止且物理页高于压力线时，普通读缺页从目标向较高文件偏移有界装入，默认窗口 64 KiB。取指缺页可围绕目标选邻页，窗口上限 128 KiB。装入的邻页进入文件页缓存，是否安装用户 PTE 由 MM 的邻页发布策略决定。缺页仍核对目标 VMA、权限、文件映射代次和 EOF。复合 ELF 页、匿名页和普通标量取页使用各自的准备路径。
+
+初次缓存查询把目标槽确实缺失的结果交给批读准备。窗口遍历一次检查目标和邻页。如果并发加载者已接管目标槽，沿现有目标借用等待或读取，并在分配描述符、物理页和提交 I/O 之前撤销本批的投机缺失。标量回退时将可复用工作区归还缓存。
+
+批读发布 LOADING 和最终 READY 时，同一 inode 的索引每次处理最多八项，唤醒和退休保持原对象的归还顺序。小于设备扇区的文件片段直接走局部块读取，在该入口检查最新日志或块缓存版本，再按需读取设备。
 
 批次在发起者执行，复用原 inode 读资格和后端批量读取，不加入异步预读队列或增加 worker。工作区及邻页借用只存在于已有 prepare-read 回调内；目标结果独立返回，邻页错误不替换目标结果。窗口内已存在的邻页由其原 owner 处理，不因推测装入等待它。临时工作区不足时处理原目标；若推测资源使目标遇到内存不足，先归还邻页与工作区，再仅对原目标重试一次。实际目标 I/O 错误仍按原路径报告。
 

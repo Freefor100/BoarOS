@@ -5,7 +5,7 @@ build_dir=${FILE_IO_HOST_BUILD:-build/host/ext4-timestamps}
 FILE_IO_HOST_BUILD="$build_dir" \
 FILE_IO_HOST_TCP=0 \
 FILE_IO_HOST_TEST_SOURCE=tests/host/ext4_timestamps.c \
-FILE_IO_HOST_LDFLAGS='-Wl,--wrap=ext4_mount_setup_inode_observer,--wrap=ext4_user_calloc' \
+FILE_IO_HOST_LDFLAGS='-Wl,--wrap=ext4_mount_setup_inode_observer,--wrap=ext4_user_calloc,--wrap=ext4_file_touch,--wrap=ext4_fs_get_inode_ref_read' \
 sh "$root/tests/host/file-io-concurrency.sh"
 cd "$root"
 for shift in ${FILE_IO_HOST_SHIFTS:-12 14}; do

@@ -1,3 +1,4 @@
+#include <arch/riscv/vector.h>
 #include <arch/context.h>
 #include <arch/riscv/direct_map.h>
 #include <arch/riscv/memory_layout.h>
@@ -43,7 +44,7 @@ static struct physical_page_allocator page_allocator;
 static struct riscv_sv39_page_table kernel_page_table;
 static struct physical_page_allocator transition_page_allocator;
 static struct riscv_sv39_page_table transition_page_table;
-static uint32_t boot_mmu_features;
+static uint32_t boot_features;
 #if BOAROS_MAX_CPUS > 1
 static struct dtb_cpu_info boot_cpus;
 #if BOAROS_SMP_TEST
@@ -839,9 +840,9 @@ void kernel_main(unsigned long hart_id, const void *dtb)
 #if BOAROS_MAX_CPUS > 1
     dtb_status = dtb_read_cpu_info(dtb, hart_id, &boot_cpus);
     if (dtb_status != DTB_STATUS_OK) riscv_smp_fail("CPU-discovery", dtb_status);
-    boot_mmu_features=boot_cpus.mmu_features;
+    boot_features=boot_cpus.features;
 #else
-    dtb_status=dtb_read_boot_cpu_features(dtb,hart_id,&boot_mmu_features);
+    dtb_status=dtb_read_boot_cpu_features(dtb,hart_id,&boot_features);
     if (dtb_status!=DTB_STATUS_OK) shutdown_for_dtb_error(dtb_status);
 #endif
     boot_dtb_address = (uintptr_t)dtb;
@@ -889,7 +890,9 @@ void kernel_main(unsigned long hart_id, const void *dtb)
 static void kernel_main_high(void)
 {
     kernel_cpu_boot_rebind();
-    riscv_mmu_svvptc=!!(boot_mmu_features&DTB_CPU_MMU_SVVPTC);
+    riscv_vector_boot(boot_features);
+    riscv_mmu_svvptc=!!(boot_features&DTB_CPU_MMU_SVVPTC);
+    riscv_mmu_cboz64=!!(boot_features&DTB_CPU_ZICBOZ_64);
     virt_uart_puts("BoarOS: MMU Svvptc=");virt_uart_put_hex(riscv_mmu_svvptc);virt_uart_putc('\n');
 #if BOAROS_MAX_CPUS > 1
     kernel_cpu_set_boot_count(boot_cpus.count);

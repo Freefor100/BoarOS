@@ -1,3 +1,6 @@
+#if defined(__riscv)
+#include <arch/riscv/vector.h>
+#endif
 #include <arch/task.h>
 #include <arch/context.h>
 #include <kernel/files.h>
@@ -570,6 +573,9 @@ enum kernel_scheduler_status scheduler_switch_claimed(
     kernel_cost_switch(&previous->cost, &next->cost);
 #endif
     arch_fpu_switch(&previous->fpu, &next->fpu);
+#if defined(__riscv)
+    riscv_vector_switch(previous,next);
+#endif
     /* 新栈完成handoff；raw已释放，IRQ仍关闭，旧任务尚不能再次运行/回收。 */
     scheduler_cpu_time_switch(previous, next);
     arch_context_switch(&previous->context, &next->context);
@@ -926,8 +932,8 @@ enum kernel_scheduler_status kernel_scheduler_init(
     scheduler.load_ticks = 0;
     for (unsigned i = 0; i < 3; i++) scheduler.loads[i] = 0;
     scheduler.allocator = allocator;
-    scheduler.identities.numbers = &scheduler.pid_allocator;
-    scheduler.identities.next_generation = 1U;
+    if (kernel_pid_registry_init(&scheduler.identities, &scheduler.pid_allocator, NULL)
+            != KERNEL_PID_STATUS_OK) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     if (kernel_heap_init(&scheduler.identity_heap, allocator, identity_heap_address)
             != KERNEL_HEAP_STATUS_OK) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     scheduler.kernel_context = kernel_context;
@@ -1437,34 +1443,6 @@ void scheduler_task_disposal_notify(void)
     (void)kernel_wait_queue_wake_all(&scheduler.cleanup_queue);
 }
 
-int scheduler_forget_task_locked(struct kernel_task *thread, struct kernel_wait_cursor *cursor)
-{
-    if (thread->deadline_indexed) __builtin_trap();
-    process_identity_release_locked(thread);
-    struct kernel_thread_join *join = thread->join;
-    int notify = 0;
-    if (join) {
-        notify = kernel_wait_cursor_prepare(&join->waiters, cursor);
-        join->task = 0;
-        thread->join = 0;
-    }
-    if (scheduler.init_task == thread) scheduler.init_task = 0;
-    scheduler_task_unlink_locked(thread);
-    return notify;
-}
-
-void scheduler_forget_task(struct kernel_task *thread)
-{
-    struct kernel_wait_cursor cursor;
-    int notify;
-    {
-        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        notify = scheduler_forget_task_locked(thread, &cursor);
-    }
-    if (notify) kernel_wait_cursor_wake(&cursor, 1);
-    process_identity_collect();
-}
-
 void kernel_scheduler_system_statistics(uint64_t loads[3], uint16_t *tasks)
 {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
@@ -1479,7 +1457,7 @@ static enum kernel_scheduler_status scheduler_sample_load(uint64_t elapsed)
     /* 只有CPU0的IRQ关闭tick推进这个采样余量，普通tick不另取调度域。 */
     scheduler.load_ticks += elapsed;
     if (scheduler.load_ticks < period) return KERNEL_SCHEDULER_STATUS_OK;
-    {
+    if (BOAROS_LOCK_DEBUG) {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         enum kernel_scheduler_status status = validate_queues_locked();
         if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
@@ -1517,7 +1495,7 @@ enum kernel_scheduler_status kernel_scheduler_on_tick(uint64_t elapsed_ticks)
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
     if (arch_interrupt_is_enabled()) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     if (scheduler_failure() != KERNEL_SCHEDULER_STATUS_OK) return scheduler_failure();
-    enum kernel_scheduler_status status = validate_current();
+    enum kernel_scheduler_status status = check_running_on_cpu(kernel_cpu_current());
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     if (elapsed_ticks
 #if BOAROS_MAX_CPUS > 1
@@ -1537,27 +1515,31 @@ enum kernel_scheduler_status kernel_scheduler_yield_current(void)
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
     if (arch_interrupt_is_enabled()) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     if (scheduler_failure() != KERNEL_SCHEDULER_STATUS_OK) return scheduler_failure();
-    enum kernel_scheduler_status status = validate_current();
+    enum kernel_scheduler_status status = check_running_on_cpu(kernel_cpu_current());
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     return scheduler_reschedule(0, 1, 1);
 }
 
 void kernel_scheduler_charge_ticks(uint64_t elapsed_ticks, int from_user)
 {
-    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-    struct kernel_task *current = kernel_cpu_current()->current;
-
+    /* Timer IRQs pin the current CPU and task. Only the owner's timer
+     * writes idle_ticks; procfs reads the published snapshot. */
+    struct kernel_cpu *cpu=kernel_cpu_current();
+    struct kernel_task *current=cpu->current;
     if (current && current->idle) {
-        kernel_cpu_current()->idle_ticks += elapsed_ticks;
+        uint64_t ticks=__atomic_load_n(&cpu->idle_ticks,__ATOMIC_RELAXED);
+        __atomic_store_n(&cpu->idle_ticks,ticks+elapsed_ticks,__ATOMIC_RELAXED);
         return;
     }
-    if (current == 0 ||
-        current->magic != KERNEL_THREAD_MAGIC) {
-        return;
-    }
-    if (current->scheduling.priority)
-        scheduler_rt_watchdog_locked(current,kernel_tick_count());
     (void)from_user; /* 用户/内核CPU时间仍由执行边界结算。 */
+    if (!current || current->magic!=KERNEL_THREAD_MAGIC || !current->arch.user_mode)
+        return;
+    /* Use the same priority publication as MQ. Positive snapshots take
+     * the domain; the watchdog rechecks priority and limits under it. */
+    if (!(uint32_t)__atomic_load_n(&current->scheduling.execution_priority,__ATOMIC_ACQUIRE))
+        return;
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    scheduler_rt_watchdog_locked(current,kernel_tick_count());
 }
 
 uint64_t kernel_scheduler_idle_ticks(void)
@@ -1565,6 +1547,6 @@ uint64_t kernel_scheduler_idle_ticks(void)
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     uint64_t ticks = 0;
     for (struct kernel_cpu *cpu = scheduler.cpus; cpu; cpu = cpu->scheduler_next)
-        ticks += cpu->idle_ticks;
+        ticks += __atomic_load_n(&cpu->idle_ticks,__ATOMIC_RELAXED);
     return ticks;
 }

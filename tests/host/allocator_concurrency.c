@@ -126,13 +126,14 @@ static void *worker(void *argument)
     assert(!cpu.raw_locks && !cpu.preempt_depth && sync_test_irq);
     return 0;
 }
-struct hook_owner { unsigned references; uint64_t value; };
+struct hook_owner { unsigned references, pins; uint64_t value, low_pages; };
 static pthread_barrier_t hook_entered, hook_continue;
 static unsigned hook_freed;
 static void hook_retain(void *context)
 {
     struct hook_owner *owner=context;
     assert(__atomic_fetch_add(&owner->references,1,__ATOMIC_RELAXED));
+    __atomic_fetch_add(&owner->pins,1,__ATOMIC_RELAXED);
 }
 static void hook_release(void *context)
 {
@@ -143,9 +144,12 @@ static void hook_release(void *context)
 }
 static uint64_t hook_reclaim(void *context,uint64_t count)
 { (void)context;(void)count;assert(0);return 0; }
-static void hook_notify(void *context)
+static int hook_wants_notification(void *context, uint64_t available)
+{ return available <= ((struct hook_owner *)context)->low_pages; }
+static void hook_notify(void *context, uint64_t available)
 {
     struct hook_owner *owner=context;
+    assert(available == physical_page_available(&allocator));
     assert(cpu.logical_id==1 && !cpu.raw_locks && !cpu.preempt_depth && sync_test_irq);
     assert(owner->value==UINT64_C(0x713791ca));
     pthread_barrier_wait(&hook_entered);
@@ -161,11 +165,16 @@ static void *hook_allocate(void *unused)
 static void hook_lifetime(void)
 {
     struct hook_owner *owner=malloc(sizeof(*owner));assert(owner);
-    *owner=(struct hook_owner){.references=1,.value=UINT64_C(0x713791ca)};
+    *owner=(struct hook_owner){.references=1,.value=UINT64_C(0x713791ca),
+        .low_pages=physical_page_available(&allocator)-7};
     hook_freed=0;
     assert(!pthread_barrier_init(&hook_entered,NULL,2) && !pthread_barrier_init(&hook_continue,NULL,2));
     assert(!physical_page_allocator_set_reclaimer(&allocator,&(struct physical_page_reclaim_hooks){
-        .reclaim=hook_reclaim,.notify=hook_notify,.retain=hook_retain,.release=hook_release,.context=owner}));
+        .reclaim=hook_reclaim,.notify=hook_notify,.wants_notification=hook_wants_notification,
+        .retain=hook_retain,.release=hook_release,.context=owner}));
+    uint64_t page;
+    assert(!physical_page_allocate(&allocator,&page) && owner->pins==1);
+    assert(!physical_page_release(&allocator,page));
     pthread_t thread;assert(!pthread_create(&thread,NULL,hook_allocate,NULL));
     pthread_barrier_wait(&hook_entered);
     assert(!physical_page_allocator_clear_reclaimer(&allocator));
@@ -176,6 +185,26 @@ static void hook_lifetime(void)
     assert(!pthread_barrier_destroy(&hook_entered) && !pthread_barrier_destroy(&hook_continue));
     puts("allocator remote notification survives concurrent hook detach; final context owner returned");
 }
+static uint64_t compound;
+static void *compound_worker(void *argument)
+{
+    unsigned id = (unsigned)(uintptr_t)argument;
+    kernel_cpu_initialize(&cpu, id, &io);
+    assert(!physical_page_acquire_order(&allocator, compound, 4));
+    barrier();
+    /* The original mapping can disappear while remote consumers own pins. */
+    if (!id) assert(!physical_page_release_order(&allocator, compound, 4));
+    barrier();
+    uint32_t refs;
+    assert(!physical_page_reference_count(&allocator, compound, &refs));
+    assert(refs == thread_count);
+    for (unsigned i = 0; i < 16 * BOAROS_PAGE_SIZE; i++)
+        assert(((unsigned char *)(uintptr_t)compound)[i] == 0x6b);
+    barrier();
+    assert(!physical_page_release_order(&allocator, compound, 4));
+    return NULL;
+}
+
 static void run(unsigned threads)
 {
     thread_count = threads;
@@ -193,6 +222,14 @@ static void run(unsigned threads)
     assert(physical_page_allocate(&allocator, &shared) == 0);
     assert(pthread_barrier_init(&gate, 0, thread_count) == 0);
     pthread_t ids[4];
+    uint64_t before_compound = physical_page_available(&allocator);
+    assert(!physical_page_allocate_order(&allocator, 4, &compound));
+    memset((void *)(uintptr_t)compound, 0x6b, 16 * BOAROS_PAGE_SIZE);
+    for (unsigned i = 0; i < threads; i++)
+        assert(!pthread_create(&ids[i], NULL, compound_worker, (void *)(uintptr_t)i));
+    for (unsigned i = 0; i < threads; i++) assert(!pthread_join(ids[i], NULL));
+    assert(physical_page_available(&allocator) == before_compound);
+    assert(!physical_page_allocator_audit(&allocator));
     for (unsigned i = 0; i < threads; i++) assert(pthread_create(&ids[i], 0, worker, (void *)(uintptr_t)i) == 0);
     for (unsigned i = 0; i < threads; i++) assert(pthread_join(ids[i], 0) == 0);
     assert(pthread_barrier_destroy(&gate) == 0);

@@ -14,6 +14,7 @@ static struct {
     bool active;
     uint32_t parent, child;
     unsigned parent_gets, child_gets, parent_puts, child_puts;
+    unsigned searches, writable_searches;
 } unlink_ref;
 
 static bool create_ref_inode(uint32_t inode)
@@ -69,6 +70,10 @@ int __wrap_ext4_dir_find_entry(struct ext4_dir_search_result *result, struct ext
 {
     if (create_ref.active && strlen(create_ref.name) == length && !memcmp(create_ref.name, name, length))
         create_ref.searches++;
+    if (unlink_ref.active && parent->index == unlink_ref.parent) {
+        unlink_ref.searches++;
+        if (write) unlink_ref.writable_searches++;
+    }
     return __real_ext4_dir_find_entry(result, parent, name, length, write);
 }
 
@@ -207,6 +212,85 @@ static void create_ref_test(struct ext4_fs *fs)
     puts("PASS creation returns actual initial attributes without reopening; types/extra times/inheritance, failed file handles, outer abort and real OOM return owners");
 }
 
+static const char nojournal_target[] =
+    "long-symlink-target-with-its-own-data-block-and-a-detectable-write-payload";
+static uint64_t nojournal_dir_sector;
+static unsigned nojournal_symlink_fault;
+
+static int nojournal_symlink_write(struct ext4_blockdev *dev, const void *bytes,
+                                  uint64_t sector, uint32_t count)
+{
+    bool directory = sector == nojournal_dir_sector;
+    bool target = count * 512U >= sizeof(nojournal_target) &&
+        !memcmp(bytes, nojournal_target, sizeof(nojournal_target) - 1);
+    unsigned fault = nojournal_symlink_fault;
+    if ((fault == 1 && target) || (fault >= 2 && directory)) {
+        nojournal_symlink_fault = 0;
+        if (fault == 3) CHECK(dev_write(dev, bytes, sector, count) == EOK);
+        return EIO;
+    }
+    return dev_write(dev, bytes, sector, count);
+}
+
+static bool nojournal_symlink_fault_test(struct ext4_fs *fs, unsigned fault)
+{
+    const char name[] = "ordered-link";
+    CHECK(!fs->jbd_journal && fault >= 1 && fault <= 3);
+    struct ext4_inode_ref root;
+    ext4_fsblk_t block;
+    CHECK(ext4_fs_get_inode_ref_read(fs, EXT4_INODE_ROOT_INDEX, &root) == EOK);
+    CHECK(ext4_fs_get_inode_dblk_idx(&root, 0, &block, false) == EOK);
+    CHECK(ext4_fs_put_inode_ref(&root) == EOK);
+    nojournal_dir_sector = block * fs->bdev->lg_bsize / 512U;
+
+    /* Persist the dirty mount marker before exposing the simulated failure. */
+    CHECK(ext4_blockdev_flush(fs->bdev) == EOK);
+    uint64_t blocks = ext4_fs_available_blocks(fs);
+    uint32_t inodes = ext4_fs_available_inodes(fs);
+    ext4_file file = {0};
+    create_ref_begin(name);
+    nojournal_symlink_fault = fault;
+    fs->bdev->bdif->bwrite = nojournal_symlink_write;
+    int error = ext4_create_child("/", EXT4_INODE_ROOT_INDEX, name, 0120777,
+        0, nojournal_target, &file, NULL, 70001, 80002);
+    fs->bdev->bdif->bwrite = dev_write;
+    create_ref.active = false;
+    CHECK(error == EIO && !file.mp && create_ref.count == 1 && !nojournal_symlink_fault);
+    CHECK(!ext4_current_operation(fs) && !fs->active_operations);
+    if (fault == 1) {
+        uint32_t found, mode;
+        CHECK(!fs->nojournal_error);
+        CHECK(ext4_lookup_child("/", EXT4_INODE_ROOT_INDEX, name, strlen(name),
+            &found, &mode) == ENOENT);
+        CHECK(ext4_fs_available_blocks(fs) == blocks &&
+            ext4_fs_available_inodes(fs) == inodes);
+        CHECK(ext4_create_child("/", EXT4_INODE_ROOT_INDEX, name, 0120777,
+            0, nojournal_target, &file, NULL, 70001, 80002) == EOK);
+        CHECK(ext4_fclose(&file) == EOK && ext4_fremove("/ordered-link") == EOK);
+        CHECK(ext4_fs_available_blocks(fs) == blocks &&
+            ext4_fs_available_inodes(fs) == inodes);
+        puts("PASS nojournal symlink target EIO: unpublished inode and data block returned, retry succeeds");
+        return false;
+    }
+
+    CHECK(fs->nojournal_error == EIO && ext4_fs_available_blocks(fs) == blocks - 1 &&
+        ext4_fs_available_inodes(fs) == inodes - 1);
+    uint64_t writes = disk.writes;
+    CHECK(ext4_create_child("/", EXT4_INODE_ROOT_INDEX, "no-reuse", 0120777,
+        0, "target", &file, NULL, 0, 0) == EIO);
+    CHECK(ext4_remount("/", true) == EIO && ext4_umount("/") == EIO && disk.writes == writes);
+
+    /* Persist exactly the writes the failed create had already submitted. */
+    CHECK(kernel_block_flush(&disk.device) == KERNEL_BLOCK_STATUS_OK);
+    CHECK(fault_block_crash(&disk) == 0);
+    struct ext4_sblock sb;
+    CHECK(ext4_sb_read(fs->bdev, &sb) == EOK);
+    CHECK(!(ext4_get16(&sb, state) & EXT4_SUPERBLOCK_STATE_VALID_FS));
+    printf("PASS nojournal symlink directory EIO: err=%u inode=%u retained for fsck\n",
+           fault, create_ref.inodes[0]);
+    return true;
+}
+
 static void unlink_ref_test(struct ext4_fs *fs)
 {
     ext4_file parent;
@@ -234,6 +318,8 @@ static void unlink_ref_test(struct ext4_fs *fs)
                 unlink_ref.parent_gets, unlink_ref.parent_puts, unlink_ref.child_gets, unlink_ref.child_puts);
         CHECK(unlink_ref.parent_gets == 1 && unlink_ref.child_gets == 1 &&
             unlink_ref.parent_puts == 1 && unlink_ref.child_puts == 1);
+        if (outer && !(i & 1))
+            CHECK(unlink_ref.searches == 1 && unlink_ref.writable_searches == 1);
         if (outer) CHECK(ext4_transaction_end("/") == EOK);
         struct ext4_inode raw;
         CHECK(ext4_fraw_inode_fill(&file, &raw) == EOK && !ext4_inode_get_links_cnt(&raw));

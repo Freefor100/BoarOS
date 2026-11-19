@@ -4,9 +4,9 @@
 #include <platform/loongarch_virt.h>
 #include "../../kernel/sched/private.h"
 void la_fault_injection_set(int);
-enum kernel_scheduler_status __real_arch_process_clone_current(const struct arch_trap_frame *,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,int64_t *);
+enum kernel_scheduler_status __real_arch_process_clone_current(const struct arch_trap_frame *,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,const int32_t *,size_t,int32_t,int64_t *);
 enum kernel_scheduler_status __wrap_arch_process_clone_current(const struct arch_trap_frame *frame,
-    uint64_t flags,uint64_t stack,uint64_t parent_tid,uint64_t tls,uint64_t child_tid,uint64_t pidfd,int64_t *result)
+    uint64_t flags,uint64_t stack,uint64_t parent_tid,uint64_t tls,uint64_t child_tid,uint64_t pidfd,const int32_t *requested_tids, size_t requested_count,int32_t cgroup_fd,int64_t *result)
 {
     static int injected;
     int inject=!injected && (flags&UINT64_C(0x10000));
@@ -19,7 +19,7 @@ enum kernel_scheduler_status __wrap_arch_process_clone_current(const struct arch
             sizeof(parent_tid_before), &copied) || copied != sizeof(parent_tid_before)))
         la_virt_fatal("clone OOM parent TID fixture");
     if(inject) {injected=1;la_fault_injection_set(CLONE_OOM_AFTER);}
-    enum kernel_scheduler_status status=__real_arch_process_clone_current(frame,flags,stack,parent_tid,tls,child_tid,pidfd,result);
+    enum kernel_scheduler_status status=__real_arch_process_clone_current(frame,flags,stack,parent_tid,tls,child_tid,pidfd,requested_tids,requested_count,cgroup_fd,result);
     if(inject) {
         la_fault_injection_set(-1);
         if(status!=KERNEL_SCHEDULER_STATUS_OK || *result!=-KERNEL_ENOMEM || physical_page_available(scheduler.allocator)!=before)

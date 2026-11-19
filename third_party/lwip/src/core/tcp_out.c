@@ -61,6 +61,8 @@
  */
 
 #include "lwip/opt.h"
+#include "lwip/sys.h"
+#include "lwip/nd6.h"
 #include <kernel/cost.h>
 
 #if LWIP_TCP /* don't build if not configured for use in lwipopts.h */
@@ -84,6 +86,7 @@
 #include "lwip/ip6_addr.h"
 #if LWIP_TCP_TIMESTAMPS
 #include "lwip/sys.h"
+#include "lwip/nd6.h"
 #endif
 
 #include <string.h>
@@ -160,6 +163,9 @@ tcp_ip_output(const struct tcp_pcb *pcb, struct pbuf *p, struct netif *netif,
   int local_result;
   if (boaros_lwip_parallel_enabled() && pcb && pcb->boaros_owner &&
       boaros_lwip_tcp_local_output(pcb, p, netif, src, dst, &local_result)) {
+#ifdef BOAROS_LWIP_TCP_INFO
+    if (local_result == ERR_OK && pcb->state != LISTEN) LWIP_CONST_CAST(struct tcp_pcb *, pcb)->boaros_segs_out++;
+#endif
     return (err_t)local_result;
   }
 #endif
@@ -175,6 +181,9 @@ tcp_ip_output(const struct tcp_pcb *pcb, struct pbuf *p, struct netif *netif,
   err_t result = ip_output_if(p, src, dst, pcb ? pcb->ttl : TCP_TTL,
                               pcb ? pcb->tos : 0, IP_PROTO_TCP, netif);
   NETIF_RESET_HINTS(netif);
+#ifdef BOAROS_LWIP_TCP_INFO
+  if (pcb && pcb->state != LISTEN && result == ERR_OK) LWIP_CONST_CAST(struct tcp_pcb *, pcb)->boaros_segs_out++;
+#endif
   return result;
 }
 
@@ -205,6 +214,9 @@ tcp_alloc_segment(struct pbuf *p, u8_t optlen, u8_t optflags)
     return NULL;
   }
   seg->flags = optflags;
+#ifdef BOAROS_LWIP_TCP_INFO
+  seg->boaros_sent_bytes = 0;
+#endif
   seg->next = NULL;
   seg->p = p;
   LWIP_ASSERT("p->tot_len >= optlen", p->tot_len >= optlen);
@@ -1148,6 +1160,11 @@ tcp_split_unsent_seg(struct tcp_pcb *pcb, u16_t split)
   LWIP_DEBUGF(TCP_QLEN_DEBUG, ("tcp_enqueue: split_unsent_seg: %u\n", (unsigned int)pcb->snd_queuelen));
 
   optflags = useg->flags;
+#ifdef BOAROS_LWIP_TCP_INFO
+  /* The fresh remainder must not inherit history through option flags.
+   * Restore telemetry below only for its actually transmitted prefix. */
+  optflags &= (u8_t)~(TF_SEG_SENT | TF_SEG_RETRANSMITTED | TF_SEG_LOST);
+#endif
 #if TCP_CHECKSUM_ON_COPY
   /* Remove since checksum is not stored until after tcp_create_segment() */
   optflags &= ~TF_SEG_DATA_CHECKSUMMED;
@@ -1201,6 +1218,11 @@ tcp_split_unsent_seg(struct tcp_pcb *pcb, u16_t split)
     goto memerr;
   }
 
+#ifdef BOAROS_LWIP_TCP_INFO
+  seg->boaros_sent_bytes = useg->boaros_sent_bytes > split ? useg->boaros_sent_bytes - split : 0;
+  if (seg->boaros_sent_bytes) seg->flags |= useg->flags & (TF_SEG_RETRANSMITTED | TF_SEG_SENT | TF_SEG_LOST);
+  useg->boaros_sent_bytes = LWIP_MIN(useg->boaros_sent_bytes, split);
+#endif
 #if TCP_CHECKSUM_ON_COPY
   seg->chksum = chksum;
   seg->chksum_swapped = chksum_swapped;
@@ -1214,7 +1236,7 @@ tcp_split_unsent_seg(struct tcp_pcb *pcb, u16_t split)
   successfully because we are modifying the original segment */
   pbuf_realloc(useg->p, useg->p->tot_len - remainder);
   useg->len -= remainder;
-  TCPH_SET_FLAG(useg->tcphdr, split_flags);
+  TCPH_FLAGS_SET(useg->tcphdr, split_flags);
 #if TCP_OVERSIZE_DBGCHECK
   /* By trimming, realloc may have actually shrunk the pbuf, so clear oversize_left */
   useg->oversize_left = 0;
@@ -1508,6 +1530,26 @@ tcp_build_wnd_scale_option(u32_t *opts)
 }
 #endif
 
+/* Re-evaluate IPv6 PMTU for queued and retransmitted data. A router's
+ * changed MTU must not strand segments made before the advertisement. */
+static int tcp_output_segment_busy(const struct tcp_seg *seg);
+static err_t
+tcp_ipv6_resize_head(struct tcp_pcb *pcb, struct netif *netif)
+{
+  struct tcp_seg *head = pcb->unsent;
+  if (head && head->len && IP_IS_V6(&pcb->remote_ip)) {
+    u16_t mss = tcp_eff_send_mss_netif(pcb->mss,netif,&pcb->remote_ip);
+    u16_t options = LWIP_TCP_OPT_LENGTH_SEGMENT(head->flags,pcb);
+    if (mss <= options) return ERR_RTE;
+    mss -= options;
+    if (head->len > mss) {
+      if (tcp_output_segment_busy(head)) return ERR_MEM;
+      return tcp_split_unsent_seg(pcb,mss);
+    }
+  }
+  return ERR_OK;
+}
+
 /**
  * @ingroup tcp_raw
  * Find out what we can send and send it
@@ -1517,7 +1559,7 @@ tcp_build_wnd_scale_option(u32_t *opts)
  *         another err_t on error
  */
 err_t
-tcp_output(struct tcp_pcb *pcb)
+boaros_lwip_tcp_output_more(struct tcp_pcb *pcb, u8_t more)
 {
   struct tcp_seg *seg, *useg;
   u32_t wnd, snd_nxt;
@@ -1587,6 +1629,10 @@ tcp_output(struct tcp_pcb *pcb)
     }
   }
 
+  err = tcp_ipv6_resize_head(pcb,netif);
+  if (err != ERR_OK) return err;
+  seg = pcb->unsent;
+
   /* Handle the current segment not fitting within the window */
   if (lwip_ntohl(seg->tcphdr->seqno) - pcb->lastack + seg->len > wnd) {
     /* We need to start the persistent timer when the next unsent segment does not fit
@@ -1626,9 +1672,20 @@ tcp_output(struct tcp_pcb *pcb)
      *   either seg->next != NULL or pcb->unacked == NULL;
      *   RST is no sent using tcp_write/tcp_output.
      */
-    if ((tcp_do_output_nagle(pcb) == 0) &&
-        ((pcb->flags & (TF_NAGLEMEMERR | TF_FIN)) == 0)) {
-      break;
+    int hold_tail = (more || pcb->boaros_cork) && !seg->next && seg->len < tcp_mss(pcb) &&
+                    !(pcb->flags & TF_FIN) && !(TCPH_FLAGS(seg->tcphdr) & TCP_SYN);
+    if (hold_tail || ((pcb->flags & (TF_NODELAY | TF_NAGLEMEMERR | TF_FIN)) == 0 &&
+                      !tcp_do_output_nagle(pcb))) {
+      u32_t seq = lwip_ntohl(seg->tcphdr->seqno);
+      int pushed = !more && pcb->boaros_push_pending && TCP_SEQ_LT(seq, pcb->boaros_push_seq);
+      if (!pushed && !TCP_SEQ_LT(seq, pcb->snd_nxt)) {
+        if (hold_tail) {
+          boaros_lwip_tcp_cork_arm(pcb);
+          /* A withheld data tail must not withhold a window update or an ACK. */
+          if (pcb->flags & TF_ACK_NOW) return tcp_send_empty_ack(pcb);
+        }
+        break;
+      }
     }
 #if TCP_CWND_DEBUG
     LWIP_DEBUGF(TCP_CWND_DEBUG, ("tcp_output: snd_wnd %"TCPWNDSIZE_F", cwnd %"TCPWNDSIZE_F", wnd %"U32_F", effwnd %"U32_F", seq %"U32_F", ack %"U32_F", i %"S16_F"\n",
@@ -1649,6 +1706,25 @@ tcp_output(struct tcp_pcb *pcb)
       tcp_set_flags(pcb, TF_NAGLEMEMERR);
       return err;
     }
+#ifdef BOAROS_LWIP_TCP_INFO
+    {
+      BOAROS_LWIP_IP_SCOPE(ip);
+      pcb->boaros_pmtu = IP_IS_V6(&pcb->remote_ip) ?
+        nd6_get_destination_mtu(ip_2_ip6(&pcb->remote_ip),netif) : netif->mtu;
+    }
+    if (seg->len) {
+      pcb->boaros_last_sent = tcp_ticks;
+      pcb->boaros_data_out++;
+      pcb->boaros_bytes_sent += seg->len;
+    }
+    if ((seg->flags & TF_SEG_SENT) || seg->boaros_sent_bytes) {
+      pcb->boaros_bytes_retrans += LWIP_MIN(seg->boaros_sent_bytes, seg->len);
+      pcb->boaros_total_retrans++;
+      seg->flags |= TF_SEG_RETRANSMITTED;
+    }
+    seg->flags |= TF_SEG_SENT; /* loss remains declared until this sequence is ACKed */
+    seg->boaros_sent_bytes = seg->len;
+#endif
 #if TCP_OVERSIZE_DBGCHECK
     seg->oversize_left = 0;
 #endif /* TCP_OVERSIZE_DBGCHECK */
@@ -1665,6 +1741,8 @@ tcp_output(struct tcp_pcb *pcb)
       }
       pcb->snd_nxt = snd_nxt;
     }
+    if (pcb->boaros_push_pending && TCP_SEQ_GEQ(pcb->snd_nxt, pcb->boaros_push_seq))
+      pcb->boaros_push_pending = 0;
     /* put segment on unacknowledged list if length > 0 */
     if (TCP_TCPLEN(seg) > 0) {
       seg->next = NULL;
@@ -1696,6 +1774,8 @@ tcp_output(struct tcp_pcb *pcb)
     } else {
       tcp_seg_free(seg);
     }
+    err = tcp_ipv6_resize_head(pcb,netif);
+    if (err != ERR_OK) return err;
     seg = pcb->unsent;
   }
 #if TCP_OVERSIZE
@@ -1706,8 +1786,15 @@ tcp_output(struct tcp_pcb *pcb)
 #endif /* TCP_OVERSIZE */
 
 output_done:
+  if (pcb->unsent == NULL && pcb->boaros_cork_pending) boaros_lwip_tcp_cork_cancel(pcb);
   tcp_clear_flags(pcb, TF_NAGLEMEMERR);
   return ERR_OK;
+}
+
+err_t
+tcp_output(struct tcp_pcb *pcb)
+{
+  return boaros_lwip_tcp_output_more(pcb, 0);
 }
 
 /** Check if a segment's pbufs are used by someone else than TCP.
@@ -1796,6 +1883,9 @@ tcp_output_segment(struct tcp_seg *seg, struct tcp_pcb *pcb, struct netif *netif
 #else /* TCP_CALCULATE_EFF_SEND_MSS */
     mss = tcp_mss_limit(pcb);
 #endif /* TCP_CALCULATE_EFF_SEND_MSS */
+#ifdef BOAROS_LWIP_TCP_INFO
+    pcb->boaros_advmss = mss;
+#endif
     *opts = TCP_BUILD_MSS_OPTION(mss);
     opts += 1;
   }
@@ -1944,6 +2034,10 @@ tcp_rexmit_rto_prepare(struct tcp_pcb *pcb)
     LWIP_DEBUGF(TCP_RTO_DEBUG, ("tcp_rexmit_rto: segment busy\n"));
     return ERR_VAL;
   }
+#ifdef BOAROS_LWIP_TCP_INFO
+  for (struct tcp_seg *lost = pcb->unacked; lost != NULL; lost = lost->next)
+    lost->flags |= TF_SEG_LOST;
+#endif
   /* concatenate unsent queue after unacked queue */
   seg->next = pcb->unsent;
 #if TCP_OVERSIZE_DBGCHECK
@@ -2033,6 +2127,9 @@ tcp_rexmit(struct tcp_pcb *pcb)
     return ERR_VAL;
   }
 
+#ifdef BOAROS_LWIP_TCP_INFO
+  seg->flags |= TF_SEG_LOST;
+#endif
   /* Move the first unacked segment to the unsent queue */
   /* Keep the unsent queue sorted. */
   pcb->unacked = seg->next;
@@ -2531,6 +2628,22 @@ tcp_zero_window_probe(struct tcp_pcb *pcb)
   tcp_output_fill_options(pcb, p, 0, 0);
 
   err = tcp_output_control_segment(pcb, p, &pcb->local_ip, &pcb->remote_ip);
+#ifdef BOAROS_LWIP_TCP_INFO
+  if (err == ERR_OK) {
+    if (len) {
+      pcb->boaros_data_out++;
+      pcb->boaros_bytes_sent++;
+      pcb->boaros_last_sent = tcp_ticks;
+    }
+    if ((seg->flags & TF_SEG_SENT) || seg->boaros_sent_bytes) {
+      pcb->boaros_total_retrans++;
+      pcb->boaros_bytes_retrans += len;
+      seg->flags |= TF_SEG_RETRANSMITTED;
+    }
+    if (is_fin) seg->flags |= TF_SEG_SENT;
+    if (len && !seg->boaros_sent_bytes) seg->boaros_sent_bytes = 1;
+  }
+#endif
 
   LWIP_DEBUGF(TCP_DEBUG, ("tcp_zero_window_probe: seqno %"U32_F
                           " ackno %"U32_F" err %d.\n",

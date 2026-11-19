@@ -70,15 +70,16 @@ int __wrap_ext4_lookup_child(const char *mount,uint32_t parent,const char *name,
 int __real_ext4_create_child(const char *,uint32_t,const char *,uint32_t,uint32_t,const char *,ext4_file *,struct ext4_inode *,uint32_t uid,uint32_t gid);
 int __wrap_ext4_create_child(const char *mount,uint32_t parent,const char *name,uint32_t mode,uint32_t dev,const char *target,ext4_file *file,struct ext4_inode *initial,uint32_t uid,uint32_t gid)
 { observe_namespace(1);return __real_ext4_create_child(mount,parent,name,mode,dev,target,file,initial,uid,gid); }
-int __real_ext4_unlink_child(const char *,uint32_t,const char *,bool,uint32_t *,bool *);
-int __wrap_ext4_unlink_child(const char *mount,uint32_t parent,const char *name,bool dir,uint32_t *ino,bool *orphan)
-{ observe_namespace(2);return __real_ext4_unlink_child(mount,parent,name,dir,ino,orphan); }
+int __real_ext4_unlink_child_resolved(const char *,uint32_t,const char *,bool,uint32_t,bool *,void (*)(void *),void *);
+int __wrap_ext4_unlink_child_resolved(const char *mount, uint32_t parent, const char *name,
+    bool dir, uint32_t inode, bool *orphan, void (*retire)(void *), void *context)
+{ observe_namespace(2);return __real_ext4_unlink_child_resolved(mount,parent,name,dir,inode,orphan,retire,context); }
 int __real_ext4_rename_child(const char *,uint32_t,const char *,uint32_t,uint32_t,const char *,uint32_t,unsigned,struct ext4_rename_result *);
 int __wrap_ext4_rename_child(const char *mount,uint32_t a,const char *an,uint32_t al,uint32_t b,const char *bn,uint32_t bl,unsigned flags,struct ext4_rename_result *out)
 { observe_namespace(3);return __real_ext4_rename_child(mount,a,an,al,b,bn,bl,flags,out); }
-int __real_ext4_dir_entry_next_status(ext4_dir *,ext4_direntry *,uint64_t *);
-int __wrap_ext4_dir_entry_next_status(ext4_dir *dir,ext4_direntry *entry,uint64_t *offset)
-{ observe_namespace(4);return __real_ext4_dir_entry_next_status(dir,entry,offset); }
+int __real_ext4_dir_iterate(ext4_file *,uint64_t *,ext4_dir_emit_fn,void *,bool *);
+int __wrap_ext4_dir_iterate(ext4_file *file,uint64_t *position,ext4_dir_emit_fn emit,void *context,bool *atime_current)
+{ observe_namespace(4);return __real_ext4_dir_iterate(file,position,emit,context,atime_current); }
 static struct kernel_block_device *raw_device;
 static struct virtio_split_queue *raw_queue;
 static unsigned raw_read_active,raw_read_cpu,raw_submissions;

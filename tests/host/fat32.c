@@ -5,6 +5,8 @@
 #include <kernel/page.h>
 #include <kernel/errno.h>
 #include <kernel/time.h>
+#include <kernel/file_mapping.h>
+#include <sched.h>
 #include "../../fs/vfs_objects.h"
 #include "../../kernel/sched/private.h"
 #include <assert.h>
@@ -20,11 +22,11 @@ struct kernel_scheduler scheduler = {.initialized=KERNEL_SCHEDULER_INITIALIZED};
 static unsigned char pool[32 * 1024 * 1024] __attribute__((aligned(16384)));
 static void *access_page(uint64_t p) { return (void *)(uintptr_t)p; }
 static int page_address(const void *p, uint64_t *out) { *out = (uintptr_t)p; return 1; }
-static int fd, write_fail; static unsigned writes,watch_remote_read,remote_reads;
+static int fd, write_fail; static unsigned reads,writes,watch_remote_read,remote_reads;
 static size_t largest_read, largest_write;
 static enum kernel_block_status rd(void *ctx, uint64_t at, void *p, size_t n)
 {
-    (void)ctx;
+    (void)ctx; reads++;
     if (largest_read < n) largest_read = n;
     if (watch_remote_read) {
         assert(!kernel_cpu_current()->logical_id);
@@ -62,6 +64,50 @@ static void *remote_contents(void *argument)
     assert(!kernel_cpu_current()->raw_locks && !kernel_io_context_current()->locks);
     return NULL;
 }
+static unsigned dio_paused,dio_resume;
+static void direct_pause(void *owner,struct kernel_vfs_node *node,uint64_t a,uint64_t b)
+{
+    (void)owner;(void)node;(void)a;(void)b;
+    __atomic_store_n(&dio_paused,1,__ATOMIC_RELEASE);
+    while (!__atomic_load_n(&dio_resume,__ATOMIC_ACQUIRE)) sched_yield();
+}
+static void direct_truncated(void *owner,struct kernel_vfs_node *node,uint64_t size)
+{ (void)owner;(void)node;(void)size; }
+static void *direct_reader(void *argument)
+{
+    mm_test_attach(1);
+    unsigned char data[4096];size_t done;
+    assert(!kernel_vfs_direct_pread(argument,0,data,sizeof(data),&done) && done==sizeof(data));
+    for(size_t i=0;i<done;i++) assert(data[i]==0x72);
+    return NULL;
+}
+static void *direct_truncater(void *argument)
+{ mm_test_attach(2); assert(!kernel_vfs_ftruncate(argument,0));return NULL; }
+static void direct_serialization(struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_node *node=kernel_vfs_file_node(file);
+    assert(kernel_vfs_direct_alignment(file)==512);
+    assert(!kernel_file_mapping_prepare(node));
+    struct kernel_file_mapping mapping={.node=node,.owner=file,
+        .truncate=direct_truncated,.invalidate_range=direct_pause};
+    assert(!kernel_file_mapping_register(&mapping));
+    dio_paused=dio_resume=0;
+    pthread_t reader,truncater;
+    assert(!pthread_create(&reader,NULL,direct_reader,file));
+    while (!__atomic_load_n(&dio_paused,__ATOMIC_ACQUIRE)) sched_yield();
+    uint64_t epoch;assert(kernel_file_mapping_epoch(node,&epoch)==-KERNEL_EBUSY);
+    assert(!pthread_create(&truncater,NULL,direct_truncater,file));
+    int waiting=0;
+    while (!waiting) {
+        KERNEL_RAW_SCOPE(guard,&node->write_operation.lock.metadata);
+        waiting=node->write_operation.lock.pending_head!=NULL;
+    }
+    __atomic_store_n(&dio_resume,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(reader,NULL)&&!pthread_join(truncater,NULL));
+    assert(!kernel_file_mapping_epoch(node,&epoch));
+    kernel_file_mapping_unregister(&mapping);
+    puts("PASS FAT direct read vs truncate: closed epoch, actual mutation waiter and reopened epoch");
+}
 static void contiguous_transfers(struct kernel_vfs_mount *mount)
 {
     struct kernel_vfs_file file={0};
@@ -83,8 +129,16 @@ static void contiguous_transfers(struct kernel_vfs_mount *mount)
     assert(largest_write>=4096);
     assert(!ops->pread(node,1553,&byte,1,&done) && done==1 && byte==0x72);
     assert(!kernel_page_cache_invalidate_node(node->instance->page_cache,node));
+    unsigned char direct_bytes[4096];
+    for (unsigned pass=0;pass<2;pass++) {
+        unsigned before=reads;
+        assert(!kernel_vfs_direct_pread(&file,0,direct_bytes,sizeof(direct_bytes),&done));
+        assert(done==sizeof(direct_bytes) && !memcmp(direct_bytes,data,done) && reads>before);
+        assert(!kernel_page_cache_resident(node->instance->page_cache,&file,0));
+    }
     largest_read=0; contents(&file,0,data,sizeof(data));
     assert(largest_read>=4096);
+    direct_serialization(&file);
     assert(!kernel_vfs_unlink(mount,"/batch.bin") && !kernel_vfs_close(&file));
     puts("PASS FAT contiguous I/O: multi-sector requests, preserved content and invalidated partial-sector cache");
 }
@@ -105,8 +159,17 @@ static void names(struct kernel_vfs_mount *mount, struct kernel_vfs_path *root)
         assert(!kernel_vfs_create(mount,path,0666,&a) && !kernel_vfs_close(&a));
     }
     assert(!kernel_vfs_open(mount,"/second/moved directory",&a));
-    uint64_t pos=0,next,id; uint8_t type; char name[256]; unsigned entries=0;
-    while(kernel_vfs_dir_entry(&a,pos,&next,&id,&type,name,sizeof(name))>0) { assert(next>pos);pos=next;entries++; }
+    unsigned char records[1024]; unsigned entries=0;
+    struct kernel_vfs_dir_batch batch={.data=records,.capacity=sizeof(records)};
+    int status;
+    do {
+        batch.used=0;
+        status=kernel_vfs_read_directory(&a,&batch,NULL); assert(status>=0);
+        for (size_t at=0;at<batch.used;) {
+            size_t length=(size_t)records[at+16]|((size_t)records[at+17]<<8);
+            assert(length>=24 && length<=batch.used-at);at+=length;entries++;
+        }
+    } while(status);
     assert(entries==42 && !kernel_vfs_close(&a));
     assert(!kernel_vfs_create(mount,"/old",0666,&a) && !kernel_vfs_create(mount,"/dest",0666,&b));
     assert(!kernel_vfs_pwrite(&a,0,"old",3,&done) && done==3);
@@ -224,8 +287,12 @@ int main(int argc, char **argv)
         assert(!kernel_vfs_create(&mount,"/fault",0666,&file) && !kernel_vfs_ftruncate(&file,4096));
         unsigned char data=91; assert(!kernel_vfs_pwrite(&file,0,&data,1,&done) && done==1);
         write_fail=1; unsigned attempted=writes;
+        unsigned char direct_buffer[512]; uint64_t epoch;
+        assert(kernel_vfs_direct_pread(&file,0,direct_buffer,sizeof(direct_buffer),&done)==-KERNEL_EIO && !done);
+        assert(writes==attempted+1);
+        assert(!kernel_file_mapping_epoch(kernel_vfs_file_node(&file),&epoch));
         uint64_t mount_observed=kernel_vfs_mount_error_sequence(&mount);
-        assert(kernel_vfs_sync_mount(&mount,&mount_observed)==-KERNEL_EIO && writes==attempted+1);
+        assert(kernel_vfs_sync_mount(&mount,&mount_observed)==-KERNEL_EIO);
         uint64_t observed=kernel_vfs_error_sequence(&file);
         assert(kernel_vfs_sync(&file,0,&observed)==-KERNEL_EIO);
         assert(!kernel_vfs_close(&file));

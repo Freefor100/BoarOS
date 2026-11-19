@@ -41,7 +41,7 @@ RISC-V 和 LoongArch 各自处理启动、异常入口、上下文切换和页�
 
 ### 2. 任务调度与多核 SMP
 - **Per-CPU 独立就绪队列**：每个 CPU 核心拥有独立的就绪任务队列，普通任务的入队、领取和运行权交接由所在 CPU 的队列保护；跨核控制仍协调共享状态。
-- **多核负载均衡与亲和性**：唤醒时按亲和性选择队列；空闲 CPU 可领取其他队列中允许迁移的就绪任务。可用核数与具体负载的加速比是两回事。
+- **多核负载均衡与亲和性**：唤醒时按亲和性选择队列；空闲 CPU 可领取其他队列中允许迁移的就绪任务；已经忙碌的 CPU 也可按公平负载或实时优先级迁移候选。可用核数与具体负载的加速比是两回事。
 - **Futex 与快速同步机制**：支持等待、唤醒、重排、多地址等待（`futex_waitv`）和优先级继承，供 pthread 互斥锁和条件变量等使用。
 - **POSIX 信号体系**：支持实时信号与经典信号投递、专用信号栈 `sigaltstack` 以及通过 `sigreturn` 恢复被中断的执行现场。
 
@@ -57,7 +57,7 @@ RISC-V 和 LoongArch 各自处理启动、异常入口、上下文切换和页�
 - **多文件系统与挂载**：支持同时挂载 ext4、FAT32/VFAT、内存文件系统 tmpfs、进程状态文件系统 procfs 以及伪终端 devpts；支持挂载、bind、延迟卸载和 `chroot`；私有挂载命名空间可以复制挂载视图并隔离挂载变化。
 
 ### 5. 网络与事件等待
-- **网络协议**：使用 lwIP 处理 IPv4 TCP/UDP，并支持 IPv6 回环。用户数据复制和等待可在调用核执行。已建立的 TCP 连接由各归属核处理，UDP、监听和建连控制仍在 CPU0。IPv4 地址、掩码、MTU 和默认网关可在运行时配置。
+- **网络协议**：使用 lwIP 处理 IPv4 TCP/UDP，与 IPv6 TCP/UDP，支持以太网链路本地地址、静态 IPv6 地址、SLAAC、默认路由和 MLDv1。用户数据复制和等待可在调用核执行。已建立的 TCP 连接由各归属核处理，UDP、监听和建连控制仍在 CPU0。IPv4 地址、掩码、MTU 和默认网关可在运行时配置。
 - **Linux 兼容 Socket API**：提供常用 Linux 套接字接口。UNIX 套接字还支持文件描述符传递与消息凭据。
 - **[BPF 过滤与跟踪](docs/modules/kernel-bpf.md)**：双架构共用校验器与解释器，提供 socket 过滤、map/bpffs/BTF、raw_syscalls tracepoint 和 ringbuf，供原版 bpftool、libbpf 与 bpftrace 使用。
 - **事件驱动多路复用**：通过 `epoll`、`poll` 和 `pselect` 等接口等待套接字、管道及事件 FD 的就绪状态。
@@ -75,7 +75,7 @@ RISC-V 和 LoongArch 各自处理启动、异常入口、上下文切换和页�
 | **MMU 页表级数** | 3 级页表 (Sv39) | 3 级页表 (Direct Map + Page Walk) |
 | **多核 SMP 支持** | 1 ~ 8 核 | 1 ~ 8 核 |
 | **外设总线** | VirtIO-MMIO | PCI / PCIe 总线 |
-| **浮点与 SIMD** | RV64D 双精度浮点 | LA464 FR / LSX / LASX 向量扩展 |
+| **浮点与 SIMD** | RV64D 双精度浮点，支持 V 的 CPU 提供 RV 向量寄存器上下文 | LA464 FR / LSX / LASX 向量扩展 |
 | **时钟源** | 架构计时器，期限由 SBI 设置 | 龙芯片上恒频时钟 + 硬件 RTC |
 | **运行与验证环境** | QEMU virt + OpenSBI（当前未适配实板） | QEMU virt + LA464（当前未适配实板） |
 

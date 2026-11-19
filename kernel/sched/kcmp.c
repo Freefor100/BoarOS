@@ -28,8 +28,8 @@ static int compare(uint64_t a, uint64_t b, unsigned type)
 static int access_locked(struct kernel_task *caller, struct kernel_task *a,
     struct kernel_task *b, int32_t pid1, int32_t pid2)
 {
-    if (process_find_identity(pid1,KERNEL_PID_TID)!=a ||
-        process_find_identity(pid2,KERNEL_PID_TID)!=b) return -KERNEL_ESRCH;
+    if (process_find_identity_in(pid1,KERNEL_PID_TID,process_pid_active(caller))!=a ||
+        process_find_identity_in(pid2,KERNEL_PID_TID,process_pid_active(caller))!=b) return -KERNEL_ESRCH;
     if (!kernel_credentials_may_access_locked(caller,a,0) ||
         !kernel_credentials_may_access_locked(caller,b,0)) return -KERNEL_EPERM;
     return 0;
@@ -64,10 +64,10 @@ int64_t kernel_kcmp(struct kernel_task *caller, int32_t pid1, int32_t pid2,
     struct kernel_task *a,*b;
     {
         KERNEL_RAW_SCOPE(domain,&kernel_wait_domain);
-        first=scheduler_task_lookup_locked(pid1,KERNEL_PID_TID,0);
+        first=scheduler_task_lookup_in_locked(process_pid_active(caller),pid1,KERNEL_PID_TID,0);
         if (!first) return -KERNEL_ESRCH;
         if (pid1!=pid2) {
-            second=scheduler_task_lookup_locked(pid2,KERNEL_PID_TID,0);
+            second=scheduler_task_lookup_in_locked(process_pid_active(caller),pid2,KERNEL_PID_TID,0);
             if (!second) return -KERNEL_ESRCH;
         }
         a=first;b=second?second:first;

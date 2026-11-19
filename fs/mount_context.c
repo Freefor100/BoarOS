@@ -1,4 +1,5 @@
 #include "mount_context.h"
+#include "cgroup_internal.h"
 #include "vfs_internal.h"
 #include "open_file_internal.h"
 #include "char_device_internal.h"
@@ -8,6 +9,7 @@
 #include <kernel/tmpfs.h>
 #include <kernel/devpts.h>
 #include <kernel/procfs.h>
+#include <kernel/proc_task.h>
 #include <kernel/mqueue.h>
 #include <kernel/ipc_namespace.h>
 #include <kernel/bpf.h>
@@ -28,7 +30,7 @@ int kernel_mount_type_supported(const char *type)
 {
     return !strcmp(type,"tmpfs") || !strcmp(type,"ext4") || !strcmp(type,"vfat") ||
         !strcmp(type,"devpts") || !strcmp(type,"proc") || !strcmp(type,"mqueue") ||
-        !strcmp(type,"bpf") || !strcmp(type,"tracefs") || !strcmp(type,"sysfs");
+        !strcmp(type,"bpf") || !strcmp(type,"tracefs") || !strcmp(type,"sysfs") || !strcmp(type,"cgroup2");
 }
 void kernel_mount_discard(struct kernel_vfs_path **owner)
 {
@@ -72,16 +74,31 @@ int kernel_mount_create(const struct kernel_fs_context *fs,const struct kernel_m
             return error;
         }
     }
+    if(!strcmp(p->type,"cgroup2")) {
+        int reused=kernel_vfs_reuse_cgroup_tree(fs->heap,
+            kernel_fs_context_namespace_id(fs),owner);
+        if(reused<0)return reused;
+        if(!reused){
+            struct kernel_vfs_mount *mount=kernel_vfs_path_mount(*owner);
+            mount->read_only=!!(p->flags&1U);mount->nosuid=!!(p->flags&2U);
+            mount->nodev=!!(p->flags&4U);mount->noexec=!!(p->flags&8U);
+            mount->silent=!!(p->flags&32768U);mount->atime_policy=kernel_vfs_atime_policy(p->flags,0,0);
+            int error=kernel_vfs_change_propagation(*owner,UINT64_C(262144),0);
+            if(error)kernel_mount_discard(owner);
+            return error;
+        }
+    }
     struct kernel_vfs_mount *mount=NULL;
     const struct kernel_credentials *previous=kernel_credentials_override(creator);
     int error=disk?kernel_vfs_disk_create(fs->heap,device,p->flags&1U,p->source,p->type,&mount):
+        !strcmp(p->type,"cgroup2")?kernel_cgroup_mount(fs->heap,p->flags&1U,&mount):
         !strcmp(p->type,"bpf")?kernel_bpffs_mount(fs->heap,p->flags&1U,&mount):
         !strcmp(p->type,"tracefs")?kernel_tracefs_mount(fs->heap,p->flags&1U,&mount):
         !strcmp(p->type,"sysfs")?kernel_sysfs_mount(fs->heap,p->flags&1U,&mount):
         !strcmp(p->type,"devpts")?kernel_devpts_create(fs->heap,p->flags&1U,p->options,&mount):
         !strcmp(p->type,"mqueue")?kernel_mqueue_fs_create(fs->heap,p->flags&1U,p->ipc_namespace?p->ipc_namespace:kernel_task_ipc_namespace(),&mount):
         !strcmp(p->type,"tmpfs")?kernel_tmpfs_create(fs->heap,p->flags&1U,p->options,&mount):
-        kernel_procfs_create(fs->heap,p->flags&1U,&mount);
+        kernel_procfs_create_in(fs->heap,p->flags&1U,p->pid_view,&mount);
     kernel_credentials_override(previous);
 
     if(error)return error;
@@ -101,6 +118,7 @@ static void context_release(void *object)
     kernel_mount_discard(&ctx->root);
     kernel_credentials_put(ctx->creator);
     if(ctx->parameters.ipc_namespace)kernel_namespace_put(ctx->parameters.ipc_namespace);
+    if(ctx->parameters.pid_view)kernel_proc_view_release(ctx->parameters.pid_view);
     kernel_heap_release(ctx->heap,ctx);
 }
 static int context_read(void *object,struct kernel_task *task,uint32_t flags,
@@ -121,6 +139,8 @@ int kernel_mount_context_open(struct kernel_heap *heap,const char *type,struct k
     if(type)memcpy(ctx->parameters.type,type,strlen(type)+1);
     if(type&&!strcmp(type,"mqueue")&&!root)
         ctx->parameters.ipc_namespace=kernel_namespace_get(kernel_task_ipc_namespace());
+    if(type&&!strcmp(type,"proc")&&!root)
+        ctx->parameters.pid_view=kernel_proc_view_acquire();
     if(root) {
         int error=kernel_vfs_clone_tree(root,0,&ctx->root);
         if(!error)error=kernel_vfs_change_propagation(ctx->root,UINT64_C(262144),0);

@@ -14,7 +14,8 @@
  * invocation. The production trace registration, targeting, ioctl, links,
  * user ABI and object information code is linked without replacement. */
 struct kernel_task {int tid,borrows;};
-static struct kernel_task actor={.tid=42},other={.tid=43};
+static struct kernel_task actor={.tid=142},other={.tid=143},replacement={.tid=144};
+static struct kernel_task *local_other=&other;
 static struct kernel_heap heap;
 static struct kernel_files files={.heap=&heap};
 static struct bpf_object *fds[128];
@@ -41,9 +42,13 @@ enum kernel_task_status kernel_task_mm_borrow_mutable(struct kernel_task *t,stru
 {assert(t==&actor);*mm=NULL;return 0;}
 enum kernel_task_status kernel_task_files_borrow(struct kernel_task *t,struct kernel_files **f)
 {assert(t==&actor);*f=&files;return 0;}
+enum kernel_task_status kernel_task_user_tid(const struct kernel_task *t,kernel_pid_t *id){*id=t->tid-100;return 0;}
 enum kernel_task_status kernel_task_tid(const struct kernel_task *t,kernel_pid_t *id){*id=t->tid;return 0;}
+struct kernel_task *kernel_task_find_user_tid(struct kernel_task *caller,kernel_pid_t id)
+{assert(caller==&actor);struct kernel_task *t=id==42?&actor:id==43?local_other:NULL;if(t)t->borrows++;return t;}
+/* Retain the root boundary for the parent-source counterexample. */
 struct kernel_task *kernel_task_find_by_tid(kernel_pid_t id)
-{struct kernel_task *t=id==42?&actor:id==43?&other:NULL;if(t)t->borrows++;return t;}
+{struct kernel_task *t=id==142?&actor:id==143?&other:NULL;if(t)t->borrows++;return t;}
 int kernel_task_has_user_context(const struct kernel_task *t){return !!t;}
 void kernel_task_lookup_put(struct kernel_task *t){assert(t->borrows>0);t->borrows--;}
 int bpf_user_copy(struct kernel_mm *mm,uint64_t a,void *p,size_t n,int from)
@@ -128,6 +133,21 @@ static void lifecycle(void)
     unsigned before=invocations;emit(&actor);assert(invocations==before+2 && !count(f1) && !count(f2));
     close_fd(f1);close_fd(f2);close_fd(p1);close_fd(p2);assert(!actor.borrows && !allocations);
 }
+static void pid_views(void)
+{
+    assert(open_event(142,-1)==-KERNEL_ESRCH);
+    int prog=new_program(),fd=open_event(43,-1);
+    assert(fd>=0&&other.borrows==1&&!replacement.borrows);
+    io(fd,0x40042408,prog);io(fd,0x2400,0);
+    /* The lookup boundary now reuses local 43, but an installed event keeps
+     * the original task storage, not an integer to resolve on each event. */
+    local_other=&replacement;
+    emit(&replacement);assert(!count(fd));
+    emit(&other);assert(count(fd)==1);
+    int newer=open_event(43,-1);assert(newer>=0&&replacement.borrows==1);
+    close_fd(fd);close_fd(newer);close_fd(prog);local_other=&other;
+    assert(!other.borrows&&!replacement.borrows&&!allocations);
+}
 static void attributes(void)
 {
     struct perf_attr a={.type=2,.size=sizeof(a),.config=1};
@@ -140,4 +160,4 @@ static void attributes(void)
     a.flags=2;assert(kernel_bpf_perf_open(&actor,(uintptr_t)&a,0,-1,-1,0)==-KERNEL_EOPNOTSUPP);
     assert(!actor.borrows && !allocations);
 }
-int main(void){attributes();lifecycle();puts("BPF TRACE HOST PASS ABI targeting lifecycle concurrent close");return 0;}
+int main(void){attributes();lifecycle();pid_views();puts("BPF TRACE HOST PASS ABI targeting lifecycle concurrent close");return 0;}

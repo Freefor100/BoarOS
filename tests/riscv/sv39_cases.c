@@ -1,4 +1,5 @@
 #include <arch/riscv/sv39.h>
+#include <arch/riscv/virt_uart.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
 
@@ -910,8 +911,106 @@ static int test_user_space_populate(void)
     return 0;
 }
 
+/* Active hardware access, not merely a software page-table lookup. The test
+ * borrows the kernel's identity slot only while running in the user root. */
+static unsigned char huge_pool[8U*1024*1024] __attribute__((aligned(2097152)));
+int run_sv39_huge_tests(void)
+{
+    struct boot_memory_layout layout={0};
+    struct physical_page_allocator a;
+    struct riscv_sv39_page_table k={0};
+    struct riscv_sv39_user_space u={0};
+    layout.usable_count=1; layout.usable[0].base=(uintptr_t)huge_pool;
+    layout.usable[0].size=sizeof(huge_pool);
+    uint64_t initial=riscv_sv39_current_satp(), physical;
+#define HUGE_CHECK(x) do { if (!(x)) { riscv_sv39_switch_satp(initial); return 110; } } while (0)
+    HUGE_CHECK(!init_test_page_allocator(&a,&layout));
+    HUGE_CHECK(!physical_page_allocator_finalize(&a));
+    uint64_t available=physical_page_available(&a);
+    HUGE_CHECK(!riscv_sv39_page_table_init(&k,&a));
+    HUGE_CHECK(!riscv_sv39_map_range(&k,0x80000000,0x80000000,0x8000000,
+        RISCV_SV39_READ|RISCV_SV39_WRITE|RISCV_SV39_EXECUTE));
+    HUGE_CHECK(!riscv_sv39_activate(&k));
+    HUGE_CHECK(!riscv_sv39_user_space_init(&u,&a,&k));
+    HUGE_CHECK(!physical_page_allocate_order(&a,9,&physical));
+    struct kernel_mm_leaf_preparation prep=KERNEL_MM_LEAF_PREPARATION_INIT;
+    HUGE_CHECK(!physical_page_allocate(&a,&prep.tables[0]));
+    uint64_t *middle=(void *)(uintptr_t)prep.tables[0];
+    for (unsigned i=0;i<512;i++) middle[i]=0;
+    HUGE_CHECK(!riscv_sv39_user_map_prepared_order(&u,0x200000,physical,
+        RISCV_SV39_READ|RISCV_SV39_WRITE,0,9,&prep));
+    uint64_t *root=(void *)(uintptr_t)u.root_address;
+    root[2]=((uint64_t *)(uintptr_t)k.root_address)[2];
+    uint64_t context;
+    HUGE_CHECK(!riscv_sv39_user_space_satp(&u,&context));
+    uint64_t sstatus;
+    __asm__ volatile("csrr %0,sstatus;csrs sstatus,%1":"=&r"(sstatus):"r"(UINT64_C(1)<<18):"memory");
+    HUGE_CHECK(!riscv_sv39_switch_satp(context));
+    volatile unsigned char *v=(void *)(uintptr_t)0x200000;
+    v[0]=11; v[0x100000]=22; v[0x1fffff]=33;
+    int correct=v[0]==11 && v[0x100000]==22 && v[0x1fffff]==33;
+    HUGE_CHECK(!riscv_sv39_switch_satp(initial));
+    __asm__ volatile("csrw sstatus,%0"::"r"(sstatus):"memory");
+    root[2]=0;
+    HUGE_CHECK(correct && ((unsigned char *)(uintptr_t)physical)[0x1fffff]==33);
+    struct riscv_sv39_user_space child={0};
+    HUGE_CHECK(!riscv_sv39_user_space_fork(&child,&u,0,0));
+    HUGE_CHECK(u.cow_pages==512 && child.cow_pages==512);
+    struct kernel_mm_leaf leaf;
+    HUGE_CHECK(!riscv_sv39_user_leaf_snapshot(&child,0x200001,&leaf) && leaf.order==9 && leaf.cow);
+    uint64_t replacement;
+    HUGE_CHECK(!physical_page_allocate_order(&a,9,&replacement));
+    for (unsigned i=0;i<2097152;i++) ((unsigned char *)(uintptr_t)replacement)[i]=((unsigned char *)(uintptr_t)physical)[i];
+    struct kernel_mm_retirement batch={0};
+    HUGE_CHECK(!riscv_sv39_user_cow_commit_order(&child,0x200000,leaf.cookie,replacement,
+        RISCV_SV39_READ|RISCV_SV39_WRITE,9,&batch));
+    __asm__ volatile("sfence.vma":::"memory");
+    kernel_mm_retirement_release(&a,&batch);
+    HUGE_CHECK(!riscv_sv39_user_protect_owned_range(&child,0x200000,0x400000,0));
+    HUGE_CHECK(!riscv_sv39_user_leaf_snapshot(&child,0x300000,&leaf) && !leaf.permissions);
+    HUGE_CHECK(!riscv_sv39_user_protect_owned_range(&child,0x200000,0x400000,RISCV_SV39_READ|RISCV_SV39_WRITE));
+    HUGE_CHECK(riscv_sv39_user_unmap_owned_range(&child,0x201000,0x400000)==RISCV_SV39_STATUS_INVALID);
+    uint64_t *child_root=(void *)(uintptr_t)child.root_address;
+    child_root[2]=((uint64_t *)(uintptr_t)k.root_address)[2];
+    HUGE_CHECK(!riscv_sv39_user_space_satp(&child,&context));
+    __asm__ volatile("csrs sstatus,%0"::"r"(UINT64_C(1)<<18):"memory");
+    HUGE_CHECK(!riscv_sv39_switch_satp(context));
+    v[0x100000]=44;
+    correct=v[0x1fffff]==33 && v[0x100000]==44;
+    HUGE_CHECK(!riscv_sv39_switch_satp(initial));
+    __asm__ volatile("csrw sstatus,%0"::"r"(sstatus):"memory");
+    child_root[2]=0;
+    HUGE_CHECK(correct && ((unsigned char *)(uintptr_t)physical)[0x100000]==22);
+    HUGE_CHECK(!riscv_sv39_user_leaf_snapshot(&u,0x200000,&leaf));
+    HUGE_CHECK(!riscv_sv39_user_cow_commit_order(&u,0x200000,leaf.cookie,KERNEL_MM_NO_PAGE,
+        RISCV_SV39_READ|RISCV_SV39_WRITE,9,&batch));
+    HUGE_CHECK(!physical_page_acquire_order(&a,replacement,9));
+    struct kernel_mm_detach_cursor cursor={0};
+    enum riscv_sv39_status status;
+    do {
+        status=riscv_sv39_user_detach_range(&child,0x200000,0x400000,&cursor,&batch,0,0);
+        HUGE_CHECK(status==RISCV_SV39_STATUS_OK || status==RISCV_SV39_STATUS_NOT_MAPPED);
+        __asm__ volatile("sfence.vma":::"memory");
+        kernel_mm_retirement_release(&a,&batch);
+    } while(status==RISCV_SV39_STATUS_OK);
+    uint32_t refs;
+    HUGE_CHECK(!physical_page_reference_count(&a,replacement,&refs) && refs==1);
+    HUGE_CHECK(((unsigned char *)(uintptr_t)replacement)[0x100000]==44);
+    HUGE_CHECK(!physical_page_release_order(&a,replacement,9));
+    HUGE_CHECK(!riscv_sv39_user_space_destroy(&child));
+    HUGE_CHECK(!riscv_sv39_user_space_destroy(&u));
+    HUGE_CHECK(!physical_page_release(&a,(((uint64_t *)(uintptr_t)k.root_address)[2]>>10)<<12));
+    HUGE_CHECK(!physical_page_release(&a,k.root_address));
+    HUGE_CHECK(physical_page_available(&a)==available && !physical_page_allocator_audit(&a));
+#undef HUGE_CHECK
+    virt_uart_puts("BoarOS: RV active 2MiB user leaf offsets and recovery passed\n");
+    return 0;
+}
+
 int run_sv39_tests(void)
 {
+    int huge_result=run_sv39_huge_tests();
+    if (huge_result) return huge_result;
     struct physical_page_allocator allocator;
     struct riscv_sv39_page_table table;
     struct boot_memory_layout scale_layout;

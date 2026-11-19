@@ -201,6 +201,19 @@ int kernel_rwlock_try_read(struct kernel_rwlock *lock, struct kernel_lock_guard 
 { return acquire(lock, guard, 0, 1); }
 int kernel_rwlock_try_write(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
 { return acquire(lock, guard, 1, 1); }
+int kernel_rwlock_try_upgrade(struct kernel_lock_guard *guard)
+{
+    struct kernel_io_context *owner=kernel_io_context_current();
+    if (!guard || !guard->lock || guard->owner!=owner || owner->locks!=guard || guard->write)
+        __builtin_trap();
+    struct kernel_rwlock *lock=guard->lock;
+    KERNEL_RAW_SCOPE(metadata,&lock->metadata);
+    if (lock->readers!=1 || lock->pending_head || lock->handoff_owner) return 0;
+    lock->readers=0;
+    lock->writer=owner;
+    guard->write=1;
+    return 1;
+}
 void kernel_rwlock_read(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
 { (void)acquire(lock, guard, 0, 0); }
 void kernel_rwlock_write(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
@@ -279,10 +292,15 @@ __attribute__((aligned(1024))) void kernel_lock_release(struct kernel_lock_guard
 
 int kernel_lock_held(const struct kernel_rwlock *lock, int write)
 {
-    for (struct kernel_lock_guard *g = kernel_io_context_current()->locks; g; g = g->previous)
+    for (struct kernel_lock_guard *g = kernel_io_context_current()->locks; g; g = g->previous) {
         if (g->lock == lock) {
             if (write && !g->write) __builtin_trap();
             return 1;
         }
+        /* acquire enforces strictly increasing (rank,key). Earlier guards
+         * cannot own a lock ordered above this one. */
+        if (g->lock->rank < lock->rank ||
+            (g->lock->rank == lock->rank && g->lock->key <= lock->key)) break;
+    }
     return 0;
 }

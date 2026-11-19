@@ -43,6 +43,10 @@ struct kernel_socket_read_request {
     struct kernel_task *task;
     void *packet;
     uint32_t bytes, completed_bytes;
+    /* Per-syscall TCP WAITALL continuation; no reservation survives a wait. */
+    uint64_t peek_sequence;
+    uint32_t peek_offset;
+    uint8_t waitall, progressed;
     int datagram;
     struct kernel_socket_message *message;
     void *peek_control;
@@ -207,6 +211,8 @@ int kernel_socket_read_user(struct kernel_socket_read_request *request,
 uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request,
                                int user_fault);
 void kernel_socket_abort_read(struct kernel_socket_read_request *request);
+int kernel_socket_wait_read(struct kernel_socket *socket,
+    struct kernel_socket_read_request *request, uint64_t target_ns, uint32_t flags);
 int kernel_socket_wait_ready(struct kernel_socket *socket, uint32_t events,
     uint64_t target_ns, uint32_t flags);
 #define KERNEL_SOCKET_MSG_PEEK 0x2U
@@ -225,9 +231,27 @@ enum kernel_socket_option {
     KERNEL_SOCKET_SNDBUF, KERNEL_SOCKET_RCVBUF,
     KERNEL_SOCKET_TYPE, KERNEL_SOCKET_ERROR, KERNEL_SOCKET_ACCEPTCONN,
     KERNEL_SOCKET_PASSCRED,
-    KERNEL_SOCKET_NODELAY, KERNEL_SOCKET_MAXSEG, KERNEL_SOCKET_V6ONLY,
+    KERNEL_SOCKET_NODELAY, KERNEL_SOCKET_CORK, KERNEL_SOCKET_MAXSEG, KERNEL_SOCKET_V6ONLY,
+    KERNEL_SOCKET_KEEPIDLE, KERNEL_SOCKET_KEEPINTVL, KERNEL_SOCKET_KEEPCNT,
     KERNEL_SOCKET_BROADCAST, KERNEL_SOCKET_IPV4_TTL, KERNEL_SOCKET_MULTICAST_TTL,
+    KERNEL_SOCKET_IPV6_MULTICAST_HOPS, KERNEL_SOCKET_IPV6_MULTICAST_LOOP, KERNEL_SOCKET_IPV6_MULTICAST_ALL,
 };
+/* Linux TCP_INFO ABI through snd_wnd (232 bytes). */
+struct kernel_socket_tcp_info {
+    uint8_t state, ca_state, retransmits, probes, backoff, options, scales, flags;
+    uint32_t rto_us, ato_us, snd_mss, rcv_mss;
+    uint32_t unacked, sacked, lost, retrans, fackets;
+    uint32_t last_data_sent, last_ack_sent, last_data_recv, last_ack_recv;
+    uint32_t pmtu, rcv_ssthresh, rtt_us, rttvar_us, snd_ssthresh, snd_cwnd;
+    uint32_t advmss, reordering, rcv_rtt_us, rcv_space, total_retrans;
+    uint64_t pacing_rate, max_pacing_rate, bytes_acked, bytes_received;
+    uint32_t segs_out, segs_in, notsent_bytes, min_rtt_us, data_segs_in, data_segs_out;
+    uint64_t delivery_rate, busy_time, rwnd_limited, sndbuf_limited;
+    uint32_t delivered, delivered_ce;
+    uint64_t bytes_sent, bytes_retrans;
+    uint32_t dsack_dups, reord_seen, rcv_ooopack, snd_wnd;
+};
+int kernel_socket_tcp_info(struct kernel_socket *, struct kernel_socket_tcp_info *);
 int kernel_socket_set_option(struct kernel_socket *socket,
                              enum kernel_socket_option option, int value);
 /* Names are kernel strings bounded by IFNAMSIZ. Interface identities are
@@ -236,6 +260,9 @@ int kernel_socket_set_bound_device(struct kernel_socket *, const char *name);
 /* length supplies user capacity and receives the actual name length. */
 int kernel_socket_get_bound_device(struct kernel_socket *, char name[16], uint32_t *length);
 /* address is network order; index zero selects by address or clears selection. */
+int kernel_socket_ipv6_membership(struct kernel_socket *, const uint8_t[16], uint32_t, int);
+int kernel_socket_set_ipv6_multicast_interface(struct kernel_socket *, uint32_t);
+int kernel_socket_get_ipv6_multicast_interface(struct kernel_socket *, uint32_t *);
 int kernel_socket_set_multicast_interface(struct kernel_socket *, uint32_t index, uint32_t address);
 int kernel_socket_get_multicast_interface(struct kernel_socket *, uint32_t *address);
 /* A write that already waited consumes an AF_UNIX asynchronous peer reset. */
@@ -255,13 +282,26 @@ struct kernel_wait_queue *kernel_socket_wait_queue(struct kernel_socket *socket)
 void kernel_socket_expire_timers(void);
 int kernel_socket_loopback_flags(const char name[16], uint16_t *flags);
 int kernel_socket_set_loopback_flags(const char name[16], uint16_t flags);
+struct kernel_socket_ipv6_address {
+    uint8_t address[16], prefix, flags, present;
+    uint32_t valid, preferred, created, updated;
+};
 struct kernel_socket_interface {
     char name[16];
     uint32_t index, address, netmask, mtu;
     uint16_t flags, hardware_type;
     uint8_t mac[6];
     uint32_t gateway;
-    int default_route;
+    int default_route, ipv6_present, link_up;
+    uint8_t ipv6_address[16], ipv6_flags;
+    union {
+        struct kernel_socket_ipv6_address ipv6_addresses[4];
+        /* Compatibility name for the two reserved manual address slots. */
+        struct kernel_socket_ipv6_address ipv6_static[4];
+    };
+    struct { uint8_t address[16], prefix, present; uint32_t lifetime; } ipv6_prefixes[5];
+    struct { uint8_t address[16], preference, present; uint32_t lifetime; } ipv6_routers[3];
+    uint8_t ipv6_gateway[16];
 };
 int kernel_socket_interface_get(const char name[16], struct kernel_socket_interface *snapshot);
 int kernel_socket_interface_index(uint32_t index, struct kernel_socket_interface *snapshot);
@@ -269,6 +309,9 @@ int kernel_socket_interface_nth(uint32_t ordinal, struct kernel_socket_interface
 int kernel_socket_interface_set_flags(const char name[16], uint16_t flags);
 int kernel_socket_interface_set_ipv4(const char name[16], uint32_t command, uint32_t value);
 int kernel_socket_interface_set_mtu(const char name[16], int32_t mtu);
+int kernel_socket_family(const struct kernel_socket *);
+int kernel_socket_ipv6_address(uint32_t,const uint8_t[16],uint32_t,int);
+int kernel_socket_ipv6_gateway(uint32_t,const uint8_t[16],int);
 int kernel_socket_default_route(const char *name, uint32_t gateway, int remove);
 void kernel_socket_network_initialize(void);
 void kernel_socket_network_purge_orphans(void);

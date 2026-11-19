@@ -118,7 +118,7 @@ enum kernel_files_status kernel_files_fcntl_lock(
     struct kernel_record_lock_conflict found;
     enum kernel_files_status status;
     enum kernel_uaccess_status access;
-    kernel_pid_t tgid;
+    kernel_pid_t tgid = 0;
     size_t copied = 0;
     int64_t start, end;
     int result;
@@ -165,7 +165,7 @@ enum kernel_files_status kernel_files_fcntl_lock(
     if (!node) { *linux_result = -KERNEL_EBADF; goto out; }
     state = kernel_vfs_node_record_locks(node);
     owner_head = kind ? &file->record_locks : &files->record->record_locks;
-    if (kernel_task_tgid(task, &tgid) != KERNEL_TASK_STATUS_OK) {
+    if (!query && !kind && flock.type != 2 && kernel_task_tgid(task, &tgid) != KERNEL_TASK_STATUS_OK) {
         status = KERNEL_FILES_STATUS_STATE;
         goto out;
     }
@@ -231,7 +231,7 @@ enum kernel_files_status kernel_files_fcntl_lock(
             flock.start = found.start;
             flock.length = found.end == INT64_MAX
                          ? 0 : found.end - found.start + 1;
-            flock.pid = found.pid;
+            flock.pid = kernel_task_lock_owner_user_number(found.pid);
         }
         copied = 0;
         access = kernel_copy_to_user(mm, user_flock, &flock,

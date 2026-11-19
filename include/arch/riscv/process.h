@@ -33,6 +33,8 @@ enum kernel_scheduler_status riscv_process_clone_current(
     uint64_t tls,
     uint64_t child_tid,
     uint64_t pidfd,
+    const int32_t *requested_tids, size_t requested_count,
+    int32_t cgroup_fd,
     int64_t *linux_result);
 
 #endif

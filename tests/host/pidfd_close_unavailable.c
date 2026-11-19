@@ -10,7 +10,10 @@ EXCLUDED(kernel_vfs_node_record_locks)
 EXCLUDED(kernel_vfs_path_release)
 EXCLUDED(kernel_vfs_close_tree)
 EXCLUDED(kernel_pipe_release_endpoint)
+#ifndef IPC_PROC_OWNER_CASE
 EXCLUDED(kernel_vfs_close)
+EXCLUDED(kernel_proc_view_release)
+#endif
 EXCLUDED(kernel_vfs_notify_file)
 EXCLUDED(kernel_event_fd_close)
 EXCLUDED(kernel_mqueue_close)

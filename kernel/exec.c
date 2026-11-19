@@ -23,8 +23,6 @@
 #include <stdint.h>
 #include <string.h>
 
-#define KERNEL_EXEC_VECTOR_LIMIT \
-    (KERNEL_EXEC_STRING_LIMIT / sizeof(uint64_t))
 #define KERNEL_EXEC_INITIAL_STRING_CAPACITY 256U
 #define KERNEL_EXEC_INITIAL_VECTOR_CAPACITY 8U
 #define KERNEL_EXEC_FD_NAME_PREFIX 32U
@@ -85,11 +83,11 @@ enum kernel_exec_status kernel_exec_transaction_cleanup(
     if ((transaction->prepared_files.state == KERNEL_FILES_LIVE ||
          transaction->prepared_files.state == KERNEL_FILES_CLEANUP) &&
         kernel_files_release_for_task(&transaction->prepared_files,
-                                      transaction->files_closer)) failed = 1;
+                                      transaction->cleanup_task)) failed = 1;
     if ((transaction->retired_files.state == KERNEL_FILES_LIVE ||
          transaction->retired_files.state == KERNEL_FILES_CLEANUP) &&
         kernel_files_release_for_task(&transaction->retired_files,
-                                      transaction->files_closer)) failed = 1;
+                                      transaction->cleanup_task)) failed = 1;
     if (kernel_exec_image_cleanup(transaction->heap,
                                   &transaction->image) !=
         KERNEL_EXEC_IMAGE_STATUS_OK) {
@@ -97,7 +95,7 @@ enum kernel_exec_status kernel_exec_transaction_cleanup(
     }
     if (transaction->retired_mm.state == KERNEL_MM_LIVE ||
         transaction->retired_mm.state == KERNEL_MM_CLEANUP) {
-        if (kernel_mm_release(&transaction->retired_mm) !=
+        if (kernel_mm_release_for_task(&transaction->retired_mm,transaction->cleanup_task) !=
             KERNEL_MM_STATUS_OK) {
             failed = 1;
         }
@@ -199,18 +197,18 @@ static enum exec_capture_status reserve_string_space(
     char *resized = transaction->string_bytes;
     enum exec_capture_status status;
 
-    if (transaction->string_size < transaction->string_capacity) {
-        return EXEC_CAPTURE_OK;
-    }
-    if (transaction->string_capacity == KERNEL_EXEC_STRING_LIMIT) {
+    if (transaction->string_size >= transaction->string_limit) {
         *linux_result = -KERNEL_E2BIG;
         return EXEC_CAPTURE_LINUX_ERROR;
+    }
+    if (transaction->string_size < transaction->string_capacity) {
+        return EXEC_CAPTURE_OK;
     }
     capacity = transaction->string_capacity == 0U
                    ? KERNEL_EXEC_INITIAL_STRING_CAPACITY
                    : transaction->string_capacity * 2U;
-    if (capacity > KERNEL_EXEC_STRING_LIMIT) {
-        capacity = KERNEL_EXEC_STRING_LIMIT;
+    if (capacity > transaction->string_limit) {
+        capacity = transaction->string_limit;
     }
     status = grow_allocation(transaction,
                              transaction->string_bytes,
@@ -238,15 +236,15 @@ static enum exec_capture_status reserve_vector_slot(
     if (count < *capacity) {
         return EXEC_CAPTURE_OK;
     }
-    if (count >= KERNEL_EXEC_VECTOR_LIMIT) {
+    if (count >= transaction->vector_limit) {
         *linux_result = -KERNEL_E2BIG;
         return EXEC_CAPTURE_LINUX_ERROR;
     }
     new_capacity = *capacity == 0U
                        ? KERNEL_EXEC_INITIAL_VECTOR_CAPACITY
                        : *capacity * 2U;
-    if (new_capacity > KERNEL_EXEC_VECTOR_LIMIT) {
-        new_capacity = KERNEL_EXEC_VECTOR_LIMIT;
+    if (new_capacity > transaction->vector_limit) {
+        new_capacity = transaction->vector_limit;
     }
     status = grow_allocation(transaction,
                              *strings,
@@ -281,8 +279,9 @@ static enum exec_capture_status append_user_string(
         if (capture_status != EXEC_CAPTURE_OK) {
             return capture_status;
         }
-        available = transaction->string_capacity -
-                    transaction->string_size;
+        available = transaction->string_capacity - transaction->string_size;
+        if (available > KERNEL_EXEC_STRING_LIMIT - source_offset)
+            available = KERNEL_EXEC_STRING_LIMIT - source_offset;
         if (source_offset > UINT64_MAX - user_string) {
             *linux_result = -KERNEL_EFAULT;
             return EXEC_CAPTURE_LINUX_ERROR;
@@ -301,7 +300,8 @@ static enum exec_capture_status append_user_string(
         }
         if (access_status == KERNEL_UACCESS_STATUS_TOO_LONG) {
             transaction->string_size += length;
-            if (transaction->string_size >= KERNEL_EXEC_STRING_LIMIT) {
+            if (transaction->string_size >= transaction->string_limit ||
+                transaction->string_size - start >= KERNEL_EXEC_STRING_LIMIT) {
                 *linux_result = -KERNEL_E2BIG;
                 return EXEC_CAPTURE_LINUX_ERROR;
             }
@@ -315,6 +315,8 @@ static enum exec_capture_status append_user_string(
     }
 }
 
+/* Snapshot both pointer vectors before copying strings, so their stack cost
+ * is known even for a large vector containing only empty strings. */
 static enum exec_capture_status capture_vector(
     struct kernel_exec_transaction *transaction,
     struct kernel_mm *mm,
@@ -345,12 +347,12 @@ static enum exec_capture_status capture_vector(
         if (capture_status != EXEC_CAPTURE_OK) {
             return capture_status;
         }
-        (*strings)[0].bytes = "";
+        (*strings)[0].bytes = 0;
         (*strings)[0].length = 0U;
         *count = 1U;
         return EXEC_CAPTURE_OK;
     }
-    for (index = 0U; index < KERNEL_EXEC_VECTOR_LIMIT; index++) {
+    for (index = 0U;; index++) {
         uint64_t user_string;
         size_t copied = 0U;
         enum kernel_uaccess_status access_status;
@@ -384,26 +386,18 @@ static enum exec_capture_status capture_vector(
             }
             return EXEC_CAPTURE_OK;
         }
-        capture_status = reserve_vector_slot(transaction,
-                                             strings,
-                                             *count,
-                                             capacity,
-                                             linux_result);
-        if (capture_status != EXEC_CAPTURE_OK) {
-            return capture_status;
+        if (transaction->argument_count + transaction->environment_count >=
+            transaction->vector_limit) {
+            *linux_result = -KERNEL_E2BIG;
+            return EXEC_CAPTURE_LINUX_ERROR;
         }
-        capture_status = append_user_string(transaction,
-                                            mm,
-                                            user_string,
-                                            &(*strings)[*count],
-                                            linux_result);
-        if (capture_status != EXEC_CAPTURE_OK) {
-            return capture_status;
-        }
+        capture_status = reserve_vector_slot(transaction, strings, *count,
+                                             capacity, linux_result);
+        if (capture_status != EXEC_CAPTURE_OK) return capture_status;
+        (*strings)[*count].bytes = (const char *)(uintptr_t)user_string;
+        (*strings)[*count].length = 0U;
         (*count)++;
     }
-    *linux_result = -KERNEL_E2BIG;
-    return EXEC_CAPTURE_LINUX_ERROR;
 }
 
 static void resolve_staged_strings(struct kernel_exec_string *strings,
@@ -415,9 +409,7 @@ static void resolve_staged_strings(struct kernel_exec_string *strings,
     for (index = 0U; index < count; index++) {
         uintptr_t encoded = (uintptr_t)strings[index].bytes;
 
-        if (encoded != 0U && encoded <= KERNEL_EXEC_STRING_LIMIT) {
-            strings[index].bytes = bytes + encoded - 1U;
-        }
+        strings[index].bytes = bytes + encoded - 1U;
     }
 }
 
@@ -436,6 +428,21 @@ static enum exec_capture_status append_kernel_string(
     return EXEC_CAPTURE_OK;
 }
 
+static enum exec_capture_status capture_strings(
+    struct kernel_exec_transaction *transaction, struct kernel_mm *mm,
+    struct kernel_exec_string *strings, size_t count, int64_t *error)
+{
+    while (count) {
+        struct kernel_exec_string *string = &strings[--count];
+        uint64_t address = (uint64_t)(uintptr_t)string->bytes;
+        enum exec_capture_status status = address
+            ? append_user_string(transaction, mm, address, string, error)
+            : append_kernel_string(transaction, "", string, error);
+        if (status != EXEC_CAPTURE_OK) return status;
+    }
+    return EXEC_CAPTURE_OK;
+}
+
 static void discard_arg_zero(struct kernel_exec_transaction *transaction)
 {
     struct kernel_exec_string first = transaction->arguments[0];
@@ -443,7 +450,6 @@ static void discard_arg_zero(struct kernel_exec_transaction *transaction)
     transaction->argument_count--;
     memmove(transaction->arguments, transaction->arguments + 1,
             transaction->argument_count * sizeof(first));
-    if (encoded == 0U || encoded > KERNEL_EXEC_STRING_LIMIT) return;
     size_t start = encoded - 1U, length = first.length + 1U;
     memmove(transaction->string_bytes + start,
             transaction->string_bytes + start + length,
@@ -454,7 +460,7 @@ static void discard_arg_zero(struct kernel_exec_transaction *transaction)
         size_t count = vector ? transaction->environment_count : transaction->argument_count;
         for (size_t i = 0; i < count; i++) {
             uintptr_t offset = (uintptr_t)strings[i].bytes;
-            if (offset > encoded && offset <= KERNEL_EXEC_STRING_LIMIT)
+            if (offset > encoded)
                 strings[i].bytes = (const char *)(offset - length);
         }
     }
@@ -782,6 +788,13 @@ enum kernel_exec_status kernel_execveat_prepare(
     }
     if (dirfd != KERNEL_FS_AT_FDCWD && transaction->original_path[0] != '/')
         filename_length = prepend_fd_name(transaction->original_path, filename_length, dirfd);
+    struct kernel_rlimit64 stack_limit;
+    if (kernel_task_get_rlimit(task, KERNEL_RLIMIT_STACK, &stack_limit) !=
+        KERNEL_TASK_STATUS_OK) return finish_prepare_state(task, transaction);
+    image_request.stack_limit = stack_limit.current;
+    image_request.stack_limit_valid = 1U;
+    size_t argument_limit = kernel_exec_argument_limit(stack_limit.current);
+    transaction->vector_limit = argument_limit / sizeof(uint64_t);
     capture_status = capture_vector(transaction,
                                     mm,
                                     user_argv,
@@ -810,6 +823,21 @@ enum kernel_exec_status kernel_execveat_prepare(
     if (capture_status != EXEC_CAPTURE_OK) {
         return finish_prepare_state(task, transaction);
     }
+    size_t pointer_bytes = (transaction->argument_count +
+                            transaction->environment_count) * sizeof(uint64_t);
+    if (pointer_bytes >= argument_limit ||
+        filename_length + 1U >= argument_limit - pointer_bytes)
+        return finish_prepare_failure(task, transaction, -KERNEL_E2BIG, linux_result);
+    image_request.string_limit = argument_limit - pointer_bytes;
+    transaction->string_limit = image_request.string_limit - filename_length - 1U;
+    capture_status = capture_strings(transaction, mm, transaction->environment,
+                                     transaction->environment_count, linux_result);
+    if (capture_status == EXEC_CAPTURE_OK)
+        capture_status = capture_strings(transaction, mm, transaction->arguments,
+                                         transaction->argument_count, linux_result);
+    if (capture_status == EXEC_CAPTURE_LINUX_ERROR)
+        return finish_prepare_failure(task, transaction, *linux_result, linux_result);
+    if (capture_status != EXEC_CAPTURE_OK) return finish_prepare_state(task, transaction);
     capture_status = expand_scripts(transaction, fs, path_inaccessible, linux_result);
     if (capture_status == EXEC_CAPTURE_LINUX_ERROR)
         return finish_prepare_failure(task, transaction, *linux_result, linux_result);
@@ -933,13 +961,6 @@ enum kernel_exec_status kernel_execveat_prepare(
         transaction->personality &= ~KERNEL_PERSONALITY_CLEAR_ON_SETID;
     image_request.personality = transaction->personality;
     {
-        struct kernel_rlimit64 stack_limit;
-
-        if (kernel_task_get_rlimit(task, KERNEL_RLIMIT_STACK,
-                                   &stack_limit) != KERNEL_TASK_STATUS_OK)
-            return finish_prepare_state(task, transaction);
-        image_request.stack_limit = stack_limit.current;
-        image_request.stack_limit_valid = 1U;
         if (kernel_task_memory_limits(task, &image_request.memory_limits) !=
             KERNEL_TASK_STATUS_OK)
             return finish_prepare_state(task, transaction);

@@ -27,10 +27,19 @@ void kernel_task_current_memory_limits(struct kernel_memory_limits *out) { limit
 void kernel_console_putc(char c) { fputc(c,stderr); }
 void mm_test_unavailable(void) { abort(); }
 static _Thread_local int pause_reclaim_fence;
+static _Thread_local unsigned unmap_fences;
+static _Thread_local uint64_t unmap_owners[2];
 static atomic_int fence_entered,fence_continue,release_done;
 void mm_test_fence(uint64_t v,int instructions)
 {
     (void)v;(void)instructions;
+    if (unmap_owners[0]) {
+        unmap_fences++;
+        for (unsigned i=0;i<2;i++) {
+            uint32_t references;
+            assert(!physical_page_reference_count(&pages,unmap_owners[i],&references) && references);
+        }
+    }
     if (pause_reclaim_fence) {
         atomic_store(&fence_entered,1);
         while (!atomic_load(&fence_continue)) sched_yield();
@@ -43,13 +52,46 @@ static int address_of(const void *p,uint64_t *out) { *out=(uintptr_t)p; return 1
 #define BASE UINT64_C(0x400000)
 static unsigned fail_resize, fail_page, fail_page_after;
 static unsigned fail_heap_zero,fail_heap_zero_after;
+static _Thread_local int pause_fault_allocation;
+static _Thread_local int pause_optional_batch;
+static atomic_int fault_allocating, fault_resume;
+static enum kernel_mm_status removed_fault_result;
 enum kernel_heap_status __real_kernel_heap_allocate_zeroed(struct kernel_heap *,size_t,size_t,void **);
 enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t n,size_t s,void **out)
 { return fail_heap_zero || (fail_heap_zero_after && !--fail_heap_zero_after) ?
     KERNEL_HEAP_STATUS_EMPTY : __real_kernel_heap_allocate_zeroed(h,n,s,out); }
 enum physical_page_status __real_physical_page_allocate(struct physical_page_allocator *,uint64_t *);
 enum physical_page_status __wrap_physical_page_allocate(struct physical_page_allocator *a,uint64_t *out)
-{ return fail_page || (fail_page_after && !--fail_page_after) ? PHYSICAL_PAGE_STATUS_EMPTY : __real_physical_page_allocate(a,out); }
+{
+    if (pause_fault_allocation) {
+        pause_fault_allocation=0;
+        atomic_store(&fault_allocating,1);
+        while (!atomic_load(&fault_resume)) sched_yield();
+    }
+    return fail_page || (fail_page_after && !--fail_page_after) ?
+        PHYSICAL_PAGE_STATUS_EMPTY : __real_physical_page_allocate(a,out);
+}
+
+unsigned __real_physical_page_allocate_batch(struct physical_page_allocator *,uint64_t *,unsigned);
+unsigned __wrap_physical_page_allocate_batch(struct physical_page_allocator *a,uint64_t *out,unsigned count)
+{
+    if (pause_optional_batch) {
+        pause_optional_batch=0;
+        atomic_store(&fault_allocating,1);
+        while (!atomic_load(&fault_resume)) sched_yield();
+    }
+    return __real_physical_page_allocate_batch(a,out,count);
+}
+
+static void *fault_against_unmap(void *optional)
+{
+    mm_test_attach(1);
+    pause_fault_allocation=optional==NULL;
+    pause_optional_batch=optional!=NULL;
+    uint64_t address=optional ? BASE+P : BASE;
+    removed_fault_result=kernel_mm_resolve_user_fault(&mm,address,KERNEL_MM_WRITE);
+    return NULL;
+}
 enum kernel_heap_status __real_kernel_heap_resize(struct kernel_heap *,void *,size_t,void **);
 enum kernel_heap_status __wrap_kernel_heap_resize(struct kernel_heap *h,void *old,size_t size,void **out)
 { return fail_resize ? KERNEL_HEAP_STATUS_EMPTY : __real_kernel_heap_resize(h,old,size,out); }
@@ -80,6 +122,30 @@ static void *lock_admission_actor(void *argument)
 }
 static enum kernel_mm_status map(uint64_t at,uint64_t len,uint32_t prot,uint32_t flags)
 { uint64_t out=0; return kernel_mm_mmap_anonymous(&mm,at,len,prot,KERNEL_MM_MAP_FIXED|flags,&out); }
+static _Thread_local int pause_growth;
+static atomic_int growth_entered,growth_resume,growth_second_done;
+static uint64_t growth_address;
+static int growth_results[2];
+enum kernel_vma_status __real_kernel_vma_set_next(const struct kernel_vma_set *,uint64_t,struct kernel_vma *);
+enum kernel_vma_status __wrap_kernel_vma_set_next(const struct kernel_vma_set *set,uint64_t address,struct kernel_vma *out)
+{
+    enum kernel_vma_status status=__real_kernel_vma_set_next(set,address,out);
+    if(pause_growth && address==growth_address) {
+        pause_growth=0;atomic_store(&growth_entered,1);
+        while(!atomic_load(&growth_resume)) sched_yield();
+    }
+    return status;
+}
+static void *growth_actor(void *argument)
+{
+    unsigned id=(unsigned)(uintptr_t)argument;
+    mm_test_attach(id+1);
+    assert(!kernel_mm_context(&mm,&mm_test_context));
+    pause_growth=id==0;
+    growth_results[id]=kernel_mm_resolve_user_fault(&mm,growth_address,KERNEL_MM_WRITE);
+    if(id==1)atomic_store(&growth_second_done,1);
+    return NULL;
+}
 static uint64_t test_detached;
 static uint64_t test_reclaim(uint64_t target)
 { return kernel_mm_reclaim_lazy(&pages,target,&test_detached); }
@@ -161,6 +227,48 @@ static void *pressure_alloc_actor(void *unused)
     pressure_alloc_result=physical_page_allocate(&pages,&pressure_alloc_page);
     atomic_store(&pressure_alloc_done,1);return NULL;
 }
+struct protect_call {
+    unsigned actor;
+    uint32_t permissions;
+    enum kernel_mm_status status;
+    atomic_int done;
+};
+static void *protect_actor(void *argument)
+{
+    struct protect_call *call=argument;
+    mm_test_attach(call->actor);
+    pause_reclaim_fence=call->actor==1;
+    call->status=kernel_mm_mprotect(&mm,BASE,P,call->permissions);
+    atomic_store(&call->done,1);
+    return NULL;
+}
+static void permission_addition_claim(void)
+{
+    assert(!map(BASE,2*P,RW,0));
+    assert(!kernel_mm_resolve_user_fault(&mm,BASE,KERNEL_MM_WRITE));
+    assert(!kernel_mm_resolve_user_fault(&mm,BASE+P,KERNEL_MM_WRITE));
+    assert(!kernel_mm_mprotect(&mm,BASE,2*P,0));
+    struct protect_call first={.actor=1,.permissions=KERNEL_MM_READ};
+    struct protect_call second={.actor=2,.permissions=RW};
+    pthread_t a,b;
+    assert(!pthread_create(&a,NULL,protect_actor,&first));
+    while (!atomic_load(&fence_entered)) sched_yield();
+    unsigned parked=mm_test_parked(2);
+    assert(!pthread_create(&b,NULL,protect_actor,&second));
+    while (mm_test_parked(2)==parked && !atomic_load(&second.done)) sched_yield();
+    CHECK(!atomic_load(&first.done) && !atomic_load(&second.done));
+    CHECK(!kernel_mm_mprotect(&mm,BASE+P,P,KERNEL_MM_READ));
+    atomic_store(&fence_continue,1);
+    assert(!pthread_join(a,NULL) && !pthread_join(b,NULL));
+    struct kernel_mm_mapping leaf;
+    CHECK(!first.status && !second.status);
+    CHECK(!kernel_mm_lookup(&mm,BASE,&leaf) && (leaf.permissions&RW)==RW);
+    CHECK(!kernel_mm_lookup(&mm,BASE+P,&leaf) && (leaf.permissions&RW)==KERNEL_MM_READ);
+    CHECK(!kernel_mm_munmap(&mm,BASE,2*P));
+    atomic_store(&fence_entered,0);
+    atomic_store(&fence_continue,0);
+    puts("PASS mprotect overlap waits through publication while disjoint permission addition progresses");
+}
 static void population_and_dump(void)
 {
     assert(!map(BASE,3*P,RW,0));
@@ -205,6 +313,68 @@ int main(void)
     assert(!arch_mmu_user_space_init(&space,&pages,&kernel) && !kernel_mm_create(&mm,&space) && !kernel_mm_vma_enable(&mm,&heap));
     assert(!kernel_mm_brk_initialize(&mm,0x10000,0x20000) && !kernel_mm_context(&mm,&mm_test_context));
     population_and_dump();
+    permission_addition_claim();
+    assert(!map(BASE,P,RW,0));
+    pthread_t fault_thread;
+    assert(!pthread_create(&fault_thread,NULL,fault_against_unmap,NULL));
+    while (!atomic_load(&fault_allocating)) sched_yield();
+    /* The shared gate survives this completed range edit. No live claim
+     * remains by the time the old fault attempts to publish its new page. */
+    CHECK(!kernel_mm_munmap(&mm,BASE,P));
+    atomic_store(&fault_resume,1);
+    assert(!pthread_join(fault_thread,NULL));
+    CHECK(removed_fault_result==KERNEL_MM_STATUS_NOT_MAPPED);
+    struct kernel_mm_mapping removed_mapping;
+    CHECK(kernel_mm_lookup(&mm,BASE,&removed_mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    riscv_mmu_svvptc=1;
+    assert(!map(BASE,24*P,RW,0));
+    CHECK(!kernel_mm_resolve_user_fault(&mm,BASE,KERNEL_MM_WRITE));
+    CHECK(kernel_mm_lookup(&mm,BASE+P,&removed_mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(!kernel_mm_resolve_user_fault(&mm,BASE+P,KERNEL_MM_WRITE));
+    for (unsigned i=2; i<8; ++i) {
+        struct kernel_mm_mapping neighbour;
+        assert(!kernel_mm_lookup(&mm,BASE+i*P,&neighbour));
+        CHECK((neighbour.permissions & KERNEL_MM_WRITE) &&
+              !*(unsigned char *)(uintptr_t)neighbour.physical_address);
+    }
+    CHECK(kernel_mm_lookup(&mm,BASE+8*P,&removed_mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(!kernel_mm_resolve_user_fault(&mm,BASE+8*P,KERNEL_MM_WRITE));
+    CHECK(!kernel_mm_lookup(&mm,BASE+15*P,&removed_mapping));
+    CHECK(kernel_mm_lookup(&mm,BASE+16*P,&removed_mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(!kernel_mm_munmap(&mm,BASE,24*P));
+    assert(!map(BASE,8*P,RW,0));
+    assert(!kernel_mm_resolve_user_fault(&mm,BASE,KERNEL_MM_WRITE));
+    atomic_store(&fault_allocating,0);
+    atomic_store(&fault_resume,0);
+    assert(!pthread_create(&fault_thread,NULL,fault_against_unmap,(void *)1));
+    while (!atomic_load(&fault_allocating)) sched_yield();
+    /* One allocation precedes publication of both demand and neighbours.
+     * Removing the optional range must still let the required fault finish. */
+    CHECK(kernel_mm_lookup(&mm,BASE+P,&removed_mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(!kernel_mm_munmap(&mm,BASE+2*P,3*P));
+    atomic_store(&fault_resume,1);
+    assert(!pthread_join(fault_thread,NULL));
+    CHECK(!removed_fault_result && !kernel_mm_lookup(&mm,BASE+P,&removed_mapping));
+    CHECK(kernel_mm_lookup(&mm,BASE+3*P,&removed_mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(kernel_mm_lookup(&mm,BASE+2*P,&removed_mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(!kernel_mm_munmap(&mm,BASE,8*P));
+    assert(!map(BASE,8*P,RW,0));
+    assert(!kernel_mm_resolve_user_fault(&mm,BASE,KERNEL_MM_WRITE));
+    atomic_store(&fault_allocating,0);
+    atomic_store(&fault_resume,0);
+    assert(!pthread_create(&fault_thread,NULL,fault_against_unmap,(void *)1));
+    while (!atomic_load(&fault_allocating)) sched_yield();
+    /* An explicit populate wins the demand slot without selecting neighbours. */
+    CHECK(!kernel_mm_madvise(&mm,BASE+P,P,23));
+    struct kernel_mm_mapping winning_mapping;
+    CHECK(!kernel_mm_lookup(&mm,BASE+P,&winning_mapping));
+    atomic_store(&fault_resume,1);
+    assert(!pthread_join(fault_thread,NULL));
+    CHECK(!removed_fault_result && !kernel_mm_lookup(&mm,BASE+P,&removed_mapping));
+    CHECK(removed_mapping.physical_address==winning_mapping.physical_address);
+    CHECK(kernel_mm_lookup(&mm,BASE+2*P,&removed_mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(!kernel_mm_munmap(&mm,BASE,8*P));
+    riscv_mmu_svvptc=0;
     struct kernel_mm held = {0};
     struct kernel_raw_lock identity;
     kernel_raw_lock_init(&identity, 40);
@@ -592,6 +762,32 @@ int main(void)
     CHECK(!kernel_mm_munlockall(&mm)&&!kernel_mm_resolve_user_fault(&mm,BASE+15*P,KERNEL_MM_READ));
     CHECK(!kernel_mm_lookup(&mm,BASE+15*P,&lazy_mapping)&&!*(unsigned char *)(uintptr_t)lazy_mapping.physical_address);
     CHECK(!kernel_mm_munmap(&mm,BASE,64*P));
+    /* The neighboring leaf keeps the table live. Both bounded detach chunks
+     * must keep their old leaf owners through the same fence. */
+    assert(!map(BASE,25*P,RW,0));
+    for (unsigned i=0;i<25;i++) assert(!kernel_mm_resolve_user_fault(&mm,BASE+i*P,KERNEL_MM_WRITE));
+    struct kernel_mm_mapping unmap_first,unmap_last;
+    assert(!kernel_mm_lookup(&mm,BASE,&unmap_first) && !kernel_mm_lookup(&mm,BASE+23*P,&unmap_last));
+    unmap_owners[0]=unmap_first.physical_address;
+    unmap_owners[1]=unmap_last.physical_address;
+    CHECK(!kernel_mm_munmap(&mm,BASE,24*P));
+    CHECK(unmap_fences==1);
+    unmap_owners[0]=0;
+    CHECK(kernel_mm_lookup(&mm,BASE+23*P,&unmap_last)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(!kernel_mm_lookup(&mm,BASE+24*P,&unmap_last));
+    CHECK(!kernel_mm_munmap(&mm,BASE+24*P,P));
+    assert(!map(BASE,81*P,RW,0));
+    for (unsigned i=0;i<81;i++) assert(!kernel_mm_resolve_user_fault(&mm,BASE+i*P,KERNEL_MM_WRITE));
+    assert(!kernel_mm_lookup(&mm,BASE,&unmap_first) && !kernel_mm_lookup(&mm,BASE+79*P,&unmap_last));
+    unmap_owners[0]=unmap_first.physical_address;
+    unmap_owners[1]=unmap_last.physical_address;
+    unmap_fences=0;
+    CHECK(!kernel_mm_munmap(&mm,BASE,80*P));
+    CHECK(unmap_fences==1);
+    unmap_owners[0]=0;
+    CHECK(kernel_mm_lookup(&mm,BASE+79*P,&unmap_last)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(!kernel_mm_lookup(&mm,BASE+80*P,&unmap_last));
+    CHECK(!kernel_mm_munmap(&mm,BASE+80*P,P));
     /* Fork policy controls actual child leaves and refs, not just a VMA flag. */
     assert(!map(BASE,4*P,RW,0));
     struct kernel_mm_mapping fork_page, original_page;
@@ -743,7 +939,16 @@ int main(void)
     assert(!kernel_mm_brk(&mm,0x10000,&result));
 
     const uint64_t top=UINT64_C(0x4000000);
-    assert(!kernel_mm_vma_insert_anon(&mm,top-2*P,top,RW,KERNEL_VMA_ROLE_STACK,KERNEL_VMA_FAULT_DEMAND_ZERO));
+    for (unsigned explicit=0; explicit<2; explicit++) {
+    if (explicit) {
+        limits.data_soft=1;
+        CHECK(!map(top-2*P,2*P,RW,KERNEL_MM_MAP_GROWSDOWN));
+        limits.data_soft=UINT64_MAX;
+        CHECK(map(top, P, RW, KERNEL_MM_MAP_GROWSDOWN|KERNEL_MM_MAP_SHARED)==KERNEL_MM_STATUS_INVALID_ARGUMENT);
+    } else assert(!kernel_mm_vma_insert_anon(&mm,top-2*P,top,RW,KERNEL_VMA_ROLE_STACK,KERNEL_VMA_FAULT_DEMAND_ZERO));
+    /* Give both halves the same anonymous history so that restoring RW below
+     * really merges them before testing the limit of a single growing VMA. */
+    CHECK(!kernel_mm_resolve_user_fault(&mm,top-2*P,KERNEL_MM_WRITE));
     stack_limit=2*P;
     assert(!kernel_mm_mprotect(&mm,top-P,P,KERNEL_MM_READ));
     CHECK(!kernel_mm_resolve_user_fault(&mm,top-3*P,KERNEL_MM_WRITE));
@@ -780,9 +985,42 @@ int main(void)
     uint64_t stack_pages=physical_page_available(&pages);
     CHECK(!kernel_mm_resolve_user_fault(&mm,top-UINT64_C(9)*1024*1024,KERNEL_MM_WRITE));
     CHECK(stack_pages-physical_page_available(&pages)<=4);
-    CHECK(!kernel_mm_vma_lookup(&mm,top-UINT64_C(9)*1024*1024,&vma) && vma.role==KERNEL_VMA_ROLE_STACK);
+    CHECK(!kernel_mm_vma_lookup(&mm,top-UINT64_C(9)*1024*1024,&vma) && kernel_vma_grows_down(&vma));
     assert(!kernel_mm_munmap(&mm,top-UINT64_C(9)*1024*1024,UINT64_C(9)*1024*1024-4*P));
     stack_limit=UINT64_MAX;
+    if (explicit) {
+        CHECK(vma.role==KERNEL_VMA_ROLE_MMAP);
+        struct kernel_mm grown_child={0};
+        CHECK(!kernel_mm_fork(&grown_child,&mm));
+        CHECK(!kernel_mm_resolve_user_fault(&grown_child,top-5*P,KERNEL_MM_WRITE));
+        CHECK(!kernel_mm_vma_lookup(&grown_child,top-5*P,&vma) && kernel_vma_grows_down(&vma));
+        CHECK(kernel_mm_vma_lookup(&mm,top-5*P,&vma)==KERNEL_MM_STATUS_NOT_MAPPED);
+        CHECK(!kernel_mm_release(&grown_child));
+        CHECK(!map(top-4*P,4*P,RW,0));
+        CHECK(kernel_mm_resolve_user_fault(&mm,top-5*P,KERNEL_MM_WRITE)==KERNEL_MM_STATUS_NOT_MAPPED);
+    }
+    CHECK(!kernel_mm_munmap(&mm,top-4*P,4*P));
+    }
+    uint64_t automatic=0;
+    CHECK(!kernel_mm_mmap_anonymous(&mm,0,P,RW,KERNEL_MM_MAP_GROWSDOWN,&automatic));
+    CHECK(!kernel_mm_vma_lookup(&mm,automatic,&vma)&&kernel_vma_grows_down(&vma)&&vma.role==KERNEL_VMA_ROLE_MMAP);
+    CHECK(!kernel_mm_munmap(&mm,automatic,P));
+    CHECK(!map(top-P,P,RW,KERNEL_MM_MAP_GROWSDOWN));
+    growth_address=top-2*P;
+    pthread_t growth_threads[2];unsigned growth_parked=mm_test_parked(2);
+    assert(!pthread_create(&growth_threads[0],NULL,growth_actor,(void *)(uintptr_t)0));
+    while(!atomic_load(&growth_entered))sched_yield();
+    assert(!pthread_create(&growth_threads[1],NULL,growth_actor,(void *)(uintptr_t)1));
+    while(!atomic_load(&growth_second_done) && mm_test_parked(2)==growth_parked)sched_yield();
+    CHECK(!atomic_load(&growth_second_done));
+    atomic_store(&growth_resume,1);
+    assert(!pthread_join(growth_threads[0],NULL)&&!pthread_join(growth_threads[1],NULL));
+    CHECK(!growth_results[0]&&!growth_results[1]);
+    CHECK(!kernel_mm_vma_lookup(&mm,growth_address,&vma)&&vma.start==growth_address&&vma.end==top);
+    CHECK(!kernel_mm_mprotect_growdown(&mm,top-P,P,KERNEL_MM_READ,0));
+    CHECK(kernel_mm_resolve_user_fault(&mm,top-3*P,KERNEL_MM_WRITE)==KERNEL_MM_STATUS_NOT_MAPPED);
+    CHECK(!kernel_mm_munmap(&mm,top-2*P,2*P));
+    assert(!kernel_mm_vma_insert_anon(&mm,top-4*P,top,RW,KERNEL_VMA_ROLE_STACK,KERNEL_VMA_FAULT_DEMAND_ZERO));
     /* 独立共享对象阻止VMA合并，验证一次保护不按碎片数重复完成TLB。 */
     for (unsigned i=0;i<32;i++) {
         assert(!map(BASE+i*P,P,RW,KERNEL_MM_MAP_SHARED));
@@ -826,6 +1064,10 @@ int main(void)
     CHECK(kernel_mm_mprotect(&mm,BASE,(fragments*2-1)*P,KERNEL_MM_READ)==KERNEL_MM_STATUS_NO_MEMORY);
     assert(!kernel_mm_vma_lookup(&mm,BASE,&vma));CHECK(vma.permissions==KERNEL_MM_READ);
     assert(!kernel_mm_vma_lookup(&mm,BASE+(fragments-1)*2*P,&vma));CHECK(vma.permissions==RW);
+    uint64_t trim = BASE+(fragments-1)*2*P;
+    CHECK(!kernel_mm_munmap(&mm,trim+P,P));
+    CHECK(!kernel_mm_vma_lookup(&mm,trim,&vma)&&vma.start==trim&&vma.end==trim+P);
+    CHECK(kernel_mm_vma_lookup(&mm,trim+P,&vma)==KERNEL_MM_STATUS_NOT_MAPPED);
     fail_resize=0;
     assert(!kernel_mm_munmap(&mm,BASE,fragments*2*P));
     /* Locked usage belongs to this MM; the initiating actor supplies admission. */
@@ -847,11 +1089,11 @@ int main(void)
     uint64_t moved=0;
     CHECK(kernel_mm_mremap(&mm,BASE,2*P,3*P,1,0,&moved)==-KERNEL_EAGAIN);
     CHECK(!kernel_mm_mprotect(&mm,BASE,P,0));
-    CHECK(!kernel_mm_vma_lookup(&mm,BASE,&vma)&&vma.flags==3);
+    CHECK(!kernel_mm_vma_lookup(&mm,BASE,&vma)&&(vma.flags & KERNEL_VMA_LOCK_MASK)==KERNEL_VMA_LOCK_MASK);
     CHECK(!kernel_mm_munlock(&mm,BASE,4*P));
     CHECK(!kernel_mm_mlockall(&mm,6));
     CHECK(map(BASE,4*P,RW,KERNEL_MM_MAP_LOCKED)==KERNEL_MM_STATUS_LOCK_LIMIT);
-    CHECK(!kernel_mm_vma_lookup(&mm,BASE,&vma)&&!vma.flags);
+    CHECK(!kernel_mm_vma_lookup(&mm,BASE,&vma)&&!(vma.flags & KERNEL_VMA_LOCK_MASK));
     CHECK(!kernel_mm_munlockall(&mm));
     assert(!kernel_mm_munmap(&mm,BASE+P,P));
     CHECK(kernel_mm_mlock(&mm,BASE,4*P,1)==-KERNEL_ENOMEM);

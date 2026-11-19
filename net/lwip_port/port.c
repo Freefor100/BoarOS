@@ -3,6 +3,7 @@
 
 #include "lwip/sys.h"
 #include "lwip/tcp.h"
+#include "lwip/nd6.h"
 #include "boaros_lwip.h"
 
 #include <stdint.h>
@@ -109,6 +110,11 @@ void boaros_lwip_ip_unlock(struct kernel_lock_guard *guard)
 #endif
 }
 
+uint32_t boaros_lwip_centiseconds(void)
+{
+    return (uint32_t)(kernel_time_monotonic_ns() / UINT64_C(10000000));
+}
+
 u32_t sys_now(void)
 {
     return (u32_t)(kernel_time_monotonic_ns() / UINT64_C(1000000));
@@ -175,6 +181,8 @@ void boaros_lwip_loopback_publish(struct netif *netif)
 { if (protocol_hooks.loopback_publish) protocol_hooks.loopback_publish(netif); }
 void boaros_lwip_capacity_available(int pool)
 { if (protocol_hooks.capacity) protocol_hooks.capacity(pool); }
+void boaros_lwip_tcp_info_retire(struct tcp_pcb *pcb)
+{ if(protocol_hooks.tcp_info_retire)protocol_hooks.tcp_info_retire(pcb); }
 void boaros_lwip_tcp_timewait_free(struct tcp_pcb *pcb)
 { if (protocol_hooks.timewait_free) protocol_hooks.timewait_free(pcb); }
 struct boaros_lwip_tcp_context *boaros_lwip_tcp_context_lookup(void)
@@ -193,6 +201,10 @@ int boaros_lwip_tcp_conflict(const struct tcp_pcb *pcb, const struct ip_addr *lo
     const struct ip_addr *remote, uint16_t remote_port)
 { return protocol_hooks.tcp_conflict ? protocol_hooks.tcp_conflict(pcb,local,local_port,remote,remote_port) : 0; }
 
+void boaros_lwip_netif_removed(struct netif *n)
+{if(protocol_hooks.netif_removed)protocol_hooks.netif_removed(n);}
+int boaros_lwip_udp_multicast_receive(struct udp_pcb *pcb,struct pbuf *p,struct netif *n,const void *header,uint16_t length,uint16_t port)
+{return protocol_hooks.udp_multicast_receive?protocol_hooks.udp_multicast_receive(pcb,p,n,header,length,port):0;}
 int boaros_lwip_udp_ingress_filter(struct udp_pcb *pcb,struct pbuf *p,struct netif *input,
     int ipv6,const void *network,uint16_t network_length,uint16_t header)
 {
@@ -204,4 +216,70 @@ int boaros_lwip_tcp_ingress_filter(struct tcp_pcb *pcb,struct pbuf *p,struct net
 {
     return !protocol_hooks.tcp_ingress_filter ||
         protocol_hooks.tcp_ingress_filter(pcb,p,input,ipv6,network,network_length,header);
+}
+
+/* Fixed-size interface configuration, under the existing shared IP ownership.
+ * No separate FIB allocation or per-packet configuration snapshot is needed. */
+int boaros_lwip_ip6_prefix_bits(const ip6_addr_t *a,const ip6_addr_t *b)
+{
+    const unsigned char *x=(const void *)a->addr,*y=(const void *)b->addr;
+    unsigned bits=0;
+    for(unsigned i=0;i<16;i++) {
+        unsigned v=x[i]^y[i];
+        if(!v){bits+=8;continue;}
+        for(unsigned mask=128;!(v&mask);mask>>=1)bits++;
+        break;
+    }
+    return (int)bits;
+}
+int boaros_lwip_ip6_onlink(struct netif *n,const ip6_addr_t *destination)
+{
+    int best=nd6_onlink_prefix_length(n,destination);
+    if(ip6_addr_islinklocal(destination))return 64;
+    for(unsigned i=0;i<LWIP_IPV6_NUM_ADDRESSES;i++) {
+        if(!ip6_addr_isvalid(netif_ip6_addr_state(n,i)))continue;
+        const ip6_addr_t *a=netif_ip6_addr(n,i);
+        unsigned prefix=n->ip6_configured[i]?n->ip6_prefix[i]:128;
+        if(ip6_addr_islinklocal(a))continue;
+        int bits=boaros_lwip_ip6_prefix_bits(a,destination);
+        if(bits==128)return 128;
+        if(bits>=(int)prefix && (int)prefix>best)best=(int)prefix;
+    }
+    return best;
+}
+struct netif *boaros_lwip_ip6_route(const ip6_addr_t *source,const ip6_addr_t *destination)
+{
+    if(ip6_addr_ismulticast(destination)) {
+        struct netif *chosen=NULL;
+        for(struct netif *n=netif_list;n;n=n->next) {
+            if(!netif_is_up(n) || !netif_is_link_up(n) || (n->hwaddr_len && n->mtu<1280) ||
+               (ip6_addr_has_zone(destination) && !ip6_addr_test_zone(destination,n)))continue;
+            if(ip6_addr_ismulticast_iflocal(destination) && n->hwaddr_len)continue;
+            int valid=0;
+            for(unsigned i=0;i<LWIP_IPV6_NUM_ADDRESSES;i++)
+                if(ip6_addr_isvalid(netif_ip6_addr_state(n,i)) &&
+                   (ip6_addr_isany(source) || ip6_addr_zoneless_eq(source,netif_ip6_addr(n,i))))valid=1;
+            if(!valid)continue;
+            if(n==netif_default)return n;
+            if(!chosen || (!chosen->hwaddr_len && n->hwaddr_len))chosen=n;
+        }
+        return chosen;
+    }
+    struct netif *best=NULL,*fallback=NULL,*advertised=NULL;int length=-1;
+    for(struct netif *n=netif_list;n;n=n->next) {
+        if(!netif_is_up(n) || !netif_is_link_up(n) || (n->hwaddr_len && n->mtu<1280))continue;
+        int source_ok=ip6_addr_isany(source),global=0;
+        for(unsigned i=0;i<LWIP_IPV6_NUM_ADDRESSES;i++) {
+            if(!ip6_addr_isvalid(netif_ip6_addr_state(n,i)))continue;
+            const ip6_addr_t *a=netif_ip6_addr(n,i);
+            if(ip6_addr_zoneless_eq(a,source))source_ok=1;
+            if(!ip6_addr_islinklocal(a) && !ip6_addr_isloopback(a))global=1;
+        }
+        if(!source_ok)continue;
+        int prefix=boaros_lwip_ip6_onlink(n,destination);
+        if(prefix>length){best=n;length=prefix;}
+        if(global && !ip6_addr_isany(&n->ip6_gateway))fallback=n;
+        else if(global && nd6_default_gateway(n))advertised=n;
+    }
+    return best?best:fallback?fallback:advertised;
 }

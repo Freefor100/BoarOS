@@ -870,6 +870,41 @@ static int apply_metadata_nested(void *context)
     struct metadata_nested *request=context;request->calls++;
     return ext4_create_child(request->mount,EXT4_INODE_ROOT_INDEX,"budget-nested",0100640,0,NULL,&request->file,NULL,0,0);
 }
+static void symlink_read(struct kernel_vfs_mount *mount)
+{
+    struct kernel_vfs_path *root = NULL;
+    assert(!kernel_vfs_path_root(mount, lwext4_instance(mount->private_data)->instance.heap, &root));
+    char long_target[181];
+    memset(long_target, 'x', sizeof(long_target)-1);
+    long_target[sizeof(long_target)-1] = 0;
+    const char *targets[] = {"short", long_target};
+    for (unsigned i=0; i<2; i++) {
+        struct kernel_vfs_path *held = NULL;
+        char buffer[256] = "/link";
+        size_t done;
+        assert(!kernel_vfs_symlink_at(root, root, targets[i], buffer));
+        assert(!kernel_vfs_readlink_at(root, root, buffer, buffer, 3, &done));
+        assert(done == 3 && !memcmp(buffer, targets[i], done));
+        assert(!kernel_vfs_path_resolve(root, root, "/link", 0, &held));
+        assert(!kernel_vfs_unlink(mount, "/link"));
+        assert(!kernel_vfs_path_readlink(held, buffer, sizeof(buffer), &done));
+        assert(done == strlen(targets[i]) && !memcmp(buffer, targets[i], done));
+        assert(!kernel_vfs_path_release(&held));
+    }
+    assert(!kernel_vfs_symlink_at(root,root,"short","/name"));
+    assert(!kernel_vfs_symlink_at(root,root,"longer","/name-extra"));
+    assert(!kernel_vfs_symlink_at(root,root,".","/via"));
+    const char *names[]={"/via///name","//name-extra","/via/name"};
+    const char *expected[]={"short","longer","short"};
+    for (unsigned i=0;i<3;i++) {
+        char output[32];
+        size_t done;
+        assert(!kernel_vfs_readlink_at(root,root,names[i],output,sizeof(output),&done));
+        assert(done==strlen(expected[i]) && !memcmp(output,expected[i],done));
+    }
+    assert(!kernel_vfs_path_release(&root));
+}
+
 static void namespace_budget(struct kernel_vfs_mount *mount)
 {
     struct lwext4_mount_adapter *adapter=lwext4_instance(mount->private_data);
@@ -901,6 +936,7 @@ static void namespace_budget(struct kernel_vfs_mount *mount)
         memset(bytes,0x69+operation,length);assert(!ext4_fpwrite(&seed,0,bytes,length,&done) && done==length);
         metadata_limit(journal,block);
         uint64_t before=jbd_memory_budget_failures(journal),checkpoint=journal->checkpoint_sequence;
+        uint64_t durable=journal->durable_sequence;
         metadata_probe=1;metadata_open_calls=0;metadata_failed_step=NULL;
         struct kernel_vfs_file file={0};int result;
         switch (operation) {
@@ -919,7 +955,9 @@ static void namespace_budget(struct kernel_vfs_mount *mount)
             operations[operation],result,metadata_failed_step?metadata_failed_step:"none",metadata_open_calls,(unsigned long long)(jbd_memory_budget_failures(journal)-before),
             (unsigned long long)checkpoint,(unsigned long long)journal->checkpoint_sequence);
         assert(!result);
-        assert(jbd_memory_budget_failures(journal)>before && journal->checkpoint_sequence>checkpoint);
+        /* Committing ordered data can release the required budget before checkpoint. */
+        assert(jbd_memory_budget_failures(journal)>before);
+        assert(journal->durable_sequence>durable || journal->checkpoint_sequence>checkpoint);
         if (operation==8) {
             uint64_t target;
             assert(!ext4_file_sync_metadata_prepare(owner,false,&target) &&
@@ -1712,6 +1750,7 @@ int main(int argc,char **argv)
     if (!strcmp(argv[2],"credential-chown")) {credential_chown_groups(&mount);goto mounted_done;}
     if (!strcmp(argv[2],"credential-write-race")) {credential_write_attributes(&heap,&pages,&mount);goto mounted_done;}
     if (!strcmp(argv[2],"vfs-credentials")) {credential_vfs_cases(&mount);goto mounted_done;}
+    if (!strcmp(argv[2],"symlink-read")) { symlink_read(&mount);goto mounted_done; }
     if (!strcmp(argv[2],"namespace-budget")) { namespace_budget(&mount);goto mounted_done; }
     if (!strncmp(argv[2],"namespace-",10)) {
         namespace_pressure(&cache,&mount,!strcmp(argv[2],"namespace-reclaim"));goto mounted_done;
@@ -1751,7 +1790,7 @@ int main(int argc,char **argv)
 #endif
 mounted_done:
     assert(!kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(&cache) && !close(image_fd));
-    struct kernel_vfs_mount *memory=NULL; struct kernel_vfs_file unsupported={0};
+    struct kernel_vfs_mount *memory=NULL; struct kernel_vfs_file regular={0};
     assert(!kernel_tmpfs_create(&heap,0,NULL,&memory));
 #ifdef CACHE_MM_CASES
     if (!strcmp(argv[2],"inode-attributes")) inode_attributes(&heap,&pages,memory,1);
@@ -1760,13 +1799,14 @@ mounted_done:
     if (!strcmp(argv[2],"vfs-credentials")) credential_vfs_cases(memory);
     if (!strcmp(argv[2],"credential-chown")) credential_chown_groups(memory);
     if (!strcmp(argv[2],"credential-write-race")) credential_write_attributes(&heap,&pages,memory);
-    assert(!kernel_vfs_create(memory,"/unsupported",0600,&unsupported));
-    assert(kernel_vfs_fallocate(&unsupported,0,0,4096)==-KERNEL_EOPNOTSUPP);
-    assert(kernel_vfs_fallocate(&unsupported,1,0,4096)==-KERNEL_EOPNOTSUPP);
-    assert(!kernel_vfs_fallocate(&unsupported,KERNEL_VFS_FALLOC_KEEP_SIZE |
+    assert(!kernel_vfs_create(memory,"/regular",0600,&regular));
+    assert(!kernel_vfs_fallocate(&regular,0,0,4096) && kernel_vfs_file_size(&regular)==4096);
+    assert(!kernel_vfs_fallocate(&regular,KERNEL_VFS_FALLOC_KEEP_SIZE,4096,4096) &&
+        kernel_vfs_file_size(&regular)==4096);
+    assert(!kernel_vfs_fallocate(&regular,KERNEL_VFS_FALLOC_KEEP_SIZE |
         KERNEL_VFS_FALLOC_PUNCH_HOLE,0,4096));
-    assert(!kernel_vfs_file_block_device(&unsupported));
-    assert(!kernel_vfs_close(&unsupported) && !kernel_vfs_unmount(memory));
+    assert(!kernel_vfs_file_block_device(&regular));
+    assert(!kernel_vfs_close(&regular) && !kernel_vfs_unmount(memory));
     assert(!physical_page_allocator_audit(&pages) && physical_page_available(&pages)==baseline);
     struct kernel_heap_statistics stats;
     if (!strncmp(argv[2],"namespace-",10)) {

@@ -32,6 +32,8 @@ struct kernel_exec_transaction {
     char *string_bytes;
     size_t string_size;
     size_t string_capacity;
+    size_t string_limit;
+    size_t vector_limit;
     struct kernel_exec_string *arguments;
     size_t argument_count;
     size_t argument_capacity;
@@ -48,7 +50,8 @@ struct kernel_exec_transaction {
     struct kernel_exec_image image;
     struct kernel_mm retired_mm;
     struct kernel_files prepared_files, retired_files;
-    struct kernel_task *files_closer;
+    /* Transaction is owned by this task through cleanup; no extra task ref. */
+    struct kernel_task *cleanup_task;
     enum kernel_exec_transaction_state state;
     struct kernel_credentials *credentials;
     struct kernel_exec_security *exec_security;

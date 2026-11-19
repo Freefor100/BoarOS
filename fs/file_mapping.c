@@ -11,8 +11,9 @@ struct kernel_file_mapping_state {
     struct kernel_file_mapping *mappings;
     uint64_t epoch;
     uint32_t borrows;
-    uint8_t closing;
 };
+
+#define FILE_MAPPING_CLOSED (UINT64_C(1) << 63)
 
 static struct kernel_file_mapping_state *state(struct kernel_vfs_node *node)
 { return __atomic_load_n(&node->mapping_state, __ATOMIC_ACQUIRE); }
@@ -36,16 +37,12 @@ int kernel_file_mapping_prepare(struct kernel_vfs_node *node)
     kernel_raw_lock_init(&candidate->metadata, KERNEL_RAW_RANK_FILE_MAPPING);
     kernel_wait_queue_init(&candidate->changed);
     candidate->epoch = 1;
-    /* I/O 读保护排除无状态截断；已有 I/O metadata 仅用于一次发布，
-     * 不能在 raw 内构造候选或释放并发输掉的候选。 */
-    {
-        KERNEL_RAW_SCOPE(publish, &node->io_lock.metadata);
-        if (!state(node)) {
-            __atomic_store_n(&node->mapping_state, candidate, __ATOMIC_RELEASE);
-            candidate = 0;
-        }
-    }
-    if (candidate) kernel_heap_release(node->instance->heap, candidate);
+    /* I/O 读资格排除无状态截断，真实 inode 引用保证指针发布后不会回收。
+     * 并发读者只为首次发布竞争一次，不再借用 I/O 锁自己的队列保护。 */
+    struct kernel_file_mapping_state *expected = NULL;
+    if (!__atomic_compare_exchange_n(&node->mapping_state, &expected, candidate, 0,
+            __ATOMIC_RELEASE, __ATOMIC_RELAXED))
+        kernel_heap_release(node->instance->heap, candidate);
     return 0;
 }
 
@@ -61,7 +58,7 @@ void kernel_file_mapping_destroy(struct kernel_vfs_node *node)
 {
     struct kernel_file_mapping_state *s = state(node);
     if (!s) return;
-    if (!kernel_file_mapping_empty(node) || s->closing ||
+    if (!kernel_file_mapping_empty(node) || (s->epoch & FILE_MAPPING_CLOSED) ||
         __atomic_load_n(&s->changed.registrations,__ATOMIC_ACQUIRE) || s->changed.borrows) __builtin_trap();
     node->mapping_state = 0;
     kernel_heap_release(node->instance->heap, s);
@@ -121,7 +118,8 @@ int kernel_file_mapping_register(struct kernel_file_mapping *mapping)
     struct kernel_file_mapping_state *s = state(mapping->node);
     if (!s) __builtin_trap();
     KERNEL_RAW_SCOPE(guard, &s->metadata);
-    if (s->closing) return -KERNEL_EBUSY;
+    if (__atomic_load_n(&s->epoch, __ATOMIC_RELAXED) & FILE_MAPPING_CLOSED)
+        return -KERNEL_EBUSY;
     mapping->next = s->mappings;
     mapping->previous = &s->mappings;
     if (mapping->next) mapping->next->previous = &mapping->next;
@@ -215,9 +213,9 @@ void kernel_file_mapping_close(struct kernel_vfs_node *node)
     struct kernel_file_mapping_state *s = state(node);
     if (!kernel_lock_held(&node->io_lock, 1)) __builtin_trap();
     KERNEL_RAW_SCOPE(guard, &s->metadata);
-    if (s->closing || s->epoch == UINT64_MAX) __builtin_trap();
-    s->closing = 1;
-    s->epoch++;
+    uint64_t epoch = __atomic_load_n(&s->epoch, __ATOMIC_RELAXED);
+    if (epoch >= FILE_MAPPING_CLOSED - 1) __builtin_trap();
+    __atomic_store_n(&s->epoch, (epoch + 1) | FILE_MAPPING_CLOSED, __ATOMIC_RELEASE);
 }
 
 void kernel_file_mapping_open(struct kernel_vfs_node *node)
@@ -225,8 +223,9 @@ void kernel_file_mapping_open(struct kernel_vfs_node *node)
     struct kernel_file_mapping_state *s = state(node);
     if (!kernel_lock_held(&node->io_lock, 1)) __builtin_trap();
     { KERNEL_RAW_SCOPE(guard, &s->metadata);
-      if (!s->closing) __builtin_trap();
-      s->closing = 0; }
+      uint64_t epoch = __atomic_load_n(&s->epoch, __ATOMIC_RELAXED);
+      if (!(epoch & FILE_MAPPING_CLOSED)) __builtin_trap();
+      __atomic_store_n(&s->epoch, epoch & ~FILE_MAPPING_CLOSED, __ATOMIC_RELEASE); }
     changed(s);
 }
 
@@ -234,9 +233,11 @@ int kernel_file_mapping_epoch(struct kernel_vfs_node *node, uint64_t *epoch)
 {
     struct kernel_file_mapping_state *s = state(node);
     if (!s) { *epoch = 0; return 0; }
-    KERNEL_RAW_SCOPE(guard, &s->metadata);
-    *epoch = s->epoch;
-    return s->closing ? -KERNEL_EBUSY : 0;
+    /* Close/open and registration still synchronize under metadata. Readers
+     * only need the value and admission bit from the same publication. */
+    uint64_t snapshot = __atomic_load_n(&s->epoch, __ATOMIC_ACQUIRE);
+    *epoch = snapshot & ~FILE_MAPPING_CLOSED;
+    return snapshot & FILE_MAPPING_CLOSED ? -KERNEL_EBUSY : 0;
 }
 
 void kernel_file_mapping_wait(struct kernel_vfs_node *node)

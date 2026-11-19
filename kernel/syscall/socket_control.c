@@ -79,7 +79,7 @@ static int set_credentials(struct kernel_socket_control *control, const struct c
 {
     const struct kernel_credentials *cred=kernel_credentials_current();
     kernel_pid_t tgid=0;
-    if (kernel_task_tgid(kernel_task_current(),&tgid)!=KERNEL_TASK_STATUS_OK) __builtin_trap();
+    if (kernel_task_user_tgid(kernel_task_current(),&tgid)!=KERNEL_TASK_STATUS_OK) __builtin_trap();
     if (value->uid==UINT32_MAX || value->gid==UINT32_MAX) return -KERNEL_EINVAL;
     if ((value->pid!=tgid && !kernel_credentials_capable(cred,KERNEL_CAP_SYS_ADMIN)) ||
         ((value->uid!=cred->uid && value->uid!=cred->euid && value->uid!=cred->suid) &&
@@ -90,7 +90,7 @@ static int set_credentials(struct kernel_socket_control *control, const struct c
     /* The identity helper's zero selects self for automatic credentials; an
      * explicitly supplied zero follows find_get_pid(0), which has no owner. */
     if (!value->pid) return -KERNEL_ESRCH;
-    int error=kernel_task_identity_get(value->pid,&pid);
+    int error=kernel_task_identity_get_user(value->pid,&pid);
     if (error) return error;
     if (control->pid) kernel_task_identity_put(control->pid);
     control->pid=pid; control->uid=value->uid; control->gid=value->gid;
@@ -191,7 +191,7 @@ void kernel_socket_control_export(struct kernel_socket_call *call,struct kernel_
     if (passcred) {
         struct {struct control_header header; struct control_credentials value;} record={
             .header={sizeof(struct control_header)+sizeof(struct control_credentials),SOL_SOCKET,SCM_CREDENTIALS},
-            .value={control->has_credentials && control->pid?control->pid->number:0,control->has_credentials?control->uid:65534,control->has_credentials?control->gid:65534}};
+            .value={control->has_credentials && control->pid?kernel_task_identity_user_number(control->pid):0,control->has_credentials?control->uid:65534,control->has_credentials?control->gid:65534}};
         uint64_t length=record.header.length;
         if (capacity<length) { length=capacity; *output_flags|=MSG_CTRUNC; }
         record.header.length=length;

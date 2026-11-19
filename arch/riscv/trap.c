@@ -1,3 +1,4 @@
+#include <arch/riscv/vector.h>
 #include <arch/riscv/uaccess.h>
 #include <kernel/accounting.h>
 #include <kernel/cost.h>
@@ -259,6 +260,7 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
         struct kernel_syscall_request request = {
             .number = frame->a7,
             .user_sp = frame->sp,
+            .instruction_pointer = frame->sepc+4,
             .arguments = {
                 frame->a0,
                 frame->a1,
@@ -269,7 +271,6 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
             },
         };
         struct kernel_syscall_result result;
-        kernel_bpf_trace_enter(caller,(int32_t)request.number,request.arguments);
 #if BOAROS_USER_SMP
         kernel_cpu_current()->syscall_dispatches++;
 #endif
@@ -300,7 +301,11 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
             if(kernel_task_current()->ptrace)kernel_ptrace_syscall_exit(kernel_task_current(),frame,request.number);
             return;
         }
-        if (result.action == KERNEL_SYSCALL_ACTION_CLONE) {
+        if (result.action == KERNEL_SYSCALL_ACTION_CLONE3) {
+            enum kernel_scheduler_status status = kernel_clone3_current(frame, caller, &request, &result.value);
+            if (status != KERNEL_SCHEDULER_STATUS_OK) riscv_scheduler_fatal(frame, status);
+            result.action = KERNEL_SYSCALL_ACTION_RETURN;
+        } else if (result.action == KERNEL_SYSCALL_ACTION_CLONE) {
             enum kernel_scheduler_status scheduler_status =
                 riscv_process_clone_current(
                     frame,
@@ -309,7 +314,8 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
                     request.arguments[2],
                     request.arguments[3],
                     request.arguments[4],
-                    request.number == 435U ? request.arguments[5] : request.arguments[2],
+                    request.arguments[2], NULL, 0,
+                    -1,
                     &result.value);
 
             if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) {
@@ -362,11 +368,12 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
             if(kernel_task_current()->ptrace)kernel_ptrace_syscall_exit(kernel_task_current(),frame,request.number);
             return;
         }
-        if (result.action != KERNEL_SYSCALL_ACTION_RETURN) {
+        if (result.action != KERNEL_SYSCALL_ACTION_RETURN &&
+            result.action != KERNEL_SYSCALL_ACTION_RETURN_FINAL) {
             riscv_trap_fatal(frame);
         }
         kernel_bpf_trace_exit(kernel_task_current(),(int32_t)request.number,result.value);
-        if (result.value == -KERNEL_ERESTARTSYS) {
+        if (result.action != KERNEL_SYSCALL_ACTION_RETURN_FINAL && result.value == -KERNEL_ERESTARTSYS) {
             if(caller->ptrace) {
                 uint64_t argument=frame->a0;
                 frame->a0=(uint64_t)result.value;frame->sepc+=4;
@@ -395,7 +402,9 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
         switch (frame->scause) {
         case 0: case 4: case 6: signal = 7U; code = 1; break;
         case 1: case 5: case 7: signal = 11U; code = 2; break;
-        case 2: signal = 4U; code = 1; break;
+        case 2:
+            if (riscv_vector_first_use(frame)) return;
+            signal = 4U; code = 1; break;
         case 3: signal = 5U; code = 1; break;
         case 18:
             if (frame->stval == 2 || frame->stval == 3) { signal = 11U; code = 10; }
@@ -439,8 +448,8 @@ void riscv_trap_return_prepare(struct riscv_trap_frame *frame)
     /* 切换、信号恢复和exec可改变实际FS；旧trap快照不能把Dirty写回已保存状态。 */
     uint64_t live_status;
     __asm__ volatile("csrr %0, sstatus" : "=r"(live_status));
-    frame->sstatus = (frame->sstatus & ~RISCV_SSTATUS_FS_MASK) |
-                     (live_status & RISCV_SSTATUS_FS_MASK);
+    frame->sstatus = (frame->sstatus & ~(RISCV_SSTATUS_FS_MASK | RISCV_SSTATUS_VS_MASK)) |
+                     (live_status & (RISCV_SSTATUS_FS_MASK | RISCV_SSTATUS_VS_MASK));
     if (!(frame->sstatus & RISCV_SSTATUS_SPP)) kernel_cpu_account_user_return();
 }
 

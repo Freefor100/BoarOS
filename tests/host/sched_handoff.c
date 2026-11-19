@@ -109,9 +109,9 @@ uintptr_t sync_test_stack(void) { return cpu.current->stack_high - 16; }
 uint64_t kernel_time_monotonic_ns(void) { return 1; }
 uint64_t kernel_time_ticks_to_ns(uint64_t ticks) { return ticks; }
 uint32_t kernel_time_is_initialized(void) { return 1; }
-enum kernel_mm_status kernel_mm_resolve_user_fault(struct kernel_mm *mm,
+enum kernel_mm_status kernel_mm_resolve_owned_user_fault(struct kernel_mm *mm, struct kernel_task *task,
                                                    uint64_t address, uint32_t access)
-{ (void)mm; (void)address; (void)access; __builtin_trap(); /* Rejected kernel caller cannot enter MM. */ }
+{ (void)mm; (void)task; (void)address; (void)access; __builtin_trap(); /* Rejected kernel caller cannot enter MM. */ }
 uint64_t riscv_time_read(void) { return 1; }
 enum riscv_timer_status riscv_timer_set_scheduler_deadline(uint64_t deadline)
 { assert(!cpu.raw_locks);timer_request=deadline;return RISCV_TIMER_STATUS_NOT_STARTED; }
@@ -379,6 +379,7 @@ int main(int argc,char **argv)
     scheduler_rearm_timer();assert(timer_request==73);
     { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);deadline_index_remove(&peer);peer.wait.deadline=0; }
     scheduler_rearm_timer();assert(!timer_request);
+#if BOAROS_LOCK_DEBUG
     /* Reject a candidate that would otherwise preempt: neither deferred nor
      * ordinary validation failure may consume an existing request or owner. */
     for (unsigned deferred = 0; deferred < 2; deferred++) {
@@ -394,6 +395,7 @@ int main(int argc,char **argv)
         assert(!cpu.raw_locks && cpu.preempt_depth == deferred && !sync_test_irq);
         if (deferred) kernel_preempt_enable();
     }
+#endif
     clear_owned_page_case();
     private_storage_case();
     join_cursor_lifetime_case();

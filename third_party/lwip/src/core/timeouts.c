@@ -107,7 +107,7 @@ const struct lwip_cyclic_timer lwip_cyclic_timers[] = {
   {IP6_REASS_TMR_INTERVAL, HANDLER(ip6_reass_tmr)},
 #endif /* LWIP_IPV6_REASS */
 #if LWIP_IPV6_MLD
-  {MLD6_TMR_INTERVAL, HANDLER(mld6_tmr)},
+  /* mld6 schedules a single timeout only while reports are pending. */
 #endif /* LWIP_IPV6_MLD */
 #if LWIP_IPV6_DHCP6
   {DHCP6_TIMER_MSECS, HANDLER(dhcp6_tmr)},

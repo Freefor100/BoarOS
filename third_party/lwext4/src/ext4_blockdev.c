@@ -42,6 +42,7 @@
 
 #include <ext4_blockdev.h>
 #include <ext4_fs.h>
+#include <ext4_super.h>
 #include <ext4_journal.h>
 #include <kernel/cost.h>
 
@@ -165,6 +166,8 @@ static void ext4_block_end_write(struct ext4_bcache *bc, struct ext4_buf *buf, i
 
 int ext4_block_flush_buf(struct ext4_blockdev *bdev, struct ext4_buf *buf)
 {
+    int failed=bdev->fs?__atomic_load_n(&bdev->fs->nojournal_error,__ATOMIC_ACQUIRE):EOK;
+    if (failed) return failed;
     struct ext4_bcache *bc=bdev->bc;
     struct ext4_block_payload *payload;
     void (*complete)(struct ext4_bcache *, struct ext4_buf *, int, void *);
@@ -178,6 +181,11 @@ int ext4_block_flush_buf(struct ext4_blockdev *bdev, struct ext4_buf *buf)
         complete=buf->end_write;argument=buf->end_write_arg;
     }
     int result=ext4_blocks_set_direct(bdev,payload->data,buf->lba,1);
+    if (result && bdev->fs && !ext4_sb_feature_com(&bdev->fs->sb,EXT4_FCOM_HAS_JOURNAL)) {
+        int expected=EOK;
+        __atomic_compare_exchange_n(&bdev->fs->nojournal_error,&expected,result,false,
+            __ATOMIC_RELEASE,__ATOMIC_RELAXED);
+    }
     if (!result) {
         KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
         /* A later publication still needs its own write, even when this older
@@ -461,8 +469,8 @@ int ext4_blocks_set_direct(struct ext4_blockdev *bdev, const void *buf,
 	return ext4_bdif_bwrite(bdev, buf, pba, pb_cnt * cnt);
 }
 
-int ext4_blocks_set_batch(struct ext4_blockdev *bdev,
-	struct kernel_block_span *spans, unsigned count)
+int ext4_blocks_check_batch(struct ext4_blockdev *bdev,
+	const struct kernel_block_span *spans, unsigned count)
 {
 	if (!bdev || !bdev->bdif || count > EXT4_BLOCK_BATCH_MAX ||
 	    (count && !spans) || !bdev->bdif->ph_bsize || !bdev->lg_bsize ||
@@ -482,7 +490,13 @@ int ext4_blocks_set_batch(struct ext4_blockdev *bdev,
 			if (spans[i].offset < spans[j].offset + spans[j].size &&
 			    spans[j].offset < spans[i].offset + spans[i].size) return EINVAL;
 	}
-	if (!count) return EOK;
+    return EOK;
+}
+int ext4_blocks_set_batch(struct ext4_blockdev *bdev,
+    struct kernel_block_span *spans,unsigned count)
+{
+    int checked=ext4_blocks_check_batch(bdev,spans,count);
+    if (checked || !count) return checked;
 	if (!bdev->bdif->bwrite_batch) {
 		for (unsigned i = 0; i < count; i++) {
 			int r = ext4_bdif_bwrite(bdev, spans[i].buffer,

@@ -67,7 +67,7 @@ struct mld_group {
   /** timer for reporting */
   u16_t              timer;
   /** counter of simultaneous uses */
-  u8_t               use;
+  u32_t              use;
 };
 
 #define MLD6_TMR_INTERVAL              100 /* Milliseconds */
@@ -81,6 +81,8 @@ err_t  mld6_joingroup(const ip6_addr_t *srcaddr, const ip6_addr_t *groupaddr);
 err_t  mld6_joingroup_netif(struct netif *netif, const ip6_addr_t *groupaddr);
 err_t  mld6_leavegroup(const ip6_addr_t *srcaddr, const ip6_addr_t *groupaddr);
 err_t  mld6_leavegroup_netif(struct netif *netif, const ip6_addr_t *groupaddr);
+/* Final owner teardown: remove software membership even if hardware DEL fails. */
+err_t  mld6_leavegroup_netif_force(struct netif *netif, const ip6_addr_t *groupaddr);
 
 /** @ingroup mld6
  * Get list head of MLD6 groups for netif.

@@ -106,6 +106,24 @@ int kernel_proc_comm(kernel_pid_t pid, uint64_t identity, int thread,
     return 0;
 }
 
+/* Identity and MM publication/release share wait_domain. The mask accessors
+ * are nonblocking atomics; no task or MM pointer survives this scope. */
+int kernel_proc_coredump_filter(kernel_pid_t pid, uint64_t identity, int thread,
+    unsigned *value, int writing)
+{
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    enum kernel_pid_role role = thread ? KERNEL_PID_TID : KERNEL_PID_TGID;
+    struct kernel_task *task = process_find_identity(pid, role);
+    struct kernel_pid *id = task ? process_identity(task, role) : 0;
+    if (!id || id->generation != identity || !task->accounted || task->retirement)
+        return -KERNEL_ESRCH;
+    if (task->proc_exiting || task->mm.state != KERNEL_MM_LIVE)
+        return writing ? -KERNEL_ESRCH : 0;
+    if (writing) kernel_mm_coredump_filter_set(&task->mm, *value);
+    else *value = kernel_mm_coredump_filter_get(&task->mm);
+    return 1;
+}
+
 void kernel_proc_task_update_comm(struct kernel_task *task)
 {
     struct kernel_vfs_path *path = 0;
@@ -122,6 +140,98 @@ static int proc_visible(const struct kernel_task *task)
     return task && task->arch.user_mode && task->tid_owned &&
         task->group_leader && task->group_leader->tid_owned &&
         task->group_leader->tid > 0 && process_identity(task,KERNEL_PID_TGID);
+}
+
+struct kernel_pid_registry *kernel_proc_view_acquire(void)
+{
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    struct kernel_pid_registry *view = process_pid_active(kernel_task_current());
+    if (!view) view = &scheduler.identities; /* early boot mount */
+    if (view != &scheduler.identities) kernel_pid_registry_get(view);
+    return view;
+}
+
+void kernel_proc_view_retain(struct kernel_pid_registry *view)
+{
+    if (view == &scheduler.identities) return;
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    kernel_pid_registry_get(view);
+}
+
+void kernel_proc_view_release(struct kernel_pid_registry *view)
+{
+    if (view == &scheduler.identities) return;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        kernel_pid_registry_put(view);
+    }
+    process_identity_collect();
+}
+
+int kernel_proc_view_self(struct kernel_pid_registry *view, kernel_pid_t *tgid,
+    kernel_pid_t *tid)
+{
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    struct kernel_task *task = kernel_task_current();
+    *tgid = kernel_pid_number_in(process_identity(task, KERNEL_PID_TGID), view);
+    *tid = kernel_pid_number_in(process_identity(task, KERNEL_PID_TID), view);
+    return *tgid && *tid ? 0 : -KERNEL_ENOENT;
+}
+
+/* Called under identity lock; canonical group and generation come from the
+ * parent inode, never from a second interpretation of a user-visible number. */
+static int proc_view_entry(struct kernel_pid *id, kernel_pid_t group,
+    uint64_t group_generation, int thread, kernel_pid_t *canonical,
+    uint64_t *generation)
+{
+    enum kernel_pid_role role = thread ? KERNEL_PID_TID : KERNEL_PID_TGID;
+    struct kernel_task *task = id && id->members[role] ? id->members[role]->task : NULL;
+    if (!task || !task->accounted || task->retirement || !proc_visible(task) ||
+        (group && (process_identity_number(task, KERNEL_PID_TGID) != group ||
+                   process_identity_generation(task) != group_generation)))
+        return -KERNEL_ENOENT;
+    *canonical = kernel_pid_number_in(id, &scheduler.identities);
+    *generation = id->generation;
+    return 0;
+}
+
+int kernel_proc_view_lookup(struct kernel_pid_registry *view, kernel_pid_t number,
+    kernel_pid_t group, uint64_t group_generation, int thread,
+    kernel_pid_t *canonical, uint64_t *generation)
+{
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    return proc_view_entry(kernel_pid_find(view, number), group, group_generation,
+        thread, canonical, generation);
+}
+
+int kernel_proc_view_next(struct kernel_pid_registry *view, kernel_pid_t after,
+    kernel_pid_t group, uint64_t group_generation, int thread,
+    kernel_pid_t *number, kernel_pid_t *canonical, uint64_t *generation)
+{
+    if (after < 0) return -KERNEL_EINVAL;
+    for (;;) {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        struct kernel_pid *id = kernel_pid_next_published(view, after);
+        if (!id) return -KERNEL_ENOENT;
+        after = kernel_pid_number_in(id, view);
+        if (!proc_view_entry(id, group, group_generation, thread, canonical, generation)) {
+            *number = after;
+            return 0;
+        }
+    }
+}
+
+/* Namespace columns start at the mount view and end at the task's active
+ * namespace, not the reader's current namespace. */
+static unsigned proc_namespace_ids(const struct kernel_pid *id,
+    struct kernel_pid_registry *view, kernel_pid_t *numbers)
+{
+    if (!kernel_pid_number_in(id, view)) return 0;
+    unsigned count = id->registry->depth - view->depth + 1U;
+    struct kernel_pid_registry *space = id->registry;
+    for (unsigned n = count; n; n--, space = space->parent)
+        numbers[n - 1U] = kernel_pid_number_in(id, space);
+    return count;
 }
 
 uint32_t kernel_proc_pid_max(void)
@@ -257,27 +367,38 @@ static void proc_mm_release(struct kernel_mm *mm)
 }
 
 static int proc_task_snapshot(struct kernel_task *task, uint64_t identity,
-    int thread, struct kernel_proc_process_snapshot *result)
+    int thread, struct kernel_proc_process_snapshot *result,
+    struct kernel_pid_registry *view)
 {
-    struct kernel_task *leader = task->group_leader;
+    struct kernel_task *leader = NULL;
+    SCHEDULER_TASK_BORROW(group_owner, NULL);
     struct kernel_mm mm __attribute__((cleanup(proc_mm_release))) = {0};
     uint32_t threads = 0;
     {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-    if (leader->retirement || !leader->accounted) return -KERNEL_ENOENT;
+    leader = task->group_leader;
+    struct kernel_pid *selected = process_identity(task, thread ? KERNEL_PID_TID : KERNEL_PID_TGID);
+    struct kernel_pid *tid_id = process_identity(task, KERNEL_PID_TID);
+    if (!leader || leader->retirement || !leader->accounted || !selected || !tid_id ||
+        selected->generation != identity || !kernel_pid_number_in(selected, view))
+        return -KERNEL_ENOENT;
+    /* A borrowed nonleader can exec while later MM/TTY reads sleep. Preserve
+     * the captured group's storage without charging ordinary leader reads. */
+    if (leader != task) { scheduler_task_get_locked(leader); group_owner = leader; }
     threads = leader->group_members;
     if (!task->proc_exiting && task->mm.state == KERNEL_MM_LIVE &&
         kernel_mm_acquire(&mm, &task->mm)) return -KERNEL_EIO;
     *result = (struct kernel_proc_process_snapshot){
         .credentials=kernel_credentials_get(kernel_credentials_task_locked(task)),
-        .pid = task->tid,
-        .tgid = leader->tid,
+        .pid = kernel_pid_number_in(process_identity(task, KERNEL_PID_TID), view),
+        .tgid = kernel_pid_number_in(process_identity(leader, KERNEL_PID_TGID), view),
         .ppid = leader->parent && leader->parent->group_leader
-            ? leader->parent->group_leader->tid : 0,
-        .process_group = process_identity_number(leader, KERNEL_PID_PGID),
-        .session_id = process_identity_number(leader, KERNEL_PID_SID),
+            ? kernel_pid_number_in(process_identity(leader->parent, KERNEL_PID_TGID), view) : 0,
+        .process_group = kernel_pid_number_in(process_identity(leader, KERNEL_PID_PGID), view),
+        .session_id = kernel_pid_number_in(process_identity(leader, KERNEL_PID_SID), view),
         .identity = identity,
-        .tracer_pid=kernel_ptrace_tracer_tid_locked(task),
+        .tracer_pid=task->ptrace && task->ptrace->tracer
+            ? kernel_pid_number_in(process_identity(task->ptrace->tracer, KERNEL_PID_TID), view) : 0,
         .start_ticks = task->proc_start_ticks,
         .state = task->proc_exiting ||
                  task->state == KERNEL_THREAD_STATE_EXITED ||
@@ -303,6 +424,12 @@ static int proc_task_snapshot(struct kernel_task *task, uint64_t identity,
         .rt_priority = scheduler_base_priority(task),
         .scheduling_policy = (uint32_t)task->scheduling.policy,
     };
+    result->namespace_count = tid_id->registry->depth - view->depth + 1U;
+    struct kernel_pid_registry *space = tid_id->registry;
+    for (unsigned n = result->namespace_count; n; n--, space = space->parent)
+        for (unsigned role = 0; role < KERNEL_PID_ROLES; role++)
+            result->namespace_ids[n - 1U][role] =
+                kernel_pid_number_in(process_identity(task, role), space);
     result->wait_channel_flag = (thread || threads < 2U) &&
         task->state != KERNEL_THREAD_STATE_RUNNING &&
         task->state != KERNEL_THREAD_STATE_READY;
@@ -321,7 +448,7 @@ static int proc_task_snapshot(struct kernel_task *task, uint64_t identity,
     }
     }
     result->tty_nr = kernel_tty_rdev(kernel_task_controlling_tty(leader));
-    result->tty_pgrp = kernel_tty_foreground(kernel_task_controlling_tty(leader));
+    result->tty_pgrp = kernel_tty_foreground_in(kernel_task_controlling_tty(leader), view);
     struct kernel_task_usage usage = {0};
     scheduler_usage_snapshot(task, thread, &usage);
     result->minor_faults = usage.minor_faults;
@@ -356,7 +483,7 @@ int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
     if (pid <= 0 || !identity || !result) return -KERNEL_EINVAL;
     KERNEL_IRQ_SCOPE(proc_irq);
     SCHEDULER_TASK_BORROW(task, find_member(pid, identity));
-    return task ? proc_task_snapshot(task, identity, 0, result) : -KERNEL_ENOENT;
+    return task ? proc_task_snapshot(task, identity, 0, result, &scheduler.identities) : -KERNEL_ENOENT;
 }
 
 int kernel_proc_thread_snapshot(kernel_pid_t tid, uint64_t identity,
@@ -365,7 +492,16 @@ int kernel_proc_thread_snapshot(kernel_pid_t tid, uint64_t identity,
     if (tid <= 0 || !identity || !result) return -KERNEL_EINVAL;
     KERNEL_IRQ_SCOPE(proc_irq);
     SCHEDULER_TASK_BORROW(task, find_thread(tid, identity));
-    return task ? proc_task_snapshot(task, identity, 1, result) : -KERNEL_ESRCH;
+    return task ? proc_task_snapshot(task, identity, 1, result, &scheduler.identities) : -KERNEL_ESRCH;
+}
+
+int kernel_proc_snapshot_in(struct kernel_pid_registry *view, kernel_pid_t pid,
+    uint64_t identity, int thread, struct kernel_proc_process_snapshot *result)
+{
+    KERNEL_IRQ_SCOPE(proc_irq);
+    SCHEDULER_TASK_BORROW(task, thread ? find_thread(pid, identity) : find_member(pid, identity));
+    if (!task) return -KERNEL_ENOENT;
+    return proc_task_snapshot(task, identity, thread, result, view);
 }
 
 static int proc_resource_matches_locked(struct kernel_task *task, kernel_pid_t pid,
@@ -383,12 +519,14 @@ int kernel_task_remote_mm_acquire(int32_t tid,struct kernel_mm *owner)
 {
     if(!owner || owner->state!=KERNEL_MM_EMPTY || owner->record)__builtin_trap();
     if(tid<=0)return -KERNEL_ESRCH;
-    SCHEDULER_TASK_BORROW(task,scheduler_task_lookup(tid,KERNEL_PID_TID,0));
+    struct kernel_task *caller=kernel_task_current();
+    SCHEDULER_TASK_BORROW(task,kernel_task_find_user_tid(caller,tid));
     if(!task)return -KERNEL_ESRCH;
     KERNEL_RAW_SCOPE(resources,&task->files_access);
     KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
     struct kernel_pid *id=process_identity(task,KERNEL_PID_TID);
-    if(!id || !proc_resource_matches_locked(task,tid,id->generation|KERNEL_PROC_THREAD_TARGET) ||
+    if(!id || !task->accounted || task->retirement || task->proc_exiting ||
+       process_find_identity_in(tid,KERNEL_PID_TID,process_pid_active(caller))!=task ||
        task->mm.state!=KERNEL_MM_LIVE)return -KERNEL_ESRCH;
     if(!kernel_credentials_may_access_locked(kernel_task_current(),task,0))return -KERNEL_EPERM;
     if(kernel_mm_acquire(owner,&task->mm))__builtin_trap();
@@ -503,15 +641,17 @@ int kernel_proc_mounts_snapshot(kernel_pid_t pid,uint64_t identity,struct kernel
 }
 
 int kernel_proc_namespaces_handle(kernel_pid_t pid,uint64_t identity,uint32_t mask,int fscreds,
-    struct kernel_namespace *owners[3])
+    struct kernel_namespace *owners[4])
 {
-    if(pid<=0 || !identity || !owners || owners[0] || owners[1] || owners[2] ||
-       !mask || (mask&~(KERNEL_NS_MNT|KERNEL_NS_UTS|KERNEL_NS_IPC)))return -KERNEL_EINVAL;
+    if(pid<=0 || !identity || !owners || owners[0] || owners[1] || owners[2] || owners[3] ||
+       !mask || (mask&~(KERNEL_NS_MNT|KERNEL_NS_UTS|KERNEL_NS_IPC|KERNEL_NS_PID|KERNEL_PROC_PID_FOR_CHILDREN)) ||
+       ((mask&KERNEL_PROC_PID_FOR_CHILDREN) && !(mask&KERNEL_NS_PID)))return -KERNEL_EINVAL;
     SCHEDULER_TASK_BORROW(task,find_resource_owner(pid,identity));
     struct proc_access access __attribute__((cleanup(proc_access_release)))={0};
     int error=proc_access_begin_mode(task,&access,fscreds);
     if(error)return error;
-    struct kernel_namespace *snapshot[3]={0};
+    struct kernel_namespace *snapshot[4]={0};
+    struct kernel_pid_registry *pid_space = NULL;
     struct kernel_fs_mounts mounts __attribute__((cleanup(kernel_fs_mounts_release)))={0};
     {
         KERNEL_RAW_SCOPE(resources,&task->files_access);
@@ -522,10 +662,23 @@ int kernel_proc_namespaces_handle(kernel_pid_t pid,uint64_t identity,uint32_t ma
             if(mask&KERNEL_NS_MNT)snapshot[0]=kernel_namespace_get(kernel_mount_namespace_base(mounts.namespace));
             if(mask&KERNEL_NS_UTS)snapshot[1]=kernel_namespace_get(task->uts_namespace);
             if(mask&KERNEL_NS_IPC)snapshot[2]=kernel_namespace_get(task->ipc_namespace);
+            if(mask&KERNEL_NS_PID) {
+                pid_space = mask&KERNEL_PROC_PID_FOR_CHILDREN ?
+                    process_pid_children_locked(task) : process_pid_active(task);
+                if(pid_space) kernel_pid_registry_get(pid_space);
+                else error=-KERNEL_ENOENT;
+            }
             if(((mask&KERNEL_NS_MNT)&&!snapshot[0]) || ((mask&KERNEL_NS_UTS)&&!snapshot[1]) ||
                ((mask&KERNEL_NS_IPC)&&!snapshot[2]))error=-KERNEL_ENOENT;
         }
     }
+    if(!error && pid_space)
+        error=process_pid_namespace_snapshot(pid_space,&scheduler.identity_heap,&snapshot[3]);
+    if(pid_space) {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        kernel_pid_registry_put(pid_space);
+    }
+    if(pid_space) process_identity_collect();
     if(!error) {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         if(!proc_resource_matches_locked(task,pid,identity))error=-KERNEL_ENOENT;
@@ -533,20 +686,31 @@ int kernel_proc_namespaces_handle(kernel_pid_t pid,uint64_t identity,uint32_t ma
             kernel_credentials_task_locked(task)!=access.credentials ||
             !kernel_credentials_may_access_locked(kernel_task_current(),task,fscreds))error=-KERNEL_EACCES;
     }
-    for(unsigned i=0;i<3;i++) {
+    for(unsigned i=0;i<4;i++) {
         if(error)kernel_namespace_put(snapshot[i]);
         else owners[i]=snapshot[i];
     }
     return error;
 }
 
+int kernel_proc_namespaces_identity_handle(struct kernel_pid *id,uint32_t mask,
+    struct kernel_namespace *owners[4])
+{
+    kernel_pid_t canonical;uint64_t generation;
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      canonical=kernel_pid_number_in(id,&scheduler.identities);generation=id->generation; }
+    return kernel_proc_namespaces_handle(canonical,generation|KERNEL_PROC_THREAD_TARGET,
+        mask,0,owners);
+}
+
 int kernel_proc_namespace_handle(kernel_pid_t pid,uint64_t identity,uint32_t type,
     struct kernel_namespace **owner)
 {
-    if(!owner || *owner || (type!=KERNEL_NS_MNT && type!=KERNEL_NS_UTS && type!=KERNEL_NS_IPC))return -KERNEL_EINVAL;
-    struct kernel_namespace *snapshot[3]={0};
+    if(!owner || *owner || (type!=KERNEL_NS_MNT && type!=KERNEL_NS_UTS && type!=KERNEL_NS_IPC &&
+        type!=KERNEL_NS_PID && type!=(KERNEL_NS_PID|KERNEL_PROC_PID_FOR_CHILDREN)))return -KERNEL_EINVAL;
+    struct kernel_namespace *snapshot[4]={0};
     int error=kernel_proc_namespaces_handle(pid,identity,type,1,snapshot);
-    if(!error)*owner=snapshot[type==KERNEL_NS_MNT ? 0 : type==KERNEL_NS_UTS ? 1 : 2];
+    if(!error)*owner=snapshot[type==KERNEL_NS_MNT ? 0 : type==KERNEL_NS_UTS ? 1 : type==KERNEL_NS_IPC ? 2 : 3];
     return error;
 }
 
@@ -641,7 +805,7 @@ int kernel_proc_fd_pseudo_snapshot(kernel_pid_t pid, uint64_t identity,
             struct kernel_namespace *ns=kernel_namespace_file(file);
             if(!ns)__builtin_trap();
             const char *prefix=ns->type==KERNEL_NS_MNT ? "mnt:[" :
-                ns->type==KERNEL_NS_UTS ? "uts:[" : ns->type==KERNEL_NS_IPC ? "ipc:[" : NULL;
+                ns->type==KERNEL_NS_UTS ? "uts:[" : ns->type==KERNEL_NS_IPC ? "ipc:[" : ns->type==KERNEL_NS_PID ? "pid:[" : NULL;
             if(!prefix)__builtin_trap();
             memcpy(snapshot->name,prefix,6);
         }
@@ -656,7 +820,16 @@ int kernel_proc_fdinfo_access(kernel_pid_t pid,uint64_t identity)
     PROC_ACCESS(task);
     return proc_access_check(&access);
 }
-int kernel_proc_fdinfo_snapshot(kernel_pid_t pid,uint64_t identity,int fd,
+static void proc_pidfd_numbers(struct kernel_pid *id, struct kernel_pid_registry *view,
+    struct kernel_proc_fdinfo *snapshot)
+{
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    snapshot->pid = id->members[KERNEL_PID_TID] ? kernel_pid_number_in(id, view) : -1;
+    snapshot->namespace_count = snapshot->pid > 0 ?
+        proc_namespace_ids(id, view, snapshot->namespace_ids) : 0;
+}
+
+int kernel_proc_fdinfo_snapshot_in(struct kernel_pid_registry *view,kernel_pid_t pid,uint64_t identity,int fd,
     struct kernel_proc_fdinfo *snapshot)
 {
     if(pid<=0 || !identity || fd<0 || !snapshot)return -KERNEL_EINVAL;
@@ -686,11 +859,20 @@ int kernel_proc_fdinfo_snapshot(kernel_pid_t pid,uint64_t identity,int fd,
         .flags=kernel_open_file_flags(file)|((fd_flags&KERNEL_FILES_FD_CLOEXEC)?02000000U:0),
         .mount_id=file->file.mount?file->file.mount->id:0,.inode=stat.ino,
         .pidfd=file->kind==KERNEL_OPEN_FILE_KIND_PIDFD,
-        .pid=file->kind==KERNEL_OPEN_FILE_KIND_PIDFD?kernel_pidfd_number(file):0};
+        .pid=0};
+    if (snapshot->pidfd) {
+        struct kernel_pid *id __attribute__((cleanup(kernel_task_identity_end))) =
+            kernel_pidfd_identity_ref(file);
+        proc_pidfd_numbers(id, view, snapshot);
+    }
     if(file->kind==KERNEL_OPEN_FILE_KIND_BPF)
         return kernel_bpf_fdinfo(file,snapshot->extra,sizeof(snapshot->extra),&snapshot->extra_length);
     return 0;
 }
+
+int kernel_proc_fdinfo_snapshot(kernel_pid_t pid, uint64_t identity, int fd,
+    struct kernel_proc_fdinfo *snapshot)
+{ return kernel_proc_fdinfo_snapshot_in(&scheduler.identities, pid, identity, fd, snapshot); }
 
 int kernel_proc_fd_pseudo_stat(kernel_pid_t pid, uint64_t identity,
                                int fd, struct kernel_vfs_stat *stat)

@@ -12,6 +12,7 @@
 extern struct kernel_raw_lock kernel_vfs_state_lock;
 struct kernel_fs_context;
 struct kernel_vfs_path;
+int kernel_vfs_reuse_cgroup_tree(struct kernel_heap *,uint64_t,struct kernel_vfs_path **);
 int kernel_vfs_reuse_block_tree(uint64_t,const char *,int,int,struct kernel_heap *,uint64_t,struct kernel_vfs_path **);
 
 size_t kernel_fs_context_pivot_publish(const struct kernel_fs_context *,struct kernel_vfs_path *,struct kernel_vfs_path *);
@@ -60,6 +61,10 @@ struct kernel_vfs_file;
 struct kernel_vfs_mount;
 struct kernel_vfs_instance;
 struct kernel_vfs_node;
+/* Return 1 if the caller needs a larger array. It owns every returned pin,
+ * including the prefix on overflow or any error. */
+int kernel_page_cache_pin_dirty_nodes(struct kernel_page_cache *,
+    const struct kernel_vfs_instance *, struct kernel_vfs_node **, size_t, size_t *);
 #if BOAROS_COST_DIAGNOSTICS
 int kernel_vfs_file_is_cost(const struct kernel_vfs_file *file);
 #endif
@@ -88,6 +93,8 @@ void kernel_vfs_cleanup_node(struct kernel_vfs_node *);
 /* Terminal node snapshot; includes final releases already removed from the index. */
 int kernel_vfs_nodes_internal_idle(struct kernel_vfs_instance *);
 uint32_t kernel_vfs_internal_file_count(struct kernel_vfs_instance *);
+/* The caller holds kernel_vfs_state_lock and has a live view. */
+int kernel_vfs_mount_view_acquire_locked(struct kernel_vfs_mount *);
 void kernel_vfs_mount_view_release(struct kernel_vfs_mount *);
 uint64_t kernel_vfs_reclaim_clean(struct physical_page_allocator *, uint64_t target_pages);
 int kernel_vfs_nodes_idle(struct kernel_vfs_instance *, struct kernel_vfs_node *root);
@@ -109,7 +116,10 @@ int kernel_vfs_node_pread(struct kernel_vfs_node *node,
                           size_t size,
                           size_t *bytes_read);
 int kernel_vfs_file_is_control(const struct kernel_vfs_file *file,int write);
+/* Bounded legacy writes may opt into pwrite; low seven bits are import size. */
+#define KERNEL_VFS_CONTROL_PREFIX_POSITIONED 0x80U
 size_t kernel_vfs_file_control_prefix(const struct kernel_vfs_file *file);
+int kernel_vfs_file_control_open_credentials(const struct kernel_vfs_file *);
 int kernel_vfs_file_control_permission(const struct kernel_vfs_file *file, int write);
 int kernel_vfs_file_control(const struct kernel_vfs_file *file, int write,
     uint64_t *offset, char *buffer, size_t size, size_t *count);
@@ -117,9 +127,11 @@ int kernel_vfs_file_generated(const struct kernel_vfs_file *file);
 int kernel_vfs_check_io_domain(const struct kernel_vfs_node *,const struct kernel_heap *,
     const struct physical_page_allocator *);
 struct kernel_namespace;
+struct kernel_pid_registry;
 int kernel_vfs_file_snapshot(const struct kernel_vfs_file *file,
                              struct kernel_heap *heap,
                              struct kernel_namespace *ipc_namespace,
+                             struct kernel_pid_registry *pid_view,
                              char **buffer, size_t *length);
 
 struct kernel_page_cache_dirty *kernel_vfs_node_dirty_pages(struct kernel_vfs_node *node);

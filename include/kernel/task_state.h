@@ -44,6 +44,7 @@ struct kernel_futex_pi_state;
 struct kernel_futex_pi_request;
 struct kernel_futex_request;
 struct kernel_ptrace_state;
+struct riscv_vector_state;
 struct kernel_remote_memory_request;
 
 enum kernel_thread_state {
@@ -111,9 +112,11 @@ enum kernel_user_return_work {
     KERNEL_USER_RETURN_SIGNAL = 2U,
 };
 
+struct kernel_cgroup;
 struct kernel_task {
     struct arch_thread_state arch;
     struct kernel_cpu *cpu;
+    struct kernel_cgroup *cgroup; /* NULL is root; membership owns one reference. */
     uint64_t magic;
     uint64_t physical_address;
     uint64_t stack_physical_address;
@@ -141,11 +144,19 @@ struct kernel_task {
     struct kernel_sched_node reservation_node;
     struct kernel_cpu *reservation_cpu;
     uint32_t user_slice_expired;
-#if BOAROS_COST_DIAGNOSTICS
-    uint64_t service_started_ticks, service_running_ns;
-#endif
 #endif
     unsigned accounted;
+#if BOAROS_MAX_CPUS > 1
+    union {
+        struct kernel_sched_rt_candidate rt_candidate;
+#if BOAROS_USER_SMP
+        struct kernel_fair_link fair_candidate;
+#endif
+    };
+#endif
+#if BOAROS_USER_SMP && BOAROS_COST_DIAGNOSTICS
+    uint64_t service_started_ticks, service_running_ns;
+#endif
     struct kernel_thread_join *join;
     struct kernel_task *parent;
     uint64_t children_epoch, group_epoch;
@@ -160,8 +171,8 @@ struct kernel_task {
 #endif
     uint32_t idle;
     kernel_pid_t tid;
-    struct kernel_pid_member identities[KERNEL_PID_ROLES];
     uint32_t tid_owned;
+    struct kernel_pid_member identities[KERNEL_PID_ROLES];
     uint32_t publish_completion;
     uint32_t wait_status;
     uint64_t set_tid_address;
@@ -187,6 +198,7 @@ struct kernel_task {
     struct kernel_tty *controlling_tty;
     struct kernel_io_context io_context;
     uint32_t accounting_mode;
+    uint32_t resource_flags;
     struct kernel_task_usage usage, dead_usage, child_usage;
     uint64_t proc_start_ticks;
     char comm[16];
@@ -197,7 +209,6 @@ struct kernel_task {
     struct kernel_task *vfork_parent;
     struct kernel_task *vfork_wait_child;
     struct kernel_task *group_leader;
-    uint32_t group_members;
     struct kernel_task *group_next;
     struct kernel_task *group_previous;
     /* 组身份拥有定时器；活动索引在最后成员清理前摘除。 */
@@ -205,9 +216,11 @@ struct kernel_task {
     uint64_t real_timer_deadline;
     uint64_t real_timer_interval;
     uint32_t real_timer_active;
+    uint32_t group_members;
     struct kernel_pid *child_creator;
     uint32_t terminate_requested;
     uint32_t proc_exiting;
+    struct process_core_session *core_session; /* leader-owned, fatal exit only */
     uint32_t group_exiting;
     uint32_t group_execing;
     uint32_t fork_no_exec;
@@ -215,7 +228,6 @@ struct kernel_task {
     uint32_t group_stopped;
     struct kernel_resource_limits *limits;
     uint64_t rttime_ticks, rttime_stamp;
-    uint32_t resource_flags;
     struct kernel_wait_queue group_wait_queue;
     uint64_t group_pending;
     uint32_t group_sender[KERNEL_SIGNAL_COUNT];
@@ -244,9 +256,15 @@ struct kernel_task {
     struct kernel_thread_completion completion;
     struct kernel_files files;
     struct kernel_fs_context fs;
+    /* NULL means active (owned by the TID identity); an override owns a ref. */
+    struct kernel_pid_registry *pid_for_children;
     struct arch_fpu_state fpu;
     struct kernel_mm mm;
     struct kernel_exec_transaction *exec_transaction;
+#if !defined(BOAROS_ARCH_LOONGARCH)
+    /* This pointer fits the alignment gap before the switch context on RV64. */
+    struct riscv_vector_state *vector;
+#endif
     struct arch_switch_context context;
 #if BOAROS_COST_DIAGNOSTICS
     struct kernel_cost_task cost;
@@ -261,6 +279,10 @@ struct kernel_task {
     const struct kernel_credentials *credentials;
     const struct kernel_credentials *credentials_override;
     uint32_t no_new_privs;
+    uint32_t personality;
+    uint32_t seccomp_mode;
+    uint32_t seccomp_exec_waiting; /* protected by the scheduler domain */
+    struct kernel_seccomp_filter *seccomp_filter;
     struct kernel_exec_security *exec_security;
     struct kernel_socket_call *socket_call;
     struct kernel_sem_undo *sem_undo;
@@ -269,8 +291,12 @@ struct kernel_task {
     /* 远端资源比较/FD读取的短访问；退出先发布离开，再等待原句柄读者。
      * FD槽由各表raw保护，FS发布由VFS状态保护，其余身份由调度域保护。 */
     struct kernel_raw_lock files_access;
-    struct kernel_mqueue_request *mqueue_request;
     uint8_t exit_signal;
+#if !defined(BOAROS_ARCH_LOONGARCH)
+    uint8_t vector_control;
+#endif
+    uint8_t signal_unkillable; /* group-owned namespace-init disposition policy */
+    struct kernel_mqueue_request *mqueue_request;
     struct kernel_io_priority_context *io_priority;
     struct kernel_files_change *files_change;
     struct kernel_open_file_description *flock_file;
@@ -283,7 +309,6 @@ struct kernel_task {
     struct kernel_namespace *uts_namespace, *ipc_namespace;
     struct kernel_ptrace_state *ptrace;
     struct kernel_remote_memory_request *remote_memory_request;
-    uint32_t personality;
     uint32_t parent_death_signal;
     uint32_t child_subreaper;
     struct kernel_task *parent_death_next;

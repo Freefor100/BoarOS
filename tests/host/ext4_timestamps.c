@@ -54,6 +54,31 @@ static unsigned timestamp_sampling, timestamp_continue;
 static _Thread_local unsigned timestamp_pause;
 static _Thread_local unsigned timestamp_samples;
 static _Thread_local unsigned timestamp_fail;
+static unsigned directory_touches;
+static _Thread_local uint32_t directory_touch_inode;
+static unsigned directory_probe_reads;
+static unsigned directory_refresh_before_touch;
+int __real_ext4_fs_get_inode_ref_read(struct ext4_fs *, uint32_t, struct ext4_inode_ref *);
+int __wrap_ext4_fs_get_inode_ref_read(struct ext4_fs *fs, uint32_t inode, struct ext4_inode_ref *ref)
+{
+    if (directory_touch_inode && inode==directory_touch_inode) directory_probe_reads++;
+    return __real_ext4_fs_get_inode_ref_read(fs,inode,ref);
+}
+int __real_ext4_file_touch(ext4_file *, unsigned);
+int __wrap_ext4_file_touch(ext4_file *file, unsigned fields)
+{
+    directory_touches++;
+    if (directory_refresh_before_touch) {
+        struct ext4_timestamp newer[3] = {timestamp_now};
+        newer[0].seconds++;
+        assert(!ext4_file_set_times(file,EXT4_TIME_ATIME,newer));
+    }
+    directory_touch_inode=file->inode;
+    int result=__real_ext4_file_touch(file, fields);
+    directory_touch_inode=0;
+    return result;
+}
+
 static bool timestamp_clock(struct ext4_timestamp *now)
 {
     timestamp_samples++;
@@ -88,6 +113,87 @@ static void *remount_during_access(void *argument)
     return NULL;
 }
 
+static void *directory_read_during_remount(void *argument)
+{
+    struct kernel_vfs_file *directory=argument;
+    struct kernel_vfs_stat stat;
+    unsigned char entries[256];
+    uint32_t flags=0;
+    mm_test_attach(1); mm_test_activate_task();
+    assert(!kernel_vfs_fstat(directory,&stat));
+    struct kernel_vfs_dir_batch batch={.data=entries,.capacity=sizeof(entries),.position=stat.size};
+    timestamp_pause=1;
+    assert(!kernel_vfs_read_directory(directory,&batch,&flags) && !batch.used);
+    mm_test_finish();
+    return NULL;
+}
+
+static void remount_directory_during_relatime(struct kernel_vfs_path *root,
+    struct kernel_vfs_file *directory,uint64_t policy)
+{
+    const uint64_t bind=4096U, relatime=2097152U;
+    pthread_t reader;
+    __atomic_store_n(&timestamp_sampling,0,__ATOMIC_RELEASE);
+    __atomic_store_n(&timestamp_continue,0,__ATOMIC_RELEASE);
+    assert(!pthread_create(&reader,NULL,directory_read_during_remount,directory));
+    while (!__atomic_load_n(&timestamp_sampling,__ATOMIC_ACQUIRE)) sched_yield();
+    assert(!kernel_vfs_remount(root,bind|policy,NULL));
+    __atomic_store_n(&timestamp_continue,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(reader,NULL));
+    assert(!kernel_vfs_remount(root,bind|relatime,NULL));
+}
+
+static void check_directory_relatime(struct kernel_vfs_path *root)
+{
+    const struct ext4_timestamp original = timestamp_now;
+    struct kernel_vfs_file directory = {0};
+    const struct kernel_vfs_open_request request = {.flags = KERNEL_VFS_OPEN_FOLLOW};
+    assert(!kernel_vfs_mkdir_at(root, root, "atime-directory", 0700, 0));
+    assert(!kernel_vfs_open_at(root, root, "atime-directory", &request, &directory, NULL));
+    const struct kernel_vfs_timespec times[2] = {
+        {timestamp_now.seconds + 1, 100}, {timestamp_now.seconds, 0}
+    };
+    assert(!kernel_vfs_file_set_times(&directory, times));
+    struct kernel_vfs_stat stat;
+    assert(!kernel_vfs_fstat(&directory, &stat));
+    directory_touches = 0;
+    directory_probe_reads = 0;
+    timestamp_now.seconds = times[0].seconds + 86399;
+    uint32_t flags = 0;
+    unsigned char entries[256];
+    struct kernel_vfs_dir_batch batch = {.data=entries,.capacity=sizeof(entries)};
+    assert(!kernel_vfs_read_directory(&directory, &batch, &flags) && batch.used);
+    assert(batch.position==stat.size);
+    batch.used=0;
+    for (unsigned i = 0; i < 4; ++i)
+        assert(!kernel_vfs_read_directory(&directory, &batch, &flags) && !batch.used);
+    assert(!directory_touches && "enumeration should use the inode's already borrowed timestamps");
+
+    timestamp_now.seconds++;
+    assert(!kernel_vfs_read_directory(&directory, &batch, &flags) && !batch.used);
+    assert(directory_touches == 1 && !kernel_vfs_fstat(&directory, &stat));
+    assert(!directory_probe_reads && "known expiration goes directly to the writer recheck");
+    assert(stat.atime.seconds == timestamp_now.seconds);
+    timestamp_now.seconds+=86400;
+    int64_t published=stat.atime.seconds;
+    remount_directory_during_relatime(root,&directory,1024U);
+    assert(directory_touches==1 && !kernel_vfs_fstat(&directory,&stat) && stat.atime.seconds==published);
+    timestamp_now.seconds=published+1;
+    remount_directory_during_relatime(root,&directory,16777216U);
+    assert(directory_touches==2 && !kernel_vfs_fstat(&directory,&stat) && stat.atime.seconds==timestamp_now.seconds);
+
+    timestamp_now.seconds+=86400;
+    directory_refresh_before_touch=1;
+    assert(!kernel_vfs_read_directory(&directory,&batch,&flags) && !batch.used);
+    directory_refresh_before_touch=0;
+    assert(directory_touches==3 && !directory_probe_reads && !kernel_vfs_fstat(&directory,&stat));
+    assert(stat.atime.seconds==timestamp_now.seconds+1);
+    assert(!kernel_vfs_close(&directory));
+    assert(!kernel_vfs_unlink_at(root, root, "atime-directory", 1));
+    timestamp_now = original;
+    puts("PASS directory relatime reuses the query, honors remount, and rechecks under the writer");
+}
+
 int main(int argc, char **argv)
 {
     assert(argc == 2 || argc == 3);
@@ -114,6 +220,7 @@ int main(int argc, char **argv)
     timestamp_now = (struct ext4_timestamp){2000000000, 10};
     struct kernel_vfs_path *root = NULL;
     assert(!kernel_vfs_path_root(&mount, &heap, &root));
+    if (argc == 2) check_directory_relatime(root);
     struct kernel_vfs_file file = {0};
     const struct kernel_vfs_open_request request = {.flags = KERNEL_VFS_OPEN_FOLLOW};
     if (argc == 3) assert(!kernel_vfs_open_at(root, root, "timestamp", &request, &file, NULL));

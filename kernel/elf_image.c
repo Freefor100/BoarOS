@@ -20,7 +20,6 @@
 #define KERNEL_ELF_STACK_GUARD_GAP (KERNEL_VMA_STACK_GUARD_PAGES * BOAROS_PAGE_SIZE)
 #define KERNEL_ELF_STACK_EXPAND UINT64_C(131072)
 #define KERNEL_ELF_STACK_HEADROOM UINT64_C(0x10000)
-#define KERNEL_ELF_STACK_IMAGE_LIMIT KERNEL_EXEC_STRING_LIMIT
 #define KERNEL_ELF_MMAP_GAP UINT64_C(0x8000000)
 #define KERNEL_ELF_BRK_RANDOM_RANGE UINT64_C(0x40000000)
 #define KERNEL_ELF_STACK_RANDOM_BITS 18U
@@ -391,6 +390,9 @@ static enum kernel_elf_image_status prepare_stack_layout(
     uint64_t total_bytes;
     uint64_t random_bytes = sizeof(layout->random_data);
     size_t index;
+    size_t argument_limit = kernel_exec_argument_limit(request->stack_limit_valid
+        ? request->stack_limit : KERNEL_RLIMIT_STACK_DEFAULT);
+    size_t string_limit = request->string_limit;
 
     *layout = *base;
     layout->uid=request->uid; layout->euid=request->euid;
@@ -411,11 +413,21 @@ static enum kernel_elf_image_status prepare_stack_layout(
     if (layout->executable->bytes == 0 && layout->executable->length == 0U) {
         layout->executable = &empty;
     }
+    if (layout->argument_count > argument_limit / sizeof(uint64_t) ||
+        layout->environment_count > argument_limit / sizeof(uint64_t))
+        return KERNEL_ELF_IMAGE_STATUS_STACK_LIMIT;
+    size_t pointer_bytes = (layout->argument_count + layout->environment_count) * sizeof(uint64_t);
+    if (!string_limit) {
+        if (pointer_bytes >= argument_limit) return KERNEL_ELF_IMAGE_STATUS_STACK_LIMIT;
+        string_limit = argument_limit - pointer_bytes;
+    }
+    if (string_limit > argument_limit) return KERNEL_ELF_IMAGE_STATUS_INVALID_ARGUMENT;
     for (index = 0U; index < layout->argument_count; index++) {
         if (layout->arguments[index].bytes == 0)
             return KERNEL_ELF_IMAGE_STATUS_INVALID_ARGUMENT;
-        if (layout->arguments[index].length >= KERNEL_ELF_STACK_IMAGE_LIMIT ||
-            string_bytes > KERNEL_ELF_STACK_IMAGE_LIMIT -
+        if (layout->arguments[index].length >= KERNEL_EXEC_STRING_LIMIT ||
+            layout->arguments[index].length >= string_limit ||
+            string_bytes > string_limit -
                                layout->arguments[index].length - 1U) {
             return KERNEL_ELF_IMAGE_STATUS_STACK_LIMIT;
         }
@@ -424,37 +436,31 @@ static enum kernel_elf_image_status prepare_stack_layout(
     for (index = 0U; index < layout->environment_count; index++) {
         if (layout->environment[index].bytes == 0)
             return KERNEL_ELF_IMAGE_STATUS_INVALID_ARGUMENT;
-        if (layout->environment[index].length >= KERNEL_ELF_STACK_IMAGE_LIMIT ||
-            string_bytes > KERNEL_ELF_STACK_IMAGE_LIMIT -
+        if (layout->environment[index].length >= KERNEL_EXEC_STRING_LIMIT ||
+            layout->environment[index].length >= string_limit ||
+            string_bytes > string_limit -
                                layout->environment[index].length - 1U) {
             return KERNEL_ELF_IMAGE_STATUS_STACK_LIMIT;
         }
         string_bytes += (uint64_t)layout->environment[index].length + 1U;
     }
-    if (layout->executable->length >= KERNEL_ELF_STACK_IMAGE_LIMIT ||
-        string_bytes > KERNEL_ELF_STACK_IMAGE_LIMIT -
+    if (layout->executable->length >= KERNEL_EXEC_STRING_LIMIT ||
+        layout->executable->length >= string_limit ||
+        string_bytes > string_limit -
                            layout->executable->length - 1U) {
         return KERNEL_ELF_IMAGE_STATUS_STACK_LIMIT;
     }
     string_bytes += (uint64_t)layout->executable->length + 1U;
-    if (random_bytes > KERNEL_ELF_STACK_IMAGE_LIMIT - string_bytes) {
-        return KERNEL_ELF_IMAGE_STATUS_STACK_LIMIT;
-    }
+    /* Linux charges strings and argv/envp pointers, not auxv, argc, vector
+     * terminators, random bytes or the final ABI alignment, to ARG_MAX. */
     total_bytes = string_bytes + random_bytes;
-    if (layout->argument_count > KERNEL_ELF_STACK_IMAGE_LIMIT / 8U ||
-        layout->environment_count > KERNEL_ELF_STACK_IMAGE_LIMIT / 8U) {
-        return KERNEL_ELF_IMAGE_STATUS_STACK_LIMIT;
-    }
     table_words = 1U + (uint64_t)layout->argument_count + 1U +
                   (uint64_t)layout->environment_count + 1U +
-                  2U * (17U + KERNEL_HAS_VDSO_ELF);
+                  2U * (17U + KERNEL_HAS_VDSO_ELF + ARCH_ELF_AUX_EXTRA);
     if (table_words > UINT64_MAX / sizeof(uint64_t)) {
         return KERNEL_ELF_IMAGE_STATUS_STACK_LIMIT;
     }
     table_bytes = table_words * sizeof(uint64_t);
-    if (table_bytes > KERNEL_ELF_STACK_IMAGE_LIMIT - total_bytes) {
-        return KERNEL_ELF_IMAGE_STATUS_STACK_LIMIT;
-    }
     if (layout->stack_top < total_bytes + table_bytes)
         return KERNEL_ELF_IMAGE_STATUS_ADDRESS_SPACE;
     layout->string_address = layout->stack_top - total_bytes;
@@ -462,10 +468,6 @@ static enum kernel_elf_image_status prepare_stack_layout(
         (layout->string_address - table_bytes) & ~UINT64_C(15);
     if (layout->stack_pointer < layout->stack_soft_base)
         return KERNEL_ELF_IMAGE_STATUS_STACK_LIMIT;
-    if (layout->stack_top - layout->stack_pointer >
-        KERNEL_ELF_STACK_IMAGE_LIMIT) {
-        return KERNEL_ELF_IMAGE_STATUS_STACK_LIMIT;
-    }
     /* VMA预留遵循参数页加128KiB；64KiB物理预映射独立计算。 */
     layout->initial_stack_base = align_down_page(layout->stack_pointer) - KERNEL_ELF_STACK_EXPAND;
     if (layout->initial_stack_base < layout->stack_soft_base)
@@ -668,6 +670,9 @@ static enum kernel_elf_image_status build_stack(
     POPULATE_AUXILIARY(8U, 0U);
     POPULATE_AUXILIARY(9U, layout->main_entry);
     POPULATE_AUXILIARY(16U, ARCH_ELF_HWCAP);
+#if ARCH_ELF_AUX_EXTRA
+    POPULATE_AUXILIARY(51U, ARCH_ELF_MINSIGSTKSZ);
+#endif
     POPULATE_AUXILIARY(17U, KERNEL_ELF_CLKTCK);
     POPULATE_AUXILIARY(11U, layout->uid);
     POPULATE_AUXILIARY(12U, layout->euid);

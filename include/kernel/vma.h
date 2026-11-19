@@ -22,7 +22,13 @@ void kernel_vma_set_clear_locks(struct kernel_vma_set *);
 #define KERNEL_VMA_WIPEONFORK 8U
 #define KERNEL_VMA_DONTDUMP 16U
 #define KERNEL_VMA_RANDOM_READ 32U
-#define KERNEL_VMA_ALL_FLAGS 63U
+#define KERNEL_VMA_GROWSDOWN 64U
+#define KERNEL_VMA_ANON_HISTORY 128U /* established private backing (including anonymous read faults); survives DONTNEED */
+#define KERNEL_VMA_ANON_SOURCE 256U /* lazy ELF zero-fill, not file-backed */
+#define KERNEL_VMA_ALL_FLAGS 511U
+/* The VMA writer is held. Revalidate the fault snapshot and mark private backing. */
+int kernel_vma_set_mark_anonymous(struct kernel_vma_set *, uint64_t address,
+    uint64_t generation, struct kernel_vma *snapshot);
 uint64_t kernel_vma_set_data_bytes(const struct kernel_vma_set *set);
 int kernel_vma_is_data(const struct kernel_vma *vma);
 
@@ -51,6 +57,8 @@ enum kernel_vma_kind {
     KERNEL_VMA_KIND_FILE_SHARED,
     KERNEL_VMA_KIND_SYSV_SHM,
     KERNEL_VMA_KIND_OBJECT_SHARED,
+    KERNEL_VMA_KIND_HUGETLB_PRIVATE,
+    KERNEL_VMA_KIND_HUGETLB_SHARED,
 };
 
 enum kernel_vma_role {
@@ -72,6 +80,7 @@ enum kernel_vma_fault_policy {
     KERNEL_VMA_FAULT_ANON_SHARED,
     KERNEL_VMA_FAULT_FILE_SHARED,
     KERNEL_VMA_FAULT_OBJECT_SHARED,
+    KERNEL_VMA_FAULT_HUGETLB,
 };
 
 /* A value copy; callers must not retain backing as a standalone owner. */
@@ -91,6 +100,11 @@ struct kernel_vma {
      * The MM backing OFD owns the counter until all such VMAs are gone. */
     uint64_t *shared_write_bytes;
 };
+
+static inline int kernel_vma_grows_down(const struct kernel_vma *vma)
+{
+    return vma->role == KERNEL_VMA_ROLE_STACK || (vma->flags & KERNEL_VMA_GROWSDOWN);
+}
 
 /*
  * A prepared edit reserves every descriptor it can need without changing the
@@ -137,6 +151,8 @@ enum kernel_vma_status kernel_vma_set_fork(
     struct kernel_vma_set **destination);
 
 /* Success clears *set. */
+struct kernel_task;
+enum kernel_vma_status kernel_vma_set_destroy_for_task(struct kernel_vma_set **,const struct kernel_task *);
 enum kernel_vma_status kernel_vma_set_destroy(struct kernel_vma_set **set);
 
 enum kernel_vma_status kernel_vma_set_insert(
@@ -147,8 +163,15 @@ enum kernel_vma_status kernel_vma_set_lookup(
     const struct kernel_vma_set *set,
     uint64_t virtual_address,
     struct kernel_vma *vma);
+/* Caller holds the mapping-set protection and provides a per-space index. */
+enum kernel_vma_status kernel_vma_set_lookup_recent(
+    const struct kernel_vma_set *, uint64_t address, uint32_t *slot,
+    struct kernel_vma *, uint64_t *generation);
 
 int kernel_vma_set_has_shm(const struct kernel_vma_set *, uint64_t start, uint64_t length);
+int kernel_vma_set_range_is_anonymous(const struct kernel_vma_set *, uint64_t start, uint64_t end);
+int kernel_vma_set_permission_addition(const struct kernel_vma_set *, uint64_t start,
+    uint64_t end, uint32_t permissions, int *unchanged);
 uint32_t kernel_vma_set_count(const struct kernel_vma_set *set);
 
 enum kernel_vma_status kernel_vma_set_get_at(
@@ -223,4 +246,8 @@ enum kernel_vma_status kernel_vma_set_trim_end(
     uint64_t old_end,
     uint64_t new_end);
 
+/* Fork's unpublished child replaces an inherited backing identity without
+ * changing ranges or taking ownership of either object. */
+enum kernel_vma_status kernel_vma_set_rebind_backing(struct kernel_vma_set *,
+    const void *old_backing, void *new_backing);
 #endif

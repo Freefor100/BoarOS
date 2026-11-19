@@ -22,13 +22,28 @@ typedef uint64_t (*physical_page_reclaim_fn)(void *context,
 struct kernel_memory_statistics;
 struct physical_page_reclaim_hooks {
     physical_page_reclaim_fn reclaim;
-    void (*notify)(void *);
+    void (*notify)(void *, uint64_t available_pages);
+    /* Optional filter under allocator->lock. Read only, no locks or waits.
+     * Allocation failure still captures the hooks for actual reclaim. */
+    int (*wants_notification)(void *, uint64_t available_pages);
     void (*wait)(void *);
     void (*snapshot)(void *, struct kernel_memory_statistics *);
     uint32_t *(*depth)(void);
     void (*retain)(void *);
     void (*release)(void *);
     void *context;
+};
+
+/* Optional native huge-pool custody transfer. retain_last runs only for a
+ * validated high-order head's final reference, under allocator->lock. It must
+ * not allocate, sleep, call allocator APIs or acquire another lock. Return one
+ * to take that existing reference (count remains one, block stays allocated),
+ * or zero to return an unmanaged block to buddy. No tail storage is touched.
+ * The owner keeps context alive until every managed block/pending preparation
+ * is removed and clear succeeds. Its ledger uses this same allocator lock. */
+struct physical_page_compound_recycler {
+    void *context;
+    int (*retain_last)(void *, uint64_t head, uint32_t order);
 };
 
 /* Byte capacities; references and mappings never multiply owned storage. */
@@ -53,6 +68,7 @@ struct physical_page_range {
 struct physical_page_allocator {
     struct kernel_raw_lock lock;
     struct physical_page_reclaim_hooks reclaim_hooks;
+    struct physical_page_compound_recycler compound_recycler;
     /* Optional anonymous-page reclaim, installed when MADV_FREE first has work. */
     uint64_t (*lazy_reclaim)(struct physical_page_allocator *, uint64_t, uint64_t *);
     uint64_t shared_anon_pages;
@@ -107,6 +123,13 @@ enum physical_page_status physical_page_allocator_set_reclaimer(
 enum physical_page_status physical_page_allocator_clear_reclaimer(
     struct physical_page_allocator *allocator);
 
+enum physical_page_status physical_page_allocator_set_compound_recycler(
+    struct physical_page_allocator *, const struct physical_page_compound_recycler *);
+/* Caller first removes all managed blocks under the shared allocator lock.
+ * A mismatched owner cannot clear another pool's recycler. */
+enum physical_page_status physical_page_allocator_clear_compound_recycler(
+    struct physical_page_allocator *, void *expected_context);
+
 enum physical_page_status physical_page_allocate(
     struct physical_page_allocator *allocator,
     uint64_t *address);
@@ -142,10 +165,16 @@ unsigned physical_page_allocate_batch(struct physical_page_allocator *,
 void physical_page_release_batch(struct physical_page_allocator *allocator,
     const uint64_t *addresses, unsigned count);
 
+/* Mixed-order finalized owners, one allocator critical section. Every address
+ * is an owned head and each byte-sized order must exactly match its allocation.
+ * Repeated heads consume separate owned references, as with release_batch. */
+void physical_page_release_order_batch(struct physical_page_allocator *,
+    const uint64_t *addresses, const uint8_t *orders, unsigned count);
+
 void physical_page_acquire_batch(struct physical_page_allocator *allocator,
     const uint64_t *addresses, unsigned count);
 
-/* Only finalized order-zero allocations may gain shared owners. */
+/* Finalized order-zero references retain their page-only contract. */
 /* Caller owns the page through a stable PTE. Return its pre-borrow count;
  * if shared, acquire the copy-source loan under that same protection. */
 uint32_t physical_page_cow_borrow(struct physical_page_allocator *,uint64_t address);
@@ -153,6 +182,23 @@ uint32_t physical_page_cow_borrow(struct physical_page_allocator *,uint64_t addr
 enum physical_page_status physical_page_acquire(
     struct physical_page_allocator *allocator,
     uint64_t address);
+
+/* Whole-allocation references for compound backing. address must be the live
+ * buddy head and order must match its allocation. A tail is never a separate
+ * owner. Each acquired or borrowed reference is returned with release_order
+ * using the same head/order; release_allocation may discover that order.
+ * Caller must already hold a stable reference, or hold the mapping lock
+ * protecting a reference, throughout acquire/borrow. An address/order pair
+ * alone is not an ownership token: allocator locking cannot prevent ABA when
+ * a stale address has been freed and reused for another allocation.
+ * No page-table mapping is installed, and no allocation is split here. */
+enum physical_page_status physical_page_acquire_order(
+    struct physical_page_allocator *, uint64_t address, uint32_t order);
+/* Like cow_borrow, but the retained source is the entire compound allocation.
+ * A return of one does not acquire a second reference. The caller must keep
+ * its original owner and serialize changes to the associated mapping. */
+uint32_t physical_page_cow_borrow_order(
+    struct physical_page_allocator *, uint64_t address, uint32_t order);
 
 enum physical_page_status physical_page_reference_count(
     const struct physical_page_allocator *allocator,
@@ -174,6 +220,10 @@ enum physical_page_status physical_page_allocation_order(
     const struct physical_page_allocator *allocator,
     uint64_t address,
     uint32_t *order);
+
+/* The caller owns a live head reference with stable allocation metadata. */
+int physical_page_owned_order(const struct physical_page_allocator *,
+    uint64_t address, uint32_t order);
 
 /* The caller must own an allocated page; this validates only address history. */
 /* 内部持有者访问：调用者须已持有覆盖此次使用的页、页表或 pin 引用。

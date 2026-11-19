@@ -37,21 +37,20 @@
 #include <arch/context.h>
 #include <arch/platform_io.h>
 
-static int64_t sendfile_output(struct kernel_open_file_description **output_owner,
+static int64_t transfer_output(struct kernel_open_file_description **output_owner,
+                               struct kernel_socket_write_request *stream,
                                const void *buffer, size_t size,
                                uint64_t deadline, uint32_t socket_flags)
 {
-    struct kernel_open_file_description *output = *output_owner;
+    struct kernel_open_file_description *output = stream ? stream->pin : *output_owner;
     enum kernel_open_file_kind kind = kernel_open_file_kind(output);
     if (kind == KERNEL_OPEN_FILE_KIND_SOCKET) {
         struct kernel_socket *socket = kernel_open_file_socket(output);
-        struct kernel_socket_write_request request = {0};
-        int tcp = kernel_socket_is_tcp(socket), result;
-        if (tcp) kernel_socket_stream_begin(&request, output_owner);
+        int result;
         for (;;) {
-            if (tcp) {
-                result = kernel_socket_stream_reserve(&request, (uint32_t)size, socket_flags);
-                if (result > 0) result = kernel_socket_stream_commit(&request, buffer, (uint32_t)result, socket_flags);
+            if (stream) {
+                result = kernel_socket_stream_reserve(stream, (uint32_t)size, socket_flags);
+                if (result > 0) result = kernel_socket_stream_commit(stream, buffer, (uint32_t)result, socket_flags);
             } else result = kernel_socket_write_packet_buffer(output_owner, buffer, size, socket_flags);
             if (result != -KERNEL_EAGAIN || (socket_flags & KERNEL_SOCKET_MSG_DONTWAIT)) break;
             uint64_t now = deadline ? kernel_time_monotonic_ns() : 0;
@@ -59,8 +58,7 @@ static int64_t sendfile_output(struct kernel_open_file_description **output_owne
                 kernel_socket_wait_ready(socket, KERNEL_POLLOUT, deadline, socket_flags);
             if (waited != 0) { result = waited; break; }
         }
-        if (tcp) kernel_socket_stream_finish(&request);
-        else if (result == -KERNEL_EPIPE && kernel_socket_is_stream(socket) &&
+        if (!stream && result == -KERNEL_EPIPE && kernel_socket_is_stream(socket) &&
                  !(socket_flags & KERNEL_SOCKET_MSG_NOSIGNAL))
             (void)kernel_signal_send_task(kernel_task_current(), 13U, 0);
         return result;
@@ -75,9 +73,22 @@ static int64_t sendfile_output(struct kernel_open_file_description **output_owne
     return written != 0U ? (int64_t)written : error;
 }
 
+/* Pipe splice retains its existing fragment-scoped TCP operation. */
+static int64_t sendfile_output(struct kernel_open_file_description **output_owner,
+    const void *buffer, size_t size, uint64_t deadline, uint32_t socket_flags)
+{
+    struct kernel_socket_write_request request = {0};
+    struct kernel_socket_write_request *stream =
+        kernel_socket_is_tcp(kernel_open_file_socket(*output_owner)) ? &request : NULL;
+    if (stream) kernel_socket_stream_begin(stream, output_owner);
+    int64_t result=transfer_output(output_owner,stream,buffer,size,deadline,socket_flags);
+    if (stream) kernel_socket_stream_finish(stream);
+    return result;
+}
+
 static int64_t regular_copy_output(struct kernel_open_file_description *out,
     const void *buffer,const struct kernel_page_cache_read_page *pages,size_t source_offset,
-    size_t size,uint64_t position,struct kernel_vfs_size_limit *limit,int first)
+    size_t size,uint64_t position,struct kernel_vfs_size_limit *limit,int first,uint32_t status_flags)
 {
     KERNEL_LOCK_SCOPE(operation);
     kernel_vfs_file_write_lock(&out->file,&operation);
@@ -88,7 +99,10 @@ static int64_t regular_copy_output(struct kernel_open_file_description *out,
         error=kernel_vfs_file_modified(&out->file,position,0);
         if (error) return error;
     }
-    error=pages?kernel_vfs_pwrite_cached(&out->file,position,pages,source_offset,allowed,&written):
+    if (status_flags&KERNEL_FILES_O_DIRECT) {
+        if (pages) __builtin_trap();
+        error=kernel_vfs_pwrite_direct(&out->file,position,buffer,allowed,&written,&operation);
+    } else error=pages?kernel_vfs_pwrite_cached(&out->file,position,pages,source_offset,allowed,&written):
         kernel_vfs_pwrite(&out->file,position,buffer,allowed,&written);
     if (written>allowed) __builtin_trap();
     /* sendfile still attempts the suffix at the size limit after accepting
@@ -105,7 +119,7 @@ static int64_t regular_copy_output(struct kernel_open_file_description *out,
 static __attribute__((noinline)) int64_t regular_cached_copy(
     struct kernel_open_file_description *input,struct kernel_open_file_description *output,
     struct kernel_page_cache *cache,uint64_t start,uint64_t out_start,uint64_t count,
-    struct kernel_vfs_size_limit *limit)
+    struct kernel_vfs_size_limit *limit,uint32_t output_flags)
 {
     enum { COPY_WINDOW_PAGES=8 };
     struct kernel_page_cache_read_page pages[COPY_WINDOW_PAGES];
@@ -142,7 +156,7 @@ static __attribute__((noinline)) int64_t regular_cached_copy(
         }
         kernel_open_file_read_progress(input,position,available,miss);
         int64_t sent=available?regular_copy_output(output,NULL,pages,offset,available,
-            out_start+total,limit,total==0):0;
+            out_start+total,limit,total==0,output_flags):0;
         kernel_page_cache_put_batch(cache,pages,nr);
         if (sent<0) { error=(int)sent;break; }
         total+=(uint64_t)sent;
@@ -163,13 +177,13 @@ static int64_t regular_file_copy(struct kernel_mm *mm,
     uint64_t start, uint64_t out_start, uint64_t count,
     struct kernel_vfs_size_limit *limit, int sync_each)
 {
-    unsigned flags=kernel_open_file_flags(output);
+    unsigned flags=kernel_open_file_flags(output),input_flags=kernel_open_file_flags(input);
     int synchronous=!!(flags&KERNEL_FILES_O_DSYNC);
     int datasync=(flags&KERNEL_FILES_O_SYNC)!=KERNEL_FILES_O_SYNC;
     struct kernel_page_cache *cache=kernel_open_file_page_cache(input);
-    if (cache && !kernel_open_file_memory_backed(input) &&
+    if (cache && !((flags|input_flags)&KERNEL_FILES_O_DIRECT) && !kernel_open_file_memory_backed(input) &&
         !kernel_vfs_files_share_node(&input->file,&output->file) && !(sync_each && synchronous)) {
-        int64_t copied=regular_cached_copy(input,output,cache,start,out_start,count,limit);
+        int64_t copied=regular_cached_copy(input,output,cache,start,out_start,count,limit,flags);
         if (copied>0 && synchronous) {
             int synced=kernel_vfs_sync(&output->file,datasync,&output->observed_writeback_error);
             if (synced) return synced;
@@ -183,10 +197,10 @@ static int64_t regular_file_copy(struct kernel_mm *mm,
     while (total < count) {
         size_t wanted = count - total > BOAROS_PAGE_SIZE
             ? BOAROS_PAGE_SIZE : (size_t)(count - total), available = 0;
-        error = kernel_open_file_pread(input, start + total, buffer.data, wanted, &available);
+        error = kernel_open_file_pread_mode(input,start+total,buffer.data,wanted,input_flags,&available);
         if (available > wanted) __builtin_trap();
         if (!available) break;
-        int64_t sent=regular_copy_output(output,buffer.data,NULL,0,available,out_start+total,limit,total==0);
+        int64_t sent=regular_copy_output(output,buffer.data,NULL,0,available,out_start+total,limit,total==0,flags);
         if (sent < 0) { error = (int)sent; break; }
         if ((uint64_t)sent > available) __builtin_trap();
         if (sent && sync_each && synchronous) {
@@ -267,8 +281,10 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
         }
         return result;
     }
+    uint32_t input_flags=kernel_open_file_flags(input);
     int datagram=kernel_socket_preserves_messages(kernel_open_file_socket(output));
-    int direct=output->kind==KERNEL_OPEN_FILE_KIND_SOCKET && !datagram;
+    int direct=output->kind==KERNEL_OPEN_FILE_KIND_SOCKET && !datagram &&
+        !(input_flags&KERNEL_FILES_O_DIRECT);
     struct kernel_task_io_buffer source_buffer = {0};
     if (!direct && !datagram && kernel_task_io_buffer_acquire(&source_buffer, mm->allocator) != KERNEL_TASK_STATUS_OK)
         return -KERNEL_ENOMEM;
@@ -293,6 +309,14 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
         uint64_t now = kernel_time_monotonic_ns();
         deadline = UINT64_MAX - now < timeout ? UINT64_MAX : now + timeout;
     }
+    struct kernel_socket_write_request request = {0};
+    struct kernel_socket_write_request *stream =
+        kernel_socket_is_tcp(kernel_open_file_socket(output)) ? &request : NULL;
+    /* The syscall owns one active write and OFD pin across source pages.
+     * Each commit still COPYs and attempts output, honoring TCP corking,
+     * without holding a reservation or adding any sendfile-specific output
+     * deferral across the next source read. */
+    if (stream) kernel_socket_stream_begin(stream, output_owner);
     while (total < count) {
         size_t wanted = count - total > capacity
             ? capacity : (size_t)(count - total), available = 0;
@@ -347,20 +371,25 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
             }
             kernel_open_file_read_progress(input,position,available,cache_miss);
         } else {
-            error=kernel_open_file_pread(input,start+total,staging,wanted,&available);
+            error=kernel_open_file_pread_mode(input,start+total,staging,wanted,input_flags,&available);
             if (available>wanted) __builtin_trap();
         }
         if (!available) {
             if (direct && source_buffer.allocator) kernel_task_io_buffer_release(&source_buffer);
             break;
         }
-        int64_t sent=sendfile_output(output_owner,staging,available,deadline,socket_flags);
+        /* Reusing registration must not change fragment error delivery: a
+         * later source fragment still observes errors as its own TCP write.
+         * No IO_MORE is used here, so there is no request-local deferral to lose. */
+        if (stream) stream->progressed=0;
+        int64_t sent=transfer_output(output_owner,stream,staging,available,deadline,socket_flags);
         if (direct) kernel_task_io_buffer_release(&source_buffer);
         if (sent < 0) { error = (int)sent; break; }
         if ((uint64_t)sent > available) __builtin_trap();
         total += (uint64_t)sent;
         if ((size_t)sent < available || error != 0) break;
     }
+    if (stream) kernel_socket_stream_finish(stream);
     if (datagram_staging) kernel_heap_release(files->heap, datagram_staging);
     if (source_buffer.allocator) kernel_task_io_buffer_release(&source_buffer);
     kernel_files_size_limit_notify(&size_limit);
@@ -573,10 +602,10 @@ static int new_transfer_page(struct kernel_pipe *pipe,void **page)
 /* Regular sources lend their real cached/memory page. Other read_iter-style
  * sources fill the final pipe page; no user address or second staging copy. */
 static int read_transfer_page(struct kernel_open_file_description *file,struct kernel_pipe *pipe,
-    uint64_t position,size_t wanted,void **page,size_t *offset,size_t *done,int *miss)
+    uint64_t position,size_t wanted,void **page,size_t *offset,size_t *done,int *miss,uint32_t status_flags)
 {
     *done=0;*offset=0;*miss=0;
-    if (file->kind==KERNEL_OPEN_FILE_KIND_REGULAR) {
+    if (file->kind==KERNEL_OPEN_FILE_KIND_REGULAR && !(status_flags&KERNEL_FILES_O_DIRECT)) {
         uint64_t physical=0;size_t valid=0;
         enum kernel_page_cache_status status;
         if (kernel_open_file_memory_backed(file)) {
@@ -611,13 +640,14 @@ static int read_transfer_page(struct kernel_open_file_description *file,struct k
         *done=valid-*offset;if (*done>wanted) *done=wanted;
         return 0;
     }
-    if (!file->block && file->kind!=KERNEL_OPEN_FILE_KIND_GENERATED &&
+    if (!file->block && file->kind!=KERNEL_OPEN_FILE_KIND_REGULAR && file->kind!=KERNEL_OPEN_FILE_KIND_GENERATED &&
         !(file->device && file->device->splice_read && file->device->read)) return -KERNEL_EINVAL;
     if (file->kind == KERNEL_OPEN_FILE_KIND_GENERATED && kernel_vfs_file_control_prefix(&file->file))
         return -KERNEL_EINVAL;
     int error=new_transfer_page(pipe,page);
     if (error) return error;
-    if (file->block) error=kernel_block_file_pread(file,position,*page,wanted,done);
+    if (file->block || file->kind==KERNEL_OPEN_FILE_KIND_REGULAR)
+        error=kernel_open_file_pread_mode(file,position,*page,wanted,status_flags,done);
     else if (file->kind==KERNEL_OPEN_FILE_KIND_GENERATED && kernel_vfs_file_is_control(&file->file,0)) {
         error=kernel_vfs_file_control_permission(&file->file,0);
         if (!error) error=kernel_vfs_file_control(&file->file,0,&position,*page,wanted,done);
@@ -629,7 +659,7 @@ static int read_transfer_page(struct kernel_open_file_description *file,struct k
             memcpy(*page,file->generated_data+position,*done);
         }
     } else if (file->device && file->device->splice_read && file->device->read)
-        error=file->device->read(file->device_instance,kernel_task_current(),kernel_open_file_flags(file),*page,wanted,done);
+        error=file->device->read(file->device_instance,kernel_task_current(),status_flags,*page,wanted,done);
     else error=-KERNEL_EINVAL;
     if (!*done) release_transfer_page(pipe,*page);
     return error;
@@ -717,8 +747,9 @@ static int64_t file_into_pipe(struct kernel_open_file_description **input,
         if(position_owner.lock)kernel_lock_release(&position_owner);
         kernel_pipe_write_finish(&borrow);return error;
     }
+    uint32_t status_flags=kernel_open_file_flags(file);
     if (file->kind==KERNEL_OPEN_FILE_KIND_REGULAR) {
-        kernel_vfs_file_accessed(&file->file,kernel_open_file_flags(file));kernel_open_file_read_begin(file,*position);
+        kernel_vfs_file_accessed(&file->file,status_flags);kernel_open_file_read_begin(file,*position);
     }
     while (total<count && borrow.slots) {
         void *page=NULL;size_t offset,done;int miss;
@@ -726,7 +757,7 @@ static int64_t file_into_pipe(struct kernel_open_file_description **input,
         size_t capacity=file->kind==KERNEL_OPEN_FILE_KIND_REGULAR?
             BOAROS_PAGE_SIZE-(*position&BOAROS_PAGE_MASK):BOAROS_PAGE_SIZE;
         if(wanted>capacity)wanted=capacity;
-        error=read_transfer_page(file,pipe,*position,wanted,&page,&offset,&done,&miss);
+        error=read_transfer_page(file,pipe,*position,wanted,&page,&offset,&done,&miss,status_flags);
         if (!done) break;
         int submitted=kernel_pipe_push_page(&borrow,page,offset,done);
         if (submitted) {release_transfer_page(pipe,page);error=submitted;break;}
@@ -758,8 +789,9 @@ static int64_t pipe_into_file(struct kernel_open_file_description *input,
     int error=signed_transfer_range(*position,count),sync_error=0;
     uint64_t total=0,start=*position;
     struct kernel_vfs_size_limit limit={.maximum=kernel_task_current_fsize_limit()};
+    uint32_t status_flags=kernel_open_file_flags(file);
     uint32_t socket_flags=(flags&SPLICE_MORE)?KERNEL_SOCKET_MSG_MORE:0;
-    if(kernel_open_file_flags(file)&KERNEL_FILES_O_NONBLOCK)socket_flags|=KERNEL_SOCKET_MSG_DONTWAIT;
+    if(status_flags&KERNEL_FILES_O_NONBLOCK)socket_flags|=KERNEL_SOCKET_MSG_DONTWAIT;
     uint64_t deadline=0;
     if(file->kind==KERNEL_OPEN_FILE_KIND_SOCKET) {
         uint64_t timeout=kernel_socket_send_timeout(kernel_open_file_socket(file)),now=kernel_time_monotonic_ns();
@@ -789,9 +821,9 @@ static int64_t pipe_into_file(struct kernel_open_file_description *input,
             if(total+size<borrow.length)send_flags|=KERNEL_SOCKET_MSG_MORE;
             written=sendfile_output(output,staging,size,deadline,send_flags);
         } else if(file->kind==KERNEL_OPEN_FILE_KIND_REGULAR)
-            written=regular_copy_output(file,data,NULL,0,length,*position,&limit,total==0);
+            written=regular_copy_output(file,data,NULL,0,length,*position,&limit,total==0,status_flags);
         else if(file->block) {
-            size_t done=0;error=kernel_block_file_pwrite(file,*position,data,length,&done);
+            size_t done=0;error=kernel_block_file_pwrite(file,*position,data,length,status_flags,&done);
             written=done?(int64_t)done:error;
         } else written=sendfile_output(output,data,length,deadline,socket_flags);
         if(written<0){error=(int)written;break;}
@@ -802,8 +834,8 @@ static int64_t pipe_into_file(struct kernel_open_file_description *input,
     }
     if(staging)kernel_heap_release(file->heap,staging);
     if(total && error==-KERNEL_ERESTARTSYS)kernel_signal_clear_syscall_restart(kernel_task_current());
-    if(total && (kernel_open_file_flags(file)&KERNEL_FILES_O_DSYNC)) {
-        int datasync=(kernel_open_file_flags(file)&KERNEL_FILES_O_SYNC)!=KERNEL_FILES_O_SYNC;
+    if(total && (status_flags&KERNEL_FILES_O_DSYNC)) {
+        int datasync=(status_flags&KERNEL_FILES_O_SYNC)!=KERNEL_FILES_O_SYNC;
         if(file->kind==KERNEL_OPEN_FILE_KIND_REGULAR)
             sync_error=kernel_vfs_sync_range_borrowing(&file->file,*position-total,*position,datasync,
                 &file->observed_writeback_error,NULL);

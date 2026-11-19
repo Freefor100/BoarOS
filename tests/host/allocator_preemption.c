@@ -217,8 +217,9 @@ static unsigned heap_case(unsigned at, unsigned release, unsigned fresh)
 static unsigned pressure_notified, pressure_reclaimed, pressure_waited;
 static uintptr_t pressure_irq;
 static uint64_t pressure_page;
-static void pressure_notify(void *context)
+static void pressure_notify(void *context, uint64_t available)
 {
+    assert(available == physical_page_available(&allocator));
     assert(!kernel_cpu_current()->raw_locks && !kernel_cpu_current()->preempt_depth);
     assert(context == &allocator && allocator_test_irq_enabled == pressure_irq);
     pressure_notified++;

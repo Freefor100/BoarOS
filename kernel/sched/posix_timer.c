@@ -329,7 +329,7 @@ int kernel_posix_timer_prepare(struct kernel_task *caller,int32_t clock,
         if(!error && notify!=0 && notify!=1 && notify!=2 && notify!=4)error=-KERNEL_EINVAL;
         if(!error && notify!=1 && (t->event.signal<=0 || t->event.signal>64))error=-KERNEL_EINVAL;
         if(!error) {
-            target=notify==4?process_find_identity(t->event.tid,KERNEL_PID_TID):group;
+            target=notify==4?process_find_identity_in(t->event.tid,KERNEL_PID_TID,process_pid_active(caller)):group;
             if(!target || target->group_leader!=group) {target=0;error=-KERNEL_EINVAL;}
             else {
                 scheduler_task_get_locked(target);
@@ -552,7 +552,9 @@ void kernel_posix_timer_unignore(struct kernel_task *task,unsigned sig)
             KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
             struct kernel_posix_timer_registry *r=task->group_leader->posix_timers;
             for(t=r?r->parked:0;t;t=t->park_next) {
-                if((unsigned)t->event.signal==sig&&!signal_timer_disposition_ignored_locked(t->recipient,t->event.notify==4,sig))break;
+                unsigned signo=(unsigned)t->event.signal;
+                if((!sig || signo==sig) &&
+                   !signal_timer_disposition_ignored_locked(t->recipient,t->event.notify==4,signo))break;
             }
             if(!t)break;
             t->references++;unpark_locked(t);queue_locked(t,&cursor,&wake,0);

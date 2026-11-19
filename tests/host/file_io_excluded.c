@@ -13,6 +13,7 @@ EXCLUDED(kernel_socket_copy_read)
 EXCLUDED(kernel_socket_read_user)
 EXCLUDED(kernel_socket_abort_read)
 EXCLUDED(kernel_socket_wait_ready)
+EXCLUDED(kernel_socket_wait_read)
 #endif
 EXCLUDED(kernel_socket_discard_receive)
 #ifndef TCP_IO_CASES
@@ -53,8 +54,12 @@ EXCLUDED(kernel_signal_note_futex_timed_restart)
 EXCLUDED(scheduler_task_get_locked)
 EXCLUDED(scheduler_task_put)
 EXCLUDED(scheduler_task_lookup_locked)
+/* This fixture has no PID namespaces. Their ioctls run in nsfs_pid. */
+EXCLUDED(kernel_pidns_parent)
+EXCLUDED(kernel_pidns_translate)
 /* Message-credential ownership is exercised by the UNIX control fixture. */
 EXCLUDED(kernel_task_identity_get)
+EXCLUDED(kernel_task_lock_owner_user_number)
 EXCLUDED(kernel_task_identity_retain)
 EXCLUDED(kernel_task_identity_put)
 EXCLUDED(kernel_signal_sigio)

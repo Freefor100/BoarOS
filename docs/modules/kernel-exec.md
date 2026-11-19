@@ -42,6 +42,10 @@
 
 事务中的 `executable_file`/`interpreter_file` 是 source 创建前的 OFD owners；`path_file` 只持有打开期间的 dirfd pin。source 创建成功后由 source 持有 OFD，事务改为持有 source owner。映像构造给 MM 增加各 source 的引用，事务在提交后释放自己的引用。解析、打开或真实 VFS/I/O 清理失败时保留准确 owner；物理页、VMA metadata 和堆的合法释放完成即结束，分配器不变量错误进入 fatal。参数字符串、向量和路径的纯堆清理直接释放并清空指针，不生成 `CLEANUP_REQUIRED`；重试只处理仍持有的 MM、source 或 OFD。
 
+argv/envp 总预算为 `max(128 KiB, min(RLIMIT_STACK / 4, 6 MiB))`，软限制在导入前读取一次，并供映像布局共同使用。默认 8 MiB 栈允许 2 MiB 参数预算；先捕获两组指针并扣除其 64 位指针空间（空 argv 计一个指针），再导入环境和参数字符串。字符串计入 NUL 和 `AT_EXECFN` 名字；每个字符串独立限制为 32 个目标架构页，即 RV 128 KiB、LA 512 KiB。auxv、argc、向量终止符、随机字节和 16 字节对齐不扣减这一参数预算，但完整初始栈仍须符合实际栈映射限制。
+
+脚本展开沿用原指针预算，删除 argv[0] 的字符串空间后添加解释器、可选参数和脚本名。动态增长的事务缓冲区仅保存本次输入；E2BIG、EFAULT 或分配失败均在发布新映像前归还准备资源，旧 MM、FD_CLOEXEC、信号动作和凭据不变。
+
 ## 执行凭据
 
 主 ELF 的执行租约固定实际 inode；凭据计算从该对象取得一致的 mode/uid/gid 和 `security.capability`。脚本自身的 set-ID 位忽略，脚本展开后的 ELF 才是身份来源；`PT_INTERP` 负责加载，自己的 set-ID 或 capability 不替代主 ELF。主程序或解释器不可读时，另行降低新映像的 dumpable。
@@ -94,7 +98,9 @@ make test-glibc-riscv
 make test-riscv
 ```
 
-动态 ET_DYN/解释器的生产构造已经接入；真实 userland runner 已验证动态 musl PIE、解释器、额外 DSO、初始 TLS 和运行中 dlopen TLS。固定 glibc 2.44 的静态、动态、PIE、静态 PIE 与 pthread/TLS/信号组合另由 `test-glibc-riscv` 双侧验证。更广重定位矩阵留待后续；LA原版动态musl/初始及late DSO TLS已双侧验证。有效参数的指针表及 auxv 也计入 128 KiB 序列化限制，超限返回 E2BIG，构造不发布新 MM、也不执行 CLOEXEC；`test-elf-boundary-riscv/loongarch` 对照失败后 PID、数据及 CLOEXEC owner 保持。128 KiB 是当前序列化初始栈镜像限制，不是完整 Linux `ARG_MAX` 策略。
+动态 ET_DYN/解释器的生产构造已经接入；真实 userland runner 已验证动态 musl PIE、解释器、额外 DSO、初始 TLS 和运行中 dlopen TLS。固定 glibc 2.44 的静态、动态、PIE、静态 PIE 与 pthread/TLS/信号组合另由 `test-glibc-riscv` 双侧验证。更广重定位矩阵留待后续；LA原版动态musl/初始及late DSO TLS已双侧验证。参数预算遵循上文的 Linux 大小计费，不再以 128 KiB 限制完整序列化映像。
+
+`python3 tests/userland/run.py --workload exec_capacity --arch riscv --cpus 1 --memory 512M --only boaros` 聚焦 argv/envp 容量；`--arch loongarch` 检查 16 KiB 页的单字符串边界。用例覆盖软栈限额的四分之一、128 KiB 下限、6 MiB 上限及各精确边界后一字节，多量空字符串的指针成本，脚本沿用原指针预算，以及 E2BIG/EFAULT 后 PID、旧数据、FD_CLOEXEC、信号动作与再次 exec。`python3 tests/tools/test-init-config.py` 检查初始进程构建期的同类计费。
 
 `python3 tests/userland/run.py --workload execveat --arch riscv --cpus 1 --memory 512M --kernel <kernel> --output <目录>` 运行原版 musl ELF 的 Linux/BoarOS 对照；`--arch loongarch` 使用 LA 后端。用例检查路径与 fd 身份、错误先后、argv/envp/auxv、CLOEXEC、解释器、当前权限、noexec、写入排斥、非组长 exec、set-ID/filecap、NNP、nosuid 和 unsafe CLONE_FS。
 

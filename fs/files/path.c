@@ -55,15 +55,16 @@ static int validate_open_flags(uint64_t flags, uint64_t mode, uint64_t resolve,
 {
     const uint64_t write_flags = LINUX_O_CREAT | LINUX_O_TRUNC |
                                  LINUX_O_APPEND | LINUX_O_EXCL;
-    uint64_t unsupported_flags =
-        LINUX_O_DIRECT |
-        (LINUX_O_TMPFILE & ~LINUX_O_DIRECTORY);
+    uint64_t unsupported_flags = 0;
     uint64_t known_flags = LINUX_O_ACCMODE | write_flags | LINUX_O_NOCTTY |
-        unsupported_flags | LINUX_O_NOATIME | LINUX_O_NONBLOCK | LINUX_O_DIRECTORY |
+        LINUX_O_DIRECT | LINUX_O_TMPFILE | LINUX_O_NOATIME | LINUX_O_NONBLOCK | LINUX_O_DIRECTORY |
         LINUX_O_NOFOLLOW |
         LINUX_O_LARGEFILE | LINUX_O_CLOEXEC | LINUX_O_SYNC | LINUX_O_PATH;
     uint64_t access_mode = flags & LINUX_O_ACCMODE;
 
+    if ((flags & (LINUX_O_TMPFILE & ~LINUX_O_DIRECTORY)) &&
+        (!(flags & LINUX_O_DIRECTORY) || !access_mode || (flags & LINUX_O_CREAT)))
+        return -KERNEL_EINVAL;
     if (strict) {
         uint64_t tmpfile = flags & (LINUX_O_TMPFILE & ~LINUX_O_DIRECTORY);
         int create = !!(flags & LINUX_O_CREAT) || tmpfile;
@@ -79,7 +80,8 @@ static int validate_open_flags(uint64_t flags, uint64_t mode, uint64_t resolve,
             ((flags & LINUX_O_PATH) && (flags & ~path_flags)))
             return -KERNEL_EINVAL;
     }
-    if ((!strict && access_mode == 3U) || (flags & ~known_flags) != 0U) {
+    if ((!strict && access_mode == 3U &&
+         !(flags & (LINUX_O_TMPFILE & ~LINUX_O_DIRECTORY))) || (flags & ~known_flags) != 0U) {
         return -KERNEL_EINVAL;
     }
     if ((flags & LINUX_O_DIRECTORY) != 0U && (flags & LINUX_O_CREAT) != 0U) {
@@ -107,6 +109,7 @@ int kernel_files_open_pty_peer(struct kernel_files *files, struct kernel_task *c
     if (flags & LINUX_O_PATH) flags &= LINUX_O_PATH | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW | LINUX_O_CLOEXEC;
     int error = validate_open_flags(flags, 0, 0, 0, &fd_flags);
     if (error) return error;
+    if (flags & LINUX_O_DIRECT) return -KERNEL_EINVAL;
     if (kernel_files_find_free_fd(files, &fd, &error) != KERNEL_FILES_STATUS_OK) __builtin_trap();
     if (error) return error;
     struct kernel_files_fd_reservation reservation __attribute__((cleanup(kernel_files_cancel_reservation))) = {files, fd};
@@ -293,7 +296,10 @@ static enum kernel_files_status files_open(
     if (flags & LINUX_O_DIRECTORY) request.flags |= KERNEL_VFS_OPEN_DIRECTORY;
     if (flags & LINUX_O_NOFOLLOW) request.flags &= ~KERNEL_VFS_OPEN_FOLLOW;
     if (flags & LINUX_O_PATH) request.flags |= KERNEL_VFS_OPEN_PATH_ONLY;
-    else if (flags & LINUX_O_CREAT) {
+    else if (flags & (LINUX_O_TMPFILE & ~LINUX_O_DIRECTORY)) {
+        request.flags |= KERNEL_VFS_OPEN_TMPFILE;
+        if (flags & LINUX_O_EXCL) request.flags |= KERNEL_VFS_OPEN_EXCLUSIVE;
+    } else if (flags & LINUX_O_CREAT) {
         request.flags |= KERNEL_VFS_OPEN_CREATE;
         if (flags & LINUX_O_EXCL) {
             request.flags |= KERNEL_VFS_OPEN_EXCLUSIVE;
@@ -335,6 +341,16 @@ static enum kernel_files_status files_open(
         (!(flags & LINUX_O_PATH) && object_type != KERNEL_VFS_S_IFREG && object_type != KERNEL_VFS_S_IFDIR))
         kernel_service_scope_begin(&service);
     if (flags & LINUX_O_PATH) goto Finish_open;
+    /* Require an actual backend data path before truncation or device open.
+     * FAT supplies a coherency-qualified direct path with explicit growth
+     * fallback; other regular backends must not silently ignore the flag. */
+    if ((flags & LINUX_O_DIRECT) && object_type != KERNEL_VFS_S_IFBLK &&
+        !kernel_vfs_direct_alignment(&description->file)) {
+        kernel_files_queue_description(files, description);
+        (void)kernel_files_drain_file_cleanup(files);
+        *linux_result = -KERNEL_EINVAL;
+        return KERNEL_FILES_STATUS_OK;
+    }
     if (special_link) {
         if ((flags & LINUX_O_NOATIME) && !kernel_open_file_noatime_allowed(description)) {
             kernel_files_queue_description(files,description);
@@ -551,12 +567,10 @@ enum kernel_files_status kernel_files_readlinkat(
 {
     KERNEL_FS_PATHS(fs_paths, fs);
     KERNEL_FILES_PATH_SCOPE(start);
-    char *storage;
-    char *buffer;
+    struct kernel_task_io_buffer scratch __attribute__((cleanup(path_buffer_release))) = {0};
     size_t bytes_read = 0U;
     size_t copied = 0U;
     int result;
-    enum kernel_heap_status heap_status;
     enum kernel_fs_context_status fs_status;
     enum kernel_uaccess_status access_status;
 
@@ -566,16 +580,18 @@ enum kernel_files_status kernel_files_readlinkat(
         *linux_result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
     }
-    heap_status = kernel_heap_allocate(files->heap, 2U * KERNEL_FS_PATH_MAX,
-                                       (void **)&storage);
-    if (heap_status == KERNEL_HEAP_STATUS_EMPTY) {
+    enum kernel_task_status allocated = kernel_task_io_buffer_acquire(&scratch, mm->allocator);
+    if (allocated == KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) {
         *linux_result = -KERNEL_ENOMEM;
         return KERNEL_FILES_STATUS_OK;
     }
-    if (heap_status != KERNEL_HEAP_STATUS_OK) return KERNEL_FILES_STATUS_STATE;
-    buffer = storage + KERNEL_FS_PATH_MAX;
+    if (allocated != KERNEL_TASK_STATUS_OK) return KERNEL_FILES_STATUS_STATE;
+    /* The resolver consumes the entire pathname before the link target is
+     * read. Both fit in the same task-owned page. */
+    _Static_assert(KERNEL_FS_PATH_MAX <= BOAROS_PAGE_SIZE, "pathname fits the I/O page");
+    char *buffer = scratch.data;
     size_t length;
-    access_status = kernel_copy_string_from_user(mm, storage, user_path,
+    access_status = kernel_copy_string_from_user(mm, buffer, user_path,
                                   KERNEL_FS_PATH_MAX, &length);
     fs_status = KERNEL_FS_CONTEXT_STATUS_OK;
     if (access_status == KERNEL_UACCESS_STATUS_FAULT) result = -KERNEL_EFAULT;
@@ -589,16 +605,15 @@ enum kernel_files_status kernel_files_readlinkat(
         if (!start) result = file ? -KERNEL_EINVAL : -KERNEL_EBADF;
         else result = kernel_vfs_path_acquire(start);
         if (result) start = 0;
-    } else result = kernel_files_path_start(files, &fs_paths, dirfd, storage, &start);
+    } else result = kernel_files_path_start(files, &fs_paths, dirfd, buffer, &start);
     if (fs_status != KERNEL_FS_CONTEXT_STATUS_OK) {
-        kernel_files_release_allocation(files, storage);
         return KERNEL_FILES_STATUS_STATE;
     }
     if (result == 0) {
         size_t capacity = size < KERNEL_FS_PATH_MAX ? (size_t)size :
                           KERNEL_FS_PATH_MAX;
-        result = storage[0] ?
-            kernel_vfs_readlink_at(start, fs_paths.root, storage, buffer, capacity, &bytes_read) :
+        result = buffer[0] ?
+            kernel_vfs_readlink_at(start, fs_paths.root, buffer, buffer, capacity, &bytes_read) :
             kernel_vfs_path_readlink(start, buffer, capacity, &bytes_read);
     }
     if (result == 0) {
@@ -608,11 +623,9 @@ enum kernel_files_status kernel_files_readlinkat(
             result = -KERNEL_EFAULT;
         else if (access_status != KERNEL_UACCESS_STATUS_OK ||
                  copied != bytes_read) {
-            kernel_files_release_allocation(files, storage);
             return KERNEL_FILES_STATUS_STATE;
         }
     }
-    kernel_files_release_allocation(files, storage);
     *linux_result = result == 0 ? (int64_t)bytes_read : result;
     return KERNEL_FILES_STATUS_OK;
 }

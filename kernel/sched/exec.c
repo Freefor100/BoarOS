@@ -38,6 +38,7 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
     enum kernel_mm_status mm_status;
     enum kernel_scheduler_status status;
     kernel_pid_t old_tid;
+    uint32_t old_trace_tid;
     int entry_present = 0;
 
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
@@ -51,7 +52,7 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
         return status;
     }
     thread = kernel_cpu_current()->current;
-    old_tid = thread->tid;
+    if(kernel_task_user_tid(thread,&old_tid)!=KERNEL_TASK_STATUS_OK)__builtin_trap();
     transaction = thread->exec_transaction;
     if (thread == kernel_cpu_current()->idle || thread->arch.user_mode != 1U ||
         transaction == 0 ||
@@ -111,6 +112,7 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
     if (!kernel_scheduler_user_service_active())
         kernel_scheduler_enter_user_service();
 #endif
+    old_trace_tid = kernel_ptrace_exec_old_tid(thread);
     status = process_group_exec_current();
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     thread->fork_no_exec = 0U;
@@ -120,9 +122,10 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
     enum kernel_signal_status signal_status=kernel_signal_unshare_for_exec(thread);
     if (signal_status != KERNEL_SIGNAL_STATUS_OK)
         kernel_user_thread_exit(KERNEL_THREAD_EXIT_USER_FAULT,UINT64_C(0x45584543),signal_status);
+    /* MM cleanup also needs the exec actor when the FD table is private. */
+    transaction->cleanup_task=thread;
     if (kernel_files_is_shared(&thread->files)) {
         /* A process outside this thread group may retain the old table. */
-        transaction->files_closer=thread;
         files_status=kernel_files_fork(&transaction->prepared_files,&thread->files);
         if (files_status != KERNEL_FILES_STATUS_OK)
             kernel_user_thread_exit(KERNEL_THREAD_EXIT_USER_FAULT,UINT64_C(0x45584543),files_status);
@@ -150,6 +153,8 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
     struct kernel_exec_security *previous_security;
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        kernel_mm_coredump_filter_set(&transaction->image.mm,
+            kernel_mm_coredump_filter_get(&thread->mm));
         transaction->retired_mm = thread->mm;
         thread->mm = transaction->image.mm;
         previous=thread->credentials;
@@ -190,7 +195,7 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
                                 UINT64_C(0x45584543),
                                 exec_status);
     }
-    kernel_ptrace_exec(thread,old_tid);
+    kernel_ptrace_exec(thread,old_trace_tid);
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
@@ -257,7 +262,7 @@ enum kernel_exec_status kernel_task_exec_finish(
     return KERNEL_EXEC_STATUS_OK;
 }
 
-int kernel_task_ptrace_exec_busy_locked(struct kernel_task *task)
+int kernel_task_exec_busy_locked(struct kernel_task *task)
 {
     if(!kernel_raw_lock_owned(&kernel_wait_domain))__builtin_trap();
     if(task->proc_exiting || !task->exec_transaction)return 0;

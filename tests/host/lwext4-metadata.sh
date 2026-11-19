@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-case "${1:-all}" in all|ownership|truncate|extent|prepend|extent-lookup) ;; *) echo 'usage: lwext4-metadata.sh [all|ownership|truncate|extent|prepend|extent-lookup]' >&2; exit 2;; esac
+case "${1:-all}" in all|ownership|truncate|extent|prepend|extent-lookup|nojournal-orphan-probe|direct-reuse|nojournal-direct) ;; *) echo 'usage: lwext4-metadata.sh [all|ownership|truncate|extent|prepend|extent-lookup|nojournal-orphan-probe|direct-reuse|nojournal-direct]' >&2; exit 2;; esac
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT HUP INT TERM
@@ -10,11 +10,76 @@ check_fs() {
 ${HOST_CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror \
     -Wno-unused-but-set-variable -Wno-stringop-truncation \
     -DBOAROS_MAX_CPUS=2 -DCONFIG_USE_DEFAULT_CFG=1 -DCONFIG_USE_USER_MALLOC=1 -DCONFIG_DEBUG_ASSERT=0 \
-    -DTEST_RANGE_WORK_COUNTERS=1 -Wl,--wrap=ext4_crc32c -Wl,--wrap=ext4_fs_get_inode_dblk_range -Wl,--wrap=ext4_trans_block_get \
+    -DTEST_RANGE_WORK_COUNTERS=1 -DTEST_DIRECT_REUSE_GOAL=1 -Wl,--wrap=ext4_balloc_alloc_blocks -Wl,--wrap=ext4_crc32c -Wl,--wrap=ext4_fs_get_inode_dblk_range -Wl,--wrap=ext4_trans_block_get \
     -include "$root/tests/host/lwext4_memory.h" \
     -I"$root/third_party/lwext4/include" -idirafter "$root/include" \
     "$root"/third_party/lwext4/src/*.c "$root/tests/host/lwext4_metadata.c" \
     "$root/tests/host/block_fault.c" "$root/kernel/block.c" "$root/tests/host/block_runtime.c" "$root/kernel/raw_lock.c" "$root/tests/host/sync/notifications.c" -I"$root/tests/host/block_model" -pthread -o "$work/probe"
+if [ "${1:-all}" = nojournal-direct ]; then
+    for block in 1024 4096; do
+        truncate -s 32M "$work/direct.img"
+        mkfs.ext4 -q -F -b "$block" -O ^has_journal "$work/direct.img"
+        timeout 30 "$work/probe" "$work/direct.img" seed
+        cp "$work/direct.img" "$work/seed.img"
+        for mode in nojournal-direct direct-data-batch direct-data-error direct-range-error direct-full-leaf-error extent-middle-oom; do
+            cp "$work/seed.img" "$work/direct.img"
+            timeout 30 "$work/probe" "$work/direct.img" "$mode"
+            check_fs "$work/direct.img"
+        done
+    done
+    exit 0
+fi
+if [ "${1:-all}" = direct-reuse ]; then
+    for block in 1024 4096; do
+        truncate -s 32M "$work/direct-base.img"
+        mkfs.ext4 -q -F -b "$block" "$work/direct-base.img"
+        for fault in 0 1 2 3 4; do
+            cp "$work/direct-base.img" "$work/direct.img"
+            timeout 30 "$work/probe" "$work/direct.img" direct-metadata-reuse "$fault"
+            timeout 30 "$work/probe" "$work/direct.img" verify-direct-metadata-reuse "$fault"
+            check_fs "$work/direct.img"
+        done
+    done
+    exit 0
+fi
+
+if [ "${1:-all}" = nojournal-orphan-probe ]; then
+    for block in 1024 4096; do
+        truncate -s 32M "$work/orphan.img"
+        mkfs.ext4 -q -F -b "$block" -O ^has_journal "$work/orphan.img"
+        : > "$work/empty"
+        debugfs -w -R "write $work/empty /pending-nojournal" "$work/orphan.img" > "$work/seed.log" 2>&1
+        timeout 30 "$work/probe" "$work/orphan.img" nojournal-clean-remount
+        timeout 30 "$work/probe" "$work/orphan.img" nojournal-orphan-crash
+        result=0; e2fsck -fn "$work/orphan.img" > "$work/crash-fsck.log" 2>&1 || result=$?
+        [ "$result" = 4 ] && grep -q 'zero dtime' "$work/crash-fsck.log" && grep -q 'Inode bitmap differences' "$work/crash-fsck.log"
+        cat "$work/crash-fsck.log"
+        timeout 30 "$work/probe" "$work/orphan.img" nojournal-reject
+        timeout 30 "$work/probe" "$work/orphan.img" nojournal-orphan-reopen
+        dumpe2fs -h "$work/orphan.img" 2>/dev/null | grep -E 'Filesystem state:[[:space:]]+not clean$'
+        result=0; e2fsck -fn "$work/orphan.img" > "$work/reopen-fsck.log" 2>&1 || result=$?
+        [ "$result" = 4 ] && grep -q 'zero dtime' "$work/reopen-fsck.log" && grep -q 'Inode bitmap differences' "$work/reopen-fsck.log"
+        cat "$work/reopen-fsck.log"
+        result=0; e2fsck -fy "$work/orphan.img" > "$work/repair.log" 2>&1 || result=$?
+        [ "$result" = 1 ] || { cat "$work/repair.log"; exit 1; }
+        check_fs "$work/orphan.img"
+        timeout 30 "$work/probe" "$work/orphan.img" seed
+        check_fs "$work/orphan.img"
+        cp "$work/orphan.img" "$work/flush-failure.img"
+        timeout 30 "$work/probe" "$work/flush-failure.img" nojournal-clean-flush-error
+        timeout 30 "$work/probe" "$work/flush-failure.img" nojournal-reject
+        cp "$work/orphan.img" "$work/clean-failure.img"
+        timeout 30 "$work/probe" "$work/clean-failure.img" nojournal-clean-write-error
+        timeout 30 "$work/probe" "$work/clean-failure.img" nojournal-reject
+        cp "$work/orphan.img" "$work/failure.img"
+        timeout 30 "$work/probe" "$work/failure.img" nojournal-metadata-error
+        timeout 30 "$work/probe" "$work/failure.img" nojournal-reject
+        debugfs -w -R 'set_super_value state 3' "$work/orphan.img" > "$work/error-bit.log" 2>&1
+        timeout 30 "$work/probe" "$work/orphan.img" nojournal-reject
+        timeout 30 "$work/probe" "$work/orphan.img" nojournal-orphan-reopen
+    done
+    exit 0
+fi
 for block in 1024 4096; do
     for inode in 128 256; do
         truncate -s 32M "$work/base.img"

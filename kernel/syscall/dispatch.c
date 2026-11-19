@@ -1,6 +1,8 @@
 #include "private.h"
 
 #include <kernel/cost.h>
+#include <kernel/seccomp.h>
+#include <kernel/task_state.h>
 #include <kernel/errno.h>
 #include <kernel/pidfd.h>
 #include <kernel/kcmp.h>
@@ -204,7 +206,11 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
     struct kernel_syscall_result *result)
 {
     struct kernel_syscall_result decoded;
-    if (request->number == 280U) {
+    if (request->number == 277U) {
+        decoded.action=KERNEL_SYSCALL_ACTION_RETURN;
+        decoded.value=kernel_seccomp_syscall(caller,(uint32_t)request->arguments[0],
+            (uint32_t)request->arguments[1],request->arguments[2]);
+    } else if (request->number == 280U) {
         decoded.action=KERNEL_SYSCALL_ACTION_RETURN;
         decoded.value=kernel_bpf_syscall(caller,(uint32_t)request->arguments[0],request->arguments[1],(uint32_t)request->arguments[2]);
     } else if (request->number == 241U) {
@@ -792,8 +798,10 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
             syscall_decode_clone(request, &decoded);
         }
     } else if (request->number == 435U) {
-        if (syscall_handle_clone3(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
-            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        /* The trap owns the frame. Import clone3 and consume its snapshot in
+         * one slow-path call, after the usual seccomp and trace entry. */
+        decoded.action = KERNEL_SYSCALL_ACTION_CLONE3;
+        decoded.value = 0;
     } else if (request->number == LINUX_SYSCALL_WAIT4) {
         decoded.action = KERNEL_SYSCALL_ACTION_WAIT4;
         decoded.value = 0;
@@ -879,6 +887,9 @@ enum kernel_syscall_status kernel_syscall_dispatch(
     COST_SCOPE(syscall_cost, OPERATION_TICKS);
     COST_ADD(OPERATIONS, 1);
 #endif
+    if (__atomic_load_n(&caller->seccomp_mode,__ATOMIC_RELAXED) && kernel_seccomp_check(caller,request,result))
+        return KERNEL_SYSCALL_STATUS_OK;
+    kernel_bpf_trace_enter(caller,(int32_t)request->number,request->arguments);
     /* 身份查询只读取调用线程的现有身份，直接完成这组标量调用，
      * 避免经过业务分发表后再次分发。权限/身份读取仍由原操作负责。 */
     if (request->number >= LINUX_SYSCALL_GETPID &&
@@ -886,7 +897,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         decoded.action = KERNEL_SYSCALL_ACTION_RETURN;
         switch (request->number) {
         case LINUX_SYSCALL_GETPID:
-            task_status = kernel_task_tgid(caller, &id);
+            task_status = kernel_task_user_tgid(caller, &id);
             if (task_status != KERNEL_TASK_STATUS_OK)
                 return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
             decoded.value = id;
@@ -898,7 +909,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
             decoded.value = id;
             break;
         case LINUX_SYSCALL_GETTID:
-            task_status = kernel_task_tid(caller, &id);
+            task_status = kernel_task_user_tid(caller, &id);
             if (task_status != KERNEL_TASK_STATUS_OK)
                 return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
             decoded.value = id;

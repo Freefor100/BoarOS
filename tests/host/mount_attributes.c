@@ -218,9 +218,9 @@ static void reconfiguration_race(struct kernel_vfs_mount *mount,struct kernel_vf
     assert(!kernel_vfs_path_release(&root));
 }
 static unsigned sync_entered,sync_calls;
-static int pause_filesystem_sync(struct kernel_vfs_instance *instance,struct kernel_vfs_node *root)
+static int pause_filesystem_sync(struct kernel_vfs_mount *mount)
 {
-    (void)instance;(void)root;
+    (void)mount;
     if (__atomic_fetch_add(&sync_calls,1,__ATOMIC_RELAXED)) return 0;
     __atomic_store_n(&sync_entered,1,__ATOMIC_RELEASE);
     while (!mm_test_parked(0)) sched_yield();
@@ -294,8 +294,8 @@ static _Thread_local unsigned delayed_constructor;
 static unsigned constructor_entered,constructor_release,constructor_done,publish_during_snapshot;
 static unsigned publish_sync_calls[3];
 static struct kernel_vfs_backend delayed_observer;
-static int delayed_sync(struct kernel_vfs_instance *instance,struct kernel_vfs_node *root)
-{ (void)instance;(void)root;publish_sync_calls[2]++;return 0; }
+static int delayed_sync(struct kernel_vfs_mount *mount)
+{ (void)mount;publish_sync_calls[2]++;return 0; }
 extern void __real_kernel_vfs_mount_initialize(struct kernel_vfs_mount *);
 void __wrap_kernel_vfs_mount_initialize(struct kernel_vfs_mount *mount)
 {
@@ -459,10 +459,10 @@ static void mount_cleanup_failure(struct kernel_vfs_mount *mount)
     assert(!kernel_vfs_path_release(&covered)&&!kernel_vfs_path_release(&root));
 }
 static unsigned detached_sync_calls,visible_sync_calls;
-static int detached_sync(struct kernel_vfs_instance *instance,struct kernel_vfs_node *root)
-{ (void)instance;(void)root;detached_sync_calls++;return 0; }
-static int visible_sync(struct kernel_vfs_instance *instance,struct kernel_vfs_node *root)
-{ (void)instance;(void)root;visible_sync_calls++;return 0; }
+static int detached_sync(struct kernel_vfs_mount *mount)
+{ (void)mount;detached_sync_calls++;return 0; }
+static int visible_sync(struct kernel_vfs_mount *mount)
+{ (void)mount;visible_sync_calls++;return 0; }
 static void mount_detached_sync(struct kernel_vfs_mount *mount)
 {
     struct kernel_vfs_path *root=NULL,*covered=NULL,*child=NULL,*alias=NULL;
@@ -502,10 +502,10 @@ static void *publish_constructor(void *argument)
     assert(!kernel_tmpfs_create(&heap,0,NULL,argument));
     __atomic_store_n(&constructor_done,1,__ATOMIC_RELEASE);return NULL;
 }
-static int publish_root_sync(struct kernel_vfs_instance *instance,struct kernel_vfs_node *root)
-{ (void)instance;(void)root;publish_sync_calls[0]++;return 0; }
-static int publish_limit_sync(struct kernel_vfs_instance *instance,struct kernel_vfs_node *root)
-{ (void)instance;(void)root;publish_sync_calls[1]++;return 0; }
+static int publish_root_sync(struct kernel_vfs_mount *mount)
+{ (void)mount;publish_sync_calls[0]++;return 0; }
+static int publish_limit_sync(struct kernel_vfs_mount *mount)
+{ (void)mount;publish_sync_calls[1]++;return 0; }
 static void mount_sync_publication(struct kernel_vfs_mount *mount)
 {
     struct kernel_vfs_mount *late=NULL,*limit=NULL;
@@ -588,11 +588,42 @@ static void mount_cleanup_chain(struct kernel_vfs_mount *mount)
 }
 static unsigned sync_owner_entered,sync_owner_done;
 static int sync_owner_result;
-static int snapshot_owner_sync(struct kernel_vfs_instance *instance,struct kernel_vfs_node *node)
+static int snapshot_owner_sync(struct kernel_vfs_mount *mount)
 {
-    (void)instance;(void)node;__atomic_store_n(&sync_owner_entered,1,__ATOMIC_RELEASE);
+    (void)mount;__atomic_store_n(&sync_owner_entered,1,__ATOMIC_RELEASE);
     while (!__atomic_load_n(&sync_owner_done,__ATOMIC_ACQUIRE)) sched_yield();
     return 0;
+}
+static unsigned rootless_sync_calls;
+static int count_rootless_sync(struct kernel_vfs_mount *mount)
+{
+    if (rootless_sync_calls++ == 1) {
+        kernel_vfs_record_mount_writeback_error(mount,-KERNEL_EIO);
+        return -KERNEL_EIO;
+    }
+    return 0;
+}
+static void mount_sync_rootless(void)
+{
+    struct kernel_vfs_mount *mount=NULL;
+    assert(!kernel_tmpfs_create(&heap,0,NULL,&mount));
+    struct kernel_vfs_instance *instance=mount->private_data;
+    const struct kernel_vfs_backend *original=instance->ops;
+    struct kernel_vfs_backend observer=*original;
+    observer.sync_filesystem=count_rootless_sync;
+    instance->ops=&observer;
+    assert(!mount->root_dentry&&!mount->root_path);
+    allocation_calls=0;allocation_fail_at=1;
+    int result=kernel_vfs_sync_mount(mount,NULL);
+    assert(!result&&rootless_sync_calls==1);
+    uint64_t observed=0;
+    assert(kernel_vfs_sync_mount(mount,NULL)==-KERNEL_EIO);
+    assert(kernel_vfs_sync_mount(mount,&observed)==-KERNEL_EIO&&observed==1);
+    assert(!kernel_vfs_sync_mount(mount,&observed)&&rootless_sync_calls==4);
+    allocation_fail_at=0;
+    assert(!result&&!allocation_calls&&!mount->root_dentry&&!mount->root_path);
+    instance->ops=original;
+    assert(!kernel_vfs_unmount(mount));
 }
 static void *snapshot_unmount(void *argument)
 {
@@ -914,6 +945,7 @@ int main(int argc,char **argv)
     else if(!strcmp(argv[1],"view-deep"))mount_deep_views(mount);
     else if(!strcmp(argv[1],"view-chain"))mount_cleanup_chain(mount);
     else if(!strcmp(argv[1],"view-sync-owner"))mount_sync_owner(mount);
+    else if(!strcmp(argv[1],"sync-rootless"))mount_sync_rootless();
     else if(!strcmp(argv[1],"remount")){reconfiguration(mount,file);file=0;}
     else if(!strcmp(argv[1],"remount-race"))reconfiguration_race(mount,&file->file);
     else if(!strcmp(argv[1],"remount-sync"))reconfiguration_sync(mount);

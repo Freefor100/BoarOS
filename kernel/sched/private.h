@@ -59,6 +59,7 @@ struct kernel_scheduler {
 #endif
     uint64_t loads[3], load_ticks;
     struct kernel_pid_registry identities;
+    struct kernel_pid_registry *pid_shutdowns;
     struct kernel_heap identity_heap;
     struct physical_page_allocator *allocator;
     struct kernel_pid_allocator pid_allocator;
@@ -71,7 +72,6 @@ struct kernel_scheduler {
 #endif
 #if BOAROS_USER_SMP
     struct kernel_sched_runqueue rt_services;
-    uint32_t pullable_rt_cpus;
 #endif
     struct kernel_rt_configuration rt_configuration;
     struct kernel_task *exited_head;
@@ -125,8 +125,11 @@ static inline enum kernel_scheduler_status scheduler_failure(void)
 
 /* Locked variants require kernel_wait_domain; a lookup borrow is obtained
  * under the same domain as discovery and lasts through task_put(). */
+struct kernel_task *scheduler_task_lookup_in_locked(struct kernel_pid_registry *, kernel_pid_t, enum kernel_pid_role, uint64_t);
 struct kernel_task *scheduler_task_lookup_locked(kernel_pid_t, enum kernel_pid_role, uint64_t);
 struct kernel_task *scheduler_task_lookup(kernel_pid_t, enum kernel_pid_role, uint64_t);
+/* Shared exec credential/image exclusion; scheduler domain held. */
+int kernel_task_exec_busy_locked(struct kernel_task *);
 void scheduler_task_get_locked(struct kernel_task *);
 void scheduler_task_put(struct kernel_task *);
 static inline void scheduler_task_borrow_end(struct kernel_task **task)
@@ -171,6 +174,29 @@ void process_identity_release_locked(struct kernel_task *);
 void kernel_proc_task_update_comm(struct kernel_task *task);
 
 void scheduler_wake_task(struct kernel_task *thread, uint32_t reason);
+/* Creation/snapshot callers retain the source registry across sleeping allocation.
+ * Returned registry owners are put under the identity lock, then collected. */
+int process_pid_namespace_create(struct kernel_pid_registry *, struct kernel_heap *,
+    struct kernel_pid_registry **);
+int process_pid_namespace_snapshot(struct kernel_pid_registry *, struct kernel_heap *,
+    struct kernel_namespace **);
+struct kernel_pid_registry *process_pid_namespace_registry(struct kernel_namespace *);
+struct kernel_pid_registry *process_pid_active(const struct kernel_task *);
+struct kernel_pid_registry *process_pid_children_locked(const struct kernel_task *);
+int process_pid_children_check_locked(struct kernel_task *, struct kernel_pid_registry *);
+int process_clone_admit(struct kernel_task *, struct kernel_task *, uint64_t flags);
+int process_pid_children_install_locked(struct kernel_task *, struct kernel_pid_registry *);
+struct kernel_task *process_pid_reaper_locked(struct kernel_pid_registry *);
+int process_identity_admit_locked(const struct kernel_task *);
+void process_pid_reaper_disable_locked(struct kernel_task *);
+struct kernel_task *process_pid_namespace_kill_target_locked(struct kernel_pid_registry *, kernel_pid_t *);
+int process_pid_namespace_defer_locked(struct kernel_task *);
+void kernel_signal_ignore_sigchld(struct kernel_task *);
+
+enum kernel_pid_status process_identity_create_new_namespace(struct kernel_task *,
+    struct kernel_task *, const kernel_pid_t *, size_t, int may_set_tid);
+enum kernel_pid_status process_identity_create_numbers(struct kernel_task *,
+    struct kernel_task *, int, const kernel_pid_t *, size_t, int may_set_tid);
 enum kernel_pid_status process_identity_create(struct kernel_task *task,
     struct kernel_task *parent, int thread_clone);
 void process_identity_release(struct kernel_task *task);
@@ -179,11 +205,15 @@ void kernel_task_identity_put(struct kernel_pid *);
 int process_group_is_orphaned(const struct kernel_task *task);
 void process_orphan_notify(struct kernel_task *task, struct kernel_task *old_parent);
 enum kernel_signal_status signal_send_kernel_group(struct kernel_task *task, uint32_t sig);
+struct kernel_task *process_find_identity_in(kernel_pid_t, enum kernel_pid_role,
+    struct kernel_pid_registry *);
 struct kernel_task *process_find_identity(kernel_pid_t number, enum kernel_pid_role role);
 struct kernel_pid *process_identity(const struct kernel_task *task, enum kernel_pid_role role);
 kernel_pid_t process_identity_number(const struct kernel_task *task, enum kernel_pid_role role);
 uint64_t process_identity_generation(const struct kernel_task *task);
 void process_group_initialize(struct kernel_task *task);
+int process_core_dump(struct kernel_task *, unsigned);
+void process_core_rendezvous(struct kernel_task *);
 void process_group_request_exit(struct kernel_task *task,
                                 enum kernel_thread_exit_reason reason,
                                 uint64_t status, uint64_t detail);
@@ -257,6 +287,17 @@ enum kernel_scheduler_status release_after_create_failure(
 enum kernel_scheduler_status validate_current(void);
 /* CPU obtained at this IRQ-off entry; never retain it across switch/sleep. */
 enum kernel_scheduler_status validate_current_on_cpu(struct kernel_cpu *cpu);
+static inline enum kernel_scheduler_status check_running_on_cpu(struct kernel_cpu *cpu)
+{
+    if (BOAROS_LOCK_DEBUG) return validate_current_on_cpu(cpu);
+    const struct kernel_task *task=cpu->current;
+    if (!task || arch_current_thread_get()!=task || task->magic!=KERNEL_THREAD_MAGIC)
+        return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+    if (task->idle ? task!=cpu->idle || task->state!=KERNEL_THREAD_STATE_IDLE :
+                    task->state!=KERNEL_THREAD_STATE_RUNNING)
+        return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+    return KERNEL_SCHEDULER_STATUS_OK;
+}
 enum kernel_task_status validate_task_resource_borrow(
     const struct kernel_task *task);
 void wake_waiting_parent(struct kernel_task *child);

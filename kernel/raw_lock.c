@@ -10,9 +10,9 @@ static inline uint64_t raw_enter(struct kernel_raw_lock *lock, struct kernel_raw
 {
     uintptr_t irq = arch_interrupt_save();
     struct kernel_cpu *cpu = kernel_cpu_current();
+#if BOAROS_LOCK_DEBUG
     if (!lock || !guard || guard->lock || lock->initialized != KERNEL_RAW_INITIALIZED ||
         cpu->preempt_depth == UINT32_MAX) __builtin_trap();
-#if BOAROS_LOCK_DEBUG
     for (struct kernel_raw_guard *held = cpu->raw_locks; held; held = held->previous)
         if (held->lock == lock) __builtin_trap();
     if (cpu->raw_locks) {
@@ -20,6 +20,8 @@ static inline uint64_t raw_enter(struct kernel_raw_lock *lock, struct kernel_raw
         if (outer->rank > lock->rank ||
             (outer->rank == lock->rank && (uintptr_t)outer >= (uintptr_t)lock)) __builtin_trap();
     }
+#else
+    (void)lock;
 #endif
     guard->interrupts = irq;
     guard->previous_depth = cpu->preempt_depth++;
@@ -58,13 +60,13 @@ void kernel_raw_lock_acquire(struct kernel_raw_lock *lock, struct kernel_raw_gua
     do {
         do {
             observed = __atomic_load_n(&lock->word, __ATOMIC_RELAXED);
-            if (observed > 1U) __builtin_trap();
+            if (BOAROS_LOCK_DEBUG && observed > 1U) __builtin_trap();
         } while (observed);
         observed = __atomic_exchange_n(&lock->word, 1U, __ATOMIC_ACQUIRE);
-        if (observed > 1U) __builtin_trap();
+        if (BOAROS_LOCK_DEBUG && observed > 1U) __builtin_trap();
     } while (observed);
 #else
-    if (lock->word) __builtin_trap();
+    if (BOAROS_LOCK_DEBUG && lock->word) __builtin_trap();
     lock->word = 1;
     __asm__ volatile("" ::: "memory");
 #endif
@@ -72,10 +74,14 @@ void kernel_raw_lock_acquire(struct kernel_raw_lock *lock, struct kernel_raw_gua
 }
 static inline void raw_validate_release(struct kernel_raw_guard *guard)
 {
+#if BOAROS_LOCK_DEBUG
     struct kernel_cpu *cpu = kernel_cpu_current();
     if (!guard || !guard->lock || guard->cpu != cpu || cpu->raw_locks != guard ||
         !cpu->preempt_depth || guard->previous_depth == UINT32_MAX ||
         cpu->preempt_depth != guard->previous_depth + 1U) __builtin_trap();
+#else
+    (void)guard;
+#endif
 }
 static inline void raw_release_owner(struct kernel_raw_guard *guard)
 {
@@ -103,7 +109,8 @@ static inline void raw_release_finish(struct kernel_raw_guard *guard, unsigned r
 void kernel_raw_lock_release(struct kernel_raw_guard *guard)
 {
     raw_validate_release(guard);
-    if (__atomic_load_n(&guard->lock->word, __ATOMIC_RELAXED) != 1U) __builtin_trap();
+    if (BOAROS_LOCK_DEBUG &&
+        __atomic_load_n(&guard->lock->word,__ATOMIC_RELAXED)!=1U) __builtin_trap();
     unsigned rank = 0;
     uint64_t hold = 0;
 #if BOAROS_COST_DIAGNOSTICS
@@ -129,60 +136,48 @@ void kernel_raw_rwlock_init(struct kernel_raw_rwlock *lock, uint32_t rank)
 void kernel_raw_rwlock_write_acquire(struct kernel_raw_rwlock *lock, struct kernel_raw_guard *guard)
 {
     if (!lock) __builtin_trap();
-    kernel_raw_lock_acquire(&lock->writer, guard);
-    /* word=1 closes admission before observing the last short reader. */
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    while (__atomic_load_n(&lock->readers, __ATOMIC_ACQUIRE)) {}
-#if BOAROS_COST_DIAGNOSTICS
-    if (guard->cost.epoch) {
-        uint64_t now = kernel_cost_clock();
-        guard->wait_ticks += now - guard->hold_start;
-        guard->hold_start = now;
-    }
-#endif
+    uint64_t wait_start = raw_enter(&lock->writer, guard);
+    uint32_t *word = &lock->writer.word;
+    uint32_t previous;
+    do {
+        while (__atomic_load_n(word, __ATOMIC_RELAXED) & 1U) {}
+        previous = __atomic_fetch_or(word, 1U, __ATOMIC_ACQUIRE);
+    } while (previous & 1U);
+    /* Readers admitted before our RMW drain with release RMWs. New
+     * readers cannot add to the count while bit 0 is set. */
+    if (previous) while (__atomic_load_n(word, __ATOMIC_ACQUIRE) != 1U) {}
+    raw_acquired(&lock->writer, guard, wait_start);
 }
 void kernel_raw_rwlock_read_acquire(struct kernel_raw_rwlock *lock, struct kernel_raw_read_guard *guard)
 {
-    if (!lock || !guard) __builtin_trap();
+    if (BOAROS_LOCK_DEBUG && (!lock || !guard)) __builtin_trap();
     uint64_t wait_start = raw_enter(&lock->writer, &guard->raw);
+    uint32_t *word = &lock->writer.word;
+    uint32_t state = __atomic_load_n(word, __ATOMIC_RELAXED);
     for (;;) {
-        uint32_t word;
-        do {
-            word = __atomic_load_n(&lock->writer.word, __ATOMIC_ACQUIRE);
-            if (word > 1U) __builtin_trap();
-        } while (word);
-        if (__atomic_fetch_add(&lock->readers, 1U, __ATOMIC_ACQ_REL) == UINT32_MAX)
-            __builtin_trap();
-        /* The writer's close and this admission use different atomic words.
-         * Full ordering prevents both sides from missing the other's store. */
-        __atomic_thread_fence(__ATOMIC_SEQ_CST);
-        word = __atomic_load_n(&lock->writer.word, __ATOMIC_ACQUIRE);
-        if (word > 1U) __builtin_trap();
-        if (!word) break;
-        if (!__atomic_fetch_sub(&lock->readers, 1U, __ATOMIC_RELEASE)) __builtin_trap();
+        while (state & 1U) state = __atomic_load_n(word, __ATOMIC_RELAXED);
+        if (BOAROS_LOCK_DEBUG && state == UINT32_MAX - 1U) __builtin_trap();
+        if (__atomic_compare_exchange_n(word, &state, state + 2U, 1,
+            __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) break;
     }
-    guard->lock = lock;
     raw_acquired(&lock->writer, &guard->raw, wait_start);
 }
 void kernel_raw_rwlock_read_release(struct kernel_raw_read_guard *guard)
 {
-    if (!guard) __builtin_trap();
+    if (BOAROS_LOCK_DEBUG && !guard) __builtin_trap();
     struct kernel_raw_guard *raw = &guard->raw;
     raw_validate_release(raw);
-    struct kernel_raw_rwlock *lock = guard->lock;
-    if (!lock || raw->lock != &lock->writer ||
-        __atomic_load_n(&lock->writer.word, __ATOMIC_RELAXED) > 1U) __builtin_trap();
     unsigned rank = 0;
     uint64_t hold = 0;
 #if BOAROS_COST_DIAGNOSTICS
-    rank = lock->writer.rank;
+    rank = raw->lock->rank;
     hold = raw->cost.epoch ? kernel_cost_clock() - raw->hold_start : 0;
 #endif
     raw_release_owner(raw);
     /* The last release may let a writer retire its containing object. Nothing
      * below this decrement may dereference lock, including cost attribution. */
-    if (!__atomic_fetch_sub(&lock->readers, 1U, __ATOMIC_RELEASE)) __builtin_trap();
-    guard->lock = 0;
+    uint32_t previous=__atomic_fetch_sub(&raw->lock->word,2U,__ATOMIC_RELEASE);
+    if (BOAROS_LOCK_DEBUG && previous<2U) __builtin_trap();
     raw_release_finish(raw, rank, hold);
 }
 #endif

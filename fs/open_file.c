@@ -5,6 +5,7 @@
 #include "open_file_internal.h"
 #include <kernel/namespace.h>
 #include <kernel/procfs.h>
+#include <kernel/proc_task.h>
 #include <kernel/ipc_namespace.h>
 #include "block_file_internal.h"
 #include "record_lock.h"
@@ -288,8 +289,10 @@ static void initialize_path_description(struct kernel_open_file_description *fil
     kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
     if (file->kind!=KERNEL_OPEN_FILE_KIND_PATH && kernel_vfs_file_generated(&file->file))
         file->kind = KERNEL_OPEN_FILE_KIND_GENERATED;
-    if (file->kind==KERNEL_OPEN_FILE_KIND_GENERATED && kernel_procfs_ipc_file(&file->file))
+    if (file->kind==KERNEL_OPEN_FILE_KIND_GENERATED && kernel_procfs_ipc_file(&file->file)) {
         file->ipc_proc_namespace=kernel_namespace_get(kernel_task_ipc_namespace());
+        file->ipc_proc_pid_view=kernel_proc_view_acquire();
+    }
     file->observed_writeback_error = kernel_vfs_error_sequence(&file->file);
     file->credentials = kernel_credentials_get(kernel_credentials_current());
 }
@@ -1027,6 +1030,7 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
             file->vfs_closed = 1U;
         }
     }
+    if(file->ipc_proc_namespace)kernel_proc_view_release(file->ipc_proc_pid_view);
     kernel_namespace_put(file->ipc_proc_namespace);
     kernel_credentials_put(file->credentials);
     kernel_heap_release(file->heap, file);
@@ -1119,6 +1123,7 @@ int kernel_open_file_generate(struct kernel_open_file_description *file)
         return -KERNEL_EINVAL;
     if (file->generated_ready) return 0;
     int result = kernel_vfs_file_snapshot(&file->file,file->heap,file->ipc_proc_namespace,
+                                           file->ipc_proc_namespace?file->ipc_proc_pid_view:NULL,
                                            &file->generated_data,
                                            &file->generated_length);
     if (result) {
@@ -1176,7 +1181,7 @@ int kernel_open_file_noatime_allowed(const struct kernel_open_file_description *
 void kernel_open_file_set_status_flags(struct kernel_open_file_description *file, uint32_t flags)
 {
     if (!open_file_live(file)) __builtin_trap();
-    const uint32_t mask=00002000U | 00004000U | 00020000U | 01000000U;
+    const uint32_t mask=00002000U | 00004000U | 00020000U | KERNEL_FILES_O_DIRECT | 01000000U;
     uint32_t old=__atomic_load_n(&file->open_flags, __ATOMIC_RELAXED);
     while (!__atomic_compare_exchange_n(&file->open_flags, &old,
         (old & ~mask) | (flags & mask), 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
@@ -1334,7 +1339,7 @@ static inline __attribute__((always_inline)) enum kernel_page_cache_status disk_
 {
     uint32_t policy=__atomic_load_n(&file->read_advice,__ATOMIC_RELAXED);
     return kernel_page_cache_get_for_fault(cache,&file->file,index,address,valid,
-        read_window && !(policy&(KERNEL_READ_RANDOM|KERNEL_READ_NOREUSE)),
+        policy&(KERNEL_READ_RANDOM|KERNEL_READ_NOREUSE) ? KERNEL_PAGE_CACHE_FAULT_SINGLE : read_window,
         !!(policy&KERNEL_READ_NOREUSE));
 }
 
@@ -1356,6 +1361,20 @@ int kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *f
     *prepared=(struct kernel_open_file_page_preparation){.address=address,.index=index,.pending=1};
     return 0;
 }
+
+/* The caller holds a live disk OFD. This path never starts or waits for I/O. */
+int kernel_open_file_try_prepare_disk_mapping_page(struct kernel_open_file_description *file,
+    uint64_t index, struct kernel_open_file_page_preparation *prepared)
+{
+    uint32_t policy=__atomic_load_n(&file->read_advice,__ATOMIC_RELAXED);
+    uint64_t address;
+    size_t valid;
+    if (kernel_page_cache_lookup_ready(kernel_vfs_file_page_cache(&file->file),
+        &file->file,index,&address,&valid,!!(policy&KERNEL_READ_NOREUSE))) return 0;
+    *prepared=(struct kernel_open_file_page_preparation){.address=address,.index=index,.pending=1};
+    return 1;
+}
+
 void kernel_open_file_finish_mapping_page(struct kernel_open_file_description *file,
     struct kernel_open_file_page_preparation *prepared,int accepted)
 {
@@ -1466,21 +1485,28 @@ enum kernel_page_cache_status kernel_open_file_alias_attach(
         physical_address, alias, owner, virtual_address, rearm);
 }
 
-int kernel_open_file_pread(struct kernel_open_file_description *file,
-                           uint64_t offset,
-                           void *buffer,
-                           size_t size,
-                           size_t *bytes_read)
+int kernel_open_file_pread_mode(struct kernel_open_file_description *file,
+    uint64_t offset, void *buffer, size_t size, uint32_t status_flags, size_t *bytes_read)
 {
-    if (open_file_live(file) && file->block)
-        return kernel_block_file_pread(file, offset, buffer, size, bytes_read);
     if (!open_file_live(file)) return -KERNEL_EINVAL;
-    if (bytes_read) *bytes_read = 0;
+    size_t ignored;
+    if (!bytes_read) bytes_read=&ignored;
+    *bytes_read=0;
+    if (file->block)
+        return kernel_block_file_pread(file,offset,buffer,size,status_flags,bytes_read);
+    if (status_flags&KERNEL_FILES_O_DIRECT)
+        return kernel_vfs_direct_pread(&file->file,offset,buffer,size,bytes_read);
     if (size) kernel_open_file_read_begin(file, offset);
     struct kernel_vfs_read_options options={.no_reuse=kernel_open_file_read_no_reuse(file)};
     int result = kernel_vfs_pread(&file->file, offset, buffer, size, bytes_read, &options);
-    if (bytes_read) kernel_open_file_read_progress(file, offset, *bytes_read, options.cache_miss);
+    kernel_open_file_read_progress(file, offset, *bytes_read, options.cache_miss);
     return result;
+}
+
+int kernel_open_file_pread(struct kernel_open_file_description *file,
+    uint64_t offset, void *buffer, size_t size, size_t *bytes_read)
+{
+    return kernel_open_file_pread_mode(file,offset,buffer,size,kernel_open_file_flags(file),bytes_read);
 }
 
 int kernel_open_file_sync_range(struct kernel_open_file_description *file,

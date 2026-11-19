@@ -32,6 +32,9 @@
 #include "lwip/memp.h"
 #include "lwip/ip_addr.h"
 #include "lwip/netif.h"
+#include "lwip/nd6.h"
+#include "lwip/mld6.h"
+#include "lwip/priv/nd6_priv.h"
 #include "lwip/pbuf.h"
 #include "lwip/sys.h"
 #include "lwip/stats.h"
@@ -43,6 +46,8 @@
 
 #include <stddef.h>
 #include <stdint.h>
+
+#include "rtnetlink.h"
 
 #define SOCKET_DGRAM 2
 #define SOCKET_STREAM 1
@@ -79,6 +84,22 @@ struct kernel_socket_name {
     struct kernel_vfs_path *path;
     unsigned char bytes[];
 };
+struct socket_ipv6_member {
+    struct socket_ipv6_member *next;
+    ip6_addr_t group;
+    uint8_t index;
+    uint8_t active; /* Owns a reference in the current IPv6 netif generation. */
+};
+struct unix_credentials {
+    struct kernel_pid *pid;
+    uint32_t uid,gid;
+};
+static void unix_cred_release(struct unix_credentials *cred)
+{
+    if(cred->pid)kernel_task_identity_put(cred->pid);
+    cred->pid=NULL;
+}
+
 struct kernel_socket {
     struct kernel_heap *heap;
     struct kernel_raw_lock endpoint_lock;
@@ -90,6 +111,7 @@ struct kernel_socket {
     struct socket_packet *packets_tail;
     struct socket_packet *retired_head, *retired_tail;
     uint32_t receive_credit;
+    uint64_t receive_sequence;
     struct socket_pending *pending_head;
     struct socket_pending *pending_tail;
     struct kernel_socket_read_request *read_request;
@@ -114,8 +136,13 @@ struct kernel_socket {
     int pending_error;
     uint8_t reuseaddr;
     uint8_t keepalive;
-    uint8_t nodelay;
+    uint32_t keep_idle, keep_intvl, keep_cnt;
+    struct kernel_socket_tcp_info retired_info;
+    uint32_t retired_info_ms;
+    uint8_t nodelay, cork;
     uint8_t broadcast, ipv4_ttl, multicast_ttl;
+    uint8_t ipv6_multicast_index, ipv6_multicast_hops, ipv6_multicast_loop, ipv6_multicast_all;
+    struct socket_ipv6_member *ipv6_members;
     uint8_t bound_device, multicast_index;
     ip_addr_t multicast_source;
     uint32_t rx_bytes;
@@ -147,13 +174,14 @@ struct kernel_socket {
     struct kernel_socket *unix_peers, *unix_peer_next, **unix_peer_previous;
     struct kernel_wait_node unix_space;
     unsigned unix_space_wait;
-    struct kernel_socket_peercred peercred;
+    struct unix_credentials peercred;
     struct kernel_socket_control *rights_head;
     struct kernel_open_file_description *gc_file;
     struct kernel_socket *gc_next, *gc_work;
     uint32_t gc_inflight;
     unsigned gc_mark, passcred;
-    uint32_t netlink_references, netlink_memory;
+    uint32_t netlink_references, netlink_memory, netlink_port;
+    struct kernel_socket *netlink_next;
 #if BOAROS_USER_SMP
     unsigned tcp_cpu;
     uint16_t tcp_prepare_mss;
@@ -262,8 +290,10 @@ static int socket_ingress_filter(struct kernel_socket *socket,struct pbuf *p,str
     return 1;
 }
 
+static void socket_ipv6_members_release(struct kernel_socket *);
 static void udp_received(void *,struct udp_pcb *,struct pbuf *,const ip_addr_t *,u16_t);
 static void tcp_failed(void *,err_t);
+static void socket_tcp_info_retire(struct tcp_pcb *);
 static err_t socket_tcp_accepted(void *,struct tcp_pcb *,err_t);
 
 static struct kernel_socket *tcp_filter_socket(const struct tcp_pcb *pcb)
@@ -341,10 +371,12 @@ static void address_export(const struct kernel_socket *socket,
     }
 }
 
+enum socket_address_use { SOCKET_ADDRESS_CONNECT, SOCKET_ADDRESS_BIND, SOCKET_ADDRESS_SEND };
 static int address_import(const struct kernel_socket *socket,
                           const struct kernel_socket_address *address,
-                          ip_addr_t *ip, int binding)
+                          ip_addr_t *ip, enum socket_address_use use)
 {
+    int binding=use==SOCKET_ADDRESS_BIND;
     if (address->family != socket->family) return -KERNEL_EAFNOSUPPORT;
     ip_addr_set_zero(ip);
     if (address->family == KERNEL_SOCKET_AF_INET) {
@@ -363,8 +395,18 @@ static int address_import(const struct kernel_socket *socket,
             IP_SET_TYPE(ip, IPADDR_TYPE_V6);
             __builtin_memcpy(ip_2_ip6(ip)->addr, address->bytes, 16);
             if (ip6_addr_has_scope(ip_2_ip6(ip), IP6_UNKNOWN)) {
-                if (address->scope > 255U) return -KERNEL_ENODEV;
-                ip6_addr_set_zone(ip_2_ip6(ip), (u8_t)address->scope);
+                uint32_t index=address->scope ? address->scope : socket->bound_device;
+                if (use==SOCKET_ADDRESS_SEND && socket->bound_device)index=socket->bound_device;
+                if (use==SOCKET_ADDRESS_CONNECT && address->scope && socket->bound_device &&
+                    address->scope!=socket->bound_device)return -KERNEL_EINVAL;
+                if (use!=SOCKET_ADDRESS_SEND && ip6_addr_islinklocal(ip_2_ip6(ip)) && !index)
+                    return -KERNEL_EINVAL;
+                /* SEND preparation runs on the caller with only its endpoint
+                 * lock. Keep this a value snapshot; owner-side routing checks
+                 * interface existence after copying, under protocol ownership. */
+                if (index>255U || (use!=SOCKET_ADDRESS_SEND && index && !netif_get_by_index((u8_t)index)))
+                    return binding?-KERNEL_ENODEV:-KERNEL_ENETUNREACH;
+                ip6_addr_set_zone(ip_2_ip6(ip), (u8_t)index);
             }
             if (binding && !socket->v6only && ip_addr_isany(ip))
                 IP_SET_TYPE(ip, IPADDR_TYPE_ANY);
@@ -396,7 +438,8 @@ static void *network_context;
 static struct kernel_socket *write_retry_head;
 
 enum { SOCKET_WORK_OUTPUT = 1, SOCKET_WORK_RECEIVE = 2, SOCKET_WORK_REAP = 4,
-       SOCKET_WORK_LISTENER = 8, SOCKET_WORK_PROMOTE = 16, SOCKET_WORK_DEVICE_FAILED = 32 };
+       SOCKET_WORK_LISTENER = 8, SOCKET_WORK_PROMOTE = 16, SOCKET_WORK_DEVICE_FAILED = 32,
+       SOCKET_WORK_PUSH = 64 };
 struct socket_work_queue { struct kernel_socket *head, *tail; unsigned slot; };
 static struct socket_work_queue ready_work, pool_wait = {.slot = 1}, nic_wait = {.slot = 2}, receive_wait = {.slot = 3};
 static uint64_t pool_generation, nic_generation, receive_generation;
@@ -1200,6 +1243,7 @@ static int unix_put_locked(struct kernel_socket *socket)
 static void unix_storage_free(struct kernel_socket *socket)
 {
     unix_name_put(socket->unix_name);
+    unix_cred_release(&socket->peercred);
     kernel_heap_release(socket->heap,socket);
 }
 static void unix_put(struct kernel_socket *socket)
@@ -1210,15 +1254,20 @@ static void unix_put(struct kernel_socket *socket)
     kernel_irq_lock_release(&state);
     if(release)unix_storage_free(socket);
 }
-static struct kernel_socket_peercred unix_current_cred(void)
+static struct unix_credentials unix_current_cred(void)
 {
     const struct kernel_credentials *cred=kernel_credentials_current();
-    kernel_pid_t pid=0;struct kernel_task *task=kernel_task_current();
-    if(task && kernel_task_tgid(task,&pid)!=KERNEL_TASK_STATUS_OK)__builtin_trap();
-    return (struct kernel_socket_peercred){.pid=(int32_t)pid,.uid=cred->euid,.gid=cred->egid};
+    struct kernel_pid *pid=NULL;
+    if(kernel_task_current() && kernel_task_identity_get(0,&pid))__builtin_trap();
+    return (struct unix_credentials){.pid=pid,.uid=cred->euid,.gid=cred->egid};
 }
 int kernel_socket_peercred(struct kernel_socket *socket,struct kernel_socket_peercred *cred)
-{ SOCKET_ENDPOINT(state,socket);*cred=socket->peercred;return 0; }
+{
+    SOCKET_ENDPOINT(state,socket);
+    *cred=(struct kernel_socket_peercred){.pid=kernel_task_identity_user_number(socket->peercred.pid),
+        .uid=socket->peercred.uid,.gid=socket->peercred.gid};
+    return 0;
+}
 static unsigned unix_name_hash(const unsigned char *name,unsigned length,unsigned type)
 {
     uint32_t hash=type;
@@ -1441,6 +1490,7 @@ static void retire_timewait(struct kernel_socket *socket)
     struct tcp_pcb *pcb = socket->tcp;
     if (!pcb || socket->listening || pcb->state != TIME_WAIT) return;
     /* 释放 hook 也走这里：只清借用与回调，不重入 raw API 或销毁堆 owner。 */
+    socket_tcp_info_retire(pcb);
     pcb->callback_arg = 0; pcb->errf = 0;
     pcb->recv = 0; pcb->sent = 0; pcb->poll = 0; pcb->pollinterval = 0;
     pcb->connected = 0;
@@ -1469,6 +1519,8 @@ static uint64_t socket_next_timer_deadline(void)
     milliseconds = socket_initialized ? sys_timeouts_sleeptime()
                                       : SYS_TIMEOUTS_SLEEPTIME_INFINITE;
     u32_t current_ms = sys_now();
+    u32_t cork_delay = boaros_lwip_tcp_cork_delay(current_ms);
+    if (cork_delay < milliseconds) milliseconds = cork_delay;
     {SOCKET_STATE(state);if(rights_retry_pending) {
         int32_t remaining=(int32_t)(rights_retry_ms-current_ms);
         u32_t retry=remaining<=0?1U:(u32_t)remaining;
@@ -1508,7 +1560,7 @@ static struct ip_pcb *socket_ip_pcb(struct kernel_socket *socket)
 
 /* Called with the shared IP/protocol qualification. Explicit interface choice
  * and broadcast permission apply equally to connected UDP and raw sends. */
-static int datagram_route(struct kernel_socket *socket,const ip_addr_t *remote,
+static int socket_ip_route(struct kernel_socket *socket,const ip_addr_t *remote,
                          struct netif **selected,const ip_addr_t **source)
 {
     struct ip_pcb *pcb=socket_ip_pcb(socket);
@@ -1517,6 +1569,8 @@ static int datagram_route(struct kernel_socket *socket,const ip_addr_t *remote,
     if(pcb->netif_idx)interface=netif_get_by_index(pcb->netif_idx);
     else if(multicast && socket->multicast_index)
         interface=netif_get_by_index(socket->multicast_index);
+    else if(IP_IS_V6(remote) && ip_addr_ismulticast(remote) && socket->ipv6_multicast_index)
+        interface=netif_get_by_index(socket->ipv6_multicast_index);
     else if(IP_IS_V4(remote) && ip4_addr_get_u32(ip_2_ip4(remote))==PP_HTONL(0xffffffffU)) {
         for(struct netif *n=netif_list;n;n=n->next)
             if(n->hwaddr_len && netif_is_up(n) && netif_is_link_up(n) &&
@@ -1532,6 +1586,25 @@ static int datagram_route(struct kernel_socket *socket,const ip_addr_t *remote,
         else local=ip_netif_get_local_ip(interface,remote);
     }
     if(!local)return -KERNEL_ENETUNREACH;
+    if(IP_IS_V6(remote)) {
+        const ip6_addr_t *dst=ip_2_ip6(remote),*src=ip_2_ip6(local);
+        if(ip6_addr_has_zone(dst) && !ip6_addr_test_zone(dst,interface))return -KERNEL_ENETUNREACH;
+        if(interface->hwaddr_len && (ip6_addr_isloopback(src) || ip6_addr_isloopback(dst)))
+            return -KERNEL_ENETUNREACH;
+        if(!ip6_addr_ismulticast(dst) && !ip6_addr_islinklocal(dst) &&
+           ip6_addr_isloopback(src) && !ip6_addr_isloopback(dst))
+            return -KERNEL_ENETUNREACH;
+        int valid=0;
+        for(unsigned i=0;i<LWIP_IPV6_NUM_ADDRESSES;i++)
+            if(ip6_addr_isvalid(netif_ip6_addr_state(interface,i)) &&
+               ip6_addr_zoneless_eq(src,netif_ip6_addr(interface,i)))valid=1;
+        if(!valid)return -KERNEL_ENETUNREACH;
+        if(!ip6_addr_ismulticast(dst) && !ip6_addr_has_scope(dst,IP6_UNKNOWN) &&
+           boaros_lwip_ip6_onlink(interface,dst)<0 && ip6_addr_isany(&interface->ip6_gateway) && !nd6_default_gateway(interface))
+            return -KERNEL_ENETUNREACH;
+    }
+    if(IP_IS_V6(remote) && ip6_addr_islinklocal(ip_2_ip6(remote)) &&
+        (!IP_IS_V6(local) || ip6_addr_isloopback(ip_2_ip6(local))))return -KERNEL_ENETUNREACH;
     if(IP_IS_V4(local) && !ip_addr_isany(local)) {
         if(ip_addr_ismulticast(local) || ip_2_ip4(local)->addr==PP_HTONL(0xffffffffU))return -KERNEL_EINVAL;
         /* An indexed IP_MULTICAST_IF may retain any requested address, but
@@ -1863,12 +1936,21 @@ static void packet_publish(struct kernel_socket *socket, struct socket_packet *p
     packet_publish_locked(socket,packet,charge);
 }
 
+static struct socket_packet *udp_packet_allocate(struct kernel_socket *socket)
+{
+    struct socket_packet *packet;
+    enum kernel_heap_status status = kernel_heap_allocate_zeroed(socket->heap,
+        1U, sizeof(*packet), (void **)&packet);
+    if (status == KERNEL_HEAP_STATUS_EMPTY) return NULL;
+    if (status != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    return packet;
+}
+
 static void udp_received(void *context, struct udp_pcb *pcb,
                          struct pbuf *payload, const ip_addr_t *peer,
                          u16_t port)
 {
     struct kernel_socket *socket = context;
-    struct socket_packet *packet = 0;
     (void)pcb;
     uint32_t charge = payload->tot_len ? payload->tot_len : 1U;
     /* 接收队列不能占尽共享协议堆：给下一条最大 UDP 和 TCP 控制报文留空间。 */
@@ -1877,14 +1959,11 @@ static void udp_received(void *context, struct udp_pcb *pcb,
         UDP_STATS_INC(udp.memerr);
         socket_pbuf_free(payload); return;
     }
-    enum kernel_heap_status status =
-        kernel_heap_allocate_zeroed(socket->heap, 1U, sizeof(*packet),
-                                    (void **)&packet);
-    if (status == KERNEL_HEAP_STATUS_EMPTY) {
+    struct socket_packet *packet = udp_packet_allocate(socket);
+    if (!packet) {
         socket_pbuf_free(payload);
         return;
     }
-    if (status != KERNEL_HEAP_STATUS_OK) __builtin_trap();
     packet->payload = payload;
     address_export(socket, peer, port, &packet->address);
     {
@@ -1897,6 +1976,44 @@ static void udp_received(void *context, struct udp_pcb *pcb,
     UDP_STATS_INC(udp.memerr);
     socket_pbuf_free(payload);
     kernel_heap_release(socket->heap,packet);
+}
+
+/* UDP multicast keeps one immutable pbuf including its UDP header. Each
+ * queue owns a reference, a separate logical end (BPF snap length), and offset.
+ * Publishing one recipient never mutates storage another CPU may be reading. */
+static int socket_udp_multicast_receive(struct udp_pcb *pcb,struct pbuf *p,struct netif *input,
+    const void *network,uint16_t network_length,uint16_t port)
+{
+    if(pcb->recv!=udp_received)return 0;
+    struct kernel_socket *socket=pcb->recv_arg;
+    int member=socket->ipv6_multicast_all;
+    for(struct socket_ipv6_member *m=socket->ipv6_members;!member && m;m=m->next)
+        if(m->active && m->index==netif_get_index(input) && ip6_addr_zoneless_eq(&m->group,ip6_current_dest_addr()))member=1;
+    if(!member)return 1;
+    struct socket_filter_packet view={p,network,network_length};
+    struct kernel_bpf_packet filter={.object=&view,.length=p->tot_len,.protocol=0x86dd,
+        .ifindex=netif_get_index(input),.ingress_ifindex=netif_get_index(input),.packet_type=2,
+        .hardware_type=input->hwaddr_len?1:772,.payload_offset=8,
+        .network_offset=network_length?-(int32_t)network_length:INT32_MIN,
+        .link_offset=INT32_MIN,.read=socket_filter_read};
+    uint32_t kept=socket_filter_run(socket,&filter);
+    if(!kept)return 1;
+    if(kept<8)kept=8;
+    if(kept>p->tot_len)kept=p->tot_len;
+    uint32_t charge=kept>8?kept-8:1;
+    if((network_udp_capacity && !network_udp_capacity(network_context)) ||
+       STATS_GET(mem.used)>MEM_SIZE-(65536U+4096U))return 1;
+    struct socket_packet *packet = udp_packet_allocate(socket);
+    if (!packet) return 1;
+    packet->length=kept;packet->consumed=8;pbuf_ref(p);packet->payload=p;
+    address_export(socket,ip_current_src_addr(),port,&packet->address);
+    {SOCKET_ENDPOINT(state,socket);
+      if(charge<=socket->rx_limit && socket->rx_bytes<=socket->rx_limit-charge) {
+        packet_publish_locked(socket,packet,charge);return 1;
+      }}
+    socket_pbuf_free(p);
+    kernel_heap_release(socket->heap,packet);
+    return 1;
 }
 
 /* Raw input precedes ICMP processing, which can strip headers and rewrite an
@@ -2095,14 +2212,21 @@ static err_t socket_tcp_accepted(void *context, struct tcp_pcb *pcb,
       child->send_timeout_ns=listener->send_timeout_ns; }
     child->listener = listener; child->pending_ready = 1;
     child->heap = listener->heap;
-    child->peercred=(struct kernel_socket_peercred){.uid=UINT32_MAX,.gid=UINT32_MAX};
+    child->peercred=(struct unix_credentials){.uid=UINT32_MAX,.gid=UINT32_MAX};
     child->family = listener->family;
     child->v6only = listener->v6only;
     child->rx_limit = listener->rx_limit;
     child->tx_limit = listener->tx_limit;
     child->reuseaddr = listener->reuseaddr;
     child->keepalive = listener->keepalive;
+    child->keep_idle = listener->keep_idle;
+    child->keep_intvl = listener->keep_intvl;
+    child->keep_cnt = listener->keep_cnt;
+    pcb->keep_idle = child->keep_idle;
+    pcb->keep_intvl = child->keep_intvl;
+    pcb->keep_cnt = child->keep_cnt;
     child->nodelay = listener->nodelay;
+    child->cork = listener->cork;
     child->broadcast=listener->broadcast;child->ipv4_ttl=listener->ipv4_ttl;
     child->multicast_ttl=listener->multicast_ttl;child->bound_device=pcb->netif_idx;
     child->multicast_index=listener->multicast_index;
@@ -2111,6 +2235,7 @@ static err_t socket_tcp_accepted(void *context, struct tcp_pcb *pcb,
     child->type = SOCKET_STREAM;
     child->tcp = pcb;
     if (child->nodelay) tcp_nagle_disable(pcb);
+    pcb->boaros_cork = child->cork;
     child->connected = 1U;
     address_export(child, &pcb->local_ip, pcb->local_port, &child->saved_local);
     address_export(child, &pcb->remote_ip, pcb->remote_port, &child->saved_peer);
@@ -2159,7 +2284,7 @@ static void unix_initialize(struct kernel_socket *socket,struct kernel_heap *hea
     socket->heap=heap;socket->type=(uint8_t)type;socket->family=KERNEL_SOCKET_AF_UNIX;
     socket->domain=KERNEL_SOCKET_DOMAIN_UNIX;socket->unix_references=1;
     {KERNEL_LOCK_SCOPE(gc);rights_acquire(&gc);socket->gc_next=unix_sockets;unix_sockets=socket;}
-    socket->rx_limit=socket->tx_limit=212992;socket->peercred=(struct kernel_socket_peercred){.uid=UINT32_MAX,.gid=UINT32_MAX};
+    socket->rx_limit=socket->tx_limit=212992;socket->peercred=(struct unix_credentials){.uid=UINT32_MAX,.gid=UINT32_MAX};
     kernel_wait_queue_init(&socket->wait);kernel_wait_queue_init(&socket->async_events);
 }
 
@@ -2192,10 +2317,10 @@ int kernel_socket_create(struct kernel_heap *heap, int family, int type, int pro
         socket->heap=heap;socket->type=(uint8_t)type;socket->family=(uint8_t)family;
         socket->domain=KERNEL_SOCKET_DOMAIN_NETLINK;socket->netlink_references=1;
         socket->rx_limit=socket->tx_limit=212992;
-        socket->peercred=(struct kernel_socket_peercred){.uid=UINT32_MAX,.gid=UINT32_MAX};
+        socket->peercred=(struct unix_credentials){.uid=UINT32_MAX,.gid=UINT32_MAX};
         kernel_wait_queue_init(&socket->wait);kernel_wait_queue_init(&socket->async_events);*owner=socket;return 0;
     }
-    socket->peercred=(struct kernel_socket_peercred){.uid=UINT32_MAX,.gid=UINT32_MAX};
+    socket->peercred=(struct unix_credentials){.uid=UINT32_MAX,.gid=UINT32_MAX};
     kernel_socket_protocol_enter(&old_status);
     kernel_socket_network_initialize();
     socket->heap = heap;
@@ -2205,6 +2330,7 @@ int kernel_socket_create(struct kernel_heap *heap, int family, int type, int pro
     socket->rx_limit = 65536U;
     socket->tx_limit = 65536U;
     socket->ipv4_ttl=64;socket->multicast_ttl=1;
+    socket->ipv6_multicast_hops=1;socket->ipv6_multicast_loop=1;socket->ipv6_multicast_all=1;
     kernel_wait_queue_init(&socket->wait);kernel_wait_queue_init(&socket->async_events);
     if(type==SOCKET_RAW) {
         socket->raw=raw_new_ip_type(IPADDR_TYPE_V4,(u8_t)protocol);
@@ -2218,6 +2344,9 @@ int kernel_socket_create(struct kernel_heap *heap, int family, int type, int pro
                                       IPADDR_TYPE_V4 : IPADDR_TYPE_ANY);
         if (socket->tcp != 0) {
             socket->tcp->ttl=64;
+            socket->keep_idle=socket->tcp->keep_idle;
+            socket->keep_intvl=socket->tcp->keep_intvl;
+            socket->keep_cnt=socket->tcp->keep_cnt;
             tcp_arg(socket->tcp, socket);
             tcp_err(socket->tcp, tcp_failed);
             tcp_recv(socket->tcp, tcp_data_received);
@@ -2246,7 +2375,8 @@ int kernel_socket_pair(struct kernel_heap *heap,int type,
     if(result)return result;
     result=kernel_socket_create(heap,KERNEL_SOCKET_AF_UNIX,type, 0,&b);
     if(result) {kernel_socket_destroy(a);return result;}
-    struct kernel_socket_peercred cred=unix_current_cred();
+    struct unix_credentials cred=unix_current_cred();
+    if(cred.pid)kernel_task_identity_retain(cred.pid);
     SOCKET_STATE(state);
     a->connected=b->connected=1;a->peercred=b->peercred=cred;
     unix_link_peer_locked(a,b);unix_link_peer_locked(b,a);
@@ -2353,6 +2483,36 @@ static __attribute__((noinline)) void unix_destroy(struct kernel_socket *socket)
     unix_put(socket);
 }
 
+/* Binding is control-plane only. Registry ownership never nests endpoint locks. */
+static struct kernel_socket *netlink_ports;
+static uint32_t netlink_next_port=0x80000000U;
+static int netlink_bind(struct kernel_socket *socket,uint32_t port,int automatic)
+{
+    kernel_pid_t pid=0;
+    if(!port && kernel_task_current())(void)kernel_task_user_tgid(kernel_task_current(),&pid);
+    uint32_t preferred=(uint32_t)pid;
+    SOCKET_STATE(state);
+    if(socket->netlink_port)return automatic || !port || socket->netlink_port==port?0:-KERNEL_EINVAL;
+    uint32_t selected=port?port:preferred;
+    for(;;) {
+        int used=!selected;
+        for(struct kernel_socket *p=netlink_ports;p;p=p->netlink_next)
+            if(p->netlink_port==selected) {used=1;break;}
+        if(!used)break;
+        if(port)return -KERNEL_EADDRINUSE;
+        selected=netlink_next_port++;
+        if(!netlink_next_port)netlink_next_port=0x80000000U;
+    }
+    socket->netlink_port=selected;socket->netlink_next=netlink_ports;netlink_ports=socket;
+    return 0;
+}
+static void netlink_unbind(struct kernel_socket *socket)
+{
+    SOCKET_STATE(state);
+    struct kernel_socket **p=&netlink_ports;
+    while(*p && *p!=socket)p=&(*p)->netlink_next;
+    if(*p)*p=socket->netlink_next;
+}
 static int netlink_put_locked(struct kernel_socket *socket)
 {
     if(!socket->netlink_references)__builtin_trap();
@@ -2374,13 +2534,15 @@ static void netlink_storage_free(struct kernel_socket *socket)
 }
 static void netlink_destroy(struct kernel_socket *socket)
 {
+    netlink_unbind(socket);
     SOCKET_ENDPOINT(state,socket);
     if(socket->destroying || socket->read_request || socket->active_writes)__builtin_trap();
     socket->destroying=1;
     struct socket_packet *packets=socket->packets_head;
     /* Pending registrations keep their own charges and storage references. */
-    uint64_t queued_memory=(uint64_t)(socket->rx_bytes/NETLINK_COOKIE_SIZE)*packet_charge(NETLINK_COOKIE_SIZE);
-    if(socket->rx_bytes%NETLINK_COOKIE_SIZE || socket->netlink_memory<queued_memory)__builtin_trap();
+    uint64_t queued_memory=0;
+    for(struct socket_packet *p=packets;p;p=p->next)queued_memory+=packet_charge(p->length);
+    if(socket->netlink_memory<queued_memory)__builtin_trap();
     socket->netlink_memory-=(uint32_t)queued_memory;
     socket->packets_head=socket->packets_tail=NULL;socket->rx_bytes=0;
     socket_state_release(&state);
@@ -2425,6 +2587,7 @@ void kernel_socket_destroy(struct kernel_socket *socket)
       work_remove_locked(socket_ready_queue(socket),socket);work_remove_locked(&pool_wait,socket);
       work_remove_locked(&nic_wait,socket);work_remove_locked(&receive_wait,socket); }
     write_retry_disarm(socket);
+    socket_ipv6_members_release(socket);
     retire_received(socket);
     if (!socket->inet_previous || *socket->inet_previous!=socket) __builtin_trap();
     *socket->inet_previous=socket->inet_next;
@@ -2450,6 +2613,7 @@ void kernel_socket_destroy(struct kernel_socket *socket)
     if (socket->raw != 0) {raw_recv(socket->raw,NULL,NULL);raw_remove(socket->raw);socket->raw=NULL;}
     if (socket->tcp != 0) {
         if (!socket->listening) {
+            boaros_lwip_tcp_push(socket->tcp);
             tcp_arg(socket->tcp, 0);
             tcp_err(socket->tcp, 0);
             tcp_recv(socket->tcp, 0);
@@ -2484,25 +2648,43 @@ void kernel_socket_destroy(struct kernel_socket *socket)
 int kernel_socket_bind(struct kernel_socket *socket,
                        const struct kernel_socket_address *address)
 {
-    if(socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK)return -KERNEL_EOPNOTSUPP;
+    if(socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK) {
+        if(!address || address->family!=KERNEL_SOCKET_AF_NETLINK)return -KERNEL_EINVAL;
+        uint32_t groups;__builtin_memcpy(&groups,address->bytes,4);
+        if(groups)return -KERNEL_EOPNOTSUPP;
+        return netlink_bind(socket,address->scope,0);
+    }
     if(socket->domain==KERNEL_SOCKET_DOMAIN_UNIX) {
         KERNEL_LOCK_SCOPE(control);unix_control_acquire(&control);return unix_bind(socket,address);
     }
     struct kernel_socket_protocol_scope scope; socket_protocol_enter(&scope,socket);
     ip_addr_t local;
     if (socket->domain != KERNEL_SOCKET_DOMAIN_INET) { kernel_socket_protocol_leave(&scope); return -KERNEL_EINVAL; }
-    int result = address_import(socket, address, &local, 1);
+    int result = address_import(socket, address, &local, SOCKET_ADDRESS_BIND);
     if (result != 0) { kernel_socket_protocol_leave(&scope); return result; }
+    if ((socket->udp != 0 && socket->udp->local_port != 0) ||
+        (socket->tcp != 0 && socket->tcp->local_port != 0)) { kernel_socket_protocol_leave(&scope); return -KERNEL_EINVAL; }
+    if (IP_IS_V6(&local) && ip6_addr_islinklocal(ip_2_ip6(&local))) {
+        /* Like IPv6 bind, an explicit address scope selects the bound device;
+         * connect checks conflicts, while sendto retains an existing device. */
+        SOCKET_ENDPOINT(state,socket);socket->bound_device=ip6_addr_zone(ip_2_ip6(&local));
+        socket_ip_pcb(socket)->netif_idx=socket->bound_device;
+    }
     int low_port_denied=!socket->raw && address->port && address->port<1024 &&
         !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_NET_BIND_SERVICE);
     if(socket->family==KERNEL_SOCKET_AF_INET6 && low_port_denied) {
         kernel_socket_protocol_leave(&scope);return -KERNEL_EACCES;
     }
     if (!ip_addr_isany(&local) &&
+        !(socket->type==SOCKET_DGRAM && IP_IS_V6(&local) && ip6_addr_ismulticast(ip_2_ip6(&local))) &&
         !(IP_IS_V4(&local) ? ip4_addr_isloopback(ip_2_ip4(&local)) : ip6_addr_isloopback(ip_2_ip6(&local)))) {
         int found = 0;
-        for (struct netif *n = netif_list; n; n = n->next)
+        for (struct netif *n = netif_list; n; n = n->next) {
             if (IP_IS_V4(&local) && ip4_addr_eq(ip_2_ip4(&local), netif_ip4_addr(n))) found = 1;
+            if (IP_IS_V6(&local)) for (unsigned i=0;i<LWIP_IPV6_NUM_ADDRESSES;i++)
+                if (ip6_addr_isvalid(netif_ip6_addr_state(n,i)) &&
+                    ip6_addr_eq(ip_2_ip6(&local),netif_ip6_addr(n,i))) found=1;
+        }
         if (!found) { kernel_socket_protocol_leave(&scope); return -KERNEL_EADDRNOTAVAIL; }
     }
 
@@ -2515,8 +2697,6 @@ int kernel_socket_bind(struct kernel_socket *socket,
         if(!error) {socket->explicit_bind=1;ip_addr_copy(socket->udp_bind_ip,local);}
         kernel_socket_protocol_leave(&scope);return lwip_error(error);
     }
-    if ((socket->udp != 0 && socket->udp->local_port != 0) ||
-        (socket->tcp != 0 && socket->tcp->local_port != 0)) { kernel_socket_protocol_leave(&scope); return -KERNEL_EINVAL; }
     result = port_conflict(socket, &local, address->port, 0);
     if (result != 0) { kernel_socket_protocol_leave(&scope); return result; }
     err_t error = socket->type == SOCKET_DGRAM
@@ -2537,7 +2717,8 @@ int kernel_socket_getname(struct kernel_socket *socket,
 {
     if(socket && socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK) {
         if(!address)return -KERNEL_EINVAL;
-        *address=(struct kernel_socket_address){.family=KERNEL_SOCKET_AF_NETLINK};return 0;
+        SOCKET_STATE(state);
+        *address=(struct kernel_socket_address){.family=KERNEL_SOCKET_AF_NETLINK,.scope=socket->netlink_port};return 0;
     }
     if(socket && socket->domain==KERNEL_SOCKET_DOMAIN_UNIX) {
         SOCKET_STATE(state);unix_export_locked(socket->unix_name,address);return 0;
@@ -2652,7 +2833,8 @@ static __attribute__((noinline)) int unix_connect(struct kernel_socket *socket,c
     enum kernel_heap_status status=kernel_heap_allocate_zeroed(socket->heap,1,sizeof(*entry),(void **)&entry);
     if(status!=KERNEL_HEAP_STATUS_OK) {unix_put(target);kernel_socket_destroy(child);return -KERNEL_ENOMEM;}
     uint64_t deadline=unix_deadline(socket);
-    struct kernel_socket_peercred cred=unix_current_cred();
+    struct unix_credentials cred __attribute__((cleanup(unix_cred_release)))=unix_current_cred();
+    struct unix_credentials retired __attribute__((cleanup(unix_cred_release)))={0};
     for(;;) {
         KERNEL_LOCK_SCOPE(gc);rights_acquire(&gc);
         SOCKET_STATE(state);
@@ -2669,7 +2851,9 @@ static __attribute__((noinline)) int unix_connect(struct kernel_socket *socket,c
             child->unix_name=target->unix_name;unix_name_get_locked(child->unix_name);
             child->unix_path=child->unix_name->path;
             child->passcred=target->passcred;
-            child->peercred=cred;socket->peercred=target->peercred;
+            child->peercred=cred;cred.pid=NULL;
+            retired=socket->peercred;socket->peercred=target->peercred;
+            if(socket->peercred.pid)kernel_task_identity_retain(socket->peercred.pid);
             child->connected=socket->connected=1;socket->peer_closed=0;
             unix_link_peer_locked(socket,child);unix_link_peer_locked(child,socket);
             child->listener=target;child->pending_ready=1;entry->child=child;
@@ -2688,12 +2872,13 @@ int kernel_socket_listen(struct kernel_socket *socket, int backlog)
 {
     if(socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK)return -KERNEL_EOPNOTSUPP;
     if(socket->domain==KERNEL_SOCKET_DOMAIN_UNIX) {
-        struct kernel_socket_peercred cred=unix_current_cred();
+        struct unix_credentials cred __attribute__((cleanup(unix_cred_release)))=unix_current_cred();
+        struct unix_credentials retired __attribute__((cleanup(unix_cred_release)))={0};
         SOCKET_STATE(state);
         if(!socket_connection_oriented(socket))return -KERNEL_EOPNOTSUPP;
         if(!socket->unix_name || socket->connected)return -KERNEL_EINVAL;
         socket->listening=1;socket->unix_backlog=(unsigned)backlog>4096U?4096U:(unsigned)backlog;
-        socket->peercred=cred;wake_socket(socket);return 0;
+        retired=socket->peercred;socket->peercred=cred;cred.pid=NULL;wake_socket(socket);return 0;
     }
     struct kernel_socket_protocol_scope scope; socket_protocol_enter(&scope,socket);
     err_t error = ERR_OK;
@@ -2730,9 +2915,9 @@ int kernel_socket_connect(struct kernel_socket *socket,
             {SOCKET_ENDPOINT(state,socket);socket->connected=0;}
             kernel_socket_protocol_leave(&old_status);return 0;
         }
-        int result=address_import(socket,address,&remote,0);
+        int result=address_import(socket,address,&remote,SOCKET_ADDRESS_CONNECT);
         struct netif *route=NULL;const ip_addr_t *source=NULL;
-        if(!result)result=datagram_route(socket,&remote,&route,&source);
+        if(!result)result=socket_ip_route(socket,&remote,&route,&source);
         if(result) {kernel_socket_protocol_leave(&old_status);return result;}
         error=raw_connect(socket->raw,&remote);
         if(!error) {
@@ -2755,10 +2940,10 @@ int kernel_socket_connect(struct kernel_socket *socket,
             if (!socket->explicit_port) boaros_lwip_udp_release_port(socket->udp);
             error = ERR_OK;
         } else {
-            int result = address_import(socket, address, &remote, 0);
+            int result = address_import(socket, address, &remote, SOCKET_ADDRESS_CONNECT);
             if (result != 0) { kernel_socket_protocol_leave(&old_status); return result; }
             struct netif *route=NULL;const ip_addr_t *source=NULL;
-            result=datagram_route(socket,&remote,&route,&source);
+            result=socket_ip_route(socket,&remote,&route,&source);
             if(result) {kernel_socket_protocol_leave(&old_status);return result;}
             error = udp_connect(socket->udp, &remote, address->port);
             if (error == ERR_OK) {
@@ -2776,8 +2961,13 @@ int kernel_socket_connect(struct kernel_socket *socket,
     if (socket->listening) { int failure = (-KERNEL_EINVAL); kernel_socket_protocol_leave(&old_status); return failure; }
     if (socket->connected) { int failure = (-KERNEL_EISCONN); kernel_socket_protocol_leave(&old_status); return failure; }
     if (socket->connecting) { int failure = (-KERNEL_EALREADY); kernel_socket_protocol_leave(&old_status); return failure; }
-    int result = address_import(socket, address, &remote, 0);
+    int result = address_import(socket, address, &remote, SOCKET_ADDRESS_CONNECT);
     if (result != 0) { int failure = (result); kernel_socket_protocol_leave(&old_status); return failure; }
+    if (IP_IS_V6(&remote)) {
+        struct netif *route=NULL;const ip_addr_t *source=NULL;
+        result=socket_ip_route(socket,&remote,&route,&source);
+        if (result) {kernel_socket_protocol_leave(&old_status);return result;}
+    }
     socket->tcp->ttl=IP_IS_V4(&remote)?socket->ipv4_ttl:64;
     error = tcp_connect(socket->tcp, &remote, address->port, tcp_connected);
     if(error==ERR_OK) {KERNEL_IRQ_LOCK_SCOPE(state,socket_endpoint_lock(socket));socket->connecting=1;}
@@ -2855,8 +3045,10 @@ int kernel_socket_accept_check(struct kernel_socket *socket)
     return socket->listening ? 0 : -KERNEL_EINVAL;
 }
 
-int kernel_socket_wait_ready(struct kernel_socket *socket, uint32_t events,
-    uint64_t target_ns, uint32_t flags)
+static int socket_receive_empty(const struct kernel_socket *, int);
+
+static int socket_wait_ready(struct kernel_socket *socket, uint32_t events,
+    uint64_t target_ns, uint32_t flags, struct kernel_socket_read_request *request)
 {
     uint64_t deadline = 0;
     int timed = target_ns == 0;
@@ -2865,6 +3057,14 @@ int kernel_socket_wait_ready(struct kernel_socket *socket, uint32_t events,
         int ready = events == KERNEL_POLLIN && !socket->listening
             ? kernel_socket_receive_ready(socket)
             : (kernel_socket_poll(socket, 0) & (events | KERNEL_POLLERR | KERNEL_POLLHUP)) != 0;
+        if (request && request->peek_offset) {
+            /* Already peeked bytes are still POLLIN, but cannot satisfy this
+             * continuation. A consuming reader invalidates the peek cursor. */
+            ready = !socket->read_request &&
+                (socket->receive_sequence != request->peek_sequence ||
+                 socket->rx_bytes > request->peek_offset ||
+                 socket_receive_empty(socket, 0) != -KERNEL_EAGAIN);
+        }
         if (ready) return (events & KERNEL_POLLOUT) ? kernel_socket_unix_wait_error(socket) : 0;
         if (flags & KERNEL_SOCKET_MSG_DONTWAIT) return -KERNEL_EAGAIN;
         if (!timed) {
@@ -2886,11 +3086,23 @@ int kernel_socket_wait_ready(struct kernel_socket *socket, uint32_t events,
         if (reason == KERNEL_WAIT_TIMEOUT && target_ns && kernel_time_monotonic_ns() >= target_ns)
             return -KERNEL_EAGAIN;
         if (reason == KERNEL_WAIT_SIGNALLED) {
-            if (target_ns) return -KERNEL_EINTR;
+            if (target_ns || (request && request->progressed)) return -KERNEL_EINTR;
             kernel_signal_note_syscall_restart(kernel_task_current());
             return -KERNEL_ERESTARTSYS;
         }
     }
+}
+
+int kernel_socket_wait_ready(struct kernel_socket *socket, uint32_t events,
+    uint64_t target_ns, uint32_t flags)
+{
+    return socket_wait_ready(socket, events, target_ns, flags, NULL);
+}
+
+int kernel_socket_wait_read(struct kernel_socket *socket,
+    struct kernel_socket_read_request *request, uint64_t target_ns, uint32_t flags)
+{
+    return socket_wait_ready(socket, KERNEL_POLLIN, target_ns, flags, request);
 }
 
 /* 无队首数据时的状态；查询不消费错误，reservation入口负责交付。 */
@@ -2923,7 +3135,7 @@ int kernel_socket_receive_ready(struct kernel_socket *socket)
 
 static uint32_t packet_available(const struct socket_packet *packet)
 {
-    return packet->payload ? packet->payload->tot_len - packet->consumed : packet->length - packet->consumed;
+    return (packet->payload && !packet->length?packet->payload->tot_len:packet->length)-packet->consumed;
 }
 
 int kernel_socket_reserve_read(struct kernel_socket *socket,
@@ -2954,13 +3166,18 @@ retry:
         socket_state_release(&old_status);
         return -KERNEL_EAGAIN;
     }
+    int continuing_peek = request->waitall && message &&
+        (message->flags & KERNEL_SOCKET_MSG_PEEK);
+    if (!continuing_peek || socket->receive_sequence != request->peek_sequence)
+        request->peek_offset = 0;
+    request->peek_sequence = socket->receive_sequence;
     packet = socket->packets_head;
-    if (packet == 0) {
+    if (packet == 0 || (continuing_peek && request->peek_offset == socket->rx_bytes)) {
         if(message && socket->domain==KERNEL_SOCKET_DOMAIN_UNIX && socket->type==SOCKET_STREAM && socket->connected)
             message->receive_state=KERNEL_SOCKET_RECEIVE_STREAM_EMPTY;
         int result = socket_receive_empty(socket, nonblocking);
         if(message && !result && socket->type==SOCKET_SEQPACKET)message->receive_state=KERNEL_SOCKET_RECEIVE_EOF;
-        if (socket->pending_error) socket->pending_error = 0;
+        if (socket->pending_error && !request->progressed) socket->pending_error = 0;
         socket_state_release(&old_status);
         return result;
     }
@@ -2971,6 +3188,7 @@ retry:
     }
     if (capacity > (uint32_t)__INT_MAX__) capacity = __INT_MAX__;
     uint32_t available = kernel_socket_preserves_messages(socket) ? packet_available(packet) : socket->rx_bytes;
+    if (continuing_peek) available -= request->peek_offset;
     struct socket_packet *control_packet=packet;
     uint32_t control_offset=0;
     if(socket->domain==KERNEL_SOCKET_DOMAIN_UNIX && socket->type==SOCKET_STREAM) {
@@ -3044,8 +3262,7 @@ void kernel_socket_read_info(const struct kernel_socket_read_request *request,
             else *address=(struct kernel_socket_address){0};
         } else *address=packet->address;
     }
-    if (length != 0) *length = packet->payload != 0 ? (uint32_t)(packet->payload->tot_len - packet->consumed)
-                                                  : packet->length - packet->consumed;
+    if (length != 0) *length = packet_available(packet);
 }
 
 void kernel_socket_copy_read(const struct kernel_socket_read_request *request,
@@ -3055,6 +3272,7 @@ void kernel_socket_copy_read(const struct kernel_socket_read_request *request,
     if (request->socket == 0 || request->socket->read_request != request ||
         offset > request->bytes || length > request->bytes - offset)
         __builtin_trap();
+    offset += request->peek_offset;
     unsigned char *destination = buffer;
     while (length) {
         if (!packet) __builtin_trap();
@@ -3075,17 +3293,21 @@ int kernel_socket_read_user(struct kernel_socket_read_request *request,
     const struct socket_packet *packet = request->packet;
     if (!request->socket || request->socket->read_request != request || !packet)
         __builtin_trap();
-    uint32_t remaining = request->bytes;
+    uint32_t remaining = request->bytes, skip = request->peek_offset;
+    while (skip && packet && skip >= packet_available(packet)) {
+        skip -= packet_available(packet); packet = packet->next;
+    }
     struct kernel_uaccess_write_cursor pages = {0};
     int result = 0;
     request->completed_bytes = 0;
     /* bytes固定本次借用的队列前缀；后来追加的packet不扩充本次用户复制。 */
     while (remaining) {
         if (!packet) __builtin_trap();
-        uint32_t take = packet_available(packet);
+        uint32_t take = packet_available(packet) - skip;
         if (take > remaining) take = remaining;
         const struct pbuf *part = packet->payload;
-        uint32_t offset = packet->consumed, pending = take;
+        uint32_t offset = packet->consumed + skip, pending = take;
+        skip = 0;
         while (pending) {
             const void *source;
             size_t length = pending, copied = 0;
@@ -3167,6 +3389,7 @@ uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request, i
     if (partial) packet->consumed += partial;
     if (socket->rx_bytes < charge) __builtin_trap();
     socket->rx_bytes -= charge;
+    if (kernel_socket_is_tcp(socket)) socket->receive_sequence += charge;
     if(!peek && request->datagram && socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK) {
         uint32_t memory=packet_charge(retired->length);
         if(socket->netlink_memory<memory)__builtin_trap();
@@ -3208,6 +3431,10 @@ uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request, i
     request->socket = 0;
     wake_socket(socket);
     uint32_t delivered = user_fault && request->datagram ? 0 : bytes;
+    if (request->waitall && delivered) {
+        request->progressed = 1;
+        if (peek) request->peek_offset += delivered;
+    }
     socket_state_release(&scope);
     /* STREAM在载荷actor失败前已经捕获凭据；零字节recv也可接收rights。 */
     if(received && (!message || (!unix_stream &&
@@ -3306,6 +3533,7 @@ static void socket_write_end(struct kernel_socket_write_request *request)
     socket_state_release(&state);
     if(release)unix_storage_free(destination);
 }
+static void socket_tcp_output(struct tcp_pcb *pcb);
 static void tcp_flush_output(struct kernel_socket *socket);
 
 #if BOAROS_USER_SMP
@@ -3587,7 +3815,7 @@ static int datagram_prepare_payload(struct kernel_socket_write_request *request)
     ip_addr_t remote;
     if(request->destination) {
         int error;
-        { KERNEL_IRQ_LOCK_SCOPE(state,socket_endpoint_lock(socket));error=address_import(socket,request->destination,&remote,0); }
+        { KERNEL_IRQ_LOCK_SCOPE(state,socket_endpoint_lock(socket));error=address_import(socket,request->destination,&remote,SOCKET_ADDRESS_SEND); }
         if(error)return error;
         /* Hold the admitted address independently of later socket option
          * changes and of the syscall's temporary name snapshot. */
@@ -3611,7 +3839,16 @@ int kernel_socket_packet_prepare(struct kernel_socket_write_request *request,
 {
     if(!request || !pin_owner || !*pin_owner)__builtin_trap();
     struct kernel_socket *socket=kernel_open_file_socket(*pin_owner);
-    if(socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK)return -KERNEL_EOPNOTSUPP;
+    if(socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK) {
+        if(destination) {
+            uint32_t groups;__builtin_memcpy(&groups,destination->bytes,4);
+            if(destination->family!=KERNEL_SOCKET_AF_NETLINK)return -KERNEL_EINVAL;
+            if(destination->scope || groups)return -KERNEL_EPERM;
+        }
+        if(count>4096)return -KERNEL_EMSGSIZE;
+        if(message && (message->control || message->credentials))return -KERNEL_EINVAL;
+        int error=netlink_bind(socket,0,1);if(error)return error;
+    }
     struct kernel_socket_control **control=message?&message->control:&request->automatic_control;
     int result=0,credentials=0;
     int hold_unix_peer=socket->domain==KERNEL_SOCKET_DOMAIN_UNIX &&
@@ -3651,6 +3888,9 @@ int kernel_socket_packet_prepare(struct kernel_socket_write_request *request,
                 request->inet_destination=inet_destination;
                 request->destination=&request->inet_destination;
             }
+            request->payload_size=count;request->flags=flags;
+        } else if(socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK) {
+            socket_write_begin(request,pin_owner,0);
             request->payload_size=count;request->flags=flags;
         } else if(hold_unix_peer) {
             /* Connected admission, peer borrowing and quota share this state. */
@@ -3729,6 +3969,55 @@ static __attribute__((noinline)) int socket_finish_packet(
     return result;
 }
 
+#define ROUTE_SNAPSHOT_MAX 16U
+#define ROUTE_RESPONSE_MAX 16384U
+static int route_snapshot(struct kernel_socket_interface *,size_t *);
+static int netlink_send(struct kernel_socket_write_request *request)
+{
+    struct kernel_socket *socket=request->socket;
+    if(request->payload_size<sizeof(struct route_header))return (int)request->payload_size;
+    size_t count=0;
+    int result;
+    struct socket_packet *packet=NULL;
+    const size_t snapshot_offset=(sizeof(*packet)+ROUTE_RESPONSE_MAX+
+        _Alignof(struct kernel_socket_interface)-1)&~(size_t)(_Alignof(struct kernel_socket_interface)-1);
+    KERNEL_NO_RECLAIM_IO;
+    enum kernel_heap_status status=kernel_heap_allocate_zeroed(socket->heap,1,
+        snapshot_offset+sizeof(struct kernel_socket_interface)*ROUTE_SNAPSHOT_MAX,(void **)&packet);
+    if(status!=KERNEL_HEAP_STATUS_OK) {
+        if(status!=KERNEL_HEAP_STATUS_EMPTY)__builtin_trap();
+        return -KERNEL_ENOMEM;
+    }
+    struct kernel_socket_interface *interfaces=(void *)((unsigned char *)packet+snapshot_offset);
+    result=route_snapshot(interfaces,&count);
+    if(result){kernel_heap_release(socket->heap,packet);return result;}
+    struct route_output out={.data=packet->data,.capacity=ROUTE_RESPONSE_MAX,.port=socket->netlink_port};
+    result=route_encode(&out,((struct socket_packet *)request->packet)->data,request->payload_size,interfaces,count);
+    if(!result && out.used) {
+        /* Queue only exact-sized storage: quota tracks the allocation, not
+         * a small payload retained in the maximum-size encoding workspace. */
+        struct socket_packet *exact=NULL;
+        status=kernel_heap_allocate_zeroed(socket->heap,1,sizeof(*exact)+out.used,(void **)&exact);
+        if(status!=KERNEL_HEAP_STATUS_OK) {
+            if(status!=KERNEL_HEAP_STATUS_EMPTY)__builtin_trap();
+            kernel_heap_release(socket->heap,packet);return -KERNEL_ENOMEM;
+        }
+        __builtin_memcpy(exact->data,packet->data,out.used);
+        kernel_heap_release(socket->heap,packet);packet=exact;
+        packet->length=(uint32_t)out.used;
+        packet->address.family=KERNEL_SOCKET_AF_NETLINK;
+        uint32_t charge=packet_charge(packet->length);
+        SOCKET_ENDPOINT(state,socket);
+        if(charge>socket->rx_limit || socket->netlink_memory>socket->rx_limit-charge)result=-KERNEL_ENOBUFS;
+        else {
+            socket->netlink_memory+=charge;
+            packet_publish_locked(socket,packet,packet->length);packet=NULL;
+        }
+    }
+    if(packet)kernel_heap_release(socket->heap,packet);
+    return result?result:(int)request->payload_size;
+}
+
 int kernel_socket_packet_write(struct kernel_socket_write_request *request,
     struct kernel_mm *mm,struct kernel_uaccess_iov_cursor *cursor,
     const void *kernel_buffer,int *user_fault,struct kernel_socket_message *message)
@@ -3757,6 +4046,9 @@ int kernel_socket_packet_write(struct kernel_socket_write_request *request,
     }
     if(request->socket->domain==KERNEL_SOCKET_DOMAIN_INET) {
         result=protocol_request(request,SOCKET_PROTOCOL_DATAGRAM_SEND);goto out;
+    }
+    if(request->socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK) {
+        result=netlink_send(request);goto out;
     }
     result=socket_finish_packet(request,(uint32_t)count,control);
     if(result<0)goto out;
@@ -3889,7 +4181,7 @@ static void tcp_publish_capacity_locked(struct kernel_socket *socket)
             boaros_lwip_tcp_detached_mss(socket->tcp):0,__ATOMIC_RELAXED);
 #endif
 }
-static void socket_tcp_output(struct tcp_pcb *pcb)
+static void socket_tcp_output_mode(struct tcp_pcb *pcb, u8_t more)
 {
     struct kernel_socket *socket=pcb->errf==tcp_failed?pcb->callback_arg:NULL;
     unsigned *blocked=&nic_blocked;
@@ -3898,8 +4190,11 @@ static void socket_tcp_output(struct tcp_pcb *pcb)
     if (owner) blocked=&owner->nic_blocked;
 #endif
     *blocked=0;
-    err_t output = tcp_output(pcb);
+    unsigned was_corked = pcb->boaros_cork_pending;
+    err_t output = boaros_lwip_tcp_output_more(pcb, more);
     if (!socket) return;
+    /* A direct caller may have armed a deadline while the worker was asleep. */
+    if (!was_corked && pcb->boaros_cork_pending) socket_schedule(socket, 0);
     if (pcb->state==TIME_WAIT) { retire_timewait(socket); return; }
     if (output == ERR_MEM) {
         if (*blocked) {
@@ -3910,10 +4205,14 @@ static void socket_tcp_output(struct tcp_pcb *pcb)
     }
 }
 
+/* ACK/input/timer output must not inherit an application's last MSG_MORE. */
+static void socket_tcp_output(struct tcp_pcb *pcb)
+{ socket_tcp_output_mode(pcb, 0); }
+
 static void tcp_flush_output(struct kernel_socket *socket)
 {
     if (socket->tcp && (socket->tcp->unsent || (socket->tcp->flags&TF_ACK_NOW)))
-        socket_tcp_output(socket->tcp);
+        socket_tcp_output_mode(socket->tcp, socket->tcp->boaros_output_more);
 }
 
 void kernel_socket_stream_begin(struct kernel_socket_write_request *request,
@@ -3936,7 +4235,8 @@ int kernel_socket_stream_reserve(struct kernel_socket_write_request *request,
             /* 其他调用者尚未COPY的预约不属于协议积压，运行CPU0不能归还它。
              * 已接纳的deferred前缀和真实协议阻塞仍沿原输出路径推进。 */
             if (!request->socket->tx_budget || (request->progressed & SOCKET_WRITE_DEFERRED))
-                schedule_output=1;
+                schedule_output=SOCKET_WORK_OUTPUT |
+                    (request->progressed ? SOCKET_WORK_PUSH : 0);
             request->progressed &= (uint8_t)~SOCKET_WRITE_DEFERRED;
             error = -KERNEL_EAGAIN; COST_ADD(STREAM_ADMIT_BLOCKED, 1);
         }
@@ -3949,7 +4249,7 @@ int kernel_socket_stream_reserve(struct kernel_socket_write_request *request,
         }
     }
     kernel_irq_lock_release(&irq);
-    if (schedule_output) socket_schedule(request->socket,SOCKET_WORK_OUTPUT);
+    if (schedule_output) socket_schedule(request->socket,schedule_output);
     return error ? error : (int)size;
 }
 void kernel_socket_stream_cancel(struct kernel_socket_write_request *request)
@@ -4023,7 +4323,7 @@ static int stream_copy_owned(struct kernel_socket_write_request *request,
              * segments and publishes only the prefix it could prepare. */
             u16_t accepted = 0;
             u8_t write_flags = TCP_WRITE_FLAG_COPY;
-            if ((flags & KERNEL_SOCKET_IO_MORE) || length < prepared)
+            if ((flags & (KERNEL_SOCKET_IO_MORE | KERNEL_SOCKET_MSG_MORE)) || length < prepared)
                 write_flags |= TCP_WRITE_FLAG_MORE;
             __atomic_fetch_add(&socket_statistics.tcp_write_calls,1,__ATOMIC_RELAXED);
             err_t error;
@@ -4044,12 +4344,18 @@ static int stream_copy_owned(struct kernel_socket_write_request *request,
                 __atomic_fetch_add(&socket_statistics.tcp_written_bytes,accepted,__ATOMIC_RELAXED);
                 write_retry_disarm(socket);
                 total = accepted;
+                socket->tcp->boaros_output_more = !!(flags & KERNEL_SOCKET_MSG_MORE);
+                if (accepted < prepared) {
+                    boaros_lwip_tcp_push(socket->tcp);
+                    *flush = 1;
+                }
             }
             if (error == ERR_MEM) {
                 /* Pool exhaustion still suppresses POLLOUT until release. */
                 write_retry_arm(socket);
                 socket_pool_wait(socket);
                 result = -KERNEL_EAGAIN; *flush = 1;
+                if (total || request->progressed) boaros_lwip_tcp_push(socket->tcp);
             } else result = error==ERR_WOULDBLOCK?-KERNEL_EAGAIN:lwip_error(error);
         }
     }
@@ -4064,6 +4370,7 @@ static int stream_copy_owned(struct kernel_socket_write_request *request,
         } else *flush = 1;
     }
     if (result == -KERNEL_EAGAIN) {
+        if (request->progressed && socket->tcp) boaros_lwip_tcp_push(socket->tcp);
         *flush = 1;
         request->progressed &= (uint8_t)~SOCKET_WRITE_DEFERRED;
         COST_ADD(STREAM_PROTOCOL_BLOCKED, 1);
@@ -4134,12 +4441,19 @@ static int execute_protocol_request(struct kernel_socket_write_request *request)
         }
         if(!request->destination)ip_addr_copy(remote,socket_ip_pcb(socket)->remote_ip);
         struct netif *route=NULL;const ip_addr_t *source=NULL;
-        int failure=datagram_route(socket,&remote,&route,&source);
+        int failure=socket_ip_route(socket,&remote,&route,&source);
         err_t error=ERR_OK;
+        if (!failure && IP_IS_V6(&remote) && route->mtu &&
+            (request->payload_size+48U>nd6_get_destination_mtu(ip_2_ip6(&remote),route)))
+            failure=-KERNEL_EMSGSIZE;
         if(!failure) {
             struct ip_pcb *pcb=socket_ip_pcb(socket);
             pcb->ttl=IP_IS_V4(&remote)?socket->ipv4_ttl:64;
-            if(socket->udp)udp_set_multicast_ttl(socket->udp,IP_IS_V4(&remote)?socket->multicast_ttl:1);
+            if(socket->udp) {
+                udp_set_multicast_ttl(socket->udp,IP_IS_V4(&remote)?socket->multicast_ttl:socket->ipv6_multicast_hops);
+                if(IP_IS_V6(&remote) && socket->ipv6_multicast_loop)socket->udp->flags|=UDP_FLAGS_MULTICAST_LOOP;
+                else socket->udp->flags&=(uint8_t)~UDP_FLAGS_MULTICAST_LOOP;
+            }
             if(IP_IS_V4(&remote))payload->flags|=PBUF_FLAG_IP4_LOCAL_DF;
             error=socket->raw?raw_sendto_if_src(socket->raw,payload,&remote,route,source):
                 udp_sendto_if_src(socket->udp,payload,&remote,request->destination?
@@ -4169,7 +4483,9 @@ static int protocol_request(struct kernel_socket_write_request *request,enum soc
             int admit;
             { KERNEL_IRQ_LOCK_SCOPE(state,&socket_state_lock);admit=network_work_queue && !network_stopping &&
                 !tcp_owner_stopping(owner) && tcp_socket_cpu(request->socket)==cpu &&
-                !request->socket->writes_head; }
+                !request->socket->writes_head &&
+                !((request->flags & KERNEL_SOCKET_MSG_MORE) &&
+                  (request->socket->work_flags & SOCKET_WORK_OUTPUT)); }
             if (admit) {
                 int result;
                 if (operation==SOCKET_PROTOCOL_STREAM && kernel_cpu_current()->logical_id!=cpu) {
@@ -4202,7 +4518,9 @@ static int protocol_request(struct kernel_socket_write_request *request,enum soc
             /* 已排队的同流写入不能被越过。COPY 不进入网卡或输入路径；
              * 仅把需要的输出交给原 worker，发送者无须等它返还源码页。 */
             { KERNEL_IRQ_LOCK_SCOPE(state,&socket_state_lock);admit=network_work_queue && !network_stopping &&
-                                        !request->socket->writes_head; }
+                                        !request->socket->writes_head &&
+                !((request->flags & KERNEL_SOCKET_MSG_MORE) &&
+                  (request->socket->work_flags & SOCKET_WORK_OUTPUT)); }
             if (admit) {
                 stream_commit_owned(&request,1,1);
                 request->segments=0;
@@ -4221,6 +4539,18 @@ static int protocol_request(struct kernel_socket_write_request *request,enum soc
 #endif
         int result;
         result=network_is_stopping() && operation<SOCKET_PROTOCOL_DISPOSE?-KERNEL_EIO:0;
+        if (!result && operation==SOCKET_PROTOCOL_STREAM &&
+            (request->flags & KERNEL_SOCKET_MSG_MORE)) {
+            /* A remote COPY can have returned before CPU0 emits it. Complete
+             * that older output decision before installing this send's hint. */
+            unsigned pending;
+            { SOCKET_STATE(state);
+              pending=request->socket->work_flags & (SOCKET_WORK_OUTPUT|SOCKET_WORK_PUSH);
+              request->socket->work_flags &= ~pending; }
+            if ((pending & SOCKET_WORK_PUSH) && request->socket->tcp)
+                boaros_lwip_tcp_push(request->socket->tcp);
+            if (pending & SOCKET_WORK_OUTPUT) tcp_flush_output(request->socket);
+        }
         if(!result)result=execute_protocol_request(request);
         request->segments=0;
         if(result>=0 && operation!=SOCKET_PROTOCOL_DATAGRAM_PREPARE && operation!=SOCKET_PROTOCOL_DISPOSE &&
@@ -4350,6 +4680,7 @@ int kernel_socket_shutdown(struct kernel_socket *socket,int how)
     wake_socket(socket);if(socket->peer)wake_socket(socket->peer);
     socket_state_release(&state);
     if(close_tx && socket->tcp && socket->connected && !socket->listening) {
+        boaros_lwip_tcp_push(socket->tcp);
         err_t error=tcp_shutdown(socket->tcp,0,1);
         if(error!=ERR_OK)result=lwip_error(error);
     }
@@ -4360,6 +4691,26 @@ int kernel_socket_shutdown(struct kernel_socket *socket,int how)
 int kernel_socket_set_option(struct kernel_socket *socket,
                              enum kernel_socket_option option, int value)
 {
+    if (option==KERNEL_SOCKET_KEEPIDLE || option==KERNEL_SOCKET_KEEPINTVL ||
+        option==KERNEL_SOCKET_KEEPCNT) {
+        if (!kernel_socket_is_tcp(socket)) return -KERNEL_ENOPROTOOPT;
+        if (value<1 || value>(option==KERNEL_SOCKET_KEEPCNT?127:32767)) return -KERNEL_EINVAL;
+        struct kernel_socket_protocol_scope protocol;socket_protocol_enter(&protocol,socket);
+        uint32_t converted=option==KERNEL_SOCKET_KEEPCNT?(uint32_t)value:(uint32_t)value*1000U;
+        /* Listen PCBs are smaller than active PCBs. Retain policy on the endpoint
+         * and install it on accepted children, never access an active-only field. */
+        uint32_t *policy=option==KERNEL_SOCKET_KEEPIDLE?&socket->keep_idle:
+            option==KERNEL_SOCKET_KEEPINTVL?&socket->keep_intvl:&socket->keep_cnt;
+        { SOCKET_ENDPOINT(state,socket); *policy=converted; }
+        if (socket->tcp && !socket->listening) {
+            if(option==KERNEL_SOCKET_KEEPIDLE)socket->tcp->keep_idle=converted;
+            else if(option==KERNEL_SOCKET_KEEPINTVL)socket->tcp->keep_intvl=converted;
+            else socket->tcp->keep_cnt=converted;
+        }
+        /* lwIP checks elapsed idle time at its existing slow timer; no new
+         * per-socket timer/worker, and no restart of the last-activity clock. */
+        kernel_socket_protocol_leave(&protocol);return 0;
+    }
     if(option==KERNEL_SOCKET_PASSCRED) {SOCKET_ENDPOINT(state,socket);socket->passcred=value!=0;return 0;}
     if (option==KERNEL_SOCKET_SNDBUF || option==KERNEL_SOCKET_RCVBUF) {
         struct kernel_socket_protocol_scope protocol;
@@ -4410,6 +4761,18 @@ int kernel_socket_set_option(struct kernel_socket *socket,
         {SOCKET_ENDPOINT(state,socket);socket->ipv4_ttl=(uint8_t)value;}
         if(pcb && IP_IS_V4(&pcb->local_ip))pcb->ttl=(u8_t)value;
         break;
+    case KERNEL_SOCKET_IPV6_MULTICAST_HOPS:
+    case KERNEL_SOCKET_IPV6_MULTICAST_LOOP:
+    case KERNEL_SOCKET_IPV6_MULTICAST_ALL:
+        if(socket->family!=KERNEL_SOCKET_AF_INET6) {result=-KERNEL_ENOPROTOOPT;break;}
+        if(option==KERNEL_SOCKET_IPV6_MULTICAST_HOPS && socket->type==SOCKET_STREAM) {result=-KERNEL_ENOPROTOOPT;break;}
+        if(option==KERNEL_SOCKET_IPV6_MULTICAST_HOPS && (value< -1 || value>255)) {result=-KERNEL_EINVAL;break;}
+        if(option==KERNEL_SOCKET_IPV6_MULTICAST_LOOP && value!=0 && value!=1) {result=-KERNEL_EINVAL;break;}
+        {SOCKET_ENDPOINT(state,socket);
+          if(option==KERNEL_SOCKET_IPV6_MULTICAST_HOPS)socket->ipv6_multicast_hops=value<0?1:(uint8_t)value;
+          else if(option==KERNEL_SOCKET_IPV6_MULTICAST_LOOP)socket->ipv6_multicast_loop=!!value;
+          else socket->ipv6_multicast_all=!!value;}
+        break;
     case KERNEL_SOCKET_MULTICAST_TTL:
         if(socket->domain!=KERNEL_SOCKET_DOMAIN_INET) {result=-KERNEL_ENOPROTOOPT;break;}
         if(socket->type==SOCKET_STREAM) {result=-KERNEL_EINVAL;break;}
@@ -4419,12 +4782,28 @@ int kernel_socket_set_option(struct kernel_socket *socket,
         if(socket->raw)raw_set_multicast_ttl(socket->raw,(u8_t)value);
         if(socket->udp)udp_set_multicast_ttl(socket->udp,(u8_t)value);
         break;
+    case KERNEL_SOCKET_CORK:
+        if (!kernel_socket_is_tcp(socket)) { result = -KERNEL_ENOPROTOOPT; break; }
+        { SOCKET_ENDPOINT(state,socket);socket->cork = value != 0; }
+        if (socket->tcp && !socket->listening) {
+            socket->tcp->boaros_cork = value != 0;
+            if (!value) {
+                socket->tcp->boaros_output_more = 0;
+                boaros_lwip_tcp_cork_cancel(socket->tcp);
+                /* Uncork alone restores normal Minshall. NODELAY additionally
+                 * requests a push, including bytes blocked by the old window. */
+                if (socket->nodelay) boaros_lwip_tcp_push(socket->tcp);
+                tcp_flush_output(socket);
+            }
+        }
+        break;
     case KERNEL_SOCKET_NODELAY:
         if (socket->domain != KERNEL_SOCKET_DOMAIN_INET || socket->type != SOCKET_STREAM) { result = -KERNEL_ENOPROTOOPT; break; }
         { KERNEL_IRQ_LOCK_SCOPE(state,socket_endpoint_lock(socket));socket->nodelay = value != 0; }
         if (socket->tcp != 0 && !socket->listening) {
             if (value) {
                 tcp_nagle_disable(socket->tcp);
+                boaros_lwip_tcp_push(socket->tcp);
                 tcp_flush_output(socket);
             } else tcp_nagle_enable(socket->tcp);
         }
@@ -4445,9 +4824,116 @@ int kernel_socket_set_option(struct kernel_socket *socket,
     return result;
 }
 
+/* Called only while the PCB's protocol owner is held. Queue-derived statistics
+ * are sampled on query/retirement, never by walking queues on normal packets. */
+static void tcp_info_snapshot(const struct tcp_pcb *pcb, struct kernel_socket_tcp_info *info)
+{
+    static const uint8_t states[]={7,10,2,3,1,4,5,8,9,11,6};
+    *info=(struct kernel_socket_tcp_info){.pacing_rate=UINT64_MAX,.max_pacing_rate=UINT64_MAX};
+    if((unsigned)pcb->state>=sizeof(states))__builtin_trap();
+    info->state=states[pcb->state];
+    if(pcb->state==LISTEN)return;
+    info->ca_state=(pcb->flags&TF_RTO)?4:(pcb->flags&TF_INFR)?3:pcb->dupacks?1:0;
+    info->retransmits=pcb->boaros_rto_retries;
+    info->backoff=pcb->persist_backoff?(uint8_t)(pcb->persist_backoff-1):pcb->boaros_rto_backoff;
+    info->probes=pcb->persist_backoff?pcb->persist_probe:pcb->keep_cnt_sent;
+#if LWIP_TCP_TIMESTAMPS
+    if(pcb->flags&TF_TIMESTAMP)info->options|=1;
+#endif
+#if LWIP_TCP_SACK_OUT
+    if(pcb->flags&TF_SACK)info->options|=2;
+#endif
+#if LWIP_WND_SCALE
+    if(pcb->flags&TF_WND_SCALE) {
+        info->options|=4;info->scales=(uint8_t)(pcb->snd_scale|(pcb->rcv_scale<<4));
+    }
+#endif
+    info->rto_us=(uint32_t)pcb->rto*TCP_SLOW_INTERVAL*1000U;
+    info->ato_us=TCP_FAST_INTERVAL*1000U;
+    info->snd_mss=tcp_mss(pcb);info->rcv_mss=pcb->boaros_rcv_mss;
+    for(const struct tcp_seg *seg=pcb->unacked;seg;seg=seg->next) {
+        info->unacked++;if(seg->flags&TF_SEG_RETRANSMITTED)info->retrans++;
+        if(seg->flags&TF_SEG_LOST)info->lost++;
+    }
+    for(const struct tcp_seg *seg=pcb->unsent;seg;seg=seg->next) {
+        info->notsent_bytes+=seg->len-seg->boaros_sent_bytes;
+        if(seg->flags&TF_SEG_SENT) {
+            info->unacked++;if(seg->flags&TF_SEG_LOST)info->lost++;
+        }
+    }
+    info->last_data_sent=(tcp_ticks-pcb->boaros_last_sent)*TCP_SLOW_INTERVAL;
+    info->last_data_recv=(tcp_ticks-pcb->boaros_last_recv)*TCP_SLOW_INTERVAL;
+    info->last_ack_recv=(tcp_ticks-pcb->boaros_last_ack)*TCP_SLOW_INTERVAL;
+    info->pmtu=pcb->boaros_pmtu;
+    if(IP_IS_V6(&pcb->remote_ip)) {
+        unsigned overhead=60;
+#if LWIP_TCP_TIMESTAMPS
+        if(pcb->flags&TF_TIMESTAMP)overhead+=12;
+#endif
+        if(info->pmtu>overhead && info->snd_mss>info->pmtu-overhead)
+            info->snd_mss=info->pmtu-overhead;
+    }
+    info->rcv_ssthresh=info->rcv_space=pcb->boaros_rcv_capacity;
+    info->rtt_us=(uint32_t)pcb->sa*TCP_SLOW_INTERVAL*1000U/8U;
+    info->rttvar_us=(uint32_t)pcb->sv*TCP_SLOW_INTERVAL*1000U/4U;
+    if(info->snd_mss) {
+        info->snd_ssthresh=pcb->ssthresh/info->snd_mss;
+        info->snd_cwnd=pcb->cwnd/info->snd_mss;
+    }
+    info->advmss=pcb->boaros_advmss;info->reordering=3;
+    info->total_retrans=pcb->boaros_total_retrans;
+    info->bytes_acked=pcb->boaros_bytes_acked;info->bytes_received=pcb->boaros_bytes_received;
+    info->segs_in=pcb->boaros_segs_in;info->segs_out=pcb->boaros_segs_out;
+    info->data_segs_in=pcb->boaros_data_in;info->data_segs_out=pcb->boaros_data_out;
+    info->bytes_sent=pcb->boaros_bytes_sent;info->bytes_retrans=pcb->boaros_bytes_retrans;
+    info->min_rtt_us=pcb->boaros_min_rtt;info->delivered=pcb->boaros_delivered;
+    info->rcv_ooopack=pcb->boaros_ooopack;info->snd_wnd=pcb->snd_wnd;
+    /* No rate/chronograph sampling, ECN/DSACK processing, or sender reorder
+     * detection is enabled; their fields remain zero, not measured results. */
+    /* No SACK scoreboard, FACK, or receive-side RTT estimator in this stack.
+     * last_ack_sent is also unrecorded (Linux keeps this ABI field zero). */
+}
+static void socket_tcp_info_retire(struct tcp_pcb *pcb)
+{
+    if(pcb->errf!=tcp_failed || !pcb->callback_arg)return;
+    struct kernel_socket *socket=pcb->callback_arg;
+    tcp_info_snapshot(pcb,&socket->retired_info);
+    socket->retired_info.state=7;
+    socket->retired_info_ms=sys_now();
+}
+int kernel_socket_tcp_info(struct kernel_socket *socket, struct kernel_socket_tcp_info *info)
+{
+    if(!kernel_socket_is_tcp(socket))return -KERNEL_ENOPROTOOPT;
+    _Static_assert(sizeof(*info)==232,"Linux TCP_INFO through snd_wnd");
+    _Static_assert(offsetof(struct kernel_socket_tcp_info,total_retrans)==100,"Linux total_retrans offset");
+    _Static_assert(offsetof(struct kernel_socket_tcp_info,snd_wnd)==228,"Linux snd_wnd offset");
+    struct kernel_socket_protocol_scope protocol;socket_protocol_enter(&protocol,socket);
+    if(socket->tcp) {
+        tcp_info_snapshot(socket->tcp,info);
+        if(socket->listening) {
+            info->unacked=socket->pending_live;
+            info->sacked=((struct tcp_pcb_listen *)socket->tcp)->backlog;
+        }
+    } else {
+        *info=socket->retired_info;info->state=7;
+        uint32_t elapsed=sys_now()-socket->retired_info_ms;
+        info->last_data_sent+=elapsed;info->last_data_recv+=elapsed;info->last_ack_recv+=elapsed;
+    }
+    kernel_socket_protocol_leave(&protocol);return 0;
+}
+
 int kernel_socket_get_option(struct kernel_socket *socket,
                              enum kernel_socket_option option, int *value)
 {
+    if (option==KERNEL_SOCKET_KEEPIDLE || option==KERNEL_SOCKET_KEEPINTVL ||
+        option==KERNEL_SOCKET_KEEPCNT) {
+        if (!kernel_socket_is_tcp(socket)) return -KERNEL_ENOPROTOOPT;
+        SOCKET_ENDPOINT(state,socket);
+        uint32_t policy=option==KERNEL_SOCKET_KEEPIDLE?socket->keep_idle:
+            option==KERNEL_SOCKET_KEEPINTVL?socket->keep_intvl:socket->keep_cnt;
+        *value=(int)(option==KERNEL_SOCKET_KEEPCNT?policy:policy/1000U);
+        return 0;
+    }
     if (option==KERNEL_SOCKET_TYPE) { *value=socket->type;return 0; }
     if (option==KERNEL_SOCKET_MAXSEG) {
         if(!kernel_socket_is_tcp(socket))return -KERNEL_ENOPROTOOPT;
@@ -4466,6 +4952,13 @@ int kernel_socket_get_option(struct kernel_socket *socket,
         if(socket->domain!=KERNEL_SOCKET_DOMAIN_INET)result=-KERNEL_ENOPROTOOPT;
         else *value=socket->ipv4_ttl;
         break;
+    case KERNEL_SOCKET_IPV6_MULTICAST_HOPS:
+    case KERNEL_SOCKET_IPV6_MULTICAST_LOOP:
+    case KERNEL_SOCKET_IPV6_MULTICAST_ALL:
+        if(socket->family!=KERNEL_SOCKET_AF_INET6)result=-KERNEL_ENOPROTOOPT;
+        else *value=option==KERNEL_SOCKET_IPV6_MULTICAST_HOPS?socket->ipv6_multicast_hops:
+            option==KERNEL_SOCKET_IPV6_MULTICAST_LOOP?socket->ipv6_multicast_loop:socket->ipv6_multicast_all;
+        break;
     case KERNEL_SOCKET_MULTICAST_TTL:
         if(socket->domain!=KERNEL_SOCKET_DOMAIN_INET)result=-KERNEL_ENOPROTOOPT;
         else *value=socket->multicast_ttl;
@@ -4478,6 +4971,10 @@ int kernel_socket_get_option(struct kernel_socket *socket,
         *value = -socket->pending_error; socket->pending_error = 0;
         break;
     }
+    case KERNEL_SOCKET_CORK:
+        if (!kernel_socket_is_tcp(socket)) result = -KERNEL_ENOPROTOOPT;
+        else *value = socket->cork;
+        break;
     case KERNEL_SOCKET_NODELAY:
         if (socket->domain != KERNEL_SOCKET_DOMAIN_INET || socket->type != SOCKET_STREAM) result = -KERNEL_ENOPROTOOPT;
         else *value = socket->nodelay;
@@ -4541,6 +5038,88 @@ int kernel_socket_get_bound_device(struct kernel_socket *socket,char name[16],ui
         *length=loop?3:5;__builtin_memcpy(name,loop?"lo":"eth0",*length);result=0;
     }
     kernel_socket_protocol_leave(&scope);return result;
+}
+
+static void socket_ipv6_members_release(struct kernel_socket *socket)
+{
+    while(socket->ipv6_members) {
+        struct socket_ipv6_member *m=socket->ipv6_members;socket->ipv6_members=m->next;
+        struct netif *n=netif_get_by_index(m->index);
+        if(n && m->active)mld6_leavegroup_netif_force(n,&m->group);
+        kernel_heap_release(socket->heap,m);
+    }
+}
+static void socket_ipv6_netif_removed(struct netif *n)
+{
+    /* Called under shared protocol qualification before mld6_stop/free.
+     * Numeric interface reuse must never transfer an old socket's membership. */
+    for(struct kernel_socket *s=inet_sockets;s;s=s->inet_next) {
+        struct socket_ipv6_member **link=&s->ipv6_members;
+        while(*link) {
+            struct socket_ipv6_member *m=*link;
+            if(m->index!=netif_get_index(n)){link=&m->next;continue;}
+            *link=m->next;kernel_heap_release(s->heap,m);
+        }
+    }
+}
+int kernel_socket_ipv6_membership(struct kernel_socket *socket,const uint8_t bytes[16],uint32_t index,int remove)
+{
+    if(socket->family!=KERNEL_SOCKET_AF_INET6)return -KERNEL_ENOPROTOOPT;
+    if(socket->type!=SOCKET_DGRAM)return -KERNEL_EPROTO;
+    ip6_addr_t group;__builtin_memcpy(group.addr,bytes,16);ip6_addr_clear_zone(&group);
+    if(!ip6_addr_ismulticast(&group))return -KERNEL_EINVAL;
+    struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    struct socket_ipv6_member **link=&socket->ipv6_members;unsigned count=0;int result=0;
+    for(;*link;link=&(*link)->next) {
+        struct socket_ipv6_member *m=*link;count++;
+        if((!index || index==m->index) && ip6_addr_zoneless_eq(&group,&m->group)) {
+            if(!remove){result=-KERNEL_EADDRINUSE;goto out;}
+            struct netif *n=netif_get_by_index(m->index);
+            err_t error=n && m->active?mld6_leavegroup_netif(n,&m->group):ERR_OK;
+            if(error!=ERR_OK){result=lwip_error(error);goto out;}
+            *link=m->next;kernel_heap_release(socket->heap,m);goto out;
+        }
+    }
+    if(remove){result=-KERNEL_EADDRNOTAVAIL;goto out;}
+    if(index>UINT8_MAX){result=-KERNEL_ENODEV;goto out;}
+    struct netif *n=index?netif_get_by_index((uint8_t)index):ip6_route(IP6_ADDR_ANY6,&group);
+    if(!n){result=-KERNEL_ENODEV;goto out;}
+    if(n->hwaddr_len && n->mtu<1280){result=-KERNEL_ENODEV;goto out;}
+    if(count>=32){result=-KERNEL_ENOBUFS;goto out;}
+    ip6_addr_assign_zone(&group,IP6_MULTICAST,n);
+    if(!mld6_lookfor_group(n,&group)) {
+        unsigned groups=0;
+        for(struct netif *p=netif_list;p;p=p->next)
+            for(struct mld_group *g=netif_mld6_data(p);g;g=g->next)groups++;
+        /* Leave room for solicited-node address groups, including concurrent
+         * DAD. This is admission control, never an eviction of another owner. */
+        if(groups>=48){result=-KERNEL_ENOBUFS;goto out;}
+    }
+    struct socket_ipv6_member *m=NULL;
+    enum kernel_heap_status status=kernel_heap_allocate_zeroed(socket->heap,1,sizeof(*m),(void **)&m);
+    if(status!=KERNEL_HEAP_STATUS_OK){result=-KERNEL_ENOBUFS;goto out;}
+    err_t error=mld6_joingroup_netif(n,&group);
+    if(error!=ERR_OK){kernel_heap_release(socket->heap,m);result=lwip_error(error);goto out;}
+    m->group=group;m->index=netif_get_index(n);m->active=1;m->next=socket->ipv6_members;socket->ipv6_members=m;
+out:
+    kernel_socket_protocol_leave(&scope);return result;
+}
+int kernel_socket_set_ipv6_multicast_interface(struct kernel_socket *socket,uint32_t index)
+{
+    if(socket->family!=KERNEL_SOCKET_AF_INET6 || socket->type==SOCKET_STREAM)return -KERNEL_ENOPROTOOPT;
+    if(index>UINT8_MAX)return -KERNEL_ENODEV;
+    struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    int result=0;
+    if(index && !netif_get_by_index((uint8_t)index))result=-KERNEL_ENODEV;
+    else {SOCKET_ENDPOINT(state,socket);
+      if(index && socket->bound_device && index!=socket->bound_device)result=-KERNEL_EINVAL;
+      else socket->ipv6_multicast_index=(uint8_t)index;}
+    kernel_socket_protocol_leave(&scope);return result;
+}
+int kernel_socket_get_ipv6_multicast_interface(struct kernel_socket *socket,uint32_t *index)
+{
+    if(socket->family!=KERNEL_SOCKET_AF_INET6)return -KERNEL_ENOPROTOOPT;
+    SOCKET_ENDPOINT(state,socket);*index=socket->ipv6_multicast_index;return 0;
 }
 
 int kernel_socket_set_multicast_interface(struct kernel_socket *socket,uint32_t index,uint32_t address)
@@ -4728,12 +5307,26 @@ static void fast_loopback_refresh(struct netif *netif)
 }
 #endif
 
+static void ipv6_withdraw(struct netif *);
 static void socket_set_interface_up(struct netif *netif,int up)
 {
     if (!!netif_is_up(netif)==!!up) return;
 #if BOAROS_USER_SMP
     fast_loopback_revoke(netif);
 #endif
+    if (netif->hwaddr_len) {
+        if(!up) {
+            ipv6_withdraw(netif);
+            __builtin_memset(netif->ip6_configured,0,sizeof(netif->ip6_configured));
+            ip6_addr_set_zero(&netif->ip6_gateway);
+        }
+        if (!up) {
+            nd6_cleanup_netif(netif);
+            netif_ip6_addr_set_state(netif,0,IP6_ADDR_INVALID);
+        } else if (netif->mtu>=1280 && ip6_addr_isinvalid(netif_ip6_addr_state(netif,0))) {
+            netif_create_ip6_linklocal_address(netif,1);
+        }
+    }
     if (up) netif_set_up(netif); else netif_set_down(netif);
 #if BOAROS_USER_SMP
     fast_loopback_refresh(netif);
@@ -4772,8 +5365,9 @@ void kernel_socket_network_initialize(void)
     if (!socket_initialized) {
         const struct boaros_lwip_hooks hooks = {
             .tcp_output = socket_tcp_output, .work = protocol_work_ready, .capacity = protocol_capacity,
-            .timewait_free = protocol_timewait_free,
+            .timewait_free = protocol_timewait_free, .tcp_info_retire = socket_tcp_info_retire,
             .udp_ingress_filter = socket_udp_ingress_filter, .tcp_ingress_filter = socket_tcp_ingress_filter,
+            .udp_multicast_receive=socket_udp_multicast_receive,.netif_removed=socket_ipv6_netif_removed,
 #if BOAROS_USER_SMP
             .tcp_context = tcp_context, .tcp_dispatch = tcp_dispatch,
             .pcb_forget = tcp_pcb_forget, .tcp_conflict = tcp_route_conflict,
@@ -4872,7 +5466,7 @@ int kernel_socket_work_pending(void)
 {
     if (protocol_current_owner() != kernel_io_context_current() || !protocol_depth) __builtin_trap();
     if (!socket_initialized) return 0;
-    int timer_ready=sys_timeouts_sleeptime()==0;
+    int timer_ready=sys_timeouts_sleeptime()==0 || boaros_lwip_tcp_cork_ready();
     SOCKET_STATE(state);
     int runnable = rights_dirty || (rights_retry_pending && (int32_t)(sys_now()-rights_retry_ms)>=0) || ready_work.head || loopback_pending ||
         capacity_ready(&pool_wait,__atomic_load_n(&pool_generation,__ATOMIC_RELAXED)) || capacity_ready(&nic_wait, nic_generation) ||
@@ -4905,12 +5499,12 @@ static unsigned service_ready_socket(unsigned budget,struct socket_work_queue *q
     while(count<budget && count<SOCKET_WRITE_BATCH && socket->writes_head) {
         struct kernel_socket_write_request *request=socket->writes_head;
         if(count && (stopping || request->operation!=SOCKET_PROTOCOL_STREAM ||
-                     (request->flags & KERNEL_SOCKET_IO_MORE)))break;
+                     (request->flags & (KERNEL_SOCKET_IO_MORE|KERNEL_SOCKET_MSG_MORE))))break;
         socket->writes_head=request->next;
         request->next=0;
         requests[count++]=request;
         /* IO_MORE 的前缀不随其他请求的正常末批提前输出。 */
-        if(request->operation!=SOCKET_PROTOCOL_STREAM || (request->flags & KERNEL_SOCKET_IO_MORE))break;
+        if(request->operation!=SOCKET_PROTOCOL_STREAM || (request->flags & (KERNEL_SOCKET_IO_MORE|KERNEL_SOCKET_MSG_MORE)))break;
     }
     /* 就绪链在同一保护内摘除并重新入队，已有的工作通知仍覆盖余项。 */
     if(socket->writes_head)work_add_locked(queue,socket,0);
@@ -4929,6 +5523,8 @@ static unsigned service_ready_socket(unsigned budget,struct socket_work_queue *q
     if (flags) retire_timewait(socket);
     /* 已捕获的OUTPUT属于此前输入/重试；先完成它，再接纳新COPY，
      * 避免旧标记把新请求仍可合批的IO_MORE前缀提前送入协议。 */
+    if ((flags & SOCKET_WORK_PUSH) && socket->tcp && !socket->listening)
+        boaros_lwip_tcp_push(socket->tcp);
     if ((flags & SOCKET_WORK_OUTPUT) && !socket->listening)tcp_flush_output(socket);
     if(count && requests[0]->operation==SOCKET_PROTOCOL_STREAM && !stopping) {
         stream_commit_owned(requests,count,0);
@@ -4966,7 +5562,10 @@ static int tcp_owner_take_input(struct socket_tcp_owner *owner,struct socket_tcp
 
 static uint64_t tcp_owner_deadline(void)
 {
-    uint32_t delay=boaros_lwip_tcp_timers_delay(sys_now());
+    uint32_t now_ms=sys_now();
+    uint32_t delay=boaros_lwip_tcp_timers_delay(now_ms);
+    uint32_t cork_delay=boaros_lwip_tcp_cork_delay(now_ms);
+    if(cork_delay<delay)delay=cork_delay;
     uint64_t deadline=0;
     if (delay==UINT32_MAX) return 0;
     if (!delay) delay=1;
@@ -4995,6 +5594,7 @@ static void tcp_owner_worker(void *arg)
         for (unsigned i=0;i<8 && service_ready_socket(4,&owner->ready,&scope);i++) {}
         if (!stopping) {
             owner->timer_running=1;
+            (void)boaros_lwip_tcp_cork_due(8);
             (void)boaros_lwip_tcp_timers_due(sys_now());
             owner->timer_running=0;
         }
@@ -5177,7 +5777,8 @@ struct kernel_socket_service_result kernel_socket_service_owned(struct kernel_so
     if (loopback_pending && result.packets < budget.packets)
         service_loopback(&result, budget.packets);
     socket_timer_running = 1;
-    result.timers = sys_check_timeouts_budget(budget.timers);
+    result.timers = boaros_lwip_tcp_cork_due(budget.timers);
+    result.timers += sys_check_timeouts_budget(budget.timers-result.timers);
     socket_timer_running = 0;
     result.runnable = kernel_socket_work_pending();
     result.next_deadline = socket_next_timer_deadline();
@@ -5219,6 +5820,9 @@ void kernel_socket_network_purge_orphans(void)
 void kernel_socket_network_failed(uint32_t address)
 {
     struct kernel_socket_protocol_scope saved; kernel_socket_protocol_enter(&saved);
+    struct netif *failed=NULL;
+    for (struct netif *n=netif_list;n;n=n->next)
+        if (n->hwaddr_len && netif_ip4_addr(n)->addr==address) {failed=n;break;}
     socket_device_failed = 1;
     COST_ADD(NETWORK_GLOBAL_SCANS, 1);
     for (struct kernel_socket *s = inet_sockets; s; s = s->inet_next) {
@@ -5230,16 +5834,27 @@ void kernel_socket_network_failed(uint32_t address)
             if (!offset || !__builtin_memcmp(s->saved_local.bytes,mapped,sizeof(mapped))) {
                 __builtin_memcpy(&local_address,s->saved_local.bytes+offset,sizeof(local_address));
                 if (local_address==address) socket_schedule(s,SOCKET_WORK_DEVICE_FAILED);
+            } else if (failed && s->saved_local.family==KERNEL_SOCKET_AF_INET6) {
+                for(unsigned i=0;i<LWIP_IPV6_NUM_ADDRESSES;i++)
+                    if((i==0 || failed->ip6_configured[i] || !ip6_addr_isinvalid(netif_ip6_addr_state(failed,i))) && !ip6_addr_isany(netif_ip6_addr(failed,i)) &&
+                       !__builtin_memcmp(s->saved_local.bytes,netif_ip6_addr(failed,i)->addr,16) &&
+                       (!s->saved_local.scope || s->saved_local.scope==netif_get_index(failed))) {
+                        socket_schedule(s,SOCKET_WORK_DEVICE_FAILED);break;
+                    }
             }
             continue;
         }
 #endif
         const ip_addr_t *local = local_ip(s);
         int affected = local && IP_IS_V4(local) && ip4_addr_get_u32(ip_2_ip4(local)) == address;
-        if (!affected && s->udp && s->connected && IP_IS_V4(&s->udp->remote_ip)) {
-            /* connected UDP可仍绑定ANY；在撤下carrier前按实际路由归因。 */
-            struct netif *route = ip4_route_src(ip_2_ip4(&s->udp->local_ip), ip_2_ip4(&s->udp->remote_ip));
-            affected = route && ip4_addr_get_u32(netif_ip4_addr(route)) == address;
+        if (!affected && local && IP_IS_V6(local) && !ip_addr_isany(local) && failed)
+            for(unsigned i=0;i<LWIP_IPV6_NUM_ADDRESSES;i++)
+                if((i==0 || failed->ip6_configured[i] || !ip6_addr_isinvalid(netif_ip6_addr_state(failed,i))) && ip6_addr_eq(ip_2_ip6(local),netif_ip6_addr(failed,i))){affected=1;break;}
+        if (!affected && s->udp && s->connected) {
+            /* Connected UDP may still bind ANY; classify before carrier removal. */
+            struct netif *route = ip_route(&s->udp->local_ip,&s->udp->remote_ip);
+            affected = route && (route==failed ||
+                (IP_IS_V4(&s->udp->remote_ip) && netif_ip4_addr(route)->addr==address));
         }
         if (!affected) continue;
         /* endpoint仍归OFD；设备故障与协议超时分开，排队数据先按原规则交付。 */
@@ -5257,6 +5872,90 @@ void kernel_socket_network_failed(uint32_t address)
     socket_device_failed = 0;
     kernel_socket_protocol_leave(&saved);
 }
+int kernel_socket_family(const struct kernel_socket *s) {return s->family;}
+static void ipv6_withdraw(struct netif *n)
+{
+    for(unsigned i=1;i<LWIP_IPV6_NUM_ADDRESSES;i++)
+        if(!ip6_addr_isinvalid(netif_ip6_addr_state(n,i)))netif_ip6_addr_set_state_preserve_pcbs(n,i,IP6_ADDR_INVALID);
+}
+int kernel_socket_ipv6_address(uint32_t index,const uint8_t bytes[16],uint32_t prefix,int remove)
+{
+    if(prefix>128)return -KERNEL_EINVAL;
+    if(!index || index>UINT8_MAX)return -KERNEL_ENODEV;
+    ip6_addr_t address;__builtin_memcpy(address.addr,bytes,16);ip6_addr_clear_zone(&address);
+    /* Link-local provisioning remains owned by DAD startup; multicast, mapped
+     * and loopback configuration need different semantics, never fake success. */
+    if(ip6_addr_isany(&address) || ip6_addr_ismulticast(&address) ||
+       ip6_addr_islinklocal(&address) || ip6_addr_isloopback(&address) ||
+       ip6_addr_isipv4mappedipv6(&address))return -KERNEL_EINVAL;
+    struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    struct netif *n=netif_get_by_index(index);int result=-KERNEL_ENODEV;
+    if(n) {
+        if(!n->hwaddr_len)result=-KERNEL_EOPNOTSUPP;
+        else if(n->mtu<1280 && !remove)result=-KERNEL_EINVAL;
+        else {
+            int found=-1,free_slot=-1;
+            for(unsigned i=1;i<LWIP_IPV6_NUM_ADDRESSES;i++) {
+                if(!ip6_addr_isinvalid(netif_ip6_addr_state(n,i)) && ip6_addr_zoneless_eq(&address,netif_ip6_addr(n,i)))found=(int)i;
+                if(i<=BOAROS_LWIP_STATIC_IP6_SLOTS && !n->ip6_configured[i] && free_slot<0)free_slot=(int)i;
+            }
+            if(remove) {
+                result=-KERNEL_EADDRNOTAVAIL;
+                if(found>=0 && n->ip6_prefix[found]==prefix) {
+                    nd6_invalidate_netif_routes(n);n->ip6_configured[found]=0;
+                    netif_ip6_addr_set_state_preserve_pcbs(n,found,IP6_ADDR_INVALID);
+                    ip6_addr_t zero={0};netif_ip6_addr_set(n,found,&zero);
+                    result=0;
+                }
+            } else if(found>=0)result=-KERNEL_EEXIST;
+            else if(free_slot<0)result=-KERNEL_ENOBUFS;
+            else {
+                nd6_invalidate_netif_routes(n);
+                n->ip6_prefix[free_slot]=(uint8_t)prefix;n->ip6_configured[free_slot]=1;
+                netif_ip6_addr_set(n,free_slot,&address);
+                netif_ip6_addr_set_valid_life(n,free_slot,IP6_ADDR_LIFE_STATIC);
+                netif_ip6_addr_set_pref_life(n,free_slot,IP6_ADDR_LIFE_STATIC);
+                netif_ip6_addr_set_state(n,free_slot,IP6_ADDR_TENTATIVE);
+                result=0;
+            }
+        }
+    }
+    kernel_socket_protocol_leave(&scope);return result;
+}
+int kernel_socket_ipv6_gateway(uint32_t index,const uint8_t bytes[16],int remove)
+{
+    if(index>UINT8_MAX)return -KERNEL_ENODEV;
+    ip6_addr_t gateway;__builtin_memcpy(gateway.addr,bytes,16);ip6_addr_clear_zone(&gateway);
+    if(!remove && !index && ip6_addr_islinklocal(&gateway))return -KERNEL_EINVAL;
+    struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    struct netif *n=index?netif_get_by_index(index):NULL;int result=remove?-KERNEL_ESRCH:-KERNEL_ENETUNREACH;
+    if(index && !n)result=-KERNEL_ENODEV;
+    else {
+        if(!n)for(struct netif *p=netif_list;p;p=p->next) {
+            if(remove && !ip6_addr_isany(&p->ip6_gateway)){n=p;break;}
+            if(!remove && !ip6_addr_islinklocal(&gateway) && boaros_lwip_ip6_onlink(p,&gateway)>=0){n=p;break;}
+        }
+        if(n) {
+            ip6_addr_assign_zone(&gateway,IP6_UNICAST,n);
+            if(remove) {
+                if(ip6_addr_isany(&n->ip6_gateway) || (remove==2 && !ip6_addr_eq(&gateway,&n->ip6_gateway)))result=-KERNEL_ESRCH;
+                else {nd6_invalidate_netif_routes(n);ip6_addr_set_zero(&n->ip6_gateway);result=0;}
+            } else if(!netif_is_up(n))result=-KERNEL_ENETDOWN;
+            else if(!n->hwaddr_len || n->mtu<1280 || ip6_addr_isany(&gateway) ||
+                ip6_addr_ismulticast(&gateway) || ip6_addr_isloopback(&gateway) ||
+                ip6_addr_isipv4mappedipv6(&gateway) || boaros_lwip_ip6_onlink(n,&gateway)<0)result=-KERNEL_ENETUNREACH;
+            else {
+                result=0;
+                for(struct netif *p=netif_list;p;p=p->next)
+                    if(!ip6_addr_isany(&p->ip6_gateway))result=-KERNEL_EEXIST;
+                for(unsigned i=0;i<LWIP_IPV6_NUM_ADDRESSES;i++)
+                    if(ip6_addr_zoneless_eq(&gateway,netif_ip6_addr(n,i)))result=-KERNEL_EINVAL;
+                if(!result){nd6_invalidate_netif_routes(n);ip6_addr_copy(n->ip6_gateway,gateway);}
+            }
+        }
+    }
+    kernel_socket_protocol_leave(&scope);return result;
+}
 static void interface_snapshot(struct netif *n, struct kernel_socket_interface *s)
 {
     *s = (struct kernel_socket_interface){0};
@@ -5267,11 +5966,61 @@ static void interface_snapshot(struct netif *n, struct kernel_socket_interface *
     s->netmask = netif_ip4_netmask(n)->addr; s->mtu = loop && n->mtu == 0 ? 65536U : n->mtu;
     s->gateway = netif_ip4_gw(n)->addr;
     s->default_route = n == netif_default && s->gateway != 0;
+    unsigned state=netif_ip6_addr_state(n,0);
+    s->ipv6_present=!ip6_addr_isinvalid(state);
+    if (s->ipv6_present) {
+        __builtin_memcpy(s->ipv6_address,netif_ip6_addr(n,0)->addr,16);
+        s->ipv6_flags=128 | ((ip6_addr_istentative(state) || ip6_addr_isduplicated(state))?64:0) |
+            (ip6_addr_isduplicated(state)?8:0) | (ip6_addr_isdeprecated(state)?32:0);
+    }
+    _Static_assert(LWIP_IPV6_NUM_ADDRESSES==5,"snapshot address capacity");
+    _Static_assert(LWIP_ND6_NUM_PREFIXES==5 && LWIP_ND6_NUM_ROUTERS==3,"snapshot route capacity");
+    for(unsigned i=1;i<LWIP_IPV6_NUM_ADDRESSES;i++) {
+        unsigned st=netif_ip6_addr_state(n,i);
+        if(ip6_addr_isinvalid(st) && !n->ip6_configured[i])continue;
+        struct kernel_socket_ipv6_address *a=&s->ipv6_addresses[i-1];
+        a->present=1;
+        __builtin_memcpy(a->address,netif_ip6_addr(n,i)->addr,16);
+        a->prefix=n->ip6_prefix[i];
+        a->flags=(netif_ip6_addr_isstatic(n,i)?128:0) | (!ip6_addr_isvalid(st)?64:0) |
+            (ip6_addr_isduplicated(st)?8:0) | (ip6_addr_isdeprecated(st)?32:0);
+        a->valid=netif_ip6_addr_isstatic(n,i)?UINT32_MAX:netif_ip6_addr_valid_life(n,i);
+        a->preferred=netif_ip6_addr_isstatic(n,i)?UINT32_MAX:netif_ip6_addr_pref_life(n,i);
+        a->created=n->ip6_created[i];a->updated=n->ip6_updated[i];
+    }
+    for(unsigned i=0;i<LWIP_ND6_NUM_PREFIXES;i++) {
+        const struct nd6_prefix_list_entry *p=&prefix_list[i];
+        if(p->netif!=n || !p->invalidation_timer)continue;
+        s->ipv6_prefixes[i].present=1;s->ipv6_prefixes[i].prefix=p->prefix_length;
+        s->ipv6_prefixes[i].lifetime=p->invalidation_timer;
+        __builtin_memcpy(s->ipv6_prefixes[i].address,p->prefix.addr,16);
+    }
+    for(unsigned i=0;i<LWIP_ND6_NUM_ROUTERS;i++) {
+        const struct nd6_router_list_entry *r=&default_router_list[i];
+        if(!r->neighbor_entry || r->neighbor_entry->netif!=n || !r->invalidation_timer)continue;
+        s->ipv6_routers[i].present=1;s->ipv6_routers[i].lifetime=r->invalidation_timer;
+        unsigned pref=(r->flags>>3)&3;
+        s->ipv6_routers[i].preference=pref==2?0:pref;
+        __builtin_memcpy(s->ipv6_routers[i].address,r->neighbor_entry->next_hop_address.addr,16);
+    }
+    __builtin_memcpy(s->ipv6_gateway,n->ip6_gateway.addr,16);
     s->hardware_type = loop ? 772 : 1;
+    s->link_up = !!netif_is_link_up(n);
     if (netif_is_up(n)) s->flags |= 1;
     if (netif_is_up(n) && netif_is_link_up(n)) s->flags |= 0x40;
     s->flags |= loop ? 8 : 0x1002;
     if (!loop) __builtin_memcpy(s->mac, n->hwaddr, 6);
+}
+static int route_snapshot(struct kernel_socket_interface *interfaces,size_t *count)
+{
+    KERNEL_SERVICE_SCOPE(service);
+    kernel_socket_network_initialize();
+    struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    for(struct netif *n=netif_list;n;n=n->next) {
+        if(*count==ROUTE_SNAPSHOT_MAX) {kernel_socket_protocol_leave(&scope);return -KERNEL_ENOBUFS;}
+        interface_snapshot(n,&interfaces[(*count)++]);
+    }
+    kernel_socket_protocol_leave(&scope);return 0;
 }
 int kernel_socket_interface_index(uint32_t index, struct kernel_socket_interface *s)
 {
@@ -5384,6 +6133,33 @@ int kernel_socket_interface_set_mtu(const char name[16], int32_t mtu)
                 fast_loopback_revoke(n);
 #endif
                 n->mtu=next;
+                if (!loop) {
+                    /* Configuration changes invalidate both queued ND packets
+                     * and destination PMTU, including a later MTU increase. */
+                    if(next<1280)nd6_cleanup_netif(n);else nd6_invalidate_netif_routes(n);
+#if LWIP_ND6_ALLOW_RA_UPDATES
+                    n->mtu6=next;
+#endif
+                    if (next<1280) {
+                        ipv6_withdraw(n);
+                        __builtin_memset(n->ip6_configured,0,sizeof(n->ip6_configured));
+                        ip6_addr_set_zero(&n->ip6_gateway);
+                        netif_ip6_addr_set_state(n,0,IP6_ADDR_INVALID);
+                        /* IPv6 device teardown, unlike ordinary link DOWN:
+                         * retain socket records, but retire their aggregate
+                         * references. A later old LEAVE must not consume a new
+                         * socket's membership after IPv6 is recreated. */
+                        for(struct kernel_socket *s=inet_sockets;s;s=s->inet_next)
+                            for(struct socket_ipv6_member *m=s->ipv6_members;m;m=m->next)
+                                if(m->index==netif_get_index(n))m->active=0;
+                        mld6_stop(n);
+                        __builtin_memset(n->ip6_mld_joined,0,sizeof(n->ip6_mld_joined));
+                    }
+                    if (next>=1280 && ip6_addr_isinvalid(netif_ip6_addr_state(n,0))) {
+                        netif_create_ip6_linklocal_address(n,1);
+                        nd6_restart_netif(n);
+                    }
+                }
 #if BOAROS_USER_SMP
                 fast_loopback_refresh(n);
 #endif

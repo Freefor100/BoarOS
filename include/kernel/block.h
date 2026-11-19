@@ -112,6 +112,22 @@ struct kernel_block_device {
  * Unregister is refused while any open, mount or request retains a reference. */
 int kernel_block_register(struct kernel_block_device *device, uint64_t number);
 int kernel_block_unregister(struct kernel_block_device *device);
+/* Explicit GPT discovery on 512-byte-sector disks. Stable zeroed children
+ * are indexed by GPT entry number minus one. Device minors reserve 15 slots;
+ * an occupied later entry returns ENOSPC, never silently truncates the table.
+ * The parent must be owned and children inaccessible until this call returns.
+ * Pure protective MBR and GPT v1, up to 128 entries of 128/256/512 bytes.
+ * One valid copy may recover the other; two valid conflicting copies fail.
+ * Publication is atomic. This does not rescan live children or repair disk. */
+#define KERNEL_BLOCK_GPT_PARTITIONS 15U
+int kernel_block_scan_gpt(struct kernel_block_device *device,
+    struct kernel_block_device *children, size_t slots);
+
+/* Boot discovery: MBR or protective-MBR GPT; preserves unpartitioned disks.
+ * Own all fifteen child slots until they have been unregistered. */
+int kernel_block_scan_partitions(struct kernel_block_device *device,
+    struct kernel_block_device children[KERNEL_BLOCK_GPT_PARTITIONS]);
+
 /* Boot discovery. Caller owns four zeroed, stable child objects until teardown.
  * No signature means a whole-disk filesystem; invalid tables publish nothing. */
 int kernel_block_scan_mbr(struct kernel_block_device *device,

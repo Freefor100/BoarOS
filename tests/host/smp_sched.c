@@ -2,13 +2,14 @@
 #include <assert.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <string.h>
 
 struct kernel_scheduler scheduler;
 struct kernel_raw_lock kernel_wait_domain __attribute__((weak));
 _Thread_local uintptr_t sync_test_irq;
 static _Thread_local struct kernel_cpu *active;
 static struct kernel_cpu cpus[BOAROS_MAX_CPUS];
-static struct kernel_task idles[BOAROS_MAX_CPUS], tasks[BOAROS_MAX_CPUS>4?BOAROS_MAX_CPUS:4];
+static struct kernel_task idles[BOAROS_MAX_CPUS], tasks[BOAROS_MAX_CPUS>5?BOAROS_MAX_CPUS:5];
 static pthread_barrier_t gate;
 static struct kernel_task *selected[BOAROS_MAX_CPUS];
 static unsigned deliveries;
@@ -17,9 +18,11 @@ static unsigned first_claimed;
 
 void *sync_test_cpu(void) { return active; }
 void *sync_test_current_task(void) { return active->current; }
-uint64_t kernel_time_monotonic_ns(void) { return 1; }
+static uint64_t scheduler_test_now=1;
+uint64_t kernel_time_monotonic_ns(void) { return scheduler_test_now; }
 #ifndef SMP_TEST_USE_LIFETIME
 void scheduler_task_publish_locked(struct kernel_task *task) { (void)task; assert(0); }
+uint64_t kernel_time_ticks_to_ns(uint64_t ticks) { return ticks; }
 #endif
 void kernel_cpu_notify(struct kernel_cpu *target, unsigned events)
 {
@@ -161,6 +164,113 @@ static void placement_blocker_cases(void)
     reset_two_queues();
 }
 
+static void balance_running(unsigned i,unsigned cpu,unsigned priority)
+{
+    tasks[i]=(struct kernel_task){.accounted=1,.cpu_mask=1U<<cpu,.cpu=&cpus[cpu],
+        .state=KERNEL_THREAD_STATE_RUNNING,.wait.on_cpu=1};
+    assert(!kernel_sched_policy_set(&tasks[i].scheduling,
+        priority?KERNEL_SCHED_FIFO:KERNEL_SCHED_OTHER,priority,0));
+    cpus[cpu].current=&tasks[i];idles[cpu].wait.on_cpu=0;
+}
+
+static void balance_queued(unsigned i,unsigned mask,unsigned priority)
+{
+    tasks[i]=(struct kernel_task){.accounted=1,.cpu_mask=mask,.cpu=&cpus[0],
+        .state=KERNEL_THREAD_STATE_READY};
+    assert(!kernel_sched_policy_set(&tasks[i].scheduling,KERNEL_SCHED_FIFO,priority,0));
+    ready_enqueue_locked(&tasks[i],SCHED_READY_LOCAL);
+}
+
+static void busy_rt_balance_cases(void)
+{
+    reset_two_queues();active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      balance_running(2,0,99);balance_running(3,1,10);
+      balance_queued(0,3,80);balance_queued(1,3,80);
+      tasks[0].scheduling.policy=KERNEL_SCHED_RR;
+      tasks[0].scheduling.rr_remaining_ns=37000000;
+      assert_ready_owner(&tasks[0],&cpus[0]);assert_ready_owner(&tasks[1],&cpus[0]); }
+    active=&cpus[1];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      /* Both CPUs are busy. FIFO99 on CPU0 must not strand its RR80 peer
+       * while CPU1 continues FIFO10, nor may the later FIFO80 overtake it. */
+      assert(ready_best_locked()==&tasks[0]);
+      assert(kernel_cpu_schedule_requested(active));
+      tasks[3].state=KERNEL_THREAD_STATE_READY;tasks[3].wait.ready_pending=1;
+      tasks[3].wait.ready_flags=SCHED_READY_HEAD|SCHED_READY_LOCAL;
+      assert(scheduler_select_next_locked(active,&tasks[3],1)==&tasks[0]);
+      assert(!tasks[0].ready_cpu && !tasks[0].ready_node.queued && tasks[0].wait.on_cpu &&
+          tasks[0].cpu==active && tasks[0].scheduling.rr_remaining_ns==37000000);
+      assert(tasks[3].wait.on_cpu && !tasks[3].ready_node.queued);
+#if BOAROS_USER_SMP
+      kernel_wait_switch_finish_locked(&tasks[3]);active->switch_previous=0;
+      assert_ready_owner(&tasks[3],active);
+#endif
+      assert_ready_owner(&tasks[1],&cpus[0]);
+      /* A remote equal-priority task does not displace the current RR
+       * owner or become a yield/expiration successor ahead of local FIFO. */
+#if BOAROS_USER_SMP
+      assert(ready_best_locked()==&tasks[3]);
+#else
+      assert(!ready_best_locked());
+#endif
+    }
+    puts("PASS busy RT pull: highest eligible source FIFO, preserved RR remainder and unique stack/ready owners");
+
+    reset_two_queues();active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      balance_running(2,0,99);balance_running(3,1,80);
+      kernel_cpu_consume_schedule(&cpus[1]);
+      balance_queued(0,3,80);balance_queued(1,1,90);
+      assert(!kernel_cpu_schedule_requested(&cpus[1])); }
+    active=&cpus[1];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      assert(!ready_best_locked());
+      scheduler_pi_priority_locked(&tasks[0],90,0);
+      assert(kernel_cpu_schedule_requested(active) && ready_best_locked()==&tasks[0]); }
+    puts("PASS busy RT pull: pinned head and equal current are excluded; queued priority promotion requests a legal peer");
+
+    reset_two_queues();active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      balance_running(2,0,99);balance_running(3,1,10);
+      balance_queued(0,3,80);setup_task(1,2,80); }
+    active=&cpus[1];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      assert(ready_best_locked()==&tasks[1]);ready_remove_locked(&tasks[1]);
+      assert(ready_best_locked()==&tasks[0]); }
+    puts("PASS busy RT pull: equal-priority local FIFO remains ahead of a remote candidate");
+
+    reset_two_queues();active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      balance_running(2,0,99);balance_running(3,1,10);
+      cpus[1].rt_bandwidth.consumed_ns=cpus[1].rt_bandwidth.runtime_ns;
+      kernel_cpu_consume_schedule(&cpus[1]);balance_queued(0,3,80);
+      assert(!kernel_cpu_schedule_requested(&cpus[1])); }
+    active=&cpus[1];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      assert(!ready_best_locked());
+      scheduler_pi_priority_locked(&tasks[0],0,80);
+      assert(kernel_cpu_schedule_requested(active) && ready_best_locked()==&tasks[0]); }
+    puts("PASS busy RT pull: exhausted target budget excludes RT but not a PI lock owner");
+
+    for (unsigned queued_blocker=0;queued_blocker<2;queued_blocker++) {
+        reset_two_queues();active=&cpus[0];
+        { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+          balance_running(2,0,10);balance_running(3,1,10);
+          kernel_cpu_consume_schedule(&cpus[1]);balance_queued(0,3,80);
+          /* The first RT task can run here; no remote notification is needed.
+           * A later pinned predecessor or running-priority promotion strands it. */
+          assert(!kernel_cpu_schedule_requested(&cpus[1]));
+          if (queued_blocker) balance_queued(1,1,99);
+          else scheduler_pi_priority_locked(&tasks[2],99,0);
+          assert(kernel_cpu_schedule_requested(&cpus[1])); }
+        active=&cpus[1];
+        { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);assert(ready_best_locked()==&tasks[0]); }
+    }
+    puts("PASS busy RT notification: a new pinned predecessor or running priority increase exposes queued work");
+    reset_two_queues();
+}
+
 static void owned_queue_cases(void)
 {
     reset_two_queues();active=&cpus[1];
@@ -230,6 +340,73 @@ static void owned_queue_cases(void)
 }
 
 #if BOAROS_MAX_CPUS >= 4
+static void *busy_rt_claim(void *argument)
+{
+    unsigned id=(uintptr_t)argument;
+    active=&cpus[id];sync_test_irq=1;
+    int result=pthread_barrier_wait(&gate);
+    assert(!result || result==PTHREAD_BARRIER_SERIAL_THREAD);
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    if (ready_best_locked()) {
+        struct kernel_task *previous=active->current;
+        previous->state=KERNEL_THREAD_STATE_READY;previous->wait.ready_pending=1;
+        previous->wait.ready_flags=SCHED_READY_HEAD|SCHED_READY_LOCAL;
+        selected[id]=scheduler_select_next_locked(active,previous,1);
+    }
+    return 0;
+}
+
+static void busy_rt_concurrent_claim(void)
+{
+    reset_two_queues();active=&cpus[2];
+    kernel_cpu_initialize(active,55,0);active->logical_id=2;active->state=KERNEL_CPU_ONLINE;
+    idles[2]=(struct kernel_task){.state=KERNEL_THREAD_STATE_IDLE,.wait.on_cpu=1};
+    active->current=&idles[2];scheduler_cpu_initialize(active,&idles[2],1);
+    active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      for (unsigned i=0;i<3;i++) {balance_running(i,i,i?10:99);selected[i]=0;}
+      kernel_cpu_consume_schedule(&cpus[1]);kernel_cpu_consume_schedule(&cpus[2]);
+      balance_queued(3,7,80);
+      assert(kernel_cpu_schedule_requested(&cpus[1]) && kernel_cpu_schedule_requested(&cpus[2])); }
+    assert(!pthread_barrier_init(&gate,0,2));pthread_t threads[2];
+    for (unsigned i=1;i<3;i++) assert(!pthread_create(&threads[i-1],0,busy_rt_claim,(void *)(uintptr_t)i));
+    for (unsigned i=0;i<2;i++) assert(!pthread_join(threads[i],0));
+    unsigned winner=selected[1]?1:2,loser=winner==1?2:1;
+    assert(selected[winner]==&tasks[3] && !selected[loser] && cpus[loser].current==&tasks[loser]);
+    assert(tasks[3].wait.on_cpu && tasks[3].cpu==&cpus[winner] && !tasks[3].ready_cpu &&
+        !tasks[3].ready_node.queued && !cpus[0].runqueue.count);
+    assert(tasks[winner].wait.on_cpu && cpus[winner].switch_previous==&tasks[winner]);
+    pthread_barrier_destroy(&gate);
+    puts("PASS busy RT concurrent pull: two notified lower-priority CPUs elect exactly one execution owner");
+}
+
+static void busy_rt_new_predecessor(void)
+{
+    reset_two_queues();active=&cpus[2];
+    kernel_cpu_initialize(active,55,0);active->logical_id=2;active->state=KERNEL_CPU_ONLINE;
+    idles[2]=(struct kernel_task){.state=KERNEL_THREAD_STATE_IDLE,.wait.on_cpu=1};
+    active->current=&idles[2];scheduler_cpu_initialize(active,&idles[2],1);
+    active=&cpus[0];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      balance_running(0,0,0);balance_running(1,1,99);balance_running(2,2,10);
+      balance_queued(3,5,80);
+      assert(!kernel_cpu_schedule_requested(&cpus[2]));
+      tasks[4]=(struct kernel_task){.accounted=1,.cpu_mask=3,.cpu=&cpus[1],
+          .state=KERNEL_THREAD_STATE_READY};
+      assert(!kernel_sched_policy_set(&tasks[4].scheduling,KERNEL_SCHED_FIFO,90,0));
+      ready_enqueue_locked(&tasks[4],SCHED_READY_LOCAL);
+      assert(!kernel_cpu_schedule_requested(&cpus[2]));
+      assert(ready_best_locked()==&tasks[4]);
+      /* RT90 comes from CPU1 and overtakes CPU0's RT80. The previous
+       * OTHER task cannot supply an RT enqueue notification at finish. */
+      assert(scheduler_select_next_locked(active,&tasks[0],1)==&tasks[4]);
+      assert(kernel_cpu_schedule_requested(&cpus[2]));
+      assert_ready_owner(&tasks[3],&cpus[0]); }
+    active=&cpus[2];
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);assert(ready_best_locked()==&tasks[3]); }
+    puts("PASS busy RT claim: a remote higher successor notifies a third CPU about the stranded local head");
+}
+
 static void many_claims(void)
 {
     for (unsigned task_count = 1; task_count <= BOAROS_MAX_CPUS; task_count += BOAROS_MAX_CPUS-1) {
@@ -263,11 +440,20 @@ static void many_claims(void)
 }
 #endif
 
-int main(void)
+int main(int argc,char **argv)
 {
     kernel_raw_lock_init(&kernel_wait_domain, KERNEL_RAW_RANK_SCHEDULER);
+    if (argc==2 && !strcmp(argv[1],"--rt-balance-only")) {
+        busy_rt_balance_cases();
+#if BOAROS_MAX_CPUS >= 4
+        busy_rt_concurrent_claim();
+        busy_rt_new_predecessor();
+#endif
+        return 0;
+    }
     owned_queue_cases();
     placement_blocker_cases();
+    busy_rt_balance_cases();
     scheduler=(struct kernel_scheduler){0};
     scheduler.rt_configuration.period_ns = 1000000000;
     scheduler.rt_configuration.runtime_ns = 950000000;
@@ -351,6 +537,8 @@ int main(void)
     assert(tasks[0].wait.on_cpu && tasks[1].wait.on_cpu && tasks[0].cpu != tasks[1].cpu);
     pthread_barrier_destroy(&gate);
 #if BOAROS_MAX_CPUS >= 4
+    busy_rt_concurrent_claim();
+    busy_rt_new_predecessor();
     many_claims();
 #endif
     puts("SMP owned FIFO queues, idle pull and concurrent execution claim passed");

@@ -29,6 +29,8 @@ struct kernel_proc_process_snapshot {
     kernel_pid_t session_id;
     uint64_t tty_nr;
     int32_t tty_pgrp;
+    uint32_t namespace_count;
+    kernel_pid_t namespace_ids[KERNEL_PID_NAMESPACE_MAX_DEPTH + 1U][KERNEL_PID_ROLES];
     uint64_t identity;
     uint64_t start_ticks;
     uint64_t user_ticks;
@@ -56,10 +58,29 @@ struct kernel_proc_process_snapshot {
     const struct kernel_credentials *credentials; /* snapshot caller releases */
 };
 
+/* A proc superblock owns this fixed view even when accessed via an inherited
+ * mount/FD. Inodes retain canonical root numbers + allocation generations;
+ * only names and reported PID values use the mount's namespace. */
+struct kernel_pid_registry *kernel_proc_view_acquire(void);
+void kernel_proc_view_retain(struct kernel_pid_registry *);
+void kernel_proc_view_release(struct kernel_pid_registry *);
+int kernel_proc_view_self(struct kernel_pid_registry *, kernel_pid_t *, kernel_pid_t *);
+int kernel_proc_view_lookup(struct kernel_pid_registry *, kernel_pid_t number,
+    kernel_pid_t group, uint64_t group_generation, int thread,
+    kernel_pid_t *canonical, uint64_t *generation);
+int kernel_proc_view_next(struct kernel_pid_registry *, kernel_pid_t after,
+    kernel_pid_t group, uint64_t group_generation, int thread,
+    kernel_pid_t *number, kernel_pid_t *canonical, uint64_t *generation);
+int kernel_proc_snapshot_in(struct kernel_pid_registry *, kernel_pid_t,
+    uint64_t, int thread, struct kernel_proc_process_snapshot *);
+
 /* Thread execution owns current task storage; proc callers select a retained
  * PID generation and may write names only within their own thread group. */
 void kernel_task_comm_get(struct kernel_task *, char name[16]);
 void kernel_task_comm_set(struct kernel_task *, const char name[16]);
+int kernel_proc_cgroup(int32_t,uint64_t,int,struct kernel_heap *,char **,size_t *);
+/* 1: live MM, 0: read EOF (no MM), negative: Linux errno. */
+int kernel_proc_coredump_filter(kernel_pid_t, uint64_t, int, unsigned *, int);
 int kernel_proc_comm(kernel_pid_t, uint64_t identity, int thread,
                      char name[16], int writing);
 
@@ -73,9 +94,12 @@ int kernel_proc_inode_owner(kernel_pid_t,uint64_t,int thread,uint32_t mode,uint3
 int kernel_proc_process_identity(kernel_pid_t pid, uint64_t *identity);
 struct kernel_fs_mounts;
 int kernel_proc_mounts_snapshot(kernel_pid_t,uint64_t,struct kernel_fs_mounts *);
+#define KERNEL_PROC_PID_FOR_CHILDREN UINT32_C(0x80000000)
 int kernel_proc_namespace_handle(kernel_pid_t,uint64_t,uint32_t,struct kernel_namespace **);
 /* Requested entries are returned with real references, in MNT/UTS/IPC order. */
-int kernel_proc_namespaces_handle(kernel_pid_t,uint64_t,uint32_t,int fscreds,struct kernel_namespace *owners[3]);
+/* Caller retains the identity (e.g. a pidfd); no local-number reinterpretation. */
+int kernel_proc_namespaces_identity_handle(struct kernel_pid *,uint32_t,struct kernel_namespace *owners[4]);
+int kernel_proc_namespaces_handle(kernel_pid_t,uint64_t,uint32_t,int fscreds,struct kernel_namespace *owners[4]);
 /* Retain the already resolved proc process inode's identity, not a later
  * numeric lookup. The node releases this owner after its final reference. */
 int kernel_proc_process_identity_acquire(kernel_pid_t pid,uint64_t identity,
@@ -118,9 +142,12 @@ struct kernel_proc_fdinfo {
     uint64_t position, flags, mount_id, inode;
     int32_t pid;
     uint8_t pidfd;
+    uint32_t namespace_count;
+    kernel_pid_t namespace_ids[KERNEL_PID_NAMESPACE_MAX_DEPTH + 1U];
     size_t extra_length;
     char extra[512];
 };
+int kernel_proc_fdinfo_snapshot_in(struct kernel_pid_registry *,kernel_pid_t,uint64_t,int,struct kernel_proc_fdinfo *);
 int kernel_proc_fdinfo_snapshot(kernel_pid_t,uint64_t,int,struct kernel_proc_fdinfo *);
 int kernel_proc_fdinfo_access(kernel_pid_t,uint64_t);
 int kernel_proc_fd_pseudo_snapshot(kernel_pid_t pid, uint64_t identity,

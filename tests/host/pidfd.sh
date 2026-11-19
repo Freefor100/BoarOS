@@ -26,7 +26,7 @@ for shift in 12 14; do
         kernel/pid.c kernel/raw_lock.c kernel/sched/park.c fs/flock.c -Wl,--gc-sections \
         -Wl,--wrap=kernel_files_pin,--wrap=kernel_files_release,--wrap=kernel_raw_lock_acquire \
         -o "$out/files-$shift"
-    for case in getfd-local open-local nofile-open nofile-getfd identity recheck cleanup-owner exit reserved-cloexec close-range-unshare; do
+    for case in namespace getfd-local open-local nofile-open nofile-getfd identity recheck cleanup-owner exit reserved-cloexec close-range-unshare; do
         timeout -k 1s 10s "$out/files-$shift" "$case"
     done
     cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_MAX_CPUS=2 \

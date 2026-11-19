@@ -138,7 +138,7 @@ DONTNEED 先尝试范围写回接纳，不执行 fsync、不等待日志 durable
 
 ## 传统与 OFD 记录锁
 
-`fs/record_lock.c` 为每个活 VFS inode 维护按有符号闭区间排序、带子树最大终点的 AVL 树和等待队列；冲突查询、同 owner 区间合并、分拆预留和批量摘除都按该树的相关范围搜索，不遍历 owner 在其他 inode 上的锁。每个锁节点同时挂在 owner 的侵入式链上，供关闭时定向释放；批量摘除通过 AVL 子树合并恢复平衡。长度为零延伸到 `INT64_MAX`，负长度向文件前方锁定，锁可以超过 EOF。`fs/files/locks.c` 导入 RV64 `struct flock` 并分派 `F_GETLK/F_SETLK/F_SETLKW` 与 `F_OFD_GETLK/F_OFD_SETLK/F_OFD_SETLKW`；标量 `fcntl` 命令仍走原入口。区间转换、读写权限、`l_pid`、坏指针和溢出错误按固定 Linux `references/linux/fs/locks.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 核对。
+`fs/record_lock.c` 为每个活 VFS inode 维护按有符号闭区间排序、带子树最大终点的 AVL 树和等待队列；冲突查询、同 owner 区间合并、分拆预留和批量摘除都按该树的相关范围搜索，不遍历 owner 在其他 inode 上的锁。每个锁节点同时挂在 owner 的侵入式链上，供关闭时定向释放；批量摘除通过 AVL 子树合并恢复平衡。长度为零延伸到 `INT64_MAX`，负长度向文件前方锁定，锁可以超过 EOF。`fs/files/locks.c` 导入 RV64 `struct flock` 并分派 `F_GETLK/F_SETLK/F_SETLKW` 与 `F_OFD_GETLK/F_OFD_SETLK/F_OFD_SETLKW`；标量 `fcntl` 命令仍走原入口。传统锁只保存设置者当时的根 TGID：冲突查询在初始 PID 命名空间原样报告，即使设置者已退出；其他视图按查询时的根编号绑定翻译，不可见为 0，OFD 锁为 -1。区间转换、读写权限、`l_pid`、坏指针和溢出错误按固定 Linux `references/linux/fs/locks.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 核对。
 
 错误检查先 pin fd，再导入 `flock`，最后检查对象是否支持记录锁。坏 fd 返回
 `EBADF`；有效 TTY 或 pipe fd 的坏指针返回 `EFAULT`，不被对象类型错误遮蔽。
@@ -180,7 +180,7 @@ OFD pin 覆盖可能缺页睡眠的复制。`make test-record-lock-riscv` 用同
 
 `openat2(437)` 导入 24 字节的 `open_how`，接受全零的扩展尾部，单独校验 flags、mode 和 resolve。它与 `openat` 共用打开及创建路径。解析器在跨越挂载点（包括 bind）、跟随符号链接或 proc 对象链接时检查对应限制；`RESOLVE_BENEATH` 拒绝逃出起点，`RESOLVE_IN_ROOT` 将绝对路径、绝对链接和根处的 `..` 限制在起点。发生挂载拓扑或目录父链变化时，受限查找可返回 `EAGAIN`，调用方可用相同约束重试。`OPENAT2_REGULAR` 在打开设备或 FIFO 之前要求最终对象为普通文件。
 
-现有路径索引命中后仍需后端复核，`RESOLVE_CACHED` 返回 `EAGAIN`，应用可去掉该位重试并保留其他解析限制。`O_TMPFILE`、`O_DIRECT` 和 `O_EMPTYPATH` 仍返回 `EOPNOTSUPP`。`tests/userland/openat2.c` 检查参数、受限创建、bind 挂载和 proc 链接。
+现有路径索引命中后仍需后端复核，`RESOLVE_CACHED` 返回 `EAGAIN`，应用可去掉该位重试并保留其他解析限制。`O_EMPTYPATH` 仍返回 `EOPNOTSUPP`。`O_TMPFILE` 支持 tmpfs 和启用 journal 的 ext4；其他后端仍返回 `EOPNOTSUPP`。`O_DIRECT` 支持[块设备](riscv-virtio-block.md#用户态块设备)、[ext4 普通文件](vfs-ext4.md#普通文件直接-io)和 [FAT 普通文件](fat32.md#普通文件直接-io)。启用日志的 ext4 匿名临时文件同样支持，tmpfs 普通文件返回 `EINVAL`。 `tests/userland/openat2.c` 检查参数、受限创建、bind 挂载和 proc 链接。
 
 `getcwd` 返回包含 NUL 的字节数；用户缓冲不足为 `ERANGE`，已断开的 cwd 为 `ENOENT`。仍连接在命名空间但位于新root之外的cwd，raw syscall返回`(unreachable)`前缀及命名空间绝对路径；libc据此处理ENOENT。proc cwd/exe/fd/maps的展示保留根外及摘树对象的绝对名称和删除后缀，实际对象链接跟随仍持有真实路径，不依赖这些展示文本。删除目录后，其持有者仍可对 `.` 打开/统计、经 `..` 访问父目录、通过 `fchdir` 切回；不能在已删除目录中新建名字。改名会更新所有持有同一目录项的 cwd/OFD 所观察到的父链。fork 独立复制 fs record，进程形式和线程形式的 `CLONE_FS` 都共享它；切换 cwd 先取得新引用再替换，失败不改变原目录。
 
@@ -226,7 +226,7 @@ pipe 的 `fstat` 以 `S_IFIFO` 形态报告，`lseek` 返回 `-ESPIPE`；匿名p
 
 `kernel_files_read()` 最多传送 Linux `MAX_RW_COUNT` 形态的 `INT32_MAX` 向下页对齐值。无效 fd 或普通文件 OFD 的访问模式为 `O_WRONLY` 时返回 `-EBADF`；该访问模式属于 OFD，因此 `dup`/fork 后仍保持。访问模式检查先于零长度和用户地址检查；通过后，零长度无需解引用用户地址并返回 0。`pread64` 对普通文件使用同一可读性契约，但按调用者给出的非负 offset 读取且不推进 OFD offset。它在 MAX_RW_COUNT 截断和 EOF 判断前校验原始用户范围，非法高地址即使 count 为零也返回 `-EFAULT`。与固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`fs/read_write.c`](../../references/linux/fs/read_write.c) 中 `vfs_read()` 顺序一致，非零读取先按调用者给出的原始 count 验证整个用户范围，再把实际请求截断到上限，从挂载共享缓存取得需求页并执行 `copy_to_user`。
 
-open file description 的 offset 只增加实际复制到用户空间的字节数。首块即发生用户 fault 时返回 `-EFAULT` 且 offset 不变；已经复制前缀后再 fault 或遇到底层读错误时返回前缀长度，并只提交该前缀。短读和 EOF 返回实际长度。这样已经进入缓存但未交付用户的数据不会被错误计入文件位置。
+open file description 的 offset 只增加实际复制到用户空间的字节数。首块即发生用户 fault 时返回 `-EFAULT` 且 offset 不变；已经复制前缀后再 fault 或遇到底层读错误时返回前缀长度，并只提交该前缀。磁盘普通文件的缓冲读取先用当前文件长度裁剪需求批次。到达 EOF 直接结束，避免装入尾部的部分页。真正请求的页仍由页缓存复核当前 EOF。
 
 `kernel_files_readv()` 使用相同的普通文件读取核心，整个调用只钉住一次 OFD，并把用户 iovec 快照到最多 8 项的栈数组或最多 1024 项的受限堆数组。先检查 fd 的读权限，再导入向量；readv、writev 和 socket 消息共用 `fs/uaccess_iov_internal.h` 的导入规则，按固定 Linux 的 `references/linux/lib/iov_iter.c` 校验每项有符号长度和地址。单项向量先按 `MAX_RW_COUNT` 截断，多项向量先校验原始范围再截断累计长度；空区间允许地址等于用户上界，零项向量不访问描述符指针。零项向量返回 0，零长度段跳过；普通文件按实际交付量推进共享 OFD，EOF、短读、fault 与后端错误均结束本次请求。已发布 serial TTY 的 console/ttyS0/tty 完整 readv 由 [TTY 行规程](kernel-tty.md) 保持一次请求、64B continuation 与消费前缀；未建立 transport 的裸 UART fixture 仍只做一次输入暂存。pipe 按上述片段提交规则消费数据。epoll 描述符没有 read 操作，在向量导入前返回 `-EINVAL`。
 
@@ -240,7 +240,7 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 - regular 文件通过 `kernel_vfs_write_user()` 把用户 iovec 直接复制到共享 inode 页缓存或 tmpfs 后备页。每次先固定来源用户页，再取得目标写资格；没有请求中转页。部分 usercopy 只发布成功复制的前缀，并推进对应 offset/逻辑大小。writeback 错误由 inode 保留，不能事后撤销已经接收的字节。
 - `kernel_files_sync()` pin 选定 OFD，分批交接目标 inode 数据，按后端执行策略捕获一次元数据durable目标，ext4在发起CPU准备，再由原调用者等待 journal 完成。栈上等待请求借用这份实际 OFD/file，关闭并复用 fd 不改变同步对象；后端执行者释放准备资格后由日志worker推进。完成事件在共享保护内一次性记录元数据错误、消费 OFD 错误游标并发布原请求结果，调用者取走结果直接返回；数据交接失败不重复递增错误序号。独立 open 各持观察位置，dup/fork 共用，同一历史错误只被该 OFD 观察一次。独立同步不以文件位置锁覆盖设备等待；普通文件和目录支持 fsync/fdatasync，pipe、字符设备、epoll 返回 EINVAL，无效 fd 返回 EBADF。分批、完成与停止边界见[VFS](vfs-ext4.md#文件节点与页缓存)。
 - `RLIMIT_FSIZE`来自原调用者线程组，在本次用户文件操作中以栈上限额对象传到VFS；CPU0执行者借用它，完成后由原调用线程处理SIGXFSZ。普通write/writev及定位变体按限额截短，起点已到限额时返回EFBIG并发送线程定向SI_USER信号；零长度写保留原地址检查。追加偏移在整次写操作保护内取实际EOF。sendfile按splice的剩余buffer继续接纳，因此跨限额时可返回已成功前缀并同时产生SIGXFSZ。
-- truncate仅在扩大文件时应用FSIZE；已支持的fallocate仅mode0扩大EOF时应用，KEEP_SIZE和打洞保持原语义。限额拒绝发生在时间戳、用户复制和映射修改之前。普通内核pwrite、loop内部I/O、mmap脏页写回和已接纳版本的同步使用各自既有约束；下调用户限额不会使旧脏页失去持久化资格。
+- truncate仅在扩大文件时应用FSIZE；fallocate 的 mode0 扩大 EOF 时应用 FSIZE，tmpfs 的 KEEP_SIZE 在预留末端超过 EOF 时也检查 FSIZE；ext4 KEEP_SIZE 和打洞不扩大 EOF。限额拒绝发生在时间戳、用户复制和映射修改之前。普通内核pwrite、loop内部I/O、mmap脏页写回和已接纳版本的同步使用各自既有约束；下调用户限额不会使旧脏页失去持久化资格。
 - `O_SYNC/O_DSYNC` 在普通写的成功前缀之后，同步实际范围 `[end_offset-written,end_offset)`；append 使用本次取得的真实 EOF，定位写和 EFAULT 短前缀也沿用实际接纳结果。同步失败返回 errno，OFD offset 与已接受内容保持；这与 Linux `generic_write_sync()` 的顺序一致。full/data 目标、时间戳及挂载同步的职责见 [VFS 同步机制](vfs-ext4.md#文件节点与页缓存)。journal commit 屏障成功后发布 durable，checkpoint 独立回收旧版本。后台清脏和组提交不替代同步错误观察与屏障。
 - `writev` 沿用上述共用向量导入规则，再与 write 共用写入核心；`iovcnt` 上限 1024。
 
@@ -355,7 +355,7 @@ O_SYNC/O_DSYNC 在整次复制后同步一次，同步失败返回错误而不�
 - `kernel_files_unlinkat()`：支持文件删除与目录删除（`AT_REMOVEDIR` 标志）。普通文件调用 `kernel_vfs_unlink()`，仍打开的对象保留页缓存；目录删除调用 `kernel_vfs_rmdir()`，非空目录返回 `-ENOTEMPTY`。
 - `kernel_files_ftruncate()`：校验 fd 具备可写权限且为常规文件，调用 `kernel_vfs_ftruncate()` 调整文件大小（向下截断或向上 sparse 扩展）并精确失效该节点页缓存；backend 已改变 inode 后才返回错误时，仍先同步 node/file size 并失效缓存，再把 errno 返回用户态。只读描述符返回 `-EINVAL`，目录返回 `-EISDIR`。向下截断根据实际新大小通知稳定 node–MM 登记，撤销所有相关 MM 中越过新 EOF 的整页 PTE（包含私有 COW 与 PROT_NONE），保留 VMA 以便随后 fault/SIGBUS。非对齐尾页的文件来源后缀清零，已私有化内容保留；来源记录不依赖缓存索引或 PTE COW 位。
 
-- `kernel_files_fallocate()` 从 FD 表取得真实 OFD，随后与 MADV_REMOVE 共用 `kernel_open_file_fallocate()`：检查可写模式、对象类型、有符号范围和模式，按实际后端执行，保持 OFD offset。MM 调用者先归还映射修改资格和用户 pin，再由来源借用保活 OFD，打洞过程可以反向撤销共享映射。RV64/LoongArch64 共用 syscall 47；ext4 支持预留、保持大小和打洞，tmpfs 支持保持大小的打洞，其余后端或模式返回 `EOPNOTSUPP`。`O_SYNC/O_DSYNC` 成功操作在归还写操作资格后等待完整文件持久化，复用该 OFD 的写回错误游标；CPU0 后端请求借用原调用者凭据和写操作资格。实际 extent、缓存和 mmap 一致性见 [VFS 范围操作](vfs-ext4.md#文件空间预留与打洞)。
+- `kernel_files_fallocate()` 从 FD 表取得真实 OFD，随后与 MADV_REMOVE 共用 `kernel_open_file_fallocate()`：检查可写模式、对象类型、有符号范围和模式，按实际后端执行，保持 OFD offset。MM 调用者先归还映射修改资格和用户 pin，再由来源借用保活 OFD，打洞过程可以反向撤销共享映射。RV64/LoongArch64 共用 syscall 47；ext4 与 tmpfs 均支持预留、保持大小和保持大小的打洞，其余后端或模式返回 `EOPNOTSUPP`。`O_SYNC/O_DSYNC` 成功操作在归还写操作资格后等待完整文件持久化，复用该 OFD 的写回错误游标；CPU0 后端请求借用原调用者凭据和写操作资格。实际 extent、缓存和 mmap 一致性见 [VFS 范围操作](vfs-ext4.md#文件空间预留与打洞)。
 
 `read/readv` 与 `write/writev` 在 fd lookup 后立即取得独立 OFD 引用，并在本次操作的全部复制、等待和唤醒处理结束后释放。共享表中的另一个线程即使在操作睡眠期间 close 并复用同一 fd 号，本次操作仍使用 lookup 时的 OFD；对于 pipe，这份引用也让原读/写 endpoint 在 in-flight I/O 结束前保持逻辑存活，避免提前产生 EOF/EPIPE 或释放等待队列。末次操作引用触发的底层 cleanup 失败会转交给共享文件表的原有 cleanup 链。该语义基线对应固定 Linux `f4cdf7ca9a1f` 中 [`fs/file.c`](../../references/linux/fs/file.c) 的 `fdget()`/`fdput()` 生命周期。
 
@@ -516,7 +516,7 @@ TCP 标量和向量写入共用有界用户页批次。取得接纳额度后，�
 
 `readv/writev` 的 8 项以内向量不分配导入缓冲；更长数组为完整输入快照分配至多 16 KiB 元数据，释放遵循堆不变量。数据仍直接从用户空间复制到 pipe 数据区，console 使用 64 字节暂存；目录条目在固定内核缓冲区中编码一次，再复制到用户空间，目录拆分没有引入转发层或额外数据复制。等待唤醒按实际事件队列通知，队列登记与任务状态由等待域保护。
 
-已删除且仍打开的目录枚举返回 `ENOENT`，保持 OFD 位置；普通已删除文件继续供原有 fd 使用。目录枚举由 OFD offset 保存可继续的后端 cookie，VFS 适配层隐藏 lwext4 类型；可变游标不放入按 inode 共享的 VFS node。独立 open 各自推进，dup 和 fork 共享同一 OFD 的目录位置。当前线性 ext4 适配器的 `ext4_dir_entry_next_status()` 区分真实 EOF 与正 errno，使用记录结束字节位置作为 cookie；未来的 htree 或其他文件系统可以替换编码而不改变文件资源接口。
+已删除且仍打开的目录枚举返回 `ENOENT`，保持 OFD 位置；普通已删除文件继续供原有 fd 使用。目录枚举由 OFD offset 保存可继续的后端 cookie，VFS 适配层隐藏 lwext4 类型；可变游标不放入按 inode 共享的 VFS node。独立 open 各自推进，dup 和 fork 共享同一 OFD 的目录位置。目录按有界内核批次打包，复制后只提交完整记录前缀；具体批次所有权与失败规则见 [VFS 目录游标](vfs-ext4.md)。当前线性 ext4 适配器的 `ext4_dir_iterate()` 区分真实 EOF 与正 errno，使用记录结束字节位置作为 cookie；未来的 htree 或其他文件系统可以替换编码而不改变文件资源接口。
 
 实现保持以下语义：
 
@@ -708,3 +708,23 @@ RV64／LA64 使用 `inotify_init1`、`inotify_add_watch` 和 `inotify_rm_watch`�
 直接探针见 [inotify.c](../../tests/workloads/fs/inotify.c)，覆盖目录事件、事件消费、溢出和卸载。
 `sh tests/host/inotify-async.sh` 检查入队/合并/溢出/忽略的通知次数，以及回调期间并发关闭
 后继 mark 和 group 的交错。
+
+### O_TMPFILE 匿名文件
+
+`openat(dirfd, ".", O_TMPFILE | O_RDWR, mode)` 直接分配链接数为 0 的普通 inode，不先生成临时名称再 unlink。目录写入/搜索权限、只读挂载、umask、默认 ACL 和创建身份沿用普通创建路径。文件可读写、映射、dup；最后引用释放后回收。ext4 在创建事务中加入持久 orphan，首次发布在同一事务中建立目录项并移除 orphan，因此恢复不依赖内存中的临时名字。无 journal 的 ext4 不支持此操作。
+
+非 `O_EXCL` 文件可通过 `linkat(fd, "", dirfd, name, AT_EMPTY_PATH)` 或跟随 `/proc/self/fd/N` 发布。`O_EXCL` 禁止发布；首次发布后再删除最后一个链接，不能借旧 fd 复活。首次发布复用 inode 与页缓存，不复制内容；发布与正常 namespace 操作使用已有目录/inode 锁。tmpfs 首次发布不重复收取 inode 配额。proc fd 链接显示原创建目录下的 `#inode (deleted)` 匿名路径。
+
+定向验证：`tests/host/tmpfile.sh` 覆盖 tmpfs 4 KiB/16 KiB、inode 配额及分配失败回滚；`tests/host/lwext4-tmpfile.sh` 覆盖 orphan_file/legacy orphan、事务回滚、最后关闭和崩溃恢复。`tests/userland/tmpfile.c` 同源运行于 Linux 和 BoarOS，覆盖发布、拒绝复活、并发发布、权限、fd 耗尽和映射生命周期；guest 还覆盖只读挂载、跨挂载和不支持后端。`tests/userland/tmpfile.py --arch riscv|loongarch --kernel KERNEL --program STATIC_ELF [--cpus 2]` 运行定向 QEMU 契约并执行离线 fsck。Linux 宿主若不能切换 uid，可设 `TMPFILE_SKIP_UID=1`，该项明确打印跳过；guest 不设置此变量。此验证不是全量兼容性或性能结论。
+
+语义依据：[Linux open(2)](https://man7.org/linux/man-pages/man2/open.2.html) 与 [link(2)](https://man7.org/linux/man-pages/man2/link.2.html)。
+
+### tmpfs 空间预留
+
+`fallocate(mode=0)` 为请求范围内缺少的页分配真实零填充后备，并按需扩大 EOF；`KEEP_SIZE` 只预留页，不改变文件长度。页粒度配额在分配时收费，重复预留不再收费，也不改写已有数据。成功预留的区域可通过普通读写或共享映射使用，不需要第二次分配后备页。未请求的稀疏区保持不分配，读回零。
+
+memory object 在一次索引锁期间私有暂存新增页，全部分配成功后批量发布；失败只释放本次暂存页及预算，不撤销原有页和数据，不改变 EOF。复用页节点的链接保存暂存链，不分配逐页回滚数组，也不为每页增加再归还临时引用。索引容量按最终页数一次调整；已存在的映射准备页在成功预留后成为正式后备，准备者随后拒绝发布不能误删它。配额耗尽返回 `ENOSPC`，物理内存或元数据分配失败返回 `ENOMEM`。与 Linux shmem 一致，KEEP_SIZE 的预留末端超过 EOF 时也受 RLIMIT_FSIZE 约束，不能借此绕过文件大小限额。
+
+`KEEP_SIZE` 页可位于 EOF 之外：增长 ftruncate 保留它们，同尺寸或缩短 ftruncate 清除新 EOF 后的预留；打洞也能释放 EOF 之外的完整预留页。这些边界使用 Linux 同源契约核对。`tests/host/tmpfs-fallocate.sh` 检查 4 KiB/16 KiB 页、预算、分配故障和实际物理内存耗尽，`test-memory-object-concurrency-host` 另检查索引增长失败回滚与映射准备页归属。`tests/userland/tmpfs_fallocate.py` 运行 RV/LA 定向契约；其 C 程序也可在 Linux 上传入 tmpfs 文件路径运行，挂载配额分支仅在 guest 运行。现有 `SEEK_DATA/SEEK_HOLE` 接口不在本次增加的功能范围内；此处稀疏验证指真实后备页、大小和内容，不声称已有完整稀疏 seek ABI。
+
+预留接口语义参考：[Linux fallocate(2)](https://man7.org/linux/man-pages/man2/fallocate.2.html)。

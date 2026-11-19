@@ -355,6 +355,7 @@ enum physical_page_status physical_page_allocator_init(
 
     kernel_raw_lock_init(&result.lock, KERNEL_RAW_RANK_PAGE);
     result.reclaim_hooks = (struct physical_page_reclaim_hooks){0};
+    result.compound_recycler = (struct physical_page_compound_recycler){0};
     result.lazy_reclaim = 0;
     result.shared_anon_pages = 0;
     result.buffer_bytes = 0;
@@ -765,15 +766,34 @@ static int head_valid(const struct physical_page_allocator *a, const struct budd
     if (owner->state == BUDDY_INTERNAL)
         return m->state == PHYSICAL_PAGE_STATE_INTERNAL && !m->reference_count;
     return owner->state == BUDDY_ALLOCATED && m->state == PHYSICAL_PAGE_STATE_ALLOCATED_HEAD &&
-           m->reference_count && (!owner->order || m->reference_count == 1);
+           m->reference_count;
+}
+
+/* An order-indexed free list already identifies the owner's size. Locate
+ * that node directly and verify its ancestor chain, without rediscovering
+ * the owner by descending from the root and tracking every split boundary. */
+static int free_owner_at_order(const struct physical_page_allocator *a,
+    uint32_t page, uint32_t order, struct buddy_owner *owner, struct page_work *work)
+{
+    const struct physical_page_root *root = root_for_page(a, page, work);
+    if (!root || order > root->order) return 0;
+    uint32_t offset = page - root->first_page_index;
+    if (offset & (order_page_count(order) - 1)) return 0;
+    uint64_t node = order_page_count(root->order - order) - 1 + (offset >> order);
+    if (tree_get(a, root, node, work) != BUDDY_FREE) return 0;
+    for (uint64_t ancestor = node; ancestor;) {
+        ancestor = (ancestor - 1) >> 1;
+        if (tree_read(a, root, ancestor, work) != BUDDY_SPLIT) return 0;
+    }
+    *owner = (struct buddy_owner){root, node, page, order, BUDDY_FREE};
+    return 1;
 }
 
 static int free_head_plain(const struct physical_page_allocator *a, uint32_t page, uint32_t order,
                            struct page_work *work)
 {
     struct buddy_owner owner;
-    return owner_find(a, page, &owner, work) && owner.first == page && owner.order == order &&
-           owner.state == BUDDY_FREE && head_valid(a, &owner, work);
+    return free_owner_at_order(a, page, order, &owner, work) && head_valid(a, &owner, work);
 }
 
 static int free_head_valid(const struct physical_page_allocator *a,
@@ -832,8 +852,8 @@ static int free_insert(struct physical_page_allocator *a, uint32_t page, uint32_
     if (old != PHYSICAL_PAGE_INDEX_NONE)
     {
         struct buddy_owner owner;
-        if (!owner_find(a, old, &owner, work) || owner.first != old ||
-            owner.order != order || !free_head_valid(a, &owner, work) ||
+        if (!free_owner_at_order(a, old, order, &owner, work) ||
+            !free_head_valid(a, &owner, work) ||
             a->metadata[old].previous != PHYSICAL_PAGE_INDEX_NONE)
             return 0;
     }
@@ -1202,8 +1222,8 @@ static enum physical_page_status allocate_order_locked(struct physical_page_allo
         return PHYSICAL_PAGE_STATUS_EMPTY;
     uint32_t page = a->free_heads[found];
     struct buddy_owner owner;
-    if (!owner_find(a, page, &owner, work) || owner.first != page ||
-        owner.order != found || !free_head_valid(a, &owner, work))
+    if (!free_owner_at_order(a, page, found, &owner, work) ||
+        !free_head_valid(a, &owner, work))
         __builtin_trap();
     uint64_t pa = owner_address(&owner);
     if (order_page_count(order) > a->available_pages ||
@@ -1236,19 +1256,30 @@ static enum physical_page_status allocate_order_locked(struct physical_page_allo
     return PHYSICAL_PAGE_STATUS_OK;
 }
 
+static void capture_allocation_hooks(struct physical_page_allocator *a,
+    struct physical_page_reclaim_hooks *hooks, int reclaim)
+{
+    const struct physical_page_reclaim_hooks *bound = &a->reclaim_hooks;
+    if (!reclaim && (!bound->notify || (bound->wants_notification &&
+        !bound->wants_notification(bound->context, a->available_pages)))) return;
+    *hooks = *bound;
+    if (hooks->retain) hooks->retain(hooks->context);
+}
+
 static enum physical_page_status
 physical_page_allocate_order_once(struct physical_page_allocator *a, uint32_t order,
-                                  uint64_t *address,struct physical_page_reclaim_hooks *hooks)
+    uint64_t *address, struct physical_page_reclaim_hooks *hooks, uint64_t *available)
 {
     PAGE_METADATA_SCOPE(work,a);
     if (!allocator_initialized(a) || !address || order>PHYSICAL_PAGE_MAX_ORDER)
         return PHYSICAL_PAGE_STATUS_INVALID;
     if (!physical_page_allocator_is_finalized(a)) return PHYSICAL_PAGE_STATUS_STATE;
+    enum physical_page_status status = allocate_order_locked(a, order, address, NULL, &work);
     if (hooks) {
-        *hooks=a->reclaim_hooks;
-        if (hooks->retain) hooks->retain(hooks->context);
+        *available = a->available_pages;
+        capture_allocation_hooks(a, hooks, status == PHYSICAL_PAGE_STATUS_EMPTY);
     }
-    return allocate_order_locked(a,order,address,NULL,&work);
+    return status;
 }
 
 /* 绑定在allocator短锁内固定；卸载只摘绑定，实际后备由本次借用持有。 */
@@ -1295,10 +1326,9 @@ unsigned physical_page_allocate_batch(struct physical_page_allocator *a,
     kernel_assert_can_block();
     unsigned completed=0;
     struct physical_page_reclaim_hooks hooks={0};
+    uint64_t available;
     {
         PAGE_METADATA_SCOPE(work,a);
-        hooks=a->reclaim_hooks;
-        if (hooks.retain) hooks.retain(hooks.context);
         while (completed<count) {
             unsigned order=0,remaining=count-completed;
             while ((1U<<(order+1))<=remaining) order++;
@@ -1318,8 +1348,10 @@ unsigned physical_page_allocate_batch(struct physical_page_allocator *a,
             unsigned pages=1U<<order;
             for (unsigned i=0;i<pages;i++) addresses[completed++]=base+(uint64_t)i*BOAROS_PAGE_SIZE;
         }
+        available = a->available_pages;
+        capture_allocation_hooks(a, &hooks, 0);
     }
-    if (hooks.notify) hooks.notify(hooks.context);
+    if (hooks.notify) hooks.notify(hooks.context, available);
     reclaim_hooks_release(&hooks);
     COST_ADD(PAGE_CALLS,1);COST_ADD(PAGE_ACCEPTED,completed);COST_IO_ADD(7,completed);
     if (completed<count) COST_ADD(PAGE_FAILURES,1);
@@ -1352,7 +1384,7 @@ enum physical_page_status physical_page_allocate_order_nosleep(
     struct physical_page_allocator *allocator, uint32_t order, uint64_t *address)
 {
     COST_ADD(PAGE_CALLS,1);
-    enum physical_page_status status=physical_page_allocate_order_once(allocator,order,address,NULL);
+    enum physical_page_status status=physical_page_allocate_order_once(allocator,order,address,NULL,NULL);
     if (status==PHYSICAL_PAGE_STATUS_OK) {
         COST_ADD(PAGE_ACCEPTED,order_page_count(order));COST_IO_ADD(7,order_page_count(order));
     } else COST_ADD(PAGE_FAILURES,1);
@@ -1367,9 +1399,10 @@ enum physical_page_status physical_page_allocate_order(
     kernel_assert_can_block();
     COST_ADD(PAGE_CALLS, 1);
     struct physical_page_reclaim_hooks hooks = {0};
+    uint64_t available = 0;
     enum physical_page_status status =
-        physical_page_allocate_order_once(allocator, order, address,&hooks);
-    if (hooks.notify) hooks.notify(hooks.context);
+        physical_page_allocate_order_once(allocator, order, address, &hooks, &available);
+    if (hooks.notify) hooks.notify(hooks.context, available);
     if (status == PHYSICAL_PAGE_STATUS_EMPTY) {
         uint64_t (*lazy_reclaim)(struct physical_page_allocator *,uint64_t,uint64_t *)=
             __atomic_load_n(&allocator->lazy_reclaim,__ATOMIC_ACQUIRE);
@@ -1389,7 +1422,7 @@ enum physical_page_status physical_page_allocate_order(
                 released=lazy_reclaim ? lazy_reclaim(allocator,order_page_count(order),&detached) : 0;
                 if (released<order_page_count(order) && hooks.reclaim)
                     released+=hooks.reclaim(hooks.context,order_page_count(order)-released);
-                status=physical_page_allocate_order_once(allocator,order,address,NULL);
+                status=physical_page_allocate_order_once(allocator,order,address,NULL,NULL);
                 /* LRU归还的页不保证物理相邻；有实际进展就继续尝试所需
                  * order，不能用空闲页总数代替连续块是否已经形成。 */
             } while (status==PHYSICAL_PAGE_STATUS_EMPTY && (released || detached));
@@ -1398,7 +1431,7 @@ enum physical_page_status physical_page_allocate_order(
             if (status==PHYSICAL_PAGE_STATUS_EMPTY &&
                 physical_page_available(allocator)<order_page_count(order) && hooks.wait) {
                 hooks.wait(hooks.context);
-                status=physical_page_allocate_order_once(allocator,order,address,NULL);
+                status=physical_page_allocate_order_once(allocator,order,address,NULL,NULL);
             }
         }
     }
@@ -1430,6 +1463,23 @@ enum physical_page_status physical_page_allocation_order(
     return PHYSICAL_PAGE_STATUS_OK;
 }
 
+int physical_page_owned_order(const struct physical_page_allocator *a,
+    uint64_t address, uint32_t order)
+{
+#if BOAROS_LOCK_DEBUG
+    uint32_t actual;
+    return !physical_page_allocation_order(a,address,&actual) && actual==order;
+#else
+    uint32_t index;
+    if (!physical_page_allocator_is_finalized(a) || !page_lookup(a,address,0,&index))
+        return 0;
+    /* A reference pins the allocation shape. Other owners can change only
+     * the reference count, which is not needed to validate this handoff. */
+    const struct physical_page_metadata *page=&a->metadata[index];
+    return page->state==PHYSICAL_PAGE_STATE_ALLOCATED_HEAD && page->order==order;
+#endif
+}
+
 static __attribute__((noinline)) uint32_t physical_page_release_owner(struct physical_page_allocator *a,
     uint64_t address, uint32_t order, const struct physical_page_root *root,
     uint32_t page, struct page_work *work, int discover_order)
@@ -1453,6 +1503,11 @@ static __attribute__((noinline)) uint32_t physical_page_release_owner(struct phy
         a->metadata[page].reference_count--;
         page_written(work);
         return order;
+    }
+    if (order && a->compound_recycler.retain_last) {
+        int retained=a->compound_recycler.retain_last(a->compound_recycler.context,address,order);
+        if (retained != 0 && retained != 1) __builtin_trap();
+        if (retained) return order;
     }
     uint64_t pages = order_page_count(order);
     if (a->available_pages > a->total_pages ||
@@ -1612,6 +1667,24 @@ void physical_page_release_batch(struct physical_page_allocator *a,
         physical_page_release_buddy(a, addresses[i], 0U, &work);
 }
 
+void physical_page_release_order_batch(struct physical_page_allocator *a,
+    const uint64_t *addresses, const uint8_t *orders, unsigned count)
+{
+    if (!count) return;
+    if (!addresses || !orders || count > PHYSICAL_PAGE_REFERENCE_BATCH_MAX)
+        __builtin_trap();
+    PAGE_METADATA_SCOPE(work, a);
+    if (!allocator_initialized(a) || !physical_page_allocator_is_finalized(a))
+        physical_page_release_fatal(a, addresses[0], orders[0],
+                                    "allocator-state", addresses[0]);
+    for (unsigned i = 0; i < count; i++) {
+        if (orders[i] > PHYSICAL_PAGE_MAX_ORDER)
+            physical_page_release_fatal(a, addresses[i], orders[i],
+                                        "order-range", addresses[i]);
+        physical_page_release_buddy(a, addresses[i], orders[i], &work);
+    }
+}
+
 static uint32_t *page_references_locked(const struct physical_page_allocator *a,uint64_t address,
     uint32_t *page,struct page_work *work)
 {
@@ -1621,19 +1694,21 @@ static uint32_t *page_references_locked(const struct physical_page_allocator *a,
     if (!head_valid(a,&head,work)) __builtin_trap();
     return &a->metadata[*page].reference_count;
 }
-static void acquire_page_locked(struct physical_page_allocator *a,uint64_t address,
-    struct page_work *work)
+static void acquire_order_locked(struct physical_page_allocator *a,uint64_t address,
+    uint32_t order, struct page_work *work)
 {
     uint32_t page;
     uint32_t *references=page_references_locked(a,address,&page,work);
-    if (a->metadata[page].order || *references==UINT32_MAX) __builtin_trap();
+    if (a->metadata[page].order != order || *references==UINT32_MAX) __builtin_trap();
     (*references)++;page_written(work);
 }
-uint32_t physical_page_cow_borrow(struct physical_page_allocator *a,uint64_t address)
+uint32_t physical_page_cow_borrow_order(struct physical_page_allocator *a,
+    uint64_t address, uint32_t order)
 {
     PAGE_METADATA_SCOPE(work,a);
     uint32_t page;
     uint32_t *references=page_references_locked(a,address,&page,&work);
+    if (a->metadata[page].order != order) __builtin_trap();
     uint32_t count=*references;
     if (count>1) {
         if (*references==UINT32_MAX) __builtin_trap();
@@ -1642,11 +1717,22 @@ uint32_t physical_page_cow_borrow(struct physical_page_allocator *a,uint64_t add
     return count;
 }
 
+uint32_t physical_page_cow_borrow(struct physical_page_allocator *a, uint64_t address)
+{ return physical_page_cow_borrow_order(a, address, 0); }
+
+enum physical_page_status physical_page_acquire_order(struct physical_page_allocator *a,
+    uint64_t address, uint32_t order)
+{
+    PAGE_METADATA_SCOPE(work, a);
+    acquire_order_locked(a, address, order, &work);
+    return PHYSICAL_PAGE_STATUS_OK;
+}
+
 enum physical_page_status physical_page_acquire(struct physical_page_allocator *a,
                                                 uint64_t address)
 {
     PAGE_METADATA_SCOPE(work, a);
-    acquire_page_locked(a, address, &work);
+    acquire_order_locked(a, address, 0, &work);
     return PHYSICAL_PAGE_STATUS_OK;
 }
 
@@ -1657,7 +1743,7 @@ void physical_page_acquire_batch(struct physical_page_allocator *a,
     if (!addresses || count > PHYSICAL_PAGE_REFERENCE_BATCH_MAX) __builtin_trap();
     PAGE_METADATA_SCOPE(work, a);
     for (unsigned i = 0; i < count; i++)
-        acquire_page_locked(a, addresses[i], &work);
+        acquire_order_locked(a, addresses[i], 0, &work);
 }
 
 enum physical_page_status
@@ -1668,6 +1754,27 @@ physical_page_reference_count(const struct physical_page_allocator *a, uint64_t 
     uint32_t page;
     if (!references) __builtin_trap();
     *references=*page_references_locked(a,address,&page,&work);
+    return PHYSICAL_PAGE_STATUS_OK;
+}
+
+enum physical_page_status physical_page_allocator_set_compound_recycler(
+    struct physical_page_allocator *a, const struct physical_page_compound_recycler *recycler)
+{
+    if (!physical_page_allocator_is_finalized(a) || !recycler ||
+        !recycler->context || !recycler->retain_last) return PHYSICAL_PAGE_STATUS_INVALID;
+    KERNEL_RAW_SCOPE(guard,&a->lock);
+    if (a->compound_recycler.retain_last) return PHYSICAL_PAGE_STATUS_STATE;
+    a->compound_recycler=*recycler;
+    return PHYSICAL_PAGE_STATUS_OK;
+}
+enum physical_page_status physical_page_allocator_clear_compound_recycler(
+    struct physical_page_allocator *a, void *context)
+{
+    if (!physical_page_allocator_is_finalized(a) || !context) return PHYSICAL_PAGE_STATUS_INVALID;
+    KERNEL_RAW_SCOPE(guard,&a->lock);
+    if (!a->compound_recycler.retain_last || a->compound_recycler.context!=context)
+        return PHYSICAL_PAGE_STATUS_STATE;
+    a->compound_recycler=(struct physical_page_compound_recycler){0};
     return PHYSICAL_PAGE_STATUS_OK;
 }
 

@@ -309,7 +309,7 @@ static void loop_partial_sector_case(struct kernel_vfs_mount *mount,
         assert(!kernel_copy_to_user(&mm,0x200800,"tail-rmw",8,&done));
         assert(!kernel_files_pwrite(local,&mm,loop,0x200800,8,4096,&result) && result==8);
         memcpy(expected+backing_offset+4096,"tail-rmw",8);
-        assert(!kernel_block_file_pwrite(loop_file,4599,"last-nine-and-more",18,&done) && done==9);
+        assert(!kernel_block_file_pwrite(loop_file,4599,"last-nine-and-more",18,0,&done) && done==9);
         memcpy(expected+backing_offset+4599,"last-nine",9);
         memset(actual,0xa5,1024);
         assert(!kernel_open_file_pread(loop_file,4094,actual,1024,&done) && done==514 &&

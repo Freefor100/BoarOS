@@ -448,9 +448,16 @@ tcp_input_on(struct pbuf *p, struct netif *inp, struct netif *dest,
     /* Set up a tcp_seg structure. */
     rx->inseg.next = NULL;
     rx->inseg.len = p->tot_len;
+#ifdef BOAROS_LWIP_TCP_INFO
+    rx->inseg.boaros_sent_bytes = 0;
+#endif
     rx->inseg.p = p;
     rx->inseg.tcphdr = rx->tcphdr;
 
+#ifdef BOAROS_LWIP_TCP_INFO
+    pcb->boaros_segs_in++;
+    if (rx->inseg.len) pcb->boaros_data_in++;
+#endif
     rx->recv_data = NULL;
     rx->recv_flags = 0;
     rx->recv_acked = 0;
@@ -477,6 +484,10 @@ tcp_input_on(struct pbuf *p, struct netif *inp, struct netif *dest,
     }
     tcp_input_pcb = pcb;
     tcp_input_flags = &rx->recv_flags;
+#ifdef BOAROS_LWIP_TCP_INFO
+    u32_t info_rcv_nxt = pcb->rcv_nxt;
+    enum tcp_state info_state = pcb->state;
+#endif
     err = tcp_process(rx, pcb);
     /* A return value of ERR_ABRT means that tcp_abort() was called
        and that the pcb has been freed. If so, we don't do anything. */
@@ -490,6 +501,12 @@ tcp_input_on(struct pbuf *p, struct netif *inp, struct netif *dest,
         tcp_pcb_remove(&tcp_active_pcbs, pcb);
         tcp_free(pcb);
       } else {
+#ifdef BOAROS_LWIP_TCP_INFO
+        if (info_state != SYN_SENT) {
+          u32_t received = pcb->rcv_nxt - info_rcv_nxt;
+          pcb->boaros_bytes_received += received;
+        }
+#endif
         err = ERR_OK;
         /* If the application has registered a "sent" function to be
            called when new send buffer space is available, we call it
@@ -749,6 +766,9 @@ tcp_listen_input(struct tcp_input_state *rx, struct tcp_pcb_listen *pcb)
     npcb->remote_port = rx->tcphdr->src;
     tcp_set_state(npcb, SYN_RCVD);
     npcb->rcv_nxt = rx->seqno + 1;
+#ifdef BOAROS_LWIP_TCP_INFO
+    npcb->boaros_segs_in = 1; /* SYN creating this passive endpoint */
+#endif
     npcb->rcv_ann_right_edge = npcb->rcv_nxt;
     iss = tcp_next_iss(npcb);
     npcb->snd_wl2 = iss;
@@ -940,6 +960,12 @@ tcp_process(struct tcp_input_state *rx, struct tcp_pcb *pcb)
         pcb->rcv_nxt = rx->seqno + 1;
         pcb->rcv_ann_right_edge = pcb->rcv_nxt;
         pcb->lastack = rx->ackno;
+#ifdef BOAROS_LWIP_TCP_INFO
+        pcb->boaros_last_ack = tcp_ticks;
+        pcb->boaros_bytes_acked = 1; /* Linux counts the active SYN in bytes_acked */
+        pcb->boaros_delivered = 1;
+        pcb->boaros_rto_retries = pcb->boaros_rto_backoff = 0;
+#endif
         pcb->snd_wnd = rx->tcphdr->wnd;
         pcb->snd_wnd_max = pcb->snd_wnd;
         pcb->snd_wl1 = rx->seqno - 1; /* initialise to seqno - 1 to force window update */
@@ -1036,6 +1062,10 @@ tcp_process(struct tcp_input_state *rx, struct tcp_pcb *pcb)
           /* If there was any data contained within this ACK,
            * we'd better pass it on to the application as well. */
           tcp_receive(rx, pcb);
+#ifdef BOAROS_LWIP_TCP_INFO
+          /* Linux passive-open bytes_acked excludes its SYN-ACK sequence byte. */
+          if (pcb->boaros_bytes_acked) pcb->boaros_bytes_acked--;
+#endif
 
           /* Prevent ACK for SYN to generate a sent event */
           if (rx->recv_acked != 0) {
@@ -1194,6 +1224,9 @@ tcp_free_acked_segments(struct tcp_input_state *rx, struct tcp_pcb *pcb, struct 
 
     pcb->snd_queuelen = (u16_t)(pcb->snd_queuelen - clen);
     rx->recv_acked = (tcpwnd_size_t)(rx->recv_acked + next->len);
+#ifdef BOAROS_LWIP_TCP_INFO
+    pcb->boaros_delivered++;
+#endif
     tcp_seg_free(next);
 
     LWIP_DEBUGF(TCP_QLEN_DEBUG, ("%"TCPWNDSIZE_F" (after freeing %s)\n",
@@ -1229,6 +1262,9 @@ tcp_receive(struct tcp_input_state *rx, struct tcp_pcb *pcb)
   LWIP_ASSERT("tcp_receive: wrong state", pcb->state >= ESTABLISHED);
 
   if (rx->flags & TCP_ACK) {
+#ifdef BOAROS_LWIP_TCP_INFO
+    if (TCP_SEQ_BETWEEN(rx->ackno, pcb->lastack, pcb->snd_nxt)) pcb->boaros_last_ack = tcp_ticks;
+#endif
     right_wnd_edge = pcb->snd_wnd + pcb->snd_wl2;
 
     /* Update window. */
@@ -1315,12 +1351,19 @@ tcp_receive(struct tcp_input_state *rx, struct tcp_pcb *pcb)
 
       /* Reset the number of retransmissions. */
       pcb->nrtx = 0;
+#ifdef BOAROS_LWIP_TCP_INFO
+      pcb->boaros_rto_retries = pcb->boaros_rto_backoff = 0;
+#endif
 
       /* Reset the retransmission time-out. */
       pcb->rto = (s16_t)((pcb->sa >> 3) + pcb->sv);
 
       /* Record how much data this ACK acks */
       acked = (tcpwnd_size_t)(rx->ackno - pcb->lastack);
+#ifdef BOAROS_LWIP_TCP_INFO
+      pcb->boaros_bytes_acked += acked;
+      pcb->boaros_last_ack = tcp_ticks;
+#endif
 
       /* Reset the fast retransmit variables. */
       pcb->dupacks = 0;
@@ -1421,6 +1464,9 @@ tcp_receive(struct tcp_input_state *rx, struct tcp_pcb *pcb)
       /* diff between this shouldn't exceed 32K since this are tcp timer ticks
          and a round-trip shouldn't be that long... */
       m = (s16_t)(tcp_ticks - pcb->rttest);
+#ifdef BOAROS_LWIP_TCP_INFO
+      pcb->boaros_min_rtt = LWIP_MIN(pcb->boaros_min_rtt, (u32_t)m * TCP_SLOW_INTERVAL * 1000U);
+#endif
 
       LWIP_DEBUGF(TCP_RTO_DEBUG, ("tcp_receive: experienced rtt %"U16_F" ticks (%"U16_F" msec).\n",
                                   m, (u16_t)(m * TCP_SLOW_INTERVAL)));
@@ -1532,6 +1578,9 @@ tcp_receive(struct tcp_input_state *rx, struct tcp_pcb *pcb)
        processed. */
     if (TCP_SEQ_BETWEEN(rx->seqno, pcb->rcv_nxt,
                         pcb->rcv_nxt + pcb->rcv_wnd - 1)) {
+#ifdef BOAROS_LWIP_TCP_INFO
+      if (TCP_SEQ_GT(rx->seqno, pcb->rcv_nxt)) pcb->boaros_ooopack++;
+#endif
       if (pcb->rcv_nxt == rx->seqno) {
         /* The incoming segment is the next in sequence. We check if
            we have to trim the end of the segment and update rcv_nxt
@@ -1613,6 +1662,12 @@ tcp_receive(struct tcp_input_state *rx, struct tcp_pcb *pcb)
         }
 #endif /* TCP_QUEUE_OOSEQ */
 
+#ifdef BOAROS_LWIP_TCP_INFO
+        if (rx->inseg.len) {
+          pcb->boaros_last_recv = tcp_ticks;
+          pcb->boaros_rcv_mss = LWIP_MAX(pcb->boaros_rcv_mss, rx->inseg.len);
+        }
+#endif
         pcb->rcv_nxt = rx->seqno + rx->tcplen;
 
         /* Update the receiver's (our) window. */

@@ -1,4 +1,8 @@
+#if defined(__riscv)
+#include <arch/riscv/vector.h>
+#endif
 #include "../../fs/files/private.h"
+#include "../../fs/cgroup_internal.h"
 #include "../../fs/open_file_internal.h"
 #include <kernel/reboot.h>
 #include <kernel/namespace.h>
@@ -41,6 +45,7 @@
 
 #include "../exec_internal.h"
 #include "private.h"
+#include <kernel/seccomp.h>
 #include "ptrace_internal.h"
 #include <kernel/remote_memory.h>
 
@@ -71,11 +76,13 @@
 #define LINUX_CLONE_FS UINT64_C(0x200)
 #define LINUX_CLONE_NEWNS UINT64_C(0x20000)
 #define LINUX_CLONE_NEWUTS UINT64_C(0x04000000)
+#define LINUX_CLONE_NEWPID UINT64_C(0x20000000)
 #define LINUX_CLONE_NEWIPC UINT64_C(0x08000000)
 #define LINUX_CLONE_FILES UINT64_C(0x400)
 #define LINUX_CLONE_SIGHAND UINT64_C(0x800)
 #define LINUX_CLONE_CLEAR_SIGHAND UINT64_C(0x100000000)
 #define LINUX_CLONE_VFORK UINT64_C(0x4000)
+#define LINUX_CLONE_SYSVSEM UINT64_C(0x40000)
 #define LINUX_CLONE_THREAD UINT64_C(0x10000)
 #define LINUX_CLONE_SETTLS UINT64_C(0x80000)
 #define LINUX_CLONE_PARENT_SETTID UINT64_C(0x100000)
@@ -84,7 +91,7 @@
 
 static struct kernel_task *session_target(struct kernel_task *caller, kernel_pid_t pid)
 {
-    struct kernel_task *target = pid ? process_find_identity(pid, KERNEL_PID_TID) : caller;
+    struct kernel_task *target = pid ? process_find_identity_in(pid, KERNEL_PID_TID, process_pid_active(caller)) : caller;
     return target && target->accounted && target->group_leader ? target : 0;
 }
 
@@ -102,20 +109,20 @@ int64_t kernel_task_getpgid(struct kernel_task *caller, kernel_pid_t pid)
 {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     struct kernel_task *target = session_target(caller, pid);
-    return target ? process_identity_number(target, KERNEL_PID_PGID) : -KERNEL_ESRCH;
+    return target ? kernel_pid_number_in(process_identity(target, KERNEL_PID_PGID), process_pid_active(caller)) : -KERNEL_ESRCH;
 }
 
 int64_t kernel_task_getsid(struct kernel_task *caller, kernel_pid_t pid)
 {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     struct kernel_task *target = session_target(caller, pid);
-    return target ? process_identity_number(target, KERNEL_PID_SID) : -KERNEL_ESRCH;
+    return target ? kernel_pid_number_in(process_identity(target, KERNEL_PID_SID), process_pid_active(caller)) : -KERNEL_ESRCH;
 }
 
 static int64_t setpgid_locked(struct kernel_task *caller, kernel_pid_t pid, kernel_pid_t pgid)
 {
     struct kernel_task *leader = caller->group_leader;
-    if (!pid) pid = leader->tid;
+    if (!pid) pid = kernel_pid_number_in(process_identity(leader, KERNEL_PID_TGID), process_pid_active(caller));
     if (!pgid) pgid = pid;
     if (pgid < 0) return -KERNEL_EINVAL;
     struct kernel_task *target = session_target(caller, pid);
@@ -129,7 +136,7 @@ static int64_t setpgid_locked(struct kernel_task *caller, kernel_pid_t pid, kern
     if (target->session_leader) return -KERNEL_EPERM;
     struct kernel_pid *group = process_identity(target, KERNEL_PID_TGID);
     if (pgid != pid) {
-        group = kernel_pid_find(&scheduler.identities, pgid);
+        group = kernel_pid_find(process_pid_active(caller), pgid);
         struct kernel_task *member = group && group->members[KERNEL_PID_PGID]
             ? group->members[KERNEL_PID_PGID]->task : 0;
         if (!member || process_identity(member, KERNEL_PID_SID) !=
@@ -161,7 +168,7 @@ int64_t kernel_task_setsid(struct kernel_task *caller)
         leader->session_leader = 1;
         identity_change_role(leader, KERNEL_PID_SID, identity);
         identity_change_role(leader, KERNEL_PID_PGID, identity);
-        result = identity->number;
+        result = kernel_pid_number_in(identity, process_pid_active(caller));
     }
     kernel_task_tty_clear(caller);
     process_identity_collect();
@@ -180,7 +187,10 @@ static int group_orphaned(struct kernel_pid *group, const struct kernel_task *ig
             struct kernel_task *member = cursor.task;
             struct kernel_task *parent = member->parent;
             if (member->accounted && member->identities[KERNEL_PID_PGID].identity == group &&
-                member != ignored && parent && parent != scheduler.init_task &&
+                member != ignored && parent &&
+                /* Only global init is excluded from POSIX orphan checks;
+                 * a nested init can still connect two groups in one session. */
+                parent != process_pid_reaper_locked(&scheduler.identities) &&
                 !(member->group_members == 1 && (member->state == KERNEL_THREAD_STATE_EXITED ||
                   member->state == KERNEL_THREAD_STATE_ZOMBIE || member->state == KERNEL_THREAD_STATE_GROUP_DEAD)) &&
                 process_identity(parent, KERNEL_PID_PGID) != group &&
@@ -312,6 +322,7 @@ static void request_thread_termination_locked(struct kernel_task *task)
         else ready_enqueue_locked(task, 0);
     }
     ptrace_terminate_locked(task);
+    kernel_seccomp_abort_wait_locked(task);
     kernel_wait_interrupt_locked(task);
 }
 
@@ -343,6 +354,11 @@ void process_group_request_exit(struct kernel_task *task,
         if (!leader) __builtin_trap();
         if (!leader->group_exiting) {
             leader->group_exiting = 1;
+            process_pid_reaper_disable_locked(leader);
+            /* Exec may have adopted another TID since task construction.
+             * Commit the current group identity with its final exit result. */
+            leader->completion.tid = leader->tid;
+            leader->completion.tgid = leader->tid;
             leader->completion.reason = reason;
             leader->completion.status = status;
             leader->completion.detail = detail;
@@ -376,7 +392,8 @@ void kernel_user_group_exit(enum kernel_thread_exit_reason reason,
     if (kernel_task_has_user_context(kernel_task_current()) && !kernel_scheduler_user_service_active())
         kernel_scheduler_enter_user_service();
 #endif
-    process_group_request_exit(kernel_cpu_current()->current, reason, status, detail);
+    if (reason == KERNEL_THREAD_EXIT_SYSCALL)
+        process_group_request_exit(kernel_cpu_current()->current, reason, status, detail);
     kernel_user_thread_exit(reason, status, detail);
 }
 
@@ -395,14 +412,13 @@ enum kernel_mm_status kernel_scheduler_resolve_current_user_fault(
      * 当前执行owner固定的task/MM，不把CPU借用带入缺页服务。 */
     struct kernel_cpu *cpu = kernel_cpu_current();
     struct kernel_task *current = cpu->current;
-    if (validate_current_on_cpu(cpu) != KERNEL_SCHEDULER_STATUS_OK ||
+    if (check_running_on_cpu(cpu) != KERNEL_SCHEDULER_STATUS_OK ||
         current == cpu->idle || current->state != KERNEL_THREAD_STATE_RUNNING ||
-        current->arch.user_mode != 1U) {
+        current->arch.user_mode != 1U || current->mm.state != KERNEL_MM_LIVE ||
+        cpu->active_mm_record != current->mm.record) {
         return KERNEL_MM_STATUS_STATE;
     }
-    return kernel_mm_resolve_user_fault(&current->mm,
-                                        virtual_address,
-                                        access);
+    return kernel_mm_resolve_owned_user_fault(&current->mm,current,virtual_address,access);
 }
 
 static enum kernel_scheduler_status validate_child_endpoints(
@@ -593,6 +609,7 @@ enum kernel_scheduler_status process_group_exec_current(void)
             }
         task->session_leader = leader->session_leader;
         task->child_subreaper = leader->child_subreaper;
+        __atomic_store_n(&task->signal_unkillable,leader->signal_unkillable,__ATOMIC_RELAXED);
         task->child_creator = leader->child_creator;
         leader->child_creator = 0;
         task->dead_usage = leader->dead_usage;
@@ -655,12 +672,18 @@ void kernel_task_namespaces_initial(struct kernel_task *task)
 }
 void kernel_task_namespaces_release(struct kernel_task *task)
 {
-    if(!task->uts_namespace && !task->ipc_namespace)return;
+    if(!task->uts_namespace && !task->ipc_namespace && !task->pid_for_children)return;
     struct kernel_namespace *uts,*ipc;
+    int had_pid_override;
     { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
       uts=task->uts_namespace;ipc=task->ipc_namespace;
-      task->uts_namespace=task->ipc_namespace=0; }
+      task->uts_namespace=task->ipc_namespace=0;
+      had_pid_override=task->pid_for_children!=NULL;
+      if(task->pid_for_children) {
+          kernel_pid_registry_put(task->pid_for_children);task->pid_for_children=NULL;
+      } }
     kernel_namespace_put(uts);kernel_namespace_put(ipc);
+    if(had_pid_override)process_identity_collect();
 }
 struct kernel_namespace *kernel_task_uts_namespace(void)
 {
@@ -674,6 +697,18 @@ struct kernel_namespace *kernel_task_ipc_namespace(void)
     if(task && task->arch.user_mode && !task->ipc_namespace)__builtin_trap();
     return task && task->ipc_namespace?task->ipc_namespace:kernel_ipc_initial();
 }
+/* A successful quota charge belongs to child, including on later errors:
+ * the common clone unwind releases it with the other child resources. */
+int process_clone_admit(struct kernel_task *child, struct kernel_task *parent, uint64_t flags)
+{
+    int error = kernel_nproc_acquire(child, parent);
+    if (error) return error;
+    if ((flags & (LINUX_CLONE_NEWNS | LINUX_CLONE_NEWUTS | LINUX_CLONE_NEWIPC | LINUX_CLONE_NEWPID)) &&
+        !kernel_credentials_capable(kernel_credentials_current(), KERNEL_CAP_SYS_ADMIN))
+        return -KERNEL_EPERM;
+    return 0;
+}
+
 static int clone_namespaces(struct kernel_task *child,struct kernel_task *parent,uint64_t flags)
 {
     if(!parent->uts_namespace || !parent->ipc_namespace)__builtin_trap();
@@ -782,6 +817,9 @@ static enum kernel_scheduler_status finish_clone_failure(
     return scheduler_failure;
 }
 
+static void clone_cgroup_end(struct kernel_cgroup **group)
+{ if (*group) kernel_cgroup_put(*group); }
+
 enum kernel_scheduler_status arch_process_clone_current(
     const struct arch_trap_frame *parent_frame,
     uint64_t flags,
@@ -790,6 +828,8 @@ enum kernel_scheduler_status arch_process_clone_current(
     uint64_t tls,
     uint64_t child_tid,
     uint64_t pidfd_address,
+    const int32_t *requested_tids, size_t requested_count,
+    int32_t cgroup_fd,
     int64_t *linux_result)
 {
     struct kernel_task *parent;
@@ -828,12 +868,12 @@ enum kernel_scheduler_status arch_process_clone_current(
         arch_frame_pc(parent_frame) > UINT64_MAX - 4U) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
-    if ((flags & (LINUX_CLONE_NEWNS|LINUX_CLONE_NEWUTS|LINUX_CLONE_NEWIPC)) &&
-        !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN)) {
-        *linux_result=-KERNEL_EPERM;
+    /* Only the running caller can change its for-children override. Reject a
+     * split thread group before allocating a task or charging RLIMIT_NPROC. */
+    if (thread_clone && ((flags & LINUX_CLONE_NEWPID) || parent->pid_for_children)) {
+        *linux_result = -KERNEL_EINVAL;
         return KERNEL_SCHEDULER_STATUS_OK;
     }
-
     status = allocate_task_pages(&child);
     if (status == KERNEL_SCHEDULER_STATUS_NO_MEMORY) {
         *linux_result = -KERNEL_ENOMEM;
@@ -847,7 +887,7 @@ enum kernel_scheduler_status arch_process_clone_current(
         kernel_credentials_clone(parent->files.heap,parent->credentials);
     if (!child->credentials)
         return finish_clone_failure(child,-KERNEL_ENOMEM,linux_result,KERNEL_SCHEDULER_STATUS_OK);
-    int admitted=kernel_nproc_acquire(child,parent);
+    int admitted=process_clone_admit(child,parent,flags);
     if(admitted)return finish_clone_failure(child,admitted,linux_result,KERNEL_SCHEDULER_STATUS_OK);
     child->limits=thread_clone?kernel_resource_limits_get(parent->limits):
         kernel_resource_limits_create(parent->limits->heap,parent->limits);
@@ -863,7 +903,6 @@ enum kernel_scheduler_status arch_process_clone_current(
     if(io_result)
         return finish_clone_failure(child,io_result,linux_result,KERNEL_SCHEDULER_STATUS_OK);
     child->personality=parent->personality;
-    child->no_new_privs=parent->no_new_privs;
     child->arch.user_mode = 1U;
     child->state = KERNEL_THREAD_STATE_EXITED;
     child->completion.kind = KERNEL_THREAD_KIND_USER;
@@ -933,18 +972,37 @@ enum kernel_scheduler_status arch_process_clone_current(
                     : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
         }
     }
-    pid_status = process_identity_create(child, parent, thread_clone);
+    int may_set_tid = 0;
+    if (requested_count) {
+        const struct kernel_credentials *cred = kernel_credentials_current();
+        may_set_tid = kernel_credentials_capable(cred, KERNEL_CAP_SYS_ADMIN) ||
+                      kernel_credentials_capable(cred, KERNEL_CAP_CHECKPOINT_RESTORE);
+    }
+    pid_status = (flags & LINUX_CLONE_NEWPID)
+        ? process_identity_create_new_namespace(child, parent, requested_tids, requested_count, may_set_tid)
+        : process_identity_create_numbers(child, parent, thread_clone, requested_tids, requested_count, may_set_tid);
     if (pid_status != KERNEL_PID_STATUS_OK) {
         return finish_clone_failure(
             child,
-            pid_status == KERNEL_PID_STATUS_EXHAUSTED
-                ? -KERNEL_EAGAIN : -KERNEL_ENOMEM,
+            pid_status == KERNEL_PID_STATUS_PERMISSION ? -KERNEL_EPERM :
+            pid_status == KERNEL_PID_STATUS_EXISTS ? -KERNEL_EEXIST :
+            pid_status == KERNEL_PID_STATUS_DEPTH_LIMIT ? -KERNEL_ENOSPC :
+            pid_status == KERNEL_PID_STATUS_INVALID ? -KERNEL_EINVAL :
+            pid_status == KERNEL_PID_STATUS_EXHAUSTED ? -KERNEL_EAGAIN : -KERNEL_ENOMEM,
             linux_result,
-            pid_status == KERNEL_PID_STATUS_EXHAUSTED
+            (pid_status == KERNEL_PID_STATUS_NO_MEMORY || pid_status == KERNEL_PID_STATUS_PERMISSION ||
+             pid_status == KERNEL_PID_STATUS_EXHAUSTED || pid_status == KERNEL_PID_STATUS_EXISTS ||
+             pid_status == KERNEL_PID_STATUS_INVALID || pid_status == KERNEL_PID_STATUS_DEPTH_LIMIT ||
+             pid_status == KERNEL_PID_STATUS_NAMESPACE_DEAD)
                 ? KERNEL_SCHEDULER_STATUS_OK
                 : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
     }
     tid = child->tid;
+    /* The child identity is private; the executing parent's active namespace
+     * cannot change. Completion bookkeeping below still uses root tid. */
+    kernel_pid_t parent_visible_tid = kernel_pid_number_in(
+        process_identity(child, KERNEL_PID_TID), process_pid_active(parent));
+    if (!parent_visible_tid) __builtin_trap();
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
 #if BOAROS_USER_SMP
@@ -1008,9 +1066,10 @@ enum kernel_scheduler_status arch_process_clone_current(
                                          (flags & LINUX_CLONE_SETTLS) != 0U,
                                          tls);
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
-        return finish_clone_failure(
-            child, -KERNEL_EAGAIN, linux_result,
-            KERNEL_SCHEDULER_STATUS_INVALID_STATE);
+        return finish_clone_failure(child,
+            status == KERNEL_SCHEDULER_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EAGAIN,
+            linux_result, status == KERNEL_SCHEDULER_STATUS_NO_MEMORY ?
+                KERNEL_SCHEDULER_STATUS_OK : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
     }
 
     if (pidfd.files) {
@@ -1027,6 +1086,20 @@ enum kernel_scheduler_status arch_process_clone_current(
 #if BOAROS_COST_DIAGNOSTICS
     kernel_cost_inherit(&child->cost, &parent->cost);
 #endif
+    struct kernel_cgroup *destination __attribute__((cleanup(clone_cgroup_end))) = 0;
+    if (cgroup_fd >= 0) {
+        struct kernel_open_file_description *file = 0;
+        int64_t error = 0;
+        enum kernel_files_status pinned = kernel_files_pin(&parent->files,cgroup_fd,&file,&error);
+        if (pinned != KERNEL_FILES_STATUS_OK) error = -KERNEL_EBADF;
+        if (!error) error = kernel_cgroup_from_file(file,&destination);
+        if (file && kernel_open_file_release(&file)) __builtin_trap();
+        if (error) {
+            (void)kernel_mm_remove_user(&child->mm);
+            return finish_clone_failure(child,error,linux_result,KERNEL_SCHEDULER_STATUS_OK);
+        }
+    }
+    struct kernel_pid *trace_child __attribute__((cleanup(kernel_task_identity_end))) = NULL;
     unsigned trace_event=0;
     int rejected;
     for (;;) {
@@ -1038,7 +1111,18 @@ enum kernel_scheduler_status arch_process_clone_current(
         struct kernel_task *leader = parent->group_leader;
         rejected = kernel_reboot_requested_locked() || parent->retirement || parent->terminate_requested ||
                    leader->group_exiting || leader->group_execing;
+        if (rejected) { rejected = -KERNEL_EAGAIN; break; }
+        /* Namespace shutdown is a recoverable clone rejection, before ptrace,
+         * cgroup, pidfd, child links or any published identity is changed. */
+        rejected = process_identity_admit_locked(child);
         if (rejected) break;
+        if (destination) {
+            struct kernel_cgroup *source = parent->cgroup ? parent->cgroup : kernel_cgroup_root();
+            rejected = !destination->linked ? -KERNEL_ENODEV :
+                kernel_cgroup_permission(source,destination,kernel_credentials_current());
+            if (!rejected && thread_clone && source != destination) rejected = -KERNEL_EOPNOTSUPP;
+            if (rejected) break;
+        }
         /* Attach may race the fallible allocations above. Choose the child
          * trace link at publication, outside-lock allocation only if needed. */
         int event = ptrace_clone_locked(parent, child, flags);
@@ -1051,7 +1135,21 @@ enum kernel_scheduler_status arch_process_clone_current(
             }
             continue;
         }
+        /* Install group membership before making the child runnable. */
+        struct kernel_cgroup *chosen = destination ? destination : parent->cgroup;
+        if (chosen && chosen != kernel_cgroup_root()) {
+            child->cgroup = kernel_cgroup_get(chosen);
+            chosen->members++;
+        }
+        /* Publish the inherited policy together with the child so a
+         * concurrent TSYNC cannot miss an unpublished descendant. */
+        child->no_new_privs=parent->no_new_privs;
+        kernel_seccomp_clone(child,parent);
         trace_event = (unsigned)event;
+        if(trace_event || vfork) {
+            trace_child=process_identity(child,KERNEL_PID_TID);
+            kernel_pid_get(trace_child);
+        }
         memcpy(child->comm, parent->comm, sizeof(child->comm));
         if(pidfd.files) kernel_pidfd_install_clone_locked(&pidfd);
         if (thread_clone) {
@@ -1090,11 +1188,11 @@ enum kernel_scheduler_status arch_process_clone_current(
     }
     if (rejected) {
         (void)kernel_mm_remove_user(&child->mm);
-        return finish_clone_failure(child, -KERNEL_EAGAIN, linux_result, KERNEL_SCHEDULER_STATUS_OK);
+        return finish_clone_failure(child, rejected, linux_result, KERNEL_SCHEDULER_STATUS_OK);
     }
     if (flags & LINUX_CLONE_PARENT_SETTID) {
         size_t copied;
-        (void)kernel_copy_to_user(&parent->mm, parent_tid, &tid, sizeof(tid), &copied);
+        (void)kernel_copy_to_user(&parent->mm, parent_tid, &parent_visible_tid, sizeof(parent_visible_tid), &copied);
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         if (child->state != KERNEL_THREAD_STATE_NEW) __builtin_trap();
         child->state = KERNEL_THREAD_STATE_READY;
@@ -1103,8 +1201,8 @@ enum kernel_scheduler_status arch_process_clone_current(
 #endif
         ready_enqueue_locked(child, 0);
     }
-    *linux_result = tid;
-    if (trace_event) ptrace_event(parent,trace_event,tid);
+    *linux_result = parent_visible_tid;
+    if (trace_event) ptrace_event_pid(parent,trace_event,trace_child);
 
     if (vfork) {
         /* Linux suspends the vfork parent inside the syscall until the
@@ -1117,7 +1215,7 @@ enum kernel_scheduler_status arch_process_clone_current(
                 return status;
             }
         }
-        ptrace_event(parent,TRACE_VFORK_DONE,tid);
+        ptrace_event_pid(parent,TRACE_VFORK_DONE,trace_child);
     }
     return KERNEL_SCHEDULER_STATUS_OK;
 }
@@ -1130,7 +1228,7 @@ static struct kernel_pid *wait_target_get(struct kernel_task *parent, int32_t wh
     /* 一次调用持有同一个identity；setpgid和数字重用都不改变等待目标。 */
     struct kernel_pid *identity = which == LINUX_P_PGID && !upid
         ? process_identity(parent, KERNEL_PID_PGID)
-        : kernel_pid_find(&scheduler.identities, (kernel_pid_t)upid);
+        : kernel_pid_find(process_pid_active(parent), (kernel_pid_t)upid);
     if (identity) kernel_pid_get(identity);
     return identity;
 }
@@ -1194,7 +1292,8 @@ static enum kernel_scheduler_status reap_waited_child(
     uint64_t rusage_address,
     int64_t *linux_result)
 {
-    kernel_pid_t pid = child->tid;
+    kernel_pid_t pid = kernel_pid_number_in(process_identity(child, KERNEL_PID_TID),
+                                             process_pid_active(parent));
     uint32_t wait_status = child->wait_status;
     struct kernel_task_usage usage = {0};
     scheduler_usage_snapshot_mm(child, -2, &usage);
@@ -1243,6 +1342,7 @@ static enum kernel_scheduler_status report_wait_event(
     struct kernel_task *parent,
     struct kernel_task *child,
     uint32_t wait_status,
+    kernel_pid_t visible_pid,
     uint64_t status_address,
     uint64_t rusage_address,
     int64_t *linux_result)
@@ -1284,7 +1384,7 @@ static enum kernel_scheduler_status report_wait_event(
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
     }
-    *linux_result = child->tid;
+    *linux_result = visible_pid;
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
@@ -1508,7 +1608,7 @@ void process_release_traced_zombie(struct kernel_task *child)
         if (parent) scheduler_task_get_locked(parent);
     }
     if (parent) kernel_signal_notify_child_exit(child);
-    int autoreap=parent && child->exit_signal==17 && kernel_signal_child_autoreap(parent);
+    int autoreap=parent && kernel_signal_child_autoreap(parent,child->exit_signal);
     int cleanup=0;
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
@@ -1559,14 +1659,18 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(int64_t pid,
     if (event==TRACE_WAIT_FINAL && finish_traced_wait(parent,child)) event=1;
     if (event == 1) return reap_waited_child(parent, child, status_address, rusage_address, linux_result);
     uint32_t reported;
+    kernel_pid_t visible_pid;
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        /* Capture identity with the event before user copies can sleep. */
+        visible_pid = kernel_pid_number_in(process_identity(child, KERNEL_PID_TID),
+                                           process_pid_active(parent));
         if (event==TRACE_WAIT_STOP) reported=ptrace_wait_status_locked(child,1);
         else reported = event == 2 || event==TRACE_WAIT_FINAL ? child->wait_status : LINUX_WAIT_CONTINUED;
         if (event == 2) child->stop_notified = 1;
         else if (event==3) child->continue_notified = 0;
     }
-    return report_wait_event(parent, child, reported, status_address, rusage_address, linux_result);
+    return report_wait_event(parent, child, reported, visible_pid, status_address, rusage_address, linux_result);
 }
 
 enum kernel_scheduler_status kernel_scheduler_waitid_current(int32_t which,
@@ -1628,7 +1732,8 @@ enum kernel_scheduler_status kernel_scheduler_waitid_current(int32_t which,
         uint32_t ws;
         {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-            child_pid = child->tid;
+            child_pid = kernel_pid_number_in(process_identity(child, KERNEL_PID_TID),
+                                             process_pid_active(parent));
             child_uid = kernel_credentials_task_locked(child)->uid;
             ws = event==TRACE_WAIT_STOP ? ptrace_wait_status_locked(child,!(options&LINUX_WNOWAIT)) : child->wait_status;
             if (event == 2 && !(options & LINUX_WNOWAIT)) child->stop_notified = 1;
@@ -1664,6 +1769,7 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
     struct kernel_task *thread);
 static uint32_t user_wait_status(const struct kernel_thread_completion *completion);
 static void reparent_children(struct kernel_task *departing);
+static int process_pid_namespace_drain(struct kernel_task *leader);
 
 int kernel_scheduler_can_sleep(void)
 {
@@ -1680,7 +1786,7 @@ void kernel_scheduler_register_cleanup(void)
     scheduler.cleanup_task = kernel_cpu_current()->current;
 }
 void kernel_scheduler_notify_cleanup(void)
-{ (void)kernel_wait_queue_wake_all(&scheduler.cleanup_queue); }
+{ KERNEL_IRQ_SCOPE(notify_irq); (void)kernel_wait_queue_wake_all(&scheduler.cleanup_queue); }
 static int cleanup_waiting(uint64_t retry_deadline)
 {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
@@ -1916,6 +2022,17 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
         if (status != KERNEL_SCHEDULER_STATUS_OK) {
             return status;
         }
+        /* The final namespace init cannot be published to its outer parent
+         * until descendants (including externally parented zombies) are gone.
+         * A deferred reaper retains metadata, not a worker or user stack. */
+        if (thread->group_leader == thread && thread->group_members == 1) {
+            if(process_pid_namespace_drain(thread)) {
+                claim = 0; /* drain detached this EXITED owner and released its claim */
+                return KERNEL_SCHEDULER_STATUS_EMPTY;
+            }
+            /* Namespace reboot replaces SIGKILL only after final drain. */
+            result=thread->completion;
+        }
         /* The creator still owns its TID, credentials and group identity here.
          * A leader returning from GROUP_DEAD has already moved its children. */
         if (thread->group_leader) reparent_children(thread);
@@ -1988,7 +2105,7 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
         }
         if (thread->parent != 0) {
             kernel_signal_notify_child_exit(thread);
-            if (thread->exit_signal == 17U && kernel_signal_child_autoreap(thread->parent)) {
+            if (kernel_signal_child_autoreap(thread->parent,thread->exit_signal)) {
                 child_remove(thread->parent, thread);
             }
         }
@@ -2055,6 +2172,9 @@ static void switch_to_fatal_idle(enum kernel_scheduler_status status)
         }
         kernel_cpu_current()->current = kernel_cpu_current()->idle;
         arch_fpu_switch(0, &kernel_cpu_current()->idle->fpu);
+#if defined(__riscv)
+        riscv_vector_restore(kernel_cpu_current()->idle);
+#endif
         arch_context_switch(&kernel_cpu_current()->discard_context,
                              &kernel_cpu_current()->idle->context);
     }
@@ -2070,7 +2190,7 @@ static enum kernel_scheduler_status cleanup_user_mm(struct kernel_task *thread)
     if (thread->mm.state != KERNEL_MM_LIVE && thread->mm.state != KERNEL_MM_CLEANUP)
         return KERNEL_SCHEDULER_STATUS_OK;
     scheduler_usage_save_mm(thread);
-    mm_status = kernel_mm_release(&thread->mm);
+    mm_status = kernel_mm_release_for_task(&thread->mm,thread);
     if (mm_status == KERNEL_MM_STATUS_OK) return KERNEL_SCHEDULER_STATUS_OK;
     if (mm_status == KERNEL_MM_STATUS_PAGE_ACCESS) return KERNEL_SCHEDULER_STATUS_PAGE_ACCESS;
     if (mm_status == KERNEL_MM_STATUS_CLEANUP_REQUIRED) return KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP;
@@ -2382,9 +2502,8 @@ static uint32_t user_wait_status(
         return 9U; /* SIGKILL */
     }
     if (completion->reason == KERNEL_THREAD_EXIT_SIGNAL) {
-        /* A core-producing default action does not mean a dump was written.
-         * BoarOS has no core writer; Linux sets bit 7 only after a dump. */
-        return (uint32_t)completion->status & UINT32_C(0x7f);
+        return ((uint32_t)completion->status & UINT32_C(0x7f)) |
+            (completion->detail ? UINT32_C(0x80) : 0);
     }
     return fault_wait_status(completion->status);
 }
@@ -2409,7 +2528,9 @@ static struct kernel_task *child_reaper_locked(struct kernel_task *departing)
     struct kernel_task *leader = departing->group_leader;
     struct kernel_task *member = live_reaper_locked(leader, departing);
     if (member) return member;
+    struct kernel_pid_registry *space = process_pid_active(departing);
     for (struct kernel_task *ancestor = leader->parent; ancestor; ancestor = ancestor->parent) {
+        if (process_pid_active(ancestor) != space) break;
         /* During a nonleader exec the old child-list owner briefly aliases
          * the new leader. Both designate the same natural parent group. */
         ancestor = ancestor->group_leader;
@@ -2418,7 +2539,10 @@ static struct kernel_task *child_reaper_locked(struct kernel_task *departing)
             if (member) return member;
         }
     }
-    return live_reaper_locked(scheduler.init_task, departing);
+    struct kernel_task *reaper = process_pid_reaper_locked(space);
+    if (space && space->parent && !space->accepting && reaper)
+        return reaper; /* Dying namespace init still owns adoption and autoreap. */
+    return live_reaper_locked(reaper, departing);
 }
 
 static struct kernel_task *parent_death_notices_locked(struct kernel_task *child,
@@ -2471,7 +2595,8 @@ static void reparent_children(struct kernel_task *departing)
                 if (notices) {
                     group = process_identity(child, KERNEL_PID_TGID);
                     kernel_pid_get(group);
-                    sender = process_identity_number(departing, KERNEL_PID_TGID);
+                    sender = kernel_pid_number_in(process_identity(departing, KERNEL_PID_TGID),
+                                                   process_pid_active(child));
                     uid = kernel_credentials_task_locked(departing)->uid;
                 }
                 child_creator_change_locked(child, process_identity(reaper, KERNEL_PID_TID));
@@ -2508,7 +2633,7 @@ static void reparent_children(struct kernel_task *departing)
         }
         if (zombie && new_parent) {
             kernel_signal_notify_child_exit(child);
-            if (kernel_signal_child_autoreap(new_parent)) {
+            if (kernel_signal_child_autoreap(new_parent,17U)) {
                 KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
                 if (child->parent == new_parent && child->state == KERNEL_THREAD_STATE_ZOMBIE &&
                     !child->reaping) {
@@ -2527,6 +2652,98 @@ static void reparent_children(struct kernel_task *departing)
     }
 }
 
+int kernel_task_reboot_namespace(struct kernel_task *caller,enum kernel_reboot_action action)
+{
+    SCHEDULER_TASK_BORROW(init,NULL);
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        struct kernel_pid_registry *space=process_pid_active(caller);
+        if(!space || !space->parent)return 0;
+        if(action<KERNEL_REBOOT_RESTART || action>KERNEL_REBOOT_POWER_OFF)return -KERNEL_EINVAL;
+        struct kernel_pid *id=space->child_reaper;
+        init=id && id->members[KERNEL_PID_TGID]?id->members[KERNEL_PID_TGID]->task:NULL;
+        if(!init)return -KERNEL_ESRCH;
+        scheduler_task_get_locked(init);
+        space->reboot_signal=action==KERNEL_REBOOT_RESTART?1U:2U;
+    }
+    /* Trusted SIGKILL uses this same group-exit transaction. The registry
+     * keeps the reported HUP/INT separate until every descendant is gone. */
+    process_group_request_exit(init,KERNEL_THREAD_EXIT_SIGNAL,9,0);
+    return 1;
+}
+
+static void namespace_reboot_completion_locked(struct kernel_task *leader,
+    struct kernel_pid_registry *space)
+{
+    if(space->reboot_signal) {
+        leader->completion.reason=KERNEL_THREAD_EXIT_SIGNAL;
+        leader->completion.status=space->reboot_signal;
+        leader->completion.detail=0;
+        leader->wait_status=user_wait_status(&leader->completion);
+    }
+}
+
+/* Called only by the cleanup owner after the init group has one remaining
+ * metadata container and no MM/FD/stack resources. Never wait on this worker:
+ * it is also responsible for retiring the namespace's other tasks. */
+static int process_pid_namespace_drain(struct kernel_task *leader)
+{
+    struct kernel_pid_registry *space;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        space = process_pid_active(leader);
+        if (!space || !space->parent ||
+            space->child_reaper != process_identity(leader, KERNEL_PID_TGID)) return 0;
+        if (space->shutdown_reaper) {
+            if (space->shutdown_reaper != leader || space->numbers->allocated != 1)
+                __builtin_trap();
+            namespace_reboot_completion_locked(leader,space);
+            return 0;
+        }
+        kernel_pid_registry_disable(space);
+        space->shutdown_reaper = leader;
+    }
+    kernel_signal_ignore_sigchld(leader);
+    kernel_pid_t after = 1;
+    for (;;) {
+        SCHEDULER_TASK_BORROW(target, NULL);
+        {
+            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+            target = process_pid_namespace_kill_target_locked(space, &after);
+            if (!target) break;
+            scheduler_task_get_locked(target);
+        }
+        if (target) process_group_request_exit(target, KERNEL_THREAD_EXIT_SIGNAL, 9, 0);
+    }
+    /* Children that were already zombies predate SIGCHLD ignore. A real wait
+     * claim avoids racing a remote tracer release or an existing waiter. */
+    for (;;) {
+        SCHEDULER_TASK_BORROW(child, NULL);
+        struct kernel_task *claim __attribute__((cleanup(wait_claim_end))) = NULL;
+        uint32_t event;
+        int matching;
+        if (select_wait_child(leader, LINUX_P_ALL, NULL, LINUX_WEXITED|LINUX___WALL,
+                              &child, &event, &matching) != KERNEL_SCHEDULER_STATUS_OK)
+            __builtin_trap();
+        claim = child;
+        if (!child) break;
+        if (event == TRACE_WAIT_FINAL && finish_traced_wait(leader, child)) event = 1;
+        if (event != 1) __builtin_trap();
+        struct kernel_task_usage usage = {0};
+        scheduler_usage_snapshot_mm(child, -2, &usage);
+        if (retire_waited_zombie(leader, child, &usage) != KERNEL_SCHEDULER_STATUS_OK)
+            __builtin_trap();
+    }
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        /* No new identities can publish now. A pre-admission reservation is
+         * awaited too; its rollback runs the same collection notification. */
+        int deferred=process_pid_namespace_defer_locked(leader);
+        if(!deferred)namespace_reboot_completion_locked(leader,space);
+        return deferred;
+    }
+}
+
 static void kernel_thread_finish(
     const struct kernel_thread_completion *completion)
     __attribute__((noreturn));
@@ -2536,9 +2753,15 @@ static void process_begin_exit(struct kernel_task *current,
 {
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        if (current->cgroup) {
+            if (!current->cgroup->members) __builtin_trap();
+            current->cgroup->members--;
+        }
         if (kernel_wait_record_phase(&current->wait) != KERNEL_WAIT_FINISHED || current->wait.nodes || kernel_wait_record_borrows(&current->wait))
             __builtin_trap();
         current->proc_exiting = 1;
+        if (current->group_leader && !live_reaper_locked(current->group_leader, current))
+            process_pid_reaper_disable_locked(current->group_leader);
         if (!current->group_exiting) current->completion = *completion;
     }
     /* 退出状态先于资源释放发布；kcmp把已离开的资源视为NULL，getfd
@@ -2573,6 +2796,7 @@ static void kernel_thread_finish(
         switch_to_fatal_idle(status);
     }
 
+    if (current->arch.user_mode) process_core_rendezvous(current);
     if (current->arch.user_mode) ptrace_begin_exit(current,user_wait_status(completion));
     process_begin_exit(current, completion);
     /* Undo is visible before publishing exit or waking a child-TID joiner. */
@@ -2583,7 +2807,9 @@ static void kernel_thread_finish(
     kernel_cost_task_exit();
 #endif
     if (current->arch.user_mode == 1U) {
-        kernel_futex_release_robust(current, current->tid);
+        kernel_pid_t robust_tid;
+        if(kernel_task_user_tid(current,&robust_tid)!=KERNEL_TASK_STATUS_OK)__builtin_trap();
+        kernel_futex_release_robust(current, robust_tid);
         kernel_futex_release_mm(current);
         if (kernel_mm_activate(0, scheduler.kernel_context) != KERNEL_MM_STATUS_OK) {
             switch_to_fatal_idle(
@@ -2618,6 +2844,9 @@ static void kernel_thread_finish(
 #endif
     scheduler_arm_timer(next_deadline);
     arch_fpu_switch(0, &next->fpu);
+#if defined(__riscv)
+    riscv_vector_restore(next);
+#endif
     scheduler_cpu_time_switch(current, next);
     arch_context_switch(&kernel_cpu_current()->discard_context, &next->context);
     kernel_scheduler_switch_finish();
@@ -2675,6 +2904,10 @@ void kernel_user_thread_exit(
         kernel_cpu_current()->current->arch.user_mode != 1U) {
         switch_to_fatal_idle(KERNEL_SCHEDULER_STATUS_INVALID_STATE);
     }
+    if (reason == KERNEL_THREAD_EXIT_SIGNAL && detail) {
+        detail = process_core_dump(kernel_cpu_current()->current, (unsigned)status);
+        completion.detail = detail;
+    }
     completion.tid = kernel_cpu_current()->current->tid;
     completion.tgid = kernel_cpu_current()->current->group_leader->tid;
     if (reason != KERNEL_THREAD_EXIT_SYSCALL)
@@ -2701,9 +2934,9 @@ enum kernel_task_status kernel_task_set_tid_address(
     if (task == 0 || tid == 0) {
         return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
     }
-    task->clear_tid_address = address;
-    *tid = task->tid;
-    return KERNEL_TASK_STATUS_OK;
+    enum kernel_task_status status = kernel_task_user_tid(task, tid);
+    if (status == KERNEL_TASK_STATUS_OK) task->clear_tid_address = address;
+    return status;
 }
 
 enum kernel_task_status kernel_task_tid(
@@ -2757,6 +2990,37 @@ enum kernel_task_status kernel_task_tgid(const struct kernel_task *task, kernel_
     }
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     return task_tgid_locked(task, tgid);
+}
+
+enum kernel_task_status kernel_task_user_tid(const struct kernel_task *task, kernel_pid_t *tid)
+{
+    enum kernel_task_status status = kernel_task_tid(task, tid);
+    if (status != KERNEL_TASK_STATUS_OK) return status;
+    if (task == arch_current_thread_get() && task->arch.user_mode) {
+        *tid = process_identity(task, KERNEL_PID_TID)->number;
+        return KERNEL_TASK_STATUS_OK;
+    }
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    struct kernel_pid *id = process_identity(task, KERNEL_PID_TID);
+    if (!id) return KERNEL_TASK_STATUS_STATE;
+    *tid = id->number;
+    return KERNEL_TASK_STATUS_OK;
+}
+
+enum kernel_task_status kernel_task_user_tgid(const struct kernel_task *task, kernel_pid_t *tgid)
+{
+    if (!task || !tgid) return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
+    if (task == arch_current_thread_get() && task->arch.user_mode) {
+        enum kernel_task_status status = kernel_task_tgid(task, tgid);
+        if (status != KERNEL_TASK_STATUS_OK) return status;
+        *tgid = kernel_pid_number_in(process_identity(task, KERNEL_PID_TGID), process_pid_active(task));
+        return KERNEL_TASK_STATUS_OK;
+    }
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    enum kernel_task_status status = task_tgid_locked(task, tgid);
+    if (status != KERNEL_TASK_STATUS_OK) return status;
+    *tgid = kernel_pid_number_in(process_identity(task, KERNEL_PID_TGID), process_pid_active(task));
+    return *tgid ? KERNEL_TASK_STATUS_OK : KERNEL_TASK_STATUS_STATE;
 }
 
 static struct kernel_rlimit64 *task_limit_slot(struct kernel_task *leader, uint32_t resource)
@@ -2871,6 +3135,7 @@ enum kernel_task_status kernel_task_ppid(
         return KERNEL_TASK_STATUS_STATE;
     }
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    struct kernel_pid_registry *view = process_pid_active(task);
     task = task->group_leader;
     if (task->parent == 0) {
         *ppid = 0;
@@ -2882,7 +3147,7 @@ enum kernel_task_status kernel_task_ppid(
         parent->tid_owned != 1U || parent->tid <= 0) {
         return KERNEL_TASK_STATUS_STATE;
     }
-    *ppid = parent->tid;
+    *ppid = kernel_pid_number_in(process_identity(parent, KERNEL_PID_TGID), view);
     return KERNEL_TASK_STATUS_OK;
 }
 
@@ -3017,9 +3282,10 @@ enum kernel_task_status kernel_task_fs_context_borrow(
 }
 
 /* All fallible preparation precedes undo consumption and publication. The
- * access qualification gives pidfd readers one combined FS/UTS/IPC view. */
+ * access qualification gives pidfd readers one combined FS/UTS/IPC/PID view. */
 static void install_namespaces(struct kernel_task *task,struct kernel_fs_context *fs,
-    struct kernel_namespace **uts,struct kernel_namespace **ipc,int detach_sem,int shared_paths)
+    struct kernel_namespace **uts,struct kernel_namespace **ipc,struct kernel_pid_registry *pid,
+    int detach_sem,int shared_paths,int fresh_pid)
 {
     struct kernel_fs_context previous={0};
     struct kernel_namespace *old_uts=0,*old_ipc=0;
@@ -3031,25 +3297,51 @@ static void install_namespaces(struct kernel_task *task,struct kernel_fs_context
             else kernel_fs_context_exchange(&task->fs,fs,&previous);
         }
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        if(fresh_pid) {
+            /* The caller just created this child of its active namespace;
+             * transfer the only reference, without a redundant get/put. */
+            task->pid_for_children=pid;
+        } else if(pid && process_pid_children_install_locked(task,pid))__builtin_trap();
         if(*uts){old_uts=task->uts_namespace;task->uts_namespace=*uts;*uts=0;}
         if(*ipc){old_ipc=task->ipc_namespace;task->ipc_namespace=*ipc;*ipc=0;}
     }
     if(previous.state==KERNEL_FS_CONTEXT_LIVE && kernel_fs_context_release(&previous))__builtin_trap();
     kernel_namespace_put(old_uts);kernel_namespace_put(old_ipc);
+    if(pid && !fresh_pid)process_identity_collect();
 }
 int kernel_task_unshare_namespaces(struct kernel_task *task,uint64_t flags)
 {
-    const uint64_t supported=LINUX_CLONE_FS|KERNEL_NS_MNT|KERNEL_NS_UTS|KERNEL_NS_IPC|UINT64_C(0x40000);
-    if(flags&~supported)return -KERNEL_EINVAL;
+    const uint64_t namespaces=KERNEL_NS_MNT|KERNEL_NS_UTS|KERNEL_NS_IPC|KERNEL_NS_PID;
+    if(flags&~(LINUX_CLONE_FS|LINUX_CLONE_THREAD|namespaces|LINUX_CLONE_SYSVSEM))return -KERNEL_EINVAL;
     if(!flags)return 0;
-    if((flags&(KERNEL_NS_MNT|KERNEL_NS_UTS|KERNEL_NS_IPC)) &&
-        !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN))return -KERNEL_EPERM;
-    struct kernel_fs_context fs={0};struct kernel_namespace *uts=0,*ipc=0;int error=0;
-    if(flags&(LINUX_CLONE_FS|KERNEL_NS_MNT))
+    /* In the pinned Linux ksys_unshare NEWPID alone does not imply THREAD. */
+    if(flags&LINUX_CLONE_THREAD) {
+        if(!(flags&KERNEL_NS_PID))return -KERNEL_EINVAL; /* No standalone thread unshare. */
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        if(task->group_leader->group_members!=1)return -KERNEL_EINVAL;
+    }
+    int denied=(flags&namespaces) &&
+        !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN);
+    struct kernel_fs_context fs={0};struct kernel_namespace *uts=0,*ipc=0;
+    struct kernel_pid_registry *pid=NULL;int error=0;
+    /* NEWNS copies even exclusive FS state before the namespace privilege
+     * check. On denial prepare only the FS record, never the mount tree. */
+    if(denied && (flags&KERNEL_NS_MNT)) {
+        enum kernel_fs_context_status status=kernel_fs_context_fork(&fs,&task->fs);
+        if(status)error=status==KERNEL_FS_CONTEXT_STATUS_NO_MEMORY?-KERNEL_ENOMEM:-KERNEL_EINVAL;
+    } else if(flags&(LINUX_CLONE_FS|KERNEL_NS_MNT))
         error=kernel_fs_context_prepare_unshare(&fs,&task->fs,!!(flags&KERNEL_NS_MNT));
+    if(!error && denied)error=-KERNEL_EPERM;
     if(!error && (flags&KERNEL_NS_UTS))error=kernel_uts_clone(task->uts_namespace,task->files.heap,&uts);
     if(!error && (flags&KERNEL_NS_IPC))error=kernel_ipc_namespace_create(task->files.heap,&ipc);
-    if(!error)install_namespaces(task,&fs,&uts,&ipc,!!(flags&(KERNEL_NS_IPC|UINT64_C(0x40000))),0);
+    if(!error && (flags&KERNEL_NS_PID)) {
+        /* The running caller owns its active identity throughout unshare. */
+        struct kernel_pid_registry *active=process_pid_active(task);
+        if(!active || task->pid_for_children)error=-KERNEL_EINVAL;
+        else if(active->depth==KERNEL_PID_NAMESPACE_MAX_DEPTH)error=-KERNEL_ENOSPC;
+        else error=process_pid_namespace_create(active,&scheduler.identity_heap,&pid);
+    }
+    if(!error)install_namespaces(task,&fs,&uts,&ipc,pid,!!(flags&(KERNEL_NS_IPC|LINUX_CLONE_SYSVSEM)),0,pid!=NULL);
     if(fs.state==KERNEL_FS_CONTEXT_LIVE && kernel_fs_context_release(&fs))__builtin_trap();
     kernel_namespace_put(uts);kernel_namespace_put(ipc);return error;
 }
@@ -3058,30 +3350,35 @@ int kernel_task_setns(struct kernel_task *task,int32_t fd,uint32_t type)
     KERNEL_FILES_PIN_SCOPE(pin);
     struct kernel_open_file_description *file=kernel_files_hold_fd(&task->files,fd,&pin);
     if(!file)return -KERNEL_EBADF;
-    const uint32_t all=KERNEL_NS_MNT|KERNEL_NS_UTS|KERNEL_NS_IPC;
-    struct kernel_namespace *next[3]={0},*direct=kernel_namespace_file(file);
+    const uint32_t all=KERNEL_NS_MNT|KERNEL_NS_UTS|KERNEL_NS_IPC|KERNEL_NS_PID;
+    struct kernel_namespace *next[4]={0},*direct=kernel_namespace_file(file);
     uint32_t mask=type;int error=0;
     if(direct) {
-        if((type && type!=direct->type) || (kernel_open_file_flags(file)&010000000U))return -KERNEL_EINVAL;
+        if(!(direct->type&all) || (type && type!=direct->type) || (kernel_open_file_flags(file)&010000000U))return -KERNEL_EINVAL;
         mask=direct->type;
-        next[mask==KERNEL_NS_MNT?0:mask==KERNEL_NS_UTS?1:2]=kernel_namespace_get(direct);
+        next[mask==KERNEL_NS_MNT?0:mask==KERNEL_NS_UTS?1:mask==KERNEL_NS_IPC?2:3]=kernel_namespace_get(direct);
     } else if(file->kind!=KERNEL_OPEN_FILE_KIND_PIDFD || !mask || (mask&~all))return -KERNEL_EINVAL;
     const struct kernel_credentials *cred=kernel_credentials_current();
     if(!kernel_credentials_capable(cred,KERNEL_CAP_SYS_ADMIN) ||
         ((mask&KERNEL_NS_MNT) && !kernel_credentials_capable(cred,KERNEL_CAP_SYS_CHROOT)))error=-KERNEL_EPERM;
     if(!error && !direct) {
         struct kernel_pid *id __attribute__((cleanup(kernel_task_identity_end)))=kernel_pidfd_identity_ref(file);
-        error=id?kernel_proc_namespaces_handle(id->number,id->generation|KERNEL_PROC_THREAD_TARGET,mask,0,next):-KERNEL_ESRCH;
+        error=id?kernel_proc_namespaces_identity_handle(id,mask,next):-KERNEL_ESRCH;
         if(error==-KERNEL_ENOENT)error=-KERNEL_ESRCH;
         else if(error==-KERNEL_EACCES)error=-KERNEL_EPERM;
+    }
+    struct kernel_pid_registry *pid=process_pid_namespace_registry(next[3]);
+    if(!error && (mask&KERNEL_NS_PID)) {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        error=process_pid_children_check_locked(task,pid);
     }
     struct kernel_fs_context fs={0};
     int shared_paths=(mask&KERNEL_NS_MNT) && (mask&~KERNEL_NS_MNT);
     if(!error && next[0])error=kernel_fs_context_prepare_namespace(&fs,&task->fs,
         (struct kernel_mount_namespace *)next[0],shared_paths);
-    if(!error)install_namespaces(task,&fs,&next[1],&next[2],!!(mask&KERNEL_NS_IPC),shared_paths);
+    if(!error)install_namespaces(task,&fs,&next[1],&next[2],pid,!!(mask&KERNEL_NS_IPC),shared_paths,0);
     if(fs.state==KERNEL_FS_CONTEXT_LIVE && kernel_fs_context_release(&fs))__builtin_trap();
-    for(unsigned i=0;i<3;i++)kernel_namespace_put(next[i]);
+    for(unsigned i=0;i<4;i++)kernel_namespace_put(next[i]);
     return error;
 }
 
@@ -3098,9 +3395,10 @@ int kernel_task_prepare_user_return(void)
     if (address) {
         task->set_tid_address = 0U;
         size_t copied;
-        /* 在子 MM 激活后处理 COW；坏地址不撤销已发布的 clone。 */
-        (void)kernel_copy_to_user(&task->mm, address, &task->tid,
-                                  sizeof(task->tid), &copied);
+        /* Each SETTID store uses its recipient's view. Faulting here does
+         * not roll back the already-published clone. */
+        kernel_pid_t tid = process_identity(task, KERNEL_PID_TID)->number;
+        (void)kernel_copy_to_user(&task->mm, address, &tid, sizeof(tid), &copied);
     }
 #if BOAROS_USER_SMP
     /* 业务准备已持有当前执行者；共用一次通知读取，普通返回不另作信号查询。 */
@@ -3163,4 +3461,20 @@ unsigned kernel_task_fs_group_users(struct kernel_task *task,
         member = member->group_next;
     } while (member && member != task);
     return count;
+}
+
+void kernel_seccomp_terminate(unsigned signal,int group)
+{
+#if BOAROS_USER_SMP
+    if (!kernel_scheduler_user_service_active()) kernel_scheduler_enter_user_service();
+#endif
+    struct kernel_task *task=kernel_task_current();
+    struct kernel_thread_completion completion={.kind=KERNEL_THREAD_KIND_USER,
+        .reason=KERNEL_THREAD_EXIT_SIGNAL,.tid=task->tid,.tgid=task->group_leader->tid,
+        .status=signal};
+    int single;
+    {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);single=task->group_leader->group_members==1;}
+    if (signal==31 && (group || single)) completion.detail=process_core_dump(task,signal);
+    if (group) process_group_request_exit(task,completion.reason,signal,completion.detail);
+    kernel_thread_finish(&completion);
 }

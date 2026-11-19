@@ -55,13 +55,13 @@ RV、LA 用户多核共用同一调度器。每核 rank42 保护实际就绪队�
 
 身份、期限索引及跨核策略使用 rank40 调度短锁；普通任务的本地运行记账、无期限等待的阻塞提交、READY 发布和领取使用实际运行队列的 rank42 保护。等待节点链、游标、退休后继、关闭与借用计数由每个实际队列的 rank45 短锁保护；heap10→physical20、对象内部30→调度40→运行队列42→等待队列45是raw锁序。双队列迁移按地址顺序取得保护，锁内不通知任务。raw不跨架构切换，不允许调度、分配、I/O、用户复制或外部回调。
 同一 API 按 CPU 数编译：UP 关闭中断、保持抢占嵌套并使用编译器屏障，SMP 另以 acquire/release 原子操作互斥。
-`LOCK_DEBUG=1` 开启递归扫描和等级审计，默认关闭；持有链始终保留，用于禁止等待、嵌套恢复和最外层解锁后的通知发布。pthread 宿主夹具明确使用 SMP 配置，`test-sync-host` 覆盖 UP/SMP 与锁调试的四种组合。
+`LOCK_DEBUG=1` 开启 raw guard 的归属、锁字、递归和等级审计，默认关闭。持有链始终保留，用于禁止等待、嵌套恢复和最外层解锁后的通知发布。`test-sync-host` 覆盖 UP/SMP 与锁调试的四种组合。
 
 短对象保护按实际访问者选择：`KERNEL_TASK_LOCK_SCOPE` 用于只由任务修改的 ext4
 缓冲元数据，`KERNEL_IRQ_LOCK_SCOPE` 用于任务和设备中断共享的 VirtIO 请求状态。
 默认 UP 构建中，前者通过抢占深度和编译器屏障排除其他任务，保留原中断状态；
 后者再关闭本地中断。UP 的互斥由抢占深度提供，检查嵌套归还并禁止阻塞，无需读写对象锁字。
-SMP、锁调试或成本诊断构建直接使用完整 raw 实现，保留持有链和对象初始化检查，递归及等级审计由 `LOCK_DEBUG` 开启。调度器和分配器继续使用原 raw
+SMP、锁调试或成本诊断构建使用带持有链的 raw 实现。锁对象在初始化时检查参数，进入和退出临界区的完整性审计由 `LOCK_DEBUG` 控制。调度器和分配器继续使用原 raw
 持有链；`test-lwext4-exclusion-host` 检查四种 UP/SMP、debug 组合及真实共享更新。
 
 任务表、身份角色、父子/组成员关系、join及退出队列也使用该调度域；私有准备和资源清理在锁外。
@@ -75,11 +75,15 @@ SMP 的代次、等待阶段和通知原因合在一个原子状态中。对尚�
 PREPARED 到 NOTIFIED 的转换；park 入口发现当前代次已被通知（NOTIFIED）时，直接读取原因返回，不再取得全局等待域锁。普通任务无期限等待在本核队列锁内发布 COMMITTED 和 BLOCKED；可中断等待先在该锁内检查待处理信号，发现待处理信号时由共同控制重查。远端信号和终止请求发布后，通知端先取得目标的实际运行队列保护，再判断等待代次：通知先于提交时，本核要么已被通知，要么能看到待处理状态；提交在先时，通知端处理已阻塞的请求。带期限、vfork 及特殊调度资格的等待仍由共同控制提交。
 已提交的普通等待，通知者在最后执行核的队列保护内核对等待代次、状态与亲和性。无期限时直接使用该队列；有期限时先取得共同控制以移除期限索引，再取得同一目标队列。旧栈已归还时直接进入该核相应的就绪索引，否则只记待就绪，由旧核换到新栈后交接。若在选择后继前已经唤醒，原任务可继续使用仍归自己的栈。亲和性不允许留核、实时和服务资格仍由共同调度仲裁；需要多队列快照时只遍历实际启动配置中的 CPU。
 
-每个 READY 任务只有一个 `ready_node`，`ready_cpu` 指向实际队列，`cpu` 保留最后执行者。普通无绑定任务唤醒优先复用上次执行核；必要时通知一个允许的空闲核。空闲核按固定顺序取得来源与目标的队列锁，直接摘取普通任务并发布新执行权；源任务尚在旧栈上时还未进入队列，无从被领取。目标核检查可迁移实时任务的 CPU 掩码，有远端位时走共同仲裁。每核首个或最后一个可迁移实时任务入队或出队才更新掩码。新任务放置和 CPU0 实时服务仍按 affinity、服务资格和真实负载选择执行者。原有事件位合并 IPI。
+每个 READY 任务只有一个 `ready_node`，`ready_cpu` 指向实际队列，`cpu` 保留最后执行者。普通无绑定任务唤醒优先复用上次执行核；必要时通知一个允许的空闲核。空闲核按固定顺序取得来源与目标的队列锁，直接摘取普通任务并发布新执行权；源任务尚在旧栈上时还未进入队列，无从被领取。目标核维护允许迁入的异核实时任务计数。存在此类任务时，本地普通任务选择交给共同仲裁。新任务放置和 CPU0 实时服务仍按 affinity、服务资格和真实负载选择执行者。原有事件位合并 IPI。
 
 请求affinity只有一个目标时，优先用任务的最后CPU或当前CPU直接定位，不再计算无从选择的负载等级。每CPU的`pullable_ready`只统计普通执行队列中、请求affinity允许其他CPU的任务；实际请求变化先摘队再更新。有效affinity还可能被CPU0服务或实时来源保留收窄，所以计数为零可跳过整条异核队列，非零仍逐项核对实际资格。入队、出队及该计数在同一调度保护内更新，未建立第二份任务队列。
 
-普通任务 yield 与时间片结束保留本核公平进度；实时任务轮转同级 FIFO，抢占保留同级队首。优先级更新只摘除和重排实际 owner 的节点。执行者真正空闲或阻塞时，可从其他 CPU 的队列取得最高优先级且满足本核资格的 off-CPU 任务，同实时优先级保留本核 FIFO，普通候选按各自队列的公平顺序检查。普通任务的领取在源、目标核队列锁下摘除原节点并发布唯一执行者；实时资格继续由共同控制仲裁。
+普通任务 yield 与时间片结束保留本核公平进度。实时任务在同一优先级内按 FIFO 轮转，遭到抢占后回到同级队首。繁忙核可领取异核队列中严格高于本核有效执行者的实时任务。本核有同级就绪任务时保留本核顺序。领取沿现有共同调度保护完成并核对有效亲和性、实时预算、优先级继承和用户保留资格。真正空闲或阻塞时也可领取异核普通任务。
+
+每个来源核以实时优先级和同级 FIFO 位置组织可迁移的 READY 任务。平衡树子树记录其中任务允许迁往的目标核，并标记内核任务及优先级继承持锁者的资格。候选查找按目标核和资格跳过整棵不匹配的子树，每个来源对目标的查询至多沿两条树路径。任务入队、摘队和有效资格变化时同步更新索引。任务实际就绪归属继续由 `ready_cpu` 决定，旧栈归还前没有候选资格。
+
+实时入队、运行者变化或资格变化后，来源核通知能运行其受阻任务的目的核。来源核可立即运行的队首任务保留原位置。通知使用现有跨核事件位，目标核领取时重新核对资格，多个目标不会重复取得同一任务。聚焦检查入口为 `make test-user-smp-rt-host` 和 `make test-user-smp-rt-riscv`。
 事件队列只由实际等待节点保存，期限、原因和可中断性只由wait record保存。通知先按原期限
 摘除AVL，再发布完成原因；finish收完节点及借用后才清空record，futex requeue直接迁移节点。
 
@@ -131,10 +135,7 @@ RV、LA 的用户任务按实际 affinity 在各 CPU 执行；默认交付仍单
 内核 worker 使用 OTHER，普通策略按下述公平进度与请求量子选择后继。FIFO/RR 的用户优先级为 1–99，数值越大越优先；FIFO 不因 tick 同级轮转，RR 默认每片 100ms，可通过 `/proc/sys/kernel/sched_rr_timeslice_ms` 设置全局毫秒值；零或负值恢复默认，输入范围为有符号32位整数。修改不替换任务尚未耗尽的剩余量，后续轮换与新建任务使用新值，`sched_rr_get_interval` 查询当前配置并返回规范化 timespec。时间片按实际在 CPU 上运行的纳秒扣除。更高优先级抢占、阻塞和 yield 不重新赠送 RR 时间片；耗尽后才重装。唤醒及策略修改标记 need_resched，在 IRQ 或返回用户态的安全边界切换。降优先级排到新级队首，升优先级排队尾，同级修改保留位置；高优先级抢占的当前任务回原级队首。
 
 挑选、摘队列与取得on_cpu执行owner在同一个短锁发布点完成，普通切换与退出复用该入口；锁外才切换架构状态，旧owner仍由新栈交接释放。未使用的拆分pop入口已删除。
-yield、预算tick与普通tick在同一次决策raw内完成队列校验、运行记账、挑选和最早期限计算，
-释放raw后才调用timer backend；切换、阻塞和退出也按这个顺序提交硬件事件。
-普通tick只在CPU0推进load采样余量，不为未到采样期的事件额外取锁。
-到采样期才借任务分段遍历，遍历前检查和决策时重查分别保留。无效队列不消费待调度请求。
+yield、预算 tick 与普通 tick 在决策保护内完成运行记账、挑选和最早期限计算，释放后调用 timer backend。生产入口核对本核任务归属及运行状态，用户缺页还核对活动 MM。任务资源、栈和队列端点的周期性审计由 `LOCK_DEBUG` 控制，创建和退出等生命周期边界仍执行完整校验。普通 tick 只在 CPU0 推进负载采样余量，到期后才借任务分段遍历。
 
 ready 节点独立于 cleanup 链，各 CPU 执行队列维护自己的优先级排序双链与遍历视图，100 个等级各存 head/tail；同级插入、OTHER 尾追加、删除和选取均 O(1)，新增空的中间等级最多扫描 99 个等级，不扫描任务数。RT 被节流时只取 OTHER 队首；没有 OTHER 则 idle，不能借机运行已耗尽的 RT。
 
@@ -187,7 +188,7 @@ sched_setparam/setscheduler/getparam/getscheduler、priority_min/max、rr_get_in
 
 RTPRIO、RTTIME限额属于线程组共享的资源记录，普通fork复制、线程clone共享，exec保留。没有CAP_SYS_NICE时，调度修改先满足同属主规则；进入或切换RT策略要求目标组的RTPRIO软值非零，提升优先级可使用目标软值或保留已经取得的更高RT优先级。降低优先级和退出RT沿Linux规则处理；清除RESET_ON_FORK仍需CAP_SYS_NICE。资源数值不裁成99，实际FIFO/RR优先级范围仍为1～99。
 
-RTTIME对每线程连续RT执行计量。各CPU的timer tick仅在当前用户线程运行FIFO/RR且软限额有限时推进watchdog；普通优先级任务在读取全局tick前跳过watchdog调用。同一全局tick跨核只计一次。超过按100Hz向上取整的软／硬阈值后，线程进入现有CPU timer活动索引，由CPU0检查并向线程组发送SIGXCPU，软限额增加1,000,000us，或在硬限额到达时发送SIGKILL。仅有RTTIME待检查的条目不采样完整CPU clock；普通trap不新增watchdog锁或采样。
+RTTIME 对每线程连续 RT 执行计量。空闲 tick 更新本核计数，procfs 汇总原子快照。普通优先级任务读取已发布的有效优先级后直接退出 watchdog 入口。有效优先级为正的用户线程进入调度域，按锁内实际优先级和有限软限额推进 watchdog。同一全局 tick 跨核只计一次。超过按 100 Hz 向上取整的软／硬阈值后，线程进入现有 CPU timer 活动索引，由 CPU0 检查并向线程组发送 SIGXCPU，软限额增加 1,000,000 µs，或在硬限额到达时发送 SIGKILL。仅有 RTTIME 待检查的条目跳过完整 CPU clock 采样。
 
 连续计数在调度器确定任务带着BLOCKED或STOPPED状态离开CPU时清零。计数为零时不写RTTIME计数或资源标记；待检查标记只会在非零计数后发布。已经退出RT策略或把限额改为无限的任务仍按历史计数清理，并移除仅由RTTIME产生的CPU timer索引。PREPARED通知、COMMITTED后在切换前收到通知、停止后在切离前收到SIGCONT，以及抢占、yield、迁移、CPU0服务和RT带宽节流都保留计数；此时状态已经或仍为READY，未完成一次睡眠/停止。直接host检查以手动tick覆盖跨CPU去重、软硬阈值及三种等待交错，真实消费者通过父子握手确认阻塞后继续执行。
 
@@ -304,7 +305,19 @@ SETTLS写r2/TP、child stack写r3/SP、返回a0=0并使ERA前进4字节。LA已�
 
 用户多核下，调用线程在当前核导入 clone3 参数，准备子任务栈页、凭据、文件表和 MM。CPU0 映射内核栈窗口后在新栈建立首次返回的寄存器现场。普通 fork 在父 MM 写资格内排空写 pin 并提交 COW，父映射含 SysV 附件时在 CPU0 更新段的附着计数。CPU0 继承控制终端，在同一次调度锁保护下发布子进程身份、pidfd、组与亲子关系，并按继承的亲和性选择就绪队列。子任务在实际运行核处理首次返回和 CHILD_SETTID。只读的资源限额、PGID、SID 和 robust-list 查询在调用核取得受保护的快照。
 
-RV/LA 的 clone 和 clone3 共用进程创建，支持 CLONE_VM、CLONE_FILES、CLONE_FS、CLONE_IO，以及共享 VM 时的 CLONE_SIGHAND 和可选 CLONE_VFORK；线程要求 VM/SIGHAND/THREAD，FILES 和 FS 按标志选择。CHILD_SETTID/CHILD_CLEARTID、SETTLS/PARENT_SETTID 与 CLONE_SYSVSEM 沿实际标志处理。clone3 检查结构长度、扩展字节和子栈范围，再转换成共同创建参数；CLONE_CLEAR_SIGHAND 在独立信号表中重置子进程处理动作，不能与 CLONE_SIGHAND 同用。指定 PID 数组、cgroup 和其他未接入的资源组合返回 ENOTSUP。CLONE_SYSVSEM 的最后共享者退出补偿见[SysV信号量](sysv-sem.md)。
+RV/LA 的 clone 和 clone3 共用进程创建，支持 CLONE_VM、CLONE_FILES、CLONE_FS、CLONE_IO，以及共享 VM 时的 CLONE_SIGHAND 和可选 CLONE_VFORK；线程要求 VM/SIGHAND/THREAD，FILES 和 FS 按标志选择。CHILD_SETTID/CHILD_CLEARTID、SETTLS/PARENT_SETTID 与 CLONE_SYSVSEM 沿实际标志处理。clone3 检查结构长度、扩展字节和子栈范围，再转换成共同创建参数；CLONE_CLEAR_SIGHAND 在独立信号表中重置子进程处理动作，不能与 CLONE_SIGHAND 同用。clone3 的 `set_tid` 数组从子任务所在的 PID namespace 向祖先逐层指定编号，未指定的祖先层自动分配；指定编号需要有效 CAP_SYS_ADMIN 或 CAP_CHECKPOINT_RESTORE。创建失败时释放各层预留，成功时与亲子关系一起发布。其他未接入的资源组合仍返回 ENOTSUP。CLONE_SYSVSEM 的最后共享者退出补偿见[SysV信号量](sysv-sem.md)。
+
+`clone` 和 `clone3` 使用 `CLONE_NEWPID` 创建进程时，父进程得到子进程在父视图中的 PID，子进程在新视图中为 PID 1。`unshare(CLONE_NEWPID)` 只改变后续子进程的目标视图，不改变调用线程自身的 PID/TID。创建 PID namespace 需要 CAP_SYS_ADMIN，不能通过 `CLONE_NEWPID | CLONE_THREAD` 创建线程。user namespace 和按 namespace owner 判定权限仍未实现；其他组合限制和生命周期见 [PID namespace](pid-namespace.md)。
+
+`CLONE_INTO_CGROUP` 支持无控制器的 cgroup v2 domain 层级。`mount -t cgroup2 none /sys/fs/cgroup` 后可创建目录，使用普通目录 FD 或 O_PATH FD 创建子进程；控制文件或其他文件系统 FD 返回 EBADF，已删除目录 FD 返回 ENOENT，取得引用后发现删除返回 ENODEV。目录引用只保活对象，不授权创建。最终发布在已有调度锁内重新检查目标状态、当前凭证对目标 `cgroup.procs` 和共同祖先 `cgroup.procs` 的写权限，再与 PID、线程组、pidfd 一起提交成员关系。检查在 ptrace 建链之前，拒绝不会留下 tracer 链接。普通 fork 在同一发布事务继承父成员，不增加锁或分配；加入非根组时只增加对象引用和成员数。
+
+`cgroup.procs` 写入 PID（0 为调用进程）原子迁移整个线程组，使用打开 FD 时的凭证检查共同祖先，不能以当前提权身份绕过继承 FD 的权限。已退出 leader 仍有活线程时可以按 TGID 迁移；`cgroup.threads` 和 CLONE_THREAD 只允许同一 domain，不实现 threaded 子树。成员读取使用一次 OFD 快照，按线程组只输出一个 PID，避免逐 PID 扫描全部任务；seek 到 0 重新生成。`/proc/PID/cgroup` 和线程对应文件报告真实路径。退出时撤销活成员计数，未回收 zombie 保留路径引用，删除后显示 ` (deleted)`；最终任务存储回收归还引用。exec 保留执行线程的成员。
+
+多次挂载复用同一个 VFS instance 的 inode/dentry，读写和只读挂载视图共享目录变化；最后卸载不删除层级，关机在所有任务和 VFS owner 退出后检查引用并释放残留目录。当前 `cgroup.controllers` 和 `cgroup.subtree_control` 为空，不提供 CPU、memory、pids、IO 等资源控制器；请求未实现的控制器返回 EINVAL。`cgroup.type` 为 domain，threaded 转换明确拒绝；冻结、kill、cgroup namespace 和层级限制接口未实现。不能把创建进组解释为资源配额或调度隔离。
+
+`tests/host/cgroupfs.sh` 检查 4K/16K 后端对象、DAC、解析、失败分配、删除引用和 shutdown；`tests/userland/run.py --workload cgroup` 使用同一用户程序检查多挂载名称缓存、只读视图、首次用户执行的成员、FD/失败路径、zombie、整组迁移、非 leader exec、opener 权限与 ptrace 拒绝路径，同时要求退出时真实 heap/page owner 回到基线。它是功能验收，不是吞吐或延迟收益测量。Linux 对照需要可挂载 cgroup2 的测试环境；没有权限的宿主错误路径检查不能代替特权成功路径。
+
+`tests/workloads/resource/clone_resources.c` 的 exact-tid 用例检查指定编号成功、存活期间冲突、坏 pidfd 输出后编号复用，以及仅 CAP_CHECKPOINT_RESTORE 和无相应 capability 的差异；`test-pid-object-host` 检查未发布预留的冲突与释放代际。复用 `tests/userland/run.py --workload clone_resources`，Linux 参考需具备上述 capability 并在初始 PID namespace 中运行。
 
 `ioprio_set/get` 支持按线程、进程组和真实 UID 设置或查询优先级；RT 设置检查 CAP_SYS_ADMIN/CAP_SYS_NICE。首次设置时按需分配块 I/O 优先级上下文；CLONE_IO 共享已经存在的对象，父线程没有对象时子线程也从空状态开始。普通 fork 对已设置的优先级生成独立副本，exec 保留执行线程的对象，退出与创建失败归还真实引用。未显式设置时，集合查询按基础策略派生RT/BE/IDLE类，并用(nice+20)/5得到默认级别；单进程原始查询保留NONE。KCMP_IO 比较该对象，包括两个空对象相等；它与每任务持锁和用户页借用的 `kernel_io_context` 分开。固定 Linux 的 `ioprio_set(USER, 0)` 按数值 UID 0 匹配，而 `get(USER, 0)` 查询调用者的真实 UID。当前块队列仍按需求 I/O 和后台回收类别服务，尚未按用户设置的 I/O 优先级调度请求。
 

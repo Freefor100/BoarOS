@@ -26,11 +26,19 @@
 #define LWIP_IPV4 1
 #define IP_DEFAULT_TTL 64
 #define LWIP_IPV6 1
-#define LWIP_IPV6_MLD 0
-#define LWIP_IPV6_AUTOCONFIG 0
+#define LWIP_IPV6_MLD 1
+#define MEMP_NUM_MLD6_GROUP 64
+#define LWIP_IPV6_AUTOCONFIG 1
+#define LWIP_IPV6_NUM_ADDRESSES 5
+#define BOAROS_LWIP_STATIC_IP6_SLOTS 2
+/* Reuse the bounded ND tables and timer for host router discovery. */
+#define LWIP_IPV6_SEND_ROUTER_SOLICIT 1
+#define BOAROS_LWIP_NO_REDIRECT 1
+#define BOAROS_LWIP_STATIC_IPV6 1
 #define LWIP_IPV6_REASS 0
 #define LWIP_IPV6_FRAG 0
 #define LWIP_TCP 1
+#define BOAROS_LWIP_TCP_INFO 1
 #define BOAROS_LWIP_TCP_WRITEV 1
 #define SO_REUSE 1
 #define TCP_LISTEN_BACKLOG 1

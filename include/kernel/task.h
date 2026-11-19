@@ -41,9 +41,11 @@ enum kernel_task_status {
 
 /* Returns the scheduler current task, or null before scheduler publication. */
 struct kernel_task *kernel_task_current(void);
-/* User-visible TID lookup includes unreaped process zombies and keeps one
+/* Root-relative TID lookup includes unreaped process zombies and keeps one
  * storage borrow; completed nonleaders await cleanup without staying visible. */
 struct kernel_task *kernel_task_find_by_tid(kernel_pid_t tid);
+/* Same storage ownership, with an explicit user namespace observer. */
+struct kernel_task *kernel_task_find_user_tid(struct kernel_task *,kernel_pid_t tid);
 /* 当前执行owner覆盖读取；内核任务没有用户信号/重启上下文。 */
 int kernel_task_has_user_context(const struct kernel_task *);
 /* Releases only a lookup storage borrow, not MM/files or a running owner. */
@@ -88,6 +90,11 @@ enum kernel_task_status kernel_task_tid(
 enum kernel_task_status kernel_task_tgid(
     const struct kernel_task *task,
     kernel_pid_t *tgid);
+
+/* User ABI numbers in the task's active PID namespace. The existing tid/tgid
+ * accessors retain initial-namespace IDs for internal completion/async users. */
+enum kernel_task_status kernel_task_user_tid(const struct kernel_task *, kernel_pid_t *);
+enum kernel_task_status kernel_task_user_tgid(const struct kernel_task *, kernel_pid_t *);
 
 enum kernel_task_status kernel_task_get_rlimit(
     const struct kernel_task *task, uint32_t resource,

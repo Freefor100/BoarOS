@@ -28,6 +28,10 @@ socket 的信号驱动通知由 OFD 的 [异步状态](kernel-files.md#信号驱
 
 当前支持 `AF_INET`/`AF_INET6` 的 `SOCK_DGRAM`/`SOCK_STREAM`，`SOCK_CLOEXEC`、`SOCK_NONBLOCK`，UDP bind/getsockname/sendto/recvfrom 和 `SO_RCVTIMEO`，TCP bind/listen/connect/accept，以及连接后的普通读写和就绪。绑定非零低端口（小于 1024）要求当前调用者的 CAP_NET_BIND_SERVICE，端口 0 仍由协议选择临时端口。网卡启停、IPv4 地址/掩码/MTU 和默认网关的实际接口及权限见[网络设备](riscv-virtio-net.md#地址与用户接口)。地址在 syscall 边界使用 RV64 `sockaddr_in`/`sockaddr_in6` 布局；内核地址携带族、16 字节网络序地址、宿主序端口和 scope。官方 loopif 提供 `::1`；IPv6 通配监听默认接收 IPv4，accept 返回映射地址。V6ONLY 在绑定前生效，双栈通配与纯 IPv6/IPv4 的端口交集由非持引用的 endpoint 登记补齐 lwIP TCP bind 的 ANY 检查缺口。登记保留指向自身的前驱链指针，最后关闭可直接摘除。非阻塞、坏 fd/地址/指针和协议错误由固定 Linux 同一 ELF 差分约束。未覆盖的地址族、选项和操作返回明确 errno，不伪造成功。
 
+INET TCP 的 `recv/recvfrom/recvmsg/recvmmsg` 支持 `MSG_WAITALL`：每次复制并提交当前可读前缀后归还预约和接收窗口，再沿同一次调用的绝对 `SO_RCVTIMEO` 期限等待剩余数据。非阻塞调用只取现有数据；EOF、信号、超时和后续复制错误返回已完成前缀，首字节前失败保留原 errno。已有前缀的异步协议错误不在此次短读中消费，下一次读取仍可取得它；已交付字节不登记 syscall restart。`MSG_PEEK|MSG_WAITALL` 在本次调用内推进观察偏移，不重复复制队首，也不把已观察字节的 POLLIN 当作新进展；并发消费使观察位置回到新的队首。等待时不持有读预约、用户页 pin 或协议锁。普通读取仍在当时可读前缀结束，不因该实现改变为 WAITALL。
+
+定向检查为 `sh tests/host/tcp-waitall.sh`（4 KiB/16 KiB 页、真实预约/park、两次等待共用期限、消费竞争和资源归还）及 `tests/workloads/network/tcp_waitall.c`（同一源代码在 Linux host 与 RV/LA guest 检查真实 syscall）。guest 执行器 `tests/userland/tcp-waitall.py --arch <riscv|loongarch> --kernel <kernel> --program <static-ELF>` 使用独立临时盘并检查退出清理。语义参考 Linux `tcp_recvmsg_locked` 的[官方 v6.6 源码](https://github.com/torvalds/linux/blob/v6.6/net/ipv4/tcp.c)及[recv(2)](https://man7.org/linux/man-pages/man2/recv.2.html)。
+
 `AF_INET/SOCK_RAW/IPPROTO_ICMP` 提供 IPv4 ICMP 原始报文接口，创建要求 CAP_NET_RAW。protocol 从系统调用经 FD 创建传给协议后端，不由 socket 类型猜测。发送方提供 ICMP 头和校验和，内核添加 IPv4 头；接收包含完整 IPv4 头，来源端口为零。端口绑定不参与 TCP/UDP 的低端口权限与分配。每个 raw PCB 的回调只观察原包，为自己的接收队列保存独立内容；过滤、队列满或分配失败只影响该接收者，不吞掉其他 raw 接收者或内核 Echo 响应的输入。读写、向量、PEEK/TRUNC、就绪和超时共用现有消息路径，关闭在协议资格下撤销回调和 PCB 后归还接收 owner。DGRAM ping、其他 raw 协议、IP_HDRINCL、PMTU 配置和远端 MTU 缓存尚未接入。
 
 `SO_BROADCAST` 默认关闭，在选定实际 IPv4 出接口后限制广播发送，未许可返回 EACCES；接收广播不要求该选项。`IP_TTL` 控制 IPv4 发包，默认 64；`IP_MULTICAST_TTL` 默认 1，`IP_MULTICAST_IF` 保存组播发送接口与地址，组播 TTL 为零时不向物理接口发送。发送选项不表示已支持组播入组。UDP connect、UDP send 与 raw send 共用出接口和源地址选择，随后使用选定结果发送，不再次路由。`SO_BINDTODEVICE` 保存数值接口索引，影响发送与接收；接口 down 后保留绑定，不静默回退。按固定 Linux，首次绑定允许无 CAP_NET_RAW，已有绑定的修改与解除要求该能力。TCP 更新同时协调所属执行者与四元组索引，监听连接继承实际绑定。
@@ -179,7 +183,7 @@ CPU0已有网络执行者推进收集和退休清理。最后关闭暂时失败�
 
 ## 发起 CPU 与等待寿命
 
-TCP 请求由 syscall 栈持有，OFD 覆盖整个接纳过程；用户页只借到实际 COPY 完成。排队请求使用自己的等待 token，工作链锁内登记、发布结果并定向通知，锁外休眠和结束等待。ACK 和发送额度变化只通知 socket 就绪等待者。归属核的执行者一次从同一 socket 取出至多四个已排队的连续普通发送请求，共用一次输出；每个请求仍占一个服务单元，剩余工作放回队尾。带 IO_MORE 的请求单独处理；先完成此前捕获的 OUTPUT，再接纳新前缀，以免提前发送仍可合并的字节。发送请求本身不安排接收资源和 TIME_WAIT 回收，真实输入和关闭仍负责安排回收。UDP 由调用者在最终 pbuf 中填入载荷，持有 UDP PCB 的协议执行者按请求发送并释放。只有协议内存未启用并行保护时，分配和放弃发送的回收也需要协议资格。UNIX 调用者准备最终 packet，发布前在端点锁内重新核对对端。请求和 OFD 借用一直保留到完成状态发布。
+TCP 请求由 syscall 栈持有，OFD 覆盖整个接纳过程；用户页只借到实际 COPY 完成。排队请求使用自己的等待 token，工作链锁内登记、发布结果并定向通知，锁外休眠和结束等待。ACK 和发送额度变化只通知 socket 就绪等待者。归属核的执行者一次从同一 socket 取出至多四个已排队的连续普通发送请求，共用一次输出；每个请求仍占一个服务单元，剩余工作放回队尾。带 IO_MORE 或用户 MSG_MORE 的请求单独处理；先完成此前捕获的 OUTPUT，再接纳新前缀，以免提前发送仍可合并的字节。发送请求本身不安排接收资源和 TIME_WAIT 回收，真实输入和关闭仍负责安排回收。UDP 由调用者在最终 pbuf 中填入载荷，持有 UDP PCB 的协议执行者按请求发送并释放。只有协议内存未启用并行保护时，分配和放弃发送的回收也需要协议资格。UNIX 调用者准备最终 packet，发布前在端点锁内重新核对对端。请求和 OFD 借用一直保留到完成状态发布。
 
 普通 I/O 与 socket syscall 共用 `kernel_socket_wait_ready`。调用者传入一次捕获的绝对超时，端点锁内检查条件并登记，锁外 park/finish；就绪先于超时判断。接收预约限制读取的原有字节前缀，复制到该前缀末端即停止，锁外复制不读取并发追加修改的尾链接。
 
@@ -189,7 +193,7 @@ epoll控制仍在CPU0，等待扫描和事件复制在发起CPU执行，详见[�
 
 ## 验证
 
-`tests/userland/api8.py --program ipv4_abi` 用同一 ELF 对照 Linux 的 raw 创建、五种选项、短缓冲、fault 输出顺序、设备权限与组播源地址。参考内核须启用 NETDEVICES，否则 Linux 自身不提供设备绑定选项。`tests/userland/run.py --workload ipv4_basic` 检查 raw 双接收、PEEK/TRUNC、大包回环和广播许可；`tests/userland/network-external.py --workload ipv4_basic --only both` 使用同一程序和原 BusyBox 进行 TAP 对照，核对线上 TTL、分片、来源、不同设备同端口的 UDP/TCP 隔离及 ping 参数。`--cpus 2` 将实际调用者固定在 CPU1 并检查记录；RV 支持 legacy/modern，LA 使用 modern。原 LA BusyBox 可用显式 `--busybox` 指定静态原 ELF，执行器记录路径与哈希，不替代为另一工具链构建身份。INET TCP 接收当前仍不支持 MSG_WAITALL，这些消费者使用普通短读循环完成精确收包。
+`tests/userland/api8.py --program ipv4_abi` 用同一 ELF 对照 Linux 的 raw 创建、五种选项、短缓冲、fault 输出顺序、设备权限与组播源地址。参考内核须启用 NETDEVICES，否则 Linux 自身不提供设备绑定选项。`tests/userland/run.py --workload ipv4_basic` 检查 raw 双接收、PEEK/TRUNC、大包回环和广播许可；`tests/userland/network-external.py --workload ipv4_basic --only both` 使用同一程序和原 BusyBox 进行 TAP 对照，核对线上 TTL、分片、来源、不同设备同端口的 UDP/TCP 隔离及 ping 参数。`--cpus 2` 将实际调用者固定在 CPU1 并检查记录；RV 支持 legacy/modern，LA 使用 modern。原 LA BusyBox 可用显式 `--busybox` 指定静态原 ELF，执行器记录路径与哈希，不替代为另一工具链构建身份。这些既有消费者继续使用普通短读循环完成精确收包；MSG_WAITALL 的独立契约见上述接收说明。
 
 `tests/host/network_owner.py --case raw-icmp-owner --case raw-icmp-close --case ipv4-options --sanitize` 以真实协议实现检查独立报文版本、过滤/队列/分配失败、实际回调期间关闭、广播、设备隔离和握手中的绑定继承；`--page-shift 14` 覆盖 LA 页大小。暂停发生在实际过滤回调和协议资格交接处，不以延时猜测交错。
 
@@ -217,7 +221,7 @@ host 入口实测 UDP loopback、PCB 16 个用尽后第 17 个失败、全部释
 Linux ABI 依据本地 `references/linux/net/socket.c`、`net/ipv4/af_inet.c`、`fs/read_write.c`，固定 Linux v7.2；测试输入来自 `references/oscomp-testsuits` 固定 pre-2025 版本，精确身份在来源清单和机器归档。核对后运行 `make prune-build` 清理日志和镜像。
 
 本轮选项阶段接入 getpeername(205)、getsockopt(209)，以及 REUSEADDR、TYPE、
-ACCEPTCONN、ERROR、KEEPALIVE、收发预算/超时、TCP_NODELAY、TCP_MAXSEG 和
+ACCEPTCONN、ERROR、KEEPALIVE、收发预算/超时、TCP_NODELAY、TCP_CORK、TCP_MAXSEG 和
 IPV6_V6ONLY。SO_ERROR 读取清除待观察错误，连接阶段 RST 返回 ECONNREFUSED；
 已建立 RST 保留 ECONNRESET。INET收发预算默认/上限 64 KiB，设置按 Linux 倍增，
 固定 RV64 最小值分别为 4608/2304；不预分配。接收队列和 TCP 发送接受量执行
@@ -337,7 +341,40 @@ reset确认；设备失败不等于DMA停止，TX在途owner与RX借用一律保
 已完成owner在worker归还。接口查询来自真实netif，DOWN撤下RUNNING。
 详细预算、寄存器、失败与验证命令见[网卡模块](riscv-virtio-net.md)。
 
-TX 使用 indirect 表借用每包最多两段镜像内 payload，其余回退复制，用户接收仍复制。外部应用测试入口见 `tests/userland/network-external.py`。当前没有外部 IPv6、DHCP/DNS/TLS 或默认网关。
+TX 使用 indirect 表借用每包最多两段镜像内 payload，其余回退复制，用户接收仍复制。IPv4 外部应用测试入口见 `tests/userland/network-external.py`；默认网关可由已实现的 IPv4 配置接口设置。内核不提供 DHCP/DNS/TLS 服务，用户态协议库与内核网络能力分别评价。
+
+### Ethernet IPv6 静态配置、RA/SLAAC 与通信
+
+eth0 从设备 MAC 派生 `fe80::/64` 地址，使用已有 ND 定时器执行 DAD（重复地址检测），不增加 worker、轮询器或新缓存。DAD 完成前不能绑定地址；收到指向 tentative 地址的 solicited-node NS 或 all-nodes NA 会标记重复，不能以未验证的地址发送普通包。链路本地 bind 要求有效 scope/interface index，也可由 SO_BINDTODEVICE 提供；bind 的显式 scope 同时选择绑定设备，非法 index 返回 ENODEV，未配置或尚未可用的本地地址返回 EADDRNOTAVAIL。connect 的显式 scope 与已绑定设备冲突返回 EINVAL，sendto 则优先使用已绑定设备。rtnetlink GETADDR 显示实际地址、tentative/dadfailed 状态，GETROUTE dump 显示可用地址的本地及链路路由；IPv6 单条 route lookup 与 netlink 修改仍明确返回 EOPNOTSUPP。
+
+已支持真实 Ethernet 上 IPv6 TCP/UDP、ND 的 NS/NA 与 ICMPv6 echo responder。通过 AF_INET6 socket 的 SIOCSIFADDR/SIOCDIFADDR（Linux `in6_ifreq`）配置/删除静态单播地址，前缀 0–128；保留自动 link-local 槽位，另有两个静态地址槽位，满时返回 ENOBUFS。新地址必须完成 DAD。管理 DOWN 期间可添加永久地址，其 DAD 等到 UP 才进行；MTU<1280 时添加返回 EINVAL。当前静态地址配置限 Ethernet，不修改 `lo`。SIOCADDRT/SIOCDELRT 使用 Linux `in6_rtmsg`，支持唯一 IPv6 default gateway（metric 0/1024）；connected route 按实际地址前缀选择最长匹配，不再套用 lwIP 的隐含 /64 或 IPv4 default。源选择比较真实公共前缀并限制到源地址前缀，只有完整 128 位相等才当作本地地址完全匹配；配置、网关与前缀随 netif 生命周期，使用已有协议所有权，不引入动态 FIB、worker 或每包配置分配。非默认手工路由、source route、非支持 metric/flags 明确返回 EOPNOTSUPP。单独删除地址清理 ND/PMTU，但不偷偷删除已配置 default，也不修改既有 socket 的绑定或同步 abort TCP；重新添加同地址并完成 DAD 后既有 TCP 可以继续。最终输出拒绝失效源和任何物理出口的 `::1` 源/目的；显式设备或 /0/default 不得绕过 loopback 边界。提供下述 RA/SLAAC；未实现 IPv6 raw/ping socket、MLDv2 或 SSM，忽略 Redirect、RIO、RDNSS/DHCPv6，不提供 Linux accept_ra/sysctl 配置面。应用 ASM 组播订阅见下节。IPv6 不进行发送分片或分片重组；atomic fragment（offset=0 且 M=0）可通过普通输入路径，但任何含 Fragment Header 的 ND 报文按 RFC6980 丢弃，包括其后还有扩展头的情形。UDP 超所选链路/路径 MTU 返回 EMSGSIZE，IPv6 零 checksum 与错误 checksum 丢弃，IPv4 的零 UDP checksum 规则不变。
+
+接口管理 DOWN 删除静态/动态 IPv6 地址/default、撤链路本地地址并清理 ND；UP 自动重建链路本地地址、重新 DAD 并发 RS，动态配置只能重新从 RA 学习。carrier 暂时断开不等同管理 DOWN。运行时 MTU 变更清理该接口 ND 队列及目的 PMTU 缓存；低于 1280 删除静态 IPv6 地址/default 并停止该接口 IPv6 收发，恢复后自动重建 link-local 并重新发 RS；这对应 Linux 默认 keep_addr_on_down=0，不支持地址保留 sysctl。最终 Ethernet IPv6 输出再次校验源地址可用性，防已绑定 socket 或延迟 ND 报文跨越地址失效继续使用旧源。UDP 与可能携带扩展头的非直接 TCP/ICMPv6 接收共用原有预算，保留控制报文余量。
+
+RA 在完整 Ethernet/IPv6/ICMPv6 校验后处理：来源必须 link-local、Hop Limit255、Code0，先扫描全部 option 边界和固定长度，再修改任何地址、路由或 MTU；未知合法 option（包括跨 pbuf 的长 option）跳过。同链路恶意但格式合法的 RA 仍可改变网络状态，本实现不是认证或 RA Guard。
+
+固定资源复用现有 ND 表与一秒定时器：两个静态槽、两个独立 SLAAC 槽、五个 L prefix 和三个 RA default router，不驱逐静态地址给自动配置让位。L 支持0–128任意前缀，A仅支持/64并从MAC派生IID；二者独立，A-only不生成隐含 connected route。静态同址不转换为动态。默认路由优先显式静态（metric1024），否则在RA（metric2048）内按邻居可达状态与router preference选择；始终先最长 connected prefix。NUD有限探测失败后保留广告寿命，但将邻居降级、清等待包/目的cache并停止空闲重试；活router优先，新实际发送或新RA才重新开启有限探测。该固定策略不是完整Linux FIB或多策略路由。
+
+SLAAC valid/preferred lifetime按RFC4862更新：preferred归零立即deprecated；两小时下限只保护已有地址valid，不保护L prefix或默认路由；无限值不递减。到期撤地址而保留绑定PCB，清ND排队及目的cache，最终输出仍拒绝失效源。RA MTU仅接受1280至物理MTU，可下降也可恢复；清旧PMTU并在TCP发送既有unsent/retransmit前按当前有效MSS切分，保留对端MSS限制。RA的hop-limit/reachable/retrans参数本阶段仍使用本地固定策略。
+
+定向验证：
+
+```sh
+python3 tests/host/network_owner.py --case ipv6-ra --case ipv6-global --case ipv6-linklocal --page-shift 12
+python3 tests/host/network_owner.py --case ipv6-ra --case ipv6-global --case ipv6-linklocal --page-shift 14
+python3 tests/host/tcp-ipv6-mtu.py --page-shift 12
+sh tests/host/rtnetlink-ipv6-ra.sh
+python3 tests/userland/ipv6-external.py --arch riscv --cpus 4 --kernel <kernel> --program <ipv6_external ELF>
+python3 tests/userland/ipv6-external.py --arch loongarch --cpus 2 --kernel <kernel> --program <ipv6_external ELF> --qemu <qemu>
+```
+
+静态 global 验证复用下列 runner 的 `--global-address`，ELF 编译增加 `-DIPV6_STATIC_GLOBAL`：先以 `2001:db8:1::100/64` 完成 UDP，再改 /128并增加 `fe80::2` static default通过TCP；删除/重加绑定地址保持TCP并清理静态配置。RA路由可同时存在，删除static default不再假定必然不可达。SLAAC用 `--slaac` 配合 `-DIPV6_SLAAC`，不调用地址配置ioctl，由真实slirp RA生成全局地址并通信；注入畸形尾option、错误source/hop/checksum、atomic及atomic+options RA，后续1452字节UDP证明非法MTU更新未生效。
+
+ELF 来源 `tests/workloads/network/ipv6_external.c`，以目标 musl 静态编译（LA 链接页对齐 16384）。外部 runner 显式配置 QEMU slirp 的 IPv6 prefix/host 为 `fe80::/64`、`fe80::2`，由独立宿主 IPv6 TCP/UDP socket 验证内容，不是 guest 的 `::1` 回环。UDP 检查 64/1232/1452 字节内容、peer/scope、1453 字节错误边界；TCP 检查 64 KiB 全内容和半关闭/EOF。QEMU Ethernet 注入通道依次送零 checksum、错误 checksum 和正确响应，以正确响应作为处理顺序屏障。host 用例另外覆盖 DAD 冲突、地址失效、ND 队列清理、MTU 恢复、RA完整预检、L/A独立、寿命与路由到期和设备失败。`ipv6-prepare-withdraw` 在真实 parallel prepare 与 commit 之间撤销并释放模型接口，验证准备阶段仅保存数值 scope、提交阶段持协议资格查找接口，并完整归还 payload/request/pin；真实 NIC stop 另外先 drain 活动调用者。每次外部运行保存命令和 kernel/program SHA256 manifest，并在结束时再次核对身份。测试不声称公网、Linux TAP 差分、实板或性能收益。
+
+Linux ioctl/DOWN/MTU/删除匹配参考 [Linux v6.12 addrconf.c](https://github.com/torvalds/linux/blob/v6.12/net/ipv6/addrconf.c)、[route.c](https://github.com/torvalds/linux/blob/v6.12/net/ipv6/route.c)。本环境不具备 Linux NET_ADMIN/TAP，未执行 namespace 配置差分。
+
+语义参考：[Linux ipv6(7)](https://www.man7.org/linux/man-pages/man7/ipv6.7.html)、[RFC 4862 §5.4](https://www.rfc-editor.org/rfc/rfc4862.html#section-5.4)、[RFC 8200 §8.1](https://www.rfc-editor.org/rfc/rfc8200.html#section-8.1)。
 
 TX 的 SG 与复制回退在槽满时都登记 NIC 容量等待。无 indirect 特性或 pbuf 链
 不满足 SG 条件时，复制发送返回 `EAGAIN` 仍属于 NIC 槽不足，不能落入协议池
@@ -348,6 +385,14 @@ TX 的 SG 与复制回退在槽满时都登记 NIC 容量等待。无 indirect �
 ## TCP 发送接纳与复制（2026-10-05）
 
 TCP 默认采用 Nagle 的 Minshall 规则，与固定 Linux `tcp_minshall_check/update` 的边界一致：已经发出的完整 MSS 包不阻止第一个小包，尚未确认的小包会阻止后续小包。PCB 尾部记录最后一个新发小包的结束序列；主动／被动建连初始化该字段，实际输出成功才推进，重传和输出失败保留原值。判断使用 TCP 序列号比较，覆盖 32 位回绕；累计 ACK 越过该边界后解除等待。这样保留小包合并，同时减少整 MSS 在途数据与延迟 ACK 组合产生的等待。
+
+TCP 的 `send/sendto/sendmsg/sendmmsg` 接受用户 `MSG_MORE`，`splice` 的同一提示也沿 TCP COPY 路径生效。它与一次 syscall 内部的 `IO_MORE` 分开：本次应用输出可以暂留尚未发送的 sub-MSS 队尾，完整 MSS、非末段、重传、ACK 和 FIN 仍能前进。它不是持续的协议屏障，后续 ACK 或其他普通输出机会可以释放短尾。无 MORE 且接纳了数据的发送恢复普通 Nagle/Minshall；零长发送和首字节前 fault 不修改此前的提示，已有前缀后的 fault 保留当次提示，空间不足则在等待前显式推送成功前缀。
+
+`TCP_CORK` 是共享 socket 的持久配置，监听端点传给 accepted 子端点，IPv4/IPv6 相同。它对普通输出也抑制未满的新尾段，优先于已开启的 NODELAY；关闭 CORK 尝试发送已排队数据，但 NODELAY 未启用时仍遵守 Minshall。显式设置 NODELAY=1 会推送当前前缀，不清除 CORK，之后新短尾仍被 cork。SHUT_RD 不解 cork，SHUT_WR 和最后 close 仍保证 FIN 前的载荷进展。
+
+暂留尾段的绝对毫秒期限保存在 PCB 内，首次阻塞时设为当前时间加 200ms，追加不延后。CPU0 网络执行者和各 TCP owner 只把已暂留的 PCB 按期限排序，等待时取首项期限，到期在原协议资格内尝试发送。实际到线仍受调度、拥塞/接收窗口和 NIC 容量约束，不承诺 200ms 墙钟内送达。期限随 PCB 迁移，摘链/free 同时结束计时，不新增 timer 对象或 socket 引用。显式 push 保存已经排队的序号边界，窗口和 NIC 重试不能遗失这次推送；不会为了区分新旧字节切开已有尾段。
+
+`tests/host/network_owner.py --case tcp-more --case tcp-cork` 以冻结时钟检查短尾、MSS、普通输出、期限/溢出、owner 迁移与回收。`tests/workloads/network/tcp_cork.c` 是 Linux/BoarOS 共用 libc 消费者，`tests/userland/tcp-cork.py` 使用已构建的静态程序与内核运行；它核对字节及有限推进，不把 PSH、接收批次或精确墙钟值当作接口保证。语义依据为固定 Linux `f4cdf7ca9a1f` 的 `net/ipv4/tcp.c`（tcp_push、tcp_sendmsg_locked、NODELAY）、`tcp_output.c`（Nagle、probe）与 [tcp(7)](https://man7.org/linux/man-pages/man7/tcp.7.html)。
 
 开启 `TCP_NODELAY` 时先禁用 Nagle，再立即尝试输出已有 unsent 数据。NIC 暂无容量时登记原有 NIC 容量等待，协议内存不足时使用原有 pool 等待；容量事件推动重试，不依赖收到 ACK 或推进定时器。关闭 NODELAY 只恢复 Nagle。用户数据报发送使用任务登记的请求和 iovec cursor，退出清理沿同一请求归还 OFD 和包引用。
 
@@ -411,3 +456,167 @@ socket 持有已校验程序的引用，替换或 detach 在端点锁下交换�
 lwIP 入口传递实际 UDP/TCP PCB，按已登记的 socket 回调识别关联；raw API 调用者的任意 callback_arg 不解释为 socket。TCP SYN_RCVD 在 accept 前借用仍活跃监听 PCB 的关联，已建立连接使用自己的关联；本地快速输出使用同一判断。设备停机及 socket 销毁先解除回调，已执行过滤所借用的程序和包/DMA 引用各自持有到停止使用。
 
 接口、权限、共同执行器和工具入口见 [BPF 模块](kernel-bpf.md)。
+
+### TCP keepalive policy
+
+`TCP_KEEPIDLE`、`TCP_KEEPINTVL`、`TCP_KEEPCNT` 分别以秒、秒、探测次数读写；默认
+7200/75/9，合法范围 1..32767、1..32767、1..127。设置这些值不隐式开启
+`SO_KEEPALIVE`。策略属于共享 socket，dup 共享，listen 转换不丢失，accept 子端点
+继承接受时的值，之后父子各自独立。关闭/错误回收 PCB 后仍可查询策略。
+
+查询仅取 endpoint 锁；设置在既有协议生命周期保护内更新策略和活跃 PCB。
+LISTEN PCB 比活跃 PCB 小，不能写入其 active-only keepalive 字段；在 accept 时安装。
+沿用 lwIP 的 500ms slow timer、最近活动和探测计数，没有新增逐包统计、周期任务或
+独立 socket 定时器。空闲 ESTABLISHED/CLOSE_WAIT 连接在开启 keepalive 后发送探测，
+ACK 恢复活动计时；探测预算耗尽沿现有 timer error 路径返回 ETIMEDOUT。
+这里不承诺与 Linux 精确相同的墙钟探测时刻。
+
+`tests/workloads/network/tcp_keepalive.c` 是 Linux/BoarOS 共用消费者，检查范围、
+短 optlen、错误指针、optlen 先于 optval 发布、dup、IPv4/IPv6 accept 继承及协议错误。
+`tests/userland/tcp-keepalive.py` 接收预构建 kernel/static ELF 做定向 guest 验证。
+`tests/host/tcp-keepalive.sh` 用生产 lwIP 与 socket service、冻结时钟推进现有 timer，
+检查真实探测、禁用状态、超时、策略存续和资源归还（4K/16K 页）。
+Linux 语义参考 [v6.6 tcp.c](https://github.com/torvalds/linux/blob/v6.6/net/ipv4/tcp.c)。
+
+Keepalive 与 `TCP_INFO` 分开交付。曾评估仅到 snd_mss 的 20-byte 前缀，但
+iperf 成功后不检查返回长度便读取后续统计，不能将这种短返回当作完整消费者兼容。
+当前统计接口与边界见下面的 TCP_INFO 小节。
+
+定向验证命令（编译器、QEMU、pahole 由调用者配置，不下载/跑宽泛基线）：
+
+```sh
+cc -O2 -Wall -Wextra -Werror tests/workloads/network/tcp_keepalive.c -o build/keepalive-linux
+build/keepalive-linux
+sh tests/host/tcp-keepalive.sh
+riscv64-buildroot-linux-musl-gcc -static -O2 tests/workloads/network/tcp_keepalive.c -o build/keepalive-rv
+loongarch64-linux-musl-gcc -static -O2 -Wl,-z,max-page-size=16384 tests/workloads/network/tcp_keepalive.c -o build/keepalive-la
+make -j4 SMP=1 SMP_CPUS=2 USER_SMP=1 COST_DIAGNOSTICS=0 all
+make -j4 SMP=1 LA_SMP=1 LA_SMP_CPUS=2 USER_SMP=1 COST_DIAGNOSTICS=0 kernel-la
+python3 tests/userland/tcp-keepalive.py --kernel build/riscv-user-smp/kernel-rv --program build/keepalive-rv --cpus 2
+python3 tests/userland/tcp-keepalive.py --arch loongarch --kernel build/loongarch-smp2/kernel-la --program build/keepalive-la --cpus 2
+```
+
+本次 Linux 同源测试、RV/LA 双核 USER_SMP guest 均 PASS；host Linux 沙箱不允许创建
+AF_UNIX socket，该错误路径在 guest 验证。LA 使用 stock QEMU 10.0.13 的本地临时
+wrapper，仅过滤其不支持的 `-global ls7a_rtc.toy-enabled=on`；不改仓库 harness，
+不据此声称验证 RTC。host 定时器测试不测真实外网丢包、性能或精确墙钟时刻。
+
+### TCP_INFO：真实状态与消费者范围
+
+返回 Linux ABI 前 232 字节，直到偏移 228 的 `tcpi_snd_wnd`，不是只返回经典
+104 字节。`optlen` 返回 `min(用户容量,232)`，剩余用户缓冲区不写；负长度、错误
+指针、optlen 先写以及只读选项的 set 错误，使用同源 Linux/BoarOS 用例核对。
+232 字节之后的新 Linux 字段尚未提供，依赖它们的消费者必须检查返回长度。
+依据为 [Linux v6.6 tcp_info](https://github.com/torvalds/linux/blob/v6.6/include/uapi/linux/tcp.h)
+及 [tcp_get_info](https://github.com/torvalds/linux/blob/v6.6/net/ipv4/tcp.c)。
+
+- 状态、拥塞恢复状态、MSS、窗口缩放、RTO、persist/keepalive 探测、窗口与发送阈值
+  来自真实 PCB；listen 仅访问小 PCB 公共字段，unacked/sacked 按 Linux 别名报告
+  可 accept 的子连接数和 backlog。cwnd/ssthresh 从字节除以 MSS 转为整段，不能表达
+  小于一个 MSS 的余量。接收窗口阈值/空间报告固定接收容量，不伪装成 Linux 自动调优。
+- total_retrans、bytes_retrans 只在成功交付 IP 输出路径后计数，失败入队、重传准备、
+  新发 SYN 都不冒充重传。segment 的既有 flags 和一个 payload-prefix 长度记录真实
+  发送历史，分段传递、尾部追加新数据及一字节 persist probe 都保留正确字节边界。
+  这是协议输出记账，不保证物理网卡或远端实际收到了包；下层拒绝不计入输出统计，
+  与 Linux 在 queue_xmit 前记部分计数的错误路径不完全相同。
+- bytes_acked/received 跟随确认/接收序列推进，包含 FIN；active SYN 在 bytes_acked
+  中计 1，passive SYN-ACK 不计。segs/data_segs、已确认段数和接收乱序包计数来自事件。
+  unacked/lost/retrans/notsent 在查询时遍历现有队列；RTO 仅在已有恢复事件中批量标记
+  待重传段，不增加正常逐包队列遍历。LOST 是尚未确认序列的丢失标记，成功重发
+  后仍保留；重传在途同时计 lost/retrans，再次丢失后仅计 lost，ACK 归还段后两者清零。
+- RTT、RTT variance、min RTT、最近数据/ACK 时间复用 lwIP 的 500ms TCP 时钟。
+  短连接可能得到 RTT=0；这代表现有估计的量化值，不能据此判断真实延迟为零。
+  不为 TCP_INFO 新增逐包高精度时钟读取或 RTT 算法；无 RTT 样本时 min_rtt 为
+  UINT32_MAX。跨 owner 迁移同步重基时间字段；PCB 释放前保存快照，释放后查询
+  不读悬空指针，时间年龄通过查询时单调时钟继续增长。
+- 0 的明确含义：没有启用的 SACK scoreboard/FACK、ECN、DSACK、发送端乱序检测，
+  对应字段为 0；未实现的接收 RTT、delivery-rate、busy/rwnd/sndbuf chronograph
+  采样为 0，**不是测得零速率或零繁忙时间**。app_limited 位也未采样。
+  last_ack_sent 与 Linux 一样不记录、为 0；pacing/max_pacing 为 UINT64_MAX，表示
+  未限速，而不是零速率。rcv_mss 是按序接纳的新数据段的最大观察值，未见数据时为 0，
+  不是 Linux 的启发式初始 MSS。PMTU 是最近成功数据/SYN 输出所选接口 MTU；
+  本栈不因此新增路径 MTU 探测。无记录时为 0，不伪造默认路径测量。
+
+最低成本的不可省记账是事件整数加法/已有时钟值存储，持有现有协议 owner，
+无新增原子计数、锁、worker、逐包分配或周期任务。PCB 保存累计值，socket 保存
+末次 232-byte 快照以覆盖错误回调先于/晚于 PCB 释放的不同路径。这里不声称通过
+性能基准；内存和事件成本是支持可靠接口所需的显式取舍。
+
+验证入口：
+
+```sh
+cc -O2 -Wall -Wextra -Werror tests/workloads/network/tcp_info.c -o build/tcp-info-linux
+build/tcp-info-linux
+sh tests/host/tcp-info.sh
+# 和 keepalive 相同的 static 交叉编译与双核 USER_SMP kernel 构建参数
+python3 tests/userland/tcp-info.py --kernel build/riscv-user-smp/kernel-rv --program build/tcp-info-rv --cpus 2
+python3 tests/userland/tcp-info.py --arch loongarch --kernel build/loongarch-smp2/kernel-la --program build/tcp-info-la --cpus 2
+# 将 tests/workloads/network/tcp_info_iperf.c 编为对应架构的 static driver
+python3 tests/userland/tcp-info-iperf.py --kernel build/riscv-user-smp/kernel-rv --program build/iperf-init-rv --iperf "$IPERF_RV" --cpus 2
+```
+
+host 用实际 lwIP 输出回调验证失败/成功、两次 persist probe、重传、分段、追加新数据、
+ACK/字节、owner 迁移、退役后查询及资源回收（4K/16K 页）。同源 libc 用例检查 SYN/FIN
+字节规则、232-byte 的 snd_wnd、状态、backlog、长度和 fault ordering。
+实际 RV iperf3 3.13（SHA256 `8a87cda6b79966699bc68c72894288ba9aa4a5d44dc0036cfb257a4a4d73860b`）
+做双端 guest loopback 32768-byte 功能传输；解析两端 JSON、核对字节和真实读取的
+retransmits/cwnd/snd_wnd，并要求无 TCP_INFO 错误及干净关机。不把吞吐、零 RTT 或
+iperf CPU 百分比作为性能结论。没有 LA iperf 二进制，本次 LA 只覆盖同源 syscall
+用例；stock QEMU 的 RTC 参数过滤限制同 keepalive。
+
+补充定向回归：`ASAN_OPTIONS=detect_leaks=0 python3 -B tests/host/network_owner.py
+--case tcp-detached --case tcp-batch --case tcp-more --case tcp-cork --case timewait-timer
+--case tcp-batch-error --sanitize`。当前沙箱不支持 LeakSanitizer 的线程枚举，明确关闭
+LSan，仍运行 ASan/UBSan；分配归还由上述 host 计数断言独立验证。64-bit host 配置
+测得 tcp_pcb 从 320 增至 408 字节，tcp_seg 仍为 32 字节（新 prefix 长度落在原 padding）。
+这些是结构大小检查，不是性能基准。
+
+
+### IPv6 ASM UDP / MLDv1
+
+提供 `IPV6_JOIN_GROUP`/`IPV6_LEAVE_GROUP`（20 字节 `ipv6_mreq`）、
+`IPV6_MULTICAST_IF`/`HOPS`/`LOOP`/`ALL`。普通 UDP 入组不要求管理员权限。
+显式索引检查完整 32 位值，不截断成 lwIP 的 8 位索引；索引零入组只选择一个接口，
+离组零索引删除该 socket 第一个匹配成员，不重新选路。同 socket 重复入组返回
+EADDRINUSE，无成员离组返回 EADDRNOTAVAIL；最后一个 open-file 引用关闭时自动离组。
+默认 MULTICAST_ALL=1，匹配地址、端口、设备和 connected peer 的 socket 可接收主机已加入的组；
+ALL=0 还要求该 socket 自己的成员记录。它不使网卡接受主机未加入的任意组。
+
+组引用按接口聚合，应用成员和 solicited-node/DAD 成员各有独立引用，应用离组不撤销 DAD。
+最多 64 个聚合组，新应用组在已有 48 个聚合组时返回 ENOBUFS，为 ND 留出容量；
+每 socket 最多 32 个成员。MAC filter 回调失败会回滚入组，普通离组失败保留记录；
+最终关闭和接口销毁必须释放软件资源。生产 virtio 尚未协商 CTRL_RX/CTRL_VQ，
+没有声称实现硬件组表或 ALLMULTI 控制，接收后由 IPv6 成员表进行软件准入。
+外部验收依赖已测 QEMU virtio-net 默认接收模式，不保证任意 virtio 或物理网卡默认接收全部组播。
+接口 DOWN/link-down 暂停 MLD 控制包，UP 后恢复报告。MTU<1280 撤销 IPv6 聚合组，
+保留 socket 成员记录但将其聚合引用标为已退役；恢复 MTU 不自动恢复旧应用组，
+须先 LEAVE 再 JOIN（旧记录直接 JOIN 仍 EADDRINUSE）。旧成员离组/关闭不消费恢复后新成员的引用。
+接口删除清理成员记录，
+不把旧成员继承给随后复用的索引。loopback 成员只用于本地交付，不发送 MLD 控制包。
+
+入站 UDP 组播只保留原 ingress pbuf，各目标队列持有独立引用、offset 和 BPF 截断长度，
+逐目标执行 BPF 与匹配，先发布的读者不会看到后续目标修改共享数据。正常内核 socket
+fanout 不复制 payload；原始 lwIP 回调的兼容分支保留独立副本。IPv4 原有 fanout 不变。
+PEEK、短读、TRUNC、关闭和错误释放沿各目标队列处理。MLD 仅在有待报告成员时安排
+一个 100ms owner timeout，静止状态不增加永久 10Hz 扫描，也不增加 worker。
+
+MLDv1 接收验证 Hop Limit=1、Router Alert=0、link-local 源、组/目的地址关系和完整 checksum；
+含 Fragment Header 的 MLD 不接收。按 RFC2710 忽略 Code/Reserved 和合法尾部扩展，
+不把 MLDv2 宣称为已支持。Query 的零响应上限立即报告，合法 Report 抑制同组待发报告。
+Done 发往 ff02::2，payload 保留原组且 checksum 使用实际目的地址。
+没有可用 link-local 源时只允许严格识别的 MLD bootstrap 以 :: 发出；接收 :: 源 MLD 丢弃。
+发送 HOPS=0 或 interface-local 组不进入物理出口，LOOP 控制本地副本。
+
+验证入口：`tests/host/network_owner.py --case ipv6-mld`（可加 `--page-shift 14 --sanitize`）、
+`tests/host/mld-protocol.py`、`tests/host/ipv6-multicast-sockopt.py`。
+`tests/userland/ipv6-multicast.py --arch riscv|loongarch --cpus N --kernel ... --program ...`
+与 `tests/workloads/network/ipv6_multicast.c` 配套，外部 peer 经 QEMU Ethernet 注入组播及 Query，
+逐字节核对 257 字节内容和抓包中的 Report/Done、Router Alert、目的 MAC、Hop Limit、checksum；
+阶段 barrier 校验多 socket 引用及最后离组。runner 保存 kernel/program SHA256、guest log 和 pcap。
+这是 slirp/filter 注入验证，不是 TAP/物理交换机验证；Linux 行为依据源码及可用 syscall probe，
+未做需要 NET_ADMIN 的 Linux network namespace 差分。仍不支持 MLDv2/SSM、IPv6 分片重组或组播路由。
+
+协议依据：[RFC2710](https://www.rfc-editor.org/rfc/rfc2710)、
+[RFC3590](https://www.rfc-editor.org/rfc/rfc3590)；ABI/成员语义对照
+[Linux v6.12 mcast.c](https://github.com/torvalds/linux/blob/v6.12/net/ipv6/mcast.c) 和
+[ipv6_sockglue.c](https://github.com/torvalds/linux/blob/v6.12/net/ipv6/ipv6_sockglue.c)。

@@ -92,6 +92,9 @@ int kernel_rwlock_try_read(struct kernel_rwlock *lock, struct kernel_lock_guard 
 /* 不登记等待者，不越过pending/handoff；忙时guard及IRQ状态不变。
  * 上下文、rank/key、递归与owner检查仍与阻塞取得相同。 */
 int kernel_rwlock_try_write(struct kernel_rwlock *lock, struct kernel_lock_guard *guard);
+/* Convert the current top read guard only when it is the sole reader and
+ * there is no queued or in-progress grant. Failure leaves it held for read. */
+int kernel_rwlock_try_upgrade(struct kernel_lock_guard *guard);
 void kernel_rwlock_read(struct kernel_rwlock *lock, struct kernel_lock_guard *guard);
 void kernel_rwlock_write(struct kernel_rwlock *lock, struct kernel_lock_guard *guard);
 void kernel_lock_release(struct kernel_lock_guard *guard);

@@ -328,8 +328,67 @@ static int shared_pidfd_child(void *opaque)
     shared_pidfd_result=result;
     return result;
 }
+static void clone3_tid_case(void)
+{
+    int status;
+    pid_t available=fork();CHECK(available>=0);
+    if(!available)_exit(0);
+    CHECK(waitpid(available,&status,0)==available);
+    int32_t wanted[2]={available,available};
+    struct test_clone_args args={.exit_signal=SIGCHLD,
+        .set_tid=(uintptr_t)wanted,.set_tid_size=1};
+    wanted[0]=0;errno=0;CHECK(syscall(435,&args,sizeof(args))==-1 && errno==EINVAL);
+    wanted[0]=-1;errno=0;CHECK(syscall(435,&args,sizeof(args))==-1 && errno==EINVAL);
+    wanted[0]=getpid();errno=0;CHECK(syscall(435,&args,sizeof(args))==-1 && errno==EEXIST);
+    wanted[0]=available;args.set_tid_size=2;
+    errno=0;CHECK(syscall(435,&args,sizeof(args))==-1 && errno==EINVAL);
+    long page=sysconf(_SC_PAGESIZE); CHECK(page>0);
+    char *boundary=mmap(NULL,2*page,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    CHECK(boundary!=MAP_FAILED && !mprotect(boundary+page,page,PROT_NONE));
+    args.set_tid=(uintptr_t)(boundary+page-sizeof(int32_t));
+    errno=0;CHECK(syscall(435,&args,sizeof(args))==-1 && errno==EFAULT);
+    CHECK(!munmap(boundary,2*page));
+    args.set_tid=(uintptr_t)wanted;
+    args.set_tid_size=1;
+    /* Failed user output must return the unpublished exact PID for reuse. */
+    args.flags=0x1000;args.pidfd=1;
+    errno=0;CHECK(syscall(435,&args,sizeof(args))==-1 && errno==EFAULT);
+    args.flags=args.pidfd=0;
+    int release[2];CHECK(!pipe(release));
+    pid_t child=(pid_t)syscall(435,&args,sizeof(args));CHECK(child>=0);
+    if(!child) { char c;_exit(getpid()==available && read(release[0],&c,1)==1 ? 0 : 99); }
+    CHECK(child==available);
+    errno=0;CHECK(syscall(435,&args,sizeof(args))==-1 && errno==EEXIST);
+    CHECK(write(release[1],"X",1)==1);
+    CHECK(waitpid(child,&status,0)==child && WIFEXITED(status) && !WEXITSTATUS(status));
+    CHECK(!close(release[0])&&!close(release[1]));
+    /* CAP_CHECKPOINT_RESTORE alone permits exact allocation. Without either
+     * checkpoint capability or SYS_ADMIN it must fail, even for uid zero. */
+    child=fork();CHECK(child>=0);
+    if(!child) {
+        pid_t spare=fork();CHECK(spare>=0);if(!spare)_exit(0);
+        CHECK(waitpid(spare,&status,0)==spare); wanted[0]=spare;
+        struct {uint32_t version;int32_t pid;} header={0x20080522,0};
+        struct {uint32_t effective,permitted,inheritable;} data[2]={{0}};
+        CHECK(!syscall(SYS_capget,&header,data));
+        CHECK(data[1].permitted & (1U<<8));
+        data[0].effective=data[0].permitted=data[0].inheritable=0;
+        data[1].effective=data[1].permitted=1U<<8;data[1].inheritable=0;
+        CHECK(!syscall(SYS_capset,&header,data));
+        pid_t exact=(pid_t)syscall(435,&args,sizeof(args));CHECK(exact>=0);
+        if(!exact)_exit(0);
+        CHECK(exact==spare && waitpid(exact,&status,0)==exact && !status);
+        data[1].effective=data[1].permitted=0;CHECK(!syscall(SYS_capset,&header,data));
+        errno=0;CHECK(syscall(435,&args,sizeof(args))==-1 && errno==EPERM);
+        _exit(0);
+    }
+    CHECK(waitpid(child,&status,0)==child && WIFEXITED(status) && !WEXITSTATUS(status));
+    puts("CLONE-RES exact-tid OK");
+}
+
 static void clone3_case(void)
 {
+    clone3_tid_case();
     struct test_clone_args args={.exit_signal=SIGCHLD};
     errno=0; CHECK(syscall(435,&args,63)==-1 && errno==EINVAL);
     errno=0; CHECK(syscall(435,(void *)1,sizeof(args))==-1 && errno==EFAULT);

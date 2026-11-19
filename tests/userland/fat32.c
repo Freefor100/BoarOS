@@ -8,6 +8,8 @@
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/resource.h>
+#include <sys/sendfile.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/uio.h>
@@ -139,6 +141,74 @@ static int file_size_limit(size_t page)
     return 0;
 }
 
+static unsigned char direct_data[32768] __attribute__((aligned(16384)));
+static int direct_contract(void)
+{
+    stage="direct";
+    size_t page=(size_t)sysconf(_SC_PAGESIZE);
+    int fd=open(BASE "/DIRECT.BIN",O_CREAT|O_RDWR|O_DIRECT,0600);CHECK(fd>=0);
+    memset(direct_data,0x41,sizeof(direct_data));
+    /* FAT growth uses the documented buffered fallback, including unaligned I/O. */
+    CHECK(pwrite(fd,direct_data+1,7,0)==7);
+    CHECK(ftruncate(fd,0)==0);
+    CHECK(pwrite(fd,direct_data,2*page,0)==(ssize_t)(2*page));
+    FAILS(pwrite(fd,direct_data+1,512,0),EINVAL);
+    FAILS(pread(fd,direct_data,511,0),EINVAL);
+    struct iovec bad[2]={{direct_data,256},{direct_data+256,256}};
+    FAILS(preadv(fd,bad,2,0),EINVAL);
+    unsigned char *map=mmap(NULL,2*page,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
+    CHECK(map!=MAP_FAILED);
+    map[0]=0x62;
+    CHECK(pread(fd,direct_data,page,0)==(ssize_t)page && direct_data[0]==0x62);
+    /* Revoke/refault the very mapping supplying or receiving the user bytes. */
+    map[0]=0x63;
+    CHECK(pwrite(fd,map,page,page)==(ssize_t)page);
+    CHECK(map[page]==0x63);
+    CHECK(pread(fd,map,page,page)==(ssize_t)page && map[0]==0x63);
+    CHECK(munmap(map,2*page)==0);
+    void *fault=mmap(NULL,page,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    CHECK(fault!=MAP_FAILED);
+    FAILS(pwrite(fd,fault,page,0),EFAULT);
+    FAILS(pread(fd,fault,page,0),EFAULT);
+    CHECK(munmap(fault,page)==0);
+    CHECK(pread(fd,direct_data,page,0)==(ssize_t)page);
+    CHECK(ftruncate(fd,page+17)==0);
+    CHECK(pread(fd,direct_data,page,page)==17);
+    CHECK(pwrite(fd,direct_data+1,31,page+1)==31);
+    CHECK(ftruncate(fd,0)==0);
+    CHECK(pread(fd,direct_data,page,0)==0);
+    CHECK(pwrite(fd,direct_data,page,0)==(ssize_t)page);
+    void *partial=mmap(NULL,2*page,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    CHECK(partial!=MAP_FAILED && mprotect((char *)partial+page,page,PROT_NONE)==0);
+    CHECK(ftruncate(fd,0)==0);
+    CHECK(pwrite(fd,partial,2*page,0)==(ssize_t)page);
+    CHECK(pwrite(fd,direct_data+1,1,page+1)==1);
+    CHECK(munmap(partial,2*page)==0);
+    CHECK(ftruncate(fd,page)==0);
+    CHECK(mknod("/dev/dio-loop",S_IFBLK|0600,makedev(7,0))==0);
+    int loop=open("/dev/dio-loop",O_RDWR|O_DIRECT);CHECK(loop>=0);
+    CHECK(ioctl(loop,0x4c00,fd)==0);
+    CHECK(pwrite(loop,direct_data,512,0)==512);
+    CHECK(pread(loop,direct_data,512,0)==512);
+    CHECK(ioctl(loop,0x4c01,0)==0 && close(loop)==0 && unlink("/dev/dio-loop")==0);
+    int other=open(BASE "/COPY.BIN",O_CREAT|O_RDWR|O_TRUNC,0600);CHECK(other>=0);
+    off_t at=0;CHECK(sendfile(other,fd,&at,page)==(ssize_t)page);
+    CHECK(lseek(fd,0,SEEK_SET)==0);at=0;
+    CHECK(sendfile(fd,other,&at,page)==(ssize_t)page);
+    int channel[2];CHECK(pipe(channel)==0);
+    at=0;CHECK(splice(fd,&at,channel[1],NULL,page,0)==(ssize_t)page);
+    at=0;CHECK(splice(channel[0],NULL,fd,&at,page,0)==(ssize_t)page);
+    CHECK(close(channel[0])==0 && close(channel[1])==0);
+    CHECK(close(other)==0 && unlink(BASE "/COPY.BIN")==0);
+    int copy=dup(fd);CHECK(copy>=0);
+    int flags=fcntl(copy,F_GETFL);CHECK(flags&O_DIRECT);
+    CHECK(fcntl(copy,F_SETFL,flags&~O_DIRECT)==0 && !(fcntl(fd,F_GETFL)&O_DIRECT));
+    CHECK(fcntl(fd,F_SETFL,flags)==0);
+    CHECK(close(copy)==0 && close(fd)==0 && unlink(BASE "/DIRECT.BIN")==0);
+    puts("BoarOS: FAT32 direct/fallback checks ok");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *device = argc > 1 ? argv[1] : "/dev/vdb2";
@@ -156,6 +226,7 @@ int main(int argc, char **argv)
     CHECK(mount(device, "/fat-test", "vfat", 0, 0) == 0);
     /* 独占自己的目录；旧失败留下的文件必须由调用者检查，不能偷偷覆盖。 */
     CHECK(mkdir(BASE, 0755) == 0);
+    CHECK(direct_contract()==0);
     CHECK(mkdir(BASE "/first", 0755) == 0 && mkdir(BASE "/second", 0755) == 0 &&
           mkdir(BASE "/first/sub", 0755) == 0);
 

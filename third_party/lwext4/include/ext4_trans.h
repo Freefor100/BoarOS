@@ -78,6 +78,8 @@ int ext4_trans_block_get_range(struct ext4_blockdev *bdev,
 
 struct kernel_block_span;
 /* Synchronous non-journal stable blocks; explicit bcache borrows remain coherent. */
+int ext4_trans_write_data_sync(struct ext4_blockdev *bdev, uint64_t lba,
+    uint32_t offset, const void *data, uint32_t length, bool initialize);
 int ext4_trans_write_data_batch(struct ext4_blockdev *bdev,
     struct kernel_block_span *spans, unsigned count);
 
@@ -94,6 +96,8 @@ int ext4_trans_write_data(struct ext4_blockdev *bdev, uint64_t lba,
  * @return standard error code*/
 int ext4_trans_try_revoke_block(struct ext4_blockdev *bdev,
 			       uint64_t lba);
+int ext4_trans_try_revoke_range(struct ext4_blockdev *bdev,
+                              uint64_t first, uint32_t count);
 
 #ifdef __cplusplus
 }

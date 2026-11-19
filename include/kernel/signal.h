@@ -57,6 +57,7 @@ struct kernel_signal_wait_info {
             };
         };
         uint64_t address;
+        struct { uint64_t call_address; int32_t syscall; uint32_t arch; };
         uint8_t payload[112];
     };
 };
@@ -126,10 +127,13 @@ struct kernel_signal_fault {
     uint32_t signal;
     int32_t code;
     uint64_t address;
+    int32_t error, syscall;
+    uint32_t arch;
 };
 /* Current-thread synchronous exception; no allocation, delivered on user return. */
 void kernel_signal_force_fault(struct kernel_task *task, uint32_t signal,
     int32_t code, uint64_t address);
+void kernel_signal_force_seccomp(struct kernel_task *, uint64_t, int32_t, uint32_t, uint16_t);
 
 struct kernel_signal_delivery {
     struct kernel_signal_wait_info info;
@@ -156,6 +160,14 @@ enum kernel_signal_select_result kernel_signal_select(
 enum kernel_signal_restart kernel_signal_restart_decide(
     struct kernel_task *task, int has_handler, uint64_t flags);
 void kernel_signal_clear_syscall_restart(struct kernel_task *task);
+/* Restart payload belongs to syscall 128. Tracer replacements use the full
+ * dispatcher number, not seccomp_data's truncated signed nr. */
+static inline void kernel_signal_retire_replaced_restart(struct kernel_task *task,
+    uint64_t original_nr,uint64_t replacement_nr)
+{
+    if (original_nr==128 && replacement_nr!=128)
+        kernel_signal_clear_syscall_restart(task);
+}
 int kernel_signal_nanosleep_restart(const struct kernel_task *task,
                                     int32_t *clock_id,
                                     uint64_t *deadline,
@@ -280,7 +292,7 @@ enum kernel_signal_status kernel_signal_unshare_for_exec(struct kernel_task *tas
 
 /* Exit notification and zombie retention are separate decisions. */
 int kernel_signal_wants_sigchld(const struct kernel_task *parent);
-int kernel_signal_child_autoreap(const struct kernel_task *parent);
+int kernel_signal_child_autoreap(const struct kernel_task *parent, uint32_t exit_signal);
 
 /* Child state transitions wake wait4 and optionally raise SIGCHLD. */
 void kernel_signal_notify_child_exit(struct kernel_task *child);
@@ -307,7 +319,8 @@ int64_t kernel_signal_send_thread(struct kernel_task *caller,
                                    uint32_t sig,
                                    kernel_pid_t sender_tid);
 
-/* Returns a storage lookup borrow; release with kernel_task_lookup_put(). */
-struct kernel_task *kernel_signal_find_by_tid(kernel_pid_t tid);
+/* Current active PID view; returns a storage borrow released with
+ * kernel_task_lookup_put(). Internal root lookups use scheduler helpers. */
+struct kernel_task *kernel_signal_find_user_tid(kernel_pid_t tid);
 
 #endif

@@ -331,7 +331,7 @@ static void finish_inode(struct ext4_inode_ref *ref)
     ref->dirty = true;
 }
 
-static int check_allocated(struct ext4_fs *fs, uint32_t ino, bool special)
+static int check_inode_number(struct ext4_fs *fs, uint32_t ino, bool special)
 {
     uint32_t first = special ? 1 : ext4_get32(ext4_fs_super(fs), first_inode);
     uint32_t per_group = ext4_get32(ext4_fs_super(fs), inodes_per_group);
@@ -345,13 +345,26 @@ static int check_allocated(struct ext4_fs *fs, uint32_t ino, bool special)
         per_group > (uint64_t)fs->bdev->lg_bsize * 8 ||
         (!special && (ino == ext4_get32(ext4_fs_super(fs), orphan_file_inum) ||
                       ino == ext4_get32(ext4_fs_super(fs), journal_inode_number)))) return EUCLEAN;
+    return EOK;
+}
+
+int ext4_orphan_check_user_inode(struct ext4_fs *fs, uint32_t inode)
+{
+    return check_inode_number(fs, inode, false);
+}
+
+static int check_allocated(struct ext4_fs *fs, uint32_t ino, bool special)
+{
+    int r=check_inode_number(fs,ino,special);
+    if (r != EOK) return r;
+    uint32_t per_group=ext4_get32(ext4_fs_super(fs),inodes_per_group);
     /* The bitmap checksum and its descriptor must describe one accepted
      * allocation state. An unrelated inode in this group can otherwise be
      * accepted between the two reads and manufacture a corruption error. */
     /* Mount/recovery validation runs after its external users are drained,
      * without a modifying operation. Only a live operation can race another
      * allocator and owns the qualification until acceptance or abort. */
-    int r = ext4_current_operation(fs) ?
+    r = ext4_current_operation(fs) ?
         ext4_operation_require_resource(fs, EXT4_RESOURCE_BLOCK_GROUP,
                                         (ino - 1) / per_group) : EOK;
     if (r) return r;
@@ -766,14 +779,15 @@ int ext4_orphan_add(struct ext4_inode_ref *inode)
     return result;
 }
 
-int ext4_orphan_remove(struct ext4_inode_ref *inode)
+static int remove_orphan(struct ext4_inode_ref *inode, bool freeing)
 {
     struct ext4_fs *fs = inode->fs;
     int result = ext4_orphan_prepare_change(inode);
     if (result) return result;
     struct orphan_record record;
     if (!operation_record(fs, inode->index, &record)) return EOK;
-    result = check_allocated(fs, inode->index, false);
+    result = freeing ? check_inode_number(fs, inode->index, false) :
+        check_allocated(fs, inode->index, false);
     if (result) return result;
     if (!valid_orphan_type(fs, inode->inode)) return EUCLEAN;
     struct ext4_orphan_undo *change = reserve_change(fs, inode->index);
@@ -816,6 +830,22 @@ int ext4_orphan_remove(struct ext4_inode_ref *inode)
     }
     if (changed) change->after_present = false;
     return result;
+}
+
+int ext4_orphan_remove(struct ext4_inode_ref *inode)
+{
+    return remove_orphan(inode, false);
+}
+
+int ext4_orphan_remove_and_free(struct ext4_inode_ref *inode)
+{
+    if (ext4_inode_get_links_cnt(inode->inode)) return EUCLEAN;
+    int result=remove_orphan(inode,true);
+    if (result != EOK) return result;
+    /* The allocator verifies the bit and checksum on the actual writable
+     * bitmap. Its failure aborts the orphan removal in this same operation. */
+    ext4_inode_set_del_time(inode->inode,UINT32_MAX);
+    return ext4_fs_free_inode(inode);
 }
 
 int ext4_orphan_set_present(struct ext4_fs *fs, bool present)

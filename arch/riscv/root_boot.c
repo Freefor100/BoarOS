@@ -1,3 +1,4 @@
+#include "../../fs/cgroup_internal.h"
 #include <kernel/bpf.h>
 #include "init-config.h"
 #include <arch/riscv/direct_map.h>
@@ -12,6 +13,7 @@
 #include <kernel/files.h>
 #include <kernel/fs_context.h>
 #include <kernel/mm.h>
+#include <kernel/hugetlb.h>
 #include <kernel/mm_backend.h>
 #include <arch/riscv/smp.h>
 #include <kernel/open_file.h>
@@ -82,7 +84,7 @@ static int destroy_devices(struct riscv_root_boot *root)
     while (root->device_count) {
         struct riscv_virtio_mmio_block *device =
             riscv_root_boot_device(root, root->device_count - 1U);
-        for (unsigned p = 0; p < 4; p++) {
+        for (unsigned p = 0; p < KERNEL_BLOCK_GPT_PARTITIONS; p++) {
             struct kernel_block_device *child = &root->partitions[root->device_count - 1U][p];
             if (child->registered && kernel_block_unregister(child))
                 return RISCV_VIRTIO_MMIO_BLOCK_STATUS_STATE;
@@ -233,6 +235,7 @@ enum riscv_root_boot_status riscv_root_boot_cleanup(
     }
     if (riscv_uart_tty_stop(&root->uart)) cleanup_failed = 1;
     if (root->heap.page_allocator && kernel_bpf_shutdown(&root->heap)) cleanup_failed = 1;
+    if (root->heap.page_allocator && kernel_cgroup_shutdown(&root->heap)) cleanup_failed = 1;
     if (root->heap.page_allocator == 0) {
         cleanup_failed = 1;
     } else {
@@ -333,7 +336,7 @@ enum riscv_root_boot_status riscv_root_boot_start_with_irq(
                 failure = RISCV_ROOT_BOOT_STATUS_DEVICE;
                 goto fail;
             }
-            if (kernel_block_scan_mbr(&device->block, root->partitions[root->device_count - 1U])) {
+            if (kernel_block_scan_partitions(&device->block, root->partitions[root->device_count - 1U])) {
                 failure = RISCV_ROOT_BOOT_STATUS_DEVICE;
                 goto fail;
             }
@@ -643,6 +646,7 @@ enum riscv_root_boot_status riscv_root_boot_finish(
     if (!error) kernel_page_cache_stop_worker(&root->page_cache);
     if (error == 0) error = kernel_vfs_unmount(&root->mount);
     if (error == 0) error = kernel_bpf_shutdown(&root->heap);
+    if (error == 0) error = kernel_cgroup_shutdown(&root->heap);
     if (error != 0) {
         root->finish_failure = RISCV_ROOT_FINISH_UNMOUNT;
         root->finish_error = error;
@@ -672,6 +676,13 @@ enum riscv_root_boot_status riscv_root_boot_finish(
     if (cpu->borrowed_mm_allocator && kernel_mm_activate(NULL,cpu->borrowed_mm_kernel_context))
         __builtin_trap();
 #endif
+    error=(int)kernel_hstate_shutdown(root->heap.page_allocator);
+    if (error) {
+        root->finish_failure=RISCV_ROOT_FINISH_HEAP_BASELINE;root->finish_error=error;
+        kernel_heap_get_statistics(&root->heap,heap_statistics);
+        *available_pages=physical_page_available(root->heap.page_allocator);
+        return RISCV_ROOT_BOOT_STATUS_CLEANUP;
+    }
     kernel_heap_get_statistics(&root->heap, heap_statistics);
     *available_pages = physical_page_available(root->heap.page_allocator);
     if (heap_statistics->live_allocations != 0U ||

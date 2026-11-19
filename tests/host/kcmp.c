@@ -20,6 +20,8 @@ static struct kernel_files_record records[2];
 static struct kernel_file_slot slots[2][4];
 static struct kernel_open_file_description descriptions[2];
 static unsigned pages,borrows,services,denied,change_security,retired,scenario;
+static struct kernel_pid_registry *views[2];
+static struct kernel_pid_member *detach_on_fd;
 static pthread_mutex_t gate=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t changed=PTHREAD_COND_INITIALIZER;
 static int at_fd,resume_fd,exit_at_barrier,exit_done;
@@ -33,14 +35,24 @@ void kernel_service_scope_begin(struct kernel_service_scope *scope)
 void kernel_service_scope_end(struct kernel_service_scope *scope){(void)scope;}
 struct kernel_task *process_find_identity(kernel_pid_t number,enum kernel_pid_role role)
 {assert(role==KERNEL_PID_TID&&cpu.raw_locks);for(unsigned i=0;i<2;i++)if(tasks[i].tid==number&&!retired)return &tasks[i];return 0;}
+struct kernel_pid_registry *process_pid_active(const struct kernel_task *task)
+{return views[0] ? views[task==&tasks[0]?0:1] : &scheduler.identities;}
+struct kernel_task *process_find_identity_in(kernel_pid_t number,enum kernel_pid_role role,
+    struct kernel_pid_registry *view)
+{
+    if(!views[0]) {assert(view==&scheduler.identities);return process_find_identity(number,role);}
+    struct kernel_pid *id=kernel_pid_find(view,number);
+    return id && id->members[role] ? id->members[role]->task : NULL;
+}
+
 struct kernel_pid *process_identity(const struct kernel_task *task,enum kernel_pid_role role)
 {return task?task->identities[role].identity:0;}
-struct kernel_task *scheduler_task_lookup_locked(kernel_pid_t number,enum kernel_pid_role role,uint64_t generation)
-{assert(!generation);struct kernel_task *task=process_find_identity(number,role);if(task){task->storage_borrows++;__atomic_fetch_add(&borrows,1,__ATOMIC_RELAXED);}return task;}
+struct kernel_task *scheduler_task_lookup_in_locked(struct kernel_pid_registry *view,kernel_pid_t number,enum kernel_pid_role role,uint64_t generation)
+{assert(!generation);struct kernel_task *task=process_find_identity_in(number,role,view);if(task){task->storage_borrows++;__atomic_fetch_add(&borrows,1,__ATOMIC_RELAXED);}return task;}
 void scheduler_task_put(struct kernel_task *task)
 {assert(!cpu.raw_locks&&task->storage_borrows);__atomic_fetch_sub(&task->storage_borrows,1,__ATOMIC_RELAXED);__atomic_fetch_sub(&borrows,1,__ATOMIC_RELAXED);}
 int kernel_credentials_may_access_locked(const struct kernel_task *from,const struct kernel_task *to,int fs)
-{assert(from==&tasks[0]&&(to==&tasks[0]||to==&tasks[1])&&!fs&&cpu.raw_locks);return !(denied&&to==&tasks[1]);}
+{assert(from==running&&(to==&tasks[0]||to==&tasks[1])&&!fs&&cpu.raw_locks);return !(denied&&to==&tasks[1]);}
 int kernel_files_is_live(const struct kernel_files *files)
 {return files->state==KERNEL_FILES_LIVE&&files->record;}
 enum kernel_random_status kernel_random_fill(void *out,size_t size)
@@ -66,6 +78,10 @@ void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_r
         assert(!pthread_mutex_lock(&gate));exit_at_barrier=1;assert(!pthread_cond_broadcast(&changed));assert(!pthread_mutex_unlock(&gate));
     }
     if(running==&tasks[0]&&lock==&records[0].metadata_lock){
+        if(detach_on_fd) {
+            KERNEL_RAW_SCOPE(domain,&kernel_wait_domain);
+            kernel_pid_detach(detach_on_fd);detach_on_fd=NULL;
+        }
         if(change_security){denied=1;change_security=0;}
         if(scenario==3){assert(!pthread_mutex_lock(&gate));at_fd=1;assert(!pthread_cond_broadcast(&changed));
             while(!resume_fd)assert(!pthread_cond_wait(&changed,&gate));
@@ -73,6 +89,9 @@ void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_r
     }
     __real_kernel_raw_lock_acquire(lock,guard);
 }
+void process_pid_reaper_disable_locked(struct kernel_task *task)
+{assert(process_pid_active(task)==&scheduler.identities);}
+
 static void setup(void)
 {
     running=&tasks[0];cpu.current=running;cpu.logical_id=1;
@@ -139,5 +158,44 @@ static void departure(void)
     for(unsigned type=KCMP_VM;type<=KCMP_SYSVSEM;type++)if(type!=KCMP_IO&&type!=KCMP_SIGHAND)assert(query(10,11,type,0,0)==0);
     retired=1;assert(query(10,11,KCMP_VM,0,0)==-KERNEL_ESRCH);
 }
+static void namespace_views(void)
+{
+    struct kernel_pid_allocator alloc[3]={0};
+    uint64_t bitmap[3][KERNEL_PID_BITMAP_WORDS(32)]={0};
+    struct kernel_pid_registry children[2]={0};
+    struct kernel_pid *owners[2]={0};struct kernel_pid_member members[2]={0};
+    for(unsigned i=0;i<3;i++)assert(!kernel_pid_allocator_init(&alloc[i],bitmap[i],32));
+    assert(!kernel_pid_registry_init(&scheduler.identities,&alloc[0],NULL));
+    for(unsigned i=0;i<2;i++) {
+        assert(!kernel_pid_registry_init(&children[i],&alloc[i+1],&scheduler.identities));
+        views[i]=&children[i];
+        size_t bytes=kernel_pid_storage_size(views[i]);owners[i]=calloc(1,bytes);assert(owners[i]);
+        kernel_pid_t requested=1;
+        assert(!kernel_pid_reserve_numbers(views[i],owners[i],bytes,&requested,1));
+        assert(!kernel_pid_publish_reserved(owners[i]));
+        kernel_pid_attach(&members[i],owners[i],KERNEL_PID_TID,&tasks[i]);
+    }
+    assert(query(1,1,KCMP_VM,0,0)==0);
+    assert(query(1,2,KCMP_VM,0,0)==-KERNEL_ESRCH);
+    assert(query(10,10,KCMP_VM,0,0)==-KERNEL_ESRCH);
+    running=&tasks[1];cpu.current=running;
+    assert(kernel_kcmp(running,1,1,KCMP_VM,0,0)==0);
+    assert(kernel_kcmp(running,1,2,KCMP_VM,0,0)==-KERNEL_ESRCH);
+    running=&tasks[0];cpu.current=running;
+    /* The FD locks occur after lookup borrows. Remove the actual PID role
+     * there: the later check must not follow a historical integer. */
+    detach_on_fd=&members[0];assert(query(1,1,KCMP_FILE,0,0)==-KERNEL_ESRCH);
+    kernel_pid_detach(&members[1]);
+    for(unsigned i=0;i<2;i++)kernel_pid_put(owners[i]);
+    struct kernel_pid *id;
+    while((id=kernel_pid_take_retired(&scheduler.identities)))free(id);
+    for(unsigned i=0;i<2;i++)kernel_pid_registry_put(&children[i]);
+    while(kernel_pid_take_retired_namespace(&scheduler.identities));
+    assert(scheduler.identities.references==1 && !borrows);
+    for(unsigned i=0;i<3;i++)assert(!alloc[i].allocated);
+    views[0]=views[1]=NULL;memset(&scheduler.identities,0,sizeof(scheduler.identities));
+    puts("kcmp: real sibling registries and FD-lock role-detach recheck passed");
+}
+
 int main(void)
-{setup();semantics();sighand();departure();puts("kcmp: order, real FD slots, lazy identity, permission recheck and exit owners passed");return 0;}
+{setup();semantics();sighand();namespace_views();departure();puts("kcmp: order, real FD slots, lazy identity, permission recheck and exit owners passed");return 0;}

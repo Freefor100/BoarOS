@@ -55,19 +55,13 @@ void kernel_run_set_release(struct kernel_run_set *);
 #define KERNEL_RUN_SET(name) ((void)0)
 #endif
 
-/* Short stable views share qualification; writers close admission before
- * draining readers. Only users of this type pay for reader bookkeeping. */
+/* On SMP, bit 0 closes admission for a writer and each reader adds 2 to
+ * the same word. A writer can enter once the word reaches 1. */
 struct kernel_raw_rwlock {
     struct kernel_raw_lock writer;
-#if BOAROS_MAX_CPUS > 1
-    uint32_t readers;
-#endif
 };
 struct kernel_raw_read_guard {
     struct kernel_raw_guard raw;
-#if BOAROS_MAX_CPUS > 1
-    struct kernel_raw_rwlock *lock;
-#endif
 };
 #if BOAROS_MAX_CPUS > 1
 void kernel_raw_rwlock_init(struct kernel_raw_rwlock *, uint32_t rank);

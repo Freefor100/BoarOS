@@ -217,6 +217,7 @@ enum kernel_vfs_open_flags {
     KERNEL_VFS_OPEN_REGULAR = 1U << 6,
     KERNEL_VFS_OPEN_NOATIME = 1U << 7,
     KERNEL_VFS_OPEN_APPEND = 1U << 8,
+    KERNEL_VFS_OPEN_TMPFILE = 1U << 9,
 };
 enum kernel_vfs_resolve_flags {
     KERNEL_VFS_RESOLVE_NO_XDEV = 1U << 0,
@@ -388,6 +389,9 @@ int kernel_vfs_pwrite(struct kernel_vfs_file *file,
                       size_t *bytes_written);
 
 struct kernel_uaccess_iovec;
+size_t kernel_vfs_direct_alignment(struct kernel_vfs_file *);
+int kernel_vfs_pwrite_direct(struct kernel_vfs_file *,uint64_t,const void *,size_t,size_t *,const struct kernel_lock_guard *);
+int kernel_vfs_direct_pread(struct kernel_vfs_file *,uint64_t,void *,size_t,size_t *);
 struct kernel_vfs_user_write_result {
     uint64_t end_offset;
     size_t written, chunks;
@@ -396,10 +400,14 @@ struct kernel_vfs_user_write_result {
 /* 调用者持file/MM/iovec owner，iovec已导入并完成区间校验；
  * 保持整个请求写操作门，直接填入最终页。
  * 用户fault保留已提交前缀，内部uaccess错误单独报告，不转换为磁盘I/O错误。 */
-int kernel_vfs_write_user(struct kernel_vfs_file *,struct kernel_mm *,
+int kernel_vfs_write_user_mode(struct kernel_vfs_file *,struct kernel_mm *,
     const struct kernel_uaccess_iovec *,size_t iov_count,size_t count,
-    uint64_t offset,int append,struct kernel_vfs_size_limit *,
+    uint64_t offset,int append,int direct,struct kernel_vfs_size_limit *,
     struct kernel_vfs_user_write_result *);
+
+int kernel_vfs_write_user(struct kernel_vfs_file *,struct kernel_mm *,
+    const struct kernel_uaccess_iovec *,size_t,size_t,uint64_t,int,
+    struct kernel_vfs_size_limit *,struct kernel_vfs_user_write_result *);
 
 #define KERNEL_VFS_FALLOC_KEEP_SIZE 1U
 #define KERNEL_VFS_FALLOC_PUNCH_HOLE 2U
@@ -471,20 +479,28 @@ uint64_t kernel_vfs_file_size(const struct kernel_vfs_file *file);
 #define KERNEL_VFS_DT_LNK UINT8_C(7)
 #define KERNEL_VFS_DT_SOCK UINT8_C(12)
 
-/*
- * Report the first entry at or after the opaque byte `position` of an open
- * directory.  `next_position` receives the cookie to use for the following
- * entry, and remains valid at EOF (unchanged unless the backend advances it).
- * Return 1 with fields filled, 0 at end of directory, or a negative errno.
- * The position is a backend cookie, not an entry ordinal.
- */
-int kernel_vfs_dir_entry(struct kernel_vfs_file *file,
-                         uint64_t position,
-                         uint64_t *next_position,
-                         uint64_t *inode,
-                         uint8_t *type,
-                         char *name,
-                         size_t name_size);
+/* Bounded kernel-owned linux_dirent64 batch. No user access occurs while the
+ * backend/namespace locks are held. position advances only for packed records,
+ * or to the backend EOF cookie; the caller commits it after copying the batch.
+ * Return 0 at EOF, 1 when full, or a negative errno (possibly after a prefix). */
+enum kernel_vfs_dir_relatime {
+    KERNEL_VFS_DIR_RELATIME_UNCHECKED,
+    KERNEL_VFS_DIR_RELATIME_CURRENT,
+    KERNEL_VFS_DIR_RELATIME_EXPIRED,
+};
+struct kernel_vfs_dir_batch {
+    unsigned char *data;
+    size_t capacity, used;
+    uint64_t position;
+    unsigned check_relatime;
+    enum kernel_vfs_dir_relatime relatime;
+};
+/* Pass open flags on the first batch of a user read to account for access time. */
+int kernel_vfs_read_directory(struct kernel_vfs_file *, struct kernel_vfs_dir_batch *,
+    const uint32_t *open_flags);
+/* Backend sink: 0 rejects a record, 1 accepts, 2 accepts and fills the batch. */
+int kernel_vfs_dir_emit(struct kernel_vfs_dir_batch *, uint64_t next_position,
+    uint64_t inode, uint8_t type, const char *name, size_t name_length);
 
 int kernel_vfs_files_share_node(const struct kernel_vfs_file *left,
                                 const struct kernel_vfs_file *right);

@@ -148,6 +148,11 @@ int32_t kernel_tty_foreground(const struct kernel_tty *tty)
 {
     return tty && tty->foreground ? tty->foreground->number : -1;
 }
+int32_t kernel_tty_foreground_in(const struct kernel_tty *tty,
+    const struct kernel_pid_registry *view)
+{
+    return tty && tty->foreground ? kernel_pid_number_in(tty->foreground, view) : -1;
+}
 static int hungup(const struct tty_instance *instance)
 {
     return instance->tty->shutdown || (!instance->console &&
@@ -1663,9 +1668,8 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
         }
         uintptr_t irq = arch_interrupt_save();
         if (command == 0x5429 && !control->session) { arch_interrupt_restore(irq); error = -KERNEL_ENOTTY; break; }
-        int32_t value = command == 0x540f ? (control->foreground ? control->foreground->number : 0)
-                        : control->session    ? control->session->number
-                                          : -1;
+        int32_t value = kernel_task_identity_user_number(command == 0x540f
+            ? control->foreground : control->session);
         arch_interrupt_restore(irq);
         error = copy_ioctl(mm, argument, &value, sizeof(value), 1);
         break;

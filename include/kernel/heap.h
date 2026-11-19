@@ -65,6 +65,11 @@ enum kernel_heap_status kernel_heap_allocate_zeroed(
 enum kernel_heap_status kernel_heap_allocate_nosleep(struct kernel_heap *,size_t,void **);
 enum kernel_heap_status kernel_heap_allocate_zeroed_nosleep(struct kernel_heap *,size_t,size_t,void **);
 
+/* Up to 16 objects from a small size class. Returns the allocated prefix
+ * on memory pressure. Each object is zeroed and individually releasable. */
+unsigned kernel_heap_allocate_zeroed_batch_nosleep(struct kernel_heap *,
+    unsigned count, size_t size, void **out);
+
 /* On failure, both the old allocation and output value remain unchanged. */
 enum kernel_heap_status kernel_heap_resize(
     struct kernel_heap *heap,

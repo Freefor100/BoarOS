@@ -689,15 +689,17 @@ enum kernel_mm_status __wrap_kernel_mm_fork(struct kernel_mm *destination,struct
 }
 
 enum kernel_mm_status __real_kernel_mm_resolve_user_fault(struct kernel_mm *,uint64_t,uint32_t);
+enum kernel_mm_status __real_kernel_mm_resolve_owned_user_fault(struct kernel_mm *,struct kernel_task *,uint64_t,uint32_t);
 enum kernel_mm_status __real_kernel_mm_resolve_user_pin(struct kernel_mm *,uint64_t,uint32_t,struct kernel_mm_user_pin *);
 static enum kernel_mm_status composition_resolve_real(struct kernel_mm *mm,uint64_t address,
-    uint32_t access,struct kernel_mm_user_pin *pin)
+    uint32_t access,struct kernel_mm_user_pin *pin,struct kernel_task *task)
 {
+    if (task) return __real_kernel_mm_resolve_owned_user_fault(mm,task,address,access);
     return pin ? __real_kernel_mm_resolve_user_pin(mm,address,access,pin) :
         __real_kernel_mm_resolve_user_fault(mm,address,access);
 }
 static enum kernel_mm_status composition_resolve(struct kernel_mm *mm,
-    uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin)
+    uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin,struct kernel_task *task)
 {
     kernel_pid_t tid=0;
     uint64_t page=address&~BOAROS_PAGE_MASK;
@@ -711,7 +713,7 @@ static enum kernel_mm_status composition_resolve(struct kernel_mm *mm,
     if (!participant) {
         int local_io=reading_task() && address>=read_address && address-read_address<read_size;
         if(local_io)check(kernel_cpu_current()->logical_id==read_hart);
-        enum kernel_mm_status status=composition_resolve_real(mm,address,access,pin);
+        enum kernel_mm_status status=composition_resolve_real(mm,address,access,pin,task);
         if(local_io && !status) { check(kernel_cpu_current()->logical_id==read_hart);read_user_faults++; }
         return status;
     }
@@ -733,7 +735,7 @@ static enum kernel_mm_status composition_resolve(struct kernel_mm *mm,
     }
     int local_io=reading_task() && address>=read_address && address-read_address<read_size;
     if(local_io)check(kernel_cpu_current()->logical_id==read_hart);
-    enum kernel_mm_status status=composition_resolve_real(mm,address,access,pin);
+    enum kernel_mm_status status=composition_resolve_real(mm,address,access,pin,task);
     check(status==KERNEL_MM_STATUS_OK);
     uint64_t resolved=fault_race_file
         ? __atomic_fetch_add(&fault_file_resolved,1,__ATOMIC_ACQ_REL)+1
@@ -744,7 +746,10 @@ static enum kernel_mm_status composition_resolve(struct kernel_mm *mm,
     return status;
 }
 enum kernel_mm_status __wrap_kernel_mm_resolve_user_fault(struct kernel_mm *mm,uint64_t address,uint32_t access)
-{ return composition_resolve(mm,address,access,NULL); }
+{ return composition_resolve(mm,address,access,NULL,NULL); }
+enum kernel_mm_status __wrap_kernel_mm_resolve_owned_user_fault(struct kernel_mm *mm,
+    struct kernel_task *task,uint64_t address,uint32_t access)
+{ return composition_resolve(mm,address,access,NULL,task); }
 enum kernel_mm_status __wrap_kernel_mm_resolve_user_pin(struct kernel_mm *mm,uint64_t address,
     uint32_t access,struct kernel_mm_user_pin *pin)
-{ return composition_resolve(mm,address,access,pin); }
+{ return composition_resolve(mm,address,access,pin,NULL); }

@@ -116,8 +116,8 @@ static void parallel_worker_startup(struct lwext4_mount_adapter *adapter,unsigne
     assert(!pthread_create(&flushing,NULL,parallel_startup_flush,adapter));
     for(;;) {
         unsigned waiting;
-        {KERNEL_RAW_SCOPE(guard,&adapter->instance.namespace_lock.lock.metadata);
-         waiting=adapter->instance.namespace_lock.lock.pending_head!=NULL;}
+        {KERNEL_RAW_SCOPE(guard,&adapter->instance.reconfiguration.metadata);
+         waiting=adapter->instance.reconfiguration.pending_head!=NULL;}
         if(waiting)break;
         assert(!__atomic_load_n(&startup_flush_done,__ATOMIC_ACQUIRE));
         sched_yield();

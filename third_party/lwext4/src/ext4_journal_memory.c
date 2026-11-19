@@ -459,6 +459,16 @@ static void free_controls(void **objects,unsigned count)
     }
     if (destroy) destroy_memory(memory);
 }
+void jbd_data_put(struct jbd_data *data)
+{
+    unsigned old=__atomic_fetch_sub(&data->references,1,__ATOMIC_ACQ_REL);
+    if (!old) __builtin_trap();
+    if (old!=1) return;
+    if (data->source) jbd_source_put(data->source);
+    jbd_image_free(data->image);
+    jbd_free(data);
+}
+
 void jbd_data_free_list(struct jbd_data *data,unsigned count)
 {
     while (data) {
@@ -466,6 +476,9 @@ void jbd_data_free_list(struct jbd_data *data,unsigned count)
         for (unsigned i=0;data && i<16;i++) {
             struct jbd_data *next=TAILQ_NEXT(data,node);
             if (!count--) __builtin_trap();
+            unsigned old=__atomic_fetch_sub(&data->references,1,__ATOMIC_ACQ_REL);
+            if (!old) __builtin_trap();
+            if (old!=1) {data=next;continue;}
             if (data->source && source_drop(data->source)) controls[n++]=data->source;
             jbd_image_free(data->image);
             controls[n++]=data;data=next;
