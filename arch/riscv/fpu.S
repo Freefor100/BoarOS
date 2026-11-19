@@ -5,17 +5,31 @@
     .align 2
 
     /* Keep floating-point instructions local to the state routines. Older
-     * assemblers can encode them without a per-region architecture option. */
+     * assemblers reject floating-point registers in the typed .insn syntax. */
 #ifdef BOAROS_RISCV_AS_EXTENSIONS
     .option arch, +f, +d
-#else
-    .macro fsd reg, address
-    .insn s 0x27, 3, \reg, \address
-    .endm
-    .macro fld reg, address
-    .insn i 0x07, 3, \reg, \address
-    .endm
 #endif
+
+#define FPU_REGISTERS 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15, \
+                      16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+
+    .macro fpu_store reg, offset
+#ifdef BOAROS_RISCV_AS_EXTENSIONS
+    fsd f\reg, \offset(a0)
+#else
+    /* FSD: split the offset around the source register and x10 (a0). */
+    .4byte 0x3027 | ((((\offset) >> 5) & 0x7f) << 25) | (\reg << 20) | (10 << 15) | (((\offset) & 0x1f) << 7)
+#endif
+    .endm
+
+    .macro fpu_load reg, offset, base
+#ifdef BOAROS_RISCV_AS_EXTENSIONS
+    fld f\reg, \offset(x\base)
+#else
+    /* FLD: offset in bits 31:20, destination in bits 11:7. */
+    .4byte 0x3007 | (((\offset) & 0xfff) << 20) | (\base << 15) | (\reg << 7)
+#endif
+    .endm
 
 /* void riscv_fpu_state_save(struct riscv_fpu_state *state)
  *
@@ -24,38 +38,9 @@
     .globl riscv_fpu_state_save
     .type riscv_fpu_state_save, @function
 riscv_fpu_state_save:
-    fsd f0, 0(a0)
-    fsd f1, 8(a0)
-    fsd f2, 16(a0)
-    fsd f3, 24(a0)
-    fsd f4, 32(a0)
-    fsd f5, 40(a0)
-    fsd f6, 48(a0)
-    fsd f7, 56(a0)
-    fsd f8, 64(a0)
-    fsd f9, 72(a0)
-    fsd f10, 80(a0)
-    fsd f11, 88(a0)
-    fsd f12, 96(a0)
-    fsd f13, 104(a0)
-    fsd f14, 112(a0)
-    fsd f15, 120(a0)
-    fsd f16, 128(a0)
-    fsd f17, 136(a0)
-    fsd f18, 144(a0)
-    fsd f19, 152(a0)
-    fsd f20, 160(a0)
-    fsd f21, 168(a0)
-    fsd f22, 176(a0)
-    fsd f23, 184(a0)
-    fsd f24, 192(a0)
-    fsd f25, 200(a0)
-    fsd f26, 208(a0)
-    fsd f27, 216(a0)
-    fsd f28, 224(a0)
-    fsd f29, 232(a0)
-    fsd f30, 240(a0)
-    fsd f31, 248(a0)
+    .irp reg, FPU_REGISTERS
+    fpu_store \reg, 8*\reg
+    .endr
     csrr t0, fcsr
     sd t0, RISCV_FPU_STATE_FCSR_OFFSET(a0)
     li t0, 1
@@ -75,38 +60,9 @@ riscv_fpu_state_save:
     .globl riscv_fpu_state_restore
     .type riscv_fpu_state_restore, @function
 riscv_fpu_state_restore:
-    fld f0, 0(a0)
-    fld f1, 8(a0)
-    fld f2, 16(a0)
-    fld f3, 24(a0)
-    fld f4, 32(a0)
-    fld f5, 40(a0)
-    fld f6, 48(a0)
-    fld f7, 56(a0)
-    fld f8, 64(a0)
-    fld f9, 72(a0)
-    fld f10, 80(a0)
-    fld f11, 88(a0)
-    fld f12, 96(a0)
-    fld f13, 104(a0)
-    fld f14, 112(a0)
-    fld f15, 120(a0)
-    fld f16, 128(a0)
-    fld f17, 136(a0)
-    fld f18, 144(a0)
-    fld f19, 152(a0)
-    fld f20, 160(a0)
-    fld f21, 168(a0)
-    fld f22, 176(a0)
-    fld f23, 184(a0)
-    fld f24, 192(a0)
-    fld f25, 200(a0)
-    fld f26, 208(a0)
-    fld f27, 216(a0)
-    fld f28, 224(a0)
-    fld f29, 232(a0)
-    fld f30, 240(a0)
-    fld f31, 248(a0)
+    .irp reg, FPU_REGISTERS
+    fpu_load \reg, 8*\reg, 10
+    .endr
     ld t0, RISCV_FPU_STATE_FCSR_OFFSET(a0)
     csrw fcsr, t0
     li t0, RISCV_SSTATUS_FS_MASK
@@ -166,38 +122,9 @@ riscv_fpu_switch:
 riscv_fpu_reset_current:
     addi sp, sp, -16
     sd zero, 0(sp)
-    fld f0, 0(sp)
-    fld f1, 0(sp)
-    fld f2, 0(sp)
-    fld f3, 0(sp)
-    fld f4, 0(sp)
-    fld f5, 0(sp)
-    fld f6, 0(sp)
-    fld f7, 0(sp)
-    fld f8, 0(sp)
-    fld f9, 0(sp)
-    fld f10, 0(sp)
-    fld f11, 0(sp)
-    fld f12, 0(sp)
-    fld f13, 0(sp)
-    fld f14, 0(sp)
-    fld f15, 0(sp)
-    fld f16, 0(sp)
-    fld f17, 0(sp)
-    fld f18, 0(sp)
-    fld f19, 0(sp)
-    fld f20, 0(sp)
-    fld f21, 0(sp)
-    fld f22, 0(sp)
-    fld f23, 0(sp)
-    fld f24, 0(sp)
-    fld f25, 0(sp)
-    fld f26, 0(sp)
-    fld f27, 0(sp)
-    fld f28, 0(sp)
-    fld f29, 0(sp)
-    fld f30, 0(sp)
-    fld f31, 0(sp)
+    .irp reg, FPU_REGISTERS
+    fpu_load \reg, 0, 2
+    .endr
     csrw fcsr, zero
     addi sp, sp, 16
 
