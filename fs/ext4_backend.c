@@ -1439,6 +1439,11 @@ int kernel_vfs_start_journal_worker(struct kernel_vfs_mount *mount)
 {
     if (!mount || !mount->private_data) return -KERNEL_EINVAL;
     struct lwext4_mount_adapter *adapter=mount->private_data;
+    /* Group initialization can still roll back before both workers exist.
+     * Mount sync already uses this qualification to pin the active mode. */
+    KERNEL_LOCK_SCOPE(configuration);
+    kernel_rwlock_write(&adapter->instance.reconfiguration,&configuration);
+    if (adapter->instance.quiescing) return -KERNEL_EIO;
     if (adapter->instance.read_only) return 0;
     KERNEL_LOCK_SCOPE(namespace_guard);
     kernel_vfs_namespace_lock(mount,&namespace_guard);
