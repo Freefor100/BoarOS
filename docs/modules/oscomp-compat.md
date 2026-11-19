@@ -172,7 +172,7 @@ make test-oscomp-official
 
 本地诊断允许选择架构和组，例如
 `python3 -B tests/oscomp/run.py --arch loongarch --groups ltp --output build/oscomp-la-ltp-check`。
-正式容器入口通过固定评测框架执行提交快照。其配置对每个虚拟机分别采用单核、
+本地官方容器入口从 `HEAD` 打包已提交的代码，工作区修改留在原处。原框架配置对每个虚拟机采用单核、
 1 GiB 和 3,600 秒总时限。逐例监督在虚拟机内运行，组切换不会重置整机时限。
 
 报告同时保留原判分、分组状态、测例退出状态和虚拟机停止原因。原判分由同一次

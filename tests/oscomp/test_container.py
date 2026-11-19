@@ -1,4 +1,4 @@
-"""Container submission must be a clean committed snapshot and pin its image."""
+"""Check the container source snapshot and root disk setup."""
 import importlib.util
 import ast
 import zipfile
@@ -40,12 +40,13 @@ class ContainerTests(unittest.TestCase):
         self.assertFalse((dest / 'build').exists())
         self.assertEqual(len(identity['commit']), 40)
 
-    def test_dirty_source_is_rejected_before_creating_submission(self):
+    def test_snapshot_uses_the_commit_with_local_edits_present(self):
         module = self.module(); repo, dest = self.repository()
-        (repo / 'source').write_text('uncommitted input')
-        with self.assertRaisesRegex(RuntimeError, 'committed'):
-            module.snapshot_source(repo, dest)
-        self.assertFalse(dest.exists())
+        source = repo / 'source'
+        source.write_text('uncommitted input')
+        module.snapshot_source(repo, dest)
+        self.assertEqual((dest / 'source').read_text(), 'committed input\n')
+        self.assertEqual(source.read_text(), 'uncommitted input')
 
     def test_container_tag_cannot_replace_pinned_digest(self):
         module = self.module()

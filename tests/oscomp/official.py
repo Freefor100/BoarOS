@@ -32,16 +32,12 @@ def require_digest(reference):
 
 def snapshot_source(repository, destination):
     repository, destination = Path(repository), Path(destination)
-    if local.output(['git', 'status', '--porcelain'], repository):
-        raise RuntimeError('official submission requires a clean committed source tree')
-    identity = {'commit': local.output(['git', 'rev-parse', 'HEAD'], repository),
-                'tree': local.output(['git', 'rev-parse', 'HEAD^{tree}'], repository)}
+    identity = {'commit': local.output(['git', 'rev-parse', 'HEAD'], repository)}
     data = subprocess.check_output(['git', 'archive', '--format=tar', identity['commit']], cwd=repository)
     destination.mkdir()
     with tarfile.open(fileobj=io.BytesIO(data)) as archive:
         # Git-owned content only; extraction must not follow paths outside this snapshot.
         archive.extractall(destination, filter='data')
-    identity['archive_sha256'] = hashlib.sha256(data).hexdigest()
     return identity
 
 
@@ -356,7 +352,7 @@ def main():
         command += [reference, 'python3', '/cg/kernel.zip']
         report.update(container_command=command, build_environment=build_env)
         (directory / 'identity.json').write_text(json.dumps(report, indent=2) + '\n')
-        print('Running official Docker framework with local root disk overlays:', directory, flush=True)
+        print('Running committed source', report['source']['commit'], 'with local root disk overlays:', directory, flush=True)
         stage = 'official-harness'
         observer_log = (directory / 'observer.log').open('wb')
         observer = subprocess.Popen([sys.executable, '-B', str(HERE / 'official.py'), '--observe-only', str(directory)],
