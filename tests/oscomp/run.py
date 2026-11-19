@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import local_disks
+from prepare import DEFAULT_LTP_CASE_TIMEOUT
 REF = ROOT / 'references/oscomp-autotest'
 GROUPS = ['basic', 'busybox', 'cyclictest', 'iozone', 'iperf', 'libcbench',
           'libctest', 'lmbench', 'lua', 'netperf', 'ltp']
@@ -288,7 +289,7 @@ def main():
     ap.add_argument('--host-vcpu-cpus', help='final-2026: one distinct host CPU per vCPU')
     ap.add_argument('--host-io-cpu', type=int, help='final-2026: host CPU for QEMU main/I/O')
     ap.add_argument('--keep-disks', action='store_true', help='final-2026: retain checked runtime images')
-    ap.add_argument('--case-timeout', type=int, default=300)
+    ap.add_argument('--case-timeout', type=int, default=DEFAULT_LTP_CASE_TIMEOUT)
     ap.add_argument('--diagnostic-exclude', action='append', default=[], metavar='CASE')
     ap.add_argument('--qemu-riscv', default=os.environ.get('QEMU_RISCV64', 'qemu-system-riscv64'))
     ap.add_argument('--qemu-loongarch', default=os.environ.get('QEMU_LOONGARCH64', 'build/qemu-la-rtc/qemu-system-loongarch64'))

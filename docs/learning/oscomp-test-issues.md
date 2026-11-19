@@ -222,7 +222,7 @@ iozone 的完整命令核对见[原脚本对照](oscomp-compat-baseline.md#2026-
 
 逐名来源和原因以 [ltp-skips.tsv](../../tests/oscomp/ltp-skips.tsv) 为准。
 netstress 的默认模式见[固定源码](https://github.com/linux-test-project/ltp/blob/20240524/testcases/network/netstress/netstress.c)。
-跳过表在执行前匹配名字；300 秒监督则结束已经启动的程序，两者作用时点不同。
+跳过表在启动前匹配测例名称。默认 120 秒的单例监督负责终止已经启动且超时的测例。
 
 ## 运行库和原盘依赖
 

@@ -82,6 +82,8 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(rv.read_bytes(), before)
         self.assertIn('BOAROS_EVAL_GROUPS=basic', json.loads(before)['envp'])
         self.assertIn('BOAROS_EVAL_GROUPS=busybox', json.loads(la.read_text())['envp'])
+        self.assertIn('BOAROS_LTP_CASE_TIMEOUT=120', json.loads(before)['envp'])
+        self.assertIn('BOAROS_LTP_CASE_TIMEOUT=120', json.loads(la.read_text())['envp'])
         self.assertIn('/lib/ld-linux-riscv64-lp64d.so.1', json.loads(before)['argv'][3])
 
     def test_wrong_architecture_helper_is_rejected_before_output(self):

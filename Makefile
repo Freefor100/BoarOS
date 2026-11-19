@@ -684,7 +684,7 @@ DEPS := \
 	test-mmap-riscv
 
 OSCOMP_GROUPS ?= basic busybox cyclictest iozone iperf libcbench libctest lmbench lua netperf ltp
-OSCOMP_CASE_TIMEOUT ?= 300
+OSCOMP_CASE_TIMEOUT ?= 120
 OSCOMP_DIAGNOSTIC_EXCLUDE ?=
 OSCOMP_LOCAL_CACHE ?= build/tools/oscomp-local
 OSCOMP_LOCAL_ARGS = --cache '$(OSCOMP_LOCAL_CACHE)'

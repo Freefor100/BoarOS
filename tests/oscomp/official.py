@@ -307,7 +307,7 @@ def main():
     directory.mkdir(parents=True)
     report = {'kind': 'official-container-supervised-compatibility', 'started_utc': datetime.now(timezone.utc).isoformat(),
         'baseline_established': False, 'program_matrix_passed': False,
-        'supervision': {'case_timeout_seconds': 300, 'term_grace_seconds': 2,
+        'supervision': {'case_timeout_seconds': local.DEFAULT_LTP_CASE_TIMEOUT, 'term_grace_seconds': 2,
                         'skip_table_sha256': local.sha(HERE / 'ltp-skips.tsv'), 'diagnostic_exclusions': []},
         'script_adaptations': local.script_adaptations(local.GROUPS),
         'architectures': {}}

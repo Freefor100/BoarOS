@@ -7,6 +7,7 @@ import struct
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+DEFAULT_LTP_CASE_TIMEOUT = 120
 
 def write_profile(profile, output):
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -23,7 +24,7 @@ def main():
     parser.add_argument('--runtime', type=Path)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--groups')
-    parser.add_argument('--case-timeout', type=int, default=300)
+    parser.add_argument('--case-timeout', type=int, default=DEFAULT_LTP_CASE_TIMEOUT)
     parser.add_argument('--diagnostic-exclude', default='', help='space-separated LTP basenames, empty by default')
     args = parser.parse_args()
     if args.profile == 'final-2026':

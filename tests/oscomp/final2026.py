@@ -11,6 +11,8 @@ import sys
 import tempfile
 import time
 
+from prepare import DEFAULT_LTP_CASE_TIMEOUT
+
 ROOT=Path(__file__).resolve().parents[2]
 HERE=Path(__file__).resolve().parent
 sys.path.insert(0,str(ROOT/'tests'))
@@ -164,7 +166,7 @@ def run_guest(args,arch,work,groups,budget,host_vcpus,suite):
 def main(args):
     groups=GROUPS if args.groups=='all' else (args.groups,)
     architectures=tuple(TAGS) if args.arch=='both' else (args.arch,)
-    if args.case_timeout!=300 or args.diagnostic_exclude:
+    if args.case_timeout != DEFAULT_LTP_CASE_TIMEOUT or args.diagnostic_exclude:
         raise ValueError('final-2026 retains its original internal timeouts and does not use LTP exclusions')
     if args.host_vcpu_cpus is not None and args.host_io_cpu is None:
         raise ValueError('--host-io-cpu is required with --host-vcpu-cpus')
