@@ -483,11 +483,17 @@ uint64_t kernel_vfs_file_size(const struct kernel_vfs_file *file);
  * backend/namespace locks are held. position advances only for packed records,
  * or to the backend EOF cookie; the caller commits it after copying the batch.
  * Return 0 at EOF, 1 when full, or a negative errno (possibly after a prefix). */
+enum kernel_vfs_dir_relatime {
+    KERNEL_VFS_DIR_RELATIME_UNCHECKED,
+    KERNEL_VFS_DIR_RELATIME_CURRENT,
+    KERNEL_VFS_DIR_RELATIME_EXPIRED,
+};
 struct kernel_vfs_dir_batch {
     unsigned char *data;
     size_t capacity, used;
     uint64_t position;
-    unsigned check_relatime, atime_current;
+    unsigned check_relatime;
+    enum kernel_vfs_dir_relatime relatime;
 };
 /* Pass open flags on the first batch of a user read to account for access time. */
 int kernel_vfs_read_directory(struct kernel_vfs_file *, struct kernel_vfs_dir_batch *,

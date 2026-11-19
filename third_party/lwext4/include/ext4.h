@@ -197,6 +197,8 @@ int ext4_mount_setup_inode_observer(const char *mount_point,
 #define EXT4_TIME_MTIME 2U
 #define EXT4_TIME_CTIME 4U
 #define EXT4_TIME_RELATIME 8U
+/* A prior read found expired relatime. The writer still rechecks. */
+#define EXT4_TIME_RELATIME_CHECKED 16U
 int ext4_mount_setup_clock(const char *mount_point, ext4_clock_read clock);
 /* Read the mount clock without inode lookup or a metadata transaction. */
 bool ext4_file_read_clock(const ext4_file *file, struct ext4_timestamp *now);

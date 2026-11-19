@@ -495,7 +495,9 @@ static int path_walk_select_mode(struct vfs_path_walk *walk,
      * under the directory guard after a concurrent rmdir. */
     int crossing=(!walk->start || walk->start->file.mount!=mount) &&
         (!walk->root || walk->root->file.mount!=mount);
-    if (namespace_is_parallel(instance) || crossing) {
+    int anchored=(walk->start && walk->start->dentry==path->dentry) ||
+        (walk->root && walk->root->dentry==path->dentry);
+    if ((namespace_is_parallel(instance) || crossing) && !anchored) {
         if (dentry_acquire(path->dentry)) return -KERNEL_EOVERFLOW;
         walk->directory_owner=path->dentry;
     }
@@ -1780,8 +1782,9 @@ static int enter_mounts(struct kernel_vfs_path **owner,unsigned resolve)
         struct kernel_vfs_path *next;
         kernel_task_lock_guard irq = {0};
         kernel_task_lock_acquire(&kernel_vfs_state_lock, &irq);
-        struct kernel_vfs_path *location=current->transient?
-            find_location(current->file.mount,current->dentry):current;
+        struct kernel_vfs_path *location=current;
+        if (current->transient)
+            location=current->dentry->mountpoints ? find_location(current->file.mount,current->dentry) : NULL;
         struct kernel_vfs_mount *child=location?location->mounted_here:NULL;
         if (!child) {
             kernel_task_lock_release(&irq);
@@ -2254,6 +2257,18 @@ static void path_bind_component(struct vfs_path_walk *walk, struct kernel_vfs_mo
     path_bind(walk->component, mount, entry, 1, borrow_mount);
 }
 
+/* VFS state protects the mountpoint count and view index together. A walk
+ * component can use local storage when no mount edge depends on its path.
+ * Preserve the canonical root so the resolver recognizes its boundary. */
+static struct kernel_vfs_path *find_walk_location(struct kernel_vfs_mount *mount,
+    struct kernel_vfs_dentry *entry, const struct vfs_path_walk *walk)
+{
+    if (walk && walk->component && !entry->mountpoints && entry!=mount->root_dentry &&
+        (!walk->root || entry!=walk->root->dentry || mount!=walk->root->file.mount))
+        return NULL;
+    return find_location(mount,entry);
+}
+
 static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
     const char *name,size_t name_length,struct kernel_vfs_path **owner,int search,
     struct vfs_path_walk *walk)
@@ -2304,7 +2319,7 @@ static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
                 if (mount->root_path &&
                     (__atomic_load_n(&mount->root_path->references,__ATOMIC_ACQUIRE) & VFS_PATH_CLOSING))
                     return -KERNEL_EBUSY;
-                struct kernel_vfs_path *location = find_location(mount, entry);
+                struct kernel_vfs_path *location = find_walk_location(mount, entry, walk);
                 if (location) {
                     result = kernel_vfs_path_acquire(location);
                     if (result) return result;
@@ -2806,7 +2821,7 @@ static int path_walk_wrap(struct kernel_vfs_mount *mount,struct kernel_vfs_dentr
         return path_wrap(mount,entry,owner);
     KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
     if (mount->root_path && (mount->root_path->references&VFS_PATH_CLOSING)) return -KERNEL_EBUSY;
-    struct kernel_vfs_path *existing=find_location(mount,entry);
+    struct kernel_vfs_path *existing=find_walk_location(mount,entry,walk);
     if (existing) {
         int result=kernel_vfs_path_acquire(existing);
         if (!result) *owner=existing;
@@ -5835,11 +5850,17 @@ int kernel_vfs_file_atime_enabled(const struct kernel_vfs_file *file)
     return !kernel_vfs_mount_is_readonly(file->mount) && !(policy&VFS_ATIME_NONE) &&
         !((policy&VFS_ATIME_NODIR) && (file->mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR);
 }
-void kernel_vfs_file_accessed(struct kernel_vfs_file *file,uint32_t open_flags)
+static void file_accessed(struct kernel_vfs_file *file,uint32_t open_flags,bool relatime_expired)
 {
     if ((open_flags&01000000U) || !kernel_vfs_file_atime_enabled(file)) return;
     struct kernel_vfs_instance *instance=file->mount->private_data;
-    instance->ops->accessed(file);
+    if (relatime_expired && instance->ops->accessed_after_relatime)
+        instance->ops->accessed_after_relatime(file);
+    else instance->ops->accessed(file);
+}
+void kernel_vfs_file_accessed(struct kernel_vfs_file *file,uint32_t open_flags)
+{
+    file_accessed(file,open_flags,false);
 }
 
 int kernel_vfs_file_modified(struct kernel_vfs_file *file,
@@ -5943,7 +5964,7 @@ int kernel_vfs_read_directory(struct kernel_vfs_file *file,
     int accessed = open_flags && !(*open_flags & 01000000U) && kernel_vfs_file_atime_enabled(file);
     batch->check_relatime = accessed &&
         !(__atomic_load_n(&file->mount->atime_policy,__ATOMIC_RELAXED) & VFS_ATIME_STRICT);
-    batch->atime_current = 0;
+    batch->relatime = KERNEL_VFS_DIR_RELATIME_UNCHECKED;
     int result;
     {
         KERNEL_LOCK_SCOPE(namespace_guard);
@@ -5953,9 +5974,9 @@ int kernel_vfs_read_directory(struct kernel_vfs_file *file,
         else if (instance->ops->read_directory) result = instance->ops->read_directory(file, batch);
         else result = vfs_read_directory_entries(file, batch, instance->ops);
     }
-    if (accessed && (!batch->atime_current ||
+    if (accessed && (batch->relatime!=KERNEL_VFS_DIR_RELATIME_CURRENT ||
         (__atomic_load_n(&file->mount->atime_policy,__ATOMIC_RELAXED) & VFS_ATIME_STRICT)))
-        kernel_vfs_file_accessed(file, *open_flags);
+        file_accessed(file,*open_flags,batch->relatime==KERNEL_VFS_DIR_RELATIME_EXPIRED);
     return result;
 }
 

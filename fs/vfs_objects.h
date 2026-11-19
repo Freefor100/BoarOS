@@ -255,6 +255,8 @@ struct kernel_vfs_backend {
     int (*link_tmpfile)(struct kernel_vfs_instance *, uint64_t inode, uint64_t parent, const char *name);
     /* The backend takes mutation qualification only when it publishes atime. */
     void (*accessed)(struct kernel_vfs_file *file);
+    /* A directory scan observed expired relatime. Recheck before publishing. */
+    void (*accessed_after_relatime)(struct kernel_vfs_file *file);
     int (*modified)(struct kernel_vfs_file *file,
         uint64_t offset, int append);
     int (*stat)(const struct kernel_vfs_file *file,

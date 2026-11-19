@@ -2311,7 +2311,7 @@ static int time_access_needed(const struct lwext4_node *node, struct ext4_timest
         now.seconds - node->times[0].seconds >= 86400;
 }
 
-static void ext4_backend_accessed(struct kernel_vfs_file *file)
+static void ext4_backend_accessed_mode(struct kernel_vfs_file *file,bool relatime_expired)
 {
     if (!file || file->state != VFS_FILE_STATE_LIVE || !file->private_data) return;
     struct kernel_vfs_node *base = file->private_data;
@@ -2320,9 +2320,14 @@ static void ext4_backend_accessed(struct kernel_vfs_file *file)
     if ((base->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) {
         KERNEL_LOCK_SCOPE(mutation);
         if (!file->write_lease) kernel_vfs_mutation_lock(file->mount, &mutation);
-        if (kernel_vfs_file_atime_enabled(file))
-            (void)ext4_file_touch(lwext4_node_file(base), EXT4_TIME_ATIME |
-                ((file->mount->atime_policy&VFS_ATIME_STRICT)?0:EXT4_TIME_RELATIME));
+        if (kernel_vfs_file_atime_enabled(file)) {
+            unsigned fields=EXT4_TIME_ATIME;
+            if (!(file->mount->atime_policy&VFS_ATIME_STRICT)) {
+                fields|=EXT4_TIME_RELATIME;
+                if (relatime_expired) fields|=EXT4_TIME_RELATIME_CHECKED;
+            }
+            (void)ext4_file_touch(lwext4_node_file(base),fields);
+        }
         return;
     }
     struct lwext4_node *node = (struct lwext4_node *)base;
@@ -2353,6 +2358,12 @@ static void ext4_backend_accessed(struct kernel_vfs_file *file)
     }
     time_notify(adapter, notify);
 }
+
+static void ext4_backend_accessed(struct kernel_vfs_file *file)
+{ ext4_backend_accessed_mode(file,false); }
+
+static void ext4_backend_accessed_after_relatime(struct kernel_vfs_file *file)
+{ ext4_backend_accessed_mode(file,true); }
 
 static int ext4_backend_exec_metadata(struct kernel_vfs_node *node,struct kernel_vfs_exec_metadata *out)
 {
@@ -2740,20 +2751,49 @@ static int ext4_backend_emit(void *context, uint64_t offset, uint64_t next,
     return kernel_vfs_dir_emit(batch, next, inode, dirent_type_from_ext4(type), name, length);
 }
 
+static int directory_cached_eof(struct lwext4_node *node, const ext4_file *directory,
+    struct kernel_vfs_dir_batch *batch, uint64_t position)
+{
+    if (!position) return 0;
+    struct lwext4_mount_adapter *adapter=lwext4_instance(node->node.instance);
+    if (ext4_current_operation(adapter->device.fs) || mount_error(adapter)) return 0;
+    struct ext4_timestamp atime, mtime, ctime;
+    {
+        TIMESTAMP_SCOPE(snapshot,adapter);
+        const struct kernel_vfs_stat *stat=&node->metadata;
+        if (node->metadata_seen!=node->metadata_epoch || position<stat->size || !stat->nlink)
+            return 0;
+        batch->position=stat->size;
+        if (!batch->check_relatime) return 1;
+        atime=(struct ext4_timestamp){stat->atime.seconds,stat->atime.nanoseconds};
+        mtime=(struct ext4_timestamp){stat->mtime.seconds,stat->mtime.nanoseconds};
+        ctime=(struct ext4_timestamp){stat->ctime.seconds,stat->ctime.nanoseconds};
+    }
+    struct ext4_timestamp now;
+    bool current=node->noatime || !ext4_file_read_clock(directory,&now) ||
+        (time_compare(mtime,atime)<0 && time_compare(ctime,atime)<0 && now.seconds-atime.seconds<86400);
+    batch->relatime=current ? KERNEL_VFS_DIR_RELATIME_CURRENT : KERNEL_VFS_DIR_RELATIME_EXPIRED;
+    return 1;
+}
+
 static int ext4_backend_read_directory(struct kernel_vfs_file *file,
     struct kernel_vfs_dir_batch *batch)
 {
     struct kernel_vfs_node *node = file->private_data;
-    KERNEL_LOCK_SCOPE(node_guard);
-    kernel_vfs_node_lock(node, &node_guard, 0);
-    if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) return -KERNEL_ENOTDIR;
-    ext4_file directory = *lwext4_node_file(node);
+    if ((file->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) return -KERNEL_ENOTDIR;
+    /* The VFS holds the directory namespace qualification, which excludes
+     * entry publication and invalidates the accepted inode snapshot on growth.
+     * The live file pins the backend handle's immutable inode identity. */
+    const ext4_file *handle=lwext4_node_file(node);
+    ext4_file directory = {.mp=handle->mp,.inode=handle->inode};
     uint64_t position = batch->position & ~UINT64_C(3);
+    if (directory_cached_eof((struct lwext4_node *)node,&directory,batch,position)) return 0;
     bool current = false;
     int result = ext4_dir_iterate(&directory, &position, ext4_backend_emit, batch,
                                   batch->check_relatime ? &current : NULL);
-    batch->atime_current = current;
+    if (current) batch->relatime=KERNEL_VFS_DIR_RELATIME_CURRENT;
     if (result != EOK) return lwext4_error(result);
+    if (batch->check_relatime && !current) batch->relatime=KERNEL_VFS_DIR_RELATIME_EXPIRED;
     if (position == UINT64_MAX) {
         batch->position = directory.fsize;
         return 0;
@@ -3136,6 +3176,7 @@ static void initialize_backend(void)
     ops->create = ext4_backend_create;
     ops->tmpfile = ext4_backend_tmpfile;
     ops->accessed = ext4_backend_accessed;
+    ops->accessed_after_relatime = ext4_backend_accessed_after_relatime;
     ops->modified = ext4_backend_modified;
     ops->stat = ext4_backend_stat;
     ops->mkdir = ext4_backend_mkdir;

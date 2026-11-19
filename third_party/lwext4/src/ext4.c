@@ -2269,11 +2269,13 @@ int ext4_file_touch(ext4_file *file, unsigned int fields)
     int result;
     if (!file || !file->mp || !file->mp->mounted) return EINVAL;
     mp = file->mp;
+    bool relatime_checked=(fields&EXT4_TIME_RELATIME_CHECKED)!=0;
+    fields&=~EXT4_TIME_RELATIME_CHECKED;
     if (mp->fs.read_only)
         return fields & (EXT4_TIME_MTIME | EXT4_TIME_CTIME) ? EROFS : EOK;
     struct ext4_timestamp now;
     if (!mp->clock || !mp->clock(&now)) return EOK;
-    if (fields == (EXT4_TIME_ATIME | EXT4_TIME_RELATIME)) {
+    if (!relatime_checked && fields == (EXT4_TIME_ATIME | EXT4_TIME_RELATIME)) {
         bool needed;
         result = ext4_file_relatime_needed(file, &needed);
         if (result != EOK || !needed) return result;
