@@ -232,21 +232,24 @@ int ext4_trans_write_data_sync(struct ext4_blockdev *bdev, uint64_t lba,
     return write_data(bdev,lba,offset,data,length,initialize,NULL,true);
 }
 
-int ext4_trans_try_revoke_block(struct ext4_blockdev *bdev __unused,
-			        uint64_t lba __unused)
+int ext4_trans_try_revoke_range(struct ext4_blockdev *bdev __unused,
+                              uint64_t first __unused, uint32_t count __unused)
 {
 	int r = EOK;
 #if CONFIG_JOURNALING_ENABLE
 	struct ext4_fs *fs = bdev->fs;
-	if (fs->jbd_journal && ext4_current_trans(fs)) {
+	if (fs->jbd_journal) {
 		struct jbd_trans *trans = ext4_current_trans(fs);
-		r = jbd_trans_try_revoke_block(trans, lba);
-	} else if (fs->jbd_journal) {
-		r = ext4_block_flush_lba(fs->bdev, lba);
+		if (trans) r = jbd_trans_try_revoke_range(trans, first, count);
+		else for (uint32_t i = 0; i < count && r == EOK; i++)
+			r = ext4_block_flush_lba(bdev, first + i);
 	}
 #endif
 	return trans_error(bdev, r);
 }
+
+int ext4_trans_try_revoke_block(struct ext4_blockdev *bdev, uint64_t lba)
+{ return ext4_trans_try_revoke_range(bdev, lba, 1); }
 
 /**
  * @}

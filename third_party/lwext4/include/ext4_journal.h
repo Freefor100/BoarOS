@@ -248,8 +248,8 @@ void jbd_data_put(struct jbd_data *);
 int jbd_journal_complete_data(struct jbd_journal *, ext4_fsblk_t, uint32_t);
 int jbd_trans_revoke_block(struct jbd_trans *trans,
 			   ext4_fsblk_t lba);
-int jbd_trans_try_revoke_block(struct jbd_trans *trans,
-			       ext4_fsblk_t lba);
+int jbd_trans_try_revoke_range(struct jbd_trans *trans,
+                             ext4_fsblk_t first, uint32_t count);
 void jbd_journal_free_trans(struct jbd_journal *journal,
 			    struct jbd_trans *trans,
 			    bool abort);

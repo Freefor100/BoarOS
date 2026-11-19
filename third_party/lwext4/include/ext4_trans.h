@@ -96,6 +96,8 @@ int ext4_trans_write_data(struct ext4_blockdev *bdev, uint64_t lba,
  * @return standard error code*/
 int ext4_trans_try_revoke_block(struct ext4_blockdev *bdev,
 			       uint64_t lba);
+int ext4_trans_try_revoke_range(struct ext4_blockdev *bdev,
+                              uint64_t first, uint32_t count);
 
 #ifdef __cplusplus
 }
