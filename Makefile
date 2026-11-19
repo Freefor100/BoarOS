@@ -669,7 +669,7 @@ DEPS := \
 	$(DEMAND_PAGE_OOM_TEST_OBJECT_RV:.o=.d) \
 	$(ROOT_BOOT_CLEANUP_TEST_OBJECT_RV:.o=.d)
 
-.PHONY: all clean debug-riscv references run-riscv \
+.PHONY: all clean debug-riscv run-riscv \
 	test-root-init-riscv test-demand-page-riscv test-exec-riscv \
 	test-root-boot-cleanup-riscv \
 	test-uaccess-oom-riscv \
@@ -677,7 +677,7 @@ DEPS := \
 	test-files-partial-write-riscv \
 	test-lwext4-host test-lwext4-recovery-host test-lwext4-rename-host \
 	test-block-riscv test-page-riscv test-vfs-riscv \
-	test-references test-riscv \
+	test-riscv \
 	test-sv39-fault-riscv test-sv39-riscv test-stack-guard-riscv \
 	test-mm-riscv \
 	test-uaccess-riscv test-vma-riscv test-brk-riscv \
@@ -763,12 +763,6 @@ $(BUILD_DIR)/arch/riscv/root_boot.o: CPPFLAGS += -I$(BUILD_DIR)/generated
 
 test-init-config-riscv:
 	python3 tests/riscv/init-config.py
-
-references:
-	./references/fetch.sh
-
-test-references:
-	./tests/tools/references.sh
 
 test-lwext4-host:
 	./tests/host/lwext4.sh

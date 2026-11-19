@@ -556,6 +556,6 @@ runner从Make接收实际构建目录，COST入口不能借用普通产物；hos
 重复运行或使用已销毁队列。原单CPU测试只作为退化配置，不能替代真实多CPU内存序。
 固定依据为本地references/linux/Documentation/locking/locktypes.rst，commit
 f4cdf7ca9a1fdcca413157df19753f388a5a224e；lwIP raw串行边界见references/lwip/doc/doxygen/main_page.h（pitfalls/multithreading），
-commit77dcd25a72509eb83f72b033d219b1d40cd8eb95。实现依赖只在[路线图](../goals.md#p6b-锁等待与中断规则)维护。
+commit77dcd25a72509eb83f72b033d219b1d40cd8eb95。实现依赖只在[开发路线](../goals.md#多核与关键路径)维护。
 
 受控匿名及tmpfs映射 MM 的创建/切换与最终释放见[两核模块](riscv-smp.md#私有匿名-mm-验证)。实际地址空间切换在 rank40 外执行 `kernel_mm_activate()`；热路径静态门禁允许这项登记/本地失效入口，但继续拒绝 MM 分配、引用修改、pin/fault、文件和 exec 生命周期操作进入 switch 路径。

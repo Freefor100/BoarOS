@@ -15,6 +15,7 @@ import time
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT/'tests/diff-abi'))
 import harness
+from sdcard import preliminary_image
 
 def digest(path):
     with Path(path).open('rb') as stream:return hashlib.file_digest(stream,'sha256').hexdigest()
@@ -93,8 +94,7 @@ def main():
     program=work/'init'
     subprocess.run([str(ROOT/'build/riscv/musl-root/bin/musl-gcc'),'-fno-link-libatomic','-static','-O2',
         '-Wall','-Wextra','-Werror',str(ROOT/'tests/workloads/network/consumers.c'),'-o',str(program)],check=True)
-    original=ROOT/'references/oscomp-autotest/sdcard-rv.img'
-    if digest(original)!='f419468678d342133546add2f8459ea09aeba987ba968e28753d6ee656996b8b':raise RuntimeError('fixed input image changed')
+    original=preliminary_image('riscv')
     fixture=harness.fixture(work,program);commands=['mkdir /proc','mkdir /tmp','mkdir /lib','cd /dev','mknod urandom c 1 9','set_inode_field urandom mode 020666','mknod random c 1 8','set_inode_field random mode 020666','cd /']
     identities={};libcs=('musl','glibc') if args.libc=='both' else (args.libc,)
     suites=('iperf','netperf') if args.suite=='both' else (args.suite,)

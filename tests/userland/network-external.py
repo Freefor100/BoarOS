@@ -26,7 +26,7 @@ sys.path.insert(0, str(ROOT / 'tests/diff-abi'))
 import harness
 sys.path.insert(0,str(ROOT/"tests"))
 from arch_profiles import PROFILES
-import network_inputs
+from sdcard import preliminary_image
 
 PATTERN = (bytes(range(251)) * ((16 * 1024 * 1024 + 250) // 251))[:16 * 1024 * 1024]
 HOST, GUEST = '10.77.0.1', '10.77.0.2'
@@ -336,8 +336,8 @@ def fixture(work, workload, libc, reference, observe, arch, busybox=None):
         inputs['busybox']=harness.digest(target)
         inputs['busybox_source']=str(source.resolve())
     if workload in ('external', 'ipv4_basic') and arch=='riscv':
-        original = network_inputs.prepare()
-        inputs['runtime_profile_sha256'] = harness.digest(ROOT / 'tests/workloads/network/inputs.json')
+        original = preliminary_image('riscv')
+        inputs['runtime_image'] = str(original)
         for name in ('busybox', 'lib/libc.so') if libc == 'musl' else (
                 'busybox', 'lib/libc.so.6', 'lib/libm.so.6', 'lib/ld-linux-riscv64-lp64d.so.1'):
             target = tree / name

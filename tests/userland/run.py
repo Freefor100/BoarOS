@@ -16,6 +16,7 @@ ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT/'tests/diff-abi'))
 import harness
 from arch_profiles import PROFILES
+from sdcard import preliminary_image
 
 def ipv4_basic_output(raw,cpus=1):
     records = [line for line in raw.replace('\r', '').splitlines() if line.startswith(('IPV4 CASE ', 'NETWORK PASS ipv4_basic'))]
@@ -129,17 +130,16 @@ def chroot_fixture(image, directory, arch):
     """Use the fixed release BusyBox and its real musl loader in this fixture."""
     cached=ROOT/'build/exec-root-20261031'/('busybox-'+arch)
     cached.mkdir(parents=True,exist_ok=True)
-    reference=ROOT/'references/oscomp-autotest'/('sdcard-rv.img' if arch=='riscv' else 'sdcard-la.img')
     busybox=cached/'busybox'
     if not busybox.exists():
-        subprocess.run(['debugfs','-R',f'dump /musl/busybox {busybox}',str(reference)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True)
+        subprocess.run(['debugfs','-R',f'dump /musl/busybox {busybox}',str(preliminary_image(arch))],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True)
     headers=subprocess.check_output(['readelf','-lW',str(busybox)],text=True)
     interpreter=re.findall(r'Requesting program interpreter: ([^\]]+)',headers)
     commands=[f'write "{busybox}" /busybox','set_inode_field /busybox mode 0100755']
     if interpreter:
         loader=cached/'libc.so'
         if not loader.exists():
-            subprocess.run(['debugfs','-R',f'dump /musl/lib/libc.so {loader}',str(reference)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True)
+            subprocess.run(['debugfs','-R',f'dump /musl/lib/libc.so {loader}',str(preliminary_image(arch))],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True)
         assert len(interpreter)==1 and interpreter[0].startswith('/lib/')
         commands+=['mkdir /lib',f'write "{loader}" {interpreter[0]}',f'set_inode_field {interpreter[0]} mode 0100755',f'write "{loader}" /lib/libc.so','set_inode_field /lib/libc.so mode 0100755']
     batch=directory/'chroot-payload.debugfs';batch.write_text('\n'.join(commands)+'\n')
