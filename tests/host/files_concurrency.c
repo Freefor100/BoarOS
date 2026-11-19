@@ -23,8 +23,10 @@
 
 enum kernel_time_status kernel_time_deadline_from_realtime(uint64_t ns,uint64_t *deadline)
 { *deadline=ns; return KERNEL_TIME_STATUS_OK; }
-int kernel_task_identity_get(int32_t number,struct kernel_pid **owner)
+int kernel_task_identity_get_user(int32_t number,struct kernel_pid **owner)
 { (void)number;*owner=NULL;return -3; }
+kernel_pid_t kernel_task_identity_user_number(const struct kernel_pid *id)
+{ (void)id;__builtin_trap(); }
 void kernel_task_identity_retain(struct kernel_pid *id)
 { (void)id;assert(!"anonymous files fixture has no process identity"); }
 void kernel_task_identity_put(struct kernel_pid *id)
@@ -313,8 +315,16 @@ static void concurrent_dup_case(struct kernel_heap *heap,unsigned actors)
     for (unsigned i=0;i<actors;i++) assert(!pthread_join(threads[i],0));
     kernel_files_get_statistics(&files,&stats);
     assert(stats.current_open_fds==2);
+    /* Internal failures publish no Linux result or descriptor reservation. */
+    struct kernel_files missing={0};
+    uint32_t fd;
+    int64_t result=INT64_MAX;
+    assert(kernel_files_find_two_free_fds(&files,&fd,NULL,&result)==KERNEL_FILES_STATUS_INVALID_ARGUMENT);
+    assert(result==INT64_MAX);
+    assert(kernel_files_memfd(&missing,"memfd:missing",0,&result)==KERNEL_FILES_STATUS_INVALID_ARGUMENT);
+    assert(result==INT64_MAX);
     /* 预留不可被dup3接管；取消后恢复最低可用编号。 */
-    uint32_t fd; int error; int64_t result;
+    int error;
     assert(!kernel_files_find_free_fd(&files,&fd,&error) && !error && fd==2);
     struct kernel_files_fd_reservation reservation={&files,fd};
     assert(!kernel_files_dup3(&files,1,fd,0,&result) && result==-16);
