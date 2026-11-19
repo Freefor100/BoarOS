@@ -61,6 +61,10 @@ struct kernel_vfs_file;
 struct kernel_vfs_mount;
 struct kernel_vfs_instance;
 struct kernel_vfs_node;
+/* Return 1 if the caller needs a larger array. It owns every returned pin,
+ * including the prefix on overflow or any error. */
+int kernel_page_cache_pin_dirty_nodes(struct kernel_page_cache *,
+    const struct kernel_vfs_instance *, struct kernel_vfs_node **, size_t, size_t *);
 #if BOAROS_COST_DIAGNOSTICS
 int kernel_vfs_file_is_cost(const struct kernel_vfs_file *file);
 #endif

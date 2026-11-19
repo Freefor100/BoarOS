@@ -3868,6 +3868,26 @@ int kernel_page_cache_writeback_range(struct kernel_page_cache *cache,
 int kernel_page_cache_writeback(struct kernel_page_cache *cache, struct kernel_vfs_node *node)
 { return kernel_page_cache_writeback_range(cache, node, 0, UINT64_MAX); }
 
+int kernel_page_cache_pin_dirty_nodes(struct kernel_page_cache *cache,
+    const struct kernel_vfs_instance *instance, struct kernel_vfs_node **nodes,
+    size_t capacity, size_t *count)
+{
+    if (!cache_live(cache)) return -KERNEL_EINVAL;
+    CACHE_SCOPE(guard, cache);
+    for (struct kernel_page_cache_dirty *dirty = cache->record->dirty_head;
+         dirty; dirty = dirty->queue_next) {
+        /* A queued inode owns at least one dirty entry and that entry pins
+         * the inode. An in-flight write stays dirty through backend acceptance. */
+        struct kernel_vfs_node *node = RB_MIN(kernel_page_cache_dirty_tree, &dirty->tree)->node;
+        if (node->instance != instance) continue;
+        if (*count == capacity) return 1;
+        int result = kernel_vfs_node_acquire(node);
+        if (result) return result;
+        nodes[(*count)++] = node;
+    }
+    return 0;
+}
+
 int kernel_page_cache_resize_prepare(struct kernel_page_cache *cache,struct kernel_vfs_node *node,
     uint64_t old_size,uint64_t target,struct kernel_page_cache_resize *token)
 {

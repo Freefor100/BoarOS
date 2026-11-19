@@ -5210,46 +5210,39 @@ struct sync_nodes {
     struct kernel_heap *heap;
     struct kernel_vfs_node **nodes;
     size_t count;
+    struct kernel_vfs_node *local[8];
 };
 
 static void release_sync_nodes(struct sync_nodes *snapshot)
 {
     for (size_t i = 0; i < snapshot->count; i++)
         if (kernel_vfs_node_release(&snapshot->nodes[i])) __builtin_trap();
-    if (snapshot->nodes) kernel_heap_release(snapshot->heap, snapshot->nodes);
+    if (snapshot->nodes && snapshot->nodes != snapshot->local)
+        kernel_heap_release(snapshot->heap, snapshot->nodes);
+    snapshot->count = 0;
+    snapshot->nodes = NULL;
 }
 
 static int snapshot_sync_nodes(struct kernel_vfs_instance *instance,
                                 struct sync_nodes *snapshot)
 {
+    if (!instance->page_cache) return 0;
     snapshot->heap = instance->heap;
+    snapshot->nodes = snapshot->local;
+    size_t capacity = sizeof(snapshot->local) / sizeof(snapshot->local[0]);
     for (;;) {
-        kernel_task_lock_guard irq = {0};
-        kernel_task_lock_acquire(&kernel_vfs_state_lock, &irq);
-        size_t capacity = instance->node_count;
-        kernel_task_lock_release(&irq);
-        if (!capacity) return 0;
-        if (capacity > SIZE_MAX / sizeof(*snapshot->nodes)) return -KERNEL_ENOMEM;
+        int result = kernel_page_cache_pin_dirty_nodes(instance->page_cache, instance,
+            snapshot->nodes, capacity, &snapshot->count);
+        if (result <= 0) return result;
+        release_sync_nodes(snapshot);
+        if (capacity > SIZE_MAX / 2 / sizeof(*snapshot->nodes)) return -KERNEL_ENOMEM;
+        capacity *= 2;
         enum kernel_heap_status allocation = kernel_heap_allocate(instance->heap,
                    capacity * sizeof(*snapshot->nodes), (void **)&snapshot->nodes);
         if (allocation != KERNEL_HEAP_STATUS_OK) {
             if (allocation != KERNEL_HEAP_STATUS_EMPTY) __builtin_trap();
             return -KERNEL_ENOMEM;
         }
-        kernel_task_lock_acquire(&kernel_vfs_state_lock, &irq);
-        if (instance->node_count > capacity) {
-            kernel_task_lock_release(&irq);
-            kernel_heap_release(instance->heap, snapshot->nodes);
-            snapshot->nodes = 0;
-            continue;
-        }
-        for (struct kernel_vfs_node *node = instance->nodes; node; node = node->next) {
-            int result = kernel_vfs_node_acquire(node);
-            if (result) { kernel_task_lock_release(&irq); return result; }
-            snapshot->nodes[snapshot->count++] = node;
-        }
-        kernel_task_lock_release(&irq);
-        return 0;
     }
 }
 
@@ -5267,11 +5260,9 @@ int kernel_vfs_sync_mount(struct kernel_vfs_mount *mount, uint64_t *observed_err
     if (instance->read_only) goto observe;
     result = snapshot_sync_nodes(instance, &snapshot);
     if (result) goto observe;
-    /* 等待任何inode或设备之前，完整节点集合已经各持有一份引用。 */
+    /* Snapshot the dirty inodes before waiting for any single file or device. */
     for (size_t i = 0; i < snapshot.count; i++) {
         struct kernel_vfs_node *node = snapshot.nodes[i];
-        if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG || !instance->page_cache)
-            continue;
         int error = kernel_page_cache_writeback(instance->page_cache, node);
         if (error && !result) result = error;
     }
