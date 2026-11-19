@@ -2119,7 +2119,7 @@ static int ext4_ext_split_extent_at(struct ext4_inode_ref *inode_ref,
 
 out:
 	return err;
-restore_extent_len:
+restore_extent_len:;
     /* Failed insertion can grow the tree and release the old leaf. Re-select
      * its current owner before restoring the extent, including unwritten state. */
     int restore_error = ext4_find_extent(inode_ref, ee_block, ppath, 0);

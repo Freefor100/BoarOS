@@ -2678,7 +2678,7 @@ static void __attribute__((noinline)) prepare_read_batch(void *argument)
         return;
     }
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
-scalar:
+scalar:;
 #endif
     /* The lease lives only in the existing prepared-read callback. A cold
      * fault may borrow a bounded result table here; callers still own one page. */
