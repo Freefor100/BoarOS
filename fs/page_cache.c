@@ -1865,24 +1865,36 @@ static enum kernel_page_cache_status allocate_entry(struct kernel_page_cache *ca
     return KERNEL_PAGE_CACHE_STATUS_OK;
 }
 
-static void publish_entry(struct kernel_page_cache *cache,struct kernel_page_cache_entry *entry,
+static void prepare_entry_publication(struct kernel_page_cache_entry *entry,
     enum kernel_page_cache_status status)
 {
-    struct kernel_page_cache_record *r=cache->record;
     kernel_wait_queue_init(&entry->ready);
     __atomic_store_n(&entry->load_status,status,__ATOMIC_RELAXED);
     if (status==KERNEL_PAGE_CACHE_STATUS_BUSY) entry_borrow(entry);
+}
+
+static void account_entry_publication(struct kernel_page_cache *cache,struct kernel_page_cache_entry *entry)
+{
+    struct kernel_page_cache_record *r=cache->record;
+    lru_insert_head(r,entry);r->statistics.insertions++;r->statistics.current_pages++;
+    if (r->statistics.current_pages>r->statistics.peak_pages) r->statistics.peak_pages=r->statistics.current_pages;
+}
+
+static void publish_entry(struct kernel_page_cache *cache,struct kernel_page_cache_entry *entry,
+    enum kernel_page_cache_status status)
+{
+    prepare_entry_publication(entry,status);
     {
         CACHE_INDEX_SCOPE(index,entry->node);
         if (RB_INSERT(kernel_page_cache_tree,&entry->node->cache_pages,entry)) __builtin_trap();
     }
-    lru_insert_head(r,entry);r->statistics.insertions++;r->statistics.current_pages++;
-    if (r->statistics.current_pages>r->statistics.peak_pages) r->statistics.peak_pages=r->statistics.current_pages;
+    account_entry_publication(cache,entry);
 }
 struct read_pages_progress {
     struct kernel_page_cache_entry **entries;
     uint32_t completed;
 };
+enum { READ_INDEX_BATCH = 8 };
 static inline enum kernel_page_cache_status read_page_result(const struct file_read_span *span,
     size_t valid)
 {
@@ -1919,37 +1931,47 @@ static size_t load_read_pages(struct kernel_page_cache *cache, struct kernel_vfs
     {
         CACHE_SCOPE(complete, cache);
         cache->record->statistics.misses += count;
-        for (size_t i = 0; i < count; i++) {
-            struct kernel_page_cache_entry *entry = entries[i];
-            size_t valid = entry_valid_bytes(entry);
-            enum kernel_page_cache_status status;
-            /* 同一调用栈已结束全部回调和DMA，不再取得提前发布者的可见性。 */
-            if (progress.completed & (UINT32_C(1) << i))
-                status = (enum kernel_page_cache_status)(
-                    __atomic_load_n(&entry->load_status, __ATOMIC_RELAXED) & ~CACHE_LOAD_EARLY);
-            else {
-                if (result && !identified) spans[i].error = result;
-                status = read_page_result(&spans[i], valid);
-            }
-            if (!status) {
-                /* Final READY clears the early release marker. Publish under
-                 * the index lock so a hot reader sees the completed bytes. */
-                CACHE_INDEX_SCOPE(index,node);
-                __atomic_store_n(&entry->load_status,status,__ATOMIC_RELAXED);
-            } else __atomic_store_n(&entry->load_status,status,__ATOMIC_RELAXED);
-            if (outputs) {
-                outputs[i]->status = status;
-                if (!status) {
-                    outputs[i]->entry = entry;
-                    outputs[i]->physical_address = entry->physical_address;
-                    outputs[i]->valid_bytes = valid;
+        for (size_t first = 0; first < count; first += READ_INDEX_BATCH) {
+            size_t end = count-first>READ_INDEX_BATCH ? first+READ_INDEX_BATCH : count;
+            enum kernel_page_cache_status statuses[READ_INDEX_BATCH];
+            for (size_t i = first; i < end; i++) {
+                struct kernel_page_cache_entry *entry = entries[i];
+                size_t valid = entry_valid_bytes(entry);
+                enum kernel_page_cache_status status;
+                /* This producer has finished all callbacks and drained DMA. */
+                if (progress.completed & (UINT32_C(1) << i))
+                    status = (enum kernel_page_cache_status)(
+                        __atomic_load_n(&entry->load_status, __ATOMIC_RELAXED) & ~CACHE_LOAD_EARLY);
+                else {
+                    if (result && !identified) spans[i].error = result;
+                    status = read_page_result(&spans[i], valid);
+                }
+                statuses[i-first] = status;
+                if (outputs) {
+                    outputs[i]->status = status;
+                    if (!status) {
+                        outputs[i]->entry = entry;
+                        outputs[i]->physical_address = entry->physical_address;
+                        outputs[i]->valid_bytes = valid;
+                    }
                 }
             }
-            failed += status != 0;
-            if (status || !outputs) entry_return(entry);
-            if (!(progress.completed & (UINT32_C(1) << i))) cache_wake(&entry->ready);
-            if (status && !entry_users(entry) && !entry_retired(entry)) {
-                remove_entry(cache, entry); clean = 1;
+            {
+                /* Final READY clears the early marker. The index lock
+                 * publishes the completed bytes to readers as a batch. */
+                CACHE_INDEX_SCOPE(index,node);
+                for (size_t i = first; i < end; i++)
+                    __atomic_store_n(&entries[i]->load_status,statuses[i-first],__ATOMIC_RELAXED);
+            }
+            for (size_t i = first; i < end; i++) {
+                struct kernel_page_cache_entry *entry = entries[i];
+                enum kernel_page_cache_status status = statuses[i-first];
+                failed += status != 0;
+                if (status || !outputs) entry_return(entry);
+                if (!(progress.completed & (UINT32_C(1) << i))) cache_wake(&entry->ready);
+                if (status && !entry_users(entry) && !entry_retired(entry)) {
+                    remove_entry(cache, entry); clean = 1;
+                }
             }
         }
     }
@@ -2367,10 +2389,11 @@ static void commit_read_batch(void *argument)
     size_t ready=0;
     {
         CACHE_SCOPE(publish,cache);
+        uint64_t size=kernel_vfs_node_size(node);
         for (size_t i=0;i<count;i++) {
             if (pages[i].status!=KERNEL_PAGE_CACHE_STATUS_NOT_FOUND || entries[i]) continue;
             struct kernel_page_cache_entry *candidate=loads[i];
-            if (((first+i)<<BOAROS_PAGE_SHIFT)>=kernel_vfs_node_size(node)) {
+            if (((first+i)<<BOAROS_PAGE_SHIFT)>=size) {
                 if (candidate) { candidate->cleanup_next=discard;discard=candidate; }
                 pages[i].status=KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE;
                 continue;
@@ -2385,13 +2408,23 @@ static void commit_read_batch(void *argument)
                 } else { entry_borrow(entry);entries[i]=entry; }
                 if (candidate) { candidate->cleanup_next=discard;discard=candidate; }
             } else if (candidate) {
-                publish_entry(cache,candidate,KERNEL_PAGE_CACHE_STATUS_BUSY);
+                prepare_entry_publication(candidate,KERNEL_PAGE_CACHE_STATUS_BUSY);
                 loads[ready]=candidate;spans[ready]=spans[i];outputs[ready]=&pages[i];ready++;
             } else {
                 if (!allocation) __builtin_trap();
                 pages[i].status=allocation;
             }
         }
+        /* The cache qualification spans candidate selection and insertion.
+         * Readers can see only initialized loading owners. Keep each raw
+         * section bounded even for the widest prefetch. */
+        for (size_t i=0;i<ready;) {
+            size_t end=ready-i>READ_INDEX_BATCH ? i+READ_INDEX_BATCH : ready;
+            CACHE_INDEX_SCOPE(index,node);
+            for (;i<end;i++)
+                if (RB_INSERT(kernel_page_cache_tree,&node->cache_pages,loads[i])) __builtin_trap();
+        }
+        for (size_t i=0;i<ready;i++) account_entry_publication(cache,loads[i]);
     }
     while (discard) {
         struct kernel_page_cache_entry *entry=discard;discard=entry->cleanup_next;entry->cleanup_next=NULL;

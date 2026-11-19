@@ -168,7 +168,11 @@ int ext4_inode_truncate_step(struct ext4_inode_ref *ref, bool *done)
         if (!found || last < keep) { *done = true; return EOK; }
         uint64_t first = last >= TRUNCATE_BATCH - 1 ? last - (TRUNCATE_BATCH - 1) : 0;
         if (first < keep) first = keep;
-        return ext4_extent_remove_space(ref, (ext4_lblk_t)first, last);
+        r = ext4_extent_remove_space(ref, (ext4_lblk_t)first, last);
+        /* The search proved that last was the highest mapped block. If
+         * this window started at keep, no tail can remain after success. */
+        if (r == EOK && first == keep) *done = true;
+        return r;
     }
 #endif
     for (unsigned i = 0; i < TRUNCATE_BATCH; ++i) {

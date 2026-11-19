@@ -114,6 +114,7 @@ struct kernel_vfs_dentry {
     uint32_t mountpoints;
     char *name;
     struct kernel_vfs_dentry *index_left, *index_right;
+    struct kernel_vfs_dentry *lookup_hint; /* Weak, protected by VFS state. */
     uint8_t index_height;
     char initial_name[];
 };

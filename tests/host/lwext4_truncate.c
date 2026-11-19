@@ -115,12 +115,8 @@ static bool step(struct ext4_fs *fs)
         uint64_t blocks = ext4_inode_get_blocks_count(&fs->sb, ref.inode);
         uint64_t keep = (target + fs->bdev->lg_bsize - 1) / fs->bdev->lg_bsize;
         CHECK(blocks <= (keep + (keep ? 4 : 0)) * (fs->bdev->lg_bsize / 512));
-        CHECK(ext4_orphan_remove(&ref) == EOK);
-        if (!ext4_inode_get_links_cnt(ref.inode)) {
-            ext4_inode_set_del_time(ref.inode, UINT32_MAX);
-            ref.dirty = true;
-            CHECK(ext4_fs_free_inode(&ref) == EOK);
-        }
+        CHECK((ext4_inode_get_links_cnt(ref.inode) ? ext4_orphan_remove(&ref) :
+               ext4_orphan_remove_and_free(&ref)) == EOK);
     }
     CHECK(ext4_fs_put_inode_ref(&ref) == EOK);
     CHECK(ext4_transaction_end("/") == EOK);

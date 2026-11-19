@@ -2076,6 +2076,13 @@ static void dentry_cache_trim(struct kernel_vfs_instance *instance,size_t keep)
 static struct kernel_vfs_dentry *find_path(struct kernel_vfs_instance *instance,
     struct kernel_vfs_dentry *parent, const char *name, size_t length)
 {
+    struct kernel_vfs_dentry *hint = parent ? parent->lookup_hint : NULL;
+    if (hint && !strncmp(name,hint->name,length) && !hint->name[length]) {
+        if (hint->cached && hint!=instance->dentry_cache_last) {
+            dentry_cache_remove(hint);dentry_cache_append(hint);
+        }
+        return hint;
+    }
     struct kernel_vfs_dentry *path = instance->path_index;
     while (path) {
         int order;
@@ -2088,6 +2095,7 @@ static struct kernel_vfs_dentry *find_path(struct kernel_vfs_instance *instance,
             if (!order && path->name[length]) order = -1;
         }
         if (!order) {
+            if (parent) parent->lookup_hint=path;
             if (path->cached && path!=instance->dentry_cache_last) {
                 dentry_cache_remove(path);dentry_cache_append(path);
             }
@@ -2098,11 +2106,17 @@ static struct kernel_vfs_dentry *find_path(struct kernel_vfs_instance *instance,
     return 0;
 }
 
+static void unindex_path(struct kernel_vfs_instance *instance, struct kernel_vfs_dentry *path)
+{
+    if (path->parent && path->parent->lookup_hint==path) path->parent->lookup_hint=NULL;
+    instance->path_index=path_index_remove(instance->path_index,path);
+}
+
 static struct kernel_vfs_dentry *detach_path(struct kernel_vfs_dentry *path)
 {
     struct kernel_vfs_instance *instance = path->file.mount->private_data;
     if (path->index_height)
-        instance->path_index = path_index_remove(instance->path_index, path);
+        unindex_path(instance,path);
     path->detached = 1;
     if (path->cached) {
         dentry_cache_remove(path);
@@ -2156,7 +2170,7 @@ static void unregister_path(struct kernel_vfs_dentry *path)
 {
     struct kernel_vfs_instance *instance = path->file.mount->private_data;
     if (path->index_height)
-        instance->path_index = path_index_remove(instance->path_index, path);
+        unindex_path(instance,path);
     if (path->cached || !path->previous || *path->previous != path) __builtin_trap();
     *path->previous = path->next;
     if (path->next) path->next->previous = path->previous;
@@ -4878,7 +4892,7 @@ LookupNames:
         if (detach_path(target->dentry)) __builtin_trap();
         if (renamed.replaced_last_link) node->unlinked = 1U;
     }
-    adapter->path_index = path_index_remove(adapter->path_index, source->dentry);
+    unindex_path(adapter,source->dentry);
     source->dentry->parent = new_parent->dentry;
     if (old_parent!=new_parent->dentry) path_topology_changed();
     if (dentry_acquire(new_parent->dentry)) __builtin_trap();

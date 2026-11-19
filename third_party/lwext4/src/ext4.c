@@ -2680,15 +2680,8 @@ static int ext4_reclaim_orphan(struct ext4_mountpoint *mp, uint32_t index,
 		r = ext4_inode_truncate_step(&ref, &done);
         if (r == EOK && done && dead && !release_inode)
             r = ext4_orphan_mark_truncate(&ref, false);
-		if (r == EOK && done && (!dead || release_inode)) {
-			r = ext4_orphan_remove(&ref);
-			if (r == EOK && dead) {
-				/* Once detached from the orphan chain, dtime resumes its
-				 * deleted-inode meaning and must be nonzero. */
-				ext4_inode_set_del_time(ref.inode, UINT32_MAX);
-				r = ext4_fs_free_inode(&ref);
-			}
-		}
+		if (r == EOK && done && (!dead || release_inode))
+			r = dead ? ext4_orphan_remove_and_free(&ref) : ext4_orphan_remove(&ref);
 		r = ext4_result(r, ext4_fs_put_inode_ref(&ref));
 FinishWindow:
 		r = ext4_trans_finish(mp, r);
@@ -5107,10 +5100,10 @@ static __attribute__((noinline)) int ext4_fpread_planned(const ext4_file *file,
                 unsigned part = parts++;
                 fragments[part] = (struct file_read_fragment){i, length, EOK};
                 if (!physical) memset(out, 0, length);
+                else if (!aligned)
+                    fragments[part].error = ext4_read_pending_data(fs->bdev, physical, skip, out, length);
                 else if (!ext4_copy_pending_data(fs->bdev, physical, skip, out, length)) {
-                    if (!aligned)
-                        fragments[part].error = ext4_read_pending_data(fs->bdev, physical, skip, out, length);
-                    else if (extend) {
+                    if (extend) {
                         parts--;
                         reads[pending - 1].size += io_length;
                         fragments[parts - 1].length += length;

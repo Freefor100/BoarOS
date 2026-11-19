@@ -34,10 +34,16 @@ for blocksize in 1024 4096; do
             if [ "$scenario" != sparse ] && [ "$scenario" != unlinked ]; then
                 # Each completed step is followed by an actual process restart.
                 done=0
+                windows=0
                 while [ "$done" = 0 ]; do
                     timeout 30 "$work/probe" "$work/pending.img" step "$target" "$kind" > "$work/step"
                     read -r done events < "$work/step"
+                    windows=$((windows + 1))
                 done
+                if [ "$mapping" = extent ]; then
+                    keep=$(((target + blocksize - 1) / blocksize))
+                    test "$windows" -eq "$(((80 - keep + 31) / 32))"
+                fi
             else
                 done=0
                 while [ "$done" = 0 ]; do
