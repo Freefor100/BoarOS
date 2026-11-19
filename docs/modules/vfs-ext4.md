@@ -549,6 +549,8 @@ inode 为零的物理记录被跳过，只有真实结束才产生 EOF。旧 lwe
 iterator 实现读取一项。ext4 的记录结束字节位置继续作为 cookie；seek 后从该位置重新建立
 iterator，状态不跨批次持有。tmpfs 同样每批只查一次 cookie tree，然后顺序前进。
 
+用户调用 `getdents64` 时，首次 ext4 批次用迭代器已经取得的目录索引节点核对相对访问时间（Relative Access Time，relatime）。如果访问时间仍有效，枚举后直接复制目录记录。需要更新时间时，释放目录读取保护后，由原访问时间更新路径重查并提交。
+
 文件资源层借用任务已保留的一页 I/O 工作区，每批最多一页；短请求或页面分配失败使用
 280 字节栈内小批次。namespace/inode/backend 锁仅覆盖打包，不跨 usercopy；OFD offset lock
 覆盖整次 syscall，因此 dup/fork 与并发 seek 不会消费同一位置。复制失败按已完整复制的

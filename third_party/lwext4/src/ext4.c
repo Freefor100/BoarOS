@@ -931,24 +931,27 @@ static void ext4_publish_times(struct ext4_mountpoint *mp,
                                ext4_time_load(ref, base[i], extra[i]));
 }
 
+static bool ext4_relatime_expired(struct ext4_inode_ref *ref, struct ext4_timestamp now)
+{
+    struct ext4_timestamp atime = ext4_time_load(ref,
+        offsetof(struct ext4_inode, access_time), offsetof(struct ext4_inode, atime_extra));
+    struct ext4_timestamp mtime = ext4_time_load(ref,
+        offsetof(struct ext4_inode, modification_time), offsetof(struct ext4_inode, mtime_extra));
+    struct ext4_timestamp ctime = ext4_time_load(ref,
+        offsetof(struct ext4_inode, change_inode_time), offsetof(struct ext4_inode, ctime_extra));
+    return ext4_time_compare(mtime, atime) >= 0 ||
+        ext4_time_compare(ctime, atime) >= 0 || now.seconds - atime.seconds >= 86400;
+}
+
 static void ext4_touch_inode(struct ext4_mountpoint *mp,
                              struct ext4_inode_ref *ref, unsigned int fields, void *owner)
 {
     struct ext4_timestamp now;
     if (mp->fs.read_only || !mp->clock || !mp->clock(&now)) return;
-    if (ext4_inode_has_flag(ref->inode, EXT4_INODE_FLAG_NOATIME)) fields &= ~EXT4_TIME_ATIME;
-    if (fields & EXT4_TIME_RELATIME) {
-        struct ext4_timestamp atime = ext4_time_load(ref,
-            offsetof(struct ext4_inode, access_time), offsetof(struct ext4_inode, atime_extra));
-        struct ext4_timestamp mtime = ext4_time_load(ref,
-            offsetof(struct ext4_inode, modification_time), offsetof(struct ext4_inode, mtime_extra));
-        struct ext4_timestamp ctime = ext4_time_load(ref,
-            offsetof(struct ext4_inode, change_inode_time), offsetof(struct ext4_inode, ctime_extra));
-        if (ext4_time_compare(mtime, atime) < 0 &&
-            ext4_time_compare(ctime, atime) < 0 &&
-            now.seconds - atime.seconds < 86400)
-            fields &= ~EXT4_TIME_ATIME;
-    }
+    if (ext4_inode_has_flag(ref->inode, EXT4_INODE_FLAG_NOATIME) ||
+        ((fields & (EXT4_TIME_ATIME | EXT4_TIME_RELATIME)) ==
+         (EXT4_TIME_ATIME | EXT4_TIME_RELATIME) && !ext4_relatime_expired(ref, now)))
+        fields &= ~EXT4_TIME_ATIME;
     if (fields & EXT4_TIME_ATIME)
         ext4_time_store(ref, offsetof(struct ext4_inode, access_time),
                         offsetof(struct ext4_inode, atime_extra), now);
@@ -2251,15 +2254,8 @@ int ext4_file_relatime_needed(ext4_file *file, bool *needed)
     struct ext4_inode_ref ref;
     int result = ext4_fs_get_inode_ref_read(&mp->fs, file->inode, &ref);
     if (result == EOK) {
-        struct ext4_timestamp atime = ext4_time_load(&ref,
-            offsetof(struct ext4_inode, access_time), offsetof(struct ext4_inode, atime_extra));
-        struct ext4_timestamp mtime = ext4_time_load(&ref,
-            offsetof(struct ext4_inode, modification_time), offsetof(struct ext4_inode, mtime_extra));
-        struct ext4_timestamp ctime = ext4_time_load(&ref,
-            offsetof(struct ext4_inode, change_inode_time), offsetof(struct ext4_inode, ctime_extra));
         *needed = !ext4_inode_has_flag(ref.inode, EXT4_INODE_FLAG_NOATIME) &&
-            !(ext4_time_compare(mtime, atime) < 0 &&
-              ext4_time_compare(ctime, atime) < 0 && now.seconds - atime.seconds < 86400);
+            ext4_relatime_expired(&ref, now);
         result = ext4_fs_put_inode_ref(&ref);
     }
     EXT4_MP_UNLOCK(mp);
@@ -7118,7 +7114,7 @@ const ext4_direntry *ext4_dir_entry_next(ext4_dir *dir)
 }
 
 int ext4_dir_iterate(ext4_file *file, uint64_t *position,
-    ext4_dir_emit_fn emit, void *context)
+    ext4_dir_emit_fn emit, void *context, bool *atime_current)
 {
     struct ext4_inode_ref dir_inode;
     struct ext4_dir_iter it = {0};
@@ -7145,6 +7141,11 @@ int ext4_dir_iterate(ext4_file *file, uint64_t *position,
     if (!ext4_inode_get_links_cnt(dir_inode.inode)) {
         result = ENOENT;
         goto Finish;
+    }
+    if (atime_current) {
+        struct ext4_timestamp now;
+        *atime_current = ext4_inode_has_flag(dir_inode.inode, EXT4_INODE_FLAG_NOATIME) ||
+            !ext4_file_read_clock(file, &now) || !ext4_relatime_expired(&dir_inode, now);
     }
     if (*position >= directory_size) {
         *position = UINT64_MAX;
@@ -7212,7 +7213,7 @@ int ext4_dir_entry_next_status(ext4_dir *dir, ext4_direntry *entry,
     memset(entry, 0, sizeof(*entry));
     *entry_offset = UINT64_MAX;
     struct ext4_dir_one one = {entry, entry_offset};
-    return ext4_dir_iterate(&dir->f, &dir->next_off, ext4_dir_emit_one, &one);
+    return ext4_dir_iterate(&dir->f, &dir->next_off, ext4_dir_emit_one, &one, NULL);
 }
 
 void ext4_dir_entry_rewind(ext4_dir *dir)

@@ -2749,7 +2749,10 @@ static int ext4_backend_read_directory(struct kernel_vfs_file *file,
     if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) return -KERNEL_ENOTDIR;
     ext4_file directory = *lwext4_node_file(node);
     uint64_t position = batch->position & ~UINT64_C(3);
-    int result = ext4_dir_iterate(&directory, &position, ext4_backend_emit, batch);
+    bool current = false;
+    int result = ext4_dir_iterate(&directory, &position, ext4_backend_emit, batch,
+                                  batch->check_relatime ? &current : NULL);
+    batch->atime_current = current;
     if (result != EOK) return lwext4_error(result);
     if (position == UINT64_MAX) {
         batch->position = directory.fsize;

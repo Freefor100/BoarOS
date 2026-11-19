@@ -1597,7 +1597,7 @@ static void directory_eof(struct kernel_heap *heap,struct kernel_vfs_mount *moun
     assert(!kernel_files_create(&local,heap) && !kernel_files_install_new_owned_at(&local,0,0,&directory));
     unsigned char entries[256];
     struct kernel_vfs_dir_batch batch={.data=entries,.capacity=sizeof(entries),.position=2};
-    assert(!kernel_vfs_read_directory(&borrowed->file,&batch) && batch.position==2 && !batch.used);
+    assert(!kernel_vfs_read_directory(&borrowed->file,&batch,NULL) && batch.position==2 && !batch.used);
     assert(!kernel_files_lseek(&local,0,2,0,&result) && result==2);
     for (unsigned i=0;i<3;i++) {
         assert(!kernel_files_getdents(&local,&mm,0,0x200000,4096,&result) && !result);

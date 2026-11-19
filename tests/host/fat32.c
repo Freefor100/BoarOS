@@ -164,7 +164,7 @@ static void names(struct kernel_vfs_mount *mount, struct kernel_vfs_path *root)
     int status;
     do {
         batch.used=0;
-        status=kernel_vfs_read_directory(&a,&batch); assert(status>=0);
+        status=kernel_vfs_read_directory(&a,&batch,NULL); assert(status>=0);
         for (size_t at=0;at<batch.used;) {
             size_t length=(size_t)records[at+16]|((size_t)records[at+17]<<8);
             assert(length>=24 && length<=batch.used-at);at+=length;entries++;

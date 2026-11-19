@@ -487,8 +487,11 @@ struct kernel_vfs_dir_batch {
     unsigned char *data;
     size_t capacity, used;
     uint64_t position;
+    unsigned check_relatime, atime_current;
 };
-int kernel_vfs_read_directory(struct kernel_vfs_file *, struct kernel_vfs_dir_batch *);
+/* Pass open flags on the first batch of a user read to account for access time. */
+int kernel_vfs_read_directory(struct kernel_vfs_file *, struct kernel_vfs_dir_batch *,
+    const uint32_t *open_flags);
 /* Backend sink: 0 rejects a record, 1 accepts, 2 accepts and fills the batch. */
 int kernel_vfs_dir_emit(struct kernel_vfs_dir_batch *, uint64_t next_position,
     uint64_t inode, uint8_t type, const char *name, size_t name_length);

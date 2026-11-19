@@ -5935,17 +5935,28 @@ static __attribute__((noinline)) int vfs_read_directory_entries(struct kernel_vf
 }
 
 int kernel_vfs_read_directory(struct kernel_vfs_file *file,
-    struct kernel_vfs_dir_batch *batch)
+    struct kernel_vfs_dir_batch *batch, const uint32_t *open_flags)
 {
     if (!file || !file->mount || !file->mount->private_data) return -KERNEL_EINVAL;
-    KERNEL_LOCK_SCOPE(namespace_guard);
-    namespace_node_lock(file->private_data, &namespace_guard, 0);
     struct kernel_vfs_instance *instance = file->mount->private_data;
     struct kernel_vfs_node *node = kernel_vfs_file_node(file);
-    if (node && node->unlinked && (node->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR)
-        return -KERNEL_ENOENT;
-    if (instance->ops->read_directory) return instance->ops->read_directory(file, batch);
-    return vfs_read_directory_entries(file, batch, instance->ops);
+    int accessed = open_flags && !(*open_flags & 01000000U) && kernel_vfs_file_atime_enabled(file);
+    batch->check_relatime = accessed &&
+        !(__atomic_load_n(&file->mount->atime_policy,__ATOMIC_RELAXED) & VFS_ATIME_STRICT);
+    batch->atime_current = 0;
+    int result;
+    {
+        KERNEL_LOCK_SCOPE(namespace_guard);
+        namespace_node_lock(file->private_data, &namespace_guard, 0);
+        if (node && node->unlinked && (node->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR)
+            result = -KERNEL_ENOENT;
+        else if (instance->ops->read_directory) result = instance->ops->read_directory(file, batch);
+        else result = vfs_read_directory_entries(file, batch, instance->ops);
+    }
+    if (accessed && (!batch->atime_current ||
+        (__atomic_load_n(&file->mount->atime_policy,__ATOMIC_RELAXED) & VFS_ATIME_STRICT)))
+        kernel_vfs_file_accessed(file, *open_flags);
+    return result;
 }
 
 int kernel_vfs_node_pread(struct kernel_vfs_node *node,

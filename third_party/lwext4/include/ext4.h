@@ -887,7 +887,7 @@ const ext4_direntry *ext4_dir_entry_next(ext4_dir *dir);
 typedef int (*ext4_dir_emit_fn)(void *, uint64_t offset, uint64_t next,
     uint32_t inode, uint8_t type, const char *name, size_t name_length);
 int ext4_dir_iterate(ext4_file *file, uint64_t *position,
-    ext4_dir_emit_fn emit, void *context);
+    ext4_dir_emit_fn emit, void *context, bool *atime_current);
 
 int ext4_dir_entry_next_status(ext4_dir *dir,
                                ext4_direntry *entry,

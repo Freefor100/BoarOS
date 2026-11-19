@@ -2122,7 +2122,8 @@ enum kernel_files_status kernel_files_getdents(
     KERNEL_SERVICE_SCOPE_IF(service, kernel_vfs_namespace_requires_cpu0(description->file.mount));
     KERNEL_LOCK_SCOPE(offset_guard);
     kernel_mutex_lock(&description->offset_lock, &offset_guard);
-    kernel_vfs_file_accessed(&description->file,kernel_open_file_flags(description));
+    uint32_t open_flags = kernel_open_file_flags(description);
+    const uint32_t *access_flags = &open_flags;
     /* Reuse the task's retained I/O page, not a page on the single-page
      * kernel stack. Allocation failure falls back to the same bounded path. */
     size_t capacity = sizeof(small);
@@ -2139,7 +2140,8 @@ enum kernel_files_status kernel_files_getdents(
             .capacity = remaining < capacity ? (size_t)remaining : capacity,
             .position = kernel_open_file_offset(description),
         };
-        int fill_result = kernel_vfs_read_directory(&description->file, &batch);
+        int fill_result = kernel_vfs_read_directory(&description->file, &batch, access_flags);
+        access_flags = NULL;
         size_t copied = 0, complete = 0;
         uint64_t position = kernel_open_file_offset(description);
         enum kernel_uaccess_status access = KERNEL_UACCESS_STATUS_OK;
