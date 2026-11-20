@@ -253,15 +253,22 @@ static int ext4_dir_iterator_seek(struct ext4_dir_iter *it, uint64_t pos)
 				return r;
 		}
 
-		ext4_fsblk_t next_blk;
 		uint32_t next_blk_idx = (uint32_t)(pos >>
 			(10U + ext4_get32(sb, log_block_size)));
-		r = ext4_fs_get_inode_dblk_idx(it->inode_ref, next_blk_idx,
-					       &next_blk, false);
+		/* Pair adjacent directory blocks at a fixed boundary. The
+		 * successor must belong to this same validated mapping run. */
+		bool pair=it->read_next && !(next_blk_idx&1U) &&
+		    it->size-(pos&~((uint64_t)block_size-1))>block_size;
+		struct ext4_inode_block_range range;
+		r=ext4_fs_get_inode_dblk_range(it->inode_ref,next_blk_idx,
+			pair ? 2 : 1,false,&range);
 		if (r != EOK)
 			return r;
 
-		r = ext4_block_get(bdev, &it->curr_blk, next_blk);
+		ext4_fsblk_t next_blk=range.unwritten ? 0 : range.block;
+		r=pair && next_blk && range.count==2 ?
+		    ext4_block_get_read_next(bdev,&it->curr_blk,next_blk) :
+		    ext4_block_get(bdev,&it->curr_blk,next_blk);
 		if (r != EOK) {
 			it->curr_blk.lb_id = 0;
 			return r;
@@ -272,17 +279,26 @@ static int ext4_dir_iterator_seek(struct ext4_dir_iter *it, uint64_t pos)
 	return ext4_dir_iterator_set(it);
 }
 
-int ext4_dir_iterator_init(struct ext4_dir_iter *it,
-			   struct ext4_inode_ref *inode_ref, uint64_t pos)
+static int dir_iterator_init(struct ext4_dir_iter *it,
+			   struct ext4_inode_ref *inode_ref,uint64_t pos,bool read_next)
 {
 	it->inode_ref = inode_ref;
 	it->curr = 0;
 	it->curr_off = 0;
 	it->curr_blk.lb_id = 0;
 	it->block_size = ext4_sb_get_block_size(&inode_ref->fs->sb);
+	it->read_next=read_next;
 
 	return ext4_dir_iterator_seek(it, pos);
 }
+
+int ext4_dir_iterator_init(struct ext4_dir_iter *it,
+                           struct ext4_inode_ref *ref,uint64_t pos)
+{ return dir_iterator_init(it,ref,pos,false); }
+
+int ext4_dir_iterator_init_scan(struct ext4_dir_iter *it,
+                               struct ext4_inode_ref *ref,uint64_t pos)
+{ return dir_iterator_init(it,ref,pos,true); }
 
 int ext4_dir_iterator_next(struct ext4_dir_iter *it)
 {

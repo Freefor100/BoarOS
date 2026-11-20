@@ -13,6 +13,7 @@ static struct fault_block disk;
 static unsigned width, batches;
 static uint64_t fail_sector=UINT64_MAX;
 static uint64_t short_sector=UINT64_MAX;
+static bool fail_pair_as_one_request;
 static unsigned track_allocations, allocation_attempts;
 static pthread_mutex_t hold_lock=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t hold_changed=PTHREAD_COND_INITIALIZER;
@@ -48,12 +49,20 @@ void *__wrap_malloc(size_t size)
 }
 static int dev_open(struct ext4_blockdev *d){(void)d;return EOK;}
 static int dev_read(struct ext4_blockdev *d,void *p,uint64_t b,uint32_t n)
-{(void)d;return kernel_block_read_at(&disk.device,b*512,p,(size_t)n*512)==0?EOK:EIO;}
+{
+    (void)d;
+    if (b<=fail_sector && fail_sector-b<n) return EIO;
+    return kernel_block_read_at(&disk.device,b*512,p,(size_t)n*512)==0 ? EOK : EIO;
+}
 static int dev_write(struct ext4_blockdev *d,const void *p,uint64_t b,uint32_t n)
 {(void)d;(void)p;(void)b;(void)n;return EROFS;}
 static int dev_batch(struct ext4_blockdev *d,struct block_read_span *s,unsigned n, const struct block_read_completion *completion)
 {
     batches++;if(n>width)width=n;int first=EOK;
+    if (fail_pair_as_one_request && n==2 && s[1].offset/512==fail_sector) {
+        s[0].status=s[1].status=EIO;
+        return EIO;
+    }
     if(hold_current){
         CHECK(pthread_mutex_lock(&hold_lock)==0);
         held_spans=s;held_count=n;read_held=1;
@@ -84,6 +93,57 @@ static void *read_while_held(void *arg)
 }
 static unsigned char expected(size_t off){return off<8*4096 || off>=12*4096 ? 1+off/4096:0;}
 static void clear(struct ext4_blockdev *d){ext4_bcache_cleanup(d->bc);width=batches=0;}
+struct directory_observation { unsigned entries; bool listed[120]; };
+static int observe_directory(void *context,uint64_t offset,uint64_t next,
+    uint32_t inode,uint8_t type,const char *name,size_t length)
+{
+    struct directory_observation *observation=context;
+    CHECK(inode && next>offset);
+    observation->entries++;
+    if (length<=2 && name[0]=='.') return 1;
+    CHECK(length==200 && type==EXT4_DE_REG_FILE && name[0]=='n');
+    unsigned index=0;
+    for (unsigned i=1;i<4;i++) {
+        CHECK(name[i]>='0' && name[i]<='9');
+        index=index*10U+(unsigned)(name[i]-'0');
+    }
+    for (unsigned i=4;i<length;i++) CHECK(name[i]=='x');
+    CHECK(index<120 && !observation->listed[index]);
+    observation->listed[index]=true;
+    return 1;
+}
+static void directory_batches(struct ext4_blockdev *dev)
+{
+    ext4_dir directory={0};
+    CHECK(ext4_dir_open(&directory,"/listed")==EOK);
+    struct ext4_inode_ref ref;
+    struct ext4_inode_block_range range;
+    CHECK(ext4_fs_get_inode_ref_read(dev->fs,directory.f.inode,&ref)==EOK);
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,0,2,false,&range)==EOK);
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+    CHECK(range.block && range.count==2 && !range.unwritten);
+    clear(dev);
+    struct directory_observation observation={0};
+    uint64_t position=0;
+    CHECK(ext4_dir_iterate(&directory.f,&position,observe_directory,&observation,NULL)==EOK);
+    CHECK(observation.entries==122 && position==UINT64_MAX);
+    printf("directory read blocksize=%u width=%u batches=%u\n",dev->lg_bsize,width,batches);
+    CHECK(width==2 && batches>0);
+
+    clear(dev);
+    position=0;
+    observation=(struct directory_observation){0};
+    fail_sector=(range.block+1)*(dev->lg_bsize/512);
+    fail_pair_as_one_request=true;
+    CHECK(ext4_dir_iterate(&directory.f,&position,observe_directory,&observation,NULL)==EIO);
+    CHECK(observation.entries>2 && observation.entries<122 && position==dev->lg_bsize);
+    fail_sector=UINT64_MAX;
+    fail_pair_as_one_request=false;
+    CHECK(ext4_dir_iterate(&directory.f,&position,observe_directory,&observation,NULL)==EOK);
+    CHECK(observation.entries==122 && position==UINT64_MAX);
+    CHECK(ext4_dir_close(&directory)==EOK);
+    puts("directory read batches preserve the exact prefix and restart cookie on a failed successor");
+}
 struct prefix_observation { unsigned char (*bytes)[4096]; uint32_t seen; uint64_t offset; };
 static void observe_prefix(void *context, unsigned index, const struct file_read_span *span)
 {
@@ -281,6 +341,7 @@ int main(int argc,char **argv)
     spans[0]=(struct file_read_span){dev.lg_bsize,out[0],4096,0,0};
     CHECK(read_batch(&file,spans,1)==EOK && out[0][0]==0xa5);
     cached.buf->journal_pending=0;CHECK(ext4_block_set(&dev,&cached)==EOK);
+    directory_batches(&dev);
     CHECK(ext4_fclose(&file)==EOK && ext4_umount("/")==EOK && ext4_device_unregister("batch")==EOK);
     fault_block_close(&disk);
     puts("file batch holes/EOF/fragments/current cache/OOM/short/error/retry passed");return 0;
