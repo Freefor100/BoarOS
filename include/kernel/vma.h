@@ -27,6 +27,8 @@ void kernel_vma_set_clear_locks(struct kernel_vma_set *);
 #define KERNEL_VMA_ANON_SOURCE 256U /* lazy ELF zero-fill, not file-backed */
 #define KERNEL_VMA_ALL_FLAGS 511U
 /* The VMA writer is held. Revalidate the fault snapshot and mark private backing. */
+/* Caller excludes edits and serializes concurrent history marks. This changes
+ * fork provenance only and leaves the mapping generation unchanged. */
 int kernel_vma_set_mark_anonymous(struct kernel_vma_set *, uint64_t address,
     uint64_t generation, struct kernel_vma *snapshot);
 uint64_t kernel_vma_set_data_bytes(const struct kernel_vma_set *set);

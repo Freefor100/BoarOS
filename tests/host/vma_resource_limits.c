@@ -154,9 +154,11 @@ int main(void)
     simultaneous=snapshot;
     v.start=3*P;v.end=4*P;
     assert(!kernel_vma_set_insert(set,&v));
+    uint64_t mapped_generation=kernel_vma_set_generation(set);
     assert(kernel_vma_set_mark_anonymous(set,P,initial_generation,&snapshot));
     assert(snapshot.flags & KERNEL_VMA_ANON_HISTORY);
     uint64_t marked_generation=kernel_vma_set_generation(set);
+    assert(marked_generation==mapped_generation);
     assert(kernel_vma_set_mark_anonymous(set,P,initial_generation,&simultaneous));
     assert(simultaneous.flags & KERNEL_VMA_ANON_HISTORY);
     assert(kernel_vma_set_generation(set)==marked_generation);
