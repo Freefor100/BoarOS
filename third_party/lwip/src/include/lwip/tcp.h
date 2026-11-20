@@ -434,6 +434,10 @@ struct tcp_pcb {
   struct tcp_pcb *boaros_route_next;
   struct tcp_pcb *boaros_loopback_peer;
   unsigned char boaros_owner;
+#if BOAROS_USER_SMP
+  u8_t boaros_route_bucket;
+  struct tcp_pcb *boaros_input_next;
+#endif
 #endif
 };
 

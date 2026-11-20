@@ -10,6 +10,7 @@
 #include "uaccess_iov_internal.h"
 #include "vfs_objects.h"
 #include "vfs_notify.h"
+#include "../third_party/lwext4/include/misc/tree.h"
 #include <string.h>
 
 #define IN_NONBLOCK 04000U
@@ -29,19 +30,28 @@
 #define IN_MAX_GROUPS 128U
 #define IN_MAX_MARKS 65536U
 #define IN_BUCKETS 256U
+#define IN_WD_BUCKETS 256U
+#define IN_WD_MAX_CHAIN 16U
 
 struct notify_event { int32_t wd; uint32_t mask, cookie, len; };
 struct inotify_group;
+RB_HEAD(inotify_descriptors,inotify_mark);
 struct inotify_mark {
     struct inotify_group *group;
     struct kernel_heap *heap;
     struct kernel_vfs_instance *instance;
     struct inotify_mark *next, **previous, *group_next, **group_previous;
     struct inotify_mark *retired_next,*dispose_next;
-    unsigned references;
+    unsigned references, wd_overflow;
     uint64_t inode;
     int wd;
     uint32_t mask;
+    union {
+        struct {
+            struct inotify_mark *wd_next, **wd_previous;
+        };
+        RB_ENTRY(inotify_mark) wd_link;
+    };
 };
 struct inotify_group {
     struct kernel_heap *heap;
@@ -52,6 +62,11 @@ struct inotify_group {
     struct inotify_group *pending;
     struct inotify_mark *marks;
     unsigned references, head, used, last, next_wd, overflow, pending_wake;
+    /* The descriptor index and the inode and group lists are published together
+     * under notify_lock. Cap hash chains even when active descriptors are sparse. */
+    struct inotify_mark *descriptors[IN_WD_BUCKETS];
+    uint8_t descriptor_counts[IN_WD_BUCKETS];
+    struct inotify_descriptors overflow_descriptors;
     unsigned char ring[IN_RING_SIZE];
 };
 static struct kernel_raw_lock notify_lock = {
@@ -68,6 +83,44 @@ static struct inotify_mark **bucket(struct kernel_vfs_instance *instance,uint64_
     uintptr_t key=((uintptr_t)instance>>4) ^ inode ^ (inode>>32);
     key ^= key>>8;
     return &buckets[key & (IN_BUCKETS-1)];
+}
+
+static int descriptor_compare(const struct inotify_mark *a,const struct inotify_mark *b)
+{ return (a->wd>b->wd)-(a->wd<b->wd); }
+RB_GENERATE_INTERNAL(inotify_descriptors,inotify_mark,wd_link,descriptor_compare,static inline)
+
+static unsigned descriptor_slot(int wd)
+{
+    return (unsigned)wd&(IN_WD_BUCKETS-1);
+}
+
+static void descriptor_insert(struct inotify_mark *mark)
+{
+    struct inotify_group *group=mark->group;
+    unsigned slot=descriptor_slot(mark->wd);
+    mark->wd_overflow=group->descriptor_counts[slot]==IN_WD_MAX_CHAIN;
+    if (mark->wd_overflow) {
+        if (RB_INSERT(inotify_descriptors,&group->overflow_descriptors,mark)) __builtin_trap();
+        return;
+    }
+    struct inotify_mark **head=&group->descriptors[slot];
+    mark->wd_next=*head;
+    mark->wd_previous=head;
+    if (*head) (*head)->wd_previous=&mark->wd_next;
+    *head=mark;
+    group->descriptor_counts[slot]++;
+}
+
+static void descriptor_remove(struct inotify_mark *mark)
+{
+    struct inotify_group *group=mark->group;
+    if (mark->wd_overflow) {
+        RB_REMOVE(inotify_descriptors,&group->overflow_descriptors,mark);
+        return;
+    }
+    *mark->wd_previous=mark->wd_next;
+    if (mark->wd_next) mark->wd_next->wd_previous=mark->wd_previous;
+    group->descriptor_counts[descriptor_slot(mark->wd)]--;
 }
 
 static void ring_read(const struct inotify_group *group,unsigned pos,void *out,unsigned n)
@@ -191,6 +244,7 @@ static void remove_mark(struct inotify_mark *mark,struct inotify_mark **retired,
     if (mark->next) mark->next->previous=mark->previous;
     *mark->group_previous=mark->group_next;
     if (mark->group_next) mark->group_next->group_previous=mark->group_previous;
+    descriptor_remove(mark);
     if (!--mark->instance->notify_marks)
         __atomic_store_n(&mark->instance->notify_ops,NULL,__ATOMIC_RELEASE);
     mark->group->account->inotify_marks--;
@@ -459,6 +513,7 @@ static int watch_install(struct inotify_group *group,struct kernel_vfs_instance 
     candidate->group_next=group->marks;candidate->group_previous=&group->marks;
     if (group->marks) group->marks->group_previous=&candidate->group_next;
     group->marks=candidate;
+    descriptor_insert(candidate);
     if (!instance->notify_marks++)
         __atomic_store_n(&instance->notify_ops,&inotify_ops,__ATOMIC_RELEASE);
     group->account->inotify_marks++;
@@ -505,6 +560,28 @@ static int watch_add(struct inotify_group *group,const struct kernel_fs_context 
     return error;
 }
 
+static int watch_remove(struct inotify_group *group,int wd)
+{
+    struct inotify_mark *retired=NULL;
+    struct kernel_wait_cursor async={0};
+    int result=-KERNEL_EINVAL;
+    {
+        KERNEL_RAW_SCOPE(guard,&notify_lock);
+        struct inotify_mark *m=group->descriptors[descriptor_slot(wd)];
+        while (m && m->wd!=wd) m=m->wd_next;
+        if (!m && !RB_EMPTY(&group->overflow_descriptors)) {
+            struct inotify_mark key={.wd=wd};
+            m=RB_FIND(inotify_descriptors,&group->overflow_descriptors,&key);
+        }
+        if (m) {
+            remove_mark(m,&retired,1,&async);
+            result=0;
+        }
+    }
+    deliver_async(group,&async);dispose_marks(retired);drain_notifications();
+    return result;
+}
+
 enum kernel_files_status kernel_files_inotify(struct kernel_files *files,
     const struct kernel_fs_context *fs,struct kernel_mm *mm,unsigned syscall,
     int fd,uint64_t path_or_watch,uint32_t mask,int64_t *result)
@@ -521,18 +598,7 @@ enum kernel_files_status kernel_files_inotify(struct kernel_files *files,
         *result=(mask&IN_MASK_CREATE) && (mask&IN_MASK_ADD)?-KERNEL_EINVAL:
             watch_add(file->device_instance,fs,mm,path_or_watch,mask);
     } else {
-        struct inotify_group *group=file->device_instance;
-        struct inotify_mark *retired=NULL;
-        struct kernel_wait_cursor async={0};
-        *result=-KERNEL_EINVAL;
-        {
-            KERNEL_RAW_SCOPE(guard,&notify_lock);
-            for (struct inotify_mark *m=group->marks;m;m=m->group_next) {
-                if (m->wd!=(int32_t)path_or_watch) continue;
-                remove_mark(m,&retired,1,&async);*result=0;break;
-            }
-        }
-        deliver_async(group,&async);dispose_marks(retired);drain_notifications();
+        *result=watch_remove(file->device_instance,(int32_t)path_or_watch);
     }
     if (kernel_open_file_release(&file)) {
         if (!file) __builtin_trap();

@@ -42,6 +42,26 @@ static struct event *next(long fd,int wd,unsigned mask,const char *name)
     pos+=sizeof(*e)+e->len;
     return e;
 }
+static void remove_out_of_order(long fd)
+{
+    int wds[64];
+    for (unsigned i=0;i<64;i++) {
+        char path[]="/watched/w00";
+        path[10]='0'+i/10;
+        path[11]='0'+i%10;
+        CHECK(SC3(34,-100,path,0700)==0);
+        wds[i]=SC3(27,fd,path,CREATE);
+        CHECK(wds[i]>0);
+        CHECK(SC3(27,fd,path,ATTRIB|0x20000000)==wds[i]);
+    }
+    CHECK(SC2(28,fd,-1)==-22 && SC2(28,fd,0)==-22);
+    for (unsigned i=0;i<64;i++) {
+        int wd=wds[i*29%64];
+        CHECK(SC2(28,fd,wd)==0 && SC2(28,fd,wd)==-22);
+    }
+    for (unsigned i=0;i<64;i++) next(fd,wds[i*29%64],IGNORED,0);
+    CHECK(used==pos && SC3(63,fd,buf,sizeof(buf))==-11);
+}
 void abi_main(void *sp)
 {
     (void)sp;
@@ -90,8 +110,9 @@ void abi_main(void *sp)
     long duplicate=SC1(23,fd);
     CHECK(duplicate>=0 && SC1(57,ep)==0 && SC1(57,fd)==0);
     fd=duplicate;
-    CHECK(SC2(28,fd,wd)==0);
+    CHECK(SC2(28,fd,wd)==0 && SC2(28,fd,wd)==-22);
     next(fd,wd,IGNORED,0);CHECK(used==pos);
+    remove_out_of_order(fd);
     CHECK(SC3(34,-100,"/watched/mnt",0700)==0);
     CHECK(SC5(40,"tmpfs","/watched/mnt","tmpfs",0,0)==0);
     int mounted=SC3(27,fd,"/watched/mnt",CREATE|ONESHOT);
@@ -99,6 +120,7 @@ void abi_main(void *sp)
     file=SC4(56,-100,"/watched/mnt/a",0102,0600);
     CHECK(file>=0 && SC1(57,file)==0);
     next(fd,mounted,CREATE,"a");next(fd,mounted,IGNORED,0);CHECK(used==pos);
+    CHECK(SC2(28,fd,mounted)==-22);
     mounted=SC3(27,fd,"/watched/mnt",MODIFY|ATTRIB);
     CHECK(mounted>0);
     file=SC4(56,-100,"/watched/mnt/a",2,0);
@@ -122,6 +144,7 @@ void abi_main(void *sp)
     }
     CHECK(count==-11 && overflow==1 && SC2(39,"/watched/mnt",0)==0);
     next(fd,mounted,UNMOUNT,0);next(fd,mounted,IGNORED,0);CHECK(used==pos);
+    CHECK(SC2(28,fd,mounted)==-22);
     CHECK(SC1(57,fd)==0);
     static const char pass[]="INOTIFY PASS\n";
     SC3(64,1,pass,sizeof(pass)-1);

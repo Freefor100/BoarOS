@@ -475,10 +475,13 @@ struct socket_tcp_input {
     ip_addr_t src, dst;
     const void *network;
     uint16_t network_length;
+    uint8_t route_bucket;
 };
 struct socket_tcp_owner {
     struct kernel_mutex mutex;
     struct boaros_lwip_tcp_context context;
+    /* Locally qualified lookup uses the same bucket number as dispatch. */
+    struct tcp_pcb *input_buckets[TCP_ROUTE_BUCKETS];
     struct kernel_thread_join worker;
     struct kernel_wait_queue work;
     struct socket_work_queue ready;
@@ -1651,9 +1654,10 @@ static unsigned tcp_route_bucket(const struct tcp_pcb *pcb)
 { return tcp_flow_hash(&pcb->local_ip,pcb->local_port,&pcb->remote_ip,pcb->remote_port)%TCP_ROUTE_BUCKETS; }
 
 static unsigned tcp_route(const ip_addr_t *src,uint16_t sport,const ip_addr_t *dst,
-                          uint16_t dport,const struct netif *input)
+                          uint16_t dport,const struct netif *input,uint8_t *route_bucket)
 {
     unsigned bucket=tcp_flow_hash(src,sport,dst,dport)%TCP_ROUTE_BUCKETS;
+    *route_bucket=(uint8_t)bucket;
     KERNEL_RAW_SCOPE(guard,&tcp_route_lock);
     for (const struct tcp_pcb *p=tcp_routes[bucket];p;p=p->boaros_route_next)
         if (p->local_port==dport && p->remote_port==sport &&
@@ -1664,19 +1668,21 @@ static unsigned tcp_route(const ip_addr_t *src,uint16_t sport,const ip_addr_t *d
 }
 
 static unsigned tcp_packet_cpu(struct pbuf *p,const struct netif *input,
-                               const ip_addr_t *src,const ip_addr_t *dst)
+                               const ip_addr_t *src,const ip_addr_t *dst,uint8_t *route_bucket)
 {
     if (p->len<TCP_HLEN) return 0;
     const struct tcp_hdr *hdr=p->payload;
-    return tcp_route(src,lwip_ntohs(hdr->src),dst,lwip_ntohs(hdr->dest),input);
+    return tcp_route(src,lwip_ntohs(hdr->src),dst,lwip_ntohs(hdr->dest),input,route_bucket);
 }
 
 static int tcp_queue_input_locked(struct socket_tcp_owner *owner,struct pbuf *p,struct netif *input,
-                                  const ip_addr_t *src,const ip_addr_t *dst,struct kernel_wait_cursor *wake)
+                                  const ip_addr_t *src,const ip_addr_t *dst,uint8_t bucket,
+                                  struct kernel_wait_cursor *wake)
 {
     if (tcp_owner_stopping(owner) || owner->count+owner->output_reserved>=TCP_RX_RING) return 0;
     unsigned slot=(owner->head+owner->count)%TCP_RX_RING;
-    owner->ring[slot]=(struct socket_tcp_input){.packet=p,.interface=input,.src=*src,.dst=*dst};
+    owner->ring[slot]=(struct socket_tcp_input){.packet=p,.interface=input,.src=*src,.dst=*dst,
+                                               .route_bucket=bucket};
     if (!owner->count++ && tcp_owner_take_waiting(owner))
         (void)kernel_wait_cursor_prepare(&owner->work,wake);
     return 1;
@@ -1694,12 +1700,13 @@ static void tcp_mark_legacy_loopback(struct netif *netif)
 static int tcp_dispatch(struct pbuf *p,struct netif *input,const ip_addr_t *src,const ip_addr_t *dst)
 {
     if (!__atomic_load_n(&tcp_owner_count,__ATOMIC_ACQUIRE)) return 0;
-    unsigned cpu=tcp_packet_cpu(p,input,src,dst);
+    uint8_t bucket;
+    unsigned cpu=tcp_packet_cpu(p,input,src,dst,&bucket);
     if (!cpu) return 0;
     int queued;
     struct kernel_wait_cursor wake={0};
     struct socket_tcp_owner *owner=tcp_owner_at(cpu);
-    { KERNEL_RAW_SCOPE(ingress,&owner->ingress); queued=tcp_queue_input_locked(owner,p,input,src,dst,&wake);
+    { KERNEL_RAW_SCOPE(ingress,&owner->ingress); queued=tcp_queue_input_locked(owner,p,input,src,dst,bucket,&wake);
       if(queued) {
           struct socket_tcp_input *entry=&owner->ring[(owner->head+owner->count-1)%TCP_RX_RING];
           entry->network=((const unsigned char *)ip_next_header_ptr()-ip_current_header_tot_len());entry->network_length=ip_current_header_tot_len();
@@ -1753,7 +1760,7 @@ static int tcp_local_output(const struct tcp_pcb *pcb,struct pbuf *p,struct neti
             uint64_t current=__atomic_load_n(&fast_loopback_state,__ATOMIC_ACQUIRE);
             if (tcp_owner_stopping(owner) || network_is_stopping()) error=ERR_IF;
             else if ((current&~UINT64_C(2))!=(state&~UINT64_C(2))) error=ERR_RTE;
-            else if (!tcp_queue_input_locked(owner,input,netif,src,dst,&wake)) __builtin_trap();
+            else if (!tcp_queue_input_locked(owner,input,netif,src,dst,peer->boaros_route_bucket,&wake)) __builtin_trap();
             else input=0;
         }
     }
@@ -1766,8 +1773,18 @@ static int tcp_local_output(const struct tcp_pcb *pcb,struct pbuf *p,struct neti
 static void tcp_pcb_forget(struct tcp_pcb *pcb)
 {
     if (!pcb->boaros_owner) return;
+    struct socket_tcp_owner *owner=current_tcp_owner();
+    if (!owner || owner->index!=pcb->boaros_owner) __builtin_trap();
+    unsigned bucket=pcb->boaros_route_bucket;
+    struct tcp_pcb **input_link=&owner->input_buckets[bucket];
+    while (*input_link!=pcb) {
+        if (!*input_link) __builtin_trap();
+        input_link=&(*input_link)->boaros_input_next;
+    }
+    *input_link=pcb->boaros_input_next;
+    pcb->boaros_input_next=0;
     KERNEL_RAW_SCOPE(guard,&tcp_route_lock);
-    struct tcp_pcb **link=&tcp_routes[tcp_route_bucket(pcb)];
+    struct tcp_pcb **link=&tcp_routes[bucket];
     while (*link!=pcb) {
         if (!*link) __builtin_trap();
         link=&(*link)->boaros_route_next;
@@ -1848,9 +1865,14 @@ static int tcp_promote(struct kernel_socket *socket,struct kernel_socket_protoco
     kernel_mutex_lock(&owner->mutex,&guard);
     int moved=boaros_lwip_tcp_context_move_active(&boaros_lwip_tcp_default_context,&owner->context,pcb);
     if (moved) {
+        /* The receiver acquires the owner mutex before using this bucket.
+         * The queued packet carries its number, never a reference to a PCB. */
+        unsigned bucket=tcp_route_bucket(pcb);
+        pcb->boaros_route_bucket=(uint8_t)bucket;
+        pcb->boaros_input_next=owner->input_buckets[bucket];
+        owner->input_buckets[bucket]=pcb;
         /* A published route never owns a pointer past tcp_free(). */
         { KERNEL_RAW_SCOPE(route_guard,&tcp_route_lock);
-          unsigned bucket=tcp_route_bucket(pcb);
           pcb->boaros_owner=(uint8_t)cpu;
           tcp_link_loopback_peer(pcb,bucket);
           pcb->boaros_route_next=tcp_routes[bucket];
@@ -5560,6 +5582,13 @@ static int tcp_owner_take_input(struct socket_tcp_owner *owner,struct socket_tcp
     return 1;
 }
 
+static void tcp_owner_receive(struct socket_tcp_owner *owner,const struct socket_tcp_input *input)
+{
+    boaros_lwip_tcp_input_packet(input->packet,input->interface,&input->src,&input->dst,
+                                input->network,input->network_length,
+                                &owner->input_buckets[input->route_bucket]);
+}
+
 static uint64_t tcp_owner_deadline(void)
 {
     uint32_t now_ms=sys_now();
@@ -5587,8 +5616,7 @@ static void tcp_owner_worker(void *arg)
         stopping=tcp_owner_stopping(owner);
         struct socket_tcp_input input;
         for (unsigned i=0;i<16 && tcp_owner_take_input(owner,&input);i++) {
-            if (!stopping)
-                boaros_lwip_tcp_input_packet(input.packet,input.interface,&input.src,&input.dst,input.network,input.network_length);
+            if (!stopping) tcp_owner_receive(owner,&input);
             else pbuf_free(input.packet);
         }
         for (unsigned i=0;i<8 && service_ready_socket(4,&owner->ready,&scope);i++) {}

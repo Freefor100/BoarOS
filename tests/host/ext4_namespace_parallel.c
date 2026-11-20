@@ -13,6 +13,7 @@
 static unsigned stat_lookup_watch,stat_lookup_reads,stat_lookup_opens,stat_lookup_io_locks,stat_lookup_allocations;
 static uint32_t directory_inode_watch;
 static unsigned directory_inode_reads,directory_inode_reject;
+static unsigned directory_name_lookups,directory_name_error;
 static unsigned borrowed_path_watch,borrowed_path_state_locks;
 static _Thread_local unsigned inode_geometry_watch,inode_geometry_reads,inode_geometry_fail;
 static uint64_t inode_geometry_block;
@@ -61,6 +62,17 @@ int __wrap_ext4_fs_get_inode_ref_read(struct ext4_fs *fs,uint32_t inode,struct e
         if (directory_inode_reject) return EUCLEAN;
     }
     return __real_ext4_fs_get_inode_ref_read(fs,inode,ref);
+}
+int __real_ext4_file_lookup_child(const ext4_file *,const char *,uint32_t,
+    uint32_t *,uint32_t *,struct ext4_inode *,bool *);
+int __wrap_ext4_file_lookup_child(const ext4_file *parent,const char *name,uint32_t length,
+    uint32_t *inode,uint32_t *mode,struct ext4_inode *snapshot,bool *current)
+{
+    if (directory_inode_watch && parent->inode==directory_inode_watch) {
+        directory_name_lookups++;
+        if (directory_name_error) return EIO;
+    }
+    return __real_ext4_file_lookup_child(parent,name,length,inode,mode,snapshot,current);
 }
 int __real_ext4_fopen_inode(ext4_file *,const char *,uint32_t,struct ext4_inode *);
 int __wrap_ext4_fopen_inode(ext4_file *file,const char *mount,uint32_t inode,struct ext4_inode *initial)
@@ -282,11 +294,35 @@ static void lookup_directory_mapping_case(struct kernel_vfs_path *root)
     assert(!kernel_vfs_mkdir_at(root,root,"mapping-parent",0700,0));
     assert(!kernel_vfs_path_resolve(root,root,"mapping-parent",1,&dir));
     directory_inode_watch=kernel_vfs_path_inode(dir);
-    directory_inode_reads=0;
+    directory_inode_reads=directory_name_lookups=0;
     assert(kernel_vfs_stat_at(dir,root,"first-missing",1,&stat)==-KERNEL_ENOENT);
     assert(directory_inode_reads==1);
     assert(kernel_vfs_stat_at(dir,root,"second-missing",1,&stat)==-KERNEL_ENOENT);
     assert(directory_inode_reads==1 && "later cold names should reuse the verified parent inode");
+    for (unsigned i=0;i<32;i++) {
+        assert(kernel_vfs_stat_at(dir,root,"first-missing",1,&stat)==-KERNEL_ENOENT);
+        assert(kernel_vfs_stat_at(dir,root,"second-missing",1,&stat)==-KERNEL_ENOENT);
+    }
+    assert(directory_name_lookups==3 && "repeated misses should not search ext4 directory entries");
+    directory_name_error=1;
+    assert(kernel_vfs_stat_at(dir,root,"first-missin",1,&stat)==-KERNEL_EIO);
+    assert(kernel_vfs_stat_at(dir,root,"first-missin",1,&stat)==-KERNEL_EIO);
+    assert(directory_name_lookups==5);
+    directory_name_error=0;
+    assert(!kernel_vfs_mknod_at(dir,root,"first-missing",KERNEL_VFS_S_IFREG|0600,0,0));
+    assert(!kernel_vfs_stat_at(dir,root,"first-missing",1,&stat));
+    uint64_t created=stat.ino;
+    struct kernel_vfs_path *source=NULL;
+    assert(!kernel_vfs_path_lookup(dir,"first-missing",13,&source));
+    assert(kernel_vfs_stat_at(dir,root,"second-missing",1,&stat)==-KERNEL_ENOENT);
+    assert(!kernel_vfs_link_at(source,dir,root,"second-missing"));
+    assert(!kernel_vfs_stat_at(dir,root,"second-missing",1,&stat) && stat.ino==created);
+    assert(kernel_vfs_stat_at(dir,root,"rename-missing",1,&stat)==-KERNEL_ENOENT);
+    assert(!kernel_vfs_rename_at(dir,dir,root,"second-missing","rename-missing",0));
+    assert(!kernel_vfs_stat_at(dir,root,"rename-missing",1,&stat) && stat.ino==created);
+    assert(!kernel_vfs_path_release(&source));
+    assert(!kernel_vfs_unlink_at(dir,root,"first-missing",0));
+    assert(!kernel_vfs_unlink_at(dir,root,"rename-missing",0));
 
     /* Fresh names are absent from the positive VFS index after mknod. Grow
      * the directory enough to change its mapping before looking one up. */
@@ -313,7 +349,7 @@ static void lookup_directory_mapping_case(struct kernel_vfs_path *root)
         assert(!kernel_vfs_unlink_at(dir,root,name,0));
     }
     assert(!kernel_vfs_path_release(&dir) && !kernel_vfs_unlink_at(root,root,"mapping-parent",1));
-    puts("PASS cold lookup reuses verified directory mapping and revalidates after growth or checksum failure");
+    puts("PASS cold lookup reuses directory mapping and exact misses; creation, rename and errors remain visible");
 }
 static void inode_attribute_lifecycle(struct lwext4_mount_adapter *adapter,struct kernel_vfs_path *root)
 {

@@ -47,7 +47,7 @@ static inline void snapshot_vma(const struct kernel_vma *entry, struct kernel_vm
         .permissions = entry->permissions, .maximum_permissions = entry->maximum_permissions,
         .kind = entry->kind, .role = entry->role, .fault_policy = entry->fault_policy,
         .flags = vma_flags(entry), .backing = entry->backing,
-        .shm_attachment = entry->shm_attachment, .shared_write_bytes = entry->shared_write_bytes,
+        .backing_owner = entry->backing_owner, .shared_write_bytes = entry->shared_write_bytes,
     };
 }
 
@@ -142,8 +142,9 @@ static int vma_valid(const struct kernel_vma *vma)
     if ((vma->maximum_permissions & ~KERNEL_VMA_ALL_PERMISSIONS) ||
         (vma->permissions & KERNEL_VMA_ALL_PERMISSIONS & ~vma->maximum_permissions))
         return 0;
-    if (vma->kind != KERNEL_VMA_KIND_SYSV_SHM &&
-        vma->kind != KERNEL_VMA_KIND_HUGETLB_SHARED && vma->shm_attachment)
+    if (vma->backing_owner && vma->kind != KERNEL_VMA_KIND_FILE_PRIVATE &&
+        vma->kind != KERNEL_VMA_KIND_FILE_SHARED && vma->kind != KERNEL_VMA_KIND_ELF_PRIVATE &&
+        vma->kind != KERNEL_VMA_KIND_OBJECT_SHARED && !kernel_vma_shm_attachment(vma))
         return 0;
     if (vma->kind == KERNEL_VMA_KIND_ANONYMOUS &&
         (vma->backing_offset != 0U || vma->backing != 0 ||
@@ -171,7 +172,7 @@ static int vma_valid(const struct kernel_vma *vma)
     }
     if (vma->kind == KERNEL_VMA_KIND_SYSV_SHM &&
         (vma->backing == 0 ||
-         vma->shm_attachment == 0 ||
+         vma->backing_owner == 0 ||
          vma->fault_policy != KERNEL_VMA_FAULT_ANON_SHARED ||
          (vma->backing_offset & BOAROS_PAGE_MASK) != 0U ||
          vma->backing_offset > UINT64_MAX - (vma->end - vma->start))) {
@@ -204,14 +205,12 @@ static int can_merge(const struct kernel_vma *left,
         left->fault_policy != right->fault_policy ||
         vma_flags(left) != vma_flags(right) ||
         left->backing != right->backing ||
-        left->shm_attachment != right->shm_attachment ||
+        left->backing_owner != right->backing_owner ||
         left->shared_write_bytes != right->shared_write_bytes ||
         left->maximum_permissions != right->maximum_permissions) {
         return 0;
     }
-    if (left->shm_attachment || right->shm_attachment ||
-        left->kind == KERNEL_VMA_KIND_SYSV_SHM ||
-        right->kind == KERNEL_VMA_KIND_SYSV_SHM) {
+    if (left->backing_owner && kernel_vma_shm_attachment(left)) {
         return 0;
     }
     if (left->kind == KERNEL_VMA_KIND_ANONYMOUS) {
@@ -273,7 +272,7 @@ int kernel_vma_set_has_shm(const struct kernel_vma_set *set,
     uint64_t end = start + length;
     for (uint32_t index = first_overlap(set, start);
          index < set->count && set->entries[index].start < end; index++)
-        if (set->entries[index].shm_attachment) return 1;
+        if (kernel_vma_shm_attachment(&set->entries[index])) return 1;
     return 0;
 }
 
@@ -387,8 +386,8 @@ static void erase_entry(struct kernel_vma_set *set, uint32_t index)
 {
     uint32_t current;
 
-    if (set->entries[index].shm_attachment)
-        kernel_shm_attachment_close(set->entries[index].shm_attachment);
+    struct kernel_shm_attachment *attachment = kernel_vma_shm_attachment(&set->entries[index]);
+    if (attachment) kernel_shm_attachment_close(attachment);
     for (current = index; current + 1U < set->count; current++) {
         set->entries[current] = set->entries[current + 1U];
     }
@@ -455,7 +454,8 @@ static enum kernel_vma_status insert_entry(struct kernel_vma_set *set,
     }
     move_entries(set, index + 1U, index, set->count - index);
     set->entries[index] = merged;
-    if (merged.shm_attachment) kernel_shm_attachment_open(merged.shm_attachment);
+    struct kernel_shm_attachment *attachment = kernel_vma_shm_attachment(&merged);
+    if (attachment) kernel_shm_attachment_open(attachment);
     set->count++;
     return KERNEL_VMA_STATUS_OK;
 }
@@ -491,7 +491,8 @@ static enum kernel_vma_status split_at(struct kernel_vma_set *set,
                  index + 1U,
                  set->count - index - 1U);
     set->entries[index + 1U] = right;
-    if (right.shm_attachment) kernel_shm_attachment_open(right.shm_attachment);
+    struct kernel_shm_attachment *attachment = kernel_vma_shm_attachment(&right);
+    if (attachment) kernel_shm_attachment_open(attachment);
     set->count++;
     return KERNEL_VMA_STATUS_OK;
 }
@@ -506,8 +507,8 @@ static void merge_window(struct kernel_vma_set *set, uint32_t first, uint32_t en
         COST_ADD(VMA_MERGE,1);
         if (can_merge(&set->entries[output],&set->entries[index])) {
             set->entries[output].end=set->entries[index].end;
-            if (set->entries[index].shm_attachment)
-                kernel_shm_attachment_close(set->entries[index].shm_attachment);
+            struct kernel_shm_attachment *attachment = kernel_vma_shm_attachment(&set->entries[index]);
+            if (attachment) kernel_shm_attachment_close(attachment);
         } else {
             output++;
             if (output!=index) {
@@ -574,7 +575,8 @@ enum kernel_vma_status kernel_vma_set_fork(
             *entry = source->entries[index];
             entry->flags &= ~KERNEL_VMA_LOCK_MASK;
             if (entry->flags & KERNEL_VMA_WIPEONFORK) entry->flags &= ~KERNEL_VMA_ANON_HISTORY;
-            if (entry->shm_attachment) kernel_shm_attachment_open(entry->shm_attachment);
+            struct kernel_shm_attachment *attachment = kernel_vma_shm_attachment(entry);
+            if (attachment) kernel_shm_attachment_open(attachment);
             account_bytes(&working->usage, entry, entry->end - entry->start, 1);
             account_shared_write(entry,entry->end-entry->start,1);
         }
@@ -598,7 +600,8 @@ enum kernel_vma_status kernel_vma_set_destroy_for_task(struct kernel_vma_set **s
         for (uint32_t i = 0; i < working->count; i++) {
             const struct kernel_vma *entry=&working->entries[i];
             account_shared_write(entry,entry->end-entry->start,0);
-            if (entry->shm_attachment) kernel_shm_attachment_close_for_task(entry->shm_attachment,task);
+            struct kernel_shm_attachment *attachment = kernel_vma_shm_attachment(entry);
+            if (attachment) kernel_shm_attachment_close_for_task(attachment,task);
         }
         kernel_heap_release(working->heap, working->entries);
         working->entries = 0;
@@ -689,6 +692,14 @@ enum kernel_vma_status kernel_vma_set_rebind_backing(struct kernel_vma_set *set,
     set->generation++;
     return KERNEL_VMA_STATUS_OK;
 }
+
+void kernel_vma_set_rebind_source_owner(struct kernel_vma_set *set, uint32_t index,
+    void *new_owner)
+{
+    if (index >= set->count || !new_owner) __builtin_trap();
+    set->entries[index].backing_owner = new_owner;
+}
+
 static int huge_edit_aligned(const struct kernel_vma_set *set,uint64_t start,uint64_t end)
 {
     if (!((start|end)&(ARCH_MMU_HUGE_SIZE-1))) return 1;
@@ -1089,10 +1100,11 @@ static enum kernel_vma_status remove_range(struct kernel_vma_set *set,
 
     /* Retain the split/close hooks, which also publish SysV SHM times and
      * the last operator. Only the movement of VMA entries is coalesced. */
-    if (keep_left && set->entries[first].shm_attachment)
-        kernel_shm_attachment_open(set->entries[first].shm_attachment);
-    if (keep_right && right.shm_attachment)
-        kernel_shm_attachment_open(right.shm_attachment);
+    struct kernel_shm_attachment *attachment;
+    if (keep_left && (attachment = kernel_vma_shm_attachment(&set->entries[first])))
+        kernel_shm_attachment_open(attachment);
+    if (keep_right && (attachment = kernel_vma_shm_attachment(&right)))
+        kernel_shm_attachment_open(attachment);
 
     struct vma_usage usage = set->usage;
     for (uint32_t i = first; i < last; i++) {
@@ -1102,8 +1114,8 @@ static enum kernel_vma_status remove_range(struct kernel_vma_set *set,
         uint64_t b = entry->end < end ? entry->end : end;
         account_bytes(&usage, entry, b - a, 0);
         account_shared_write(entry, b - a, 0);
-        if (entry->shm_attachment)
-            kernel_shm_attachment_close(entry->shm_attachment);
+        attachment = kernel_vma_shm_attachment(entry);
+        if (attachment) kernel_shm_attachment_close(attachment);
     }
     if (keep_left) set->entries[first].end = start;
     /* Move the unaffected suffix once, even when both boundaries split. */
@@ -1175,8 +1187,8 @@ enum kernel_vma_status kernel_vma_set_commit_edit(
             uint64_t bytes=entry->end-entry->start;
             account_bytes(&usage,entry,bytes,0);
             account_shared_write(entry,bytes,0);
-            if (set->entries[index].shm_attachment)
-                kernel_shm_attachment_close(set->entries[index].shm_attachment);
+            struct kernel_shm_attachment *attachment = kernel_vma_shm_attachment(&set->entries[index]);
+            if (attachment) kernel_shm_attachment_close(attachment);
         }
         move_entries(set,
                      first,
@@ -1255,7 +1267,7 @@ int kernel_vma_set_mark_anonymous(struct kernel_vma_set *set, uint64_t address,
          entry->kind!=snapshot->kind || entry->role!=snapshot->role ||
          entry->fault_policy!=snapshot->fault_policy ||
          ((vma_flags(entry)^snapshot->flags)&~KERNEL_VMA_ANON_HISTORY) ||
-         entry->backing!=snapshot->backing || entry->shm_attachment!=snapshot->shm_attachment ||
+         entry->backing!=snapshot->backing || entry->backing_owner!=snapshot->backing_owner ||
          entry->shared_write_bytes!=snapshot->shared_write_bytes)) return 0;
     uint32_t flags = vma_flags(entry);
     if (!(flags & KERNEL_VMA_ANON_HISTORY)) {
