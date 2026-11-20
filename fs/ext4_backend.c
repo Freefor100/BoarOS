@@ -2021,6 +2021,11 @@ static int close_node_file(struct kernel_vfs_node *node)
     if (file->mp) ext4_file_release_reservations(file,0);
     int result=file->mp?ext4_fclose(file):EOK;
     /* Failed close remains owned by the existing cleanup node. */
+    struct lwext4_node *live=(struct lwext4_node *)node;
+    if (!result && live->directory_mapping) {
+        kernel_heap_release(node->instance->heap,live->directory_mapping);
+        live->directory_mapping=NULL;
+    }
 #if BOAROS_MAX_CPUS > 1
     struct lwext4_mount_adapter *adapter=lwext4_instance(node->instance);
     if(!result)boaros_lwext4_inode_put(&adapter->backend_lock,
@@ -2976,15 +2981,52 @@ static int ext4_backend_error(struct kernel_vfs_instance *instance)
 { return instance->quiescing ? -KERNEL_EIO : lwext4_error(mount_error(lwext4_instance(instance))); }
 static int ext4_backend_root(struct kernel_vfs_instance *instance, uint64_t *inode, uint32_t *mode)
 { *inode = EXT4_INODE_ROOT_INDEX; return lwext4_error(ext4_mode_get(lwext4_instance(instance)->mount_point, mode)); }
-static int ext4_backend_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
+static int ext4_backend_lookup(struct kernel_vfs_node *parent,
     const char *name, size_t length, uint64_t *inode, uint32_t *mode)
 {
-    int error = ext4_backend_error(instance);
+    struct lwext4_mount_adapter *adapter=lwext4_instance(parent->instance);
+    int error = ext4_backend_error(parent->instance);
     if (error) return error;
-    if (parent > UINT32_MAX) return -KERNEL_EINVAL;
+    ext4_file *directory=lwext4_node_file(parent);
+    struct lwext4_node *live=(struct lwext4_node *)parent;
     uint32_t result_inode;
-    error = lwext4_error(ext4_lookup_child(lwext4_instance(instance)->mount_point, (uint32_t)parent,
-                                             name, length, &result_inode, mode));
+    if (ext4_current_operation(adapter->device.fs)) {
+        error=lwext4_error(ext4_file_lookup_child(directory,name,length,&result_inode,mode,NULL,NULL));
+    } else {
+        struct ext4_inode snapshot;
+        uint64_t epoch;
+        bool ready;
+        struct lwext4_directory_mapping *mapping;
+        {
+            TIMESTAMP_SCOPE(guard,adapter);
+            epoch=live->metadata_epoch;
+            mapping=live->directory_mapping;
+            ready=mapping && mapping->epoch==epoch;
+            if (ready) snapshot=mapping->inode;
+        }
+        bool reused=ready;
+        error=lwext4_error(ext4_file_lookup_child(directory,name,length,&result_inode,mode,&snapshot,&ready));
+        /* The namespace reader covers directory mapping changes. The epoch
+         * also rejects snapshots superseded by another metadata publication. */
+        if (!reused && ready) {
+            struct lwext4_directory_mapping *candidate=NULL;
+            if (!mapping)
+                (void)kernel_heap_allocate_nosleep(adapter->instance.heap,sizeof(*candidate),
+                                                  (void **)&candidate);
+            {
+                TIMESTAMP_SCOPE(guard,adapter);
+                if (epoch==live->metadata_epoch) {
+                    if (!live->directory_mapping && candidate) {
+                        live->directory_mapping=candidate;
+                        candidate=NULL;
+                    }
+                    mapping=live->directory_mapping;
+                    if (mapping) *mapping=(struct lwext4_directory_mapping){epoch,snapshot};
+                }
+            }
+            if (candidate) kernel_heap_release(adapter->instance.heap,candidate);
+        }
+    }
     if (!error) *inode = result_inode;
     return error;
 }
@@ -3170,7 +3212,7 @@ static void initialize_backend(void)
     ops->owns_dentry_names = true;
     ops->error = ext4_backend_error;
     ops->root = ext4_backend_root;
-    ops->lookup = ext4_backend_lookup;
+    ops->lookup_node = ext4_backend_lookup;
     ops->readlink = ext4_backend_readlink;
     ops->check_domain = ext4_check_domain;
     ops->truncate = ext4_backend_truncate;

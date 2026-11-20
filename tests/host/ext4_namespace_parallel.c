@@ -11,6 +11,8 @@
 #include <stdlib.h>
 
 static unsigned stat_lookup_watch,stat_lookup_reads,stat_lookup_opens,stat_lookup_io_locks,stat_lookup_allocations;
+static uint32_t directory_inode_watch;
+static unsigned directory_inode_reads,directory_inode_reject;
 static unsigned borrowed_path_watch,borrowed_path_state_locks;
 static _Thread_local unsigned inode_geometry_watch,inode_geometry_reads,inode_geometry_fail;
 static uint64_t inode_geometry_block;
@@ -54,6 +56,10 @@ int __real_ext4_fs_get_inode_ref_read(struct ext4_fs *,uint32_t,struct ext4_inod
 int __wrap_ext4_fs_get_inode_ref_read(struct ext4_fs *fs,uint32_t inode,struct ext4_inode_ref *ref)
 {
     if (stat_lookup_watch) stat_lookup_reads++;
+    if (directory_inode_watch && inode==directory_inode_watch) {
+        directory_inode_reads++;
+        if (directory_inode_reject) return EUCLEAN;
+    }
     return __real_ext4_fs_get_inode_ref_read(fs,inode,ref);
 }
 int __real_ext4_fopen_inode(ext4_file *,const char *,uint32_t,struct ext4_inode *);
@@ -248,6 +254,47 @@ static void directory_eof_case(struct kernel_vfs_path *root)
     assert(!kernel_vfs_unlink_at(root,root,"enumerated",1));
     puts("PASS directory EOF reuses accepted size and observes subsequent growth");
 }
+
+static void lookup_directory_mapping_case(struct kernel_vfs_path *root)
+{
+    struct kernel_vfs_path *dir=NULL;
+    struct kernel_vfs_stat stat;
+    assert(!kernel_vfs_mkdir_at(root,root,"mapping-parent",0700,0));
+    assert(!kernel_vfs_path_resolve(root,root,"mapping-parent",1,&dir));
+    directory_inode_watch=kernel_vfs_path_inode(dir);
+    directory_inode_reads=0;
+    assert(kernel_vfs_stat_at(dir,root,"first-missing",1,&stat)==-KERNEL_ENOENT);
+    assert(directory_inode_reads==1);
+    assert(kernel_vfs_stat_at(dir,root,"second-missing",1,&stat)==-KERNEL_ENOENT);
+    assert(directory_inode_reads==1 && "later cold names should reuse the verified parent inode");
+
+    /* Fresh names are absent from the positive VFS index after mknod. Grow
+     * the directory enough to change its mapping before looking one up. */
+    directory_inode_watch=0;
+    char name[244];
+    memset(name,'m',sizeof(name)-1);
+    for (unsigned i=0;i<32;i++) {
+        snprintf(name+sizeof(name)-3,3,"%02u",i);
+        assert(!kernel_vfs_mknod_at(dir,root,name,KERNEL_VFS_S_IFREG|0600,0,0));
+    }
+    directory_inode_watch=kernel_vfs_path_inode(dir);
+    directory_inode_reads=0;
+    directory_inode_reject=1;
+    assert(kernel_vfs_stat_at(dir,root,name,1,&stat)==-KERNEL_EUCLEAN);
+    assert(directory_inode_reads==1);
+    directory_inode_reject=0;
+    assert(!kernel_vfs_stat_at(dir,root,name,1,&stat) && stat.mode==(KERNEL_VFS_S_IFREG|0600));
+    assert(directory_inode_reads==2);
+    assert(kernel_vfs_stat_at(dir,root,"third-missing",1,&stat)==-KERNEL_ENOENT);
+    assert(directory_inode_reads==2);
+    directory_inode_watch=0;
+    for (unsigned i=0;i<32;i++) {
+        snprintf(name+sizeof(name)-3,3,"%02u",i);
+        assert(!kernel_vfs_unlink_at(dir,root,name,0));
+    }
+    assert(!kernel_vfs_path_release(&dir) && !kernel_vfs_unlink_at(root,root,"mapping-parent",1));
+    puts("PASS cold lookup reuses verified directory mapping and revalidates after growth or checksum failure");
+}
 static void inode_attribute_lifecycle(struct lwext4_mount_adapter *adapter,struct kernel_vfs_path *root)
 {
     struct kernel_vfs_file file={0};struct kernel_vfs_path *path=NULL;
@@ -293,12 +340,16 @@ static void removed_directory_qualification(struct kernel_vfs_path *root)
     assert(!kernel_vfs_mkdir_at(root,root,"walk-removed",0700,0));
     assert(!kernel_vfs_path_resolve(root,root,"walk-removed",1,&directory));
     removed_directory_lock=&((struct kernel_vfs_node *)directory->file.private_data)->namespace_lock;
+    struct kernel_vfs_dentry *entry=directory->dentry;
+    assert(entry->cached && entry->references==2);
     assert(!kernel_vfs_path_release(&directory));
     assert(!kernel_vfs_create_at(root,root,"walk-stable",0600,&file,0));
     struct removed_walk test={root,kernel_vfs_file_inode(&file)};
     assert(!kernel_vfs_close(&file));removed_entered=removed_continue=0;
     pthread_t walking;assert(!pthread_create(&walking,NULL,walk_removed_directory,&test));
     while (!__atomic_load_n(&removed_entered,__ATOMIC_ACQUIRE))sched_yield();
+    assert(__atomic_load_n(&entry->references,__ATOMIC_ACQUIRE)==2 &&
+        "the resolver's local path already owns the directory at lock entry");
     assert(!kernel_vfs_unlink_at(root,root,"walk-removed",1));
     __atomic_store_n(&removed_continue,1,__ATOMIC_RELEASE);
     assert(!pthread_join(walking,NULL) && !kernel_vfs_unlink_at(root,root,"walk-stable",0));
@@ -711,6 +762,7 @@ int main(int argc,char **argv)
         rename_inode_case(adapter,root);goto Finish;}
     lookup_attributes_case(root);
     directory_eof_case(root);
+    lookup_directory_mapping_case(root);
     if (getenv("EXT4_NAMESPACE_STAT_ONLY")) goto Finish;
     worker_notification_case(adapter,root);
     rename_order_case(adapter,root);

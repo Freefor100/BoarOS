@@ -64,9 +64,11 @@ static void observe_namespace(unsigned kind)
     if (kernel_cpu_current()->logical_id!=copy_cpu) riscv_smp_fail("namespace-left-caller",kind);
     namespace_calls[kind]++;
 }
-int __real_ext4_lookup_child(const char *,uint32_t,const char *,uint32_t,uint32_t *,uint32_t *);
-int __wrap_ext4_lookup_child(const char *mount,uint32_t parent,const char *name,uint32_t length,uint32_t *ino,uint32_t *mode)
-{ observe_namespace(0);return __real_ext4_lookup_child(mount,parent,name,length,ino,mode); }
+int __real_ext4_file_lookup_child(const ext4_file *,const char *,uint32_t,
+    uint32_t *,uint32_t *,struct ext4_inode *,bool *);
+int __wrap_ext4_file_lookup_child(const ext4_file *parent,const char *name,uint32_t length,
+    uint32_t *inode,uint32_t *mode,struct ext4_inode *snapshot,bool *current)
+{ observe_namespace(0);return __real_ext4_file_lookup_child(parent,name,length,inode,mode,snapshot,current); }
 int __real_ext4_create_child(const char *,uint32_t,const char *,uint32_t,uint32_t,const char *,ext4_file *,struct ext4_inode *,uint32_t uid,uint32_t gid);
 int __wrap_ext4_create_child(const char *mount,uint32_t parent,const char *name,uint32_t mode,uint32_t dev,const char *target,ext4_file *file,struct ext4_inode *initial,uint32_t uid,uint32_t gid)
 { observe_namespace(1);return __real_ext4_create_child(mount,parent,name,mode,dev,target,file,initial,uid,gid); }

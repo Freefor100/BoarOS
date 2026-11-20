@@ -4,6 +4,13 @@ root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$root"
 build_dir=${FILE_IO_HOST_BUILD:-build/host/file-io}
 mkdir -p "$build_dir"
+identity_sources=
+for source in kernel/pid.c kernel/sched/identity.c; do
+    case " ${FILE_IO_HOST_SOURCES:-} " in
+        *" $source "*) ;;
+        *) identity_sources="$identity_sources $source" ;;
+    esac
+done
 network_sources=
 if [ "${FILE_IO_HOST_TCP:-1}" = 1 ]; then
     network_sources=$(python3 -c 'import re; s=open("Makefile").read().split("LWIP_SOURCES :=",1)[1].split("\n\n",1)[0]; print(" ".join(re.findall(r"(?:third_party/lwip|net/lwip_port)/[\w/]+\.c",s)))')
@@ -41,6 +48,7 @@ for shift in ${FILE_IO_HOST_SHIFTS:-12 14}; do
         -idirafter third_party/lwip/src/include -idirafter include \
         ${FILE_IO_HOST_TEST_SOURCE:-tests/host/file_io_concurrency.c} tests/host/file_io_excluded.c tests/host/mm/context.c tests/host/mm/disk_context.c \
         kernel/cpu.c kernel/raw_lock.c kernel/credentials.c kernel/posix_acl.c kernel/sched/sync.c kernel/sched/accounting.c kernel/sched/park.c kernel/sched/futex.c kernel/sched/futex_pi.c "$build_dir/process-$shift.o" \
+        $identity_sources \
         kernel/physical_page.c mm/heap.c mm/hugetlb.c mm/memory_object.c mm/mm.c mm/vma.c mm/uaccess.c arch/riscv/sv39.c \
         fs/files/table.c fs/files/io.c fs/files/transfer.c fs/files/range.c fs/files/locks.c fs/files/flock.c fs/files/path.c fs/files/metadata.c fs/files/socket.c fs/files/epoll.c fs/fs_context.c kernel/namespace.c kernel/ipc_namespace.c fs/open_file.c fs/async_io.c fs/block_file.c fs/loop.c fs/disk_mount.c \
         fs/pipe.c fs/vfs.c fs/tmpfs.c fs/file_mapping.c fs/record_lock.c fs/flock.c \

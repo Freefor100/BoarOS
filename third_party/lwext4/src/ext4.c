@@ -5826,21 +5826,24 @@ int ext4_raw_inode_fill(const char *path, uint32_t *ret_ino,
 	return r;
 }
 
+static void copy_inode_snapshot(const struct ext4_inode_ref *ref,struct ext4_inode *inode)
+{
+    size_t size=ext4_get16(ext4_fs_super(ref->fs),inode_size);
+    if (size>sizeof(*inode)) size=sizeof(*inode);
+    memcpy(inode,ref->inode,size);
+    memset((uint8_t *)inode+size,0,sizeof(*inode)-size);
+}
+
 static int read_inode_snapshot(struct ext4_mountpoint *mp,uint32_t number,struct ext4_inode *inode)
 {
-    int r;size_t inode_size;struct ext4_inode_ref inode_ref;
+    int r;struct ext4_inode_ref inode_ref;
 	EXT4_MP_LOCK(mp);
 	r = ext4_fs_get_inode_ref_read(&mp->fs, number, &inode_ref);
 	if (r != EOK) {
 		EXT4_MP_UNLOCK(mp);
 		return r;
 	}
-	inode_size = ext4_get16(ext4_fs_super(&mp->fs), inode_size);
-	if (inode_size > sizeof(*inode))
-		inode_size = sizeof(*inode);
-	memcpy(inode, inode_ref.inode, inode_size);
-	/* Only the absent suffix needs zeros; the on-disk prefix is overwritten. */
-	memset((uint8_t *)inode + inode_size, 0, sizeof(*inode) - inode_size);
+	copy_inode_snapshot(&inode_ref,inode);
 	r = ext4_fs_put_inode_ref(&inode_ref);
 	EXT4_MP_UNLOCK(mp);
 	return r;
@@ -7123,39 +7126,40 @@ int ext4_fopen_inode(ext4_file *file, const char *mount_point,
         file->delalloc = NULL;
         file->fsize = ext4_inode_get_size(ext4_fs_super(&mp->fs), ref.inode);
         file->fmax = ext4_inode_max_size(&mp->fs, ref.inode);
-        if (initial) {
-            size_t bytes=ext4_get16(ext4_fs_super(&mp->fs),inode_size);
-            if (bytes>sizeof(*initial)) bytes=sizeof(*initial);
-            memcpy(initial,ref.inode,bytes);
-            memset((uint8_t *)initial+bytes,0,sizeof(*initial)-bytes);
-        }
+        if (initial) copy_inode_snapshot(&ref,initial);
         result = ext4_fs_put_inode_ref(&ref);
     }
     EXT4_MP_UNLOCK(mp);
     return result;
 }
 
-static int lookup_child(const char *mount_point, uint32_t parent_inode,
+static int lookup_child(struct ext4_mountpoint *mp, uint32_t parent_inode,
                       const char *name, uint32_t name_length,
-                      uint32_t *child_inode, uint32_t *child_mode)
+                      uint32_t *child_inode, uint32_t *child_mode,
+                      struct ext4_inode *snapshot,bool *current)
 {
-    struct ext4_mountpoint *mp = ext4_get_mount(mount_point);
     struct ext4_inode_ref parent, child;
     struct ext4_dir_search_result found;
     int result;
 
     if (!mp || !name || name_length == 0 || name_length > 255 ||
-        !child_inode)
+        !child_inode || (snapshot!=NULL)!=(current!=NULL))
         return EINVAL;
     EXT4_MP_LOCK(mp);
-    result = ext4_fs_get_inode_ref_read(&mp->fs, parent_inode, &parent);
-    if (result != EOK) goto Unlock;
+    bool verified = false;
+    bool cached=current && *current;
+    if (cached) parent=(struct ext4_inode_ref){.inode=snapshot,.fs=&mp->fs,.index=parent_inode};
+    else {
+        result=ext4_fs_get_inode_ref_read(&mp->fs,parent_inode,&parent);
+        if (result!=EOK) goto Unlock;
+    }
     if (ext4_inode_type(ext4_fs_super(&mp->fs), parent.inode) !=
         EXT4_INODE_MODE_DIRECTORY) {
         result = ENOTDIR;
         goto PutParent;
     }
     result = ext4_dir_find_entry(&found, &parent, name, name_length, false);
+    verified = result == EOK || result == ENOENT;
     if (result == EOK) {
         uint32_t index = ext4_dir_en_get_inode(found.dentry);
         if (!child_mode) *child_inode=index;
@@ -7170,11 +7174,15 @@ static int lookup_child(const char *mount_point, uint32_t parent_inode,
     }
     {
         int cleanup = ext4_dir_destroy_result(&parent, &found);
+        if (cleanup) verified = false;
         if (result == EOK) result = cleanup;
     }
 PutParent:
-    {
+    if (!cached) {
+        bool copy=snapshot && verified && (result==EOK || result==ENOENT);
+        if (copy) copy_inode_snapshot(&parent,snapshot);
         int cleanup = ext4_fs_put_inode_ref(&parent);
+        if (copy && cleanup==EOK) *current=true;
         if (result == EOK) result = cleanup;
     }
 Unlock:
@@ -7185,7 +7193,14 @@ Unlock:
 int ext4_lookup_child(const char *mount_point, uint32_t parent_inode,
     const char *name,uint32_t name_length,uint32_t *child_inode,uint32_t *child_mode)
 {
-    return lookup_child(mount_point,parent_inode,name,name_length,child_inode,child_mode);
+    return lookup_child(ext4_get_mount(mount_point),parent_inode,name,name_length,child_inode,child_mode,NULL,NULL);
+}
+
+int ext4_file_lookup_child(const ext4_file *parent,const char *name,uint32_t name_length,
+    uint32_t *child_inode,uint32_t *child_mode,struct ext4_inode *snapshot,bool *current)
+{
+    if (!parent || !parent->mp || !parent->mp->mounted) return EINVAL;
+    return lookup_child(parent->mp,parent->inode,name,name_length,child_inode,child_mode,snapshot,current);
 }
 
 
@@ -7275,12 +7290,7 @@ int ext4_dir_iterate(ext4_file *file, uint64_t *position,
     result = ext4_dir_iterator_init(&it, &dir_inode, *position);
     while (result == EOK && it.curr) {
         uint64_t offset = it.curr_off;
-        uint16_t length = ext4_dir_en_get_entry_len(it.curr);
-        if (length < 8U || offset > directory_size || length > directory_size - offset) {
-            result = EIO;
-            break;
-        }
-        uint64_t next = offset + length;
+        uint64_t next = it.next_off;
         uint32_t inode = ext4_dir_en_get_inode(it.curr);
         if (inode) {
             uint16_t name_length = ext4_dir_en_get_name_len(&dir_inode.fs->sb, it.curr);

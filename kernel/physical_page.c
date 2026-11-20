@@ -769,9 +769,10 @@ static int head_valid(const struct physical_page_allocator *a, const struct budd
            m->reference_count;
 }
 
-/* An order-indexed free list already identifies the owner's size. Locate
- * that node directly and verify its ancestor chain, without rediscovering
- * the owner by descending from the root and tracking every split boundary. */
+/* The order list locates an exact buddy node. Under the allocator lock,
+ * coalescing marks both child nodes inactive before publishing their parent
+ * as free. Splitting does the reverse before publishing the new list heads.
+ * A free node and its matching head therefore suffice for list edits. */
 static int free_owner_at_order(const struct physical_page_allocator *a,
     uint32_t page, uint32_t order, struct buddy_owner *owner, struct page_work *work)
 {
@@ -781,10 +782,12 @@ static int free_owner_at_order(const struct physical_page_allocator *a,
     if (offset & (order_page_count(order) - 1)) return 0;
     uint64_t node = order_page_count(root->order - order) - 1 + (offset >> order);
     if (tree_get(a, root, node, work) != BUDDY_FREE) return 0;
+#if BOAROS_LOCK_DEBUG
     for (uint64_t ancestor = node; ancestor;) {
         ancestor = (ancestor - 1) >> 1;
         if (tree_read(a, root, ancestor, work) != BUDDY_SPLIT) return 0;
     }
+#endif
     *owner = (struct buddy_owner){root, node, page, order, BUDDY_FREE};
     return 1;
 }
@@ -852,8 +855,14 @@ static int free_insert(struct physical_page_allocator *a, uint32_t page, uint32_
     if (old != PHYSICAL_PAGE_INDEX_NONE)
     {
         struct buddy_owner owner;
+        /* Insertion rewrites the old head's previous field only. Its next
+         * edge is unchanged and will be checked when that edge is edited. */
         if (!free_owner_at_order(a, old, order, &owner, work) ||
+#if BOAROS_LOCK_DEBUG
             !free_head_valid(a, &owner, work) ||
+#else
+            !head_valid(a, &owner, work) ||
+#endif
             a->metadata[old].previous != PHYSICAL_PAGE_INDEX_NONE)
             return 0;
     }
