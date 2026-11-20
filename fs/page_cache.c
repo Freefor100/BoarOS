@@ -2392,15 +2392,31 @@ static void commit_read_batch(void *argument)
     {
         CACHE_SCOPE(publish,cache);
         uint64_t size=kernel_vfs_node_size(node);
+        struct kernel_page_cache_entry *next=NULL;
+        int have_cursor=0;
         for (size_t i=0;i<count;i++) {
             if (pages[i].status!=KERNEL_PAGE_CACHE_STATUS_NOT_FOUND || entries[i]) continue;
             struct kernel_page_cache_entry *candidate=loads[i];
-            if (((first+i)<<BOAROS_PAGE_SHIFT)>=size) {
+            uint64_t index=first+i;
+            if ((index<<BOAROS_PAGE_SHIFT)>=size) {
                 if (candidate) { candidate->cleanup_next=discard;discard=candidate; }
                 pages[i].status=KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE;
                 continue;
             }
-            struct kernel_page_cache_entry *entry=index_find(node,first+i);
+            /* No candidate is inserted until the recheck finishes. Follow
+             * the same protected index across this contiguous window. */
+            struct kernel_page_cache_entry *entry;
+            if (count==1) entry=index_find(node,index);
+            else {
+                if (!have_cursor) {
+                    next=index_at_or_after(node,index);
+                    have_cursor=1;
+                } else {
+                    while (next && next->page_index<index)
+                        next=RB_NEXT(kernel_page_cache_tree,&node->cache_pages,next);
+                }
+                entry=next && next->page_index==index?next:NULL;
+            }
             if (entry) {
                 if (request->required>=0 && i!=(size_t)request->required) {
                     pages[i].status=KERNEL_PAGE_CACHE_STATUS_BUSY;

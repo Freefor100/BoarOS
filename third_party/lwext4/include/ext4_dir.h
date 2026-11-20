@@ -57,7 +57,8 @@ extern "C" {
 struct ext4_dir_iter {
 	struct ext4_inode_ref *inode_ref;
 	struct ext4_block curr_blk;
-	uint64_t curr_off;
+	uint64_t curr_off, next_off, size;
+	uint32_t block_size;
 	struct ext4_dir_en *curr;
 };
 

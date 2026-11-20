@@ -7275,12 +7275,7 @@ int ext4_dir_iterate(ext4_file *file, uint64_t *position,
     result = ext4_dir_iterator_init(&it, &dir_inode, *position);
     while (result == EOK && it.curr) {
         uint64_t offset = it.curr_off;
-        uint16_t length = ext4_dir_en_get_entry_len(it.curr);
-        if (length < 8U || offset > directory_size || length > directory_size - offset) {
-            result = EIO;
-            break;
-        }
-        uint64_t next = offset + length;
+        uint64_t next = it.next_off;
         uint32_t inode = ext4_dir_en_get_inode(it.curr);
         if (inode) {
             uint16_t name_length = ext4_dir_en_get_name_len(&dir_inode.fs->sb, it.curr);

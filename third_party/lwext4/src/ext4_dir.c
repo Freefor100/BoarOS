@@ -168,13 +168,12 @@ void ext4_dir_set_csum(struct ext4_inode_ref *inode_ref,
 
 /**@brief Do some checks before returning iterator.
  * @param it Iterator to be checked
- * @param block_size Size of data block
  * @return Error code
  */
-static int ext4_dir_iterator_set(struct ext4_dir_iter *it,
-				 uint32_t block_size)
+static int ext4_dir_iterator_set(struct ext4_dir_iter *it)
 {
-	uint32_t off_in_block = it->curr_off % block_size;
+	uint32_t block_size = it->block_size;
+	uint32_t off_in_block = it->curr_off & (block_size - 1);
 	struct ext4_sblock *sb = &it->inode_ref->fs->sb;
 
 	it->curr = NULL;
@@ -192,7 +191,8 @@ static int ext4_dir_iterator_set(struct ext4_dir_iter *it,
 
 	/* Ensure that the whole entry does not overflow the block */
 	uint16_t length = ext4_dir_en_get_entry_len(en);
-	if (off_in_block + length > block_size)
+	if (length < 8 || length > block_size - off_in_block ||
+	    length > it->size - it->curr_off)
 		return EIO;
 
 	/* Ensure the name length is not too large */
@@ -201,6 +201,7 @@ static int ext4_dir_iterator_set(struct ext4_dir_iter *it,
 
 	/* Everything OK - "publish" the entry */
 	it->curr = en;
+	it->next_off = it->curr_off + length;
 	return EOK;
 }
 
@@ -215,14 +216,14 @@ static int ext4_dir_iterator_seek(struct ext4_dir_iter *it, uint64_t pos)
 	struct ext4_sblock *sb = &it->inode_ref->fs->sb;
 	struct ext4_inode *inode = it->inode_ref->inode;
 	struct ext4_blockdev *bdev = it->inode_ref->fs->bdev;
-	uint64_t size = ext4_inode_get_size(sb, inode);
+	it->size = ext4_inode_get_size(sb, inode);
 	int r;
 
 	/* The iterator is not valid until we seek to the desired position */
 	it->curr = NULL;
 
 	/* Are we at the end? */
-	if (pos >= size) {
+	if (pos >= it->size) {
 		if (it->curr_blk.lb_id) {
 
 			r = ext4_block_set(bdev, &it->curr_blk);
@@ -236,16 +237,14 @@ static int ext4_dir_iterator_seek(struct ext4_dir_iter *it, uint64_t pos)
 	}
 
 	/* Compute next block address */
-	uint32_t block_size = ext4_sb_get_block_size(sb);
-	uint64_t current_blk_idx = it->curr_off / block_size;
-	uint32_t next_blk_idx = (uint32_t)(pos / block_size);
+	uint32_t block_size = it->block_size;
 
 	/*
 	 * If we don't have a block or are moving across block boundary,
 	 * we need to get another block
 	 */
 	if ((it->curr_blk.lb_id == 0) ||
-	    (current_blk_idx != next_blk_idx)) {
+	    ((it->curr_off ^ pos) >= block_size)) {
 		if (it->curr_blk.lb_id) {
 			r = ext4_block_set(bdev, &it->curr_blk);
 			it->curr_blk.lb_id = 0;
@@ -255,6 +254,8 @@ static int ext4_dir_iterator_seek(struct ext4_dir_iter *it, uint64_t pos)
 		}
 
 		ext4_fsblk_t next_blk;
+		uint32_t next_blk_idx = (uint32_t)(pos >>
+			(10U + ext4_get32(sb, log_block_size)));
 		r = ext4_fs_get_inode_dblk_idx(it->inode_ref, next_blk_idx,
 					       &next_blk, false);
 		if (r != EOK)
@@ -268,7 +269,7 @@ static int ext4_dir_iterator_seek(struct ext4_dir_iter *it, uint64_t pos)
 	}
 
 	it->curr_off = pos;
-	return ext4_dir_iterator_set(it, block_size);
+	return ext4_dir_iterator_set(it);
 }
 
 int ext4_dir_iterator_init(struct ext4_dir_iter *it,
@@ -278,6 +279,7 @@ int ext4_dir_iterator_init(struct ext4_dir_iter *it,
 	it->curr = 0;
 	it->curr_off = 0;
 	it->curr_blk.lb_id = 0;
+	it->block_size = ext4_sb_get_block_size(&inode_ref->fs->sb);
 
 	return ext4_dir_iterator_seek(it, pos);
 }
@@ -303,16 +305,17 @@ int ext4_dir_iterator_next(struct ext4_dir_iter *it)
 
 int ext4_dir_iterator_next_raw(struct ext4_dir_iter *it)
 {
-	uint16_t skip;
-
 	if (it == NULL || it->curr == NULL) {
 		return EINVAL;
 	}
-	skip = ext4_dir_en_get_entry_len(it->curr);
-	if (skip < 8U || it->curr_off > UINT64_MAX - skip) {
-		return EIO;
+	/* Read-only iteration owns this directory image and its current block.
+	 * Crossing the block or EOF still uses seek to release or load a block. */
+	uint64_t next = it->next_off;
+	if (next < it->size && (next ^ it->curr_off) < it->block_size) {
+		it->curr_off = next;
+		return ext4_dir_iterator_set(it);
 	}
-	return ext4_dir_iterator_seek(it, it->curr_off + skip);
+	return ext4_dir_iterator_seek(it, next);
 }
 
 int ext4_dir_iterator_fini(struct ext4_dir_iter *it)
