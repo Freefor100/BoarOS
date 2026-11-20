@@ -3,6 +3,31 @@
 
 static struct kernel_sched_node *fair_node(struct kernel_avl_node *node)
 { return (void *)node; }
+#if BOAROS_MAX_CPUS > 1
+static unsigned fair_subtree_affinity(struct kernel_avl_node *node)
+{ return node ? fair_node(node)->fair_subtree_affinity : 0; }
+
+static void fair_update_affinity(struct kernel_avl_node *node)
+{
+    struct kernel_sched_node *task=fair_node(node);
+    task->fair_subtree_affinity=task->fair_affinity |
+        fair_subtree_affinity(node->left) | fair_subtree_affinity(node->right);
+}
+
+struct kernel_sched_node *kernel_sched_fair_pick_cpu(const struct kernel_sched_runqueue *queue,unsigned cpu)
+{
+    unsigned mask=1U<<cpu;
+    struct kernel_avl_node *node=queue->fair_root;
+    if (!(fair_subtree_affinity(node)&mask)) return 0;
+    while (node) {
+        if (fair_subtree_affinity(node->left)&mask) node=node->left;
+        else if (fair_node(node)->fair_affinity&mask) return fair_node(node);
+        else node=node->right;
+    }
+    return 0;
+}
+#endif
+
 void kernel_sched_enqueue(struct kernel_sched_runqueue *queue,
     struct kernel_sched_node *node,void *owner,unsigned priority,int at_head)
 {
@@ -10,7 +35,13 @@ void kernel_sched_enqueue(struct kernel_sched_runqueue *queue,
     node->owner=owner;node->priority=priority;node->queued=1;queue->count++;
     if(!priority) {
         node->fair.left=node->fair.right=0;node->fair.height=1;
-        queue->fair_root=kernel_avl_insert_node(queue->fair_root,&node->fair);return;
+#if BOAROS_MAX_CPUS > 1
+        node->fair_subtree_affinity=node->fair_affinity;
+        queue->fair_root=kernel_avl_insert_node_augmented(queue->fair_root,&node->fair,fair_update_affinity);
+#else
+        queue->fair_root=kernel_avl_insert_node(queue->fair_root,&node->fair);
+#endif
+        return;
     }
     struct kernel_sched_node *previous=0,*next=0;
     if(queue->heads[priority]) {
@@ -33,7 +64,11 @@ void kernel_sched_dequeue(struct kernel_sched_runqueue *queue,struct kernel_sche
     queue->count--;
     unsigned p=node->priority;
     if(!p) {
+#if BOAROS_MAX_CPUS > 1
+        queue->fair_root=kernel_avl_remove_node_augmented(queue->fair_root,&node->fair,fair_update_affinity);
+#else
         queue->fair_root=kernel_avl_remove_node(queue->fair_root,&node->fair);
+#endif
         node->fair.left=node->fair.right=0;node->fair.height=0;
     } else {
         if(queue->heads[p]==node)queue->heads[p]=node->next&&node->next->priority==p?node->next:0;

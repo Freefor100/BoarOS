@@ -228,7 +228,7 @@ static void fair_slice_case(uint32_t slice)
     assert(!running.scheduling.fair_slice_used);
 }
 
-static void ready_wait_case(int nice, int policy, int should_preempt)
+static void ready_wait_case(int nice, int policy, unsigned queued, int should_preempt)
 {
     setup(KERNEL_SCHED_OTHER, 0, 0);
     kernel_sched_dequeue(&scheduler.runqueue, &peer.ready_node);
@@ -239,6 +239,14 @@ static void ready_wait_case(int nice, int policy, int should_preempt)
     peer.ready_node.fair.key = 6000000;
     peer.fair_queue = &scheduler.runqueue;
     ready_append(&peer);
+    static struct kernel_task competitors[9];
+    for (unsigned i=0;i<queued;i++) {
+        struct kernel_task *competitor=&competitors[i];
+        *competitor=(struct kernel_task){.accounted=1,.arch.user_mode=1,
+            .state=KERNEL_THREAD_STATE_READY,.fair_queue=&scheduler.runqueue};
+        competitor->ready_node.fair.key=7000000+i;
+        ready_append(competitor);
+    }
 
     assert(!scheduler_reschedule(0,0,0) && !switches);
     assert(timer_request == (should_preempt ? 2000001 : 10000001));
@@ -344,10 +352,12 @@ int main(int argc,char **argv)
 {
     deferred_slice_case();
     fair_slice_case(100000);fair_slice_case(30000000);fair_slice_case(100000000);
-    ready_wait_case(0,KERNEL_SCHED_OTHER,1);
-    ready_wait_case(5,KERNEL_SCHED_OTHER,0);
-    ready_wait_case(0,KERNEL_SCHED_BATCH,0);
-    puts("ready wait: earlier timer and same-nice preemption without crossing nice or BATCH policy");
+    ready_wait_case(0,KERNEL_SCHED_OTHER,1,1);
+    ready_wait_case(0,KERNEL_SCHED_OTHER,8,1);
+    ready_wait_case(0,KERNEL_SCHED_OTHER,9,0);
+    ready_wait_case(5,KERNEL_SCHED_OTHER,0,0);
+    ready_wait_case(0,KERNEL_SCHED_BATCH,0,0);
+    puts("ready wait: short same-nice queues preempt earlier; crowded queues and BATCH keep ordinary timeslices");
     setup(KERNEL_SCHED_OTHER,0,0);
     running.scheduling.fair_slice_ns=100000;running.scheduling.fair_slice_used=5000000;
     scheduler_rearm_timer();assert(timer_request==2);

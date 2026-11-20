@@ -58,6 +58,13 @@ static struct kernel_sched_runqueue *cpu_queue(struct kernel_cpu *cpu)
 
 #define READY_WAIT_NS (2 * KERNEL_SCHED_WAKE_NS)
 
+static int ready_wait_short_queue(const struct kernel_sched_runqueue *queue)
+{
+    /* A round of extra preemptions should fit in one ordinary quantum.
+     * On a saturated queue use weighted scheduling for the whole round. */
+    return queue->count<KERNEL_SCHED_FAIR_NS/KERNEL_SCHED_WAKE_NS;
+}
+
 static int ready_wait_user(const struct kernel_task *task)
 {
     if (!task || !task->arch.user_mode || task->scheduling.priority) return 0;
@@ -111,7 +118,9 @@ static struct kernel_task *ready_wait_head(struct kernel_cpu *cpu,const struct k
 #if BOAROS_USER_SMP
     if (cpu->user_reservations.rt_first) return 0;
 #endif
-    return cpu_queue(cpu)->ready_wait_first[normal->scheduling.nice-KERNEL_SCHED_NICE_MIN];
+    struct kernel_sched_runqueue *queue=cpu_queue(cpu);
+    return ready_wait_short_queue(queue) ?
+        queue->ready_wait_first[normal->scheduling.nice-KERNEL_SCHED_NICE_MIN] : 0;
 }
 
 /* At least one short execution interval separates age-driven switches when
@@ -161,9 +170,16 @@ static int is_rt(const struct kernel_task *task)
     return task && !task->idle && task->scheduling.priority != 0;
 }
 
+#if BOAROS_MAX_CPUS > 1
+static uint32_t effective_cpu_mask(const struct kernel_task *task);
+#endif
+
 static void enqueue_task(struct kernel_sched_runqueue *queue,struct kernel_sched_node *node,
     struct kernel_task *task,int head)
 {
+#if BOAROS_MAX_CPUS > 1
+    if (!task->scheduling.priority) node->fair_affinity=effective_cpu_mask(task);
+#endif
     kernel_sched_enqueue(queue,node,task,(unsigned)task->scheduling.priority,head);
 #if BOAROS_USER_SMP
     if (!node->priority) {
@@ -828,7 +844,9 @@ static struct kernel_task *ready_pull_locked(struct kernel_cpu *cpu,int busy,uns
             best=rt;
             minimum=rt->scheduling.priority;
         } else if (!busy && !minimum && !best) {
-            for (struct kernel_sched_node *node=kernel_sched_pick(&other->runqueue,0);node;
+            /* The index covers affinity. A real-time reservation can also
+             * exclude a user task on this slow path. */
+            for (struct kernel_sched_node *node=kernel_sched_fair_pick_cpu(&other->runqueue,cpu->logical_id);node;
                  node=kernel_sched_next(&other->runqueue,node)) {
                 struct kernel_task *task=node->owner;
                 if (task->wait.on_cpu || task->ready_cpu!=other) __builtin_trap();
@@ -964,7 +982,8 @@ static void ready_enqueue_at_locked(struct kernel_task *task, int flags
         task->scheduling.priority>target->current->scheduling.priority ||
         fair_preempts(task,target->current);
     /* A first waiter can bring an unarmed or later timer forward. */
-    if (!task->ready_node.priority && task->ready_wait_next==task && ready_wait_user(target->current) &&
+    if (!task->ready_node.priority && task->ready_wait_next==task && ready_wait_short_queue(queue) &&
+        ready_wait_user(target->current) &&
         task->scheduling.nice==target->current->scheduling.nice) preempt=1;
 #if BOAROS_USER_SMP
     preempt |= is_rt_service(task) && !is_rt_service(target->current);
@@ -1125,7 +1144,7 @@ uint64_t scheduler_deadline_locked(struct kernel_cpu *cpu)
         uint32_t slice=kernel_sched_fair_slice(&cpu->current->scheduling);
         uint32_t used=cpu->current->scheduling.fair_slice_used;
         uint64_t fair=used>=slice?1:slice-used;
-        if (ready_wait_user(cpu->current) &&
+        if (ready_wait_short_queue(cpu_queue(cpu)) && ready_wait_user(cpu->current) &&
             cpu_queue(cpu)->ready_wait_first[cpu->current->scheduling.nice-KERNEL_SCHED_NICE_MIN]) {
             struct kernel_sched_node *first=kernel_sched_pick(cpu_queue(cpu),0);
             struct kernel_task *oldest=ready_wait_head(cpu,first?first->owner:0);
@@ -1236,11 +1255,10 @@ static __attribute__((noinline)) int try_pull_ordinary(struct kernel_cpu *cpu,
             KERNEL_RAW_SCOPE(second,two);
             if (!local_queue_eligible(cpu,current,blocked) || remote_rt_ready(cpu)) return -1;
             if (cpu->runqueue.count || (blocked && current->wait.ready_pending)) return 0;
-            for (struct kernel_sched_node *node=kernel_sched_pick(&source->runqueue,0);node;node=kernel_sched_next(&source->runqueue,node)) {
-                if (!ready_allowed_on(cpu,node->owner)) continue;
-                if (!scheduler_local_task(node->owner,cpu)) return -1;
+            struct kernel_sched_node *node=kernel_sched_fair_pick_cpu(&source->runqueue,cpu->logical_id);
+            if (node) {
                 next=node->owner;
-                break;
+                if (!scheduler_local_task(next,cpu)) return -1;
             }
             if (next) {
                 account_cpu(cpu,kernel_time_raw_ns());
