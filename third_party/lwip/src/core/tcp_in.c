@@ -905,6 +905,18 @@ tcp_timewait_input(struct tcp_input_state *rx, struct tcp_pcb *pcb)
   return;
 }
 
+static void
+tcp_enter_timewait(struct tcp_pcb *pcb)
+{
+  tcp_pcb_purge(pcb);
+  TCP_RMV_ACTIVE(pcb);
+  tcp_set_state(pcb, TIME_WAIT);
+#if BOAROS_USER_SMP
+  boaros_lwip_tcp_pcb_timewait(pcb);
+#endif
+  TCP_REG(&tcp_tw_pcbs, pcb);
+}
+
 /**
  * Implements the TCP state machine. Called by tcp_input. In some
  * states tcp_receive() is called to receive data. The tcp_seg
@@ -1144,10 +1156,7 @@ tcp_process(struct tcp_input_state *rx, struct tcp_pcb *pcb)
           LWIP_DEBUGF(TCP_DEBUG,
                       ("TCP connection closed: FIN_WAIT_1 %"U16_F" -> %"U16_F".\n", rx->inseg.tcphdr->src, rx->inseg.tcphdr->dest));
           tcp_ack_now(pcb);
-          tcp_pcb_purge(pcb);
-          TCP_RMV_ACTIVE(pcb);
-          tcp_set_state(pcb, TIME_WAIT);
-          TCP_REG(&tcp_tw_pcbs, pcb);
+          tcp_enter_timewait(pcb);
         } else {
           tcp_ack_now(pcb);
           tcp_set_state(pcb, CLOSING);
@@ -1162,20 +1171,14 @@ tcp_process(struct tcp_input_state *rx, struct tcp_pcb *pcb)
       if (rx->recv_flags & TF_GOT_FIN) {
         LWIP_DEBUGF(TCP_DEBUG, ("TCP connection closed: FIN_WAIT_2 %"U16_F" -> %"U16_F".\n", rx->inseg.tcphdr->src, rx->inseg.tcphdr->dest));
         tcp_ack_now(pcb);
-        tcp_pcb_purge(pcb);
-        TCP_RMV_ACTIVE(pcb);
-        tcp_set_state(pcb, TIME_WAIT);
-        TCP_REG(&tcp_tw_pcbs, pcb);
+        tcp_enter_timewait(pcb);
       }
       break;
     case CLOSING:
       tcp_receive(rx, pcb);
       if ((rx->flags & TCP_ACK) && rx->ackno == pcb->snd_nxt && pcb->unsent == NULL) {
         LWIP_DEBUGF(TCP_DEBUG, ("TCP connection closed: CLOSING %"U16_F" -> %"U16_F".\n", rx->inseg.tcphdr->src, rx->inseg.tcphdr->dest));
-        tcp_pcb_purge(pcb);
-        TCP_RMV_ACTIVE(pcb);
-        tcp_set_state(pcb, TIME_WAIT);
-        TCP_REG(&tcp_tw_pcbs, pcb);
+        tcp_enter_timewait(pcb);
       }
       break;
     case LAST_ACK:

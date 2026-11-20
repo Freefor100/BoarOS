@@ -32,6 +32,7 @@ struct boaros_lwip_hooks {
     int (*tcp_local_output)(const struct tcp_pcb *, struct pbuf *, struct netif *,
                            const struct ip_addr *, const struct ip_addr *, int *);
     void (*pcb_forget)(struct tcp_pcb *);
+    void (*pcb_timewait)(struct tcp_pcb *);
     int (*tcp_conflict)(const struct tcp_pcb *, const struct ip_addr *, uint16_t, const struct ip_addr *, uint16_t);
 };
 void boaros_lwip_netif_removed(struct netif *);
@@ -50,6 +51,7 @@ int boaros_lwip_tcp_dispatch(struct pbuf *, struct netif *, const struct ip_addr
 int boaros_lwip_tcp_local_output(const struct tcp_pcb *, struct pbuf *, struct netif *,
                                 const struct ip_addr *, const struct ip_addr *, int *);
 void boaros_lwip_tcp_pcb_forget(struct tcp_pcb *);
+void boaros_lwip_tcp_pcb_timewait(struct tcp_pcb *);
 int boaros_lwip_tcp_conflict(const struct tcp_pcb *, const struct ip_addr *, uint16_t, const struct ip_addr *, uint16_t);
 /* Boot topology is known before lwIP can start any secondary owner. */
 void boaros_lwip_ip_init(unsigned cpu_count);

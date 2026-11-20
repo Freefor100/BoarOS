@@ -197,6 +197,8 @@ int boaros_lwip_tcp_local_output(const struct tcp_pcb *pcb, struct pbuf *p, stru
 }
 void boaros_lwip_tcp_pcb_forget(struct tcp_pcb *pcb)
 { if(protocol_hooks.pcb_forget)protocol_hooks.pcb_forget(pcb); }
+void boaros_lwip_tcp_pcb_timewait(struct tcp_pcb *pcb)
+{ if(protocol_hooks.pcb_timewait)protocol_hooks.pcb_timewait(pcb); }
 int boaros_lwip_tcp_conflict(const struct tcp_pcb *pcb, const struct ip_addr *local, uint16_t local_port,
     const struct ip_addr *remote, uint16_t remote_port)
 { return protocol_hooks.tcp_conflict ? protocol_hooks.tcp_conflict(pcb,local,local_port,remote,remote_port) : 0; }

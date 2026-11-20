@@ -469,6 +469,9 @@ static struct kernel_io_context *protocol_current_owner(void);
  * Ownership of the pbuf (and any DMA loan) transfers with the ring entry. */
 #define TCP_RX_RING 64U
 #define TCP_ROUTE_BUCKETS 64U
+/* Two ordinary loopback connections can share one context. Spread new
+ * work once there are already four active endpoints on its preferred CPU. */
+#define TCP_OWNER_SPREAD_AT 4U
 struct socket_tcp_input {
     struct pbuf *packet;
     struct netif *interface;
@@ -500,6 +503,7 @@ static struct netif *fast_loopback;
 enum { LOOPBACK_AVAILABLE=1, LOOPBACK_LEGACY=2, LOOPBACK_GENERATION=4 };
 static uint64_t fast_loopback_state;
 static struct tcp_pcb *tcp_routes[TCP_ROUTE_BUCKETS];
+static unsigned tcp_owner_active[BOAROS_MAX_CPUS];
 static struct kernel_raw_lock tcp_route_lock = {
     .rank=KERNEL_RAW_RANK_OBJECT, .initialized=KERNEL_RAW_INITIALIZED
 };
@@ -1650,8 +1654,8 @@ static uint32_t tcp_flow_hash(const ip_addr_t *a,unsigned ap,const ip_addr_t *b,
     return h^(h>>13);
 }
 
-static unsigned tcp_route_bucket(const struct tcp_pcb *pcb)
-{ return tcp_flow_hash(&pcb->local_ip,pcb->local_port,&pcb->remote_ip,pcb->remote_port)%TCP_ROUTE_BUCKETS; }
+static uint32_t tcp_pcb_hash(const struct tcp_pcb *pcb)
+{ return tcp_flow_hash(&pcb->local_ip,pcb->local_port,&pcb->remote_ip,pcb->remote_port); }
 
 static unsigned tcp_route(const ip_addr_t *src,uint16_t sport,const ip_addr_t *dst,
                           uint16_t dport,const struct netif *input,uint8_t *route_bucket)
@@ -1791,6 +1795,7 @@ static void tcp_pcb_forget(struct tcp_pcb *pcb)
     }
     *link=pcb->boaros_route_next;
     pcb->boaros_route_next=0;
+    if (tcp_get_state(pcb)!=TIME_WAIT) tcp_owner_active[pcb->boaros_owner]--;
     if (pcb->boaros_loopback_peer) {
         struct tcp_pcb *peer=pcb->boaros_loopback_peer;
         if (peer->boaros_owner!=pcb->boaros_owner || peer->boaros_loopback_peer!=pcb)
@@ -1801,8 +1806,38 @@ static void tcp_pcb_forget(struct tcp_pcb *pcb)
     pcb->boaros_owner=0;
 }
 
-/* Promotion holds the destination TCP owner and the route-index lock. The
- * symmetric hash assigns a reverse tuple to the same protocol context. */
+/* TIME_WAIT keeps the tuple routed, but no longer competes for data work. */
+static void tcp_pcb_timewait(struct tcp_pcb *pcb)
+{
+    if (!pcb->boaros_owner) return;
+    KERNEL_RAW_SCOPE(guard,&tcp_route_lock);
+    tcp_owner_active[pcb->boaros_owner]--;
+}
+
+/* Promotion is serialized by the default TCP protocol mutex. Look up a
+ * published owner before taking its mutex, keeping the route lock innermost. */
+static unsigned tcp_pick_owner(const struct tcp_pcb *pcb,unsigned count,uint32_t hash)
+{
+    if (count==1) return 1;
+    KERNEL_RAW_SCOPE(guard,&tcp_route_lock);
+    for (const struct tcp_pcb *p=tcp_routes[hash%TCP_ROUTE_BUCKETS];p;p=p->boaros_route_next) {
+        if (p->local_port==pcb->local_port && p->remote_port==pcb->remote_port &&
+            ip_addr_cmp(&p->local_ip,&pcb->local_ip) && ip_addr_cmp(&p->remote_ip,&pcb->remote_ip))
+            return p->boaros_owner;
+        if (p->local_port==pcb->remote_port && p->remote_port==pcb->local_port &&
+            ip_addr_cmp(&p->local_ip,&pcb->remote_ip) &&
+            ip_addr_cmp(&p->remote_ip,&pcb->local_ip))
+            return p->boaros_owner;
+    }
+    unsigned chosen=1+hash%count;
+    if (tcp_owner_active[chosen]<TCP_OWNER_SPREAD_AT) return chosen;
+    for (unsigned cpu=1;cpu<=count && tcp_owner_active[chosen];cpu++)
+        if (tcp_owner_active[cpu]<tcp_owner_active[chosen]) chosen=cpu;
+    return chosen;
+}
+
+/* Both tuples have the same owner. Re-read the actual peer after acquiring
+ * that owner's mutex, since the previous peer may have retired meanwhile. */
 static void tcp_link_loopback_peer(struct tcp_pcb *pcb,unsigned bucket)
 {
     if (!pcb->boaros_loopback) return;
@@ -1858,7 +1893,8 @@ static int tcp_promote(struct kernel_socket *socket,struct kernel_socket_protoco
     struct tcp_pcb *pcb=socket->tcp;
     if (!count || !scope->outer || !pcb ||
         (pcb->state!=ESTABLISHED && pcb->state!=CLOSE_WAIT) || tcp_socket_cpu(socket)) return 0;
-    unsigned cpu=1+tcp_flow_hash(&pcb->local_ip,pcb->local_port,&pcb->remote_ip,pcb->remote_port)%count;
+    uint32_t hash=tcp_pcb_hash(pcb);
+    unsigned cpu=tcp_pick_owner(pcb,count,hash);
     struct socket_tcp_owner *owner=tcp_owner_at(cpu);
     boaros_lwip_ip_unlock(&scope->ip_guard);
     struct kernel_lock_guard guard={0};
@@ -1867,7 +1903,7 @@ static int tcp_promote(struct kernel_socket *socket,struct kernel_socket_protoco
     if (moved) {
         /* The receiver acquires the owner mutex before using this bucket.
          * The queued packet carries its number, never a reference to a PCB. */
-        unsigned bucket=tcp_route_bucket(pcb);
+        unsigned bucket=hash%TCP_ROUTE_BUCKETS;
         pcb->boaros_route_bucket=(uint8_t)bucket;
         pcb->boaros_input_next=owner->input_buckets[bucket];
         owner->input_buckets[bucket]=pcb;
@@ -1876,7 +1912,8 @@ static int tcp_promote(struct kernel_socket *socket,struct kernel_socket_protoco
           pcb->boaros_owner=(uint8_t)cpu;
           tcp_link_loopback_peer(pcb,bucket);
           pcb->boaros_route_next=tcp_routes[bucket];
-          tcp_routes[bucket]=pcb; }
+          tcp_routes[bucket]=pcb;
+          tcp_owner_active[cpu]++; }
         SOCKET_STATE(state);
         int queued=socket->work_links[ready_work.slot].queued;
         if (queued) work_remove_locked(&ready_work,socket);
@@ -5392,7 +5429,8 @@ void kernel_socket_network_initialize(void)
             .udp_multicast_receive=socket_udp_multicast_receive,.netif_removed=socket_ipv6_netif_removed,
 #if BOAROS_USER_SMP
             .tcp_context = tcp_context, .tcp_dispatch = tcp_dispatch,
-            .pcb_forget = tcp_pcb_forget, .tcp_conflict = tcp_route_conflict,
+            .pcb_forget = tcp_pcb_forget, .pcb_timewait = tcp_pcb_timewait,
+            .tcp_conflict = tcp_route_conflict,
             .tcp_local_output = tcp_local_output, .loopback_publish = tcp_mark_legacy_loopback,
 #endif
         };
