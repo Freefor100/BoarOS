@@ -428,6 +428,14 @@ int kernel_vfs_sync(struct kernel_vfs_file *file, int datasync,
                     uint64_t *observed_error);
 int kernel_vfs_sync_range(struct kernel_vfs_file *file,
     uint64_t start, uint64_t end, uint64_t *observed_error);
+enum kernel_sync_file_range_flags {
+    KERNEL_SYNC_FILE_RANGE_WAIT_BEFORE = 1,
+    KERNEL_SYNC_FILE_RANGE_WRITE = 2,
+    KERNEL_SYNC_FILE_RANGE_WAIT_AFTER = 4,
+    KERNEL_SYNC_FILE_RANGE_ALL = 7,
+};
+int kernel_vfs_sync_file_range(struct kernel_vfs_file *, uint64_t start,
+    uint64_t end, unsigned flags, uint64_t *observed_error);
 
 int kernel_vfs_mkdir(struct kernel_vfs_mount *mount,
                      const char *path,

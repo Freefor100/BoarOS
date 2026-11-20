@@ -5630,17 +5630,58 @@ uint64_t kernel_vfs_error_sequence(const struct kernel_vfs_file *file)
     return node->writeback_error_sequence;
 }
 
+int kernel_vfs_node_complete_data_range(struct kernel_vfs_node *node, uint64_t start, uint64_t end)
+{
+    if (!node->instance->ops->complete_data_range || start >= end)
+        return 0;
+    KERNEL_LOCK_SCOPE(io);
+    kernel_vfs_node_lock(node, &io, 0);
+    int result = node->instance->ops->complete_data_range(node, start, end);
+    if (result) kernel_vfs_record_writeback_error(node, result);
+    return result;
+}
+
+static int observe_node_writeback_error(struct kernel_vfs_node *node,
+    uint64_t *observed_error, int result)
+{
+    KERNEL_TASK_LOCK_SCOPE(error, &node->instance->error_lock);
+    if (*observed_error != node->writeback_error_sequence) {
+        if (!result) result = node->writeback_error;
+        *observed_error = node->writeback_error_sequence;
+    }
+    return result;
+}
+
+int kernel_vfs_sync_file_range(struct kernel_vfs_file *file, uint64_t start,
+    uint64_t end, unsigned flags, uint64_t *observed_error)
+{
+    struct kernel_vfs_node *node = kernel_vfs_file_node(file);
+    if (!node) return -KERNEL_EBADF;
+    struct kernel_page_cache *cache = node->instance->page_cache;
+    if (!flags || !cache) return 0;
+    int result = 0;
+    if (flags & KERNEL_SYNC_FILE_RANGE_WAIT_BEFORE) {
+        kernel_page_cache_wait_range(cache, node, start, end);
+        result = kernel_vfs_node_complete_data_range(node, start, end);
+        result = observe_node_writeback_error(node, observed_error, result);
+    }
+    if (!result && (flags & KERNEL_SYNC_FILE_RANGE_WRITE) && !node->instance->read_only)
+        result = flags == KERNEL_SYNC_FILE_RANGE_ALL ?
+            kernel_page_cache_writeback_range(cache, node, start, end) :
+            kernel_page_cache_submit_range(cache, node, start, end);
+    if (!result && (flags & KERNEL_SYNC_FILE_RANGE_WAIT_AFTER)) {
+        kernel_page_cache_wait_range(cache, node, start, end);
+        result = kernel_vfs_node_complete_data_range(node, start, end);
+        result = observe_node_writeback_error(node, observed_error, result);
+    }
+    return result;
+}
+
 static void vfs_sync_observe_complete(struct kernel_vfs_sync_request *request, int result)
 {
     struct kernel_vfs_node *node = kernel_vfs_file_node(request->file);
     /* 完成可来自任一CPU；错误与共享OFD游标在通知前成对消费。 */
-    {
-        KERNEL_TASK_LOCK_SCOPE(error, &node->instance->error_lock);
-        if (*request->observed_error != node->writeback_error_sequence) {
-            if (!result) result = node->writeback_error;
-            *request->observed_error = node->writeback_error_sequence;
-        }
-    }
+    result = observe_node_writeback_error(node, request->observed_error, result);
     {
         KERNEL_RAW_SCOPE(guard, &request->metadata);
         if (request->done || request->index_height) __builtin_trap();

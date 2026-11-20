@@ -308,6 +308,38 @@ static enum kernel_files_status memory_read(
     return KERNEL_FILES_STATUS_OK;
 }
 
+enum kernel_files_status kernel_files_sync_file_range(struct kernel_files *files,
+    int64_t fd, int64_t offset, int64_t length, unsigned flags, int64_t *linux_result)
+{
+    if (!kernel_files_is_live(files) || !linux_result)
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    KERNEL_FILES_PIN_SCOPE(pin);
+    struct kernel_open_file_description *file = NULL;
+    enum kernel_files_status status = kernel_files_pin_data(files, fd, &file, linux_result);
+    if (status || *linux_result)
+        return status;
+    pin = (struct kernel_files_pin_guard){files, file};
+    enum kernel_open_file_kind kind = kernel_open_file_kind(file);
+    if (flags & ~KERNEL_SYNC_FILE_RANGE_ALL || offset < 0 || length < 0 ||
+        length > INT64_MAX - offset)
+        *linux_result = -KERNEL_EINVAL;
+    else if (kind == KERNEL_OPEN_FILE_KIND_BLOCK)
+        *linux_result = 0; /* Block descriptions do not buffer writes. */
+    else if (kind == KERNEL_OPEN_FILE_KIND_MQUEUE)
+        *linux_result = 0; /* The regular inode has no data mapping. */
+    else if (kind != KERNEL_OPEN_FILE_KIND_REGULAR && kind != KERNEL_OPEN_FILE_KIND_DIRECTORY &&
+             kind != KERNEL_OPEN_FILE_KIND_GENERATED)
+        *linux_result = -KERNEL_ESPIPE;
+    else {
+        uint64_t start = (uint64_t)offset & ~(uint64_t)BOAROS_PAGE_MASK;
+        uint64_t end = length ? (uint64_t)(offset + length) : (uint64_t)INT64_MAX + 1U;
+        end = (end + BOAROS_PAGE_MASK) & ~(uint64_t)BOAROS_PAGE_MASK;
+        *linux_result = kernel_vfs_sync_file_range(&file->file, start, end, flags,
+            &file->observed_writeback_error);
+    }
+    return KERNEL_FILES_STATUS_OK;
+}
+
 static enum kernel_files_status sync_pinned(struct kernel_open_file_description *description,
     int datasync,int64_t *linux_result,const struct kernel_lock_guard *borrowed)
 {

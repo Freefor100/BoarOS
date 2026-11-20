@@ -51,9 +51,15 @@ static unsigned direct_read_pin_seen;
 static unsigned watch_write_source, write_source_pins;
 static struct kernel_vfs_node *watch_sparse_node;
 static size_t sparse_spans,sparse_source_bytes;
+static struct kernel_vfs_node *fail_range_node;
+static unsigned fail_range_writeback;
 int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *,struct file_write_span *,size_t);
 int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node,struct file_write_span *spans,size_t count)
 {
+    if (node == fail_range_node && __atomic_exchange_n(&fail_range_writeback, 0, __ATOMIC_ACQ_REL)) {
+        kernel_vfs_record_writeback_error(node, -KERNEL_EIO);
+        return -KERNEL_EIO;
+    }
     if (node==watch_sparse_node) {
         sparse_spans+=count;
         for (size_t i=0;i<count;i++) sparse_source_bytes+=spans[i].source_size;
@@ -1867,6 +1873,35 @@ static void file_advice_case(struct kernel_heap *heap,struct kernel_vfs_mount *m
 }
 #include "file_io_directory_cases.c"
 
+static void range_writeback_error_case(struct kernel_heap *heap, struct kernel_vfs_mount *mount,
+    struct kernel_page_cache *cache)
+{
+    int error;
+    size_t written;
+    struct kernel_open_file_description *file = NULL, *other = NULL;
+    assert(!kernel_open_file_create_mode(heap, mount, "/range-writeback", 0600, &file, &error) && !error);
+    assert(!kernel_open_file_create(heap, mount, "/range-writeback", &other, &error) && !error);
+    file->open_flags = 2;
+    assert(!kernel_vfs_file_acquire_write(&file->file));
+    assert(!kernel_vfs_pwrite(&file->file, 0, "range", 5, &written) && written == 5);
+    assert(!kernel_page_cache_start_worker(cache));
+    fail_range_node = kernel_open_file_node(file);
+    __atomic_store_n(&fail_range_writeback, 1, __ATOMIC_RELEASE);
+    uint64_t length = BOAROS_PAGE_SIZE;
+    assert(!kernel_vfs_sync_file_range(&file->file, 0, length, KERNEL_SYNC_FILE_RANGE_WRITE,
+        &file->observed_writeback_error));
+    assert(kernel_vfs_sync_file_range(&file->file, 0, length, KERNEL_SYNC_FILE_RANGE_WAIT_AFTER,
+        &file->observed_writeback_error) == -KERNEL_EIO);
+    assert(kernel_vfs_sync_file_range(&other->file, 0, length, KERNEL_SYNC_FILE_RANGE_WAIT_AFTER,
+        &other->observed_writeback_error) == -KERNEL_EIO);
+    assert(!kernel_vfs_sync_file_range(&file->file, 0, length, KERNEL_SYNC_FILE_RANGE_ALL,
+        &file->observed_writeback_error));
+    fail_range_node = NULL;
+    assert(!kernel_open_file_release(&other) && !kernel_open_file_release(&file));
+    assert(!kernel_vfs_unlink(mount, "/range-writeback"));
+    puts("PASS range writeback: asynchronous error, distinct file cursors and successful retry");
+}
+
 int main(int argc,char **argv)
 {
     assert(argc==2); setvbuf(stdout,0,_IONBF,0); mm_test_attach(0); mm_test_activate_task();
@@ -1879,9 +1914,11 @@ int main(int argc,char **argv)
     int advice_only=getenv("FILE_IO_ADVICE_ONLY")!=NULL;
     int transfers_only=getenv("FILE_IO_TRANSFERS_ONLY")!=NULL;
     int direct_only=getenv("FILE_IO_DIRECT_ONLY")!=NULL;
+    int range_only=getenv("FILE_IO_RANGE_ONLY")!=NULL;
     int paths_only=getenv("FILE_IO_PATHS_ONLY")!=NULL;
     int directories_only=getenv("FILE_IO_DIRECTORIES_ONLY")!=NULL;
-    int focused=direct_only || block_only || directories_only || advice_only || transfers_only || paths_only || getenv("FILE_IO_VECTORS_ONLY")!=NULL;
+    int focused=direct_only || range_only || block_only || directories_only || advice_only ||
+        transfers_only || paths_only || getenv("FILE_IO_VECTORS_ONLY")!=NULL;
     if (!focused) {
     borrowed_page_case(&pages);
     namespace_retiring_mount_case(&heap);
@@ -1953,6 +1990,7 @@ int main(int argc,char **argv)
     else if (directories_only) directory_batch_cases(&heap,&mount,1);
     else if (paths_only) pathname_storage_case(&heap,&mount);
     else if (direct_only) ext4_direct_case(&heap,&mount);
+    else if (range_only) range_writeback_error_case(&heap,&mount,&cache);
     else if (transfers_only) transfer_cases(&heap,&mount);
     else if (advice_only) file_advice_case(&heap,&mount,&cache);
     else if (focused) synchronous_write_ranges(&heap,&mount);

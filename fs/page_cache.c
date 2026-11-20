@@ -164,6 +164,10 @@ struct readahead_job {
 struct kernel_page_cache_record {
     struct kernel_mutex metadata;
     struct cache_request *reads_head, **reads_tail;
+    struct range_writeback *range_head, **range_tail;
+    struct kernel_wait_queue range_progress;
+    uint64_t range_sequence;
+    unsigned range_count;
     struct kernel_io_context *executor_io;
     uint32_t read_requests, reads_running;
     /* Atomic lifetime: final unwind returns without reacquiring metadata. */
@@ -1318,7 +1322,9 @@ static enum kernel_page_cache_status cache_init(
         return KERNEL_PAGE_CACHE_STATUS_NO_MEMORY;
     }
     kernel_wait_queue_init(&record->work);
+    kernel_wait_queue_init(&record->range_progress);
     record->reads_tail=&record->reads_head;
+    record->range_tail=&record->range_head;
     kernel_mutex_init(&record->metadata, 45, (uintptr_t)record);
     cache->heap = heap;
     cache->allocator = allocator;
@@ -3849,6 +3855,13 @@ struct foreground_writeback {
     int result,done;
 };
 
+enum { RANGE_WRITEBACK_SLOTS = 32 };
+struct range_writeback {
+    struct range_writeback *next;
+    struct foreground_writeback window;
+    uint64_t first, sequence;
+};
+
 static void writeback_window(void *argument)
 {
     struct foreground_writeback *request=argument;
@@ -3940,6 +3953,176 @@ int kernel_page_cache_writeback_range(struct kernel_page_cache *cache,
 
 int kernel_page_cache_writeback(struct kernel_page_cache *cache, struct kernel_vfs_node *node)
 { return kernel_page_cache_writeback_range(cache, node, 0, UINT64_MAX); }
+
+static int range_has_dirty(struct kernel_vfs_node *node, uint64_t first, uint64_t last)
+{
+    struct kernel_page_cache_entry *entry = dirty_at_or_after(node, first);
+    return entry && entry->page_index <= last;
+}
+
+static void wait_range_progress(struct kernel_wait_token *token)
+{
+    enum kernel_wait_wake_reason reason;
+    if (kernel_wait_park(token, &reason) || kernel_wait_finish(token))
+        __builtin_trap();
+}
+
+int kernel_page_cache_submit_range(struct kernel_page_cache *cache,
+    struct kernel_vfs_node *node, uint64_t start, uint64_t end)
+{
+    struct kernel_page_cache_record *record = cache->record;
+    uint64_t first = start >> BOAROS_PAGE_SHIFT;
+    uint64_t last = (end - 1) >> BOAROS_PAGE_SHIFT;
+    {
+        CACHE_SCOPE(check, cache);
+        if (!range_has_dirty(node, first, last))
+            return 0;
+    }
+    struct range_writeback *request = NULL;
+    if (kernel_heap_allocate_zeroed(cache->heap, 1, sizeof(*request), (void **)&request))
+        return -KERNEL_ENOMEM;
+    int result = 0;
+    for (;;) {
+        struct kernel_wait_token token = {0};
+        {
+            CACHE_SCOPE(admit, cache);
+            if (!record->started || record->stopping) {
+                result = -KERNEL_EIO;
+                break;
+            }
+            if (!range_has_dirty(node, first, last))
+                break;
+            if (record->range_count < RANGE_WRITEBACK_SLOTS) {
+                if (kernel_vfs_node_acquire(node))
+                    __builtin_trap();
+                struct kernel_page_cache_entry *tail =
+                    RB_MAX(kernel_page_cache_dirty_tree, &kernel_vfs_node_dirty_pages(node)->tree);
+                if (last > tail->page_index)
+                    last = tail->page_index;
+                struct writeback_workspace *work = record->writeback_workspace;
+                request->window = (struct foreground_writeback){
+                    .cache = cache, .node = node, .cursor = first, .last = last,
+                    .end = end, .selected = work->selected, .workspace = work,
+                    .capacity = record->writeback_capacity,
+                };
+                request->first = first;
+                request->sequence = ++record->range_sequence;
+                if (!request->sequence) __builtin_trap();
+                *record->range_tail = request;
+                record->range_tail = &request->next;
+                record->range_count++;
+                cache_wake(&record->work);
+                return 0;
+            }
+            if (kernel_wait_prepare(&record->range_progress, 0, 0, &token))
+                __builtin_trap();
+        }
+        wait_range_progress(&token);
+    }
+    kernel_heap_release(cache->heap, request);
+    return result;
+}
+
+void kernel_page_cache_wait_range(struct kernel_page_cache *cache,
+    struct kernel_vfs_node *node, uint64_t start, uint64_t end)
+{
+    struct kernel_page_cache_record *record = cache->record;
+    uint64_t first = start >> BOAROS_PAGE_SHIFT;
+    uint64_t last = (end - 1) >> BOAROS_PAGE_SHIFT;
+    uint64_t sequence = 0;
+    int sampled = 0;
+    for (;;) {
+        struct kernel_wait_token token = {0};
+        struct kernel_page_cache_entry *inflight = NULL;
+        {
+            CACHE_SCOPE(check, cache);
+            if (!sampled) {
+                sequence = record->range_sequence;
+                sampled = 1;
+            }
+            struct range_writeback *item = record->range_head;
+            for (; item && item->sequence <= sequence; item = item->next)
+                if (item->window.node == node && item->first <= last && item->window.last >= first)
+                    break;
+            if (item && item->sequence <= sequence) {
+                if (kernel_wait_prepare(&record->range_progress, 0, 0, &token))
+                    __builtin_trap();
+            } else {
+                if (!record->writeback_active)
+                    return;
+                struct kernel_page_cache_entry *entry = dirty_at_or_after(node, first);
+                unsigned inspected = 0;
+                while (entry && entry->page_index <= last && !entry->writeback &&
+                       inspected++ < BOAROS_PAGE_CACHE_WRITEBACK_PAGES)
+                    entry = RB_NEXT(kernel_page_cache_dirty_tree, &kernel_vfs_node_dirty_pages(node)->tree, entry);
+                if (!entry || entry->page_index > last)
+                    return;
+                if (!entry->writeback) {
+                    first = entry->page_index;
+                    continue;
+                }
+                inflight = entry;
+                entry_borrow(inflight);
+                if (kernel_wait_prepare(&entry->ready, 0, 0, &token))
+                    __builtin_trap();
+            }
+        }
+        wait_range_progress(&token);
+        if (inflight) {
+            CACHE_SCOPE(release, cache);
+            first = inflight->page_index;
+            entry_return(inflight);
+        }
+    }
+}
+
+static void run_range_writeback(struct kernel_page_cache *cache,
+    struct range_writeback *request, int stopping)
+{
+    struct kernel_page_cache_record *record = cache->record;
+    if (!stopping) {
+        struct kernel_io_context *io = kernel_io_context_current();
+        unsigned previous = io->background_reclaim;
+        io->background_reclaim = 1;
+        uint64_t first = request->window.cursor;
+        writeback_window(&request->window);
+        if (!request->window.result && request->window.cursor > first) {
+            uint64_t end = request->window.cursor << BOAROS_PAGE_SHIFT;
+            if (end > request->window.end) end = request->window.end;
+            request->window.result = kernel_vfs_node_complete_data_range(request->window.node,
+                first << BOAROS_PAGE_SHIFT, end);
+            if (request->window.result) request->window.done = 1;
+        }
+        io->background_reclaim = previous;
+    } else {
+        request->window.result = -KERNEL_EIO;
+        request->window.done = 1;
+    }
+    if (!request->window.done) {
+        CACHE_SCOPE(progress, cache);
+        request->first = request->window.cursor;
+        cache_wake(&record->range_progress);
+        return;
+    }
+    /* Backend failures already have a publication in kernel_vfs_node_writeback.
+     * Failures before a submission still need a completion for a later wait. */
+    if (stopping || request->window.result == -KERNEL_ENOMEM ||
+        request->window.result == -KERNEL_EBUSY)
+        kernel_vfs_record_writeback_error(request->window.node, request->window.result);
+    {
+        CACHE_SCOPE(complete, cache);
+        if (record->range_head != request || !record->range_count)
+            __builtin_trap();
+        record->range_head = request->next;
+        if (!record->range_head)
+            record->range_tail = &record->range_head;
+        record->range_count--;
+        cache_wake(&record->range_progress);
+    }
+    if (kernel_vfs_node_release(&request->window.node))
+        __builtin_trap();
+    kernel_heap_release(cache->heap, request);
+}
 
 int kernel_page_cache_pin_dirty_nodes(struct kernel_page_cache *cache,
     const struct kernel_vfs_instance *instance, struct kernel_vfs_node **nodes,
@@ -4441,7 +4624,7 @@ static void cache_background(struct kernel_page_cache *cache)
         {
             CACHE_SCOPE(guard,cache);
             r->statistics.worker_batches++;
-            if (r->reads_head) {
+            if (r->reads_head || r->range_head) {
                 r->requested=1;interrupted=1;
                 break;
             }
@@ -4477,9 +4660,11 @@ static void page_cache_worker(void *argument)
     struct kernel_page_cache_record *r = cache->record;
     __atomic_store_n(&r->executor_io,kernel_io_context_current(),__ATOMIC_RELEASE);
     unsigned reads=0;
+    int prefer_range=1;
     struct kernel_page_cache_entry *cleanup_entries=NULL;
     for (;;) {
         struct cache_request *request = 0;
+        struct range_writeback *range = NULL;
         struct kernel_wait_token token = {0};
         int cleanup = 0, stopping=0, park=1, waiting_batch=0;
         {
@@ -4501,7 +4686,11 @@ static void page_cache_worker(void *argument)
                 r->dirty_deadline=0;r->expired_writeback=1;r->requested=1;
             }
 #endif
-            if (r->requested && !waiting_batch && (reads>=16 || !r->reads_head)) {
+            if (r->range_head && (prefer_range || !r->requested || waiting_batch) &&
+                (!r->reads_head || reads >= 16)) {
+                range = r->range_head;
+                reads = 0;
+            } else if (r->requested && !waiting_batch && (reads>=16 || !r->reads_head)) {
                 r->requested=0; cleanup=1; reads=0;
             } else if (r->reads_head) {
                 request = r->reads_head; r->reads_head = request->next;
@@ -4530,12 +4719,21 @@ static void page_cache_worker(void *argument)
                 park=waiting_batch || !r->requested;
             }
         }
+        if (range) {
+            prefer_range=0;
+            run_range_writeback(cache, range, stopping);
+            cache_yield();
+            continue;
+        }
         if (!request) {
             if (cleanup) {
                 if (!cleanup_entries) take_cleanup_entries(cache,&cleanup_entries);
                 uint64_t released=0;
                 (void)drain_cleanup_entries(cache,&cleanup_entries,16,&released);
-                if (cleanup==1 && !stopping) cache_background(cache);
+                if (cleanup==1 && !stopping) {
+                    prefer_range=1;
+                    cache_background(cache);
+                }
                 cache_yield();
                 continue;
             }

@@ -2952,6 +2952,16 @@ static int ext4_backend_writeback(struct kernel_vfs_node *node,
     return lwext4_error(result);
 }
 
+static int ext4_backend_complete_data_range(struct kernel_vfs_node *node, uint64_t start, uint64_t end)
+{
+    struct jbd_journal *journal = lwext4_instance(node->instance)->device.fs->jbd_journal;
+    if (!journal || jbd_journal_error(journal))
+        return 0;
+    if (!__atomic_load_n(&journal->ordered_trees, __ATOMIC_ACQUIRE))
+        return 0;
+    return lwext4_error(ext4_fdata_complete(lwext4_node_file(node), start, end - start));
+}
+
 static size_t ext4_backend_direct_alignment(struct kernel_vfs_node *node)
 {
     struct lwext4_mount_adapter *adapter=lwext4_instance(node->instance);
@@ -3235,6 +3245,7 @@ static void initialize_backend(void)
     ops->writeback_allowed = ext4_backend_writeback_allowed;
     ops->reclaim_clean = ext4_backend_reclaim_clean;
     ops->writeback_reclaim = ext4_backend_writeback_reclaim;
+    ops->complete_data_range = ext4_backend_complete_data_range;
     ops->sync_prepare = ext4_backend_sync_prepare;
     ops->sync_filesystem = ext4_backend_sync_filesystem;
     ops->flush = ext4_backend_flush;

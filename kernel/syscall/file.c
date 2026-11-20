@@ -443,6 +443,25 @@ enum kernel_syscall_status syscall_handle_fsync(
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
+enum kernel_syscall_status syscall_handle_sync_file_range(
+    struct kernel_task *caller, const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    struct kernel_files *files;
+    int64_t result;
+    enum kernel_task_status status = kernel_task_files_borrow(caller, &files);
+    if (status == KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE)
+        result = -KERNEL_EBADF;
+    else if (status != KERNEL_TASK_STATUS_OK ||
+        kernel_files_sync_file_range(files, (int32_t)request->arguments[0],
+            (int64_t)request->arguments[1], (int64_t)request->arguments[2],
+            (unsigned)request->arguments[3], &result))
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = result;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
 enum kernel_syscall_status syscall_handle_sync(
     struct kernel_task *caller, const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded, int filesystem_only)
