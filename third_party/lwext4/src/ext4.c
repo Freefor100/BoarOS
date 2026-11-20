@@ -7249,8 +7249,8 @@ const ext4_direntry *ext4_dir_entry_next(ext4_dir *dir)
     return &dir->de;
 }
 
-int ext4_dir_iterate(ext4_file *file, uint64_t *position,
-    ext4_dir_emit_fn emit, void *context, bool *atime_current)
+static int dir_iterate(ext4_file *file, uint64_t *position,
+    ext4_dir_emit_fn emit, void *context, bool *atime_current, bool scan)
 {
     struct ext4_inode_ref dir_inode;
     struct ext4_dir_iter it = {0};
@@ -7287,7 +7287,9 @@ int ext4_dir_iterate(ext4_file *file, uint64_t *position,
         *position = UINT64_MAX;
         goto Finish;
     }
-    result = ext4_dir_iterator_init(&it, &dir_inode, *position);
+    result=scan && !ext4_current_operation(dir_inode.fs) ?
+        ext4_dir_iterator_init_scan(&it,&dir_inode,*position) :
+        ext4_dir_iterator_init(&it,&dir_inode,*position);
     while (result == EOK && it.curr) {
         uint64_t offset = it.curr_off;
         uint64_t next = it.next_off;
@@ -7321,6 +7323,10 @@ Finish:
     return result;
 }
 
+int ext4_dir_iterate(ext4_file *file,uint64_t *position,
+    ext4_dir_emit_fn emit,void *context,bool *atime_current)
+{ return dir_iterate(file,position,emit,context,atime_current,true); }
+
 struct ext4_dir_one {
     ext4_direntry *entry;
     uint64_t *offset;
@@ -7344,7 +7350,7 @@ int ext4_dir_entry_next_status(ext4_dir *dir, ext4_direntry *entry,
     memset(entry, 0, sizeof(*entry));
     *entry_offset = UINT64_MAX;
     struct ext4_dir_one one = {entry, entry_offset};
-    return ext4_dir_iterate(&dir->f, &dir->next_off, ext4_dir_emit_one, &one, NULL);
+    return dir_iterate(&dir->f,&dir->next_off,ext4_dir_emit_one,&one,NULL,false);
 }
 
 void ext4_dir_entry_rewind(ext4_dir *dir)

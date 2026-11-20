@@ -305,8 +305,40 @@ static int ext4_block_wait_loaded(struct ext4_blockdev *bdev, struct ext4_buf *b
         bdev->bdif->wait_read(buf);
     }
 }
-int ext4_block_get_range(struct ext4_blockdev *bdev, struct ext4_block *b,
-    uint64_t lba, uint32_t offset, uint32_t length, enum ext4_block_access access)
+static __attribute__((noinline)) int block_load_read_next(struct ext4_blockdev *bdev,
+    struct ext4_block *demand)
+{
+    uint64_t lba=demand->lb_id, next=lba+1;
+    uint32_t size=bdev->lg_bsize;
+    if (!bdev->bdif->bread_batch || next>=bdev->lg_bcnt ||
+        next>(UINT64_MAX-bdev->part_offset)/size)
+        return ext4_blocks_get_direct(bdev,demand->data,lba,1);
+
+    struct ext4_block neighbor={.lb_id=next};
+    enum ext4_bcache_read_state read;
+    /* The optional block skips cache trimming and never waits on another
+     * loader here. A later demand owns those decisions. */
+    if (!ext4_bcache_alloc(bdev->bc,&neighbor,&read)) {
+        if (read==EXT4_BCACHE_READ_LOAD) {
+            uint64_t offset=bdev->part_offset+lba*size;
+            struct block_read_span spans[2]={
+                {offset,demand->data,size,0,EIO},
+                {offset+size,neighbor.data,size,0,EIO},
+            };
+            ext4_blockdev_read_batch(bdev,spans,2,NULL);
+            ext4_block_loaded(bdev,neighbor.buf,spans[1].status);
+            ext4_bcache_free_read(bdev->bc,&neighbor);
+            if (!spans[0].status) return EOK;
+            /* A device may merge both spans into one request. Retry the
+             * demanded block alone if the combined request failed. */
+        } else ext4_bcache_free_read(bdev->bc,&neighbor);
+    }
+    return ext4_blocks_get_direct(bdev,demand->data,lba,1);
+}
+
+static inline int block_get_range(struct ext4_blockdev *bdev, struct ext4_block *b,
+    uint64_t lba, uint32_t offset, uint32_t length, enum ext4_block_access access,
+    bool read_next)
 {
     if (offset > bdev->lg_bsize || !length || length > bdev->lg_bsize - offset) return EINVAL;
     enum ext4_bcache_read_state read;
@@ -315,7 +347,8 @@ int ext4_block_get_range(struct ext4_blockdev *bdev, struct ext4_block *b,
     if (r) return r;
     if (private) return EOK;
     if (read==EXT4_BCACHE_READ_LOAD) {
-        r=ext4_blocks_get_direct(bdev,b->data,lba,1);
+        r=read_next ? block_load_read_next(bdev,b) :
+            ext4_blocks_get_direct(bdev,b->data,lba,1);
         ext4_block_loaded(bdev,b->buf,r);
     } else if (read==EXT4_BCACHE_READ_WAIT) r=ext4_block_wait_loaded(bdev,b->buf);
     if (r) {
@@ -332,8 +365,15 @@ int ext4_block_get_range(struct ext4_blockdev *bdev, struct ext4_block *b,
     ext4_block_payload_write(b->payload);
     return EOK;
 }
+int ext4_block_get_range(struct ext4_blockdev *bdev, struct ext4_block *b,
+    uint64_t lba, uint32_t offset, uint32_t length, enum ext4_block_access access)
+{ return block_get_range(bdev,b,lba,offset,length,access,false); }
+
 int ext4_block_get(struct ext4_blockdev *bdev, struct ext4_block *b, uint64_t lba)
 { return ext4_block_get_range(bdev,b,lba,0,bdev->lg_bsize,EXT4_BLOCK_READ); }
+
+int ext4_block_get_read_next(struct ext4_blockdev *bdev,struct ext4_block *b,uint64_t lba)
+{ return block_get_range(bdev,b,lba,0,bdev->lg_bsize,EXT4_BLOCK_READ,true); }
 
 static void ext4_bread_completed(void *context, unsigned index, const struct block_read_span *span)
 {

@@ -244,6 +244,10 @@ int ext4_block_get_noread(struct ext4_blockdev *bdev, struct ext4_block *b,
  * @return  standard error code*/
 int ext4_block_get(struct ext4_blockdev *bdev, struct ext4_block *b,
 		   uint64_t lba);
+/* On a demand miss, try reading the known contiguous successor too.
+ * Only the demanded block is returned to the caller. */
+int ext4_block_get_read_next(struct ext4_blockdev *, struct ext4_block *,
+                             uint64_t lba);
 enum ext4_block_access {
     EXT4_BLOCK_READ,
     EXT4_BLOCK_WRITE,

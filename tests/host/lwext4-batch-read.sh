@@ -19,7 +19,14 @@ for blocksize in 1024 4096 8192; do
     for extent in extent '^extent'; do
         truncate -s 128M "$work/root.img"
         mkfs.ext4 -q -F -b "$blocksize" -O "$extent,^64bit" "$work/root.img"
-        debugfs -w -R "write $work/data /data" "$work/root.img" >/dev/null 2>&1
+        python3 - "$work/data" >"$work/commands" <<'PY'
+import sys
+print(f"write {sys.argv[1]} /data")
+print("mkdir /listed")
+for index in range(120):
+    print(f"write /dev/null /listed/n{index:03d}{'x' * 196}")
+PY
+        debugfs -w -f "$work/commands" "$work/root.img" >/dev/null 2>&1
         timeout 30 "$work/probe" "$work/root.img"
     done
 done

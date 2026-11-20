@@ -59,6 +59,7 @@ struct ext4_dir_iter {
 	struct ext4_block curr_blk;
 	uint64_t curr_off, next_off, size;
 	uint32_t block_size;
+	bool read_next;
 	struct ext4_dir_en *curr;
 };
 
@@ -201,6 +202,8 @@ int ext4_dir_check_empty(struct ext4_inode_ref *dir, bool *empty);
  */
 int ext4_dir_iterator_init(struct ext4_dir_iter *it,
 			   struct ext4_inode_ref *inode_ref, uint64_t pos);
+int ext4_dir_iterator_init_scan(struct ext4_dir_iter *it,
+                               struct ext4_inode_ref *inode_ref,uint64_t pos);
 
 /**@brief Jump to the next valid entry
  * @param it Initialized iterator
