@@ -40,7 +40,7 @@ RV 的 vDSO 是用户态共享 ELF，链接时还需要 `riscv64-linux-gnu-ld` �
 
 ### 3.1 交叉编译器
 
-先安装交叉 GCC 和 binutils，并将它们加入 `PATH`。已验证的交叉 GCC 为 15.1.0。默认前缀为 `loongarch64-unknown-linux-gnu-`，可在编译时覆盖：
+先安装交叉 GCC 和 binutils，并将它们加入 `PATH`。Makefile 优先选择 `loongarch64-unknown-linux-gnu-`，也识别 `loongarch64-linux-gnu-`。内核使用整数调用约定，构建探测编译器能否禁用两种向量扩展。较早的 GCC 通过关闭自动向量化编译。已有工具链也可显式指定前缀。
 
 ```sh
 make kernel-la LA_CROSS_COMPILE=loongarch64-unknown-linux-gnu-
@@ -60,7 +60,7 @@ make kernel-la LA_CROSS_COMPILE=loongarch64-unknown-linux-gnu-
 
 ## 🔍 4. 启动与调试
 
-交互启动使用 `make shell-riscv INIT_CONFIG=config/init.json` 或 `make shell-loongarch INIT_CONFIG=config/init.json`。根盘制作需要 curl 和 e2fsprogs，首次启动方法见 [README](../README.md) 的快速上手一节。
+交互命令和根盘制作方法见 [main 分支的 README](https://github.com/Freefor100/BoarOS/tree/main)。在兼容分支交互启动时，为 `make shell-riscv` 或 `make shell-loongarch` 额外指定 `INIT_CONFIG=config/init.json`。
 
 `make run-riscv` 和 `make run-loongarch` 启动本地评测环境，`make debug-riscv` 启动同一环境并等待调试器连接。使用方法见[评测环境适配](modules/oscomp-compat.md)。
 

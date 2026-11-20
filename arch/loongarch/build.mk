@@ -41,7 +41,17 @@ KERNEL_LA ?= kernel-la
 LA_CPU_CAPACITY := 1
 endif
 LA_CC := $(LA_CROSS_COMPILE)gcc
-LA_FLAGS ?= -march=loongarch64 -mabi=lp64s -msoft-float -mno-lsx -mno-lasx -mcmodel=normal
+# Keep compiler-generated kernel code integer-only with both toolchains.
+# Older GCC has no LSX/LASX switches, so disable auto-vectorization there.
+LA_INTEGER_FLAGS := -march=loongarch64 -mabi=lp64s -msoft-float
+LA_VECTOR_FLAGS := $(shell \
+	if printf '%s\n' 'int probe;' | $(LA_CC) $(LA_INTEGER_FLAGS) \
+		-mno-lsx -mno-lasx -x c -c -o /dev/null - >/dev/null 2>&1; then \
+		printf '%s' '-mno-lsx -mno-lasx'; \
+	else \
+		printf '%s' '-fno-tree-vectorize -fno-tree-slp-vectorize'; \
+	fi)
+LA_FLAGS := $(LA_INTEGER_FLAGS) $(LA_VECTOR_FLAGS) -mcmodel=normal
 LA_CPPFLAGS := -DBOAROS_LOCK_DEBUG=$(LOCK_DEBUG) -Iinclude -DBOAROS_ARCH_LOONGARCH=1 -DBOAROS_MAX_CPUS=$(LA_CPU_CAPACITY) -DBOAROS_USER_SMP=$(LA_SMP) -DBOAROS_LA_SMP_TEST=$(LA_SMP_TEST) -DBOAROS_PAGE_SHIFT=14 -DBOAROS_COST_DIAGNOSTICS=$(COST_DIAGNOSTICS) -DBOAROS_UTS_MACHINE=\"loongarch64\"
 LA_CFLAGS := $(LA_FLAGS) -std=gnu11 -O2 -g3 -gdwarf-4 -gstrict-dwarf -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie -ffunction-sections -fdata-sections -Wall -Wextra -Werror -fstack-usage -MMD -MP
 LA_C_SOURCES := $(COMMON_C_SOURCES) \

@@ -1,18 +1,13 @@
 .DEFAULT_GOAL := all
 
 CROSS_COMPILE ?= $(shell \
-	if test -x /usr/bin/riscv64-unknown-elf-gcc; then \
-		printf '%s' /usr/bin/riscv64-unknown-elf-; \
-	elif command -v riscv64-unknown-elf-gcc >/dev/null 2>&1; then \
+	if command -v riscv64-unknown-elf-gcc >/dev/null 2>&1; then \
 		printf '%s' riscv64-unknown-elf-; \
 	elif command -v riscv64-elf-gcc >/dev/null 2>&1; then \
 		printf '%s' riscv64-elf-; \
 	else \
 		printf '%s' riscv64-unknown-elf-; \
 	fi)
-
-# 官方 GCC13 以 soft-float 和禁自动向量化生成整数内核，支持原 Harness 默认 make。
-LA_FLAGS ?= -march=loongarch64 -mabi=lp64s -msoft-float -mcmodel=normal -fno-tree-vectorize -fno-tree-slp-vectorize
 
 CC := $(CROSS_COMPILE)gcc
 NM := $(CROSS_COMPILE)nm
