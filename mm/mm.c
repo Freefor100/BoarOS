@@ -6075,14 +6075,24 @@ static enum kernel_mm_status cached_write_fault(struct mm_operation *operation,
     /* Commit this generation before releasing the inode: a later truncate
      * and regrowth must not be accepted by this old fault's delayed finish. */
     kernel_page_cache_accept_mapping_write(node,&reservation);
+#if defined(BOAROS_ARCH_LOONGARCH)
     struct kernel_mm_retirement batch={0}; uint32_t targets;
+#endif
     {
         KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
         if (arch_mmu_user_protect_owned_page(&record->space,address,
             backend_permissions_from_mm(vma->permissions))) __builtin_trap();
+#if defined(BOAROS_ARCH_LOONGARCH)
         targets=note_tlb_change_locked(record, &batch, 0);
+#endif
     }
+#if defined(BOAROS_ARCH_LOONGARCH)
     finish_tlb_change(record,&batch,targets,address,BOAROS_PAGE_SIZE,0);
+#else
+    /* The physical page is unchanged and write permission only increases.
+     * A hart retaining a read-only entry fences locally if its store faults. */
+    sync_tlb_change(0,address,BOAROS_PAGE_SIZE,0);
+#endif
     kernel_page_cache_write_end(&permit);
     status=KERNEL_MM_STATUS_OK;
 finish:
@@ -6284,6 +6294,12 @@ static __attribute__((noinline)) enum kernel_mm_status mapped_file_fault(struct 
         status = fault_lookup_leaf(record,address,force,&leaf,&missing);
         if (status == KERNEL_MM_STATUS_OK && shared && disk && access==KERNEL_MM_WRITE) {
             kernel_raw_lock_release(&guard);
+#if !defined(BOAROS_ARCH_LOONGARCH)
+            if ((leaf.permissions & KERNEL_MM_WRITE) && !force && !operation->populate && !operation->fault_pin) {
+                arch_mmu_flush_address(address);
+                goto finish;
+            }
+#endif
             status=cached_write_fault(operation,file,vma,address,generation,&inode);
             goto finish;
         }

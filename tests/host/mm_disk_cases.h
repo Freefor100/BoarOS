@@ -10,6 +10,13 @@ void mm_test_bind(struct kernel_mm *);
 #include <ext4.h>
 static _Thread_local unsigned *disk_raw_observe;
 static _Thread_local unsigned disk_forbid_backing_scans;
+static _Thread_local unsigned *disk_sync_count;
+void __real_riscv_smp_sync_user(uint32_t,uint64_t,uint64_t,int);
+void __wrap_riscv_smp_sync_user(uint32_t targets,uint64_t address,uint64_t size,int instructions)
+{
+    if (disk_sync_count) (*disk_sync_count)++;
+    __real_riscv_smp_sync_user(targets,address,size,instructions);
+}
 enum kernel_vma_status __real_kernel_vma_set_backing_in_use(const struct kernel_vma_set *,const void *,int *);
 enum kernel_vma_status __wrap_kernel_vma_set_backing_in_use(const struct kernel_vma_set *set,const void *backing,int *used)
 {
@@ -180,6 +187,11 @@ static void disk_mm_case(struct kernel_page_cache *cache,struct kernel_heap *hea
     printf("resident anonymous copy beside shared disk mapping: locks=%u\n",locks);
 
     assert(!kernel_copy_to_user(&parent,shared,&byte,1,&done) && done==1);
+    unsigned sync_count=0;
+    disk_sync_count=&sync_count;
+    assert(!kernel_mm_resolve_user_fault(&parent,shared,KERNEL_MM_WRITE));
+    disk_sync_count=NULL;
+    assert(!sync_count && "a processor with a stale read-only translation only refreshes its local entry");
     assert(!kernel_mm_context(&child,&mm_test_context)); mm_test_bind(&child);
     byte=0; assert(!kernel_copy_from_user(&child,&byte,shared,1,&done) && done==1 && byte==0x5a);
     struct kernel_mm_mapping p,c;
