@@ -219,7 +219,10 @@ static uint64_t delalloc_range(struct ext4_delalloc *da,uint64_t first,uint64_t 
         }
         chunk=next;
     }
-    if (clear) { if (count>da->blocks)__builtin_trap();da->blocks-=count; }
+    if (clear) {
+        if (count>__atomic_load_n(&da->blocks,__ATOMIC_RELAXED)) __builtin_trap();
+        __atomic_fetch_sub(&da->blocks,count,__ATOMIC_RELAXED);
+    }
     return count;
 }
 static uint64_t delalloc_spans(struct ext4_delalloc *da,
@@ -4452,7 +4455,7 @@ int ext4_file_reserve_write(ext4_file *file,uint64_t offset,size_t length,size_t
                 chunk->borrowers++;
                 *change=(struct file_write_reservation){.owner=chunk,.mask=mask};
                 if (change!=ticket) {change->next=ticket->next;ticket->next=change;}
-                file->delalloc->blocks+=charged;
+                __atomic_fetch_add(&file->delalloc->blocks,charged,__ATOMIC_RELAXED);
             }
             ext4_free(candidate);
             if (!range.count) {
@@ -4505,7 +4508,7 @@ void ext4_file_finish_reservation(ext4_file *file,struct file_write_reservation 
             uint64_t unused=chunk->mask&~chunk->accepted;
             unsigned count=delalloc_count(unused);
             chunk->mask&=~unused;
-            file->delalloc->blocks-=count;
+            __atomic_fetch_sub(&file->delalloc->blocks,count,__ATOMIC_RELAXED);
             if (count) {
                 EXT4_SPACE_SCOPE(space,fs);
                 if (count>fs->delayed_blocks) __builtin_trap();
@@ -5508,7 +5511,7 @@ Retry:
         EXT4_STATE_SCOPE(state,fs);
         /* 在同一次预留遍历中清除即将修改的映射知识；abort 后重新查询。 */
         uint64_t credit=delalloc_spans(file->delalloc,spans,count,block_size,false);
-        if (file->delalloc->blocks) {
+        if (__atomic_load_n(&file->delalloc->blocks,__ATOMIC_RELAXED)) {
             /* Adapter writeback commits its own operation before returning spans. */
             if (!outer)__builtin_trap();
             struct ext4_operation *operation=ext4_current_operation(fs);

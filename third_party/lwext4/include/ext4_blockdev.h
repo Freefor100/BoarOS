@@ -244,10 +244,11 @@ int ext4_block_get_noread(struct ext4_blockdev *bdev, struct ext4_block *b,
  * @return  standard error code*/
 int ext4_block_get(struct ext4_blockdev *bdev, struct ext4_block *b,
 		   uint64_t lba);
-/* On a demand miss, try reading the known contiguous successor too.
+/* The caller supplies a bounded, physically contiguous mapping run.
  * Only the demanded block is returned to the caller. */
-int ext4_block_get_read_next(struct ext4_blockdev *, struct ext4_block *,
-                             uint64_t lba);
+#define EXT4_BLOCK_READ_AHEAD_MAX 4U
+int ext4_block_get_read_ahead(struct ext4_blockdev *, struct ext4_block *,
+			     uint64_t lba, unsigned count);
 enum ext4_block_access {
     EXT4_BLOCK_READ,
     EXT4_BLOCK_WRITE,

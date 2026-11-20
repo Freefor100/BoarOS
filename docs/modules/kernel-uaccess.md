@@ -33,11 +33,11 @@ enum kernel_uaccess_status kernel_copy_string_from_user(
 
 ## 范围、权限与部分复制
 
-RISC-V 直接复制路径向用户空间写入时，每轮先读齐四个内核机器字，再连续写入用户地址，减少源和目标地址转换交替竞争。每条用户存储指令各有异常恢复点，恢复时按已经完成的存储报告前缀。
+RISC-V 直接复制路径对齐后每轮复制 32 字节。向用户空间写入时，先读齐本轮的四个内核机器字，再连续写入用户地址，减少源和目标地址转换交替竞争。两个地址在机器字内的偏移不同时，先对齐目标地址，再用请求范围内读取的对齐内核机器字组装输出。首尾不足一字的部分逐字节处理。每条用户存储指令各有异常恢复点，恢复时按已经完成的存储报告前缀。从用户空间读取时，偏移不同的请求按字节处理，避免为了组装一个机器字提前访问后续不可读页面。
 
 非零固定长度请求首先验证整个半开区间位于构建期架构用户范围 `[0, ARCH_MMU_USER_LIMIT)`（RV 为 2^38，LA 为 2^47）；整数溢出或越过上限在复制前返回 `KERNEL_UACCESS_STATUS_FAULT`，`bytes_copied=0`。零长度请求不检查用户地址或内核 buffer，直接成功并报告 0。
 
-合法范围按构建期基页边界切分（RV 4 KiB、LA 16 KiB）。每个片段先经 `kernel_mm_pin_user_page()` 查询物理地址、验证通用权限并取得实际物理页引用；若 PTE 尚未驻留或需要 COW，uaccess 用实际读/写方向调用 `kernel_mm_resolve_user_fault()`，成功后重新 pin。anonymous `DEMAND_ZERO`、file-private 和 COW 页都复用该解析器。写入用户空间要求 `USER|WRITE`，读取用户空间要求 `USER|READ`，随后通过物理页分配器已绑定的 direct-map 访问函数复制。VMA 外、`PROT_NONE`、权限不足、文件整页越过 EOF 或缺页解析得到 `NO_MEMORY` 时返回 `FAULT`；MM 状态、页表结构、设备故障或已映射物理页无法解析返回 `STATE`，不能把真正的内核对象损坏伪装成普通用户 `EFAULT`。
+不能直接访问目标地址空间时，合法范围按构建期基页边界切分（RV 4 KiB、LA 16 KiB）。每个片段先经 `kernel_mm_pin_user_page()` 查询物理地址、验证通用权限并取得实际物理页引用；若 PTE 尚未驻留或需要 COW，uaccess 用实际读/写方向调用 `kernel_mm_resolve_user_fault()`，成功后重新 pin。RISC-V 在本核已启用调用者地址空间时直接复制，遇到页故障由 `local_copy()` 返回公共解析器，再从完成前缀之后重试。anonymous `DEMAND_ZERO`、file-private 和 COW 页都复用该解析器。写入用户空间要求 `USER|WRITE`，读取用户空间要求 `USER|READ`。VMA 外、`PROT_NONE`、权限不足、文件整页越过 EOF 或缺页解析得到 `NO_MEMORY` 时返回 `FAULT`；MM 状态、页表结构、设备故障或已映射物理页无法解析返回 `STATE`，不能把真正的内核对象损坏伪装成普通用户 `EFAULT`。
 
 固定长度复制不是事务。若前面的完整片段已经复制，后续页未映射或权限不足，函数保留已复制的连续前缀并精确报告 `bytes_copied`；这与 Linux usercopy 允许部分修改目标缓冲区的内部语义一致。文件 `read` 依据这个前缀提交 open-file offset；普通文件 `write/writev` 把可读前缀提交给 backend，只按 backend 实际写入量推进 offset，并在用户 fault 后结束整个请求；`uname` 和文件层只把 `FAULT` 转成用户可见的 `-EFAULT`，内核状态错误仍由 syscall/Trap 边界判为 fatal。
 

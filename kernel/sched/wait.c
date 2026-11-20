@@ -125,7 +125,8 @@ static struct kernel_task *deadline_remove_node(struct kernel_task *root,
     return deadline_balance(next);
 }
 
-void deadline_index_insert(struct kernel_task *task)
+/* Return whether CPU0 needs to reprogram its wait timer. */
+int deadline_index_insert(struct kernel_task *task)
 {
     if (task == 0 || task->wait.deadline == 0U ||
         task->deadline_indexed) __builtin_trap();
@@ -136,8 +137,15 @@ void deadline_index_insert(struct kernel_task *task)
     scheduler.deadline_root =
         deadline_insert_node(scheduler.deadline_root, task);
 #if BOAROS_USER_SMP
-    if (!scheduler.wait_deadline || task->wait.deadline<scheduler.wait_deadline)
+    if (!scheduler.wait_deadline || task->wait.deadline<scheduler.wait_deadline) {
         __atomic_store_n(&scheduler.wait_deadline,task->wait.deadline,__ATOMIC_RELEASE);
+        return 1;
+    }
+    return 0;
+#elif BOAROS_MAX_CPUS > 1
+    return deadline_index_first()==task;
+#else
+    return 0;
 #endif
 }
 
@@ -267,10 +275,14 @@ void kernel_wait_backend_commit(struct kernel_task *task, uint64_t deadline, int
 #endif
     if (task->wait.deadline != deadline || task->wait.interruptible != (uint32_t)interruptible) __builtin_trap();
     if (deadline) {
-        deadline_index_insert(task);
+        int advanced=deadline_index_insert(task);
 #if BOAROS_MAX_CPUS > 1
-        if (kernel_cpu_current()->logical_id)
+        /* An already-armed earlier deadline will process this waiter too.
+         * Only the first insertion or a strictly earlier one needs an IPI. */
+        if (advanced && kernel_cpu_current()->logical_id)
             kernel_cpu_notify(arch_smp_cpu(0), ARCH_IPI_DEADLINE);
+#else
+        (void)advanced;
 #endif
     }
     publish_blocked(task);

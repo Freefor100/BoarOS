@@ -49,6 +49,27 @@ static void nonjournal_staging_failure(struct lwext4_mount_adapter *adapter,stru
     puts("PASS nonjournal staging ENOMEM preserves actual changed prefix and invalidates cached attributes");
 }
 
+static void check_cached_attributes(struct kernel_vfs_path *root, struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_stat before, after;
+    assert(!kernel_vfs_fstat(file,&before));
+    struct kernel_vfs_node *node=file->private_data;
+    write_sequence_lock=&node->io_lock;
+    write_sequence_queries=0;
+    assert(!kernel_vfs_fstat(file,&after) && !write_sequence_queries);
+    assert(after.ino==before.ino && after.mode==before.mode &&
+        after.size==before.size && after.blocks==before.blocks);
+
+    struct kernel_vfs_file opened={0};
+    const struct kernel_vfs_open_request request={
+        .flags=KERNEL_VFS_OPEN_FOLLOW,.access=KERNEL_VFS_MAY_READ};
+    assert(!kernel_vfs_open_at(root,root,"timestamp",&request,&opened,NULL));
+    assert(opened.private_data==node && write_sequence_queries==1);
+    write_sequence_lock=NULL;
+    assert(!kernel_vfs_close(&opened));
+    puts("PASS cached stat skips the inode data lock and open reuses its single write qualification");
+}
+
 static struct ext4_timestamp timestamp_now;
 static unsigned timestamp_sampling, timestamp_continue;
 static _Thread_local unsigned timestamp_pause;
@@ -226,6 +247,7 @@ int main(int argc, char **argv)
     if (argc == 3) assert(!kernel_vfs_open_at(root, root, "timestamp", &request, &file, NULL));
     else assert(!kernel_vfs_create_at(root, root, "timestamp", 0600, &file,0));
     if (argc==3) nonjournal_staging_failure(adapter,&file);
+    check_cached_attributes(root,&file);
     uint64_t observed_error = kernel_vfs_error_sequence(&file);
     const struct kernel_vfs_timespec explicit[2] = {{2000000100, 20}, {1999999900, 30}};
     assert(!kernel_vfs_file_set_times(&file, explicit));

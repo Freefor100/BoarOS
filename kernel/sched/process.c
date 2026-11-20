@@ -2974,6 +2974,14 @@ static enum kernel_task_status task_tgid_locked(
     return KERNEL_TASK_STATUS_OK;
 }
 
+static inline const struct kernel_task *running_group_leader(const struct kernel_task *task)
+{
+    const struct kernel_task *leader=task->group_leader;
+    return task->magic==KERNEL_THREAD_MAGIC && task->tid_owned && leader &&
+        leader->magic==KERNEL_THREAD_MAGIC && leader->tid_owned && leader->tid>0 ?
+        leader : NULL;
+}
+
 enum kernel_task_status kernel_task_tgid(const struct kernel_task *task, kernel_pid_t *tgid)
 {
     if (!task || !tgid) return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
@@ -2981,10 +2989,8 @@ enum kernel_task_status kernel_task_tgid(const struct kernel_task *task, kernel_
      * exec 必须等本线程停止后才能转移它；读取自身 TGID 不需全局锁。
      * 远端查询仍在调度域取得一致快照。 */
     if (task==arch_current_thread_get() && task->arch.user_mode) {
-        const struct kernel_task *leader=task->group_leader;
-        if (task->magic!=KERNEL_THREAD_MAGIC || !task->tid_owned || !leader ||
-            leader->magic!=KERNEL_THREAD_MAGIC || !leader->tid_owned || leader->tid<=0)
-            return KERNEL_TASK_STATUS_STATE;
+        const struct kernel_task *leader=running_group_leader(task);
+        if (!leader) return KERNEL_TASK_STATUS_STATE;
         *tgid=leader->tid;
         return KERNEL_TASK_STATUS_OK;
     }
@@ -3011,10 +3017,15 @@ enum kernel_task_status kernel_task_user_tgid(const struct kernel_task *task, ke
 {
     if (!task || !tgid) return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
     if (task == arch_current_thread_get() && task->arch.user_mode) {
-        enum kernel_task_status status = kernel_task_tgid(task, tgid);
-        if (status != KERNEL_TASK_STATUS_OK) return status;
-        *tgid = kernel_pid_number_in(process_identity(task, KERNEL_PID_TGID), process_pid_active(task));
-        return KERNEL_TASK_STATUS_OK;
+        const struct kernel_task *leader=running_group_leader(task);
+        if (!leader) return KERNEL_TASK_STATUS_STATE;
+        /* A running member pins the group identity, including an exited
+         * leader. Thread creation keeps TID and TGID in the same active
+         * namespace. setns only changes the namespace for future children. */
+        const struct kernel_pid *group=leader->identities[KERNEL_PID_TGID].identity;
+        if (!group) return KERNEL_TASK_STATUS_STATE;
+        *tgid=group->number;
+        return *tgid>0 ? KERNEL_TASK_STATUS_OK : KERNEL_TASK_STATUS_STATE;
     }
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     enum kernel_task_status status = task_tgid_locked(task, tgid);

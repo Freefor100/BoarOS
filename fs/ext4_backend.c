@@ -389,6 +389,17 @@ static int time_compare(struct ext4_timestamp a, struct ext4_timestamp b)
     return (a.nanoseconds > b.nanoseconds) - (a.nanoseconds < b.nanoseconds);
 }
 
+static void publish_relatime_due(struct lwext4_node *node)
+{
+    struct ext4_timestamp atime=node->times[0];
+    int modified=time_compare(node->times[1],atime)>=0 ||
+                 time_compare(node->times[2],atime)>=0;
+    /* The ext4 timestamp range leaves room for the 24-hour threshold.
+     * INT64_MIN means that mtime or ctime already makes the update due. */
+    __atomic_store_n(&node->relatime_due,modified ? INT64_MIN : atime.seconds+86400,
+                     __ATOMIC_RELEASE);
+}
+
 static struct ext4_timestamp normalize_time(struct lwext4_node *node,
                                             unsigned field, struct ext4_timestamp time)
 {
@@ -437,13 +448,16 @@ static int time_dirty_locked(struct lwext4_node *node, unsigned fields,
 {
     struct lwext4_mount_adapter *adapter = lwext4_instance(node->node.instance);
     int notify = 0;
+    unsigned changed=0;
     for (unsigned i = 0; i < 3; i++) if (fields & (1U << i)) {
         struct ext4_timestamp value = normalize_time(node, i, now);
         if (!time_compare(node->times[i], value)) continue;
         node->times[i] = value;
+        changed=1;
         if (!++node->time_version[i]) __builtin_trap();
         node->dirty_fields |= 1U << i;
     }
+    if (changed) publish_relatime_due(node);
     if (node->dirty_fields && !node->dirty_previous) {
         if (kernel_vfs_node_acquire(&node->node)) __builtin_trap();
         time_append_dirty(node);
@@ -555,13 +569,16 @@ static void time_finish(void *context, void *staged_inodes, bool accepted)
             /* Invalidate even after abort: nonjournal failures may have an
              * accepted prefix. No candidate attributes are ever published. */
             if (!++node->metadata_epoch) __builtin_trap();
+            unsigned changed=0;
             for (unsigned i = 0; i < 3; i++) {
                 if (!accepted || !(record->fields & (1U << i)) ||
                     record->versions[i] != node->time_version[i]) continue;
                 node->times[i] = record->values[i];
+                changed=1;
                 if (!++node->time_version[i]) __builtin_trap();
                 node->dirty_fields &= ~(1U << i);
             }
+            if (changed) publish_relatime_due(node);
             dirty_pin = time_drop_dirty(node);
         }
         if (record->journal) jbd_journal_free(record);
@@ -670,6 +687,7 @@ static void initialize_times(struct kernel_vfs_node *base,
         struct kernel_vfs_timespec value = decode_inode_time(seconds[i], extra[i], extended);
         node->times[i] = (struct ext4_timestamp){value.seconds, value.nanoseconds};
     }
+    publish_relatime_due(node);
 }
 
 
@@ -1933,6 +1951,7 @@ static int ext4_backend_set_flags(struct kernel_vfs_node *node,uint32_t flags)
         {
             TIMESTAMP_SCOPE(times,lwext4_instance(node->instance));
             owner->times[2]=ctime;
+            publish_relatime_due(owner);
             if (!++owner->time_version[2]) __builtin_trap();
             owner->dirty_fields&=~EXT4_TIME_CTIME;
             pin=time_drop_dirty(owner);
@@ -2318,9 +2337,8 @@ static int ext4_backend_tmpfile(struct kernel_vfs_mount *mount, uint64_t parent,
 
 static int time_access_needed(const struct lwext4_node *node, struct ext4_timestamp now,unsigned policy)
 {
-    return (policy&VFS_ATIME_STRICT) || time_compare(node->times[1], node->times[0]) >= 0 ||
-        time_compare(node->times[2], node->times[0]) >= 0 ||
-        now.seconds - node->times[0].seconds >= 86400;
+    return (policy&VFS_ATIME_STRICT) ||
+        now.seconds>=__atomic_load_n(&node->relatime_due,__ATOMIC_RELAXED);
 }
 
 static void ext4_backend_accessed_mode(struct kernel_vfs_file *file,bool relatime_expired)
@@ -2344,18 +2362,12 @@ static void ext4_backend_accessed_mode(struct kernel_vfs_file *file,bool relatim
     }
     struct lwext4_node *node = (struct lwext4_node *)base;
     if (node->noatime) return;
-    struct ext4_timestamp now, atime;
-    int modified;
-    {
-        TIMESTAMP_SCOPE(times, adapter);
-        atime = node->times[0];
-        modified = time_compare(node->times[1], atime) >= 0 ||
-            time_compare(node->times[2], atime) >= 0;
+    struct ext4_timestamp now;
+    if (!(file->mount->atime_policy&VFS_ATIME_STRICT)) {
+        int64_t due=__atomic_load_n(&node->relatime_due,__ATOMIC_ACQUIRE);
+        if (due!=INT64_MIN && (!ext4_file_read_clock(lwext4_node_file(base),&now) ||
+            now.seconds<due)) return;
     }
-    /* 写后的relatime已由时间顺序决定；仅年龄判断需要提前采样。
-     * 快照只用于跳过更新，发布仍在remount资格内重查当前时间。 */
-    if (!(file->mount->atime_policy&VFS_ATIME_STRICT) && !modified && (!ext4_file_read_clock(lwext4_node_file(base), &now) ||
-        now.seconds - atime.seconds < 86400)) return;
     /* Suppressed relatime reads do not mutate the mount. Recheck after taking
      * remount qualification: another reader may already have published atime. */
     KERNEL_LOCK_SCOPE(mutation);
@@ -2539,11 +2551,6 @@ static int ext4_backend_stat(const struct kernel_vfs_file *file,
         return -KERNEL_EINVAL;
     }
     node = file->private_data;
-    KERNEL_LOCK_SCOPE(inode_guard);
-    /* Directory attributes come from one immutable accepted inode payload.
-     * Regular stat also snapshots live EOF, so it retains the data gate. */
-    if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR)
-        kernel_vfs_node_lock((struct kernel_vfs_node *)node,&inode_guard,0);
     if (node->instance == 0 || lwext4_instance(node->instance)->superblock == 0)
         return -KERNEL_EIO;
     struct lwext4_node *live=(struct lwext4_node *)node;
@@ -2560,7 +2567,10 @@ static int ext4_backend_stat(const struct kernel_vfs_file *file,
             if (regular) memcpy(times,live->times,sizeof(times));
         }
     }
+    KERNEL_LOCK_SCOPE(inode_guard);
     if (!cached) {
+        if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR)
+            kernel_vfs_node_lock(&live->node,&inode_guard,0);
         result=read_inode_attributes(file,stat);
         if (result) return result;
         if (!private || regular) {
@@ -2572,14 +2582,12 @@ static int ext4_backend_stat(const struct kernel_vfs_file *file,
         }
     }
     stat->dev=node->instance->device_id;
-    if ((node->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG) {
-        stat->size = node->size;
-        /* Linux reports reserved delayed data in st_blocks while its physical
-         * mappings and on-disk inode still wait for writeback. */
-        struct ext4_fs *fs=lwext4_instance(node->instance)->device.fs;
-        ext4_fs_state_read_lock(fs);
-        stat->blocks+=((struct lwext4_node *)node)->delalloc.blocks*(stat->blksize/512);
-        ext4_fs_state_unlock(fs);
+    if (regular) {
+        /* The accepted attributes and timestamps have already been copied.
+         * Like Linux getattr, live EOF and delayed blocks are separate
+         * samples. Neither requires data I/O exclusion or a tree walk. */
+        stat->size = kernel_vfs_node_size(node);
+        stat->blocks+=__atomic_load_n(&live->delalloc.blocks,__ATOMIC_RELAXED)*(stat->blksize/512);
         stat->atime = (struct kernel_vfs_timespec){times[0].seconds, times[0].nanoseconds};
         stat->mtime = (struct kernel_vfs_timespec){times[1].seconds, times[1].nanoseconds};
         stat->ctime = (struct kernel_vfs_timespec){times[2].seconds, times[2].nanoseconds};
@@ -2729,7 +2737,8 @@ static int ext4_backend_remove_resolved(struct kernel_vfs_mount *mount,
         return -KERNEL_EINVAL;
     struct lwext4_node *target = (struct lwext4_node *)node;
     bool orphan;
-    if (target->delalloc.blocks || target->write_completion) exclusive = false;
+    if (__atomic_load_n(&target->delalloc.blocks,__ATOMIC_RELAXED) || target->write_completion)
+        exclusive = false;
     int result = ext4_unlink_child_resolved(adapter->mount_point, parent, name,
         directory, node->inode, &orphan, exclusive ? retire_resolved_inode : NULL, node);
     /* VFS still owns the target through its dentry. If it or another path is

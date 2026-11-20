@@ -331,11 +331,11 @@ vfork 共享 MM；files、fs 及 disposition 分别按 CLONE_FILES、CLONE_FS �
 同类事件已经待处理时复用现有通知；接收者以原子交换取走事件后，新发布重新请求IPI。
 发送者关闭本地中断，实际IPI由当前raw保护退出或既有通知批次结束时发出，
 因此合并保留已经排队的发送者或接收者负责推进，不改变任务READY与执行者交接。
-RV与LA使用同一事件位发布原语，各自保留硬件确认及IPI发送。
+RISC-V 与 LoongArch 共用事件位发布原语，各自处理硬件确认和核间中断发送。
 
 ## 等待与 futex
 
-BLOCKED 状态由任务的等待记录维护；事件等待按实际等待队列登记和通知，不另维护全局阻塞任务链。队列 wake-one 取队首，wake-all 唤醒全部；摘除队列成员为 O(1)。deadline 使用原始 time ticks，0 表示无限；带期限任务进入以 (deadline, tid) 为键的有序索引，tick 只弹出已到期者，全部唤醒路径统一摘除索引项。`nanosleep`、`clock_nanosleep` 的墙钟等待和重启留在调用核；远端插入期限后通知 CPU0 重设定时器。
+BLOCKED 状态由任务的等待记录维护；事件等待按实际等待队列登记和通知，不另维护全局阻塞任务链。队列 wake-one 取队首，wake-all 唤醒全部；摘除队列成员为 O(1)。deadline 使用原始 time ticks，0 表示无限；带期限任务进入以 (deadline, tid) 为键的有序索引，tick 只弹出已到期者，全部唤醒路径统一摘除索引项。`nanosleep`、`clock_nanosleep` 的墙钟等待和重启留在调用核；首个期限插入或现有最早期限提前时，远端才向 0 号处理器发送核间中断（Inter-Processor Interrupt，IPI）以重设定时器。已安排的较早定时器足以处理后续期限。
 
 MM 一次准备至多两个 key 和一个用户字 pin。private key 使用不复用的 MM 身份号与四字节对齐地址，不取得映射编辑资格；WAKE 和不读字的 REQUEUE 不要求地址仍有映射。驻留 private WAIT 在桶资格内，通过 MM metadata 短读保护检查 PTE、USER/READ 权限并原子读完 32 位比较值，不把用户指针带出保护，也不登记物理页借用。冷页、撤权及关闭许可需要可睡眠处理时，先释放桶，再沿共同用户页准备处理并重试。CMP_REQUEUE、WAKE_OP及需要跨保护访问的路径继续持有真实 pin。共享 key 由 operation 资格固定整组映射，再由 metadata 检查 PTE；所有缺页和 COW 在归还部分 pin、后备引用之后处理。共享匿名与 SysV key 使用内存对象和对象内偏移，共享文件 key 使用活 VFS inode 和文件内偏移。非 private 操作按实际 PTE 检查身份解析资格：驻留纯执行叶可用于 WAKE，PROT_NONE 不可；读写命令另需相应许可。等待者的后备引用持续到等待调用结束，FD 关闭或映射撤销不提前释放它。
 

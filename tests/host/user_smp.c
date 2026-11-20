@@ -690,6 +690,28 @@ static void ordinary_local_wake(void)
     puts("PASS ordinary wakes (including timeout) and old-stack release use only the destination queue");
 }
 
+static void remote_deadline_notification(void)
+{
+    reset_two_queues();
+    active=&cpus[1];
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        const uint64_t deadlines[]={200,300,200,100};
+        struct kernel_task waiters[4]={0};
+        for (unsigned i=0;i<4;i++) {
+            waiters[i].wait.deadline=deadlines[i];
+            kernel_wait_backend_commit(&waiters[i],deadlines[i],0);
+            assert((cpus[0].events&RISCV_IPI_DEADLINE)==
+                   ((i==0 || i==3)?RISCV_IPI_DEADLINE:0));
+            cpus[0].events=0;
+        }
+        assert(scheduler.wait_deadline==100);
+        for (unsigned i=0;i<4;i++) deadline_index_remove(&waiters[i]);
+        assert(!scheduler.wait_deadline && !scheduler.deadline_root);
+    }
+    puts("PASS remote timed waits notify CPU0 only when the first deadline advances");
+}
+
 static void ordinary_wake_after_affinity_change(void)
 {
     for (unsigned after=0;after<2;after++) {
@@ -1124,12 +1146,16 @@ int main(int argc,char **argv)
         fair_affinity_during_balance();fair_parallel_handoff();return 0;
     }
     if(argc==2&&!strcmp(argv[1],"--slice-only")) {kernel_wait_domain_init();ordinary_local_slice();return 0;}
+    if (argc==2 && !strcmp(argv[1],"--deadline-only")) {
+        kernel_wait_domain_init();remote_deadline_notification();return 0;
+    }
     if (argc==2) {kernel_wait_domain_init();ordinary_local_park();return 0;}
     assert(!controlled_smp_main(0,0));
     ordinary_local_park();
     local_fifo_cases();
     ordinary_local_claim();
     ordinary_local_wake();
+    remote_deadline_notification();
     ordinary_wake_after_affinity_change();
     ordinary_pull();
     ordinary_local_slice();

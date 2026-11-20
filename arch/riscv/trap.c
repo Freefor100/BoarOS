@@ -255,8 +255,27 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
         struct kernel_task *caller = arch_current_thread_get();
         if (!caller || frame->kernel_tp != (uintptr_t)caller ||
             kernel_cpu_current()->current != caller) riscv_trap_fatal(frame);
-        if (__atomic_load_n(&caller->ptrace, __ATOMIC_ACQUIRE) &&
-            !kernel_ptrace_syscall_enter(caller, frame)) return;
+        struct kernel_ptrace_state *tracer=__atomic_load_n(&caller->ptrace,__ATOMIC_ACQUIRE);
+        if (tracer && !kernel_ptrace_syscall_enter(caller,frame)) return;
+#if BOAROS_USER_SMP
+        kernel_cpu_current()->syscall_dispatches++;
+#endif
+#if !BOAROS_COST_DIAGNOSTICS
+        /* This query has no arguments. Import the full frame whenever a
+         * tracer or filter may inspect it. The common user return still
+         * performs accounting, pending work and rescheduling. */
+        if (frame->a7==LINUX_SYSCALL_GETPID && !tracer && frame->sepc<=UINT64_MAX-4 &&
+            !__atomic_load_n(&caller->seccomp_mode,__ATOMIC_RELAXED) &&
+            !kernel_bpf_trace_active()) {
+            kernel_pid_t pid;
+            if (kernel_task_user_tgid(caller,&pid)!=KERNEL_TASK_STATUS_OK) riscv_trap_fatal(frame);
+            kernel_bpf_trace_exit(caller,LINUX_SYSCALL_GETPID,pid);
+            frame->a0=(uint64_t)pid;
+            frame->sepc+=4;
+            if (caller->ptrace) kernel_ptrace_syscall_exit(caller,frame,LINUX_SYSCALL_GETPID);
+            return;
+        }
+#endif
         struct kernel_syscall_request request = {
             .number = frame->a7,
             .user_sp = frame->sp,
@@ -271,10 +290,6 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
             },
         };
         struct kernel_syscall_result result;
-#if BOAROS_USER_SMP
-        kernel_cpu_current()->syscall_dispatches++;
-#endif
-
         if (kernel_syscall_dispatch(caller,
                                     &request,
                                     &result) !=
@@ -372,7 +387,7 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
             result.action != KERNEL_SYSCALL_ACTION_RETURN_FINAL) {
             riscv_trap_fatal(frame);
         }
-        kernel_bpf_trace_exit(kernel_task_current(),(int32_t)request.number,result.value);
+        kernel_bpf_trace_exit(caller,(int32_t)request.number,result.value);
         if (result.action != KERNEL_SYSCALL_ACTION_RETURN_FINAL && result.value == -KERNEL_ERESTARTSYS) {
             if(caller->ptrace) {
                 uint64_t argument=frame->a0;
@@ -381,7 +396,7 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
                 if((int64_t)frame->a0!=-KERNEL_ERESTARTSYS)return;
                 frame->a0=argument;frame->sepc-=4;
             }
-            kernel_signal_note_syscall_restart(kernel_task_current());
+            kernel_signal_note_syscall_restart(caller);
             return;
         }
         if (frame->sepc > UINT64_MAX - 4U) {

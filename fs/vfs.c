@@ -77,7 +77,8 @@ static int node_dac_permission(struct kernel_vfs_node *node,
     }
     return kernel_vfs_dac_permission(node->mode,node->uid,node->gid,access,cred);
 }
-static int inode_permission(struct kernel_vfs_node *node,unsigned access,int directory_guarded)
+static int inode_permission(struct kernel_vfs_node *node,unsigned access,int directory_guarded,
+    bool inode_guarded)
 {
     const struct kernel_credentials *cred=kernel_credentials_current();
     uint32_t type=node->mode & KERNEL_VFS_S_IFMT;
@@ -91,7 +92,8 @@ static int inode_permission(struct kernel_vfs_node *node,unsigned access,int dir
      * excluded by this path walk. Reuse that qualification for the DAC/ACL
      * snapshot; backend-specific dynamic permission still uses inode I/O. */
     KERNEL_LOCK_SCOPE(io);
-    if (!directory_guarded || type!=KERNEL_VFS_S_IFDIR || node->instance->ops->permission)
+    if (!inode_guarded &&
+        (!directory_guarded || type!=KERNEL_VFS_S_IFDIR || node->instance->ops->permission))
         kernel_vfs_node_lock(node,&io,0);
     return node_dac_permission(node,cred,access);
 }
@@ -102,14 +104,20 @@ int kernel_vfs_file_noappend_allowed(const struct kernel_vfs_file *file)
     return !(kernel_vfs_node_attributes(node)&KERNEL_VFS_INODE_APPEND);
 }
 
-int kernel_vfs_file_noatime_allowed(const struct kernel_vfs_file *file)
+static int file_noatime_allowed(const struct kernel_vfs_file *file,bool inode_guarded)
 {
     const struct kernel_credentials *cred=kernel_credentials_current();
     if (kernel_credentials_capable(cred,KERNEL_CAP_FOWNER)) return 1;
     struct kernel_vfs_node *node=kernel_vfs_file_node(file);
     if (!node) return 0;
-    KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(node,&io,0);
+    KERNEL_LOCK_SCOPE(io);
+    if (!inode_guarded) kernel_vfs_node_lock(node,&io,0);
     return cred->fsuid==node->uid;
+}
+
+int kernel_vfs_file_noatime_allowed(const struct kernel_vfs_file *file)
+{
+    return file_noatime_allowed(file,false);
 }
 
 int kernel_vfs_file_mincore_allowed(const struct kernel_vfs_file *file)
@@ -123,7 +131,7 @@ int kernel_vfs_file_mincore_allowed(const struct kernel_vfs_file *file)
     return !node_dac_permission(node,cred,2U);
 }
 
-int kernel_vfs_path_permission(struct kernel_vfs_path *path, unsigned access)
+static int path_permission(struct kernel_vfs_path *path,unsigned access,bool inode_guarded)
 {
     if (!path || !path->file.private_data) return -KERNEL_EINVAL;
     KERNEL_SERVICE_SCOPE_IF(service,kernel_vfs_namespace_requires_cpu0(path->file.mount));
@@ -131,7 +139,12 @@ int kernel_vfs_path_permission(struct kernel_vfs_path *path, unsigned access)
         ((path->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFREG ||
          (path->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR ||
          (path->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFLNK)) return -KERNEL_EROFS;
-    return inode_permission(path->file.private_data,access,0);
+    return inode_permission(path->file.private_data,access,0,inode_guarded);
+}
+
+int kernel_vfs_path_permission(struct kernel_vfs_path *path, unsigned access)
+{
+    return path_permission(path,access,false);
 }
 int kernel_vfs_chmod_allowed(uint32_t uid,uint32_t gid,uint32_t *mode)
 {
@@ -487,10 +500,16 @@ static int path_walk_select_mode(struct vfs_path_walk *walk,
     struct kernel_vfs_mount *mount=path->file.mount;
     struct kernel_vfs_instance *instance=mount->private_data;
     struct kernel_vfs_node *node=path->file.private_data;
+    int parallel=namespace_is_parallel(instance);
     if (walk->mount==mount && (!write || walk->mutation.lock ||
-        kernel_lock_held(&instance->reconfiguration,0)) && (!namespace_is_parallel(instance) ||
+        kernel_lock_held(&instance->reconfiguration,0)) && (!parallel ||
         (walk->directory==node && (!write || walk->guard.write)))) return 0;
-    path_walk_release(walk);
+    int keep_mount=walk->mount==mount && parallel && !write && !walk->mutation.lock;
+    if (keep_mount) {
+        kernel_lock_scope_release(&walk->guard);
+        if (walk->directory_owner) dentry_release(&walk->directory_owner);
+        walk->local_directory=NULL;
+    } else path_walk_release(walk);
     /* The dentry keeps both lock storage and the final close alive until
      * qualifications are dropped. A node pin alone would allow last close
      * under the directory guard after a concurrent rmdir. */
@@ -500,17 +519,18 @@ static int path_walk_select_mode(struct vfs_path_walk *walk,
         (walk->root && walk->root->dentry==path->dentry);
     if (!crossing && !write && use_local_directory) {
         walk->local_directory=path;
-    } else if ((namespace_is_parallel(instance) || crossing) && !anchored) {
+    } else if ((parallel || crossing) && !anchored) {
         if (dentry_acquire(path->dentry)) return -KERNEL_EOVERFLOW;
         walk->directory_owner=path->dentry;
     }
-    if (crossing) {
+    if (crossing && !keep_mount) {
         KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
         if (kernel_vfs_mount_view_acquire_locked(mount)) return -KERNEL_EOVERFLOW;
         walk->mount_owner=mount;
     }
 #if BOAROS_USER_SMP
-    if (kernel_vfs_namespace_requires_cpu0(mount)) kernel_service_scope_begin(&walk->service);
+    if (!keep_mount && kernel_vfs_namespace_requires_cpu0(mount))
+        kernel_service_scope_begin(&walk->service);
 #endif
     if (write) kernel_vfs_mutation_lock(mount,&walk->mutation);
     namespace_node_lock(node,&walk->guard,write);
@@ -2297,7 +2317,7 @@ int kernel_vfs_path_stat(const struct kernel_vfs_path *path,
 static void path_bind(struct kernel_vfs_path *, struct kernel_vfs_mount *,
     struct kernel_vfs_dentry *, int transient, bool borrow_mount);
 static int vfs_open_owned_node(struct kernel_vfs_mount *, struct kernel_vfs_node *,
-    struct kernel_vfs_file *);
+    struct kernel_vfs_file *, bool path_owns_location, bool inode_guarded);
 
 static void path_bind_component(struct vfs_path_walk *walk, struct kernel_vfs_mount *mount,
     struct kernel_vfs_dentry *entry)
@@ -2349,12 +2369,12 @@ static bool lookup_walk_child(struct vfs_path_walk *walk,struct kernel_vfs_path 
 
 static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
     const char *name,size_t name_length,struct kernel_vfs_path **owner,int search,
-    struct vfs_path_walk *walk)
+    struct vfs_path_walk *walk,bool parsed)
 {
     if (!parent || !parent->references || !name || !name_length || !owner || *owner) return -KERNEL_EINVAL;
     if (name_length>255U) return -KERNEL_ENAMETOOLONG;
     if ((parent->file.mode & KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFDIR) return -KERNEL_ENOTDIR;
-    int result=search ? inode_permission(parent->file.private_data,KERNEL_VFS_MAY_EXEC,1) : 0;
+    int result=search ? inode_permission(parent->file.private_data,KERNEL_VFS_MAY_EXEC,1,false) : 0;
     if (result) return result;
     if (name_length==1 && name[0]=='.') {
         result=kernel_vfs_path_acquire(parent);if (!result) *owner=parent;return result;
@@ -2382,7 +2402,8 @@ static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
         result=path_walk_wrap(mount,ancestor,owner,walk);dentry_release(&ancestor);return result;
     }
     if (((struct kernel_vfs_node *)parent->file.private_data)->unlinked) return -KERNEL_ENOENT;
-    for (size_t i=0;i<name_length;i++) if (name[i]=='/' || !name[i]) return -KERNEL_EINVAL;
+    if (!parsed) for (size_t i=0;i<name_length;i++)
+        if (name[i]=='/' || !name[i]) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance=mount->private_data;
     struct kernel_vfs_dentry *entry=NULL;
     if (instance->ops->owns_dentry_names) {
@@ -2468,14 +2489,14 @@ Enter:
 }
 
 static int path_lookup_locked(struct kernel_vfs_path *parent,const char *name,size_t length,struct kernel_vfs_path **owner)
-{ return path_lookup_locked_mode(parent,name,length,owner,1,NULL); }
+{ return path_lookup_locked_mode(parent,name,length,owner,1,NULL,false); }
 int kernel_vfs_path_lookup_object(struct kernel_vfs_path *parent,const char *name,size_t length,struct kernel_vfs_path **owner)
 {
     KERNEL_SERVICE_SCOPE_IF(service,parent && kernel_vfs_namespace_requires_cpu0(parent->file.mount));
     if (!parent || !parent->file.mount || !parent->file.mount->private_data) return -KERNEL_EINVAL;
     KERNEL_LOCK_SCOPE(guard);namespace_node_lock(parent->file.private_data,&guard,0);
     if (((struct kernel_vfs_instance *)parent->file.mount->private_data)->quiescing) return -KERNEL_EIO;
-    return path_lookup_locked_mode(parent,name,length,owner,0,NULL);
+    return path_lookup_locked_mode(parent,name,length,owner,0,NULL,false);
 }
 
 int kernel_vfs_path_lookup(struct kernel_vfs_path *parent,
@@ -2523,6 +2544,14 @@ static void release_walk_path(struct vfs_path_walk *walk, struct kernel_vfs_path
     } else if (kernel_vfs_path_release(owner)) __builtin_trap();
 }
 
+static inline void advance_walk_path(struct vfs_path_walk *walk,
+    struct kernel_vfs_path **current,bool *borrowed,struct kernel_vfs_path *next)
+{
+    if (!*borrowed) release_walk_path(walk,current);
+    *current=next;
+    *borrowed=false;
+}
+
 static int resolve_object(struct kernel_vfs_path *start,
                           struct kernel_vfs_path *root,
                           const char *path, size_t length, int follow_final,
@@ -2533,6 +2562,7 @@ static int resolve_object(struct kernel_vfs_path *start,
                           char missing_name[256], struct vfs_path_walk *walk)
 {
     struct kernel_vfs_path *current;
+    bool borrowed=true;
     struct kernel_vfs_path components[2]={0};
     struct kernel_vfs_instance *adapter;
     char *work = 0;
@@ -2556,12 +2586,9 @@ static int resolve_object(struct kernel_vfs_path *start,
     }
     adapter = start->file.mount->private_data;
     if (length >= KERNEL_FS_PATH_MAX) return -KERNEL_ENAMETOOLONG;
+    /* The caller holds both anchors through the walk. Acquire a separate
+     * reference only when exporting an anchor as the accepted result. */
     current = pending[0] == '/' ? root : start;
-    result = kernel_vfs_path_acquire(current);
-    if (result != 0) {
-        current = 0;
-        goto Finish;
-    }
     while (cursor<length) {
         struct kernel_vfs_path *next = 0;
         size_t begin, end, component_length;
@@ -2592,7 +2619,7 @@ static int resolve_object(struct kernel_vfs_path *start,
         }
         if (current == root && component_length == 2U &&
             pending[begin] == '.' && pending[begin + 1U] == '.') {
-            result = inode_permission(current->file.private_data,KERNEL_VFS_MAY_EXEC,1);
+            result = inode_permission(current->file.private_data,KERNEL_VFS_MAY_EXEC,1,false);
             if (!result && (walk->resolve & KERNEL_VFS_RESOLVE_BENEATH))
                 result=-KERNEL_EXDEV;
             if (!result) result = kernel_vfs_path_acquire(root);
@@ -2608,7 +2635,10 @@ static int resolve_object(struct kernel_vfs_path *start,
                 if (walk->terminal->references) __builtin_trap();
                 walk->component=walk->terminal;
             }
-            result=path_lookup_locked_mode(current,pending+begin,component_length,&next,1,walk);
+            /* The original C string has already been split at slashes.
+             * A length-delimited symlink target can contain invalid bytes. */
+            result=path_lookup_locked_mode(current,pending+begin,component_length,&next,1,walk,
+                                           pending==path);
             walk->component=NULL;
         }
         if (result == -KERNEL_ENOENT && allow_missing_final &&
@@ -2616,6 +2646,7 @@ static int resolve_object(struct kernel_vfs_path *start,
             missing_name != 0) {
             memcpy(missing_name, pending + begin, component_length);
             missing_name[component_length] = '\0';
+            if (borrowed && (result=kernel_vfs_path_acquire(current))) goto Finish;
             *owner = current;
             current = 0;
             result = 0;
@@ -2629,8 +2660,7 @@ static int resolve_object(struct kernel_vfs_path *start,
             }
             /* 挂载根及向上的跨挂载目标是目录；先在旧执行域归还旧分量，
              * 下一轮或返回前再切换保护，切换时始终持有next。 */
-            release_walk_path(walk,&current);
-            current=next;
+            advance_walk_path(walk,&current,&borrowed,next);
             continue;
         }
         if ((next->file.mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFLNK &&
@@ -2665,8 +2695,7 @@ static int resolve_object(struct kernel_vfs_path *start,
                         goto Finish;
                     }
                     (void)kernel_vfs_path_release(&next);
-                    release_walk_path(walk,&current);
-                    current = linked;
+                    advance_walk_path(walk,&current,&borrowed,linked);
                     if (!current) { result = -KERNEL_EIO; goto Finish; }
                     continue;
                 }
@@ -2720,13 +2749,8 @@ static int resolve_object(struct kernel_vfs_path *start,
                     result=-KERNEL_EXDEV;
                     goto Finish;
                 }
-                release_walk_path(walk,&current);
-                current = root;
-                result = kernel_vfs_path_acquire(current);
-                if (result != 0) {
-                    current = 0;
-                    goto Finish;
-                }
+                advance_walk_path(walk,&current,&borrowed,root);
+                borrowed=true;
             }
             cursor = 0U;
             continue;
@@ -2738,9 +2762,9 @@ static int resolve_object(struct kernel_vfs_path *start,
             (void)kernel_vfs_path_release(&next);
             goto Finish;
         }
-        release_walk_path(walk,&current);
-        current = next;
+        advance_walk_path(walk,&current,&borrowed,next);
     }
+    if (borrowed && (result=kernel_vfs_path_acquire(current))) goto Finish;
     *owner = current;
     current = 0;
 Finish:
@@ -2760,7 +2784,7 @@ Finish:
         result=scoped_path_check(walk,*owner);
         if (result && kernel_vfs_path_release(owner)) __builtin_trap();
     }
-    if (current != 0) release_walk_path(walk,&current);
+    if (current && !borrowed) release_walk_path(walk,&current);
     if (work) kernel_heap_release(adapter->heap, work);
     return result;
 }
@@ -3053,23 +3077,29 @@ int kernel_vfs_path_acquire(struct kernel_vfs_path *path)
         if (__atomic_compare_exchange_n(&path->references,&refs,refs+1,1,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) return 0;
     }
 }
-int kernel_vfs_path_release(struct kernel_vfs_path **owner)
+static int path_release(struct kernel_vfs_path **owner, bool keep_location)
 {
     if (!owner || !*owner) return -KERNEL_EINVAL;
     struct kernel_vfs_path *path=*owner;*owner=NULL;
+    if (keep_location && (path->transient || path->borrow_mount)) __builtin_trap();
     if (path->transient) {
         /* Resolver-local storage is never in the mount's weak path index. */
         if (!path->references) __builtin_trap();
         if (--path->references) return 0;
     } else {
         uint32_t refs=__atomic_load_n(&path->references,__ATOMIC_ACQUIRE);
-        while (refs>1 && !(refs&VFS_PATH_CLOSING)) {
+        while (!keep_location && refs>1 && !(refs&VFS_PATH_CLOSING)) {
             if (__atomic_compare_exchange_n(&path->references,&refs,refs-1,1,
                 __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) return 0;
         }
         KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
         if (!path->references) __builtin_trap();
-        if (__atomic_fetch_sub(&path->references,1,__ATOMIC_ACQ_REL)!=1) return 0;
+        if (__atomic_fetch_sub(&path->references,1,__ATOMIC_ACQ_REL)!=1) {
+            /* Another path owner still needs its reference. Final path
+             * removal is excluded until the closing file owns the view. */
+            if (keep_location && kernel_vfs_mount_view_acquire_locked(path->file.mount)) __builtin_trap();
+            return 0;
+        }
         path->file.mount->path_index=location_index_remove(path->file.mount->path_index,path);
         *path->previous=path->next;
         if (path->next) path->next->previous=path->previous;
@@ -3080,9 +3110,12 @@ int kernel_vfs_path_release(struct kernel_vfs_path **owner)
     bool borrow_mount=path->borrow_mount;
     dentry_release(&entry);
     if (!path->transient) kernel_heap_release(path->heap,path);
-    if (!borrow_mount) (void)mount_put(mount);
+    if (!borrow_mount && !keep_location) (void)mount_put(mount);
     return 0;
 }
+
+int kernel_vfs_path_release(struct kernel_vfs_path **owner)
+{ return path_release(owner,false); }
 
 struct kernel_vfs_mount *kernel_vfs_path_mount(
     const struct kernel_vfs_path *path)
@@ -3222,13 +3255,13 @@ int kernel_vfs_path_copy_name(const struct kernel_vfs_path *path, char *buffer, 
 }
 
 static int path_open_locked(struct kernel_vfs_path *path,
-                         struct kernel_vfs_file *file)
+    struct kernel_vfs_file *file,struct kernel_vfs_path **resolved_owner,bool inode_guarded)
 {
     if (!path || !file || file->path || file->private_data ||
         file->state != VFS_FILE_STATE_EMPTY) return -KERNEL_EINVAL;
     if ((path->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFSOCK)
         return -KERNEL_ENXIO;
-    int result = kernel_vfs_path_acquire(path);
+    int result = resolved_owner ? 0 : kernel_vfs_path_acquire(path);
     if (result) return result;
     struct kernel_vfs_mount *mount = path->file.mount;
     struct kernel_vfs_instance *instance = mount->private_data;
@@ -3238,15 +3271,45 @@ static int path_open_locked(struct kernel_vfs_path *path,
             instance->ops->error ? instance->ops->error(instance) : 0;
         if (!result) result = kernel_vfs_node_acquire(node);
         if (!result) {
-            result = vfs_open_owned_node(mount, node, file);
+            result = vfs_open_owned_node(mount, node, file, !path->transient,inode_guarded);
             if (result && kernel_vfs_node_release(&node)) __builtin_trap();
         }
     } else {
         result = vfs_open_inode_raw(mount, kernel_vfs_path_inode(path), path->file.mode, file);
     }
-    if (result) (void)kernel_vfs_path_release(&path);
-    else file->path = path;
+    if (result) {
+        if (!resolved_owner) (void)kernel_vfs_path_release(&path);
+    } else {
+        file->path=path;
+        if (resolved_owner) *resolved_owner=NULL;
+    }
     return result;
+}
+
+static int path_open_checked(struct kernel_vfs_path **owner,
+    struct kernel_vfs_file *file,const struct kernel_vfs_open_request *request)
+{
+    struct kernel_vfs_path *path=*owner;
+    struct kernel_vfs_node *node=path->file.private_data;
+    const struct kernel_vfs_backend *ops=node->instance->ops;
+    KERNEL_LOCK_SCOPE(inode);
+    if ((path->file.mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFREG &&
+        ops->owns_dentry_names && !ops->permission) {
+        /* The open already needs this writer for its new inode lease.
+         * Reuse it for the permission snapshot. Non-owner ACL lookup may
+         * read metadata, so leave it on the ordinary inode reader path. */
+        kernel_vfs_node_lock(node,&inode,1);
+        if (ops->acl_permission && (node->mode&0070U) &&
+            kernel_credentials_current()->fsuid!=node->uid)
+            kernel_lock_scope_release(&inode);
+    }
+    bool inode_guarded=inode.lock!=NULL;
+    int result=path_permission(path,request->access,inode_guarded);
+    if (!result && (request->access&2U) && !(request->flags&KERNEL_VFS_OPEN_APPEND) &&
+        !kernel_vfs_file_noappend_allowed(&path->file)) result=-KERNEL_EPERM;
+    if (!result && (request->flags&KERNEL_VFS_OPEN_NOATIME) &&
+        !file_noatime_allowed(&path->file,inode_guarded)) result=-KERNEL_EPERM;
+    return result ? result : path_open_locked(path,file,owner,inode_guarded);
 }
 
 int kernel_vfs_path_open(struct kernel_vfs_path *path,struct kernel_vfs_file *file)
@@ -3255,7 +3318,7 @@ int kernel_vfs_path_open(struct kernel_vfs_path *path,struct kernel_vfs_file *fi
     if (!path || !path->file.mount || !path->file.mount->private_data) return -KERNEL_EINVAL;
     KERNEL_LOCK_SCOPE(guard);
     namespace_node_lock(path->file.private_data,&guard,0);
-    return path_open_locked(path,file);
+    return path_open_locked(path,file,NULL,false);
 }
 
 static int path_open_executable_locked(struct kernel_vfs_path *path,struct kernel_vfs_file *file,unsigned access)
@@ -3264,7 +3327,7 @@ static int path_open_executable_locked(struct kernel_vfs_path *path,struct kerne
     if (type==KERNEL_VFS_S_IFLNK) return -KERNEL_ELOOP;
     if (type!=KERNEL_VFS_S_IFREG || path->file.mount->noexec) return -KERNEL_EACCES;
     int result=kernel_vfs_path_permission(path,access|KERNEL_VFS_MAY_EXEC);
-    return result ? result : path_open_locked(path,file);
+    return result ? result : path_open_locked(path,file,NULL,false);
 }
 
 int kernel_vfs_path_open_executable(struct kernel_vfs_path *path,struct kernel_vfs_file *file)
@@ -3388,14 +3451,7 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
             else if (resolved->file.mount->nodev &&
                 ((resolved->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFCHR ||
                  (resolved->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFBLK)) result=-KERNEL_EACCES;
-            else {
-                result=kernel_vfs_path_permission(resolved,request->access);
-                if (!result && (request->access&2U) && !(flags&KERNEL_VFS_OPEN_APPEND) &&
-                    !kernel_vfs_file_noappend_allowed(&resolved->file)) result=-KERNEL_EPERM;
-                if (!result && (flags & KERNEL_VFS_OPEN_NOATIME) &&
-                    !kernel_vfs_file_noatime_allowed(&resolved->file)) result=-KERNEL_EPERM;
-                if (!result) result=path_open_locked(resolved,file);
-            }
+            else result=path_open_checked(&resolved,file,request);
         } else {
             if (path[strlen(path)-1U]=='/') result=-KERNEL_EISDIR;
             else {
@@ -3838,7 +3894,7 @@ static int direct_write_source(struct kernel_vfs_file *file,uint64_t offset,
 }
 
 /* 写入口持有整次请求的rank15；内部来源循环只借用同一个owner。 */
-static int vfs_write_source_locked(struct kernel_vfs_file *file,uint64_t offset,
+static int vfs_write_source_locked(struct kernel_vfs_file *file,uint64_t offset,uint64_t *append_position,
     struct kernel_vfs_write_source *source,size_t size,
     struct kernel_vfs_size_limit *limit,size_t *bytes_written)
 {
@@ -3849,6 +3905,7 @@ static int vfs_write_source_locked(struct kernel_vfs_file *file,uint64_t offset,
     *bytes_written=0;
     KERNEL_LOCK_SCOPE(node_guard);
     kernel_vfs_node_lock(node, &node_guard, 1);
+    if (append_position) *append_position=offset=node->size;
     if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) {
         return -KERNEL_EINVAL;
     }
@@ -3943,7 +4000,7 @@ static int pwrite_source(struct kernel_vfs_file *file,uint64_t offset,
     if ((file->mode&KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFREG) return -KERNEL_EINVAL;
     VFS_TEMPORARY_WRITER(writer,file);
     size_t written=0;
-    int error=vfs_write_source_locked(file,offset,source,size,NULL,&written);
+    int error=vfs_write_source_locked(file,offset,NULL,source,size,NULL,&written);
     *bytes_written=written;
     return written?0:error;
 }
@@ -3961,7 +4018,7 @@ int kernel_vfs_pwrite_direct(struct kernel_vfs_file *file,uint64_t offset,
 {
     struct kernel_vfs_write_source source={.data=buffer,.direct=1,.operation=operation};
     VFS_TEMPORARY_WRITER(writer,file);
-    return vfs_write_source_locked(file,offset,&source,size,NULL,written);
+    return vfs_write_source_locked(file,offset,NULL,&source,size,NULL,written);
 }
 
 int kernel_vfs_pwrite_cached(struct kernel_vfs_file *file,uint64_t offset,
@@ -3983,15 +4040,8 @@ int kernel_vfs_write_user_mode(struct kernel_vfs_file *file,struct kernel_mm *mm
     kernel_vfs_file_write_lock(file,&operation);
     if ((file->mode&KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFREG) return -KERNEL_EINVAL;
     VFS_TEMPORARY_WRITER(writer,file);
-    if (append) {
-        KERNEL_LOCK_SCOPE(io);
-        struct kernel_vfs_node *node=file->private_data;
-        kernel_vfs_node_lock(node,&io,0);
-        offset=node->size;
-        result->end_offset=offset;
-    }
     struct kernel_vfs_write_source source={.mm=mm,.user={iov,iov_count,0,0},.direct=direct,.operation=&operation};
-    int error=vfs_write_source_locked(file,offset,&source,count,limit,&result->written);
+    int error=vfs_write_source_locked(file,offset,append?&offset:NULL,&source,count,limit,&result->written);
     result->end_offset=offset+result->written;
     result->access=source.access;
     result->chunks=source.chunks;
@@ -4301,8 +4351,11 @@ int kernel_vfs_close(struct kernel_vfs_file *file)
     KERNEL_LOCK_SCOPE(mutation);
     if (file->write_lease || (node->unlinked && !node->retired))
         kernel_vfs_mutation_lock(file->mount,&mutation);
-    if (file->path && kernel_vfs_path_release(&file->path) != 0)
-        __builtin_trap();
+    if (file->path) {
+        bool keep_location=!file->location_owner && !file->mount->backend_owner;
+        if (path_release(&file->path,keep_location)) __builtin_trap();
+        if (keep_location) file->location_owner=1;
+    }
     {
         KERNEL_LOCK_SCOPE(node_guard);
         kernel_vfs_node_lock(node, &node_guard, 1);
@@ -4664,7 +4717,7 @@ int kernel_vfs_unlink_at(struct kernel_vfs_path *start,
     /* Keep basename lookup and removal in one namespace operation; a racing
      * rename must not redirect unlink to the object's new name. */
     if (!directory) walk.component = &leaf;
-    result = path_lookup_locked_mode(parent, name, strlen(name), &path, 1, &walk);
+    result = path_lookup_locked_mode(parent, name, strlen(name), &path, 1, &walk, false);
     walk.component = NULL;
     if (result) goto Finish;
     if (directory && namespace_is_parallel(parent->file.mount->private_data) &&
@@ -5927,11 +5980,12 @@ int kernel_vfs_path_set_owner(struct kernel_vfs_path *path, uint32_t uid, uint32
 
 /* The caller has a real inode reference. Success transfers it to the file. */
 static int vfs_open_owned_node(struct kernel_vfs_mount *mount,
-    struct kernel_vfs_node *node, struct kernel_vfs_file *file)
+    struct kernel_vfs_node *node, struct kernel_vfs_file *file,bool path_owns_location,
+    bool inode_guarded)
 {
     struct kernel_vfs_instance *instance = node->instance;
     KERNEL_LOCK_SCOPE(node_guard);
-    kernel_vfs_node_lock(node, &node_guard, 1);
+    if (!inode_guarded) kernel_vfs_node_lock(node, &node_guard, 1);
     if (node->open_files == UINT32_MAX ||
         instance->external_files == UINT32_MAX) return -KERNEL_EOVERFLOW;
     /* 已有 owner 保证 inode 有效；新 file 只取得资格，不再临时打开后端。 */
@@ -5943,7 +5997,10 @@ static int vfs_open_owned_node(struct kernel_vfs_mount *mount,
     file->mode = node->mode;
     file->state = VFS_FILE_STATE_LIVE;
     file->write_lease = file->exec_lease = 0;
-    file_location_acquire(file);
+    /* The open description receives the path reference before publication.
+     * Close takes its view reference before dropping the directory entry. */
+    if (path_owns_location) file->location_owner=0;
+    else file_location_acquire(file);
     return 0;
 }
 static int vfs_open_raw(struct kernel_vfs_mount *mount,
@@ -5971,7 +6028,7 @@ static int vfs_open_raw(struct kernel_vfs_mount *mount,
         if (pinned) return pinned;
         if (node) {
             struct kernel_vfs_node *pin __attribute__((cleanup(release_node_pin))) = node;
-            int result = vfs_open_owned_node(mount, node, file);
+            int result = vfs_open_owned_node(mount, node, file, false, false);
             if (!result) pin = NULL;
             return result;
         }

@@ -46,6 +46,7 @@ uint32_t kernel_bpf_filter(struct kernel_bpf_program *,
 void kernel_bpf_trace_enter(struct kernel_task *, uint64_t nr,
     const uint64_t arguments[6]);
 void kernel_bpf_trace_exit(struct kernel_task *, uint64_t nr, int64_t result);
+int kernel_bpf_trace_active(void);
 
 /* The MM retains the OFD as its mapping source, independently of the FD. */
 /* On success guard holds freeze serialization until VMA publication. */

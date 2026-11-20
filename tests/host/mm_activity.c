@@ -28,7 +28,7 @@ static struct kernel_mm mm;
 static uint64_t context, kernel_context;
 static unsigned sampled, entered, allow_send, pause_exit, exiting, allow_exit, sample_activation;
 static _Thread_local unsigned flushes, instruction_sync;
-static uint64_t reentry_root, reentry_address;
+static uint64_t reentry_table, reentry_address;
 static unsigned reentry_entered, reentry_release;
 static unsigned membership_pause, membership_entered, membership_flush;
 static unsigned membership_joined, membership_leave, membership_left;
@@ -87,7 +87,7 @@ static void publish(unsigned *flag)
 { __atomic_store_n(flag, 1, __ATOMIC_RELEASE); }
 static void *page_access(uint64_t address)
 {
-    if (address == reentry_root && kernel_cpu_current()->hardware_id == 3) {
+    if (address == reentry_table && kernel_cpu_current()->hardware_id == 3) {
         publish(&reentry_entered);
         await(&reentry_release);
     }
@@ -160,7 +160,12 @@ static void same_mm_reentry(uint64_t address)
 {
     assert(!kernel_mm_activate(&mm, kernel_context));
     unsigned tlb = flushes, instructions = instruction_sync;
-    reentry_root = (context & ((UINT64_C(1) << 44) - 1)) << 12;
+    const uint64_t ppn_mask = (UINT64_C(1) << 44) - 1;
+    const uint64_t *root = (const uint64_t *)(uintptr_t)((context & ppn_mask) << 12);
+    /* The root is already mapped in the user space object. Stop at the
+     * first child table actually resolved by the lookup. */
+    reentry_table = ((root[(address >> 30) & 511] >> 10) & ppn_mask) << 12;
+    assert(reentry_table);
     reentry_address = address;
     pthread_t lookup;
     alarm(10);
@@ -178,7 +183,7 @@ static void same_mm_reentry(uint64_t address)
     publish(&reentry_release);
     assert(!pthread_join(lookup, NULL));
     alarm(0);
-    reentry_root = 0;
+    reentry_table = 0;
     assert(!kernel_mm_activate(NULL, kernel_context));
     mm_test_context = context;
     puts("MM same-root reuse and leave/rejoin progress during an independent PTE lookup");

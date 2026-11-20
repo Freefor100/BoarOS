@@ -406,13 +406,15 @@ struct ext4_buf *ext4_bcache_dirty_get(struct ext4_bcache *bc, struct ext4_block
 }
 int ext4_bcache_shake(struct ext4_bcache *bc)
 {
-    bool read_only=bc->bdev->bdif->read_context && bc->bdev->bdif->read_context();
     int result=EOK;
     {
         KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
-        if (bc->dont_shake) return EOK;
+        /* A cold miss below the idle retention limit has no eviction work.
+         * Stop at the first check instead of starting an empty shake. */
+        if (bc->dont_shake || bc->idle_blocks<bc->cnt) return EOK;
         bc->dont_shake=true;
     }
+    bool read_only=bc->bdev->bdif->read_context && bc->bdev->bdif->read_context();
     for (;;) {
         struct ext4_buf *buf;
         struct ext4_block owned;

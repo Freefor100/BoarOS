@@ -26,7 +26,8 @@ enum kernel_uaccess_status __wrap_kernel_copy_to_user(struct kernel_mm *space,
 int __real_ext4_dir_iterator_next_raw(struct ext4_dir_iter *);
 int __wrap_ext4_dir_iterator_next_raw(struct ext4_dir_iter *iterator)
 {
-    if (directory_iterator_fail && ++directory_iterator_steps == directory_iterator_fail) return 5;
+    if (directory_iterator_fail && ext4_dir_en_get_inode(iterator->curr) &&
+        ++directory_iterator_steps == directory_iterator_fail) return 5;
     return __real_ext4_dir_iterator_next_raw(iterator);
 }
 static uint64_t directory_number(const unsigned char *bytes, unsigned length)
@@ -147,11 +148,14 @@ static void directory_batch_cases(struct kernel_heap *heap, struct kernel_vfs_mo
     assert(!kernel_copy_from_user(&mm, actual, address, 24, &copied) && !memcmp(actual, expected + 24, 24));
     if (ext4) {
         directory_rewind(&local);
+        size_t prefix = 0;
+        for (unsigned i = 0; i < 3; i++)
+            prefix += directory_number(expected + prefix + 16, 2);
         directory_iterator_steps = 0; directory_iterator_fail = 3;
-        assert(!kernel_files_getdents(&local, &mm, 0, address, 512, &result) && result == 112);
+        assert(!kernel_files_getdents(&local, &mm, 0, address, 512, &result) && result == (int64_t)prefix);
         directory_iterator_fail = 0;
-        assert(!kernel_files_getdents(&local, &mm, 0, address, sizeof(expected), &result) && result == (int64_t)(size - 112));
-        assert(!kernel_copy_from_user(&mm, actual, address, result, &copied) && !memcmp(actual, expected + 112, copied));
+        assert(!kernel_files_getdents(&local, &mm, 0, address, sizeof(expected), &result) && result == (int64_t)(size - prefix));
+        assert(!kernel_copy_from_user(&mm, actual, address, result, &copied) && !memcmp(actual, expected + prefix, copied));
     }
     /* Pause at the actual batch publication to user memory. Namespace writers
      * can progress, but a shared-OFD reader must wait for the offset commit. */

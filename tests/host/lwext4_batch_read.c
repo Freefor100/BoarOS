@@ -127,16 +127,16 @@ static void directory_batches(struct ext4_blockdev *dev)
     struct ext4_inode_ref ref;
     struct ext4_inode_block_range range;
     CHECK(ext4_fs_get_inode_ref_read(dev->fs,directory.f.inode,&ref)==EOK);
-    CHECK(ext4_fs_get_inode_dblk_range(&ref,0,2,false,&range)==EOK);
+    CHECK(ext4_fs_get_inode_dblk_range(&ref,0,4,false,&range)==EOK);
     CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
-    CHECK(range.block && range.count==2 && !range.unwritten);
+    CHECK(range.block && range.count==4 && !range.unwritten);
     clear(dev);
     struct directory_observation observation={0};
     uint64_t position=0;
     CHECK(ext4_dir_iterate(&directory.f,&position,observe_directory,&observation,NULL)==EOK);
     CHECK(observation.entries==122 && position==UINT64_MAX);
     printf("directory read blocksize=%u width=%u batches=%u\n",dev->lg_bsize,width,batches);
-    CHECK(width==2 && batches>0);
+    CHECK(width==4 && batches>0);
 
     clear(dev);
     position=0;

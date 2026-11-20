@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #define KERNEL_SYSCALL_ARGUMENT_COUNT 6U
+#define LINUX_SYSCALL_GETPID 172U
 
 struct kernel_task;
 

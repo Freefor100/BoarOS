@@ -59,6 +59,7 @@ struct lwext4_node {
     struct kernel_vfs_node node;
     ext4_file file;
     struct ext4_timestamp times[3];
+    int64_t relatime_due;
     uint64_t time_version[3];
     struct lwext4_node *dirty_next, **dirty_previous;
 #if BOAROS_MAX_CPUS > 1
