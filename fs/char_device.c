@@ -18,9 +18,6 @@
 
 #include <string.h>
 
-static struct kernel_char_device devices[5];
-static uint8_t devices_ready;
-
 static int empty_read(void *instance, struct kernel_task *caller, uint32_t flags, void *buffer, size_t size,
                       size_t *bytes_read)
 {
@@ -182,55 +179,33 @@ static int random_ioctl(void *instance, struct kernel_task *caller, struct kerne
     }
 }
 
-static void initialize_devices(void)
+static int full_write(void *instance, struct kernel_task *caller, uint32_t flags,
+                      const void *buffer, size_t size, size_t *written)
 {
-    uintptr_t irq = arch_interrupt_save();
-    if (!devices_ready) {
-        volatile struct kernel_char_device *null = &devices[0];
-        null->rdev = UINT64_C(0x103);
-        null->kind = KERNEL_OPEN_FILE_KIND_NULL;
-        null->discard_writes = 1U;
-        null->splice_write = 1U;
-        null->positioned = 1U;
-        null->empty_range_fault = 1U;
-        null->read = empty_read;
-        null->write = discard_write;
-        null->poll = memory_poll;
-        volatile struct kernel_char_device *zero = &devices[1];
-        zero->rdev = UINT64_C(0x105);
-        zero->kind = KERNEL_OPEN_FILE_KIND_ZERO;
-        zero->discard_writes = 1U;
-        zero->splice_read = zero->splice_write = 1U;
-        zero->positioned = 1U;
-        zero->empty_range_fault = 1U;
-        zero->read = zero_read;
-        zero->write = discard_write;
-        zero->poll = memory_poll;
-        volatile struct kernel_char_device *console = &devices[2];
-        console->rdev = UINT64_C(0x501);
-        console->kind = KERNEL_OPEN_FILE_KIND_CONSOLE;
-        console->read_once = 1U;
-        console->read = console_read;
-        console->write = console_write;
-        console->poll = console_poll;
-        for (unsigned i = 3; i < 5; i++) {
-            volatile struct kernel_char_device *rng = &devices[i];
-            rng->rdev = i == 3 ? UINT64_C(0x108) : UINT64_C(0x109);
-            rng->kind = i == 3 ? KERNEL_OPEN_FILE_KIND_RANDOM
-                              : KERNEL_OPEN_FILE_KIND_URANDOM;
-            rng->positioned = 1U;
-            rng->splice_read = rng->splice_write = 1U;
-            rng->empty_range_fault = 1U;
-            rng->ioctl = random_ioctl;
-            rng->interruptible_bulk = 1U;
-            rng->read = i == 3 ? random_read : urandom_read;
-            rng->write = random_write;
-            rng->poll = i == 3 ? random_poll : memory_poll;
-        }
-        devices_ready = 1U;
-    }
-    arch_interrupt_restore(irq);
+    (void)instance; (void)caller; (void)flags; (void)buffer; (void)size;
+    *written = 0;
+    return -KERNEL_ENOSPC;
 }
+
+static const struct kernel_char_device devices[] = {
+    {.rdev=0x103, .kind=KERNEL_OPEN_FILE_KIND_NULL, .discard_writes=1,
+     .splice_write=1, .positioned=1, .empty_range_fault=1,
+     .read=empty_read, .write=discard_write, .poll=memory_poll},
+    {.rdev=0x105, .kind=KERNEL_OPEN_FILE_KIND_ZERO, .discard_writes=1,
+     .splice_read=1, .splice_write=1, .positioned=1, .empty_range_fault=1,
+     .read=zero_read, .write=discard_write, .poll=memory_poll},
+    {.rdev=0x107, .kind=KERNEL_OPEN_FILE_KIND_FULL, .discard_writes=1,
+     .splice_read=1, .positioned=1, .empty_range_fault=1,
+     .read=zero_read, .write=full_write, .poll=memory_poll},
+    {.rdev=0x501, .kind=KERNEL_OPEN_FILE_KIND_CONSOLE, .read_once=1,
+     .read=console_read, .write=console_write, .poll=console_poll},
+    {.rdev=0x108, .kind=KERNEL_OPEN_FILE_KIND_RANDOM, .positioned=1,
+     .splice_read=1, .splice_write=1, .empty_range_fault=1, .ioctl=random_ioctl,
+     .interruptible_bulk=1, .read=random_read, .write=random_write, .poll=random_poll},
+    {.rdev=0x109, .kind=KERNEL_OPEN_FILE_KIND_URANDOM, .positioned=1,
+     .splice_read=1, .splice_write=1, .empty_range_fault=1, .ioctl=random_ioctl,
+     .interruptible_bulk=1, .read=urandom_read, .write=random_write, .poll=memory_poll},
+};
 
 const struct kernel_char_device *kernel_char_device_lookup(uint64_t rdev)
 {
@@ -239,7 +214,6 @@ const struct kernel_char_device *kernel_char_device_lookup(uint64_t rdev)
     if (rdev == 0x502 || (rdev >= 0x8800 && rdev < 0x8840)) return kernel_tty_device_template();
     if (rdev == kernel_rtc_device.rdev) return &kernel_rtc_device;
     if (rdev == kernel_loop_control_device.rdev) return &kernel_loop_control_device;
-    initialize_devices();
     for (size_t i = 0U; i < sizeof(devices) / sizeof(devices[0]); i++)
         if (devices[i].rdev == rdev) return &devices[i];
     return 0;

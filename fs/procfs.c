@@ -1520,7 +1520,7 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
             e->path=path;e->mount_root=mount_root;e->source=it->source_name;
             struct kernel_vfs_instance *instance=it->private_data;
             e->bpf_type=kernel_bpf_filesystem_type(it);
-            if(!e->bpf_type)e->bpf_type=instance->ops->type;
+            if(!e->bpf_type)e->bpf_type=kernel_devtmpfs_is_mount(it) ? "devtmpfs" : instance->ops->type;
             e->is_proc=kernel_procfs_is_mount(it);e->is_tmpfs=kernel_tmpfs_is_mount(it);e->is_devpts=kernel_devpts_is_mount(it);
             e->nosuid=it->nosuid;e->nodev=it->nodev;e->noexec=it->noexec;e->atime_policy=it->atime_policy;
             e->read_only=kernel_vfs_mount_is_readonly(it);e->super_read_only=instance->read_only;

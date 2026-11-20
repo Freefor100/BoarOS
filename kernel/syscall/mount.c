@@ -17,6 +17,7 @@
 #include <kernel/procfs.h>
 #include <kernel/devpts.h>
 #include <kernel/tmpfs.h>
+#include <kernel/loop.h>
 #include <kernel/task.h>
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
@@ -109,6 +110,10 @@ static __attribute__((noinline)) int mount_filesystem(struct kernel_mm *mm, cons
     if (result) goto Finish;
     if(!kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN)) {result=-KERNEL_EPERM;goto Finish;}
     if(flags & ~(LINUX_MS_RDONLY|LINUX_MS_NOSUID|LINUX_MS_NODEV|LINUX_MS_NOEXEC|LINUX_MS_SILENT|LINUX_MS_REMOUNT|LINUX_MS_BIND|LINUX_MS_MOVE|LINUX_MS_REC|UINT64_C(1966080)|UINT64_C(1024)|2048U|2097152U|16777216U)) {result=-KERNEL_ENOTSUP;goto Finish;}
+    if (!(flags & (LINUX_MS_BIND | LINUX_MS_MOVE | LINUX_MS_REMOUNT)) && !strcmp(type, "devtmpfs")) {
+        result = kernel_loop_initialize(fs->heap);
+        if (result) goto Finish;
+    }
     kernel_vfs_mount_topology_lock(&topology);
     struct kernel_vfs_mount *top=kernel_fs_context_mount_root(fs);
     if (!kernel_vfs_mount_contains(top,covered)) {result=-KERNEL_EINVAL;goto Finish;}

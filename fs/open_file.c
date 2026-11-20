@@ -850,6 +850,8 @@ enum kernel_open_file_kind kernel_open_file_kind(
         return KERNEL_OPEN_FILE_KIND_EPOLL;
     case KERNEL_OPEN_FILE_KIND_NULL:
         return KERNEL_OPEN_FILE_KIND_NULL;
+    case KERNEL_OPEN_FILE_KIND_FULL:
+        return KERNEL_OPEN_FILE_KIND_FULL;
     case KERNEL_OPEN_FILE_KIND_ZERO:
         return KERNEL_OPEN_FILE_KIND_ZERO;
     case KERNEL_OPEN_FILE_KIND_SOCKET:
@@ -1207,6 +1209,7 @@ int kernel_open_file_readable(
     case KERNEL_OPEN_FILE_KIND_DIRECTORY:
     case KERNEL_OPEN_FILE_KIND_NULL:
     case KERNEL_OPEN_FILE_KIND_ZERO:
+    case KERNEL_OPEN_FILE_KIND_FULL:
     case KERNEL_OPEN_FILE_KIND_RANDOM:
     case KERNEL_OPEN_FILE_KIND_URANDOM:
         return access_mode == 0U || access_mode == 2U;

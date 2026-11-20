@@ -1,5 +1,6 @@
 #include <kernel/credentials.h>
 #include <kernel/loop.h>
+#include <kernel/tmpfs.h>
 #include <kernel/block.h>
 #include <kernel/errno.h>
 #include <kernel/heap.h>
@@ -652,5 +653,7 @@ int kernel_loop_shutdown_mounts(struct kernel_vfs_mount *root)
         }
         if (!detached && !progress) return -KERNEL_EBUSY;
     }
-    return kernel_loop_shutdown();
+    kernel_devtmpfs_shutdown();
+    int error = kernel_vfs_cleanup_pending();
+    return error ? error : kernel_loop_shutdown();
 }

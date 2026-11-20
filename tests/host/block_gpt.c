@@ -37,11 +37,55 @@ static void rejected(struct kernel_block_device *disk,int error)
     assert(!disk->references);
     for(unsigned i=0;i<15;i++)assert(!gpt_test_children[i].registered && !kernel_block_lookup(disk->device_number+i+1));
 }
+static int fail_publication;
+static unsigned batches, removals;
+
+static int publish_partitions(struct kernel_block_device *const *devices,
+    size_t count, int create, kernel_block_activate_fn activate)
+{
+    if (create) {
+        assert(count == 2);
+        batches++;
+    } else {
+        assert(count == 1);
+        removals++;
+    }
+    for (size_t i = 0; i < count; i++) {
+        assert(devices[i]->parent);
+        assert(!kernel_block_get(devices[i]->device_number));
+    }
+    if (fail_publication) return -KERNEL_ENOMEM;
+    if (create) {
+        activate(devices, count);
+        /* Observer woken by the first IN_CREATE, while the publisher is still active. */
+        for (size_t i = 0; i < count; i++) {
+            struct kernel_block_device *held = kernel_block_get(devices[i]->device_number);
+            assert(held == devices[i]);
+            kernel_block_put(held);
+            assert(kernel_block_unregister(devices[i]) == -KERNEL_EBUSY);
+        }
+    }
+    return 0;
+}
+
+static void test_partition_publication(struct kernel_block_device *disk)
+{
+    assert(!gpt_test_fixture(disk, 128));
+    kernel_block_set_devnode_publisher(publish_partitions);
+    fail_publication = 1;
+    rejected(disk, -KERNEL_ENOMEM);
+    fail_publication = 0;
+    assert(!kernel_block_scan_gpt(disk, gpt_test_children, 15));
+    assert(!gpt_test_release() && !disk->references);
+    assert(batches == 2 && removals == 2);
+    kernel_block_set_devnode_publisher(NULL);
+}
 int main(int argc,char **argv)
 {
     struct kernel_block_device disk={.read=read_image,.write=write_image,.logical_block_size=512,.capacity_bytes=sizeof(image)};
     assert(!test_gpt_partitions(&disk));
     assert(!kernel_block_register(&disk,KERNEL_BLOCK_DEVICE_NUMBER(0)));
+    test_partition_publication(&disk);
     for(unsigned size=128;size<=512;size*=2) {
         assert(!gpt_test_fixture(&disk,size));reads=0;
         assert(!kernel_block_scan_gpt(&disk,gpt_test_children,15));

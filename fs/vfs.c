@@ -690,6 +690,11 @@ static void notify_child(struct kernel_vfs_path *parent,const char *name,uint32_
     struct kernel_vfs_node *node=parent->file.private_data;
     notify_inode(node->instance,node->inode,mask,0,name,0);
 }
+void kernel_vfs_notify_create(struct kernel_vfs_path *parent, const char *name)
+{
+    notify_child(parent, name, VFS_NOTIFY_CREATE);
+}
+
 
 static void __attribute__((noinline)) notify_file_path(const struct kernel_vfs_file *file,
     const struct kernel_vfs_path *path,uint32_t mask)
@@ -4567,7 +4572,7 @@ int kernel_vfs_mknod_at(struct kernel_vfs_path *start,
                      ? -KERNEL_ENOTSUP
                      : instance->ops->mknod(instance, kernel_vfs_path_inode(path), name, type, mode, device,umask);
     }
-    if (!result) notify_child(path,name,VFS_NOTIFY_CREATE);
+    if (!result) kernel_vfs_notify_create(path, name);
     (void)kernel_vfs_path_release(&path);
     return result;
 }
@@ -4857,7 +4862,7 @@ int kernel_vfs_symlink_at(struct kernel_vfs_path *start,
              kernel_vfs_mount_is_readonly(path->file.mount) || !instance->ops->symlink ? -KERNEL_EROFS :
              directory_mutation_allowed(path,NULL);
     if (!result) result=instance->ops->symlink(instance,kernel_vfs_path_inode(path),target,name);
-    if (!result) notify_child(path,name,VFS_NOTIFY_CREATE);
+    if (!result) kernel_vfs_notify_create(path, name);
     (void)kernel_vfs_path_release(&path);
     return result;
 }

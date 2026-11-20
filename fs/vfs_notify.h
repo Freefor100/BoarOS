@@ -5,6 +5,7 @@
 
 struct kernel_vfs_instance;
 struct kernel_vfs_file;
+struct kernel_vfs_path;
 
 enum {
     VFS_NOTIFY_ACCESS = 1, VFS_NOTIFY_MODIFY = 2, VFS_NOTIFY_ATTRIB = 4,
@@ -20,6 +21,7 @@ struct kernel_vfs_notify_ops {
     void (*unmount)(struct kernel_vfs_instance *);
 };
 
+void kernel_vfs_notify_create(struct kernel_vfs_path *, const char *);
 void kernel_vfs_notify_file(const struct kernel_vfs_file *, uint32_t);
 
 #endif
