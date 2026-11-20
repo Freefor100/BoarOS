@@ -22,7 +22,7 @@ static struct kernel_uts_namespace initial_uts = {
         .sysname = "Linux",
         .nodename = "boaros",
         /* glibc checks this ABI baseline before main; it is not feature coverage. */
-        .release = "5.19.0-boaros",
+        .release = "6.7.0-boaros",
         .version = "#1 BoarOS 0.1.0",
         .machine = BOAROS_UTS_MACHINE,
         .domainname = "(none)",
