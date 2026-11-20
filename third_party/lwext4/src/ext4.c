@@ -4334,15 +4334,22 @@ int ext4_file_reserve_write(ext4_file *file,uint64_t offset,size_t length,size_t
     if (!file->delalloc || !file->mp->fs.jbd_journal)return ENOTSUP;
     if (file->mp->fs.read_only)return EROFS;
     if (offset>file->fmax || length>file->fmax-offset)return EFBIG;
-    EXT4_MP_LOCK(file->mp);
     struct ext4_fs *fs=&file->mp->fs;
-    struct ext4_inode_ref ref;
-    bool have_ref=false;
     /* 私有事务看到的空洞可能随 abort 消失，不能作为后续写入的依据。 */
     bool stable_mapping=!ext4_current_operation(fs);
     struct ext4_delalloc *da=file->delalloc;
-    int r=EOK;
     size_t block=fs->bdev->lg_bsize;
+    /* The adapter's inode writer already protects these accepted mappings.
+     * An overwrite entirely inside them needs no backend scope or ticket. */
+    if (!length || (stable_mapping && offset>=da->mapped_first*block &&
+        offset+length<=da->mapped_end*block)) {
+        *ready=length;
+        return EOK;
+    }
+    EXT4_MP_LOCK(file->mp);
+    struct ext4_inode_ref ref;
+    bool have_ref=false;
+    int r=EOK;
     while (!r && *ready<length) {
         uint64_t position=offset+*ready,logical=position/block;
         size_t rest=length-*ready;
@@ -5103,7 +5110,7 @@ struct ext4_file_read_plan {
 
 static __attribute__((noinline)) int ext4_fpread_planned(const ext4_file *file,
     struct file_read_span *spans, unsigned count, const struct ext4_file_read_plan *plan,
-    uint64_t size_limit, bool pad_eof)
+    uint64_t size_limit, unsigned flags)
 {
     size_t *limits = plan->limits;
     struct file_read_fragment *fragments = plan->fragments;
@@ -5114,8 +5121,10 @@ static __attribute__((noinline)) int ext4_fpread_planned(const ext4_file *file,
     struct file_read_workspace *progress = plan->progress;
     const struct block_read_completion forward = {ext4_file_read_completed, progress};
     const struct ext4_lock *locks = file->mp->os_locks;
-    if (locks && locks->read_lock) locks->read_lock(locks->context);
-    else EXT4_MP_LOCK(file->mp);
+    if (!(flags & EXT4_PREAD_LOCK_HELD)) {
+        if (locks && locks->read_lock) locks->read_lock(locks->context);
+        else EXT4_MP_LOCK(file->mp);
+    }
     int result = EOK;
     if (file->flags & O_WRONLY) { result = EPERM; goto Failed; }
     struct ext4_fs *fs = &file->mp->fs;
@@ -5181,7 +5190,7 @@ static __attribute__((noinline)) int ext4_fpread_planned(const ext4_file *file,
                  * for the last sector instead of allocating/copying scratch;
                  * logical completion remains length and the cache zeros EOF. */
                 size_t io_length=length;
-                if (pad_eof && physical && !(skip%sector) && offset+length==size) {
+                if ((flags & EXT4_PREAD_PAD_EOF) && physical && !(skip%sector) && offset+length==size) {
                     size_t rounded=(length+sector-1)/sector*sector;
                     if (rounded<=block_size-skip && rounded<=spans[i].size-planned)
                         io_length=rounded;
@@ -5276,7 +5285,7 @@ Failed:
         if (result && !spans[i].error) spans[i].error = result;
     }
     for (unsigned i = 0; i < count; i++) if (!result) result = spans[i].error;
-    EXT4_MP_UNLOCK(file->mp);
+    if (!(flags & EXT4_PREAD_LOCK_HELD)) EXT4_MP_UNLOCK(file->mp);
     return result;
 }
 
@@ -5284,7 +5293,7 @@ Failed:
  * entry owns its descriptors until the common executor has drained DMA. */
 #define EXT4_SCALAR_READ(capacity) \
 static __attribute__((noinline)) int ext4_fpread_scalar##capacity(const ext4_file *file, \
-    struct file_read_span *span, uint64_t size_limit, bool pad_eof) \
+    struct file_read_span *span, uint64_t size_limit, unsigned flags) \
 { \
     size_t limit; \
     struct file_read_fragment fragments[capacity]; \
@@ -5294,7 +5303,7 @@ static __attribute__((noinline)) int ext4_fpread_scalar##capacity(const ext4_fil
     const struct ext4_file_read_plan plan = { \
         &limit, fragments, reads, owners, &mapping_error, capacity, NULL \
     }; \
-    return ext4_fpread_planned(file, span, 1, &plan, size_limit, pad_eof); \
+    return ext4_fpread_planned(file, span, 1, &plan, size_limit, flags); \
 }
 EXT4_SCALAR_READ(1)
 EXT4_SCALAR_READ(2)
@@ -5303,7 +5312,7 @@ EXT4_SCALAR_READ(8)
 #undef EXT4_SCALAR_READ
 
 int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsigned count,
-    struct file_read_workspace *work, uint64_t size_limit, const struct file_read_completion *completion, bool pad_eof)
+    struct file_read_workspace *work, uint64_t size_limit, const struct file_read_completion *completion, unsigned flags)
 {
     if (!file || !file->mp || count > EXT4_BLOCK_BATCH_MAX || (count && !spans)) return EINVAL;
     for (unsigned i = 0; i < count; i++) { spans[i].completed = 0; spans[i].error = EINVAL; }
@@ -5352,16 +5361,16 @@ int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsig
             work->limits, work->fragments, work->reads, work->owners,
             work->mapping_errors, EXT4_BLOCK_BATCH_MAX, progress
         };
-        return ext4_fpread_planned(file, spans, count, &plan, size_limit, pad_eof);
+        return ext4_fpread_planned(file, spans, count, &plan, size_limit, flags);
     }
     unsigned bs = ext4_sb_get_block_size(&file->mp->fs.sb);
     uint64_t blocks = spans[0].size / bs;
     if (blocks < 8)
         blocks += (spans[0].offset % bs + spans[0].size % bs + bs - 1) / bs;
-    if (blocks <= 1) return ext4_fpread_scalar1(file, spans, size_limit, pad_eof);
-    if (blocks <= 2) return ext4_fpread_scalar2(file, spans, size_limit, pad_eof);
-    if (blocks <= 4) return ext4_fpread_scalar4(file, spans, size_limit, pad_eof);
-    return ext4_fpread_scalar8(file, spans, size_limit, pad_eof);
+    if (blocks <= 1) return ext4_fpread_scalar1(file, spans, size_limit, flags);
+    if (blocks <= 2) return ext4_fpread_scalar2(file, spans, size_limit, flags);
+    if (blocks <= 4) return ext4_fpread_scalar4(file, spans, size_limit, flags);
+    return ext4_fpread_scalar8(file, spans, size_limit, flags);
 }
 
 /* Non-journal writes borrow caller versions until synchronous DMA completes;

@@ -362,6 +362,8 @@ legacy 间接指针格式没有 unwritten 状态，新分配块先清零。若�
 
 共享映射写缺页在授予可写 PTE 前调用同一空间准备，预留借用持续到真实标脏和 PTE 发布；VMA／映射代次变化、页写资格冲突等路径先释放 MM 与 inode 资格，再取消尚未接纳的准备。整页中所有有效 EOF 字节均有已分配空间或实际预留；16 KiB 页只准备出部分 1/4 KiB 块时返回 BUS fault，不能开放其余 hole。等待期间释放 MM gate 和 inode 读资格，返回后先重新检查 VMA 代次、映射代次与 EOF，再解释后端错误并核对驻留页；若地址已被 MAP_FIXED 替换，重试新映射，不把旧文件的 ENOSPC 施加到新地址。private COW 不需要后端存储，仍可在磁盘满时生成私有副本。
 
+写入范围完全落在索引节点已经确认的磁盘映射内时，空间准备在现有索引节点写保护下直接完成。它不创建票据，也不进入挂载后端保护。打洞和截断在同一索引节点保护下使映射快照失效，下一次写入重新查询并按需要预留空间。
+
 `FALLOCATE_HOST_CASES='admission-full admission-legacy admission-prefix admission-prefix-legacy admission-fault admission-mmap' FALLOCATE_HOST_IMAGE_SIZE=8M sh tests/host/fallocate.sh` 检查磁盘满前的接纳与准确短写、fsync 和失效后读回、来源 EFAULT、legacy 清理失败后的 truncate／unlink／仅关闭及卸载重试、真实写回错误，以及共享映射和 private COW。默认组合为 4/16 KiB 页、1/4 KiB 文件系统块和有／无 journal，共 48 个场景，每个场景检查资源归还及 e2fsck。
 
 `FALLOCATE_HOST_CASE=delalloc FALLOCATE_HOST_JOURNALS=journal sh tests/host/fallocate.sh` 检查缓存可见而磁盘仍为空、重复覆盖计费、跨节点部分接纳、批量转换、分配后 abort、映射准备后注入 ENOSPC 时事务回滚并保留数据与预留、随后同步重试，以及截断归还。
@@ -1211,6 +1213,7 @@ gap 和同块 partial 重入结束分配窗口，出错释放所有尚未消费�
 元数据继续使用 `ext4_block_get_batch` 的共享 loading；本批自有加载先完成并唤醒，
 再等待其他 owner 的既有加载，避免交叉等待尚未发布的缓冲。各项保留自己的错误与
 成功前缀，读失败不记录为 inode 写回错误。设备持有输出至全部完成或确认 reset。
+ext4 后端读取已存储长度时已经取得挂载读保护。单段和批量定位读取都把该保护传给 lwext4，覆盖块映射和数据版本的借用，直到设备读取完成。独立调用 lwext4 定位读取接口时，由该接口自行取得保护。
 
 `make test-lwext4-cache-host test-lwext4-batch-read-host` 覆盖共享加载、旧缓存版本保护、
 OOM、独立错误与重试；后者运行 1/4/8 KiB ext4、extent/传统映射的洞、EOF 和片段。

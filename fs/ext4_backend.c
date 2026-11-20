@@ -2847,7 +2847,6 @@ static int ext4_backend_pread(struct kernel_vfs_node *node,
                           size_t *bytes_read)
 {
     size_t requested;
-    size_t result_count;
     int result;
 
     if (node == 0 || __atomic_load_n(&node->references,__ATOMIC_ACQUIRE) == 0U || node->closed ||
@@ -2870,10 +2869,11 @@ static int ext4_backend_pread(struct kernel_vfs_node *node,
     uint64_t stored=ext4_fsize(lwext4_node_file(node));
     if (stored>node->size) stored=node->size;
     size_t prefix=offset>=stored?0:stored-offset<requested?(size_t)(stored-offset):requested;
-    result = ext4_fpread(lwext4_node_file(node), offset, buffer, prefix, &result_count);
+    struct file_read_span span={offset,buffer,prefix,0,0};
+    result=ext4_fpread_batch(lwext4_node_file(node),&span,1,NULL,stored,NULL,EXT4_PREAD_LOCK_HELD);
     adapter->locks.unlock(adapter->locks.context);
     if (result != EOK) return lwext4_error(result);
-    if (result_count != prefix) return -KERNEL_EIO;
+    if (span.completed != prefix) return -KERNEL_EIO;
     /* Cache-only growth has known zero holes beyond the accepted inode EOF. */
     memset((unsigned char *)buffer+prefix,0,requested-prefix);
     *bytes_read = requested;
@@ -2922,7 +2922,7 @@ static int ext4_backend_pread_batch(struct kernel_vfs_node *node,
     struct ext4_file_read_progress progress = {node, stored, completion, 0};
     const struct file_read_completion forward = {file_read_completed, &progress};
     int result = ext4_fpread_batch(lwext4_node_file(node), spans, count, workspace, stored,
-        completion ? &forward : NULL, true);
+        completion ? &forward : NULL, EXT4_PREAD_PAD_EOF | EXT4_PREAD_LOCK_HELD);
     adapter->locks.unlock(adapter->locks.context);
     for (size_t i = 0; i < count; i++)
         file_read_result(&progress, &spans[i], !(progress.completed & (UINT32_C(1) << i)));

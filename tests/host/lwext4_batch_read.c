@@ -76,6 +76,14 @@ static int dev_batch(struct ext4_blockdev *d,struct block_read_span *s,unsigned 
     return first;
 }
 static struct file_read_workspace read_workspace;
+static void enter_read_scope(void *context)
+{ ++*(unsigned *)context; }
+static void leave_read_scope(void *context)
+{
+    unsigned *depth=context;
+    CHECK(*depth==1);
+    --*depth;
+}
 static int read_batch(const ext4_file *f,struct file_read_span *s,unsigned n)
 {return ext4_fpread_batch(f,s,n,n>1?&read_workspace:NULL,UINT64_MAX, file_completion, false);}
 struct held_read {
@@ -219,7 +227,7 @@ int main(int argc,char **argv)
     memset(out,0xcd,sizeof(out));
     spans[0]=(struct file_read_span){0,out[0],4096,0,0};
     allocation_attempts=0;track_allocations=2;
-    CHECK(ext4_fpread_batch(&file,spans,1,NULL,123,NULL,true)==EOK);
+    CHECK(ext4_fpread_batch(&file,spans,1,NULL,123,NULL,EXT4_PREAD_PAD_EOF)==EOK);
     track_allocations=0;
     CHECK(!allocation_attempts && spans[0].completed==123 && !spans[0].error);
     for(unsigned i=0;i<123;i++)CHECK(out[0][i]==1);
@@ -227,6 +235,17 @@ int main(int argc,char **argv)
     spans[0]=(struct file_read_span){0,out[0],4096,0,0};memset(out[0],0xcd,4096);
     CHECK(ext4_fpread_batch(&file,spans,1,NULL,123,NULL,false)==EOK && spans[0].completed==123);
     for(unsigned i=123;i<4096;i++)CHECK(out[0][i]==0xcd);
+    unsigned depth=0;
+    const struct ext4_lock read_scope={.lock=enter_read_scope,.read_lock=enter_read_scope,
+        .unlock=leave_read_scope,.context=&depth};
+    CHECK(ext4_mount_setup_locks("/",&read_scope)==EOK);
+    CHECK(ext4_fpread_batch(&file,spans,1,NULL,123,NULL,0)==EOK && !depth);
+    enter_read_scope(&depth);
+    CHECK(ext4_fpread_batch(&file,spans,1,NULL,123,NULL,EXT4_PREAD_LOCK_HELD)==EOK);
+    CHECK(depth==1 && spans[0].completed==123);
+    leave_read_scope(&depth);
+    CHECK(ext4_mount_setup_locks("/",NULL)==EOK && !depth);
+    puts("batch reads share the caller's mount qualification until completion");
     puts("cache EOF tail uses final output storage; ordinary read preserves its untouched suffix");
     CHECK(ext4_fpread_batch(&file,spans,8,NULL,UINT64_MAX, NULL, false)==ENOMEM);
     for(unsigned i=0;i<8;i++)CHECK(spans[i].error==ENOMEM && !spans[i].completed);
