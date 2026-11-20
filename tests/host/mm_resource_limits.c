@@ -97,6 +97,13 @@ enum kernel_heap_status __wrap_kernel_heap_resize(struct kernel_heap *h,void *ol
 { return fail_resize ? KERNEL_HEAP_STATUS_EMPTY : __real_kernel_heap_resize(h,old,size,out); }
 static unsigned checks,failures;
 #define CHECK(x) do { checks++; if (!(x)) { fprintf(stderr,"FAIL %s:%u: %s\n",__FILE__,__LINE__,#x); failures++; } } while(0)
+static _Thread_local unsigned *fault_write_locks;
+void __real_kernel_rwlock_write(struct kernel_rwlock *, struct kernel_lock_guard *);
+void __wrap_kernel_rwlock_write(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
+{
+    if (fault_write_locks) (*fault_write_locks)++;
+    __real_kernel_rwlock_write(lock,guard);
+}
 static _Thread_local int pause_lock_admission;
 static atomic_int lock_admission_entered, lock_admission_resume, lock_second_done;
 static int lock_admission_result[2];
@@ -314,6 +321,16 @@ int main(void)
     assert(!kernel_mm_brk_initialize(&mm,0x10000,0x20000) && !kernel_mm_context(&mm,&mm_test_context));
     population_and_dump();
     permission_addition_claim();
+    assert(!map(BASE,P,RW,0));
+    struct kernel_vma history;
+    CHECK(!kernel_mm_vma_lookup(&mm,BASE,&history) && !(history.flags & KERNEL_VMA_ANON_HISTORY));
+    unsigned write_locks=0;
+    fault_write_locks=&write_locks;
+    enum kernel_mm_status first_fault=kernel_mm_resolve_user_fault(&mm,BASE,KERNEL_MM_WRITE);
+    fault_write_locks=NULL;
+    CHECK(!first_fault && !write_locks);
+    CHECK(!kernel_mm_vma_lookup(&mm,BASE,&history) && (history.flags & KERNEL_VMA_ANON_HISTORY));
+    CHECK(!kernel_mm_munmap(&mm,BASE,P));
     assert(!map(BASE,P,RW,0));
     pthread_t fault_thread;
     assert(!pthread_create(&fault_thread,NULL,fault_against_unmap,NULL));

@@ -33,6 +33,24 @@ static int set_valid(const struct kernel_vma_set *set)
              set->count <= set->capacity));
 }
 
+static inline uint32_t vma_flags(const struct kernel_vma *vma)
+{
+    return __atomic_load_n(&vma->flags, __ATOMIC_RELAXED);
+}
+
+/* A VMA reader fixes the descriptor's shape. Other readers may only set
+ * ANON_HISTORY, so keep that field separate from the ordinary copy. */
+static inline void snapshot_vma(const struct kernel_vma *entry, struct kernel_vma *out)
+{
+    *out = (struct kernel_vma){
+        .start = entry->start, .end = entry->end, .backing_offset = entry->backing_offset,
+        .permissions = entry->permissions, .maximum_permissions = entry->maximum_permissions,
+        .kind = entry->kind, .role = entry->role, .fault_policy = entry->fault_policy,
+        .flags = vma_flags(entry), .backing = entry->backing,
+        .shm_attachment = entry->shm_attachment, .shared_write_bytes = entry->shared_write_bytes,
+    };
+}
+
 uint64_t kernel_vma_set_generation(const struct kernel_vma_set *set)
 {
     if (!set_valid(set)) __builtin_trap();
@@ -184,7 +202,7 @@ static int can_merge(const struct kernel_vma *left,
         left->permissions != right->permissions ||
         left->kind != right->kind || left->role != right->role ||
         left->fault_policy != right->fault_policy ||
-        left->flags != right->flags ||
+        vma_flags(left) != vma_flags(right) ||
         left->backing != right->backing ||
         left->shm_attachment != right->shm_attachment ||
         left->shared_write_bytes != right->shared_write_bytes ||
@@ -237,7 +255,7 @@ uint64_t kernel_vma_set_locked_range(const struct kernel_vma_set *set, uint64_t 
     for (uint32_t i = first_overlap(set, start);
          i < set->count && set->entries[i].start < end; i++) {
         const struct kernel_vma *v = &set->entries[i];
-        if (!(v->flags & KERNEL_VMA_LOCKED)) continue;
+        if (!(vma_flags(v) & KERNEL_VMA_LOCKED)) continue;
         uint64_t a = v->start > start ? v->start : start;
         uint64_t b = v->end < end ? v->end : end;
         bytes += b - a;
@@ -304,7 +322,7 @@ enum kernel_vma_status kernel_vma_set_get_at(
     if (!set_valid(set) || vma == 0)
         return KERNEL_VMA_STATUS_INVALID_ARGUMENT;
     if (index >= set->count) return KERNEL_VMA_STATUS_NOT_FOUND;
-    *vma = set->entries[index];
+    snapshot_vma(&set->entries[index], vma);
     return KERNEL_VMA_STATUS_OK;
 }
 
@@ -317,7 +335,7 @@ enum kernel_vma_status kernel_vma_set_next(
         return KERNEL_VMA_STATUS_INVALID_ARGUMENT;
     index = lower_bound(set, address);
     if (index == set->count) return KERNEL_VMA_STATUS_NOT_FOUND;
-    *vma = set->entries[index];
+    snapshot_vma(&set->entries[index], vma);
     return KERNEL_VMA_STATUS_OK;
 }
 
@@ -328,7 +346,7 @@ enum kernel_vma_status kernel_vma_set_previous(
     if (!set_valid(set) || !vma) return KERNEL_VMA_STATUS_INVALID_ARGUMENT;
     uint32_t index = lower_bound(set, address);
     if (!index) return KERNEL_VMA_STATUS_NOT_FOUND;
-    *vma = set->entries[index - 1];
+    snapshot_vma(&set->entries[index - 1], vma);
     return KERNEL_VMA_STATUS_OK;
 }
 
@@ -1193,7 +1211,7 @@ enum kernel_vma_status kernel_vma_set_lookup(
     if (!set_valid(set) || !vma) return KERNEL_VMA_STATUS_INVALID_ARGUMENT;
     uint32_t index = containing_index(set, virtual_address);
     if (index == set->count) return KERNEL_VMA_STATUS_NOT_FOUND;
-    *vma = set->entries[index];
+    snapshot_vma(&set->entries[index], vma);
     return KERNEL_VMA_STATUS_OK;
 }
 
@@ -1212,7 +1230,7 @@ enum kernel_vma_status kernel_vma_set_lookup_recent(
         if (index == set->count) return KERNEL_VMA_STATUS_NOT_FOUND;
         if (index != previous) __atomic_store_n(slot, index, __ATOMIC_RELAXED);
     }
-    *vma = set->entries[index];
+    snapshot_vma(&set->entries[index], vma);
     *generation = set->generation;
     return KERNEL_VMA_STATUS_OK;
 }
@@ -1236,16 +1254,15 @@ int kernel_vma_set_mark_anonymous(struct kernel_vma_set *set, uint64_t address,
          entry->maximum_permissions!=snapshot->maximum_permissions ||
          entry->kind!=snapshot->kind || entry->role!=snapshot->role ||
          entry->fault_policy!=snapshot->fault_policy ||
-         ((entry->flags^snapshot->flags)&~KERNEL_VMA_ANON_HISTORY) ||
+         ((vma_flags(entry)^snapshot->flags)&~KERNEL_VMA_ANON_HISTORY) ||
          entry->backing!=snapshot->backing || entry->shm_attachment!=snapshot->shm_attachment ||
          entry->shared_write_bytes!=snapshot->shared_write_bytes)) return 0;
-    if (!(entry->flags & KERNEL_VMA_ANON_HISTORY)) {
-        if (set->generation==UINT64_MAX) __builtin_trap();
-        entry->flags |= KERNEL_VMA_ANON_HISTORY;
+    uint32_t flags = vma_flags(entry);
+    if (!(flags & KERNEL_VMA_ANON_HISTORY)) {
+        __atomic_store_n(&entry->flags, flags | KERNEL_VMA_ANON_HISTORY, __ATOMIC_RELAXED);
         if ((index>1 && can_merge(entry-1,entry)) ||
             (index<set->count && can_merge(entry,entry+1)))
             set->deferred_merge=1;
-        set->generation++;
     }
     snapshot->flags |= KERNEL_VMA_ANON_HISTORY;
     return 1;

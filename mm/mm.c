@@ -2394,11 +2394,39 @@ struct fault_vma {
     uint64_t range_edit_generation;
 };
 
+/* Anonymous reads also install a zero-filled private page. A private file
+ * mapping acquires anonymous history when servicing its first write. */
+static inline int fault_needs_anon_history(const struct kernel_vma *vma,
+    uint32_t access, int force)
+{
+    if (vma->flags & KERNEL_VMA_ANON_HISTORY) return 0;
+    int anonymous = (vma->kind == KERNEL_VMA_KIND_ANONYMOUS &&
+        vma->role != KERNEL_VMA_ROLE_VDSO && vma->role != KERNEL_VMA_ROLE_VVAR) ||
+        (vma->flags & KERNEL_VMA_ANON_SOURCE);
+    return (anonymous || (access == KERNEL_MM_WRITE &&
+        (vma->kind == KERNEL_VMA_KIND_FILE_PRIVATE || vma->kind == KERNEL_VMA_KIND_ELF_PRIVATE))) &&
+        remote_access_allowed(vma, access, force);
+}
+
+/* The caller holds VMA qualification. Metadata serializes simultaneous
+ * history marks and the merge hint without upgrading the VMA reader. */
+static __attribute__((noinline)) enum kernel_mm_status mark_fault_history(
+    struct mm_operation *operation, uint64_t address, struct fault_vma *view)
+{
+    struct kernel_mm_record *record = operation->record;
+    struct kernel_raw_guard metadata __attribute__((cleanup(kernel_raw_scope_release))) = {0};
+    if (operation->shared) kernel_raw_rwlock_write_acquire(&record->metadata, &metadata);
+    if (!kernel_vma_set_mark_anonymous(record->vmas, address, view->generation, &view->vma))
+        return KERNEL_MM_STATUS_CONFLICT;
+    view->generation = kernel_vma_set_generation(record->vmas);
+    return KERNEL_MM_STATUS_OK;
+}
+
 /* A file or ELF registration cannot disappear while the MM gate is held.
  * Shared-gate range edits still own vma_lock: copy descriptor and version
  * together, after any conflicting range claim has finished. */
 static enum kernel_mm_status read_fault_vma(struct mm_operation *operation,
-    uint64_t address, struct fault_vma *view)
+    uint64_t address, struct fault_vma *view, uint32_t access, int force)
 {
     struct kernel_mm_record *record = operation->record;
     if (!record->vmas) return KERNEL_MM_STATUS_NOT_MAPPED;
@@ -2410,8 +2438,11 @@ static enum kernel_mm_status read_fault_vma(struct mm_operation *operation,
         view->range_edit_generation =
             __atomic_load_n(&record->range_edit_generation, __ATOMIC_ACQUIRE);
     }
-    return status_from_vma(kernel_vma_set_lookup_recent(record->vmas, address,
+    enum kernel_mm_status status = status_from_vma(kernel_vma_set_lookup_recent(record->vmas, address,
         &record->recent_fault_vma, &view->vma, &view->generation));
+    if (!status && access && fault_needs_anon_history(&view->vma, access, force))
+        return mark_fault_history(operation, address, view);
+    return status;
 }
 /* 在MM raw内登记并复查，解锁后park；末次pin归还也以该锁同步登记后wake。
  * 注册owner由局部token持有，退出函数前finish，不携带裸队列游标。 */
@@ -7048,7 +7079,7 @@ static enum kernel_mm_status huge_fault(struct mm_operation *operation,uint64_t 
         if (hs==KERNEL_HUGETLB_OK && !current_pins(operation->mm) &&
             !mm_operation_begin(operation->mm,operation)) {
             struct fault_vma fresh;
-            if (!read_fault_vma(operation,address,&fresh) && fresh.vma.backing==map &&
+            if (!read_fault_vma(operation,address,&fresh,0,0) && fresh.vma.backing==map &&
                 fresh.vma.kind==KERNEL_VMA_KIND_HUGETLB_PRIVATE &&
                 (fresh.vma.backing_offset+base-fresh.vma.start)/ARCH_MMU_HUGE_SIZE==index &&
                 remote_access_allowed(&fresh.vma,access,force)) {
@@ -7111,19 +7142,6 @@ static enum kernel_mm_status huge_fault(struct mm_operation *operation,uint64_t 
     if (claim.map) kernel_hugetlb_fault_finish(&claim,!status);
     if (borrowed) physical_page_release_order(record->space.allocator,old.physical_address,old.order);
     return status;
-}
-
-/* Keep the one-time VMA editor off the nested file/page fault stack. */
-static __attribute__((noinline)) enum kernel_mm_status associate_anonymous_fault(
-    struct mm_operation *operation,uint64_t address,struct fault_vma *view)
-{
-    struct kernel_mm_record *record=operation->record;
-    KERNEL_LOCK_SCOPE(vma_guard);
-    if (operation->shared) kernel_rwlock_write(&record->vma_lock,&vma_guard);
-    if (!kernel_vma_set_mark_anonymous(record->vmas,address,view->generation,&view->vma))
-        return KERNEL_MM_STATUS_CONFLICT;
-    view->generation=kernel_vma_set_generation(record->vmas);
-    return KERNEL_MM_STATUS_OK;
 }
 
 /* The continuous read gate keeps the source live. Its executable lease
@@ -7189,19 +7207,12 @@ static __attribute__((noinline)) int try_elf_ready_fault(struct mm_operation *op
 static enum kernel_mm_status dispatch_fault(struct mm_operation *operation, uint64_t address,
     uint32_t access, struct fault_vma *view, int force)
 {
-    /* A completely cold VMA has no anonymous backing. BoarOS materializes a
-     * private writable zero page even on reads: record the association during
-     * that existing fault, without adding write protection or a second fault.
-     * File mappings instead acquire it on COW. The one-time association is
-     * sticky across discard/split/fork, like Linux anon_vma preparation. */
-    int anonymous=(view->vma.kind==KERNEL_VMA_KIND_ANONYMOUS &&
-        view->vma.role!=KERNEL_VMA_ROLE_VDSO && view->vma.role!=KERNEL_VMA_ROLE_VVAR) ||
-        (view->vma.flags & KERNEL_VMA_ANON_SOURCE);
-    if (!(view->vma.flags & KERNEL_VMA_ANON_HISTORY) &&
-        (anonymous || (access==KERNEL_MM_WRITE &&
-         (view->vma.kind==KERNEL_VMA_KIND_FILE_PRIVATE || view->vma.kind==KERNEL_VMA_KIND_ELF_PRIVATE))) &&
-        remote_access_allowed(&view->vma,access,force)) {
-        enum kernel_mm_status status=associate_anonymous_fault(operation,address,view);
+    /* Stack growth and explicit population choose the effective access
+     * after the initial lookup. Hardware faults already handled this. */
+    if (fault_needs_anon_history(&view->vma, access, force)) {
+        KERNEL_LOCK_SCOPE(vma_guard);
+        if (operation->shared) kernel_rwlock_read(&operation->record->vma_lock, &vma_guard);
+        enum kernel_mm_status status=mark_fault_history(operation,address,view);
         if (status) return status;
     }
     switch (view->vma.kind) {
@@ -7239,7 +7250,7 @@ static enum kernel_mm_status resolve_user_fault(struct kernel_mm *mm,
         enum kernel_mm_status status = mm_operation_begin(mm, &operation);
         if (status) return status;
         struct fault_vma view={0};
-        status = read_fault_vma(&operation, address, &view);
+        status = read_fault_vma(&operation, address, &view, access, force);
         if (status == KERNEL_MM_STATUS_NOT_MAPPED && operation.record->vmas) {
             if (operation.shared) {
                 shared = 0; /* Re-read the hole under the stack editor's writer qualification. */
@@ -7729,11 +7740,11 @@ static int populate_range(struct kernel_mm *mm, uint64_t start, uint64_t end,
             if (mm_operation_begin(mm, &operation)) return -KERNEL_EAGAIN;
         }
         struct fault_vma view;
-        enum kernel_mm_status status = read_fault_vma(&operation, start, &view);
+        enum kernel_mm_status status = read_fault_vma(&operation, start, &view, 0, 0);
         if (status) return -KERNEL_ENOMEM;
         if (huge_vma(&view.vma) && operation.shared) {
             mm_operation_end(&operation);operation.shared=0;
-            if (mm_operation_begin(mm,&operation) || read_fault_vma(&operation,start,&view)) return -KERNEL_EAGAIN;
+            if (mm_operation_begin(mm,&operation) || read_fault_vma(&operation,start,&view,0,0)) return -KERNEL_EAGAIN;
         }
         const struct kernel_vma *vma = &view.vma;
         if (locked_only && (vma->flags & KERNEL_VMA_LOCK_MASK) != KERNEL_VMA_LOCKED) {
