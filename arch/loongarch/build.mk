@@ -86,7 +86,7 @@ ifneq ($(KERNEL_LA),kernel-la)
 .PHONY: kernel-la
 kernel-la: $(KERNEL_LA)
 endif
-.PHONY: run-loongarch test-loongarch prepare-la-tools prepare-la-linux test-stack-usage-la
+.PHONY: test-loongarch prepare-la-tools prepare-la-linux test-stack-usage-la
 prepare-la-tools:
 	python3 -B tests/loongarch/qemu_rtc.py
 .PHONY: prepare-la-original-tools test-rtc-model-loongarch test-rtc-alarm-loongarch
@@ -102,7 +102,7 @@ prepare-la-linux:
 prepare-la-linux-platform:
 	python3 -B tests/loongarch/prepare.py --component linux --profile platform --cross $(LA_CROSS_COMPILE)
 ifeq ($(QEMU_LOONGARCH64),build/qemu-la-rtc/qemu-system-loongarch64)
-run-loongarch test-loongarch: prepare-la-tools
+test-loongarch: prepare-la-tools
 endif
 
 $(LA_BUILD)/kernel-block-la: $(LA_TEST_OBJECTS) $(LA_BUILD)/tests/loongarch/block.o arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config
@@ -125,8 +125,6 @@ test-pci-host:
 	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/pci.c kernel/pci.c -o build/host/pci
 	build/host/pci
 	python3 -B tests/host/loongarch_irq.py
-run-loongarch: kernel-la
-	$(QEMU_LOONGARCH64) -machine virt -cpu la464 -smp 1 -m 1G -kernel kernel-la -nographic -no-reboot
 test-loongarch: kernel-la-contract prepare-la-linux test-stack-usage-la test-loongarch-fatal
 	python3 -B tests/loongarch/run.py --kernel $(LA_BUILD)/kernel-contract-la --qemu $(QEMU_LOONGARCH64) --log $(LA_BUILD)/boaros.log
 $(LA_BUILD)/kernel-boot-random: $(LA_TEST_OBJECTS) $(LA_BUILD)/tests/loongarch/boot_random.o arch/loongarch/linker.ld $(LA_BUILD)/generated/link-config

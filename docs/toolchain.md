@@ -63,3 +63,9 @@ make kernel-la LA_CROSS_COMPILE=loongarch64-unknown-linux-gnu-
 交互启动使用 `make shell-riscv` 或 `make shell-loongarch`。根盘制作需要 curl 和 e2fsprogs，首次启动方法见 [README](../README.md) 的快速上手一节。
 
 开发时可以用 `make run-riscv` 检查无盘启动，用 `make debug-riscv` 启动并等待调试器连接。LoongArch 的 `make run-loongarch` 可检查生产内核在无盘时的启动诊断。测试入口见[贡献指南](../CONTRIBUTING.md#测试)。
+
+## 5. Docker 开发环境
+
+仓库根目录的 [Dockerfile](../Dockerfile) 以 x86-64 Arch Linux 为宿主环境，使用 Arch Linux Archive 的 `2026/11/20` 软件仓库快照。关键版本为 RISC-V 交叉 GCC 16.2.0、GNU Binutils 2.47、QEMU 11.1.3 和 pahole 1.32。LoongArch 使用本地开发同款的龙芯 GCC 15.1.0、Binutils 2.45 工具链。
+
+交互启动使用 Arch 软件包中的两种 QEMU。需要仓库实时时钟（Real-Time Clock，RTC）模型补丁的 LoongArch 测试，仍按本页的模拟器准备步骤构建并显式指定 `QEMU_LOONGARCH64`。
