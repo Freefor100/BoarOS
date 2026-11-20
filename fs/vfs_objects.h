@@ -108,8 +108,9 @@ struct kernel_vfs_dentry {
     struct kernel_heap *heap;
     struct kernel_vfs_dentry *parent, *next, **previous;
     uint32_t references;
+    uint32_t recently_used; /* Native word exchange when cache trimming consumes the hint. */
     struct kernel_vfs_dentry *cache_next, *cache_previous;
-    uint8_t cached, detached, recently_used, mountpoint_seen;
+    uint8_t cached, detached, mountpoint_seen;
     uint32_t mountpoints;
     char *name;
     struct kernel_vfs_dentry *index_left, *index_right;
