@@ -17,7 +17,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 
 调用者是 scheduler 当前不透明 task，供依赖任务身份或资源的系统调用取得明确上下文；通用解码层不从 RISC-V `tp` 隐式寻找 current。请求包含系统调用号和六个 64 位参数。结果动作定义在公共头中：
 
-当前分派覆盖RV的258个编号、LA的255个编号；这表示入口已接入，各接口的具体支持范围见对应模块。
+当前分派覆盖 RISC-V 的 269 个编号和 LoongArch 的 265 个编号。各接口的具体支持范围见对应模块。
 `vhangup(58)` 提供有权限的控制终端挂断，旧实例失效而设备保持可重新打开；具体行为见[终端模块](kernel-tty.md)。`fcntl` 的异步 owner、所选信号和 `O_ASYNC` 见[文件接口](kernel-files.md)及[信号模块](kernel-signal.md#sigio-异步-io-通知)。
 
 
@@ -58,7 +58,26 @@ LA的259仍返回`ENOSYS`。这些入口的直接消费者可用`python3 tests/u
 | bpf（280）、perf_event_open（241） | [BPF 模块](kernel-bpf.md)：对象/map/程序/BTF、socket 过滤与 raw_syscalls 跟踪 |
 | sendfile（71） | [文件模块](kernel-files.md)：有界内核复制、位置、来源片段、整包与同步错误 |
 | statfs/fstatfs（43/44）、utimensat（88） | [文件模块](kernel-files.md)：挂载统计、显式纳秒时间与 fd/nofollow |
+| `sync_file_range`（84） | 指定页范围的数据写回与等待，错误按打开文件对象的游标交付 |
+| `io_setup` 至 `io_getevents`（0–4）、`io_pgetevents`（292） | 地址空间拥有完成环，支持普通文件的定位读写、文件同步、轮询和事件描述符通知 |
 | pselect6/ppoll（72/73）、newfstatat/fstat（79/80） | [文件模块](kernel-files.md)：集合/信号屏蔽、stat 编码和元数据 |
+
+`sync_file_range` 的 WRITE 请求可由页缓存执行者在调用返回后推进。WAIT_BEFORE
+及 WAIT_AFTER 等待相应范围的数据版本，ext4 也把已交给日志子系统的有序数据写到
+文件实际数据块。该调用提供数据写回完成点。元数据提交和设备缓存刷新由
+`fsync`、`fdatasync` 等接口负责。
+
+异步输入输出（Asynchronous I/O，AIO）的映射和上下文随地址空间管理，完成环和
+事件描述符使用同一次实际完成。常规文件满足对齐、长度不超过 64 KiB 且符合提交
+条件时，直接数据读写由后台执行者完成。带逐次标志或需要额外页缓存借用等请求沿
+提交线程的既有路径完成。`io_pgetevents` 在信号中断时优先返回已交付事件。
+没有事件时，已执行信号处理函数的调用返回 `EINTR`，没有执行处理函数的调用
+在恢复信号掩码后重试。系统额度及使用量在 `/proc/sys/fs/aio-max-nr` 和 `aio-nr` 查看。
+
+`membarrier`（283）提供全局和私有跨核屏障。私有屏障按活动地址空间选核，
+全局命令覆盖每个在线处理器。RISC-V `riscv_hwprobe`（258）从启动时取得的每核
+信息回答查询和 CPU 筛选。两个系统调用的普通路径开销可用
+`tests/workloads/resource/syscall_wave1_cost.c` 检查。
 
 - `clock_gettime` 编号 113、`clock_getres` 编号 114、`gettimeofday` 编号 169、`clock_nanosleep` 编号 115 与 `nanosleep` 编号 101 构成时间族，语义见[内核时间模块](kernel-time.md)。
 - `setpriority(140)`、`getpriority(141)`支持线程、进程组和真实UID集合，权限、RLIMIT_NICE与实际CPU权重见[调度模块](kernel-scheduler.md)。

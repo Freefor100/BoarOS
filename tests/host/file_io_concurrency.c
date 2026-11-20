@@ -56,7 +56,8 @@ static unsigned fail_range_writeback;
 int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *,struct file_write_span *,size_t);
 int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node,struct file_write_span *spans,size_t count)
 {
-    if (node == fail_range_node && __atomic_exchange_n(&fail_range_writeback, 0, __ATOMIC_ACQ_REL)) {
+    if (node == __atomic_load_n(&fail_range_node, __ATOMIC_ACQUIRE) &&
+        __atomic_exchange_n(&fail_range_writeback, 0, __ATOMIC_ACQ_REL)) {
         kernel_vfs_record_writeback_error(node, -KERNEL_EIO);
         return -KERNEL_EIO;
     }
@@ -1885,7 +1886,7 @@ static void range_writeback_error_case(struct kernel_heap *heap, struct kernel_v
     assert(!kernel_vfs_file_acquire_write(&file->file));
     assert(!kernel_vfs_pwrite(&file->file, 0, "range", 5, &written) && written == 5);
     assert(!kernel_page_cache_start_worker(cache));
-    fail_range_node = kernel_open_file_node(file);
+    __atomic_store_n(&fail_range_node, kernel_open_file_node(file), __ATOMIC_RELEASE);
     __atomic_store_n(&fail_range_writeback, 1, __ATOMIC_RELEASE);
     uint64_t length = BOAROS_PAGE_SIZE;
     assert(!kernel_vfs_sync_file_range(&file->file, 0, length, KERNEL_SYNC_FILE_RANGE_WRITE,
@@ -1896,7 +1897,7 @@ static void range_writeback_error_case(struct kernel_heap *heap, struct kernel_v
         &other->observed_writeback_error) == -KERNEL_EIO);
     assert(!kernel_vfs_sync_file_range(&file->file, 0, length, KERNEL_SYNC_FILE_RANGE_ALL,
         &file->observed_writeback_error));
-    fail_range_node = NULL;
+    __atomic_store_n(&fail_range_node, NULL, __ATOMIC_RELEASE);
     assert(!kernel_open_file_release(&other) && !kernel_open_file_release(&file));
     assert(!kernel_vfs_unlink(mount, "/range-writeback"));
     puts("PASS range writeback: asynchronous error, distinct file cursors and successful retry");
