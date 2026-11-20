@@ -31,6 +31,8 @@ int kernel_files_path_start(struct kernel_files *files,
 
 #define KERNEL_FILES_INITIAL_CAPACITY 32U
 #define KERNEL_FILES_MAX_CAPACITY ((uint32_t)KERNEL_RLIMIT_NOFILE_CAP)
+#define KERNEL_FILES_INLINE_BITMAP_CAPACITY 512U
+#define KERNEL_FILES_BITMAP_WORDS(capacity) (((capacity) + 63U) / 64U)
 #define KERNEL_FILES_FD_CLOEXEC UINT32_C(1)
 #define KERNEL_FILES_FD_RESERVED UINT32_C(2)
 struct kernel_files_fd_reservation { struct kernel_files *files; uint32_t fd; };
@@ -60,9 +62,13 @@ struct kernel_files_record {
     struct kernel_record_lock *record_locks;
     struct kernel_files_statistics statistics;
     uint32_t references;
+    /* Lowest free slot, or capacity when full. */
     uint32_t next_fd;
     struct kernel_raw_lock metadata_lock;
     uint8_t retired;
+    /* Under metadata_lock, a bit covers an installed description or a reservation. */
+    uint64_t *occupied;
+    uint64_t inline_occupied[KERNEL_FILES_BITMAP_WORDS(KERNEL_FILES_INLINE_BITMAP_CAPACITY)];
 };
 #if BOAROS_COST_DIAGNOSTICS
 /* 同级对象锁很多；单列实际 FD 表争用，复用 raw guard 的计时。 */

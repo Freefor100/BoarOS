@@ -165,6 +165,58 @@ static void finish_files(struct kernel_files *files,
     files->state = state;
 }
 
+static enum kernel_heap_status allocate_fd_bitmap(struct kernel_heap *heap,
+    uint64_t **bitmap)
+{
+    return kernel_heap_allocate_zeroed(heap,
+        KERNEL_FILES_BITMAP_WORDS(KERNEL_FILES_MAX_CAPACITY), sizeof(**bitmap),
+        (void **)bitmap);
+}
+
+static uint32_t first_fd_bit(uint64_t bits)
+{
+#if defined(__riscv) && !defined(__riscv_zbb)
+    /* 基础 RV64 的编译器内建操作会调用外部运行库。 */
+    uint32_t bit = 0;
+    if (!(bits & UINT32_MAX)) { bits >>= 32U; bit += 32U; }
+    if (!(bits & UINT16_MAX)) { bits >>= 16U; bit += 16U; }
+    if (!(bits & UINT8_MAX)) { bits >>= 8U; bit += 8U; }
+    if (!(bits & 0xFU)) { bits >>= 4U; bit += 4U; }
+    if (!(bits & 0x3U)) { bits >>= 2U; bit += 2U; }
+    return bit + !(bits & 1U);
+#else
+    return (uint32_t)__builtin_ctzll(bits);
+#endif
+}
+
+static uint32_t find_empty_locked(const struct kernel_files_record *record,
+    uint32_t minimum, uint32_t upper)
+{
+    if (minimum >= upper) return upper;
+    uint32_t word = minimum / 64U;
+    uint64_t empty = ~record->occupied[word] >> (minimum % 64U);
+    while (!empty) {
+        minimum = ++word * 64U;
+        if (minimum >= upper) return upper;
+        empty = ~record->occupied[word];
+    }
+    uint32_t fd = minimum + ((empty & 1U) ? 0U : first_fd_bit(empty));
+    return fd < upper ? fd : upper;
+}
+
+static void occupy_fd_locked(struct kernel_files_record *record, uint32_t fd)
+{
+    record->occupied[fd / 64U] |= UINT64_C(1) << (fd % 64U);
+    if (fd == record->next_fd)
+        record->next_fd = find_empty_locked(record, fd + 1U, record->statistics.capacity);
+}
+
+static void free_fd_locked(struct kernel_files_record *record, uint32_t fd)
+{
+    record->occupied[fd / 64U] &= ~(UINT64_C(1) << (fd % 64U));
+    if (fd < record->next_fd) record->next_fd = fd;
+}
+
 static enum kernel_files_status create_files(
     struct kernel_files *files,
     struct kernel_heap *heap,
@@ -194,6 +246,16 @@ static enum kernel_files_status create_files(
         return heap_status == KERNEL_HEAP_STATUS_EMPTY
                    ? KERNEL_FILES_STATUS_NO_MEMORY
                    : KERNEL_FILES_STATUS_STATE;
+    }
+    record->occupied = record->inline_occupied;
+    if (capacity > KERNEL_FILES_INLINE_BITMAP_CAPACITY) {
+        heap_status = allocate_fd_bitmap(heap, &record->occupied);
+        if (heap_status != KERNEL_HEAP_STATUS_OK) {
+            kernel_heap_release(heap, slots);
+            kernel_heap_release(heap, record);
+            return heap_status == KERNEL_HEAP_STATUS_EMPTY
+                ? KERNEL_FILES_STATUS_NO_MEMORY : KERNEL_FILES_STATUS_STATE;
+        }
     }
     record->slots = slots;
     record->statistics.capacity = capacity;
@@ -311,7 +373,6 @@ Retry:
     if (status != KERNEL_FILES_STATUS_OK) {
         return status;
     }
-    destination->record->next_fd = 0;
     destination->nofile_limit = source->nofile_limit;
     struct kernel_raw_guard source_guard={0};
     kernel_raw_lock_acquire(&source->record->metadata_lock,&source_guard);
@@ -340,9 +401,13 @@ Retry:
                 destination->record->statistics.close_on_exec_fds++;
             }
         }
-        if (description) destination->record->slots[index] = source->record->slots[index];
+        if (description) {
+            destination->record->slots[index] = source->record->slots[index];
+            destination->record->occupied[index / 64U] |= UINT64_C(1) << (index % 64U);
+        }
     }
     if (index == source->record->statistics.capacity) {
+        destination->record->next_fd = find_empty_locked(destination->record, 0, capacity);
         destination->record->statistics.peak_open_fds =
             destination->record->statistics.current_open_fds;
         kernel_raw_lock_release(&source_guard);
@@ -437,58 +502,62 @@ static enum kernel_files_status ensure_slot_capacity(
 {
     *linux_result = 0;
     if (needed > KERNEL_FILES_MAX_CAPACITY) { *linux_result=-KERNEL_EBADF; return KERNEL_FILES_STATUS_OK; }
-    uint32_t capacity;
-    { KERNEL_FILES_SCOPE(guard, files); capacity=files->record->statistics.capacity; }
-    if (needed <= capacity) return KERNEL_FILES_STATUS_OK;
+    struct kernel_files_record *record=files->record;
+    uint32_t observed;
+    { KERNEL_FILES_SCOPE(guard, files); observed=record->statistics.capacity; }
+    if (needed <= observed) return KERNEL_FILES_STATUS_OK;
+    uint32_t capacity=observed;
     while (capacity < needed) capacity *= 2;
     struct kernel_file_slot *candidate=0, *old=0;
+    uint64_t *bitmap=0;
     enum kernel_heap_status status=kernel_heap_allocate_zeroed(files->heap,
         capacity, sizeof(*candidate), (void **)&candidate);
+    if (!status && capacity > KERNEL_FILES_INLINE_BITMAP_CAPACITY &&
+        observed <= KERNEL_FILES_INLINE_BITMAP_CAPACITY) {
+        status=allocate_fd_bitmap(files->heap, &bitmap);
+        if (status) kernel_heap_release(files->heap, candidate);
+    }
     if (status == KERNEL_HEAP_STATUS_EMPTY) { *linux_result=-KERNEL_ENOMEM; return KERNEL_FILES_STATUS_OK; }
     if (status != KERNEL_HEAP_STATUS_OK) return KERNEL_FILES_STATUS_STATE;
     {
         KERNEL_FILES_SCOPE(guard, files);
-        uint32_t current=files->record->statistics.capacity;
+        uint32_t current=record->statistics.capacity;
         if (needed > current) {
             if (current >= capacity || current > KERNEL_FILES_MAX_CAPACITY/2) __builtin_trap();
             /* 最大旧数组512槽，即8KiB；发布后旧数组只有本调用者拥有。 */
-            memcpy(candidate, files->record->slots, current * sizeof(*candidate));
-            old=files->record->slots;
-            files->record->slots=candidate;
-            files->record->statistics.capacity=capacity;
+            memcpy(candidate, record->slots, current * sizeof(*candidate));
+            old=record->slots;
+            if (bitmap && current <= KERNEL_FILES_INLINE_BITMAP_CAPACITY) {
+                memcpy(bitmap, record->inline_occupied, sizeof(record->inline_occupied));
+                record->occupied=bitmap;
+                bitmap=0;
+            }
+            record->slots=candidate;
+            record->statistics.capacity=capacity;
             candidate=0;
         }
     }
     if (old) kernel_heap_release(files->heap, old);
     if (candidate) kernel_heap_release(files->heap, candidate);
+    if (bitmap) kernel_heap_release(files->heap, bitmap);
     return KERNEL_FILES_STATUS_OK;
 }
-static uint32_t find_empty_locked(const struct kernel_files *files, uint32_t minimum)
-{
-    uint32_t upper=files->nofile_limit < files->record->statistics.capacity
-        ? files->nofile_limit : files->record->statistics.capacity;
-    for (uint32_t i=minimum; i<upper; i++)
-        if (!files->record->slots[i].description && !files->record->slots[i].flags) return i;
-    return upper;
-}
 /* 找到编号时取得预留owner，直到安装或取消，close/dup不能接管它。 */
-static enum kernel_files_status find_fd_from(
-    struct kernel_files *files, uint32_t minimum, uint32_t *fd, int64_t *linux_result, int hint)
+enum kernel_files_status kernel_files_find_free_fd(
+    struct kernel_files *files, uint32_t *fd, int *linux_result)
 {
+    if (!kernel_files_is_live(files) || !fd || !linux_result)
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     *linux_result=0;
+    struct kernel_files_record *record=files->record;
     for (;;) {
         uint32_t needed;
         {
             KERNEL_FILES_SCOPE(guard, files);
-            uint32_t index=find_empty_locked(files, hint ? files->record->next_fd : minimum);
-            if (index < files->record->statistics.capacity && index < files->nofile_limit) {
-                files->record->slots[index].flags=KERNEL_FILES_FD_RESERVED;
-                if (index==files->record->next_fd) {
-                    do { files->record->next_fd++; }
-                    while (files->record->next_fd<files->record->statistics.capacity &&
-                        (files->record->slots[files->record->next_fd].description ||
-                         files->record->slots[files->record->next_fd].flags));
-                }
+            uint32_t index=record->next_fd;
+            if (index < record->statistics.capacity && index < files->nofile_limit) {
+                record->slots[index].flags=KERNEL_FILES_FD_RESERVED;
+                occupy_fd_locked(record, index);
                 *fd=index;
                 return KERNEL_FILES_STATUS_OK;
             }
@@ -497,18 +566,13 @@ static enum kernel_files_status find_fd_from(
             }
             needed=index+1;
         }
-        enum kernel_files_status status=ensure_slot_capacity(files, needed, linux_result);
-        if (status || *linux_result) return status;
+        int64_t result;
+        enum kernel_files_status status=ensure_slot_capacity(files, needed, &result);
+        if (status || result) {
+            *linux_result=(int)result;
+            return status;
+        }
     }
-}
-enum kernel_files_status kernel_files_find_free_fd(
-    struct kernel_files *files, uint32_t *fd, int *linux_result)
-{
-    if (!kernel_files_is_live(files) || !fd || !linux_result) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
-    int64_t result;
-    enum kernel_files_status status=find_fd_from(files, 0, fd, &result, 1);
-    *linux_result=(int)result;
-    return status;
 }
 
 enum kernel_files_status kernel_files_install_owned_locked(
@@ -539,6 +603,7 @@ enum kernel_files_status kernel_files_install_owned_locked(
 
     /* close_range(CLOEXEC) can mark a claimed slot while its opener is
      * still allocating/copying. Installation preserves that published bit. */
+    if (!slot->flags) occupy_fd_locked(files->record, fd);
     fd_flags |= slot->flags & KERNEL_FILES_FD_CLOEXEC;
     slot->description = *owner;
     slot->flags = fd_flags;
@@ -550,14 +615,6 @@ enum kernel_files_status kernel_files_install_owned_locked(
     }
     if ((fd_flags & KERNEL_FILES_FD_CLOEXEC) != 0U) {
         files->record->statistics.close_on_exec_fds++;
-    }
-    if (fd == files->record->next_fd) {
-        do {
-            files->record->next_fd++;
-        } while (files->record->next_fd <
-                     files->record->statistics.capacity &&
-                 (files->record->slots[files->record->next_fd].description != 0 ||
-                  files->record->slots[files->record->next_fd].flags != 0));
     }
     *owner = 0;
     return KERNEL_FILES_STATUS_OK;
@@ -622,7 +679,7 @@ void kernel_files_cancel_reservation(struct kernel_files_fd_reservation *reserva
         (record->slots[reservation->fd].flags & ~KERNEL_FILES_FD_CLOEXEC) !=
             KERNEL_FILES_FD_RESERVED) __builtin_trap();
     record->slots[reservation->fd].flags = 0;
-    if (reservation->fd < record->next_fd) record->next_fd = reservation->fd;
+    free_fd_locked(record, reservation->fd);
     reservation->files = 0;
 }
 
@@ -822,7 +879,7 @@ static struct kernel_open_file_description *detach_fd_locked(
     slot->flags = 0;
     if (!files->record->statistics.current_open_fds) __builtin_trap();
     files->record->statistics.current_open_fds--;
-    if (fd < files->record->next_fd) files->record->next_fd = fd;
+    free_fd_locked(files->record, fd);
     return description;
 }
 static enum kernel_files_status release_detached(
@@ -853,14 +910,18 @@ static enum kernel_files_status release_detached(
 static enum kernel_files_status dup_from(struct kernel_files *files,
     int64_t oldfd, uint32_t minimum, uint32_t flags, int64_t *result)
 {
+    struct kernel_files_record *record=files->record;
     for (;;) {
         uint32_t needed;
         {
             KERNEL_FILES_SCOPE(guard, files);
             struct kernel_open_file_description *source=lookup_locked(files, oldfd);
             if (!source) { *result=-KERNEL_EBADF; return KERNEL_FILES_STATUS_OK; }
-            uint32_t fd=find_empty_locked(files, minimum);
-            if (fd < files->record->statistics.capacity && fd < files->nofile_limit) {
+            uint32_t upper=record->statistics.capacity;
+            if (files->nofile_limit < upper) upper=files->nofile_limit;
+            uint32_t fd=record->next_fd;
+            if (minimum > fd) fd=find_empty_locked(record, minimum, upper);
+            if (fd < upper) {
                 if (kernel_open_file_acquire(source)) __builtin_trap();
                 enum kernel_files_status status=kernel_files_install_owned_locked(files, fd, flags, &source);
                 if (status) __builtin_trap();
@@ -1313,6 +1374,8 @@ enum kernel_files_status kernel_files_release_for_task(struct kernel_files *file
     enum kernel_files_status status=kernel_files_drain_file_cleanup(files);
     if (status) return status;
     kernel_heap_release(files->heap, files->record->slots);
+    if (files->record->occupied != files->record->inline_occupied)
+        kernel_heap_release(files->heap, files->record->occupied);
     kernel_heap_release(files->heap, files->record);
     finish_files(files, KERNEL_FILES_RELEASED);
     return KERNEL_FILES_STATUS_OK;

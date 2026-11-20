@@ -27,7 +27,8 @@ OFD 引用采用非零/溢出检查的原子取得与归还，只有最后归还
 每张 FD record 的 rank30 raw 锁保护槽、预留编号、descriptor flags、record 引用和槽位数量。已持有句柄直接访问 record，查槽只检查编号和槽状态；可变不变量在实际修改处维护。调用、字节和分块计数使用 relaxed 原子更新，读取统计时分别取样；它们不参与 FD 所有权决策。
 lookup 与 OFD acquire 在同一临界区完成；跨解锁消费者持实际 OFD pin，已移除裸 description 查询入口。
 close/dup 替换在锁内摘槽，锁外处理选定 OFD；fd 复用不改变已 pin 请求的身份。
-扩容先在锁外分配并清零候选，锁内复查、最多复制 8 KiB 后发布，旧数组及竞争失败候选在锁外释放。
+同一把表锁保护占用位图和最低空闲编号 `next_fd`。已安装的槽和正在预留的槽都置位，安装已预留的槽沿用该位，取消预留或摘除槽时清除该位。普通分配直接读出最低空闲编号；`F_DUPFD` 指定的下界更高时，从下界按 64 位机器字查找。最低空闲编号被占用后也按机器字查找下一个空槽，最多检查 16 个机器字。分配同时受当前句柄的 `RLIMIT_NOFILE` 限制。共享表共同维护位图，独立复制的表按实际继承的槽重建位图和最低编号。
+扩容在锁外准备清零的槽数组。最多 512 槽时使用表内的位图，扩到 1024 槽时另在锁外分配 128 字节位图。锁内复查后最多复制 8 KiB 旧槽与 64 字节旧位图，一起发布新容量和存储。旧槽数组及竞争失败的候选在锁外释放，末次归还文件表时释放独立位图。
 open/pipe/socket 的编号预留保持到安装或取消；成对 fd 在用户输出成功后一起发布，复制失败不会按复用后的编号关闭对象。
 共享 OFD 的 APPEND/NONBLOCK 使用原子 status 更新，访问方向保持；F_SETFL 忽略不可变/open-only位，保留 O_SYNC/O_DSYNC、DIRECTORY/NOFOLLOW，DIRECT 仍返回 EINVAL。O_NOATIME 资格见[访问时间策略](vfs-ext4.md)。FD_CLOEXEC 仍属于各张表。
 
@@ -54,7 +55,7 @@ ext4 路径查找、目录操作与文件元数据在发起 CPU 执行；VFS 在
 host模型只提供线程/架构上下文及未开放消费者的abort；task定位与scratch使用生产实现。新增共享read/readv包唯一性、热读不排队、冷读期间同OFD seek在提交前等待，以及伪造guard和自持用户pin拒绝检查。暂停独立 fsync 或范围同步的调用时，同一 OFD 的热 read 与 SEEK_CUR 仍完成；竞争同步只消费一次已有写回错误，完成时请求及 OFD 引用归还。实际跨核执行见[两核模块](riscv-smp.md#普通文件io的执行位置)。
 宿主另强制交错执行中close/dup复用及worker停止：排队者被取消，执行者仍返回原OFD内容，最后请求/引用归零；调用 CPU 的冷缺页复制经 fork 私有页验证 COW 隔离。真实RV单/两核、双RAM与独立重启以及原静态/pthread组合见[普通文件交接](riscv-smp.md#普通文件io的执行位置)。
 `make test-files-concurrency-host`直接链接真实表/OFD/pipe、allocator、MM 和等待实现，
-在 4/16 KiB 模型核对 2/4 线程扩容/dup 编号唯一性、pin-close 交接、预留冲突、OOM 和引用归还；
+在 4/16 KiB 模型核对 2/4 线程扩容/dup 编号唯一性、pin-close 交接、预留冲突、OOM 和引用归还，并验证跨位图字的最低编号、共享表中不同句柄的上限、独立复制及位图分配失败后的回滚。
 `make test-pipe-concurrency-host`另验证真实MM/uaccess的提前wake、fd复用后旧请求、EOF/部分EPIPE、
 复制期间poll、4095/4096/4097向量几何、故障片段撤销与munmap前缀；2/4线程检查内容隔离、ring wrap及无端点保留的EOF。
 其中tmpfs作为真实缺页复制缓冲，驻留/来源及后备owner在最终MM释放后归还；客户机磁盘缓冲与CPU0 worker的组合见[RV两核](riscv-smp.md#共享-fd-表与匿名-pipe)。

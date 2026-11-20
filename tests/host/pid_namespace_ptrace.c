@@ -110,6 +110,15 @@ void pid_namespace_ptrace_cases(struct kernel_task *root,struct kernel_task *inn
     publish_stop(child,TRACE_STOP,0,NULL);
     child->ptrace->token=token;
     struct kernel_task *claimed=NULL;uint32_t event=0;int matching=0;
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        assert(!ptrace_select_target_locked(root,child,2,&claimed,&event,&matching));
+        assert(!claimed && !matching);
+        assert(ptrace_select_target_locked(inner,child,2,&claimed,&event,&matching));
+        assert(claimed==child && event==TRACE_WAIT_STOP && matching);
+    }
+    scheduler_task_wait_claim_release(child);ptrace_wait_claim_done(child);scheduler_task_put(child);
+    claimed=NULL;event=0;matching=0;
     assert(ptrace_select(inner,0,NULL,2,&claimed,&event,&matching));
     assert(claimed==child && event==TRACE_WAIT_STOP);
     copy_terminate=child;

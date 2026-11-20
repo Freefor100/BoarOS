@@ -1,5 +1,7 @@
 /* Exercise the production child-link edits without exposing private APIs. */
+#define kernel_raw_lock_acquire child_test_lock_acquire
 #include "../../kernel/sched/process.c"
+#undef kernel_raw_lock_acquire
 #include <assert.h>
 #include <signal.h>
 #include <stdio.h>
@@ -11,9 +13,36 @@
 struct kernel_scheduler scheduler;
 struct kernel_raw_lock kernel_wait_domain;
 static struct kernel_cpu cpu;
+static unsigned child_domain_acquires;
 _Thread_local uintptr_t sync_test_irq;
 void *sync_test_cpu(void) { return &cpu; }
 void *sync_test_current_task(void) { return cpu.current; }
+void kernel_raw_lock_acquire(struct kernel_raw_lock *, struct kernel_raw_guard *);
+void child_test_lock_acquire(struct kernel_raw_lock *lock, struct kernel_raw_guard *guard)
+{
+    if (lock == &kernel_wait_domain) child_domain_acquires++;
+    kernel_raw_lock_acquire(lock, guard);
+}
+
+void scheduler_task_get_locked(struct kernel_task *task) { task->storage_borrows++; }
+void scheduler_task_put(struct kernel_task *task)
+{ assert(task->storage_borrows); task->storage_borrows--; }
+uint32_t kernel_ptrace_tracer_tid_locked(const struct kernel_task *task)
+{ assert(!task->ptrace); return 0; }
+int ptrace_select(struct kernel_task *task, int which, const struct kernel_pid *target,
+    unsigned options, struct kernel_task **selected, uint32_t *event, int *matching)
+{
+    (void)which; (void)target; (void)options; (void)selected; (void)event; (void)matching;
+    assert(!task->ptrace);
+    return 0;
+}
+int ptrace_select_target_locked(struct kernel_task *parent, struct kernel_task *task,
+    unsigned options, struct kernel_task **selected, uint32_t *event, int *matching)
+{
+    (void)options; (void)selected; (void)event; (void)matching;
+    assert(!parent->ptrace && !task->ptrace);
+    return 0;
+}
 
 /* Pause the production report at its first potentially sleeping user copy. */
 static struct kernel_task *copy_transfer_from, *copy_transfer_to;
@@ -78,6 +107,49 @@ static void setup(void)
     parent = adoptive = (struct kernel_task){0};
     memset(children, 0, sizeof(children));
     for (unsigned i = 0; i < 65; i++) child_append_locked(&parent, &children[i]);
+}
+
+static void exact_child_selection(void)
+{
+    setup();
+    parent.group_leader = &parent;
+    parent.magic = KERNEL_THREAD_MAGIC;
+    parent.tid_owned = 1;
+    for (unsigned i=0;i<65;i++) {
+        children[i].magic=KERNEL_THREAD_MAGIC;
+        children[i].arch.user_mode=1;
+        children[i].tid_owned=children[i].accounted=1;
+        children[i].tid=i+2;
+        children[i].exit_signal=17;
+        children[i].state=KERNEL_THREAD_STATE_BLOCKED;
+    }
+    struct kernel_task *last=&children[64], *selected;
+    struct kernel_pid identity={.registry=&scheduler.identities,.references=1};
+    uint32_t event;
+    int matching;
+    kernel_pid_attach(&last->identities[KERNEL_PID_TID],&identity,KERNEL_PID_TID,last);
+    child_domain_acquires=0;
+    assert(!select_wait_child(&parent,LINUX_P_PID,&identity,LINUX_WEXITED,&selected,&event,&matching));
+    assert(!selected && !event && matching && child_domain_acquires==1);
+
+    last->group_stopped=1;
+    assert(!select_wait_child(&parent,LINUX_P_PIDFD,&identity,LINUX_WSTOPPED,&selected,&event,&matching));
+    assert(selected==last && event==2 && matching && last->reaping && last->storage_borrows==1);
+    assert(!select_wait_child(&parent,LINUX_P_PID,&identity,LINUX_WSTOPPED,&selected,&event,&matching));
+    assert(!selected && !event && matching && last->storage_borrows==1);
+    last->reaping=0;
+    scheduler_task_put(last);
+    last->child_creator=&identity;
+    assert(!select_wait_child(&parent,LINUX_P_PID,&identity,LINUX_WEXITED|LINUX___WNOTHREAD,
+        &selected,&event,&matching));
+    assert(!selected && !event && !matching);
+
+    child_remove_locked(&parent,last);
+    child_append_locked(&adoptive,last);
+    assert(!select_wait_child(&parent,LINUX_P_PIDFD,&identity,LINUX_WSTOPPED,&selected,&event,&matching));
+    assert(!selected && !event && !matching);
+    kernel_pid_detach(&last->identities[KERNEL_PID_TID]);
+    puts("PASS exact wait: one domain acquisition, event claims, creator filter and adoption");
 }
 
 static void broken_edit(unsigned which)
@@ -234,6 +306,7 @@ int main(void)
     orphan_classification();
     reaper_selection();
     wait_view_selection();
+    exact_child_selection();
     setup();
     child_remove_locked(&parent, &children[32]);
     assert(children[31].next_sibling == &children[33] && children[33].previous_sibling == &children[31]);

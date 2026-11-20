@@ -30,6 +30,8 @@ void ptrace_consume_final(struct kernel_task *);
 void process_release_traced_zombie(struct kernel_task *);
 void ptrace_wait_claim_done(struct kernel_task *);
 int ptrace_select(struct kernel_task *,int,const struct kernel_pid *,unsigned,struct kernel_task **,uint32_t *,int *);
+int ptrace_select_target_locked(struct kernel_task *,struct kernel_task *,unsigned,
+    struct kernel_task **,uint32_t *,int *);
 uint32_t ptrace_wait_status_locked(struct kernel_task *,int);
 size_t arch_ptrace_regset_size(unsigned);
 void arch_ptrace_regset(struct kernel_task *,unsigned,uint64_t *,uint64_t *,int);
