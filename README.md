@@ -83,18 +83,29 @@ RISC-V 和 LoongArch 各自处理启动、异常入口、上下文切换和页�
 
 ## 🚀 快速上手
 
-在 Linux 宿主安装 GNU Make、Python 3、Git、curl、e2fsprogs、pahole，以及目标架构的交叉工具链和 QEMU。交叉编译器前缀与模拟器配置见[工具链指南](docs/toolchain.md)。
+### 构建并进入命令行
 
-在仓库根目录按目标架构选择一条命令。首次运行会下载静态 BusyBox、制作 ext4 根盘、编译内核并启动 QEMU。
+在 Linux 上准备交叉工具链和 QEMU，再按目标架构选择一条命令。命令会构建内核、制作根盘并启动虚拟机。首次制盘会用 curl 下载静态 BusyBox，并用 e2fsprogs 制作 ext4 镜像。 [安装依赖和配置工具链](docs/toolchain.md)
 
 ```sh
-make shell-riscv PAHOLE=pahole
-make shell-loongarch PAHOLE=pahole QEMU_LOONGARCH64=qemu-system-loongarch64
+make shell-riscv
+make shell-loongarch QEMU_LOONGARCH64=qemu-system-loongarch64
 ```
 
-看到 `Please press Enter to activate this console.` 时按回车。进入 `/ #` 后可执行 `ls /`、`uname -a`，用 `poweroff -f` 关机。BusyBox 提供 `sh` 命令解释器及常用用户态工具。
+LoongArch 命令中的 `QEMU_LOONGARCH64` 指定要运行的模拟器，可写程序名或绝对路径。
 
-根盘存放在 `build/rootfs/`，后续启动会复用原镜像及盘内改动。只制作根盘可用 `make rootfs-riscv` 或 `make rootfs-loongarch`。只编译内核可用 `make PAHOLE=pahole` 或 `make kernel-la PAHOLE=pahole`。
+pahole 用来为内核生成类型信息。构建默认从仓库附带的源码编译它，并缓存到 `build/tools/pahole/`。已有系统 pahole 时，可在上面的命令后加 `PAHOLE=pahole`，让构建从 `PATH` 调用它。 [pahole 的构建依赖](docs/toolchain.md#从随仓库的源码构建-pahole)
+
+看到 `Please press Enter to activate this console.` 时按回车。进入 `/ #` 后可执行 `ls /`、`uname -a`，用 `poweroff -f` 关机。根盘存放在 `build/rootfs/`，后续启动会复用盘内改动。
+
+### 只编译内核
+
+```sh
+make            # RISC-V，生成 kernel-rv
+make kernel-la  # LoongArch，生成 kernel-la
+```
+
+只制作根盘时，使用 `make rootfs-riscv` 或 `make rootfs-loongarch`。
 
 <details>
 <summary>展开等价命令，指定工具路径、输出目录和虚拟机参数</summary>
@@ -109,12 +120,11 @@ cross=riscv64-elf-
 rv_ld=riscv64-linux-gnu-ld
 qemu=qemu-system-riscv64
 firmware=default
-pahole=pahole
 ram=1G
 
 # 对象文件、内核和根盘都放在这个目录下
 out="$PWD/build/manual-riscv"
-make -j"$(nproc)" CROSS_COMPILE="$cross" RV_VDSO_LD="$rv_ld" PAHOLE="$pahole" \
+make -j"$(nproc)" CROSS_COMPILE="$cross" RV_VDSO_LD="$rv_ld" \
   INIT_CONFIG=config/init.json BUILD_DIR="$out/obj" KERNEL_RV="$out/kernel-rv" "$out/kernel-rv"
 python3 -B tools/mkrootfs.py riscv64 "$out/root.img"
 
@@ -131,12 +141,11 @@ python3 -B tools/mkrootfs.py riscv64 "$out/root.img"
 # 按本机安装位置调整交叉编译器前缀和 QEMU 路径
 cross=loongarch64-unknown-linux-gnu-
 qemu=qemu-system-loongarch64
-pahole=pahole
 ram=1G
 out="$PWD/build/manual-loongarch"
 
 # LA_BUILD 指定对象目录，KERNEL_LA 指定内核输出文件
-make -j"$(nproc)" LA_CROSS_COMPILE="$cross" PAHOLE="$pahole" \
+make -j"$(nproc)" LA_CROSS_COMPILE="$cross" \
   INIT_CONFIG=config/init.json LA_BUILD="$out/obj" KERNEL_LA="$out/kernel-la" "$out/kernel-la"
 python3 -B tools/mkrootfs.py loongarch64 "$out/root.img"
 
