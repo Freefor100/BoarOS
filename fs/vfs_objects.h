@@ -162,6 +162,9 @@ struct kernel_vfs_backend {
     /* Owned-name backends accept NULL mode: open imports real inode state. */
     int (*lookup)(struct kernel_vfs_instance *instance, uint64_t parent,
         const char *name, size_t length, uint64_t *inode, uint32_t *mode);
+    /* Optional lookup through the live, namespace-qualified directory. */
+    int (*lookup_node)(struct kernel_vfs_node *parent, const char *name,
+        size_t length, uint64_t *inode, uint32_t *mode);
     /* A backend with one directory entry per inode can expose several lookup
      * spellings (VFAT long/short names). They share one canonical path owner. */
     int (*entry_name)(struct kernel_vfs_instance *, uint64_t inode, char *, size_t);

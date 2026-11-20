@@ -51,6 +51,10 @@ struct lwext4_mount_adapter {
     uint64_t published_sealed, published_durable, published_checkpoint;
     int published_error;
 };
+struct lwext4_directory_mapping {
+    uint64_t epoch;
+    struct ext4_inode inode;
+};
 struct lwext4_node {
     struct kernel_vfs_node node;
     ext4_file file;
@@ -70,6 +74,7 @@ struct lwext4_node {
      * metadata mutation invalidates them under the existing timestamp lock. */
     struct kernel_vfs_stat metadata;
     uint64_t metadata_epoch, metadata_seen;
+    struct lwext4_directory_mapping *directory_mapping;
 };
 _Static_assert(offsetof(struct lwext4_mount_adapter, instance) == 0,
                "mount private_data begins with its VFS instance");

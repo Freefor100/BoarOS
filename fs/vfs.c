@@ -2351,8 +2351,10 @@ static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
     uint64_t inode;uint32_t mode=0;
     /* Owned names retain real positive objects. A backend that initializes
      * the inode itself needs no speculative child mode read before opening. */
-    result=instance->ops->lookup(instance,kernel_vfs_path_inode(parent),name,name_length,
-        &inode,instance->ops->owns_dentry_names?NULL:&mode);
+    uint32_t *lookup_mode=instance->ops->owns_dentry_names ? NULL : &mode;
+    if (instance->ops->lookup_node)
+        result=instance->ops->lookup_node(parent->file.private_data,name,name_length,&inode,lookup_mode);
+    else result=instance->ops->lookup(instance,kernel_vfs_path_inode(parent),name,name_length,&inode,lookup_mode);
     if (result) return result;
     char canonical[256];
     if (instance->ops->entry_name) {

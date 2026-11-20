@@ -11,12 +11,13 @@
 #include <kernel/credentials.h>
 #include "../../fs/pipe_internal.h"
 static unsigned retained_name_lookups;
-int __real_ext4_lookup_child(const char *,uint32_t,const char *,size_t,uint32_t *,uint32_t *);
-int __wrap_ext4_lookup_child(const char *mount,uint32_t parent,const char *name,size_t length,
-    uint32_t *inode,uint32_t *mode)
+int __real_ext4_file_lookup_child(const ext4_file *,const char *,uint32_t,
+    uint32_t *,uint32_t *,struct ext4_inode *,bool *);
+int __wrap_ext4_file_lookup_child(const ext4_file *parent,const char *name,uint32_t length,
+    uint32_t *inode,uint32_t *mode,struct ext4_inode *snapshot,bool *current)
 {
     retained_name_lookups++;
-    return __real_ext4_lookup_child(mount,parent,name,length,inode,mode);
+    return __real_ext4_file_lookup_child(parent,name,length,inode,mode,snapshot,current);
 }
 static unsigned credential_pin_pause,credential_pin_entered,credential_pin_resume;
 enum kernel_uaccess_status __real_kernel_uaccess_pin_user_page(struct kernel_mm *,uint64_t,uint32_t,struct kernel_mm_user_pin *);
