@@ -33,6 +33,7 @@ void scheduler_pi_priority_locked(struct kernel_task *task,unsigned base,unsigne
 int kernel_wait_notify_locked(const struct kernel_wait_token *token,uint32_t reason)
 {assert(token->task && reason==KERNEL_WAIT_WOKEN);notices++;return 1;}
 struct futex_bucket futex_buckets[FUTEX_BUCKETS];
+struct kernel_wait_queue futex_wait_queues[FUTEX_WAIT_QUEUES];
 static uint32_t shared_word;
 static unsigned pins,operations;
 enum kernel_mm_status kernel_mm_prepare_futex(struct kernel_mm *mm,const uint64_t *addresses,

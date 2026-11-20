@@ -421,6 +421,106 @@ static void copy_and_faults(void)
     clean();
     puts("PASS MSG_COPY prepare input faults ordinal EINVAL E2BIG no mutation and consumed EFAULT");
 }
+static void deep_selection(void)
+{
+    int q = make();
+    struct packet p, o;
+    unsigned char consumed[96] = {0};
+    for (unsigned i = 0; i < sizeof(consumed); i++) {
+        p.type = 40 - i % 40;
+        p.data[0] = (char)i;
+        assert(!send(q, &p, 1, 0));
+    }
+    assert(recv(q, &o, 0, 7, KERNEL_IPC_NOWAIT) == -KERNEL_E2BIG);
+    assert(recv(q, &o, 1, 7, 0) == 1 && o.type == 7 && o.data[0] == 33);
+    assert(recv(q, &o, 1, 7, 0) == 1 && o.type == 7 && o.data[0] == 73);
+    consumed[33] = consumed[73] = 1;
+    assert(recv(q, &o, 1, 0, 0) == 1 && o.type == 40 && o.data[0] == 0);
+    consumed[0] = 1;
+    assert(recv(q, &o, 1, 39, KERNEL_MSG_EXCEPT) == 1 && o.type == 38 && o.data[0] == 2);
+    consumed[2] = 1;
+    assert(recv(q, &o, 1, 0, KERNEL_MSG_COPY | KERNEL_IPC_NOWAIT) == 1 &&
+           o.type == 39 && o.data[0] == 1);
+    assert(recv(q, &o, 1, 2, KERNEL_MSG_COPY | KERNEL_IPC_NOWAIT) == 1 &&
+           o.type == 36 && o.data[0] == 4);
+    assert(recv(q, &o, 1, -1, KERNEL_MSG_EXCEPT) == 1 && o.type == 1 && o.data[0] == 39);
+    assert(recv(q, &o, 1, -1, 0) == 1 && o.type == 1 && o.data[0] == 79);
+    consumed[39] = consumed[79] = 1;
+    assert(recv(q, &o, 1, -1, KERNEL_IPC_NOWAIT) == -KERNEL_ENOMSG);
+    assert(recv(q, &o, 1, INT64_MIN, 0) == 1 && o.type == 2 && o.data[0] == 38);
+    consumed[38] = 1;
+    assert(recv(q, (void *)1, 1, 39, 0) == -KERNEL_EFAULT);
+    assert(recv(q, &o, 1, 39, 0) == 1 && o.type == 39 && o.data[0] == 41);
+    consumed[1] = consumed[41] = 1;
+    for (unsigned i = 0; i < sizeof(consumed); i++) {
+        if (!consumed[i])
+            assert(recv(q, &o, 1, 0, 0) == 1 && o.type == 40 - i % 40 && o.data[0] == (char)i);
+    }
+    assert(!statq(q).msg_qnum);
+
+    p.type = INT64_MAX;
+    for (unsigned i = 0; i < sizeof(consumed); i++) {
+        p.data[0] = (char)i;
+        assert(!send(q, &p, 1, 0));
+    }
+    assert(recv(q, &o, 1, INT64_MAX - 1, KERNEL_IPC_NOWAIT) == -KERNEL_ENOMSG);
+    assert(recv(q, &o, 1, -INT64_MAX + 1, KERNEL_IPC_NOWAIT) == -KERNEL_ENOMSG);
+    assert(recv(q, &o, 1, INT64_MIN, 0) == 1 && o.type == INT64_MAX && o.data[0] == 0);
+    assert(recv(q, &o, 1, INT64_MAX, 0) == 1 && o.type == INT64_MAX && o.data[0] == 1);
+    rm(q);
+    clean();
+    puts("PASS deep queue exact and minimum selection, ordinal, FIFO, and indexed removal");
+}
+static void type_index_growth(void)
+{
+    int q = make();
+    struct packet p = {.data = "x"}, o;
+    for (unsigned i = 1; i <= 205; i++) {
+        p.type = i;
+        assert(!send(q, &p, 1, 0));
+    }
+    allocation_calls = 0;
+    fail_at = 1;
+    assert(recv(q, &o, 0, 205, KERNEL_IPC_NOWAIT) == -KERNEL_E2BIG);
+    assert(allocation_calls == 2);
+    fail_at = -1;
+
+    /* Build the initial block over two lookups. A failed growth allocation
+     * still permits a receive from the suffix at the build cursor. */
+    assert(recv(q, &o, 1, 500, KERNEL_IPC_NOWAIT) == -KERNEL_ENOMSG);
+    assert(recv(q, &o, 1, 500, KERNEL_IPC_NOWAIT) == -KERNEL_ENOMSG);
+    allocation_calls = 0;
+    fail_at = 1;
+    assert(recv(q, &o, 1, 97, KERNEL_IPC_NOWAIT) == 1 && o.type == 97);
+    assert(allocation_calls == 2);
+    fail_at = -1;
+
+    for (unsigned i = 0; i < 4; i++)
+        assert(recv(q, &o, 1, 500, KERNEL_IPC_NOWAIT) == -KERNEL_ENOMSG);
+    assert(recv(q, &o, 1, 205, KERNEL_IPC_NOWAIT) == 1 && o.type == 205);
+    p.type = 500;
+    assert(!send(q, &p, 1, 0));
+    assert(recv(q, &o, 1, 500, KERNEL_IPC_NOWAIT) == 1 && o.type == 500);
+    assert(recv(q, &o, 1, -2, KERNEL_IPC_NOWAIT) == 1 && o.type == 1);
+    assert(statq(q).msg_qnum == 202);
+
+    struct msg_queue *held = queue_lookup(q, 0);
+    assert(held && held->types);
+    for (unsigned batch = 0; batch < 2; batch++) {
+        for (unsigned i = 0; i < 63; i++)
+            assert(recv(q, &o, 1, 0, KERNEL_IPC_NOWAIT) == 1);
+        assert(held->types);
+        if (batch == 0)
+            assert(recv(q, &o, 1, 500, KERNEL_IPC_NOWAIT) == -KERNEL_ENOMSG);
+    }
+    assert(recv(q, &o, 1, 0, KERNEL_IPC_NOWAIT) == 1);
+    assert(!held->types && statq(q).msg_qnum == 75);
+    assert(recv(q, &o, 1, 200, KERNEL_IPC_NOWAIT) == 1 && o.type == 200 && held->types);
+    queue_put(held);
+    rm(q);
+    clean();
+    puts("PASS index growth, allocation fallback, cursor removal, FIFO retirement and reactivation");
+}
 struct wait_case {
     unsigned task;
     int id, sending, flags, permission, export_pause, before_park, notify_pause;
@@ -952,6 +1052,8 @@ int main(void)
     current(0);
     basic();
     copy_and_faults();
+    deep_selection();
+    type_index_growth();
     waits();
     removal_and_permissions();
     oom();

@@ -67,7 +67,8 @@ int64_t kernel_futex_waitv(struct kernel_task *task,uint64_t address,unsigned co
             enum kernel_mm_status prepared=kernel_mm_try_futex_pin(&task->mm,entry->address,
                 !(entry->operation&FUTEX_PRIVATE),KERNEL_MM_READ,&entry->key,&pin);
             if(prepared) {if(prepared!=KERNEL_MM_STATUS_CONFLICT)*status=KERNEL_SCHEDULER_STATUS_INVALID_STATE;retry=i;break;}
-            struct futex_bucket *bucket=futex_bucket(&entry->key);
+            unsigned slot=futex_slot(&entry->key);
+            struct futex_bucket *bucket=futex_slot_bucket(slot);
             KERNEL_LOCK_SCOPE(guard);
             if(!kernel_mutex_try_lock(&bucket->operation,&guard)) {
                 kernel_mm_unpin_user_page(&pin);retry=i;busy=bucket;break;
@@ -76,8 +77,9 @@ int64_t kernel_futex_waitv(struct kernel_task *task,uint64_t address,unsigned co
             if(__atomic_load_n(word,__ATOMIC_ACQUIRE)!=entry->expected)result=-KERNEL_EAGAIN;
             else {
                 entry->priority=priority;
-                KERNEL_IRQ_LOCK_SCOPE(g,&bucket->waiters.lock);
-                futex_bind_entry_locked(&bucket->waiters,entry,&request.token);
+                struct kernel_wait_queue *queue=futex_slot_queue(slot);
+                KERNEL_IRQ_LOCK_SCOPE(g,&queue->lock);
+                futex_bind_entry_locked(queue,entry,&request.token);
             }
             kernel_lock_release(&guard);kernel_mm_unpin_user_page(&pin);
             if(result || consumed(&request)>=0)break;

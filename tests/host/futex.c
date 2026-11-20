@@ -279,8 +279,8 @@ static void notification_batch(void)
     }
     sync_test_irq = 0;
 }
-static struct kernel_task synthetic[17];
-static struct kernel_futex_entry synthetic_entries[17];
+static struct kernel_task synthetic[64];
+static struct kernel_futex_entry synthetic_entries[64];
 static void synthetic_add(unsigned count, const struct kernel_futex_key *key)
 {
     KERNEL_RAW_SCOPE(guard,&futex_queue->lock);
@@ -337,7 +337,7 @@ static void wake_batches(void)
     synthetic_add(3, &key);
     /* Only the real COMMITTED waiter needs the scheduler domain; collision
      * and mask filtering stay in the queue, and PREPARED notification uses CAS. */
-    synthetic_entries[0].key.offset += 1024;
+    synthetic_entries[0].key.offset += 4096 + 4;
     synthetic_entries[1].bitset = 2;
     fast_notification = 1;
     notification_probe = 1; notification_sends = notification_seen = 0;
@@ -352,7 +352,7 @@ static void wake_batches(void)
         kernel_wait_record_phase(&synthetic[1].wait) == KERNEL_WAIT_PREPARED &&
         kernel_wait_record_phase(&synthetic[2].wait) == KERNEL_WAIT_NOTIFIED);
     assert(!pthread_join(worker, 0) && w.result == 0);
-    assert(measured_wake(source+1024,1)==1 && !domain_takes && queue_takes==1);
+    assert(measured_wake(source+4096+4,1)==1 && !domain_takes && queue_takes==1);
     assert(measured_wake(source,2)==1 && !domain_takes && queue_takes==1);
     assert(measured_wake(source,3)==0 && !domain_takes && !queue_takes);
     synthetic_remove(3);
@@ -372,6 +372,49 @@ static void wake_batches(void)
     kernel_wait_record_store(&synthetic[0].wait,1000,KERNEL_WAIT_NOTIFIED,KERNEL_WAIT_TIMEOUT);
     assert(call(source,3|128,0,1,target,0)==1);
     assert(call(target,1|128,1,0,0,0)==1);
+    synthetic_remove(1);
+}
+
+static void wake_colliding_bucket(void)
+{
+    uint64_t other=source+1024;
+    struct kernel_futex_key key,target_key;
+    assert(!kernel_mm_prepare_futex(&mm,&other,1,0,0,0,&key,0));
+    assert(!kernel_mm_prepare_futex(&mm,&source,1,0,0,0,&target_key,0));
+    assert(futex_bucket(&key)==futex_bucket(&target_key));
+    put(other,0);
+    struct waiter w={1,1,other,-99,0,0,0};
+    unsigned before=mm_test_parked(1);
+    pthread_t worker;
+    assert(!pthread_create(&worker,0,waiter,&w));queued(1,before);
+    synthetic_add(64,&key);
+    assert(measured_wake(source,1)==0 && !queue_takes && !domain_takes);
+    assert(measured_wake(other,1)==65);
+    assert(!pthread_join(worker,0) && w.result==0);
+    synthetic_remove(64);
+}
+
+static void requeue_priority(void)
+{
+    uint64_t other=source+1024;
+    put(source,0);
+    put(other,0);
+    struct waiter waiters[]={{1,1,other,-99,0,0,0},{2,1,source,-99,0,0,0}};
+    pthread_t workers[2];
+    for (unsigned i=0;i<2;i++) {
+        unsigned before=mm_test_parked(waiters[i].id);
+        assert(!pthread_create(&workers[i],0,waiter,&waiters[i]));
+        queued(waiters[i].id,before);
+    }
+    struct kernel_futex_key key;
+    assert(!kernel_mm_prepare_futex(&mm,&source,1,0,0,0,&key,0));
+    synthetic_add(1,&key);
+    synthetic_entries[0].priority=30;
+    assert(call(source,3|128,0,2,other,0)==2);
+    assert(call(other,1|128,1,0,0,0)==1);
+    assert(kernel_wait_record_phase(&synthetic[0].wait)==KERNEL_WAIT_NOTIFIED);
+    assert(measured_wake(other,1)==2);
+    for (unsigned i=0;i<2;i++) assert(!pthread_join(workers[i],0) && !waiters[i].result);
     synthetic_remove(1);
 }
 static void operations(void)
@@ -768,8 +811,8 @@ int main(void)
     waitv_cases();
     realtime_prepared_cases();
     notification_batch();
-    wake_batches(); operations(); private_with_mm_gate_busy(); private_access(); private_admission();
-    requeue(target); requeue(source + 1024); comparisons();
+    wake_batches(); wake_colliding_bucket(); requeue_priority(); operations(); private_with_mm_gate_busy(); private_access(); private_admission();
+    requeue(target); requeue(source + 1024); requeue(source + 4096 + 4); comparisons();
     opposite(target); opposite(source + 1024); coherent_remap(); shared_wake();partial_requeue_backing();
     detach(); mm_test_context = 0;
     assert(!kernel_mm_release(&mm));

@@ -7,6 +7,7 @@
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
 #define FUTEX_BUCKETS 256U
+#define FUTEX_WAIT_QUEUES (FUTEX_BUCKETS * 4U)
 #define FUTEX_PRIVATE 128U
 #define FUTEX_CLOCK_REALTIME 256U
 #define FUTEX_WAIT_BITSET 9U
@@ -37,10 +38,10 @@ static inline struct kernel_futex_entry *futex_entry(struct kernel_wait_node *no
 { return (struct kernel_futex_entry *)node; }
 struct futex_bucket {
     struct kernel_mutex operation;
-    struct kernel_wait_queue waiters;
     struct kernel_futex_pi_state *pi_states;
 };
 extern struct futex_bucket futex_buckets[FUTEX_BUCKETS];
+extern struct kernel_wait_queue futex_wait_queues[FUTEX_WAIT_QUEUES];
 
 static inline unsigned futex_wait_priority(const struct kernel_task *task)
 {
@@ -98,19 +99,35 @@ static inline int futex_key_equal(const struct kernel_futex_key *left,
            left->identity == right->identity && left->offset == right->offset;
 }
 
-static inline struct futex_bucket *futex_bucket(const struct kernel_futex_key *key)
+static inline unsigned futex_slot(const struct kernel_futex_key *key)
 {
     uint64_t hash = (key->identity >> 4U) ^ key->identity ^
                     (key->offset >> 2U) ^ (key->offset >> 12U) ^ key->kind;
-    unsigned index = hash & (FUTEX_BUCKETS - 1U);
-    return &futex_buckets[index];
+    return hash & (FUTEX_WAIT_QUEUES - 1U);
+}
+
+static inline struct futex_bucket *futex_slot_bucket(unsigned slot)
+{
+    return &futex_buckets[slot & (FUTEX_BUCKETS - 1U)];
+}
+
+static inline struct futex_bucket *futex_bucket(const struct kernel_futex_key *key)
+{
+    return futex_slot_bucket(futex_slot(key));
+}
+
+static inline struct kernel_wait_queue *futex_slot_queue(unsigned slot)
+{
+    return &futex_wait_queues[slot];
 }
 
 static inline void futex_lock_buckets(const struct kernel_futex_key *keys,
-    unsigned count, struct futex_bucket **resolved, struct kernel_lock_guard *guards)
+    unsigned count, unsigned *resolved, struct kernel_lock_guard *guards)
 {
-    struct futex_bucket *first = resolved[0] = futex_bucket(&keys[0]);
-    struct futex_bucket *second = resolved[1] = count == 2 ? futex_bucket(&keys[1]) : first;
+    resolved[0] = futex_slot(&keys[0]);
+    resolved[1] = count == 2 ? futex_slot(&keys[1]) : resolved[0];
+    struct futex_bucket *first = futex_slot_bucket(resolved[0]);
+    struct futex_bucket *second = futex_slot_bucket(resolved[1]);
     if (first > second) {
         struct futex_bucket *swap = first; first = second; second = swap;
     }
