@@ -1,4 +1,7 @@
 #include "private.h"
+#if !defined(BOAROS_ARCH_LOONGARCH)
+#include <arch/riscv/hwprobe.h>
+#endif
 
 #include <kernel/cost.h>
 #include <kernel/seccomp.h>
@@ -213,6 +216,14 @@ static enum kernel_syscall_status __attribute__((noinline, cold)) dispatch_addit
     case 266U:
         status = syscall_handle_adjtimex(caller, request, &decoded);
         break;
+    case 283U:
+        status = syscall_handle_membarrier(caller, request, &decoded);
+        break;
+#if !defined(BOAROS_ARCH_LOONGARCH)
+    case 258U:
+        status = riscv_syscall_hwprobe(caller, request, &decoded);
+        break;
+#endif
     default:
         decoded = (struct kernel_syscall_result){
             .action = KERNEL_SYSCALL_ACTION_RETURN, .value = -KERNEL_ENOSYS,

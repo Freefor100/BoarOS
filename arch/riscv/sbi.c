@@ -55,6 +55,17 @@ long sbi_probe_extension(unsigned long extension_id)
     return result.error == SBI_SUCCESS ? result.value : result.error;
 }
 
+int sbi_hardware_ids(uint64_t ids[3])
+{
+    for (unsigned i = 0; i < 3; i++) {
+        struct sbi_ret result = sbi_ecall(SBI_EXT_BASE, 4U + i, 0, 0, 0, 0);
+        if (result.error)
+            return -1;
+        ids[i] = (uint64_t)result.value;
+    }
+    return 0;
+}
+
 long sbi_set_timer(uint64_t absolute_time)
 {
     return sbi_ecall(SBI_EXT_TIME,

@@ -192,6 +192,7 @@ struct kernel_mm_record {
     struct mm_lazy_scan_cursor *lazy_scan_cursor;
     size_t lazy_capacity, lazy_count;
     struct kernel_mm_record *lazy_next, *lazy_previous;
+    unsigned membarrier_registrations;
     struct kernel_wait_queue lazy_drained;
     uint32_t lazy_borrows, lazy_registered;
     uint64_t lazy_seen_round, lazy_birth;
@@ -1683,6 +1684,8 @@ static enum kernel_mm_status mm_fork_impl(
         source->allocator, record_page_address, KERNEL_MM_STATUS_NO_MEMORY);
     destination_record->references = 1U;
     destination_record->coredump_filter = kernel_mm_coredump_filter_get(source);
+    destination_record->membarrier_registrations =
+        __atomic_load_n(&source_record->membarrier_registrations, __ATOMIC_ACQUIRE);
     kernel_raw_rwlock_init(&destination_record->metadata, KERNEL_RAW_RANK_MM);
     kernel_rwlock_init(&destination_record->operations, 25, (uintptr_t)destination_record);
     kernel_rwlock_init(&destination_record->vma_lock, 31, (uintptr_t)destination_record);
@@ -4869,6 +4872,27 @@ static enum kernel_mm_status activate_mm(const struct kernel_mm *next,
 out:
     arch_interrupt_restore(irq);
     return status;
+}
+
+unsigned kernel_mm_membarrier_registrations(const struct kernel_mm *mm)
+{
+    struct kernel_mm_record *record;
+    if (resolve_record_storage(mm, &record)) __builtin_trap();
+    return __atomic_load_n(&record->membarrier_registrations, __ATOMIC_ACQUIRE);
+}
+
+void kernel_mm_membarrier_register(struct kernel_mm *mm, unsigned command)
+{
+    struct kernel_mm_record *record;
+    if (resolve_record_storage(mm, &record)) __builtin_trap();
+    __atomic_fetch_or(&record->membarrier_registrations, command, __ATOMIC_RELEASE);
+}
+
+unsigned kernel_mm_membarrier_active(const struct kernel_mm *mm)
+{
+    struct kernel_mm_record *record;
+    if (resolve_record_storage(mm, &record)) __builtin_trap();
+    return __atomic_load_n(&record->active_cpus, __ATOMIC_SEQ_CST);
 }
 
 enum kernel_mm_status kernel_mm_activate(const struct kernel_mm *next,uint64_t kernel_context)

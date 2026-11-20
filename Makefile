@@ -431,6 +431,7 @@ COMMON_C_SOURCES := \
 	kernel/syscall/msg.c \
 	kernel/syscall/mqueue.c \
 	kernel/syscall/time.c \
+	kernel/syscall/membarrier.c \
 	kernel/syscall/uts.c \
 	kernel/syscall/event.c \
 	kernel/credentials.c \
@@ -477,6 +478,7 @@ RV_C_SOURCES := \
 	arch/riscv/uaccess.c \
 	arch/riscv/root_boot.c \
 	arch/riscv/sbi.c \
+	arch/riscv/hwprobe.c \
 	arch/riscv/sv39.c \
 	arch/riscv/timer.c \
 	arch/riscv/trap.c \

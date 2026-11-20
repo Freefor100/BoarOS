@@ -3,6 +3,8 @@
 #if BOAROS_MAX_CPUS > 1
 #include <arch/riscv/direct_map.h>
 #include <arch/riscv/sbi.h>
+#include <arch/riscv/hwprobe.h>
+#include <kernel/membarrier.h>
 #include <arch/riscv/sv39.h>
 #include <arch/riscv/mmu_context.h>
 #include <arch/riscv/timer.h>
@@ -19,6 +21,7 @@
 static struct kernel_cpu *cpus[BOAROS_MAX_CPUS];
 static unsigned cpu_count;
 static uint32_t timebase;
+static uint32_t hart_features[BOAROS_MAX_CPUS], common_features;
 
 static uint32_t fatal_claim;
 static uint64_t fatal_hart;
@@ -191,6 +194,8 @@ static void consume_ipi(int interrupt)
         __atomic_store_n(&current_secondary()->stop_requested, 1, __ATOMIC_RELEASE);
     if (events & RISCV_IPI_DEADLINE)
         kernel_scheduler_deadline_changed();
+    if (events & KERNEL_IPI_MEMBARRIER)
+        kernel_membarrier_receive();
     if (events & RISCV_IPI_DROP_ROOT) {
         if (cpu->active_mm_record) riscv_smp_fail("root-drain-live-user",-1);
         if (cpu->borrowed_mm_allocator &&
@@ -230,6 +235,7 @@ void riscv_smp_secondary_high(void)
     if (riscv_sv39_switch_satp(state->launch.final)) riscv_smp_fail("secondary-satp", -1);
     kernel_cpu_secondary_attach(cpu, (uintptr_t)state->stack,
                                (uintptr_t)state->stack + sizeof(state->stack));
+    riscv_hwprobe_initialize(cpu->logical_id, hart_features[cpu->logical_id], common_features, timebase);
     if (!riscv_vector_check_hart()) riscv_smp_fail("incompatible-vector-VLEN", -1);
     uintptr_t mask = 0x6000U, clean = 0x4000U;
     asm volatile("csrc sstatus, %0; csrs sstatus, %1; csrsi sie, 2"
@@ -268,6 +274,8 @@ void riscv_smp_start(const struct dtb_cpu_info *info, uint64_t transition,
     cpus[0] = kernel_cpu_current();
     cpu_count = info->count;
     timebase = frequency;
+    common_features = info->features;
+    for (unsigned i = 1; i < cpu_count; i++) hart_features[i] = info->hart_features[i];
     cpus[0]->logical_id = 0;
     cpus[0]->state = KERNEL_CPU_ONLINE;
     asm volatile("csrsi sie, 2" ::: "memory");

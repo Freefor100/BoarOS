@@ -75,6 +75,9 @@ struct kernel_mm {
 /* Publish instruction stores; LOCAL defers other CPUs until their next MM entry. */
 enum kernel_mm_status kernel_mm_flush_instructions(struct kernel_mm *, int local_only);
 #endif
+unsigned kernel_mm_membarrier_registrations(const struct kernel_mm *);
+void kernel_mm_membarrier_register(struct kernel_mm *, unsigned);
+unsigned kernel_mm_membarrier_active(const struct kernel_mm *);
 enum kernel_mm_status kernel_mm_check_files_domain(const struct kernel_mm *, const struct kernel_heap *);
 
 struct kernel_mm_mapping {

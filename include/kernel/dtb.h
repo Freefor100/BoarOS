@@ -12,9 +12,15 @@
 #define DTB_CPU_MMU_SVVPTC UINT32_C(1)
 #define DTB_CPU_ISA_V UINT32_C(2)
 #define DTB_CPU_ZICBOZ_64 UINT32_C(4)
+#define DTB_CPU_ISA_FD UINT32_C(8)
+#define DTB_CPU_ISA_C UINT32_C(16)
+#define DTB_CPU_ZBA UINT32_C(32)
+#define DTB_CPU_ZBB UINT32_C(64)
+#define DTB_CPU_ZBS UINT32_C(128)
 
 struct dtb_cpu_info {
     uint64_t hart_ids[DTB_MAX_CPUS];
+    uint32_t hart_features[DTB_MAX_CPUS];
     uint32_t count;
     uint32_t features; /* Intersection over the enabled harts. */
 };
