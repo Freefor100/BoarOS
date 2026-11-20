@@ -112,17 +112,18 @@ static void state_put(struct kernel_futex_pi_state *state)
     if(old)scheduler_task_put(old);
     if(release)state_release(state);
 }
-static int normal_waiter(struct futex_bucket *bucket,const struct kernel_futex_key *key)
+static int normal_waiter(unsigned slot,const struct kernel_futex_key *key)
 {
-    if(!__atomic_load_n(&bucket->waiters.registrations,__ATOMIC_RELAXED))return 0;
+    struct kernel_wait_queue *queue=futex_slot_queue(slot);
+    if(!__atomic_load_n(&queue->registrations,__ATOMIC_RELAXED))return 0;
     int found=0;
     struct kernel_wait_cursor cursor;
-    kernel_wait_cursor_begin(&bucket->waiters,&cursor);
+    kernel_wait_cursor_begin(queue,&cursor);
     while(cursor.node) {
         {
-            KERNEL_IRQ_LOCK_SCOPE(g,&bucket->waiters.lock);
+            KERNEL_IRQ_LOCK_SCOPE(g,&queue->lock);
             struct kernel_wait_node *node=cursor.node;
-            if(node->queue==&bucket->waiters && node->task &&
+            if(node->queue==queue && node->task &&
                !futex_entry(node)->woken && futex_key_equal(&futex_entry(node)->key,key))found=1;
         }
         if(found)break;
@@ -329,9 +330,10 @@ static int pi_unlock(struct kernel_futex_pi_request *request,enum kernel_schedul
     if((value&FUTEX_TID_MASK)!=(uint32_t)self)return -KERNEL_EPERM;
     int result=prepare_word(request,status);
     if(result || *status)return result;
-    struct futex_bucket *bucket=futex_bucket(&request->key);
+    unsigned slot=futex_slot(&request->key);
+    struct futex_bucket *bucket=futex_slot_bucket(slot);
     KERNEL_LOCK_SCOPE(operation);kernel_mutex_lock(&bucket->operation,&operation);
-    int mixed=normal_waiter(bucket,&request->key);
+    int mixed=normal_waiter(slot,&request->key);
     struct kernel_cpu_notification_batch notifications;
     kernel_cpu_notification_batch_begin(&notifications);
     struct kernel_task *old=0;
@@ -384,9 +386,10 @@ int64_t kernel_futex_pi(struct kernel_task *task,uint64_t address,uint32_t opera
     for(;;) {
         result=prepare_word(&request,status);
         if(result || *status)break;
-        struct futex_bucket *bucket=futex_bucket(&request.key);
+        unsigned slot=futex_slot(&request.key);
+        struct futex_bucket *bucket=futex_slot_bucket(slot);
         KERNEL_LOCK_SCOPE(operation_guard);kernel_mutex_lock(&bucket->operation,&operation_guard);
-        int mixed=normal_waiter(bucket,&request.key);
+        int mixed=normal_waiter(slot,&request.key);
         struct kernel_cpu_notification_batch notifications;
         kernel_cpu_notification_batch_begin(&notifications);
         action=FINISHED;
@@ -489,7 +492,8 @@ int64_t kernel_futex_wait_requeue_pi(struct kernel_task *task,uint64_t address,
     result=futex_prepare(task,&address,1,operation,0,KERNEL_MM_READ,&entry.key,&pi_request.source_pin,status);
     if(result || *status)goto out;
     if(futex_key_equal(&entry.key,&pi_request.key)){result=-KERNEL_EINVAL;goto out;}
-    struct futex_bucket *bucket=futex_bucket(&entry.key);
+    unsigned slot=futex_slot(&entry.key);
+    struct futex_bucket *bucket=futex_slot_bucket(slot);
     {
         KERNEL_LOCK_SCOPE(g);kernel_mutex_lock(&bucket->operation,&g);
         uint32_t *word=(void *)((unsigned char *)pi_request.source_pin.page+(address&BOAROS_PAGE_MASK));
@@ -501,8 +505,9 @@ int64_t kernel_futex_wait_requeue_pi(struct kernel_task *task,uint64_t address,
             kernel_wait_prepare(0,0,1,&pi_request.token);
         if(prepared)__builtin_trap();
         entry.priority=scheduler_base_priority(task);
-        { KERNEL_IRQ_LOCK_SCOPE(queue_guard,&bucket->waiters.lock);
-          futex_bind_entry_locked(&bucket->waiters,&entry,&pi_request.token); }
+        struct kernel_wait_queue *queue=futex_slot_queue(slot);
+        { KERNEL_IRQ_LOCK_SCOPE(queue_guard,&queue->lock);
+          futex_bind_entry_locked(queue,&entry,&pi_request.token); }
     }
     kernel_mm_unpin_user_page(&pi_request.source_pin);
     enum kernel_wait_wake_reason reason;
@@ -578,8 +583,9 @@ int64_t kernel_futex_cmp_requeue_pi(struct kernel_task *task,uint64_t address,
         if(result || *status)break;
         struct kernel_futex_key keys[2]={entries[0].key,entries[1].key};
         if(futex_key_equal(&keys[0],&keys[1])){result=-KERNEL_EINVAL;break;}
-        struct futex_bucket *buckets[2];struct kernel_lock_guard guards[2]={0};
-        futex_lock_buckets(keys,2,buckets,guards);
+        unsigned slots[2];struct kernel_lock_guard guards[2]={0};
+        futex_lock_buckets(keys,2,slots,guards);
+        struct futex_bucket *target_bucket=futex_slot_bucket(slots[1]);
         struct kernel_cpu_notification_batch notifications;
         kernel_cpu_notification_batch_begin(&notifications);
         uint32_t *source=(void *)((unsigned char *)call.source_pin.page+(address&BOAROS_PAGE_MASK));
@@ -597,16 +603,17 @@ int64_t kernel_futex_cmp_requeue_pi(struct kernel_task *task,uint64_t address,
             }
         }
         (void)__atomic_load_n(request_word(&call),__ATOMIC_ACQUIRE);
-        int target_mixed=normal_waiter(buckets[1],&keys[1]);
-        kernel_wait_cursor_begin(&buckets[0]->waiters,&cursor);
+        int target_mixed=normal_waiter(slots[1],&keys[1]);
+        struct kernel_wait_queue *queue=futex_slot_queue(slots[0]);
+        kernel_wait_cursor_begin(queue,&cursor);
         while(cursor.node && (uint64_t)moved<1+(uint64_t)move_count) {
             struct kernel_wait_node *node=cursor.node;
             struct kernel_futex_entry *entry=futex_entry(node);
             int selected=0;
             {
                 KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
-                KERNEL_IRQ_LOCK_SCOPE(queue_guard,&buckets[0]->waiters.lock);
-                if(node->queue==&buckets[0]->waiters && futex_key_equal(&entry->key,&keys[0])) {
+                KERNEL_IRQ_LOCK_SCOPE(queue_guard,&queue->lock);
+                if(node->queue==queue && futex_key_equal(&entry->key,&keys[0])) {
                     if(entry->kind!=FUTEX_ENTRY_REQUEUE_PI || !entry->pi ||
                        !futex_key_equal(&entry->pi->key,&keys[1]))result=-KERNEL_EINVAL;
                     else if(entry->pi->requeue_stage==1)selected=1;
@@ -630,12 +637,12 @@ int64_t kernel_futex_cmp_requeue_pi(struct kernel_task *task,uint64_t address,
                 KERNEL_RUN_SET(runs);
                 int notify=0;
                 {
-                KERNEL_IRQ_LOCK_SCOPE(queue_guard,&buckets[0]->waiters.lock);
+                KERNEL_IRQ_LOCK_SCOPE(queue_guard,&queue->lock);
                 /* 游标保活source entry；超时线程可能已摘队，发布前复核。 */
-                if(node->queue==&buckets[0]->waiters && entry->pi->requeue_stage==1) {
+                if(node->queue==queue && entry->pi->requeue_stage==1) {
                     struct kernel_futex_pi_request *request=entry->pi;
                     request->candidate=call.candidate;call.candidate=0;
-                    enum pi_action action=claim_locked(request,buckets[1],request_word(&call),task,
+                    enum pi_action action=claim_locked(request,target_bucket,request_word(&call),task,
                         target_mixed,0,move_count!=0,&result);
                     call.candidate=request->candidate;request->candidate=0;
                     if(request->exiting) {

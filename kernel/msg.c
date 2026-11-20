@@ -13,16 +13,46 @@
 #include <stddef.h>
 #include <string.h>
 
+#define MSG_TYPE_INDEX_START 64U
+#define MSG_TYPE_INDEX_STOP 32U
+#define MSG_TYPE_INDEX_STEP 64U
+#define MSG_TYPE_INDEX_FIFO_IDLE 64U
+#define MSG_TYPE_BLOCK_NODES 96U
+#define MSG_RECEIVE_PREPARE_TYPE_BLOCK 2
+
 /* Namespace discovery owns one queue reference; queue state is independently
  * locked. Lock order: index(25), queue(30), scheduler/PID domain(40).
  * Message contents never change after import. A request owns every allocation
  * used across usercopy or a wait, including detached receive messages. */
 struct msg_message {
     struct msg_message *previous, *next;
-    uint32_t references;
-    uint64_t size;
+    struct msg_message *type_next;
+    uint32_t references, size;
     int64_t type;
     unsigned char data[];
+};
+struct msg_type {
+    union {
+        struct kernel_avl_node node;
+        struct msg_type *next_free;
+    };
+    struct msg_message *tail;
+};
+/* Only the newest block holds the active root, free list and build cursor.
+ * Older blocks retain the storage for their type nodes until index retirement. */
+struct msg_type_block {
+    struct msg_type_block *older;
+    struct kernel_avl_node *root;
+    struct msg_type *free;
+    struct msg_message *unindexed;
+    unsigned used, fifo_receives;
+    struct msg_type types[MSG_TYPE_BLOCK_NODES];
+};
+/* Exclude the padding/reserved fields of the userspace ipc64_perm layout. */
+struct msg_permission {
+    int32_t key;
+    uint32_t uid, gid, cuid, cgid;
+    uint16_t mode, seq;
 };
 struct msg_queue {
     struct kernel_msg_table *table;
@@ -30,11 +60,12 @@ struct msg_queue {
     struct kernel_raw_lock lock;
     uint32_t references, removed;
     int32_t id;
-    struct kernel_ipc64_perm permission;
+    struct msg_permission permission;
     int64_t stime, rtime, ctime;
     uint64_t bytes, count, limit;
     struct kernel_pid *spid, *rpid;
     struct msg_message *head, *tail;
+    struct msg_type_block *types;
     struct kernel_msg_request *send_head, *send_tail, *recv_head, *recv_tail;
 };
 struct kernel_msg_request {
@@ -42,6 +73,7 @@ struct kernel_msg_request {
     struct kernel_task *task;
     struct kernel_pid *displaced_pid;
     struct msg_message *message, *copy;
+    struct msg_type_block *type_blocks;
     struct kernel_msg_request *previous, *next;
     struct kernel_wait_token token;
     uint32_t sending, queued;
@@ -72,6 +104,14 @@ static void msg_free(void *p)
 {
     if (p)
         kernel_heap_release(msg_heap, p);
+}
+static void msg_type_blocks_release(struct msg_type_block *block)
+{
+    while (block) {
+        struct msg_type_block *older = block->older;
+        msg_free(block);
+        block = older;
+    }
 }
 static struct kernel_msg_table *msg_namespace_table(struct kernel_namespace *base,int create)
 {
@@ -118,7 +158,7 @@ static void queue_put(struct msg_queue *q)
 {
     if (__atomic_sub_fetch(&q->references, 1, __ATOMIC_ACQ_REL))
         return;
-    if (!q->removed || q->head || q->send_head || q->recv_head)
+    if (!q->removed || q->head || q->types || q->send_head || q->recv_head)
         __builtin_trap();
     if (q->spid)
         kernel_task_identity_put(q->spid);
@@ -145,8 +185,11 @@ static struct msg_queue *queue_lookup(int32_t id, int by_slot)
 }
 static void queue_descriptor(const struct msg_queue *q, struct kernel_msqid64_ds *d,struct kernel_pid_registry *view)
 {
+    const struct msg_permission *p = &q->permission;
     *d = (struct kernel_msqid64_ds){
-        .msg_perm = q->permission, .msg_stime = q->stime, .msg_rtime = q->rtime,
+        .msg_perm = {.key = p->key, .uid = p->uid, .gid = p->gid, .cuid = p->cuid,
+                     .cgid = p->cgid, .mode = p->mode, .seq = p->seq},
+        .msg_stime = q->stime, .msg_rtime = q->rtime,
         .msg_ctime = q->ctime, .msg_cbytes = q->bytes, .msg_qnum = q->count,
         .msg_qbytes = q->limit, .msg_lspid = view?kernel_pid_number_in(q->spid,view):kernel_task_identity_user_number(q->spid),
         .msg_lrpid = view?kernel_pid_number_in(q->rpid,view):kernel_task_identity_user_number(q->rpid),
@@ -174,7 +217,7 @@ int kernel_msg_proc_next(struct kernel_namespace *ns,struct kernel_pid_registry 
 static int permission(const struct msg_queue *q, const struct kernel_credentials *c,
                       unsigned requested)
 {
-    const struct kernel_ipc64_perm *p = &q->permission;
+    const struct msg_permission *p = &q->permission;
     return kernel_ipc_permission(c, p->mode, p->uid, p->gid, p->cuid, p->cgid, requested);
 }
 static int owner(const struct msg_queue *q, const struct kernel_credentials *c)
@@ -202,7 +245,7 @@ static struct kernel_pid *pid_set(struct kernel_pid **target, struct kernel_task
     /* 将原队列引用交给请求，结束调用或弃栈时再在 raw 外归还。 */
     return old;
 }
-static struct msg_message *message_create(uint64_t size)
+static struct msg_message *message_create(uint32_t size)
 {
     struct msg_message *m = msg_allocate(sizeof(*m) + (size_t)size);
     if (m) {
@@ -304,12 +347,9 @@ int64_t kernel_msg_get(struct kernel_task *task, int32_t key, int32_t flags)
         candidate->slot_node.height = candidate->key_node.height = 1;
         candidate->limit = KERNEL_MSGMNB;
         candidate->ctime = msg_now();
-        candidate->permission = (struct kernel_ipc64_perm){.key = key,
-                                                           .uid = c->euid,
-                                                           .cuid = c->euid,
-                                                           .gid = c->egid,
-                                                           .cgid = c->egid,
-                                                           .mode = (uint32_t)flags & 0777};
+        candidate->permission = (struct msg_permission){.key = key, .uid = c->euid,
+                                                       .cuid = c->euid, .gid = c->egid,
+                                                       .cgid = c->egid, .mode = flags & 0777};
     }
     msg_free(candidate);
     return result;
@@ -334,6 +374,7 @@ static void request_release(struct kernel_msg_request *r)
         kernel_task_identity_put(r->displaced_pid);
     message_put(r->message);
     message_put(r->copy);
+    msg_type_blocks_release(r->type_blocks);
     if (r->queue)
         queue_put(r->queue);
     msg_free(r);
@@ -438,17 +479,102 @@ static int matches(struct msg_message *m, int64_t type, int flags)
         return m->type <= (type == INT64_MIN ? INT64_MAX : -type);
     return flags & KERNEL_MSG_EXCEPT ? m->type != type : m->type == type;
 }
+/* Each type has a circular FIFO. The index covers the insertion-order prefix
+ * before unindexed, so it already knows the first message of any indexed type. */
+static int message_type_append(struct msg_type_block *block, struct msg_message *m)
+{
+    struct msg_type *type = (void *)index_find(block->root, (uint64_t)m->type);
+    if (type) {
+        m->type_next = type->tail->type_next;
+        type->tail->type_next = m;
+    } else {
+        if (block->free) {
+            type = block->free;
+            block->free = type->next_free;
+        } else if (block->used < MSG_TYPE_BLOCK_NODES) {
+            type = &block->types[block->used++];
+        } else {
+            return 0;
+        }
+        m->type_next = m;
+        type->node = (struct kernel_avl_node){.key = (uint64_t)m->type, .height = 1};
+        block->root = kernel_avl_insert_node(block->root, &type->node);
+    }
+    type->tail = m;
+    return 1;
+}
+static void message_type_remove(struct msg_type_block *block, struct msg_message *m)
+{
+    if (block->unindexed == m)
+        block->unindexed = m->next;
+    struct msg_type *type = (void *)index_find(block->root, (uint64_t)m->type);
+    /* Every consuming mode selects the earliest message of the chosen type.
+     * If it is absent from the indexed prefix, only the FIFO needs updating. */
+    if (!type || type->tail->type_next != m)
+        return;
+    if (type->tail != m) {
+        type->tail->type_next = m->type_next;
+    } else {
+        block->root = kernel_avl_remove_node(block->root, &type->node);
+        type->next_free = block->free;
+        block->free = type;
+    }
+}
+static int message_prepare_index(struct kernel_msg_request *r, int allocation_failed)
+{
+    struct msg_queue *q = r->queue;
+    struct msg_type_block *block = q->types;
+    if (r->type > 0 ? q->head->type == r->type : q->head->type == 1)
+        return 0;
+    if (!block || (block->unindexed && !block->free && block->used == MSG_TYPE_BLOCK_NODES &&
+                   !index_find(block->root, (uint64_t)block->unindexed->type))) {
+        if (r->type_blocks) {
+            struct msg_type_block *fresh = r->type_blocks;
+            r->type_blocks = 0;
+            fresh->older = block;
+            fresh->root = block ? block->root : 0;
+            fresh->unindexed = block ? block->unindexed : q->head;
+            q->types = block = fresh;
+        } else if (!allocation_failed) {
+            return 1;
+        }
+    }
+    if (block) {
+        block->fifo_receives = 0;
+        for (unsigned n = 0; n < MSG_TYPE_INDEX_STEP && block->unindexed; n++) {
+            if (!message_type_append(block, block->unindexed))
+                break;
+            block->unindexed = block->unindexed->next;
+        }
+    }
+    return 0;
+}
 static struct msg_message *message_find(struct msg_queue *q, int64_t type, int flags)
 {
+    struct msg_message *m = q->head;
+    if (flags & KERNEL_MSG_COPY) {
+        if (type < 0 || (uint64_t)type >= q->count)
+            return 0;
+        while (type--)
+            m = m->next;
+        return m;
+    }
+    if (!type)
+        return m;
+    if (m && (type > 0 ? matches(m, type, flags) : m->type == 1))
+        return m;
     struct msg_message *best = 0;
-    uint64_t index = 0;
-    for (struct msg_message *m = q->head; m; m = m->next) {
-        if (flags & KERNEL_MSG_COPY) {
-            if (type >= 0 && index == (uint64_t)type)
-                return m;
-            index++;
-            continue;
+    if (q->types && (type < 0 || !(flags & KERNEL_MSG_EXCEPT))) {
+        struct msg_type *group = type < 0 ? (void *)kernel_avl_first(q->types->root)
+                                         : (void *)index_find(q->types->root, (uint64_t)type);
+        if (group && matches(group->tail, type, flags)) {
+            best = group->tail->type_next;
+            if (type > 0 || best->type == 1)
+                return best;
         }
+        m = q->types->unindexed;
+    }
+    for (; m; m = m->next) {
         if (!matches(m, type, flags))
             continue;
         if (type >= 0 || m->type == 1)
@@ -468,11 +594,28 @@ static void message_enqueue(struct msg_queue *q, struct msg_message *m)
     q->tail = m;
     q->count++;
     q->bytes += m->size;
+    if (q->types && !q->types->unindexed && !message_type_append(q->types, m))
+        q->types->unindexed = m;
     __atomic_fetch_add(&q->table->messages, 1, __ATOMIC_RELAXED);
     __atomic_fetch_add(&q->table->bytes, m->size, __ATOMIC_RELAXED);
 }
-static void message_detach(struct msg_queue *q, struct msg_message *m)
+static void message_detach(struct kernel_msg_request *r, struct msg_message *m)
 {
+    struct msg_queue *q = r->queue;
+    if (q->types) {
+        int fifo_idle = !r->type && ++q->types->fifo_receives == MSG_TYPE_INDEX_FIFO_IDLE;
+        if (q->count > MSG_TYPE_INDEX_STOP + 1 && !fifo_idle) {
+            message_type_remove(q->types, m);
+        } else {
+            /* Release after unlocking. The request may still have a spare
+             * block if a concurrent caller installed the index first. */
+            if (r->type_blocks)
+                r->type_blocks->older = q->types;
+            else
+                r->type_blocks = q->types;
+            q->types = 0;
+        }
+    }
     if (m->previous)
         m->previous->next = m->next;
     else
@@ -528,7 +671,7 @@ int64_t kernel_msg_send(struct kernel_task *task, struct kernel_mm *mm, int32_t 
     if (!r)
         return -KERNEL_ENOMEM;
     int result = -KERNEL_ENOMEM;
-    r->message = message_create(size);
+    r->message = message_create((uint32_t)size);
     if (!r->message)
         goto done;
     r->message->type = type;
@@ -586,8 +729,9 @@ int64_t kernel_msg_receive(struct kernel_task *task, struct kernel_mm *mm, int32
     r->size = size;
     size_t copied;
     int64_t result = -KERNEL_ENOMEM;
+    int type_allocation_failed = 0;
     if (flags & KERNEL_MSG_COPY) {
-        uint64_t n = size > KERNEL_MSGMAX ? KERNEL_MSGMAX : size;
+        uint32_t n = size > KERNEL_MSGMAX ? KERNEL_MSGMAX : (uint32_t)size;
         r->copy = message_create(n);
         if (!r->copy)
             goto done;
@@ -608,6 +752,11 @@ int64_t kernel_msg_receive(struct kernel_task *task, struct kernel_mm *mm, int32
             if (q->removed)
                 result = -KERNEL_EIDRM;
             else if ((result = permission(q, kernel_credentials_current(), 4))) {
+            } else if (type && !(flags & KERNEL_MSG_COPY) &&
+                       (type < 0 || !(flags & KERNEL_MSG_EXCEPT)) &&
+                       (q->types || q->count >= MSG_TYPE_INDEX_START) &&
+                       message_prepare_index(r, type_allocation_failed)) {
+                result = MSG_RECEIVE_PREPARE_TYPE_BLOCK;
             } else {
                 struct msg_message *m = message_find(q, type, flags);
                 if (m) {
@@ -619,7 +768,7 @@ int64_t kernel_msg_receive(struct kernel_task *task, struct kernel_mm *mm, int32
                         if (flags & KERNEL_MSG_COPY)
                             message_get(m);
                         else {
-                            message_detach(q, m);
+                            message_detach(r, m);
                             q->rtime = msg_now();
                             r->displaced_pid = pid_set(&q->rpid, task, 0);
                             wake_senders(q);
@@ -634,6 +783,13 @@ int64_t kernel_msg_receive(struct kernel_task *task, struct kernel_mm *mm, int32
                     result = 1;
                 }
             }
+        }
+        if (result == MSG_RECEIVE_PREPARE_TYPE_BLOCK) {
+            /* A type block is optional. Under memory pressure select from
+             * the indexed prefix and scan the remaining messages. */
+            r->type_blocks = msg_allocate(sizeof(*r->type_blocks));
+            type_allocation_failed = !r->type_blocks;
+            continue;
         }
         if (result != 1)
             break;
@@ -665,6 +821,7 @@ static int queue_remove(struct msg_queue *q, const struct kernel_credentials *c)
 {
     struct kernel_msg_table *table=q->table;
     struct msg_message *messages;
+    struct msg_type_block *types;
     {
         KERNEL_RAW_SCOPE(index_guard, &table->lock);
         KERNEL_RAW_SCOPE(queue_guard, &q->lock);
@@ -684,6 +841,8 @@ static int queue_remove(struct msg_queue *q, const struct kernel_credentials *c)
             request_complete(q->recv_head, -KERNEL_EIDRM);
         messages = q->head;
         q->head = q->tail = 0;
+        types = q->types;
+        q->types = 0;
         __atomic_fetch_sub(&q->table->messages, q->count, __ATOMIC_RELAXED);
         __atomic_fetch_sub(&q->table->bytes, q->bytes, __ATOMIC_RELAXED);
         q->count = q->bytes = 0;
@@ -693,6 +852,7 @@ static int queue_remove(struct msg_queue *q, const struct kernel_credentials *c)
         messages = m->next;
         message_put(m);
     }
+    msg_type_blocks_release(types);
     queue_put(q);
     return 0;
 }

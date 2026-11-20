@@ -15,14 +15,15 @@
 #include "futex_internal.h"
 
 struct futex_bucket futex_buckets[FUTEX_BUCKETS];
+struct kernel_wait_queue futex_wait_queues[FUTEX_WAIT_QUEUES];
 
 /* 桶表在任务与secondary发布前初始化，热路径只取得实际桶资格。 */
 void kernel_futex_init(void)
 {
-    for (unsigned i = 0; i < FUTEX_BUCKETS; i++) {
-        kernel_wait_queue_init(&futex_buckets[i].waiters);
+    for (unsigned i = 0; i < FUTEX_WAIT_QUEUES; i++)
+        kernel_wait_queue_init(&futex_wait_queues[i]);
+    for (unsigned i = 0; i < FUTEX_BUCKETS; i++)
         kernel_mutex_init(&futex_buckets[i].operation, 26, (uintptr_t)i + 1U);
-    }
 }
 
 static int futex_waiter_matches(struct kernel_wait_node *node,
@@ -32,10 +33,8 @@ static int futex_waiter_matches(struct kernel_wait_node *node,
         futex_key_equal(&futex_entry(node)->key, key) && !futex_entry(node)->woken;
 }
 
-void futex_bind_entry_locked(struct kernel_wait_queue *queue,struct kernel_futex_entry *entry,
-    const struct kernel_wait_token *token)
+static void futex_order_entry_locked(struct kernel_wait_queue *queue,struct kernel_futex_entry *entry)
 {
-    if(kernel_wait_node_bind_locked(queue,&entry->node,token))__builtin_trap();
     if(!entry->priority)return;
     /* 与Linux futex桶一致：登记时的基础RT优先级，其余线程按FIFO。 */
     struct kernel_wait_node *at=queue->head,*node=&entry->node;
@@ -46,6 +45,13 @@ void futex_bind_entry_locked(struct kernel_wait_queue *queue,struct kernel_futex
     node->previous=at->previous;node->next=at;
     if(at->previous)at->previous->next=node;else queue->head=node;
     at->previous=node;
+}
+
+void futex_bind_entry_locked(struct kernel_wait_queue *queue,struct kernel_futex_entry *entry,
+    const struct kernel_wait_token *token)
+{
+    if(kernel_wait_node_bind_locked(queue,&entry->node,token))__builtin_trap();
+    futex_order_entry_locked(queue,entry);
 }
 /* 每个排队项独立消费；超时/信号通知不等于调用者已经摘除该项。 */
 static int futex_wake_entry_locked(struct kernel_wait_node *node,struct kernel_wait_token *token)
@@ -74,11 +80,12 @@ void kernel_futex_abort(struct kernel_task *task)
  * moved个源后备引用由caller在解桶锁、归还用户pin之后释放。 */
 static int64_t futex_wake(const struct kernel_futex_key *source,
     uint32_t count, uint32_t requeue, const struct kernel_futex_key *target,
-    uint32_t bitset, uint32_t *moved_count, struct futex_bucket *bucket,
-    struct futex_bucket *target_bucket)
+    uint32_t bitset, uint32_t *moved_count, unsigned source_slot,
+    unsigned target_slot)
 {
-    struct kernel_wait_queue *queue = &bucket->waiters;
-    struct kernel_wait_queue *destination = target_bucket ? &target_bucket->waiters : 0;
+    struct futex_bucket *bucket = futex_slot_bucket(source_slot);
+    struct kernel_wait_queue *queue = futex_slot_queue(source_slot);
+    struct kernel_wait_queue *destination = target ? futex_slot_queue(target_slot) : 0;
     struct kernel_wait_cursor cursor;
     uint32_t woken = 0, moved = 0;
     int error=0;
@@ -92,7 +99,7 @@ static int64_t futex_wake(const struct kernel_futex_key *source,
         if (moved_count) *moved_count=0;
         return 0;
     }
-    if (!target_bucket) {
+    if (!target) {
         struct kernel_wait_token tokens[16];
         int short_scan=0;
         {
@@ -162,7 +169,7 @@ static int64_t futex_wake(const struct kernel_futex_key *source,
         }
         if (move) {
             /* 当前node借用覆盖task_pin，放游标后task借用阻止finish回收。
-             * 同桶扫描由operation串行；此时没有其他游标持有要移动的node。 */
+             * 桶操作锁排除同一等待队列的其他futex游标。 */
             kernel_wait_cursor_advance(&cursor);
             {
                 struct kernel_wait_queue *first=queue,*second=destination;
@@ -176,6 +183,7 @@ static int64_t futex_wake(const struct kernel_futex_key *source,
                     if (result == KERNEL_SCHEDULER_STATUS_OK) {
                         futex_key_hold(target);
                         futex_entry(node)->key = *target;
+                        if (destination != queue) futex_order_entry_locked(destination,futex_entry(node));
                         moved++;
                     } else if (result != KERNEL_SCHEDULER_STATUS_EMPTY) __builtin_trap();
                 }
@@ -231,7 +239,7 @@ static int64_t futex_wait_until(struct kernel_task *task, uint64_t address,
     struct kernel_futex_key key;
     struct kernel_mm_user_pin pin = {0};
     struct kernel_lock_guard guards[2] = {0};
-    struct futex_bucket *resolved[2];
+    unsigned resolved[2];
     int realtime = (operation & FUTEX_CLOCK_REALTIME) != 0;
     int private = (operation & FUTEX_PRIVATE) != 0;
     int64_t result = futex_prepare(task, &address, 1, operation, 0,
@@ -277,8 +285,9 @@ static int64_t futex_wait_until(struct kernel_task *task, uint64_t address,
         kernel_wait_prepare(0,0,1,&request.token);
     if(!*status) {
         entry.priority=futex_wait_priority(task);
-        KERNEL_IRQ_LOCK_SCOPE(guard,&resolved[0]->waiters.lock);
-        futex_bind_entry_locked(&resolved[0]->waiters,&entry,&request.token);
+        struct kernel_wait_queue *queue=futex_slot_queue(resolved[0]);
+        KERNEL_IRQ_LOCK_SCOPE(guard,&queue->lock);
+        futex_bind_entry_locked(queue,&entry,&request.token);
     }
     /* token登记后不再取得任何可睡眠锁；先放桶锁再归还pin，MM编辑可排空它。 */
     futex_unlock_buckets(guards);
@@ -376,7 +385,7 @@ int64_t kernel_futex(struct kernel_task *task, uint64_t address,
         struct kernel_futex_key keys[2];
         struct kernel_mm_user_pin pin = {0};
         struct kernel_lock_guard guards[2] = {0};
-        struct futex_bucket *resolved[2];
+        unsigned resolved[2];
         uint32_t pin_access = command == 4U ? KERNEL_MM_READ :
                               command == 5U ? KERNEL_MM_WRITE : 0;
         /* private key不访问映射；未知op先报ENOSYS，不用无关fault覆盖它。 */
@@ -459,7 +468,7 @@ static void futex_wake_user(struct kernel_task *task, uint64_t address)
 {
     struct kernel_futex_key key;
     struct kernel_lock_guard guards[2] = {0};
-    struct futex_bucket *resolved[2];
+    unsigned resolved[2];
     enum kernel_scheduler_status status = KERNEL_SCHEDULER_STATUS_OK;
     if ((address & 3U) || kernel_user_range_check(address, sizeof(uint32_t)) !=
         KERNEL_UACCESS_STATUS_OK || futex_prepare(task, &address, 1, 0, 0, 0,
