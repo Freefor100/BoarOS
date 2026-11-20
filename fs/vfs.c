@@ -871,6 +871,9 @@ int kernel_vfs_mount_contains(struct kernel_vfs_mount *root, const struct kernel
 static void publish_mount_edge(struct kernel_vfs_mount *mount,struct kernel_vfs_path *covered,struct kernel_vfs_path *root)
 {
     struct kernel_vfs_mount *parent=covered->file.mount;
+    /* Sticky for this dentry lifetime. A move or overmount can transiently
+     * remove every edge under VFS state before publishing replacements. */
+    __atomic_store_n(&covered->dentry->mountpoint_seen,1,__ATOMIC_RELEASE);
     parent->child_mounts++;mount->covered_path=covered;mount->root_path=root;mount->parent=parent;
     mount->propagation_staged=0;
     mount->previous_sibling=NULL;mount->next_sibling=parent->first_child;
@@ -1650,14 +1653,17 @@ static void unmount_trim(struct unmount_entry *items,size_t count,uint64_t visit
 }
 static void unmount_reopen_paths(struct unmount_entry *items,size_t count)
 {
-    for(size_t i=0;i<count;i++)if(items[i].selected)
+    for(size_t i=0;i<count;i++)if(items[i].selected) {
         for(struct kernel_vfs_path *p=items[i].mount->paths;p;p=p->next)
             __atomic_fetch_and(&p->references,~VFS_PATH_CLOSING,__ATOMIC_RELEASE);
+        __atomic_store_n(&items[i].mount->paths_closing,0,__ATOMIC_RELEASE);
+    }
 }
 static int unmount_close_paths(struct unmount_entry *items,size_t count,const struct kernel_vfs_path *named)
 {
     for(size_t i=0;i<count;i++)if(items[i].selected) {
         struct kernel_vfs_mount *m=items[i].mount;uint32_t locations=0;
+        __atomic_store_n(&m->paths_closing,1,__ATOMIC_RELEASE);
         for(struct kernel_vfs_path *p=m->paths;p;p=p->next) {
             locations++;
             uint32_t expected=(p==m->root_path)+(p==named);
@@ -1958,12 +1964,6 @@ static int dentry_acquire(struct kernel_vfs_dentry *);
 static void dentry_release(struct kernel_vfs_dentry **);
 static int path_wrap(struct kernel_vfs_mount *,struct kernel_vfs_dentry *,struct kernel_vfs_path **);
 static int mount_put(struct kernel_vfs_mount *);
-static int path_key_compare(const struct kernel_vfs_dentry *parent, const char *name,
-                            const struct kernel_vfs_dentry *other)
-{
-    if (parent != other->parent) return (uintptr_t)parent < (uintptr_t)other->parent ? -1 : 1;
-    return strcmp(name, other->name);
-}
 static unsigned path_height(const struct kernel_vfs_dentry *node)
 { return node ? node->index_height : 0; }
 static void path_height_update(struct kernel_vfs_dentry *node)
@@ -2003,8 +2003,9 @@ static struct kernel_vfs_dentry *path_index_insert(struct kernel_vfs_dentry *roo
                                                  struct kernel_vfs_dentry *node)
 {
     if (!root) { node->index_height = 1; return node; }
-    if (path_key_compare(node->parent, node->name, root) < 0) root->index_left = path_index_insert(root->index_left, node);
-    else if (path_key_compare(node->parent, node->name, root) > 0) root->index_right = path_index_insert(root->index_right, node);
+    int order=strcmp(node->name,root->name);
+    if (order < 0) root->index_left = path_index_insert(root->index_left, node);
+    else if (order > 0) root->index_right = path_index_insert(root->index_right, node);
     else __builtin_trap();
     return path_balance(root);
 }
@@ -2019,7 +2020,7 @@ static struct kernel_vfs_dentry *path_index_remove(struct kernel_vfs_dentry *roo
                                                  struct kernel_vfs_dentry *node)
 {
     if (!root) return 0;
-    int order = path_key_compare(node->parent, node->name, root);
+    int order=strcmp(node->name,root->name);
     if (order < 0) root->index_left = path_index_remove(root->index_left, node);
     else if (order > 0) root->index_right = path_index_remove(root->index_right, node);
     else {
@@ -2066,45 +2067,42 @@ static void dentry_cache_trim(struct kernel_vfs_instance *instance,size_t keep)
         KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
         remaining=instance->dentry_cache_count>keep ? instance->dentry_cache_count-keep : 0;
     }
-    while (remaining--) {
+    /* Cache hits only flag recency. Bound how many second chances each
+     * trim can spend without giving up its eviction target. */
+    unsigned second_chances=8;
+    while (remaining) {
         struct kernel_vfs_dentry *entry;
         {
             KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
             if (instance->dentry_cache_count<=keep) return;
             entry=instance->dentry_cache_first;
+            if (keep && second_chances &&
+                __atomic_exchange_n(&entry->recently_used,0,__ATOMIC_RELAXED)) {
+                second_chances--;
+                dentry_cache_remove(entry);dentry_cache_append(entry);
+                continue;
+            }
             dentry_cache_remove(entry);
         }
         /* Transfer the real cache reference before closing outside protection.
          * A lookup that already acquired it continues with its own identity. */
         dentry_release(&entry);
+        remaining--;
     }
 }
-static struct kernel_vfs_dentry *find_path(struct kernel_vfs_instance *instance,
-    struct kernel_vfs_dentry *parent, const char *name, size_t length)
+/* The parent's names lock protects both the tree and its weak hint. */
+static struct kernel_vfs_dentry *find_child_name(struct kernel_vfs_dentry *parent,
+    const char *name,size_t length)
 {
-    struct kernel_vfs_dentry *hint = parent ? parent->lookup_hint : NULL;
-    if (hint && !strncmp(name,hint->name,length) && !hint->name[length]) {
-        if (hint->cached && hint!=instance->dentry_cache_last) {
-            dentry_cache_remove(hint);dentry_cache_append(hint);
-        }
+    struct kernel_vfs_dentry *hint=parent->lookup_hint;
+    if (hint && !strncmp(name,hint->name,length) && !hint->name[length])
         return hint;
-    }
-    struct kernel_vfs_dentry *path = instance->path_index;
+    struct kernel_vfs_dentry *path=parent->children;
     while (path) {
-        int order;
-        if (parent != path->parent) {
-            order = (uintptr_t)parent < (uintptr_t)path->parent ? -1 : 1;
-        } else {
-            /* Query names have no NUL in their given extent. An equal
-             * prefix is a full match only if the indexed name ends here. */
-            order = strncmp(name, path->name, length);
-            if (!order && path->name[length]) order = -1;
-        }
+        int order=strncmp(name,path->name,length);
+        if (!order && path->name[length]) order=-1;
         if (!order) {
-            if (parent) parent->lookup_hint=path;
-            if (path->cached && path!=instance->dentry_cache_last) {
-                dentry_cache_remove(path);dentry_cache_append(path);
-            }
+            parent->lookup_hint=path;
             return path;
         }
         path = order < 0 ? path->index_left : path->index_right;
@@ -2112,10 +2110,51 @@ static struct kernel_vfs_dentry *find_path(struct kernel_vfs_instance *instance,
     return 0;
 }
 
+/* The global state lock keeps a returned weak entry alive after releasing
+ * the name lock. Fast readers obtain their reference before releasing it. */
+static struct kernel_vfs_dentry *find_path(struct kernel_vfs_instance *instance,
+    struct kernel_vfs_dentry *parent,const char *name,size_t length)
+{
+    if (!parent) return instance->root_name;
+    struct kernel_vfs_dentry *entry;
+    {
+        KERNEL_TASK_LOCK_SCOPE(names,&parent->names_lock);
+        entry=find_child_name(parent,name,length);
+    }
+    if (entry && entry->cached && entry!=instance->dentry_cache_last) {
+        dentry_cache_remove(entry);dentry_cache_append(entry);
+    }
+    return entry;
+}
+
+static void index_path(struct kernel_vfs_instance *instance,struct kernel_vfs_dentry *path)
+{
+    struct kernel_vfs_dentry *parent=path->parent;
+    if (parent) {
+        KERNEL_TASK_LOCK_SCOPE(names,&parent->names_lock);
+        parent->children=path_index_insert(parent->children,path);
+    } else {
+        if (instance->root_name) __builtin_trap();
+        instance->root_name=path;path->index_height=1;
+    }
+}
+
+static void unindex_child(struct kernel_vfs_dentry *path)
+{
+    struct kernel_vfs_dentry *parent=path->parent;
+    if (parent->lookup_hint==path) parent->lookup_hint=NULL;
+    parent->children=path_index_remove(parent->children,path);
+}
+
 static void unindex_path(struct kernel_vfs_instance *instance, struct kernel_vfs_dentry *path)
 {
-    if (path->parent && path->parent->lookup_hint==path) path->parent->lookup_hint=NULL;
-    instance->path_index=path_index_remove(instance->path_index,path);
+    if (path->parent) {
+        KERNEL_TASK_LOCK_SCOPE(names,&path->parent->names_lock);
+        unindex_child(path);
+    } else {
+        if (instance->root_name!=path) __builtin_trap();
+        instance->root_name=NULL;path->index_height=0;
+    }
 }
 
 static struct kernel_vfs_dentry *detach_path(struct kernel_vfs_dentry *path)
@@ -2126,8 +2165,12 @@ static struct kernel_vfs_dentry *detach_path(struct kernel_vfs_dentry *path)
     path->detached = 1;
     if (path->cached) {
         dentry_cache_remove(path);
-        if (__atomic_load_n(&path->references,__ATOMIC_ACQUIRE)==1) return path;
-        if (__atomic_fetch_sub(&path->references,1,__ATOMIC_ACQ_REL)<=1) __builtin_trap();
+        uint32_t refs=__atomic_load_n(&path->references,__ATOMIC_ACQUIRE);
+        while (refs>1) {
+            if (__atomic_compare_exchange_n(&path->references,&refs,refs-1,1,
+                __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) return NULL;
+        }
+        return path; /* Transfer the last cache reference to the caller. */
     }
     return NULL;
 }
@@ -2137,6 +2180,7 @@ static int register_path(struct kernel_vfs_dentry **owner)
     struct kernel_vfs_dentry *path=*owner,*existing,*retired=NULL;
     struct kernel_vfs_instance *adapter = path->file.mount->private_data;
     int result=0;
+    kernel_raw_lock_init(&path->names_lock,KERNEL_RAW_RANK_DIRECTORY_NAMES);
     {
         KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
         existing=find_path(adapter,path->parent,path->name,strlen(path->name));
@@ -2149,7 +2193,7 @@ static int register_path(struct kernel_vfs_dentry **owner)
             path->previous = &adapter->paths;
             if (path->next) path->next->previous = &path->next;
             adapter->paths = path;
-            adapter->path_index = path_index_insert(adapter->path_index, path);
+            index_path(adapter,path);
             if (adapter->ops->owns_dentry_names && !adapter->quiescing && adapter->mount_views &&
                 path->parent && ((path->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR ||
                     (path->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFREG ||
@@ -2175,8 +2219,11 @@ static int register_path(struct kernel_vfs_dentry **owner)
 static void unregister_path(struct kernel_vfs_dentry *path)
 {
     struct kernel_vfs_instance *instance = path->file.mount->private_data;
-    if (path->index_height)
-        unindex_path(instance,path);
+    if (path->index_height) {
+        if (path->parent) unindex_child(path);
+        else unindex_path(instance,path);
+    }
+    if (path->children) __builtin_trap(); /* Every child owns its parent. */
     if (path->cached || !path->previous || *path->previous != path) __builtin_trap();
     *path->previous = path->next;
     if (path->next) path->next->previous = path->previous;
@@ -2272,6 +2319,34 @@ static struct kernel_vfs_path *find_walk_location(struct kernel_vfs_mount *mount
     return find_location(mount,entry);
 }
 
+/* Ordinary transient components already borrow a mount from an input
+ * path. Name publication does not need to publish a mount location for
+ * them. A name that has served as a mountpoint uses the full resolver. */
+static bool lookup_walk_child(struct vfs_path_walk *walk,struct kernel_vfs_path *parent,
+    const char *name,size_t length,struct kernel_vfs_dentry **entry,
+    struct kernel_vfs_path **owner)
+{
+    struct kernel_vfs_mount *mount=parent->file.mount;
+    if (!walk || !walk->component || walk->resolve ||
+        ((!walk->start || walk->start->file.mount!=mount) &&
+         (!walk->root || walk->root->file.mount!=mount))) return false;
+    KERNEL_TASK_LOCK_SCOPE(names,&parent->dentry->names_lock);
+    struct kernel_vfs_dentry *child=find_child_name(parent->dentry,name,length);
+    if (child) {
+        if (__atomic_load_n(&child->mountpoint_seen,__ATOMIC_ACQUIRE) ||
+            __atomic_load_n(&mount->paths_closing,__ATOMIC_ACQUIRE) ||
+            child==mount->root_dentry ||
+            (walk->root && child==walk->root->dentry && mount==walk->root->file.mount))
+            return false;
+        path_bind_component(walk,mount,child);
+        if (!__atomic_load_n(&child->recently_used,__ATOMIC_RELAXED))
+            __atomic_store_n(&child->recently_used,1,__ATOMIC_RELAXED);
+        *owner=walk->component;
+    }
+    *entry=child;
+    return true;
+}
+
 static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
     const char *name,size_t name_length,struct kernel_vfs_path **owner,int search,
     struct vfs_path_walk *walk)
@@ -2315,7 +2390,7 @@ static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
          * publication. A retained positive name needs no second disk lookup;
          * pseudo-filesystems with independent name changes still revalidate. */
         int covered = 0;
-        {
+        if (!lookup_walk_child(walk,parent,name,name_length,&entry,owner)) {
             KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
             entry=find_path(instance,parent->dentry,name,name_length);
             if (entry) {
@@ -2812,11 +2887,18 @@ static void dentry_release(struct kernel_vfs_dentry **owner)
         {
             KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
             if (!entry->references) __builtin_trap();
-            if (__atomic_fetch_sub(&entry->references,1,__ATOMIC_ACQ_REL)!=1) return;
-            /* Anonymous dentries have no name index. O_TMPFILE retains a
-             * parent only for display/ancestry, not directory lookup. */
-            if (entry->previous) unregister_path(entry);
-            else if (!entry->detached) __builtin_trap();
+            if (entry->parent && entry->index_height) {
+                /* A reader may promote a weak name while holding this lock.
+                 * The final decrement and unindex must be indivisible to it. */
+                KERNEL_TASK_LOCK_SCOPE(names,&entry->parent->names_lock);
+                if (__atomic_fetch_sub(&entry->references,1,__ATOMIC_ACQ_REL)!=1) return;
+                unregister_path(entry);
+            } else {
+                if (__atomic_fetch_sub(&entry->references,1,__ATOMIC_ACQ_REL)!=1) return;
+                /* Anonymous dentries use their parent only for ancestry. */
+                if (entry->previous) unregister_path(entry);
+                else if (!entry->detached) __builtin_trap();
+            }
         }
         struct kernel_vfs_dentry *parent=entry->parent;
         if (kernel_vfs_close(&entry->file)) __builtin_trap();
@@ -2824,7 +2906,8 @@ static void dentry_release(struct kernel_vfs_dentry **owner)
         kernel_heap_release(entry->heap,entry);entry=parent;
     }
 }
-/* State protection owns these ref transitions and persistent publication. */
+/* Persistent locations use VFS state. A transient component may instead
+ * borrow the input mount and take its dentry ref under the name lock. */
 static void path_bind(struct kernel_vfs_path *path,struct kernel_vfs_mount *mount,
     struct kernel_vfs_dentry *entry,int transient,bool borrow_mount)
 {
@@ -4958,7 +5041,7 @@ LookupNames:
     if (old_parent!=new_parent->dentry) path_topology_changed();
     if (dentry_acquire(new_parent->dentry)) __builtin_trap();
     source->dentry->name = new_name;
-    adapter->path_index = path_index_insert(adapter->path_index, source->dentry);
+    index_path(adapter,source->dentry);
     kernel_task_lock_release(&irq);
     if (__atomic_load_n(&adapter->notify_ops,__ATOMIC_ACQUIRE)) {
         static uint32_t rename_cookie;
