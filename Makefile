@@ -432,6 +432,7 @@ COMMON_C_SOURCES := \
 	kernel/syscall/mqueue.c \
 	kernel/syscall/time.c \
 	kernel/syscall/membarrier.c \
+	kernel/syscall/aio.c \
 	kernel/syscall/uts.c \
 	kernel/syscall/event.c \
 	kernel/credentials.c \

@@ -192,6 +192,8 @@ void kernel_signal_restore_temporary_mask(
 /* Records that the current user syscall must be retried after signal
  * handling; the generic form keeps the original trap arguments. */
 void kernel_signal_note_syscall_restart(struct kernel_task *task);
+/* Keep original trap arguments unless signal delivery builds a user handler frame. */
+void kernel_signal_note_nohandler_restart(struct kernel_task *task);
 
 /* Records a nanosleep restart: absolute REALTIME uses wall nanoseconds,
  * other wall sleeps use architecture ticks, CPU sleeps use their selected

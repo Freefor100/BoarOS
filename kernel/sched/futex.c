@@ -1,3 +1,4 @@
+#include <kernel/aio.h>
 #include <kernel/scheduler.h>
 #include "private.h"
 
@@ -484,7 +485,8 @@ void kernel_futex_release_mm(struct kernel_task *task)
         futex_wake_user(task, address);
     }
     /* 用户复制可能睡眠；返回前仍是 MM 使用者，不能让另一退出者误判为独占。 */
-    (void)kernel_mm_remove_user(&task->mm);
+    if (!kernel_mm_remove_user(&task->mm) && *kernel_mm_aio_contexts(&task->mm))
+        kernel_aio_exit(&task->mm);
 }
 
 void kernel_futex_set_robust_list(struct kernel_task *task, uint64_t head)

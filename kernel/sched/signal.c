@@ -245,6 +245,13 @@ void kernel_signal_note_syscall_restart(struct kernel_task *task)
     }
 }
 
+void kernel_signal_note_nohandler_restart(struct kernel_task *task)
+{
+    task->syscall_restart=(struct kernel_syscall_restart_state){
+        .kind=KERNEL_SYSCALL_RESTART_NOHAND,
+    };
+}
+
 void kernel_signal_note_nanosleep_restart(struct kernel_task *task,
                                           int32_t clock_id, int absolute,
                                           uint64_t deadline,
@@ -2101,13 +2108,19 @@ enum kernel_signal_restart kernel_signal_restart_decide(
     kernel_signal_clear_syscall_restart(task);
     if (kind == KERNEL_SYSCALL_RESTART_NOINTR)
         return KERNEL_SIGNAL_RESTART_RETRY;
-    if (has_handler && (kind == KERNEL_SYSCALL_RESTART_NANOSLEEP ||
+    if (has_handler && (kind == KERNEL_SYSCALL_RESTART_NOHAND ||
+                         kind == KERNEL_SYSCALL_RESTART_NANOSLEEP ||
                          kind == KERNEL_SYSCALL_RESTART_FUTEX_TIMED ||
                          (flags & LINUX_SA_RESTART) == 0U)) {
         return KERNEL_SIGNAL_RESTART_INTERRUPTED;
     }
     return KERNEL_SIGNAL_RESTART_RETRY;
 }
+
+enum mask_restore_mode {
+    MASK_RESTORE_ON_HANDLER=1,
+    MASK_RESTORE_AFTER_WAIT,
+};
 
 enum kernel_signal_status kernel_signal_suspend(struct kernel_task *task,
                                                 uint64_t mask)
@@ -2121,7 +2134,7 @@ enum kernel_signal_status kernel_signal_suspend(struct kernel_task *task,
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         task->signal_saved_mask = task->signal_blocked;
-        task->signal_restore_mask = 1U;
+        task->signal_restore_mask = MASK_RESTORE_ON_HANDLER;
         retarget=signal_set_blocked_locked(task,mask);
     }
     signal_finish_mask_change(task,retarget);
@@ -2160,7 +2173,7 @@ enum kernel_signal_status kernel_signal_set_temporary_mask(
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         *saved_mask = task->signal_blocked;
         task->signal_saved_mask = task->signal_blocked;
-        task->signal_restore_mask = 1U;
+        task->signal_restore_mask = MASK_RESTORE_AFTER_WAIT;
         retarget=signal_set_blocked_locked(task,new_mask);
     }
     signal_finish_mask_change(task,retarget);
@@ -2335,6 +2348,13 @@ static __attribute__((noinline)) enum kernel_signal_select_result signal_select_
         signal_finish_mask_change(task,retarget);
         if (pending == 0U) {
             if (task->signal_restore_mask != 0U) {
+                /* Job control or tracer suppression consumed the signal.
+                 * A completed wait restores its caller's mask before return
+                 * or retry. sigsuspend keeps waiting for a handler. */
+                if (task->signal_restore_mask==MASK_RESTORE_AFTER_WAIT) {
+                    kernel_signal_restore_temporary_mask(task,task->signal_saved_mask,0);
+                    continue;
+                }
                 kernel_service_scope_begin(&return_service);
                 enum kernel_wait_wake_reason reason;
 

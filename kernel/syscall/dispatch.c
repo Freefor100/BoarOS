@@ -219,6 +219,14 @@ static enum kernel_syscall_status __attribute__((noinline, cold)) dispatch_addit
     case 283U:
         status = syscall_handle_membarrier(caller, request, &decoded);
         break;
+    case 0U:
+    case 1U:
+    case 2U:
+    case 3U:
+    case 4U:
+    case 292U:
+        status = syscall_handle_native_aio(caller, request, &decoded);
+        break;
 #if !defined(BOAROS_ARCH_LOONGARCH)
     case 258U:
         status = riscv_syscall_hwprobe(caller, request, &decoded);

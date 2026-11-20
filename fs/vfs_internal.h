@@ -162,6 +162,8 @@ int kernel_vfs_ftruncate_borrowing(struct kernel_vfs_file *, uint64_t,
 int kernel_vfs_fallocate_borrowing(struct kernel_vfs_file *, unsigned,
     uint64_t, uint64_t, const struct kernel_lock_guard *, struct kernel_vfs_size_limit *);
 /* Whole syscall write/truncate gate; rank 15, before namespace/inode locks. */
+int kernel_vfs_aio_direct_write(struct kernel_vfs_file *,uint64_t,const void *,size_t,size_t *,
+    const struct kernel_lock_guard *);
 void kernel_vfs_file_write_lock(struct kernel_vfs_file *file,
     struct kernel_lock_guard *guard);
 void kernel_vfs_node_lock(struct kernel_vfs_node *node, struct kernel_lock_guard *guard, int write);

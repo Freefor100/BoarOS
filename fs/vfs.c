@@ -3937,7 +3937,7 @@ static int vfs_write_source_locked(struct kernel_vfs_file *file,uint64_t offset,
         result=node->instance->ops->killpriv(node,kernel_vfs_write_mode(node->mode,node->gid));
         if (result) return result;
     }
-    if (source->mm) {
+    if (source->mm || source->user_payload) {
         /* 首字节用户fault仍保留修改时间；限额拒绝则没有这项副作用。 */
         result = kernel_vfs_file_modified(file, offset, 0);
         if (result) return result;
@@ -4022,6 +4022,14 @@ int kernel_vfs_pwrite_direct(struct kernel_vfs_file *file,uint64_t offset,
     const void *buffer,size_t size,size_t *written,const struct kernel_lock_guard *operation)
 {
     struct kernel_vfs_write_source source={.data=buffer,.direct=1,.operation=operation};
+    VFS_TEMPORARY_WRITER(writer,file);
+    return vfs_write_source_locked(file,offset,NULL,&source,size,NULL,written);
+}
+
+int kernel_vfs_aio_direct_write(struct kernel_vfs_file *file,uint64_t offset,
+    const void *data,size_t size,size_t *written,const struct kernel_lock_guard *operation)
+{
+    struct kernel_vfs_write_source source={.data=data,.user_payload=1,.direct=1,.operation=operation};
     VFS_TEMPORARY_WRITER(writer,file);
     return vfs_write_source_locked(file,offset,NULL,&source,size,NULL,written);
 }

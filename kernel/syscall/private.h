@@ -384,6 +384,8 @@ enum kernel_syscall_status syscall_handle_membarrier(
     struct kernel_task *, const struct kernel_syscall_request *, struct kernel_syscall_result *);
 enum kernel_syscall_status syscall_handle_adjtimex(
     struct kernel_task *, const struct kernel_syscall_request *, struct kernel_syscall_result *);
+enum kernel_syscall_status syscall_handle_native_aio(
+    struct kernel_task *, const struct kernel_syscall_request *, struct kernel_syscall_result *);
 enum kernel_syscall_status syscall_handle_times(
     struct kernel_task *caller,
     uint64_t tms_address,
