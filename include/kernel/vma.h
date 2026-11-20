@@ -157,9 +157,13 @@ enum kernel_vma_status kernel_vma_set_create(
     struct kernel_heap *heap,
     struct kernel_vma_set **set);
 
+/* Rebind receives an unpublished file-backed entry. On rebind failure the
+ * caller owns the completed prefix in *destination and any source copies. */
+typedef enum kernel_vma_status (*kernel_vma_fork_rebind_fn)(struct kernel_vma *, void *);
 enum kernel_vma_status kernel_vma_set_fork(
     const struct kernel_vma_set *source,
-    struct kernel_vma_set **destination);
+    struct kernel_vma_set **destination,
+    kernel_vma_fork_rebind_fn rebind, void *context);
 
 /* Success clears *set. */
 struct kernel_task;
@@ -261,6 +265,4 @@ enum kernel_vma_status kernel_vma_set_trim_end(
  * changing ranges or taking ownership of either object. */
 enum kernel_vma_status kernel_vma_set_rebind_backing(struct kernel_vma_set *,
     const void *old_backing, void *new_backing);
-/* Only for an unpublished fork child; the backing and range do not change. */
-void kernel_vma_set_rebind_source_owner(struct kernel_vma_set *, uint32_t index, void *new_owner);
 #endif

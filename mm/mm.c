@@ -1323,34 +1323,29 @@ static enum kernel_mm_status clone_file_source(struct kernel_mm_record *child,
     return KERNEL_MM_STATUS_OK;
 }
 
-/* The parent MM writer fixes its active owners. Walk only inherited VMAs
- * and memoize each owner's child copy until the unpublished child is rebound.
- * On failure, clear the same peer links before child cleanup owns the copies. */
-static enum kernel_mm_status clone_mapping_sources(const struct kernel_mm_record *parent,
-    struct kernel_mm_record *child)
+/* The parent MM writer keeps each source live while the VMA copy loop
+ * memoizes its child source and replaces the borrowed parent pointer. */
+static enum kernel_vma_status rebind_fork_source(struct kernel_vma *entry,void *context)
 {
-    if (!parent->file_sources && !parent->elf_sources) return KERNEL_MM_STATUS_OK;
+    struct kernel_mm_record *child=context;
     enum kernel_mm_status status = KERNEL_MM_STATUS_OK;
-    uint32_t count = kernel_vma_set_count(child->vmas);
-    for (uint32_t i = 0; i < count; i++) {
-        struct kernel_vma vma;
-        if (kernel_vma_set_get_at(child->vmas, i, &vma)) __builtin_trap();
-        if (vma.kind == KERNEL_VMA_KIND_ELF_PRIVATE) {
-            struct kernel_mm_elf_source *source = vma.backing_owner;
-            if (!source) __builtin_trap();
-            if (!source->fork_peer) status = clone_elf_source(child, source);
-            if (status) break;
-            kernel_vma_set_rebind_source_owner(child->vmas, i, source->fork_peer);
-        } else if (vma.kind == KERNEL_VMA_KIND_FILE_PRIVATE ||
-                   vma.kind == KERNEL_VMA_KIND_FILE_SHARED ||
-                   vma.kind == KERNEL_VMA_KIND_OBJECT_SHARED) {
-            struct kernel_mm_file_source *source = vma.backing_owner;
-            if (!source) __builtin_trap();
-            if (!source->fork_peer) status = clone_file_source(child, source);
-            if (status) break;
-            kernel_vma_set_rebind_source_owner(child->vmas, i, source->fork_peer);
-        }
+    if (entry->kind==KERNEL_VMA_KIND_ELF_PRIVATE) {
+        struct kernel_mm_elf_source *source=entry->backing_owner;
+        if (!source->fork_peer) status=clone_elf_source(child,source);
+        if (!status) entry->backing_owner=source->fork_peer;
+    } else {
+        struct kernel_mm_file_source *source=entry->backing_owner;
+        if (!source->fork_peer) status=clone_file_source(child,source);
+        if (!status) entry->backing_owner=source->fork_peer;
     }
+    return !status ? KERNEL_VMA_STATUS_OK : status==KERNEL_MM_STATUS_NO_MEMORY ?
+        KERNEL_VMA_STATUS_NO_MEMORY : KERNEL_VMA_STATUS_STATE;
+}
+
+/* Clear temporary links on either outcome before releasing the parent gate
+ * or reclaiming an unpublished child. */
+static void finish_fork_sources(struct kernel_mm_record *child)
+{
     for (struct kernel_mm_file_source *copy = child->file_sources; copy; copy = copy->next) {
         copy->fork_peer->fork_peer = NULL;
         copy->fork_peer = NULL;
@@ -1359,7 +1354,6 @@ static enum kernel_mm_status clone_mapping_sources(const struct kernel_mm_record
         copy->fork_peer->fork_peer = NULL;
         copy->fork_peer = NULL;
     }
-    return status;
 }
 
 static void prepare_huge_registration(struct mm_huge_map *);
@@ -1697,7 +1691,8 @@ static enum kernel_mm_status mm_fork_impl(
     if (source_record->vmas != 0) {
         status = status_from_vma(kernel_vma_set_fork(
             source_record->vmas,
-            &destination_record->vmas));
+            &destination_record->vmas,rebind_fork_source,destination_record));
+        finish_fork_sources(destination_record);
         if (status != KERNEL_MM_STATUS_OK) {
             if (destination_record->vmas != 0) {
                 destination_record->stage =
@@ -1720,8 +1715,6 @@ static enum kernel_mm_status mm_fork_impl(
     }
     status = clone_huge_maps(source_record,destination_record,record_page_address);
     if (status==KERNEL_MM_STATUS_OK) status = clone_shared_anon(source_record, destination_record);
-    if (status == KERNEL_MM_STATUS_OK)
-        status = clone_mapping_sources(source_record, destination_record);
     if (status != KERNEL_MM_STATUS_OK) {
         destination_record->stage = KERNEL_MM_RECORD_VMAS_CLEANUP;
         destination->allocator = source->allocator;

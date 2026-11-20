@@ -293,21 +293,25 @@ static void lookup_directory_mapping_case(struct kernel_vfs_path *root)
     struct kernel_vfs_stat stat;
     assert(!kernel_vfs_mkdir_at(root,root,"mapping-parent",0700,0));
     assert(!kernel_vfs_path_resolve(root,root,"mapping-parent",1,&dir));
+    assert(!kernel_vfs_mknod_at(dir,root,"config.rs",KERNEL_VFS_S_IFREG|0600,0,0));
+    assert(!kernel_vfs_mknod_at(dir,root,"builder.rs",KERNEL_VFS_S_IFREG|0600,0,0));
     directory_inode_watch=kernel_vfs_path_inode(dir);
     directory_inode_reads=directory_name_lookups=0;
     assert(kernel_vfs_stat_at(dir,root,"first-missing",1,&stat)==-KERNEL_ENOENT);
     assert(directory_inode_reads==1);
     assert(kernel_vfs_stat_at(dir,root,"second-missing",1,&stat)==-KERNEL_ENOENT);
     assert(directory_inode_reads==1 && "later cold names should reuse the verified parent inode");
+    assert(!kernel_vfs_stat_at(dir,root,"config.rs",1,&stat));
+    assert(!kernel_vfs_stat_at(dir,root,"builder.rs",1,&stat));
     for (unsigned i=0;i<32;i++) {
         assert(kernel_vfs_stat_at(dir,root,"first-missing",1,&stat)==-KERNEL_ENOENT);
         assert(kernel_vfs_stat_at(dir,root,"second-missing",1,&stat)==-KERNEL_ENOENT);
     }
-    assert(directory_name_lookups==3 && "repeated misses should not search ext4 directory entries");
+    assert(directory_name_lookups==5 && "positive lookups should keep recent miss history");
     directory_name_error=1;
     assert(kernel_vfs_stat_at(dir,root,"first-missin",1,&stat)==-KERNEL_EIO);
     assert(kernel_vfs_stat_at(dir,root,"first-missin",1,&stat)==-KERNEL_EIO);
-    assert(directory_name_lookups==5);
+    assert(directory_name_lookups==7);
     directory_name_error=0;
     assert(!kernel_vfs_mknod_at(dir,root,"first-missing",KERNEL_VFS_S_IFREG|0600,0,0));
     assert(!kernel_vfs_stat_at(dir,root,"first-missing",1,&stat));
@@ -323,6 +327,8 @@ static void lookup_directory_mapping_case(struct kernel_vfs_path *root)
     assert(!kernel_vfs_path_release(&source));
     assert(!kernel_vfs_unlink_at(dir,root,"first-missing",0));
     assert(!kernel_vfs_unlink_at(dir,root,"rename-missing",0));
+    assert(!kernel_vfs_unlink_at(dir,root,"config.rs",0));
+    assert(!kernel_vfs_unlink_at(dir,root,"builder.rs",0));
 
     /* Fresh names are absent from the positive VFS index after mknod. Grow
      * the directory enough to change its mapping before looking one up. */
