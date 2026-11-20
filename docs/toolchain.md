@@ -40,7 +40,7 @@ RV 的 vDSO 是用户态共享 ELF，链接时还需要 `riscv64-linux-gnu-ld` �
 
 ### 3.1 交叉编译器
 
-先安装交叉 GCC 和 binutils，并将它们加入 `PATH`。已验证的交叉 GCC 为 15.1.0。默认前缀为 `loongarch64-unknown-linux-gnu-`，可在编译时覆盖：
+先安装交叉 GCC 和 binutils，并将它们加入 `PATH`。Makefile 优先选择 `loongarch64-unknown-linux-gnu-`，也识别 `loongarch64-linux-gnu-`。内核使用整数调用约定，构建探测编译器能否禁用两种向量扩展。较早的 GCC 通过关闭自动向量化编译。已有工具链也可显式指定前缀。
 
 ```sh
 make kernel-la LA_CROSS_COMPILE=loongarch64-unknown-linux-gnu-
