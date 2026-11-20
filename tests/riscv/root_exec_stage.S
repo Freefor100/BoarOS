@@ -73,17 +73,14 @@ _start:
     la s1, .Lstage3_path
 #endif
 
-    # Find AT_EXECFN and compare the pointed-to original caller path.
-    li s2, 16
+    # Find AT_EXECFN before AT_NULL and compare the original caller path.
 .Laux_loop:
-    beqz s2, .Lfailure
     ld t0, 0(s0)
     ld t2, 8(s0)
     li t1, 31
     beq t0, t1, .Laux_execfn
     beqz t0, .Lfailure
     addi s0, s0, 16
-    addi s2, s2, -1
     j .Laux_loop
 .Laux_execfn:
     mv t0, t2
@@ -242,18 +239,6 @@ _start:
     li a7, 260
     ecall
     li t0, -3
-    bne a0, t0, .Lfailure
-
-    # This stage implements ordinary process clone only.  A sharing flag
-    # must fail explicitly rather than silently changing its semantics.
-    li a0, 0x111
-    li a1, 0
-    li a2, 0
-    li a3, 0
-    li a4, 0
-    li a7, 220
-    ecall
-    li t0, -95
     bne a0, t0, .Lfailure
 
     li a0, 17

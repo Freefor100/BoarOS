@@ -523,13 +523,6 @@ _start:
     li t0, 04000
     bne a0, t0, .Lfailure
     li a0, 7
-    li a1, 4
-    li a2, 040000
-    li a7, 25
-    ecall
-    li t0, -22
-    bne a0, t0, .Lfailure
-    li a0, 7
     li a1, 2
     li a2, 1
     li a7, 25

@@ -1,7 +1,8 @@
 OUTPUT_ARCH(riscv)
 
-KERNEL_VIRTUAL_BASE = 0xffffffff80000000;
 KERNEL_PHYSICAL_BASE = 0x80200000;
+/* A bare test that never enables address translation needs physical function pointers. */
+KERNEL_VIRTUAL_BASE = DEFINED(__boaros_test_link_physical) ? KERNEL_PHYSICAL_BASE : 0xffffffff80000000;
 KERNEL_LOAD_OFFSET = KERNEL_VIRTUAL_BASE - KERNEL_PHYSICAL_BASE;
 
 ENTRY(__kernel_physical_start)

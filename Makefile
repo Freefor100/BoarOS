@@ -979,7 +979,7 @@ $(UACCESS_TEST_KERNEL_RV): $(UACCESS_TEST_OBJECTS) \
 		-o $@ $(UACCESS_TEST_OBJECTS)
 
 $(FILES_TEST_KERNEL_RV): $(FILES_TEST_OBJECTS) arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) \
+	$(CC) -Wl,--defsym=__boaros_test_link_physical=1 $(LDFLAGS) \
 		-Wl,--wrap=kernel_open_file_prepare_mapping_page \
 		-Wl,--wrap=kernel_open_file_release \
 		-Wl,--wrap=kernel_heap_allocate \

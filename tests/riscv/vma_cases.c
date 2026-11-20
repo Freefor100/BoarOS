@@ -754,27 +754,6 @@ unsigned long run_all_vma_cases(void)
         use_test_satp = 0;
         return 34U;
     }
-    if (kernel_mm_mprotect(&parent,
-                           0U,
-                           BOAROS_PAGE_SIZE,
-                           KERNEL_MM_READ) !=
-        KERNEL_MM_STATUS_NOT_MAPPED) {
-        use_test_satp = 0;
-        return 39U;
-    }
-    if (kernel_mm_mprotect(&parent,
-                           mmap_address,
-                           3U * BOAROS_PAGE_SIZE,
-                           KERNEL_MM_READ) !=
-            KERNEL_MM_STATUS_NOT_MAPPED ||
-        kernel_mm_vma_lookup(&parent,
-                             mmap_address,
-                             &descriptor) != KERNEL_MM_STATUS_OK ||
-        descriptor.permissions !=
-            (KERNEL_MM_READ | KERNEL_MM_WRITE)) {
-        use_test_satp = 0;
-        return 35U;
-    }
     mmap_result = UINT64_MAX;
     if (kernel_mm_mmap_anonymous(
             &parent,

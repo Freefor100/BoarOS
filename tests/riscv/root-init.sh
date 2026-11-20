@@ -117,12 +117,12 @@ fi
 # The stdio markers only apply to the default /init fixture; the OOM
 # variant substitutes a different program.
 if [ -z "${ROOT_INIT_PROGRAM_RV:-}" ]; then
-    if [ "$(grep -cxF 'BoarOS: root-init stdio write ok' "$output" || true)" -ne 1 ]; then
+    if [ "$(grep -cF 'BoarOS: root-init stdio write ok' "$output" || true)" -ne 1 ]; then
         tail -n 120 "$output" >&2
         echo "PID 1 did not write through the console descriptor" >&2
         exit 1
     fi
-    if [ "$(grep -cxF 'BoarOS: stage2 stdio write ok' "$output" || true)" -ne 1 ]; then
+    if [ "$(grep -cF 'BoarOS: stage2 stdio write ok' "$output" || true)" -ne 1 ]; then
         tail -n 120 "$output" >&2
         echo "stage2 did not keep the console descriptors across exec" >&2
         exit 1

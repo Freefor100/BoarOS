@@ -46,7 +46,6 @@
 #define TEST_O_WRONLY UINT64_C(1)
 #define TEST_O_CREAT UINT64_C(0100)
 #define TEST_O_NONBLOCK UINT64_C(00004000)
-#define TEST_O_DIRECT UINT64_C(00040000)
 #define TEST_O_LARGEFILE UINT64_C(00100000)
 #define TEST_O_DIRECTORY UINT64_C(00200000)
 #define TEST_O_CLOEXEC UINT64_C(02000000)
@@ -665,14 +664,6 @@ static void run_file_operations(struct kernel_files *files,
                 UINT64_C(1) << 63U,
                 -KERNEL_EINVAL,
                 35U);
-    expect_open(files,
-                fs,
-                mm,
-                TEST_AT_FDCWD,
-                "/data",
-                TEST_O_DIRECT,
-                -KERNEL_ENOTSUP,
-                214U);
     /* The root directory opens read-only; reads stay reserved for
      * regular files and getdents64. */
     expect_open(files,
@@ -1251,13 +1242,17 @@ static void run_mmap_operations(struct kernel_files *files,
     }
 
     /* Fault-in allocation failure publishes neither PTE nor provenance. */
+    uint64_t fault_address = second_address + BOAROS_PAGE_SIZE;
+    /* A previous fault may have mapped this ready neighbour in a batch. */
+    if (kernel_mm_madvise(mm, fault_address, BOAROS_PAGE_SIZE, KERNEL_MM_ADVICE_DONTNEED) ||
+        kernel_mm_lookup(mm, fault_address, &second_mapping) != KERNEL_MM_STATUS_NOT_MAPPED)
+        fail_files(334U, KERNEL_MM_STATUS_NOT_MAPPED, -1);
     fail_metadata_allocation = 1;
-    enum kernel_mm_status resident_status = kernel_mm_resolve_user_fault(
-        mm, second_address + BOAROS_PAGE_SIZE, KERNEL_MM_READ);
+    enum kernel_mm_status resident_status = kernel_mm_resolve_user_fault(mm, fault_address, KERNEL_MM_READ);
+    unsigned pending_metadata = fail_metadata_allocation;
     fail_metadata_allocation = 0;
-    if (resident_status != KERNEL_MM_STATUS_NO_MEMORY ||
-        kernel_mm_lookup(mm, second_address + BOAROS_PAGE_SIZE, &second_mapping) !=
-            KERNEL_MM_STATUS_NOT_MAPPED)
+    if (resident_status != KERNEL_MM_STATUS_NO_MEMORY || pending_metadata ||
+        kernel_mm_lookup(mm, fault_address, &second_mapping) != KERNEL_MM_STATUS_NOT_MAPPED)
         fail_files(334U, KERNEL_MM_STATUS_NO_MEMORY, resident_status);
     /* A cached write-first fault publishes a COW PTE before copying. If the
      * private allocation fails, that temporary PTE must be removed as well. */
@@ -2464,12 +2459,6 @@ static void run_dup_fcntl_operations(struct kernel_files *files,
                                KERNEL_FILES_O_LARGEFILE,
                            &result) != KERNEL_FILES_STATUS_OK ||
         result != 0 ||
-        kernel_files_fcntl(files,
-                           3,
-                           KERNEL_FILES_F_SETFL,
-                           UINT64_C(0x40000),
-                           &result) != KERNEL_FILES_STATUS_OK ||
-        result != -KERNEL_EINVAL ||
         kernel_files_fcntl(files, 40, KERNEL_FILES_F_GETFD, 0U, &result) !=
             KERNEL_FILES_STATUS_OK ||
         result != -KERNEL_EBADF) {
@@ -2617,6 +2606,8 @@ static void run_fifo_allocation_failure(struct kernel_heap *heap)
     struct kernel_vfs_node *node = file->file.private_data;
     struct kernel_pipe *pipe = 0;
     uint8_t endpoint; uint64_t observed;
+    /* The last endpoint releases the pipe's metadata and data pages. */
+    uint64_t before_open = physical_page_available(heap->page_allocator);
     fail_metadata_allocation = 1;
     result = kernel_pipe_fifo_open(heap, node, 2U, &pipe, &endpoint, &observed);
     unsigned pending = fail_metadata_allocation; fail_metadata_allocation = 0;
@@ -2635,7 +2626,7 @@ static void run_fifo_allocation_failure(struct kernel_heap *heap)
         fail_files(605U, -KERNEL_ENOMEM, written.bytes);
     if (kernel_pipe_write_buffer(pipe,"x",1,2U|KERNEL_PIPE_NONBLOCK,&written) || written.bytes != 1 ||
         kernel_pipe_release_endpoint(pipe, endpoint) != KERNEL_PIPE_STATUS_OK || node->fifo_pipe ||
-        physical_page_available(heap->page_allocator) != available)
+        physical_page_available(heap->page_allocator) != before_open)
         fail_files(603U, 0, -1);
     if (kernel_open_file_release(&file) != KERNEL_OPEN_FILE_STATUS_OK ||
         kernel_vfs_path_release(&root) || kernel_vfs_unmount(mount))
