@@ -554,7 +554,8 @@ enum kernel_vma_status kernel_vma_set_create(
 
 enum kernel_vma_status kernel_vma_set_fork(
     const struct kernel_vma_set *source,
-    struct kernel_vma_set **destination)
+    struct kernel_vma_set **destination,
+    kernel_vma_fork_rebind_fn rebind, void *context)
 {
     struct kernel_vma_set *working = 0;
     enum kernel_vma_status status;
@@ -571,18 +572,23 @@ enum kernel_vma_status kernel_vma_set_fork(
     if (status == KERNEL_VMA_STATUS_OK) {
         for (index = 0U; index < source->count; index++) {
             if (source->entries[index].flags & KERNEL_VMA_DONTFORK) continue;
-            struct kernel_vma *entry = &working->entries[working->count++];
+            struct kernel_vma *entry = &working->entries[working->count];
             *entry = source->entries[index];
             entry->flags &= ~KERNEL_VMA_LOCK_MASK;
             if (entry->flags & KERNEL_VMA_WIPEONFORK) entry->flags &= ~KERNEL_VMA_ANON_HISTORY;
             struct kernel_shm_attachment *attachment = kernel_vma_shm_attachment(entry);
             if (attachment) kernel_shm_attachment_open(attachment);
+            else if (rebind && entry->backing_owner) {
+                status = rebind(entry, context);
+                if (status) break;
+            }
             account_bytes(&working->usage, entry, entry->end - entry->start, 1);
             account_shared_write(entry,entry->end-entry->start,1);
+            working->count++;
         }
-        merge_all(working);
+        if (!status) merge_all(working);
         *destination = working;
-        return KERNEL_VMA_STATUS_OK;
+        return status;
     }
     (void)kernel_vma_set_destroy(&working);
     return status;
@@ -691,13 +697,6 @@ enum kernel_vma_status kernel_vma_set_rebind_backing(struct kernel_vma_set *set,
     }
     set->generation++;
     return KERNEL_VMA_STATUS_OK;
-}
-
-void kernel_vma_set_rebind_source_owner(struct kernel_vma_set *set, uint32_t index,
-    void *new_owner)
-{
-    if (index >= set->count || !new_owner) __builtin_trap();
-    set->entries[index].backing_owner = new_owner;
 }
 
 static int huge_edit_aligned(const struct kernel_vma_set *set,uint64_t start,uint64_t end)

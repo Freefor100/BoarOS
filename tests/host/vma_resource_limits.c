@@ -16,6 +16,15 @@ static int address_of(const void *p,uint64_t *out) { *out=(uintptr_t)p;return 1;
 #define P BOAROS_PAGE_SIZE
 static void usage(struct kernel_vma_set *set,uint64_t total,uint64_t data)
 { assert(kernel_vma_set_total_bytes(set)==total*P);assert(kernel_vma_set_data_bytes(set)==data*P); }
+
+struct rebind_failure { unsigned visited; int child_owner; };
+static enum kernel_vma_status fail_second_rebind(struct kernel_vma *entry,void *context)
+{
+    struct rebind_failure *trial=context;
+    if (++trial->visited==2) return KERNEL_VMA_STATUS_NO_MEMORY;
+    entry->backing_owner=&trial->child_owner;
+    return KERNEL_VMA_STATUS_OK;
+}
 int main(void)
 {
     mm_test_attach(0);
@@ -45,7 +54,7 @@ int main(void)
     assert(kernel_vma_set_locked_range(set,2*P,4*P)==P);
     assert(!kernel_vma_set_prepare_protect(set,P,2*P,1,&edit)&&!kernel_vma_set_commit_edit(set,&edit));
     assert(kernel_vma_set_locked_bytes(set)==2*P);usage(set,4,1);
-    assert(!kernel_vma_set_fork(set,&copy));usage(copy,4,1);
+    assert(!kernel_vma_set_fork(set,&copy,NULL,NULL));usage(copy,4,1);
     assert(!kernel_vma_set_locked_bytes(copy));
     assert(kernel_vma_set_locked_bytes(set)==2*P);
     assert(!kernel_vma_set_prepare_protect(set,P,2*P,1,&edit)&&!kernel_vma_set_commit_edit(set,&edit));
@@ -55,7 +64,7 @@ int main(void)
         !kernel_vma_set_commit_edit(set,&edit));
     assert(!kernel_vma_set_prepare_flags(set,2*P,3*P,KERNEL_VMA_WIPEONFORK,KERNEL_VMA_WIPEONFORK,&edit)&&
         !kernel_vma_set_commit_edit(set,&edit));
-    assert(!kernel_vma_set_fork(set,&copy));usage(copy,3,1);
+    assert(!kernel_vma_set_fork(set,&copy,NULL,NULL));usage(copy,3,1);
     struct kernel_vma inherited;
     assert(kernel_vma_set_lookup(copy,P,&inherited)==KERNEL_VMA_STATUS_NOT_FOUND);
     assert(!kernel_vma_set_lookup(copy,2*P,&inherited)&&inherited.flags==KERNEL_VMA_WIPEONFORK);
@@ -120,9 +129,21 @@ int main(void)
     assert(!kernel_vma_set_prepare_protect(set,2*P,3*P,1,&edit)&&
         !kernel_vma_set_commit_edit(set,&edit)&&writable==3*P);
     assert(kernel_vma_set_prepare_protect(set,P,2*P,7,&edit)==KERNEL_VMA_STATUS_ACCESS);
-    assert(!kernel_vma_set_fork(set,&copy)&&writable==6*P);
+    assert(!kernel_vma_set_fork(set,&copy,NULL,NULL)&&writable==6*P);
     assert(!kernel_vma_set_prepare_replace(set,2*P,3*P,NULL,&edit)&&
         !kernel_vma_set_commit_edit(set,&edit)&&writable==5*P);
+    assert(!kernel_vma_set_destroy(&copy)&&writable==2*P);
+    assert(!kernel_vma_set_destroy(&set)&&!writable);
+    assert(!kernel_vma_set_create(&heap,&set));
+    v.start=P;v.end=2*P;v.backing_owner=&backing;
+    assert(!kernel_vma_set_insert(set,&v));
+    v.start=3*P;v.end=4*P;
+    assert(!kernel_vma_set_insert(set,&v)&&writable==2*P);
+    struct rebind_failure trial={0};
+    assert(kernel_vma_set_fork(set,&copy,fail_second_rebind,&trial)==KERNEL_VMA_STATUS_NO_MEMORY);
+    assert(trial.visited==2 && writable==3*P && kernel_vma_set_count(copy)==1);
+    assert(!kernel_vma_set_lookup(copy,P,&inherited)&&inherited.backing_owner==&trial.child_owner);
+    assert(!kernel_vma_set_lookup(set,P,&inherited)&&inherited.backing_owner==&backing);
     assert(!kernel_vma_set_destroy(&copy)&&writable==2*P);
     assert(!kernel_vma_set_destroy(&set)&&!writable);
     assert(!kernel_vma_set_create(&heap,&set));

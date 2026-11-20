@@ -228,7 +228,7 @@ static pthread_mutex_t model_rights_mutex=PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t model_unix_mutex=PTHREAD_MUTEX_INITIALIZER;
 #if BOAROS_USER_SMP
 static pthread_mutex_t model_ip_mutex=PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t model_tcp_mutex=PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t model_tcp_mutex[BOAROS_MAX_CPUS-1];
 unsigned kernel_cpu_get_boot_count(void) { return 2; }
 int kernel_service_scope_try_local(struct kernel_service_scope *scope)
 { (void)scope; return !kernel_cpu_current()->logical_id; }
@@ -244,7 +244,8 @@ static pthread_mutex_t *model_lock(struct kernel_rwlock *lock)
     if(lock==&rights_mutex.lock)return &model_rights_mutex;
 #if BOAROS_USER_SMP
     if(lock->rank==27)return &model_ip_mutex;
-    if(lock==&tcp_owner_at(1)->mutex.lock)return &model_tcp_mutex;
+    for (unsigned i=1;i<BOAROS_MAX_CPUS;i++)
+        if(lock==&tcp_owner_at(i)->mutex.lock)return &model_tcp_mutex[i-1];
 #endif
     CHECK(lock==&unix_control.lock);return &model_unix_mutex;
 }
@@ -1272,7 +1273,7 @@ static void tcp_owner_lookup(void)
     struct kernel_socket *listener[2]={0},*client[2]={0},*server[2]={0};
     connected_pair(&listener[0],&client[0],&server[0]);
     connected_pair(&listener[1],&client[1],&server[1]);
-    CHECK(tcp_route_bucket(server[0]->tcp)!=tcp_route_bucket(server[1]->tcp));
+    CHECK(tcp_pcb_hash(server[0]->tcp)%TCP_ROUTE_BUCKETS!=tcp_pcb_hash(server[1]->tcp)%TCP_ROUTE_BUCKETS);
     struct socket_tcp_owner *owner=tcp_lookup_test_start();
     struct kernel_socket_protocol_scope scope;
     kernel_socket_protocol_enter(&scope);
@@ -1325,6 +1326,7 @@ static void tcp_owner_lookup(void)
     u32_t opposite=client[0]->tcp->boaros_segs_in;
     TCP_RMV_ACTIVE(retired);
     tcp_set_state(retired,TIME_WAIT);
+    boaros_lwip_tcp_pcb_timewait(retired);
     TCP_REG(&tcp_tw_pcbs,retired);
     drops=STATS_GET(tcp.drop);
     tcp_lookup_test_drain(owner);
@@ -1346,6 +1348,78 @@ static void tcp_owner_lookup(void)
     CHECK(!kernel_wait_queue_close(&owner->work) && !kernel_wait_queue_destroy(&owner->work));
     tcp_owner_count=0;
     puts("PASS owned TCP lookup: interleaving, binding changes, direct loopback, TIME_WAIT and retirement");
+}
+
+static void tcp_owner_placement(void)
+{
+    enum { OWNERS = 3, PAIRS = OWNERS+1 };
+    struct kernel_socket *listener[PAIRS]={0},*client[PAIRS]={0},*server[PAIRS]={0};
+    for (unsigned i=0;i<PAIRS;i++) connected_pair(&listener[i],&client[i],&server[i]);
+    tcp_lookup_test_start();
+    for (unsigned cpu=2;cpu<=OWNERS;cpu++) {
+        struct socket_tcp_owner *owner=tcp_owner_at(cpu);
+        owner->index=cpu;
+        kernel_raw_lock_init(&owner->ingress,KERNEL_RAW_RANK_OBJECT+1);
+        kernel_wait_queue_init(&owner->work);
+        kernel_mutex_init(&owner->mutex,26,(uintptr_t)&owner->mutex);
+        boaros_lwip_tcp_context_init(&owner->context);
+    }
+    tcp_owner_count=OWNERS;
+
+    struct kernel_socket_protocol_scope scope;
+    kernel_socket_protocol_enter(&scope);
+    for (unsigned i=0;i<PAIRS;i++) {
+        struct tcp_pcb *pcb=client[i]->tcp;
+        /* Distinct listener ports allow different connects to share one
+         * preferred owner without sharing any actual tuple. */
+        unsigned port=50000;
+        while (tcp_flow_hash(&pcb->local_ip,port,&pcb->remote_ip,pcb->remote_port)%OWNERS)
+            port++;
+        pcb->local_port=server[i]->tcp->remote_port=port;
+    }
+    for (unsigned i=0;i<OWNERS;i++) {
+        CHECK(tcp_promote(client[i],&scope));
+        unsigned cpu=tcp_socket_cpu(client[i]);
+        struct tcp_pcb reverse=*server[i]->tcp;
+        reverse.boaros_loopback=0;
+        CHECK(tcp_pick_owner(&reverse,OWNERS,tcp_pcb_hash(&reverse))==cpu);
+        CHECK(tcp_promote(server[i],&scope));
+        CHECK(cpu && cpu==tcp_socket_cpu(server[i]) && (i<2 ? cpu==1 : cpu!=1));
+        CHECK(client[i]->tcp->boaros_loopback_peer==server[i]->tcp);
+    }
+    kernel_socket_protocol_leave(&scope);
+
+    unsigned freed=tcp_socket_cpu(client[1]);
+    CHECK(tcp_owner_lock(&scope,tcp_owner_at(freed),0));
+    struct tcp_pcb *closed[2]={client[1]->tcp,server[1]->tcp};
+    for (unsigned i=0;i<2;i++) {
+        struct tcp_pcb *pcb=closed[i];
+        TCP_RMV_ACTIVE(pcb);
+        tcp_set_state(pcb,TIME_WAIT);
+        boaros_lwip_tcp_pcb_timewait(pcb);
+        TCP_REG(&tcp_tw_pcbs,pcb);
+    }
+    kernel_socket_protocol_leave(&scope);
+    kernel_socket_protocol_enter(&scope);
+    CHECK(tcp_promote(client[OWNERS],&scope) && tcp_promote(server[OWNERS],&scope));
+    CHECK(tcp_socket_cpu(client[OWNERS])==freed && tcp_socket_cpu(server[OWNERS])==freed);
+    kernel_socket_protocol_leave(&scope);
+
+    for (unsigned i=0;i<PAIRS;i++) {
+        CHECK(tcp_owner_lock(&scope,tcp_owner_at(tcp_socket_cpu(client[i])),0));
+        tcp_abandon(client[i]->tcp,0);
+        tcp_abandon(server[i]->tcp,0);
+        kernel_socket_protocol_leave(&scope);
+        kernel_socket_destroy(client[i]);
+        kernel_socket_destroy(server[i]);
+        kernel_socket_destroy(listener[i]);
+    }
+    for (unsigned cpu=1;cpu<=OWNERS;cpu++) {
+        struct socket_tcp_owner *owner=tcp_owner_at(cpu);
+        CHECK(!tcp_owner_active[cpu] && !owner->context.active && !owner->context.timewait);
+        CHECK(!kernel_wait_queue_close(&owner->work) && !kernel_wait_queue_destroy(&owner->work));
+    }
+    puts("PASS TCP owner placement: colliding tuples, paired peers and retired route capacity");
 }
 #endif
 
@@ -4641,6 +4715,9 @@ static void unix_peer_identity(void)
 int main(int argc, char **argv)
 {
     CHECK(argc == 2);
+#if BOAROS_USER_SMP
+    for (unsigned i=0;i<BOAROS_MAX_CPUS-1;i++) CHECK(!pthread_mutex_init(&model_tcp_mutex[i],NULL));
+#endif
     CHECK(kernel_pid_allocator_init(&model_pid_numbers,model_pid_bitmap,1024)==KERNEL_PID_STATUS_OK);
     CHECK(kernel_pid_publish(&model_pid_registry,&model_pid)==KERNEL_PID_STATUS_OK);
     if (!strcmp(argv[1], "unix-peer-identity")) unix_peer_identity();
@@ -4659,6 +4736,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "tcp-loopback-checksum")) tcp_loopback_checksum();
 #if BOAROS_USER_SMP
     else if (!strcmp(argv[1], "tcp-owner-lookup")) tcp_owner_lookup();
+    else if (!strcmp(argv[1], "tcp-owner-placement")) tcp_owner_placement();
 #endif
     else if (!strcmp(argv[1], "tcp-cork")) tcp_cork_contract();
     else if (!strcmp(argv[1], "tcp-more")) tcp_more_contract();

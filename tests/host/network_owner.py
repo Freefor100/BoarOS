@@ -13,7 +13,8 @@ cases += ('tcp-quota-notify', 'remote-quota-notify', 'remote-batch-writers', 're
 cases += ('tcp-loopback-checksum', 'tcp-detached', 'tcp-input-output', 'tcp-reset-receive-retry', 'raw-tcp-ingress')
 cases += ('tcp-more', 'tcp-cork')
 cases += ('ipv6-mld', 'ipv6-ra', 'ipv6-source-prefix', 'ipv6-global', 'ipv6-prepare-withdraw', 'ipv6-linklocal', 'raw-icmp-owner', 'raw-icmp-close', 'ipv4-options')
-parser.add_argument('--case', choices=(*cases, 'tcp-owner-lookup', 'all'), action='append', help='repeat to share one host build; default: all')
+smp_cases = ('tcp-owner-lookup', 'tcp-owner-placement')
+parser.add_argument('--case', choices=(*cases, *smp_cases, 'all'), action='append', help='repeat to share one host build; default: all')
 parser.add_argument('--sanitize', action='store_true')
 parser.add_argument('--page-shift', type=int, choices=(12, 14), default=12)
 args = parser.parse_args()
@@ -31,12 +32,15 @@ with tempfile.TemporaryDirectory(prefix='boaros-network-owner-') as directory:
                '-idirafter', 'net/lwip_port/include', '-Ithird_party/lwip/src/include', '-I' + str(work),
                'tests/host/network_owner.c','kernel/raw_lock.c','tests/host/cpu_context.c','-Wl,--wrap=netif_get_by_index,--wrap=kernel_raw_lock_acquire,--wrap=kernel_bpf_program_get,--wrap=kernel_bpf_program_put,--wrap=kernel_bpf_filter', *sources, '-o', str(program)]
     if args.sanitize: command += ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']
-    selected = (*cases, 'tcp-owner-lookup') if not args.case or 'all' in args.case else args.case
-    ordinary = [case for case in selected if case != 'tcp-owner-lookup']
+    selected = (*cases, *smp_cases) if not args.case or 'all' in args.case else args.case
+    ordinary = [case for case in selected if case not in smp_cases]
     if ordinary:
         subprocess.run(command, cwd=ROOT, check=True, timeout=60)
         for case in ordinary:
             subprocess.run([str(program), case], check=True, timeout=20)
-    if 'tcp-owner-lookup' in selected:
+    if any(case in smp_cases for case in selected):
+        command[command.index('-DBOAROS_MAX_CPUS=2')] = '-DBOAROS_MAX_CPUS=4'
         subprocess.run(command + ['-DBOAROS_USER_SMP=1'], cwd=ROOT, check=True, timeout=60)
-        subprocess.run([str(program), 'tcp-owner-lookup'], check=True, timeout=20)
+        for case in selected:
+            if case in smp_cases:
+                subprocess.run([str(program), case], check=True, timeout=20)
