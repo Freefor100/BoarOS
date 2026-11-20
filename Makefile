@@ -688,7 +688,7 @@ DEPS := \
 	$(DEMAND_PAGE_OOM_TEST_OBJECT_RV:.o=.d) \
 	$(ROOT_BOOT_CLEANUP_TEST_OBJECT_RV:.o=.d)
 
-.PHONY: all clean debug-riscv run-riscv \
+.PHONY: all clean \
 	test-root-init-riscv test-demand-page-riscv test-exec-riscv \
 	test-root-boot-cleanup-riscv \
 	test-uaccess-oom-riscv \
@@ -1118,14 +1118,6 @@ $(BUILD_DIR)/third_party/lwext4/src/%.o: \
 $(BUILD_DIR)/%.o: %.S $(BUILD_DIR)/generated/cost-config.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(ASFLAGS) -MMD -MP $(DEP_TARGET_FLAGS) -c $< -o $@
-
-run-riscv: $(KERNEL_RV)
-	python3 -B tests/oscomp/local_disks.py --arch riscv $(OSCOMP_LOCAL_ARGS) \
-		--qemu '$(QEMU_RISCV64)' --kernel $(KERNEL_RV) --memory $(QEMU_MEMORY)
-
-debug-riscv: $(KERNEL_RV)
-	python3 -B tests/oscomp/local_disks.py --arch riscv $(OSCOMP_LOCAL_ARGS) \
-		--qemu '$(QEMU_RISCV64)' --kernel $(KERNEL_RV) --memory $(QEMU_MEMORY) --gdb
 
 .NOTPARALLEL: test-riscv
 test-riscv: test-page-riscv \
@@ -1855,17 +1847,26 @@ test-epoll-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 include arch/loongarch/build.mk
 include vdso/build.mk
 
+# ===== BEGIN QEMU BOOT TARGETS =====
+# Override QEMU_RISCV64 or QEMU_LOONGARCH64 to select a simulator, and
+# QEMU_MEMORY to set guest RAM. QEMU_RISCV_FIRMWARE selects the RISC-V
+# firmware image. ROOTFS_DIR holds the writable disks for interactive boots.
 ROOTFS_DIR ?= build/rootfs
+QEMU_RISCV_FIRMWARE ?= default
 .PHONY: rootfs-riscv rootfs-loongarch shell-riscv shell-loongarch
+.PHONY: run-riscv debug-riscv run-loongarch run-smp-riscv run-user-smp-riscv
+
+# Build each root disk on demand and keep guest files across boots.
 rootfs-riscv: $(ROOTFS_DIR)/riscv64.img
 rootfs-loongarch: $(ROOTFS_DIR)/loongarch64.img
 
-# A root disk can contain user data after first boot. Create it only when missing.
 $(ROOTFS_DIR)/riscv64.img $(ROOTFS_DIR)/loongarch64.img: $(ROOTFS_DIR)/%.img:
 	python3 -B tools/mkrootfs.py $* "$@"
 
+# Interactive boots attach the ext4 disk through each platform's VirtIO
+# transport and connect the guest serial console to the terminal.
 shell-riscv: $(KERNEL_RV) $(ROOTFS_DIR)/riscv64.img
-	$(QEMU_RISCV64) -machine virt -bios default -kernel $< \
+	$(QEMU_RISCV64) -machine virt -bios "$(QEMU_RISCV_FIRMWARE)" -kernel $< \
 		-m $(QEMU_MEMORY) -smp 1 -nographic -no-reboot -nic none \
 		-drive "file=$(ROOTFS_DIR)/riscv64.img,format=raw,if=none,id=root" \
 		-device virtio-blk-device,drive=root
@@ -1875,9 +1876,36 @@ shell-loongarch: $(KERNEL_LA) $(ROOTFS_DIR)/loongarch64.img
 		-m $(QEMU_MEMORY) -smp 1 -nographic -no-reboot -nic none \
 		-drive "file=$(ROOTFS_DIR)/loongarch64.img,format=raw,if=none,id=root" \
 		-device virtio-blk-pci,drive=root,disable-legacy=on
+
+# Assessment boots prepare the competition disks and run the local supervisor.
+# The debug target pauses the guest and starts the debugger stub on port 1234.
+run-riscv: $(KERNEL_RV)
+	python3 -B tests/oscomp/local_disks.py --arch riscv $(OSCOMP_LOCAL_ARGS) \
+		--qemu '$(QEMU_RISCV64)' --kernel $(KERNEL_RV) --memory $(QEMU_MEMORY)
+
+debug-riscv: $(KERNEL_RV)
+	python3 -B tests/oscomp/local_disks.py --arch riscv $(OSCOMP_LOCAL_ARGS) \
+		--qemu '$(QEMU_RISCV64)' --kernel $(KERNEL_RV) --memory $(QEMU_MEMORY) --gdb
+
+run-loongarch: $(KERNEL_LA)
+	python3 -B tests/oscomp/local_disks.py --arch loongarch $(OSCOMP_LOCAL_ARGS) \
+		--qemu '$(QEMU_LOONGARCH64)' --kernel $(KERNEL_LA) --memory 1G
+
 ifeq ($(QEMU_LOONGARCH64),build/qemu-la-rtc/qemu-system-loongarch64)
-shell-loongarch: prepare-la-tools
+shell-loongarch run-loongarch: prepare-la-tools
 endif
+
+# The RISC-V multicore targets boot the matching build profile without a disk.
+run-smp-riscv: kernel-rv-smp
+	$(QEMU_RISCV64) -machine virt -accel tcg,thread=multi -smp $(SMP_CPUS) \
+		-m $(QEMU_MEMORY) -nographic -bios $(QEMU_RISCV_FIRMWARE) \
+		-kernel build/riscv-smp$(SMP_BUILD_SUFFIX)/kernel-rv
+
+run-user-smp-riscv: kernel-rv-user-smp
+	$(QEMU_RISCV64) -machine virt -accel tcg,thread=multi -smp $(SMP_CPUS) \
+		-m $(QEMU_MEMORY) -nographic -bios $(QEMU_RISCV_FIRMWARE) \
+		-kernel build/riscv-user-smp$(SMP_BUILD_SUFFIX)/kernel-rv
+# ===== END QEMU BOOT TARGETS =====
 
 .PHONY: test-elf-layout-host
 test-elf-layout-host:
@@ -2240,12 +2268,10 @@ test-sched-concurrency-host:
 
 test-riscv: test-scheduler-handoff-riscv
 
-.PHONY: kernel-rv-smp run-smp-riscv test-smp-host test-smp-riscv
-.PHONY: kernel-rv-user-smp run-user-smp-riscv test-user-smp-host
+.PHONY: kernel-rv-smp test-smp-host test-smp-riscv
+.PHONY: kernel-rv-user-smp test-user-smp-host
 kernel-rv-user-smp:
 	$(MAKE) SMP=1 USER_SMP=1 COST_DIAGNOSTICS=0 all
-run-user-smp-riscv: kernel-rv-user-smp
-	$(QEMU_RISCV64) -machine virt -accel tcg,thread=multi -smp $(SMP_CPUS) -m $(QEMU_MEMORY) -nographic -bios $(QEMU_RISCV_FIRMWARE) -kernel build/riscv-user-smp$(SMP_BUILD_SUFFIX)/kernel-rv
 # Reuse the real scheduler model for protocol-local qualification and owner handoff.
 .PHONY: test-socket-protocol-host
 test-socket-protocol-host:
@@ -2339,11 +2365,8 @@ test-mm-smp-riscv:
 		$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 SMP_TEST_PROFILE=$$profile COST_DIAGNOSTICS=0 all; \
 		python3 -B tests/smp/riscv.py --contract mm --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel build/riscv-mm-smp-test$(SMP_BUILD_SUFFIX)/$$profile/kernel-rv --profile $$profile --output build/riscv-mm-smp-test$(SMP_BUILD_SUFFIX)/runs/$$profile; \
 	done
-QEMU_RISCV_FIRMWARE ?= default
 kernel-rv-smp:
 	$(MAKE) SMP=1 SMP_TEST=0 COST_DIAGNOSTICS=0 all
-run-smp-riscv: kernel-rv-smp
-	$(QEMU_RISCV64) -machine virt -accel tcg,thread=multi -smp $(SMP_CPUS) -m $(QEMU_MEMORY) -nographic -bios $(QEMU_RISCV_FIRMWARE) -kernel build/riscv-smp$(SMP_BUILD_SUFFIX)/kernel-rv
 .PHONY: test-riscv-rfence-host
 test-riscv-rfence-host:
 	sh tests/host/riscv-rfence.sh

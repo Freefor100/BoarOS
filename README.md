@@ -98,6 +98,76 @@ make shell-loongarch INIT_CONFIG=config/init.json PAHOLE=pahole QEMU_LOONGARCH64
 
 比赛交付用 `make all` 生成两份内核和第二盘，并选用对应架构的评测启动配置。运行命令、固定输入和监督策略见[评测环境适配](docs/modules/oscomp-compat.md)，原盘和判分问题见[测例问题](docs/learning/oscomp-test-issues.md)。
 
+<details>
+<summary>展开等价命令，指定工具路径、输出目录和虚拟机参数</summary>
+
+在仓库根目录执行下列其中一组命令。可将工具名换成绝对路径。示例使用独立的对象目录和根盘，首次制盘后可直接重复运行最后一条 QEMU 命令。
+
+**RISC-V**
+
+```sh
+# 改这里可以选择交叉工具链、模拟器、固件和客户机内存
+cross=riscv64-elf-
+rv_ld=riscv64-linux-gnu-ld
+qemu=qemu-system-riscv64
+firmware=default
+pahole=pahole
+ram=1G
+
+# 对象文件、内核和根盘都放在这个目录下
+out="$PWD/build/manual-riscv"
+make -j"$(nproc)" CROSS_COMPILE="$cross" RV_VDSO_LD="$rv_ld" PAHOLE="$pahole" \
+  INIT_CONFIG=config/init.json BUILD_DIR="$out/obj" KERNEL_RV="$out/kernel-rv" "$out/kernel-rv"
+python3 -B tools/mkrootfs.py riscv64 "$out/root.img"
+
+# 使用 VirtIO 内存映射 I/O 块设备，串口接到当前终端
+"$qemu" -machine virt -bios "$firmware" -kernel "$out/kernel-rv" \
+  -m "$ram" -smp 1 -nographic -no-reboot -nic none \
+  -drive "file=$out/root.img,format=raw,if=none,id=root" \
+  -device virtio-blk-device,drive=root
+```
+
+**LoongArch**
+
+```sh
+# 按本机安装位置调整交叉编译器前缀和 QEMU 路径
+cross=loongarch64-unknown-linux-gnu-
+qemu=qemu-system-loongarch64
+pahole=pahole
+ram=1G
+out="$PWD/build/manual-loongarch"
+
+# LA_BUILD 指定对象目录，KERNEL_LA 指定内核输出文件
+make -j"$(nproc)" LA_CROSS_COMPILE="$cross" PAHOLE="$pahole" \
+  INIT_CONFIG=config/init.json LA_BUILD="$out/obj" KERNEL_LA="$out/kernel-la" "$out/kernel-la"
+python3 -B tools/mkrootfs.py loongarch64 "$out/root.img"
+
+# 选择 LA464 处理器和现代 VirtIO PCI 块设备
+"$qemu" -machine virt -cpu la464 -kernel "$out/kernel-la" \
+  -m "$ram" -smp 1 -nographic -no-reboot -nic none \
+  -drive "file=$out/root.img,format=raw,if=none,id=root" \
+  -device virtio-blk-pci,drive=root,disable-legacy=on
+```
+
+以上命令使用默认单核内核。调整 `-smp` 前，RISC-V 需用 `SMP=1 USER_SMP=1 SMP_CPUS=4` 等参数编译对应容量的内核，LoongArch 需用 `LA_SMP=1 LA_SMP_CPUS=4` 等参数。给不同构建配置各自指定对象目录。
+
+</details>
+
+### 在 Docker 中构建和运行
+
+[Dockerfile](Dockerfile) 采用本地开发使用的 x86-64 Arch Linux 软件包版本和 LoongArch 交叉工具链。构建镜像后，在同一仓库根目录挂载源码并启动。
+
+```sh
+docker build --platform linux/amd64 -t boaros-dev .
+
+# 挂载当前仓库，以宿主用户身份写入内核和根盘
+docker run --rm -it --user "$(id -u):$(id -g)" \
+  --mount "type=bind,source=$PWD,target=/workspace" \
+  boaros-dev make -j4 INIT_CONFIG=config/init.json shell-riscv
+```
+
+启动 LoongArch 时将最后的 `shell-riscv` 换成 `shell-loongarch`。镜像已设置 `PAHOLE` 和 `QEMU_LOONGARCH64`。工具版本与宿主配置见[工具链指南](docs/toolchain.md)。
+
 开发和回归检查见[贡献指南](CONTRIBUTING.md)。
 
 ---
