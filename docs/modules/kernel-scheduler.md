@@ -435,7 +435,7 @@ exec 完成映像验证后收拢组内其他线程。竞争 exec 或已被组终
 
 ## wait 与记账
 
-wait4 遍历组长父子树，默认允许等待同组其他线程的子进程；线程本身不作为独立子进程出现。`__WNOTHREAD` 按创建/收养线程关系过滤。创建者退出时，子进程依次交给父线程组内仍存活的成员、最近的存活 subreaper 祖先进程或 PID 1。组长已退出的 subreaper 仍可由其存活成员收养；正在结束的组跳过。组内交接保留退出信号和父子链位置，跨组收养则把子进程移入新父组的等待链，将退出信号设为 SIGCHLD，并按新父组的处置通知或回收已结束的子进程。
+指定进程编号（Process Identifier，PID）或进程文件描述符（PID file descriptor，pidfd）的 `wait4`／`waitid` 在一次调度锁保护内，从已持有的进程身份取得当前任务，再检查追踪和父子关系并领取可报告事件。执行映像替换过程中发生身份转移时，由身份中的当前成员决定目标。等待任意子进程或按进程组等待仍分批遍历子链。默认允许等待同组其他线程的子进程，`__WNOTHREAD` 按创建或收养线程关系过滤。线程本身不作为独立子进程出现。创建者退出时，子进程依次交给父线程组内仍存活的成员、最近的存活 subreaper 祖先进程或 PID 1。组长已退出的 subreaper 仍可由其存活成员收养；正在结束的组跳过。组内交接保留退出信号和父子链位置，跨组收养则把子进程移入新父组的等待链，将退出信号设为 SIGCHLD，并按新父组的处置通知或回收已结束的子进程。
 
 `PR_SET_CHILD_SUBREAPER` 由线程组共享。普通 fork 产生未设置的子组，exec 保留设置，非组长 exec 随进程身份接管设置。父线程 TID 的变更和[父线程死亡信号](kernel-signal.md#状态与生命周期)的选择使用同一调度保护。
 
@@ -465,7 +465,7 @@ LA生产任务也沿现有内核栈窗口接口运行：PGDH共享骨架持有�
 按SP下方字节定位槽位。用户PGDL切换不改PGDH，回收先撤叶/TLB同步再归还栈。
 该硬件保护和映射失败/骨架OOM回滚由`test-stack-guard-loongarch`验证。
 
-`make test-stack-usage` 强制重建隔离的生产对象，编译器 `-fstack-usage` 产出逐函数记录；host probe 从实际栈配置和 Trap Frame 头计算容量、guard、汇编 Frame 与余量预算，避免测试大栈或旧报告污染门禁。`tests/tools/stack-usage.py` 拒绝超出“栈容量减 16 字节、288 字节汇编 Trap Frame、1024 字节余量”的单帧及无界动态栈；该检查不能证明完整调用链。真实 root-init、静态 musl 与动态 pthread 测试另要求已退出任务的最小实测余量至少 1024 字节，不足时必须扩大栈后重新运行。Canary 用于发现破坏，填充测量用于观察高水位；生产栈的未映射 guard 只对经窗口 VA 的 SP 式越界生效，direct-map 别名仍可达同一批物理页，且二者都不证明未执行分支的栈界。idle/boot 栈仍在 .bss 高半区别名内，没有 guard。ASID 0 的切换刷新成本、OTHER 的 100 Hz tick 与线性 wait4 仍存在。
+`make test-stack-usage` 强制重建隔离的生产对象，编译器 `-fstack-usage` 产出逐函数记录；host probe 从实际栈配置和 Trap Frame 头计算容量、guard、汇编 Frame 与余量预算，避免测试大栈或旧报告污染门禁。`tests/tools/stack-usage.py` 拒绝超出“栈容量减 16 字节、288 字节汇编 Trap Frame、1024 字节余量”的单帧及无界动态栈；该检查不能证明完整调用链。真实 root-init、静态 musl 与动态 pthread 测试另要求已退出任务的最小实测余量至少 1024 字节，不足时必须扩大栈后重新运行。Canary 用于发现破坏，填充测量用于观察高水位；生产栈的未映射 guard 只对经窗口 VA 的 SP 式越界生效，direct-map 别名仍可达同一批物理页，且二者都不证明未执行分支的栈界。idle/boot 栈仍在 .bss 高半区别名内，没有 guard。ASID 0 的切换刷新成本、OTHER 的 100 Hz tick 与按任意子进程或进程组等待时的线性扫描仍存在。
 
 futex 的直接宿主入口 `make test-futex-host` 运行真实 MM、park、桶锁和原子操作，覆盖 4/16 KiB pin、MM gate 被另一执行者持有时 private 操作继续完成、关闭新许可后的等待与撤权、冷页和 COW、同桶/跨桶与同 key requeue、六种有符号比较、bitset、短链单次调度锁通知、同桶碰撞与 17 节点游标续批、PREPARED/COMMITTED 通知及 owner 归还；`tests/workloads/futex/caller.c` 可在 Linux 与两种架构上运行相同用户探针。
 

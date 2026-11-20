@@ -676,6 +676,32 @@ int64_t kernel_ptrace_request(struct kernel_task *caller,uint64_t request,int32_
     return result;
 }
 
+static int claim_trace_event_locked(struct kernel_task *task,struct kernel_ptrace_state *s,
+    unsigned options,struct kernel_task **child,uint32_t *event)
+{
+    if (!s->unread || task->reaping) return 0;
+    int final = s->phase == TRACE_FINAL;
+    if (final ? !(options & 4U) : (!(options & (2U | 0x10000000U)) || s->phase != TRACE_STOPPED)) return 0;
+    task->reaping = 1;
+    scheduler_task_get_locked(task);
+    *child = task;
+    *event = final ? TRACE_WAIT_FINAL : TRACE_WAIT_STOP;
+    return 1;
+}
+
+int ptrace_select_target_locked(struct kernel_task *parent,struct kernel_task *task,
+    unsigned options,struct kernel_task **child,uint32_t *event,int *matching)
+{
+    struct kernel_ptrace_state *s = state(task);
+    struct kernel_task *tracer = s ? s->tracer : 0;
+    if (!tracer) return 0;
+    if (tracer != parent && ((options & 0x20000000U) ||
+        parent->group_leader->group_members == 1 || tracer->group_leader != parent->group_leader ||
+        !tracer->group_next)) return 0;
+    *matching = 1;
+    return claim_trace_event_locked(task,s,options,child,event);
+}
+
 static int select_tracee(struct kernel_task *tracer,int which,const struct kernel_pid *target,
     unsigned options,struct kernel_task **child,uint32_t *event,int *matching)
 {
@@ -698,12 +724,10 @@ static int select_tracee(struct kernel_task *tracer,int which,const struct kerne
                 if (which && (!target || process_identity(t,which==2?KERNEL_PID_PGID:KERNEL_PID_TID)!=target))
                     continue;
                 saw=1;
-                if (!s->unread || t->reaping) continue;
-                int final=s->phase==TRACE_FINAL;
-                if (final ? !(options&4) : (!(options&(2U|0x10000000U)) || s->phase!=TRACE_STOPPED)) continue;
-                t->reaping=1; scheduler_task_get_locked(t);
-                *child=t; *event=final?TRACE_WAIT_FINAL:TRACE_WAIT_STOP;
-                *matching=1; return 1;
+                if (claim_trace_event_locked(t,s,options,child,event)) {
+                    *matching=1;
+                    return 1;
+                }
             }
             if (!next) { *matching|=saw; return 0; }
             scheduler_task_get_locked(next);

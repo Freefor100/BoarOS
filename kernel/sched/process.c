@@ -1233,12 +1233,41 @@ static struct kernel_pid *wait_target_get(struct kernel_task *parent, int32_t wh
     return identity;
 }
 
-static int wait_child_matches(const struct kernel_task *child, int32_t which,
-                              const struct kernel_pid *target)
+static int wait_child_valid(const struct kernel_task *parent, const struct kernel_task *child)
 {
-    if (which == LINUX_P_ALL) return 1;
-    return target && process_identity(child,
-        (which == LINUX_P_PID || which == LINUX_P_PIDFD) ? KERNEL_PID_TID : KERNEL_PID_PGID) == target;
+    return child != parent && child->magic == KERNEL_THREAD_MAGIC &&
+        !child->idle && child->arch.user_mode == 1 && child->tid_owned && child->tid > 0 &&
+        !child->publish_completion &&
+        child->state >= KERNEL_THREAD_STATE_READY && child->state <= KERNEL_THREAD_STATE_NEW;
+}
+
+static int wait_claim_child_locked(struct kernel_task *parent, struct kernel_task *child,
+    uint32_t options, struct kernel_task **selected, uint32_t *event, int *matching)
+{
+    if (((options & LINUX___WNOTHREAD) && child->child_creator != process_identity(parent, KERNEL_PID_TID)) ||
+        (!(options & LINUX___WALL) && ((child->exit_signal != 17U) != !!(options & LINUX___WCLONE))))
+        return 0;
+    uint32_t kind;
+    if (child->state == KERNEL_THREAD_STATE_ZOMBIE) {
+        if (!(options & LINUX_WEXITED)) return 0;
+        *matching = 1;
+        if (child->reaping || kernel_ptrace_tracer_tid_locked(child)) return 0;
+        kind = 1;
+    } else {
+        *matching = 1;
+        /* A stop in this parent's trace list is the sole stop report. */
+        int traced_here = child->ptrace && child->ptrace->tracer &&
+            child->ptrace->tracer->group_leader == child->parent;
+        kind = !traced_here && child->group_stopped &&
+            (options & (LINUX_WUNTRACED | LINUX_WSTOPPED)) && !child->stop_notified ? 2 :
+            !child->group_stopped && (options & LINUX_WCONTINUED) && child->continue_notified ? 3 : 0;
+        if (!kind || child->reaping) return 0;
+    }
+    child->reaping = 1;
+    scheduler_task_get_locked(child);
+    *selected = child;
+    *event = kind;
+    return 1;
 }
 
 static enum kernel_scheduler_status retire_waited_zombie(
@@ -1467,6 +1496,19 @@ static enum kernel_scheduler_status select_wait_child(struct kernel_task *parent
     *selected = 0;
     *event = 0;
     *matching = 0;
+    if (which == LINUX_P_PID || which == LINUX_P_PIDFD) {
+        /* The caller holds the identity even if its member has exited or
+         * changed on exec. Read the current member and claim under one lock. */
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        if (!parent->group_leader) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        const struct kernel_pid_member *member = target ? target->members[KERNEL_PID_TID] : 0;
+        struct kernel_task *child = member ? member->task : 0;
+        if (!child || ptrace_select_target_locked(parent,child,options,selected,event,matching) ||
+            child->parent != parent->group_leader) return KERNEL_SCHEDULER_STATUS_OK;
+        if (!wait_child_valid(parent,child)) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        (void)wait_claim_child_locked(parent,child,options,selected,event,matching);
+        return KERNEL_SCHEDULER_STATUS_OK;
+    }
     if (ptrace_select(parent,which,target,options,selected,event,matching))
         return KERNEL_SCHEDULER_STATUS_OK;
     int trace_matching=*matching;
@@ -1497,45 +1539,14 @@ static enum kernel_scheduler_status select_wait_child(struct kernel_task *parent
             struct kernel_task *child = restart ? leader->first_child : owner;
             restart = 0;
             for (unsigned n = 0; child && n < 16; n++) {
-                if (++count > KERNEL_PID_LIMIT || child == parent || child->magic != KERNEL_THREAD_MAGIC ||
-                    child->idle || child->arch.user_mode != 1 || !child->tid_owned || child->tid <= 0 ||
-                    child->parent != leader || (uintptr_t)child->previous_sibling != previous ||
-                    child->publish_completion || child->state < KERNEL_THREAD_STATE_READY ||
-                    child->state > KERNEL_THREAD_STATE_NEW) {
+                if (++count > KERNEL_PID_LIMIT || child->parent != leader || !wait_child_valid(parent,child) ||
+                    (uintptr_t)child->previous_sibling != previous) {
                     status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
                     break;
                 }
-                if (!((options & LINUX___WNOTHREAD) && child->child_creator != process_identity(parent, KERNEL_PID_TID)) &&
-                    ((options & LINUX___WALL) || ((child->exit_signal != 17U) == !!(options & LINUX___WCLONE))) &&
-                    wait_child_matches(child, which, target)) {
-                    if (child->state == KERNEL_THREAD_STATE_ZOMBIE) {
-                        if (options & LINUX_WEXITED) {
-                            *matching = 1;
-                            if (!child->reaping && !kernel_ptrace_tracer_tid_locked(child)) {
-                                child->reaping = 1;
-                                scheduler_task_get_locked(child);
-                                *selected = child;
-                                *event = 1;
-                                return KERNEL_SCHEDULER_STATUS_OK;
-                            }
-                        }
-                    } else {
-                        *matching = 1;
-                        /* The same parent group can reach this child through
-                         * both lists. Its ptrace stop is the sole stop report. */
-                        int traced_here=child->ptrace && child->ptrace->tracer &&
-                            child->ptrace->tracer->group_leader==leader;
-                        uint32_t kind = !traced_here && child->group_stopped && (options & (LINUX_WUNTRACED | LINUX_WSTOPPED)) && !child->stop_notified ? 2 :
-                            !child->group_stopped && (options & LINUX_WCONTINUED) && child->continue_notified ? 3 : 0;
-                        if (kind && !child->reaping) {
-                            child->reaping = 1;
-                            scheduler_task_get_locked(child);
-                            *selected = child;
-                            *event = kind;
-                            return KERNEL_SCHEDULER_STATUS_OK;
-                        }
-                    }
-                }
+                if ((which == LINUX_P_ALL || (target && process_identity(child,KERNEL_PID_PGID)==target)) &&
+                    wait_claim_child_locked(parent,child,options,selected,event,matching))
+                    return KERNEL_SCHEDULER_STATUS_OK;
                 previous = (uintptr_t)child;
                 child = child->next_sibling;
             }

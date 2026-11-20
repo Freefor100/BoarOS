@@ -2,6 +2,7 @@
 #include <kernel/heap.h>
 #include <kernel/physical_page.h>
 #include <kernel/cpu.h>
+#include <kernel/errno.h>
 #include <kernel/open_file.h>
 #include <kernel/mm_backend.h>
 #include <kernel/signal.h>
@@ -238,7 +239,7 @@ static void regular_file_domain(struct kernel_heap *heap)
     puts("PASS regular FD domain, cross-CPU dup/close, CPU0 final backend owner");
 }
 static unsigned allocated[4][192], group_ready, group_release;
-static _Thread_local unsigned fail_growth,fail_next_allocation;
+static _Thread_local unsigned fail_growth,fail_next_allocation,fail_bitmap;
 static unsigned maximum_copy, metadata_acquisitions;
 void *__real_memcpy(void *,const void *,size_t);
 void *__wrap_memcpy(void *dst,const void *src,size_t length)
@@ -267,6 +268,10 @@ enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *h
     if (fail_growth && size==sizeof(struct kernel_file_slot) && count>32) {
         fail_growth=0; return KERNEL_HEAP_STATUS_EMPTY;
     }
+    if (fail_bitmap && size==sizeof(uint64_t) &&
+        count==KERNEL_FILES_BITMAP_WORDS(KERNEL_FILES_MAX_CAPACITY)) {
+        fail_bitmap=0; return KERNEL_HEAP_STATUS_EMPTY;
+    }
     return __real_kernel_heap_allocate_zeroed(heap,count,size,owner);
 }
 static void *dup_group(void *p)
@@ -285,6 +290,64 @@ static void *dup_group(void *p)
     assert(!kernel_files_release(&views[id]));
     mm_test_bind_files(0); mm_test_bind(0);
     return 0;
+}
+static void lowest_available_fd_case(struct kernel_heap *heap)
+{
+    struct kernel_files table={0}, copy={0}, without_range={0}, shared={0};
+    struct kernel_open_file_description *source=0;
+    struct kernel_pipe *pipe=0;
+    int64_t result;
+    uint32_t fd, second;
+    int error;
+
+    assert(!kernel_files_create(&table,heap));
+    assert(!kernel_pipe_create(heap,&pipe));
+    assert(!kernel_open_file_create_pipe(heap,pipe,KERNEL_PIPE_ENDPOINT_READ,0,&source));
+    assert(!kernel_files_install_new_owned_at(&table,0,0,&source));
+    for (uint32_t i=1;i<=69;i++)
+        assert(!kernel_files_dup(&table,0,&result) && result==i);
+    fail_bitmap=1;
+    assert(!kernel_files_dup3(&table,0,513,0,&result) && result==-KERNEL_ENOMEM && !fail_bitmap);
+    struct kernel_files_statistics stats;
+    kernel_files_get_statistics(&table,&stats);
+    assert(stats.capacity==128 && stats.current_open_fds==70);
+    assert(!kernel_files_dup3(&table,0,513,0,&result) && result==513);
+    assert(!kernel_files_close_range(&table,63,64,0,0));
+    assert(!kernel_files_find_free_fd(&table,&fd,&error) && !error && fd==63);
+    struct kernel_files_fd_reservation pending={&table,fd};
+    assert(!kernel_files_close_range(&table,fd,fd,1,0));
+    assert(!kernel_files_close_range(&table,fd,fd,0,0));
+    assert(!kernel_files_dup3(&table,0,fd,0,&result) && result==-KERNEL_EBUSY);
+
+    assert(!kernel_files_acquire(&shared,&table));
+    shared.nofile_limit=65;
+    assert(!kernel_files_find_two_free_fds(&shared,&fd,&second,&result) &&
+        result==-KERNEL_EMFILE && fd==64);
+    assert(!kernel_files_fcntl(&shared,0,KERNEL_FILES_F_DUPFD_CLOEXEC,63,&result) && result==64);
+    assert(!kernel_files_dup(&shared,0,&result) && result==-KERNEL_EMFILE);
+    assert(!kernel_files_fcntl(&shared,0,KERNEL_FILES_F_DUPFD,65,&result) && result==-KERNEL_EINVAL);
+    assert(!kernel_files_release(&shared));
+
+    fail_bitmap=1;
+    assert(kernel_files_fork(&copy,&table)==KERNEL_FILES_STATUS_NO_MEMORY && !fail_bitmap);
+    assert(!kernel_files_fork(&copy,&table));
+    assert(!kernel_files_dup(&copy,0,&result) && result==63);
+    assert(!kernel_files_fcntl(&copy,0,KERNEL_FILES_F_DUPFD,513,&result) && result==514);
+    assert(!kernel_files_release(&copy));
+    assert(!kernel_files_fork_except(&without_range,&table,61,68));
+    assert(!kernel_files_dup(&without_range,0,&result) && result==61);
+    assert(!kernel_files_fcntl(&without_range,0,KERNEL_FILES_F_DUPFD,68,&result) && result==68);
+    assert(!kernel_files_release(&without_range));
+
+    assert(!kernel_files_pin(&table,0,&source,&result) && !result);
+    assert(!kernel_files_install_shared_acquired_at(&table,pending.fd,0,&source));
+    pending.files=0;
+    assert(!kernel_files_fcntl(&table,63,KERNEL_FILES_F_GETFD,0,&result) && result==1);
+    assert(!kernel_files_close_on_exec(&table));
+    assert(!kernel_files_dup(&table,0,&result) && result==63);
+    assert(!kernel_files_dup(&table,0,&result) && result==64);
+    assert(!kernel_files_release(&table));
+    puts("PASS lowest FD across bitmap words, shared limits, reservations and fork");
 }
 static void concurrent_dup_case(struct kernel_heap *heap,unsigned actors)
 {
@@ -404,6 +467,7 @@ int main(void)
         !kernel_heap_init(&heap, &pages, page_address));
     uint64_t baseline=physical_page_available(&pages);
     umask_case(&heap);
+    lowest_available_fd_case(&heap);
     directory_pin_handoff(&heap,0);
     assert(!kernel_files_create(&files, &heap));
     struct kernel_pipe *pipe = 0;
