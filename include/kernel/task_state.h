@@ -150,9 +150,13 @@ struct kernel_task {
 #if BOAROS_MAX_CPUS > 1
     union {
         struct kernel_sched_rt_candidate rt_candidate;
+        struct {
 #if BOAROS_USER_SMP
-        struct kernel_fair_link fair_candidate;
+            struct kernel_fair_link fair_candidate;
 #endif
+            struct kernel_task *ready_wait_next, *ready_wait_previous;
+            uint64_t ready_wait_deadline;
+        };
     };
 #endif
 #if BOAROS_USER_SMP && BOAROS_COST_DIAGNOSTICS
@@ -314,6 +318,11 @@ struct kernel_task {
     uint32_t child_subreaper;
     struct kernel_task *parent_death_next;
     uint32_t parent_death_notice;
+    int ready_wait_nice; /* Saved bucket while linked, including during priority updates. */
+#if BOAROS_MAX_CPUS == 1
+    struct kernel_task *ready_wait_next, *ready_wait_previous;
+    uint64_t ready_wait_deadline;
+#endif
 } __attribute__((aligned(16)));
 
 #endif

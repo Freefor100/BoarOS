@@ -19,7 +19,7 @@ int kernel_sched_rr_slice_set_ms(int64_t milliseconds)
 
 /* Linux's per-thread nice weights: equal nice levels receive equal CPU share,
  * while each +1 step reduces weight by approximately 20 percent. */
-static const unsigned nice_weights[40]={
+static const unsigned nice_weights[KERNEL_SCHED_NICE_LEVELS]={
     88761,71755,56483,46273,36291,29154,23254,18705,14949,11916,
     9548,7620,6100,4904,3906,3121,2501,1991,1586,1277,
     1024,820,655,526,423,335,272,215,172,137,
@@ -28,7 +28,7 @@ static const unsigned nice_weights[40]={
 unsigned kernel_sched_weight(const struct kernel_sched_policy *state)
 {
     if (state->nice < -20 || state->nice > 19) __builtin_trap();
-    return state->policy==KERNEL_SCHED_IDLE ? 3U : nice_weights[state->nice+20];
+    return state->policy==KERNEL_SCHED_IDLE ? 3U : nice_weights[state->nice-KERNEL_SCHED_NICE_MIN];
 }
 uint64_t kernel_sched_fair_delta(struct kernel_sched_policy *state,uint64_t ns)
 {

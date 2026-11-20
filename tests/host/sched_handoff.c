@@ -18,6 +18,7 @@ static unsigned char peer_stack[KERNEL_STACK_BYTES] __attribute__((aligned(KERNE
 static unsigned char running_stack[KERNEL_STACK_BYTES] __attribute__((aligned(KERNEL_STACK_BYTES)));
 static unsigned lock_calls, cpu_queries;
 static uint64_t timer_request;
+static uint64_t now;
 static struct kernel_wait_cursor join_cursor;
 static struct kernel_wait_queue *join_borrow_queue;
 static unsigned join_borrow_returned;
@@ -107,13 +108,13 @@ void *sync_test_current_task(void) { return cpu.current; }
 void sync_test_current_task_set(void *task) { cpu.current = task; }
 uintptr_t sync_test_stack(void) { return cpu.current->stack_high - 16; }
 uint64_t kernel_time_monotonic_ns(void) { return 1; }
-uint64_t kernel_time_raw_ns(void) { return 1; }
+uint64_t kernel_time_raw_ns(void) { return now; }
 uint64_t kernel_time_ticks_to_ns(uint64_t ticks) { return ticks; }
 uint32_t kernel_time_is_initialized(void) { return 1; }
 enum kernel_mm_status kernel_mm_resolve_owned_user_fault(struct kernel_mm *mm, struct kernel_task *task,
                                                    uint64_t address, uint32_t access)
 { (void)mm; (void)task; (void)address; (void)access; __builtin_trap(); /* Rejected kernel caller cannot enter MM. */ }
-uint64_t riscv_time_read(void) { return 1; }
+uint64_t riscv_time_read(void) { return now; }
 enum riscv_timer_status riscv_timer_set_scheduler_deadline(uint64_t deadline)
 { assert(!cpu.raw_locks);timer_request=deadline;return RISCV_TIMER_STATUS_NOT_STARTED; }
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t ns, uint64_t *ticks)
@@ -160,6 +161,7 @@ void riscv_context_switch(struct riscv_switch_context *previous,
 }
 static void setup(int policy, int priority, int next_priority)
 {
+    now = 1;
     scheduler = (struct kernel_scheduler){.initialized = KERNEL_SCHEDULER_INITIALIZED};
     running = (struct kernel_task){0};
     peer = (struct kernel_task){0};
@@ -224,6 +226,27 @@ static void fair_slice_case(uint32_t slice)
     running.scheduling.fair_slice_used++;
     assert(!scheduler_reschedule(0,0,1) && switches==1 && selected==&peer);
     assert(!running.scheduling.fair_slice_used);
+}
+
+static void ready_wait_case(int nice, int policy, int should_preempt)
+{
+    setup(KERNEL_SCHED_OTHER, 0, 0);
+    kernel_sched_dequeue(&scheduler.runqueue, &peer.ready_node);
+    running.arch.user_mode = peer.arch.user_mode = 1;
+    peer.accounted = 1;
+    peer.scheduling.nice = nice;
+    peer.scheduling.policy = policy;
+    peer.ready_node.fair.key = 6000000;
+    peer.fair_queue = &scheduler.runqueue;
+    ready_append(&peer);
+
+    assert(!scheduler_reschedule(0,0,0) && !switches);
+    assert(timer_request == (should_preempt ? 2000001 : 10000001));
+    now = 2000001;
+    running.usage.user_ns = 2000000;
+    assert(!scheduler_reschedule(0,0,0));
+    assert(switches == (unsigned)should_preempt);
+    if (should_preempt) assert(selected == &peer);
 }
 
 static void deferred_slice_case(void)
@@ -321,6 +344,10 @@ int main(int argc,char **argv)
 {
     deferred_slice_case();
     fair_slice_case(100000);fair_slice_case(30000000);fair_slice_case(100000000);
+    ready_wait_case(0,KERNEL_SCHED_OTHER,1);
+    ready_wait_case(5,KERNEL_SCHED_OTHER,0);
+    ready_wait_case(0,KERNEL_SCHED_BATCH,0);
+    puts("ready wait: earlier timer and same-nice preemption without crossing nice or BATCH policy");
     setup(KERNEL_SCHED_OTHER,0,0);
     running.scheduling.fair_slice_ns=100000;running.scheduling.fair_slice_used=5000000;
     scheduler_rearm_timer();assert(timer_request==2);

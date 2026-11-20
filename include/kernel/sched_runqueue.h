@@ -2,6 +2,8 @@
 #define BOAROS_KERNEL_SCHED_RUNQUEUE_H
 #include <kernel/avl.h>
 #include <kernel/cpu_config.h>
+#include <kernel/sched_policy.h>
+struct kernel_task;
 #if BOAROS_USER_SMP
 struct kernel_fair_link {
     struct kernel_fair_link *next,*previous;
@@ -30,6 +32,7 @@ struct kernel_sched_runqueue {
     struct kernel_sched_node *rt_first,*rt_last;
     struct kernel_sched_node *heads[100],*tails[100];
     struct kernel_avl_node *fair_root;
+    struct kernel_task *ready_wait_first[KERNEL_SCHED_NICE_LEVELS];
     uint64_t min_vruntime;
 #if BOAROS_USER_SMP
     uint64_t fair_weight;

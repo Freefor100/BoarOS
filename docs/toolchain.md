@@ -6,8 +6,7 @@
 
 ## 🛠️ 1. 环境依赖概览
 
-内核使用 GNU Make 和目标架构的交叉 GCC 构建，脚本使用 Python 3 和 Git。运行或测试内核需要对应架构的 QEMU 系统模拟器。
-已安装 pahole 时，可以传入 `PAHOLE=pahole` 使用系统工具。默认构建使用随仓库提供的固定源码，宿主依赖见[类型信息构建说明](modules/kernel-bpf.md#构建与检查)。
+内核使用 GNU Make 和目标架构的交叉 GCC 构建，脚本使用 Python 3 和 Git。运行内核需要对应架构的 QEMU 系统模拟器。交互启动首次制作根盘时还需要 curl 和 e2fsprogs。
 
 | 目标 | 交叉编译器 | 模拟器 | 内核构建模式 |
 | :--- | :--- | :--- | :--- |
@@ -15,6 +14,12 @@
 | **LoongArch 64** | `loongarch64-unknown-linux-gnu-gcc` | `qemu-system-loongarch64` | GNU C11、freestanding、LP64S |
 
 以下是仓库使用过的环境和构建入口。固定测试输入的版本与校验见 [`references/sources.tsv`](../references/sources.tsv)。
+
+### 从随仓库的源码构建 pahole
+
+直接执行 `make` 或 `make kernel-la`。构建会先用宿主 C 编译器从随仓库附带的归档编译 pahole，再用它为内核生成类型信息。内核构建可以离线执行。宿主需提供 C 编译器、binutils、CMake、pkg-config、patch，以及包含 `libz.a` 和 `libdl.a` 的开发库。 [类型信息构建说明](modules/kernel-bpf.md#构建与检查)
+
+如果宿主已经安装了 pahole，也可以用 `make PAHOLE=pahole`。遇到缺少 `libz.a` 的提示时，可以安装提供静态库的 zlib 开发包，或使用已安装的 pahole。
 
 ---
 
