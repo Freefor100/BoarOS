@@ -4,7 +4,7 @@
 
 ## 官方镜像构建
 
-在本分支的仓库根目录使用官方初赛镜像。容器内执行的 `make all` 与评测框架的构建命令一致。 [官方构建环境](https://github.com/oscomp/autotest-for-oskernel)
+比赛的构建入口是 `make all`。在本分支的仓库根目录使用下面的命令，可在官方初赛镜像中生成交付产物。 [官方构建环境](https://github.com/oscomp/autotest-for-oskernel)
 
 ```sh
 docker run --rm --network none --user "$(id -u):$(id -g)" \
