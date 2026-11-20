@@ -1,4 +1,7 @@
 #include "private.h"
+#if !defined(BOAROS_ARCH_LOONGARCH)
+#include <arch/riscv/hwprobe.h>
+#endif
 
 #include <kernel/cost.h>
 #include <kernel/seccomp.h>
@@ -197,6 +200,48 @@ static enum kernel_syscall_status syscall_handle_sysinfo(struct kernel_task *cal
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     decoded->value = access == KERNEL_UACCESS_STATUS_FAULT ? -KERNEL_EFAULT : 0;
     return KERNEL_SYSCALL_STATUS_OK;
+}
+
+static enum kernel_syscall_status __attribute__((noinline, cold)) dispatch_additional(
+    struct kernel_task *caller, const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *result)
+{
+    struct kernel_syscall_result decoded;
+    enum kernel_syscall_status status;
+    switch (request->number) {
+    case 84U:
+        status = syscall_handle_sync_file_range(caller, request, &decoded);
+        break;
+    case 171U:
+    case 266U:
+        status = syscall_handle_adjtimex(caller, request, &decoded);
+        break;
+    case 283U:
+        status = syscall_handle_membarrier(caller, request, &decoded);
+        break;
+    case 0U:
+    case 1U:
+    case 2U:
+    case 3U:
+    case 4U:
+    case 292U:
+        status = syscall_handle_native_aio(caller, request, &decoded);
+        break;
+#if !defined(BOAROS_ARCH_LOONGARCH)
+    case 258U:
+        status = riscv_syscall_hwprobe(caller, request, &decoded);
+        break;
+#endif
+    default:
+        decoded = (struct kernel_syscall_result){
+            .action = KERNEL_SYSCALL_ACTION_RETURN, .value = -KERNEL_ENOSYS,
+        };
+        status = KERNEL_SYSCALL_STATUS_OK;
+        break;
+    }
+    if (status == KERNEL_SYSCALL_STATUS_OK)
+        *result = decoded;
+    return status;
 }
 
 static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
@@ -859,8 +904,7 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
     } else {
-        decoded.action = KERNEL_SYSCALL_ACTION_RETURN;
-        decoded.value = -KERNEL_ENOSYS;
+        return dispatch_additional(caller, request, result);
     }
 
     *result = decoded;

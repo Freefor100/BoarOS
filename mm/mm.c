@@ -1,3 +1,4 @@
+#include <kernel/aio.h>
 #include <kernel/vdso.h>
 #include <kernel/bpf.h>
 #include <kernel/mm_backend.h>
@@ -135,6 +136,8 @@ struct kernel_mm_record {
     uint64_t futex_id;
     uint32_t references;
     uint32_t users;
+    struct kernel_aio_context *aio_contexts;
+    uint32_t aio_destinations, aio_fork_waiters;
     uint32_t coredump_filter; /* MM-owned: CLONE_VM shares; fork/exec copy */
     uint32_t core_remote; /* high bit: dump owner, low bits: remote writers */
     struct kernel_raw_rwlock metadata;
@@ -192,6 +195,7 @@ struct kernel_mm_record {
     struct mm_lazy_scan_cursor *lazy_scan_cursor;
     size_t lazy_capacity, lazy_count;
     struct kernel_mm_record *lazy_next, *lazy_previous;
+    unsigned membarrier_registrations;
     struct kernel_wait_queue lazy_drained;
     uint32_t lazy_borrows, lazy_registered;
     uint64_t lazy_seen_round, lazy_birth;
@@ -1683,6 +1687,8 @@ static enum kernel_mm_status mm_fork_impl(
         source->allocator, record_page_address, KERNEL_MM_STATUS_NO_MEMORY);
     destination_record->references = 1U;
     destination_record->coredump_filter = kernel_mm_coredump_filter_get(source);
+    destination_record->membarrier_registrations =
+        __atomic_load_n(&source_record->membarrier_registrations, __ATOMIC_ACQUIRE);
     kernel_raw_rwlock_init(&destination_record->metadata, KERNEL_RAW_RANK_MM);
     kernel_rwlock_init(&destination_record->operations, 25, (uintptr_t)destination_record);
     kernel_rwlock_init(&destination_record->vma_lock, 31, (uintptr_t)destination_record);
@@ -3618,7 +3624,7 @@ static enum kernel_mm_status mm_mmap_anonymous_impl(
     uint64_t length,
     uint32_t permissions,
     uint32_t flags,
-    uint64_t *address)
+    uint64_t *address, struct kernel_memory_object **ring)
 {
     KERNEL_NO_RECLAIM_IO;
     struct kernel_mm_record *record;
@@ -3730,7 +3736,7 @@ static enum kernel_mm_status mm_mmap_anonymous_impl(
     vma = (struct kernel_vma){
         .start = start,
         .end = end,
-        .flags = mapping_lock_flags(record, flags) |
+        .flags = mapping_lock_flags(record, flags) | (ring ? KERNEL_VMA_DONTFORK | KERNEL_VMA_AIO_RING : 0U) |
             ((flags & KERNEL_MM_MAP_GROWSDOWN) ? KERNEL_VMA_GROWSDOWN : 0),
         .backing_offset = 0U,
         .permissions = normalized,
@@ -3751,6 +3757,10 @@ static enum kernel_mm_status mm_mmap_anonymous_impl(
                 shared_entry->next = record->shared_anon;
                 record->shared_anon = shared_entry;
                 register_shared_anon(shared_entry,record);
+            }
+            if (ring) {
+                if (kernel_memory_object_acquire(shared_object)) __builtin_trap();
+                *ring = shared_object;
             }
             *address = start;
         } else {
@@ -4871,6 +4881,27 @@ out:
     return status;
 }
 
+unsigned kernel_mm_membarrier_registrations(const struct kernel_mm *mm)
+{
+    struct kernel_mm_record *record;
+    if (resolve_record_storage(mm, &record)) __builtin_trap();
+    return __atomic_load_n(&record->membarrier_registrations, __ATOMIC_ACQUIRE);
+}
+
+void kernel_mm_membarrier_register(struct kernel_mm *mm, unsigned command)
+{
+    struct kernel_mm_record *record;
+    if (resolve_record_storage(mm, &record)) __builtin_trap();
+    __atomic_fetch_or(&record->membarrier_registrations, command, __ATOMIC_RELEASE);
+}
+
+unsigned kernel_mm_membarrier_active(const struct kernel_mm *mm)
+{
+    struct kernel_mm_record *record;
+    if (resolve_record_storage(mm, &record)) __builtin_trap();
+    return __atomic_load_n(&record->active_cpus, __ATOMIC_SEQ_CST);
+}
+
 enum kernel_mm_status kernel_mm_activate(const struct kernel_mm *next,uint64_t kernel_context)
 { return activate_mm(next,kernel_context,0); }
 
@@ -5427,12 +5458,46 @@ int kernel_mm_msync(struct kernel_mm *mm, uint64_t address,
     return sync_mapped_ranges(mm,address,length,flags,&operation);
 }
 
+struct kernel_aio_context **kernel_mm_aio_contexts(struct kernel_mm *mm)
+{
+    return &mm->record->aio_contexts;
+}
+
+int kernel_mm_aio_map(struct kernel_mm *mm, uint64_t length, uint64_t *address,
+    struct kernel_memory_object **object)
+{
+    struct mm_operation operation __attribute__((cleanup(mm_operation_end))) = {0};
+    if (mm_operation_begin(mm,&operation)) return -KERNEL_ENOMEM;
+    return mm_mmap_anonymous_impl(mm,0,length,KERNEL_MM_READ|KERNEL_MM_WRITE,
+        KERNEL_MM_MAP_SHARED,address,object) ? -KERNEL_ENOMEM : 0;
+}
+
+void kernel_mm_aio_unmap(struct kernel_mm *mm, uint64_t address, uint64_t bytes,
+    struct kernel_memory_object *object)
+{
+    /* Users can split or replace the mapping while the context is live. */
+    struct mm_operation operation __attribute__((cleanup(mm_operation_end))) = {0};
+    if (mm_operation_begin(mm,&operation)) return;
+    uint64_t end=address+bytes;
+    while (address<end) {
+        struct kernel_vma vma;
+        if (kernel_vma_set_lookup(operation.record->vmas,address,&vma)) {
+            address+=BOAROS_PAGE_SIZE;
+            continue;
+        }
+        uint64_t next=vma.end<end?vma.end:end;
+        if (vma.backing==object)
+            (void)mm_munmap_impl(mm,address,next-address);
+        address=next;
+    }
+}
+
 enum kernel_mm_status kernel_mm_mmap_anonymous(struct kernel_mm *mm,
     uint64_t hint, uint64_t length, uint32_t permissions, uint32_t flags, uint64_t *address)
 {
 #if BOAROS_MAX_CPUS == 1
     MM_RANGE_OPERATION(mm, hint, (flags & KERNEL_MM_MAP_FIXED) ? length : 0);
-    enum kernel_mm_status result = mm_mmap_anonymous_impl(mm, hint, length, permissions, flags, address);
+    enum kernel_mm_status result = mm_mmap_anonymous_impl(mm, hint, length, permissions, flags, address, NULL);
     uint32_t policy = mapping_lock_flags(operation.record, flags);
     mm_operation_end(&operation);
     if (!result && policy == KERNEL_VMA_LOCKED)
@@ -5462,7 +5527,7 @@ enum kernel_mm_status kernel_mm_mmap_anonymous(struct kernel_mm *mm,
 
     if (flags & KERNEL_MM_MAP_SHARED) {
         MM_RANGE_OPERATION(mm, hint, (flags & KERNEL_MM_MAP_FIXED) ? length : 0);
-        enum kernel_mm_status result = mm_mmap_anonymous_impl(mm, hint, length, permissions, flags, address);
+        enum kernel_mm_status result = mm_mmap_anonymous_impl(mm, hint, length, permissions, flags, address, NULL);
         uint32_t policy = mapping_lock_flags(operation.record, flags);
         mm_operation_end(&operation);
         if (!result && policy == KERNEL_VMA_LOCKED)
@@ -5474,7 +5539,7 @@ enum kernel_mm_status kernel_mm_mmap_anonymous(struct kernel_mm *mm,
         /* Replacement changes a common address and accounting; preserve the
          * original edit until the PTEs and all backing owners are retired. */
         MM_RANGE_OPERATION(mm, hint, (flags & KERNEL_MM_MAP_FIXED) ? length : 0);
-        enum kernel_mm_status result = mm_mmap_anonymous_impl(mm, hint, length, permissions, flags, address);
+        enum kernel_mm_status result = mm_mmap_anonymous_impl(mm, hint, length, permissions, flags, address, NULL);
         uint32_t policy = mapping_lock_flags(operation.record, flags);
         mm_operation_end(&operation);
         if (!result && policy == KERNEL_VMA_LOCKED)
@@ -5756,6 +5821,27 @@ enum kernel_mm_status kernel_mm_mprotect(struct kernel_mm *mm,
 {
     return kernel_mm_mprotect_personality(mm, address, length, permissions, 0);
 }
+/* A direct-read destination owns actual physical pages independently of VMA
+ * edits. Fork must finish copying the page-table view before new destination
+ * captures, or observe their completed data. Storage revocation may enter the
+ * MM gate, so fork waits outside that gate. */
+int kernel_mm_aio_destination_begin(struct kernel_mm *mm)
+{
+    struct mm_operation operation __attribute__((cleanup(mm_operation_end)))={0};
+    if (mm_operation_begin(mm,&operation)) return 0;
+    if (__atomic_load_n(&operation.record->aio_fork_waiters,__ATOMIC_ACQUIRE)) return 0;
+    __atomic_fetch_add(&operation.record->aio_destinations,1,__ATOMIC_ACQ_REL);
+    return 1;
+}
+
+void kernel_mm_aio_destination_end(struct kernel_mm_record *record)
+{
+    uint32_t previous=__atomic_fetch_sub(&record->aio_destinations,1,__ATOMIC_ACQ_REL);
+    if (!previous) __builtin_trap();
+    if (previous==1 && __atomic_load_n(&record->aio_fork_waiters,__ATOMIC_ACQUIRE))
+        wake_pin_waiters(record);
+}
+
 enum kernel_mm_status kernel_mm_fork(struct kernel_mm *destination, struct kernel_mm *source)
 {
     if (!destination || !source || destination == source) return KERNEL_MM_STATUS_INVALID_ARGUMENT;
@@ -5763,6 +5849,20 @@ enum kernel_mm_status kernel_mm_fork(struct kernel_mm *destination, struct kerne
     /* SysV attachment open/close updates its CPU0-owned segment. Check under
      * the parent MM gate and reacquire it after any service migration. */
     MM_RANGE_OPERATION(source, 0, ARCH_MMU_USER_LIMIT);
+    struct kernel_mm_record *record=operation.record;
+    if (__atomic_load_n(&record->aio_destinations,__ATOMIC_ACQUIRE)) {
+        __atomic_fetch_add(&record->aio_fork_waiters,1,__ATOMIC_ACQ_REL);
+        mm_operation_end(&operation);
+        while (__atomic_load_n(&record->aio_destinations,__ATOMIC_ACQUIRE)) {
+            KERNEL_IRQ_SCOPE(irq);
+            enum kernel_wait_wake_reason reason;
+            if (KERNEL_WAIT_RECHECK(&record->pins_changed,0,0,&reason,
+                    __atomic_load_n(&record->aio_destinations,__ATOMIC_ACQUIRE))) __builtin_trap();
+        }
+        op_status=mm_ranges_operation_begin(source,0,ARCH_MMU_USER_LIMIT,0,0,&operation,&mm_service);
+        __atomic_fetch_sub(&record->aio_fork_waiters,1,__ATOMIC_ACQ_REL);
+        if (op_status) return op_status;
+    }
     close_pins(&operation, 1);
     return mm_fork_impl(destination, source);
 }
@@ -5932,6 +6032,13 @@ int kernel_mm_mremap(struct kernel_mm *mm, uint64_t old_address,
         return -KERNEL_EINVAL;
     /* remap_vmalloc_range mappings carry VM_DONTEXPAND: neither leaving
      * the old range behind nor duplicating it through old_size=0 is allowed. */
+    if (source.flags & KERNEL_VMA_AIO_RING) {
+        if ((flags & 4U) || !old_size) return -KERNEL_EINVAL;
+        if (new_size>old_size) return -KERNEL_EFAULT;
+        if ((flags & 2U) && (source.backing_offset || source.start!=old_address ||
+            source.end-source.start!=old_size || new_size!=old_size ||
+            kernel_memory_object_contains_offset(source.backing,old_size))) return -KERNEL_EINVAL;
+    }
     if (source.kind==KERNEL_VMA_KIND_OBJECT_SHARED && (flags & 4U))
         return -KERNEL_EINVAL;
     uint64_t covered = new_size < old_size ? new_size : old_size;
@@ -6028,6 +6135,12 @@ int kernel_mm_mremap(struct kernel_mm *mm, uint64_t old_address,
         close_pins(&operation, 0);
         int error = prepare_remap_tables(record, old_address, old_size, new_address);
         if (error) return error;
+        /* All fallible mapping preparations have finished. Publish the move
+         * against io_destroy before changing any source PTE. An admitted
+         * destroy can now remove only the published new address. */
+        if ((source.flags & KERNEL_VMA_AIO_RING) &&
+            kernel_aio_ring_move(mm,source.backing,old_address,new_address))
+            return -KERNEL_EINVAL;
         move_remap_leaves(record, old_address, old_size, new_address,
             (source.permissions & KERNEL_MM_EXECUTE) != 0);
     }
@@ -7933,6 +8046,7 @@ static int advise_fork(struct kernel_mm_record *record, const struct kernel_vma 
 static int advise_remove(struct mm_operation *operation,const struct kernel_vma *vma,
     uint64_t address,uint64_t end)
 {
+    if (vma->flags & KERNEL_VMA_AIO_RING) return -KERNEL_EOPNOTSUPP;
     if (vma->flags & KERNEL_VMA_LOCKED) return -KERNEL_EINVAL;
     if (vma->kind==KERNEL_VMA_KIND_ELF_PRIVATE) {
         struct kernel_elf64_source *source=vma->backing;

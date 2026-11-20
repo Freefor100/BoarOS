@@ -401,7 +401,8 @@ int64_t kernel_futex_pi(struct kernel_task *task,uint64_t address,uint32_t opera
                 request.order=++waiter_order;
                 enum kernel_scheduler_status prepared=timeout && realtime ?
                     kernel_wait_prepare_realtime(0,deadline_ns,1,&request.token) :
-                    kernel_wait_prepare(0,deadline,1,&request.token);
+                    timeout ? kernel_wait_prepare_monotonic(0,deadline_ns,1,&request.token) :
+                    kernel_wait_prepare(0,0,1,&request.token);
                 if(prepared)__builtin_trap();
                 waiter_insert(&request);kernel_futex_pi_recalculate_locked(request.state->owner,-1);
 #if BOAROS_MAX_CPUS > 1
@@ -496,7 +497,8 @@ int64_t kernel_futex_wait_requeue_pi(struct kernel_task *task,uint64_t address,
         KERNEL_RAW_SCOPE(raw,&kernel_wait_domain);
         enum kernel_scheduler_status prepared=timeout && realtime ?
             kernel_wait_prepare_realtime(0,deadline_ns,1,&pi_request.token) :
-            kernel_wait_prepare(0,deadline,1,&pi_request.token);
+            timeout ? kernel_wait_prepare_monotonic(0,deadline_ns,1,&pi_request.token) :
+            kernel_wait_prepare(0,0,1,&pi_request.token);
         if(prepared)__builtin_trap();
         entry.priority=scheduler_base_priority(task);
         { KERNEL_IRQ_LOCK_SCOPE(queue_guard,&bucket->waiters.lock);

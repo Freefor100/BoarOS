@@ -75,7 +75,7 @@ void kernel_cpu_secondary_attach(struct kernel_cpu *cpu, uintptr_t low, uintptr_
     idle->wait.on_cpu = 1;
     cpu->current = idle;
     arch_current_thread_set(idle);
-    scheduler_cpu_initialize(cpu, idle, kernel_time_monotonic_ns());
+    scheduler_cpu_initialize(cpu, idle, kernel_time_raw_ns());
 }
 #endif
 
@@ -975,7 +975,7 @@ enum kernel_scheduler_status kernel_scheduler_init(
 #if BOAROS_MAX_CPUS == 1
     memset(&scheduler.runqueue, 0, sizeof(scheduler.runqueue));
 #endif
-    uint64_t now = kernel_time_monotonic_ns();
+    uint64_t now = kernel_time_raw_ns();
     struct kernel_rt_bandwidth initial_budget;
     kernel_rt_bandwidth_init(&initial_budget, now);
     scheduler.rt_configuration = (struct kernel_rt_configuration){

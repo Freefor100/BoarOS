@@ -96,7 +96,8 @@ struct kernel_block_device {
     struct kernel_block_device *registry_next;
     const void *claim_owner;
     uint64_t device_number;
-    uint32_t registered;
+    uint32_t registered, registering;
+    uint64_t devtmpfs_inode; /* Owned by the device-node publisher. */
     struct kernel_rwlock transfer_lock;
     struct kernel_block_device *pressure_parent;
     uint8_t virtual_backing;
@@ -110,6 +111,16 @@ struct kernel_block_device {
 /* Return zero or negative errno. get pins registry membership; put consumes
  * that owner. A raw device pointer requires an existing lifetime owner.
  * Unregister is refused while any open, mount or request retains a reference. */
+/* The publisher may sleep. A number stays reserved across either callback.
+ * snapshot() pins every returned device for initial directory population. */
+/* During creation, activate the whole batch after the last fallible step,
+ * before waking directory observers or exposing a new pathname. The callback
+ * must return success after activation. Removal receives no activate callback. */
+typedef void (*kernel_block_activate_fn)(struct kernel_block_device *const *, size_t);
+typedef int (*kernel_block_devnode_fn)(struct kernel_block_device *const *, size_t,
+    int create, kernel_block_activate_fn activate);
+void kernel_block_set_devnode_publisher(kernel_block_devnode_fn);
+int kernel_block_snapshot(struct kernel_block_device **, size_t capacity, size_t *count);
 int kernel_block_register(struct kernel_block_device *device, uint64_t number);
 int kernel_block_unregister(struct kernel_block_device *device);
 /* Explicit GPT discovery on 512-byte-sector disks. Stable zeroed children

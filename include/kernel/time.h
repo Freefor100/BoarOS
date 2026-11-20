@@ -14,15 +14,25 @@ enum kernel_time_status {
 /*
  * `boot_realtime_ns` is the wall-clock reading captured at boot (0 when no
  * RTC source is available; CLOCK_REALTIME then tracks time since boot).
- * Monotonic and deadline values use the arch time-counter directly.
+ * The hardware counter supplies the unadjusted clock and deadline domain.
  */
 enum kernel_time_status kernel_time_init(uint32_t timebase_frequency,
                                          uint64_t boot_realtime_ns);
 
 uint32_t kernel_time_is_initialized(void);
 
-/* Nanoseconds since boot, derived from the arch time-counter. */
+/* Continuous disciplined clock and unadjusted hardware clock, respectively. */
 uint64_t kernel_time_monotonic_ns(void);
+uint64_t kernel_time_raw_ns(void);
+
+/* Keep a relative user timeout in the disciplined clock domain until park.
+ * Linux ktime uses signed 64-bit nanoseconds. */
+static inline uint64_t kernel_time_monotonic_after(uint64_t duration)
+{
+    uint64_t now=kernel_time_monotonic_ns();
+    return now>=(uint64_t)INT64_MAX || duration>(uint64_t)INT64_MAX-now ?
+        (uint64_t)INT64_MAX : now+duration;
+}
 
 /* Wall-clock nanoseconds: mutable offset plus monotonic, read consistently. */
 uint64_t kernel_time_realtime_ns(void);
@@ -48,6 +58,9 @@ uint64_t kernel_time_boot_realtime_offset(void);
 enum kernel_time_status kernel_time_deadline_from_monotonic(
     uint64_t target_monotonic_ns,
     uint64_t *deadline);
+
+/* Scheduler execution budgets use unadjusted time. */
+enum kernel_time_status kernel_time_deadline_from_raw(uint64_t ns,uint64_t *deadline);
 
 /* Caller serializes clock control and holds the scheduler wait domain so that
  * publishing the offset and retargeting committed waits are one operation. */

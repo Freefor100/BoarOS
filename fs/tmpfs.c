@@ -1,4 +1,7 @@
 #include "vfs_objects.h"
+#include "vfs_notify.h"
+#include "char_device_internal.h"
+#include <kernel/block.h>
 #include <kernel/tmpfs.h>
 #include <kernel/credentials.h>
 #include <kernel/posix_acl.h>
@@ -1010,4 +1013,201 @@ int kernel_tmpfs_create(struct kernel_heap *heap,uint64_t flags,const char *opti
     m->mount.private_data=&m->instance; m->mount.id=kernel_vfs_allocate_mount_id(); m->mount.state=VFS_MOUNT_STATE_LIVE;
     kernel_vfs_mount_initialize(&m->mount);
     *owner=&m->mount; return 0;
+}
+
+/* The hidden, writable view owns the instance until boot teardown. User mounts
+ * clone only the view, including when the last user mount was unmounted. */
+static struct kernel_vfs_path *devtmpfs_root;
+
+int kernel_devtmpfs_is_mount(const struct kernel_vfs_mount *mount)
+{
+    return devtmpfs_root && mount && mount->private_data ==
+        kernel_vfs_path_mount(devtmpfs_root)->private_data;
+}
+
+static char *append_number(char *out, unsigned value)
+{
+    if (value >= 10) out = append_number(out, value / 10);
+    *out++ = '0' + value % 10;
+    return out;
+}
+
+static int block_name(uint64_t number, char name[32])
+{
+    unsigned major = (number >> 8) & 0xfff;
+    unsigned minor = (number & 0xff) | ((number >> 12) & 0xfff00);
+    char *out = name;
+    if (major == 7) {
+        memcpy(out, "loop", 4);
+        out = append_number(out + 4, minor);
+    } else if (major == 252) {
+        unsigned disk = minor / 16;
+        char reversed[8];
+        size_t length = 0;
+        do {
+            reversed[length++] = 'a' + disk % 26;
+            disk = disk / 26;
+            if (!disk) break;
+            disk--;
+        } while (1);
+        *out++ = 'v'; *out++ = 'd';
+        while (length) *out++ = reversed[--length];
+        if (minor % 16) out = append_number(out, minor % 16);
+    } else return 0;
+    *out = '\0';
+    return 1;
+}
+
+static int devtmpfs_add_blocks(struct kernel_vfs_mount *mount,
+    struct kernel_block_device *const *devices, size_t count, kernel_block_activate_fn activate)
+{
+    struct kernel_vfs_instance *instance = mount->private_data;
+    char name[32];
+    int error = 0;
+    size_t staged = 0;
+    /* The namespace lock keeps the new names private until the whole batch
+     * exists. No lookup has populated a dentry for a staged inode. */
+    while (staged < count) {
+        struct kernel_block_device *device = devices[staged];
+        device->devtmpfs_inode = 0;
+        if (block_name(device->device_number, name)) {
+            struct tmp_entry *e = NULL;
+            error = create_child(tm(instance), 1, name, KERNEL_VFS_S_IFBLK | 0600,
+                NULL, &e, 0, NULL);
+            if (!error) {
+                e->inode->rdev = device->device_number;
+                device->devtmpfs_inode = e->inode->number;
+            } else if (error == -KERNEL_EEXIST) error = 0;
+            else break;
+        }
+        staged++;
+    }
+    if (!error && activate) activate(devices, count);
+    for (size_t i = 0; i < staged; i++) {
+        struct kernel_block_device *device = devices[i];
+        if (!device->devtmpfs_inode) continue;
+        block_name(device->device_number, name);
+        if (error) {
+            if (remove_path(mount, 1, name, 0)) __builtin_trap();
+            device->devtmpfs_inode = 0;
+        } else kernel_vfs_notify_create(devtmpfs_root, name);
+    }
+    return error;
+}
+
+static int devtmpfs_block_nodes(struct kernel_block_device *const *devices,
+    size_t count, int create_nodes, kernel_block_activate_fn activate)
+{
+    KERNEL_SERVICE_SCOPE(service);
+    KERNEL_LOCK_SCOPE(topology);
+    kernel_vfs_mount_topology_lock(&topology);
+    if (!devtmpfs_root) {
+        if (activate) activate(devices, count);
+        return 0;
+    }
+    struct kernel_vfs_mount *mount = kernel_vfs_path_mount(devtmpfs_root);
+    KERNEL_LOCK_SCOPE(mutation);
+    kernel_vfs_mutation_lock(mount, &mutation);
+    KERNEL_LOCK_SCOPE(namespace);
+    kernel_vfs_namespace_lock(mount, &namespace);
+    const struct kernel_credentials *previous = kernel_credentials_override(kernel_credentials_initial());
+    int error = 0;
+    if (create_nodes) error = devtmpfs_add_blocks(mount, devices, count, activate);
+    else {
+        if (count != 1) __builtin_trap();
+        struct kernel_block_device *device = devices[0];
+        uint64_t id;
+        char name[32];
+        if (device->devtmpfs_inode && block_name(device->device_number, name)) {
+            error = lookup(mount->private_data, 1, name, strlen(name), &id, NULL);
+            /* Leave a userspace replacement in place, even for the same rdev. */
+            if (!error && id == device->devtmpfs_inode)
+                error = kernel_vfs_unlink_at(devtmpfs_root, devtmpfs_root, name, 0);
+            if (error == -KERNEL_ENOENT) error = 0;
+        }
+        if (!error) device->devtmpfs_inode = 0;
+    }
+    kernel_credentials_override(previous);
+    return error;
+}
+
+void kernel_devtmpfs_shutdown(void)
+{
+    KERNEL_LOCK_SCOPE(topology);
+    kernel_vfs_mount_topology_lock(&topology);
+    kernel_block_set_devnode_publisher(NULL);
+    if (devtmpfs_root) {
+        kernel_vfs_close_tree(kernel_vfs_path_mount(devtmpfs_root));
+        if (kernel_vfs_path_release(&devtmpfs_root)) __builtin_trap();
+    }
+}
+
+static int devtmpfs_initialize(struct kernel_heap *heap)
+{
+    static const struct {
+        const char *name;
+        uint32_t number, mode;
+    } characters[] = {
+        {"null", 0x103, 0666}, {"zero", 0x105, 0666}, {"full", 0x107, 0666},
+        {"random", 0x108, 0666}, {"urandom", 0x109, 0666}, {"console", 0x501, 0600},
+        {"tty", 0x500, 0666}, {"ttyS0", 0x440, 0600}, {"ptmx", 0x502, 0666},
+        {"rtc0", 0xa87, 0600}, {"loop-control", 0xaed, 0600},
+    };
+    struct kernel_vfs_mount *mount = NULL;
+    int error = kernel_tmpfs_create(heap, 0, "mode=0755", &mount);
+    if (error) return error;
+    error = kernel_vfs_detach_created_mount(mount, heap, 0, &devtmpfs_root);
+    if (error) {
+        if (kernel_vfs_unmount(mount)) __builtin_trap();
+        return error;
+    }
+    for (size_t i = 0; i < sizeof(characters) / sizeof(characters[0]); i++) {
+        if (!kernel_char_device_lookup(characters[i].number)) continue;
+        error = kernel_vfs_mknod_at(devtmpfs_root, devtmpfs_root, characters[i].name,
+            KERNEL_VFS_S_IFCHR | characters[i].mode, characters[i].number, 0);
+        if (error) break;
+    }
+    if (!error) {
+        kernel_block_set_devnode_publisher(devtmpfs_block_nodes);
+        struct kernel_block_device **devices = NULL;
+        size_t count = 0;
+        error = kernel_block_snapshot(NULL, 0, &count);
+        if (error == -KERNEL_ENOSPC) {
+            if (kernel_heap_allocate_zeroed(heap, count, sizeof(*devices), (void **)&devices))
+                error = -KERNEL_ENOMEM;
+            else {
+                /* New registrations need this topology lock to finish publication. */
+                error = kernel_block_snapshot(devices, count, &count);
+                if (!error) {
+                    error = devtmpfs_block_nodes(devices, count, 1, NULL);
+                    for (size_t i = 0; i < count; i++) kernel_block_put(devices[i]);
+                }
+                kernel_heap_release(heap, devices);
+            }
+        }
+    }
+    if (error) kernel_devtmpfs_shutdown();
+    return error;
+}
+
+int kernel_devtmpfs_mount(struct kernel_heap *heap, const char *options, struct kernel_vfs_path **owner)
+{
+    if (options && *options) {
+        size_t pages = 0;
+        uint64_t inodes = 0;
+        uint32_t mode = 0;
+        int error = parse_mount_options(physical_page_total(heap->page_allocator),
+            options, &pages, &inodes, &mode);
+        if (error) return error;
+    }
+    KERNEL_SERVICE_SCOPE(service);
+    KERNEL_LOCK_SCOPE(topology);
+    kernel_vfs_mount_topology_lock(&topology);
+    if (!devtmpfs_root) {
+        const struct kernel_credentials *previous = kernel_credentials_override(kernel_credentials_initial());
+        int error = devtmpfs_initialize(heap);
+        kernel_credentials_override(previous);
+        if (error) return error;
+    }
+    return kernel_vfs_clone_tree(devtmpfs_root, 0, owner);
 }

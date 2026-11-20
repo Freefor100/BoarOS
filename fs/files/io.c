@@ -1,3 +1,4 @@
+#include <kernel/aio.h>
 #include "../vfs_notify.h"
 #include "private.h"
 #include "../open_file_internal.h"
@@ -305,6 +306,38 @@ static enum kernel_files_status memory_read(
     if (error) KERNEL_FILES_NOTE(files, read_failures, 1);
     KERNEL_FILES_NOTE(files, bytes_read, total);
     *linux_result = total ? (int64_t)total : error;
+    return KERNEL_FILES_STATUS_OK;
+}
+
+enum kernel_files_status kernel_files_sync_file_range(struct kernel_files *files,
+    int64_t fd, int64_t offset, int64_t length, unsigned flags, int64_t *linux_result)
+{
+    if (!kernel_files_is_live(files) || !linux_result)
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    KERNEL_FILES_PIN_SCOPE(pin);
+    struct kernel_open_file_description *file = NULL;
+    enum kernel_files_status status = kernel_files_pin_data(files, fd, &file, linux_result);
+    if (status || *linux_result)
+        return status;
+    pin = (struct kernel_files_pin_guard){files, file};
+    enum kernel_open_file_kind kind = kernel_open_file_kind(file);
+    if (flags & ~KERNEL_SYNC_FILE_RANGE_ALL || offset < 0 || length < 0 ||
+        length > INT64_MAX - offset)
+        *linux_result = -KERNEL_EINVAL;
+    else if (kind == KERNEL_OPEN_FILE_KIND_BLOCK)
+        *linux_result = 0; /* Block descriptions do not buffer writes. */
+    else if (kind == KERNEL_OPEN_FILE_KIND_MQUEUE)
+        *linux_result = 0; /* The regular inode has no data mapping. */
+    else if (kind != KERNEL_OPEN_FILE_KIND_REGULAR && kind != KERNEL_OPEN_FILE_KIND_DIRECTORY &&
+             kind != KERNEL_OPEN_FILE_KIND_GENERATED)
+        *linux_result = -KERNEL_ESPIPE;
+    else {
+        uint64_t start = (uint64_t)offset & ~(uint64_t)BOAROS_PAGE_MASK;
+        uint64_t end = length ? (uint64_t)(offset + length) : (uint64_t)INT64_MAX + 1U;
+        end = (end + BOAROS_PAGE_MASK) & ~(uint64_t)BOAROS_PAGE_MASK;
+        *linux_result = kernel_vfs_sync_file_range(&file->file, start, end, flags,
+            &file->observed_writeback_error);
+    }
     return KERNEL_FILES_STATUS_OK;
 }
 
@@ -1912,6 +1945,183 @@ enum kernel_files_status kernel_files_pwritev(struct kernel_files *files,
 enum kernel_files_status kernel_files_pwritev2(struct kernel_files *files,struct kernel_mm *mm,
     int64_t fd,uint64_t iov,uint64_t count,int64_t offset,uint32_t flags,int64_t *result)
 { return writev_request(files,mm,fd,iov,count,offset!=-1,offset,flags,result); }
+
+int64_t kernel_files_aio_sync(struct kernel_open_file_description *file,int data_only)
+{
+    int64_t result;
+    if (sync_pinned(file,data_only,&result,NULL)) __builtin_trap();
+    return result;
+}
+
+/* Keep the memory used by a single deferred transfer bounded. Larger
+ * requests keep the existing streaming implementation. No user-page pin or
+ * page-cache writer may survive into direct_transfer's mapping revocation. */
+#define AIO_DIRECT_BYTES (64U * 1024U)
+struct aio_destination_page {
+    uint64_t owner;
+    unsigned order;
+    void *address;
+    size_t length;
+};
+struct kernel_aio_direct {
+    struct kernel_heap *heap;
+    struct kernel_mm_record *destination;
+    uint64_t offset;
+    size_t size;
+    unsigned pages, writing;
+    void *staging;
+    struct aio_destination_page spans[];
+};
+
+void kernel_files_aio_direct_free(struct kernel_aio_direct *direct)
+{
+    for (unsigned i=0;i<direct->pages;i++) {
+        struct aio_destination_page *span=&direct->spans[i];
+        if (physical_page_release_order(direct->heap->page_allocator,span->owner,span->order))
+            __builtin_trap();
+    }
+    if (direct->destination) kernel_mm_aio_destination_end(direct->destination);
+    if (direct->staging) kernel_heap_release(direct->heap,direct->staging);
+    kernel_heap_release(direct->heap,direct);
+}
+
+static int capture_destination(struct kernel_aio_direct *direct,struct kernel_mm *mm,
+    uint64_t address,size_t length)
+{
+    struct kernel_mm_user_pin pin={0};
+    enum kernel_mm_status status=kernel_mm_pin_user_page(mm,address,KERNEL_MM_WRITE,&pin);
+    if (status==KERNEL_MM_STATUS_NOT_MAPPED || status==KERNEL_MM_STATUS_ACCESS)
+        status=kernel_mm_resolve_user_pin(mm,address,KERNEL_MM_WRITE,&pin);
+    if (status) return 0;
+    int captured=!pin.cache_write.entry;
+    if (captured) {
+        if (physical_page_acquire_order(mm->allocator,pin.owner_address,pin.order)) __builtin_trap();
+        direct->spans[direct->pages++]=(struct aio_destination_page){
+            .owner=pin.owner_address,.order=pin.order,
+            .address=(char *)pin.page+(address&BOAROS_PAGE_MASK),.length=length};
+    }
+    kernel_mm_unpin_user_page(&pin);
+    return captured;
+}
+
+static struct kernel_aio_direct *prepare_direct(struct kernel_open_file_description *file,
+    struct kernel_mm *mm,const struct kernel_uaccess_iovec *iov,size_t elements,
+    uint64_t count,uint64_t offset,int writing,uint32_t flags)
+{
+    size_t alignment=kernel_vfs_direct_alignment(&file->file);
+    if (!count || count>AIO_DIRECT_BYTES || !alignment || offset%alignment || flags ||
+        (writing && ((kernel_open_file_flags(file)&(KERNEL_FILES_O_APPEND|KERNEL_FILES_O_DSYNC)) ||
+        kernel_task_current_fsize_limit()!=UINT64_MAX))) return NULL;
+    size_t spans=0;
+    for (size_t i=0;i<elements;i++) {
+        if (iov[i].base%alignment || iov[i].length%alignment) return NULL;
+        if (iov[i].length) spans+=1+((iov[i].base&BOAROS_PAGE_MASK)+iov[i].length-1)/BOAROS_PAGE_SIZE;
+    }
+    struct kernel_aio_direct *direct=NULL;
+    size_t size=sizeof(*direct)+(writing?0:spans)*sizeof(struct aio_destination_page);
+    if (kernel_heap_allocate_zeroed(file->heap,1,size,(void **)&direct)) return NULL;
+    direct->heap=file->heap; direct->size=count; direct->offset=offset; direct->writing=writing;
+    if ((writing || spans>1) && kernel_heap_allocate(file->heap,count,&direct->staging)) goto fail;
+    if (writing) {
+        size_t offset_in_buffer=0;
+        for (size_t i=0;i<elements;i++) {
+            size_t copied=0;
+            if (kernel_copy_from_user(mm,(char *)direct->staging+offset_in_buffer,iov[i].base,
+                    iov[i].length,&copied) || copied!=iov[i].length) goto fail;
+            offset_in_buffer+=copied;
+        }
+    } else {
+        if (!kernel_mm_aio_destination_begin(mm)) goto fail;
+        direct->destination=mm->record;
+        for (size_t i=0;i<elements;i++) {
+            uint64_t address=iov[i].base,left=iov[i].length;
+            while (left) {
+                size_t length=BOAROS_PAGE_SIZE-(address&BOAROS_PAGE_MASK);
+                if (length>left) length=left;
+                if (!capture_destination(direct,mm,address,length)) goto fail;
+                address+=length; left-=length;
+            }
+        }
+    }
+    return direct;
+fail:
+    kernel_files_aio_direct_free(direct);
+    return NULL;
+}
+
+int64_t kernel_files_aio_direct_run(struct kernel_open_file_description *file,
+    struct kernel_aio_direct *direct)
+{
+    size_t done=0;
+    int error;
+    if (direct->writing) {
+        KERNEL_LOCK_SCOPE(operation);
+        kernel_vfs_file_write_lock(&file->file,&operation);
+        error=kernel_vfs_aio_direct_write(&file->file,direct->offset,direct->staging,
+            direct->size,&done,&operation);
+    } else {
+        kernel_vfs_file_accessed(&file->file,kernel_open_file_flags(file));
+        void *data=direct->staging?direct->staging:direct->spans[0].address;
+        error=kernel_vfs_direct_pread(&file->file,direct->offset,data,direct->size,&done);
+        if (direct->staging) {
+            size_t copied=0;
+            for (unsigned i=0;copied<done;i++) {
+                size_t n=direct->spans[i].length;
+                if (n>done-copied) n=done-copied;
+                memcpy(direct->spans[i].address,(char *)data+copied,n);
+                copied+=n;
+            }
+        }
+        if (done) kernel_vfs_notify_file(&file->file,VFS_NOTIFY_ACCESS);
+    }
+    return done?(int64_t)done:error;
+}
+
+int kernel_files_aio_rw(struct kernel_files *files,struct kernel_mm *mm,
+    struct kernel_open_file_description **owner,unsigned op,uint64_t buf,
+    uint64_t count,int64_t offset,uint32_t flags,int64_t *result,struct kernel_aio_direct **deferred)
+{
+    struct kernel_open_file_description *file=*owner;
+    int writing=op==1 || op==8, vector=op==7 || op==8;
+    if (writing ? !kernel_files_description_writable(file) : !kernel_open_file_readable(file))
+        return -KERNEL_EBADF;
+    if (file->kind!=KERNEL_OPEN_FILE_KIND_REGULAR && !file->block) return -KERNEL_EINVAL;
+    struct kernel_uaccess_iov_snapshot snapshot={0};
+    struct kernel_uaccess_iovec scalar={buf,count};
+    const struct kernel_uaccess_iovec *iov=&scalar;
+    size_t elements=1;
+    int error=0;
+    if (vector) {
+        if (count>1024) return -KERNEL_EINVAL;
+        int64_t imported=0;
+        if (kernel_uaccess_iov_import(&snapshot,files->heap,mm,buf,count,&imported)) __builtin_trap();
+        if (imported) {error=(int)imported;goto out;}
+        iov=snapshot.view; elements=snapshot.count; count=snapshot.total;
+    } else {
+        if (count>KERNEL_FILES_MAX_RW_COUNT) count=KERNEL_FILES_MAX_RW_COUNT;
+        if (kernel_user_range_check(buf,count) || scalar_empty_range_fault(buf,count)) return -KERNEL_EFAULT;
+        scalar.length=count;
+    }
+    if (offset<0 || count>(uint64_t)(INT64_MAX-offset)) {error=-KERNEL_EINVAL;goto out;}
+    error=vector_request_error(file,(uint64_t)offset,count,flags);
+    if (error) goto out;
+    *result=0;
+    if (file->kind==KERNEL_OPEN_FILE_KIND_REGULAR && (kernel_open_file_flags(file)&KERNEL_FILES_O_DIRECT)) {
+        *deferred=prepare_direct(file,mm,iov,elements,count,(uint64_t)offset,writing,flags);
+        if (*deferred) goto out;
+    }
+    if (count && writing) {
+        if (write_request(files,mm,file,iov,elements,count,1,(uint64_t)offset,result,
+                0,NULL,NULL,flags)) __builtin_trap();
+        account_write(files,*result);
+    } else if (count) {
+        if (pread_iov_pinned(files,mm,owner,iov,elements,count,offset,!vector,result)) __builtin_trap();
+        if (*result>0 && *owner) kernel_vfs_notify_file(&file->file,VFS_NOTIFY_ACCESS);
+    }
+out:
+    kernel_uaccess_iov_cleanup(&snapshot,files->heap);
+    return error;
+}
 
 static enum kernel_files_status lseek_pinned(
     struct kernel_open_file_description *description, int64_t offset,

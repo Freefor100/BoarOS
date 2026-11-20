@@ -730,7 +730,7 @@ static void realtime_prepared_cases(void)
         assert(!pthread_create(&worker,0,vector?vector_waiter:waiter,vector?(void *)&v:(void *)&w));
         while(!__atomic_load_n(&vector_paused,__ATOMIC_ACQUIRE))sched_yield();
         assert(futex_queue && futex_queue->head &&
-            futex_queue->head->task->wait.realtime_deadline==100 &&
+            futex_queue->head->task->wait.clock_deadline==100 &&
             kernel_wait_record_phase(&futex_queue->head->task->wait)==KERNEL_WAIT_PREPARED);
         __atomic_store_n(&realtime_offset,backward?0:200,__ATOMIC_RELEASE);
         __atomic_store_n(&vector_resume,1,__ATOMIC_RELEASE);

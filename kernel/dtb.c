@@ -1,4 +1,5 @@
 #include <kernel/dtb.h>
+#include <string.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -1239,9 +1240,10 @@ enum dtb_status dtb_read_irq_info(const void *dtb, uint64_t boot_hart,
     return status;
 }
 
-static int isa_has_extension(const unsigned char *isa,uint32_t length,int vector)
+static int isa_has_extension(const unsigned char *isa,uint32_t length,const char *name)
 {
     if (length<4 || isa[0]!='r' || isa[1]!='v' || isa[2]!='6' || isa[3]!='4') return 0;
+    uint32_t name_length = (uint32_t)strlen(name);
     uint32_t i=4;
     while (i<length) {
         if (isa[i]=='_') {i++;continue;}
@@ -1255,15 +1257,12 @@ static int isa_has_extension(const unsigned char *isa,uint32_t length,int vector
                 while (i<length && isa[i]>='0' && isa[i]<='9') i++;
             }
         }
-        if (vector) {
-            if (!multi && isa[begin]=='v' && (i==begin+1 || isa[begin+1]=='1')) return 1;
-            continue;
-        }
-        if (!multi || i-begin<6 ||
-            !bytes_equal_string(isa+begin,6,"svvptc")) continue;
-        uint32_t version=begin+6;
+        if (i-begin < name_length || !bytes_equal_string(isa+begin,name_length,name) ||
+            (multi && name_length == 1)) continue;
+        uint32_t version=begin+name_length;
         if (version==i) return 1;
         if (isa[version]<'1' || isa[version]>'9') continue;
+        if (name[0]=='v' && name_length==1 && isa[version]!='1') continue;
         while (version<i && isa[version]>='0' && isa[version]<='9') version++;
         if (version==i) return 1;
         if (isa[version++]!='p' || version==i) continue;
@@ -1271,6 +1270,20 @@ static int isa_has_extension(const unsigned char *isa,uint32_t length,int vector
         if (version==i) return 1;
     }
     return 0;
+}
+
+static int dtb_probe_extension(const unsigned char *extensions, uint32_t extensions_length,
+    const unsigned char *isa, uint32_t isa_length, const char *name, int *supported)
+{
+    *supported = 0;
+    if (extensions)
+        return string_list_contains(extensions, extensions_length, name, supported);
+    if (isa) {
+        if (!property_value_is_one_string(isa, isa_length))
+            return 0;
+        *supported = isa_has_extension(isa, isa_length-1, name);
+    }
+    return 1;
 }
 
 static enum dtb_status read_cpu_info(const void *dtb,uint64_t boot_hart,
@@ -1358,28 +1371,36 @@ static enum dtb_status read_cpu_info(const void *dtb,uint64_t boot_hart,
                     node->reg_length != ac * 4) return DTB_STATUS_INVALID;
                 uint64_t hart = read_cells(node->reg, ac);
                 if (!boot_only || hart==boot_hart) {
-                    int supported=0, vector=0, zicboz=0;
-                    if (node->extensions) {
-                        if (!string_list_contains(node->extensions,node->extensions_length,
-                                "svvptc",&supported) ||
-                            !string_list_contains(node->extensions,node->extensions_length,
-                                "v",&vector) ||
-                            (node->cboz_bytes == 64 &&
-                             !string_list_contains(node->extensions, node->extensions_length,
-                                 "zicboz", &zicboz))) return DTB_STATUS_INVALID;
-                    } else if (node->isa) {
-                        if (!property_value_is_one_string(node->isa,node->isa_length))
+                    /* This parser also runs at the physical boot address. The
+                     * array must not contain high-half virtual pointers. */
+                    static const struct { char name[8]; uint32_t feature; } probes[] = {
+                        {"svvptc", DTB_CPU_MMU_SVVPTC}, {"v", DTB_CPU_ISA_V},
+                        {"zicboz", DTB_CPU_ZICBOZ_64}, {"c", DTB_CPU_ISA_C},
+                        {"zba", DTB_CPU_ZBA}, {"zbb", DTB_CPU_ZBB}, {"zbs", DTB_CPU_ZBS},
+                    };
+                    uint32_t features = 0;
+                    for (unsigned i=0; i<sizeof(probes)/sizeof(probes[0]); i++) {
+                        int found;
+                        if (!dtb_probe_extension(node->extensions,node->extensions_length,
+                                node->isa,node->isa_length,probes[i].name,&found))
                             return DTB_STATUS_INVALID;
-                        supported=isa_has_extension(node->isa,node->isa_length-1,0);
-                        vector=isa_has_extension(node->isa,node->isa_length-1,1);
+                        if (found) features |= probes[i].feature;
                     }
-                    uint32_t features=(supported?DTB_CPU_MMU_SVVPTC:0) |
-                        (vector?DTB_CPU_ISA_V:0) | (zicboz?DTB_CPU_ZICBOZ_64:0);
+                    int f, d, g;
+                    if (!dtb_probe_extension(node->extensions,node->extensions_length,
+                            node->isa,node->isa_length,"f",&f) ||
+                        !dtb_probe_extension(node->extensions,node->extensions_length,
+                            node->isa,node->isa_length,"d",&d) ||
+                        !dtb_probe_extension(node->extensions,node->extensions_length,
+                            node->isa,node->isa_length,"g",&g)) return DTB_STATUS_INVALID;
+                    if ((f && d) || g) features |= DTB_CPU_ISA_FD;
+                    if (node->cboz_bytes != 64) features &= ~DTB_CPU_ZICBOZ_64;
                     for (uint32_t i=0;i<result.count;i++)
                         if (result.hart_ids[i]==hart) return DTB_STATUS_INVALID;
                     if (result.count==DTB_MAX_CPUS) return DTB_STATUS_UNSUPPORTED;
                     result.features=result.count ? result.features&features : features;
-                    result.hart_ids[result.count++]=hart;
+                    result.hart_ids[result.count]=hart;
+                    result.hart_features[result.count++]=features;
                 }
             }
             depth--;
@@ -1389,16 +1410,22 @@ static enum dtb_status read_cpu_info(const void *dtb,uint64_t boot_hart,
     for (uint32_t i = 0; i < result.count; i++)
         if (result.hart_ids[i] == boot_hart) boot = i;
     if (boot == result.count) return DTB_STATUS_NOT_FOUND;
+    uint32_t boot_features=result.hart_features[boot];
+    result.hart_features[boot]=result.hart_features[0];
+    result.hart_features[0]=boot_features;
     result.hart_ids[boot] = result.hart_ids[0];
     result.hart_ids[0] = boot_hart;
     for (uint32_t i = 2; i < result.count; i++) {
         uint64_t hart = result.hart_ids[i];
+        uint32_t features=result.hart_features[i];
         uint32_t j = i;
         while (j > 1 && result.hart_ids[j - 1] > hart) {
             result.hart_ids[j] = result.hart_ids[j - 1];
+            result.hart_features[j] = result.hart_features[j-1];
             j--;
         }
         result.hart_ids[j] = hart;
+        result.hart_features[j] = features;
     }
     *info = result;
     return DTB_STATUS_OK;

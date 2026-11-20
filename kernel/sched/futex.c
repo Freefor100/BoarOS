@@ -1,3 +1,4 @@
+#include <kernel/aio.h>
 #include <kernel/scheduler.h>
 #include "private.h"
 
@@ -231,16 +232,7 @@ static int64_t futex_wait_until(struct kernel_task *task, uint64_t address,
     struct kernel_mm_user_pin pin = {0};
     struct kernel_lock_guard guards[2] = {0};
     struct futex_bucket *resolved[2];
-    uint64_t deadline = 0;
     int realtime = (operation & FUTEX_CLOCK_REALTIME) != 0;
-    if (has_timeout && !realtime) {
-        enum kernel_time_status result = kernel_time_deadline_from_monotonic(deadline_ns, &deadline);
-        if (result == KERNEL_TIME_STATUS_DEADLINE_PASSED) deadline = 1;
-        else if (result != KERNEL_TIME_STATUS_OK) {
-            *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-            return 0;
-        }
-    }
     int private = (operation & FUTEX_PRIVATE) != 0;
     int64_t result = futex_prepare(task, &address, 1, operation, 0,
                                     private ? 0 : KERNEL_MM_READ, &key, &pin, status);
@@ -281,7 +273,8 @@ static int64_t futex_wait_until(struct kernel_task *task, uint64_t address,
     task->futex_request=&request;
     *status=has_timeout && realtime ?
         kernel_wait_prepare_realtime(0,deadline_ns,1,&request.token) :
-        kernel_wait_prepare(0,deadline,1,&request.token);
+        has_timeout ? kernel_wait_prepare_monotonic(0,deadline_ns,1,&request.token) :
+        kernel_wait_prepare(0,0,1,&request.token);
     if(!*status) {
         entry.priority=futex_wait_priority(task);
         KERNEL_IRQ_LOCK_SCOPE(guard,&resolved[0]->waiters.lock);
@@ -492,7 +485,8 @@ void kernel_futex_release_mm(struct kernel_task *task)
         futex_wake_user(task, address);
     }
     /* 用户复制可能睡眠；返回前仍是 MM 使用者，不能让另一退出者误判为独占。 */
-    (void)kernel_mm_remove_user(&task->mm);
+    if (!kernel_mm_remove_user(&task->mm) && *kernel_mm_aio_contexts(&task->mm))
+        kernel_aio_exit(&task->mm);
 }
 
 void kernel_futex_set_robust_list(struct kernel_task *task, uint64_t head)

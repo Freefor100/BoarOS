@@ -65,6 +65,7 @@ enum kernel_syscall_restart_kind {
     KERNEL_SYSCALL_RESTART_NANOSLEEP,
     KERNEL_SYSCALL_RESTART_FUTEX_TIMED,
     KERNEL_SYSCALL_RESTART_NOINTR,
+    KERNEL_SYSCALL_RESTART_NOHAND,
 };
 
 struct kernel_syscall_restart_state {

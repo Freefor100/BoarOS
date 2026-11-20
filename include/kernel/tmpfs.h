@@ -4,6 +4,7 @@
 struct kernel_heap;
 struct kernel_vfs_mount;
 struct kernel_vfs_file;
+struct kernel_vfs_path;
 struct kernel_vfs_node;
 struct physical_page_allocator;
 
@@ -35,4 +36,7 @@ int kernel_tmpfs_is_mount(const struct kernel_vfs_mount *mount);
 int kernel_tmpfs_create(struct kernel_heap *, uint64_t flags, const char *options,
                          struct kernel_vfs_mount **owner);
 int kernel_tmpfs_check_mount_parameter(struct kernel_heap *,const char *,const char *);
+int kernel_devtmpfs_mount(struct kernel_heap *, const char *options, struct kernel_vfs_path **);
+int kernel_devtmpfs_is_mount(const struct kernel_vfs_mount *);
+void kernel_devtmpfs_shutdown(void);
 #endif

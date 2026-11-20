@@ -485,19 +485,16 @@ int64_t kernel_sem_op(struct kernel_task *task, struct kernel_mm *mm, int32_t id
         goto done;
     result = -KERNEL_EINVAL;
     if (id < 0) goto done;
-    uint64_t deadline = 0;
+    uint64_t target_ns = 0;
     int expired = 0;
     if (timeout_address) {
         if (timeout.seconds < 0 || timeout.nanoseconds < 0 || timeout.nanoseconds >= 1000000000)
             goto done;
         unsigned __int128 duration = (unsigned __int128)(uint64_t)timeout.seconds *
             UINT64_C(1000000000) + (uint64_t)timeout.nanoseconds;
-        uint64_t now = kernel_time_monotonic_ns();
-        uint64_t target = now >= INT64_MAX || duration > (uint64_t)INT64_MAX - now
-            ? INT64_MAX : now + (uint64_t)duration;
-        enum kernel_time_status status = kernel_time_deadline_from_monotonic(target, &deadline);
-        expired = status == KERNEL_TIME_STATUS_DEADLINE_PASSED;
-        if (status != KERNEL_TIME_STATUS_OK && !expired) goto done;
+        expired = !duration;
+        if (!expired) target_ns=kernel_time_monotonic_after(duration>INT64_MAX ?
+            (uint64_t)INT64_MAX : (uint64_t)duration);
     }
     struct sem_set *set = set_lookup(id, 0);
     if (!set) goto done;
@@ -522,7 +519,10 @@ int64_t kernel_sem_op(struct kernel_task *task, struct kernel_mm *mm, int32_t id
             else if (result == 1) {
                 if (expired) result = -KERNEL_EAGAIN;
                 else {
-                    if (kernel_wait_prepare(0, deadline, 1, &request->token)) __builtin_trap();
+                    enum kernel_scheduler_status prepared=target_ns ?
+                        kernel_wait_prepare_monotonic(0,target_ns,1,&request->token) :
+                        kernel_wait_prepare(0,0,1,&request->token);
+                    if (prepared) __builtin_trap();
                     request->prepared = 1;
                     request->result = 1;
                     request->previous = set->tail;

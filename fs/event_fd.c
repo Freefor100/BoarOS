@@ -1,3 +1,4 @@
+#include <kernel/aio.h>
 #include <kernel/credentials.h>
 #include "open_file_internal.h"
 #include <kernel/avl.h>
@@ -150,7 +151,7 @@ static void timer_reindex(struct kernel_avl_node *node)
     struct kernel_timer_fd *timer=(void *)((char *)node- offsetof(struct kernel_timer_fd,deadline));
     timer_insert(timer);
 }
-void kernel_timer_fd_clock_changed(void)
+void kernel_timer_fd_reindex(int wall_step)
 {
     /* Clock setters serialize these batches; settime and close use timer_lock. */
     struct kernel_timer_fd *notifications=0;
@@ -158,7 +159,7 @@ void kernel_timer_fd_clock_changed(void)
         KERNEL_RAW_SCOPE(guard,&timer_lock);
         struct kernel_avl_node *old=timer_root;timer_root=0;timer_reindex(old);timer_publish();
         uint64_t offset=kernel_time_boot_realtime_offset();
-        for(struct kernel_timer_fd *timer=cancel_timers;timer;timer=timer->cancel_next) {
+        for(struct kernel_timer_fd *timer=wall_step?cancel_timers:0;timer;timer=timer->cancel_next) {
             if(!timer->canceled&&timer->cancel_offset==offset)continue;
             timer->canceled=1;timer->event.count++;
             /* Close waits for these borrows, including before cursor setup. */
@@ -177,6 +178,7 @@ void kernel_timer_fd_clock_changed(void)
     }
     kernel_timer_fd_expire(arch_time_read());timer_changed();
 }
+void kernel_timer_fd_clock_changed(void) { kernel_timer_fd_reindex(1); }
 static enum kernel_files_status install_event(struct kernel_files *files,
     struct kernel_event_fd *event, uint32_t flags, int64_t *result)
 {
@@ -246,6 +248,21 @@ void kernel_event_fd_close(struct kernel_open_file_description *file)
         if (kernel_scheduler_yield_current()) __builtin_trap();
     }
 }
+void kernel_event_fd_signal(struct kernel_open_file_description *file)
+{
+    struct kernel_event_fd *event=event_of(file);
+    struct kernel_counter_fd *counter=(void *)event;
+    struct kernel_wait_cursor poll={0},readers={0};
+    int wake_poll,wake_readers;
+    {
+        KERNEL_RAW_SCOPE(guard,&event->lock);
+        if (event->count!=UINT64_MAX) event->count++;
+        wake_poll=kernel_wait_cursor_prepare(&event->waiters,&poll);
+        wake_readers=kernel_wait_cursor_prepare(&counter->readers,&readers);
+    }
+    if (wake_poll) kernel_wait_cursor_wake(&poll,1);
+    if (wake_readers) kernel_wait_cursor_wake(&readers,1);
+}
 uint32_t kernel_event_fd_poll(struct kernel_open_file_description *file,uint32_t requested,struct kernel_wait_queue **queue)
 {
     struct kernel_event_fd *event=event_of(file);
@@ -260,7 +277,8 @@ uint32_t kernel_event_fd_poll(struct kernel_open_file_description *file,uint32_t
             else if(write&&!read)*queue=&counter->writers;
         }
     }
-    return (event->count?KERNEL_POLLIN:0U) | (!is_timer(event)&&event->count<UINT64_MAX-1?KERNEL_POLLOUT:0U);
+    return (event->count==UINT64_MAX && !is_timer(event)?KERNEL_POLLERR:0U) |
+        (event->count?KERNEL_POLLIN:0U) | (!is_timer(event)&&event->count<UINT64_MAX-1?KERNEL_POLLOUT:0U);
 }
 /* The actual caller holds the OFD. State and registration share the object
  * lock, while user faults, callback invocation and parking happen outside it. */
@@ -272,7 +290,7 @@ static int event_transfer(struct kernel_event_fd *event,uint64_t *value,int writ
         int wait=0,notify=0,notify_directed=0;
         {
             KERNEL_RAW_SCOPE(guard,event_lock(event));
-            wait=writing ? *value>UINT64_MAX-1-event->count : !event->count;
+            wait=writing ? *value>=UINT64_MAX-event->count : !event->count;
             if(!writing&&is_timer(event)&&(!wait||interrupted||(flags&EVENT_NONBLOCK))&&timer_canceled((void *)event)) {
                 event->count=0;((struct kernel_timer_fd *)event)->expired=0;return -KERNEL_ECANCELED;
             }

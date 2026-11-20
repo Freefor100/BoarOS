@@ -22,7 +22,7 @@ int64_t kernel_futex_waitv(struct kernel_task *task,uint64_t address,unsigned co
         *status=KERNEL_SCHEDULER_STATUS_INVALID_STATE;return 0;
     }
     if(flags || !address || !count || count>128)return -KERNEL_EINVAL;
-    uint64_t deadline=0,deadline_ns=0;
+    uint64_t deadline_ns=0;
     if(timeout) {
         if(clock!=0 && clock!=1)return -KERNEL_EINVAL;
         struct {int64_t seconds,nanoseconds;} t;size_t copied;
@@ -30,11 +30,6 @@ int64_t kernel_futex_waitv(struct kernel_task *task,uint64_t address,unsigned co
         if(t.seconds<0 || t.nanoseconds<0 || t.nanoseconds>=1000000000)return -KERNEL_EINVAL;
         __uint128_t ns=(__uint128_t)(uint64_t)t.seconds*1000000000+(uint64_t)t.nanoseconds;
         deadline_ns=ns>INT64_MAX?INT64_MAX:(uint64_t)ns;
-        if(clock) {
-            enum kernel_time_status result=kernel_time_deadline_from_monotonic(deadline_ns,&deadline);
-            if(result==KERNEL_TIME_STATUS_DEADLINE_PASSED)deadline=1;
-            else if(result!=KERNEL_TIME_STATUS_OK)__builtin_trap();
-        }
     }
     struct kernel_futex_request request={.task=task,.heap=task->files.heap,.count=count};
     enum kernel_heap_status allocated=kernel_heap_allocate_zeroed(request.heap,count,sizeof(*request.entries),(void **)&request.entries);
@@ -61,7 +56,8 @@ int64_t kernel_futex_waitv(struct kernel_task *task,uint64_t address,unsigned co
         }
         enum kernel_scheduler_status prepared_wait=timeout && !clock ?
             kernel_wait_prepare_realtime(0,deadline_ns,1,&request.token) :
-            kernel_wait_prepare(0,deadline,1,&request.token);
+            timeout ? kernel_wait_prepare_monotonic(0,deadline_ns,1,&request.token) :
+            kernel_wait_prepare(0,0,1,&request.token);
         if(prepared_wait)__builtin_trap();
         unsigned priority=futex_wait_priority(task);
         unsigned retry=count;struct futex_bucket *busy=0;

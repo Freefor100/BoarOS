@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 long sbi_probe_extension(unsigned long extension_id);
+int sbi_hardware_ids(uint64_t ids[3]);
 long sbi_set_timer(uint64_t absolute_time);
 #define SBI_EXT_HSM 0x48534dUL
 #define SBI_EXT_IPI 0x735049UL

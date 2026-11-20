@@ -10,6 +10,12 @@ __attribute__((weak)) uint64_t kernel_time_monotonic_ns(void) { return 0; }
 __attribute__((weak)) enum kernel_time_status kernel_time_deadline_from_monotonic(
     uint64_t target,uint64_t *deadline)
 { (void)target;(void)deadline;return KERNEL_TIME_STATUS_NOT_INITIALIZED; }
+/* Scheduler models without calibration use the same sample for both clocks. */
+__attribute__((weak)) uint64_t kernel_time_raw_ns(void) { return kernel_time_monotonic_ns(); }
+__attribute__((weak)) enum kernel_time_status kernel_time_deadline_from_raw(
+    uint64_t target,uint64_t *deadline)
+{ return kernel_time_deadline_from_monotonic(target,deadline); }
+
 __attribute__((weak)) uint64_t riscv_time_read(void) { return 0; }
 /* 宿主等待器直接发布 pthread 可见状态，不模拟硬件 IPI 排队。
  * 有专用 CPU 模型的夹具覆盖这两个平台入口。 */

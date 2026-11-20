@@ -444,6 +444,8 @@ enum kernel_files_status kernel_files_ftruncate(
 
 enum kernel_files_status kernel_files_sync(struct kernel_files *files,
     int64_t fd, int datasync, int64_t *linux_result);
+enum kernel_files_status kernel_files_sync_file_range(struct kernel_files *,
+    int64_t fd, int64_t offset, int64_t length, unsigned flags, int64_t *linux_result);
 enum kernel_files_status kernel_files_syncfs(struct kernel_files *files,
     int64_t fd, int64_t *linux_result);
 

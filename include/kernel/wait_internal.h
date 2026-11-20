@@ -1,6 +1,7 @@
 #ifndef BOAROS_KERNEL_WAIT_INTERNAL_H
 #define BOAROS_KERNEL_WAIT_INTERNAL_H
 #include <kernel/scheduler.h>
+#include <kernel/time.h>
 #include <kernel/raw_lock.h>
 
 enum kernel_wait_phase { KERNEL_WAIT_FINISHED, KERNEL_WAIT_PREPARED,
@@ -15,9 +16,10 @@ struct kernel_wait_record {
     uint64_t generation;
 #endif
     uint64_t deadline;
-    /* Nonzero original absolute REALTIME ns. Prepared waits convert at commit;
-     * committed deadlines are reindexed atomically with a wall-clock step. */
-    uint64_t realtime_deadline;
+    /* Preserve the original clock-domain timestamp through prepare/commit
+     * and clock adjustments. Raw scheduler deadlines have no converter. */
+    uint64_t clock_deadline;
+    enum kernel_time_status (*convert_deadline)(uint64_t, uint64_t *);
     struct kernel_wait_node *nodes;
 #if BOAROS_MAX_CPUS == 1
     uint32_t phase, reason, interruptible;

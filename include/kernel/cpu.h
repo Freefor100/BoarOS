@@ -112,6 +112,16 @@ static inline struct kernel_cpu *kernel_cpu_current(void)
  * This counts configured executors, including secondaries not yet started. */
 void kernel_cpu_set_boot_count(unsigned count);
 unsigned kernel_cpu_get_boot_count(void);
+static inline unsigned kernel_cpu_first_in_mask(unsigned mask)
+{
+    if (!mask) __builtin_trap();
+    unsigned id = 0;
+    while (!(mask & 1U)) {
+        mask >>= 1;
+        id++;
+    }
+    return id;
+}
 void kernel_cpu_initialize(struct kernel_cpu *, uint64_t, struct kernel_io_context *);
 void kernel_cpu_boot_initialize(uint64_t hardware_id);
 void kernel_cpu_boot_rebind(void);

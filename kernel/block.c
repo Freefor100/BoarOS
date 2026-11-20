@@ -497,6 +497,81 @@ enum kernel_block_status kernel_block_read_batch(struct kernel_block_device *dev
 }
 
 static struct kernel_block_device *registered_devices;
+static kernel_block_devnode_fn devnode_publisher;
+
+void kernel_block_set_devnode_publisher(kernel_block_devnode_fn fn)
+{
+    uintptr_t irq = registry_lock();
+    devnode_publisher = fn;
+    registry_unlock(irq);
+}
+
+int kernel_block_snapshot(struct kernel_block_device **devices, size_t capacity, size_t *count)
+{
+    uintptr_t irq = registry_lock();
+    size_t n = 0;
+    for (struct kernel_block_device *it = registered_devices; it; it = it->registry_next)
+        if (it->registered) n++;
+    *count = n;
+    if (n > capacity) { registry_unlock(irq); return -KERNEL_ENOSPC; }
+    n = 0;
+    for (struct kernel_block_device *it = registered_devices; it; it = it->registry_next)
+        if (it->registered) {
+            if (it->references == UINT32_MAX) __builtin_trap();
+            it->references++;
+            devices[n++] = it;
+        }
+    registry_unlock(irq);
+    return 0;
+}
+
+static void remove_device_locked(struct kernel_block_device *device)
+{
+    struct kernel_block_device **link = &registered_devices;
+    while (*link && *link != device) link = &(*link)->registry_next;
+    if (!*link) __builtin_trap();
+    *link = device->registry_next;
+    device->registry_next = NULL;
+    if (device->parent) {
+        if (!device->parent->references) __builtin_trap();
+        device->parent->references--;
+    }
+}
+
+static void activate_devices(struct kernel_block_device *const *devices, size_t count)
+{
+    /* devtmpfs owns the directory lock here. No registry owner calls into
+     * the filesystem with the registry lock held. */
+    uintptr_t irq = registry_lock();
+    for (size_t i = 0; i < count; i++) {
+        if (!devices[i]->registering || devices[i]->registered) __builtin_trap();
+        devices[i]->registered = 1;
+    }
+    registry_unlock(irq);
+}
+
+/* Numbers and parent references have already been reserved under *irq.
+ * Retain registration ownership until the publisher finishes notifying users. */
+static int publish_devices_locked(struct kernel_block_device *const *devices,
+    size_t count, uintptr_t *irq)
+{
+    kernel_block_devnode_fn publish = devnode_publisher;
+    if (!publish) {
+        for (size_t i = 0; i < count; i++) devices[i]->registered = 1;
+        return 0;
+    }
+    for (size_t i = 0; i < count; i++) devices[i]->registering = 1;
+    registry_unlock(*irq);
+    int error = publish(devices, count, 1, activate_devices);
+    *irq = registry_lock();
+    for (size_t i = 0; i < count; i++) {
+        struct kernel_block_device *device = devices[i];
+        if (device->registered != (unsigned)!error) __builtin_trap();
+        if (error) remove_device_locked(device);
+        device->registering = 0;
+    }
+    return error;
+}
 
 int kernel_block_register(struct kernel_block_device *device, uint64_t number)
 {
@@ -504,7 +579,7 @@ int kernel_block_register(struct kernel_block_device *device, uint64_t number)
         return -KERNEL_EINVAL;
     uintptr_t irq = registry_lock();
     int error = 0;
-    if (device->registered || device->references || device->notifications || device->claim_owner) error = -KERNEL_EBUSY;
+    if (device->registered || device->registering || device->references || device->notifications || device->claim_owner) error = -KERNEL_EBUSY;
     for (struct kernel_block_device *it = registered_devices; it; it = it->registry_next)
         if (it->device_number == number) error = -KERNEL_EBUSY;
     if (device->parent && (!device->parent->registered || device->parent->parent ||
@@ -519,8 +594,8 @@ int kernel_block_register(struct kernel_block_device *device, uint64_t number)
         device->device_number = number;
         device->claim_owner = 0;
         device->registry_next = registered_devices;
-        device->registered = 1U;
         registered_devices = device;
+        error = publish_devices_locked(&device, 1, &irq);
     }
     registry_unlock(irq);
     return error;
@@ -532,18 +607,21 @@ int kernel_block_unregister(struct kernel_block_device *device)
     uintptr_t irq = registry_lock();
     int error = 0;
     if (!device->registered) error = -KERNEL_ENODEV;
-    else if (device->references || device->notifications || device->claim_owner) error = -KERNEL_EBUSY;
+    else if (device->registering || device->references || device->notifications || device->claim_owner) error = -KERNEL_EBUSY;
     else {
-        struct kernel_block_device **link = &registered_devices;
-        while (*link && *link != device) link = &(*link)->registry_next;
-        if (!*link) __builtin_trap();
-        *link = device->registry_next;
-        device->registered = 0U;
-        device->registry_next = 0;
-        if (device->parent) {
-            if (!device->parent->references) __builtin_trap();
-            device->parent->references--;
+        /* Stop new opens while retaining the name reservation. An existing
+         * open, partition or mount already prevented us from entering here. */
+        device->registered = 0;
+        kernel_block_devnode_fn publish = devnode_publisher;
+        if (publish) {
+            device->registering = 1;
+            registry_unlock(irq);
+            error = publish(&device, 1, 0, NULL);
+            irq = registry_lock();
+            device->registering = 0;
         }
+        if (error) device->registered = 1;
+        else remove_device_locked(device);
     }
     registry_unlock(irq);
     return error;
@@ -553,7 +631,7 @@ struct kernel_block_device *kernel_block_lookup(uint64_t number)
 {
     uintptr_t irq = registry_lock();
     struct kernel_block_device *device = registered_devices;
-    while (device && device->device_number != number) device = device->registry_next;
+    while (device && (!device->registered || device->device_number != number)) device = device->registry_next;
     registry_unlock(irq);
     return device;
 }
@@ -599,7 +677,7 @@ struct kernel_block_device *kernel_block_get(uint64_t number)
 {
     uintptr_t irq = registry_lock();
     struct kernel_block_device *device = registered_devices;
-    while (device && device->device_number != number) device = device->registry_next;
+    while (device && (!device->registered || device->device_number != number)) device = device->registry_next;
     if (device) {
         if (device->references == UINT32_MAX) __builtin_trap();
         device->references++;
@@ -948,12 +1026,13 @@ int kernel_block_scan_gpt(struct kernel_block_device *disk,
      * rollback can race a consumer acquiring a partially published child. */
     uintptr_t irq = registry_lock();
     int error = 0;
-    unsigned used = 0;
+    size_t used = 0;
+    struct kernel_block_device *batch[KERNEL_BLOCK_GPT_PARTITIONS];
     for (size_t i = 0; i < slots; i++) {
-        if (children[i].registered || children[i].references || children[i].notifications || children[i].claim_owner)
+        if (children[i].registered || children[i].registering || children[i].references || children[i].notifications || children[i].claim_owner)
             error = -KERNEL_EBUSY;
         if (!parts[i].count) continue;
-        used++;
+        batch[used++] = &children[i];
         for (struct kernel_block_device *it = registered_devices; it; it = it->registry_next)
             if (it->device_number == disk->device_number + i + 1) error = -KERNEL_EBUSY;
     }
@@ -964,9 +1043,10 @@ int kernel_block_scan_gpt(struct kernel_block_device *disk,
             .start_bytes = parts[i].first * 512, .capacity_bytes = parts[i].count * 512,
             .logical_block_size = 512, .device_number = disk->device_number + i + 1 };
         prepare_locked(&children[i]); disk->references++;
-        children[i].registry_next = registered_devices; children[i].registered = 1;
+        children[i].registry_next = registered_devices;
         registered_devices = &children[i];
     }
+    if (!error && used) error = publish_devices_locked(batch, used, &irq);
     registry_unlock(irq);
     return error;
 }

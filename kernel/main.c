@@ -1,6 +1,7 @@
 #include <arch/riscv/vector.h>
 #include <arch/context.h>
 #include <arch/riscv/direct_map.h>
+#include <arch/riscv/hwprobe.h>
 #include <arch/riscv/memory_layout.h>
 #include <arch/riscv/root_boot.h>
 #include <arch/riscv/plic.h>
@@ -891,6 +892,11 @@ static void kernel_main_high(void)
 {
     kernel_cpu_boot_rebind();
     riscv_vector_boot(boot_features);
+#if BOAROS_MAX_CPUS > 1
+    riscv_hwprobe_initialize(0, boot_cpus.hart_features[0], boot_features, boot_info.timebase_frequency);
+#else
+    riscv_hwprobe_initialize(0, boot_features, boot_features, boot_info.timebase_frequency);
+#endif
     riscv_mmu_svvptc=!!(boot_features&DTB_CPU_MMU_SVVPTC);
     riscv_mmu_cboz64=!!(boot_features&DTB_CPU_ZICBOZ_64);
     virt_uart_puts("BoarOS: MMU Svvptc=");virt_uart_put_hex(riscv_mmu_svvptc);virt_uart_putc('\n');

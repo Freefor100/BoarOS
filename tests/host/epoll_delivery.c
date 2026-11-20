@@ -179,6 +179,9 @@ enum kernel_scheduler_status kernel_scheduler_block_current(struct kernel_wait_q
 { (void)q;(void)d;(void)i;*r=KERNEL_WAIT_TIMEOUT;return KERNEL_SCHEDULER_STATUS_OK; }
 enum kernel_scheduler_status kernel_wait_prepare(struct kernel_wait_queue *q,uint64_t d,int i,struct kernel_wait_token *t)
 { (void)q;(void)d;(void)i;CHECK(!scopes[actor] && !wait_live[actor] && !network_host_irq);prepares++;wait_live[actor]=1;*t=(struct kernel_wait_token){host_task,1};return KERNEL_SCHEDULER_STATUS_OK; }
+enum kernel_scheduler_status kernel_wait_prepare_monotonic(struct kernel_wait_queue *q,
+    uint64_t target,int interruptible,struct kernel_wait_token *token)
+{ return kernel_wait_prepare(q,target,interruptible,token); }
 enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *t,enum kernel_wait_wake_reason *r)
 { (void)t;CHECK(!scopes[actor] && wait_live[actor] && !network_host_irq);parks++;*r=KERNEL_WAIT_TIMEOUT;return KERNEL_SCHEDULER_STATUS_OK; }
 enum kernel_scheduler_status kernel_wait_finish(struct kernel_wait_token *t)

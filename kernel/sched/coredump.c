@@ -159,7 +159,7 @@ static struct process_core_session *core_freeze(struct kernel_task *task,unsigne
     while (core_arriving(session)) {
         enum kernel_wait_wake_reason reason;
         if (KERNEL_WAIT_RECHECK(&session->arrivals,deadline,0,&reason,core_arriving(session)) ||
-            kernel_time_monotonic_ns()>=kernel_time_ticks_to_ns(deadline)) goto failed;
+            reason==KERNEL_WAIT_TIMEOUT) goto failed;
     }
     return session;
 failed:

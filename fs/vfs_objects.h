@@ -213,6 +213,8 @@ struct kernel_vfs_backend {
     void (*reclaim_clean)(struct kernel_vfs_instance *instance);
     /* Caller has returned source/entry and inode qualifications before waiting. */
     int (*writeback_reclaim)(struct kernel_vfs_instance *instance, int memory_pressure);
+    /* Complete data already accepted by writeback, without committing metadata. */
+    int (*complete_data_range)(struct kernel_vfs_node *, uint64_t start, uint64_t end);
     /* Returns after capturing/registering a fixed target. The backend completes
      * request once durable or failed, without borrowing a CPU0 executor stack.
      * NULL denotes a memory-only backend without persistent metadata. */
@@ -324,6 +326,7 @@ int kernel_vfs_inode_times_allowed(struct kernel_vfs_node *, const struct kernel
 void kernel_vfs_creation_identity(uint32_t parent_mode, uint32_t parent_gid,
     uint32_t *mode, uint32_t *uid, uint32_t *gid);
 void kernel_vfs_record_writeback_error(struct kernel_vfs_node *node, int error);
+int kernel_vfs_node_complete_data_range(struct kernel_vfs_node *, uint64_t start, uint64_t end);
 void kernel_vfs_record_mount_writeback_error(struct kernel_vfs_mount *mount, int error);
 int kernel_vfs_attach_unnamed_path(struct kernel_vfs_file *, const char *name);
 int kernel_vfs_publish_node(struct kernel_vfs_mount *mount, struct kernel_vfs_node *node,

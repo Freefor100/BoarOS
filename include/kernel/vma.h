@@ -25,7 +25,8 @@ void kernel_vma_set_clear_locks(struct kernel_vma_set *);
 #define KERNEL_VMA_GROWSDOWN 64U
 #define KERNEL_VMA_ANON_HISTORY 128U /* established private backing (including anonymous read faults); survives DONTNEED */
 #define KERNEL_VMA_ANON_SOURCE 256U /* lazy ELF zero-fill, not file-backed */
-#define KERNEL_VMA_ALL_FLAGS 511U
+#define KERNEL_VMA_AIO_RING 512U
+#define KERNEL_VMA_ALL_FLAGS 1023U
 /* The VMA writer is held. Revalidate the fault snapshot and mark private backing. */
 /* Caller excludes edits and serializes concurrent history marks. This changes
  * fork provenance only and leaves the mapping generation unchanged. */

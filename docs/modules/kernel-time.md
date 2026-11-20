@@ -6,7 +6,7 @@
 
 | 文件 | 当前职责 |
 |---|---|
-| `include/kernel/time.h`、`kernel/time.c` | 固定点乘数换算、单调/实时时钟、timer 驱动 coarse 快照、运行时墙钟与时区、deadline 换算 |
+| `include/kernel/time.h`、`kernel/time.c` | 定点乘数换算、软件时钟频率与相位校准、单调/实时时钟、timer 驱动 coarse 快照、运行时墙钟与时区、deadline 换算 |
 | `arch/riscv/virt_rtc.c`、`include/arch/riscv/virt_rtc.h` | QEMU virt goldfish RTC 读取与合理性探测 |
 | `kernel/main.c`、`arch/loongarch/main.c` | 在 timer 启动前读取 RTC 并调用 `kernel_time_init` |
 | `platform/loongarch_rtc.c`、`include/platform/loongarch_rtc.h` | QEMU virt LS7A TOY 启用、一致 UTC 读取与明确失败 |
@@ -43,9 +43,21 @@ clock_settime 先检查时钟编号，再导入并验证 timespec，最后检查
 
 调钟使用一个任务互斥串行完成发布和各期限索引调整。现有调度短保护内同时提交新偏移、更新 vDSO 数据并重排已提交的绝对 REALTIME 等待；记录保存原始墙钟期限，尚未阻塞的请求在提交时重新换算。MQ、futex BITSET/waitv/PI 及绝对 clock_nanosleep 因而不需要撤销登记再重排队，也不会把调钟冒充实际唤醒。相对请求继续使用 MONOTONIC。信号重启保留原时钟域和期限；处理函数可观察的 EINTR 与无处理函数的自动重启规则不变。
 
-timerfd 和 POSIX 墙钟索引在各自已有保护内更新，通知和信号投递在保护外完成；远端修改通过既有 deadline IPI 让 CPU0 重新编程事件。期限处理再次核对有效时钟，覆盖偏移已经提交、对象索引尚未更新时的倒拨。正常时钟查询不取得调钟互斥，也不扫描等待者。调钟不新增 worker、RTC 写入或 NTP 调整。
+timerfd 和 POSIX 墙钟索引在各自已有保护内更新，通知和信号投递在保护外完成；远端修改通过既有 deadline IPI 让 CPU0 重新编程事件。期限处理再次核对有效时钟，覆盖偏移已经提交、对象索引尚未更新时的倒拨。正常时钟查询不取得调钟互斥，也不扫描等待者。硬件实时时钟只在启动时提供初始墙钟。
 
 功能消费者为 `python3 -B tests/userland/api8.py --program system_control --arch riscv --libc glibc --only boaros`，LA 使用 `--arch loongarch`。它通过实际 BLOCKED 状态握手检查等待期间调钟，并直接调用 vDSO 符号与 syscall 对照，不以 libc 回退掩盖入口缺失。
+
+## 软件时钟校准
+
+`adjtimex(171)` 和 `clock_adjtime(266, CLOCK_REALTIME)` 使用相同的 208 字节原生 `timex` 结构。零模式查询和 `ADJ_OFFSET_SS_READ` 余量查询向普通用户开放，修改要求系统校时能力 `CAP_SYS_TIME`。两种接口都先从用户空间读取整个结构。`clock_adjtime` 随后区分未知时钟编号（`EINVAL`）和可查询但缺少校时方法的时钟（`EOPNOTSUPP`）。
+
+原始硬件时间构成 `CLOCK_MONOTONIC_RAW`。内核以最近一次修改参数时的一对原始时间与单调时间为基准，把此后的计数增量换算为校准后的单调时间。频率参数采用百万分之一的 1/65536 为单位，范围为 ±500 ppm（parts per million，百万分比）。`ADJ_TICK` 可在每百分之一秒 9000 至 11000 微秒之间设置名义时长。网络时间协议（Network Time Protocol，NTP）的锁相环（phase-locked loop，PLL）按时间常数逐秒衰减剩余相位，在采样间隔较长时还可使用锁频环（frequency-locked loop，FLL）更新频率。单次渐调独立保存尚待施加的有符号微秒数，每秒最多消耗 500 微秒。各项校正以定点数相加后统一取整，保证负频率与负相位同时生效时单调时钟仍向前推进。
+
+`ADJ_MAXERROR` 和 `ADJ_ESTERROR` 设置最大误差与估计误差。最大误差按每秒 500 微秒累积，超过 16 秒时进入未同步状态。查询用已经过去的秒数一次计算累计量。成功调用返回同步状态 `TIME_OK`（0）或 `TIME_ERROR`（5，时钟未同步或请求的每秒脉冲信号不可用）。`ADJ_SETOFFSET` 以秒和非负秒内偏移之和调整墙钟，清除尚未施加的渐调和相位，并将时钟标为未同步。
+
+参数修改时，调度器根据等待记录保存的时钟域和目标纳秒，重新计算已提交等待的硬件期限。`ppoll`、`pselect6`、两种 `epoll_pwait` 和 `semtimedop` 在调用时把相对时限换算为单调时钟的绝对目标，后续重新登记仍使用同一目标。定时器文件描述符和可移植操作系统接口（Portable Operating System Interface，POSIX）定时器分别重排自己的期限索引。只有墙钟阶跃才会向设置了 `TFD_TIMER_CANCEL_ON_SET` 的定时器发出取消通知。虚拟动态共享对象（virtual dynamic shared object，vDSO）与系统调用使用同一套时钟换算公式和序列检查。调度执行预算与中央处理器（central processing unit，CPU）运行时间始终使用原始计数。计时中断沿用已有粗粒度时钟采样与到期处理，校准不增加周期性任务遍历。
+
+`tests/host/clock_discipline.c` 用可控计数器检查渐调余量、误差增长、组合校正的单调性和逆向换算。`tests/userland/clock-discipline.c` 检查两种系统调用、权限、vDSO 查询、调速前已阻塞的睡眠和定时器，以及墙钟阶跃取消通知。闰秒和国际原子时（International Atomic Time，TAI）偏移设置返回 `EOPNOTSUPP`。
 
 ## 用户态 vDSO
 
@@ -53,15 +65,15 @@ RV64 和 LA64 的 exec 映射一个只读可执行 ELF 页和紧随其后的只�
 
 vDSO 的独立 C 编译规则同样启用 `-fstack-usage`，生成 `vdso/time.su`；内核构建目录的完整栈检查要求该对象有报告。报告缺失是构建覆盖错误，不表示 vDSO ELF 或运行时函数不存在。该编译选项只输出用量记录，不改变 vDSO 的代码或用户态 ABI。
 
-REALTIME、MONOTONIC 和 MONOTONIC_RAW 直接读取用户可用的架构计数器，用与 syscall 相同的乘数换算。两种 COARSE 读取 CPU0 最近发布的原子样本；CPU 时钟和其他时钟编号交给 syscall。vDSO 在用户态写出结果，因此错误输出地址按普通用户内存访问处理。乘数在初始化后不变；调钟和时区修改更新共享数据页的序列，vDSO 在同一序列内读取偏移和 counter，发现写者介入则重读。内核 REALTIME 查询同样复查序列。计时中断只更新 coarse 单调样本，不遍历进程。
+REALTIME、MONOTONIC、BOOTTIME 和 MONOTONIC_RAW 直接读取用户可用的架构计数器。前三种应用共享校准参数，RAW 只使用硬件换算乘数。两种 COARSE 读取 CPU0 最近发布的原子样本；CPU 时钟和其他时钟编号交给 syscall。vDSO 在用户态写出结果，因此错误输出地址按普通用户内存访问处理。乘数在初始化后不变；调钟和时区修改更新共享数据页的序列，vDSO 在同一序列内读取偏移和 counter，发现写者介入则重读。内核 REALTIME 查询同样复查序列。计时中断只更新 coarse 单调样本，不遍历进程。
 
 各 MM 共享一页时钟数据，每个映射 PTE 与 MM 的恢复后备分别持有引用。fork 继承后备，`MADV_DONTNEED` 只丢弃驻留映射；再次访问时，代码从内核 ELF 重新装入，数据重新接入同一时钟页。页表销毁后归还 MM 的后备引用，最后一个 MM 释放时先停止时间写者对该页的访问。
 
-直接检查：`python3 -B tests/userland/run.py --workload vdso_time --arch riscv --cpus 1 --memory 512M --libc glibc`，LA 用 `--arch loongarch`。该程序检查 auxv、符号版本、各时钟的取值及分辨率、线程 CPU 时钟与 BOOTTIME 回退、fork 后丢页再访问和信号返回。
+直接检查：`python3 -B tests/userland/run.py --workload vdso_time --arch riscv --cpus 1 --memory 512M --libc glibc`，LA 用 `--arch loongarch`。该程序检查 auxv、符号版本、各时钟的取值及分辨率、线程 CPU 时钟回退与 BOOTTIME 查询、fork 后丢页再访问和信号返回。
 
 ## 消费者与验证
 
-syscall 层的 `clock_gettime(113)`、`clock_getres(114)` 支持 `CLOCK_REALTIME`、`CLOCK_MONOTONIC`、`CLOCK_MONOTONIC_RAW`（4）、`CLOCK_BOOTTIME`（7）、两种 `COARSE`（5、6）及[进程/线程 CPU 时钟](kernel-accounting.md#cpu-时钟)。当前没有 NTP 或其他频率渐进校正，RAW 与 MONOTONIC 使用相同的原始架构计数器换算，运行时墙钟修改不影响二者；RAW 支持查询但不支持睡眠、timerfd 或 POSIX 定时器。系统不支持挂起，因此 BOOTTIME 与 fine MONOTONIC 使用同一计数，分辨率为 1ns；vDSO 将 BOOTTIME 查询交给 syscall。该查询支持不扩展睡眠或定时器可接受的 clockid。未知 clockid 返回 `-EINVAL`。coarse getres 如实返回 10ms，NULL 输出成功，坏输出指针返回 EFAULT。`gettimeofday(169)` 使用 fine realtime；依次写出 timeval 和可选 timezone，后者返回系统保存的 timezone，两字段初始均为零。先前输出已成功时，后续用户地址错误返回 EFAULT 并保留该输出。
+syscall 层的 `clock_gettime(113)`、`clock_getres(114)` 支持 `CLOCK_REALTIME`、`CLOCK_MONOTONIC`、`CLOCK_MONOTONIC_RAW`（4）、`CLOCK_BOOTTIME`（7）、两种 `COARSE`（5、6）及[进程/线程 CPU 时钟](kernel-accounting.md#cpu-时钟)。RAW 返回原始硬件时间，MONOTONIC 返回校准后的时间。RAW 支持查询。系统持续运行期间，BOOTTIME 和 MONOTONIC 返回同一时钟域的时间，两者分辨率均为 1ns。未知 clockid 返回 `-EINVAL`。coarse getres 如实返回 10ms，NULL 输出成功，坏输出指针返回 EFAULT。`gettimeofday(169)` 使用 fine realtime；依次写出 timeval 和可选 timezone，后者返回系统保存的 timezone，两字段初始均为零。先前输出已成功时，后续用户地址错误返回 EFAULT 并保留该输出。
 
 `clock_nanosleep(115)` 支持 REALTIME、MONOTONIC、进程 CPU 时钟及编码后的其他线程 CPU 时钟。CPU 睡眠在调用者 CPU 登记和返回，复用 POSIX CPU 期限索引，按目标实际执行时间到期；不建立用户可见 timer ID，也不预留信号队列额度。内建 CLOCK_THREAD_CPUTIME_ID、MONOTONIC_RAW 与 coarse 时钟在读取 timespec 前返回 EOPNOTSUPP，编码后的本线程时钟返回 EINVAL。进程时钟可以由同组其他线程推进；只有睡眠线程且没有其他执行者时，CPU 时间不会因墙钟流逝增加。
 
@@ -69,7 +81,7 @@ CPU 睡眠对象由调用线程持有，期限检查和取消在共同调度保�
 
 `tests/diff-abi/coarse.c` 覆盖真实 U-mode timer 推进、查询错误和拒绝 coarse sleep。固定 Linux 必须启用 `CONFIG_POSIX_TIMERS` 才能对照 raw coarse syscall；Linux HZ=250 的 4ms 与 BoarOS HZ=100 的 10ms 分辨率按各自真实周期验证，不要求裸值相等。`make test-userland-riscv` 用 musl 验证真实 trap→expire→wake 闭环和 RTC 墙钟。
 
-当前限制：无 NTP、adjtime/clock_adjtime 渐进校准；POSIX 定时器的期限推进见下节；timekeeper只在启动采样RTC，此后由CSR换算推进，用户RTC_RD_TIME仍读取设备当前值；SMP的coarse快照由CPU0发布。
+硬件实时时钟只在启动时为软件墙钟提供初值。用户通过 `RTC_RD_TIME` 仍可读取设备当前值。多处理器系统的粗粒度时钟样本由 CPU0 发布。
 
 fine时钟和deadline换算精度不等于到期唤醒精度。普通blocked deadline由timer路径
 检查；`kernel/sched/scheduling.c::scheduler_rearm_timer`的架构timer事件取min(实时预算、

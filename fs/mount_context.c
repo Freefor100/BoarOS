@@ -7,6 +7,7 @@
 #include <kernel/errno.h>
 #include <kernel/heap.h>
 #include <kernel/tmpfs.h>
+#include <kernel/loop.h>
 #include <kernel/devpts.h>
 #include <kernel/procfs.h>
 #include <kernel/proc_task.h>
@@ -28,7 +29,7 @@ struct mount_context {
 };
 int kernel_mount_type_supported(const char *type)
 {
-    return !strcmp(type,"tmpfs") || !strcmp(type,"ext4") || !strcmp(type,"vfat") ||
+    return !strcmp(type,"devtmpfs") || !strcmp(type,"tmpfs") || !strcmp(type,"ext4") || !strcmp(type,"vfat") ||
         !strcmp(type,"devpts") || !strcmp(type,"proc") || !strcmp(type,"mqueue") ||
         !strcmp(type,"bpf") || !strcmp(type,"tracefs") || !strcmp(type,"sysfs") || !strcmp(type,"cgroup2");
 }
@@ -58,6 +59,19 @@ int kernel_mount_create(const struct kernel_fs_context *fs,const struct kernel_m
         device=st.rdev;
         if(kernel_vfs_path_release(&source))__builtin_trap();
         if(error)return error;
+    }
+    if (!strcmp(p->type, "devtmpfs")) {
+        int error = kernel_devtmpfs_mount(fs->heap, p->options, owner);
+        if (error) return error;
+        struct kernel_vfs_mount *mount = kernel_vfs_path_mount(*owner);
+        mount->detached_origin = kernel_fs_context_namespace_id(fs);
+        mount->read_only = !!(p->flags & 1U);
+        mount->nosuid = !!(p->flags & 2U);
+        mount->nodev = !!(p->flags & 4U);
+        mount->noexec = !!(p->flags & 8U);
+        mount->silent = !!(p->flags & 32768U);
+        mount->atime_policy = kernel_vfs_atime_policy(p->flags, 0, 0);
+        return 0;
     }
     if(strcmp(p->type,"tmpfs") && strcmp(p->type,"devpts") && p->options[0])return -KERNEL_ENOTSUP;
     if(disk) {
@@ -131,6 +145,10 @@ static const struct kernel_char_device context_operations={.release=context_rele
 int kernel_mount_context_open(struct kernel_heap *heap,const char *type,struct kernel_vfs_path *root,
     struct kernel_open_file_description **owner)
 {
+    if (type && !strcmp(type, "devtmpfs")) {
+        int error = kernel_loop_initialize(heap);
+        if (error) return error;
+    }
     struct mount_context *ctx=NULL;
     struct kernel_open_file_description *file=NULL;
     if(kernel_heap_allocate_zeroed(heap,1,sizeof(*ctx),(void **)&ctx))return -KERNEL_ENOMEM;
@@ -168,7 +186,7 @@ static int context_parameter(struct mount_context *ctx,unsigned command,const ch
         memcpy(p->source,value,n+1);ctx->source_set=1;return 0;
     }
     if(ctx->phase==2 || command>1)return -KERNEL_EINVAL;
-    int tmpfs=!strcmp(p->type,"tmpfs"),devpts=!strcmp(p->type,"devpts");
+    int tmpfs=!strcmp(p->type,"tmpfs") || !strcmp(p->type,"devtmpfs"),devpts=!strcmp(p->type,"devpts");
     const char *scalar=command==0?NULL:value;
     int error=tmpfs?kernel_tmpfs_check_mount_parameter(ctx->heap,key,scalar):
         devpts?kernel_devpts_check_mount_parameter(key,scalar):-KERNEL_EINVAL;

@@ -3,6 +3,7 @@
 #include <arch/mmu.h>
 #include <arch/timer.h>
 #include <kernel/dtb.h>
+#include <kernel/membarrier.h>
 #include <kernel/console.h>
 #include <kernel/page.h>
 #include <kernel/raw_lock.h>
@@ -166,6 +167,7 @@ static void consume(int interrupt)
         __atomic_fetch_or(&ordinary_ipi_seen,1U<<cpu->logical_id,__ATOMIC_RELEASE);
 #endif
     if(events&LA_IPI_DEADLINE)kernel_scheduler_deadline_changed();
+    if(events&KERNEL_IPI_MEMBARRIER)kernel_membarrier_receive();
 #if BOAROS_LA_SMP_TEST == 3
     if((events&LA_IPI_HANDSHAKE) && cpu->logical_id!=topology.count-1)
 #else
