@@ -963,6 +963,42 @@ static void fair_parallel_handoff(void)
     puts("PASS fair pair transfer races destination selection: one execution owner and delayed old-stack release");
 }
 
+static void ready_wait_migration(void)
+{
+    scheduler_test_now=1;
+    reset_two_queues();active=&cpus[0];
+    balance_running(3,0,0);balance_running(4,1,0);
+    { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+      fair_queued(0,1,0,2000000);ready_remove_locked(&tasks[0]);
+      tasks[0].arch.user_mode=1;tasks[0].tid_owned=1;
+      ready_enqueue_locked(&tasks[0],SCHED_READY_LOCAL); }
+    unsigned zero=0-KERNEL_SCHED_NICE_MIN, low=5-KERNEL_SCHED_NICE_MIN;
+    assert(cpus[0].runqueue.ready_wait_first[zero]==&tasks[0]);
+    scheduler_test_now++;
+    assert(!kernel_task_affinity_set(&tasks[0],0,2));
+    assert_ready_owner(&tasks[0],&cpus[1]);
+    assert(!cpus[0].runqueue.ready_wait_first[zero] &&
+        cpus[1].runqueue.ready_wait_first[zero]==&tasks[0] &&
+        tasks[0].ready_wait_deadline==2000002);
+
+    struct kernel_sched_attr attr={.size=56,.policy=KERNEL_SCHED_OTHER,.nice=5};
+    assert(!kernel_task_sched_setattr(&tasks[0],0,&attr));
+    assert(!cpus[1].runqueue.ready_wait_first[zero] &&
+        cpus[1].runqueue.ready_wait_first[low]==&tasks[0]);
+    attr.policy=KERNEL_SCHED_BATCH;
+    assert(!kernel_task_sched_setattr(&tasks[0],0,&attr));
+    assert(!cpus[1].runqueue.ready_wait_first[low] && !tasks[0].ready_wait_next);
+    attr.policy=KERNEL_SCHED_OTHER;
+    assert(!kernel_task_sched_setattr(&tasks[0],0,&attr));
+    active=&cpus[1];
+    struct kernel_task *next;
+    uint64_t deadline;
+    assert(scheduler_select_local(0,0,1,&next,&deadline) && next==&tasks[0]);
+    assert(!cpus[1].runqueue.ready_wait_first[low] && !tasks[0].ready_wait_next);
+    assert(scheduler_finish_local(active));
+    puts("PASS ready wait: affinity migration, nice/policy changes and local claim update the owning index");
+}
+
 static void ordinary_busy_balance(void)
 {
     scheduler_test_now=1;
@@ -1142,7 +1178,7 @@ int main(int argc,char **argv)
         return 0;
     }
     if(argc==2&&!strcmp(argv[1],"--fair-balance-only")) {
-        kernel_wait_domain_init();fair_long_queue();ordinary_busy_balance();
+        kernel_wait_domain_init();ready_wait_migration();fair_long_queue();ordinary_busy_balance();
         fair_affinity_during_balance();fair_parallel_handoff();return 0;
     }
     if(argc==2&&!strcmp(argv[1],"--slice-only")) {kernel_wait_domain_init();ordinary_local_slice();return 0;}
@@ -1159,6 +1195,7 @@ int main(int argc,char **argv)
     ordinary_wake_after_affinity_change();
     ordinary_pull();
     ordinary_local_slice();
+    ready_wait_migration();
     ordinary_busy_balance();
     fair_long_queue();
     fair_affinity_during_balance();

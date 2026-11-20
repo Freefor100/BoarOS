@@ -2744,6 +2744,20 @@ static int process_pid_namespace_drain(struct kernel_task *leader)
     }
 }
 
+static void wake_local_cleanup_locked(void)
+{
+    struct kernel_wait_queue *queue = &scheduler.cleanup_queue;
+    struct kernel_wait_token token = {0};
+    {
+        KERNEL_IRQ_LOCK_SCOPE(registrations, &queue->lock);
+        const struct kernel_wait_node *node = queue->head;
+        if (node) token = (struct kernel_wait_token){node->task, node->generation};
+    }
+    /* The cleanup queue's only waiter is the local reaper. It cannot run
+     * and retire its wait while this CPU is selecting the next task. */
+    if (token.task) (void)kernel_wait_notify_locked(&token, KERNEL_WAIT_WOKEN);
+}
+
 static void kernel_thread_finish(
     const struct kernel_thread_completion *completion)
     __attribute__((noreturn));
@@ -2821,17 +2835,26 @@ static void kernel_thread_finish(
     (void)cleanup_status;
     struct kernel_cpu *cpu = kernel_cpu_current();
     struct kernel_wait_cursor cleanup_cursor;
-    int notify_cleanup;
+    int notify_cleanup = 0;
     uint64_t next_deadline;
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         KERNEL_RUN_SET(runs);
         current->state = KERNEL_THREAD_STATE_EXITED;
         exited_append_locked(current);
-        /* The cleanup task must be runnable before choosing next. Join
-         * notification waits for switch_finish to release the old stack. */
-        notify_cleanup = kernel_wait_cursor_prepare(&scheduler.cleanup_queue, &cleanup_cursor);
         scheduler_account_runtime_locked();
+        struct kernel_task *cleanup = scheduler.cleanup_task;
+        if (cleanup && kernel_wait_queue_registrations(&scheduler.cleanup_queue)) {
+#if BOAROS_MAX_CPUS > 1
+            if (cleanup->cpu_mask != (1U << cpu->logical_id))
+                notify_cleanup = kernel_wait_cursor_prepare(&scheduler.cleanup_queue, &cleanup_cursor);
+            else
+#endif
+                wake_local_cleanup_locked();
+        }
+        /* Include the local reaper in this decision. The exiting task's
+         * stack remains owned until switch_finish runs on the new stack. */
+        (void)kernel_cpu_consume_schedule(cpu);
         next = scheduler_select_next_locked(cpu, current, scheduler.cleanup_task != 0);
         if (!next) __builtin_trap();
         next_deadline = scheduler_deadline_locked(cpu);

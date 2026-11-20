@@ -55,6 +55,92 @@ static struct kernel_sched_runqueue *cpu_queue(struct kernel_cpu *cpu)
     (void)cpu;return &scheduler.runqueue;
 #endif
 }
+
+#define READY_WAIT_NS (2 * KERNEL_SCHED_WAKE_NS)
+
+static int ready_wait_user(const struct kernel_task *task)
+{
+    if (!task || !task->arch.user_mode || task->scheduling.priority) return 0;
+#if BOAROS_USER_SMP
+    if (task->user_service) return 0;
+#endif
+    return task->scheduling.policy==KERNEL_SCHED_OTHER;
+}
+
+/* Each nice bucket is a FIFO in actual runqueue insertion order.
+ * The same runqueue lock protects it and the virtual-runtime tree. */
+static void ready_wait_append(struct kernel_sched_runqueue *queue,struct kernel_task *task)
+{
+    if (!ready_wait_user(task)) return;
+    int nice=task->scheduling.nice;
+    struct kernel_task **first=&queue->ready_wait_first[nice-KERNEL_SCHED_NICE_MIN];
+    struct kernel_task *head=*first;
+    struct kernel_task *tail=head?head->ready_wait_previous:task;
+    task->ready_wait_nice=nice;
+    task->ready_wait_deadline=kernel_time_raw_ns()+READY_WAIT_NS;
+    task->ready_wait_next=head?head:task;
+    task->ready_wait_previous=tail;
+    tail->ready_wait_next=task;
+    if (head) head->ready_wait_previous=task;
+    else *first=task;
+}
+
+static void ready_wait_remove(struct kernel_sched_runqueue *queue,struct kernel_task *task)
+{
+    struct kernel_task *next=task->ready_wait_next;
+    if (!next) return;
+    struct kernel_task **first=&queue->ready_wait_first[task->ready_wait_nice-KERNEL_SCHED_NICE_MIN];
+    if (*first==task) *first=next==task?0:next;
+    task->ready_wait_previous->ready_wait_next=next;
+    next->ready_wait_previous=task->ready_wait_previous;
+    task->ready_wait_next=0;
+#if BOAROS_MAX_CPUS > 1
+    /* This storage becomes the RT migration node if the task is boosted. */
+    task->ready_wait_previous=0;
+    task->ready_wait_deadline=0;
+#endif
+}
+
+static struct kernel_task *ready_wait_head(struct kernel_cpu *cpu,const struct kernel_task *normal)
+{
+    if (!normal || normal->scheduling.priority || normal->scheduling.policy==KERNEL_SCHED_IDLE)
+        return 0;
+#if BOAROS_MAX_CPUS > 1
+    if (normal->ready_cpu!=cpu) return 0;
+#endif
+#if BOAROS_USER_SMP
+    if (cpu->user_reservations.rt_first) return 0;
+#endif
+    return cpu_queue(cpu)->ready_wait_first[normal->scheduling.nice-KERNEL_SCHED_NICE_MIN];
+}
+
+/* At least one short execution interval separates age-driven switches when
+ * several tasks are already overdue. Virtual runtime still charges all CPU time. */
+static uint64_t ready_wait_delay(struct kernel_cpu *cpu,const struct kernel_task *oldest)
+{
+    uint64_t now=cpu->rt_bandwidth.last_account_ns;
+    uint64_t delay=oldest->ready_wait_deadline>now?oldest->ready_wait_deadline-now:0;
+    const struct kernel_sched_policy *running=&cpu->current->scheduling;
+    uint32_t slice=kernel_sched_fair_slice(running);
+    uint32_t minimum=slice<KERNEL_SCHED_WAKE_NS?slice:KERNEL_SCHED_WAKE_NS;
+    uint32_t used=running->fair_slice_used;
+    if (used<minimum && delay<minimum-used) delay=minimum-used;
+    return delay;
+}
+
+static int ready_wait_preempts(struct kernel_cpu *cpu,const struct kernel_task *oldest)
+{
+    return oldest && ready_wait_user(cpu->current) &&
+        cpu->current->scheduling.nice==oldest->scheduling.nice &&
+        !ready_wait_delay(cpu,oldest);
+}
+
+static struct kernel_task *ready_wait_pick(struct kernel_cpu *cpu,struct kernel_task *normal,
+    struct kernel_task *oldest)
+{
+    return oldest && oldest->ready_wait_deadline<=cpu->rt_bandwidth.last_account_ns?oldest:normal;
+}
+
 static void fair_place(struct kernel_task *task,struct kernel_cpu *cpu)
 {
     struct kernel_sched_runqueue *queue=cpu_queue(cpu);
@@ -441,7 +527,10 @@ static void account_cpu(struct kernel_cpu *cpu, uint64_t now)
     if (cpu->current && !cpu->current->idle) {
         struct kernel_task *task=cpu->current;
         scheduler_fair_account(task,scheduler_cpu_execution_ns(cpu,task));
-        kernel_sched_fair_advance(cpu_queue(cpu),task->scheduling.priority?0:&task->ready_node);
+        unsigned state=task->state;
+        int runnable=state==KERNEL_THREAD_STATE_RUNNING || state==KERNEL_THREAD_STATE_READY;
+        kernel_sched_fair_advance(cpu_queue(cpu),
+            runnable && !task->scheduling.priority?&task->ready_node:0);
         kernel_sched_policy_charge(&task->scheduling,delta);
     }
     kernel_rt_bandwidth_account(&cpu->rt_bandwidth, now, is_rt(cpu->current));
@@ -814,9 +903,12 @@ void ready_remove_locked(struct kernel_task *task)
 #endif
         }
     }
+    if (!task->ready_node.priority) ready_wait_remove(queue,task);
+    else task->rt_candidate=(struct kernel_sched_rt_candidate){0};
     dequeue_task(queue,&task->ready_node);
     task->ready_cpu=0;
 #else
+    ready_wait_remove(&scheduler.runqueue,task);
     dequeue_task(&scheduler.runqueue,&task->ready_node);
 #endif
 }
@@ -864,11 +956,16 @@ static void ready_enqueue_at_locked(struct kernel_task *task, int flags
 #else
     struct kernel_cpu *target=task->cpu?task->cpu:kernel_cpu_current();
     fair_place(task,target);
-    enqueue_task(&scheduler.runqueue,&task->ready_node,task,flags&SCHED_READY_HEAD);
+    struct kernel_sched_runqueue *queue=&scheduler.runqueue;
+    enqueue_task(queue,&task->ready_node,task,flags&SCHED_READY_HEAD);
 #endif
+    ready_wait_append(queue,task);
     int preempt=!target->current || target->current->idle ||
         task->scheduling.priority>target->current->scheduling.priority ||
         fair_preempts(task,target->current);
+    /* A first waiter can bring an unarmed or later timer forward. */
+    if (!task->ready_node.priority && task->ready_wait_next==task && ready_wait_user(target->current) &&
+        task->scheduling.nice==target->current->scheduling.nice) preempt=1;
 #if BOAROS_USER_SMP
     preempt |= is_rt_service(task) && !is_rt_service(target->current);
 #endif
@@ -971,7 +1068,8 @@ struct kernel_task *scheduler_select_next_locked(struct kernel_cpu *cpu,
     if (previous->state!=KERNEL_THREAD_STATE_RUNNING && previous->state!=KERNEL_THREAD_STATE_READY)
         scheduler_user_reservation_release_locked(previous);
 #endif
-    return claim_next_locked(cpu, previous, ready_allowed ? ready_best_locked() : 0);
+    struct kernel_task *next=ready_allowed?ready_best_locked():0;
+    return claim_next_locked(cpu,previous,ready_wait_pick(cpu,next,ready_wait_head(cpu,next)));
 }
 
 /* External deadlines remain actionable even while a CPU cannot switch its
@@ -1027,6 +1125,16 @@ uint64_t scheduler_deadline_locked(struct kernel_cpu *cpu)
         uint32_t slice=kernel_sched_fair_slice(&cpu->current->scheduling);
         uint32_t used=cpu->current->scheduling.fair_slice_used;
         uint64_t fair=used>=slice?1:slice-used;
+        if (ready_wait_user(cpu->current) &&
+            cpu_queue(cpu)->ready_wait_first[cpu->current->scheduling.nice-KERNEL_SCHED_NICE_MIN]) {
+            struct kernel_sched_node *first=kernel_sched_pick(cpu_queue(cpu),0);
+            struct kernel_task *oldest=ready_wait_head(cpu,first?first->owner:0);
+            if (oldest && oldest->scheduling.nice==cpu->current->scheduling.nice) {
+                uint64_t waiting=ready_wait_delay(cpu,oldest);
+                if (!waiting) waiting=1;
+                if (waiting<fair) fair=waiting;
+            }
+        }
         if(!delay||fair<delay)delay=fair;
     }
 #if BOAROS_USER_SMP
@@ -1252,20 +1360,25 @@ int scheduler_select_local(int blocked,int rotate,int voluntary,struct kernel_ta
         if (remote_rt_ready(cpu)) return 0;
         struct kernel_sched_node *head=kernel_sched_pick(&cpu->runqueue,1);
         account_cpu(cpu,kernel_time_raw_ns());
+        struct kernel_task *normal=head?head->owner:0;
+        struct kernel_task *oldest=ready_wait_head(cpu,normal);
+        struct kernel_task *next=ready_wait_pick(cpu,normal,oldest);
         if (blocked) {
             /* 唤醒在选择后继前到达时，当前栈仍归自己，无需切走再取回。 */
             if (current->wait.ready_pending && current->state==KERNEL_THREAD_STATE_READY) {
                 current->wait.ready_pending=0;
                 __atomic_store_n(&current->state,KERNEL_THREAD_STATE_RUNNING,__ATOMIC_RELAXED);
-            } else *selected=claim_next_locked(cpu,current,head?head->owner:0);
+            } else *selected=claim_next_locked(cpu,current,next);
         } else {
             (void)kernel_cpu_consume_schedule(cpu);
             rotate |= cpu->rotate_other;
             cpu->rotate_other=0;
+            int age_due=ready_wait_preempts(cpu,oldest);
             int expired=current->scheduling.fair_slice_used>=kernel_sched_fair_slice(&current->scheduling);
             if(expired)current->scheduling.fair_slice_used=0;
             int due=head && current->ready_node.fair.key>=head->fair.key;
-            if (head && (current->idle || voluntary || ((rotate||expired)&&due) || fair_preempts(head->owner,current))) {
+            if (head && (current->idle || voluntary || ((rotate||expired)&&due) ||
+                         age_due || fair_preempts(normal,current))) {
                 if (current->idle) cpu->idle_context_saved=1;
                 else {
                     if (current->wait.ready_pending) __builtin_trap();
@@ -1273,7 +1386,7 @@ int scheduler_select_local(int blocked,int rotate,int voluntary,struct kernel_ta
                     current->wait.ready_pending=1;
                     current->wait.ready_flags=SCHED_READY_LOCAL;
                 }
-                *selected=claim_next_locked(cpu,current,head->owner);
+                *selected=claim_next_locked(cpu,current,next);
             }
         }
         *deadline=scheduler_deadline_locked(cpu);
@@ -1343,7 +1456,8 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
     }
 #endif
     struct kernel_task *next = ready_best_locked();
-    int higher = next && (current == cpu->idle ||
+    struct kernel_task *oldest=ready_wait_head(cpu,next);
+    int higher = next && (ready_wait_preempts(cpu,oldest) || current == cpu->idle ||
                          next->scheduling.priority > current->scheduling.priority || fair_preempts(next,current));
     int fair_expired=!is_rt(current) && current->scheduling.fair_slice_used>=kernel_sched_fair_slice(&current->scheduling);
     if(fair_expired)current->scheduling.fair_slice_used=0;
@@ -1387,7 +1501,7 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
         if (!disallowed) current->wait.ready_flags |= SCHED_READY_LOCAL;
 #endif
     } else cpu->idle_context_saved = 1U;
-    selected = claim_next_locked(cpu, current, next);
+    selected = claim_next_locked(cpu,current,ready_wait_pick(cpu,next,oldest));
     deadline = scheduler_deadline_locked(cpu);
     }
     if (!selected) __builtin_trap();
@@ -1594,6 +1708,16 @@ static void sched_commit_locked(struct kernel_task *task,const struct kernel_sch
     }
     if(weight_changed)task->scheduling.fair_remainder=0;
     task->scheduling.policy=updated->policy;
+    if (weight_changed && task->ready_node.queued && !task->ready_node.priority) {
+        struct kernel_sched_runqueue *queue=
+#if BOAROS_MAX_CPUS > 1
+            ready_queue(task,task->ready_cpu);
+#else
+            &scheduler.runqueue;
+#endif
+        ready_wait_remove(queue,task);
+        ready_wait_append(queue,task);
+    }
 #if BOAROS_USER_SMP
     if (task->ready_node.queued && !task->ready_node.priority) {
         struct kernel_sched_runqueue *queue=ready_queue(task,task->ready_cpu);

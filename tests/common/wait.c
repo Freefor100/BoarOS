@@ -78,6 +78,48 @@ static void worker(void *argument)
     arch_interrupt_restore(irq);
 }
 #ifdef BOAROS_SCHED_LIFECYCLE
+static unsigned exit_handoff_phase;
+
+static void reap_after_exit(void *unused)
+{
+    (void)unused;
+    (void)arch_interrupt_save();
+    kernel_scheduler_register_cleanup();
+    exit_handoff_phase = 1;
+    kernel_scheduler_wait_cleanup(0);
+    check(exit_handoff_phase == 2 && !kernel_cpu_current()->switch_previous);
+    struct kernel_thread_completion completion;
+    check(kernel_scheduler_reap_one(&completion) == KERNEL_SCHEDULER_STATUS_OK);
+    exit_handoff_phase = 3;
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    scheduler.cleanup_task = 0;
+}
+
+static void exit_for_cleanup(void *unused)
+{
+    (void)unused;
+    check(exit_handoff_phase == 1);
+    exit_handoff_phase = 2;
+}
+
+static void cleanup_exit_handoff(struct physical_page_allocator *allocator)
+{
+    uint64_t baseline = physical_page_available(allocator);
+    check(kernel_thread_create(reap_after_exit, 0) == KERNEL_SCHEDULER_STATUS_OK);
+    check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK);
+    check(exit_handoff_phase == 1 && scheduler.cleanup_task &&
+          kernel_wait_record_phase(&scheduler.cleanup_task->wait) == KERNEL_WAIT_COMMITTED);
+
+    check(kernel_thread_create(exit_for_cleanup, 0) == KERNEL_SCHEDULER_STATUS_OK);
+    check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK);
+    /* With no other runnable task, exit should switch directly to the reaper. */
+    check(exit_handoff_phase == 3 && !scheduler.cleanup_task);
+    struct kernel_thread_completion completion;
+    check(kernel_scheduler_reap_one(&completion) == KERNEL_SCHEDULER_STATUS_OK);
+    check(physical_page_available(allocator) == baseline);
+    say("SCHED exit handoff passed: direct switch to reaper and stack release\n");
+}
+
 static struct kernel_task *held_task;
 static unsigned cleanup_phase;
 static void cleanup_probe(void *unused)
@@ -134,6 +176,8 @@ static void cleanup_owner_progress(struct physical_page_allocator *allocator)
     check(held_task->state == KERNEL_THREAD_STATE_EXITED && !held_task->wait.on_cpu);
     cleanup_phase = 0;
     check(kernel_thread_create(cleanup_probe, 0) == KERNEL_SCHEDULER_STATUS_OK);
+    check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK);
+    check(cleanup_phase == 1);
     check(kernel_thread_create(release_probe, 0) == KERNEL_SCHEDULER_STATUS_OK);
     check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK);
     check(cleanup_phase == 4 && !held_task && !scheduler.cleanup_task && !join.task);
@@ -204,6 +248,7 @@ static void run(struct physical_page_allocator *allocator)
     check(physical_page_allocator_audit(allocator) == PHYSICAL_PAGE_STATUS_OK);
 #ifdef BOAROS_SCHED_LIFECYCLE
     lifecycle(allocator);
+    cleanup_exit_handoff(allocator);
     cleanup_owner_progress(allocator);
 #endif
     say("WAIT native passed: first-entry, pre-switch wake, timeout, exit and owner baseline\n");
