@@ -33,6 +33,8 @@ enum kernel_uaccess_status kernel_copy_string_from_user(
 
 ## 范围、权限与部分复制
 
+RISC-V 直接复制路径向用户空间写入时，每轮先读齐四个内核机器字，再连续写入用户地址，减少源和目标地址转换交替竞争。每条用户存储指令各有异常恢复点，恢复时按已经完成的存储报告前缀。
+
 非零固定长度请求首先验证整个半开区间位于构建期架构用户范围 `[0, ARCH_MMU_USER_LIMIT)`（RV 为 2^38，LA 为 2^47）；整数溢出或越过上限在复制前返回 `KERNEL_UACCESS_STATUS_FAULT`，`bytes_copied=0`。零长度请求不检查用户地址或内核 buffer，直接成功并报告 0。
 
 合法范围按构建期基页边界切分（RV 4 KiB、LA 16 KiB）。每个片段先经 `kernel_mm_pin_user_page()` 查询物理地址、验证通用权限并取得实际物理页引用；若 PTE 尚未驻留或需要 COW，uaccess 用实际读/写方向调用 `kernel_mm_resolve_user_fault()`，成功后重新 pin。anonymous `DEMAND_ZERO`、file-private 和 COW 页都复用该解析器。写入用户空间要求 `USER|WRITE`，读取用户空间要求 `USER|READ`，随后通过物理页分配器已绑定的 direct-map 访问函数复制。VMA 外、`PROT_NONE`、权限不足、文件整页越过 EOF 或缺页解析得到 `NO_MEMORY` 时返回 `FAULT`；MM 状态、页表结构、设备故障或已映射物理页无法解析返回 `STATE`，不能把真正的内核对象损坏伪装成普通用户 `EFAULT`。

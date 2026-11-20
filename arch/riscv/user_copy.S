@@ -49,6 +49,22 @@ riscv_uaccess_fixups_start:
     bnez t1,.Lword\@
 .Lread0\@:
     ld t0,0(a1)
+    .if \to_user
+    /* Kernel source words are already in range. Read all four before
+     * touching the user mapping so alternating translations cannot evict
+     * each other on every word. Each user store has its own fixup. */
+    ld t2,8(a1)
+    ld t3,16(a1)
+    ld t4,24(a1)
+.Lwrite0\@:
+    sd t0,0(a0)
+.Lwrite8\@:
+    sd t2,8(a0)
+.Lwrite16\@:
+    sd t3,16(a0)
+.Lwrite24\@:
+    sd t4,24(a0)
+    .else
 .Lwrite0\@:
     sd t0,0(a0)
 .Lread8\@:
@@ -63,6 +79,7 @@ riscv_uaccess_fixups_start:
     ld t0,24(a1)
 .Lwrite24\@:
     sd t0,24(a0)
+    .endif
     addi a0,a0,32
     addi a1,a1,32
     addi a2,a2,-32
