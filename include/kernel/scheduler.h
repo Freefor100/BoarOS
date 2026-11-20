@@ -240,6 +240,8 @@ enum kernel_scheduler_status kernel_wait_prepare(struct kernel_wait_queue *,
     uint64_t deadline, int interruptible, struct kernel_wait_token *);
 enum kernel_scheduler_status kernel_wait_prepare_realtime(struct kernel_wait_queue *,
     uint64_t nanoseconds, int interruptible, struct kernel_wait_token *);
+enum kernel_scheduler_status kernel_wait_prepare_monotonic(struct kernel_wait_queue *,
+    uint64_t nanoseconds, int interruptible, struct kernel_wait_token *);
 int kernel_scheduler_set_realtime(uint64_t nanoseconds);
 enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *,
     enum kernel_wait_wake_reason *);

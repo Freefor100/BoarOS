@@ -51,7 +51,6 @@ _Static_assert(sizeof(struct kernel_sigset_argpack) == 16U,
 static int poll_compute_deadline(
     struct kernel_mm *mm,
     uint64_t user_timeout,
-    uint64_t *out_deadline,
     int *out_has_timeout,
     int *out_immediate,
     uint64_t *out_target_monotonic_ns,
@@ -64,7 +63,6 @@ static int poll_compute_deadline(
     if (user_timeout == 0U) {
         *out_has_timeout = 0;
         *out_immediate = 0;
-        *out_deadline = 0U;
         *out_target_monotonic_ns = 0U;
         *out_zero_timeout = 0;
         return 0;
@@ -83,7 +81,6 @@ static int poll_compute_deadline(
     }
     if (ts.tv_sec == 0 && ts.tv_nsec == 0) {
         *out_immediate = 1;
-        *out_deadline = 0U;
         *out_target_monotonic_ns = 0U;
         *out_zero_timeout = 1;
         return 0;
@@ -96,22 +93,7 @@ static int poll_compute_deadline(
         uint64_t duration_ns =
             requested > (unsigned __int128)INT64_MAX ? (uint64_t)INT64_MAX
                                                      : (uint64_t)requested;
-        uint64_t now_ns = kernel_time_monotonic_ns();
-        uint64_t target_monotonic_ns =
-            duration_ns > (uint64_t)INT64_MAX - now_ns ? (uint64_t)INT64_MAX
-                                                       : now_ns + duration_ns;
-        *out_target_monotonic_ns = target_monotonic_ns;
-        enum kernel_time_status time_status =
-            kernel_time_deadline_from_monotonic(target_monotonic_ns,
-                                                out_deadline);
-        if (time_status == KERNEL_TIME_STATUS_DEADLINE_PASSED) {
-            *out_immediate = 1;
-            *out_deadline = 0U;
-            return 0;
-        }
-        if (time_status != KERNEL_TIME_STATUS_OK) {
-            return -KERNEL_EINVAL;
-        }
+        *out_target_monotonic_ns = kernel_time_monotonic_after(duration_ns);
     }
     *out_immediate = 0;
     return 0;
@@ -226,7 +208,7 @@ static int core_poll_run(
     struct kernel_task *task,
     struct kernel_pollfd *pfds,
     uint32_t nfds,
-    uint64_t deadline,
+    uint64_t target_monotonic_ns,
     int immediate,
     int mask_modified,
     uint64_t saved_mask)
@@ -284,7 +266,10 @@ static int core_poll_run(
         uintptr_t saved_intr = arch_interrupt_save();
         struct kernel_wait_token token;
         enum kernel_wait_wake_reason reason = KERNEL_WAIT_WOKEN;
-        if (kernel_wait_prepare(0, deadline, 1, &token) != KERNEL_SCHEDULER_STATUS_OK) {
+        enum kernel_scheduler_status prepared=target_monotonic_ns ?
+            kernel_wait_prepare_monotonic(0,target_monotonic_ns,1,&token) :
+            kernel_wait_prepare(0,0,1,&token);
+        if (prepared != KERNEL_SCHEDULER_STATUS_OK) {
             error = -KERNEL_EIO;
             arch_interrupt_restore(saved_intr);
             break;
@@ -346,7 +331,6 @@ enum kernel_files_status kernel_files_ppoll(
     struct kernel_pollfd stack_pfds[KERNEL_POLL_STACK_CAPACITY];
     struct kernel_pollfd *pfds = stack_pfds;
     void *heap_pfds = 0;
-    uint64_t deadline = 0U;
     uint64_t target_monotonic_ns = 0U;
     int has_timeout = 0;
     int zero_timeout = 0;
@@ -365,7 +349,6 @@ enum kernel_files_status kernel_files_ppoll(
 
     err = poll_compute_deadline(mm,
                                 user_timeout,
-                                &deadline,
                                 &has_timeout,
                                 &immediate,
                                 &target_monotonic_ns,
@@ -427,7 +410,7 @@ enum kernel_files_status kernel_files_ppoll(
                             task,
                             pfds,
                             (uint32_t)nfds,
-                            deadline,
+                            target_monotonic_ns,
                             immediate,
                             mask_modified,
                             saved_mask);
@@ -483,7 +466,6 @@ enum kernel_files_status kernel_files_pselect6(
     struct kernel_pollfd stack_pfds[KERNEL_POLL_STACK_CAPACITY];
     struct kernel_pollfd *pfds = stack_pfds;
     void *heap_pfds = 0;
-    uint64_t deadline = 0U;
     uint64_t target_monotonic_ns = 0U;
     int has_timeout = 0;
     int zero_timeout = 0;
@@ -527,7 +509,6 @@ enum kernel_files_status kernel_files_pselect6(
 
     err = poll_compute_deadline(mm,
                                 user_timeout,
-                                &deadline,
                                 &has_timeout,
                                 &immediate,
                                 &target_monotonic_ns,
@@ -659,7 +640,7 @@ enum kernel_files_status kernel_files_pselect6(
                         task,
                         pfds,
                         count,
-                        deadline,
+                        target_monotonic_ns,
                         immediate,
                         mask_modified,
                         saved_mask);

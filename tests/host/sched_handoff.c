@@ -107,6 +107,7 @@ void *sync_test_current_task(void) { return cpu.current; }
 void sync_test_current_task_set(void *task) { cpu.current = task; }
 uintptr_t sync_test_stack(void) { return cpu.current->stack_high - 16; }
 uint64_t kernel_time_monotonic_ns(void) { return 1; }
+uint64_t kernel_time_raw_ns(void) { return 1; }
 uint64_t kernel_time_ticks_to_ns(uint64_t ticks) { return ticks; }
 uint32_t kernel_time_is_initialized(void) { return 1; }
 enum kernel_mm_status kernel_mm_resolve_owned_user_fault(struct kernel_mm *mm, struct kernel_task *task,
@@ -117,6 +118,8 @@ enum riscv_timer_status riscv_timer_set_scheduler_deadline(uint64_t deadline)
 { assert(!cpu.raw_locks);timer_request=deadline;return RISCV_TIMER_STATUS_NOT_STARTED; }
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t ns, uint64_t *ticks)
 { *ticks = ns; return KERNEL_TIME_STATUS_OK; }
+enum kernel_time_status kernel_time_deadline_from_raw(uint64_t ns,uint64_t *ticks)
+{ return kernel_time_deadline_from_monotonic(ns,ticks); }
 enum kernel_time_status kernel_time_deadline_from_realtime(uint64_t ns,uint64_t *ticks)
 { return kernel_time_deadline_from_monotonic(ns,ticks); }
 

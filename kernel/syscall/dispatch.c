@@ -209,6 +209,10 @@ static enum kernel_syscall_status __attribute__((noinline, cold)) dispatch_addit
     case 84U:
         status = syscall_handle_sync_file_range(caller, request, &decoded);
         break;
+    case 171U:
+    case 266U:
+        status = syscall_handle_adjtimex(caller, request, &decoded);
+        break;
     default:
         decoded = (struct kernel_syscall_result){
             .action = KERNEL_SYSCALL_ACTION_RETURN, .value = -KERNEL_ENOSYS,

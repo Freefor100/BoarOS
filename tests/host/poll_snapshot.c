@@ -4,6 +4,7 @@
 #include <stdint.h>
 #define BOAROS_ARCH_CONTEXT_H
 static void *arch_current_cpu_get(void) { return NULL; }
+static inline void *arch_current_thread_get(void) { return NULL; }
 static uintptr_t arch_interrupt_save(void) { return 0; }
 static void arch_interrupt_restore(uintptr_t saved) { (void)saved; }
 #ifndef POLL_SOURCE
@@ -49,6 +50,9 @@ enum kernel_scheduler_status kernel_wait_prepare(struct kernel_wait_queue *q,uin
 { (void)q;(void)i;CHECK(!live);wait_deadline=d;*t=(struct kernel_wait_token){0};live++;return KERNEL_SCHEDULER_STATUS_OK; }
 enum kernel_scheduler_status kernel_wait_node_bind(struct kernel_wait_queue *q,struct kernel_wait_node *n,const struct kernel_wait_token *t)
 { (void)n;(void)t;CHECK(q==&queue && live==1);binds++;if(at_bind)readable=1;return KERNEL_SCHEDULER_STATUS_OK; }
+enum kernel_scheduler_status kernel_wait_prepare_monotonic(struct kernel_wait_queue *q,
+    uint64_t target,int interruptible,struct kernel_wait_token *token)
+{ return kernel_wait_prepare(q,target,interruptible,token); }
 enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *t,enum kernel_wait_wake_reason *r)
 { (void)t;CHECK(live==1);parks++;if(at_park)readable=1;*r=signalled?KERNEL_WAIT_SIGNALLED:(at_park?KERNEL_WAIT_WOKEN:KERNEL_WAIT_TIMEOUT);if(*r==KERNEL_WAIT_TIMEOUT && wait_deadline>now_ns)now_ns=wait_deadline;return KERNEL_SCHEDULER_STATUS_OK; }
 enum kernel_scheduler_status kernel_wait_finish(struct kernel_wait_token *t)

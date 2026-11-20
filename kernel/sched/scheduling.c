@@ -453,9 +453,9 @@ void scheduler_account_runtime_locked(void)
     struct kernel_cpu *cpu=kernel_cpu_current();
     struct kernel_raw_guard guard __attribute__((cleanup(kernel_raw_scope_release)))={0};
     if (!kernel_raw_lock_owned(kernel_run_lock(cpu))) kernel_raw_lock_acquire(kernel_run_lock(cpu),&guard);
-    account_cpu(cpu,kernel_time_monotonic_ns());
+    account_cpu(cpu,kernel_time_raw_ns());
 #else
-    account_cpu(kernel_cpu_current(), kernel_time_monotonic_ns());
+    account_cpu(kernel_cpu_current(), kernel_time_raw_ns());
 #endif
 }
 
@@ -1041,7 +1041,7 @@ uint64_t scheduler_deadline_locked(struct kernel_cpu *cpu)
     if (delay && kernel_time_is_initialized()) {
         uint64_t now = cpu->rt_bandwidth.last_account_ns;
         uint64_t target = UINT64_MAX - now < delay ? UINT64_MAX : now + delay;
-        enum kernel_time_status status = kernel_time_deadline_from_monotonic(target, &deadline);
+        enum kernel_time_status status = kernel_time_deadline_from_raw(target, &deadline);
         if (status == KERNEL_TIME_STATUS_DEADLINE_PASSED) deadline = arch_time_read() + 1U;
         else if (status != KERNEL_TIME_STATUS_OK) __builtin_trap();
     }
@@ -1135,7 +1135,7 @@ static __attribute__((noinline)) int try_pull_ordinary(struct kernel_cpu *cpu,
                 break;
             }
             if (next) {
-                account_cpu(cpu,kernel_time_monotonic_ns());
+                account_cpu(cpu,kernel_time_raw_ns());
                 if (current->idle) cpu->idle_context_saved=1;
                 if (!blocked) (void)kernel_cpu_consume_schedule(cpu);
                 next=claim_next_locked(cpu,current,next);
@@ -1182,7 +1182,7 @@ static uint32_t fair_balance_stage(struct kernel_cpu *cpu,struct kernel_fair_lin
 static __attribute__((noinline)) void balance_ordinary(struct kernel_cpu *cpu)
 {
     if (!__atomic_load_n(&cpu->pullable_ready,__ATOMIC_RELAXED)) return;
-    uint64_t now=kernel_time_monotonic_ns();
+    uint64_t now=kernel_time_raw_ns();
     struct kernel_fair_link batch={&batch,&batch};
     uint32_t targets;
     unsigned start;
@@ -1251,7 +1251,7 @@ int scheduler_select_local(int blocked,int rotate,int voluntary,struct kernel_ta
         if (!local_queue_eligible(cpu,current,blocked)) return 0;
         if (remote_rt_ready(cpu)) return 0;
         struct kernel_sched_node *head=kernel_sched_pick(&cpu->runqueue,1);
-        account_cpu(cpu,kernel_time_monotonic_ns());
+        account_cpu(cpu,kernel_time_raw_ns());
         if (blocked) {
             /* 唤醒在选择后继前到达时，当前栈仍归自己，无需切走再取回。 */
             if (current->wait.ready_pending && current->state==KERNEL_THREAD_STATE_READY) {
@@ -1509,7 +1509,7 @@ void scheduler_pi_priority_locked(struct kernel_task *task,unsigned base,unsigne
     /* 未改变实际执行优先级时，owner交接不产生新的CPU记账边界。 */
     if(move && task->wait.on_cpu) {
         if(!task->cpu)__builtin_trap();
-        if(task->cpu->current==task)account_cpu(task->cpu,kernel_time_monotonic_ns());
+        if(task->cpu->current==task)account_cpu(task->cpu,kernel_time_raw_ns());
     }
     int queued=task->ready_node.queued;
 #if BOAROS_MAX_CPUS > 1
@@ -1582,7 +1582,7 @@ static void sched_commit_locked(struct kernel_task *task,const struct kernel_sch
         task->scheduling.reset_on_fork=updated->reset_on_fork;return;
     }
     if(task->wait.on_cpu && task->cpu) {
-        if(task->cpu->current==task)account_cpu(task->cpu,kernel_time_monotonic_ns());
+        if(task->cpu->current==task)account_cpu(task->cpu,kernel_time_raw_ns());
         else if(task->cpu->accounting_owner==task)
             scheduler_fair_account(task,scheduler_cpu_execution_ns(task->cpu,task));
     }
@@ -1772,7 +1772,7 @@ int kernel_scheduler_rt_bandwidth_set(int runtime_field, int64_t value)
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         KERNEL_RUN_SET(runs);
-        uint64_t now = kernel_time_monotonic_ns();
+        uint64_t now = kernel_time_raw_ns();
         uint64_t old_period = scheduler.rt_configuration.period_ns;
         for (struct kernel_cpu *cpu = scheduler.cpus; cpu; cpu = cpu->scheduler_next)
 #if BOAROS_MAX_CPUS > 1

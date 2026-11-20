@@ -651,46 +651,6 @@ enum kernel_files_status kernel_files_epoll_ctl(
     return KERNEL_FILES_STATUS_OK;
 }
 
-static int epoll_calculate_deadline(
-    int32_t timeout_ms,
-    int *out_has_timeout,
-    int *out_immediate,
-    uint64_t *out_deadline)
-{
-    if (timeout_ms < 0) {
-        *out_has_timeout = 0;
-        *out_immediate = 0;
-        *out_deadline = 0U;
-        return 0;
-    }
-    if (timeout_ms == 0) {
-        *out_has_timeout = 1;
-        *out_immediate = 1;
-        *out_deadline = 0U;
-        return 0;
-    }
-    *out_has_timeout = 1;
-    {
-        uint64_t duration_ns = (uint64_t)timeout_ms * 1000000ULL;
-        uint64_t now_ns = kernel_time_monotonic_ns();
-        uint64_t target_monotonic_ns =
-            duration_ns > (uint64_t)INT64_MAX - now_ns ? (uint64_t)INT64_MAX
-                                                       : now_ns + duration_ns;
-        enum kernel_time_status time_status =
-            kernel_time_deadline_from_monotonic(target_monotonic_ns, out_deadline);
-        if (time_status == KERNEL_TIME_STATUS_DEADLINE_PASSED) {
-            *out_immediate = 1;
-            *out_deadline = 0U;
-            return 0;
-        }
-        if (time_status != KERNEL_TIME_STATUS_OK) {
-            return -KERNEL_EINVAL;
-        }
-    }
-    *out_immediate = 0;
-    return 0;
-}
-
 static int epoll_setup_sigmask(
     struct kernel_mm *mm,
     struct kernel_task *task,
@@ -991,7 +951,7 @@ static enum kernel_files_status epoll_pwait_deadline(
     int64_t epfd,
     uint64_t user_events,
     int32_t maxevents,
-    int immediate, uint64_t deadline,
+    int immediate, uint64_t target_ns,
     uint64_t user_sigmask,
     size_t sigsetsize,
     int64_t *linux_result)
@@ -1054,10 +1014,10 @@ static enum kernel_files_status epoll_pwait_deadline(
         {
             enum kernel_wait_wake_reason wake_reason = KERNEL_WAIT_WOKEN;
             EPOLL_STATE(saved_intr);
-            uint64_t sleep_deadline = deadline;
             struct kernel_wait_token token;
-            enum kernel_scheduler_status sched_status = kernel_wait_prepare(
-                &epoll->wait_queue, sleep_deadline, 1, &token);
+            enum kernel_scheduler_status sched_status = target_ns ?
+                kernel_wait_prepare_monotonic(&epoll->wait_queue,target_ns,1,&token) :
+                kernel_wait_prepare(&epoll->wait_queue,0,1,&token);
             if (sched_status == KERNEL_SCHEDULER_STATUS_OK) {
                 int ready = !epoll->scan_owner && epoll->ready_head;
                 uintptr_t interrupts=epoll_state_unlock_wait(&saved_intr);
@@ -1096,11 +1056,9 @@ enum kernel_files_status kernel_files_epoll_pwait(struct kernel_files *files,
     uint64_t events, int32_t maxevents, int32_t timeout,
     uint64_t mask, size_t sigsetsize, int64_t *result)
 {
-    int has_timeout=0, immediate=0;uint64_t deadline=0;
-    int error=epoll_calculate_deadline(timeout,&has_timeout,&immediate,&deadline);
-    if(error){*result=error;return KERNEL_FILES_STATUS_OK;}
+    uint64_t target_ns=timeout>0 ? kernel_time_monotonic_after((uint64_t)timeout*1000000) : 0;
     return epoll_pwait_deadline(files,mm,task,epfd,events,maxevents,
-        immediate,deadline,mask,sigsetsize,result);
+        timeout==0,target_ns,mask,sigsetsize,result);
 }
 
 enum kernel_files_status kernel_files_epoll_pwait2(struct kernel_files *files,
@@ -1108,7 +1066,7 @@ enum kernel_files_status kernel_files_epoll_pwait2(struct kernel_files *files,
     uint64_t events, int32_t maxevents, uint64_t user_timeout,
     uint64_t mask, size_t sigsetsize, int64_t *result)
 {
-    int immediate=0;uint64_t deadline=0;
+    int immediate=0;uint64_t target_ns=0;
     if(user_timeout) {
         struct {int64_t sec,nsec;} timeout;
         size_t copied=0;
@@ -1122,13 +1080,9 @@ enum kernel_files_status kernel_files_epoll_pwait2(struct kernel_files *files,
         if(!immediate) {
             uint64_t duration=(uint64_t)timeout.sec>((uint64_t)INT64_MAX-(uint64_t)timeout.nsec)/1000000000U
                 ? (uint64_t)INT64_MAX : (uint64_t)timeout.sec*1000000000U+(uint64_t)timeout.nsec;
-            uint64_t now=kernel_time_monotonic_ns();
-            uint64_t target=duration>UINT64_MAX-now?UINT64_MAX:now+duration;
-            enum kernel_time_status status=kernel_time_deadline_from_monotonic(target,&deadline);
-            if(status==KERNEL_TIME_STATUS_DEADLINE_PASSED) immediate=1;
-            else if(status!=KERNEL_TIME_STATUS_OK){*result=-KERNEL_EINVAL;return KERNEL_FILES_STATUS_OK;}
+            target_ns=kernel_time_monotonic_after(duration);
         }
     }
     return epoll_pwait_deadline(files,mm,task,epfd,events,maxevents,
-        immediate,deadline,mask,sigsetsize,result);
+        immediate,target_ns,mask,sigsetsize,result);
 }

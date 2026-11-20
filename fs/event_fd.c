@@ -150,7 +150,7 @@ static void timer_reindex(struct kernel_avl_node *node)
     struct kernel_timer_fd *timer=(void *)((char *)node- offsetof(struct kernel_timer_fd,deadline));
     timer_insert(timer);
 }
-void kernel_timer_fd_clock_changed(void)
+void kernel_timer_fd_reindex(int wall_step)
 {
     /* Clock setters serialize these batches; settime and close use timer_lock. */
     struct kernel_timer_fd *notifications=0;
@@ -158,7 +158,7 @@ void kernel_timer_fd_clock_changed(void)
         KERNEL_RAW_SCOPE(guard,&timer_lock);
         struct kernel_avl_node *old=timer_root;timer_root=0;timer_reindex(old);timer_publish();
         uint64_t offset=kernel_time_boot_realtime_offset();
-        for(struct kernel_timer_fd *timer=cancel_timers;timer;timer=timer->cancel_next) {
+        for(struct kernel_timer_fd *timer=wall_step?cancel_timers:0;timer;timer=timer->cancel_next) {
             if(!timer->canceled&&timer->cancel_offset==offset)continue;
             timer->canceled=1;timer->event.count++;
             /* Close waits for these borrows, including before cursor setup. */
@@ -177,6 +177,7 @@ void kernel_timer_fd_clock_changed(void)
     }
     kernel_timer_fd_expire(arch_time_read());timer_changed();
 }
+void kernel_timer_fd_clock_changed(void) { kernel_timer_fd_reindex(1); }
 static enum kernel_files_status install_event(struct kernel_files *files,
     struct kernel_event_fd *event, uint32_t flags, int64_t *result)
 {

@@ -1,4 +1,5 @@
 #include <kernel/time.h>
+#include <kernel/timex.h>
 #include <kernel/errno.h>
 #include <kernel/posix_timer.h>
 #include <arch/context.h>
@@ -435,18 +436,31 @@ enum kernel_scheduler_status kernel_scheduler_wake_signal(struct kernel_task *ta
 /* Only the rare clock-control path walks tasks. Normal waits retain the
  * deadline AVL and do not acquire an extra clock lock. PREPARED requests are
  * owned by their caller and recompute under this same domain at commit. */
-int kernel_scheduler_set_realtime(uint64_t ns)
+static void reindex_clock_waits_locked(void)
 {
-    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-    if (kernel_time_set_realtime(ns)!=KERNEL_TIME_STATUS_OK) return -KERNEL_EINVAL;
     for (struct kernel_task *task=scheduler.all_tasks;task;task=task->all_next) {
-        if (!task->deadline_indexed || !task->wait.realtime_deadline) continue;
+        if (!task->deadline_indexed || !task->wait.convert_deadline) continue;
         deadline_index_remove(task);
-        enum kernel_time_status status=kernel_time_deadline_from_realtime(
-            task->wait.realtime_deadline,&task->wait.deadline);
+        enum kernel_time_status status=task->wait.convert_deadline(
+            task->wait.clock_deadline,&task->wait.deadline);
         if (status==KERNEL_TIME_STATUS_DEADLINE_PASSED) task->wait.deadline=arch_time_read()+1;
         else if (status!=KERNEL_TIME_STATUS_OK) __builtin_trap();
         deadline_index_insert(task);
     }
+}
+
+int kernel_scheduler_set_realtime(uint64_t ns)
+{
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    if (kernel_time_set_realtime(ns)!=KERNEL_TIME_STATUS_OK) return -KERNEL_EINVAL;
+    reindex_clock_waits_locked();
     return 0;
+}
+
+int kernel_scheduler_adjust_time(struct kernel_timex *tx,enum kernel_clock_change *change)
+{
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    int result=kernel_time_adjust(tx,change);
+    if (result>=0 && *change!=KERNEL_CLOCK_UNCHANGED) reindex_clock_waits_locked();
+    return result;
 }
