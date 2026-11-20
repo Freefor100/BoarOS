@@ -86,7 +86,7 @@ enum kernel_vma_fault_policy {
     KERNEL_VMA_FAULT_HUGETLB,
 };
 
-/* A value copy; callers must not retain backing as a standalone owner. */
+/* A value copy; backing and its owner may only be borrowed with MM protection. */
 struct kernel_vma {
     uint64_t start;
     uint64_t end;
@@ -98,11 +98,19 @@ struct kernel_vma {
     enum kernel_vma_fault_policy fault_policy;
     uint32_t flags;
     void *backing;
-    struct kernel_shm_attachment *shm_attachment;
+    /* Source owner for file/ELF/object mappings, attachment for SysV mappings. */
+    void *backing_owner;
     /* VM_MAYWRITE mappings charge their sealable file or shared object.
      * The MM backing OFD owns the counter until all such VMAs are gone. */
     uint64_t *shared_write_bytes;
 };
+
+static inline struct kernel_shm_attachment *kernel_vma_shm_attachment(const struct kernel_vma *vma)
+{
+    if (vma->kind == KERNEL_VMA_KIND_SYSV_SHM || vma->kind == KERNEL_VMA_KIND_HUGETLB_SHARED)
+        return vma->backing_owner;
+    return 0;
+}
 
 static inline int kernel_vma_grows_down(const struct kernel_vma *vma)
 {
@@ -253,4 +261,6 @@ enum kernel_vma_status kernel_vma_set_trim_end(
  * changing ranges or taking ownership of either object. */
 enum kernel_vma_status kernel_vma_set_rebind_backing(struct kernel_vma_set *,
     const void *old_backing, void *new_backing);
+/* Only for an unpublished fork child; the backing and range do not change. */
+void kernel_vma_set_rebind_source_owner(struct kernel_vma_set *, uint32_t index, void *new_owner);
 #endif

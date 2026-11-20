@@ -1,6 +1,6 @@
 # 虚拟内存区域（VMA）模块
 
-本文描述用户地址空间的逻辑区间元数据。页表格式与硬件失效见 [RISC-V Sv39 分页模块](riscv-sv39.md)，MM owner 生命周期见 [内核 MM 模块](kernel-mm.md)。
+虚拟内存区域（Virtual Memory Area，VMA）记录用户地址空间的逻辑区间。页表格式与硬件失效见 [RISC-V Sv39 分页模块](riscv-sv39.md)，内存管理（Memory Management，MM）对象的生命周期见 [内核 MM 模块](kernel-mm.md)。
 
 ## 范围与入口
 
@@ -8,7 +8,7 @@
 |---|---|
 | `include/kernel/vma.h`、`mm/vma.c` | VMA 描述符、排序集合、查找/选址以及准备—提交式区间编辑 |
 | `include/kernel/mm.h`、`mm/mm.c` | 匿名/文件私有/文件共享/对象共享 `mmap`、`mremap`、`munmap`、`mprotect`、`msync`、`brk` 和缺页解析 |
-| `arch/riscv/elf_image.c`、`arch/riscv/mm.c` | 登记 source-backed ELF、栈 reserve、随机 mmap ceiling 与初始 heap 布局 |
+| `arch/riscv/elf_image.c`、`arch/riscv/mm.c` | 登记可执行与可链接格式（Executable and Linkable Format，ELF）的映射来源、栈预留区、随机映射上界与初始堆布局 |
 | `tests/riscv/vma_cases.c`、`tests/riscv/vma.sh` | 区间语义、失败原子性、fork 与缺页 |
 
 一个 VMA 用半开区间 `[start, end)`、R/W/X 权限、kind、role、fault policy 和可选 backing 表示一段逻辑有效的用户地址。PTE 只表示其中已经驻留的体系结构页（RV64 为 4 KiB，LA64 为 16 KiB）；没有 PTE 不等于没有 VMA。`ELF_PRIVATE/ELF` 用不可变 ELF source 和 `backing_offset` 描述专用按需装载，`DEMAND_ZERO` 用于栈、heap 和私有匿名 mmap，`ANON_SHARED` 用共享匿名对象与页偏移描述跨 fork 的后备页；`FILE_PRIVATE` 与 `FILE_SHARED` 都用 OFD backing 和文件偏移，`OBJECT_SHARED` 用 OFD 与对象偏移保留 BPF map；页在 mmap 时装入，丢弃后的缺页返回 SIGBUS（[生命周期](kernel-mm.md#bpf-对象共享映射)）；所有 VMA 另记 `maximum_permissions`，与当前 R/W/X 分开；共享文件只读 fd 和 `SHM_RDONLY` 附件不保留 WRITE 上限。guard 和被 `munmap` 的洞不属于任何 VMA。
@@ -89,5 +89,7 @@ make test-riscv
 当前实现共享匿名、普通文件 private/shared mapping 与 `msync`，支持 best-effort `MAP_POPULATE` 预填，以及 RISC-V USER_SMP 下的两核匿名缺页、用户复制和 TLB 失效协议；尚无全局内存承诺 accounting 或 VMA 数量上限。ELF source-backed demand paging 和 RISC-V Sv39 ASLR 已接入；没有任何随机材料时沿用确定性布局；仅有 DTB 材料时的随机布局不构成可信安全保证。`MAP_STACK` 目前只是兼容性标志，不改变增长方向；`MAP_NORESERVE` 与全局尚无 commit accounting 的当前策略等价。
 
 ## 文件缺页跨 I/O 等待
+
+VMA 直接保存文件或 ELF 来源登记的指针。缺页、范围同步和缓存建议等操作在地址空间保护内从区域取得该登记。拆分、合并和移动区域时沿用登记。创建子地址空间时，`fork` 为每个被继承的来源建立一份子登记，并在子地址空间可用前逐个绑定其区域。地址空间通过活动和退休链表持有登记。最后一个使用该来源的区域撤销后，登记退出活动链表，已经借用它的操作归还后才释放来源。
 
 文件 source 登记有独立在途操作 pin，覆盖缺页与 `msync`；ELF source 保留 fault pin。`msync` 在首个 inode 等待前 pin，直到范围同步与 OFD 错误游标访问完成后才 unpin，再清理未使用来源。最后映射并发撤销不释放被 pin 的 OFD，真实 close 失败留在 MM registry，遍历每段时重新查当前 VMA。缺页先保存 VMA generation 和 source owner，在发布任何 PTE 前完成文件 I/O；返回后重新验证 VMA 版本、大小、页状态及同地址 PTE。并发 unmap/固定替换不能发布旧映射；另一线程已满足同一缺页时视为成功并执行本地失效。截断由 inode 锁与发布阶段互斥，元数据分配只做干净回收，避免发布中途递归存储等待。source 清理等待在途操作，清理发生等待后重新定位 registry 链接，不能使用过期前驱。`make test-io-sleep-riscv` 的三任务交错覆盖 inode 持锁等待、最后撤映射、终止请求、同步/关闭错误及最终清理；`tests/riscv/files_main.c` 的确定性交错覆盖 I/O 期间 unmap 和另一线程先发布同一页。

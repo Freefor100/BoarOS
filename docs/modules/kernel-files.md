@@ -697,6 +697,12 @@ RV64／LA64 使用 `inotify_init1`、`inotify_add_watch` 和 `inotify_rm_watch`�
 最后使用者归还时发送 `IN_DELETE_SELF`，文件系统退役时发送 `IN_UNMOUNT`，
 两者都撤除监视并发送 `IN_IGNORED`。共享映射中的内存写入不产生 inotify 写事件。
 
+`inotify_rm_watch` 在文件描述符所属的监视组内查找监视描述符。描述符的低 8 位选择
+256 个哈希桶之一，每桶最多挂入 16 项。桶已满时，新监视按完整描述符插入该组的红黑树。
+删除调用先检查该桶，再在未命中时沿红黑树的一条路径查找。显式删除、单次事件后自动撤销、
+`IN_DELETE_SELF`、卸载和末次关闭共用 `remove_mark()`，在 `notify_lock` 保护下同时撤除
+描述符索引、文件监视链和组内监视链。末次关闭沿组内监视链分批撤除，每次持锁最多处理 32 项。
+
 每个真实 UID 最多 128 个实例、65,536 个监视；每个实例的未读记录使用 64 KiB 环。
 环为 `IN_Q_OVERFLOW` 保留位置，读返回完整记录，名称以 NUL 补齐到记录边界。
 阻塞读取、`IN_NONBLOCK`、poll/epoll 和 `FIONREAD` 使用同一队列状态。事件发布时借用
@@ -706,9 +712,9 @@ RV64／LA64 使用 `inotify_init1`、`inotify_add_watch` 和 `inotify_rm_watch`�
 记录数。遍历仅跨锁借用当前 mark 和后继，移除中的后继由独立退休链接保活；mark 的借用
 同时持有 group，因此另一线程关闭监视组后，锁外回调和剩余遍历仍有实际所有者覆盖。
 
-直接探针见 [inotify.c](../../tests/workloads/fs/inotify.c)，覆盖目录事件、事件消费、溢出和卸载。
-`sh tests/host/inotify-async.sh` 检查入队/合并/溢出/忽略的通知次数，以及回调期间并发关闭
-后继 mark 和 group 的交错。
+直接探针见 [inotify.c](../../tests/workloads/fs/inotify.c)，覆盖目录事件、事件消费、溢出、
+乱序删除及自动撤销后再次删除。`sh tests/host/inotify-async.sh` 检查通知次数、回调期间并发
+撤除后继监视项，以及哈希碰撞时显式删除、卸载和关闭对描述符索引的清理。
 
 ### O_TMPFILE 匿名文件
 

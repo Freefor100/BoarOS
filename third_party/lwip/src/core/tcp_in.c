@@ -187,6 +187,39 @@ static int tcp_prepare_input(struct tcp_input_state *rx,struct pbuf *p,u8_t hdrl
   return 1;
 }
 
+#if BOAROS_USER_SMP
+/* The bucket number survived the queue handoff, but the originally matched
+ * PCB may have closed or changed its interface binding before this lookup. */
+static struct tcp_pcb *
+tcp_input_owned_active(struct tcp_pcb **bucket, const struct tcp_input_state *rx)
+{
+  u16_t remote_port = lwip_ntohs(rx->tcphdr->src);
+  u16_t local_port = lwip_ntohs(rx->tcphdr->dest);
+  u8_t input_index = netif_get_index(rx->inp);
+
+  for (struct tcp_pcb **link = bucket; *link != NULL; link = &(*link)->boaros_input_next) {
+    struct tcp_pcb *pcb = *link;
+    if (pcb->state == TIME_WAIT) continue;
+    LWIP_ASSERT("tcp_input: owned active PCB state", pcb->state != CLOSED && pcb->state != LISTEN);
+    if (pcb->remote_port != remote_port || pcb->local_port != local_port ||
+        (pcb->netif_idx != NETIF_NO_INDEX && pcb->netif_idx != input_index) ||
+        !ip_addr_eq(&pcb->remote_ip, rx->src) || !ip_addr_eq(&pcb->local_ip, rx->dst)) continue;
+
+    /* Preserve the active lookup order for equal tuples in this bucket.
+     * The timer list has its own links and does not participate in lookup. */
+    if (link != bucket) {
+      *link = pcb->boaros_input_next;
+      pcb->boaros_input_next = *bucket;
+      *bucket = pcb;
+    } else {
+      TCP_STATS_INC(tcp.cachehit);
+    }
+    return pcb;
+  }
+  return NULL;
+}
+#endif
+
 /**
  * The initial input processing of TCP. It verifies the TCP header, demultiplexes
  * the segment between the PCBs and passes it on to tcp_process(), which implements
@@ -198,7 +231,7 @@ static int tcp_prepare_input(struct tcp_input_state *rx,struct pbuf *p,u8_t hdrl
  */
 static void
 tcp_input_on(struct pbuf *p, struct netif *inp, struct netif *dest,
-    const ip_addr_t *src, const ip_addr_t *dst, int owner_only,
+    const ip_addr_t *src, const ip_addr_t *dst, struct tcp_pcb **owner_bucket,
     const void *network,u16_t network_length)
 {
   struct tcp_input_state scratch;
@@ -241,7 +274,7 @@ tcp_input_on(struct pbuf *p, struct netif *inp, struct netif *dest,
 
   /* A detached packet was already matched to an established unicast tuple.
    * Ordinary IP input still performs the interface's broadcast check. */
-  if (!owner_only) {
+  if (!owner_bucket) {
     BOAROS_LWIP_IP_SCOPE(ip);
     if (ip_addr_isbroadcast(rx->dst, dest) || ip_addr_ismulticast(rx->dst)) {
       TCP_STATS_INC(tcp.proterr);
@@ -276,6 +309,11 @@ tcp_input_on(struct pbuf *p, struct netif *inp, struct netif *dest,
      for an active connection. */
   prev = NULL;
 
+#if BOAROS_USER_SMP
+  if (owner_bucket) {
+    pcb = tcp_input_owned_active(owner_bucket, rx);
+  } else
+#endif
   for (pcb = tcp_active_pcbs; pcb != NULL; pcb = pcb->next) {
     LWIP_ASSERT("tcp_input: active pcb->state != CLOSED", pcb->state != CLOSED);
     LWIP_ASSERT("tcp_input: active pcb->state != TIME-WAIT", pcb->state != TIME_WAIT);
@@ -345,7 +383,7 @@ tcp_input_on(struct pbuf *p, struct netif *inp, struct netif *dest,
 
     /* An already routed packet can outlive its PCB. The next retransmission
      * can use the ordinary IP path; do not reset from the old owner. */
-    if (owner_only) goto dropped;
+    if (owner_bucket) goto dropped;
 
     /* Finally, if we still did not get a match, we check all PCBs that
        are LISTENing for incoming connections. */
@@ -663,15 +701,16 @@ tcp_input(struct pbuf *p, struct netif *inp)
 #ifdef BOAROS_LWIP_TCP_CONTEXT
   if (boaros_lwip_parallel_enabled() && boaros_lwip_tcp_dispatch(p, inp, src, dst)) return;
 #endif
-  tcp_input_on(p, inp, ip_current_netif(), src, dst, 0,((const unsigned char *)ip_next_header_ptr()-ip_current_header_tot_len()),ip_current_header_tot_len());
+  tcp_input_on(p, inp, ip_current_netif(), src, dst, NULL,((const unsigned char *)ip_next_header_ptr()-ip_current_header_tot_len()),ip_current_header_tot_len());
 }
 
-#ifdef BOAROS_LWIP_TCP_CONTEXT
+#if BOAROS_USER_SMP
 void
 boaros_lwip_tcp_input_packet(struct pbuf *p, struct netif *inp,
-    const ip_addr_t *src, const ip_addr_t *dst,const void *network,u16_t network_length)
+    const ip_addr_t *src, const ip_addr_t *dst, const void *network, u16_t network_length,
+    struct tcp_pcb **owner_bucket)
 {
-  tcp_input_on(p, inp, NULL, src, dst, 1,network,network_length);
+  tcp_input_on(p, inp, NULL, src, dst, owner_bucket, network, network_length);
 }
 #endif
 

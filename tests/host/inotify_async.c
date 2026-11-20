@@ -47,10 +47,13 @@ static struct inotify_group *new_group(void)
     account.inotify_groups++;account.references++;
     kernel_wait_queue_init(&g->queue);kernel_wait_queue_init(&g->async_events);return g;
 }
-static void new_mark(struct inotify_group *g,struct kernel_vfs_instance *instance,unsigned inode,unsigned mask)
+static int new_mark(struct inotify_group *g,struct kernel_vfs_instance *instance,unsigned inode,unsigned mask)
 {
     struct inotify_mark *m=allocate(sizeof(*m));memset(m,0xa5,sizeof(*m));m->heap=&heap;
-    KERNEL_RAW_SCOPE(guard,&notify_lock);assert(watch_install(g,instance,inode,mask,m)>0);
+    KERNEL_RAW_SCOPE(guard,&notify_lock);
+    int wd=watch_install(g,instance,inode,mask,m);
+    assert(wd>0);
+    return wd;
 }
 static void notified(struct kernel_wait_node *node,uint32_t reason,uint64_t event)
 {
@@ -114,8 +117,34 @@ static void concurrent_retirement(void)
     assert(!kernel_wait_node_remove_sync(&an));release_group(a);
     assert(!allocations&&account.references==1&&!account.inotify_groups&&!account.inotify_marks&&!instance.notify_marks);
 }
+static void colliding_descriptors(void)
+{
+    struct kernel_vfs_instance instance={0},mounted={0};
+    struct inotify_group *g=new_group(),*other=new_group();
+    int wds[IN_WD_MAX_CHAIN+4];
+    unsigned count=sizeof(wds)/sizeof(wds[0]);
+    for (unsigned i=0;i<count;i++) {
+        /* Simulate gaps left by prior removals while keeping the low bits equal. */
+        g->next_wd=i*IN_WD_BUCKETS;
+        unsigned mask=VFS_NOTIFY_ACCESS;
+        if (i==count-1) mask|=IN_ONESHOT;
+        wds[i]=new_mark(g,i==count-2?&mounted:&instance,100+i,mask);
+    }
+    int other_wd=new_mark(other,&instance,100,VFS_NOTIFY_ACCESS);
+    assert(other_wd==wds[0]);
+    assert(watch_remove(g,wds[count-3])==0);
+    assert(watch_remove(g,wds[count-3])==-KERNEL_EINVAL);
+    assert(watch_remove(g,wds[0])==0 && watch_remove(other,other_wd)==0);
+    emit(&instance,100+count-1,VFS_NOTIFY_ACCESS,0,NULL,0);
+    assert(watch_remove(g,wds[count-1])==-KERNEL_EINVAL);
+    unmount(&mounted);
+    assert(watch_remove(g,wds[count-2])==-KERNEL_EINVAL);
+    assert(instance.notify_marks==count-4 && !mounted.notify_marks);
+    release_group(g);release_group(other);
+    assert(!allocations&&account.references==1&&!account.inotify_groups&&!account.inotify_marks&&!instance.notify_marks);
+}
 int main(void)
 {
-    kernel_wait_domain_init();accepted_events();concurrent_retirement();
-    puts("PASS inotify async: accepted/merged/overflow/ignored cadence, poll dedup, concurrent successor/group retirement");
+    kernel_wait_domain_init();accepted_events();concurrent_retirement();colliding_descriptors();
+    puts("PASS inotify async: event cadence, poll dedup, concurrent and colliding descriptor retirement");
 }

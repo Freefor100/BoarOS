@@ -7,6 +7,7 @@
 #include <kernel/errno.h>
 #include <kernel/elf64_source.h>
 #include <kernel/vma.h>
+#include <arch/riscv/plic.h>
 #include <string.h>
 #include "../../fs/open_file_internal.h"
 #include "../../kernel/sched/private.h"
@@ -19,6 +20,19 @@
 void mm_test_attach(unsigned);
 void mm_test_bind(struct kernel_mm *);
 unsigned mm_test_parked(unsigned);
+void mm_file_unavailable(void);
+/* madvise links disk-only paths in this tmpfs fixture. */
+int kernel_scheduler_can_sleep(void) { return 1; }
+int riscv_plic_in_interrupt(void) { return 0; }
+enum kernel_page_cache_status kernel_page_cache_run_cpu0_borrowing(
+    struct kernel_page_cache *cache, void (*execute)(void *), void *argument,
+    const struct kernel_lock_guard *borrowed)
+{
+    (void)cache; (void)execute; (void)argument; (void)borrowed;
+    mm_file_unavailable();
+    abort();
+}
+
 extern _Thread_local uint64_t mm_test_context;
 static unsigned char pool[4*1024*1024] __attribute__((aligned(4096)));
 static struct physical_page_allocator pages;
@@ -240,6 +254,58 @@ static void u32(unsigned char *p,uint32_t value)
 { for(unsigned i=0;i<4;i++)p[i]=(unsigned char)(value>>(8*i)); }
 static void u64(unsigned char *p,uint64_t value)
 { for(unsigned i=0;i<8;i++)p[i]=(unsigned char)(value>>(8*i)); }
+
+static void fork_fault_sources(struct kernel_elf64_source *source)
+{
+    const uint64_t page = BOAROS_PAGE_SIZE;
+    const uint64_t first = 0xc0000, alias = 0xc2000, skip = 0xc4000;
+    const uint64_t elf_page = 0x100000, elf_bias = 0x100000;
+    uint64_t mapped;
+    struct kernel_open_file_description *file = map_file("/forked-source", first);
+    struct kernel_open_file_description *owner = file;
+    assert(!kernel_open_file_acquire(owner));
+    assert(!kernel_mm_mmap_file_private(&mm, &owner, alias, page, 0, KERNEL_MM_READ,
+        KERNEL_MM_MAP_FIXED, &mapped) && !owner);
+    struct kernel_open_file_description *excluded = map_file("/fork-excluded-source", skip);
+    assert(!kernel_mm_madvise(&mm, skip, page, KERNEL_MM_ADVICE_DONTFORK));
+    assert(!kernel_mm_map_elf_source(&mm, source, elf_bias));
+
+    struct kernel_mm child = {0};
+    assert(!kernel_mm_fork(&child, &mm));
+    struct kernel_vma parent_vma, child_vma, child_alias;
+    assert(!kernel_mm_vma_lookup(&mm, first, &parent_vma));
+    assert(!kernel_mm_vma_lookup(&child, first, &child_vma));
+    assert(!kernel_mm_vma_lookup(&child, alias, &child_alias));
+    assert(child_vma.backing == file && child_alias.backing == file);
+    assert(child_vma.backing_owner != parent_vma.backing_owner &&
+        child_vma.backing_owner == child_alias.backing_owner);
+    assert(!kernel_mm_vma_lookup(&mm, elf_page, &parent_vma));
+    assert(!kernel_mm_vma_lookup(&child, elf_page + elf_bias, &child_vma));
+    assert(!kernel_mm_vma_lookup(&child, elf_page, &child_alias));
+    assert(child_vma.backing == source && child_alias.backing == source);
+    assert(child_vma.backing_owner != parent_vma.backing_owner &&
+        child_vma.backing_owner == child_alias.backing_owner);
+    assert(kernel_mm_vma_lookup(&child, skip, &child_vma) == KERNEL_MM_STATUS_NOT_MAPPED);
+    assert(excluded->references == 2);
+
+    assert(!kernel_mm_munmap(&mm, first, skip + page - first));
+    assert(!kernel_mm_munmap(&mm, elf_page, page));
+    assert(!kernel_mm_munmap(&mm, elf_page + elf_bias, page));
+    assert(file->references == 2 && excluded->references == 1);
+    assert(!kernel_open_file_release(&excluded));
+    assert(!kernel_mm_context(&child, &mm_test_context));
+    assert(!kernel_mm_resolve_user_fault(&child, first, KERNEL_MM_READ));
+    assert(!kernel_mm_resolve_user_fault(&child, alias, KERNEL_MM_READ));
+    assert(!kernel_mm_resolve_user_fault(&child, elf_page + elf_bias, KERNEL_MM_EXECUTE));
+    assert(!kernel_vfs_ftruncate(&file->file, 0));
+    assert(kernel_mm_resolve_user_fault(&child, first, KERNEL_MM_READ) == KERNEL_MM_STATUS_BUS_FAULT);
+    assert(kernel_mm_resolve_user_fault(&child, alias, KERNEL_MM_READ) == KERNEL_MM_STATUS_BUS_FAULT);
+    mm_test_context = context;
+    assert(!kernel_mm_release(&child) && file->references == 1);
+    assert(!kernel_open_file_release(&file));
+    puts("MM fork rebinds shared file and ELF owners once per child, skips DONTFORK and keeps truncate handling");
+}
+
 static void remote_last_executable_close(void)
 {
     unsigned char bytes[128]={0};memcpy(bytes,"\177ELF\2\1\1",7);
@@ -269,11 +335,14 @@ static void remote_last_executable_close(void)
     assert(!watched_elf && elf_releases==released_before+1);
     puts("MM self-pin ELF borrow remains retired through writer drain; user-return drain returns its source owner");
     assert(!kernel_elf64_source_create_reader(&heap,&reader,BOAROS_PAGE_SIZE,KERNEL_ELF64_MACHINE_RISCV,&source));
-    assert(!kernel_mm_map_elf_source(&mm,source,0));assert(!kernel_elf64_source_release(&source));
+    assert(!kernel_mm_map_elf_source(&mm,source,0));
     forbid_backing_scans=1;
     assert(!kernel_mm_resolve_user_fault(&mm,0x100078,KERNEL_MM_EXECUTE));
     forbid_backing_scans=0;
     puts("MM ordinary ELF fault skips unchanged VMA backing scans");
+    fork_fault_sources(source);
+    assert(!kernel_mm_map_elf_source(&mm, source, 0));
+    assert(!kernel_elf64_source_release(&source));
     struct kernel_open_file_description *file=NULL;int error;
     assert(!kernel_open_file_create_mode(&heap,mount,"/remote-executable",0700,&file,&error)&&!error);
     assert(!kernel_mm_set_executable(&mm,file));close_caller(&file);

@@ -367,8 +367,12 @@ int boaros_lwip_tcp_context_move_active(struct boaros_lwip_tcp_context *from,
 unsigned boaros_lwip_tcp_timers_due(u32_t now);
 u32_t boaros_lwip_tcp_timers_delay(u32_t now);
 void boaros_lwip_tcp_timer_arm(struct boaros_lwip_tcp_context *ctx, u32_t now);
+#if BOAROS_USER_SMP
+/* The caller owns the input bucket and every PCB linked in it. */
 void boaros_lwip_tcp_input_packet(struct pbuf *p, struct netif *inp,
-    const ip_addr_t *src, const ip_addr_t *dst,const void *network,u16_t network_length);
+    const ip_addr_t *src, const ip_addr_t *dst, const void *network, u16_t network_length,
+    struct tcp_pcb **owner_bucket);
+#endif
 #define tcp_input_pcb             (boaros_lwip_tcp_context_current()->input)
 #define tcp_ticks                 (boaros_lwip_tcp_context_current()->ticks)
 #define tcp_active_pcbs_changed  (boaros_lwip_tcp_context_current()->active_changed)

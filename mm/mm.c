@@ -65,6 +65,7 @@ struct kernel_mm_file_source {
     struct kernel_open_file_description *file;
     _Atomic uint32_t operations;
     int draining;
+    struct kernel_mm_file_source *fork_peer;
 };
 
 struct mm_huge_map {
@@ -106,6 +107,7 @@ struct kernel_mm_elf_source {
     struct kernel_elf64_source *source;
     _Atomic uint32_t faults;
     int draining;
+    struct kernel_mm_elf_source *fork_peer;
 };
 
 struct mm_lazy_page {
@@ -1281,95 +1283,83 @@ static enum kernel_mm_status drain_elf_sources(
                        : KERNEL_MM_STATUS_OK;
 }
 
-static enum kernel_mm_status clone_elf_sources(
-    const struct kernel_mm_record *source_record,
-    struct kernel_mm_record *destination_record)
+static enum kernel_mm_status clone_elf_source(struct kernel_mm_record *child,
+    struct kernel_mm_elf_source *parent)
 {
-    struct kernel_mm_elf_source *source;
-
-    for (source = source_record->elf_sources;
-         source != 0;
-         source = source->next) {
-        struct kernel_mm_elf_source *copy;
-        int in_use;
-        enum kernel_heap_status heap_status;
-
-        if (source->source == 0 ||
-            kernel_vma_set_backing_in_use(destination_record->vmas,
-                                          source->source,
-                                          &in_use) != KERNEL_VMA_STATUS_OK) {
-            return KERNEL_MM_STATUS_STATE;
-        }
-        if (in_use == 0) {
-            continue;
-        }
-        heap_status = kernel_heap_allocate_zeroed(destination_record->vma_heap,
-                                                  1U,
-                                                  sizeof(*copy),
-                                                  (void **)&copy);
-        if (heap_status != KERNEL_HEAP_STATUS_OK) {
-            return heap_status == KERNEL_HEAP_STATUS_EMPTY
-                       ? KERNEL_MM_STATUS_NO_MEMORY
-                       : KERNEL_MM_STATUS_STATE;
-        }
-        if (kernel_elf64_source_acquire(source->source) !=
-            KERNEL_ELF64_SOURCE_STATUS_OK) {
-            kernel_heap_release(destination_record->vma_heap, copy);
-            return KERNEL_MM_STATUS_STATE;
-        }
-        copy->source = source->source;
-        copy->next = destination_record->elf_sources;
-        destination_record->elf_sources = copy;
+    struct kernel_mm_elf_source *copy;
+    enum kernel_heap_status hs = kernel_heap_allocate_zeroed(child->vma_heap, 1U,
+        sizeof(*copy), (void **)&copy);
+    if (hs) return hs == KERNEL_HEAP_STATUS_EMPTY ? KERNEL_MM_STATUS_NO_MEMORY
+                                                 : KERNEL_MM_STATUS_STATE;
+    if (kernel_elf64_source_acquire(parent->source)) {
+        kernel_heap_release(child->vma_heap, copy);
+        return KERNEL_MM_STATUS_STATE;
     }
+    copy->source = parent->source;
+    copy->next = child->elf_sources;
+    child->elf_sources = copy;
+    copy->fork_peer = parent;
+    parent->fork_peer = copy;
     return KERNEL_MM_STATUS_OK;
 }
 
-static enum kernel_mm_status clone_file_sources(
-    const struct kernel_mm_record *source_record,
-    struct kernel_mm_record *destination_record)
+static enum kernel_mm_status clone_file_source(struct kernel_mm_record *child,
+    struct kernel_mm_file_source *parent)
 {
-    struct kernel_mm_file_source *source;
-
-    for (source = source_record->file_sources;
-         source != 0;
-         source = source->next) {
-        struct kernel_mm_file_source *copy;
-        int in_use;
-        enum kernel_heap_status heap_status;
-
-        if (source->file == 0) {
-            continue;
-        }
-        if (kernel_vma_set_backing_in_use(destination_record->vmas,
-                                          source->file,
-                                          &in_use) !=
-            KERNEL_VMA_STATUS_OK) {
-            return KERNEL_MM_STATUS_STATE;
-        }
-        if (in_use == 0) {
-            continue;
-        }
-        heap_status = kernel_heap_allocate_zeroed(
-            destination_record->vma_heap,
-            1U,
-            sizeof(*copy),
-            (void **)&copy);
-        if (heap_status != KERNEL_HEAP_STATUS_OK) {
-            return heap_status == KERNEL_HEAP_STATUS_EMPTY
-                       ? KERNEL_MM_STATUS_NO_MEMORY
-                       : KERNEL_MM_STATUS_STATE;
-        }
-        if (kernel_open_file_acquire(source->file) !=
-            KERNEL_OPEN_FILE_STATUS_OK) {
-            kernel_heap_release(destination_record->vma_heap,
-                                    copy);
-            return KERNEL_MM_STATUS_STATE;
-        }
-        copy->file = source->file;
-        copy->next = destination_record->file_sources;
-        destination_record->file_sources = copy;
+    struct kernel_mm_file_source *copy;
+    enum kernel_heap_status hs = kernel_heap_allocate_zeroed(child->vma_heap, 1U,
+        sizeof(*copy), (void **)&copy);
+    if (hs) return hs == KERNEL_HEAP_STATUS_EMPTY ? KERNEL_MM_STATUS_NO_MEMORY
+                                                 : KERNEL_MM_STATUS_STATE;
+    if (kernel_open_file_acquire(parent->file)) {
+        kernel_heap_release(child->vma_heap, copy);
+        return KERNEL_MM_STATUS_STATE;
     }
+    copy->file = parent->file;
+    copy->next = child->file_sources;
+    child->file_sources = copy;
+    copy->fork_peer = parent;
+    parent->fork_peer = copy;
     return KERNEL_MM_STATUS_OK;
+}
+
+/* The parent MM writer fixes its active owners. Walk only inherited VMAs
+ * and memoize each owner's child copy until the unpublished child is rebound.
+ * On failure, clear the same peer links before child cleanup owns the copies. */
+static enum kernel_mm_status clone_mapping_sources(const struct kernel_mm_record *parent,
+    struct kernel_mm_record *child)
+{
+    if (!parent->file_sources && !parent->elf_sources) return KERNEL_MM_STATUS_OK;
+    enum kernel_mm_status status = KERNEL_MM_STATUS_OK;
+    uint32_t count = kernel_vma_set_count(child->vmas);
+    for (uint32_t i = 0; i < count; i++) {
+        struct kernel_vma vma;
+        if (kernel_vma_set_get_at(child->vmas, i, &vma)) __builtin_trap();
+        if (vma.kind == KERNEL_VMA_KIND_ELF_PRIVATE) {
+            struct kernel_mm_elf_source *source = vma.backing_owner;
+            if (!source) __builtin_trap();
+            if (!source->fork_peer) status = clone_elf_source(child, source);
+            if (status) break;
+            kernel_vma_set_rebind_source_owner(child->vmas, i, source->fork_peer);
+        } else if (vma.kind == KERNEL_VMA_KIND_FILE_PRIVATE ||
+                   vma.kind == KERNEL_VMA_KIND_FILE_SHARED ||
+                   vma.kind == KERNEL_VMA_KIND_OBJECT_SHARED) {
+            struct kernel_mm_file_source *source = vma.backing_owner;
+            if (!source) __builtin_trap();
+            if (!source->fork_peer) status = clone_file_source(child, source);
+            if (status) break;
+            kernel_vma_set_rebind_source_owner(child->vmas, i, source->fork_peer);
+        }
+    }
+    for (struct kernel_mm_file_source *copy = child->file_sources; copy; copy = copy->next) {
+        copy->fork_peer->fork_peer = NULL;
+        copy->fork_peer = NULL;
+    }
+    for (struct kernel_mm_elf_source *copy = child->elf_sources; copy; copy = copy->next) {
+        copy->fork_peer->fork_peer = NULL;
+        copy->fork_peer = NULL;
+    }
+    return status;
 }
 
 static void prepare_huge_registration(struct mm_huge_map *);
@@ -1731,7 +1721,7 @@ static enum kernel_mm_status mm_fork_impl(
     status = clone_huge_maps(source_record,destination_record,record_page_address);
     if (status==KERNEL_MM_STATUS_OK) status = clone_shared_anon(source_record, destination_record);
     if (status == KERNEL_MM_STATUS_OK)
-        status = clone_file_sources(source_record, destination_record);
+        status = clone_mapping_sources(source_record, destination_record);
     if (status != KERNEL_MM_STATUS_OK) {
         destination_record->stage = KERNEL_MM_RECORD_VMAS_CLEANUP;
         destination->allocator = source->allocator;
@@ -1808,8 +1798,6 @@ static enum kernel_mm_status mm_fork_impl(
         copy->address=page->address;copy->physical=page->physical;
         lazy_insert(destination_record,copy);
     }
-    if (status == KERNEL_MM_STATUS_OK)
-        status = clone_elf_sources(source_record, destination_record);
     if (status == KERNEL_MM_STATUS_OK && source_record->executable_file) {
         if (kernel_open_file_acquire(source_record->executable_file) !=
             KERNEL_OPEN_FILE_STATUS_OK)
@@ -2844,7 +2832,8 @@ enum kernel_mm_status kernel_mm_map_elf_source(
 {
     KERNEL_NO_RECLAIM_IO;
     struct kernel_mm_record *record;
-    struct kernel_mm_elf_source *source_owner = 0;
+    struct kernel_mm_elf_source *source_owner;
+    int added_source = 0;
     uint32_t run_count;
     uint32_t index;
     uint32_t inserted = 0U;
@@ -2860,7 +2849,8 @@ enum kernel_mm_status kernel_mm_map_elf_source(
     if (status != KERNEL_MM_STATUS_OK) {
         return status;
     }
-    if (find_elf_source(record, source) == 0) {
+    source_owner = find_elf_source(record, source);
+    if (!source_owner) {
         heap_status = kernel_heap_allocate_zeroed(record->vma_heap,
                                                   1U,
                                                   sizeof(*source_owner),
@@ -2878,10 +2868,11 @@ enum kernel_mm_status kernel_mm_map_elf_source(
         source_owner->source = source;
         source_owner->next = record->elf_sources;
         record->elf_sources = source_owner;
+        added_source = 1;
     }
     run_count = kernel_elf64_source_run_count(source);
     if (run_count == 0U) {
-        if (source_owner != 0) {
+        if (added_source) {
             (void)drain_elf_sources(record, 1);
         }
         return KERNEL_MM_STATUS_INVALID_ARGUMENT;
@@ -2932,6 +2923,7 @@ enum kernel_mm_status kernel_mm_map_elf_source(
             .role = KERNEL_VMA_ROLE_ELF,
             .fault_policy = KERNEL_VMA_FAULT_ELF,
             .backing = source,
+            .backing_owner = source_owner,
         };
 
         /* Linux padzero creates private anonymous backing for the ELF tail.
@@ -2969,7 +2961,7 @@ rollback:
         }
         inserted--;
     }
-    if (source_owner != 0) {
+    if (added_source) {
         if (drain_elf_sources(record, 1) != KERNEL_MM_STATUS_OK) {
             status = KERNEL_MM_STATUS_CLEANUP_REQUIRED;
         }
@@ -4074,6 +4066,7 @@ static enum kernel_mm_status commit_file_mapping(
                             ? KERNEL_VMA_FAULT_FILE_SHARED
                             : KERNEL_VMA_FAULT_FILE_PRIVATE,
         .backing = *file,
+        .backing_owner = prepared ? prepared : existing,
         .shared_write_bytes=write_bytes,
         .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS &
             (((flags & KERNEL_MM_MAP_SHARED) == 0U || may_write)
@@ -4340,7 +4333,7 @@ enum kernel_mm_status kernel_mm_shmat(
         .role = KERNEL_VMA_ROLE_SYSV_SHM,
         .fault_policy = KERNEL_VMA_FAULT_ANON_SHARED,
         .backing = segment->memory,
-        .shm_attachment = attachment,
+        .backing_owner = attachment,
     };
 
     if ((flags & KERNEL_SHM_REMAP) == 0U) {
@@ -4426,9 +4419,10 @@ enum kernel_mm_status kernel_mm_shmdt(struct kernel_mm *mm, uint64_t address)
     for (uint32_t i = 0; i < kernel_vma_set_count(record->vmas); i++) {
         if (kernel_vma_set_get_at(record->vmas, i, &vma) != KERNEL_VMA_STATUS_OK)
             __builtin_trap();
-        if (vma.shm_attachment && vma.start >= vma.backing_offset &&
+        struct kernel_shm_attachment *candidate = kernel_vma_shm_attachment(&vma);
+        if (candidate && vma.start >= vma.backing_offset &&
             vma.start - vma.backing_offset == address) {
-            attachment = vma.shm_attachment;
+            attachment = candidate;
             kernel_shm_attachment_acquire(attachment);
             break;
         }
@@ -4441,8 +4435,9 @@ enum kernel_mm_status kernel_mm_shmdt(struct kernel_mm *mm, uint64_t address)
     for (uint32_t i = 0; i < kernel_vma_set_count(record->vmas);) {
         if (kernel_vma_set_get_at(record->vmas, i, &vma) != KERNEL_VMA_STATUS_OK)
             __builtin_trap();
+        struct kernel_shm_attachment *candidate = kernel_vma_shm_attachment(&vma);
         if (vma.start < address || vma.start - address != vma.backing_offset ||
-            !vma.shm_attachment || vma.shm_attachment->file_identity != file_identity ||
+            !candidate || candidate->file_identity != file_identity ||
             (!first && vma.end - address > segment_size)) { i++; continue; }
         status = mm_munmap_impl(mm, vma.start, vma.end - vma.start);
         if (status != KERNEL_MM_STATUS_OK) return status;
@@ -5288,7 +5283,7 @@ static enum kernel_mm_status mmap_hugetlb(struct kernel_mm *mm,
         .maximum_permissions=KERNEL_VMA_ALL_PERMISSIONS &
             ((shm_flags & KERNEL_SHM_RDONLY) ? ~KERNEL_MM_WRITE : KERNEL_VMA_ALL_PERMISSIONS),
         .kind=shared?KERNEL_VMA_KIND_HUGETLB_SHARED:KERNEL_VMA_KIND_HUGETLB_PRIVATE,
-        .role=segment?KERNEL_VMA_ROLE_SYSV_SHM:KERNEL_VMA_ROLE_MMAP,.shm_attachment=attachment,.fault_policy=KERNEL_VMA_FAULT_HUGETLB,.backing=entry->map,
+        .role=segment?KERNEL_VMA_ROLE_SYSV_SHM:KERNEL_VMA_ROLE_MMAP,.backing_owner=attachment,.fault_policy=KERNEL_VMA_FAULT_HUGETLB,.backing=entry->map,
         .flags=mapping_lock_flags(record,flags)};
     enum kernel_mm_status status;
     if (flags&KERNEL_MM_MAP_FIXED) {
@@ -5415,7 +5410,7 @@ static int sync_mapped_ranges(struct kernel_mm *mm,uint64_t address,uint64_t len
             } else if (status) __builtin_trap();
             uint64_t finish=vma.end<end?vma.end:end;
             if ((flags&4U) && vma.kind==KERNEL_VMA_KIND_FILE_SHARED) {
-                struct kernel_mm_file_source *source=find_file_source(operation->record,vma.backing);
+                struct kernel_mm_file_source *source=vma.backing_owner;
                 if (!source || source->operations==UINT32_MAX) __builtin_trap();
                 source->operations++;
                 sources[count].source=source;
@@ -6117,11 +6112,12 @@ int kernel_mm_mremap(struct kernel_mm *mm, uint64_t old_address,
     struct kernel_shm_attachment *attachment
         __attribute__((cleanup(kernel_shm_attachment_release))) = 0;
     if (source.kind == KERNEL_VMA_KIND_SYSV_SHM) {
-        if (kernel_shm_attachment_create(source.shm_attachment->segment,
-                new_address, new_address + new_size, source.shm_attachment,
+        struct kernel_shm_attachment *original = kernel_vma_shm_attachment(&source);
+        if (kernel_shm_attachment_create(original->segment,
+                new_address, new_address + new_size, original,
                 &attachment) != KERNEL_SHM_STATUS_OK)
             return -KERNEL_ENOMEM;
-        replacement.shm_attachment = attachment;
+        replacement.backing_owner = attachment;
     }
     struct kernel_vma_remap edit;
     enum kernel_vma_status prepared = preserve ?
@@ -6362,7 +6358,7 @@ static __attribute__((noinline)) enum kernel_mm_status mapped_file_fault(struct 
     uint64_t offset = vma->backing_offset + address - vma->start;
     uint64_t generation = view->generation;
     struct kernel_open_file_description *file = vma->backing;
-    struct kernel_mm_file_source *file_source = find_file_source(record, file);
+    struct kernel_mm_file_source *file_source = vma->backing_owner;
     if (!file_source || __atomic_fetch_add(&file_source->operations, 1, __ATOMIC_RELAXED) == UINT32_MAX) __builtin_trap();
     struct kernel_vfs_node *node = kernel_open_file_node(file);
     KERNEL_LOCK_SCOPE(inode);
@@ -6926,7 +6922,7 @@ static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_op
     }
     if (elf && !cookie) {
         source = vma->backing;
-        source_owner = find_elf_source(record, source);
+        source_owner = vma->backing_owner;
         if (!source_owner || __atomic_fetch_add(&source_owner->faults, 1, __ATOMIC_RELAXED) == UINT32_MAX) __builtin_trap();
     }
 #if BOAROS_MAX_CPUS > 1
@@ -7738,7 +7734,7 @@ enum kernel_mm_status kernel_mm_check_task_domain(const struct kernel_mm *mm)
                 !kernel_memory_object_check_domain(vma.backing, record->vma_heap, mm->allocator) :
             (vma.kind == KERNEL_VMA_KIND_FILE_SHARED || vma.kind == KERNEL_VMA_KIND_FILE_PRIVATE) &&
                 !kernel_open_file_check_mapping_domain(vma.backing, record->vma_heap, mm->allocator);
-        if (vma.shm_attachment || !valid) return KERNEL_MM_STATUS_STATE;
+        if (!valid) return KERNEL_MM_STATUS_STATE;
     }
     return KERNEL_MM_STATUS_OK;
 }
@@ -7958,7 +7954,6 @@ static int lock_interval(uint64_t address, uint64_t length, uint64_t *start, uin
 static int advise_file(struct mm_operation *operation, const struct kernel_vma *vma,
     uint64_t address, uint64_t *end, unsigned *budget)
 {
-    struct kernel_mm_record *record = operation->record;
     struct kernel_open_file_description *file = 0;
     _Atomic uint32_t *borrow = 0;
     uint64_t offset = vma->backing_offset + address - vma->start;
@@ -7968,7 +7963,7 @@ static int advise_file(struct mm_operation *operation, const struct kernel_vma *
         return 0; /* shmem has no swap-in work in this kernel. */
     if (vma->kind == KERNEL_VMA_KIND_FILE_PRIVATE || vma->kind == KERNEL_VMA_KIND_FILE_SHARED) {
         file = vma->backing;
-        struct kernel_mm_file_source *source = find_file_source(record, file);
+        struct kernel_mm_file_source *source = vma->backing_owner;
         if (!source) __builtin_trap();
         borrow = &source->operations;
     } else if (vma->kind == KERNEL_VMA_KIND_ELF_PRIVATE) {
@@ -7985,7 +7980,7 @@ static int advise_file(struct mm_operation *operation, const struct kernel_vma *
             offset = run->file_offset + offset - run->start;
             break;
         }
-        struct kernel_mm_elf_source *owner = find_elf_source(record, source);
+        struct kernel_mm_elf_source *owner = vma->backing_owner;
         if (!owner) __builtin_trap();
         borrow = &owner->faults;
     } else return -KERNEL_EINVAL;
@@ -8074,9 +8069,8 @@ static int advise_remove(struct mm_operation *operation,const struct kernel_vma 
         return -KERNEL_EINVAL;
     if (vma->kind != KERNEL_VMA_KIND_FILE_SHARED || !(vma->maximum_permissions & KERNEL_MM_WRITE))
         return -KERNEL_EACCES;
-    struct kernel_mm_record *record=operation->record;
     struct kernel_open_file_description *file=vma->backing;
-    struct kernel_mm_file_source *source=find_file_source(record,file);
+    struct kernel_mm_file_source *source=vma->backing_owner;
     if (!source || source->operations==UINT32_MAX) __builtin_trap();
     source->operations++;
     uint64_t offset=vma->backing_offset+address-vma->start;
@@ -8378,7 +8372,7 @@ int kernel_mm_mincore(struct kernel_mm *mm, uint64_t address, unsigned count,
         _Atomic uint32_t *borrow = 0;
         if (vma.kind == KERNEL_VMA_KIND_FILE_PRIVATE || vma.kind == KERNEL_VMA_KIND_FILE_SHARED) {
             file = vma.backing;
-            struct kernel_mm_file_source *source = find_file_source(record, file);
+            struct kernel_mm_file_source *source = vma.backing_owner;
             if (!source) __builtin_trap();
             borrow = &source->operations;
         } else if (vma.kind == KERNEL_VMA_KIND_ELF_PRIVATE) {
@@ -8393,7 +8387,7 @@ int kernel_mm_mincore(struct kernel_mm *mm, uint64_t address, unsigned count,
                 }
             }
             if (file) {
-                struct kernel_mm_elf_source *owner = find_elf_source(record, source);
+                struct kernel_mm_elf_source *owner = vma.backing_owner;
                 if (!owner) __builtin_trap();
                 borrow = &owner->faults;
             }

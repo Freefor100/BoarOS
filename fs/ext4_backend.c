@@ -3000,6 +3000,9 @@ static int ext4_backend_error(struct kernel_vfs_instance *instance)
 { return instance->quiescing ? -KERNEL_EIO : lwext4_error(mount_error(lwext4_instance(instance))); }
 static int ext4_backend_root(struct kernel_vfs_instance *instance, uint64_t *inode, uint32_t *mode)
 { *inode = EXT4_INODE_ROOT_INDEX; return lwext4_error(ext4_mode_get(lwext4_instance(instance)->mount_point, mode)); }
+_Static_assert(sizeof(struct lwext4_directory_mapping)<=256,
+    "directory lookup state must fit its existing heap size class");
+
 static int ext4_backend_lookup(struct kernel_vfs_node *parent,
     const char *name, size_t length, uint64_t *inode, uint32_t *mode)
 {
@@ -3016,22 +3019,45 @@ static int ext4_backend_lookup(struct kernel_vfs_node *parent,
         uint64_t epoch;
         bool ready;
         struct lwext4_directory_mapping *mapping;
+        bool cacheable=!mode && length && length<=sizeof(mapping->misses[0].name);
+        bool repeated=false;
         {
             TIMESTAMP_SCOPE(guard,adapter);
             epoch=live->metadata_epoch;
             mapping=live->directory_mapping;
             ready=mapping && mapping->epoch==epoch;
-            if (ready) snapshot=mapping->inode;
+            if (ready) {
+                if (cacheable) {
+                    for (unsigned i=0;i<2;i++) {
+                        if (mapping->misses[i].length==length &&
+                            !memcmp(mapping->misses[i].name,name,length))
+                            return -KERNEL_ENOENT;
+                    }
+                    /* Only admission uses this tag. A hit still compares the
+                     * complete name from a successful directory search. */
+                    uint16_t tag=(uint16_t)((uint8_t)name[0]*251U ^
+                        (uint8_t)name[length/2]*31U ^ (uint8_t)name[length-1] ^ length);
+                    repeated=tag==mapping->attempts[0] || tag==mapping->attempts[1];
+                    if (tag!=mapping->attempts[0]) {
+                        mapping->attempts[1]=mapping->attempts[0];
+                        mapping->attempts[0]=tag;
+                    }
+                }
+                snapshot=mapping->inode;
+            }
         }
         bool reused=ready;
         error=lwext4_error(ext4_file_lookup_child(directory,name,length,&result_inode,mode,&snapshot,&ready));
         /* The namespace reader covers directory mapping changes. The epoch
          * also rejects snapshots superseded by another metadata publication. */
-        if (!reused && ready) {
+        bool missing=cacheable && (!reused || repeated) && error==-KERNEL_ENOENT;
+        if (ready && (!reused || missing)) {
             struct lwext4_directory_mapping *candidate=NULL;
-            if (!mapping)
+            if (!mapping) {
                 (void)kernel_heap_allocate_nosleep(adapter->instance.heap,sizeof(*candidate),
                                                   (void **)&candidate);
+                if (candidate) *candidate=(struct lwext4_directory_mapping){.epoch=epoch,.inode=snapshot};
+            }
             {
                 TIMESTAMP_SCOPE(guard,adapter);
                 if (epoch==live->metadata_epoch) {
@@ -3040,7 +3066,21 @@ static int ext4_backend_lookup(struct kernel_vfs_node *parent,
                         candidate=NULL;
                     }
                     mapping=live->directory_mapping;
-                    if (mapping) *mapping=(struct lwext4_directory_mapping){epoch,snapshot};
+                    if (mapping) {
+                        if (mapping->epoch!=epoch)
+                            *mapping=(struct lwext4_directory_mapping){.epoch=epoch,.inode=snapshot};
+                        if (missing) {
+                            unsigned slot=mapping->next_miss;
+                            unsigned other=slot^1U;
+                            /* A concurrent reader may have published this miss. */
+                            if (mapping->misses[other].length!=length ||
+                                memcmp(mapping->misses[other].name,name,length)) {
+                                memcpy(mapping->misses[slot].name,name,length);
+                                mapping->misses[slot].length=length;
+                                mapping->next_miss=other;
+                            }
+                        }
+                    }
                 }
             }
             if (candidate) kernel_heap_release(adapter->instance.heap,candidate);

@@ -226,10 +226,26 @@ void kernel_rwlock_init(struct kernel_rwlock *lock, uint32_t rank, uintptr_t key
 static pthread_mutex_t model_mutex=PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t model_rights_mutex=PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t model_unix_mutex=PTHREAD_MUTEX_INITIALIZER;
+#if BOAROS_USER_SMP
+static pthread_mutex_t model_ip_mutex=PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t model_tcp_mutex=PTHREAD_MUTEX_INITIALIZER;
+unsigned kernel_cpu_get_boot_count(void) { return 2; }
+int kernel_service_scope_try_local(struct kernel_service_scope *scope)
+{ (void)scope; return !kernel_cpu_current()->logical_id; }
+void kernel_service_scope_begin(struct kernel_service_scope *scope)
+{ CHECK(kernel_service_scope_try_local(scope)); }
+void kernel_service_scope_end(struct kernel_service_scope *scope) { (void)scope; }
+int kernel_lock_held(const struct kernel_rwlock *lock,int write)
+{ CHECK(write);return lock->writer==&test_context; }
+#endif
 static pthread_mutex_t *model_lock(struct kernel_rwlock *lock)
 {
     if(lock==&protocol_mutex.lock)return &model_mutex;
     if(lock==&rights_mutex.lock)return &model_rights_mutex;
+#if BOAROS_USER_SMP
+    if(lock->rank==27)return &model_ip_mutex;
+    if(lock==&tcp_owner_at(1)->mutex.lock)return &model_tcp_mutex;
+#endif
     CHECK(lock==&unix_control.lock);return &model_unix_mutex;
 }
 static pthread_mutex_t handshake=PTHREAD_MUTEX_INITIALIZER;
@@ -1200,6 +1216,138 @@ static void connected_pair(struct kernel_socket **listener, struct kernel_socket
         (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8, 8, 0});
     CHECK((*client)->connected && kernel_socket_accept(*listener, server, NULL) == 0);
 }
+
+#if BOAROS_USER_SMP
+/* Start the secondary context without a scheduler thread so the test can
+ * choose exactly when it drains each queued input packet. */
+static struct socket_tcp_owner *tcp_lookup_test_start(void)
+{
+    struct socket_tcp_owner *owner=tcp_owner_at(1);
+    owner->index=1;
+    kernel_raw_lock_init(&owner->ingress,KERNEL_RAW_RANK_OBJECT+1);
+    kernel_wait_queue_init(&owner->work);
+    kernel_mutex_init(&owner->mutex,26,(uintptr_t)&owner->mutex);
+    boaros_lwip_tcp_context_init(&owner->context);
+    tcp_owner_count=1;
+    return owner;
+}
+
+static struct pbuf *tcp_lookup_test_packet(const struct tcp_pcb *pcb,
+                                           struct netif *interface)
+{
+    struct pbuf *packet=pbuf_alloc(PBUF_RAW,IP_HLEN+TCP_HLEN,PBUF_RAM);
+    CHECK(packet && !pbuf_remove_header(packet,IP_HLEN));
+    struct tcp_hdr *header=packet->payload;
+    *header=(struct tcp_hdr){.src=lwip_htons(pcb->remote_port),
+                            .dest=lwip_htons(pcb->local_port),
+                            .seqno=lwip_htonl(pcb->rcv_nxt),
+                            .ackno=lwip_htonl(pcb->lastack),
+                            .wnd=lwip_htons((u16_t)pcb->snd_wnd)};
+    TCPH_HDRLEN_FLAGS_SET(header,5,TCP_ACK);
+    header->chksum=ip_chksum_pseudo(packet,IP_PROTO_TCP,packet->tot_len,
+                                  &pcb->remote_ip,&pcb->local_ip);
+    packet->if_idx=netif_get_index(interface);
+    return packet;
+}
+
+static void tcp_lookup_test_dispatch(struct pbuf *packet,struct netif *interface,
+                                     const struct tcp_pcb *pcb)
+{
+    const struct ip_globals saved=ip_data;
+    ip_data.current_ip4_header=(void *)((unsigned char *)packet->payload-IP_HLEN);
+    ip_data.current_ip_header_tot_len=IP_HLEN;
+    CHECK(tcp_dispatch(packet,interface,&pcb->remote_ip,&pcb->local_ip));
+    ip_data=saved;
+}
+
+static void tcp_lookup_test_drain(struct socket_tcp_owner *owner)
+{
+    struct socket_tcp_input input;
+    CHECK(tcp_owner_take_input(owner,&input));
+    tcp_owner_receive(owner,&input);
+}
+
+static void tcp_owner_lookup(void)
+{
+    struct kernel_socket *listener[2]={0},*client[2]={0},*server[2]={0};
+    connected_pair(&listener[0],&client[0],&server[0]);
+    connected_pair(&listener[1],&client[1],&server[1]);
+    CHECK(tcp_route_bucket(server[0]->tcp)!=tcp_route_bucket(server[1]->tcp));
+    struct socket_tcp_owner *owner=tcp_lookup_test_start();
+    struct kernel_socket_protocol_scope scope;
+    kernel_socket_protocol_enter(&scope);
+    struct netif *loop=loopback_netif();
+    for(unsigned i=0;i<2;i++)CHECK(tcp_promote(server[i],&scope));
+    for(unsigned j=0;j<2;j++)
+        for(unsigned i=0;i<2;i++)
+            tcp_lookup_test_dispatch(tcp_lookup_test_packet(server[i]->tcp,loop),loop,server[i]->tcp);
+    kernel_socket_protocol_leave(&scope);
+
+    CHECK(tcp_owner_lock(&scope,owner,0));
+    unsigned before=STATS_GET(tcp.cachehit);
+    u32_t packets[2]={server[0]->tcp->boaros_segs_in,server[1]->tcp->boaros_segs_in};
+    for(unsigned i=0;i<4;i++)tcp_lookup_test_drain(owner);
+    CHECK(server[0]->tcp->boaros_segs_in==packets[0]+2 &&
+          server[1]->tcp->boaros_segs_in==packets[1]+2);
+    CHECK(STATS_GET(tcp.cachehit)==before+4);
+    kernel_socket_protocol_leave(&scope);
+
+    struct netif other={.num=(u8_t)(loop->num+1)};
+    kernel_socket_protocol_enter(&scope);
+    CHECK(tcp_promote(client[1],&scope));
+    tcp_lookup_test_dispatch(tcp_lookup_test_packet(server[1]->tcp,&other),&other,server[1]->tcp);
+    kernel_socket_protocol_leave(&scope);
+    CHECK(!kernel_socket_set_bound_device(server[1],"lo"));
+
+    CHECK(tcp_owner_lock(&scope,owner,0));
+    unsigned drops=STATS_GET(tcp.drop);
+    tcp_lookup_test_drain(owner);
+    CHECK(STATS_GET(tcp.drop)==drops+1 && server[1]->tcp->boaros_segs_in==packets[1]+2);
+    struct tcp_pcb *sender=client[1]->tcp;
+    struct pbuf *direct=tcp_lookup_test_packet(server[1]->tcp,loop);
+    int result;
+    CHECK(tcp_local_output(sender,direct,loop,&sender->local_ip,&sender->remote_ip,&result) && result==ERR_OK);
+    pbuf_free(direct);
+    tcp_lookup_test_drain(owner);
+    CHECK(server[1]->tcp->boaros_segs_in==packets[1]+3);
+    tcp_abandon(sender,0);
+    kernel_socket_protocol_leave(&scope);
+
+    /* A queued packet reaches the TIME_WAIT branch after the active socket
+     * changes state, then is dropped after owner-side retirement. */
+    kernel_socket_protocol_enter(&scope);
+    CHECK(tcp_promote(client[0],&scope));
+    for(unsigned j=0;j<2;j++)
+        tcp_lookup_test_dispatch(tcp_lookup_test_packet(server[0]->tcp,loop),loop,server[0]->tcp);
+    kernel_socket_protocol_leave(&scope);
+    CHECK(tcp_owner_lock(&scope,owner,0));
+    struct tcp_pcb *retired=server[0]->tcp;
+    u32_t opposite=client[0]->tcp->boaros_segs_in;
+    TCP_RMV_ACTIVE(retired);
+    tcp_set_state(retired,TIME_WAIT);
+    TCP_REG(&tcp_tw_pcbs,retired);
+    drops=STATS_GET(tcp.drop);
+    tcp_lookup_test_drain(owner);
+    CHECK(STATS_GET(tcp.drop)==drops);
+    tcp_abandon(retired,0);
+    CHECK(!server[0]->tcp);
+    tcp_lookup_test_drain(owner);
+    CHECK(STATS_GET(tcp.drop)==drops+1 && client[0]->tcp->boaros_segs_in==opposite);
+    tcp_abandon(client[0]->tcp,0);
+    tcp_abandon(server[1]->tcp,0);
+    kernel_socket_protocol_leave(&scope);
+
+    for(unsigned i=0;i<2;i++) {
+        kernel_socket_destroy(server[i]);
+        kernel_socket_destroy(client[i]);
+        kernel_socket_destroy(listener[i]);
+    }
+    CHECK(!owner->count && !owner->context.active && !owner->context.timewait);
+    CHECK(!kernel_wait_queue_close(&owner->work) && !kernel_wait_queue_destroy(&owner->work));
+    tcp_owner_count=0;
+    puts("PASS owned TCP lookup: interleaving, binding changes, direct loopback, TIME_WAIT and retirement");
+}
+#endif
 
 static void tcp_more_service(void)
 {
@@ -4509,6 +4657,9 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "unix-seq-records")) unix_seqpacket_records();
     else if (!strcmp(argv[1], "ipv4-route")) ipv4_route_output();
     else if (!strcmp(argv[1], "tcp-loopback-checksum")) tcp_loopback_checksum();
+#if BOAROS_USER_SMP
+    else if (!strcmp(argv[1], "tcp-owner-lookup")) tcp_owner_lookup();
+#endif
     else if (!strcmp(argv[1], "tcp-cork")) tcp_cork_contract();
     else if (!strcmp(argv[1], "tcp-more")) tcp_more_contract();
     else if (!strcmp(argv[1], "tcp-detached")) tcp_detached_copy();
