@@ -164,6 +164,7 @@ struct ext4_block_group_ref {
 	struct ext4_fs *fs;
 	uint32_t index;
 	bool dirty;
+	bool preserves_inode_table;
 };
 
 struct ext4_inode_ref {
@@ -253,6 +254,10 @@ int ext4_fs_get_block_group_ref(struct ext4_fs *fs, uint32_t bgid,
 				struct ext4_block_group_ref *ref);
 int ext4_fs_get_block_group_ref_write(struct ext4_fs *fs, uint32_t bgid,
                                     struct ext4_block_group_ref *ref);
+/* Allocation accounting can update counts, flags and bitmap checksums.
+ * The inode table and bitmap locations belong to the mounted layout. */
+int ext4_fs_get_block_group_ref_accounting(struct ext4_fs *, uint32_t,
+                                         struct ext4_block_group_ref *);
 /* A claim caller already owns the group's shared allocation qualification. */
 int ext4_fs_get_block_group_ref_claim(struct ext4_fs *, uint32_t,
                                     struct ext4_block_group_ref *);

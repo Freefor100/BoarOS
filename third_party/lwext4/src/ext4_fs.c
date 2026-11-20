@@ -662,8 +662,14 @@ static void metadata_checked(struct ext4_block_payload *payload,
             UINT64_C(1)<<(check->position%64),__ATOMIC_RELEASE);
 }
 
+enum block_group_access {
+	BLOCK_GROUP_READ,
+	BLOCK_GROUP_ACCOUNTING,
+	BLOCK_GROUP_WRITE,
+};
+
 static int ext4_fs_get_block_group_ref_mode(struct ext4_fs *fs, uint32_t bgid,
-    struct ext4_block_group_ref *ref, bool write)
+    struct ext4_block_group_ref *ref, enum block_group_access access)
 {
 	COST_PHASE_SCOPE(read_source, 6);
 	if (bgid >= ext4_block_group_cnt(ext4_fs_super(fs)))
@@ -671,7 +677,7 @@ static int ext4_fs_get_block_group_ref_mode(struct ext4_fs *fs, uint32_t bgid,
 	/* A mutable descriptor can later change without another get. Permanently
 	 * stop reusing this group's fact before exposing its writable bytes; a
 	 * delayed reader can no longer publish over this marker. */
-	if (write && fs->inode_table_starts && bgid < fs->inode_table_groups)
+	if (access == BLOCK_GROUP_WRITE && fs->inode_table_starts && bgid < fs->inode_table_groups)
 		(void)__atomic_exchange_n(&fs->inode_table_starts[bgid],
 					  UINT64_MAX, __ATOMIC_ACQ_REL);
 	/* Compute number of descriptors, that fits in one data block */
@@ -685,8 +691,9 @@ static int ext4_fs_get_block_group_ref_mode(struct ext4_fs *fs, uint32_t bgid,
 
 	uint32_t offset = (bgid % dsc_cnt) * size;
 
-	int rc = write ? ext4_trans_block_get_range(fs->bdev, &ref->block, block_id, offset, size) :
-        ext4_block_get_range(fs->bdev, &ref->block, block_id, offset, size, EXT4_BLOCK_READ);
+	int rc = access == BLOCK_GROUP_READ ?
+	    ext4_block_get_range(fs->bdev, &ref->block, block_id, offset, size, EXT4_BLOCK_READ) :
+	    ext4_trans_block_get_range(fs->bdev, &ref->block, block_id, offset, size);
 	if (rc != EOK)
 		return rc;
 
@@ -694,6 +701,7 @@ static int ext4_fs_get_block_group_ref_mode(struct ext4_fs *fs, uint32_t bgid,
 	ref->fs = fs;
 	ref->index = bgid;
 	ref->dirty = false;
+	ref->preserves_inode_table = access == BLOCK_GROUP_ACCOUNTING;
 	struct ext4_bgroup *bg = ref->block_group;
 	struct metadata_check check;
 	bool cached=metadata_cached(ref->block.payload,bgid,offset,size,false,&check);
@@ -712,18 +720,26 @@ static int ext4_fs_get_block_group_ref_mode(struct ext4_fs *fs, uint32_t bgid,
 
 int ext4_fs_get_block_group_ref(struct ext4_fs *fs, uint32_t bgid,
     struct ext4_block_group_ref *ref)
-{ return ext4_fs_get_block_group_ref_mode(fs, bgid, ref, false); }
+{ return ext4_fs_get_block_group_ref_mode(fs, bgid, ref, BLOCK_GROUP_READ); }
+
+static int ext4_fs_get_block_group_ref_exclusive(struct ext4_fs *fs, uint32_t bgid,
+    struct ext4_block_group_ref *ref, enum block_group_access access)
+{
+    int result = ext4_operation_require_resource(fs, EXT4_RESOURCE_BLOCK_GROUP, bgid);
+    return result ? result : ext4_fs_get_block_group_ref_mode(fs, bgid, ref, access);
+}
 
 int ext4_fs_get_block_group_ref_write(struct ext4_fs *fs, uint32_t bgid,
     struct ext4_block_group_ref *ref)
-{
-    int result = ext4_operation_require_resource(fs, EXT4_RESOURCE_BLOCK_GROUP, bgid);
-    return result ? result : ext4_fs_get_block_group_ref_mode(fs, bgid, ref, true);
-}
+{ return ext4_fs_get_block_group_ref_exclusive(fs, bgid, ref, BLOCK_GROUP_WRITE); }
+
+int ext4_fs_get_block_group_ref_accounting(struct ext4_fs *fs, uint32_t bgid,
+    struct ext4_block_group_ref *ref)
+{ return ext4_fs_get_block_group_ref_exclusive(fs, bgid, ref, BLOCK_GROUP_ACCOUNTING); }
 
 int ext4_fs_get_block_group_ref_claim(struct ext4_fs *fs,uint32_t bgid,
                                      struct ext4_block_group_ref *ref)
-{ return ext4_fs_get_block_group_ref_mode(fs,bgid,ref,true); }
+{ return ext4_fs_get_block_group_ref_mode(fs,bgid,ref,BLOCK_GROUP_ACCOUNTING); }
 
 int ext4_fs_calculate_overhead(struct ext4_fs *fs, uint64_t *blocks)
 {
@@ -806,7 +822,7 @@ int ext4_fs_get_block_group_ref_alloc(struct ext4_fs *fs, uint32_t bgid,
 {
 	if (fs->read_only)
 		return EROFS;
-	int rc = ext4_fs_get_block_group_ref_write(fs, bgid, ref);
+	int rc = ext4_fs_get_block_group_ref_accounting(fs, bgid, ref);
 	if (rc != EOK)
 		return rc;
 	struct ext4_bgroup *bg = ref->block_group;
@@ -843,7 +859,8 @@ int ext4_fs_put_block_group_ref(struct ext4_block_group_ref *ref)
 {
 	/* Check if reference modified */
 	if (ref->dirty) {
-		if (ref->fs->inode_table_starts && ref->index < ref->fs->inode_table_groups)
+		if (!ref->preserves_inode_table && ref->fs->inode_table_starts &&
+		    ref->index < ref->fs->inode_table_groups)
 			(void)__atomic_exchange_n(&ref->fs->inode_table_starts[ref->index],
 						  UINT64_MAX, __ATOMIC_ACQ_REL);
 		/* Compute new checksum of block group */
