@@ -7,6 +7,7 @@
 ## 🛠️ 1. 环境依赖概览
 
 内核使用 GNU Make 和目标架构的交叉 GCC 构建，脚本使用 Python 3 和 Git。运行或测试内核需要对应架构的 QEMU 系统模拟器。
+已安装 pahole 时，可以传入 `PAHOLE=pahole` 使用系统工具。默认构建使用随仓库提供的固定源码，宿主依赖见[类型信息构建说明](modules/kernel-bpf.md#构建与检查)。
 
 | 目标 | 交叉编译器 | 模拟器 | 内核构建模式 |
 | :--- | :--- | :--- | :--- |
@@ -23,7 +24,7 @@
 
 ```sh
 make CROSS_COMPILE=riscv64-elf-
-make run-riscv QEMU_RISCV64=qemu-system-riscv64
+make shell-riscv QEMU_RISCV64=qemu-system-riscv64
 ```
 
 构建时会检查编译器和汇编器是否接受 `rv64imac_zicsr_zifencei`。早期工具链使用
@@ -57,17 +58,8 @@ make kernel-la LA_CROSS_COMPILE=loongarch64-unknown-linux-gnu-
 
 ---
 
-## 🔍 4. 环境验证与快速测试
+## 🔍 4. 启动与调试
 
-下列目标可检查内核构建与 QEMU 启动。无根盘时，RV 进入空闲循环，LA 生产内核报告根盘缺失。完整用户态启动见 [RV 根盘](modules/riscv-root-boot.md)和 [LA 根盘](modules/loongarch-boot.md)。
+交互启动使用 `make shell-riscv` 或 `make shell-loongarch`。根盘制作需要 curl 和 e2fsprogs，首次启动方法见 [README](../README.md) 的快速上手一节。
 
-```bash
-# 1. 编译并启动 RISC-V 内核（通过串口查看日志，Ctrl+A X 退出）
-make run-riscv
-
-# 2. 编译并启动 LoongArch 内核
-make run-loongarch
-
-# 3. 运行 RISC-V 架构与内核回归
-make test-riscv
-```
+开发时可以用 `make run-riscv` 检查无盘启动，用 `make debug-riscv` 启动并等待调试器连接。LoongArch 的 `make run-loongarch` 可检查生产内核在无盘时的启动诊断。测试入口见[贡献指南](../CONTRIBUTING.md#测试)。

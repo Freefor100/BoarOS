@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep installed tools and SDKs; remove rebuildable kernels and experiment outputs."""
+"""Keep boot disks and installed tools; remove rebuildable kernels and experiment outputs."""
 import sys
 from pathlib import Path
 sys.path[:0] = [str(Path(__file__).resolve().parent), str(Path(__file__).resolve().parents[1])]
@@ -12,9 +12,9 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
 BUILD = ROOT / 'build'
-# Whole installed inputs, not every historical profile that once built them.
+# Persistent boot disks and reusable installed inputs.
 CACHE_TREES = (
-    'tools/loongarch', 'tools/oscomp-local/host', 'local-keep',
+    'rootfs', 'tools/loongarch', 'tools/oscomp-local/host', 'local-keep',
     'qemu-la-rtc/qemu-system-loongarch64', 'qemu-la-rtc/build/qemu-system-loongarch64',
     'qemu-la-rtc/boaros-identity.json',
     'loongarch/musl-root', 'loongarch/gcc-sf/root',

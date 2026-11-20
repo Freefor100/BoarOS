@@ -18,7 +18,8 @@ class CleanupContract(unittest.TestCase):
                 'tools/loongarch/bin/gcc', 'loongarch/musl-root/bin/musl-gcc',
                 'riscv-user-smp4/riscv/musl-root/bin/musl-gcc',
                 'local-keep/source.tar', 'loongarch/gcc-sf/root/bin/gcc',
-                'tools/oscomp-local/riscv/mke2fs')
+                'tools/oscomp-local/riscv/mke2fs', 'rootfs/riscv64.img',
+                'rootfs/loongarch64.img')
             outputs=('host/cache/concurrency-12', 'io-budget/kernels/profile/kernel-rv',
                 'riscv/kernel/main.o', 'loongarch/fs/vfs.o',
                 'riscv-user-smp8/riscv/mm/mm.o', 'riscv-user-smp8/kernel-rv',

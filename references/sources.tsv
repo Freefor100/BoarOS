@@ -12,6 +12,8 @@ snapshot	opensbi	https://github.com/riscv-software-src/opensbi.git	refs/tags/v1.
 snapshot	loongarch-documentation	https://github.com/loongson/LoongArch-Documentation.git	e0d6592229d9e00e512bd28b688a7f20b171714f	e0d6592229d9e00e512bd28b688a7f20b171714f
 snapshot	visionfive2-sdk	https://github.com/starfive-tech/VisionFive2.git	refs/tags/JH7110_VF2_6.12_v6.0.0	7f1bacc7c3969ea7ae7da4b9f3ca3fbd6e39c142
 file	musl/musl-1.2.5.tar.gz	https://musl.libc.org/releases/musl-1.2.5.tar.gz	-	a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4
+file	alpine/v3.23/main/riscv64/busybox-static-1.37.0-r30.apk	https://dl-cdn.alpinelinux.org/alpine/v3.23/main/riscv64/busybox-static-1.37.0-r30.apk	-	538f48780e21ef78cd171137cecb4197da2cc3c15d3f1895a23eeea99a4a3614
+file	alpine/v3.23/main/loongarch64/busybox-static-1.37.0-r30.apk	https://dl-cdn.alpinelinux.org/alpine/v3.23/main/loongarch64/busybox-static-1.37.0-r30.apk	-	91e817d5598cdb0cd51706995119fa4058fd1cdd372d8c57db1e2c4a487e7920
 # glibc 2.44 release source for ABI and license; accessed 2026-09-27.
 file	glibc/glibc-2.44.tar.xz	https://ftp.gnu.org/gnu/glibc/glibc-2.44.tar.xz	-	37f600f2bef3c5e8300147059568b2a2e40a7ad6ccc65ce942556d49429cc667
 # SQLite 3.53.4 official amalgamation; accessed 2026-09-27.

@@ -83,51 +83,20 @@ RISC-V 和 LoongArch 各自处理启动、异常入口、上下文切换和页�
 
 ## 🚀 快速上手
 
-### 1. 环境准备
+在 Linux 宿主安装 GNU Make、Python 3、Git、curl、e2fsprogs、pahole，以及目标架构的交叉工具链和 QEMU。交叉编译器前缀与模拟器配置见[工具链指南](docs/toolchain.md)。
 
-在宿主安装 GNU Make、Python 3、Git、目标架构的交叉 GCC 与 QEMU。编译器前缀、已验证版本和 LoongArch QEMU 的准备方式见[工具链指南](docs/toolchain.md)。
+在仓库根目录按目标架构选择一条命令。首次运行会下载静态 BusyBox、制作 ext4 根盘、编译内核并启动 QEMU。
 
-### 2. 编译内核
-
-```bash
-# 编译 RISC-V 内核（生成 kernel-rv）
-make
-
-# 编译 LoongArch 内核（生成 kernel-la）
-make kernel-la
-
-# 编译 8 核 SMP 多核内核版本
-make kernel-rv-user-smp SMP_CPUS=8
-make kernel-la LA_SMP=1 LA_SMP_CPUS=8
+```sh
+make shell-riscv PAHOLE=pahole
+make shell-loongarch PAHOLE=pahole QEMU_LOONGARCH64=qemu-system-loongarch64
 ```
 
-### 3. 一键运行与体验
+看到 `Please press Enter to activate this console.` 时按回车。进入 `/ #` 后可执行 `ls /`、`uname -a`，用 `poweroff -f` 关机。BusyBox 提供 `sh` 命令解释器及常用用户态工具。
 
-下列启动目标不附加根盘。RISC-V 无盘时进入空闲循环；LoongArch 生产内核会报告缺少根盘。运行用户程序时，按 [RISC-V 根盘](docs/modules/riscv-root-boot.md)或 [LoongArch 根盘](docs/modules/loongarch-boot.md)的说明准备镜像。
+根盘存放在 `build/rootfs/`，后续启动会复用原镜像及盘内改动。只制作根盘可用 `make rootfs-riscv` 或 `make rootfs-loongarch`。只编译内核可用 `make PAHOLE=pahole` 或 `make kernel-la PAHOLE=pahole`。
 
-```bash
-# 启动 RISC-V 内核（单核，无根盘启动）
-make run-riscv
-
-# 启动 LoongArch 内核（单核模式）
-make run-loongarch
-
-# 调试模式（启动并等待 GDB 连接）
-make debug-riscv
-```
-
-### 4. 运行架构回归
-
-```bash
-# 运行 RISC-V 内核单元测试与子系统测试
-make test-riscv
-
-# 运行 LoongArch 相关契约测试与内存测试
-make test-loongarch
-
-# 清理构建产物与临时镜像
-make prune-build
-```
+开发和回归检查见[贡献指南](CONTRIBUTING.md)。
 
 ---
 
