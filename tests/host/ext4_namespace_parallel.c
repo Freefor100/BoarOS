@@ -92,6 +92,26 @@ static void inode_geometry_reuse_case(struct lwext4_mount_adapter *adapter)
     inode_geometry_watch=0;
     printf("inode location reuse: GDT reads=%u\n",inode_geometry_reads);
     assert(inode_geometry_reads<=1);
+    char name[64];
+    int length=snprintf(name,sizeof(name),"%sgeometry-reuse",adapter->mount_point);
+    assert(length>0 && (size_t)length<sizeof(name));
+    ext4_file file;
+    assert(!ext4_fopen(&file,name,"w+"));
+    assert((file.inode-1)/ext4_get32(&fs->sb,inodes_per_group)==index);
+    unsigned char data[4096]={1};
+    size_t written;
+    assert(!ext4_fwrite(&file,data,sizeof(data),&written) && written==sizeof(data));
+    assert(!ext4_fclose(&file));
+    assert(!ext4_fremove(name));
+    inode_geometry_watch=1;inode_geometry_reads=0;
+    for(unsigned i=0;i<32;i++) {
+        struct ext4_inode_ref inode;
+        assert(!ext4_fs_get_inode_ref_read(fs,number,&inode));
+        assert(!ext4_fs_put_inode_ref(&inode));
+    }
+    inode_geometry_watch=0;
+    printf("inode location after allocation and free: GDT reads=%u\n",inode_geometry_reads);
+    assert(!inode_geometry_reads);
     assert(!ext4_fs_get_block_group_ref_write(fs,index,&group));
     uint16_t checksum=group.block_group->checksum;
     group.block_group->checksum^=1;

@@ -165,7 +165,7 @@ int ext4_ialloc_free_inode(struct ext4_fs *fs, uint32_t index, bool is_dir)
 	int rc;
 
 	struct ext4_block_group_ref bg_ref;
-	rc = ext4_fs_get_block_group_ref_write(fs, block_group, &bg_ref);
+	rc = ext4_fs_get_block_group_ref_accounting(fs, block_group, &bg_ref);
 	if (rc != EOK)
 		return rc;
 
