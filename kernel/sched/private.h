@@ -266,7 +266,7 @@ static inline __attribute__((always_inline)) int scheduler_finish_local_locked(s
 void ready_append(struct kernel_task *thread);
 int scheduler_forget_task_locked(struct kernel_task *, struct kernel_wait_cursor *);
 void scheduler_forget_task(struct kernel_task *thread);
-void deadline_index_insert(struct kernel_task *task);
+int deadline_index_insert(struct kernel_task *task);
 void deadline_index_remove(struct kernel_task *task);
 struct kernel_task *deadline_index_first(void);
 enum kernel_scheduler_status scheduler_switch_current_away(

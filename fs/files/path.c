@@ -172,6 +172,21 @@ int kernel_files_path_start(struct kernel_files *files,
     return *start ? kernel_vfs_path_acquire(*start) : -KERNEL_EIO;
 }
 
+static int borrow_lookup_start(struct kernel_files *files,
+    const struct kernel_fs_paths *snapshot,int64_t dirfd,const char *path,
+    struct kernel_vfs_path **start,struct kernel_vfs_path **owner)
+{
+    if (!path[0]) return -KERNEL_ENOENT;
+    if (path[0]=='/') *start=snapshot->root;
+    else if (dirfd==KERNEL_FS_AT_FDCWD) *start=snapshot->cwd;
+    else {
+        int result=kernel_files_path_start(files,snapshot,dirfd,path,owner);
+        if (result) return result;
+        *start=*owner;
+    }
+    return *start ? 0 : -KERNEL_EIO;
+}
+
 static enum kernel_fs_context_status copy_path(
     struct kernel_mm *mm, uint64_t user_path, char *buffer, size_t capacity,
     int *result)
@@ -212,9 +227,10 @@ static enum kernel_files_status files_open(
 {
     KERNEL_SERVICE_SCOPE_IF(service, 0);
     struct kernel_task_io_buffer path_buffer __attribute__((cleanup(path_buffer_release)))={0};
-    KERNEL_FS_PATHS(fs_paths, fs);
+    struct kernel_fs_paths fs_paths __attribute__((cleanup(kernel_fs_paths_release)))={0};
     struct kernel_open_file_description *description = 0;
-    KERNEL_FILES_PATH_SCOPE(start);
+    KERNEL_FILES_PATH_SCOPE(start_owner);
+    struct kernel_vfs_path *start=NULL;
     char *path;
     uint32_t fd;
     uint32_t fd_flags = 0U;
@@ -266,7 +282,9 @@ static enum kernel_files_status files_open(
         else {
             const char *selection=path;
             if (path[0]=='/' && (resolve & KERNEL_VFS_RESOLVE_IN_ROOT)) selection=".";
-            result=kernel_files_path_start(files,&fs_paths,dirfd,selection,&start);
+            fs_paths=kernel_fs_context_path_snapshot(fs,
+                selection[0]!='/' && dirfd==KERNEL_FS_AT_FDCWD);
+            result=borrow_lookup_start(files,&fs_paths,dirfd,selection,&start,&start_owner);
         }
         /* Normal lookup revalidates names through the backend even on a dentry
          * hit. There is no cache-only backend walk to fall back to. */
@@ -768,7 +786,8 @@ static enum kernel_files_status stat_at_to_user(
     struct kernel_task_io_buffer path_buffer __attribute__((cleanup(path_buffer_release)))={0};
     KERNEL_FILES_PIN_SCOPE(pin_guard);
     struct kernel_vfs_stat stat={0};
-    KERNEL_FILES_PATH_SCOPE(start);
+    KERNEL_FILES_PATH_SCOPE(start_owner);
+    struct kernel_vfs_path *start=NULL;
     char *path = 0;
     size_t length = 0;
     int result;
@@ -810,9 +829,6 @@ static enum kernel_files_status stat_at_to_user(
         *linux_result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
     }
-    /* A descriptor-only stat borrows its OFD, not root/cwd. Acquire the
-     * path snapshot only for operations that actually resolve a path. */
-    KERNEL_FS_PATHS(fs_paths, fs);
     if (!empty) {
         enum kernel_task_status allocation=kernel_task_io_buffer_acquire(&path_buffer,mm->allocator);
         if (allocation != KERNEL_TASK_STATUS_OK) {
@@ -832,6 +848,11 @@ static enum kernel_files_status stat_at_to_user(
         }
         empty = !length && (flags & KERNEL_FILES_AT_EMPTY_PATH);
     }
+    /* Absolute paths and relative dirfd walks still need the root boundary
+     * for symlinks and dot-dot, but never use the working directory. */
+    struct kernel_fs_paths fs_paths __attribute__((cleanup(kernel_fs_paths_release))) =
+        kernel_fs_context_path_snapshot(fs,dirfd==KERNEL_FS_AT_FDCWD &&
+                                       (empty || path[0]!='/'));
     if (empty) {
         if (dirfd == KERNEL_FS_AT_FDCWD) {
             result = kernel_vfs_path_stat(fs_paths.cwd, &stat);
@@ -841,7 +862,7 @@ static enum kernel_files_status stat_at_to_user(
             result = file ? stat_description(&stat, file) : -KERNEL_EBADF;
         }
     } else {
-        result = kernel_files_path_start(files, &fs_paths, dirfd, path, &start);
+        result=borrow_lookup_start(files,&fs_paths,dirfd,path,&start,&start_owner);
         if (!result) result = kernel_vfs_stat_at(start, fs_paths.root,
                     path, !(flags & KERNEL_FILES_AT_SYMLINK_NOFOLLOW), &stat);
     }

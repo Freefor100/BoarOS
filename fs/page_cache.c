@@ -234,8 +234,16 @@ RB_GENERATE_INTERNAL(kernel_page_cache_tree,kernel_page_cache_entry,page_link,di
 
 static struct kernel_page_cache_entry *index_at_or_after(struct kernel_vfs_node *node,uint64_t index)
 {
-    struct kernel_page_cache_entry key={.page_index=index};
-    return RB_NFIND(kernel_page_cache_tree,&node->cache_pages,&key);
+    struct kernel_page_cache_entry *entry=RB_ROOT(&node->cache_pages), *next=NULL;
+    while (entry) {
+        COST_ADD(CACHE_PROBES,1);
+        if (entry->page_index==index) return entry;
+        if (entry->page_index>index) {
+            next=entry;
+            entry=RB_LEFT(entry,page_link);
+        } else entry=RB_RIGHT(entry,page_link);
+    }
+    return next;
 }
 static struct kernel_page_cache_entry *index_find(const struct kernel_vfs_node *node,uint64_t index)
 {
@@ -1668,19 +1676,34 @@ static size_t entry_valid_bytes(const struct kernel_page_cache_entry *entry)
                                           : BOAROS_PAGE_SIZE;
 }
 
-static inline void note_read_hit(struct kernel_page_cache *cache,
+static inline void note_read_access(struct kernel_page_cache *cache,
     struct kernel_page_cache_entry *entry, int no_reuse)
 {
 #if BOAROS_MAX_CPUS > 1
+    (void)cache;
     /* Reclaim clears the reference bit only under this inode's index lock.
      * Readers also protected by cache metadata cannot race that clear. */
     if (!no_reuse && !__atomic_load_n(&entry->accessed,__ATOMIC_RELAXED))
         __atomic_store_n(&entry->accessed,1,__ATOMIC_RELAXED);
-    __atomic_fetch_add(&cache->record->read_hits,1,__ATOMIC_RELAXED);
 #else
     if (!no_reuse && !entry_retired(entry)) lru_touch(cache->record,entry);
-    cache->record->statistics.hits++;
 #endif
+}
+
+static inline void note_read_hits(struct kernel_page_cache *cache,size_t count)
+{
+#if BOAROS_MAX_CPUS > 1
+    __atomic_fetch_add(&cache->record->read_hits,count,__ATOMIC_RELAXED);
+#else
+    cache->record->statistics.hits+=count;
+#endif
+}
+
+static inline void note_read_hit(struct kernel_page_cache *cache,
+    struct kernel_page_cache_entry *entry,int no_reuse)
+{
+    note_read_access(cache,entry,no_reuse);
+    note_read_hits(cache,1);
 }
 
 /* 在索引保护内把已完成页交给读取者；物理引用接替entry保护，不必再借用一次entry。 */
@@ -1691,7 +1714,7 @@ static inline void take_read_page(struct kernel_page_cache *cache,
     if (physical_page_acquire(cache->allocator, entry->physical_address)) __builtin_trap();
     *address = entry->physical_address;
     *valid = bytes;
-    note_read_hit(cache,entry,no_reuse);
+    note_read_access(cache,entry,no_reuse);
 }
 
 /* 批量读取中直接借用entry保护物理页，避免频繁进入分配器获取全局自旋锁。 */
@@ -1702,7 +1725,7 @@ static inline void take_read_page_borrow(struct kernel_page_cache *cache,
     *entry_out = entry;
     *address = entry->physical_address;
     *valid = bytes;
-    note_read_hit(cache,entry,no_reuse);
+    note_read_access(cache,entry,no_reuse);
 }
 
 static enum kernel_page_cache_status finish_read_page(
@@ -1792,6 +1815,7 @@ enum kernel_page_cache_status kernel_page_cache_lookup_ready(
     size_t bytes=entry_valid_bytes(entry);
     if (!bytes) return KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE;
     take_read_page(cache,entry,address,valid,bytes,no_reuse);
+    note_read_hits(cache,1);
     return KERNEL_PAGE_CACHE_STATUS_OK;
 }
 
@@ -2406,6 +2430,7 @@ static void commit_read_batch(void *argument)
                     pages[i].status=KERNEL_PAGE_CACHE_STATUS_BUSY;
                 } else if (read_entry_ready(entry)) {
                     take_read_page_borrow(cache,entry,&pages[i].physical_address,&pages[i].valid_bytes,&pages[i].entry,entry_valid_bytes(entry),request->no_reuse);
+                    note_read_hits(cache,1);
                     pages[i].status=KERNEL_PAGE_CACHE_STATUS_OK;
                 } else { entry_borrow(entry);entries[i]=entry; }
                 if (candidate) { candidate->cleanup_next=discard;discard=candidate; }
@@ -2566,6 +2591,7 @@ static int read_cached_batch(struct cache_read_batch_request *request, bool take
     struct kernel_page_cache *cache=request->cache;
     struct kernel_vfs_node *node=request->node;
     int pending=0,retry=0,remote=-1;
+    size_t i=0,hits=0;
     {
 #if BOAROS_MAX_CPUS > 1
         CACHE_INDEX_SCOPE(guard,node);
@@ -2575,11 +2601,29 @@ static int read_cached_batch(struct cache_read_batch_request *request, bool take
 #endif
         if (!retry) retry=!read_cache_open(node);
         uint64_t size=retry?0:kernel_vfs_node_size(node);
-        for (size_t i=0;i<request->count && !retry;i++) {
+        uint64_t first=request->first;
+        struct kernel_page_cache_entry *next=NULL;
+        if ((first<<BOAROS_PAGE_SHIFT)<size)
+            next=request->count==1?index_find(node,first):index_at_or_after(node,first);
+        for (;i<request->count && !retry;i++) {
             struct kernel_page_cache_read_page *page=&request->pages[i];
-            uint64_t offset=(request->first+i)<<BOAROS_PAGE_SHIFT;
-            if (offset>=size) { page->status=KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE; continue; }
-            struct kernel_page_cache_entry *entry=index_find(node,request->first+i);
+            page->status=KERNEL_PAGE_CACHE_STATUS_NOT_FOUND;
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+            page->cache_miss=0;
+#endif
+            uint64_t index=first+i;
+            uint64_t offset=index<<BOAROS_PAGE_SHIFT;
+            if (offset>=size) {
+                page->status=KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE;
+                page->physical_address=0;
+                page->valid_bytes=0;
+                continue;
+            }
+            /* One root lookup per batch. A gap leaves the next cached page
+             * in place until the loop reaches it. */
+            struct kernel_page_cache_entry *entry=next && next->page_index==index?next:NULL;
+            if (entry && i+1<request->count)
+                next=RB_NEXT(kernel_page_cache_tree,&node->cache_pages,entry);
             if (!entry) {
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
                 page->cache_miss=1;
@@ -2608,10 +2652,14 @@ static int read_cached_batch(struct cache_read_batch_request *request, bool take
             else
                 take_read_page_borrow(cache,entry,&page->physical_address,&page->valid_bytes,&page->entry,valid,request->no_reuse);
             page->status=KERNEL_PAGE_CACHE_STATUS_OK;
+            hits++;
         }
+#if BOAROS_MAX_CPUS == 1
+        note_read_hits(cache,hits);
+#endif
         if (retry) {
-            for (size_t i=0;i<request->count;i++) {
-                struct kernel_page_cache_read_page *page=&request->pages[i];
+            for (size_t j=0;j<i;j++) {
+                struct kernel_page_cache_read_page *page=&request->pages[j];
                 if (!page->status && page->entry) {
                     entry_return(page->entry);
                     page->entry=NULL;
@@ -2623,6 +2671,19 @@ static int read_cached_batch(struct cache_read_batch_request *request, bool take
             /* Private preparation has no indexed entry yet. Retain the same
              * cache lifetime used by queued requests until caller unwind. */
             request_borrow(cache->record);
+        }
+    }
+#if BOAROS_MAX_CPUS > 1
+    if (hits) note_read_hits(cache,hits);
+#endif
+    if (pending || retry) {
+        /* A local miss already initialized the slot where the scan stopped. */
+        if (!retry && i<request->count) i++;
+        for (;i<request->count;i++) {
+            request->pages[i].status=KERNEL_PAGE_CACHE_STATUS_NOT_FOUND;
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+            request->pages[i].cache_miss=0;
+#endif
         }
     }
     return pending || retry;
@@ -2719,6 +2780,7 @@ scalar:;
                 if (read_entry_ready(entry)) {
                     size_t valid = size - offset < BOAROS_PAGE_SIZE ? size - offset : BOAROS_PAGE_SIZE;
                     take_read_page_borrow(cache, entry, &page->physical_address, &page->valid_bytes, &page->entry, valid,request->no_reuse);
+                    note_read_hits(cache,1);
                     page->status = KERNEL_PAGE_CACHE_STATUS_OK;
                     continue;
                 }
@@ -2769,20 +2831,15 @@ static enum kernel_page_cache_status get_batch(
         (count && (!pages || first > UINT64_MAX >> BOAROS_PAGE_SHIFT ||
             count - 1 > (UINT64_MAX >> BOAROS_PAGE_SHIFT) - first)))
         return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
-    for (size_t i=0;i<count;i++) {
-        pages[i].status=KERNEL_PAGE_CACHE_STATUS_NOT_FOUND;
-#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
-        pages[i].cache_miss=0;
-#endif
-    }
     if (!count) return KERNEL_PAGE_CACHE_STATUS_OK;
     struct cache_read_batch_request request = {cache,file,node,first,pages,count,no_reuse,read_window,false};
     /* local首个缺页后交给inode资格下的重查，不重复预扫整批。remote须先
      * 取出全部热页：尚未执行的CPU0请求被取消时，后部成功项也继续有效。 */
-    if (read_cached_batch(&request,take_physical)) {
-        prepare_read_batch(&request);
-        request_return(cache->record);
-    }
+    if (!read_cached_batch(&request,take_physical))
+        /* The fast scan only returns hits and a possible EOF suffix. */
+        return pages[count-1].status;
+    prepare_read_batch(&request);
+    request_return(cache->record);
     enum kernel_page_cache_status result = KERNEL_PAGE_CACHE_STATUS_OK;
     for (size_t i = 0; i < count; i++) if (pages[i].status) {
         pages[i].physical_address = 0;
@@ -3025,13 +3082,16 @@ PrepareTarget:
                 return error;
             }
         }
-        kernel_vfs_node_lock(node,&io,1);
-        int admitted=0,published=0;
+        struct kernel_vfs_write_source copied_source;
         if (candidate) {
             /* 私有页尚无读取者；先填入，再一次发布ready和dirty。
              * 竞胜页或写资格关闭时，原来源游标仍可重试。 */
-            struct kernel_vfs_write_source copied_source=*source;
+            copied_source=*source;
             kernel_vfs_write_source_copy_view(&copied_source,candidate->data+start,&view);
+        }
+        kernel_vfs_node_lock(node,&io,1);
+        int admitted=0,published=0;
+        if (candidate) {
             CACHE_SCOPE(guard,cache);
             struct kernel_page_cache_entry *current=index_find(node,offset>>BOAROS_PAGE_SHIFT);
             if (current) {
@@ -3068,7 +3128,7 @@ PrepareTarget:
             if (writer.registration) writer_end_locked(&writer);
             entry_return(entry);
         }
-        kernel_vfs_node_written(node,offset+count);
+        if (offset+count>old_size) kernel_vfs_node_written(node,offset+count);
         kernel_lock_release(&io);
         kernel_vfs_write_source_finish(source,&view);
         kernel_page_cache_resize_finish(&resize,old_size);

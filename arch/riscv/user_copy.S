@@ -24,7 +24,11 @@ riscv_uaccess_fixups_start:
     beqz a2,.Ldone\@
     xor t1,a0,a1
     andi t1,t1,7
+    .if \to_user
+    bnez t1,.Ldst_align\@
+    .else
     bnez t1,.Lbytes\@
+    .endif
 .Lalign\@:
     andi t1,a0,7
     beqz t1,.Lbatch\@
@@ -47,8 +51,27 @@ riscv_uaccess_fixups_start:
     andi t1,a1,31
     .endif
     bnez t1,.Lword\@
+    /* The aligned loop advances by a whole batch, preserving alignment
+     * and the fault offsets. Only the remaining length can end it. */
+    li t1,32
 .Lread0\@:
     ld t0,0(a1)
+    .if \to_user
+    /* Kernel source words are already in range. Read all four before
+     * touching the user mapping so alternating translations cannot evict
+     * each other on every word. Each user store has its own fixup. */
+    ld t2,8(a1)
+    ld t3,16(a1)
+    ld t4,24(a1)
+.Lwrite0\@:
+    sd t0,0(a0)
+.Lwrite8\@:
+    sd t2,8(a0)
+.Lwrite16\@:
+    sd t3,16(a0)
+.Lwrite24\@:
+    sd t4,24(a0)
+    .else
 .Lwrite0\@:
     sd t0,0(a0)
 .Lread8\@:
@@ -63,10 +86,11 @@ riscv_uaccess_fixups_start:
     ld t0,24(a1)
 .Lwrite24\@:
     sd t0,24(a0)
+    .endif
     addi a0,a0,32
     addi a1,a1,32
     addi a2,a2,-32
-    j .Lbatch\@
+    bgeu a2,t1,.Lread0\@
 .Lwords\@:
     li t1,8
     bltu a2,t1,.Lbytes\@
@@ -79,6 +103,55 @@ riscv_uaccess_fixups_start:
     addi a1,a1,8
     addi a2,a2,-8
     j .Lbatch\@
+    .if \to_user
+/* Align the user stores, then assemble each word from in-range kernel
+ * loads. Each recovered store still has exactly a2 bytes remaining.
+ * User reads keep their byte path so a missing next page cannot discard
+ * a valid prefix while assembling a word. */
+.Ldst_align\@:
+    andi t1,a0,7
+    beqz t1,.Lshift_prepare\@
+    lbu t0,0(a1)
+.Lwrite_dst_align\@:
+    sb t0,0(a0)
+    addi a0,a0,1
+    addi a1,a1,1
+    addi a2,a2,-1
+    bnez a2,.Ldst_align\@
+    j .Ldone\@
+.Lshift_prepare\@:
+    li t1,16
+    bltu a2,t1,.Lbytes\@
+    andi t3,a1,7
+    neg t4,a1
+    andi t4,t4,7
+    add a3,a1,t4
+    addi a4,t4,8
+    slli t3,t3,3
+    slli t4,t4,3
+    mv a5,a1
+    li t2,0
+    li a6,0
+.Lshift_prefix\@:
+    lbu t0,0(a5)
+    sll t0,t0,a6
+    or t2,t2,t0
+    addi a6,a6,8
+    addi a5,a5,1
+    bne a5,a3,.Lshift_prefix\@
+.Lshift_words\@:
+    ld a5,0(a3)
+    sll t0,a5,t4
+    or t0,t0,t2
+.Lwrite_shift_word\@:
+    sd t0,0(a0)
+    srl t2,a5,t3
+    addi a0,a0,8
+    addi a1,a1,8
+    addi a2,a2,-8
+    addi a3,a3,8
+    bgeu a2,a4,.Lshift_words\@
+    .endif
 .Lbytes\@:
     beqz a2,.Ldone\@
 .Lread_byte\@:
@@ -116,6 +189,8 @@ riscv_uaccess_fixups_start:
     recover .Lwrite16\@,.Lfail16\@
     recover .Lwrite24\@,.Lfail24\@
     recover .Lwrite_word\@,.Lfail\@
+    recover .Lwrite_dst_align\@,.Lfail\@
+    recover .Lwrite_shift_word\@,.Lfail\@
     recover .Lwrite_byte\@,.Lfail\@
     .else
     recover .Lread_align\@,.Lfail\@

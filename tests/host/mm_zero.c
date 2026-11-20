@@ -116,6 +116,25 @@ static void detach_neighbor_publication(void)
     assert(!arch_mmu_user_space_destroy(&space));
     puts("MM detach preserves a neighbor published behind an earlier scan prefix");
 }
+
+static void detach_sparse_leaf_window(void)
+{
+    struct arch_mmu_user_space space={0};
+    assert(!arch_mmu_user_space_init(&space,&pages,&kernel));
+    const uint64_t start=UINT64_C(0x400000),page=BOAROS_PAGE_SIZE;
+    assert(!arch_mmu_user_map_zeroed_page(&space,start+page,ARCH_MMU_READ));
+    assert(!arch_mmu_user_map_zeroed_page(&space,start+63*page,ARCH_MMU_READ));
+    struct kernel_mm_detach_cursor cursor={0};
+    struct kernel_mm_retirement batch={0};
+    enum arch_mmu_status status=arch_mmu_user_detach_range(&space,start,start+64*page,
+        &cursor,&batch,0,0);
+    assert(status==ARCH_MMU_STATUS_OK || status==ARCH_MMU_STATUS_NOT_MAPPED);
+    assert(cursor.address==start+64*page && !space.leaf_pages);
+    drain(&batch);
+    detach(&space,start,start+64*page,0);
+    assert(!arch_mmu_user_space_destroy(&space));
+}
+
 static void detach_parent_replacement(void)
 {
     for (unsigned replace=0;replace<2;replace++) {
@@ -226,6 +245,7 @@ int main(void)
     assert(physical_page_available(&pages) == baseline);
     detach_parent_replacement();
     detach_neighbor_publication();
+    detach_sparse_leaf_window();
     assert(physical_page_available(&pages) == baseline);
 
     take_zero();

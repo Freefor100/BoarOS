@@ -415,11 +415,12 @@ static void mount_view_tree(struct kernel_vfs_mount *mount)
     assert(!kernel_vfs_path_stat(path,&bound)&&original.dev==bound.dev&&original.ino==bound.ino);
     assert(!kernel_vfs_path_release(&path));
     assert(!kernel_vfs_umount(tree,2)&&!kernel_vfs_path_release(&tree));
-    assert(!kernel_vfs_path_open(held,&file)&&!kernel_vfs_close(&file));
+    assert(!kernel_vfs_path_open(held,&file) && file.path==held && !file.location_owner);
+    assert(!kernel_vfs_close(&file));
     assert(!kernel_vfs_path_release(&held));
     assert(!kernel_vfs_umount(copy,0)&&!kernel_vfs_path_release(&copy));
     assert(!kernel_vfs_path_resolve(root,root,"/single",1,&path));
-    assert(!kernel_vfs_path_open(path,&file));
+    assert(!kernel_vfs_path_open(path,&file) && file.path==path && !file.location_owner);
     assert(!kernel_vfs_umount(path,2)&&!kernel_vfs_path_release(&path));
     char bytes[3]={0};struct kernel_vfs_read_options miss={0};
     assert(!kernel_vfs_pread(&file,0,bytes,2,&done,&miss)&&done==2&&!strcmp(bytes,"ok"));

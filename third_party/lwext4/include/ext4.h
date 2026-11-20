@@ -598,11 +598,16 @@ int ext4_fpread(const ext4_file *file, uint64_t offset, void *buf, size_t size, 
  * Reads consult cache versions, including dirty and journal-pending data.
  * Multi-output callers lend a workspace until return; scalar callers may pass
  * NULL. size_limit caps visible EOF without changing the caller's span sizes.
- * pad_eof grants DMA access within each span beyond logical EOF. Only callers
- * owning that suffix may enable it; they initialize the tail before exposure.
- * Ordinary positioned reads preserve their untouched suffix by passing false. */
+ * EXT4_PREAD_PAD_EOF grants DMA access within each span beyond logical EOF.
+ * Only callers owning that suffix may enable it; they initialize the tail
+ * before exposure. EXT4_PREAD_LOCK_HELD borrows the mount scope already
+ * held by the caller until synchronous completion. */
+enum ext4_pread_flags {
+    EXT4_PREAD_PAD_EOF = 1U,
+    EXT4_PREAD_LOCK_HELD = 2U,
+};
 int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsigned count,
-    struct file_read_workspace *workspace, uint64_t size_limit, const struct file_read_completion *completion, bool pad_eof);
+    struct file_read_workspace *workspace, uint64_t size_limit, const struct file_read_completion *completion, unsigned flags);
 
 
 /**@brief   Write data to file.

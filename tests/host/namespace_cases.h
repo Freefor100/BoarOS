@@ -651,6 +651,12 @@ static void namespace_snapshot_case(struct kernel_heap *heap,
     assert(!kernel_vfs_path_release(&selected));
     struct kernel_fs_paths changed=kernel_fs_context_snapshot(&original);
     assert(changed.cwd==b);
+    struct kernel_fs_paths absolute=kernel_fs_context_path_snapshot(&original,false);
+    assert(absolute.root==changed.root && !absolute.cwd && absolute.umask==changed.umask);
+    assert(!kernel_files_path_start(NULL,&absolute,123,"/namespace-cwd-b",&selected) &&
+           selected==absolute.root);
+    assert(!kernel_vfs_path_release(&selected));
+    kernel_fs_paths_release(&absolute);
     struct kernel_fs_paths isolated=kernel_fs_context_snapshot(&forked);
     assert(isolated.cwd==a);
     assert(!kernel_fs_context_move(&moved,&shared));

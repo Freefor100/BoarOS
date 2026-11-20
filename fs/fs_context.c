@@ -66,19 +66,24 @@ static void finish_context(struct kernel_fs_context *fs,
     fs->state = state;
 }
 
-struct kernel_fs_paths kernel_fs_context_snapshot(const struct kernel_fs_context *fs)
+struct kernel_fs_paths kernel_fs_context_path_snapshot(const struct kernel_fs_context *fs,
+                                                      bool need_cwd)
 {
     KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
     struct kernel_fs_paths paths = {0};
     if (kernel_fs_context_is_live(fs)) {
         paths.root = fs->record->root;
-        paths.cwd = fs->record->cwd;
+        paths.cwd = need_cwd ? fs->record->cwd : NULL;
         paths.umask = fs->record->umask;
-        if (kernel_vfs_path_acquire(paths.root) || kernel_vfs_path_acquire(paths.cwd))
+        if (kernel_vfs_path_acquire(paths.root) ||
+            (paths.cwd && kernel_vfs_path_acquire(paths.cwd)))
             __builtin_trap();
     }
     return paths;
 }
+
+struct kernel_fs_paths kernel_fs_context_snapshot(const struct kernel_fs_context *fs)
+{ return kernel_fs_context_path_snapshot(fs,true); }
 
 void kernel_fs_paths_release(struct kernel_fs_paths *paths)
 {

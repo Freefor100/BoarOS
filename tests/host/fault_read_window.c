@@ -79,6 +79,16 @@ unsigned __wrap_kernel_heap_allocate_zeroed_batch_nosleep(struct kernel_heap *he
     if (allocated) window_borrow_after_optional();
     return allocated;
 }
+int __real_kernel_open_file_try_prepare_disk_mapping_page(struct kernel_open_file_description *,
+    uint64_t,struct kernel_open_file_page_preparation *);
+int __wrap_kernel_open_file_try_prepare_disk_mapping_page(struct kernel_open_file_description *file,
+    uint64_t index,struct kernel_open_file_page_preparation *prepared)
+{
+    /* The slow-path race pauses after the blocking lookup has taken its
+     * reference. Exercise that route even when a cached page could go fast. */
+    return window_pause_after_get ? 0 :
+        __real_kernel_open_file_try_prepare_disk_mapping_page(file,index,prepared);
+}
 enum kernel_page_cache_status __real_kernel_page_cache_get_for_fault(struct kernel_page_cache *,
     const struct kernel_vfs_file *,uint64_t,uint64_t *,size_t *,int,int);
 enum kernel_page_cache_status __wrap_kernel_page_cache_get_for_fault(struct kernel_page_cache *cache,
@@ -505,8 +515,9 @@ static void window_mm_ready_gate(struct kernel_page_cache *cache,struct kernel_h
     struct window_mm view={0};window_mm_create(&view,heap,pages);
     window_map(&view,file,base,3*p);
     assert(!kernel_mm_madvise(&view.mm,base,3*p,KERNEL_MM_ADVICE_RANDOM));
-    assert(window_mm_read(&view.mm,view.context,base)==0x30);
     unsigned ordinary=window_fault_get_calls;
+    assert(window_mm_read(&view.mm,view.context,base)==0x30);
+    assert(window_fault_get_calls==ordinary);
     assert(window_mm_read(&view.mm,view.context,base+p)==0x31);
     assert(window_fault_get_calls==ordinary);
     window_fail_nosleep=1;window_nosleep_failures=0;

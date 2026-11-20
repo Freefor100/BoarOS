@@ -34,7 +34,7 @@ struct kernel_vfs_instance {
     uint8_t read_only;
     uint8_t quiescing;
     struct kernel_raw_lock error_lock;
-    struct kernel_vfs_dentry *path_index;
+    struct kernel_vfs_dentry *root_name;
     struct kernel_vfs_dentry *dentry_cache_first, *dentry_cache_last;
     size_t dentry_cache_count, dentry_cache_limit;
     size_t transient_owners; /* Node retirement and clean reclaim still borrow the backend. */
@@ -109,12 +109,14 @@ struct kernel_vfs_dentry {
     struct kernel_vfs_dentry *parent, *next, **previous;
     uint32_t references;
     struct kernel_vfs_dentry *cache_next, *cache_previous;
-    uint8_t cached;
-    uint8_t detached;
+    uint8_t cached, detached, recently_used, mountpoint_seen;
     uint32_t mountpoints;
     char *name;
     struct kernel_vfs_dentry *index_left, *index_right;
-    struct kernel_vfs_dentry *lookup_hint; /* Weak, protected by VFS state. */
+    /* Weak child names. VFS state precedes this lock on publication and
+     * final retirement. A cache-hit reader can obtain a reference here. */
+    struct kernel_raw_lock names_lock;
+    struct kernel_vfs_dentry *children, *lookup_hint;
     uint8_t index_height;
     char initial_name[];
 };

@@ -293,6 +293,9 @@ static void trace_run(struct kernel_task *task,uint32_t type,void *context,uint3
     }
     kernel_preempt_enable();
 }
+int kernel_bpf_trace_active(void)
+{ return __atomic_load_n(&first_event,__ATOMIC_ACQUIRE)!=NULL; }
+
 void kernel_bpf_trace_enter(struct kernel_task *task,uint64_t nr,const uint64_t args[6])
 {
     if(!__atomic_load_n(&first_event,__ATOMIC_ACQUIRE))return;

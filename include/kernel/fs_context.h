@@ -1,6 +1,7 @@
 #ifndef BOAROS_KERNEL_FS_CONTEXT_H
 #define BOAROS_KERNEL_FS_CONTEXT_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -105,6 +106,7 @@ struct kernel_fs_paths {
     uint32_t umask;
 };
 struct kernel_fs_paths kernel_fs_context_snapshot(const struct kernel_fs_context *);
+struct kernel_fs_paths kernel_fs_context_path_snapshot(const struct kernel_fs_context *, bool need_cwd);
 void kernel_fs_paths_release(struct kernel_fs_paths *);
 #define KERNEL_FS_PATHS(name, fs) \
     struct kernel_fs_paths name __attribute__((cleanup(kernel_fs_paths_release))) = \

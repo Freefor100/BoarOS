@@ -384,7 +384,7 @@ static void lazy_remove_registration_locked(struct kernel_mm_record *record)
 /* Callers hold the MM raw lock; retiring never frees under that lock. */
 static struct mm_lazy_page *lazy_find(struct kernel_mm_record *record, uint64_t address)
 {
-    if (!record->lazy_capacity) return NULL;
+    if (!record->lazy_count) return NULL;
     for (struct mm_lazy_page *page=record->lazy_buckets[resident_bucket(address,record->lazy_capacity)]; page; page=page->hash_next)
         if (page->address==address) return page;
     return NULL;
@@ -940,7 +940,7 @@ static int rearm_shared_file_alias(void *owner, uint64_t address)
 static struct mm_file_resident *find_file_resident(
     struct kernel_mm_record *record, uint64_t address)
 {
-    if (record->resident_capacity == 0) return 0;
+    if (!record->resident_count) return 0;
     size_t index = resident_bucket(address, record->resident_capacity);
     for (struct mm_file_resident *page = record->resident_buckets[index];
          page != 0; page = page->hash_next) {
@@ -3341,15 +3341,10 @@ static enum kernel_mm_status unmap_space_range(
     struct kernel_mm_retirement local[DETACH_CHUNKS_PER_LOCK];
     struct kernel_mm_retirement *batches = local;
     unsigned capacity = DETACH_CHUNKS_PER_LOCK;
+    unsigned scan_limit = DETACH_CHUNKS_PER_LOCK;
 #if BOAROS_MAX_CPUS > 1
-    if (end - start >= 32U * BOAROS_PAGE_SIZE) {
-        void *storage;
-        if (!kernel_heap_allocate_nosleep(record->vma_heap,
-            DETACH_CHUNKS_LARGE * sizeof(*batches), &storage)) {
-            batches = storage;
-            capacity = DETACH_CHUNKS_LARGE;
-        }
-    }
+    bool can_expand = end - start >= 32U * BOAROS_PAGE_SIZE;
+    if (can_expand) scan_limit = DETACH_CHUNKS_LARGE;
 #endif
     do {
         struct mm_unmap_residents residents={.record=record};
@@ -3357,12 +3352,13 @@ static enum kernel_mm_status unmap_space_range(
         unsigned count = 0, publications = 0;
         int nonleaf = 0;
         uint64_t last_end = 0;
-        for (unsigned first = 0; first < capacity; first += DETACH_CHUNKS_PER_LOCK) {
+        for (unsigned scanned = 0; scanned < scan_limit;) {
             /* Each short section has its own publication. CPUs joining between
              * sections can cache later leaves and must be included again. */
             unsigned before = count;
             KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
-            for (unsigned i = 0; i < DETACH_CHUNKS_PER_LOCK; i++) {
+            for (unsigned i = 0; i < DETACH_CHUNKS_PER_LOCK && count < capacity &&
+                 scanned < scan_limit; i++, scanned++) {
                 struct kernel_mm_retirement *batch = &batches[count];
                 batch->count = batch->nonleaf = batch->compound = 0;
                 status = arch_mmu_user_detach_range(&record->space, start, end,
@@ -3385,6 +3381,22 @@ static enum kernel_mm_status unmap_space_range(
 #endif
             }
             if (status == ARCH_MMU_STATUS_NOT_MAPPED) break;
+#if BOAROS_MAX_CPUS > 1
+            if (can_expand && count == capacity && scanned < scan_limit) {
+                /* A large virtual extent can contain very few mapped pages.
+                 * Grow only when actual retirement fills the stack batches. */
+                can_expand = false;
+                kernel_raw_lock_release(&guard);
+                void *storage;
+                if (!kernel_heap_allocate_nosleep(record->vma_heap,
+                    DETACH_CHUNKS_LARGE * sizeof(*batches), &storage)) {
+                    memcpy(storage,local,sizeof(local));
+                    batches = storage;
+                    capacity = DETACH_CHUNKS_LARGE;
+                }
+            }
+#endif
+            if (count == capacity) break;
         }
         if (count) {
             sync_tlb_change(targets, nonleaf ? 0 : residents.first,
@@ -6151,6 +6163,7 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
 {
     uint64_t end=address+BOAROS_PAGE_SIZE;
     uint64_t limit, first=file_fault_window(vma,address,&limit);
+    if (limit-first==BOAROS_PAGE_SIZE) return end;
     unsigned selected=0,slots=KERNEL_PAGE_CACHE_READY_WINDOW;
     {
         KERNEL_RAW_READ_SCOPE(raw,&record->metadata);
@@ -6269,7 +6282,7 @@ static __attribute__((noinline)) enum kernel_mm_status mapped_file_fault(struct 
         }
         if (absent) {
 #if BOAROS_MAX_CPUS > 1
-            if (operation->shared && !missing &&
+            if (operation->shared &&
                 kernel_open_file_try_prepare_disk_mapping_page(file,offset >> BOAROS_PAGE_SHIFT,&source))
                 replacement = source.address;
 #endif
@@ -6336,8 +6349,7 @@ static __attribute__((noinline)) enum kernel_mm_status mapped_file_fault(struct 
 prepare_page:
     /* 来源引用覆盖inode/对象/预算；解锁后不保存registry节点或PTE指针。 */
     kernel_lock_scope_release(&inode);
-    if (source.pending && !kernel_heap_allocate_zeroed_nosleep(record->vma_heap,
-        1,sizeof(*resident),(void **)&resident)) goto prepare_file_tables;
+    if (source.pending) goto prepare_file_tables;
     if (operation->guard.lock) mm_operation_release(operation);
     if (!cookie && !source.pending) {
         int error = kernel_open_file_prepare_mapping_page(file,offset >> BOAROS_PAGE_SHIFT,
@@ -6359,16 +6371,24 @@ prepare_page:
             MM_DIAGNOSTIC(count++);
         }
     }
-    if (status == KERNEL_MM_STATUS_OK && !cookie) {
-        enum kernel_heap_status hs = kernel_heap_allocate_zeroed(record->vma_heap,1,sizeof(*resident),(void **)&resident);
-        if (hs != KERNEL_HEAP_STATUS_OK)
-            status = hs == KERNEL_HEAP_STATUS_EMPTY ? KERNEL_MM_STATUS_NO_MEMORY : KERNEL_MM_STATUS_STATE;
-    }
 prepare_file_tables:
     for (unsigned i=0; i<2 && status==KERNEL_MM_STATUS_OK; i++) if ((missing & (1U << i)) && prepared.tables[i]==KERNEL_MM_NO_PAGE) {
         void *table;
-        status = allocate_private_page(allocator,&prepared.tables[i],&table);
+        status = allocate_fault_page(operation,&prepared.tables[i],&table);
         if (status == KERNEL_MM_STATUS_OK) { clear_page(table); MM_DIAGNOSTIC(count++); }
+    }
+    /* Complete the demand's table preparation before allocating mapping
+     * metadata. Keep a READY page's qualification if neither step waits. */
+    if (!status && !cookie && !resident) {
+        if (operation->guard.lock &&
+            kernel_heap_allocate_zeroed_nosleep(record->vma_heap,1,sizeof(*resident),(void **)&resident))
+            mm_operation_release(operation);
+        if (!resident) {
+            enum kernel_heap_status hs=kernel_heap_allocate_zeroed(record->vma_heap,
+                1,sizeof(*resident),(void **)&resident);
+            if (hs) status=hs==KERNEL_HEAP_STATUS_EMPTY ?
+                KERNEL_MM_STATUS_NO_MEMORY : KERNEL_MM_STATUS_STATE;
+        }
     }
     /* Private first faults publish only their PTE and resident under metadata.
      * Shared aliases and COW replacement retain the exclusive operation. */

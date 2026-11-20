@@ -1285,8 +1285,10 @@ enum riscv_sv39_status riscv_sv39_user_detach_range(
     }
     uint64_t *root = s->root_entries;
     enum riscv_sv39_status status;
-    unsigned visits=0;
-    while (visits<16 && batch->count<=KERNEL_MM_RETIRE_CAPACITY-3) {
+    unsigned visits=0, holes=0;
+    enum { MAX_DETACH_VISITS=16, MAX_EMPTY_LEAVES=64 };
+    while (visits<MAX_DETACH_VISITS && holes<MAX_EMPTY_LEAVES &&
+           batch->count<=KERNEL_MM_RETIRE_CAPACITY-3) {
         if (cursor->phase==2) {
             unsigned r=cursor->middle_address>>30;
             /* Another disjoint range may have retired or replaced this
@@ -1344,10 +1346,13 @@ enum riscv_sv39_status riscv_sv39_user_detach_range(
              * the virtual cursor survives a return to the MM caller. */
             uint64_t limit = (address & ~(leaf_span - 1)) + leaf_span;
             if (limit > end) limit = end;
+            /* An empty slot only costs a load. Keep a separate bound so
+             * sparse ranges do not restart the same table walk every 16
+             * slots while the number of actual removals stays bounded. */
             do {
                 uint64_t old=leaves[l];
-                visits++;
                 if (old) {
+                    visits++;
                     int present=valid_user_leaf_entry(old), protected=valid_protected_entry(old);
                     int cow=present_cow_entry(old)||protected_cow_entry(old);
                     if ((!present && !protected) || (present && !s->leaf_pages) ||
@@ -1365,10 +1370,11 @@ enum riscv_sv39_status riscv_sv39_user_detach_range(
                     kernel_mm_retirement_add(batch,physical,0);
                     if (present) s->leaf_pages--; else s->protected_pages--;
                     if (cow) s->cow_pages--;
-                }
+                } else holes++;
                 address += BOAROS_PAGE_SIZE;
                 l++;
-            } while (address < limit && visits < 16 &&
+            } while (address < limit && visits<MAX_DETACH_VISITS &&
+                     holes<MAX_EMPTY_LEAVES &&
                      batch->count <= KERNEL_MM_RETIRE_CAPACITY - 3);
             cursor->address = address;
             if (address < limit) return RISCV_SV39_STATUS_OK;
@@ -1801,7 +1807,7 @@ static unsigned map_owned_window(struct riscv_sv39_user_space *s, uint64_t addre
     if (!pages) return 0;
     unsigned slots = (RISCV_SV39_PAGE_SIZE_2M - (address & (RISCV_SV39_PAGE_SIZE_2M-1))) / BOAROS_PAGE_SIZE;
     if ((address & BOAROS_PAGE_MASK) || address < BOAROS_PAGE_SIZE ||
-        (slots < 32 && (pages >> slots)))
+        (slots < 32 && (pages >> slots)) || (permissions && !valid_user_permissions(permissions)))
         __builtin_trap();
     uint64_t *slot;
     uint32_t order;
@@ -1813,8 +1819,7 @@ static unsigned map_owned_window(struct riscv_sv39_user_space *s, uint64_t addre
         if (!(pages & 1)) continue;
         uint64_t p = *physical++;
         if (slot[index]) continue;
-        if ((p & BOAROS_PAGE_MASK) || (permissions && !valid_user_permissions(permissions)))
-            __builtin_trap();
+        if (p & BOAROS_PAGE_MASK) __builtin_trap();
         if ((permissions ? s->leaf_pages : s->protected_pages) >= UINT32_MAX-count ||
             (cow && s->cow_pages >= UINT32_MAX-count)) __builtin_trap();
         uint64_t entry = permissions ?

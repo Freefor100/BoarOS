@@ -75,7 +75,7 @@ LA的259仍返回`ENOSYS`。这些入口的直接消费者可用`python3 tests/u
 - `uname` 编号为 160，把六个 65 字节字段组成的 Linux `new_utsname` 写到参数 0 指向的用户缓冲区；成功返回 0，用户范围、映射或写权限错误返回 `-EFAULT`（-14）。初始值为 `Linux/boaros/5.19.0-boaros/#1 BoarOS 0.1.0/<架构>/(none)`，机器名由架构构建配置提供。`kernel/uts.c` 持有各 UTS 命名空间的完整名称；`uname` 在调用线程当前命名空间的短锁内取得副本，在锁外写用户内存。release 的数值用于通过现有 glibc 的启动检查：固定 RV glibc 的最低 Linux ABI 为 4.15，LA 为 5.19，因此两架构统一使用 5.19.0。该值不表示完整实现 Linux 5.19；BoarOS 自身版本保存在 version 字段，具体接口范围见能力目录。
 - `clock_settime(112)`、`settimeofday(170)` 修改软件墙钟和时区，要求 CAP_SYS_TIME；参数顺序、vDSO 发布和各类绝对期限的处理见[时间模块](kernel-time.md#运行时调钟与绝对等待)。
 - `sethostname`、`setdomainname` 编号为 161、162，参数为用户字节地址和有符号 32 位长度。沿固定 Linux `kernel/sys.c`，先检查 `CAP_SYS_ADMIN`（缺少时 `EPERM`），再检查长度是否在 0–64 内（否则 `EINVAL`），最后完整复制用户输入（失败为 `EFAULT`）。成功后一次替换对应字段并清零剩余字节；长度零清空名称且不访问用户地址，64 字节名称在第 65 字节补 NUL。它们与 `/proc/sys/kernel/{hostname,domainname}` 修改调用线程当前 UTS 命名空间的同一状态；普通 fork 共享，exec 保留，`CLONE_NEWUTS` 复制当前六字段后独立修改。proc 字符串的权限、偏移与截断规则见 [procfs 模块](procfs.md)。
-- `getpid` 编号为 172，返回调用任务所属线程组的 TGID。
+- `getpid` 编号为 172，返回调用任务在其进程标识命名空间中的线程组编号（Thread Group ID，TGID）。RISC-V 常规构建可从当前线程的线程组对象读取该编号，无需导入六个参数或进入通用分派。在启用跟踪、系统调用过滤或成本诊断时使用通用入口，两条路径继续共用系统调用记账和用户态返回流程。
 - `getppid` 编号为 173，返回当前父任务的 TGID；PID 1 或 parentless 进程返回 0，reparent 后观察到 PID 1。
 - `getuid/geteuid/getgid/getegid` 编号 174/175/176/177，返回调用线程当前真实／有效 UID/GID；调用无参数，忽略残留寄存器。`setregid/setgid/setreuid/setuid/setresuid/getresuid/setresgid/getresgid/setfsuid/setfsgid` 对应 143～152；`getgroups/setgroups` 为 158/159。raw 设置只影响调用线程，libc 负责全线程协调，凭据共享与发布见[用户凭据](kernel-scheduler.md#用户凭据)。
 - `gettid` 编号为 178，返回调用任务自己的 TID。

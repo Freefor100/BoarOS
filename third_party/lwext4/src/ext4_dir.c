@@ -255,19 +255,23 @@ static int ext4_dir_iterator_seek(struct ext4_dir_iter *it, uint64_t pos)
 
 		uint32_t next_blk_idx = (uint32_t)(pos >>
 			(10U + ext4_get32(sb, log_block_size)));
-		/* Pair adjacent directory blocks at a fixed boundary. The
-		 * successor must belong to this same validated mapping run. */
-		bool pair=it->read_next && !(next_blk_idx&1U) &&
-		    it->size-(pos&~((uint64_t)block_size-1))>block_size;
+		/* Bound speculation by EOF and by the one validated mapping
+		 * run. The first cold block can start at either parity. */
+		unsigned count=1;
+		if (it->read_next) {
+			uint64_t remaining=(it->size-(pos&~((uint64_t)block_size-1)))/block_size;
+			if (remaining>EXT4_BLOCK_READ_AHEAD_MAX)
+				remaining=EXT4_BLOCK_READ_AHEAD_MAX;
+			if (remaining>1) count=(unsigned)remaining;
+		}
 		struct ext4_inode_block_range range;
-		r=ext4_fs_get_inode_dblk_range(it->inode_ref,next_blk_idx,
-			pair ? 2 : 1,false,&range);
+		r=ext4_fs_get_inode_dblk_range(it->inode_ref,next_blk_idx,count,false,&range);
 		if (r != EOK)
 			return r;
 
 		ext4_fsblk_t next_blk=range.unwritten ? 0 : range.block;
-		r=pair && next_blk && range.count==2 ?
-		    ext4_block_get_read_next(bdev,&it->curr_blk,next_blk) :
+		r=next_blk && range.count>1 ?
+		    ext4_block_get_read_ahead(bdev,&it->curr_blk,next_blk,range.count) :
 		    ext4_block_get(bdev,&it->curr_blk,next_blk);
 		if (r != EOK) {
 			it->curr_blk.lb_id = 0;

@@ -405,6 +405,8 @@ static enum kernel_files_status disk_read(
     uint64_t total = 0;
     int error = 0, done = 0;
     enum kernel_files_status status = KERNEL_FILES_STATUS_OK;
+    size_t chunks=0;
+    int no_reuse=kernel_open_file_read_no_reuse(description);
     while (total < request && !done) {
         /* As in kernel_vfs_pread, this snapshot only sizes the demand. The
          * cache still revalidates every requested page against live EOF. */
@@ -421,13 +423,15 @@ static enum kernel_files_status disk_read(
         enum kernel_page_cache_status loaded;
         loaded = kernel_page_cache_get_batch(
             cache, &description->file,
-            position >> BOAROS_PAGE_SHIFT, pages, count, kernel_open_file_read_no_reuse(description));
-        if (loaded == KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT)
-            return KERNEL_FILES_STATUS_STATE;
+            position >> BOAROS_PAGE_SHIFT, pages, count, no_reuse);
+        if (loaded == KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT) {
+            status=KERNEL_FILES_STATUS_STATE;
+            break;
+        }
         struct kernel_uaccess_write_cursor user_copy={0};
         for (size_t i = 0; i < count; i++) {
             struct kernel_page_cache_read_page *part = &pages[i];
-            KERNEL_FILES_NOTE(files, read_chunks, 1);
+            chunks++;
             if (part->status == KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE ||
                 (!part->status && start >= part->valid_bytes)) { done = 1; break; }
             if (part->status) {
@@ -442,7 +446,9 @@ static enum kernel_files_status disk_read(
             enum kernel_uaccess_status access = count==1 && cursor->count==1 ?
                 kernel_copy_to_user_iov(mm,cursor,page+start,chunk,&copied) :
                 kernel_copy_to_user_iov_cursor(mm,cursor,&user_copy,page+start,chunk,&copied);
-            if (copied > chunk || (advance && kernel_open_file_advance(description, copied))) {
+            /* A later user page can fault and the task may be reaped while
+             * blocked. Keep the copied prefix visible to other FD owners. */
+            if (copied > chunk || (advance && kernel_open_file_advance(description,copied))) {
                 status = KERNEL_FILES_STATUS_STATE; done = 1; break;
             }
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
@@ -464,6 +470,7 @@ static enum kernel_files_status disk_read(
         kernel_uaccess_write_cursor_finish(&user_copy);
         kernel_page_cache_put_batch(cache, pages, count);
     }
+    if (chunks) KERNEL_FILES_NOTE(files,read_chunks,chunks);
     if (error) KERNEL_FILES_NOTE(files, read_failures, 1);
     KERNEL_FILES_NOTE(files, bytes_read, total);
     *linux_result = total ? (int64_t)total : error;
@@ -2135,15 +2142,15 @@ enum kernel_files_status kernel_files_getdents(
     }
     do {
         uint64_t remaining = request - total;
+        uint64_t position = description->offset;
         struct kernel_vfs_dir_batch batch = {
             .data = data,
             .capacity = remaining < capacity ? (size_t)remaining : capacity,
-            .position = kernel_open_file_offset(description),
+            .position = position,
         };
         int fill_result = kernel_vfs_read_directory(&description->file, &batch, access_flags);
         access_flags = NULL;
         size_t copied = 0, complete = 0;
-        uint64_t position = kernel_open_file_offset(description);
         enum kernel_uaccess_status access = KERNEL_UACCESS_STATUS_OK;
         /* Drop all namespace/backend locks before faulting user memory.
          * offset_lock still serializes dup/fork readers and directory seeks. */
@@ -2169,10 +2176,9 @@ enum kernel_files_status kernel_files_getdents(
                 complete += length;
             }
         }
-        if (kernel_open_file_seek(description, position) != KERNEL_OPEN_FILE_STATUS_OK) {
-            status = KERNEL_FILES_STATUS_STATE;
-            break;
-        }
+        /* Directory cookies use the same offset lock as seek. Committing a
+         * read here does not seek or reset regular-file read prediction. */
+        description->offset = position;
         total += complete;
         if (access == KERNEL_UACCESS_STATUS_FAULT) {
             *linux_result = total ? (int64_t)total : -KERNEL_EFAULT;

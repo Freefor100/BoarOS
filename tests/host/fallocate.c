@@ -417,6 +417,10 @@ static void reserved_abort_reuse(struct kernel_page_cache *cache,struct kernel_v
 }
 static void (*reservation_state_lock)(void *);
 static unsigned reservation_state_calls;
+static void (*reservation_backend_lock)(void *);
+static _Thread_local unsigned reservation_backend_calls;
+static void count_reservation_backend_lock(void *context)
+{ reservation_backend_calls++;reservation_backend_lock(context); }
 static void count_reservation_state_lock(void *context)
 { reservation_state_calls++;reservation_state_lock(context); }
 
@@ -540,7 +544,12 @@ static void delayed_allocation(struct kernel_page_cache *cache, struct kernel_vf
         unsigned queries=__atomic_load_n(&reservation_extent_queries,__ATOMIC_RELAXED);
         assert(!ext4_file_reserve_write(raw,0,1,&done,&ticket) && done==1 && !ticket.owner);
         assert(__atomic_load_n(&reservation_extent_queries,__ATOMIC_RELAXED)==queries+1);
+        reservation_backend_lock=adapter->locks.lock;
+        reservation_backend_calls=0;
+        adapter->locks.lock=count_reservation_backend_lock;
         assert(!ext4_file_reserve_write(raw,block/2,1,&done,&ticket) && done==1 && !ticket.owner);
+        adapter->locks.lock=reservation_backend_lock;
+        assert(!reservation_backend_calls);
         assert(__atomic_load_n(&reservation_extent_queries,__ATOMIC_RELAXED)==queries+1 &&
             fs->delayed_blocks==baseline);
     }

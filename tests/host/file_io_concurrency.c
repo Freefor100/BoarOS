@@ -1624,6 +1624,55 @@ static void borrowed_page_case(struct physical_page_allocator *pages)
     mm_test_finish();mm_test_attach(0);mm_test_activate_task();
 }
 
+struct cached_name_walk {
+    struct kernel_vfs_path *root;
+    unsigned ready,start,done;
+    int result;
+};
+
+static void *walk_cached_name(void *argument)
+{
+    struct cached_name_walk *walk=argument;
+    struct kernel_vfs_stat stat;
+    mm_test_attach(1);
+    mm_test_activate_task();
+    __atomic_store_n(&walk->ready,1,__ATOMIC_RELEASE);
+    while (!__atomic_load_n(&walk->start,__ATOMIC_ACQUIRE)) sched_yield();
+    walk->result=kernel_vfs_stat_at(walk->root,walk->root,"pathname-storage",1,&stat);
+    __atomic_store_n(&walk->done,1,__ATOMIC_RELEASE);
+    mm_test_finish();
+    return NULL;
+}
+
+static void cached_name_independent_of_mount_state(struct kernel_heap *heap,
+    struct kernel_vfs_mount *mount)
+{
+    struct cached_name_walk walk={0};
+    struct kernel_vfs_stat stat;
+    assert(!kernel_vfs_path_root(mount,heap,&walk.root));
+    assert(!kernel_vfs_stat_at(walk.root,walk.root,"pathname-storage",1,&stat));
+    pthread_t reader;
+    assert(!pthread_create(&reader,NULL,walk_cached_name,&walk));
+    while (!__atomic_load_n(&walk.ready,__ATOMIC_ACQUIRE)) sched_yield();
+    unsigned finished=0;
+    {
+        KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+        __atomic_store_n(&walk.start,1,__ATOMIC_RELEASE);
+        struct timespec start,now;
+        assert(!clock_gettime(CLOCK_MONOTONIC,&start));
+        do {
+            finished=__atomic_load_n(&walk.done,__ATOMIC_ACQUIRE);
+            if (finished) break;
+            sched_yield();
+            assert(!clock_gettime(CLOCK_MONOTONIC,&now));
+        } while (now.tv_sec-start.tv_sec<2);
+    }
+    assert(!pthread_join(reader,NULL));
+    assert(finished && !walk.result);
+    assert(!kernel_vfs_path_release(&walk.root));
+    puts("PASS cached name walk finishes while another CPU owns mount state");
+}
+
 static void pathname_storage_case(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
 {
     struct kernel_files local={0};struct kernel_fs_context directory={0};
@@ -1645,6 +1694,7 @@ static void pathname_storage_case(struct kernel_heap *heap,struct kernel_vfs_mou
         query.stx_atime.tv_nsec==expected.atime.nanoseconds && query.stx_mtime.tv_sec==expected.mtime.seconds &&
         query.stx_ctime.tv_sec==expected.ctime.seconds && !query.stx_btime.tv_sec && !query.stx_btime.tv_nsec);
     for(unsigned i=144;i<sizeof(query);i++)assert(!((unsigned char *)&query)[i]);
+    cached_name_independent_of_mount_state(heap,mount);
     path_snapshot_watch=1;path_snapshot_allocations=0;
     for (unsigned i=0;i<16;i++) {
         assert(!kernel_files_statx(&local,&directory,&mm,-100,0x100000,0,0x7ff,0x200000,&result) && !result);
