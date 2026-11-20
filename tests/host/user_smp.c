@@ -916,6 +916,30 @@ static void fair_queued(unsigned index,unsigned mask,int nice,uint64_t lag)
 {
     fair_enqueue(&tasks[index],mask,nice,lag);
 }
+
+static void ordinary_pull_affinity(void)
+{
+    static struct kernel_task pinned[256];
+    reset_two_queues();active=&cpus[0];
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        for (unsigned i=0;i<256;i++) fair_enqueue(&pinned[i],1,0,i);
+        fair_queued(0,3,0,256);
+        fair_queued(1,3,0,257);
+    }
+    tasks[0].arch.user_mode=1;tasks[0].tid_owned=1;
+    assert(!kernel_task_affinity_set(&tasks[0],0,1));
+    assert_ready_owner(&tasks[0],&cpus[0]);
+    active=&cpus[1];
+    struct kernel_task *next;
+    uint64_t deadline;
+    assert(scheduler_select_local(0,0,0,&next,&deadline) && next==&tasks[1]);
+    assert(scheduler_finish_local(active) && cpus[0].runqueue.count==257);
+    assert_ready_owner(&tasks[0],&cpus[0]);
+    assert(tasks[1].wait.on_cpu && !tasks[1].ready_cpu);
+    puts("PASS ordinary pull: skip a long pinned prefix and honor affinity changed while queued");
+}
+
 static void fair_select_unchanged(void)
 {
     struct kernel_task *next=0;uint64_t deadline;
@@ -1178,7 +1202,7 @@ int main(int argc,char **argv)
         return 0;
     }
     if(argc==2&&!strcmp(argv[1],"--fair-balance-only")) {
-        kernel_wait_domain_init();ready_wait_migration();fair_long_queue();ordinary_busy_balance();
+        kernel_wait_domain_init();ordinary_pull_affinity();ready_wait_migration();fair_long_queue();ordinary_busy_balance();
         fair_affinity_during_balance();fair_parallel_handoff();return 0;
     }
     if(argc==2&&!strcmp(argv[1],"--slice-only")) {kernel_wait_domain_init();ordinary_local_slice();return 0;}
@@ -1194,6 +1218,7 @@ int main(int argc,char **argv)
     remote_deadline_notification();
     ordinary_wake_after_affinity_change();
     ordinary_pull();
+    ordinary_pull_affinity();
     ordinary_local_slice();
     ready_wait_migration();
     ordinary_busy_balance();

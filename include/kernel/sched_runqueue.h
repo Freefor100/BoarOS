@@ -24,6 +24,9 @@ struct kernel_sched_node {
     };
     void *owner;
     uint8_t priority,queued;
+#if BOAROS_MAX_CPUS > 1
+    uint8_t fair_affinity, fair_subtree_affinity;
+#endif
 #if BOAROS_USER_SMP
     unsigned fair_weight; /* Snapshot while queued, including a later nice/PI change. */
 #endif
@@ -46,6 +49,9 @@ struct kernel_sched_runqueue {
 void kernel_sched_enqueue(struct kernel_sched_runqueue *,struct kernel_sched_node *,void *,unsigned,int);
 void kernel_sched_dequeue(struct kernel_sched_runqueue *,struct kernel_sched_node *);
 struct kernel_sched_node *kernel_sched_pick(struct kernel_sched_runqueue *,int rt_eligible);
+#if BOAROS_MAX_CPUS > 1
+struct kernel_sched_node *kernel_sched_fair_pick_cpu(const struct kernel_sched_runqueue *,unsigned cpu);
+#endif
 struct kernel_sched_node *kernel_sched_last(struct kernel_sched_runqueue *);
 struct kernel_sched_node *kernel_sched_next(struct kernel_sched_runqueue *,struct kernel_sched_node *);
 void kernel_sched_fair_place(struct kernel_sched_runqueue *,struct kernel_sched_node *,
