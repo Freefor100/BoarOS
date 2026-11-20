@@ -12,6 +12,8 @@ BoarOS 采用 GPL-2.0-only。随仓库分发的第三方代码和归档保留上
 
 外部规范和用于开发的上游源码见[参考资料](../references/README.md)。模块文档解释本地适配的设计，变更沿 Git 历史追查。
 
+交互根盘使用 Alpine Linux 提供的 [BusyBox 静态软件包](https://dl-cdn.alpinelinux.org/alpine/v3.23/main/)，提供串口登录和用户态命令，采用 GPL-2.0-only 许可。
+
 ## strace 验证工具
 
 [strace 7.3](https://github.com/strace/strace/releases/tag/v7.3) 用于验证 RISC-V 和 LoongArch 的进程跟踪接口。

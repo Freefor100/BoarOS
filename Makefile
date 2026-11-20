@@ -1855,6 +1855,30 @@ test-epoll-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 include arch/loongarch/build.mk
 include vdso/build.mk
 
+ROOTFS_DIR ?= build/rootfs
+.PHONY: rootfs-riscv rootfs-loongarch shell-riscv shell-loongarch
+rootfs-riscv: $(ROOTFS_DIR)/riscv64.img
+rootfs-loongarch: $(ROOTFS_DIR)/loongarch64.img
+
+# A root disk can contain user data after first boot. Create it only when missing.
+$(ROOTFS_DIR)/riscv64.img $(ROOTFS_DIR)/loongarch64.img: $(ROOTFS_DIR)/%.img:
+	python3 -B tools/mkrootfs.py $* "$@"
+
+shell-riscv: $(KERNEL_RV) $(ROOTFS_DIR)/riscv64.img
+	$(QEMU_RISCV64) -machine virt -bios default -kernel $< \
+		-m $(QEMU_MEMORY) -smp 1 -nographic -no-reboot -nic none \
+		-drive "file=$(ROOTFS_DIR)/riscv64.img,format=raw,if=none,id=root" \
+		-device virtio-blk-device,drive=root
+
+shell-loongarch: $(KERNEL_LA) $(ROOTFS_DIR)/loongarch64.img
+	$(QEMU_LOONGARCH64) -machine virt -cpu la464 -kernel $< \
+		-m $(QEMU_MEMORY) -smp 1 -nographic -no-reboot -nic none \
+		-drive "file=$(ROOTFS_DIR)/loongarch64.img,format=raw,if=none,id=root" \
+		-device virtio-blk-pci,drive=root,disable-legacy=on
+ifeq ($(QEMU_LOONGARCH64),build/qemu-la-rtc/qemu-system-loongarch64)
+shell-loongarch: prepare-la-tools
+endif
+
 .PHONY: test-elf-layout-host
 test-elf-layout-host:
 	sh tests/host/elf-layout.sh
