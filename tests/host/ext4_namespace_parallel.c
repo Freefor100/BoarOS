@@ -340,12 +340,16 @@ static void removed_directory_qualification(struct kernel_vfs_path *root)
     assert(!kernel_vfs_mkdir_at(root,root,"walk-removed",0700,0));
     assert(!kernel_vfs_path_resolve(root,root,"walk-removed",1,&directory));
     removed_directory_lock=&((struct kernel_vfs_node *)directory->file.private_data)->namespace_lock;
+    struct kernel_vfs_dentry *entry=directory->dentry;
+    assert(entry->cached && entry->references==2);
     assert(!kernel_vfs_path_release(&directory));
     assert(!kernel_vfs_create_at(root,root,"walk-stable",0600,&file,0));
     struct removed_walk test={root,kernel_vfs_file_inode(&file)};
     assert(!kernel_vfs_close(&file));removed_entered=removed_continue=0;
     pthread_t walking;assert(!pthread_create(&walking,NULL,walk_removed_directory,&test));
     while (!__atomic_load_n(&removed_entered,__ATOMIC_ACQUIRE))sched_yield();
+    assert(__atomic_load_n(&entry->references,__ATOMIC_ACQUIRE)==2 &&
+        "the resolver's local path already owns the directory at lock entry");
     assert(!kernel_vfs_unlink_at(root,root,"walk-removed",1));
     __atomic_store_n(&removed_continue,1,__ATOMIC_RELEASE);
     assert(!pthread_join(walking,NULL) && !kernel_vfs_unlink_at(root,root,"walk-stable",0));

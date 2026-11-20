@@ -408,7 +408,7 @@ struct vfs_path_walk {
     struct kernel_vfs_mount *mount;
     struct kernel_vfs_mount *mount_owner;
     struct kernel_vfs_dentry *directory_owner;
-    struct kernel_vfs_path *component,*terminal;
+    struct kernel_vfs_path *component,*terminal,*local_directory;
     struct kernel_lock_guard guard, mutation;
     struct kernel_service_scope service;
     struct kernel_vfs_node *directory;
@@ -421,6 +421,7 @@ static void path_walk_release(struct vfs_path_walk *walk)
     kernel_lock_scope_release(&walk->guard);
     kernel_lock_scope_release(&walk->mutation);
     if (walk->directory_owner) dentry_release(&walk->directory_owner);
+    walk->local_directory=NULL;
     if (walk->mount_owner) { (void)mount_put(walk->mount_owner);walk->mount_owner=NULL; }
     kernel_service_scope_end(&walk->service);
     walk->service.entered=0;
@@ -481,7 +482,7 @@ static void namespace_inode_lock(struct kernel_vfs_node *node,
         kernel_vfs_node_lock(node, guard, 1);
 }
 static int path_walk_select_mode(struct vfs_path_walk *walk,
-    struct kernel_vfs_path *path, int write)
+    struct kernel_vfs_path *path, int write, int use_local_directory)
 {
     struct kernel_vfs_mount *mount=path->file.mount;
     struct kernel_vfs_instance *instance=mount->private_data;
@@ -497,7 +498,9 @@ static int path_walk_select_mode(struct vfs_path_walk *walk,
         (!walk->root || walk->root->file.mount!=mount);
     int anchored=(walk->start && walk->start->dentry==path->dentry) ||
         (walk->root && walk->root->dentry==path->dentry);
-    if ((namespace_is_parallel(instance) || crossing) && !anchored) {
+    if (!crossing && !write && use_local_directory) {
+        walk->local_directory=path;
+    } else if ((namespace_is_parallel(instance) || crossing) && !anchored) {
         if (dentry_acquire(path->dentry)) return -KERNEL_EOVERFLOW;
         walk->directory_owner=path->dentry;
     }
@@ -516,7 +519,7 @@ static int path_walk_select_mode(struct vfs_path_walk *walk,
     return instance->quiescing ? -KERNEL_EIO : 0;
 }
 static int path_walk_select(struct vfs_path_walk *walk,struct kernel_vfs_path *path)
-{ return path_walk_select_mode(walk,path,0); }
+{ return path_walk_select_mode(walk,path,0,0); }
 #define VFS_PATH_WALK(name, initial, boundary) \
     struct vfs_path_walk name __attribute__((cleanup(path_walk_release))) = { \
         .start=(initial), .root=(boundary) }
@@ -2430,6 +2433,21 @@ static int scoped_path_check(const struct vfs_path_walk *walk,
     }
 }
 
+/* A local component already owns the directory while the walk takes its
+ * namespace guard. If resolving the next component consumes this slot,
+ * move that ownership to the guard until it is unlocked. Published paths
+ * and paths in other mounts retain the independent ownership rules. */
+static void release_walk_path(struct vfs_path_walk *walk, struct kernel_vfs_path **owner)
+{
+    struct kernel_vfs_path *path=*owner;
+    if (path==walk->local_directory && path->references==1) {
+        walk->local_directory=NULL;
+        walk->directory_owner=path->dentry;
+        path->references=0;
+        *owner=NULL;
+    } else if (kernel_vfs_path_release(owner)) __builtin_trap();
+}
+
 static int resolve_object(struct kernel_vfs_path *start,
                           struct kernel_vfs_path *root,
                           const char *path, size_t length, int follow_final,
@@ -2485,7 +2503,8 @@ static int resolve_object(struct kernel_vfs_path *start,
         while (cursor<length && pending[cursor] == '/') cursor++;
         trailing_only = cursor==length;
         result=path_walk_select_mode(walk,current,
-            walk->final_write && (!suffix || trailing_only));
+            walk->final_write && (!suffix || trailing_only),
+            current==&components[0] || current==&components[1]);
         if (result) goto Finish;
         /* open(O_CREAT)拒绝最后的斜杠；此前父路径的错误仍先返回。 */
         if (suffix && trailing_only && follow_trailing_final==VFS_TRAILING_CREATE) {
@@ -2535,7 +2554,7 @@ static int resolve_object(struct kernel_vfs_path *start,
             }
             /* 挂载根及向上的跨挂载目标是目录；先在旧执行域归还旧分量，
              * 下一轮或返回前再切换保护，切换时始终持有next。 */
-            if (kernel_vfs_path_release(&current)) __builtin_trap();
+            release_walk_path(walk,&current);
             current=next;
             continue;
         }
@@ -2571,7 +2590,7 @@ static int resolve_object(struct kernel_vfs_path *start,
                         goto Finish;
                     }
                     (void)kernel_vfs_path_release(&next);
-                    (void)kernel_vfs_path_release(&current);
+                    release_walk_path(walk,&current);
                     current = linked;
                     if (!current) { result = -KERNEL_EIO; goto Finish; }
                     continue;
@@ -2626,7 +2645,7 @@ static int resolve_object(struct kernel_vfs_path *start,
                     result=-KERNEL_EXDEV;
                     goto Finish;
                 }
-                (void)kernel_vfs_path_release(&current);
+                release_walk_path(walk,&current);
                 current = root;
                 result = kernel_vfs_path_acquire(current);
                 if (result != 0) {
@@ -2644,7 +2663,7 @@ static int resolve_object(struct kernel_vfs_path *start,
             (void)kernel_vfs_path_release(&next);
             goto Finish;
         }
-        (void)kernel_vfs_path_release(&current);
+        release_walk_path(walk,&current);
         current = next;
     }
     *owner = current;
@@ -2653,7 +2672,7 @@ Finish:
     if (!result && *owner && (*owner)->transient && *owner!=walk->terminal) {
         struct kernel_vfs_path *accepted=NULL;
         result=path_wrap((*owner)->file.mount,(*owner)->dentry,&accepted);
-        if (kernel_vfs_path_release(owner)) __builtin_trap();
+        release_walk_path(walk,owner);
         if (!result) *owner=accepted;
     }
     if (!result && *owner && (walk->mount!=(*owner)->file.mount || !walk->guard.lock)) {
@@ -2666,7 +2685,7 @@ Finish:
         result=scoped_path_check(walk,*owner);
         if (result && kernel_vfs_path_release(owner)) __builtin_trap();
     }
-    if (current != 0) (void)kernel_vfs_path_release(&current);
+    if (current != 0) release_walk_path(walk,&current);
     if (work) kernel_heap_release(adapter->heap, work);
     return result;
 }
@@ -4557,7 +4576,7 @@ int kernel_vfs_unlink_at(struct kernel_vfs_path *start,
         (void)kernel_vfs_path_release(&parent);
         return !directory ? -KERNEL_EISDIR : special == 1 ? -KERNEL_EINVAL : -KERNEL_ENOTEMPTY;
     }
-    result=path_walk_select_mode(&walk,parent,1);
+    result=path_walk_select_mode(&walk,parent,1,0);
     if (result) goto Finish;
     /* Keep basename lookup and removal in one namespace operation; a racing
      * rename must not redirect unlink to the object's new name. */
@@ -4811,7 +4830,7 @@ int kernel_vfs_rename_at(struct kernel_vfs_path *old_start,
     struct kernel_vfs_instance *adapter = source_parent->file.mount->private_data;
     if (old_special) { result = -KERNEL_EBUSY; goto Finish; }
     if (new_special) { result = flags & 1U ? -KERNEL_EEXIST : -KERNEL_EBUSY; goto Finish; }
-    result=path_walk_select_mode(&walk,source_parent,1);
+    result=path_walk_select_mode(&walk,source_parent,1,0);
     if (result) goto Finish;
     if (kernel_vfs_mount_is_readonly(source_parent->file.mount) || !adapter->ops->rename) {
         result = -KERNEL_EROFS;
