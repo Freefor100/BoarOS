@@ -444,7 +444,9 @@ static void group_exit_work(void)
             }
         }
         uint64_t user, kernel, child_user, child_kernel;
-        leader->child_usage.user_ns=70000000U;leader->child_usage.kernel_ns=90000000U;
+        struct kernel_resource_limits group_resources={0};
+        leader->limits=&group_resources;
+        leader->limits->child_usage.user_ns=70000000U;leader->limits->child_usage.kernel_ns=90000000U;
         group_lock_calls=0;
         kernel_task_cpu_ticks(&tasks[members-1],&user,&kernel,&child_user,&child_kernel);
         assert(user==members*(members+1)/2 && kernel==members*(members+1));
@@ -937,8 +939,10 @@ static void resource_snapshot(void)
     tasks[0]=(struct kernel_task){.magic=KERNEL_THREAD_MAGIC,.group_members=1};
     tasks[0].group_leader=&tasks[0];
     tasks[0].usage=(struct kernel_task_usage){.user_ns=1000000,.minor_faults=3,.read_bytes=1024,.voluntary=1};
-    tasks[0].dead_usage=(struct kernel_task_usage){.user_ns=2000000,.minor_faults=5,.maxrss_pages=7,.write_bytes=4096};
-    tasks[0].child_usage=(struct kernel_task_usage){.user_ns=4000000,.minor_faults=11,.maxrss_pages=3};
+    struct kernel_resource_limits group_resources={0};
+    tasks[0].limits=&group_resources;
+    group_resources.dead_usage=(struct kernel_task_usage){.user_ns=2000000,.minor_faults=5,.maxrss_pages=7,.write_bytes=4096};
+    group_resources.child_usage=(struct kernel_task_usage){.user_ns=4000000,.minor_faults=11,.maxrss_pages=3};
     struct kernel_task_usage u={0};struct kernel_linux_rusage r;
     scheduler_usage_snapshot(&tasks[0],1,&u);assert(u.user_ns==1000000 && u.minor_faults==3 && u.maxrss_pages==7);
     scheduler_usage_snapshot(&tasks[0],0,&u);assert(u.user_ns==3000000 && u.minor_faults==8);

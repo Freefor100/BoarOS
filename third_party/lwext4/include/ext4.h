@@ -594,6 +594,12 @@ int ext4_fread(ext4_file *file, void *buf, size_t size, size_t *rcnt);
 /* Positioned data read. The caller stabilizes the inode mapping; returned
  * bytes borrow exact payload versions while accepted cache versions advance. */
 int ext4_fpread(const ext4_file *file, uint64_t offset, void *buf, size_t size, size_t *rcnt);
+/* Search mappings up to the caller's visible EOF. During an on-disk hole or
+ * unwritten run, find a byte of the requested kind in the caller's page cache.
+ * The search callback returns the run end when it finds no such byte. */
+int ext4_file_seek_sparse(const ext4_file *, uint64_t offset, uint64_t end,
+    bool seek_hole, uint64_t (*cache_seek)(void *, uint64_t, uint64_t, bool, bool),
+    void *context, uint64_t *position);
 /* At most FILE_READ_BATCH_MAX disjoint outputs; every span reports a contiguous prefix.
  * Reads consult cache versions, including dirty and journal-pending data.
  * Multi-output callers lend a workspace until return; scalar callers may pass

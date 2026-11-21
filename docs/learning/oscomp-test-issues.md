@@ -197,6 +197,20 @@ BuildStorm 的 Rust 工具链曾在准备阶段中止。沿 `Child::wait_with_ou
 
 按架构提供的旧入口要另外处理。例如原 RISC-V `futex_waitv01/02/03` 使用的是发布程序构建时的无效系统调用号 `-1`，而 LoongArch 版本已执行断言。`getrlimit03` 在 LoongArch 期待该架构的 Linux 原生接口未提供的旧 `getrlimit` 入口，RISC-V 对应原程序有 16 分。类似的 16 位用户标识符、旧 `socketcall` 和 `readdir` 测例，先核对架构应用二进制接口（Application Binary Interface，ABI）及发布程序的头文件。
 
+#### 稀疏定位、文件查询与统计接口的判读
+
+- `lseek11` 已能查找普通文件的数据与空洞。`fallocate04` 已进入打洞后的内容检查，
+  当前 ext4 配置上的 `FALLOC_FL_ZERO_RANGE` 附加场景仍报告不支持。
+- `statx10` 查询文件系统上的普通文件，`statx11` 查询块设备。普通文件现在通过与直接输入输出（Direct I/O）相同的后端报告对齐要求。
+  LoongArch glibc 原 `statx10` 执行了两条对齐断言。`statx12` 已通过路径和文件描述符
+  检查挂载根和普通文件，区分同一文件系统的不同挂载视图。
+- 同步测例读取的是整盘或分区 `stat` 文件内的已完成扇区数及设备忙时长。现在这些值由块层按实际请求采样，
+  `sync_file_range02` 和 `fdatasync03` 已能在 ext4 上完成真实同步量的断言。`/proc/self/io` 已可读取实际的进程与线程用量。
+  `readahead02` 还需要测试环境提供缓存控制及设备预读参数。`msync04` 仍需要 `/proc/self/pagemap`。
+- `msync03` 的锁页区间遇 `MS_INVALIDATE` 现在按预期返回 `EBUSY`。原程序的六条断言均通过，
+  它仍无判分用的 `Summary:`。`ioctl_ns03` 对主机名与域名命名空间发出 `NS_GET_OWNER_UID`，
+  现在检查到了预期的 `EINVAL`。
+
 ### 挂载相关的三类故障
 
 初赛发布根盘带有 `/musl/busybox` 和 `/glibc/busybox`。BoarOS 内核挂载根文件系统后，

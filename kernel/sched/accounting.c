@@ -204,6 +204,9 @@ void scheduler_usage_add(struct kernel_task_usage *to, const struct kernel_task_
     to->minor_faults += from->minor_faults; to->major_faults += from->major_faults;
     to->voluntary += from->voluntary; to->involuntary += from->involuntary;
     to->read_bytes += from->read_bytes; to->write_bytes += from->write_bytes;
+    to->rchar += from->rchar; to->wchar += from->wchar;
+    to->syscr += from->syscr; to->syscw += from->syscw;
+    to->cancelled_write_bytes += from->cancelled_write_bytes;
     if (to->maxrss_pages < from->maxrss_pages) to->maxrss_pages = from->maxrss_pages;
 }
 
@@ -215,6 +218,11 @@ void scheduler_usage_thread_locked(const struct kernel_task *task, struct kernel
         .major_faults = __atomic_load_n(&task->usage.major_faults, __ATOMIC_RELAXED),
         .read_bytes = __atomic_load_n(&task->usage.read_bytes, __ATOMIC_RELAXED),
         .write_bytes = __atomic_load_n(&task->usage.write_bytes, __ATOMIC_RELAXED),
+        .rchar = __atomic_load_n(&task->usage.rchar, __ATOMIC_RELAXED),
+        .wchar = __atomic_load_n(&task->usage.wchar, __ATOMIC_RELAXED),
+        .syscr = __atomic_load_n(&task->usage.syscr, __ATOMIC_RELAXED),
+        .syscw = __atomic_load_n(&task->usage.syscw, __ATOMIC_RELAXED),
+        .cancelled_write_bytes = __atomic_load_n(&task->usage.cancelled_write_bytes, __ATOMIC_RELAXED),
         .maxrss_pages = task->usage.maxrss_pages,
         .voluntary = task->usage.voluntary, .involuntary = task->usage.involuntary,
     };
@@ -237,8 +245,8 @@ void scheduler_group_usage_snapshot(struct kernel_task *leader, int children,
     struct scheduler_group_cursor cursor = {0};
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        *usage = leader->dead_usage;
-        if (children) scheduler_usage_add(usage, &leader->child_usage);
+        *usage = leader->limits ? leader->limits->dead_usage : (struct kernel_task_usage){0};
+        if (children && leader->limits) scheduler_usage_add(usage, &leader->limits->child_usage);
         if (leader->group_members <= 1 || leader->retirement || leader->group_leader != leader) {
             struct kernel_task_usage own;
             scheduler_usage_thread_locked(leader, &own);
@@ -255,8 +263,8 @@ void scheduler_group_usage_snapshot(struct kernel_task *leader, int children,
         {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
             if (epoch != cursor.epoch) {
-                *usage = leader->dead_usage;
-                if (children) scheduler_usage_add(usage, &leader->child_usage);
+                *usage = leader->limits ? leader->limits->dead_usage : (struct kernel_task_usage){0};
+                if (children && leader->limits) scheduler_usage_add(usage, &leader->limits->child_usage);
                 epoch = cursor.epoch;
             }
             if (leader->group_epoch == cursor.epoch && member->group_leader == leader) {
@@ -279,10 +287,10 @@ void scheduler_usage_snapshot(const struct kernel_task *task, int who,
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         leader = task->group_leader;
         if (!leader) __builtin_trap();
-        if (who == -1) { *usage = leader->child_usage; return; }
+        if (who == -1) { *usage = leader->limits ? leader->limits->child_usage : (struct kernel_task_usage){0}; return; }
         if (who == 1) {
             scheduler_usage_thread_locked(task, usage);
-            uint64_t peak = leader->dead_usage.maxrss_pages;
+            uint64_t peak = leader->limits ? leader->limits->dead_usage.maxrss_pages : 0;
             if (peak < leader->usage.maxrss_pages) peak = leader->usage.maxrss_pages;
             if (usage->maxrss_pages < peak) usage->maxrss_pages = peak;
             return;
@@ -355,6 +363,30 @@ void kernel_task_account_write(uint64_t bytes)
 {
     struct kernel_task *task = io_account_task();
     if (task) __atomic_fetch_add(&task->usage.write_bytes, bytes, __ATOMIC_RELAXED);
+}
+void kernel_task_account_cancelled_write(uint64_t bytes)
+{
+    struct kernel_task *task = io_account_task();
+    if (task) __atomic_fetch_add(&task->usage.cancelled_write_bytes, bytes, __ATOMIC_RELAXED);
+}
+
+void kernel_task_account_io_return(struct kernel_task *task, int64_t completed, unsigned directions)
+{
+    if (completed < 0 && !(directions & KERNEL_IO_ACCOUNT_VECTOR)) return;
+    /* Only the task returning this system call writes its character and call
+     * counters. Remote proc queries take atomic snapshots of these values. */
+#define ACCOUNT_CALL(field, value) \
+    __atomic_store_n(&task->usage.field, \
+        __atomic_load_n(&task->usage.field, __ATOMIC_RELAXED) + (value), __ATOMIC_RELAXED)
+    if (directions & KERNEL_IO_ACCOUNT_READ) {
+        if (completed > 0) ACCOUNT_CALL(rchar, (uint64_t)completed);
+        ACCOUNT_CALL(syscr, 1);
+    }
+    if (directions & KERNEL_IO_ACCOUNT_WRITE) {
+        if (completed > 0) ACCOUNT_CALL(wchar, (uint64_t)completed);
+        ACCOUNT_CALL(syscw, 1);
+    }
+#undef ACCOUNT_CALL
 }
 uint64_t kernel_task_read_bytes(const struct kernel_task *task)
 { return task ? __atomic_load_n(&task->usage.read_bytes, __ATOMIC_RELAXED) : 0; }

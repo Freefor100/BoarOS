@@ -2968,6 +2968,23 @@ static size_t ext4_backend_direct_alignment(struct kernel_vfs_node *node)
     struct lwext4_mount_adapter *adapter=lwext4_instance(node->instance);
     return adapter->device.bdif->ph_bsize;
 }
+
+static uint64_t ext4_seek_cached(void *context, uint64_t start, uint64_t end,
+    bool seek_hole, bool unwritten)
+{
+    struct kernel_vfs_node *node = context;
+    struct kernel_page_cache *cache = node->instance->page_cache;
+    return cache ? kernel_page_cache_seek_sparse(cache, node, start, end, seek_hole, unwritten) :
+        seek_hole ? start : end;
+}
+
+static int ext4_backend_seek_sparse(struct kernel_vfs_node *node, uint64_t offset,
+    uint64_t end, bool seek_hole, uint64_t *position)
+{
+    return lwext4_error(ext4_file_seek_sparse(lwext4_node_file(node), offset, end,
+        seek_hole, ext4_seek_cached, node, position));
+}
+
 static uint64_t ext4_backend_direct_limit(struct kernel_vfs_node *node)
 { return node->max_size; }
 
@@ -3353,6 +3370,7 @@ static void initialize_backend(void)
     ops->writeback = ext4_backend_writeback;
     ops->direct_io = ext4_backend_direct_io;
     ops->direct_alignment = ext4_backend_direct_alignment;
+    ops->seek_sparse = ext4_backend_seek_sparse;
     ops->direct_write_limit = ext4_backend_direct_limit;
     __atomic_store_n(&ext4_backend.pread_batch,ext4_backend_pread_batch,__ATOMIC_RELEASE);
 }

@@ -3477,6 +3477,60 @@ static size_t writeback_block_size(const struct kernel_page_cache_entry *entry)
     if (block&(block-1)) __builtin_trap();
     return block;
 }
+
+static size_t seek_cached_page(const struct kernel_page_cache_entry *entry,
+    size_t start, size_t end, bool seek_hole, bool unwritten)
+{
+    if (unwritten && entry_load_status(entry)==KERNEL_PAGE_CACHE_STATUS_OK)
+        return seek_hole ? end : start;
+    if (!entry->dirty_end) return seek_hole ? start : end;
+#if BOAROS_PAGE_CACHE_DIRTY_BLOCKS
+    size_t block = dirty_block_size(entry);
+    if (block) {
+        uint64_t mask = seek_hole ? ~entry->dirty_blocks : entry->dirty_blocks;
+        mask &= dirty_block_range(block, start, end);
+        if (!mask) return end;
+        size_t match = (size_t)__builtin_ctzll(mask) * block;
+        return match > start ? match : start;
+    }
+#endif
+    size_t quantum = writeback_block_size(entry);
+    size_t first = entry->dirty_begin & ~(quantum - 1);
+    size_t last = (entry->dirty_end + quantum - 1) & ~(quantum - 1);
+    size_t match;
+    if (seek_hole) match = start < first || start >= last ? start : last;
+    else match = start >= last ? end : start > first ? start : first;
+    return match < end ? match : end;
+}
+
+uint64_t kernel_page_cache_seek_sparse(struct kernel_page_cache *cache, struct kernel_vfs_node *node,
+    uint64_t start, uint64_t end, bool seek_hole, bool unwritten)
+{
+    while (start < end) {
+        CACHE_SCOPE(guard, cache);
+        struct kernel_page_cache_entry *entry = unwritten ?
+            index_at_or_after(node, start >> BOAROS_PAGE_SHIFT) :
+            dirty_at_or_after(node, start >> BOAROS_PAGE_SHIFT);
+        /* Long runs use bounded batches and don't block other inodes. */
+        for (unsigned checked = 0; checked < 16U && start < end; checked++) {
+            if (!entry || entry->page_index > (end - 1) >> BOAROS_PAGE_SHIFT)
+                return seek_hole ? start : end;
+            uint64_t base = entry->page_index << BOAROS_PAGE_SHIFT;
+            if (start < base) {
+                if (seek_hole) return start;
+                start = base;
+            }
+            size_t limit = end - base < BOAROS_PAGE_SIZE ? end - base : BOAROS_PAGE_SIZE;
+            size_t match = seek_cached_page(entry, start - base, limit, seek_hole, unwritten);
+            if (match < limit) return base + match;
+            start = base + limit;
+            entry = unwritten ? RB_NEXT(kernel_page_cache_tree, &node->cache_pages, entry) :
+                RB_NEXT(kernel_page_cache_dirty_tree, &kernel_vfs_node_dirty_pages(node)->tree, entry);
+        }
+    }
+    return end;
+}
+
 static int next_writeback_span(struct kernel_page_cache_entry *entry,
     struct prepared_writeback *prepared,size_t *cursor,struct file_write_span *span)
 {
@@ -4256,6 +4310,7 @@ void kernel_page_cache_truncate(struct kernel_page_cache *cache,
 {
     if (cache_live(cache)) readahead_cancel_node(cache, node);
     {
+        uint64_t cancelled = 0;
         {
             CACHE_SCOPE(guard,cache);
             uint64_t first=(size>>BOAROS_PAGE_SHIFT)+!!(size&BOAROS_PAGE_MASK);
@@ -4263,11 +4318,13 @@ void kernel_page_cache_truncate(struct kernel_page_cache *cache,
             while (entry) {
                 struct kernel_page_cache_entry *next=RB_NEXT(kernel_page_cache_tree,&node->cache_pages,entry);
                 /* The old writeback borrower observes retirement before capture. */
+                if (entry->dirty_end) cancelled += BOAROS_PAGE_SIZE;
                 remove_entry(cache,entry);
                 cache_wake(&entry->ready);
                 entry=next;
             }
         }
+        if (cancelled) kernel_task_account_cancelled_write(cancelled);
         uint64_t released=0; (void)drain_entries(cache,&released);
         return;
     }

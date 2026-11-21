@@ -203,6 +203,10 @@ const void *kernel_page_cache_read_data(const struct kernel_page_cache_read_page
 /* A successful lookup also returns an owned physical-page reference. */
 /* 只借用当前已完成页；装入、resize或截断中的条目返回BUSY。 */
 int kernel_page_cache_resident(struct kernel_page_cache *, const struct kernel_vfs_file *, uint64_t index);
+/* Search a backend hole or unwritten run without loading pages. End is the
+ * no-match sentinel. Caller excludes concurrent mapping writeback. */
+uint64_t kernel_page_cache_seek_sparse(struct kernel_page_cache *, struct kernel_vfs_node *,
+    uint64_t start, uint64_t end, bool seek_hole, bool unwritten);
 enum kernel_page_cache_status kernel_page_cache_lookup(
     struct kernel_page_cache *cache,
     const struct kernel_vfs_file *file,

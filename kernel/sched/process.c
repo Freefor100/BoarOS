@@ -612,9 +612,7 @@ enum kernel_scheduler_status process_group_exec_current(void)
         __atomic_store_n(&task->signal_unkillable,leader->signal_unkillable,__ATOMIC_RELAXED);
         task->child_creator = leader->child_creator;
         leader->child_creator = 0;
-        task->dead_usage = leader->dead_usage;
-        scheduler_usage_add(&task->dead_usage, &leader->usage);
-        task->child_usage = leader->child_usage;
+        scheduler_usage_add(&task->limits->dead_usage, &leader->usage);
         __atomic_store_n(&task->group_pending,leader->group_pending,__ATOMIC_RELAXED);
         task->group_child_info = leader->group_child_info;
         if(task->limits!=leader->limits)__builtin_trap();
@@ -1296,7 +1294,7 @@ static enum kernel_scheduler_status retire_waited_zombie(
     kernel_task_release_io_scratch(child);
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        scheduler_usage_add(&parent->group_leader->child_usage, usage);
+        scheduler_usage_add(&parent->group_leader->limits->child_usage, usage);
         child_remove_locked(parent->group_leader, child);
         if (scheduler.init_task == child) {
             scheduler.init_task = 0;
@@ -2064,7 +2062,7 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
             struct kernel_task_usage departed;
             scheduler_usage_thread_locked(thread, &departed);
-            scheduler_usage_add(&leader->dead_usage, &departed);
+            scheduler_usage_add(&leader->limits->dead_usage, &departed);
             /* 与退出线程从组目录移除处在同一可观察边界。 */
             kernel_nproc_release_locked(thread);
             thread->group_previous->group_next = thread->group_next;

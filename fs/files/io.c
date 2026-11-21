@@ -2192,6 +2192,22 @@ static enum kernel_files_status lseek_pinned(
         }
         target = current + offset;
         break;
+    case KERNEL_FILES_SEEK_DATA:
+    case KERNEL_FILES_SEEK_HOLE: {
+        if (kernel_open_file_kind(description)!=KERNEL_OPEN_FILE_KIND_REGULAR) {
+            *linux_result=-KERNEL_EINVAL;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        uint64_t position;
+        int error=kernel_vfs_seek_sparse(&description->file, (uint64_t)offset,
+            whence==KERNEL_FILES_SEEK_HOLE, &position);
+        if (error) {
+            *linux_result=error;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        target=(int64_t)position;
+        break;
+    }
     default:
         *linux_result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;

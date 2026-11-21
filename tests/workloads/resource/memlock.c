@@ -38,7 +38,10 @@ static void pass(const char *s){printf("MEMLOCK CASE %s PASS\n",s);cases++;}
 static void onfault(void)
 {
     unsigned char *p=area(4);CHECK(!syscall(SYS_mlock2,p,4*page,MLOCK_ONFAULT));
+    ERROR(msync(p,4*page,MS_INVALIDATE),EBUSY);
+    CHECK(!msync(p,0,MS_INVALIDATE));
     CHECK(locked()==4*page);resident(p,4,0);p[page]=73;resident(p,4,2);
+    CHECK(!msync(p,4*page,MS_SYNC));
     CHECK(!munlock(p,4*page)&&!locked());resident(p,4,2);CHECK(!munmap(p,4*page));pass("onfault-residency-and-unlock");
 }
 static void overlap(void)
@@ -125,6 +128,9 @@ static void file_ranges(void)
 {
     int fd=open("/locked-source",O_CREAT|O_EXCL|O_RDWR,0600);CHECK(fd>=0&&!ftruncate(fd,4*page));
     unsigned char *p=mmap(0,4*page,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);CHECK(p!=MAP_FAILED);
+    CHECK(!mlock(p+page,page));
+    ERROR(msync(p,2*page,MS_SYNC|MS_INVALIDATE),EBUSY);
+    CHECK(!munlock(p+page,page)&&!msync(p,2*page,MS_SYNC|MS_INVALIDATE));
     CHECK(!mlock(p,4*page)&&locked()==4*page);resident(p,4,15);p[0]=31;
     CHECK(!ftruncate(fd,page));CHECK(locked()==4*page);CHECK(!munlock(p,4*page)&&!munmap(p,4*page));
     CHECK(!ftruncate(fd,4*page));p=mmap(0,4*page,PROT_READ|PROT_WRITE,MAP_PRIVATE,fd,0);CHECK(p!=MAP_FAILED);

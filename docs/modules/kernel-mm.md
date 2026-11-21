@@ -271,6 +271,8 @@ exec 的 ADDR_NO_RANDOMIZE 候选状态控制主 ELF/解释器、mmap ceiling、
 
 `kernel_mm_msync()` 按固定 Linux `references/linux/mm/msync.c`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）检查 flags、对齐和范围；长度零成功，空洞在处理已映射片段后返回 `ENOMEM`。`MS_SYNC` 对共享文件 VMA 的对应 inode 范围写回，再同步元数据并传递块 flush，错误沿 inode/OFD 序列传播；`MS_ASYNC` 不提交 I/O。映射保持 OFD/node 引用，所以关闭 fd 或 unlink 后仍能同步。
 
+调用设置 `MS_INVALIDATE` 时，内核沿虚拟内存区域（Virtual Memory Area，VMA）的地址顺序检查锁页状态。遇到已锁定的区域立即返回 `EBUSY`，按需锁页 `MLOCK_ONFAULT` 即使尚未装页也属于锁定状态。若同时设置 `MS_SYNC`，每段共享文件映射在释放地址空间操作锁后完成同步，再重新查找下一段。后段返回 `EBUSY` 时，前段已完成的同步仍然有效。
+
 ELF image 使用独立的 `kernel_elf64_source`，不把 `PT_LOAD` 当作普通 file-private mmap。source 在 exec 时一次解析 program headers，并将页区间规范化为 `ELF_PRIVATE` VMA 的 `backing_offset`。完整文件页可以共享 page cache；文件/BSS 边界页、多个段贡献页和 BSS 页由 fault 路径私有分配、清零并精确填充。source 引用由 MM 记录，重复映射不增加历史引用，fork 子 MM 获取独立引用，最后一个相关 VMA 消失才 release。可执行页发布后执行本地 `SFENCE.VMA` 和必要 `FENCE.I`，覆盖先读后取指。source 的 OFD/I/O 清理错误仍由 source owner 保留，堆和物理页释放不建立重试状态。
 
 MM 还单独持有主 ELF 的执行 OFD，供 `/proc/<pid>/exe` 查询。它在新映像全部构造成功后取得，exec 失败不改变旧 MM；线程共享同一 MM，fork 子 MM 另取引用，末次 MM 清理在 ELF source 仍持有 OFD 时先释放该引用。`PT_INTERP` 只决定实际入口，不改变 exe 所指主文件；查询返回带引用的路径，调用者不能在任务退出后借用 MM 指针。

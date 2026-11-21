@@ -19,7 +19,8 @@ struct kernel_memory_object_page {
     uint64_t index;
     uint64_t physical_address;
     uint32_t preparations;
-    uint32_t publication;
+    uint32_t publication : 2;
+    uint32_t preallocated : 1;
 };
 
 struct kernel_memory_object {
@@ -276,8 +277,9 @@ static enum kernel_memory_object_status get_page(
             page->preparations++;
             /* 继承直接消费者保存的页；新协议不能撤销其既有内容。 */
             if (page->publication == PAGE_DIRECT) page->publication = PAGE_ADOPTED;
-        } else if (page->publication == PAGE_PREPARING) {
-            page->publication = PAGE_ADOPTED;
+        } else {
+            if (page->publication == PAGE_PREPARING) page->publication = PAGE_ADOPTED;
+            page->preallocated = 0;
         }
         *physical_address = page->physical_address;
         *created = 0;
@@ -322,12 +324,23 @@ enum kernel_memory_object_status kernel_memory_object_preallocate(
     for (uint64_t index=first;index<last;index++) {
         struct kernel_memory_object_page *page=object->buckets[bucket_for(index,object->bucket_count)];
         while (page && page->index!=index) page=page->next;
-        if (page) { pending |= page->publication==PAGE_PREPARING; continue; }
+        if (page) { pending |= page->publication==PAGE_PREPARING || page->preallocated; continue; }
         status=allocate_backing(object,index,0,&page);
         if (status) break;
         page->next=staged;staged=page;added++;
     }
     if (!status) status=grow_buckets(object,object->page_count+added);
+    if (!status && pending) {
+        /* Existing zero pages become data on a second fallocate. Newly staged
+         * pages have not yet joined the object and remain unwritten. */
+        for (uint64_t index=first;index<last;index++) {
+            struct kernel_memory_object_page *page=object->buckets[bucket_for(index,object->bucket_count)];
+            while (page && page->index!=index) page=page->next;
+            if (!page) continue;
+            page->preallocated = page->publication == PAGE_PREPARING;
+            if (page->preallocated) page->publication=PAGE_ADOPTED;
+        }
+    }
     while (staged) {
         struct kernel_memory_object_page *page=staged;staged=page->next;
         if (status) {
@@ -337,19 +350,12 @@ enum kernel_memory_object_status kernel_memory_object_preallocate(
         } else {
             size_t bucket=bucket_for(page->index,object->bucket_count);
             page->publication=PAGE_DIRECT;
+            page->preallocated=1;
             page->next=object->buckets[bucket];object->buckets[bucket]=page;
         }
     }
-    if (!status) {
+    if (!status)
         __atomic_fetch_add(&object->page_count,added,__ATOMIC_RELEASE);
-        /* A successful reservation adopts any already prepared backing too. */
-        if (pending) for (uint64_t index=first;index<last;index++) {
-            struct kernel_memory_object_page *page=object->buckets[bucket_for(index,object->bucket_count)];
-            while (page && page->index!=index) page=page->next;
-            if (!page) __builtin_trap();
-            if (page->publication==PAGE_PREPARING) page->publication=PAGE_ADOPTED;
-        }
-    }
     return status;
 }
 
@@ -377,7 +383,10 @@ void kernel_memory_object_finish_page(struct kernel_memory_object *object,
     }
     struct kernel_memory_object_page *page = *link;
     if (!page->preparations || page->publication == PAGE_DIRECT) __builtin_trap();
-    if (accepted) page->publication = PAGE_ADOPTED;
+    if (accepted) {
+        page->publication = PAGE_ADOPTED;
+        page->preallocated = 0;
+    }
     else if (physical_page_release(object->allocator, address) != PHYSICAL_PAGE_STATUS_OK)
         __builtin_trap();
     page->preparations--;
@@ -441,6 +450,43 @@ enum kernel_memory_object_status kernel_memory_object_find_page(
         return KERNEL_MEMORY_OBJECT_OK;
     }
     return KERNEL_MEMORY_OBJECT_NOT_FOUND;
+}
+
+static int seek_data_page(const struct kernel_memory_object_page *page)
+{ return page->publication != PAGE_PREPARING && !page->preallocated; }
+
+static int page_has_data(const struct kernel_memory_object *object, uint64_t index)
+{
+    const struct kernel_memory_object_page *page = object->buckets[bucket_for(index, object->bucket_count)];
+    for (; page; page = page->next)
+        if (page->index == index) return seek_data_page(page);
+    return 0;
+}
+
+int kernel_memory_object_seek_sparse(struct kernel_memory_object *object, uint64_t start,
+    uint64_t end, int seek_hole, uint64_t *position)
+{
+    KERNEL_LOCK_SCOPE(guard);
+    kernel_mutex_lock(&object->lock, &guard);
+    uint64_t first = start >> BOAROS_PAGE_SHIFT;
+    if (seek_hole) {
+        while (start < end && page_has_data(object, first))
+            start = ++first << BOAROS_PAGE_SHIFT;
+        *position = start < end ? start : end;
+    } else if (page_has_data(object, first)) {
+        *position = start;
+    } else {
+        /* A large hole costs at most a scan of actual backing slots. */
+        uint64_t next = ((end - 1) >> BOAROS_PAGE_SHIFT) + 1;
+        for (size_t i = 0; i < object->bucket_count; i++) {
+            for (const struct kernel_memory_object_page *page = object->buckets[i]; page; page = page->next)
+                if (page->index > first && page->index < next && seek_data_page(page))
+                    next = page->index;
+        }
+        *position = next << BOAROS_PAGE_SHIFT;
+        if (*position >= end) return -KERNEL_ENXIO;
+    }
+    return 0;
 }
 
 uint64_t kernel_memory_object_resident_pages(const struct kernel_memory_object *object)

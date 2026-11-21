@@ -1008,9 +1008,9 @@ static void signal_send_child(struct kernel_task *parent, struct kernel_task *ch
                                                    process_pid_active(parent));
         info.uid=kernel_credentials_task_locked(child)->uid;
         scheduler_task_cpu_time_locked(child,&info.user_time,&info.system_time);
-        if(code>=1 && code<=3) {
-            info.user_time=timer_add(info.user_time,child->dead_usage.user_ns);
-            info.system_time=timer_add(info.system_time,child->dead_usage.kernel_ns);
+        if(code>=1 && code<=3 && child->limits) {
+            info.user_time=timer_add(info.user_time,child->limits->dead_usage.user_ns);
+            info.system_time=timer_add(info.system_time,child->limits->dead_usage.kernel_ns);
         }
         info.user_time/=UINT64_C(10000000);info.system_time/=UINT64_C(10000000);
     }

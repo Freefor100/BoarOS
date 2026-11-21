@@ -185,6 +185,7 @@ struct kernel_vfs_backend {
      * releases it and creates a new one after seek to offset zero. */
     int (*snapshot)(struct kernel_vfs_node *node, struct kernel_heap *heap,
         struct kernel_namespace *ipc_namespace, struct kernel_pid_registry *pid_view, char **buffer, size_t *length);
+    int (*is_generated)(const struct kernel_vfs_node *);
     /* Controls use a complete kernel buffer and return the new position,
      * which can differ from old position + accepted bytes. The files layer
      * commits that position only after successful user copying. */
@@ -291,6 +292,7 @@ struct kernel_vfs_backend {
         size_t name_size);
     /* Nonzero alignment advertises real synchronous file-data direct I/O. */
     size_t (*direct_alignment)(struct kernel_vfs_node *);
+    int (*seek_sparse)(struct kernel_vfs_node *, uint64_t, uint64_t, bool, uint64_t *);
     /* Closed mapping epoch; direction is read=0, write=1, drain-only=-1. */
     int (*direct_io)(struct kernel_vfs_node *,uint64_t,void *,size_t,int,size_t *);
     uint64_t (*direct_write_limit)(struct kernel_vfs_node *);
