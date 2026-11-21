@@ -65,9 +65,7 @@ int kernel_open_file_fallocate(struct kernel_open_file_description *file,
 {
     if (!open_file_live(file)) return -KERNEL_EBADF;
     if (offset<0 || length<=0) return -KERNEL_EINVAL;
-    if (mode!=0 && mode!=KERNEL_VFS_FALLOC_KEEP_SIZE &&
-        mode!=(KERNEL_VFS_FALLOC_KEEP_SIZE|KERNEL_VFS_FALLOC_PUNCH_HOLE))
-        return -KERNEL_EOPNOTSUPP;
+    if (!kernel_vfs_fallocate_mode_supported(mode)) return -KERNEL_EOPNOTSUPP;
     if (file->kind==KERNEL_OPEN_FILE_KIND_PATH || !(file->open_flags&3U)) return -KERNEL_EBADF;
     if (file->kind==KERNEL_OPEN_FILE_KIND_PIPE) return -KERNEL_ESPIPE;
     if (file->kind==KERNEL_OPEN_FILE_KIND_DIRECTORY) return -KERNEL_EISDIR;

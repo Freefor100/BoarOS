@@ -4696,8 +4696,10 @@ int ext4_fallocate(ext4_file *file, unsigned mode, uint64_t offset,
 {
     ext4_assert(file && file->mp && changed);
     *changed = false;
-    if (mode != 0 && mode != EXT4_FALLOC_KEEP_SIZE &&
-        mode != (EXT4_FALLOC_KEEP_SIZE | EXT4_FALLOC_PUNCH_HOLE)) return ENOTSUP;
+    unsigned operation = mode & ~EXT4_FALLOC_KEEP_SIZE;
+    bool punch = operation == EXT4_FALLOC_PUNCH_HOLE;
+    bool zero = operation == EXT4_FALLOC_ZERO_RANGE;
+    if (operation && !zero && !(punch && (mode & EXT4_FALLOC_KEEP_SIZE))) return ENOTSUP;
     if (!length || offset > INT64_MAX || length > INT64_MAX) return EINVAL;
     if (length > INT64_MAX - offset) return EFBIG;
     if (file->mp->fs.read_only) return EROFS;
@@ -4707,7 +4709,7 @@ int ext4_fallocate(ext4_file *file, unsigned mode, uint64_t offset,
     EXT4_MP_LOCK(file->mp);
     struct ext4_fs *fs=&file->mp->fs;
     if (file->delalloc && fs->jbd_journal) {
-        if (mode&EXT4_FALLOC_PUNCH_HOLE) file->delalloc->mapped_end=0;
+        if (punch || zero) file->delalloc->mapped_end=0;
         size_t block=fs->bdev->lg_bsize;
         EXT4_STATE_SCOPE(state,fs);
         (void)delalloc_range(file->delalloc,offset/block,(end-1)/block+1,false);
@@ -4734,7 +4736,7 @@ Retry:
         goto Put;
     }
     if (ext4_inode_has_flag(ref.inode, EXT4_INODE_FLAG_IMMUTABLE) ||
-        ((mode & EXT4_FALLOC_PUNCH_HOLE) && ext4_inode_has_flag(ref.inode, EXT4_INODE_FLAG_APPEND))) {
+        ((punch || zero) && ext4_inode_has_flag(ref.inode, EXT4_INODE_FLAG_APPEND))) {
         r = EPERM;
         goto Put;
     }
@@ -4747,8 +4749,8 @@ Retry:
     if (privilege_mode!=UINT32_MAX) {
         ext4_inode_set_mode(sb,ref.inode,privilege_mode);ref.dirty=true;
     }
-    if ((mode & EXT4_FALLOC_PUNCH_HOLE) && offset >= size) goto Touch;
-    if (mode & EXT4_FALLOC_PUNCH_HOLE) {
+    if (punch && offset >= size) goto Touch;
+    if (punch) {
         uint64_t eof_block = (size + block_size - 1) / block_size * block_size;
         if (end > eof_block) end = eof_block;
         uint64_t first = (offset + block_size - 1) / block_size;
@@ -4765,18 +4767,39 @@ Retry:
     } else {
         uint64_t first = offset / block_size;
         uint64_t last = (end + block_size - 1) / block_size;
+        uint64_t full_first = (offset + block_size - 1) / block_size;
+        uint64_t full_end = end / block_size;
         while (r == EOK && first < last) {
             struct ext4_inode_block_range range;
-            uint64_t count = last - first;
+            bool convert = zero && first >= full_first && first < full_end;
+            uint64_t run_end = convert ? full_end : last;
+            if (zero && first < full_first) run_end = full_first;
+            uint64_t count = run_end - first;
             if (count > UINT32_MAX) count = UINT32_MAX;
-            r = ext4_extent_reserve_range(&ref, (ext4_lblk_t)first,
-                (uint32_t)count, &range);
+            if (convert)
+                r = ext4_extent_zero_range(&ref, (ext4_lblk_t)first, (uint32_t)count, &range);
+            else
+                r = ext4_extent_reserve_range(&ref, (ext4_lblk_t)first, (uint32_t)count, &range);
             if (r != EOK) break;
             if (!range.count) { r = EIO; break; }
             first += range.count;
         }
+        if (r == EOK && zero) {
+            uint64_t left_end = full_first * block_size;
+            uint64_t right = full_end * block_size;
+            if (left_end > end) left_end = end;
+            r = ext4_zero_file_range(&ref, offset, left_end);
+            if (r == EOK && right >= left_end && right < end)
+                r = ext4_zero_file_range(&ref, right, end);
+        }
         if (r == EOK && !(mode & EXT4_FALLOC_KEEP_SIZE) && end > size) {
-            r = ext4_zero_allocated_eof_tail(&ref, size, end);
+            if (!zero)
+                r = ext4_zero_allocated_eof_tail(&ref, size, end);
+            else if (size < offset && size % block_size) {
+                /* Clear a newly visible old EOF tail without allocating a gap. */
+                uint64_t tail = (size / block_size + 1) * block_size;
+                r = ext4_zero_file_range(&ref, size, offset < tail ? offset : tail);
+            }
             if (r == EOK) {
                 ext4_inode_set_size(ref.inode, end);
                 ref.dirty = true;

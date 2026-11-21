@@ -3347,6 +3347,7 @@ static void initialize_backend(void)
     ops->readlink = ext4_backend_readlink;
     ops->check_domain = ext4_check_domain;
     ops->truncate = ext4_backend_truncate;
+    ops->fallocate_zero_range = true;
     ops->fallocate = ext4_backend_fallocate;
     ops->reserve_write = ext4_backend_reserve_write;
     ops->finish_reservation = ext4_backend_finish_reservation;

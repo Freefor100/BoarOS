@@ -2444,6 +2444,39 @@ int ext4_extent_reserve_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblo
     return extent_get_range(inode_ref, iblock, max_blocks, true, true, range);
 }
 
+int ext4_extent_zero_range(struct ext4_inode_ref *ref, ext4_lblk_t first,
+    uint32_t count, struct ext4_inode_block_range *range)
+{
+    /* An initialized extent can encode one more block than an unwritten one. */
+    if (count > EXT_UNWRITTEN_MAX_LEN) count = EXT_UNWRITTEN_MAX_LEN;
+    int result = ext4_extent_reserve_range(ref, first, count, range);
+    if (result || range->unwritten) return result;
+
+    struct ext4_extent_path *path = NULL;
+    result = ext4_find_extent(ref, first, &path, 0);
+    if (result) return result;
+    struct ext4_extent *extent = path[ext_depth(ref->inode)].extent;
+    ext4_lblk_t begin = to_le32(extent->first_block);
+    ext4_lblk_t end = first + range->count;
+    if (end < begin + ext4_ext_get_actual_len(extent)) {
+        /* Leave the right neighbor initialized. If there is also a left
+         * neighbor, retain both states until the second split succeeds. */
+        result = ext4_ext_split_extent_at(ref, &path, end,
+            first == begin ? EXT4_EXT_MARK_UNWRIT1 : 0);
+        if (result || first == begin) goto Release;
+        result = ext4_find_extent(ref, first, &path, 0);
+    }
+    if (!result)
+        result = ext4_ext_split_extent_at(ref, &path, first, EXT4_EXT_MARK_UNWRIT2);
+Release:
+    if (path) {
+        ext4_ext_drop_refs(ref, path, 0);
+        ext4_free(path);
+    }
+    if (!result) range->unwritten = true;
+    return result;
+}
+
 int ext4_extent_get_blocks(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
     uint32_t max_blocks, ext4_fsblk_t *result, bool create, uint32_t *blocks_count)
 {

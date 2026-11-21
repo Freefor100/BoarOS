@@ -4170,9 +4170,10 @@ static int fallocate_borrowing(struct kernel_vfs_file *file, unsigned mode,
     if (!file || file->state != VFS_FILE_STATE_LIVE || !file->private_data) return -KERNEL_EINVAL;
     if (!length || offset > INT64_MAX || length > INT64_MAX) return -KERNEL_EINVAL;
     if (length > INT64_MAX - offset) return -KERNEL_EFBIG;
-    if (mode != 0 && mode != KERNEL_VFS_FALLOC_KEEP_SIZE &&
-        mode != (KERNEL_VFS_FALLOC_KEEP_SIZE | KERNEL_VFS_FALLOC_PUNCH_HOLE))
-        return -KERNEL_EOPNOTSUPP;
+    if (!kernel_vfs_fallocate_mode_supported(mode)) return -KERNEL_EOPNOTSUPP;
+    int punch = mode & KERNEL_VFS_FALLOC_PUNCH_HOLE;
+    int zero = mode & KERNEL_VFS_FALLOC_ZERO_RANGE;
+    int changes_data = punch || zero;
     struct kernel_vfs_node *node = file->private_data;
     KERNEL_LOCK_SCOPE(operation);
     if (borrowed) {
@@ -4188,7 +4189,8 @@ static int fallocate_borrowing(struct kernel_vfs_file *file, unsigned mode,
     if (node->exec_users) return -KERNEL_ETXTBSY;
     uint32_t denied=(mode & ~KERNEL_VFS_FALLOC_KEEP_SIZE) ? KERNEL_VFS_INODE_PROTECTED : KERNEL_VFS_INODE_IMMUTABLE;
     if (kernel_vfs_node_attributes(node)&denied) return -KERNEL_EPERM;
-    if (!node->instance->ops->fallocate) return -KERNEL_EOPNOTSUPP;
+    if (!node->instance->ops->fallocate || (zero && !node->instance->ops->fallocate_zero_range))
+        return -KERNEL_EOPNOTSUPP;
     uint64_t end = offset + length, old_size = node->size;
     /* vfs_fallocate先拒绝文件系统上限，后端的进程限额检查才可能发信号。 */
     if (end > node->max_size) return -KERNEL_EFBIG;
@@ -4202,44 +4204,44 @@ static int fallocate_borrowing(struct kernel_vfs_file *file, unsigned mode,
     if (modified) return modified;
     /* shmem validates reservations beyond EOF against FSIZE even KEEP_SIZE;
      * disk allocation retains the existing size-changing-only check. */
-    if ((!mode || (node->memory && mode==KERNEL_VFS_FALLOC_KEEP_SIZE)) &&
+    if ((!(mode & KERNEL_VFS_FALLOC_KEEP_SIZE) ||
+         (node->memory && mode==KERNEL_VFS_FALLOC_KEEP_SIZE)) &&
         end > old_size && limit && end > limit->maximum) {
         limit->exceeded = 1;
         return -KERNEL_EFBIG;
     }
-    if (mode & KERNEL_VFS_FALLOC_PUNCH_HOLE) {
-        if (node->file_seals&KERNEL_SEAL_WRITES) return -KERNEL_EPERM;
-    } else if ((node->file_seals&KERNEL_SEAL_GROW) && end>old_size) return -KERNEL_EPERM;
+    if (changes_data && (node->file_seals&KERNEL_SEAL_WRITES)) return -KERNEL_EPERM;
+    if (!punch && (node->file_seals&KERNEL_SEAL_GROW) && end>old_size) return -KERNEL_EPERM;
     struct kernel_page_cache *cache = node->instance->page_cache;
     int result = kernel_file_mapping_prepare(node);
     if (result) return result;
     kernel_file_mapping_close(node);
     kernel_lock_release(&io);
-    int punch = mode & KERNEL_VFS_FALLOC_PUNCH_HOLE;
     uint64_t first = offset & ~BOAROS_PAGE_MASK;
     uint64_t last = (end + BOAROS_PAGE_MASK) & ~BOAROS_PAGE_MASK;
-    if (punch) kernel_file_mapping_invalidate_range(node,first,last);
+    if (changes_data) kernel_file_mapping_invalidate_range(node,first,last);
     /* Buffered EOF can lead persistent EOF. Publish its dirty prefix before
-     * the backend computes KEEP_SIZE or clamps a punch at i_size. */
+     * a range update changes the cached data or computes its new size. */
     result = cache ? kernel_page_cache_writeback_range_borrowing(cache,node,0,UINT64_MAX,
         borrowed ? borrowed : &operation) : 0;
     struct kernel_page_cache_resize resize = {0};
-    if (!result && cache && !mode && end > old_size)
+    if (!result && cache && !(mode & KERNEL_VFS_FALLOC_KEEP_SIZE) && end > old_size)
         result = kernel_page_cache_resize_prepare(cache,node,old_size,end,&resize);
     kernel_vfs_node_lock(node,&io,1);
+    int changed = 0;
     if (!result) {
         uint64_t actual;
-        int changed;
         result = node->instance->ops->fallocate(node,mode,offset,length,&actual,&changed);
         if (changed) {
             __atomic_store_n(&node->size,actual,__ATOMIC_RELEASE);
             file->size = actual;
-            /* The same inode writer publishes disk mappings, cache retirement
-             * and EOF; queued old writeback cannot capture between them. */
-            if (punch && cache) kernel_page_cache_invalidate_range(cache,node,first,last);
         }
     }
     kernel_page_cache_resize_finish(&resize,node->size);
+    /* The inode writer publishes mappings, size and cache retirement together.
+     * Finish the resize's boundary-page borrow before retiring that entry. */
+    if (changed && changes_data && cache)
+        kernel_page_cache_invalidate_range(cache,node,first,last);
     kernel_file_mapping_open(node);
     return result;
 }
