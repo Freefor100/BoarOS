@@ -90,8 +90,11 @@ int main(void)
     assert(virtio_split_notify(&q,&t,0)==VIRTIO_OK && m.notified==notified+1);
     assert(q.available->index==(uint16_t)(first+2));
     assert(q.available->ring[first%q.size]==1 && q.available->ring[(first+1)%q.size]==0);
-    complete(&q,0,16);complete(&q,1,16);
-    assert(virtio_split_take(&q,&done)==VIRTIO_OK && done.token==&owners[0]);
+    complete(&q,0,16);
+    uint16_t completed = virtio_split_completion_index(&q);
+    complete(&q,1,16);
+    assert(virtio_split_take_before(&q,completed,&done)==VIRTIO_OK && done.token==&owners[0]);
+    assert(virtio_split_take_before(&q,completed,&done)==VIRTIO_EMPTY && q.inflight==1);
     assert(virtio_split_take(&q,&done)==VIRTIO_OK && done.token==&owners[1]);
     for(unsigned i=0;i<65544;i++) {
         assert(virtio_split_publish(&q,&t,0,0,&owners[0],1,16)==VIRTIO_OK);

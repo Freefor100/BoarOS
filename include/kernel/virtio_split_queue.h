@@ -52,6 +52,11 @@ enum virtio_status virtio_split_enqueue(struct virtio_split_queue *,struct virti
 enum virtio_status virtio_split_stage(struct virtio_split_queue *,struct virtio_transport *,
     uint16_t,void *,uint32_t,uint32_t);
 enum virtio_status virtio_split_notify(struct virtio_split_queue *,struct virtio_transport *,uint16_t);
+/* Snapshot the device's completed prefix under the same queue guard used
+ * to consume it. Entries published later belong to the next snapshot. */
+uint16_t virtio_split_completion_index(const struct virtio_split_queue *);
+enum virtio_status virtio_split_take_before(struct virtio_split_queue *,uint16_t,
+    struct virtio_completion *);
 enum virtio_status virtio_split_take(struct virtio_split_queue *,struct virtio_completion *);
 enum virtio_status virtio_split_reset(struct virtio_split_queue *,const struct virtio_transport *);
 #endif

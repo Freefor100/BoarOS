@@ -45,7 +45,7 @@ block包装层记录core owner是否已消费，根清理也纳入尚未构造co
 head/token/链mask和完成长度边界。token是业务owner的不透明身份，不被框架解引用。
 发布后，设备对象、传输接口和队列地址必须保持稳定。块设备使用 `enqueue()` 发布描述符链，可以在发布后合并设备通知。网卡的发送与接收补充路径使用 `stage()` 在驱动保护内登记描述符所有者、链和队列项，再通过 `notify()` 成批推进设备可见的可用索引。直接内存访问（Direct Memory Access，DMA）屏障保证描述符和队列项先于索引可见。设备可以在索引更新后、收到通知前完成请求。
 
-`take`先读used idx并执行DMA屏障，检查ring容量、已发布head与长度边界。每次
+`virtio_split_take()` 读设备完成索引后执行直接内存访问屏障。网卡在同一次设备状态保护内用 `virtio_split_completion_index()` 捕获一批完成项的结束索引，再用 `virtio_split_take_before()` 逐项取出该前缀。批次中后到的完成项留给后续扫描，不重新读取结束索引或重复执行屏障。框架逐项检查队列容量、描述符头身份与长度边界。每次
 合法完成返回token并归还descriptor资格；它不释放业务buffer、RX loan、pbuf或
 调用方的块请求内存。已收割的合法完成不因后续重复/非法项改变结果；错误保留
 未收割token、used/consumed/head/length快照，设备核心决定停止与错误传播。
