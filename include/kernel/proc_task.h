@@ -134,6 +134,9 @@ int kernel_proc_process_path_acquire(kernel_pid_t pid, uint64_t identity,
 /* Rows own real backing OFD references; caller releases them and heap storage. */
 int kernel_proc_maps_snapshot(kernel_pid_t pid, uint64_t identity,
     struct kernel_heap *heap, struct kernel_mm_proc_map **rows, uint32_t *count);
+struct kernel_mm_pagemap;
+int kernel_proc_pagemap_open(kernel_pid_t pid, uint64_t identity,
+    struct kernel_mm_pagemap *view);
 int kernel_proc_next_fd(kernel_pid_t pid, uint64_t identity,
                          int after, int *fd);
 int kernel_proc_fd_access_snapshot(kernel_pid_t pid, uint64_t identity,

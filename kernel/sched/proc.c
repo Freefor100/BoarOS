@@ -515,6 +515,23 @@ static int proc_resource_matches_locked(struct kernel_task *task, kernel_pid_t p
         id->generation == (target & ~KERNEL_PROC_THREAD_TARGET);
 }
 
+int kernel_proc_pagemap_open(kernel_pid_t pid, uint64_t identity,
+    struct kernel_mm_pagemap *view)
+{
+    KERNEL_IRQ_SCOPE(proc_irq);
+    SCHEDULER_TASK_BORROW(task, find_resource_owner(pid, identity));
+    if (!task) return -KERNEL_ESRCH;
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    if (!proc_resource_matches_locked(task, pid, identity) || task->mm.state != KERNEL_MM_LIVE)
+        return -KERNEL_ESRCH;
+    if (!kernel_credentials_may_access_locked(kernel_task_current(), task, 1))
+        return -KERNEL_EACCES;
+    /* Open-time authorization and the weak address-space reference are
+     * captured together. Later exec or PID reuse cannot retarget the file. */
+    kernel_mm_pagemap_hold(&task->mm, view);
+    return 0;
+}
+
 int kernel_proc_io_snapshot(kernel_pid_t pid, uint64_t identity,
     struct kernel_proc_io_counters *out)
 {

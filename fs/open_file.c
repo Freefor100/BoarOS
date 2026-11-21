@@ -285,14 +285,31 @@ static void initialize_path_description(struct kernel_open_file_description *fil
     file->references = 1U;
     file->observed_mount_error = kernel_vfs_mount_error_sequence(file->file.mount);
     kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
-    if (file->kind!=KERNEL_OPEN_FILE_KIND_PATH && kernel_vfs_file_generated(&file->file))
-        file->kind = KERNEL_OPEN_FILE_KIND_GENERATED;
     if (file->kind==KERNEL_OPEN_FILE_KIND_GENERATED && kernel_procfs_ipc_file(&file->file)) {
         file->ipc_proc_namespace=kernel_namespace_get(kernel_task_ipc_namespace());
         file->ipc_proc_pid_view=kernel_proc_view_acquire();
     }
     file->observed_writeback_error = kernel_vfs_error_sequence(&file->file);
     file->credentials = kernel_credentials_get(kernel_credentials_current());
+}
+
+static int finish_path_open(struct kernel_open_file_description *file, struct kernel_heap *heap)
+{
+    if (file->kind != KERNEL_OPEN_FILE_KIND_PATH && kernel_vfs_file_generated(&file->file)) {
+        file->kind = KERNEL_OPEN_FILE_KIND_GENERATED;
+        struct kernel_mm_pagemap *view = NULL;
+        int error = kernel_procfs_pagemap_open(&file->file, heap, &view);
+        if (error) {
+            if (kernel_vfs_close(&file->file)) __builtin_trap();
+            return error;
+        }
+        if (view) {
+            file->proc_pagemap = view;
+            file->pagemap = 1;
+        }
+    }
+    initialize_path_description(file, heap);
+    return 0;
 }
 
 static enum kernel_open_file_status create_open_file(
@@ -325,6 +342,7 @@ static enum kernel_open_file_status create_open_file(
     result = follow_final
                  ? kernel_vfs_open(mount, path, &file->file)
                  : kernel_vfs_open_nofollow(mount, path, &file->file);
+    if (!result) result = finish_path_open(file, heap);
     if (result != 0) {
         file->heap = heap;
         file->vfs_closed = 1U;
@@ -332,7 +350,6 @@ static enum kernel_open_file_status create_open_file(
         *linux_result = result;
         return KERNEL_OPEN_FILE_STATUS_OK;
     }
-    initialize_path_description(file, heap);
     *owner = file;
     *linux_result = 0;
     return KERNEL_OPEN_FILE_STATUS_OK;
@@ -395,10 +412,10 @@ enum kernel_open_file_status kernel_open_file_create_at(
         kernel_vfs_open_resolved(start, &file->file, request);
     if (!result && (request->flags & KERNEL_VFS_OPEN_PATH_ONLY))
         file->kind=KERNEL_OPEN_FILE_KIND_PATH;
+    if (!result) result = finish_path_open(file, heap);
     if (result) {
         kernel_heap_release(heap, file);
     } else {
-        initialize_path_description(file, heap);
         *owner = file;
     }
     *linux_result = result;
@@ -420,11 +437,9 @@ enum kernel_open_file_status kernel_open_file_create_executable_path(
         return KERNEL_OPEN_FILE_STATUS_OK;
     }
     int result = kernel_vfs_path_open_executable(path, &file->file);
+    if (!result) result = finish_path_open(file, heap);
     if (result) kernel_heap_release(heap, file);
-    else {
-        initialize_path_description(file, heap);
-        *owner = file;
-    }
+    else *owner = file;
     *linux_result = result;
     return KERNEL_OPEN_FILE_STATUS_OK;
 }
@@ -1033,6 +1048,10 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
     }
     if(file->ipc_proc_namespace)kernel_proc_view_release(file->ipc_proc_pid_view);
     kernel_namespace_put(file->ipc_proc_namespace);
+    if (file->pagemap) {
+        kernel_mm_pagemap_put(file->proc_pagemap);
+        kernel_heap_release(file->heap, file->proc_pagemap);
+    }
     kernel_credentials_put(file->credentials);
     kernel_heap_release(file->heap, file);
     *owner = 0;
@@ -1120,7 +1139,7 @@ uint64_t kernel_open_file_size(
 
 int kernel_open_file_generate(struct kernel_open_file_description *file)
 {
-    if (!open_file_live(file) || file->kind != KERNEL_OPEN_FILE_KIND_GENERATED)
+    if (!open_file_live(file) || file->kind != KERNEL_OPEN_FILE_KIND_GENERATED || file->pagemap)
         return -KERNEL_EINVAL;
     if (file->generated_ready) return 0;
     int result = kernel_vfs_file_snapshot(&file->file,file->heap,file->ipc_proc_namespace,
@@ -1138,6 +1157,7 @@ int kernel_open_file_generate(struct kernel_open_file_description *file)
 void kernel_open_file_reset_generated(struct kernel_open_file_description *file)
 {
     if (!file || file->kind != KERNEL_OPEN_FILE_KIND_GENERATED) __builtin_trap();
+    if (file->pagemap) return;
     if (file->generated_data) kernel_heap_release(file->heap, file->generated_data);
     file->generated_data = 0;
     file->generated_length = 0U;

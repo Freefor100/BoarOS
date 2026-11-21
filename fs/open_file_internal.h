@@ -13,6 +13,7 @@ struct kernel_char_device;
 struct kernel_block_device;
 struct kernel_async_io;
 struct kernel_namespace;
+struct kernel_mm_pagemap;
 
 int kernel_open_file_pread_mode(struct kernel_open_file_description *file,
     uint64_t offset, void *buffer, size_t size, uint32_t status_flags, size_t *bytes_read);
@@ -49,10 +50,14 @@ struct kernel_open_file_description {
     const struct kernel_char_device *device;
     void *device_instance;
     uint8_t device_opened;
-    char *generated_data;
+    union {
+        char *generated_data;
+        struct kernel_mm_pagemap *proc_pagemap;
+    };
     size_t generated_length;
     uint64_t generated_read_offset;
     uint8_t generated_ready;
+    uint8_t pagemap;
     const struct kernel_credentials *credentials;
     struct kernel_namespace *ipc_proc_namespace; /* /proc/sysvipc discovery owner from open. */
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
