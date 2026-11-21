@@ -312,6 +312,17 @@ static void setup(unsigned version)
     dma_base = version == 1 ? UINT64_C(0x81000000) : UINT64_C(0x181000000);
     now = 100;
 }
+unsigned kernel_cpu_get_boot_count(void)
+{
+    return 2;
+}
+#if BOAROS_COST_DIAGNOSTICS
+void kernel_cost_add(enum kernel_cost_metric metric, uint64_t value)
+{
+    (void)metric;
+    (void)value;
+}
+#endif
 static void start(unsigned version, struct riscv_virtio_mmio_net *d)
 {
     setup(version); memset(d, 0, sizeof(*d));
@@ -388,19 +399,28 @@ static void test_loan_budget(unsigned version)
 static void test_tx_copy_budget(unsigned version)
 {
     struct riscv_virtio_mmio_net d; start(version, &d); char input[64]; memset(input, 'x', sizeof(input));
-    for (unsigned i = 0; i < 64; i++) assert(riscv_virtio_mmio_net_send(&d, input, sizeof(input)) == 64);
+    unsigned h = version == 1 ? 10 : 12;
+    unsigned rx = prepare_rx("x", 1, 0, 0);
+    complete(0, rx, h + 1, 0);
+    assert(riscv_virtio_mmio_net_send(&d, input, sizeof(input)) == 64);
+    assert(d.split[0].last_used == 0);
+    assert(!riscv_virtio_mmio_net_service(&d));
+    struct riscv_net_frame frame;
+    assert(riscv_virtio_mmio_net_receive(&d, &frame) == 1 && frame.size == 1);
+    riscv_virtio_mmio_net_release(&d, frame.buffer);
+    for (unsigned i = 1; i < 64; i++) assert(riscv_virtio_mmio_net_send(&d, input, sizeof(input)) == 64);
     assert(riscv_virtio_mmio_net_send(&d, input, sizeof(input)) == -KERNEL_EAGAIN);
     memset(input, 'z', sizeof(input)); unsigned id = next_head(1);
-    struct wire_descriptor desc = descriptor(1, id); unsigned h = version == 1 ? 10 : 12;
+    struct wire_descriptor desc = descriptor(1, id);
     assert(desc.length == h + sizeof(input));
     assert(((char *)resolve(desc.address))[h] == 'x');
-    complete(1, id, 0, 1); assert(!riscv_virtio_mmio_net_service(&d));
+    complete(1, id, 0, 0);
+    assert(riscv_virtio_mmio_net_send(&d, input, sizeof(input)) == 64);
     assert(d.tx_capacity_generation == 1);
 #if BOAROS_COST_DIAGNOSTICS
     assert(d.statistics.tx_done_free_count == 1 && d.statistics.tx_done_free_ticks == 0 &&
            d.statistics.tx_done_free_max == 0 && !d.statistics.tx_latency_overflow);
 #endif
-    assert(riscv_virtio_mmio_net_send(&d, input, sizeof(input)) == 64);
     complete(1, 99, 0, 1); failed_owner(&d); stop(&d);
     printf("PASS: VirtIO-net v%u TX copies, 64-buffer budget and out-of-range used ID\n", version);
 }

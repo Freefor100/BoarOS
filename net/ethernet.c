@@ -53,9 +53,7 @@ static int copy_pbuf(const void *context, void *destination, uint32_t length)
 { return pbuf_copy_partial(context, destination, (u16_t)length, 0) == length; }
 static void release_owner(void *owner)
 {
-    struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
-    pbuf_free((struct pbuf *)owner);
-    kernel_socket_protocol_leave(&irq);
+    kernel_socket_pbuf_free(owner);
 }
 static err_t link_output(struct netif *interface, struct pbuf *p)
 {
