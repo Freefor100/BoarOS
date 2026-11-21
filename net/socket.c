@@ -790,7 +790,7 @@ void kernel_socket_protocol_leave(struct kernel_socket_protocol_scope *scope)
 #endif
     arch_interrupt_restore(scope->interrupts);
 }
-static void socket_pbuf_free(struct pbuf *payload)
+void kernel_socket_pbuf_free(struct pbuf *payload)
 {
 #if BOAROS_USER_SMP
     if (boaros_lwip_parallel_enabled()) {
@@ -817,7 +817,7 @@ static struct pbuf *udp_pending_take(struct kernel_socket *socket)
 static void udp_pending_discard(struct kernel_socket *socket)
 {
     struct pbuf *payload=udp_pending_take(socket);
-    if (payload) socket_pbuf_free(payload);
+    if (payload) kernel_socket_pbuf_free(payload);
 }
 static void socket_protocol_enter(struct kernel_socket_protocol_scope *scope,
                                   const struct kernel_socket *socket)
@@ -2425,11 +2425,11 @@ static void udp_received(void *context, struct udp_pcb *pcb,
     if ((network_udp_capacity && !network_udp_capacity(network_context)) ||
         STATS_GET(mem.used) > MEM_SIZE - (65536U + 4096U)) {
         UDP_STATS_INC(udp.memerr);
-        socket_pbuf_free(payload); return;
+        kernel_socket_pbuf_free(payload); return;
     }
     struct socket_packet *packet = udp_packet_allocate(socket);
     if (!packet) {
-        socket_pbuf_free(payload);
+        kernel_socket_pbuf_free(payload);
         return;
     }
     packet->payload = payload;
@@ -2442,7 +2442,7 @@ static void udp_received(void *context, struct udp_pcb *pcb,
         }
     }
     UDP_STATS_INC(udp.memerr);
-    socket_pbuf_free(payload);
+    kernel_socket_pbuf_free(payload);
     kernel_heap_release(socket->heap,packet);
 }
 
@@ -2484,7 +2484,7 @@ static int socket_udp_multicast_receive(struct udp_pcb *pcb,struct pbuf *p,struc
       if(charge<=socket->rx_limit && socket->rx_bytes<=socket->rx_limit-charge) {
         packet_publish_locked(socket,packet,charge);return 1;
       }}
-    socket_pbuf_free(p);
+    kernel_socket_pbuf_free(p);
     kernel_heap_release(socket->heap,packet);
     return 1;
 }
@@ -2532,7 +2532,7 @@ static u8_t raw_received(void *context,struct raw_pcb *pcb,struct pbuf *input,
          socket->rx_bytes<=socket->rx_limit-charge) {
           packet_publish_locked(socket,packet,charge);return 0;
       } }
-    socket_pbuf_free(copy);kernel_heap_release(socket->heap,packet);
+    kernel_socket_pbuf_free(copy);kernel_heap_release(socket->heap,packet);
     return 0;
 }
 
@@ -3262,7 +3262,7 @@ void kernel_socket_destroy(struct kernel_socket *socket)
         struct socket_packet *packet = socket->packets_head;
         socket->packets_head = packet->next;
         if (packet->payload != 0) {
-            socket_pbuf_free(packet->payload);
+            kernel_socket_pbuf_free(packet->payload);
         }
         unix_uncharge(packet);
         kernel_heap_release(socket->heap, packet);
@@ -5232,7 +5232,7 @@ static int udp_pending_append(struct kernel_socket_write_request *request,
         pending->head=part;
         __atomic_store_n(&socket->udp_pending,pending,__ATOMIC_RELAXED);
     } else if (!part->len) {
-        socket_pbuf_free(part);
+        kernel_socket_pbuf_free(part);
         request->protocol_payload=NULL;
         return 0;
     } else pending->tail->next=part;
@@ -5308,7 +5308,7 @@ static int datagram_send_owned(struct kernel_socket_write_request *request)
         failure=lwip_error(socket->raw?raw_sendto_if_src(socket->raw,payload,&remote,route,source):
             udp_sendto_if_src(socket->udp,payload,&remote,port,route,source));
     }
-    socket_pbuf_free(payload);
+    kernel_socket_pbuf_free(payload);
     request->protocol_payload=NULL;
     return failure?failure:(int)request->payload_size;
 }
@@ -5327,7 +5327,7 @@ static int execute_protocol_request(struct kernel_socket_write_request *request)
     case SOCKET_PROTOCOL_DATAGRAM_CANCEL: udp_pending_discard(socket);return 0;
     case SOCKET_PROTOCOL_DISPOSE:
         if(!request->protocol_payload)__builtin_trap();
-        socket_pbuf_free(request->protocol_payload);request->protocol_payload=0;return 0;
+        kernel_socket_pbuf_free(request->protocol_payload);request->protocol_payload=0;return 0;
     case SOCKET_PROTOCOL_FLUSH:
         tcp_flush_output(socket);request->progressed &= (uint8_t)~SOCKET_WRITE_DEFERRED;return 0;
     }

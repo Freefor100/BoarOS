@@ -43,7 +43,7 @@ struct virtio_net_device {
     uint64_t tx_done_time[VIRTIO_NET_BUFFERS], tx_free_time[VIRTIO_NET_BUFFERS];
     uint64_t tx_done_valid, tx_free_valid;
 #endif
-    uint64_t tx_capacity_generation;
+    uint64_t tx_capacity_generation, tx_available;
     uint32_t version, queue_order, buffer_order, irq_source, feature_low;
     uint32_t rx_posted, tx_posted;
     uint16_t rx_free[VIRTIO_NET_BUFFERS], rx_ready[VIRTIO_NET_BUFFERS];

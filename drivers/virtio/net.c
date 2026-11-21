@@ -37,6 +37,21 @@ static void wake(struct virtio_net_device *d)
 }
 static unsigned free_head(uint32_t mask)
 { for (unsigned i = 0; i < 32; i++) if (!(mask & (UINT32_C(1) << i))) return i; return 32; }
+static unsigned first_tx_slot(uint64_t available)
+{
+#if defined(__riscv) && !defined(__riscv_zbb)
+    /* Base RV64 lowers ctz to a runtime call in a freestanding build. */
+    unsigned bit = 0;
+    if (!(available & UINT32_MAX)) { available >>= 32; bit += 32; }
+    if (!(available & UINT16_MAX)) { available >>= 16; bit += 16; }
+    if (!(available & UINT8_MAX)) { available >>= 8; bit += 8; }
+    if (!(available & 0xfU)) { available >>= 4; bit += 4; }
+    if (!(available & 0x3U)) { available >>= 2; bit += 2; }
+    return bit + !(available & 1U);
+#else
+    return (unsigned)__builtin_ctzll(available);
+#endif
+}
 static void enqueue(struct virtio_net_device *d, unsigned q, unsigned id, unsigned b)
 {
     void *token = q ? (void *)&d->tx_state[b] : (void *)&d->rx_state[b];
@@ -218,6 +233,12 @@ static void check_status(struct virtio_net_device *d)
         if (status & 64U) fail(d, "needs-reset", 0, status, 0);
     }
 }
+static void tx_slot_return(struct virtio_net_device *d, unsigned b)
+{
+    d->tx_state[b] = TX_FREE;
+    d->tx_available |= UINT64_C(1) << b;
+    d->tx_capacity_generation++;
+}
 static int harvest(struct virtio_net_device *d)
 {
     if (!d->configured || d->failed) return 0;
@@ -261,7 +282,7 @@ static int harvest(struct virtio_net_device *d)
                     d->tx_done[(d->tx_done_head + d->tx_done_count++) %
                                VIRTIO_NET_BUFFERS] = (uint16_t)b;
                 } else {
-                    d->tx_state[b] = TX_FREE; d->tx_capacity_generation++;
+                    tx_slot_return(d, b);
 #if BOAROS_COST_DIAGNOSTICS
                     note_tx_free(d, b, d->tx_done_time[b]);
 #endif
@@ -361,6 +382,7 @@ int virtio_net_init(struct virtio_net_device *d, const struct virtio_transport *
     }
     for (unsigned i = 0; i < 64; i++) d->rx_free[i] = (uint16_t)i;
     d->rx_count = 64;
+    d->tx_available = UINT64_MAX >> (64 - VIRTIO_NET_BUFFERS);
     if (!d->transport.ops.register_irq(d->transport.context, source, interrupt, d)) { error = -KERNEL_EIO; goto failed; }
     d->irq_registered = 1;
     {
@@ -453,12 +475,19 @@ static int tx_slot(struct virtio_net_device *d, int *notify)
     *notify = !failed && d->failed;
     int status = tx_status(d);
     if (status) return status;
-    *notify = harvest(d);
-    if (d->failed) return -KERNEL_EIO;
-    for (unsigned b = 0; b < VIRTIO_NET_BUFFERS; b++)
-        if (d->tx_state[b] == TX_FREE) return (int)b;
-    COST_ADD(NET_TX_NOSLOT, 1);
-    return -KERNEL_EAGAIN;
+    if (!d->tx_available) {
+        /* IRQ and service normally harvest completions. At capacity, check
+         * once before returning EAGAIN in case the device just made progress. */
+        *notify = harvest(d);
+        if (d->failed) return -KERNEL_EIO;
+        if (!d->tx_available) {
+            COST_ADD(NET_TX_NOSLOT, 1);
+            return -KERNEL_EAGAIN;
+        }
+    }
+    unsigned slot = first_tx_slot(d->tx_available);
+    d->tx_available &= ~(UINT64_C(1) << slot);
+    return (int)slot;
 }
 static void tx_publish(struct virtio_net_device *d, unsigned b, uint32_t size)
 {
@@ -506,8 +535,7 @@ int virtio_net_send_copy(struct virtio_net_device *d, uint32_t size,
         result = copied ? tx_status(d) : -KERNEL_EIO;
         wake_after_submit = result || tx_submit_needs_wake(d);
         if (result) {
-            d->tx_state[slot] = TX_FREE;
-            d->tx_capacity_generation++;
+            tx_slot_return(d, (unsigned)slot);
         } else {
             uint16_t length = (uint16_t)(size + h);
             memcpy((char *)d->tx_memory + slot * VIRTIO_NET_BUFFER_SIZE, &length, 2);
@@ -583,8 +611,8 @@ unsigned virtio_net_tx_release(struct virtio_net_device *d,
             }
             /* 先归还槽位与capacity，再在IRQ外释放已摘下的独立owner。 */
             owners[released++] = d->tx_owner[b];
-            d->tx_owner[b] = 0; d->tx_state[b] = TX_FREE;
-            d->tx_capacity_generation++;
+            d->tx_owner[b] = 0;
+            tx_slot_return(d, b);
 #if BOAROS_COST_DIAGNOSTICS
             note_tx_free(d, b, arch_time_read());
 #endif

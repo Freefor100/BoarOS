@@ -157,14 +157,20 @@ tcp_route(const struct tcp_pcb *pcb, const ip_addr_t *src, const ip_addr_t *dst)
 /* Both data and control segments are checksummed before reaching this point. */
 static err_t
 tcp_ip_output(const struct tcp_pcb *pcb, struct pbuf *p, struct netif *netif,
-              const ip_addr_t *src, const ip_addr_t *dst)
+              const ip_addr_t *src, const ip_addr_t *dst, u16_t *path_mtu)
 {
 #ifdef BOAROS_LWIP_TCP_CONTEXT
   int local_result;
   if (boaros_lwip_parallel_enabled() && pcb && pcb->boaros_owner &&
       boaros_lwip_tcp_local_output(pcb, p, netif, src, dst, &local_result)) {
 #ifdef BOAROS_LWIP_TCP_INFO
-    if (local_result == ERR_OK && pcb->state != LISTEN) LWIP_CONST_CAST(struct tcp_pcb *, pcb)->boaros_segs_out++;
+    if (local_result == ERR_OK && pcb->state != LISTEN) {
+      LWIP_CONST_CAST(struct tcp_pcb *, pcb)->boaros_segs_out++;
+      if (path_mtu) {
+        BOAROS_LWIP_IP_SCOPE(ip);
+        *path_mtu = IP_IS_V6(dst) ? nd6_get_destination_mtu(ip_2_ip6(dst), netif) : netif->mtu;
+      }
+    }
 #endif
     return (err_t)local_result;
   }
@@ -182,7 +188,15 @@ tcp_ip_output(const struct tcp_pcb *pcb, struct pbuf *p, struct netif *netif,
                               pcb ? pcb->tos : 0, IP_PROTO_TCP, netif);
   NETIF_RESET_HINTS(netif);
 #ifdef BOAROS_LWIP_TCP_INFO
-  if (pcb && pcb->state != LISTEN && result == ERR_OK) LWIP_CONST_CAST(struct tcp_pcb *, pcb)->boaros_segs_out++;
+  if (pcb && pcb->state != LISTEN && result == ERR_OK) {
+    LWIP_CONST_CAST(struct tcp_pcb *, pcb)->boaros_segs_out++;
+    /* Route and neighbor state are already protected during IP output. */
+    if (path_mtu) {
+      *path_mtu = IP_IS_V6(dst) ? nd6_get_destination_mtu(ip_2_ip6(dst), netif) : netif->mtu;
+    }
+  }
+#else
+  LWIP_UNUSED_ARG(path_mtu);
 #endif
   return result;
 }
@@ -1706,11 +1720,6 @@ tcp_output(struct tcp_pcb *pcb)
       return err;
     }
 #ifdef BOAROS_LWIP_TCP_INFO
-    {
-      BOAROS_LWIP_IP_SCOPE(ip);
-      pcb->boaros_pmtu = IP_IS_V6(&pcb->remote_ip) ?
-        nd6_get_destination_mtu(ip_2_ip6(&pcb->remote_ip),netif) : netif->mtu;
-    }
     if (seg->len) {
       pcb->boaros_last_sent = tcp_ticks;
       pcb->boaros_data_out++;
@@ -1981,7 +1990,11 @@ tcp_output_segment(struct tcp_seg *seg, struct tcp_pcb *pcb, struct netif *netif
 #endif /* CHECKSUM_GEN_TCP */
   TCP_STATS_INC(tcp.xmit);
 
-  err = tcp_ip_output(pcb, seg->p, netif, &pcb->local_ip, &pcb->remote_ip);
+  u16_t *path_mtu = NULL;
+#ifdef BOAROS_LWIP_TCP_INFO
+  path_mtu = &pcb->boaros_pmtu;
+#endif
+  err = tcp_ip_output(pcb, seg->p, netif, &pcb->local_ip, &pcb->remote_ip, path_mtu);
 
 #if TCP_CHECKSUM_ON_COPY
   if (seg_chksum_was_swapped) {
@@ -2340,7 +2353,7 @@ tcp_output_control_segment_netif(const struct tcp_pcb *pcb, struct pbuf *p,
   }
 #endif
   TCP_STATS_INC(tcp.xmit);
-  err = tcp_ip_output(pcb, p, netif, src, dst);
+  err = tcp_ip_output(pcb, p, netif, src, dst, NULL);
 
   pbuf_free(p);
   return err;
