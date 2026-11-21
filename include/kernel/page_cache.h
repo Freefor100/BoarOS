@@ -231,6 +231,15 @@ enum kernel_page_cache_status kernel_page_cache_alias_attach(
     struct kernel_page_cache_alias *alias, void *owner,
     uint64_t virtual_address,
     int (*rearm)(void *owner, uint64_t virtual_address));
+struct kernel_page_cache_alias_binding {
+    struct kernel_page_cache_alias *alias;
+    uint64_t physical_address;
+};
+/* One binding per selected bit, in page order. The caller holds the file
+ * mapping qualification and owns each mapped physical page. */
+void kernel_page_cache_alias_attach_window(struct kernel_page_cache *,
+    const struct kernel_vfs_file *, uint64_t first, unsigned selected,
+    const struct kernel_page_cache_alias_binding *);
 /* 已有alias owner/借用下使用；额外借用覆盖锁外通知，不能从裸指针复活。 */
 void kernel_page_cache_alias_hold(struct kernel_page_cache_alias *);
 void kernel_page_cache_alias_put(struct kernel_page_cache_alias *);
@@ -247,7 +256,8 @@ void kernel_page_cache_resize_finish(struct kernel_page_cache_resize *,uint64_t 
 void kernel_page_cache_alias_clone(struct kernel_page_cache_alias *target,
     const struct kernel_page_cache_alias *source, void *owner);
 void kernel_page_cache_alias_detach(struct kernel_page_cache_alias *alias);
-/* detach只停止发布，alias保持entry直到锁外drain；MM存储同样须存活。
+void kernel_page_cache_alias_detach_batch(struct kernel_page_cache_alias **, unsigned count);
+/* 有借用时 detach 保留 entry 直到锁外 drain，MM 存储也须保持存活。
  * drain不持MM gate、inode I/O或raw，不能由当前在途回调等待自己。 */
 void kernel_page_cache_alias_drain(struct kernel_page_cache_alias *alias);
 void kernel_page_cache_alias_mark_dirty(struct kernel_page_cache_alias *alias);

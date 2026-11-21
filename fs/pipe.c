@@ -85,11 +85,16 @@ int kernel_pipe_set_owner(struct kernel_pipe *pipe, uint32_t uid, uint32_t gid)
     return 0;
 }
 
-static void pipe_release_page(struct kernel_pipe *pipe,void *page,unsigned order)
+static uint64_t pipe_page_head(struct kernel_pipe *pipe,void *page,unsigned order)
 {
     uint64_t physical;
     if (!page || !pipe->heap->physical_address(page,&physical) || order>PHYSICAL_PAGE_MAX_ORDER) __builtin_trap();
-    physical &= ~(((uint64_t)BOAROS_PAGE_SIZE<<order)-1);
+    return physical & ~(((uint64_t)BOAROS_PAGE_SIZE<<order)-1);
+}
+
+static void pipe_release_page(struct kernel_pipe *pipe,void *page,unsigned order)
+{
+    uint64_t physical=pipe_page_head(pipe,page,order);
     if (order ? physical_page_release_order(pipe->allocator,physical,order) :
         physical_page_release(pipe->allocator,physical)) __builtin_trap();
 }
@@ -113,6 +118,7 @@ static enum kernel_pipe_status pipe_destroy(struct kernel_pipe *pipe)
     }
     for (uint32_t i=0;i<pipe->ring_size;i++)
         if (pipe->buffers[i].page) pipe_release_page(pipe,pipe->buffers[i].page,pipe->buffers[i].order);
+    physical_page_pipe_drain(pipe->allocator);
     if (pipe->buffers!=pipe->inline_buffers) kernel_heap_release(pipe->heap,pipe->buffers);
     (void)kernel_uid_account_pipe_pages(pipe->account,pipe->ring_size,0);
     kernel_uid_account_put(pipe->account);
@@ -437,7 +443,7 @@ int kernel_pipe_fifo_open(struct kernel_heap *heap,struct kernel_vfs_node *node,
 static uint32_t next_slot(const struct kernel_pipe *pipe,uint32_t slot)
 { return (slot+1U)&(pipe->ring_size-1U); }
 
-static void *pipe_consume(struct kernel_pipe *pipe, uint64_t count,unsigned *order)
+static void *pipe_consume(struct kernel_pipe *pipe,uint64_t count,unsigned *order,int *reusable)
 {
     uint32_t slot = pipe->head;
     void *page=0;
@@ -448,6 +454,8 @@ static void *pipe_consume(struct kernel_pipe *pipe, uint64_t count,unsigned *ord
     if (pipe->buffers[slot].length == 0U) {
         page=pipe->buffers[slot].page;pipe->buffers[slot].page=0;
         *order=pipe->buffers[slot].order;pipe->buffers[slot].order=0;
+        if (reusable) *reusable=pipe->buffers[slot].reusable;
+        pipe->buffers[slot].reusable=0;
         pipe->buffers[slot].offset = 0U;
         pipe->buffers[slot].can_merge=0;
         pipe->head = next_slot(pipe,slot);
@@ -532,7 +540,7 @@ void kernel_pipe_read_finish(struct kernel_pipe_read_borrow *borrow,size_t consu
         pipe->read_slot=KERNEL_PIPE_NO_SLOT;
     }
     while (left) {
-        void *page=NULL;unsigned order=0;
+        void *page=NULL;unsigned order=0;int reusable=0;
         {
             PIPE_META(guard,pipe);
             if (pipe->read_slot!=pipe->head || !pipe->slots) __builtin_trap();
@@ -546,11 +554,12 @@ void kernel_pipe_read_finish(struct kernel_pipe_read_borrow *borrow,size_t consu
             }
             size_t n=left<pipe->buffers[pipe->head].length?left:pipe->buffers[pipe->head].length;
             if (n==pipe->buffers[pipe->head].length && pipe->slots==pipe->ring_size) wake_writers=1;
-            page=pipe_consume(pipe,n,&order);
+            page=pipe_consume(pipe,n,&order,&reusable);
             left-=n;
             pipe->read_slot=left?pipe->head:KERNEL_PIPE_NO_SLOT;
         }
-        if (page) pipe_release_page(pipe,page,order);
+        if (reusable) physical_page_pipe_release(pipe->allocator,pipe_page_head(pipe,page,0));
+        else if (page) pipe_release_page(pipe,page,order);
     }
     kernel_lock_release(&borrow->guard);*borrow=(struct kernel_pipe_read_borrow){0};
     if (wake_writers) pipe_notify(pipe,0,1);
@@ -618,7 +627,8 @@ static int pipe_push_order(struct kernel_pipe_write_borrow *borrow,void *page,si
         PIPE_META(guard,pipe);
         if (!pipe->readers) return -KERNEL_EPIPE;
         if (pipe->slots==pipe->ring_size || pipe->buffers[pipe->tail].page) __builtin_trap();
-        pipe->buffers[pipe->tail]=(struct kernel_pipe_buffer){page,(uint16_t)offset,(uint16_t)length,0,(uint8_t)order};
+        pipe->buffers[pipe->tail]=(struct kernel_pipe_buffer){.page=page,
+            .offset=(uint16_t)offset,.length=(uint16_t)length,.order=(uint8_t)order};
         pipe->tail=next_slot(pipe,pipe->tail);pipe->slots++;pipe->bytes+=length;borrow->slots--;borrow->changed=1;
     }
     pipe_notify(pipe,1,0);
@@ -686,12 +696,15 @@ int64_t kernel_pipe_link(struct kernel_pipe *in,struct kernel_pipe *out,size_t c
                     if (in->read_slot!=KERNEL_PIPE_NO_SLOT || in->merge_slot!=KERNEL_PIPE_NO_SLOT ||
                         out->read_slot!=KERNEL_PIPE_NO_SLOT || out->merge_slot!=KERNEL_PIPE_NO_SLOT ||
                         out->buffers[out->tail].page) __builtin_trap();
+                    /* A clone can outlive either donor slot. Neither owner
+                     * may publish the backing for overwrite while it is shared. */
+                    if (!move) in->buffers[index].reusable=part.reusable=0;
                     part.length=(uint16_t)n;out->buffers[out->tail]=part;
                     out->tail=next_slot(out,out->tail);out->slots++;out->bytes+=n;
                     if (consume) {
                         if (move && in->slots==in->ring_size) wake_writers=1;
                         unsigned released_order=0;
-                        void *released=pipe_consume(in,n,&released_order);
+                        void *released=pipe_consume(in,n,&released_order,NULL);
                         if (move && (released!=part.page || released_order!=part.order)) __builtin_trap();
                     }
                     publish=1;
@@ -828,7 +841,7 @@ static enum kernel_pipe_status pipe_write_source_locked(struct kernel_pipe *pipe
         }
         if (!pipe->buffers[slot].page) {
             uint64_t physical;void *page;
-            enum physical_page_status allocated=physical_page_allocate(pipe->allocator,&physical);
+            enum physical_page_status allocated=physical_page_pipe_allocate(pipe->allocator,&physical);
             if (allocated==PHYSICAL_PAGE_STATUS_EMPTY) {
                 result->bytes=total?(int64_t)total:-KERNEL_ENOMEM;
                 kernel_lock_scope_release(&copy);arch_interrupt_restore(irq);
@@ -863,6 +876,7 @@ static enum kernel_pipe_status pipe_write_source_locked(struct kernel_pipe *pipe
                 pipe->buffers[slot].offset=pipe->buffers[slot].length=0;
                 if (!buffer) pipe->buffers[slot].can_merge=1;
                 else pipe->buffers[slot].can_merge=0;
+                pipe->buffers[slot].reusable=1;
                 pipe->tail=next_slot(pipe,slot); pipe->slots++;
             }
             pipe->buffers[slot].length+=(uint16_t)chunk; pipe->bytes+=chunk;

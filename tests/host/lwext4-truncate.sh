@@ -7,13 +7,24 @@ trap 'exit 1' HUP INT TERM
 ${HOST_CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror \
     -Wno-unused-but-set-variable -Wno-stringop-truncation \
     -DBOAROS_MAX_CPUS=2 -DCONFIG_USE_DEFAULT_CFG=1 -DTEST_TRUNCATE_FALLBACK=1 \
-    -Wl,--wrap=ext4_balloc_free_blocks ${TRUNCATE_TEST_CFLAGS:-} \
+    -Wl,--wrap=ext4_balloc_free_blocks,--wrap=ext4_fs_inode_ref_write,--wrap=ext4_fs_free_inode ${TRUNCATE_TEST_CFLAGS:-} \
     -I"$root/third_party/lwext4/include" -idirafter "$root/include" \
     "$root"/third_party/lwext4/src/*.c "$root/tests/host/lwext4_truncate.c" \
     "$root/tests/host/block_fault.c" "$root/kernel/block.c" "$root/tests/host/block_runtime.c" "$root/kernel/raw_lock.c" "$root/tests/host/sync/notifications.c" -I"$root/tests/host/block_model" -pthread -o "$work/probe"
 check_fs() {
     e2fsck -fn "$1" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log"; exit 1; }
 }
+if [ "${1:-all}" = single-reap ]; then
+    for features in orphan_file '^orphan_file'; do
+        for kind in empty mapped; do
+            truncate -s 32M "$work/reap.img"
+            mkfs.ext4 -q -F -b 4096 -O "$features" "$work/reap.img"
+            timeout 30 "$work/probe" "$work/reap.img" single-reap 0 "$kind"
+            check_fs "$work/reap.img"
+        done
+    done
+    exit 0
+fi
 for blocksize in 1024 4096; do
     for mapping in extent indirect; do
         features=orphan_file

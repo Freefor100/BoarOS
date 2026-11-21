@@ -366,6 +366,7 @@ enum physical_page_status physical_page_allocator_init(
     result.allocated_peak_pages = 0;
 #endif
     result.recycled_head = PHYSICAL_PAGE_NONE;
+    result.pipe_spares[0] = result.pipe_spares[1] = 0;
     result.metadata_address = PHYSICAL_PAGE_NONE;
     result.metadata_pages = 0U;
     result.range_count = 0U;
@@ -1266,19 +1267,26 @@ physical_page_allocator_finalize(struct physical_page_allocator *allocator)
     return PHYSICAL_PAGE_STATUS_OK;
 }
 
+static unsigned reclaim_pipe_spares_locked(struct physical_page_allocator *,struct page_work *);
+
+static uint32_t find_free_order(struct physical_page_allocator *a,uint32_t order,struct page_work *work)
+{
+    for (;order<=PHYSICAL_PAGE_MAX_ORDER;order++) {
+        page_checked(work);
+        if (a->free_heads[order]!=PHYSICAL_PAGE_INDEX_NONE) break;
+    }
+    return order;
+}
+
 static enum physical_page_status allocate_order_locked(struct physical_page_allocator *a,
     uint32_t order,uint64_t *address,struct buddy_owner *allocated,struct page_work *work)
 {
-    uint32_t found = order;
-    while (found <= PHYSICAL_PAGE_MAX_ORDER)
-    {
-        page_checked(work);
-        if (a->free_heads[found] != PHYSICAL_PAGE_INDEX_NONE)
-            break;
-        found++;
+    uint32_t found=find_free_order(a,order,work);
+    if (found>PHYSICAL_PAGE_MAX_ORDER) {
+        if (!reclaim_pipe_spares_locked(a,work)) return PHYSICAL_PAGE_STATUS_EMPTY;
+        found=find_free_order(a,order,work);
+        if (found>PHYSICAL_PAGE_MAX_ORDER) return PHYSICAL_PAGE_STATUS_EMPTY;
     }
-    if (found > PHYSICAL_PAGE_MAX_ORDER)
-        return PHYSICAL_PAGE_STATUS_EMPTY;
     uint32_t page = a->free_heads[found];
     struct buddy_owner owner;
     if (!free_owner_at_order(a, page, found, &owner, work) ||
@@ -1642,6 +1650,58 @@ static inline __attribute__((always_inline)) void physical_page_release_buddy(
         }
     }
     (void)physical_page_release_owner(a,address,order,root,page,work,0);
+}
+
+/* Bit zero distinguishes an owned physical page at address zero from empty. */
+static uint64_t take_pipe_spare(uint64_t *slot)
+{
+    if (!__atomic_load_n(slot,__ATOMIC_RELAXED)) return 0;
+    return __atomic_exchange_n(slot,0,__ATOMIC_ACQUIRE);
+}
+
+static __attribute__((noinline)) unsigned reclaim_pipe_spares_locked(
+    struct physical_page_allocator *a,struct page_work *work)
+{
+    unsigned released=0;
+    for (unsigned i=0;i<2;i++) {
+        uint64_t entry=take_pipe_spare(&a->pipe_spares[i]);
+        if (!entry) continue;
+        physical_page_release_buddy(a,entry&~UINT64_C(1),0,work);
+        released++;
+    }
+    return released;
+}
+
+enum physical_page_status physical_page_pipe_allocate(struct physical_page_allocator *a,uint64_t *address)
+{
+    for (unsigned i=0;i<2;i++) {
+        uint64_t entry=take_pipe_spare(&a->pipe_spares[i]);
+        if (entry) {
+            *address=entry&~UINT64_C(1);
+            return PHYSICAL_PAGE_STATUS_OK;
+        }
+    }
+    return physical_page_allocate(a,address);
+}
+
+void physical_page_pipe_release(struct physical_page_allocator *a,uint64_t address)
+{
+    if (address&BOAROS_PAGE_MASK) __builtin_trap();
+    uint64_t entry=address|1;
+    for (unsigned i=0;i<2;i++) {
+        uint64_t empty=0;
+        if (__atomic_compare_exchange_n(&a->pipe_spares[i],&empty,entry,0,
+            __ATOMIC_RELEASE,__ATOMIC_RELAXED)) return;
+    }
+    (void)physical_page_release(a,address);
+}
+
+void physical_page_pipe_drain(struct physical_page_allocator *a)
+{
+    if (!(__atomic_load_n(&a->pipe_spares[0],__ATOMIC_RELAXED) |
+          __atomic_load_n(&a->pipe_spares[1],__ATOMIC_RELAXED))) return;
+    PAGE_METADATA_SCOPE(work,a);
+    (void)reclaim_pipe_spares_locked(a,&work);
 }
 
 enum physical_page_status physical_page_release_order(struct physical_page_allocator *a,

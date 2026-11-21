@@ -23,6 +23,25 @@ static bool reorder;
 #if TEST_TRUNCATE_FALLBACK
 static int reclaim_injected_error;
 static unsigned expanded_attempts, narrow_attempts;
+static uint32_t reaped_inode;
+static unsigned reap_write_qualifications;
+static bool fail_inode_free;
+int __real_ext4_fs_free_inode(struct ext4_inode_ref *);
+int __wrap_ext4_fs_free_inode(struct ext4_inode_ref *ref)
+{
+    int result = __real_ext4_fs_free_inode(ref);
+    if (!result && fail_inode_free && ref->index == reaped_inode) {
+        fail_inode_free = false;
+        return EIO;
+    }
+    return result;
+}
+int __real_ext4_fs_inode_ref_write(struct ext4_inode_ref *);
+int __wrap_ext4_fs_inode_ref_write(struct ext4_inode_ref *ref)
+{
+    if (ref->index == reaped_inode) reap_write_qualifications++;
+    return __real_ext4_fs_inode_ref_write(ref);
+}
 int __real_ext4_balloc_free_blocks(struct ext4_inode_ref *, ext4_fsblk_t, uint32_t);
 int __wrap_ext4_balloc_free_blocks(struct ext4_inode_ref *ref, ext4_fsblk_t first,
                                  uint32_t count)
@@ -36,6 +55,44 @@ int __wrap_ext4_balloc_free_blocks(struct ext4_inode_ref *ref, ext4_fsblk_t firs
     }
     narrow_attempts++;
     return EOK;
+}
+
+static void single_reap(struct ext4_fs *fs, bool mapped)
+{
+    uint32_t free_inodes = ext4_fs_available_inodes(fs);
+    uint64_t free_blocks = ext4_fs_available_blocks(fs);
+    ext4_file file;
+    CHECK(ext4_fopen(&file, "/victim", "w+") == EOK);
+    if (mapped) {
+        unsigned char bytes[4096] = {0x7d};
+        size_t written;
+        CHECK(fs->bdev->lg_bsize <= sizeof(bytes));
+        CHECK(ext4_fwrite(&file, bytes, fs->bdev->lg_bsize, &written) == EOK);
+        CHECK(written == fs->bdev->lg_bsize);
+    }
+    uint32_t inode = file.inode, victim;
+    bool orphan;
+    CHECK(ext4_fclose(&file) == EOK);
+    CHECK(ext4_funlink_dentry("/victim", &victim, &orphan) == EOK && victim == inode && orphan);
+    CHECK(ext4_orphan_contains(fs, inode, &orphan) == EOK && orphan);
+    uint32_t before_reap_inodes = ext4_fs_available_inodes(fs);
+    uint64_t before_reap_blocks = ext4_fs_available_blocks(fs);
+    reaped_inode = inode;
+    /* Fail after the private bitmap changes. Removal and allocation counts
+     * both have to roll back in the same operation. */
+    fail_inode_free = true;
+    CHECK(ext4_orphan_free("/", inode) == EIO && !fail_inode_free);
+    CHECK(ext4_orphan_contains(fs, inode, &orphan) == EOK && orphan);
+    CHECK(ext4_fs_available_inodes(fs) == before_reap_inodes &&
+          ext4_fs_available_blocks(fs) == before_reap_blocks);
+    reap_write_qualifications = 0;
+    CHECK(ext4_orphan_free("/", inode) == EOK);
+    reaped_inode = 0;
+    printf("orphan reap: mapped=%d, inode write qualifications=%u\n", mapped, reap_write_qualifications);
+    CHECK(reap_write_qualifications == 0);
+    CHECK(ext4_orphan_contains(fs, inode, &orphan) == EOK && !orphan);
+    CHECK(ext4_fs_available_inodes(fs) == free_inodes && ext4_fs_available_blocks(fs) == free_blocks);
+    CHECK(ext4_fopen(&file, "/victim", "r") == ENOENT);
 }
 #endif
 
@@ -243,6 +300,14 @@ int main(int argc, char **argv)
     CHECK(ext4_mount("truncate", "/", false) == EOK);
     replay(dev.fs);
     CHECK(ext4_journal_start("/") == EOK);
+#if TEST_TRUNCATE_FALLBACK
+    if (!strcmp(argv[2], "single-reap")) {
+        single_reap(dev.fs, !strcmp(argv[4], "mapped"));
+        CHECK(ext4_journal_stop("/") == EOK && ext4_umount("/") == EOK);
+        fault_block_close(&disk);
+        return 0;
+    }
+#endif
     if (!strcmp(argv[2], "deep-prepare") || !strcmp(argv[2], "deep-check")) {
         if (!strcmp(argv[2], "deep-prepare")) deep_prepare(dev.fs);
         else deep_check(dev.fs);

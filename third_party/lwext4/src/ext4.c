@@ -2697,7 +2697,7 @@ static int ext4_reclaim_orphan(struct ext4_mountpoint *mp, uint32_t index,
 		r = ext4_fs_get_inode_ref(&mp->fs, index, &ref);
         if (r != EOK) goto FinishWindow;
         /* 映射释放会取得组资格，先保留本窗口结束时要修改的 orphan 记录。 */
-        r = ext4_orphan_prepare_change(&ref);
+        r = ext4_orphan_prepare_reclaim(&ref);
         if (r != EOK) {
             r = ext4_result(r, ext4_fs_put_inode_ref(&ref));
             goto FinishWindow;
@@ -2710,10 +2710,7 @@ static int ext4_reclaim_orphan(struct ext4_mountpoint *mp, uint32_t index,
 		/* The truncate/unlink already passed permission checks. A surviving
 		 * descriptor may since have set immutable or append-only. */
 		r = ext4_inode_truncate_orphan_step(&ref, &done, expand ? &expanded : NULL);
-        if (r == EOK && done && dead && !release_inode)
-            r = ext4_orphan_mark_truncate(&ref, false);
-		if (r == EOK && done && (!dead || release_inode))
-			r = dead ? ext4_orphan_remove_and_free(&ref) : ext4_orphan_remove(&ref);
+        if (r == EOK && done) r = ext4_orphan_finish_reclaim(&ref, release_inode);
 		r = ext4_result(r, ext4_fs_put_inode_ref(&ref));
 FinishWindow:
 		r = ext4_trans_finish(mp, r);
@@ -2762,12 +2759,11 @@ static int ext4_prepare_growth(ext4_file *file, uint64_t visible_end)
 		r = ext4_fs_put_inode_ref(&ref);
 		if (r == EOK) r = ext4_reclaim_orphan(mp, file->inode, false);
 	} else {
-        r = ext4_orphan_prepare_change(&ref);
+        r = ext4_orphan_prepare_reclaim(&ref);
 		while (r == EOK && !done) {
 			r = ext4_inode_truncate_step(&ref, &done);
 		}
-        if (r == EOK) r = ext4_inode_get_links_cnt(ref.inode)
-            ? ext4_orphan_remove(&ref) : ext4_orphan_mark_truncate(&ref,false);
+        if (r == EOK) r = ext4_orphan_finish_reclaim(&ref, false);
 		r = ext4_result(r, ext4_fs_put_inode_ref(&ref));
 	}
 Finish:

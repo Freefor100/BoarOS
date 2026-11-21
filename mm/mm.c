@@ -851,12 +851,22 @@ static void defer_cache_rearm(struct mm_file_resident *page,uint64_t generation)
     }
 }
 
-static void retire_file_resident(struct kernel_mm_record *record,struct mm_file_resident *page)
+static void retire_file_residents(struct kernel_mm_record *record,
+    struct mm_file_resident **pages, unsigned count)
 {
-    if (kernel_page_cache_alias_active(&page->alias)) kernel_page_cache_alias_detach(&page->alias);
-    if (page->alias.entry) {
-        page->next=record->retired_file_residents; record->retired_file_residents=page;
-    } else kernel_heap_release(record->vma_heap,page);
+    struct kernel_page_cache_alias *aliases[KERNEL_MM_RETIRE_CAPACITY];
+    unsigned alias_count = 0;
+    for (unsigned i = 0; i < count; ++i)
+        if (kernel_page_cache_alias_active(&pages[i]->alias))
+            aliases[alias_count++] = &pages[i]->alias;
+    kernel_page_cache_alias_detach_batch(aliases, alias_count);
+    for (unsigned i = 0; i < count; ++i) {
+        struct mm_file_resident *page = pages[i];
+        if (page->alias.entry) {
+            page->next = record->retired_file_residents;
+            record->retired_file_residents = page;
+        } else kernel_heap_release(record->vma_heap, page);
+    }
 }
 static void drain_retired_residents(struct kernel_mm_record *record,struct mm_file_resident *pages)
 {
@@ -867,21 +877,27 @@ static void drain_retired_residents(struct kernel_mm_record *record,struct mm_fi
     }
 }
 
-static void unindex_file_resident(struct kernel_mm_record *record,
-                                  struct mm_file_resident *page)
+static void unlink_file_resident(struct kernel_mm_record *record,
+    struct mm_file_resident **link)
 {
-    if (record->resident_count == 0) __builtin_trap();
-    size_t index = resident_bucket(page->address, record->resident_capacity);
-    struct mm_file_resident **link = &record->resident_buckets[index];
-    while (*link != page) {
-        if (*link == 0) __builtin_trap();
-        link = &(*link)->hash_next;
-    }
+    struct mm_file_resident *page = *link;
     *link = page->hash_next;
     record->resident_count--;
     *page->previous = page->next;
     if (page->next) page->next->previous = page->previous;
     page->previous = 0;
+}
+
+static void unindex_file_resident(struct kernel_mm_record *record,
+    struct mm_file_resident *page)
+{
+    size_t index = resident_bucket(page->address, record->resident_capacity);
+    struct mm_file_resident **link = &record->resident_buckets[index];
+    while (*link != page) {
+        if (!*link) __builtin_trap();
+        link = &(*link)->hash_next;
+    }
+    unlink_file_resident(record, link);
 }
 
 static void forget_file_residents(struct kernel_mm_record *record)
@@ -899,8 +915,7 @@ static void forget_file_residents(struct kernel_mm_record *record)
         }
         /* Cache detachment and any final reference release stay outside MM
          * metadata. Pending alias borrowers still own their callbacks. */
-        for (unsigned i = 0; i < count; ++i)
-            retire_file_resident(record, detached[i]);
+        retire_file_residents(record, detached, count);
     }
 }
 
@@ -944,19 +959,26 @@ static int rearm_shared_file_alias(void *owner, uint64_t address)
     return 0;
 }
 
-static struct mm_file_resident *find_file_resident(
+static struct mm_file_resident **find_file_resident_link(
     struct kernel_mm_record *record, uint64_t address)
 {
     if (!record->resident_count) return 0;
     size_t index = resident_bucket(address, record->resident_capacity);
-    for (struct mm_file_resident *page = record->resident_buckets[index];
-         page != 0; page = page->hash_next) {
+    for (struct mm_file_resident **link = &record->resident_buckets[index];
+         *link != 0; link = &(*link)->hash_next) {
 #if BOAROS_COST_DIAGNOSTICS
         __atomic_fetch_add(&record->resident_probes, 1U, __ATOMIC_RELAXED);
 #endif
-        if (page->address == address) return page;
+        if ((*link)->address == address) return link;
     }
     return 0;
+}
+
+static struct mm_file_resident *find_file_resident(
+    struct kernel_mm_record *record, uint64_t address)
+{
+    struct mm_file_resident **link = find_file_resident_link(record, address);
+    return link ? *link : 0;
 }
 
 static void truncate_file_residents(void *owner, struct kernel_vfs_node *node,
@@ -3386,10 +3408,11 @@ static void unmap_resident_before_pte(void *owner,uint64_t address,uint64_t phys
         lazy_retire(residents->record,lazy);
         residents->lazy_removed=1;
     }
-    struct mm_file_resident *page=find_file_resident(residents->record,address);
-    if (!page) return;
+    struct mm_file_resident **link = find_file_resident_link(residents->record, address);
+    if (!link) return;
+    struct mm_file_resident *page = *link;
     if (page->physical_address!=physical) __builtin_trap();
-    unindex_file_resident(residents->record,page);
+    unlink_file_resident(residents->record, link);
     page->next=residents->removed; residents->removed=page;
 }
 static enum kernel_mm_status unmap_space_range(
@@ -3469,9 +3492,13 @@ static enum kernel_mm_status unmap_space_range(
         }
         if (residents.lazy_removed) lazy_drain(record);
         while (residents.removed) {
-            struct mm_file_resident *page=residents.removed;
-            residents.removed=page->next;
-            retire_file_resident(record,page);
+            struct mm_file_resident *pages[KERNEL_MM_RETIRE_CAPACITY];
+            unsigned n = 0;
+            do {
+                pages[n++] = residents.removed;
+                residents.removed = residents.removed->next;
+            } while (residents.removed && n < KERNEL_MM_RETIRE_CAPACITY);
+            retire_file_residents(record, pages, n);
         }
     } while (status==ARCH_MMU_STATUS_OK);
     if (batches != local) kernel_heap_release(record->vma_heap, batches);
@@ -6399,7 +6426,8 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
             *targets = note_fault_change_locked(record,batch,0,
                 (vma->permissions & KERNEL_MM_EXECUTE) != 0);
     }
-    unsigned unused = 0, i = 0;
+    struct kernel_page_cache_alias_binding aliases[KERNEL_PAGE_CACHE_READY_WINDOW];
+    unsigned unused = 0, alias_count = 0, i = 0;
     for (unsigned bits = ready, index = 0; bits; bits >>= 1, index++) {
         if (!(bits & 1)) continue;
         struct mm_file_resident *page = residents[i];
@@ -6410,12 +6438,18 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
             /* Shared leaves are initially read-only. The MM writer and
              * inode reader exclude write faults and revocation until the
              * cache knows about every newly published alias. */
-            if (kernel_open_file_alias_attach(file,(offset>>BOAROS_PAGE_SHIFT)+index,
-                page->physical_address,&page->alias,page,page->address,
-                rearm_shared_file_alias)) __builtin_trap();
+            page->alias.owner = page;
+            page->alias.virtual_address = page->address;
+            page->alias.rearm = rearm_shared_file_alias;
+            aliases[alias_count++] = (struct kernel_page_cache_alias_binding){
+                .alias = &page->alias, .physical_address = page->physical_address,
+            };
         }
         i++;
     }
+    if (alias_count)
+        kernel_page_cache_alias_attach_window(kernel_open_file_page_cache(file),
+            kernel_open_file_vfs_borrow(file), offset>>BOAROS_PAGE_SHIFT, installed, aliases);
     physical_page_release_batch(record->space.allocator,refs,unused);
     return end;
 }

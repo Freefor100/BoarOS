@@ -21,6 +21,7 @@ struct kernel_pipe_buffer {
     unsigned char *page;
     uint16_t offset, length;
     uint8_t can_merge, order; /* page is a base-page window; owner is its aligned compound head. */
+    uint8_t reusable; /* Exclusively owned backing from the ordinary copy path. */
 };
 #define KERNEL_PIPE_INLINE_SLOTS 16U
 #define KERNEL_PIPE_NO_SLOT UINT32_MAX

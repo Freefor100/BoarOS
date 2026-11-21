@@ -38,6 +38,11 @@ int ext4_orphan_truncate_pending(struct ext4_fs *, uint32_t inode, bool *pending
 /* Retain an existing record before mapping changes acquire allocation groups.
  * A missing record needs no qualification and remains absent. */
 int ext4_orphan_prepare_change(struct ext4_inode_ref *inode);
+/* Reclaim keeps the reference obtained with ext4_fs_get_inode_ref() in the
+ * current transaction. Qualify its orphan record before acquiring block
+ * groups, then finish using the same reference and transaction. */
+int ext4_orphan_prepare_reclaim(struct ext4_inode_ref *inode);
+int ext4_orphan_finish_reclaim(struct ext4_inode_ref *inode, bool release_inode);
 int ext4_orphan_mark_truncate(struct ext4_inode_ref *, bool pending);
 int ext4_orphan_add(struct ext4_inode_ref *inode);
 int ext4_orphan_remove(struct ext4_inode_ref *inode);
