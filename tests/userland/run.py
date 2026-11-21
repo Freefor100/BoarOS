@@ -361,13 +361,14 @@ def remount_output(raw):
     lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('REMOUNT ')]
     return lines==[*(f'REMOUNT CASE {name} PASS' for name in REMOUNT_CASES),'REMOUNT END 4']
 
-BIND_CASES=('directory-file-bind-and-unlinked-owner','alias-rename-held-dirfd-cwd-and-parent',
+BIND_CASES=('expiry-marker-activity-busy-and-view-isolation',
+    'directory-file-bind-and-unlinked-owner','alias-rename-held-dirfd-cwd-and-parent',
     'independent-readonly-nodev-noexec-nosuid','recursive-clone-and-lazy-child-owner',
     'source-target-type-and-nonmount-errors','original-unmount-keeps-bind-instance',
     'lazy-final-dirfd-mmap-remove-and-cow','devpts-ptmx-file-bind-peer-and-last-owner')
 def mount_bind_output(raw):
     lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('BIND ')]
-    return lines==[*(f'BIND CASE {name} PASS' for name in BIND_CASES),'BIND END 8']
+    return lines==[*(f'BIND CASE {name} PASS' for name in BIND_CASES),f'BIND END {len(BIND_CASES)}']
 
 MOVE_CASES=('live-subtree-identity-attributes-fd-cwd-and-maps',
  'source-root-type-cycles-and-failure-rollback','stack-unstack-cross-parent-and-preserved-flags',

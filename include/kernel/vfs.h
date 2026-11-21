@@ -68,6 +68,7 @@ struct kernel_vfs_mount {
     uint8_t atime_policy; /* 0=relatime; NOATIME/STRICT/NODIR are per-view. */
     uint8_t unbindable,namespace_retiring,propagation_staged,detached_tree,external_owner;
     uint8_t paths_closing;
+    uint32_t expiry_mark;
     uint64_t propagation_group,propagation_visit,unmount_visit,detached_origin;
     size_t unmount_index;
     struct kernel_vfs_mount *peer_next,*peer_previous;
@@ -95,7 +96,10 @@ void kernel_vfs_close_tree(struct kernel_vfs_mount *);
 int kernel_vfs_detach_created_mount(struct kernel_vfs_mount *,struct kernel_heap *,uint64_t,struct kernel_vfs_path **);
 int kernel_vfs_set_mount_attributes(struct kernel_vfs_path *,uint64_t,uint64_t,uint64_t,int);
 int kernel_vfs_pivot_root(const struct kernel_fs_context *,struct kernel_vfs_path *,struct kernel_vfs_path *);
+enum { KERNEL_VFS_MNT_DETACH = 2U, KERNEL_VFS_MNT_EXPIRE = 4U };
 int kernel_vfs_umount(struct kernel_vfs_path *root, unsigned flags);
+/* The target lookup of umount must preserve an earlier expiry mark. */
+int kernel_vfs_umount_path_release(struct kernel_vfs_path **owner);
 /* User-return/exit drains fresh retirements; explicit cleanup also retries failures. */
 int kernel_vfs_reap_mounts(void);
 int kernel_vfs_cleanup_pending(void);

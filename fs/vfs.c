@@ -974,7 +974,8 @@ static int mount_attach_one(struct kernel_vfs_mount *mount,
 static int mount_view_idle(struct kernel_vfs_mount *mount,const struct kernel_vfs_path *named)
 {
     uint32_t expected=named==mount->root_path ? 2U : 1U;
-    return !mount->child_mounts && mount_references(mount)==2U+mount->external_owner && mount->root_path->references==expected;
+    return !mount->child_mounts && mount_references(mount)==2U+mount->external_owner &&
+        __atomic_load_n(&mount->root_path->references,__ATOMIC_ACQUIRE)==expected;
 }
 int kernel_vfs_mount_prepare_detach(struct kernel_vfs_mount *mount,const struct kernel_vfs_path *named)
 {
@@ -1704,9 +1705,15 @@ static int unmount_close_paths(struct unmount_entry *items,size_t count,const st
 int kernel_vfs_umount(struct kernel_vfs_path *root,unsigned flags)
 {
     KERNEL_LOCK_SCOPE(topology);mount_topology_lock(&topology);
-    if(!root || !root->references || (flags&~2U))return -KERNEL_EINVAL;
+    if(!root || !root->references || (flags && flags!=KERNEL_VFS_MNT_DETACH &&
+        flags!=KERNEL_VFS_MNT_EXPIRE))return -KERNEL_EINVAL;
     struct kernel_vfs_mount *origin=root->file.mount;
     if(!origin->parent || origin->root_path!=root)return -KERNEL_EINVAL;
+    if(flags==KERNEL_VFS_MNT_EXPIRE) {
+        if(!mount_view_idle(origin,root))return -KERNEL_EBUSY;
+        if(!__atomic_exchange_n(&origin->expiry_mark,1U,__ATOMIC_RELAXED))return -KERNEL_EAGAIN;
+        flags=0;
+    }
     if(!flags && origin->child_mounts)return -KERNEL_EBUSY;
     if(!flags && !origin->parent->propagation_group) {
         int error=kernel_vfs_mount_prepare_detach(origin,root);if(error)return error;
@@ -3082,11 +3089,15 @@ int kernel_vfs_path_acquire(struct kernel_vfs_path *path)
         if (__atomic_compare_exchange_n(&path->references,&refs,refs+1,1,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) return 0;
     }
 }
-static int path_release(struct kernel_vfs_path **owner, bool keep_location)
+static int path_release(struct kernel_vfs_path **owner, bool keep_location, bool preserve_expiry)
 {
     if (!owner || !*owner) return -KERNEL_EINVAL;
     struct kernel_vfs_path *path=*owner;*owner=NULL;
     if (keep_location && (path->transient || path->borrow_mount)) __builtin_trap();
+    struct kernel_vfs_mount *mount=path->file.mount;
+    /* Clear the mark before dropping the reference that makes expiry busy. */
+    if (!preserve_expiry && __atomic_load_n(&mount->expiry_mark,__ATOMIC_RELAXED))
+        __atomic_store_n(&mount->expiry_mark,0U,__ATOMIC_RELAXED);
     if (path->transient) {
         /* Resolver-local storage is never in the mount's weak path index. */
         if (!path->references) __builtin_trap();
@@ -3109,7 +3120,6 @@ static int path_release(struct kernel_vfs_path **owner, bool keep_location)
         *path->previous=path->next;
         if (path->next) path->next->previous=path->previous;
     }
-    struct kernel_vfs_mount *mount=path->file.mount;
     KERNEL_SERVICE_SCOPE_IF(service,kernel_vfs_namespace_requires_cpu0(mount));
     struct kernel_vfs_dentry *entry=path->dentry;
     bool borrow_mount=path->borrow_mount;
@@ -3120,7 +3130,10 @@ static int path_release(struct kernel_vfs_path **owner, bool keep_location)
 }
 
 int kernel_vfs_path_release(struct kernel_vfs_path **owner)
-{ return path_release(owner,false); }
+{ return path_release(owner,false,false); }
+
+int kernel_vfs_umount_path_release(struct kernel_vfs_path **owner)
+{ return path_release(owner,false,true); }
 
 struct kernel_vfs_mount *kernel_vfs_path_mount(
     const struct kernel_vfs_path *path)
@@ -4366,7 +4379,7 @@ int kernel_vfs_close(struct kernel_vfs_file *file)
         kernel_vfs_mutation_lock(file->mount,&mutation);
     if (file->path) {
         bool keep_location=!file->location_owner && !file->mount->backend_owner;
-        if (path_release(&file->path,keep_location)) __builtin_trap();
+        if (path_release(&file->path,keep_location,false)) __builtin_trap();
         if (keep_location) file->location_owner=1;
     }
     {

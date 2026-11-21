@@ -32,6 +32,30 @@ static void create(const char *name,const char *text)
 {int fd=open(name,O_CREAT|O_RDWR|O_EXCL,0755);CHECK(fd>=0&&write(fd,text,strlen(text))==(ssize_t)strlen(text)&&!ftruncate(fd,(off_t)page)&&!close(fd));}
 static void flags(const char *name,unsigned expected)
 {struct statfs s;CHECK(!statfs(name,&s)&&((unsigned long)s.f_flags&15U)==expected);}
+static void expiry(void)
+{
+    CHECK(!mount("bs/sub", "bp", NULL, MS_BIND, NULL));
+    CHECK(!mount("bs/sub", "br", NULL, MS_BIND, NULL));
+    ERROR(umount2("bp", MNT_EXPIRE | MNT_FORCE), EINVAL);
+    ERROR(umount2("bp", MNT_EXPIRE | MNT_DETACH), EINVAL);
+    ERROR(umount2("/", MNT_EXPIRE), EINVAL);
+
+    int fd = open("bp/data", O_RDONLY);
+    CHECK(fd >= 0);
+    ERROR(umount2("bp", MNT_EXPIRE), EBUSY);
+    CHECK(!close(fd));
+
+    ERROR(umount2("bp", MNT_EXPIRE), EAGAIN);
+    CHECK(!access("br/data", F_OK));
+    CHECK(!umount2("bp", MNT_EXPIRE));
+
+    ERROR(umount2("br", MNT_EXPIRE), EAGAIN);
+    CHECK(!access("br/data", F_OK));
+    ERROR(umount2("br", MNT_EXPIRE), EAGAIN);
+    CHECK(!umount2("br", MNT_EXPIRE));
+    ERROR(access("br/data", F_OK), ENOENT);
+    pass("expiry-marker-activity-busy-and-view-isolation");
+}
 static void identity(void)
 {
     CHECK(!mount("bs/sub","bv",0,MS_BIND,0));same("bs/sub/data","bv/data");
@@ -130,7 +154,7 @@ int main(void)
     printf("bind caller cpu=%d\n",cpu);page=(size_t)sysconf(_SC_PAGESIZE);CHECK(page&&getcwd(base,sizeof(base)));
     for(unsigned i=0;i<4;i++)directory((const char *[]){"bs","bv","bp","br"}[i]);
     create("bf","");CHECK(!mount("tmpfs","bs","tmpfs",0,0));directory("bs/sub");create("bs/sub/data","stable");
-    identity();renamed_directory();attributes();recursive();errors();detach();pty_bind();
+    expiry();identity();renamed_directory();attributes();recursive();errors();detach();pty_bind();
     CHECK(!unlink("bf"));for(unsigned i=0;i<4;i++)CHECK(!rmdir((const char *[]){"bs","bv","bp","br"}[i]));
     printf("BIND END %u\n",cases);return 0;
 }
