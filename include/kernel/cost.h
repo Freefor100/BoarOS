@@ -12,6 +12,7 @@ struct kernel_cost_task {
     uint32_t depth;
     uint8_t suppress, operation, wait_rank, wait_flags;
 };
+#define KERNEL_COST_TCP_WORKER 16U
 /* Two backend guards and four inline resource request guards live in the
  * task's IO context. SMP service accounting retains two further timestamps. */
 #define KERNEL_COST_TASK_BYTES (sizeof(struct kernel_cost_task) + 6U * 16U + (BOAROS_USER_SMP ? 16U : 0U))
@@ -75,6 +76,7 @@ void kernel_cost_add_tag(struct kernel_cost_tag tag, enum kernel_cost_metric met
 /* One metadata region publishes three counters with one bounded observer update. */
 void kernel_cost_page_metadata(struct kernel_cost_tag tag, uint64_t checked,
                               uint64_t written, uint64_t ticks);
+void kernel_cost_tcp_input_dequeue(uint64_t queued, uint64_t locking, uint64_t locked);
 void kernel_cost_raw_lock(struct kernel_cost_tag tag, unsigned rank, uint64_t wait, uint64_t hold);
 void kernel_cost_sample_tag(struct kernel_cost_tag tag, enum kernel_cost_metric metric, uint64_t value);
 void kernel_cost_add(enum kernel_cost_metric metric, uint64_t value);

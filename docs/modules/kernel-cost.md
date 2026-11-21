@@ -62,7 +62,7 @@ RFENCE 调用数。这些阶段存在嵌套，累计经过时间含等待，不�
 
 ## 当前消费者
 
-网络诊断把共享互联网协议（Internet Protocol，IP）锁、分片传输控制协议（Transmission Control Protocol，TCP）锁和报文队列分别计时。`network_ip_lock_ticks` 与 `network_tcp_lock_ticks` 累计实际互斥锁取得的经过时间，包含等待。`tcp_input_queue_ticks` 从报文进入归属核队列计到执行者取走，`tcp_input_queue_depth` 同时记录入队时队列深度。`net_tx_post_done_ticks` 从发送描述符发布前计到驱动读取设备的完成记录，覆盖设备处理及驱动收取完成之前的延迟。多个请求的计时可能重叠。
+网络诊断把共享互联网协议（Internet Protocol，IP）锁、分片传输控制协议（Transmission Control Protocol，TCP）锁和报文队列分别计时。`network_ip_lock_ticks` 与 `network_tcp_lock_ticks` 累计实际互斥锁取得的经过时间，包含等待。`tcp_input_queue_ticks` 从报文进入归属核队列计到执行者取走，分别统计本轮开始取锁前、取得锁期间、取得锁后轮到报文前三段。`tcp_worker_wake_to_run_ticks` 直接记录归属核工作线程被唤醒到获得运行权的时间，以线程唤醒次数统计。`tcp_input_process_ticks` 记录取出报文后执行协议处理的时间。`net_tx_post_done_ticks` 从发送描述符发布前计到驱动读取设备的完成记录。多个请求的计时可能重叠。
 
 存储和 TCP 使用 `tests/cost/io-budget-experiment.py`、`network-budget-experiment.py` 及实际业务程序；运行方式与完成条件见[数据路径实验工具](../learning/data-path-budget-experiments.md)。CPU、线程及定时器使用 `tests/cost/accounting/cost.py`，见[CPU 测量](../learning/cpu-accounting-cost.md)。早期独立校准器和一次性参数矩阵已删除。
 
