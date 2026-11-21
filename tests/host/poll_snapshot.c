@@ -41,7 +41,10 @@ enum kernel_files_status kernel_files_pin(struct kernel_files *f,int64_t fd,
 enum kernel_open_file_status kernel_open_file_release(struct kernel_open_file_description **out)
 { CHECK(*out==&target && refs);refs--;*out=NULL;return KERNEL_OPEN_FILE_STATUS_OK; }
 uint32_t kernel_open_file_poll(struct kernel_open_file_description *f,uint32_t requested,struct kernel_wait_queue **out)
-{ CHECK(f==&target);CHECK(target_kind!=KERNEL_OPEN_FILE_KIND_EPOLL || !live);polls++;*out=&queue;return readable?(requested&(KERNEL_POLLIN|KERNEL_POLLRDNORM)):0; }
+{ CHECK(f==&target);CHECK(target_kind!=KERNEL_OPEN_FILE_KIND_EPOLL || !live);polls++;*out=&queue;
+  if (target_kind==KERNEL_OPEN_FILE_KIND_REGULAR)
+      return KERNEL_POLLIN|KERNEL_POLLRDNORM|KERNEL_POLLOUT|KERNEL_POLLWRNORM;
+  return readable?(requested&(KERNEL_POLLIN|KERNEL_POLLRDNORM)):0; }
 int kernel_epoll_wait_pending(struct kernel_open_file_description *f,struct kernel_wait_queue **out)
 { CHECK(f==&target && target_kind==KERNEL_OPEN_FILE_KIND_EPOLL && live);if(out)*out=&queue;hints++;if(!out && stale_hint){stale_hint--;return 1;}return readable; }
 void kernel_wait_node_init(struct kernel_wait_node *n,struct kernel_task *t)
@@ -69,7 +72,20 @@ enum kernel_uaccess_status kernel_copy_from_user(struct kernel_mm *mm,void *to,u
 enum kernel_uaccess_status kernel_copy_to_user(struct kernel_mm *mm,uint64_t to,const void *from,size_t n,size_t *copied)
 { (void)mm;*copied=0;if(to<4096)return KERNEL_UACCESS_STATUS_FAULT;memcpy((void *)(uintptr_t)to,from,n);*copied=n;return KERNEL_UACCESS_STATUS_OK; }
 int kernel_files_fd_matches(struct kernel_files *f,int64_t fd,const struct kernel_open_file_description *file)
-{ (void)f;return fd==7 && file==&target; }
+{ (void)f;return file==(fd==7?&target:NULL); }
+int kernel_files_scan_select(struct kernel_files *files,unsigned nfds,const uint64_t *readfds,
+    const uint64_t *writefds,const uint64_t *exceptfds,unsigned *count,int *ready)
+{
+    (void)files;
+    uint64_t requested=*readfds|*writefds|*exceptfds;
+    if (nfds<64) requested &= (UINT64_C(1)<<nfds)-1;
+    uint64_t available=UINT64_C(1)<<7;
+    if (requested&~available) return -KERNEL_EBADF;
+    *count=requested!=0;
+    *ready=(requested && target_kind!=KERNEL_OPEN_FILE_KIND_REGULAR) ? -1 :
+        !!(*readfds&requested)+!!(*writefds&requested);
+    return 0;
+}
 enum kernel_heap_status kernel_heap_allocate(struct kernel_heap *h,size_t n,void **out)
 { (void)h;*out=malloc(n);CHECK(*out);allocs++;allocated_bytes=n;return KERNEL_HEAP_STATUS_OK; }
 void kernel_heap_release(struct kernel_heap *h,void *p)
@@ -107,6 +123,13 @@ static void empty_waits(void)
     reset();uint64_t readfds=UINT64_C(1)<<7;ts=(struct kernel_timespec){0};readable=1;
     CHECK(!kernel_files_pselect6(&files,&mm,&task,8,(uintptr_t)&readfds,0,0,(uintptr_t)&ts,0,&result) && result==1);
     CHECK(!service_entries && !service_exits && readfds==(UINT64_C(1)<<7) && !refs && !live && !allocs);
+    reset();target_kind=KERNEL_OPEN_FILE_KIND_REGULAR;
+    readfds=UINT64_C(1)<<7;
+    uint64_t writefds=readfds,exceptfds=readfds;
+    CHECK(!kernel_files_pselect6(&files,&mm,&task,8,(uintptr_t)&readfds,(uintptr_t)&writefds,
+        (uintptr_t)&exceptfds,0,0,&result) && result==2);
+    CHECK(readfds==(UINT64_C(1)<<7) && writefds==readfds && !exceptfds);
+    CHECK(!polls && !parks && !refs);
     reset();target_cpu0=1;readable=1;
     CHECK(!kernel_files_ppoll(&files,&mm,&task,(uintptr_t)&fd,1,0,0,0,&result) && result==1);
     CHECK(service_entries==1 && service_exits==1 && !refs && !live && !allocs);

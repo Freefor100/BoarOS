@@ -551,7 +551,7 @@ enum arch_mmu_status arch_mmu_user_fork_commit_window(
 }
 
 unsigned arch_mmu_user_map_owned_window(struct arch_mmu_user_space *s, uint64_t address,
-    unsigned pages, const uint64_t *physical, uint32_t permissions)
+    unsigned pages, const uint64_t *physical, uint32_t permissions, int cow)
 {
     if (!pages) return 0;
     unsigned slots = (ARCH_MMU_HUGE_SIZE - (address & (ARCH_MMU_HUGE_SIZE-1))) / BOAROS_PAGE_SIZE;
@@ -571,15 +571,15 @@ unsigned arch_mmu_user_map_owned_window(struct arch_mmu_user_space *s, uint64_t 
         if ((p & BOAROS_PAGE_MASK) || !p || p > PTE_ADDRESS || (permissions & ~7U))
             __builtin_trap();
         if ((permissions ? s->leaf_pages : s->protected_pages) >= UINT32_MAX-count ||
-            s->cow_pages >= UINT32_MAX-count) __builtin_trap();
-        uint64_t entry = encode(p, permissions, 1);
+            (cow && s->cow_pages >= UINT32_MAX-count)) __builtin_trap();
+        uint64_t entry = encode(p, permissions, cow);
         __atomic_store_n(&slot[index], entry, __ATOMIC_RELEASE);
         installed |= 1U << index;
         count++;
     }
     if (permissions) s->leaf_pages += count;
     else s->protected_pages += count;
-    s->cow_pages += count;
+    if (cow) s->cow_pages += count;
     resident_peak(s);
     return installed;
 }

@@ -186,9 +186,12 @@ enum kernel_pipe_status kernel_pipe_create(
 
 static void pipe_notify(struct kernel_pipe *pipe,int readers,int writers)
 {
-    KERNEL_IRQ_SCOPE(irq);
     struct kernel_wait_queue *queues[]={&pipe->read_queue,&pipe->write_queue,&pipe->both_queue};
-    int notify[]={readers,writers,readers||writers};
+    int notify[]={readers && kernel_wait_queue_registrations(queues[0]),
+        writers && kernel_wait_queue_registrations(queues[1]),
+        (readers||writers) && kernel_wait_queue_registrations(queues[2])};
+    if (!(notify[0] | notify[1] | notify[2])) return;
+    KERNEL_IRQ_SCOPE(irq);
     for (unsigned i=0;i<3;i++) if (notify[i]) {
         enum kernel_scheduler_status status=kernel_wait_queue_wake_all(queues[i]);
         if (status!=KERNEL_SCHEDULER_STATUS_OK && status!=KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED)
@@ -490,9 +493,13 @@ int64_t kernel_pipe_read_begin(struct kernel_pipe *pipe,size_t count,int nonbloc
         int error=pipe_wait_ready(pipe,0,nonblocking);
         if (error) return error;
         kernel_mutex_lock(&pipe->read_lock,&borrow->guard);
+        int eof;
         for (;;) {
             PIPE_META(guard,pipe);
-            if (!pipe->bytes) break;
+            if (!pipe->bytes) {
+                eof=!pipe->writers;
+                break;
+            }
             if (pipe->merge_slot==pipe->head) {
                 kernel_raw_scope_release(&guard);
                 KERNEL_LOCK_SCOPE(writer);kernel_mutex_lock(&pipe->write_lock,&writer);
@@ -502,11 +509,14 @@ int64_t kernel_pipe_read_begin(struct kernel_pipe *pipe,size_t count,int nonbloc
             if (!pipe->slots || !part->page || !part->length || pipe->read_slot!=KERNEL_PIPE_NO_SLOT) __builtin_trap();
             pipe->read_slot=pipe->head;borrow->pipe=pipe;
             borrow->length=count<pipe->bytes?count:(size_t)pipe->bytes;
-            borrow->cursor_slot=pipe->head;borrow->cursor_position=0;
+            /* The copy reservation prevents tail merging into the head. Its
+             * published span is therefore stable until this reader consumes it. */
+            borrow->first_data=part->page+part->offset;
+            borrow->first_length=part->length<borrow->length?part->length:borrow->length;
+            borrow->cursor_slot=next_slot(pipe,pipe->head);
+            borrow->cursor_position=borrow->first_length;
             return (int64_t)borrow->length;
         }
-        int eof;
-        { PIPE_META(guard,pipe);eof=!pipe->bytes && !pipe->writers; }
         kernel_lock_release(&borrow->guard);
         if (eof) return 0;
     }
@@ -517,6 +527,10 @@ void kernel_pipe_read_finish(struct kernel_pipe_read_borrow *borrow,size_t consu
     if (!pipe || consumed>borrow->length || !borrow->guard.lock) __builtin_trap();
     size_t left=consumed;
     int wake_writers=0;
+    if (!left) {
+        PIPE_META(guard,pipe);
+        pipe->read_slot=KERNEL_PIPE_NO_SLOT;
+    }
     while (left) {
         void *page=NULL;unsigned order=0;
         {
@@ -532,11 +546,12 @@ void kernel_pipe_read_finish(struct kernel_pipe_read_borrow *borrow,size_t consu
             }
             size_t n=left<pipe->buffers[pipe->head].length?left:pipe->buffers[pipe->head].length;
             if (n==pipe->buffers[pipe->head].length && pipe->slots==pipe->ring_size) wake_writers=1;
-            page=pipe_consume(pipe,n,&order);left-=n;pipe->read_slot=pipe->head;
+            page=pipe_consume(pipe,n,&order);
+            left-=n;
+            pipe->read_slot=left?pipe->head:KERNEL_PIPE_NO_SLOT;
         }
         if (page) pipe_release_page(pipe,page,order);
     }
-    { PIPE_META(guard,pipe);pipe->read_slot=KERNEL_PIPE_NO_SLOT; }
     kernel_lock_release(&borrow->guard);*borrow=(struct kernel_pipe_read_borrow){0};
     if (wake_writers) pipe_notify(pipe,0,1);
     pipe_async(pipe,KERNEL_ASYNC_POLL_OUT);
@@ -546,7 +561,15 @@ void kernel_pipe_read_fragment(struct kernel_pipe_read_borrow *borrow,size_t off
 {
     struct kernel_pipe *pipe=borrow->pipe;
     if (!pipe || !borrow->guard.lock || offset>=borrow->length) __builtin_trap();
-    if (offset<borrow->cursor_position) {borrow->cursor_slot=pipe->head;borrow->cursor_position=0;}
+    if (offset<borrow->first_length) {
+        *data=borrow->first_data+offset;
+        *count=borrow->first_length-offset;
+        return;
+    }
+    if (offset<borrow->cursor_position) {
+        borrow->cursor_slot=next_slot(pipe,pipe->head);
+        borrow->cursor_position=borrow->first_length;
+    }
     for (;;) {
         struct kernel_pipe_buffer part;
         { PIPE_META(guard,pipe);part=pipe->buffers[borrow->cursor_slot]; }
@@ -811,7 +834,7 @@ static enum kernel_pipe_status pipe_write_source_locked(struct kernel_pipe *pipe
                 kernel_lock_scope_release(&copy);arch_interrupt_restore(irq);
                 return KERNEL_PIPE_STATUS_OK;
             }
-            if (allocated || physical_page_resolve(pipe->allocator,physical,&page)) __builtin_trap();
+            if (allocated || physical_page_map_owned(pipe->allocator,physical,&page)) __builtin_trap();
             /* 槽先拥有尚未发布的页；用户fault或最后端点释放都能找到它。 */
             { PIPE_META(guard,pipe);pipe->buffers[slot].page=page;pipe->buffers[slot].order=0; }
         }

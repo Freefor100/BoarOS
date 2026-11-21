@@ -1837,9 +1837,9 @@ static unsigned map_owned_window(struct riscv_sv39_user_space *s, uint64_t addre
 }
 
 unsigned riscv_sv39_user_map_owned_window(struct riscv_sv39_user_space *s, uint64_t address,
-    unsigned pages, const uint64_t *physical, uint32_t permissions)
+    unsigned pages, const uint64_t *physical, uint32_t permissions, int cow)
 {
-    return map_owned_window(s, address, pages, physical, permissions, 1, -1);
+    return map_owned_window(s, address, pages, physical, permissions, cow, -1);
 }
 
 unsigned riscv_sv39_user_map_zero_window(struct riscv_sv39_user_space *s, uint64_t address,

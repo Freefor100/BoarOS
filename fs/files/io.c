@@ -566,6 +566,32 @@ static enum kernel_files_status disk_read(
     return status;
 }
 
+static enum kernel_files_status read_device_zeros(
+    struct kernel_files *files,struct kernel_mm *mm,struct kernel_uaccess_iov_cursor *cursor,
+    uint64_t count,int64_t *linux_result)
+{
+    static const unsigned char zeros[BOAROS_PAGE_SIZE];
+    struct kernel_uaccess_write_cursor destination={0};
+    size_t remaining=count>KERNEL_FILES_MAX_RW_COUNT ? KERNEL_FILES_MAX_RW_COUNT : (size_t)count;
+    size_t total=0;
+    enum kernel_uaccess_status access=KERNEL_UACCESS_STATUS_OK;
+    while (remaining) {
+        size_t copied;
+        size_t size=remaining<sizeof(zeros) ? remaining : sizeof(zeros);
+        access=kernel_copy_to_user_iov_cursor(mm,cursor,&destination,zeros,size,&copied);
+        total+=copied;
+        KERNEL_FILES_NOTE(files,read_chunks,1);
+        if (access) break;
+        remaining-=size;
+    }
+    kernel_uaccess_write_cursor_finish(&destination);
+    if (access && access!=KERNEL_UACCESS_STATUS_FAULT) return KERNEL_FILES_STATUS_STATE;
+    *linux_result=total || !access ? (int64_t)total : -KERNEL_EFAULT;
+    if (*linux_result<0) KERNEL_FILES_NOTE(files,read_failures,1);
+    else KERNEL_FILES_NOTE(files,bytes_read,total);
+    return KERNEL_FILES_STATUS_OK;
+}
+
 static enum kernel_files_status read_pinned(
     struct kernel_files *files,
     struct kernel_mm *mm,
@@ -621,7 +647,8 @@ static enum kernel_files_status read_pinned(
     if (kind == KERNEL_OPEN_FILE_KIND_SOCKET &&
         (kernel_open_file_flags(description) & KERNEL_FILES_O_NONBLOCK))
         socket_flags |= KERNEL_SOCKET_MSG_DONTWAIT;
-    KERNEL_SERVICE_SCOPE_IF(service, !description->proc_page_stream && kind != KERNEL_OPEN_FILE_KIND_INOTIFY &&
+    KERNEL_SERVICE_SCOPE_IF(service, !description->proc_page_stream &&
+        !(description->device && description->device->stateless_io) && kind != KERNEL_OPEN_FILE_KIND_INOTIFY &&
         kind != KERNEL_OPEN_FILE_KIND_REGULAR && kind != KERNEL_OPEN_FILE_KIND_SOCKET && kind != KERNEL_OPEN_FILE_KIND_PIPE);
     KERNEL_LOCK_SCOPE(offset_guard);
     if ((kind == KERNEL_OPEN_FILE_KIND_REGULAR || kind == KERNEL_OPEN_FILE_KIND_GENERATED) &&
@@ -725,6 +752,7 @@ static enum kernel_files_status read_pinned(
             KERNEL_FILES_NOTE(files,read_failures,1);
             return KERNEL_FILES_STATUS_OK;
         }
+        if (device->zero_fill) return read_device_zeros(files,mm,&cursor,count,linux_result);
         if (device->readv) {
             enum kernel_files_status status = device->readv(description->device_instance,
                 kernel_task_current(), files, description_owner, 0, mm, iov, iov_count,
@@ -926,7 +954,8 @@ static enum kernel_files_status readv_request(
         KERNEL_FILES_NOTE(files, read_failures, 1);
         return KERNEL_FILES_STATUS_OK;
     }
-    KERNEL_SERVICE_SCOPE_IF(service, description->kind != KERNEL_OPEN_FILE_KIND_INOTIFY && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_EVENTFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_TIMERFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SIGNALFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_MQUEUE);
+    KERNEL_SERVICE_SCOPE_IF(service, !(description->device && description->device->stateless_io) &&
+        description->kind != KERNEL_OPEN_FILE_KIND_INOTIFY && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SOCKET && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_EVENTFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_TIMERFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_SIGNALFD && kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_MQUEUE);
     if (description->kind==KERNEL_OPEN_FILE_KIND_NAMESPACE) {
         *linux_result=(kernel_open_file_flags(description)&010000000U)?-KERNEL_EBADF:-KERNEL_EINVAL;
         status=KERNEL_FILES_STATUS_OK;
@@ -1047,7 +1076,8 @@ static enum kernel_files_status pread_iov_pinned(
         }
         return status;
     }
-    KERNEL_SERVICE_SCOPE_IF(service, !description->proc_page_stream && kind != KERNEL_OPEN_FILE_KIND_REGULAR &&
+    KERNEL_SERVICE_SCOPE_IF(service, !description->proc_page_stream &&
+        !(description->device && description->device->stateless_io) && kind != KERNEL_OPEN_FILE_KIND_REGULAR &&
         kind != KERNEL_OPEN_FILE_KIND_SOCKET && kind != KERNEL_OPEN_FILE_KIND_PIPE &&
         kind != KERNEL_OPEN_FILE_KIND_EVENTFD && kind != KERNEL_OPEN_FILE_KIND_TIMERFD &&
         kind != KERNEL_OPEN_FILE_KIND_SIGNALFD && kind != KERNEL_OPEN_FILE_KIND_MQUEUE);
@@ -1322,13 +1352,6 @@ static enum kernel_files_status buffered_write_request(
 {
     uint64_t total = 0U;
 
-    if (description->device && description->device->discard_writes) {
-        size_t consumed = 0U;
-        int result = description->device->write(description->device_instance, kernel_task_current(), options->flags, 0, (size_t)count, &consumed);
-        if (consumed > count) return KERNEL_FILES_STATUS_STATE;
-        *linux_result = result && !consumed ? result : (int64_t)consumed;
-        return KERNEL_FILES_STATUS_OK;
-    }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_GENERATED) {
         if (kernel_vfs_file_is_control(&description->file, 1))
             return control_write(files, mm, description, iov, iov_count, count,
@@ -1698,12 +1721,22 @@ static enum kernel_files_status write_request(
     if (kind == KERNEL_OPEN_FILE_KIND_SOCKET &&
         (options.flags & KERNEL_FILES_O_NONBLOCK))
         socket_flags |= KERNEL_SOCKET_MSG_DONTWAIT;
-    KERNEL_SERVICE_SCOPE_IF(service, kind != KERNEL_OPEN_FILE_KIND_REGULAR && kind != KERNEL_OPEN_FILE_KIND_SOCKET && kind != KERNEL_OPEN_FILE_KIND_PIPE);
+    KERNEL_SERVICE_SCOPE_IF(service, !(description->device && description->device->stateless_io) &&
+        kind != KERNEL_OPEN_FILE_KIND_REGULAR && kind != KERNEL_OPEN_FILE_KIND_SOCKET && kind != KERNEL_OPEN_FILE_KIND_PIPE);
     COST_SCOPE(write_cost, OPERATION_TICKS);
     COST_IO_SCOPE(io_cost,
         kernel_socket_preserves_messages(kernel_open_file_socket(description)) ? 2 :
         kind == KERNEL_OPEN_FILE_KIND_REGULAR ? 0 : kind == KERNEL_OPEN_FILE_KIND_SOCKET ? 1 : 3);
     COST_IO_ADD(0, 1); COST_IO_ADD(1, count);
+    if (description->device && description->device->discard_writes) {
+        size_t consumed=0;
+        int result=description->device->write(description->device_instance,kernel_task_current(),
+            options.flags,NULL,(size_t)count,&consumed);
+        if (consumed>count) return KERNEL_FILES_STATUS_STATE;
+        *linux_result=result && !consumed ? result : (int64_t)consumed;
+        COST_IO_ADD(2,consumed);
+        return KERNEL_FILES_STATUS_OK;
+    }
     /* Pipe copy owns its final pages; do not carry the device staging frame
      * through a file-backed user-page fault. */
     if (kind == KERNEL_OPEN_FILE_KIND_PIPE) {

@@ -165,6 +165,7 @@ int main(int argc, char **argv)
     struct kernel_vfs_file inherited_file={0};struct kernel_vfs_stat inherited_stat;
     assert(!kernel_vfs_create_at(directory,top,"inherited",0666,&inherited_file,077));
     assert(!kernel_vfs_fstat(&inherited_file,&inherited_stat));
+    assert((inherited_stat.mode & 0777)==0660);
     struct ext4_inode inherited_inode;
     assert(!ext4_fraw_inode_fill(lwext4_node_file(inherited_file.private_data),&inherited_inode));
     uint32_t extra=to_le32(inherited_inode.ctime_extra);
@@ -181,6 +182,11 @@ int main(int argc, char **argv)
     assert(!raw_result && inherited_size==sizeof(acl));
     int got=kernel_vfs_file_xattr(&subfile,KERNEL_XATTR_GET,KERNEL_ACL_DEFAULT,&user_acl,sizeof(user_acl),0);
     assert(got==(int)sizeof(user_acl));
+    assert(!kernel_vfs_file_xattr(&dirfile,KERNEL_XATTR_REMOVE,KERNEL_ACL_DEFAULT,NULL,0,0));
+    struct kernel_vfs_file removed_default={0};
+    assert(!kernel_vfs_create_at(directory,top,"removed-default",0666,&removed_default,077));
+    assert(!kernel_vfs_fstat(&removed_default,&empty_stat) && (empty_stat.mode & 0777)==0600);
+    assert(!kernel_vfs_close(&removed_default));
     assert(!kernel_vfs_close(&subfile) && !kernel_vfs_close(&dirfile));
     assert(!kernel_vfs_path_release(&sub) && !kernel_vfs_path_release(&directory) && !kernel_vfs_path_release(&top));
 Cleanup:

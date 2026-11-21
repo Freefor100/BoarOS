@@ -206,6 +206,7 @@ static struct ext4_delalloc_chunk *delalloc_find(struct ext4_delalloc *da, uint3
 static uint64_t delalloc_range(struct ext4_delalloc *da,uint64_t first,uint64_t last,bool clear)
 {
     if (first>=last) return 0;
+    da->fresh_extent=false;
     struct ext4_delalloc_chunk find={.key=first>>6};
     struct ext4_delalloc_chunk *chunk=RB_NFIND(ext4_delalloc_tree,&da->tree,&find);
     uint64_t count=0;
@@ -4370,7 +4371,11 @@ int ext4_file_reserve_write(ext4_file *file,uint64_t offset,size_t length,size_t
         *ready=length;
         return EOK;
     }
-    EXT4_MP_LOCK(file->mp);
+    /* Creation already initialized and published a valid empty extent root.
+     * On that inode, the I/O writer and space-counter guard suffice until a
+     * mapping change invalidates this fact through delalloc_range(). */
+    bool fresh_extent=stable_mapping && da->fresh_extent;
+    if (!fresh_extent) EXT4_MP_LOCK(file->mp);
     struct ext4_inode_ref ref;
     bool have_ref=false;
     int r=EOK;
@@ -4392,7 +4397,10 @@ int ext4_file_reserve_write(ext4_file *file,uint64_t offset,size_t length,size_t
         uint64_t holes=0;
         struct ext4_inode_block_range range={0};
         while (range.count<maximum && (known&1)) {range.count++;known>>=1;}
-        if (!range.count) {
+        if (!range.count && fresh_extent) {
+            range.count=maximum;
+            holes=delalloc_mask(bit,maximum);
+        } else if (!range.count) {
             if (!have_ref) {
                 r=ext4_fs_get_inode_ref_read(fs,file->inode,&ref);
                 if (r)break;
@@ -4496,7 +4504,7 @@ int ext4_file_reserve_write(ext4_file *file,uint64_t offset,size_t length,size_t
         *ready+=bytes;
     }
     int put=have_ref?ext4_fs_put_inode_ref(&ref):EOK;if(!r)r=put;
-    EXT4_MP_UNLOCK(file->mp);
+    if (!fresh_extent) EXT4_MP_UNLOCK(file->mp);
     return r;
 }
 void ext4_file_accept_reservation(ext4_file *file,struct file_write_reservation *ticket,uint64_t start,uint64_t accepted_end)

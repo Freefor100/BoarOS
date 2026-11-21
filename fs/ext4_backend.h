@@ -78,6 +78,7 @@ struct lwext4_node {
 
     struct ext4_delalloc delalloc;
     uint8_t capability_absent; /* Inode writer updates this after capability set/remove and killpriv. */
+    uint8_t default_acl_absent; /* Inode I/O qualification protects creation against ACL changes. */
     /* Basic attributes belong to this live inode. Completion of every actual
      * metadata mutation invalidates them under the existing timestamp lock. */
     struct kernel_vfs_stat metadata;

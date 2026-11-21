@@ -2232,7 +2232,14 @@ static int namespace_create_execute(struct lwext4_mount_adapter *adapter,struct 
         KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(parent,&io,0);
         kernel_vfs_creation_identity(parent->mode,parent->gid,&mode,&request->uid,&request->gid);
         if (request->type!=KERNEL_VFS_S_IFLNK) {
-            int error=ext4_acl_read(parent,KERNEL_ACL_DEFAULT,&def,&size);
+            struct lwext4_node *directory=(struct lwext4_node *)parent;
+            bool accepted_view=!kernel_io_context_inline()->ext4_operations;
+            int error=-KERNEL_ENODATA;
+            if (!accepted_view || !__atomic_load_n(&directory->default_acl_absent,__ATOMIC_RELAXED)) {
+                error=ext4_acl_read(parent,KERNEL_ACL_DEFAULT,&def,&size);
+                if (accepted_view && error==-KERNEL_ENODATA)
+                    __atomic_store_n(&directory->default_acl_absent,1,__ATOMIC_RELAXED);
+            }
             if (error==-KERNEL_ENODATA) mode &= ~request->umask;
             else if (error) result=-error;
             else {
@@ -2353,6 +2360,8 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
     node->attributes=ext4_inode_get_flags(&initial)&KERNEL_VFS_INODE_ATTRIBUTES;
     initialize_times(node, adapter, &initial);
     ((struct lwext4_node *)node)->capability_absent=1;
+    ((struct lwext4_node *)node)->delalloc.fresh_extent=type==KERNEL_VFS_S_IFREG &&
+        ext4_inode_has_flag(&initial,EXT4_INODE_FLAG_EXTENTS);
     node->unlinked = path == NULL;
     return kernel_vfs_publish_node(mount, node, file, 1);
 }
@@ -2495,6 +2504,9 @@ static int ext4_backend_xattr(struct kernel_vfs_node *node,enum kernel_xattr_ope
             result=kernel_acl_to_ext4(value,size,disk,length,&length);
             if (result) {kernel_heap_release(node->instance->heap,disk);return result;}
         }
+        struct lwext4_node *owner=(struct lwext4_node *)node;
+        /* An unsuccessful update can have reached metadata publication. */
+        if (!access) __atomic_store_n(&owner->default_acl_absent,0,__ATOMIC_RELAXED);
         result=lwext4_error(ext4_file_set_acl(file,index,disk,length,remove,
                                              access && op==KERNEL_XATTR_SET,mode));
         if (disk) kernel_heap_release(node->instance->heap,disk);

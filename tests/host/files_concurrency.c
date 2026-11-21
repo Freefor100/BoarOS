@@ -241,6 +241,10 @@ static void regular_file_domain(struct kernel_heap *heap)
 static unsigned allocated[4][192], group_ready, group_release;
 static _Thread_local unsigned fail_growth,fail_next_allocation,fail_bitmap;
 static unsigned maximum_copy, metadata_acquisitions;
+#ifdef PIPE_CONCURRENCY_CASES
+static _Thread_local struct kernel_raw_lock *measured_pipe_metadata;
+static _Thread_local unsigned pipe_metadata_acquisitions;
+#endif
 void *__real_memcpy(void *,const void *,size_t);
 void *__wrap_memcpy(void *dst,const void *src,size_t length)
 {
@@ -258,6 +262,9 @@ void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_r
 {
     if (lock->rank==KERNEL_RAW_RANK_OBJECT)
         __atomic_fetch_add(&metadata_acquisitions,1,__ATOMIC_RELAXED);
+#ifdef PIPE_CONCURRENCY_CASES
+    if (lock==measured_pipe_metadata) pipe_metadata_acquisitions++;
+#endif
     __real_kernel_raw_lock_acquire(lock,guard);
 }
 enum kernel_heap_status __real_kernel_heap_allocate_zeroed(struct kernel_heap *,size_t,size_t,void **);

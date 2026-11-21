@@ -3328,6 +3328,26 @@ enum kernel_task_status kernel_task_files_borrow(
     return KERNEL_TASK_STATUS_OK;
 }
 
+enum kernel_task_status kernel_task_file_io_borrow(
+    struct kernel_task *task,struct kernel_files **files,struct kernel_mm **mm)
+{
+    if (!task || !files || !mm) return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
+#if BOAROS_MAX_CPUS > 1
+    if (!task->arch.user_mode) {
+        enum kernel_task_status status=kernel_task_files_borrow(task,files);
+        return status ? status : kernel_task_mm_borrow_mutable(task,mm);
+    }
+#endif
+    enum kernel_task_status status=validate_task_resource_borrow(task);
+    if (status) return status;
+    if (task->mm.state!=KERNEL_MM_LIVE) return KERNEL_TASK_STATUS_STATE;
+    /* This operation does not reserve a descriptor. The allocation limit is
+     * sampled by the file-table entry points that can install a new FD. */
+    *files=&task->files;
+    *mm=&task->mm;
+    return KERNEL_TASK_STATUS_OK;
+}
+
 enum kernel_task_status kernel_task_fs_context_borrow(
     const struct kernel_task *task,
     const struct kernel_fs_context **fs)

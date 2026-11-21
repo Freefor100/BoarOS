@@ -126,7 +126,7 @@ enum arch_mmu_status arch_mmu_user_fork_commit_window(
 /* One base-leaf table. Transfer owned base-page references for returned
  * bits only, consuming the packed vector in increasing selected-bit order. */
 unsigned arch_mmu_user_map_owned_window(struct arch_mmu_user_space *, uint64_t,
-    unsigned, const uint64_t *, uint32_t);
+    unsigned, const uint64_t *, uint32_t, int cow);
 enum arch_mmu_status arch_mmu_user_mark_cow_page(struct arch_mmu_user_space *, uint64_t);
 enum arch_mmu_status arch_mmu_user_space_fork_prepare(
     struct arch_mmu_user_space *, struct arch_mmu_user_space *,
