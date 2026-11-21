@@ -33,6 +33,10 @@ int virtio_net_receive(struct virtio_net_device *d, struct virtio_net_frame *f)
 void netif_set_link_down(struct netif *n) { n->flags &= (u8_t)~NETIF_FLAG_LINK_UP; }
 void netif_set_link_up(struct netif *n) { n->flags |= NETIF_FLAG_LINK_UP; }
 void kernel_socket_network_failed(uint32_t address) { (void)address; errors++; }
+void kernel_socket_packet_ethernet(struct netif *n,const struct pbuf *p,
+    const void *data,uint16_t size,int outgoing)
+{ (void)n;(void)p;(void)data;(void)size;(void)outgoing; }
+void kernel_socket_packet_detach(struct netif *n) { (void)n; }
 struct kernel_socket_service_result kernel_socket_service_pending(struct kernel_socket_service_budget budget)
 {
     (void)budget;

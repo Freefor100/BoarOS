@@ -7,6 +7,7 @@ EXCLUDED(kernel_socket_destroy)
 EXCLUDED(kernel_socket_pair)
 EXCLUDED(kernel_socket_create)
 EXCLUDED(kernel_socket_accept)
+EXCLUDED(kernel_network_send_frame)
 EXCLUDED(kernel_epoll_create)
 EXCLUDED(kernel_socket_copy_read)
 #ifndef TCP_IO_CASES

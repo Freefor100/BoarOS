@@ -311,6 +311,7 @@ LWIP_SOURCES := \
 	third_party/lwip/src/netif/ethernet.c \
 	third_party/lwip/src/core/ipv4/etharp.c \
 	third_party/lwip/src/core/ipv4/icmp.c \
+	third_party/lwip/src/core/ipv4/igmp.c \
 	third_party/lwip/src/core/ipv4/ip4.c \
 	third_party/lwip/src/core/ipv4/ip4_addr.c \
 	third_party/lwip/src/core/ipv4/ip4_frag.c \

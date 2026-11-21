@@ -63,6 +63,12 @@ struct kernel_socket_address {
     union {
         uint8_t bytes[16];
         struct {
+            uint16_t link_type;
+            uint8_t link_packet_type, link_length;
+            uint8_t link_address[8];
+            uint8_t link_size;
+        };
+        struct {
             const unsigned char *unix_path;
             struct kernel_socket_name *unix_owner;
         };
@@ -165,11 +171,18 @@ void kernel_socket_protocol_snapshot(uint64_t values[KERNEL_SOCKET_PROTOCOL_VALU
 #define KERNEL_SOCKET_DOMAIN_INET 0U
 #define KERNEL_SOCKET_DOMAIN_UNIX 1U
 #define KERNEL_SOCKET_DOMAIN_NETLINK 2U
+#define KERNEL_SOCKET_DOMAIN_PACKET 3U
 
 #define KERNEL_SOCKET_AF_UNIX 1U
 #define KERNEL_SOCKET_AF_INET 2U
 #define KERNEL_SOCKET_AF_INET6 10U
 #define KERNEL_SOCKET_AF_NETLINK 16U
+#define KERNEL_SOCKET_AF_PACKET 17U
+struct netif;
+struct pbuf;
+void kernel_socket_packet_ethernet(struct netif *, const struct pbuf *,
+    const void *frame, uint16_t size, int outgoing);
+void kernel_socket_packet_detach(struct netif *);
 
 /* Imported names borrow syscall storage. Exported names own unix_owner until
  * address_release; queued UNIX messages retain their sending endpoint. */
@@ -236,6 +249,7 @@ enum kernel_socket_option {
     KERNEL_SOCKET_KEEPIDLE, KERNEL_SOCKET_KEEPINTVL, KERNEL_SOCKET_KEEPCNT,
     KERNEL_SOCKET_BROADCAST, KERNEL_SOCKET_IPV4_TTL, KERNEL_SOCKET_MULTICAST_TTL,
     KERNEL_SOCKET_IPV6_MULTICAST_HOPS, KERNEL_SOCKET_IPV6_MULTICAST_LOOP, KERNEL_SOCKET_IPV6_MULTICAST_ALL,
+    KERNEL_SOCKET_SNDBUFFORCE, KERNEL_SOCKET_IPV4_MULTICAST_LOOP, KERNEL_SOCKET_IPV4_MULTICAST_ALL,
 };
 /* Linux TCP_INFO ABI through snd_wnd (232 bytes). */
 struct kernel_socket_tcp_info {
@@ -261,6 +275,8 @@ int kernel_socket_set_bound_device(struct kernel_socket *, const char *name);
 /* length supplies user capacity and receives the actual name length. */
 int kernel_socket_get_bound_device(struct kernel_socket *, char name[16], uint32_t *length);
 /* address is network order; index zero selects by address or clears selection. */
+int kernel_socket_ipv4_membership(struct kernel_socket *, uint32_t group, uint32_t address,
+    uint32_t index, int remove);
 int kernel_socket_ipv6_membership(struct kernel_socket *, const uint8_t[16], uint32_t, int);
 int kernel_socket_set_ipv6_multicast_interface(struct kernel_socket *, uint32_t);
 int kernel_socket_get_ipv6_multicast_interface(struct kernel_socket *, uint32_t *);

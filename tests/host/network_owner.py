@@ -12,7 +12,7 @@ cases = ('unix-peer-identity', 'async-events', 'ipv4-address-shutdown', 'ipv4-ro
 cases += ('tcp-quota-notify', 'remote-quota-notify', 'remote-batch-writers', 'remote-direct', 'queued-completion')
 cases += ('tcp-loopback-checksum', 'tcp-detached', 'tcp-input-output', 'tcp-reset-receive-retry', 'raw-tcp-ingress')
 cases += ('tcp-more', 'tcp-cork')
-cases += ('ipv6-mld', 'ipv6-ra', 'ipv6-source-prefix', 'ipv6-global', 'ipv6-prepare-withdraw', 'ipv6-linklocal', 'raw-icmp-owner', 'raw-icmp-close', 'ipv4-options')
+cases += ('ipv6-mld', 'ipv6-ra', 'ipv6-source-prefix', 'ipv6-global', 'ipv6-prepare-withdraw', 'ipv6-linklocal', 'raw-icmp-owner', 'raw-icmp-close', 'ipv4-options', 'ipv4-igmp', 'packet-tap')
 smp_cases = ('tcp-owner-lookup', 'tcp-owner-placement')
 parser.add_argument('--case', choices=(*cases, *smp_cases, 'all'), action='append', help='repeat to share one host build; default: all')
 parser.add_argument('--sanitize', action='store_true')

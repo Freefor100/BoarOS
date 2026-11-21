@@ -80,7 +80,10 @@ static err_t link_output(struct netif *interface, struct pbuf *p)
             pbuf_ref(p);
             int result = virtio_net_send_segments(n->device, segments,
                                                              count, p);
-            if (result == 0) return ERR_OK;
+            if (result == 0) {
+                kernel_socket_packet_ethernet(interface,p,NULL,p->tot_len,1);
+                return ERR_OK;
+            }
             pbuf_free(p);
             if (result == -KERNEL_EAGAIN) { kernel_socket_network_blocked(); return ERR_MEM; }
             if (result != -KERNEL_ENOTSUP) return ERR_IF;
@@ -88,10 +91,24 @@ static err_t link_output(struct netif *interface, struct pbuf *p)
         }
     }
     int result = virtio_net_send_copy(n->device, p->tot_len, copy_pbuf, p);
+    if (result>=0) kernel_socket_packet_ethernet(interface,p,NULL,p->tot_len,1);
     /* 复制回退耗尽的仍是 NIC 槽；只等协议池归还会漏掉真实 TX 完成。 */
     if (result == -KERNEL_EAGAIN) { kernel_socket_network_blocked(); return ERR_MEM; }
     return result >= 0 ? ERR_OK : result == -KERNEL_EMSGSIZE ? ERR_BUF : ERR_IF;
 }
+int kernel_network_send_frame(struct netif *interface, const void *frame, uint16_t size)
+{
+    /* The protocol owner keeps the Ethernet attachment and device alive. */
+    if (interface->linkoutput != link_output) return -KERNEL_EOPNOTSUPP;
+    struct kernel_network *n=interface->state;
+    int result=virtio_net_send(n->device,frame,size);
+    if (result==-KERNEL_EAGAIN) {
+        kernel_socket_network_blocked();
+        return -KERNEL_ENOBUFS;
+    }
+    return result<0 ? result : 0;
+}
+
 static err_t ipv6_output(struct netif *interface,struct pbuf *p,const ip6_addr_t *destination)
 {
     /* IPv6 cannot use a sub-1280 link. Check before neighbor queue admission,
@@ -136,7 +153,8 @@ static err_t interface_init(struct netif *interface)
     interface->name[0] = 'e'; interface->name[1] = 't';
     interface->hwaddr_len = 6; memcpy(interface->hwaddr, n->device->mac, 6);
     interface->mtu = 1500;
-    interface->flags = NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP | NETIF_FLAG_ETHERNET | NETIF_FLAG_MLD6;
+    interface->flags = NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP | NETIF_FLAG_ETHERNET |
+        NETIF_FLAG_IGMP | NETIF_FLAG_MLD6;
     interface->output = etharp_output; interface->output_ip6 = ipv6_output;
     interface->linkoutput = link_output;
     return ERR_OK;
@@ -231,6 +249,7 @@ static void input_frame(struct kernel_network *n, struct virtio_net_frame *frame
 {
     struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
     const unsigned char *data = frame->data;
+    kernel_socket_packet_ethernet(&n->interface,NULL,data,(uint16_t)frame->size,0);
     int budgeted = (frame->size >= 34 && data[12] == 8 && data[13] == 0 && data[23] == 17) ||
         /* Extension-header traffic is conservatively budgeted too: it may
          * terminate in UDP. Direct TCP/ICMPv6 retain the control reserve. */
@@ -380,6 +399,7 @@ int kernel_network_stop(struct kernel_network **owner)
         struct kernel_socket_protocol_scope core; kernel_socket_protocol_enter(&core);
         ip4_reass_cleanup_netif(&n->interface);
         etharp_cleanup_netif(&n->interface);
+        kernel_socket_packet_detach(&n->interface);
         netif_set_down(&n->interface); netif_remove(&n->interface); n->attached = 0;
         kernel_socket_protocol_leave(&core);
     }

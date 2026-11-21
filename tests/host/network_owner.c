@@ -474,6 +474,10 @@ int virtio_net_send_copy(struct virtio_net_device *device, uint32_t size,
     ++copied_packets;
     return 0;
 }
+static int copy_test_frame(const void *source,void *destination,uint32_t size)
+{ memcpy(destination,source,size);return 1; }
+int virtio_net_send(struct virtio_net_device *device,const void *data,uint32_t size)
+{ return virtio_net_send_copy(device,size,copy_test_frame,data); }
 
 static struct model_socket_file *model_socket_file(const struct kernel_open_file_description *file)
 {
@@ -4189,6 +4193,116 @@ static void ipv6_ra(void)
     puts("PASS RA full-wire preflight/checksum/fragments, L/A, DAD, lifetimes, bounded coexistence, MTU and teardown");
 }
 
+static void inject_ipv4_group(struct netif *n,const ip4_addr_t *group)
+{
+    unsigned char frame[46]={
+        1,0,0x5e,1,2,3, 0x52,0x54,0,0x12,0x34,0x57, 0x08,0x00,
+        0x45,0,0,32,0,1,0,0,1,17,0,0, 10,77,0,3, 0,0,0,0,
+        0x4b,0x65,0x4b,0x64,0,12,0,0, 'b','o','a','r'
+    };
+    memcpy(frame+30,&group->addr,4);
+    uint16_t checksum=inet_chksum(frame+14,20);
+    memcpy(frame+24,&checksum,2);
+    struct pbuf *p=pbuf_alloc(PBUF_RAW,sizeof(frame),PBUF_RAM);
+    CHECK(p && !pbuf_take(p,frame,sizeof(frame)));
+    struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
+    CHECK(!ethernet_input(p,n));
+    kernel_socket_protocol_leave(&scope);
+}
+
+static void ipv4_igmp(void)
+{
+    kernel_socket_network_initialize();
+    struct virtio_net_device device={.mac={0x52,0x54,0,0x12,0x34,0x56}};
+    struct kernel_network network={.device=&device};
+    struct netif *n=&network.interface;
+    ip4_addr_t local={lwip_htonl(0x0a4d0002)},mask={lwip_htonl(0xffffff00)},zero={0};
+    CHECK(netif_add(n,&local,&mask,&zero,&network,interface_init,ethernet_input));
+    netif_set_up(n);netif_set_link_up(n);
+    unsigned index=netif_get_index(n);
+    struct kernel_socket *a=NULL,*b=NULL;
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,0,&a));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,0,&b));
+    CHECK(!kernel_socket_set_option(a,KERNEL_SOCKET_REUSEADDR,1));
+    CHECK(!kernel_socket_set_option(b,KERNEL_SOCKET_REUSEADDR,1));
+    struct kernel_socket_address any={.family=KERNEL_SOCKET_AF_INET,.port=19300};
+    CHECK(!kernel_socket_bind(a,&any) && !kernel_socket_bind(b,&any));
+    CHECK(!kernel_socket_set_option(b,KERNEL_SOCKET_IPV4_MULTICAST_ALL,0));
+    ip4_addr_t group={lwip_htonl(0xef010203)};
+    inject_ipv4_group(n,&group);
+    CHECK(!a->rx_bytes && !b->rx_bytes);
+    heap_fail_after=1;
+    CHECK(kernel_socket_ipv4_membership(a,group.addr,0,index,0)==-KERNEL_ENOBUFS);
+    CHECK(!a->ipv4_members && !igmp_lookfor_group(n,&group));
+    CHECK(!kernel_socket_ipv4_membership(a,group.addr,0,index,0));
+    CHECK(captured_size>=46 && captured[12]==8 && captured[13]==0 && captured[23]==2);
+    unsigned message=14+(captured[14]&15)*4U;
+    CHECK(captured_size>=message+8 && captured[message]==0x16 &&
+        !memcmp(captured+message+4,&group.addr,4));
+    CHECK(igmp_lookfor_group(n,&group)->use==1);
+    inject_ipv4_group(n,&group);
+    CHECK(a->rx_bytes==4 && !b->rx_bytes);
+    raw_drain(a);
+    CHECK(!kernel_socket_ipv4_membership(b,group.addr,local.addr,0,0));
+    inject_ipv4_group(n,&group);
+    CHECK(a->rx_bytes==4 && b->rx_bytes==4 &&
+        a->packets_head->payload==b->packets_head->payload &&
+        a->packets_head->payload->ref==2);
+    kernel_socket_destroy(a);
+    CHECK(igmp_lookfor_group(n,&group)->use==1 && b->packets_head->payload->ref==1);
+    raw_drain(b);
+    CHECK(!kernel_socket_ipv4_membership(b,group.addr,0,index,1));
+    CHECK(!igmp_lookfor_group(n,&group));
+    CHECK(captured[23]==2 && captured[14+(captured[14]&15)*4U]==0x17);
+    CHECK(!kernel_socket_ipv4_membership(b,group.addr,0,0,0)); /* Default multicast interface. */
+    netif_remove(n);
+    CHECK(!b->ipv4_members);
+    kernel_socket_destroy(b);
+    CHECK(!heap_live);
+    puts("PASS IPv4 IGMP: Ethernet reports, joined input, independent queues, failure and release");
+}
+
+static void packet_tap_contract(void)
+{
+    kernel_socket_network_initialize();
+    struct virtio_net_device device={.mac={0x52,0x54,0,0x12,0x34,0x56}};
+    struct kernel_network network={.device=&device};
+    struct netif *n=&network.interface;
+    ip4_addr_t zero={0};
+    CHECK(netif_add(n,&zero,&zero,&zero,&network,interface_init,ethernet_input));
+    netif_set_up(n);
+    struct kernel_socket *raw=NULL,*cooked=NULL,*other=NULL;
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_PACKET,SOCKET_RAW,0,&raw));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_PACKET,SOCKET_DGRAM,0,&cooked));
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_PACKET,SOCKET_RAW,0,&other));
+    struct kernel_socket_address addr={.family=KERNEL_SOCKET_AF_PACKET,
+        .port=0x88b5,.scope=netif_get_index(n)};
+    CHECK(!kernel_socket_bind(raw,&addr) && !kernel_socket_bind(cooked,&addr));
+    addr.scope=netif_get_index(loopback_netif());
+    CHECK(!kernel_socket_bind(other,&addr));
+    unsigned char frame[32]={0};
+    memcpy(frame,device.mac,6);
+    frame[6]=0xaa;frame[12]=0x88;frame[13]=0xb5;frame[14]=0xab;
+    cooked->rx_limit=packet_charge(sizeof(frame)-PACKET_ETH_HEADER);
+    kernel_socket_packet_ethernet(n,NULL,frame,sizeof(frame),0);
+    CHECK(raw->rx_bytes==sizeof(frame) && cooked->rx_bytes==sizeof(frame)-PACKET_ETH_HEADER);
+    CHECK(!other->packets_head);
+    CHECK(raw->packets_head->address.link_packet_type==PACKET_HOST &&
+        raw->packets_head->address.link_address[0]==0xaa);
+    kernel_socket_packet_ethernet(n,NULL,frame,sizeof(frame),0);
+    CHECK(raw->packets_head->next && !cooked->packets_head->next);
+    frame[14]=0xff;
+    CHECK(raw->packets_head->data[14]==0xab && cooked->packets_head->data[0]==0xab);
+    struct kernel_socket_protocol_scope protocol;kernel_socket_protocol_enter(&protocol);
+    kernel_socket_packet_detach(n);
+    netif_remove(n);
+    kernel_socket_protocol_leave(&protocol);
+    CHECK(raw->pending_error==-KERNEL_ENODEV && raw->packet_index==UINT32_MAX);
+    kernel_socket_destroy(raw);kernel_socket_destroy(cooked);kernel_socket_destroy(other);
+    CHECK(!packet_taps_active() && !heap_live);
+    puts("PASS AF_PACKET Ethernet tap: filters, independent frame ownership, quota and detach");
+}
+
 static struct kernel_socket *mld_socket(unsigned port)
 {
     struct kernel_socket *s=NULL;CHECK(!kernel_socket_create(&test_heap,10,SOCKET_DGRAM,0,&s));
@@ -4734,6 +4848,8 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "ipv6-ra")) ipv6_ra();
     else if (!strcmp(argv[1], "ipv6-mld")) ipv6_mld();
     else if (!strcmp(argv[1], "ipv4-options")) ipv4_options();
+    else if (!strcmp(argv[1], "ipv4-igmp")) ipv4_igmp();
+    else if (!strcmp(argv[1], "packet-tap")) packet_tap_contract();
     else if (!strcmp(argv[1], "async-events")) async_events();
     else if (!strcmp(argv[1], "unix-seq-records")) unix_seqpacket_records();
     else if (!strcmp(argv[1], "ipv4-route")) ipv4_route_output();
