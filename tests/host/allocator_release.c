@@ -56,7 +56,7 @@ struct test_page_metadata {
     uint32_t reference_count;
     uint8_t order;
     uint8_t state;
-    uint16_t reserved;
+    uint16_t cache_state;
 };
 
 struct test_page_root {
@@ -427,7 +427,7 @@ static void check_release_diagnostic(unsigned int which, const char *diagnostic,
         (void)diagnostic_number(diagnostic, "references=");
         (void)diagnostic_number(diagnostic, "next=");
         (void)diagnostic_number(diagnostic, "previous=");
-        (void)diagnostic_number(diagnostic, "reserved=");
+        (void)diagnostic_number(diagnostic, "cache_state=");
     } else {
         assert(diagnostic_field(diagnostic, "page_index=") == 0);
         assert(diagnostic_field(diagnostic, "state=") == 0);

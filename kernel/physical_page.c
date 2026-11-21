@@ -40,7 +40,7 @@ struct physical_page_metadata {
     uint32_t reference_count;
     uint8_t order;
     uint8_t state;
-    uint16_t reserved;
+    uint16_t cache_state;
 };
 
 struct physical_page_root
@@ -295,8 +295,8 @@ static void physical_page_release_fatal(
         release_diagnostic_hex(metadata->next);
         release_diagnostic_text(" previous=");
         release_diagnostic_hex(metadata->previous);
-        release_diagnostic_text(" reserved=");
-        release_diagnostic_hex(metadata->reserved);
+        release_diagnostic_text(" cache_state=");
+        release_diagnostic_hex(__atomic_load_n(&metadata->cache_state,__ATOMIC_RELAXED));
     }
     kernel_console_putc('\n');
     __builtin_trap();
@@ -757,16 +757,66 @@ static int head_valid(const struct physical_page_allocator *a, const struct budd
 {
     const struct physical_page_metadata *m = &a->metadata[owner->first];
     page_checked(work);
-    if (m->order != owner->order || m->reserved)
+    if (m->order != owner->order)
         return 0;
     if (owner->state == BUDDY_FREE)
-        return m->state == PHYSICAL_PAGE_STATE_FREE_HEAD && !m->reference_count;
+        return m->state == PHYSICAL_PAGE_STATE_FREE_HEAD && !m->reference_count && !m->cache_state;
     if (m->next != PHYSICAL_PAGE_INDEX_NONE || m->previous != PHYSICAL_PAGE_INDEX_NONE)
         return 0;
     if (owner->state == BUDDY_INTERNAL)
-        return m->state == PHYSICAL_PAGE_STATE_INTERNAL && !m->reference_count;
+        return m->state == PHYSICAL_PAGE_STATE_INTERNAL && !m->reference_count && !m->cache_state;
     return owner->state == BUDDY_ALLOCATED && m->state == PHYSICAL_PAGE_STATE_ALLOCATED_HEAD &&
            m->reference_count;
+}
+
+/* Linux's stable /proc/kpageflags bit positions. The cache owns the mutable
+ * bits; allocator state is sampled independently under its existing lock. */
+enum { PAGE_FLAG_DIRTY = 1U << 4, PAGE_FLAG_WRITEBACK = 1U << 8, PAGE_FLAG_BUDDY = 1U << 10 };
+
+void physical_page_publish_cache_state(struct physical_page_allocator *allocator,
+    uint64_t address, int dirty, int writeback)
+{
+    uint32_t index;
+    if (!page_lookup(allocator,address,NULL,&index)) __builtin_trap();
+    struct physical_page_metadata *page=&allocator->metadata[index];
+    if (page->state!=PHYSICAL_PAGE_STATE_ALLOCATED_HEAD || page->order) __builtin_trap();
+    uint16_t flags=(dirty ? PAGE_FLAG_DIRTY : 0) | (writeback ? PAGE_FLAG_WRITEBACK : 0);
+    __atomic_store_n(&page->cache_state,flags,__ATOMIC_RELAXED);
+}
+
+unsigned physical_page_flags_snapshot(struct physical_page_allocator *allocator,
+    uint64_t first_frame, uint64_t *output, unsigned count)
+{
+    if (!physical_page_allocator_is_finalized(allocator) || !allocator->range_count) return 0;
+    uint64_t limit=allocator->ranges[allocator->range_count-1].end>>BOAROS_PAGE_SHIFT;
+    if (first_frame>=limit) return 0;
+    if (count>PHYSICAL_PAGE_REFERENCE_BATCH_MAX) count=PHYSICAL_PAGE_REFERENCE_BATCH_MAX;
+    if (count>limit-first_frame) count=(unsigned)(limit-first_frame);
+    KERNEL_RAW_SCOPE(guard,&allocator->lock);
+    const struct physical_page_root *root=NULL;
+    uint64_t root_end=0;
+    for (unsigned i=0; i<count; ++i) {
+        uint64_t address=(first_frame+i)<<BOAROS_PAGE_SHIFT;
+        if (address>=root_end) {
+            root=root_for_address(allocator,address,NULL);
+            root_end=root ? root->address+(order_page_count(root->order)<<BOAROS_PAGE_SHIFT) : 0;
+        }
+        output[i]=0;
+        if (!root) continue;
+        uint32_t index=root->first_page_index+(uint32_t)((address-root->address)>>BOAROS_PAGE_SHIFT);
+        const struct physical_page_metadata *page=&allocator->metadata[index];
+        if (page->state==PHYSICAL_PAGE_STATE_ALLOCATED_HEAD && !page->order) {
+            struct buddy_owner owner;
+            if (!owner_walk(allocator,root,index,&owner,NULL)) __builtin_trap();
+            if (owner.state==BUDDY_ALLOCATED && owner.first==index && !owner.order)
+                output[i]=__atomic_load_n(&page->cache_state,__ATOMIC_RELAXED);
+        } else if (page->state==PHYSICAL_PAGE_STATE_FREE_HEAD) {
+            struct buddy_owner owner;
+            if (!owner_walk(allocator,root,index,&owner,NULL)) __builtin_trap();
+            if (owner.state==BUDDY_FREE && owner.first==index) output[i]=PAGE_FLAG_BUDDY;
+        }
+    }
+    return count;
 }
 
 /* The order list locates an exact buddy node. Under the allocator lock,

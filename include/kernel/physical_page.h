@@ -116,6 +116,13 @@ enum physical_page_status physical_page_allocator_audit(
 int physical_page_allocator_is_finalized(
     const struct physical_page_allocator *allocator);
 
+/* Page-cache transitions are serialized by the entry's cache protection.
+ * Its order-zero page reference excludes free/reuse throughout publication. */
+void physical_page_publish_cache_state(struct physical_page_allocator *,
+    uint64_t address, int dirty, int writeback);
+unsigned physical_page_flags_snapshot(struct physical_page_allocator *,
+    uint64_t first_frame, uint64_t *output, unsigned count);
+
 enum physical_page_status physical_page_allocator_set_reclaimer(
     struct physical_page_allocator *allocator,
     const struct physical_page_reclaim_hooks *hooks);

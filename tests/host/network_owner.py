@@ -12,7 +12,7 @@ cases = ('unix-peer-identity', 'async-events', 'ipv4-address-shutdown', 'ipv4-ro
 cases += ('tcp-quota-notify', 'remote-quota-notify', 'remote-batch-writers', 'remote-direct', 'queued-completion')
 cases += ('tcp-loopback-checksum', 'tcp-detached', 'tcp-input-output', 'tcp-reset-receive-retry', 'raw-tcp-ingress')
 cases += ('tcp-more', 'tcp-cork')
-cases += ('ipv6-mld', 'ipv6-ra', 'ipv6-source-prefix', 'ipv6-global', 'ipv6-prepare-withdraw', 'ipv6-linklocal', 'raw-icmp-owner', 'raw-icmp-close', 'ipv4-options', 'ipv4-igmp', 'packet-tap')
+cases += ('ipv6-mld', 'ipv6-ra', 'ipv6-source-prefix', 'ipv6-global', 'ipv6-prepare-withdraw', 'ipv6-linklocal', 'raw-icmp-owner', 'raw-icmp-close', 'ipv4-options', 'ipv4-igmp', 'packet-tap', 'packet-ring')
 smp_cases = ('tcp-owner-lookup', 'tcp-owner-placement')
 parser.add_argument('--case', choices=(*cases, *smp_cases, 'all'), action='append', help='repeat to share one host build; default: all')
 parser.add_argument('--sanitize', action='store_true')
@@ -30,7 +30,7 @@ with tempfile.TemporaryDirectory(prefix='boaros-network-owner-') as directory:
                '-ffunction-sections', '-fdata-sections', '-Wl,--gc-sections',
                '-DBOAROS_MAX_CPUS=2', f'-DBOAROS_PAGE_SHIFT={args.page_shift}', '-DBOAROS_COST_DIAGNOSTICS=1', '-Itests/host/random', '-idirafter', 'include',
                '-idirafter', 'net/lwip_port/include', '-Ithird_party/lwip/src/include', '-I' + str(work),
-               'tests/host/network_owner.c','kernel/raw_lock.c','tests/host/cpu_context.c','-Wl,--wrap=netif_get_by_index,--wrap=kernel_raw_lock_acquire,--wrap=kernel_bpf_program_get,--wrap=kernel_bpf_program_put,--wrap=kernel_bpf_filter', *sources, '-o', str(program)]
+               'tests/host/network_owner.c','kernel/raw_lock.c','kernel/physical_page.c','net/packet_ring.c','tests/host/cpu_context.c','-Wl,--wrap=netif_get_by_index,--wrap=kernel_raw_lock_acquire,--wrap=kernel_bpf_program_get,--wrap=kernel_bpf_program_put,--wrap=kernel_bpf_filter', *sources, '-o', str(program)]
     if args.sanitize: command += ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']
     selected = (*cases, *smp_cases) if not args.case or 'all' in args.case else args.case
     ordinary = [case for case in selected if case not in smp_cases]

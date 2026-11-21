@@ -69,6 +69,7 @@ const struct kernel_credentials *kernel_credentials_current(void){return NULL;}
 const struct kernel_credentials *kernel_credentials_get(const struct kernel_credentials *cred){assert(!cred);return NULL;}
 struct kernel_namespace *kernel_task_ipc_namespace(void){return &ipc;}
 int kernel_procfs_ipc_file(const struct kernel_vfs_file *f){(void)f;return 1;}
+int kernel_procfs_kpageflags_file(const struct kernel_vfs_file *f){(void)f;return 0;}
 int kernel_procfs_pagemap_open(const struct kernel_vfs_file *f, struct kernel_heap *heap,
     struct kernel_mm_pagemap **view)
 { (void)f; (void)heap; (void)view; return 0; }

@@ -39,8 +39,10 @@ EXCLUDED(kernel_elf64_source_run_at)
 #if BOAROS_MAX_CPUS == 1
 EXCLUDED(kernel_task_mm_borrow)
 #endif
-EXCLUDED(kernel_task_read_bytes)
-EXCLUDED(kernel_task_account_fault)
+uint64_t kernel_task_read_bytes(const struct kernel_task *task)
+{ (void)task;mm_file_unavailable();__builtin_unreachable(); }
+void kernel_task_account_fault(struct kernel_task *task,int major)
+{ (void)task;(void)major;mm_file_unavailable(); }
 #ifndef MM_TEST_EPOLL
 EXCLUDED(kernel_epoll_notify_file_release)
 EXCLUDED(kernel_epoll_destroy)

@@ -59,8 +59,10 @@ static int map_view(struct kernel_mm *mm,struct kernel_open_file_description *fi
     KERNEL_LOCK_SCOPE(lock);uint64_t *counter=NULL,out;
     int error=kernel_bpf_mmap_begin(file,offset,length,!!(permissions&KERNEL_MM_WRITE),&lock,&counter);
     if (error) return error;
+    struct kernel_mm_mapped_object object={kernel_bpf_mmap_page,counter,
+        !!(permissions&KERNEL_MM_WRITE)};
     enum kernel_mm_status status=kernel_mm_mmap_object_shared(mm,file,address,length,offset,
-        permissions,KERNEL_MM_MAP_SHARED|KERNEL_MM_MAP_FIXED,counter,&out);
+        permissions,KERNEL_MM_MAP_SHARED|KERNEL_MM_MAP_FIXED,&object,&out);
     if (!status) assert(out==address);
     return status;
 }
@@ -197,8 +199,9 @@ static void *admission_worker(void *argument)
     mm_test_attach(1);mm_test_context=parent_context;
     KERNEL_LOCK_SCOPE(admission);uint64_t *counter=NULL,out;
     assert(!kernel_bpf_mmap_begin(pin,0,P,1,&admission,&counter));
+    struct kernel_mm_mapped_object object={kernel_bpf_mmap_page,counter,1};
     assert(!kernel_mm_mmap_object_shared(&parent,pin,A,P,0,RW,
-        KERNEL_MM_MAP_SHARED|KERNEL_MM_MAP_FIXED,counter,&out));
+        KERNEL_MM_MAP_SHARED|KERNEL_MM_MAP_FIXED,&object,&out));
     __atomic_store_n(&entered,1,__ATOMIC_RELEASE);
     while (!__atomic_load_n(&resume,__ATOMIC_ACQUIRE)) sched_yield();
     /* The VMA and FD were removed by the other actor. The calling pin still

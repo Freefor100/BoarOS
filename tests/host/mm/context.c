@@ -12,6 +12,8 @@ __attribute__((weak)) void kernel_proc_view_release(struct kernel_pid_registry *
 { (void)view;assert(!"PID view is outside this fixture"); }
 __attribute__((weak)) int kernel_procfs_ipc_file(const struct kernel_vfs_file *file)
 { (void)file;return 0; }
+__attribute__((weak)) int kernel_procfs_kpageflags_file(const struct kernel_vfs_file *file)
+{ (void)file;return 0; }
 __attribute__((weak)) int kernel_procfs_pagemap_open(const struct kernel_vfs_file *file,
     struct kernel_heap *heap, struct kernel_mm_pagemap **view)
 { (void)file; (void)heap; (void)view; return 0; }

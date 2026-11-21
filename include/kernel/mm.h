@@ -330,12 +330,21 @@ enum kernel_mm_status kernel_mm_validate_file_private_mapping(
     uint32_t permissions,
     uint32_t flags);
 
-/* The caller retains its OFD pin through admission-lock release. The MM
- * acquires a separate source owner; write_bytes is owned by that object. */
+/* Supply references to already allocated pages under the object's mmap
+ * admission guard. The virtual area accounts all its bytes to mapping_bytes
+ * when supplied. The source keeps the file description and counter alive. */
+struct kernel_mm_mapped_object {
+    int (*acquire_page)(struct kernel_open_file_description *, uint64_t offset,
+        int writable, uint64_t *physical);
+    uint64_t *mapping_bytes;
+    int may_write;
+};
+
+/* The caller retains its own file reference through admission-lock release. */
 enum kernel_mm_status kernel_mm_mmap_object_shared(struct kernel_mm *,
     struct kernel_open_file_description *, uint64_t hint, uint64_t length,
     uint64_t offset, uint32_t permissions, uint32_t flags,
-    uint64_t *write_bytes, uint64_t *address);
+    const struct kernel_mm_mapped_object *, uint64_t *address);
 
 /* Success consumes *file; failure leaves the caller's OFD reference intact. */
 enum kernel_mm_status kernel_mm_mmap_file_private(

@@ -184,6 +184,27 @@ void kernel_socket_packet_ethernet(struct netif *, const struct pbuf *,
     const void *frame, uint16_t size, int outgoing);
 void kernel_socket_packet_detach(struct netif *);
 
+#define KERNEL_PACKET_RX_RING 5U
+#define KERNEL_PACKET_STATISTICS 6U
+#define KERNEL_PACKET_VERSION 10U
+#define KERNEL_PACKET_HDRLEN 11U
+#define KERNEL_PACKET_RESERVE 12U
+struct kernel_socket_packet_ring_request {
+    uint32_t block_size, block_count, frame_size, frame_count;
+    uint32_t timeout_ms, private_bytes, features;
+};
+int kernel_socket_packet_option_set(struct kernel_socket *, unsigned option, int value);
+int kernel_socket_packet_option_get(struct kernel_socket *, unsigned option, uint32_t selection,
+    uint32_t values[3], unsigned *count);
+int kernel_socket_packet_ring_configure(struct kernel_socket *,
+    const struct kernel_socket_packet_ring_request *);
+/* Success retains the configuration guard until mapping publication completes.
+ * A published mapping holds the socket file and charges mapped bytes. */
+int kernel_socket_packet_ring_mmap_begin(struct kernel_socket *, uint64_t offset,
+    uint64_t aligned_length, struct kernel_lock_guard *, uint64_t **mapped_bytes);
+int kernel_socket_packet_ring_mmap_page(struct kernel_socket *, uint64_t offset,
+    uint64_t *physical);
+
 /* Imported names borrow syscall storage. Exported names own unix_owner until
  * address_release; queued UNIX messages retain their sending endpoint. */
 void kernel_socket_address_release(struct kernel_socket_address *address);

@@ -22,6 +22,14 @@
 任务使用者后，页表和映射照常回收，旧描述符读到文件末尾；成功执行新程序与进程编号复用均不会
 更换旧描述符的目标。
 
+`/proc/kpageflags` 是属主可读的系统级二进制文件。用物理页帧编号乘以八得到字节偏移，
+读取长度和偏移均以八字节对齐。文件缓存页的 `KPF_DIRTY` 表示仍有待写回的修改，
+`KPF_WRITEBACK` 表示页缓存写回正在执行。`MAP_SHARED` 的写入与普通文件写入共同更新
+脏页状态，通过 `msync(MS_SYNC)` 成功写回后清除已同步的脏状态，写回失败时保留脏状态。
+`KPF_BUDDY` 仅标记实际在伙伴分配器空闲链中的块首。当前仅输出这三个标志，
+物理地址空洞输出零，读到最高受管页帧之后返回文件末尾。该文件和 `pagemap` 共用分批读出机制，
+填充记录和向用户空间复制分开执行。
+
 路径解析把本地 PID/TID 转为 canonical root 编号及全局 allocation generation，inode 保存后两者。后续 maps、fd、ns、comm 等资源查询继续检查这个 generation、任务资源状态和当前权限，不把 inode 中的编号解释成当前读取者的本地号。根目录和 task 目录按挂载视图的 PID bitmap 枚举，名字与 continuation cookie 使用本地号；不扫描全局任务或逐个遍历祖先。self/thread-self 也按同一挂载转换，读取者不可见时返回 ENOENT。
 
 stat/status 在 identity 锁内捕获 PID/TGID/PPID/PGID/SID 与 tracer 的 TID，外层身份在内层不可见时显示 0。NSpid/NStgid/NSpgid/NSsid 从挂载层列到任务 active 层。pidfd fdinfo 持有原 FD 的真实身份，在挂载视图中显示 Pid 与 NSpid；跨兄弟视图显示单个 0，任务已不存在显示 -1，不能用历史整数重新查找。快照的可睡眠阶段只使用已捕获的 PID 标量；资源引用与权限仍按原 proc 规则复核。

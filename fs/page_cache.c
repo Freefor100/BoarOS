@@ -885,11 +885,18 @@ static uint64_t dirty_block_range(size_t block,size_t begin,size_t end)
     return mask&~((UINT64_C(1)<<first)-1);
 }
 #endif
+static void publish_cache_page_state(struct kernel_page_cache_entry *entry)
+{
+    physical_page_publish_cache_state(entry->cache->allocator,entry->physical_address,
+        entry->dirty_end!=0,entry->writeback);
+}
+
 static void dirty_mark(struct kernel_page_cache_entry *entry, size_t begin, size_t end)
 {
     if (begin>=end || end>BOAROS_PAGE_SIZE) __builtin_trap();
     struct kernel_page_cache_record *r=entry->cache->record;
-    if (!entry->dirty_end) {
+    int first_dirty=!entry->dirty_end;
+    if (first_dirty) {
 #if BOAROS_PAGE_CACHE_DIRTY_AGE
         if (!r->dirty_pages) {
             r->dirty_deadline=dirty_deadline();
@@ -913,6 +920,7 @@ static void dirty_mark(struct kernel_page_cache_entry *entry, size_t begin, size
         entry->dirty_begin=begin;
     } else if (begin<entry->dirty_begin) entry->dirty_begin=begin;
     if (end>entry->dirty_end) entry->dirty_end=end;
+    if (first_dirty) publish_cache_page_state(entry);
 #if BOAROS_PAGE_CACHE_DIRTY_BLOCKS
     size_t block=dirty_block_size(entry);
     if (block) entry->dirty_blocks|=dirty_block_range(block,begin,end);
@@ -952,6 +960,7 @@ static void dirty_clear(struct kernel_page_cache_entry *entry)
         dirty->queue_next=dirty->queue_previous=NULL;
     }
     entry->dirty_begin=entry->dirty_end=0;
+    publish_cache_page_state(entry);
 #if BOAROS_PAGE_CACHE_DIRTY_BLOCKS
     entry->dirty_blocks=0;
 #endif
@@ -3216,6 +3225,7 @@ static int complete_writeback(struct kernel_page_cache *cache,
     }
     if (!entry->writeback || !cache->record->writeback_active) __builtin_trap();
     entry->writeback_error=result;entry->writeback=0;cache->record->writeback_active--;
+    publish_cache_page_state(entry);
     cache_wake(&entry->ready);
     /* 旧版本完成后只通知真实剩余工作；错误仍由原owner保留。 */
     if (!result && cache->record->started && !cache->record->stopping &&
@@ -3274,6 +3284,7 @@ static void writeback_unprepare(struct kernel_page_cache *cache,
           if (!(previous&CACHE_WRITES_CLOSED)) __builtin_trap();
       }
       entry->writeback=0; cache->record->writeback_active--;
+      publish_cache_page_state(entry);
       cache_wake(&entry->ready); }
 }
 
@@ -3323,6 +3334,7 @@ static int qualify_writeback_locked(struct kernel_page_cache *cache,
     }
     if (background) entry->retry_blocked=1;
     prepared->closed=1;entry->writeback=1;cache->record->writeback_active++;
+    publish_cache_page_state(entry);
     if (slow) { slow->aliases=entry->aliases; alias_borrow(slow->aliases); }
     return 0;
 }

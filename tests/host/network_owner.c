@@ -5,6 +5,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <kernel/random.h>
+#include <kernel/physical_page.h>
 #include <kernel/raw_lock.h>
 #include <kernel/wait_internal.h>
 #include "lwip/inet_chksum.h"
@@ -161,6 +162,10 @@ struct kernel_cost_scope kernel_cost_enter(enum kernel_cost_metric metric) {retu
 void kernel_cost_leave(struct kernel_cost_scope *scope) {(void)scope;}
 void kernel_cost_raw_lock(struct kernel_cost_tag tag,unsigned rank,uint64_t wait,uint64_t hold)
 {(void)tag;(void)rank;(void)wait;(void)hold;}
+void kernel_cost_page_metadata(struct kernel_cost_tag tag,uint64_t checked,uint64_t written,uint64_t elapsed)
+{(void)tag;(void)checked;(void)written;(void)elapsed;}
+void kernel_cost_add_io(unsigned offset,uint64_t value) { (void)offset;(void)value; }
+void kernel_console_putc(char byte) { fputc((unsigned char)byte,stderr); }
 
 void kernel_cost_add(enum kernel_cost_metric metric,uint64_t value)
 { if (metric==COST_NETWORK_SERVICE_CALLS) protocol_services+=(unsigned)value; }
@@ -173,6 +178,7 @@ static unsigned unix_credit_copy_observed;
 static unsigned heap_live, dma_eligible, nic_full, copy_attempts, copied_packets, segment_attempts, captured_size;
 static void (*heap_release_once)(void *);
 static uint64_t clock_ns = 1000000000ULL;
+uint64_t kernel_time_realtime_ns(void) { return clock_ns; }
 static unsigned char captured[1536],captured_dad_target[16];
 static unsigned captured_dad_packets,captured_router_probes,captured_non_mld_packets;
 static unsigned fixed_random;
@@ -226,6 +232,8 @@ void kernel_rwlock_init(struct kernel_rwlock *lock, uint32_t rank, uintptr_t key
 static pthread_mutex_t model_mutex=PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t model_rights_mutex=PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t model_unix_mutex=PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t model_packet_mutex=PTHREAD_MUTEX_INITIALIZER;
+static struct kernel_rwlock *packet_test_configuration_lock;
 #if BOAROS_USER_SMP
 static pthread_mutex_t model_ip_mutex=PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t model_tcp_mutex[BOAROS_MAX_CPUS-1];
@@ -242,6 +250,7 @@ static pthread_mutex_t *model_lock(struct kernel_rwlock *lock)
 {
     if(lock==&protocol_mutex.lock)return &model_mutex;
     if(lock==&rights_mutex.lock)return &model_rights_mutex;
+    if(lock==packet_test_configuration_lock)return &model_packet_mutex;
 #if BOAROS_USER_SMP
     if(lock->rank==27)return &model_ip_mutex;
     for (unsigned i=1;i<BOAROS_MAX_CPUS;i++)
@@ -4262,6 +4271,70 @@ static void ipv4_igmp(void)
     puts("PASS IPv4 IGMP: Ethernet reports, joined input, independent queues, failure and release");
 }
 
+static void *packet_test_page(uint64_t address)
+{ return (void *)(uintptr_t)address; }
+
+static void packet_ring_contract(void)
+{
+    static _Alignas(BOAROS_PAGE_SIZE) unsigned char backing[32 * BOAROS_PAGE_SIZE];
+    struct physical_page_allocator allocator={0};
+    struct boot_memory_layout layout={.usable_count=1,.usable={{(uintptr_t)backing,sizeof(backing)}}};
+    CHECK(!physical_page_allocator_init(&allocator,&layout));
+    CHECK(!physical_page_allocator_bind_access(&allocator,packet_test_page));
+    CHECK(!physical_page_allocator_finalize(&allocator));
+    uint64_t free_pages=physical_page_available(&allocator);
+    test_heap.page_allocator=&allocator;
+    kernel_socket_network_initialize();
+    struct netif *interface=loopback_netif();
+    CHECK(interface);
+    struct kernel_socket *socket=NULL;
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_PACKET,SOCKET_RAW,0,&socket));
+    packet_test_configuration_lock=&socket->packet_options->configuration.lock;
+    CHECK(!kernel_socket_packet_option_set(socket,KERNEL_PACKET_VERSION,PACKET_VERSION_V3));
+    struct kernel_socket_packet_ring_request req={
+        .block_size=BOAROS_PAGE_SIZE*2,.block_count=1,
+        .frame_size=BOAROS_PAGE_SIZE*2,.frame_count=1,.timeout_ms=8,.private_bytes=32
+    };
+    CHECK(!kernel_socket_packet_ring_configure(socket,&req));
+    CHECK(physical_page_available(&allocator)+2==free_pages);
+    struct kernel_lock_guard mapping={0};
+    uint64_t physical,*mapped_bytes;
+    CHECK(!kernel_socket_packet_ring_mmap_begin(socket,0,req.block_size,&mapping,&mapped_bytes));
+    CHECK(!kernel_socket_packet_ring_mmap_page(socket,0,&physical));
+    kernel_lock_release(&mapping);
+    uint32_t *block=packet_test_page(physical);
+    unsigned char frame[1400]={0};
+    frame[12]=0x88;frame[13]=0xb5;frame[14]=0xab;
+    struct kernel_socket_address bind={.family=KERNEL_SOCKET_AF_PACKET,.port=0x88b5,
+        .scope=netif_get_index(interface)};
+    CHECK(!kernel_socket_bind(socket,&bind));
+    for (unsigned i=0;i<BOAROS_PAGE_SIZE/sizeof(frame)+2;i++)
+        kernel_socket_packet_ethernet(interface,NULL,frame,sizeof(frame),0);
+    if (!(kernel_socket_poll(socket,NULL)&KERNEL_POLLIN)) {
+        clock_ns+=UINT64_C(8000000);
+        CHECK(kernel_socket_service_pending((struct kernel_socket_service_budget){0,0,1}).timers==1);
+    }
+    CHECK((kernel_socket_poll(socket,NULL)&KERNEL_POLLIN) && block[0]==PACKET_VERSION_V3);
+    CHECK(block[3]>=2 && block[4]==80 && block[5]>BOAROS_PAGE_SIZE);
+    unsigned char *record=(unsigned char *)block+block[4];
+    CHECK(record[82+14]==0xab);
+    kernel_socket_packet_ethernet(interface,NULL,frame,sizeof(frame),0);
+    uint32_t counters[3]; unsigned count;
+    CHECK(!kernel_socket_packet_option_get(socket,KERNEL_PACKET_STATISTICS,0,counters,&count));
+    CHECK(count==3 && counters[0]>=block[3]+1 && counters[1]>=1 && counters[2]==1);
+    __atomic_store_n(&block[2],0,__ATOMIC_RELEASE);
+    CHECK(!(kernel_socket_poll(socket,NULL)&KERNEL_POLLIN));
+    kernel_socket_packet_ethernet(interface,NULL,frame,sizeof(frame),0);
+    CHECK(packet_timer_head==socket);
+    kernel_socket_destroy(socket);
+    packet_test_configuration_lock=NULL;
+    CHECK(!packet_timer_head && !packet_taps_active() && !heap_live);
+    CHECK(physical_page_available(&allocator)+1==free_pages);
+    CHECK(!physical_page_release(&allocator,physical));
+    CHECK(physical_page_available(&allocator)==free_pages);
+    puts("PASS AF_PACKET V3: timeout, full ring, cross-page copy and teardown owners");
+}
+
 static void packet_tap_contract(void)
 {
     kernel_socket_network_initialize();
@@ -4850,6 +4923,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "ipv4-options")) ipv4_options();
     else if (!strcmp(argv[1], "ipv4-igmp")) ipv4_igmp();
     else if (!strcmp(argv[1], "packet-tap")) packet_tap_contract();
+    else if (!strcmp(argv[1], "packet-ring")) packet_ring_contract();
     else if (!strcmp(argv[1], "async-events")) async_events();
     else if (!strcmp(argv[1], "unix-seq-records")) unix_seqpacket_records();
     else if (!strcmp(argv[1], "ipv4-route")) ipv4_route_output();

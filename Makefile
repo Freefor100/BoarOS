@@ -452,7 +452,7 @@ COMMON_C_SOURCES := \
 	kernel/reboot.c \
 	kernel/cost.c \
 	kernel/sched/cost.c \
-	net/socket.c \
+	net/socket.c net/packet_ring.c \
 	net/ethernet.c \
 	lib/qsort.c \
 	lib/string.c \

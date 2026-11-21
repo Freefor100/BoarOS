@@ -137,8 +137,13 @@ static void directory_views(void)
     assert(proc_lookup(&instance,PROC_ROOT_INODE,"42",2,&ino,&mode)==-KERNEL_ENOENT);
     struct kernel_vfs_node root={.inode=PROC_ROOT_INODE,.instance=&instance};
     struct kernel_vfs_file file={.private_data=&root};
+    uint64_t flags_inode;
+    assert(!proc_lookup(&instance,PROC_ROOT_INODE,"kpageflags",10,&flags_inode,&mode));
+    assert(flags_inode==PROC_KPAGEFLAGS_INODE && mode==(KERNEL_VFS_S_IFREG | 0400));
     assert(proc_dir_entry(&file,10,&next,&ino,&type,name,sizeof(name))==1);
-    assert(!strcmp(name,"1") && next==11 && ino==first);
+    assert(!strcmp(name,"kpageflags") && ino==flags_inode && type==8);
+    assert(proc_dir_entry(&file,PROC_ROOT_STATIC_COUNT,&next,&ino,&type,name,sizeof(name))==1);
+    assert(!strcmp(name,"1") && next==PROC_ROOT_STATIC_COUNT+1 && ino==first);
     assert(!proc_dir_entry(&file,next,&next,&ino,&type,name,sizeof(name)));
     root.inode=proc_pid_inode(42,17,PROC_TASK_DIR_KIND);
     assert(!proc_lookup(&instance,root.inode,"3",1,&first,&mode));
