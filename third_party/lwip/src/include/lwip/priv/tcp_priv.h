@@ -278,6 +278,14 @@ struct tcp_seg {
   struct tcp_hdr *tcphdr;  /* the TCP header */
 };
 
+#if BOAROS_LWIP_TCP_WRITEV
+static inline struct tcp_seg *
+boaros_lwip_pbuf_segment(struct pbuf *p)
+{
+  return p->allocation_prefix ? (struct tcp_seg *)((u8_t *)p - p->allocation_prefix) : NULL;
+}
+#endif
+
 #define LWIP_TCP_OPT_EOL        0
 #define LWIP_TCP_OPT_NOP        1
 #define LWIP_TCP_OPT_MSS        2

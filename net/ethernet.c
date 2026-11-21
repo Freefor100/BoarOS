@@ -16,6 +16,7 @@
 #include "lwip/netif.h"
 #include "lwip/pbuf.h"
 #include "lwip/stats.h"
+#include "boaros_lwip.h"
 #include "netif/ethernet.h"
 #include <stddef.h>
 #include <string.h>
@@ -300,10 +301,28 @@ static unsigned receive_inline(void *context)
     struct kernel_network *n = context;
     struct virtio_net_frame frame;
     unsigned count = 0;
+    int serial = !boaros_lwip_parallel_enabled();
+    int batching = 0;
     while (count < KERNEL_NETWORK_RECEIVE_BATCH && virtio_net_receive(n->device, &frame)) {
+        if (serial && !batching && frame.more_ready) {
+            boaros_lwip_tcp_ack_batch_begin();
+            batching = 1;
+        }
+        const unsigned char *data = frame.data;
+        /* Flush before other link or network traffic. TCP verifies the
+         * checksum, ingress filter, tuple and each advancing sequence. */
+        if (batching && (frame.size < 54 || data[12] != 8 || data[13] || data[14] != 0x45 ||
+                         data[16] || data[17] != 40 || (data[20] & 0x3f) || data[21] ||
+                         data[23] != 6 || data[46] != 0x50 || data[47] != 0x10))
+            boaros_lwip_tcp_ack_batch_flush();
         input_frame(n, &frame);
         count++;
+        if (batching && !frame.more_ready) {
+            boaros_lwip_tcp_ack_batch_end();
+            batching = 0;
+        }
     }
+    if (batching) boaros_lwip_tcp_ack_batch_end();
     return count;
 }
 

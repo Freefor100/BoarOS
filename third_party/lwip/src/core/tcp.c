@@ -1936,6 +1936,14 @@ tcp_seg_free(struct tcp_seg *seg)
 {
   if (seg != NULL) {
     if (seg->p != NULL) {
+#if BOAROS_LWIP_TCP_WRITEV
+      /* The descriptor is in the packet allocation. Once TCP relinquishes
+         it, the remaining DMA or payload-view owners alone govern storage. */
+      if (seg == boaros_lwip_pbuf_segment(seg->p)) {
+        pbuf_free(seg->p);
+        return;
+      }
+#endif
       pbuf_free(seg->p);
 #if TCP_DEBUG
       seg->p = NULL;

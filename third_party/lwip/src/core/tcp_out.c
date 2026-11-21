@@ -258,11 +258,17 @@ tcp_flush_batch(struct netif **batch)
 static struct tcp_seg *
 tcp_alloc_segment(struct pbuf *p, u8_t optlen, u8_t optflags)
 {
-  struct tcp_seg *seg;
+  struct tcp_seg *seg = NULL;
 
   LWIP_ASSERT("tcp_create_segment: invalid pbuf", p != NULL);
 
-  if ((seg = (struct tcp_seg *)memp_malloc(MEMP_TCP_SEG)) == NULL) {
+#if BOAROS_LWIP_TCP_WRITEV
+  seg = boaros_lwip_pbuf_segment(p);
+#endif
+  if (seg == NULL) {
+    seg = (struct tcp_seg *)memp_malloc(MEMP_TCP_SEG);
+  }
+  if (seg == NULL) {
     LWIP_DEBUGF(TCP_OUTPUT_DEBUG | LWIP_DBG_LEVEL_SERIOUS, ("tcp_create_segment: no memory.\n"));
     pbuf_free(p);
     return NULL;
@@ -1690,7 +1696,8 @@ tcp_output(struct tcp_pcb *pcb)
     }
 #if BOAROS_USER_SMP
     pcb->boaros_path4.generation = 0;
-    if (pcb->boaros_owner && IP_IS_V4(&pcb->local_ip) && IP_IS_V4(&pcb->remote_ip)) {
+    if ((pcb->boaros_owner || !boaros_lwip_parallel_enabled()) &&
+        IP_IS_V4(&pcb->local_ip) && IP_IS_V4(&pcb->remote_ip)) {
       boaros_ipv4_path_resolve(&pcb->boaros_path4, netif, ip_2_ip4(&pcb->local_ip),
                                ip_2_ip4(&pcb->remote_ip), pcb->netif_idx);
     }
