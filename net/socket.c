@@ -76,6 +76,13 @@ struct socket_pending {
     struct kernel_socket *child;
 };
 
+struct socket_udp_pending {
+    struct pbuf *head, *tail;
+    ip_addr_t remote;
+    uint32_t bytes, charge;
+    uint16_t port;
+};
+
 struct socket_link { struct kernel_socket *next, *previous; uint64_t epoch; unsigned queued; };
 struct kernel_socket_name {
     struct kernel_heap *heap;
@@ -123,6 +130,7 @@ struct kernel_socket {
     unsigned work_flags, pending_live;
     uint8_t pending_ready, destroying;
     struct udp_pcb *udp;
+    struct socket_udp_pending *udp_pending;
     struct raw_pcb *raw;
     struct tcp_pcb *tcp;
     struct kernel_socket *peer;
@@ -334,6 +342,10 @@ int kernel_socket_is_stream(const struct kernel_socket *socket)
 { return socket && socket->type == SOCKET_STREAM; }
 int kernel_socket_is_seqpacket(const struct kernel_socket *socket)
 { return socket && socket->type == SOCKET_SEQPACKET; }
+int kernel_socket_is_udp(const struct kernel_socket *socket)
+{ return socket && socket->domain == KERNEL_SOCKET_DOMAIN_INET && socket->type == SOCKET_DGRAM; }
+static int udp_has_pending(const struct kernel_socket *socket)
+{ return __atomic_load_n(&socket->udp_pending,__ATOMIC_RELAXED)!=NULL; }
 static int socket_prepare_send_locked(struct kernel_socket *socket)
 {
     if(!kernel_socket_is_seqpacket(socket))return 0;
@@ -683,6 +695,23 @@ static void socket_pbuf_free(struct pbuf *payload)
     struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
     pbuf_free(payload);
     kernel_socket_protocol_leave(&irq);
+}
+/* The protocol owner exclusively edits the chain. Admission only samples
+ * whether a destination has already been selected for the datagram. */
+static struct pbuf *udp_pending_take(struct kernel_socket *socket)
+{
+    struct socket_udp_pending *pending=socket->udp_pending;
+    if (!pending) return NULL;
+    __atomic_store_n(&socket->udp_pending,NULL,__ATOMIC_RELAXED);
+    struct pbuf *payload=pending->head;
+    kernel_heap_release(socket->heap,pending);
+    return payload;
+}
+
+static void udp_pending_discard(struct kernel_socket *socket)
+{
+    struct pbuf *payload=udp_pending_take(socket);
+    if (payload) socket_pbuf_free(payload);
 }
 static void socket_protocol_enter(struct kernel_socket_protocol_scope *scope,
                                   const struct kernel_socket *socket)
@@ -2668,7 +2697,10 @@ void kernel_socket_destroy(struct kernel_socket *socket)
         kernel_socket_destroy(entry->child);
         kernel_heap_release(socket->heap, entry);
     }
-    if (socket->udp != 0) udp_remove(socket->udp);
+    if (socket->udp != 0) {
+        udp_pending_discard(socket);
+        udp_remove(socket->udp);
+    }
     if (socket->raw != 0) {raw_recv(socket->raw,NULL,NULL);raw_remove(socket->raw);socket->raw=NULL;}
     if (socket->tcp != 0) {
         if (!socket->listening) {
@@ -3544,7 +3576,8 @@ void kernel_socket_abort_read(struct kernel_socket_read_request *request)
 
 enum { SOCKET_WRITE_ACCEPTED=1U, SOCKET_WRITE_DEFERRED=2U };
 enum socket_protocol_operation { SOCKET_PROTOCOL_STREAM, SOCKET_PROTOCOL_DATAGRAM_PREPARE,
-    SOCKET_PROTOCOL_DATAGRAM_SEND, SOCKET_PROTOCOL_DISPOSE, SOCKET_PROTOCOL_FLUSH };
+    SOCKET_PROTOCOL_DATAGRAM_SEND, SOCKET_PROTOCOL_DATAGRAM_CANCEL,
+    SOCKET_PROTOCOL_DISPOSE, SOCKET_PROTOCOL_FLUSH };
 static int protocol_request(struct kernel_socket_write_request *,enum socket_protocol_operation);
 
 static void socket_link_active_write(struct kernel_socket_write_request *request)
@@ -3930,13 +3963,14 @@ int kernel_socket_packet_prepare(struct kernel_socket_write_request *request,
             limit-=(uint32_t)sizeof(struct socket_packet);
             if(count>limit)count=limit;
         } else {
-            if(kernel_source && socket->domain==KERNEL_SOCKET_DOMAIN_INET && !destination &&
-                !socket->connected && count<=UINT16_MAX)return -KERNEL_EDESTADDRREQ;
+            int missing_destination=socket->domain==KERNEL_SOCKET_DOMAIN_INET && !destination &&
+                !socket->connected && !udp_has_pending(socket);
+            if(kernel_source && missing_destination && count<=UINT16_MAX)return -KERNEL_EDESTADDRREQ;
             if(count>(socket->domain==KERNEL_SOCKET_DOMAIN_INET?
                 (socket->type==SOCKET_RAW?RAW_MAX_PAYLOAD:UDP_MAX_PAYLOAD):socket->tx_limit-32U) ||
                 count>socket->tx_limit)return -KERNEL_EMSGSIZE;
             if(socket->write_closed)return -KERNEL_EPIPE;
-            if(socket->domain==KERNEL_SOCKET_DOMAIN_INET && !destination && !socket->connected)return -KERNEL_EDESTADDRREQ;
+            if(missing_destination)return -KERNEL_EDESTADDRREQ;
         }
         if(socket->domain==KERNEL_SOCKET_DOMAIN_INET) {
             /* The caller may reuse its import storage for this request. */
@@ -3987,7 +4021,11 @@ int kernel_socket_packet_prepare(struct kernel_socket_write_request *request,
             result=network_is_stopping()?
                 -KERNEL_EIO:datagram_prepare_payload(request);
         } else result=protocol_request(request,SOCKET_PROTOCOL_DATAGRAM_PREPARE);
-        if(result)goto out;
+        if(result) {
+            if (result==-KERNEL_ENOMEM && kernel_socket_is_udp(socket) && udp_has_pending(socket))
+                (void)protocol_request(request,SOCKET_PROTOCOL_DATAGRAM_CANCEL);
+            goto out;
+        }
     } else {
         KERNEL_NO_RECLAIM_IO;
         enum kernel_heap_status status = kernel_heap_allocate_zeroed(request->socket->heap,
@@ -4098,6 +4136,8 @@ int kernel_socket_packet_write(struct kernel_socket_write_request *request,
         if (access == KERNEL_UACCESS_STATUS_FAULT) {
             if (user_fault) *user_fault=1;
             if (request->socket->type != SOCKET_STREAM || !copied) {
+                if (kernel_socket_is_udp(request->socket) && udp_has_pending(request->socket))
+                    (void)protocol_request(request,SOCKET_PROTOCOL_DATAGRAM_CANCEL);
                 result = -KERNEL_EFAULT; goto out;
             }
             count=copied; packet->length=(uint32_t)copied;
@@ -4240,7 +4280,7 @@ static void tcp_publish_capacity_locked(struct kernel_socket *socket)
             boaros_lwip_tcp_detached_mss(socket->tcp):0,__ATOMIC_RELAXED);
 #endif
 }
-static void socket_tcp_output_mode(struct tcp_pcb *pcb, u8_t more)
+static void socket_tcp_output(struct tcp_pcb *pcb)
 {
     struct kernel_socket *socket=pcb->errf==tcp_failed?pcb->callback_arg:NULL;
     unsigned *blocked=&nic_blocked;
@@ -4250,7 +4290,7 @@ static void socket_tcp_output_mode(struct tcp_pcb *pcb, u8_t more)
 #endif
     *blocked=0;
     unsigned was_corked = pcb->boaros_cork_pending;
-    err_t output = boaros_lwip_tcp_output_more(pcb, more);
+    err_t output = tcp_output(pcb);
     if (!socket) return;
     /* A direct caller may have armed a deadline while the worker was asleep. */
     if (!was_corked && pcb->boaros_cork_pending) socket_schedule(socket, 0);
@@ -4264,14 +4304,10 @@ static void socket_tcp_output_mode(struct tcp_pcb *pcb, u8_t more)
     }
 }
 
-/* ACK/input/timer output must not inherit an application's last MSG_MORE. */
-static void socket_tcp_output(struct tcp_pcb *pcb)
-{ socket_tcp_output_mode(pcb, 0); }
-
 static void tcp_flush_output(struct kernel_socket *socket)
 {
     if (socket->tcp && (socket->tcp->unsent || (socket->tcp->flags&TF_ACK_NOW)))
-        socket_tcp_output_mode(socket->tcp, socket->tcp->boaros_output_more);
+        socket_tcp_output(socket->tcp);
 }
 
 void kernel_socket_stream_begin(struct kernel_socket_write_request *request,
@@ -4475,6 +4511,112 @@ static void stream_commit_owned(struct kernel_socket_write_request **requests, u
     if(flush && !defer_output)tcp_flush_output(socket);
 }
 
+/* Each send already owns a copied PBUF_RAM. Keep the private buffers in
+ * order and fill their aggregate lengths once, when the datagram leaves. */
+static int udp_pending_append(struct kernel_socket_write_request *request,
+                              const ip_addr_t *remote,uint16_t port)
+{
+    struct kernel_socket *socket=request->socket;
+    struct socket_udp_pending *pending=socket->udp_pending;
+    struct pbuf *part=request->protocol_payload;
+    uint32_t limit;
+    { SOCKET_ENDPOINT(state,socket);limit=socket->tx_limit; }
+    uint32_t charge=LWIP_MEM_ALIGN_SIZE(sizeof(*part))+LWIP_MEM_ALIGN_SIZE(PBUF_TRANSPORT)+
+        LWIP_MEM_ALIGN_SIZE(part->len);
+    if (pending && (pending->bytes+part->len>UDP_MAX_PAYLOAD || pending->bytes+part->len>limit))
+        return -KERNEL_EMSGSIZE;
+    /* Bound the memory held by many tiny sends as well as the wire size. */
+    if (pending && part->len && pending->charge+charge>2U*limit) return -KERNEL_ENOBUFS;
+    if (!pending) {
+        enum kernel_heap_status status=kernel_heap_allocate_zeroed(socket->heap,1,sizeof(*pending),
+            (void **)&pending);
+        if (status==KERNEL_HEAP_STATUS_EMPTY) return -KERNEL_ENOMEM;
+        if (status!=KERNEL_HEAP_STATUS_OK) __builtin_trap();
+        pending->remote=*remote;
+        pending->port=port;
+        pending->head=part;
+        __atomic_store_n(&socket->udp_pending,pending,__ATOMIC_RELAXED);
+    } else if (!part->len) {
+        socket_pbuf_free(part);
+        request->protocol_payload=NULL;
+        return 0;
+    } else pending->tail->next=part;
+    request->protocol_payload=NULL;
+    pending->tail=part;
+    pending->bytes+=part->len;
+    pending->charge+=charge;
+    return 0;
+}
+
+static int datagram_send_owned(struct kernel_socket_write_request *request)
+{
+    struct kernel_socket *socket=request->socket;
+    struct socket_udp_pending *pending=socket->udp_pending;
+    struct pbuf *payload=request->protocol_payload;
+    if (!payload) __builtin_trap();
+    ip_addr_t remote={0};
+    uint16_t port=request->destination?request->destination->port:socket->udp?socket->udp->remote_port:0;
+    if (pending) {
+        remote=pending->remote;
+        port=pending->port;
+    } else if (request->destination && request->destination->family==KERNEL_SOCKET_AF_INET) {
+        IP_SET_TYPE(&remote,IPADDR_TYPE_V4);
+        __builtin_memcpy(&ip_2_ip4(&remote)->addr,request->destination->bytes,4);
+    } else if (request->destination) {
+        if (request->destination->family!=KERNEL_SOCKET_AF_INET6) __builtin_trap();
+        IP_SET_TYPE(&remote,IPADDR_TYPE_V6);
+        __builtin_memcpy(ip_2_ip6(&remote)->addr,request->destination->bytes,16);
+        ip6_addr_set_zone(ip_2_ip6(&remote),(u8_t)request->destination->scope);
+    } else ip_addr_copy(remote,socket_ip_pcb(socket)->remote_ip);
+
+    int failure=0;
+    if (socket->udp) {
+        if (socket->write_closed) failure=-KERNEL_EPIPE;
+        else if (!pending && !request->destination && !socket->connected) failure=-KERNEL_EDESTADDRREQ;
+        else if (!port) failure=-KERNEL_EINVAL;
+    }
+    struct netif *route=NULL;
+    const ip_addr_t *source=NULL;
+    if (!failure) failure=socket_ip_route(socket,&remote,&route,&source);
+    uint32_t length=request->payload_size+(pending?pending->bytes:0);
+    if (!failure && IP_IS_V6(&remote) && route->mtu &&
+        length+48U>nd6_get_destination_mtu(ip_2_ip6(&remote),route)) failure=-KERNEL_EMSGSIZE;
+
+    int more=!!(request->flags&KERNEL_SOCKET_MSG_MORE);
+    if (!failure && socket->udp && (pending || more)) {
+        if (!socket->udp->local_port)
+            failure=lwip_error(udp_bind(socket->udp,&socket->udp->local_ip,0));
+        if (!failure) failure=udp_pending_append(request,&remote,port);
+        if (!failure && more) {
+            request->progressed=SOCKET_WRITE_DEFERRED;
+            return (int)request->payload_size;
+        }
+        if (!failure) {
+            payload=udp_pending_take(socket);
+            for (struct pbuf *part=payload;part;part=part->next) {
+                part->tot_len=(u16_t)length;
+                length-=part->len;
+            }
+        }
+    }
+    if (failure) udp_pending_discard(socket);
+    else {
+        struct ip_pcb *pcb=socket_ip_pcb(socket);
+        pcb->ttl=IP_IS_V4(&remote)?socket->ipv4_ttl:64;
+        if (socket->udp) {
+            udp_set_multicast_ttl(socket->udp,IP_IS_V4(&remote)?socket->multicast_ttl:socket->ipv6_multicast_hops);
+            if (IP_IS_V6(&remote) && socket->ipv6_multicast_loop) socket->udp->flags|=UDP_FLAGS_MULTICAST_LOOP;
+            else socket->udp->flags&=(uint8_t)~UDP_FLAGS_MULTICAST_LOOP;
+        }
+        if (IP_IS_V4(&remote)) payload->flags|=PBUF_FLAG_IP4_LOCAL_DF;
+        failure=lwip_error(socket->raw?raw_sendto_if_src(socket->raw,payload,&remote,route,source):
+            udp_sendto_if_src(socket->udp,payload,&remote,port,route,source));
+    }
+    socket_pbuf_free(payload);
+    request->protocol_payload=NULL;
+    return failure?failure:(int)request->payload_size;
+}
+
 static int execute_protocol_request(struct kernel_socket_write_request *request)
 {
     if(request->operation==SOCKET_PROTOCOL_STREAM) {
@@ -4485,42 +4627,8 @@ static int execute_protocol_request(struct kernel_socket_write_request *request)
     struct kernel_socket *socket=request->socket;
     switch(request->operation) {
     case SOCKET_PROTOCOL_DATAGRAM_PREPARE: return datagram_prepare_payload(request);
-    case SOCKET_PROTOCOL_DATAGRAM_SEND: {
-        struct pbuf *payload=request->protocol_payload;
-        if(!payload)__builtin_trap();
-        ip_addr_t remote={0};
-        if(request->destination && request->destination->family==KERNEL_SOCKET_AF_INET) {
-            IP_SET_TYPE(&remote,IPADDR_TYPE_V4);
-            __builtin_memcpy(&ip_2_ip4(&remote)->addr,request->destination->bytes,4);
-        } else if(request->destination) {
-            if(request->destination->family!=KERNEL_SOCKET_AF_INET6)__builtin_trap();
-            IP_SET_TYPE(&remote,IPADDR_TYPE_V6);
-            __builtin_memcpy(ip_2_ip6(&remote)->addr,request->destination->bytes,16);
-            ip6_addr_set_zone(ip_2_ip6(&remote),(u8_t)request->destination->scope);
-        }
-        if(!request->destination)ip_addr_copy(remote,socket_ip_pcb(socket)->remote_ip);
-        struct netif *route=NULL;const ip_addr_t *source=NULL;
-        int failure=socket_ip_route(socket,&remote,&route,&source);
-        err_t error=ERR_OK;
-        if (!failure && IP_IS_V6(&remote) && route->mtu &&
-            (request->payload_size+48U>nd6_get_destination_mtu(ip_2_ip6(&remote),route)))
-            failure=-KERNEL_EMSGSIZE;
-        if(!failure) {
-            struct ip_pcb *pcb=socket_ip_pcb(socket);
-            pcb->ttl=IP_IS_V4(&remote)?socket->ipv4_ttl:64;
-            if(socket->udp) {
-                udp_set_multicast_ttl(socket->udp,IP_IS_V4(&remote)?socket->multicast_ttl:socket->ipv6_multicast_hops);
-                if(IP_IS_V6(&remote) && socket->ipv6_multicast_loop)socket->udp->flags|=UDP_FLAGS_MULTICAST_LOOP;
-                else socket->udp->flags&=(uint8_t)~UDP_FLAGS_MULTICAST_LOOP;
-            }
-            if(IP_IS_V4(&remote))payload->flags|=PBUF_FLAG_IP4_LOCAL_DF;
-            error=socket->raw?raw_sendto_if_src(socket->raw,payload,&remote,route,source):
-                udp_sendto_if_src(socket->udp,payload,&remote,request->destination?
-                    request->destination->port:socket->udp->remote_port,route,source);
-        }
-        socket_pbuf_free(payload);request->protocol_payload=0;
-        return failure?failure:error==ERR_OK?(int)request->payload_size:lwip_error(error);
-    }
+    case SOCKET_PROTOCOL_DATAGRAM_SEND: return datagram_send_owned(request);
+    case SOCKET_PROTOCOL_DATAGRAM_CANCEL: udp_pending_discard(socket);return 0;
     case SOCKET_PROTOCOL_DISPOSE:
         if(!request->protocol_payload)__builtin_trap();
         socket_pbuf_free(request->protocol_payload);request->protocol_payload=0;return 0;
@@ -4612,7 +4720,8 @@ static int protocol_request(struct kernel_socket_write_request *request,enum soc
         }
         if(!result)result=execute_protocol_request(request);
         request->segments=0;
-        if(result>=0 && operation!=SOCKET_PROTOCOL_DATAGRAM_PREPARE && operation!=SOCKET_PROTOCOL_DISPOSE &&
+        if(result>=0 && operation!=SOCKET_PROTOCOL_DATAGRAM_PREPARE &&
+            operation!=SOCKET_PROTOCOL_DATAGRAM_CANCEL && operation!=SOCKET_PROTOCOL_DISPOSE &&
             !(request->progressed & SOCKET_WRITE_DEFERRED))service_inline(&protocol);
         kernel_socket_protocol_leave(&protocol);return result;
     }

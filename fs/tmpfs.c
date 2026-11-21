@@ -1025,39 +1025,6 @@ int kernel_devtmpfs_is_mount(const struct kernel_vfs_mount *mount)
         kernel_vfs_path_mount(devtmpfs_root)->private_data;
 }
 
-static char *append_number(char *out, unsigned value)
-{
-    if (value >= 10) out = append_number(out, value / 10);
-    *out++ = '0' + value % 10;
-    return out;
-}
-
-static int block_name(uint64_t number, char name[32])
-{
-    unsigned major = (number >> 8) & 0xfff;
-    unsigned minor = (number & 0xff) | ((number >> 12) & 0xfff00);
-    char *out = name;
-    if (major == 7) {
-        memcpy(out, "loop", 4);
-        out = append_number(out + 4, minor);
-    } else if (major == 252) {
-        unsigned disk = minor / 16;
-        char reversed[8];
-        size_t length = 0;
-        do {
-            reversed[length++] = 'a' + disk % 26;
-            disk = disk / 26;
-            if (!disk) break;
-            disk--;
-        } while (1);
-        *out++ = 'v'; *out++ = 'd';
-        while (length) *out++ = reversed[--length];
-        if (minor % 16) out = append_number(out, minor % 16);
-    } else return 0;
-    *out = '\0';
-    return 1;
-}
-
 static int devtmpfs_add_blocks(struct kernel_vfs_mount *mount,
     struct kernel_block_device *const *devices, size_t count, kernel_block_activate_fn activate)
 {
@@ -1070,7 +1037,7 @@ static int devtmpfs_add_blocks(struct kernel_vfs_mount *mount,
     while (staged < count) {
         struct kernel_block_device *device = devices[staged];
         device->devtmpfs_inode = 0;
-        if (block_name(device->device_number, name)) {
+        if (kernel_block_device_name(device->device_number, name)) {
             struct tmp_entry *e = NULL;
             error = create_child(tm(instance), 1, name, KERNEL_VFS_S_IFBLK | 0600,
                 NULL, &e, 0, NULL);
@@ -1086,7 +1053,7 @@ static int devtmpfs_add_blocks(struct kernel_vfs_mount *mount,
     for (size_t i = 0; i < staged; i++) {
         struct kernel_block_device *device = devices[i];
         if (!device->devtmpfs_inode) continue;
-        block_name(device->device_number, name);
+        kernel_block_device_name(device->device_number, name);
         if (error) {
             if (remove_path(mount, 1, name, 0)) __builtin_trap();
             device->devtmpfs_inode = 0;
@@ -1118,7 +1085,7 @@ static int devtmpfs_block_nodes(struct kernel_block_device *const *devices,
         struct kernel_block_device *device = devices[0];
         uint64_t id;
         char name[32];
-        if (device->devtmpfs_inode && block_name(device->device_number, name)) {
+        if (device->devtmpfs_inode && kernel_block_device_name(device->device_number, name)) {
             error = lookup(mount->private_data, 1, name, strlen(name), &id, NULL);
             /* Leave a userspace replacement in place, even for the same rdev. */
             if (!error && id == device->devtmpfs_inode)

@@ -762,6 +762,7 @@ static __attribute__((noinline)) enum kernel_files_status socket_prepare_message
     int seqpacket=kernel_socket_is_seqpacket(socket);
     uint32_t allowed=KERNEL_SOCKET_MSG_DONTWAIT|KERNEL_SOCKET_MSG_NOSIGNAL;
     if(batch)allowed|=KERNEL_SOCKET_MSG_EOR;
+    if(kernel_socket_is_udp(socket))allowed|=KERNEL_SOCKET_MSG_MORE;
     if(seqpacket)allowed|=KERNEL_SOCKET_MSG_EOR|KERNEL_SOCKET_MSG_MORE;
     struct linux_msghdr *header=&phase->import.header;
     size_t copied=0;
@@ -1140,7 +1141,7 @@ enum kernel_syscall_status syscall_handle_socket_operation(
     case 206: { /* sendto / send */
         uint32_t flags = (uint32_t)request->arguments[3];
         uint32_t allowed=KERNEL_SOCKET_MSG_DONTWAIT | KERNEL_SOCKET_MSG_NOSIGNAL;
-        if (kernel_socket_is_tcp(socket)) allowed|=KERNEL_SOCKET_MSG_MORE;
+        if (kernel_socket_is_tcp(socket) || kernel_socket_is_udp(socket)) allowed|=KERNEL_SOCKET_MSG_MORE;
         if (kernel_socket_is_seqpacket(socket)) allowed|=KERNEL_SOCKET_MSG_EOR|KERNEL_SOCKET_MSG_MORE;
         if ((flags & ~allowed) && !kernel_socket_is_seqpacket(socket)) { result = -KERNEL_EOPNOTSUPP; break; }
         const struct kernel_socket_address *destination = 0;

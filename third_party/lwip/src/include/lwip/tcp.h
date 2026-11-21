@@ -290,6 +290,7 @@ struct tcp_pcb {
 #if LWIP_TCP_SACK_OUT
 #define TF_SACK        0x1000U /* Selective ACKs enabled */
 #endif
+#define TF_RCVDATA     0x2000U /* In-order application data has been received. */
 
   /* the rest of the fields are in host byte order
      as we have to do some math with them */
@@ -470,9 +471,7 @@ err_t lwip_tcp_event(void *arg, struct tcp_pcb *pcb,
 #endif /* LWIP_EVENT_API */
 
 /* Application program's interface: */
-/* MORE is an output hint, not persistent TCP_CORK: ACK-driven tcp_output()
- * uses the ordinary policy. A queued application output retains its hint. */
-err_t boaros_lwip_tcp_output_more(struct tcp_pcb *pcb, u8_t more);
+/* The queued short tail retains its MORE hint across output sources. */
 void boaros_lwip_tcp_push(struct tcp_pcb *pcb);
 void boaros_lwip_tcp_cork_arm(struct tcp_pcb *pcb);
 void boaros_lwip_tcp_cork_cancel(struct tcp_pcb *pcb);

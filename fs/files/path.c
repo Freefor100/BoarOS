@@ -691,17 +691,34 @@ struct linux_statx {
     uint64_t ino,size,blocks,attributes_mask;
     struct linux_statx_timestamp atime,btime,ctime,mtime;
     uint32_t rdev_major,rdev_minor,dev_major,dev_minor;
-    uint64_t spare[14];
+    uint64_t mount_id;
+    uint32_t dio_mem_align,dio_offset_align;
+    uint64_t spare[12];
 };
 _Static_assert(sizeof(struct linux_statx)==256,"Linux statx ABI size");
+_Static_assert(offsetof(struct linux_statx,dio_mem_align)==0x98,"Linux statx alignment offset");
+#define LINUX_STATX_DIOALIGN UINT32_C(0x2000)
+
 static uint32_t device_major(uint64_t device)
 { return ((device>>8)&0xfff)|((device>>32)&0xfffff000); }
 static uint32_t device_minor(uint64_t device)
 { return (device&0xff)|((device>>12)&0xffffff00); }
+
+static uint32_t statx_dio_alignment(uint64_t number,const struct kernel_block_device *open_device)
+{
+    if (open_device) return kernel_block_user_dio_alignment(kernel_block_logical_size(open_device));
+    struct kernel_block_device *device=kernel_block_get(number);
+    if (!device) return 0;
+    uint32_t alignment=kernel_block_user_dio_alignment(kernel_block_logical_size(device));
+    kernel_block_put(device);
+    return alignment;
+}
+
 static int copy_stat_to_user(struct kernel_mm *mm,
                              uint64_t user_buffer,
                              const struct kernel_vfs_stat *source,
-                             int64_t *linux_result, int extended)
+                             int64_t *linux_result, int extended, uint32_t mask,
+                             const struct kernel_block_device *open_device)
 {
     union {struct linux_statx extended;struct kernel_linux_stat basic;} output;
     const void *bytes;size_t size;
@@ -717,6 +734,14 @@ static int copy_stat_to_user(struct kernel_mm *mm,
         stat->ctime=(struct linux_statx_timestamp){source->ctime.seconds,source->ctime.nanoseconds,0};
         stat->dev_major=device_major(source->dev);stat->dev_minor=device_minor(source->dev);
         stat->rdev_major=device_major(source->rdev);stat->rdev_minor=device_minor(source->rdev);
+        if ((mask&LINUX_STATX_DIOALIGN) && (source->mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFBLK) {
+            uint32_t alignment=statx_dio_alignment(source->rdev,open_device);
+            if (alignment) {
+                stat->mask|=LINUX_STATX_DIOALIGN;
+                stat->dio_mem_align=alignment;
+                stat->dio_offset_align=alignment;
+            }
+        }
         bytes=stat;size=sizeof(*stat);
     } else {
         memset(&output.basic,0,sizeof(output.basic));
@@ -753,7 +778,7 @@ static enum kernel_files_status stat_pinned(struct kernel_open_file_description 
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
-    copy_result = copy_stat_to_user(mm, user_buffer, &stat, linux_result, 0);
+    copy_result = copy_stat_to_user(mm, user_buffer, &stat, linux_result, 0, 0, NULL);
     if (copy_result < 0) {
         return KERNEL_FILES_STATUS_STATE;
     }
@@ -780,7 +805,7 @@ static enum kernel_files_status stat_at_to_user(
     uint64_t user_path,
     uint64_t user_buffer,
     uint64_t flags,
-    int64_t *linux_result, int extended)
+    int64_t *linux_result, int extended, uint32_t mask)
 {
     COST_SCOPE(query_cost, FILE_QUERY_TICKS);
     struct kernel_task_io_buffer path_buffer __attribute__((cleanup(path_buffer_release)))={0};
@@ -819,7 +844,8 @@ static enum kernel_files_status stat_at_to_user(
             struct kernel_open_file_description *file=kernel_files_hold_fd(files,dirfd,&pin_guard);
             result=file ? stat_description(&stat,file) : -KERNEL_EBADF;
             if(result) { *linux_result=result; return KERNEL_FILES_STATUS_OK; }
-            int copied=copy_stat_to_user(mm,user_buffer,&stat,linux_result,1);
+            const struct kernel_block_device *device=file->kind==KERNEL_OPEN_FILE_KIND_BLOCK ? file->block : NULL;
+            int copied=copy_stat_to_user(mm,user_buffer,&stat,linux_result,1,mask,device);
             if(copied<0) return KERNEL_FILES_STATUS_STATE;
             if(copied>0) *linux_result=0;
             return KERNEL_FILES_STATUS_OK;
@@ -868,7 +894,7 @@ static enum kernel_files_status stat_at_to_user(
     }
     path_buffer_release(&path_buffer);
     if (result) { *linux_result = result; return KERNEL_FILES_STATUS_OK; }
-    int copied = copy_stat_to_user(mm, user_buffer, &stat, linux_result, extended);
+    int copied = copy_stat_to_user(mm, user_buffer, &stat, linux_result, extended, mask, NULL);
     if (copied < 0) return KERNEL_FILES_STATUS_STATE;
     if (copied > 0) *linux_result = 0;
     return KERNEL_FILES_STATUS_OK;
@@ -878,7 +904,7 @@ enum kernel_files_status kernel_files_fstatat(struct kernel_files *files,
     const struct kernel_fs_context *fs,struct kernel_mm *mm,int64_t dirfd,
     uint64_t user_path,uint64_t user_buffer,uint64_t flags,int64_t *result)
 {
-    return stat_at_to_user(files,fs,mm,dirfd,user_path,user_buffer,flags,result,0);
+    return stat_at_to_user(files,fs,mm,dirfd,user_path,user_buffer,flags,result,0,0);
 }
 
 enum kernel_files_status kernel_files_statx(struct kernel_files *files,
@@ -890,7 +916,7 @@ enum kernel_files_status kernel_files_statx(struct kernel_files *files,
     if((mask&0x80000000U) || (flags&0x6000)==0x6000) {
         *result=-KERNEL_EINVAL;return KERNEL_FILES_STATUS_OK;
     }
-    return stat_at_to_user(files,fs,mm,dirfd,user_path,user_buffer,flags,result,1);
+    return stat_at_to_user(files,fs,mm,dirfd,user_path,user_buffer,flags,result,1,mask);
 }
 
 static void restore_access_credentials(const struct kernel_credentials **previous)

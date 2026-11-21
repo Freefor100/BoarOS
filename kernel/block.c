@@ -5,9 +5,43 @@
 #include <arch/context.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 static struct kernel_block_device *physical(struct kernel_block_device *device)
 { return device->parent ? device->parent : device; }
+
+static char *append_number(char *out, unsigned value)
+{
+    if (value >= 10) out = append_number(out, value / 10);
+    *out++ = '0' + value % 10;
+    return out;
+}
+
+int kernel_block_device_name(uint64_t number, char name[32])
+{
+    unsigned major = (number >> 8) & 0xfff;
+    unsigned minor = (number & 0xff) | ((number >> 12) & 0xfff00);
+    char *out = name;
+    if (major == 7) {
+        memcpy(out, "loop", 4);
+        out = append_number(out + 4, minor);
+    } else if (major == 252) {
+        unsigned disk = minor / 16;
+        char reversed[8];
+        size_t length = 0;
+        do {
+            reversed[length++] = 'a' + disk % 26;
+            disk = disk / 26;
+            if (!disk) break;
+            disk--;
+        } while (1);
+        *out++ = 'v'; *out++ = 'd';
+        while (length) *out++ = reversed[--length];
+        if (minor % 16) out = append_number(out, minor % 16);
+    } else return 0;
+    *out = '\0';
+    return 1;
+}
 
 static int write_needs_rmw(struct kernel_block_device *device,uint64_t offset,size_t size)
 {

@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <common/block_io.h>
+#include <kernel/page.h>
 #include <kernel/sync.h>
 
 enum kernel_block_status {
@@ -107,6 +108,17 @@ struct kernel_block_device {
 #define KERNEL_BLOCK_DEVICE_NUMBER(index) \
     (UINT64_C(0xfc00) | (((uint64_t)(index) * 16U) & 0xffU) | \
      ((((uint64_t)(index) * 16U) & ~UINT64_C(0xff)) << 12))
+
+/* Known block-device names are shared by devtmpfs and sysfs. */
+int kernel_block_device_name(uint64_t number, char name[32]);
+
+static inline uint32_t kernel_block_logical_size(const struct kernel_block_device *device)
+{ return __atomic_load_n(&device->logical_block_size, __ATOMIC_ACQUIRE); }
+
+/* Direct user I/O stages data in a kernel page and accepts only sector
+ * aligned offsets, lengths and user buffer addresses. */
+static inline uint32_t kernel_block_user_dio_alignment(uint32_t sector)
+{ return sector <= BOAROS_PAGE_SIZE ? sector : 0; }
 
 /* Return zero or negative errno. get pins registry membership; put consumes
  * that owner. A raw device pointer requires an existing lifetime owner.

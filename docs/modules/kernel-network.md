@@ -387,7 +387,7 @@ TX 的 SG 与复制回退在槽满时都登记 NIC 容量等待。无 indirect �
 
 TCP 默认采用 Nagle 的 Minshall 规则，与固定 Linux `tcp_minshall_check/update` 的边界一致：已经发出的完整 MSS 包不阻止第一个小包，尚未确认的小包会阻止后续小包。PCB 尾部记录最后一个新发小包的结束序列；主动／被动建连初始化该字段，实际输出成功才推进，重传和输出失败保留原值。判断使用 TCP 序列号比较，覆盖 32 位回绕；累计 ACK 越过该边界后解除等待。这样保留小包合并，同时减少整 MSS 在途数据与延迟 ACK 组合产生的等待。
 
-TCP 的 `send/sendto/sendmsg/sendmmsg` 接受用户 `MSG_MORE`，`splice` 的同一提示也沿 TCP COPY 路径生效。它与一次 syscall 内部的 `IO_MORE` 分开：本次应用输出可以暂留尚未发送的 sub-MSS 队尾，完整 MSS、非末段、重传、ACK 和 FIN 仍能前进。它不是持续的协议屏障，后续 ACK 或其他普通输出机会可以释放短尾。无 MORE 且接纳了数据的发送恢复普通 Nagle/Minshall；零长发送和首字节前 fault 不修改此前的提示，已有前缀后的 fault 保留当次提示，空间不足则在等待前显式推送成功前缀。
+TCP 的 `send/sendto/sendmsg/sendmmsg` 接受用户 `MSG_MORE`，`splice` 的同一提示也沿 TCP COPY 路径生效。用户提示沿协议控制块保留，输入回调、定时器和普通输出共用同一状态。未曾发送的短尾段继续暂留，独立确认报文（Acknowledgment，ACK）、完整报文段、重传和结束连接的报文均可推进。收到首个有序数据时，接收方立即安排 ACK，后续数据继续使用正常的延迟确认。这样在新连接上连续发送的小报文无需等首个延迟确认周期，发送端仍遵守 Nagle/Minshall。接受未带 MORE 的数据后解除当次提示。零长发送和首字节前 fault 保留此前提示，已有前缀后的 fault 保留当次提示，空间不足则在等待前显式推送成功前缀。
 
 `TCP_CORK` 是共享 socket 的持久配置，监听端点传给 accepted 子端点，IPv4/IPv6 相同。它对普通输出也抑制未满的新尾段，优先于已开启的 NODELAY；关闭 CORK 尝试发送已排队数据，但 NODELAY 未启用时仍遵守 Minshall。显式设置 NODELAY=1 会推送当前前缀，不清除 CORK，之后新短尾仍被 cork。SHUT_RD 不解 cork，SHUT_WR 和最后 close 仍保证 FIN 前的载荷进展。
 
@@ -396,6 +396,8 @@ TCP 的 `send/sendto/sendmsg/sendmmsg` 接受用户 `MSG_MORE`，`splice` 的同
 `tests/host/network_owner.py --case tcp-more --case tcp-cork` 以冻结时钟检查短尾、MSS、普通输出、期限/溢出、owner 迁移与回收。`tests/workloads/network/tcp_cork.c` 是 Linux/BoarOS 共用 libc 消费者，`tests/userland/tcp-cork.py` 使用已构建的静态程序与内核运行；它核对字节及有限推进，不把 PSH、接收批次或精确墙钟值当作接口保证。语义依据为固定 Linux `f4cdf7ca9a1f` 的 `net/ipv4/tcp.c`（tcp_push、tcp_sendmsg_locked、NODELAY）、`tcp_output.c`（Nagle、probe）与 [tcp(7)](https://man7.org/linux/man-pages/man7/tcp.7.html)。
 
 开启 `TCP_NODELAY` 时先禁用 Nagle，再立即尝试输出已有 unsent 数据。NIC 暂无容量时登记原有 NIC 容量等待，协议内存不足时使用原有 pool 等待；容量事件推动重试，不依赖收到 ACK 或推进定时器。关闭 NODELAY 只恢复 Nagle。用户数据报发送使用任务登记的请求和 iovec cursor，退出清理沿同一请求归还 OFD 和包引用。
+
+网络数据报的 `MSG_MORE` 由同一个套接字的协议执行者维护。第一次带标志的发送固定目的地址和端口，后续发送使用这些值。已复制的报文缓冲区按顺序交给待发送的数据报，最终一次无标志发送把它们作为单个数据报提交，并返回本次接纳的字节数。按数据报及套接字的大小上限限制待发送数据，同时约束许多小分片占用的协议内存。追加失败和最后关闭会归还已保留的缓冲区。
 
 INET stream 的 write/writev/send/sendmsg 使用任务登记的 `kernel_socket_write_request`，
 与数据报请求共用退出登记但不拥有数据报 packet。请求持有原 OFD pin，
