@@ -2,6 +2,7 @@
 #include "block_file_internal.h"
 #include "open_file_internal.h"
 #include "uaccess_iov_internal.h"
+#include <kernel/accounting.h>
 #include <kernel/errno.h>
 #include <kernel/heap.h>
 #include <kernel/page.h>
@@ -19,6 +20,17 @@ static int block_error(enum kernel_block_status status)
     case KERNEL_BLOCK_STATUS_INVALID: return -KERNEL_EINVAL;
     default: return -KERNEL_EIO;
     }
+}
+
+static int direct_block_write(struct kernel_block_device *device, uint64_t offset,
+    const void *buffer, size_t size, size_t *completed)
+{
+    int error = block_error(kernel_block_write_at(device, offset, buffer, size));
+    if (!error) {
+        *completed = size;
+        kernel_task_account_write(size);
+    }
+    return error;
 }
 int kernel_block_file_open(struct kernel_open_file_description *file, uint64_t number, uint32_t flags)
 {
@@ -105,8 +117,7 @@ enum kernel_files_status kernel_block_file_io(struct kernel_open_file_descriptio
              * mapping or DMA ownership after the synchronous request. */
             size_t accepted = direct ? copied - copied % sector : copied;
             if (accepted && direct) {
-                error = block_error(kernel_block_write_at(device, offset + total, buffer, accepted));
-                if (!error) completed = accepted;
+                error = direct_block_write(device, offset + total, buffer, accepted, &completed);
             } else if (accepted) error = block_error(kernel_block_write_bytes(device, offset + total,
                 buffer, accepted, buffer + BOAROS_PAGE_SIZE, sector, &completed));
             total += completed;
@@ -169,9 +180,7 @@ int kernel_block_file_pwrite(struct kernel_open_file_description *file, uint64_t
     size_t sector = kernel_block_logical_size(file->block);
     if (status_flags & KERNEL_FILES_O_DIRECT) {
         if (!sector || offset % sector || size % sector) return -KERNEL_EINVAL;
-        int error = block_error(kernel_block_write_at(file->block, offset, buffer, size));
-        if (!error) *completed = size;
-        return error;
+        return direct_block_write(file->block, offset, buffer, size, completed);
     }
     enum kernel_heap_status allocation = kernel_heap_allocate(file->heap, sector, &scratch);
     if (allocation) return allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
