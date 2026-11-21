@@ -326,6 +326,7 @@ int virtio_net_init(struct virtio_net_device *d, const struct virtio_transport *
     kernel_raw_lock_init(&d->state, KERNEL_RAW_RANK_OBJECT);
     d->transport = *transport; d->allocator = allocator; d->frequency = frequency;
     d->irq_source = source; d->version = transport->version;
+    d->wake_on_tx_submit = kernel_cpu_get_boot_count() <= 1;
     d->queue_order = d->version == 1 ? 2 : (BOAROS_PAGE_SHIFT < 13 ? 13 - BOAROS_PAGE_SHIFT : 0);
     d->buffer_order = 17 - BOAROS_PAGE_SHIFT;
     kernel_wait_queue_init(&d->progress);
@@ -437,6 +438,7 @@ void virtio_net_release(struct virtio_net_device *d, unsigned b)
         if (d->rx_count == 64) __builtin_trap();
         d->rx_free[(d->rx_head + d->rx_count++) % 64] = (uint16_t)b;
     }
+    COST_ADD(NET_RX_RETURN_WAKE, 1);
     wake(d);
 }
 static int tx_status(const struct virtio_net_device *d)
@@ -455,6 +457,7 @@ static int tx_slot(struct virtio_net_device *d, int *notify)
     if (d->failed) return -KERNEL_EIO;
     for (unsigned b = 0; b < VIRTIO_NET_BUFFERS; b++)
         if (d->tx_state[b] == TX_FREE) return (int)b;
+    COST_ADD(NET_TX_NOSLOT, 1);
     return -KERNEL_EAGAIN;
 }
 static void tx_publish(struct virtio_net_device *d, unsigned b, uint32_t size)
@@ -464,6 +467,14 @@ static void tx_publish(struct virtio_net_device *d, unsigned b, uint32_t size)
     d->statistics.tx_packets++; d->statistics.tx_bytes += size;
     flush_tx(d);
 }
+
+static int tx_submit_needs_wake(const struct virtio_net_device *d)
+{
+    /* Start watchdog coverage on the first submission. When a different
+     * CPU can already service completions, later submissions use its IRQ. */
+    return d->wake_on_tx_submit || (!d->tx_posted && !d->tx_count);
+}
+
 int virtio_net_send_copy(struct virtio_net_device *d, uint32_t size,
     int (*copy)(const void *, void *, uint32_t), const void *context)
 {
@@ -487,11 +498,13 @@ int virtio_net_send_copy(struct virtio_net_device *d, uint32_t size,
     memset(buffer, 0, h);
     int copied = copy(context, buffer + h, size);
     int result;
+    int wake_after_submit;
     {
         KERNEL_IRQ_LOCK_SCOPE(guard, &d->state);
         if (d->tx_state[slot] != TX_FILLING) __builtin_trap();
         check_status(d);
         result = copied ? tx_status(d) : -KERNEL_EIO;
+        wake_after_submit = result || tx_submit_needs_wake(d);
         if (result) {
             d->tx_state[slot] = TX_FREE;
             d->tx_capacity_generation++;
@@ -503,7 +516,7 @@ int virtio_net_send_copy(struct virtio_net_device *d, uint32_t size,
             result = (int)size;
         }
     }
-    wake(d);
+    if (wake_after_submit) wake(d);
     return result;
 }
 static int copy_data(const void *source, void *destination, uint32_t size)
@@ -538,10 +551,14 @@ int virtio_net_send_segments(struct virtio_net_device *d,
             d->tx_table[b] = (uint16_t)((count + 1U) * 16U);
             d->tx_owner[b] = owner;
             d->statistics.tx_sg_packets++;
+            notify |= tx_submit_needs_wake(d);
             tx_publish(d, b, (uint32_t)total);
         }
     }
-    if (slot >= 0 || notify) wake(d);
+    if (notify) {
+        COST_ADD(NET_TX_POST_WAKE, 1);
+        wake(d);
+    }
     return slot >= 0 ? 0 : slot;
 }
 unsigned virtio_net_tx_release(struct virtio_net_device *d,
@@ -573,6 +590,10 @@ unsigned virtio_net_tx_release(struct virtio_net_device *d,
 #endif
         }
         if (abandon) d->tx_head = d->tx_count = d->tx_done_head = d->tx_done_count = 0;
+    }
+    if (released) {
+        COST_ADD(NET_TX_RETURN, released);
+        COST_ADD(NET_TX_RETURN_BATCHES, 1);
     }
     for (unsigned i = 0; i < released; i++) release(owners[i]);
     return released;

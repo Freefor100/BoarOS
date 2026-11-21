@@ -29,6 +29,8 @@ TX 在协商 indirect（bit28）后按包发布槽内 indirect 表：首项为�
 `linkoutput` 不睡眠，容量不足返回 ERR_MEM。TCP 已接受的内容仍归协议，完成
 唤醒 worker 后先释放已完成 owner 和槽，再重试 unsent 数据，无需用户再次进入 syscall。零拷贝 TX 持引用期间 TCP 段保持 busy，完成后才可重传。
 
+多核启动时，发送队列从空闲转为有在途请求才因提交而通知执行线程，以建立设备超时检查。后续提交直接通知设备，由完成中断推动回收。如果提交者同时发现新的完成项，也会通知执行线程归还槽位和载荷引用。
+
 IRQ 先确认事件，再校验并收割完成，只唤醒 worker。used-index 差值、head ID、
 发布资格、长度和未协商 offload 头都必须合法；modern 运行期 NEEDS_RESET 在
 IRQ、service 与直接 send 入口都检查，不能因无 TX 或配置 IRQ 丢失而继续发布。
