@@ -34,6 +34,13 @@ int virtio_net_service(struct virtio_net_device *d)
 int virtio_net_poll_service(struct virtio_net_device *d) { return virtio_net_service(d); }
 int virtio_net_receive(struct virtio_net_device *d, struct virtio_net_frame *f)
 { (void)d; (void)f; return 0; }
+static unsigned protocol_held, ack_batch_active;
+void boaros_lwip_tcp_ack_batch_begin(void)
+{ if (!protocol_held || ack_batch_active) abort(); ack_batch_active = 1; }
+void boaros_lwip_tcp_ack_batch_flush(void)
+{ if (!ack_batch_active) abort(); }
+void boaros_lwip_tcp_ack_batch_end(void)
+{ boaros_lwip_tcp_ack_batch_flush(); ack_batch_active = 0; }
 void netif_set_link_down(struct netif *n) { n->flags &= (u8_t)~NETIF_FLAG_LINK_UP; }
 void netif_set_link_up(struct netif *n) { n->flags |= NETIF_FLAG_LINK_UP; }
 void kernel_socket_network_failed(uint32_t address) { (void)address; errors++; }
@@ -53,7 +60,7 @@ struct kernel_socket_service_result kernel_socket_service_pending(struct kernel_
     return (struct kernel_socket_service_result){.runnable = worker_mode >= 5 && protocol_attempts == 1, .next_deadline = 1200};
 }
 _Thread_local uintptr_t network_host_irq = RISCV_SSTATUS_SIE;
-static unsigned protocol_held, wait_active, wait_inject, wait_parks, wait_finishes;
+static unsigned wait_active, wait_inject, wait_parks, wait_finishes;
 static unsigned outer_acquisitions, owned_services;
 static int actual_work=-1;
 static struct virtio_net_device *wait_device;

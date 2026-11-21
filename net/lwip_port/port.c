@@ -106,8 +106,7 @@ uint64_t boaros_lwip_ipv4_path_generation(void)
 
 void boaros_lwip_ipv4_path_changed(void)
 {
-    if (boaros_lwip_parallel_enabled())
-        __atomic_add_fetch(&ipv4_path_generation,1,__ATOMIC_RELEASE);
+    __atomic_add_fetch(&ipv4_path_generation,1,__ATOMIC_RELEASE);
 }
 
 void boaros_lwip_ip_lock_shared(struct kernel_lock_guard *guard)

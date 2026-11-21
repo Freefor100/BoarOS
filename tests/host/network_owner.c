@@ -483,8 +483,10 @@ int virtio_net_send_segments(struct virtio_net_device *device,
     (void)device; (void)more; CHECK(segments && count && owner); ++segment_attempts;
 #if BOAROS_USER_SMP
     if (parallel_tx_probe) {
-        CHECK(current_tcp_owner() && !pthread_mutex_trylock(&model_ip_mutex));
-        CHECK(!pthread_mutex_unlock(&model_ip_mutex));
+        if (boaros_lwip_parallel_enabled()) {
+            CHECK(current_tcp_owner() && !pthread_mutex_trylock(&model_ip_mutex));
+            CHECK(!pthread_mutex_unlock(&model_ip_mutex));
+        } else CHECK(caller_owns_protocol());
         if (nic_full) {
             kernel_socket_network_capacity();
             return -KERNEL_EAGAIN;
@@ -1373,10 +1375,11 @@ static void test_arp_reply(struct netif *netif, const ip4_addr_t *peer, unsigned
     etharp_input(packet, netif);
 }
 
-static void tcp_resolved_output_contract(void)
+static void tcp_resolved_output_contract(int serial)
 {
+    if (serial) model_boot_cpus = 1;
     kernel_socket_network_initialize();
-    struct socket_tcp_owner *owner = tcp_lookup_test_start();
+    struct socket_tcp_owner *owner = serial ? NULL : tcp_lookup_test_start();
     struct virtio_net_device device = {.mac = {2, 0, 0, 0, 0, 2}};
     struct kernel_network network = {.device = &device};
     struct netif *netif = &network.interface;
@@ -1401,14 +1404,17 @@ static void tcp_resolved_output_contract(void)
     pcb->remote_port = 22001;
     pcb->cwnd = pcb->snd_wnd = pcb->snd_wnd_max = TCP_WND;
     TCP_REG_ACTIVE(pcb);
-    CHECK(tcp_promote(socket, &scope));
+    if (owner) CHECK(tcp_promote(socket, &scope));
     kernel_socket_protocol_leave(&scope);
 
-    CHECK(tcp_owner_lock(&scope, owner, 0));
+    if (owner) CHECK(tcp_owner_lock(&scope, owner, 0));
+    else kernel_socket_protocol_enter(&scope);
     parallel_tx_probe = dma_eligible = 1;
     tcp_nagle_disable(pcb);
     CHECK(tcp_write(pcb, "a", 1, TCP_WRITE_FLAG_COPY) == ERR_OK);
     CHECK(tcp_output(pcb) == ERR_OK && parallel_dma_count == 1);
+    uint64_t route_generation = pcb->boaros_path4.generation;
+    CHECK(route_generation);
     unsigned locked = model_ip_acquisitions;
     CHECK(tcp_write(pcb, "b", 1, TCP_WRITE_FLAG_COPY) == ERR_OK);
     CHECK(tcp_output(pcb) == ERR_OK && parallel_dma_count == 2);
@@ -1418,10 +1424,12 @@ static void tcp_resolved_output_contract(void)
     kernel_socket_protocol_enter(&scope);
     test_arp_reply(netif, &peer, 7);
     kernel_socket_protocol_leave(&scope);
-    CHECK(tcp_owner_lock(&scope, owner, 0));
+    if (owner) CHECK(tcp_owner_lock(&scope, owner, 0));
+    else kernel_socket_protocol_enter(&scope);
     CHECK(tcp_write(pcb, "c", 1, TCP_WRITE_FLAG_COPY) == ERR_OK);
     CHECK(tcp_output(pcb) == ERR_OK && parallel_dma_count == 3);
     CHECK(link_flushes == 3 && !link_deferred);
+    CHECK(pcb->boaros_path4.generation && pcb->boaros_path4.generation != route_generation);
     u32_t sequence = 0;
     for (unsigned i = 0; i < 3; i++) {
         struct pbuf *frame = parallel_dma[i];
@@ -1448,7 +1456,7 @@ static void tcp_resolved_output_contract(void)
     parallel_tx_probe = dma_eligible = 0;
     kernel_socket_destroy(socket);
     netif_remove(netif);
-    CHECK(!heap_live && !owner->context.active);
+    CHECK(!heap_live && (!owner || !owner->context.active));
     puts("PASS resolved IPv4 TCP send reuses route and refreshes the Ethernet neighbor");
 }
 
@@ -1964,7 +1972,7 @@ static void tcp_detached_copy(void)
     struct tcp_seg *prepared=NULL;
     CHECK(boaros_lwip_tcp_preparev(vector,2,(u16_t)length,mss,&prepared)==ERR_OK);
     CHECK(prepared && prepared->next && prepared->next->next && !prepared->next->next->next);
-    CHECK(MEMP_STATS_GET(used,MEMP_TCP_SEG)==pool+3);
+    CHECK(MEMP_STATS_GET(used,MEMP_TCP_SEG)==pool);
     memset(source,0,length);
 
     kernel_socket_protocol_enter(&scope);
@@ -1988,17 +1996,26 @@ static void tcp_detached_copy(void)
     CHECK(kernel_socket_finish_read(&read,0)==mss && pin==(void *)server);
     for (unsigned i=0;i<mss;i++) CHECK(output[i]==(unsigned char)(31*i+3));
 
-    /* Exhaust only the segment pool. A prepared prefix survives the second
-     * allocation failure; both the unused pbuf and the prefix are returned. */
-    void *held[MEMP_NUM_TCP_SEG]; unsigned count=0;
-    while (count<MEMP_NUM_TCP_SEG && (held[count]=memp_malloc(MEMP_TCP_SEG))) count++;
-    CHECK(count>1); memp_free(MEMP_TCP_SEG,held[--count]);
+    /* Leave room for one full segment. A prepared prefix survives a later
+     * allocation failure and the device can still retain its packet. */
+    struct tcp_seg *held[MEMP_NUM_TCP_SEG]; unsigned count=0;
+    while (count<MEMP_NUM_TCP_SEG &&
+           boaros_lwip_tcp_preparev(vector,2,mss,mss,&held[count])==ERR_OK) count++;
+    CHECK(count>1 && count<MEMP_NUM_TCP_SEG && !held[count]);
+    tcp_segs_free(held[--count]);
     mem_size_t heap=STATS_GET(mem.used);
-    CHECK(boaros_lwip_tcp_preparev(vector,2,(u16_t)length,mss,&prepared)==ERR_MEM);
+    CHECK(boaros_lwip_tcp_preparev(vector,2,(u16_t)(2*mss),mss,&prepared)==ERR_MEM);
     CHECK(prepared && prepared->len==mss && !prepared->next);
+    struct pbuf *submitted=prepared->p;
+    u16_t trimmed = submitted->tot_len - 8;
+    pbuf_realloc(submitted, trimmed);
+    CHECK(submitted->tot_len == trimmed);
+    pbuf_ref(submitted);
     tcp_segs_free(prepared);
+    CHECK(STATS_GET(mem.used)>heap);
+    pbuf_free(submitted);
     CHECK(STATS_GET(mem.used)==heap);
-    while (count) memp_free(MEMP_TCP_SEG,held[--count]);
+    while (count) tcp_segs_free(held[--count]);
     kernel_socket_protocol_enter(&scope);
     if (client->tcp) tcp_abort(client->tcp);
     if (server->tcp) tcp_abort(server->tcp);
@@ -2119,6 +2136,83 @@ static void tcp_loopback_checksum(void)
     kernel_socket_destroy(server);kernel_socket_destroy(client);kernel_socket_destroy(listener);
     (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,0});
     puts("PASS TCP checksum: the same bad checksum is rejected on Ethernet ingress and ignored on internal lo");
+}
+
+static void deliver_plain_ack(struct tcp_pcb *pcb, struct netif *inp, u32_t ack)
+{
+    struct pbuf *p = pbuf_alloc(PBUF_RAW, TCP_HLEN, PBUF_RAM);
+    CHECK(p);
+    struct tcp_hdr *h = p->payload;
+    memset(h, 0, sizeof(*h));
+    h->src = lwip_htons(pcb->remote_port);
+    h->dest = lwip_htons(pcb->local_port);
+    h->seqno = lwip_htonl(pcb->rcv_nxt);
+    h->ackno = lwip_htonl(ack);
+    h->wnd = lwip_htons(TCPWND16(pcb->snd_wnd));
+#if LWIP_WND_SCALE
+    h->wnd = lwip_htons(TCPWND16(pcb->snd_wnd >> pcb->snd_scale));
+#endif
+    TCPH_HDRLEN_FLAGS_SET(h, 5, TCP_ACK);
+    h->chksum = ip_chksum_pseudo(p, IP_PROTO_TCP, TCP_HLEN, &pcb->remote_ip, &pcb->local_ip);
+    tcp_input(p, inp);
+}
+
+static void tcp_ack_receive_batch(void)
+{
+    struct kernel_socket *listener = NULL, *client = NULL, *server = NULL;
+    connected_pair(&listener, &client, &server);
+    struct kernel_socket_protocol_scope scope;
+    kernel_socket_protocol_enter(&scope);
+    struct tcp_pcb *pcb = client->tcp;
+    struct netif *loop = loopback_netif();
+    const struct ip_globals saved = ip_data;
+    struct ip_hdr network = {0};
+    IPH_VHL_SET(&network, 4, 5);
+    ip_data.current_ip4_header = &network;
+    ip_data.current_ip_header_tot_len = IP_HLEN;
+    ip_data.current_netif = loop;
+    ip_data.current_input_netif = loop;
+    ip_addr_copy(ip_data.current_iphdr_src, pcb->remote_ip);
+    ip_addr_copy(ip_data.current_iphdr_dest, pcb->local_ip);
+    static unsigned char bytes[16384];
+    u16_t mss = tcp_mss(pcb);
+    CHECK(2U*mss <= sizeof(bytes));
+    pcb->cwnd = 2U*mss;
+    pcb->ssthresh = 3U*mss;
+    u32_t start = pcb->lastack;
+    CHECK(tcp_write(pcb, bytes, 2U*mss, TCP_WRITE_FLAG_COPY) == ERR_OK);
+    CHECK(tcp_output(pcb) == ERR_OK && pcb->snd_nxt == start + 2U*mss && pcb->unacked);
+    boaros_lwip_tcp_ack_batch_begin();
+    deliver_plain_ack(pcb, loop, start + mss);
+    CHECK(pcb->lastack == start);
+    deliver_plain_ack(pcb, loop, start + 2U*mss);
+    CHECK(pcb->lastack == start);
+    boaros_lwip_tcp_ack_batch_end();
+    CHECK(pcb->lastack == start + 2U*mss && !pcb->unacked);
+    CHECK(pcb->cwnd == 3U*mss && pcb->bytes_acked == mss);
+    start = pcb->lastack;
+    CHECK(tcp_write(pcb, bytes, 2U*mss, TCP_WRITE_FLAG_COPY) == ERR_OK);
+    CHECK(tcp_output(pcb) == ERR_OK && pcb->snd_nxt == start + 2U*mss);
+    boaros_lwip_tcp_ack_batch_begin();
+    deliver_plain_ack(pcb, loop, start + mss);
+    CHECK(pcb->lastack == start);
+    deliver_plain_ack(pcb, loop, start + mss);
+    CHECK(pcb->lastack == start + mss && pcb->dupacks == 1);
+    deliver_plain_ack(pcb, loop, start + 3U*mss);
+    CHECK(pcb->lastack == start + mss && pcb->unacked);
+    deliver_plain_ack(pcb, loop, start + 2U*mss);
+    boaros_lwip_tcp_ack_batch_end();
+    CHECK(pcb->lastack == start + 2U*mss && !pcb->unacked);
+    ip_data = saved;
+    tcp_abandon(client->tcp, 0);
+    tcp_abandon(server->tcp, 0);
+    netif_poll_all();
+    kernel_socket_protocol_leave(&scope);
+    kernel_socket_destroy(server);
+    kernel_socket_destroy(client);
+    kernel_socket_destroy(listener);
+    CHECK(!heap_live);
+    puts("PASS TCP ACK receive batch retains per-ACK congestion accounting");
 }
 
 static struct tcp_pcb *close_to_timewait(struct kernel_socket *client, struct kernel_socket *server)
@@ -5363,6 +5457,9 @@ static void tcp_single_cpu_service(void)
     kernel_socket_protocol_enter(&outer);
     kernel_socket_protocol_enter(&nested);
     CHECK(outer.outer && !nested.outer && protocol_depth == 2);
+    uint64_t route_generation = boaros_lwip_ipv4_path_generation();
+    boaros_lwip_ipv4_path_changed();
+    CHECK(boaros_lwip_ipv4_path_generation() != route_generation);
     kernel_socket_protocol_leave(&nested);
     kernel_socket_protocol_leave(&outer);
     CHECK(!protocol_depth && !protocol_current_owner() && !model_service_requests);
@@ -5404,12 +5501,14 @@ int main(int argc, char **argv)
         tcp_passive_capacity_retry(1);
     }
     else if (!strcmp(argv[1], "tcp-loopback-checksum")) tcp_loopback_checksum();
+    else if (!strcmp(argv[1], "tcp-ack-batch")) tcp_ack_receive_batch();
 #if BOAROS_USER_SMP
     else if (!strcmp(argv[1], "tcp-single-cpu-service")) tcp_single_cpu_service();
     else if (!strcmp(argv[1], "tcp-owner-lookup")) tcp_owner_lookup();
     else if (!strcmp(argv[1], "tcp-owner-placement")) tcp_owner_placement();
     else if (!strcmp(argv[1], "tcp-physical-submit")) tcp_physical_submit_contract();
-    else if (!strcmp(argv[1], "tcp-resolved-output")) tcp_resolved_output_contract();
+    else if (!strcmp(argv[1], "tcp-resolved-output")) tcp_resolved_output_contract(0);
+    else if (!strcmp(argv[1], "tcp-serial-resolved-output")) tcp_resolved_output_contract(1);
 #endif
     else if (!strcmp(argv[1], "tcp-cork")) tcp_cork_contract();
     else if (!strcmp(argv[1], "tcp-receive-before-wait")) tcp_receive_before_wait_contract();

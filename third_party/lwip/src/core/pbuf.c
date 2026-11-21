@@ -208,6 +208,7 @@ pbuf_init_alloced_pbuf(struct pbuf *p, void *payload, u16_t tot_len, u16_t len, 
   p->ref = 1;
   p->storage_refs = 1;
   p->if_idx = NETIF_NO_INDEX;
+  p->allocation_prefix = 0;
 
   LWIP_PBUF_CUSTOM_DATA_INIT(p);
 }
@@ -217,23 +218,34 @@ pbuf_alloc_ram(pbuf_layer layer, u16_t length, int tcp_data)
 {
   const u16_t offset = (u16_t)layer;
   const mem_size_t payload_len = (mem_size_t)(LWIP_MEM_ALIGN_SIZE(offset) + LWIP_MEM_ALIGN_SIZE(length));
-  const mem_size_t alloc_len = (mem_size_t)(LWIP_MEM_ALIGN_SIZE(SIZEOF_STRUCT_PBUF) + payload_len);
+  u8_t prefix = 0;
+  void *allocation;
   struct pbuf *p;
-  if ((payload_len < LWIP_MEM_ALIGN_SIZE(length)) || (alloc_len < LWIP_MEM_ALIGN_SIZE(length))) {
+#if BOAROS_LWIP_TCP_WRITEV
+  _Static_assert(LWIP_MEM_ALIGN_SIZE(sizeof(struct tcp_seg)) <= UINT8_MAX, "TCP buffer prefix");
+  if (tcp_data && layer == PBUF_TRANSPORT) {
+    prefix = LWIP_MEM_ALIGN_SIZE(sizeof(struct tcp_seg));
+  }
+#endif
+  const mem_size_t alloc_len = (mem_size_t)(prefix + SIZEOF_STRUCT_PBUF + payload_len);
+  if ((payload_len < LWIP_MEM_ALIGN_SIZE(length)) || (alloc_len < payload_len)) {
     return NULL;
   }
 #if BOAROS_LWIP_TCP_WRITEV
-  p = tcp_data ? boaros_lwip_mem_malloc_tcp_data(alloc_len) : mem_malloc(alloc_len);
+  allocation = tcp_data ? boaros_lwip_mem_malloc_tcp_data(alloc_len) : mem_malloc(alloc_len);
 #else
   LWIP_UNUSED_ARG(tcp_data);
-  p = mem_malloc(alloc_len);
+  allocation = mem_malloc(alloc_len);
 #endif
-  if (p != NULL) {
-    pbuf_init_alloced_pbuf(p, LWIP_MEM_ALIGN((void *)((u8_t *)p + SIZEOF_STRUCT_PBUF + offset)),
-                           length, length, PBUF_RAM, 0);
-    LWIP_ASSERT("pbuf_alloc: pbuf->payload properly aligned",
-                ((mem_ptr_t)p->payload % MEM_ALIGNMENT) == 0);
+  if (allocation == NULL) {
+    return NULL;
   }
+  p = (struct pbuf *)((u8_t *)allocation + prefix);
+  pbuf_init_alloced_pbuf(p, LWIP_MEM_ALIGN((void *)((u8_t *)p + SIZEOF_STRUCT_PBUF + offset)),
+                         length, length, PBUF_RAM, 0);
+  p->allocation_prefix = prefix;
+  LWIP_ASSERT("pbuf_alloc: pbuf->payload properly aligned",
+              ((mem_ptr_t)p->payload % MEM_ALIGNMENT) == 0);
   return p;
 }
 
@@ -481,10 +493,11 @@ pbuf_realloc(struct pbuf *p, u16_t new_len)
 #endif /* LWIP_SUPPORT_CUSTOM_PBUF */
      ) {
     /* reallocate and adjust the length of the pbuf that will be split */
-    struct pbuf *r = (struct pbuf *)mem_trim(q, (mem_size_t)(((u8_t *)q->payload - (u8_t *)q) + rem_len));
+    u8_t *allocation = (u8_t *)q - q->allocation_prefix;
+    void *r = mem_trim(allocation, (mem_size_t)(((u8_t *)q->payload - allocation) + rem_len));
     LWIP_ASSERT("mem_trim returned r == NULL", r != NULL);
     /* help to detect faulty overridden implementation of mem_trim */
-    LWIP_ASSERT("mem_trim returned r != q", r == q);
+    LWIP_ASSERT("mem_trim moved pbuf allocation", r == allocation);
     LWIP_UNUSED_ARG(r);
   }
   /* adjust length fields for new last pbuf */
@@ -749,7 +762,7 @@ pbuf_deallocate(struct pbuf *p)
     } else if (alloc_src == PBUF_TYPE_ALLOC_SRC_MASK_STD_MEMP_PBUF) {
       memp_free(MEMP_PBUF, p);
     } else if (alloc_src == PBUF_TYPE_ALLOC_SRC_MASK_STD_HEAP) {
-      mem_free(p);
+      mem_free((u8_t *)p - p->allocation_prefix);
     } else {
       LWIP_ASSERT("invalid pbuf type", 0);
     }

@@ -42,6 +42,11 @@ int boaros_lwip_udp_ingress_filter(struct udp_pcb *,struct pbuf *,struct netif *
 int boaros_lwip_tcp_ingress_filter(struct tcp_pcb *,struct pbuf *,struct netif *,int,const void *,uint16_t,uint16_t);
 void boaros_lwip_set_hooks(const struct boaros_lwip_hooks *hooks);
 void boaros_lwip_tcp_output(struct tcp_pcb *pcb);
+/* A serialized Ethernet receive pass may coalesce adjacent plain ACKs.
+ * Flush before handing other traffic to a protocol or returning the scope. */
+void boaros_lwip_tcp_ack_batch_begin(void);
+void boaros_lwip_tcp_ack_batch_flush(void);
+void boaros_lwip_tcp_ack_batch_end(void);
 void boaros_lwip_work_ready(void);
 void boaros_lwip_loopback_publish(struct netif *);
 void boaros_lwip_capacity_available(int pool);

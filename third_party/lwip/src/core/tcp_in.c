@@ -85,6 +85,8 @@ struct tcp_input_state {
   const ip_addr_t *src, *dst;
   u8_t *tcphdr_opt2;
   u32_t seqno, ackno;
+  const u32_t *ack_series;
+  unsigned ack_count;
   tcpwnd_size_t recv_acked;
   u16_t tcphdr_optlen, tcphdr_opt1len, tcp_optidx, tcplen;
   u8_t flags, recv_flags;
@@ -232,13 +234,15 @@ tcp_input_owned_active(struct tcp_pcb **bucket, const struct tcp_input_state *rx
 static void
 tcp_input_on(struct pbuf *p, struct netif *inp, struct netif *dest,
     const ip_addr_t *src, const ip_addr_t *dst, struct tcp_pcb **owner_bucket,
-    const void *network,u16_t network_length)
+    const void *network,u16_t network_length,const u32_t *ack_series,unsigned ack_count)
 {
   struct tcp_input_state scratch;
   struct tcp_input_state *rx = &scratch;
   rx->inp = inp;
   rx->src = src;
   rx->dst = dst;
+  rx->ack_series = ack_series;
+  rx->ack_count = ack_count;
   struct tcp_pcb *pcb, *prev;
   struct tcp_pcb_listen *lpcb;
 #if SO_REUSE
@@ -255,8 +259,17 @@ tcp_input_on(struct pbuf *p, struct netif *inp, struct netif *dest,
 
   PERF_START;
 
-  TCP_STATS_INC(tcp.recv);
-  MIB2_STATS_INC(mib2.tcpinsegs);
+  if (ack_count) {
+#if TCP_STATS
+    STATS_STORE(tcp.recv, STATS_GET(tcp.recv) + ack_count);
+#endif
+#if MIB2_STATS
+    STATS_STORE(mib2.tcpinsegs, STATS_GET(mib2.tcpinsegs) + ack_count);
+#endif
+  } else {
+    TCP_STATS_INC(tcp.recv);
+    MIB2_STATS_INC(mib2.tcpinsegs);
+  }
 
   rx->tcphdr = (struct tcp_hdr *)p->payload;
 
@@ -283,7 +296,7 @@ tcp_input_on(struct pbuf *p, struct netif *inp, struct netif *dest,
   }
 
 #if CHECKSUM_CHECK_TCP
-  IF__NETIF_CHECKSUM_ENABLED(inp, NETIF_CHECKSUM_CHECK_TCP) {
+  if (!ack_count) IF__NETIF_CHECKSUM_ENABLED(inp, NETIF_CHECKSUM_CHECK_TCP) {
     /* Verify TCP checksum. */
     u16_t chksum = ip_chksum_pseudo(p, IP_PROTO_TCP, p->tot_len,
                                     rx->src, rx->dst);
@@ -467,7 +480,7 @@ tcp_input_on(struct pbuf *p, struct netif *inp, struct netif *dest,
 
 
   if (!pcb && !tcp_prepare_input(rx,p,hdrlen_bytes)) goto dropped;
-  if (pcb && (!boaros_lwip_tcp_ingress_filter(pcb,p,inp,IP_IS_V6(dst),network,network_length,hdrlen_bytes) ||
+  if (pcb && ((!ack_count && !boaros_lwip_tcp_ingress_filter(pcb,p,inp,IP_IS_V6(dst),network,network_length,hdrlen_bytes)) ||
       !tcp_prepare_input(rx,p,hdrlen_bytes))) goto dropped;
 
 #ifdef LWIP_HOOK_TCP_INPACKET_PCB
@@ -493,7 +506,7 @@ tcp_input_on(struct pbuf *p, struct netif *inp, struct netif *dest,
     rx->inseg.tcphdr = rx->tcphdr;
 
 #ifdef BOAROS_LWIP_TCP_INFO
-    pcb->boaros_segs_in++;
+    pcb->boaros_segs_in += ack_count ? ack_count : 1;
     if (rx->inseg.len) pcb->boaros_data_in++;
 #endif
     rx->recv_data = NULL;
@@ -694,6 +707,125 @@ dropped:
   pbuf_free(p);
 }
 
+/* Only the serialized Ethernet protocol owner uses this batch. It holds at
+ * most one packet reference and never lends it outside the receive pass. */
+static struct {
+  struct pbuf *packet;
+  struct tcp_pcb *pcb;
+  struct netif *inp, *dest;
+  ip_addr_t src, dst;
+  const void *network;
+  u32_t acknowledgments[8];
+  unsigned count, active;
+} tcp_serial_acks;
+
+void
+boaros_lwip_tcp_ack_batch_begin(void)
+{
+  LWIP_ASSERT("serial TCP receive batch", !tcp_serial_acks.active &&
+              !boaros_lwip_parallel_enabled());
+  tcp_serial_acks.active = 1;
+}
+
+void
+boaros_lwip_tcp_ack_batch_flush(void)
+{
+  unsigned count = tcp_serial_acks.count;
+  if (!count) {
+    return;
+  }
+  unsigned active = tcp_serial_acks.active;
+  tcp_serial_acks.active = 0;
+  tcp_serial_acks.count = 0;
+  tcp_input_on(tcp_serial_acks.packet, tcp_serial_acks.inp, tcp_serial_acks.dest,
+               &tcp_serial_acks.src, &tcp_serial_acks.dst, NULL, tcp_serial_acks.network,
+               IP_HLEN, tcp_serial_acks.acknowledgments, count);
+  tcp_serial_acks.active = active;
+}
+
+void
+boaros_lwip_tcp_ack_batch_end(void)
+{
+  tcp_serial_acks.active = 0;
+  boaros_lwip_tcp_ack_batch_flush();
+}
+
+static int
+tcp_serial_ack_offer(struct pbuf *p, struct netif *inp, const ip_addr_t *src, const ip_addr_t *dst,
+                     const void *network, u16_t network_length)
+{
+  const struct tcp_hdr *header = p->payload;
+  if (!IP_IS_V4(dst) || network_length != IP_HLEN || p->len != TCP_HLEN ||
+      p->tot_len != TCP_HLEN || p->next ||
+      header->_hdrlen_rsvd_flags != lwip_htons((5U << 12) | TCP_ACK) ||
+      header->wnd == 0 || ip_addr_ismulticast(dst) ||
+      ip_addr_isbroadcast(dst, ip_current_netif())) {
+    return 0;
+  }
+
+  u32_t ack = lwip_ntohl(header->ackno);
+  u32_t seq = lwip_ntohl(header->seqno);
+  u16_t remote = lwip_ntohs(header->src), local = lwip_ntohs(header->dest);
+  if (tcp_serial_acks.count) {
+    const struct tcp_pcb *old = tcp_serial_acks.pcb;
+    if (tcp_serial_acks.inp != inp || tcp_serial_acks.dest != ip_current_netif() ||
+        old->remote_port != remote || old->local_port != local ||
+        !ip_addr_eq(&tcp_serial_acks.src, src) || !ip_addr_eq(&tcp_serial_acks.dst, dst) ||
+        !TCP_SEQ_GT(ack, tcp_serial_acks.acknowledgments[tcp_serial_acks.count - 1])) {
+      boaros_lwip_tcp_ack_batch_flush();
+    }
+  }
+
+  struct tcp_pcb *pcb = tcp_serial_acks.count ? tcp_serial_acks.pcb : tcp_active_pcbs;
+  if (!tcp_serial_acks.count) {
+    for (; pcb != NULL; pcb = pcb->next) {
+      if (pcb->remote_port == remote && pcb->local_port == local &&
+          (pcb->netif_idx == NETIF_NO_INDEX || pcb->netif_idx == netif_get_index(inp)) &&
+          ip_addr_eq(&pcb->remote_ip, src) && ip_addr_eq(&pcb->local_ip, dst)) {
+        break;
+      }
+    }
+  }
+  if (pcb == NULL || pcb->state != ESTABLISHED || pcb->refused_data || pcb->dupacks || pcb->nrtx ||
+      (pcb->flags & (TF_INFR | TF_RTO | TF_ACK_NOW)) ||
+      seq != pcb->rcv_nxt || !TCP_SEQ_GT(ack, pcb->lastack) || TCP_SEQ_GT(ack, pcb->snd_nxt) ||
+      (tcpwnd_size_t)SND_WND_SCALE(pcb, lwip_ntohs(header->wnd)) != pcb->snd_wnd) {
+    return 0;
+  }
+#if CHECKSUM_CHECK_TCP
+  IF__NETIF_CHECKSUM_ENABLED(inp, NETIF_CHECKSUM_CHECK_TCP) {
+    if (ip_chksum_pseudo(p, IP_PROTO_TCP, TCP_HLEN, src, dst)) {
+      return 0;
+    }
+  }
+#endif
+  if (!boaros_lwip_tcp_ingress_filter(pcb, p, inp, 0, network, network_length, TCP_HLEN)) {
+    TCP_STATS_INC(tcp.recv);
+    TCP_STATS_INC(tcp.drop);
+    MIB2_STATS_INC(mib2.tcpinsegs);
+    MIB2_STATS_INC(mib2.tcpinerrs);
+    pbuf_free(p);
+    return 1;
+  }
+
+  if (tcp_serial_acks.count) {
+    pbuf_free(tcp_serial_acks.packet);
+  } else {
+    tcp_serial_acks.pcb = pcb;
+    tcp_serial_acks.inp = inp;
+    tcp_serial_acks.dest = ip_current_netif();
+    ip_addr_copy(tcp_serial_acks.src, *src);
+    ip_addr_copy(tcp_serial_acks.dst, *dst);
+  }
+  tcp_serial_acks.packet = p;
+  tcp_serial_acks.network = network;
+  tcp_serial_acks.acknowledgments[tcp_serial_acks.count++] = ack;
+  if (tcp_serial_acks.count == LWIP_ARRAYSIZE(tcp_serial_acks.acknowledgments)) {
+    boaros_lwip_tcp_ack_batch_flush();
+  }
+  return 1;
+}
+
 void
 tcp_input(struct pbuf *p, struct netif *inp)
 {
@@ -701,7 +833,15 @@ tcp_input(struct pbuf *p, struct netif *inp)
 #ifdef BOAROS_LWIP_TCP_CONTEXT
   if (boaros_lwip_parallel_enabled() && boaros_lwip_tcp_dispatch(p, inp, src, dst)) return;
 #endif
-  tcp_input_on(p, inp, ip_current_netif(), src, dst, NULL,((const unsigned char *)ip_next_header_ptr()-ip_current_header_tot_len()),ip_current_header_tot_len());
+  u16_t network_length = ip_current_header_tot_len();
+  const unsigned char *network = (const unsigned char *)ip_next_header_ptr() - network_length;
+  if (!boaros_lwip_parallel_enabled() && tcp_serial_acks.active) {
+    if (tcp_serial_ack_offer(p, inp, src, dst, network, network_length)) {
+      return;
+    }
+    boaros_lwip_tcp_ack_batch_flush();
+  }
+  tcp_input_on(p, inp, ip_current_netif(), src, dst, NULL, network, network_length, NULL, 0);
 }
 
 #if BOAROS_USER_SMP
@@ -710,7 +850,7 @@ boaros_lwip_tcp_input_packet(struct pbuf *p, struct netif *inp,
     const ip_addr_t *src, const ip_addr_t *dst, const void *network, u16_t network_length,
     struct tcp_pcb **owner_bucket)
 {
-  tcp_input_on(p, inp, NULL, src, dst, owner_bucket, network, network_length);
+  tcp_input_on(p, inp, NULL, src, dst, owner_bucket, network, network_length, NULL, 0);
 }
 #endif
 
@@ -1415,25 +1555,26 @@ tcp_receive(struct tcp_input_state *rx, struct tcp_pcb *pcb)
       pcb->dupacks = 0;
       pcb->lastack = rx->ackno;
 
-      /* Update the congestion control variables (cwnd and
-         ssthresh). */
+      /* Retain each advancing ACK's congestion credit even when the
+         receive pass releases the acknowledged buffers together. */
       if (pcb->state >= ESTABLISHED) {
-        if (pcb->cwnd < pcb->ssthresh) {
-          tcpwnd_size_t increase;
-          /* limit to 1 SMSS segment during period following RTO */
-          u8_t num_seg = (pcb->flags & TF_RTO) ? 1 : 2;
-          /* RFC 3465, section 2.2 Slow Start */
-          increase = LWIP_MIN(acked, (tcpwnd_size_t)(num_seg * pcb->mss));
-          TCP_WND_INC(pcb->cwnd, increase);
-          LWIP_DEBUGF(TCP_CWND_DEBUG, ("tcp_receive: slow start cwnd %"TCPWNDSIZE_F"\n", pcb->cwnd));
-        } else {
-          /* RFC 3465, section 2.1 Congestion Avoidance */
-          TCP_WND_INC(pcb->bytes_acked, acked);
-          if (pcb->bytes_acked >= pcb->cwnd) {
-            pcb->bytes_acked = (tcpwnd_size_t)(pcb->bytes_acked - pcb->cwnd);
-            TCP_WND_INC(pcb->cwnd, pcb->mss);
+        u32_t previous = rx->ackno - acked;
+        for (unsigned i = 0; i < (rx->ack_count ? rx->ack_count : 1); i++) {
+          u32_t next_ack = rx->ack_count ? rx->ack_series[i] : rx->ackno;
+          tcpwnd_size_t increment = (tcpwnd_size_t)(next_ack - previous);
+          previous = next_ack;
+          if (pcb->cwnd < pcb->ssthresh) {
+            /* Limit to one segment during the period following RTO. */
+            u8_t num_seg = (pcb->flags & TF_RTO) ? 1 : 2;
+            tcpwnd_size_t increase = LWIP_MIN(increment, (tcpwnd_size_t)(num_seg * pcb->mss));
+            TCP_WND_INC(pcb->cwnd, increase);
+          } else {
+            TCP_WND_INC(pcb->bytes_acked, increment);
+            if (pcb->bytes_acked >= pcb->cwnd) {
+              pcb->bytes_acked = (tcpwnd_size_t)(pcb->bytes_acked - pcb->cwnd);
+              TCP_WND_INC(pcb->cwnd, pcb->mss);
+            }
           }
-          LWIP_DEBUGF(TCP_CWND_DEBUG, ("tcp_receive: congestion avoidance cwnd %"TCPWNDSIZE_F"\n", pcb->cwnd));
         }
       }
       LWIP_DEBUGF(TCP_INPUT_DEBUG, ("tcp_receive: ACK for %"U32_F", unacked->seqno %"U32_F":%"U32_F"\n",
