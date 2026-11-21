@@ -2764,8 +2764,17 @@ static void remote_work_ready(struct kernel_wait_node *node,uint32_t reason,uint
     CHECK(!pthread_mutex_lock(&remote_gate));remote_work=1;
     CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));
 }
+static struct tcp_pcb *close_retry_probe;
+static unsigned close_retry_attempts, close_retry_blocked;
+
 static err_t held_completion_tcp_output(struct tcp_pcb *pcb)
 {
+    if (pcb == close_retry_probe) {
+        close_retry_attempts++;
+        if (!close_retry_blocked) return ERR_OK;
+        kernel_socket_network_blocked();
+        return ERR_MEM;
+    }
     if (completion_output.socket && pcb==completion_output.socket->tcp) {
         CHECK(caller_owns_protocol() && !kernel_cpu_current()->raw_locks);
         CHECK(!pthread_mutex_lock(&remote_gate));
@@ -2777,6 +2786,55 @@ static err_t held_completion_tcp_output(struct tcp_pcb *pcb)
         CHECK(!pthread_mutex_unlock(&remote_gate));
     }
     return tcp_output(pcb);
+}
+
+static void tcp_close_capacity_retry(int capacity_before_close)
+{
+    kernel_socket_network_initialize();
+    struct kernel_socket *socket=NULL;
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_STREAM,0,&socket));
+    struct kernel_socket_protocol_scope scope;
+    kernel_socket_protocol_enter(&scope);
+    struct tcp_pcb *pcb=socket->tcp;
+    pcb->state=ESTABLISHED;
+    socket->connected=1;
+    TCP_REG_ACTIVE(pcb);
+    CHECK(tcp_write(pcb,"tail",4,TCP_WRITE_FLAG_COPY)==ERR_OK);
+    /* The application has shut down its write side and the device could
+     * not accept the last segment. Close has to transfer this retry. */
+    pcb->state=FIN_WAIT_1;
+    close_retry_probe=pcb;
+    close_retry_attempts=0;
+    close_retry_blocked=1;
+    socket_tcp_output(pcb);
+    CHECK(close_retry_attempts==1 && nic_wait.head==socket);
+    kernel_socket_protocol_leave(&scope);
+    if (capacity_before_close) kernel_socket_network_capacity();
+    kernel_socket_destroy(socket);
+    CHECK(!nic_wait.head && pcb->unsent && !pcb->callback_arg);
+    const struct kernel_socket_service_budget budget={8,8,1};
+    if (!capacity_before_close) {
+        kernel_socket_service_pending(budget);
+        CHECK(close_retry_attempts==1);
+        kernel_socket_network_capacity();
+    }
+    kernel_socket_service_pending(budget);
+    CHECK(close_retry_attempts==2);
+    kernel_socket_service_pending(budget);
+    CHECK(close_retry_attempts==2);
+    close_retry_blocked=0;
+    kernel_socket_network_capacity();
+    kernel_socket_service_pending(budget);
+    CHECK(close_retry_attempts==3);
+    kernel_socket_network_capacity();
+    kernel_socket_service_pending(budget);
+    CHECK(close_retry_attempts==3);
+    kernel_socket_protocol_enter(&scope);
+    close_retry_probe=NULL;
+    tcp_abandon(pcb,0);
+    kernel_socket_protocol_leave(&scope);
+    printf("PASS TCP close transfers the NIC retry with capacity %s close\n",
+        capacity_before_close ? "before" : "after");
 }
 struct completed_output_write {
     struct kernel_socket *socket;
@@ -5256,6 +5314,10 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "unix-seq-records")) unix_seqpacket_records();
     else if (!strcmp(argv[1], "ipv4-route")) ipv4_route_output();
     else if (!strcmp(argv[1], "internet-checksum")) internet_checksum();
+    else if (!strcmp(argv[1], "tcp-close-capacity-retry")) {
+        tcp_close_capacity_retry(0);
+        tcp_close_capacity_retry(1);
+    }
     else if (!strcmp(argv[1], "tcp-loopback-checksum")) tcp_loopback_checksum();
 #if BOAROS_USER_SMP
     else if (!strcmp(argv[1], "tcp-single-cpu-service")) tcp_single_cpu_service();

@@ -430,6 +430,7 @@ struct tcp_pcb {
   /* Delayed new short tail, owned and retired with this PCB. */
   u32_t boaros_cork_deadline, boaros_push_seq;
   u8_t boaros_output_more, boaros_cork_pending, boaros_push_pending, boaros_cork;
+  u8_t boaros_nic_retry;
   struct tcp_pcb *boaros_cork_prev, *boaros_cork_next;
 #ifdef BOAROS_LWIP_TCP_CONTEXT
   struct tcp_pcb *boaros_route_next;

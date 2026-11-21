@@ -561,6 +561,9 @@ enum { SOCKET_WORK_OUTPUT = 1, SOCKET_WORK_RECEIVE = 2, SOCKET_WORK_REAP = 4,
 struct socket_work_queue { struct kernel_socket *head, *tail; unsigned slot; };
 static struct socket_work_queue ready_work, pool_wait = {.slot = 1}, nic_wait = {.slot = 2}, receive_wait = {.slot = 3};
 static uint64_t pool_generation, nic_generation, receive_generation;
+/* Protected by socket_state_lock. The per-PCB marker belongs to its TCP
+ * context. These masks carry readiness without holding a PCB pointer. */
+static unsigned orphan_nic_wait, orphan_nic_ready;
 #if BOAROS_USER_SMP
 static unsigned pool_has_waiters;
 #endif
@@ -883,6 +886,41 @@ static int caller_owns_protocol(void)
     if (current_tcp_owner()) return 1;
 #endif
     return protocol_current_owner()==kernel_io_context_current() && protocol_depth;
+}
+
+static unsigned orphan_nic_context(void)
+{
+#if BOAROS_USER_SMP
+    struct socket_tcp_owner *owner = current_tcp_owner();
+    if (owner) return owner->index;
+#endif
+    return 0;
+}
+
+static void orphan_nic_notify_locked(struct socket_state_guard *state, unsigned mask)
+{
+    if (mask & 1U) socket_work_ready_locked(state);
+#if BOAROS_USER_SMP
+    for (unsigned cpu=1; mask>>cpu; cpu++) {
+        if (!(mask & (1U<<cpu))) continue;
+        struct socket_tcp_owner *owner = tcp_owner_at(cpu);
+        if (!tcp_owner_stopping(owner) && tcp_owner_take_waiting(owner))
+            socket_state_notify(state,&owner->work);
+    }
+#endif
+}
+
+static void orphan_nic_register_locked(struct socket_state_guard *state,
+    struct tcp_pcb *pcb, uint64_t generation)
+{
+    if (!pcb || network_stopping || socket_device_failed) return;
+    unsigned mask = 1U << orphan_nic_context();
+    pcb->boaros_nic_retry = 1;
+    orphan_nic_wait |= mask;
+    if (generation != nic_generation) {
+        orphan_nic_ready |= mask;
+        orphan_nic_notify_locked(state,mask);
+    }
 }
 
 static struct socket_work_queue *socket_ready_queue(const struct kernel_socket *socket)
@@ -3299,8 +3337,10 @@ void kernel_socket_destroy(struct kernel_socket *socket)
         socket->listener->pending_live--;
     }
     socket->listener = 0; socket->pending_ready = 0;
-    { KERNEL_IRQ_LOCK_SCOPE(work,&socket_state_lock);
+    { SOCKET_STATE(work);
       work_remove_locked(socket_ready_queue(socket),socket);work_remove_locked(&pool_wait,socket);
+      const struct socket_link *retry=&socket->work_links[nic_wait.slot];
+      if (retry->queued) orphan_nic_register_locked(work.owner,socket->tcp,retry->epoch);
       work_remove_locked(&nic_wait,socket);work_remove_locked(&receive_wait,socket); }
     write_retry_disarm(socket);
     if (socket->ipv4_members) {
@@ -5052,12 +5092,21 @@ static void socket_tcp_output(struct tcp_pcb *pcb)
 #if BOAROS_USER_SMP
     struct socket_tcp_owner *owner=current_tcp_owner();
     if (owner) blocked=&owner->nic_blocked;
-    uint64_t capacity = owner ? __atomic_load_n(&nic_generation,__ATOMIC_RELAXED) : 0;
+    uint64_t capacity = owner || !socket ? __atomic_load_n(&nic_generation,__ATOMIC_RELAXED) : 0;
+#else
+    uint64_t capacity = !socket ? __atomic_load_n(&nic_generation,__ATOMIC_RELAXED) : 0;
 #endif
     *blocked=0;
+    if (!socket) pcb->boaros_nic_retry=0;
     unsigned was_corked = pcb->boaros_cork_pending;
     err_t output = tcp_output(pcb);
-    if (!socket) return;
+    if (!socket) {
+        if (output==ERR_MEM && *blocked) {
+            SOCKET_STATE(state);
+            orphan_nic_register_locked(state.owner,pcb,capacity);
+        }
+        return;
+    }
     /* A direct caller may have armed a deadline while the worker was asleep. */
     if (!was_corked && pcb->boaros_cork_pending) socket_schedule(socket, 0);
     if (pcb->state==TIME_WAIT) { retire_timewait(socket); return; }
@@ -6520,7 +6569,8 @@ void kernel_socket_network_capacity(void)
 {
     SOCKET_STATE(state);
     __atomic_store_n(&nic_generation,nic_generation+1,__ATOMIC_RELAXED);
-    if(nic_wait.head)socket_work_ready_locked(state.owner);
+    orphan_nic_ready |= orphan_nic_wait;
+    orphan_nic_notify_locked(state.owner,orphan_nic_ready | (nic_wait.head != NULL));
 }
 void kernel_socket_network_blocked(void)
 {
@@ -6540,11 +6590,27 @@ int kernel_socket_work_pending(void)
     int timer_ready=sys_timeouts_sleeptime()==0 || boaros_lwip_tcp_cork_ready() ||
         (packet_timer_head && (int32_t)(sys_now()-packet_timer_head->packet_options->deadline)>=0);
     SOCKET_STATE(state);
-    int runnable = rights_dirty || (rights_retry_pending && (int32_t)(sys_now()-rights_retry_ms)>=0) || ready_work.head || loopback_pending ||
+    int runnable = rights_dirty || (rights_retry_pending && (int32_t)(sys_now()-rights_retry_ms)>=0) || ready_work.head || loopback_pending || (orphan_nic_ready & 1U) ||
         capacity_ready(&pool_wait,__atomic_load_n(&pool_generation,__ATOMIC_RELAXED)) || capacity_ready(&nic_wait, nic_generation) ||
         capacity_ready(&receive_wait, receive_generation) || timer_ready ||
         (write_retry_head && (int32_t)(sys_now() - write_retry_head->write_retry_ms) >= 0);
     return runnable;
+}
+
+static unsigned service_orphan_nic(unsigned cpu)
+{
+    unsigned mask = 1U << cpu;
+    {
+        SOCKET_STATE(state);
+        if (!(orphan_nic_ready & mask)) return 0;
+        orphan_nic_ready &= ~mask;
+        orphan_nic_wait &= ~mask;
+    }
+    /* The caller holds this context's protocol lock. The PCB pool bounds
+     * this pass. No PCB is borrowed by a different context or a work queue. */
+    for (struct tcp_pcb *pcb=tcp_active_pcbs;pcb;pcb=pcb->next)
+        if (pcb->boaros_nic_retry) socket_tcp_output(pcb);
+    return 1;
 }
 
 static unsigned service_ready_socket(unsigned budget,struct socket_work_queue *queue,
@@ -6680,6 +6746,7 @@ static void tcp_owner_worker(void *arg)
         struct kernel_wait_cursor ack_wake = {0};
         /* Include any consumer that registered since earlier ACKs in the batch. */
         tcp_prepare_ack_wake(ack_socket, &ack_wake);
+        if (!stopping) service_orphan_nic(owner->index);
         for (unsigned i=0;i<8 && service_ready_socket(4,&owner->ready,&scope);i++) {}
         if (!stopping) {
             owner->timer_running=1;
@@ -6693,7 +6760,7 @@ static void tcp_owner_worker(void *arg)
         {
             SOCKET_STATE(state);
             KERNEL_RAW_SCOPE(ingress,&owner->ingress);
-            if (!owner->count && !owner->ready.head) {
+            if (!owner->count && !owner->ready.head && !(orphan_nic_ready & (1U<<owner->index))) {
                 done=tcp_owner_stopping(owner);
                 if (!done) {
                     if (kernel_wait_prepare(&owner->work,deadline,0,&token)) __builtin_trap();
@@ -6721,6 +6788,8 @@ static void tcp_owner_close_admission(struct socket_tcp_owner *owner)
     SOCKET_STATE(state);
     KERNEL_RAW_SCOPE(ingress,&owner->ingress);
     __atomic_store_n(&owner->stopping,1,__ATOMIC_RELAXED);
+    orphan_nic_wait &= ~(1U<<owner->index);
+    orphan_nic_ready &= ~(1U<<owner->index);
 }
 
 static void tcp_owner_stop(struct socket_tcp_owner *owner)
@@ -6783,6 +6852,10 @@ void kernel_socket_stop_tcp_owners(void)
 static int service_capacity(void)
 {
     SOCKET_STATE(state);
+    if (orphan_nic_ready & 1U) {
+        socket_state_release(&state);
+        return service_orphan_nic(0);
+    }
     struct socket_work_queue *queues[] = {&pool_wait, &nic_wait, &receive_wait};
     uint64_t generations[] = {__atomic_load_n(&pool_generation,__ATOMIC_RELAXED),nic_generation,receive_generation};
     for (unsigned i = 0; i < 3; i++) {
@@ -6911,6 +6984,7 @@ struct kernel_socket_service_result kernel_socket_service_pending(struct kernel_
 void kernel_socket_network_purge_orphans(void)
 {
     struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
+    { SOCKET_STATE(state); orphan_nic_wait &= ~1U; orphan_nic_ready &= ~1U; }
     struct tcp_pcb *lists[] = {tcp_active_pcbs, tcp_bound_pcbs, tcp_tw_pcbs};
     for (unsigned i = 0; i < sizeof(lists) / sizeof(lists[0]); i++) {
         for (struct tcp_pcb *pcb = lists[i], *next; pcb; pcb = next) {
