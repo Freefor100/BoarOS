@@ -1277,17 +1277,18 @@ static void connected_pair(struct kernel_socket **listener, struct kernel_socket
     CHECK((*client)->connected && kernel_socket_accept(*listener, server, NULL) == 0);
 }
 
-static unsigned inline_receive_calls;
+static unsigned inline_receive_calls, inline_receive_target, inline_receive_count;
 static unsigned inline_receive_credit(void *context)
 {
     CHECK(caller_owns_protocol() && !kernel_cpu_current()->raw_locks);
     struct kernel_socket *client = context;
     SOCKET_ENDPOINT(state,client);
     CHECK(!tcp_admission_capacity_locked(client));
-    tcp_publish_capacity_locked(client);
-    CHECK(tcp_admission_capacity_locked(client));
-    inline_receive_calls++;
-    return 1;
+    if (++inline_receive_calls == inline_receive_target) {
+        tcp_publish_capacity_locked(client);
+        CHECK(tcp_admission_capacity_locked(client));
+    }
+    return inline_receive_count;
 }
 
 static void tcp_receive_before_wait_contract(void)
@@ -1298,13 +1299,24 @@ static void tcp_receive_before_wait_contract(void)
     struct kernel_wait_queue queue;
     kernel_wait_queue_init(&queue);
     kernel_socket_network_hooks(NULL, &queue, NULL, inline_receive_credit, client);
+    inline_receive_target = 2;
+    inline_receive_count = KERNEL_NETWORK_RECEIVE_BATCH;
     client->tx_budget = 0;
     CHECK(kernel_socket_wait_ready(client, KERNEL_POLLOUT, 0, KERNEL_SOCKET_MSG_DONTWAIT) == -KERNEL_EAGAIN);
     CHECK(!inline_receive_calls);
     CHECK(!kernel_socket_wait_ready(client, KERNEL_POLLOUT, 0, 0));
-    CHECK(inline_receive_calls == 1);
+    CHECK(inline_receive_calls == 2);
     CHECK(!kernel_socket_wait_ready(client, KERNEL_POLLOUT, 0, 0));
-    CHECK(inline_receive_calls == 1);
+    CHECK(inline_receive_calls == 2);
+    client->tx_budget = 0;
+    inline_receive_calls = 0;
+    inline_receive_target = 0;
+    socket_receive_before_wait(client);
+    CHECK(inline_receive_calls == 4 && !client->tx_budget);
+    inline_receive_calls = 0;
+    inline_receive_count = 1;
+    socket_receive_before_wait(client);
+    CHECK(inline_receive_calls == 1 && !client->tx_budget);
     struct kernel_socket_protocol_scope scope;
     kernel_socket_protocol_enter(&scope);
     tcp_abandon(client->tcp, 0);
@@ -1315,7 +1327,7 @@ static void tcp_receive_before_wait_contract(void)
     kernel_socket_destroy(server);
     kernel_socket_destroy(listener);
     CHECK(!heap_live);
-    puts("PASS single-CPU blocked TCP sender rechecks receive progress before parking");
+    puts("PASS single-CPU blocked TCP sender stops at returned credit or the receive budget");
 }
 
 #if BOAROS_USER_SMP
