@@ -5,6 +5,7 @@
 #include "write_source.h"
 #include <arch/context.h>
 
+#include <kernel/accounting.h>
 #include <kernel/block.h>
 #include <kernel/credentials.h>
 #include <kernel/io_context.h>
@@ -3877,9 +3878,12 @@ static int direct_transfer(struct kernel_vfs_file *file,uint64_t offset,
             error=node->instance->ops->writeback(node,&span,1);
             *done=span.written;
         } else if (!writing) error=node->instance->ops->pread(node,offset,buffer,size,done);
-        if (writing>0 && *done && offset+*done>node->size) {
-            __atomic_store_n(&node->size,offset+*done,__ATOMIC_RELEASE);
-            file->size=node->size;
+        if (writing>0 && *done) {
+            kernel_task_account_write(*done);
+            if (offset+*done>node->size) {
+                __atomic_store_n(&node->size,offset+*done,__ATOMIC_RELEASE);
+                file->size=node->size;
+            }
         }
         /* Even an error may have changed media. No clean cached preimage may
          * survive and later hide a device-completed prefix. */
