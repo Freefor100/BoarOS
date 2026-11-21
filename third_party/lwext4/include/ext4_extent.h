@@ -48,6 +48,9 @@ extern "C" {
 #include <ext4_types.h>
 #include <ext4_inode.h>
 
+/* A single insertion can allocate one block per level, including root growth. */
+enum { EXT4_EXTENT_MAX_DEPTH = 5 };
+
 void ext4_extent_tree_init(struct ext4_inode_ref *inode_ref);
 int ext4_extent_remove_tail(struct ext4_inode_ref *inode_ref, uint64_t keep,
     uint32_t window, bool *expanded, bool *done);

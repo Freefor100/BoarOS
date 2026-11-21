@@ -38,3 +38,33 @@ pthserv	testcases/kernel/sched/clisrv/pthserv.c	controller-client-and-terminatio
 shell_pipe01.sh	testcases/commands/shell/shell_pipe01.sh	upstream-pipeline-stdin-required
 timed_forkbomb	testcases/kernel/controllers/freezer/timed_forkbomb.c	controller-stdin-start-token-required
 tst_hexdump	testcases/lib/tst_hexdump.c	pipeline-stdin-and-EOF-required
+
+# All four audited configurations pass without a scoreable summary.
+fcntl14	testcases/kernel/syscalls/fcntl/fcntl14.c	evaluation-no-score-without-summary
+fcntl14_64	testcases/kernel/syscalls/fcntl/fcntl14.c	evaluation-no-score-without-summary
+ftest01	testcases/kernel/fs/ftest/ftest01.c	evaluation-no-score-without-summary
+ftest03	testcases/kernel/fs/ftest/ftest03.c	evaluation-no-score-without-summary
+ftest04	testcases/kernel/fs/ftest/ftest04.c	evaluation-no-score-without-summary
+ftest05	testcases/kernel/fs/ftest/ftest05.c	evaluation-no-score-without-summary
+ftest07	testcases/kernel/fs/ftest/ftest07.c	evaluation-no-score-without-summary
+ftest08	testcases/kernel/fs/ftest/ftest08.c	evaluation-no-score-without-summary
+inode02	testcases/kernel/fs/inode/inode02.c	evaluation-no-score-without-summary
+kill02	testcases/kernel/syscalls/kill/kill02.c	evaluation-no-score-without-summary
+lchown03	testcases/kernel/syscalls/lchown/lchown03.c	evaluation-no-score-without-summary
+mknodat02	testcases/kernel/syscalls/mknodat/mknodat02.c	evaluation-no-score-without-summary
+nptl01	testcases/kernel/sched/nptl/nptl01.c	evaluation-no-score-without-summary
+open12	testcases/kernel/syscalls/open/open12.c	evaluation-no-score-without-summary
+rename11	testcases/kernel/syscalls/rename/rename11.c	evaluation-no-score-without-summary
+rename14	testcases/kernel/syscalls/rename/rename14.c	evaluation-no-score-without-summary
+renameat01	testcases/kernel/syscalls/renameat/renameat01.c	evaluation-no-score-without-summary
+sendmsg02	testcases/kernel/syscalls/sendmsg/sendmsg02.c	evaluation-no-score-without-summary
+umount2_01	testcases/kernel/syscalls/umount2/umount2_01.c	evaluation-no-score-without-summary
+
+# At least 60 seconds for 1–2 points in the audit.
+cve-2016-7117	testcases/cve/cve-2016-7117.c	evaluation-time-budget-low-score
+dio_append	testcases/kernel/io/ltp-aiodio/dio_append.c	evaluation-time-budget-low-score
+dio_sparse	testcases/kernel/io/ltp-aiodio/dio_sparse.c	evaluation-time-budget-low-score
+inotify09	testcases/kernel/syscalls/inotify/inotify09.c	evaluation-time-budget-low-score
+mmap1	testcases/kernel/mem/mtest06/mmap1.c	evaluation-time-budget-low-score
+mmap3	testcases/kernel/mem/mtest06/mmap3.c	evaluation-time-budget-low-score
+starvation	testcases/kernel/sched/cfs-scheduler/starvation.c	evaluation-time-budget-low-score

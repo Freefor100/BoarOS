@@ -2861,7 +2861,7 @@ enum kernel_page_cache_status kernel_page_cache_get_batch(
 { return get_batch(cache,file,first,pages,count,no_reuse,0,false); }
 
 static void resize_apply(struct kernel_page_cache_resize *,uint64_t);
-static int write_admission(struct kernel_page_cache *cache,struct kernel_vfs_node *node);
+static int write_admission(struct kernel_page_cache *cache,struct kernel_vfs_node *node,int space_pressure);
 /* 已发布entry的借用覆盖其数据页，不再另加物理引用；完整冷覆盖只准备私有候选，
  * 用户来源缺页结束后才发布，避免把未初始化数据交给读取者或等待自身加载。 */
 static enum kernel_page_cache_status prepare_write_entry(struct kernel_page_cache *cache,
@@ -2997,25 +2997,33 @@ static int copy_cached_source(struct kernel_page_cache *cache,struct kernel_vfs_
     *written=0;
     size_t ready=0;
     int space_error=0;
+    int retried_space=0;
     struct kernel_vfs_write_view view={0};
     struct file_write_reservation *ticket=reservation->reservation;
     while (*written<size) {
         if (!ready) {
+            int retry_space=space_error==-KERNEL_ENOSPC && ticket->space_pressure && !retried_space;
             if (ticket->owner) {
                 reservation->accepted_end=offset;
                 prepare_space_request(cache,reservation,finish_space);
             }
-            if (space_error) return space_error;
-            int error=write_admission(cache,node);
+            if (space_error && !retry_space) return space_error;
+            int error=write_admission(cache,node,retry_space);
             if (error) return error;
+            retried_space=retry_space;
             size_t length=BOAROS_PAGE_CACHE_WRITEBACK_PAGES*BOAROS_PAGE_SIZE-(offset&BOAROS_PAGE_MASK);
             if (length>size-*written) length=size-*written;
             int needed=0;
             *reservation=(struct prepare_space){.node=node,.offset=offset,.length=length,.reservation=ticket};
+            ticket->space_pressure=0;
             space_error=prepare_space_request(cache,reservation,prepare_space);
             ready=reservation->ready;needed=reservation->complete;
             *complete|=needed;
-            if (!ready) return space_error;
+            if (!ready) {
+                if (space_error!=-KERNEL_ENOSPC || !ticket->space_pressure || retried_space)
+                    return space_error;
+                continue;
+            }
         }
         size_t start=offset&BOAROS_PAGE_MASK;
         size_t count=BOAROS_PAGE_SIZE-start;
@@ -3139,6 +3147,7 @@ PrepareTarget:
         kernel_vfs_write_source_finish(source,&view);
         kernel_page_cache_resize_finish(&resize,old_size);
         offset+=count; *written+=count; ready-=count;
+        retried_space=0;
     }
     return 0;
 }
@@ -3650,7 +3659,7 @@ struct write_admission_request {
     struct kernel_vfs_node *progress;
 #endif
     struct writeback_workspace *workspace;
-    int caller_writeback, independent_batch, advanced;
+    int caller_writeback, independent_batch, advanced, space_pressure;
     int result;
 };
 static void write_admission_window(void *argument)
@@ -3692,6 +3701,7 @@ static void write_admission_window(void *argument)
         for (dirty=r->dirty_head;dirty;dirty=dirty->queue_next) {
             entry=RB_MIN(kernel_page_cache_dirty_tree,&dirty->tree);
             if (entry && entry->node->instance->writeback.domain==request->node->instance->writeback.domain &&
+                (!request->space_pressure || entry->node->instance==request->node->instance) &&
                 (!request->caller_writeback ||
                  entry->node->instance->ops->file_operation_execution==KERNEL_VFS_EXECUTION_CALLER)) break;
         }
@@ -3751,12 +3761,12 @@ static void write_admission_local(struct write_admission_request *request)
     request->workspace=NULL;
     if (lease) foreground_workspace_put(request->cache,lease);
 }
-static int write_admission(struct kernel_page_cache *cache,struct kernel_vfs_node *node)
+static int write_admission(struct kernel_page_cache *cache,struct kernel_vfs_node *node,int space_pressure)
 {
     struct kernel_page_cache_record *r=cache->record;
     if (!r->started || r->stopping) return 0;
     uint64_t available=physical_page_available(cache->allocator);
-    if (available>r->low && !node_pressure(node,r,0)) return 0;
+    if (!space_pressure && available>r->low && !node_pressure(node,r,0)) return 0;
     /* 写入接纳处尚无inode锁、来源pin或cache写借用。不能等到分配器
      * 持有重入保护才等待脏页；executor也不能排队等待自己的后台工作。 */
     struct kernel_io_context *io=kernel_io_context_current();
@@ -3773,11 +3783,12 @@ static int write_admission(struct kernel_page_cache *cache,struct kernel_vfs_nod
         node->instance->ops->file_operation_execution==KERNEL_VFS_EXECUTION_CALLER;
     int caller_writeback=can_help && domain_bytes(domain)>=domain_limit(domain,0) &&
         __atomic_load_n(&r->group->domain_count,__ATOMIC_RELAXED)>1;
-    struct write_admission_request request={.cache=cache,.node=node,.caller_writeback=caller_writeback};
+    struct write_admission_request request={.cache=cache,.node=node,.caller_writeback=caller_writeback,
+        .space_pressure=space_pressure};
 #if BOAROS_MAX_CPUS > 1
     /* Only dirty-data pressure warrants helping here. If pinned versions or
      * journal metadata consume the budget, wait for their actual owner. */
-    if (can_help && !caller_writeback && kernel_cpu_get_boot_count()>1 &&
+    if (!space_pressure && can_help && !caller_writeback && kernel_cpu_get_boot_count()>1 &&
         __atomic_load_n(&domain->dirty_bytes,__ATOMIC_RELAXED)>=domain_limit(domain,0)) {
         request.caller_writeback=request.independent_batch=1;
         write_admission_local(&request);
@@ -3785,7 +3796,7 @@ static int write_admission(struct kernel_page_cache *cache,struct kernel_vfs_nod
         request.caller_writeback=request.independent_batch=0;
     }
 #endif
-    if (!executor && !caller_writeback &&
+    if (!space_pressure && !executor && !caller_writeback &&
         physical_page_available(cache->allocator)>=r->high && node_pressure(node,r,0)) {
         /* 额度归还由跨cache的共同owner通知；dirty转为借出的版本不算归还。
          * 后台轮次结束仍不足时保留原有界推进及错误处理。 */

@@ -40,6 +40,7 @@
 #define EXT4_EXT_DATA_VALID1 0x08  /* first half contains valid data */
 #define EXT4_EXT_DATA_VALID2 0x10  /* second half contains valid data */
 #define EXT4_EXT_NO_COMBINE 0x20   /* do not combine two extents */
+#define EXT4_EXT_INSERT_DATA 0x40  /* insert a newly allocated data extent */
 
 #define EXT4_EXT_UNWRITTEN_MASK (1L << 15)
 
@@ -492,12 +493,16 @@ static void ext4_idx_store_pblock(struct ext4_extent_index *ix, ext4_fsblk_t pb)
 }
 
 static ext4_fsblk_t ext4_new_meta_blocks(struct ext4_inode_ref *inode_ref,
-    ext4_fsblk_t goal, uint32_t flags __unused, uint32_t *count, int *errp)
+    ext4_fsblk_t goal, uint32_t flags, int *errp)
 {
     ext4_fsblk_t block = 0;
     uint32_t allocated = 0;
-    *errp = ext4_balloc_alloc_blocks(inode_ref, goal, count ? *count : 1, &block, &allocated);
-    if (count) *count = allocated;
+    struct ext4_operation *operation=ext4_current_operation(inode_ref->fs);
+    if (operation)
+        operation->extent_allocation=(flags&EXT4_EXT_INSERT_DATA)
+            ? EXT4_ALLOC_DELAYED_EXTENT_METADATA : EXT4_ALLOC_EXTENT_METADATA;
+    *errp=ext4_balloc_alloc_blocks(inode_ref,goal,1,&block,&allocated);
+    if (operation) operation->extent_allocation=EXT4_ALLOC_DATA;
     return block;
 }
 
@@ -641,7 +646,7 @@ static ext4_fsblk_t ext4_ext_new_meta_block(struct ext4_inode_ref *inode_ref,
 	ext4_fsblk_t goal, newblock;
 
 	goal = ext4_ext_find_goal(inode_ref, path, to_le32(ex->first_block));
-	newblock = ext4_new_meta_blocks(inode_ref, goal, flags, NULL, err);
+	newblock = ext4_new_meta_blocks(inode_ref, goal, flags, err);
 	return newblock;
 }
 
@@ -865,7 +870,7 @@ static int ext4_ext_check_root(struct ext4_inode_ref *inode_ref)
 {
     struct ext4_extent_header *eh=ext_inode_hdr(inode_ref->inode);
     unsigned depth=ext_depth(inode_ref->inode);
-	if (to_le16(eh->magic) != EXT4_EXTENT_MAGIC || depth > 5 ||
+	if (to_le16(eh->magic) != EXT4_EXTENT_MAGIC || depth > EXT4_EXTENT_MAX_DEPTH ||
 	    to_le16(eh->max_entries_count) >
 	      (sizeof(inode_ref->inode->blocks) - sizeof(*eh)) /
 		 sizeof(struct ext4_extent) ||
@@ -1107,7 +1112,7 @@ static int ext4_ext_split_node(struct ext4_inode_ref *inode_ref,
 			       struct ext4_extent_path *path, int at,
 			       struct ext4_extent *newext,
 			       struct ext4_extent_path *npath,
-			       bool *ins_right_leaf)
+			       bool *ins_right_leaf, int flags)
 {
 	int i, npath_at, ret;
 	ext4_lblk_t insert_index;
@@ -1128,7 +1133,7 @@ static int ext4_ext_split_node(struct ext4_inode_ref *inode_ref,
 		/* FIXME: currently we split at the point after the current
 		 * extent. */
 		newblock =
-		    ext4_ext_new_meta_block(inode_ref, path, newext, &ret, 0);
+		    ext4_ext_new_meta_block(inode_ref, path, newext, &ret, flags);
 		if (ret != EOK)
 			goto cleanup;
 
@@ -1473,7 +1478,7 @@ static int ext4_ext_grow_indepth(struct ext4_inode_ref *inode_ref,
 	else
 		goal = ext4_fs_inode_to_goal_block(inode_ref);
 
-	newblock = ext4_new_meta_blocks(inode_ref, goal, flags, NULL, &err);
+	newblock = ext4_new_meta_blocks(inode_ref, goal, flags, &err);
 	if (newblock == 0)
 		return err;
 
@@ -1554,7 +1559,11 @@ again:
 
 		/* Do we need to grow the tree? */
 		if (i < 0) {
-			ret = ext4_ext_grow_indepth(inode_ref, 0);
+			if (depth == EXT4_EXTENT_MAX_DEPTH) {
+				ret = EFBIG;
+				goto out;
+			}
+			ret = ext4_ext_grow_indepth(inode_ref, flags);
 			if (ret != EOK)
 				goto out;
 
@@ -1582,7 +1591,7 @@ again:
 				goto out;
 			}
 			ret = ext4_ext_split_node(inode_ref, path, i, newext,
-						  npath, &ins_right_leaf);
+						  npath, &ins_right_leaf, flags);
 			if (ret != EOK)
 				goto out;
 
@@ -2382,7 +2391,7 @@ static int extent_get_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock
 
 	/* allocate new block */
 	goal = ext4_ext_find_goal(inode_ref, path, iblock);
-	newblock = ext4_new_meta_blocks(inode_ref, goal, 0, &allocated, &err);
+	err = ext4_balloc_alloc_blocks(inode_ref, goal, allocated, &newblock, &allocated);
 	if (!newblock)
 		goto out2;
 
@@ -2391,7 +2400,7 @@ static int extent_get_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock
 	ext4_ext_store_pblock(&newex, newblock);
 	newex.block_count = to_le16(allocated);
     if (reserve) ext4_ext_mark_unwritten(&newex);
-	err = ext4_ext_insert_extent(inode_ref, &path, &newex, 0);
+	err = ext4_ext_insert_extent(inode_ref, &path, &newex, reserve ? 0 : EXT4_EXT_INSERT_DATA);
 	if (err != EOK) {
 		/* Private journal mappings and allocation claims are discarded on
 		 * abort. An exclusive free here could obscure the original failure. */

@@ -15,6 +15,12 @@ enum ext4_resource_kind {
     EXT4_RESOURCE_ORPHAN,
     EXT4_RESOURCE_BLOCK_GROUP,
 };
+enum ext4_extent_allocation {
+    EXT4_ALLOC_DATA,
+    EXT4_ALLOC_EXTENT_METADATA,
+    EXT4_ALLOC_DELAYED_EXTENT_METADATA,
+};
+
 /* Private preparation belongs to the actual task, independently of journal
  * groups and the mount's accepted metadata. */
 struct ext4_operation {
@@ -27,7 +33,8 @@ struct ext4_operation {
     struct ext4_delalloc *delalloc;
     struct file_write_span *delalloc_spans;
     unsigned delalloc_span_count;
-    uint64_t delalloc_credit, delalloc_used;
+    uint64_t delalloc_credit, delalloc_used, delalloc_extent_used;
+    enum ext4_extent_allocation extent_allocation;
 
     uint32_t ro_flags_add;
     uint32_t orphan_base, orphan_head;

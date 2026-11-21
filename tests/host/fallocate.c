@@ -424,6 +424,65 @@ static void count_reservation_backend_lock(void *context)
 static void count_reservation_state_lock(void *context)
 { reservation_state_calls++;reservation_state_lock(context); }
 
+static void delayed_extent_growth(struct kernel_page_cache *cache,struct kernel_vfs_mount *mount)
+{
+    struct kernel_vfs_file file={0},filler={0},tail={0};
+    struct ext4_fs *fs=lwext4_instance(mount->private_data)->device.fs;
+    size_t block=fs->bdev->lg_bsize,done;
+    unsigned char bytes[4096];memset(bytes,0x63,block);
+    uint64_t observed=0;
+    assert(!create_file(mount,"/extent-growth",0600,&file));
+    assert(!create_file(mount,"/pending-space",0600,&filler));
+    assert(!create_file(mount,"/last-space",0600,&tail));
+    for (unsigned i=0;i<4;i++) {
+        assert(!kernel_vfs_pwrite(&file,2*i*block,bytes,block,&done) && done==block);
+        assert(!kernel_vfs_sync(&file,0,&observed));
+    }
+    assert(!kernel_vfs_pwrite(&file,8*block,bytes,block,&done) && done==block);
+    assert(!mapped(&file,8).block);
+    struct file_write_reservation ticket={0};
+    {
+        KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(kernel_vfs_file_node(&filler),&io,1);
+        int error=ext4_file_reserve_write(lwext4_node_file(kernel_vfs_file_node(&filler)),
+            0,ext4_fs_available_blocks(fs)*block,&done,&ticket);
+        assert((!error || error==ENOSPC) && done && ticket.owner);
+    }
+    uint64_t remainder=ext4_fs_available_blocks(fs);
+    if (remainder) assert(!kernel_vfs_fallocate(&tail,0,0,remainder*block));
+    assert(!ext4_fs_available_blocks(fs));
+    uint64_t pending=fs->delayed_blocks,metadata=fs->delayed_extent_blocks;
+    uint64_t free=ext4_sb_get_free_blocks_cnt(&fs->sb);
+    fail_delayed_allocation=ENOMEM;
+    assert(kernel_page_cache_writeback(cache,kernel_vfs_file_node(&file))==-KERNEL_ENOMEM &&
+        !fail_delayed_allocation);
+    assert(!mapped(&file,8).block && fs->delayed_blocks==pending &&
+        fs->delayed_extent_blocks==metadata && !fs->reserved_blocks &&
+        ext4_sb_get_free_blocks_cnt(&fs->sb)==free && !ext4_fs_available_blocks(fs));
+    assert(kernel_vfs_sync(&file,0,&observed)==-KERNEL_ENOMEM);
+    assert(!kernel_vfs_sync(&file,0,&observed));
+    assert(mapped(&file,8).block);
+    {
+        KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(kernel_vfs_file_node(&filler),&io,1);
+        ext4_file_finish_reservation(lwext4_node_file(kernel_vfs_file_node(&filler)),&ticket,0,0);
+    }
+    assert(!fs->delayed_blocks && !fs->delayed_extent_blocks && !fs->reserved_blocks);
+    assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&file)));
+    unsigned char readback[4096];
+    assert(!kernel_vfs_pread(&file,8*block,readback,block,&done,NULL) && done==block &&
+        !memcmp(bytes,readback,block));
+    assert(!kernel_vfs_pwrite(&file,10*block,bytes,block,&done) && done==block);
+    assert(fs->delayed_blocks==1 && fs->delayed_extent_blocks);
+    assert(!kernel_vfs_fallocate(&file,KERNEL_VFS_FALLOC_PUNCH_HOLE|KERNEL_VFS_FALLOC_KEEP_SIZE,
+        10*block,block));
+    assert(!mapped(&file,10).block && !fs->delayed_blocks && !fs->delayed_extent_blocks);
+    assert(!kernel_vfs_pwrite(&file,10*block,bytes,block,&done) && done==block);
+    assert(fs->delayed_blocks==1 && fs->delayed_extent_blocks);
+    assert(!kernel_vfs_ftruncate(&file,9*block));
+    assert(!mapped(&file,10).block && !fs->delayed_blocks && !fs->delayed_extent_blocks);
+    assert(!kernel_vfs_close(&tail) && !kernel_vfs_close(&filler) && !kernel_vfs_close(&file));
+    puts("PASS full extent growth, writeback rollback, durable data, punch and truncate");
+}
+
 static void delayed_allocation(struct kernel_page_cache *cache, struct kernel_vfs_mount *mount)
 {
     struct kernel_vfs_file file={0};
@@ -580,8 +639,9 @@ static void delayed_allocation(struct kernel_page_cache *cache, struct kernel_vf
     assert(!kernel_vfs_ftruncate(&file,0));
     /* The old preparation stays alive while fallocate turns a nearby hole
      * into an unwritten mapping. Covering that mapping must work at zero quota. */
-    struct kernel_vfs_file filler={0};
+    struct kernel_vfs_file filler={0},tail={0};
     assert(!create_file(mount,"/delalloc-full-quota",0600,&filler));
+    assert(!create_file(mount,"/delalloc-last-space",0600,&tail));
     struct file_write_reservation held={0},full={0};
     {
         KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(kernel_vfs_file_node(&file),&io,1);
@@ -592,9 +652,12 @@ static void delayed_allocation(struct kernel_page_cache *cache, struct kernel_vf
     {
         KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(kernel_vfs_file_node(&filler),&io,1);
         size_t length=ext4_fs_available_blocks(fs)*block;
-        assert(length && !ext4_file_reserve_write(lwext4_node_file(kernel_vfs_file_node(&filler)),
-            0,length,&done,&full) && done==length && full.owner);
+        int error=ext4_file_reserve_write(lwext4_node_file(kernel_vfs_file_node(&filler)),
+            0,length,&done,&full);
+        assert(done && full.owner && (error==ENOSPC || (!error && done==length)));
     }
+    uint64_t remainder=ext4_fs_available_blocks(fs);
+    if (remainder) assert(!kernel_vfs_fallocate(&tail,0,0,remainder*block));
     assert(!ext4_fs_available_blocks(fs));
     assert(!kernel_vfs_pwrite(&file,block,bytes,block,&done) && done==block);
     {
@@ -605,7 +668,8 @@ static void delayed_allocation(struct kernel_page_cache *cache, struct kernel_vf
         KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(kernel_vfs_file_node(&file),&io,1);
         ext4_file_finish_reservation(lwext4_node_file(kernel_vfs_file_node(&file)),&held,0,0);
     }
-    assert(fs->delayed_blocks==baseline && !kernel_vfs_close(&filler));
+    assert(fs->delayed_blocks==baseline && !fs->delayed_extent_blocks &&
+        !kernel_vfs_close(&filler) && !kernel_vfs_close(&tail));
     assert(!kernel_vfs_sync(&file,0,&observed) && !kernel_vfs_close(&file));
     puts("PASS delayed allocation: cache visibility, failed writeback ownership, retry, batched conversion and truncate");
 }
@@ -1755,6 +1819,7 @@ int main(int argc,char **argv)
     struct kernel_vfs_mount mount={0}; assert(!kernel_vfs_mount_ext4(&mount,&device,
         !strncmp(argv[2],"namespace-",10)?&heap:&backend_heap,&cache,0));
     if (!strcmp(argv[2],"delalloc")) {delayed_allocation(&cache,&mount);goto mounted_done;}
+    if (!strcmp(argv[2],"delalloc-full-growth")) {delayed_extent_growth(&cache,&mount);goto mounted_done;}
     if (!strcmp(argv[2],"vfs-socket")) {vfs_socket_paths(&mount);goto mounted_done;}
     if (!strcmp(argv[2],"credential-race")) {credential_namespace_race(&mount);goto mounted_done;}
     if (!strcmp(argv[2],"credential-chown")) {credential_chown_groups(&mount);goto mounted_done;}

@@ -26,6 +26,7 @@
 #include <ext4_blockdev.h>
 #include <ext4_inode.h>
 #include <ext4_fs.h>
+#include <ext4_extent.h>
 #include <ext4_journal.h>
 #include <ext4_journal_memory.h>
 #include <ext4_orphan.h>
@@ -3141,6 +3142,24 @@ static int ext4_backend_reserve_write(struct kernel_vfs_node *node,uint64_t offs
     *complete=0;
     int result=ext4_file_reserve_write(lwext4_node_file(node),offset,length,ready,ticket);
     if (result==ENOTSUP)return ext4_backend_prepare_write(node,offset,length,ready,complete);
+    if (result==ENOSPC && !*ready && !ticket->space_pressure && offset>=node->size) {
+        struct ext4_fs *fs=lwext4_instance(node->instance)->device.fs;
+        uint64_t free=ext4_fs_available_blocks(fs);
+        if (free && free<=EXT4_EXTENT_MAX_DEPTH) {
+            /* With only a few blocks left, try the actual tree insertion
+             * before accepting an append. Orphan cleanup owns any unwritten
+             * tail left by a short copy or a bad user buffer. */
+            size_t extent=free*fs->bdev->lg_bsize-offset%fs->bdev->lg_bsize;
+            if (extent>length) extent=length;
+            int error=ext4_backend_prepare_write(node,offset,extent,ready,complete);
+            size_t first=fs->bdev->lg_bsize-offset%fs->bdev->lg_bsize;
+            if (error==-KERNEL_ENOSPC && !*ready && !*complete && extent>first) {
+                extent=first;
+                error=ext4_backend_prepare_write(node,offset,extent,ready,complete);
+            }
+            return !error && extent<length ? -KERNEL_ENOSPC : error;
+        }
+    }
     return lwext4_error(result);
 }
 static void ext4_backend_accept_reservation(struct kernel_vfs_node *node,struct file_write_reservation *ticket,uint64_t start,uint64_t end)

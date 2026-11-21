@@ -87,6 +87,7 @@ struct ext4_fs {
     struct kernel_raw_lock block_space;
     uint64_t reserved_blocks;
     uint64_t delayed_blocks;
+    uint64_t delayed_extent_blocks;
     uint32_t reserved_inodes;
     struct ext4_inode_goal_tree inode_goals;
     struct ext4_inode_goal_queue pending_inode_goals;
