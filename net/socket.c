@@ -609,7 +609,7 @@ struct socket_tcp_owner {
      * lock. The worker joins both locks only when it prepares to sleep. */
     struct kernel_raw_lock ingress;
     struct socket_tcp_input ring[TCP_RX_RING];
-    unsigned index, head, count, depth, nic_blocked;
+    unsigned index, head, count, depth, nic_blocked, timewait_count;
     uint8_t timer_running, stopping, output_reserved, waiting;
 };
 static struct socket_tcp_owner tcp_owners[BOAROS_MAX_CPUS-1];
@@ -1951,7 +1951,9 @@ static void tcp_pcb_forget(struct tcp_pcb *pcb)
     }
     *link=pcb->boaros_route_next;
     pcb->boaros_route_next=0;
-    if (tcp_get_state(pcb)!=TIME_WAIT) tcp_owner_active[pcb->boaros_owner]--;
+    if (tcp_get_state(pcb) == TIME_WAIT)
+        __atomic_sub_fetch(&owner->timewait_count, 1, __ATOMIC_RELAXED);
+    else tcp_owner_active[pcb->boaros_owner]--;
     if (pcb->boaros_loopback_peer) {
         struct tcp_pcb *peer=pcb->boaros_loopback_peer;
         if (peer->boaros_owner!=pcb->boaros_owner || peer->boaros_loopback_peer!=pcb)
@@ -1968,6 +1970,29 @@ static void tcp_pcb_timewait(struct tcp_pcb *pcb)
     if (!pcb->boaros_owner) return;
     KERNEL_RAW_SCOPE(guard,&tcp_route_lock);
     tcp_owner_active[pcb->boaros_owner]--;
+    __atomic_add_fetch(&tcp_owner_at(pcb->boaros_owner)->timewait_count, 1, __ATOMIC_RELAXED);
+}
+
+static int tcp_reclaim_remote_timewait(void)
+{
+    unsigned count = __atomic_load_n(&tcp_owner_count, __ATOMIC_ACQUIRE);
+    if (!count || current_tcp_owner() || protocol_current_owner() != kernel_io_context_current())
+        return 0;
+    int reclaimed = 0;
+    struct kernel_lock_guard *ip = NULL;
+    for (unsigned cpu = 1; cpu <= count && !reclaimed; ++cpu) {
+        struct socket_tcp_owner *owner = tcp_owner_at(cpu);
+        if (!__atomic_load_n(&owner->timewait_count, __ATOMIC_RELAXED)) continue;
+        /* The default TCP mutex still owns the listener and the input packet.
+         * Drop IP before acquiring a shard, in the same order as promotion. */
+        if (!ip && !(ip = boaros_lwip_ip_drop_current())) return 0;
+        struct kernel_socket_protocol_scope scope;
+        (void)tcp_owner_lock(&scope, owner, 0);
+        if (!tcp_owner_stopping(owner)) reclaimed = boaros_lwip_tcp_reclaim_timewait();
+        kernel_socket_protocol_leave(&scope);
+    }
+    if (ip) boaros_lwip_ip_lock(ip);
+    return reclaimed;
 }
 
 /* Promotion is serialized by the default TCP protocol mutex. Look up a
@@ -6233,6 +6258,7 @@ void kernel_socket_network_initialize(void)
 #if BOAROS_USER_SMP
             .tcp_context = tcp_context, .tcp_dispatch = tcp_dispatch,
             .pcb_forget = tcp_pcb_forget, .pcb_timewait = tcp_pcb_timewait,
+            .reclaim_remote_timewait = tcp_reclaim_remote_timewait,
             .tcp_conflict = tcp_route_conflict,
             .tcp_local_output = tcp_local_output, .loopback_publish = tcp_mark_legacy_loopback,
 #endif

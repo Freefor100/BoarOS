@@ -23,13 +23,24 @@ struct kernel_socket_call;
 struct kernel_epoll_wait_request;
 
 struct physical_page_allocator;
+struct kernel_page_cache;
+struct kernel_page_cache_read_page;
 /* 当前I/O持有scratch或取得的源页引用；forced exit沿同一登记归还。 */
 struct kernel_task_io_buffer {
     struct kernel_task *task;
     struct physical_page_allocator *allocator;
-    uint64_t physical_address;
-    void *data;
-    uint8_t retained_scratch;
+    union {
+        struct {
+            uint64_t physical_address;
+            void *data;
+            uint8_t retained_scratch;
+        };
+        struct {
+            struct kernel_page_cache *cache;
+            struct kernel_page_cache_read_page *pages;
+            size_t count;
+        } read_batch;
+    };
 };
 
 enum kernel_task_status {
@@ -72,6 +83,8 @@ enum kernel_task_status kernel_task_io_buffer_acquire(
 /* 接管调用者已有的物理页引用，不额外hold；成功后由release或任务退出归还。 */
 void kernel_task_io_buffer_take_page(struct kernel_task_io_buffer *buffer,
     struct physical_page_allocator *allocator, uint64_t physical_address,const void *mapped);
+void kernel_task_io_buffer_take_read_pages(struct kernel_task_io_buffer *,
+    struct kernel_page_cache *, struct kernel_page_cache_read_page *, size_t count);
 void kernel_task_io_buffer_release(struct kernel_task_io_buffer *buffer);
 
 /* 非零表示本次返回需要选择信号；USER_SMP在这里消费本批本地通知。 */
