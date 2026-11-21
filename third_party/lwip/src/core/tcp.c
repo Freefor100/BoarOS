@@ -649,7 +649,11 @@ tcp_close_shutdown_fin(struct tcp_pcb *pcb)
        Since we don't really have to ensure all data has been sent when tcp_close
        returns (unsent data is sent from tcp timer functions, also), we don't care
        for the return value of tcp_output for now. */
+#ifdef LWIP_HOOK_TCP_OUTPUT_PENDING
+    LWIP_HOOK_TCP_OUTPUT_PENDING(pcb);
+#else
     tcp_output(pcb);
+#endif
   } else if (err == ERR_MEM) {
     /* Mark this pcb for closing. Closing is retried from tcp_tmr. */
     tcp_set_flags(pcb, TF_CLOSEPEND);

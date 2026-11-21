@@ -145,6 +145,50 @@ u32_t sys_now(void)
     return (u32_t)(kernel_time_monotonic_ns() / UINT64_C(1000000));
 }
 
+typedef uint16_t checksum_halfword __attribute__((__may_alias__));
+typedef uint32_t checksum_word __attribute__((__may_alias__));
+
+uint16_t boaros_lwip_internet_sum(const void *data, int length)
+{
+    const uint8_t *bytes = data;
+    unsigned odd = (uintptr_t)bytes & 1U;
+    uint64_t sum = 0;
+    if (odd && length > 0) {
+        sum = (uint32_t)*bytes++ << 8;
+        length--;
+    }
+    if (((uintptr_t)bytes & 2U) && length >= 2) {
+        sum += *(const checksum_halfword *)(const void *)bytes;
+        bytes += 2;
+        length -= 2;
+    }
+    /* Both targets use little-endian packet words. Even INT_MAX bytes of
+     * 32-bit words fit in the accumulator without a carry in the loop. */
+    while (length >= 16) {
+        const checksum_word *words = (const void *)bytes;
+        sum += (uint64_t)words[0] + words[1] + words[2] + words[3];
+        bytes += 16;
+        length -= 16;
+    }
+    while (length >= 4) {
+        sum += *(const checksum_word *)(const void *)bytes;
+        bytes += 4;
+        length -= 4;
+    }
+    if (length >= 2) {
+        sum += *(const checksum_halfword *)(const void *)bytes;
+        bytes += 2;
+        length -= 2;
+    }
+    if (length > 0) sum += *bytes;
+    sum = (sum >> 32) + (uint32_t)sum;
+    sum = (sum >> 32) + (uint32_t)sum;
+    sum = (sum >> 16) + (uint16_t)sum;
+    sum = (sum >> 16) + (uint16_t)sum;
+    uint16_t folded = (uint16_t)sum;
+    return odd ? __builtin_bswap16(folded) : folded;
+}
+
 unsigned int boaros_lwip_random(void)
 {
     uint32_t value;
