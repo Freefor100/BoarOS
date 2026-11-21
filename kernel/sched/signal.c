@@ -68,6 +68,13 @@ static void signal_sender_view_locked(struct kernel_signal_wait_info *info,
 }
 
 static struct kernel_task *real_timers;
+static uint64_t real_timer_next_ns;
+
+static void real_timer_publish_locked(void)
+{
+    __atomic_store_n(&real_timer_next_ns,real_timers ? real_timers->real_timer_deadline : 0,
+                     __ATOMIC_RELEASE);
+}
 /* PID-derived identities occupy the low generation range. */
 static uint64_t unshared_signal_identity = UINT64_C(1) << 63U;
 
@@ -114,8 +121,7 @@ static void real_timer_insert(struct kernel_task *leader)
 
 static void real_timer_rearm(struct kernel_task *leader)
 {
-    KERNEL_SERVICE_SCOPE(service);
-    KERNEL_IRQ_SCOPE(irq);
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     if (!leader || leader->real_timer_active || !leader->real_timer_interval) return;
     uint64_t now = kernel_time_monotonic_ns();
     uint64_t deadline = leader->real_timer_deadline;
@@ -125,6 +131,18 @@ static void real_timer_rearm(struct kernel_task *leader)
     deadline = advance > (UINT64_MAX - deadline) / interval ? UINT64_MAX : deadline + advance * interval;
     leader->real_timer_deadline = deadline;
     real_timer_insert(leader);
+    real_timer_publish_locked();
+}
+
+static void real_timer_snapshot_locked(const struct kernel_task *leader,
+    uint64_t *remaining, uint64_t *interval)
+{
+    *remaining = 0;
+    if (leader->real_timer_active) {
+        uint64_t now = kernel_time_monotonic_ns();
+        *remaining = leader->real_timer_deadline > now ? leader->real_timer_deadline - now : 1000;
+    }
+    *interval = leader->real_timer_interval;
 }
 
 void kernel_signal_timer_get(struct kernel_task *task, uint32_t which,
@@ -140,21 +158,18 @@ void kernel_signal_timer_get(struct kernel_task *task, uint32_t which,
         *interval = leader->cpu_timers[which - 1].interval;
         return;
     }
-    uint64_t now = kernel_time_monotonic_ns();
-    *remaining = leader->real_timer_active ?
-        (leader->real_timer_deadline > now ? leader->real_timer_deadline - now : 1000) : 0;
-    *interval = leader->real_timer_interval;
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    real_timer_snapshot_locked(task->group_leader,remaining,interval);
 }
 
 void kernel_signal_timer_cancel(struct kernel_task *leader)
 {
-    uintptr_t irq = arch_interrupt_save();
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     real_timer_remove(leader);
     leader->real_timer_deadline = leader->real_timer_interval = 0;
-    {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-     memset(leader->cpu_timers, 0, sizeof(leader->cpu_timers));
-     scheduler_cpu_timer_update_locked(leader,0);}
-    arch_interrupt_restore(irq);
+    real_timer_publish_locked();
+    memset(leader->cpu_timers, 0, sizeof(leader->cpu_timers));
+    scheduler_cpu_timer_update_locked(leader,0);
 }
 
 void kernel_signal_timer_set(struct kernel_task *task, uint32_t which,
@@ -178,31 +193,34 @@ void kernel_signal_timer_set(struct kernel_task *task, uint32_t which,
         scheduler_cpu_timer_update_locked(leader,0);
         return;
     }
-    kernel_signal_timer_get(task, which, old_remaining, old_interval);
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    leader = task->group_leader;
+    real_timer_snapshot_locked(leader,old_remaining,old_interval);
     real_timer_remove(leader);
     leader->real_timer_deadline = leader->real_timer_interval = 0;
-    if (!value) return;
-    uint64_t now = kernel_time_monotonic_ns();
-    leader->real_timer_deadline = value > UINT64_MAX - now ? UINT64_MAX : now + value;
-    leader->real_timer_interval = interval;
-    real_timer_insert(leader);
+    if (value) {
+        uint64_t now = kernel_time_monotonic_ns();
+        leader->real_timer_deadline = value > UINT64_MAX - now ? UINT64_MAX : now + value;
+        leader->real_timer_interval = interval;
+        real_timer_insert(leader);
+    }
+    real_timer_publish_locked();
 }
 
 void kernel_signal_timer_adopt(struct kernel_task *task, struct kernel_task *old_leader)
 {
-    uintptr_t irq = arch_interrupt_save();
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     uint32_t active = old_leader->real_timer_active;
     real_timer_remove(old_leader);
     task->real_timer_deadline = old_leader->real_timer_deadline;
     task->real_timer_interval = old_leader->real_timer_interval;
     old_leader->real_timer_deadline = old_leader->real_timer_interval = 0;
     if (active) real_timer_insert(task);
-    {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-     memcpy(task->cpu_timers, old_leader->cpu_timers, sizeof(task->cpu_timers));
-     memset(old_leader->cpu_timers, 0, sizeof(old_leader->cpu_timers));
-     scheduler_cpu_timer_update_locked(old_leader,0);}
+    real_timer_publish_locked();
+    memcpy(task->cpu_timers, old_leader->cpu_timers, sizeof(task->cpu_timers));
+    memset(old_leader->cpu_timers, 0, sizeof(old_leader->cpu_timers));
+    scheduler_cpu_timer_update_locked(old_leader,0);
     /* The adopted TGID and its native thresholds are published together later. */
-    arch_interrupt_restore(irq);
 }
 
 #define SIGNAL_MASK_KILL_STOP KERNEL_SIGNAL_UNBLOCKABLE_MASK
@@ -527,6 +545,45 @@ static void signal_clear_pending_group(struct kernel_task *task,uint64_t mask)
     scheduler_group_cursor_end(&cursor);
 }
 
+static int signal_action_ignores(uint32_t sig, const struct kernel_linux_sigaction *action)
+{
+    return action->handler == KERNEL_SIGNAL_IGN ||
+        (action->handler == KERNEL_SIGNAL_DFL &&
+         signal_default_action(sig) == KERNEL_SIGNAL_DEFAULT_IGNORE);
+}
+
+static void signal_install_action_locked(struct kernel_signal_action *entry,
+    const struct kernel_linux_sigaction *action, struct kernel_linux_sigaction *old)
+{
+    if (old) *old = (struct kernel_linux_sigaction){entry->handler,entry->flags,entry->mask};
+    *entry = (struct kernel_signal_action){action->handler,action->flags,
+                                           action->mask & ~SIGNAL_MASK_KILL_STOP};
+}
+
+int kernel_signal_try_set_private_action(struct kernel_task *task, uint32_t sig,
+    const struct kernel_linux_sigaction *action, struct kernel_linux_sigaction *old)
+{
+    if (kernel_cpu_current()->current != task || !task || !action ||
+        !sig || sig > KERNEL_SIGNAL_COUNT || sig == SIGNAL_KILL || sig == SIGNAL_STOP) return 0;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        if (!signal_dispatchable_locked(task) || task->group_leader != task ||
+            task->group_members != 1 || task->posix_timers) return 0;
+        struct kernel_signal_table *table = signal_table_of(task);
+        if (!table || table->references != 1) return 0;
+        signal_install_action_locked(&table->actions[sig-1U], action, old);
+    }
+    if (signal_action_ignores(sig, action)) {
+        /* Nobody else can change this disposition or create another member
+         * while this task is in the syscall. Signal producers still use the
+         * signal domain and observe the new action before posting. */
+        uint64_t mask = signal_mask(sig);
+        clear_task_pending(task, 1, mask, 1);
+        clear_task_pending(task, 0, mask, 1);
+    }
+    return 1;
+}
+
 enum kernel_signal_status kernel_signal_get_action(
     struct kernel_task *task,
     uint32_t sig,
@@ -570,17 +627,13 @@ enum kernel_signal_status kernel_signal_set_action(
         table = signal_table_of(task);
         if (table == 0) return KERNEL_SIGNAL_STATUS_INVALID_STATE;
         entry = &table->actions[sig - 1U];
-        if (old_action) *old_action=(struct kernel_linux_sigaction){entry->handler,entry->flags,entry->mask};
-        *entry=(struct kernel_signal_action){action->handler,action->flags,action->mask & ~SIGNAL_MASK_KILL_STOP};
+        signal_install_action_locked(entry, action, old_action);
     }
-    if (action->handler == KERNEL_SIGNAL_IGN ||
-        (action->handler == KERNEL_SIGNAL_DFL &&
-         signal_default_action(sig) == KERNEL_SIGNAL_DEFAULT_IGNORE)) {
+    if (signal_action_ignores(sig, action)) {
         signal_clear_pending_group(task, signal_mask(sig));
-    }
-    if(task->group_leader->posix_timers&&action->handler!=KERNEL_SIGNAL_IGN&&
-        !(action->handler==KERNEL_SIGNAL_DFL&&signal_default_action(sig)==KERNEL_SIGNAL_DEFAULT_IGNORE))
+    } else if(task->group_leader->posix_timers) {
         kernel_posix_timer_unignore(task,sig);
+    }
     return KERNEL_SIGNAL_STATUS_OK;
 }
 
@@ -1690,10 +1743,20 @@ void signal_cpu_timer_notify(struct kernel_task *leader,unsigned fired)
 }
 void kernel_signal_timer_expire(void)
 {
-    if(real_timers) {
+    uint64_t earliest = __atomic_load_n(&real_timer_next_ns,__ATOMIC_ACQUIRE);
+    if (earliest) {
         uint64_t now=kernel_time_monotonic_ns();
-        while(real_timers&&real_timers->real_timer_deadline<=now) {
-            struct kernel_task *leader=real_timers;real_timer_remove(leader);
+        while (earliest <= now) {
+            SCHEDULER_TASK_BORROW(leader,0);
+            {
+                KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+                if (!real_timers || real_timers->real_timer_deadline > now) break;
+                leader = real_timers;
+                scheduler_task_get_locked(leader);
+                real_timer_remove(leader);
+                real_timer_publish_locked();
+                earliest = real_timers ? real_timers->real_timer_deadline : UINT64_MAX;
+            }
             SCHEDULER_TASK_BORROW(representative,signal_group_representative_get(leader));
             if(representative&&signal_send_one(leader,14U,0,1,128,0,0,0)!=KERNEL_SIGNAL_STATUS_OK)__builtin_trap();
         }

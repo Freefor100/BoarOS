@@ -67,7 +67,7 @@ handler与sigtimedwait取得同一规范记录，用户输出在消费之后发�
 
 ## SMP上的状态和执行位置
 
-`rt_sigprocmask` 在调用线程所在核读写该线程的屏蔽集合，`rt_sigpending` 在同一位置取得待决集合快照。两者都复用信号状态的调度保护。仅查询处理动作的 `rt_sigaction` 也在调用核完成；安装新动作仍进入 CPU0 服务区，处理共享信号表和待决信号的变化。
+`rt_sigprocmask` 在调用线程所在核读写该线程的屏蔽集合，`rt_sigpending` 在同一位置取得待决集合快照。两者都复用信号状态的调度保护。`rt_sigaction` 查询也在调用核完成。线程组只有调用者、已拥有独占信号表且没有可移植操作系统接口（Portable Operating System Interface，POSIX）定时器时，调用者在同一保护内读取旧动作并安装新动作。当新动作忽略信号时，调用者处理自己与所属组中已经待决的该信号。共享信号表、需分配信号表或需重新检查 POSIX 定时器的操作沿用 CPU0 服务区。
 
 RV USER_SMP中的普通信号在实际执行线程所在CPU递送。pending及其来源、共享disposition、blocked和SA_RESETHAND的修改由调度raw保护。未被跟踪的线程在同一保护内取走pending、复制完整action、记录恢复mask、设置handler期间的屏蔽位并重置一次性动作；锁外只使用线程栈上的delivery快照，后续rt_sigaction替换保留新动作。被跟踪的线程先取走pending并完成原生定时器记录，再在锁外进入信号递送停点；tracer可抑制、替换信号或修改完整siginfo。恢复后重新读取最终信号的action，仅实际递送的handler提交mask和SA_RESETHAND；重新被屏蔽的信号带完整载荷放回原线程或组队列。已忽略的信号仍可被tracer观察，SIGKILL绕过递送停点。rt_sigaction的旧动作和新动作在同一提交点交换，fork复制与exec重置同样使用该保护。
 

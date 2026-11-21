@@ -41,7 +41,6 @@ static uint64_t itimer_ns(int64_t seconds, int64_t usec)
 enum kernel_syscall_status syscall_handle_itimer(struct kernel_task *caller,
     const struct kernel_syscall_request *request, struct kernel_syscall_result *decoded)
 {
-    KERNEL_SERVICE_SCOPE(service);
     struct kernel_mm *mm;
     struct linux_itimerval input={0}, output={0};
     uint64_t remaining=0, interval=0;
@@ -64,11 +63,14 @@ enum kernel_syscall_status syscall_handle_itimer(struct kernel_task *caller,
         decoded->value = -KERNEL_EINVAL;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    uintptr_t irq = arch_interrupt_save();
-    if (setting) kernel_signal_timer_set(caller,(uint32_t)which,itimer_ns(input.seconds,input.usec),
-        itimer_ns(input.interval_seconds,input.interval_usec),&remaining,&interval);
-    else kernel_signal_timer_get(caller,(uint32_t)which,&remaining,&interval);
-    arch_interrupt_restore(irq);
+    {
+        KERNEL_SERVICE_SCOPE_IF(service, which != 0);
+        uintptr_t irq = arch_interrupt_save();
+        if (setting) kernel_signal_timer_set(caller,(uint32_t)which,itimer_ns(input.seconds,input.usec),
+            itimer_ns(input.interval_seconds,input.interval_usec),&remaining,&interval);
+        else kernel_signal_timer_get(caller,(uint32_t)which,&remaining,&interval);
+        arch_interrupt_restore(irq);
+    }
     output.seconds = (int64_t)(remaining/1000000000U);
     output.usec = (int64_t)((remaining%1000000000U)/1000U);
     output.interval_seconds = (int64_t)(interval/1000000000U);

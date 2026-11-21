@@ -253,6 +253,10 @@ enum kernel_signal_status kernel_signal_set_action(
     uint32_t sig,
     const struct kernel_linux_sigaction *action,
     struct kernel_linux_sigaction *old_action);
+/* Installs a disposition locally when the running task owns its existing
+ * table and there are no POSIX timers to reconsider. */
+int kernel_signal_try_set_private_action(struct kernel_task *, uint32_t,
+    const struct kernel_linux_sigaction *, struct kernel_linux_sigaction *);
 
 /* Fork copies the blocked mask and a private disposition page, with no pending
  * signals. clear_sighand resets caught dispositions and clears action flags. */

@@ -505,10 +505,63 @@ static void signal_namespace_cases(void)
     puts("signal PID views: sibling isolation, kill-all, tgkill, queued sender and SIGCHLD passed");
 }
 
+static void private_action_install(void)
+{
+    struct kernel_task task = {
+        .magic = KERNEL_THREAD_MAGIC, .state = KERNEL_THREAD_STATE_RUNNING,
+        .group_members = 1,
+    };
+    struct kernel_signal_table table = {.magic=KERNEL_SIGNAL_TABLE_MAGIC,.references=1};
+    kernel_wait_queue_init(&table.signalfd_waiters);
+    task.arch.user_mode = 1;
+    task.group_leader = &task;
+    task.group_previous = task.group_next = &task;
+    task.signal_table_address = (uintptr_t)&table;
+    struct kernel_task *saved = kernel_cpu_current()->current;
+    kernel_cpu_current()->current = &task;
+    struct kernel_linux_sigaction initial = {.handler=0x3000,.mask=signal_mask(12)};
+    struct kernel_linux_sigaction ignore = {.handler=KERNEL_SIGNAL_IGN}, old;
+    assert(kernel_signal_try_set_private_action(&task, 10, &initial, &old));
+    assert(!old.handler && table.actions[9].handler == initial.handler);
+    task.signal_pending = signal_mask(10)|signal_mask(12);
+    task.group_pending = signal_mask(10)|signal_mask(12);
+    table.references = 2;
+    assert(!kernel_signal_try_set_private_action(&task, 10, &ignore, &old));
+    assert(table.actions[9].handler == initial.handler && task.signal_pending == task.group_pending);
+    table.references = 1;
+    assert(kernel_signal_try_set_private_action(&task, 10, &ignore, &old));
+    assert(old.handler == initial.handler && old.mask == initial.mask);
+    assert(task.signal_pending == signal_mask(12) && task.group_pending == signal_mask(12));
+    kernel_cpu_current()->current = saved;
+    puts("private signal action installs locally; shared action stays on serial path");
+}
+
+static void real_timer_order(void)
+{
+    struct kernel_task first = {0}, second = {0};
+    first.group_leader = &first;
+    second.group_leader = &second;
+    uint64_t old, interval;
+    uint64_t now = kernel_time_monotonic_ns();
+    kernel_signal_timer_set(&first,0,800000,900000,&old,&interval);
+    assert(!old && !interval && real_timer_next_ns == now + 800000);
+    kernel_signal_timer_set(&second,0,400000,500000,&old,&interval);
+    assert(!old && !interval && real_timer_next_ns == now + 400000 && real_timers == &second);
+    kernel_signal_timer_get(&first,0,&old,&interval);
+    assert(old == 800000 && interval == 900000);
+    kernel_signal_timer_set(&second,0,0,0,&old,&interval);
+    assert(old == 400000 && interval == 500000 && real_timer_next_ns == now + 800000);
+    kernel_signal_timer_set(&first,0,0,0,&old,&interval);
+    assert(old == 800000 && interval == 900000 && !real_timer_next_ns && !real_timers);
+    puts("real interval timer: queued deadlines, prior value and cancellation agree");
+}
+
 void signal_owner_cases(unsigned *lock_calls)
 {
     scheduler.initialized = KERNEL_SCHEDULER_INITIALIZED;
     signal_namespace_cases();
+    private_action_install();
+    real_timer_order();
     struct kernel_task leader = {0}, member = {0};
     struct kernel_resource_limits limits={0};
     leader.limits=member.limits=&limits;
