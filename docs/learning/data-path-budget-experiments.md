@@ -33,7 +33,7 @@ IOzone 以文件内容读写为负载，不覆盖目录枚举，不能拿其分�
 
 ## 网络
 
-`tests/cost/network-budget-experiment.py` 使用 `tests/workloads/network/tcp-budget.c`，覆盖 loopback/TAP、阻塞/非阻塞、收发、bulk、请求响应与混合控制连接。普通接口的默认预算为 `w8-p4-m2`：8 MSS 窗口与发送缓冲、4 倍协议池、2 倍协议堆；回环连接另用 8192 字节 MSS 与 32768 字节窗口。PCB 容量不随候选增加。
+`tests/cost/network-budget-experiment.py` 使用 `tests/workloads/network/tcp-budget.c`，覆盖回环和虚拟网卡（TAP）、阻塞与非阻塞收发、连续传输、请求响应及混合控制连接。早期实验以 `w8-p4-m2` 为基线，普通连接使用 8 个最大报文段长度（Maximum Segment Size，MSS）的接收通告窗口和发送缓冲额度。当前默认是 `w32-p4-m2`，两个额度均为 32 个最大报文段长度。两种配置都使用 4 倍协议池、2 倍协议堆，回环连接仍用 8192 字节的最大报文段长度和 32768 字节窗口。协议控制块（Protocol Control Block，PCB）容量不随候选增加。
 
 ```sh
 python3 -B tests/cost/network-budget-experiment.py profiles

@@ -1998,7 +1998,7 @@ static void tcp_detached_copy(void)
 
     /* Leave room for one full segment. A prepared prefix survives a later
      * allocation failure and the device can still retain its packet. */
-    struct tcp_seg *held[MEMP_NUM_TCP_SEG]; unsigned count=0;
+    struct tcp_seg *held[MEMP_NUM_TCP_SEG] = {0}; unsigned count=0;
     while (count<MEMP_NUM_TCP_SEG &&
            boaros_lwip_tcp_preparev(vector,2,mss,mss,&held[count])==ERR_OK) count++;
     CHECK(count>1 && count<MEMP_NUM_TCP_SEG && !held[count]);
