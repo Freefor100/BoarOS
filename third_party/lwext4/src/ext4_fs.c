@@ -82,6 +82,7 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 	kernel_raw_lock_init(&fs->block_space,KERNEL_RAW_RANK_OBJECT);
 	fs->reserved_blocks = 0;
     fs->delayed_blocks = 0;
+    fs->delayed_extent_blocks = 0;
 	fs->reserved_inodes = 0;
 	fs->jbd_journal = NULL;
     fs->inode_observer = NULL;

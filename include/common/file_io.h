@@ -53,6 +53,8 @@ struct file_write_reservation {
     void *owner;
     uint64_t mask;
     uint8_t committed;
+    /* ENOSPC may be relieved by publishing dirty data from this filesystem. */
+    uint8_t space_pressure;
 };
 
 /* The synchronous caller owns these descriptors; a backend may retain source
