@@ -569,18 +569,26 @@ static int require_record(struct ext4_fs *fs, const struct orphan_record *record
         ext4_operation_require_resource(fs, EXT4_RESOURCE_ORPHAN, record->file_block + 1);
 }
 
-int ext4_orphan_prepare_change(struct ext4_inode_ref *inode)
+static int prepare_change(struct ext4_inode_ref *inode, bool writable)
 {
     struct ext4_fs *fs = inode->fs;
     int result = require_transaction(fs);
     if (result) return result;
     result = ensure_index(fs, inode);
     if (result) return result;
-    result = ext4_fs_inode_ref_write(inode);
-    if (result) return result;
+    if (!writable) {
+        result = ext4_fs_inode_ref_write(inode);
+        if (result) return result;
+    }
     struct orphan_record record;
     return operation_record(fs, inode->index, &record) ? require_record(fs, &record) : EOK;
 }
+
+int ext4_orphan_prepare_change(struct ext4_inode_ref *inode)
+{ return prepare_change(inode, false); }
+
+int ext4_orphan_prepare_reclaim(struct ext4_inode_ref *inode)
+{ return prepare_change(inode, true); }
 
 int ext4_orphan_validate(struct ext4_fs *fs)
 {
@@ -637,11 +645,9 @@ int ext4_orphan_truncate_pending(struct ext4_fs *fs, uint32_t inode, bool *pendi
     return EOK;
 }
 
-int ext4_orphan_mark_truncate(struct ext4_inode_ref *inode, bool pending)
+static int mark_truncate(struct ext4_inode_ref *inode, bool pending)
 {
     struct ext4_fs *fs = inode->fs;
-    int result = ext4_orphan_prepare_change(inode);
-    if (result) return result;
     struct orphan_record record;
     if (!operation_record(fs, inode->index, &record)) return ENOENT;
     if (record.truncate_pending == pending) return EOK;
@@ -649,6 +655,12 @@ int ext4_orphan_mark_truncate(struct ext4_inode_ref *inode, bool pending)
     if (!change) return ENOMEM;
     change->after.truncate_pending = pending;
     return EOK;
+}
+
+int ext4_orphan_mark_truncate(struct ext4_inode_ref *inode, bool pending)
+{
+    int result = ext4_orphan_prepare_change(inode);
+    return result ? result : mark_truncate(inode, pending);
 }
 
 static int update_slot(struct ext4_fs *fs, struct orphan_record *record,
@@ -782,11 +794,9 @@ int ext4_orphan_add(struct ext4_inode_ref *inode)
 static int remove_orphan(struct ext4_inode_ref *inode, bool freeing)
 {
     struct ext4_fs *fs = inode->fs;
-    int result = ext4_orphan_prepare_change(inode);
-    if (result) return result;
     struct orphan_record record;
     if (!operation_record(fs, inode->index, &record)) return EOK;
-    result = freeing ? check_inode_number(fs, inode->index, false) :
+    int result = freeing ? check_inode_number(fs, inode->index, false) :
         check_allocated(fs, inode->index, false);
     if (result) return result;
     if (!valid_orphan_type(fs, inode->inode)) return EUCLEAN;
@@ -834,18 +844,33 @@ static int remove_orphan(struct ext4_inode_ref *inode, bool freeing)
 
 int ext4_orphan_remove(struct ext4_inode_ref *inode)
 {
-    return remove_orphan(inode, false);
+    int result = ext4_orphan_prepare_change(inode);
+    return result ? result : remove_orphan(inode, false);
 }
 
-int ext4_orphan_remove_and_free(struct ext4_inode_ref *inode)
+static int remove_and_free(struct ext4_inode_ref *inode)
 {
-    if (ext4_inode_get_links_cnt(inode->inode)) return EUCLEAN;
     int result=remove_orphan(inode,true);
     if (result != EOK) return result;
     /* The allocator verifies the bit and checksum on the actual writable
      * bitmap. Its failure aborts the orphan removal in this same operation. */
     ext4_inode_set_del_time(inode->inode,UINT32_MAX);
     return ext4_fs_free_inode(inode);
+}
+
+int ext4_orphan_remove_and_free(struct ext4_inode_ref *inode)
+{
+    if (ext4_inode_get_links_cnt(inode->inode)) return EUCLEAN;
+    int result = ext4_orphan_prepare_change(inode);
+    return result ? result : remove_and_free(inode);
+}
+
+int ext4_orphan_finish_reclaim(struct ext4_inode_ref *inode, bool release_inode)
+{
+    int error = jbd_journal_error(inode->fs->jbd_journal);
+    if (error) return error;
+    if (ext4_inode_get_links_cnt(inode->inode)) return remove_orphan(inode, false);
+    return release_inode ? remove_and_free(inode) : mark_truncate(inode, false);
 }
 
 int ext4_orphan_set_present(struct ext4_fs *fs, bool present)

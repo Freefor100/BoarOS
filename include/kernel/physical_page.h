@@ -80,6 +80,8 @@ struct physical_page_allocator {
     uint64_t allocated_peak_pages; /* Allocator lifetime maximum, not a per-window peak. */
 #endif
     uint64_t recycled_head;
+    /* Unpublished order-zero backing. Each nonzero slot owns one reference. */
+    uint64_t pipe_spares[2];
     uint64_t metadata_address;
     uint64_t metadata_pages;
     uint32_t range_count;
@@ -160,6 +162,13 @@ enum physical_page_status physical_page_allocate_contiguous(
 enum physical_page_status physical_page_release(
     struct physical_page_allocator *allocator,
     uint64_t address);
+
+/* Only a fully consumed, exclusively owned pipe page may enter this pool.
+ * A hit transfers that same owner. Buddy exhaustion and pipe close drain it. */
+enum physical_page_status physical_page_pipe_allocate(
+    struct physical_page_allocator *, uint64_t *address);
+void physical_page_pipe_release(struct physical_page_allocator *, uint64_t address);
+void physical_page_pipe_drain(struct physical_page_allocator *);
 
 /* Each array item transfers one order-zero reference, including duplicate addresses. */
 #define PHYSICAL_PAGE_REFERENCE_BATCH_MAX 16U

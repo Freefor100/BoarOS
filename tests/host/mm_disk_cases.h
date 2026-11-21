@@ -466,6 +466,15 @@ static void disk_fault_batch_case(struct kernel_heap *heap,
     for(unsigned i=0;i<window;i++)
         assert(!kernel_mm_lookup(&mm,placed+(uint64_t)i*BOAROS_PAGE_SIZE,&mapping) && !(mapping.permissions&KERNEL_MM_WRITE));
     assert(kernel_mm_lookup(&mm,placed+65536,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    /* Leave holes between still-published aliases in the same fault window.
+     * The next read must register only the borrowed pages for those holes. */
+    uint64_t first_hole = placed + BOAROS_PAGE_SIZE;
+    uint64_t second_hole = placed + 3U * BOAROS_PAGE_SIZE;
+    assert(!kernel_mm_madvise(&mm,first_hole,BOAROS_PAGE_SIZE,4));
+    assert(!kernel_mm_madvise(&mm,second_hole,BOAROS_PAGE_SIZE,4));
+    assert(kernel_mm_lookup(&mm,second_hole,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    assert(!kernel_mm_resolve_user_fault(&mm,first_hole,KERNEL_MM_READ));
+    assert(!kernel_mm_lookup(&mm,second_hole,&mapping) && !(mapping.permissions&KERNEL_MM_WRITE));
     uint64_t neighbour=placed+65536-BOAROS_PAGE_SIZE;
     assert(!kernel_mm_lookup(&mm,neighbour,&mapping));
     uint64_t physical=mapping.physical_address;

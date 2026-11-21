@@ -335,10 +335,14 @@ static void pipe_page_ownership_case(struct kernel_heap *heap)
     struct kernel_pipe_result write;
     assert(!kernel_pipe_write_buffer(pipe,"x",1,1,&write) && write.bytes==1);
     assert(physical_page_available(heap->page_allocator)==before-1);
+    uint64_t physical;
+    assert(heap->physical_address(pipe->buffers[pipe->head].page,&physical));
     struct kernel_uaccess_iovec target={PIPE_TARGET,1};int64_t bytes;
     assert(!kernel_pipe_readv(pipe,&domain_mm,&target,1,1,0,&bytes) && bytes==1);
-    assert(physical_page_available(heap->page_allocator)==before);
+    assert(physical_page_available(heap->page_allocator)==before-1);
     assert(!kernel_pipe_write_buffer(pipe,"y",1,1,&write) && write.bytes==1);
+    uint64_t reused;
+    assert(heap->physical_address(pipe->buffers[pipe->head].page,&reused) && reused==physical);
     struct kernel_pipe_read_borrow borrow={0};
     assert(kernel_pipe_read_begin(pipe,1,0,&borrow)==1);
     measured_pipe_metadata=&pipe->metadata_lock;
@@ -351,9 +355,24 @@ static void pipe_page_ownership_case(struct kernel_heap *heap)
     assert(pipe_metadata_acquisitions==1 &&
         "Reading a borrowed head and committing it needs only the consume lock");
     measured_pipe_metadata=NULL;
-    assert(physical_page_available(heap->page_allocator)==before);
+    struct physical_page_allocator *allocator=heap->page_allocator;
+    uint64_t available=physical_page_available(allocator);
+    assert(available==before-1);
+    uint64_t *held=calloc(available,sizeof(*held));
+    assert(held);
+    for (uint64_t i=0;i<available;i++) assert(!physical_page_allocate_order_nosleep(allocator,0,&held[i]));
+    assert(!physical_page_available(allocator));
+    assert(!physical_page_allocate_order_nosleep(allocator,0,&reused) && reused==physical);
+    assert(!physical_page_release(allocator,reused));
+    for (uint64_t i=0;i<available;i++) assert(!physical_page_release(allocator,held[i]));
+    free(held);
+    assert(physical_page_available(allocator)==before);
+    assert(!kernel_pipe_write_buffer(pipe,"z",1,1,&write) && write.bytes==1);
+    assert(!kernel_pipe_readv(pipe,&domain_mm,&target,1,1,0,&bytes) && bytes==1);
+    assert(physical_page_available(allocator)==before-1);
     assert(!kernel_files_release(&files));
-    puts("PASS pipe first fragment: one consume lock, no idle payload allocation");
+    assert(physical_page_available(allocator)>=before);
+    puts("PASS pipe first fragment: one consume lock, reused payload, allocator pressure and close drained");
 }
 static void pipe_copy_overlap_case(struct kernel_heap *heap)
 {

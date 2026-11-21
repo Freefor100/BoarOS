@@ -1476,6 +1476,29 @@ enum kernel_page_cache_status kernel_page_cache_alias_attach(
     return KERNEL_PAGE_CACHE_STATUS_OK;
 }
 
+void kernel_page_cache_alias_attach_window(struct kernel_page_cache *cache,
+    const struct kernel_vfs_file *file, uint64_t first, unsigned selected,
+    const struct kernel_page_cache_alias_binding *bindings)
+{
+    if (!selected) return;
+    struct kernel_vfs_node *node = kernel_vfs_file_node(file);
+    CACHE_SCOPE(guard, cache);
+    while (!(selected & 1U)) {
+        selected >>= 1;
+        first++;
+    }
+    struct kernel_page_cache_entry *entry = index_at_or_after(node, first);
+    for (uint64_t index = first; selected; selected >>= 1, index++) {
+        if (!(selected & 1U)) continue;
+        while (entry && entry->page_index < index)
+            entry = RB_NEXT(kernel_page_cache_tree, &node->cache_pages, entry);
+        if (!entry || entry->page_index != index ||
+            entry->physical_address != bindings->physical_address) __builtin_trap();
+        link_alias(entry, bindings->alias);
+        bindings++;
+    }
+}
+
 void kernel_page_cache_alias_clone(struct kernel_page_cache_alias *target,
     const struct kernel_page_cache_alias *source, void *owner)
 {
@@ -1528,21 +1551,40 @@ void kernel_page_cache_retry_alias(struct kernel_page_cache_alias *alias)
         cache->record->requested=1; cache_wake(&cache->record->work);
     }
 }
-void kernel_page_cache_alias_detach(struct kernel_page_cache_alias *alias)
+static void alias_detach_locked(struct kernel_page_cache_alias *alias)
 {
-    if (!alias || !alias->entry || !alias->previous) __builtin_trap();
-    struct kernel_page_cache *cache = alias->entry->cache;
-    CACHE_SCOPE(guard, cache);
-    if (*alias->previous != alias) __builtin_trap();
+    if (!alias->previous || *alias->previous != alias) __builtin_trap();
     *alias->previous = alias->next;
     if (alias->next) alias->next->previous = alias->previous;
     alias->previous = 0;
     __atomic_store_n(&alias->registered,0,__ATOMIC_RELEASE);
-    {
-        /* stop->drain的真实entry存储owner；回调末次put不能抢先释放它。 */
-        entry_borrow(alias->entry);
-        if (alias->borrows) { alias->retired_next = alias->next; alias_borrow(alias->retired_next); }
+    if (!alias->borrows) {
+        alias->entry = 0;
+        alias->next = 0;
         return;
+    }
+    /* Keep the entry and the retired successor live until drain and the
+     * outstanding callbacks have finished, respectively. */
+    entry_borrow(alias->entry);
+    alias->retired_next = alias->next;
+    alias_borrow(alias->retired_next);
+}
+
+void kernel_page_cache_alias_detach(struct kernel_page_cache_alias *alias)
+{
+    CACHE_SCOPE(guard, alias->entry->cache);
+    alias_detach_locked(alias);
+}
+
+void kernel_page_cache_alias_detach_batch(struct kernel_page_cache_alias **aliases,
+    unsigned count)
+{
+    for (unsigned i = 0; i < count;) {
+        struct kernel_page_cache *cache = aliases[i]->entry->cache;
+        CACHE_SCOPE(guard, cache);
+        do {
+            alias_detach_locked(aliases[i++]);
+        } while (i < count && aliases[i]->entry->cache == cache);
     }
 }
 void kernel_page_cache_alias_drain(struct kernel_page_cache_alias *alias)
