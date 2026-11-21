@@ -64,6 +64,25 @@
 #define PROC_FS_INODE UINT64_C(28)
 #define PROC_AIO_NR_INODE UINT64_C(29)
 #define PROC_AIO_MAX_NR_INODE UINT64_C(30)
+#define PROC_KPAGEFLAGS_INODE UINT64_C(31)
+
+static const struct proc_root_entry {
+    const char *name;
+    uint64_t inode;
+    uint8_t type;
+} proc_root_entries[] = {
+    {".", PROC_ROOT_INODE, 4}, {"..", PROC_ROOT_INODE, 4},
+    {"meminfo", PROC_MEMINFO_INODE, 8}, {"uptime", PROC_UPTIME_INODE, 8},
+    {"self", PROC_SELF_INODE, 10}, {"mounts", PROC_MOUNTS_INODE, 10},
+    {"sys", PROC_SYS_INODE, 4}, {"thread-self", PROC_THREAD_SELF_INODE, 10},
+    {"sysvipc", PROC_SYSVIPC_INODE, 4}, {"net", PROC_NET_INODE, 4},
+    {"kpageflags", PROC_KPAGEFLAGS_INODE, 8},
+#if BOAROS_COST_DIAGNOSTICS
+    {"boaros_cost", PROC_COST_INODE, 8}, {"boaros_cost_control", PROC_COST_CONTROL_INODE, 8},
+    {"boaros_net_stats", PROC_NETWORK_STATS_INODE, 8}, {"boaros_mem_stats", PROC_MEMORY_STATS_INODE, 8},
+#endif
+};
+#define PROC_ROOT_STATIC_COUNT (sizeof(proc_root_entries)/sizeof(proc_root_entries[0]))
 #define PROC_TASK_DIR_KIND 10U
 #define PROC_TID_DIR_KIND 11U
 #define PROC_TID_STAT_KIND 12U
@@ -517,6 +536,11 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
         *mode = KERNEL_VFS_S_IFREG | 0444U;
         return 0;
     }
+    if (length == 10U && !memcmp(name,"kpageflags",length)) {
+        *inode=PROC_KPAGEFLAGS_INODE;
+        *mode=KERNEL_VFS_S_IFREG | 0400U;
+        return 0;
+    }
     if (length == 6U && !memcmp(name, "uptime", length)) {
         *inode = PROC_UPTIME_INODE;
         *mode = KERNEL_VFS_S_IFREG | 0444U;
@@ -565,7 +589,7 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
     struct kernel_vfs_instance *instance = mount->private_data;
     struct kernel_vfs_node *node = 0;
     (void)path;
-    if ((inode != PROC_ROOT_INODE && inode != PROC_MEMINFO_INODE &&
+    if ((inode != PROC_ROOT_INODE && inode != PROC_MEMINFO_INODE && inode != PROC_KPAGEFLAGS_INODE &&
          inode != PROC_UPTIME_INODE && inode != PROC_SELF_INODE && inode != PROC_THREAD_SELF_INODE &&
          inode != PROC_MOUNTS_INODE && inode != PROC_SYS_INODE &&
          inode != PROC_FS_INODE && inode != PROC_AIO_NR_INODE && inode != PROC_AIO_MAX_NR_INODE &&
@@ -615,7 +639,7 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
         (inode >= (UINT64_C(1) << 30U) &&
          (mode & KERNEL_VFS_S_IFMT) !=
             (proc_kind_mode(proc_inode_kind(inode)) & KERNEL_VFS_S_IFMT)) ||
-        ((inode == PROC_MEMINFO_INODE || inode == PROC_UPTIME_INODE ||
+        ((inode == PROC_MEMINFO_INODE || inode == PROC_KPAGEFLAGS_INODE || inode == PROC_UPTIME_INODE ||
           inode == PROC_AIO_NR_INODE || inode == PROC_AIO_MAX_NR_INODE ||
           inode == PROC_PID_MAX_INODE || inode == PROC_NR_HUGEPAGES_INODE || inode == PROC_SYSVIPC_SHM_INODE ||
           inode == PROC_SYSVIPC_SEM_INODE || inode == PROC_SYSVIPC_MSG_INODE ||
@@ -955,64 +979,28 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
                 position >= 5U ? 8U : 10U;
         return 1;
     }
-    const char *entry_name;
-    if (position == 0U) entry_name = ".";
-    else if (position == 1U) entry_name = "..";
-    else if (position == 2U) entry_name = "meminfo";
-    else if (position == 3U) entry_name = "uptime";
-    else if (position == 4U) entry_name = "self";
-    else if (position == 5U) entry_name = "mounts";
-    else if (position == 6U) entry_name = "sys";
-    else if (position == 7U) entry_name = "thread-self";
-    else if (position == 8U) entry_name = "sysvipc";
-    else if (position == 9U) entry_name = "net";
-#if BOAROS_COST_DIAGNOSTICS
-    else if (position == 10U) entry_name = "boaros_cost";
-    else if (position == 11U) entry_name = "boaros_cost_control";
-    else if (position == 12U) entry_name = "boaros_net_stats";
-    else if (position == 13U) entry_name = "boaros_mem_stats";
-    else if (position >= 14U) {
-        position -= 4U;
-#else
-    else if (position >= 10U) {
-#endif
+    if (position >= PROC_ROOT_STATIC_COUNT) {
+        uint64_t cookie=position-PROC_ROOT_STATIC_COUNT;
         kernel_pid_t pid, number;
         uint64_t identity;
-        if (position - 10U >= INT32_MAX ||
+        if (cookie >= INT32_MAX ||
             kernel_proc_view_next(((struct procfs_mount *)((struct kernel_vfs_node *)file->private_data)->instance->backend_data)->pid_view,
-                (kernel_pid_t)(position - 10U), 0, 0, 0, &number, &pid, &identity)) return 0;
+                (kernel_pid_t)cookie, 0, 0, 0, &number, &pid, &identity)) return 0;
         size_t length = decimal(name, (uint32_t)number);
         if (name_size <= length) return -KERNEL_ERANGE;
         name[length] = '\0';
-        *next_position = 10U + (uint32_t)number;
-#if BOAROS_COST_DIAGNOSTICS
-        *next_position += 4U;
-#endif
+        *next_position = PROC_ROOT_STATIC_COUNT + (uint32_t)number;
         *inode = proc_pid_inode(pid, identity, PROC_PID_DIR_KIND);
         *type = 4U;
         return 1;
-    } else return 0;
-    size_t length = strlen(entry_name) + 1U;
+    }
+    const struct proc_root_entry *entry=&proc_root_entries[position];
+    size_t length = strlen(entry->name) + 1U;
     if (name_size < length) return -KERNEL_ERANGE;
-    memcpy(name, entry_name, length);
+    memcpy(name, entry->name, length);
     *next_position = position + 1U;
-    *inode = position == 2U ? PROC_MEMINFO_INODE :
-             position == 3U ? PROC_UPTIME_INODE :
-             position == 4U ? PROC_SELF_INODE :
-             position == 5U ? PROC_MOUNTS_INODE :
-             position == 6U ? PROC_SYS_INODE :
-             position == 7U ? PROC_THREAD_SELF_INODE :
-             position == 8U ? PROC_SYSVIPC_INODE :
-             position == 9U ? PROC_NET_INODE :
-#if BOAROS_COST_DIAGNOSTICS
-             position == 10U ? PROC_COST_INODE :
-             position == 11U ? PROC_COST_CONTROL_INODE :
-             position == 12U ? PROC_NETWORK_STATS_INODE :
-             position == 13U ? PROC_MEMORY_STATS_INODE :
-#endif
-             PROC_ROOT_INODE;
-    *type = position == 4U || position == 5U || position == 7U ? 10U :
-            position >= 2U && position != 6U && position != 8U && position != 9U ? 8U : 4U;
+    *inode = entry->inode;
+    *type = entry->type;
     return 1;
 }
 
@@ -2407,6 +2395,13 @@ int kernel_procfs_ipc_file(const struct kernel_vfs_file *file)
     const struct kernel_vfs_node *node=file->private_data;
     return node && (node->inode==PROC_SYSVIPC_SHM_INODE ||
         node->inode==PROC_SYSVIPC_SEM_INODE || node->inode==PROC_SYSVIPC_MSG_INODE);
+}
+
+int kernel_procfs_kpageflags_file(const struct kernel_vfs_file *file)
+{
+    if (!file || !kernel_procfs_is_mount(file->mount)) return 0;
+    const struct kernel_vfs_node *node=file->private_data;
+    return node && node->inode==PROC_KPAGEFLAGS_INODE;
 }
 
 int kernel_procfs_pagemap_open(const struct kernel_vfs_file *file,

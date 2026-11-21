@@ -1047,10 +1047,14 @@ static void snapshot_copy_case(struct kernel_page_cache *cache,const char *path)
         assert(!kernel_vfs_pwrite(&file,(uint64_t)i*BOAROS_PAGE_SIZE,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
     uint64_t address,last;size_t valid;assert(!kernel_page_cache_get(cache,&file,0,&address,&valid));
     assert(!kernel_page_cache_get(cache,&file,pages-1,&last,&valid));
+    const uint64_t dirty=UINT64_C(1)<<4, writeback=UINT64_C(1)<<8;
+    uint64_t flags, frame=address>>BOAROS_PAGE_SHIFT;
+    assert(physical_page_flags_snapshot(cache->allocator,frame,&flags,1)==1 && flags==dirty);
     struct kernel_page_cache_alias alias={0};assert(!kernel_page_cache_alias_attach(cache,&file,0,address,&alias,
         kernel_vfs_file_node(&file),0x80000,rearm_alias));
     snapshot_copy=(__typeof__(snapshot_copy)){.source=access_page(last),.armed=1};sync_done=0;
     pthread_t sync,reader,writer;assert(!pthread_create(&sync,NULL,sync_file,&file));wait_progress(&snapshot_copy.entered,1);
+    assert(physical_page_flags_snapshot(cache->allocator,frame,&flags,1)==1 && flags==(dirty|writeback));
     snapshot_writer=(__typeof__(snapshot_writer)){.cache=cache,.file=&file,.address=address,.alias=&alias};unsigned parked=mm_test_parked(8);
     assert(!pthread_create(&writer,NULL,snapshot_alias_writer,NULL));
     while(mm_test_parked(8)==parked)sched_yield();
@@ -1060,9 +1064,11 @@ static void snapshot_copy_case(struct kernel_page_cache *cache,const char *path)
     assert(!snapshot_copy.resume && !__atomic_load_n(&snapshot_writer.done,__ATOMIC_ACQUIRE) && !__atomic_load_n(&sync_done,__ATOMIC_ACQUIRE));
     __atomic_store_n(&snapshot_copy.resume,1,__ATOMIC_RELEASE);
     assert(!pthread_join(sync,NULL) && !pthread_join(writer,NULL));snapshot_copy.source=NULL;
+    assert(physical_page_flags_snapshot(cache->allocator,frame,&flags,1)==1 && flags==dirty);
     kernel_page_cache_alias_detach(&alias);kernel_page_cache_alias_drain(&alias);
     assert(!physical_page_release(cache->allocator,address) && !physical_page_release(cache->allocator,last));
     observed=kernel_vfs_error_sequence(&file);assert(!kernel_vfs_sync(&file,0,&observed));
+    assert(physical_page_flags_snapshot(cache->allocator,frame,&flags,1)==1 && !(flags&(dirty|writeback)));
     assert(!kernel_vfs_close(&file) && !kernel_vfs_close(&hot) && !kernel_vfs_unmount(&mount));
     assert(!kernel_page_cache_destroy(cache) && !close(image_fd));current_cache=NULL;
     puts("PASS snapshot batch: unrelated hot read finishes during second-page copy, first-page mmap writer waits for batch reopening, owners returned");

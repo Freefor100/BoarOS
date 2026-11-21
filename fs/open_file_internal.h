@@ -14,6 +14,11 @@ struct kernel_block_device;
 struct kernel_async_io;
 struct kernel_namespace;
 struct kernel_mm_pagemap;
+enum kernel_proc_page_stream {
+    KERNEL_PROC_PAGE_STREAM_NONE,
+    KERNEL_PROC_PAGE_STREAM_PAGEMAP,
+    KERNEL_PROC_PAGE_STREAM_FLAGS,
+};
 
 int kernel_open_file_pread_mode(struct kernel_open_file_description *file,
     uint64_t offset, void *buffer, size_t size, uint32_t status_flags, size_t *bytes_read);
@@ -57,7 +62,7 @@ struct kernel_open_file_description {
     size_t generated_length;
     uint64_t generated_read_offset;
     uint8_t generated_ready;
-    uint8_t pagemap;
+    uint8_t proc_page_stream;
     const struct kernel_credentials *credentials;
     struct kernel_namespace *ipc_proc_namespace; /* /proc/sysvipc discovery owner from open. */
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES

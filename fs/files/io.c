@@ -186,19 +186,20 @@ static enum kernel_files_status mqueue_read_text(struct kernel_files *files,stru
     KERNEL_FILES_NOTE(files,bytes_read,copied);return KERNEL_FILES_STATUS_OK;
 }
 
-static enum kernel_files_status pagemap_read(struct kernel_files *files, struct kernel_mm *mm,
+static enum kernel_files_status proc_page_stream_read(struct kernel_files *files, struct kernel_mm *mm,
     struct kernel_open_file_description *description, struct kernel_uaccess_iov_cursor *cursor,
     uint64_t count, uint64_t offset, int advance, int64_t *linux_result)
 {
-    struct kernel_mm_pagemap *view = description->proc_pagemap;
-    uint64_t total = 0;
+    int pagemap=description->proc_page_stream==KERNEL_PROC_PAGE_STREAM_PAGEMAP;
+    struct kernel_mm_pagemap *view=pagemap ? description->proc_pagemap : NULL;
+    uint64_t total=0, fault_prefix=0;
     int error = 0;
-    if (!kernel_mm_pagemap_live(view)) goto Out;
+    if (pagemap && !kernel_mm_pagemap_live(view)) goto Out;
     if (offset % sizeof(uint64_t)) { error = -KERNEL_EINVAL; goto Out; }
-    int show_pfn = kernel_credentials_capable(description->credentials, KERNEL_CAP_SYS_ADMIN);
+    int show_pfn=pagemap && kernel_credentials_capable(description->credentials,KERNEL_CAP_SYS_ADMIN);
     uint64_t entries[KERNEL_MM_PAGEMAP_BATCH];
-    /* Linux falls back to one pagemap read per iovec. A failed segment keeps
-     * earlier segments, but never advances the offset by a faulted segment. */
+    /* The native proc files implement scalar reads. Vectored IO retains each
+     * preceding completed segment when a later one fails alignment or copying. */
     for (size_t i = 0; i < cursor->count && total < count; ++i) {
         uint64_t length = cursor->iov[i].length;
         if (length > count - total) length = count - total;
@@ -208,11 +209,17 @@ static enum kernel_files_status pagemap_read(struct kernel_files *files, struct 
             uint64_t remaining = (length - done) / sizeof(uint64_t);
             unsigned batch = remaining > KERNEL_MM_PAGEMAP_BATCH ? KERNEL_MM_PAGEMAP_BATCH : (unsigned)remaining;
             unsigned produced;
-            error = kernel_mm_pagemap_read(view, (offset + total + done) / sizeof(uint64_t),
-                batch, show_pfn, entries, &produced);
+            uint64_t first=(offset+total+done)/sizeof(uint64_t);
+            if (pagemap)
+                error=kernel_mm_pagemap_read(view,first,batch,show_pfn,entries,&produced);
+            else
+                produced=physical_page_flags_snapshot(description->heap->page_allocator,first,entries,batch);
             if (error || !produced) break;
             size_t bytes = produced * sizeof(uint64_t), copied;
             if (kernel_copy_to_user(mm, cursor->iov[i].base + done, entries, bytes, &copied)) {
+                /* kpageflags advances after each successfully copied record,
+                 * even when the scalar read returns EFAULT. */
+                if (!pagemap) fault_prefix=done+copied/sizeof(uint64_t)*sizeof(uint64_t);
                 error = -KERNEL_EFAULT;
                 break;
             }
@@ -223,10 +230,11 @@ static enum kernel_files_status pagemap_read(struct kernel_files *files, struct 
         if (done != length) break;
     }
 Out:
-    if (advance && total && kernel_open_file_advance(description, total))
+    uint64_t consumed=total+fault_prefix;
+    if (advance && consumed && kernel_open_file_advance(description,consumed))
         return KERNEL_FILES_STATUS_STATE;
     if (error) KERNEL_FILES_NOTE(files, read_failures, 1);
-    KERNEL_FILES_NOTE(files, bytes_read, total);
+    KERNEL_FILES_NOTE(files, bytes_read, consumed);
     *linux_result = total ? (int64_t)total : error;
     return KERNEL_FILES_STATUS_OK;
 }
@@ -237,8 +245,8 @@ static enum kernel_files_status generated_read(
     struct kernel_uaccess_iov_cursor *cursor, uint64_t count,
     uint64_t offset, int advance, int64_t *linux_result)
 {
-    if (description->pagemap)
-        return pagemap_read(files, mm, description, cursor, count, offset, advance, linux_result);
+    if (description->proc_page_stream)
+        return proc_page_stream_read(files, mm, description, cursor, count, offset, advance, linux_result);
     if (kernel_vfs_file_is_control(&description->file, 0))
         return control_read(files, mm, description, cursor, count, offset, advance, linux_result);
     if (!count) { *linux_result = 0; return KERNEL_FILES_STATUS_OK; }
@@ -613,7 +621,7 @@ static enum kernel_files_status read_pinned(
     if (kind == KERNEL_OPEN_FILE_KIND_SOCKET &&
         (kernel_open_file_flags(description) & KERNEL_FILES_O_NONBLOCK))
         socket_flags |= KERNEL_SOCKET_MSG_DONTWAIT;
-    KERNEL_SERVICE_SCOPE_IF(service, !description->pagemap && kind != KERNEL_OPEN_FILE_KIND_INOTIFY &&
+    KERNEL_SERVICE_SCOPE_IF(service, !description->proc_page_stream && kind != KERNEL_OPEN_FILE_KIND_INOTIFY &&
         kind != KERNEL_OPEN_FILE_KIND_REGULAR && kind != KERNEL_OPEN_FILE_KIND_SOCKET && kind != KERNEL_OPEN_FILE_KIND_PIPE);
     KERNEL_LOCK_SCOPE(offset_guard);
     if ((kind == KERNEL_OPEN_FILE_KIND_REGULAR || kind == KERNEL_OPEN_FILE_KIND_GENERATED) &&
@@ -807,7 +815,7 @@ static enum kernel_files_status read_pinned(
         *linux_result=-KERNEL_EFAULT;
         return KERNEL_FILES_STATUS_OK;
     }
-    if (count == 0U && !description->pagemap) {
+    if (count == 0U && !description->proc_page_stream) {
         *linux_result = 0;
         return KERNEL_FILES_STATUS_OK;
     }
@@ -1039,7 +1047,7 @@ static enum kernel_files_status pread_iov_pinned(
         }
         return status;
     }
-    KERNEL_SERVICE_SCOPE_IF(service, !description->pagemap && kind != KERNEL_OPEN_FILE_KIND_REGULAR &&
+    KERNEL_SERVICE_SCOPE_IF(service, !description->proc_page_stream && kind != KERNEL_OPEN_FILE_KIND_REGULAR &&
         kind != KERNEL_OPEN_FILE_KIND_SOCKET && kind != KERNEL_OPEN_FILE_KIND_PIPE &&
         kind != KERNEL_OPEN_FILE_KIND_EVENTFD && kind != KERNEL_OPEN_FILE_KIND_TIMERFD &&
         kind != KERNEL_OPEN_FILE_KIND_SIGNALFD && kind != KERNEL_OPEN_FILE_KIND_MQUEUE);
@@ -1087,7 +1095,7 @@ static enum kernel_files_status pread_iov_pinned(
         KERNEL_FILES_NOTE(files, read_failures, 1);
         return KERNEL_FILES_STATUS_OK;
     }
-    if (count == 0U && !description->pagemap) {
+    if (count == 0U && !description->proc_page_stream) {
         *linux_result = 0;
         return KERNEL_FILES_STATUS_OK;
     }
@@ -2268,7 +2276,7 @@ static enum kernel_files_status lseek_pinned(
         *linux_result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
     }
-    if (description->kind == KERNEL_OPEN_FILE_KIND_GENERATED && !description->pagemap && !control && target &&
+    if (description->kind == KERNEL_OPEN_FILE_KIND_GENERATED && !description->proc_page_stream && !control && target &&
         (uint64_t)target != description->generated_read_offset) {
         kernel_open_file_reset_generated(description);
         int error = kernel_open_file_generate(description);

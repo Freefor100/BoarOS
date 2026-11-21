@@ -297,15 +297,19 @@ static int finish_path_open(struct kernel_open_file_description *file, struct ke
 {
     if (file->kind != KERNEL_OPEN_FILE_KIND_PATH && kernel_vfs_file_generated(&file->file)) {
         file->kind = KERNEL_OPEN_FILE_KIND_GENERATED;
-        struct kernel_mm_pagemap *view = NULL;
-        int error = kernel_procfs_pagemap_open(&file->file, heap, &view);
-        if (error) {
-            if (kernel_vfs_close(&file->file)) __builtin_trap();
-            return error;
-        }
-        if (view) {
-            file->proc_pagemap = view;
-            file->pagemap = 1;
+        if (kernel_procfs_kpageflags_file(&file->file))
+            file->proc_page_stream = KERNEL_PROC_PAGE_STREAM_FLAGS;
+        else {
+            struct kernel_mm_pagemap *view = NULL;
+            int error = kernel_procfs_pagemap_open(&file->file, heap, &view);
+            if (error) {
+                if (kernel_vfs_close(&file->file)) __builtin_trap();
+                return error;
+            }
+            if (view) {
+                file->proc_pagemap = view;
+                file->proc_page_stream = KERNEL_PROC_PAGE_STREAM_PAGEMAP;
+            }
         }
     }
     initialize_path_description(file, heap);
@@ -1048,7 +1052,7 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
     }
     if(file->ipc_proc_namespace)kernel_proc_view_release(file->ipc_proc_pid_view);
     kernel_namespace_put(file->ipc_proc_namespace);
-    if (file->pagemap) {
+    if (file->proc_page_stream == KERNEL_PROC_PAGE_STREAM_PAGEMAP) {
         kernel_mm_pagemap_put(file->proc_pagemap);
         kernel_heap_release(file->heap, file->proc_pagemap);
     }
@@ -1139,7 +1143,7 @@ uint64_t kernel_open_file_size(
 
 int kernel_open_file_generate(struct kernel_open_file_description *file)
 {
-    if (!open_file_live(file) || file->kind != KERNEL_OPEN_FILE_KIND_GENERATED || file->pagemap)
+    if (!open_file_live(file) || file->kind != KERNEL_OPEN_FILE_KIND_GENERATED || file->proc_page_stream)
         return -KERNEL_EINVAL;
     if (file->generated_ready) return 0;
     int result = kernel_vfs_file_snapshot(&file->file,file->heap,file->ipc_proc_namespace,
@@ -1157,7 +1161,7 @@ int kernel_open_file_generate(struct kernel_open_file_description *file)
 void kernel_open_file_reset_generated(struct kernel_open_file_description *file)
 {
     if (!file || file->kind != KERNEL_OPEN_FILE_KIND_GENERATED) __builtin_trap();
-    if (file->pagemap) return;
+    if (file->proc_page_stream) return;
     if (file->generated_data) kernel_heap_release(file->heap, file->generated_data);
     file->generated_data = 0;
     file->generated_length = 0U;
