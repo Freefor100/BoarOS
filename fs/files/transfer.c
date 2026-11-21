@@ -222,6 +222,100 @@ static int offset_capable(const struct kernel_open_file_description *);
 static int64_t file_into_pipe(struct kernel_open_file_description **,
     struct kernel_open_file_description *,uint64_t *,size_t,unsigned,int,int,unsigned *);
 
+static __attribute__((noinline)) int64_t sendfile_tcp_cached(
+    struct kernel_open_file_description *input, struct kernel_socket_write_request *stream,
+    uint64_t start, uint64_t length, uint64_t deadline, uint32_t flags)
+{
+    enum { SEND_WINDOW_PAGES = 32768 / BOAROS_PAGE_SIZE };
+    struct kernel_page_cache_read_page pages[SEND_WINDOW_PAGES];
+    struct kernel_socket_write_segment segments[SEND_WINDOW_PAGES];
+    struct kernel_page_cache *cache = kernel_open_file_page_cache(input);
+    uint64_t total = 0;
+    size_t window = SEND_WINDOW_PAGES;
+    int no_reuse = kernel_open_file_read_no_reuse(input);
+    int error = 0;
+    while (total < length) {
+        uint64_t position = start + total;
+        uint64_t end = kernel_open_file_size(input);
+        if (position >= end) break;
+        size_t offset = position & BOAROS_PAGE_MASK;
+        size_t wanted = window * BOAROS_PAGE_SIZE - offset;
+        if (wanted > length - total) wanted = (size_t)(length - total);
+        if (wanted > end - position) wanted = (size_t)(end - position);
+        size_t count = (offset + wanted + BOAROS_PAGE_MASK) >> BOAROS_PAGE_SHIFT;
+        kernel_open_file_read_begin(input, position);
+        if (kernel_page_cache_get_batch(cache, &input->file, position >> BOAROS_PAGE_SHIFT,
+                                       pages, count, no_reuse) == KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT)
+            __builtin_trap();
+        struct kernel_task_io_buffer source;
+        kernel_task_io_buffer_take_read_pages(&source, cache, pages, count);
+        unsigned parts = 0;
+        size_t available = 0;
+        int miss = 0;
+        error = 0;
+        for (size_t i = 0; i < count; ++i) {
+            const struct kernel_page_cache_read_page *page = &pages[i];
+            if (page->status == KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE) break;
+            if (page->status) {
+                error = page->status == KERNEL_PAGE_CACHE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+                break;
+            }
+            if (offset >= page->valid_bytes) break;
+            size_t size = page->valid_bytes - offset;
+            if (size > wanted - available) size = wanted - available;
+            const unsigned char *data = kernel_page_cache_read_data(page);
+            segments[parts++] = (struct kernel_socket_write_segment){data + offset, (uint32_t)size};
+            available += size;
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+            miss |= page->cache_miss;
+#endif
+            offset = 0;
+            if (available == wanted || page->valid_bytes < BOAROS_PAGE_SIZE) break;
+        }
+        int sent = 0;
+        if (available) {
+            /* Keep this prefix protected until TCP owns its copy. Return
+             * all page borrows before waiting for transport capacity. */
+            stream->progressed = 0;
+            sent = kernel_socket_stream_reserve(stream, (uint32_t)available, flags);
+            if (sent > 0) {
+                uint32_t remaining = (uint32_t)sent;
+                unsigned i = 0;
+                while (remaining > segments[i].size)
+                    remaining -= segments[i++].size;
+                segments[i].size = remaining;
+                parts = i + 1;
+#if BOAROS_USER_SMP
+                if (kernel_socket_stream_preparev(stream, segments, parts, (uint32_t)sent)) {
+                    kernel_task_io_buffer_release(&source);
+                    sent = kernel_socket_stream_publish(stream, flags);
+                } else
+#endif
+                    sent = kernel_socket_stream_commitv(stream, segments, parts, flags);
+            }
+        }
+        if (source.read_batch.cache) kernel_task_io_buffer_release(&source);
+        if (sent == -KERNEL_EAGAIN && !(flags & KERNEL_SOCKET_MSG_DONTWAIT)) {
+            sent = deadline && kernel_time_monotonic_ns() >= deadline ? -KERNEL_EAGAIN :
+                kernel_socket_wait_ready(stream->socket, KERNEL_POLLOUT, deadline, flags);
+            if (!sent) continue;
+        }
+        if (sent < 0) { error = sent; break; }
+        if ((size_t)sent > available) __builtin_trap();
+        kernel_open_file_read_progress(input, position, (size_t)sent, miss);
+        total += (uint64_t)sent;
+        if ((size_t)sent < available) {
+            if (flags & KERNEL_SOCKET_MSG_DONTWAIT) break;
+            continue;
+        }
+        if (error == -KERNEL_ENOMEM && count > 1) { window = 1; continue; }
+        if (available < wanted || error) break;
+    }
+    if (total && error == -KERNEL_ERESTARTSYS)
+        kernel_signal_clear_syscall_restart(kernel_task_current());
+    return total ? (int64_t)total : error;
+}
+
 static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
     struct kernel_open_file_description *input,
     struct kernel_open_file_description **output_owner,
@@ -270,7 +364,8 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
     if (input->kind != KERNEL_OPEN_FILE_KIND_REGULAR) return -KERNEL_EINVAL;
     if (count) kernel_open_file_read_begin(input, start);
     kernel_vfs_file_accessed(&input->file,kernel_open_file_flags(input));
-    if (count == 0U || start >= kernel_open_file_size(input)) return 0;
+    uint64_t source_size = kernel_open_file_size(input);
+    if (count == 0U || start >= source_size) return 0;
     if (output->kind == KERNEL_OPEN_FILE_KIND_REGULAR) {
         int64_t result = regular_file_copy(mm, input, output, start, out_start, count, &size_limit, 1);
         kernel_files_size_limit_notify(&size_limit);
@@ -312,6 +407,17 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
     struct kernel_socket_write_request request = {0};
     struct kernel_socket_write_request *stream =
         kernel_socket_is_tcp(kernel_open_file_socket(output)) ? &request : NULL;
+    if (stream && direct && count > BOAROS_PAGE_SIZE && source_size - start > BOAROS_PAGE_SIZE &&
+        !kernel_open_file_memory_backed(input)) {
+        kernel_socket_stream_begin(stream, output_owner);
+        int64_t sent = sendfile_tcp_cached(input, stream, start, count, deadline, socket_flags);
+        kernel_socket_stream_finish(stream);
+        if (sent > 0) {
+            if (explicit_offset) *position = (int64_t)(start + (uint64_t)sent);
+            else input->offset = start + (uint64_t)sent;
+        }
+        return sent;
+    }
     /* The syscall owns one active write and OFD pin across source pages.
      * Each commit still COPYs and attempts output, honoring TCP corking,
      * without holding a reservation or adding any sendfile-specific output

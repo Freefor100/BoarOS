@@ -36,6 +36,7 @@
 #include <kernel/sem.h>
 #include <kernel/signal.h>
 #include <kernel/task.h>
+#include <kernel/page_cache.h>
 #include <kernel/uaccess.h>
 #include <kernel/tty_task.h>
 
@@ -2401,9 +2402,29 @@ void kernel_task_io_buffer_take_page(struct kernel_task_io_buffer *buffer,
     if (task) task->io_buffer=buffer;
 }
 
+void kernel_task_io_buffer_take_read_pages(struct kernel_task_io_buffer *buffer,
+    struct kernel_page_cache *cache, struct kernel_page_cache_read_page *pages, size_t count)
+{
+    struct kernel_task *task = kernel_task_current();
+    if (task && task->io_buffer) __builtin_trap();
+    *buffer = (struct kernel_task_io_buffer){.task=task, .read_batch={cache,pages,count}};
+    if (task) task->io_buffer = buffer;
+}
+
 void kernel_task_io_buffer_release(struct kernel_task_io_buffer *buffer)
 {
-    if (buffer == 0 || buffer->allocator == 0) __builtin_trap();
+    if (!buffer) __builtin_trap();
+    if (!buffer->allocator) {
+        if (!buffer->read_batch.cache) __builtin_trap();
+        if (buffer->task) {
+            if (buffer->task->io_buffer != buffer) __builtin_trap();
+            buffer->task->io_buffer = NULL;
+        }
+        kernel_page_cache_put_batch(buffer->read_batch.cache, buffer->read_batch.pages,
+                                    buffer->read_batch.count);
+        *buffer = (struct kernel_task_io_buffer){0};
+        return;
+    }
     if (buffer->task) {
         if (buffer->task->io_buffer != buffer) __builtin_trap();
         if (buffer->retained_scratch &&
