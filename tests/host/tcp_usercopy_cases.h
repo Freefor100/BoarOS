@@ -805,7 +805,7 @@ static void tcp_write_batch_case(struct kernel_heap *heap)
 {
     struct kernel_wait_queue progress;struct kernel_wait_node work;
     kernel_wait_queue_init(&progress);kernel_wait_node_init_callback(&work,tcp_write_work_notification,NULL);
-    kernel_wait_queue_add(&progress,&work);kernel_socket_network_hooks(NULL,&progress,NULL,NULL);
+    kernel_wait_queue_add(&progress,&work);kernel_socket_network_hooks(NULL,&progress,NULL, NULL,NULL);
     /* Stop/queued COPY uses a separate stop caller and live worker in network_owner.c. */
     for(unsigned mode=0;mode<6;mode++) {
         struct kernel_socket *listener=NULL,*client=NULL,*server=NULL;
@@ -933,6 +933,6 @@ static void tcp_write_batch_case(struct kernel_heap *heap)
         printf("PASS TCP batched write %s: real content/prefix, bounded pins, request result before unpin and final owners\n",names[mode]);
         mm_test_finish();mm_test_attach(0);mm_test_activate_task();mm_test_context=context;
     }
-    kernel_socket_network_hooks(NULL,NULL,NULL,NULL);
+    kernel_socket_network_hooks(NULL,NULL,NULL, NULL,NULL);
     assert(!kernel_wait_node_remove_sync(&work) && !kernel_wait_queue_close(&progress) && !kernel_wait_queue_destroy(&progress));
 }

@@ -66,6 +66,8 @@ static inline int boaros_lwip_parallel_enabled(void)
 static inline int boaros_lwip_parallel_enabled(void) { return 0; }
 #endif
 #if BOAROS_USER_SMP
+uint64_t boaros_lwip_ipv4_path_generation(void);
+void boaros_lwip_ipv4_path_changed(void);
 void boaros_lwip_ip_lock_shared(struct kernel_lock_guard *);
 struct kernel_lock_guard *boaros_lwip_ip_drop_current(void);
 static inline void boaros_lwip_ip_lock(struct kernel_lock_guard *guard)
@@ -76,6 +78,7 @@ static inline void boaros_lwip_ip_lock(struct kernel_lock_guard *guard)
     struct kernel_lock_guard name __attribute__((cleanup(kernel_lock_scope_release))) = {0}; \
     boaros_lwip_ip_lock(&name)
 #else
+static inline void boaros_lwip_ipv4_path_changed(void) {}
 static inline void boaros_lwip_ip_lock(struct kernel_lock_guard *guard) { (void)guard; }
 #define BOAROS_LWIP_IP_SCOPE(name) (void)0
 #endif

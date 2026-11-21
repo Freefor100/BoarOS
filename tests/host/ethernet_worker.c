@@ -219,8 +219,8 @@ void netif_remove(struct netif *n) {(void)n;if(!protocol_held) abort();removed++
 void kernel_socket_network_purge_orphans(void) {if(protocol_held) abort();}
 int kernel_socket_rights_drain(void) {return 0;}
 void kernel_socket_rights_service(void) {}
-void kernel_socket_network_hooks(void (*timer)(void *),struct kernel_wait_queue *work,int (*capacity)(void *),void *context)
-{ if(timer || work || capacity || context || protocol_held || !arch_interrupt_is_enabled()) abort();hook_removed++; }
+void kernel_socket_network_hooks(void (*timer)(void *),struct kernel_wait_queue *work,int (*capacity)(void *),unsigned (*receive)(void *),void *context)
+{ if(timer || work || capacity || receive || context || protocol_held || !arch_interrupt_is_enabled()) abort();hook_removed++; }
 enum kernel_scheduler_status kernel_wait_queue_wake_all(struct kernel_wait_queue *q)
 {(void)q;if(arch_interrupt_is_enabled()) abort();return KERNEL_SCHEDULER_STATUS_OK;}
 void kernel_heap_get_statistics(const struct kernel_heap *heap,struct kernel_heap_statistics *out)

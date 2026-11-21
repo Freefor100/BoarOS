@@ -438,6 +438,7 @@ struct tcp_pcb {
 #if BOAROS_USER_SMP
   u8_t boaros_route_bucket;
   struct tcp_pcb *boaros_input_next;
+  struct boaros_ipv4_path boaros_path4;
 #endif
 #endif
 };
