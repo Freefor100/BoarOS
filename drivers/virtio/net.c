@@ -515,16 +515,24 @@ static int tx_slot(struct virtio_net_device *d, int *notify)
     d->tx_available &= ~(UINT64_C(1) << slot);
     return (int)slot;
 }
-static void tx_publish(struct virtio_net_device *d, unsigned b, uint32_t size)
+static void tx_publish(struct virtio_net_device *d, unsigned b, uint32_t size, int more)
 {
     d->tx_state[b] = TX_PENDING;
     d->tx_pending[(d->tx_head + d->tx_count++) % VIRTIO_NET_BUFFERS] = (uint16_t)b;
     d->statistics.tx_packets++; d->statistics.tx_bytes += size;
+    /* Keep the first packets flowing in long batches and alongside senders
+     * that are waiting for queue capacity. */
+    if (!more || d->tx_count >= 8 || !d->tx_available) flush_tx(d);
+}
+
+void virtio_net_tx_flush(struct virtio_net_device *d)
+{
+    KERNEL_IRQ_LOCK_SCOPE(guard, &d->state);
     flush_tx(d);
 }
 
 int virtio_net_send_copy(struct virtio_net_device *d, uint32_t size,
-    int (*copy)(const void *, void *, uint32_t), const void *context)
+    int (*copy)(const void *, void *, uint32_t), const void *context, int more)
 {
     if (!copy || size > 1514) return -KERNEL_EMSGSIZE;
     int slot, notify;
@@ -557,7 +565,7 @@ int virtio_net_send_copy(struct virtio_net_device *d, uint32_t size,
             uint16_t length = (uint16_t)(size + h);
             memcpy((char *)d->tx_memory + slot * VIRTIO_NET_BUFFER_SIZE, &length, 2);
             d->statistics.tx_copy_packets++;
-            tx_publish(d, (unsigned)slot, size);
+            tx_publish(d, (unsigned)slot, size, more);
             result = (int)size;
         }
     }
@@ -567,7 +575,7 @@ int virtio_net_send_copy(struct virtio_net_device *d, uint32_t size,
 static int copy_data(const void *source, void *destination, uint32_t size)
 { memcpy(destination, source, size); return 1; }
 int virtio_net_send_segments(struct virtio_net_device *d,
-    const struct virtio_net_tx_segment *segments, unsigned count, void *owner)
+    const struct virtio_net_tx_segment *segments, unsigned count, void *owner, int more)
 {
     if (!segments || count == 0U || count > VIRTIO_NET_TX_SEGMENTS) return -KERNEL_EMSGSIZE;
     uint64_t total = 0;
@@ -596,7 +604,7 @@ int virtio_net_send_segments(struct virtio_net_device *d,
             d->tx_table[b] = (uint16_t)((count + 1U) * 16U);
             d->tx_owner[b] = owner;
             d->statistics.tx_sg_packets++;
-            tx_publish(d, b, (uint32_t)total);
+            tx_publish(d, b, (uint32_t)total, more);
         }
     }
     if (notify) {
@@ -646,7 +654,7 @@ unsigned virtio_net_tx_release(struct virtio_net_device *d,
 int virtio_net_send(struct virtio_net_device *d, const void *data, uint32_t size)
 {
     if (!data) return -KERNEL_EINVAL;
-    return virtio_net_send_copy(d, size, copy_data, data);
+    return virtio_net_send_copy(d, size, copy_data, data, 0);
 }
 void virtio_net_begin_stop(struct virtio_net_device *d)
 {

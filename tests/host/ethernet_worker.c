@@ -135,8 +135,8 @@ unsigned virtio_net_tx_release(struct virtio_net_device *d,
     return released;
 }
 int virtio_net_send_segments(struct virtio_net_device *d,
-    const struct virtio_net_tx_segment *s, unsigned count, void *owner)
-{ (void)d; (void)s; (void)count; (void)owner; return -KERNEL_ENOTSUP; }
+    const struct virtio_net_tx_segment *s, unsigned count, void *owner, int more)
+{ (void)d; (void)s; (void)count; (void)owner; (void)more; return -KERNEL_ENOTSUP; }
 int arch_dma_image_address(uint64_t v, uint64_t size,
     uint64_t *p)
 { (void)v; (void)size; (void)p; return 0; }

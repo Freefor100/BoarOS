@@ -136,7 +136,8 @@
 #endif
 
 /* Forward declarations.*/
-static err_t tcp_output_segment(struct tcp_seg *seg, struct tcp_pcb *pcb, struct netif *netif);
+static err_t tcp_output_segment(struct tcp_seg *seg, struct tcp_pcb *pcb,
+                                struct netif *netif, struct netif **batch);
 static err_t tcp_output_control_segment_netif(const struct tcp_pcb *pcb, struct pbuf *p,
                                               const ip_addr_t *src, const ip_addr_t *dst,
                                               struct netif *netif);
@@ -170,7 +171,8 @@ tcp_path4_current(const struct tcp_pcb *pcb)
 /* Both data and control segments are checksummed before reaching this point. */
 static err_t
 tcp_ip_output(const struct tcp_pcb *pcb, struct pbuf *p, struct netif *netif,
-              const ip_addr_t *src, const ip_addr_t *dst, u16_t *path_mtu)
+              const ip_addr_t *src, const ip_addr_t *dst, u16_t *path_mtu,
+              struct netif **batch)
 {
 #ifdef BOAROS_LWIP_TCP_CONTEXT
   int local_result;
@@ -189,37 +191,39 @@ tcp_ip_output(const struct tcp_pcb *pcb, struct pbuf *p, struct netif *netif,
   }
 #endif
   BOAROS_LWIP_IP_SCOPE(ip);
+  int more = batch && netif->boaros_link_flush;
+  int split = more;
 #if BOAROS_USER_SMP
   /* The interface may have gone down since the earlier route selection. */
   if (boaros_lwip_parallel_enabled() &&
       (!netif_is_up(netif) || !netif_is_link_up(netif))) return ERR_RTE;
-  struct boaros_link_defer defer = { .packet = p };
   /* Only a sharded connection with its own IP guard can release that
    * guard here. Its owner protects the packet and serializes the next send. */
-  int split = ip.lock && pcb && pcb->boaros_owner && netif->hwaddr_len;
-  if (split) netif->boaros_link_defer = &defer;
+  split |= ip.lock && pcb && pcb->boaros_owner && netif->hwaddr_len;
 #endif
+  struct boaros_link_defer defer = { .packet = p };
+  struct boaros_link_defer *previous = netif->boaros_link_defer;
+  if (split) netif->boaros_link_defer = &defer;
   if (pcb) {
     NETIF_SET_HINTS(netif, LWIP_CONST_CAST(struct netif_hint*, &(pcb->netif_hints)));
   }
   err_t result = ip_output_if(p, src, dst, pcb ? pcb->ttl : TCP_TTL,
                               pcb ? pcb->tos : 0, IP_PROTO_TCP, netif);
   NETIF_RESET_HINTS(netif);
-#if BOAROS_USER_SMP
-  if (split) netif->boaros_link_defer = NULL;
-#endif
+  if (split) netif->boaros_link_defer = previous;
 #ifdef BOAROS_LWIP_TCP_INFO
   /* Route and neighbor state are already protected during IP output. */
   u16_t mtu = 0;
   if (path_mtu && result == ERR_OK)
     mtu = IP_IS_V6(dst) ? nd6_get_destination_mtu(ip_2_ip6(dst), netif) : netif->mtu;
 #endif
-#if BOAROS_USER_SMP
   if (result == ERR_OK && defer.submit) {
-    boaros_lwip_ip_unlock(&ip);
-    result = defer.submit(netif, p);
-  }
+#if BOAROS_USER_SMP
+    if (ip.lock) boaros_lwip_ip_unlock(&ip);
 #endif
+    result = defer.submit(netif, p, more);
+    if (more && result == ERR_OK) *batch = netif;
+  }
 #ifdef BOAROS_LWIP_TCP_INFO
   if (pcb && pcb->state != LISTEN && result == ERR_OK) {
     LWIP_CONST_CAST(struct tcp_pcb *, pcb)->boaros_segs_out++;
@@ -229,6 +233,12 @@ tcp_ip_output(const struct tcp_pcb *pcb, struct pbuf *p, struct netif *netif,
   LWIP_UNUSED_ARG(path_mtu);
 #endif
   return result;
+}
+
+static void
+tcp_flush_batch(struct netif **batch)
+{
+  if (*batch) (*batch)->boaros_link_flush(*batch);
 }
 
 /**
@@ -1609,6 +1619,7 @@ tcp_output(struct tcp_pcb *pcb)
   u32_t wnd, snd_nxt;
   err_t err;
   struct netif *netif;
+  struct netif *batch __attribute__((cleanup(tcp_flush_batch))) = NULL;
 #if TCP_CWND_DEBUG
   s16_t i = 0;
 #endif /* TCP_CWND_DEBUG */
@@ -1755,7 +1766,7 @@ tcp_output(struct tcp_pcb *pcb)
       TCPH_SET_FLAG(seg->tcphdr, TCP_ACK);
     }
 
-    err = tcp_output_segment(seg, pcb, netif);
+    err = tcp_output_segment(seg, pcb, netif, &batch);
     if (err != ERR_OK) {
       /* segment could not be sent, for whatever reason */
       tcp_set_flags(pcb, TF_NAGLEMEMERR);
@@ -1878,7 +1889,8 @@ tcp_output_segment_busy(const struct tcp_seg *seg)
  * @param netif the netif used to send the segment
  */
 static err_t
-tcp_output_segment(struct tcp_seg *seg, struct tcp_pcb *pcb, struct netif *netif)
+tcp_output_segment(struct tcp_seg *seg, struct tcp_pcb *pcb, struct netif *netif,
+                   struct netif **batch)
 {
   err_t err;
   u16_t len;
@@ -2043,7 +2055,9 @@ tcp_output_segment(struct tcp_seg *seg, struct tcp_pcb *pcb, struct netif *netif
       path->generation == boaros_lwip_ipv4_path_generation()) {
     /* The owner serializes the PCB and the descriptors retain the pbuf
      * until the device returns it, just like ordinary Ethernet output. */
-    err = boaros_ipv4_output_resolved(path, seg->p, pcb->ttl, pcb->tos);
+    int more = netif->boaros_link_flush != NULL;
+    err = boaros_ipv4_output_resolved(path, seg->p, pcb->ttl, pcb->tos, more);
+    if (more && err == ERR_OK) *batch = netif;
 #ifdef BOAROS_LWIP_TCP_INFO
     if (err == ERR_OK) {
       pcb->boaros_segs_out++;
@@ -2053,7 +2067,7 @@ tcp_output_segment(struct tcp_seg *seg, struct tcp_pcb *pcb, struct netif *netif
   } else
 #endif
   {
-    err = tcp_ip_output(pcb, seg->p, netif, &pcb->local_ip, &pcb->remote_ip, path_mtu);
+    err = tcp_ip_output(pcb, seg->p, netif, &pcb->local_ip, &pcb->remote_ip, path_mtu, batch);
   }
 
 #if TCP_CHECKSUM_ON_COPY
@@ -2413,7 +2427,7 @@ tcp_output_control_segment_netif(const struct tcp_pcb *pcb, struct pbuf *p,
   }
 #endif
   TCP_STATS_INC(tcp.xmit);
-  err = tcp_ip_output(pcb, p, netif, src, dst, NULL);
+  err = tcp_ip_output(pcb, p, netif, src, dst, NULL, NULL);
 
   pbuf_free(p);
   return err;

@@ -80,11 +80,13 @@ int virtio_net_lend(struct virtio_net_device *device, unsigned buffer);
 void virtio_net_release(struct virtio_net_device *device, unsigned buffer);
 int virtio_net_send(struct virtio_net_device *device, const void *data, uint32_t size);
 int virtio_net_send_copy(struct virtio_net_device *device, uint32_t size,
-    int (*copy)(const void *, void *, uint32_t), const void *context);
+    int (*copy)(const void *, void *, uint32_t), const void *context, int more);
 /* Zero-copy TX: post an indirect table of header plus segments, holding owner
  * until the caller releases it. Needs the negotiated indirect feature. */
 int virtio_net_send_segments(struct virtio_net_device *device,
-    const struct virtio_net_tx_segment *segments, unsigned count, void *owner);
+    const struct virtio_net_tx_segment *segments, unsigned count, void *owner, int more);
+/* Every accepted deferred send is covered by a flush at the end of its batch. */
+void virtio_net_tx_flush(struct virtio_net_device *device);
 /* Return the number of released owners; abandon also releases posted/pending
  * owners after DMA stopped. tx_capacity_generation also includes copied TX. */
 unsigned virtio_net_tx_release(struct virtio_net_device *device,

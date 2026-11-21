@@ -267,9 +267,9 @@ free_and_return:
  * @return ERR_OK if the packet was sent, any other err_t on failure
  */
 static err_t
-ethernet_output_to(struct netif * netif, struct pbuf * p,
+ethernet_prepend(struct netif * netif, struct pbuf * p,
                 const struct eth_addr * src, const struct eth_addr * dst,
-                u16_t eth_type, netif_linkoutput_fn submit) {
+                u16_t eth_type) {
   struct eth_hdr *ethhdr;
   u16_t eth_type_be = lwip_htons(eth_type);
 
@@ -314,8 +314,8 @@ ethernet_output_to(struct netif * netif, struct pbuf * p,
   LWIP_DEBUGF(ETHARP_DEBUG | LWIP_DBG_TRACE,
               ("ethernet_output: sending packet %p\n", (void *)p));
 
-  /* send the packet */
-  return submit(netif, p);
+  LWIP_UNUSED_ARG(netif);
+  return ERR_OK;
 
 pbuf_header_failed:
   LWIP_DEBUGF(ETHARP_DEBUG | LWIP_DBG_TRACE | LWIP_DBG_LEVEL_SERIOUS,
@@ -329,15 +329,17 @@ ethernet_output(struct netif *netif, struct pbuf *p, const struct eth_addr *src,
                 const struct eth_addr *dst, u16_t eth_type)
 {
   LWIP_ASSERT_CORE_LOCKED();
-  return ethernet_output_to(netif, p, src, dst, eth_type, netif->linkoutput);
+  err_t err = ethernet_prepend(netif, p, src, dst, eth_type);
+  return err == ERR_OK ? netif->linkoutput(netif, p) : err;
 }
 
 #if BOAROS_USER_SMP
 err_t
 boaros_ethernet_output_resolved(struct netif *netif, struct pbuf *p,
-                               const struct eth_addr *src, const struct eth_addr *dst)
+                               const struct eth_addr *src, const struct eth_addr *dst, int more)
 {
-  return ethernet_output_to(netif, p, src, dst, ETHTYPE_IP, netif->boaros_link_submit);
+  err_t err = ethernet_prepend(netif, p, src, dst, ETHTYPE_IP);
+  return err == ERR_OK ? netif->boaros_link_submit(netif, p, more) : err;
 }
 #endif
 

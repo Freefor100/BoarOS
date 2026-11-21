@@ -732,7 +732,7 @@ static void test_tx_segments(unsigned version)
     memset(data[0], 'a', 64); memset(data[1], 'b', 37);
     struct riscv_net_tx_segment segments[2] = {{phys[0], 64}, {phys[1], 37}};
     int owner = 42; released_count = 0;
-    assert(riscv_virtio_mmio_net_send_segments(&d, segments, 2, &owner) == 0);
+    assert(riscv_virtio_mmio_net_send_segments(&d, segments, 2, &owner, 0) == 0);
     assert(d.statistics.tx_sg_packets == 1 && d.statistics.tx_copy_packets == 0);
     unsigned id = next_head(1); struct wire_descriptor desc = descriptor(1, id);
     assert(desc.flags == DESC_INDIRECT && desc.length == 3U * 16U);
@@ -757,7 +757,7 @@ static void test_tx_segments(unsigned version)
 #endif
     /* abandon 释放仍持有的在途 owner 且不重复释放。 */
     now += 11;
-    assert(riscv_virtio_mmio_net_send_segments(&d, segments, 1, &owner) == 0);
+    assert(riscv_virtio_mmio_net_send_segments(&d, segments, 1, &owner, 0) == 0);
 #if BOAROS_COST_DIAGNOSTICS
     assert(d.statistics.tx_free_post_count == 1 && d.statistics.tx_free_post_ticks == 11 &&
            d.statistics.tx_free_post_max == 11);
@@ -784,7 +784,7 @@ static void test_tx_segments_unsupported(unsigned version)
     struct riscv_virtio_mmio_net d; memset(&d, 0, sizeof(d));
     assert(riscv_virtio_mmio_net_init(&d, regs, sizeof(regs), &allocator, 100, 7) == 0);
     struct riscv_net_tx_segment segment = {UINT64_C(0x81000000), 16};
-    assert(riscv_virtio_mmio_net_send_segments(&d, &segment, 1, 0) == -KERNEL_ENOTSUP);
+    assert(riscv_virtio_mmio_net_send_segments(&d, &segment, 1, 0, 0) == -KERNEL_ENOTSUP);
     stop(&d);
     printf("PASS: VirtIO-net v%u TX segments require the negotiated indirect feature\n", version);
 }
@@ -812,7 +812,7 @@ static void reenter_tx_release(void *owner)
         assert(d->tx_capacity_generation == 2);
         assert(!riscv_virtio_mmio_net_tx_release(d, reenter_tx_release, probe->abandon));
         if (!probe->abandon) {
-            assert(!riscv_virtio_mmio_net_send_segments(d, &probe->segment, 1, &probe->owner[2]));
+            assert(!riscv_virtio_mmio_net_send_segments(d, &probe->segment, 1, &probe->owner[2], 0));
             complete(1, next_head(1), 0, 1);
             assert(riscv_virtio_mmio_net_tx_release(d, reenter_tx_release, 0) == 1);
         }
@@ -828,7 +828,7 @@ static void test_tx_release_reentry(unsigned version, unsigned abandon)
     struct tx_release_probe probe = {.device = &d, .segment = {phys, 64}, .abandon = abandon};
     active_release_probe = &probe;
     for (unsigned i = 0; i < 2; i++)
-        assert(!riscv_virtio_mmio_net_send_segments(&d, &probe.segment, 1, &probe.owner[i]));
+        assert(!riscv_virtio_mmio_net_send_segments(&d, &probe.segment, 1, &probe.owner[i], 0));
     if (abandon) {
         reject_reset_from = reset_calls + 1;
         for (unsigned i = 0; i < 2; i++) {
@@ -861,6 +861,22 @@ static void test_batch_notify(unsigned version)
     }
     assert(!virtio_net_service(&d));
     assert(queues[0].notifications==rx_before+1);
+    uint64_t phys;
+    unsigned char *data = model_extra_memory(&phys);
+    *data = 'q';
+    struct riscv_net_tx_segment seg = {phys, 1};
+    unsigned owner[2] = {1, 2};
+    assert(!virtio_net_send_segments(&d, &seg, 1, &owner[0], 1));
+    assert(!virtio_net_send_segments(&d, &seg, 1, &owner[1], 1));
+    assert(d.tx_count == 2 && !queues[1].pending_count && !queues[1].notifications);
+    virtio_net_tx_flush(&d);
+    assert(!d.tx_count && queues[1].pending_count == 2 && queues[1].notifications == 1);
+    for (unsigned i = 0; i < 2; i++) complete(1, next_head(1), 0, 0);
+    assert(!virtio_net_service(&d));
+    released_count = 0;
+    assert(virtio_net_tx_release(&d, collect_owner, 0) == 2);
+    assert(released_owner[0] == &owner[0] && released_owner[1] == &owner[1]);
+    model_extra_free(phys);
     for(unsigned i=0;i<64;i++) assert(virtio_net_send(&d,"x",1)==1);
     assert(d.tx_count==32 && queues[1].pending_count==32);
     unsigned tx_before=queues[1].notifications;
@@ -895,7 +911,7 @@ static int hold_tx_copy(const void *context, void *destination, uint32_t size)
 static void *paused_send(void *context)
 {
     struct paused_copy *copy = context;
-    copy->result = virtio_net_send_copy(copy->device, 4, hold_tx_copy, copy);
+    copy->result = virtio_net_send_copy(copy->device, 4, hold_tx_copy, copy, 0);
     return 0;
 }
 static void test_concurrent_copy(unsigned version, int stop_during_copy)
