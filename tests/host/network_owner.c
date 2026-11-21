@@ -2030,6 +2030,32 @@ static void tcp_reset_receive_retry(void)
     puts("PASS TCP abort: retry state and list end together, reserved receive prefix survives, resources returned");
 }
 
+static uint16_t checksum_reference(const unsigned char *data, size_t size)
+{
+    uint64_t sum=0;
+    for (size_t i=0; i<size; i++) sum+=(uint32_t)data[i] << (i&1U ? 8 : 0);
+    while (sum>>16) sum=(sum&UINT16_MAX)+(sum>>16);
+    return (uint16_t)~sum;
+}
+
+static void internet_checksum(void)
+{
+    kernel_socket_network_initialize();
+    unsigned char bytes[UINT16_MAX+16];
+    for (unsigned i=0; i<sizeof(bytes); i++) bytes[i]=(unsigned char)(i*61^(i>>4));
+    for (unsigned offset=0; offset<16; offset++) {
+        for (unsigned size=0; size<128; size++)
+            CHECK(inet_chksum(bytes+offset,(uint16_t)size)==checksum_reference(bytes+offset,size));
+        for (unsigned size=1400; size<1500; size++)
+            CHECK(inet_chksum(bytes+offset,(uint16_t)size)==checksum_reference(bytes+offset,size));
+        size_t size=UINT16_MAX;
+        CHECK(inet_chksum(bytes+offset,(uint16_t)size)==checksum_reference(bytes+offset,size));
+    }
+    memset(bytes,0xff,sizeof(bytes));
+    CHECK(inet_chksum(bytes+7,UINT16_MAX)==checksum_reference(bytes+7,UINT16_MAX));
+    puts("PASS Internet checksum: all alignments, odd tails, MTU-size input and carry folding");
+}
+
 static void tcp_loopback_checksum(void)
 {
     struct kernel_socket *listener=NULL,*client=NULL,*server=NULL;
@@ -5229,6 +5255,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "async-events")) async_events();
     else if (!strcmp(argv[1], "unix-seq-records")) unix_seqpacket_records();
     else if (!strcmp(argv[1], "ipv4-route")) ipv4_route_output();
+    else if (!strcmp(argv[1], "internet-checksum")) internet_checksum();
     else if (!strcmp(argv[1], "tcp-loopback-checksum")) tcp_loopback_checksum();
 #if BOAROS_USER_SMP
     else if (!strcmp(argv[1], "tcp-single-cpu-service")) tcp_single_cpu_service();

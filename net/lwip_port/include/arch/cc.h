@@ -14,7 +14,9 @@ typedef uintptr_t sys_prot_t;
 #define LWIP_PLATFORM_DIAG(message) ((void)0)
 #define LWIP_PLATFORM_ASSERT(message) __builtin_trap()
 #define LWIP_RAND() boaros_lwip_random()
+#define LWIP_CHKSUM(data, length) boaros_lwip_internet_sum((data), (length))
 
 unsigned int boaros_lwip_random(void);
+uint16_t boaros_lwip_internet_sum(const void *data, int length);
 
 #endif
