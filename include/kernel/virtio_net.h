@@ -54,9 +54,12 @@ struct virtio_net_device {
     uint8_t rx_state[VIRTIO_NET_BUFFERS], tx_state[VIRTIO_NET_BUFFERS];
     uint8_t mac[6], link_up, configured, irq_registered, stopping, failed, polling;
     uint16_t loaned;
-    /* 零拷贝 TX：每槽持有调用方 owner 与 indirect 表长度；完成后经 tx_release 归还。 */
+    /* The posted slot owns the payload until hardware completes it. A
+     * retired payload reference can outlive that slot's descriptor storage. */
     void *tx_owner[VIRTIO_NET_BUFFERS];
     uint16_t tx_table[VIRTIO_NET_BUFFERS];
+    void *tx_retired[VIRTIO_NET_QUEUE_SIZE];
+    uint16_t tx_retired_head, tx_retired_count;
     uint16_t tx_done[VIRTIO_NET_BUFFERS];
     uint16_t tx_done_head, tx_done_count;
     struct kernel_raw_lock state;

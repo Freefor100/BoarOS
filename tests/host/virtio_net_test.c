@@ -104,11 +104,13 @@ static void model_extra_free(uint64_t phys)
         if (memory[i].data && memory[i].phys == phys) { free(memory[i].data); memory[i].data = 0; return; }
     assert(0);
 }
-static void *released_owner[8]; static unsigned released_count;
+static void *released_owner[VIRTIO_NET_BUFFERS + VIRTIO_NET_QUEUE_SIZE];
+static unsigned released_count;
 static void collect_owner(void *owner)
 {
     assert(arch_interrupt_is_enabled());
-    assert(released_count < 8); released_owner[released_count++] = owner;
+    assert(released_count < sizeof(released_owner) / sizeof(released_owner[0]));
+    released_owner[released_count++] = owner;
 }
 static struct wire_descriptor raw_descriptor(uint64_t table, unsigned id)
 {
@@ -745,22 +747,23 @@ static void test_tx_segments(unsigned version)
            !memcmp(resolve(first.address), data[0], 64));
     assert(second.flags == 0 && second.length == 37 && !memcmp(resolve(second.address), data[1], 37));
     complete(1, id, 0, 1); assert(!riscv_virtio_mmio_net_service(&d));
-    assert(d.tx_capacity_generation == 0);
+    assert(d.tx_capacity_generation == 1 && virtio_net_get_progress(&d).tx_done_count == 1);
+    assert(d.tx_owner[0] == NULL && released_count == 0);
     now += 7;
     assert(riscv_virtio_mmio_net_tx_release(&d, collect_owner, 0) == 1 && d.tx_capacity_generation == 1);
     assert(released_count == 1 && released_owner[0] == &owner);
     assert(riscv_virtio_mmio_net_tx_release(&d, collect_owner, 0) == 0 && d.tx_capacity_generation == 1);
     assert(released_count == 1);
 #if BOAROS_COST_DIAGNOSTICS
-    assert(d.statistics.tx_done_free_count == 1 && d.statistics.tx_done_free_ticks == 7 &&
-           d.statistics.tx_done_free_max == 7 && d.statistics.tx_free_post_count == 0);
+    assert(d.statistics.tx_done_free_count == 1 && d.statistics.tx_done_free_ticks == 0 &&
+           d.statistics.tx_done_free_max == 0 && d.statistics.tx_free_post_count == 0);
 #endif
     /* abandon 释放仍持有的在途 owner 且不重复释放。 */
     now += 11;
     assert(riscv_virtio_mmio_net_send_segments(&d, segments, 1, &owner, 0) == 0);
 #if BOAROS_COST_DIAGNOSTICS
-    assert(d.statistics.tx_free_post_count == 1 && d.statistics.tx_free_post_ticks == 11 &&
-           d.statistics.tx_free_post_max == 11);
+    assert(d.statistics.tx_free_post_count == 1 && d.statistics.tx_free_post_ticks == 18 &&
+           d.statistics.tx_free_post_max == 18);
 #endif
     reject_reset_from = reset_calls + 1;
     assert(virtio_net_quiesce(&d) == -KERNEL_EIO);
@@ -787,6 +790,35 @@ static void test_tx_segments_unsupported(unsigned version)
     assert(riscv_virtio_mmio_net_send_segments(&d, &segment, 1, 0, 0) == -KERNEL_ENOTSUP);
     stop(&d);
     printf("PASS: VirtIO-net v%u TX segments require the negotiated indirect feature\n", version);
+}
+
+static void test_tx_retirement_pressure(unsigned version)
+{
+    struct riscv_virtio_mmio_net d; start(version, &d);
+    uint64_t phys;
+    *(unsigned char *)model_extra_memory(&phys) = 'p';
+    struct riscv_net_tx_segment segment = {phys, 1};
+    enum { COUNT = VIRTIO_NET_QUEUE_SIZE + 2 };
+    unsigned owners[COUNT];
+    for (unsigned i = 0; i < COUNT; i++) {
+        owners[i] = i;
+        assert(!riscv_virtio_mmio_net_send_segments(&d, &segment, 1, &owners[i], 0));
+        complete(1, next_head(1), 0, 1);
+    }
+    assert(d.tx_capacity_generation == VIRTIO_NET_QUEUE_SIZE);
+    assert(d.tx_retired_count == VIRTIO_NET_QUEUE_SIZE && d.tx_done_count == 2);
+    assert(virtio_net_get_progress(&d).tx_done_count == COUNT);
+    /* Reset must retain the old references, including those no longer
+     * attached to a descriptor slot. */
+    assert(riscv_virtio_mmio_net_stop(&d) == -KERNEL_EBUSY);
+    released_count = 0;
+    assert(riscv_virtio_mmio_net_tx_release(&d, collect_owner, 0) == COUNT);
+    assert(released_count == COUNT && d.tx_capacity_generation == COUNT);
+    for (unsigned i = 0; i < COUNT; i++) assert(released_owner[i] == &owners[i]);
+    assert(!riscv_virtio_mmio_net_tx_release(&d, collect_owner, 1));
+    stop(&d);
+    model_extra_free(phys);
+    printf("PASS: VirtIO-net v%u reuses completed slots with bounded callback backlog\n", version);
 }
 
 struct tx_release_probe {
@@ -994,6 +1026,7 @@ int main(void)
         test_concurrent_copy(version, 0); test_concurrent_copy(version, 1);
         test_loan_budget(version); test_tx_copy_budget(version); test_failure_slot_dump(version);
         test_tx_segments(version);
+        test_tx_retirement_pressure(version);
         test_tx_segments_unsupported(version); test_index_wrap(version);
         for (unsigned q = 0; q < 2; q++) { test_used_index(version, q, 0); test_used_index(version, q, 1); test_duplicate_id(version, q); }
         test_rx_length(version, 0); test_rx_length(version, 1);

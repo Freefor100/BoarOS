@@ -349,7 +349,7 @@ static void worker(void *context)
         struct kernel_socket_service_result service = kernel_socket_service_owned(&scope,
             (struct kernel_socket_service_budget){8, 8, 1});
         if (virtio_net_service(d)) device_failed(n);
-        /* 新TX_DONE由下轮开头在owner外归还；当前条件保证不会睡过完成。 */
+        /* Release completed payload references outside the protocol scope. */
         wait_progress(n, &scope, service, n->capacity_generation);
         arch_interrupt_restore(irq);
     }
