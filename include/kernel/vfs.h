@@ -447,6 +447,19 @@ int kernel_vfs_write_user(struct kernel_vfs_file *,struct kernel_mm *,
 
 #define KERNEL_VFS_FALLOC_KEEP_SIZE 1U
 #define KERNEL_VFS_FALLOC_PUNCH_HOLE 2U
+#define KERNEL_VFS_FALLOC_ZERO_RANGE 0x10U
+static inline int kernel_vfs_fallocate_mode_supported(unsigned mode)
+{
+    switch (mode & ~KERNEL_VFS_FALLOC_KEEP_SIZE) {
+    case 0:
+    case KERNEL_VFS_FALLOC_ZERO_RANGE:
+        return 1;
+    case KERNEL_VFS_FALLOC_PUNCH_HOLE:
+        return (mode & KERNEL_VFS_FALLOC_KEEP_SIZE) != 0;
+    default:
+        return 0;
+    }
+}
 int kernel_vfs_fallocate(struct kernel_vfs_file *file, unsigned mode,
     uint64_t offset, uint64_t length);
 /* Borrowed while the caller retains its file/OFD owner. */

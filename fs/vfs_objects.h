@@ -199,6 +199,7 @@ struct kernel_vfs_backend {
     int (*control)(struct kernel_vfs_node *node, int write, uint64_t *offset,
         char *buffer, size_t size, size_t *count);
     int (*truncate)(struct kernel_vfs_node *node, uint64_t size, uint64_t *actual, int *changed);
+    bool fallocate_zero_range;
     int (*fallocate)(struct kernel_vfs_node *node, unsigned mode, uint64_t offset,
         uint64_t length, uint64_t *actual, int *changed);
     /* prepare returns a physically backed prefix without publishing EOF.

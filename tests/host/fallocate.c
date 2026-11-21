@@ -250,6 +250,63 @@ static void basic_ranges(struct kernel_page_cache *cache,struct kernel_vfs_mount
     assert(!kernel_vfs_close(&file));
     puts("PASS ranges: real unwritten reservations/free counts, KEEP_SIZE/EOF, mixed states, partial/full-block holes and reload");
 }
+static void zero_range(struct kernel_vfs_mount *mount)
+{
+    const unsigned zero = KERNEL_VFS_FALLOC_ZERO_RANGE;
+    struct kernel_vfs_file file = {0};
+    assert(!create_file(mount,"/zero-range",0600,&file));
+    size_t block = kernel_vfs_file_node(&file)->instance->writeback_block_size;
+    size_t length = 6*block, done;
+    unsigned char *expected = calloc(1,length);
+    assert(expected);
+    memset(expected,0x51,3*block);
+    memset(expected+4*block,0x93,2*block);
+    assert(!kernel_vfs_pwrite(&file,0,expected,3*block,&done) && done==3*block);
+    assert(!kernel_vfs_pwrite(&file,4*block,expected+4*block,2*block,&done) && done==2*block);
+    /* Split an initialized run on both sides, then write into its middle again. */
+    assert(!kernel_vfs_fallocate(&file,zero,block,block));
+    memset(expected+block,0,block);
+    assert(mapped(&file,1).unwritten && !mapped(&file,0).unwritten && !mapped(&file,2).unwritten);
+    expect_bytes(&file,expected,length);
+    expected[block+7]=0x39;
+    assert(!kernel_vfs_pwrite(&file,block+7,expected+block+7,1,&done) && done==1);
+    expect_bytes(&file,expected,length);
+    assert(!kernel_vfs_fallocate(&file,zero,19,4*block+23-19));
+    memset(expected+19,0,4*block+23-19);
+    expect_bytes(&file,expected,length);
+    assert(kernel_vfs_file_size(&file)==length && allocated(&file)==length/512);
+    for (unsigned i=1;i<4;i++) assert(mapped(&file,i).block && mapped(&file,i).unwritten);
+    assert(!mapped(&file,0).unwritten && !mapped(&file,4).unwritten);
+
+    if (lwext4_instance(mount->private_data)->device.fs->jbd_journal) {
+        struct kernel_vfs_statfs before, after;
+        assert(!kernel_vfs_mount_statfs(mount,&before));
+        /* Clear initialized full blocks, then fail reserving the last partial
+         * block. The abort must restore both the extent state and the bytes. */
+        fail_reserve=1;
+        assert(kernel_vfs_fallocate(&file,zero,block,5*block+1)==-KERNEL_ENOMEM && !fail_reserve);
+        assert(kernel_vfs_file_size(&file)==length && allocated(&file)==length/512);
+        assert(!kernel_vfs_mount_statfs(mount,&after) && before.free_blocks==after.free_blocks);
+        assert(!mapped(&file,4).unwritten && !mapped(&file,5).unwritten);
+        expect_bytes(&file,expected,length);
+    }
+
+    assert(!kernel_vfs_fallocate(&file,zero|KERNEL_VFS_FALLOC_KEEP_SIZE,8*block+11,block));
+    assert(kernel_vfs_file_size(&file)==length && mapped(&file,8).unwritten &&
+        mapped(&file,9).unwritten);
+    assert(!kernel_vfs_fallocate(&file,zero,6*block,block+13));
+    assert(kernel_vfs_file_size(&file)==7*block+13);
+    assert(kernel_vfs_fallocate(&file,zero|KERNEL_VFS_FALLOC_PUNCH_HOLE|
+        KERNEL_VFS_FALLOC_KEEP_SIZE,0,block)==-KERNEL_EOPNOTSUPP);
+    uint64_t observed=0;
+    assert(!kernel_vfs_sync(&file,0,&observed) && !kernel_vfs_close(&file));
+    assert(!kernel_vfs_open(mount,"/zero-range",&file));
+    expect_bytes(&file,expected,length);
+    free(expected);
+    assert(!kernel_vfs_close(&file));
+    puts("PASS zero-range: cached reads, allocated zeros, preserved edges and KEEP_SIZE");
+}
+
 static void rollback_ranges(struct kernel_vfs_mount *mount)
 {
     struct kernel_vfs_file file={0}; assert(!create_file(mount,"/rollback",0600,&file));
@@ -1818,6 +1875,7 @@ int main(int argc,char **argv)
         .capacity_bytes=stat.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
     struct kernel_vfs_mount mount={0}; assert(!kernel_vfs_mount_ext4(&mount,&device,
         !strncmp(argv[2],"namespace-",10)?&heap:&backend_heap,&cache,0));
+    if (!strcmp(argv[2],"zero-range")) {zero_range(&mount);goto mounted_done;}
     if (!strcmp(argv[2],"delalloc")) {delayed_allocation(&cache,&mount);goto mounted_done;}
     if (!strcmp(argv[2],"delalloc-full-growth")) {delayed_extent_growth(&cache,&mount);goto mounted_done;}
     if (!strcmp(argv[2],"vfs-socket")) {vfs_socket_paths(&mount);goto mounted_done;}

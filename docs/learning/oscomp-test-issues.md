@@ -199,9 +199,10 @@ BuildStorm 的 Rust 工具链曾在准备阶段中止。沿 `Child::wait_with_ou
 
 #### 稀疏定位、文件查询与统计接口的判读
 
-- `lseek11` 已能查找普通文件的数据与空洞。`fallocate04` 已进入打洞后的内容检查，
-  `FALLOC_FL_ZERO_RANGE` 附加场景仍跳过。BoarOS 的 `kernel_open_file_fallocate()` 在
-  解释模式标志时返回 `EOPNOTSUPP`，该请求未进入 ext4 后端。挂载选项不影响此分支。
+- `lseek11` 已能查找普通文件的数据与空洞。`fallocate04` 中的预分配、打洞和
+  `FALLOC_FL_ZERO_RANGE` 均可在 ext4 上执行原断言。清零断言同时检查读回的内容和
+  已分配的空间。随后测试 `FALLOC_FL_COLLAPSE_RANGE`（从文件中移除指定区间并前移后续数据）
+  时仍得到 `EOPNOTSUPP`，原程序将其标为 `TCONF`（当前配置不支持）。
 - `statx10` 查询文件系统上的普通文件，`statx11` 查询块设备。普通文件现在通过与直接输入输出（Direct I/O）相同的后端报告对齐要求。
   LoongArch glibc 原 `statx10` 执行了两条对齐断言。`statx12` 已通过路径和文件描述符
   检查挂载根和普通文件，区分同一文件系统的不同挂载视图。
