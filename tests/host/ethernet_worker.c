@@ -21,6 +21,8 @@ struct virtio_net_progress virtio_net_get_progress(struct virtio_net_device *d)
     };
 }
 void virtio_net_begin_stop(struct virtio_net_device *d) { d->stopping=1; }
+struct virtio_net_progress virtio_net_begin_poll(struct virtio_net_device *d)
+{ return virtio_net_get_progress(d); }
 int virtio_net_service(struct virtio_net_device *d)
 {
     if (!worker_mode) { d->failed = 1; return -KERNEL_EIO; }
@@ -135,8 +137,8 @@ unsigned virtio_net_tx_release(struct virtio_net_device *d,
     return released;
 }
 int virtio_net_send_segments(struct virtio_net_device *d,
-    const struct virtio_net_tx_segment *s, unsigned count, void *owner)
-{ (void)d; (void)s; (void)count; (void)owner; return -KERNEL_ENOTSUP; }
+    const struct virtio_net_tx_segment *s, unsigned count, void *owner, int more)
+{ (void)d; (void)s; (void)count; (void)owner; (void)more; return -KERNEL_ENOTSUP; }
 int arch_dma_image_address(uint64_t v, uint64_t size,
     uint64_t *p)
 { (void)v; (void)size; (void)p; return 0; }

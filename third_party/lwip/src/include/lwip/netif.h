@@ -263,12 +263,11 @@ typedef u8_t netif_addr_idx_t;
  #define LWIP_NETIF_USE_HINTS              0
 #endif /* LWIP_NETIF_HWADDRHINT || LWIP_VLAN_PCP*/
 
-#if BOAROS_USER_SMP
+typedef err_t (*boaros_link_submit_fn)(struct netif *, struct pbuf *, int);
 struct boaros_link_defer {
   const struct pbuf *packet;
-  netif_linkoutput_fn submit;
+  boaros_link_submit_fn submit;
 };
-#endif
 
 /** Generic data structure used for all lwIP network interfaces.
  *  The following fields should be filled in by the initialization
@@ -409,10 +408,9 @@ struct netif {
 #if LWIP_NETIF_USE_HINTS
   struct netif_hint *hints;
 #endif /* LWIP_NETIF_USE_HINTS */
-#if BOAROS_USER_SMP
-  struct boaros_link_defer *boaros_link_defer; /* Borrowed only during locked IP output. */
-  netif_linkoutput_fn boaros_link_submit; /* Immutable until TCP owners are drained. */
-#endif
+  struct boaros_link_defer *boaros_link_defer; /* Borrowed only during protected IP output. */
+  boaros_link_submit_fn boaros_link_submit; /* Immutable until TCP owners are drained. */
+  void (*boaros_link_flush)(struct netif *);
 #if ENABLE_LOOPBACK
   /* List of packets to be queued for ourselves. */
   struct pbuf *loop_first;

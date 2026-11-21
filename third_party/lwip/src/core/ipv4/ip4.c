@@ -944,7 +944,8 @@ boaros_ipv4_path_resolve(struct boaros_ipv4_path *path, struct netif *netif,
 }
 
 err_t
-boaros_ipv4_output_resolved(const struct boaros_ipv4_path *path, struct pbuf *p, u8_t ttl, u8_t tos)
+boaros_ipv4_output_resolved(const struct boaros_ipv4_path *path, struct pbuf *p, u8_t ttl,
+                            u8_t tos, int more)
 {
   LWIP_IP_CHECK_PBUF_REF_COUNT_FOR_TX(p);
   MIB2_STATS_INC(mib2.ipoutrequests);
@@ -954,7 +955,7 @@ boaros_ipv4_output_resolved(const struct boaros_ipv4_path *path, struct pbuf *p,
     return error;
   }
   IP_STATS_INC(ip.xmit);
-  return boaros_ethernet_output_resolved(path->interface, p, &path->link_source, &path->link_destination);
+  return boaros_ethernet_output_resolved(path->interface, p, &path->link_source, &path->link_destination, more);
 }
 #endif
 

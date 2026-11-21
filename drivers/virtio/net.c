@@ -323,6 +323,7 @@ static int reset_locked(struct virtio_net_device *d)
 {
     if (virtio_transport_reset(&d->transport) != VIRTIO_OK) return -KERNEL_EIO;
     d->configured = 0;
+    d->polling = 0;
     for (unsigned q = 0; q < 2; q++) if (d->split[q].size &&
         virtio_split_reset(&d->split[q], &d->transport) != VIRTIO_OK) __builtin_trap();
     return 0;
@@ -396,16 +397,31 @@ failed:
     if (virtio_net_stop(d)) return -KERNEL_EIO;
     return error;
 }
-struct virtio_net_progress virtio_net_get_progress(struct virtio_net_device *d)
+static struct virtio_net_progress progress_locked(struct virtio_net_device *d)
 {
-    if (!d->state.initialized) return (struct virtio_net_progress){0};
-    KERNEL_IRQ_LOCK_SCOPE(guard, &d->state);
     return (struct virtio_net_progress){
         .tx_capacity_generation = d->tx_capacity_generation,
         .tx_done_count = d->tx_done_count, .ready_count = d->ready_count, .loaned = d->loaned,
         .configured = d->configured, .link_up = d->link_up, .stopping = d->stopping,
         .failed = d->failed, .rx_refill_pending = rx_refill_pending(d)
     };
+}
+struct virtio_net_progress virtio_net_get_progress(struct virtio_net_device *d)
+{
+    if (!d->state.initialized) return (struct virtio_net_progress){0};
+    KERNEL_IRQ_LOCK_SCOPE(guard, &d->state);
+    return progress_locked(d);
+}
+
+struct virtio_net_progress virtio_net_begin_poll(struct virtio_net_device *d)
+{
+    KERNEL_IRQ_LOCK_SCOPE(guard, &d->state);
+    if (d->configured && !d->failed && !d->stopping && !d->polling) {
+        d->split[0].available->flags = VIRTIO_AVAIL_NO_INTERRUPT;
+        d->split[1].available->flags = VIRTIO_AVAIL_NO_INTERRUPT;
+        d->polling = 1;
+    }
+    return progress_locked(d);
 }
 uint64_t virtio_net_watchdog_deadline(struct virtio_net_device *d)
 {
@@ -432,6 +448,14 @@ int virtio_net_service(struct virtio_net_device *d)
         KERNEL_IRQ_LOCK_SCOPE(guard, &d->state);
         int failed = d->failed;
         check_status(d);
+        if (d->polling) {
+            d->split[0].available->flags = 0;
+            d->split[1].available->flags = 0;
+            d->polling = 0;
+            /* Enable notification before sampling used indexes, to cover
+             * completions produced while IRQs were suppressed. */
+            arch_dma_barrier();
+        }
         harvest(d);
         if (!d->failed) {
             uint64_t now = arch_time_read();
@@ -515,16 +539,24 @@ static int tx_slot(struct virtio_net_device *d, int *notify)
     d->tx_available &= ~(UINT64_C(1) << slot);
     return (int)slot;
 }
-static void tx_publish(struct virtio_net_device *d, unsigned b, uint32_t size)
+static void tx_publish(struct virtio_net_device *d, unsigned b, uint32_t size, int more)
 {
     d->tx_state[b] = TX_PENDING;
     d->tx_pending[(d->tx_head + d->tx_count++) % VIRTIO_NET_BUFFERS] = (uint16_t)b;
     d->statistics.tx_packets++; d->statistics.tx_bytes += size;
+    /* Keep the first packets flowing in long batches and alongside senders
+     * that are waiting for queue capacity. */
+    if (!more || d->tx_count >= 8 || !d->tx_available) flush_tx(d);
+}
+
+void virtio_net_tx_flush(struct virtio_net_device *d)
+{
+    KERNEL_IRQ_LOCK_SCOPE(guard, &d->state);
     flush_tx(d);
 }
 
 int virtio_net_send_copy(struct virtio_net_device *d, uint32_t size,
-    int (*copy)(const void *, void *, uint32_t), const void *context)
+    int (*copy)(const void *, void *, uint32_t), const void *context, int more)
 {
     if (!copy || size > 1514) return -KERNEL_EMSGSIZE;
     int slot, notify;
@@ -557,7 +589,7 @@ int virtio_net_send_copy(struct virtio_net_device *d, uint32_t size,
             uint16_t length = (uint16_t)(size + h);
             memcpy((char *)d->tx_memory + slot * VIRTIO_NET_BUFFER_SIZE, &length, 2);
             d->statistics.tx_copy_packets++;
-            tx_publish(d, (unsigned)slot, size);
+            tx_publish(d, (unsigned)slot, size, more);
             result = (int)size;
         }
     }
@@ -567,7 +599,7 @@ int virtio_net_send_copy(struct virtio_net_device *d, uint32_t size,
 static int copy_data(const void *source, void *destination, uint32_t size)
 { memcpy(destination, source, size); return 1; }
 int virtio_net_send_segments(struct virtio_net_device *d,
-    const struct virtio_net_tx_segment *segments, unsigned count, void *owner)
+    const struct virtio_net_tx_segment *segments, unsigned count, void *owner, int more)
 {
     if (!segments || count == 0U || count > VIRTIO_NET_TX_SEGMENTS) return -KERNEL_EMSGSIZE;
     uint64_t total = 0;
@@ -596,7 +628,7 @@ int virtio_net_send_segments(struct virtio_net_device *d,
             d->tx_table[b] = (uint16_t)((count + 1U) * 16U);
             d->tx_owner[b] = owner;
             d->statistics.tx_sg_packets++;
-            tx_publish(d, b, (uint32_t)total);
+            tx_publish(d, b, (uint32_t)total, more);
         }
     }
     if (notify) {
@@ -646,7 +678,7 @@ unsigned virtio_net_tx_release(struct virtio_net_device *d,
 int virtio_net_send(struct virtio_net_device *d, const void *data, uint32_t size)
 {
     if (!data) return -KERNEL_EINVAL;
-    return virtio_net_send_copy(d, size, copy_data, data);
+    return virtio_net_send_copy(d, size, copy_data, data, 0);
 }
 void virtio_net_begin_stop(struct virtio_net_device *d)
 {

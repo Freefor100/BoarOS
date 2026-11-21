@@ -52,7 +52,7 @@ struct virtio_net_device {
     uint16_t rx_map[VIRTIO_NET_QUEUE_SIZE], tx_map[VIRTIO_NET_QUEUE_SIZE];
     uint16_t rx_length[VIRTIO_NET_BUFFERS];
     uint8_t rx_state[VIRTIO_NET_BUFFERS], tx_state[VIRTIO_NET_BUFFERS];
-    uint8_t mac[6], link_up, configured, irq_registered, stopping, failed;
+    uint8_t mac[6], link_up, configured, irq_registered, stopping, failed, polling;
     uint16_t loaned;
     /* 零拷贝 TX：每槽持有调用方 owner 与 indirect 表长度；完成后经 tx_release 归还。 */
     void *tx_owner[VIRTIO_NET_BUFFERS];
@@ -73,6 +73,8 @@ int virtio_net_quiesce(struct virtio_net_device *device);
 int virtio_net_stop(struct virtio_net_device *device);
 void virtio_net_begin_stop(struct virtio_net_device *device);
 struct virtio_net_progress virtio_net_get_progress(struct virtio_net_device *device);
+/* Service re-arms interrupts and checks for completions after a poll turn. */
+struct virtio_net_progress virtio_net_begin_poll(struct virtio_net_device *device);
 int virtio_net_service(struct virtio_net_device *device);
 uint64_t virtio_net_watchdog_deadline(struct virtio_net_device *device);
 int virtio_net_receive(struct virtio_net_device *device, struct virtio_net_frame *frame);
@@ -80,11 +82,13 @@ int virtio_net_lend(struct virtio_net_device *device, unsigned buffer);
 void virtio_net_release(struct virtio_net_device *device, unsigned buffer);
 int virtio_net_send(struct virtio_net_device *device, const void *data, uint32_t size);
 int virtio_net_send_copy(struct virtio_net_device *device, uint32_t size,
-    int (*copy)(const void *, void *, uint32_t), const void *context);
+    int (*copy)(const void *, void *, uint32_t), const void *context, int more);
 /* Zero-copy TX: post an indirect table of header plus segments, holding owner
  * until the caller releases it. Needs the negotiated indirect feature. */
 int virtio_net_send_segments(struct virtio_net_device *device,
-    const struct virtio_net_tx_segment *segments, unsigned count, void *owner);
+    const struct virtio_net_tx_segment *segments, unsigned count, void *owner, int more);
+/* Every accepted deferred send is covered by a flush at the end of its batch. */
+void virtio_net_tx_flush(struct virtio_net_device *device);
 /* Return the number of released owners; abandon also releases posted/pending
  * owners after DMA stopped. tx_capacity_generation also includes copied TX. */
 unsigned virtio_net_tx_release(struct virtio_net_device *device,

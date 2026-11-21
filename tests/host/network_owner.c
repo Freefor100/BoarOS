@@ -181,6 +181,7 @@ static unsigned heap_live, dma_eligible, nic_full, copy_attempts, copied_packets
 #if BOAROS_USER_SMP
 static struct pbuf *parallel_dma[4];
 static unsigned parallel_tx_probe, parallel_dma_count;
+static unsigned link_flushes, link_deferred;
 #endif
 static void (*heap_release_once)(void *);
 static uint64_t clock_ns = 1000000000ULL;
@@ -475,9 +476,9 @@ enum kernel_random_status kernel_random_fill(void *buffer, size_t size)
 int arch_dma_image_address(uint64_t address, uint64_t size, uint64_t *physical)
 { (void)size; *physical = address; return dma_eligible; }
 int virtio_net_send_segments(struct virtio_net_device *device,
-    const struct virtio_net_tx_segment *segments, unsigned count, void *owner)
+    const struct virtio_net_tx_segment *segments, unsigned count, void *owner, int more)
 {
-    (void)device; CHECK(segments && count && owner); ++segment_attempts;
+    (void)device; (void)more; CHECK(segments && count && owner); ++segment_attempts;
 #if BOAROS_USER_SMP
     if (parallel_tx_probe) {
         CHECK(current_tcp_owner() && !pthread_mutex_trylock(&model_ip_mutex));
@@ -488,15 +489,25 @@ int virtio_net_send_segments(struct virtio_net_device *device,
         }
         CHECK(parallel_dma_count < sizeof(parallel_dma) / sizeof(parallel_dma[0]));
         parallel_dma[parallel_dma_count++] = owner;
+        if (more) link_deferred++;
         return 0;
     }
 #endif
     return -KERNEL_ENOTSUP;
 }
-int virtio_net_send_copy(struct virtio_net_device *device, uint32_t size,
-    int (*copy)(const void *, void *, uint32_t), const void *context)
+void virtio_net_tx_flush(struct virtio_net_device *device)
 {
-    (void)device; ++copy_attempts;
+    (void)device;
+#if BOAROS_USER_SMP
+    CHECK(link_deferred);
+    link_deferred = 0;
+    link_flushes++;
+#endif
+}
+int virtio_net_send_copy(struct virtio_net_device *device, uint32_t size,
+    int (*copy)(const void *, void *, uint32_t), const void *context, int more)
+{
+    (void)device; (void)more; ++copy_attempts;
     if (nic_full) return -KERNEL_EAGAIN;
     CHECK(size <= sizeof(captured) && copy(context, captured, size));
     captured_size = size;
@@ -519,7 +530,7 @@ int virtio_net_send_copy(struct virtio_net_device *device, uint32_t size,
 static int copy_test_frame(const void *source,void *destination,uint32_t size)
 { memcpy(destination,source,size);return 1; }
 int virtio_net_send(struct virtio_net_device *device,const void *data,uint32_t size)
-{ return virtio_net_send_copy(device,size,copy_test_frame,data); }
+{ return virtio_net_send_copy(device,size,copy_test_frame,data,0); }
 
 static struct model_socket_file *model_socket_file(const struct kernel_open_file_description *file)
 {
@@ -1396,6 +1407,7 @@ static void tcp_resolved_output_contract(void)
     CHECK(tcp_owner_lock(&scope, owner, 0));
     CHECK(tcp_write(pcb, "c", 1, TCP_WRITE_FLAG_COPY) == ERR_OK);
     CHECK(tcp_output(pcb) == ERR_OK && parallel_dma_count == 3);
+    CHECK(link_flushes == 3 && !link_deferred);
     u32_t sequence = 0;
     for (unsigned i = 0; i < 3; i++) {
         struct pbuf *frame = parallel_dma[i];

@@ -55,7 +55,7 @@ static void release_owner(void *owner)
 {
     kernel_socket_pbuf_free(owner);
 }
-static err_t submit_link_frame(struct netif *interface, struct pbuf *p)
+static err_t submit_link_frame(struct netif *interface, struct pbuf *p, int more)
 {
     COST_SCOPE(output_cost, NET_TX_OUTPUT_TICKS);
     struct kernel_network *n = interface->state;
@@ -77,8 +77,7 @@ static err_t submit_link_frame(struct netif *interface, struct pbuf *p)
         }
         if (eligible && count != 0) {
             pbuf_ref(p);
-            int result = virtio_net_send_segments(n->device, segments,
-                                                             count, p);
+            int result = virtio_net_send_segments(n->device, segments, count, p, more);
             if (result == 0) return ERR_OK;
             pbuf_free(p);
             if (result == -KERNEL_EAGAIN) { kernel_socket_network_blocked(); return ERR_MEM; }
@@ -86,20 +85,24 @@ static err_t submit_link_frame(struct netif *interface, struct pbuf *p)
             /* 未协商 indirect：回退复制路径。 */
         }
     }
-    int result = virtio_net_send_copy(n->device, p->tot_len, copy_pbuf, p);
+    int result = virtio_net_send_copy(n->device, p->tot_len, copy_pbuf, p, more);
     /* 复制回退耗尽的仍是 NIC 槽；只等协议池归还会漏掉真实 TX 完成。 */
     if (result == -KERNEL_EAGAIN) { kernel_socket_network_blocked(); return ERR_MEM; }
     return result >= 0 ? ERR_OK : result == -KERNEL_EMSGSIZE ? ERR_BUF : ERR_IF;
 }
-static err_t output_link_frame(struct netif *interface, struct pbuf *p)
+static err_t output_link_frame(struct netif *interface, struct pbuf *p, int more)
 {
-    err_t result = submit_link_frame(interface, p);
+    err_t result = submit_link_frame(interface, p, more);
     if (result == ERR_OK) kernel_socket_packet_ethernet(interface,p,NULL,p->tot_len,1);
     return result;
 }
+static void flush_link_frames(struct netif *interface)
+{
+    struct kernel_network *n = interface->state;
+    virtio_net_tx_flush(n->device);
+}
 static err_t link_output(struct netif *interface, struct pbuf *p)
 {
-#if BOAROS_USER_SMP
     struct boaros_link_defer *defer = interface->boaros_link_defer;
     /* ARP probes, reinjected packets and fragments own other buffers and
      * still go through the synchronous link path. */
@@ -107,8 +110,7 @@ static err_t link_output(struct netif *interface, struct pbuf *p)
         defer->submit = output_link_frame;
         return ERR_OK;
     }
-#endif
-    return output_link_frame(interface, p);
+    return output_link_frame(interface, p, 0);
 }
 int kernel_network_send_frame(struct netif *interface, const void *frame, uint16_t size)
 {
@@ -171,9 +173,8 @@ static err_t interface_init(struct netif *interface)
         NETIF_FLAG_IGMP | NETIF_FLAG_MLD6;
     interface->output = etharp_output; interface->output_ip6 = ipv6_output;
     interface->linkoutput = link_output;
-#if BOAROS_USER_SMP
     interface->boaros_link_submit = output_link_frame;
-#endif
+    interface->boaros_link_flush = flush_link_frames;
     return ERR_OK;
 }
 static unsigned pool_used(void)
@@ -333,7 +334,8 @@ static void worker(void *context)
         virtio_net_tx_release(d, release_owner, 0);
         uintptr_t irq = arch_interrupt_save();
         struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
-        struct virtio_net_progress state = virtio_net_get_progress(d);
+        struct virtio_net_progress state = boaros_lwip_parallel_enabled()
+            ? virtio_net_begin_poll(d) : virtio_net_get_progress(d);
         if (n->capacity_generation != state.tx_capacity_generation) {
             n->capacity_generation = state.tx_capacity_generation;
             kernel_socket_network_capacity();
