@@ -245,9 +245,11 @@ static struct kernel_rwlock *packet_test_configuration_lock;
 static pthread_mutex_t model_ip_mutex=PTHREAD_MUTEX_INITIALIZER;
 static unsigned model_ip_acquisitions;
 static pthread_mutex_t model_tcp_mutex[BOAROS_MAX_CPUS-1];
-unsigned kernel_cpu_get_boot_count(void) { return 2; }
+static unsigned model_boot_cpus = 2;
+static _Thread_local unsigned model_service_requests;
+unsigned kernel_cpu_get_boot_count(void) { return model_boot_cpus; }
 int kernel_service_scope_try_local(struct kernel_service_scope *scope)
-{ (void)scope; return !kernel_cpu_current()->logical_id; }
+{ (void)scope; model_service_requests++; return !kernel_cpu_current()->logical_id; }
 void kernel_service_scope_begin(struct kernel_service_scope *scope)
 { CHECK(kernel_service_scope_try_local(scope)); }
 void kernel_service_scope_end(struct kernel_service_scope *scope) { (void)scope; }
@@ -5187,6 +5189,22 @@ static void unix_peer_identity(void)
     puts("PASS UNIX peer identity: two snapshot references survive creator context and independent closes return both owners");
 }
 
+#if BOAROS_USER_SMP
+static void tcp_single_cpu_service(void)
+{
+    model_boot_cpus = 1;
+    kernel_socket_network_initialize();
+    struct kernel_socket_protocol_scope outer, nested;
+    kernel_socket_protocol_enter(&outer);
+    kernel_socket_protocol_enter(&nested);
+    CHECK(outer.outer && !nested.outer && protocol_depth == 2);
+    kernel_socket_protocol_leave(&nested);
+    kernel_socket_protocol_leave(&outer);
+    CHECK(!protocol_depth && !protocol_current_owner() && !model_service_requests);
+    puts("PASS single active CPU needs no socket service migration");
+}
+#endif
+
 int main(int argc, char **argv)
 {
     CHECK(argc == 2);
@@ -5213,6 +5231,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "ipv4-route")) ipv4_route_output();
     else if (!strcmp(argv[1], "tcp-loopback-checksum")) tcp_loopback_checksum();
 #if BOAROS_USER_SMP
+    else if (!strcmp(argv[1], "tcp-single-cpu-service")) tcp_single_cpu_service();
     else if (!strcmp(argv[1], "tcp-owner-lookup")) tcp_owner_lookup();
     else if (!strcmp(argv[1], "tcp-owner-placement")) tcp_owner_placement();
     else if (!strcmp(argv[1], "tcp-physical-submit")) tcp_physical_submit_contract();

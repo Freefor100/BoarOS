@@ -734,7 +734,9 @@ static int protocol_enter(struct kernel_socket_protocol_scope *scope, int try_on
     scope->tcp_owner=0;
     scope->ip_guard.lock=0;
     scope->service=(struct kernel_service_scope){0};
-    if (!kernel_service_scope_try_local(&scope->service)) {
+    /* With only CPU 0 online, the protocol mutex suffices to keep the
+     * caller in the right execution context across a preemption. */
+    if (kernel_cpu_get_boot_count() > 1 && !kernel_service_scope_try_local(&scope->service)) {
         if (local_only) return 0;
         kernel_service_scope_begin(&scope->service);
     }
