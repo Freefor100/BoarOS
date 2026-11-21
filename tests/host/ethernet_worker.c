@@ -17,12 +17,11 @@ struct virtio_net_progress virtio_net_get_progress(struct virtio_net_device *d)
     return (struct virtio_net_progress){
         .tx_capacity_generation=d->tx_capacity_generation, .tx_done_count=d->tx_done_count,
         .ready_count=d->ready_count, .loaned=d->loaned, .configured=d->configured,
-        .link_up=d->link_up, .stopping=d->stopping, .failed=d->failed, .rx_refill_pending=rx_refill
+        .link_up=d->link_up, .stopping=d->stopping, .failed=d->failed, .rx_refill_pending=rx_refill,
+        .polling=d->polling
     };
 }
 void virtio_net_begin_stop(struct virtio_net_device *d) { d->stopping=1; }
-struct virtio_net_progress virtio_net_begin_poll(struct virtio_net_device *d)
-{ return virtio_net_get_progress(d); }
 int virtio_net_service(struct virtio_net_device *d)
 {
     if (!worker_mode) { d->failed = 1; return -KERNEL_EIO; }
@@ -32,6 +31,7 @@ int virtio_net_service(struct virtio_net_device *d)
     if (worker_mode == 4 && service_calls == 2) { held = 0; d->tx_capacity_generation += 64; }
     return 0;
 }
+int virtio_net_poll_service(struct virtio_net_device *d) { return virtio_net_service(d); }
 int virtio_net_receive(struct virtio_net_device *d, struct virtio_net_frame *f)
 { (void)d; (void)f; return 0; }
 void netif_set_link_down(struct netif *n) { n->flags &= (u8_t)~NETIF_FLAG_LINK_UP; }
@@ -186,15 +186,15 @@ static void wait_contract(void)
     struct virtio_net_device d={.frequency=100};
     struct kernel_network n={.device=&d,.frequency=100};
     worker_mode=0;wait_device=&d;network_host_irq=RISCV_SSTATUS_SIE;
-    for(wait_inject=1;wait_inject<=5;wait_inject++) {
+    for(wait_inject=1;wait_inject<=6;wait_inject++) {
         unsigned parks=wait_parks,finishes=wait_finishes;
-        rx_refill=d.failed=d.link_up=0;
+        rx_refill=d.failed=d.link_up=d.polling=0;
         wait_once(&n,(struct kernel_socket_service_result){.next_deadline=1200},d.tx_capacity_generation);
         if(wait_active || protocol_held || !arch_interrupt_is_enabled() ||
             wait_finishes!=finishes+1 || wait_parks!=parks+(wait_inject==2)) abort();
     }
     wait_inject=0;wait_device=NULL;
-    puts("PASS worker wait: recheck sees capacity, RX refill, device failure and link change; early wake is retained");
+    puts("PASS worker wait: recheck sees capacity, RX refill, device failure, link change and polling; early wake is retained");
 }
 static void current_work_contract(void)
 {
@@ -306,6 +306,7 @@ enum kernel_scheduler_status kernel_wait_prepare(struct kernel_wait_queue *q,uin
     if(wait_inject==3) rx_refill=1;
     if(wait_inject==4) wait_device->failed=1;
     if(wait_inject==5) wait_device->link_up=1;
+    if(wait_inject==6) wait_device->polling=1;
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *t,enum kernel_wait_wake_reason *r)

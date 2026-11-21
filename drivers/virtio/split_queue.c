@@ -73,7 +73,10 @@ enum virtio_status virtio_split_notify(struct virtio_split_queue *q,struct virti
     if(!q || !q->size || !t || !t->ops.write)return VIRTIO_INVALID;
     if(q->fault.reason || q->transport!=t || !t->started || t->quiescent)return VIRTIO_STATE;
     if (q->next_available!=q->published_available)publish_available(q);
-    arch_dma_barrier();t->ops.write(t->context,VIRTIO_REG_QUEUE_NOTIFY,queue);
+    /* Publish the new index before reading the device's suppression hint. */
+    arch_dma_barrier();
+    if (!(q->used->flags & VIRTIO_USED_NO_NOTIFY))
+        t->ops.write(t->context,VIRTIO_REG_QUEUE_NOTIFY,queue);
     return VIRTIO_OK;
 }
 enum virtio_status virtio_split_publish(struct virtio_split_queue *q,struct virtio_transport *t,

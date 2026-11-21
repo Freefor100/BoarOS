@@ -313,6 +313,14 @@ static int link_read(struct virtio_net_device *d)
     if (virtio_transport_config_read(&d->transport, 6, 2, &value) != VIRTIO_OK) return -KERNEL_EIO;
     d->link_up = (value & 1) != 0; return 0;
 }
+static void start_poll_locked(struct virtio_net_device *d)
+{
+    if (d->configured && !d->failed && !d->stopping && !d->polling) {
+        d->split[0].available->flags = VIRTIO_AVAIL_NO_INTERRUPT;
+        d->split[1].available->flags = VIRTIO_AVAIL_NO_INTERRUPT;
+        d->polling = 1;
+    }
+}
 static void interrupt(void *owner)
 {
     struct virtio_net_device *d = owner;
@@ -322,7 +330,8 @@ static void interrupt(void *owner)
         d->transport.ops.ack_interrupt(d->transport.context);
         arch_io_barrier(); check_status(d);
         if (d->configured && link_read(d)) fail(d, "configuration", 0, 0, 0);
-        d->statistics.interrupts++; harvest(d);
+        d->statistics.interrupts++;
+        if (harvest(d)) start_poll_locked(d);
     }
     wake(d);
 }
@@ -411,7 +420,7 @@ static struct virtio_net_progress progress_locked(struct virtio_net_device *d)
         .tx_done_count = d->tx_retired_count + d->tx_done_count,
         .ready_count = d->ready_count, .loaned = d->loaned,
         .configured = d->configured, .link_up = d->link_up, .stopping = d->stopping,
-        .failed = d->failed, .rx_refill_pending = rx_refill_pending(d)
+        .failed = d->failed, .rx_refill_pending = rx_refill_pending(d), .polling = d->polling,
     };
 }
 struct virtio_net_progress virtio_net_get_progress(struct virtio_net_device *d)
@@ -421,16 +430,6 @@ struct virtio_net_progress virtio_net_get_progress(struct virtio_net_device *d)
     return progress_locked(d);
 }
 
-struct virtio_net_progress virtio_net_begin_poll(struct virtio_net_device *d)
-{
-    KERNEL_IRQ_LOCK_SCOPE(guard, &d->state);
-    if (d->configured && !d->failed && !d->stopping && !d->polling) {
-        d->split[0].available->flags = VIRTIO_AVAIL_NO_INTERRUPT;
-        d->split[1].available->flags = VIRTIO_AVAIL_NO_INTERRUPT;
-        d->polling = 1;
-    }
-    return progress_locked(d);
-}
 uint64_t virtio_net_watchdog_deadline(struct virtio_net_device *d)
 {
     KERNEL_IRQ_LOCK_SCOPE(guard, &d->state);
@@ -449,14 +448,15 @@ uint64_t virtio_net_watchdog_deadline(struct virtio_net_device *d)
      * descriptor published after this snapshot. Submission need not wake. */
     return now + remaining;
 }
-int virtio_net_service(struct virtio_net_device *d)
+static int service(struct virtio_net_device *d, int poll)
 {
     int result, notify;
     {
         KERNEL_IRQ_LOCK_SCOPE(guard, &d->state);
         int failed = d->failed;
         check_status(d);
-        if (d->polling) {
+        if (poll) start_poll_locked(d);
+        else if (d->polling) {
             d->split[0].available->flags = 0;
             d->split[1].available->flags = 0;
             d->polling = 0;
@@ -480,10 +480,18 @@ int virtio_net_service(struct virtio_net_device *d)
     if (result) report_failure(d);
     return result;
 }
+int virtio_net_poll_service(struct virtio_net_device *d) { return service(d, 1); }
+int virtio_net_service(struct virtio_net_device *d) { return service(d, 0); }
+
 int virtio_net_receive(struct virtio_net_device *d, struct virtio_net_frame *frame)
 {
     KERNEL_IRQ_LOCK_SCOPE(guard, &d->state);
-    if (!d->ready_count || d->stopping || d->failed) return 0;
+    if (d->stopping || d->failed) return 0;
+    /* A writer helping with receive need not wait for the worker to re-arm
+     * interrupts if the device has already published another frame. */
+    if (!d->ready_count && d->polling && d->split[0].used->index != d->split[0].last_used)
+        harvest(d);
+    if (!d->ready_count || d->failed) return 0;
     unsigned b = d->rx_ready[d->ready_head++ % 64]; d->ready_count--;
     if (d->rx_state[b] != RX_READY) __builtin_trap();
     d->rx_state[b] = RX_CPU;

@@ -935,7 +935,7 @@ static void test_poll_reenable(unsigned version)
 {
     struct riscv_virtio_mmio_net d;
     start(version, &d);
-    assert(!virtio_net_begin_poll(&d).ready_count);
+    assert(!virtio_net_poll_service(&d) && !virtio_net_get_progress(&d).ready_count);
     assert(d.split[0].available->flags == VIRTIO_AVAIL_NO_INTERRUPT &&
            d.split[1].available->flags == VIRTIO_AVAIL_NO_INTERRUPT);
 
@@ -951,6 +951,38 @@ static void test_poll_reenable(unsigned version)
     virtio_net_release(&d, frame.buffer);
     stop(&d);
     printf("PASS: VirtIO-net v%u re-arms interrupts and harvests completions from the poll turn\n",version);
+}
+
+static void test_interrupt_poll_turn(unsigned version)
+{
+    struct riscv_virtio_mmio_net d;
+    start(version, &d);
+    receive("first", 5);
+    assert(d.polling && d.split[0].available->flags == VIRTIO_AVAIL_NO_INTERRUPT &&
+           d.split[1].available->flags == VIRTIO_AVAIL_NO_INTERRUPT);
+    unsigned header = version == 1 ? 10 : 12;
+    unsigned id = prepare_rx("quiet", 5, 0, 0);
+    complete(0, id, header + 5, 0);
+    assert(!virtio_net_poll_service(&d) && d.polling);
+    struct virtio_net_frame frame;
+    assert(virtio_net_receive(&d, &frame) && !memcmp(frame.data, "first", 5));
+    virtio_net_release(&d, frame.buffer);
+    assert(virtio_net_receive(&d, &frame) && !memcmp(frame.data, "quiet", 5));
+    virtio_net_release(&d, frame.buffer);
+
+    id = prepare_rx("assist", 6, 0, 0);
+    complete(0, id, header + 6, 0);
+    assert(virtio_net_receive(&d, &frame) && !memcmp(frame.data, "assist", 6));
+    virtio_net_release(&d, frame.buffer);
+
+    id = prepare_rx("last", 4, 0, 0);
+    complete(0, id, header + 4, 0);
+    assert(!virtio_net_service(&d) && !d.polling);
+    assert(!d.split[0].available->flags && !d.split[1].available->flags);
+    assert(virtio_net_receive(&d, &frame) && !memcmp(frame.data, "last", 4));
+    virtio_net_release(&d, frame.buffer);
+    stop(&d);
+    printf("PASS: VirtIO-net v%u IRQ hands off polling through assist and rearm\n",version);
 }
 
 struct paused_copy {
@@ -1030,6 +1062,7 @@ int main(void)
 {
     test_batch_notify(1); test_batch_notify(2);
     test_poll_reenable(1); test_poll_reenable(2);
+    test_interrupt_poll_turn(1); test_interrupt_poll_turn(2);
     setvbuf(stdout, 0, _IONBF, 0); unsigned errors = 0;
     for (unsigned version = 1; version <= 2; version++) {
         test_concurrent_copy(version, 0); test_concurrent_copy(version, 1);
