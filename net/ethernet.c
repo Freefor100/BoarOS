@@ -201,7 +201,7 @@ static int device_work_pending(struct kernel_network *n, uint64_t generation)
 {
     if (!n->device) return 0;
     struct virtio_net_progress state = virtio_net_get_progress(n->device);
-    return generation != state.tx_capacity_generation || state.tx_done_count ||
+    return state.polling || generation != state.tx_capacity_generation || state.tx_done_count ||
         state.rx_refill_pending || (state.failed ? !n->failure_delivered :
             state.ready_count || state.link_up != netif_is_link_up(&n->interface));
 }
@@ -326,12 +326,11 @@ static void worker(void *context)
     struct virtio_net_device *d = n->device;
     while (!stopping(n)) {
         kernel_socket_rights_service();
-        int failed = virtio_net_service(d);
+        int failed = virtio_net_poll_service(d);
         virtio_net_tx_release(d, kernel_socket_pbuf_free_batch, 0);
         uintptr_t irq = arch_interrupt_save();
         struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
-        struct virtio_net_progress state = boaros_lwip_parallel_enabled()
-            ? virtio_net_begin_poll(d) : virtio_net_get_progress(d);
+        struct virtio_net_progress state = virtio_net_get_progress(d);
         if (n->capacity_generation != state.tx_capacity_generation) {
             n->capacity_generation = state.tx_capacity_generation;
             kernel_socket_network_capacity();

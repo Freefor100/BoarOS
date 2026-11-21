@@ -17,7 +17,7 @@ struct virtio_net_tx_segment { uint64_t physical_address; uint32_t length; };
 struct virtio_net_progress {
     uint64_t tx_capacity_generation;
     uint16_t tx_done_count, ready_count, loaned;
-    uint8_t configured, link_up, stopping, failed, rx_refill_pending;
+    uint8_t configured, link_up, stopping, failed, rx_refill_pending, polling;
 };
 struct virtio_net_statistics {
     uint64_t rx_packets, rx_bytes, tx_packets, tx_bytes, drops, errors, interrupts;
@@ -76,8 +76,9 @@ int virtio_net_quiesce(struct virtio_net_device *device);
 int virtio_net_stop(struct virtio_net_device *device);
 void virtio_net_begin_stop(struct virtio_net_device *device);
 struct virtio_net_progress virtio_net_get_progress(struct virtio_net_device *device);
-/* Service re-arms interrupts and checks for completions after a poll turn. */
-struct virtio_net_progress virtio_net_begin_poll(struct virtio_net_device *device);
+/* Poll service masks queue interrupts for the worker's next bounded turn.
+ * Regular service re-arms them and checks for completions before waiting. */
+int virtio_net_poll_service(struct virtio_net_device *device);
 int virtio_net_service(struct virtio_net_device *device);
 uint64_t virtio_net_watchdog_deadline(struct virtio_net_device *device);
 int virtio_net_receive(struct virtio_net_device *device, struct virtio_net_frame *frame);
