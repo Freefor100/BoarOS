@@ -285,6 +285,9 @@ static void input_frame(struct kernel_network *n, struct virtio_net_frame *frame
         n->device->statistics.copied_packets++; n->device->statistics.copied_bytes += frame->size;
         virtio_net_release(n->device, frame->buffer);
     }
+#if BOAROS_USER_SMP
+    if (frame->more_ready) p->flags |= PBUF_FLAG_BOAROS_RX_BACKLOG;
+#endif
     /* 成功input消耗或接纳pbuf；失败才由当前接收请求释放。 */
     if (n->interface.input(p, &n->interface) != ERR_OK) pbuf_free(p);
     kernel_socket_protocol_leave(&irq);

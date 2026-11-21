@@ -184,6 +184,10 @@ typedef enum {
 /** Default IPv4 WANT policy: advertise DF when this local packet fits the
  * outgoing MTU; larger local packets may still be fragmented. */
 #define PBUF_FLAG_IP4_LOCAL_DF 0x40U
+#if BOAROS_USER_SMP
+/** Ethernet ingress had another completed frame waiting when this was picked up. */
+#define PBUF_FLAG_BOAROS_RX_BACKLOG 0x80U
+#endif
 
 /** Main packet buffer struct */
 struct pbuf {

@@ -455,7 +455,10 @@ int virtio_net_receive(struct virtio_net_device *d, struct virtio_net_frame *fra
     unsigned b = d->rx_ready[d->ready_head++ % 64]; d->ready_count--;
     if (d->rx_state[b] != RX_READY) __builtin_trap();
     d->rx_state[b] = RX_CPU;
-    *frame = (struct virtio_net_frame){ (char *)rx_data(d, b) + header(d), d->rx_length[b], b };
+    *frame = (struct virtio_net_frame){
+        .data = (char *)rx_data(d, b) + header(d), .size = d->rx_length[b],
+        .buffer = b, .more_ready = d->ready_count != 0,
+    };
     return 1;
 }
 int virtio_net_lend(struct virtio_net_device *d, unsigned b)
