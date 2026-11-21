@@ -323,6 +323,7 @@ static int reset_locked(struct virtio_net_device *d)
 {
     if (virtio_transport_reset(&d->transport) != VIRTIO_OK) return -KERNEL_EIO;
     d->configured = 0;
+    d->polling = 0;
     for (unsigned q = 0; q < 2; q++) if (d->split[q].size &&
         virtio_split_reset(&d->split[q], &d->transport) != VIRTIO_OK) __builtin_trap();
     return 0;
@@ -396,16 +397,31 @@ failed:
     if (virtio_net_stop(d)) return -KERNEL_EIO;
     return error;
 }
-struct virtio_net_progress virtio_net_get_progress(struct virtio_net_device *d)
+static struct virtio_net_progress progress_locked(struct virtio_net_device *d)
 {
-    if (!d->state.initialized) return (struct virtio_net_progress){0};
-    KERNEL_IRQ_LOCK_SCOPE(guard, &d->state);
     return (struct virtio_net_progress){
         .tx_capacity_generation = d->tx_capacity_generation,
         .tx_done_count = d->tx_done_count, .ready_count = d->ready_count, .loaned = d->loaned,
         .configured = d->configured, .link_up = d->link_up, .stopping = d->stopping,
         .failed = d->failed, .rx_refill_pending = rx_refill_pending(d)
     };
+}
+struct virtio_net_progress virtio_net_get_progress(struct virtio_net_device *d)
+{
+    if (!d->state.initialized) return (struct virtio_net_progress){0};
+    KERNEL_IRQ_LOCK_SCOPE(guard, &d->state);
+    return progress_locked(d);
+}
+
+struct virtio_net_progress virtio_net_begin_poll(struct virtio_net_device *d)
+{
+    KERNEL_IRQ_LOCK_SCOPE(guard, &d->state);
+    if (d->configured && !d->failed && !d->stopping && !d->polling) {
+        d->split[0].available->flags = VIRTIO_AVAIL_NO_INTERRUPT;
+        d->split[1].available->flags = VIRTIO_AVAIL_NO_INTERRUPT;
+        d->polling = 1;
+    }
+    return progress_locked(d);
 }
 uint64_t virtio_net_watchdog_deadline(struct virtio_net_device *d)
 {
@@ -432,6 +448,14 @@ int virtio_net_service(struct virtio_net_device *d)
         KERNEL_IRQ_LOCK_SCOPE(guard, &d->state);
         int failed = d->failed;
         check_status(d);
+        if (d->polling) {
+            d->split[0].available->flags = 0;
+            d->split[1].available->flags = 0;
+            d->polling = 0;
+            /* Enable notification before sampling used indexes, to cover
+             * completions produced while IRQs were suppressed. */
+            arch_dma_barrier();
+        }
         harvest(d);
         if (!d->failed) {
             uint64_t now = arch_time_read();

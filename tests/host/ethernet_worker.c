@@ -21,6 +21,8 @@ struct virtio_net_progress virtio_net_get_progress(struct virtio_net_device *d)
     };
 }
 void virtio_net_begin_stop(struct virtio_net_device *d) { d->stopping=1; }
+struct virtio_net_progress virtio_net_begin_poll(struct virtio_net_device *d)
+{ return virtio_net_get_progress(d); }
 int virtio_net_service(struct virtio_net_device *d)
 {
     if (!worker_mode) { d->failed = 1; return -KERNEL_EIO; }

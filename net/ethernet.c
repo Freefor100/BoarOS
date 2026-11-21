@@ -334,7 +334,8 @@ static void worker(void *context)
         virtio_net_tx_release(d, release_owner, 0);
         uintptr_t irq = arch_interrupt_save();
         struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
-        struct virtio_net_progress state = virtio_net_get_progress(d);
+        struct virtio_net_progress state = boaros_lwip_parallel_enabled()
+            ? virtio_net_begin_poll(d) : virtio_net_get_progress(d);
         if (n->capacity_generation != state.tx_capacity_generation) {
             n->capacity_generation = state.tx_capacity_generation;
             kernel_socket_network_capacity();

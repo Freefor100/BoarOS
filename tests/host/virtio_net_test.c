@@ -890,6 +890,28 @@ static void test_batch_notify(unsigned version)
     printf("PASS: VirtIO-net v%u RX/TX batch notifies once, partial full batch publishes, empty batch silent\n",version);
 }
 
+static void test_poll_reenable(unsigned version)
+{
+    struct riscv_virtio_mmio_net d;
+    start(version, &d);
+    assert(!virtio_net_begin_poll(&d).ready_count);
+    assert(d.split[0].available->flags == VIRTIO_AVAIL_NO_INTERRUPT &&
+           d.split[1].available->flags == VIRTIO_AVAIL_NO_INTERRUPT);
+
+    /* Device completes without an interrupt while software owns the poll
+     * turn. Re-arming must discover it before the worker prepares to wait. */
+    unsigned id = prepare_rx("poll", 4, 0, 0);
+    complete(0, id, (version == 1 ? 10 : 12) + 4, 0);
+    assert(!virtio_net_get_progress(&d).ready_count);
+    assert(!virtio_net_service(&d));
+    assert(!d.split[0].available->flags && !d.split[1].available->flags);
+    struct virtio_net_frame frame;
+    assert(virtio_net_receive(&d, &frame) && frame.size == 4 && !memcmp(frame.data, "poll", 4));
+    virtio_net_release(&d, frame.buffer);
+    stop(&d);
+    printf("PASS: VirtIO-net v%u re-arms interrupts and harvests completions from the poll turn\n",version);
+}
+
 struct paused_copy {
     struct virtio_net_device *device;
     pthread_mutex_t mutex;
@@ -966,6 +988,7 @@ static void test_concurrent_copy(unsigned version, int stop_during_copy)
 int main(void)
 {
     test_batch_notify(1); test_batch_notify(2);
+    test_poll_reenable(1); test_poll_reenable(2);
     setvbuf(stdout, 0, _IONBF, 0); unsigned errors = 0;
     for (unsigned version = 1; version <= 2; version++) {
         test_concurrent_copy(version, 0); test_concurrent_copy(version, 1);

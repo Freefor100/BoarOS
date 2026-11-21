@@ -6,6 +6,7 @@
 #define VIRTIO_DESC_NEXT 1U
 #define VIRTIO_DESC_WRITE 2U
 #define VIRTIO_DESC_INDIRECT 4U
+#define VIRTIO_AVAIL_NO_INTERRUPT 1U
 struct virtio_descriptor { uint64_t address; uint32_t length; uint16_t flags,next; };
 struct virtio_available_ring {
     uint16_t flags,index,ring[VIRTIO_SPLIT_MAX_SIZE],used_event;
