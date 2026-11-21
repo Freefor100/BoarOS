@@ -522,6 +522,8 @@ socket 持有已校验程序的引用，替换或 detach 在端点锁下交换�
 
 lwIP 入口传递实际 UDP/TCP PCB，按已登记的 socket 回调识别关联；raw API 调用者的任意 callback_arg 不解释为 socket。TCP SYN_RCVD 在 accept 前借用仍活跃监听 PCB 的关联，已建立连接使用自己的关联；本地快速输出使用同一判断。设备停机及 socket 销毁先解除回调，已执行过滤所借用的程序和包/DMA 引用各自持有到停止使用。
 
+被动建连的首次握手应答使用同一传输控制协议（Transmission Control Protocol，TCP）输出入口。网卡暂时没有发送槽时，半开连接在自己的协议控制块上登记重试，由下一次真实容量归还触发。此时尚未创建已接纳连接的套接字。连接撤销时协议控制块及其待发报文一起释放，已登记的重试不会继续持有该对象。
+
 接口、权限、共同执行器和工具入口见 [BPF 模块](kernel-bpf.md)。
 
 ### TCP keepalive policy

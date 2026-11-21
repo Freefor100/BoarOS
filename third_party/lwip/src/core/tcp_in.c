@@ -854,7 +854,11 @@ tcp_listen_input(struct tcp_input_state *rx, struct tcp_pcb_listen *pcb)
       tcp_abandon(npcb, 0);
       return;
     }
+#ifdef LWIP_HOOK_TCP_OUTPUT_PENDING
+    LWIP_HOOK_TCP_OUTPUT_PENDING(npcb);
+#else
     tcp_output(npcb);
+#endif
   }
   return;
 }
