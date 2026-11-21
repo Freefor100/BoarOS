@@ -75,6 +75,9 @@ struct etharp_q_entry {
 
 #define etharp_init() /* Compatibility define, no init needed. */
 void etharp_tmr(void);
+#if BOAROS_USER_SMP
+int boaros_etharp_fresh_neighbor(struct netif *, const ip4_addr_t *, struct eth_addr *);
+#endif
 ssize_t etharp_find_addr(struct netif *netif, const ip4_addr_t *ipaddr,
          struct eth_addr **eth_ret, const ip4_addr_t **ip_ret);
 int etharp_get_entry(size_t i, ip4_addr_t **ipaddr, struct netif **netif, struct eth_addr **eth_ret);

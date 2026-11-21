@@ -411,6 +411,7 @@ struct netif {
 #endif /* LWIP_NETIF_USE_HINTS */
 #if BOAROS_USER_SMP
   struct boaros_link_defer *boaros_link_defer; /* Borrowed only during locked IP output. */
+  netif_linkoutput_fn boaros_link_submit; /* Immutable until TCP owners are drained. */
 #endif
 #if ENABLE_LOOPBACK
   /* List of packets to be queued for ourselves. */

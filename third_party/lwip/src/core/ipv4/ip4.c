@@ -56,6 +56,10 @@
 #include "lwip/autoip.h"
 #include "lwip/stats.h"
 #include "lwip/prot/iana.h"
+#if BOAROS_USER_SMP
+#include "lwip/etharp.h"
+#include "netif/ethernet.h"
+#endif
 
 #include <string.h>
 
@@ -104,7 +108,23 @@
 #endif /* LWIP_DHCP */
 
 /** The IP header ID of the next outgoing IP packet */
+#if BOAROS_USER_SMP
+/* Use a word-sized counter so SMP builds can use the native atomic operation. */
+static u32_t ip_id;
+#else
 static u16_t ip_id;
+#endif
+
+static u16_t
+ip4_next_id(void)
+{
+#if BOAROS_USER_SMP
+  if (boaros_lwip_parallel_enabled()) {
+    return (u16_t)__atomic_fetch_add(&ip_id, 1, __ATOMIC_RELAXED);
+  }
+#endif
+  return (u16_t)ip_id++;
+}
 
 #if LWIP_MULTICAST_TX_OPTIONS
 /** The default netif used for multicast */
@@ -799,6 +819,145 @@ ip4_input(struct pbuf *p, struct netif *inp)
   return ERR_OK;
 }
 
+static err_t
+ip4_prepend_header(struct pbuf *p, const ip4_addr_t *src, const ip4_addr_t *dest,
+                   u8_t ttl, u8_t tos, u8_t proto, u16_t mtu, u16_t ip_hlen,
+                   int checksum, u32_t chk_sum)
+{
+  struct ip_hdr *iphdr;
+#if !CHECKSUM_GEN_IP_INLINE
+  LWIP_UNUSED_ARG(chk_sum);
+#endif
+#if !CHECKSUM_GEN_IP
+  LWIP_UNUSED_ARG(checksum);
+#endif
+  if (pbuf_add_header(p, IP_HLEN)) {
+    LWIP_DEBUGF(IP_DEBUG | LWIP_DBG_LEVEL_SERIOUS, ("ip4_output: not enough room for IP header in pbuf\n"));
+
+    IP_STATS_INC(ip.err);
+    MIB2_STATS_INC(mib2.ipoutdiscards);
+    return ERR_BUF;
+  }
+
+  iphdr = (struct ip_hdr *)p->payload;
+  LWIP_ASSERT("check that first pbuf can hold struct ip_hdr",
+              (p->len >= sizeof(struct ip_hdr)));
+
+  IPH_TTL_SET(iphdr, ttl);
+  IPH_PROTO_SET(iphdr, proto);
+#if CHECKSUM_GEN_IP_INLINE
+  chk_sum += PP_NTOHS(proto | (ttl << 8));
+#endif /* CHECKSUM_GEN_IP_INLINE */
+
+  /* dest cannot be NULL here */
+  ip4_addr_copy(iphdr->dest, *dest);
+#if CHECKSUM_GEN_IP_INLINE
+  chk_sum += ip4_addr_get_u32(&iphdr->dest) & 0xFFFF;
+  chk_sum += ip4_addr_get_u32(&iphdr->dest) >> 16;
+#endif /* CHECKSUM_GEN_IP_INLINE */
+
+  IPH_VHL_SET(iphdr, 4, ip_hlen / 4);
+  IPH_TOS_SET(iphdr, tos);
+#if CHECKSUM_GEN_IP_INLINE
+  chk_sum += PP_NTOHS(tos | (iphdr->_v_hl << 8));
+#endif /* CHECKSUM_GEN_IP_INLINE */
+  IPH_LEN_SET(iphdr, lwip_htons(p->tot_len));
+#if CHECKSUM_GEN_IP_INLINE
+  chk_sum += iphdr->_len;
+#endif /* CHECKSUM_GEN_IP_INLINE */
+  IPH_OFFSET_SET(iphdr, ((p->flags & PBUF_FLAG_IP4_LOCAL_DF) &&
+                       (!mtu || p->tot_len <= mtu)) ? PP_HTONS(IP_DF) : 0);
+  IPH_ID_SET(iphdr, lwip_htons(ip4_next_id()));
+#if CHECKSUM_GEN_IP_INLINE
+  chk_sum += iphdr->_id;
+  chk_sum += iphdr->_offset;
+#endif /* CHECKSUM_GEN_IP_INLINE */
+
+  if (src == NULL) {
+    ip4_addr_copy(iphdr->src, *IP4_ADDR_ANY4);
+  } else {
+    /* src cannot be NULL here */
+    ip4_addr_copy(iphdr->src, *src);
+  }
+
+#if CHECKSUM_GEN_IP_INLINE
+  chk_sum += ip4_addr_get_u32(&iphdr->src) & 0xFFFF;
+  chk_sum += ip4_addr_get_u32(&iphdr->src) >> 16;
+  chk_sum = (chk_sum >> 16) + (chk_sum & 0xFFFF);
+  chk_sum = (chk_sum >> 16) + chk_sum;
+  chk_sum = ~chk_sum;
+  if (checksum) {
+    iphdr->_chksum = (u16_t)chk_sum; /* network order */
+  }
+  else {
+    IPH_CHKSUM_SET(iphdr, 0);
+  }
+#else /* CHECKSUM_GEN_IP_INLINE */
+  IPH_CHKSUM_SET(iphdr, 0);
+#if CHECKSUM_GEN_IP
+  if (checksum) {
+    IPH_CHKSUM_SET(iphdr, inet_chksum(iphdr, ip_hlen));
+  }
+#endif /* CHECKSUM_GEN_IP */
+#endif /* CHECKSUM_GEN_IP_INLINE */
+  return ERR_OK;
+}
+
+#if BOAROS_USER_SMP
+/* Snapshot under the IP mutex. Keep only unicast, directly reachable peers
+ * with fresh ARP entries. ARP probes, loopback and fragmentation use regular
+ * IP output; the interface remains live until its TCP owners have drained. */
+void
+boaros_ipv4_path_resolve(struct boaros_ipv4_path *path, struct netif *netif,
+                         const ip4_addr_t *src, const ip4_addr_t *dst, u8_t bound_if)
+{
+  path->generation = 0;
+#if LWIP_ARP && !ETHARP_SUPPORT_VLAN && !LWIP_IPV4_SRC_ROUTING && !defined(LWIP_HOOK_IP4_ROUTE)
+  if (!netif->boaros_link_submit || netif->output != etharp_output || !netif->mtu ||
+      !netif_is_up(netif) || !netif_is_link_up(netif) ||
+      !ip4_addr_eq(src, netif_ip4_addr(netif)) || ip4_addr_isany(src) ||
+      ip4_addr_isany(dst) || ip4_addr_isloopback(dst) || ip4_addr_ismulticast(dst) ||
+      ip4_addr_eq(src, dst) || ip4_addr_isbroadcast(dst, netif) ||
+      !ip4_addr_net_eq(dst, src, netif_ip4_netmask(netif)) ||
+      !boaros_etharp_fresh_neighbor(netif, dst, &path->link_destination)) {
+    return;
+  }
+  memcpy(&path->link_source, netif->hwaddr, ETH_HWADDR_LEN);
+  path->interface = netif;
+  path->source = *src;
+  path->destination = *dst;
+  path->bound_if = bound_if;
+  path->mtu = netif->mtu;
+  path->checksum = 0;
+#if CHECKSUM_GEN_IP
+  IF__NETIF_CHECKSUM_ENABLED(netif, NETIF_CHECKSUM_GEN_IP) {
+    path->checksum = 1;
+  }
+#endif
+  path->generation = boaros_lwip_ipv4_path_generation();
+#else
+  LWIP_UNUSED_ARG(netif);
+  LWIP_UNUSED_ARG(src);
+  LWIP_UNUSED_ARG(dst);
+  LWIP_UNUSED_ARG(bound_if);
+#endif
+}
+
+err_t
+boaros_ipv4_output_resolved(const struct boaros_ipv4_path *path, struct pbuf *p, u8_t ttl, u8_t tos)
+{
+  LWIP_IP_CHECK_PBUF_REF_COUNT_FOR_TX(p);
+  MIB2_STATS_INC(mib2.ipoutrequests);
+  err_t error = ip4_prepend_header(p, &path->source, &path->destination, ttl, tos, IP_PROTO_TCP,
+                                    path->mtu, IP_HLEN, path->checksum, 0);
+  if (error != ERR_OK) {
+    return error;
+  }
+  IP_STATS_INC(ip.xmit);
+  return boaros_ethernet_output_resolved(path->interface, p, &path->link_source, &path->link_destination);
+}
+#endif
+
 /**
  * Sends an IP packet on a network interface. This function constructs
  * the IP header and calculates the IP header checksum. If the source
@@ -885,9 +1044,7 @@ ip4_output_if_opt_src(struct pbuf *p, const ip4_addr_t *src, const ip4_addr_t *d
 #endif /* IP_OPTIONS_SEND */
   struct ip_hdr *iphdr;
   ip4_addr_t dest_addr;
-#if CHECKSUM_GEN_IP_INLINE
-  u32_t chk_sum = 0;
-#endif /* CHECKSUM_GEN_IP_INLINE */
+  u32_t option_checksum = 0;
 
   LWIP_ASSERT_CORE_LOCKED();
   LWIP_IP_CHECK_PBUF_REF_COUNT_FOR_TX(p);
@@ -927,84 +1084,23 @@ ip4_output_if_opt_src(struct pbuf *p, const ip4_addr_t *src, const ip4_addr_t *d
       }
 #if CHECKSUM_GEN_IP_INLINE
       for (i = 0; i < optlen_aligned / 2; i++) {
-        chk_sum += ((u16_t *)p->payload)[i];
+        option_checksum += ((u16_t *)p->payload)[i];
       }
 #endif /* CHECKSUM_GEN_IP_INLINE */
     }
 #endif /* IP_OPTIONS_SEND */
-    /* generate IP header */
-    if (pbuf_add_header(p, IP_HLEN)) {
-      LWIP_DEBUGF(IP_DEBUG | LWIP_DBG_LEVEL_SERIOUS, ("ip4_output: not enough room for IP header in pbuf\n"));
-
-      IP_STATS_INC(ip.err);
-      MIB2_STATS_INC(mib2.ipoutdiscards);
-      return ERR_BUF;
-    }
-
-    iphdr = (struct ip_hdr *)p->payload;
-    LWIP_ASSERT("check that first pbuf can hold struct ip_hdr",
-                (p->len >= sizeof(struct ip_hdr)));
-
-    IPH_TTL_SET(iphdr, ttl);
-    IPH_PROTO_SET(iphdr, proto);
-#if CHECKSUM_GEN_IP_INLINE
-    chk_sum += PP_NTOHS(proto | (ttl << 8));
-#endif /* CHECKSUM_GEN_IP_INLINE */
-
-    /* dest cannot be NULL here */
-    ip4_addr_copy(iphdr->dest, *dest);
-#if CHECKSUM_GEN_IP_INLINE
-    chk_sum += ip4_addr_get_u32(&iphdr->dest) & 0xFFFF;
-    chk_sum += ip4_addr_get_u32(&iphdr->dest) >> 16;
-#endif /* CHECKSUM_GEN_IP_INLINE */
-
-    IPH_VHL_SET(iphdr, 4, ip_hlen / 4);
-    IPH_TOS_SET(iphdr, tos);
-#if CHECKSUM_GEN_IP_INLINE
-    chk_sum += PP_NTOHS(tos | (iphdr->_v_hl << 8));
-#endif /* CHECKSUM_GEN_IP_INLINE */
-    IPH_LEN_SET(iphdr, lwip_htons(p->tot_len));
-#if CHECKSUM_GEN_IP_INLINE
-    chk_sum += iphdr->_len;
-#endif /* CHECKSUM_GEN_IP_INLINE */
-    IPH_OFFSET_SET(iphdr, ((p->flags & PBUF_FLAG_IP4_LOCAL_DF) &&
-                         (!netif->mtu || p->tot_len<=netif->mtu)) ? PP_HTONS(IP_DF) : 0);
-    IPH_ID_SET(iphdr, lwip_htons(ip_id));
-#if CHECKSUM_GEN_IP_INLINE
-    chk_sum += iphdr->_id;
-    chk_sum += iphdr->_offset;
-#endif /* CHECKSUM_GEN_IP_INLINE */
-    ++ip_id;
-
-    if (src == NULL) {
-      ip4_addr_copy(iphdr->src, *IP4_ADDR_ANY4);
-    } else {
-      /* src cannot be NULL here */
-      ip4_addr_copy(iphdr->src, *src);
-    }
-
-#if CHECKSUM_GEN_IP_INLINE
-    chk_sum += ip4_addr_get_u32(&iphdr->src) & 0xFFFF;
-    chk_sum += ip4_addr_get_u32(&iphdr->src) >> 16;
-    chk_sum = (chk_sum >> 16) + (chk_sum & 0xFFFF);
-    chk_sum = (chk_sum >> 16) + chk_sum;
-    chk_sum = ~chk_sum;
-    IF__NETIF_CHECKSUM_ENABLED(netif, NETIF_CHECKSUM_GEN_IP) {
-      iphdr->_chksum = (u16_t)chk_sum; /* network order */
-    }
-#if LWIP_CHECKSUM_CTRL_PER_NETIF
-    else {
-      IPH_CHKSUM_SET(iphdr, 0);
-    }
-#endif /* LWIP_CHECKSUM_CTRL_PER_NETIF*/
-#else /* CHECKSUM_GEN_IP_INLINE */
-    IPH_CHKSUM_SET(iphdr, 0);
+    int checksum = 0;
 #if CHECKSUM_GEN_IP
     IF__NETIF_CHECKSUM_ENABLED(netif, NETIF_CHECKSUM_GEN_IP) {
-      IPH_CHKSUM_SET(iphdr, inet_chksum(iphdr, ip_hlen));
+      checksum = 1;
     }
-#endif /* CHECKSUM_GEN_IP */
-#endif /* CHECKSUM_GEN_IP_INLINE */
+#endif
+    err_t error = ip4_prepend_header(p, src, dest, ttl, tos, proto, netif->mtu,
+                                    ip_hlen, checksum, option_checksum);
+    if (error != ERR_OK) {
+      return error;
+    }
+    iphdr = p->payload;
   } else {
     /* IP header already included in p */
     if (p->len < IP_HLEN) {

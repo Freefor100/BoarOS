@@ -171,6 +171,9 @@ static err_t interface_init(struct netif *interface)
         NETIF_FLAG_IGMP | NETIF_FLAG_MLD6;
     interface->output = etharp_output; interface->output_ip6 = ipv6_output;
     interface->linkoutput = link_output;
+#if BOAROS_USER_SMP
+    interface->boaros_link_submit = output_link_frame;
+#endif
     return ERR_OK;
 }
 static unsigned pool_used(void)
@@ -291,6 +294,19 @@ dropped:
     virtio_net_release(n->device, frame->buffer);
     kernel_socket_protocol_leave(&irq);
 }
+/* A caller with the network protocol scope may consume the receive FIFO. */
+static unsigned receive_inline(void *context)
+{
+    struct kernel_network *n = context;
+    struct virtio_net_frame frame;
+    unsigned count = 0;
+    while (count < 8 && virtio_net_receive(n->device, &frame)) {
+        input_frame(n, &frame);
+        count++;
+    }
+    return count;
+}
+
 static void device_failed(struct kernel_network *n)
 {
     struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
@@ -310,7 +326,6 @@ static void worker(void *context)
     struct virtio_net_device *d = n->device;
     while (!stopping(n)) {
         kernel_socket_rights_service();
-        unsigned handled = 0;
         int failed = virtio_net_service(d);
         virtio_net_tx_release(d, release_owner, 0);
         uintptr_t irq = arch_interrupt_save();
@@ -324,10 +339,7 @@ static void worker(void *context)
             device_failed(n);
         } else {
             if (state.link_up) netif_set_link_up(&n->interface); else netif_set_link_down(&n->interface);
-            struct virtio_net_frame frame;
-            while (handled < 8 && virtio_net_receive(d, &frame)) {
-                input_frame(n, &frame); handled++;
-            }
+            receive_inline(n);
         }
         struct kernel_socket_service_result service = kernel_socket_service_owned(&scope,
             (struct kernel_socket_service_budget){8, 8, 1});
@@ -369,7 +381,8 @@ int kernel_network_start(struct kernel_network **owner, struct kernel_heap *heap
     if (kernel_thread_create_joinable(device ? worker : timer_worker, n, &n->worker) != KERNEL_SCHEDULER_STATUS_OK) {
         kernel_socket_protocol_leave(&saved); (void)kernel_network_stop(owner); return -KERNEL_ENOMEM;
     }
-    kernel_socket_network_hooks(timer_wake, progress(n), device ? udp_capacity : 0, n);
+    kernel_socket_network_hooks(timer_wake, progress(n), device ? udp_capacity : 0,
+                                device ? receive_inline : 0, n);
     kernel_socket_protocol_leave(&saved);
     if (device) {
         print_text("BoarOS: eth0 ready transport="); print_text(device->version == 1 ? "legacy" : "modern");
@@ -392,7 +405,7 @@ int kernel_network_stop(struct kernel_network **owner)
     kernel_assert_can_block();
     arch_interrupt_restore(ARCH_INTERRUPT_ENABLE_MASK);
     /* Close queued admission and finish pinned callers before joining the worker. */
-    if (first_stop) kernel_socket_network_hooks(0, 0, 0, 0);
+    if (first_stop) kernel_socket_network_hooks(0, 0, 0, 0, 0);
     uintptr_t stopped_irq=arch_interrupt_save();
     n->stopping=1;(void)kernel_wait_queue_wake_all(progress(n));
     arch_interrupt_restore(stopped_irq);

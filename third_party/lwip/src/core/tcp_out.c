@@ -154,6 +154,19 @@ tcp_route(const struct tcp_pcb *pcb, const ip_addr_t *src, const ip_addr_t *dst)
   }
 }
 
+#if BOAROS_USER_SMP
+static int
+tcp_path4_current(const struct tcp_pcb *pcb)
+{
+  const struct boaros_ipv4_path *path = &pcb->boaros_path4;
+  return path->generation && path->generation == boaros_lwip_ipv4_path_generation() &&
+         path->bound_if == pcb->netif_idx && IP_IS_V4(&pcb->local_ip) &&
+         IP_IS_V4(&pcb->remote_ip) &&
+         ip4_addr_eq(&path->source, ip_2_ip4(&pcb->local_ip)) &&
+         ip4_addr_eq(&path->destination, ip_2_ip4(&pcb->remote_ip));
+}
+#endif
+
 /* Both data and control segments are checksummed before reaching this point. */
 static err_t
 tcp_ip_output(const struct tcp_pcb *pcb, struct pbuf *p, struct netif *netif,
@@ -1644,6 +1657,11 @@ tcp_output(struct tcp_pcb *pcb)
                  lwip_ntohl(seg->tcphdr->seqno), pcb->lastack));
   }
 
+#if BOAROS_USER_SMP
+  if (tcp_path4_current(pcb)) {
+    netif = pcb->boaros_path4.interface;
+  } else
+#endif
   {
     BOAROS_LWIP_IP_SCOPE(ip);
     netif = tcp_route(pcb, &pcb->local_ip, &pcb->remote_ip);
@@ -1659,6 +1677,13 @@ tcp_output(struct tcp_pcb *pcb)
       }
       ip_addr_copy(pcb->local_ip, *local_ip);
     }
+#if BOAROS_USER_SMP
+    pcb->boaros_path4.generation = 0;
+    if (pcb->boaros_owner && IP_IS_V4(&pcb->local_ip) && IP_IS_V4(&pcb->remote_ip)) {
+      boaros_ipv4_path_resolve(&pcb->boaros_path4, netif, ip_2_ip4(&pcb->local_ip),
+                               ip_2_ip4(&pcb->remote_ip), pcb->netif_idx);
+    }
+#endif
   }
 
   err = tcp_ipv6_resize_head(pcb,netif);
@@ -2011,7 +2036,25 @@ tcp_output_segment(struct tcp_seg *seg, struct tcp_pcb *pcb, struct netif *netif
 #ifdef BOAROS_LWIP_TCP_INFO
   path_mtu = &pcb->boaros_pmtu;
 #endif
-  err = tcp_ip_output(pcb, seg->p, netif, &pcb->local_ip, &pcb->remote_ip, path_mtu);
+#if BOAROS_USER_SMP
+  const struct boaros_ipv4_path *path = &pcb->boaros_path4;
+  if (seg->len && path->interface == netif && path->generation &&
+      seg->p->tot_len <= path->mtu - IP_HLEN &&
+      path->generation == boaros_lwip_ipv4_path_generation()) {
+    /* The owner serializes the PCB and the descriptors retain the pbuf
+     * until the device returns it, just like ordinary Ethernet output. */
+    err = boaros_ipv4_output_resolved(path, seg->p, pcb->ttl, pcb->tos);
+#ifdef BOAROS_LWIP_TCP_INFO
+    if (err == ERR_OK) {
+      pcb->boaros_segs_out++;
+      pcb->boaros_pmtu = path->mtu;
+    }
+#endif
+  } else
+#endif
+  {
+    err = tcp_ip_output(pcb, seg->p, netif, &pcb->local_ip, &pcb->remote_ip, path_mtu);
+  }
 
 #if TCP_CHECKSUM_ON_COPY
   if (seg_chksum_was_swapped) {

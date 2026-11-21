@@ -95,6 +95,21 @@ void boaros_lwip_ip_init(unsigned cpu_count)
 #endif
 }
 #if BOAROS_USER_SMP
+/* Configuration and neighbor writers publish under the IP mutex. Cached
+ * TCP paths contain copies, so an already admitted frame needs no pin on ARP. */
+static uint64_t ipv4_path_generation = 1;
+
+uint64_t boaros_lwip_ipv4_path_generation(void)
+{
+    return __atomic_load_n(&ipv4_path_generation,__ATOMIC_ACQUIRE);
+}
+
+void boaros_lwip_ipv4_path_changed(void)
+{
+    if (boaros_lwip_parallel_enabled())
+        __atomic_add_fetch(&ipv4_path_generation,1,__ATOMIC_RELEASE);
+}
+
 void boaros_lwip_ip_lock_shared(struct kernel_lock_guard *guard)
 {
     if(!kernel_lock_held(&ip_mutex.lock,1)) {

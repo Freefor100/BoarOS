@@ -47,6 +47,9 @@
 #include "lwip/err.h"
 #include "lwip/netif.h"
 #include "lwip/prot/ip4.h"
+#if BOAROS_USER_SMP
+#include "lwip/prot/ethernet.h"
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -75,6 +78,19 @@ err_t ip4_output_if(struct pbuf *p, const ip4_addr_t *src, const ip4_addr_t *des
        u8_t ttl, u8_t tos, u8_t proto, struct netif *netif);
 err_t ip4_output_if_src(struct pbuf *p, const ip4_addr_t *src, const ip4_addr_t *dest,
        u8_t ttl, u8_t tos, u8_t proto, struct netif *netif);
+#if BOAROS_USER_SMP
+struct boaros_ipv4_path {
+  struct netif *interface;
+  uint64_t generation;
+  ip4_addr_t source, destination;
+  struct eth_addr link_source, link_destination;
+  u16_t mtu;
+  u8_t bound_if, checksum;
+};
+void boaros_ipv4_path_resolve(struct boaros_ipv4_path *, struct netif *,
+                              const ip4_addr_t *, const ip4_addr_t *, u8_t);
+err_t boaros_ipv4_output_resolved(const struct boaros_ipv4_path *, struct pbuf *, u8_t, u8_t);
+#endif
 #if LWIP_NETIF_USE_HINTS
 err_t ip4_output_hinted(struct pbuf *p, const ip4_addr_t *src, const ip4_addr_t *dest,
        u8_t ttl, u8_t tos, u8_t proto, struct netif_hint *netif_hint);

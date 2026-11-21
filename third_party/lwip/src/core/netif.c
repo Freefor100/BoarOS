@@ -352,6 +352,10 @@ netif_add(struct netif *netif,
   NETIF_SET_CHECKSUM_CTRL(netif, NETIF_CHECKSUM_ENABLE_ALL);
   netif->mtu = 0;
   netif->flags = 0;
+#if BOAROS_USER_SMP
+  netif->boaros_link_defer = NULL;
+  netif->boaros_link_submit = NULL;
+#endif
 #ifdef netif_get_client_data
   memset(netif->client_data, 0, sizeof(netif->client_data));
 #endif /* LWIP_NUM_NETIF_CLIENT_DATA */
@@ -441,6 +445,9 @@ netif_add(struct netif *netif,
   }
 
   /* add this netif to the list */
+#if BOAROS_USER_SMP
+  boaros_lwip_ipv4_path_changed();
+#endif
   netif->next = netif_list;
   netif_list = netif;
 #endif /* "LWIP_SINGLE_NETIF */
@@ -512,6 +519,9 @@ netif_do_set_ipaddr(struct netif *netif, const ip4_addr_t *ipaddr, ip_addr_t *ol
     mib2_remove_ip4(netif);
     mib2_remove_route_ip4(0, netif);
     /* set new IP address to netif */
+#if BOAROS_USER_SMP
+    boaros_lwip_ipv4_path_changed();
+#endif
     ip4_addr_set(ip_2_ip4(&netif->ip_addr), ipaddr);
     IP_SET_TYPE_VAL(netif->ip_addr, IPADDR_TYPE_V4);
     mib2_add_ip4(netif);
@@ -585,6 +595,9 @@ netif_do_set_netmask(struct netif *netif, const ip4_addr_t *netmask, ip_addr_t *
 #endif
     mib2_remove_route_ip4(0, netif);
     /* set new netmask to netif */
+#if BOAROS_USER_SMP
+    boaros_lwip_ipv4_path_changed();
+#endif
     ip4_addr_set(ip_2_ip4(&netif->netmask), netmask);
     IP_SET_TYPE_VAL(netif->netmask, IPADDR_TYPE_V4);
     mib2_add_route_ip4(0, netif);
@@ -648,6 +661,9 @@ netif_do_set_gw(struct netif *netif, const ip4_addr_t *gw, ip_addr_t *old_gw)
     LWIP_UNUSED_ARG(old_gw);
 #endif
 
+#if BOAROS_USER_SMP
+    boaros_lwip_ipv4_path_changed();
+#endif
     ip4_addr_set(ip_2_ip4(&netif->gw), gw);
     IP_SET_TYPE_VAL(netif->gw, IPADDR_TYPE_V4);
     LWIP_DEBUGF(NETIF_DEBUG | LWIP_DBG_TRACE | LWIP_DBG_STATE, ("netif: GW address of interface %c%c set to %"U16_F".%"U16_F".%"U16_F".%"U16_F"\n",
@@ -845,6 +861,9 @@ netif_remove(struct netif *netif)
     netif_set_default(NULL);
   }
 #if !LWIP_SINGLE_NETIF
+#if BOAROS_USER_SMP
+  boaros_lwip_ipv4_path_changed();
+#endif
   /*  is it the first netif? */
   if (netif_list == netif) {
     netif_list = netif->next;
@@ -890,6 +909,11 @@ netif_set_default(struct netif *netif)
     /* install default route */
     mib2_add_route_ip4(1, netif);
   }
+#if BOAROS_USER_SMP
+  if (netif_default != netif) {
+    boaros_lwip_ipv4_path_changed();
+  }
+#endif
   netif_default = netif;
   LWIP_DEBUGF(NETIF_DEBUG, ("netif: setting default interface %c%c\n",
                             netif ? netif->name[0] : '\'', netif ? netif->name[1] : '\''));
@@ -908,6 +932,9 @@ netif_set_up(struct netif *netif)
   LWIP_ERROR("netif_set_up: invalid netif", netif != NULL, return);
 
   if (!(netif->flags & NETIF_FLAG_UP)) {
+#if BOAROS_USER_SMP
+    boaros_lwip_ipv4_path_changed();
+#endif
     netif_set_flags(netif, NETIF_FLAG_UP);
 
     MIB2_COPY_SYSUPTIME_TO(&netif->ts);
@@ -994,6 +1021,9 @@ netif_set_down(struct netif *netif)
     }
 #endif
 
+#if BOAROS_USER_SMP
+    boaros_lwip_ipv4_path_changed();
+#endif
     netif_clear_flags(netif, NETIF_FLAG_UP);
     MIB2_COPY_SYSUPTIME_TO(&netif->ts);
 
@@ -1055,6 +1085,9 @@ netif_set_link_up(struct netif *netif)
   LWIP_ERROR("netif_set_link_up: invalid netif", netif != NULL, return);
 
   if (!(netif->flags & NETIF_FLAG_LINK_UP)) {
+#if BOAROS_USER_SMP
+    boaros_lwip_ipv4_path_changed();
+#endif
     netif_set_flags(netif, NETIF_FLAG_LINK_UP);
 
 #if LWIP_DHCP
@@ -1093,6 +1126,9 @@ netif_set_link_down(struct netif *netif)
   LWIP_ERROR("netif_set_link_down: invalid netif", netif != NULL, return);
 
   if (netif->flags & NETIF_FLAG_LINK_UP) {
+#if BOAROS_USER_SMP
+    boaros_lwip_ipv4_path_changed();
+#endif
     netif_clear_flags(netif, NETIF_FLAG_LINK_UP);
 
 #if LWIP_AUTOIP

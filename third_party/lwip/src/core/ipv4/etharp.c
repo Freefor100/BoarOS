@@ -178,6 +178,11 @@ etharp_free_entry(int i)
     arp_table[i].q = NULL;
   }
   /* recycle entry for re-use */
+#if BOAROS_USER_SMP
+  if (arp_table[i].state >= ETHARP_STATE_STABLE) {
+    boaros_lwip_ipv4_path_changed();
+  }
+#endif
   arp_table[i].state = ETHARP_STATE_EMPTY;
 #ifdef LWIP_DEBUG
   /* for debugging, clean out the complete entry */
@@ -209,6 +214,12 @@ etharp_tmr(void)
 #endif /* ETHARP_SUPPORT_STATIC_ENTRIES */
        ) {
       arp_table[i].ctime++;
+#if BOAROS_USER_SMP
+      if (arp_table[i].state == ETHARP_STATE_STABLE &&
+          arp_table[i].ctime == ARP_AGE_REREQUEST_USED_UNICAST) {
+        boaros_lwip_ipv4_path_changed();
+      }
+#endif
       if ((arp_table[i].ctime >= ARP_MAXAGE) ||
           ((arp_table[i].state == ETHARP_STATE_PENDING)  &&
            (arp_table[i].ctime >= ARP_MAXPENDING))) {
@@ -457,6 +468,12 @@ etharp_update_arp_entry(struct netif *netif, const ip4_addr_t *ipaddr, struct et
   }
 
   /* record network interface */
+#if BOAROS_USER_SMP
+  if (arp_table[i].netif != netif ||
+      memcmp(&arp_table[i].ethaddr, ethaddr, ETH_HWADDR_LEN) != 0) {
+    boaros_lwip_ipv4_path_changed();
+  }
+#endif
   arp_table[i].netif = netif;
   /* insert in SNMP ARP index tree */
   mib2_add_arp_entry(netif, &arp_table[i].ipaddr);
@@ -599,6 +616,22 @@ etharp_find_addr(struct netif *netif, const ip4_addr_t *ipaddr,
   }
   return -1;
 }
+
+#if BOAROS_USER_SMP
+int
+boaros_etharp_fresh_neighbor(struct netif *netif, const ip4_addr_t *ipaddr,
+                           struct eth_addr *address)
+{
+  s16_t i = etharp_find_entry(ipaddr, ETHARP_FLAG_FIND_ONLY, netif);
+  if (i < 0 || arp_table[i].netif != netif ||
+      arp_table[i].state < ETHARP_STATE_STABLE ||
+      arp_table[i].ctime >= ARP_AGE_REREQUEST_USED_UNICAST) {
+    return 0;
+  }
+  *address = arp_table[i].ethaddr;
+  return 1;
+}
+#endif
 
 /**
  * Possibility to iterate over stable ARP table entries

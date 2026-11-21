@@ -386,6 +386,6 @@ void kernel_socket_network_capacity(void);
 void kernel_socket_network_blocked(void);
 void kernel_socket_network_failed(uint32_t address);
 void kernel_socket_network_hooks(void (*timer_wake)(void *), struct kernel_wait_queue *work_queue,
-    int (*udp_capacity)(void *), void *context);
+    int (*udp_capacity)(void *), unsigned (*receive_inline)(void *), void *context);
 
 #endif

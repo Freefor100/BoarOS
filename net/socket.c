@@ -551,6 +551,7 @@ static inline int network_is_stopping(void)
 static void (*network_timer_wake)(void *);
 static struct kernel_wait_queue *network_work_queue;
 static int (*network_udp_capacity)(void *);
+static unsigned (*network_receive_inline)(void *);
 static void *network_context;
 static struct kernel_socket *write_retry_head;
 
@@ -3793,11 +3794,21 @@ int kernel_socket_accept_check(struct kernel_socket *socket)
 
 static int socket_receive_empty(const struct kernel_socket *, int);
 
+static void socket_receive_before_wait(void)
+{
+    struct kernel_socket_protocol_scope scope;
+    if (!protocol_enter(&scope, 1, 1)) return;
+    if (scope.outer && !network_is_stopping() && network_receive_inline)
+        network_receive_inline(network_context);
+    kernel_socket_protocol_leave(&scope);
+}
+
 static int socket_wait_ready(struct kernel_socket *socket, uint32_t events,
     uint64_t target_ns, uint32_t flags, struct kernel_socket_read_request *request)
 {
     uint64_t deadline = 0;
     int timed = target_ns == 0;
+    int assisted = 0;
     for (;;) {
         SOCKET_ENDPOINT(state,socket);
         int ready = events == KERNEL_POLLIN && !socket->listening
@@ -3818,6 +3829,16 @@ static int socket_wait_ready(struct kernel_socket *socket, uint32_t events,
             if (status != KERNEL_TIME_STATUS_OK)
                 return status == KERNEL_TIME_STATUS_DEADLINE_PASSED ? -KERNEL_EAGAIN : -KERNEL_EIO;
             timed = 1;
+        }
+        /* On one CPU a writer may be about to wait for an ACK that is
+         * already on the receive ring. Poll once with no endpoint lock and
+         * no prepared wait token. The regular worker owns any remainder. */
+        if (!assisted && (events & KERNEL_POLLOUT) && kernel_socket_is_tcp(socket) &&
+            !boaros_lwip_parallel_enabled()) {
+            assisted = 1;
+            socket_state_release(&state);
+            socket_receive_before_wait();
+            continue;
         }
         struct kernel_wait_token token;
         enum kernel_wait_wake_reason reason = KERNEL_WAIT_WOKEN;
@@ -6426,7 +6447,7 @@ void kernel_socket_network_initialize(void)
     kernel_socket_protocol_leave(&scope);
 }
 void kernel_socket_network_hooks(void (*timer_wake)(void *),struct kernel_wait_queue *work_queue,
-    int (*udp_capacity)(void *),void *context)
+    int (*udp_capacity)(void *),unsigned (*receive_inline)(void *),void *context)
 {
     struct kernel_socket_protocol_scope protocol;kernel_socket_protocol_enter(&protocol);
     {SOCKET_STATE(state);__atomic_store_n(&network_stopping,work_queue==0,__ATOMIC_RELAXED);}
@@ -6472,7 +6493,7 @@ void kernel_socket_network_hooks(void (*timer_wake)(void *),struct kernel_wait_q
     {SOCKET_STATE(state);
      old_queue=network_work_queue;
      network_timer_wake=timer_wake;network_work_queue=work_queue;
-     network_udp_capacity=udp_capacity;network_context=context;}
+     network_udp_capacity=udp_capacity;network_receive_inline=receive_inline;network_context=context;}
     kernel_socket_protocol_leave(&protocol);
     if (!work_queue && old_queue) for (;;) {
         int borrowed;
@@ -7208,6 +7229,7 @@ int kernel_socket_interface_set_mtu(const char name[16], int32_t mtu)
             if (n->mtu!=next) {
 #if BOAROS_USER_SMP
                 fast_loopback_revoke(n);
+                boaros_lwip_ipv4_path_changed();
 #endif
                 n->mtu=next;
                 if (!loop) {

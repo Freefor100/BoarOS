@@ -11,6 +11,8 @@
 #include "lwip/inet_chksum.h"
 #include "lwip/tcp.h"
 #include "lwip/priv/nd6_priv.h"
+#include "lwip/prot/etharp.h"
+#include "lwip/prot/iana.h"
 static err_t copy_capacity_tcp_writev(struct tcp_pcb *,
     const struct kernel_socket_write_segment *,unsigned,u16_t,u8_t,u16_t *);
 static err_t held_completion_tcp_output(struct tcp_pcb *);
@@ -177,7 +179,7 @@ static struct kernel_socket *unix_credit_copy_probe;
 static unsigned unix_credit_copy_observed;
 static unsigned heap_live, dma_eligible, nic_full, copy_attempts, copied_packets, segment_attempts, captured_size;
 #if BOAROS_USER_SMP
-static struct pbuf *parallel_dma[2];
+static struct pbuf *parallel_dma[4];
 static unsigned parallel_tx_probe, parallel_dma_count;
 #endif
 static void (*heap_release_once)(void *);
@@ -240,6 +242,7 @@ static pthread_mutex_t model_packet_mutex=PTHREAD_MUTEX_INITIALIZER;
 static struct kernel_rwlock *packet_test_configuration_lock;
 #if BOAROS_USER_SMP
 static pthread_mutex_t model_ip_mutex=PTHREAD_MUTEX_INITIALIZER;
+static unsigned model_ip_acquisitions;
 static pthread_mutex_t model_tcp_mutex[BOAROS_MAX_CPUS-1];
 unsigned kernel_cpu_get_boot_count(void) { return 2; }
 int kernel_service_scope_try_local(struct kernel_service_scope *scope)
@@ -285,6 +288,7 @@ void kernel_rwlock_write(struct kernel_rwlock *lock, struct kernel_lock_guard *g
     lock->writer=&test_context; *guard=(struct kernel_lock_guard){.lock=lock,.owner=&test_context};
 #if BOAROS_USER_SMP
     guard->previous=test_context.locks;test_context.locks=guard;
+    if (lock->rank == 27) model_ip_acquisitions++;
 #endif
     if(lock==&protocol_mutex.lock)acquired++;
 }
@@ -482,7 +486,7 @@ int virtio_net_send_segments(struct virtio_net_device *device,
             kernel_socket_network_capacity();
             return -KERNEL_EAGAIN;
         }
-        CHECK(parallel_dma_count < 2);
+        CHECK(parallel_dma_count < sizeof(parallel_dma) / sizeof(parallel_dma[0]));
         parallel_dma[parallel_dma_count++] = owner;
         return 0;
     }
@@ -1260,6 +1264,47 @@ static void connected_pair(struct kernel_socket **listener, struct kernel_socket
     CHECK((*client)->connected && kernel_socket_accept(*listener, server, NULL) == 0);
 }
 
+static unsigned inline_receive_calls;
+static unsigned inline_receive_credit(void *context)
+{
+    CHECK(caller_owns_protocol() && !kernel_cpu_current()->raw_locks);
+    struct kernel_socket *client = context;
+    SOCKET_ENDPOINT(state,client);
+    CHECK(!tcp_admission_capacity_locked(client));
+    tcp_publish_capacity_locked(client);
+    CHECK(tcp_admission_capacity_locked(client));
+    inline_receive_calls++;
+    return 1;
+}
+
+static void tcp_receive_before_wait_contract(void)
+{
+    kernel_socket_network_initialize();
+    struct kernel_socket *listener = NULL, *client = NULL, *server = NULL;
+    connected_pair(&listener, &client, &server);
+    struct kernel_wait_queue queue;
+    kernel_wait_queue_init(&queue);
+    kernel_socket_network_hooks(NULL, &queue, NULL, inline_receive_credit, client);
+    client->tx_budget = 0;
+    CHECK(kernel_socket_wait_ready(client, KERNEL_POLLOUT, 0, KERNEL_SOCKET_MSG_DONTWAIT) == -KERNEL_EAGAIN);
+    CHECK(!inline_receive_calls);
+    CHECK(!kernel_socket_wait_ready(client, KERNEL_POLLOUT, 0, 0));
+    CHECK(inline_receive_calls == 1);
+    CHECK(!kernel_socket_wait_ready(client, KERNEL_POLLOUT, 0, 0));
+    CHECK(inline_receive_calls == 1);
+    struct kernel_socket_protocol_scope scope;
+    kernel_socket_protocol_enter(&scope);
+    tcp_abandon(client->tcp, 0);
+    tcp_abandon(server->tcp, 0);
+    kernel_socket_protocol_leave(&scope);
+    kernel_socket_network_hooks(NULL, NULL, NULL, NULL, NULL);
+    kernel_socket_destroy(client);
+    kernel_socket_destroy(server);
+    kernel_socket_destroy(listener);
+    CHECK(!heap_live);
+    puts("PASS single-CPU blocked TCP sender rechecks receive progress before parking");
+}
+
 #if BOAROS_USER_SMP
 /* Start the secondary context without a scheduler thread so the test can
  * choose exactly when it drains each queued input packet. */
@@ -1286,6 +1331,99 @@ static void tcp_inline_ack_ready(struct kernel_wait_node *node, uint32_t reason,
     CHECK(!pthread_mutex_trylock(&model_ip_mutex));
     CHECK(!pthread_mutex_unlock(&model_ip_mutex));
     (*(unsigned *)node->context)++;
+}
+
+static void test_arp_reply(struct netif *netif, const ip4_addr_t *peer, unsigned char last)
+{
+    struct pbuf *packet = pbuf_alloc(PBUF_RAW, SIZEOF_ETHARP_HDR, PBUF_RAM);
+    CHECK(packet);
+    struct etharp_hdr *header = packet->payload;
+    *header = (struct etharp_hdr){
+        .hwtype = PP_HTONS(LWIP_IANA_HWTYPE_ETHERNET), .proto = PP_HTONS(ETHTYPE_IP),
+        .hwlen = ETH_HWADDR_LEN, .protolen = sizeof(ip4_addr_t), .opcode = PP_HTONS(ARP_REPLY),
+        .shwaddr = {{2, 0, 0, 0, 0, last}}
+    };
+    IPADDR_WORDALIGNED_COPY_FROM_IP4_ADDR_T(&header->sipaddr, peer);
+    IPADDR_WORDALIGNED_COPY_FROM_IP4_ADDR_T(&header->dipaddr, netif_ip4_addr(netif));
+    etharp_input(packet, netif);
+}
+
+static void tcp_resolved_output_contract(void)
+{
+    kernel_socket_network_initialize();
+    struct socket_tcp_owner *owner = tcp_lookup_test_start();
+    struct virtio_net_device device = {.mac = {2, 0, 0, 0, 0, 2}};
+    struct kernel_network network = {.device = &device};
+    struct netif *netif = &network.interface;
+    struct kernel_socket_protocol_scope scope;
+    ip4_addr_t local, mask, peer, gateway = {0};
+    IP4_ADDR(&local, 10, 77, 0, 2);
+    IP4_ADDR(&mask, 255, 255, 255, 0);
+    IP4_ADDR(&peer, 10, 77, 0, 1);
+    kernel_socket_protocol_enter(&scope);
+    CHECK(netif_add(netif, &local, &mask, &gateway, &network, interface_init, ip_input));
+    netif_set_up(netif);
+    netif_set_link_up(netif);
+    test_arp_reply(netif, &peer, 1);
+    struct kernel_socket *socket = NULL;
+    CHECK(!kernel_socket_create(&test_heap, KERNEL_SOCKET_AF_INET, SOCKET_STREAM, 0, &socket));
+    struct tcp_pcb *pcb = socket->tcp;
+    socket->connected = 1;
+    pcb->state = ESTABLISHED;
+    ip_addr_copy_from_ip4(pcb->local_ip, local);
+    ip_addr_copy_from_ip4(pcb->remote_ip, peer);
+    pcb->local_port = 22000;
+    pcb->remote_port = 22001;
+    pcb->cwnd = pcb->snd_wnd = pcb->snd_wnd_max = TCP_WND;
+    TCP_REG_ACTIVE(pcb);
+    CHECK(tcp_promote(socket, &scope));
+    kernel_socket_protocol_leave(&scope);
+
+    CHECK(tcp_owner_lock(&scope, owner, 0));
+    parallel_tx_probe = dma_eligible = 1;
+    tcp_nagle_disable(pcb);
+    CHECK(tcp_write(pcb, "a", 1, TCP_WRITE_FLAG_COPY) == ERR_OK);
+    CHECK(tcp_output(pcb) == ERR_OK && parallel_dma_count == 1);
+    unsigned locked = model_ip_acquisitions;
+    CHECK(tcp_write(pcb, "b", 1, TCP_WRITE_FLAG_COPY) == ERR_OK);
+    CHECK(tcp_output(pcb) == ERR_OK && parallel_dma_count == 2);
+    CHECK(model_ip_acquisitions == locked);
+    kernel_socket_protocol_leave(&scope);
+
+    kernel_socket_protocol_enter(&scope);
+    test_arp_reply(netif, &peer, 7);
+    kernel_socket_protocol_leave(&scope);
+    CHECK(tcp_owner_lock(&scope, owner, 0));
+    CHECK(tcp_write(pcb, "c", 1, TCP_WRITE_FLAG_COPY) == ERR_OK);
+    CHECK(tcp_output(pcb) == ERR_OK && parallel_dma_count == 3);
+    u32_t sequence = 0;
+    for (unsigned i = 0; i < 3; i++) {
+        struct pbuf *frame = parallel_dma[i];
+        const struct eth_hdr *ethernet = frame->payload;
+        struct ip_hdr ip;
+        struct tcp_hdr tcp;
+        CHECK(ethernet->type == PP_HTONS(ETHTYPE_IP));
+        CHECK(ethernet->dest.addr[5] == (i == 2 ? 7 : 1));
+        CHECK(ethernet->src.addr[5] == 2);
+        CHECK(pbuf_copy_partial(frame, &ip, IP_HLEN, SIZEOF_ETH_HDR) == IP_HLEN);
+        CHECK(IPH_LEN(&ip) == lwip_htons(IP_HLEN + TCP_HLEN + 1) && !inet_chksum(&ip, IP_HLEN));
+        CHECK(pbuf_copy_partial(frame, &tcp, TCP_HLEN, SIZEOF_ETH_HDR + IP_HLEN) == TCP_HLEN);
+        if (!i) sequence = lwip_ntohl(tcp.seqno);
+        CHECK(lwip_ntohl(tcp.seqno) == sequence + i);
+        CHECK(pbuf_get_at(frame, frame->tot_len - 1) == 'a' + i);
+    }
+    tcp_abandon(pcb, 0);
+    socket->tcp = NULL;
+    kernel_socket_protocol_leave(&scope);
+    for (unsigned i = 0; i < parallel_dma_count; i++) {
+        CHECK(parallel_dma[i]->ref == 1);
+        kernel_socket_pbuf_free(parallel_dma[i]);
+    }
+    parallel_tx_probe = dma_eligible = 0;
+    kernel_socket_destroy(socket);
+    netif_remove(netif);
+    CHECK(!heap_live && !owner->context.active);
+    puts("PASS resolved IPv4 TCP send reuses route and refreshes the Ethernet neighbor");
 }
 
 static void tcp_physical_submit_contract(void)
@@ -2174,7 +2312,7 @@ static void loopback_work(void)
         loopback_prepare(&observation);
         struct kernel_wait_node work_node={.callback=loopback_wake,.context=&observation};
         kernel_wait_queue_init(&model_work_queue);model_work_queue.head=model_work_queue.tail=&work_node;
-        kernel_socket_network_hooks(NULL, &model_work_queue, NULL, &observation);
+        kernel_socket_network_hooks(NULL, &model_work_queue, NULL, NULL, &observation);
         struct kernel_socket_service_result service = kernel_socket_service_pending(
             (struct kernel_socket_service_budget){0, 8, 0});
         CHECK(!service.runnable && !work_pending_snapshot());
@@ -2230,7 +2368,7 @@ static void loopback_work(void)
         service = kernel_socket_service_pending((struct kernel_socket_service_budget){0, 1, 0});
         CHECK(service.packets == 1 && !service.timers && observation.received == 4);
         udp_remove(observation.sender); udp_remove(receiver);
-        kernel_socket_network_hooks(NULL, NULL, NULL, NULL);
+        kernel_socket_network_hooks(NULL, NULL, NULL, NULL, NULL);
         CHECK(clock_ns == frozen && lwip_stats.mem.used == initial_memory);
         CHECK(lwip_stats.memp[MEMP_UDP_PCB]->used == initial_udp);
         printf("PASS IPv%u loopback work publication, late enqueue and OOM rollback with frozen clock\n", ipv6 ? 6 : 4);
@@ -2632,7 +2770,7 @@ static void queued_completion_before_output(void)
     struct completed_output_write write={client,model_socket_file_create(client)};
     struct kernel_wait_node work_node={.callback=remote_work_ready,.context=&remote_work};
     kernel_wait_queue_init(&model_work_queue);model_work_queue.head=model_work_queue.tail=&work_node;
-    kernel_socket_network_hooks(NULL,&model_work_queue,NULL,&remote_work);
+    kernel_socket_network_hooks(NULL,&model_work_queue,NULL, NULL,&remote_work);
     remote_socket=client;
     struct kernel_socket_protocol_scope held;kernel_socket_protocol_enter(&held);
     pthread_t writer,service,closer;
@@ -2674,7 +2812,7 @@ static void queued_completion_before_output(void)
     CHECK(server->rx_bytes==3);
     char bytes[3];
     CHECK(pbuf_copy_partial(server->packets_head->payload,bytes,3,0)==3 && !memcmp(bytes,"out",3));
-    kernel_socket_network_hooks(NULL,NULL,NULL,NULL);
+    kernel_socket_network_hooks(NULL,NULL,NULL, NULL,NULL);
     struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
     if(server->tcp)tcp_abort(server->tcp);
     kernel_socket_protocol_leave(&scope);
@@ -2715,7 +2853,7 @@ static void *remote_writer(void *argument)
 }
 static void *remote_stopper(void *unused)
 {
-    (void)unused;kernel_socket_network_hooks(NULL,NULL,NULL,NULL);
+    (void)unused;kernel_socket_network_hooks(NULL,NULL,NULL, NULL,NULL);
     CHECK(!pthread_mutex_lock(&remote_gate));stop_done=1;
     CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));return NULL;
 }
@@ -2736,7 +2874,7 @@ static void remote_protocol_request(unsigned mode)
     for(unsigned i=0;i<8;i++)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
     struct kernel_wait_node work_node={.callback=remote_work_ready,.context=&remote_work};
     kernel_wait_queue_init(&model_work_queue);model_work_queue.head=model_work_queue.tail=&work_node;
-    kernel_socket_network_hooks(NULL,&model_work_queue,NULL,&remote_work);
+    kernel_socket_network_hooks(NULL,&model_work_queue,NULL, NULL,&remote_work);
     remote_socket=client;
     struct kernel_open_file_description *quota_pin=(void *)client;
     struct kernel_socket_write_request quota={0};
@@ -2845,7 +2983,7 @@ static void remote_protocol_request(unsigned mode)
     if(client->tcp)tcp_abort(client->tcp);
     if(server->tcp)tcp_abort(server->tcp);
     kernel_socket_protocol_leave(&scope);
-    kernel_socket_network_hooks(NULL,NULL,NULL,NULL);
+    kernel_socket_network_hooks(NULL,NULL,NULL, NULL,NULL);
     kernel_socket_destroy(client);kernel_socket_destroy(server);if(listener)kernel_socket_destroy(listener);
     for(unsigned i=0;i<8;i++)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
     if(mode==9)
@@ -2871,7 +3009,7 @@ static void notification_stop_lifetime(void)
     kernel_socket_network_initialize();kernel_wait_queue_init(&notify_queue);notify_testing=1;
     struct kernel_wait_node node={.callback=held_work_notification,.context=&notify_queue};
     notify_queue.head=notify_queue.tail=&node;
-    kernel_socket_network_hooks(NULL,&notify_queue,NULL,NULL);
+    kernel_socket_network_hooks(NULL,&notify_queue,NULL, NULL,NULL);
     pthread_t producer,stopper;CHECK(!pthread_create(&producer,NULL,late_work_producer,NULL));
     CHECK(!pthread_mutex_lock(&remote_gate));
     while(!notify_entered)CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
@@ -2892,7 +3030,7 @@ static void stopped_wait_notification(void)
     CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM, 0,&socket));
     struct kernel_wait_node marker={0};stop_probe_queue=&socket->wait;
     socket->wait.head=socket->wait.tail=&marker;
-    kernel_socket_network_hooks(NULL,NULL,NULL,NULL);
+    kernel_socket_network_hooks(NULL,NULL,NULL, NULL,NULL);
     CHECK(stop_probe_notified && !socket->wait.borrows && kernel_socket_receive_ready(socket));
     CHECK(kernel_socket_poll(socket,NULL)&KERNEL_POLLERR);
     socket->wait.head=socket->wait.tail=NULL;stop_probe_queue=NULL;
@@ -5055,8 +5193,10 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "tcp-owner-lookup")) tcp_owner_lookup();
     else if (!strcmp(argv[1], "tcp-owner-placement")) tcp_owner_placement();
     else if (!strcmp(argv[1], "tcp-physical-submit")) tcp_physical_submit_contract();
+    else if (!strcmp(argv[1], "tcp-resolved-output")) tcp_resolved_output_contract();
 #endif
     else if (!strcmp(argv[1], "tcp-cork")) tcp_cork_contract();
+    else if (!strcmp(argv[1], "tcp-receive-before-wait")) tcp_receive_before_wait_contract();
     else if (!strcmp(argv[1], "tcp-more")) tcp_more_contract();
     else if (!strcmp(argv[1], "tcp-detached")) tcp_detached_copy();
     else if (!strcmp(argv[1], "tcp-reset-receive-retry")) tcp_reset_receive_retry();

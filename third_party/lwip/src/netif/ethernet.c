@@ -266,10 +266,10 @@ free_and_return:
  * @param eth_type ethernet type (@ref lwip_ieee_eth_type)
  * @return ERR_OK if the packet was sent, any other err_t on failure
  */
-err_t
-ethernet_output(struct netif * netif, struct pbuf * p,
+static err_t
+ethernet_output_to(struct netif * netif, struct pbuf * p,
                 const struct eth_addr * src, const struct eth_addr * dst,
-                u16_t eth_type) {
+                u16_t eth_type, netif_linkoutput_fn submit) {
   struct eth_hdr *ethhdr;
   u16_t eth_type_be = lwip_htons(eth_type);
 
@@ -304,8 +304,6 @@ ethernet_output(struct netif * netif, struct pbuf * p,
     }
   }
 
-  LWIP_ASSERT_CORE_LOCKED();
-
   ethhdr = (struct eth_hdr *)p->payload;
   ethhdr->type = eth_type_be;
   SMEMCPY(&ethhdr->dest, dst, ETH_HWADDR_LEN);
@@ -317,7 +315,7 @@ ethernet_output(struct netif * netif, struct pbuf * p,
               ("ethernet_output: sending packet %p\n", (void *)p));
 
   /* send the packet */
-  return netif->linkoutput(netif, p);
+  return submit(netif, p);
 
 pbuf_header_failed:
   LWIP_DEBUGF(ETHARP_DEBUG | LWIP_DBG_TRACE | LWIP_DBG_LEVEL_SERIOUS,
@@ -325,5 +323,22 @@ pbuf_header_failed:
   LINK_STATS_INC(link.lenerr);
   return ERR_BUF;
 }
+
+err_t
+ethernet_output(struct netif *netif, struct pbuf *p, const struct eth_addr *src,
+                const struct eth_addr *dst, u16_t eth_type)
+{
+  LWIP_ASSERT_CORE_LOCKED();
+  return ethernet_output_to(netif, p, src, dst, eth_type, netif->linkoutput);
+}
+
+#if BOAROS_USER_SMP
+err_t
+boaros_ethernet_output_resolved(struct netif *netif, struct pbuf *p,
+                               const struct eth_addr *src, const struct eth_addr *dst)
+{
+  return ethernet_output_to(netif, p, src, dst, ETHTYPE_IP, netif->boaros_link_submit);
+}
+#endif
 
 #endif /* LWIP_ARP || LWIP_ETHERNET */
