@@ -174,8 +174,9 @@ BuildStorm 的 Rust 工具链曾在准备阶段中止。沿 `Child::wait_with_ou
 正式[跳过表](../../tests/oscomp/ltp-skips.tsv)按程序名应用于两架构、两种库。新增上节逐项核实的
 19 个无摘要零分项，以及 `cve-2016-7117`、`dio_append`、`dio_sparse`、`inotify09`、
 `mmap1`、`mmap3`、`starvation`。后七项至少有一组实测耗时达到 60 秒且只得 1–2 分，
-各组最高观察分均不超过 2 分。`mallocstress` 实测 7–35 秒，仍按原流程运行。`shm_test`
-只被本地审计续跑的临时清单排除，正式表没有它，仍受 120 秒逐项监督。
+各组最高观察分均不超过 2 分。`mallocstress` 实测 7–35 秒，仍按原流程运行。
+`shm_test` 也列入正式表。其默认压力场景没有内部时间上限，也不输出原判分所需的摘要。
+本地看到线程持续推进，故按运行预算排除。评估共享内存功能时可以独立设置线程数和轮数。
 
 按本地 LoongArch 顺序和既有前置组耗时模拟，旧表加 120 秒监督约在 6418 秒结束。若按
 配置排除所有耗时至少 3 秒且通过断言但无摘要的实例，估算约 5609 秒，模型内原分相同。
@@ -198,9 +199,18 @@ BuildStorm 的 Rust 工具链曾在准备阶段中止。沿 `Child::wait_with_ou
 
 ### 挂载相关的三类故障
 
+初赛发布根盘带有 `/musl/busybox` 和 `/glibc/busybox`。BoarOS 内核挂载根文件系统后，
+按兼容分支生成的启动配置，加载 `/musl/busybox` 并以 `sh -c` 运行启动脚本，作为用户态的
+第一个进程。BusyBox 将多条命令合在一个可执行文件里，调用名为 `sh` 时解释脚本，调用名为
+`stat` 或 `df` 时执行对应的工具。启动脚本用 `busybox --install -s /bin` 创建这些命令的
+符号链接。执行 `df01.sh` 时，内核处理文件第一行的 `#!/bin/sh` 并启动解释器，解释器按
+`PATH` 查找并运行 `stat`、`df`。命令自己的代码解析选项、查询文件系统并格式化输出，底层
+查询与挂载通过系统调用交给内核。发布盘的 `stat`、`df` 与脚本所使用的 GNU Coreutils
+命令具有不同的选项集合；版本更新也需要核对实际应用程序及其构建配置。
+
 **`df01.sh` 的工具选项及挂载残留。** RISC-V glibc 原脚本先格式化并挂载测试盘，再用 `stat -f ... --printf=%b` 等命令读取总块数、空闲块数和块大小，以检查 `df` 输出。发布盘 BusyBox 的 `stat` 提供 `-c` 格式选项，遇到 GNU `--printf` 报错。命令替换得到空字符串，脚本在第 85 行算术表达式退出，未运行框架的卸载清理。下一程序 `execveat03` 对同一分区执行格式化时报告设备仍在挂载。LoongArch 原程序遇到的是更早的 Shell 超时参数准备错误，未走到同一条格式命令。短例只将原脚本的 `stat --printf` 参数映射到 `stat -c`，保留原脚本和 BusyBox。原程序恢复 7 项通过，剩下 5 项分别在 BusyBox 的 `df -t/-v/-H/--version/-x` 失败。框架仍在释放设备时打印警告，但同一虚拟机里的下一个 `umount2_02` 已能格式化原测试分区并通过 7 项，确认这次未遗留挂载。完整保留原脚本时，应在兼容环境同时提供 GNU Coreutils 的 `stat` 和 `df`，并将测例放到私有挂载命名空间，或在失败后显式卸载测试分区，确认无残留再复用。GNU 两个程序的完整对照和 LoongArch 的超时参数仍需分别验收。
 
-**`umount03` 的账户准备失败。** LoongArch glibc 原程序约 10.7 秒退出，状态为 2、得 0 分。它先以特权用户格式化并挂载测试盘，随后在 `getpwnam("nobody")` 得到 `ENOENT`（找不到账户），所以未切换有效用户标识符，也未执行预期返回 `EPERM` 的卸载断言。在独立运行副本加入 `nobody:x:65534:65534:nobody:/:/bin/false`，保留原程序再次执行，LoongArch glibc 按预期得到 `EPERM`，原摘要为 1 个通过。今后若决定为评测统一提供该账户，应在准备可写副本时检查同名账户是否已经存在，再补缺失项。该程序只读取账户条目并调用 `seteuid`，无需为它另配登录程序。
+**`umount03` 的账户准备失败。** LoongArch glibc 原程序约 10.7 秒退出，状态为 2、得 0 分。它先以特权用户格式化并挂载测试盘，随后用 C 库的 `getpwnam("nobody")` 查找约定的低权限账户。该用户态查询从根盘的账户数据库取得账户名对应的数字用户和组标识，通常由 `/etc/passwd` 提供。两个架构的初赛原始根盘均缺少 `/etc/passwd`。测例查找返回 `ENOENT`（找不到账户），所以未调用 `seteuid` 切换有效用户标识，也未执行卸载权限断言。内核在 `seteuid` 和卸载时使用数字身份及进程的权限状态。在独立根盘副本加入 `nobody:x:65534:65534:nobody:/:/bin/false` 后，原程序按预期得到 `EPERM`（权限不足），原摘要为 1 个通过。正式适配可由兼容分支的用户态启动脚本在可写根盘只补缺失项。原始发布镜像、反复格式化的 `/dev/vdb3` 和内核启动代码都无需写入该账户。
 
 #### 官方流程的两项准备
 
@@ -228,7 +238,20 @@ BuildStorm 的 Rust 工具链曾在准备阶段中止。沿 `Child::wait_with_ou
 ### 两个使用内部超时的测例
 
 - **`send02`。** 四组都停在首个传输控制协议（Transmission Control Protocol，TCP）子项，未进入用户数据报协议（User Datagram Protocol，UDP）子项。原程序每轮先发 16 字节，再用 `MSG_MORE` 暂留 16 字节，最后用 1 字节结束本批发送。它用非阻塞接收反复检查最后 17 字节。RISC-V 相同可执行文件的短对照中，BoarOS 在 10.007 秒完成 80 轮，9.943 秒花在等最后 17 字节；Linux 在 253 毫秒完成 1000 轮。通过 `TCP_INFO` 核对，BoarOS 最后一次发送返回时，前一段 16 字节仍待确认。Nagle 算法继续暂缓后续短报文，到对端延迟确认或原缓冲期限触发才推进。关闭 Nagle 的对照消除了这段等待，随后仍出现一次提前收到 `MSG_MORE` 数据，不能作为兼容适配。后续应修通用小报文确认和显式结束缓冲的协作，再验证原程序。
-- **`statx11`。** 超时在准备阶段。`setup` 先查 `/sys/block/vdb3/queue/logical_block_size`，找不到便逐字符截短设备名，预期能查到整盘 `vdb`。正式启动未挂载 sysfs，现有 sysfs 也不提供此块设备目录。发布程序没有空名称终止条件，耗尽字符后还有越界写入，四组均未执行 `statx`。要让原程序通过，启动须挂载 sysfs，内核须从实际块设备导出 `logical_block_size` 和 `dma_alignment`，并让 `STATX_DIOALIGN` 返回与直接输入输出要求一致的两个对齐值。只改测例查找循环，最多能让它及时报告缺少准备条件。
+- **`statx11`。** 超时在准备阶段。`setup` 先查 `/sys/block/vdb3/queue/logical_block_size`，找不到便逐字符截短设备名，预期能查到整盘 `vdb`。Linux 通常经 `/sys/block/vdb/queue/` 提供整盘队列的属性，分区目录没有独立的 `queue`。发布程序没有空名称终止条件，耗尽字符后还有越界写入，四组均未执行 `statx`。
+
+`/dev/vdb3` 是供进程打开分区的块设备节点。初赛兼容启动脚本用 `mknod` 在根盘创建该节点，
+同时显式执行 `mount -t proc proc /proc`。进程文件系统（process filesystem，procfs）由内核
+提供进程和系统信息，启动脚本负责将它接到 `/proc`。系统文件系统（system filesystem，sysfs）
+由内核导出设备等内核对象的属性，初赛的 `init.sh` 没有将它挂到 `/sys`，决赛的启动脚本则有
+该挂载步骤。设备临时文件系统（device temporary filesystem，devtmpfs）可在 `/dev` 提供
+设备节点；初赛流程使用手工创建的节点。Linux 可按 `CONFIG_DEVTMPFS_MOUNT` 在挂好根盘后自动
+挂载 `devtmpfs`，也可以由用户态挂载，具体取决于启动方式和配置。
+
+即使给初赛加上 `mount -t sysfs sysfs /sys`，BoarOS 当前的 `kernel_sysfs_mount` 仍未导出
+`/sys/block` 和块设备队列属性。跑通 `statx11` 需要初赛启动完成挂载，内核按设备实际信息导出
+`logical_block_size` 和 `dma_alignment`，并在 `statx` 中以 `STATX_DIOALIGN` 报告一致的直接输入
+输出对齐要求。修正测例的查找边界可使缺少准备条件时及时退出。
 
 ### `fs_fill` 的空间预留修复
 

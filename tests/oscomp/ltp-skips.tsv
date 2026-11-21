@@ -36,6 +36,7 @@ netstress	testcases/network/netstress/netstress.c	controller-client-and-terminat
 pids_task2	testcases/kernel/controllers/pids/pids_task2.c	controller-kill-required
 pthserv	testcases/kernel/sched/clisrv/pthserv.c	controller-client-and-termination-required
 shell_pipe01.sh	testcases/commands/shell/shell_pipe01.sh	upstream-pipeline-stdin-required
+shm_test	testcases/kernel/mem/mtest07/shm_test.c	evaluation-unbounded-stress-without-summary
 timed_forkbomb	testcases/kernel/controllers/freezer/timed_forkbomb.c	controller-stdin-start-token-required
 tst_hexdump	testcases/lib/tst_hexdump.c	pipeline-stdin-and-EOF-required
 
