@@ -239,14 +239,39 @@ BusyBox 的 `stat` 只支持 `-c`，命令替换得到空字符串，脚本在�
 也可通过设备临时文件系统（device temporary filesystem，devtmpfs）提供它们。设备节点
 `/dev/vdb3` 用于打开分区，整盘队列属性由 `/sys/block/vdb/queue/` 提供，两处属于不同接口。
 
-BoarOS 从实际块设备导出 `logical_block_size` 和 `dma_alignment`，并在 `statx` 中通过
-`STATX_DIOALIGN` 返回一致的直接输入输出对齐值。LoongArch glibc 发布程序执行了两个对齐断言。
-RISC-V 两个发布程序和 LoongArch musl 发布程序取得相应结果掩码后，走到编译期缺少字段的
-`TCONF` 分支。其固定提示提及 glibc，也会出现在原 musl 程序中。发布程序原样保留。
-
 使用官方容器中的 QEMU 及初赛原程序验证时，两架构、两种库的 `df01.sh` 均由原摘要报告
 12 项通过、0 警告，并可正常复用测试分区。`send02` 均通过 TCP 和三种 UDP 发送场景，
-`umount03` 均到达卸载权限断言并通过。`statx11` 的三处配置跳过来自发布程序编译条件。
+`umount03` 均到达卸载权限断言并通过。
+
+#### `statx11` 的发布程序缺少对齐断言
+
+BoarOS 从实际块设备导出 `logical_block_size` 和 `dma_alignment`，并在 `statx` 中通过
+`STATX_DIOALIGN` 报告直接输入输出（direct I/O）的对齐要求。初赛发布程序中，LoongArch glibc
+通过两个对齐断言。其余三组在 `statx` 成功且返回掩码含 `STATX_DIOALIGN` 后报告配置跳过
+（`TCONF`）。提示字符串写死了 glibc，两种 C 标准库的构建都可能显示它。
+
+固定的 [LTP 源码](https://github.com/oscomp/testsuits-for-oskernel/blob/4b40ee92e8b594fb20e3957ebc2f79ad43aca538/ltp-full-20240524/testcases/kernel/syscalls/statx/statx11.c) 用 `HAVE_STRUCT_STATX_STX_DIO_MEM_ALIGN` 控制是否编译两个断言。
+`configure.ac` 在启用 `_GNU_SOURCE` 后经目标工具链的 `<sys/stat.h>` 探测该成员。发布盘程序的
+调试信息保留了编译时实际使用的 `struct statx`，用 `readelf --debug-dump=info` 和
+`readelf --debug-dump=rawline` 可以核对成员和声明来源。
+
+| 发布程序 | `struct statx` 的声明来源及对齐字段 |
+| --- | --- |
+| RISC-V glibc | 目标工具链的 `<linux/stat.h>`。已有 `stx_mnt_id`，两个对齐字段所在位置仍是保留成员 `__spare2`。 |
+| RISC-V musl | LTP 的 `include/lapi/stat.h` 提供兼容定义，表示配置阶段未在 `<sys/stat.h>` 找到完整定义。两个对齐字段所在位置纳入 `__spare2[14]`。 |
+| LoongArch musl | 目标工具链的 `<sys/stat.h>` 提供旧版定义，两个对齐字段所在位置纳入 `__pad1[14]`。 |
+| LoongArch glibc | 目标工具链的 `<linux/stat.h>` 声明了 `stx_dio_mem_align` 和 `stx_dio_offset_align`。 |
+
+这三组发布程序在交叉编译时就已选入配置跳过分支。初赛的
+[LTP 构建脚本](https://github.com/oscomp/testsuits-for-oskernel/blob/4b40ee92e8b594fb20e3957ebc2f79ad43aca538/ltp-full-20240524/build-oscomp.sh)
+按架构和库分别执行 `configure`，随后[制盘配方](https://github.com/oscomp/testsuits-for-oskernel/blob/4b40ee92e8b594fb20e3957ebc2f79ad43aca538/Makefile)
+将编译好的程序复制进 ext4 镜像。发布方如需恢复断言，应让这三组构建使用可经 `<sys/stat.h>`
+见到两个字段的目标头文件，再重新配置、编译和制盘。
+
+本地用原 `statx11.c`、带对齐字段的头文件重新配置并编译这三组。在独立运行盘上查询
+`/dev/vdb3`，三组均通过原来的两项断言，失败和跳过均为零。`stx_dio_mem_align = 512`
+字节，对应整盘的 `dma_alignment = 511` 掩码。`stx_dio_offset_align = 512` 字节，与整盘的
+`logical_block_size = 512` 一致。重编程序仅用于本地验证，正式入口仍运行原发布程序。
 
 ### `fs_fill` 的空间预留修复
 
