@@ -2,6 +2,7 @@
 #include <kernel/scheduler.h>
 #include <kernel/cpu.h>
 #include <kernel/time.h>
+#include <kernel/aio.h>
 #include "../../../mm/uaccess_internal.h"
 #include <pthread.h>
 #include <stdlib.h>
@@ -94,6 +95,15 @@ __attribute__((weak)) void kernel_task_current_memory_limits(struct kernel_memor
 { *out = (struct kernel_memory_limits){UINT64_MAX, UINT64_MAX, UINT64_MAX}; }
 #endif
 static void excluded(void) { fputs("unopened consumer reached\n", stderr); abort(); }
+#ifdef CACHE_MM_CASES
+int kernel_aio_ring_move(struct kernel_mm *mm,struct kernel_memory_object *object,
+    uint64_t old_address,uint64_t new_address)
+{
+    (void)mm; (void)object; (void)old_address; (void)new_address;
+    excluded();
+    __builtin_unreachable();
+}
+#endif
 #if BOAROS_USER_SMP && !defined(FILE_IO_CASES)
 void mm_test_unavailable(void) { excluded(); }
 #endif

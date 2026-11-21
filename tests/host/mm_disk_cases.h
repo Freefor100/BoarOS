@@ -132,6 +132,10 @@ static void *disk_retiring_sync(void *arg)
 }
 static void disk_cohort(struct kernel_mm *parent,struct kernel_mm *child,uint64_t address,unsigned actors)
 {
+    /* Earlier shared reads may have installed this neighbouring leaf.
+     * All actors in this case must enter first-fault preparation. */
+    assert(!kernel_mm_madvise(parent,address,BOAROS_PAGE_SIZE,KERNEL_MM_ADVICE_DONTNEED));
+    assert(!kernel_mm_madvise(child,address,BOAROS_PAGE_SIZE,KERNEL_MM_ADVICE_DONTNEED));
     struct kernel_mm views[5]={0};
     memset(disk_entered,0,sizeof(disk_entered)); disk_resume=0;
     disk_capture=(1U<<(actors+1))-2; disk_target=address;
@@ -448,8 +452,34 @@ static void disk_fault_batch_case(struct kernel_heap *heap,
     for(unsigned i=0;i<window;i++)
         assert(!kernel_mm_lookup(&mm,placed+(uint64_t)i*BOAROS_PAGE_SIZE,&mapping) && !(mapping.permissions&KERNEL_MM_WRITE));
     assert(!kernel_open_file_release(&file));
+
+    assert(!kernel_vfs_create(mount,"/batch-shared",0600,&created) && !kernel_vfs_close(&created));
+    assert(!kernel_open_file_create(heap,mount,"/batch-shared",&file,&error) && !error);
+    file->open_flags=2;
+    memset(bytes,0x51,sizeof(bytes));
+    for(unsigned i=0;i<window;i++)
+        assert(!kernel_vfs_pwrite(&file->file,(uint64_t)i*BOAROS_PAGE_SIZE,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+    owner=file;
+    assert(!kernel_open_file_acquire(owner) && !kernel_mm_mmap_file_private(&mm,&owner,
+        0xc0000,131072,0,KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED|KERNEL_MM_MAP_SHARED,&placed));
+    assert(!kernel_mm_resolve_user_fault(&mm,placed,KERNEL_MM_READ));
+    for(unsigned i=0;i<window;i++)
+        assert(!kernel_mm_lookup(&mm,placed+(uint64_t)i*BOAROS_PAGE_SIZE,&mapping) && !(mapping.permissions&KERNEL_MM_WRITE));
+    assert(kernel_mm_lookup(&mm,placed+65536,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    uint64_t neighbour=placed+65536-BOAROS_PAGE_SIZE;
+    assert(!kernel_mm_lookup(&mm,neighbour,&mapping));
+    uint64_t physical=mapping.physical_address;
+    value=0x73;
+    assert(!kernel_copy_to_user(&mm,neighbour,&value,1,&done) && done==1);
+    assert(!kernel_mm_lookup(&mm,neighbour,&mapping) && mapping.physical_address==physical);
+    value=0;
+    assert(!kernel_vfs_pread(&file->file,65536-BOAROS_PAGE_SIZE,&value,1,&done,NULL) && done==1 && value==0x73);
+    assert(!kernel_vfs_ftruncate(&file->file,BOAROS_PAGE_SIZE));
+    assert(kernel_mm_lookup(&mm,neighbour,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    assert(kernel_mm_resolve_user_fault(&mm,neighbour,KERNEL_MM_READ)==KERNEL_MM_STATUS_BUS_FAULT);
+    assert(!kernel_open_file_release(&file));
     mm_test_bind(NULL);mm_test_context=0;
     assert(!kernel_mm_release(&mm) && !kernel_elf64_source_release(&source));
     assert(!physical_page_release(pages,kernel.root_address));
-    puts("PASS file PTE batch: cached ELF pages, full bounded window, current VMA, COW and all owners returned");
+    puts("PASS file PTE batch: cached ELF, private COW, shared aliases and truncation");
 }

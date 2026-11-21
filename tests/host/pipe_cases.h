@@ -338,8 +338,22 @@ static void pipe_page_ownership_case(struct kernel_heap *heap)
     struct kernel_uaccess_iovec target={PIPE_TARGET,1};int64_t bytes;
     assert(!kernel_pipe_readv(pipe,&domain_mm,&target,1,1,0,&bytes) && bytes==1);
     assert(physical_page_available(heap->page_allocator)==before);
+    assert(!kernel_pipe_write_buffer(pipe,"y",1,1,&write) && write.bytes==1);
+    struct kernel_pipe_read_borrow borrow={0};
+    assert(kernel_pipe_read_begin(pipe,1,0,&borrow)==1);
+    measured_pipe_metadata=&pipe->metadata_lock;
+    pipe_metadata_acquisitions=0;
+    const void *data;
+    size_t count;
+    kernel_pipe_read_fragment(&borrow,0,&data,&count);
+    assert(count==1 && *(const char *)data=='y');
+    kernel_pipe_read_finish(&borrow,1);
+    assert(pipe_metadata_acquisitions==1 &&
+        "Reading a borrowed head and committing it needs only the consume lock");
+    measured_pipe_metadata=NULL;
+    assert(physical_page_available(heap->page_allocator)==before);
     assert(!kernel_files_release(&files));
-    puts("PASS pipe lazy slot pages: empty creation, one-byte allocation and drain returns backing");
+    puts("PASS pipe first fragment: one consume lock, no idle payload allocation");
 }
 static void pipe_copy_overlap_case(struct kernel_heap *heap)
 {

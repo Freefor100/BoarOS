@@ -6347,6 +6347,7 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
 {
     uint64_t end=address+BOAROS_PAGE_SIZE;
     uint64_t limit, first=file_fault_window(vma,address,&limit);
+    int shared = vma->kind == KERNEL_VMA_KIND_FILE_SHARED;
     if (limit-first==BOAROS_PAGE_SIZE) return end;
     unsigned selected=0,slots=KERNEL_PAGE_CACHE_READY_WINDOW;
     {
@@ -6378,7 +6379,7 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
         /* Drop the unprepared suffix of the packed reference vector. */
         for (unsigned i = 0; i < capacity; i++) unprepared &= unprepared - 1;
         installed = arch_mmu_user_map_owned_window(&record->space, first, ready ^ unprepared, refs,
-            backend_permissions_from_mm(vma->permissions & ~KERNEL_MM_WRITE));
+            backend_permissions_from_mm(vma->permissions & ~KERNEL_MM_WRITE), !shared);
         unsigned i = 0;
         for (unsigned bits = ready, index = 0; bits; bits >>= 1, index++) {
             if (!(bits & 1)) continue;
@@ -6390,7 +6391,6 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
                 page->address = address;
                 page->physical_address = physical;
                 publish_file_resident(record, page);
-                residents[i-1] = NULL;
             }
             if (address < *begin) *begin = address;
             if (address + BOAROS_PAGE_SIZE > end) end = address + BOAROS_PAGE_SIZE;
@@ -6402,8 +6402,18 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
     unsigned unused = 0, i = 0;
     for (unsigned bits = ready, index = 0; bits; bits >>= 1, index++) {
         if (!(bits & 1)) continue;
-        if (!(installed & (1U << index))) refs[unused++] = refs[i];
-        if (residents[i]) kernel_heap_release(record->vma_heap, residents[i]);
+        struct mm_file_resident *page = residents[i];
+        if (!(installed & (1U << index))) {
+            refs[unused++] = refs[i];
+            if (page) kernel_heap_release(record->vma_heap, page);
+        } else if (shared) {
+            /* Shared leaves are initially read-only. The MM writer and
+             * inode reader exclude write faults and revocation until the
+             * cache knows about every newly published alias. */
+            if (kernel_open_file_alias_attach(file,(offset>>BOAROS_PAGE_SHIFT)+index,
+                page->physical_address,&page->alias,page,page->address,
+                rearm_shared_file_alias)) __builtin_trap();
+        }
         i++;
     }
     physical_page_release_batch(record->space.allocator,refs,unused);
@@ -6453,10 +6463,10 @@ static __attribute__((noinline)) enum kernel_mm_status mapped_file_fault(struct 
     int shared = vma->kind == KERNEL_VMA_KIND_FILE_SHARED;
     int disk = !kernel_open_file_memory_backed(file);
     enum kernel_mm_status status = KERNEL_MM_STATUS_OK;
-    /* A missing private disk leaf does not access mutable inode contents
+    /* A missing disk read leaf does not access mutable inode contents
      * here. The cache admits the read against current EOF, and publication
      * still takes inode I/O qualification and rechecks the captured epoch. */
-    if (disk && !shared && !force && access != KERNEL_MM_WRITE &&
+    if (disk && !force && access != KERNEL_MM_WRITE &&
         !kernel_file_mapping_epoch(node, &epoch) && offset < kernel_vfs_node_size(node)) {
         int absent;
         {
@@ -6465,11 +6475,10 @@ static __attribute__((noinline)) enum kernel_mm_status mapped_file_fault(struct 
             absent = fault_lookup_leaf(record,address,0,&leaf,&missing) == KERNEL_MM_STATUS_NOT_MAPPED;
         }
         if (absent) {
-#if BOAROS_MAX_CPUS > 1
-            if (operation->shared &&
-                kernel_open_file_try_prepare_disk_mapping_page(file,offset >> BOAROS_PAGE_SHIFT,&source))
+            if (kernel_open_file_try_prepare_disk_mapping_page(file,offset >> BOAROS_PAGE_SHIFT,&source)) {
                 replacement = source.address;
-#endif
+                if (shared || !operation->shared) mm_operation_release(operation);
+            }
             goto prepare_page;
         }
     }
@@ -6613,7 +6622,7 @@ prepare_file_tables:
     int map_neighbours = 0, defer_sync = 0;
     int instructions = (vma->permissions & KERNEL_MM_EXECUTE) != 0;
     if (status == KERNEL_MM_STATUS_OK) {
-        map_neighbours = !cookie && disk && !shared && !force && !operation->populate &&
+        map_neighbours = !cookie && disk && !force && !operation->populate &&
             access != KERNEL_MM_WRITE && !(vma->flags & KERNEL_VMA_RANDOM_READ) &&
             kernel_open_file_speculative_read_allowed(file);
 #if defined(BOAROS_ARCH_LOONGARCH)
@@ -7406,7 +7415,7 @@ static __attribute__((noinline)) int try_elf_ready_fault(struct mm_operation *op
         if (kernel_vma_set_generation(record->vmas) == view->generation &&
             !fault_range_claimed(record,first,limit)) {
             installed = arch_mmu_user_map_owned_window(&record->space,first,ready,refs,
-                backend_permissions_from_mm(vma->permissions & ~KERNEL_MM_WRITE));
+                backend_permissions_from_mm(vma->permissions & ~KERNEL_MM_WRITE),1);
             if (installed) targets = note_fault_change_locked(record,&batch,0,instructions);
         }
     }

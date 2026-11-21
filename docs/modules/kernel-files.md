@@ -205,6 +205,10 @@ ext4 和 tmpfs 的 `FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS` 使用 32 位数据。�
 
 普通用户的匿名管道、已打开FIFO读写及普通文件到管道的sendfile在发起CPU执行，复用下述片段、读写资格和端点短保护。没有附加观察者的匿名管道末OFD在调用者结束端点并通知；存在epoll登记或FIFO inode时仍沿CPU0完成关联清理。pipe2创建和FIFO路径打开沿原CPU0执行位置。
 
+读者在预约管道头部时取得首个片段的数据指针和长度。读取资格和槽预约共同阻止
+扩缩容与尾部合并改变该片段。消费已复制前缀时，最后一个片段在同一次状态更新中撤销预约。
+发布端检查等待队列的登记计数，已登记的线程仍在休眠前重查数据或容量。
+
 `kernel_files_pipe2()` 创建两个新的 open file description 和两个 fd 槽，共享一个片段环。默认容量为16个目标页（RV64KiB、LA256KiB），对象内保留16个槽描述符；更大的环另外分配描述符数组。各槽在写入时才取得一张独立目标页，不要求连续物理区间；扩容不预分配数据页，空 pipe 只占对象和必要的环元数据。读端只增加 read-side 引用，写端只增加 write-side 引用。`O_CLOEXEC` 保存在两个 descriptor flag 中，`O_NONBLOCK` 保存在两个 OFD status 中；`F_SETFL` 可切换 `O_NONBLOCK`，并接受 64 位目标上 musl 每次带来的 `O_LARGEFILE` 兼容位而不改变该位。
 
 读端有数据时按 ring 顺序返回，空且仍有 writer 时：阻塞 fd 进入 interruptible wait，非阻塞 fd 返回 `-EAGAIN`。所有 writer 关闭后空读返回 EOF；写端没有 reader 时返回 `-EPIPE`，同时向当前 task 发送 SIGPIPE，因此有 handler 时先观察信号、无 handler 时按默认动作终止。写端空间不足时阻塞或返回 `-EAGAIN`；不超过 4096 字节的单次写由writer复制资格和完整片段发布保持原子，较大写按可用空间推进。EOF/EPIPE 唤醒全部受影响 waiter。发布数据通知读者，读取或 splice 从已满环中释放首个槽时通知写者。异步读写信号维持各自的操作时点。等待者被唤醒后重查条件，也可被未阻塞信号唤醒后返回 `-EINTR`/按 `SA_RESTART` 重启。
@@ -360,13 +364,22 @@ O_SYNC/O_DSYNC 在整次复制后同步一次，同步失败返回错误而不�
 
 `read/readv` 与 `write/writev` 在 fd lookup 后立即取得独立 OFD 引用，并在本次操作的全部复制、等待和唤醒处理结束后释放。共享表中的另一个线程即使在操作睡眠期间 close 并复用同一 fd 号，本次操作仍使用 lookup 时的 OFD；对于 pipe，这份引用也让原读/写 endpoint 在 in-flight I/O 结束前保持逻辑存活，避免提前产生 EOF/EPIPE 或释放等待队列。末次操作引用触发的底层 cleanup 失败会转交给共享文件表的原有 cleanup 链。该语义基线对应固定 Linux `f4cdf7ca9a1f` 中 [`fs/file.c`](../../references/linux/fs/file.c) 的 `fdget()`/`fdput()` 生命周期。
 
+标量读写在验证当前任务身份后，一次借用文件表和地址空间。已有文件描述符的读写无需查询
+新描述符的分配限额。`/dev/null`、`/dev/zero` 和 `/dev/full` 的数据操作在调用核完成。
+提供零值的设备共用只读零缓冲和用户页复制游标，复制故障保留已写到用户地址空间的前缀。
+丢弃写入仍检查文件访问模式和地址范围，随后由设备返回接受字节数或错误。
+
 ## I/O 多路复用与 `poll/select`
 
 `kernel_files_ppoll()` 与 `kernel_files_pselect6()` 提供 Linux I/O 多路就绪通知：
 
-USER_SMP 中，FD快照、pipe/socket/epoll及普通文件的就绪查询、临时信号掩码、等待和结果复制在发起CPU执行。引擎先取得整份真实OFD引用，再按对象判断设备集合是否需要CPU0；设备集合在准备等待token前进入原业务范围。嵌套epoll在prepared token期间仅观察就绪提示，实际目标查询留在token结束后。
+USER_SMP 中，FD快照、pipe/socket/epoll及普通文件的就绪查询、临时信号掩码、等待和结果复制在发起CPU执行。对具有实际就绪状态的对象，引擎先取得真实OFD引用，再按对象判断是否需要CPU0；设备集合在准备等待token前进入原业务范围。嵌套epoll在prepared token期间仅观察就绪提示，实际目标查询留在token结束后。
 
-- **OFD 就绪检查与等待契约**：每个 open file description 通过 `kernel_open_file_poll()` 报告当前就绪位（`KERNEL_POLLIN/OUT/PRI/ERR/HUP`）并导出所属事件等待队列。管道为空且无写者（`POLLHUP`）、读端有数据（`POLLIN`）、写端有空间（`POLLOUT`）、控制台输出可用或常规文件读取就绪等状态在第一遍扫描时直接确定；若已有就绪事件或指定超时为零，则完全跳过睡眠，并直接交付该次扫描的结果，不在返回前重复查询。零超时调用只准备 OFD 引用数组，不分配或初始化等待节点。
+- **普通文件立即就绪**：`kernel_files_scan_select()` 按每 64 个编号检查用户位图实际请求的槽位，
+  每字最多取得一次文件表保护。只查询普通文件且有可报告事件时，调用直接生成读写就绪位图。
+  同一编号可同时计入读集和写集。遇到具有实际就绪状态的对象时，后续查询持有真实文件引用并使用对象等待队列。
+
+- **OFD 就绪检查与等待契约**：每个 open file description 通过 `kernel_open_file_poll()` 报告当前就绪位（`KERNEL_POLLIN/OUT/PRI/ERR/HUP`）并导出所属事件等待队列。管道为空且无写者（`POLLHUP`）、读端有数据（`POLLIN`）、写端有空间（`POLLOUT`）、控制台输出可用或常规文件读取就绪等状态在第一遍扫描时直接确定；若已有就绪事件或指定超时为零，则完全跳过睡眠，并直接交付该次扫描的结果，不在返回前重复查询。需要查询状态的零超时调用准备 OFD 引用数组，等待节点仅供允许休眠的请求使用。
 - **多队列等待节点（Wait Node）泛化**：调度器等待队列泛化为由 `struct kernel_wait_node` 串联的双向链表。当 poll 需要睡眠等待时，在被关心的所有有效 OFD 等待队列上分别挂载独立的等待节点（均绑定同一个task/代次token），任一队列事件触发唤醒即退出阻塞，并在返回前可靠从全部队列脱链。登记后的复查和唤醒后的扫描直接填写 revents；登记、复查、park 的顺序仍保证事件不会丢失。
 - **OFD 钉住引用（Pinned References）生命周期**：进入阻塞前，poll 引擎通过 `kernel_files_pin()` 对所有被监听的有效 OFD 各获取一份独立引用。这确保了在多线程共享文件表环境中，即使另一线程在睡眠期间 `close()` 并复用相应 fd，正在被 poll 的 OFD 及其内部等待队列依然受保护，不会发生 Use-After-Free；唤醒与清理时统一通过 `kernel_open_file_release()` 释放。
 - **原子信号掩码替换**：`ppoll` 和 `pselect6` 支持以原子方式应用调用者指定的临时 `sigmask`，使阻塞等待能够被特定信号打断并返回 `-EINTR`，返回或打断时自动恢复原有信号掩码。

@@ -111,6 +111,8 @@ struct kernel_pipe_read_borrow {
     struct kernel_pipe *pipe;
     struct kernel_lock_guard guard;
     size_t length;
+    const unsigned char *first_data;
+    size_t first_length;
     uint64_t cursor_position;
     uint32_t cursor_slot;
 };

@@ -550,6 +550,7 @@ enum kernel_files_status kernel_files_pselect6(
     }
 
     int ret = 0;
+    int total_bits = 0;
     if (bytes > 0U) {
         size_t copied = 0U;
         if (user_readfds != 0U) {
@@ -590,22 +591,24 @@ enum kernel_files_status kernel_files_pselect6(
         }
     }
 
-    /* Count active bits and check validity */
-    uint32_t count = 0U;
-    for (int32_t fd = 0; fd < nfds; fd++) {
-        uint32_t widx = (uint32_t)fd / 64U;
-        uint64_t bit = UINT64_C(1) << ((uint32_t)fd % 64U);
-        int r = (in_rfds[widx] & bit) != 0U;
-        int w = (in_wfds[widx] & bit) != 0U;
-        int e = (in_efds[widx] & bit) != 0U;
-        if (r || w || e) {
-            /* Linux select: all queried fds must be open in files! */
-            if (kernel_files_fd_matches(files, fd, 0)) {
-                ret = -KERNEL_EBADF;
-                goto cleanup;
-            }
-            count++;
-        }
+    if (nfds % 64) {
+        uint64_t mask=(UINT64_C(1)<<(nfds%64))-1;
+        in_rfds[words-1]&=mask;
+        in_wfds[words-1]&=mask;
+        in_efds[words-1]&=mask;
+    }
+    unsigned count;
+    int regular_ready;
+    ret=kernel_files_scan_select(files,(unsigned)nfds,in_rfds,in_wfds,in_efds,
+        &count,&regular_ready);
+    if (ret) goto cleanup;
+    if (regular_ready>0 || (immediate && regular_ready==0)) {
+        memcpy(out_rfds,in_rfds,bytes);
+        memcpy(out_wfds,in_wfds,bytes);
+        total_bits=regular_ready;
+        poll_restore_sigmask(task,saved_mask,mask_modified,0);
+        sigmask_restored=1;
+        goto copy_fds;
     }
 
     if (count > KERNEL_POLL_STACK_CAPACITY) {
@@ -647,7 +650,6 @@ enum kernel_files_status kernel_files_pselect6(
     sigmask_restored = 1;
 
     if (ret >= 0) {
-        int total_bits = 0;
         for (uint32_t i = 0; i < count; i++) {
             int32_t fd = pfds[i].fd;
             uint32_t widx = (uint32_t)fd / 64U;
@@ -672,6 +674,10 @@ enum kernel_files_status kernel_files_pselect6(
                 total_bits++;
             }
         }
+    }
+
+copy_fds:
+    if (ret >= 0) {
         size_t copied = 0U;
         if (user_readfds != 0U) {
             enum kernel_uaccess_status ustatus =

@@ -715,6 +715,35 @@ int kernel_files_fd_matches(struct kernel_files *files, int64_t fd,
     KERNEL_FILES_SCOPE(guard, files);
     return lookup_locked(files, fd)==description;
 }
+
+int kernel_files_scan_select(struct kernel_files *files,unsigned nfds,const uint64_t *readfds,
+    const uint64_t *writefds,const uint64_t *exceptfds,unsigned *count,int *ready)
+{
+    unsigned descriptors=0, ready_bits=0;
+    int regular_only=1;
+    for (unsigned first=0;first<nfds;first+=64) {
+        unsigned word=first/64;
+        uint64_t pending=readfds[word]|writefds[word]|exceptfds[word];
+        if (!pending) continue;
+        /* A word bounds the lock hold. Only copy readiness that is immutable
+         * for this live slot. Stateful targets still need their own references. */
+        KERNEL_FILES_SCOPE(guard,files);
+        while (pending) {
+            unsigned bit=first_fd_bit(pending);
+            uint64_t mask=UINT64_C(1)<<bit;
+            struct kernel_open_file_description *file=lookup_locked(files,first+bit);
+            if (!file) return -KERNEL_EBADF;
+            if (file->kind!=KERNEL_OPEN_FILE_KIND_REGULAR || file->device) regular_only=0;
+            descriptors++;
+            ready_bits+=!!(readfds[word]&mask)+!!(writefds[word]&mask);
+            pending&=pending-1;
+        }
+    }
+    *count=descriptors;
+    *ready=regular_only ? (int)ready_bits : -1;
+    return 0;
+}
+
 enum kernel_files_status kernel_files_pin_data(
     struct kernel_files *files, int64_t fd,
     struct kernel_open_file_description **description, int64_t *result)

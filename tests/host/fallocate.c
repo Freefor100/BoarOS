@@ -553,7 +553,9 @@ static void delayed_allocation(struct kernel_page_cache *cache, struct kernel_vf
         KERNEL_LOCK_SCOPE(io);kernel_vfs_node_lock(kernel_vfs_file_node(&file),&io,1);
         ext4_file *raw=lwext4_node_file(kernel_vfs_file_node(&file));
         struct file_write_reservation a={0},b={0};size_t ready;
+        unsigned queries=__atomic_load_n(&reservation_extent_queries,__ATOMIC_RELAXED);
         assert(!ext4_file_reserve_write(raw,0,2*block,&ready,&a) && ready==2*block);
+        assert(__atomic_load_n(&reservation_extent_queries,__ATOMIC_RELAXED)==queries);
         struct lwext4_mount_adapter *adapter=lwext4_instance(mount->private_data);
         reservation_state_lock=adapter->locks.state_lock;reservation_state_calls=0;
         adapter->locks.state_lock=count_reservation_state_lock;

@@ -1550,7 +1550,8 @@ int kernel_open_file_sync_range(struct kernel_open_file_description *file,
 
 int kernel_open_file_poll_requires_cpu0(const struct kernel_open_file_description *file)
 {
-    return file && ((file->device && file->kind!=KERNEL_OPEN_FILE_KIND_INOTIFY) ||
+    return file && ((file->device && !file->device->stateless_io &&
+        file->kind!=KERNEL_OPEN_FILE_KIND_INOTIFY) ||
         file->kind==KERNEL_OPEN_FILE_KIND_CONSOLE);
 }
 
