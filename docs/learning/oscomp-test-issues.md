@@ -191,7 +191,7 @@ BuildStorm 的 Rust 工具链曾在准备阶段中止。沿 `Child::wait_with_ou
 | 改名、调度和时钟选项 | `renameat201/202` 需要 `RENAME_EXCHANGE/RENAME_WHITEOUT`，`sched_getattr01` 和 `sched_setattr01` 需要截止期调度 `SCHED_DEADLINE`。`rtc01/02` 缺实时时钟（Real-Time Clock，RTC）的闹钟、更新中断或设时操作，`leapsec01` 缺闰秒插入。上述原程序在四种配置中均未得分。 |
 | 文件通知和文件系统观察 | `fanotify` 的初始化与监视接口缺失。原盘 23 个同名程序还可能依赖 OverlayFS 或其他文件系统，补齐入口后仍需逐项核对。设备枚举、进程读写统计、页表映射信息和文件区间映射接口见上一节。`wqueue01–09` 还需要 `O_NOTIFICATION_PIPE` 的内核事件通知管道。当前有匿名与共享内存大页，`hugemmap*` 等因缺大页文件系统 `hugetlbfs` 无法准备。 |
 | 进程记账、密钥和内存操作 | `acct01/02` 缺进程记账，`keyctl01` 及相关程序缺内核密钥管理，`userfaultfd01` 缺用户态缺页处理入口，`remap_file_pages01/02` 缺对应的旧映射操作。各接口族使用独立探针复核，再量化可恢复分数。`ioctl_ns03` 缺命名空间所有者标识查询，`ioctl_ns06` 缺用户命名空间。 |
-| 网络套接字选项与协议 | `accept02` 在设置 IPv4 组播成员选项 `MCAST_JOIN_GROUP` 时返回 `ENOPROTOOPT`，还未执行接纳断言。`setsockopt04` 缺强制发送缓冲区选项 `SO_SNDBUFFORCE`，`setsockopt02` 缺 `AF_PACKET`，`sendto02` 需要流控制传输协议（Stream Control Transmission Protocol，SCTP）。`accept03` 已有 17 分，文件通知、用户态缺页处理及性能事件等描述符构造分支跳过。 |
+| 网络套接字选项与协议 | `accept02` 先设置 IPv4 组播成员选项 `MCAST_JOIN_GROUP`，随后才检查接纳。`setsockopt04` 依赖强制发送缓冲区选项 `SO_SNDBUFFORCE`。这两个接口已通过直接消费者验证。`setsockopt02` 在创建 `AF_PACKET` 后还需要 `TPACKET_V3` 和 `PACKET_RX_RING`，当前提供基础链路层收发，尚无共享接收环。`sendto02` 需要流控制传输协议（Stream Control Transmission Protocol，SCTP）。`accept03` 已有 17 分，文件通知、用户态缺页处理及性能事件等描述符构造分支跳过。 |
 | 更大范围的内存、设备与异步接口 | 交换空间、非均匀内存访问（Non-Uniform Memory Access，NUMA）的内存策略和迁移、内存保护密钥、`io_uring`、模块装载、文件系统配额分别核对。配额原程序还缺 `quotacheck` 等工具，`io_uring01/02` 与部分模块测例先检查 Linux 配置；此类零分记录本身不足以证明已执行对应 syscall。 |
 | 已接入但原程序无法核对的接口 | 新版本已有原生异步输入输出（Asynchronous I/O，AIO）、`sync_file_range`、`adjtimex`、`clock_adjtime` 及 `membarrier`。发布盘的 `io_setup01` 在构建时缺 libaio，运行未调用内核。当前审计中 `sync_file_range01`、`clock_adjtime01`、`membarrier01` 已分别在四种配置得到 5、9、12 分。`perf_event_open01` 在配置检查阶段停止，现有内核接口也只覆盖有限事件。 |
 
@@ -208,7 +208,9 @@ BuildStorm 的 Rust 工具链曾在准备阶段中止。沿 `Child::wait_with_ou
   检查挂载根和普通文件，区分同一文件系统的不同挂载视图。
 - 同步测例读取的是整盘或分区 `stat` 文件内的已完成扇区数及设备忙时长。现在这些值由块层按实际请求采样，
   `sync_file_range02` 和 `fdatasync03` 已能在 ext4 上完成真实同步量的断言。`/proc/self/io` 已可读取实际的进程与线程用量。
-  `readahead02` 还需要测试环境提供缓存控制及设备预读参数。`msync04` 仍需要 `/proc/self/pagemap`。
+  `readahead02` 还需要测试环境提供缓存控制及设备预读参数。`/proc/self/pagemap` 已能查询驻留页，
+  原版 `mmap12` 可执行真实驻留断言。`msync04` 从该文件得到物理页帧编号后，还要读取
+  `/proc/kpageflags` 判断脏页，该接口尚未实现。
 - `msync03` 的锁页区间遇 `MS_INVALIDATE` 现在按预期返回 `EBUSY`。原程序的六条断言均通过，
   它仍无判分用的 `Summary:`。`ioctl_ns03` 对主机名与域名命名空间发出 `NS_GET_OWNER_UID`，
   现在检查到了预期的 `EINVAL`。

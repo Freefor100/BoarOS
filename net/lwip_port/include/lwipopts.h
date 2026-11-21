@@ -51,7 +51,9 @@
 #define LWIP_DNS 0
 #define LWIP_DHCP 0
 #define LWIP_AUTOIP 0
-#define LWIP_IGMP 0
+#define LWIP_IGMP 1
+#define LWIP_LOOPIF_MULTICAST 1
+#define MEMP_NUM_IGMP_GROUP 64
 #define LWIP_ARP 1
 #define LWIP_ETHERNET 1
 #define LWIP_SUPPORT_CUSTOM_PBUF 1

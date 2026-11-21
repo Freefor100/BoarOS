@@ -26,6 +26,7 @@
 #define LINUX_AF_INET 2
 #define LINUX_AF_INET6 10
 #define LINUX_AF_NETLINK 16
+#define LINUX_AF_PACKET 17
 #define LINUX_AF_MAX 46
 #define LINUX_SOCK_STREAM 1
 #define LINUX_SOCK_DGRAM 2
@@ -175,6 +176,15 @@ static int parse_address(const union linux_sockaddr_storage *snapshot,
         if(length<12)return -KERNEL_EINVAL;
         __builtin_memcpy(&address->scope,snapshot->bytes+4,4);
         __builtin_memcpy(address->bytes,snapshot->bytes+8,4);
+    } else if (family == LINUX_AF_PACKET) {
+        if (length < 20) return -KERNEL_EINVAL;
+        uint16_t protocol;
+        __builtin_memcpy(&protocol,snapshot->bytes+2,2);
+        address->port=network_port(protocol);
+        __builtin_memcpy(&address->scope,snapshot->bytes+4,4);
+        address->link_length=snapshot->bytes[11];
+        address->link_size=(uint8_t)length;
+        __builtin_memcpy(address->link_address,snapshot->bytes+12,8);
     } else if (family != 0 && !unix_socket) return -KERNEL_EAFNOSUPPORT;
     return 0;
 }
@@ -208,6 +218,16 @@ static int copy_address_out(struct kernel_mm *mm, uint64_t user_address,
         __builtin_memcpy(local.bytes+4,&address->scope,4);
         __builtin_memcpy(local.bytes+8,address->bytes,4);
         size=12;
+    } else if (address->family == LINUX_AF_PACKET) {
+        uint16_t protocol=network_port(address->port);
+        local.v4.family=LINUX_AF_PACKET;
+        __builtin_memcpy(local.bytes+2,&protocol,2);
+        __builtin_memcpy(local.bytes+4,&address->scope,4);
+        __builtin_memcpy(local.bytes+8,&address->link_type,2);
+        local.bytes[10]=address->link_packet_type;
+        local.bytes[11]=address->link_length;
+        __builtin_memcpy(local.bytes+12,address->link_address,8);
+        size=address->link_size;
     } else if (address->family == LINUX_AF_INET6) {
         local.v6.family = LINUX_AF_INET6;
         local.v6.port = network_port(address->port);
@@ -249,6 +269,7 @@ static int socket_option(int level, int name, enum kernel_socket_option *option)
         case 9: *option = KERNEL_SOCKET_KEEPALIVE; return 0;
         case 16: *option = KERNEL_SOCKET_PASSCRED; return 0;
         case 30: *option = KERNEL_SOCKET_ACCEPTCONN; return 0;
+        case 32: *option = KERNEL_SOCKET_SNDBUFFORCE; return 0;
         }
     } else if (level == LINUX_IPPROTO_TCP) {
         if (name == 1) { *option = KERNEL_SOCKET_NODELAY; return 0; }
@@ -368,8 +389,39 @@ static int ipv4_sockopt(struct kernel_socket *socket, struct kernel_mm *mm,
     int value = 0;
     uint32_t address = 0;
     size_t copied = 0;
-    enum kernel_socket_option option = name == 2 ?
-        KERNEL_SOCKET_IPV4_TTL : KERNEL_SOCKET_MULTICAST_TTL;
+    enum kernel_socket_option option = name == 2 ? KERNEL_SOCKET_IPV4_TTL :
+        name == 34 ? KERNEL_SOCKET_IPV4_MULTICAST_LOOP :
+        name == 49 ? KERNEL_SOCKET_IPV4_MULTICAST_ALL : KERNEL_SOCKET_MULTICAST_TTL;
+    if (name == 35 || name == 36 || name == 42 || name == 45) {
+        int family=kernel_socket_family(socket);
+        if (get || (family!=LINUX_AF_INET && family!=LINUX_AF_INET6)) return -KERNEL_ENOPROTOOPT;
+        struct { uint32_t group, address, index; } membership = {0};
+        if (name == 35 || name == 36) {
+            if (kernel_socket_is_tcp(socket)) return -KERNEL_EPROTO;
+            if (length < 8) return -KERNEL_EINVAL;
+            size_t input = length >= 12 ? 12U : 8U;
+            if (kernel_copy_from_user(mm, &membership, request->arguments[3], input, &copied) !=
+                    KERNEL_UACCESS_STATUS_OK || copied != input) return -KERNEL_EFAULT;
+        } else {
+            /* Native group_req has an eight-byte-aligned sockaddr_storage
+             * after the interface; its protocol address is a sockaddr_in. */
+            struct {
+                uint32_t index, pad;
+                uint16_t family, port;
+                uint32_t group;
+                unsigned char remainder[120];
+            } input;
+            _Static_assert(sizeof(input)==136,"Linux group_req layout");
+            if (length < (int32_t)sizeof(input)) return -KERNEL_EINVAL;
+            if (kernel_copy_from_user(mm, &input, request->arguments[3], sizeof(input), &copied) !=
+                    KERNEL_UACCESS_STATUS_OK || copied != sizeof(input)) return -KERNEL_EFAULT;
+            if (input.family != LINUX_AF_INET) return -KERNEL_EINVAL;
+            membership.group = input.group;
+            membership.index = input.index;
+        }
+        return kernel_socket_ipv4_membership(socket,membership.group,membership.address,
+            membership.index,name==36 || name==45);
+    }
     if (!get) {
         if (name == 32) { /* IP_MULTICAST_IF */
             struct { uint32_t group, address; int32_t index; } selection = {0};
@@ -517,7 +569,8 @@ static int sockopt(struct kernel_socket *socket, struct kernel_files *files, str
     }
     if (level == LINUX_SOL_SOCKET && name == 25)
         return device_sockopt(socket, mm, request, get, length);
-    if (level == 0 && (name == 2 || name == 32 || name == 33))
+    if (level == 0 && (name == 2 || (name >= 32 && name <= 36) ||
+            name == 42 || name == 45 || name == 49))
         return ipv4_sockopt(socket, mm, request, get, length);
     if(level==LINUX_SOL_SOCKET && (name==26 || name==27 || name==44 || name==50)) {
         /* Classic-program import/export holds separate heap/program owners
@@ -593,8 +646,14 @@ static int socket_creation_error(int family, int type, int protocol)
     if (base_type >= LINUX_SOCK_MAX) {
         return -KERNEL_EINVAL;
     }
-    if (family != LINUX_AF_UNIX && family != LINUX_AF_INET && family != LINUX_AF_INET6 && family != LINUX_AF_NETLINK) {
+    if (family != LINUX_AF_UNIX && family != LINUX_AF_INET && family != LINUX_AF_INET6 && family != LINUX_AF_NETLINK && family != LINUX_AF_PACKET) {
         return -KERNEL_EAFNOSUPPORT;
+    }
+    if (family==LINUX_AF_PACKET) {
+        if (!kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_NET_RAW))
+            return -KERNEL_EPERM;
+        return base_type==LINUX_SOCK_RAW || base_type==LINUX_SOCK_DGRAM ?
+            0 : -KERNEL_ESOCKTNOSUPPORT;
     }
     if(family==LINUX_AF_NETLINK) {
         if(base_type!=LINUX_SOCK_RAW && base_type!=LINUX_SOCK_DGRAM)return -KERNEL_ESOCKTNOSUPPORT;

@@ -231,6 +231,19 @@ int kernel_mm_munlockall(struct kernel_mm *);
 /* At most 16 pages; no page is faulted in. The completed prefix is returned. */
 int kernel_mm_mincore(struct kernel_mm *, uint64_t, unsigned, unsigned char *, unsigned *);
 
+/* The descriptor retains the address-space record, not its mappings. */
+struct kernel_mm_pagemap {
+    struct kernel_mm_record *record;
+    struct physical_page_allocator *allocator;
+    uint64_t record_page;
+};
+#define KERNEL_MM_PAGEMAP_BATCH 16U
+void kernel_mm_pagemap_hold(const struct kernel_mm *, struct kernel_mm_pagemap *);
+void kernel_mm_pagemap_put(struct kernel_mm_pagemap *);
+int kernel_mm_pagemap_live(const struct kernel_mm_pagemap *);
+int kernel_mm_pagemap_read(const struct kernel_mm_pagemap *, uint64_t first_page,
+    unsigned, int show_pfn, uint64_t *, unsigned *);
+
 /* Returns NOT_MAPPED for a valid address outside all VMAs. */
 enum kernel_mm_status kernel_mm_vma_lookup(
     const struct kernel_mm *mm,

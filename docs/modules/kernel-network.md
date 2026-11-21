@@ -34,7 +34,23 @@ INET TCP 的 `recv/recvfrom/recvmsg/recvmmsg` 支持 `MSG_WAITALL`：每次复�
 
 `AF_INET/SOCK_RAW/IPPROTO_ICMP` 提供 IPv4 ICMP 原始报文接口，创建要求 CAP_NET_RAW。protocol 从系统调用经 FD 创建传给协议后端，不由 socket 类型猜测。发送方提供 ICMP 头和校验和，内核添加 IPv4 头；接收包含完整 IPv4 头，来源端口为零。端口绑定不参与 TCP/UDP 的低端口权限与分配。每个 raw PCB 的回调只观察原包，为自己的接收队列保存独立内容；过滤、队列满或分配失败只影响该接收者，不吞掉其他 raw 接收者或内核 Echo 响应的输入。读写、向量、PEEK/TRUNC、就绪和超时共用现有消息路径，关闭在协议资格下撤销回调和 PCB 后归还接收 owner。DGRAM ping、其他 raw 协议、IP_HDRINCL、PMTU 配置和远端 MTU 缓存尚未接入。
 
-`SO_BROADCAST` 默认关闭，在选定实际 IPv4 出接口后限制广播发送，未许可返回 EACCES；接收广播不要求该选项。`IP_TTL` 控制 IPv4 发包，默认 64；`IP_MULTICAST_TTL` 默认 1，`IP_MULTICAST_IF` 保存组播发送接口与地址，组播 TTL 为零时不向物理接口发送。发送选项不表示已支持组播入组。UDP connect、UDP send 与 raw send 共用出接口和源地址选择，随后使用选定结果发送，不再次路由。`SO_BINDTODEVICE` 保存数值接口索引，影响发送与接收；接口 down 后保留绑定，不静默回退。按固定 Linux，首次绑定允许无 CAP_NET_RAW，已有绑定的修改与解除要求该能力。TCP 更新同时协调所属执行者与四元组索引，监听连接继承实际绑定。
+`SO_BROADCAST` 默认关闭，在选定实际 IPv4 出接口后限制广播发送，未许可返回 EACCES；接收广播不要求该选项。`IP_TTL` 控制 IPv4 发包，默认 64；`IP_MULTICAST_TTL` 默认 1，`IP_MULTICAST_IF` 保存组播发送接口与地址，组播 TTL 为零时不向物理接口发送。UDP connect、UDP send 与 raw send 共用出接口和源地址选择，随后使用选定结果发送，不再次路由。`SO_BINDTODEVICE` 保存数值接口索引，影响发送与接收；接口 down 后保留绑定，不静默回退。按固定 Linux，首次绑定允许无 CAP_NET_RAW，已有绑定的修改与解除要求该能力。TCP 更新同时协调所属执行者与四元组索引，监听连接继承实际绑定。
+
+IPv4 任意源组播支持 `IP_ADD_MEMBERSHIP/IP_DROP_MEMBERSHIP` 的地址和接口索引形式，以及
+`MCAST_JOIN_GROUP/MCAST_LEAVE_GROUP` 的通用套接字地址形式。每个套接字独立持有订阅，
+以接口和组地址定位成员，并共同计入接口的互联网组管理协议第二版（Internet Group
+Management Protocol version 2，IGMPv2）成员状态。以太网接口由此发送入组报告和最后订阅
+解除时的离组报文。关闭套接字或移除接口时归还相应订阅。IPv4 的通用入组选项也可用于
+TCP 套接字，接纳产生的子连接拥有独立的成员列表。
+
+`IP_MULTICAST_ALL=0` 要求接收套接字自己订阅入站组；默认值允许接收本接口已经加入的
+组。组播数据报按端口、地址、设备和已连接对端筛选，多个接收者分别计费和保存独立的
+读取位置，共享同一份不可变报文。IPv4 源过滤与 IGMPv3 留待实现。
+
+`SO_SNDBUFFORCE` 要求调用者具有网络管理能力 `CAP_NET_ADMIN`。它绕过普通
+`SO_SNDBUF` 的设置上限，按 Linux 的规则对请求值做倍增和整数裁剪；实际值通过
+`SO_SNDBUF` 查询。设置只提高套接字接纳额度，协议内存池、TCP 窗口和设备队列仍按各自
+资源限制推进。
 
 输入地址按 Linux 的有符号 32 位长度校验，bind/connect/sendto 拒绝负值及超过 128 字节的声明，并完整复制声明范围后解析。sendmsg 对空 name、负长度及超过 128 字节的输入使用其独立的规范化规则；先完成 name 复制和 iovec 导入，再解释地址，错误路径保留协议状态和报文队列。
 
@@ -112,11 +128,28 @@ socket，也不遍历全局 socket registry。OFD 销毁仍先清回调，再释
 关闭工作尚未服务时验证容量回收及 timer 到期均清空借用；同时检查非 socket
 raw PCB 和已经销毁的 socket，不用无 owner 的 raw PCB 代替主要所有权用例。
 
-`AF_NETLINK` 的 `NETLINK_ROUTE`（protocol 0）提供 `SOCK_RAW`/`SOCK_DGRAM` 通知接收端点，支持 NONBLOCK/CLOEXEC，并复用普通 read/readv、recvfrom/recvmsg 与 poll/epoll 路径。它用于原版 musl/glibc 的 `mq_notify(SIGEV_THREAD)`：libc 创建未绑定的 socket，将其 FD 和 32 字节 cookie 传给内核；通知报文不带 netlink header，只有 cookie 的最后一字节替换为 WOKENUP（1）或 REMOVED（2），源地址是 `AF_NETLINK`、内核 portid 0。RAW 类型不套用 INET 的 `CAP_NET_RAW` 要求。路由消息、bind/connect/listen/shutdown 和普通发送返回 `EOPNOTSUPP`；没有伪造路由应答。
+`AF_NETLINK` 的 `NETLINK_ROUTE`（protocol 0）提供 `SOCK_RAW`/`SOCK_DGRAM` 端点，
+支持单播绑定、接口和地址枚举及有限的路由查询。路由修改和订阅组当前无实现。
+消息队列的 `mq_notify(SIGEV_THREAD)` 也使用该地址族：C 标准库创建未绑定的套接字，
+将其文件描述符和 32 字节通知数据传给内核。通知报文不带 Netlink 头，通知数据最后一字节
+表示唤醒（1）或移除（2），源端口标识为内核的 0。Netlink 原始套接字的创建不要求
+`CAP_NET_RAW`。
 
 通知准备在消息队列锁外取得真实 socket OFD，分配最终 packet，并按 packet 及载荷大小预约接收端内存。尚未触发的 cookie 与已入队报文共享 SO_RCVBUF 额度；首条允许超过当前额度，其余超额准备通过已有 task 请求和等待 token 等待。唤醒后重新查 FD，关闭或复用能改变此次查找结果。注册成功后 cookie 独立持有端点存储，OFD 临时引用随准备结束归还；消息队列移出通知状态后在锁外发送或取消 cookie。接收完成或失败消费报文时归还实际接收额度；PEEK 保留它。取消注册失败时直接取消预约，不投递报文。
 
 socket 最后关闭立即撤下接收队列并关闭等待对象，尚未触发的 cookie 只保留已关闭端点的存储；其后发送会释放该 cookie，最后一个实际使用者归还 heap。通知不新增 worker，也不进入 lwIP。`sh tests/host/netlink-notify.sh` 用真实 FD/OFD、MM、heap 与 socket 检查两种类型的 cookie 内容、源地址、PEEK/read/readv、复制故障及关闭后的资源归还，并以明确握手检查满额度等待、接收归还额度和等待期间 FD 关闭。固定依据是 `references/linux/ipc/mqueue.c`、`net/netlink/af_netlink.c` 和 `include/uapi/linux/mqueue.h`，libc 消费方式来自固定 musl 1.2.5、glibc 2.44 源码归档。
+
+`AF_PACKET` 提供链路层的 `SOCK_RAW` 和 `SOCK_DGRAM`，创建时检查 `CAP_NET_RAW`。
+调用者用 `sockaddr_ll` 设置接口编号和网络字节序的以太网协议号。原始套接字收发带头的
+帧，数据报套接字接收时省去以太网头，发送时根据接口和目的地址构造头。`ETH_P_ALL`
+还接收本机发出的帧。回环接口为普通互联网协议（Internet Protocol，IP）报文合成以太网头，
+使两种套接字看到与其类型相符的字节布局。
+
+接收旁路在设备归还缓冲区之前检查接口、协议和已安装的过滤程序，随后把匹配帧的独立副本
+交给套接字接收队列。每个队列独立计费，满队列只丢弃给该接收者的副本。取消绑定或
+关闭套接字时，在协议保护内撤下接收登记，接口销毁时解除该接口上的绑定。
+等待和用户复制复用普通消息接口。当前支持普通收发，未提供 `PACKET_RX_RING`、
+`PACKET_TX_RING`、混杂模式和分流组。
 
 `AF_UNIX` 提供 STREAM/DGRAM/SEQPACKET 的普通 socket、socketpair、文件路径名和抽象名称。创建、绑定、连接、监听、accept/accept4、配置及最后关闭由 CPU0 执行；载荷复制、接纳、读预约和等待保留在发起 CPU。socketpair 的双 OFD/FD 原子发布，失败归还未发布对象。
 

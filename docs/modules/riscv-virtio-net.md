@@ -71,8 +71,8 @@ core stop 遇到 CPU lease、RX loan 或未归还 TX owner 返回 EBUSY，reset 
 TCP/UDP 套接字的绑定。网络服务停止并确认 DMA 停止后，归还已无 socket 使用者的
 TCP 连接记录，再移除设备；其他对象沿各自生命周期处理。协议栈实际使用网关进行 ARP；
 跨核调用沿现有协议执行者处理。快照不借用 netif 给用户复制；copy fault 不延长设备生命。
-多地址、非默认静态路由、路由度量及普通 NETLINK_ROUTE 消息仍待实现；
-AF_NETLINK 的消息队列通知接收见[网络端点模块](kernel-network.md)。
+IPv4 多地址、非默认静态路由及路由度量仍待实现。通过 `NETLINK_ROUTE` 可以查询
+接口、地址和部分路由信息，修改当前走上述设备控制接口。
 loopback 的协议 MTU=0 表示无 L2 限制，对应公开的 65536；较小设置直接用于协议栈。
 
 ## 验证与固定资料

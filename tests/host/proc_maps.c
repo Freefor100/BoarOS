@@ -181,7 +181,7 @@ int main(void)
     assert(!strcmp(name, "maps") && next == 11 && inode == node.inode && type == 8);
     assert(proc_dir_entry(&dir, next, &next, &inode, &type, name, sizeof(name))==1);
     assert(!strcmp(name,"fdinfo") && type==4);
-    const char *tail_names[]={"ns","mountinfo","comm","cgroup","coredump_filter","io"};
+    const char *tail_names[]={"ns","mountinfo","comm","cgroup","coredump_filter","io","pagemap"};
     for(unsigned i=0;i<sizeof(tail_names)/sizeof(tail_names[0]);i++) {
         assert(proc_dir_entry(&dir,next,&next,&inode,&type,name,sizeof(name))==1);
         assert(!strcmp(name,tail_names[i]));
@@ -205,6 +205,13 @@ int main(void)
         assert(mode == (KERNEL_VFS_S_IFREG | 0400U));
         assert(proc_dir_entry(parent, thread ? 15U : 17U, &next, &inode, &type, name, sizeof(name)) == 1);
         assert(!strcmp(name, "io") && inode == found && type == 8U);
+        uint64_t pagemap;
+        assert(!proc_lookup(0, thread ? thread_dir : directory, "pagemap", 7, &pagemap, &mode));
+        assert(mode == (KERNEL_VFS_S_IFREG | 0400U));
+        assert(proc_inode_is_thread(pagemap) == (int)thread);
+        assert(proc_dir_entry(parent, next, &next, &inode, &type, name, sizeof(name)) == 1);
+        assert(!strcmp(name,"pagemap") && inode == pagemap && type == 8U);
+        assert(!proc_dir_entry(parent, next, &next, &inode, &type, name, sizeof(name)));
         struct kernel_vfs_node io_node = {.inode=found};
         char *counters = NULL;
         size_t size;

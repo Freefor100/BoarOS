@@ -138,6 +138,7 @@ struct kernel_mm_record {
     uint64_t futex_id;
     uint32_t references;
     uint32_t users;
+    uint32_t record_references; /* MM owner plus weak /proc pagemap references. */
     struct kernel_aio_context *aio_contexts;
     uint32_t aio_destinations, aio_fork_waiters;
     uint32_t coredump_filter; /* MM-owned: CLONE_VM shares; fork/exec copy */
@@ -553,8 +554,8 @@ static enum kernel_mm_status resolve_record(const struct kernel_mm *mm,
 
 static enum kernel_mm_status release_record_only(struct kernel_mm *mm)
 {
-    (void)physical_page_release(mm->allocator,
-                              mm->record_page_address);
+    if (__atomic_fetch_sub(&mm->record->record_references, 1U, __ATOMIC_ACQ_REL) == 1U)
+        (void)physical_page_release(mm->allocator, mm->record_page_address);
     finish_handle(mm, KERNEL_MM_RELEASED);
     return KERNEL_MM_STATUS_OK;
 }
@@ -615,6 +616,7 @@ enum kernel_mm_status kernel_mm_create(
     if (!record->futex_id) return abandon_unresolved_record(mm, allocator,
         record_page_address, KERNEL_MM_STATUS_NO_MEMORY);
     record->references = 1U;
+    record->record_references = 1U;
     record->coredump_filter = 0x33U;
     kernel_raw_rwlock_init(&record->metadata, KERNEL_RAW_RANK_MM);
     kernel_rwlock_init(&record->operations, 25, (uintptr_t)record);
@@ -1670,6 +1672,7 @@ static enum kernel_mm_status mm_fork_impl(
     if (!destination_record->futex_id) return abandon_unresolved_record(destination,
         source->allocator, record_page_address, KERNEL_MM_STATUS_NO_MEMORY);
     destination_record->references = 1U;
+    destination_record->record_references = 1U;
     destination_record->coredump_filter = kernel_mm_coredump_filter_get(source);
     destination_record->membarrier_registrations =
         __atomic_load_n(&source_record->membarrier_registrations, __ATOMIC_ACQUIRE);
@@ -1990,6 +1993,73 @@ static int remote_access_allowed(const struct kernel_vma *vma, uint32_t access, 
             vma->kind == KERNEL_VMA_KIND_FILE_PRIVATE ||
             vma->kind == KERNEL_VMA_KIND_ELF_PRIVATE) &&
            vma->role != KERNEL_VMA_ROLE_VVAR && vma->role != KERNEL_VMA_ROLE_VDSO;
+}
+
+void kernel_mm_pagemap_hold(const struct kernel_mm *mm, struct kernel_mm_pagemap *view)
+{
+    /* The task resource guard stabilizes the live MM while opening procfs. */
+    struct kernel_mm_record *record = mm->record;
+    if (__atomic_fetch_add(&record->record_references, 1U, __ATOMIC_RELAXED) == UINT32_MAX)
+        __builtin_trap();
+    *view = (struct kernel_mm_pagemap){record, mm->allocator, mm->record_page_address};
+}
+
+void kernel_mm_pagemap_put(struct kernel_mm_pagemap *view)
+{
+    if (__atomic_fetch_sub(&view->record->record_references, 1U, __ATOMIC_ACQ_REL) == 1U &&
+        physical_page_release(view->allocator, view->record_page))
+        __builtin_trap();
+}
+
+int kernel_mm_pagemap_live(const struct kernel_mm_pagemap *view)
+{
+    return __atomic_load_n(&view->record->users, __ATOMIC_ACQUIRE) != 0;
+}
+
+int kernel_mm_pagemap_read(const struct kernel_mm_pagemap *view, uint64_t first,
+    unsigned count, int show_pfn, uint64_t *entries, unsigned *completed)
+{
+    *completed = 0;
+    uint64_t limit = ARCH_MMU_USER_LIMIT >> BOAROS_PAGE_SHIFT;
+    if (first >= limit || !kernel_mm_pagemap_live(view)) return 0;
+    if (count > KERNEL_MM_PAGEMAP_BATCH) count = KERNEL_MM_PAGEMAP_BATCH;
+    if (count > limit - first) count = (unsigned)(limit - first);
+    struct kernel_mm_record *record = view->record;
+    KERNEL_LOCK_SCOPE(gate);
+    kernel_rwlock_read(&record->operations, &gate);
+    /* After the last task's user reference drops, teardown takes the same
+     * gate for writing. The weak owner only retains the record page. */
+    if (!kernel_mm_pagemap_live(view)) return 0;
+    KERNEL_LOCK_SCOPE(vmas);
+    kernel_rwlock_read(&record->vma_lock, &vmas);
+    KERNEL_RAW_READ_SCOPE(metadata, &record->metadata);
+    uint64_t address = first << BOAROS_PAGE_SHIFT;
+    for (unsigned i = 0; i < count; ++i, address += BOAROS_PAGE_SIZE) {
+        struct kernel_mm_leaf leaf;
+        enum arch_mmu_status status = arch_mmu_user_leaf_snapshot(&record->space, address, &leaf);
+        if (status == ARCH_MMU_STATUS_NOT_MAPPED) {
+            entries[i] = 0;
+            continue;
+        }
+        if (status != ARCH_MMU_STATUS_OK) return -KERNEL_EIO;
+        uint64_t entry = UINT64_C(1) << 63; /* PROT_NONE leaves still own a page. */
+        struct kernel_vma vma;
+        if (record->vmas && !kernel_vma_set_lookup(record->vmas, address, &vma)) {
+            struct mm_file_resident *file_page = find_file_resident(record, address);
+            if ((file_page && !file_page->private) ||
+                vma.kind == KERNEL_VMA_KIND_ANON_SHARED ||
+                vma.kind == KERNEL_VMA_KIND_SYSV_SHM ||
+                vma.kind == KERNEL_VMA_KIND_HUGETLB_SHARED)
+                entry |= UINT64_C(1) << 61;
+        }
+        if (show_pfn) {
+            uint64_t physical = leaf.physical_address + address - leaf.virtual_address;
+            entry |= (physical >> BOAROS_PAGE_SHIFT) & ((UINT64_C(1) << 55) - 1);
+        }
+        entries[i] = entry;
+    }
+    *completed = count;
+    return 0;
 }
 static enum kernel_mm_status remote_lookup_record(struct kernel_mm_record *record,
     uint64_t address, struct kernel_mm_mapping *mapping)

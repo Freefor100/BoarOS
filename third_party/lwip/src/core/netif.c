@@ -1255,6 +1255,12 @@ netif_loop_output(struct netif *netif, struct pbuf *p)
   }
   SYS_ARCH_UNPROTECT(lev);
 
+  /* Packet sockets see the same completed output before the protocol reads it. */
+#if BOAROS_LWIP_LINUX_LOOPBACK
+  extern void kernel_socket_packet_loopback(struct netif *, const struct pbuf *)
+      __attribute__((weak));
+  if (kernel_socket_packet_loopback) kernel_socket_packet_loopback(netif, p);
+#endif
   /* 队列已完整发布；通知端只标记工作和唤醒，不重入协议处理。 */
 #ifdef LWIP_HOOK_NETIF_LOOPBACK_QUEUED
   LWIP_HOOK_NETIF_LOOPBACK_QUEUED(netif);

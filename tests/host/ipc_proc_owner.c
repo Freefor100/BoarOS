@@ -69,6 +69,11 @@ const struct kernel_credentials *kernel_credentials_current(void){return NULL;}
 const struct kernel_credentials *kernel_credentials_get(const struct kernel_credentials *cred){assert(!cred);return NULL;}
 struct kernel_namespace *kernel_task_ipc_namespace(void){return &ipc;}
 int kernel_procfs_ipc_file(const struct kernel_vfs_file *f){(void)f;return 1;}
+int kernel_procfs_pagemap_open(const struct kernel_vfs_file *f, struct kernel_heap *heap,
+    struct kernel_mm_pagemap **view)
+{ (void)f; (void)heap; (void)view; return 0; }
+void kernel_mm_pagemap_put(struct kernel_mm_pagemap *view)
+{ (void)view; assert(!"pagemap is outside this fixture"); }
 int kernel_vfs_file_generated(const struct kernel_vfs_file *f){(void)f;return 1;}
 uint64_t kernel_vfs_mount_error_sequence(const struct kernel_vfs_mount *m){(void)m;return 0;}
 uint64_t kernel_vfs_error_sequence(const struct kernel_vfs_file *f){(void)f;return 0;}
@@ -98,7 +103,7 @@ int main(void)
      assert(!kernel_pid_reserve_numbers(&view,id,kernel_pid_storage_size(&view),NULL,0));
      assert(!kernel_pid_publish_reserved(id));kernel_pid_attach(&task.identities[KERNEL_PID_TID],id,KERNEL_PID_TID,&task);}
     struct kernel_open_file_description *file=calloc(1,sizeof(*file));assert(file);
-    initialize_path_description(file,&heap);
+    assert(!finish_path_open(file,&heap));
     assert(file->ipc_proc_namespace==&ipc&&file->ipc_proc_pid_view==&view&&ipc.references==2&&view.references==3);
     struct kernel_open_file_description *alias=file;assert(!kernel_open_file_acquire(alias));
     assert(view.references==3&&!kernel_open_file_release(&alias)&&!alias&&view.references==3);

@@ -558,7 +558,8 @@ ip4_input(struct pbuf *p, struct netif *inp)
   /* match packet against an interface, i.e. is this packet for us? */
   if (ip4_addr_ismulticast(ip4_current_dest_addr())) {
 #if LWIP_IGMP
-    if ((inp->flags & NETIF_FLAG_IGMP) && (igmp_lookfor_group(inp, ip4_current_dest_addr()))) {
+    if (netif_is_up(inp) && (inp->flags & NETIF_FLAG_IGMP) &&
+        igmp_lookfor_group(inp, ip4_current_dest_addr())) {
       /* IGMP snooping switches need 0.0.0.0 to be allowed as source address (RFC 4541) */
       ip4_addr_t allsystems;
       IP4_ADDR(&allsystems, 224, 0, 0, 1);
@@ -1026,6 +1027,10 @@ ip4_output_if_opt_src(struct pbuf *p, const ip4_addr_t *src, const ip4_addr_t *d
   if (ip4_addr_eq(dest, netif_ip4_addr(netif))
 #if !LWIP_HAVE_LOOPIF
       || ip4_addr_isloopback(dest)
+#elif LWIP_MULTICAST_TX_OPTIONS
+      /* Delivery through lo is already local. Only Ethernet output needs
+       * the extra multicast copy controlled by IP_MULTICAST_LOOP. */
+      || (netif == netif_get_loopif() && ip4_addr_ismulticast(dest))
 #endif /* !LWIP_HAVE_LOOPIF */
      ) {
     /* Packet to self, enqueue it for loopback */

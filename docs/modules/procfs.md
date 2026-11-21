@@ -8,6 +8,20 @@
 
 每个 proc 实例固定创建者的 active PID namespace，而不是读取者的当前视图。`fsopen("proc")` 在创建配置 FD 时保留该视图，之后的创建、fsmount、bind 及 FD 继承不会替换它；legacy mount 在创建实例时捕获。动态 registry 的引用直到配置 FD 或挂载实例末引用才归还，双退休队列在 identity 锁外回收，初始静态 registry 不增加堆 owner。
 
+## 逐页查询
+
+`/proc/<pid>/pagemap` 和线程目录内的 `pagemap` 按虚拟基页输出 64 位记录。字节偏移为
+虚拟页号乘以八，读取长度与偏移都以八字节对齐。读者在保护下分批查看现有页表项，保留
+`PROT_NONE` 的已驻留页和大页内各基页的实际页帧偏移。未映射页返回零；读取不触发缺页。
+普通文件映射和共享匿名映射按已记录的物理页来源标记，私有文件页写时复制后清除文件页标志。
+当前没有交换空间，换出位恒为零。同一格式中的软脏跟踪、独占映射计数与 ioctl 扫描仍待实现。
+
+打开时以文件系统凭据检查进程观察权限，并在同一保护内取得目标地址空间的弱引用。
+文件描述符经复制或传递后仍查询原地址空间，只有打开者具有 `CAP_SYS_ADMIN` 时才输出
+物理页帧编号（Page Frame Number，PFN）。关闭描述符只归还记录引用。目标地址空间失去最后一个
+任务使用者后，页表和映射照常回收，旧描述符读到文件末尾；成功执行新程序与进程编号复用均不会
+更换旧描述符的目标。
+
 路径解析把本地 PID/TID 转为 canonical root 编号及全局 allocation generation，inode 保存后两者。后续 maps、fd、ns、comm 等资源查询继续检查这个 generation、任务资源状态和当前权限，不把 inode 中的编号解释成当前读取者的本地号。根目录和 task 目录按挂载视图的 PID bitmap 枚举，名字与 continuation cookie 使用本地号；不扫描全局任务或逐个遍历祖先。self/thread-self 也按同一挂载转换，读取者不可见时返回 ENOENT。
 
 stat/status 在 identity 锁内捕获 PID/TGID/PPID/PGID/SID 与 tracer 的 TID，外层身份在内层不可见时显示 0。NSpid/NStgid/NSpgid/NSsid 从挂载层列到任务 active 层。pidfd fdinfo 持有原 FD 的真实身份，在挂载视图中显示 Pid 与 NSpid；跨兄弟视图显示单个 0，任务已不存在显示 -1，不能用历史整数重新查找。快照的可睡眠阶段只使用已捕获的 PID 标量；资源引用与权限仍按原 proc 规则复核。

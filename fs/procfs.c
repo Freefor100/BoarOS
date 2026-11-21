@@ -94,6 +94,8 @@
 #define PROC_PID_CHILDREN_NS_KIND 27U
 #define PROC_PID_IO_KIND 28U
 #define PROC_IO_BITS 0x308U
+#define PROC_PID_PAGEMAP_KIND 29U
+#define PROC_PAGEMAP_BITS 0x30aU
 #define PROC_CGROUP_BITS 0x304U
 #define PROC_COMM_BITS 0x302U
 #define PROC_NS_DIR_BITS 0x100U
@@ -145,6 +147,8 @@ static uint64_t proc_pid_inode(kernel_pid_t pid, uint64_t identity,
 {
     if (kind == PROC_PID_IO_KIND)
         return proc_pid_inode_fd(pid, identity, PROC_PID_MOUNTS_KIND, PROC_IO_BITS);
+    if (kind == PROC_PID_PAGEMAP_KIND)
+        return proc_pid_inode_fd(pid, identity, PROC_PID_MOUNTS_KIND, PROC_PAGEMAP_BITS);
     if (kind == PROC_PID_FILTER_KIND)
         return proc_pid_inode_fd(pid, identity, PROC_PID_MOUNTS_KIND,
             PROC_FILTER_BITS);
@@ -170,7 +174,8 @@ static uint64_t proc_pid_inode(kernel_pid_t pid, uint64_t identity,
 static uint64_t proc_thread_resource_inode(kernel_pid_t pid, uint64_t identity,
                                             uint8_t kind, uint16_t fd)
 {
-    if (kind == PROC_PID_NS_DIR_KIND || proc_namespace_type(kind) || kind==PROC_PID_MOUNTINFO_KIND || kind==PROC_PID_IO_KIND)
+    if (kind == PROC_PID_NS_DIR_KIND || proc_namespace_type(kind) ||
+        kind == PROC_PID_MOUNTINFO_KIND || kind == PROC_PID_IO_KIND || kind == PROC_PID_PAGEMAP_KIND)
         return proc_pid_inode(pid,identity,kind)|(UINT64_C(1)<<16U);
     if (kind == PROC_PID_FD_LINK_KIND || kind == PROC_PID_FDINFO_KIND)
         return proc_pid_inode_fd(pid, identity,
@@ -204,6 +209,7 @@ static uint8_t proc_inode_kind(uint64_t inode)
         if(encoded==PROC_MOUNTINFO_BITS)return PROC_PID_MOUNTINFO_KIND;
         if(encoded==PROC_FILTER_BITS)return PROC_PID_FILTER_KIND;
         if(encoded==PROC_IO_BITS)return PROC_PID_IO_KIND;
+        if(encoded==PROC_PAGEMAP_BITS)return PROC_PID_PAGEMAP_KIND;
         if(encoded==PROC_CGROUP_BITS)return (inode & (UINT64_C(1)<<16U)) ? PROC_TID_CGROUP_KIND : PROC_PID_CGROUP_KIND;
         if(encoded==PROC_COMM_BITS)return (inode & (UINT64_C(1)<<16U)) ? PROC_TID_COMM_KIND : PROC_PID_COMM_KIND;
     }
@@ -227,7 +233,8 @@ static uint32_t proc_kind_mode(uint8_t kind)
     if (kind == PROC_PID_EXE_KIND || kind == PROC_PID_CWD_KIND ||
         kind == PROC_PID_ROOT_KIND || kind == PROC_PID_FD_LINK_KIND || proc_namespace_type(kind))
         return KERNEL_VFS_S_IFLNK | 0777U;
-    if (kind == PROC_PID_IO_KIND) return KERNEL_VFS_S_IFREG | 0400U;
+    if (kind == PROC_PID_IO_KIND || kind == PROC_PID_PAGEMAP_KIND)
+        return KERNEL_VFS_S_IFREG | 0400U;
     return KERNEL_VFS_S_IFREG | ((kind == PROC_PID_COMM_KIND || kind == PROC_TID_COMM_KIND || kind == PROC_PID_FILTER_KIND) ? 0644U : 0444U);
 }
 
@@ -412,7 +419,8 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
                 ? PROC_PID_MOUNTINFO_KIND : length == 4U && !memcmp(name,"comm",length)
                 ? PROC_TID_COMM_KIND : length == 6U && !memcmp(name,"cgroup",length)
                 ? PROC_TID_CGROUP_KIND : length == 2U && !memcmp(name,"io",length)
-                ? PROC_PID_IO_KIND : 0;
+                ? PROC_PID_IO_KIND : length == 7U && !memcmp(name,"pagemap",length)
+                ? PROC_PID_PAGEMAP_KIND : 0;
             if (!kind) return -KERNEL_ENOENT;
             if (kind != PROC_TID_STAT_KIND && kind != PROC_TID_STATUS_KIND && kind != PROC_TID_COMM_KIND && kind != PROC_TID_CGROUP_KIND &&
                 kernel_proc_thread_resources_live(pid, identity))
@@ -452,6 +460,8 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
             kind = PROC_PID_STATUS_KIND;
         else if (length == 2U && !memcmp(name,"io",length))
             kind = PROC_PID_IO_KIND;
+        else if (length == 7U && !memcmp(name,"pagemap",length))
+            kind = PROC_PID_PAGEMAP_KIND;
         else if (length == 15U && !memcmp(name, "coredump_filter", length))
             kind = PROC_PID_FILTER_KIND;
         else if (length == 6U && !memcmp(name, "cgroup", length))
@@ -580,6 +590,7 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
           proc_inode_kind(inode) != PROC_PID_STAT_KIND &&
           proc_inode_kind(inode) != PROC_PID_STATUS_KIND &&
           proc_inode_kind(inode) != PROC_PID_IO_KIND &&
+          proc_inode_kind(inode) != PROC_PID_PAGEMAP_KIND &&
           proc_inode_kind(inode) != PROC_PID_FD_DIR_KIND &&
           proc_inode_kind(inode) != PROC_PID_FD_LINK_KIND &&
           proc_inode_kind(inode) != PROC_TASK_DIR_KIND &&
@@ -855,12 +866,12 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
                 *type = 4U;
                 return 1;
             }
-            if (position > 15U) return 0;
+            if (position > 16U) return 0;
             const char *entry = position == 0 ? "." : position == 1 ? ".." :
                 position == 2 ? "stat" : position == 3 ? "status" :
                 position == 4 ? "exe" : position == 5 ? "cwd" :
                 position == 6 ? "root" : position == 7 ? "maps" :
-                position == 8 ? "fd" : position==9?"fdinfo":position==10?"ns":position==11?"mounts":position==12?"mountinfo":position==13?"comm":position==14?"cgroup":"io";
+                position == 8 ? "fd" : position==9?"fdinfo":position==10?"ns":position==11?"mounts":position==12?"mountinfo":position==13?"comm":position==14?"cgroup":position==15?"io":"pagemap";
             if (name_size <= strlen(entry)) return -KERNEL_ERANGE;
             strcpy(name, entry);
             *next_position = position + 1;
@@ -883,7 +894,7 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
                 position == 6 ? PROC_PID_ROOT_KIND : position == 7 ? PROC_PID_MAPS_KIND :
                 position == 8 ? PROC_PID_FD_DIR_KIND : position==9?PROC_PID_FDINFO_DIR_KIND:
                 position==10?PROC_PID_NS_DIR_KIND:position==11?PROC_PID_MOUNTS_KIND:
-                position==12?PROC_PID_MOUNTINFO_KIND:PROC_PID_IO_KIND, 0);
+                position==12?PROC_PID_MOUNTINFO_KIND:position==15?PROC_PID_IO_KIND:PROC_PID_PAGEMAP_KIND, 0);
             return 1;
         }
         if (proc_inode_kind(directory) == PROC_PID_FD_DIR_KIND ||
@@ -915,7 +926,7 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
             *type = 4U;
             return 1;
         }
-        if (position > 17U) return 0;
+        if (position > 18U) return 0;
         const char *entry = position == 0U ? "." :
                             position == 1U ? ".." :
                             position == 2U ? "exe" :
@@ -924,7 +935,7 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
                             position == 5U ? "mounts" :
                             position == 6U ? "stat" :
                             position == 7U ? "status" : position == 8U ? "fd" :
-                            position == 9U ? "task" : position==10U?"maps":position==11U?"fdinfo":position==12U?"ns":position==13U?"mountinfo":position==14U?"comm":position==15U?"cgroup":position==16U?"coredump_filter":"io";
+                            position == 9U ? "task" : position==10U?"maps":position==11U?"fdinfo":position==12U?"ns":position==13U?"mountinfo":position==14U?"comm":position==15U?"cgroup":position==16U?"coredump_filter":position==17U?"io":"pagemap";
         if (name_size < strlen(entry) + 1U) return -KERNEL_ERANGE;
         strcpy(name, entry);
         *next_position = position + 1U;
@@ -939,7 +950,7 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
                      position == 7U ? PROC_PID_STATUS_KIND :
                      position == 8U ? PROC_PID_FD_DIR_KIND :
                      position == 9U ? PROC_TASK_DIR_KIND : position==10U?PROC_PID_MAPS_KIND:
-                     position==11U?PROC_PID_FDINFO_DIR_KIND:position==12U?PROC_PID_NS_DIR_KIND:position==13U?PROC_PID_MOUNTINFO_KIND:position==14U?PROC_PID_COMM_KIND:position==15U?PROC_PID_CGROUP_KIND:position==16U?PROC_PID_FILTER_KIND:PROC_PID_IO_KIND);
+                     position==11U?PROC_PID_FDINFO_DIR_KIND:position==12U?PROC_PID_NS_DIR_KIND:position==13U?PROC_PID_MOUNTINFO_KIND:position==14U?PROC_PID_COMM_KIND:position==15U?PROC_PID_CGROUP_KIND:position==16U?PROC_PID_FILTER_KIND:position==17U?PROC_PID_IO_KIND:PROC_PID_PAGEMAP_KIND);
         *type = position < 2U || position == 8U || position == 9U || position==11U || position==12U ? 4U :
                 position >= 5U ? 8U : 10U;
         return 1;
@@ -2396,6 +2407,21 @@ int kernel_procfs_ipc_file(const struct kernel_vfs_file *file)
     const struct kernel_vfs_node *node=file->private_data;
     return node && (node->inode==PROC_SYSVIPC_SHM_INODE ||
         node->inode==PROC_SYSVIPC_SEM_INODE || node->inode==PROC_SYSVIPC_MSG_INODE);
+}
+
+int kernel_procfs_pagemap_open(const struct kernel_vfs_file *file,
+    struct kernel_heap *heap, struct kernel_mm_pagemap **owner)
+{
+    const struct kernel_vfs_node *node = file->private_data;
+    if (!node || !kernel_procfs_is_mount(file->mount) ||
+        proc_inode_kind(node->inode) != PROC_PID_PAGEMAP_KIND) return 0;
+    struct kernel_mm_pagemap *view;
+    if (kernel_heap_allocate(heap, sizeof(*view), (void **)&view)) return -KERNEL_ENOMEM;
+    int error = kernel_proc_pagemap_open(proc_inode_pid(node->inode),
+        proc_resource_identity(node->inode), view);
+    if (error) kernel_heap_release(heap, view);
+    else *owner = view;
+    return error;
 }
 
 struct kernel_pid *kernel_procfs_process_identity(const struct kernel_vfs_file *file)

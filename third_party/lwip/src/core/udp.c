@@ -402,7 +402,7 @@ udp_input(struct pbuf *p, struct netif *inp)
       }
     }
 #endif /* CHECKSUM_CHECK_UDP */
-    if(ip_current_is_v6() && ip6_addr_ismulticast(ip6_current_dest_addr())) {
+    if(ip_addr_ismulticast(ip_current_dest_addr())) {
       /* All local and connected-peer predicates apply to each recipient.
        * Socket targets share immutable storage with independent BPF limits;
        * raw lwIP callbacks retain their legacy private mutable payload. */
@@ -415,7 +415,8 @@ udp_input(struct pbuf *p, struct netif *inp)
         if(target->recv) {
           struct pbuf *copy=pbuf_clone(PBUF_RAW,PBUF_POOL,p);
           if(copy) {
-            if(boaros_lwip_udp_ingress_filter(target,copy,inp,1,network,ip_current_header_tot_len(),UDP_HLEN) &&
+            if(boaros_lwip_udp_ingress_filter(target,copy,inp,ip_current_is_v6(),
+                network,ip_current_header_tot_len(),UDP_HLEN) &&
                !pbuf_remove_header(copy,UDP_HLEN))target->recv(target->recv_arg,target,copy,ip_current_src_addr(),src);
             else pbuf_free(copy);
           }
