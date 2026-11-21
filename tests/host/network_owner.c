@@ -2836,6 +2836,75 @@ static void tcp_close_capacity_retry(int capacity_before_close)
     printf("PASS TCP close transfers the NIC retry with capacity %s close\n",
         capacity_before_close ? "before" : "after");
 }
+
+static void tcp_passive_capacity_retry(int cancel)
+{
+    struct virtio_net_device device = {0};
+    struct kernel_network network = {.device = &device};
+    ip4_addr_t local, mask, gateway = {0};
+    IP4_ADDR(&local, 10, 77, 0, 2);
+    IP4_ADDR(&mask, 255, 255, 255, 0);
+    kernel_socket_network_initialize();
+    CHECK(netif_add(&network.interface, &local, &mask, &gateway, &network, physical_init, ip_input));
+    netif_set_up(&network.interface);
+    netif_set_link_up(&network.interface);
+    struct kernel_socket *listener = NULL;
+    struct kernel_socket_address address = {
+        .family = KERNEL_SOCKET_AF_INET, .port = 22000, .bytes = {10, 77, 0, 2},
+    };
+    CHECK(!kernel_socket_create(&test_heap, KERNEL_SOCKET_AF_INET, SOCKET_STREAM, 0, &listener));
+    CHECK(!kernel_socket_bind(listener, &address) && !kernel_socket_listen(listener, 2));
+    struct kernel_socket_protocol_scope scope;
+    kernel_socket_protocol_enter(&scope);
+    struct pbuf *packet = pbuf_alloc(PBUF_RAW, TCP_HLEN, PBUF_RAM);
+    CHECK(packet);
+    struct tcp_hdr *header = packet->payload;
+    *header = (struct tcp_hdr){
+        .src = lwip_htons(22001), .dest = lwip_htons(address.port),
+        .seqno = lwip_htonl(100), .wnd = lwip_htons(TCP_WND),
+    };
+    TCPH_HDRLEN_FLAGS_SET(header, 5, TCP_SYN);
+    struct ip_globals saved = ip_data;
+    IP_ADDR4(&ip_data.current_iphdr_src, 10, 77, 0, 1);
+    ip_addr_copy_from_ip4(ip_data.current_iphdr_dest, local);
+    ip_data.current_netif = ip_data.current_input_netif = &network.interface;
+    header->chksum = ip_chksum_pseudo(packet, IP_PROTO_TCP, TCP_HLEN,
+        &ip_data.current_iphdr_src, &ip_data.current_iphdr_dest);
+    unsigned attempts = copy_attempts, sent = copied_packets;
+    uint64_t frozen = clock_ns;
+    nic_full = 1;
+    tcp_input(packet, &network.interface);
+    ip_data = saved;
+    struct tcp_pcb *half_open = tcp_active_pcbs;
+    CHECK(half_open && half_open->state == SYN_RCVD && half_open->unsent);
+    CHECK(copy_attempts == attempts + 1 && copied_packets == sent);
+    if (cancel) tcp_abandon(half_open, 0);
+    kernel_socket_protocol_leave(&scope);
+
+    const struct kernel_socket_service_budget budget = {8, 8, 0};
+    kernel_socket_service_pending(budget);
+    CHECK(copy_attempts == attempts + 1);
+    if (!cancel) {
+        kernel_socket_network_capacity();
+        kernel_socket_service_pending(budget);
+        CHECK(copy_attempts == attempts + 2 && copied_packets == sent);
+    }
+    nic_full = 0;
+    kernel_socket_network_capacity();
+    kernel_socket_service_pending(budget);
+    CHECK(copied_packets == sent + !cancel && clock_ns == frozen);
+    if (!cancel) {
+        kernel_socket_protocol_enter(&scope);
+        CHECK(half_open->unacked && !half_open->unsent);
+        tcp_abandon(half_open, 0);
+        kernel_socket_protocol_leave(&scope);
+    }
+    kernel_socket_destroy(listener);
+    netif_set_down(&network.interface);
+    netif_remove(&network.interface);
+    CHECK(!heap_live && !tcp_active_pcbs);
+    puts("PASS passive TCP open retries on device capacity and preserves cancellation");
+}
 struct completed_output_write {
     struct kernel_socket *socket;
     struct kernel_open_file_description *pin;
@@ -5317,6 +5386,10 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "tcp-close-capacity-retry")) {
         tcp_close_capacity_retry(0);
         tcp_close_capacity_retry(1);
+    }
+    else if (!strcmp(argv[1], "tcp-passive-capacity-retry")) {
+        tcp_passive_capacity_retry(0);
+        tcp_passive_capacity_retry(1);
     }
     else if (!strcmp(argv[1], "tcp-loopback-checksum")) tcp_loopback_checksum();
 #if BOAROS_USER_SMP
