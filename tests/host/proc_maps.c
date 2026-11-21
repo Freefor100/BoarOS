@@ -44,6 +44,18 @@ int kernel_proc_maps_snapshot(kernel_pid_t pid, uint64_t identity,
     memcpy(*rows, fixture, sizeof(fixture)); *count = 6; references++;
     return 0;
 }
+int kernel_proc_io_snapshot(kernel_pid_t pid, uint64_t identity,
+    struct kernel_proc_io_counters *counts)
+{
+    int thread = (identity & KERNEL_PROC_THREAD_TARGET) != 0;
+    assert(pid == (thread ? 43 : 42));
+    assert((identity & ~KERNEL_PROC_THREAD_TARGET) == (thread ? 18U : 17U));
+    *counts = (struct kernel_proc_io_counters){
+        .rchar = thread ? 1U : 10U, .wchar = 80, .syscr = 2, .syscw = 1,
+        .read_bytes = 512, .write_bytes = 4096, .cancelled_write_bytes = 4096,
+    };
+    return 0;
+}
 const struct kernel_vfs_file *kernel_open_file_vfs_borrow(const struct kernel_open_file_description *file)
 { assert((uintptr_t)file == 1 && references); return &backing; }
 struct kernel_vfs_path *kernel_open_file_path(const struct kernel_open_file_description *file)
@@ -169,8 +181,8 @@ int main(void)
     assert(!strcmp(name, "maps") && next == 11 && inode == node.inode && type == 8);
     assert(proc_dir_entry(&dir, next, &next, &inode, &type, name, sizeof(name))==1);
     assert(!strcmp(name,"fdinfo") && type==4);
-    const char *tail_names[]={"ns","mountinfo","comm","cgroup","coredump_filter"};
-    for(unsigned i=0;i<5;i++) {
+    const char *tail_names[]={"ns","mountinfo","comm","cgroup","coredump_filter","io"};
+    for(unsigned i=0;i<sizeof(tail_names)/sizeof(tail_names[0]);i++) {
         assert(proc_dir_entry(&dir,next,&next,&inode,&type,name,sizeof(name))==1);
         assert(!strcmp(name,tail_names[i]));
     }
@@ -185,6 +197,23 @@ int main(void)
         assert(proc_inode_is_thread(found) && proc_inode_pid(found) == 43 && proc_inode_identity(found) == 18);
         assert(proc_dir_entry(&tdir, i + 2, &next, &inode, &type, name, sizeof(name)) == 1);
         assert(!strcmp(name, thread_names[i]) && inode == found && next == i + 3);
+    }
+    for (unsigned thread = 0; thread < 2; thread++) {
+        struct kernel_vfs_file *parent = thread ? &tdir : &dir;
+        uint64_t found;
+        assert(!proc_lookup(0, thread ? thread_dir : directory, "io", 2, &found, &mode));
+        assert(mode == (KERNEL_VFS_S_IFREG | 0400U));
+        assert(proc_dir_entry(parent, thread ? 15U : 17U, &next, &inode, &type, name, sizeof(name)) == 1);
+        assert(!strcmp(name, "io") && inode == found && type == 8U);
+        struct kernel_vfs_node io_node = {.inode=found};
+        char *counters = NULL;
+        size_t size;
+        assert(!proc_io_snapshot(&io_node, &heap, &counters, &size));
+        const char *expected = thread ?
+            "rchar: 1\nwchar: 80\nsyscr: 2\nsyscw: 1\nread_bytes: 512\nwrite_bytes: 4096\ncancelled_write_bytes: 4096\n" :
+            "rchar: 10\nwchar: 80\nsyscr: 2\nsyscw: 1\nread_bytes: 512\nwrite_bytes: 4096\ncancelled_write_bytes: 4096\n";
+        assert(strlen(expected) == size && !memcmp(counters, expected, size));
+        kernel_heap_release(&heap, counters);
     }
     /* TID identity can remain visible after resources begin exiting. */
     thread_exiting = 1;

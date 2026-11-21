@@ -3,6 +3,12 @@
 #include <stdint.h>
 struct kernel_task;
 struct kernel_linux_rusage;
+struct kernel_task_usage {
+    uint64_t user_ns, kernel_ns;
+    uint64_t minor_faults, major_faults, maxrss_pages;
+    uint64_t voluntary, involuntary, read_bytes, write_bytes;
+    uint64_t rchar, wchar, syscr, syscw, cancelled_write_bytes;
+};
 struct kernel_cpu_account_scope { struct kernel_task *task; uint32_t restore_mode; };
 /* 架构trap/返回入口已关闭本地IRQ；数值发布期间不等待、不迁移。 */
 void kernel_cpu_account_trap_begin(struct kernel_cpu_account_scope *, int user, int interrupt);
@@ -13,6 +19,11 @@ int kernel_task_cpu_clock(struct kernel_task *, int32_t clock, int resolution, u
 /* I/O在实际发起/首次弄脏时记给原调用者，背景执行沿现有account_task借用。 */
 void kernel_task_account_read(uint64_t bytes);
 void kernel_task_account_write(uint64_t bytes);
+void kernel_task_account_cancelled_write(uint64_t bytes);
+void kernel_task_account_io_return(struct kernel_task *, int64_t completed, unsigned directions);
+#define KERNEL_IO_ACCOUNT_READ 1U
+#define KERNEL_IO_ACCOUNT_WRITE 2U
+#define KERNEL_IO_ACCOUNT_VECTOR 4U
 uint64_t kernel_task_read_bytes(const struct kernel_task *);
 void kernel_task_account_fault(struct kernel_task *, int major);
 #endif

@@ -18,6 +18,8 @@ struct bpf_inode {
     char name[256];
     struct bpf_object *object;
     struct kernel_memory_object *memory;
+    uint64_t attribute_key, attribute_generation;
+    int (*attribute_snapshot)(uint64_t, uint64_t, struct kernel_heap *, char **, size_t *);
 };
 struct bpf_fs {
     struct kernel_vfs_mount mount;
@@ -38,14 +40,14 @@ static void destroy_inode(struct bpf_fs *f,struct bpf_inode *n)
 {if(n->object)bpf_object_put(n->object);if(n->memory)kernel_memory_object_release(&n->memory);kernel_heap_release(f->instance.heap,n);}
 static struct kernel_vfs_timespec now(void)
 {uint64_t n=kernel_time_realtime_ns();return (struct kernel_vfs_timespec){n/1000000000,n%1000000000};}
-static int add(struct bpf_fs *f,uint64_t parent,const char *name,uint32_t mode,
-    struct bpf_object *object,const void *data,size_t size)
+static int add_node(struct bpf_fs *f,uint64_t parent,const char *name,uint32_t mode,
+    struct bpf_object *object,const void *data,size_t size,const struct bpf_fs_attribute *attribute)
 {
     size_t length=strlen(name);if(length>255)return -KERNEL_ENAMETOOLONG;
     if(child(f,parent,name,length))return -KERNEL_EEXIST;
     if(f->next_inode==UINT64_MAX)return -KERNEL_EOVERFLOW;
     struct bpf_inode *n=0;int r=allocate(f->instance.heap,sizeof(*n),(void **)&n);if(r)return r;
-    if(!object && (mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFREG) {
+    if (!object && !attribute && (mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFREG) {
         enum kernel_memory_object_status status=kernel_memory_object_create(
             f->instance.heap,f->instance.heap->page_allocator,&n->memory);
         if(status)r=status==KERNEL_MEMORY_OBJECT_NO_MEMORY?-KERNEL_ENOMEM:-KERNEL_EIO;
@@ -69,11 +71,19 @@ static int add(struct bpf_fs *f,uint64_t parent,const char *name,uint32_t mode,
         .mode=mode,.uid=c->fsuid,.gid=c->fsgid,.nlink=(mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR?2:1,
         .size=size,.blksize=4096,.atime=time,.mtime=time,.ctime=time};
     memcpy(n->name,name,length+1);n->parent=parent;n->linked=1;n->object=object;
+    if (attribute) {
+        n->attribute_key = attribute->key;
+        n->attribute_generation = attribute->generation;
+        n->attribute_snapshot = attribute->snapshot;
+    }
     if(object)bpf_object_get(object);
     struct bpf_inode *p=inode(f,parent);
     if(p && p!=n){if((mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR)p->stat.nlink++;p->stat.mtime=p->stat.ctime=time;}
     n->next=f->entries;f->entries=n;return 0;
 }
+static int add(struct bpf_fs *f,uint64_t parent,const char *name,uint32_t mode,
+    struct bpf_object *object,const void *data,size_t size)
+{ return add_node(f,parent,name,mode,object,data,size,NULL); }
 static int error(struct kernel_vfs_instance *i){(void)i;return 0;}
 static int root(struct kernel_vfs_instance *i,uint64_t *id,uint32_t *mode)
 {*id=1;*mode=inode(fs(i),1)->stat.mode;return 0;}
@@ -216,6 +226,20 @@ static int check_domain(const struct kernel_vfs_node *node,const struct kernel_h
 }
 static int pin_control(struct kernel_vfs_node *n,int write,uint64_t *offset,char *bytes,size_t size,size_t *count)
 {(void)n;(void)write;(void)offset;(void)bytes;(void)size;*count=0;return -KERNEL_EINVAL;}
+
+static int is_attribute(const struct kernel_vfs_node *node)
+{ return node && ((const struct bpf_inode *)node->backend_data)->attribute_snapshot != NULL; }
+
+static int snapshot_attribute(struct kernel_vfs_node *node, struct kernel_heap *heap,
+    struct kernel_namespace *space, struct kernel_pid_registry *view, char **data, size_t *length)
+{
+    (void)space;
+    (void)view;
+    const struct bpf_inode *inode = node->backend_data;
+    return inode->attribute_snapshot(inode->attribute_key, inode->attribute_generation,
+        heap, data, length);
+}
+
 static int unmount(struct kernel_vfs_mount *m)
 {
     struct bpf_fs *f=fs(m->private_data);struct kernel_vfs_instance *i=&f->instance;
@@ -225,14 +249,16 @@ static int unmount(struct kernel_vfs_mount *m)
 }
 static struct kernel_vfs_backend bpf_ops={
     .read_execution=KERNEL_VFS_EXECUTION_CALLER,.file_operation_execution=KERNEL_VFS_EXECUTION_CALLER,.namespace_execution=KERNEL_VFS_EXECUTION_CALLER,
-    .check_domain=check_domain,.control=pin_control,
+    .check_domain=check_domain,.control=pin_control,.snapshot=snapshot_attribute,.is_generated=is_attribute,
     .error=error,.root=root,.lookup=lookup,.open=open_inode,.close_node=close_node,
     .mkdir=mkdir_inode,.unlink=unlink_inode,.rmdir=rmdir_inode,.rename=rename_inode,
     .stat=stat_inode,.statfs=statfs_inode,.set_mode=set_mode,.set_owner=set_owner,.set_times=set_times,
     .accessed=accessed,.modified=modified,.truncate=no_truncate,.writeback_allowed=error,.flush=error,
     .release_unlinked=release_unlinked,.dir_entry=dir_entry,.pread=pread_inode,.unmount=unmount,
 };
-int bpf_metadata_mount(struct kernel_heap *h,uint64_t flags,uint64_t magic,const struct bpf_fs_entry *entries,size_t count,struct kernel_vfs_mount **out)
+int bpf_metadata_mount_attributes(struct kernel_heap *h,uint64_t flags,uint64_t magic,
+    const struct bpf_fs_entry *entries,size_t count,const struct bpf_fs_attribute *attrs,
+    size_t attributes,struct kernel_vfs_mount **out)
 {
     if(!h || !out || *out)return -KERNEL_EINVAL;
     struct bpf_fs *f=0;int r=allocate(h,sizeof(*f),(void **)&f);if(r)return r;
@@ -243,9 +269,14 @@ int bpf_metadata_mount(struct kernel_heap *h,uint64_t flags,uint64_t magic,const
     f->mount.private_data=&f->instance;f->mount.id=kernel_vfs_allocate_mount_id();f->mount.state=VFS_MOUNT_STATE_LIVE;
     r=add(f,1,"",KERNEL_VFS_S_IFDIR|(magic==BPF_FS_MAGIC?01777:0555),0,0,0);
     for(size_t j=0;!r&&j<count;j++)r=add(f,entries[j].parent,entries[j].name,entries[j].mode,0,entries[j].data,entries[j].size);
+    for (size_t j = 0; !r && j < attributes; j++)
+        r = add_node(f, attrs[j].parent, attrs[j].name, KERNEL_VFS_S_IFREG|0444, NULL, NULL, 0, &attrs[j]);
     if(r){unmount(&f->mount);return r;}
     kernel_vfs_mount_initialize(&f->mount);*out=&f->mount;return 0;
 }
+int bpf_metadata_mount(struct kernel_heap *h,uint64_t flags,uint64_t magic,
+    const struct bpf_fs_entry *entries,size_t count,struct kernel_vfs_mount **out)
+{ return bpf_metadata_mount_attributes(h,flags,magic,entries,count,NULL,0,out); }
 int kernel_bpffs_mount(struct kernel_heap *h,uint64_t flags,struct kernel_vfs_mount **out)
 {return bpf_metadata_mount(h,flags,BPF_FS_MAGIC,0,0,out);}
 int kernel_vfs_bpf_pin_at(struct kernel_vfs_path *,struct kernel_vfs_path *,const char *,struct bpf_object *,uint32_t);

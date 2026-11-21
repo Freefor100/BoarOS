@@ -2,11 +2,15 @@
  * permission metadata, immutable read data and object owners remain real. */
 #include "../../fs/vfs_objects.h"
 #include <kernel/errno.h>
+#include <kernel/block.h>
 #include <string.h>
 #include "pseudo_fs_fixture.h"
 #include "../../kernel/bpf/private.h"
 #include <kernel/trace_events.h>
 int kernel_bpf_initialize(struct kernel_heap *h){assert(h==&heap);return 0;}
+void kernel_task_account_read(uint64_t size) { (void)size; }
+static uint64_t stat_clock;
+uint64_t kernel_time_monotonic_ns(void) { return stat_clock; }
 static unsigned fail_physical;
 enum physical_page_status __real_physical_page_allocate(struct physical_page_allocator *,uint64_t *);
 enum physical_page_status __wrap_physical_page_allocate(struct physical_page_allocator *a,uint64_t *out)
@@ -96,14 +100,92 @@ static void metadata(void)
     assert(n==sizeof(kernel_btf_bytes)-1&&!memcmp(bytes,kernel_btf_bytes+1,n));
     close_file(&f);assert(!ops(m)->unmount(m));
 }
+
+static enum kernel_block_status stat_read(void *context, uint64_t offset,
+    void *buffer, size_t size)
+{
+    struct kernel_block_device *part = context;
+    struct kernel_block_usage usage;
+    assert(!kernel_block_stat(part->device_number, part->registration_generation, &usage));
+    assert(usage.in_flight == 1);
+    stat_clock += 3000000U;
+    if (offset == 1024) return KERNEL_BLOCK_STATUS_IO;
+    memset(buffer, 0, size);
+    return KERNEL_BLOCK_STATUS_OK;
+}
+
+static void block_stat(struct kernel_vfs_mount *m, uint64_t parent, uint64_t *ops_read,
+    uint64_t *sectors_read, uint64_t *busy_ms)
+{
+    struct kernel_vfs_file f = {0};
+    open_id(m, find(m, parent, "stat", 0), &f);
+    char *data = NULL;
+    size_t length;
+    assert(ops(m)->snapshot);
+    assert(!ops(m)->snapshot(f.private_data, &heap, NULL, NULL, &data, &length));
+    assert(length < 512);
+    char line[512];
+    memcpy(line, data, length);
+    line[length] = 0;
+    unsigned long long count, sectors, busy;
+    assert(sscanf(line, "%llu %*u %llu %*u %*u %*u %*u %*u %*u %llu",
+                  &count, &sectors, &busy) == 3);
+    *ops_read = count;
+    *sectors_read = sectors;
+    *busy_ms = busy;
+    kernel_heap_release(&heap, data);
+    close_file(&f);
+}
+
+static void block_metadata(void)
+{
+    struct kernel_block_device disk = {
+        .capacity_bytes = 4096, .logical_block_size = 512, .read = stat_read,
+    };
+    struct kernel_block_device part = {
+        .parent = &disk, .start_bytes = 512, .capacity_bytes = 1024, .logical_block_size = 512,
+    };
+    disk.context = &part;
+    uint64_t dev = KERNEL_BLOCK_DEVICE_NUMBER(0);
+    assert(!kernel_block_register(&disk, dev));
+    assert(!kernel_block_register(&part, dev + 1));
+    struct kernel_vfs_mount *m = NULL;
+    assert(!kernel_sysfs_mount(&heap, 0, &m));
+    uint64_t block = find(m, 1, "block", 0);
+    uint64_t vda = find(m, block, "vda", 0);
+    uint64_t vda1 = find(m, vda, "vda1", 0);
+    unsigned char data[512];
+    uint64_t reads, sectors, busy;
+    block_stat(m, vda1, &reads, &sectors, &busy);
+    assert(!reads && !sectors && !busy);
+    stat_clock = 8000000U;
+    assert(kernel_block_read_at(&part, 0, data, sizeof(data)) == KERNEL_BLOCK_STATUS_OK);
+    assert(kernel_block_read_at(&part, 512, data, sizeof(data)) == KERNEL_BLOCK_STATUS_IO);
+    block_stat(m, vda, &reads, &sectors, &busy);
+    assert(reads == 2 && sectors == 1 && busy == 6);
+    block_stat(m, vda1, &reads, &sectors, &busy);
+    assert(reads == 2 && sectors == 1 && busy == 6);
+    assert(!kernel_block_unregister(&part));
+    assert(!kernel_block_register(&part, dev + 1));
+    struct kernel_vfs_file stale = {0};
+    open_id(m, find(m, vda1, "stat", 0), &stale);
+    char *snapshot = NULL;
+    size_t length;
+    assert(ops(m)->snapshot(stale.private_data, &heap, NULL, NULL, &snapshot, &length) == -KERNEL_ENODEV);
+    close_file(&stale);
+    assert(!kernel_block_unregister(&part));
+    assert(!kernel_block_unregister(&disk));
+    assert(!ops(m)->unmount(m));
+}
+
 int main(void)
 {
     mm_test_attach(0);kernel_cpu_current()->state=KERNEL_CPU_ONLINE;
     struct boot_memory_layout layout={0};layout.usable_count=1;layout.usable[0].base=(uintptr_t)pool;layout.usable[0].size=sizeof(pool);
     assert(!physical_page_allocator_init(&pages,&layout));assert(!physical_page_allocator_bind_access(&pages,access_page));
     assert(!physical_page_allocator_finalize(&pages)&&!kernel_heap_init(&heap,&pages,page_address));
-    uint64_t baseline=physical_page_available(&pages);pins();metadata();
+    uint64_t baseline=physical_page_available(&pages);pins();metadata();block_metadata();
     struct kernel_heap_statistics s;kernel_heap_get_statistics(&heap,&s);assert(!s.live_allocations&&!s.current_pages);
     assert(physical_page_available(&pages)==baseline&&!physical_page_allocator_audit(&pages));
-    puts("PASS bpffs mount isolation, pin references, rename/unlink, busy/readonly, trace formats, sysfs bytes and final owners");
+    puts("PASS bpffs ownership, trace formats, sysfs block completion, stale device generations and final owners");
 }

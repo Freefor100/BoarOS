@@ -2,6 +2,7 @@
 #include <kernel/accounting.h>
 #include <kernel/cpu.h>
 #include <kernel/errno.h>
+#include <kernel/time.h>
 #include <arch/context.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -9,6 +10,66 @@
 
 static struct kernel_block_device *physical(struct kernel_block_device *device)
 { return device->parent ? device->parent : device; }
+
+enum block_operation { BLOCK_IO_READ, BLOCK_IO_WRITE, BLOCK_IO_FLUSH };
+
+static void block_activity(struct kernel_block_usage *usage, uint64_t now, int completing)
+{
+    uint64_t ms = now / UINT64_C(1000000);
+    uint64_t previous = __atomic_load_n(&usage->event_milliseconds, __ATOMIC_RELAXED);
+    if (ms > previous && __atomic_compare_exchange_n(&usage->event_milliseconds,
+            &previous, ms, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED) &&
+        (completing || __atomic_load_n(&usage->in_flight, __ATOMIC_RELAXED)))
+        __atomic_fetch_add(&usage->busy_milliseconds, ms - previous, __ATOMIC_RELAXED);
+}
+
+static uint64_t block_io_begin(struct kernel_block_device *device)
+{
+    uint64_t started = kernel_time_monotonic_ns();
+    for (; device; device = device->parent) {
+        block_activity(&device->usage, started, 0);
+        __atomic_fetch_add(&device->usage.in_flight, 1, __ATOMIC_RELAXED);
+    }
+    return started;
+}
+
+static void block_io_end(struct kernel_block_device *device, enum block_operation operation,
+    uint64_t started, uint64_t bytes)
+{
+    uint64_t now = kernel_time_monotonic_ns();
+    uint64_t elapsed = now - started;
+    uint64_t sectors = bytes / 512U + !!(bytes % 512U);
+    for (; device; device = device->parent) {
+        struct kernel_block_usage *usage = &device->usage;
+        struct kernel_block_stat_operation *stats = operation == BLOCK_IO_READ ? &usage->read :
+            operation == BLOCK_IO_WRITE ? &usage->write : &usage->flush;
+        block_activity(usage, now, 1);
+        __atomic_fetch_add(&stats->elapsed_ns, elapsed, __ATOMIC_RELAXED);
+        if (sectors) __atomic_fetch_add(&stats->sectors, sectors, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&stats->completed, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_sub(&usage->in_flight, 1, __ATOMIC_RELAXED);
+    }
+}
+
+static enum kernel_block_status read_backend(struct kernel_block_device *device,
+    uint64_t offset, void *buffer, size_t size)
+{
+    struct kernel_block_device *disk = physical(device);
+    uint64_t started = block_io_begin(device);
+    enum kernel_block_status result = disk->read(disk->context, device->start_bytes + offset, buffer, size);
+    block_io_end(device, BLOCK_IO_READ, started, result ? 0 : size);
+    return result;
+}
+
+static enum kernel_block_status write_backend(struct kernel_block_device *device,
+    uint64_t offset, const void *buffer, size_t size)
+{
+    struct kernel_block_device *disk = physical(device);
+    uint64_t started = block_io_begin(device);
+    enum kernel_block_status result = disk->write(disk->context, device->start_bytes + offset, buffer, size);
+    block_io_end(device, BLOCK_IO_WRITE, started, result ? 0 : size);
+    return result;
+}
 
 static char *append_number(char *out, unsigned value)
 {
@@ -152,7 +213,11 @@ enum kernel_block_status kernel_block_flush(struct kernel_block_device *device)
     KERNEL_LOCK_SCOPE(io); kernel_rwlock_write(&disk->phase_barrier, &io);
     KERNEL_LOCK_SCOPE(transfer); kernel_rwlock_write(&disk->transfer_lock, &transfer);
     if (disk->flush != 0) {
-        return disk->flush(disk->context);
+        /* FLUSH covers the whole underlying queue, regardless of its caller. */
+        uint64_t started = block_io_begin(disk);
+        enum kernel_block_status result = disk->flush(disk->context);
+        block_io_end(disk, BLOCK_IO_FLUSH, started, 0);
+        return result;
     }
     return disk->cache_mode == KERNEL_BLOCK_CACHE_WRITETHROUGH
                ? KERNEL_BLOCK_STATUS_OK : KERNEL_BLOCK_STATUS_UNSUPPORTED;
@@ -184,7 +249,7 @@ enum kernel_block_status kernel_block_read_at(
     }
 
     kernel_task_account_read(size);
-    return disk->read(disk->context, device->start_bytes + offset, buffer, size);
+    return read_backend(device, offset, buffer, size);
 }
 
 enum kernel_block_status kernel_block_write_at(
@@ -217,7 +282,7 @@ enum kernel_block_status kernel_block_write_at(
     }
 
     if (kernel_block_read_only(device)) return KERNEL_BLOCK_STATUS_READ_ONLY;
-    return disk->write(disk->context, device->start_bytes + offset, buffer, size);
+    return write_backend(device, offset, buffer, size);
 }
 
 #define PARTITION_SMALL_BATCH 4U
@@ -280,7 +345,7 @@ enum kernel_block_status kernel_block_write_batch_prio(
     }
     const uint64_t limit = capacity(device);
     int nonempty = 0;
-    uint64_t first=UINT64_MAX,last=0;
+    uint64_t first=UINT64_MAX,last=0,submitted=0;
     for (size_t i = 0; i < count; i++) {
         const struct kernel_block_span *span = &spans[i];
         if (span->offset > limit ||
@@ -298,20 +363,26 @@ enum kernel_block_status kernel_block_write_batch_prio(
                     return KERNEL_BLOCK_STATUS_INVALID;
         if (span->offset<first) first=span->offset;
         if (end>last) last=end;
+        submitted+=span->size;
         nonempty = 1;
     }
     if (!nonempty) return KERNEL_BLOCK_STATUS_OK;
     if (kernel_block_read_only(device)) return KERNEL_BLOCK_STATUS_READ_ONLY;
-    if (disk->write_batch_prio)
-        return device->parent ? partition_write_batch_prio(device, spans, count, priority) :
-            disk->write_batch_prio(disk->context, spans, count, priority);
-    if (disk->write_batch)
-        return device->parent ? partition_write_batch_prio(device, spans, count, priority) :
-            disk->write_batch(disk->context, spans, count);
+    if (disk->write_batch_prio || disk->write_batch) {
+        uint64_t started = block_io_begin(device);
+        enum kernel_block_status result;
+        if (device->parent)
+            result = partition_write_batch_prio(device, spans, count, priority);
+        else if (disk->write_batch_prio)
+            result = disk->write_batch_prio(disk->context, spans, count, priority);
+        else result = disk->write_batch(disk->context, spans, count);
+        block_io_end(device, BLOCK_IO_WRITE, started, result ? 0 : submitted);
+        return result;
+    }
     for (size_t i = 0; i < count; i++) {
         if (!spans[i].size) continue;
-        enum kernel_block_status result = disk->write(disk->context,
-            device->start_bytes + spans[i].offset, spans[i].buffer, spans[i].size);
+        enum kernel_block_status result = write_backend(device,
+            spans[i].offset, spans[i].buffer, spans[i].size);
         if (result != KERNEL_BLOCK_STATUS_OK) return result;
     }
     return KERNEL_BLOCK_STATUS_OK;
@@ -381,11 +452,13 @@ static __attribute__((noinline)) enum kernel_block_status write_phase_windows(
          * the phase barrier independently keeps FLUSH behind all windows. */
         KERNEL_LOCK_SCOPE(transfer);kernel_rwlock_read(&disk->transfer_lock,&transfer);
         if (disk->write_batch) {
+            uint64_t started = block_io_begin(device);
             enum kernel_block_status result=disk->write_batch(disk->context,window.spans,window.count);
+            block_io_end(device, BLOCK_IO_WRITE, started, result ? 0 : bytes);
             if (result) return result;
         } else for (size_t i=0;i<window.count;i++) {
             const struct kernel_block_span *span=&window.spans[i];
-            enum kernel_block_status result=disk->write(disk->context,span->offset,span->buffer,span->size);
+            enum kernel_block_status result=write_backend(device,span->offset-device->start_bytes,span->buffer,span->size);
             if (result) return result;
         }
     } while (!ended || pending.size);
@@ -403,7 +476,8 @@ enum kernel_block_status kernel_block_write_phase(struct kernel_block_device *de
     const uint64_t limit = capacity(device);
     const void *cursor = first;
     struct kernel_block_span span;
-    unsigned nonempty = 0;
+    uint64_t submitted = 0;
+    int nonempty = 0;
     while (next(next_context, &cursor, &span)) {
         if (span.offset > limit || span.size > limit - span.offset)
             return KERNEL_BLOCK_STATUS_OUT_OF_RANGE;
@@ -412,6 +486,7 @@ enum kernel_block_status kernel_block_write_phase(struct kernel_block_device *de
             span.offset % device->logical_block_size || span.size % device->logical_block_size ||
             write_needs_rmw(device,span.offset,span.size))
             return KERNEL_BLOCK_STATUS_INVALID;
+        submitted += span.size;
         nonempty = 1;
     }
     if (!nonempty) return KERNEL_BLOCK_STATUS_OK;
@@ -421,10 +496,13 @@ enum kernel_block_status kernel_block_write_phase(struct kernel_block_device *de
          * driver refills free request slots without draining artificial windows.
          * Aligned peers remain concurrent; RMW waits for this finite phase. */
         KERNEL_LOCK_SCOPE(transfer); kernel_rwlock_read(&disk->transfer_lock, &transfer);
-        if (!device->start_bytes)
-            return disk->write_phase(disk->context, next, next_context, first);
+        uint64_t started = block_io_begin(device);
         const struct translated_phase phase = { next, next_context, device->start_bytes };
-        return disk->write_phase(disk->context, translated_phase_next, &phase, first);
+        enum kernel_block_status result = device->start_bytes ?
+            disk->write_phase(disk->context, translated_phase_next, &phase, first) :
+            disk->write_phase(disk->context, next, next_context, first);
+        block_io_end(device, BLOCK_IO_WRITE, started, result ? 0 : submitted);
+        return result;
     }
     return write_phase_windows(device,next,next_context,first);
 }
@@ -515,13 +593,20 @@ enum kernel_block_status kernel_block_read_batch(struct kernel_block_device *dev
     /* The validated nonoverlapping destinations fit one address space.
      * Account the complete submission with one task lookup and update. */
     kernel_task_account_read(submitted);
-    if (disk->read_batch)
-        return device->parent ? partition_read_batch(device, spans, count, completion) :
+    if (disk->read_batch) {
+        uint64_t started = block_io_begin(device);
+        enum kernel_block_status result = device->parent ?
+            partition_read_batch(device, spans, count, completion) :
             disk->read_batch(disk->context, spans, count, completion);
+        uint64_t completed = 0;
+        for (size_t i = 0; i < count; i++) completed += spans[i].completed;
+        block_io_end(device, BLOCK_IO_READ, started, completed);
+        return result;
+    }
     enum kernel_block_status result = KERNEL_BLOCK_STATUS_OK;
     for (size_t i = 0; i < count; i++) {
         if (spans[i].size) {
-            spans[i].status = disk->read(disk->context, device->start_bytes + spans[i].offset, spans[i].buffer, spans[i].size);
+            spans[i].status = read_backend(device, spans[i].offset, spans[i].buffer, spans[i].size);
             if (spans[i].status == KERNEL_BLOCK_STATUS_OK) spans[i].completed = spans[i].size;
             else if (result == KERNEL_BLOCK_STATUS_OK) result = spans[i].status;
         }
@@ -532,6 +617,7 @@ enum kernel_block_status kernel_block_read_batch(struct kernel_block_device *dev
 
 static struct kernel_block_device *registered_devices;
 static kernel_block_devnode_fn devnode_publisher;
+static uint64_t registration_generation;
 
 void kernel_block_set_devnode_publisher(kernel_block_devnode_fn fn)
 {
@@ -557,6 +643,37 @@ int kernel_block_snapshot(struct kernel_block_device **devices, size_t capacity,
         }
     registry_unlock(irq);
     return 0;
+}
+
+static struct kernel_block_stat_operation block_operation_snapshot(
+    const struct kernel_block_stat_operation *operation)
+{
+    return (struct kernel_block_stat_operation){
+        .completed = __atomic_load_n(&operation->completed, __ATOMIC_RELAXED),
+        .sectors = __atomic_load_n(&operation->sectors, __ATOMIC_RELAXED),
+        .elapsed_ns = __atomic_load_n(&operation->elapsed_ns, __ATOMIC_RELAXED),
+    };
+}
+
+int kernel_block_stat(uint64_t number, uint64_t generation, struct kernel_block_usage *out)
+{
+    uintptr_t irq = registry_lock();
+    struct kernel_block_device *device = registered_devices;
+    while (device && (!device->registered || device->device_number != number ||
+            device->registration_generation != generation))
+        device = device->registry_next;
+    if (device) {
+        struct kernel_block_usage *usage = &device->usage;
+        *out = (struct kernel_block_usage){
+            .read = block_operation_snapshot(&usage->read),
+            .write = block_operation_snapshot(&usage->write),
+            .flush = block_operation_snapshot(&usage->flush),
+            .in_flight = __atomic_load_n(&usage->in_flight, __ATOMIC_RELAXED),
+            .busy_milliseconds = __atomic_load_n(&usage->busy_milliseconds, __ATOMIC_RELAXED),
+        };
+    }
+    registry_unlock(irq);
+    return device ? 0 : -KERNEL_ENODEV;
 }
 
 static void remove_device_locked(struct kernel_block_device *device)
@@ -589,6 +706,11 @@ static void activate_devices(struct kernel_block_device *const *devices, size_t 
 static int publish_devices_locked(struct kernel_block_device *const *devices,
     size_t count, uintptr_t *irq)
 {
+    for (size_t i = 0; i < count; i++) {
+        if (++registration_generation == 0) __builtin_trap();
+        devices[i]->registration_generation = registration_generation;
+        devices[i]->usage = (struct kernel_block_usage){0};
+    }
     kernel_block_devnode_fn publish = devnode_publisher;
     if (!publish) {
         for (size_t i = 0; i < count; i++) devices[i]->registered = 1;
@@ -834,16 +956,16 @@ static enum kernel_block_status byte_io(struct kernel_block_device *device,
             amount = size - size % sector;
             submitted = amount;
             if (!writing) kernel_task_account_read(amount);
-            result = writing ? disk->write(disk->context, device->start_bytes + offset, bytes, amount)
-                             : disk->read(disk->context, device->start_bytes + offset, bytes, amount);
+            result = writing ? write_backend(device, offset, bytes, amount)
+                             : read_backend(device, offset, bytes, amount);
         } else {
             submitted = span;
             kernel_task_account_read(span);
-            result = disk->read(disk->context, device->start_bytes + first, scratch, span);
+            result = read_backend(device, first, scratch, span);
             if (result != KERNEL_BLOCK_STATUS_OK) return result;
             if (writing) {
                 __builtin_memcpy((unsigned char *)scratch + within, bytes, amount);
-                result = disk->write(disk->context, device->start_bytes + first, scratch, span);
+                result = write_backend(device, first, scratch, span);
             } else __builtin_memcpy(bytes, (unsigned char *)scratch + within, amount);
         }
         if (result != KERNEL_BLOCK_STATUS_OK) return result;
@@ -956,7 +1078,7 @@ static int gpt_nonzero(const unsigned char *p, unsigned size)
 static int gpt_read(struct kernel_block_device *disk, uint64_t lba, unsigned char sector[512])
 {
     kernel_task_account_read(512);
-    return disk->read(disk->context, lba * 512, sector, 512) == KERNEL_BLOCK_STATUS_OK ? 0 : -KERNEL_EIO;
+    return read_backend(disk, lba * 512, sector, 512) == KERNEL_BLOCK_STATUS_OK ? 0 : -KERNEL_EIO;
 }
 static int gpt_copy(struct kernel_block_device *disk, uint64_t where, uint64_t end,
     struct gpt_header *header, struct gpt_partition parts[KERNEL_BLOCK_GPT_PARTITIONS], size_t slots)

@@ -732,6 +732,6 @@ RV64／LA64 使用 `inotify_init1`、`inotify_add_watch` 和 `inotify_rm_watch`�
 
 memory object 在一次索引锁期间私有暂存新增页，全部分配成功后批量发布；失败只释放本次暂存页及预算，不撤销原有页和数据，不改变 EOF。复用页节点的链接保存暂存链，不分配逐页回滚数组，也不为每页增加再归还临时引用。索引容量按最终页数一次调整；已存在的映射准备页在成功预留后成为正式后备，准备者随后拒绝发布不能误删它。配额耗尽返回 `ENOSPC`，物理内存或元数据分配失败返回 `ENOMEM`。与 Linux shmem 一致，KEEP_SIZE 的预留末端超过 EOF 时也受 RLIMIT_FSIZE 约束，不能借此绕过文件大小限额。
 
-`KEEP_SIZE` 页可位于 EOF 之外：增长 ftruncate 保留它们，同尺寸或缩短 ftruncate 清除新 EOF 后的预留；打洞也能释放 EOF 之外的完整预留页。这些边界使用 Linux 同源契约核对。`tests/host/tmpfs-fallocate.sh` 检查 4 KiB/16 KiB 页、预算、分配故障和实际物理内存耗尽，`test-memory-object-concurrency-host` 另检查索引增长失败回滚与映射准备页归属。`tests/userland/tmpfs_fallocate.py` 运行 RV/LA 定向契约；其 C 程序也可在 Linux 上传入 tmpfs 文件路径运行，挂载配额分支仅在 guest 运行。现有 `SEEK_DATA/SEEK_HOLE` 接口不在本次增加的功能范围内；此处稀疏验证指真实后备页、大小和内容，不声称已有完整稀疏 seek ABI。
+`KEEP_SIZE` 页可位于 EOF 之外。增长 ftruncate 保留它们，同尺寸或缩短 ftruncate 清除新 EOF 后的预留，打洞也能释放 EOF 之外的完整预留页。这些边界使用 Linux 同源契约核对。`tests/host/tmpfs-fallocate.sh` 检查 4 KiB/16 KiB 页、预算、分配故障和实际物理内存耗尽，`test-memory-object-concurrency-host` 另检查索引增长失败回滚与映射准备页归属。`tests/userland/tmpfs_fallocate.py` 运行 RV/LA 定向契约，其 C 程序可在 Linux 上传入 tmpfs 文件路径运行，挂载配额分支仅在客户机运行。`SEEK_DATA` 和 `SEEK_HOLE` 按文件的实际后备定位，见[稀疏文件定位](vfs-ext4.md#稀疏文件定位与挂载根属性)。
 
 预留接口语义参考：[Linux fallocate(2)](https://man7.org/linux/man-pages/man2/fallocate.2.html)。

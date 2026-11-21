@@ -5087,6 +5087,47 @@ Exit:
     return result;
 }
 
+int ext4_file_seek_sparse(const ext4_file *file, uint64_t offset, uint64_t end,
+    bool seek_hole, uint64_t (*cache_seek)(void *, uint64_t, uint64_t, bool, bool),
+    void *context, uint64_t *position)
+{
+    if (offset >= end) return ENXIO;
+    const struct ext4_lock *locks = file->mp->os_locks;
+    if (locks && locks->read_lock) locks->read_lock(locks->context);
+    else EXT4_MP_LOCK(file->mp);
+
+    struct ext4_fs *fs = &file->mp->fs;
+    unsigned block_size = ext4_sb_get_block_size(&fs->sb);
+    struct ext4_inode_ref ref;
+    int result = ext4_fs_get_inode_ref_read(fs, file->inode, &ref);
+    if (result) goto unlock;
+    while (offset < end) {
+        uint64_t logical = offset / block_size;
+        uint64_t blocks = (end - 1) / block_size - logical + 1;
+        struct ext4_inode_block_range range;
+        result = ext4_fs_get_inode_dblk_range(&ref, (ext4_lblk_t)logical,
+            blocks > UINT32_MAX ? UINT32_MAX : (uint32_t)blocks, false, &range);
+        if (result) break;
+        if (!range.count) { result = EIO; break; }
+        uint64_t next = (logical + range.count) * block_size;
+        if (next > end) next = end;
+        if (!range.block || range.unwritten) {
+            uint64_t found = cache_seek(context, offset, next, seek_hole, range.unwritten);
+            if (found < next) { offset = found; break; }
+        } else if (!seek_hole) break;
+        offset = next;
+    }
+    int released = ext4_fs_put_inode_ref(&ref);
+    if (!result) result = released;
+    if (!result) {
+        if (offset == end && !seek_hole) result = ENXIO;
+        else *position = offset;
+    }
+unlock:
+    EXT4_MP_UNLOCK(file->mp);
+    return result;
+}
+
 int ext4_fpread(const ext4_file *file, uint64_t offset, void *buf, size_t size, size_t *rcnt)
 {
     if (!rcnt) return EINVAL;

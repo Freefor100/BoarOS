@@ -26,6 +26,8 @@ static void create(struct kernel_task *task, struct kernel_task *parent,
         .state=KERNEL_THREAD_STATE_READY,.parent=parent,.group_members=1};
     task->group_leader=task->group_next=task->group_previous=task;
     task->arch.user_mode=1;
+    task->limits=kernel_resource_limits_create(&scheduler.identity_heap,NULL);
+    assert(task->limits);
     kernel_wait_queue_init(&task->group_wait_queue);
     kernel_wait_queue_init(&task->child_exit_queue);
     memset(table,0,sizeof(*table));
@@ -44,6 +46,8 @@ static void cleaned_child(struct kernel_task *task,struct kernel_task *parent,ui
         .stack_physical_address=KERNEL_THREAD_NO_PAGE,.physical_address=physical};
     task->arch.user_mode=1;task->mm.state=KERNEL_MM_RELEASED;
     task->group_leader=task->group_next=task->group_previous=task;
+    task->limits=kernel_resource_limits_create(&scheduler.identity_heap,NULL);
+    assert(task->limits);
     assert(!process_identity_create(task,parent,0));
     KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
     assert(!process_identity_admit_locked(task));scheduler_task_publish_locked(task);
@@ -66,6 +70,8 @@ static void release(struct kernel_task *task)
         process_identity_release_locked(task);
     }
     process_identity_collect();
+    kernel_resource_limits_put(task->limits);
+    task->limits=NULL;
 }
 static int drain(struct kernel_task *task)
 {
@@ -119,6 +125,7 @@ static void namespace_shutdown_case(enum kernel_reboot_action reboot,int init_ca
     children(&root,&scheduler.identities);
     thread=(struct kernel_task){.magic=KERNEL_THREAD_MAGIC,.accounted=1,
         .state=KERNEL_THREAD_STATE_READY,.group_leader=&c,.group_next=&c,.group_previous=&c};
+    thread.limits=kernel_resource_limits_get(c.limits);
     assert(!process_identity_create(&thread,&c,1));
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);

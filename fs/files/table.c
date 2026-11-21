@@ -58,6 +58,7 @@ static int namespace_ioctl(struct kernel_files *files, struct kernel_open_file_d
         return error;
     }
     case 0xb703U: return ns->type; /* NS_GET_NSTYPE */
+    case 0xb704U: return -KERNEL_EINVAL; /* NS_GET_OWNER_UID requires a user namespace. */
     case 0x8004b706U: return kernel_pidns_translate(ns, (int32_t)argument, 1, 0);
     case 0x8004b707U: return kernel_pidns_translate(ns, (int32_t)argument, 1, 1);
     case 0x8004b708U: return kernel_pidns_translate(ns, (int32_t)argument, 0, 0);

@@ -68,6 +68,15 @@ typedef int (*kernel_block_phase_next_fn)(const void *context, const void **curs
 typedef enum kernel_block_status (*kernel_block_write_phase_fn)(void *context,
     kernel_block_phase_next_fn next, const void *next_context, const void *first);
 
+struct kernel_block_stat_operation {
+    uint64_t completed, sectors, elapsed_ns;
+};
+
+struct kernel_block_usage {
+    struct kernel_block_stat_operation read, write, flush;
+    uint64_t in_flight, busy_milliseconds, event_milliseconds;
+};
+
 struct kernel_block_device {
     /* Immutable while registered; each child registration retains its parent. */
     struct kernel_block_device *parent;
@@ -102,6 +111,8 @@ struct kernel_block_device {
     struct kernel_rwlock transfer_lock;
     struct kernel_block_device *pressure_parent;
     uint8_t virtual_backing;
+    uint64_t registration_generation;
+    struct kernel_block_usage usage;
 };
 
 /* Linux new_encode_dev(252, disk_index * 16); primary partitions add 1..4. */
@@ -133,6 +144,7 @@ typedef int (*kernel_block_devnode_fn)(struct kernel_block_device *const *, size
     int create, kernel_block_activate_fn activate);
 void kernel_block_set_devnode_publisher(kernel_block_devnode_fn);
 int kernel_block_snapshot(struct kernel_block_device **, size_t capacity, size_t *count);
+int kernel_block_stat(uint64_t number, uint64_t generation, struct kernel_block_usage *);
 int kernel_block_register(struct kernel_block_device *device, uint64_t number);
 int kernel_block_unregister(struct kernel_block_device *device);
 /* Explicit GPT discovery on 512-byte-sector disks. Stable zeroed children

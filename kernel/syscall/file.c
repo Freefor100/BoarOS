@@ -1,6 +1,7 @@
 #include <kernel/credentials.h>
 #include "private.h"
 
+#include <kernel/accounting.h>
 #include <kernel/errno.h>
 #include <kernel/files.h>
 #include <kernel/fs_context.h>
@@ -546,6 +547,7 @@ enum kernel_syscall_status syscall_handle_read(
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    kernel_task_account_io_return(caller, linux_result, KERNEL_IO_ACCOUNT_READ);
     decoded->value = linux_result;
     return KERNEL_SYSCALL_STATUS_OK;
 }
@@ -563,6 +565,7 @@ enum kernel_syscall_status syscall_handle_readv(
     task_status = kernel_task_files_borrow(caller, &files);
     if (task_status == KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) {
         decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+        kernel_task_account_io_return(caller, -KERNEL_EBADF, KERNEL_IO_ACCOUNT_READ | KERNEL_IO_ACCOUNT_VECTOR);
         decoded->value = -KERNEL_EBADF;
         return KERNEL_SYSCALL_STATUS_OK;
     }
@@ -577,6 +580,7 @@ enum kernel_syscall_status syscall_handle_readv(
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    kernel_task_account_io_return(caller, linux_result, KERNEL_IO_ACCOUNT_READ | KERNEL_IO_ACCOUNT_VECTOR);
     decoded->value = linux_result;
     return KERNEL_SYSCALL_STATUS_OK;
 }
@@ -595,8 +599,11 @@ enum kernel_syscall_status syscall_handle_positioned_iov(
         decoded->value = -KERNEL_EINVAL;
         return KERNEL_SYSCALL_STATUS_OK;
     }
+    unsigned direction = (request->number == 69U || request->number == 286U ?
+        KERNEL_IO_ACCOUNT_READ : KERNEL_IO_ACCOUNT_WRITE) | KERNEL_IO_ACCOUNT_VECTOR;
     enum kernel_task_status task_status = kernel_task_files_borrow(caller, &files);
     if (task_status == KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) {
+        kernel_task_account_io_return(caller, -KERNEL_EBADF, direction);
         decoded->value = -KERNEL_EBADF;
         return KERNEL_SYSCALL_STATUS_OK;
     }
@@ -616,6 +623,8 @@ enum kernel_syscall_status syscall_handle_positioned_iov(
             request->arguments[1], request->arguments[2], offset, &decoded->value)
         : kernel_files_pwritev(files, mm, (int64_t)request->arguments[0],
             request->arguments[1], request->arguments[2], offset, &decoded->value);
+    if (status == KERNEL_FILES_STATUS_OK)
+        kernel_task_account_io_return(caller, decoded->value, direction);
     return status == KERNEL_FILES_STATUS_OK ? KERNEL_SYSCALL_STATUS_OK
                                           : KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
 }
@@ -654,6 +663,7 @@ enum kernel_syscall_status syscall_handle_pread64(
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    kernel_task_account_io_return(caller, linux_result, KERNEL_IO_ACCOUNT_READ);
     decoded->value = linux_result;
     return KERNEL_SYSCALL_STATUS_OK;
 }
@@ -690,6 +700,7 @@ enum kernel_syscall_status syscall_handle_pwrite64(
                             &linux_result) != KERNEL_FILES_STATUS_OK)
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    kernel_task_account_io_return(caller, linux_result, KERNEL_IO_ACCOUNT_WRITE);
     decoded->value = linux_result;
     return KERNEL_SYSCALL_STATUS_OK;
 }
@@ -722,6 +733,7 @@ enum kernel_syscall_status syscall_handle_write(
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    kernel_task_account_io_return(caller, linux_result, KERNEL_IO_ACCOUNT_WRITE);
     decoded->value = linux_result;
     return KERNEL_SYSCALL_STATUS_OK;
 }
@@ -746,6 +758,7 @@ enum kernel_syscall_status syscall_handle_sendfile(
             request->arguments[3], &value) != KERNEL_FILES_STATUS_OK)
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    kernel_task_account_io_return(caller, value, KERNEL_IO_ACCOUNT_READ | KERNEL_IO_ACCOUNT_WRITE);
     decoded->value = value;
     return KERNEL_SYSCALL_STATUS_OK;
 }
@@ -1345,6 +1358,7 @@ enum kernel_syscall_status syscall_handle_writev(
     task_status = kernel_task_files_borrow(caller, &files);
     if (task_status == KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) {
         decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+        kernel_task_account_io_return(caller, -KERNEL_EBADF, KERNEL_IO_ACCOUNT_WRITE | KERNEL_IO_ACCOUNT_VECTOR);
         decoded->value = -KERNEL_EBADF;
         return KERNEL_SYSCALL_STATUS_OK;
     }
@@ -1360,6 +1374,7 @@ enum kernel_syscall_status syscall_handle_writev(
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    kernel_task_account_io_return(caller, linux_result, KERNEL_IO_ACCOUNT_WRITE | KERNEL_IO_ACCOUNT_VECTOR);
     decoded->value = linux_result;
     return KERNEL_SYSCALL_STATUS_OK;
 }
@@ -1807,6 +1822,7 @@ enum kernel_syscall_status syscall_handle_copy_range(struct kernel_task *caller,
         kernel_files_copy_range(files,mm,(int32_t)request->arguments[0],request->arguments[1],
             (int32_t)request->arguments[2],request->arguments[3],request->arguments[4],
             (uint32_t)request->arguments[5],&value)) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    kernel_task_account_io_return(caller, value, KERNEL_IO_ACCOUNT_READ | KERNEL_IO_ACCOUNT_WRITE);
     decoded->value=value;return KERNEL_SYSCALL_STATUS_OK;
 }
 

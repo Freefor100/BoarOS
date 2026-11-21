@@ -3805,12 +3805,43 @@ int kernel_vfs_check_write_limit(struct kernel_vfs_size_limit *limit,
     return 0;
 }
 
-size_t kernel_vfs_direct_alignment(struct kernel_vfs_file *file)
+size_t kernel_vfs_direct_alignment(const struct kernel_vfs_file *file)
 {
     struct kernel_vfs_node *node=kernel_vfs_file_node(file);
     return node && (node->mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFREG &&
         node->instance->ops->direct_alignment ?
         node->instance->ops->direct_alignment(node) : 0;
+}
+
+int kernel_vfs_seek_sparse(struct kernel_vfs_file *file, uint64_t offset, bool seek_hole, uint64_t *position)
+{
+    struct kernel_vfs_node *node = kernel_vfs_file_node(file);
+    KERNEL_LOCK_SCOPE(io);
+    /* Writeback may publish mappings under the I/O read qualification and
+     * then retire dirty entries. Exclude that handoff while querying both. */
+    kernel_vfs_node_lock(node, &io, node->instance->ops->seek_sparse != NULL);
+    uint64_t size = node->size;
+    if (offset >= size) return -KERNEL_ENXIO;
+    if (node->memory)
+        return kernel_memory_object_seek_sparse(node->memory, offset, size, seek_hole, position);
+    if (node->instance->ops->seek_sparse)
+        return node->instance->ops->seek_sparse(node, offset, size, seek_hole, position);
+    /* The generic rule treats a regular file as data up to its implicit EOF hole. */
+    *position = seek_hole ? size : offset;
+    return 0;
+}
+
+void kernel_vfs_statx_extra(const struct kernel_vfs_file *file, const struct kernel_vfs_path *path,
+    struct kernel_vfs_stat *stat, struct kernel_vfs_statx_extra *extra)
+{
+    /* A bind may expose the same inode as both an ordinary entry and a root. */
+    if (!path && file) path = file->path;
+    if (path) file = &path->file;
+    stat->attributes_mask |= KERNEL_VFS_STATX_ATTR_MOUNT_ROOT;
+    if (kernel_vfs_path_is_mount_root(path))
+        stat->attributes |= KERNEL_VFS_STATX_ATTR_MOUNT_ROOT;
+    if (file && (extra->request & KERNEL_VFS_STATX_DIOALIGN))
+        extra->dio_alignment = kernel_vfs_direct_alignment(file);
 }
 
 /* No user mapping or pin may be held here: revocation can wait for those
@@ -4476,13 +4507,15 @@ uint64_t kernel_vfs_file_size(const struct kernel_vfs_file *file)
 static int stat_at_resolved(struct kernel_vfs_path *start,
                             struct kernel_vfs_path *root, const char *path,
                             int follow_final, struct kernel_vfs_stat *stat,
-                            struct kernel_vfs_path **target,struct kernel_vfs_path *terminal)
+                            struct kernel_vfs_path **target,struct kernel_vfs_path *terminal,
+                            struct kernel_vfs_statx_extra *extra)
 {
     struct kernel_vfs_path *resolved __attribute__((cleanup(release_path_pin))) = 0;
     struct kernel_vfs_path *link __attribute__((cleanup(release_path_pin))) = 0;
     int result=path_resolve(start,root,path,follow_final,&resolved,&link,terminal);
     if (!result && resolved) {
         result = kernel_vfs_path_stat(resolved, stat);
+        if (!result && extra) kernel_vfs_statx_extra(NULL, resolved, stat, extra);
         if (target) { *target=resolved;resolved=NULL; }
     } else if (link) {
         COST_SCOPE(fallback_cost, PATH_FALLBACK_TICKS);
@@ -4492,6 +4525,7 @@ static int stat_at_resolved(struct kernel_vfs_path *start,
         result=instance->ops->stat_link ?
             instance->ops->stat_link(link->file.private_data,stat) : -KERNEL_ENOTSUP;
         if (result == -KERNEL_ENOTSUP) result = original;
+        if (!result && extra) kernel_vfs_statx_extra(NULL, NULL, stat, extra);
     }
     return result;
 }
@@ -4501,7 +4535,14 @@ int kernel_vfs_stat_at(struct kernel_vfs_path *start,
                        int follow_final, struct kernel_vfs_stat *stat)
 {
     struct kernel_vfs_path terminal={0};
-    return stat_at_resolved(start,root,path,follow_final,stat,NULL,&terminal);
+    return stat_at_resolved(start,root,path,follow_final,stat,NULL,&terminal,NULL);
+}
+
+int kernel_vfs_statx_at(struct kernel_vfs_path *start, struct kernel_vfs_path *root,
+    const char *path, int follow_final, struct kernel_vfs_stat *stat, struct kernel_vfs_statx_extra *extra)
+{
+    struct kernel_vfs_path terminal={0};
+    return stat_at_resolved(start, root, path, follow_final, stat, NULL, &terminal, extra);
 }
 
 static int access_check(const struct kernel_vfs_stat *stat,
@@ -4548,7 +4589,7 @@ int kernel_vfs_access_at(struct kernel_vfs_path *start,
     struct kernel_vfs_path *target __attribute__((cleanup(release_path_pin))) = 0;
     struct kernel_vfs_stat stat;
     struct kernel_vfs_path terminal={0};
-    int result=stat_at_resolved(start,root,path,follow_final,&stat,&target,&terminal);
+    int result=stat_at_resolved(start,root,path,follow_final,&stat,&target,&terminal,NULL);
     return result ? result : access_check(&stat,target ? target->file.mount : NULL,
                          target ? target->file.private_data : NULL,mode);
 }
@@ -6328,7 +6369,8 @@ int kernel_vfs_file_generated(const struct kernel_vfs_file *file)
     if (!file || !file->mount || !file->mount->private_data) return 0;
     struct kernel_vfs_instance *instance = file->mount->private_data;
     return instance->ops->snapshot != 0 &&
-           (file->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG;
+           (file->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG &&
+           (!instance->ops->is_generated || instance->ops->is_generated(file->private_data));
 }
 
 int kernel_vfs_file_snapshot(const struct kernel_vfs_file *file,

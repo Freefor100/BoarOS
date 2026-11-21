@@ -5380,6 +5380,12 @@ enum kernel_mm_status kernel_mm_validate_file_private_mapping(struct kernel_mm *
     return validate_file_mapping(mm,hint,length,offset,permissions,flags);
 }
 
+enum {
+    LINUX_MS_ASYNC = 1U,
+    LINUX_MS_INVALIDATE = 2U,
+    LINUX_MS_SYNC = 4U,
+};
+
 static int sync_mapped_ranges(struct kernel_mm *mm,uint64_t address,uint64_t length,
     uint32_t flags,struct mm_operation *operation)
 {
@@ -5389,20 +5395,25 @@ static int sync_mapped_ranges(struct kernel_mm *mm,uint64_t address,uint64_t len
     int hole=0,result=0;
     while (cursor<end) {
         struct { struct kernel_mm_file_source *source; uint64_t start,end; } sources[16];
+        /* A synchronous invalidation must finish each earlier range before
+         * checking a later mapping's lock state. */
+        const unsigned batch_limit=(flags & LINUX_MS_INVALIDATE) ? 1U : 16U;
         unsigned count=0;
-        while (cursor<end && count<16) {
+        while (cursor<end && count<batch_limit) {
             struct kernel_vma vma;
             enum kernel_vma_status status=kernel_vma_set_lookup(operation->record->vmas,cursor,&vma);
             if (status==KERNEL_VMA_STATUS_NOT_FOUND) {
                 hole=1;
-                if (flags==1U) { cursor=end; break; }
+                if (flags==LINUX_MS_ASYNC) { cursor=end; break; }
                 status=kernel_vma_set_next(operation->record->vmas,cursor,&vma);
                 if (status==KERNEL_VMA_STATUS_NOT_FOUND || vma.start>=end) { cursor=end; break; }
                 if (status) __builtin_trap();
                 cursor=vma.start;
             } else if (status) __builtin_trap();
+            if ((flags & LINUX_MS_INVALIDATE) && (vma.flags & KERNEL_VMA_LOCKED))
+                return -KERNEL_EBUSY;
             uint64_t finish=vma.end<end?vma.end:end;
-            if ((flags&4U) && vma.kind==KERNEL_VMA_KIND_FILE_SHARED) {
+            if ((flags & LINUX_MS_SYNC) && vma.kind==KERNEL_VMA_KIND_FILE_SHARED) {
                 struct kernel_mm_file_source *source=vma.backing_owner;
                 if (!source || source->operations==UINT32_MAX) __builtin_trap();
                 source->operations++;
@@ -5431,8 +5442,9 @@ static int sync_mapped_ranges(struct kernel_mm *mm,uint64_t address,uint64_t len
 int kernel_mm_msync(struct kernel_mm *mm, uint64_t address,
     uint64_t length, uint32_t flags)
 {
-    if ((flags & ~7U) || (address & BOAROS_PAGE_MASK) ||
-        ((flags & 1U) && (flags & 4U))) return -KERNEL_EINVAL;
+    if ((flags & ~(LINUX_MS_ASYNC | LINUX_MS_INVALIDATE | LINUX_MS_SYNC)) ||
+        (address & BOAROS_PAGE_MASK) || ((flags & LINUX_MS_ASYNC) && (flags & LINUX_MS_SYNC)))
+        return -KERNEL_EINVAL;
     if (!length) {
         struct kernel_mm_record *record;
         return mutable_vma_record(mm, &record) == KERNEL_MM_STATUS_OK ? 0 : -KERNEL_ENOMEM;

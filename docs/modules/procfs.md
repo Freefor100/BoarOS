@@ -16,6 +16,20 @@ stat/status 在 identity 锁内捕获 PID/TGID/PPID/PGID/SID 与 tracer 的 TID�
 
 生成式普通文件不进入 ext4 页缓存。后端 `snapshot` 返回由 OFD 持有的堆缓冲；第一次非空顺序读取或非零seek形成快照，连续短读、readv和pread复用已生成的内容，seek 到零后释放并在下一次读取重新取值；定位读取偏移与上次读取进度不连续时也重新生成，`SEEK_END` 按固定 Linux 的 seq_file 语义返回 `EINVAL`。用户复制时不持有后端或 inode 锁；只推进已经复制的字节。OFD 末引用释放快照，mount 忙判断覆盖文件及目录引用。`fstat` 中的 size 为零是生成文件的元数据语义，不能由它推断 read EOF。
 
+`/proc/self/io` 通过当前进程的数字目录展示输入输出统计，进程目录汇总同一线程组，
+包括已退出线程和已经回收的子进程。线程目录的 `io` 只报告指定线程。文本包含
+`rchar`、`wchar`、`syscr`、`syscw`、`read_bytes`、`write_bytes` 和
+`cancelled_write_bytes`。普通、定位、向量读写及 `sendfile`、`copy_file_range`
+按系统调用返回的已完成字节记字符数。向量操作完成参数预检查后，无论是否传输数据都计一次，
+其中无效文件描述符也计入。当前标量调用按非负返回计次数。数据读写量沿任务资源记账，
+区分已经装入的缓存读与实际提交的块读。截断撤下还未交给写回的整脏页时，由发起者记录
+取消写入量。
+
+文件为所有者只读，生成快照时还检查读取者的文件系统凭据与目标的可转储状态。
+任务借用覆盖采样，结束前复核进程编号代次、凭据和执行映像。快照文本按打开文件描述
+（Open File Description，OFD）保留，顺序短读可以拼接，回到偏移零后再次采样。
+线程组历史复用现有的资源限制对象，普通 fork 初始化新组历史，非组长 exec 保留组历史。
+
 `/proc/<pid>/comm` 和 `/proc/<pid>/task/<tid>/comm` 展示对应线程的名称，
 `PR_SET_NAME/PR_GET_NAME` 与这两个文件共用任务中已有的16字节 `comm`。
 最多保存15字节并补NUL；fork/clone复制名称，成功exec取本次执行请求路径的末级名称；空路径execveat取脚本展开后的执行inode名称，PT_INTERP装载器不替换这一名称，
@@ -97,6 +111,8 @@ CLONE_NEWIPC。捕获和复核覆盖 PID 代次、目标资源存续、exec/MM�
 pidfd setns 的多类型查询在同一目标资源保护中取得 MNT/UTS/IPC 引用，按 REALCREDS
 检查权限；proc 链接继续按 FSCREDS 检查。挂载路径和引用规则见
 [VFS 挂载说明](vfs-ext4.md)。
+
+`NS_GET_OWNER_UID` 查询用户命名空间的所有者用户标识。对当前导出的非用户命名空间描述符，内核在访问用户输出地址前返回 `EINVAL`。以 `O_PATH` 打开的描述符仍返回 `EBADF`。
 
 `/proc/<pid>/mountinfo`、线程目录的对应文件及self/thread-self链接展示目标的实际挂载命名空间。每行包含挂载ID、父ID、与fstat一致的文件系统设备号、文件系统内的bind根、目标进程根下的挂载点、视图属性及后端属性；可选字段shared/master/propagate_from/unbindable来自真实传播关系。chroot所在挂载使用其根路径生成挂载点，因此可显示为`/`；根外的挂载按Linux规则不输出。
 

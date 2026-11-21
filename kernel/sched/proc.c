@@ -408,8 +408,8 @@ static int proc_task_snapshot(struct kernel_task *task, uint64_t identity,
                  task->state == KERNEL_THREAD_STATE_READY ? 'R' :
                  task->state == KERNEL_THREAD_STATE_STOPPED ? 'T' :
                  task->ptrace && (task->ptrace->phase==TRACE_STOPPED || task->ptrace->phase==TRACE_LISTENING) ? 't' : 'S',
-        .child_minor_faults = leader->child_usage.minor_faults,
-        .child_major_faults = leader->child_usage.major_faults,
+        .child_minor_faults = leader->limits->child_usage.minor_faults,
+        .child_major_faults = leader->limits->child_usage.major_faults,
         .signal_pending = task->signal_pending,
         .signal_shared_pending = leader->group_pending,
         .signal_blocked = task->signal_blocked,
@@ -457,8 +457,8 @@ static int proc_task_snapshot(struct kernel_task *task, uint64_t identity,
     result->kernel_ticks = usage.kernel_ns / 10000000U;
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        result->child_user_ticks = leader->child_usage.user_ns / 10000000U;
-        result->child_kernel_ticks = leader->child_usage.kernel_ns / 10000000U;
+        result->child_user_ticks = leader->limits->child_usage.user_ns / 10000000U;
+        result->child_kernel_ticks = leader->limits->child_usage.kernel_ns / 10000000U;
     }
     if (mm.state == KERNEL_MM_LIVE) {
         struct kernel_mm_proc_memory memory;
@@ -513,6 +513,37 @@ static int proc_resource_matches_locked(struct kernel_task *task, kernel_pid_t p
     return task->accounted && !task->retirement && !task->proc_exiting &&
         process_find_identity(pid, role) == task && id &&
         id->generation == (target & ~KERNEL_PROC_THREAD_TARGET);
+}
+
+int kernel_proc_io_snapshot(kernel_pid_t pid, uint64_t identity,
+    struct kernel_proc_io_counters *out)
+{
+    int thread = (identity & KERNEL_PROC_THREAD_TARGET) != 0;
+    identity &= ~KERNEL_PROC_THREAD_TARGET;
+    KERNEL_IRQ_SCOPE(proc_irq);
+    SCHEDULER_TASK_BORROW(task, thread ? find_thread(pid, identity) : find_member(pid, identity));
+    if (!task) return -KERNEL_ENOENT;
+    PROC_ACCESS(task);
+    struct kernel_task_usage usage;
+    if (thread) {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        scheduler_usage_thread_locked(task, &usage);
+    } else scheduler_group_usage_snapshot(task, 1, &usage);
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        enum kernel_pid_role role = thread ? KERNEL_PID_TID : KERNEL_PID_TGID;
+        struct kernel_pid *id = process_identity(task, role);
+        if (!task->accounted || task->retirement || process_find_identity(pid, role) != task ||
+            !id || id->generation != identity) return -KERNEL_ENOENT;
+    }
+    int result = proc_access_check(&access);
+    if (result) return result;
+    *out = (struct kernel_proc_io_counters){
+        .rchar = usage.rchar, .wchar = usage.wchar, .syscr = usage.syscr, .syscw = usage.syscw,
+        .read_bytes = usage.read_bytes, .write_bytes = usage.write_bytes,
+        .cancelled_write_bytes = usage.cancelled_write_bytes,
+    };
+    return 0;
 }
 
 int kernel_task_remote_mm_acquire(int32_t tid,struct kernel_mm *owner)

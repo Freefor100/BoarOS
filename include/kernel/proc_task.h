@@ -14,6 +14,13 @@ struct kernel_credentials;
 struct kernel_mm_proc_map;
 struct kernel_namespace;
 
+struct kernel_proc_io_counters {
+    uint64_t rchar, wchar, syscr, syscw, read_bytes, write_bytes, cancelled_write_bytes;
+};
+
+int kernel_proc_io_snapshot(kernel_pid_t, uint64_t identity,
+    struct kernel_proc_io_counters *);
+
 enum kernel_proc_path_kind {
     KERNEL_PROC_PATH_EXE = 1,
     KERNEL_PROC_PATH_CWD,

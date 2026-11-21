@@ -4,6 +4,7 @@
 /* Internal canonical task storage. Public interfaces keep kernel_task opaque;
  * code using an executing task's embedded state shares this exact layout. */
 #include <arch/task.h>
+#include <kernel/accounting.h>
 #include <kernel/cost.h>
 #include <kernel/avl.h>
 #include <kernel/files.h>
@@ -19,12 +20,6 @@
 #include <kernel/task.h>
 #include <kernel/wait_internal.h>
 #include <stdint.h>
-
-struct kernel_task_usage {
-    uint64_t user_ns, kernel_ns;
-    uint64_t minor_faults, major_faults, maxrss_pages;
-    uint64_t voluntary, involuntary, read_bytes, write_bytes;
-};
 
 struct kernel_cpu_timer_index {
     struct kernel_avl_node node;
@@ -204,7 +199,7 @@ struct kernel_task {
     struct kernel_io_context io_context;
     uint32_t accounting_mode;
     uint32_t resource_flags;
-    struct kernel_task_usage usage, dead_usage, child_usage;
+    struct kernel_task_usage usage;
     uint64_t proc_start_ticks;
     char comm[16];
     struct kernel_wait_queue child_exit_queue;

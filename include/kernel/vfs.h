@@ -142,7 +142,16 @@ struct kernel_vfs_stat {
     struct kernel_vfs_timespec ctime;
 };
 
+#define KERNEL_VFS_STATX_DIOALIGN UINT32_C(0x2000)
+#define KERNEL_VFS_STATX_ATTR_MOUNT_ROOT UINT32_C(0x2000)
+
+struct kernel_vfs_statx_extra {
+    uint32_t request;
+    uint32_t dio_alignment;
+};
+
 struct kernel_page_cache;
+struct kernel_vfs_file;
 struct kernel_vfs_path;
 
 /* An owned path identity; root and cwd may name the same object while each
@@ -168,6 +177,8 @@ uint32_t kernel_vfs_path_mode(const struct kernel_vfs_path *path);
 int kernel_vfs_path_readlink(struct kernel_vfs_path *path, char *buffer, size_t size, size_t *read);
 int kernel_vfs_path_stat(const struct kernel_vfs_path *path,
                          struct kernel_vfs_stat *stat);
+void kernel_vfs_statx_extra(const struct kernel_vfs_file *, const struct kernel_vfs_path *,
+                           struct kernel_vfs_stat *, struct kernel_vfs_statx_extra *);
 int kernel_vfs_path_set_times(struct kernel_vfs_path *path,
                               const struct kernel_vfs_timespec times[2]);
 int kernel_vfs_path_set_mode(struct kernel_vfs_path *path, uint32_t mode);
@@ -304,6 +315,8 @@ int kernel_vfs_readlink_at(struct kernel_vfs_path *start,
 int kernel_vfs_stat_at(struct kernel_vfs_path *start,
                        struct kernel_vfs_path *root, const char *path,
                        int follow_final, struct kernel_vfs_stat *stat);
+int kernel_vfs_statx_at(struct kernel_vfs_path *start, struct kernel_vfs_path *root,
+    const char *path, int follow_final, struct kernel_vfs_stat *, struct kernel_vfs_statx_extra *);
 /* Both lookup and final access checks use the active actor credentials. */
 int kernel_vfs_access_at(struct kernel_vfs_path *start,
                          struct kernel_vfs_path *root, const char *path,
@@ -394,7 +407,8 @@ int kernel_vfs_pwrite(struct kernel_vfs_file *file,
                       size_t *bytes_written);
 
 struct kernel_uaccess_iovec;
-size_t kernel_vfs_direct_alignment(struct kernel_vfs_file *);
+size_t kernel_vfs_direct_alignment(const struct kernel_vfs_file *);
+int kernel_vfs_seek_sparse(struct kernel_vfs_file *, uint64_t offset, bool seek_hole, uint64_t *);
 int kernel_vfs_pwrite_direct(struct kernel_vfs_file *,uint64_t,const void *,size_t,size_t *,const struct kernel_lock_guard *);
 int kernel_vfs_direct_pread(struct kernel_vfs_file *,uint64_t,void *,size_t,size_t *);
 struct kernel_vfs_user_write_result {

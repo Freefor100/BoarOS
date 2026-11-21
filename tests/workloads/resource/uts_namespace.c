@@ -22,6 +22,7 @@
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"UTS FAIL %d %s errno=%d\n",__LINE__,#x,errno); exit(1); } } while (0)
 #define NS_GET_NSTYPE 0xb703U
+#define NS_GET_OWNER_UID 0xb704U
 #ifndef SYS_pidfd_open
 #define SYS_pidfd_open 434
 #endif
@@ -78,6 +79,9 @@ static void fd_contract(void)
     uint64_t ids[3];
     for(unsigned i=0;i<3;i++) {
         int fd=open(paths[i],O_RDONLY);CHECK(fd>=0&&ioctl(fd,NS_GET_NSTYPE)==types[i]);
+        uid_t owner=(uid_t)-1;
+        CHECK(ioctl(fd,NS_GET_OWNER_UID,&owner)==-1&&errno==EINVAL&&owner==(uid_t)-1);
+        CHECK(ioctl(fd,NS_GET_OWNER_UID,NULL)==-1&&errno==EINVAL);
         struct stat stat;struct statfs fs;
         CHECK(!fstat(fd,&stat)&&S_ISREG(stat.st_mode)&&stat.st_nlink==1);
         CHECK(!fstatfs(fd,&fs)&&fs.f_type==0x6e736673);ids[i]=stat.st_ino;
@@ -90,6 +94,7 @@ static void fd_contract(void)
         CHECK(ioctl(fd,0xb7ffU)==-1&&errno==ENOTTY);
         int alias=dup(fd);CHECK(alias>=0&&!close(fd)&&ioctl(alias,NS_GET_NSTYPE)==types[i]&&!close(alias));
         fd=open(paths[i],O_PATH);CHECK(fd>=0);
+        CHECK(ioctl(fd,NS_GET_OWNER_UID,NULL)==-1&&errno==EBADF);
         CHECK(ioctl(fd,NS_GET_NSTYPE)==-1&&errno==EBADF);CHECK(!close(fd));
         CHECK(open(paths[i],O_WRONLY)==-1&&errno==EPERM);
         CHECK(open(paths[i],O_RDWR)==-1&&errno==EPERM);

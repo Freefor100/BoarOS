@@ -2,6 +2,7 @@
 #define BOAROS_KERNEL_RLIMIT_H
 
 #include <stdint.h>
+#include <kernel/accounting.h>
 
 #define KERNEL_RLIMIT_CPU 0U
 #define KERNEL_RLIMIT_STACK 3U
@@ -38,6 +39,9 @@ struct kernel_resource_limits {
     struct kernel_heap *heap;
     uint32_t references;
     struct kernel_rlimit64 values[KERNEL_RLIMIT_COUNT];
+    /* One object per thread group. These histories outlive the leader and
+     * are copied into neither a fork child nor a replacement exec image. */
+    struct kernel_task_usage dead_usage, child_usage;
 };
 /* A task owns one reference; clone threads share, fork takes a value copy. */
 struct kernel_resource_limits *kernel_resource_limits_create(struct kernel_heap *,

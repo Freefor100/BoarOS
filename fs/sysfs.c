@@ -6,12 +6,13 @@
 #include <kernel/errno.h>
 #include <kernel/heap.h>
 #include <string.h>
-static char *number(char *out,unsigned n)
-{char digits[16];unsigned count=0;do{digits[count++]=(char)('0'+n%10);n/=10;}while(n);while(count)*out++=digits[--count];return out;}
+static char *number(char *out,uint64_t n)
+{char digits[20];unsigned count=0;do{digits[count++]=(char)('0'+n%10);n/=10;}while(n);while(count)*out++=digits[--count];return out;}
 
 struct sysfs_block_data {
     char name[32];
     char logical_size[12], dma_alignment[12];
+    uint64_t inode;
 };
 
 static size_t number_line(char *out, uint32_t value)
@@ -19,6 +20,33 @@ static size_t number_line(char *out, uint32_t value)
     char *end=number(out,value);
     *end++='\n';
     return end-out;
+}
+
+static int block_stat_snapshot(uint64_t device, uint64_t generation, struct kernel_heap *heap,
+    char **buffer, size_t *length)
+{
+    struct kernel_block_usage usage;
+    int error = kernel_block_stat(device, generation, &usage);
+    if (error) return error;
+    const uint64_t fields[] = {
+        usage.read.completed, 0, usage.read.sectors, usage.read.elapsed_ns / 1000000U,
+        usage.write.completed, 0, usage.write.sectors, usage.write.elapsed_ns / 1000000U,
+        usage.in_flight, usage.busy_milliseconds,
+        (usage.read.elapsed_ns + usage.write.elapsed_ns + usage.flush.elapsed_ns) / 1000000U,
+        0, 0, 0, 0, usage.flush.completed, usage.flush.elapsed_ns / 1000000U,
+    };
+    char *data;
+    if (kernel_heap_allocate(heap, sizeof(fields) / sizeof(fields[0]) * 21U, (void **)&data))
+        return -KERNEL_ENOMEM;
+    char *end = data;
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+        if (i) *end++ = ' ';
+        end = number(end, fields[i]);
+    }
+    *end++ = '\n';
+    *buffer = data;
+    *length = (size_t)(end - data);
+    return 0;
 }
 
 static int mount_block_snapshot(struct kernel_heap *heap,uint64_t flags,
@@ -40,11 +68,13 @@ static int mount_block_snapshot(struct kernel_heap *heap,uint64_t flags,
     }
 
     struct bpf_fs_entry *entries=NULL;
+    struct bpf_fs_attribute *attributes=NULL;
     struct sysfs_block_data *data=NULL;
-    size_t used=base_count;
+    size_t used=base_count, attribute_count=0;
     if (count>(SIZE_MAX-base_count)/4 ||
         kernel_heap_allocate_zeroed(heap,base_count+count*4,sizeof(*entries),(void **)&entries) ||
-        kernel_heap_allocate_zeroed(heap,count,sizeof(*data),(void **)&data))
+        kernel_heap_allocate_zeroed(heap,count,sizeof(*data),(void **)&data) ||
+        kernel_heap_allocate_zeroed(heap,count,sizeof(*attributes),(void **)&attributes))
         result=-KERNEL_ENOMEM;
     if (!result) {
         memcpy(entries,base,base_count*sizeof(*entries));
@@ -54,6 +84,7 @@ static int mount_block_snapshot(struct kernel_heap *heap,uint64_t flags,
             /* A partition shares its whole disk's queue. */
             if (device->parent || !kernel_block_device_name(device->device_number,disk->name)) continue;
             uint64_t disk_inode=used+2, queue_inode=disk_inode+1;
+            disk->inode=disk_inode;
             uint32_t sector=kernel_block_logical_size(device);
             uint32_t alignment=kernel_block_user_dio_alignment(sector);
             entries[used++]=(struct bpf_fs_entry){block_inode,disk->name,0,0,KERNEL_VFS_S_IFDIR|0555};
@@ -64,11 +95,28 @@ static int mount_block_snapshot(struct kernel_heap *heap,uint64_t flags,
                 entries[used++]=(struct bpf_fs_entry){queue_inode,"dma_alignment",disk->dma_alignment,
                     number_line(disk->dma_alignment,alignment-1),KERNEL_VFS_S_IFREG|0444};
         }
+        for (size_t i=0;i<count;i++) {
+            const struct kernel_block_device *device=devices[i];
+            if (device->parent) {
+                size_t parent=0;
+                while (parent<count && devices[parent]!=device->parent) parent++;
+                if (parent==count || !data[parent].inode ||
+                    !kernel_block_device_name(device->device_number,data[i].name)) continue;
+                data[i].inode=used+2;
+                entries[used++]=(struct bpf_fs_entry){data[parent].inode,data[i].name,0,0,KERNEL_VFS_S_IFDIR|0555};
+            }
+            if (data[i].inode)
+                attributes[attribute_count++]=(struct bpf_fs_attribute){
+                    data[i].inode,"stat",device->device_number,device->registration_generation,block_stat_snapshot
+                };
+        }
     }
     /* The immutable files copy the values. Open sysfs views must not pin disks. */
     for (size_t i=0;i<count;i++) kernel_block_put(devices[i]);
     kernel_heap_release(heap,devices);
-    if (!result) result=bpf_metadata_mount(heap,flags,0x62656572,entries,used,out);
+    if (!result) result=bpf_metadata_mount_attributes(heap,flags,0x62656572,
+        entries,used,attributes,attribute_count,out);
+    if (attributes) kernel_heap_release(heap,attributes);
     if (data) kernel_heap_release(heap,data);
     if (entries) kernel_heap_release(heap,entries);
     return result;
