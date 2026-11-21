@@ -52,7 +52,7 @@ struct virtio_net_device {
     uint16_t rx_map[VIRTIO_NET_QUEUE_SIZE], tx_map[VIRTIO_NET_QUEUE_SIZE];
     uint16_t rx_length[VIRTIO_NET_BUFFERS];
     uint8_t rx_state[VIRTIO_NET_BUFFERS], tx_state[VIRTIO_NET_BUFFERS];
-    uint8_t mac[6], link_up, configured, irq_registered, stopping, failed;
+    uint8_t mac[6], link_up, configured, irq_registered, stopping, failed, wake_on_tx_submit;
     uint16_t loaned;
     /* 零拷贝 TX：每槽持有调用方 owner 与 indirect 表长度；完成后经 tx_release 归还。 */
     void *tx_owner[VIRTIO_NET_BUFFERS];

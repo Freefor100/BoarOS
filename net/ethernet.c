@@ -59,6 +59,7 @@ static void release_owner(void *owner)
 }
 static err_t link_output(struct netif *interface, struct pbuf *p)
 {
+    COST_SCOPE(output_cost, NET_TX_OUTPUT_TICKS);
     struct kernel_network *n = interface->state;
     /* 零拷贝候选：整链为可 DMA 的 PBUF_RAM/POOL、段数受限且地址可换算。 */
     if (p->tot_len != 0 && p->tot_len <= 1514) {
