@@ -1172,6 +1172,9 @@ int ext4_fs_alloc_inode(struct ext4_fs *fs, struct ext4_inode_ref *inode_ref,
 	/* Initialize i-node */
 	struct ext4_inode *inode = inode_ref->inode;
 
+	uint32_t generation = ext4_inode_get_generation(inode) + 1U;
+	if (!generation)
+		generation = 1;
 	memset(inode, 0, inode_size);
 
 	uint32_t mode;
@@ -1213,7 +1216,7 @@ int ext4_fs_alloc_inode(struct ext4_fs *fs, struct ext4_inode_ref *inode_ref,
 	ext4_inode_set_del_time(inode, 0);
 	ext4_inode_set_blocks_count(ext4_fs_super(fs), inode, 0);
 	ext4_inode_set_flags(inode, 0);
-	ext4_inode_set_generation(inode, 0);
+	ext4_inode_set_generation(inode, generation);
 	if (inode_size > EXT4_GOOD_OLD_INODE_SIZE) {
 		uint16_t size = ext4_get16(ext4_fs_super(fs), want_extra_isize);
 		ext4_inode_set_extra_isize(ext4_fs_super(fs), inode, size);

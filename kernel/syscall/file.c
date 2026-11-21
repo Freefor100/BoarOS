@@ -153,6 +153,28 @@ static int copy_open_how(struct kernel_mm *mm,uint64_t user,uint64_t size,
         ? 0 : -KERNEL_EFAULT;
 }
 
+enum kernel_syscall_status syscall_handle_file_handle(struct kernel_task *caller,
+    const struct kernel_syscall_request *request, struct kernel_syscall_result *decoded, int open)
+{
+    struct kernel_files *files;
+    const struct kernel_fs_context *fs;
+    struct kernel_mm *mm;
+    enum kernel_task_status status = kernel_task_files_borrow(caller, &files);
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    if (status == KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) {
+        decoded->value = -KERNEL_ENODEV;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (status != KERNEL_TASK_STATUS_OK ||
+        kernel_task_fs_context_borrow(caller, &fs) != KERNEL_TASK_STATUS_OK ||
+        kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK)
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    const uint64_t *args = request->arguments;
+    decoded->value = open ? kernel_files_open_by_handle(files, fs, mm, (int32_t)args[0], args[1], (uint32_t)args[2]) :
+        kernel_files_name_to_handle(files, fs, mm, (int32_t)args[0], args[1], args[2], args[3], (uint32_t)args[4]);
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
 enum kernel_syscall_status syscall_handle_openat(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,

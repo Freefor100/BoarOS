@@ -2053,10 +2053,10 @@ static int close_node_file(struct kernel_vfs_node *node)
 #endif
     return result;
 }
-static int ext4_backend_open(struct kernel_vfs_mount *mount,
+static int ext4_backend_open_inode(struct kernel_vfs_mount *mount,
                         const char *path, uint64_t inode_number,
                         uint32_t inode_mode,
-                        struct kernel_vfs_file *file)
+                        struct kernel_vfs_file *file, const uint32_t *generation)
 {
     struct lwext4_mount_adapter *adapter;
     struct kernel_vfs_node *node;
@@ -2093,8 +2093,10 @@ static int ext4_backend_open(struct kernel_vfs_mount *mount,
     node->instance=&adapter->instance;
     node->backend_data = &((struct lwext4_node *)node)->file;
     if (path == 0) {
-        result = ext4_fopen_inode(lwext4_node_file(node), adapter->mount_point,
-                                  inode_number, &initial);
+        result = generation ?
+            ext4_fopen_handle(lwext4_node_file(node), adapter->mount_point,
+                inode_number, *generation, &initial) :
+            ext4_fopen_inode(lwext4_node_file(node), adapter->mount_point, inode_number, &initial);
         if (result != EOK) {
             kernel_heap_release(adapter->instance.heap, node);
             return lwext4_error(result);
@@ -2132,6 +2134,7 @@ static int ext4_backend_open(struct kernel_vfs_mount *mount,
     node->size = ext4_fsize(lwext4_node_file(node));
     if (path) result=ext4_fraw_inode_fill(lwext4_node_file(node),&initial);
     node->mode=ext4_inode_get_mode(&adapter->device.fs->sb,&initial);
+    ((struct lwext4_node *)node)->generation = ext4_inode_get_generation(&initial);
     node->uid=ext4_inode_get_uid(&initial);node->gid=ext4_inode_get_gid(&initial);
     node->attributes=ext4_inode_get_flags(&initial)&KERNEL_VFS_INODE_ATTRIBUTES;
     if (!result) initialize_times(node,adapter,&initial);
@@ -2145,6 +2148,27 @@ static int ext4_backend_open(struct kernel_vfs_mount *mount,
     }
     return kernel_vfs_publish_node(mount, node, file, 0);
 }
+
+static int ext4_backend_open(struct kernel_vfs_mount *mount, const char *path,
+    uint64_t inode, uint32_t mode, struct kernel_vfs_file *file)
+{ return ext4_backend_open_inode(mount, path, inode, mode, file, NULL); }
+
+static void ext4_handle_filesystem(struct kernel_vfs_instance *instance, unsigned char uuid[16])
+{ memcpy(uuid, lwext4_instance(instance)->device.fs->sb.uuid, 16); }
+
+static uint32_t ext4_handle_generation(struct kernel_vfs_node *node)
+{ return ((struct lwext4_node *)node)->generation; }
+
+static int ext4_handle_open(struct kernel_vfs_mount *mount, const struct kernel_vfs_handle *handle,
+    struct kernel_vfs_file *file)
+{ return ext4_backend_open_inode(mount, NULL, handle->inode, 0, file, &handle->generation); }
+
+static const struct kernel_vfs_export_ops ext4_export = {
+    .type = KERNEL_VFS_HANDLE_EXT4,
+    .filesystem = ext4_handle_filesystem,
+    .generation = ext4_handle_generation,
+    .open = ext4_handle_open,
+};
 
 struct namespace_create {
     const char *mount, *path, *target;
@@ -2324,6 +2348,7 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
     node->max_size = lwext4_node_file(node)->fmax;
     node->size = ext4_fsize(lwext4_node_file(node));
     node->mode=ext4_inode_get_mode(&adapter->device.fs->sb,&initial);
+    ((struct lwext4_node *)node)->generation = ext4_inode_get_generation(&initial);
     node->uid=ext4_inode_get_uid(&initial);node->gid=ext4_inode_get_gid(&initial);
     node->attributes=ext4_inode_get_flags(&initial)&KERNEL_VFS_INODE_ATTRIBUTES;
     initialize_times(node, adapter, &initial);
@@ -3315,6 +3340,7 @@ static void initialize_backend(void)
     ops->file_operation_execution = KERNEL_VFS_EXECUTION_CALLER;
     ops->namespace_execution = KERNEL_VFS_EXECUTION_CALLER;
     ops->owns_dentry_names = true;
+    ops->export = &ext4_export;
     ops->error = ext4_backend_error;
     ops->root = ext4_backend_root;
     ops->lookup_node = ext4_backend_lookup;

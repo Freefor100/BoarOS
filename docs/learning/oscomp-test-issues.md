@@ -200,7 +200,8 @@ BuildStorm 的 Rust 工具链曾在准备阶段中止。沿 `Child::wait_with_ou
 #### 稀疏定位、文件查询与统计接口的判读
 
 - `lseek11` 已能查找普通文件的数据与空洞。`fallocate04` 已进入打洞后的内容检查，
-  当前 ext4 配置上的 `FALLOC_FL_ZERO_RANGE` 附加场景仍报告不支持。
+  `FALLOC_FL_ZERO_RANGE` 附加场景仍跳过。BoarOS 的 `kernel_open_file_fallocate()` 在
+  解释模式标志时返回 `EOPNOTSUPP`，该请求未进入 ext4 后端。挂载选项不影响此分支。
 - `statx10` 查询文件系统上的普通文件，`statx11` 查询块设备。普通文件现在通过与直接输入输出（Direct I/O）相同的后端报告对齐要求。
   LoongArch glibc 原 `statx10` 执行了两条对齐断言。`statx12` 已通过路径和文件描述符
   检查挂载根和普通文件，区分同一文件系统的不同挂载视图。
@@ -210,6 +211,16 @@ BuildStorm 的 Rust 工具链曾在准备阶段中止。沿 `Child::wait_with_ou
 - `msync03` 的锁页区间遇 `MS_INVALIDATE` 现在按预期返回 `EBUSY`。原程序的六条断言均通过，
   它仍无判分用的 `Summary:`。`ioctl_ns03` 对主机名与域名命名空间发出 `NS_GET_OWNER_UID`，
   现在检查到了预期的 `EINVAL`。
+
+#### 文件句柄测例的标准输入假设
+
+`open_by_handle_at02` 的 `stale-dfd` 使用文件描述符 0 选择挂载，期待它位于测试文件所在卷之外。
+初赛启动脚本从根盘打开 `/dev/console` 作为标准输入，测例在同一 ext4 根盘的 `/tmp` 创建文件。
+因此描述符 0 仍选中包含目标文件的实例，原句柄能打开文件。原程序在此环境中通过另外六项。
+固定 Linux 启用了设备临时文件系统（device temporary filesystem，devtmpfs）的自动挂载，
+`/dev/console` 位于另一实例。在本地给同一发布程序传入进程文件系统（process filesystem，
+procfs）中的普通文件作为标准输入后，BoarOS 在该项也返回 `ESTALE`，原程序通过七项。
+判读该项时应核对描述符 0 实际选择的挂载。正式启动脚本和发布程序保留原来的输入方式。
 
 ### 挂载相关的三类故障
 

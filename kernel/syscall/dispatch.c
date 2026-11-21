@@ -146,6 +146,8 @@
 #define LINUX_SYSCALL_GETGROUPS 158U
 #define LINUX_SYSCALL_SETGROUPS 159U
 #define LINUX_SYSCALL_NEWFSTATAT 79U
+#define LINUX_SYSCALL_NAME_TO_HANDLE_AT 264U
+#define LINUX_SYSCALL_OPEN_BY_HANDLE_AT 265U
 #define LINUX_SYSCALL_STATX 291U
 #define LINUX_SYSCALL_FACCESSAT 48U
 #define LINUX_SYSCALL_FACCESSAT2 439U
@@ -474,6 +476,11 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
         if (syscall_handle_fsync(caller, request, &decoded,
                 request->number == LINUX_SYSCALL_FDATASYNC) !=
             KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == LINUX_SYSCALL_NAME_TO_HANDLE_AT ||
+               request->number == LINUX_SYSCALL_OPEN_BY_HANDLE_AT) {
+        if (syscall_handle_file_handle(caller, request, &decoded,
+                request->number == LINUX_SYSCALL_OPEN_BY_HANDLE_AT) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_OPENAT ||
                request->number == LINUX_SYSCALL_OPENAT2) {

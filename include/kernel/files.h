@@ -233,6 +233,11 @@ enum kernel_files_status kernel_files_renameat(
     int64_t new_dirfd, uint64_t new_user_path, uint32_t flags,
     int64_t *linux_result);
 
+int kernel_files_name_to_handle(struct kernel_files *, const struct kernel_fs_context *,
+    struct kernel_mm *, int32_t dirfd, uint64_t path, uint64_t handle, uint64_t mount, uint32_t flags);
+int kernel_files_open_by_handle(struct kernel_files *, const struct kernel_fs_context *,
+    struct kernel_mm *, int32_t mountfd, uint64_t handle, uint32_t flags);
+
 enum kernel_files_status kernel_files_openat(
     struct kernel_files *files,
     const struct kernel_fs_context *fs,

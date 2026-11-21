@@ -142,12 +142,15 @@ struct kernel_vfs_stat {
     struct kernel_vfs_timespec ctime;
 };
 
+#define KERNEL_VFS_STATX_MNT_ID UINT32_C(0x1000)
 #define KERNEL_VFS_STATX_DIOALIGN UINT32_C(0x2000)
+#define KERNEL_VFS_STATX_MNT_ID_UNIQUE UINT32_C(0x4000)
 #define KERNEL_VFS_STATX_ATTR_MOUNT_ROOT UINT32_C(0x2000)
 
 struct kernel_vfs_statx_extra {
     uint32_t request;
     uint32_t dio_alignment;
+    uint64_t mount_id;
 };
 
 struct kernel_page_cache;
@@ -169,6 +172,18 @@ int kernel_vfs_path_resolve(struct kernel_vfs_path *start,
                             struct kernel_vfs_path *root,
                             const char *path, int follow_final,
                             struct kernel_vfs_path **owner);
+#define KERNEL_VFS_HANDLE_EXT4 0x4241
+#define KERNEL_VFS_HANDLE_TMPFS 0x4242
+struct kernel_vfs_handle {
+    uint64_t inode;
+    uint32_t generation, reserved;
+    unsigned char filesystem[16];
+};
+int kernel_vfs_handle_type(const struct kernel_vfs_path *);
+void kernel_vfs_encode_handle(const struct kernel_vfs_path *, struct kernel_vfs_handle *);
+int kernel_vfs_decode_handle(struct kernel_vfs_mount *, int, const struct kernel_vfs_handle *,
+    struct kernel_vfs_path **);
+
 uint64_t kernel_vfs_path_inode(const struct kernel_vfs_path *path);
 int kernel_vfs_path_is_mount_root(const struct kernel_vfs_path *path);
 int kernel_vfs_path_truncate(struct kernel_vfs_path *path, uint64_t size,
@@ -275,6 +290,8 @@ int kernel_vfs_exec_metadata(struct kernel_vfs_file *file,
 /* One lookup yields an existing identity or its held parent and missing name.
  * FOLLOW is explicit: syscall O_EXCL omits it; strict VFS create may follow.
  * result reports creation and may own a pathless final link on failure. */
+int kernel_vfs_open_resolved(struct kernel_vfs_path *, struct kernel_vfs_file *,
+    const struct kernel_vfs_open_request *);
 int kernel_vfs_open_at(struct kernel_vfs_path *start,
                        struct kernel_vfs_path *root, const char *path,
                        const struct kernel_vfs_open_request *request,

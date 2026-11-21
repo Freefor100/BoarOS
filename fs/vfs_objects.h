@@ -16,6 +16,12 @@
 #define VFS_FILE_STATE_CLEANUP UINT32_C(0x5646434c)
 
 struct kernel_vfs_notify_ops;
+struct kernel_vfs_export_ops {
+    int type;
+    void (*filesystem)(struct kernel_vfs_instance *, unsigned char [16]);
+    uint32_t (*generation)(struct kernel_vfs_node *);
+    int (*open)(struct kernel_vfs_mount *, const struct kernel_vfs_handle *, struct kernel_vfs_file *);
+};
 struct kernel_vfs_instance {
     const struct kernel_vfs_backend *ops;
     void *backend_data;
@@ -161,6 +167,7 @@ struct kernel_vfs_backend {
     int (*check_domain)(const struct kernel_vfs_node *, const struct kernel_heap *,
         const struct physical_page_allocator *);
     int (*error)(struct kernel_vfs_instance *instance);
+    const struct kernel_vfs_export_ops *export;
     int (*root)(struct kernel_vfs_instance *instance, uint64_t *inode, uint32_t *mode);
     /* Owned-name backends accept NULL mode: open imports real inode state. */
     int (*lookup)(struct kernel_vfs_instance *instance, uint64_t parent,

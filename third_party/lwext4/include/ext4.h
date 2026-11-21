@@ -847,6 +847,9 @@ int ext4_dir_mk(const char *path);
 int ext4_dir_open(ext4_dir *dir, const char *path);
 int ext4_dir_open_file(ext4_file *file, const char *path);
 int ext4_chrdev_open_file(ext4_file *file, const char *path);
+/* Open a linked and allocated inode of this exact incarnation. */
+int ext4_fopen_handle(ext4_file *, const char *, uint32_t inode, uint32_t generation,
+    struct ext4_inode *initial);
 int ext4_fopen_inode(ext4_file *file, const char *mount_point,
                      uint32_t inode_number, struct ext4_inode *initial);
 /* The file output is published only on success. Optional initial attributes
