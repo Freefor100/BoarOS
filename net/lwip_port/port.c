@@ -100,6 +100,14 @@ void boaros_lwip_ip_lock_shared(struct kernel_lock_guard *guard)
     if(!kernel_lock_held(&ip_mutex.lock,1))
         kernel_mutex_lock(&ip_mutex,guard);
 }
+
+struct kernel_lock_guard *boaros_lwip_ip_drop_current(void)
+{
+    struct kernel_lock_guard *guard = kernel_io_context_current()->locks;
+    if (!guard || guard->lock != &ip_mutex.lock) return NULL;
+    kernel_lock_release(guard);
+    return guard;
+}
 #endif
 void boaros_lwip_ip_unlock(struct kernel_lock_guard *guard)
 {
@@ -199,6 +207,10 @@ void boaros_lwip_tcp_pcb_forget(struct tcp_pcb *pcb)
 { if(protocol_hooks.pcb_forget)protocol_hooks.pcb_forget(pcb); }
 void boaros_lwip_tcp_pcb_timewait(struct tcp_pcb *pcb)
 { if(protocol_hooks.pcb_timewait)protocol_hooks.pcb_timewait(pcb); }
+int boaros_lwip_tcp_reclaim_remote_timewait(void)
+{
+    return protocol_hooks.reclaim_remote_timewait && protocol_hooks.reclaim_remote_timewait();
+}
 int boaros_lwip_tcp_conflict(const struct tcp_pcb *pcb, const struct ip_addr *local, uint16_t local_port,
     const struct ip_addr *remote, uint16_t remote_port)
 { return protocol_hooks.tcp_conflict ? protocol_hooks.tcp_conflict(pcb,local,local_port,remote,remote_port) : 0; }

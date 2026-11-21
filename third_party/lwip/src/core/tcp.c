@@ -2088,7 +2088,7 @@ tcp_kill_state(enum tcp_state state)
  * Kills the oldest connection that is in TIME_WAIT state.
  * Called from tcp_alloc() if no more connections are available.
  */
-static void
+static int
 tcp_kill_timewait(void)
 {
   struct tcp_pcb *pcb, *inactive;
@@ -2107,8 +2107,18 @@ tcp_kill_timewait(void)
     LWIP_DEBUGF(TCP_DEBUG, ("tcp_kill_timewait: killing oldest TIME-WAIT PCB %p (%"S32_F")\n",
                             (void *)inactive, inactivity));
     tcp_abort(inactive);
+    return 1;
   }
+  return 0;
 }
+
+#if BOAROS_USER_SMP
+int
+boaros_lwip_tcp_reclaim_timewait(void)
+{
+  return tcp_kill_timewait();
+}
+#endif
 
 /* Called when allocating a pcb fails.
  * In this case, we want to handle all pcbs that want to close first: if we can
@@ -2155,6 +2165,12 @@ tcp_alloc(u8_t prio)
     tcp_kill_timewait();
     /* Try to allocate a tcp_pcb again. */
     pcb = (struct tcp_pcb *)memp_malloc(MEMP_TCP_PCB);
+#if BOAROS_USER_SMP
+    if (pcb == NULL && boaros_lwip_tcp_reclaim_remote_timewait()) {
+      MEMP_STATS_DEC(err, MEMP_TCP_PCB);
+      pcb = (struct tcp_pcb *)memp_malloc(MEMP_TCP_PCB);
+    }
+#endif
     if (pcb == NULL) {
       /* Try killing oldest connection in LAST-ACK (these wouldn't go to TIME-WAIT). */
       LWIP_DEBUGF(TCP_DEBUG, ("tcp_alloc: killing off oldest LAST-ACK connection\n"));
