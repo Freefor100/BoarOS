@@ -6,7 +6,7 @@
 
 协议实现来自官方 lwIP `STABLE-2_2_1_RELEASE` raw API，位于 `third_party/lwip/`；固定资料和许可证见 `references/README.md`、`references/sources.tsv` 与 `third_party/lwip/COPYING`。IPv4 重组有本地所有权和边界修补，具体范围见[第三方组件](../third-party.md)。本地移植层是 `net/lwip_port/`，使用 `NO_SYS=1`；回环与物理接口共用协议池。UDP PCB 16、TCP active 32、listen 16、segment 512、pbuf header/pool 各 256、协议堆 512 KiB。协议堆按实际分配块计费，回环共享的载荷只计一次，最后一个引用归还后才释放。TCP 批量数据分配保留少量堆空间给 ACK 和接收描述；遇到内存压力沿原等待链，实际归还后重试。BoarOS socket、接收/accept 队列节点及 OFD 使用 kernel_heap。PCB 池耗尽映射 `ENOMEM`，创建失败不留下 OFD；分配器 `STATE` 和错误释放是 fatal 不变量。
 
-实际从内置回环接口建连、且双方都是回环地址的 TCP 连接，使用 8 KiB MSS 上限和 32 KiB 的通告窗口及发送载荷额度。外部连接仍以 1460 字节为 MSS 上限，按路径 MTU 和对端通告收紧，保留原来的 11,680 字节额度。只在内置回环接口跳过 TCP 校验和生成及验证，物理接口保持完整检查。 软件互联网校验和先处理缓冲区起始处对齐所需的字节，再将 32 位字累加到 64 位累加器。余下的字节处理完后执行回卷进位，得到协议要求的 16 位结果。显式设置 `SO_RCVBUF` 后，TCP 用它限制此后的接收通告；监听端的设置在 SYN-ACK 前由子连接继承。运行中降低上限时，已经向对端通告的字节仍可接收，应用消费后才逐步收紧。socket 不再在 TCP 之后重复按同一额度拒绝报文；实际分配失败仍走接收重试。
+实际从内置回环接口建连、且双方都是回环地址的 TCP 连接，使用 8 KiB MSS 上限和 32 KiB 的通告窗口及发送载荷额度。外部连接仍以 1460 字节为 MSS 上限，按路径 MTU 和对端通告收紧。每条外部连接默认的接收通告窗口和发送载荷额度均为 46,720 字节，协议堆按实际分配计费。只在内置回环接口跳过 TCP 校验和生成及验证，物理接口保持完整检查。 软件互联网校验和先处理缓冲区起始处对齐所需的字节，再将 32 位字累加到 64 位累加器。余下的字节处理完后执行回卷进位，得到协议要求的 16 位结果。显式设置 `SO_RCVBUF` 后，TCP 用它限制此后的接收通告；监听端的设置在 SYN-ACK 前由子连接继承。运行中降低上限时，已经向对端通告的字节仍可接收，应用消费后才逐步收紧。socket 不再在 TCP 之后重复按同一额度拒绝报文；实际分配失败仍走接收重试。
 
 IPv4 重组键包括源/目的地址、IP ID、协议号和输入 netif 身份。已完整覆盖的重复范围只丢弃新输入；部分重叠、冲突终点或越过已知终点丢弃整个对象。判重与边界校验先于资源淘汰，重复输入不能挤掉正在重组的有效数据。对象借用 netif 身份，不延长设备生命；移除接口前调用 `ip4_reass_cleanup_netif()`，释放该接口的所有重组引用。最后一个 pbuf 引用释放后，custom 回调才归还 DMA 缓冲。IPv4 头选项仍不支持。宿主反例和所有权检查由 `make test-lwip-reassembly-host` 重建，包含普通/乱序、重复/部分重叠、协议/接口隔离、终点冲突、预算、年龄和实际 fragmenter 的最大 UDP 内容；宿主结果不代替真实网卡验收。
 
@@ -507,7 +507,7 @@ INET stream 的 write/writev/send/sendmsg 使用任务登记的 `kernel_socket_w
 NIC 容量通知没有遗漏。
 
 TCP 的 27 组窗口/池/堆候选由 `BOAROS_LWIP_WINDOW_MSS`、`BOAROS_LWIP_POOL_SCALE`、
-`BOAROS_LWIP_MEM_SCALE` 选择，当前默认 8/4/2，PCB 数不变。工具、静态/动态内存口径、
+`BOAROS_LWIP_MEM_SCALE` 选择，当前默认 32/4/2，PCB 数不变。工具、静态/动态内存口径、
 控制流 tail 与固定输入约束见[预算实验](../learning/data-path-budget-experiments.md)，
 可运行候选不等于吞吐已经验收，默认值须依据匹配结果由人选择。
 

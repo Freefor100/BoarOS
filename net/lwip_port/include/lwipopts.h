@@ -73,7 +73,7 @@
 /* Protocol and packet storage is bounded static memory, not kernel_heap. */
 /* 独立构建目录中的实验覆盖；不传宏时保留生产预算。 */
 #ifndef BOAROS_LWIP_WINDOW_MSS
-#define BOAROS_LWIP_WINDOW_MSS 8
+#define BOAROS_LWIP_WINDOW_MSS 32
 #endif
 #ifndef BOAROS_LWIP_POOL_SCALE
 #define BOAROS_LWIP_POOL_SCALE 4
