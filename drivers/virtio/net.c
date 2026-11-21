@@ -139,7 +139,6 @@ static void diagnostic_hex(uint64_t v)
     diagnostic_text("0x");
     for (int shift = 60; shift >= 0; shift -= 4) kernel_console_putc(digits[(v >> shift) & 15]);
 }
-static unsigned posted_count(uint32_t bits) { unsigned n=0; while(bits) { bits &= bits-1; n++; } return n; }
 static void fail(struct virtio_net_device *d, const char *reason, unsigned q, uint32_t id, uint32_t length)
 {
     if (d->failed) return;
@@ -244,17 +243,17 @@ static int harvest(struct virtio_net_device *d)
     if (!d->configured || d->failed) return 0;
     int progress = 0;
     for (unsigned q = 0; q < 2; q++) {
-        volatile uint16_t *used = (void *)((char *)queue(d, q) + used_offset(d));
-        uint16_t index = used[1]; arch_dma_barrier();
-        unsigned count = (uint16_t)(index - d->split[q].last_used);
+        struct virtio_split_queue *ring = &d->split[q];
+        uint16_t index = virtio_split_completion_index(ring);
+        unsigned count = (uint16_t)(index - ring->last_used);
         uint32_t *posted = q ? &d->tx_posted : &d->rx_posted;
-        if (count > posted_count(*posted)) { fail(d, "used-index", q, index, count); return 1; }
+        if (count > ring->inflight) { fail(d, "used-index", q, index, count); return 1; }
         progress |= count != 0;
-        while (d->split[q].last_used != index) {
+        while (ring->last_used != index) {
             struct virtio_completion e;
-            enum virtio_status status = virtio_split_take(&d->split[q], &e);
+            enum virtio_status status = virtio_split_take_before(ring, index, &e);
             if (status != VIRTIO_OK) {
-                struct virtio_queue_fault *f = &d->split[q].fault;
+                struct virtio_queue_fault *f = &ring->fault;
                 const char *reason = f->reason == VIRTIO_QUEUE_BAD_LENGTH ?
                     (q ? "tx-length-owner" : "rx-length-owner") : "head-owner";
                 fail(d, reason, q, f->head, f->length); return 1;

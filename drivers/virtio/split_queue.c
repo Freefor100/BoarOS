@@ -88,12 +88,18 @@ static enum virtio_status fault(struct virtio_split_queue *q,enum virtio_queue_f
     q->fault=(struct virtio_queue_fault){reason,observed,count,q->last_used,head,length};
     return VIRTIO_DEVICE;
 }
-enum virtio_status virtio_split_take(struct virtio_split_queue *q,struct virtio_completion *done)
+uint16_t virtio_split_completion_index(const struct virtio_split_queue *q)
+{
+    uint16_t end=q->used->index;
+    arch_dma_barrier();
+    return end;
+}
+enum virtio_status virtio_split_take_before(struct virtio_split_queue *q,uint16_t observed,
+    struct virtio_completion *done)
 {
     if(!q || !q->size || !done)return VIRTIO_INVALID;
     if(q->fault.reason)return VIRTIO_STATE;
-    uint16_t observed=q->used->index,count=(uint16_t)(observed-q->last_used);
-    arch_dma_barrier();
+    uint16_t count=(uint16_t)(observed-q->last_used);
     if(count>q->size)return fault(q,VIRTIO_QUEUE_OVERFLOW,observed,count,UINT32_MAX,0);
     if(!count)return VIRTIO_EMPTY;
     struct virtio_used_element item=q->used->ring[q->last_used++%q->size];
@@ -104,6 +110,12 @@ enum virtio_status virtio_split_take(struct virtio_split_queue *q,struct virtio_
     q->claimed&=~q->owners[item.id].mask;q->inflight--;
     q->owners[item.id].token=0;q->owners[item.id].mask=0;
     return VIRTIO_OK;
+}
+enum virtio_status virtio_split_take(struct virtio_split_queue *q,struct virtio_completion *done)
+{
+    if(!q || !q->size || !done)return VIRTIO_INVALID;
+    if(q->fault.reason)return VIRTIO_STATE;
+    return virtio_split_take_before(q,virtio_split_completion_index(q),done);
 }
 enum virtio_status virtio_split_reset(struct virtio_split_queue *q,const struct virtio_transport *t)
 {
