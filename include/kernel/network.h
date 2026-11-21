@@ -4,6 +4,8 @@
 #include <kernel/heap.h>
 struct kernel_network;
 struct netif;
+/* One pass through the hardware receive queue under a protocol scope. */
+#define KERNEL_NETWORK_RECEIVE_BATCH 8U
 int kernel_network_send_frame(struct netif *, const void *, uint16_t size);
 /* Device/transport are borrowed from platform; stop joins worker and returns
  * all loans/TX references, then platform may destroy hardware. NULL is timer-only. */

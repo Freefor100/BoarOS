@@ -3847,12 +3847,18 @@ int kernel_socket_accept_check(struct kernel_socket *socket)
 
 static int socket_receive_empty(const struct kernel_socket *, int);
 
-static void socket_receive_before_wait(void)
+static void socket_receive_before_wait(struct kernel_socket *socket)
 {
     struct kernel_socket_protocol_scope scope;
     if (!protocol_enter(&scope, 1, 1)) return;
-    if (scope.outer && !network_is_stopping() && network_receive_inline)
-        network_receive_inline(network_context);
+    if (scope.outer && !network_is_stopping() && network_receive_inline) {
+        for (unsigned batch = 0; batch < 4; batch++) {
+            if (network_receive_inline(network_context) < KERNEL_NETWORK_RECEIVE_BATCH) break;
+            SOCKET_ENDPOINT(state,socket);
+            if (tcp_admission_capacity_locked(socket) || socket->pending_error || socket->write_closed)
+                break;
+        }
+    }
     kernel_socket_protocol_leave(&scope);
 }
 
@@ -3883,14 +3889,14 @@ static int socket_wait_ready(struct kernel_socket *socket, uint32_t events,
                 return status == KERNEL_TIME_STATUS_DEADLINE_PASSED ? -KERNEL_EAGAIN : -KERNEL_EIO;
             timed = 1;
         }
-        /* On one CPU a writer may be about to wait for an ACK that is
-         * already on the receive ring. Poll once with no endpoint lock and
-         * no prepared wait token. The regular worker owns any remainder. */
+        /* On one CPU the writer can process queued acknowledgments before
+         * registering to wait. Bound that work even if other flows keep
+         * producing input; the worker owns any remainder. */
         if (!assisted && (events & KERNEL_POLLOUT) && kernel_socket_is_tcp(socket) &&
             !boaros_lwip_parallel_enabled()) {
             assisted = 1;
             socket_state_release(&state);
-            socket_receive_before_wait();
+            socket_receive_before_wait(socket);
             continue;
         }
         struct kernel_wait_token token;

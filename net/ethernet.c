@@ -300,7 +300,7 @@ static unsigned receive_inline(void *context)
     struct kernel_network *n = context;
     struct virtio_net_frame frame;
     unsigned count = 0;
-    while (count < 8 && virtio_net_receive(n->device, &frame)) {
+    while (count < KERNEL_NETWORK_RECEIVE_BATCH && virtio_net_receive(n->device, &frame)) {
         input_frame(n, &frame);
         count++;
     }
