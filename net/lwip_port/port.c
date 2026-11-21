@@ -97,8 +97,10 @@ void boaros_lwip_ip_init(unsigned cpu_count)
 #if BOAROS_USER_SMP
 void boaros_lwip_ip_lock_shared(struct kernel_lock_guard *guard)
 {
-    if(!kernel_lock_held(&ip_mutex.lock,1))
+    if(!kernel_lock_held(&ip_mutex.lock,1)) {
+        COST_SCOPE(acquire, NETWORK_IP_LOCK_TICKS);
         kernel_mutex_lock(&ip_mutex,guard);
+    }
 }
 
 struct kernel_lock_guard *boaros_lwip_ip_drop_current(void)

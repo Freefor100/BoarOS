@@ -596,6 +596,9 @@ struct socket_tcp_input {
     const void *network;
     uint16_t network_length;
     uint8_t route_bucket;
+#if BOAROS_COST_DIAGNOSTICS
+    uint64_t queued_ticks;
+#endif
 };
 struct socket_tcp_owner {
     struct kernel_mutex mutex;
@@ -668,7 +671,10 @@ static int tcp_owner_lock(struct kernel_socket_protocol_scope *scope,
             arch_interrupt_restore(scope->interrupts);
             return 0;
         }
-    } else kernel_mutex_lock(&owner->mutex,&scope->guard);
+    } else {
+        COST_SCOPE(acquire, NETWORK_TCP_LOCK_TICKS);
+        kernel_mutex_lock(&owner->mutex,&scope->guard);
+    }
     if (owner->depth || io->allocation_depth==UINT32_MAX) __builtin_trap();
     owner->depth=1;
     io->socket_tcp_owner=owner;
@@ -1846,6 +1852,10 @@ static int tcp_queue_input_locked(struct socket_tcp_owner *owner,struct pbuf *p,
     unsigned slot=(owner->head+owner->count)%TCP_RX_RING;
     owner->ring[slot]=(struct socket_tcp_input){.packet=p,.interface=input,.src=*src,.dst=*dst,
                                                .route_bucket=bucket};
+#if BOAROS_COST_DIAGNOSTICS
+    owner->ring[slot].queued_ticks=kernel_cost_clock();
+    COST_ADD(TCP_INPUT_QUEUE_DEPTH,owner->count+1);
+#endif
     if (!owner->count++ && tcp_owner_take_waiting(owner))
         (void)kernel_wait_cursor_prepare(&owner->work,wake);
     return 1;
@@ -6427,11 +6437,8 @@ void kernel_socket_network_hooks(void (*timer_wake)(void *),struct kernel_wait_q
 }
 void kernel_socket_network_capacity(void)
 {
-    struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
     SOCKET_STATE(state);nic_generation++;
     if(nic_wait.head)socket_work_ready_locked(state.owner);
-    socket_state_release(&state);
-    kernel_socket_protocol_leave(&irq);
 }
 void kernel_socket_network_blocked(void)
 {
@@ -6572,6 +6579,9 @@ static void tcp_owner_worker(void *arg)
         owner->ack_waiter = &ack_socket;
         struct socket_tcp_input input;
         for (unsigned i=0;i<16 && tcp_owner_take_input(owner,&input);i++) {
+#if BOAROS_COST_DIAGNOSTICS
+            COST_ADD(TCP_INPUT_QUEUE_TICKS,kernel_cost_clock()-input.queued_ticks);
+#endif
             if (!stopping) tcp_owner_receive(owner,&input);
             else pbuf_free(input.packet);
         }
