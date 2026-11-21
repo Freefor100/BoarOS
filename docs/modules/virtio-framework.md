@@ -43,7 +43,7 @@ block包装层记录core owner是否已消费，根清理也纳入尚未构造co
 调用方只能构造空闲descriptor。`enqueue`检查NEXT链范围/循环、flags、DMA地址
 溢出、链间descriptor冲突及indirect协商/表地址长度边界；在推进available idx之前登记
 head/token/链mask和完成长度边界。token是业务owner的不透明身份，不被框架解引用。
-发布后设备对象、transport和队列地址必须保持稳定。`notify` 在一轮 enqueue 后执行 DMA 屏障并通知队列；block 使用它合并通知，其他设备沿用一次 enqueue 后立即通知的 `publish`。设备可在 enqueue 后、notify 前完成，调用方不能把通知点当成 DMA 所有权的起点。
+发布后，设备对象、传输接口和队列地址必须保持稳定。块设备使用 `enqueue()` 发布描述符链，可以在发布后合并设备通知。网卡的发送与接收补充路径使用 `stage()` 在驱动保护内登记描述符所有者、链和队列项，再通过 `notify()` 成批推进设备可见的可用索引。直接内存访问（Direct Memory Access，DMA）屏障保证描述符和队列项先于索引可见。设备可以在索引更新后、收到通知前完成请求。
 
 `take`先读used idx并执行DMA屏障，检查ring容量、已发布head与长度边界。每次
 合法完成返回token并归还descriptor资格；它不释放业务buffer、RX loan、pbuf或

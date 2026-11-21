@@ -4,6 +4,8 @@
 #define ARCH_TASK_CPU_OFFSET 32
 void *allocator_host_cpu_get(void);
 static inline void *arch_current_cpu_get(void) { return allocator_host_cpu_get(); }
+/* These fixtures supply a processor record without a scheduler-owned task. */
+static inline void *riscv_current_thread_get(void) { return 0; }
 #define RISCV_SSTATUS_SIE 0x2
 #ifdef BOAROS_HOST_IRQ_STATE
 extern _Thread_local uintptr_t network_host_irq;

@@ -121,10 +121,13 @@ u8_t pbuf_free(struct pbuf *p)
     }
     return 0;
 }
-void kernel_socket_pbuf_free(struct pbuf *p) { (void)pbuf_free(p); }
+void kernel_socket_pbuf_free_batch(void *const *payloads, unsigned count)
+{
+    for (unsigned i = 0; i < count; i++) pbuf_free(payloads[i]);
+}
 void pbuf_ref(struct pbuf *p) { p->ref++; }
 unsigned virtio_net_tx_release(struct virtio_net_device *d,
-    void (*release)(void *), int abandon)
+    void (*release)(void *const *, unsigned), int abandon)
 {
     (void)release;
     if (!arch_interrupt_is_enabled() || protocol_held) abort();

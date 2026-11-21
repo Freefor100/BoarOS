@@ -24,7 +24,7 @@ enum virtio_status virtio_split_initialize(struct virtio_split_queue *q,void *me
     memset((void *)q->used,0,6U+8U*size);
     return VIRTIO_OK;
 }
-enum virtio_status virtio_split_enqueue(struct virtio_split_queue *q,struct virtio_transport *t,
+enum virtio_status virtio_split_stage(struct virtio_split_queue *q,struct virtio_transport *t,
     uint16_t head,void *token,uint32_t min_length,uint32_t max_length)
 {
     if(!q || !q->size || !t || !t->ops.write || !token || head>=q->size || min_length>max_length)return VIRTIO_INVALID;
@@ -46,19 +46,33 @@ enum virtio_status virtio_split_enqueue(struct virtio_split_queue *q,struct virt
         if(!(d.flags&VIRTIO_DESC_NEXT))break;
         index=d.next;
     }
-    if((mask&q->claimed) || q->owners[head].token || q->available->index!=q->next_available)return VIRTIO_STATE;
+    if((mask&q->claimed) || q->owners[head].token || q->available->index!=q->published_available)return VIRTIO_STATE;
     q->transport=t;q->owners[head].token=token;q->owners[head].mask=mask;
     q->owners[head].min_length=min_length;q->owners[head].max_length=max_length;
     q->claimed|=mask;q->inflight++;
-    q->available->ring[q->next_available%q->size]=head;
-    /* 先发布owner与完整链，最后一次半字写推进设备可见idx。 */
-    arch_dma_barrier();q->available->index=++q->next_available;
+    q->available->ring[q->next_available++%q->size]=head;
     return VIRTIO_OK;
+}
+static void publish_available(struct virtio_split_queue *q)
+{
+    /* Publish all initialized descriptors and ring entries before the
+     * aligned index store makes them visible to the device. */
+    arch_dma_barrier();
+    q->available->index=q->next_available;
+    q->published_available=q->next_available;
+}
+enum virtio_status virtio_split_enqueue(struct virtio_split_queue *q,struct virtio_transport *t,
+    uint16_t head,void *token,uint32_t min_length,uint32_t max_length)
+{
+    enum virtio_status status=virtio_split_stage(q,t,head,token,min_length,max_length);
+    if(status==VIRTIO_OK)publish_available(q);
+    return status;
 }
 enum virtio_status virtio_split_notify(struct virtio_split_queue *q,struct virtio_transport *t,uint16_t queue)
 {
     if(!q || !q->size || !t || !t->ops.write)return VIRTIO_INVALID;
     if(q->fault.reason || q->transport!=t || !t->started || t->quiescent)return VIRTIO_STATE;
+    if (q->next_available!=q->published_available)publish_available(q);
     arch_dma_barrier();t->ops.write(t->context,VIRTIO_REG_QUEUE_NOTIFY,queue);
     return VIRTIO_OK;
 }
@@ -96,6 +110,7 @@ enum virtio_status virtio_split_reset(struct virtio_split_queue *q,const struct 
     if(!q || !q->size || !t)return VIRTIO_INVALID;
     if(!t->quiescent || t->started || (q->transport && q->transport!=t))return VIRTIO_STATE;
     memset(q->owners,0,sizeof(q->owners));q->inflight=0;q->claimed=0;
-    q->last_used=0;q->next_available=0;q->transport=0;q->fault=(struct virtio_queue_fault){0};
+    q->last_used=0;q->next_available=0;q->published_available=0;
+    q->transport=0;q->fault=(struct virtio_queue_fault){0};
     q->available->index=0;q->used->index=0;arch_dma_barrier();return VIRTIO_OK;
 }

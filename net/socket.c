@@ -811,6 +811,15 @@ void kernel_socket_pbuf_free(struct pbuf *payload)
     pbuf_free(payload);
     kernel_socket_protocol_leave(&irq);
 }
+
+void kernel_socket_pbuf_free_batch(void *const *payloads, unsigned count)
+{
+    struct kernel_socket_protocol_scope scope;
+    int serial = !boaros_lwip_parallel_enabled();
+    if (serial) kernel_socket_protocol_enter(&scope);
+    for (unsigned i = 0; i < count; i++) pbuf_free(payloads[i]);
+    if (serial) kernel_socket_protocol_leave(&scope);
+}
 /* The protocol owner exclusively edits the chain. Admission only samples
  * whether a destination has already been selected for the datagram. */
 static struct pbuf *udp_pending_take(struct kernel_socket *socket)

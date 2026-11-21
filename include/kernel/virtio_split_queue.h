@@ -31,7 +31,7 @@ struct virtio_split_queue {
     struct virtio_descriptor *descriptors;
     volatile struct virtio_available_ring *available;
     volatile struct virtio_used_ring *used;
-    uint16_t size,last_used,next_available,inflight;
+    uint16_t size,last_used,next_available,published_available,inflight;
     uint64_t claimed;
     struct { void *token; uint64_t mask; uint32_t min_length,max_length; } owners[VIRTIO_SPLIT_MAX_SIZE];
     struct virtio_queue_fault fault;
@@ -46,6 +46,10 @@ enum virtio_status virtio_split_publish(struct virtio_split_queue *,struct virti
 /* Enqueue publishes one complete chain. Notify once after the caller's wave;
  * completion can already arrive between these operations. */
 enum virtio_status virtio_split_enqueue(struct virtio_split_queue *,struct virtio_transport *,
+    uint16_t,void *,uint32_t,uint32_t);
+/* Reserve a descriptor chain without advancing the device-visible index.
+ * The caller must publish the staged prefix with notify under the same guard. */
+enum virtio_status virtio_split_stage(struct virtio_split_queue *,struct virtio_transport *,
     uint16_t,void *,uint32_t,uint32_t);
 enum virtio_status virtio_split_notify(struct virtio_split_queue *,struct virtio_transport *,uint16_t);
 enum virtio_status virtio_split_take(struct virtio_split_queue *,struct virtio_completion *);

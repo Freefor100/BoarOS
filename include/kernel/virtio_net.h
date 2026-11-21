@@ -92,8 +92,9 @@ int virtio_net_send_segments(struct virtio_net_device *device,
     const struct virtio_net_tx_segment *segments, unsigned count, void *owner, int more);
 /* Every accepted deferred send is covered by a flush at the end of its batch. */
 void virtio_net_tx_flush(struct virtio_net_device *device);
-/* Return the number of released owners; abandon also releases posted/pending
- * owners after DMA stopped. tx_capacity_generation also includes copied TX. */
+/* Detach a batch under the device lock, then pass the owner array to the
+ * caller outside that lock. Abandon also detaches posted/pending owners
+ * after DMA stopped. */
 unsigned virtio_net_tx_release(struct virtio_net_device *device,
-    void (*release)(void *owner), int abandon);
+    void (*release)(void *const *owners, unsigned count), int abandon);
 #endif
