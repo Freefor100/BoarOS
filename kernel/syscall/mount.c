@@ -168,8 +168,11 @@ static __attribute__((noinline)) int unmount_filesystem(struct kernel_mm *mm,
 {
     KERNEL_FS_PATHS(fs_paths, fs);
     KERNEL_LOCK_SCOPE(topology);
+    enum { MNT_FORCE_FLAG = 1U, UMOUNT_NOFOLLOW_FLAG = 8U };
     unsigned flags=(uint32_t)request->arguments[1];
-    if (flags & ~(2U|8U)) return -KERNEL_ENOTSUP;
+    if (flags & ~(MNT_FORCE_FLAG|KERNEL_VFS_MNT_DETACH|KERNEL_VFS_MNT_EXPIRE|UMOUNT_NOFOLLOW_FLAG))
+        return -KERNEL_ENOTSUP;
+    if ((flags&MNT_FORCE_FLAG) && !(flags&KERNEL_VFS_MNT_EXPIRE)) return -KERNEL_ENOTSUP;
     if (!request->arguments[0]) return -KERNEL_EFAULT;
     char *target = 0;
     struct kernel_vfs_path *root = 0;
@@ -181,16 +184,21 @@ static __attribute__((noinline)) int unmount_filesystem(struct kernel_mm *mm,
                                request->arguments[0]);
     if (result) goto Finish;
     result = kernel_vfs_path_resolve(fs_paths.cwd,
-             fs_paths.root, target, !(flags & 8U), &root);
+             fs_paths.root, target, !(flags & UMOUNT_NOFOLLOW_FLAG), &root);
     if (result) goto Finish;
     if(!kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN)) {result=-KERNEL_EPERM;goto Finish;}
     kernel_vfs_mount_topology_lock(&topology);
     if (!kernel_vfs_mount_contains(kernel_fs_context_mount_root(fs),root)) {
         result=-KERNEL_EINVAL;goto Finish;
     }
-    flags &= ~8U;
+    flags &= ~UMOUNT_NOFOLLOW_FLAG;
     struct kernel_vfs_mount *mount = kernel_vfs_path_mount(root);
     if (!kernel_vfs_path_is_mount_root(root)) {
+        result = -KERNEL_EINVAL;
+        goto Finish;
+    }
+    if ((flags&KERNEL_VFS_MNT_EXPIRE) &&
+        ((flags&(MNT_FORCE_FLAG|KERNEL_VFS_MNT_DETACH)) || mount==kernel_vfs_path_mount(fs_paths.root))) {
         result = -KERNEL_EINVAL;
         goto Finish;
     }
@@ -202,7 +210,7 @@ static __attribute__((noinline)) int unmount_filesystem(struct kernel_mm *mm,
     }
     result=kernel_vfs_umount(root,flags);
 Finish:
-    if (root && kernel_vfs_path_release(&root)) __builtin_trap();
+    if (root && kernel_vfs_umount_path_release(&root)) __builtin_trap();
     kernel_heap_release(fs->heap, target);
     return result;
 }
