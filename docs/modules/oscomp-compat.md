@@ -82,7 +82,9 @@ ELF EXEC、LP64D 工具；LA LOAD 段符合 16 KiB 页对齐。宿主 `mke2fs` �
 识别为未知 Linux 年代，避免把自身 release 当作旧 Linux 而生成 revision 0。
 真实 Linux 继续使用原有版本判断。
 `/bin/mke2fs`、`mkfs.ext2`、`mkfs.ext3`、`mkfs.ext4` 均链接真实上游工具，原参数
-直接传入，配置使用原版 `mke2fs.conf`。
+直接传入，配置使用原版 `mke2fs.conf`。工具分区还携带从 GNU Coreutils 9.5 构建的
+`stat`、`df` 和为 LoongArch 构建的 Dash 0.5.12。源码归档随仓库交付，离线构建沿用同一
+目标编译器。仅 `df01.sh` 使用 GNU 工具，LoongArch 在监督器内用 Dash 解释原脚本。
 
 缓存模板的 LBA 8 起 4096 字节槽始终全零。每次 `make all` 或本地准备交付盘时，
 宿主为每个架构分别调用 `getrandom` 取得新的 64 字节，写入带版本、架构、长度和
@@ -120,10 +122,17 @@ LA 使用 `--arch loongarch` 和独立目录，QEMU 使用 `-cpu la464 -kernel k
 
 ## 原盘bootstrap与监督
 
-PID1直接exec原盘`/musl/busybox`，bootstrap作为sh -c参数编入内核，监督器、脚本和
-LA 调度共享对象从只读工具分区加载。启动创建/bin、设备、proc和/dev/shm，并从目标profile建立
-原loader链接。LA使用/lib、/lib64、/usr/lib64三个实际interpreter路径；RV的
-普通/sf musl名称保留。两个libc的LD_LIBRARY_PATH和工作目录分别设置。
+内核挂载初赛根盘后，启动进程直接执行原盘的 `/musl/busybox sh -c`。`tests/oscomp/prepare.py`
+将初赛脚本 `tests/oscomp/init.sh` 和架构相关的设备节点、加载器链接、工具分区挂载命令写入
+随内核构建的启动配置。该脚本以用户态身份创建 `/bin`、设备节点并挂载 `/proc`、`/sys`、
+`/dev/shm`。然后将 `/dev/vdb1` 只读挂到 `/boaros-tools`，为实际运行的测试加载工具和监督器。
+进入 Linux 测试项目（Linux Test Project，LTP）组前，只在可写根盘缺少 `nobody` 时补入账户。
+LoongArch 使用 `/lib`、`/lib64`、`/usr/lib64` 的实际解释器路径，RISC-V 保留普通与软浮点
+musl 名称。两个 C 标准库的 `LD_LIBRARY_PATH` 和工作目录分别设置。
+
+`/dev/vdb3` 的 ext4 挂载由各个原测试程序在准备阶段执行，程序结束时负责卸载。对
+`df01.sh` 使用的预置外部分区，适配后的释放入口先按设备号检查当前挂载表，仅在确认卸载后
+结束租用。真实回环设备与其他请求仍交给原 `tst_device` 工具处理。
 
 默认组顺序为basic、busybox、cyclictest、iozone、iperf、libcbench、libctest、
 lmbench、lua、netperf、ltp，各组先glibc再musl。basic/run-all.sh的原发布权限

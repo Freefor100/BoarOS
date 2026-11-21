@@ -203,55 +203,50 @@ BuildStorm 的 Rust 工具链曾在准备阶段中止。沿 `Child::wait_with_ou
 按兼容分支生成的启动配置，加载 `/musl/busybox` 并以 `sh -c` 运行启动脚本，作为用户态的
 第一个进程。BusyBox 将多条命令合在一个可执行文件里，调用名为 `sh` 时解释脚本，调用名为
 `stat` 或 `df` 时执行对应的工具。启动脚本用 `busybox --install -s /bin` 创建这些命令的
-符号链接。执行 `df01.sh` 时，内核处理文件第一行的 `#!/bin/sh` 并启动解释器，解释器按
-`PATH` 查找并运行 `stat`、`df`。命令自己的代码解析选项、查询文件系统并格式化输出，底层
+符号链接。通常执行 `df01.sh` 时，内核处理文件第一行的 `#!/bin/sh` 并启动解释器。LoongArch 的兼容入口显式选择 Dash。解释器按 `PATH` 查找并运行 `stat`、`df`。命令自己的代码解析选项、查询文件系统并格式化输出，底层
 查询与挂载通过系统调用交给内核。发布盘的 `stat`、`df` 与脚本所使用的 GNU Coreutils
 命令具有不同的选项集合；版本更新也需要核对实际应用程序及其构建配置。
 
-**`df01.sh` 的工具选项及挂载残留。** RISC-V glibc 原脚本先格式化并挂载测试盘，再用 `stat -f ... --printf=%b` 等命令读取总块数、空闲块数和块大小，以检查 `df` 输出。发布盘 BusyBox 的 `stat` 提供 `-c` 格式选项，遇到 GNU `--printf` 报错。命令替换得到空字符串，脚本在第 85 行算术表达式退出，未运行框架的卸载清理。下一程序 `execveat03` 对同一分区执行格式化时报告设备仍在挂载。LoongArch 原程序遇到的是更早的 Shell 超时参数准备错误，未走到同一条格式命令。短例只将原脚本的 `stat --printf` 参数映射到 `stat -c`，保留原脚本和 BusyBox。原程序恢复 7 项通过，剩下 5 项分别在 BusyBox 的 `df -t/-v/-H/--version/-x` 失败。框架仍在释放设备时打印警告，但同一虚拟机里的下一个 `umount2_02` 已能格式化原测试分区并通过 7 项，确认这次未遗留挂载。完整保留原脚本时，应在兼容环境同时提供 GNU Coreutils 的 `stat` 和 `df`，并将测例放到私有挂载命名空间，或在失败后显式卸载测试分区，确认无残留再复用。GNU 两个程序的完整对照和 LoongArch 的超时参数仍需分别验收。
+**`df01.sh` 的工具选项及挂载残留。** RISC-V 原脚本挂载测试分区后，用 GNU 形式的
+`stat -f ... --printf=%b` 等命令读取总块数和空闲块数，并用这些值核对 `df` 的输出。原盘
+BusyBox 的 `stat` 只支持 `-c`，命令替换得到空字符串，脚本在算术表达式处退出并遗留挂载。
+只替换 `stat` 时，BusyBox `df` 还缺少 `-t/-v/-H/--version/-x`。LoongArch 的原 Shell
+在进入断言前还无法正确传递外层局部变量 `sec`，导致测例的超时准备失败。正式流程从只读
+工具分区提供 GNU `stat`、`df`，只对这一测例更改命令搜索路径，LoongArch 由 Dash 解释原
+脚本。原脚本先卸载测试分区。它随后对外部提供的分区发出释放请求，兼容入口按设备号检查挂载
+表后结束这次租用，实际回环设备仍由上游工具执行解除绑定。
 
-**`umount03` 的账户准备失败。** LoongArch glibc 原程序约 10.7 秒退出，状态为 2、得 0 分。它先以特权用户格式化并挂载测试盘，随后用 C 库的 `getpwnam("nobody")` 查找约定的低权限账户。该用户态查询从根盘的账户数据库取得账户名对应的数字用户和组标识，通常由 `/etc/passwd` 提供。两个架构的初赛原始根盘均缺少 `/etc/passwd`。测例查找返回 `ENOENT`（找不到账户），所以未调用 `seteuid` 切换有效用户标识，也未执行卸载权限断言。内核在 `seteuid` 和卸载时使用数字身份及进程的权限状态。在独立根盘副本加入 `nobody:x:65534:65534:nobody:/:/bin/false` 后，原程序按预期得到 `EPERM`（权限不足），原摘要为 1 个通过。正式适配可由兼容分支的用户态启动脚本在可写根盘只补缺失项。原始发布镜像、反复格式化的 `/dev/vdb3` 和内核启动代码都无需写入该账户。
+**`umount03` 的账户准备失败。** LoongArch glibc 原程序约 10.7 秒退出，状态为 2、得 0 分。它先以特权用户格式化并挂载测试盘，随后用 C 库的 `getpwnam("nobody")` 查找约定的低权限账户。该用户态查询从根盘的账户数据库取得账户名对应的数字用户和组标识，通常由 `/etc/passwd` 提供。两个架构的初赛原始根盘均缺少 `/etc/passwd`。测例查找返回 `ENOENT`（找不到账户），所以未调用 `seteuid` 切换有效用户标识，也未执行卸载权限断言。内核在 `seteuid` 和卸载时使用数字身份及进程的权限状态。在独立根盘副本加入 `nobody:x:65534:65534:nobody:/:/bin/false` 后，原程序按预期得到 `EPERM`（权限不足），原摘要为 1 个通过。正式流程由兼容分支的用户态启动脚本在可写根盘只补缺失项。原始发布镜像、反复格式化的 `/dev/vdb3` 和内核启动代码都无需写入该账户。
 
-#### 官方流程的两项准备
+#### 初赛挂载位置
 
-初赛的可写根盘副本保留原发布文件。兼容分支的 `prepare.py` 生成客体启动配置，
-`local_disks.py` 打包官方流程挂载的第二盘。客体把其工具分区 `/dev/vdb1` 只读挂在
-`/boaros-tools`，将另一分区 `/dev/vdb3` 交给测例格式化。两项适配都应通过这个启动配置
-或原单项执行点进入原测试流程，保留脚本、参数、监督和判分。
-
-1. `df01.sh` 所需的 `stat` 和 `df` 应提前为目标架构构建并放入工具分区，例如
-   `/boaros-tools/coreutils/`。在该测例的子进程中把此目录放在 `PATH` 最前面，
-   使原脚本找到两个 GNU 命令，其他程序继续使用原环境。LoongArch 还要提供能执行原
-   `tst_test.sh` 超时辅助函数的解释器。应先检查原函数携带的 300 秒默认值能传入
-   `_tst_multiply_timeout`，再在单项入口显式用验证过的解释器运行原脚本。保留原计时，
-   并核对 `/dev/vdb3` 的挂载已清理，随后才允许下一个程序重新格式化。
-2. `umount03` 的准备可放在 `init.sh` 启动 LTP 之前。由特权进程在可写根盘补建
-   `/etc`，保持已有 `/etc/passwd` 内容，并只在缺少 `nobody` 时加一条账户记录。
-   保持原程序的特权启动身份，由它自己挂载、调用 `seteuid` 切换有效身份、检查
-   卸载返回 `EPERM`，并在清理阶段恢复特权和卸载。
-
-确认适配时，用同一官方单项入口查看原 `Summary:`，并检查相邻程序能重新格式化测试盘。
-本轮发布配置未加入工具或账户准备。上述 GNU 工具和 LoongArch 解释器的组合仍待验收。
+`tests/oscomp/init.sh` 负责初赛用户态启动，由 `tests/oscomp/prepare.py` 加入针对架构的
+设备节点、加载器路径和工具分区挂载命令后生成启动配置。内核先挂载根盘，再执行其中的
+`/musl/busybox sh -c`。启动脚本挂载 `/proc`、`/sys` 和 `/dev/shm`，工具分区
+`/dev/vdb1` 只读挂到 `/boaros-tools`。测例使用的 `/dev/vdb3` 由原 LTP 程序在各自
+准备阶段格式化和挂载。启动配置只在运行 LTP 时向可写根盘补缺失的账户。见
+[初赛启动与工具分区](../modules/oscomp-compat.md#原盘bootstrap与监督)。
 
 **`umount2_02` 的两步卸载。** 旧内核拒绝 `MNT_EXPIRE`，两个 glibc 配置只通过 2 项 `UMOUNT_NOFOLLOW` 断言。原测例继续执行后会留下叠放的挂载。通用内核接入过期标记后，LoongArch 和 RISC-V 的 glibc 原程序均通过 7 项，退出状态均为 0。短例在同一 RISC-V 可执行文件中对照 BoarOS 与 Linux，额外验证了忙引用、普通访问清除标记及绑定视图之间的隔离。
 
 ### 两个使用内部超时的测例
 
-- **`send02`。** 四组都停在首个传输控制协议（Transmission Control Protocol，TCP）子项，未进入用户数据报协议（User Datagram Protocol，UDP）子项。原程序每轮先发 16 字节，再用 `MSG_MORE` 暂留 16 字节，最后用 1 字节结束本批发送。它用非阻塞接收反复检查最后 17 字节。RISC-V 相同可执行文件的短对照中，BoarOS 在 10.007 秒完成 80 轮，9.943 秒花在等最后 17 字节；Linux 在 253 毫秒完成 1000 轮。通过 `TCP_INFO` 核对，BoarOS 最后一次发送返回时，前一段 16 字节仍待确认。Nagle 算法继续暂缓后续短报文，到对端延迟确认或原缓冲期限触发才推进。关闭 Nagle 的对照消除了这段等待，随后仍出现一次提前收到 `MSG_MORE` 数据，不能作为兼容适配。后续应修通用小报文确认和显式结束缓冲的协作，再验证原程序。
+- **`send02`。** 四组都停在首个传输控制协议（Transmission Control Protocol，TCP）子项，未进入用户数据报协议（User Datagram Protocol，UDP）子项。原程序每轮先发 16 字节，再用 `MSG_MORE` 暂留 16 字节，最后用 1 字节结束本批发送。它用非阻塞接收反复检查最后 17 字节。RISC-V 相同可执行文件的短对照中，BoarOS 在 10.007 秒完成 80 轮，9.943 秒花在等最后 17 字节；Linux 在 253 毫秒完成 1000 轮。通过 `TCP_INFO` 核对，BoarOS 最后一次发送返回时，前一段 16 字节仍待确认。Nagle 算法继续暂缓后续短报文，到对端延迟确认或原缓冲期限触发才推进。关闭 Nagle 的对照消除了这段等待，随后仍出现一次提前收到 `MSG_MORE` 数据，不能作为兼容适配。通用内核现在对首个有序数据段及时安排确认，后续数据保留延迟确认。控制确认可以独立发送，输入和定时器不会提前释放应用指定的短尾。同一套接字的数据报发送也支持 `MSG_MORE`，最后一次无标志发送提交完整数据报。
 - **`statx11`。** 超时在准备阶段。`setup` 先查 `/sys/block/vdb3/queue/logical_block_size`，找不到便逐字符截短设备名，预期能查到整盘 `vdb`。Linux 通常经 `/sys/block/vdb/queue/` 提供整盘队列的属性，分区目录没有独立的 `queue`。发布程序没有空名称终止条件，耗尽字符后还有越界写入，四组均未执行 `statx`。
 
-`/dev/vdb3` 是供进程打开分区的块设备节点。初赛兼容启动脚本用 `mknod` 在根盘创建该节点，
-同时显式执行 `mount -t proc proc /proc`。进程文件系统（process filesystem，procfs）由内核
-提供进程和系统信息，启动脚本负责将它接到 `/proc`。系统文件系统（system filesystem，sysfs）
-由内核导出设备等内核对象的属性，初赛的 `init.sh` 没有将它挂到 `/sys`，决赛的启动脚本则有
-该挂载步骤。设备临时文件系统（device temporary filesystem，devtmpfs）可在 `/dev` 提供
-设备节点；初赛流程使用手工创建的节点。Linux 可按 `CONFIG_DEVTMPFS_MOUNT` 在挂好根盘后自动
-挂载 `devtmpfs`，也可以由用户态挂载，具体取决于启动方式和配置。
+初赛兼容脚本此前只挂载进程文件系统（process filesystem，procfs），现在也把系统文件系统
+（system filesystem，sysfs）挂到 `/sys`。初赛仍由用户态以 `mknod` 创建设备节点，Linux
+也可通过设备临时文件系统（device temporary filesystem，devtmpfs）提供它们。设备节点
+`/dev/vdb3` 用于打开分区，整盘队列属性由 `/sys/block/vdb/queue/` 提供，两处属于不同接口。
 
-即使给初赛加上 `mount -t sysfs sysfs /sys`，BoarOS 当前的 `kernel_sysfs_mount` 仍未导出
-`/sys/block` 和块设备队列属性。跑通 `statx11` 需要初赛启动完成挂载，内核按设备实际信息导出
-`logical_block_size` 和 `dma_alignment`，并在 `statx` 中以 `STATX_DIOALIGN` 报告一致的直接输入
-输出对齐要求。修正测例的查找边界可使缺少准备条件时及时退出。
+BoarOS 从实际块设备导出 `logical_block_size` 和 `dma_alignment`，并在 `statx` 中通过
+`STATX_DIOALIGN` 返回一致的直接输入输出对齐值。LoongArch glibc 发布程序执行了两个对齐断言。
+RISC-V 两个发布程序和 LoongArch musl 发布程序取得相应结果掩码后，走到编译期缺少字段的
+`TCONF` 分支。其固定提示提及 glibc，也会出现在原 musl 程序中。发布程序原样保留。
+
+使用官方容器中的 QEMU 及初赛原程序验证时，两架构、两种库的 `df01.sh` 均由原摘要报告
+12 项通过、0 警告，并可正常复用测试分区。`send02` 均通过 TCP 和三种 UDP 发送场景，
+`umount03` 均到达卸载权限断言并通过。`statx11` 的三处配置跳过来自发布程序编译条件。
 
 ### `fs_fill` 的空间预留修复
 

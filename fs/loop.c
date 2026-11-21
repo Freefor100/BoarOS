@@ -412,8 +412,9 @@ static int configure_loop(struct loop_device *loop,struct kernel_files *files,in
             loop->info.number=loop->number;
             if (!kernel_open_file_writable(backing) || !(open_flags&3U)) loop->info.flags|=KERNEL_LOOP_READ_ONLY;
             loop->backing=backing;loop->parent=parent;
-            loop->block.logical_block_size=block_size?block_size:512;
-            loop->block.soft_block_size=loop->block.logical_block_size;
+            uint32_t sector_size=block_size?block_size:512;
+            __atomic_store_n(&loop->block.logical_block_size,sector_size,__ATOMIC_RELEASE);
+            loop->block.soft_block_size=sector_size;
             __atomic_store_n(&loop->block.capacity_bytes,loop_capacity(backing,&loop->info),__ATOMIC_RELEASE);
             __atomic_store_n(&loop->block.read_only,!!(loop->info.flags&KERNEL_LOOP_READ_ONLY),__ATOMIC_RELEASE);
             loop->state=LOOP_BOUND;loop->worker_done=0;loop->detach_error=0;

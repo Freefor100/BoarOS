@@ -1,7 +1,7 @@
 #!/musl/busybox sh
 set -e
 BB=/musl/busybox
-$BB mkdir -p /bin /lib /lib64 /usr/lib64 /tmp /dev/misc /dev/block /dev/shm /proc
+$BB mkdir -p /bin /lib /lib64 /usr/lib64 /tmp /dev/misc /dev/block /dev/shm /proc /sys
 $BB --install -s /bin
 $BB ln -s /musl/busybox /bin/busybox
 # BOAROS_LOADER_LINKS
@@ -19,6 +19,7 @@ $BB mknod -m 600 /dev/block/252:0 b 252 0
 # BOAROS_LOCAL_DEVICE_NODES
 exec </dev/console >/dev/console 2>&1
 $BB mount -t proc proc /proc
+$BB mount -t sysfs sysfs /sys
 $BB mount -t tmpfs -o mode=1777 tmpfs /dev/shm
 $BB chmod 1777 /tmp
 # 发布镜像将此脚本存成 0644；补执行权限，不改测例内容或判断。
@@ -28,6 +29,24 @@ export HOME=/ TERM=vt100
 # BOAROS_CASE_PAYLOAD
 groups=${BOAROS_EVAL_GROUPS:-'basic busybox cyclictest iozone iperf libcbench libctest lmbench lua netperf ltp'}
 export BOAROS_LTP_CASE_TIMEOUT=${BOAROS_LTP_CASE_TIMEOUT:-120}
+case " $groups " in
+    *' ltp '*)
+        # 权限测例通过 C 库从可写根盘查询低权限账户。
+        $BB mkdir -p /etc
+        add_nobody=1
+        if [ -e /etc/passwd ]; then
+            if $BB grep -q '^nobody:' /etc/passwd; then
+                add_nobody=0
+            else
+                [ "$?" -eq 1 ] || exit 125
+            fi
+        fi
+        if [ "$add_nobody" -eq 1 ]; then
+            if [ -s /etc/passwd ]; then printf '\n' >> /etc/passwd; fi
+            printf '%s\n' 'nobody:x:65534:65534:nobody:/:/bin/false' >> /etc/passwd
+        fi
+        ;;
+esac
 for group in $groups; do
     for libc in glibc musl; do
         (

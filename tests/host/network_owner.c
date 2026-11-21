@@ -12,11 +12,11 @@
 #include "lwip/priv/nd6_priv.h"
 static err_t copy_capacity_tcp_writev(struct tcp_pcb *,
     const struct kernel_socket_write_segment *,unsigned,u16_t,u8_t,u16_t *);
-static err_t held_completion_tcp_output(struct tcp_pcb *, u8_t);
+static err_t held_completion_tcp_output(struct tcp_pcb *);
 #define boaros_lwip_tcp_writev copy_capacity_tcp_writev
-#define boaros_lwip_tcp_output_more(pcb, more) held_completion_tcp_output(pcb, more)
+#define tcp_output(pcb) held_completion_tcp_output(pcb)
 #include "../../net/socket.c"
-#undef boaros_lwip_tcp_output_more
+#undef tcp_output
 #undef boaros_lwip_tcp_writev
 #include "../../net/ethernet.c"
 #include "../../kernel/pid.c"
@@ -1482,12 +1482,16 @@ static void tcp_more_contract(void)
     tcp_more_service();tcp_more_read(server,"timeout",7);
     CHECK(!client->tcp->boaros_cork_pending);
 
-    /* MORE is not CORK: an unrelated ordinary output opportunity can push it. */
+    /* Control output sends the ACK while retaining the application tail. */
     CHECK(write_buffer(client,"ack",3,KERNEL_SOCKET_MSG_MORE)==3);
     tcp_more_service();CHECK(!server->rx_bytes);
     {struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
-     CHECK(tcp_output(client->tcp)==ERR_OK);kernel_socket_protocol_leave(&scope);}
-    tcp_more_service();tcp_more_read(server,"ack",3);
+     tcp_ack_now(client->tcp);
+     CHECK(tcp_output(client->tcp)==ERR_OK && !(client->tcp->flags&TF_ACK_NOW));
+     kernel_socket_protocol_leave(&scope);}
+    tcp_more_service();CHECK(!server->rx_bytes && client->tcp->unsent);
+    CHECK(write_buffer(client,"!",1,0)==1);
+    tcp_more_service();tcp_more_read(server,"ack!",4);
 
     unsigned mss=tcp_mss(client->tcp);static char payload[32768];
     CHECK(mss+3<sizeof(payload));memset(payload,'m',mss+3);
@@ -1535,7 +1539,7 @@ static void tcp_more_contract(void)
     kernel_socket_destroy(second_client);kernel_socket_destroy(second_server);kernel_socket_destroy(second_listener);
     tcp_more_service();kernel_socket_network_purge_orphans();tcp_more_service();
     CHECK(!heap_live && boaros_lwip_tcp_cork_delay(sys_now())==UINT32_MAX);
-    puts("PASS TCP MSG_MORE: syscall tail, ordinary ACK policy, full MSS, fixed deadline/wrap, NODELAY push, FIN and timer ownership");
+    puts("PASS TCP MSG_MORE: syscall tail, separate ACK, full MSS, fixed deadline/wrap, NODELAY push, FIN and timer ownership");
 }
 
 static void tcp_cork_contract(void)
@@ -1594,16 +1598,16 @@ static void tcp_cork_contract(void)
     tcp_more_service();CHECK(server->rx_bytes==1);tcp_more_read(server,"r",1);
     CHECK(!kernel_socket_set_option(client,KERNEL_SOCKET_CORK,0));tcp_more_service();tcp_more_read(server,"tail",4);
 
-    /* A push survives a closed window. MORE overrides it for the application
-     * attempt, but ordinary window-open output can send the combined tail. */
+    /* A window update retains a newer MORE suffix merged with an older push. */
     CHECK(!kernel_socket_set_option(client,KERNEL_SOCKET_CORK,1));
     tcpwnd_size_t window=client->tcp->snd_wnd;client->tcp->snd_wnd=0;
     CHECK(write_buffer(client,"a",1,0)==1 && !kernel_socket_set_option(client,KERNEL_SOCKET_NODELAY,1));
     CHECK(write_buffer(client,"b",1,KERNEL_SOCKET_MSG_MORE)==1);
     {struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
-     client->tcp->snd_wnd=window;CHECK(boaros_lwip_tcp_output_more(client->tcp,1)==ERR_OK && client->tcp->unsent);
-     CHECK(tcp_output(client->tcp)==ERR_OK && !client->tcp->unsent);
+     client->tcp->snd_wnd=window;CHECK(tcp_output(client->tcp)==ERR_OK && client->tcp->unsent);
      kernel_socket_protocol_leave(&scope);}
+    tcp_more_service();CHECK(!server->rx_bytes);
+    CHECK(!kernel_socket_set_option(client,KERNEL_SOCKET_NODELAY,1));
     tcp_more_service();tcp_more_read(server,"ab",2);
 
     /* A full application admission budget must push before waiting for room,
@@ -2435,7 +2439,7 @@ static void remote_work_ready(struct kernel_wait_node *node,uint32_t reason,uint
     CHECK(!pthread_mutex_lock(&remote_gate));remote_work=1;
     CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));
 }
-static err_t held_completion_tcp_output(struct tcp_pcb *pcb, u8_t more)
+static err_t held_completion_tcp_output(struct tcp_pcb *pcb)
 {
     if (completion_output.socket && pcb==completion_output.socket->tcp) {
         CHECK(caller_owns_protocol() && !kernel_cpu_current()->raw_locks);
@@ -2447,7 +2451,7 @@ static err_t held_completion_tcp_output(struct tcp_pcb *pcb, u8_t more)
         completion_output.socket=NULL;
         CHECK(!pthread_mutex_unlock(&remote_gate));
     }
-    return boaros_lwip_tcp_output_more(pcb, more);
+    return tcp_output(pcb);
 }
 struct completed_output_write {
     struct kernel_socket *socket;

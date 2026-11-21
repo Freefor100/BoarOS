@@ -113,6 +113,57 @@ def run_logged(command, cwd, log, environment=None):
                        stdout=stream, stderr=subprocess.STDOUT, check=True)
 
 
+def build_ltp_tools(cache, arch, target, environment, host):
+    recipes = {
+        'coreutils': (['--disable-nls', '--disable-acl', '--disable-libcap',
+                       '--without-gmp', '--without-openssl', '--without-selinux'],
+                      ['src/stat', 'src/df']),
+    }
+    if arch == 'loongarch':
+        recipes['dash'] = ([], ['src/dash'])
+    for package, (options, programs) in recipes.items():
+        facts = INPUTS[package]
+        archive = ROOT / facts['archive']
+        source = cache / facts['source']
+        build = target / facts['source']
+        products = [target / Path(program).name for program in programs]
+        identity = {'archive': sha(archive), 'cc': sha(environment['CC']),
+                    'cflags': environment['CFLAGS'], 'ldflags': environment['LDFLAGS'],
+                    'options': [*host, *options]}
+        stamp = build / 'identity.json'
+        if stamp.is_file() and json.loads(stamp.read_text()) == identity and all(
+                product.is_file() for product in products):
+            for product in products:
+                verify_target(product, arch)
+            continue
+        with locked(cache / 'source.lock'):
+            if not source.is_dir():
+                with tempfile.TemporaryDirectory(prefix=package + '-', dir=cache) as temporary:
+                    with tarfile.open(archive) as content:
+                        content.extractall(temporary)
+                    (Path(temporary) / facts['source']).replace(source)
+        if build.exists():
+            shutil.rmtree(build)
+        build.mkdir()
+        log = build / 'build.log'
+        print('Building LTP tools:', arch, package, 'log:', log, flush=True)
+        tool_env = dict(environment, FORCE_UNSAFE_CONFIGURE='1', CC_FOR_BUILD='/usr/bin/cc')
+        run_logged([source / 'configure', *host, *options], build, log, tool_env)
+        if package == 'coreutils':
+            # Automake generates the portability headers before its "all"
+            # target. A direct executable target needs that prerequisite too.
+            (build / 'ltp-headers.mk').write_text('ltp-headers: $(BUILT_SOURCES)\n')
+            run_logged(['make', '-j8', '-f', 'Makefile', '-f', 'ltp-headers.mk', 'ltp-headers'],
+                       build, log, tool_env)
+            run_logged(['make', '-j8', *programs], build, log, tool_env)
+        else:
+            run_logged(['make', '-j8'], build, log, tool_env)
+        for program, product in zip(programs, products):
+            shutil.copy2(build / program, product)
+            verify_target(product, arch)
+        stamp.write_text(json.dumps(identity) + '\n')
+
+
 def build_tools(cache, arch):
     cache = Path(cache).resolve()
     source = fixed_source(cache)
@@ -137,6 +188,10 @@ def build_tools(cache, arch):
             if arch == 'loongarch': link += ['-Wl,-z,max-page-size=16384']
             host = ['--host=' + subprocess.check_output([cc, '-dumpmachine'], text=True).strip()]
             environment.update({name.upper(): prefix + name for name in ('ar', 'ranlib', 'ld', 'strip', 'nm', 'objcopy', 'objdump')})
+        environment.update(CC=str(cc), CFLAGS=' '.join(flags), LDFLAGS=' '.join(link + flags),
+                           BUILD_CC='/usr/bin/cc', PKG_CONFIG='false')
+        if arch != 'host':
+            build_ltp_tools(cache, arch, target, environment, host)
         options = ['--enable-libuuid', '--enable-libblkid', '--disable-nls',
                    '--disable-elf-shlibs', '--disable-uuidd', '--disable-fuse2fs',
                    '--without-libarchive', '--without-pthread', '--disable-rpath', *host]
@@ -169,8 +224,6 @@ def build_tools(cache, arch):
             if build.exists(): shutil.rmtree(build)
             build.mkdir()
         log = target / 'build.log'; log.write_text('')
-        environment.update(CC=str(cc), CFLAGS=' '.join(flags), LDFLAGS=' '.join(link + flags),
-                           BUILD_CC='/usr/bin/cc', PKG_CONFIG='false')
         print('Building fixed filesystem tools:', arch, 'log:', log, flush=True)
         if not reuse:
             run_logged([source / 'configure', *options], build, log, environment)
@@ -202,7 +255,7 @@ def mbr():
 
 def payload_files(arch):
     build = ROOT / ('build/riscv' if arch == 'riscv' else 'build/loongarch') / 'oscomp'
-    result = {'case': build / 'case'}
+    result = {'case': build / 'case', 'tst_device': HERE / 'ltp-device.sh'}
     for name in ('ltp-hook.sh', 'libctest-hook.sh', 'ltp-case.sh', 'ltp-skips.tsv'):
         result[name] = HERE / name
     if arch == 'loongarch': result['linux-sched.so'] = build / 'linux-sched.so'
@@ -225,7 +278,10 @@ def prepare_assets(cache, arch):
         return cache / arch
     host, target = build_tools(cache, 'host'), build_tools(cache, arch)
     files = payload_files(arch)
-    for name in ('mke2fs', 'mke2fs.conf', 'seed'): files[name] = target / name
+    for name in ('mke2fs', 'mke2fs.conf', 'seed', 'stat', 'df'):
+        files[name] = target / name
+    if arch == 'loongarch':
+        files['dash'] = target / 'dash'
     fat = Path(INPUTS['dosfstools']['path'])
     version = subprocess.run([fat, '--help'], capture_output=True, text=True).stdout
     if 'mkfs.fat ' + INPUTS['dosfstools']['version'] not in version:

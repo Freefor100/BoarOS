@@ -95,6 +95,13 @@ iovec 的地址和长度按设备逻辑扇区对齐。有效请求每次最多�
 FD 仍按后备普通文件的文件系统规则读写。`O_DIRECT` 的块设备支持范围是未挂载设备，
 已挂载文件系统独立管理其缓存。普通文件支持情况见[文件模块](kernel-files.md)。
 
+系统文件系统（sysfs）在挂载时从块设备登记表取得快照，沿用设备临时文件系统
+（devtmpfs）的设备命名，并在 `/sys/block/<整盘>/queue/` 导出 `logical_block_size`
+和 `dma_alignment`。分区沿用父盘队列，设备借用在复制属性后归还。已有挂载继续读到
+该次快照。对于已登记的块设备，`statx` 在请求 `STATX_DIOALIGN` 时按实际设备报告直接
+输入输出（Direct I/O，DIO）的内存地址和偏移对齐。当前用户读写统一按逻辑扇区对齐，
+因此这两个值为逻辑扇区大小，队列的 `dma_alignment` 对齐掩码为该值减一。
+
 `FILE_IO_HOST_TCP=0 FILE_IO_BLOCK_ONLY=1 sh tests/host/file-io-concurrency.sh` 检查
 对齐、故障前缀和 splice 中途切换状态标志。`tests/userland/direct-block.py` 运行
 `tests/workloads/io/direct-block.c` 的静态 ELF，使用私有 VirtIO 盘和 loop 设备。

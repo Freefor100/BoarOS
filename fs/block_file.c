@@ -60,12 +60,15 @@ enum kernel_files_status kernel_block_file_io(struct kernel_open_file_descriptio
     if (offset >= capacity) { *result = writing ? -KERNEL_ENOSPC : 0; return 0; }
     if (count > capacity - offset) count = capacity - offset;
     if (count > KERNEL_FILES_MAX_RW_COUNT) count = KERNEL_FILES_MAX_RW_COUNT;
-    size_t sector = device->logical_block_size;
+    size_t sector = kernel_block_logical_size(device);
     if (!sector || sector > SIZE_MAX - BOAROS_PAGE_SIZE) { *result = -KERNEL_EINVAL; return 0; }
     uint32_t flags = kernel_open_file_flags(file);
     int direct = !!(flags & KERNEL_FILES_O_DIRECT);
     if (direct) {
-        if (sector > BOAROS_PAGE_SIZE || offset % sector || count % sector) { *result = -KERNEL_EINVAL; return 0; }
+        if (!kernel_block_user_dio_alignment(sector) || offset % sector || count % sector) {
+            *result = -KERNEL_EINVAL;
+            return 0;
+        }
         uint64_t remaining = count;
         for (size_t i = 0; i < iov_count && remaining; ++i) {
             uint64_t length = iov[i].length < remaining ? iov[i].length : remaining;
@@ -140,7 +143,7 @@ int kernel_block_file_pread(struct kernel_open_file_description *file, uint64_t 
     if (size > capacity - offset) size = capacity - offset;
     if (!size) return 0;
     void *scratch = 0;
-    size_t sector = file->block->logical_block_size;
+    size_t sector = kernel_block_logical_size(file->block);
     if (status_flags & KERNEL_FILES_O_DIRECT) {
         if (!sector || offset % sector || size % sector) return -KERNEL_EINVAL;
         int error = block_error(kernel_block_read_at(file->block, offset, buffer, size));
@@ -163,7 +166,7 @@ int kernel_block_file_pwrite(struct kernel_open_file_description *file, uint64_t
     if (offset >= capacity) return -KERNEL_ENOSPC;
     if (size > capacity - offset) size = capacity - offset;
     void *scratch = 0;
-    size_t sector = file->block->logical_block_size;
+    size_t sector = kernel_block_logical_size(file->block);
     if (status_flags & KERNEL_FILES_O_DIRECT) {
         if (!sector || offset % sector || size % sector) return -KERNEL_EINVAL;
         int error = block_error(kernel_block_write_at(file->block, offset, buffer, size));
@@ -198,7 +201,7 @@ int64_t kernel_block_file_ioctl(struct kernel_files *files, struct kernel_open_f
     case 0x80081272: /* BLKGETSIZE64 */
         value = __atomic_load_n(&device->capacity_bytes, __ATOMIC_ACQUIRE);
         return transfer(mm, argument, &value, sizeof(value), 0);
-    case 0x1268: integer = device->logical_block_size; break; /* BLKSSZGET */
+    case 0x1268: integer = kernel_block_logical_size(device); break; /* BLKSSZGET */
     case 0x125e: integer = kernel_block_read_only(device); break; /* BLKROGET */
     case 0x80081270: integer = __atomic_load_n(&device->soft_block_size, __ATOMIC_ACQUIRE); break;
     case 0x125d: /* BLKROSET */
@@ -210,7 +213,7 @@ int64_t kernel_block_file_ioctl(struct kernel_files *files, struct kernel_open_f
         if(!argument)return -KERNEL_EINVAL;
         if (transfer(mm, argument, &integer, sizeof(integer), 1)) return -KERNEL_EFAULT;
         if (integer < 512 || integer > BOAROS_PAGE_SIZE || (integer & (integer - 1)) ||
-            integer < device->logical_block_size) return -KERNEL_EINVAL;
+            integer < kernel_block_logical_size(device)) return -KERNEL_EINVAL;
         int claim = !(file->open_flags & 0200U);
         int error = claim ? kernel_block_claim(device, file) : 0;
         if (error) return error;

@@ -1794,8 +1794,14 @@ tcp_receive(struct tcp_input_state *rx, struct tcp_pcb *pcb)
 #endif /* TCP_QUEUE_OOSEQ */
 
 
-        /* Acknowledge the segment(s). */
-        tcp_ack(pcb);
+        /* Establish the sender's ACK clock on the first in-order data.
+         * Later data keeps the normal delayed-ACK policy. */
+        if (rx->recv_data && !(pcb->flags & TF_RCVDATA)) {
+          tcp_set_flags(pcb, TF_RCVDATA);
+          tcp_ack_now(pcb);
+        } else {
+          tcp_ack(pcb);
+        }
 
 #if LWIP_TCP_SACK_OUT
         if (LWIP_TCP_SACK_VALID(pcb, 0)) {

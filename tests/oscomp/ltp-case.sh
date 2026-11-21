@@ -33,4 +33,13 @@ while IFS="$tab" read -r helper source reason <&3; do
     fi
 done
 exec 3<&- || exit 125
+if [ "$name" = df01.sh ]; then
+    # 原脚本使用 GNU stat、df 的选项。工具目录只进入该测例的环境。
+    PATH=/boaros-tools:$PATH
+    export PATH
+    if [ "${BOAROS_EVAL_ARCH:-}" = loongarch ]; then
+        # 原计时函数通过变量名读取调用者的 local sec，LA 发布盘的 hush 无法解析它。
+        exec "$runner" -i "$limit" /boaros-tools/dash "$file"
+    fi
+fi
 exec "$runner" "$limit" "$shell" "$file"

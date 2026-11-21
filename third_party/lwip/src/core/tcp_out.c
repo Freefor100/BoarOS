@@ -1559,7 +1559,7 @@ tcp_ipv6_resize_head(struct tcp_pcb *pcb, struct netif *netif)
  *         another err_t on error
  */
 err_t
-boaros_lwip_tcp_output_more(struct tcp_pcb *pcb, u8_t more)
+tcp_output(struct tcp_pcb *pcb)
 {
   struct tcp_seg *seg, *useg;
   u32_t wnd, snd_nxt;
@@ -1585,6 +1585,7 @@ boaros_lwip_tcp_output_more(struct tcp_pcb *pcb, u8_t more)
   }
 
   wnd = LWIP_MIN(pcb->snd_wnd, pcb->cwnd);
+  const u8_t more = pcb->boaros_output_more;
 
   seg = pcb->unsent;
 
@@ -1679,11 +1680,9 @@ boaros_lwip_tcp_output_more(struct tcp_pcb *pcb, u8_t more)
       u32_t seq = lwip_ntohl(seg->tcphdr->seqno);
       int pushed = !more && pcb->boaros_push_pending && TCP_SEQ_LT(seq, pcb->boaros_push_seq);
       if (!pushed && !TCP_SEQ_LT(seq, pcb->snd_nxt)) {
-        if (hold_tail) {
-          boaros_lwip_tcp_cork_arm(pcb);
-          /* A withheld data tail must not withhold a window update or an ACK. */
-          if (pcb->flags & TF_ACK_NOW) return tcp_send_empty_ack(pcb);
-        }
+        if (hold_tail) boaros_lwip_tcp_cork_arm(pcb);
+        /* Data held by either policy must not delay an independent ACK. */
+        if (pcb->flags & TF_ACK_NOW) return tcp_send_empty_ack(pcb);
         break;
       }
     }
@@ -1789,12 +1788,6 @@ output_done:
   if (pcb->unsent == NULL && pcb->boaros_cork_pending) boaros_lwip_tcp_cork_cancel(pcb);
   tcp_clear_flags(pcb, TF_NAGLEMEMERR);
   return ERR_OK;
-}
-
-err_t
-tcp_output(struct tcp_pcb *pcb)
-{
-  return boaros_lwip_tcp_output_more(pcb, 0);
 }
 
 /** Check if a segment's pbufs are used by someone else than TCP.

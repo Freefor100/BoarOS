@@ -52,6 +52,16 @@
     },
     "archive": "third_party/sources/e2fsprogs-1.47.2.tar.xz"
   },
+  "coreutils": {
+    "source": "coreutils-9.5",
+    "archive": "third_party/sources/coreutils-9.5.tar.xz",
+    "url": "https://ftp.gnu.org/gnu/coreutils/coreutils-9.5.tar.xz"
+  },
+  "dash": {
+    "source": "dash-0.5.12",
+    "archive": "third_party/sources/dash-0.5.12.tar.gz",
+    "url": "https://deb.debian.org/debian/pool/main/d/dash/dash_0.5.12.orig.tar.gz"
+  },
   "architectures": {
     "riscv": {
       "elf_machine": 243,

@@ -106,6 +106,7 @@ struct kernel_socket_write_request {
 int kernel_socket_preserves_messages(const struct kernel_socket *socket);
 int kernel_socket_is_stream(const struct kernel_socket *socket);
 int kernel_socket_is_seqpacket(const struct kernel_socket *socket);
+int kernel_socket_is_udp(const struct kernel_socket *socket);
 /* Linux SEQPACKET checks pending error/connection before SCM interpretation. */
 int kernel_socket_prepare_send(struct kernel_socket *socket);
 int kernel_socket_prepare_receive(struct kernel_socket *socket);

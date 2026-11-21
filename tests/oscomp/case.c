@@ -91,7 +91,7 @@ static void stop_group(long group, long child, int signal)
     if (child > 0) call(NR_KILL, child, signal, 0, 0, 0, 0);
 }
 
-static int run(int argc, char **argv, char **envp)
+static int run(int argc, char **argv, char **envp, int interpret)
 {
     if (argc < 4 || argc > 27) return setup_error("arguments", argc);
     long limit = 0;
@@ -134,18 +134,15 @@ static int run(int argc, char **argv, char **envp)
         }
         char *arguments[32];
         arguments[0] = argv[2];
-        arguments[1] = "sh";
-        arguments[2] = "-c";
-        arguments[3] = "exec \"$@\"";
-        arguments[4] = "boaros-case";
-#ifdef CASE_HOST
-        arguments[1] = "-c";
-        arguments[2] = "exec \"$@\"";
-        arguments[3] = "boaros-case";
-        unsigned base = 4;
-#else
-        unsigned base = 5;
+        unsigned base = 1;
+        if (!interpret) {
+#ifndef CASE_HOST
+            arguments[base++] = "sh";
 #endif
+            arguments[base++] = "-c";
+            arguments[base++] = "exec \"$@\"";
+            arguments[base++] = "boaros-case";
+        }
         for (int i = 3; i < argc; i++) arguments[base++] = argv[i];
         arguments[base] = 0;
         long error = call(NR_EXEC, (long)argv[2], (long)arguments, (long)envp, 0, 0, 0);
@@ -213,11 +210,14 @@ static int run(int argc, char **argv, char **envp)
 
 static int timed_run(int argc, char **argv, char **envp)
 {
+    /* -i selects a script interpreter while preserving the logged script name. */
+    int interpret = argc > 1 && argv[1][0] == '-' && argv[1][1] == 'i' && !argv[1][2];
+    if (interpret) { argc--; argv++; }
     const char *program = argc > 3 ? argv[3] : "invalid-arguments";
     long start = now();
     message("BOAROS-CASE START command="); message(program);
     message(" monotonic_ms="); number(start); message("\n");
-    int result = run(argc, argv, envp);
+    int result = run(argc, argv, envp, interpret);
     long end = now();
     message("BOAROS-CASE END command="); message(program);
     message(" status="); number(result);
