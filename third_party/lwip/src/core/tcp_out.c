@@ -180,6 +180,11 @@ tcp_ip_output(const struct tcp_pcb *pcb, struct pbuf *p, struct netif *netif,
   /* The interface may have gone down since the earlier route selection. */
   if (boaros_lwip_parallel_enabled() &&
       (!netif_is_up(netif) || !netif_is_link_up(netif))) return ERR_RTE;
+  struct boaros_link_defer defer = { .packet = p };
+  /* Only a sharded connection with its own IP guard can release that
+   * guard here. Its owner protects the packet and serializes the next send. */
+  int split = ip.lock && pcb && pcb->boaros_owner && netif->hwaddr_len;
+  if (split) netif->boaros_link_defer = &defer;
 #endif
   if (pcb) {
     NETIF_SET_HINTS(netif, LWIP_CONST_CAST(struct netif_hint*, &(pcb->netif_hints)));
@@ -187,13 +192,25 @@ tcp_ip_output(const struct tcp_pcb *pcb, struct pbuf *p, struct netif *netif,
   err_t result = ip_output_if(p, src, dst, pcb ? pcb->ttl : TCP_TTL,
                               pcb ? pcb->tos : 0, IP_PROTO_TCP, netif);
   NETIF_RESET_HINTS(netif);
+#if BOAROS_USER_SMP
+  if (split) netif->boaros_link_defer = NULL;
+#endif
+#ifdef BOAROS_LWIP_TCP_INFO
+  /* Route and neighbor state are already protected during IP output. */
+  u16_t mtu = 0;
+  if (path_mtu && result == ERR_OK)
+    mtu = IP_IS_V6(dst) ? nd6_get_destination_mtu(ip_2_ip6(dst), netif) : netif->mtu;
+#endif
+#if BOAROS_USER_SMP
+  if (result == ERR_OK && defer.submit) {
+    boaros_lwip_ip_unlock(&ip);
+    result = defer.submit(netif, p);
+  }
+#endif
 #ifdef BOAROS_LWIP_TCP_INFO
   if (pcb && pcb->state != LISTEN && result == ERR_OK) {
     LWIP_CONST_CAST(struct tcp_pcb *, pcb)->boaros_segs_out++;
-    /* Route and neighbor state are already protected during IP output. */
-    if (path_mtu) {
-      *path_mtu = IP_IS_V6(dst) ? nd6_get_destination_mtu(ip_2_ip6(dst), netif) : netif->mtu;
-    }
+    if (path_mtu) *path_mtu = mtu;
   }
 #else
   LWIP_UNUSED_ARG(path_mtu);

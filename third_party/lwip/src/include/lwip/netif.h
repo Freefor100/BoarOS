@@ -263,6 +263,13 @@ typedef u8_t netif_addr_idx_t;
  #define LWIP_NETIF_USE_HINTS              0
 #endif /* LWIP_NETIF_HWADDRHINT || LWIP_VLAN_PCP*/
 
+#if BOAROS_USER_SMP
+struct boaros_link_defer {
+  const struct pbuf *packet;
+  netif_linkoutput_fn submit;
+};
+#endif
+
 /** Generic data structure used for all lwIP network interfaces.
  *  The following fields should be filled in by the initialization
  *  function for the device driver: hwaddr_len, hwaddr[], mtu, flags */
@@ -402,6 +409,9 @@ struct netif {
 #if LWIP_NETIF_USE_HINTS
   struct netif_hint *hints;
 #endif /* LWIP_NETIF_USE_HINTS */
+#if BOAROS_USER_SMP
+  struct boaros_link_defer *boaros_link_defer; /* Borrowed only during locked IP output. */
+#endif
 #if ENABLE_LOOPBACK
   /* List of packets to be queued for ourselves. */
   struct pbuf *loop_first;

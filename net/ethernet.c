@@ -55,7 +55,7 @@ static void release_owner(void *owner)
 {
     kernel_socket_pbuf_free(owner);
 }
-static err_t link_output(struct netif *interface, struct pbuf *p)
+static err_t submit_link_frame(struct netif *interface, struct pbuf *p)
 {
     COST_SCOPE(output_cost, NET_TX_OUTPUT_TICKS);
     struct kernel_network *n = interface->state;
@@ -79,10 +79,7 @@ static err_t link_output(struct netif *interface, struct pbuf *p)
             pbuf_ref(p);
             int result = virtio_net_send_segments(n->device, segments,
                                                              count, p);
-            if (result == 0) {
-                kernel_socket_packet_ethernet(interface,p,NULL,p->tot_len,1);
-                return ERR_OK;
-            }
+            if (result == 0) return ERR_OK;
             pbuf_free(p);
             if (result == -KERNEL_EAGAIN) { kernel_socket_network_blocked(); return ERR_MEM; }
             if (result != -KERNEL_ENOTSUP) return ERR_IF;
@@ -90,10 +87,28 @@ static err_t link_output(struct netif *interface, struct pbuf *p)
         }
     }
     int result = virtio_net_send_copy(n->device, p->tot_len, copy_pbuf, p);
-    if (result>=0) kernel_socket_packet_ethernet(interface,p,NULL,p->tot_len,1);
     /* 复制回退耗尽的仍是 NIC 槽；只等协议池归还会漏掉真实 TX 完成。 */
     if (result == -KERNEL_EAGAIN) { kernel_socket_network_blocked(); return ERR_MEM; }
     return result >= 0 ? ERR_OK : result == -KERNEL_EMSGSIZE ? ERR_BUF : ERR_IF;
+}
+static err_t output_link_frame(struct netif *interface, struct pbuf *p)
+{
+    err_t result = submit_link_frame(interface, p);
+    if (result == ERR_OK) kernel_socket_packet_ethernet(interface,p,NULL,p->tot_len,1);
+    return result;
+}
+static err_t link_output(struct netif *interface, struct pbuf *p)
+{
+#if BOAROS_USER_SMP
+    struct boaros_link_defer *defer = interface->boaros_link_defer;
+    /* ARP probes, reinjected packets and fragments own other buffers and
+     * still go through the synchronous link path. */
+    if (defer && defer->packet == p && !defer->submit) {
+        defer->submit = output_link_frame;
+        return ERR_OK;
+    }
+#endif
+    return output_link_frame(interface, p);
 }
 int kernel_network_send_frame(struct netif *interface, const void *frame, uint16_t size)
 {

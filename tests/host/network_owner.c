@@ -176,6 +176,10 @@ static struct kernel_socket *read_shutdown_during_copy;
 static struct kernel_socket *unix_credit_copy_probe;
 static unsigned unix_credit_copy_observed;
 static unsigned heap_live, dma_eligible, nic_full, copy_attempts, copied_packets, segment_attempts, captured_size;
+#if BOAROS_USER_SMP
+static struct pbuf *parallel_dma[2];
+static unsigned parallel_tx_probe, parallel_dma_count;
+#endif
 static void (*heap_release_once)(void *);
 static uint64_t clock_ns = 1000000000ULL;
 uint64_t kernel_time_realtime_ns(void) { return clock_ns; }
@@ -279,6 +283,9 @@ void kernel_rwlock_write(struct kernel_rwlock *lock, struct kernel_lock_guard *g
     }
     CHECK(!pthread_mutex_lock(model_lock(lock))); CHECK(!lock->writer);
     lock->writer=&test_context; *guard=(struct kernel_lock_guard){.lock=lock,.owner=&test_context};
+#if BOAROS_USER_SMP
+    guard->previous=test_context.locks;test_context.locks=guard;
+#endif
     if(lock==&protocol_mutex.lock)acquired++;
 }
 int kernel_rwlock_try_write(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
@@ -287,12 +294,18 @@ int kernel_rwlock_try_write(struct kernel_rwlock *lock, struct kernel_lock_guard
     if (pthread_mutex_trylock(model_lock(lock))) return 0;
     CHECK(!lock->writer);
     lock->writer=&test_context; *guard=(struct kernel_lock_guard){.lock=lock,.owner=&test_context};
+#if BOAROS_USER_SMP
+    guard->previous=test_context.locks;test_context.locks=guard;
+#endif
     if(lock==&protocol_mutex.lock)acquired++;
     return 1;
 }
 void kernel_lock_release(struct kernel_lock_guard *guard)
 {
     CHECK(guard->lock && guard->owner==&test_context && guard->lock->writer==&test_context);
+#if BOAROS_USER_SMP
+    CHECK(test_context.locks==guard);test_context.locks=guard->previous;
+#endif
     if (handoff_peer && guard->lock==&protocol_mutex.lock) { CHECK(handoff_peer->rx_bytes == handoff_bytes); handoff_peer=NULL; }
     pthread_mutex_t *mutex=model_lock(guard->lock);
     guard->lock->writer=0; guard->lock=0; CHECK(!pthread_mutex_unlock(mutex));
@@ -459,7 +472,23 @@ int arch_dma_image_address(uint64_t address, uint64_t size, uint64_t *physical)
 { (void)size; *physical = address; return dma_eligible; }
 int virtio_net_send_segments(struct virtio_net_device *device,
     const struct virtio_net_tx_segment *segments, unsigned count, void *owner)
-{ (void)device; CHECK(segments && count && owner); ++segment_attempts; return -KERNEL_ENOTSUP; }
+{
+    (void)device; CHECK(segments && count && owner); ++segment_attempts;
+#if BOAROS_USER_SMP
+    if (parallel_tx_probe) {
+        CHECK(current_tcp_owner() && !pthread_mutex_trylock(&model_ip_mutex));
+        CHECK(!pthread_mutex_unlock(&model_ip_mutex));
+        if (nic_full) {
+            kernel_socket_network_capacity();
+            return -KERNEL_EAGAIN;
+        }
+        CHECK(parallel_dma_count < 2);
+        parallel_dma[parallel_dma_count++] = owner;
+        return 0;
+    }
+#endif
+    return -KERNEL_ENOTSUP;
+}
 int virtio_net_send_copy(struct virtio_net_device *device, uint32_t size,
     int (*copy)(const void *, void *, uint32_t), const void *context)
 {
@@ -1244,6 +1273,100 @@ static struct socket_tcp_owner *tcp_lookup_test_start(void)
     boaros_lwip_tcp_context_init(&owner->context);
     tcp_owner_count=1;
     return owner;
+}
+
+static struct pbuf *tcp_lookup_test_packet(const struct tcp_pcb *, struct netif *);
+static void tcp_lookup_test_dispatch(struct pbuf *, struct netif *, const struct tcp_pcb *);
+static void tcp_lookup_test_drain(struct socket_tcp_owner *);
+
+static void tcp_inline_ack_ready(struct kernel_wait_node *node, uint32_t reason, uint64_t event)
+{
+    (void)event;
+    CHECK(reason == KERNEL_WAIT_WOKEN && !current_tcp_owner());
+    CHECK(!pthread_mutex_trylock(&model_ip_mutex));
+    CHECK(!pthread_mutex_unlock(&model_ip_mutex));
+    (*(unsigned *)node->context)++;
+}
+
+static void tcp_physical_submit_contract(void)
+{
+    kernel_socket_network_initialize();
+    struct socket_tcp_owner *owner = tcp_lookup_test_start();
+    struct virtio_net_device device = {0};
+    struct kernel_network network = {.device = &device};
+    ip4_addr_t local, mask, gateway = {0};
+    IP4_ADDR(&local, 10, 77, 0, 2); IP4_ADDR(&mask, 255, 255, 255, 0);
+    struct kernel_socket_protocol_scope scope;
+    kernel_socket_protocol_enter(&scope);
+    CHECK(netif_add(&network.interface,&local,&mask,&gateway,&network,physical_init,ip_input));
+    network.interface.linkoutput = link_output;
+    network.interface.hwaddr_len = 6;
+    netif_set_up(&network.interface); netif_set_link_up(&network.interface);
+    struct kernel_socket *socket = NULL;
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_STREAM,0,&socket));
+    struct tcp_pcb *pcb = socket->tcp;
+    socket->connected = 1; pcb->state = ESTABLISHED;
+    ip_addr_copy_from_ip4(pcb->local_ip,local);
+    IP_ADDR4(&pcb->remote_ip,10,77,0,1);
+    pcb->local_port = 22000; pcb->remote_port = 22001;
+    pcb->cwnd = pcb->snd_wnd = pcb->snd_wnd_max = TCP_WND;
+    TCP_REG_ACTIVE(pcb); tcp_bind_netif(pcb,&network.interface);
+    CHECK(tcp_promote(socket,&scope));
+    kernel_socket_protocol_leave(&scope);
+
+    CHECK(tcp_owner_lock(&scope,owner,0));
+    parallel_tx_probe = dma_eligible = 1;
+    nic_full = 1;
+    CHECK(tcp_write(pcb,"a",1,TCP_WRITE_FLAG_COPY) == ERR_OK);
+    socket_tcp_output(pcb);
+    CHECK(pcb->unsent && !pcb->unacked && !parallel_dma_count);
+    CHECK(capacity_ready(&nic_wait,nic_generation));
+    nic_full = 0;
+    socket_tcp_output(pcb);
+    tcp_nagle_disable(pcb);
+    CHECK(tcp_write(pcb,"b",1,TCP_WRITE_FLAG_COPY) == ERR_OK);
+    socket_tcp_output(pcb);
+    CHECK(!pcb->unsent && parallel_dma_count == 2);
+    CHECK(pbuf_get_at(parallel_dma[0],parallel_dma[0]->tot_len-1) == 'a');
+    CHECK(pbuf_get_at(parallel_dma[1],parallel_dma[1]->tot_len-1) == 'b');
+    { SOCKET_ENDPOINT(state,socket); tcp_publish_capacity_locked(socket); }
+    kernel_socket_protocol_leave(&scope);
+
+    kernel_socket_protocol_enter(&scope);
+    u32_t received = pcb->boaros_segs_in;
+    owner->waiting = 1;
+    unsigned notifications = 0;
+    struct kernel_wait_node observer = {0};
+    kernel_wait_node_init_callback(&observer,tcp_inline_ack_ready,&notifications);
+    kernel_wait_queue_add(&socket->wait,&observer);
+    struct pbuf *ack = tcp_lookup_test_packet(pcb,&network.interface);
+    struct tcp_hdr *header = ack->payload;
+    header->ackno = lwip_htonl(pcb->snd_nxt);
+    header->chksum = 0;
+    header->chksum = ip_chksum_pseudo(ack,IP_PROTO_TCP,ack->tot_len,&pcb->remote_ip,&pcb->local_ip);
+    tcp_lookup_test_dispatch(ack,&network.interface,pcb);
+    CHECK(!owner->count && pcb->boaros_segs_in == received + 1 && !pcb->unacked);
+    CHECK(notifications == 1 && kernel_wait_node_remove_sync(&observer) == KERNEL_SCHEDULER_STATUS_OK);
+    CHECK(!pthread_mutex_lock(&model_tcp_mutex[0]));
+    tcp_lookup_test_dispatch(tcp_lookup_test_packet(pcb,&network.interface),&network.interface,pcb);
+    CHECK(!pthread_mutex_unlock(&model_tcp_mutex[0]));
+    tcp_lookup_test_dispatch(tcp_lookup_test_packet(pcb,&network.interface),&network.interface,pcb);
+    CHECK(owner->count == 2 && pcb->boaros_segs_in == received + 1);
+    kernel_socket_protocol_leave(&scope);
+    CHECK(tcp_owner_lock(&scope,owner,0));
+    tcp_lookup_test_drain(owner);
+    tcp_lookup_test_drain(owner);
+    CHECK(!owner->count && pcb->boaros_segs_in == received + 3);
+    tcp_abandon(pcb,0);
+    kernel_socket_protocol_leave(&scope);
+    for (unsigned i = 0; i < 2; i++) {
+        CHECK(parallel_dma[i]->ref == 1);
+        kernel_socket_pbuf_free(parallel_dma[i]);
+    }
+    kernel_socket_destroy(socket);
+    netif_remove(&network.interface);
+    CHECK(!heap_live && !owner->context.active);
+    puts("PASS physical TCP submit outside IP mutex preserves order, retry and DMA lifetime");
 }
 
 static struct pbuf *tcp_lookup_test_packet(const struct tcp_pcb *pcb,
@@ -4931,6 +5054,7 @@ int main(int argc, char **argv)
 #if BOAROS_USER_SMP
     else if (!strcmp(argv[1], "tcp-owner-lookup")) tcp_owner_lookup();
     else if (!strcmp(argv[1], "tcp-owner-placement")) tcp_owner_placement();
+    else if (!strcmp(argv[1], "tcp-physical-submit")) tcp_physical_submit_contract();
 #endif
     else if (!strcmp(argv[1], "tcp-cork")) tcp_cork_contract();
     else if (!strcmp(argv[1], "tcp-more")) tcp_more_contract();

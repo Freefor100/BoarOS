@@ -1878,6 +1878,21 @@ static void tcp_owner_receive(struct socket_tcp_owner *owner,const struct socket
                                 &owner->input_buckets[input->route_bucket]);
 }
 
+static void tcp_prepare_ack_wake(struct kernel_socket *socket, struct kernel_wait_cursor *wake)
+{
+    if (!socket) return;
+    KERNEL_IRQ_LOCK_SCOPE(guard, socket_endpoint_lock(socket));
+    (void)kernel_wait_cursor_prepare(&socket->wait, wake);
+}
+
+static void tcp_wake_ack_waiters(struct kernel_wait_cursor *wake)
+{
+    if (!wake->queue) return;
+    uintptr_t interrupts = arch_interrupt_save();
+    kernel_wait_cursor_wake(wake, 1);
+    arch_interrupt_restore(interrupts);
+}
+
 static int tcp_try_inline_ack(struct socket_tcp_owner *owner, const struct socket_tcp_input *input)
 {
     /* Established ACKs can use an idle shard's qualification on the
@@ -1885,15 +1900,23 @@ static int tcp_try_inline_ack(struct socket_tcp_owner *owner, const struct socke
     struct kernel_lock_guard *ip = boaros_lwip_ip_drop_current();
     if (!ip) return 0;
     struct kernel_socket_protocol_scope scope;
+    struct kernel_wait_cursor wake = {0};
     int ordered = 0;
     if (tcp_owner_lock(&scope, owner, 1)) {
         {
             KERNEL_RAW_SCOPE(ingress, &owner->ingress);
             ordered = !owner->count && !owner->output_reserved && !tcp_owner_stopping(owner);
         }
-        if (ordered) tcp_owner_receive(owner, input);
+        if (ordered) {
+            struct kernel_socket *ack_socket = NULL;
+            owner->ack_waiter = &ack_socket;
+            tcp_owner_receive(owner, input);
+            owner->ack_waiter = NULL;
+            tcp_prepare_ack_wake(ack_socket, &wake);
+        }
         kernel_socket_protocol_leave(&scope);
     }
+    tcp_wake_ack_waiters(&wake);
     boaros_lwip_ip_lock(ip);
     return ordered;
 }
@@ -1908,6 +1931,7 @@ static int tcp_dispatch(struct pbuf *p,struct netif *input,const ip_addr_t *src,
     const struct tcp_hdr *header = p->payload;
     int ack_only = TCPH_FLAGS(header) == TCP_ACK && TCPH_HDRLEN_BYTES(header) == p->tot_len;
     struct socket_tcp_owner *owner=tcp_owner_at(cpu);
+    /* An active worker can merge sender notifications over its batch. */
     if (established && ack_only && input->hwaddr_len &&
         __atomic_load_n(&owner->waiting, __ATOMIC_RELAXED)) {
         struct socket_tcp_input packet = {.packet=p, .interface=input, .src=*src, .dst=*dst,
@@ -1917,6 +1941,7 @@ static int tcp_dispatch(struct pbuf *p,struct netif *input,const ip_addr_t *src,
             COST_ADD(TCP_INPUT_INLINE_ACK, 1);
             return 1;
         }
+        COST_ADD(TCP_INPUT_INLINE_MISS, 1);
     }
     int queued;
     struct kernel_wait_cursor wake={0};
@@ -2350,12 +2375,9 @@ static void packet_tap(struct netif *interface,struct packet_frame *view,unsigne
     }
 }
 
-void kernel_socket_packet_ethernet(struct netif *interface,const struct pbuf *pbuf,
+static void packet_capture_ethernet(struct netif *interface,const struct pbuf *pbuf,
     const void *bytes,uint16_t size,int outgoing)
 {
-    if (!packet_taps_active() || size<PACKET_ETH_HEADER) return;
-    struct kernel_socket_protocol_scope protocol;
-    kernel_socket_protocol_enter(&protocol);
     KERNEL_NO_RECLAIM_IO;
     struct packet_frame view={.pbuf=pbuf,.bytes=bytes,.length=size};
     unsigned type=PACKET_OUTGOING;
@@ -2367,6 +2389,22 @@ void kernel_socket_packet_ethernet(struct netif *interface,const struct pbuf *pb
             __builtin_memcmp(dest,interface->hwaddr,6) ? PACKET_OTHERHOST : PACKET_HOST;
     }
     packet_tap(interface,&view,type,NULL);
+}
+
+void kernel_socket_packet_ethernet(struct netif *interface,const struct pbuf *pbuf,
+    const void *bytes,uint16_t size,int outgoing)
+{
+    if (!packet_taps_active() || size<PACKET_ETH_HEADER) return;
+#if BOAROS_USER_SMP
+    if (boaros_lwip_parallel_enabled()) {
+        BOAROS_LWIP_IP_SCOPE(ip);
+        packet_capture_ethernet(interface,pbuf,bytes,size,outgoing);
+        return;
+    }
+#endif
+    struct kernel_socket_protocol_scope protocol;
+    kernel_socket_protocol_enter(&protocol);
+    packet_capture_ethernet(interface,pbuf,bytes,size,outgoing);
     kernel_socket_protocol_leave(&protocol);
 }
 
@@ -4980,6 +5018,7 @@ static void socket_tcp_output(struct tcp_pcb *pcb)
 #if BOAROS_USER_SMP
     struct socket_tcp_owner *owner=current_tcp_owner();
     if (owner) blocked=&owner->nic_blocked;
+    uint64_t capacity = owner ? __atomic_load_n(&nic_generation,__ATOMIC_RELAXED) : 0;
 #endif
     *blocked=0;
     unsigned was_corked = pcb->boaros_cork_pending;
@@ -4992,7 +5031,15 @@ static void socket_tcp_output(struct tcp_pcb *pcb)
         if (*blocked) {
             SOCKET_STATE(state);
             work_remove_locked(&nic_wait, socket);
-            work_add_locked(&nic_wait, socket, nic_generation);
+#if BOAROS_USER_SMP
+            if (owner) {
+                /* A completion can now be published before the failed
+                 * submitter acquires the work lock to register its retry. */
+                work_add_locked(&nic_wait, socket, capacity);
+                if (capacity != nic_generation) socket_work_ready_locked(state.owner);
+            } else
+#endif
+                work_add_locked(&nic_wait, socket, nic_generation);
         } else socket_pool_wait(socket);
     }
 }
@@ -6437,7 +6484,8 @@ void kernel_socket_network_hooks(void (*timer_wake)(void *),struct kernel_wait_q
 }
 void kernel_socket_network_capacity(void)
 {
-    SOCKET_STATE(state);nic_generation++;
+    SOCKET_STATE(state);
+    __atomic_store_n(&nic_generation,nic_generation+1,__ATOMIC_RELAXED);
     if(nic_wait.head)socket_work_ready_locked(state.owner);
 }
 void kernel_socket_network_blocked(void)
@@ -6569,9 +6617,18 @@ static void tcp_owner_worker(void *arg)
 {
     struct socket_tcp_owner *owner=arg;
     if (kernel_cpu_current()->logical_id!=owner->index) __builtin_trap();
+#if BOAROS_COST_DIAGNOSTICS
+    kernel_cost_current()->wait_flags |= KERNEL_COST_TCP_WORKER;
+#endif
     for (;;) {
         struct kernel_socket_protocol_scope scope;
+#if BOAROS_COST_DIAGNOSTICS
+        uint64_t locking = kernel_cost_clock();
+#endif
         (void)tcp_owner_lock(&scope,owner,0);
+#if BOAROS_COST_DIAGNOSTICS
+        uint64_t locked = kernel_cost_clock();
+#endif
         int stopping;
         __atomic_store_n(&owner->waiting,0,__ATOMIC_RELAXED);
         stopping=tcp_owner_stopping(owner);
@@ -6580,19 +6637,15 @@ static void tcp_owner_worker(void *arg)
         struct socket_tcp_input input;
         for (unsigned i=0;i<16 && tcp_owner_take_input(owner,&input);i++) {
 #if BOAROS_COST_DIAGNOSTICS
-            COST_ADD(TCP_INPUT_QUEUE_TICKS,kernel_cost_clock()-input.queued_ticks);
+            kernel_cost_tcp_input_dequeue(input.queued_ticks,locking,locked);
 #endif
             if (!stopping) tcp_owner_receive(owner,&input);
             else pbuf_free(input.packet);
         }
         owner->ack_waiter = NULL;
         struct kernel_wait_cursor ack_wake = {0};
-        if (ack_socket) {
-            /* Take the cursor after the last batched credit publication.
-             * A consumer may have registered after an earlier ACK. */
-            KERNEL_IRQ_LOCK_SCOPE(guard, socket_endpoint_lock(ack_socket));
-            (void)kernel_wait_cursor_prepare(&ack_socket->wait, &ack_wake);
-        }
+        /* Include any consumer that registered since earlier ACKs in the batch. */
+        tcp_prepare_ack_wake(ack_socket, &ack_wake);
         for (unsigned i=0;i<8 && service_ready_socket(4,&owner->ready,&scope);i++) {}
         if (!stopping) {
             owner->timer_running=1;
@@ -6615,11 +6668,7 @@ static void tcp_owner_worker(void *arg)
             }
         }
         kernel_socket_protocol_leave(&scope);
-        if (ack_wake.queue) {
-            uintptr_t interrupts = arch_interrupt_save();
-            kernel_wait_cursor_wake(&ack_wake, 1);
-            arch_interrupt_restore(interrupts);
-        }
+        tcp_wake_ack_waiters(&ack_wake);
         if (done) return;
         if (token.task) {
             enum kernel_wait_wake_reason reason;
