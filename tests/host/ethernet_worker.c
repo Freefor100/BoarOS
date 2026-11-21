@@ -10,6 +10,8 @@ static uint64_t blocked_deadline;
 static unsigned expired, errors, worker_mode, service_calls, protocol_attempts, sent, held, yields;
 static unsigned rx_refill;
 uint64_t riscv_time_read(void) { return 1000; }
+uint64_t virtio_net_watchdog_deadline(struct virtio_net_device *d)
+{ return riscv_time_read() + 5 * d->frequency; }
 struct virtio_net_progress virtio_net_get_progress(struct virtio_net_device *d)
 {
     return (struct virtio_net_progress){
@@ -117,6 +119,7 @@ u8_t pbuf_free(struct pbuf *p)
     }
     return 0;
 }
+void kernel_socket_pbuf_free(struct pbuf *p) { (void)pbuf_free(p); }
 void pbuf_ref(struct pbuf *p) { p->ref++; }
 unsigned virtio_net_tx_release(struct virtio_net_device *d,
     void (*release)(void *), int abandon)

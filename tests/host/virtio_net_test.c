@@ -50,6 +50,7 @@ static uint32_t regs[128], selected, low_features, high_features;
 static uint32_t driver_features[2], guest_page_size;
 static unsigned allocation_count, allocation_calls, live, allocation_fail;
 static unsigned reset_calls, reject_reset_from, reject_features, reject_plic;
+static _Thread_local unsigned queue_wakes;
 static uint64_t now, dma_base;
 static void (*interrupt_fn)(void *);
 static void *interrupt_owner;
@@ -244,6 +245,7 @@ enum kernel_scheduler_status kernel_wait_queue_wake_all(struct kernel_wait_queue
 {
     (void)q;
     assert(!kernel_cpu_current()->raw_locks && !arch_interrupt_is_enabled());
+    queue_wakes++;
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 int riscv_plic_register(uint32_t source, void (*fn)(void *), void *owner)
@@ -311,10 +313,6 @@ static void setup(unsigned version)
     /* Modern queue addresses must exercise the high register banks as well. */
     dma_base = version == 1 ? UINT64_C(0x81000000) : UINT64_C(0x181000000);
     now = 100;
-}
-unsigned kernel_cpu_get_boot_count(void)
-{
-    return 2;
 }
 #if BOAROS_COST_DIAGNOSTICS
 void kernel_cost_add(enum kernel_cost_metric metric, uint64_t value)
@@ -388,7 +386,9 @@ static void test_loan_budget(unsigned version)
     assert(d.loaned == 32); receive("later", 5); struct riscv_net_frame frame;
     assert(riscv_virtio_mmio_net_receive(&d, &frame) == 1);
     assert(riscv_virtio_mmio_net_lend(&d, frame.buffer) == -KERNEL_EAGAIN);
+    unsigned wakes = queue_wakes;
     riscv_virtio_mmio_net_release(&d, frame.buffer);
+    assert(queue_wakes == wakes + 1 && virtio_net_get_progress(&d).rx_refill_pending);
     for (unsigned i = 0; i < 2; i++) {
         assert(riscv_virtio_mmio_net_stop(&d) == -KERNEL_EBUSY && live == 3 && d.transport.context);
         for (unsigned j = 0; j < 32; j++) assert(!memcmp(frames[j].data, "owned", 5));
@@ -407,7 +407,9 @@ static void test_tx_copy_budget(unsigned version)
     assert(!riscv_virtio_mmio_net_service(&d));
     struct riscv_net_frame frame;
     assert(riscv_virtio_mmio_net_receive(&d, &frame) == 1 && frame.size == 1);
+    unsigned wakes = queue_wakes;
     riscv_virtio_mmio_net_release(&d, frame.buffer);
+    assert(queue_wakes == wakes);
     for (unsigned i = 1; i < 64; i++) assert(riscv_virtio_mmio_net_send(&d, input, sizeof(input)) == 64);
     assert(riscv_virtio_mmio_net_send(&d, input, sizeof(input)) == -KERNEL_EAGAIN);
     memset(input, 'z', sizeof(input)); unsigned id = next_head(1);
@@ -509,9 +511,20 @@ static unsigned test_rx_offload(unsigned version, unsigned flags, unsigned gso)
 static void test_tx_timeout(unsigned version)
 {
     struct riscv_virtio_mmio_net d; start(version, &d);
+    unsigned wakes = queue_wakes;
+    uint64_t initial = virtio_net_watchdog_deadline(&d);
+    assert(initial == 600);
+    now = 120;
     assert(riscv_virtio_mmio_net_send(&d, "x", 1) == 1);
-    now = 599; assert(!riscv_virtio_mmio_net_service(&d) && live == 3);
-    now = 600; failed_owner(&d); stop(&d);
+    assert(queue_wakes == wakes);
+    now = 140;
+    assert(riscv_virtio_mmio_net_send(&d, "y", 1) == 1);
+    now = initial;
+    assert(!riscv_virtio_mmio_net_service(&d) && virtio_net_watchdog_deadline(&d) == 620);
+    complete(1, next_head(1), 0, 1);
+    assert(virtio_net_watchdog_deadline(&d) == 640);
+    now = 639; assert(!riscv_virtio_mmio_net_service(&d) && live == 3);
+    now = 640; failed_owner(&d); stop(&d);
     printf("PASS: VirtIO-net v%u TX timeout at five seconds retains DMA until reset\n", version);
 }
 static void test_configuration_irq(unsigned version)

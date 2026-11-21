@@ -174,16 +174,6 @@ static int udp_capacity(void *context)
 }
 static struct kernel_wait_queue *progress(struct kernel_network *n)
 { return n->device ? &n->device->progress : &n->progress; }
-static void release_completed(struct kernel_network *network)
-{
-    struct virtio_net_device *device = network->device;
-    virtio_net_tx_release(device, release_owner, 0);
-    uint64_t generation = virtio_net_get_progress(device).tx_capacity_generation;
-    if (network->capacity_generation != generation) {
-        network->capacity_generation = generation;
-        kernel_socket_network_capacity();
-    }
-}
 static void timer_wake(void *context)
 {
     struct kernel_network *n = context;
@@ -212,7 +202,8 @@ static void wait_progress(struct kernel_network *n, struct kernel_socket_protoco
         return;
     }
     n->deadline = service.next_deadline;
-    uint64_t timeout = arch_time_read() + 5 * n->frequency;
+    uint64_t timeout = n->device ? virtio_net_watchdog_deadline(n->device) :
+        arch_time_read() + 5 * n->frequency;
     if (!n->deadline || timeout < n->deadline) n->deadline = timeout;
     struct kernel_wait_token token = {0};
     enum kernel_wait_wake_reason reason;
@@ -306,10 +297,14 @@ static void worker(void *context)
         kernel_socket_rights_service();
         unsigned handled = 0;
         int failed = virtio_net_service(d);
-        release_completed(n);
+        virtio_net_tx_release(d, release_owner, 0);
         uintptr_t irq = arch_interrupt_save();
         struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
         struct virtio_net_progress state = virtio_net_get_progress(d);
+        if (n->capacity_generation != state.tx_capacity_generation) {
+            n->capacity_generation = state.tx_capacity_generation;
+            kernel_socket_network_capacity();
+        }
         if (failed || state.failed) {
             device_failed(n);
         } else {
