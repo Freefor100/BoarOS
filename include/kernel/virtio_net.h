@@ -12,7 +12,7 @@
 #define VIRTIO_NET_TX_SEGMENTS 2U
 #define VIRTIO_NET_TX_TABLE_OFFSET 64U
 
-struct virtio_net_frame { void *data; uint32_t size, buffer; };
+struct virtio_net_frame { void *data; uint32_t size, buffer; int more_ready; };
 struct virtio_net_tx_segment { uint64_t physical_address; uint32_t length; };
 struct virtio_net_progress {
     uint64_t tx_capacity_generation;

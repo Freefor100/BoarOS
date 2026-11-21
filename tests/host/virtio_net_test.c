@@ -913,9 +913,13 @@ static void test_concurrent_copy(unsigned version, int stop_during_copy)
     } else {
         assert(virtio_net_send(&d, "peer", 4) == 4);
         receive("rx", 2);
+        receive("ry", 2);
         struct virtio_net_frame frame;
         assert(virtio_net_receive(&d, &frame) && !virtio_net_lend(&d, frame.buffer));
-        assert(frame.size == 2 && !memcmp(frame.data, "rx", 2));
+        assert(frame.more_ready && frame.size == 2 && !memcmp(frame.data, "rx", 2));
+        virtio_net_release(&d, frame.buffer);
+        assert(virtio_net_receive(&d, &frame) && !virtio_net_lend(&d, frame.buffer));
+        assert(!frame.more_ready && frame.size == 2 && !memcmp(frame.data, "ry", 2));
         virtio_net_release(&d, frame.buffer);
     }
     assert(!pthread_mutex_lock(&copy.mutex));

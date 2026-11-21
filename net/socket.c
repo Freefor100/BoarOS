@@ -1932,8 +1932,10 @@ static int tcp_dispatch(struct pbuf *p,struct netif *input,const ip_addr_t *src,
     const struct tcp_hdr *header = p->payload;
     int ack_only = TCPH_FLAGS(header) == TCP_ACK && TCPH_HDRLEN_BYTES(header) == p->tot_len;
     struct socket_tcp_owner *owner=tcp_owner_at(cpu);
-    /* An active worker can merge sender notifications over its batch. */
+    /* Leave pending Ethernet frames to the receiving CPU and let the owner
+     * merge notifications while serving its own pending acknowledgements. */
     if (established && ack_only && input->hwaddr_len &&
+        !(p->flags & PBUF_FLAG_BOAROS_RX_BACKLOG) &&
         __atomic_load_n(&owner->waiting, __ATOMIC_RELAXED)) {
         struct socket_tcp_input packet = {.packet=p, .interface=input, .src=*src, .dst=*dst,
             .route_bucket=bucket, .network_length=ip_current_header_tot_len()};
