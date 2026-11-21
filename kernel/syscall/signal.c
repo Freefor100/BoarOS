@@ -124,8 +124,12 @@ enum kernel_syscall_status syscall_handle_rt_sigaction(
         }
     }
     if (input != 0U) {
-        KERNEL_SERVICE_SCOPE(service);
-        status = kernel_signal_set_action(caller, sig, &action, &old_action);
+        if (kernel_signal_try_set_private_action(caller, sig, &action, &old_action)) {
+            status = KERNEL_SIGNAL_STATUS_OK;
+        } else {
+            KERNEL_SERVICE_SCOPE(service);
+            status = kernel_signal_set_action(caller, sig, &action, &old_action);
+        }
     } else status = kernel_signal_get_action(caller, sig, &old_action);
     if (status != KERNEL_SIGNAL_STATUS_OK) return signal_result(status, decoded);
     if (output != 0U) {

@@ -173,7 +173,7 @@ static void report_failure(struct virtio_net_device *d)
         report.posted = q ? d->tx_posted : d->rx_posted;
         report.available = d->split[q].next_available; report.consumed = d->split[q].last_used;
         report.loaned = d->loaned; report.ready = d->ready_count; report.pending = d->tx_count;
-        report.done = d->tx_done_count; report.used = used_words[1];
+        report.done = d->tx_retired_count + d->tx_done_count; report.used = used_words[1];
         report.avail_rx = d->split[0].next_available; report.avail_tx = d->split[1].next_available;
         report.configured = d->configured; report.link = d->link_up;
     }
@@ -278,16 +278,24 @@ static int harvest(struct virtio_net_device *d)
                 COST_ADD(NET_TX_POST_DONE_TICKS, d->tx_done_time[b] - d->tx_time[b]);
 #endif
                 if (d->tx_owner[b]) {
-                    if (d->tx_done_count == VIRTIO_NET_BUFFERS) __builtin_trap();
-                    d->tx_state[b] = TX_DONE;
-                    d->tx_done[(d->tx_done_head + d->tx_done_count++) %
-                               VIRTIO_NET_BUFFERS] = (uint16_t)b;
-                } else {
-                    tx_slot_return(d, b);
-#if BOAROS_COST_DIAGNOSTICS
-                    note_tx_free(d, b, d->tx_done_time[b]);
-#endif
+                    /* Retire references without running protocol callbacks
+                     * in the device lock or delaying reuse of a DMA slot.
+                     * A full retirement queue falls back to holding slots. */
+                    if (d->tx_retired_count == VIRTIO_NET_QUEUE_SIZE || d->tx_done_count) {
+                        if (d->tx_done_count == VIRTIO_NET_BUFFERS) __builtin_trap();
+                        d->tx_state[b] = TX_DONE;
+                        d->tx_done[(d->tx_done_head + d->tx_done_count++) %
+                                   VIRTIO_NET_BUFFERS] = (uint16_t)b;
+                        continue;
+                    }
+                    d->tx_retired[(d->tx_retired_head + d->tx_retired_count++) %
+                                  VIRTIO_NET_QUEUE_SIZE] = d->tx_owner[b];
+                    d->tx_owner[b] = 0;
                 }
+                tx_slot_return(d, b);
+#if BOAROS_COST_DIAGNOSTICS
+                note_tx_free(d, b, d->tx_done_time[b]);
+#endif
             }
             else {
                 if (d->ready_count == 64) __builtin_trap();
@@ -401,7 +409,8 @@ static struct virtio_net_progress progress_locked(struct virtio_net_device *d)
 {
     return (struct virtio_net_progress){
         .tx_capacity_generation = d->tx_capacity_generation,
-        .tx_done_count = d->tx_done_count, .ready_count = d->ready_count, .loaned = d->loaned,
+        .tx_done_count = d->tx_retired_count + d->tx_done_count,
+        .ready_count = d->ready_count, .loaned = d->loaned,
         .configured = d->configured, .link_up = d->link_up, .stopping = d->stopping,
         .failed = d->failed, .rx_refill_pending = rx_refill_pending(d)
     };
@@ -641,11 +650,17 @@ unsigned virtio_net_tx_release(struct virtio_net_device *d,
     void (*release)(void *owner), int abandon)
 {
     if (!d || !release) return 0;
-    void *owners[VIRTIO_NET_BUFFERS];
+    void *owners[VIRTIO_NET_BUFFERS + VIRTIO_NET_QUEUE_SIZE];
     unsigned released = 0;
     {
         KERNEL_IRQ_LOCK_SCOPE(guard, &d->state);
         if (abandon && (!d->transport.quiescent || d->transport.started)) __builtin_trap();
+        while (d->tx_retired_count) {
+            unsigned i = d->tx_retired_head++ % VIRTIO_NET_QUEUE_SIZE;
+            owners[released++] = d->tx_retired[i];
+            d->tx_retired[i] = 0;
+            d->tx_retired_count--;
+        }
         unsigned next = 0;
         while (abandon ? next < VIRTIO_NET_BUFFERS : d->tx_done_count != 0) {
             unsigned b;
@@ -665,7 +680,10 @@ unsigned virtio_net_tx_release(struct virtio_net_device *d,
             note_tx_free(d, b, arch_time_read());
 #endif
         }
-        if (abandon) d->tx_head = d->tx_count = d->tx_done_head = d->tx_done_count = 0;
+        if (abandon) {
+            d->tx_head = d->tx_count = d->tx_done_head = d->tx_done_count = 0;
+            d->tx_retired_head = 0;
+        }
     }
     if (released) {
         COST_ADD(NET_TX_RETURN, released);
@@ -706,7 +724,7 @@ int virtio_net_stop(struct virtio_net_device *d)
     {
         KERNEL_IRQ_LOCK_SCOPE(guard, &d->state);
         /* DMA stop does not revoke a CPU copy, RX lease or protocol reference. */
-        if (d->loaned) return -KERNEL_EBUSY;
+        if (d->loaned || d->tx_retired_count) return -KERNEL_EBUSY;
         for (unsigned i = 0; i < 64; i++)
             if (d->rx_state[i] == RX_CPU || d->tx_state[i] == TX_FILLING || d->tx_owner[i])
                 return -KERNEL_EBUSY;
