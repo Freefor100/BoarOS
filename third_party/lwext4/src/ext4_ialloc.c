@@ -156,6 +156,36 @@ ext4_ialloc_verify_bitmap_csum(struct ext4_sblock *sb __unused,
 	return true;
 }
 
+/* Called with filesystem mutation excluded. An uninitialized inode group
+ * cannot be used as a source of exportable objects. */
+int ext4_ialloc_inode_present(struct ext4_fs *fs, uint32_t index)
+{
+    struct ext4_sblock *sb = ext4_fs_super(fs);
+    struct ext4_block_group_ref group;
+    int result = ext4_fs_get_block_group_ref(fs, ext4_ialloc_get_bgid_of_inode(sb, index), &group);
+    if (result) return result;
+    ext4_fsblk_t bitmap = ext4_bg_get_inode_bitmap(group.block_group, sb);
+    if (ext4_bg_has_flag(group.block_group, EXT4_BLOCK_GROUP_INODE_UNINIT))
+        result = ENOENT;
+    else if (!bitmap || bitmap >= fs->bdev->lg_bcnt)
+        result = EUCLEAN;
+    else {
+        struct ext4_block block;
+        unsigned size = ext4_sb_get_block_size(sb);
+        result = ext4_block_get_range(fs->bdev, &block, bitmap, 0, size, EXT4_BLOCK_READ);
+        if (!result) {
+            if (!ext4_ialloc_verify_bitmap_csum(sb, group.block_group, block.data))
+                result = EUCLEAN;
+            else if (!ext4_bmap_is_bit_set(block.data, ext4_ialloc_inode_to_bgidx(sb, index)))
+                result = ENOENT;
+            int released = ext4_block_set(fs->bdev, &block);
+            if (!result) result = released;
+        }
+    }
+    int released = ext4_fs_put_block_group_ref(&group);
+    return result ? result : released;
+}
+
 int ext4_ialloc_free_inode(struct ext4_fs *fs, uint32_t index, bool is_dir)
 {
 	struct ext4_sblock *sb = ext4_fs_super(fs);

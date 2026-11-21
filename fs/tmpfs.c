@@ -393,6 +393,34 @@ static int open_inode(struct kernel_vfs_mount *mount, const char *path, uint64_t
     n->file_seals=i->memfd ? i->initial_seals : KERNEL_SEAL_SEAL;
     return kernel_vfs_publish_node(mount, n, file, 0);
 }
+static void tmp_handle_filesystem(struct kernel_vfs_instance *instance, unsigned char identity[16])
+{
+    memset(identity, 0, 16);
+    memcpy(identity, &instance->device_id, sizeof(instance->device_id));
+}
+
+static uint32_t tmp_handle_generation(struct kernel_vfs_node *node)
+{
+    (void)node;
+    /* Inode numbers increase monotonically within this tmpfs instance. */
+    return 0;
+}
+
+static int tmp_handle_open(struct kernel_vfs_mount *mount, const struct kernel_vfs_handle *handle,
+    struct kernel_vfs_file *file)
+{
+    struct tmp_inode *object = inode(tm(mount->private_data), handle->inode);
+    if (!object || !object->links || handle->generation) return -KERNEL_ESTALE;
+    return open_inode(mount, NULL, handle->inode, 0, file);
+}
+
+static const struct kernel_vfs_export_ops tmp_export = {
+    .type = KERNEL_VFS_HANDLE_TMPFS,
+    .filesystem = tmp_handle_filesystem,
+    .generation = tmp_handle_generation,
+    .open = tmp_handle_open,
+};
+
 static int close_node(struct kernel_vfs_node *n)
 {
     struct tmp_mount *m = tm(n->instance); struct tmp_inode *i = ti(n);
@@ -799,7 +827,7 @@ static int unmount(struct kernel_vfs_mount *mount)
 }
 static const struct kernel_vfs_backend tmp_ops = {
     .type="tmpfs",
-    .owns_dentry_names=true,
+    .owns_dentry_names=true, .export=&tmp_export,
     .check_domain=kernel_tmpfs_check_domain,
     .error=error, .root=root, .lookup=lookup, .open=open_inode, .close_node=close_node,
     .create=create, .tmpfile=tmpfile_inode, .link_tmpfile=link_tmpfile, .mkdir=mkdir, .symlink=symlink, .mknod=mknod_node, .readlink=readlink,

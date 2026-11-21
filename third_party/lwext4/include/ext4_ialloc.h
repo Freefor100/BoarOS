@@ -65,6 +65,8 @@ bool ext4_ialloc_verify_bitmap_csum(struct ext4_sblock *sb,
  * @param index  Index of i-node to be release
  * @param is_dir Flag us for information whether i-node is directory or not
  */
+int ext4_ialloc_inode_present(struct ext4_fs *fs, uint32_t index);
+
 int ext4_ialloc_free_inode(struct ext4_fs *fs, uint32_t index, bool is_dir);
 
 /**@brief Allocate files near their parent and distribute new directories

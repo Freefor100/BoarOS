@@ -72,6 +72,7 @@ struct lwext4_node {
     struct boaros_lwext4_resource *inode_resource;
 #endif
     unsigned dirty_fields, extra_times;
+    uint32_t generation;
     uint8_t noatime;
     uint8_t write_completion;
 

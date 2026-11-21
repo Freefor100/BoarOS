@@ -1817,8 +1817,12 @@ done:
     return error;
 }
 
+/* Directory handle reconstruction walks the selected instance under any
+ * overmounted names, then publishes a location in the supplied mount view. */
+#define VFS_RESOLVE_HANDLE_DIRECTORY (1U << 31)
 static int enter_mounts(struct kernel_vfs_path **owner,unsigned resolve)
 {
+    if (resolve & VFS_RESOLVE_HANDLE_DIRECTORY) return 0;
     struct kernel_vfs_path *current = *owner;
     for (;;) {
         struct kernel_vfs_path *next;
@@ -3010,7 +3014,7 @@ static int attach_unnamed_path_at(struct kernel_vfs_file *file,const char *name,
     struct kernel_vfs_dentry *parent)
 {
     struct kernel_vfs_node *node=kernel_vfs_file_node(file);
-    if (!node || !node->unlinked || file->path) return -KERNEL_EINVAL;
+    if (!node || file->path) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance=node->instance;
     size_t length=strlen(name)+1;
     struct kernel_vfs_dentry *entry;
@@ -3400,6 +3404,42 @@ static int create_at_parent(struct kernel_vfs_path **owner,const char *name,uint
     return result;
 }
 
+static int open_existing_path(struct kernel_vfs_path **owner, struct kernel_vfs_file *file,
+    const struct kernel_vfs_open_request *request)
+{
+    struct kernel_vfs_path *path = *owner;
+    unsigned type = path->file.mode & KERNEL_VFS_S_IFMT;
+    unsigned flags = request->flags;
+    if ((flags & KERNEL_VFS_OPEN_CREATE) && type == KERNEL_VFS_S_IFDIR) return -KERNEL_EISDIR;
+    if ((flags & KERNEL_VFS_OPEN_REGULAR) && type != KERNEL_VFS_S_IFREG) return -KERNEL_EFTYPE;
+    if ((flags & KERNEL_VFS_OPEN_DIRECTORY) && type != KERNEL_VFS_S_IFDIR) return -KERNEL_ENOTDIR;
+    if (flags & KERNEL_VFS_OPEN_PATH_ONLY) {
+        file->path = path;
+        file->mount = path->file.mount;
+        file->mode = path->file.mode;
+        *owner = NULL;
+        return 0;
+    }
+    if (type == KERNEL_VFS_S_IFLNK) return -KERNEL_ELOOP;
+    if ((request->access & KERNEL_VFS_MAY_WRITE) && type == KERNEL_VFS_S_IFDIR) return -KERNEL_EISDIR;
+    if (flags & KERNEL_VFS_OPEN_EXECUTABLE) return path_open_executable_locked(path,file,request->access);
+    if (path->file.mount->nodev && (type == KERNEL_VFS_S_IFCHR || type == KERNEL_VFS_S_IFBLK))
+        return -KERNEL_EACCES;
+    return path_open_checked(owner, file, request);
+}
+
+int kernel_vfs_open_resolved(struct kernel_vfs_path *path, struct kernel_vfs_file *file,
+    const struct kernel_vfs_open_request *request)
+{
+    KERNEL_SERVICE_SCOPE_IF(service,kernel_vfs_namespace_requires_cpu0(path->file.mount));
+    int result = kernel_vfs_path_acquire(path);
+    if (result) return result;
+    struct kernel_vfs_path *owner __attribute__((cleanup(release_path_pin))) = path;
+    if (((struct kernel_vfs_instance *)path->file.mount->private_data)->quiescing) return -KERNEL_EIO;
+    result = open_existing_path(&owner, file, request);
+    return result;
+}
+
 int kernel_vfs_open_at(struct kernel_vfs_path *start,
                        struct kernel_vfs_path *root, const char *path,
                        const struct kernel_vfs_open_request *request,
@@ -3453,24 +3493,7 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
         else if (!missing[0]) {
             if (create && path[strlen(path)-1U]=='/') result=-KERNEL_EISDIR;
             else if (exclusive) result=-KERNEL_EEXIST;
-            else if (create && (resolved->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR)
-                result=-KERNEL_EISDIR;
-            else if ((flags & KERNEL_VFS_OPEN_REGULAR) &&
-                (resolved->file.mode & KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFREG) result=-KERNEL_EFTYPE;
-            else if ((flags & KERNEL_VFS_OPEN_DIRECTORY) &&
-                (resolved->file.mode & KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFDIR) result=-KERNEL_ENOTDIR;
-            else if (flags & KERNEL_VFS_OPEN_PATH_ONLY) {
-                file->path=resolved;resolved=NULL;
-                file->mount=file->path->file.mount;file->mode=file->path->file.mode;
-            } else if ((resolved->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFLNK)
-                result=-KERNEL_ELOOP;
-            else if ((request->access & 2U) &&
-                (resolved->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR) result=-KERNEL_EISDIR;
-            else if (flags & KERNEL_VFS_OPEN_EXECUTABLE) result=path_open_executable_locked(resolved,file,request->access);
-            else if (resolved->file.mount->nodev &&
-                ((resolved->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFCHR ||
-                 (resolved->file.mode & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFBLK)) result=-KERNEL_EACCES;
-            else result=path_open_checked(&resolved,file,request);
+            else result=open_existing_path(&resolved,file,request);
         } else {
             if (path[strlen(path)-1U]=='/') result=-KERNEL_EISDIR;
             else {
@@ -3838,6 +3861,8 @@ void kernel_vfs_statx_extra(const struct kernel_vfs_file *file, const struct ker
     /* A bind may expose the same inode as both an ordinary entry and a root. */
     if (!path && file) path = file->path;
     if (path) file = &path->file;
+    struct kernel_vfs_mount *mount = file ? file->mount : NULL;
+    if (mount) extra->mount_id = mount->id;
     stat->attributes_mask |= KERNEL_VFS_STATX_ATTR_MOUNT_ROOT;
     if (kernel_vfs_path_is_mount_root(path))
         stat->attributes |= KERNEL_VFS_STATX_ATTR_MOUNT_ROOT;
@@ -6294,6 +6319,177 @@ int kernel_vfs_read_directory(struct kernel_vfs_file *file,
         (__atomic_load_n(&file->mount->atime_policy,__ATOMIC_RELAXED) & VFS_ATIME_STRICT)))
         file_accessed(file,*open_flags,batch->relatime==KERNEL_VFS_DIR_RELATIME_EXPIRED);
     return result;
+}
+
+int kernel_vfs_handle_type(const struct kernel_vfs_path *path)
+{
+    if (!path) return -KERNEL_EOPNOTSUPP;
+    const struct kernel_vfs_instance *instance = path->file.mount->private_data;
+    return instance->ops->export ? instance->ops->export->type : -KERNEL_EOPNOTSUPP;
+}
+
+void kernel_vfs_encode_handle(const struct kernel_vfs_path *path, struct kernel_vfs_handle *handle)
+{
+    struct kernel_vfs_node *node = path->file.private_data;
+    const struct kernel_vfs_export_ops *ops = node->instance->ops->export;
+    *handle = (struct kernel_vfs_handle){.inode=node->inode,.generation=ops->generation(node)};
+    ops->filesystem(node->instance, handle->filesystem);
+}
+
+static int handle_directory_parent(struct kernel_vfs_file *directory,
+    struct kernel_vfs_dir_batch *batch, uint64_t *inode)
+{
+    /* "." and ".." are the first two 24-byte linux_dirent64 records. In
+     * indexed ext4 directories those entries live in the index root, outside
+     * the hash lookup used for ordinary names. */
+    const size_t record = 24U;
+    batch->position = 0;
+    batch->used = 0;
+    batch->capacity = 2U * record;
+    int result = kernel_vfs_read_directory(directory, batch, NULL);
+    batch->capacity = KERNEL_FS_PATH_MAX;
+    if (result < 0) return result;
+    if (batch->used != 2U * record || strcmp((const char *)batch->data+19, ".") ||
+        strcmp((const char *)batch->data+record+19, "..")) return -KERNEL_ESTALE;
+    memcpy(inode, batch->data+record, sizeof(*inode));
+    return 0;
+}
+
+static int handle_directory_name(struct kernel_vfs_file *parent, uint64_t child,
+    struct kernel_vfs_dir_batch *batch, char **start, const char *base)
+{
+    batch->position = 0;
+    for (;;) {
+        batch->used = 0;
+        int result = kernel_vfs_read_directory(parent, batch, NULL);
+        if (result < 0) return result;
+        for (size_t offset = 0; offset < batch->used;) {
+            unsigned char *entry = batch->data + offset;
+            uint64_t inode;
+            memcpy(&inode, entry, sizeof(inode));
+            size_t record = (unsigned)entry[16] | (unsigned)entry[17] << 8;
+            const char *name = (const char *)entry + 19;
+            if (inode == child && strcmp(name, ".") && strcmp(name, "..")) {
+                size_t length = strlen(name);
+                if ((size_t)(*start - base) <= length) return -KERNEL_ENAMETOOLONG;
+                *start -= length;
+                memcpy(*start, name, length);
+                *--*start = '/';
+                return 0;
+            }
+            offset += record;
+        }
+        if (!result) return -KERNEL_ESTALE;
+    }
+}
+
+static int reconnect_handle_directory(struct kernel_vfs_mount *mount,
+    struct kernel_vfs_file *file, struct kernel_vfs_path **owner)
+{
+    struct kernel_vfs_instance *instance = mount->private_data;
+    struct kernel_vfs_dentry *entry;
+    {
+        KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
+        if (file->private_data == mount->root_dentry->file.private_data)
+            entry = mount->root_dentry;
+        else entry = instance->root_name;
+        if (entry && dentry_acquire(entry)) return -KERNEL_EOVERFLOW;
+    }
+    if (!entry) return -KERNEL_ESTALE;
+    struct kernel_vfs_path *root __attribute__((cleanup(release_path_pin))) = NULL;
+    int result = path_wrap(mount, entry, &root);
+    dentry_release(&entry);
+    if (result) return result;
+    if (root->file.private_data == file->private_data) {
+        *owner = root;
+        root = NULL;
+        return 0;
+    }
+    unsigned char *storage;
+    if (kernel_heap_allocate(instance->heap, 2U * KERNEL_FS_PATH_MAX, (void **)&storage))
+        return -KERNEL_ENOMEM;
+    char *base = (char *)storage;
+    char *path = base + KERNEL_FS_PATH_MAX - 1U;
+    *path = 0;
+    struct kernel_vfs_dir_batch batch = {.data=storage+KERNEL_FS_PATH_MAX,.capacity=KERNEL_FS_PATH_MAX};
+    uint64_t root_inode = kernel_vfs_path_inode(root);
+    struct kernel_vfs_file parent = {0};
+    struct kernel_vfs_node *node = file->private_data;
+    while (node->inode != root_inode) {
+        uint64_t inode = node->inode, parent_inode;
+        result = handle_directory_parent(parent.private_data ? &parent : file, &batch, &parent_inode);
+        if (parent.private_data && kernel_vfs_close(&parent)) __builtin_trap();
+        if (result) break;
+        if (parent_inode == inode) { result = -KERNEL_ESTALE; break; }
+        result = vfs_open_inode_raw(mount, parent_inode, KERNEL_VFS_S_IFDIR, &parent);
+        if (result) break;
+        if ((parent.mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) {result=-KERNEL_ESTALE;break;}
+        result = handle_directory_name(&parent, inode, &batch, &path, base);
+        if (result) break;
+        node = parent.private_data;
+    }
+    if (parent.private_data && kernel_vfs_close(&parent)) __builtin_trap();
+    if (!result) {
+        VFS_PATH_WALK(walk, root, root);
+        walk.resolve = VFS_RESOLVE_HANDLE_DIRECTORY;
+        char missing[256] = {0};
+        result = resolve_object(root, root, path, strlen(path), 1, 0, 0,
+            VFS_TRAILING_FOLLOW, owner, missing, &walk);
+        if (!result && (*owner)->file.private_data != file->private_data) {
+            release_path_pin(owner);
+            result = -KERNEL_ESTALE;
+        }
+    }
+    kernel_heap_release(instance->heap, storage);
+    return result;
+}
+
+int kernel_vfs_decode_handle(struct kernel_vfs_mount *mount, int type,
+    const struct kernel_vfs_handle *handle, struct kernel_vfs_path **owner)
+{
+    if (!mount || !mount->private_data) return -KERNEL_ESTALE;
+    struct kernel_vfs_instance *instance = mount->private_data;
+    const struct kernel_vfs_export_ops *ops = instance->ops->export;
+    if (!ops || ops->type != type || !handle->inode || handle->reserved) return -KERNEL_ESTALE;
+    unsigned char identity[sizeof(handle->filesystem)];
+    ops->filesystem(instance, identity);
+    if (memcmp(identity, handle->filesystem, sizeof(identity))) return -KERNEL_ESTALE;
+    KERNEL_SERVICE_SCOPE_IF(service,kernel_vfs_namespace_requires_cpu0(mount));
+    /* The cold inode has no caller-visible pathname to qualify. Reuse the
+     * instance's mutation barrier until its real reference has been acquired.
+     * Name lookups and other instances remain independent. */
+    KERNEL_LOCK_SCOPE(mutation);
+    kernel_rwlock_write(&instance->reconfiguration, &mutation);
+    KERNEL_LOCK_SCOPE(namespace_guard);
+    if (!namespace_is_parallel(instance)) kernel_vfs_namespace_lock(mount, &namespace_guard);
+    if (instance->quiescing) return -KERNEL_ESTALE;
+    struct kernel_vfs_file file = {0};
+    struct kernel_vfs_node *node __attribute__((cleanup(release_node_pin))) =
+        kernel_vfs_node_pin(instance, handle->inode);
+    int result;
+    if (node) {
+        if (node->retired || ops->generation(node) != handle->generation) return -KERNEL_ESTALE;
+        result = vfs_open_owned_node(mount, node, &file, false, false);
+        if (!result) node = NULL;
+    } else result = ops->open(mount, handle, &file);
+    if (result) return result == -KERNEL_ENOMEM ? result : -KERNEL_ESTALE;
+    if ((file.mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR)
+        result = reconnect_handle_directory(mount, &file, owner);
+    else {
+        char name[22];
+        size_t pos = sizeof(name) - 1;
+        uint64_t number = handle->inode;
+        name[pos] = 0;
+        do { name[--pos] = '0' + number % 10; number /= 10; } while (number);
+        name[--pos] = '#';
+        result = attach_unnamed_path_at(&file, name + pos, NULL);
+        if (!result) {
+            *owner = file.path;
+            file.path = NULL;
+        }
+    }
+    if (kernel_vfs_close(&file)) __builtin_trap();
+    return result && result != -KERNEL_ENOMEM ? -KERNEL_ESTALE : result;
 }
 
 int kernel_vfs_node_pread(struct kernel_vfs_node *node,

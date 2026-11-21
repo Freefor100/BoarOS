@@ -49,6 +49,7 @@
 #include <ext4_fs.h>
 #include <ext4_dir.h>
 #include <ext4_inode.h>
+#include <ext4_ialloc.h>
 #include <ext4_super.h>
 #include <ext4_block_group.h>
 #include <ext4_dir_idx.h>
@@ -7185,8 +7186,8 @@ int ext4_chrdev_open_file(ext4_file *file, const char *path)
     return result;
 }
 
-int ext4_fopen_inode(ext4_file *file, const char *mount_point,
-                     uint32_t inode_number, struct ext4_inode *initial)
+static int fopen_inode(ext4_file *file, const char *mount_point, uint32_t inode_number,
+    struct ext4_inode *initial, const uint32_t *generation)
 {
     struct ext4_mountpoint *mp = ext4_get_mount(mount_point);
     struct ext4_inode_ref ref;
@@ -7195,8 +7196,22 @@ int ext4_fopen_inode(ext4_file *file, const char *mount_point,
     if (!mp || !file || inode_number == 0)
         return EINVAL;
     EXT4_MP_LOCK(mp);
+    struct ext4_sblock *sb = ext4_fs_super(&mp->fs);
+    if (generation) {
+        uint32_t first = ext4_get32(sb, rev_level) ? ext4_get32(sb, first_inode) : EXT4_GOOD_OLD_FIRST_INO;
+        result = inode_number > ext4_get32(sb, inodes_count) ||
+                 (inode_number != EXT4_ROOT_INO && inode_number < first) ?
+            ENOENT : ext4_ialloc_inode_present(&mp->fs, inode_number);
+        if (result) goto unlock;
+    }
     result = ext4_fs_get_inode_ref_read(&mp->fs, inode_number, &ref);
     if (result == EOK) {
+        if (generation && (ext4_inode_get_generation(ref.inode) != *generation ||
+            !ext4_inode_get_links_cnt(ref.inode) || ext4_inode_has_flag(ref.inode, EXT4_INODE_FLAG_EA_INODE))) {
+            ext4_fs_put_inode_ref(&ref);
+            result = ENOENT;
+            goto unlock;
+        }
         file->mp = mp;
         file->inode = inode_number;
         file->flags = mp->fs.read_only ? O_RDONLY : O_RDWR;
@@ -7208,9 +7223,18 @@ int ext4_fopen_inode(ext4_file *file, const char *mount_point,
         if (initial) copy_inode_snapshot(&ref,initial);
         result = ext4_fs_put_inode_ref(&ref);
     }
+unlock:
     EXT4_MP_UNLOCK(mp);
     return result;
 }
+
+int ext4_fopen_inode(ext4_file *file, const char *mount, uint32_t inode,
+    struct ext4_inode *initial)
+{ return fopen_inode(file, mount, inode, initial, NULL); }
+
+int ext4_fopen_handle(ext4_file *file, const char *mount, uint32_t inode,
+    uint32_t generation, struct ext4_inode *initial)
+{ return fopen_inode(file, mount, inode, initial, &generation); }
 
 static int lookup_child(struct ext4_mountpoint *mp, uint32_t parent_inode,
                       const char *name, uint32_t name_length,
