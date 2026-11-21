@@ -11,6 +11,7 @@
 #include <kernel/tty_task.h>
 #include "../fs/uaccess_iov_internal.h"
 #include "socket_state.h"
+#include "packet_ring.h"
 
 #include <arch/context.h>
 #include <arch/timer.h>
@@ -91,6 +92,14 @@ struct socket_udp_pending {
     ip_addr_t remote;
     uint32_t bytes, charge;
     uint16_t port;
+};
+
+struct socket_packet_options {
+    struct kernel_mutex configuration;
+    struct packet_ring *ring;
+    struct kernel_socket *timer_next, **timer_previous;
+    uint32_t deadline, version, reserve;
+    uint32_t packets, drops, freezes;
 };
 
 struct socket_link { struct kernel_socket *next, *previous; uint64_t epoch; unsigned queued; };
@@ -209,6 +218,7 @@ struct kernel_socket {
     uint32_t netlink_references, record_memory, netlink_port;
     struct kernel_socket *netlink_next;
     struct kernel_socket *packet_next, **packet_previous;
+    struct socket_packet_options *packet_options;
     uint32_t packet_index;
     uint16_t packet_protocol;
 #if BOAROS_USER_SMP
@@ -220,6 +230,7 @@ struct kernel_socket {
 /* Link-level taps and their bind configuration share the IP qualification.
  * The atomic count avoids entering the protocol path when no tap is active. */
 static struct kernel_socket *packet_taps;
+static struct kernel_socket *packet_timer_head;
 static unsigned packet_tap_count;
 
 static int packet_taps_active(void)
@@ -253,6 +264,41 @@ static void packet_tap_update(struct kernel_socket *socket,uint32_t index,uint16
     else if (was_hooked && !packet_hooked(socket)) __atomic_sub_fetch(&packet_tap_count,1U,__ATOMIC_RELEASE);
 }
 static struct netif *loopback_netif(void);
+static void socket_work_ready_locked(struct socket_state_guard *state);
+
+static void packet_timer_disarm(struct socket_packet_options *options)
+{
+    if (!options->timer_previous) return;
+    *options->timer_previous = options->timer_next;
+    if (options->timer_next)
+        options->timer_next->packet_options->timer_previous = options->timer_previous;
+    options->timer_previous = NULL;
+    options->timer_next = NULL;
+}
+
+static void packet_timer_update(struct kernel_socket *socket)
+{
+    struct socket_packet_options *options = socket->packet_options;
+    uint32_t deadline;
+    if (!packet_ring_deadline(options->ring, &deadline)) {
+        packet_timer_disarm(options);
+        return;
+    }
+    if (options->timer_previous && options->deadline == deadline) return;
+    packet_timer_disarm(options);
+    struct kernel_socket **link = &packet_timer_head;
+    while (*link && (int32_t)((*link)->packet_options->deadline - deadline) <= 0)
+        link = &(*link)->packet_options->timer_next;
+    options->deadline = deadline;
+    options->timer_previous = link;
+    options->timer_next = *link;
+    if (*link) (*link)->packet_options->timer_previous = &options->timer_next;
+    *link = socket;
+    if (link == &packet_timer_head) {
+        SOCKET_STATE(state);
+        socket_work_ready_locked(state.owner);
+    }
+}
 
 /* UNIX packet publication also changes its peer's quota, reference graph and
  * names. INET and netlink endpoint transactions touch only their own socket. */
@@ -1616,6 +1662,11 @@ static uint64_t socket_next_timer_deadline(void)
     u32_t current_ms = sys_now();
     u32_t cork_delay = boaros_lwip_tcp_cork_delay(current_ms);
     if (cork_delay < milliseconds) milliseconds = cork_delay;
+    if (packet_timer_head) {
+        int32_t remaining = (int32_t)(packet_timer_head->packet_options->deadline - current_ms);
+        u32_t packet_delay = remaining <= 0 ? 1U : (u32_t)remaining;
+        if (packet_delay < milliseconds) milliseconds = packet_delay;
+    }
     {SOCKET_STATE(state);if(rights_retry_pending) {
         int32_t remaining=(int32_t)(rights_retry_ms-current_ms);
         u32_t retry=remaining<=0?1U:(u32_t)remaining;
@@ -2154,30 +2205,58 @@ static void packet_tap(struct netif *interface,struct packet_frame *view,unsigne
         };
         uint32_t kept=socket_filter_run(socket,&filter);
         if (!kept) continue;
+        uint32_t original_length=length;
         if (kept<length) length=kept;
-        uint32_t charge=packet_charge(length);
-        {
-            SOCKET_ENDPOINT(state,socket);
-            if (charge>socket->rx_limit || socket->record_memory>socket->rx_limit-charge) continue;
-        }
-        /* The frame's original owner may recycle it as soon as the tap returns. */
-        struct socket_packet *packet=NULL;
-        if (kernel_heap_allocate_zeroed(socket->heap,1,charge,(void **)&packet)) continue;
-        packet->length=length;
-        packet->address=(struct kernel_socket_address){
+        struct kernel_socket_address address={
             .family=KERNEL_SOCKET_AF_PACKET,.port=protocol,.scope=index,.link_type=hardware,
             .link_packet_type=(uint8_t)type,.link_length=6,.link_size=20
         };
-        __builtin_memcpy(packet->address.link_address,header+6,6);
+        __builtin_memcpy(address.link_address,header+6,6);
+        struct socket_packet_options *options=socket->packet_options;
+        if (options->ring) {
+            unsigned events=packet_ring_receive(options->ring,&address,original_length,length,
+                PACKET_ETH_HEADER-view->start,packet_frame_read,view,sys_now(),
+                kernel_time_realtime_ns());
+            if (events & PACKET_RING_RECEIVED) options->packets++;
+            else options->drops++;
+            if (events & PACKET_RING_FROZEN) options->freezes++;
+            packet_timer_update(socket);
+            if (events & PACKET_RING_PUBLISHED) {
+                SOCKET_ENDPOINT(state,socket);
+                wake_socket(socket);
+                socket_async(socket,KERNEL_ASYNC_POLL_IN);
+            }
+            continue;
+        }
+        uint32_t charge=packet_charge(length);
+        {
+            SOCKET_ENDPOINT(state,socket);
+            if (charge>socket->rx_limit || socket->record_memory>socket->rx_limit-charge) {
+                options->drops++;
+                continue;
+            }
+        }
+        /* The frame's original owner may recycle it as soon as the tap returns. */
+        struct socket_packet *packet=NULL;
+        if (kernel_heap_allocate_zeroed(socket->heap,1,charge,(void **)&packet)) {
+            options->drops++;
+            continue;
+        }
+        packet->length=length;
+        packet->address=address;
         if (packet_frame_read(view,0,packet->data,length)) __builtin_trap();
         SOCKET_ENDPOINT(state,socket);
         if (charge<=socket->rx_limit && socket->record_memory<=socket->rx_limit-charge) {
             socket->record_memory+=charge;
             packet_publish_locked(socket,packet,length ? length : 1);
+            options->packets++;
             packet=NULL;
         }
         socket_state_release(&state);
-        if (packet) kernel_heap_release(socket->heap,packet);
+        if (packet) {
+            options->drops++;
+            kernel_heap_release(socket->heap,packet);
+        }
     }
 }
 
@@ -2637,6 +2716,15 @@ int kernel_socket_create(struct kernel_heap *heap, int family, int type, int pro
         socket->heap=heap;socket->type=(uint8_t)type;socket->family=(uint8_t)family;
         socket->domain=family==KERNEL_SOCKET_AF_NETLINK ?
             KERNEL_SOCKET_DOMAIN_NETLINK : KERNEL_SOCKET_DOMAIN_PACKET;
+        if (family==KERNEL_SOCKET_AF_PACKET) {
+            struct socket_packet_options *options;
+            if (kernel_heap_allocate_zeroed(heap,1,sizeof(*options),(void **)&options)) {
+                kernel_heap_release(heap,socket);
+                return -KERNEL_ENOMEM;
+            }
+            kernel_mutex_init(&options->configuration,12,(uintptr_t)options);
+            socket->packet_options=options;
+        }
         socket->netlink_references=1;
         socket->rx_limit=socket->tx_limit=212992;
         socket->peercred=(struct unix_credentials){.uid=UINT32_MAX,.gid=UINT32_MAX};
@@ -2862,13 +2950,141 @@ static void netlink_storage_free(struct kernel_socket *socket)
     arch_interrupt_restore(interrupts);
     kernel_heap_release(socket->heap,socket);
 }
+
+int kernel_socket_packet_option_set(struct kernel_socket *socket, unsigned option, int value)
+{
+    struct socket_packet_options *options=socket->packet_options;
+    if (!options) return -KERNEL_ENOPROTOOPT;
+    if (option==KERNEL_PACKET_VERSION) {
+        if (value<0 || value>(int)PACKET_VERSION_V3) return -KERNEL_EINVAL;
+    } else if (option==KERNEL_PACKET_RESERVE) {
+        /* Leave room for link offsets in the packet header's uint16_t fields. */
+        if (value<0 || value>UINT16_MAX-96) return -KERNEL_EINVAL;
+    } else return -KERNEL_ENOPROTOOPT;
+    KERNEL_LOCK_SCOPE(configuration);
+    kernel_mutex_lock(&options->configuration,&configuration);
+    if (options->ring) return -KERNEL_EBUSY;
+    if (option==KERNEL_PACKET_VERSION) options->version=(uint32_t)value;
+    else options->reserve=(uint32_t)value;
+    return 0;
+}
+
+int kernel_socket_packet_option_get(struct kernel_socket *socket, unsigned option, uint32_t selection,
+    uint32_t values[3], unsigned *count)
+{
+    struct socket_packet_options *options=socket->packet_options;
+    if (!options) return -KERNEL_ENOPROTOOPT;
+    /* PACKET_STATISTICS samples and clears the counts under the packet producer
+     * qualification. Start the service before taking the configuration lock. */
+    KERNEL_SERVICE_SCOPE_IF(service,option==KERNEL_PACKET_STATISTICS);
+    KERNEL_LOCK_SCOPE(configuration);
+    kernel_mutex_lock(&options->configuration,&configuration);
+    *count=1;
+    switch (option) {
+    case KERNEL_PACKET_VERSION: values[0]=options->version;return 0;
+    case KERNEL_PACKET_RESERVE: values[0]=options->reserve;return 0;
+    case KERNEL_PACKET_HDRLEN:
+        if (selection>PACKET_VERSION_V3) return -KERNEL_EINVAL;
+        values[0]=selection==PACKET_VERSION_V3 ? PACKET_V3_HEADER_LENGTH : 52U;
+        return 0;
+    case KERNEL_PACKET_STATISTICS: {
+        struct kernel_socket_protocol_scope protocol;
+        kernel_socket_protocol_enter(&protocol);
+        values[0]=options->packets+options->drops;
+        values[1]=options->drops;
+        values[2]=options->freezes;
+        options->packets=options->drops=options->freezes=0;
+        kernel_socket_protocol_leave(&protocol);
+        *count=options->version==PACKET_VERSION_V3 ? 3 : 2;
+        return 0;
+    }
+    default: return -KERNEL_ENOPROTOOPT;
+    }
+}
+
+int kernel_socket_packet_ring_configure(struct kernel_socket *socket,
+    const struct kernel_socket_packet_ring_request *request)
+{
+    struct socket_packet_options *options=socket->packet_options;
+    if (!options) return -KERNEL_ENOPROTOOPT;
+    KERNEL_SERVICE_SCOPE(service);
+    KERNEL_LOCK_SCOPE(configuration);
+    kernel_mutex_lock(&options->configuration,&configuration);
+    struct packet_ring *old=options->ring;
+    if (old && (request->block_count ||
+        __atomic_load_n(packet_ring_map_count(old),__ATOMIC_ACQUIRE))) return -KERNEL_EBUSY;
+    if (options->version!=PACKET_VERSION_V3) return -KERNEL_EOPNOTSUPP;
+    struct packet_ring *new_ring=NULL;
+    if (request->block_count) {
+        int error=packet_ring_create(socket->heap,request,options->reserve,&new_ring);
+        if (error) return error;
+    } else if (request->frame_count) return -KERNEL_EINVAL;
+
+    struct kernel_socket_protocol_scope protocol;
+    kernel_socket_protocol_enter(&protocol);
+    SOCKET_ENDPOINT(state,socket);
+    if (socket->read_request) {
+        socket_state_release(&state);
+        kernel_socket_protocol_leave(&protocol);
+        packet_ring_destroy(new_ring);
+        return -KERNEL_EBUSY;
+    }
+    struct socket_packet *packet=socket->packets_head;
+    socket->packets_head=socket->packets_tail=NULL;
+    socket->rx_bytes=socket->record_memory=0;
+    options->ring=new_ring;
+    packet_timer_disarm(options);
+    socket_state_release(&state);
+    kernel_socket_protocol_leave(&protocol);
+    kernel_lock_release(&configuration);
+    packet_ring_destroy(old);
+    while (packet) {
+        struct socket_packet *next=packet->next;
+        kernel_heap_release(socket->heap,packet);
+        packet=next;
+    }
+    return 0;
+}
+
+int kernel_socket_packet_ring_mmap_begin(struct kernel_socket *socket, uint64_t offset,
+    uint64_t aligned_length, struct kernel_lock_guard *guard, uint64_t **mapped_bytes)
+{
+    struct socket_packet_options *options=socket->packet_options;
+    if (!options) return -KERNEL_ENODEV;
+    kernel_mutex_lock(&options->configuration,guard);
+    struct packet_ring *ring=options->ring;
+    if (!ring || offset || aligned_length!=packet_ring_bytes(ring)) {
+        kernel_lock_release(guard);
+        return -KERNEL_EINVAL;
+    }
+    *mapped_bytes=packet_ring_map_count(ring);
+    return 0;
+}
+
+int kernel_socket_packet_ring_mmap_page(struct kernel_socket *socket, uint64_t offset,
+    uint64_t *physical)
+{
+    struct socket_packet_options *options=socket->packet_options;
+    if (!options) return -KERNEL_ENODEV;
+    /* The caller holds the configure guard until mapping publication. A live
+     * mapping's charge and file reference also prevent ring replacement. */
+    struct packet_ring *ring=options->ring;
+    return ring ? packet_ring_page(ring,offset,physical) : -KERNEL_EINVAL;
+}
+
 static void record_endpoint_destroy(struct kernel_socket *socket)
 {
+    struct socket_packet_options *packet_options=NULL;
     if (socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK) netlink_unbind(socket);
     else {
         struct kernel_socket_protocol_scope protocol;
         kernel_socket_protocol_enter(&protocol);
         packet_tap_unlink(socket);
+        SOCKET_ENDPOINT(state,socket);
+        packet_options=socket->packet_options;
+        packet_timer_disarm(packet_options);
+        socket->packet_options=NULL;
+        socket_state_release(&state);
         kernel_socket_protocol_leave(&protocol);
     }
     SOCKET_ENDPOINT(state,socket);
@@ -2882,6 +3098,10 @@ static void record_endpoint_destroy(struct kernel_socket *socket)
     socket->record_memory-=(uint32_t)queued_memory;
     socket->packets_head=socket->packets_tail=NULL;socket->rx_bytes=0;
     socket_state_release(&state);
+    if (packet_options) {
+        packet_ring_destroy(packet_options->ring);
+        kernel_heap_release(socket->heap,packet_options);
+    }
     while(packets) {
         struct socket_packet *next=packets->next;
         kernel_heap_release(socket->heap,packets);packets=next;
@@ -5872,6 +6092,9 @@ uint32_t kernel_socket_poll(struct kernel_socket *socket,
     if (kernel_socket_preserves_messages(socket)) {
         if ((socket->packets_head != 0 || socket->read_closed) && socket->read_request == 0)
             events |= KERNEL_POLLIN | KERNEL_POLLRDNORM;
+        if (socket->packet_options && socket->packet_options->ring &&
+            packet_ring_poll(socket->packet_options->ring))
+            events |= KERNEL_POLLIN | KERNEL_POLLRDNORM;
         events |= KERNEL_POLLOUT | KERNEL_POLLWRNORM;
     } else if (socket->listening) {
         if (socket->pending_live != 0) events |= KERNEL_POLLIN | KERNEL_POLLRDNORM;
@@ -6106,7 +6329,8 @@ int kernel_socket_work_pending(void)
 {
     if (protocol_current_owner() != kernel_io_context_current() || !protocol_depth) __builtin_trap();
     if (!socket_initialized) return 0;
-    int timer_ready=sys_timeouts_sleeptime()==0 || boaros_lwip_tcp_cork_ready();
+    int timer_ready=sys_timeouts_sleeptime()==0 || boaros_lwip_tcp_cork_ready() ||
+        (packet_timer_head && (int32_t)(sys_now()-packet_timer_head->packet_options->deadline)>=0);
     SOCKET_STATE(state);
     int runnable = rights_dirty || (rights_retry_pending && (int32_t)(sys_now()-rights_retry_ms)>=0) || ready_work.head || loopback_pending ||
         capacity_ready(&pool_wait,__atomic_load_n(&pool_generation,__ATOMIC_RELAXED)) || capacity_ready(&nic_wait, nic_generation) ||
@@ -6389,6 +6613,25 @@ static void service_loopback(struct kernel_socket_service_result *result, unsign
 #endif
 }
 
+static unsigned service_packet_ring_timers(unsigned budget)
+{
+    if (!budget || !packet_timer_head) return 0;
+    uint32_t now=sys_now();
+    unsigned retired=0;
+    while (retired<budget && packet_timer_head) {
+        struct kernel_socket *socket=packet_timer_head;
+        struct socket_packet_options *options=socket->packet_options;
+        if ((int32_t)(now-options->deadline)<0) break;
+        packet_timer_disarm(options);
+        if (!packet_ring_retire(options->ring,now)) __builtin_trap();
+        SOCKET_ENDPOINT(state,socket);
+        wake_socket(socket);
+        socket_async(socket,KERNEL_ASYNC_POLL_IN);
+        retired++;
+    }
+    return retired;
+}
+
 struct kernel_socket_service_result kernel_socket_service_owned(struct kernel_socket_protocol_scope *scope,
     struct kernel_socket_service_budget budget)
 {
@@ -6423,7 +6666,8 @@ struct kernel_socket_service_result kernel_socket_service_owned(struct kernel_so
     if (loopback_pending && result.packets < budget.packets)
         service_loopback(&result, budget.packets);
     socket_timer_running = 1;
-    result.timers = boaros_lwip_tcp_cork_due(budget.timers);
+    result.timers = service_packet_ring_timers(budget.timers);
+    result.timers += boaros_lwip_tcp_cork_due(budget.timers-result.timers);
     result.timers += sys_check_timeouts_budget(budget.timers-result.timers);
     socket_timer_running = 0;
     result.runnable = kernel_socket_work_pending();

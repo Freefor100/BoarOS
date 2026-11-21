@@ -52,7 +52,7 @@ for shift in ${FILE_IO_HOST_SHIFTS:-12 14}; do
         kernel/physical_page.c mm/heap.c mm/hugetlb.c mm/memory_object.c mm/mm.c mm/vma.c mm/uaccess.c arch/riscv/sv39.c \
         fs/files/table.c fs/files/io.c fs/files/transfer.c fs/files/range.c fs/files/locks.c fs/files/flock.c fs/files/path.c fs/files/metadata.c fs/files/socket.c fs/files/epoll.c fs/fs_context.c kernel/namespace.c kernel/ipc_namespace.c fs/open_file.c fs/async_io.c fs/block_file.c fs/loop.c fs/disk_mount.c \
         fs/pipe.c fs/vfs.c fs/tmpfs.c fs/file_mapping.c fs/record_lock.c fs/flock.c \
-        fs/page_cache.c fs/ext4_backend.c fs/fat32.c fs/lwext4_port.c kernel/block.c net/socket.c \
+        fs/page_cache.c fs/ext4_backend.c fs/fat32.c fs/lwext4_port.c kernel/block.c net/socket.c net/packet_ring.c \
         third_party/lwext4/src/*.c $network_sources ${FILE_IO_HOST_SOURCES:-} ${FILE_IO_HOST_FLAGS:-} \
         ${FILE_IO_HOST_LDFLAGS:-} "$@" -Wl,--wrap=kernel_copy_to_user,--wrap=ext4_dir_iterator_next_raw -Wl,--gc-sections,--wrap=ext4_fraw_inode_fill,--wrap=kernel_heap_allocate,--wrap=kernel_rwlock_write,--wrap=kernel_lock_held,--wrap=kernel_vfs_sync_borrowing,--wrap=kernel_vfs_sync_range,--wrap=kernel_vfs_file_accessed,--wrap=kernel_vfs_file_mincore_allowed,--wrap=kernel_record_lock_set,--wrap=kernel_wait_prepare,--wrap=kernel_mm_unpin_user_page,--wrap=riscv_smp_sync_user,--wrap=kernel_task_io_buffer_acquire,--wrap=kernel_uaccess_pin_user_page,--wrap=kernel_open_file_lookup_page,--wrap=kernel_vfs_node_writeback \
         -Wl,--wrap=kernel_page_cache_get_batch,--wrap=kernel_vfs_sync_range_borrowing,--wrap=kernel_mm_try_futex_read -o "$build_dir/concurrency-$shift"

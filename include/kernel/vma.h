@@ -100,9 +100,9 @@ struct kernel_vma {
     void *backing;
     /* Source owner for file/ELF/object mappings, attachment for SysV mappings. */
     void *backing_owner;
-    /* VM_MAYWRITE mappings charge their sealable file or shared object.
-     * The MM backing OFD owns the counter until all such VMAs are gone. */
-    uint64_t *shared_write_bytes;
+    /* Optional byte count for sealable file mappings or shared object views.
+     * The backing file description keeps the counter alive. */
+    uint64_t *shared_mapping_bytes;
 };
 
 static inline struct kernel_shm_attachment *kernel_vma_shm_attachment(const struct kernel_vma *vma)

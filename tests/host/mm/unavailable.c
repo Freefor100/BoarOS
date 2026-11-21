@@ -25,8 +25,10 @@ EXCLUDED(kernel_page_cache_alias_detach)
 EXCLUDED(kernel_task_mm_borrow)
 #endif
 #if !BOAROS_USER_SMP
-EXCLUDED(kernel_task_read_bytes)
-EXCLUDED(kernel_task_account_fault)
+uint64_t kernel_task_read_bytes(const struct kernel_task *task)
+{ (void)task;mm_test_unavailable();__builtin_unreachable(); }
+void kernel_task_account_fault(struct kernel_task *task,int major)
+{ (void)task;(void)major;mm_test_unavailable(); }
 #endif
 EXCLUDED(kernel_vfs_node_lock)
 EXCLUDED(kernel_vfs_node_try_read)

@@ -7,6 +7,7 @@
 #include <kernel/mm.h>
 #include <kernel/files.h>
 #include <kernel/open_file.h>
+#include <kernel/socket.h>
 #include <kernel/page.h>
 #include <kernel/task.h>
 #include <kernel/task_state.h>
@@ -95,6 +96,13 @@ static int64_t mmap_error(enum kernel_mm_status status)
         return -KERNEL_EEXIST;
     }
     return -KERNEL_EINVAL;
+}
+
+static int packet_mmap_page(struct kernel_open_file_description *file,
+    uint64_t offset,int writable,uint64_t *physical)
+{
+    (void)writable;
+    return kernel_socket_packet_ring_mmap_page(kernel_open_file_socket(file),offset,physical);
 }
 
 enum kernel_syscall_status syscall_handle_mmap(
@@ -221,9 +229,13 @@ enum kernel_syscall_status syscall_handle_mmap(
             }
         } else {
             const struct kernel_vfs_file *source=kernel_open_file_vfs_borrow(file);
+            enum kernel_open_file_kind kind=kernel_open_file_kind(file);
+            int packet_mapping=kind==KERNEL_OPEN_FILE_KIND_SOCKET &&
+                kernel_socket_family(kernel_open_file_socket(file))==KERNEL_SOCKET_AF_PACKET;
+            int object_mapping=kind==KERNEL_OPEN_FILE_KIND_BPF || packet_mapping;
             if ((protections & LINUX_PROT_READ) &&
                 (caller->personality & KERNEL_PERSONALITY_READ_IMPLIES_EXEC) &&
-                !(source->mount && source->mount->noexec))
+                !packet_mapping && !(source->mount && source->mount->noexec))
                 protections |= LINUX_PROT_EXEC;
             /* mmap检查打开模式；epoll等对象没有read操作并不表示OFD无读权限。 */
             uint32_t access_mode=kernel_open_file_flags(file)&3U;
@@ -234,10 +246,10 @@ enum kernel_syscall_status syscall_handle_mmap(
                 error=-KERNEL_EACCES;
             else if ((protections & LINUX_PROT_EXEC) && source->mount && source->mount->noexec)
                 error=-KERNEL_EPERM;
-            else if (kernel_open_file_kind(file)==KERNEL_OPEN_FILE_KIND_BPF) {
+            else if (object_mapping) {
                 if (!(mm_flags & KERNEL_MM_MAP_SHARED)) error=-KERNEL_EINVAL;
                 else if (protections & LINUX_PROT_EXEC) error=-KERNEL_EPERM;
-            } else if (kernel_open_file_kind(file)!=KERNEL_OPEN_FILE_KIND_REGULAR)
+            } else if (kind!=KERNEL_OPEN_FILE_KIND_REGULAR)
                 error=-KERNEL_ENODEV;
             if (error) {
                 if (kernel_open_file_release(&file)!=KERNEL_OPEN_FILE_STATUS_OK)
@@ -247,21 +259,30 @@ enum kernel_syscall_status syscall_handle_mmap(
             }
             /* file mmap's backend setup records access, before population.
              * A later PTE refault does not create another file access. */
-            if (kernel_open_file_kind(file)==KERNEL_OPEN_FILE_KIND_REGULAR)
+            if (kind==KERNEL_OPEN_FILE_KIND_REGULAR)
                 kernel_vfs_file_accessed((struct kernel_vfs_file *)source,kernel_open_file_flags(file));
-            if (kernel_open_file_kind(file)==KERNEL_OPEN_FILE_KIND_BPF) {
+            if (object_mapping) {
                 KERNEL_LOCK_SCOPE(mapping);
-                uint64_t *write_bytes=NULL;
-                error=kernel_bpf_mmap_begin(file,request->arguments[5],
-                    (request->arguments[1]+BOAROS_PAGE_MASK)&~BOAROS_PAGE_MASK,
-                    !!(protections & LINUX_PROT_WRITE),&mapping,&write_bytes);
+                uint64_t length=(request->arguments[1]+BOAROS_PAGE_MASK)&~BOAROS_PAGE_MASK;
+                struct kernel_mm_mapped_object object={0};
+                if (kind==KERNEL_OPEN_FILE_KIND_BPF) {
+                    object.acquire_page=kernel_bpf_mmap_page;
+                    object.may_write=!!(protections & LINUX_PROT_WRITE);
+                    error=kernel_bpf_mmap_begin(file,request->arguments[5],length,
+                        object.may_write,&mapping,&object.mapping_bytes);
+                } else {
+                    object.acquire_page=packet_mmap_page;
+                    object.may_write=1;
+                    error=kernel_socket_packet_ring_mmap_begin(kernel_open_file_socket(file),
+                        request->arguments[5],length,&mapping,&object.mapping_bytes);
+                }
                 if (error) {
                     if (kernel_open_file_release(&file)) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
                     decoded->value=error; return KERNEL_SYSCALL_STATUS_OK;
                 }
                 status=kernel_mm_mmap_object_shared(mm,file,request->arguments[0],
                     request->arguments[1],request->arguments[5],mm_permissions_from_linux(protections),
-                    mm_flags,write_bytes,&mapped_address);
+                    mm_flags,&object,&mapped_address);
             } else status = kernel_mm_mmap_file_private(
                 mm,
                 &file,

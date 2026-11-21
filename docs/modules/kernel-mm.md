@@ -471,7 +471,16 @@ host 链接真实 MM/VMA/Sv39/allocator/uaccess/等待实现，只替换硬件�
 
 `OBJECT_SHARED` VMA 以 BPF map OFD 和 map 内偏移作为来源，同一个 MM 的来源列表持有 OFD，因此关闭 FD 后，fork、拆分和移动仍保留原 map。对象页没有 inode、page cache 或截断登记；ARRAY 值区与 RINGBUF 重复数据窗口直接取得 map 存储的真实物理页引用。mmap 在独占 MM 修改资格内装入整个范围，再发布 VMA；页表分配在 raw metadata 锁外完成，每个 PTE 接收一个真实页引用，初始 PROT_NONE 直接安装受保护的 PTE。中途失败撤销已经安装的页，并归还页表和来源；MAP_FIXED 失败留下空洞。撤销沿共同 TLB 确认和页退休路径归还引用。
 
-mmap 从 map 的 `mapping_lock` 接纳到 VMA 发布都与 freeze 串行。调用者的 OFD pin 保留至 admission 锁释放；MM 仅在首次登记该来源时另取一个引用，所以并发 munmap 与 FD close 不能释放尚未解锁的 map。最初可写映射把 `shared_write_bytes` 指向 map 的计数，VMA 拆分、fork、替换、移动和释放按映射字节维护；mprotect 降为只读仍保留可写上限及计数。最初只读映射清除 WRITE 上限，所有对象映射清除 EXEC 上限。MADV_DONTNEED 撤销 PTE 后保留 VMA 和 map 数据，但该映射没有补页路径，再访问返回 SIGBUS；fork、mprotect 和 mremap 都不会恢复已丢弃的页，新 mmap 可重新映射同一份数据。这与固定 Linux `remap_vmalloc_range` 预装页、BPF 默认 vm_ops 没有 fault 回调的行为一致。mremap 可移动或缩小；扩大范围或 old_size=0 复制返回 EFAULT，MREMAP_DONTUNMAP 返回 EINVAL，沿用 VM_DONTEXPAND 的限制。共享 futex 对此类没有 inode/匿名身份的 vmalloc 页返回 EFAULT，私有 futex 仍按 MM 和虚拟地址取键，与固定 Linux 的 BPF 映射规则一致。
+mmap 从 map 的 `mapping_lock` 接纳到 VMA 发布都与 freeze 串行。调用者的 OFD pin 保留至 admission 锁释放；MM 仅在首次登记该来源时另取一个引用，所以并发 munmap 与 FD close 不能释放尚未解锁的 map。最初可写映射把 `shared_mapping_bytes` 指向 map 的计数，VMA 拆分、fork、替换、移动和释放按映射字节维护；mprotect 降为只读仍保留可写上限及计数。最初只读映射清除 WRITE 上限，所有对象映射清除 EXEC 上限。MADV_DONTNEED 撤销 PTE 后保留 VMA 和 map 数据，但该映射没有补页路径，再访问返回 SIGBUS；fork、mprotect 和 mremap 都不会恢复已丢弃的页，新 mmap 可重新映射同一份数据。这与固定 Linux `remap_vmalloc_range` 预装页、BPF 默认 vm_ops 没有 fault 回调的行为一致。mremap 可移动或缩小；扩大范围或 old_size=0 复制返回 EFAULT，MREMAP_DONTUNMAP 返回 EINVAL，沿用 VM_DONTEXPAND 的限制。共享 futex 对此类没有 inode/匿名身份的 vmalloc 页返回 EFAULT，私有 futex 仍按 MM 和虚拟地址取键，与固定 Linux 的 BPF 映射规则一致。
+
+### 链路层套接字接收环
+
+`AF_PACKET` 的 `TPACKET_V3` 接收环复用 `OBJECT_SHARED` 映射路径。映射必须从偏移
+零开始，覆盖已配置的整个环。接纳期间持有接收环配置互斥，页表逐页取得现有后备页的
+引用。`shared_mapping_bytes` 统计可读或可写的所有环映射。虚拟区域分裂、派生子进程和
+取消映射时沿用同一计数规则，因此只要有实际映射，改配环就返回 `EBUSY`。即使最后一个
+用户文件描述符已关闭，映射也继续持有打开文件描述，直到最后一个区域撤销、页引用归还
+并完成关闭。接收块的交付和归还见[网络模块](kernel-network.md)。
 
 ## tmpfs 文件映射
 

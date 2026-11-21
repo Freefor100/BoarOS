@@ -1,6 +1,5 @@
 #include <kernel/aio.h>
 #include <kernel/vdso.h>
-#include <kernel/bpf.h>
 #include <kernel/mm_backend.h>
 #include <kernel/hugetlb.h>
 #include <kernel/rlimit.h>
@@ -1069,7 +1068,9 @@ static enum kernel_mm_status prepare_file_registration(
     struct kernel_vfs_node *node = kernel_open_file_node(file);
     enum kernel_heap_status status;
     *prepared = 0;
-    if (kernel_open_file_kind(file) == KERNEL_OPEN_FILE_KIND_BPF) return KERNEL_MM_STATUS_OK;
+    enum kernel_open_file_kind kind=kernel_open_file_kind(file);
+    if (kind==KERNEL_OPEN_FILE_KIND_BPF || kind==KERNEL_OPEN_FILE_KIND_SOCKET)
+        return KERNEL_MM_STATUS_OK;
     if (node == 0) return KERNEL_MM_STATUS_STATE;
     int error = kernel_file_mapping_prepare(node);
     if (error) return error == -KERNEL_ENOMEM ? KERNEL_MM_STATUS_NO_MEMORY : KERNEL_MM_STATUS_STATE;
@@ -4019,7 +4020,7 @@ static enum kernel_mm_status allocate_private_page(struct physical_page_allocato
  * reference. The caller retires any partially installed range on failure. */
 static enum kernel_mm_status populate_object_mapping(struct kernel_mm_record *record,
     struct kernel_open_file_description *file,uint64_t offset,
-    const struct mm_file_mapping_plan *plan)
+    const struct mm_file_mapping_plan *plan,const struct kernel_mm_mapped_object *object)
 {
     struct physical_page_allocator *allocator=record->space.allocator;
     struct kernel_mm_retirement batch={0};
@@ -4034,7 +4035,7 @@ static enum kernel_mm_status populate_object_mapping(struct kernel_mm_record *re
         }
         struct kernel_mm_leaf_preparation prepared=KERNEL_MM_LEAF_PREPARATION_INIT;
         uint64_t physical=KERNEL_MM_NO_PAGE;
-        int error=kernel_bpf_mmap_page(file,offset+address-plan->start,
+        int error=object->acquire_page(file,offset+address-plan->start,
             !!(plan->permissions & KERNEL_MM_WRITE),&physical);
         status=!error ? KERNEL_MM_STATUS_OK : error==-KERNEL_ENOMEM ?
             KERNEL_MM_STATUS_NO_MEMORY : KERNEL_MM_STATUS_BUS_FAULT;
@@ -4066,7 +4067,7 @@ static enum kernel_mm_status commit_file_mapping(
     uint32_t flags,
     uint64_t *address,
     const struct mm_file_mapping_plan *input,
-    struct kernel_lock_guard *inode, uint64_t *object_write_bytes)
+    struct kernel_lock_guard *inode,const struct kernel_mm_mapped_object *object)
 {
     KERNEL_NO_RECLAIM_IO;
     struct mm_file_mapping_plan plan = *input;
@@ -4085,17 +4086,16 @@ static enum kernel_mm_status commit_file_mapping(
                         flags & KERNEL_MM_MAP_SHARED, flags & KERNEL_MM_MAP_FIXED, 0)) return KERNEL_MM_STATUS_NO_MEMORY;
     status = admit_mapping_lock(record, plan.start, plan.end, flags);
     if (status) return status;
-    int object=kernel_open_file_kind(*file)==KERNEL_OPEN_FILE_KIND_BPF;
-    int may_write=object ? !!(plan.permissions & KERNEL_MM_WRITE) : kernel_open_file_writable(*file),sealed=0;
-    uint64_t *write_bytes=object_write_bytes;
+    int may_write=object ? object->may_write : kernel_open_file_writable(*file),sealed=0;
+    uint64_t *mapping_bytes=object ? object->mapping_bytes : NULL;
     if (!object && (flags&KERNEL_MM_MAP_SHARED) && may_write) {
         if (kernel_vfs_node_attributes(kernel_open_file_node(*file))&KERNEL_VFS_INODE_APPEND)
             return KERNEL_MM_STATUS_ACCESS;
-        write_bytes=kernel_vfs_node_shared_write_counter(kernel_open_file_node(*file),&sealed);
+        mapping_bytes=kernel_vfs_node_shared_write_counter(kernel_open_file_node(*file),&sealed);
         if (sealed) {
             if (plan.permissions&KERNEL_MM_WRITE) return KERNEL_MM_STATUS_SEALED;
             may_write=0;
-            write_bytes=NULL;
+            mapping_bytes=NULL;
         }
     }
     existing = find_file_source(record, *file);
@@ -4130,7 +4130,7 @@ static enum kernel_mm_status commit_file_mapping(
                             : KERNEL_VMA_FAULT_FILE_PRIVATE,
         .backing = *file,
         .backing_owner = prepared ? prepared : existing,
-        .shared_write_bytes=write_bytes,
+        .shared_mapping_bytes=mapping_bytes,
         .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS &
             (((flags & KERNEL_MM_MAP_SHARED) == 0U || may_write)
                  ? KERNEL_VMA_ALL_PERMISSIONS : ~KERNEL_MM_WRITE) &
@@ -4143,7 +4143,7 @@ static enum kernel_mm_status commit_file_mapping(
             return status_from_vma(vma_status);
         }
         if (unmap_space_range(record,plan.start,plan.end)) __builtin_trap();
-        status=populate_object_mapping(record,*file,file_offset,&plan);
+        status=populate_object_mapping(record,*file,file_offset,&plan,object);
         if (status) {
             /* Replacement reserved enough VMA capacity for removal as well.
              * A failed MAP_FIXED leaves a hole, never an unpopulated object VMA. */
@@ -4198,7 +4198,7 @@ static enum kernel_mm_status commit_file_mapping(
     }
     /* 旧来源的最后close可能取得另一inode写锁，不能带着新inode读锁清理。 */
     if (inode->lock) kernel_lock_release(inode);
-    finish_file_mapping(record, file, prepared, object);
+    finish_file_mapping(record, file, prepared, object!=NULL);
     drain_shared_anon(record, 1);
     *address = plan.start;
     return KERNEL_MM_STATUS_OK;
@@ -5392,18 +5392,18 @@ void kernel_mm_drain_sources(const struct kernel_mm *mm)
 
 enum kernel_mm_status kernel_mm_mmap_object_shared(struct kernel_mm *mm,
     struct kernel_open_file_description *file,uint64_t hint,uint64_t length,
-    uint64_t offset,uint32_t permissions,uint32_t flags,uint64_t *write_bytes,uint64_t *address)
+    uint64_t offset,uint32_t permissions,uint32_t flags,const struct kernel_mm_mapped_object *object,
+    uint64_t *address)
 {
-    if (!file || !address || !(flags & KERNEL_MM_MAP_SHARED) ||
-        (permissions & KERNEL_MM_EXECUTE) ||
-        kernel_open_file_kind(file) != KERNEL_OPEN_FILE_KIND_BPF)
+    if (!file || !address || !object || !object->acquire_page ||
+        !(flags & KERNEL_MM_MAP_SHARED) || (permissions & KERNEL_MM_EXECUTE))
         return KERNEL_MM_STATUS_INVALID_ARGUMENT;
     MM_RANGE_OPERATION(mm, hint, (flags & KERNEL_MM_MAP_FIXED) ? length : 0);
     struct mm_file_mapping_plan plan;
     enum kernel_mm_status status=prepare_file_mapping(mm,hint,length,offset,permissions,flags,&plan);
     if (status) return status;
     struct kernel_lock_guard inode={0};
-    status=commit_file_mapping(&file,offset,flags,address,&plan,&inode,write_bytes);
+    status=commit_file_mapping(&file,offset,flags,address,&plan,&inode,object);
     return status;
 }
 
@@ -6312,7 +6312,7 @@ static int fault_inode_lock(struct mm_operation *operation, struct kernel_vfs_no
     return 0;
 }
 
-/* BPF's vmalloc mappings are populated at mmap, with no refill callback.
+/* Object mappings are populated at mmap, with no refill callback.
  * A missing PTE (including after DONTNEED) is a bus error, not another borrow. */
 static enum kernel_mm_status mapped_object_fault(struct mm_operation *operation,
     uint64_t address,uint32_t access,const struct kernel_vma *vma)
@@ -7690,7 +7690,7 @@ enum kernel_mm_status kernel_mm_prepare_futex(struct kernel_mm *mm,
             if (address >= ARCH_MMU_USER_LIMIT) return KERNEL_MM_STATUS_NOT_MAPPED;
             if (!record->vmas || kernel_vma_set_lookup(record->vmas, address, &vmas[i]))
                 return KERNEL_MM_STATUS_NOT_MAPPED;
-            /* vmalloc-backed BPF pages have no inode/anonymous futex identity. */
+            /* These directly mapped object pages have no inode/anonymous futex identity. */
             if (vmas[i].kind==KERNEL_VMA_KIND_OBJECT_SHARED) return KERNEL_MM_STATUS_ACCESS;
             struct kernel_mm_mapping mapping;
             enum kernel_mm_status status;

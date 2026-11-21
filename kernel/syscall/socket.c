@@ -43,6 +43,7 @@
 #define LINUX_SOCKADDR_STORAGE_SIZE 128
 #define LINUX_SOCKADDR_UN_SIZE 110
 #define LINUX_SOL_SOCKET 1
+#define LINUX_SOL_PACKET 263
 #define LINUX_SO_PEERCRED 17
 #define LINUX_SO_RCVTIMEO 20
 #define LINUX_SO_SNDTIMEO 21
@@ -513,6 +514,46 @@ static int ipv6_multicast_sockopt(struct kernel_socket *socket, struct kernel_mm
     return kernel_socket_set_option(socket,option,value);
 }
 
+static int packet_sockopt(struct kernel_socket *socket, struct kernel_mm *mm,
+    const struct kernel_syscall_request *request, unsigned name, int get, int32_t length)
+{
+    if (kernel_socket_family(socket)!=KERNEL_SOCKET_AF_PACKET) return -KERNEL_ENOPROTOOPT;
+    uint64_t address=request->arguments[3];
+    size_t copied;
+    if (!get) {
+        if (name==KERNEL_PACKET_RX_RING) {
+            struct kernel_socket_packet_ring_request ring;
+            _Static_assert(sizeof(ring)==28,"native tpacket_req3 size");
+            if ((uint32_t)length<sizeof(ring)) return -KERNEL_EINVAL;
+            if (kernel_copy_from_user(mm,&ring,address,sizeof(ring),&copied) ||
+                copied!=sizeof(ring)) return -KERNEL_EFAULT;
+            return kernel_socket_packet_ring_configure(socket,&ring);
+        }
+        if (name!=KERNEL_PACKET_VERSION && name!=KERNEL_PACKET_RESERVE)
+            return -KERNEL_ENOPROTOOPT;
+        int32_t value;
+        if (length<(int32_t)sizeof(value)) return -KERNEL_EINVAL;
+        if (kernel_copy_from_user(mm,&value,address,sizeof(value),&copied) ||
+            copied!=sizeof(value)) return -KERNEL_EFAULT;
+        return kernel_socket_packet_option_set(socket,name,value);
+    }
+    uint32_t selection=0, values[3];
+    unsigned count;
+    if (name==KERNEL_PACKET_HDRLEN) {
+        if (length<(int32_t)sizeof(selection)) return -KERNEL_EINVAL;
+        if (kernel_copy_from_user(mm,&selection,address,sizeof(selection),&copied) ||
+            copied!=sizeof(selection)) return -KERNEL_EFAULT;
+    }
+    int error=kernel_socket_packet_option_get(socket,name,selection,values,&count);
+    if (error) return error;
+    if ((uint32_t)length>count*sizeof(values[0])) length=(int32_t)(count*sizeof(values[0]));
+    if (kernel_copy_to_user(mm,request->arguments[4],&length,sizeof(length),&copied) ||
+        copied!=sizeof(length)) return -KERNEL_EFAULT;
+    if (length && (kernel_copy_to_user(mm,address,values,(size_t)length,&copied) ||
+        copied!=(size_t)length)) return -KERNEL_EFAULT;
+    return 0;
+}
+
 static int sockopt(struct kernel_socket *socket, struct kernel_files *files, struct kernel_mm *mm,
                    const struct kernel_syscall_request *request, int get)
 {
@@ -534,6 +575,7 @@ static int sockopt(struct kernel_socket *socket, struct kernel_files *files, str
                 KERNEL_UACCESS_STATUS_OK || copied != sizeof(length)) return -KERNEL_EFAULT;
     }
     if (length < 0) return -KERNEL_EINVAL;
+    if (level == LINUX_SOL_PACKET) return packet_sockopt(socket,mm,request,(unsigned)name,get,length);
     /* TCP publishes optlen before touching optval (Linux tcp.c). */
     int tcp_extended = level == LINUX_IPPROTO_TCP &&
         ((name >= 4 && name <= 6) || name == 11);
