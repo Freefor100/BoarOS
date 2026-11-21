@@ -51,10 +51,6 @@ static void rx_free(struct pbuf *p)
 }
 static int copy_pbuf(const void *context, void *destination, uint32_t length)
 { return pbuf_copy_partial(context, destination, (u16_t)length, 0) == length; }
-static void release_owner(void *owner)
-{
-    kernel_socket_pbuf_free(owner);
-}
 static err_t submit_link_frame(struct netif *interface, struct pbuf *p, int more)
 {
     COST_SCOPE(output_cost, NET_TX_OUTPUT_TICKS);
@@ -331,7 +327,7 @@ static void worker(void *context)
     while (!stopping(n)) {
         kernel_socket_rights_service();
         int failed = virtio_net_service(d);
-        virtio_net_tx_release(d, release_owner, 0);
+        virtio_net_tx_release(d, kernel_socket_pbuf_free_batch, 0);
         uintptr_t irq = arch_interrupt_save();
         struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
         struct virtio_net_progress state = boaros_lwip_parallel_enabled()
@@ -432,7 +428,7 @@ int kernel_network_stop(struct kernel_network **owner)
     }
     /* reset已确认DMA停止；worker已join，归还剩余TX owner。 */
     if (n->device) {
-        virtio_net_tx_release(n->device, release_owner, 1);
+        virtio_net_tx_release(n->device, kernel_socket_pbuf_free_batch, 1);
         if (virtio_net_get_progress(n->device).loaned) { arch_interrupt_restore(irq); return -KERNEL_EBUSY; }
     }
     if (n->device) {

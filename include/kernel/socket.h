@@ -373,6 +373,7 @@ void kernel_socket_protocol_enter(struct kernel_socket_protocol_scope *scope);
 void kernel_socket_protocol_leave(struct kernel_socket_protocol_scope *scope);
 /* Release a packet reference without modifying protocol or interface state. */
 void kernel_socket_pbuf_free(struct pbuf *payload);
+void kernel_socket_pbuf_free_batch(void *const *payloads, unsigned count);
 #if BOAROS_USER_SMP
 int kernel_socket_start_tcp_owners(void);
 void kernel_socket_stop_tcp_owners(void);

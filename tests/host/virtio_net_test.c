@@ -105,12 +105,13 @@ static void model_extra_free(uint64_t phys)
     assert(0);
 }
 static void *released_owner[VIRTIO_NET_BUFFERS + VIRTIO_NET_QUEUE_SIZE];
-static unsigned released_count;
-static void collect_owner(void *owner)
+static unsigned released_count, release_batches;
+static void collect_owner(void *const *owners, unsigned count)
 {
     assert(arch_interrupt_is_enabled());
-    assert(released_count < sizeof(released_owner) / sizeof(released_owner[0]));
-    released_owner[released_count++] = owner;
+    assert(count && released_count + count <= sizeof(released_owner) / sizeof(released_owner[0]));
+    release_batches++;
+    for (unsigned i = 0; i < count; i++) released_owner[released_count++] = owners[i];
 }
 static struct wire_descriptor raw_descriptor(uint64_t table, unsigned id)
 {
@@ -434,6 +435,7 @@ static void seed_ring(struct riscv_virtio_mmio_net *d, unsigned q, uint16_t cons
     write16((char *)resolve(queues[q].used) + 2, consumed);
     write16((char *)resolve(queues[q].available) + 2, advertised);
     d->split[q].last_used = consumed; d->split[q].next_available = advertised;
+    d->split[q].published_available = advertised;
     queues[q].observed_available = advertised;
     unsigned char *a = resolve(queues[q].available);
     for (unsigned i = 0; i < queues[q].pending_count; i++)
@@ -811,9 +813,9 @@ static void test_tx_retirement_pressure(unsigned version)
     /* Reset must retain the old references, including those no longer
      * attached to a descriptor slot. */
     assert(riscv_virtio_mmio_net_stop(&d) == -KERNEL_EBUSY);
-    released_count = 0;
+    released_count = release_batches = 0;
     assert(riscv_virtio_mmio_net_tx_release(&d, collect_owner, 0) == COUNT);
-    assert(released_count == COUNT && d.tx_capacity_generation == COUNT);
+    assert(released_count == COUNT && release_batches == 1 && d.tx_capacity_generation == COUNT);
     for (unsigned i = 0; i < COUNT; i++) assert(released_owner[i] == &owners[i]);
     assert(!riscv_virtio_mmio_net_tx_release(&d, collect_owner, 1));
     stop(&d);
@@ -828,7 +830,9 @@ struct tx_release_probe {
 };
 static struct tx_release_probe *active_release_probe;
 
-static void reenter_tx_release(void *owner)
+static void reenter_tx_release(void *const *owners, unsigned count);
+
+static void reenter_tx_owner(void *owner)
 {
     struct tx_release_probe *probe = active_release_probe;
     struct riscv_virtio_mmio_net *d = probe->device;
@@ -849,6 +853,11 @@ static void reenter_tx_release(void *owner)
             assert(riscv_virtio_mmio_net_tx_release(d, reenter_tx_release, 0) == 1);
         }
     }
+}
+
+static void reenter_tx_release(void *const *owners, unsigned count)
+{
+    for (unsigned i = 0; i < count; i++) reenter_tx_owner(owners[i]);
 }
 
 static void test_tx_release_reentry(unsigned version, unsigned abandon)

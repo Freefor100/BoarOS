@@ -35,8 +35,6 @@ static void wake(struct virtio_net_device *d)
     if (kernel_wait_queue_wake_all(&d->progress) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
     arch_interrupt_restore(irq);
 }
-static unsigned free_head(uint32_t mask)
-{ for (unsigned i = 0; i < 32; i++) if (!(mask & (UINT32_C(1) << i))) return i; return 32; }
 static unsigned first_tx_slot(uint64_t available)
 {
 #if defined(__riscv) && !defined(__riscv_zbb)
@@ -52,10 +50,12 @@ static unsigned first_tx_slot(uint64_t available)
     return (unsigned)__builtin_ctzll(available);
 #endif
 }
-static void enqueue(struct virtio_net_device *d, unsigned q, unsigned id, unsigned b)
+static unsigned free_head(uint32_t mask)
+{ return first_tx_slot((uint32_t)~mask); }
+static void stage(struct virtio_net_device *d, unsigned q, unsigned id, unsigned b)
 {
     void *token = q ? (void *)&d->tx_state[b] : (void *)&d->rx_state[b];
-    if (virtio_split_enqueue(&d->split[q], &d->transport, id, token,
+    if (virtio_split_stage(&d->split[q], &d->transport, id, token,
         q ? 0 : header(d), q ? 2048 : 2048 - padding(d)) != VIRTIO_OK) __builtin_trap();
 }
 static int rx_refill_pending(const struct virtio_net_device *d)
@@ -72,7 +72,7 @@ static void refill_rx(struct virtio_net_device *d)
         struct virtio_descriptor *desc = queue(d, 0);
         desc[id] = (struct virtio_descriptor){ d->rx_phys + b * 2048 + padding(d), 2048 - padding(d), 2, 0 };
         d->rx_posted |= UINT32_C(1) << id;
-        enqueue(d, 0, id, b); submitted++;
+        stage(d, 0, id, b); submitted++;
     }
     if (submitted && virtio_split_notify(&d->split[0], &d->transport, 0) != VIRTIO_OK) __builtin_trap();
 }
@@ -128,7 +128,7 @@ static void flush_tx(struct virtio_net_device *d)
         }
 #endif
         d->tx_posted |= UINT32_C(1) << id;
-        enqueue(d, 1, id, b); submitted++;
+        stage(d, 1, id, b); submitted++;
     }
     if (submitted && virtio_split_notify(&d->split[1], &d->transport, 1) != VIRTIO_OK) __builtin_trap();
 }
@@ -647,7 +647,7 @@ int virtio_net_send_segments(struct virtio_net_device *d,
     return slot >= 0 ? 0 : slot;
 }
 unsigned virtio_net_tx_release(struct virtio_net_device *d,
-    void (*release)(void *owner), int abandon)
+    void (*release)(void *const *owners, unsigned count), int abandon)
 {
     if (!d || !release) return 0;
     void *owners[VIRTIO_NET_BUFFERS + VIRTIO_NET_QUEUE_SIZE];
@@ -688,8 +688,8 @@ unsigned virtio_net_tx_release(struct virtio_net_device *d,
     if (released) {
         COST_ADD(NET_TX_RETURN, released);
         COST_ADD(NET_TX_RETURN_BATCHES, 1);
+        release(owners, released);
     }
-    for (unsigned i = 0; i < released; i++) release(owners[i]);
     return released;
 }
 
