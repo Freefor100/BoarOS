@@ -117,6 +117,11 @@ void boaros_lwip_ip_lock_shared(struct kernel_lock_guard *guard)
     }
 }
 
+int boaros_lwip_ip_try_lock(struct kernel_lock_guard *guard)
+{
+    return kernel_mutex_try_lock(&ip_mutex, guard);
+}
+
 struct kernel_lock_guard *boaros_lwip_ip_drop_current(void)
 {
     struct kernel_lock_guard *guard = kernel_io_context_current()->locks;

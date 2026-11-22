@@ -31,6 +31,7 @@
 
 #include "lwip/init.h"
 #include "boaros_lwip.h"
+#include "lwip/etharp.h"
 #include "lwip/memp.h"
 #include "lwip/ip.h"
 #include "lwip/ip_addr.h"
@@ -748,6 +749,8 @@ static int protocol_enter(struct kernel_socket_protocol_scope *scope, int try_on
     scope->tcp_owner=0;
     scope->ip_guard.lock=0;
     scope->service=(struct kernel_service_scope){0};
+    /* Loopback packet taps can borrow a caller's UDP submission scope. */
+    if (protocol_current_owner() == kernel_io_context_current()) return protocol_lock(scope, try_only);
     /* With only CPU 0 online, the protocol mutex suffices to keep the
      * caller in the right execution context across a preemption. */
     if (kernel_cpu_get_boot_count() > 1 && !kernel_service_scope_try_local(&scope->service)) {
@@ -4279,7 +4282,7 @@ uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request, i
         if (socket->receive_credit > UINT32_MAX - bytes) __builtin_trap();
         if (!peek && !request->datagram) socket->receive_credit += bytes;
         if (retired && (!boaros_lwip_parallel_enabled() ||
-            (request->datagram && !retired->loopback))) {
+            (request->datagram && !retired->loopback && !socket->packets_head))) {
             if (socket->retired_tail) socket->retired_tail->next = retired;
             else socket->retired_head = retired;
             socket->retired_tail = tail;
@@ -4295,8 +4298,8 @@ uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request, i
             socket_schedule_locked(socket,flags,scope.owner);
         }
         if (retired) {
-            /* A parallel reader can return TCP and loopback UDP buffers
-             * without either lock. Keep the request visible to network stop
+            /* During a UDP burst the reader returns buffers while more
+             * datagrams are queued. Keep the request visible to network stop
              * until the underlying buffers have actually returned. */
             socket_state_release(&scope);
             release_inet_packets(socket,retired);
@@ -5454,7 +5457,9 @@ static int udp_pending_append(struct kernel_socket_write_request *request,
     return 0;
 }
 
-static int datagram_send_owned(struct kernel_socket_write_request *request)
+enum { DATAGRAM_REQUIRES_WORKER = INT32_MIN };
+
+static int datagram_send_owned(struct kernel_socket_write_request *request, int caller_only)
 {
     struct kernel_socket *socket=request->socket;
     struct socket_udp_pending *pending=socket->udp_pending;
@@ -5484,6 +5489,10 @@ static int datagram_send_owned(struct kernel_socket_write_request *request)
     struct netif *route=NULL;
     const ip_addr_t *source=NULL;
     if (!failure) failure=socket_ip_route(socket,&remote,&route,&source);
+    if (caller_only && (failure || !IP_IS_V4(&remote) || ip_addr_ismulticast(&remote) ||
+        ip_addr_isbroadcast(&remote, route) ||
+        (route != netif_get_loopif() && (route->output != etharp_output || !route->boaros_link_submit))))
+        return DATAGRAM_REQUIRES_WORKER;
     uint32_t length=request->payload_size+(pending?pending->bytes:0);
     if (!failure && IP_IS_V6(&remote) && route->mtu &&
         length+48U>nd6_get_destination_mtu(ip_2_ip6(&remote),route)) failure=-KERNEL_EMSGSIZE;
@@ -5548,7 +5557,7 @@ static int execute_protocol_request(struct kernel_socket_write_request *request)
     struct kernel_socket *socket=request->socket;
     switch(request->operation) {
     case SOCKET_PROTOCOL_DATAGRAM_PREPARE: return datagram_prepare_payload(request);
-    case SOCKET_PROTOCOL_DATAGRAM_SEND: return datagram_send_owned(request);
+    case SOCKET_PROTOCOL_DATAGRAM_SEND: return datagram_send_owned(request,0);
     case SOCKET_PROTOCOL_DATAGRAM_CANCEL: udp_pending_discard(socket);return 0;
     case SOCKET_PROTOCOL_DISPOSE:
         if(!request->protocol_payload)__builtin_trap();
@@ -5558,6 +5567,41 @@ static int execute_protocol_request(struct kernel_socket_write_request *request)
     }
     __builtin_trap();
 }
+
+#if BOAROS_USER_SMP
+static int datagram_try_caller(struct kernel_socket_write_request *request)
+{
+    struct kernel_socket *socket = request->socket;
+    if (!kernel_cpu_current()->logical_id || socket->family != KERNEL_SOCKET_AF_INET ||
+        socket->type != SOCKET_DGRAM || (request->flags & KERNEL_SOCKET_MSG_MORE) ||
+        !__atomic_load_n(&protocol_mutex_initialized, __ATOMIC_ACQUIRE) ||
+        !boaros_lwip_parallel_enabled())
+        return DATAGRAM_REQUIRES_WORKER;
+
+    struct kernel_socket_protocol_scope scope = {0};
+    if (!protocol_lock(&scope, 1)) {
+        arch_interrupt_restore(scope.interrupts);
+        return DATAGRAM_REQUIRES_WORKER;
+    }
+    int result = DATAGRAM_REQUIRES_WORKER;
+    if (scope.outer && boaros_lwip_ip_try_lock(&scope.ip_guard)) {
+        int admit;
+        {
+            KERNEL_IRQ_LOCK_SCOPE(state, &socket_state_lock);
+            admit = network_work_queue && !network_stopping && !socket->writes_head;
+        }
+        /* Only this transaction runs on the caller. Queued input or other
+         * work published by output remains the network worker's responsibility. */
+        if (admit && !socket->udp_pending) {
+            COST_SCOPE(execution, NETWORK_PROTOCOL_EXEC_TICKS);
+            result = datagram_send_owned(request, 1);
+        }
+    }
+    kernel_socket_protocol_leave(&scope);
+    return result;
+}
+#endif
+
 static int protocol_request(struct kernel_socket_write_request *request,enum socket_protocol_operation operation)
 {
     request->operation=operation;
@@ -5566,6 +5610,10 @@ static int protocol_request(struct kernel_socket_write_request *request,enum soc
     int owner_locked = 0;
 #endif
 #if BOAROS_USER_SMP
+    if (operation == SOCKET_PROTOCOL_DATAGRAM_SEND) {
+        int result = datagram_try_caller(request);
+        if (result != DATAGRAM_REQUIRES_WORKER) return result;
+    }
     unsigned cpu=tcp_socket_cpu(request->socket);
     if (cpu) {
         struct socket_tcp_owner *owner=tcp_owner_at(cpu);
