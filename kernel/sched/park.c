@@ -628,8 +628,28 @@ static enum kernel_scheduler_status wake(struct kernel_wait_queue *queue, int al
         return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     if (!kernel_wait_backend_initialized()) return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
     if (arch_interrupt_is_enabled()) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+    if (!kernel_wait_queue_registrations(queue)) return KERNEL_SCHEDULER_STATUS_OK;
+    struct kernel_wait_token token={0};
     struct kernel_wait_cursor cursor;
-    if (kernel_wait_cursor_prepare(queue, &cursor)) kernel_wait_cursor_wake(&cursor, all);
+    {
+        KERNEL_IRQ_LOCK_SCOPE(guard,&queue->lock);
+        struct kernel_wait_node *node=queue->head;
+        if (node && node==queue->tail && !node->callback && !node->event_mask &&
+            node->generation && node->task && node==kernel_wait_default_node(node->task)) {
+            queue_shape(queue);
+            if (node->borrow_owner!=queue) __builtin_trap();
+            token=(struct kernel_wait_token){node->task,node->generation};
+            kernel_wait_task_pin(token.task);
+        } else if (!cursor_prepare_queue_locked(queue,&cursor,0,0,0))
+            return KERNEL_SCHEDULER_STATUS_OK;
+    }
+    /* Later registrations belong to the next wake. The record borrow keeps
+     * the task alive outside the queue lock; normal commit and cancellation
+     * still own removal of the embedded node. */
+    if (token.task) {
+        (void)notify_token(&token,KERNEL_WAIT_WOKEN);
+        kernel_wait_task_unpin(token.task);
+    } else kernel_wait_cursor_wake(&cursor,all);
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 enum kernel_scheduler_status kernel_wait_queue_wake_one(struct kernel_wait_queue *queue) { return wake(queue, 0); }

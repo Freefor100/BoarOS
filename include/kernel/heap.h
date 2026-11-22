@@ -81,6 +81,8 @@ enum kernel_heap_status kernel_heap_resize(
 void kernel_heap_release(
     struct kernel_heap *heap,
     void *pointer);
+/* Return up to 16 live small allocations under one heap guard. */
+void kernel_heap_release_small_batch(struct kernel_heap *, void *const *, unsigned count);
 
 void kernel_heap_get_statistics(
     const struct kernel_heap *heap,

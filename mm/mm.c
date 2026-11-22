@@ -860,13 +860,16 @@ static void retire_file_residents(struct kernel_mm_record *record,
         if (kernel_page_cache_alias_active(&pages[i]->alias))
             aliases[alias_count++] = &pages[i]->alias;
     kernel_page_cache_alias_detach_batch(aliases, alias_count);
+    void *released[KERNEL_MM_RETIRE_CAPACITY];
+    unsigned release_count = 0;
     for (unsigned i = 0; i < count; ++i) {
         struct mm_file_resident *page = pages[i];
         if (page->alias.entry) {
             page->next = record->retired_file_residents;
             record->retired_file_residents = page;
-        } else kernel_heap_release(record->vma_heap, page);
+        } else released[release_count++] = page;
     }
+    kernel_heap_release_small_batch(record->vma_heap, released, release_count);
 }
 static void drain_retired_residents(struct kernel_mm_record *record,struct mm_file_resident *pages)
 {
@@ -6370,7 +6373,8 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
     struct kernel_mm_record *record,struct kernel_open_file_description *file,
     struct kernel_elf64_source *source,const struct kernel_vma *vma,
     uint64_t address,uint64_t *begin,
-    const struct kernel_mm_retirement *batch,uint32_t *targets)
+    const struct kernel_mm_retirement *batch,uint32_t *targets,
+    struct mm_file_resident *demand)
 {
     uint64_t end=address+BOAROS_PAGE_SIZE;
     uint64_t limit, first=file_fault_window(vma,address,&limit);
@@ -6427,14 +6431,24 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
                 (vma->permissions & KERNEL_MM_EXECUTE) != 0);
     }
     struct kernel_page_cache_alias_binding aliases[KERNEL_PAGE_CACHE_READY_WINDOW];
+    unsigned demand_bit = demand && installed ?
+        1U << ((demand->address - first) >> BOAROS_PAGE_SHIFT) : 0;
     unsigned unused = 0, alias_count = 0, i = 0;
-    for (unsigned bits = ready, index = 0; bits; bits >>= 1, index++) {
+    for (unsigned bits = ready | demand_bit, index = 0; bits; bits >>= 1, index++) {
         if (!(bits & 1)) continue;
-        struct mm_file_resident *page = residents[i];
-        if (!(installed & (1U << index))) {
-            refs[unused++] = refs[i];
-            if (page) kernel_heap_release(record->vma_heap, page);
-        } else if (shared) {
+        unsigned bit = 1U << index;
+        struct mm_file_resident *page;
+        if (bit == demand_bit) page = demand;
+        else {
+            page = residents[i];
+            if (!(installed & bit)) {
+                refs[unused++] = refs[i++];
+                if (page) kernel_heap_release(record->vma_heap, page);
+                continue;
+            }
+            i++;
+        }
+        if (shared) {
             /* Shared leaves are initially read-only. The MM writer and
              * inode reader exclude write faults and revocation until the
              * cache knows about every newly published alias. */
@@ -6445,11 +6459,10 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
                 .alias = &page->alias, .physical_address = page->physical_address,
             };
         }
-        i++;
     }
     if (alias_count)
         kernel_page_cache_alias_attach_window(kernel_open_file_page_cache(file),
-            kernel_open_file_vfs_borrow(file), offset>>BOAROS_PAGE_SHIFT, installed, aliases);
+            kernel_open_file_vfs_borrow(file), offset>>BOAROS_PAGE_SHIFT, installed | demand_bit, aliases);
     physical_page_release_batch(record->space.allocator,refs,unused);
     return end;
 }
@@ -6488,6 +6501,7 @@ static __attribute__((noinline)) enum kernel_mm_status mapped_file_fault(struct 
     struct kernel_mm_retirement batch;
     batch.count = batch.nonleaf = batch.compound = 0;
     struct mm_file_resident *resident = 0;
+    struct mm_file_resident *published = 0;
     void *old_bytes = 0, *copy = 0;
     unsigned missing = 0;
 #if BOAROS_COST_DIAGNOSTICS
@@ -6685,6 +6699,7 @@ prepare_file_tables:
                 page->address=address; page->physical_address=replacement;
                 page->private=!shared && access==KERNEL_MM_WRITE;
                 if (resident) { publish_file_resident(record,resident); resident=0; }
+                published = page;
                 if (!defer_sync)
                     targets=note_fault_change_locked(record,&batch,cookie!=0,instructions);
             }
@@ -6703,7 +6718,7 @@ prepare_file_tables:
         uint64_t begin=address,end=address+BOAROS_PAGE_SIZE;
         if (map_neighbours)
             end = map_file_neighbours(record,file,NULL,vma,address,&begin,
-                &batch,defer_sync ? &targets : NULL);
+                &batch,defer_sync ? &targets : NULL, shared && disk ? published : NULL);
         if (defer_sync && end - begin == BOAROS_PAGE_SIZE) {
             KERNEL_RAW_WRITE_SCOPE(raw,&record->metadata);
             targets=note_fault_change_locked(record,&batch,0,instructions);
@@ -6715,10 +6730,9 @@ prepare_file_tables:
             if (!shared && access==KERNEL_MM_WRITE) physical_page_release(allocator,source.address);
         }
         replacement=KERNEL_MM_NO_PAGE;
-        if (shared && disk && !cookie) {
-            struct mm_file_resident *page=find_file_resident(record,address);
-            if (!page || kernel_open_file_alias_attach(file,offset>>BOAROS_PAGE_SHIFT,
-                page->physical_address,&page->alias,page,address,rearm_shared_file_alias)) __builtin_trap();
+        if (shared && disk && !cookie && !kernel_page_cache_alias_active(&published->alias)) {
+            if (kernel_open_file_alias_attach(file,offset>>BOAROS_PAGE_SHIFT,
+                published->physical_address,&published->alias,published,address,rearm_shared_file_alias)) __builtin_trap();
         }
         if (shared && access==KERNEL_MM_WRITE) {
             if (disk) status=cached_write_fault(operation,file,vma,address,generation,&inode);
@@ -7220,7 +7234,7 @@ memory_tables_changed:
     if (status == KERNEL_MM_STATUS_OK) {
         uint64_t begin=address,end=address+BOAROS_PAGE_SIZE;
         if (fault_batch) {
-            end=map_file_neighbours(record,NULL,source,vma,address,&begin,&batch,&targets);
+            end=map_file_neighbours(record,NULL,source,vma,address,&begin,&batch,&targets,NULL);
             if (end - begin == BOAROS_PAGE_SIZE) {
                 KERNEL_RAW_WRITE_SCOPE(raw,&record->metadata);
                 targets=note_fault_change_locked(record,&batch,0,

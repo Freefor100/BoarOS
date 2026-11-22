@@ -5,6 +5,7 @@
 #include <ext4_bcache.h>
 #include <ext4_blockdev.h>
 #include <ext4_errno.h>
+#include <ext4_extent.h>
 #include <ext4_fs.h>
 #include <ext4_inode.h>
 #include <ext4_journal.h>
@@ -26,6 +27,25 @@ static unsigned expanded_attempts, narrow_attempts;
 static uint32_t reaped_inode;
 static unsigned reap_write_qualifications;
 static bool fail_inode_free;
+static bool in_reap_tail;
+static unsigned reap_tail_calls, reap_tail_allocations;
+void *__real_calloc(size_t, size_t);
+void *__wrap_calloc(size_t count, size_t size)
+{
+    if (in_reap_tail) reap_tail_allocations++;
+    return __real_calloc(count, size);
+}
+int __real_ext4_extent_remove_tail(struct ext4_inode_ref *, uint64_t,
+                                  uint32_t, bool *, bool *);
+int __wrap_ext4_extent_remove_tail(struct ext4_inode_ref *ref, uint64_t keep,
+                                  uint32_t window, bool *expanded, bool *done)
+{
+    in_reap_tail = ref->index == reaped_inode;
+    if (in_reap_tail) reap_tail_calls++;
+    int result = __real_ext4_extent_remove_tail(ref, keep, window, expanded, done);
+    in_reap_tail = false;
+    return result;
+}
 int __real_ext4_fs_free_inode(struct ext4_inode_ref *);
 int __wrap_ext4_fs_free_inode(struct ext4_inode_ref *ref)
 {
@@ -57,8 +77,9 @@ int __wrap_ext4_balloc_free_blocks(struct ext4_inode_ref *ref, ext4_fsblk_t firs
     return EOK;
 }
 
-static void single_reap(struct ext4_fs *fs, bool mapped)
+static void single_reap(struct ext4_fs *fs, const char *kind)
 {
+    bool mapped = strcmp(kind, "empty") != 0;
     uint32_t free_inodes = ext4_fs_available_inodes(fs);
     uint64_t free_blocks = ext4_fs_available_blocks(fs);
     ext4_file file;
@@ -67,6 +88,8 @@ static void single_reap(struct ext4_fs *fs, bool mapped)
         unsigned char bytes[4096] = {0x7d};
         size_t written;
         CHECK(fs->bdev->lg_bsize <= sizeof(bytes));
+        if (!strcmp(kind, "sparse"))
+            CHECK(ext4_fseek(&file, 64 * fs->bdev->lg_bsize, SEEK_SET) == EOK);
         CHECK(ext4_fwrite(&file, bytes, fs->bdev->lg_bsize, &written) == EOK);
         CHECK(written == fs->bdev->lg_bsize);
     }
@@ -86,10 +109,14 @@ static void single_reap(struct ext4_fs *fs, bool mapped)
     CHECK(ext4_fs_available_inodes(fs) == before_reap_inodes &&
           ext4_fs_available_blocks(fs) == before_reap_blocks);
     reap_write_qualifications = 0;
+    reap_tail_calls = reap_tail_allocations = 0;
     CHECK(ext4_orphan_free("/", inode) == EOK);
     reaped_inode = 0;
-    printf("orphan reap: mapped=%d, inode write qualifications=%u\n", mapped, reap_write_qualifications);
+    printf("orphan reap: %s, inode write qualifications=%u, tail calls=%u, calloc=%u\n",
+        kind, reap_write_qualifications, reap_tail_calls, reap_tail_allocations);
     CHECK(reap_write_qualifications == 0);
+    CHECK(reap_tail_calls == 1);
+    if (!mapped) CHECK(reap_tail_allocations == 0);
     CHECK(ext4_orphan_contains(fs, inode, &orphan) == EOK && !orphan);
     CHECK(ext4_fs_available_inodes(fs) == free_inodes && ext4_fs_available_blocks(fs) == free_blocks);
     CHECK(ext4_fopen(&file, "/victim", "r") == ENOENT);
@@ -302,7 +329,7 @@ int main(int argc, char **argv)
     CHECK(ext4_journal_start("/") == EOK);
 #if TEST_TRUNCATE_FALLBACK
     if (!strcmp(argv[2], "single-reap")) {
-        single_reap(dev.fs, !strcmp(argv[4], "mapped"));
+        single_reap(dev.fs, argv[4]);
         CHECK(ext4_journal_stop("/") == EOK && ext4_umount("/") == EOK);
         fault_block_close(&disk);
         return 0;

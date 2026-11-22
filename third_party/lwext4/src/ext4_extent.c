@@ -2030,8 +2030,19 @@ int ext4_extent_remove_space(struct ext4_inode_ref *inode_ref, ext4_lblk_t from,
 int ext4_extent_remove_tail(struct ext4_inode_ref *inode_ref, uint64_t keep,
     uint32_t window, bool *expanded, bool *done)
 {
+    struct ext4_extent_path root = {.header = ext_inode_hdr(inode_ref->inode)};
     struct ext4_extent_path *path = NULL;
-    int result = ext4_find_extent(inode_ref, EXT_MAX_BLOCKS, &path, 0);
+    bool single_root = !root.header->depth && to_le16(root.header->entries_count) <= 1;
+    int result;
+    if (single_root) {
+        /* Removing the end of the sole inode-resident extent cannot split
+         * the tree. The writable inode already owns the whole path. */
+        result = ext4_ext_check_root(inode_ref);
+        path = &root;
+        if (root.header->entries_count) root.extent = EXT_FIRST_EXTENT(root.header);
+    } else {
+        result = ext4_find_extent(inode_ref, EXT_MAX_BLOCKS, &path, 0);
+    }
     if (result != EOK) return result;
 
     struct ext4_extent *extent = path[ext_depth(inode_ref->inode)].extent;
@@ -2062,16 +2073,27 @@ int ext4_extent_remove_tail(struct ext4_inode_ref *inode_ref, uint64_t keep,
         }
     }
 
-    /* The highest extent already owns the writable path for a single-extent
-     * tail. A wider logical window can reuse the allocation for its rewalk. */
-    result = ext4_extent_remove_space_path(inode_ref, (ext4_lblk_t)first,
-        (ext4_lblk_t)(end - 1), path, first >= start);
-    if (result == EOK && first == keep) *done = true;
+    if (single_root) {
+        uint64_t from = first < start ? start : first;
+        result = ext4_ext_remove_leaf(inode_ref, &root, (ext4_lblk_t)from,
+            (ext4_lblk_t)(end - 1));
+        if (result == EOK && !root.header->entries_count)
+            root.header->max_entries_count = to_le16(ext4_ext_space_root(inode_ref));
+    } else {
+        /* The highest extent already owns the writable path. A wider
+         * logical window can reuse the allocation for its rewalk. */
+        result = ext4_extent_remove_space_path(inode_ref, (ext4_lblk_t)first,
+            (ext4_lblk_t)(end - 1), path, first >= start);
+    }
+    if (result == EOK && (first == keep || (single_root && !root.header->entries_count)))
+        *done = true;
     return result;
 
 Release:
-    ext4_ext_drop_refs(inode_ref, path, 0);
-    ext4_free(path);
+    if (!single_root) {
+        ext4_ext_drop_refs(inode_ref, path, 0);
+        ext4_free(path);
+    }
     return result;
 }
 

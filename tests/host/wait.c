@@ -51,9 +51,14 @@ static unsigned retired_returned;
 static pthread_barrier_t retired_paused, retired_resume;
 static _Thread_local unsigned pause_finish_borrow;
 static pthread_barrier_t finish_borrow_paused, finish_borrow_resume;
+static struct kernel_wait_queue *measured_wake_queue;
+static unsigned wake_queue_acquisitions;
+static struct kernel_task *register_during_wake;
+static struct kernel_wait_token late_wake_token;
 void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *,struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_raw_guard *guard)
 {
+    if (measured_wake_queue && lock==&measured_wake_queue->lock) wake_queue_acquisitions++;
     assert(!(forbid_wait_lock && lock==&kernel_wait_domain));
     if (observe_prepared_notify && lock==&kernel_wait_domain)
         __atomic_store_n(&prepared_notify_progress,2,__ATOMIC_RELEASE);
@@ -62,6 +67,11 @@ void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_r
 void __real_kernel_raw_lock_release(struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_release(struct kernel_raw_guard *guard)
 {
+    struct kernel_task *register_after_unlock=0;
+    if (register_during_wake && guard->lock==&measured_wake_queue->lock) {
+        register_after_unlock=register_during_wake;
+        register_during_wake=0;
+    }
     if (segment_tasks && guard->lock == &segment_queue->lock) {
         unsigned count = 0;
         for (unsigned i = 0; i < segment_count; i++) count += kernel_wait_record_phase(&segment_tasks[i].wait) == KERNEL_WAIT_NOTIFIED;
@@ -86,6 +96,12 @@ void __wrap_kernel_raw_lock_release(struct kernel_raw_guard *guard)
         finish_remaining = remaining;
     }
     __real_kernel_raw_lock_release(guard);
+    if (register_after_unlock) {
+        assert(!selected_task);
+        selected_task=register_after_unlock;
+        assert(!kernel_wait_prepare(measured_wake_queue,0,0,&late_wake_token));
+        selected_task=0;
+    }
     if (pause_batch) {
         int result = pthread_barrier_wait(&retired_paused);
         assert(!result || result == PTHREAD_BARRIER_SERIAL_THREAD);
@@ -808,6 +824,52 @@ static void event_filtering(void)
     assert(!kernel_wait_queue_close(&queue)&&!kernel_wait_queue_destroy(&queue));
     puts("wait: directed event filters, shared callbacks and mask-change broadcast passed");
 }
+static void singleton_default_wake(void)
+{
+    for (unsigned committed=0;committed<2;committed++) {
+        struct kernel_wait_queue queue;
+        struct kernel_task late={0};
+        struct kernel_wait_token token;
+        kernel_wait_record_init(&late.wait);
+        late.wait.on_cpu=1;
+        kernel_wait_node_init(&late.node,&late);
+        kernel_wait_queue_init(&queue);
+        assert(!kernel_wait_prepare(&queue,0,0,&token));
+        if (committed) {
+            kernel_wait_backend_commit(&task,0,0);
+            kernel_wait_record_transition(&task.wait,token.generation,KERNEL_WAIT_COMMITTED,KERNEL_WAIT_WOKEN);
+            task.wait.on_cpu=0;
+        }
+        measured_wake_queue=&queue;
+        wake_queue_acquisitions=0;
+        register_during_wake=&late;
+        assert(!(committed?kernel_wait_queue_wake_all(&queue):kernel_wait_queue_wake_one(&queue)));
+        /* The guarded snapshot and late registration each take the lock
+         * once. Waking a committed token also removes its default node. */
+        assert(wake_queue_acquisitions==2+committed);
+        assert(!register_during_wake && !queue.borrows &&
+            !kernel_wait_record_borrows(&task.wait) && !kernel_wait_node_references(&task.node));
+        measured_wake_queue=0;
+        assert(queue.registrations==2-committed);
+        assert(kernel_wait_record_phase(&late.wait)==KERNEL_WAIT_PREPARED);
+        assert(kernel_wait_record_phase(&task.wait)==KERNEL_WAIT_NOTIFIED);
+        if (committed) {
+            assert(task.completions==1 && task.ready_node.queued && !task.node.queue);
+            kernel_sched_dequeue(&runnable,&task.ready_node);
+            task.wait.on_cpu=1;
+            task.completions=0;
+        }
+        assert(!kernel_wait_finish(&token));
+        assert(!kernel_wait_queue_close(&queue));
+        assert(kernel_wait_record_phase(&late.wait)==KERNEL_WAIT_NOTIFIED);
+        selected_task=&late;
+        assert(!kernel_wait_finish(&late_wake_token));
+        selected_task=0;
+        assert(!kernel_wait_queue_destroy(&queue));
+    }
+    puts("wait: single default wake preserves commit, later registration and close with no cursor locks");
+}
+
 static void independent_wait_registration(void)
 {
     struct kernel_wait_queue queue;
@@ -1022,6 +1084,7 @@ int main(void)
     struct rlimit limit = {0}; assert(!setrlimit(RLIMIT_CORE, &limit));
     initialize(0);
     kernel_wait_domain_init();
+    singleton_default_wake();
     independent_wait_registration();
     independent_registration();
     stale_signal_generation();
