@@ -22,6 +22,7 @@ static int readable, at_bind, at_park, signalled, stale_hint;
 static unsigned hints;
 static unsigned service_entries, service_exits;
 static int target_cpu0;
+static int fd_closed, close_after_scan;
 int kernel_open_file_poll_requires_cpu0(const struct kernel_open_file_description *f)
 { CHECK(f==&target);return target_cpu0; }
 static enum kernel_open_file_kind target_kind;
@@ -37,7 +38,7 @@ void kernel_service_scope_end(struct kernel_service_scope *scope)
 int kernel_files_is_live(const struct kernel_files *f) { return f != NULL; }
 enum kernel_files_status kernel_files_pin(struct kernel_files *f,int64_t fd,
     struct kernel_open_file_description **out,int64_t *result)
-{ (void)f; *out=fd==7?&target:NULL; *result=*out?0:-KERNEL_EBADF; if(*out)refs++;return KERNEL_FILES_STATUS_OK; }
+{ (void)f; *out=fd==7 && !fd_closed?&target:NULL; *result=*out?0:-KERNEL_EBADF; if(*out)refs++;return KERNEL_FILES_STATUS_OK; }
 enum kernel_open_file_status kernel_open_file_release(struct kernel_open_file_description **out)
 { CHECK(*out==&target && refs);refs--;*out=NULL;return KERNEL_OPEN_FILE_STATUS_OK; }
 uint32_t kernel_open_file_poll(struct kernel_open_file_description *f,uint32_t requested,struct kernel_wait_queue **out)
@@ -74,16 +75,22 @@ enum kernel_uaccess_status kernel_copy_to_user(struct kernel_mm *mm,uint64_t to,
 int kernel_files_fd_matches(struct kernel_files *f,int64_t fd,const struct kernel_open_file_description *file)
 { (void)f;return file==(fd==7?&target:NULL); }
 int kernel_files_scan_select(struct kernel_files *files,unsigned nfds,const uint64_t *readfds,
-    const uint64_t *writefds,const uint64_t *exceptfds,unsigned *count,int *ready)
+    const uint64_t *writefds,const uint64_t *exceptfds,unsigned *count,int *ready,
+    struct kernel_open_file_description **small_snapshot)
 {
     (void)files;
     uint64_t requested=*readfds|*writefds|*exceptfds;
     if (nfds<64) requested &= (UINT64_C(1)<<nfds)-1;
-    uint64_t available=UINT64_C(1)<<7;
+    uint64_t available=fd_closed?0:UINT64_C(1)<<7;
     if (requested&~available) return -KERNEL_EBADF;
     *count=requested!=0;
     *ready=(requested && target_kind!=KERNEL_OPEN_FILE_KIND_REGULAR) ? -1 :
         !!(*readfds&requested)+!!(*writefds&requested);
+    if (small_snapshot && *ready<0) {
+        *small_snapshot=&target;
+        refs++;
+    }
+    if (close_after_scan) fd_closed=1;
     return 0;
 }
 enum kernel_heap_status kernel_heap_allocate(struct kernel_heap *h,size_t n,void **out)
@@ -91,9 +98,9 @@ enum kernel_heap_status kernel_heap_allocate(struct kernel_heap *h,size_t n,void
 void kernel_heap_release(struct kernel_heap *h,void *p)
 { (void)h;CHECK(allocs==1);allocs--;free(p); }
 static int run(struct kernel_pollfd *p,unsigned n,int immediate)
-{ struct kernel_files f={0};int ret=core_poll_run(&f,NULL,p,n,123,immediate,0,0);CHECK(!refs&&!live&&!allocs);return ret; }
+{ struct kernel_files f={0};int ret=core_poll_run(&f,NULL,p,n,123,immediate,0,0,NULL);CHECK(!refs&&!live&&!allocs);return ret; }
 static void reset(void)
-{ polls=binds=parks=finishes=initialized=0;allocated_bytes=0;readable=at_bind=at_park=signalled=stale_hint=0;hints=0;service_entries=service_exits=0;target_cpu0=0;target_kind=KERNEL_OPEN_FILE_KIND_PIPE;now_ns=1000; }
+{ polls=binds=parks=finishes=initialized=0;allocated_bytes=0;readable=at_bind=at_park=signalled=stale_hint=0;hints=0;service_entries=service_exits=0;target_cpu0=0;target_kind=KERNEL_OPEN_FILE_KIND_PIPE;fd_closed=close_after_scan=0;now_ns=1000; }
 static void empty_waits(void)
 {
     struct kernel_files files={0};struct kernel_mm mm={0};struct kernel_task task={0};
@@ -123,6 +130,10 @@ static void empty_waits(void)
     reset();uint64_t readfds=UINT64_C(1)<<7;ts=(struct kernel_timespec){0};readable=1;
     CHECK(!kernel_files_pselect6(&files,&mm,&task,8,(uintptr_t)&readfds,0,0,(uintptr_t)&ts,0,&result) && result==1);
     CHECK(!service_entries && !service_exits && readfds==(UINT64_C(1)<<7) && !refs && !live && !allocs);
+    reset();target_kind=KERNEL_OPEN_FILE_KIND_SOCKET;readable=close_after_scan=1;
+    CHECK(!kernel_files_pselect6(&files,&mm,&task,8,(uintptr_t)&readfds,0,0,0,0,&result) && result==1);
+    CHECK(fd_closed && polls==1 && !initialized && !refs && readfds==(UINT64_C(1)<<7));
+    CHECK(!kernel_files_pselect6(&files,&mm,&task,8,(uintptr_t)&readfds,0,0,0,0,&result) && result==-KERNEL_EBADF);
     reset();target_kind=KERNEL_OPEN_FILE_KIND_REGULAR;
     readfds=UINT64_C(1)<<7;
     uint64_t writefds=readfds,exceptfds=readfds;
@@ -141,7 +152,7 @@ int main(void)
     struct kernel_pollfd p[5];
     reset();p[0]=(struct kernel_pollfd){7,KERNEL_POLLIN,0};readable=1;
     CHECK(run(p,1,0)==1 && p[0].revents==KERNEL_POLLIN);
-    CHECK(polls==1 && !binds && !parks);
+    CHECK(polls==1 && !binds && !parks && !initialized);
     reset();for(unsigned i=0;i<5;i++)p[i]=(struct kernel_pollfd){7,KERNEL_POLLIN,0};
     CHECK(run(p,5,1)==0 && polls==5 && initialized==0);
     CHECK(allocated_bytes==5*sizeof(struct kernel_open_file_description *));

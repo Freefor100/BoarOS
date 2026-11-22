@@ -23,6 +23,8 @@ enum {
     BOAROS_UDP_LOOPBACK_INLINE,
 };
 void boaros_lwip_udp_loopback_input(struct netif *, struct pbuf *);
+int boaros_lwip_raw_input_idle(void);
+struct pbuf *boaros_lwip_udp_copy_borrowed(struct pbuf *);
 struct boaros_lwip_hooks {
     void (*netif_removed)(struct netif *);
     int (*udp_multicast_receive)(struct udp_pcb *,struct pbuf *,struct netif *,const void *,uint16_t,uint16_t);

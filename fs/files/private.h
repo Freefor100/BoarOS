@@ -95,8 +95,10 @@ static inline void kernel_files_scope_release(struct kernel_raw_guard *guard)
     __atomic_fetch_add(&(files)->record->statistics.field, (uint64_t)(value), __ATOMIC_RELAXED)
 int kernel_files_fd_matches(struct kernel_files *, int64_t,
     const struct kernel_open_file_description *);
+#define KERNEL_POLL_STACK_CAPACITY 4U
 int kernel_files_scan_select(struct kernel_files *,unsigned nfds,const uint64_t *readfds,
-    const uint64_t *writefds,const uint64_t *exceptfds,unsigned *count,int *ready);
+    const uint64_t *writefds,const uint64_t *exceptfds,unsigned *count,int *ready,
+    struct kernel_open_file_description **small_snapshot);
 
 /* 成功find取得独占预留；调用者随后安装或取消，不能遗弃编号owner。 */
 enum kernel_files_status kernel_files_find_free_fd(

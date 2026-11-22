@@ -717,10 +717,13 @@ int kernel_files_fd_matches(struct kernel_files *files, int64_t fd,
 }
 
 int kernel_files_scan_select(struct kernel_files *files,unsigned nfds,const uint64_t *readfds,
-    const uint64_t *writefds,const uint64_t *exceptfds,unsigned *count,int *ready)
+    const uint64_t *writefds,const uint64_t *exceptfds,unsigned *count,int *ready,
+    struct kernel_open_file_description **small_snapshot)
 {
     unsigned descriptors=0, ready_bits=0;
     int regular_only=1;
+    struct kernel_open_file_description *candidates[KERNEL_POLL_STACK_CAPACITY];
+    if (small_snapshot) small_snapshot[0]=NULL;
     for (unsigned first=0;first<nfds;first+=64) {
         unsigned word=first/64;
         uint64_t pending=readfds[word]|writefds[word]|exceptfds[word];
@@ -734,9 +737,20 @@ int kernel_files_scan_select(struct kernel_files *files,unsigned nfds,const uint
             struct kernel_open_file_description *file=lookup_locked(files,first+bit);
             if (!file) return -KERNEL_EBADF;
             if (file->kind!=KERNEL_OPEN_FILE_KIND_REGULAR || file->device) regular_only=0;
+            if (small_snapshot && descriptors<KERNEL_POLL_STACK_CAPACITY)
+                candidates[descriptors]=file;
             descriptors++;
             ready_bits+=!!(readfds[word]&mask)+!!(writefds[word]&mask);
             pending&=pending-1;
+        }
+        /* The small snapshot fits one bitmap word. Stateful descriptors
+         * can be retained here without looking up the same slots again. */
+        if (small_snapshot && !regular_only && descriptors<=KERNEL_POLL_STACK_CAPACITY) {
+            for (unsigned i=0;i<descriptors;i++) {
+                if (kernel_open_file_acquire(candidates[i])!=KERNEL_OPEN_FILE_STATUS_OK)
+                    __builtin_trap();
+                small_snapshot[i]=candidates[i];
+            }
         }
     }
     *count=descriptors;

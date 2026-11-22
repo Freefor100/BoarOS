@@ -65,6 +65,12 @@
 /** The list of RAW PCBs */
 static struct raw_pcb *raw_pcbs;
 
+int
+boaros_lwip_raw_input_idle(void)
+{
+  return raw_pcbs == NULL;
+}
+
 static u8_t
 raw_input_local_match(struct raw_pcb *pcb, u8_t broadcast)
 {

@@ -494,8 +494,16 @@ udp_input(struct pbuf *p, struct netif *inp)
 #endif /* SO_REUSE && SO_REUSE_RXTOALL */
       /* callback */
       if (pcb->recv != NULL) {
-        /* now the recv function is responsible for freeing p */
-        pcb->recv(pcb->recv_arg, pcb, p, ip_current_src_addr(), src);
+        if (p->boaros_udp_rx_borrowed) {
+          struct pbuf *owned = boaros_lwip_udp_copy_borrowed(p);
+          /* The original still backs the input headers during the callback. */
+          if (owned) pcb->recv(pcb->recv_arg, pcb, owned, ip_current_src_addr(), src);
+          else UDP_STATS_INC(udp.memerr);
+          pbuf_free(p);
+        } else {
+          /* The receive function owns the packet from this point. */
+          pcb->recv(pcb->recv_arg, pcb, p, ip_current_src_addr(), src);
+        }
       } else {
         /* no recv function registered? then we have to free the pbuf! */
         pbuf_free(p);
