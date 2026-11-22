@@ -111,7 +111,7 @@ struct pbuf *pbuf_alloced_custom(pbuf_layer layer, u16_t length, pbuf_type type,
 }
 struct pbuf *pbuf_alloc(pbuf_layer layer, u16_t length, pbuf_type type)
 {
-    if (layer != PBUF_RAW || type != PBUF_POOL) abort();
+    if ((layer != PBUF_RAW && layer != PBUF_TRANSPORT) || type != PBUF_POOL) abort();
     if (allocation_fail) return NULL;
     struct pbuf *p = calloc(1, sizeof(*p) + length);
     if (!p) abort();
@@ -120,6 +120,12 @@ struct pbuf *pbuf_alloc(pbuf_layer layer, u16_t length, pbuf_type type)
 }
 err_t pbuf_take(struct pbuf *p, const void *bytes, u16_t length)
 { memcpy(p->payload, bytes, length); copied += length; return ERR_OK; }
+struct pbuf *pbuf_clone(pbuf_layer layer, pbuf_type type, struct pbuf *source)
+{
+    struct pbuf *p=pbuf_alloc(layer,source->tot_len,type);
+    if (p && pbuf_take(p,source->payload,source->tot_len)!=ERR_OK) abort();
+    return p;
+}
 u8_t pbuf_free(struct pbuf *p)
 {
     if (!--p->ref) {
@@ -160,6 +166,7 @@ void virtio_net_release(struct virtio_net_device *d, unsigned b)
 { released++; if (lent[b]) { lent[b] = 0; d->loaned--; } }
 static err_t receive_input(struct pbuf *p, struct netif *n)
 { (void)n; received = p; return input_result; }
+int boaros_lwip_raw_input_idle(void) { return 1; }
 static int receive_contract(void)
 {
     struct virtio_net_device device = {0};
@@ -188,6 +195,25 @@ static int receive_contract(void)
     pool_stats.used = 0; owner.device->loaned = 0; input_result = ERR_IF;
     input_frame_owned(&owner, &frame);
     if (released != 4 || owner.device->loaned) return 1;
+    input_result=ERR_OK;
+    owner.device->loaned=32;
+    memcpy(bytes,device.mac,sizeof(device.mac));
+    bytes[14]=0x45;bytes[20]=bytes[21]=0;
+    ip4_addr_t destination={PP_HTONL(0x0a4d0002)};
+    memcpy(bytes+30,&destination.addr,sizeof(destination.addr));
+    ip_addr_copy_from_ip4(owner.interface.ip_addr,destination);
+    input_frame_owned(&owner,&frame);
+    if (received->payload!=bytes || !received->boaros_udp_rx_borrowed ||
+        released!=4 || copied!=sizeof(bytes)) return 1;
+    pool_stats.used=PBUF_POOL_SIZE-16;
+    if (boaros_lwip_udp_copy_borrowed(received) || released!=4 || copied!=sizeof(bytes))
+        return 1;
+    pool_stats.used=0;
+    struct pbuf *owned=boaros_lwip_udp_copy_borrowed(received);
+    if (!owned || owned->payload==bytes || owned->boaros_udp_rx_borrowed ||
+        memcmp(owned->payload,bytes,sizeof(bytes))) return 1;
+    if (!pbuf_free(received) || released!=5 || owner.device->loaned!=32) return 1;
+    if (!pbuf_free(owned) || pool_stats.used) return 1;
     kernel_socket_protocol_leave(&scope);
     printf("PASS same RX input: loan copies=0 fallback copies=%u; final reference, OOM, reserve and input error balanced\n", copied);
     return 0;

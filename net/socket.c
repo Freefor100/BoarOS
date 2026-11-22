@@ -68,6 +68,7 @@
 #define PACKET_OTHERHOST 3U
 #define PACKET_OUTGOING 4U
 #define UDP_MAX_PAYLOAD 65507U
+#define UDP_RECEIVE_LIMIT (96U * 1024U)
 #define RAW_MAX_PAYLOAD 65515U
 #define SOCKET_WRITE_BATCH 4U
 #define SOCKET_WRITE_RETRY_MS 250U
@@ -145,6 +146,7 @@ struct kernel_socket {
     struct socket_packet *packets_head;
     struct socket_packet *packets_tail;
     struct socket_packet *retired_head, *retired_tail;
+    struct socket_packet *udp_spares;
     uint32_t receive_credit;
     uint64_t receive_sequence;
     struct socket_pending *pending_head;
@@ -185,6 +187,7 @@ struct kernel_socket {
     ip_addr_t multicast_source;
     uint32_t rx_bytes;
     uint32_t rx_limit;
+    uint8_t udp_spare_count;
     int error;
     uint8_t type;
     uint8_t domain;
@@ -418,6 +421,7 @@ static int socket_ingress_filter(struct kernel_socket *socket,struct pbuf *p,str
 static void socket_ipv4_members_release(struct kernel_socket *);
 static void socket_ipv6_members_release(struct kernel_socket *);
 static void udp_received(void *,struct udp_pcb *,struct pbuf *,const ip_addr_t *,u16_t);
+static int udp_receive_fits_locked(const struct kernel_socket *, uint32_t);
 static void tcp_failed(void *,err_t);
 static void socket_tcp_info_retire(struct tcp_pcb *);
 static err_t socket_tcp_accepted(void *,struct tcp_pcb *,err_t);
@@ -440,8 +444,19 @@ static struct kernel_socket *tcp_filter_socket(const struct tcp_pcb *pcb)
 static int socket_udp_ingress_filter(struct udp_pcb *pcb,struct pbuf *p,struct netif *input,
     int ipv6,const void *network,uint16_t network_length,uint16_t header)
 {
-    return socket_ingress_filter(pcb->recv==udp_received?pcb->recv_arg:NULL,
-        p,input,ipv6,network,network_length,header);
+    struct kernel_socket *socket=pcb->recv==udp_received?pcb->recv_arg:NULL;
+    if (!socket_ingress_filter(socket,p,input,ipv6,network,network_length,header)) return 0;
+    if (p->boaros_udp_rx_borrowed && socket) {
+        /* Filtering can shorten the packet. Only an admissible record
+         * should be copied out of the transient receive slot. */
+        uint32_t charge=p->tot_len>header?p->tot_len-header:1;
+        KERNEL_IRQ_LOCK_SCOPE(state,socket_endpoint_lock(socket));
+        if (!udp_receive_fits_locked(socket,charge)) {
+            UDP_STATS_INC(udp.memerr);
+            return 0;
+        }
+    }
+    return 1;
 }
 static int socket_tcp_ingress_filter(struct tcp_pcb *pcb,struct pbuf *p,struct netif *input,
     int ipv6,const void *network,uint16_t network_length,uint16_t header)
@@ -2573,8 +2588,8 @@ static int udp_receive_capacity(void)
 static struct socket_packet *udp_packet_allocate(struct kernel_socket *socket)
 {
     struct socket_packet *packet;
-    enum kernel_heap_status status = kernel_heap_allocate_zeroed(socket->heap,
-        1U, sizeof(*packet), (void **)&packet);
+    enum kernel_heap_status status = kernel_heap_allocate(socket->heap,
+        sizeof(*packet), (void **)&packet);
     if (status == KERNEL_HEAP_STATUS_EMPTY) return NULL;
     if (status != KERNEL_HEAP_STATUS_OK) __builtin_trap();
     return packet;
@@ -2589,6 +2604,11 @@ static int ipv4_multicast_accept(const struct kernel_socket *socket,struct netif
     return 0;
 }
 
+static int udp_receive_fits_locked(const struct kernel_socket *socket, uint32_t charge)
+{
+    return charge<=socket->rx_limit && socket->rx_bytes<=socket->rx_limit-charge;
+}
+
 static void udp_received(void *context, struct udp_pcb *pcb,
                          struct pbuf *payload, const ip_addr_t *peer,
                          u16_t port)
@@ -2596,31 +2616,39 @@ static void udp_received(void *context, struct udp_pcb *pcb,
     struct kernel_socket *socket = context;
     (void)pcb;
     uint32_t charge = payload->tot_len ? payload->tot_len : 1U;
-    if (!udp_receive_capacity()) {
-        UDP_STATS_INC(udp.memerr);
-        kernel_socket_pbuf_free(payload); return;
-    }
-    struct socket_packet *packet = udp_packet_allocate(socket);
-    if (!packet) {
-        kernel_socket_pbuf_free(payload);
-        return;
-    }
-    packet->payload = payload;
-    if (boaros_lwip_parallel_enabled()) {
-        struct netif *input=ip_current_input_netif();
-        packet->loopback=input && input==netif_get_loopif();
-    }
-    address_export(socket, peer, port, &packet->address);
-    {
+    if (udp_receive_capacity()) {
         SOCKET_ENDPOINT(state,socket);
-        if (charge<=socket->rx_limit && socket->rx_bytes<=socket->rx_limit-charge) {
+        if (udp_receive_fits_locked(socket,charge)) {
+            struct socket_packet *packet=socket->udp_spares;
+            if (packet) {
+                socket->udp_spares=packet->next;
+                socket->udp_spare_count--;
+            } else {
+                socket_state_release(&state);
+                packet=udp_packet_allocate(socket);
+                if (!packet) {
+                    kernel_socket_pbuf_free(payload);
+                    return;
+                }
+                socket_state_acquire_lock(&state,socket_endpoint_lock(socket));
+                if (!udp_receive_fits_locked(socket,charge)) {
+                    socket_state_release(&state);
+                    kernel_heap_release(socket->heap,packet);
+                    goto drop;
+                }
+            }
+            struct netif *input=boaros_lwip_parallel_enabled()?ip_current_input_netif():NULL;
+            *packet=(struct socket_packet){
+                .payload=payload, .loopback=input && input==netif_get_loopif(),
+            };
+            address_export(socket,peer,port,&packet->address);
             packet_publish_locked(socket,packet,charge);
             return;
         }
     }
+drop:
     UDP_STATS_INC(udp.memerr);
     kernel_socket_pbuf_free(payload);
-    kernel_heap_release(socket->heap,packet);
 }
 
 /* UDP multicast keeps one immutable pbuf including its UDP header. Each
@@ -2654,7 +2682,8 @@ static int socket_udp_multicast_receive(struct udp_pcb *pcb,struct pbuf *p,struc
     if (!udp_receive_capacity()) return 1;
     struct socket_packet *packet = udp_packet_allocate(socket);
     if (!packet) return 1;
-    packet->length=kept;packet->consumed=8;pbuf_ref(p);packet->payload=p;
+    pbuf_ref(p);
+    *packet=(struct socket_packet){.length=kept,.consumed=8,.payload=p};
     address_export(socket,ip_current_src_addr(),port,&packet->address);
     {SOCKET_ENDPOINT(state,socket);
       if(charge<=socket->rx_limit && socket->rx_bytes<=socket->rx_limit-charge) {
@@ -3032,7 +3061,7 @@ int kernel_socket_create(struct kernel_heap *heap, int family, int type, int pro
     socket->type = (uint8_t)type;
     socket->family = (uint8_t)family;
     socket->domain = KERNEL_SOCKET_DOMAIN_INET;
-    socket->rx_limit = 65536U;
+    socket->rx_limit = type==SOCKET_DGRAM ? UDP_RECEIVE_LIMIT : 65536U;
     socket->tx_limit = 65536U;
     socket->ipv4_ttl=64;socket->multicast_ttl=1;
     socket->ipv6_multicast_hops=1;socket->ipv6_multicast_loop=1;socket->ipv6_multicast_all=1;
@@ -3090,15 +3119,42 @@ int kernel_socket_pair(struct kernel_heap *heap,int type,
     *owner_a=a;*owner_b=b;return 0;
 }
 
+static void udp_recycle_locked(struct kernel_socket *socket, struct socket_packet *packet)
+{
+    packet->payload=NULL;
+    packet->next=socket->udp_spares;
+    socket->udp_spares=packet;
+    socket->udp_spare_count++;
+}
+
 static void release_inet_packets(struct kernel_socket *socket, struct socket_packet *packets)
 {
     if (!packets) return;
+    struct socket_packet *spares=NULL;
+    unsigned remaining=socket->udp && !socket->destroying?KERNEL_NETWORK_RECEIVE_BATCH:0;
     do {
         struct socket_packet *next = packets->next;
         if (packets->payload) pbuf_free(packets->payload);
-        kernel_heap_release(socket->heap, packets);
+        if (remaining) {
+            remaining--;
+            packets->next=spares;
+            spares=packets;
+        } else kernel_heap_release(socket->heap,packets);
         packets = next;
     } while (packets);
+    if (spares) {
+        SOCKET_ENDPOINT(state,socket);
+        while (spares && socket->udp_spare_count<KERNEL_NETWORK_RECEIVE_BATCH) {
+            struct socket_packet *packet=spares;
+            spares=packet->next;
+            udp_recycle_locked(socket,packet);
+        }
+    }
+    while (spares) {
+        struct socket_packet *next=spares->next;
+        kernel_heap_release(socket->heap,spares);
+        spares=next;
+    }
     receive_capacity();
 }
 
@@ -3475,6 +3531,11 @@ void kernel_socket_destroy(struct kernel_socket *socket)
         kernel_heap_release(socket->heap, entry);
     }
     if (socket->udp != 0) {
+        while (socket->udp_spares) {
+            struct socket_packet *packet=socket->udp_spares;
+            socket->udp_spares=packet->next;
+            kernel_heap_release(socket->heap,packet);
+        }
         udp_pending_discard(socket);
         udp_remove(socket->udp);
     }
@@ -4374,8 +4435,17 @@ uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request, i
             /* During a UDP burst the reader returns buffers while more
              * datagrams are queued. Keep the request visible to network stop
              * until the underlying buffers have actually returned. */
+            struct pbuf *reuse_payload=NULL;
+            if (socket->udp && socket->udp_spare_count<KERNEL_NETWORK_RECEIVE_BATCH) {
+                reuse_payload=retired->payload;
+                udp_recycle_locked(socket,retired);
+                retired=NULL;
+            }
             socket_state_release(&scope);
-            release_inet_packets(socket,retired);
+            if (reuse_payload) {
+                pbuf_free(reuse_payload);
+                receive_capacity();
+            } else release_inet_packets(socket,retired);
             retired=NULL;
             socket_state_acquire_lock(&scope,socket_endpoint_lock(socket));
         }
@@ -6055,6 +6125,7 @@ int kernel_socket_set_option(struct kernel_socket *socket,
         /* UNIX按Linux倍增/下限和4MiB配置上限；INET保留现有协议预算。 */
         uint32_t maximum=force ? INT32_MAX/2U :
             socket->domain!=KERNEL_SOCKET_DOMAIN_INET ? (4U<<20) : 32768U;
+        if (!send && kernel_socket_is_udp(socket)) maximum=UDP_RECEIVE_LIMIT/2U;
         if(limit>maximum)limit=maximum;
         limit *= 2;
         if (limit < minimum) limit = minimum;

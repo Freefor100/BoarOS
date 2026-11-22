@@ -188,6 +188,36 @@ static int udp_capacity(void *context)
     struct kernel_network *n = context;
     return udp_capacity_after(virtio_net_loan_count(n->device), 0, 0);
 }
+
+struct pbuf *boaros_lwip_udp_copy_borrowed(struct pbuf *p)
+{
+    struct network_rx *rx=(void *)p;
+    struct virtio_net_device *device=rx->device;
+    unsigned bytes=LWIP_MEM_ALIGN_SIZE(PBUF_TRANSPORT)+p->tot_len;
+    unsigned pool=(bytes+PBUF_POOL_BUFSIZE-1)/PBUF_POOL_BUFSIZE;
+    if (!udp_capacity_after(virtio_net_loan_count(device),0,pool)) return NULL;
+    struct pbuf *owned=pbuf_clone(PBUF_TRANSPORT,PBUF_POOL,p);
+    if (owned) {
+        owned->if_idx=p->if_idx;
+        device->statistics.copied_packets++;
+        device->statistics.copied_bytes+=p->tot_len;
+    }
+    return owned;
+}
+
+static int udp_frame_can_borrow(struct kernel_network *n, const struct virtio_net_frame *frame)
+{
+    const unsigned char *data=frame->data;
+    /* Only local IPv4 UDP with an unfragmented, fixed-size IP header can
+     * reach UDP synchronously. Raw IP observers retain the original path. */
+    if (frame->size<42 || (data[0]&1) || data[12]!=8 || data[13]!=0 ||
+        data[14]!=0x45 || (data[20]&0x3f) || data[21] || data[23]!=17 || data[30]>=224)
+        return 0;
+    uint32_t destination;
+    memcpy(&destination,data+30,sizeof(destination));
+    return destination==netif_ip4_addr(&n->interface)->addr && boaros_lwip_raw_input_idle();
+}
+
 static struct kernel_wait_queue *progress(struct kernel_network *n)
 { return n->device ? &n->device->progress : &n->progress; }
 static void timer_wake(void *context)
@@ -273,12 +303,15 @@ static void input_frame_owned(struct kernel_network *n, const struct virtio_net_
         if (!udp_capacity_after(loaned, loans, pool)) goto dropped;
     }
     struct pbuf *p;
-    if (!virtio_net_lend(n->device, frame->buffer)) {
+    int lent=!virtio_net_lend(n->device,frame->buffer);
+    int borrowed=!lent && budgeted && udp_frame_can_borrow(n,frame);
+    if (lent || borrowed) {
         struct network_rx *rx = &n->rx[frame->buffer];
         rx->device = n->device; rx->buffer = frame->buffer; rx->custom.custom_free_function = rx_free;
         p = pbuf_alloced_custom(PBUF_RAW, (u16_t)frame->size, PBUF_REF, &rx->custom,
                                frame->data, 2048 - 16);
         if (!p) __builtin_trap();
+        p->boaros_udp_rx_borrowed=borrowed;
     } else {
         p = pbuf_alloc(PBUF_RAW, (u16_t)frame->size, PBUF_POOL);
         if (!p) goto dropped;

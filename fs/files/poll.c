@@ -21,8 +21,6 @@
 #include <stdint.h>
 #include <string.h>
 
-#define KERNEL_POLL_STACK_CAPACITY 4U
-
 struct kernel_pollfd {
     int32_t fd;
     int16_t events;
@@ -211,13 +209,14 @@ static int core_poll_run(
     uint64_t target_monotonic_ns,
     int immediate,
     int mask_modified,
-    uint64_t saved_mask)
+    uint64_t saved_mask,
+    struct kernel_open_file_description **snapshot)
 {
     KERNEL_SERVICE_SCOPE_IF(service, 0);
     struct kernel_open_file_description *stack_pinned[KERNEL_POLL_STACK_CAPACITY];
     struct kernel_wait_node stack_nodes[KERNEL_POLL_STACK_CAPACITY];
 
-    struct kernel_open_file_description **pinned = stack_pinned;
+    struct kernel_open_file_description **pinned = snapshot?snapshot:stack_pinned;
     struct kernel_wait_node *nodes = stack_nodes;
     void *heap_block = 0;
     int ready_count = 0;
@@ -237,13 +236,10 @@ static int core_poll_run(
                                             nfds * sizeof(*pinned));
     }
 
-    for (uint32_t i = 0; i < nfds; i++) {
+    /* ppoll still takes its own slot references. Small select calls can
+     * supply the references obtained during descriptor validation. */
+    for (uint32_t i = 0; !snapshot && i < nfds; i++) {
         pinned[i] = 0;
-        if (!immediate) kernel_wait_node_init(&nodes[i], task);
-    }
-
-    /* 固定整份FD快照；socket就绪只读端点状态，不进入lwIP。 */
-    for (uint32_t i = 0; i < nfds; i++) {
         if (pfds[i].fd < 0) continue;
         int64_t pin_result = 0;
         if (kernel_files_pin(files, pfds[i].fd, &pinned[i], &pin_result) !=
@@ -260,6 +256,10 @@ static int core_poll_run(
     }
 #endif
     ready_count = poll_snapshot(pfds, pinned, nfds, POLL_QUERY_ALL, 0);
+    if (!ready_count && !immediate) {
+        for (uint32_t i=0;i<nfds;i++)
+            if (pinned[i]) kernel_wait_node_init(&nodes[i],task);
+    }
 
     while (!ready_count && !error && !immediate) {
         /* 查询、绑定、复查共用短IRQ范围；不在已准备的token内等待其他锁。 */
@@ -413,7 +413,7 @@ enum kernel_files_status kernel_files_ppoll(
                             target_monotonic_ns,
                             immediate,
                             mask_modified,
-                            saved_mask);
+                            saved_mask,NULL);
 
     if (ret >= 0 && nfds > 0U) {
         size_t copied = 0U;
@@ -599,8 +599,9 @@ enum kernel_files_status kernel_files_pselect6(
     }
     unsigned count;
     int regular_ready;
+    struct kernel_open_file_description *small_snapshot[KERNEL_POLL_STACK_CAPACITY]={0};
     ret=kernel_files_scan_select(files,(unsigned)nfds,in_rfds,in_wfds,in_efds,
-        &count,&regular_ready);
+        &count,&regular_ready,words==1?small_snapshot:NULL);
     if (ret) goto cleanup;
     if (regular_ready>0 || (immediate && regular_ready==0)) {
         memcpy(out_rfds,in_rfds,bytes);
@@ -646,7 +647,7 @@ enum kernel_files_status kernel_files_pselect6(
                         target_monotonic_ns,
                         immediate,
                         mask_modified,
-                        saved_mask);
+                        saved_mask,small_snapshot[0]?small_snapshot:NULL);
     sigmask_restored = 1;
 
     if (ret >= 0) {

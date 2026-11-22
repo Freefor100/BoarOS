@@ -486,6 +486,8 @@ enum kernel_random_status kernel_random_fill(void *buffer, size_t size)
 
 int arch_dma_image_address(uint64_t address, uint64_t size, uint64_t *physical)
 { (void)size; *physical = address; return dma_eligible; }
+unsigned virtio_net_loan_count(const struct virtio_net_device *device)
+{ return device->loaned; }
 int virtio_net_send_segments(struct virtio_net_device *device,
     const struct virtio_net_tx_segment *segments, unsigned count, void *owner, int more)
 {
@@ -1231,6 +1233,59 @@ static void udp_loopback_payload(void)
     }
 }
 
+static void udp_receive_queue(void)
+{
+    kernel_socket_network_initialize();
+    struct kernel_socket *socket=NULL;
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,0,&socket));
+    int size;
+    CHECK(!kernel_socket_get_option(socket,KERNEL_SOCKET_RCVBUF,&size) && size==96*1024);
+    CHECK(!kernel_socket_set_option(socket,KERNEL_SOCKET_RCVBUF,128*1024));
+    CHECK(!kernel_socket_get_option(socket,KERNEL_SOCKET_RCVBUF,&size) && size==96*1024);
+    CHECK(!kernel_socket_set_option(socket,KERNEL_SOCKET_RCVBUF,0));
+    struct kernel_socket_protocol_scope scope;
+    kernel_socket_protocol_enter(&scope);
+    ip_addr_t source;
+    IP_ADDR4(&source,192,0,2,2);
+    for (unsigned i=0;i<3;i++) {
+        struct pbuf *payload=pbuf_alloc(PBUF_RAW,1200,PBUF_RAM);
+        CHECK(payload);
+        *(unsigned char *)payload->payload=(unsigned char)('a'+i);
+        unsigned allocated=heap_allocations;
+        udp_received(socket,socket->udp,payload,&source,23001+i);
+        CHECK(socket->rx_bytes==1200 && heap_allocations==allocated+(i==0));
+    }
+    struct pbuf *borrowed=pbuf_alloc(PBUF_RAW,1200+UDP_HLEN,PBUF_RAM);
+    CHECK(borrowed);
+    borrowed->boaros_udp_rx_borrowed=1;
+    CHECK(!socket_udp_ingress_filter(socket->udp,borrowed,NULL,0,NULL,0,UDP_HLEN));
+    pbuf_free(borrowed);
+    struct kernel_open_file_description *pin=(void *)socket;
+    struct kernel_socket_read_request request={0};
+    CHECK(kernel_socket_reserve_read(socket,NULL,&request,&pin,1,0,NULL)==1);
+    struct kernel_socket_address peer;
+    uint32_t length;
+    kernel_socket_read_info(&request,&peer,&length);
+    CHECK(peer.port==23001 && length==1200);
+    char first;
+    kernel_socket_copy_read(&request,0,&first,1);
+    CHECK(first=='a' && kernel_socket_finish_read(&request,0)==1 && !socket->rx_bytes);
+    retire_received(socket);
+
+    unsigned allocated=heap_allocations;
+    struct pbuf *payload=pbuf_alloc(PBUF_RAW,0,PBUF_RAM);
+    CHECK(payload);
+    udp_received(socket,socket->udp,payload,&source,23004);
+    CHECK(heap_allocations==allocated && socket->rx_bytes==1);
+    CHECK(kernel_socket_reserve_read(socket,NULL,&request,&pin,0,0,NULL)==0 && request.socket==socket);
+    kernel_socket_read_info(&request,&peer,&length);
+    CHECK(peer.port==23004 && !length);
+    CHECK(!kernel_socket_finish_read(&request,0) && !socket->rx_bytes);
+    kernel_socket_destroy(socket);
+    kernel_socket_protocol_leave(&scope);
+    CHECK(!heap_live && !STATS_GET(mem.used));
+}
+
 static void udp_final_payload(void)
 {
     kernel_socket_network_initialize();
@@ -1249,6 +1304,7 @@ static void udp_final_payload(void)
     CHECK(owner==(void *)socket && lwip_stats.mem.used==memory && !socket->tx_reserved);
     user_remaining=SIZE_MAX;
     kernel_socket_destroy(socket);
+    udp_receive_queue();
     udp_bind_ownership();
     udp_loopback_payload();
     puts("PASS UDP final payload and bind: gather, fault rollback, dual-stack ports and IPv4/IPv6 loopback ownership");
