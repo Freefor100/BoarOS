@@ -944,12 +944,12 @@ boaros_ipv4_path_resolve(struct boaros_ipv4_path *path, struct netif *netif,
 }
 
 err_t
-boaros_ipv4_output_resolved(const struct boaros_ipv4_path *path, struct pbuf *p, u8_t ttl,
-                            u8_t tos, int more)
+boaros_ipv4_output_resolved(const struct boaros_ipv4_path *path, struct pbuf *p, u8_t proto,
+                            u8_t ttl, u8_t tos, int more)
 {
   LWIP_IP_CHECK_PBUF_REF_COUNT_FOR_TX(p);
   MIB2_STATS_INC(mib2.ipoutrequests);
-  err_t error = ip4_prepend_header(p, &path->source, &path->destination, ttl, tos, IP_PROTO_TCP,
+  err_t error = ip4_prepend_header(p, &path->source, &path->destination, ttl, tos, proto,
                                     path->mtu, IP_HLEN, path->checksum, 0);
   if (error != ERR_OK) {
     return error;

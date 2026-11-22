@@ -89,7 +89,7 @@ struct boaros_ipv4_path {
 };
 void boaros_ipv4_path_resolve(struct boaros_ipv4_path *, struct netif *,
                               const ip4_addr_t *, const ip4_addr_t *, u8_t);
-err_t boaros_ipv4_output_resolved(const struct boaros_ipv4_path *, struct pbuf *, u8_t, u8_t, int);
+err_t boaros_ipv4_output_resolved(const struct boaros_ipv4_path *, struct pbuf *, u8_t proto, u8_t ttl, u8_t tos, int more);
 #endif
 #if LWIP_NETIF_USE_HINTS
 err_t ip4_output_hinted(struct pbuf *p, const ip4_addr_t *src, const ip4_addr_t *dest,

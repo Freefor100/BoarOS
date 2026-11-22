@@ -110,6 +110,9 @@ static unsigned reservation_first, reservation_second, reservation_release;
 static pthread_mutex_t remote_gate=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t remote_changed=PTHREAD_COND_INITIALIZER;
 static unsigned remote_work,remote_done,remote_mode,remote_testing,remote_parked;
+#if BOAROS_USER_SMP
+static int udp_wire_pause, udp_wire_entered, udp_wire_release;
+#endif
 static unsigned copy_waiting,copy_release,stop_waiting,stop_done,stop_borrows;
 static unsigned batch_waiting,batch_release;
 static struct {
@@ -518,6 +521,15 @@ int virtio_net_send_copy(struct virtio_net_device *device, uint32_t size,
     int (*copy)(const void *, void *, uint32_t), const void *context, int more)
 {
     (void)device; (void)more; ++copy_attempts;
+#if BOAROS_USER_SMP
+    if (udp_wire_pause) {
+        CHECK(!pthread_mutex_lock(&remote_gate));
+        udp_wire_entered=1;
+        CHECK(!pthread_cond_broadcast(&remote_changed));
+        while (!udp_wire_release) CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
+        CHECK(!pthread_mutex_unlock(&remote_gate));
+    }
+#endif
     if (nic_full) return -KERNEL_EAGAIN;
     CHECK(size <= sizeof(captured) && copy(context, captured, size));
     captured_size = size;
@@ -3424,6 +3436,47 @@ static void udp_caller_submit(void)
     CHECK(copied_packets == submitted + 1 && captured[5] == 1 && captured[12] == 8 &&
           captured[23] == IP_PROTO_UDP && captured[captured_size - 1] == 'w');
     CHECK(!remote_work && !wire_sender->active_writes && wire_sender->udp->local_port);
+    kernel_socket_protocol_enter(&scope);
+    boaros_lwip_ip_unlock(&scope.ip_guard);
+    wire_call.byte='z';
+    CHECK(!pthread_create(&first,NULL,udp_submit_writer,&wire_call) && !pthread_join(first,NULL));
+    CHECK(copied_packets==submitted+2 && captured[captured_size-1]=='z');
+    CHECK(!remote_work && !wire_sender->active_writes);
+    kernel_socket_protocol_leave(&scope);
+    CHECK(!kernel_socket_set_option(wire_sender,KERNEL_SOCKET_IPV4_TTL,43));
+    kernel_socket_protocol_enter(&scope);
+    test_arp_reply(netif,&peer,7);
+    kernel_socket_protocol_leave(&scope);
+    wire_call.byte='y';
+    CHECK(!pthread_create(&first,NULL,udp_submit_writer,&wire_call) && !pthread_join(first,NULL));
+    CHECK(copied_packets==submitted+3 && captured[5]==7 && captured[22]==43);
+
+    remote_mode=9;
+    udp_wire_pause=1;
+    wire_call.byte='q';
+    struct udp_submit_call wire_later={.pin=wire_pin,.destination=&wire,.byte='r',.queued=1};
+    CHECK(!pthread_create(&first,NULL,udp_submit_writer,&wire_call));
+    CHECK(!pthread_mutex_lock(&remote_gate));
+    while (!udp_wire_entered) CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
+    CHECK(!pthread_mutex_unlock(&remote_gate));
+    CHECK(!pthread_create(&second,NULL,udp_submit_writer,&wire_later));
+    CHECK(!pthread_mutex_lock(&remote_gate));
+    while (remote_parked != 1) CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
+    CHECK(!pthread_mutex_unlock(&remote_gate));
+    (void)kernel_socket_service_pending((struct kernel_socket_service_budget){2,2,0});
+    CHECK(copied_packets==submitted+3);
+    CHECK(!pthread_mutex_lock(&remote_gate));
+    udp_wire_release=1;
+    CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));
+    CHECK(!pthread_join(first,NULL));
+    udp_wire_pause=0;
+    CHECK(copied_packets==submitted+4 && captured[captured_size-1]=='q');
+    (void)kernel_socket_service_pending((struct kernel_socket_service_budget){2,2,0});
+    CHECK(!pthread_mutex_lock(&remote_gate));
+    CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));
+    CHECK(!pthread_join(second,NULL));
+    CHECK(copied_packets==submitted+5 && captured[captured_size-1]=='r');
+    remote_parked=0;
     CHECK(kernel_open_file_release(&wire_pin) == KERNEL_OPEN_FILE_STATUS_OK && !wire_pin);
 
     remote_mode = 9;
@@ -3466,7 +3519,7 @@ static void udp_caller_submit(void)
     netif_remove(netif);
     kernel_socket_protocol_leave(&scope);
     CHECK(!heap_live && !model_socket_files && !protocol_current_owner());
-    puts("PASS IPv4 UDP caller submits loopback and Ethernet; busy IP lock and prior request keep FIFO");
+    puts("PASS IPv4 UDP caller shares a resolved Ethernet path, refreshes TTL and ARP, and preserves FIFO");
 }
 #endif
 

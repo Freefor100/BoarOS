@@ -2069,7 +2069,7 @@ tcp_output_segment(struct tcp_seg *seg, struct tcp_pcb *pcb, struct netif *netif
     /* The owner serializes the PCB and the descriptors retain the pbuf
      * until the device returns it, just like ordinary Ethernet output. */
     int more = netif->boaros_link_flush != NULL;
-    err = boaros_ipv4_output_resolved(path, seg->p, pcb->ttl, pcb->tos, more);
+    err = boaros_ipv4_output_resolved(path, seg->p, IP_PROTO_TCP, pcb->ttl, pcb->tos, more);
     if (more && err == ERR_OK) *batch = netif;
 #ifdef BOAROS_LWIP_TCP_INFO
     if (err == ERR_OK) {
@@ -2443,7 +2443,7 @@ tcp_output_control_segment_netif(const struct tcp_pcb *pcb, struct pbuf *p,
 #if BOAROS_USER_SMP
   if (use_resolved_path && pcb->boaros_path4.interface == netif &&
       tcp_path4_current(pcb) && p->tot_len <= pcb->boaros_path4.mtu - IP_HLEN) {
-    err = boaros_ipv4_output_resolved(&pcb->boaros_path4, p, pcb->ttl, pcb->tos, 0);
+    err = boaros_ipv4_output_resolved(&pcb->boaros_path4, p, IP_PROTO_TCP, pcb->ttl, pcb->tos, 0);
 #ifdef BOAROS_LWIP_TCP_INFO
     if (err == ERR_OK) {
       LWIP_CONST_CAST(struct tcp_pcb *, pcb)->boaros_segs_out++;

@@ -45,6 +45,9 @@
 #include "lwip/pbuf.h"
 #include "lwip/netif.h"
 #include "lwip/ip_addr.h"
+#if BOAROS_USER_SMP
+#include "lwip/ip4.h"
+#endif
 #include "lwip/ip.h"
 #include "lwip/ip6_addr.h"
 #include "lwip/prot/udp.h"
@@ -58,6 +61,14 @@ extern "C" {
 #define UDP_FLAGS_CONNECTED      0x04U
 #define UDP_FLAGS_MULTICAST_LOOP 0x08U
 
+#if BOAROS_USER_SMP
+struct boaros_udp4_path {
+  struct boaros_ipv4_path ip;
+  u16_t local_port, remote_port;
+  u8_t ttl, tos, no_checksum, matches_peer;
+};
+err_t boaros_udp4_output_resolved(const struct boaros_udp4_path *, struct pbuf *);
+#endif
 struct udp_pcb;
 
 /** Function prototype for udp pcb receive callback functions
@@ -110,6 +121,10 @@ struct udp_pcb {
   udp_recv_fn recv;
   /** user-supplied argument for the recv callback */
   void *recv_arg;
+#if BOAROS_USER_SMP
+  /* The socket work-list lock protects publication to remote writers. */
+  struct boaros_udp4_path boaros_path4;
+#endif
 };
 /* Release an automatically assigned Linux local port after AF_UNSPEC. */
 void boaros_lwip_udp_release_port(struct udp_pcb *pcb);

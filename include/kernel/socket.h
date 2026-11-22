@@ -102,6 +102,10 @@ struct kernel_socket_write_request {
     struct kernel_socket_address inet_destination;
     uint64_t payload_size;
     uint8_t operation, queued;
+#if BOAROS_USER_SMP
+    uint8_t udp_output_owned;
+    uint8_t udp_rx_drained;
+#endif
     struct kernel_socket *unix_destination;
     struct kernel_wait_token completion;
 #if BOAROS_COST_DIAGNOSTICS
