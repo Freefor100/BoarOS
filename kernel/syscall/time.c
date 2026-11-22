@@ -17,6 +17,7 @@
 #include <kernel/time.h>
 #include <kernel/timex.h>
 #include <kernel/uaccess.h>
+#include <kernel/wait_internal.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -97,6 +98,8 @@ static int syscall_clock_id_valid(uint64_t clock_id)
     return clock_id == LINUX_CLOCK_REALTIME || clock_id == LINUX_CLOCK_MONOTONIC ||
            clock_id == LINUX_CLOCK_MONOTONIC_RAW ||
            clock_id == LINUX_CLOCK_BOOTTIME ||
+           clock_id == KERNEL_CLOCK_TAI ||
+           (kernel_clock_is_alarm((int32_t)clock_id) && kernel_time_has_rtc()) ||
            syscall_clock_id_coarse(clock_id);
 }
 
@@ -155,9 +158,12 @@ enum kernel_syscall_status syscall_handle_clock_gettime(
             return KERNEL_SYSCALL_STATUS_OK;
         }
     } else switch (clock) {
-    case LINUX_CLOCK_REALTIME: nanoseconds = kernel_time_realtime_ns(); break;
+    case LINUX_CLOCK_REALTIME:
+    case KERNEL_CLOCK_REALTIME_ALARM: nanoseconds = kernel_time_realtime_ns(); break;
+    case KERNEL_CLOCK_TAI: nanoseconds = kernel_time_tai_ns(); break;
     /* No suspend support: boottime has no suspended interval to add. */
     case LINUX_CLOCK_BOOTTIME:
+    case KERNEL_CLOCK_BOOTTIME_ALARM:
     case LINUX_CLOCK_MONOTONIC: nanoseconds = kernel_time_monotonic_ns(); break;
     case LINUX_CLOCK_MONOTONIC_RAW: nanoseconds = kernel_time_raw_ns(); break;
     case LINUX_CLOCK_REALTIME_COARSE: nanoseconds = kernel_time_coarse_realtime_ns(); break;
@@ -329,9 +335,13 @@ enum kernel_syscall_status syscall_handle_adjtimex(struct kernel_task *caller,
             decoded->value=kernel_time_adjust(&tx,&change);
         else
             decoded->value=kernel_scheduler_adjust_time(&tx,&change);
-        if (decoded->value>=0 && change!=KERNEL_CLOCK_UNCHANGED) {
-            kernel_timer_fd_reindex(change==KERNEL_CLOCK_STEP);
-            kernel_posix_timer_clock_changed();
+        if (decoded->value >= 0) {
+            if (change & (KERNEL_CLOCK_RATE | KERNEL_CLOCK_STEP)) {
+                kernel_timer_fd_reindex(!!(change & KERNEL_CLOCK_STEP));
+                kernel_posix_timer_clock_changed();
+            } else if (change & KERNEL_CLOCK_TAI_OFFSET) {
+                kernel_posix_timer_tai_changed();
+            }
         }
     }
 copy_out:
@@ -340,11 +350,22 @@ copy_out:
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
-static enum kernel_scheduler_status sleep_clock(int realtime,uint64_t ns,enum kernel_wait_wake_reason *reason)
+static int alarm_permission(void)
+{
+    return kernel_credentials_capable(kernel_credentials_current(), KERNEL_CAP_WAKE_ALARM) ?
+        0 : -KERNEL_EPERM;
+}
+
+static enum kernel_scheduler_status sleep_clock(enum kernel_time_domain domain, uint64_t ns,
+                                                enum kernel_wait_wake_reason *reason)
 {
     struct kernel_wait_token token;
-    enum kernel_scheduler_status status=realtime ? kernel_wait_prepare_realtime(0,ns,1,&token) :
-        kernel_wait_prepare_monotonic(0,ns,1,&token);
+    enum kernel_scheduler_status status;
+    if (domain == KERNEL_TIME_TAI)
+        status = kernel_wait_prepare_clock(0, ns, 1, &token, kernel_time_deadline_from_tai);
+    else if (domain == KERNEL_TIME_REALTIME)
+        status = kernel_wait_prepare_realtime(0, ns, 1, &token);
+    else status = kernel_wait_prepare_monotonic(0, ns, 1, &token);
     if (status) return status;
     status=kernel_wait_park(&token,reason);
     if (kernel_wait_finish(&token)) __builtin_trap();
@@ -434,12 +455,36 @@ static enum kernel_syscall_status syscall_cpu_sleep(struct kernel_task *caller,
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
+static enum kernel_syscall_status syscall_wait_clock(struct kernel_task *caller,
+    int32_t clock, enum kernel_time_domain domain, int absolute, uint64_t deadline,
+    uint64_t remaining_address,
+    struct kernel_syscall_result *decoded)
+{
+    enum kernel_wait_wake_reason reason;
+    if (sleep_clock(domain, deadline, &reason) != KERNEL_SCHEDULER_STATUS_OK)
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = 0;
+    if (reason != KERNEL_WAIT_SIGNALLED) return KERNEL_SYSCALL_STATUS_OK;
+
+    if (remaining_address) {
+        uint64_t now = kernel_time_domain_now(domain);
+        int64_t seconds, sub_nanoseconds;
+        syscall_split_nanoseconds(deadline > now ? deadline - now : 0, &seconds, &sub_nanoseconds);
+        enum kernel_syscall_status status = syscall_return_time(
+            caller, remaining_address, seconds, sub_nanoseconds, decoded);
+        if (status != KERNEL_SYSCALL_STATUS_OK || decoded->value) return status;
+    }
+    kernel_signal_note_nanosleep_restart(caller, clock, absolute, deadline, remaining_address);
+    decoded->value = -KERNEL_ERESTARTSYS;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
 enum kernel_syscall_status syscall_handle_restart_syscall(
     struct kernel_task *caller,
     struct kernel_syscall_result *decoded)
 {
-    enum kernel_wait_wake_reason wake_reason = KERNEL_WAIT_WOKEN;
-    enum kernel_scheduler_status sleep_status;
     int32_t clock_id;
     uint64_t deadline;
     uint64_t remaining_address;
@@ -476,67 +521,17 @@ enum kernel_syscall_status syscall_handle_restart_syscall(
         if(decoded->value!=-KERNEL_ERESTARTSYS)kernel_signal_clear_syscall_restart(caller);
         return status;
     }
-    if (clock_id==LINUX_CLOCK_REALTIME) {
-        sleep_status=sleep_clock(1,deadline,&wake_reason);
-        if (sleep_status) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-        decoded->value=wake_reason==KERNEL_WAIT_SIGNALLED?-KERNEL_ERESTARTSYS:0;
-        if (!decoded->value) kernel_signal_clear_syscall_restart(caller);
-        return KERNEL_SYSCALL_STATUS_OK;
-    }
-    if (deadline == 0U ||
-        kernel_time_monotonic_ns() >= deadline) {
+    enum kernel_time_domain domain = kernel_time_timer_domain(clock_id, 1);
+    if (kernel_time_domain_now(domain) >= deadline) {
         kernel_signal_clear_syscall_restart(caller);
         decoded->value = 0;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    sleep_status = sleep_clock(0,deadline,&wake_reason);
-    if (sleep_status != KERNEL_SCHEDULER_STATUS_OK) {
-        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-    }
-    if (wake_reason == KERNEL_WAIT_SIGNALLED) {
-        struct kernel_mm *mm;
-        uint64_t now_ns = kernel_time_monotonic_ns();
-        uint64_t target_ns = deadline;
-        uint64_t remaining_ns = target_ns > now_ns
-                                    ? target_ns - now_ns
-                                    : 0U;
-
-        if (remaining_address != 0U) {
-            struct linux_timespec remaining = {
-                .tv_sec = (int64_t)(remaining_ns /
-                                    LINUX_CLOCK_NSECS_PER_SEC),
-                .tv_nsec = (int64_t)(remaining_ns %
-                                     LINUX_CLOCK_NSECS_PER_SEC),
-            };
-            enum kernel_task_status task_status =
-                kernel_task_mm_borrow_mutable(caller, &mm);
-            enum kernel_uaccess_status access_status;
-            size_t copied = 0U;
-
-            if (task_status != KERNEL_TASK_STATUS_OK) {
-                return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-            }
-            access_status = kernel_copy_to_user(mm,
-                                                remaining_address,
-                                                &remaining,
-                                                sizeof(remaining),
-                                                &copied);
-            if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
-                kernel_signal_clear_syscall_restart(caller);
-                decoded->value = -KERNEL_EFAULT;
-                return KERNEL_SYSCALL_STATUS_OK;
-            }
-            if (access_status != KERNEL_UACCESS_STATUS_OK ||
-                copied != sizeof(remaining)) {
-                return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-            }
-        }
-        decoded->value = -KERNEL_ERESTARTSYS;
-        return KERNEL_SYSCALL_STATUS_OK;
-    }
-    kernel_signal_clear_syscall_restart(caller);
-    decoded->value = 0;
-    return KERNEL_SYSCALL_STATUS_OK;
+    enum kernel_syscall_status status = syscall_wait_clock(
+        caller, clock_id, domain, 0, deadline, remaining_address, decoded);
+    if (status != KERNEL_SYSCALL_STATUS_OK || decoded->value != -KERNEL_ERESTARTSYS)
+        kernel_signal_clear_syscall_restart(caller);
+    return status;
 }
 
 /*
@@ -559,12 +554,8 @@ enum kernel_syscall_status syscall_handle_sleep_for(
     struct linux_timespec request_spec;
     enum kernel_task_status task_status;
     enum kernel_uaccess_status access_status;
-    enum kernel_scheduler_status sleep_status;
-    enum kernel_wait_wake_reason wake_reason = KERNEL_WAIT_WOKEN;
     size_t copied;
-    uint64_t duration_ns;
-    uint64_t target_monotonic_ns;
-    uint64_t now_ns;
+    int alarm = kernel_clock_is_alarm(clock_id);
 
     if (syscall_clock_id_coarse(clock_id) || clock_id == 3U ||
         clock_id == LINUX_CLOCK_MONOTONIC_RAW) {
@@ -572,12 +563,15 @@ enum kernel_syscall_status syscall_handle_sleep_for(
         decoded->value = -KERNEL_EOPNOTSUPP;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    if (!cpu_clock && clock_id != LINUX_CLOCK_REALTIME && clock_id != LINUX_CLOCK_MONOTONIC) {
+    if (!cpu_clock && !alarm && clock_id != LINUX_CLOCK_REALTIME &&
+        clock_id != LINUX_CLOCK_MONOTONIC && clock_id != LINUX_CLOCK_BOOTTIME &&
+        clock_id != KERNEL_CLOCK_TAI) {
         decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
         decoded->value = -KERNEL_EINVAL;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    if (!cpu_clock && (flags & ~LINUX_TIMER_ABSTIME) != 0U) {
+    if (!cpu_clock && !alarm && clock_id != LINUX_CLOCK_BOOTTIME &&
+        clock_id != KERNEL_CLOCK_TAI && (flags & ~LINUX_TIMER_ABSTIME)) {
         decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
         decoded->value = -KERNEL_EINVAL;
         return KERNEL_SYSCALL_STATUS_OK;
@@ -608,88 +602,36 @@ enum kernel_syscall_status syscall_handle_sleep_for(
         return KERNEL_SYSCALL_STATUS_OK;
     }
 
-    {
-        unsigned __int128 requested =
-            (unsigned __int128)(uint64_t)request_spec.tv_sec *
-                LINUX_CLOCK_NSECS_PER_SEC + (uint64_t)request_spec.tv_nsec;
-
-        duration_ns = requested > INT64_MAX ? INT64_MAX : (uint64_t)requested;
-    }
-    if(cpu_clock)return syscall_cpu_sleep(caller,(int32_t)clock_id,
-        (flags&LINUX_TIMER_ABSTIME)!=0,(flags&LINUX_TIMER_ABSTIME)!=0,duration_ns,
-        (flags&LINUX_TIMER_ABSTIME)?0:remaining_address,decoded);
-    if ((flags&LINUX_TIMER_ABSTIME) && clock_id==LINUX_CLOCK_REALTIME) {
-        sleep_status=sleep_clock(1,duration_ns,&wake_reason);
-        if (sleep_status) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-        decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
-        decoded->value=wake_reason==KERNEL_WAIT_SIGNALLED?-KERNEL_ERESTARTSYS:0;
-        if (decoded->value) kernel_signal_note_nanosleep_restart(caller,LINUX_CLOCK_REALTIME,1,duration_ns,0);
-        return KERNEL_SYSCALL_STATUS_OK;
-    }
-    if ((flags & LINUX_TIMER_ABSTIME) != 0U) {
-        target_monotonic_ns = duration_ns;
-    } else {
-        now_ns = kernel_time_monotonic_ns();
-        target_monotonic_ns = duration_ns > (uint64_t)INT64_MAX - now_ns
-                                  ? INT64_MAX
-                                  : now_ns + duration_ns;
-    }
-
-    sleep_status = sleep_clock(0,target_monotonic_ns,&wake_reason);
-    if (sleep_status != KERNEL_SCHEDULER_STATUS_OK) {
-        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-    }
-
-    if ((wake_reason == KERNEL_WAIT_WOKEN ||
-         wake_reason == KERNEL_WAIT_SIGNALLED) &&
-        (flags & LINUX_TIMER_ABSTIME) == 0U && remaining_address != 0U) {
-        uint64_t now = kernel_time_monotonic_ns();
-        uint64_t remaining_ns = target_monotonic_ns > now
-                                    ? target_monotonic_ns - now
-                                    : 0U;
-
-        {
-            int64_t seconds;
-            int64_t sub_nanoseconds;
-
-            syscall_split_nanoseconds(remaining_ns,
-                                     &seconds,
-                                     &sub_nanoseconds);
-            access_status = kernel_copy_to_user(mm,
-                                                remaining_address,
-                                                &(struct linux_timespec){
-                                                    .tv_sec = seconds,
-                                                    .tv_nsec = sub_nanoseconds,
-                                                },
-                                                sizeof(struct linux_timespec),
-                                                &copied);
-            if (access_status != KERNEL_UACCESS_STATUS_OK ||
-                copied != sizeof(struct linux_timespec)) {
-                if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
-                    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
-                    decoded->value = -KERNEL_EFAULT;
-                    return KERNEL_SYSCALL_STATUS_OK;
-                }
-                return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-            }
+    if (alarm) {
+        int error = !kernel_time_has_rtc() ? -KERNEL_EOPNOTSUPP :
+            flags & ~LINUX_TIMER_ABSTIME ? -KERNEL_EINVAL : alarm_permission();
+        if (error) {
+            decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+            decoded->value = error;
+            return KERNEL_SYSCALL_STATUS_OK;
         }
     }
 
-    if (wake_reason == KERNEL_WAIT_SIGNALLED) {
-        kernel_signal_note_nanosleep_restart(caller,
-                                             LINUX_CLOCK_MONOTONIC,
-                                             (flags&LINUX_TIMER_ABSTIME)!=0,
-                                             target_monotonic_ns,
-                                             (flags & LINUX_TIMER_ABSTIME) != 0U
-                                                 ? 0U : remaining_address);
-        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
-        decoded->value = -KERNEL_ERESTARTSYS;
-        return KERNEL_SYSCALL_STATUS_OK;
-    }
+    unsigned __int128 requested =
+        (unsigned __int128)(uint64_t)request_spec.tv_sec *
+        LINUX_CLOCK_NSECS_PER_SEC + (uint64_t)request_spec.tv_nsec;
+    uint64_t deadline = requested > INT64_MAX ? INT64_MAX : (uint64_t)requested;
+    int absolute = !!(flags & LINUX_TIMER_ABSTIME);
+    if (absolute) remaining_address = 0;
+    if (cpu_clock)
+        return syscall_cpu_sleep(caller, (int32_t)clock_id, absolute, absolute,
+                                 deadline, remaining_address, decoded);
 
-    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
-    decoded->value = 0;
-    return KERNEL_SYSCALL_STATUS_OK;
+    /* Relative REALTIME is monotonic. The other new clock IDs keep their
+     * domain through timer arming and through a restart after a stop. */
+    if (!absolute && clock_id == LINUX_CLOCK_REALTIME) clock_id = LINUX_CLOCK_MONOTONIC;
+    enum kernel_time_domain domain = kernel_time_timer_domain(clock_id, 1);
+    if (!absolute) {
+        uint64_t now = kernel_time_domain_now(domain);
+        deadline = now >= (uint64_t)INT64_MAX || deadline > (uint64_t)INT64_MAX - now ?
+            INT64_MAX : deadline + now;
+    }
+    return syscall_wait_clock(caller, clock_id, domain, absolute, deadline, remaining_address, decoded);
 }
 
 enum kernel_syscall_status syscall_handle_getrusage(struct kernel_task *caller,
@@ -724,6 +666,7 @@ enum kernel_syscall_status syscall_handle_posix_timer(struct kernel_task *caller
     decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
     if(kernel_task_mm_borrow_mutable(caller,&mm)!=KERNEL_TASK_STATUS_OK)return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     if(request->number==107) {
+        int32_t clock = id;
         struct kernel_posix_event event,*input=0;
         struct kernel_posix_timer *timer=0;
         if(request->arguments[1]) {
@@ -734,6 +677,10 @@ enum kernel_syscall_status syscall_handle_posix_timer(struct kernel_task *caller
         if(!error)error=kernel_posix_timer_prepare(caller,id,input,&id,&timer);
         if(!error) {
             enum kernel_syscall_status status=posix_copy(mm,&id,request->arguments[2],sizeof(id),1,&error);
+            /* Linux validates alarm availability and permission at activation,
+             * after copying out the reserved timer ID. */
+            if (status == KERNEL_SYSCALL_STATUS_OK && !error && kernel_clock_is_alarm(clock))
+                error = kernel_time_has_rtc() ? alarm_permission() : -KERNEL_EOPNOTSUPP;
             kernel_posix_timer_publish(timer,!error&&status==KERNEL_SYSCALL_STATUS_OK);
             if(status!=KERNEL_SYSCALL_STATUS_OK)return status;
         }

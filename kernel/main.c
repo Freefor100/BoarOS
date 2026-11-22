@@ -1053,12 +1053,10 @@ static void kernel_main_high(void)
     virt_uart_put_hex((unsigned long)riscv_sv39_current_satp());
     virt_uart_putc('\n');
 
-    if (riscv_virt_rtc_read_ns(&boot_realtime_ns) !=
-        RISCV_VIRT_RTC_STATUS_OK) {
-        boot_realtime_ns = 0;
-    }
+    int rtc_available = riscv_virt_rtc_read_ns(&boot_realtime_ns) ==
+        RISCV_VIRT_RTC_STATUS_OK;
     time_status = kernel_time_init(boot_info.timebase_frequency,
-                                   boot_realtime_ns);
+                                   rtc_available ? &boot_realtime_ns : 0);
     if (time_status != KERNEL_TIME_STATUS_OK) {
         shutdown_for_time_error(time_status);
     }

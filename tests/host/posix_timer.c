@@ -17,6 +17,7 @@ static struct kernel_pid pid;
 static struct kernel_pid_member members[2];
 static uint64_t now_ns;
 static uint64_t wall_offset;
+static uint64_t tai_offset;
 static unsigned live,ignored,allocation_calls,allocation_fail,cpu_samples;
 static int detach_recipient;
 static uint64_t cpu_user,cpu_kernel;
@@ -29,12 +30,15 @@ uint64_t kernel_time_monotonic_ns(void)
     return __atomic_load_n(&now_ns,__ATOMIC_RELAXED);
 }
 uint64_t kernel_time_realtime_ns(void){return kernel_time_monotonic_ns()+wall_offset;}
+uint64_t kernel_time_tai_ns(void){return kernel_time_realtime_ns()+tai_offset;}
 uint64_t kernel_time_boot_realtime_offset(void){return wall_offset;}
 uint64_t riscv_time_read(void){return kernel_time_monotonic_ns()/100;}
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t ns,uint64_t *out)
 {if(ns<=kernel_time_monotonic_ns())return KERNEL_TIME_STATUS_DEADLINE_PASSED;*out=(ns+99)/100;return 0;}
 enum kernel_time_status kernel_time_deadline_from_realtime(uint64_t ns,uint64_t *out)
 {if(ns<=kernel_time_realtime_ns()){*out=riscv_time_read()+1;return KERNEL_TIME_STATUS_DEADLINE_PASSED;}return kernel_time_deadline_from_monotonic(ns-wall_offset,out);}
+enum kernel_time_status kernel_time_deadline_from_tai(uint64_t ns,uint64_t *out)
+{return kernel_time_deadline_from_realtime(ns>tai_offset?ns-tai_offset:0,out);}
 void kernel_scheduler_deadline_changed(void){assert(!kernel_cpu_current()->raw_locks);}
 void kernel_cpu_flush_notifications(void){assert(!kernel_cpu_current()->outbound);}
 struct kernel_cpu *riscv_smp_cpu(uint32_t n){assert(!n);return kernel_cpu_current();}
@@ -311,6 +315,38 @@ static void queued_periodic_clock_steps(void)
     expire(now_ns+650);out=take(36);assert(out.signal==36&&!out.uid&&remaining(id)==100);
     assert(!kernel_posix_timer_delete(&task,id));finish();
 }
+static void alarm_and_tai_indexes(void)
+{
+    init();
+    tai_offset=37000000000ULL;
+    int tai=create_timer(KERNEL_CLOCK_TAI,36);
+    int boot=create_timer(KERNEL_CLOCK_BOOTTIME,36);
+    int alarm=create_timer(KERNEL_CLOCK_REALTIME_ALARM,36);
+    int boot_alarm=create_timer(KERNEL_CLOCK_BOOTTIME_ALARM,36);
+    struct kernel_posix_itimerspec setting={.value={0,1000}},old;
+    assert(!kernel_posix_timer_set(&task,tai,0,&setting,&old));
+    assert(!kernel_posix_timer_set(&task,alarm,0,&setting,&old));
+    arm(boot,now_ns+1200,0);
+    arm(boot_alarm,now_ns+1300,0);
+    tai_offset-=500;
+    kernel_posix_timer_tai_changed();
+    assert(remaining(tai)==1500&&remaining(alarm)==1000);
+    tai_offset+=2000;
+    kernel_posix_timer_tai_changed();
+    kernel_posix_timer_expire(riscv_time_read()+1);
+    assert(take(36).sender==(unsigned)tai&&!task.group_pending);
+    wall_offset+=1100;
+    kernel_posix_timer_clock_changed();
+    kernel_posix_timer_expire(riscv_time_read()+1);
+    assert(take(36).sender==(unsigned)alarm&&!task.group_pending);
+    assert(remaining(boot)==1200&&remaining(boot_alarm)==1300);
+    assert(!kernel_posix_timer_delete(&task,tai));
+    assert(!kernel_posix_timer_delete(&task,alarm));
+    assert(!kernel_posix_timer_delete(&task,boot));
+    assert(!kernel_posix_timer_delete(&task,boot_alarm));
+    assert(!kernel_posix_timer_deadline());
+    finish();
+}
 static void thread_recipient_view(void)
 {
     init();task.tid=11; /* internal number is not the local recipient TID 1 */
@@ -333,7 +369,7 @@ int main(void)
 {
     thread_recipient_view();retired_kernel_worker();rttime_index_only();cpu_sleep_owner();
     reservation_and_mixed();stale_and_ignored();clear_batch_and_exec();completion_owner();completion_reset();cpu_thresholds();changed_uid_reservation();
-    clock_steps();queued_periodic_clock_steps();
+    clock_steps();queued_periodic_clock_steps();alarm_and_tai_indexes();
     puts("POSIX native reservation, mixed FIFO, stale generation, ignore phase, completion/delete owner and clock steps passed");return 0;
 }
 

@@ -438,10 +438,12 @@ enum kernel_scheduler_status kernel_scheduler_wake_signal(struct kernel_task *ta
 /* Only the rare clock-control path walks tasks. Normal waits retain the
  * deadline AVL and do not acquire an extra clock lock. PREPARED requests are
  * owned by their caller and recompute under this same domain at commit. */
-static void reindex_clock_waits_locked(void)
+static void reindex_clock_waits_locked(
+    enum kernel_time_status (*only)(uint64_t, uint64_t *))
 {
     for (struct kernel_task *task=scheduler.all_tasks;task;task=task->all_next) {
-        if (!task->deadline_indexed || !task->wait.convert_deadline) continue;
+        if (!task->deadline_indexed || !task->wait.convert_deadline ||
+            (only && task->wait.convert_deadline != only)) continue;
         deadline_index_remove(task);
         enum kernel_time_status status=task->wait.convert_deadline(
             task->wait.clock_deadline,&task->wait.deadline);
@@ -455,7 +457,7 @@ int kernel_scheduler_set_realtime(uint64_t ns)
 {
     KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
     if (kernel_time_set_realtime(ns)!=KERNEL_TIME_STATUS_OK) return -KERNEL_EINVAL;
-    reindex_clock_waits_locked();
+    reindex_clock_waits_locked(0);
     return 0;
 }
 
@@ -463,6 +465,8 @@ int kernel_scheduler_adjust_time(struct kernel_timex *tx,enum kernel_clock_chang
 {
     KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
     int result=kernel_time_adjust(tx,change);
-    if (result>=0 && *change!=KERNEL_CLOCK_UNCHANGED) reindex_clock_waits_locked();
+    if (result >= 0 && *change != KERNEL_CLOCK_UNCHANGED)
+        reindex_clock_waits_locked(*change == KERNEL_CLOCK_TAI_OFFSET ?
+                                   kernel_time_deadline_from_tai : 0);
     return result;
 }

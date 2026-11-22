@@ -60,6 +60,8 @@ SOURCES['process_control']='resource/process_control.c'
 SOURCES['file_flags']='resource/file_flags.c'
 SOURCES['file_ioctl']='resource/fd_events.c'
 SOURCES['ipv4_abi']='network/ipv4_abi.c'
+SOURCES['fanotify']='fs/fanotify.c'
+SOURCES['clock_domains']='resource/clock_domains.c'
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -139,7 +141,7 @@ def build(args,work):
 
 def accepted(raw,arch,cpus,target,selected=None):
     programs=[name for name in (selected or LEGACY) if name!='icache' or arch=='riscv']
-    if target=='boaros' and arch=='riscv' and ('mount_api' in programs or 'mount_context' in programs or 'system_control' in programs or 'sched_control' in programs or 'async_io' in programs or 'tty_async' in programs or 'uts_namespace' in programs or 'ipc_namespace' in programs or 'pid_namespace' in programs or 'nsfs_pid' in programs or any(p in programs for p in ('ptrace','ptrace_signal','ptrace_tools','process_memory','personality','process_control','file_flags','file_ioctl'))):
+    if target=='boaros' and arch=='riscv' and ('mount_api' in programs or 'mount_context' in programs or 'system_control' in programs or 'sched_control' in programs or 'async_io' in programs or 'tty_async' in programs or 'uts_namespace' in programs or 'ipc_namespace' in programs or 'pid_namespace' in programs or 'nsfs_pid' in programs or any(p in programs for p in ('ptrace','ptrace_signal','ptrace_tools','process_memory','personality','process_control','file_flags','file_ioctl','fanotify','clock_domains'))):
         free=re.search(r'task stacks released=0x[0-9a-f]+ min-free=0x([0-9a-f]+)',raw)
         if not free or int(free[1],16)<1024:return False
     ends=[line for line in raw.replace('\r','').splitlines() if line.startswith('API8 END ')]
@@ -152,6 +154,11 @@ def accepted(raw,arch,cpus,target,selected=None):
            'vectors_v2':[*(f'VECTORS2 CASE {name} PASS' for name in (
                'positions-libc-native-width','per-call-append-sync','vectors-errors-prefix',
                'signal-targets-seals','caller-cpus-atomic-append','local-copy-fault-prefix-cow-string')),'VECTORS2 PASS cases=6']}
+    known['fanotify']=['FANOTIFY PASS fd-delivery faults scopes fid namespace privacy']
+    known['clock_domains']=['CLOCK DOMAINS PASS tai-retarget-and-cancel-isolation',
+        'CLOCK DOMAINS PASS tai-signal-and-stop-restart absolute=0',
+        'CLOCK DOMAINS PASS tai-signal-and-stop-restart absolute=1',
+        'CLOCK DOMAINS PASS boottime-periodic','CLOCK DOMAINS PASS alarms','CLOCK DOMAINS PASS']
     markers=[f'API8 PASS programs={len(programs)}']
     for name in programs:markers+=known.get(name,[])
     lines=raw.replace('\r','').splitlines()
@@ -170,6 +177,7 @@ def main():
     parser.add_argument('--libc',choices=('musl','glibc'),default='musl')
     parser.add_argument('--dynamic',action='store_true')
     parser.add_argument('--kernel',type=Path)
+    parser.add_argument('--linux-kernel',type=Path,help='use an existing fixed-reference Linux build')
     parser.add_argument('--cpus',type=int,choices=range(1,9),default=1)
     parser.add_argument('--memory',default='512M')
     parser.add_argument('--vfat',action='store_true',help='also check copy_file_range on a BoarOS VFAT disk')
@@ -187,7 +195,9 @@ def main():
         report.update(programs=programs,fixture_sha256=digest(fixture))
         kernels=[]
         if args.only!='boaros':
-            if args.arch=='riscv':
+            if args.linux_kernel is not None:
+                linux=args.linux_kernel
+            elif args.arch=='riscv':
                 linux,identity=harness.linux_build(ROOT/'tests/smp/linux-user.config')
                 report['linux_identity']=identity
             else:linux=profile.linux_kernel()

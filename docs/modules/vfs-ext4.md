@@ -97,6 +97,18 @@ ext4 句柄包含卷的通用唯一标识符（Universally Unique Identifier，U
 `tests/workloads/io/file-handles.c` 检查容量、权限、符号链接、改名、硬链接、绑定挂载、
 延迟卸载、删除及索引节点编号复用。程序使用可写的 ext4 工作盘和独立的 tmpfs 挂载。
 
+### 文件访问通知
+
+文件访问通知从实际文件对象取得索引节点、父节点和挂载视图，并将操作提交给相应的监视组。
+文件句柄通知使用同一个句柄编码器，无需重新查找路径。传统描述符通知则保留触发事件的
+目录项和挂载视图，读取事件时从该位置创建新的打开文件描述。改名或延迟卸载后，待读事件
+仍引用原对象。由事件交付的描述符执行普通文件读写，抑制自身引发的文件通知。
+
+挂载标记使用实际视图，文件系统标记使用共享实例。最后一个视图引用归还时，虚拟文件系统
+（Virtual File System，VFS）暂时持有实例，撤下该视图的标记后才回收视图存储。实例卸载
+撤下剩余标记。已取消链接的索引节点在最后一个打开引用关闭时撤下标记，然后归还编号，
+避免新分配的索引节点继承旧标记。普通缓存回收保留仍有链接的索引节点标记。
+
 ## 通用边界
 
 `include/kernel/block.h` 定义同步块设备（支持读与可选写），`include/kernel/vfs.h` 定义 mount/file 对象以及根挂载、open/create、pread/pwrite、ftruncate、mkdir、unlink、rmdir、close、unmount、`kernel_vfs_fstat()` 与 `kernel_vfs_mount_is_readonly()` 查询。VFS 对外返回负 Linux errno；lwext4 的结构、全局设备名和正值 errno 不泄漏到调用者。当前有独立的 ext4、FAT32/VFAT、tmpfs、proc 和 devpts 实例；lwext4 共用 heap binding 按实例引用计数维护，每实例携带自己的锁上下文；进程 fd/open-file-description 位于独立的[文件资源层](kernel-files.md)，每个挂载命名空间持有自己的挂载视图树；命名空间修改使用可睡眠 mutex，inode、OFD 与后端各自同步。

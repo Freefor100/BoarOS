@@ -17,6 +17,7 @@
 #include <kernel/irq.h>
 #include <kernel/epoll.h>
 #include <kernel/exec.h>
+#include <kernel/fanotify.h>
 #include <kernel/files.h>
 #include <kernel/futex.h>
 #include <kernel/fs_context.h>
@@ -1935,6 +1936,11 @@ static int cleanup_task_io_requests(struct kernel_task *thread)
     if (thread->socket_read_request) kernel_socket_abort_read(thread->socket_read_request);
     if (thread->socket_call) kernel_socket_call_abort(thread->socket_call);
     if (thread->tty_request) kernel_tty_abort_request(thread->tty_request);
+    if (thread->fanotify_read) {
+        struct kernel_fanotify_read *read = thread->fanotify_read;
+        thread->fanotify_read = NULL;
+        kernel_fanotify_read_abort(read);
+    }
     if (thread->io_buffer) kernel_task_io_buffer_release(thread->io_buffer);
     return 0;
 }
@@ -2485,6 +2491,18 @@ enum kernel_task_status kernel_task_socket_call_register(struct kernel_task *tas
         return KERNEL_TASK_STATUS_STATE;
     task->socket_call = call;
     return KERNEL_TASK_STATUS_OK;
+}
+
+void kernel_task_fanotify_read_set(struct kernel_task *task, struct kernel_fanotify_read *read)
+{
+    if (task != kernel_task_current() || task->fanotify_read) __builtin_trap();
+    task->fanotify_read = read;
+}
+
+void kernel_task_fanotify_read_clear(struct kernel_task *task, struct kernel_fanotify_read *read)
+{
+    if (task->fanotify_read != read) __builtin_trap();
+    task->fanotify_read = NULL;
 }
 enum kernel_task_status kernel_task_socket_call_clear(struct kernel_task *task, struct kernel_socket_call *call)
 {

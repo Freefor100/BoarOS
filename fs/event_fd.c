@@ -384,7 +384,17 @@ enum kernel_files_status kernel_files_timerfd_create(struct kernel_files *files,
     int32_t clock,uint32_t flags,int64_t *result)
 {
     if (!kernel_files_is_live(files)||!result) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
-    if ((clock!=0&&clock!=1)||(flags&~(EVENT_NONBLOCK|EVENT_CLOEXEC))) { *result=-KERNEL_EINVAL;return 0; }
+    int alarm = kernel_clock_is_alarm(clock);
+    if ((clock != KERNEL_CLOCK_REALTIME && clock != KERNEL_CLOCK_MONOTONIC &&
+         clock != KERNEL_CLOCK_BOOTTIME && !alarm) ||
+        (flags & ~(EVENT_NONBLOCK | EVENT_CLOEXEC))) {
+        *result = -KERNEL_EINVAL;
+        return 0;
+    }
+    if (alarm && !kernel_credentials_capable(kernel_credentials_current(), KERNEL_CAP_WAKE_ALARM)) {
+        *result = -KERNEL_EPERM;
+        return 0;
+    }
     struct kernel_event_fd *event=0;
     int error=allocate_event(files,sizeof(struct kernel_timer_fd),KERNEL_OPEN_FILE_KIND_TIMERFD,flags,&event);
     if (error) { *result=error;return 0; }
@@ -406,10 +416,18 @@ static enum kernel_files_status timer_time(struct kernel_files *files,struct ker
     if (!file) { *result=-KERNEL_EBADF;return 0; }
     if (file->kind!=KERNEL_OPEN_FILE_KIND_TIMERFD) { *result=-KERNEL_EINVAL;return 0; }
     struct kernel_timer_fd *timer=(void *)file;
+    if (setting && kernel_clock_is_alarm(timer->clock) &&
+        !kernel_credentials_capable(kernel_credentials_current(), KERNEL_CAP_WAKE_ALARM)) {
+        *result = -KERNEL_EPERM;
+        return 0;
+    }
     struct kernel_wait_cursor cursor={0};int notify=0,error=0;
     {
         KERNEL_RAW_SCOPE(guard,&timer_lock);
-        if(setting)timer_cancel_registration(timer,timer->clock==0&&(flags&3U)==3U);
+        if (setting)
+            timer_cancel_registration(timer,
+                (timer->clock == KERNEL_CLOCK_REALTIME || timer->clock == KERNEL_CLOCK_REALTIME_ALARM) &&
+                (flags & 3U) == 3U);
         timer_forward(timer);
         uint64_t now=timer_now(timer);
         old.interval=time_spec(timer->interval);
@@ -417,10 +435,13 @@ static enum kernel_files_status timer_time(struct kernel_files *files,struct ker
         if (setting) {
             timer_remove(timer);timer->event.count=0;timer->expired=0;
             timer->interval=time_ns(new.interval);timer->expires=time_ns(new.value);timer->flags=flags;
-            timer->realtime=timer->clock==0&&(flags&1U);
+            timer->realtime=kernel_time_timer_domain(timer->clock, flags & 1U)==KERNEL_TIME_REALTIME;
             now=timer_now(timer);
             if (timer->expires) {
-                if (!(flags&1U)) timer->expires=timer->expires>INT64_MAX-now?INT64_MAX:timer->expires+now;
+                if (!(flags & 1U))
+                    timer->expires = now >= (uint64_t)INT64_MAX ||
+                                     timer->expires > (uint64_t)INT64_MAX - now ?
+                                     INT64_MAX : timer->expires + now;
                 if (timer->expires<=now) { timer->expired=1;timer->event.count=1;notify=kernel_wait_cursor_prepare(&timer->event.waiters,&cursor); }
                 else timer_insert(timer);
                 if(timer_canceled(timer))error=-KERNEL_ECANCELED;

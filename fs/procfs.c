@@ -1083,6 +1083,8 @@ static int proc_readlink(struct kernel_vfs_node *node, char *buffer,
                 prefix = "anon_inode:[eventpoll]";
             else if (file_kind == KERNEL_OPEN_FILE_KIND_INOTIFY)
                 prefix = "anon_inode:inotify";
+            else if (file_kind == KERNEL_OPEN_FILE_KIND_FANOTIFY)
+                prefix = "anon_inode:[fanotify]";
             else if (file_kind == KERNEL_OPEN_FILE_KIND_EVENTFD)
                 prefix = "anon_inode:[eventfd]";
             else if (file_kind == KERNEL_OPEN_FILE_KIND_TIMERFD)
@@ -1092,14 +1094,15 @@ static int proc_readlink(struct kernel_vfs_node *node, char *buffer,
             else if (file_kind==KERNEL_OPEN_FILE_KIND_PIDFD)
                 prefix="anon_inode:[pidfd]";
             else prefix = 0;
-            if (!prefix || (file_kind != KERNEL_OPEN_FILE_KIND_FS_CONTEXT && file_kind != KERNEL_OPEN_FILE_KIND_INOTIFY && file_kind != KERNEL_OPEN_FILE_KIND_PIDFD && file_kind != KERNEL_OPEN_FILE_KIND_EPOLL && file_kind != KERNEL_OPEN_FILE_KIND_EVENTFD && file_kind != KERNEL_OPEN_FILE_KIND_TIMERFD && file_kind != KERNEL_OPEN_FILE_KIND_SIGNALFD &&
-                            !identity)) result = -KERNEL_ENOENT;
+            int numbered = file_kind == KERNEL_OPEN_FILE_KIND_PIPE ||
+                file_kind == KERNEL_OPEN_FILE_KIND_NAMESPACE || file_kind == KERNEL_OPEN_FILE_KIND_SOCKET;
+            if (!prefix || (numbered && !identity)) result = -KERNEL_ENOENT;
             else {
                 char display[64];
                 prefix_length = strlen(prefix);
                 memcpy(display, prefix, prefix_length);
                 size_t length = prefix_length;
-                if (file_kind != KERNEL_OPEN_FILE_KIND_FS_CONTEXT && file_kind != KERNEL_OPEN_FILE_KIND_INOTIFY && file_kind != KERNEL_OPEN_FILE_KIND_PIDFD && file_kind != KERNEL_OPEN_FILE_KIND_EPOLL && file_kind != KERNEL_OPEN_FILE_KIND_EVENTFD && file_kind != KERNEL_OPEN_FILE_KIND_TIMERFD && file_kind != KERNEL_OPEN_FILE_KIND_SIGNALFD) {
+                if (numbered) {
                     length += decimal(display + length, identity);
                     display[length++] = ']';
                 }

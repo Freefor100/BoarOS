@@ -15,9 +15,17 @@ static int adjust(struct kernel_timex *tx) { return kernel_time_adjust(tx,&chang
 int main(void)
 {
     const uint64_t second=1000000000;
-    assert(!kernel_time_init(second,100*second));
+    const uint64_t rtc=100*second;
+    assert(!kernel_time_init(second,&rtc));
     struct kernel_timex tx={0};
     assert(adjust(&tx)==5 && tx.maxerror==16000000 && tx.time.sec==100);
+    tx=(struct kernel_timex){.modes=KADJ_TAI,.constant=37};
+    assert(adjust(&tx)==5 && tx.tai==37 && change==KERNEL_CLOCK_TAI_OFFSET);
+    assert(kernel_time_has_rtc() && kernel_time_tai_ns()==137*second);
+    uint64_t tai_deadline;
+    assert(!kernel_time_deadline_from_tai(139*second,&tai_deadline) && tai_deadline==2*second);
+    tx=(struct kernel_timex){.modes=KADJ_TAI,.constant=100001};
+    assert(adjust(&tx)==5 && tx.tai==37 && change==KERNEL_CLOCK_UNCHANGED);
     tx=(struct kernel_timex){.modes=KADJ_STATUS|KADJ_FREQUENCY|KADJ_MAXERROR|KADJ_TICK,
         .status=KSTA_PLL,.freq=32768000,.tick=11000,.maxerror=7};
     assert(adjust(&tx)==0 && change==KERNEL_CLOCK_RATE);
