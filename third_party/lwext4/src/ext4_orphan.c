@@ -174,46 +174,50 @@ static bool operation_record(struct ext4_fs *fs, uint32_t inode, struct orphan_r
     return accepted != NULL;
 }
 
-/* Account for all in-flight inserts before private metadata changes. A hash
- * replacement is allocated outside the state lock and published after recheck. */
-static int index_reserve_pending(struct ext4_fs *fs, struct ext4_orphan_index *index)
+/* Reserve capacity and take the undo snapshot from the same accepted index.
+ * A replacement is allocated outside STATE and published after a recheck. */
+static int index_reserve_pending(struct ext4_fs *fs, struct ext4_orphan_undo *change)
 {
+    struct ext4_orphan_index *index = change->index;
     struct orphan_record *candidate = NULL;
     size_t candidate_capacity = 0;
     for (;;) {
         ext4_fs_state_lock(fs);
         if (index->pending == SIZE_MAX || index->occupied > SIZE_MAX - index->pending - 1) __builtin_trap();
         size_t needed = index->occupied + index->pending + 1;
-        if (needed < index->capacity / 2) {
-            index->pending++;
-            ext4_fs_state_unlock(fs);
-            ext4_free(candidate);
-            return EOK;
-        }
-        size_t capacity = index->capacity ? index->capacity : 32;
-        while (index->count + index->pending + 1 >= capacity / 2) {
-            if (capacity > SIZE_MAX / 2 / sizeof(*candidate)) {
-                ext4_fs_state_unlock(fs); ext4_free(candidate); return ENOMEM;
+        if (needed >= index->capacity / 2) {
+            size_t capacity = index->capacity ? index->capacity : 32;
+            while (index->count + index->pending + 1 >= capacity / 2) {
+                if (capacity > SIZE_MAX / 2 / sizeof(*candidate)) {
+                    ext4_fs_state_unlock(fs); ext4_free(candidate); return ENOMEM;
+                }
+                capacity *= 2;
             }
-            capacity *= 2;
-        }
-        if (candidate && candidate_capacity >= capacity) {
+            if (!candidate || candidate_capacity < capacity) {
+                ext4_fs_state_unlock(fs);
+                ext4_free(candidate);
+                candidate = ext4_calloc(capacity, sizeof(*candidate));
+                if (!candidate) return ENOMEM;
+                candidate_capacity = capacity;
+                continue;
+            }
             struct orphan_record *previous = index->table;
             size_t previous_capacity = index->capacity;
             index->table = candidate; index->capacity = candidate_capacity;
             index->occupied = index->count = 0;
             for (size_t i = 0; i < previous_capacity; i++)
                 if (previous[i].state == 1) index_store(index, previous[i]);
-            index->pending++;
-            ext4_fs_state_unlock(fs);
-            ext4_free(previous);
-            return EOK;
+            candidate = previous;
+        }
+        index->pending++;
+        struct orphan_record *accepted = index_find(index, change->before.inode);
+        if (accepted) {
+            change->before = change->after = *accepted;
+            change->before_present = change->after_present = true;
         }
         ext4_fs_state_unlock(fs);
         ext4_free(candidate);
-        candidate = ext4_calloc(capacity, sizeof(*candidate));
-        if (!candidate) return ENOMEM;
-        candidate_capacity = capacity;
+        return EOK;
     }
 }
 
@@ -224,18 +228,11 @@ static struct ext4_orphan_undo *reserve_change(struct ext4_fs *fs, uint32_t inod
     if (change) return change;
     change = jbd_journal_alloc(fs->jbd_journal, sizeof(*change));
     if (!change) return NULL;
-    if (index_reserve_pending(fs, fs->orphan_index) != EOK) {
-        jbd_journal_free(change); return NULL;
-    }
     *change = (struct ext4_orphan_undo){.index = fs->orphan_index,
         .before.inode = inode, .after.inode = inode, .next = trans->orphan_undo};
-    ext4_fs_state_read_lock(fs);
-    struct orphan_record *accepted = index_find(fs->orphan_index, inode);
-    if (accepted) {
-        change->before = change->after = *accepted;
-        change->before_present = change->after_present = true;
+    if (index_reserve_pending(fs, change) != EOK) {
+        jbd_journal_free(change); return NULL;
     }
-    ext4_fs_state_unlock(fs);
     trans->orphan_undo = change;
     return change;
 }

@@ -3597,10 +3597,10 @@ int ext4_rename_child(const char *mount_point,
 	else r = ext4_dir_add_entry(destination, new_name, new_len, &source);
 	/* The held block borrows this transaction's private payload. Same-parent
 	 * insertion may repack it or move the source to a new leaf; discard the
-	 * old entry pointer and scan the current records before deleting. */
+	 * old entry and predecessor and scan the current records before deleting. */
 	if (r == EOK && old_parent == new_parent) {
 		found.dentry = NULL;
-		r = ext4_dir_find_in_block(&found.block, sb, old_len, old_name, &found.dentry);
+		r = ext4_dir_find_in_block(&found.block, sb, old_len, old_name, &found);
 		if (r == ENOENT) {
 			r = ext4_dir_destroy_result(&old, &found);
 			if (r == EOK) r = ext4_dir_find_entry(&found, &old, old_name, old_len, true);
