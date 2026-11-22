@@ -249,6 +249,7 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
 int scheduler_local_task(const struct kernel_task *, const struct kernel_cpu *);
 void scheduler_ready_local_locked(struct kernel_task *, struct kernel_cpu *);
 int scheduler_select_local(int, int, int, struct kernel_task **, uint64_t *);
+int scheduler_select_queued_after_park_locked(struct kernel_cpu *,struct kernel_task **,uint64_t *);
 /* 运行在已恢复的新栈上；复用外层guard，不能再为交接叠一层深栈。 */
 static inline __attribute__((always_inline)) int scheduler_finish_local_locked(struct kernel_cpu *cpu)
 {

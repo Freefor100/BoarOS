@@ -149,12 +149,8 @@ static unsigned char *slab_slot(struct kernel_slab *slab,
            class_size(slab->class_index) * slot_index;
 }
 
-static uint32_t slot_next(const struct kernel_slab *slab,
-                          uint32_t slot_index)
+static uint32_t slot_next(const unsigned char *slot)
 {
-    const unsigned char *slot =
-        (const unsigned char *)slab + slab->slot_offset +
-        class_size(slab->class_index) * slot_index;
     uint32_t result = 0U;
     uint32_t index;
 
@@ -263,7 +259,9 @@ static enum kernel_heap_status slab_metadata_validate(const struct kernel_heap *
             bitmap_test(slab, slab->free_head)) {
             return KERNEL_HEAP_STATUS_STATE;
         }
-        next = slot_next(slab, slab->free_head);
+        const unsigned char *payload = (const unsigned char *)slab + slab->slot_offset +
+            class_size(slab->class_index) * slab->free_head;
+        next = slot_next(payload);
         if (next != KERNEL_SLAB_INDEX_NONE &&
             (next >= slab->slot_count || bitmap_test(slab, next))) {
             return KERNEL_HEAP_STATUS_STATE;
@@ -356,32 +354,30 @@ static enum kernel_heap_status slab_create(struct kernel_heap *heap,
     return KERNEL_HEAP_STATUS_OK;
 }
 
-/* 调用者持有短 IRQ 临界区，slab 从查找到取槽不能被回收。 */
-static enum kernel_heap_status slab_allocate_slot(struct kernel_heap *heap,
-                                                 struct kernel_slab *slab,
-                                                 uint32_t class_index,
-                                                 void **pointer)
+/* The heap guard keeps the slab and its free list stable for the batch. */
+static inline __attribute__((always_inline)) enum kernel_heap_status slab_allocate_slots(
+    struct kernel_heap *heap, struct kernel_slab *slab, uint32_t class_index,
+    void **pointers, unsigned count)
 {
-    uint32_t slot_index;
     if (slab->magic != KERNEL_SLAB_MAGIC || slab->heap != heap ||
-        slab->class_index != class_index || slab->free_count == 0U ||
-        slab->free_head >= slab->slot_count) {
+        slab->class_index != class_index || slab->free_count < count)
         return KERNEL_HEAP_STATUS_STATE;
-    }
 
-    slot_index = slab->free_head;
-    slab->free_head = slot_next(slab, slot_index);
-    if (bitmap_test(slab, slot_index)) {
-        return KERNEL_HEAP_STATUS_STATE;
+    uint32_t slot = slab->free_head;
+    size_t stride = class_size(class_index);
+    unsigned char *base = (unsigned char *)slab + slab->slot_offset;
+    for (unsigned i = 0; i < count; i++) {
+        if (slot >= slab->slot_count || bitmap_test(slab, slot))
+            return KERNEL_HEAP_STATUS_STATE;
+        unsigned char *payload = base + stride * slot;
+        pointers[i] = payload;
+        bitmap_set(slab, slot);
+        slot = slot_next(payload);
     }
-    bitmap_set(slab, slot_index);
-    slab->free_count--;
-    if (slab->free_count == 0U) {
-        partial_remove(heap, slab);
-    }
-
-    heap->statistics.live_allocations++;
-    *pointer = slab_slot(slab, slot_index);
+    slab->free_head = slot;
+    slab->free_count -= count;
+    if (!slab->free_count) partial_remove(heap, slab);
+    heap->statistics.live_allocations += count;
     return KERNEL_HEAP_STATUS_OK;
 }
 
@@ -395,7 +391,7 @@ static enum kernel_heap_status allocate_small(struct kernel_heap *heap,
         KERNEL_RAW_SCOPE(guard, &heap->lock);
         heap->statistics.allocation_calls++;
         struct kernel_slab *slab = heap->partial_slabs[class_index];
-        if (slab) return slab_allocate_slot(heap, slab, class_index, pointer);
+        if (slab) return slab_allocate_slots(heap, slab, class_index, pointer, 1);
     }
     /* 回收可能重入堆；申请页时尚未借用任何共享 slab 指针。 */
     status = slab_create(heap, class_index, &prepared,nosleep);
@@ -404,7 +400,7 @@ static enum kernel_heap_status allocate_small(struct kernel_heap *heap,
         KERNEL_RAW_SCOPE(guard, &heap->lock);
         partial_insert(heap, prepared);
         statistics_add_pages(heap, 0U);
-        return slab_allocate_slot(heap, prepared, class_index, pointer);
+        return slab_allocate_slots(heap, prepared, class_index, pointer, 1);
     }
 }
 
@@ -427,10 +423,12 @@ unsigned kernel_heap_allocate_zeroed_batch_nosleep(struct kernel_heap *heap,
             while (allocated < count) {
                 struct kernel_slab *slab = heap->partial_slabs[class_index];
                 if (!slab) break;
-                if (slab_allocate_slot(heap, slab, class_index, &out[allocated]))
+                unsigned take = count - allocated;
+                if (slab->free_count < take) take = slab->free_count;
+                if (!take || slab_allocate_slots(heap, slab, class_index, out + allocated, take))
                     __builtin_trap();
-                heap->statistics.allocation_calls++;
-                allocated++;
+                heap->statistics.allocation_calls += take;
+                allocated += take;
             }
         }
         if (allocated == count) break;

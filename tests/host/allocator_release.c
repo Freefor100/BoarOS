@@ -555,6 +555,17 @@ static void test_batch_allocation(void)
     }
     uint64_t unchanged=UINT64_C(0x716153);
     assert(!physical_page_allocate_batch(&allocator,&unchanged,1) && unchanged==UINT64_C(0x716153));
+    uint64_t low = pages[0], high = pages[0];
+    for (unsigned i = 1; i < count; i++) {
+        if (pages[i] < low) low = pages[i];
+        if (pages[i] > high) high = pages[i];
+    }
+    const uint64_t borrowed[] = {low, high, low};
+    uint32_t references;
+    physical_page_acquire_batch(&allocator, borrowed, 3);
+    assert(!physical_page_reference_count(&allocator, low, &references) && references == 3);
+    assert(!physical_page_reference_count(&allocator, high, &references) && references == 2);
+    physical_page_release_batch(&allocator, borrowed, 3);
     assert(!unexpected_reclaim);
     /* Fragmented free pages remain usable; a batch does not require one
      * physically contiguous block and never consumes a hidden spare page. */
@@ -565,6 +576,14 @@ static void test_batch_allocation(void)
     for(unsigned i=1;i<count;i+=2)assert(!physical_page_release(&allocator,pages[i]));
     assert(physical_page_available(&allocator)==initial && !physical_page_allocator_audit(&allocator));
     assert(!physical_page_allocator_clear_reclaimer(&allocator));
+    void *slots[16];
+    assert(kernel_heap_allocate_zeroed_batch_nosleep(&heap, 16, 512, slots) == 16);
+    for (unsigned i = 0; i < 16; i++) {
+        for (unsigned j = 0; j < i; j++) assert(slots[i] != slots[j]);
+        for (unsigned j = 0; j < 512; j++) assert(!((unsigned char *)slots[i])[j]);
+    }
+    kernel_heap_release_small_batch(&heap, slots, 16);
+    assert(physical_page_available(&allocator)==initial && !physical_page_allocator_audit(&allocator));
 }
 
 struct recycle_test { uint64_t head; unsigned calls, retained; };

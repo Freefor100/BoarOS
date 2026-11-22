@@ -786,13 +786,11 @@ int ext4_dir_dx_find_entry(struct ext4_dir_search_result *result,
 		}
 
 		/* Linear search inside block */
-		struct ext4_dir_en *de;
-		rc = ext4_dir_find_in_block(&b, &fs->sb, name_len, name, &de);
+		rc = ext4_dir_find_in_block(&b, &fs->sb, name_len, name, result);
 
 		/* Found => return it */
 		if (rc == EOK) {
 			result->block = b;
-			result->dentry = de;
 			goto cleanup;
 		}
 

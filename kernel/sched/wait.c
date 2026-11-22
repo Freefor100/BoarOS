@@ -239,6 +239,9 @@ int kernel_wait_backend_park_local(const struct kernel_wait_token *token,
     struct kernel_task *task=token->task;
     struct kernel_cpu *cpu=kernel_cpu_current();
     if (cpu->preempt_depth) return 0;
+    struct kernel_task *next=0;
+    uint64_t deadline;
+    int claimed;
     {
         KERNEL_RAW_SCOPE(run,kernel_run_lock(cpu));
         /* vfork cancellation also detaches the parent/child relationship
@@ -257,10 +260,9 @@ int kernel_wait_backend_park_local(const struct kernel_wait_token *token,
             return 1;
         }
         publish_blocked(task);
+        claimed=scheduler_select_queued_after_park_locked(cpu,&next,&deadline);
     }
-    struct kernel_task *next;
-    uint64_t deadline;
-    if (scheduler_select_local(1,0,0,&next,&deadline)) {
+    if (claimed || scheduler_select_local(1,0,0,&next,&deadline)) {
         scheduler_arm_timer(deadline);
         *status=next?scheduler_switch_claimed(task,next):KERNEL_SCHEDULER_STATUS_OK;
     } else *status=scheduler_switch_current_away(task);

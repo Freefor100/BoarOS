@@ -6374,12 +6374,13 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
     struct kernel_elf64_source *source,const struct kernel_vma *vma,
     uint64_t address,uint64_t *begin,
     const struct kernel_mm_retirement *batch,uint32_t *targets,
-    struct mm_file_resident *demand)
+    struct mm_file_resident *demand, int include_demand)
 {
-    uint64_t end=address+BOAROS_PAGE_SIZE;
+    uint64_t end=include_demand ? 0 : address+BOAROS_PAGE_SIZE;
     uint64_t limit, first=file_fault_window(vma,address,&limit);
     int shared = vma->kind == KERNEL_VMA_KIND_FILE_SHARED;
     if (limit-first==BOAROS_PAGE_SIZE) return end;
+    unsigned required = include_demand ? 1U << ((address-first)>>BOAROS_PAGE_SHIFT) : 0;
     unsigned selected=0,slots=KERNEL_PAGE_CACHE_READY_WINDOW;
     {
         KERNEL_RAW_READ_SCOPE(raw,&record->metadata);
@@ -6389,12 +6390,12 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
         if (arch_mmu_user_empty_window(&record->space,first,
             (limit-first)>>BOAROS_PAGE_SHIFT,&selected)) return end;
     }
-    if (!selected) return end;
+    if (!selected || (selected & required) != required) return end;
     uint64_t refs[KERNEL_PAGE_CACHE_READY_WINDOW];
     uint64_t offset=vma->backing_offset+first-vma->start;
     unsigned ready=source ? kernel_elf64_source_acquire_ready(source,offset,selected,refs,slots) :
         kernel_page_cache_acquire_ready(kernel_open_file_page_cache(file),
-            kernel_open_file_vfs_borrow(file),offset>>BOAROS_PAGE_SHIFT,selected,refs,slots);
+            kernel_open_file_vfs_borrow(file),offset>>BOAROS_PAGE_SHIFT,selected,refs,slots,required);
     if (!ready) return end;
     void *residents[KERNEL_PAGE_CACHE_READY_WINDOW] = {0};
     unsigned count = 0;
@@ -6409,8 +6410,12 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
         unsigned unprepared = ready;
         /* Drop the unprepared suffix of the packed reference vector. */
         for (unsigned i = 0; i < capacity; i++) unprepared &= unprepared - 1;
-        installed = arch_mmu_user_map_owned_window(&record->space, first, ready ^ unprepared, refs,
-            backend_permissions_from_mm(vma->permissions & ~KERNEL_MM_WRITE), !shared);
+        unsigned prepared_mask = ready ^ unprepared;
+        if ((prepared_mask & required) == required)
+            installed = arch_mmu_user_map_owned_window(&record->space, first, prepared_mask, refs,
+                backend_permissions_from_mm(vma->permissions & ~KERNEL_MM_WRITE), !shared);
+        /* A required slot was selected under the continuously held MM writer. */
+        if (installed && (installed & required) != required) __builtin_trap();
         unsigned i = 0;
         for (unsigned bits = ready, index = 0; bits; bits >>= 1, index++) {
             if (!(bits & 1)) continue;
@@ -6523,6 +6528,28 @@ static __attribute__((noinline)) enum kernel_mm_status mapped_file_fault(struct 
             absent = fault_lookup_leaf(record,address,0,&leaf,&missing) == KERNEL_MM_STATUS_NOT_MAPPED;
         }
         if (absent) {
+            /* When the table exists, the MM writer and inode reader can
+             * carry both demand and neighbors through one READY-page batch. */
+            if (shared && !missing && !operation->populate && !operation->fault_pin &&
+                !(vma->flags & KERNEL_VMA_RANDOM_READ) &&
+                kernel_open_file_speculative_read_allowed(file) &&
+                (!operation->shared || kernel_rwlock_try_upgrade(&operation->guard))) {
+                operation->shared = 0;
+                if (kernel_vfs_node_try_read(node, &inode)) {
+                    uint64_t latest;
+                    if (!kernel_file_mapping_epoch(node,&latest) && latest == epoch) {
+                        uint64_t first = address;
+                        uint64_t end = map_file_neighbours(record,file,NULL,vma,address,&first,
+                            &batch,&targets,NULL,1);
+                        if (end) {
+                            finish_fault_change(record,&batch,targets,first,end-first,0,
+                                (vma->permissions & KERNEL_MM_EXECUTE) != 0);
+                            goto finish;
+                        }
+                    }
+                    kernel_lock_release(&inode);
+                }
+            }
             if (kernel_open_file_try_prepare_disk_mapping_page(file,offset >> BOAROS_PAGE_SHIFT,&source)) {
                 replacement = source.address;
                 if (shared || !operation->shared) mm_operation_release(operation);
@@ -6718,7 +6745,7 @@ prepare_file_tables:
         uint64_t begin=address,end=address+BOAROS_PAGE_SIZE;
         if (map_neighbours)
             end = map_file_neighbours(record,file,NULL,vma,address,&begin,
-                &batch,defer_sync ? &targets : NULL, shared && disk ? published : NULL);
+                &batch,defer_sync ? &targets : NULL, shared && disk ? published : NULL,0);
         if (defer_sync && end - begin == BOAROS_PAGE_SIZE) {
             KERNEL_RAW_WRITE_SCOPE(raw,&record->metadata);
             targets=note_fault_change_locked(record,&batch,0,instructions);
@@ -7234,7 +7261,7 @@ memory_tables_changed:
     if (status == KERNEL_MM_STATUS_OK) {
         uint64_t begin=address,end=address+BOAROS_PAGE_SIZE;
         if (fault_batch) {
-            end=map_file_neighbours(record,NULL,source,vma,address,&begin,&batch,&targets,NULL);
+            end=map_file_neighbours(record,NULL,source,vma,address,&begin,&batch,&targets,NULL,0);
             if (end - begin == BOAROS_PAGE_SIZE) {
                 KERNEL_RAW_WRITE_SCOPE(raw,&record->metadata);
                 targets=note_fault_change_locked(record,&batch,0,

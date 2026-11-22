@@ -218,12 +218,12 @@ enum kernel_page_cache_status kernel_page_cache_lookup_ready(
     uint64_t page_index, uint64_t *physical_address, size_t *valid_bytes,
     int no_reuse);
 
-/* Selected bits are offsets from first. Returned bits identify READY pages;
- * addresses are packed in increasing index order, one physical owner per bit. */
+/* Selected bits are offsets from first. Return READY pages with one physical
+ * reference per bit, in index order. Return no owners if required bits miss. */
 #define KERNEL_PAGE_CACHE_READY_WINDOW (65536U / BOAROS_PAGE_SIZE)
 unsigned kernel_page_cache_acquire_ready(struct kernel_page_cache *,
     const struct kernel_vfs_file *, uint64_t first, unsigned selected,
-    uint64_t *addresses, unsigned capacity);
+    uint64_t *addresses, unsigned capacity, unsigned required);
 
 enum kernel_page_cache_status kernel_page_cache_alias_attach(
     struct kernel_page_cache *cache, const struct kernel_vfs_file *file,

@@ -66,6 +66,7 @@ struct ext4_dir_iter {
 struct ext4_dir_search_result {
 	struct ext4_block block;
 	struct ext4_dir_en *dentry;
+	struct ext4_dir_en *previous;
 };
 
 
@@ -297,12 +298,13 @@ int ext4_dir_try_insert_entry(struct ext4_sblock *sb,
  * @param sb        Superblock
  * @param name_len  Length of entry name
  * @param name      Name of entry to be found
- * @param res_entry Output pointer to found entry, NULL if not found
+ * @param result    Receives the matching entry and its immediate predecessor
+ *                  in the borrowed leaf. The caller retains the block loan.
  * @return Error code
  */
 int ext4_dir_find_in_block(struct ext4_block *block, struct ext4_sblock *sb,
 			   size_t name_len, const char *name,
-			   struct ext4_dir_en **res_entry);
+			   struct ext4_dir_search_result *result);
 
 /**@brief Simple function to release allocated data from result.
  * @param parent Parent inode

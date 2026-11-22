@@ -502,6 +502,7 @@ int ext4_dir_find_entry(struct ext4_dir_search_result *result,
 	/* Entry clear */
 	result->block.lb_id = 0;
 	result->dentry = NULL;
+	result->previous = NULL;
 
 #if CONFIG_DIR_INDEX_ENABLE
 	/* Index search */
@@ -546,11 +547,9 @@ int ext4_dir_find_entry(struct ext4_dir_search_result *result,
 		}
 
 		/* Try to find entry in block */
-		struct ext4_dir_en *res_entry;
-		r = ext4_dir_find_in_block(&b, sb, name_len, name, &res_entry);
+		r = ext4_dir_find_in_block(&b, sb, name_len, name, result);
 		if (r == EOK) {
 			result->block = b;
-			result->dentry = res_entry;
 			return EOK;
 		}
 
@@ -587,33 +586,11 @@ int ext4_dir_remove_found(struct ext4_inode_ref *parent,
 	/* Invalidate entry */
 	ext4_dir_en_set_inode(result->dentry, 0);
 
-	/* Store entry position in block */
-	uint32_t pos = (uint8_t *)result->dentry - result->block.data;
-
-	/*
-	 * If entry is not the first in block, it must be merged
-	 * with previous entry
-	 */
-	if (pos != 0) {
-		uint32_t offset = 0;
-
-		/* Start from the first entry in block */
-		struct ext4_dir_en *tmp_de =(void *)result->block.data;
-		uint16_t de_len = ext4_dir_en_get_entry_len(tmp_de);
-
-		/* Find direct predecessor of removed entry */
-		while ((offset + de_len) < pos) {
-			offset += ext4_dir_en_get_entry_len(tmp_de);
-			tmp_de = (void *)(result->block.data + offset);
-			de_len = ext4_dir_en_get_entry_len(tmp_de);
-		}
-
-		ext4_assert(de_len + offset == pos);
-
-		/* Add to removed entry length to predecessor's length */
-		uint16_t del_len;
-		del_len = ext4_dir_en_get_entry_len(result->dentry);
-		ext4_dir_en_set_entry_len(tmp_de, de_len + del_len);
+	/* Lookup already validated the preceding record in this leaf version. */
+	if (result->previous) {
+		uint16_t length = ext4_dir_en_get_entry_len(result->previous);
+		uint16_t removed = ext4_dir_en_get_entry_len(result->dentry);
+		ext4_dir_en_set_entry_len(result->previous, length + removed);
 	}
 
 	ext4_dir_set_csum(parent,
@@ -697,10 +674,11 @@ int ext4_dir_try_insert_entry(struct ext4_sblock *sb,
 
 int ext4_dir_find_in_block(struct ext4_block *block, struct ext4_sblock *sb,
 			   size_t name_len, const char *name,
-			   struct ext4_dir_en **res_entry)
+			   struct ext4_dir_search_result *result)
 {
 	/* Start from the first entry in block */
 	struct ext4_dir_en *de = (struct ext4_dir_en *)block->data;
+	struct ext4_dir_en *previous = NULL;
 
 	/* Set upper bound for cycling */
 	uint8_t *addr_limit = block->data + ext4_sb_get_block_size(sb);
@@ -719,13 +697,15 @@ int ext4_dir_find_in_block(struct ext4_block *block, struct ext4_sblock *sb,
 			if (el == name_len) {
 				/* Compare names */
 				if (memcmp(name, de->name, name_len) == 0) {
-					*res_entry = de;
+					result->dentry = de;
+					result->previous = previous;
 					return EOK;
 				}
 			}
 		}
 
 		/* Jump to next entry */
+		previous = de;
 		de = (struct ext4_dir_en *)((uint8_t *)de + de_len);
 	}
 

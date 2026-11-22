@@ -11,6 +11,18 @@ void mm_test_bind(struct kernel_mm *);
 static _Thread_local unsigned *disk_raw_observe;
 static _Thread_local unsigned disk_forbid_backing_scans;
 static _Thread_local unsigned *disk_sync_count;
+static _Thread_local unsigned disk_required_ready;
+unsigned __real_kernel_page_cache_acquire_ready(struct kernel_page_cache *,
+    const struct kernel_vfs_file *, uint64_t, unsigned, uint64_t *, unsigned, unsigned);
+unsigned __wrap_kernel_page_cache_acquire_ready(struct kernel_page_cache *cache,
+    const struct kernel_vfs_file *file, uint64_t first, unsigned selected,
+    uint64_t *addresses, unsigned capacity, unsigned required)
+{
+    unsigned ready=__real_kernel_page_cache_acquire_ready(cache,file,first,selected,
+        addresses,capacity,required);
+    if (required && (ready & required)) disk_required_ready++;
+    return ready;
+}
 void __real_riscv_smp_sync_user(uint32_t,uint64_t,uint64_t,int);
 void __wrap_riscv_smp_sync_user(uint32_t targets,uint64_t address,uint64_t size,int instructions)
 {
@@ -473,7 +485,9 @@ static void disk_fault_batch_case(struct kernel_heap *heap,
     assert(!kernel_mm_madvise(&mm,first_hole,BOAROS_PAGE_SIZE,4));
     assert(!kernel_mm_madvise(&mm,second_hole,BOAROS_PAGE_SIZE,4));
     assert(kernel_mm_lookup(&mm,second_hole,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
+    disk_required_ready=0;
     assert(!kernel_mm_resolve_user_fault(&mm,second_hole,KERNEL_MM_READ));
+    assert(disk_required_ready==1);
     assert(!kernel_mm_lookup(&mm,first_hole,&mapping) && !(mapping.permissions&KERNEL_MM_WRITE));
     value=0x61;
     assert(!kernel_copy_to_user(&mm,second_hole,&value,1,&done) && done==1);

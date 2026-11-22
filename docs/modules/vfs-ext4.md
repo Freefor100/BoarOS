@@ -582,7 +582,7 @@ checkpoint 合并另检查 1–3 组不产生 I/O、第四组合并同一 home �
 
 `ext4_orphan.c` 支持传统 `last_orphan/i_dtime` 链和 `orphan_file`，校验范围、重复记录、循环、分配状态和 checksum。挂载准备或显式校验建立已接纳的成员索引，记录传统链前后节点或 orphan_file 块与槽位；contains/peek 先查看本操作的私有变化，再查询该索引，热查询不读取设备或分配内存。orphan_file 以 inode 哈希选择起始块，按块取得资格后重新检查空槽；每块的资格保留到操作结束，传统链使用独立拓扑资格。已接纳空槽位图是空闲位置的共同状态，本操作的增加、删除及移位在其私有视图中计算。
 
-操作在修改前准备成员变化记录和索引容量，记录原成员状态及最终期望状态。接纳在挂载状态保护下更新这些 inode 对应的索引、链和槽位；abort 只丢弃本操作的变化及容量预留。同一操作先归还全部原槽位置，再扣除最终成员的槽占用；接纳也先撤去旧位置、再发布最终成员，使删除后复用的槽只有一个最终 owner。其他操作已接纳的成员保持可见，hash 扩容的分配与旧表释放在状态保护外完成。ORPHAN_PRESENT 按最新已接纳成员数加本操作净变化计算；成员变化预先保留 superblock 日志记录，即使准备时标志未改变，也能在接纳时合并其他操作的变化。显式 validate 重新完整校验，活动私有变化结束后才可替换索引。
+操作在修改前准备成员变化记录。在同一次挂载状态保护内预留索引容量并记录原成员状态，随后计算最终期望状态。接纳在挂载状态保护下更新这些 inode 对应的索引、链和槽位；abort 只丢弃本操作的变化及容量预留。同一操作先归还全部原槽位置，再扣除最终成员的槽占用；接纳也先撤去旧位置、再发布最终成员，使删除后复用的槽只有一个最终 owner。其他操作已接纳的成员保持可见，hash 扩容的分配与旧表释放在状态保护外完成。ORPHAN_PRESENT 按最新已接纳成员数加本操作净变化计算；成员变化预先保留 superblock 日志记录，即使准备时标志未改变，也能在接纳时合并其他操作的变化。显式 validate 重新完整校验，活动私有变化结束后才可替换索引。
 
 unlink 将最后一个链接摘除与持久 orphan 记录放在同一事务；缩小文件先在操作中登记最终 size 与 orphan，再由 `ext4_truncate.c` 每事务最多释放 32 个尾部数据块及已空的索引路径。意图与回收可以合入同一运行组，也可以按 journal FIFO 跨组提交；普通 truncate/unlink 按真实预算、日志空间或复用压力选择归还资源的提交或 checkpoint，释放范围继续由 quarantine 保留。无 orphan 的新建、同尺寸截断和扩展不启动回收事务。恢复根据实际映射查找尾部，支持稀疏 extent 和三级间接块；最后删除 orphan 记录与释放无链接 inode 在同一事务完成。正常运行时仍打开的无链接 inode 保持内容，重启后回收。`sh tests/host/lwext4-orphan.sh` 包含不同 orphan_file 块的两个真实调用上下文交错、另一操作接纳后本操作 abort、传统链及满文件回退、损坏与日志错误恢复；`sh tests/host/lwext4-operation.sh` 检查调用者上下文、计数增量及父组分配。
 
@@ -618,7 +618,7 @@ GDT 与 inode 的成功校验绑定块数据的实际 payload 版本。每个 pa
 只读借用能看到本事务已有的私有版本，但不自行创建私有块或将未修改的payload标成原地可写。事务私有版本在修改期间不复用校验，接纳发布时清空布局与位图，新旧读者各自持有自己的版本；abort不修改已接纳版本。原地写资格在暴露字节前永久禁用该版本的布局，即使旧读者随后设置一个验证位，也不能重新启用复用。淘汰、块复用和journal image复用均重新开始校验。目录叶、HTree索引和extent树块在同一payload保存一次成功校验，键区分块类型、所属inode及generation；不能编码完整键的inode继续实际校验。extent树节点的magic、深度、条目数量及边界仍逐次核对，稳定版本只省去重复CRC。写资格同时关闭目录校验复用。64位payload头为72字节；不分配另一份数据。
 
 目录修改由父 inode 和单个名称定位；`kernel_vfs_unlink` 保留 Linux 打开后删除的对象语义：
-- `kernel_vfs_unlink` 从挂载的 orphan 记录池预留回收记录，再调用 `ext4_unlink_child` 从父目录摘下目标。在已有私有元数据事务中，后端取得可写目录项并持有到删除，复用同一查询结果更新目录块。后续对原路径的 `open` 返回 `-ENOENT`，同名重建使用独立 inode。没有现存 node 时，orphan 回收失败由挂载持有预留记录并重试。
+- `kernel_vfs_unlink` 从挂载的 orphan 记录池预留回收记录，再调用 `ext4_unlink_child` 从父目录摘下目标。在已有私有元数据事务中，后端持有可写目录叶，查找同时记录目标和前一条已校验记录。删除用这两条记录合并空间，无需再次扫描叶的前缀。同目录改名若重排目录叶，删除源项之前重新定位这两条记录。后续对原路径的 `open` 返回 `-ENOENT`，同名重建使用独立 inode。没有现存 node 时，orphan 回收失败由挂载持有预留记录并重试。
 - 若目标文件当前仍处于打开状态（`node->open_files > 0`），VFS 标记 `node->unlinked = 1`，旧 open 描述符（包括只读/读写 OFD 以及正在运行的源映射 ELF 可执行文件）保留底层 inode 数据与有效物理块，继续正常执行 `read/write/fstat` 与缺页加载（demand fault）；
 - 只有当最后一个打开描述符与执行租约释放（`node->open_files == 0 && node->exec_users == 0`）时，VFS 才通过专有的 `kernel_vfs_try_release_orphan` 驱动物理存储释放。该过程先持有临时节点引用并安全使页缓存失效，再在扁平调用栈上调用 `ext4_orphan_free` 截断释放底层 inode，最后标记 `node->retired = 1`。通用的 `kernel_vfs_node_release` 仅负责内存节点对象的生命周期，绝不隐式或嵌套调用 `ext4_orphan_free`，避免双重释放与页缓存回收深度嵌套额外消耗任务栈；若底层释放失败，节点转移至 `adapter->cleanup_nodes`，由 mount 保留唯一重试 owner，绝不重新指向 file。若文件在 unlink 时没有现存 node，则使用预留记录直接调用 orphan free；失败后记录留在 mount 链，路径仍保持已删除。
 由于 lwext4 的 `ext4_dir_rm` 会递归删除非空目录，`kernel_vfs_rmdir` 通过带目录标志的 `ext4_unlink_child` 只摘目标目录项；后端 `ext4_dir_check_empty` 校验目录记录和 checksum、跳过 `.`/`..` 并拒绝非空目录。被持有的目录 inode 延至最后引用释放才回收；同名重建得到不同 inode，旧路径对象仍可查询零链接状态。目录项 checksum 在设置 inode 字段后计算，卸载后的 `e2fsck -fn` 验证磁盘结构。

@@ -1360,6 +1360,55 @@ static __attribute__((noinline)) void balance_ordinary(struct kernel_cpu *cpu)
     if (batch.next!=&batch) fair_list_move(&batch,batch.previous,&cpu->fair_candidates);
 }
 
+static int select_local_locked(struct kernel_cpu *cpu,struct kernel_task *current,
+    int blocked,int rotate,int voluntary,struct kernel_task **selected,uint64_t *deadline)
+{
+    if (!local_queue_eligible(cpu,current,blocked)) return 0;
+    if (remote_rt_ready(cpu)) return 0;
+    struct kernel_sched_node *head=kernel_sched_pick(&cpu->runqueue,1);
+    account_cpu(cpu,kernel_time_raw_ns());
+    struct kernel_task *normal=head?head->owner:0;
+    struct kernel_task *oldest=ready_wait_head(cpu,normal);
+    struct kernel_task *next=ready_wait_pick(cpu,normal,oldest);
+    if (blocked) {
+        /* 唤醒在选择后继前到达时，当前栈仍归自己，无需切走再取回。 */
+        if (current->wait.ready_pending && current->state==KERNEL_THREAD_STATE_READY) {
+            current->wait.ready_pending=0;
+            __atomic_store_n(&current->state,KERNEL_THREAD_STATE_RUNNING,__ATOMIC_RELAXED);
+        } else *selected=claim_next_locked(cpu,current,next);
+    } else {
+        (void)kernel_cpu_consume_schedule(cpu);
+        rotate |= cpu->rotate_other;
+        cpu->rotate_other=0;
+        int age_due=ready_wait_preempts(cpu,oldest);
+        int expired=current->scheduling.fair_slice_used>=kernel_sched_fair_slice(&current->scheduling);
+        if(expired)current->scheduling.fair_slice_used=0;
+        int due=head && current->ready_node.fair.key>=head->fair.key;
+        if (head && (current->idle || voluntary || ((rotate||expired)&&due) ||
+                     age_due || fair_preempts(normal,current))) {
+            if (current->idle) cpu->idle_context_saved=1;
+            else {
+                if (current->wait.ready_pending) __builtin_trap();
+                __atomic_store_n(&current->state,KERNEL_THREAD_STATE_READY,__ATOMIC_RELAXED);
+                current->wait.ready_pending=1;
+                current->wait.ready_flags=SCHED_READY_LOCAL;
+            }
+            *selected=claim_next_locked(cpu,current,next);
+        }
+    }
+    *deadline=scheduler_deadline_locked(cpu);
+    return 1;
+}
+
+int scheduler_select_queued_after_park_locked(struct kernel_cpu *cpu,
+    struct kernel_task **selected,uint64_t *deadline)
+{
+    /* A nonempty local queue takes precedence over pulling ordinary work.
+     * Keep the existing eligibility checks, including migratable RT work. */
+    if (!cpu->runqueue.count) return 0;
+    return select_local_locked(cpu,cpu->current,1,0,0,selected,deadline);
+}
+
 int scheduler_select_local(int blocked,int rotate,int voluntary,struct kernel_task **selected,
                            uint64_t *deadline)
 {
@@ -1374,43 +1423,8 @@ int scheduler_select_local(int blocked,int rotate,int voluntary,struct kernel_ta
     }
     {
         KERNEL_RAW_SCOPE(guard,kernel_run_lock(cpu));
-        if (!local_queue_eligible(cpu,current,blocked)) return 0;
-        if (remote_rt_ready(cpu)) return 0;
-        struct kernel_sched_node *head=kernel_sched_pick(&cpu->runqueue,1);
-        account_cpu(cpu,kernel_time_raw_ns());
-        struct kernel_task *normal=head?head->owner:0;
-        struct kernel_task *oldest=ready_wait_head(cpu,normal);
-        struct kernel_task *next=ready_wait_pick(cpu,normal,oldest);
-        if (blocked) {
-            /* 唤醒在选择后继前到达时，当前栈仍归自己，无需切走再取回。 */
-            if (current->wait.ready_pending && current->state==KERNEL_THREAD_STATE_READY) {
-                current->wait.ready_pending=0;
-                __atomic_store_n(&current->state,KERNEL_THREAD_STATE_RUNNING,__ATOMIC_RELAXED);
-            } else *selected=claim_next_locked(cpu,current,next);
-        } else {
-            (void)kernel_cpu_consume_schedule(cpu);
-            rotate |= cpu->rotate_other;
-            cpu->rotate_other=0;
-            int age_due=ready_wait_preempts(cpu,oldest);
-            int expired=current->scheduling.fair_slice_used>=kernel_sched_fair_slice(&current->scheduling);
-            if(expired)current->scheduling.fair_slice_used=0;
-            int due=head && current->ready_node.fair.key>=head->fair.key;
-            if (head && (current->idle || voluntary || ((rotate||expired)&&due) ||
-                         age_due || fair_preempts(normal,current))) {
-                if (current->idle) cpu->idle_context_saved=1;
-                else {
-                    if (current->wait.ready_pending) __builtin_trap();
-                    __atomic_store_n(&current->state,KERNEL_THREAD_STATE_READY,__ATOMIC_RELAXED);
-                    current->wait.ready_pending=1;
-                    current->wait.ready_flags=SCHED_READY_LOCAL;
-                }
-                *selected=claim_next_locked(cpu,current,next);
-            }
-        }
-        *deadline=scheduler_deadline_locked(cpu);
+        return select_local_locked(cpu,current,blocked,rotate,voluntary,selected,deadline);
     }
-    /* 在实际切栈、页表和 FPU 交接前退掉本函数和双队列 guard 的栈帧。 */
-    return 1;
 }
 #endif
 

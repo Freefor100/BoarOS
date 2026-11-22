@@ -1821,6 +1821,17 @@ static void acquire_order_locked(struct physical_page_allocator *a,uint64_t addr
     if (a->metadata[page].order != order || *references==UINT32_MAX) __builtin_trap();
     (*references)++;page_written(work);
 }
+
+static const struct physical_page_root *batch_root(const struct physical_page_allocator *a,
+    const struct physical_page_root *root, uint64_t address, struct page_work *work)
+{
+    if (address & BOAROS_PAGE_MASK) __builtin_trap();
+    if (root && address - root->address <
+        (order_page_count(root->order) << BOAROS_PAGE_SHIFT)) return root;
+    root = root_for_address(a, address, work);
+    if (!root) __builtin_trap();
+    return root;
+}
 uint32_t physical_page_cow_borrow_order(struct physical_page_allocator *a,
     uint64_t address, uint32_t order)
 {
@@ -1861,8 +1872,18 @@ void physical_page_acquire_batch(struct physical_page_allocator *a,
     if (!count) return;
     if (!addresses || count > PHYSICAL_PAGE_REFERENCE_BATCH_MAX) __builtin_trap();
     PAGE_METADATA_SCOPE(work, a);
-    for (unsigned i = 0; i < count; i++)
-        acquire_order_locked(a, addresses[i], 0, &work);
+    if (!physical_page_allocator_is_finalized(a)) __builtin_trap();
+    const struct physical_page_root *root = NULL;
+    for (unsigned i = 0; i < count; i++) {
+        uint64_t address = addresses[i];
+        root = batch_root(a, root, address, &work);
+        uint32_t page = root->first_page_index + (uint32_t)((address-root->address)>>BOAROS_PAGE_SHIFT);
+        struct buddy_owner head = {.first=page,.order=0,.state=BUDDY_ALLOCATED};
+        uint32_t *refs = &a->metadata[page].reference_count;
+        if (!head_valid(a,&head,&work) || *refs == UINT32_MAX) __builtin_trap();
+        (*refs)++;
+        page_written(&work);
+    }
 }
 
 enum physical_page_status
