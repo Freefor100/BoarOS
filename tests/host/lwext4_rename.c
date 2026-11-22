@@ -18,6 +18,7 @@ static const char split_name[] =
     "abcdefghijklmnopqrstuvwxyz-abcdefghijklmnopqrstuvwxyz-abcdefghijklmnopqrstuvwxyz-"
     "abcdefghijklmnopqrstuvwxyz-abcdefghijklmnopqrstuv";
 static unsigned allocations, fail_allocation, events, cut, allocation_hits, io_hits;
+static unsigned write_batches;
 static int reorder;
 static unsigned injected_allocation;
 static const char *operation_kind = "setup", *operation_mode = "setup";
@@ -94,6 +95,17 @@ static int dev_read(struct ext4_blockdev *b, void *p, uint64_t n, uint32_t c)
 { (void)b; return kernel_block_read_at(&disk.device, n * 512, p, (size_t)c * 512) == KERNEL_BLOCK_STATUS_OK ? EOK : EIO; }
 static int dev_write(struct ext4_blockdev *b, const void *p, uint64_t n, uint32_t c)
 { (void)b; int r = kernel_block_write_at(&disk.device, n * 512, p, (size_t)c * 512) == KERNEL_BLOCK_STATUS_OK ? EOK : EIO; if (disk.fail_write && disk.writes == disk.fail_write) io_hits++; boundary(); return r; }
+static int dev_write_batch(struct ext4_blockdev *b, const struct kernel_block_span *spans,
+    unsigned count)
+{
+    CHECK(count > 1);
+    write_batches++;
+    for (unsigned i = 0; i < count; i++) {
+        int error = dev_write(b, spans[i].buffer, spans[i].offset / 512, spans[i].size / 512);
+        if (error) return error;
+    }
+    return EOK;
+}
 static int dev_flush(struct ext4_blockdev *b)
 { (void)b; int r = kernel_block_flush(&disk.device) == KERNEL_BLOCK_STATUS_OK ? EOK : EIO; if (disk.fail_flush && disk.flushes == disk.fail_flush) io_hits++; boundary(); return r; }
 static uint32_t inode(const char *path)
@@ -708,6 +720,7 @@ static void ext2_namespace(struct ext4_fs *fs)
     CHECK(ext4_remount("/", false) == EOK);
     CHECK(ext4_create_child("/", to, "read-write", 0100644,
         0, NULL, NULL, NULL, uid, gid) == EOK);
+    CHECK(write_batches > 0);
     puts("PASS ext2 namespace, open overwritten inode and last-reference reclaim");
 }
 
@@ -770,6 +783,7 @@ int main(int argc, char **argv)
     CHECK(ext4_device_register(&dev, "rename") == EOK);
     bool readonly = !strcmp(argv[2], "readonly");
     bool ext2 = !strncmp(argv[2], "ext2-", 5);
+    if (ext2) iface.bwrite_batch = dev_write_batch;
     if (!strcmp(argv[2], "ext2-mount-reject")) {
         CHECK(ext4_mount_ext2("rename", "/", false) == ENOTSUP);
         CHECK(!disk.writes && !disk.flushes);

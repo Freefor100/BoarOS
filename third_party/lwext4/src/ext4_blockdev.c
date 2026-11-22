@@ -164,6 +164,27 @@ static void ext4_block_end_write(struct ext4_bcache *bc, struct ext4_buf *buf, i
     { KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);bc->dont_shake=previous; }
 }
 
+static void note_home_write_error(struct ext4_blockdev *bdev, int result)
+{
+    if (result && bdev->fs && !ext4_sb_feature_com(&bdev->fs->sb,EXT4_FCOM_HAS_JOURNAL)) {
+        int expected=EOK;
+        __atomic_compare_exchange_n(&bdev->fs->nojournal_error,&expected,result,false,
+            __ATOMIC_RELEASE,__ATOMIC_RELAXED);
+    }
+}
+
+static inline void home_write_complete_locked(struct ext4_bcache *bc, struct ext4_buf *buf,
+    struct ext4_block_payload *payload)
+{
+    /* A later publication needs a write of its own. */
+    if (buf->current_payload!=payload) return;
+    if (buf->on_dirty_list) {
+        SLIST_REMOVE(&bc->dirty_list,buf,ext4_buf,dirty_node);
+        buf->on_dirty_list=false;
+    }
+    ext4_bcache_clear_flag(buf,BC_DIRTY);
+}
+
 int ext4_block_flush_buf(struct ext4_blockdev *bdev, struct ext4_buf *buf)
 {
     int failed=bdev->fs?__atomic_load_n(&bdev->fs->nojournal_error,__ATOMIC_ACQUIRE):EOK;
@@ -181,26 +202,74 @@ int ext4_block_flush_buf(struct ext4_blockdev *bdev, struct ext4_buf *buf)
         complete=buf->end_write;argument=buf->end_write_arg;
     }
     int result=ext4_blocks_set_direct(bdev,payload->data,buf->lba,1);
-    if (result && bdev->fs && !ext4_sb_feature_com(&bdev->fs->sb,EXT4_FCOM_HAS_JOURNAL)) {
-        int expected=EOK;
-        __atomic_compare_exchange_n(&bdev->fs->nojournal_error,&expected,result,false,
-            __ATOMIC_RELEASE,__ATOMIC_RELAXED);
-    }
+    note_home_write_error(bdev,result);
     if (!result) {
         KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
-        /* A later publication still needs its own write, even when this older
-         * payload completed successfully while its device loan stayed alive. */
-        if (buf->current_payload==payload) {
-            if (buf->on_dirty_list) {
-                SLIST_REMOVE(&bc->dirty_list,buf,ext4_buf,dirty_node);
-                buf->on_dirty_list=false;
-            }
-            ext4_bcache_clear_flag(buf,BC_DIRTY);
-        }
+        home_write_complete_locked(bc,buf,payload);
     }
     ext4_block_end_write(bc,buf,result,complete,argument);
     ext4_block_payload_put(payload);
     return result;
+}
+
+/* The extent of one batch is a metadata phase. The scope owns the buffer
+ * descriptors, and the loans below cover their exact versions until I/O drains. */
+static int flush_ext2_scope(struct ext4_bcache *bc,struct ext4_writeback_scope *scope)
+{
+    struct ext4_blockdev *bdev=bc->bdev;
+    struct ext4_scope_batch *batch=scope->batch;
+    struct ext4_buf *next=scope->head;
+    while (next) {
+        int result=__atomic_load_n(&bdev->fs->nojournal_error,__ATOMIC_ACQUIRE);
+        if (result) return result;
+        unsigned count=0;
+        {
+            KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
+            while (next && count<EXT4_SCOPE_BATCH_MAX) {
+                struct ext4_buf *buf=next;
+                /* Keep exceptional completions on the original scalar path. */
+                if (buf->end_write || buf->journal_pending) break;
+                next=buf->writeback_next;
+                if (!ext4_bcache_test_flag(buf,BC_DIRTY) ||
+                    !ext4_bcache_test_flag(buf,BC_UPTODATE)) continue;
+                struct ext4_block_payload *payload=buf->current_payload;
+                ext4_block_payload_get(payload);
+                batch->spans[count]=(struct kernel_block_span){
+                    .offset=buf->lba*bdev->lg_bsize,.size=bdev->lg_bsize,.buffer=payload->data};
+                batch->buffers[count]=buf;
+                batch->payloads[count++]=payload;
+            }
+        }
+        if (!count) {
+            if (!next) return EOK;
+            result=ext4_block_flush_buf(bdev,next);
+            if (result) return result;
+            next=next->writeback_next;
+            continue;
+        }
+        result=count==1 ? ext4_blocks_set_direct(bdev,batch->payloads[0]->data,batch->buffers[0]->lba,1) :
+            ext4_blocks_set_batch(bdev,batch->spans,count);
+        if (result) note_home_write_error(bdev,result);
+        else {
+            KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
+            for (unsigned i=0;i<count;i++)
+                home_write_complete_locked(bc,batch->buffers[i],batch->payloads[i]);
+        }
+        for (unsigned i=0;i<count;i++) ext4_block_payload_put(batch->payloads[i]);
+        if (result) return result;
+    }
+    return EOK;
+}
+
+int ext4_bcache_scope_flush(struct ext4_bcache *bc,struct ext4_writeback_scope *scope)
+{
+    struct ext4_blockdev *bdev=bc->bdev;
+    if (scope->batch) return flush_ext2_scope(bc,scope);
+    for (struct ext4_buf *buf=scope->head;buf;buf=buf->writeback_next) {
+        int result=ext4_block_flush_buf(bdev,buf);
+        if (result) return result;
+    }
+    return EOK;
 }
 
 int ext4_block_flush_lba(struct ext4_blockdev *bdev, uint64_t lba)
