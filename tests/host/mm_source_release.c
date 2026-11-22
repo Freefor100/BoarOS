@@ -42,7 +42,8 @@ static struct kernel_vfs_mount *mount;
 static struct kernel_open_file_description *watched, *callback_file;
 static struct kernel_elf64_source *watched_elf;
 static uint64_t context;
-static unsigned last_releases, pause_callback, callback_after_fence, callback_entered, callback_resume, unmap_done;
+static unsigned last_releases, pause_callback, callback_entered, callback_resume, unmap_done;
+static void (*truncate_mapping)(void *, struct kernel_vfs_node *, uint64_t);
 static unsigned fail_close;
 static unsigned fail_page, mincore_pause, mincore_entered, mincore_resume;
 static unsigned self_pin_prepare, self_pin_prepared, self_pin_hold, self_pin_writer_held, self_pin_returned;
@@ -136,14 +137,27 @@ void __wrap_kernel_file_mapping_drain(struct kernel_file_mapping *mapping)
 void __real_kernel_heap_release(struct kernel_heap *,void *);
 void __wrap_kernel_heap_release(struct kernel_heap *h,void *pointer)
 {
-    if (kernel_cpu_current()->hardware_id==5 &&
-        __atomic_exchange_n(&callback_after_fence,0,__ATOMIC_ACQ_REL)) {
-        /* 此resident已摘索引；callback尚未返回，registration仍被实际借用。 */
-        publish(&callback_entered); await(&callback_resume);
-    }
     int last_elf=watched_elf && pointer==watched_elf;
     __real_kernel_heap_release(h,pointer);
     if (last_elf) {watched_elf=NULL;elf_releases++;}
+}
+static void paused_truncate(void *owner,struct kernel_vfs_node *node,uint64_t size)
+{
+    truncate_mapping(owner,node,size);
+    /* The callback has returned its MM writer and still owns the registration borrow. */
+    outside_gate();
+    publish(&callback_entered);
+    await(&callback_resume);
+}
+int __real_kernel_file_mapping_register(struct kernel_file_mapping *);
+int __wrap_kernel_file_mapping_register(struct kernel_file_mapping *mapping)
+{
+    if (pause_callback) {
+        pause_callback=0;
+        truncate_mapping=mapping->truncate;
+        mapping->truncate=paused_truncate;
+    }
+    return __real_kernel_file_mapping_register(mapping);
 }
 void kernel_assert_service_context(void) { assert(!kernel_cpu_current()->logical_id); }
 void kernel_cpu_flush_notifications(void) {}
@@ -153,9 +167,6 @@ void mm_test_fence(uint64_t address,int instructions)
 void riscv_smp_sync_user(uint32_t targets,uint64_t address,uint64_t size,int instructions)
 {
     (void)address; (void)size; (void)instructions; assert(!targets && !kernel_cpu_current()->raw_locks);
-    if (kernel_cpu_current()->hardware_id==5 && __atomic_exchange_n(&pause_callback,0,__ATOMIC_ACQ_REL)) {
-        publish(&callback_after_fence);
-    }
 }
 static struct kernel_open_file_description *map_file(const char *path,uint64_t address)
 {
@@ -404,13 +415,14 @@ int main(void)
     mincore_unmap();
     self_pin_source_retirement();
 
+    pause_callback=1;
     callback_file=map_file("/callback",0x40000);
     unsigned char byte=0; size_t copied;
     assert(!kernel_copy_from_user(&mm,&byte,0x40000,1,&copied) && copied==1);
     assert(!kernel_mm_mmap_anonymous(&mm,0x80000,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,
         KERNEL_MM_MAP_FIXED,&address));
     assert(!kernel_copy_to_user(&mm,0x80000,&byte,1,&copied));
-    pause_callback=1; pthread_t notifier,remover;
+    pthread_t notifier,remover;
     assert(!pthread_create(&notifier,NULL,truncate_callback,NULL)); await(&callback_entered);
     unsigned before=mm_test_parked(6);
     assert(!pthread_create(&remover,NULL,unmap_callback,NULL));

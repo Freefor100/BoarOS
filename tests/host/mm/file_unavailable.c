@@ -92,6 +92,8 @@ EXCLUDED(kernel_page_cache_alias_put)
 EXCLUDED(kernel_page_cache_retry_alias)
 
 EXCLUDED(kernel_page_cache_write_source)
+void kernel_task_account_write(uint64_t bytes)
+{ (void)bytes; mm_file_unavailable(); }
 
 EXCLUDED(kernel_page_cache_resize_prepare)
 EXCLUDED(kernel_page_cache_resize_finish)
