@@ -6384,6 +6384,23 @@ int kernel_vfs_files_share_node(const struct kernel_vfs_file *left,
     return left_node != 0 && left_node == kernel_vfs_file_node(right);
 }
 
+int kernel_vfs_copy_range_files(const struct kernel_vfs_file *input,
+    const struct kernel_vfs_file *output, const struct kernel_vfs_file **source,
+    const struct kernel_vfs_file **target)
+{
+    const struct kernel_vfs_instance *in = input->mount->private_data;
+    const struct kernel_vfs_instance *out = output->mount->private_data;
+    *source = input;
+    *target = output;
+    if (!out->ops->copy_range_backing)
+        return in == out ? 0 : -KERNEL_EXDEV;
+    if (in->ops->copy_range_backing != out->ops->copy_range_backing)
+        return -KERNEL_EXDEV;
+    *source = in->ops->copy_range_backing(input->private_data);
+    *target = out->ops->copy_range_backing(output->private_data);
+    return 0;
+}
+
 uint64_t kernel_vfs_file_max_size(const struct kernel_vfs_file *file)
 {
     struct kernel_vfs_node *node = kernel_vfs_file_node(file);

@@ -828,6 +828,7 @@ static const struct kernel_vfs_backend overlay_ops={
     .file_operation_execution=KERNEL_VFS_EXECUTION_CALLER,.namespace_execution=KERNEL_VFS_EXECUTION_CALLER,
     .owns_dentry_names=true,.export=&overlay_export,.error=mount_error,.root=root,.open=open_root,
     .lookup_open=lookup_open,.data_file=data_file,.event_backing=event_backing,
+    .copy_range_backing=data_file,
     .prepare_access=prepare_access,.copy_up=copy_up,.close_node=close_node,
     .readlink=readlink,.stat=stat_inode,.statfs=statfs,.acl_permission=permission,
     .accessed=accessed,.modified=modified,.set_mode=set_mode,.set_owner=set_owner,.set_times=set_times,.xattr=xattr,

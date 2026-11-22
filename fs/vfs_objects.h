@@ -192,6 +192,9 @@ struct kernel_vfs_backend {
     int (*lookup_open)(struct kernel_vfs_node *, const char *, size_t,
         struct kernel_vfs_file *);
     const struct kernel_vfs_file *(*data_file)(struct kernel_vfs_node *);
+    /* Matching copy methods may delegate a cross-instance copy to real files.
+     * The returned file stays live while its outer open file is held. */
+    const struct kernel_vfs_file *(*copy_range_backing)(struct kernel_vfs_node *);
     int (*prepare_access)(struct kernel_vfs_path *, unsigned);
     int (*copy_up)(struct kernel_vfs_file *);
     /* A backend with one directory entry per inode can expose several lookup

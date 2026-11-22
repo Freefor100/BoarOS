@@ -209,6 +209,11 @@ def main():
         if args.only!='linux':kernels.append(('boaros',args.kernel or ROOT/profile.kernel))
         qemu=os.environ.get('QEMU_RISCV64' if args.arch=='riscv' else 'QEMU_LOONGARCH64',profile.qemu)
         report['qemu']=subprocess.check_output([qemu,'--version'],text=True)
+        overlay_volume=None
+        if 'overlay' in programs:
+            overlay_volume=work/'overlay-volume.img'
+            with overlay_volume.open('wb') as stream:stream.truncate(32*1024*1024)
+            harness.run_logged(['mkfs.ext4','-q','-F','-b','4096',str(overlay_volume)],work/'overlay-mkfs.log')
         for target,kernel in kernels:
             snapshot=work/(target+'-kernel');shutil.copyfile(kernel,snapshot)
             disk=work/(target+'.img');shutil.copyfile(fixture,disk)
@@ -226,6 +231,19 @@ def main():
                 device=('virtio-blk-device,drive=fat,bus=virtio-mmio-bus.1' if args.arch=='riscv'
                         else 'virtio-blk-pci,drive=fat,addr=2,disable-legacy=on')
                 command+=['-drive',f'file={fat},if=none,format=raw,id=fat','-device',device]
+            extra=None
+            if overlay_volume:
+                extra=work/(target+'-overlay-volume.img');shutil.copyfile(overlay_volume,extra)
+                if args.arch=='riscv':
+                    bus=2 if fat else 1
+                    if target=='linux':
+                        # The reference probes virtio-mmio buses in reverse order.
+                        command[command.index(profile.block('modern'))]=profile.block('modern').replace('bus.0','bus.1')
+                        bus=0
+                    device=f'virtio-blk-device,drive=extra,bus=virtio-mmio-bus.{bus}'
+                else:
+                    device=f'virtio-blk-pci,drive=extra,disable-legacy=on,addr={3 if fat else 2}'
+                command+=['-drive',f'file={extra},if=none,format=raw,id=extra','-device',device]
             if target=='linux':
                 # setns installs the namespace root. Use a real root mount on
                 # both architectures, rather than a LA-only chroot in initrd.
@@ -241,9 +259,12 @@ def main():
             harness.run_logged(['e2fsck','-fn',str(disk)],work/(target+'-fsck.log'))
             if fat:
                 harness.run_logged(['fsck.fat','-n',str(fat)],work/'fat-fsck.log');fat.unlink()
+            if extra:
+                harness.run_logged(['e2fsck','-fn',str(extra)],work/(target+'-overlay-fsck.log'));extra.unlink()
             if any(digest(row['path'])!=row['sha256'] for row in programs.values()):
                 raise RuntimeError('caller ELF changed during comparison')
             disk.unlink();print(target,'PASS',work,flush=True)
+        if overlay_volume:overlay_volume.unlink()
         fixture.unlink();report['status']='passed'
     except Exception as error:
         report.update(status='failed',error=str(error));raise

@@ -338,11 +338,20 @@ proc控制、FIFO时间戳、FSIZE、文件封印、TCP／UNIX控制消息、分
 
 ## `copy_file_range`
 
-syscall 285 支持同一文件系统实例内 tmpfs、ext4 与 VFAT 普通文件复制。
-绑定挂载与来源视图共享实例，因此允许跨两个视图复制；不同实例返回 EXDEV，
-即使文件系统类型相同。flags 必须为零，目录返回 EISDIR，其他非普通文件返回
-EINVAL；输入不可读、输出不可写或 O_APPEND 返回 EBADF。同 inode 的实际复制
-区间重叠返回 EINVAL，范围先按输入 EOF、输出最大文件尺寸及 RLIMIT_FSIZE 缩短。
+系统调用 285 支持在同一文件系统实例内复制普通文件，包括经绑定挂载取得的文件。
+ext2、ext4、tmpfs 和 VFAT 的普通文件跨实例复制返回 `EXDEV`，同一文件系统类型
+的两个实例也遵循这条规则。
+
+两个 OverlayFS 文件可以来自不同叠加实例。内核从已打开的源文件选定后备层，
+目标文件使用其可写上层，两个后备文件必须属于同一个文件系统实例。
+一端为 OverlayFS、另一端为普通后备文件系统时返回 `EXDEV`。
+已选定的源层随源文件描述符保活，复制过程中发生的上层副本发布不会切换来源。
+两个叠加视图指向同一个后备索引节点时，重叠的复制区间返回 `EINVAL`。
+
+`flags` 必须为零。目录返回 `EISDIR`，其他非普通文件返回 `EINVAL`；
+输入不可读、输出不可写或设置了 `O_APPEND` 时返回 `EBADF`。
+检查同一文件的复制区间是否重叠前，先按源文件末尾、目标文件最大尺寸及
+`RLIMIT_FSIZE` 缩短实际范围。
 
 两端 fd 先取得独立 OFD pin，再读取显式用户 offset。隐式 offset 在 OFD 位置锁
 内取值并提交；两个锁按 key 排序，alias 只取一次。复制成功后按输入、输出顺序
@@ -358,6 +367,7 @@ O_SYNC/O_DSYNC 在整次复制后同步一次，同步失败返回错误而不�
 `tests/workloads/io/copy_range.c` 检查四种 offset 组合、EOF、同 inode 区间、错误
 顺序、copyout 副作用、FSIZE、独立 tmpfs 实例和绑定视图；环境变量
 `COPY_RANGE_VFAT` 可指定已挂载 VFAT 目录运行同一内容检查。
+`tests/workloads/fs/overlay.c` 使用独立 ext4 卷验证跨叠加实例复制、后备文件重叠及跨卷拒绝。
 
 ## 目录与文件系统操作
 
