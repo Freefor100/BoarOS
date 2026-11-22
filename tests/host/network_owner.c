@@ -91,7 +91,7 @@ struct netif *__wrap_netif_get_by_index(u8_t index)
     if(scoped_lookup_contract)CHECK(protocol_current_owner()==kernel_io_context_current());
     return __real_netif_get_by_index(index);
 }
-static unsigned heap_allocations,protocol_services,allow_ofd_release,heap_fail_after;
+static unsigned heap_allocations,protocol_services,allow_ofd_release,heap_fail_after,heap_fail_again;
 static size_t heap_last_allocation_size;
 static unsigned space_callbacks;
 static _Thread_local unsigned reservation_actor,state_acquires;
@@ -383,7 +383,11 @@ enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *heap, si
       struct kernel_socket *listener=accept_binding_probe;accept_binding_probe=NULL;
       CHECK(!kernel_socket_set_bound_device(listener,"eth0"));accept_binding_changed++;
   }
-  if(heap_fail_after && !--heap_fail_after) { *out=NULL;return KERNEL_HEAP_STATUS_EMPTY; } *out = calloc(n, size); CHECK(*out); heap_last_allocation_size=n*size; ++heap_live; ++heap_allocations; return KERNEL_HEAP_STATUS_OK; }
+  if(heap_fail_after && !--heap_fail_after) {
+      heap_fail_after=heap_fail_again;heap_fail_again=0;
+      *out=NULL;return KERNEL_HEAP_STATUS_EMPTY;
+  }
+  *out = calloc(n, size); CHECK(*out); heap_last_allocation_size=n*size; ++heap_live; ++heap_allocations; return KERNEL_HEAP_STATUS_OK; }
 enum kernel_heap_status kernel_heap_allocate(struct kernel_heap *heap, size_t size, void **out)
 { return kernel_heap_allocate_zeroed(heap, 1, size, out); }
 void kernel_heap_release(struct kernel_heap *heap, void *allocation)
@@ -2195,15 +2199,28 @@ static void tcp_reset_receive_retry(void)
     struct kernel_socket_read_request read={0};
     CHECK(kernel_socket_reserve_read(server,0,&read,&pin,4,0,NULL)==4);
     heap_fail_after=1;
+#if BOAROS_USER_SMP
+    heap_fail_again=1;
+#endif
     CHECK(write_buffer(client,"x",1,0)==1);
     netif_poll_all();
     CHECK(!heap_fail_after && server->receive_retry && server->tcp->refused_data &&
           server->work_links[receive_wait.slot].queued);
+#if BOAROS_USER_SMP
+    uint64_t generation=receive_generation;
+    receive_capacity();
+    CHECK(receive_generation==generation+1);
+#endif
     reset_retry_socket=server;
     tcp_abort(server->tcp);
     reset_retry_socket=NULL;
     CHECK(reset_retry_observations && !server->tcp && !server->receive_retry &&
           !server->work_links[receive_wait.slot].queued && server->pending_error==-KERNEL_ECONNABORTED);
+#if BOAROS_USER_SMP
+    unsigned work_locks=state_acquires;
+    receive_capacity();
+    CHECK(state_acquires==work_locks);
+#endif
     kernel_socket_protocol_leave(&scope);
     char bytes[4];kernel_socket_copy_read(&read,0,bytes,sizeof(bytes));
     CHECK(kernel_socket_finish_read(&read,0)==4 && !memcmp(bytes,"kept",4) && pin==(void *)server);
@@ -5774,6 +5791,9 @@ static void parallel_receive_retirement(void)
     model_boot_cpus=2;
     kernel_socket_network_initialize();
     CHECK(boaros_lwip_parallel_enabled());
+    unsigned work_locks=state_acquires;
+    receive_capacity();
+    CHECK(state_acquires==work_locks);
     struct kernel_socket *listener=NULL,*client=NULL,*socket=NULL;
     connected_pair(&listener,&client,&socket);
     unsigned saves=network_host_irq_saves;
@@ -5794,7 +5814,9 @@ static void parallel_receive_retirement(void)
     struct pbuf *payload=pbuf_alloced_custom(PBUF_RAW,sizeof(input),PBUF_REF,&custom,input,sizeof(input));
     CHECK(payload);
     socket->tcp->rcv_wnd-=sizeof(input);
+    heap_fail_after=1;
     CHECK(tcp_data_received(socket,socket->tcp,payload,ERR_OK)==ERR_OK);
+    CHECK(!heap_fail_after && !socket->receive_retry && !receive_wait.head);
     kernel_socket_protocol_leave(&scope);
 
     struct kernel_socket_message peek={.flags=KERNEL_SOCKET_MSG_PEEK};
@@ -5923,6 +5945,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "tcp-serial-resolved-output")) tcp_resolved_output_contract(1);
     else if (!strcmp(argv[1], "udp-caller-submit")) udp_caller_submit();
     else if (!strcmp(argv[1], "udp-caller-stop")) remote_protocol_request(3);
+    else if (!strcmp(argv[1], "parallel-receive-reset")) tcp_reset_receive_retry();
 #endif
     else if (!strcmp(argv[1], "tcp-cork")) tcp_cork_contract();
     else if (!strcmp(argv[1], "tcp-receive-before-wait")) tcp_receive_before_wait_contract();

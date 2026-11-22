@@ -16,11 +16,13 @@ enum virtio_register {
     VIRTIO_REG_QUEUE_DEVICE_LOW, VIRTIO_REG_QUEUE_DEVICE_HIGH, VIRTIO_REG_CONFIG_GENERATION
 };
 enum virtio_transport_kind { VIRTIO_TRANSPORT_MMIO=1, VIRTIO_TRANSPORT_PCI=2 };
+enum { VIRTIO_INTERRUPT_CONFIG = 1U << 1 };
 struct virtio_transport_ops {
     uint32_t (*read)(void *,enum virtio_register);
     void (*write)(void *,enum virtio_register,uint32_t);
     uint32_t (*config_read)(void *,uint32_t,unsigned);
-    /* PCI ISR read-to-clear and MMIO W1C belong to the adapter. */
+    /* Return acknowledged reasons. Read-to-clear and write-one-to-clear
+     * belong to the transport adapter. */
     uint32_t (*ack_interrupt)(void *);
     int (*register_irq)(void *,uint32_t,void (*)(void *),void *);
     void (*unregister_irq)(void *,uint32_t,void *);

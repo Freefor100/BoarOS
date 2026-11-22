@@ -576,7 +576,7 @@ static uint64_t pool_generation, nic_generation, receive_generation;
  * context. These masks carry readiness without holding a PCB pointer. */
 static unsigned orphan_nic_wait, orphan_nic_ready;
 #if BOAROS_USER_SMP
-static unsigned pool_has_waiters;
+static unsigned pool_has_waiters, receive_has_waiters;
 #endif
 static unsigned loopback_pending, nic_blocked, protocol_depth, service_cursor, capacity_cursor;
 #if BOAROS_COST_DIAGNOSTICS
@@ -959,6 +959,7 @@ static void work_remove_locked(struct socket_work_queue *queue, struct kernel_so
     *link = (struct socket_link){0};
 #if BOAROS_USER_SMP
     if (queue==&pool_wait && !queue->head) __atomic_store_n(&pool_has_waiters,0,__ATOMIC_RELEASE);
+    if (queue==&receive_wait && !queue->head) __atomic_store_n(&receive_has_waiters,0,__ATOMIC_RELEASE);
 #endif
 }
 /* Caller holds the shared work-list lock through membership publication. */
@@ -973,6 +974,7 @@ static void work_add_locked(struct socket_work_queue *queue, struct kernel_socke
     queue->tail = socket;
 #if BOAROS_USER_SMP
     if (queue==&pool_wait) __atomic_store_n(&pool_has_waiters,1,__ATOMIC_RELEASE);
+    if (queue==&receive_wait) __atomic_store_n(&receive_has_waiters,1,__ATOMIC_RELEASE);
 #endif
 }
 static void socket_schedule_locked(struct kernel_socket *socket,unsigned flags,
@@ -1011,10 +1013,14 @@ static void socket_pool_wait(struct kernel_socket *socket)
 }
 static void receive_capacity(void)
 {
+#if BOAROS_USER_SMP
+    if (!__atomic_load_n(&receive_has_waiters,__ATOMIC_ACQUIRE)) return;
+#endif
     SOCKET_STATE(irq);
-    receive_generation++;
-    if (receive_wait.head) socket_work_ready_locked(irq.owner);
-    socket_state_release(&irq);
+    if (receive_wait.head) {
+        receive_generation++;
+        socket_work_ready_locked(irq.owner);
+    }
 }
 static void protocol_work_ready(void)
 {
@@ -2699,7 +2705,22 @@ static err_t tcp_data_received(void *context, struct tcp_pcb *pcb,
      * promised before SO_RCVBUF was lowered. Only real memory can fail here. */
     status = kernel_heap_allocate_zeroed(socket->heap, 1U, sizeof(*packet),
                                          (void **)&packet);
-    if (status == KERNEL_HEAP_STATUS_EMPTY) { KERNEL_IRQ_LOCK_SCOPE(state,&socket_state_lock);socket->receive_retry=1; work_remove_locked(&receive_wait, socket); work_add_locked(&receive_wait, socket, receive_generation); return ERR_MEM; }
+    if (status == KERNEL_HEAP_STATUS_EMPTY) {
+        {
+            KERNEL_IRQ_LOCK_SCOPE(state,&socket_state_lock);
+            socket->receive_retry=1;
+            work_remove_locked(&receive_wait, socket);
+            work_add_locked(&receive_wait, socket, receive_generation);
+        }
+#if BOAROS_USER_SMP
+        /* A reader may have returned a packet before seeing this waiter.
+         * Recheck the heap after publication, with the work-list lock free. */
+        status = kernel_heap_allocate_zeroed(socket->heap, 1U, sizeof(*packet), (void **)&packet);
+        if (status == KERNEL_HEAP_STATUS_EMPTY) return ERR_MEM;
+#else
+        return ERR_MEM;
+#endif
+    }
     if (status != KERNEL_HEAP_STATUS_OK) __builtin_trap();
     packet->payload = payload;
     if (socket->receive_retry) {
