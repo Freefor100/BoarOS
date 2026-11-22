@@ -193,6 +193,7 @@ static enum kernel_files_status proc_page_stream_read(struct kernel_files *files
     int pagemap=description->proc_page_stream==KERNEL_PROC_PAGE_STREAM_PAGEMAP;
     struct kernel_mm_pagemap *view=pagemap ? description->proc_pagemap : NULL;
     uint64_t total=0, fault_prefix=0;
+    uint64_t consumed;
     int error = 0;
     if (pagemap && !kernel_mm_pagemap_live(view)) goto Out;
     if (offset % sizeof(uint64_t)) { error = -KERNEL_EINVAL; goto Out; }
@@ -230,7 +231,7 @@ static enum kernel_files_status proc_page_stream_read(struct kernel_files *files
         if (done != length) break;
     }
 Out:
-    uint64_t consumed=total+fault_prefix;
+    consumed = total + fault_prefix;
     if (advance && consumed && kernel_open_file_advance(description,consumed))
         return KERNEL_FILES_STATUS_STATE;
     if (error) KERNEL_FILES_NOTE(files, read_failures, 1);
