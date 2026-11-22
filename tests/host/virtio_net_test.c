@@ -931,6 +931,40 @@ static void test_batch_notify(unsigned version)
     printf("PASS: VirtIO-net v%u RX/TX batch notifies once, partial full batch publishes, empty batch silent\n",version);
 }
 
+static void test_receive_batch(unsigned version)
+{
+    struct riscv_virtio_mmio_net d;
+    start(version, &d);
+    /* Three passes cross the ready FIFO's wrap point. The device may finish
+     * several packets without an interrupt while the driver owns polling. */
+    for (unsigned pass = 0; pass < 3; pass++) {
+        assert(!virtio_net_poll_service(&d));
+        for (unsigned i = 0; i < 24; i++) {
+            unsigned char value = (unsigned char)(pass * 24 + i);
+            unsigned id = prepare_rx(&value, 1, 0, 0);
+            complete(0, id, (version == 1 ? 10 : 12) + 1, 0);
+        }
+        for (unsigned i = 0; i < 24; i += 7) {
+            struct virtio_net_frame frames[7];
+            unsigned count = virtio_net_receive_batch(&d, frames, 7);
+            assert(count == (24 - i < 7 ? 24 - i : 7));
+            for (unsigned j = 0; j < count; j++) {
+                assert(frames[j].size == 1 &&
+                       *(unsigned char *)frames[j].data == pass * 24 + i + j);
+                assert(frames[j].more_ready == (i + j + 1 < 24));
+                /* Reset, lend and release see each batch item as its own
+                 * CPU lease until the corresponding ownership transfer. */
+                assert(!virtio_net_lend(&d, frames[j].buffer));
+                assert(virtio_net_loan_count(&d) == 1);
+                virtio_net_release(&d, frames[j].buffer);
+            }
+        }
+        assert(!virtio_net_service(&d));
+    }
+    stop(&d);
+    printf("PASS: VirtIO-net v%u receives bounded FIFO batches with separate leases\n", version);
+}
+
 static void test_poll_reenable(unsigned version)
 {
     struct riscv_virtio_mmio_net d;
@@ -1061,6 +1095,7 @@ static void test_concurrent_copy(unsigned version, int stop_during_copy)
 int main(void)
 {
     test_batch_notify(1); test_batch_notify(2);
+    test_receive_batch(1); test_receive_batch(2);
     test_poll_reenable(1); test_poll_reenable(2);
     test_interrupt_poll_turn(1); test_interrupt_poll_turn(2);
     setvbuf(stdout, 0, _IONBF, 0); unsigned errors = 0;

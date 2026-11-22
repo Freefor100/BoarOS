@@ -14,6 +14,10 @@ struct kernel_lock_guard;
 struct pbuf;
 struct tcp_pcb;
 struct udp_pcb;
+enum {
+    BOAROS_UDP_LOOPBACK_TRANSFER = 1,
+    BOAROS_UDP_LOOPBACK_QUEUED,
+};
 struct boaros_lwip_hooks {
     void (*netif_removed)(struct netif *);
     int (*udp_multicast_receive)(struct udp_pcb *,struct pbuf *,struct netif *,const void *,uint16_t,uint16_t);

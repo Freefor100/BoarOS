@@ -1556,16 +1556,21 @@ static int tcp_write_user_batch(struct kernel_mm *mm,
      * makes the address-space editor wait for this send's user pins. */
     if (detached) result=kernel_socket_stream_publish(request,flags);
 #endif
-    /* The protocol may accept only part of the prepared vector. Descriptor
-     * preparation never advances the caller's completed prefix. */
-    if (result>0) {
-        unsigned left=(unsigned)result;
-        if (left>prepared) __builtin_trap();
-        while (left) {
-            uint64_t address;size_t length=kernel_uaccess_iov_span(cursor,left,&address);
-            if (!length) __builtin_trap();
-            cursor->offset+=length;left-=(unsigned)length;
-        }
+    /* Commit the gathered cursor only when the protocol accepts the whole
+     * prefix. A short accept still advances by exactly the accepted bytes. */
+    if (result<=0) return result;
+    unsigned left=(unsigned)result;
+    if (left>prepared) __builtin_trap();
+    if (left==prepared) {
+        *cursor=gather;
+        return result;
+    }
+    while (left) {
+        uint64_t address;
+        size_t length=kernel_uaccess_iov_span(cursor,left,&address);
+        if (!length) __builtin_trap();
+        cursor->offset+=length;
+        left-=(unsigned)length;
     }
     return result;
 }

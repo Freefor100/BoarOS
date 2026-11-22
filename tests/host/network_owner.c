@@ -1143,6 +1143,46 @@ static void udp_bind_ownership(void)
     kernel_socket_destroy(sender);kernel_socket_destroy(receiver);
 }
 
+static void udp_loopback_payload(void)
+{
+    struct netif *loop=netif_get_loopif();
+    for (unsigned ipv6=0;ipv6<2;ipv6++) {
+        uint32_t memory=STATS_GET(mem.used);
+        struct kernel_socket_address address={.family=ipv6?KERNEL_SOCKET_AF_INET6:KERNEL_SOCKET_AF_INET};
+        address.bytes[ipv6?15:3]=1;
+        if (!ipv6) address.bytes[0]=127;
+        struct kernel_socket *sender=NULL,*receiver=NULL;
+        CHECK(!kernel_socket_create(&test_heap,address.family,SOCKET_DGRAM,0,&sender));
+        CHECK(!kernel_socket_create(&test_heap,address.family,SOCKET_DGRAM,0,&receiver));
+        CHECK(!kernel_socket_bind(receiver,&address) && !kernel_socket_getname(receiver,&address));
+
+        struct pbuf *payloads[2];
+        struct kernel_socket_protocol_scope scope;
+        kernel_socket_protocol_enter(&scope);
+        CHECK(!loop->loop_first);
+        for (unsigned i=0;i<2;i++) {
+            struct kernel_open_file_description *pin=(void *)sender;
+            struct kernel_socket_write_request request={0};
+            unsigned length=i?0:3;
+            CHECK(!kernel_socket_packet_prepare(&request,&pin,length,0,&address,1,NULL));
+            payloads[i]=request.protocol_payload;
+            CHECK(kernel_socket_packet_write(&request,NULL,NULL,"udp",NULL,NULL)==(int)length);
+            CHECK(pin==(void *)sender && !request.protocol_payload && !receiver->packets_head);
+            CHECK(loop->loop_last==payloads[i] && payloads[i]->ref==1);
+        }
+        CHECK(loop->loop_first==payloads[0] && payloads[0]->next==payloads[1]);
+        kernel_socket_protocol_leave(&scope);
+        CHECK(kernel_socket_service_pending((struct kernel_socket_service_budget){0,2,0}).packets==2);
+        CHECK(receiver->rx_bytes==4 && receiver->packets_head->payload==payloads[0] &&
+            receiver->packets_tail->payload==payloads[1] && !loop->loop_first);
+        CHECK(!payloads[0]->next && !payloads[1]->next && payloads[1]->tot_len==0);
+        char data[3];
+        CHECK(pbuf_copy_partial(payloads[0],data,sizeof(data),0)==sizeof(data) && !memcmp(data,"udp",3));
+        kernel_socket_destroy(sender);kernel_socket_destroy(receiver);
+        CHECK(STATS_GET(mem.used)==memory && !heap_live);
+    }
+}
+
 static void udp_final_payload(void)
 {
     kernel_socket_network_initialize();
@@ -1162,7 +1202,8 @@ static void udp_final_payload(void)
     user_remaining=SIZE_MAX;
     kernel_socket_destroy(socket);
     udp_bind_ownership();
-    puts("PASS UDP final payload and bind: gather, fault rollback, dual-stack reuse and V6ONLY port ownership");
+    udp_loopback_payload();
+    puts("PASS UDP final payload and bind: gather, fault rollback, dual-stack ports and IPv4/IPv6 loopback ownership");
 }
 
 static void unix_final_payload(void)
@@ -1583,7 +1624,7 @@ static void tcp_lookup_test_dispatch(struct pbuf *packet,struct netif *interface
 static void tcp_lookup_test_drain(struct socket_tcp_owner *owner)
 {
     struct socket_tcp_input input;
-    CHECK(tcp_owner_take_input(owner,&input));
+    CHECK(tcp_owner_take_input(owner,&input,1)==1);
     tcp_owner_receive(owner,&input);
 }
 
@@ -1598,18 +1639,33 @@ static void tcp_owner_lookup(void)
     kernel_socket_protocol_enter(&scope);
     struct netif *loop=loopback_netif();
     for(unsigned i=0;i<2;i++)CHECK(tcp_promote(server[i],&scope));
-    for(unsigned j=0;j<2;j++)
-        for(unsigned i=0;i<2;i++)
-            tcp_lookup_test_dispatch(tcp_lookup_test_packet(server[i]->tcp,loop),loop,server[i]->tcp);
+    CHECK(!owner->count);
+    owner->head=TCP_RX_RING-2;
+    struct pbuf *queued[5];
+    for (unsigned i=0;i<5;i++) {
+        struct tcp_pcb *pcb=server[i%2]->tcp;
+        queued[i]=tcp_lookup_test_packet(pcb,loop);
+        tcp_lookup_test_dispatch(queued[i],loop,pcb);
+    }
     kernel_socket_protocol_leave(&scope);
 
     CHECK(tcp_owner_lock(&scope,owner,0));
     unsigned before=STATS_GET(tcp.cachehit);
     u32_t packets[2]={server[0]->tcp->boaros_segs_in,server[1]->tcp->boaros_segs_in};
-    for(unsigned i=0;i<4;i++)tcp_lookup_test_drain(owner);
+    struct socket_tcp_input input[4];
+    unsigned saves=network_host_irq_saves;
+    CHECK(tcp_owner_take_input(owner,input,4)==4);
+    CHECK(network_host_irq_saves==saves+1 && owner->head==2 && owner->count==1);
+    for (unsigned i=0;i<4;i++) {
+        CHECK(input[i].packet==queued[i]);
+        tcp_owner_receive(owner,&input[i]);
+    }
     CHECK(server[0]->tcp->boaros_segs_in==packets[0]+2 &&
           server[1]->tcp->boaros_segs_in==packets[1]+2);
     CHECK(STATS_GET(tcp.cachehit)==before+4);
+    CHECK(tcp_owner_take_input(owner,input,4)==1 && input[0].packet==queued[4]);
+    tcp_owner_receive(owner,&input[0]);
+    CHECK(!owner->count && STATS_GET(tcp.cachehit)==before+5);
     kernel_socket_protocol_leave(&scope);
 
     struct netif other={.num=(u8_t)(loop->num+1)};
@@ -1666,7 +1722,7 @@ static void tcp_owner_lookup(void)
     CHECK(!owner->count && !owner->context.active && !owner->context.timewait);
     CHECK(!kernel_wait_queue_close(&owner->work) && !kernel_wait_queue_destroy(&owner->work));
     tcp_owner_count=0;
-    puts("PASS owned TCP lookup: interleaving, binding changes, direct loopback, TIME_WAIT and retirement");
+    puts("PASS owned TCP lookup: batched FIFO wrap, binding changes, direct loopback, TIME_WAIT and retirement");
 }
 
 static void tcp_owner_placement(void)
@@ -4747,7 +4803,7 @@ static void ipv6_ra(void)
     puts("PASS RA full-wire preflight/checksum/fragments, L/A, DAD, lifetimes, bounded coexistence, MTU and teardown");
 }
 
-static void inject_ipv4_group(struct netif *n,const ip4_addr_t *group)
+static void inject_ipv4_group(struct netif *n,const ip4_addr_t *group,u16_t port,int corrupt_checksum)
 {
     unsigned char frame[46]={
         1,0,0x5e,1,2,3, 0x52,0x54,0,0x12,0x34,0x57, 0x08,0x00,
@@ -4755,10 +4811,19 @@ static void inject_ipv4_group(struct netif *n,const ip4_addr_t *group)
         0x4b,0x65,0x4b,0x64,0,12,0,0, 'b','o','a','r'
     };
     memcpy(frame+30,&group->addr,4);
+    frame[36]=(unsigned char)(port>>8);
+    frame[37]=(unsigned char)port;
     uint16_t checksum=inet_chksum(frame+14,20);
     memcpy(frame+24,&checksum,2);
     struct pbuf *p=pbuf_alloc(PBUF_RAW,sizeof(frame),PBUF_RAM);
     CHECK(p && !pbuf_take(p,frame,sizeof(frame)));
+    if(corrupt_checksum) {
+        ip4_addr_t peer={lwip_htonl(0x0a4d0003)};
+        CHECK(!pbuf_remove_header(p,34));
+        checksum=inet_chksum_pseudo(p,17,p->tot_len,&peer,group)==1?2:1;
+        memcpy((unsigned char *)p->payload+6,&checksum,2);
+        CHECK(!pbuf_add_header(p,34));
+    }
     struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
     CHECK(!ethernet_input(p,n));
     kernel_socket_protocol_leave(&scope);
@@ -4783,7 +4848,7 @@ static void ipv4_igmp(void)
     CHECK(!kernel_socket_bind(a,&any) && !kernel_socket_bind(b,&any));
     CHECK(!kernel_socket_set_option(b,KERNEL_SOCKET_IPV4_MULTICAST_ALL,0));
     ip4_addr_t group={lwip_htonl(0xef010203)};
-    inject_ipv4_group(n,&group);
+    inject_ipv4_group(n,&group,19300,0);
     CHECK(!a->rx_bytes && !b->rx_bytes);
     heap_fail_after=1;
     CHECK(kernel_socket_ipv4_membership(a,group.addr,0,index,0)==-KERNEL_ENOBUFS);
@@ -4794,11 +4859,16 @@ static void ipv4_igmp(void)
     CHECK(captured_size>=message+8 && captured[message]==0x16 &&
         !memcmp(captured+message+4,&group.addr,4));
     CHECK(igmp_lookfor_group(n,&group)->use==1);
-    inject_ipv4_group(n,&group);
+    unsigned checksum_errors=STATS_GET(udp.chkerr);
+    inject_ipv4_group(n,&group,19316,1); /* Same bucket, no matching local port. */
+    CHECK(STATS_GET(udp.chkerr)==checksum_errors && !a->rx_bytes && !b->rx_bytes);
+    inject_ipv4_group(n,&group,19300,1);
+    CHECK(STATS_GET(udp.chkerr)==checksum_errors+1 && !a->rx_bytes && !b->rx_bytes);
+    inject_ipv4_group(n,&group,19300,0);
     CHECK(a->rx_bytes==4 && !b->rx_bytes);
     raw_drain(a);
     CHECK(!kernel_socket_ipv4_membership(b,group.addr,local.addr,0,0));
-    inject_ipv4_group(n,&group);
+    inject_ipv4_group(n,&group,19300,0);
     CHECK(a->rx_bytes==4 && b->rx_bytes==4 &&
         a->packets_head->payload==b->packets_head->payload &&
         a->packets_head->payload->ref==2);
@@ -5003,7 +5073,17 @@ static void ipv6_mld(void)
     CHECK(!kernel_socket_set_ipv6_multicast_interface(d,d->bound_device));
     CHECK(!kernel_socket_set_ipv6_multicast_interface(d,0));
     ipv6_inject_protocol(n,&peer,&group,body,sizeof(body),17,2);CHECK(!c->rx_bytes && !d->rx_bytes);raw_drain(a);raw_drain(b);tcp_more_service();
-    body[1]++;ipv6_inject_protocol(n,&peer,&group,body,sizeof(body),17,2);CHECK(c->rx_bytes==16 && !d->rx_bytes);
+    /* A port collision leaves the connected target behind another PCB.
+     * Multicast delivery does not promote it in the unicast lookup order. */
+    struct udp_pcb *other_port=udp_new_ip_type(IPADDR_TYPE_V6);
+    CHECK(other_port && udp_bind(other_port,IP6_ADDR_ANY,19316)==ERR_OK);
+    CHECK(other_port->next==c->udp);
+    unsigned checksum_errors=STATS_GET(udp.chkerr);
+    body[1]++;ipv6_inject_protocol(n,&peer,&group,body,sizeof(body),17,1);
+    CHECK(STATS_GET(udp.chkerr)==checksum_errors+1 && !c->rx_bytes && other_port->next==c->udp);
+    ipv6_inject_protocol(n,&peer,&group,body,sizeof(body),17,2);
+    CHECK(c->rx_bytes==16 && !d->rx_bytes && other_port->next==c->udp);
+    udp_remove(other_port);
     raw_drain(a);raw_drain(b);raw_drain(c);tcp_more_service();kernel_socket_destroy(c);kernel_socket_destroy(d);
     /* Closing one member with a queued shared payload neither drops the other
      * member's data nor leaves the interface subscribed after the last close. */

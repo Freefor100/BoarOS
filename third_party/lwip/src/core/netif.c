@@ -1236,8 +1236,17 @@ netif_loop_output(struct netif *netif, struct pbuf *p)
   LWIP_ASSERT("netif_loop_output: invalid netif", netif != NULL);
   LWIP_ASSERT("netif_loop_output: invalid pbuf", p != NULL);
 
-  /* TCP RX owns its headers and descriptors; immutable TX payload may outlive ACK. */
-  r = loopback_clone(netif, p);
+  /* Only a socket UDP send to lo may give up its private, complete pbuf.
+   * The IP owner prevents netif_poll_budget from removing it during send. */
+#if BOAROS_LWIP_LINUX_LOOPBACK && LWIP_HAVE_LOOPIF && !LWIP_NETIF_LOOPBACK_MULTITHREADING
+  int adopt = netif == &loop_netif && p->boaros_udp_loopback == BOAROS_UDP_LOOPBACK_TRANSFER;
+  LWIP_ASSERT("private socket UDP payload", !adopt ||
+              (!p->next && p->ref == 1 && p->storage_refs == 1 &&
+               pbuf_match_type(p, PBUF_RAM) && !(p->flags & PBUF_FLAG_IS_CUSTOM)));
+#else
+  int adopt = 0;
+#endif
+  r = adopt ? p : loopback_clone(netif, p);
   if (r == NULL) {
     LINK_STATS_INC(link.memerr);
     LINK_STATS_INC(link.drop);
@@ -1249,7 +1258,9 @@ netif_loop_output(struct netif *netif, struct pbuf *p)
   /* check for overflow or too many pbuf on queue */
   if (((netif->loop_cnt_current + clen) < netif->loop_cnt_current) ||
       ((netif->loop_cnt_current + clen) > LWIP_MIN(LWIP_LOOPBACK_MAX_PBUFS, 0xFFFF))) {
-    pbuf_free(r);
+    if (!adopt) {
+      pbuf_free(r);
+    }
     LINK_STATS_INC(link.memerr);
     LINK_STATS_INC(link.drop);
     MIB2_STATS_NETIF_INC(stats_if, ifoutdiscards);
@@ -1270,6 +1281,12 @@ netif_loop_output(struct netif *netif, struct pbuf *p)
   LWIP_HOOK_NETIF_LOOPBACK_PUBLISH(netif);
 #endif
   SYS_ARCH_PROTECT(lev);
+#if BOAROS_LWIP_LINUX_LOOPBACK && LWIP_HAVE_LOOPIF && !LWIP_NETIF_LOOPBACK_MULTITHREADING
+  if (adopt) {
+    p->flags = 0;
+    p->boaros_udp_loopback = BOAROS_UDP_LOOPBACK_QUEUED;
+  }
+#endif
   if (netif->loop_first != NULL) {
     LWIP_ASSERT("if first != NULL, last must also be != NULL", netif->loop_last != NULL);
     netif->loop_last->next = r;

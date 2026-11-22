@@ -186,7 +186,7 @@ static int udp_capacity_after(unsigned loaned, unsigned loans, unsigned pbufs)
 static int udp_capacity(void *context)
 {
     struct kernel_network *n = context;
-    return udp_capacity_after(virtio_net_get_progress(n->device).loaned, 0, 0);
+    return udp_capacity_after(virtio_net_loan_count(n->device), 0, 0);
 }
 static struct kernel_wait_queue *progress(struct kernel_network *n)
 { return n->device ? &n->device->progress : &n->progress; }
@@ -251,9 +251,8 @@ static void timer_worker(void *context)
         arch_interrupt_restore(irq);
     }
 }
-static void input_frame(struct kernel_network *n, struct virtio_net_frame *frame)
+static void input_frame_owned(struct kernel_network *n, const struct virtio_net_frame *frame)
 {
-    struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
     const unsigned char *data = frame->data;
     kernel_socket_packet_ethernet(&n->interface,NULL,data,(uint16_t)frame->size,0);
     int budgeted = (frame->size >= 34 && data[12] == 8 && data[13] == 0 && data[23] == 17) ||
@@ -263,12 +262,16 @@ static void input_frame(struct kernel_network *n, struct virtio_net_frame *frame
          data[20] != 6 && data[20] != 58);
     int address_ok = frame->size >= 14 &&
         ((!memcmp(data, n->device->mac, 6)) || (data[0] & 1));
-    /* 预算检查包含即将持有的版本，不能先吃掉控制余量再等待完整重组。 */
-    unsigned loaned = virtio_net_get_progress(n->device).loaned;
-    unsigned loans = loaned < 32 ? 1 : 0;
-    unsigned pool = loans ? 0 : (frame->size + PBUF_POOL_BUFSIZE - 1) / PBUF_POOL_BUFSIZE;
-    if (!address_ok || (frame->size>=14 && data[12]==0x86 && data[13]==0xdd && n->interface.mtu<1280) ||
-        (budgeted && !udp_capacity_after(loaned, loans, pool))) goto dropped;
+    if (!address_ok || (data[12]==0x86 && data[13]==0xdd && n->interface.mtu<1280))
+        goto dropped;
+    if (budgeted) {
+        /* Only this receive scope can add loans. Concurrent returns can
+         * make this budget estimate conservative and need no device lock. */
+        unsigned loaned = virtio_net_loan_count(n->device);
+        unsigned loans = loaned < 32 ? 1 : 0;
+        unsigned pool = loans ? 0 : (frame->size + PBUF_POOL_BUFSIZE - 1) / PBUF_POOL_BUFSIZE;
+        if (!udp_capacity_after(loaned, loans, pool)) goto dropped;
+    }
     struct pbuf *p;
     if (!virtio_net_lend(n->device, frame->buffer)) {
         struct network_rx *rx = &n->rx[frame->buffer];
@@ -288,36 +291,40 @@ static void input_frame(struct kernel_network *n, struct virtio_net_frame *frame
 #endif
     /* 成功input消耗或接纳pbuf；失败才由当前接收请求释放。 */
     if (n->interface.input(p, &n->interface) != ERR_OK) pbuf_free(p);
-    kernel_socket_protocol_leave(&irq);
     return;
 dropped:
     n->device->statistics.drops++;
     virtio_net_release(n->device, frame->buffer);
-    kernel_socket_protocol_leave(&irq);
 }
 /* A caller with the network protocol scope may consume the receive FIFO. */
 static unsigned receive_inline(void *context)
 {
     struct kernel_network *n = context;
-    struct virtio_net_frame frame;
+    struct virtio_net_frame frames[KERNEL_NETWORK_RECEIVE_BATCH];
     unsigned count = 0;
     int serial = !boaros_lwip_parallel_enabled();
     int batching = 0;
-    while (count < KERNEL_NETWORK_RECEIVE_BATCH && virtio_net_receive(n->device, &frame)) {
-        if (serial && !batching && frame.more_ready) {
+    while (count < KERNEL_NETWORK_RECEIVE_BATCH) {
+        unsigned ready = virtio_net_receive_batch(n->device, frames,
+            KERNEL_NETWORK_RECEIVE_BATCH - count);
+        if (!ready) break;
+        if (serial && !batching && frames[0].more_ready) {
             boaros_lwip_tcp_ack_batch_begin();
             batching = 1;
         }
-        const unsigned char *data = frame.data;
-        /* Flush before other link or network traffic. TCP verifies the
-         * checksum, ingress filter, tuple and each advancing sequence. */
-        if (batching && (frame.size < 54 || data[12] != 8 || data[13] || data[14] != 0x45 ||
-                         data[16] || data[17] != 40 || (data[20] & 0x3f) || data[21] ||
-                         data[23] != 6 || data[46] != 0x50 || data[47] != 0x10))
-            boaros_lwip_tcp_ack_batch_flush();
-        input_frame(n, &frame);
-        count++;
-        if (batching && !frame.more_ready) {
+        for (unsigned i = 0; i < ready; i++) {
+            const struct virtio_net_frame *frame = &frames[i];
+            const unsigned char *data = frame->data;
+            /* Flush before other link or network traffic. TCP verifies the
+             * checksum, ingress filter, tuple and each advancing sequence. */
+            if (batching && (frame->size < 54 || data[12] != 8 || data[13] || data[14] != 0x45 ||
+                             data[16] || data[17] != 40 || (data[20] & 0x3f) || data[21] ||
+                             data[23] != 6 || data[46] != 0x50 || data[47] != 0x10))
+                boaros_lwip_tcp_ack_batch_flush();
+            input_frame_owned(n, frame);
+        }
+        count += ready;
+        if (batching && !frames[ready-1].more_ready) {
             boaros_lwip_tcp_ack_batch_end();
             batching = 0;
         }

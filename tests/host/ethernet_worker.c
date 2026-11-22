@@ -32,8 +32,10 @@ int virtio_net_service(struct virtio_net_device *d)
     return 0;
 }
 int virtio_net_poll_service(struct virtio_net_device *d) { return virtio_net_service(d); }
-int virtio_net_receive(struct virtio_net_device *d, struct virtio_net_frame *f)
-{ (void)d; (void)f; return 0; }
+unsigned virtio_net_receive_batch(struct virtio_net_device *d,
+    struct virtio_net_frame *frames, unsigned capacity)
+{ (void)d; (void)frames; (void)capacity; return 0; }
+unsigned virtio_net_loan_count(const struct virtio_net_device *d) { return d->loaned; }
 static unsigned protocol_held, ack_batch_active;
 void boaros_lwip_tcp_ack_batch_begin(void)
 { if (!protocol_held || ack_batch_active) abort(); ack_batch_active = 1; }
@@ -167,23 +169,26 @@ static int receive_contract(void)
     struct virtio_net_frame frame = {.data = bytes, .size = sizeof(bytes), .buffer = 0};
     owner.interface.input = receive_input;
     lwip_stats.memp[MEMP_PBUF_POOL] = &pool_stats;
-    input_frame(&owner, &frame);
+    struct kernel_socket_protocol_scope scope;
+    kernel_socket_protocol_enter(&scope);
+    input_frame_owned(&owner, &frame);
     if (received->payload != bytes || copied || released || owner.device->loaned != 1) return 1;
     received->ref++; if (pbuf_free(received) || released) return 1;
     if (!pbuf_free(received) || released != 1 || owner.device->loaned) return 1;
     owner.device->loaned = 32; released = 0;
-    input_frame(&owner, &frame);
+    input_frame_owned(&owner, &frame);
     if (received->payload == bytes || copied != sizeof(bytes) || released != 1 ||
         memcmp(received->payload, bytes, sizeof(bytes)) || owner.device->loaned != 32) return 1;
     if (!pbuf_free(received) || pool_stats.used) return 1;
-    allocation_fail = 1; input_frame(&owner, &frame);
+    allocation_fail = 1; input_frame_owned(&owner, &frame);
     if (released != 2 || owner.device->statistics.drops != 1) return 1;
     allocation_fail = 0; pool_stats.used = PBUF_POOL_SIZE - 16;
-    input_frame(&owner, &frame);
+    input_frame_owned(&owner, &frame);
     if (released != 3 || owner.device->statistics.drops != 2 || copied != sizeof(bytes)) return 1;
     pool_stats.used = 0; owner.device->loaned = 0; input_result = ERR_IF;
-    input_frame(&owner, &frame);
+    input_frame_owned(&owner, &frame);
     if (released != 4 || owner.device->loaned) return 1;
+    kernel_socket_protocol_leave(&scope);
     printf("PASS same RX input: loan copies=0 fallback copies=%u; final reference, OOM, reserve and input error balanced\n", copied);
     return 0;
 }
