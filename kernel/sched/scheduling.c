@@ -1121,7 +1121,8 @@ static uint64_t event_deadline_locked(struct kernel_cpu *cpu,uint64_t deadline)
     return deadline;
 }
 
-uint64_t scheduler_deadline_locked(struct kernel_cpu *cpu)
+#define READY_WAIT_DELAY_UNKNOWN UINT64_MAX
+static uint64_t scheduler_deadline_with_wait_locked(struct kernel_cpu *cpu,uint64_t waiting)
 {
     uint64_t delay = kernel_rt_bandwidth_delay(&cpu->rt_bandwidth,
         is_rt(cpu->current),
@@ -1144,16 +1145,19 @@ uint64_t scheduler_deadline_locked(struct kernel_cpu *cpu)
         uint32_t slice=kernel_sched_fair_slice(&cpu->current->scheduling);
         uint32_t used=cpu->current->scheduling.fair_slice_used;
         uint64_t fair=used>=slice?1:slice-used;
-        if (ready_wait_short_queue(cpu_queue(cpu)) && ready_wait_user(cpu->current) &&
-            cpu_queue(cpu)->ready_wait_first[cpu->current->scheduling.nice-KERNEL_SCHED_NICE_MIN]) {
-            struct kernel_sched_node *first=kernel_sched_pick(cpu_queue(cpu),0);
-            struct kernel_task *oldest=ready_wait_head(cpu,first?first->owner:0);
-            if (oldest && oldest->scheduling.nice==cpu->current->scheduling.nice) {
-                uint64_t waiting=ready_wait_delay(cpu,oldest);
-                if (!waiting) waiting=1;
-                if (waiting<fair) fair=waiting;
+        if (waiting==READY_WAIT_DELAY_UNKNOWN) {
+            waiting=0;
+            if (ready_wait_short_queue(cpu_queue(cpu)) && ready_wait_user(cpu->current) &&
+                cpu_queue(cpu)->ready_wait_first[cpu->current->scheduling.nice-KERNEL_SCHED_NICE_MIN]) {
+                struct kernel_sched_node *first=kernel_sched_pick(cpu_queue(cpu),0);
+                struct kernel_task *oldest=ready_wait_head(cpu,first?first->owner:0);
+                if (oldest && oldest->scheduling.nice==cpu->current->scheduling.nice) {
+                    waiting=ready_wait_delay(cpu,oldest);
+                    if (!waiting) waiting=1;
+                }
             }
         }
+        if (waiting && waiting<fair) fair=waiting;
         if(!delay||fair<delay)delay=fair;
     }
 #if BOAROS_USER_SMP
@@ -1174,6 +1178,9 @@ uint64_t scheduler_deadline_locked(struct kernel_cpu *cpu)
     }
     return event_deadline_locked(cpu,deadline);
 }
+
+uint64_t scheduler_deadline_locked(struct kernel_cpu *cpu)
+{ return scheduler_deadline_with_wait_locked(cpu,READY_WAIT_DELAY_UNKNOWN); }
 
 void scheduler_arm_timer(uint64_t deadline)
 {
@@ -1380,7 +1387,10 @@ static int select_local_locked(struct kernel_cpu *cpu,struct kernel_task *curren
         (void)kernel_cpu_consume_schedule(cpu);
         rotate |= cpu->rotate_other;
         cpu->rotate_other=0;
-        int age_due=ready_wait_preempts(cpu,oldest);
+        int age_candidate=oldest && ready_wait_user(current) &&
+            current->scheduling.nice==oldest->scheduling.nice;
+        uint64_t waiting=age_candidate?ready_wait_delay(cpu,oldest):0;
+        int age_due=age_candidate && !waiting;
         int expired=current->scheduling.fair_slice_used>=kernel_sched_fair_slice(&current->scheduling);
         if(expired)current->scheduling.fair_slice_used=0;
         int due=head && current->ready_node.fair.key>=head->fair.key;
@@ -1394,6 +1404,14 @@ static int select_local_locked(struct kernel_cpu *cpu,struct kernel_task *curren
                 current->wait.ready_flags=SCHED_READY_LOCAL;
             }
             *selected=claim_next_locked(cpu,current,next);
+        }
+        if (!*selected) {
+            /* No queue or owner change: reuse the age decision for its timer.
+             * Resetting an expired slice changes the minimum execution time. */
+            if (age_candidate && expired) waiting=ready_wait_delay(cpu,oldest);
+            if (age_candidate && !waiting) waiting=1;
+            *deadline=scheduler_deadline_with_wait_locked(cpu,waiting);
+            return 1;
         }
     }
     *deadline=scheduler_deadline_locked(cpu);
