@@ -21,6 +21,8 @@ EXCLUDED(kernel_open_file_node)
 EXCLUDED(kernel_file_mapping_unregister)
 EXCLUDED(kernel_open_file_release)
 EXCLUDED(kernel_page_cache_alias_detach)
+EXCLUDED(kernel_page_cache_alias_detach_batch)
+EXCLUDED(kernel_page_cache_alias_attach_window)
 #if !defined(BOAROS_MAX_CPUS) || BOAROS_MAX_CPUS == 1
 EXCLUDED(kernel_task_mm_borrow)
 #endif

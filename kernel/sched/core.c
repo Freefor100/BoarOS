@@ -622,11 +622,12 @@ _Static_assert(KERNEL_STACK_ALIAS_PAGES > 1 &&
                    ARCH_KERNEL_STACK_SLOT_SIZE == 3 * BOAROS_PAGE_SIZE &&
                    (ARCH_KERNEL_STACK_WINDOW_BASE / BOAROS_PAGE_SIZE) % KERNEL_STACK_ALIAS_PAGES == 0,
                "stack aliases require an aligned three-page slot geometry");
+/* CPU0 owns the bitmap; reserve and release cannot schedule. */
 static uint64_t kernel_stack_slot_bitmap[KERNEL_STACK_SLOT_WORDS];
 
 static int kernel_stack_slot_acquire(uint64_t stack_address, uint64_t *window_address)
 {
-    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    KERNEL_IRQ_SCOPE(irq);
     /* 线性槽号曾让热栈与ext4对象反复争用QEMU soft-TLB同一槽；
      * 按物理栈页号分散别名。3的模逆元为(N+1)/3，无同色空槽仍用全容量。 */
     uint32_t selected = (uint32_t)(((stack_address / BOAROS_PAGE_SIZE - 1) *
@@ -654,7 +655,7 @@ found:
 
 static void kernel_stack_slot_release(uint64_t window_address)
 {
-    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    KERNEL_IRQ_SCOPE(irq);
     uint32_t index = (uint32_t)((window_address -
                                  ARCH_KERNEL_STACK_WINDOW_BASE) /
                                 ARCH_KERNEL_STACK_SLOT_SIZE);

@@ -62,7 +62,7 @@ void riscv_smp_sync_kernel(uint64_t address, uint64_t size)
 {
     struct kernel_cpu *local = kernel_cpu_current();
     if (local->raw_locks) __builtin_trap();
-    riscv_mmu_flush_all();
+    riscv_mmu_flush_kernel_range(address, size);
     sync_remote(remote_targets(0, 1, 0), address, size, 1, 0, "RFENCE", 0);
 }
 
