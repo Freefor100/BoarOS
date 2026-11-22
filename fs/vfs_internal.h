@@ -25,6 +25,9 @@ int kernel_vfs_path_lookup_object(struct kernel_vfs_path *,const char *,size_t,s
 #include <stdint.h>
 
 #define VFS_PATH_CLOSING (UINT32_C(1)<<31U)
+#define VFS_MS_NOSYMFOLLOW UINT64_C(0x100)
+#define VFS_MOUNT_ATTR_NOSYMFOLLOW UINT64_C(0x200000)
+#define VFS_ST_NOSYMFOLLOW UINT64_C(0x2000)
 #define VFS_ATIME_NONE 1U
 #define VFS_ATIME_STRICT 2U
 #define VFS_ATIME_NODIR 4U

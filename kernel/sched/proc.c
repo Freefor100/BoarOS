@@ -915,6 +915,10 @@ int kernel_proc_fdinfo_snapshot_in(struct kernel_pid_registry *view,kernel_pid_t
     }
     if(file->kind==KERNEL_OPEN_FILE_KIND_BPF)
         return kernel_bpf_fdinfo(file,snapshot->extra,sizeof(snapshot->extra),&snapshot->extra_length);
+    if (file->kind == KERNEL_OPEN_FILE_KIND_INOTIFY) {
+        if (kernel_open_file_acquire(file)) __builtin_trap();
+        snapshot->inotify = file;
+    }
     return 0;
 }
 

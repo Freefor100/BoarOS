@@ -415,10 +415,10 @@ def chroot_output(raw):
     lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('CHROOT ')]
     return lines==[*(f'CHROOT CASE {name} PASS' for name in CHROOT_CASES),f'CHROOT END {len(CHROOT_CASES)}']
 
-MOUNT_ATTR_CASES=('new-mount-flags-statfs-mounts','atime-tmpfs-views-and-directories','atime-ext4-views-and-directories','noatime-ofd-alias-flags-and-permission', 'exec-script-format-writer-order', 'elf-interpreter-final-mount', 'symlinks-and-child-use-final-mount', 'access-directory-empty-fd-and-privilege', 'nodev-special-types-path-only-and-aliases', 'nodev-block-mount-source-and-type-order', 'mmap-noexec-mprotect-fork-remap-and-fixed-content', 'mmap-fd-rights-validation-and-no-mmap-order', 'overmount-proc-dirfd-and-prior-fd-rights', 'prior-pty-master-peer-path-and-io','mapping-owner-survives-close-and-fork-until-release')
+MOUNT_ATTR_CASES=('new-mount-flags-statfs-mounts','atime-tmpfs-views-and-directories','atime-ext4-views-and-directories','noatime-ofd-alias-flags-and-permission', 'nosymfollow-view-lookup-remount-recursive-and-fsmount', 'exec-script-format-writer-order', 'elf-interpreter-final-mount', 'symlinks-and-child-use-final-mount', 'access-directory-empty-fd-and-privilege', 'nodev-special-types-path-only-and-aliases', 'nodev-block-mount-source-and-type-order', 'mmap-noexec-mprotect-fork-remap-and-fixed-content', 'mmap-fd-rights-validation-and-no-mmap-order', 'overmount-proc-dirfd-and-prior-fd-rights', 'prior-pty-master-peer-path-and-io','mapping-owner-survives-close-and-fork-until-release')
 def mount_attributes_output(raw):
     lines=[line for line in raw.replace('\r','').splitlines() if line.startswith('MOUNT-ATTR ')]
-    return lines==[*(f'MOUNT-ATTR CASE {name} PASS' for name in MOUNT_ATTR_CASES),'MOUNT-ATTR END 15']
+    return lines==[*(f'MOUNT-ATTR CASE {name} PASS' for name in MOUNT_ATTR_CASES),f'MOUNT-ATTR END {len(MOUNT_ATTR_CASES)}']
 
 SHM_QUERY_CASES=('namespace-limits-and-empty','allocated-pages-and-highest-index',
     'slot-descriptor-and-generation','permission-and-stat-any','resident-shared-pages',

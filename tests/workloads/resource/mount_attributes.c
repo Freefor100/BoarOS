@@ -10,7 +10,6 @@
 #include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
-#include <sys/reboot.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
@@ -345,6 +344,98 @@ static void noatime_ofd(void)
     }joined(child,0);CHECK(!close(alias)&&!close(fd)&&!unlink("/ma/base/noatime")&&!unlink("/ma/base/owned"));
     pass("noatime-ofd-alias-flags-and-permission");
 }
+
+enum { nofollow_mount = 256, nofollow_attr = 0x200000, nofollow_stat = 0x2000 };
+
+static void expect_nofollow(const char *path, int blocked)
+{
+    struct statfs stat;
+    int fd = open(path, O_PATH | O_DIRECTORY);
+    CHECK(fd >= 0 && !fstatfs(fd, &stat) && !!(stat.f_flags & nofollow_stat) == blocked);
+    CHECK(!statfs(path, &stat) && !!(stat.f_flags & nofollow_stat) == blocked && !close(fd));
+}
+
+static void expect_nofollow_option(const char *table, const char *path)
+{
+    FILE *file = fopen(table, "r");
+    CHECK(file);
+    char *line = NULL;
+    size_t capacity = 0;
+    int found = 0;
+    while (getline(&line, &capacity, file) > 0) {
+        char target[256], options[256];
+        const char *format = strstr(table, "mountinfo") ?
+            "%*s %*s %*s %*s %255s %255s" : "%*s %255s %*s %255s";
+        if (sscanf(line, format, target, options) != 2 || strcmp(target, path)) continue;
+        char *save;
+        for (char *word = strtok_r(options, ",", &save); word; word = strtok_r(NULL, ",", &save))
+            if (!strcmp(word, "nosymfollow")) found++;
+    }
+    free(line);
+    CHECK(!fclose(file) && found == 1);
+}
+
+static void nosymfollow(void)
+{
+    directory("/ma/links");
+    CHECK(!mount("tmpfs", "/ma/links", "tmpfs", nofollow_mount, NULL));
+    directory("/ma/links/sub");
+    text_file("/ma/links/sub/item", "ok");
+    CHECK(!symlink("sub", "/ma/links/dirlink") && !symlink("sub/item", "/ma/links/filelink"));
+    CHECK(!symlink("/ma/links/sub/item", "/ma/into-links"));
+    ERROR(open("/ma/links/dirlink/item", O_RDONLY), ELOOP);
+    ERROR(open("/ma/links/filelink", O_RDONLY), ELOOP);
+    int fd = open("/ma/into-links", O_RDONLY);
+    CHECK(fd >= 0 && !close(fd));
+    char target[16];
+    CHECK(readlink("/ma/links/filelink", target, sizeof(target)) == 8 && !memcmp(target, "sub/item", 8));
+    struct stat st;
+    fd = open("/ma/links/filelink", O_PATH | O_NOFOLLOW);
+    CHECK(fd >= 0 && !fstat(fd, &st) && S_ISLNK(st.st_mode) && !close(fd));
+    expect_nofollow("/ma/links", 1);
+    expect_nofollow_option("/ma/proc/self/mounts", "/ma/links");
+    expect_nofollow_option("/ma/proc/self/mountinfo", "/ma/links");
+
+    CHECK(!mount("/ma/links", "/ma/peer", NULL, MS_BIND, NULL));
+    ERROR(open("/ma/peer/filelink", O_RDONLY), ELOOP);
+    CHECK(!mount(NULL, "/ma/peer", NULL, MS_BIND | MS_REMOUNT, NULL));
+    expect_nofollow("/ma/peer", 0);
+    fd = open("/ma/peer/dirlink/item", O_RDONLY);
+    CHECK(fd >= 0 && !close(fd));
+    ERROR(open("/ma/links/filelink", O_RDONLY), ELOOP);
+
+    directory("/ma/links/inner");
+    CHECK(!mount("tmpfs", "/ma/links/inner", "tmpfs", 0, NULL));
+    text_file("/ma/links/inner/item", "ok");
+    CHECK(!symlink("item", "/ma/links/inner/link"));
+    fd = open("/ma/links/inner/link", O_RDONLY);
+    CHECK(fd >= 0 && !close(fd));
+    struct { uint64_t set, clear, propagation, userns; } attr = {nofollow_attr, 0, 0, 0};
+    CHECK(!syscall(442, AT_FDCWD, "/ma/links", 0x8000U, &attr, sizeof(attr)));
+    expect_nofollow("/ma/links/inner", 1);
+    ERROR(open("/ma/links/inner/link", O_RDONLY), ELOOP);
+    attr.set = 0;
+    attr.clear = nofollow_attr;
+    CHECK(!syscall(442, AT_FDCWD, "/ma/links", 0, &attr, sizeof(attr)));
+    expect_nofollow("/ma/links", 0);
+    ERROR(open("/ma/links/inner/link", O_RDONLY), ELOOP);
+    CHECK(!syscall(442, AT_FDCWD, "/ma/links", 0x8000U, &attr, sizeof(attr)));
+    expect_nofollow("/ma/links/inner", 0);
+    fd = open("/ma/links/inner/link", O_RDONLY);
+    CHECK(fd >= 0 && !close(fd));
+    CHECK(!mount(NULL, "/ma/links", NULL, MS_REMOUNT | nofollow_mount, NULL));
+    ERROR(open("/ma/links/filelink", O_RDONLY), ELOOP);
+    expect_nofollow("/ma/peer", 0);
+    CHECK(!umount("/ma/links/inner") && !umount("/ma/links") && !umount("/ma/peer"));
+
+    int context = (int)syscall(430, "tmpfs", 0);
+    CHECK(context >= 0 && !syscall(431, context, 6, NULL, NULL, 0));
+    int mount_fd = (int)syscall(432, context, 0, nofollow_attr);
+    CHECK(mount_fd >= 0 && !syscall(429, mount_fd, "", AT_FDCWD, "/ma/peer", 4));
+    expect_nofollow("/ma/peer", 1);
+    CHECK(!close(mount_fd) && !close(context) && !umount("/ma/peer"));
+    pass("nosymfollow-view-lookup-remount-recursive-and-fsmount");
+}
 int main(int argc,char **argv)
 {
     if(argc>1&&!strcmp(argv[1],"--exec-ok"))return 42;
@@ -354,8 +445,8 @@ int main(int argc,char **argv)
 #ifndef MOUNT_ATIME_ONLY
 #define MOUNT_ATIME_ONLY 0
 #endif
-    if (!MOUNT_ATIME_ONLY) {execution();interpreter();links_and_children();access_cases();device_cases();mount_source();
+    if (!MOUNT_ATIME_ONLY) {nosymfollow();execution();interpreter();links_and_children();access_cases();device_cases();mount_source();
     mapping_cases();mapping_errors();old_fd_mounts();pty_peer();mapping_lifetime();}
     CHECK(!umount("/ma/devpts")&&!umount("/ma/proc")&&!umount("/ma/deny")&&!umount("/ma"));
-    printf("MOUNT-ATTR END %u\n",cases);if(getpid()==1){sync();reboot(RB_POWER_OFF);}return 0;
+    printf("MOUNT-ATTR END %u\n",cases);return 0;
 }

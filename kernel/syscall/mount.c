@@ -109,7 +109,7 @@ static __attribute__((noinline)) int mount_filesystem(struct kernel_mm *mm, cons
               fs_paths.root, target, 1, &covered);
     if (result) goto Finish;
     if(!kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN)) {result=-KERNEL_EPERM;goto Finish;}
-    if(flags & ~(LINUX_MS_RDONLY|LINUX_MS_NOSUID|LINUX_MS_NODEV|LINUX_MS_NOEXEC|LINUX_MS_SILENT|LINUX_MS_REMOUNT|LINUX_MS_BIND|LINUX_MS_MOVE|LINUX_MS_REC|UINT64_C(1966080)|UINT64_C(1024)|2048U|2097152U|16777216U)) {result=-KERNEL_ENOTSUP;goto Finish;}
+    if(flags & ~(LINUX_MS_RDONLY|LINUX_MS_NOSUID|LINUX_MS_NODEV|LINUX_MS_NOEXEC|VFS_MS_NOSYMFOLLOW|LINUX_MS_SILENT|LINUX_MS_REMOUNT|LINUX_MS_BIND|LINUX_MS_MOVE|LINUX_MS_REC|UINT64_C(1966080)|UINT64_C(1024)|2048U|2097152U|16777216U)) {result=-KERNEL_ENOTSUP;goto Finish;}
     if (!(flags & (LINUX_MS_BIND | LINUX_MS_MOVE | LINUX_MS_REMOUNT)) && !strcmp(type, "devtmpfs")) {
         result = kernel_loop_initialize(fs->heap);
         if (result) goto Finish;
@@ -204,7 +204,7 @@ static __attribute__((noinline)) int unmount_filesystem(struct kernel_mm *mm,
     }
     if (!flags && mount==kernel_vfs_path_mount(fs_paths.root)) {
         uint64_t flags=1U|(mount->nosuid?2U:0U)|(mount->nodev?4U:0U)|
-            (mount->noexec?8U:0U)|(mount->silent?32768U:0U);
+            (mount->noexec?8U:0U)|(mount->nosymfollow?VFS_MS_NOSYMFOLLOW:0U)|(mount->silent?32768U:0U);
         result=kernel_vfs_remount(root,flags,NULL);
         goto Finish;
     }
@@ -269,12 +269,12 @@ static __attribute__((noinline)) int import_mount_attributes(struct kernel_mm *m
         offset+=bytes;
     }
 
-    if((attr->set|attr->clear)&~UINT64_C(0x3000ff))return -KERNEL_EINVAL;
+    if((attr->set|attr->clear)&~(UINT64_C(0x1000ff)|VFS_MOUNT_ATTR_NOSYMFOLLOW))return -KERNEL_EINVAL;
     if(attr->propagation&~UINT64_C(1966080) || (attr->propagation&(attr->propagation-1)))return -KERNEL_EINVAL;
     if((attr->clear&0x70U) && (attr->clear&0x70U)!=0x70U)return -KERNEL_EINVAL;
     if((attr->set&0x70U) && !(attr->clear&0x70U))return -KERNEL_EINVAL;
     if((attr->set&0x70U)!=0 && (attr->set&0x70U)!=0x10U && (attr->set&0x70U)!=0x20U)return -KERNEL_EINVAL;
-    if((attr->set|attr->clear)&0x300000U)return -KERNEL_EOPNOTSUPP;
+    if((attr->set|attr->clear)&0x100000U)return -KERNEL_EOPNOTSUPP;
     return 0;
 }
 struct mount_api_context {
@@ -457,8 +457,7 @@ static __attribute__((noinline)) int filesystem_api(struct kernel_task *caller,s
         if(flags&~3U)return -KERNEL_EINVAL;
         if(!kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN))return -KERNEL_EPERM;
         unsigned attrs=(unsigned)request->arguments[2];
-        if(attrs&~0x2000ffU)return -KERNEL_EINVAL;
-        if(attrs&0x200000U)return -KERNEL_EOPNOTSUPP;
+        if(attrs&~(0xffU|VFS_MOUNT_ATTR_NOSYMFOLLOW))return -KERNEL_EINVAL;
         if((attrs&0x70U)!=0 && (attrs&0x70U)!=0x10U && (attrs&0x70U)!=0x20U)return -KERNEL_EINVAL;
         KERNEL_FILES_PIN_SCOPE(pin);
         struct kernel_open_file_description *file=kernel_files_hold_fd(files,(int32_t)request->arguments[0],&pin);

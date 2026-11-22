@@ -66,6 +66,7 @@ struct kernel_vfs_mount {
     struct kernel_vfs_mount *instance_next, **instance_previous;
     struct kernel_vfs_mount *namespace_retirement_next;
     uint8_t atime_policy; /* 0=relatime; NOATIME/STRICT/NODIR are per-view. */
+    uint8_t nosymfollow;
     uint8_t unbindable,namespace_retiring,propagation_staged,detached_tree,external_owner;
     uint8_t paths_closing;
     uint32_t expiry_mark;

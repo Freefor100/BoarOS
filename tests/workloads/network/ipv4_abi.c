@@ -309,11 +309,67 @@ static void permissions(void)
     puts("IPV4 ABI PASS permissions");
 }
 
+static void tcp_message_options(void)
+{
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(listener >= 0 && integer(listener, SOL_SOCKET, SO_OOBINLINE) == 0);
+    int option = 1;
+    CHECK(!opt_set(listener, SOL_SOCKET, SO_OOBINLINE, &option, sizeof(option)));
+    CHECK(integer(listener, SOL_SOCKET, SO_OOBINLINE) == 1);
+    socklen_t size = sizeof(option);
+    ERROR(opt_get(listener, SOL_SOCKET, SO_OOBINLINE, NULL, &size), EFAULT);
+    ERROR(opt_get(listener, 500, SO_OOBINLINE, &option, NULL), EOPNOTSUPP);
+    ERROR(opt_get(listener, IPPROTO_UDP, SO_OOBINLINE, &option, &size), EOPNOTSUPP);
+    ERROR(opt_get(listener, IPPROTO_IP, -1, &option, &size), ENOPROTOOPT);
+
+    struct sockaddr_in address = {.sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    size = sizeof(address);
+    CHECK(!bind(listener, (struct sockaddr *)&address, size) && !listen(listener, 1));
+    CHECK(!getsockname(listener, (struct sockaddr *)&address, &size));
+    int sender = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(sender >= 0 && !connect(sender, (struct sockaddr *)&address, size));
+    int receiver = accept(listener, NULL, NULL);
+    CHECK(receiver >= 0 && integer(receiver, SOL_SOCKET, SO_OOBINLINE) == 1);
+
+    char byte = 'x';
+    struct iovec data = {&byte, 1};
+    struct msghdr message = {.msg_iov = &data, .msg_iovlen = 1,
+        .msg_name = &address, .msg_namelen = (socklen_t)-1};
+    ERROR(recvmsg(receiver, &message, MSG_OOB), EINVAL);
+    message.msg_name = NULL;
+    message.msg_namelen = 0;
+    ERROR(recvmsg(receiver, &message, MSG_OOB), EINVAL);
+    ERROR(recvmsg(listener, &message, MSG_OOB), ENOTCONN);
+    ERROR(recvmsg(receiver, &message, MSG_ERRQUEUE), EAGAIN);
+    union {
+        struct cmsghdr alignment;
+        unsigned char bytes[CMSG_SPACE(sizeof(int))];
+    } control = {0};
+    message.msg_control = control.bytes;
+    message.msg_controllen = sizeof(control.bytes);
+    struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+    header->cmsg_level = SOL_SOCKET;
+    header->cmsg_type = SCM_RIGHTS;
+    header->cmsg_len = CMSG_LEN(sizeof(int)) - sizeof(struct cmsghdr);
+    ERROR(sendmsg(sender, &message, 0), EINVAL);
+    header->cmsg_len = CMSG_LEN(sizeof(int));
+    int ignored_descriptor = -1;
+    memcpy(CMSG_DATA(header), &ignored_descriptor, sizeof(ignored_descriptor));
+    CHECK(sendmsg(sender, &message, 0) == 1);
+    byte = 0;
+    memset(control.bytes, 0, sizeof(control.bytes));
+    CHECK(recvmsg(receiver, &message, 0) == 1 && byte == 'x' && !message.msg_controllen);
+    CHECK(!close(receiver) && !close(sender) && !close(listener));
+    puts("IPV4 ABI PASS tcp-message-options");
+}
+
 int main(void)
 {
     page_size = (size_t)sysconf(_SC_PAGESIZE); CHECK(page_size >= 4096);
     loopback_up();
     scalar_options();
+    tcp_message_options();
     device_options();
     multicast_interface();
     raw_boundaries();

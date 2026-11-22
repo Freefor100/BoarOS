@@ -169,6 +169,27 @@ int kernel_socket_control_parse(struct kernel_socket_call *call,uint64_t length)
     return 0;
 }
 
+/* TCP accepts the text alongside UNIX control headers without exporting them.
+ * This also keeps descriptor lookup and Unix credential checks out of TCP. */
+int kernel_socket_control_parse_tcp(struct kernel_socket_call *call, uint64_t length)
+{
+    for (uint64_t offset = 0; length - offset >= sizeof(struct control_header);) {
+        struct control_header header;
+        memcpy(&header, (unsigned char *)call->import + offset, sizeof(header));
+        if (header.length < sizeof(header) || header.length > length - offset)
+            return -KERNEL_EINVAL;
+        if (header.level == SOL_SOCKET && header.type != SCM_RIGHTS &&
+                header.type != SCM_CREDENTIALS)
+            return -KERNEL_EOPNOTSUPP;
+        uint64_t step = (header.length + 7U) & ~UINT64_C(7);
+        if (step > length - offset) break;
+        offset += step;
+    }
+    kernel_heap_release(call->heap, call->import);
+    call->import = NULL;
+    return 0;
+}
+
 static int copy_output(struct kernel_mm *mm,uint64_t address,const void *data,size_t length)
 {
     size_t copied=0;

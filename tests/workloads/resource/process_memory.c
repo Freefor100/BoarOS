@@ -32,6 +32,72 @@ static void permissions(void)
     }
     joined(helper);puts("PROCESS_MEMORY CASE realcreds-dumpable-denial PASS");
 }
+static void mapping_permissions(const unsigned char *address, const char *expected)
+{
+    FILE *maps = fopen("/proc/self/maps", "r");
+    CHECK(maps);
+    char line[512], mode[5];
+    unsigned long begin, end;
+    while (fgets(line, sizeof(line), maps)) {
+        if (sscanf(line, "%lx-%lx %4s", &begin, &end, mode) == 3 &&
+                (uintptr_t)address >= begin && (uintptr_t)address < end) {
+            if (strcmp(mode, expected)) {
+                dprintf(2, "map permissions %s, expected %s\n", mode, expected);
+                CHECK(0);
+            }
+            CHECK(!fclose(maps));
+            return;
+        }
+    }
+    CHECK(0);
+}
+
+static void write_only_mapping(void)
+{
+#ifdef __riscv
+    const char *private_mode = "rw-p", *shared_mode = "rw-s";
+#else
+    const char *private_mode = "-w-p", *shared_mode = "-w-s";
+#endif
+    unsigned char *data = mmap(NULL, page * 2, PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(data != MAP_FAILED);
+    mapping_permissions(data, private_mode);
+    CHECK(*(volatile unsigned char *)data == 0);
+    *(volatile unsigned char *)data = 39;
+    CHECK(*(volatile unsigned char *)data == 39);
+    CHECK(!mprotect(data, page, PROT_READ | PROT_WRITE));
+    mapping_permissions(data, "rw-p");
+    mapping_permissions(data + page, private_mode);
+    CHECK(!mprotect(data, page, PROT_WRITE));
+    mapping_permissions(data, private_mode);
+
+    pid_t child = fork();
+    CHECK(child >= 0);
+    if (!child) {
+        mapping_permissions(data, private_mode);
+        CHECK(*(volatile unsigned char *)data == 39);
+        *(volatile unsigned char *)data = 83;
+        CHECK(*(volatile unsigned char *)data == 83);
+        _exit(0);
+    }
+    joined(child);
+    CHECK(*(volatile unsigned char *)data == 39 && !munmap(data, page * 2));
+
+    char name[] = "/tmp/write-only-map-XXXXXX";
+    int fd = mkstemp(name);
+    CHECK(fd >= 0 && !unlink(name) && !ftruncate(fd, page));
+    data = mmap(NULL, page, PROT_WRITE, MAP_SHARED, fd, 0);
+    CHECK(data != MAP_FAILED);
+    mapping_permissions(data, shared_mode);
+    CHECK(*(volatile unsigned char *)data == 0);
+    *(volatile unsigned char *)data = 71;
+    CHECK(!msync(data, page, MS_SYNC));
+    CHECK(*(volatile unsigned char *)data == 71);
+    CHECK(!munmap(data, page) && !close(fd));
+    puts("PROCESS_MEMORY CASE logical-write-only-permissions PASS");
+}
+
 static void replaced_mm(const char *program)
 {
     int to[2],from[2];CHECK(!pipe(to)&&!pipe(from));pid_t c=fork();CHECK(c>=0);
@@ -87,6 +153,6 @@ int main(int argc,char **argv)
     ERROR(process_vm_readv(c,&local,1,&remote,1,0),ESRCH);
     CHECK(!close(to[0])&&!close(to[1])&&!close(from[0])&&!close(from[1])&&!munmap(p,3*page));
     puts("PROCESS_MEMORY CASE child-cow-exit PASS");
-    permissions();replaced_mm(argv[0]);
+    permissions();write_only_mapping();replaced_mm(argv[0]);
     puts("PROCESS_MEMORY PASS");return 0;
 }

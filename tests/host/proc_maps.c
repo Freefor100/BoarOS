@@ -101,7 +101,11 @@ int kernel_proc_fdinfo_snapshot_in(struct kernel_pid_registry *view,kernel_pid_t
         .inode=7,.pidfd=1,.pid=fdinfo_pid};
     return 0;
 }
-
+int kernel_inotify_fdinfo(const struct kernel_open_file_description *file, struct kernel_heap *heap,
+    char **buffer, size_t *length)
+{
+    (void)file; (void)heap; (void)buffer; (void)length; abort();
+}
 /* Directory adapter fixture: query semantics are exercised separately against
  * production scheduler identities by proc_index.c. */
 int kernel_proc_view_lookup(struct kernel_pid_registry *view, kernel_pid_t number,

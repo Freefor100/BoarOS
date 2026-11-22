@@ -1205,6 +1205,8 @@ int kernel_vfs_set_mount_attributes(struct kernel_vfs_path *root,uint64_t set,ui
             if((set|clear)&2U)m->nosuid=!!(set&2U);
             if((set|clear)&4U)m->nodev=!!(set&4U);
             if((set|clear)&8U)m->noexec=!!(set&8U);
+            if ((set | clear) & VFS_MOUNT_ATTR_NOSYMFOLLOW)
+                __atomic_store_n(&m->nosymfollow, !!(set & VFS_MOUNT_ATTR_NOSYMFOLLOW), __ATOMIC_RELAXED);
             if(clear&0x70U)m->atime_policy=(m->atime_policy&VFS_ATIME_NODIR)|
                 ((set&0x70U)==0x10U?VFS_ATIME_NONE:(set&0x70U)==0x20U?VFS_ATIME_STRICT:0);
             if((set|clear)&0x80U)m->atime_policy=(m->atime_policy&~VFS_ATIME_NODIR)|
@@ -1233,6 +1235,7 @@ static int clone_one_view(struct kernel_vfs_mount *source,struct kernel_vfs_dent
         instance->views=mount;
         mount->read_only=source->read_only;mount->nosuid=source->nosuid;mount->nodev=source->nodev;
         mount->noexec=source->noexec;mount->silent=source->silent;mount->atime_policy=source->atime_policy;mount->source_name=instance->backend_mount.source_name;
+        mount->nosymfollow=source->nosymfollow;
     }
     mount->propagation_staged=1;
     propagation_copy(source,mount,flags);
@@ -2687,6 +2690,7 @@ static int resolve_object(struct kernel_vfs_path *start,
             size_t remainder = length-end;
             int backend;
             if ((walk->resolve & KERNEL_VFS_RESOLVE_NO_SYMLINKS) ||
+                __atomic_load_n(&next->file.mount->nosymfollow, __ATOMIC_RELAXED) ||
                 ++follows > VFS_SYMLINK_MAX_FOLLOWS) {
                 result = -KERNEL_ELOOP;
                 (void)kernel_vfs_path_release(&next);
@@ -5613,6 +5617,7 @@ int kernel_vfs_mount_reconfigure(struct kernel_vfs_path *root,uint64_t flags,uin
         mount->read_only=read_only;
         mount->atime_policy=kernel_vfs_atime_policy(flags,mount->atime_policy,1);
         mount->nosuid=!!(flags&2U);mount->nodev=!!(flags&4U);mount->noexec=!!(flags&8U);mount->silent=!!(flags&32768U);
+        __atomic_store_n(&mount->nosymfollow, !!(flags & VFS_MS_NOSYMFOLLOW), __ATOMIC_RELAXED);
         return 0;
     }
     if (read_only && !instance->read_only) {
@@ -5640,6 +5645,7 @@ int kernel_vfs_mount_reconfigure(struct kernel_vfs_path *root,uint64_t flags,uin
             mount->read_only=read_only;
             mount->atime_policy=kernel_vfs_atime_policy(flags,mount->atime_policy,1);
             mount->nosuid=!!(flags&2U);mount->nodev=!!(flags&4U);mount->noexec=!!(flags&8U);
+            __atomic_store_n(&mount->nosymfollow, !!(flags & VFS_MS_NOSYMFOLLOW), __ATOMIC_RELAXED);
             mount->silent=!!(flags&32768U);
         }
     }
@@ -5976,6 +5982,7 @@ int kernel_vfs_mount_statfs(struct kernel_vfs_mount *mount,
         if (mount->nosuid) stat->flags |= 2U;
         if (mount->nodev) stat->flags |= 4U;
         if (mount->noexec) stat->flags |= 8U;
+        if (mount->nosymfollow) stat->flags |= VFS_ST_NOSYMFOLLOW;
         uint8_t policy=mount->atime_policy;
         stat->flags&=~UINT64_C(7168);
         if(policy&VFS_ATIME_NONE)stat->flags|=1024U;

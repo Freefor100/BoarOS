@@ -518,7 +518,7 @@ filecap设置接受revision 2／3，revision 3的rootid=0查询为revision 2，�
 
 `utimensat` 的 times 先完整复制，两项 `UTIME_OMIT` 随即成功，不解析路径、fd 或 flags。其他请求先检查 flags 并取得目标，再检查纳秒，最后检查只读挂载；不存在路径与坏 fd 优先于非法纳秒。NULL pathname 且 dirfd 不是 `AT_FDCWD` 是 musl `futimens` 使用的 fd 形式，只接受 flags=0；空字符串配 `AT_EMPTY_PATH` 支持 fd 与 cwd。`AT_SYMLINK_NOFOLLOW` 修改链接自身，默认跟随链接。NULL times 或 `UTIME_NOW` 使用本次同一个 realtime 值，`UTIME_OMIT` 保留字段，实际修改同时更新 ctime，不修改父目录时间。fd 无须写访问模式；显式时间要求所有者或 CAP_FOWNER，全部使用当前时间也允许具有写访问权限的调用者。
 
-`statfs/fstatfs` 输出 RV64 asm-generic 的 120 字节布局，输出前取得真实 mount 统计；路径/fd 错误优先于输出指针 fault。fd 直接使用其持有的 mount，unlink 后仍可查询；没有文件系统 mount 的 pipe/匿名 epoll/初始 console 返回 `ENOTSUP`，不伪装成根盘。统计不触发文件数据写回，空闲块只计实际磁盘分配；容量扣除真实 ext4 元数据及内部 journal 开销，bavail 扣除 superblock 保留块。BoarOS 没有 Linux 的紧急 extent 保留池，因此不额外扣除不存在的池。只读和 relatime 标志来自实际挂载契约。
+`statfs/fstatfs` 输出 RV64 asm-generic 的 120 字节布局，输出前取得真实 mount 统计；路径/fd 错误优先于输出指针 fault。fd 直接使用其持有的 mount，unlink 后仍可查询；匿名管道报告管道伪文件系统的 `PIPEFS_MAGIC`、架构页大小及零容量，命名管道沿打开时持有的文件系统挂载查询。没有文件系统挂载的匿名 epoll 和初始 console 返回 `ENOTSUP`。统计不触发文件数据写回，空闲块只计实际磁盘分配；容量扣除真实 ext4 元数据及内部 journal 开销，bavail 扣除 superblock 保留块。BoarOS 没有 Linux 的紧急 extent 保留池，因此不额外扣除不存在的池。只读和 relatime 标志来自实际挂载契约。
 
 固定依据为 `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `fs/utimes.c`、`fs/statfs.c`、`fs/ext4/super.c`、`fs/inode.c` 与 `include/uapi/asm-generic/statfs.h`。测试入口为 `make test-files-riscv test-lwext4-metadata-host test-userland-riscv test-diff-abi-riscv`。
 所有权窄宿主回归用`./tests/host/lwext4-metadata.sh ownership`，覆盖大ID、
@@ -720,6 +720,11 @@ RV64／LA64 使用 `inotify_init1`、`inotify_add_watch` 和 `inotify_rm_watch`�
 删除调用先检查该桶，再在未命中时沿红黑树的一条路径查找。显式删除、单次事件后自动撤销、
 `IN_DELETE_SELF`、卸载和末次关闭共用 `remove_mark()`，在 `notify_lock` 保护下同时撤除
 描述符索引、文件监视链和组内监视链。末次关闭沿组内监视链分批撤除，每次持锁最多处理 32 项。
+
+`/proc/<pid>/fdinfo/<fd>` 持有查到的打开文件描述，按组内监视链读取实际监视编号、索引节点、
+设备号和事件掩码。支持导出文件句柄的文件系统还会列出对应句柄。读取者分批在 `notify_lock`
+下取得字段快照，锁外格式化。删除操作将仍指向该标记的读取游标推进至下一项，原描述符关闭或
+复用时，正在进行的读取仍使用已持有的监视组。
 
 每个真实 UID 最多 128 个实例、65,536 个监视；每个实例的未读记录使用 64 KiB 环。
 环为 `IN_Q_OVERFLOW` 保留位置，读返回完整记录，名称以 NUL 补齐到记录边界。
