@@ -3298,6 +3298,134 @@ static void *remote_stopper(void *unused)
     CHECK(!pthread_mutex_lock(&remote_gate));stop_done=1;
     CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));return NULL;
 }
+#if BOAROS_USER_SMP
+struct udp_submit_call {
+    struct kernel_open_file_description *pin;
+    const struct kernel_socket_address *destination;
+    char byte;
+    int queued;
+};
+
+static void *udp_submit_writer(void *argument)
+{
+    struct udp_submit_call *call = argument;
+    kernel_cpu_current()->logical_id = 1;
+    remote_task = (void *)&test_context;
+    struct kernel_open_file_description *pin = call->pin;
+    const struct kernel_uaccess_iovec iov = {(uintptr_t)&call->byte, 1};
+    CHECK(kernel_socket_write_datagram(&pin, (void *)call, &iov, 1, 1, 0,
+                                      call->destination, NULL) == 1);
+    CHECK(pin == call->pin && !remote_waiter.request && !test_context.locks &&
+          !test_context.allocation_depth && arch_interrupt_is_enabled());
+    CHECK((model_service_requests != 0) == call->queued);
+    remote_task = NULL;
+    return NULL;
+}
+
+static void udp_caller_submit(void)
+{
+    remote_testing = 1;
+    remote_mode = 10;
+    kernel_socket_network_initialize();
+    CHECK(boaros_lwip_parallel_enabled());
+    struct virtio_net_device device = {.mac = {2, 0, 0, 0, 0, 2}};
+    struct kernel_network network = {.device = &device};
+    struct netif *netif = &network.interface;
+    ip4_addr_t local, mask, peer, gateway = {0};
+    IP4_ADDR(&local, 10, 77, 0, 2);
+    IP4_ADDR(&mask, 255, 255, 255, 0);
+    IP4_ADDR(&peer, 10, 77, 0, 1);
+    struct kernel_socket_protocol_scope scope;
+    kernel_socket_protocol_enter(&scope);
+    CHECK(netif_add(netif, &local, &mask, &gateway, &network, interface_init, ip_input));
+    netif_set_up(netif);
+    netif_set_link_up(netif);
+    test_arp_reply(netif, &peer, 1);
+    kernel_socket_protocol_leave(&scope);
+
+    struct kernel_socket *receiver = NULL, *sender = NULL, *tap = NULL;
+    struct kernel_socket_address address = {.family = KERNEL_SOCKET_AF_INET,
+        .port = 24017, .bytes = {127, 0, 0, 1}};
+    struct kernel_socket_address wire = {.family = KERNEL_SOCKET_AF_INET,
+        .port = 24018, .bytes = {10, 77, 0, 1}};
+    struct kernel_socket_address packet = {.family = KERNEL_SOCKET_AF_PACKET,
+        .port = PACKET_ETH_ALL, .scope = netif_get_index(netif_get_loopif())};
+    CHECK(!kernel_socket_create(&test_heap, KERNEL_SOCKET_AF_INET, SOCKET_DGRAM, 0, &receiver));
+    CHECK(!kernel_socket_bind(receiver, &address));
+    CHECK(!kernel_socket_create(&test_heap, KERNEL_SOCKET_AF_INET, SOCKET_DGRAM, 0, &sender));
+    CHECK(!kernel_socket_connect(sender, &address, 0));
+    CHECK(!kernel_socket_create(&test_heap, KERNEL_SOCKET_AF_PACKET, SOCKET_RAW, 0, &tap));
+    CHECK(!kernel_socket_bind(tap, &packet));
+    struct kernel_open_file_description *pin = model_socket_file_create(sender);
+    struct kernel_wait_node work_node = {.callback = remote_work_ready, .context = &remote_work};
+    kernel_wait_queue_init(&model_work_queue);
+    model_work_queue.head = model_work_queue.tail = &work_node;
+    kernel_socket_network_hooks(NULL, &model_work_queue, NULL, NULL, &remote_work);
+
+    struct udp_submit_call call = {.pin = pin, .byte = 'a'};
+    pthread_t first, second;
+    CHECK(!pthread_create(&first, NULL, udp_submit_writer, &call) && !pthread_join(first, NULL));
+    CHECK(!remote_work && !sender->active_writes && receiver->rx_bytes == 1);
+    CHECK(tap->packets_head && tap->packets_head->address.link_packet_type == PACKET_OUTGOING &&
+          tap->packets_tail != tap->packets_head && tap->packets_tail->address.link_packet_type == PACKET_HOST);
+    CHECK(tap->packets_head->data[tap->packets_head->length - 1] == 'a' &&
+          tap->packets_tail->data[tap->packets_tail->length - 1] == 'a');
+
+    struct kernel_socket *wire_sender = NULL;
+    CHECK(!kernel_socket_create(&test_heap, KERNEL_SOCKET_AF_INET, SOCKET_DGRAM, 0, &wire_sender));
+    struct kernel_open_file_description *wire_pin = model_socket_file_create(wire_sender);
+    unsigned submitted = copied_packets;
+    struct udp_submit_call wire_call = {.pin = wire_pin, .destination = &wire, .byte = 'w'};
+    CHECK(!pthread_create(&first, NULL, udp_submit_writer, &wire_call) && !pthread_join(first, NULL));
+    CHECK(copied_packets == submitted + 1 && captured[5] == 1 && captured[12] == 8 &&
+          captured[23] == IP_PROTO_UDP && captured[captured_size - 1] == 'w');
+    CHECK(!remote_work && !wire_sender->active_writes && wire_sender->udp->local_port);
+    CHECK(kernel_open_file_release(&wire_pin) == KERNEL_OPEN_FILE_STATUS_OK && !wire_pin);
+
+    remote_mode = 9;
+    struct udp_submit_call earlier = {.pin = pin, .byte = 'b', .queued = 1};
+    struct udp_submit_call later = {.pin = pin, .byte = 'c', .queued = 1};
+    struct kernel_lock_guard ip = {0};
+    boaros_lwip_ip_lock(&ip);
+    CHECK(!pthread_create(&first, NULL, udp_submit_writer, &earlier));
+    CHECK(!pthread_mutex_lock(&remote_gate));
+    while (remote_parked != 1) CHECK(!pthread_cond_wait(&remote_changed, &remote_gate));
+    CHECK(!pthread_mutex_unlock(&remote_gate));
+    boaros_lwip_ip_unlock(&ip);
+    CHECK(!pthread_create(&second, NULL, udp_submit_writer, &later));
+    CHECK(!pthread_mutex_lock(&remote_gate));
+    while (remote_parked != 2) CHECK(!pthread_cond_wait(&remote_changed, &remote_gate));
+    CHECK(!pthread_mutex_unlock(&remote_gate));
+    { SOCKET_STATE(state);
+      CHECK(sender->writes_head && sender->writes_head->next == sender->writes_tail &&
+            sender->writes_head->pin == pin && sender->writes_tail->pin == pin); }
+    CHECK(receiver->rx_bytes == 1);
+    struct kernel_socket_service_result service = kernel_socket_service_pending(
+        (struct kernel_socket_service_budget){2, 2, 0});
+    CHECK(service.sockets == 2 && service.packets == 2);
+    CHECK(!pthread_mutex_lock(&remote_gate));
+    CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));
+    CHECK(!pthread_join(first, NULL) && !pthread_join(second, NULL));
+    CHECK(receiver->rx_bytes == 3 && !sender->writes_head && !sender->active_writes);
+    struct socket_packet *received = receiver->packets_head;
+    for (char byte = 'a'; byte <= 'c'; byte++, received = received->next) {
+        CHECK(received && received->payload->tot_len == 1 &&
+              pbuf_get_at(received->payload, 0) == byte);
+    }
+    CHECK(!received);
+
+    kernel_socket_network_hooks(NULL, NULL, NULL, NULL, NULL);
+    CHECK(kernel_open_file_release(&pin) == KERNEL_OPEN_FILE_STATUS_OK && !pin);
+    kernel_socket_destroy(receiver);
+    kernel_socket_destroy(tap);
+    kernel_socket_protocol_enter(&scope);
+    netif_remove(netif);
+    kernel_socket_protocol_leave(&scope);
+    CHECK(!heap_live && !model_socket_files && !protocol_current_owner());
+    puts("PASS IPv4 UDP caller submits loopback and Ethernet; busy IP lock and prior request keep FIFO");
+}
+#endif
+
 static void remote_protocol_request(unsigned mode)
 {
     remote_testing=1;remote_mode=mode;
@@ -3310,7 +3438,7 @@ static void remote_protocol_request(unsigned mode)
         CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM, 0,&client));
         CHECK(!kernel_socket_connect(client,&address,0));
         if(mode==2)user_remaining=0;
-        if(mode==2 || mode==3) boaros_lwip_ip_init(2);
+        if ((mode == 2 || mode == 3) && !boaros_lwip_parallel_enabled()) boaros_lwip_ip_init(2);
     }
     for(unsigned i=0;i<8;i++)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
     struct kernel_wait_node work_node={.callback=remote_work_ready,.context=&remote_work};
@@ -5707,19 +5835,29 @@ static void parallel_receive_retirement(void)
     CHECK(kernel_socket_finish_read(&request,0)==sizeof(input) && !socket->retired_head);
 
     ip_addr_t source; IP_ADDR4(&source,10,77,0,1);
-    custom.custom_free_function=retired_payload_free;
+    struct pbuf_custom last={.custom_free_function=retired_payload_free};
+    unsigned char last_input[]={'t','a','i','l'};
     kernel_socket_protocol_enter(&scope);
     payload=pbuf_alloced_custom(PBUF_RAW,sizeof(input),PBUF_REF,&custom,input,sizeof(input));
     CHECK(payload);
     udp_received(socket,socket->udp,payload,&source,18000);
+    payload=pbuf_alloced_custom(PBUF_RAW,sizeof(last_input),PBUF_REF,&last,last_input,sizeof(last_input));
+    CHECK(payload);
+    udp_received(socket,socket->udp,payload,&source,18000);
     kernel_socket_protocol_leave(&scope);
     CHECK(socket->packets_head && !socket->packets_head->loopback);
+    retirement_socket=socket;
     CHECK(kernel_socket_reserve_read(socket,NULL,&request,&pin,sizeof(input),0,NULL)==sizeof(input));
-    CHECK(kernel_socket_finish_read(&request,0)==sizeof(input) && socket->retired_head);
-    CHECK(retired_payloads==1);
+    kernel_socket_copy_read(&request,0,output,sizeof(output));
+    CHECK(kernel_socket_finish_read(&request,0)==sizeof(input) && !socket->retired_head);
+    CHECK(retired_payloads==2 && !memcmp(output,input,sizeof(input)));
+    CHECK(kernel_socket_reserve_read(socket,NULL,&request,&pin,sizeof(last_input),0,NULL)==sizeof(last_input));
+    kernel_socket_copy_read(&request,0,output,sizeof(output));
+    CHECK(kernel_socket_finish_read(&request,0)==sizeof(last_input) && socket->retired_head);
+    CHECK(retired_payloads==2 && !memcmp(output,last_input,sizeof(last_input)));
     kernel_socket_destroy(socket);
-    CHECK(retired_payloads==2 && !heap_live);
-    puts("PASS parallel receive returns TCP and loopback UDP locally, retaining external UDP retirement");
+    CHECK(retired_payloads==3 && !heap_live);
+    puts("PASS TCP and queued UDP return buffers locally; the final external datagram retires once");
 }
 
 static void tcp_single_cpu_service(void)
@@ -5783,6 +5921,8 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "tcp-physical-submit")) tcp_physical_submit_contract();
     else if (!strcmp(argv[1], "tcp-resolved-output")) tcp_resolved_output_contract(0);
     else if (!strcmp(argv[1], "tcp-serial-resolved-output")) tcp_resolved_output_contract(1);
+    else if (!strcmp(argv[1], "udp-caller-submit")) udp_caller_submit();
+    else if (!strcmp(argv[1], "udp-caller-stop")) remote_protocol_request(3);
 #endif
     else if (!strcmp(argv[1], "tcp-cork")) tcp_cork_contract();
     else if (!strcmp(argv[1], "tcp-receive-before-wait")) tcp_receive_before_wait_contract();
