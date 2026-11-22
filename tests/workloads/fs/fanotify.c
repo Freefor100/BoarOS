@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/fanotify.h>
+#include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -277,6 +278,28 @@ static void blocked_reader_exit(const char *name)
     touch_open(name);
 }
 
+static void drop_clean_pages(const char *name)
+{
+    long length = sysconf(_SC_PAGESIZE);
+    int writer = open(name, O_RDWR);
+    int drop = open("/proc/sys/vm/drop_caches", O_WRONLY);
+    int pressure = open("/proc/sys/vm/vfs_cache_pressure", O_RDONLY);
+    CHECK(length > 0 && writer >= 0 && drop >= 0 && pressure >= 0);
+    char value[24];
+    CHECK(read(pressure, value, sizeof(value)) > 0 && !close(pressure));
+    CHECK(pwrite(writer, "B", 1, length - 1) == 1 && !fsync(writer));
+    char *mapping = mmap(NULL, length, PROT_READ, MAP_SHARED, writer, 0);
+    unsigned char resident;
+    CHECK(mapping != MAP_FAILED);
+    CHECK(!mincore(mapping, length, &resident) && (resident & 1));
+    CHECK(write(drop, "1\n", 2) == 2);
+    CHECK(!mincore(mapping, length, &resident) && !(resident & 1));
+    CHECK(*(volatile char *)(mapping + length - 1) == 'B');
+    CHECK(lseek(drop, 0, SEEK_SET) == 0 && write(drop, "1\n", 2) == 2);
+    CHECK(!mincore(mapping, length, &resident) && (resident & 1));
+    CHECK(!munmap(mapping, length) && !close(writer) && !close(drop));
+}
+
 int main(void)
 {
     char base[] = "/tmp/fannot-base-XXXXXX", alias[] = "/tmp/fannot-alias-XXXXXX";
@@ -294,6 +317,7 @@ int main(void)
     tmpfs_fid(alias, aliased);
     restricted(a);
     blocked_reader_exit(a);
+    drop_clean_pages(a);
     CHECK(!unlink(a) && !rmdir(base) && !rmdir(alias));
     puts("FANOTIFY PASS fd-delivery faults scopes fid namespace privacy");
     return 0;

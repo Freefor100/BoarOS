@@ -87,6 +87,28 @@ enum kernel_uaccess_status kernel_copy_to_user(struct kernel_mm *mm, uint64_t to
     *copied = size;
     return KERNEL_UACCESS_STATUS_OK;
 }
+enum kernel_uaccess_status kernel_copy_from_user(struct kernel_mm *mm, void *to,
+    uint64_t from, size_t size, size_t *copied)
+{
+    (void)mm;
+    assert(!cpu.raw_locks);
+    if (from == fault_address) {
+        *copied = 0;
+        return KERNEL_UACCESS_STATUS_FAULT;
+    }
+    memcpy(to, (const void *)(uintptr_t)from, size);
+    *copied = size;
+    return KERNEL_UACCESS_STATUS_OK;
+}
+enum kernel_uaccess_status kernel_uaccess_write_cursor_copy(struct kernel_mm *mm,
+    struct kernel_uaccess_write_cursor *cursor, uint64_t to, const void *from,
+    size_t size, size_t *copied)
+{
+    (void)cursor;
+    return kernel_copy_to_user(mm, to, from, size, copied);
+}
+void kernel_uaccess_write_cursor_finish(struct kernel_uaccess_write_cursor *cursor)
+{ (void)cursor; }
 enum kernel_files_status kernel_files_find_free_fd(struct kernel_files *files, uint32_t *fd, int *result)
 {
     (void)files;
@@ -145,6 +167,10 @@ int kernel_vfs_fanotify_encode_handle(const struct kernel_vfs_file *file,
     *handle = (struct kernel_vfs_handle){.inode = node->inode, .generation = 13};
     return 1;
 }
+int kernel_vfs_node_acquire(struct kernel_vfs_node *node)
+{ node->references++; return 0; }
+int kernel_vfs_node_release(struct kernel_vfs_node **owner)
+{ assert((*owner)->references); (*owner)->references--; *owner = NULL; return 0; }
 struct kernel_wait_record *kernel_wait_record_of(struct kernel_task *t) { (void)t; abort(); }
 struct kernel_wait_node *kernel_wait_default_node(struct kernel_task *t) { (void)t; abort(); }
 struct kernel_task *kernel_wait_current_task(void) { return NULL; }
@@ -192,7 +218,8 @@ static void matching_and_merge(void)
     struct kernel_vfs_instance instance = {0};
     struct kernel_vfs_mount mount = {.private_data = &instance}, bind = {.private_data = &instance};
     struct kernel_vfs_node first = {.instance = &instance, .inode = 7},
-                           second = {.instance = &instance, .inode = 8};
+                           second = {.instance = &instance, .inode = 8},
+                           directory = {.instance = &instance, .inode = 9};
     struct kernel_vfs_file a = {.private_data = &first, .mount = &mount, .mode = KERNEL_VFS_S_IFREG};
     struct kernel_vfs_file b = {.private_data = &second, .mount = &mount, .mode = KERNEL_VFS_S_IFREG};
     struct fan_group *group = group_create(), *other = group_create();
@@ -210,9 +237,9 @@ static void matching_and_merge(void)
     struct kernel_wait_node ready = {0};
     kernel_wait_node_init_callback(&ready, notified, NULL);
     kernel_wait_queue_add(&group->ready, &ready);
-    notify(&a, NULL, 9, VFS_NOTIFY_OPEN);
-    notify(&b, NULL, 9, VFS_NOTIFY_OPEN);
-    notify(&a, NULL, 9, VFS_NOTIFY_CLOSE_NOWRITE);
+    notify(&a, NULL, &directory, NULL, VFS_NOTIFY_OPEN);
+    notify(&b, NULL, &directory, NULL, VFS_NOTIFY_OPEN);
+    notify(&a, NULL, &directory, NULL, VFS_NOTIFY_CLOSE_NOWRITE);
     assert(group->queued == 2 && wakes == 1);
     assert(group->first->handle.inode == 7 &&
            group->first->mask == (VFS_NOTIFY_OPEN | VFS_NOTIFY_CLOSE_NOWRITE));
@@ -220,22 +247,80 @@ static void matching_and_merge(void)
 
     assert(!update_mark(group, inode, FAN_MARK_ADD | FAN_MARK_IGNORED_MASK, VFS_NOTIFY_OPEN, 42));
     a.mount = &bind;
-    notify(&a, NULL, 9, VFS_NOTIFY_OPEN);
+    notify(&a, NULL, &directory, NULL, VFS_NOTIFY_OPEN);
     assert(group->queued == 2 && other->queued == 2);
     /* Modification clears the legacy ignore flag even when not selected. */
-    notify(&a, NULL, 9, VFS_NOTIFY_MODIFY);
+    notify(&a, NULL, &directory, NULL, VFS_NOTIFY_MODIFY);
     assert(group->queued == 2);
-    notify(&a, NULL, 9, VFS_NOTIFY_OPEN);
+    notify(&a, NULL, &directory, NULL, VFS_NOTIFY_OPEN);
     assert(group->queued == 2 && group->first->mask == (VFS_NOTIFY_OPEN | VFS_NOTIFY_CLOSE_NOWRITE));
 
     retire_mount(&mount);
-    retire_inode(&instance, 7);
+    retire_inode(&first, false);
     retire_instance(&instance);
     assert(!instance.fanotify_ops && !instance.fanotify_marks && !account.fanotify_marks);
     assert(!kernel_wait_node_remove_sync(&ready));
     release_group(group);
     release_group(other);
     assert(!allocations && !sender_a.references && !account.fanotify_groups);
+}
+
+static void mark_conversion(void)
+{
+    struct kernel_vfs_instance instance = {0};
+    struct kernel_vfs_node first = {.instance = &instance, .inode = 7, .references = 1};
+    struct kernel_vfs_node replacement = {.instance = &instance, .inode = 7, .references = 1};
+    struct fan_group *group = group_create();
+    struct fan_key key = inode_key(&first);
+    key.serial = group->serial;
+    assert(!update_mark(group, key, FAN_MARK_ADD | FAN_MARK_EVICTABLE, VFS_NOTIFY_OPEN, 42));
+    assert(first.references == 1 && !first.fanotify_pins);
+    retire_inode(&replacement, true);
+    assert(instance.fanotify_marks == 1 && (instance.fanotify_interest & VFS_NOTIFY_OPEN));
+    retire_inode(&first, true);
+    assert(!instance.fanotify_marks && !instance.fanotify_interest);
+    assert(!update_mark(group, key, FAN_MARK_ADD | FAN_MARK_EVICTABLE, VFS_NOTIFY_OPEN, 42));
+    assert(!update_mark(group, key, FAN_MARK_ADD, VFS_NOTIFY_OPEN, 42));
+    assert(first.references == 2 && first.fanotify_pins == 1);
+    assert(update_mark(group, key, FAN_MARK_ADD | FAN_MARK_EVICTABLE, VFS_NOTIFY_OPEN, 42)
+           == -KERNEL_EEXIST);
+    assert(!update_mark(group, key, FAN_MARK_ADD | FAN_MARK_IGNORE | FAN_MARK_IGNORED_SURV_MODIFY,
+                       VFS_NOTIFY_OPEN, 42));
+    assert(update_mark(group, key, FAN_MARK_ADD | FAN_MARK_IGNORED_MASK,
+                       VFS_NOTIFY_OPEN, 42) == -KERNEL_EEXIST);
+    release_group(group);
+    assert(!instance.fanotify_marks && !allocations && !account.fanotify_groups);
+    assert(first.references == 1 && !first.fanotify_pins);
+}
+
+static void rename_records(void)
+{
+    struct kernel_vfs_instance instance = {0};
+    struct kernel_vfs_node left = {.instance = &instance, .inode = 7, .references = 1};
+    struct kernel_vfs_node right = {.instance = &instance, .inode = 8, .references = 1};
+    struct kernel_vfs_node child = {.instance = &instance, .inode = 9, .references = 1};
+    struct kernel_vfs_path from = {.file.private_data = &left}, to = {.file.private_data = &right};
+    struct kernel_vfs_file file = {.private_data = &child};
+    struct fan_group *group = group_create();
+    group->report = FAN_FID_FLAGS;
+    struct fan_key key = inode_key(&left);
+    key.serial = group->serial;
+    assert(!update_mark(group, key, FAN_MARK_ADD,
+        VFS_NOTIFY_CREATE | VFS_NOTIFY_MOVED_FROM | FAN_RENAME, 42));
+    notify_entry(&from, "a", &file, NULL, NULL, NULL, VFS_NOTIFY_CREATE);
+    notify_entry(&from, "a", &file, NULL, &to, "b", 0);
+    assert(group->queued == 2 && group->first->mask == (VFS_NOTIFY_CREATE | VFS_NOTIFY_MOVED_FROM));
+    struct fan_event *event = group->first->next;
+    assert(event->mask == FAN_RENAME && event->info_bytes);
+    struct fan_fid_info *info = (void *)(event + 1);
+    assert(info->type == FAN_INFO_OLD_DFID_NAME && !strcmp((const char *)(info + 1), "a"));
+    info = (void *)((char *)info + info->len);
+    struct kernel_vfs_handle handle;
+    memcpy(&handle, info->handle, sizeof(handle));
+    assert(info->type == FAN_INFO_FID && handle.inode == 9);
+    assert((char *)info + info->len == (char *)(event + 1) + event->info_bytes);
+    release_group(group);
+    assert(!allocations && !account.fanotify_groups);
 }
 
 static void overflow_and_sender_identity(void)
@@ -313,6 +398,8 @@ int main(void)
 {
     kernel_wait_domain_init();
     matching_and_merge();
+    mark_conversion();
+    rename_records();
     overflow_and_sender_identity();
     read_legacy();
     puts("PASS fanotify: mark scope, merge, overflow, copy faults and descriptor ownership");

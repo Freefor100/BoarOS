@@ -156,7 +156,7 @@ struct kernel_proc_fdinfo {
     kernel_pid_t namespace_ids[KERNEL_PID_NAMESPACE_MAX_DEPTH + 1U];
     size_t extra_length;
     char extra[512];
-    struct kernel_open_file_description *inotify; /* Owned on success. */
+    struct kernel_open_file_description *notification; /* Owned on success. */
 };
 int kernel_proc_fdinfo_snapshot_in(struct kernel_pid_registry *,kernel_pid_t,uint64_t,int,struct kernel_proc_fdinfo *);
 int kernel_proc_fdinfo_snapshot(kernel_pid_t,uint64_t,int,struct kernel_proc_fdinfo *);

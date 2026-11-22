@@ -470,6 +470,26 @@ static int mknod_node(struct kernel_vfs_instance *instance, uint64_t parent_inod
         created->inode->rdev = device;
     return result;
 }
+static int create_with_handle(struct kernel_vfs_mount *mount, uint64_t parent, const char *name,
+    uint32_t mode, uint32_t device, const char *target, uint32_t umask,
+    struct kernel_vfs_handle *handle)
+{
+    uint32_t type = mode & KERNEL_VFS_S_IFMT;
+    if (type != KERNEL_VFS_S_IFREG && type != KERNEL_VFS_S_IFDIR &&
+        type != KERNEL_VFS_S_IFIFO && type != KERNEL_VFS_S_IFCHR &&
+        type != KERNEL_VFS_S_IFBLK && type != KERNEL_VFS_S_IFSOCK &&
+        type != KERNEL_VFS_S_IFLNK) return -KERNEL_ENOTSUP;
+    struct tmp_entry *created = NULL;
+    int result = create_child(tm(mount->private_data), parent, name, mode, target,
+                              &created, umask, NULL);
+    if (!result) {
+        if (type == KERNEL_VFS_S_IFCHR || type == KERNEL_VFS_S_IFBLK)
+            created->inode->rdev = device;
+        *handle = (struct kernel_vfs_handle){.inode = created->inode->number};
+        tmp_handle_filesystem(mount->private_data, handle->filesystem);
+    }
+    return result;
+}
 static int readlink(struct kernel_vfs_node *n, char *buffer, size_t size, size_t *count)
 {
     struct tmp_inode *i = ti(n);
@@ -831,6 +851,7 @@ static const struct kernel_vfs_backend tmp_ops = {
     .check_domain=kernel_tmpfs_check_domain,
     .error=error, .root=root, .lookup=lookup, .open=open_inode, .close_node=close_node,
     .create=create, .tmpfile=tmpfile_inode, .link_tmpfile=link_tmpfile, .mkdir=mkdir, .symlink=symlink, .mknod=mknod_node, .readlink=readlink,
+    .create_with_handle=create_with_handle,
     .unlink=unlink_file, .rmdir=rmdir, .release_unlinked=release_unlinked, .link=link_inode,
     .rename=rename_inode, .stat=stat_inode, .statfs=statfs, .read_directory=read_directory,
     .truncate=truncate_inode, .fallocate=fallocate_inode, .pread=pread_inode,

@@ -45,10 +45,7 @@ static struct kernel_vfs_path *real(const struct overlay_node *e)
 static const struct kernel_vfs_file *data_file(struct kernel_vfs_node *n)
 { return &real(entry(n))->file; }
 static struct kernel_vfs_path *event_backing(struct kernel_vfs_node *n)
-{
-    struct kernel_vfs_path *p=real(entry(n));
-    return kernel_vfs_path_acquire(p) ? NULL : p;
-}
+{ return real(entry(n)); }
 static void put_path(struct kernel_vfs_path **p)
 { if (*p && kernel_vfs_path_release(p)) __builtin_trap(); }
 static void put_node(struct kernel_vfs_node **n)
@@ -584,8 +581,11 @@ static int remove_work(struct overlay_mount *m,const char *name,bool directory)
     return kernel_vfs_unlink_at(m->work,m->work,name,directory);
 }
 
+static void filesystem_id(struct kernel_vfs_instance *, unsigned char[16]);
+
 static int create_object(struct kernel_vfs_mount *view,uint64_t parent_inode,
-    const char *name,uint32_t mode,const char *link,struct kernel_vfs_file *output,uint32_t umask)
+    const char *name,uint32_t mode,const char *link,struct kernel_vfs_file *output,uint32_t umask,
+    struct kernel_vfs_handle *handle)
 {
     uint32_t type=mode&KERNEL_VFS_S_IFMT;
     if (type!=KERNEL_VFS_S_IFREG && type!=KERNEL_VFS_S_IFDIR && type!=KERNEL_VFS_S_IFLNK)
@@ -633,15 +633,28 @@ static int create_object(struct kernel_vfs_mount *view,uint64_t parent_inode,
     finish_work(m,pending,error!=0 || (directory && hidden),error!=0 && directory);
     if (error) return error;
     if (output) return publish(view,parent,name,strlen(name),&low,&candidate,output);
+    if (handle) {
+        struct kernel_vfs_node *backing = candidate->file.private_data;
+        *handle = (struct kernel_vfs_handle){.inode = inode_number(candidate, true),
+            .generation = backing->instance->ops->export->generation(backing)};
+        filesystem_id(i, handle->filesystem);
+    }
     return 0;
 }
 static int create(struct kernel_vfs_mount *view,uint64_t parent,const char *name,
     uint32_t mode,struct kernel_vfs_file *file,uint32_t umask)
-{ return create_object(view,parent,name,mode,NULL,file,umask); }
+{ return create_object(view,parent,name,mode,NULL,file,umask,NULL); }
 static int mkdir(struct kernel_vfs_mount *view,uint64_t parent,const char *name,uint32_t mode,uint32_t mask)
-{ return create_object(view,parent,name,KERNEL_VFS_S_IFDIR|(mode&07777U),NULL,NULL,mask); }
+{ return create_object(view,parent,name,KERNEL_VFS_S_IFDIR|(mode&07777U),NULL,NULL,mask,NULL); }
 static int symlink(struct kernel_vfs_instance *i,uint64_t parent,const char *target,const char *name)
-{ return create_object(&i->backend_mount,parent,name,KERNEL_VFS_S_IFLNK|0777U,target,NULL,0); }
+{ return create_object(&i->backend_mount,parent,name,KERNEL_VFS_S_IFLNK|0777U,target,NULL,0,NULL); }
+static int create_with_handle(struct kernel_vfs_mount *view, uint64_t parent, const char *name,
+    uint32_t mode, uint32_t device, const char *target, uint32_t umask,
+    struct kernel_vfs_handle *handle)
+{
+    (void)device;
+    return create_object(view,parent,name,mode,target,NULL,umask,handle);
+}
 
 static int remove_resolved(struct kernel_vfs_mount *view,uint64_t number,const char *name,
     struct kernel_vfs_node *node,bool directory,bool exclusive)
@@ -819,6 +832,7 @@ static const struct kernel_vfs_backend overlay_ops={
     .readlink=readlink,.stat=stat_inode,.statfs=statfs,.acl_permission=permission,
     .accessed=accessed,.modified=modified,.set_mode=set_mode,.set_owner=set_owner,.set_times=set_times,.xattr=xattr,
     .create=create,.mkdir=mkdir,.symlink=symlink,.remove_resolved=remove_resolved,
+    .create_with_handle=create_with_handle,
     .release_unlinked=release_unlinked,.rename=rename_inode,
     .read_directory=read_directory,.sync_filesystem=sync_filesystem,.remount=remount,.unmount=unmount,
 };

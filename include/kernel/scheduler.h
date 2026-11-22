@@ -159,6 +159,12 @@ enum kernel_wait_wake_reason {
     KERNEL_WAIT_POLL_FREE = 3, /* Internal callback: detach a retiring source. */
 };
 
+enum kernel_wait_signal_mode {
+    KERNEL_WAIT_UNINTERRUPTIBLE = 0,
+    KERNEL_WAIT_INTERRUPTIBLE = 1,
+    KERNEL_WAIT_KILLABLE = 2,
+};
+
 #define KERNEL_WAIT_QUEUE_INITIALIZED UINT32_C(0x57414954)
 
 struct kernel_wait_node;

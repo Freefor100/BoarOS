@@ -60,6 +60,9 @@ struct kernel_vfs_instance {
     unsigned notify_marks; /* Protected by the active notification backend. */
     unsigned fanotify_marks; /* Protected by the fanotify mark index. */
     const struct kernel_fanotify_ops *fanotify_ops;
+    uint32_t fanotify_interest, fanotify_parent_interest;
+    unsigned fanotify_interest_count[32], fanotify_parent_count[32];
+    unsigned fanotify_create_targets;
     uint64_t device_id; /* Filesystem st_dev, shared by every mount view. */
 };
 
@@ -88,6 +91,7 @@ struct kernel_vfs_node {
     uint32_t mode;
     uint32_t references;
     uint32_t open_files;
+    unsigned fanotify_pins;
     uint32_t write_openers;
     uint32_t exec_users;
     uint8_t closed;
@@ -171,9 +175,12 @@ struct kernel_vfs_backend {
         const struct physical_page_allocator *);
     int (*error)(struct kernel_vfs_instance *instance);
     const struct kernel_vfs_export_ops *export;
-    /* A stacked file has its own notification identity. An owned backing
-     * path adds an inode/filesystem event for the object doing the work. */
+    /* A stacked file may report both its own identity and the real object.
+     * The backing path is borrowed while the stacked node remains live. */
     struct kernel_vfs_path *(*event_backing)(struct kernel_vfs_node *);
+    int (*create_with_handle)(struct kernel_vfs_mount *, uint64_t parent, const char *name,
+        uint32_t mode, uint32_t device, const char *target, uint32_t umask,
+        struct kernel_vfs_handle *);
     int (*root)(struct kernel_vfs_instance *instance, uint64_t *inode, uint32_t *mode);
     /* Owned-name backends accept NULL mode: open imports real inode state. */
     int (*lookup)(struct kernel_vfs_instance *instance, uint64_t parent,

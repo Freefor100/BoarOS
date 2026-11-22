@@ -65,6 +65,7 @@ struct ext4_fs {
 	bool read_only;
 	bool super_replay_required;
 	bool journaled_session;
+	bool ext2_format;
 	/* Failed nonjournal metadata writeback cannot be cleared by unmount. */
 	int nojournal_error;
 
@@ -227,7 +228,7 @@ static inline ext4_fsblk_t ext4_fs_first_bg_block_no(struct ext4_sblock *s,
  * @return Error code
  */
 int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
-		 bool read_only);
+		 bool read_only, bool ext2_format);
 
 /**@brief Destroy filesystem instance (used by unmount operation).
  * @param fs Filesystem to be destroyed

@@ -149,7 +149,6 @@ static __attribute__((noinline)) int mount_filesystem(struct kernel_mm *mm, cons
     }
     if (flags & LINUX_MS_REC) {result=-KERNEL_ENOTSUP;goto Finish;}
     if(!kernel_mount_type_supported(type)){result=-KERNEL_ENODEV;goto Finish;}
-    if((!strcmp(type,"ext4") || !strcmp(type,"vfat")) && !request->arguments[0]){result=-KERNEL_EINVAL;goto Finish;}
     storage->parameters.flags=flags;
     result=kernel_mount_create(fs,&storage->parameters,kernel_credentials_current(),0,&created);
     /* Legacy mount checks the new root type after creating the filesystem;

@@ -239,7 +239,7 @@ static enum kernel_scheduler_status prepare_owner(struct kernel_wait_queue *queu
 enum kernel_scheduler_status kernel_wait_prepare(struct kernel_wait_queue *queue,
     uint64_t deadline,int interruptible,struct kernel_wait_token *token)
 {
-    if (!token || (interruptible!=0 && interruptible!=1) ||
+    if (!token || (unsigned)interruptible>KERNEL_WAIT_KILLABLE ||
         (queue && queue->initialized!=KERNEL_WAIT_QUEUE_INITIALIZED))
         return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     if (!kernel_wait_backend_initialized()) return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
@@ -284,7 +284,7 @@ static int notify_locked(const struct kernel_wait_token *token,uint32_t reason,
     struct kernel_wait_record *record=kernel_wait_record_of(token->task);
 #if BOAROS_MAX_CPUS > 1
     uint64_t state=kernel_wait_record_load(record);
-    if ((state>>5)!=token->generation) return 0;
+    if (kernel_wait_state_generation(state)!=token->generation) return 0;
     unsigned phase=(unsigned)(state&3U);
 #else
     if (!matches(token)) return 0;
@@ -297,7 +297,7 @@ static int notify_locked(const struct kernel_wait_token *token,uint32_t reason,
         if (!__atomic_compare_exchange_n(&record->state,&state,notified,0,
                 __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) {
             /* The owner can finish or start its next wait without this domain. */
-            if ((state>>5)==token->generation && (state&3U)==KERNEL_WAIT_COMMITTED) {
+            if (kernel_wait_state_generation(state)==token->generation && (state&3U)==KERNEL_WAIT_COMMITTED) {
                 if (committed_locked) __builtin_trap();
                 return -1; /* Local park won; acquire its run queue before notifying. */
             }
@@ -334,7 +334,7 @@ static int notify_token(const struct kernel_wait_token *token,uint32_t reason)
 {
 #if BOAROS_MAX_CPUS > 1
     uint64_t state=kernel_wait_record_load(kernel_wait_record_of(token->task));
-    if ((state>>5)!=token->generation || (state&3U)==KERNEL_WAIT_FINISHED ||
+    if (kernel_wait_state_generation(state)!=token->generation || (state&3U)==KERNEL_WAIT_FINISHED ||
         (state&3U)==KERNEL_WAIT_NOTIFIED) return 0;
     if ((state&3U)==KERNEL_WAIT_PREPARED) {
         uint64_t notified=(state&~UINT64_C(15))|((uint64_t)reason<<2)|KERNEL_WAIT_NOTIFIED;
@@ -343,7 +343,7 @@ static int notify_token(const struct kernel_wait_token *token,uint32_t reason)
             COST_ADD(WAIT_NOTIFICATIONS,1);
             return 1;
         }
-        if ((state>>5)!=token->generation || (state&3U)==KERNEL_WAIT_FINISHED ||
+        if (kernel_wait_state_generation(state)!=token->generation || (state&3U)==KERNEL_WAIT_FINISHED ||
             (state&3U)==KERNEL_WAIT_NOTIFIED) return 0;
     }
 #if BOAROS_USER_SMP
@@ -380,14 +380,14 @@ enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *to
 #if BOAROS_MAX_CPUS > 1
     struct kernel_wait_record *record_fast = kernel_wait_record_of(token->task);
     uint64_t state_fast = kernel_wait_record_load(record_fast);
-    if ((state_fast >> 5) == token->generation && (state_fast & 3U) == KERNEL_WAIT_NOTIFIED) {
+    if (kernel_wait_state_generation(state_fast) == token->generation && (state_fast & 3U) == KERNEL_WAIT_NOTIFIED) {
         *reason = (enum kernel_wait_wake_reason)((state_fast >> 2) & 3U);
         return KERNEL_SCHEDULER_STATUS_OK;
     }
     enum kernel_scheduler_status status;
 #endif
 #if BOAROS_USER_SMP
-    if ((state_fast>>5)==token->generation && (state_fast&3U)==KERNEL_WAIT_PREPARED &&
+    if (kernel_wait_state_generation(state_fast)==token->generation && (state_fast&3U)==KERNEL_WAIT_PREPARED &&
         !record_fast->deadline &&
         kernel_wait_backend_park_local(token,&status)) goto resumed;
 #endif

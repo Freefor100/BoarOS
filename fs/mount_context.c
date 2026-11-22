@@ -27,12 +27,31 @@ struct mount_context {
     unsigned source_set;
     unsigned phase; /* 0=create parameters, 1=ready, 2=reconfigure, 3=failed */
 };
-int kernel_mount_type_supported(const char *type)
+static const struct mount_type {
+    const char *name;
+    bool block;
+} mount_types[] = {
+    {"devtmpfs", false}, {"tmpfs", false}, {"ext4", true}, {"ext2", true},
+    {"vfat", true}, {"devpts", false}, {"proc", false}, {"mqueue", false},
+    {"bpf", false}, {"tracefs", false}, {"sysfs", false}, {"cgroup2", false},
+    {"overlay", false},
+};
+
+static const struct mount_type *find_mount_type(const char *name)
 {
-    return !strcmp(type,"devtmpfs") || !strcmp(type,"tmpfs") || !strcmp(type,"ext4") || !strcmp(type,"vfat") ||
-        !strcmp(type,"devpts") || !strcmp(type,"proc") || !strcmp(type,"mqueue") ||
-        !strcmp(type,"bpf") || !strcmp(type,"tracefs") || !strcmp(type,"sysfs") || !strcmp(type,"cgroup2") ||
-        !strcmp(type,"overlay");
+    for (size_t index = 0; index < sizeof(mount_types) / sizeof(mount_types[0]); index++)
+        if (!strcmp(name, mount_types[index].name)) return &mount_types[index];
+    return NULL;
+}
+
+int kernel_mount_type_supported(const char *type)
+{ return find_mount_type(type) != NULL; }
+
+const char *kernel_mount_registered_type(size_t index, int *block)
+{
+    if (index >= sizeof(mount_types) / sizeof(mount_types[0])) return NULL;
+    *block = mount_types[index].block;
+    return mount_types[index].name;
 }
 void kernel_mount_discard(struct kernel_vfs_path **owner)
 {
@@ -142,10 +161,11 @@ static int mount_overlay(const struct kernel_fs_context *fs,const struct kernel_
 int kernel_mount_create(const struct kernel_fs_context *fs,const struct kernel_mount_parameters *p,
     const struct kernel_credentials *creator,int exclusive,struct kernel_vfs_path **owner)
 {
-    if(!kernel_mount_type_supported(p->type))return -KERNEL_ENODEV;
+    const struct mount_type *type = find_mount_type(p->type);
+    if (!type) return -KERNEL_ENODEV;
     KERNEL_LOCK_SCOPE(topology);kernel_vfs_mount_topology_lock(&topology);
     if (!strcmp(p->type,"overlay")) return mount_overlay(fs,p,creator,owner);
-    int disk=!strcmp(p->type,"ext4") || !strcmp(p->type,"vfat");
+    bool disk = type->block;
     uint64_t device=0;
     if(disk) {
         if(!p->source[0])return -KERNEL_EINVAL;
