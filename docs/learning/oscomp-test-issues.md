@@ -140,8 +140,10 @@ BuildStorm 的 Rust 工具链曾在准备阶段中止。沿 `Child::wait_with_ou
 
 - `fanotify13` 按变体格式化并挂载测试盘。ext4 基础变体检查索引节点、挂载、文件系统
   三种标记在打开和关闭后交付的事件，并把文件系统标识和文件句柄与 `statfs`、
-  `name_to_handle_at` 对照。当前两架构、两种 C 标准库的原程序均通过该变体的 15 项断言。
-  其余 24 个配置跳过来自叠加文件系统前提。基础通知实现见
+  `name_to_handle_at` 对照。两架构、两种 C 标准库的原程序在 ext4 上分别通过 45 项断言。
+  基础变体通过 15 项，下层与上层监视各通过 10 项，监视叠加视图中的下层与上层对象各通过
+  5 项。与固定 Linux 一致，监视下层或上层时各有两项因底层挂载标记不可见而按配置跳过。
+  直接监视叠加视图时各有四项因当前配置只提供文件标识编码而按配置跳过。通知实现见
   [文件模块](../modules/kernel-files.md#fanotify-文件访问通知)。
 - `clock_getres01`、`timer_delete01`、`timer_settime01/02` 的闹钟分支依赖运行环境提供
   可用的实时时钟（Real-Time Clock，RTC）。比较结果时，应区分启动累计时钟、国际原子时
@@ -160,8 +162,11 @@ BuildStorm 的 Rust 工具链曾在准备阶段中止。沿 `Child::wait_with_ou
 - `readahead02` 依赖进程读写统计、缓存控制及设备预读参数。`msync04` 从
   `/proc/self/pagemap` 得到页帧编号，通过 `/proc/kpageflags` 观察写入共享映射后的
   脏页及同步后的状态。`msync03` 的锁页断言可以通过，发布程序无可计分摘要。
-- `accept03`、`readahead01` 和 `splice07` 依赖多类描述符构造者。分支在构造时
-  跳过，表示目标系统调用未收到该类描述符。
+- `accept03`、`readahead01` 和 `splice07` 依赖多类描述符构造器。软件中央处理器
+  （Central Processing Unit，CPU）时钟计数器现可通过原 `perf_event_open` 构造，
+  恢复了前两项各一条断言和 `splice07` 的 41 条输入／输出组合断言。剩余跳过来自
+  `userfaultfd`、`io_uring_setup`、`memfd_secret` 或构造器给 `fsopen` 传入的
+  文件系统类型。构造失败的分支尚未进入目标系统调用。
 
 #### 文件句柄测例的标准输入假设
 
