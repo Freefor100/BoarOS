@@ -493,12 +493,14 @@ void scheduler_cpu_timer_expire(void)
         kernel_task_identity_put(clock.identity);
     }
 }
-void kernel_posix_cpu_target_exit(struct kernel_task *task)
+static void cpu_target_exit(struct kernel_task *task,unsigned thread)
 {
-    for(unsigned thread=0;thread<2;thread++)for(;;) {
+    for(;;) {
         KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
         if(cpu_target_live(task,thread))break;
         struct kernel_cpu_timer_index *index=&task->cpu_timer_index[thread];unsigned removed=0;
+        if (!index->indexed && !index->timers[0] && !index->timers[1] && !index->timers[2])
+            break;
         for(unsigned kind=0;kind<3&&removed<16;kind++) {
             struct kernel_avl_node *node;
             while(removed<16&&(node=kernel_avl_first(index->timers[kind]))) {
@@ -509,6 +511,11 @@ void kernel_posix_cpu_target_exit(struct kernel_task *task)
         scheduler_cpu_timer_update_locked(task,thread);
         if(removed<16)break;
     }
+}
+void kernel_posix_cpu_target_exit(struct kernel_task *task)
+{
+    cpu_target_exit(task,1);
+    cpu_target_exit(task,0);
 }
 void kernel_posix_timer_expire(uint64_t now)
 {
@@ -580,8 +587,12 @@ void kernel_posix_timers_exec(struct kernel_task *task)
 }
 void kernel_posix_timers_exit(struct kernel_task *task)
 {
-    kernel_posix_cpu_target_exit(task);
-    if(task->group_leader==task && task->group_members<=1)kernel_posix_timers_exec(task);
+    /* The thread target was closed before publication. Only the process
+     * clock can have survived an earlier exit of its group leader. */
+    if(task->group_leader==task && task->group_members<=1) {
+        cpu_target_exit(task,0);
+        kernel_posix_timers_exec(task);
+    }
 }
 void kernel_posix_timers_adopt_locked(struct kernel_task *to,struct kernel_task *from)
 {

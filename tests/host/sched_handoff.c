@@ -64,7 +64,7 @@ enum physical_page_status physical_page_allocate(struct physical_page_allocator 
 { (void)a; assert(!metadata_owned); metadata_owned = 1; *address = 10 * BOAROS_PAGE_SIZE; return PHYSICAL_PAGE_STATUS_OK; }
 enum physical_page_status physical_page_allocate_order(struct physical_page_allocator *a, uint32_t order, uint64_t *address)
 { (void)a; assert(metadata_owned && !stack_owned && order == KERNEL_STACK_ORDER); stack_owned = 1; *address = 12 * BOAROS_PAGE_SIZE; return PHYSICAL_PAGE_STATUS_OK; }
-enum physical_page_status physical_page_resolve(const struct physical_page_allocator *a, uint64_t address, void **pointer)
+enum physical_page_status physical_page_map_owned(const struct physical_page_allocator *a, uint64_t address, void **pointer)
 {
     (void)a;
     if (address == 10 * BOAROS_PAGE_SIZE) *pointer = metadata_arena + BOAROS_PAGE_SIZE;

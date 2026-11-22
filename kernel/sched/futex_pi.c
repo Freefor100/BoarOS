@@ -696,7 +696,12 @@ void kernel_futex_pi_cleanup_end(struct kernel_task *task)
         struct kernel_futex_pi_state *state;struct kernel_task *old=0;
         {
             KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
-            state=task->pi_owned;if(!state)break;
+            state=task->pi_owned;
+            if(!state) {
+                kernel_futex_pi_recalculate_locked(task,-1);
+                task->futex_exit_state=task->proc_exiting?2U:0U;
+                break;
+            }
             state_get(state);
         }
         /* 重排发布持有目标桶；退出先等待它结束，保留后续等待者的PI状态。 */
@@ -708,11 +713,6 @@ void kernel_futex_pi_cleanup_end(struct kernel_task *task)
         kernel_lock_release(&operation);kernel_cpu_notification_batch_end(&notifications);
         if(old)scheduler_task_put(old);
         state_put(state);
-    }
-    {
-        KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
-        kernel_futex_pi_recalculate_locked(task,-1);
-        task->futex_exit_state=task->proc_exiting?2U:0U;
     }
     (void)kernel_wait_queue_wake_all(&task->group_wait_queue);
 }

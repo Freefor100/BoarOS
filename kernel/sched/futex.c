@@ -482,7 +482,7 @@ static void futex_wake_user(struct kernel_task *task, uint64_t address)
     futex_key_release(&key);
 }
 
-void kernel_futex_release_mm(struct kernel_task *task)
+uint32_t kernel_futex_release_mm(struct kernel_task *task)
 {
     uint64_t address = task->clear_tid_address;
     uint32_t zero = 0U;
@@ -494,8 +494,10 @@ void kernel_futex_release_mm(struct kernel_task *task)
         futex_wake_user(task, address);
     }
     /* 用户复制可能睡眠；返回前仍是 MM 使用者，不能让另一退出者误判为独占。 */
-    if (!kernel_mm_remove_user(&task->mm) && *kernel_mm_aio_contexts(&task->mm))
+    uint32_t users = kernel_mm_remove_user(&task->mm);
+    if (!users && *kernel_mm_aio_contexts(&task->mm))
         kernel_aio_exit(&task->mm);
+    return users;
 }
 
 void kernel_futex_set_robust_list(struct kernel_task *task, uint64_t head)
@@ -568,21 +570,22 @@ static int robust_release_word(struct kernel_task *task, uint64_t entry,
 static void robust_words(struct kernel_task *task, int32_t owner_tid)
 {
     uint64_t head = __atomic_exchange_n(&task->robust_list_head,0U,__ATOMIC_RELAXED);
-    uint64_t next, pending, offset_bits;
-    uint64_t entry, pending_entry;
+    struct {
+        uint64_t first;
+        int64_t offset;
+        uint64_t pending;
+    } snapshot;
+    size_t copied;
+    uint64_t next;
     uint32_t limit = ROBUST_LIST_LIMIT;
 
-    if (head == 0U || task->mm.state != KERNEL_MM_LIVE ||
-        kernel_user_range_check(head, 3U * sizeof(uint64_t)) !=
-            KERNEL_UACCESS_STATUS_OK)
+    if (head == 0U || task->mm.state != KERNEL_MM_LIVE)
         return;
-    if (!robust_read_u64(&task->mm, head, &entry) ||
-        !robust_read_u64(&task->mm, head + sizeof(uint64_t),
-                         &offset_bits) ||
-        !robust_read_u64(&task->mm, head + 2U * sizeof(uint64_t),
-                         &pending))
+    if (kernel_copy_from_user(&task->mm, &snapshot, head, sizeof(snapshot), &copied) !=
+        KERNEL_UACCESS_STATUS_OK || copied != sizeof(snapshot))
         return;
-    pending_entry = pending & ~UINT64_C(1);
+    uint64_t entry = snapshot.first;
+    uint64_t pending_entry = snapshot.pending & ~UINT64_C(1);
     while ((entry & ~UINT64_C(1)) != head && limit-- != 0U) {
         uint64_t current = entry & ~UINT64_C(1);
 
@@ -591,18 +594,18 @@ static void robust_words(struct kernel_task *task, int32_t owner_tid)
         if (current != pending_entry) {
             if (entry & 1U) {
                 uint64_t address;
-                if (!robust_word_address(current,(int64_t)offset_bits,&address) ||
+                if (!robust_word_address(current,snapshot.offset,&address) ||
                     !kernel_futex_pi_robust(task,address,(uint32_t)owner_tid))return;
-            } else if (!robust_release_word(task,current,(int64_t)offset_bits,(uint32_t)owner_tid,0))return;
+            } else if (!robust_release_word(task,current,snapshot.offset,(uint32_t)owner_tid,0))return;
         }
         entry = next;
     }
     if (pending_entry != 0U) {
-        if(pending&1U) {
+        if(snapshot.pending&1U) {
             uint64_t address;
-            if(robust_word_address(pending_entry,(int64_t)offset_bits,&address))
+            if(robust_word_address(pending_entry,snapshot.offset,&address))
                 (void)kernel_futex_pi_robust(task,address,(uint32_t)owner_tid);
-        } else (void)robust_release_word(task,pending_entry,(int64_t)offset_bits,(uint32_t)owner_tid,1);
+        } else (void)robust_release_word(task,pending_entry,snapshot.offset,(uint32_t)owner_tid,1);
     }
 }
 void kernel_futex_release_robust(struct kernel_task *task,int32_t owner_tid)

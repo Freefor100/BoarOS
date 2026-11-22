@@ -38,7 +38,7 @@ enum physical_page_status physical_page_allocate_order(struct physical_page_allo
     stack_owned = 1; *address = physical_stack;
     return PHYSICAL_PAGE_STATUS_OK;
 }
-enum physical_page_status physical_page_resolve(const struct physical_page_allocator *owner,
+enum physical_page_status physical_page_map_owned(const struct physical_page_allocator *owner,
     uint64_t address, void **pointer)
 {
     assert(owner == &allocator && metadata_owned);

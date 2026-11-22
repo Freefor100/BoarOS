@@ -7782,6 +7782,22 @@ enum kernel_mm_status kernel_mm_prepare_futex(struct kernel_mm *mm,
                 return KERNEL_MM_STATUS_NOT_MAPPED;
             /* These directly mapped object pages have no inode/anonymous futex identity. */
             if (vmas[i].kind==KERNEL_VMA_KIND_OBJECT_SHARED) return KERNEL_MM_STATUS_ACCESS;
+            if (count == 1 && access == KERNEL_MM_READ) {
+                /* A single wait can check the mapping and borrow its page
+                 * together. Multi-address operations still validate all keys first. */
+                enum kernel_mm_status status;
+                {
+                    KERNEL_RAW_READ_SCOPE(guard, &record->metadata);
+                    if (pin_admission_closed(record)) __builtin_trap();
+                    status = pin_mapping(mm, record, address, access, pin, 0, 0);
+                }
+                if (status == KERNEL_MM_STATUS_NOT_MAPPED || status == KERNEL_MM_STATUS_ACCESS) {
+                    fault_index = i;
+                    break;
+                }
+                if (status) return status;
+                continue;
+            }
             struct kernel_mm_mapping mapping;
             enum kernel_mm_status status;
             { KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
@@ -7795,7 +7811,7 @@ enum kernel_mm_status kernel_mm_prepare_futex(struct kernel_mm *mm,
             if (!(mapping.permissions & (KERNEL_MM_READ | KERNEL_MM_WRITE | KERNEL_MM_EXECUTE)))
                 return KERNEL_MM_STATUS_ACCESS;
         }
-        if (fault_index == count && access) {
+        if (fault_index == count && access && !pin->registration) {
             enum kernel_mm_status status;
             { KERNEL_RAW_READ_SCOPE(guard, &record->metadata);
               if (pin_admission_closed(record)) __builtin_trap();
