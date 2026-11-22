@@ -166,6 +166,8 @@ void kernel_cost_raw_lock(struct kernel_cost_tag tag,unsigned rank,uint64_t wait
 {(void)tag;(void)rank;(void)wait;(void)hold;}
 void kernel_cost_page_metadata(struct kernel_cost_tag tag,uint64_t checked,uint64_t written,uint64_t elapsed)
 {(void)tag;(void)checked;(void)written;(void)elapsed;}
+void kernel_cost_tcp_input_dequeue(uint64_t queued,uint64_t locking,uint64_t locked)
+{(void)queued;(void)locking;(void)locked;}
 void kernel_cost_add_io(unsigned offset,uint64_t value) { (void)offset;(void)value; }
 void kernel_console_putc(char byte) { fputc((unsigned char)byte,stderr); }
 
@@ -1143,6 +1145,13 @@ static void udp_bind_ownership(void)
     kernel_socket_destroy(sender);kernel_socket_destroy(receiver);
 }
 
+static void udp_loopback_worker_wake(struct kernel_wait_node *node,uint32_t reason,uint64_t event)
+{
+    (void)event;
+    CHECK(reason==KERNEL_WAIT_WOKEN);
+    (*(unsigned *)node->context)++;
+}
+
 static void udp_loopback_payload(void)
 {
     struct netif *loop=netif_get_loopif();
@@ -1156,6 +1165,11 @@ static void udp_loopback_payload(void)
         CHECK(!kernel_socket_create(&test_heap,address.family,SOCKET_DGRAM,0,&receiver));
         CHECK(!kernel_socket_bind(receiver,&address) && !kernel_socket_getname(receiver,&address));
 
+        unsigned wakes=0;
+        struct kernel_wait_node work_node={.callback=udp_loopback_worker_wake,.context=&wakes};
+        struct kernel_wait_queue work;
+        kernel_wait_queue_init(&work);work.head=work.tail=&work_node;
+        kernel_socket_network_hooks(NULL,&work,NULL,NULL,NULL);
         struct pbuf *payloads[2];
         struct kernel_socket_protocol_scope scope;
         kernel_socket_protocol_enter(&scope);
@@ -1172,13 +1186,31 @@ static void udp_loopback_payload(void)
         }
         CHECK(loop->loop_first==payloads[0] && payloads[0]->next==payloads[1]);
         kernel_socket_protocol_leave(&scope);
-        CHECK(kernel_socket_service_pending((struct kernel_socket_service_budget){0,2,0}).packets==2);
-        CHECK(receiver->rx_bytes==4 && receiver->packets_head->payload==payloads[0] &&
-            receiver->packets_tail->payload==payloads[1] && !loop->loop_first);
+        CHECK(kernel_socket_service_pending((struct kernel_socket_service_budget){0,1,0}).packets==1);
+        CHECK(receiver->rx_bytes==3 && receiver->packets_head->payload==payloads[0] &&
+            loop->loop_first==payloads[1]);
+        struct kernel_open_file_description *pin=(void *)sender;
+        struct kernel_socket_write_request request={0};
+        CHECK(!kernel_socket_packet_prepare(&request,&pin,3,0,&address,1,NULL));
+        struct pbuf *fifo_payload=request.protocol_payload;
+        CHECK(kernel_socket_packet_write(&request,NULL,NULL,"fifo",NULL,NULL)==3);
+        CHECK(receiver->rx_bytes==7 && receiver->packets_head->next->payload==payloads[1] &&
+            receiver->packets_tail->payload==fifo_payload && !loop->loop_first);
         CHECK(!payloads[0]->next && !payloads[1]->next && payloads[1]->tot_len==0);
         char data[3];
         CHECK(pbuf_copy_partial(payloads[0],data,sizeof(data),0)==sizeof(data) && !memcmp(data,"udp",3));
+        CHECK(wakes==1);
+
+        /* An isolated syscall delivers its own record without waking the
+         * worker. Delivery still publishes normal receive readiness. */
+        CHECK(!kernel_socket_packet_prepare(&request,&pin,sizeof(data),0,&address,1,NULL));
+        struct pbuf *inline_payload=request.protocol_payload;
+        CHECK(kernel_socket_packet_write(&request,NULL,NULL,"now",NULL,NULL)==sizeof(data));
+        CHECK(pin==(void *)sender && receiver->packets_tail->payload==inline_payload);
+        CHECK(pbuf_copy_partial(inline_payload,data,sizeof(data),0)==sizeof(data) && !memcmp(data,"now",3));
+        CHECK(!loop->loop_first && wakes==1 && (kernel_socket_poll(receiver,NULL)&KERNEL_POLLIN));
         kernel_socket_destroy(sender);kernel_socket_destroy(receiver);
+        kernel_socket_network_hooks(NULL,NULL,NULL,NULL,NULL);
         CHECK(STATS_GET(mem.used)==memory && !heap_live);
     }
 }
@@ -1626,6 +1658,75 @@ static void tcp_lookup_test_drain(struct socket_tcp_owner *owner)
     struct socket_tcp_input input;
     CHECK(tcp_owner_take_input(owner,&input,1)==1);
     tcp_owner_receive(owner,&input);
+}
+
+static void tcp_shard_receive_before_wait(void)
+{
+    struct kernel_socket *listener = NULL, *client = NULL, *server = NULL;
+    connected_pair(&listener,&client,&server);
+    struct socket_tcp_owner *owner = tcp_lookup_test_start();
+    struct kernel_socket_protocol_scope scope;
+    kernel_socket_protocol_enter(&scope);
+    struct netif *loop = loopback_netif();
+    CHECK(tcp_promote(server,&scope) && tcp_promote(client,&scope));
+    for (unsigned i = 1; i < TCP_RX_BATCH; i++)
+        tcp_lookup_test_dispatch(tcp_lookup_test_packet(client->tcp,loop),loop,client->tcp);
+    kernel_socket_protocol_leave(&scope);
+
+    CHECK(tcp_owner_lock(&scope,owner,0));
+    CHECK(tcp_write(client->tcp,"a",1,TCP_WRITE_FLAG_COPY)==ERR_OK);
+    socket_tcp_output(client->tcp);
+    CHECK(owner->count==TCP_RX_BATCH && client->tcp->unacked);
+    client->tx_budget=0;
+    kernel_socket_protocol_leave(&scope);
+
+    kernel_socket_protocol_enter(&scope);
+    struct pbuf *suffix = tcp_lookup_test_packet(client->tcp,loop);
+    struct tcp_hdr *ack=suffix->payload;
+    ack->ackno=lwip_htonl(client->tcp->snd_nxt);
+    ack->chksum=0;
+    ack->chksum=ip_chksum_pseudo(suffix,IP_PROTO_TCP,suffix->tot_len,&client->tcp->remote_ip,&client->tcp->local_ip);
+    tcp_lookup_test_dispatch(suffix,loop,client->tcp);
+    kernel_socket_protocol_leave(&scope);
+    CHECK(owner->count==TCP_RX_BATCH+1 && !kernel_socket_receive_ready(server));
+    CHECK(kernel_socket_wait_ready(server,KERNEL_POLLIN,0,KERNEL_SOCKET_MSG_DONTWAIT)==-KERNEL_EAGAIN);
+    CHECK(owner->count==TCP_RX_BATCH+1);
+
+    CHECK(!pthread_mutex_lock(&model_tcp_mutex[0]));
+    tcp_owner_receive_before_wait(owner);
+    CHECK(owner->count==TCP_RX_BATCH+1);
+    CHECK(!pthread_mutex_unlock(&model_tcp_mutex[0]));
+
+    CHECK(!kernel_socket_wait_ready(server,KERNEL_POLLIN,0,0));
+    CHECK(kernel_socket_receive_ready(server) && server->rx_bytes==1);
+    CHECK(pbuf_get_at(server->packets_head->payload,0)=='a');
+    /* Receiving the byte can append an ACK, which must follow the suffix. */
+    CHECK(owner->count && owner->ring[owner->head].packet==suffix);
+
+    unsigned notifications=0;
+    struct kernel_wait_node observer={0};
+    kernel_wait_node_init_callback(&observer,tcp_inline_ack_ready,&notifications);
+    kernel_wait_queue_add(&client->wait,&observer);
+    CHECK(!(kernel_socket_poll(client,NULL)&KERNEL_POLLOUT));
+    CHECK(!kernel_socket_wait_ready(client,KERNEL_POLLOUT,0,0));
+    CHECK(kernel_socket_poll(client,NULL)&KERNEL_POLLOUT);
+    CHECK(!client->tcp->unacked && notifications==1);
+    CHECK(kernel_wait_node_remove_sync(&observer)==KERNEL_SCHEDULER_STATUS_OK);
+
+    CHECK(tcp_owner_lock(&scope,owner,0));
+    tcp_abandon(client->tcp,0);
+    tcp_abandon(server->tcp,0);
+    /* Retire the queued suffix and any replies after removing both routes. */
+    for (unsigned count=owner->count; count; count--) tcp_lookup_test_drain(owner);
+    kernel_socket_protocol_leave(&scope);
+    kernel_socket_destroy(server);
+    kernel_socket_destroy(client);
+    kernel_socket_destroy(listener);
+    CHECK(!owner->count);
+    CHECK(!owner->context.active && !heap_live);
+    CHECK(!kernel_wait_queue_close(&owner->work) && !kernel_wait_queue_destroy(&owner->work));
+    tcp_owner_count=0;
+    puts("PASS blocked TCP reader and writer process ordered shard input before parking");
 }
 
 static void tcp_owner_lookup(void)
@@ -5529,6 +5630,98 @@ static void unix_peer_identity(void)
 }
 
 #if BOAROS_USER_SMP
+static struct kernel_socket *retirement_socket;
+static struct kernel_socket_read_request *retirement_request;
+
+static void parallel_receive_payload_free(struct pbuf *payload)
+{
+    CHECK(payload && !protocol_current_owner() && !current_tcp_owner());
+    CHECK(arch_interrupt_is_enabled() && retirement_socket->read_request==retirement_request);
+    CHECK(retirement_request->pin==(void *)retirement_socket && !retirement_socket->retired_head);
+    retired_payloads++;
+}
+
+static void parallel_receive_retirement(void)
+{
+    model_boot_cpus=2;
+    kernel_socket_network_initialize();
+    CHECK(boaros_lwip_parallel_enabled());
+    struct kernel_socket *listener=NULL,*client=NULL,*socket=NULL;
+    connected_pair(&listener,&client,&socket);
+    unsigned saves=network_host_irq_saves;
+    CHECK(!kernel_socket_filter_get(socket) && network_host_irq_saves==saves);
+    raw_filter_test.references=1;
+    CHECK(!kernel_socket_filter_set(socket,(void *)&raw_filter_test));
+    struct kernel_bpf_program *program=kernel_socket_filter_get(socket);
+    CHECK(program==(void *)&raw_filter_test && raw_filter_test.references==2);
+    CHECK(!kernel_socket_filter_set(socket,NULL) && raw_filter_test.references==1);
+    kernel_bpf_program_put(program);
+    CHECK(!raw_filter_test.references);
+    struct kernel_open_file_description *pin=(void *)socket;
+    struct kernel_socket_read_request request={0};
+    struct pbuf_custom custom={.custom_free_function=parallel_receive_payload_free};
+    unsigned char input[]={'l','o','a','n'},output[sizeof(input)];
+    struct kernel_socket_protocol_scope scope;
+    kernel_socket_protocol_enter(&scope);
+    struct pbuf *payload=pbuf_alloced_custom(PBUF_RAW,sizeof(input),PBUF_REF,&custom,input,sizeof(input));
+    CHECK(payload);
+    socket->tcp->rcv_wnd-=sizeof(input);
+    CHECK(tcp_data_received(socket,socket->tcp,payload,ERR_OK)==ERR_OK);
+    kernel_socket_protocol_leave(&scope);
+
+    struct kernel_socket_message peek={.flags=KERNEL_SOCKET_MSG_PEEK};
+    CHECK(kernel_socket_reserve_read(socket,NULL,&request,&pin,sizeof(input),0,&peek)==sizeof(input));
+    kernel_socket_copy_read(&request,0,output,sizeof(output));
+    CHECK(kernel_socket_finish_read(&request,0)==sizeof(output));
+    CHECK(!retired_payloads && socket->packets_head && !memcmp(output,input,sizeof(input)));
+
+    retirement_socket=socket;
+    retirement_request=&request;
+    CHECK(kernel_socket_reserve_read(socket,NULL,&request,&pin,sizeof(input),0,NULL)==sizeof(input));
+    CHECK(kernel_socket_finish_read(&request,0)==sizeof(input));
+    CHECK(retired_payloads==1 && !socket->retired_head && !socket->packets_head &&
+        !socket->read_request && pin==(void *)socket);
+    CHECK(socket->receive_credit==sizeof(input));
+    kernel_socket_protocol_enter(&scope);
+    retire_received(socket);
+    CHECK(!socket->receive_credit);
+    tcp_abort(client->tcp);
+    if (socket->tcp) tcp_abort(socket->tcp);
+    kernel_socket_protocol_leave(&scope);
+    kernel_socket_destroy(socket);
+    kernel_socket_destroy(client);
+    kernel_socket_destroy(listener);
+    for (unsigned i=0;i<8 && loopback_pending;i++)
+        (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+    CHECK(!heap_live);
+
+    socket=NULL;
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_DGRAM,0,&socket));
+    struct kernel_socket_address local={.family=KERNEL_SOCKET_AF_INET,.bytes={127,0,0,1}};
+    CHECK(!kernel_socket_bind(socket,&local) && !kernel_socket_getname(socket,&local));
+    CHECK(!kernel_socket_connect(socket,&local,0));
+    CHECK(write_buffer(socket,input,sizeof(input),0)==sizeof(input));
+    CHECK(socket->packets_head && socket->packets_head->loopback);
+    pin=(void *)socket;
+    CHECK(kernel_socket_reserve_read(socket,NULL,&request,&pin,sizeof(input),0,NULL)==sizeof(input));
+    CHECK(kernel_socket_finish_read(&request,0)==sizeof(input) && !socket->retired_head);
+
+    ip_addr_t source; IP_ADDR4(&source,10,77,0,1);
+    custom.custom_free_function=retired_payload_free;
+    kernel_socket_protocol_enter(&scope);
+    payload=pbuf_alloced_custom(PBUF_RAW,sizeof(input),PBUF_REF,&custom,input,sizeof(input));
+    CHECK(payload);
+    udp_received(socket,socket->udp,payload,&source,18000);
+    kernel_socket_protocol_leave(&scope);
+    CHECK(socket->packets_head && !socket->packets_head->loopback);
+    CHECK(kernel_socket_reserve_read(socket,NULL,&request,&pin,sizeof(input),0,NULL)==sizeof(input));
+    CHECK(kernel_socket_finish_read(&request,0)==sizeof(input) && socket->retired_head);
+    CHECK(retired_payloads==1);
+    kernel_socket_destroy(socket);
+    CHECK(retired_payloads==2 && !heap_live);
+    puts("PASS parallel receive returns TCP and loopback UDP locally, retaining external UDP retirement");
+}
+
 static void tcp_single_cpu_service(void)
 {
     model_boot_cpus = 1;
@@ -5584,6 +5777,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "tcp-ack-batch")) tcp_ack_receive_batch();
 #if BOAROS_USER_SMP
     else if (!strcmp(argv[1], "tcp-single-cpu-service")) tcp_single_cpu_service();
+    else if (!strcmp(argv[1], "tcp-shard-receive-before-wait")) tcp_shard_receive_before_wait();
     else if (!strcmp(argv[1], "tcp-owner-lookup")) tcp_owner_lookup();
     else if (!strcmp(argv[1], "tcp-owner-placement")) tcp_owner_placement();
     else if (!strcmp(argv[1], "tcp-physical-submit")) tcp_physical_submit_contract();
@@ -5631,6 +5825,9 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "concurrent-reservation")) {concurrent_reservation();return 0;}
     else if (!strcmp(argv[1], "protocol-owner")) { protocol_ownership(); return 0; }
     else if (!strcmp(argv[1], "endpoint-owner")) endpoint_ownership();
+#if BOAROS_USER_SMP
+    else if (!strcmp(argv[1], "parallel-receive-retire")) parallel_receive_retirement();
+#endif
     else if (!strcmp(argv[1], "receive-chains")) receive_packet_chains();
     else if (!strcmp(argv[1], "receive-prefix")) receive_prefix();
     else if (!strcmp(argv[1], "protocol-transaction")) protocol_transaction();
