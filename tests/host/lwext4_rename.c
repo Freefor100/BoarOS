@@ -283,6 +283,33 @@ static void basic(struct ext4_fs *fs)
     CHECK(length == strlen("/old/source") && !memcmp(name, "/old/source", length));
 }
 
+static void exchange_entries(struct ext4_fs *fs)
+{
+    uint32_t old=directory("/old"),new=directory("/new");
+    uint32_t dir=directory("/old/dir"),file=inode("/new/target");
+    struct ext4_rename_result out={0};
+    CHECK(rename_entry(old,"dir",new,"absent",2,&out)==ENOENT);
+    CHECK(rename_entry(old,"dir",dir,"item",2,&out)==EINVAL);
+    CHECK(rename_entry(dir,"item",old,"dir",2,&out)==EINVAL);
+    CHECK(ext4_transaction_begin("/")==EOK);
+    CHECK(rename_entry(old,"dir",new,"target",2,&out)==EOK && out.changed);
+    CHECK(ext4_transaction_abort("/",ECANCELED)==ECANCELED);
+    CHECK(directory("/old/dir")==dir && inode("/new/target")==file);
+    CHECK(dotdot(fs,dir)==old && links(fs,old)==3 && links(fs,new)==3);
+    CHECK(rename_entry(old,"dir",new,"target",2,&out)==EOK &&
+        out.changed && !out.replaced_inode && !out.replaced_last_link);
+    CHECK(inode("/old/dir")==file && directory("/new/target")==dir);
+    CHECK(dotdot(fs,dir)==new && links(fs,old)==2 && links(fs,new)==4);
+    CHECK(links(fs,file)==1);
+    content("/old/dir","TARGET");
+    content("/new/target/item","CHILD");
+    CHECK(rename_entry(new,"target",new,"empty",2,&out)==EOK && out.changed);
+    CHECK(directory("/new/empty")==dir && dotdot(fs,dir)==new);
+    CHECK(links(fs,new)==4);
+    CHECK(!fs->active_operations && !ext4_current_operation(fs));
+    puts("PASS exchange: cross-parent mixed types, parent link counts, ancestry and abort");
+}
+
 static void serial_refs(struct ext4_fs *fs)
 {
     CHECK(!fs->os_locks || !fs->os_locks->resource_acquire);
@@ -663,6 +690,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[3], "orphan-reclaim")) return 0;
     }
     else if (!strcmp(argv[2], "basic")) basic(dev.fs);
+    else if (!strcmp(argv[2], "exchange")) exchange_entries(dev.fs);
     else if (!strcmp(argv[2], "serial-refs")) serial_refs(dev.fs);
     else if (!strcmp(argv[2], "source-leaf-split")) source_leaf_split(dev.fs);
     else if (!strcmp(argv[2], "hardlink")) hardlink(dev.fs);

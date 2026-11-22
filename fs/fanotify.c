@@ -821,7 +821,7 @@ static int modify_mark(struct kernel_files *files, const struct kernel_fs_contex
     if (error) return error;
     uint64_t fsid = 0;
     if (group->fid) {
-        if (kernel_vfs_handle_type(path) < 0) return -KERNEL_EOPNOTSUPP;
+        if (kernel_vfs_handle_type(path,!type) < 0) return -KERNEL_EOPNOTSUPP;
         if (command == FAN_MARK_ADD) {
             struct kernel_vfs_statfs stat;
             error = kernel_vfs_mount_statfs(path->file.mount, &stat);

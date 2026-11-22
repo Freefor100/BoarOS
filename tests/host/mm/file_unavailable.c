@@ -74,6 +74,13 @@ EXCLUDED(kernel_page_cache_acquire_ready)
 EXCLUDED(kernel_page_cache_resident)
 EXCLUDED(kernel_page_cache_alias_attach)
 EXCLUDED(kernel_page_cache_alias_detach)
+EXCLUDED(kernel_page_cache_alias_attach_window)
+struct kernel_page_cache_alias;
+void kernel_page_cache_alias_detach_batch(struct kernel_page_cache_alias **aliases,unsigned count)
+{
+    (void)aliases;
+    if (count) mm_file_unavailable();
+}
 EXCLUDED(kernel_page_cache_alias_clone)
 EXCLUDED(kernel_page_cache_alias_mark_dirty)
 EXCLUDED(kernel_page_cache_alias_drain)

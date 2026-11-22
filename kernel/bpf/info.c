@@ -220,7 +220,8 @@ int kernel_bpf_fdinfo(const struct kernel_open_file_description *file,char *buff
     }
     case BPF_OBJECT_PERF:{
         struct bpf_perf *event=(void *)object;
-        field(&out,"perf_event_attr.type",2);field(&out,"pmu_type",2);
+        unsigned type=event->cpu_clock?1:2;
+        field(&out,"perf_event_attr.type",type);field(&out,"pmu_type",type);
         text(&out,"perf_event_attr.config:\t0x");number(&out,event->event,16);text(&out,"\n");
         text(&out,"perf_event_attr.config1:\t0x0\nperf_event_attr.config2:\t0x0\n"
             "perf_event_attr.config3:\t0x0\nperf_event_attr.config4:\t0x0\n");break;

@@ -4,6 +4,7 @@
 #include <kernel/errno.h>
 #include <kernel/irq.h>
 #include <kernel/accounting.h>
+#include <kernel/credentials.h>
 
 enum { ACCOUNT_KERNEL, ACCOUNT_USER, ACCOUNT_INTERRUPT };
 
@@ -59,7 +60,9 @@ static __attribute__((noinline)) int accounting_initialize(struct kernel_cpu *cp
     KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
     if (!cpu->current) return 0;
     cpu->accounting_owner=cpu->current;
-    __atomic_store_n(&cpu->accounting_started_ticks,accounting_counter(),__ATOMIC_RELAXED);
+    uint64_t now=accounting_counter();
+    cpu->accounting_dispatch_ticks=now;
+    __atomic_store_n(&cpu->accounting_started_ticks,now,__ATOMIC_RELAXED);
     return 1;
 }
 /* Scheduling consumes the same real execution counters as CPU clocks, not
@@ -115,6 +118,7 @@ void scheduler_cpu_time_switch(struct kernel_task *previous,struct kernel_task *
     if (!cpu->accounting_owner) {
         cpu->accounting_owner=previous;
         cpu->accounting_started_ticks=now;
+        cpu->accounting_dispatch_ticks=now;
     }
     if (cpu->accounting_owner!=previous) __builtin_trap();
     accounting_write_begin(cpu);
@@ -132,8 +136,40 @@ void scheduler_cpu_time_switch(struct kernel_task *previous,struct kernel_task *
             previous->state==KERNEL_THREAD_STATE_EXITED) previous->usage.voluntary++;
         else previous->usage.involuntary++;
     }
+    /* PERF_COUNT_SW_CPU_CLOCK includes the whole dispatched interval. User
+     * and system time above deliberately exclude interrupt handling. */
+    previous->scheduled_ticks+=now-cpu->accounting_dispatch_ticks;
+    cpu->accounting_dispatch_ticks=now;
     cpu->accounting_owner=next;
 }
+
+int kernel_task_perf_clock_authorize(const struct kernel_task *caller,
+    const struct kernel_task *target, int perfmon)
+{
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    if (!target->accounted || target->retirement || !target->arch.user_mode ||
+        target->state==KERNEL_THREAD_STATE_EXITED ||
+        target->state==KERNEL_THREAD_STATE_ZOMBIE ||
+        target->state==KERNEL_THREAD_STATE_GROUP_DEAD) return -KERNEL_ESRCH;
+    return perfmon || kernel_credentials_may_access_locked(caller,target,0)
+        ? 0 : -KERNEL_EACCES;
+}
+
+uint64_t kernel_task_scheduled_ns(const struct kernel_task *task)
+{
+    /* The context switch publishes the dispatch timestamp and owner under
+     * the same protection. The hardware clock advances between switches. */
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    KERNEL_RUN_SET(runs);
+    uint64_t elapsed=task->scheduled_ticks;
+    for (struct kernel_cpu *cpu=scheduler.cpus;cpu;cpu=cpu->scheduler_next) {
+        if (cpu->accounting_owner!=task) continue;
+        elapsed+=accounting_counter()-cpu->accounting_dispatch_ticks;
+        break;
+    }
+    return kernel_time_ticks_to_ns(elapsed);
+}
+
 void scheduler_task_cpu_time_locked(const struct kernel_task *task,uint64_t *user,uint64_t *system)
 {
     KERNEL_RUN_SET(runs);

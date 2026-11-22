@@ -349,7 +349,7 @@ Finish_open:
     description->open_flags = (uint32_t)((flags & LINUX_O_PATH) ? flags & ~LINUX_O_CLOEXEC : flags);
     if (!(flags&LINUX_O_PATH)) {
         description->notify_opened=1;
-        kernel_vfs_notify_file(&description->file,VFS_NOTIFY_OPEN);
+        kernel_vfs_notify_open(&description->file,&description->notify_backing);
     }
     enum kernel_files_status files_status = kernel_files_install_new_owned_at(files,
                                                      fd,
@@ -572,7 +572,7 @@ int kernel_files_name_to_handle(struct kernel_files *files, const struct kernel_
         if (result) return result;
     }
     kernel_task_io_buffer_release(&path_buffer);
-    int type = kernel_vfs_handle_type(resolved);
+    int type = kernel_vfs_handle_type(resolved,flags & LINUX_HANDLE_FID);
     if (type < 0) return type;
     if (flags & LINUX_HANDLE_CONNECTABLE) return -KERNEL_EOPNOTSUPP;
     struct linux_file_handle_header input;

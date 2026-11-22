@@ -138,7 +138,7 @@ int kernel_open_file_advise(struct kernel_open_file_description *file,int64_t of
         return 0;
     }
     struct kernel_page_cache *cache=kernel_vfs_file_page_cache(&file->file);
-    struct kernel_vfs_node *node=kernel_vfs_file_node(&file->file);
+    struct kernel_vfs_node *node=kernel_vfs_file_node(kernel_vfs_data_file(&file->file));
     if (!cache || !node) return 0;
     uint64_t start=(uint64_t)offset,end=length?(uint64_t)offset+(uint64_t)length:UINT64_MAX;
     if (end>INT64_MAX) end=UINT64_MAX;
@@ -190,6 +190,7 @@ void kernel_open_file_read_progress(struct kernel_open_file_description *file,
     const unsigned maximum=BOAROS_PAGE_CACHE_READAHEAD_PAGES*((policy&KERNEL_READ_SEQUENTIAL)?2U:1U);
     if (!open_file_live(file) || file->kind!=KERNEL_OPEN_FILE_KIND_REGULAR ||
         kernel_open_file_memory_backed(file) || kernel_vfs_file_generated(&file->file)) return;
+    if (kernel_vfs_data_file(&file->file)!=&file->file) return;
     /* A demand batch already as large as the prediction window needs no
      * competing speculative stream. Tiny configured windows still train on
      * page reads; the useful demand batching threshold starts at 16 KiB. */
@@ -269,7 +270,8 @@ struct kernel_flock_identity *kernel_open_file_flock_identity(
 struct kernel_vfs_path *kernel_open_file_path(
     const struct kernel_open_file_description *description)
 {
-    return open_file_live(description) ? description->file.path : 0;
+    return open_file_live(description) ?
+        (description->mapping_path ? description->mapping_path : description->file.path) : NULL;
 }
 
 static void release_record_locks(struct kernel_open_file_description *file)
@@ -335,6 +337,43 @@ static int finish_path_open(struct kernel_open_file_description *file, struct ke
     }
     initialize_path_description(file, heap);
     return 0;
+}
+
+int kernel_open_file_mapping_backing(struct kernel_open_file_description **owner)
+{
+    struct kernel_open_file_description *file=*owner;
+    if (kernel_vfs_data_file(&file->file)==&file->file) return 0;
+    struct kernel_vfs_path *path=kernel_vfs_backing_path(&file->file);
+    if (!path) return -KERNEL_EOVERFLOW;
+    struct kernel_open_file_description *backing=NULL;
+    int error=kernel_heap_allocate_zeroed(file->heap,1,sizeof(*backing),(void **)&backing) ?
+        -KERNEL_ENOMEM : kernel_vfs_path_open(path,&backing->file);
+    if (kernel_vfs_path_release(&path)) __builtin_trap();
+    if (error) {
+        if (backing) kernel_heap_release(file->heap,backing);
+        return error;
+    }
+    initialize_path_description(backing,file->heap);
+    backing->open_flags=kernel_open_file_flags(file);
+    if (backing->open_flags&3U) error=kernel_vfs_file_acquire_write(&backing->file);
+    if (!error) {
+        error=kernel_vfs_path_acquire(file->file.path);
+        if (!error) backing->mapping_path=file->file.path;
+    }
+    if (error) {
+        if (kernel_open_file_release(&backing)) __builtin_trap();
+        return error;
+    }
+    if (kernel_open_file_release(owner)) __builtin_trap();
+    *owner=backing;
+    return 0;
+}
+
+int kernel_open_file_mapping_noexec(const struct kernel_open_file_description *file)
+{
+    const struct kernel_vfs_mount *view=file->mapping_path ?
+        kernel_vfs_path_mount(file->mapping_path) : file->file.mount;
+    return view->noexec;
 }
 
 int kernel_files_open_fanotify_event(struct kernel_files *files, struct kernel_vfs_path *path,
@@ -1034,8 +1073,8 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
     if (first) {
         kernel_open_file_async_close(file);
         if (file->notify_opened)
-            kernel_vfs_notify_file(&file->file,(__atomic_load_n(&file->open_flags,__ATOMIC_RELAXED)&3U) ?
-                VFS_NOTIFY_CLOSE_WRITE : VFS_NOTIFY_CLOSE_NOWRITE);
+            kernel_vfs_notify_close(&file->file,(__atomic_load_n(&file->open_flags,__ATOMIC_RELAXED)&3U) ?
+                VFS_NOTIFY_CLOSE_WRITE : VFS_NOTIFY_CLOSE_NOWRITE,&file->notify_backing);
         reset_read_prediction(file);release_record_locks(file);
         kernel_flock_release(&file->flock_owner);
         kernel_flock_destroy(&file->flock_identity);
@@ -1114,6 +1153,7 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
         kernel_mm_pagemap_put(file->proc_pagemap);
         kernel_heap_release(file->heap, file->proc_pagemap);
     }
+    if (file->mapping_path && kernel_vfs_path_release(&file->mapping_path)) __builtin_trap();
     kernel_credentials_put(file->credentials);
     kernel_heap_release(file->heap, file);
     *owner = 0;
@@ -1423,7 +1463,7 @@ static inline __attribute__((always_inline)) enum kernel_page_cache_status disk_
     uint64_t index,uint64_t *address,size_t *valid,int read_window)
 {
     uint32_t policy=__atomic_load_n(&file->read_advice,__ATOMIC_RELAXED);
-    return kernel_page_cache_get_for_fault(cache,&file->file,index,address,valid,
+    return kernel_page_cache_get_for_fault(cache,kernel_vfs_data_file(&file->file),index,address,valid,
         policy&(KERNEL_READ_RANDOM|KERNEL_READ_NOREUSE) ? KERNEL_PAGE_CACHE_FAULT_SINGLE : read_window,
         !!(policy&KERNEL_READ_NOREUSE));
 }
@@ -1455,7 +1495,7 @@ int kernel_open_file_try_prepare_disk_mapping_page(struct kernel_open_file_descr
     uint64_t address;
     size_t valid;
     if (kernel_page_cache_lookup_ready(kernel_vfs_file_page_cache(&file->file),
-        &file->file,index,&address,&valid,!!(policy&KERNEL_READ_NOREUSE))) return 0;
+        kernel_vfs_data_file(&file->file),index,&address,&valid,!!(policy&KERNEL_READ_NOREUSE))) return 0;
     *prepared=(struct kernel_open_file_page_preparation){.address=address,.index=index,.pending=1};
     return 1;
 }
@@ -1531,7 +1571,7 @@ enum kernel_page_cache_status kernel_open_file_get_page(
     if (kernel_open_file_memory_backed(file)) return memory_page(file,page_index,physical_address,valid_bytes,1,&created);
     return kernel_page_cache_get(
         kernel_vfs_file_page_cache(&file->file),
-        &file->file,
+        kernel_vfs_data_file(&file->file),
         page_index,
         physical_address,
         valid_bytes);
@@ -1550,7 +1590,7 @@ enum kernel_page_cache_status kernel_open_file_lookup_page(
     if (kernel_open_file_memory_backed(file)) return memory_page(file,page_index,physical_address,valid_bytes,0,0);
     return kernel_page_cache_lookup(
         kernel_vfs_file_page_cache(&file->file),
-        &file->file,
+        kernel_vfs_data_file(&file->file),
         page_index,
         physical_address,
         valid_bytes);

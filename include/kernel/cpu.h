@@ -39,6 +39,8 @@ struct kernel_cpu {
     /* 由实际栈交接转移；current可提前发布下一任务。 */
     struct kernel_task *accounting_owner;
     uint64_t accounting_started_ticks;
+    /* Fixed for the current dispatch; started_ticks changes at traps. */
+    uint64_t accounting_dispatch_ticks;
     uint64_t accounting_user_ticks, accounting_kernel_ticks;
 #if BOAROS_MAX_CPUS > 1
     /* 本CPU在IRQ关闭下写；远端读者用代次重试，owner仍由调度域转移。 */

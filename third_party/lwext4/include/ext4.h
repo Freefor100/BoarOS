@@ -465,9 +465,10 @@ struct ext4_rename_result {
 	bool replaced_last_link;
 	bool changed;
 };
+enum { EXT4_RENAME_NOREPLACE = 1, EXT4_RENAME_EXCHANGE = 2 };
 
 /* Rename one directory entry without resolving an absolute pathname. Flags
- * are 0 or 1 (NOREPLACE). Requires an active journal and caller-held
+ * are 0, EXT4_RENAME_NOREPLACE or EXT4_RENAME_EXCHANGE. Requires an active journal and caller-held
  * namespace qualifications for the affected directories and inodes. A replaced inode keeps its contents; its last link is transferred
  * to the persistent orphan owner until the caller releases live references.
  * Results are published only on success. Within an outer transaction they

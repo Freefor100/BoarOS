@@ -60,6 +60,7 @@ static void mount_arguments_initialize(struct mount_arguments *storage)
     /* Legacy mount chooses the caller view at creation, unlike fsopen's
      * retained view. Heap contents are not guaranteed to start at zero. */
     storage->parameters.pid_view=NULL;
+    memset(storage->parameters.overlay_layers,0,sizeof(storage->parameters.overlay_layers));
 }
 static __attribute__((noinline)) int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context *fs,
                       const struct kernel_syscall_request *request)
@@ -87,7 +88,8 @@ static __attribute__((noinline)) int mount_filesystem(struct kernel_mm *mm, cons
         if (result) goto Finish;
     }
     if (!(flags & (LINUX_MS_BIND|LINUX_MS_MOVE)) && request->arguments[4]) {
-        result = import_string(mm, options, 256,
+        size_t capacity=!strcmp(type,"overlay")?KERNEL_MOUNT_OPTIONS_MAX:256U;
+        result = import_string(mm, options, capacity,
                                request->arguments[4]);
         if (result) goto Finish;
     }

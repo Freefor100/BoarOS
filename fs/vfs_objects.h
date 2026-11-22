@@ -171,6 +171,9 @@ struct kernel_vfs_backend {
         const struct physical_page_allocator *);
     int (*error)(struct kernel_vfs_instance *instance);
     const struct kernel_vfs_export_ops *export;
+    /* A stacked file has its own notification identity. An owned backing
+     * path adds an inode/filesystem event for the object doing the work. */
+    struct kernel_vfs_path *(*event_backing)(struct kernel_vfs_node *);
     int (*root)(struct kernel_vfs_instance *instance, uint64_t *inode, uint32_t *mode);
     /* Owned-name backends accept NULL mode: open imports real inode state. */
     int (*lookup)(struct kernel_vfs_instance *instance, uint64_t parent,
@@ -178,6 +181,12 @@ struct kernel_vfs_backend {
     /* Optional lookup through the live, namespace-qualified directory. */
     int (*lookup_node)(struct kernel_vfs_node *parent, const char *name,
         size_t length, uint64_t *inode, uint32_t *mode);
+    /* Layered filesystems may acquire the real object while resolving a name. */
+    int (*lookup_open)(struct kernel_vfs_node *, const char *, size_t,
+        struct kernel_vfs_file *);
+    const struct kernel_vfs_file *(*data_file)(struct kernel_vfs_node *);
+    int (*prepare_access)(struct kernel_vfs_path *, unsigned);
+    int (*copy_up)(struct kernel_vfs_file *);
     /* A backend with one directory entry per inode can expose several lookup
      * spellings (VFAT long/short names). They share one canonical path owner. */
     int (*entry_name)(struct kernel_vfs_instance *, uint64_t inode, char *, size_t);

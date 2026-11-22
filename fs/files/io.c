@@ -489,8 +489,9 @@ static enum kernel_files_status disk_read(
 {
     if (kernel_open_file_flags(description)&KERNEL_FILES_O_DIRECT)
         return direct_read(files,mm,description,cursor,request,position,advance,linux_result);
-    struct kernel_page_cache *cache=kernel_open_file_page_cache(description);
-    struct kernel_vfs_node *node=kernel_open_file_node(description);
+    const struct kernel_vfs_file *backing=kernel_vfs_data_file(&description->file);
+    struct kernel_page_cache *cache=kernel_vfs_file_page_cache(backing);
+    struct kernel_vfs_node *node=kernel_vfs_file_node(backing);
     uint64_t total = 0;
     int error = 0, done = 0;
     enum kernel_files_status status = KERNEL_FILES_STATUS_OK;
@@ -511,7 +512,7 @@ static enum kernel_files_status disk_read(
         struct kernel_page_cache_read_page pages[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
         enum kernel_page_cache_status loaded;
         loaded = kernel_page_cache_get_batch(
-            cache, &description->file,
+            cache, backing,
             position >> BOAROS_PAGE_SHIFT, pages, count, no_reuse);
         if (loaded == KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT) {
             status=KERNEL_FILES_STATUS_STATE;

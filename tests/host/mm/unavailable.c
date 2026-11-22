@@ -69,6 +69,7 @@ void kernel_shm_attachment_release(struct kernel_shm_attachment **owner)
 EXCLUDED(kernel_file_mapping_prepare)
 
 EXCLUDED(kernel_open_file_vfs_borrow)
+EXCLUDED(kernel_open_file_mapping_noexec)
 EXCLUDED(kernel_open_file_page_cache)
 EXCLUDED(kernel_open_file_prepare_mapping_page)
 EXCLUDED(kernel_open_file_try_prepare_disk_mapping_page)

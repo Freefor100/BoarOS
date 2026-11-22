@@ -379,6 +379,7 @@ COMMON_C_SOURCES := \
 	fs/procfs.c \
 	fs/bpffs.c fs/tracefs.c fs/sysfs.c fs/cgroupfs.c \
 	fs/tmpfs.c \
+	fs/overlay.c \
 	fs/disk_mount.c \
 	fs/fat32.c \
 	fs/ext4_backend.c \

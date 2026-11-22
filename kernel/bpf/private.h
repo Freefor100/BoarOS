@@ -70,6 +70,9 @@ struct bpf_perf {
     int32_t pid,cpu;
     uint32_t event;
     uint8_t enabled,registered,file_closed;
+    uint8_t cpu_clock;
+    struct kernel_raw_lock clock_lock;
+    uint64_t clock_start;
 };
 struct bpf_link {
     struct bpf_object object;

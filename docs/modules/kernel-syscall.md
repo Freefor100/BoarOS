@@ -56,7 +56,7 @@ LA的259仍返回`ENOSYS`。这些入口的直接消费者可用`python3 tests/u
 | fanotify_init/mark（262/263） | [文件模块](kernel-files.md#fanotify-文件访问通知)：标记范围、按组排队、事件描述符与文件句柄 |
 | getcwd（17）、mkdirat/unlinkat/symlinkat（34–36）、renameat/renameat2（38/276）、chdir/fchdir（49/50）、openat/close（56/57）、readlinkat（78） | [文件模块](kernel-files.md)：路径、flags、dirfd 与错误 |
 | ftruncate/fallocate（46/47）、pipe2（59）、getdents64/lseek（61/62）、read/write/readv/writev/pread64/pwrite64/preadv/pwritev（63–70） | [文件模块](kernel-files.md)：部分成功、offset、pin、稀疏文件、pipe 与目录 cookie |
-| bpf（280）、perf_event_open（241） | [BPF 模块](kernel-bpf.md)：对象/map/程序/BTF、socket 过滤与 raw_syscalls 跟踪 |
+| bpf（280）、perf_event_open（241） | [BPF 模块](kernel-bpf.md)：对象/map/程序/BTF、socket 过滤、raw_syscalls 跟踪和线程软件时钟 |
 | sendfile（71） | [文件模块](kernel-files.md)：有界内核复制、位置、来源片段、整包与同步错误 |
 | statfs/fstatfs（43/44）、utimensat（88） | [文件模块](kernel-files.md)：挂载统计、显式纳秒时间与 fd/nofollow |
 | `sync_file_range`（84） | 指定页范围的数据写回与等待，错误按打开文件对象的游标交付 |

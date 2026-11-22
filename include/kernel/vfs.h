@@ -175,12 +175,13 @@ int kernel_vfs_path_resolve(struct kernel_vfs_path *start,
                             struct kernel_vfs_path **owner);
 #define KERNEL_VFS_HANDLE_EXT4 0x4241
 #define KERNEL_VFS_HANDLE_TMPFS 0x4242
+#define KERNEL_VFS_HANDLE_OVERLAY 0x4243
 struct kernel_vfs_handle {
     uint64_t inode;
     uint32_t generation, reserved;
     unsigned char filesystem[16];
 };
-int kernel_vfs_handle_type(const struct kernel_vfs_path *);
+int kernel_vfs_handle_type(const struct kernel_vfs_path *, int fid_only);
 void kernel_vfs_encode_handle(const struct kernel_vfs_path *, struct kernel_vfs_handle *);
 int kernel_vfs_decode_handle(struct kernel_vfs_mount *, int, const struct kernel_vfs_handle *,
     struct kernel_vfs_path **);
