@@ -1240,15 +1240,24 @@ static enum riscv_sv39_status resolve_existing_user_leaf(struct riscv_sv39_user_
     return status ? status : order ? RISCV_SV39_STATUS_INVALID : RISCV_SV39_STATUS_OK;
 }
 
+static unsigned next_table_entry(const uint64_t *entries, unsigned first, unsigned limit)
+{
+    if (first == limit || entries[first]) return first;
+    first++;
+    for (; limit - first >= 8; first += 8) {
+        const uint64_t *entry = entries + first;
+        if (entry[0] | entry[1] | entry[2] | entry[3] |
+            entry[4] | entry[5] | entry[6] | entry[7])
+            break;
+    }
+    while (first < limit && !entries[first]) first++;
+    return first;
+}
+
 static int runtime_table_empty(const uint64_t *entries)
 {
-    /* An empty table is common when retiring a short-lived mapping. */
-    for (unsigned i = 0; i < RISCV_SV39_INDEX_MASK + 1U; i += 8) {
-        if (entries[i]     | entries[i + 1] | entries[i + 2] | entries[i + 3] |
-            entries[i + 4] | entries[i + 5] | entries[i + 6] | entries[i + 7])
-            return 0;
-    }
-    return 1;
+    const unsigned limit = RISCV_SV39_INDEX_MASK + 1U;
+    return next_table_entry(entries, 0, limit) == limit;
 }
 
 static enum riscv_sv39_status validate_leaf_boundaries(struct riscv_sv39_user_space *s,
@@ -1688,13 +1697,17 @@ enum riscv_sv39_status riscv_sv39_user_next_owned(struct riscv_sv39_user_space *
     enum riscv_sv39_status status;
     unsigned first_r = *cursor >> 30, first_m = (*cursor >> 21) & RISCV_SV39_INDEX_MASK;
     unsigned first_l = (*cursor >> BOAROS_PAGE_SHIFT) & RISCV_SV39_INDEX_MASK;
-    for (unsigned r = first_r; r < 256 && ((uint64_t)r << 30) < end; r++) {
-        if (!root[r]) continue;
+    unsigned last_r = (end - 1) >> 30, last_m = ((end - 1) >> 21) & RISCV_SV39_INDEX_MASK;
+    unsigned last_l = ((end - 1) >> BOAROS_PAGE_SHIFT) & RISCV_SV39_INDEX_MASK;
+    const unsigned entries = RISCV_SV39_INDEX_MASK + 1U;
+    for (unsigned r = next_table_entry(root, first_r, last_r + 1); r <= last_r;
+         r = next_table_entry(root, r + 1, last_r + 1)) {
         if (!valid_nonleaf_entry(root[r])) return RISCV_SV39_STATUS_STATE;
         status = resolve_runtime_table(s->allocator, entry_address(root[r]), &middle);
         if (status != RISCV_SV39_STATUS_OK) return status;
-        for (unsigned m = r == first_r ? first_m : 0; m < 512 && (((uint64_t)r << 30) | ((uint64_t)m << 21)) < end; m++) {
-            if (!middle[m]) continue;
+        unsigned middle_limit = r == last_r ? last_m + 1 : entries;
+        for (unsigned m = next_table_entry(middle, r == first_r ? first_m : 0, middle_limit);
+             m < middle_limit; m = next_table_entry(middle, m + 1, middle_limit)) {
             if (valid_user_leaf_entry(middle[m]) || valid_protected_entry(middle[m])) {
                 if (entry_address(middle[m]) & (RISCV_SV39_PAGE_SIZE_2M-1)) return RISCV_SV39_STATUS_STATE;
                 *address=((uint64_t)r<<30)|((uint64_t)m<<21);
@@ -1704,13 +1717,15 @@ enum riscv_sv39_status riscv_sv39_user_next_owned(struct riscv_sv39_user_space *
             if (!valid_nonleaf_entry(middle[m])) return RISCV_SV39_STATUS_STATE;
             status = resolve_runtime_table(s->allocator, entry_address(middle[m]), &leaves);
             if (status != RISCV_SV39_STATUS_OK) return status;
-            for (unsigned l = r == first_r && m == first_m ? first_l : 0; l < 512 && (((uint64_t)r << 30) | ((uint64_t)m << 21) | ((uint64_t)l << BOAROS_PAGE_SHIFT)) < end; l++) {
-                if (!leaves[l]) continue;
-                if (!valid_user_leaf_entry(leaves[l]) && !valid_protected_entry(leaves[l])) return RISCV_SV39_STATUS_STATE;
-                *address = ((uint64_t)r << 30) | ((uint64_t)m << 21) | ((uint64_t)l << BOAROS_PAGE_SHIFT);
-                *cursor = *address + BOAROS_PAGE_SIZE;
-                return RISCV_SV39_STATUS_OK;
-            }
+            unsigned leaf_limit = r == last_r && m == last_m ? last_l + 1 : entries;
+            unsigned l = next_table_entry(leaves,
+                r == first_r && m == first_m ? first_l : 0, leaf_limit);
+            if (l == leaf_limit) continue;
+            if (!valid_user_leaf_entry(leaves[l]) && !valid_protected_entry(leaves[l]))
+                return RISCV_SV39_STATUS_STATE;
+            *address = ((uint64_t)r << 30) | ((uint64_t)m << 21) | ((uint64_t)l << BOAROS_PAGE_SHIFT);
+            *cursor = *address + BOAROS_PAGE_SIZE;
+            return RISCV_SV39_STATUS_OK;
         }
     }
     *cursor = end;
@@ -2509,13 +2524,20 @@ static __attribute__((noinline)) enum riscv_sv39_status share_leaf_table(
 {
     _Static_assert((RISCV_SV39_INDEX_MASK + 1) % PHYSICAL_PAGE_REFERENCE_BATCH_MAX == 0,
                    "whole number of reference batches per leaf table");
+    _Static_assert((PHYSICAL_PAGE_REFERENCE_BATCH_MAX & (PHYSICAL_PAGE_REFERENCE_BATCH_MAX - 1U)) == 0,
+                   "reference batches must be a power of two");
     const unsigned batch = PHYSICAL_PAGE_REFERENCE_BATCH_MAX;
+    const unsigned limit = RISCV_SV39_INDEX_MASK + 1U;
     uint64_t *child_entries = NULL;
-    for (unsigned first = 0; first <= RISCV_SV39_INDEX_MASK; first += batch) {
+    for (unsigned start = 0; start < limit;) {
+        unsigned first_present = next_table_entry(parent_entries, start, limit);
+        if (first_present == limit) break;
+        unsigned first = first_present & ~(batch - 1U);
+        start = first + batch;
         uint64_t refs[PHYSICAL_PAGE_REFERENCE_BATCH_MAX];
         uint64_t entries[PHYSICAL_PAGE_REFERENCE_BATCH_MAX] = {0};
         unsigned count = 0, protected = 0, cow = 0;
-        for (unsigned i = 0; i < batch; i++) {
+        for (unsigned i = first_present - first; i < batch; i++) {
             unsigned index = first + i;
             uint64_t old = parent_entries[index];
             if (!old) continue;
@@ -2578,8 +2600,6 @@ enum riscv_sv39_status riscv_sv39_user_space_fork_prepare(
     uint64_t *root;
     uint64_t *level1;
     uint64_t *level0;
-    uint32_t root_index;
-    uint32_t level1_index;
     enum riscv_sv39_status status;
 
     if (destination == 0 || source == 0 || destination == source) {
@@ -2595,12 +2615,11 @@ enum riscv_sv39_status riscv_sv39_user_space_fork_prepare(
         return status;
     }
     root = source->root_entries;
-    for (root_index = 0U;
-         root_index < RISCV_SV39_USER_ROOT_ENTRIES;
-         root_index++) {
-        if (root[root_index] == 0U) {
-            continue;
-        }
+    const unsigned root_limit = RISCV_SV39_USER_ROOT_ENTRIES;
+    const unsigned middle_limit = RISCV_SV39_INDEX_MASK + 1U;
+    for (unsigned root_index = next_table_entry(root, 0, root_limit);
+         root_index < root_limit;
+         root_index = next_table_entry(root, root_index + 1, root_limit)) {
         if (!valid_nonleaf_entry(root[root_index])) {
             return RISCV_SV39_STATUS_STATE;
         }
@@ -2610,12 +2629,9 @@ enum riscv_sv39_status riscv_sv39_user_space_fork_prepare(
         if (status != RISCV_SV39_STATUS_OK) {
             return status;
         }
-        for (level1_index = 0U;
-             level1_index < BOAROS_PAGE_SIZE / sizeof(*level1);
-             level1_index++) {
-            if (level1[level1_index] == 0U) {
-                continue;
-            }
+        for (unsigned level1_index = next_table_entry(level1, 0, middle_limit);
+             level1_index < middle_limit;
+             level1_index = next_table_entry(level1, level1_index + 1, middle_limit)) {
             if (valid_user_leaf_entry(level1[level1_index]) || valid_protected_entry(level1[level1_index])) {
                 uint64_t va=((uint64_t)root_index<<30)|((uint64_t)level1_index<<21);
                 int action=fork_leaf?fork_leaf(context,va):RISCV_SV39_FORK_PRIVATE;
@@ -2736,7 +2752,6 @@ static enum riscv_sv39_status destroy_level0(
     uint64_t *parent_entry)
 {
     uint64_t *entries;
-    uint32_t index;
     enum riscv_sv39_status status;
 
     if (!valid_nonleaf_entry(*parent_entry)) {
@@ -2750,9 +2765,10 @@ static enum riscv_sv39_status destroy_level0(
     }
     uint64_t refs[PHYSICAL_PAGE_REFERENCE_BATCH_MAX];
     unsigned count=0;
-    for (index = 0U; index < BOAROS_PAGE_SIZE / sizeof(*entries); index++) {
+    const unsigned limit = RISCV_SV39_INDEX_MASK + 1U;
+    for (unsigned index = next_table_entry(entries, 0, limit); index < limit;
+         index = next_table_entry(entries, index + 1, limit)) {
         uint64_t old=entries[index];
-        if (!old) continue;
         status=detach_destroy_leaf(space,&entries[index],0);
         if (status) break;
         refs[count++]=entry_address(old);
@@ -2771,7 +2787,6 @@ static enum riscv_sv39_status destroy_level1(
     uint64_t *parent_entry)
 {
     uint64_t *entries;
-    uint32_t index;
     enum riscv_sv39_status status;
 
     if (!valid_nonleaf_entry(*parent_entry)) {
@@ -2783,10 +2798,9 @@ static enum riscv_sv39_status destroy_level1(
     if (status != RISCV_SV39_STATUS_OK) {
         __builtin_trap();
     }
-    for (index = 0U; index < BOAROS_PAGE_SIZE / sizeof(*entries); index++) {
-        if (entries[index] == 0U) {
-            continue;
-        }
+    const unsigned limit = RISCV_SV39_INDEX_MASK + 1U;
+    for (unsigned index = next_table_entry(entries, 0, limit); index < limit;
+         index = next_table_entry(entries, index + 1, limit)) {
         uint64_t old=entries[index];
         if (valid_user_leaf_entry(old) || valid_protected_entry(old)) {
             status=detach_destroy_leaf(space,&entries[index],9);
@@ -2805,7 +2819,6 @@ enum riscv_sv39_status riscv_sv39_user_space_destroy(
     uint64_t *root;
     uint64_t satp;
     uint64_t root_ppn;
-    uint32_t index;
     enum riscv_sv39_status status;
 
     if (space == 0) {
@@ -2837,15 +2850,14 @@ enum riscv_sv39_status riscv_sv39_user_space_destroy(
     uint32_t references;
     if (physical_page_reference_count(space->allocator,space->root_address,&references))
         __builtin_trap();
-    for (index=0;index<RISCV_SV39_USER_ROOT_ENTRIES;) {
+    const unsigned limit = RISCV_SV39_USER_ROOT_ENTRIES;
+    for (unsigned index = next_table_entry(root, 0, limit); index < limit;) {
         uint64_t detached[16];unsigned count=0;
-        while (index<RISCV_SV39_USER_ROOT_ENTRIES && count<16) {
-            if (root[index]) {
-                if (!valid_nonleaf_entry(root[index])) return RISCV_SV39_STATUS_STATE;
-                detached[count++]=root[index];
-                __atomic_store_n(&root[index],0,__ATOMIC_RELEASE);
-            }
-            index++;
+        while (index < limit && count < 16) {
+            if (!valid_nonleaf_entry(root[index])) return RISCV_SV39_STATUS_STATE;
+            detached[count++]=root[index];
+            __atomic_store_n(&root[index],0,__ATOMIC_RELEASE);
+            index = next_table_entry(root, index + 1, limit);
         }
         /* Root-only borrowers can still have speculative user walks. Detach
          * their parent entries and finish every RFENCE before freeing children. */

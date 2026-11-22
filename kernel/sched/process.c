@@ -1995,7 +1995,6 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
     if (thread->io_context.locks || thread->io_context.backend_depth) __builtin_trap();
     if (cleanup_task_io_requests(thread)) return KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP;
     kernel_ioprio_exit(thread);
-    kernel_sem_exit(thread);
     kernel_posix_timers_exit(thread);
     kernel_signal_pending_cleanup(thread);
     status = release_task_stack(thread);
@@ -2090,7 +2089,6 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
             thread->group_members = 1U;
             process_group_initialize(thread);
             }
-            (void)kernel_wait_queue_wake_all(&scheduler.cleanup_queue);
             (void)kernel_wait_queue_wake_all(&leader->group_wait_queue);
         }
         if (thread->group_leader == thread && thread->controlling_tty) {
@@ -2857,11 +2855,12 @@ static void kernel_thread_finish(
 #if BOAROS_COST_DIAGNOSTICS
     kernel_cost_task_exit();
 #endif
+    int last_mm_user = 0;
     if (current->arch.user_mode == 1U) {
         kernel_pid_t robust_tid;
         if(kernel_task_user_tid(current,&robust_tid)!=KERNEL_TASK_STATUS_OK)__builtin_trap();
         kernel_futex_release_robust(current, robust_tid);
-        kernel_futex_release_mm(current);
+        last_mm_user = !kernel_futex_release_mm(current);
         if (!scheduler.cleanup_task) {
             /* Inline cleanup can release the current root before switching. */
             if (kernel_mm_activate(0, scheduler.kernel_context) != KERNEL_MM_STATUS_OK)
@@ -2900,7 +2899,14 @@ static void kernel_thread_finish(
         next_deadline = scheduler_deadline_locked(cpu);
     }
     if (notify_cleanup) kernel_wait_cursor_wake(&cleanup_cursor, 1);
-    status = activate_thread_address_space(next);
+    if (last_mm_user && next->mm.state != KERNEL_MM_LIVE) {
+        /* A kernel successor need not borrow the dying user root. The
+         * reaper would switch away from it before releasing that root. */
+        status = kernel_mm_activate(NULL, scheduler.kernel_context)
+            ? KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE : KERNEL_SCHEDULER_STATUS_OK;
+    } else {
+        status = activate_thread_address_space(next);
+    }
     if (status != KERNEL_SCHEDULER_STATUS_OK) switch_to_fatal_idle(status);
 #if BOAROS_COST_DIAGNOSTICS
     kernel_cost_switch(&current->cost, &next->cost);
