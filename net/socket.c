@@ -7056,6 +7056,10 @@ static unsigned tcp_owner_receive_batch(struct socket_tcp_owner *owner,unsigned 
 {
     struct socket_tcp_input input[TCP_RX_BATCH];
     unsigned count=tcp_owner_take_input(owner,input,limit);
+    struct netif *ack_interface=NULL;
+    /* The connection owner already holds this prefix. Do not wait for
+     * subsequent input or retain the interface beyond this protocol turn. */
+    if (count>1 && !stopping) owner->context.input_ack_batch=&ack_interface;
     for (unsigned i=0;i<count;i++) {
 #if BOAROS_COST_DIAGNOSTICS
         kernel_cost_tcp_input_dequeue(input[i].queued_ticks,locking,locked);
@@ -7063,6 +7067,8 @@ static unsigned tcp_owner_receive_batch(struct socket_tcp_owner *owner,unsigned 
         if (!stopping) tcp_owner_receive(owner,&input[i]);
         else pbuf_free(input[i].packet);
     }
+    owner->context.input_ack_batch=NULL;
+    if (ack_interface) ack_interface->boaros_link_flush(ack_interface);
     return count;
 }
 

@@ -1562,6 +1562,52 @@ static void tcp_resolved_output_contract(int serial)
     CHECK(tcp_send_empty_ack(pcb) == ERR_OK && parallel_dma_count == 4);
     CHECK(pcb->boaros_path4.generation != route_generation && link_flushes == 3);
     CHECK(((const struct eth_hdr *)parallel_dma[3]->payload)->dest.addr[5] == 9);
+    if (owner) {
+        for (unsigned i = 0; i < parallel_dma_count; i++) {
+            CHECK(parallel_dma[i]->ref == (i < 3 ? 2 : 1));
+            kernel_socket_pbuf_free(parallel_dma[i]);
+        }
+        parallel_dma_count = 0;
+        struct pbuf *confirmation = tcp_lookup_test_packet(pcb, netif);
+        struct tcp_hdr *confirmed = confirmation->payload;
+        confirmed->ackno = lwip_htonl(pcb->snd_nxt);
+        confirmed->chksum = 0;
+        confirmed->chksum = ip_chksum_pseudo(confirmation, IP_PROTO_TCP, confirmation->tot_len,
+                                           &pcb->remote_ip, &pcb->local_ip);
+        const struct socket_tcp_input input = {
+            .packet = confirmation, .interface = netif, .route_bucket = pcb->boaros_route_bucket,
+            .src = pcb->remote_ip, .dst = pcb->local_ip,
+        };
+        tcp_owner_receive(owner, &input);
+        CHECK(!pcb->unacked && !parallel_dma_count);
+        for (unsigned count = 1; count <= 2; count++) {
+            for (unsigned i = 0; i < count; i++) {
+                struct pbuf *packet = tcp_lookup_test_packet(pcb, netif);
+                struct tcp_hdr *header = packet->payload;
+                /* Each input requests an immediate ACK for the current window. */
+                header->seqno = lwip_htonl(pcb->rcv_nxt + pcb->rcv_wnd + 1);
+                header->chksum = 0;
+                header->chksum = ip_chksum_pseudo(packet, IP_PROTO_TCP, packet->tot_len,
+                                                &pcb->remote_ip, &pcb->local_ip);
+                struct kernel_wait_cursor wake = {0};
+                KERNEL_RAW_SCOPE(ingress, &owner->ingress);
+                CHECK(tcp_queue_input_locked(owner, packet, netif, &pcb->remote_ip,
+                                            &pcb->local_ip, pcb->boaros_route_bucket, &wake));
+                CHECK(!wake.queue);
+            }
+            unsigned flushes = link_flushes;
+            CHECK(tcp_owner_receive_batch(owner, TCP_RX_BATCH, 0, 0, 0) == count);
+            CHECK(link_flushes == flushes + (count > 1) && !link_deferred);
+            CHECK(!owner->count && parallel_dma_count == count);
+            for (unsigned i = 0; i < count; i++) {
+                struct pbuf *frame = parallel_dma[i];
+                CHECK(frame->ref == 1 && frame->tot_len == SIZEOF_ETH_HDR + IP_HLEN + TCP_HLEN);
+                CHECK(((const struct eth_hdr *)frame->payload)->dest.addr[5] == 9);
+                kernel_socket_pbuf_free(frame);
+            }
+            parallel_dma_count = 0;
+        }
+    }
     tcp_abandon(pcb, 0);
     socket->tcp = NULL;
     kernel_socket_protocol_leave(&scope);

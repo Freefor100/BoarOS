@@ -355,6 +355,9 @@ struct boaros_lwip_tcp_context {
   u16_t local_port;
   u8_t active_changed, timer, timer_ctr, timer_armed;
   u8_t *input_flags;
+#if BOAROS_USER_SMP
+  struct netif **input_ack_batch;
+#endif
 };
 
 extern struct boaros_lwip_tcp_context boaros_lwip_tcp_default_context;
