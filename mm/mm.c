@@ -4173,7 +4173,7 @@ static enum kernel_mm_status commit_file_mapping(
         .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS &
             (((flags & KERNEL_MM_MAP_SHARED) == 0U || may_write)
                  ? KERNEL_VMA_ALL_PERMISSIONS : ~KERNEL_MM_WRITE) &
-            ((object || kernel_open_file_vfs_borrow(*file)->mount->noexec) ? ~KERNEL_MM_EXECUTE : KERNEL_VMA_ALL_PERMISSIONS),
+            ((object || kernel_open_file_mapping_noexec(*file)) ? ~KERNEL_MM_EXECUTE : KERNEL_VMA_ALL_PERMISSIONS),
     };
     if (object) {
         vma_status=kernel_vma_set_prepare_replace(record->vmas,plan.start,plan.end,&vma,&edit);

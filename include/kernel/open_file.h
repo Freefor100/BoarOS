@@ -36,6 +36,8 @@ struct kernel_vfs_path *kernel_open_file_path(
 /* 同一OFD owner下借用真实文件/cache，不增加引用或允许后端跨核。 */
 const struct kernel_vfs_file *kernel_open_file_vfs_borrow(const struct kernel_open_file_description *);
 struct kernel_page_cache *kernel_open_file_page_cache(const struct kernel_open_file_description *);
+int kernel_open_file_mapping_backing(struct kernel_open_file_description **);
+int kernel_open_file_mapping_noexec(const struct kernel_open_file_description *);
 
 enum kernel_open_file_status {
     KERNEL_OPEN_FILE_STATUS_OK = 0,

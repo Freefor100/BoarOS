@@ -283,7 +283,14 @@ enum kernel_syscall_status syscall_handle_mmap(
                 status=kernel_mm_mmap_object_shared(mm,file,request->arguments[0],
                     request->arguments[1],request->arguments[5],mm_permissions_from_linux(protections),
                     mm_flags,&object,&mapped_address);
-            } else status = kernel_mm_mmap_file_private(
+            } else {
+                error=kernel_open_file_mapping_backing(&file);
+                if (error) {
+                    if (kernel_open_file_release(&file)) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+                    decoded->value=error;
+                    return KERNEL_SYSCALL_STATUS_OK;
+                }
+                status = kernel_mm_mmap_file_private(
                 mm,
                 &file,
                 request->arguments[0],
@@ -291,7 +298,8 @@ enum kernel_syscall_status syscall_handle_mmap(
                 request->arguments[5],
                 mm_permissions_from_linux(protections),
                 mm_flags,
-                &mapped_address);
+                    &mapped_address);
+            }
             if (file &&
                 kernel_open_file_release(&file) !=
                     KERNEL_OPEN_FILE_STATUS_OK) {

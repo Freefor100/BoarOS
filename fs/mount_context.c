@@ -31,7 +31,8 @@ int kernel_mount_type_supported(const char *type)
 {
     return !strcmp(type,"devtmpfs") || !strcmp(type,"tmpfs") || !strcmp(type,"ext4") || !strcmp(type,"vfat") ||
         !strcmp(type,"devpts") || !strcmp(type,"proc") || !strcmp(type,"mqueue") ||
-        !strcmp(type,"bpf") || !strcmp(type,"tracefs") || !strcmp(type,"sysfs") || !strcmp(type,"cgroup2");
+        !strcmp(type,"bpf") || !strcmp(type,"tracefs") || !strcmp(type,"sysfs") || !strcmp(type,"cgroup2") ||
+        !strcmp(type,"overlay");
 }
 void kernel_mount_discard(struct kernel_vfs_path **owner)
 {
@@ -50,11 +51,100 @@ static void mount_creation_flags(struct kernel_vfs_mount *mount, uint64_t flags)
     mount->atime_policy = kernel_vfs_atime_policy(flags, 0, 0);
 }
 
+static int overlay_layer_index(const char *key,size_t length)
+{
+    if (length==8 && !memcmp(key,"lowerdir",8)) return KERNEL_OVERLAY_LOWER;
+    if (length==8 && !memcmp(key,"upperdir",8)) return KERNEL_OVERLAY_UPPER;
+    if (length==7 && !memcmp(key,"workdir",7)) return KERNEL_OVERLAY_WORK;
+    return -KERNEL_EINVAL;
+}
+
+static void overlay_release_layers(struct kernel_vfs_path *layers[3])
+{
+    for (unsigned i=0;i<3;i++)
+        if (layers[i] && kernel_vfs_path_release(&layers[i])) __builtin_trap();
+}
+
+static int overlay_resolve_layer(const struct kernel_fs_paths *paths,int layer,
+    const char *value,struct kernel_vfs_path **owner)
+{
+    if (!*value) return layer==KERNEL_OVERLAY_LOWER?0:-KERNEL_ENOENT;
+    int error=kernel_vfs_path_resolve(paths->cwd,paths->root,value,1,owner);
+    if (!error && (kernel_vfs_path_mode(*owner)&KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFDIR) {
+        if (kernel_vfs_path_release(owner)) __builtin_trap();
+        error=-KERNEL_ENOTDIR;
+    }
+    return error;
+}
+
+static int overlay_layer_value(const char **argument,char *decoded,int layer,bool monolithic)
+{
+    const char *input=*argument;
+    while (*input && (!monolithic || *input!=',')) {
+        char byte=*input++;
+        if (byte==':' && layer==KERNEL_OVERLAY_LOWER) return -KERNEL_EOPNOTSUPP;
+        if (byte=='\\') {
+            if (!*input) return -KERNEL_EINVAL;
+            byte=*input++;
+        }
+        *decoded++=byte;
+    }
+    *decoded=0;
+    *argument=input;
+    return 0;
+}
+
+/* Legacy mount supplies a comma-separated string. Unescape each value before
+ * lookup and reject the colon separator for configurations with multiple lower
+ * layers. Directory names containing either separator may be escaped. */
+static int overlay_resolve_options(const struct kernel_fs_context *fs,const char *options,
+    struct kernel_vfs_path *layers[3])
+{
+    if (!*options) return -KERNEL_EINVAL;
+    KERNEL_FS_PATHS(paths,fs);
+    char *argument;
+    if (kernel_heap_allocate(fs->heap,strlen(options)+1,(void **)&argument)) return -KERNEL_ENOMEM;
+    int error=0;
+    for (const char *input=options;*input && !error;) {
+        const char *key=input;
+        while (*input && *input!='=' && *input!=',') input++;
+        int layer=overlay_layer_index(key,(size_t)(input-key));
+        if (layer<0 || *input!='=') {error=-KERNEL_EINVAL;break;}
+        input++;
+        error=overlay_layer_value(&input,argument,layer,true);
+        if (error) break;
+        if (layers[layer] && kernel_vfs_path_release(&layers[layer])) __builtin_trap();
+        error=overlay_resolve_layer(&paths,layer,argument,&layers[layer]);
+        if (*input==',') input++;
+    }
+    kernel_heap_release(fs->heap,argument);
+    return error;
+}
+
+static int mount_overlay(const struct kernel_fs_context *fs,const struct kernel_mount_parameters *p,
+    const struct kernel_credentials *creator,struct kernel_vfs_path **owner)
+{
+    struct kernel_vfs_path *resolved[3]={0};
+    struct kernel_vfs_mount *mount=NULL;
+    int error=0;
+    if (p->options[0]) {
+        error=overlay_resolve_options(fs,p->options,resolved);
+        if (!error) error=kernel_overlay_mount(fs->heap,p->flags,creator,resolved,&mount);
+        overlay_release_layers(resolved);
+    } else error=kernel_overlay_mount(fs->heap,p->flags,creator,p->overlay_layers,&mount);
+    if (error) return error;
+    mount_creation_flags(mount,p->flags);
+    error=kernel_vfs_detach_created_mount(mount,fs->heap,kernel_fs_context_namespace_id(fs),owner);
+    if (error && kernel_vfs_unmount(mount)) __builtin_trap();
+    return error;
+}
+
 int kernel_mount_create(const struct kernel_fs_context *fs,const struct kernel_mount_parameters *p,
     const struct kernel_credentials *creator,int exclusive,struct kernel_vfs_path **owner)
 {
     if(!kernel_mount_type_supported(p->type))return -KERNEL_ENODEV;
     KERNEL_LOCK_SCOPE(topology);kernel_vfs_mount_topology_lock(&topology);
+    if (!strcmp(p->type,"overlay")) return mount_overlay(fs,p,creator,owner);
     int disk=!strcmp(p->type,"ext4") || !strcmp(p->type,"vfat");
     uint64_t device=0;
     if(disk) {
@@ -133,6 +223,7 @@ static void context_release(void *object)
 {
     struct mount_context *ctx=object;
     kernel_mount_discard(&ctx->root);
+    overlay_release_layers(ctx->parameters.overlay_layers);
     kernel_credentials_put(ctx->creator);
     if(ctx->parameters.ipc_namespace)kernel_namespace_put(ctx->parameters.ipc_namespace);
     if(ctx->parameters.pid_view)kernel_proc_view_release(ctx->parameters.pid_view);
@@ -156,7 +247,7 @@ int kernel_mount_context_open(struct kernel_heap *heap,const char *type,struct k
     struct kernel_open_file_description *file=NULL;
     if(kernel_heap_allocate_zeroed(heap,1,sizeof(*ctx),(void **)&ctx))return -KERNEL_ENOMEM;
     ctx->heap=heap;ctx->creator=kernel_credentials_get(kernel_credentials_current());
-    kernel_mutex_init(&ctx->lock,12,(uintptr_t)ctx);
+    kernel_mutex_init(&ctx->lock,11,(uintptr_t)ctx);
     if(type)memcpy(ctx->parameters.type,type,strlen(type)+1);
     if(type&&!strcmp(type,"mqueue")&&!root)
         ctx->parameters.ipc_namespace=kernel_namespace_get(kernel_task_ipc_namespace());
@@ -177,7 +268,8 @@ int kernel_mount_context_open(struct kernel_heap *heap,const char *type,struct k
     kernel_mutex_init(&file->offset_lock,10,(uintptr_t)file);
     *owner=file;return 0;
 }
-static int context_parameter(struct mount_context *ctx,unsigned command,const char *key,const char *value,char *candidate)
+static int context_parameter(struct mount_context *ctx,const struct kernel_fs_context *fs,
+    unsigned command,const char *key,const char *value,char *candidate)
 {
     struct kernel_mount_parameters *p=&ctx->parameters;
     if(!strcmp(key,"ro") || !strcmp(key,"rw")) {
@@ -189,6 +281,19 @@ static int context_parameter(struct mount_context *ctx,unsigned command,const ch
         memcpy(p->source,value,n+1);ctx->source_set=1;return 0;
     }
     if(ctx->phase==2 || command>1)return -KERNEL_EINVAL;
+    if (!strcmp(p->type,"overlay")) {
+        int layer=overlay_layer_index(key,strlen(key));
+        if (command!=1 || layer<0) return -KERNEL_EINVAL;
+        int error=overlay_layer_value(&value,candidate,layer,false);
+        if (error) return error;
+        struct kernel_vfs_path *path=NULL;
+        KERNEL_FS_PATHS(paths,fs);
+        error=overlay_resolve_layer(&paths,layer,candidate,&path);
+        if (error) return error;
+        if (p->overlay_layers[layer] && kernel_vfs_path_release(&p->overlay_layers[layer])) __builtin_trap();
+        p->overlay_layers[layer]=path;
+        return 0;
+    }
     int tmpfs=!strcmp(p->type,"tmpfs") || !strcmp(p->type,"devtmpfs"),devpts=!strcmp(p->type,"devpts");
     const char *scalar=command==0?NULL:value;
     int error=tmpfs?kernel_tmpfs_check_mount_parameter(ctx->heap,key,scalar):
@@ -223,6 +328,7 @@ int kernel_mount_context_configure(struct kernel_open_file_description *file,con
         if(ctx->phase!=0)return -KERNEL_EBUSY;
         if(!kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN))return -KERNEL_EPERM;
         int error=kernel_mount_create(fs,&ctx->parameters,ctx->creator,command==8,&ctx->root);
+        overlay_release_layers(ctx->parameters.overlay_layers);
         ctx->phase=error?3:1;return error;
     }
     if(command==7) {
@@ -235,7 +341,7 @@ int kernel_mount_context_configure(struct kernel_open_file_description *file,con
         return error;
     }
     if(ctx->phase!=0 && ctx->phase!=2)return -KERNEL_EBUSY;
-    return context_parameter(ctx,command,key,value,candidate);
+    return context_parameter(ctx,fs,command,key,value,candidate);
 }
 int kernel_mount_context_mount(struct kernel_open_file_description *file,const struct kernel_fs_context *fs,
     unsigned flags,unsigned attributes,struct kernel_open_file_description **owner)

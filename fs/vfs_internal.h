@@ -12,6 +12,16 @@
 extern struct kernel_raw_lock kernel_vfs_state_lock;
 struct kernel_fs_context;
 struct kernel_vfs_path;
+struct kernel_credentials;
+struct kernel_vfs_mount;
+struct kernel_heap;
+enum kernel_overlay_layer {
+    KERNEL_OVERLAY_LOWER, KERNEL_OVERLAY_UPPER, KERNEL_OVERLAY_WORK
+};
+/* The context keeps its directory references through creation. The backend
+ * acquires independent owners for an instance that is successfully created. */
+int kernel_overlay_mount(struct kernel_heap *, uint64_t, const struct kernel_credentials *,
+    struct kernel_vfs_path *const [3], struct kernel_vfs_mount **);
 int kernel_vfs_reuse_cgroup_tree(struct kernel_heap *,uint64_t,struct kernel_vfs_path **);
 int kernel_vfs_reuse_block_tree(uint64_t,const char *,int,int,struct kernel_heap *,uint64_t,struct kernel_vfs_path **);
 
@@ -22,6 +32,12 @@ int kernel_vfs_path_filesystem_string(const struct kernel_vfs_path *,char *,size
 int kernel_vfs_path_parent_pin(const struct kernel_vfs_path *path,struct kernel_vfs_path **owner);
 /* Existing object capability (PTY master) selects kernel-owned children without new DAC search. */
 int kernel_vfs_path_lookup_object(struct kernel_vfs_path *,const char *,size_t,struct kernel_vfs_path **);
+/* Look up a directory entry of the selected layer without following another
+ * filesystem mounted on that entry. Honor search permission on the layer. */
+int kernel_vfs_path_lookup_layer(struct kernel_vfs_path *,const char *,size_t,struct kernel_vfs_path **);
+/* Atomically exchange two existing ext4 backing names within the layer. */
+int kernel_vfs_exchange_layer_entries(struct kernel_vfs_path *,struct kernel_vfs_path *,
+    const char *,const char *);
 #include <stdint.h>
 
 #define VFS_PATH_CLOSING (UINT32_C(1)<<31U)
@@ -38,6 +54,10 @@ static inline uint8_t kernel_vfs_atime_policy(uint64_t flags,uint8_t previous,in
         (flags&2048U ? VFS_ATIME_NODIR : 0);
 }
 struct kernel_vfs_file;
+/* An overlay inode retains both layer paths. Borrow the selected backing
+ * file for the operation while the caller holds the visible file. */
+const struct kernel_vfs_file *kernel_vfs_data_file(const struct kernel_vfs_file *);
+struct kernel_vfs_path *kernel_vfs_backing_path(const struct kernel_vfs_file *);
 int kernel_vfs_file_atime_enabled(const struct kernel_vfs_file *);
 int kernel_vfs_file_noatime_allowed(const struct kernel_vfs_file *);
 struct kernel_vfs_size_limit;

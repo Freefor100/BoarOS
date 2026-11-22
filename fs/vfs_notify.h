@@ -23,5 +23,7 @@ struct kernel_vfs_notify_ops {
 
 void kernel_vfs_notify_create(struct kernel_vfs_path *, const char *);
 void kernel_vfs_notify_file(const struct kernel_vfs_file *, uint32_t);
+void kernel_vfs_notify_open(const struct kernel_vfs_file *, struct kernel_vfs_path **);
+void kernel_vfs_notify_close(const struct kernel_vfs_file *, uint32_t, struct kernel_vfs_path **);
 
 #endif

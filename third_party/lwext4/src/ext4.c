@@ -3458,6 +3458,17 @@ static int ext4_rename_ancestry(struct ext4_fs *fs, uint32_t source, uint32_t cu
 	}
 }
 
+static int ext4_rename_replace_found(struct ext4_inode_ref *parent,
+		const char *name, uint32_t length, struct ext4_inode_ref *source,
+		uint32_t victim, struct ext4_dir_search_result *found)
+{
+	if (ext4_dir_en_get_inode(found->dentry) != victim) return EUCLEAN;
+	ext4_dir_write_entry(ext4_fs_super(parent->fs), found->dentry,
+	    ext4_dir_en_get_entry_len(found->dentry), source, name, length);
+	ext4_dir_set_csum(parent, (void *)found->block.data);
+	return ext4_trans_set_block_dirty(found->block.buf);
+}
+
 static int ext4_rename_replace(struct ext4_inode_ref *parent, const char *name,
 		uint32_t length, struct ext4_inode_ref *source, uint32_t victim)
 {
@@ -3466,14 +3477,16 @@ static int ext4_rename_replace(struct ext4_inode_ref *parent, const char *name,
 	if (!r) r = ext4_operation_record_inode(parent->fs, source->index, false);
 	if (!r) r = ext4_dir_find_entry(&found, parent, name, length, true);
 	if (r != EOK) return r;
-	if (ext4_dir_en_get_inode(found.dentry) != victim) r = EUCLEAN;
-	else {
-		ext4_dir_write_entry(ext4_fs_super(parent->fs), found.dentry,
-		    ext4_dir_en_get_entry_len(found.dentry), source, name, length);
-		ext4_dir_set_csum(parent, (void *)found.block.data);
-		r = ext4_trans_set_block_dirty(found.block.buf);
-	}
+	r = ext4_rename_replace_found(parent, name, length, source, victim, &found);
 	return ext4_result(r, ext4_dir_destroy_result(parent, &found));
+}
+
+static bool ext4_rename_can_add_directory(struct ext4_inode_ref *parent)
+{
+	struct ext4_sblock *sb = ext4_fs_super(parent->fs);
+	return ext4_inode_get_links_cnt(parent->inode) < EXT4_LINK_MAX ||
+	    (ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_DIR_NLINK) &&
+	     ext4_inode_has_flag(parent->inode, EXT4_INODE_FLAG_INDEX));
 }
 
 int ext4_rename_child(const char *mount_point,
@@ -3492,10 +3505,11 @@ int ext4_rename_child(const char *mount_point,
 	struct ext4_dir_search_result found = {0};
 	uint32_t source_ino = 0, victim_ino = 0, parent;
 	bool is_dir = false, target_dir = false;
+	bool exchange = flags == EXT4_RENAME_EXCHANGE;
 	bool ordered = fs->os_locks && fs->os_locks->resource_acquire;
 	int r;
 	EXT4_MP_LOCK(mp);
-	if (!result || flags & ~1U || !old_parent || !new_parent ||
+	if (!result || flags > EXT4_RENAME_EXCHANGE || !old_parent || !new_parent ||
 	    !ext4_rename_name_valid(old_name, old_len) ||
 	    !ext4_rename_name_valid(new_name, new_len)) { r = EINVAL; goto Unlock; }
 	if (fs->read_only) { r = EROFS; goto Unlock; }
@@ -3523,7 +3537,8 @@ int ext4_rename_child(const char *mount_point,
 	source_ino = ext4_dir_en_get_inode(found.dentry);
 	r = ext4_rename_lookup(destination, new_name, new_len, &victim_ino);
 	if (r != EOK && r != ENOENT) goto Put;
-	if (victim_ino && flags == 1) { r = EEXIST; goto Put; }
+	if (victim_ino && flags == EXT4_RENAME_NOREPLACE) { r = EEXIST; goto Put; }
+	if (exchange && !victim_ino) { r = ENOENT; goto Put; }
 	if (source_ino == EXT4_INODE_ROOT_INDEX || source_ino == old_parent ||
 	    victim_ino == old_parent || victim_ino == new_parent) { r = EINVAL; goto Put; }
 	r = ordered ? ext4_fs_get_inode_ref_read(fs, source_ino, &source) :
@@ -3538,13 +3553,19 @@ int ext4_rename_child(const char *mount_point,
 		if (r != EOK) goto Put;
 		if (!ext4_inode_get_links_cnt(victim.inode)) { r = EUCLEAN; goto Put; }
 		target_dir = ext4_inode_is_type(sb, victim.inode, EXT4_INODE_MODE_DIRECTORY);
-		if (is_dir != target_dir) { r = is_dir ? ENOTDIR : EISDIR; goto Put; }
+		if (!exchange && is_dir != target_dir) { r = is_dir ? ENOTDIR : EISDIR; goto Put; }
 		if (target_dir) {
-			bool empty;
 			r = ext4_dir_parent_inode(&victim, &parent);
 			if (r == EOK && parent != new_parent) r = EUCLEAN;
-			if (r == EOK) r = ext4_dir_check_empty(&victim, &empty);
-			if (r == EOK && !empty) r = ENOTEMPTY;
+			if (r == EOK && !exchange) {
+				bool empty;
+				r = ext4_dir_check_empty(&victim, &empty);
+				if (r == EOK && !empty) r = ENOTEMPTY;
+			} else if (r == EOK && old_parent != new_parent) {
+				r = ext4_rename_ancestry(fs, victim_ino, old_parent);
+				if (r == EOK && !is_dir && !ext4_rename_can_add_directory(&old))
+					r = EMLINK;
+			}
 			if (r != EOK) goto Put;
 		}
 	}
@@ -3554,10 +3575,8 @@ int ext4_rename_child(const char *mount_point,
 		if (r == EOK && old_parent != new_parent)
 			r = ext4_rename_ancestry(fs, source_ino, new_parent);
 		if (r != EOK) goto Put;
-		if (old_parent != new_parent && !victim_ino &&
-		    ext4_inode_get_links_cnt(destination->inode) >= EXT4_LINK_MAX &&
-		    !(ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_DIR_NLINK) &&
-		      ext4_inode_has_flag(destination->inode, EXT4_INODE_FLAG_INDEX))) {
+		if (old_parent != new_parent && (!victim_ino || (exchange && !target_dir)) &&
+		    !ext4_rename_can_add_directory(destination)) {
 			r = EMLINK; goto Put;
 		}
 	}
@@ -3592,6 +3611,26 @@ int ext4_rename_child(const char *mount_point,
             (victim_ino && !ext4_inode_get_links_cnt(victim.inode))) r = EUCLEAN;
         if (r != EOK) goto Put;
     }
+	if (exchange) {
+		r = ext4_operation_record_inode(fs, old_parent, true);
+		if (r == EOK) r = ext4_operation_record_inode(fs, victim_ino, false);
+		if (r == EOK) r = ext4_rename_replace(destination, new_name, new_len, &source, victim_ino);
+		if (r == EOK) r = ext4_rename_replace_found(&old, old_name, old_len,
+		    &victim, source_ino, &found);
+		if (r != EOK) goto Put;
+		if (old_parent != new_parent) {
+			if (is_dir) r = ext4_dir_reparent(&source, old_parent, new_parent);
+			if (r == EOK && target_dir) r = ext4_dir_reparent(&victim, new_parent, old_parent);
+			if (r != EOK) goto Put;
+			if (is_dir != target_dir) {
+				ext4_fs_inode_links_count_dec(is_dir ? &old : destination);
+				ext4_fs_inode_links_count_inc(is_dir ? destination : &old);
+				old.dirty = destination->dirty = true;
+			}
+		}
+		ext4_touch_inode(mp, &victim, EXT4_TIME_CTIME, NULL);
+		goto Touch;
+	}
 	if (victim_ino)
 		r = ext4_rename_replace(destination, new_name, new_len, &source, victim_ino);
 	else r = ext4_dir_add_entry(destination, new_name, new_len, &source);
@@ -3627,6 +3666,7 @@ int ext4_rename_child(const char *mount_point,
 		output.replaced_inode = victim_ino;
 		output.replaced_last_link = !ext4_inode_get_links_cnt(victim.inode);
 	}
+Touch:
 	ext4_touch_inode(mp, &source, EXT4_TIME_CTIME, NULL);
 	ext4_touch_inode(mp, &old, EXT4_TIME_MTIME | EXT4_TIME_CTIME, NULL);
 	if (destination != &old)
