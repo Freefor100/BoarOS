@@ -1487,6 +1487,23 @@ static void tcp_resolved_output_contract(int serial)
     if (owner) CHECK(tcp_owner_lock(&scope, owner, 0));
     else kernel_socket_protocol_enter(&scope);
     parallel_tx_probe = dma_eligible = 1;
+    CHECK(tcp_send_empty_ack(pcb) == ERR_OK && parallel_dma_count == 1);
+    CHECK(pcb->boaros_path4.generation);
+    unsigned ack_locks = model_ip_acquisitions;
+    CHECK(tcp_send_empty_ack(pcb) == ERR_OK && parallel_dma_count == 2);
+    CHECK(model_ip_acquisitions == ack_locks && !link_flushes);
+    for (unsigned i = 0; i < parallel_dma_count; i++) {
+        struct pbuf *frame = parallel_dma[i];
+        struct tcp_hdr header;
+        CHECK(frame->ref == 1 && frame->tot_len == SIZEOF_ETH_HDR + IP_HLEN + TCP_HLEN);
+        CHECK(((const struct eth_hdr *)frame->payload)->dest.addr[5] == 1);
+        CHECK(pbuf_copy_partial(frame, &header, TCP_HLEN, SIZEOF_ETH_HDR + IP_HLEN) == TCP_HLEN);
+        struct pbuf checksum = {.payload = &header, .len = TCP_HLEN, .tot_len = TCP_HLEN};
+        CHECK(TCPH_FLAGS(&header) == TCP_ACK &&
+              !ip_chksum_pseudo(&checksum, IP_PROTO_TCP, TCP_HLEN, &pcb->local_ip, &pcb->remote_ip));
+        kernel_socket_pbuf_free(frame);
+    }
+    parallel_dma_count = 0;
     tcp_nagle_disable(pcb);
     CHECK(tcp_write(pcb, "a", 1, TCP_WRITE_FLAG_COPY) == ERR_OK);
     CHECK(tcp_output(pcb) == ERR_OK && parallel_dma_count == 1);
@@ -1523,6 +1540,16 @@ static void tcp_resolved_output_contract(int serial)
         CHECK(lwip_ntohl(tcp.seqno) == sequence + i);
         CHECK(pbuf_get_at(frame, frame->tot_len - 1) == 'a' + i);
     }
+    route_generation = pcb->boaros_path4.generation;
+    kernel_socket_protocol_leave(&scope);
+    kernel_socket_protocol_enter(&scope);
+    test_arp_reply(netif, &peer, 9);
+    kernel_socket_protocol_leave(&scope);
+    if (owner) CHECK(tcp_owner_lock(&scope, owner, 0));
+    else kernel_socket_protocol_enter(&scope);
+    CHECK(tcp_send_empty_ack(pcb) == ERR_OK && parallel_dma_count == 4);
+    CHECK(pcb->boaros_path4.generation != route_generation && link_flushes == 3);
+    CHECK(((const struct eth_hdr *)parallel_dma[3]->payload)->dest.addr[5] == 9);
     tcp_abandon(pcb, 0);
     socket->tcp = NULL;
     kernel_socket_protocol_leave(&scope);
@@ -1534,7 +1561,7 @@ static void tcp_resolved_output_contract(int serial)
     kernel_socket_destroy(socket);
     netif_remove(netif);
     CHECK(!heap_live && (!owner || !owner->context.active));
-    puts("PASS resolved IPv4 TCP send reuses route and refreshes the Ethernet neighbor");
+    puts("PASS IPv4 TCP data and empty ACKs share a resolved route and refresh the Ethernet neighbor");
 }
 
 static void tcp_physical_submit_contract(void)
@@ -5466,6 +5493,7 @@ static void ipv6_linklocal(void)
     remote_scope.scope=netif_get_index(n);CHECK(kernel_socket_connect(scoped,&remote_scope,0)==-KERNEL_EINVAL);
     struct kernel_open_file_description *scope_pin=(void *)scoped;
     struct kernel_uaccess_iovec scope_iov={(uintptr_t)"x",1};
+    remote_scope.port=18000; /* Exercise scope routing with a valid UDP destination port. */
     CHECK(kernel_socket_write_datagram(&scope_pin,NULL,&scope_iov,1,1,0,&remote_scope,NULL)==-KERNEL_ENETUNREACH);
     CHECK(!kernel_socket_bind(scoped,&address));
     bound_length=sizeof(bound);CHECK(!kernel_socket_get_bound_device(scoped,bound,&bound_length) && !strcmp(bound,"eth0"));

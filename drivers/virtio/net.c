@@ -328,9 +328,12 @@ static void interrupt(void *owner)
         KERNEL_IRQ_LOCK_SCOPE(guard, &d->state);
         /* 先ack再收割；新的完成必须仍能留下通知。IRQ不发布新RX/TX。 */
         uint32_t pending = d->transport.ops.ack_interrupt(d->transport.context);
-        arch_io_barrier(); check_status(d);
-        if ((pending & VIRTIO_INTERRUPT_CONFIG) && d->configured && link_read(d))
-            fail(d, "configuration", 0, 0, 0);
+        arch_io_barrier();
+        if (pending & VIRTIO_INTERRUPT_CONFIG) {
+            check_status(d);
+            if (d->configured && !d->failed && link_read(d))
+                fail(d, "configuration", 0, 0, 0);
+        }
         d->statistics.interrupts++;
         if (harvest(d)) start_poll_locked(d);
     }
@@ -583,8 +586,17 @@ static void tx_publish(struct virtio_net_device *d, unsigned b, uint32_t size, i
 
 void virtio_net_tx_flush(struct virtio_net_device *d)
 {
-    KERNEL_IRQ_LOCK_SCOPE(guard, &d->state);
-    flush_tx(d);
+    int failed;
+    {
+        KERNEL_IRQ_LOCK_SCOPE(guard, &d->state);
+        if (!d->tx_count || d->tx_posted == UINT32_MAX || d->failed ||
+            d->stopping || !d->configured) return;
+        /* This batch can reach the device long after its slots were reserved. */
+        check_status(d);
+        failed = d->failed;
+        flush_tx(d);
+    }
+    if (failed) wake(d);
 }
 
 int virtio_net_send_copy(struct virtio_net_device *d, uint32_t size,

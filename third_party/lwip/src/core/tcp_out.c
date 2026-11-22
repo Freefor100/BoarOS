@@ -140,7 +140,7 @@ static err_t tcp_output_segment(struct tcp_seg *seg, struct tcp_pcb *pcb,
                                 struct netif *netif, struct netif **batch);
 static err_t tcp_output_control_segment_netif(const struct tcp_pcb *pcb, struct pbuf *p,
                                               const ip_addr_t *src, const ip_addr_t *dst,
-                                              struct netif *netif);
+                                              struct netif *netif, int use_resolved_path);
 
 /* tcp_route: common code that returns a fixed bound netif or calls ip_route */
 static struct netif *
@@ -167,6 +167,37 @@ tcp_path4_current(const struct tcp_pcb *pcb)
          ip4_addr_eq(&path->destination, ip_2_ip4(&pcb->remote_ip));
 }
 #endif
+
+static struct netif *
+tcp_output_route(struct tcp_pcb *pcb, int choose_source)
+{
+#if BOAROS_USER_SMP
+  if (tcp_path4_current(pcb)) {
+    return pcb->boaros_path4.interface;
+  }
+#endif
+  BOAROS_LWIP_IP_SCOPE(ip);
+  struct netif *netif = tcp_route(pcb, &pcb->local_ip, &pcb->remote_ip);
+  if (!netif) {
+    return NULL;
+  }
+  if (choose_source && ip_addr_isany(&pcb->local_ip)) {
+    const ip_addr_t *source = ip_netif_get_local_ip(netif, &pcb->remote_ip);
+    if (!source) {
+      return NULL;
+    }
+    ip_addr_copy(pcb->local_ip, *source);
+  }
+#if BOAROS_USER_SMP
+  pcb->boaros_path4.generation = 0;
+  if ((pcb->boaros_owner || !boaros_lwip_parallel_enabled()) &&
+      IP_IS_V4(&pcb->local_ip) && IP_IS_V4(&pcb->remote_ip)) {
+    boaros_ipv4_path_resolve(&pcb->boaros_path4, netif, ip_2_ip4(&pcb->local_ip),
+                            ip_2_ip4(&pcb->remote_ip), pcb->netif_idx);
+  }
+#endif
+  return netif;
+}
 
 /* Both data and control segments are checksummed before reaching this point. */
 static err_t
@@ -1674,34 +1705,9 @@ tcp_output(struct tcp_pcb *pcb)
                  lwip_ntohl(seg->tcphdr->seqno), pcb->lastack));
   }
 
-#if BOAROS_USER_SMP
-  if (tcp_path4_current(pcb)) {
-    netif = pcb->boaros_path4.interface;
-  } else
-#endif
-  {
-    BOAROS_LWIP_IP_SCOPE(ip);
-    netif = tcp_route(pcb, &pcb->local_ip, &pcb->remote_ip);
-    if (netif == NULL) {
-      return ERR_RTE;
-    }
-
-    /* If we don't have a local IP address, we get one from netif */
-    if (ip_addr_isany(&pcb->local_ip)) {
-      const ip_addr_t *local_ip = ip_netif_get_local_ip(netif, &pcb->remote_ip);
-      if (local_ip == NULL) {
-        return ERR_RTE;
-      }
-      ip_addr_copy(pcb->local_ip, *local_ip);
-    }
-#if BOAROS_USER_SMP
-    pcb->boaros_path4.generation = 0;
-    if ((pcb->boaros_owner || !boaros_lwip_parallel_enabled()) &&
-        IP_IS_V4(&pcb->local_ip) && IP_IS_V4(&pcb->remote_ip)) {
-      boaros_ipv4_path_resolve(&pcb->boaros_path4, netif, ip_2_ip4(&pcb->local_ip),
-                               ip_2_ip4(&pcb->remote_ip), pcb->netif_idx);
-    }
-#endif
+  netif = tcp_output_route(pcb, 1);
+  if (netif == NULL) {
+    return ERR_RTE;
   }
 
   err = tcp_ipv6_resize_head(pcb,netif);
@@ -2409,7 +2415,7 @@ tcp_output_control_segment(const struct tcp_pcb *pcb, struct pbuf *p,
     pbuf_free(p);
     return ERR_RTE;
   }
-  return tcp_output_control_segment_netif(pcb, p, src, dst, netif);
+  return tcp_output_control_segment_netif(pcb, p, src, dst, netif, 0);
 }
 
 /** Output a control segment pbuf to IP.
@@ -2420,7 +2426,7 @@ tcp_output_control_segment(const struct tcp_pcb *pcb, struct pbuf *p,
 static err_t
 tcp_output_control_segment_netif(const struct tcp_pcb *pcb, struct pbuf *p,
                                  const ip_addr_t *src, const ip_addr_t *dst,
-                                 struct netif *netif)
+                                 struct netif *netif, int use_resolved_path)
 {
   err_t err;
 
@@ -2434,7 +2440,22 @@ tcp_output_control_segment_netif(const struct tcp_pcb *pcb, struct pbuf *p,
   }
 #endif
   TCP_STATS_INC(tcp.xmit);
-  err = tcp_ip_output(pcb, p, netif, src, dst, NULL, NULL);
+#if BOAROS_USER_SMP
+  if (use_resolved_path && pcb->boaros_path4.interface == netif &&
+      tcp_path4_current(pcb) && p->tot_len <= pcb->boaros_path4.mtu - IP_HLEN) {
+    err = boaros_ipv4_output_resolved(&pcb->boaros_path4, p, pcb->ttl, pcb->tos, 0);
+#ifdef BOAROS_LWIP_TCP_INFO
+    if (err == ERR_OK) {
+      LWIP_CONST_CAST(struct tcp_pcb *, pcb)->boaros_segs_out++;
+    }
+#endif
+  } else
+#else
+  LWIP_UNUSED_ARG(use_resolved_path);
+#endif
+  {
+    err = tcp_ip_output(pcb, p, netif, src, dst, NULL, NULL);
+  }
 
   pbuf_free(p);
   return err;
@@ -2537,7 +2558,7 @@ tcp_rst_netif(struct netif *netif, u32_t seqno, u32_t ackno,
   if (netif) {
     struct pbuf *p = tcp_rst_common(NULL, seqno, ackno, local_ip, remote_ip, local_port, remote_port);
     if (p != NULL) {
-      tcp_output_control_segment_netif(NULL, p, local_ip, remote_ip, netif);
+      tcp_output_control_segment_netif(NULL, p, local_ip, remote_ip, netif, 0);
     }
   } else {
     LWIP_DEBUGF(TCP_OUTPUT_DEBUG, ("tcp_rst_netif: no netif given\n"));
@@ -2588,7 +2609,17 @@ tcp_send_empty_ack(struct tcp_pcb *pcb)
 
   LWIP_DEBUGF(TCP_OUTPUT_DEBUG,
               ("tcp_output: sending ACK for %"U32_F"\n", pcb->rcv_nxt));
+#if BOAROS_USER_SMP
+  struct netif *netif = tcp_output_route(pcb, 0);
+  if (netif) {
+    err = tcp_output_control_segment_netif(pcb, p, &pcb->local_ip, &pcb->remote_ip, netif, 1);
+  } else {
+    pbuf_free(p);
+    err = ERR_RTE;
+  }
+#else
   err = tcp_output_control_segment(pcb, p, &pcb->local_ip, &pcb->remote_ip);
+#endif
   if (err != ERR_OK) {
     /* let tcp_fasttmr retry sending this ACK */
     tcp_set_flags(pcb, TF_ACK_DELAY | TF_ACK_NOW);

@@ -50,6 +50,7 @@ static uint32_t regs[128], selected, low_features, high_features;
 static uint32_t driver_features[2], guest_page_size;
 static unsigned allocation_count, allocation_calls, live, allocation_fail;
 static unsigned reset_calls, reject_reset_from, reject_features, reject_plic;
+static unsigned status_reads;
 static _Thread_local unsigned queue_wakes;
 static uint64_t now, dma_base;
 static void (*interrupt_fn)(void *);
@@ -165,6 +166,7 @@ static void observe_notification(unsigned q)
 uint32_t virtio_mmio_read32(volatile void *context, unsigned offset)
 {
     assert(context == (volatile void *)regs && offset < sizeof(regs) && !(offset & 3U));
+    if (offset == MMIO_STATUS) status_reads++;
     struct model_queue *queue = &queues[selected];
     switch (offset) {
     case MMIO_DEVICE_FEATURES:
@@ -308,6 +310,7 @@ static void setup(unsigned version)
     memset(queues, 0, sizeof(queues)); memset(driver_features, 0, sizeof(driver_features));
     selected = guest_page_size = allocation_count = allocation_calls = allocation_fail = 0;
     reset_calls = reject_reset_from = reject_features = reject_plic = 0;
+    status_reads = 0;
     regs[MMIO_MAGIC / 4] = UINT32_C(0x74726976); regs[MMIO_VERSION / 4] = version;
     regs[MMIO_DEVICE_ID / 4] = 1; low_features = FEATURE_MAC | FEATURE_STATUS | FEATURE_INDIRECT; high_features = 1;
     memcpy((char *)regs + MMIO_CONFIG, device_mac, sizeof(device_mac));
@@ -536,8 +539,9 @@ static void test_configuration_irq(unsigned version)
     struct riscv_virtio_mmio_net d; start(version, &d);
     assert(riscv_virtio_mmio_net_send(&d, "x", 1) == 1);
     ((unsigned char *)regs)[MMIO_CONFIG + 6] = 0;
+    unsigned reads=status_reads;
     complete(1, next_head(1), 0, 1);
-    assert(d.link_up && d.tx_capacity_generation == 1);
+    assert(d.link_up && d.tx_capacity_generation == 1 && status_reads == reads);
     trigger_interrupt(2);
     assert(!d.link_up && riscv_virtio_mmio_net_send(&d, "x", 1) == -KERNEL_ENETDOWN);
     ((unsigned char *)regs)[MMIO_CONFIG + 6] = 1; trigger_interrupt(3);
@@ -693,6 +697,28 @@ static unsigned test_device_needs_reset_loan(void)
     if (correct)
         puts("PASS: VirtIO-net v2 DEVICE_NEEDS_RESET and refused resets retain DMA owner until final loan return");
     return !correct;
+}
+
+static void test_device_needs_reset_flush(void)
+{
+    struct riscv_virtio_mmio_net d; start(2, &d);
+    uint64_t phys;
+    *(unsigned char *)model_extra_memory(&phys) = 'x';
+    struct riscv_net_tx_segment segment = {phys, 1};
+    int owner;
+    assert(!virtio_net_send_segments(&d, &segment, 1, &owner, 1));
+    assert(d.tx_count == 1 && !available_index(1));
+    unsigned wakes=queue_wakes;
+    regs[MMIO_STATUS / 4] |= STATUS_DEVICE_NEEDS_RESET;
+    virtio_net_tx_flush(&d);
+    assert(d.failed && d.tx_count == 1 && !available_index(1) && !queues[1].notifications);
+    assert(queue_wakes == wakes + 1);
+    assert(virtio_net_tx_release(&d, collect_owner, 0) == 0);
+    assert(!virtio_net_quiesce(&d));
+    released_count=0;
+    assert(virtio_net_tx_release(&d, collect_owner, 1) == 1 && released_owner[0] == &owner);
+    model_extra_free(phys); stop(&d);
+    puts("PASS: VirtIO-net v2 reset ahead of a deferred flush leaves descriptors unpublished");
 }
 
 static void test_legacy_reserved_status(void)
@@ -1122,5 +1148,6 @@ int main(void)
     test_legacy_reserved_status();
     for (unsigned entry = 0; entry < 3; entry++) errors += test_device_needs_reset(entry);
     errors += test_device_needs_reset_loan();
+    test_device_needs_reset_flush();
     return errors ? 1 : 0;
 }
