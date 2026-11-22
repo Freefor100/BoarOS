@@ -785,6 +785,76 @@ udp_sendto_if_chksum(struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *dst_i
 #endif /* LWIP_CHECKSUM_ON_COPY && CHECKSUM_GEN_UDP */
 }
 
+static void
+udp_write_header(struct udp_hdr *header, u16_t source, u16_t destination)
+{
+  header->src = lwip_htons(source);
+  header->dest = lwip_htons(destination);
+  header->chksum = 0;
+}
+
+static void
+udp_finish_header(struct pbuf *p, const struct netif *netif, const ip_addr_t *source,
+                  const ip_addr_t *destination, int no_checksum
+#if LWIP_CHECKSUM_ON_COPY && CHECKSUM_GEN_UDP
+                  , u8_t have_chksum, u16_t chksum
+#endif
+                  )
+{
+  struct udp_hdr *header = p->payload;
+  header->len = lwip_htons(p->tot_len);
+#if CHECKSUM_GEN_UDP
+  IF__NETIF_CHECKSUM_ENABLED(netif, NETIF_CHECKSUM_GEN_UDP) {
+    if (IP_IS_V6(destination) || !no_checksum) {
+      u16_t sum;
+#if LWIP_CHECKSUM_ON_COPY
+      if (have_chksum) {
+        u32_t acc = ip_chksum_pseudo_partial(p, IP_PROTO_UDP, p->tot_len,
+                                           UDP_HLEN, source, destination);
+        acc += (u16_t)~chksum;
+        sum = FOLD_U32T(acc);
+      } else
+#endif
+      {
+        sum = ip_chksum_pseudo(p, IP_PROTO_UDP, p->tot_len, source, destination);
+      }
+      header->chksum = sum ? sum : 0xffff;
+    }
+  }
+#else
+  LWIP_UNUSED_ARG(netif);
+  LWIP_UNUSED_ARG(source);
+  LWIP_UNUSED_ARG(destination);
+  LWIP_UNUSED_ARG(no_checksum);
+#endif
+}
+
+#if BOAROS_USER_SMP
+/* The caller owns this private payload and a resolved unicast path. No
+ * mutable UDP PCB or shared network-layer state is needed after admission. */
+err_t
+boaros_udp4_output_resolved(const struct boaros_udp4_path *path, struct pbuf *p)
+{
+  if (pbuf_add_header(p, UDP_HLEN)) {
+    return ERR_BUF;
+  }
+  udp_write_header(p->payload, path->local_port, path->remote_port);
+  ip_addr_t source, destination;
+  ip_addr_copy_from_ip4(source, path->ip.source);
+  ip_addr_copy_from_ip4(destination, path->ip.destination);
+  udp_finish_header(p, path->ip.interface, &source, &destination, path->no_checksum
+#if LWIP_CHECKSUM_ON_COPY && CHECKSUM_GEN_UDP
+      , 0, 0
+#endif
+      );
+  p->flags |= PBUF_FLAG_IP4_LOCAL_DF;
+  err_t result = boaros_ipv4_output_resolved(&path->ip, p, IP_PROTO_UDP, path->ttl, path->tos, 0);
+  MIB2_STATS_INC(mib2.udpoutdatagrams);
+  UDP_STATS_INC(udp.xmit);
+  return result;
+}
+#endif
+
 /** @ingroup udp_raw
  * Same as @ref udp_sendto_if, but with source address */
 err_t
@@ -874,10 +944,7 @@ udp_sendto_if_src_chksum(struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *d
               (q->len >= sizeof(struct udp_hdr)));
   /* q now represents the packet to be sent */
   udphdr = (struct udp_hdr *)q->payload;
-  udphdr->src = lwip_htons(pcb->local_port);
-  udphdr->dest = lwip_htons(dst_port);
-  /* in UDP, 0 checksum means 'no checksum' */
-  udphdr->chksum = 0x0000;
+  udp_write_header(udphdr, pcb->local_port, dst_port);
 
   /* Multicast Loop? */
 #if LWIP_MULTICAST_TX_OPTIONS
@@ -939,35 +1006,11 @@ udp_sendto_if_src_chksum(struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *d
 #endif /* LWIP_UDPLITE */
   {      /* UDP */
     LWIP_DEBUGF(UDP_DEBUG, ("udp_send: UDP packet length %"U16_F"\n", q->tot_len));
-    udphdr->len = lwip_htons(q->tot_len);
-    /* calculate checksum */
-#if CHECKSUM_GEN_UDP
-    IF__NETIF_CHECKSUM_ENABLED(netif, NETIF_CHECKSUM_GEN_UDP) {
-      /* Checksum is mandatory over IPv6. */
-      if (IP_IS_V6(dst_ip) || (pcb->flags & UDP_FLAGS_NOCHKSUM) == 0) {
-        u16_t udpchksum;
-#if LWIP_CHECKSUM_ON_COPY
-        if (have_chksum) {
-          u32_t acc;
-          udpchksum = ip_chksum_pseudo_partial(q, IP_PROTO_UDP,
-                                               q->tot_len, UDP_HLEN, src_ip, dst_ip);
-          acc = udpchksum + (u16_t)~(chksum);
-          udpchksum = FOLD_U32T(acc);
-        } else
-#endif /* LWIP_CHECKSUM_ON_COPY */
-        {
-          udpchksum = ip_chksum_pseudo(q, IP_PROTO_UDP, q->tot_len,
-                                       src_ip, dst_ip);
-        }
-
-        /* chksum zero must become 0xffff, as zero means 'no checksum' */
-        if (udpchksum == 0x0000) {
-          udpchksum = 0xffff;
-        }
-        udphdr->chksum = udpchksum;
-      }
-    }
-#endif /* CHECKSUM_GEN_UDP */
+    udp_finish_header(q, netif, src_ip, dst_ip, pcb->flags & UDP_FLAGS_NOCHKSUM
+#if LWIP_CHECKSUM_ON_COPY && CHECKSUM_GEN_UDP
+        , have_chksum, chksum
+#endif
+        );
     ip_proto = IP_PROTO_UDP;
   }
 

@@ -48,6 +48,7 @@
 #include "lwip/timeouts.h"
 #include "lwip/udp.h"
 #include "lwip/raw.h"
+#include "lwip/prot/udp.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -226,6 +227,7 @@ struct kernel_socket {
 #if BOAROS_USER_SMP
     unsigned tcp_cpu;
     uint16_t tcp_prepare_mss;
+    uint8_t udp_output_active, udp_rx_drained;
 #endif
 };
 
@@ -986,6 +988,9 @@ static void socket_schedule_locked(struct kernel_socket *socket,unsigned flags,
     if (cpu && tcp_owner_stopping(tcp_owner_at(cpu))) return;
 #endif
     socket->work_flags |= flags;
+#if BOAROS_USER_SMP
+    if (socket->udp_output_active) return;
+#endif
     struct socket_work_queue *queue=socket_ready_queue(socket);
     unsigned queued = socket->work_links[queue->slot].queued;
     work_add_locked(queue, socket, 0);
@@ -1005,6 +1010,46 @@ static void socket_schedule(struct kernel_socket *socket, unsigned flags)
     SOCKET_STATE(state);
     socket_schedule_locked(socket,flags,state.owner);
 }
+#if BOAROS_USER_SMP
+static int udp4_output_socket(const struct kernel_socket *socket)
+{
+    return socket->family == KERNEL_SOCKET_AF_INET && socket->type == SOCKET_DGRAM;
+}
+
+static void udp4_forget_path(struct kernel_socket *socket)
+{
+    if (!udp4_output_socket(socket) || !boaros_lwip_parallel_enabled()) return;
+    KERNEL_IRQ_LOCK_SCOPE(state,&socket_state_lock);
+    socket->udp->boaros_path4.ip.generation = 0;
+}
+
+static int udp4_begin_output_locked(struct kernel_socket_write_request *request)
+{
+    /* The same qualification covers queued, synchronous and resolved sends.
+     * Admission must not pass a request already published on the work list. */
+    struct kernel_socket *socket=request->socket;
+    if (socket->udp_output_active || socket->writes_head) return 0;
+    socket->udp_output_active=1;
+    request->udp_output_owned=1;
+    return 1;
+}
+
+static void udp4_end_output_locked(struct kernel_socket_write_request *request,
+    struct socket_state_guard *state)
+{
+    struct kernel_socket *socket=request->socket;
+    socket->udp_output_active=0;
+    request->udp_output_owned=0;
+    if (socket->writes_head || socket->work_flags) socket_schedule_locked(socket,0,state);
+}
+
+static void udp4_end_output(struct kernel_socket_write_request *request)
+{
+    SOCKET_STATE(state);
+    udp4_end_output_locked(request,state.owner);
+}
+#endif
+
 static void socket_pool_wait(struct kernel_socket *socket)
 {
     SOCKET_STATE(state);
@@ -3781,6 +3826,9 @@ int kernel_socket_connect(struct kernel_socket *socket,
         kernel_socket_protocol_leave(&old_status);return lwip_error(error);
     }
     if (socket->udp != 0) {
+#if BOAROS_USER_SMP
+        udp4_forget_path(socket);
+#endif
         if (address->family == 0) {
             udp_disconnect(socket->udp);
             { KERNEL_IRQ_LOCK_SCOPE(state,socket_endpoint_lock(socket));socket->connected=0; }
@@ -4284,6 +4332,10 @@ uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request, i
     if (partial) packet->consumed += partial;
     if (socket->rx_bytes < charge) __builtin_trap();
     socket->rx_bytes -= charge;
+#if BOAROS_USER_SMP
+    if (retired && request->datagram && udp4_output_socket(socket) && !retired->loopback)
+        socket->udp_rx_drained = !socket->packets_head;
+#endif
     if (kernel_socket_is_tcp(socket)) socket->receive_sequence += charge;
     if (!peek && request->datagram && (socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK ||
         socket->domain==KERNEL_SOCKET_DOMAIN_PACKET)) {
@@ -4473,6 +4525,9 @@ static void clear_write_request(struct kernel_socket_write_request *request)
     discard_tcp_prepared(request);
 #endif
     free_write_packet(request);
+#if BOAROS_USER_SMP
+    if (request->udp_output_owned) udp4_end_output(request);
+#endif
     if(request->unix_receive_reserved) {
         SOCKET_STATE(state);
         if(!request->unix_destination->unix_reserved)__builtin_trap();
@@ -4815,6 +4870,12 @@ int kernel_socket_packet_prepare(struct kernel_socket_write_request *request,
                 request->destination=&request->inet_destination;
             }
             request->payload_size=count;request->flags=flags;
+#if BOAROS_USER_SMP
+            if (udp4_output_socket(socket)) {
+                request->udp_rx_drained=socket->udp_rx_drained;
+                socket->udp_rx_drained=0;
+            }
+#endif
         } else if (socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK || socket->domain==KERNEL_SOCKET_DOMAIN_PACKET) {
             socket_write_begin(request,pin_owner,0);
             request->payload_size=count;request->flags=flags;
@@ -5480,6 +5541,31 @@ static int udp_pending_append(struct kernel_socket_write_request *request,
 
 enum { DATAGRAM_REQUIRES_WORKER = INT32_MIN };
 
+#if BOAROS_USER_SMP
+static void udp4_remember_path(struct kernel_socket *socket, struct netif *interface,
+    const ip_addr_t *src,const ip_addr_t *dst,uint16_t port)
+{
+    struct udp_pcb *pcb=socket->udp;
+    const struct boaros_udp4_path *current=&pcb->boaros_path4;
+    if (current->ip.generation==boaros_lwip_ipv4_path_generation() &&
+        current->ip.interface==interface && current->remote_port==port &&
+        ip4_addr_eq(&current->ip.source,ip_2_ip4(src)) &&
+        ip4_addr_eq(&current->ip.destination,ip_2_ip4(dst))) return;
+    struct boaros_udp4_path resolved={0};
+    boaros_ipv4_path_resolve(&resolved.ip,interface,ip_2_ip4(src),ip_2_ip4(dst),pcb->netif_idx);
+    if (!resolved.ip.generation) return;
+    resolved.local_port=pcb->local_port;
+    resolved.remote_port=port;
+    resolved.ttl=socket->ipv4_ttl;
+    resolved.tos=pcb->tos;
+    resolved.no_checksum=!!(pcb->flags & UDP_FLAGS_NOCHKSUM);
+    resolved.matches_peer=socket->connected && port==pcb->remote_port &&
+        ip_addr_cmp(dst,&pcb->remote_ip);
+    KERNEL_IRQ_LOCK_SCOPE(state,&socket_state_lock);
+    pcb->boaros_path4=resolved;
+}
+#endif
+
 static int datagram_send_owned(struct kernel_socket_write_request *request, int caller_only)
 {
     struct kernel_socket *socket=request->socket;
@@ -5554,6 +5640,11 @@ static int datagram_send_owned(struct kernel_socket_write_request *request, int 
         if (IP_IS_V4(&remote)) payload->flags|=PBUF_FLAG_IP4_LOCAL_DF;
         failure=lwip_error(socket->raw?raw_sendto_if_src(socket->raw,payload,&remote,route,source):
             udp_sendto_if_src(socket->udp,payload,&remote,port,route,source));
+#if BOAROS_USER_SMP
+        if (!failure && !more && !pending && udp4_output_socket(socket) &&
+            route->boaros_link_submit && boaros_lwip_parallel_enabled())
+            udp4_remember_path(socket,route,source,&remote,port);
+#endif
     }
     /* Transfer the sole reference after output has returned and reset the
      * netif hints. The input may free the payload before returning. */
@@ -5590,13 +5681,54 @@ static int execute_protocol_request(struct kernel_socket_write_request *request)
 }
 
 #if BOAROS_USER_SMP
+static int udp4_try_resolved(struct kernel_socket_write_request *request)
+{
+    struct kernel_socket *socket=request->socket;
+    struct boaros_udp4_path route;
+    {
+        KERNEL_IRQ_LOCK_SCOPE(state,&socket_state_lock);
+        const struct boaros_udp4_path *stored=&socket->udp->boaros_path4;
+        if (!stored->ip.generation || !network_work_queue || network_stopping ||
+            request->payload_size+UDP_HLEN+IP_HLEN>stored->ip.mtu || udp_has_pending(socket) ||
+            stored->ip.generation!=boaros_lwip_ipv4_path_generation())
+            return DATAGRAM_REQUIRES_WORKER;
+        if (request->destination) {
+            uint32_t address;
+            __builtin_memcpy(&address,request->destination->bytes,sizeof(address));
+            if (request->destination->family!=KERNEL_SOCKET_AF_INET ||
+                address!=stored->ip.destination.addr || request->destination->port!=stored->remote_port)
+                return DATAGRAM_REQUIRES_WORKER;
+        } else if (!stored->matches_peer) return DATAGRAM_REQUIRES_WORKER;
+        if (!udp4_begin_output_locked(request)) return DATAGRAM_REQUIRES_WORKER;
+        route=*stored;
+    }
+    int result=DATAGRAM_REQUIRES_WORKER;
+    if (route.ip.generation==boaros_lwip_ipv4_path_generation()) {
+        struct pbuf *payload=request->protocol_payload;
+        int error=lwip_error(boaros_udp4_output_resolved(&route,payload));
+        request->protocol_payload=NULL;
+        kernel_socket_pbuf_free(payload);
+        result=error ? error : (int)request->payload_size;
+    }
+    udp4_end_output(request);
+    return result;
+}
+
 static int datagram_try_caller(struct kernel_socket_write_request *request)
 {
     struct kernel_socket *socket = request->socket;
-    if (!kernel_cpu_current()->logical_id || socket->family != KERNEL_SOCKET_AF_INET ||
-        socket->type != SOCKET_DGRAM || (request->flags & KERNEL_SOCKET_MSG_MORE) ||
-        !__atomic_load_n(&protocol_mutex_initialized, __ATOMIC_ACQUIRE) ||
+    if (!udp4_output_socket(socket) || (request->flags & KERNEL_SOCKET_MSG_MORE) ||
         !boaros_lwip_parallel_enabled())
+        return DATAGRAM_REQUIRES_WORKER;
+
+    /* Keep the response to an isolated receive on the normal path. An
+     * outbound burst or a reader with packets left can use the snapshot. */
+    if (!request->udp_rx_drained) {
+        int cached=udp4_try_resolved(request);
+        if (cached!=DATAGRAM_REQUIRES_WORKER) return cached;
+    }
+    if (!kernel_cpu_current()->logical_id ||
+        !__atomic_load_n(&protocol_mutex_initialized,__ATOMIC_ACQUIRE))
         return DATAGRAM_REQUIRES_WORKER;
 
     struct kernel_socket_protocol_scope scope = {0};
@@ -5609,13 +5741,15 @@ static int datagram_try_caller(struct kernel_socket_write_request *request)
         int admit;
         {
             KERNEL_IRQ_LOCK_SCOPE(state, &socket_state_lock);
-            admit = network_work_queue && !network_stopping && !socket->writes_head;
+            admit = network_work_queue && !network_stopping && !socket->udp_pending &&
+                udp4_begin_output_locked(request);
         }
         /* Only this transaction runs on the caller. Queued input or other
          * work published by output remains the network worker's responsibility. */
-        if (admit && !socket->udp_pending) {
+        if (admit) {
             COST_SCOPE(execution, NETWORK_PROTOCOL_EXEC_TICKS);
             result = datagram_send_owned(request, 1);
+            udp4_end_output(request);
         }
     }
     kernel_socket_protocol_leave(&scope);
@@ -5715,7 +5849,25 @@ static int protocol_request(struct kernel_socket_write_request *request,enum soc
                 boaros_lwip_tcp_push(request->socket->tcp);
             if (pending & SOCKET_WORK_OUTPUT) tcp_flush_output(request->socket);
         }
+#if BOAROS_USER_SMP
+        int udp_output=!result && operation==SOCKET_PROTOCOL_DATAGRAM_SEND &&
+            udp4_output_socket(request->socket) && boaros_lwip_parallel_enabled();
+        if (udp_output) {
+            int claimed;
+            {
+                KERNEL_IRQ_LOCK_SCOPE(state,&socket_state_lock);
+                claimed=udp4_begin_output_locked(request);
+            }
+            if (!claimed) {
+                kernel_socket_protocol_leave(&protocol);
+                goto queue;
+            }
+        }
+#endif
         if(!result)result=execute_protocol_request(request);
+#if BOAROS_USER_SMP
+        if (udp_output) udp4_end_output(request);
+#endif
         request->segments=0;
         if(result>=0 && operation!=SOCKET_PROTOCOL_DATAGRAM_PREPARE &&
             operation!=SOCKET_PROTOCOL_DATAGRAM_CANCEL && operation!=SOCKET_PROTOCOL_DISPOSE &&
@@ -5844,6 +5996,9 @@ int kernel_socket_shutdown(struct kernel_socket *socket,int how)
     int close_tx=how!=0 && !socket->write_closed;
     if(how!=1)socket->read_closed=1;
     if(close_tx) {
+#if BOAROS_USER_SMP
+        udp4_forget_path(socket);
+#endif
         socket->write_closed=1;
         if(socket->peer && socket_connection_oriented(socket))socket->peer->peer_closed=1;
     }
@@ -5938,6 +6093,9 @@ int kernel_socket_set_option(struct kernel_socket *socket,
         if(socket->domain!=KERNEL_SOCKET_DOMAIN_INET) {result=-KERNEL_ENOPROTOOPT;break;}
         if(value==-1)value=64;
         if(value<1 || value>255) {result=-KERNEL_EINVAL;break;}
+#if BOAROS_USER_SMP
+        udp4_forget_path(socket);
+#endif
         {SOCKET_ENDPOINT(state,socket);socket->ipv4_ttl=(uint8_t)value;}
         if(pcb && IP_IS_V4(&pcb->local_ip))pcb->ttl=(u8_t)value;
         break;
@@ -6205,7 +6363,12 @@ int kernel_socket_set_bound_device(struct kernel_socket *socket,const char *name
     { SOCKET_ENDPOINT(state,socket);
       if(socket->bound_device &&
          !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_NET_RAW))result=-KERNEL_EPERM;
-      else socket->bound_device=chosen?netif_get_index(chosen):0; }
+      else {
+#if BOAROS_USER_SMP
+          udp4_forget_path(socket);
+#endif
+          socket->bound_device=chosen?netif_get_index(chosen):0;
+      } }
     if(!result) {
         struct ip_pcb *pcb=socket_ip_pcb(socket);
 #if BOAROS_USER_SMP
@@ -6738,6 +6901,8 @@ void kernel_socket_network_blocked(void)
 #if BOAROS_USER_SMP
     struct socket_tcp_owner *owner=current_tcp_owner();
     if (owner) { owner->nic_blocked=1; return; }
+    /* A resolved UDP send reports a full queue to its own caller. */
+    if (protocol_current_owner()!=kernel_io_context_current()) return;
 #endif
     nic_blocked=1;
 }
@@ -6783,6 +6948,11 @@ static unsigned service_ready_socket(unsigned budget,struct socket_work_queue *q
     if (!queue->head) { kernel_irq_lock_release(&irq); return 0; }
     struct kernel_socket *socket = queue->head;
 #if BOAROS_USER_SMP
+    if (socket->udp_output_active) {
+        work_remove_locked(queue,socket);
+        kernel_irq_lock_release(&irq);
+        return 1;
+    }
     if (queue==&ready_work && (socket->work_flags&SOCKET_WORK_PROMOTE)) {
         socket->work_flags &= ~SOCKET_WORK_PROMOTE;
         kernel_irq_lock_release(&irq);
@@ -6806,8 +6976,18 @@ static unsigned service_ready_socket(unsigned budget,struct socket_work_queue *q
         if(request->operation!=SOCKET_PROTOCOL_STREAM || (request->flags & (KERNEL_SOCKET_IO_MORE|KERNEL_SOCKET_MSG_MORE)))break;
     }
     /* 就绪链在同一保护内摘除并重新入队，已有的工作通知仍覆盖余项。 */
-    if(socket->writes_head)work_add_locked(queue,socket,0);
-    else socket->writes_tail=0;
+#if BOAROS_USER_SMP
+    int udp_output=count && requests[0]->operation==SOCKET_PROTOCOL_DATAGRAM_SEND &&
+        udp4_output_socket(socket) && boaros_lwip_parallel_enabled();
+    if (udp_output) {
+        socket->udp_output_active=1;
+        requests[0]->udp_output_owned=1;
+    }
+    if (socket->writes_head && !udp_output) work_add_locked(queue,socket,0);
+#else
+    if (socket->writes_head) work_add_locked(queue,socket,0);
+#endif
+    if (!socket->writes_head) socket->writes_tail=0;
     kernel_irq_lock_release(&irq);
 #if BOAROS_USER_SMP
     if ((flags&SOCKET_WORK_DEVICE_FAILED) && socket->tcp) {
@@ -6845,7 +7025,13 @@ static unsigned service_ready_socket(unsigned budget,struct socket_work_queue *q
             socket_state_notify(state.owner,&socket->wait);socket_async(socket,KERNEL_ASYNC_POLL_OUT);
         }
     }
-    if(request) { KERNEL_IRQ_LOCK_SCOPE(queue_state,&socket_state_lock);complete_protocol_request_locked(request); }
+    if (request) {
+        SOCKET_STATE(queue_state);
+#if BOAROS_USER_SMP
+        if (udp_output) udp4_end_output_locked(request,queue_state.owner);
+#endif
+        complete_protocol_request_locked(request);
+    }
     return 1;
 }
 #if BOAROS_USER_SMP
@@ -6870,6 +7056,10 @@ static unsigned tcp_owner_receive_batch(struct socket_tcp_owner *owner,unsigned 
 {
     struct socket_tcp_input input[TCP_RX_BATCH];
     unsigned count=tcp_owner_take_input(owner,input,limit);
+    struct netif *ack_interface=NULL;
+    /* The connection owner already holds this prefix. Do not wait for
+     * subsequent input or retain the interface beyond this protocol turn. */
+    if (count>1 && !stopping) owner->context.input_ack_batch=&ack_interface;
     for (unsigned i=0;i<count;i++) {
 #if BOAROS_COST_DIAGNOSTICS
         kernel_cost_tcp_input_dequeue(input[i].queued_ticks,locking,locked);
@@ -6877,6 +7067,8 @@ static unsigned tcp_owner_receive_batch(struct socket_tcp_owner *owner,unsigned 
         if (!stopping) tcp_owner_receive(owner,&input[i]);
         else pbuf_free(input[i].packet);
     }
+    owner->context.input_ack_batch=NULL;
+    if (ack_interface) ack_interface->boaros_link_flush(ack_interface);
     return count;
 }
 

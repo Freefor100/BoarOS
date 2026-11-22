@@ -110,6 +110,9 @@ static unsigned reservation_first, reservation_second, reservation_release;
 static pthread_mutex_t remote_gate=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t remote_changed=PTHREAD_COND_INITIALIZER;
 static unsigned remote_work,remote_done,remote_mode,remote_testing,remote_parked;
+#if BOAROS_USER_SMP
+static int udp_wire_pause, udp_wire_entered, udp_wire_release;
+#endif
 static unsigned copy_waiting,copy_release,stop_waiting,stop_done,stop_borrows;
 static unsigned batch_waiting,batch_release;
 static struct {
@@ -518,6 +521,15 @@ int virtio_net_send_copy(struct virtio_net_device *device, uint32_t size,
     int (*copy)(const void *, void *, uint32_t), const void *context, int more)
 {
     (void)device; (void)more; ++copy_attempts;
+#if BOAROS_USER_SMP
+    if (udp_wire_pause) {
+        CHECK(!pthread_mutex_lock(&remote_gate));
+        udp_wire_entered=1;
+        CHECK(!pthread_cond_broadcast(&remote_changed));
+        while (!udp_wire_release) CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
+        CHECK(!pthread_mutex_unlock(&remote_gate));
+    }
+#endif
     if (nic_full) return -KERNEL_EAGAIN;
     CHECK(size <= sizeof(captured) && copy(context, captured, size));
     captured_size = size;
@@ -1550,6 +1562,52 @@ static void tcp_resolved_output_contract(int serial)
     CHECK(tcp_send_empty_ack(pcb) == ERR_OK && parallel_dma_count == 4);
     CHECK(pcb->boaros_path4.generation != route_generation && link_flushes == 3);
     CHECK(((const struct eth_hdr *)parallel_dma[3]->payload)->dest.addr[5] == 9);
+    if (owner) {
+        for (unsigned i = 0; i < parallel_dma_count; i++) {
+            CHECK(parallel_dma[i]->ref == (i < 3 ? 2 : 1));
+            kernel_socket_pbuf_free(parallel_dma[i]);
+        }
+        parallel_dma_count = 0;
+        struct pbuf *confirmation = tcp_lookup_test_packet(pcb, netif);
+        struct tcp_hdr *confirmed = confirmation->payload;
+        confirmed->ackno = lwip_htonl(pcb->snd_nxt);
+        confirmed->chksum = 0;
+        confirmed->chksum = ip_chksum_pseudo(confirmation, IP_PROTO_TCP, confirmation->tot_len,
+                                           &pcb->remote_ip, &pcb->local_ip);
+        const struct socket_tcp_input input = {
+            .packet = confirmation, .interface = netif, .route_bucket = pcb->boaros_route_bucket,
+            .src = pcb->remote_ip, .dst = pcb->local_ip,
+        };
+        tcp_owner_receive(owner, &input);
+        CHECK(!pcb->unacked && !parallel_dma_count);
+        for (unsigned count = 1; count <= 2; count++) {
+            for (unsigned i = 0; i < count; i++) {
+                struct pbuf *packet = tcp_lookup_test_packet(pcb, netif);
+                struct tcp_hdr *header = packet->payload;
+                /* Each input requests an immediate ACK for the current window. */
+                header->seqno = lwip_htonl(pcb->rcv_nxt + pcb->rcv_wnd + 1);
+                header->chksum = 0;
+                header->chksum = ip_chksum_pseudo(packet, IP_PROTO_TCP, packet->tot_len,
+                                                &pcb->remote_ip, &pcb->local_ip);
+                struct kernel_wait_cursor wake = {0};
+                KERNEL_RAW_SCOPE(ingress, &owner->ingress);
+                CHECK(tcp_queue_input_locked(owner, packet, netif, &pcb->remote_ip,
+                                            &pcb->local_ip, pcb->boaros_route_bucket, &wake));
+                CHECK(!wake.queue);
+            }
+            unsigned flushes = link_flushes;
+            CHECK(tcp_owner_receive_batch(owner, TCP_RX_BATCH, 0, 0, 0) == count);
+            CHECK(link_flushes == flushes + (count > 1) && !link_deferred);
+            CHECK(!owner->count && parallel_dma_count == count);
+            for (unsigned i = 0; i < count; i++) {
+                struct pbuf *frame = parallel_dma[i];
+                CHECK(frame->ref == 1 && frame->tot_len == SIZEOF_ETH_HDR + IP_HLEN + TCP_HLEN);
+                CHECK(((const struct eth_hdr *)frame->payload)->dest.addr[5] == 9);
+                kernel_socket_pbuf_free(frame);
+            }
+            parallel_dma_count = 0;
+        }
+    }
     tcp_abandon(pcb, 0);
     socket->tcp = NULL;
     kernel_socket_protocol_leave(&scope);
@@ -3424,6 +3482,47 @@ static void udp_caller_submit(void)
     CHECK(copied_packets == submitted + 1 && captured[5] == 1 && captured[12] == 8 &&
           captured[23] == IP_PROTO_UDP && captured[captured_size - 1] == 'w');
     CHECK(!remote_work && !wire_sender->active_writes && wire_sender->udp->local_port);
+    kernel_socket_protocol_enter(&scope);
+    boaros_lwip_ip_unlock(&scope.ip_guard);
+    wire_call.byte='z';
+    CHECK(!pthread_create(&first,NULL,udp_submit_writer,&wire_call) && !pthread_join(first,NULL));
+    CHECK(copied_packets==submitted+2 && captured[captured_size-1]=='z');
+    CHECK(!remote_work && !wire_sender->active_writes);
+    kernel_socket_protocol_leave(&scope);
+    CHECK(!kernel_socket_set_option(wire_sender,KERNEL_SOCKET_IPV4_TTL,43));
+    kernel_socket_protocol_enter(&scope);
+    test_arp_reply(netif,&peer,7);
+    kernel_socket_protocol_leave(&scope);
+    wire_call.byte='y';
+    CHECK(!pthread_create(&first,NULL,udp_submit_writer,&wire_call) && !pthread_join(first,NULL));
+    CHECK(copied_packets==submitted+3 && captured[5]==7 && captured[22]==43);
+
+    remote_mode=9;
+    udp_wire_pause=1;
+    wire_call.byte='q';
+    struct udp_submit_call wire_later={.pin=wire_pin,.destination=&wire,.byte='r',.queued=1};
+    CHECK(!pthread_create(&first,NULL,udp_submit_writer,&wire_call));
+    CHECK(!pthread_mutex_lock(&remote_gate));
+    while (!udp_wire_entered) CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
+    CHECK(!pthread_mutex_unlock(&remote_gate));
+    CHECK(!pthread_create(&second,NULL,udp_submit_writer,&wire_later));
+    CHECK(!pthread_mutex_lock(&remote_gate));
+    while (remote_parked != 1) CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
+    CHECK(!pthread_mutex_unlock(&remote_gate));
+    (void)kernel_socket_service_pending((struct kernel_socket_service_budget){2,2,0});
+    CHECK(copied_packets==submitted+3);
+    CHECK(!pthread_mutex_lock(&remote_gate));
+    udp_wire_release=1;
+    CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));
+    CHECK(!pthread_join(first,NULL));
+    udp_wire_pause=0;
+    CHECK(copied_packets==submitted+4 && captured[captured_size-1]=='q');
+    (void)kernel_socket_service_pending((struct kernel_socket_service_budget){2,2,0});
+    CHECK(!pthread_mutex_lock(&remote_gate));
+    CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));
+    CHECK(!pthread_join(second,NULL));
+    CHECK(copied_packets==submitted+5 && captured[captured_size-1]=='r');
+    remote_parked=0;
     CHECK(kernel_open_file_release(&wire_pin) == KERNEL_OPEN_FILE_STATUS_OK && !wire_pin);
 
     remote_mode = 9;
@@ -3466,7 +3565,7 @@ static void udp_caller_submit(void)
     netif_remove(netif);
     kernel_socket_protocol_leave(&scope);
     CHECK(!heap_live && !model_socket_files && !protocol_current_owner());
-    puts("PASS IPv4 UDP caller submits loopback and Ethernet; busy IP lock and prior request keep FIFO");
+    puts("PASS IPv4 UDP caller shares a resolved Ethernet path, refreshes TTL and ARP, and preserves FIFO");
 }
 #endif
 
