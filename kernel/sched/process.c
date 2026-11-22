@@ -1039,11 +1039,16 @@ enum kernel_scheduler_status arch_process_clone_current(
     child->signal_stack = parent->signal_stack;
     if ((flags & LINUX_CLONE_VM) && !(flags & LINUX_CLONE_VFORK))
         kernel_signal_stack_reset(child);
-    mm_status = kernel_mm_context(&child->mm, &child_context);
-    if (mm_status != KERNEL_MM_STATUS_OK) {
-        return finish_clone_failure(
-            child, -KERNEL_EAGAIN, linux_result,
-            KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE);
+    if (flags & LINUX_CLONE_VM) {
+        /* The child acquired the running parent's address space, including its root. */
+        child_context = arch_thread_mm(&parent->arch);
+    } else {
+        mm_status = kernel_mm_context(&child->mm, &child_context);
+        if (mm_status != KERNEL_MM_STATUS_OK) {
+            return finish_clone_failure(
+                child, -KERNEL_EAGAIN, linux_result,
+                KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE);
+        }
     }
     arch_thread_set_mm(&child->arch, child_context);
     if ((flags & LINUX_CLONE_CHILD_CLEARTID) != 0U)
@@ -1961,20 +1966,20 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
     if (kernel_cpu_current()->current != (scheduler.cleanup_task ? scheduler.cleanup_task : kernel_cpu_current()->idle)) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
+#if BOAROS_LOCK_DEBUG
     status = validate_queues();
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         return status;
     }
-
-
+#endif
     scheduler_task_collect();
     struct kernel_task *claim __attribute__((cleanup(reap_claim_end))) = 0;
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         thread = scheduler.exited_head;
         if (!thread) return KERNEL_SCHEDULER_STATUS_EMPTY;
-        if (scheduler_task_claim_exit_locked(thread) != KERNEL_SCHEDULER_STATUS_OK)
-            return KERNEL_SCHEDULER_STATUS_BUSY;
+        status = scheduler_task_claim_exit_locked(thread);
+        if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
         claim = thread;
     }
     if (thread->magic != KERNEL_THREAD_MAGIC ||
@@ -2147,13 +2152,17 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
     } else {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
+    struct kernel_wait_cursor join_cursor;
+    int notify_join;
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         exited_remove_locked(thread);
         thread->reaping = 0;
+        notify_join = scheduler_forget_task_locked(thread, &join_cursor);
         claim = 0;
     }
-    scheduler_forget_task(thread);
+    if (notify_join) kernel_wait_cursor_wake(&join_cursor, 1);
+    process_identity_collect();
     kernel_task_release_io_scratch(thread);
     scheduler_task_retire(thread);
     scheduler_task_collect();
@@ -2275,7 +2284,6 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
     enum kernel_files_status files_status;
     enum kernel_fs_context_status fs_status;
 
-    if (cleanup_task_io_requests(thread)) return KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP;
     files_status=finish_files_change(thread);
     if(files_status) return files_status==KERNEL_FILES_STATUS_CLEANUP_REQUIRED
         ? KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP : KERNEL_SCHEDULER_STATUS_INVALID_STATE;
@@ -2344,9 +2352,6 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
     kernel_task_namespaces_release(thread);
     /* MM/FD/cwd已归还，脱树挂载的最后owner可在此安全停止后端。 */
     (void)kernel_vfs_reap_mounts();
-    if (thread->mm.state == KERNEL_MM_RELEASED) {
-        process_complete_vfork(thread);
-    }
     return (thread->mm.state == KERNEL_MM_RELEASED ||
             (thread->publish_completion == 0U &&
              thread->mm.state == KERNEL_MM_EMPTY))
@@ -2835,10 +2840,12 @@ static void kernel_thread_finish(
                 ? KERNEL_SCHEDULER_STATUS_INVALID_STATE
                 : status);
     }
+#if BOAROS_LOCK_DEBUG
     status = validate_queues();
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         switch_to_fatal_idle(status);
     }
+#endif
 
     if (current->arch.user_mode) process_core_rendezvous(current);
     if (current->arch.user_mode) ptrace_begin_exit(current,user_wait_status(completion));
@@ -2855,11 +2862,14 @@ static void kernel_thread_finish(
         if(kernel_task_user_tid(current,&robust_tid)!=KERNEL_TASK_STATUS_OK)__builtin_trap();
         kernel_futex_release_robust(current, robust_tid);
         kernel_futex_release_mm(current);
-        if (kernel_mm_activate(0, scheduler.kernel_context) != KERNEL_MM_STATUS_OK) {
-            switch_to_fatal_idle(
-                KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE);
+        if (!scheduler.cleanup_task) {
+            /* Inline cleanup can release the current root before switching. */
+            if (kernel_mm_activate(0, scheduler.kernel_context) != KERNEL_MM_STATUS_OK)
+                switch_to_fatal_idle(KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE);
+            cleanup_status = cleanup_task_io_requests(current)
+                ? KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP
+                : cleanup_user_task_resources(current);
         }
-        if (!scheduler.cleanup_task) cleanup_status = cleanup_user_task_resources(current);
         current->wait_status = user_wait_status(&current->completion);
     }
     (void)cleanup_status;

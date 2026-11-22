@@ -410,17 +410,27 @@ static void map_failure_and_reuse(void)
         alias_address = empty_window_l0(level1, 1);
         require(riscv_sv39_kernel_window_map(allocator, alias_address, pages) == RISCV_SV39_STATUS_OK,
                 "alias-map-old");
+        uint64_t neighbor = alias_address + RISCV_SV39_PAGE_SIZE_4K;
+        require(riscv_sv39_kernel_window_map(allocator, neighbor, pages) ==
+                RISCV_SV39_STATUS_OK, "alias-map-retained-neighbor");
+        unsigned alias_index = (alias_address >> 21) & 511;
+        uint64_t leaf_table = level1[alias_index];
         __atomic_store_n(&alias_mapped, 1, __ATOMIC_RELEASE);
         wait_flag(&alias_read, "alias-cached-handshake");
         require(riscv_sv39_kernel_window_unmap(allocator, alias_address) == RISCV_SV39_STATUS_OK &&
-                riscv_sv39_kernel_window_map(allocator, alias_address, pages + 4096) == RISCV_SV39_STATUS_OK,
-                "alias-replace");
+                last_fence_address == alias_address && last_fence_size == RISCV_SV39_PAGE_SIZE_4K &&
+                level1[alias_index] == leaf_table, "alias-leaf-only-unmap");
+        require(riscv_sv39_kernel_window_map(allocator, alias_address, pages + 4096) ==
+                RISCV_SV39_STATUS_OK, "alias-replace");
         __atomic_store_n(&alias_continue, 1, __ATOMIC_RELEASE);
         wait_flag(&alias_checked, "alias-replacement-observed");
         require(alias_checked && riscv_sv39_kernel_window_unmap(allocator, alias_address) ==
                 RISCV_SV39_STATUS_OK, "alias-observer-owner-return");
-        require(!level1[(alias_address >> 21) & 511] &&
-            physical_page_available(allocator) == available, "alias-table-owner-return");
+        require(*(volatile uint64_t *)(uintptr_t)neighbor == UINT64_C(0x1111222233334444) &&
+                riscv_sv39_kernel_window_unmap(allocator, neighbor) == RISCV_SV39_STATUS_OK &&
+                !last_fence_address && (!last_fence_size || last_fence_size == UINT64_MAX) &&
+                !level1[alias_index] && physical_page_available(allocator) == available,
+                "alias-table-owner-return");
     }
     arch_interrupt_restore(irq);
     if (riscv_smp_cpu(1)) kernel_thread_join(&edge_join);
