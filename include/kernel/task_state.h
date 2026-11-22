@@ -319,6 +319,7 @@ struct kernel_task {
     uint64_t ready_wait_deadline;
 #endif
     struct kernel_fanotify_read *fanotify_read;
+    uint64_t scheduled_ticks;
 } __attribute__((aligned(16)));
 
 #endif

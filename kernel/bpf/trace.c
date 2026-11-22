@@ -1,4 +1,5 @@
 #include "private.h"
+#include <kernel/accounting.h>
 #include <kernel/credentials.h>
 #include <kernel/errno.h>
 #include <kernel/files.h>
@@ -13,6 +14,12 @@ static struct kernel_raw_lock trace_lock={
     .rank=KERNEL_RAW_RANK_OBJECT,.initialized=KERNEL_RAW_INITIALIZED
 };
 static struct bpf_perf *first_event,*last_event;
+enum { PERF_TYPE_SOFTWARE=1, PERF_TYPE_TRACEPOINT=2 };
+enum { PERF_COUNT_SW_CPU_CLOCK=0, PERF_FORMAT_ID=4, PERF_FLAG_FD_CLOEXEC=8 };
+enum {
+    PERF_ATTR_DISABLED=1, PERF_ATTR_EXCLUDE_USER=1U<<4,
+    PERF_ATTR_EXCLUDE_KERNEL=1U<<5, PERF_ATTR_EXCLUDE_HV=1U<<6,
+};
 struct perf_attribute {
     uint32_t type,size;
     uint64_t config,period,sample_type,read_format,flags;
@@ -62,8 +69,10 @@ int64_t kernel_bpf_perf_open(struct kernel_task *task,uint64_t address,
     struct perf_attribute a={0};int error=perf_attributes(mm,address,&a);
     if(error)return error;
     const struct kernel_credentials *credentials=kernel_credentials_current();
-    if(!kernel_credentials_capable(credentials,KERNEL_CAP_PERFMON) &&
-        !kernel_credentials_capable(credentials,KERNEL_CAP_SYS_ADMIN))return -KERNEL_EACCES;
+    int software=a.type==PERF_TYPE_SOFTWARE;
+    int perfmon=kernel_credentials_capable(credentials,KERNEL_CAP_PERFMON) ||
+        kernel_credentials_capable(credentials,KERNEL_CAP_SYS_ADMIN);
+    if(!perfmon && (!software || !(a.flags&PERF_ATTR_EXCLUDE_KERNEL)))return -KERNEL_EACCES;
     if(a.period>>63)return -KERNEL_EINVAL;
     if(flags&7)return -KERNEL_EOPNOTSUPP;
     if(group!=-1){
@@ -77,22 +86,30 @@ int64_t kernel_bpf_perf_open(struct kernel_task *task,uint64_t address,
         if(pid==0){if(kernel_task_user_tid(task,&tid))__builtin_trap();pid=(int32_t)tid;}
         target=kernel_task_find_user_tid(task,pid);
         if(!target)return -KERNEL_ESRCH;
-        if(!kernel_task_has_user_context(target)){error=-KERNEL_ESRCH;goto target_error;}
+        if(software) {
+            error=kernel_task_perf_clock_authorize(task,target,perfmon);
+            if(error)goto target_error;
+        } else if(!kernel_task_has_user_context(target)){error=-KERNEL_ESRCH;goto target_error;}
     }
     if(cpu < -1 || (cpu==-1 && pid==-1)){error=-KERNEL_EINVAL;goto target_error;}
     if(cpu>=0 && (uint32_t)cpu>=kernel_cpu_get_boot_count()){
         error=-KERNEL_ENODEV;goto target_error;
     }
-    if(a.type!=2){error=-KERNEL_ENOENT;goto target_error;}
-    if(a.config!=KERNEL_TRACE_SYS_ENTER && a.config!=KERNEL_TRACE_SYS_EXIT){
+    if(software) {
+        if(a.config!=PERF_COUNT_SW_CPU_CLOCK){error=-KERNEL_ENOENT;goto target_error;}
+        if(cpu!=-1){error=-KERNEL_EOPNOTSUPP;goto target_error;}
+    } else if(a.type!=PERF_TYPE_TRACEPOINT ||
+        (a.config!=KERNEL_TRACE_SYS_ENTER && a.config!=KERNEL_TRACE_SYS_EXIT)){
         error=-KERNEL_ENOENT;goto target_error;
     }
     /* RAW/period=1/wakeup=1 is the standard libbpf tracepoint attach
      * configuration. BPF output goes to its map ring; no perf sample mmap is
      * advertised. Other PMU, inherited, sample and clock options are absent. */
-    if((a.flags&~UINT64_C(1)) || a.period>1 ||
-        (a.sample_type && a.sample_type!=(UINT64_C(1)<<10)) ||
-        (a.read_format&~UINT64_C(4)) || a.wakeup>1 || a.bp_type ||
+    uint64_t allowed_flags=PERF_ATTR_DISABLED;
+    if(software)allowed_flags|=PERF_ATTR_EXCLUDE_USER|PERF_ATTR_EXCLUDE_KERNEL|PERF_ATTR_EXCLUDE_HV;
+    if((a.flags&~allowed_flags) || a.period>(software?0U:1U) ||
+        (a.sample_type&~(software?UINT64_C(0):UINT64_C(1)<<10)) ||
+        (a.read_format&~(uint64_t)PERF_FORMAT_ID) || a.wakeup>(software?0U:1U) || a.bp_type ||
         a.config1 || a.config2 || a.branch_type || a.regs_user || a.stack_user ||
         a.clock || a.regs_intr || a.aux_watermark || a.max_stack || a.aux_size ||
         a.aux_action || a.signal_data || a.config3 || a.config4){
@@ -104,9 +121,14 @@ int64_t kernel_bpf_perf_open(struct kernel_task *task,uint64_t address,
     }
     bpf_object_initialize(&event->object,files->heap,BPF_OBJECT_PERF);
     event->pid=pid;event->cpu=cpu;event->event=(uint32_t)a.config;
-    event->target_task=target;event->read_format=a.read_format;event->enabled=!(a.flags&1);
+    event->target_task=target;event->read_format=a.read_format;event->enabled=!(a.flags&PERF_ATTR_DISABLED);
+    event->cpu_clock=software;
+    if(software) {
+        kernel_raw_lock_init(&event->clock_lock,KERNEL_RAW_RANK_OBJECT);
+        if(event->enabled)event->clock_start=kernel_task_scheduled_ns(target);
+    }
     error=bpf_object_publish(&event->object);
-    if(!error){
+    if(!error && !software){
         KERNEL_RAW_SCOPE(lock,&trace_lock);
         struct bpf_perf *before=last_event;
         while(before && before->object.id>event->object.id)before=before->previous;
@@ -115,7 +137,7 @@ int64_t kernel_bpf_perf_open(struct kernel_task *task,uint64_t address,
         if(before)before->next=event;else __atomic_store_n(&first_event,event,__ATOMIC_RELEASE);
         event->registered=1;
     }
-    if(!error)error=bpf_object_install(files,&event->object,2,(flags&8)?1:0);
+    if(!error)error=bpf_object_install(files,&event->object,2,(flags&PERF_FLAG_FD_CLOEXEC)?1:0);
     bpf_object_put(&event->object);return error;
 target_error:
     if(target)kernel_task_lookup_put(target);
@@ -123,6 +145,10 @@ target_error:
 }
 void bpf_perf_destroy(struct bpf_perf *event)
 {
+    if(event->cpu_clock) {
+        kernel_task_lookup_put(event->target_task);
+        return;
+    }
     struct kernel_bpf_program *program;
     {
         KERNEL_RAW_SCOPE(lock,&trace_lock);
@@ -139,6 +165,7 @@ void bpf_perf_destroy(struct bpf_perf *event)
 }
 void bpf_perf_close_file(struct bpf_perf *event)
 {
+    if(event->cpu_clock)return;
     struct kernel_bpf_program *program=NULL;
     {
         KERNEL_RAW_SCOPE(lock,&trace_lock);
@@ -151,6 +178,7 @@ void bpf_perf_close_file(struct bpf_perf *event)
 }
 static int attach(struct bpf_perf *event,struct kernel_bpf_program *program,struct bpf_link *link)
 {
+    if(event->cpu_clock)return -KERNEL_EINVAL;
     int error=bpf_program_trace_context(program,event->event);
     if(error)return error;
     KERNEL_RAW_SCOPE(lock,&trace_lock);
@@ -165,10 +193,27 @@ static int attach(struct bpf_perf *event,struct kernel_bpf_program *program,stru
     if(link)link->detached=0;
     return 0;
 }
+
+static void cpu_clock_control(struct bpf_perf *event,uint64_t command)
+{
+    KERNEL_RAW_SCOPE(lock,&event->clock_lock);
+    if(command==0x2400 && !event->enabled) {
+        event->clock_start=kernel_task_scheduled_ns(event->target_task);
+        event->enabled=1;
+    } else if(command==0x2401 && event->enabled) {
+        event->count+=kernel_task_scheduled_ns(event->target_task)-event->clock_start;
+        event->enabled=0;
+    } else if(command==0x2403) {
+        if(event->enabled)event->clock_start=kernel_task_scheduled_ns(event->target_task);
+        event->count=0;
+    }
+}
+
 int bpf_perf_ioctl(struct bpf_perf *event,struct kernel_task *task,struct kernel_files *files,
     uint64_t command,uint64_t argument)
 {
     if(command==UINT64_C(0x40042408)){
+        if(event->cpu_clock)return -KERNEL_EINVAL;
         struct kernel_bpf_program *program;
         int error=kernel_bpf_program_fd(files,(int32_t)argument,BPF_TRACEPOINT,&program);
         if(error)return error;
@@ -182,6 +227,10 @@ int bpf_perf_ioctl(struct bpf_perf *event,struct kernel_task *task,struct kernel
     }
     if(command==0x2400 || command==0x2401 || command==0x2403){
         if(argument&~UINT64_C(1))return -KERNEL_EINVAL;
+        if(event->cpu_clock) {
+            cpu_clock_control(event,command);
+            return 0;
+        }
         KERNEL_RAW_SCOPE(lock,&trace_lock);
         if(command==0x2403)event->count=0;else event->enabled=command==0x2400;
         return 0;
@@ -190,11 +239,13 @@ int bpf_perf_ioctl(struct bpf_perf *event,struct kernel_task *task,struct kernel
 }
 int bpf_perf_read(struct bpf_perf *event,void *buffer,size_t capacity,size_t *length)
 {
-    uint64_t values[2];size_t size=event->read_format&4?16:8;
+    uint64_t values[2];size_t size=event->read_format&PERF_FORMAT_ID?16:8;
     if(capacity<size)return -KERNEL_ENOSPC;
     {
-        KERNEL_RAW_SCOPE(lock,&trace_lock);
+        KERNEL_RAW_SCOPE(lock,event->cpu_clock?&event->clock_lock:&trace_lock);
         values[0]=event->count;values[1]=event->object.id;
+        if(event->cpu_clock && event->enabled)
+            values[0]+=kernel_task_scheduled_ns(event->target_task)-event->clock_start;
     }
     memcpy(buffer,values,size);*length=size;return 0;
 }

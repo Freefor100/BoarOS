@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "../../kernel/bpf/private.h"
+#include <kernel/accounting.h>
 #include <kernel/credentials.h>
 #include <kernel/errno.h>
 #include <kernel/files.h>
@@ -13,7 +14,7 @@
 /* Hosted dependencies model FD/task ownership and an explicitly blocked VM
  * invocation. The production trace registration, targeting, ioctl, links,
  * user ABI and object information code is linked without replacement. */
-struct kernel_task {int tid,borrows;};
+struct kernel_task {int tid,borrows;uint64_t scheduled_ns;};
 static struct kernel_task actor={.tid=142},other={.tid=143},replacement={.tid=144};
 static struct kernel_task *local_other=&other;
 static struct kernel_heap heap;
@@ -30,6 +31,8 @@ void *sync_test_cpu(void){return &cpu;}
 void kernel_preempt_disable(void){cpu.preempt_depth++;}
 void kernel_preempt_enable(void){assert(cpu.preempt_depth);cpu.preempt_depth--;}
 unsigned kernel_cpu_get_boot_count(void){return 2;}
+void kernel_raw_lock_init(struct kernel_raw_lock *l,uint32_t rank)
+{l->rank=rank;l->initialized=KERNEL_RAW_INITIALIZED;}
 void kernel_raw_lock_acquire(struct kernel_raw_lock *l,struct kernel_raw_guard *g)
 {assert(!locks);pthread_mutex_lock(&mutex);locks++;g->lock=l;}
 void kernel_raw_lock_release(struct kernel_raw_guard *g)
@@ -51,6 +54,9 @@ struct kernel_task *kernel_task_find_by_tid(kernel_pid_t id)
 {struct kernel_task *t=id==142?&actor:id==143?&other:NULL;if(t)t->borrows++;return t;}
 int kernel_task_has_user_context(const struct kernel_task *t){return !!t;}
 void kernel_task_lookup_put(struct kernel_task *t){assert(t->borrows>0);t->borrows--;}
+int kernel_task_perf_clock_authorize(const struct kernel_task *caller,const struct kernel_task *target,int perfmon)
+{return caller==target || perfmon?0:-KERNEL_EACCES;}
+uint64_t kernel_task_scheduled_ns(const struct kernel_task *t){assert(t->borrows);return t->scheduled_ns;}
 int bpf_user_copy(struct kernel_mm *mm,uint64_t a,void *p,size_t n,int from)
 {(void)mm;assert(!locks);if(n && a<4096)return -KERNEL_EFAULT;if(from)memcpy(p,(void *)(uintptr_t)a,n);else memcpy((void *)(uintptr_t)a,p,n);return 0;}
 enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t n,size_t s,void **p)
@@ -160,4 +166,32 @@ static void attributes(void)
     a.flags=2;assert(kernel_bpf_perf_open(&actor,(uintptr_t)&a,0,-1,-1,0)==-KERNEL_EOPNOTSUPP);
     assert(!actor.borrows && !allocations);
 }
-int main(void){attributes();lifecycle();pid_views();puts("BPF TRACE HOST PASS ABI targeting lifecycle concurrent close");return 0;}
+
+static void cpu_clock(void)
+{
+    struct perf_attr a={.type=1,.size=sizeof(a),.flags=1|(1U<<5)|(1U<<6)};
+    privileged=0;
+    assert(kernel_bpf_perf_open(&actor,(uintptr_t)&a,43,-1,-1,0)==-KERNEL_EACCES);
+    int fd=kernel_bpf_perf_open(&actor,(uintptr_t)&a,0,-1,-1,8);
+    assert(fd>=0 && actor.borrows==1 && !kernel_bpf_trace_active());
+    assert(!count(fd));
+    actor.scheduled_ns=100;
+    io(fd,0x2400,0);
+    actor.scheduled_ns=170;
+    io(fd,0x2400,0);
+    assert(count(fd)==70);
+    io(fd,0x2401,0);
+    actor.scheduled_ns=210;
+    assert(count(fd)==70);
+    io(fd,0x2400,0);
+    actor.scheduled_ns=300;
+    assert(count(fd)==160);
+    io(fd,0x2403,0);
+    actor.scheduled_ns=370;
+    assert(count(fd)==70);
+    close_fd(fd);
+    assert(!actor.borrows && !other.borrows && !allocations);
+    privileged=1;
+}
+
+int main(void){attributes();lifecycle();pid_views();cpu_clock();puts("BPF TRACE HOST PASS ABI targeting lifecycle concurrent close CPU clock");return 0;}
