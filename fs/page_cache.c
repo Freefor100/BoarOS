@@ -4476,15 +4476,11 @@ void kernel_page_cache_dontneed(struct kernel_page_cache *cache,struct kernel_vf
     if (!remote_cache_client()) { uint64_t extra=0;(void)drain_entries(cache,&extra); }
 }
 
-uint64_t kernel_page_cache_reclaim(struct kernel_page_cache *cache,uint64_t target_pages)
+static uint64_t reclaim_clean_pages(struct kernel_page_cache *cache,uint64_t target_pages,
+    int second_chance)
 {
-    if (!cache_live(cache) || !target_pages) return 0;
-    uint64_t released=version_pool_reclaim(cache->record->versions,target_pages);
-    if (released>=target_pages) return released;
-    struct kernel_lock_guard *held=kernel_io_context_current()->locks;
-    if (held && held->lock->rank>=cache->record->metadata.lock.rank) return released;
     struct kernel_page_cache_record *r=cache->record;
-    uint64_t scanned=0,limit;
+    uint64_t released=0,scanned=0,limit;
     {
         CACHE_SCOPE(guard,cache);
         r->statistics.reclaim_calls++;
@@ -4492,7 +4488,7 @@ uint64_t kernel_page_cache_reclaim(struct kernel_page_cache *cache,uint64_t targ
 #if BOAROS_MAX_CPUS > 1
         /* A referenced page gets one chance; if all pages were used, reclaim
          * may still complete a full round on the next pass. */
-        limit*=2;
+        if (second_chance) limit*=2;
 #endif
     }
     while (scanned<limit && released<target_pages) {
@@ -4505,7 +4501,7 @@ uint64_t kernel_page_cache_reclaim(struct kernel_page_cache *cache,uint64_t targ
             while (r->reclaim_cursor && released+selected<target_pages && scanned<limit && window<64) {
                 struct kernel_page_cache_entry *entry=r->reclaim_cursor;
                 r->reclaim_cursor=entry->lru_previous;scanned++;window++;
-                if (!retire_clean_page(cache,entry,1)) continue;
+                if (!retire_clean_page(cache,entry,second_chance)) continue;
                 entry->reclaim_next=retired;retired=entry;selected++;
             }
             if (!window) break;
@@ -4520,9 +4516,25 @@ uint64_t kernel_page_cache_reclaim(struct kernel_page_cache *cache,uint64_t targ
       }
     }
     if (!remote_cache_client() && !kernel_lock_held(&cache->record->group->walk.lock,1)) { uint64_t extra=0;(void)drain_entries(cache,&extra); }
+    return released;
+}
+
+uint64_t kernel_page_cache_reclaim(struct kernel_page_cache *cache,uint64_t target_pages)
+{
+    if (!cache_live(cache) || !target_pages) return 0;
+    uint64_t released=version_pool_reclaim(cache->record->versions,target_pages);
+    if (released>=target_pages) return released;
+    struct kernel_lock_guard *held=kernel_io_context_current()->locks;
+    if (held && held->lock->rank>=cache->record->metadata.lock.rank) return released;
+    released+=reclaim_clean_pages(cache,target_pages-released,1);
     if (released<target_pages)
         released+=kernel_vfs_reclaim_clean(cache->allocator,target_pages-released);
     return released;
+}
+
+void kernel_page_cache_drop_clean(struct kernel_page_cache *cache)
+{
+    if (cache_live(cache)) (void)reclaim_clean_pages(cache,UINT64_MAX,0);
 }
 
 static uint64_t cache_low_watermark(const struct physical_page_allocator *allocator)

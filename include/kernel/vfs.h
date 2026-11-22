@@ -215,6 +215,7 @@ struct kernel_vfs_file {
     uint32_t exec_lease;
     uint8_t location_owner;
     uint8_t notify_suppressed; /* Opened by a file-event reader. */
+    uint8_t notify_access_perm; /* Open-time fanotify access permission interest. */
 };
 
 /* Paths are borrowed for the duration of a call; successful opens own a path
@@ -267,7 +268,11 @@ struct kernel_vfs_open_request { unsigned flags; uint32_t mode, umask; unsigned 
  * an OFD-level reopen. The caller releases pathless_link even on failure. */
 struct kernel_vfs_open_result { int created; struct kernel_vfs_path *pathless_link; };
 #define KERNEL_VFS_MAY_EXEC 1U
-enum { KERNEL_VFS_CONTROL_READ=1, KERNEL_VFS_CONTROL_WRITE=2 };
+enum {
+    KERNEL_VFS_CONTROL_READ=1,
+    KERNEL_VFS_CONTROL_WRITE=2,
+    KERNEL_VFS_CONTROL_SYSTEM=4,
+};
 enum {
     KERNEL_VFS_INODE_IMMUTABLE=0x10, KERNEL_VFS_INODE_APPEND=0x20, KERNEL_VFS_INODE_NODUMP=0x40,
     KERNEL_VFS_INODE_PROTECTED=KERNEL_VFS_INODE_IMMUTABLE|KERNEL_VFS_INODE_APPEND,
@@ -353,6 +358,9 @@ int kernel_vfs_rename_at(struct kernel_vfs_path *old_start,
 
 /* Returns zero or a negative Linux-compatible errno value. */
 int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
+    struct kernel_block_device *block, struct kernel_heap *heap,
+    struct kernel_page_cache *page_cache, int read_only);
+int kernel_vfs_mount_ext2(struct kernel_vfs_mount *mount,
     struct kernel_block_device *block, struct kernel_heap *heap,
     struct kernel_page_cache *page_cache, int read_only);
 int kernel_vfs_mount_fat32(struct kernel_vfs_mount *mount,

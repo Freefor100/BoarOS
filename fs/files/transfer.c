@@ -545,6 +545,10 @@ enum kernel_files_status kernel_files_sendfile(
         checked_position > (uint64_t)INT64_MAX - count) {
         *linux_result = -KERNEL_EINVAL; goto done;
     }
+    if (input->file.notify_access_perm) {
+        *linux_result = kernel_vfs_fanotify_permission(&input->file, VFS_NOTIFY_ACCESS_PERM, NULL);
+        if (*linux_result) goto done;
+    }
     status = kernel_files_pin_data(files, out_fd, &output, linux_result);
     if (status != KERNEL_FILES_STATUS_OK || *linux_result != 0) goto done;
     if (!kernel_files_description_writable(output)) { *linux_result = -KERNEL_EBADF; goto done; }
@@ -575,9 +579,10 @@ static int64_t copy_range_pinned(struct kernel_mm *mm,
     struct kernel_open_file_description *input,
     struct kernel_open_file_description **output_owner,
     uint64_t user_in, int64_t position_in, uint64_t user_out, int64_t position_out,
-    uint64_t count)
+    uint64_t requested)
 {
     struct kernel_open_file_description *output = *output_owner;
+    bool permission_pending = input->file.notify_access_perm;
     KERNEL_LOCK_SCOPE(first_guard);
     KERNEL_LOCK_SCOPE(second_guard);
     struct kernel_open_file_description *first = user_in ? 0 : input;
@@ -585,10 +590,12 @@ static int64_t copy_range_pinned(struct kernel_mm *mm,
     if (first && second && (uintptr_t)first > (uintptr_t)second) {
         struct kernel_open_file_description *swap = first; first = second; second = swap;
     }
+check_ranges:
     if (first) kernel_mutex_lock(&first->offset_lock, &first_guard);
     if (second) kernel_mutex_lock(&second->offset_lock, &second_guard);
     uint64_t start = user_in ? (uint64_t)position_in : input->offset;
     uint64_t out_start = user_out ? (uint64_t)position_out : output->offset;
+    uint64_t count = requested;
     struct kernel_vfs_size_limit limit = {.maximum = kernel_task_current_fsize_limit()};
     /* Linux 先检查文件类型/打开模式和实例，再缩短 EOF/写入限额范围。 */
     uint32_t in_type = kernel_open_file_mode(input) & KERNEL_VFS_S_IFMT;
@@ -614,6 +621,16 @@ static int64_t copy_range_pinned(struct kernel_mm *mm,
     if (kernel_vfs_files_share_node(&input->file, &output->file) &&
         out_start + count > start && out_start < start + count) return -KERNEL_EINVAL;
     if ((int64_t)start < 0 || (int64_t)out_start < 0) return -KERNEL_EINVAL;
+    if (permission_pending) {
+        /* The monitor can use these same descriptions to make its decision.
+         * Recheck offsets after reacquiring their locks. */
+        if (second_guard.lock) kernel_lock_release(&second_guard);
+        if (first_guard.lock) kernel_lock_release(&first_guard);
+        error=kernel_vfs_fanotify_permission(&input->file,VFS_NOTIFY_ACCESS_PERM,NULL);
+        if (error) return error;
+        permission_pending=false;
+        if (first || second) goto check_ranges;
+    }
     if (!count) return 0;
     if (count > KERNEL_FILES_MAX_RW_COUNT) count = KERNEL_FILES_MAX_RW_COUNT;
     kernel_open_file_read_begin(input, start);
@@ -1003,6 +1020,10 @@ enum kernel_files_status kernel_files_splice(struct kernel_files *files,struct k
                 ((kernel_open_file_flags(input)|kernel_open_file_flags(output))&KERNEL_FILES_O_NONBLOCK)),1,&broken);
         } else if(outp) {
             uint64_t position=(uint64_t)in;
+            if (input->file.notify_access_perm) {
+                *result = kernel_vfs_fanotify_permission(&input->file, VFS_NOTIFY_ACCESS_PERM, NULL);
+                if (*result) goto transfer_done;
+            }
             *result=file_into_pipe(&input,output,&position,count,flags,!user_in,0,&broken);
             in=(int64_t)position;
         } else {

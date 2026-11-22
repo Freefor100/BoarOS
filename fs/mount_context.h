@@ -16,6 +16,7 @@ struct kernel_mount_parameters {
 /* Creation returns a detached tree owner. Attachment does not consume the
  * caller's path; close_tree only retires a tree that never became attached. */
 int kernel_mount_type_supported(const char *);
+const char *kernel_mount_registered_type(size_t index, int *block);
 int kernel_mount_create(const struct kernel_fs_context *,const struct kernel_mount_parameters *,
     const struct kernel_credentials *,int,struct kernel_vfs_path **);
 void kernel_mount_discard(struct kernel_vfs_path **);

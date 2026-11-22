@@ -12,8 +12,13 @@ enum {
     VFS_NOTIFY_CLOSE_WRITE = 8, VFS_NOTIFY_CLOSE_NOWRITE = 16, VFS_NOTIFY_OPEN = 32,
     VFS_NOTIFY_MOVED_FROM = 64, VFS_NOTIFY_MOVED_TO = 128, VFS_NOTIFY_CREATE = 256,
     VFS_NOTIFY_DELETE = 512, VFS_NOTIFY_DELETE_SELF = 1024, VFS_NOTIFY_MOVE_SELF = 2048,
-    VFS_NOTIFY_UNMOUNT = 0x2000, VFS_NOTIFY_ISDIR = 0x40000000
+    VFS_NOTIFY_OPEN_EXEC = 0x1000, VFS_NOTIFY_UNMOUNT = 0x2000,
+    VFS_NOTIFY_OPEN_PERM = 0x10000, VFS_NOTIFY_ACCESS_PERM = 0x20000,
+    VFS_NOTIFY_OPEN_EXEC_PERM = 0x40000, VFS_NOTIFY_RENAME = 0x10000000, VFS_NOTIFY_ISDIR = 0x40000000
 };
+
+#define VFS_NOTIFY_PERMISSION_EVENTS (VFS_NOTIFY_OPEN_PERM | VFS_NOTIFY_ACCESS_PERM | \
+                                      VFS_NOTIFY_OPEN_EXEC_PERM)
 
 struct kernel_vfs_notify_ops {
     void (*emit)(struct kernel_vfs_instance *, uint64_t, uint32_t, uint32_t,
@@ -23,7 +28,8 @@ struct kernel_vfs_notify_ops {
 
 void kernel_vfs_notify_create(struct kernel_vfs_path *, const char *);
 void kernel_vfs_notify_file(const struct kernel_vfs_file *, uint32_t);
-void kernel_vfs_notify_open(const struct kernel_vfs_file *, struct kernel_vfs_path **);
+void kernel_vfs_notify_open(const struct kernel_vfs_file *, struct kernel_vfs_path **, uint32_t mask);
 void kernel_vfs_notify_close(const struct kernel_vfs_file *, uint32_t, struct kernel_vfs_path **);
+int kernel_vfs_fanotify_permission(const struct kernel_vfs_file *, uint32_t, uint8_t *track_access);
 
 #endif

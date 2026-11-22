@@ -28,7 +28,8 @@
 #if !BOAROS_USER_SMP
 static inline void kernel_wait_interrupt_locked(struct kernel_task *task)
 {
-    uint64_t generation=kernel_wait_signal_generation(&task->wait);
+    uint64_t generation=kernel_wait_signal_generation(&task->wait,
+        __atomic_load_n(&task->terminate_requested,__ATOMIC_RELAXED));
     if (generation) {
         struct kernel_wait_token token={task,generation};
         (void)kernel_wait_notify_locked(&token,KERNEL_WAIT_SIGNALLED);

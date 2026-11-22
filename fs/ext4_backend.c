@@ -173,13 +173,14 @@ static int ext4_backend_pread(struct kernel_vfs_node *node,
 static int ext4_backend_writeback(struct kernel_vfs_node *node,
     struct file_write_span *spans, size_t count);
 
-static struct kernel_vfs_backend ext4_backend;
+static struct kernel_vfs_backend ext4_backend, ext2_backend;
 static int ext4_check_domain(const struct kernel_vfs_node *node,
     const struct kernel_heap *heap, const struct physical_page_allocator *allocator)
 {
     if (!node || !node->instance || !node->mount ||
         node->closed || node->retired || (node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG ||
-        node->instance->ops != &ext4_backend || node->mount->private_data != node->instance ||
+        (node->instance->ops != &ext4_backend && node->instance->ops != &ext2_backend) ||
+        node->mount->private_data != node->instance ||
         !kernel_page_cache_check_domain(node->instance->page_cache,heap,allocator)) return -KERNEL_EINVAL;
     return 0;
 }
@@ -1551,10 +1552,10 @@ static int cleanup_mount(struct kernel_vfs_mount *mount)
     return release_mount_storage(mount);
 }
 
-int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
+static int mount_ext_filesystem(struct kernel_vfs_mount *mount,
                           struct kernel_block_device *block,
                           struct kernel_heap *heap,
-                          struct kernel_page_cache *page_cache, int read_only)
+                          struct kernel_page_cache *page_cache, int read_only, bool ext2)
 {
     struct lwext4_mount_adapter *adapter;
     struct ext4_sblock *superblock;
@@ -1605,7 +1606,7 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     kernel_raw_lock_init(&adapter->instance.error_lock, KERNEL_RAW_RANK_OBJECT);
     initialize_backend();
     adapter->instance.backend_data = adapter;
-    adapter->instance.ops = &ext4_backend;
+    adapter->instance.ops = ext2 ? &ext2_backend : &ext4_backend;
     adapter->instance.heap = heap;
     adapter->block = block;
     adapter->instance.page_cache = page_cache;
@@ -1666,7 +1667,8 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     }
     adapter->registered = 1U;
     adapter->instance.read_only = (uint8_t)(read_only != 0 ? 1U : 0U);
-    result = ext4_mount(adapter->device_name, adapter->mount_point, read_only != 0);
+    result = ext2 ? ext4_mount_ext2(adapter->device_name, adapter->mount_point, read_only != 0) :
+        ext4_mount(adapter->device_name, adapter->mount_point, read_only != 0);
     if (result != EOK) {
         (void)cleanup_mount(mount);
         return lwext4_error(result);
@@ -1724,6 +1726,16 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     adapter->instance.device_id=block->device_number?block->device_number:adapter->instance.backend_mount.id;
     return 0;
 }
+
+int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
+    struct kernel_block_device *block, struct kernel_heap *heap,
+    struct kernel_page_cache *page_cache, int read_only)
+{ return mount_ext_filesystem(mount, block, heap, page_cache, read_only, false); }
+
+int kernel_vfs_mount_ext2(struct kernel_vfs_mount *mount,
+    struct kernel_block_device *block, struct kernel_heap *heap,
+    struct kernel_page_cache *page_cache, int read_only)
+{ return mount_ext_filesystem(mount, block, heap, page_cache, read_only, true); }
 
 int kernel_vfs_mount_root(struct kernel_vfs_mount *mount,
                           struct kernel_block_device *block,
@@ -2178,6 +2190,8 @@ struct namespace_create {
     uint32_t uid,gid,umask;
     void *access_acl,*default_acl;
     size_t access_size,default_size;
+    struct kernel_vfs_handle *handle;
+    bool prepare_acl;
 };
 static int apply_namespace_create(void *context)
 {
@@ -2189,23 +2203,29 @@ static int apply_namespace_create(void *context)
         if (result) return result;
         memset(file, 0, sizeof(*file));
     }
-    int result=request->path ? ext4_create_child(request->mount, request->parent, request->path,
+    struct ext4_create_acl acl = {request->access_acl, request->default_acl,
+        request->access_size, request->default_size};
+    int result=request->path ? ext4_create_child_acl(request->mount, request->parent, request->path,
         request->mode | request->type, request->device, request->target, file,
-        request->initial, request->uid, request->gid) :
+        request->initial, request->uid, request->gid, request->prepare_acl ? &acl : NULL) :
         ext4_tmpfile_child(request->mount, request->parent, request->mode | request->type,
             file, request->initial, request->uid, request->gid);
-    if (!result && request->access_acl)
+    if (!result && !request->prepare_acl && request->access_acl)
         result=ext4_file_set_acl(file,EXT4_XATTR_INDEX_POSIX_ACL_ACCESS,
             request->access_acl,request->access_size,false,false,0);
-    if (!result && request->default_acl)
+    if (!result && !request->prepare_acl && request->default_acl)
         result=ext4_file_set_acl(file,EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT,
             request->default_acl,request->default_size,false,false,0);
     /* The live node's time cache must include the inherited ACL updates. */
-    if (!result && request->initial && (request->access_acl || request->default_acl))
+    if (!result && !request->prepare_acl && request->initial && (request->access_acl || request->default_acl))
         result=ext4_fraw_inode_fill(file,request->initial);
     /* Bind before the outer operation accepts the new directory entry, so
      * allocation failure aborts create instead of following a committed name. */
     if(!result && request->node)result=retain_node_inode(request->node);
+    if (!result && request->handle) {
+        request->handle->inode = file->inode;
+        request->handle->generation = ext4_inode_get_generation(request->initial);
+    }
     if (!request->node && file->mp) {
         int close_result=ext4_fclose(file);
         if (!result) result=close_result;
@@ -2262,6 +2282,8 @@ static int namespace_create_execute(struct lwext4_mount_adapter *adapter,struct 
     request->mode=mode;
     if (def) kernel_heap_release(adapter->instance.heap,def);
     if (access) kernel_heap_release(adapter->instance.heap,access);
+    request->prepare_acl = adapter->device.fs->ext2_format &&
+        (request->access_acl || request->default_acl);
     if (!result) result=ext4_metadata_execute(adapter->mount_point,apply_namespace_create,request);
     if (request->access_acl) kernel_heap_release(adapter->instance.heap,request->access_acl);
     if (request->default_acl) kernel_heap_release(adapter->instance.heap,request->default_acl);
@@ -2324,7 +2346,8 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
     if (adapter->instance.read_only) {
         return -KERNEL_EROFS;
     }
-    if (!adapter->device.fs->jbd_journal) return -KERNEL_EOPNOTSUPP;
+    if (!adapter->device.fs->jbd_journal && (!adapter->device.fs->ext2_format || !path))
+        return -KERNEL_EOPNOTSUPP;
     heap_status = kernel_heap_allocate_zeroed(adapter->instance.heap,
                                               1U,
                                               sizeof(struct lwext4_node),
@@ -2649,7 +2672,8 @@ static int ext4_backend_mkdir(struct kernel_vfs_mount *mount,
         return -KERNEL_EROFS;
     }
 
-    if (!adapter->device.fs->jbd_journal) return -KERNEL_EOPNOTSUPP;
+    if (!adapter->device.fs->jbd_journal && !adapter->device.fs->ext2_format)
+        return -KERNEL_EOPNOTSUPP;
     struct namespace_create request={.mount=adapter->mount_point,.parent=parent_inode,.path=path,.mode=mode&07777U,.type=KERNEL_VFS_S_IFDIR,.umask=umask};
     result=namespace_create_execute(adapter,&request);
     if (result != EOK) return lwext4_error(result);
@@ -3301,11 +3325,36 @@ static int ext4_backend_mknod(struct kernel_vfs_instance *instance,
 {
     if (!parent_inode || parent_inode > UINT32_MAX) return -KERNEL_EOVERFLOW;
     struct lwext4_mount_adapter *adapter = lwext4_instance(instance);
-    if (!adapter->device.fs->jbd_journal) return -KERNEL_EOPNOTSUPP;
+    if (!adapter->device.fs->jbd_journal &&
+        (!adapter->device.fs->ext2_format || type != KERNEL_VFS_S_IFREG))
+        return -KERNEL_EOPNOTSUPP;
     struct namespace_create request = {.mount=adapter->mount_point, .parent=parent_inode,
         .path=name, .type=type, .mode=mode & 07777U, .device=device,.umask=umask};
     return lwext4_error(namespace_create_execute(adapter,&request));
 }
+
+static int ext4_backend_create_with_handle(struct kernel_vfs_mount *mount, uint64_t parent,
+    const char *name, uint32_t mode, uint32_t device, const char *target, uint32_t umask,
+    struct kernel_vfs_handle *handle)
+{
+    if (!parent || parent > UINT32_MAX) return -KERNEL_EOVERFLOW;
+    struct lwext4_mount_adapter *adapter = mount->private_data;
+    if (adapter->instance.read_only) return -KERNEL_EROFS;
+    uint32_t type = mode & KERNEL_VFS_S_IFMT;
+    struct ext4_fs *fs = adapter->device.fs;
+    if (!fs->jbd_journal && type != KERNEL_VFS_S_IFLNK &&
+        (!fs->ext2_format || (type != KERNEL_VFS_S_IFDIR && type != KERNEL_VFS_S_IFREG)))
+        return -KERNEL_EOPNOTSUPP;
+    struct ext4_inode initial;
+    *handle = (struct kernel_vfs_handle){0};
+    struct namespace_create request = {.mount=adapter->mount_point, .parent=parent,
+        .path=name, .target=target, .type=type, .mode=mode & 07777U, .device=device,
+        .umask=umask, .initial=&initial, .handle=handle};
+    int error = namespace_create_execute(adapter, &request);
+    if (!error) ext4_handle_filesystem(&adapter->instance, handle->filesystem);
+    return lwext4_error(error);
+}
+
 static int ext4_backend_rename(struct kernel_vfs_instance *instance,
     uint64_t old_parent, const char *old_name, uint64_t new_parent,
     const char *new_name, unsigned flags, struct kernel_vfs_rename_result *result)
@@ -3376,6 +3425,7 @@ static void initialize_backend(void)
     ops->flush = ext4_backend_flush;
     ops->symlink = ext4_backend_symlink;
     ops->mknod = ext4_backend_mknod;
+    ops->create_with_handle = ext4_backend_create_with_handle;
     ops->rename = ext4_backend_rename;
     ops->link = ext4_backend_link;
     ops->link_tmpfile = ext4_backend_link_tmpfile;
@@ -3411,5 +3461,8 @@ static void initialize_backend(void)
     ops->direct_alignment = ext4_backend_direct_alignment;
     ops->seek_sparse = ext4_backend_seek_sparse;
     ops->direct_write_limit = ext4_backend_direct_limit;
+    ext2_backend = ext4_backend;
+    ext2_backend.type = "ext2";
+    ext2_backend.pread_batch = ext4_backend_pread_batch;
     __atomic_store_n(&ext4_backend.pread_batch,ext4_backend_pread_batch,__ATOMIC_RELEASE);
 }

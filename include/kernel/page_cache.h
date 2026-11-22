@@ -338,6 +338,7 @@ void kernel_page_cache_stop_worker(struct kernel_page_cache *cache);
 
 uint64_t kernel_page_cache_reclaim(struct kernel_page_cache *cache,
                                    uint64_t target_pages);
+void kernel_page_cache_drop_clean(struct kernel_page_cache *cache);
 
 enum kernel_page_cache_status kernel_page_cache_purge_mount(
     struct kernel_page_cache *cache,

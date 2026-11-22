@@ -300,6 +300,7 @@ int ext4_device_unregister_all(void);
 int ext4_mount(const char *dev_name,
 	       const char *mount_point,
 	       bool read_only);
+int ext4_mount_ext2(const char *dev_name, const char *mount_point, bool read_only);
 
 /**@brief   Umount operation.
  *
@@ -867,6 +868,14 @@ int ext4_tmpfile_link_child(const char *mount, uint32_t source, uint32_t parent,
 int ext4_create_child(const char *mount, uint32_t parent, const char *name,
     uint32_t mode, uint32_t device, const char *target, ext4_file *output,
     struct ext4_inode *initial,uint32_t uid,uint32_t gid);
+struct ext4_create_acl {
+    const void *access, *defaults;
+    size_t access_size, default_size;
+};
+int ext4_create_child_acl(const char *mount, uint32_t parent, const char *name,
+    uint32_t mode, uint32_t device, const char *target, ext4_file *output,
+    struct ext4_inode *initial, uint32_t uid, uint32_t gid,
+    const struct ext4_create_acl *acl);
 int ext4_unlink_child(const char *mount, uint32_t parent, const char *name,
     bool directory, uint32_t *inode, bool *orphan);
 /* Remove only the resolved inode. A callback also certifies that the target

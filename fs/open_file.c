@@ -484,6 +484,12 @@ int kernel_open_file_create_memfd(struct kernel_heap *heap,const char *name,uint
     return 0;
 }
 
+static void notify_exec_open(struct kernel_open_file_description *file)
+{
+    file->notify_opened = 1;
+    kernel_vfs_notify_open(&file->file, &file->notify_backing, VFS_NOTIFY_OPEN | VFS_NOTIFY_OPEN_EXEC);
+}
+
 enum kernel_open_file_status kernel_open_file_create_at(
     struct kernel_heap *heap, struct kernel_vfs_path *start,
     struct kernel_vfs_path *root, const char *path,
@@ -510,6 +516,7 @@ enum kernel_open_file_status kernel_open_file_create_at(
     if (result) {
         kernel_heap_release(heap, file);
     } else {
+        if (request->flags & KERNEL_VFS_OPEN_EXECUTABLE) notify_exec_open(file);
         *owner = file;
     }
     *linux_result = result;
@@ -533,7 +540,10 @@ enum kernel_open_file_status kernel_open_file_create_executable_path(
     int result = kernel_vfs_path_open_executable(path, &file->file);
     if (!result) result = finish_path_open(file, heap);
     if (result) kernel_heap_release(heap, file);
-    else *owner = file;
+    else {
+        notify_exec_open(file);
+        *owner = file;
+    }
     *linux_result = result;
     return KERNEL_OPEN_FILE_STATUS_OK;
 }
@@ -643,6 +653,7 @@ enum kernel_open_file_status kernel_open_file_create_executable(
     file->observed_mount_error = kernel_vfs_mount_error_sequence(file->file.mount);
     kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
     file->credentials = kernel_credentials_get(kernel_credentials_current());
+    notify_exec_open(file);
     *owner = file;
     *linux_result = 0;
     return KERNEL_OPEN_FILE_STATUS_OK;

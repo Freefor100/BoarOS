@@ -652,9 +652,6 @@ static enum kernel_files_status read_pinned(
         !(description->device && description->device->stateless_io) && kind != KERNEL_OPEN_FILE_KIND_INOTIFY &&
         kind != KERNEL_OPEN_FILE_KIND_REGULAR && kind != KERNEL_OPEN_FILE_KIND_SOCKET && kind != KERNEL_OPEN_FILE_KIND_PIPE);
     KERNEL_LOCK_SCOPE(offset_guard);
-    if ((kind == KERNEL_OPEN_FILE_KIND_REGULAR || kind == KERNEL_OPEN_FILE_KIND_GENERATED) &&
-        !regular_borrows_offset(description,borrowed_offset))
-        kernel_mutex_lock(&description->offset_lock, &offset_guard);
     uint64_t request;
     uint64_t total = 0U;
     struct kernel_uaccess_iov_cursor cursor = {iov, iov_count, 0U, 0U};
@@ -844,10 +841,17 @@ static enum kernel_files_status read_pinned(
         *linux_result=-KERNEL_EFAULT;
         return KERNEL_FILES_STATUS_OK;
     }
+    if (scalar && description->file.notify_access_perm) {
+        *linux_result = kernel_vfs_fanotify_permission(&description->file, VFS_NOTIFY_ACCESS_PERM, NULL);
+        if (*linux_result) return KERNEL_FILES_STATUS_OK;
+    }
     if (count == 0U && !description->proc_page_stream) {
         *linux_result = 0;
         return KERNEL_FILES_STATUS_OK;
     }
+    if ((kind == KERNEL_OPEN_FILE_KIND_REGULAR || kind == KERNEL_OPEN_FILE_KIND_GENERATED) &&
+        !regular_borrows_offset(description,borrowed_offset))
+        kernel_mutex_lock(&description->offset_lock, &offset_guard);
     if (kind == KERNEL_OPEN_FILE_KIND_GENERATED) {
         request = count > KERNEL_FILES_MAX_RW_COUNT
                       ? KERNEL_FILES_MAX_RW_COUNT : count;
@@ -906,11 +910,17 @@ enum kernel_files_status kernel_files_read(
     return kernel_files_release_io(files, &description, status);
 }
 
+enum positioned_read_mode {
+    POSITIONED_READ_VECTOR,
+    POSITIONED_READ_SCALAR,
+    POSITIONED_READ_AIO_SCALAR,
+};
+
 static enum kernel_files_status pread_iov_pinned(
     struct kernel_files *files, struct kernel_mm *mm,
     struct kernel_open_file_description **description_owner,
     const struct kernel_uaccess_iovec *iov, size_t iov_count,
-    uint64_t count, int64_t offset, int scalar, int64_t *linux_result);
+    uint64_t count, int64_t offset, enum positioned_read_mode mode, int64_t *linux_result);
 
 static int vector_request_error(struct kernel_open_file_description *file,
     uint64_t position,uint64_t count,uint32_t flags)
@@ -1000,9 +1010,21 @@ static enum kernel_files_status readv_request(
     *linux_result=vector_request_error(description,positioned?(uint64_t)offset:kernel_open_file_offset(description),
         snapshot.total,flags);
     if (*linux_result) goto out;
+    if (description->file.notify_access_perm) {
+        int shared_position = offset_guard.lock != NULL;
+        if (shared_position) kernel_lock_release(&offset_guard);
+        *linux_result = kernel_vfs_fanotify_permission(&description->file, VFS_NOTIFY_ACCESS_PERM, NULL);
+        if (*linux_result) goto out;
+        if (shared_position) {
+            kernel_mutex_lock(&description->offset_lock, &offset_guard);
+            *linux_result = vector_request_error(description, kernel_open_file_offset(description),
+                snapshot.total, flags);
+            if (*linux_result) goto out;
+        }
+    }
     if (positioned) {
         status = pread_iov_pinned(files, mm, &description, snapshot.view, snapshot.count,
-                                  snapshot.total, offset, 0, linux_result);
+                                  snapshot.total, offset, POSITIONED_READ_VECTOR, linux_result);
     } else if (description->device && description->device->readv) {
         status = description->device->readv(description->device_instance,
             kernel_task_current(), files, &description,
@@ -1051,10 +1073,11 @@ static enum kernel_files_status pread_iov_pinned(
     struct kernel_open_file_description **description_owner,
     const struct kernel_uaccess_iovec *iov, size_t iov_count,
     uint64_t count,
-    int64_t offset, int scalar,
+    int64_t offset, enum positioned_read_mode mode,
     int64_t *linux_result)
 {
     struct kernel_open_file_description *description = *description_owner;
+    int scalar = mode != POSITIONED_READ_VECTOR;
     /* pin覆盖本次请求；kind只在OFD发布前设置。 */
     const enum kernel_open_file_kind kind = description->kind;
     if(kind==KERNEL_OPEN_FILE_KIND_MQUEUE){
@@ -1126,6 +1149,10 @@ static enum kernel_files_status pread_iov_pinned(
         KERNEL_FILES_NOTE(files, read_failures, 1);
         return KERNEL_FILES_STATUS_OK;
     }
+    if (mode == POSITIONED_READ_SCALAR && description->file.notify_access_perm) {
+        *linux_result = kernel_vfs_fanotify_permission(&description->file, VFS_NOTIFY_ACCESS_PERM, NULL);
+        if (*linux_result) return KERNEL_FILES_STATUS_OK;
+    }
     if (count == 0U && !description->proc_page_stream) {
         *linux_result = 0;
         return KERNEL_FILES_STATUS_OK;
@@ -1191,7 +1218,7 @@ enum kernel_files_status kernel_files_pread(
     }
     struct kernel_uaccess_iovec iov = {user_buffer, count};
     status = pread_iov_pinned(files, mm, &description, &iov, 1,
-                              count, offset, 1, linux_result);
+                              count, offset, POSITIONED_READ_SCALAR, linux_result);
     if (!status && *linux_result>0 && description)
         kernel_vfs_notify_file(&description->file,VFS_NOTIFY_ACCESS);
     return kernel_files_release_io(files, &description, status);
@@ -2199,6 +2226,10 @@ int kernel_files_aio_rw(struct kernel_files *files,struct kernel_mm *mm,
     if (offset<0 || count>(uint64_t)(INT64_MAX-offset)) {error=-KERNEL_EINVAL;goto out;}
     error=vector_request_error(file,(uint64_t)offset,count,flags);
     if (error) goto out;
+    if (count && !writing && file->file.notify_access_perm) {
+        error = kernel_vfs_fanotify_permission(&file->file, VFS_NOTIFY_ACCESS_PERM, NULL);
+        if (error) goto out;
+    }
     *result=0;
     if (file->kind==KERNEL_OPEN_FILE_KIND_REGULAR && (kernel_open_file_flags(file)&KERNEL_FILES_O_DIRECT)) {
         *deferred=prepare_direct(file,mm,iov,elements,count,(uint64_t)offset,writing,flags);
@@ -2209,7 +2240,8 @@ int kernel_files_aio_rw(struct kernel_files *files,struct kernel_mm *mm,
                 0,NULL,NULL,flags)) __builtin_trap();
         account_write(files,*result);
     } else if (count) {
-        if (pread_iov_pinned(files,mm,owner,iov,elements,count,offset,!vector,result)) __builtin_trap();
+        enum positioned_read_mode mode = vector ? POSITIONED_READ_VECTOR : POSITIONED_READ_AIO_SCALAR;
+        if (pread_iov_pinned(files, mm, owner, iov, elements, count, offset, mode, result)) __builtin_trap();
         if (*result>0 && *owner) kernel_vfs_notify_file(&file->file,VFS_NOTIFY_ACCESS);
     }
 out:

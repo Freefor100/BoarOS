@@ -1126,8 +1126,8 @@ static int ext4_unlink(struct ext4_mountpoint *mp,
 
 /****************************************************************************/
 
-int ext4_mount(const char *dev_name, const char *mount_point,
-	       bool read_only)
+static int ext4_mount_format(const char *dev_name, const char *mount_point,
+	       bool read_only, bool ext2_format)
 {
 	int r;
 	uint32_t bsize;
@@ -1180,7 +1180,7 @@ int ext4_mount(const char *dev_name, const char *mount_point,
 	r = ext4_block_init(bd);
 	if (r != EOK) { { KERNEL_TASK_LOCK_SCOPE(index, &mount_index_lock); mp->reserved = false; } return r; }
 
-	r = ext4_fs_init(&mp->fs, bd, read_only);
+	r = ext4_fs_init(&mp->fs, bd, read_only, ext2_format);
 	if (r != EOK) {
 		ext4_block_fini(bd);
 		{ KERNEL_TASK_LOCK_SCOPE(index, &mount_index_lock); mp->reserved = false; }
@@ -1207,6 +1207,14 @@ int ext4_mount(const char *dev_name, const char *mount_point,
 
 	/*Bind block cache to block device*/
 	r = ext4_block_bind_bcache(bd, bc);
+	if (r == EOK && ext2_format && !read_only) {
+		struct ext4_sblock *sb = ext4_fs_super(&mp->fs);
+		/* Publish a durable dirty marker before allowing namespace changes. */
+		ext4_set16(sb, mount_count, ext4_get16(sb, mount_count) + 1);
+		ext4_set16(sb, state, ext4_get16(sb, state) & ~EXT4_SUPERBLOCK_STATE_VALID_FS);
+		r = ext4_sb_write(bd, sb);
+		if (r == EOK) r = ext4_blockdev_flush(bd);
+	}
 	if (r != EOK) {
 		ext4_bcache_cleanup(bc);
 		ext4_block_fini(bd);
@@ -1222,6 +1230,12 @@ int ext4_mount(const char *dev_name, const char *mount_point,
 	{ KERNEL_TASK_LOCK_SCOPE(index, &mount_index_lock); mp->mounted = 1; }
 	return r;
 }
+
+int ext4_mount(const char *dev_name, const char *mount_point, bool read_only)
+{ return ext4_mount_format(dev_name, mount_point, read_only, false); }
+
+int ext4_mount_ext2(const char *dev_name, const char *mount_point, bool read_only)
+{ return ext4_mount_format(dev_name, mount_point, read_only, true); }
 
 
 static struct ext4_mountpoint *ext4_get_mount(const char *path);
@@ -1243,6 +1257,12 @@ static int ext4_umount_locked(const char *mount_point)
 	 * owner. Only the successful final teardown makes the mount reusable. */
 	r = ext4_block_cache_flush(mp->fs.bdev);
 	if (r != EOK) return r;
+	/* The clean marker may reach the device only after directory and
+	 * allocation updates have reached stable storage. */
+	if (mp->fs.ext2_format && !mp->fs.read_only) {
+		r = ext4_blockdev_flush(mp->fs.bdev);
+		if (r != EOK) return r;
+	}
 	r = ext4_fs_fini(&mp->fs);
 	if (r != EOK) return r;
 	if (!mp->fs.read_only) {
@@ -1300,6 +1320,7 @@ int ext4_remount(const char *mount_point, bool read_only)
          * releasing the session. No fallible teardown follows publication. */
         result=ext4_block_cache_flush(fs->bdev);
         if (!result) result=ext4_journal_stop(mount_point);
+        if (!result && fs->ext2_format) result=ext4_blockdev_flush(fs->bdev);
         if (!result && !ext4_sb_feature_com(&fs->sb,EXT4_FCOM_HAS_JOURNAL)) {
             struct ext4_sblock clean=fs->sb;
             ext4_set16(&clean,state,EXT4_SUPERBLOCK_STATE_VALID_FS);
@@ -3489,6 +3510,8 @@ static bool ext4_rename_can_add_directory(struct ext4_inode_ref *parent)
 	     ext4_inode_has_flag(parent->inode, EXT4_INODE_FLAG_INDEX));
 }
 
+static void ext4_latch_nojournal_error(struct ext4_fs *fs, int error);
+
 int ext4_rename_child(const char *mount_point,
 	uint32_t old_parent, const char *old_name, uint32_t old_len,
 	uint32_t new_parent, const char *new_name, uint32_t new_len,
@@ -3506,14 +3529,15 @@ int ext4_rename_child(const char *mount_point,
 	uint32_t source_ino = 0, victim_ino = 0, parent;
 	bool is_dir = false, target_dir = false;
 	bool exchange = flags == EXT4_RENAME_EXCHANGE;
-	bool ordered = fs->os_locks && fs->os_locks->resource_acquire;
+	bool ordered = fs->jbd_journal && fs->os_locks && fs->os_locks->resource_acquire;
+	bool publishing = false;
 	int r;
 	EXT4_MP_LOCK(mp);
 	if (!result || flags > EXT4_RENAME_EXCHANGE || !old_parent || !new_parent ||
 	    !ext4_rename_name_valid(old_name, old_len) ||
 	    !ext4_rename_name_valid(new_name, new_len)) { r = EINVAL; goto Unlock; }
 	if (fs->read_only) { r = EROFS; goto Unlock; }
-	if (!fs->jbd_journal) { r = ENOTSUP; goto Unlock; }
+	if (!fs->jbd_journal && (!fs->ext2_format || exchange)) { r = ENOTSUP; goto Unlock; }
 	r = ext4_trans_start(mp);
 	if (r != EOK) goto Unlock;
 	/* Without per-object resources the caller's serial qualification spans
@@ -3631,9 +3655,18 @@ int ext4_rename_child(const char *mount_point,
 		ext4_touch_inode(mp, &victim, EXT4_TIME_CTIME, NULL);
 		goto Touch;
 	}
+	uint64_t previous_size = fs->ext2_format ? ext4_inode_get_size(sb, destination->inode) : 0;
 	if (victim_ino)
 		r = ext4_rename_replace(destination, new_name, new_len, &source, victim_ino);
 	else r = ext4_dir_add_entry(destination, new_name, new_len, &source);
+	if (fs->ext2_format) {
+		/* An index split or an appended leaf can already have changed
+		 * directory structure even if creating the new name failed. */
+		publishing = !r || previous_size != ext4_inode_get_size(sb, destination->inode);
+		if (!r) r = ext4_fs_stage_inode_ref(destination);
+		if (!r) r = ext4_bcache_scope_flush(&mp->bc, &ext4_current_operation(fs)->scope);
+		if (r != EOK) goto Put;
+	}
 	/* The held block borrows this transaction's private payload. Same-parent
 	 * insertion may repack it or move the source to a new leaf; discard the
 	 * old entry and predecessor and scan the current records before deleting. */
@@ -3680,14 +3713,16 @@ Put:
 	if (old.block.data) r = ext4_result(r, ext4_fs_put_inode_ref(&old));
 	/* Release the modified references before orphan enrollment so its initial
 	 * index load sees completed inode checksums in the shared table blocks. */
-	if (r == EOK && output.replaced_last_link) {
+	if (r == EOK && output.replaced_last_link && fs->jbd_journal) {
 		r = ext4_fs_get_inode_ref(fs, victim_ino, &victim);
 		if (r == EOK) {
 			r = ext4_orphan_add(&victim);
 			r = ext4_result(r, ext4_fs_put_inode_ref(&victim));
 		}
 	}
+	if (r && publishing) ext4_latch_nojournal_error(fs, r);
 	r = ext4_trans_finish(mp, r);
+	if (r && publishing) ext4_latch_nojournal_error(fs, r);
 	if (r == EOK) *result = output;
 Unlock:
 	if (r != EOK && ext4_current_trans(fs) && !ext4_current_trans(fs)->error)
@@ -3875,7 +3910,8 @@ static int ext4_unlink_dentry_core(struct ext4_mountpoint *mp, uint32_t parent_i
 
 	EXT4_MP_LOCK(mp);
     bool private_refs = ext4_current_trans(&mp->fs) != NULL;
-    bool reuse_dirent = parent_inode && private_refs;
+    bool reuse_dirent = parent_inode && (private_refs || mp->fs.ext2_format);
+    bool publishing = false;
     size_t prefix = parent_inode ? 0 : strlen(mp->name);
     if (reuse_dirent) {
         /* The caller owns the private metadata operation and the parent
@@ -3923,7 +3959,7 @@ static int ext4_unlink_dentry_core(struct ext4_mountpoint *mp, uint32_t parent_i
     if (target && child_inode != target->inode) { r = EUCLEAN; goto Finish; }
     /* Lookup precedes an independent operation's begin. Upgrade its existing
      * accepted loans in place; an outer operation already owns private refs. */
-    if (!private_refs) {
+    if (!reuse_dirent && !private_refs) {
         r = ext4_fs_inode_ref_write(&parent);
         if (r == EOK) r = ext4_fs_inode_ref_write(&child);
         if (r != EOK) goto Finish;
@@ -3946,6 +3982,7 @@ static int ext4_unlink_dentry_core(struct ext4_mountpoint *mp, uint32_t parent_i
 	r = reuse_dirent ? ext4_dir_remove_found(&parent, &found) :
         ext4_dir_remove_entry(&parent, path, len);
 	if (r == EOK) {
+        publishing = mp->fs.ext2_format;
 		ext4_unlink_update_links(mp, &parent, &child);
 		if (allow_directory) {
 			ext4_inode_set_links_cnt(child.inode, 0);
@@ -3966,7 +4003,9 @@ Finish:
     if (found.block.lb_id) r = ext4_result(r, ext4_dir_destroy_result(&parent, &found));
     if (child.block.data) r = ext4_result(r, ext4_fs_put_inode_ref(&child));
     if (parent.block.data) r = ext4_result(r, ext4_fs_put_inode_ref(&parent));
+    if (r && publishing) ext4_latch_nojournal_error(&mp->fs, r);
     r = ext4_trans_finish(mp, r);
+    if (r && publishing) ext4_latch_nojournal_error(&mp->fs, r);
     EXT4_MP_UNLOCK(mp);
     return r;
 PutRefs:
@@ -6627,13 +6666,33 @@ static void ext4_latch_nojournal_error(struct ext4_fs *fs, int error)
         __ATOMIC_RELEASE, __ATOMIC_RELAXED);
 }
 
-static int ext4_create_symlink_nojournal(struct ext4_mountpoint *mp, uint32_t parent,
-    const char *name, uint32_t mode, const char *target, ext4_file *file,
-    struct ext4_inode *initial, uint32_t uid, uint32_t gid)
+static int ext2_init_directory(struct ext4_inode_ref *child, struct ext4_inode_ref *parent)
+{
+    ext4_fsblk_t physical;
+    ext4_lblk_t logical;
+    int result = ext4_fs_append_inode_dblk(child, &physical, &logical);
+    if (result) return result;
+    struct ext4_block block;
+    struct ext4_blockdev *device = child->fs->bdev;
+    result = ext4_trans_block_get_noread(device, &block, physical);
+    if (result) return result;
+    uint32_t block_size = device->lg_bsize;
+    struct ext4_sblock *sb = ext4_fs_super(child->fs);
+    memset(block.data, 0, block_size);
+    ext4_dir_write_entry(sb, (void *)block.data, 12, child, ".", 1);
+    ext4_dir_write_entry(sb, (void *)(block.data + 12), block_size - 12, parent, "..", 2);
+    result = ext4_trans_set_block_dirty(block.buf);
+    return ext4_result(result, ext4_block_set(device, &block));
+}
+
+static int ext4_create_child_nojournal(struct ext4_mountpoint *mp, uint32_t parent,
+    const char *name, uint32_t mode, int type, const char *target, ext4_file *file,
+    struct ext4_inode *initial, uint32_t uid, uint32_t gid,
+    const struct ext4_create_acl *acl)
 {
     struct ext4_fs *fs = &mp->fs;
     struct ext4_sblock *sb = ext4_fs_super(fs);
-    size_t length = strlen(target), name_len = strlen(name);
+    size_t length = target ? strlen(target) : 0, name_len = strlen(name);
     if (length > ext4_sb_get_block_size(sb)) return EINVAL;
     /* The writeback scope must contain this creation's changes only. */
     if (ext4_operation_depth(fs)) return EBUSY;
@@ -6652,6 +6711,10 @@ static int ext4_create_symlink_nojournal(struct ext4_mountpoint *mp, uint32_t pa
         result = ENOENT;
         goto Finish;
     }
+    if (type == EXT4_DE_DIR && !ext4_rename_can_add_directory(&directory)) {
+        result = EMLINK;
+        goto Finish;
+    }
     struct ext4_dir_search_result found;
     int lookup = ext4_dir_find_entry(&found, &directory, name, name_len, false);
     result = ext4_dir_destroy_result(&directory, &found);
@@ -6661,7 +6724,7 @@ static int ext4_create_symlink_nojournal(struct ext4_mountpoint *mp, uint32_t pa
     /* Reserve the live parent's metadata observer memory before publication. */
     result = ext4_operation_record_inode(fs, parent, true);
     if (result) goto Finish;
-    result = ext4_fs_alloc_inode(fs, &child, EXT4_DE_SYMLINK, parent, name, name_len);
+    result = ext4_fs_alloc_inode(fs, &child, type, parent, name, name_len);
     if (result) goto Finish;
     ext4_inode_set_mode_initial(&child, mode);
     ext4_inode_set_uid(child.inode, uid);
@@ -6669,10 +6732,19 @@ static int ext4_create_symlink_nojournal(struct ext4_mountpoint *mp, uint32_t pa
     if (ext4_inode_has_flag(directory.inode, EXT4_INODE_FLAG_NODUMP))
         ext4_inode_set_flag(child.inode, EXT4_INODE_FLAG_NODUMP);
     ext4_touch_inode(mp, &child, EXT4_TIME_ATIME | EXT4_TIME_MTIME | EXT4_TIME_CTIME, NULL);
-    result = ext4_symlink_inode_set(&child, target, (uint32_t)length, true);
+    if (type == EXT4_DE_SYMLINK)
+        result = ext4_symlink_inode_set(&child, target, (uint32_t)length, true);
+    else if (type == EXT4_DE_DIR)
+        result = ext2_init_directory(&child, &directory);
+    if (!result && acl && acl->access)
+        result = ext4_xattr_set(&child, EXT4_XATTR_INDEX_POSIX_ACL_ACCESS,
+            "", 0, acl->access, acl->access_size);
+    if (!result && acl && acl->defaults)
+        result = ext4_xattr_set(&child, EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT,
+            "", 0, acl->defaults, acl->default_size);
     if (result) goto Reclaim;
 
-    ext4_inode_set_links_cnt(child.inode, 1);
+    ext4_inode_set_links_cnt(child.inode, type == EXT4_DE_DIR ? 2 : 1);
     result = ext4_fs_stage_inode_ref(&child);
     if (result) goto Reclaim;
     /* Complete the target and all inode/allocator writes before a directory
@@ -6680,13 +6752,24 @@ static int ext4_create_symlink_nojournal(struct ext4_mountpoint *mp, uint32_t pa
     result = ext4_bcache_scope_flush(&mp->bc, &ext4_current_operation(fs)->scope);
     if (result) goto Reclaim;
 
-    publishing = true;
+    uint64_t previous_size = ext4_inode_get_size(sb, directory.inode);
     result = ext4_dir_add_entry(&directory, name, name_len, &child);
+    publishing = true;
+    if (fs->ext2_format && (result == ENOSPC || result == ENOMEM) &&
+        previous_size == ext4_inode_get_size(sb, directory.inode)) {
+        publishing = false;
+        goto Reclaim;
+    }
     if (result) goto Finish;
+    if (type == EXT4_DE_DIR) {
+        ext4_fs_inode_links_count_inc(&directory);
+        directory.dirty = true;
+    }
     ext4_touch_inode(mp, &directory, EXT4_TIME_MTIME | EXT4_TIME_CTIME, NULL);
     if (initial) ext4_copy_initial_inode(&child, initial);
     *file = (ext4_file){.mp = mp, .inode = child.index, .flags = O_RDWR,
-        .fsize = length, .fmax = ext4_inode_max_size(fs, child.inode)};
+        .fsize = ext4_inode_get_size(sb, child.inode),
+        .fmax = ext4_inode_max_size(fs, child.inode)};
     goto Finish;
 
 Reclaim:
@@ -6711,6 +6794,15 @@ int ext4_create_child(const char *mount, uint32_t parent, const char *name,
     uint32_t mode, uint32_t device, const char *target, ext4_file *output,
     struct ext4_inode *initial,uint32_t uid,uint32_t gid)
 {
+    return ext4_create_child_acl(mount, parent, name, mode, device, target, output,
+        initial, uid, gid, NULL);
+}
+
+int ext4_create_child_acl(const char *mount, uint32_t parent, const char *name,
+    uint32_t mode, uint32_t device, const char *target, ext4_file *output,
+    struct ext4_inode *initial, uint32_t uid, uint32_t gid,
+    const struct ext4_create_acl *acl)
+{
     struct ext4_mountpoint *mp = ext4_get_mount(mount);
     if (!mp) return ENOENT;
     if (!parent || !name || !ext4_rename_name_valid(name, strlen(name))) return EINVAL;
@@ -6724,8 +6816,11 @@ int ext4_create_child(const char *mount, uint32_t parent, const char *name,
     ext4_file file = {0};
     struct ext4_inode_ref ref;
     int result;
-    if (type == EXT4_DE_SYMLINK && !ext4_sb_feature_com(&mp->fs.sb, EXT4_FCOM_HAS_JOURNAL))
-        result = ext4_create_symlink_nojournal(mp, parent, name, mode, target, &file, initial, uid, gid);
+    if ((type == EXT4_DE_SYMLINK && !ext4_sb_feature_com(&mp->fs.sb, EXT4_FCOM_HAS_JOURNAL)) ||
+        (mp->fs.ext2_format && (type == EXT4_DE_REG_FILE || type == EXT4_DE_DIR)))
+        result = ext4_create_child_nojournal(mp, parent, name, mode, type, target, &file,
+            initial, uid, gid, acl);
+    else if (mp->fs.ext2_format || acl) result = ENOTSUP;
     else if ((result = ext4_trans_start(mp)) == EOK) {
         result = ext4_open_relative(&file, mp, parent, name, O_CREAT | O_EXCL | O_RDWR,
             type, NULL, NULL, &ref, NULL);

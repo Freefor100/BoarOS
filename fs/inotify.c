@@ -6,6 +6,7 @@
 #include <kernel/wait_internal.h>
 #include "char_device_internal.h"
 #include "files/private.h"
+#include "notify_fdinfo.h"
 #include "open_file_internal.h"
 #include "uaccess_iov_internal.h"
 #include "vfs_objects.h"
@@ -459,25 +460,6 @@ struct inotify_fdinfo_row {
     uint32_t wd, mask, handle_type;
 };
 
-static size_t fdinfo_hex(char *out, uint64_t value)
-{
-    static const char digits[] = "0123456789abcdef";
-    unsigned shift = 60;
-    while (shift && !(value >> shift)) shift -= 4;
-    size_t size = shift / 4 + 1;
-    for (size_t i = 0; i < size; i++, shift -= 4)
-        out[i] = digits[(value >> shift) & 15U];
-    return size;
-}
-
-static char *fdinfo_field(char *out, const char *label, uint64_t value)
-{
-    size_t length = strlen(label);
-    memcpy(out, label, length);
-    out += length;
-    return out + fdinfo_hex(out, value);
-}
-
 /* The OFD keeps the group alive. Allocate before linking the cursor so that
  * the bounded mark snapshots and formatting cannot block with a live cursor. */
 int kernel_inotify_fdinfo(const struct kernel_open_file_description *file,
@@ -540,27 +522,13 @@ int kernel_inotify_fdinfo(const struct kernel_open_file_description *file,
         if (!count) break;
         for (size_t i = 0; i < count; i++) {
             const struct inotify_fdinfo_row *row = &rows[i];
-            out = fdinfo_field(out, "inotify wd:", row->wd);
-            out = fdinfo_field(out, " ino:", row->handle.inode);
-            /* VFS stores the userspace dev_t encoding; fdinfo uses the kernel dev_t. */
-            uint64_t major = (row->device >> 8) & 0xfffU;
-            uint64_t minor = (row->device & 0xffU) | ((row->device >> 12) & 0xfff00U);
-            out = fdinfo_field(out, " sdev:", (major << 20) | minor);
-            out = fdinfo_field(out, " mask:", row->mask);
-            out = fdinfo_field(out, " ignored_mask:", 0);
-            if (row->handle_type) {
-                static const char label[] = " f_handle:";
-                static const char digits[] = "0123456789abcdef";
-                out = fdinfo_field(out, " fhandle-bytes:", sizeof(row->handle));
-                out = fdinfo_field(out, " fhandle-type:", row->handle_type);
-                memcpy(out, label, sizeof(label) - 1);
-                out += sizeof(label) - 1;
-                const unsigned char *bytes = (const unsigned char *)&row->handle;
-                for (size_t n = 0; n < sizeof(row->handle); n++) {
-                    *out++ = digits[bytes[n] >> 4];
-                    *out++ = digits[bytes[n] & 15U];
-                }
-            }
+            out = notify_fdinfo_field(out, "inotify wd:", row->wd);
+            out = notify_fdinfo_field(out, " ino:", row->handle.inode);
+            out = notify_fdinfo_field(out, " sdev:", notify_fdinfo_device(row->device));
+            out = notify_fdinfo_field(out, " mask:", row->mask);
+            out = notify_fdinfo_field(out, " ignored_mask:", 0);
+            if (row->handle_type)
+                out = notify_fdinfo_handle(out, &row->handle, row->handle_type);
             *out++ = '\n';
         }
     }

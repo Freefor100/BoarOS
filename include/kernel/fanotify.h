@@ -5,6 +5,8 @@
 
 struct kernel_fs_context;
 struct kernel_fanotify_read;
+int kernel_fanotify_fdinfo(const struct kernel_open_file_description *, struct kernel_heap *,
+                         char **, size_t *);
 void kernel_task_fanotify_read_set(struct kernel_task *, struct kernel_fanotify_read *);
 void kernel_task_fanotify_read_clear(struct kernel_task *, struct kernel_fanotify_read *);
 void kernel_fanotify_read_abort(struct kernel_fanotify_read *);

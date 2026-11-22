@@ -222,20 +222,30 @@ static enum kernel_files_status finish_open(struct kernel_files *files,
     KERNEL_SERVICE_SCOPE_IF(service, 0);
     uint32_t fd = reservation->fd;
     uint32_t object_type = kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT;
-    if (kernel_vfs_namespace_requires_cpu0(description->file.mount) ||
-        (!(flags & LINUX_O_PATH) && object_type != KERNEL_VFS_S_IFREG && object_type != KERNEL_VFS_S_IFDIR))
-        kernel_service_scope_begin(&service);
-    if (flags & LINUX_O_PATH) goto Finish_open;
-    /* Require an actual backend data path before truncation or device open.
-     * FAT supplies a coherency-qualified direct path with explicit growth
-     * fallback; other regular backends must not silently ignore the flag. */
-    if ((flags & LINUX_O_DIRECT) && object_type != KERNEL_VFS_S_IFBLK &&
+    if (!(flags & LINUX_O_PATH) && !special_link) {
+        int error = kernel_vfs_fanotify_permission(&description->file, VFS_NOTIFY_OPEN_PERM,
+            &description->file.notify_access_perm);
+        if (error) {
+            KERNEL_FILES_NOTE(files, open_failures, 1);
+            kernel_files_queue_description(files, description);
+            (void)kernel_files_drain_file_cleanup(files);
+            *linux_result = error;
+            return KERNEL_FILES_STATUS_OK;
+        }
+    }
+    /* Permission notification precedes the backend's O_DIRECT check.
+     * Validate direct I/O before truncation or device open. */
+    if (!(flags & LINUX_O_PATH) && (flags & LINUX_O_DIRECT) && object_type != KERNEL_VFS_S_IFBLK &&
         !kernel_vfs_direct_alignment(&description->file)) {
         kernel_files_queue_description(files, description);
         (void)kernel_files_drain_file_cleanup(files);
         *linux_result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
     }
+    if (kernel_vfs_namespace_requires_cpu0(description->file.mount) ||
+        (!(flags & LINUX_O_PATH) && object_type != KERNEL_VFS_S_IFREG && object_type != KERNEL_VFS_S_IFDIR))
+        kernel_service_scope_begin(&service);
+    if (flags & LINUX_O_PATH) goto Finish_open;
     if (special_link) {
         if ((flags & LINUX_O_NOATIME) && !kernel_open_file_noatime_allowed(description)) {
             kernel_files_queue_description(files,description);
@@ -349,7 +359,7 @@ Finish_open:
     description->open_flags = (uint32_t)((flags & LINUX_O_PATH) ? flags & ~LINUX_O_CLOEXEC : flags);
     if (!(flags&LINUX_O_PATH)) {
         description->notify_opened=1;
-        kernel_vfs_notify_open(&description->file,&description->notify_backing);
+        kernel_vfs_notify_open(&description->file,&description->notify_backing,VFS_NOTIFY_OPEN);
     }
     enum kernel_files_status files_status = kernel_files_install_new_owned_at(files,
                                                      fd,

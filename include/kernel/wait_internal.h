@@ -45,13 +45,16 @@ static inline uint32_t kernel_wait_record_borrows(const struct kernel_wait_recor
 #endif
 }
 #if BOAROS_MAX_CPUS > 1
-#define KERNEL_WAIT_GENERATION_MAX (UINT64_MAX >> 5)
+#define KERNEL_WAIT_GENERATION_SHIFT 6
+#define KERNEL_WAIT_GENERATION_MAX (UINT64_MAX >> KERNEL_WAIT_GENERATION_SHIFT)
+static inline uint64_t kernel_wait_state_generation(uint64_t state)
+{ return state >> KERNEL_WAIT_GENERATION_SHIFT; }
 static inline uint64_t kernel_wait_state(uint64_t generation, unsigned phase, unsigned reason)
-{ return (generation << 5) | ((uint64_t)reason << 2) | phase; }
+{ return (generation << KERNEL_WAIT_GENERATION_SHIFT) | ((uint64_t)reason << 2) | phase; }
 static inline uint64_t kernel_wait_record_load(const struct kernel_wait_record *record)
 { return __atomic_load_n(&record->state, __ATOMIC_ACQUIRE); }
 static inline uint64_t kernel_wait_record_generation(const struct kernel_wait_record *record)
-{ return kernel_wait_record_load(record) >> 5; }
+{ return kernel_wait_state_generation(kernel_wait_record_load(record)); }
 static inline unsigned kernel_wait_record_phase(const struct kernel_wait_record *record)
 { return (unsigned)(kernel_wait_record_load(record) & 3U); }
 static inline unsigned kernel_wait_record_reason(const struct kernel_wait_record *record)
@@ -72,7 +75,7 @@ static inline int kernel_wait_try_commit(struct kernel_wait_record *record,uint6
     uint64_t committed=(expected&~UINT64_C(3))|KERNEL_WAIT_COMMITTED;
     if (__atomic_compare_exchange_n(&record->state,&expected,committed,0,
             __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) return 1;
-    if ((expected>>5)!=generation || (expected&3U)!=KERNEL_WAIT_NOTIFIED) __builtin_trap();
+    if (kernel_wait_state_generation(expected)!=generation || (expected&3U)!=KERNEL_WAIT_NOTIFIED) __builtin_trap();
     return 0;
 }
 
@@ -94,21 +97,26 @@ static inline void kernel_wait_record_transition(struct kernel_wait_record *reco
 static inline int kernel_wait_record_interruptible(const struct kernel_wait_record *record)
 {
 #if BOAROS_MAX_CPUS > 1
-    return !!(kernel_wait_record_load(record)&16U);
+    return !!(kernel_wait_record_load(record)&48U);
 #else
     return record->interruptible;
 #endif
 }
-static inline uint64_t kernel_wait_signal_generation(const struct kernel_wait_record *record)
+static inline uint64_t kernel_wait_signal_generation(const struct kernel_wait_record *record,
+    int terminating)
 {
 #if BOAROS_MAX_CPUS > 1
     uint64_t state=kernel_wait_record_load(record);
     unsigned phase=(unsigned)(state&3U);
-    return (state&16U) && (phase==KERNEL_WAIT_PREPARED || phase==KERNEL_WAIT_COMMITTED)
-        ? state>>5 : 0;
+    unsigned mode = (unsigned)(state >> 4) & 3U;
+    return (mode==KERNEL_WAIT_INTERRUPTIBLE || (mode==KERNEL_WAIT_KILLABLE && terminating)) &&
+        (phase==KERNEL_WAIT_PREPARED || phase==KERNEL_WAIT_COMMITTED)
+        ? kernel_wait_state_generation(state) : 0;
 #else
-    return record->interruptible && (record->phase==KERNEL_WAIT_PREPARED ||
-        record->phase==KERNEL_WAIT_COMMITTED) ? record->generation : 0;
+    return (record->interruptible==KERNEL_WAIT_INTERRUPTIBLE ||
+        (record->interruptible==KERNEL_WAIT_KILLABLE && terminating)) &&
+        (record->phase==KERNEL_WAIT_PREPARED || record->phase==KERNEL_WAIT_COMMITTED)
+        ? record->generation : 0;
 #endif
 }
 extern struct kernel_raw_lock kernel_wait_domain;

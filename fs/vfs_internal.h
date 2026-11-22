@@ -120,6 +120,9 @@ uint32_t kernel_vfs_internal_file_count(struct kernel_vfs_instance *);
 int kernel_vfs_mount_view_acquire_locked(struct kernel_vfs_mount *);
 void kernel_vfs_mount_view_release(struct kernel_vfs_mount *);
 uint64_t kernel_vfs_reclaim_clean(struct physical_page_allocator *, uint64_t target_pages);
+unsigned kernel_vfs_cache_pressure(void);
+void kernel_vfs_set_cache_pressure(unsigned);
+void kernel_vfs_drop_caches(struct physical_page_allocator *, unsigned);
 int kernel_vfs_nodes_idle(struct kernel_vfs_instance *, struct kernel_vfs_node *root);
 
 #define KERNEL_VFS_READ_BATCH_MAX FILE_READ_BATCH_MAX

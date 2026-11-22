@@ -53,7 +53,7 @@ LA的259仍返回`ENOSYS`。这些入口的直接消费者可用`python3 tests/u
 | 调用族（RISC-V 编号） | 契约归属 |
 |---|---|
 | epoll_create1/ctl/pwait（20–22）、dup/dup3/fcntl（23–25） | [文件模块](kernel-files.md)：OFD 共享、就绪与生命周期 |
-| fanotify_init/mark（262/263） | [文件模块](kernel-files.md#fanotify-文件访问通知)：标记范围、按组排队、事件描述符与文件句柄 |
+| fanotify_init/mark（262/263） | [文件模块](kernel-files.md#fanotify-文件访问通知)：标记范围、目录和名称记录、文件句柄及权限事件响应 |
 | getcwd（17）、mkdirat/unlinkat/symlinkat（34–36）、renameat/renameat2（38/276）、chdir/fchdir（49/50）、openat/close（56/57）、readlinkat（78） | [文件模块](kernel-files.md)：路径、flags、dirfd 与错误 |
 | ftruncate/fallocate（46/47）、pipe2（59）、getdents64/lseek（61/62）、read/write/readv/writev/pread64/pwrite64/preadv/pwritev（63–70） | [文件模块](kernel-files.md)：部分成功、offset、pin、稀疏文件、pipe 与目录 cookie |
 | bpf（280）、perf_event_open（241） | [BPF 模块](kernel-bpf.md)：对象/map/程序/BTF、socket 过滤、raw_syscalls 跟踪和线程软件时钟 |

@@ -217,7 +217,10 @@ struct kernel_task *kernel_wait_current_task(void)
 }
 int kernel_wait_backend_initialized(void) { return scheduler.initialized == KERNEL_SCHEDULER_INITIALIZED; }
 int kernel_wait_backend_signal(struct kernel_task *task)
-{ return task->arch.user_mode && (__atomic_load_n(&task->terminate_requested,__ATOMIC_RELAXED) || kernel_signal_has_pending(task)); }
+{
+    return task->arch.user_mode && (__atomic_load_n(&task->terminate_requested,__ATOMIC_RELAXED) ||
+        (task->wait.interruptible != KERNEL_WAIT_KILLABLE && kernel_signal_has_pending(task)));
+}
 uint64_t kernel_wait_backend_time(void) { return arch_time_read(); }
 static inline void publish_blocked(struct kernel_task *task)
 {
@@ -330,7 +333,7 @@ int kernel_wait_backend_lock_local(const struct kernel_wait_token *token,struct 
     if (__atomic_load_n(&task->cpu,__ATOMIC_RELAXED)==cpu) {
         uint64_t state=kernel_wait_record_load(&task->wait);
         unsigned phase=(unsigned)(state&3U);
-        if ((state>>5)!=token->generation || phase==KERNEL_WAIT_FINISHED || phase==KERNEL_WAIT_NOTIFIED) result=0;
+        if (kernel_wait_state_generation(state)!=token->generation || phase==KERNEL_WAIT_FINISHED || phase==KERNEL_WAIT_NOTIFIED) result=0;
         else if (phase==KERNEL_WAIT_COMMITTED && task->state==KERNEL_THREAD_STATE_BLOCKED &&
             (domain || !task->wait.deadline) && scheduler_local_task(task,cpu)) return 1;
     }
@@ -402,12 +405,13 @@ enum kernel_scheduler_status kernel_scheduler_block_current(struct kernel_wait_q
 #if BOAROS_USER_SMP
 void kernel_wait_interrupt_locked(struct kernel_task *task)
 {
+    int terminating=__atomic_load_n(&task->terminate_requested,__ATOMIC_RELAXED);
     for (;;) {
         struct kernel_cpu *cpu=__atomic_load_n(&task->cpu,__ATOMIC_ACQUIRE);
         if (!cpu) break;
         KERNEL_RAW_SCOPE(run,kernel_run_lock(cpu));
         if (__atomic_load_n(&task->cpu,__ATOMIC_RELAXED)!=cpu) continue;
-        uint64_t generation=kernel_wait_signal_generation(&task->wait);
+        uint64_t generation=kernel_wait_signal_generation(&task->wait,terminating);
         if (!generation) return;
         /* Holding the queue excludes a new commit. For a committed ordinary
          * task this is also the actual protection used by notify_locked. */
@@ -419,7 +423,7 @@ void kernel_wait_interrupt_locked(struct kernel_task *task)
         }
         break;
     }
-    uint64_t generation=kernel_wait_signal_generation(&task->wait);
+    uint64_t generation=kernel_wait_signal_generation(&task->wait,terminating);
     if (generation) {
         struct kernel_wait_token token={task,generation};
         (void)kernel_wait_notify_locked(&token,KERNEL_WAIT_SIGNALLED);

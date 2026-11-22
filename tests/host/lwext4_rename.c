@@ -663,6 +663,102 @@ static void verify(struct ext4_fs *fs, const char *kind, bool old_only)
         }
     }
 }
+static void ext2_namespace(struct ext4_fs *fs)
+{
+    ext4_file held = {0};
+    struct ext4_rename_result out;
+    uint32_t uid = 1001, gid = 1002;
+    CHECK(ext4_create_child("/", EXT4_INODE_ROOT_INDEX, "from", 0040755,
+        0, NULL, NULL, NULL, uid, gid) == EOK);
+    CHECK(ext4_create_child("/", EXT4_INODE_ROOT_INDEX, "to", 0040755,
+        0, NULL, NULL, NULL, uid, gid) == EOK);
+    uint32_t from = directory("/from"), to = directory("/to");
+    CHECK(ext4_create_child("/", from, "file", 0100644,
+        0, NULL, NULL, NULL, uid, gid) == EOK);
+    CHECK(ext4_create_child("/", to, "target", 0100644,
+        0, NULL, NULL, NULL, uid, gid) == EOK);
+    write_file("/from/file", "source");
+    write_file("/to/target", "victim");
+    CHECK(ext4_fopen(&held, "/to/target", "r") == EOK);
+    CHECK(rename_entry(from, "file", to, "target", EXT4_RENAME_NOREPLACE, &out) == EEXIST);
+    CHECK(rename_entry(from, "file", to, "target", 0, &out) == EOK);
+    CHECK(out.replaced_inode == held.inode && out.replaced_last_link && out.changed);
+    CHECK(!exists("/from/file"));
+    content("/to/target", "source");
+    read_file(&held, "victim");
+    uint32_t orphan = held.inode;
+    CHECK(ext4_fclose(&held) == EOK);
+    CHECK(ext4_orphan_free("/", orphan) == EOK);
+
+    CHECK(ext4_create_child("/", from, "dir", 0040755,
+        0, NULL, NULL, NULL, uid, gid) == EOK);
+    CHECK(rename_entry(from, "dir", to, "moved", 0, &out) == EOK);
+    CHECK(dotdot(fs, directory("/to/moved")) == to);
+    CHECK(links(fs, from) == 2 && links(fs, to) == 3);
+    bool last = false;
+    CHECK(ext4_unlink_child("/", to, "moved", true, &orphan, &last) == EOK && last);
+    CHECK(ext4_orphan_free("/", orphan) == EOK);
+    CHECK(links(fs, to) == 2);
+    CHECK(ext4_unlink_child("/", to, "target", false, &orphan, &last) == EOK && last);
+    CHECK(ext4_orphan_free("/", orphan) == EOK);
+    CHECK(!exists("/to/target"));
+    CHECK(ext4_remount("/", true) == EOK);
+    CHECK(ext4_create_child("/", to, "read-only", 0100644,
+        0, NULL, NULL, NULL, uid, gid) == EROFS);
+    CHECK(ext4_remount("/", false) == EOK);
+    CHECK(ext4_create_child("/", to, "read-write", 0100644,
+        0, NULL, NULL, NULL, uid, gid) == EOK);
+    puts("PASS ext2 namespace, open overwritten inode and last-reference reclaim");
+}
+
+static void ext2_full(struct ext4_fs *fs)
+{
+    uint32_t root = EXT4_INODE_ROOT_INDEX;
+    ext4_file file;
+    CHECK(ext4_create_child("/", root, "full", 0100644, 0, NULL, &file,
+        NULL, 0, 0) == EOK);
+    static char bytes[65536];
+    size_t written;
+    uint64_t iterations = disk.device.capacity_bytes / sizeof(bytes) + 1;
+    int error;
+    do {
+        written = 0;
+        error = ext4_fwrite(&file, bytes, sizeof(bytes), &written);
+    } while (error == EOK && written == sizeof(bytes) && --iterations);
+    CHECK(iterations && (error == ENOSPC || (error == EOK && written < sizeof(bytes))));
+    CHECK(ext4_fclose(&file) == EOK);
+    uint32_t inodes = ext4_fs_available_inodes(fs);
+    uint64_t blocks = ext4_fs_available_blocks(fs);
+    CHECK(ext4_create_child("/", root, "no-space", 0040755,
+        0, NULL, NULL, NULL, 0, 0) == ENOSPC);
+    CHECK(!exists("/no-space") && ext4_fs_available_inodes(fs) == inodes &&
+          ext4_fs_available_blocks(fs) == blocks);
+    CHECK(ext4_create_child("/", root, "after-full", 0100644,
+        0, NULL, NULL, NULL, 0, 0) == EOK);
+    puts("PASS ext2 ENOSPC returns inode and block space before publishing the name");
+}
+
+static void ext2_failed_create(struct ext4_fs *fs, unsigned index)
+{
+    uint32_t root = EXT4_INODE_ROOT_INDEX;
+    unsigned long long writes = disk.writes, flushes = disk.flushes;
+    if (index) disk.fail_write = disk.writes + index;
+    int result = ext4_create_child("/", root, "created", 0100644,
+        0, NULL, NULL, NULL, 0, 0);
+    if (!index) {
+        CHECK(result == EOK && disk.flushes == flushes);
+        printf("%llu\n", (unsigned long long)disk.writes - writes);
+        return;
+    }
+    CHECK(io_hits == 1 && result == EIO && fs->nojournal_error == EIO);
+    /* Failed writes and held cache state cannot make this mount clean. */
+    CHECK(ext4_create_child("/", root, "later", 0100644,
+        0, NULL, NULL, NULL, 0, 0) == EIO);
+    CHECK(ext4_umount("/") == EIO);
+    CHECK(disk.flushes == flushes && fault_block_crash(&disk) == 0);
+    puts("PASS ext2 failed home write stops later mutations and leaves the disk dirty");
+}
+
 int main(int argc, char **argv)
 {
     CHECK(argc >= 3); CHECK(fault_block_open(&disk, argv[1]) == 0);
@@ -673,11 +769,27 @@ int main(int argc, char **argv)
     struct ext4_blockdev dev = { .bdif=&iface, .part_size=disk.device.capacity_bytes };
     CHECK(ext4_device_register(&dev, "rename") == EOK);
     bool readonly = !strcmp(argv[2], "readonly");
-    CHECK(ext4_mount("rename", "/", readonly) == EOK);
-    CHECK(ext4_recover("/") == EOK); CHECK(ext4_journal_start("/") == EOK);
+    bool ext2 = !strncmp(argv[2], "ext2-", 5);
+    if (!strcmp(argv[2], "ext2-mount-reject")) {
+        CHECK(ext4_mount_ext2("rename", "/", false) == ENOTSUP);
+        CHECK(!disk.writes && !disk.flushes);
+        return 0;
+    }
+    if (!strcmp(argv[2], "ext2-dirty")) {
+        CHECK(ext4_mount_ext2("rename", "/", false) == EUCLEAN);
+        CHECK(!disk.writes && !disk.flushes);
+        CHECK(ext4_mount_ext2("rename", "/", true) == EOK);
+        CHECK(!exists("/created") && ext4_umount("/") == EOK);
+        return 0;
+    }
+    CHECK((ext2 ? ext4_mount_ext2("rename", "/", readonly) :
+        ext4_mount("rename", "/", readonly)) == EOK);
+    if (!ext2) {
+        CHECK(ext4_recover("/") == EOK); CHECK(ext4_journal_start("/") == EOK);
+    }
     bool reclaim_probe = argc >= 4 && !strcmp(argv[3], "orphan-reclaim") &&
                          strcmp(argv[2], "verify") && strcmp(argv[2], "seed-links");
-    if (!reclaim_probe) CHECK(ext4_orphan_recover("/") == EOK);
+    if (!ext2 && !reclaim_probe) CHECK(ext4_orphan_recover("/") == EOK);
     if (readonly) {
         struct ext4_rename_result out = { .replaced_inode = 123 };
         CHECK(rename_entry(directory("/old"), "source", directory("/new"), "target", 0, &out) == EROFS);
@@ -690,6 +802,14 @@ int main(int argc, char **argv)
         if (!strcmp(argv[3], "orphan-reclaim")) return 0;
     }
     else if (!strcmp(argv[2], "basic")) basic(dev.fs);
+    else if (!strcmp(argv[2], "ext2-namespace")) ext2_namespace(dev.fs);
+    else if (!strcmp(argv[2], "ext2-full")) ext2_full(dev.fs);
+    else if (!strcmp(argv[2], "ext2-io")) {
+        CHECK(argc == 4);
+        unsigned index = strtoul(argv[3], NULL, 10);
+        ext2_failed_create(dev.fs, index);
+        if (index) return 0;
+    }
     else if (!strcmp(argv[2], "exchange")) exchange_entries(dev.fs);
     else if (!strcmp(argv[2], "serial-refs")) serial_refs(dev.fs);
     else if (!strcmp(argv[2], "source-leaf-split")) source_leaf_split(dev.fs);

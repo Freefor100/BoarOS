@@ -16,6 +16,30 @@ ${HOST_CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror \
 check_fs() {
     e2fsck -fn "$1" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log"; exit 1; }
 }
+if [ "${1:-all}" = ext2 ]; then
+    for size in 1024 4096; do
+        truncate -s 32M "$work/test.img"
+        mkfs.ext2 -q -F -b "$size" "$work/test.img"
+        timeout 30 "$work/probe" "$work/test.img" ext2-namespace
+        check_fs "$work/test.img"
+        cp "$work/test.img" "$work/io.img"
+        writes=$(timeout 30 "$work/probe" "$work/io.img" ext2-io 0)
+        [ "$writes" -gt 1 ]
+        check_fs "$work/io.img"
+        for write in 1 "$writes"; do
+            cp "$work/test.img" "$work/io.img"
+            timeout 30 "$work/probe" "$work/io.img" ext2-io "$write"
+            timeout 30 "$work/probe" "$work/io.img" ext2-dirty
+        done
+        truncate -s 2M "$work/full.img"
+        mkfs.ext2 -q -F -b "$size" "$work/full.img"
+        timeout 30 "$work/probe" "$work/full.img" ext2-full
+        check_fs "$work/full.img"
+        mkfs.ext4 -q -F -b "$size" "$work/test.img"
+        timeout 30 "$work/probe" "$work/test.img" ext2-mount-reject
+    done
+    exit 0
+fi
 for size in 1024 4096; do
     for directory in dir_index '^dir_index'; do
         for orphan in orphan_file '^orphan_file'; do

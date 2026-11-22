@@ -69,7 +69,7 @@
 #include <stdlib.h>
 
 int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
-		 bool read_only)
+		 bool read_only, bool ext2_format)
 {
 	int r, i;
 	uint16_t tmp;
@@ -94,6 +94,7 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 	TAILQ_INIT(&fs->pending_inode_goals);
 	fs->super_replay_required = false;
 	fs->journaled_session = false;
+	fs->ext2_format = ext2_format;
 	fs->nojournal_error = EOK;
 
 	fs->read_only = read_only;
@@ -161,7 +162,8 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 	if (!fs->read_only) {
 		/* Recovery must see the original disk superblock. The journal start
 		 * barrier records RECOVER only after its format has been checked. */
-		if (!ext4_sb_feature_com(ext4_fs_super(fs), EXT4_FCOM_HAS_JOURNAL)) {
+		if (!fs->ext2_format &&
+		    !ext4_sb_feature_com(ext4_fs_super(fs), EXT4_FCOM_HAS_JOURNAL)) {
 			ext4_set16(ext4_fs_super(fs), mount_count,
 				ext4_get16(ext4_fs_super(fs), mount_count) + 1);
 			ext4_set16(ext4_fs_super(fs), state,
@@ -303,6 +305,22 @@ int ext4_fs_check_features(struct ext4_fs *fs, bool *read_only)
 {
 	ext4_assert(fs && read_only);
 	uint32_t v;
+	if (fs->ext2_format) {
+		struct ext4_sblock *sb = ext4_fs_super(fs);
+		uint32_t revision = ext4_get32(sb, rev_level);
+		const uint32_t compatible = EXT4_FCOM_EXT_ATTR | EXT4_FCOM_RESIZE_INODE |
+		    EXT4_FCOM_DIR_INDEX;
+		if (revision > 1 ||
+		    (!revision && (ext4_get32(sb, features_compatible) ||
+		        ext4_get32(sb, features_incompatible) || ext4_get32(sb, features_read_only))) ||
+		    (ext4_get32(sb, features_compatible) & ~compatible) ||
+		    (ext4_get32(sb, features_incompatible) & ~EXT2_SUPPORTED_FINCOM))
+			return ENOTSUP;
+		if (ext4_get32(sb, features_read_only) & ~EXT2_SUPPORTED_FRO_COM) {
+			*read_only = true;
+			return EOK;
+		}
+	}
 	if (ext4_get32(ext4_fs_super(fs), rev_level) == 0) {
 		*read_only = false;
 		return EOK;
