@@ -1,264 +1,354 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1417" viewBox="0 0 1200 1417" role="img" aria-labelledby="title desc" xml:lang="zh-CN">
-  <title id="title">BoarOS 内核架构与多核执行分工</title>
-  <desc id="desc">内核空间包含架构入口、共用内核子系统和设备驱动。两种架构都将系统调用交给公共分派器，将缺页异常交给内存管理。文件系统经块层连接块设备驱动，网络协议栈经以太网接入网卡驱动。蓝色标签表示调用核执行，琥珀色标签表示 CPU0 推进。QEMU virt 平台位于内核空间之外。</desc>
+<svg xmlns="http://www.w3.org/2000/svg" width="1312" height="1288" viewBox="0 0 1312 1288" role="img" aria-labelledby="title desc" xml:lang="zh-CN">
+  <title id="title">BoarOS 内核总体架构</title>
+  <desc id="desc">用户程序执行系统调用指令或因取指、访存触发缺页异常，由对应架构保存现场后，分别交给系统调用分派器和虚拟内存管理子系统。设备中断由平台中断控制器送到 0 号核，再根据中断来源交给设备驱动。</desc>
   <defs>
-    <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto">
-      <path d="M1 1l5 3-5 3" fill="none" stroke="#70829b" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <linearGradient id="headerGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#0f2342"/>
+      <stop offset="100%" stop-color="#1d3b66"/>
+    </linearGradient>
+    <filter id="cardShadow" x="-2%" y="-4%" width="104%" height="112%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0f172a" flood-opacity="0.06"/>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M1.5 2L8.5 5L1.5 8" fill="none" stroke="#64748b" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
     </marker>
-    <g id="chip" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round">
-      <rect x="5" y="5" width="14" height="14" rx="3"/>
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M1.5 2L8.5 5L1.5 8" fill="none" stroke="#2563eb" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="arrowTeal" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M1.5 2L8.5 5L1.5 8" fill="none" stroke="#0f766e" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="arrowAmber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M1.5 2L8.5 5L1.5 8" fill="none" stroke="#b45309" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <g id="ico-cpu" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="5" y="5" width="14" height="14" rx="2.5"/>
       <rect x="9" y="9" width="6" height="6" rx="1"/>
-      <path d="M9 2v3m6-3v3M9 19v3m6-3v3M2 9h3m-3 6h3m14-6h3m-3 6h3"/>
+      <path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/>
     </g>
-    <g id="terminal" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">
-      <rect x="2" y="4" width="20" height="16" rx="3"/>
-      <path d="m6 9 3 3-3 3m6 0h5"/>
+    <g id="ico-mem" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="3" y="6" width="18" height="11" rx="2"/>
+      <path d="M7 10v3M12 10v3M17 10v3M7 17v3M12 17v3M17 17v3"/>
     </g>
-    <g id="memory" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">
-      <rect x="2" y="6" width="20" height="12" rx="2"/>
-      <path d="M7 10v4m5-4v4m5-4v4M7 18v3m5-3v3m5-3v3"/>
+    <g id="ico-bpf" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 18V6M4 18h16"/>
+      <path d="M7 14l4-4 3 2.5L19 7"/>
+      <circle cx="19" cy="7" r="1.5" fill="currentColor"/>
     </g>
-    <g id="disk" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round">
-      <ellipse cx="12" cy="6" rx="8" ry="3"/>
-      <path d="M4 6v12c0 4 16 4 16 0V6M4 12c0 4 16 4 16 0"/>
+    <g id="ico-fs" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <ellipse cx="12" cy="6" rx="7.5" ry="2.8"/>
+      <path d="M4.5 6v11.5c0 1.6 3.4 2.8 7.5 2.8s7.5-1.2 7.5-2.8V6"/>
+      <path d="M4.5 11.8c0 1.6 3.4 2.8 7.5 2.8s7.5-1.2 7.5-2.8"/>
     </g>
-    <g id="network" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round">
-      <circle cx="12" cy="5" r="3"/><circle cx="5" cy="18" r="3"/><circle cx="19" cy="18" r="3"/>
-      <path d="m10.6 7.7-4.2 7.6m7-7.6 4.2 7.6M8 18h8"/>
+    <g id="ico-net" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="5.5" r="2.6"/>
+      <circle cx="5.5" cy="17.5" r="2.6"/>
+      <circle cx="18.5" cy="17.5" r="2.6"/>
+      <path d="M10.7 7.8L6.8 15.2M13.3 7.8l3.9 7.4M8.1 17.5h7.8"/>
     </g>
-    <g id="branch" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M12 3v6m0 0-7 5v6m7-11 7 5v6M2 17l3 3 3-3m8 0 3 3 3-3"/>
+    <g id="ico-user" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="2.5" y="4" width="19" height="16" rx="2.5"/>
+      <path d="M6.5 9.5l3 2.5-3 2.5M12 14.5h5"/>
     </g>
-    <g id="board" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round">
+    <g id="ico-dev" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
       <rect x="3" y="3" width="18" height="18" rx="3"/>
-      <rect x="7" y="7" width="6" height="6" rx="1"/>
-      <path d="M16 8h2m-2 4h2M7 16h3m3 0h5"/>
+      <rect x="7" y="7" width="5" height="5" rx="1"/>
+      <path d="M15 8h2.5M15 12h2.5M7 16h3.5M13.5 16h4"/>
     </g>
   </defs>
+
   <style>
-    text { font-family: system-ui, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #23334c; }
-    .title { font-size: 30px; font-weight: 750; fill: #fff; }
-    .subtitle { font-size: 15px; fill: #d7e6fd; }
-    .section { font-size: 21px; font-weight: 700; }
-    .heading { font-size: 20px; font-weight: 700; }
-    .body { font-size: 17px; }
-    .small { font-size: 16px; fill: #42536d; }
-    .strong { font-weight: 650; }
-    .card { fill: #fff; stroke: #d2dce9; }
-    .rv { fill: #125985; }
-    .la { fill: #8b365d; }
-    .blue { fill: #194f9b; }
-    .amber { fill: #8b4b13; }
-    .teal { fill: #14635c; }
-    .wire { fill: none; stroke: #647993; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
-    .storage-wire { stroke: #9b6c3f; }
-    .network-wire { stroke: #865398; }
-    .arrow { marker-end: url(#arrow); }
+    text { font-family: "Noto Sans CJK SC", "PingFang SC", "Microsoft YaHei", system-ui, -apple-system, sans-serif; fill: #1e293b; }
+    .mono { font-family: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .h-title { font-size: 26px; font-weight: 700; fill: #ffffff; }
+    .h-sub { font-size: 13.5px; fill: #cbd5e1; }
+    .layer-tag { font-size: 12px; font-weight: 700; letter-spacing: 0.4px; }
+    .layer-title { font-size: 16px; font-weight: 700; fill: #0f172a; }
+    .card-title { font-size: 15.5px; font-weight: 700; fill: #0f172a; }
+    .card-sub { font-size: 12px; fill: #64748b; }
+    .item { font-size: 13px; fill: #334155; }
+    .item-bold { font-size: 13px; font-weight: 600; fill: #1e293b; }
+    .pill-txt { font-size: 11.5px; font-weight: 600; }
+    .caption { font-size: 12px; fill: #475569; }
+    .card { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.2; filter: url(#cardShadow); }
+    .wire { fill: none; stroke: #64748b; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+    .wire-accent { fill: none; stroke: #2563eb; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+    .wire-fault { fill: none; stroke: #0f766e; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+    .wire-irq { fill: none; stroke: #b45309; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
   </style>
 
-  <rect x="1" y="1" width="1198" height="1415" rx="19" fill="#f4f7fb" stroke="#d2dce9"/>
+  <!-- Outer Canvas -->
+  <rect x="1" y="1" width="1310" height="1286" rx="18" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
 
-  <g aria-label="图题">
-    <rect x="24" y="20" width="1152" height="70" rx="14" fill="#152a48"/>
-    <rect x="45" y="37" width="36" height="36" rx="10" fill="#355482"/>
-    <use href="#chip" x="51" y="43" color="#e8f2ff"/>
-    <text class="title" x="99" y="54">BoarOS 内核架构</text>
-    <text class="subtitle" x="101" y="76">从架构入口到共用子系统与设备</text>
-    <g transform="translate(120)">
-      <path d="M834 20v18h47l18 18h157m-126 0v14h126" fill="none" stroke="#6384b0" stroke-opacity=".38" stroke-width="1.4"/>
-      <rect x="873" y="38" width="157" height="30" rx="15" fill="#2a456a"/>
-      <text class="subtitle strong" x="951" y="58" text-anchor="middle">RV64 / LA64 · 1–8 核</text>
-    </g>
+  <!-- Header Banner -->
+  <g aria-label="标题与多核执行图例">
+    <rect x="20" y="18" width="1240" height="76" rx="14" fill="url(#headerGrad)"/>
+    <rect x="38" y="36" width="40" height="40" rx="10" fill="#25487a"/>
+    <use href="#ico-cpu" x="46" y="44" width="24" height="24" color="#e0f2fe"/>
+    <text class="h-title" x="92" y="54">BoarOS 内核总体架构</text>
+    <text class="h-sub" x="92" y="77">双架构统一单体内核 · Linux 应用二进制接口（ABI）兼容 · 1～8 核对称多处理（SMP）</text>
+
+    <!-- Execution Mode Legend -->
+    <text class="h-sub" x="772" y="44" style="font-size:12px; fill:#94a3b8;">多核执行分工图例</text>
+    <rect x="772" y="53" width="136" height="24" rx="12" fill="#dbeafe"/>
+    <circle cx="786" cy="65" r="4.5" fill="#1d4ed8"/>
+    <text class="pill-txt" x="798" y="69.5" style="fill:#1e40af;">调用核直接并行</text>
+
+    <rect x="918" y="53" width="160" height="24" rx="12" fill="#ccfbf1"/>
+    <circle cx="932" cy="65" r="4.5" fill="#0f766e"/>
+    <text class="pill-txt" x="944" y="69.5" style="fill:#115e59;">归属核 / 按挂载分片</text>
+
+    <rect x="1088" y="53" width="152" height="24" rx="12" fill="#fef3c7"/>
+    <circle cx="1102" cy="65" r="4.5" fill="#b45309"/>
+    <text class="pill-txt" x="1114" y="69.5" style="fill:#92400e;">CPU0 串行协调 / 中断</text>
   </g>
 
-  <g aria-label="用户空间">
-    <rect x="24" y="105" width="1152" height="62" rx="12" fill="#f3eeff" stroke="#dacdf4"/>
-    <rect x="43" y="124" width="33" height="33" rx="9" fill="#e6dbfb"/>
-    <use href="#terminal" x="47.5" y="128.5" color="#6d4899"/>
-    <text class="heading" x="90" y="137">用户空间</text>
-    <text class="small" x="90" y="158">已验证应用包括 BusyBox、SQLite WAL 和 Lua</text>
-    <text class="body strong" x="627" y="137">musl / glibc</text>
-    <text class="small" x="627" y="158">支持静态和动态链接的 ELF</text>
-    <rect x="998" y="123" width="154" height="31" rx="15.5" fill="#e6dbfb"/>
-    <text class="small strong" x="1075" y="144" text-anchor="middle">OSComp 评测适配</text>
+  <!-- Layer 1: User Space -->
+  <g aria-label="用户空间与生态">
+    <rect x="20" y="108" width="1240" height="106" rx="14" fill="#f5f3ff" stroke="#ddd6fe" stroke-width="1.3"/>
+    <rect x="36" y="120" width="28" height="28" rx="7" fill="#ede9fe"/>
+    <use href="#ico-user" x="38" y="122" width="24" height="24" color="#6d28d9"/>
+    <text class="layer-title" x="74" y="139" style="fill:#4c1d95;">用户空间与 Linux 生态</text>
+    <text class="caption" x="260" y="139" style="fill:#6d28d9;">直接运行未经修改的 Linux 用户态程序与上游系统工具</text>
+
+    <!-- 3 User Space Cards -->
+    <rect class="card" x="36" y="156" width="420" height="46" rx="9" style="stroke:#ddd6fe;"/>
+    <text class="item-bold" x="50" y="175" style="fill:#4c1d95;">真实应用与工具链</text>
+    <text class="caption" x="50" y="193">BusyBox · SQLite · Lua · strace · bpftrace · 客体内离线编译</text>
+
+    <rect class="card" x="470" y="156" width="380" height="46" rx="9" style="stroke:#ddd6fe;"/>
+    <text class="item-bold" x="484" y="175" style="fill:#4c1d95;">运行时库与标准接口</text>
+    <text class="caption" x="484" y="193">musl / glibc（静态与动态 ELF）· RV 273 / LA 269 个系统调用</text>
+
+    <rect class="card" x="864" y="156" width="380" height="46" rx="9" style="stroke:#ddd6fe;"/>
+    <text class="item-bold" x="878" y="175" style="fill:#4c1d95;">用户态快速通道与共享映射</text>
+    <text class="caption" x="878" y="193">内嵌 vDSO（时钟/信号返回）· BPF RingBuf · TPACKET_V3</text>
   </g>
 
-  <path class="wire arrow" d="M600 168v32"/>
-  <text class="small" x="620" y="189">陷入内核</text>
+  <!-- Transition Arrow: User -> Kernel -->
+  <path class="wire-accent" marker-end="url(#arrowBlue)" d="M640 214v24"/>
+  <rect x="652" y="217" width="298" height="19" rx="9.5" fill="#eff6ff" stroke="#bfdbfe"/>
+  <text class="caption" x="801" y="230.5" text-anchor="middle" style="fill:#1d4ed8; font-weight:600;">系统调用指令 · 取指或访存触发缺页异常</text>
 
-  <g aria-label="内核空间">
-    <rect x="16" y="201" width="1168" height="1032" rx="17" fill="#e9eff8" stroke="#a9bdd7" stroke-width="1.5"/>
-    <path d="M33 201h1134a17 17 0 0 1 17 17v21H16v-21a17 17 0 0 1 17-17z" fill="#264362"/>
-    <use href="#chip" x="38" y="208" color="#e3efff"/>
-    <text class="section" x="75" y="227" style="fill:#fff">内核空间</text>
-    <text class="subtitle" x="180" y="226">架构入口、共用子系统和设备驱动</text>
+  <!-- Kernel Space Container -->
+  <rect x="20" y="242" width="1240" height="860" rx="16" fill="#eff4fa" stroke="#94a3b8" stroke-width="1.4"/>
+  <path d="M36 242h1208a16 16 0 0 1 16 16v22H20v-22a16 16 0 0 1 16-16z" fill="#1e3a5f"/>
+  <text class="layer-title" x="38" y="267" style="fill:#ffffff;">内核空间（Monolithic Kernel）</text>
+  <text class="h-sub" x="285" y="266" style="font-size:12.5px;">构建期选定架构后端 · 调度、虚拟内存、文件系统和网络共用内核实现</text>
 
-    <g aria-label="双架构入口和异常分流">
-      <rect x="48" y="249" width="1104" height="255" rx="13" fill="#f7fafe" stroke="#c5d4e8"/>
-      <use href="#branch" x="65" y="255" color="#315b8d"/>
-      <text class="section" x="101" y="274">架构入口与分派</text>
-      <text class="small" x="295" y="273">两种架构都从各自的异常入口进入，并按异常类型分流</text>
+  <!-- Architecture entry and dispatch -->
+  <g aria-label="架构入口与陷入分流">
+    <rect x="36" y="292" width="1208" height="254" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
+    <text class="layer-tag" x="52" y="313" style="fill:#334155;">架构入口与陷入分流</text>
 
-      <g aria-label="两种架构的异常入口">
-        <rect x="66" y="284" width="1068" height="73" rx="10" fill="#e7effa" stroke="#b6cbe5"/>
-        <text class="small strong" x="83" y="302">两种架构的异常入口</text>
+    <rect x="52" y="324" width="1176" height="88" rx="9" fill="#f1f5f9" stroke="#cbd5e1"/>
+    <text class="item-bold" x="66" y="345">双架构陷入入口</text>
+    <text class="caption" x="174" y="345">保存寄存器现场 · 读取陷入原因</text>
+    <text class="caption" x="1212" y="345" text-anchor="end" style="fill:#92400e;">设备中断由 0 号核接收</text>
 
-        <rect x="80" y="308" width="510" height="41" rx="7" fill="#f0f8fd" stroke="#bfdcee"/>
-        <text class="heading rv" x="95" y="326">RISC-V 64 · S-mode</text>
-        <text class="small" x="95" y="343">ECALL 发起系统调用，SBI RFENCE 使远端 TLB 失效</text>
+    <rect x="64" y="354" width="560" height="46" rx="8" fill="#f0f9ff" stroke="#7dd3fc"/>
+    <rect x="76" y="364" width="96" height="26" rx="6" fill="#0369a1"/>
+    <text class="pill-txt" x="124" y="381.5" text-anchor="middle" style="fill:#ffffff;">RISC-V 64</text>
+    <text class="item-bold" x="184" y="374" style="fill:#0c4a6e;">S-Mode · Sv39 三级页表（4 KiB 基页 / 2 MiB 大页）</text>
+    <text class="caption" x="184" y="392">ECALL · 读取 scause / stval · arch/riscv/trap.c</text>
 
-        <rect x="610" y="308" width="510" height="41" rx="7" fill="#fdf3f8" stroke="#eac9da"/>
-        <text class="heading la" x="625" y="326">LoongArch 64 · PLV0</text>
-        <text class="small" x="625" y="343">SYSCALL 发起系统调用，IPI 逐核确认远端 TLB 失效</text>
-      </g>
+    <rect x="656" y="354" width="560" height="46" rx="8" fill="#fff1f2" stroke="#fda4af"/>
+    <rect x="668" y="364" width="108" height="26" rx="6" fill="#9f1239"/>
+    <text class="pill-txt" x="722" y="381.5" text-anchor="middle" style="fill:#ffffff;">LoongArch 64</text>
+    <text class="item-bold" x="788" y="374" style="fill:#881337;">PLV0 · LA464 三级页表（16 KiB 基页 / 32 MiB 大页）</text>
+    <text class="caption" x="788" y="392">SYSCALL · 读取 ESTAT / BADV · arch/loongarch/trap.c</text>
 
-      <g aria-label="按异常类型分流">
-        <rect x="66" y="385" width="1068" height="92" rx="10" fill="#edf5f6" stroke="#bfd5da"/>
-        <text class="small strong" x="83" y="405">按异常类型分流</text>
+    <rect x="52" y="438" width="1176" height="96" rx="9" fill="#f1f5f9" stroke="#cbd5e1"/>
+    <text class="item-bold" x="66" y="460">按陷入原因分派</text>
+    <path class="wire" d="M640 412v15"/>
+    <path class="wire-accent" marker-end="url(#arrowBlue)" d="M640 427H242v8"/>
+    <path class="wire-fault" marker-end="url(#arrowTeal)" d="M640 427v8"/>
+    <path class="wire-irq" marker-end="url(#arrowAmber)" d="M640 427h398v8"/>
 
-        <path class="wire" d="M600 357v53"/>
-        <path class="wire arrow" d="M600 410H335v16"/>
-        <path class="wire arrow" d="M600 410h265v16"/>
-        <circle cx="600" cy="410" r="3.4" fill="#647993"/>
+    <rect x="64" y="471" width="356" height="51" rx="8" fill="#ffffff" stroke="#93c5fd"/>
+    <text class="item-bold" x="78" y="491" style="fill:#1d4ed8;">系统调用分派</text>
+    <text class="caption" x="78" y="510">寄存器参数 → 按调用号选择处理函数</text>
 
-        <rect class="card" x="80" y="427" width="510" height="41" rx="7"/>
-        <text class="heading blue" x="95" y="445">系统调用交给公共分派器</text>
-        <text class="small" x="95" y="462">按编号选择处理函数，通过 uaccess 访问用户内存</text>
+    <rect x="458" y="471" width="364" height="51" rx="8" fill="#ffffff" stroke="#5eead4"/>
+    <text class="item-bold" x="472" y="491" style="fill:#0f766e;">缺页异常处理</text>
+    <text class="caption" x="472" y="510">故障地址与访问类型 → 解析映射和访问权限</text>
 
-        <rect class="card" x="610" y="427" width="510" height="41" rx="7"/>
-        <text class="heading teal" x="625" y="445">缺页异常（Page Fault）交给内存管理</text>
-        <text class="small" x="625" y="462">查找虚拟内存区域，检查权限和后备来源</text>
-      </g>
-
-      <text class="small" x="66" y="494">系统调用失败时内核返回负错误码，libc 通常返回 -1 并设置 errno。</text>
-      <text class="small" x="610" y="494">返回用户态前按需构造信号帧，sigreturn 恢复执行现场。</text>
-    </g>
-    <path class="wire arrow" d="M600 505v36"/>
-    <text class="small" x="620" y="528">进入共用子系统</text>
-
-    <rect x="48" y="542" width="1104" height="589" rx="14" fill="#f1f6fd" stroke="#b2c7e3" stroke-width="1.4"/>
-    <path d="M62 542h1076a14 14 0 0 1 14 14v27H48v-27a14 14 0 0 1 14-14z" fill="#dae7f8"/>
-    <g transform="translate(60 89)" aria-label="共用子系统与执行位置">
-      <text class="section" x="24" y="481">共用内核子系统</text>
-      <rect x="804" y="467" width="116" height="27" rx="13.5" fill="#e1edff"/>
-      <text class="small blue strong" x="862" y="486" text-anchor="middle">调用核执行</text>
-      <rect x="930" y="467" width="126" height="27" rx="13.5" fill="#ffedd8"/>
-      <text class="small amber strong" x="993" y="486" text-anchor="middle">CPU0 推进</text>
-
-      <rect class="card" x="24" y="506" width="502" height="168" rx="13"/>
-      <rect x="44" y="523" width="35" height="35" rx="9" fill="#e7eeff"/>
-      <use href="#chip" x="49.5" y="528.5" color="#315b9b"/>
-      <text class="heading" x="92" y="547">任务管理与调度</text>
-      <text class="small" x="504" y="546" text-anchor="end">struct kernel_task</text>
-      <text class="body" x="46" y="575">每个就绪任务只进入一个 CPU 的队列。</text>
-      <text class="body" x="46" y="598">各核管理普通任务的入队、领取和运行权交接。</text>
-      <text class="body" x="46" y="621">迁移、亲和性和实时资格由共享调度状态协调。</text>
-      <text class="body" x="46" y="642">任务退出后，等执行核完成切换，再回收内核栈。</text>
-      <text class="small" x="46" y="661">fork / clone3 / exec / wait4</text>
-
-      <rect class="card" x="554" y="506" width="502" height="149" rx="13"/>
-      <rect x="574" y="523" width="35" height="35" rx="9" fill="#dcf3ee"/>
-      <use href="#memory" x="579.5" y="528.5" color="#237468"/>
-      <text class="heading" x="622" y="547">虚拟内存管理</text>
-      <text class="body" x="576" y="575">伙伴系统分配物理页，Slab 管理内核小对象。</text>
-      <text class="body" x="576" y="598">二分查找虚拟内存区域，确定权限与后备来源。</text>
-      <text class="body" x="576" y="621">缺页时按需装入，fork 的私有页采用写时复制。</text>
-      <text class="body" x="576" y="642">撤销映射后，等相关 CPU 确认 TLB 失效再归还页。</text>
-
-      <rect class="card" x="24" y="688" width="502" height="222" rx="13"/>
-      <rect x="44" y="705" width="35" height="35" rx="9" fill="#f8e9d9"/>
-      <use href="#disk" x="49.5" y="710.5" color="#96602f"/>
-      <text class="heading" x="92" y="729">文件系统与存储</text>
-      <text class="body" x="46" y="757">VFS 区分路径、inode 与打开文件对象。</text>
-      <text class="body" x="46" y="780">磁盘文件的读写和映射共用页缓存。</text>
-
-      <rect x="46" y="791" width="72" height="22" rx="11" fill="#e1edff"/>
-      <text class="small blue strong" x="82" y="807" text-anchor="middle">调用核</text>
-      <text class="body" x="129" y="808">ext4 冷读、前台写回和目录操作</text>
-      <rect x="46" y="817" width="72" height="22" rx="11" fill="#ffedd8"/>
-      <text class="small amber strong" x="82" y="833" text-anchor="middle">CPU0</text>
-      <text class="body" x="129" y="834">日志提交、回填与后台写回</text>
-
-      <text class="body" x="46" y="858">带日志的 extent 文件写入空洞时先预留空间，</text>
-      <text class="body" x="46" y="878">写回时才分配物理块。fsync 等待本次持久化目标。</text>
-      <text class="small" x="46" y="897">ext4 / FAT32 / tmpfs / procfs</text>
-
-      <rect class="card" x="554" y="669" width="502" height="221" rx="13"/>
-      <rect x="574" y="686" width="35" height="35" rx="9" fill="#f2e6f6"/>
-      <use href="#network" x="579.5" y="691.5" color="#81468e"/>
-      <text class="heading" x="622" y="710">网络</text>
-      <text class="body" x="576" y="738">程序通过文件描述符访问套接字。</text>
-      <text class="body" x="576" y="761">支持 IPv4 TCP / UDP 及 IPv6 回环。</text>
-
-      <rect x="576" y="772" width="72" height="22" rx="11" fill="#e1edff"/>
-      <text class="small blue strong" x="612" y="788" text-anchor="middle">调用核</text>
-      <text class="body" x="659" y="789">收发预约、用户数据复制与等待</text>
-      <rect x="576" y="798" width="72" height="22" rx="11" fill="#ffedd8"/>
-      <text class="small amber strong" x="612" y="814" text-anchor="middle">CPU0</text>
-      <text class="body" x="659" y="815">lwIP 推进 TCP/IP 状态机与重传</text>
-
-      <text class="body" x="576" y="844">IPv4 地址、掩码、默认网关与 MTU 可在运行时配置。</text>
-      <text class="body" x="576" y="868">UNIX 套接字可传递文件描述符与消息凭据。</text>
-
-      <rect x="24" y="926" width="1032" height="100" rx="12" fill="#eaf0fa" stroke="#c9d7ea"/>
-      <text class="heading" x="46" y="952">跨子系统的 IPC 与等待</text>
-      <text class="small strong" x="46" y="977">文件描述符就绪</text>
-      <text class="small" x="46" y="999">poll / epoll / pselect</text>
-
-      <text class="small strong" x="279" y="977">管道与 FIFO</text>
-      <text class="small" x="279" y="999">容量可调，写入量不超过</text>
-      <text class="small" x="279" y="1016">PIPE_BUF 时保持原子性</text>
-
-      <text class="small strong" x="528" y="977">IPC 对象</text>
-      <text class="small" x="528" y="999">SysV 共享内存、信号量和消息</text>
-      <text class="small" x="528" y="1016">POSIX 优先级消息队列</text>
-
-      <text class="small strong" x="797" y="977">futex</text>
-      <text class="small" x="797" y="999">等待、唤醒和重排</text>
-      <text class="small" x="797" y="1016">多地址等待与优先级继承</text>
-    </g>
-
-    <g transform="translate(0 89)" aria-label="设备驱动与数据路径">
-      <rect x="48" y="1051" width="1104" height="81" rx="12" fill="#e3f2ee" stroke="#bfd8d0"/>
-      <path class="wire storage-wire arrow" d="M84 809H32v299h51"/>
-      <path class="wire network-wire arrow" d="M1116 789h52v319h-51"/>
-
-      <use href="#board" x="67" y="1054" color="#28766d"/>
-      <text class="section teal" x="104" y="1074">内核设备驱动</text>
-
-      <rect class="card" x="84" y="1082" width="246" height="43" rx="8"/>
-      <text class="body strong teal" x="100" y="1100">VirtIO 块设备</text>
-      <text class="small" x="100" y="1118">共用块层 · 单队列批量请求</text>
-      <rect class="card" x="346" y="1082" width="246" height="43" rx="8"/>
-      <text class="body strong teal" x="362" y="1100">VirtIO RNG</text>
-      <text class="small" x="362" y="1118">向内核随机源补充熵</text>
-      <rect class="card" x="608" y="1082" width="246" height="43" rx="8"/>
-      <text class="body strong" x="624" y="1100">串口与 RTC</text>
-      <text class="small" x="624" y="1118">16550A 串口与平台实时时钟</text>
-      <rect class="card" x="870" y="1082" width="246" height="43" rx="8"/>
-      <text class="body strong teal" x="886" y="1100">VirtIO 网卡</text>
-      <text class="small" x="886" y="1118">以太网收发 · 独立收发队列</text>
-    </g>
+    <rect x="860" y="471" width="356" height="51" rx="8" fill="#ffffff" stroke="#fbbf24"/>
+    <text class="item-bold" x="874" y="491" style="fill:#92400e;">设备中断分派</text>
+    <text class="caption" x="874" y="510">平台控制器报告来源 → 调用驱动注册的处理程序</text>
   </g>
 
-  <path class="wire arrow" d="M600 1234v35"/>
-  <text class="small" x="620" y="1257">经平台接口访问设备</text>
+  <path class="wire-accent" marker-end="url(#arrowBlue)" d="M242 522v38"/>
+  <rect x="52" y="564" width="380" height="23" rx="7" fill="#eff6ff" stroke="#bfdbfe"/>
+  <text class="caption" x="242" y="579.5" text-anchor="middle" style="fill:#1d4ed8;">进入对应的进程、内存、文件或网络服务</text>
+  <path class="wire-fault" marker-end="url(#arrowTeal)" d="M640 522v72"/>
 
-  <g transform="translate(0 89)" aria-label="QEMU virt 平台">
-    <rect x="24" y="1181" width="1152" height="125" rx="14" fill="#edf2f7" stroke="#c4d1e0"/>
-    <text class="section" x="46" y="1206">QEMU virt 平台</text>
-    <text class="small" x="1152" y="1205" text-anchor="end"><tspan class="amber strong">CPU0</tspan> 处理外设中断，各核处理本地定时器和 IPI</text>
+  <g transform="translate(0 148)">
+  <!-- Layer 3: Core Kernel Subsystems -->
+  <!-- Row 1: Scheduler | VMM | eBPF -->
+  <g aria-label="核心子系统第一行">
+    <!-- Card 1: Scheduler & SMP -->
+    <rect class="card" x="36" y="450" width="392" height="162" rx="12"/>
+    <rect x="50" y="464" width="32" height="32" rx="8" fill="#dbeafe"/>
+    <use href="#ico-cpu" x="54" y="468" width="24" height="24" color="#1d4ed8"/>
+    <text class="card-title" x="92" y="479">任务调度与多核 SMP</text>
+    <text class="card-sub mono" x="92" y="495">kernel/sched/ · kernel/pid.c</text>
+    <rect x="296" y="464" width="56" height="20" rx="10" fill="#dbeafe"/>
+    <text class="pill-txt" x="324" y="478" text-anchor="middle" style="fill:#1e40af;">调用核</text>
+    <rect x="358" y="464" width="56" height="20" rx="10" fill="#fef3c7"/>
+    <text class="pill-txt" x="386" y="478" text-anchor="middle" style="fill:#92400e;">CPU0</text>
 
-    <rect x="48" y="1216" width="540" height="79" rx="9" fill="#eaf5fc" stroke="#bfdcee"/>
-    <text class="heading rv" x="66" y="1236">RISC-V 64 · OpenSBI</text>
-    <text class="body" x="66" y="1255">Sv39 / 4 KiB 页，通过设备树发现设备</text>
-    <text class="small" x="66" y="1273">VirtIO 走 MMIO，SBI 设置定时器，PLIC 接收外设中断</text>
-    <text class="small" x="66" y="1290">SBI HSM 启动其他核，再通过 IPI 握手</text>
+    <line x1="50" y1="506" x2="414" y2="506" stroke="#e2e8f0"/>
+    <text class="item" x="50" y="527">• 每核独立就绪队列：公平虚拟运行时间树 + 实时优先级桶</text>
+    <text class="item" x="50" y="549">• 亲和性感知窃取与负载均衡，支持实时带宽限流与优先级继承</text>
+    <text class="item" x="50" y="571">• 代次无锁快路径等待令牌 + 严格分层锁序防止死锁</text>
+    <text class="item" x="50" y="593">• 带保护页的每核内核栈缓存，线程创建与退出低开销交接</text>
 
-    <rect x="612" y="1216" width="540" height="79" rx="9" fill="#faf0f5" stroke="#eac9da"/>
-    <text class="heading la" x="630" y="1236">LoongArch 64 · LA464</text>
-    <text class="body" x="630" y="1255">三级页表 / 16 KiB 页，枚举 PCI 设备并接入 VirtIO</text>
-    <text class="small" x="630" y="1273">通过 QEMU -kernel 启动，使用扩展 I/O 中断控制器</text>
-    <text class="small" x="630" y="1290">IOCSR 邮箱传递从核启动信息，IPI 唤醒从核</text>
+    <!-- Card 2: VMM -->
+    <rect class="card" x="444" y="450" width="392" height="162" rx="12"/>
+    <rect x="458" y="464" width="32" height="32" rx="8" fill="#ccfbf1"/>
+    <use href="#ico-mem" x="462" y="468" width="24" height="24" color="#0f766e"/>
+    <text class="card-title" x="500" y="479">虚拟内存管理（VMM）</text>
+    <text class="card-sub mono" x="500" y="495">mm/ · kernel/physical_page.c</text>
+    <rect x="748" y="464" width="74" height="20" rx="10" fill="#dbeafe"/>
+    <text class="pill-txt" x="785" y="478" text-anchor="middle" style="fill:#1e40af;">调用核并行</text>
+
+    <line x1="458" y1="506" x2="822" y2="506" stroke="#e2e8f0"/>
+    <text class="item" x="458" y="526">• 物理页伙伴分配器（Buddy）与小对象堆分配（Slab）</text>
+    <text class="item" x="458" y="544">• 区间认领（range_claim）：不重叠的地址区间并行操作</text>
+    <text class="item" x="458" y="562">• 按需装页、写时复制（CoW）、批量页表项发布与原生大页</text>
+    <text class="item" x="458" y="580">• 跨核 TLB 失效确认后回收退役页 · mlock / madvise</text>
+    <text class="item" x="458" y="598">• 用户内存访问（uaccess）· 异常恢复与页引用管理</text>
+
+    <!-- Card 3: eBPF & Observability -->
+    <rect class="card" x="852" y="450" width="392" height="162" rx="12"/>
+    <rect x="866" y="464" width="32" height="32" rx="8" fill="#ede9fe"/>
+    <use href="#ico-bpf" x="870" y="468" width="24" height="24" color="#6d28d9"/>
+    <text class="card-title" x="908" y="479">eBPF 与内核可观测性</text>
+    <text class="card-sub mono" x="908" y="495">kernel/bpf/ · kernel/cost.c</text>
+    <rect x="1126" y="464" width="104" height="20" rx="10" fill="#dbeafe"/>
+    <text class="pill-txt" x="1178" y="478" text-anchor="middle" style="fill:#1e40af;">每核解释器工作区</text>
+
+    <line x1="866" y1="506" x2="1230" y2="506" stroke="#e2e8f0"/>
+    <text class="item" x="866" y="527">• 双架构共用 eBPF/cBPF 静态校验器与每核独立解释器</text>
+    <text class="item" x="866" y="549">• 支持 Array / Hash / Per-CPU / RingBuf Map 与 bpffs 挂载</text>
+    <text class="item" x="866" y="571">• 由内核 DWARF 自动生成真实 BTF，支持 raw_syscalls 跟踪</text>
+    <text class="item" x="866" y="593">• 内置 COST 归因框架：拆解执行、锁等待、排队与 I/O</text>
   </g>
+
+  <!-- Row 2: VFS & Storage | Multi-core Network -->
+  <g aria-label="核心子系统第二行">
+    <!-- Card 4: VFS & Storage -->
+    <rect class="card" x="36" y="628" width="596" height="168" rx="12"/>
+    <rect x="50" y="642" width="32" height="32" rx="8" fill="#ffedd5"/>
+    <use href="#ico-fs" x="54" y="646" width="24" height="24" color="#c2410c"/>
+    <text class="card-title" x="92" y="657">虚拟文件系统（VFS）与存储持久化</text>
+    <text class="card-sub mono" x="92" y="673">fs/ · third_party/lwext4/</text>
+
+    <rect x="424" y="642" width="56" height="20" rx="10" fill="#dbeafe"/>
+    <text class="pill-txt" x="452" y="656" text-anchor="middle" style="fill:#1e40af;">调用核</text>
+    <rect x="486" y="642" width="72" height="20" rx="10" fill="#ccfbf1"/>
+    <text class="pill-txt" x="522" y="656" text-anchor="middle" style="fill:#115e59;">按挂载分核</text>
+    <rect x="564" y="642" width="56" height="20" rx="10" fill="#fef3c7"/>
+    <text class="pill-txt" x="592" y="656" text-anchor="middle" style="fill:#92400e;">CPU0</text>
+
+    <line x1="50" y1="684" x2="618" y2="684" stroke="#e2e8f0"/>
+    <text class="item" x="50" y="705">• 清晰分层：目录项（dentry）、索引节点（inode）、打开文件描述（OFD）与挂载命名空间</text>
+    <text class="item" x="50" y="727">• 高并发 ext4：JBD2 事务日志、延迟分配、有序直接 I/O、多核目录级并行锁与页缓存共享</text>
+    <text class="item" x="50" y="749">• 多文件系统：ext4 / ext2 · 可写 OverlayFS · FAT32 · tmpfs · procfs · sysfs · devpts</text>
+    <text class="item" x="50" y="771">• 完整高级语义：POSIX ACL / xattr · 文件句柄重打开 · fanotify 访问通知 · 现代挂载 API</text>
+
+    <!-- Card 5: Multi-core Network -->
+    <rect class="card" x="648" y="628" width="596" height="168" rx="12"/>
+    <rect x="662" y="642" width="32" height="32" rx="8" fill="#fae8ff"/>
+    <use href="#ico-net" x="666" y="646" width="24" height="24" color="#9333ea"/>
+    <text class="card-title" x="704" y="657">多核网络协议栈与套接字</text>
+    <text class="card-sub mono" x="704" y="673">net/ · third_party/lwip/</text>
+
+    <rect x="1036" y="642" width="56" height="20" rx="10" fill="#dbeafe"/>
+    <text class="pill-txt" x="1064" y="656" text-anchor="middle" style="fill:#1e40af;">调用核</text>
+    <rect x="1098" y="642" width="72" height="20" rx="10" fill="#ccfbf1"/>
+    <text class="pill-txt" x="1134" y="656" text-anchor="middle" style="fill:#115e59;">连接归属核</text>
+    <rect x="1176" y="642" width="56" height="20" rx="10" fill="#fef3c7"/>
+    <text class="pill-txt" x="1204" y="656" text-anchor="middle" style="fill:#92400e;">CPU0</text>
+
+    <line x1="662" y1="684" x2="1230" y2="684" stroke="#e2e8f0"/>
+    <text class="item" x="662" y="705">• 协议栈：IPv4 / IPv6 双栈 TCP &amp; UDP · SLAAC / MLDv1 · IGMPv2 组播 · RAW ICMP</text>
+    <text class="item" x="662" y="727">• 多核分片并行：已建立 TCP 连接按四元组归属各核独立推进；用户拷贝与等待留在调用核</text>
+    <text class="item" x="662" y="749">• 数据路径优化：批量接收与 ACK 合并 · IPv4 直连路由快照复用 · 回环连接零排队直交</text>
+    <text class="item" x="662" y="771">• 扩展套接字族：AF_UNIX（支持 FD 传递与凭据）· AF_PACKET（TPACKET_V3 环）· rtnetlink</text>
+  </g>
+
+  <!-- Cross-cutting IPC & Events Strip -->
+  <g aria-label="跨子系统 IPC 与事件机制">
+    <rect x="36" y="810" width="1208" height="58" rx="10" fill="#e2e8f0" stroke="#cbd5e1"/>
+    <text class="item-bold" x="54" y="833" style="fill:#0f172a;">跨子系统同步、事件多路复用与进程间通信（IPC）</text>
+    <rect x="54" y="841" width="224" height="20" rx="6" fill="#ffffff"/>
+    <text class="caption" x="64" y="855">I/O 多路复用：epoll / poll / pselect</text>
+    <rect x="288" y="841" width="212" height="20" rx="6" fill="#ffffff"/>
+    <text class="caption" x="298" y="855">快速用户锁：Futex / waitv / PI</text>
+    <rect x="510" y="841" width="244" height="20" rx="6" fill="#ffffff"/>
+    <text class="caption" x="520" y="855">流与事件：管道 / FIFO / eventfd / AIO</text>
+    <rect x="764" y="841" width="256" height="20" rx="6" fill="#ffffff"/>
+    <text class="caption" x="774" y="855">经典 IPC：SysV shm/sem/msg · mqueue</text>
+    <rect x="1030" y="841" width="198" height="20" rx="6" fill="#ffffff"/>
+    <text class="caption" x="1040" y="855">控制与跟踪：信号 / TTY / ptrace</text>
+  </g>
+
+  <!-- Layer 4: Device Drivers (inside Kernel Space bottom) -->
+  <g aria-label="设备驱动层">
+    <rect x="36" y="882" width="1208" height="58" rx="10" fill="#ecfdf5" stroke="#a7f3d0"/>
+    <use href="#ico-dev" x="50" y="891" width="24" height="24" color="#047857"/>
+    <text class="item-bold" x="82" y="907" style="fill:#065f46;">统一设备驱动层</text>
+    <text class="caption mono" x="54" y="931" style="fill:#047857;">drivers/ · kernel/block.c</text>
+
+    <rect x="256" y="892" width="234" height="38" rx="7" fill="#ffffff" stroke="#6ee7b7"/>
+    <text class="item-bold" x="268" y="909" style="fill:#065f46;">VirtIO 块设备驱动</text>
+    <text class="caption" x="268" y="924">多核提交 · FLUSH 持久化屏障</text>
+
+    <rect x="504" y="892" width="248" height="38" rx="7" fill="#ffffff" stroke="#6ee7b7"/>
+    <text class="item-bold" x="516" y="909" style="fill:#065f46;">VirtIO 网络设备驱动</text>
+    <text class="caption" x="516" y="924">收发双环 · 合批发布与中断合并</text>
+
+    <rect x="766" y="892" width="222" height="38" rx="7" fill="#ffffff" stroke="#6ee7b7"/>
+    <text class="item-bold" x="778" y="909" style="fill:#065f46;">VirtIO 硬件随机数</text>
+    <text class="caption" x="778" y="924">硬件熵源 + BLAKE2s 熵池</text>
+
+    <rect x="1002" y="892" width="228" height="38" rx="7" fill="#ffffff" stroke="#6ee7b7"/>
+    <text class="item-bold" x="1014" y="909" style="fill:#065f46;">串口终端与实时时钟</text>
+    <text class="caption" x="1014" y="924">16550A UART · 平台硬件 RTC</text>
+  </g>
+
+  <!-- Transition Arrow: Kernel -> Platform -->
+  <path class="wire" marker-end="url(#arrow)" d="M340 954v22"/>
+  <path class="wire" marker-end="url(#arrow)" d="M940 954v22"/>
+  <rect x="506" y="957" width="268" height="19" rx="9.5" fill="#f1f5f9" stroke="#cbd5e1"/>
+  <text class="caption" x="640" y="970.5" text-anchor="middle">设备访问 · 平台总线（MMIO / PCI）</text>
+
+  <!-- Layer 5: Hardware / QEMU virt Platform -->
+  <g aria-label="双架构硬件平台">
+    <rect x="20" y="980" width="1240" height="142" rx="14" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.3"/>
+    <text class="layer-title" x="38" y="1005">双架构验证平台（QEMU virt · 1～8 核）</text>
+    <text class="caption" x="1240" y="1005" text-anchor="end">本地定时器与核间中断由各目标核接收</text>
+
+    <!-- RISC-V Platform Card -->
+    <rect x="38" y="1020" width="592" height="86" rx="10" fill="#e0f2fe" stroke="#7dd3fc"/>
+    <text class="card-title" x="56" y="1044" style="fill:#0c4a6e;">RISC-V 64 平台（QEMU virt + OpenSBI）</text>
+    <text class="item" x="56" y="1068">• 设备发现与总线：扁平设备树（DTB）动态探测 · VirtIO-MMIO 传输</text>
+    <text class="item" x="56" y="1091">• 中断与多核引导：PLIC 外部中断控制器 · OpenSBI HSM 唤醒从核与定时器编程</text>
+
+    <!-- LoongArch Platform Card -->
+    <rect x="650" y="1020" width="592" height="86" rx="10" fill="#ffe4e6" stroke="#fda4af"/>
+    <text class="card-title" x="668" y="1044" style="fill:#881337;">LoongArch 64 平台（QEMU virt + LA464）</text>
+    <text class="item" x="668" y="1068">• 设备发现与总线：PCI / PCIe 总线枚举 · 现代 VirtIO-PCI 传输</text>
+    <text class="item" x="668" y="1091">• 中断与多核引导：扩展 I/O 中断控制器 · IOCSR 邮箱传递从核入口与 IPI 唤醒</text>
+  </g>
+  </g>
+
+  <!-- External interrupt delivery and the driver callback use distinct lanes. -->
+  <path class="wire-irq" marker-end="url(#arrowAmber)" d="M1260 1153h22V405h-50"/>
+  <circle cx="1260" cy="1153" r="3.5" fill="#b45309"/>
+  <text class="caption" x="1299" y="799" transform="rotate(-90 1299 799)"
+        text-anchor="middle" style="fill:#92400e;">设备中断经平台控制器送达 0 号核</text>
+  <path class="wire-irq" marker-end="url(#arrowAmber)" stroke-dasharray="5 4" d="M1216 498h36v561h-7"/>
 </svg>

@@ -1,19 +1,27 @@
-# 第三方组件
+# 第三方开源组件与许可说明
 
-BoarOS 采用 GPL-2.0-only。随仓库分发的第三方代码和归档保留上游版权及许可声明。
+BoarOS 内核本身采用 **GNU General Public License v2.0 only（GPL-2.0-only）** 开源协议（见 [LICENSE](../LICENSE)）。随仓库引入或辅助构建的第三方开源组件均完整保留上游版权与许可声明，绝不混用未标明来源的代码。
 
-| 组件 | 来源与版本 | 用途 | 许可位置 |
-|---|---|---|---|
-| lwIP | [STABLE-2_2_1_RELEASE](https://github.com/lwip-tcpip/lwip/tree/STABLE-2_2_1_RELEASE) | 提供网络协议实现，BoarOS 维护套接字、等待和多核接入，见[网络模块](modules/kernel-network.md) | [BSD-3-Clause](../third_party/lwip/COPYING) |
-| lwext4 | [上游版本 `58bcf89`](https://github.com/gkostka/lwext4/tree/58bcf89a121b72d4fb66334f1693d3b30e4cb9c5) | 提供 ext4 磁盘格式基础，BoarOS 在其上实现事务、缓存和并发适配，见[文件系统模块](modules/vfs-ext4.md) | [上游许可证](../third_party/lwext4/LICENSE) |
-| BLAKE2s | [Linux 的通用 BLAKE2s 实现](https://github.com/torvalds/linux/blob/f4cdf7ca9a1fdcca413157df19753f388a5a224e/lib/crypto/blake2s.c) | 内核随机数发生器使用的混种函数 | [源码中的 GPL-2.0 或 MIT 声明](../kernel/blake2s.c) |
-| pahole 1.28、elfutils 0.192 | [dwarves 发布页](https://fedorapeople.org/~acme/dwarves/)、[elfutils 项目](https://sourceware.org/elfutils/) | 离线生成 BPF 类型格式（BPF Type Format，BTF），见[构建说明](modules/kernel-bpf.md#构建与检查) | `third_party/sources/` 原始归档内的许可文件 |
+---
 
-外部规范和用于开发的上游源码见[参考资料](../references/README.md)。模块文档解释本地适配的设计，变更沿 Git 历史追查。
+## 一、集成于仓库的第三方组件
 
-交互根盘使用 Alpine Linux 提供的 [BusyBox 静态软件包](https://dl-cdn.alpinelinux.org/alpine/v3.23/main/)，提供串口登录和用户态命令，采用 GPL-2.0-only 许可。
+| 组件名称 | 上游版本与来源 | 在 BoarOS 中的角色与本地工作边界 | 开源许可 |
+| :--- | :--- | :--- | :--- |
+| **lwIP** | [`STABLE-2_2_1_RELEASE`](https://github.com/lwip-tcpip/lwip/tree/STABLE-2_2_1_RELEASE) | 提供基础 TCP/IP 协议状态机。BoarOS 实现了 Linux 套接字层、阻塞等待、按连接分配处理器核、路由快照和链路层共享内存接收环，并在 IPv4 分片重组及 `TIME_WAIT` 回收路径中补充对象所有权管理。详见 [多核网络协议栈](modules/kernel-network.md)。 | [BSD-3-Clause](../third_party/lwip/COPYING) |
+| **lwext4** | [上游提交 `58bcf89`](https://github.com/gkostka/lwext4/tree/58bcf89a121b72d4fb66334f1693d3b30e4cb9c5) | 提供 ext4 磁盘元数据与区段格式解析基础。BoarOS 在其上构建了完整 VFS 层、统一页缓存、延迟分配与元数据空间预留、JBD2 多核日志调度、有序直接 I/O、多核目录级并行锁与块组位置缓存（详见 [VFS 与 ext4](modules/vfs-ext4.md)）。 | [上游许可证](../third_party/lwext4/LICENSE) |
+| **BLAKE2s** | [Linux 内核通用实现](https://github.com/torvalds/linux/blob/f4cdf7ca9a1fdcca413157df19753f388a5a224e/lib/crypto/blake2s.c) | 用作内核随机源的密码学混种压缩函数，仅以独立单文件集成。 | GPL-2.0 或 MIT（见 [kernel/blake2s.c](../kernel/blake2s.c)） |
+| **pahole 1.28 & elfutils 0.192** | [dwarves](https://fedorapeople.org/~acme/dwarves/) · [elfutils](https://sourceware.org/elfutils/) | 作为宿主机离线构建工具保存于 `third_party/sources/`，用于将 BoarOS 内核 ELF 的 DWARF 调试信息转换为真实 BTF 类型信息，不链接进内核本体。 | 见 `third_party/sources/` 原始归档内许可文件 |
 
-## strace 验证工具
+---
 
-[strace 7.3](https://github.com/strace/strace/releases/tag/v7.3) 用于验证 RISC-V 和 LoongArch 的进程跟踪接口。
-构建入口为 [tools/build-strace.py](../tools/build-strace.py)，许可见原发布包。
+## 二、用户态根盘与辅助验证工具
+
+下列组件不进入内核源码树，仅用于制作交互式根盘或在验证环境中作为独立用户态工具运行：
+
+| 工具名称 | 来源与版本 | 用途 | 许可 |
+| :--- | :--- | :--- | :--- |
+| **BusyBox 静态包** | [Alpine Linux v3.23](https://dl-cdn.alpinelinux.org/alpine/v3.23/main/) | 制作本地交互式 ext4 根盘（`make shell-*`），提供串口登录与基础 Shell 命令。 | GPL-2.0-only |
+| **strace 7.3** | [strace 官方发布](https://github.com/strace/strace/releases/tag/v7.3) | 由 [tools/build-strace.py](../tools/build-strace.py) 构建，用于在双架构上验证 `ptrace` 系统调用跟踪接口。 | LGPL-2.1-or-later |
+
+开发与差分验证所参考的外部标准规范与上游源码清单（均按提交哈希固定，不复制到内核源树中），详见 [references/README.md](../references/README.md) 与 [references/sources.tsv](../references/sources.tsv)。

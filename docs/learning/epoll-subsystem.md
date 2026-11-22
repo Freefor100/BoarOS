@@ -1,47 +1,115 @@
-# epoll 事件通知子系统
+# epoll 事件多路复用子系统设计
 
-`poll/select` 每次导入调用者的 FD 集合并查询所有目标；需要阻塞时，等待节点随本次调用登记和撤销。epoll 则长期登记关注关系，由目标通知把候选加入就绪队列。通知表示“值得重新查询”，不保证交付时仍有事件：其他线程可能已经读空管道或 socket，嵌套 epoll 的子项也可能失效。
+在并发 I/O 编程中，程序常常需要同时监听成百上千条管道、套接字或事件描述符。传统的 `poll` 与 `select` 采用**无状态轮询模型**：每次系统调用都需要把整个文件描述符（File Descriptor，FD）集合从用户态重新拷入内核，逐一检查状态；若全部未就绪，还需在本次调用期间临时把等待节点挂到每个目标的等待队列上，返回时再逐个拆除。当监听规模扩大但每次只有少数描述符活跃时，这种 O(N) 的重复搬运与装拆会成为明显瓶颈。
 
-因此，epoll 的工作分为登记、通知、候选刷新和事件交付。实现入口及用户接口见[文件资源模块](../modules/kernel-files.md#epoll-事件通知子系统)，扫描、引用和错误前缀的具体协议集中在[epoll 交付说明](epoll-delivery.md)。
+Linux 的 **`epoll`**（事件轮询，Event Poll）机制将“长期关注的集合”沉淀为内核对象，把工作拆解为四个职责清晰的阶段：**登记（`epoll_ctl`）**、**目标通知（回调入队）**、**候选刷新（状态核验）** 与 **事件交付（`epoll_wait` / `epoll_pwait` / `epoll_pwait2`）**。目标状态变化时，只把活跃对象推入就绪链表，等待者无需扫描全部注册项。需要特别注意的是，通知本身只意味着**“该对象值得重新查询”**，并不保证交付瞬间一定仍有可读/可写数据——例如并发线程可能已提前读空管道，或嵌套 `epoll` 下的子对象已恢复静默。
 
-## 登记身份与双向关联
+本文基于 `fs/files/epoll.c`、`fs/files/epoll_internal.h` 与 `fs/files/epoll_state.h` 的实际实现，介绍 BoarOS 中 `epoll` 的数据结构、图嵌套校验、触发模式与等待协议。文件资源层总览见 [文件描述符、打开文件对象与通用 I/O 层](../modules/kernel-files.md)，并发扫描与生命周期协议见 [epoll 并发扫描、事件交付与对象生命周期协议](epoll-delivery.md)。
 
-登记键为 `(target_fd, OFD)`。同一 OFD 经 `dup` 得到的不同 FD 可以分别登记；FD 关闭后，只要该 OFD 仍有其他持有者，原登记不会因编号失效而自动消失。编号被复用时，新 OFD 与旧登记也不共享身份。最后一个真实 OFD 引用归还时，才解除该对象的全部反向登记。
+---
 
-BoarOS 用 epoll 私有 AVL 索引登记，目标 OFD 保存反向双链。ready 与 pending 也使用可直接摘除的双链；不再另存一条完整登记链。查找与索引增删随登记数按对数增长，队列摘除不扫描整队。销毁一个实例或目标仍需处理其实际关联的登记数，不能把整体回收说成常数时间。
+## 一、登记身份与核心数据结构
 
-登记通过反向关联借用目标 OFD，不长期增加其引用。目标析构先撤销反向登记；跨查询、复制或取消的当前操作另持 item/OFD 引用，逻辑解绑之后才归还最后借用。
+在类 Unix 系统中，进程持有的整数 FD 只是索引表槽位，底层共享状态由内核的**打开文件描述（Open File Description，OFD）**对象承担。`epoll` 在登记关注关系时，采用复合键 **`(target_fd, target_file)`** 作为唯一身份：
 
-## 图检查与发布
+- **支持 `dup` 副本独立登记**：通过 `dup` / `dup2` 复制同一 OFD 得到的两个不同 FD，因为 `target_fd` 不同，可以在同一个 `epoll` 实例中分别登记。
+- **不随单个 FD 关闭自动消失**：若某进程关闭了登记时使用的 FD，但该 OFD 仍被 `dup` 或 `fork` 后的其他描述符持有，原登记项继续有效。只有当该 OFD 的最后一个引用释放时，内核才会通过 `kernel_epoll_notify_file_release()` 解除其全部反向登记。
+- **隔离 FD 编号复用**：即使原 FD 关闭后编号立刻被新打开的 OFD 复用，新旧两者的 `target_file` 指针不同，不会发生身份混淆，两者可以在索引中共存。
 
-支持真实等待队列的 pipe、socket、终端及 epoll 可作为目标，普通文件和目录的 ADD 返回 `EPERM`。直接监听自身返回 `EINVAL`；嵌套图成环或超过支持深度返回 `ELOOP`。
+```mermaid
+flowchart LR
+    subgraph EpollInst["struct kernel_epoll 实例"]
+        AVL["items_root<br/>侵入式 AVL 平衡树<br/>按 (target_fd, target_file) 排序"]
+        Ready["ready_head / ready_tail<br/>就绪双向链表"]
+        Pending["pending_head / pending_tail<br/>扫描期间新通知暂存双链"]
+        WQ["wait_queue<br/>阻塞等待者与父 epoll 回调队列"]
+    end
 
-ADD 先分配并初始化未发布候选。分配允许任务切换，因此图检查和重复键检查放在分配之后；从最终检查到发布禁止 CPU0 任务切换。图遍历允许 IRQ，实际 AVL、反向关联与队列链接只占短 IRQ 范围。目标查询放在这个范围之外，持有当前 item/OFD 引用并在查询后重查控制与通知代次。DEL、MOD 或关闭不能让分配前、查询前的检查结果直接决定最终发布与就绪状态。
+    subgraph Item["struct kernel_epoll_item 登记项"]
+        Meta["control_generation · notification_generation<br/>events · data · references · linked<br/>on_ready_list · on_pending_list · in_scan · oneshot_disarmed"]
+        WNode["wait_node<br/>挂接在目标等待队列上的回调节点"]
+    end
 
-## 通知与候选刷新
+    subgraph TargetOFD["目标 OFD（管道 / 套接字 / 终端 / 子 epoll 等）"]
+        RevList["ep_items 反向双向链表"]
+        TargetWQ["目标自身等待队列"]
+    end
 
-目标等待队列上的回调把 item 加入 ready；已有交付扫描时，新通知进入 pending。嵌套图按一次源通知合并父队列唤醒，每条登记仍维护自己的通知代次，不用长期 readiness 缓存替代目标查询。
+    AVL <--> Item
+    Ready <--> Item
+    Pending <--> Item
+    Item -- "target_next / target_prev" --> RevList
+    WNode -- "kernel_epoll_wait_callback" --> TargetWQ
+```
 
-`kernel_epoll_poll` 刷新候选后才报告可读，不能仅凭 ready 链非空返回事件。失效且代次未变的候选被摘除；查询期间发生 MOD 或新通知的候选留给下一轮。纯查询只保活当前 item/OFD，不消费 ET、不解除 ONESHOT，也不占事件交付的独占扫描资格。共享子图失效候选的剪除和并发查询规则见[交付说明](epoll-delivery.md)。
+BoarOS 对每个 `epoll` 实例（`struct kernel_epoll`）维护以下索引结构：
 
-## 交付与触发方式
+1. **侵入式 AVL 平衡树（`items_root`）**：直接利用 `struct kernel_epoll_item` 内嵌的 `index_left`、`index_right`、`index_parent` 与 `index_height` 字段组织索引，查找、插入与删除均为 O(log N) 时间复杂度，无需另建冗余节点。删除节点（`epoll_index_remove()`）通过旋转把目标节点自身下沉到叶位置再摘除，而不是与中序后继交换键内容，从而保证正在持有该 `item` 指针的扫描者与反向链表始终指向同一对象。
+2. **双链表就绪与暂存队列（`ready` / `pending`）**：均使用可直接 O(1) 摘除的双向链表，删除或清理登记项时无需线性扫描队列。
+3. **目标 OFD 反向链表（`target_file->ep_items`）**：登记项只通过反向链表借用目标 OFD，不长期增加目标 OFD 的引用计数，避免 `epoll` 与目标之间形成无法回收的循环引用。目标析构时会主动沿反向链表撤销所有关联登记；实际跨锁查询或交付中的临时操作则额外借用 `item` 与 OFD 引用，确保逻辑解绑后安全延迟释放。
 
-每个实例同一时刻只有一个事件交付扫描。内核一次构造一个栈上 event，完整复制到用户后才提交，不按 `maxevents` 分配整个事件数组。
+> 整体销毁一个 `epoll` 实例（`kernel_epoll_destroy()`）或释放一个目标 OFD 时，仍需遍历并解绑其实际关联的每一条登记项，整体回收复杂度与关联登记数成正比。
 
-- LT：完整交付后，仍有效的候选可以再次排队。
-- ET：完整交付才消费本次通知；期间到达的新通知继续保留。
-- ONESHOT：完整交付才解除当前登记的触发资格；MOD 重装后的新代次不受旧交付影响。
+---
 
-首项复制失败返回 `EFAULT` 并保留未交付事件；已有完整交付时返回成功条数。用户复制可能缺页和睡眠，因此不能持 IRQ 保护或网络协议 mutex，也不能提前消费触发状态。
+## 二、目标约束、嵌套图检查与发布流程
 
-## 等待与关闭
+并非所有文件类型都可以加入 `epoll`。只有具备真实等待队列的对象（如管道、命名管道、套接字、终端、事件描述符、`timerfd`、`signalfd`、`inotify`/`fanotify` 以及另一个 `epoll`）满足 `kernel_open_file_supports_epoll()`；尝试将普通文件或目录加入 `epoll` 会直接返回 `-EPERM`（操作不允许）。
 
-epoll 等待使用共同的 prepare、登记复查、park、finish 协议。prepared token 内只读取非阻塞的候选提示；需要真实目标查询时先 finish，再进入目标自己的同步域。socket 查询可等待协议 mutex，不能在已有 token 中再次登记锁等待。`poll` 固定 FD/OFD 快照后依照相同顺序订阅，临时信号掩码沿既有恢复规则处理。
+当被监听的目标本身也是 `epoll` 时，多个 `epoll` 实例之间会形成有向监听图。`epoll_check_nesting()` 负责维护两项严格约束：
 
-DEL 和最后关闭先停止通知、解绑索引与反向关联，再同步撤销 wait node。当前操作的 item/OFD 引用延后实际释放，最终后端清理在 IRQ 与协议 scope 外执行。任务强制退出同样先撤销其活动查询、交付和等待借用，再归还调用栈。
+- **禁止自监听**：监听自身对应的 `epoll` 实例（无论是同一 FD 还是经 `dup` 指向同一 OFD）直接返回 `-EINVAL`。
+- **禁止成环与过深嵌套**：沿着目标向下遍历子节点（`epoll_check_downward()`），同时沿着当前实例的反向链表向上回溯父节点（`epoll_check_upward()`）。若发现环路，或新增该边后的总嵌套边数 `down_depth + 1 + up_depth` 超过 **`KERNEL_EPOLL_MAX_NESTS = 4`**（即最多允许 5 层 `epoll` 串联，第 6 层触及上限），则拒绝加入并返回 `-ELOOP`。
 
-## 固定资料与验证
+在 `EPOLL_CTL_ADD` 的并发发布流程中，BoarOS 将可能睡眠的操作与临界区严格分层：
 
-- `references/linux/fs/eventpoll.c` 与 `include/uapi/linux/eventpoll.h`，Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`：登记身份、事件标志与交付协议。
-- 固定 musl 1.2.5 归档中的 `src/select/epoll.c`、`src/select/epoll_pwait.c`：用户态包装。
-- [epoll 交付说明](epoll-delivery.md)：当前宿主交错测试、真实用户程序检查及各自验证范围。
+1. **先分配未发布候选**：堆分配（`kernel_heap_allocate_zeroed()`）可能发生阻塞或调度切换，因此先在无锁状态下分配并初始化 `struct kernel_epoll_item`。
+2. **禁抢占完成图检查与发布**：通过 `kernel_preempt_disable()` 阻止当前处理器任务切换，依次执行 `epoll_check_nesting()` 图检查与 `epoll_find_item()` 重复键检查（重复返回 `-EEXIST`）。图遍历期间保持中断开启（允许中断服务程序推进），仅在实际插入 AVL 树和目标反向链表时获取极短的中断保护状态锁（`EPOLL_STATE`），并将 `item->references` 增至 2（1 份归登记所有权，1 份供本次初始化查询临时借用）。
+3. **锁外绑定与补查防丢通知**：退出抢占保护后，先在锁外调用 `kernel_open_file_poll()` 获取目标等待队列指针，再加状态锁将 `item->wait_node` 挂入目标等待队列，并记录当前的 `control_generation`。由于目标可能在完成绑定之前刚刚触发过就绪通知，内核随后在锁外**再次执行一次真实状态查询**；若此时目标已就绪且 `control_generation` 未被并发 `MOD` 改写，则立即补发一次回调入队，彻底堵住“订阅前就绪漏通知”的竞态窗口。
+
+---
+
+## 三、通知汇聚与触发模式语义
+
+当底层目标发生状态变化时，等待队列触发 `kernel_epoll_wait_callback()`：
+
+- 递增该登记项的 `notification_generation`（通知代次）。
+- 若当前 `epoll` 实例没有正在进行的交付扫描（`scan_owner == NULL`），将 `item` 加入 `ready` 链表；若已有交付扫描正在执行且该项尚未在 `ready` 上，则加入独立的 `pending` 链表，避免干扰扫描者正在遍历的指针。
+- 通过 `epoll_notify()` 唤醒当前 `epoll` 自身的等待队列。在多层嵌套 `epoll` 图中，借助全局 `kernel_wait_notification_sequence()` 与实例上的 `notification_sequence` 比较，同一轮源通知对每个父 `epoll` 仅传播唤醒一次，防止菱形拓扑下的唤醒风暴；同时每条登记项仍各自递增通知代次并维护自身的 `ready`/`pending` 状态，不使用长期有效的“就绪状态缓存”替代真实查询。
+
+事件交付统一由 `epoll_deliver()` 执行，每个 `epoll` 实例在同一时刻只允许一个交付扫描者持有 `scan_owner`。内核并不按用户传入的 `maxevents` 预分配大块事件数组，而是在栈上逐条构造 16 字节的 `struct linux_epoll_event`，**只有当整条结构完整拷贝回用户态后，才正式提交该事件的消费状态**：
+
+| 触发模式 / 标志 | 语义与 BoarOS 提交时机 |
+| :--- | :--- |
+| **水平触发（Level-Triggered，LT，默认）** | 只要目标仍处于就绪状态，下次等待就应继续报告。完整拷贝回用户态后，将未解绑且代次未变的项重新放入 `pending`（扫描结束时归并回 `ready`），供后续调用再次核验。 |
+| **边缘触发（Edge-Triggered，ET，`EPOLLET`）** | 仅在目标状态新产生通知时交付一次。完整拷贝后直接消费本次通知不再重新排队；但若在查询或拷贝期间已有新通知到达（`notification_generation` 递增），则保留并转入 `pending` 供下一轮处理。 |
+| **单次触发（`EPOLLONESHOT`）** | 交付一次事件后自动禁用该登记项（`oneshot_disarmed = 1`），直到用户显式调用 `EPOLL_CTL_MOD` 重新激活。仅在完整拷贝后才置位禁用；若拷贝期间并发执行了 `MOD`（`control_generation` 改变），旧交付不会误禁用新配置。 |
+| **强制上报错误与挂断（`EPOLLERR` / `EPOLLHUP`）** | 无需用户显式订阅，只要目标轮询结果包含错误或挂断位，候选刷新阶段始终将其纳入有效事件掩码。 |
+
+用户态拷贝可能触发缺页中断甚至阻塞睡眠，因此拷贝始终在释放状态锁、开启中断且不持有任何网络协议互斥锁的环境中执行：
+
+- 若**第 1 条事件**拷贝失败，返回 `-EFAULT`（坏地址错误），且不提交 `ET`/`ONESHOT` 消费，保留事件不丢。
+- 若**已经完整交付至少 1 条事件**后后续拷贝失败，则立即停止扫描并返回已成功交付的条数，保证用户态看到的事件全部完整有效。
+
+---
+
+## 四、阻塞等待、信号掩码与退出清理
+
+`epoll_pwait`（毫秒级整型超时）与 `epoll_pwait2`（纳秒级 `struct timespec` 超时）统一换算为单调时钟截止点 `target_ns`，收敛到同一套 `epoll_pwait_deadline()` 协议中执行：
+
+1. **临时信号掩码原子切换**：若用户提供 `sigmask` 且 `sigsetsize == 8`，在进入等待循环前通过 `kernel_signal_set_temporary_mask()` 安装临时屏蔽掩码；退出循环时交由 `kernel_signal_restore_temporary_mask()` 按是否被信号中断（`-EINTR`）遵循 Linux 规则恢复原掩码，确保挂起信号在恢复前有机会按临时掩码递送。
+2. **四阶段安全阻塞（Prepare → Recheck → Park → Finish）**：
+   - 先尝试非阻塞交付 `epoll_deliver()`；若已有事件或请求立即返回（`timeout == 0`），直接结束。
+   - 需要睡眠时，获取 `EPOLL_STATE` 保护，调用 `kernel_wait_prepare()` 或 `kernel_wait_prepare_monotonic()` 登记等待令牌（`struct kernel_wait_token`），并在释放锁前**复查非阻塞元数据**（`!epoll->scan_owner && epoll->ready_head`）。
+   - 若复查仍无候选，在关闭中断的状态下通过 `epoll_state_unlock_wait()` 释放状态锁并调用 `kernel_wait_park()` 让出处理器；被唤醒、超时或收到信号后调用 `kernel_wait_finish()` 注销令牌并恢复中断状态。
+   - 当外层 `poll` 监听一个 `epoll` 描述符时，在已持有等待令牌的阶段也只通过 `kernel_epoll_wait_pending()` 读取非阻塞元数据提示，绝不在等待令牌内调用可能睡眠的目标查询；检测到潜在候选后先结束令牌，再在锁外执行真实刷新（`kernel_epoll_poll()`）。
+3. **解绑与强制退出清理**：
+   - `EPOLL_CTL_DEL`、实例销毁或目标 OFD 关闭均调用 `epoll_item_unlink_and_destroy()`：先在状态锁内置 `linked = 0` 并发起等待节点摘除，在锁外调用 `kernel_wait_node_remove_sync()` 等待所有并发回调彻底退出，再从 AVL 树、反向链表与 `ready`/`pending` 队列摘除，最后在锁外递减引用并释放堆内存。
+   - 每个正在等待或执行嵌套纯查询的调用帧（`struct kernel_epoll_wait_request`）都以栈式链表挂在当前任务上。即使任务被致命信号强制终止，`kernel_epoll_abort_wait()` 也会沿栈逐层归还扫描权、`item` 与 OFD 借用，再安全回收任务内核栈。
+
+---
+
+## 五、参考依据与专题延伸
+
+- **协议规范依据**：Linux 内核 `fs/eventpoll.c` 与 `include/uapi/linux/eventpoll.h`（登记身份、嵌套深度与事件提交边界），以及 musl 1.2.5 `src/select/epoll.c`、`src/select/epoll_pwait.c` 的用户态系统调用封装。
+- **并发与生命周期细节**：关于无锁纯查询（`kernel_epoll_poll`）的键序游标、代次防重入竞态与宿主 ASan/UBSan 交错测试矩阵，详见 [epoll 并发扫描、事件交付与对象生命周期协议](epoll-delivery.md)。

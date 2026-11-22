@@ -1,153 +1,116 @@
-# Linux 双架构 ABI 对照
+# Linux 双架构差分 ABI 验证体系
 
-`make test-diff-abi-riscv` 将同一个无 libc raw-syscall ELF `/init` 分别交给
-Linux 与 BoarOS 生产内核。两次 QEMU system 均为 `virt`、一个 hart、512 MiB，
-使用同一 raw whole-disk ext4 fixture 的独立可写副本。Linux 内核来自
-`references/linux`，对照版本由[构建输入清单](../../references/sources.tsv)选择。
-Linux 原有源码许可证见 `references/linux/COPYING`，构建产物位于被忽略的
-`build/diff-abi/`，不复制 Linux 源码进入 BoarOS。
+操作系统兼容 Linux **应用二进制接口（Application Binary Interface，ABI）**时，最容易出现偏差的往往不是常规路径，而是错误码优先级、部分读写进度、用户地址缺页边界、信号中断行为与元数据时间关系。BoarOS 在 `tests/diff-abi/` 构建了一套**确定性双架构差分 ABI 验证框架**：将**完全相同的无 C 库原生系统调用 ELF 可执行文件**分别送入固定版本的上游 Linux 内核与 BoarOS 生产内核执行，对两条串口记录流进行严格逐项比对。
 
-完整案例清单由 `cases.txt` 维护；聚焦入口使用各组独立清单，结果按实际执行范围记录。
-其中 `exec_boundaries.c`、`fault_count.c`、`sigreturn.c` 和 `boundaries.c` 保护参数容量失败原子性、tmpfs 成功/失败缺页记账、真实偏移恢复帧及 I/O 输入顺序。
-`test-elf-boundary-riscv/loongarch` 另用显式 GNU_STACK RWE、RW 和无标记的三个 ELF 单独检查初始/扩展栈执行。
-历史小清单结果保持其当时身份，不替代当前验证。
+---
 
-## 入口与契约
+## 一、源码组织与架构覆盖
 
-- `tests/diff-abi/cases.c`、`start.S`：同一 RV64GC/LP64D 程序调用 RISC-V
-  Linux syscall ABI。覆盖 open 的三种访问模式、read/pread/file-private mmap、
-  sparse hole/尾页零填充/越过 EOF 的 SIGBUS，以及 write/writev/append 的
-  0、1、32、63、64、65 字节有效用户前缀。请求长度统一为有效前缀 + 1，
-  文件初始位置为 1；该参数契约保存在 `cases.txt` 并记录其 SHA-256。
-- `abi.h`：case pack 公共 syscall、stat、输出与 setup 检查。`truncate.c` 提供驻留页/COW/PROT_NONE、当前与非当前 MM、关闭 fd/unlink、
-  非对齐尾页、O_TRUNC 与重新增长的观测；记录 ID 同步维护在 `cases.txt`。
-- `timestamps.c`：22 条 create/read/write/truncate/unlink 与父目录时间观测。Linux 根挂载沿固定源码 `fs/namespace.c` 的默认 `MNT_RELATIME`，BoarOS 使用同一策略。
-- `readv.c`：覆盖向量导入顺序、零项及零长度、1024/1025 项、`MAX_RW_COUNT`、普通文件跨页/共享 OFD/EOF、0/1/32/63/64/65 字节可写前缀，以及 pipe 的未完成片段保留、写入故障、尾片段合并、环回、非阻塞/EOF 和可写 poll 边界。与上述测试合计 126 条记录；不以手工 Linux 输出替代双侧执行。
-- `links.c`、`signals.c`、`limits.c`：覆盖符号链接解析和元数据、同步信号等待、NOFILE 对 open/dup/pipe/fcntl 的实际约束、降低限制后保留旧 fd、跨 PID 访问、fork/exec 继承、STACK fault，以及 `prlimit64` 参数错误和设置后旧值输出故障。exec 子进程仍执行同一 `/init` ELF，由启动栈中的专用参数进入查询分支，不另造参考程序。
-- `robust.c`：9 条 raw syscall 记录覆盖注册长度、当前线程查询、缺失 TID、输出故障顺序、fork 不继承和注销；内核退出写字与唤醒另由真实 U-mode 探针保护。
-- `usage.c`：资源统计聚焦清单检查线程/进程/已回收子进程、缺页、RSS高水位、冷热I/O、首次弄脏记账、等待消费及输出前缀。RV参考配置显式启用 TASKSTATS/TASK_XACCT/TASK_IO_ACCOUNTING，避免将精简参考核的固定零字段作为目标语义。
-- `waitid.c`：`test-waitid-abi-riscv/loongarch` 使用 58 条 raw 记录核对事件选择、WNOWAIT、停止/继续/退出、参数错误与无子进程时的六字段输出、rusage 写入顺序、EFAULT 后事件消费及线程有序交接；保持 siginfo padding 与其余字段的原始字节。实际持有 claim 时的竞争、阻塞期间换组及信号中断由[等待组合](riscv-smp.md#用户态原程序与压力组合)补充。
-- `file_locks.c`：同一 ELF 核对传统与 OFD 锁的区间边界、权限与坏指针、负长度/EOF、互相冲突、dup/exec/CLOEXEC、unlink 后的 inode 身份、阻塞唤醒、信号打断/重启和有限死锁检测。Linux profile 显式启用 `CONFIG_FILE_LOCKING`；否则最小配置的参考内核并不具备记录锁，不能将其 `EACCES` 当成目标 ABI。
-- `access.c`、`mode.c`：raw `O_NOCTTY` 对普通文件/字符设备的 open 结果，`umask` 的创建掩码、fork/`CLONE_FS` 身份，`fchmodat/fchmod` 的路径/fd 错误、ctime、执行权限与 unlink 后活 inode。
-  `mode.c` 比较 ctime 是否变化：镜像旧时间来自宿主，而固定 Linux 客体时钟可从 epoch 起步，不能把数值递增当作 chmod 契约。
-- `socket.c`：72 条 raw syscall 记录使用真实 loopback ioctl 握手，对照 IPv4 UDP 的 bind/getsockname、接收超时、sendto/recvfrom 数据和来源，以及 TCP 的 CLOEXEC/NONBLOCK、listen、非阻塞 connect、ppoll 就绪和 accept；还覆盖两进程握手、普通与向量 I/O、零长度 datagram、用户复制 fault、负地址长度、`F_SETFL`、混合 fd 的 ppoll/epoll 协议定时器，以及非法类型标志、协议、地址族和坏 fd/用户指针的错误顺序。端口由内核分配；只检查身份和语义，不比较随机端口。固定 Linux 参考启用 `CONFIG_NET`/`CONFIG_INET`。整合后 502 条记录双侧一致，其中 socket 72 条；原 libc-test 静态/动态 socket entry 另由真实程序套件验证。
-- `cases.c` 另覆盖 root UID/GID 四项无参数查询（寄存器留有无效地址仍须忽略）及 fork/exec 后身份；与固定 Linux PID 1 root 环境比较。
-- `credentials.c` 的聚焦清单 `credentials-cases.txt` 检查可变 UID/GID、补充组、capset/prctl 与错误副作用。每组在独立子进程降权，完整观测通过继承管道交回父进程，统一记录序列和 END 数量。构建目标为 `build/diff-abi/credentials-rv`、`build/loongarch/credentials-la`。
-- 实际 set-ID/filecap 执行由 `tests/workloads/credentials/exec.c` 与 `tests/userland/credentials-fixture.py` 提供，沿现有 runner 使用独立镜像副本。参考 Linux 启用 `CONFIG_EXT4_FS_SECURITY` 才能读取 security.capability；夹具读回 rev1/2/3 字节并确认外部 EA 块。动态加载用真实 preload constructor 和 secure_getenv 检查，另记录 libc 是否仍向 getenv 暴露环境字符串。
-- `boundaries.c`：标量原始范围/零长度、F_SETFL 保留不可变标志与 dup 可见性、socket 限长和拒绝后的消息身份；聚焦入口为 `test-abi-boundary-riscv/loongarch`，也纳入完整案例清单。
-- `harness.py`：构建 Linux、制作镜像、运行两个系统、校验完整协议并做严格 diff。
-- `linux.config`：以 `allnoconfig` 为基础，启用 virt、MMU、ELF、串口、VirtIO
-  MMIO/block、ext4、futex、IPv4 网络和关机所需能力；Linux 自己解析依赖。futex 在首次 robust 差分前显式启用，避免固定 Linux 因精简配置返回 `ENOSYS`。`CONFIG_RISCV_ISA_FALLBACK=y` 允许固定 Linux 在缺少 `riscv,isa-extensions` 的旧 QEMU 设备树上读取 `riscv,isa`；较新 QEMU 仍优先使用扩展列表。程序清单的 Linux profile 保持同一设置，保证参考侧能使用其实际提供的浮点指令。
+| 源码路径 | 核心职责 |
+| :--- | :--- |
+| `tests/diff-abi/harness.py` | 差分测试总控器：固定 Linux 源码校验与缓存构建、ext4 镜像制作、双侧 QEMU 启动、记录流规范化、严格 diff 与磁盘一致性检查 |
+| `tests/diff-abi/abi.h`、`start.S` | 无 libc 原生系统调用封装（支持 RV64 与 LA64）、独立子栈跳板（用于 `clone`/`vfork`）、标准结果输出协议与断言工具 |
+| `tests/diff-abi/cases.txt` | 主案例清单，包含 **1,744 条**有序 ABI 观测记录（另有 26 份专题聚焦清单，可单独快速回归） |
+| `tests/diff-abi/*.c` | 50 余个分领域测试包（文件 I/O、管道、截断、时间、路径、信号、锁、套接字、凭据、能力、大页/SHM、futex、procfs、调度、资源限额、定时器等） |
+| `tests/diff-abi/timestamps.py` | 224 字节文件时间戳与 256 字节显式 `utimensat` 观测的关系规范化器（校验时钟区间、纳秒边界与 `MNT_RELATIME` 语义） |
+| `tests/diff-abi/linux.config` | 以 `allnoconfig` 为基线的精简参考 Linux 内核配置，确保只启用明确对照所需的子系统 |
+| `tests/diff-abi/Makefile.inc` | RISC-V 64 与 LoongArch 64 全量及各专题构建与执行入口 |
 
-每条记录含 ID、返回值、errno、文件 size、OFD offset、子进程 wait status 和
-完整观测数据的十六进制值。fd 与 mmap 地址只有其成功身份规范为 0；错误返回、
-部分计数、字节、大小、位置和退出/信号状态均保留。未观测 size/offset 用 -1。
-除时间观测外，规范化只去除引导噪声和串口 CRLF；缺失、重复、未知、乱序、格式错误的记录，
-错误 errno、缺少 END、QEMU 非零退出和超时均失败。BoarOS 还必须报告 PID 1
-状态 42、heap-live 为零及完整资源回收关机。
+---
 
-时间观测保留原始 224 字节（28 个有符号 little-endian RV64 word）：操作前后时钟区间、文件操作前后的 atime/mtime/ctime、父目录操作前后的三个时间，均以秒/纳秒成对编码。`timestamps.py` 校验纳秒范围、变化字段属于操作时钟区间，再比较字段变化关系、创建时间相等关系、mtime/ctime 关系及 relatime 前置条件；不直接比较两次独立启动的绝对墙钟。规范化器自身的哈希进入运行清单，原值仍保存在串口日志。宿主测试故意破坏纳秒、时钟范围和变化关系以验证其会失败。
+## 二、执行管线与确定性对比协议
 
-Linux PID 1 在完整输出后 sync 并 reboot poweroff；同一程序在 BoarOS 的未实现
-调用返回后 exit(42)。这些启动/终止适配不参与案例观测，不影响文件操作路径。
-fixture 内 `/dev/console` 是由 debugfs 创建的字符设备 inode，用于 Linux init
-标准流；无需宿主 root 或 loop mount。
+```mermaid
+flowchart LR
+    ELF["同一无 libc 原生 ELF (/init) + 32 MiB ext4 基础镜像"]
+    Linux["参考侧: 固定 Linux 内核 (QEMU virt)"]
+    BoarOS["待测侧: BoarOS 生产内核 (QEMU virt)"]
+    Norm["串口协议解析与时间关系规范化 (timestamps.py)"]
+    Diff["严格逐项 unified diff + e2fsck -fn + heap-live=0 校验"]
 
-## 进程、随机与调度阶段（2026-09-29）
-
-该阶段完整同 ELF 差分为 **1000 条匹配**：本阶段新增 coarse clock 14、随机接口 34、
-会话/进程组 105、RT proc 控制 36、调度策略 23 与 proc 调度字段 5 条。
-`session.c` 必须在删除 `/init` 的 proc 用例之前运行，使 exec 子进程仍有真实来源。
-`rt_controls.c` 自建独立 proc 挂载；配置用例退出前恢复预算，后续策略测试不依赖残留状态。
-Linux 配置启用 HWRNG、SYSCTL/PROC_SYSCTL；随机字节仅验证契约，不逐字比较或以不同输出证明熵。
-
-并发运行恢复矩阵和程序清单时，默认 60 秒总预算曾在第一个 session 分组后耗尽；
-同一内核/ELF 的 180 秒预算复跑输出完整 END 1000、heap-live=0 并逐条一致。
-独立 105 条 session 窄测也通过，未据超时末条记录推断内核死锁。
-复建后可用 `python3 -B tests/diff-abi/harness.py --kernel kernel-rv --program build/diff-abi/cases-rv --timeout 180` 重复本次完整验收。
-
-## 构建、缓存与证据
-
-依赖 GNU Make、RV64 bare-metal GCC/binutils、RV64 Linux GCC/binutils、宿主 GCC、
-flex、bison、bc、Python 3、QEMU system RISC-V、OpenSBI、e2fsprogs 和 Git。
-Linux 源码缺失时只 fetch manifest 中的固定 commit；现有源码有修改、版本或
-origin 不符时失败。源码构建时，已有 sparse checkout 按参考资料流程展开同一 commit；缓存命中时
-直接验证已记录的 Image 和 config，不读取 Linux 工作树。
-
-```sh
-make test-diff-abi-host
-make build-diff-abi-linux
-make test-diff-abi-riscv
+    ELF -- "独立可写副本" --> Linux
+    ELF -- "独立可写副本" --> BoarOS
+    Linux --> Norm
+    BoarOS --> Norm
+    Norm --> Diff
 ```
 
-缓存 key 包含固定来源/commit、输入 config、构建器代码、编译器/汇编器/链接器
-以及宿主构建工具的版本与可执行文件 SHA-256。读取缓存还验证实际 `.config`
-和 Linux Image SHA-256。`LINUX_CC` 可选择以 `gcc` 结尾的交叉编译器，
-`DIFF_JOBS` 控制 Linux 构建并行数。
+### 2.1 双架构与输入冻结
 
-运行期间 `build/diff-abi/run/` 保存双方 raw logs、normalized records、`results.diff` 和
-包含内核、程序、fixture 哈希、工具版本及完整 QEMU 命令的 `metadata.json`。
-启动 Linux 构建前即快照 BoarOS 内核、测试 ELF 和案例清单，哈希及运行均使用
-该快照，避免并行构建改变输入。成功时删除运行镜像，失败保留三份初始/运行镜像。每次运行替换此目录；核对结果应记录固定输入和结论，本地核对完成后用 `make prune-build` 清理该目录。参考 Linux 使用精确输入身份，
-本次日志保存在执行目录，失败时另保留镜像。
+- **统一参考基线**：参考 Linux 内核严格锁定于 `references/sources.tsv` 中的单一提交（`f4cdf7ca9a1fdcca413157df19753f388a5a224e`）。构建缓存键包含源码提交、输入 `linux.config`、构建脚本及全部交叉/宿主工具链二进制的 SHA-256 校验值；缓存命中时复核 `.config` 与内核镜像哈希，若工作树被修改或 origin 不符则立即报错中止。
+- **双架构覆盖**：
+  - **RISC-V 64（`make test-diff-abi-riscv`）**：以 RV64GC/LP64D 构建 `/init`（默认 512 MiB 内存），对比参考 Linux 4 KiB 页内核。
+  - **LoongArch 64（`make test-diff-abi-loongarch`）**：使用完全相同的 C 源码集以 16 KiB 页对齐构建 `/init`，默认分别在 **512 MiB** 与 **1 GiB** 两种内存配置下对照 16 KiB 页参考 Linux（`CONFIG_16KB_3LEVEL=y`）执行四路比对。
+- **输入快照与镜像准备**：运行前将待测内核、ELF、案例清单与参考 Linux 镜像复制到独立输出目录并计算哈希，避免并行构建污染当轮输入。测试夹具通过 `mkfs.ext4` 与 `debugfs` 在无宿主 root 权限下生成 32 MiB ext4 镜像，预置 `/init`、测试数据文件 `/data` 以及 `/dev/{console,null,zero,rtc0}` 字符设备节点。
 
-宿主协议测试包含刻意错误返回值/errno、数据、size、offset、signal，缺失/重复
-结果和实际子进程 timeout/nonzero，确保比较器不会将未执行或不完整运行当作成功。
-LA 四路输出的宿主模型自建内核、ELF、Linux 和 QEMU 身份 fixture，不依赖本机
-LA 模拟器缓存；真实 runner 仍校验选定 QEMU 的内容、权限和链接目标。
-此入口验证明确案例子集，不代表完整 Linux ABI 或尚未实现架构通过。
+### 2.2 线缆协议与零容忍校验
 
-## 固定 reference 的已知限制
+每个测试用例通过串口输出一条格式严格的记录：
+```text
+ABI BEGIN 1
+ABI <case_id> <ret> <errno> <size> <offset> <wait_status> <hex_payload_or_->
+...
+ABI END <total_cases>
+```
 
-在上述固定 Linux、同一最小 config 与 4 KiB ext4 上，请求 128 字节的跨页
-无效用户缓冲区测试发生真实超时。文件位置 0 与 1 均复现；GDB 均停在
-`handle_exception <- fault_in_iov_iter_readable`，位置 1 时已经复制 31 字节，
-剩余 97 字节的源地址落在有效页最后一字节。
-本地 `references/linux/arch/riscv/lib/uaccess.S` 的 word/shift-copy 可能在
-跨页 load 上无法复制剩余有效字节，而 `references/linux/mm/filemap.c` 的
-`generic_perform_write()` 在 prefault 仍发现有效字节后继续 retry；这是结合
-源码与调试现场的原因分析，并非修改过的 Linux 行为。
+- **最小规范化原则**：仅剔除引导阶段内核前缀和串口 CRLF 换行；文件描述符编号与成功 `mmap` 地址仅将其非确定性句柄值归零，而所有错误码、部分读写字节数、文件大小、OFD 偏移、字节内容十六进制载荷及子进程 `wait` 状态均原样保留逐字节比对。
+- **零容忍失败条件**：任何缺失、重复、未知或乱序记录，`ret` 与 `errno` 冲突，缺少 `ABI END`，QEMU 超时或非零退出均判失败。BoarOS 侧还必须额外满足：PID 1 以退出码 `42` 正常关机、`heap-live=0`（无内核堆泄漏），且运行后的 ext4 磁盘通过 `e2fsck -fn` 检查。
+- **相对时间关系验证**：由于两次独立启动的墙钟起点不同，`time.*`（28 个 64 位小端字）与 `utime.*`（32 个 64 位小端字）记录保留操作前后时钟窗口及文件/父目录的完整 `atime`/`mtime`/`ctime`；`timestamps.py` 严格校验纳秒合法性、变更时间落入操作窗口内、创建时三时相等、`MNT_RELATIME` 更新条件以及 `UTIME_NOW`/`UTIME_OMIT` 精确关系。
 
-当前 pack 使用统一的最小 fault span（有效前缀 + 一个无效字节）保护部分
-成功的 ABI 契约；不把上述 128-byte 实例超时规范化为成功，也不更换固定
-Linux commit。较长请求的上游 RISC-V usercopy 进展问题留作独立 reference
-调查。SIGBUS 对照显式禁用 Linux core dump，仍严格比较整个 wait status，
-不能把没有生成 core 的退出伪装为 `WCOREDUMP`。
+---
 
-路径组合探针 `tests/diff-abi/namespace.c` 覆盖 cwd/dirfd、父目录改名、跨目录移动、NOREPLACE/特殊末分量、活覆盖目标、删除 cwd 与目录同步；该阶段共 297 条，显式元数据加入后为 320 条记录。普通 rename 使用固定 RV64 Linux 原生 `renameat2(276, flags=0)`，旧 38 号兼容入口不作为 Linux 对照。
+## 三、核心案例覆盖领域与专题矩阵
 
-显式时间用 `metadata.c` 的 `utime.*` 记录：256 字节（32 个 RV64 word），在上述时钟和 inode/父目录观测外保留两项原始请求。规范化器检查 explicit 精确值/范围截断、NOW 与 ctime 同一时刻、OMIT/失败完全不变、父目录不变。`metadata.*` 保留错误顺序、statfs 几何/UUID/标志与实际分配/截断的空闲块差量；容量值不归零。bavail 的 Linux 专有 extent 保留池不同于 BoarOS，分别用真实分配状态验证，不伪造相同储备。加入 robust syscall 后完整差分为 329 条记录。
+除包含 **1,744 条**记录的主矩阵 `cases.txt` 外，`tests/diff-abi/` 将高频回归与独立隔离场景拆分为专题清单，支持按单模块秒级验证，部分核心模块如下：
 
-`child_tid.c` 记录 fork/vfork/thread 的 CHILD_SETTID、CHILD_CLEARTID 与成功/失败 exec；由 `start.S` 提供独立子栈 trampoline，避免 C 函数在换栈后误用父栈。当前 child-TID 阶段完整 manifest 为 556 条。
+| 专题领域 | 核心源码与清单 | 验证重点 |
+| :--- | :--- | :--- |
+| **基础 I/O、向量与边界** | `cases.c`、`readv.c`、`boundaries.c`、`common-io-cases.txt`（263 条） | `open`/`read`/`pread`/`writev`/append 0 ～ 65 字节有效前缀跨页故障、1024/1025 向量上限、`MAX_RW_COUNT`、管道环回与非阻塞边界 |
+| **内存映射、截断与 `mremap`** | `truncate.c`、`shared_mapping.c`、`mremap.c`（27 条）、`fault_count.c`（3 条） | 稀疏空洞、尾页补零、越界 `SIGBUS`、私有 CoW 隔离、`PROT_NONE`、`mremap` 迁移与缺页记账 |
+| **路径、链接与文件系统语义** | `namespace.c`、`path_only.c`（96 条）、`links.c`、`hardlink.c`、`metadata.c`、`statx.c`、`sync.c`（23 条） | `cwd`/`dirfd`、跨目录与 `RENAME_NOREPLACE` 重命名、活覆盖目标、删除 `cwd`、`statx` 掩码与错误优先级、`statfs` 块差量 |
+| **tmpfs 与文件锁** | `tmpfs.c`、`tmpfs_options.c`、`file_locks.c` | tmpfs 页/节点配额、空洞、挂载选项边界与 `st_blocks` 单位；POSIX 传统锁与 OFD 锁冲突、分裂合并、信号打断与死锁检测 |
+| **进程、等待、信号与会话** | `waitid.c`（58 条）、`signals.c`（31 条）、`sigreturn.c`（3 条）、`session.c`、`child_tid.c` | `waitid` 六字段 `siginfo` 与 `WNOWAIT`、同步信号等待、真实帧恢复、`CLONE_CHILD_SETTID/CLEARTID`、会话与进程组 105 项契约 |
+| **凭据、权限与能力** | `credentials.c`（73 条）、`credential_consumers.c`（48 条）、`capability.c`（31 条）、`faccessat2.c`（36 条）、`access.c`、`mode.c`、`ownership.c` | 独立子进程降权、可变 UID/GID 与补充组、`capset`/`prctl`、文件模式与 `set-ID` 清除、`faccessat2` 标志组合 |
+| **调度、资源统计与定时器** | `usage.c`（54 条）、`resource-cases.txt`（29 条）、`itimer.c`（36 条）、`fsize.c`（59 条）、`core_limit.c`（19 条）、`rt_controls.c`、`sched_policy.c`、`sched_stat.c`、`cpu_clock.c` | `getrusage`/`proc` 统计、CPU 间隔定时器、`RLIMIT_FSIZE`/`RLIMIT_CORE`/`RLIMIT_NOFILE` 强制执行、FIFO/RR 策略与 RT 带宽控制 |
+| **网络、SysV SHM、futex 与设备** | `socket.c`、`shm.c`、`futex_shared.c`、`robust.c`、`devices.c`、`mknod.c`、`random.c`、`coarse.c`、`environment.c` | IPv4/IPv6 loopback TCP/UDP 与 `ppoll`/`epoll`、SysV SHM 生命周期与只读改权、共享 `futex` bitset/requeue 与稳健锁、RTC 与 `klogctl` |
+| **procfs 与 ELF 执行边界** | `proc.c`（115 条）、`exec_script.c`、`exec_boundaries.c`（2 条）、`stack-cases.txt`（2 条） | 进程/线程目录、复用隔离、`fd` 重开、`mounts`；shebang 脚本展开、`GNU_STACK`（RWE/RW/无标记）与参数容量原子失败 |
+| **串口终端与作业控制** | `make test-tty-diff-riscv`（独立宿主 PTY 驱动） | 27 条 `termios`/行规程读取与 80 条前台进程组/作业控制记录，无全局 CR 归一化 |
 
-脚本差分要求 Linux 配置 `CONFIG_BINFMT_SCRIPT=y`；关闭时两侧 ENOEXEC 一致不能证明 shebang 正确。`exec_script.c` 检查参数、环境、嵌套、无换行与错误边界。
+---
 
-本轮 tmpfs 对照内核配置必须同时启用 CONFIG_SHMEM=y 与 CONFIG_TMPFS=y。
-仅启用 TMPFS 会被 Kconfig 依赖裁掉；Linux 可退回 ramfs 接受 tmpfs 挂载名称，
-却忽略配额，不能用它作为 tmpfs 参考。运行前核对生成 .config 与缓存身份。
-新增 hardlink、tmpfs 配额/空洞/映射/生命周期及选项差分；动态容量仍比较来源
-和关系，不要求两个系统的物理内存或负载相等。
+<details>
+<summary>展开查看：参考内核配置要点、已知上游细节与运行命令</summary>
 
-环境补全增加27条，合计1118：完整klogctl控制/错误边界和RTC读取、日历布局、
-独占/dup重开、fault及ioctl请求号的32位截断。RTC日历检验范围，不比较两个启动的
-实际秒值。固定Linux profile启用Goldfish RTC与HCTOSYS，Linux用其真实devtmpfs节点。
-启动UART可能在保留的ABI前缀前插入内核半行；normalizer只截掉前缀之前的串口文本，
-仍严格核对完整payload、全部ID、顺序、计数、errno及最终回收。
+### 参考 Linux `linux.config` 关键配置说明
 
-## 串口终端差分
+- 为防止精简参考内核因裁掉功能而返回 `ENOSYS`/`EACCES` 造成“错误一致”的假通过，`linux.config` 显式启用：`CONFIG_TMPFS=y` 与 `CONFIG_SHMEM=y`（避免退化为忽略配额的 `ramfs`）、`CONFIG_FILE_LOCKING=y`、`CONFIG_BINFMT_SCRIPT=y`、`CONFIG_FUTEX=y`、`CONFIG_SYSVIPC=y`、`CONFIG_NET=y` / `CONFIG_INET=y` / `CONFIG_IPV6=y`、`CONFIG_TASKSTATS=y` / `CONFIG_TASK_XACCT=y` / `CONFIG_TASK_IO_ACCOUNTING=y`、`CONFIG_HW_RANDOM_VIRTIO=y`、`CONFIG_RTC_DRV_GOLDFISH=y`、`CONFIG_RISCV_ISA_FALLBACK=y`，并关闭 `CONFIG_COREDUMP=n` 使 `SIGBUS` 等终止状态可严格一致比较。
 
-通用runner的stdin为无输入设备，不能代替真实UART交互。`make test-tty-diff-riscv`
-使用独立raw宿主PTY、关闭monitor混用，对相同RV64 ELF执行27条termios/读取及80条
-作业控制记录；与原1207条通用差分分别计量。客体按FIONREAD、任务状态、pipe/wait
-握手推进，记录返回值、errno、关系与字节，不比较分配的PID或实际墙钟。原始字节
-不做全局CR归一化；同时核对真实wait status与BoarOS最终heap-live=0。
+### 参考 Linux 的跨页用户拷贝边界说明
 
-测试输入和可重建命令见[TTY模块](kernel-tty.md)，原ash/stty验收另由
-`make test-tty-riscv`负责。两个入口不能由宿主模型或编译成功替代；宿主PTY也不代表
-客体拥有PTY。
+- 在固定参考 Linux 的 RISC-V 最小配置上，对 128 字节跨页无效用户缓冲区执行 `write` 会触发参考侧自身重试循环超时（源于 `arch/riscv/lib/uaccess.S` 在跨页边界剩余单字节时的搬运与 `generic_perform_write()` 重试交互）。因此测试包统一采用最小跨页故障跨度（有效前缀 0/1/32/63/64/65 字节 + 1 字节 `PROT_NONE`）来精确检验部分写入进度与错误返回契约。
 
-2026-10-06 通用矩阵新增22条 statx：基本路径/fd/NULL 空路径、cwd、符号链接、
-同步与 mask、坏 fd/path/缓冲、错误组合优先级及跨页复制故障。当前1366条
-同 RV ELF 在固定 Linux 与 BoarOS 匹配；结果只证明矩阵所覆盖的契约。
-LA 的静态 musl/原 BusyBox 根盘对照入口为 `make test-root-loongarch`，采用该架构
-内部同一个 LP64S ELF，不能用 RV 记录替代其架构验收。
+### 常用运行与调试命令
+
+```sh
+# 宿主协议与时间戳规范化器反例自测（检验比较器能可靠拦截伪造/缺漏结果）
+make test-diff-abi-host
+
+# 仅构建并缓存固定参考 Linux 内核（可通过 DIFF_JOBS 控制并行度）
+make build-diff-abi-linux
+
+# 运行 RISC-V / LoongArch 全量 1,744 条差分 ABI 验证
+make test-diff-abi-riscv
+make test-diff-abi-loongarch
+
+# 独立复跑或自定义超时（如宿主机负载较高时延长至 180 秒）
+python3 -B tests/diff-abi/harness.py --kernel kernel-rv --program build/diff-abi/cases-rv --timeout 180
+
+# 常用专题聚焦入口（均提供 -riscv 与 -loongarch 双目标）
+make test-waitid-abi-riscv test-usage-abi-riscv test-itimer-abi-riscv
+make test-capability-abi-riscv test-fsize-abi-riscv test-core-limit-abi-riscv
+make test-elf-boundary-riscv test-abi-boundary-riscv test-tty-diff-riscv
+```
+
+- 每次运行结果、双侧原始串口日志、规范化记录、`results.diff` 与完整环境指纹保存在 `build/diff-abi/run/metadata.json`（成功自动清理临时镜像，失败保留三份镜像供排查），核对后可通过 `make prune-build` 清理临时运行目录。
+
+</details>

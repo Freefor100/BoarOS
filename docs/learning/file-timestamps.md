@@ -1,123 +1,126 @@
-# 文件时间戳：请求边界、live inode 与 relatime
+# 文件时间戳、所有权与持久化语义
 
-## 固定证据
+在类 Unix 文件系统中，每个索引节点（`inode`）维护三个核心时间戳：**访问时间（`atime`）**、**内容修改时间（`mtime`）** 与 **元数据状态变更时间（`ctime`）**，以及表示文件归属的用户标识（User ID，UID）和组标识（Group ID，GID）。看似简单的几个字段，实际牵涉三个棘手的工程问题：
 
-Linux 参考均为 `references/linux/` commit
-`f4cdf7ca9a1fdcca413157df19753f388a5a224e`：
+1. **性能与语义平衡**：如果每次 `read` 都立即开启文件系统日志事务去写盘更新 `atime`，只读负载也会退化为密集随机写。
+2. **精确的请求触发边界**：零长度读写、越界写入（`-EFBIG`）、首字节用户态地址错误（`-EFAULT`）和同长度截断（`ftruncate`）分别该不该更新时间？顺序错一步就会违背 Linux 应用二进制接口（Application Binary Interface，ABI）契约。
+3. **磁盘格式边界与崩溃一致性**：传统 128 字节 ext4 `inode` 在 2038 年后会溢出，扩展 `inode` 需要正确编码纪元（epoch）与纳秒；修改文件属主（`chown`）涉及双 16 位磁盘字段与共享扩展属性（Extended Attribute，EA）块的写时复制（Copy-on-Write，CoW）回滚。
 
-- `fs/ext4/file.c` 的 `ext4_file_read_iter()` 对零长度请求直接返回，跳过 atime；
-  `ext4_write_checks()` 在 `file_modified()` 之前检查请求是否非零。
-- `mm/filemap.c:filemap_read()` 在实际 read_iter 路径末尾调用 `file_accessed()`，
-  因此 EOF、部分复制和首字节 user fault 不能统一视为“没有访问”。缓存命中同样经过这个路径。
-- `fs/inode.c` 的 `relatime_need_update()` 在 `atime <= mtime`、`atime <= ctime` 或
-  `now.tv_sec - atime.tv_sec >= 86400` 时允许更新；`touch_atime()` 不让 metadata I/O 错误
-  覆盖 read 的结果。`file_modified()` 在用户数据复制之前修改 mtime/ctime。
-- `fs/open.c:do_sys_ftruncate()` 请求 `ATTR_MTIME|ATTR_CTIME`，同长度 truncate 也更新；
-  `fs/ext4/inode.c:ext4_setattr()` 保持 inode 的数据与 metadata 修改路径。
-- `init/do_mounts.c:init_mount()` 和 `fs/namespace.c` 的普通 mount 路径默认使用 relatime。
-  `rootflags=relatime` 会被传给 ext4 的 filesystem 参数解析器并被当前基线拒绝，不能用它
-  代替 VFS 的 mount 选项。
+本文依据 `fs/vfs.c`、`fs/files/metadata.c`、`fs/files/io.c` 与 `fs/ext4_backend.c` 的实际代码，系统说明 BoarOS 的文件时间戳、所有权与持久化实现。VFS 挂载策略与事务协作详见 [VFS 与 ext4 文件系统](../modules/vfs-ext4.md)。
 
-lwext4 基线为仓库内 `third_party/lwext4/`，上游固定 commit
-`58bcf89a121b72d4fb66334f1693d3b30e4cb9c5`，本地修改另见 `docs/third-party.md`。
+---
 
-## 所有权和更新位置
+## 一、运行时节点所有权与 `relatime` 延迟写回
 
-VFS 在 mount 上绑定可选 realtime 回调，未初始化 kernel clock 时返回“不可用”，保持 fixture 的
-原时间。正常系统使用 `kernel_time_realtime_ns()`；回调结构保留 signed seconds 和 nanoseconds。
-普通文件首次打开时从实际 inode 初始化共享节点的时间字段。后续普通 I/O 使用该节点的
-运行时值；别名和 unlink 后仍打开的文件保持同一 inode owner。脏字段的保存、事务接受与
-更新交错由 [VFS 时间状态](../modules/vfs-ext4.md) 描述。
+### 1.1 时钟源与活节点（Live Inode）
 
-文件层在完成 fd/模式/用户范围检查之后、非零 I/O 请求开始时更新：read/pread 走 relatime，
-普通文件 write/writev 在 usercopy 前更新 mtime/ctime。零长度和访问模式拒绝不更新；
-非零首字节用户 fault 写仍更新 mtime/ctime。写入会先按实际 append/普通 offset 校验 inode maxbytes，`-EFBIG` 不更新时间；pread 按原始 count 在 MAX_RW_COUNT 截断及 EOF 判定前检查完整用户范围，含非法高地址的零长度范围，`-EFAULT` 不更新时间。实际数据返回值和 OFD offset 继续只统计 backend
-提交的字节数，metadata 更新不构成数据进度。
+虚拟文件系统（Virtual File System，VFS）在 ext4 后端通过 `vfs_realtime()` 读取内核实时时钟（`kernel_time_realtime_ns()`）。当系统时钟尚未初始化（例如独立宿主测试桩）时，该函数返回不可用，保留磁盘原有时间戳；正常启动后以有符号 64 位秒数和纳秒精度表示时间。
 
-创建时直接初始化新 inode 的 atime/mtime/ctime；权限通过同一 inode handle 设置，
-避免成功创建后再次解析完整路径，操作仍在原事务内失败回滚。初始化权限
-不重新采样ctime，普通chmod则更新ctime；两者不能混用。成功目录链接/移除更新父目录 mtime/ctime，
-unlink 更新子 inode ctime。truncate 在活 inode 修改后更新 mtime/ctime，包括同长度请求；
-已改变大小但后续错误的 inode 状态仍按原 VFS mutation reconciliation 保持可见。
+普通文件首次打开时，`fs/ext4_backend.c` 从磁盘 `inode` 解码 `atime`、`mtime`、`ctime` 到共享的内存活节点 `struct lwext4_node`，之后所有指向同一 `inode` 的硬链接别名、以及已被 `unlink` 但仍有打开描述符引用的文件，全部读写这份统一的运行时时间，由短临界区 `TIMESTAMP_SCOPE`（多核为自旋锁 `adapter->timestamp_lock`，单核为中断保护）协调并发可见性。
 
-扩展时间字段同时受磁盘 inode_size 和 extra_isize 限制。128-byte inode 只保存 signed32 seconds；
-扩展 inode 使用 signed32 基数加两位 epoch，范围为 `[-2147483648, 15032385535]` 秒，
-其余 30 位保存纳秒。写入超范围时间按 inode 支持范围截断，不把 2038 年之后时间解释成负数，
-也不把不存在的 extra 字段写进下一 inode。
+### 1.2 `relatime` 策略与 100 ms 批量落盘
 
-## 文件所有权与进程身份
+Linux 挂载默认采用 **`relatime`（相对访问时间）** 策略，避免每次读盘都产生元数据写放大：只有当满足以下任一条件时，读取操作才更新 `atime`：
 
-inode的UID/GID是文件元数据，不等于当前进程的UID/GID。固定root也可以通过
-chown记录其他所有者，后续stat和硬链接应读到该值；这并不自动实现setuid、账户
-查询、访问权限或capability执行。匿名pipe的元数据归共享pipe对象，命名FIFO归
-VFS inode，不能把所有特殊fd都当成根盘路径。
+- 当前 `atime <= mtime` 或 `atime <= ctime`（文件内容或元数据在最后一次访问之后发生过变化）；
+- 距离上次 `atime` 更新已满 24 小时（`now.seconds - atime.seconds >= 86400`）。
 
-固定Linux 7.2的`references/linux/fs/open.c:chown_common/do_fchownat`与
-`fs/attr.c:setattr_should_drop_sgid`定义字段保留、ctime、set-ID和错误检查顺序。
-尤其是`fchownat(fd, "", ..., AT_EMPTY_PATH)`与NULL路径不同：后者是EFAULT，
-不能借用utimensat的NULL pathname规则。chown不会改变atime/mtime；固定root下
-非目录清S_ISUID，组执行位存在时才清S_ISGID，目录保留set-ID。setgid目录的
-GID继承另见`references/linux/fs/inode.c:inode_init_owner`。
+BoarOS 对热读路径做了两层优化：
 
-ext4 UID/GID使用两组16位磁盘字段；仅更新低位会让大ID错误变成另一所有者。
-非目录chown还须移除capability属性，与UID/GID、mode、ctime共用操作undo。
-属性可能在inode内，也可能位于有引用计数的外部EA块；共享块须先复制，旧块
-refcount、新块checksum、inode占有扇区数和释放都必须一致。操作失败只回滚本次
-修改，不能删除另一inode的共享属性，也不能失去缓冲owner。inode删除同样只
-归还自己的EA引用，最后引用才释放物理块；否则属性内容仍可能读到，但位图已经
-把块误记为空闲，后续复用才暴露损坏。独立e2fsck核对磁盘
-格式，raw-syscall差分核对可见语义，两类证据不能互相替代。
+1. **无锁快速跳过（`relatime_due`）**：每当 `atime`/`mtime`/`ctime` 变化时，`publish_relatime_due()` 会原子发布下一次需要更新 `atime` 的到期秒数（若 `mtime >= atime` 或 `ctime >= atime` 则设为 `INT64_MIN` 表示立刻到期，否则设为 `atime.seconds + 86400`）。读路径无需加锁即可快速判断当前是否无需刷新 `atime`。
+2. **延迟合并写回**：普通 `read`/`write` 绝不为每次访问单独开启日志事务，而是通过 `time_dirty_locked()` 更新内存中的 `node->times[i]`，递增字段版本号 `node->time_version[i]`，标记 `dirty_fields`，并将节点挂入挂载点的 `dirty_times` 链表。首次有节点变脏时，设置 **100 ms**（`100,000,000` ns）的批量刷新截止时间 `adapter->times_deadline`，交由挂载点的后台日志/写回线程统一合批写入。
 
-重建用`sh tests/host/lwext4-metadata.sh ownership`和`make test-diff-abi-riscv`。
-原BusyBox可用`chown 70001:80002 file`与`stat -c '%u:%g:%a' file`核对实际字段；
-显式sync后正常卸载再启动才能核对持久化，tmpfs和匿名pipe不适用重启保存要求。
+> 挂载选项支持 `relatime`、`noatime`、`nodiratime` 与 `strictatime`（按 VFS 层挂载策略管理；注意内核启动参数不把 `rootflags=relatime` 直接透传给 ext4 内部解析器，而是由 VFS 挂载标志统一控制）。带有 `EXT4_INODE_FLAG_NOATIME` 标志的 `inode` 或使用 `O_NOATIME` 打开的描述符同样跳过 `atime` 更新。
 
-## I/O 失败与持久化
+---
 
-普通 read/write 在共享 inode 上发布运行时时间并登记脏字段，不为每次访问开启 metadata
-事务。数据写回取得实际事务资格后才捕获当前时间，因此准入等待期间的 namespace 修改
-不会被旧快照覆盖。显式设置和 namespace 操作仍使用各自事务；准备失败或 abort 不发布
-暂存时间，成功后按字段版本保留期间发生的较新更新。
+## 二、各类系统调用的精确触发边界
 
-已知 mount 错误在写侧数据复制前返回；时间编码、日志提交或 flush 的后续错误由
-node/journal/mount 保留，并在同步调用中观察。读侧 atime 错误按 Linux 规则不改变 read
-返回值。关键 I/O 失败不能通过清除错误或重复卸载冒充成功；只有尚未改变持久状态的准备
-失败才安全回滚。重启按 journal/replay 和持久 orphan 恢复，见 [VFS 模块](../modules/vfs-ext4.md)。
+内核在文件层与 VFS 层严格对齐 Linux 的错误检查顺序与时间戳更新时机：
 
-完整 fsync 先编码脏时间，再捕获 durable 目标。fdatasync 保留只同步数据所需依赖的语义，
-纯时间修改不单独推进 data 目标；与数据同事务编码的时间随数据持久化。
+| 操作类型 | 触发条件与检查顺序 | 更新字段 |
+| :--- | :--- | :--- |
+| **`read` / `pread`** | 先校验 FD、读权限及用户缓冲区地址范围（`pread` 在 `MAX_RW_COUNT` 截断与文件尾判断前校验完整用户范围，包含指向非法高地址的零长度请求，`-EFAULT` 不更新时间）。零长度请求跳过；非零读取即使命中页缓存、遇到文件尾（EOF）或部分拷贝，仍按 `relatime` 判定更新。 | `atime`（受 `relatime` / `noatime` 约束） |
+| **`write` / `writev`** | 先校验 FD、写权限与按实际写入/追加偏移计算的 `inode maxbytes` 上限（超限返回 `-EFBIG` 且不更新时间）。随后对非零普通文件写入在**拷贝用户数据之前**更新时间戳——因此即便首字节用户拷贝触发 `-EFAULT`，`mtime`/`ctime` 也已更新；但返回值与打开文件偏移严格只计后端实际提交的字节数。 | `mtime`、`ctime` |
+| **创建文件/目录** | 创建新 `inode` 时直接初始化三项时间戳；初始权限位通过同一 `inode` 句柄在原事务内设置，不重新解析路径，也不额外重采 `ctime`（与普通 `chmod` 更新 `ctime` 严格区分）。创建或移除目录项成功时更新父目录时间；`unlink` 同步更新子 `inode` 的 `ctime`。 | 新建：`atime`/`mtime`/`ctime`；父目录：`mtime`/`ctime` |
+| **`truncate` / `ftruncate`** | 在活 `inode` 尺寸修改路径后更新，**即使目标长度与原长度相同**也更新时间戳。 | `mtime`、`ctime` |
 
-## 显式设置与检查顺序
+### 显式设置：`utimensat` 与 `futimens`
 
-固定 Linux 同一 commit 的 `fs/utimes.c` 先复制 times，再对两项 OMIT 直接返回；其他请求先解析目标，再由 `vfs_utimes` 验证纳秒和只读。NULL pathname 与非 AT_FDCWD 是 fd 形式，空字符串/AT_EMPTY_PATH 是路径形式；两者的 flags 与错误顺序不同。`fs/inode.c:timestamp_truncate` 在 seconds 小于等于最小值或大于等于最大值时清零纳秒。VFS 只采样一次 realtime，保证 NOW 与 ctime 相等，OMIT 字段与父目录不变；后端按 inode 更新，删除名字不影响 fd 形式。
+`fs/files/metadata.c` 中的 `kernel_files_utimensat()` 严格遵守以下判定优先级：
 
-musl 的 `futimens` 调用 utimensat(fd,NULL,times,0)。其 `statfs/fstatfs` 包装会先清零用户输出结构，所以验证坏输出指针必须调用 raw syscall，不能把 libc 自身用户态 fault 当作内核 errno。依据为固定 musl 1.2.5 的 `src/stat/{futimens,statvfs}.c`（来源及 SHA-256 见 `references/sources.tsv`）。
+1. **先拷入 `times[2]`**：若用户提供非空 `user_times`，先从用户态拷贝两个时间结构（非法指针直接返回 `-EFAULT`）；若两项纳秒字段均为 `UTIME_OMIT`（忽略不改），立刻返回 `0`，不做路径解析。
+2. **区分“描述符形式”与“路径形式”**：
+   - **描述符形式**（`user_path == NULL` 且 `dirfd != AT_FDCWD`，musl 的 `futimens()` 即采用此形式）：要求 `flags` 必须为 `0`（否则 `-EINVAL`），禁止对 `O_PATH` 描述符操作（`-EBADF`），且直接按底层 `inode` 修改，不受文件已被 `unlink` 的影响。
+   - **路径形式**（提供路径字符串，或空字符串配合 `AT_EMPTY_PATH`）：仅允许 `AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH` 标志，先完成路径解析再检查纳秒合法性与只读挂载（`-EROFS`）。
+3. **单次采样一致性**：后端只采样一次实时时钟，保证同时指定 `UTIME_NOW` 的字段与自动刷新的 `ctime` 严格相等；指定 `UTIME_OMIT` 的字段与父目录时间戳保持不变。
 
-## 验证
+> 在编写 ABI 对照测试时需留意 C 标准库封装差异：例如 musl 1.2.5 的 `statfs`/`fstatfs` 包装会在发起系统调用前先在用户态清零输出缓冲区，因此测试非法输出指针必须使用原始系统调用（raw syscall），避免把用户态自身触发的段错误误判为内核错误码。
+
+---
+
+## 三、ext4 磁盘时间编码与 2038/2106 边界
+
+ext4 支持两种 `inode` 尺寸，决定了时间戳的表示范围与精度：
+
+| `inode` 格式 | 磁盘存储字段 | 支持秒数范围与纳秒精度 |
+| :--- | :--- | :--- |
+| **传统 128 字节 `inode`** | 仅 32 位有符号秒字段 | `[-2147483648, 2147483647]`（1901–2038 年），纳秒固定为 `0` |
+| **扩展 `inode`（256 字节等）** | 32 位有符号基数 + `atime_extra`/`mtime_extra`/`ctime_extra`（2 位纪元 + 30 位纳秒） | `[-2147483648, 15032385535]`（覆盖至 2446 年），支持纳秒精度 |
+
+`fs/ext4_backend.c` 中的 `decode_inode_time()` 与 `normalize_time()` 同时核对磁盘超级块的 `inode_size` 以及当前 `inode` 自身的 `extra_isize`：
+
+- 只有当对应 `*_extra` 字段完整落在 `extra_isize` 范围内时，才启用扩展编解码，绝不把不存在的扩展字段越界写进下一个 `inode`。
+- 写入超过支持范围的时间值时，遵循 Linux `timestamp_truncate()` 规则：秒数截断至 `[INT32_MIN, maximum]`，且达到或越过边界端点时**清零纳秒**，同时确保 2038 年之后的无符号低 32 位配合纪元位正确解码，不被误解为负数。
+
+---
+
+## 四、文件所有权（`chown`）与共享扩展属性块
+
+文件 `inode` 上记录的 `uid`/`gid` 是对象自身元数据，与当前进程身份相互独立。匿名管道的属主元数据归共享管道对象持有，命名管道（FIFO）归 VFS `inode` 持有，两者互不混淆。
+
+BoarOS 的 `fchown`/`fchownat`（`fs/files/metadata.c`）与权限/模式辅助函数（`fs/vfs.c` 中的 `kernel_vfs_chown_allowed()`、`kernel_vfs_chown_mode()`）遵循以下规则：
+
+1. **路径与空路径区分**：与 `utimensat` 不同，`fchownat` 传入 `NULL` 路径指针返回 `-EFAULT`，传入空字符串配合 `AT_EMPTY_PATH` 才按 `dirfd` 指向的打开文件描述（包括无路径匿名管道与已 `unlink` 的 `inode`）修改属主。
+2. **时间戳与 set-ID 位处理**：`chown` 更新 `ctime`，不改变 `atime`/`mtime`；针对非目录文件，修改属主后清除 `S_ISUID` 位，且仅在组执行位（`S_IXGRP`）置位时清除 `S_ISGID` 位；目录则保留 set-ID 位，并在 `setgid` 目录下创建新对象时继承目录 GID。
+3. **ext4 双 16 位 UID/GID 与安全能力属性**：
+   - ext4 将 32 位 UID 与 GID 拆分为低 16 位和高 16 位两组磁盘字段存储，修改大编号 ID（如 `70001:80002`）必须同步更新高 16 位，避免截断成错误属主。
+   - 非目录执行 `chown` 还需移除关联的 `security.capability` 扩展属性，并与 UID/GID、`mode`、`ctime` 共享同一操作级撤销（undo）记录。
+   - 扩展属性既可能内联在扩展 `inode` 中，也可能存放在多个 `inode` 共享的外部扩展属性（EA）块中。修改共享 EA 块前必须先复制出私有副本，并同步维护旧块引用计数、新块校验和与 `inode` 占用扇区数；若操作中途失败，仅回滚本次修改，绝不破坏其他 `inode` 共享的属性块。删除 `inode` 时同样只递减自身对 EA 块的引用，仅在最后一份引用归零时释放物理块，防止位图误标空闲引发静默数据损坏。
+
+---
+
+## 五、失败语义、版本交错与同步边界
+
+为了在延迟写回与显式修改并发交错时不丢更新、不冒充持久化，BoarOS 在 `fs/ext4_backend.c` 中采用**暂存快照 + 字段版本比对**协议：
+
+- **写回延迟采样**：数据页写回直到真正获得事务准入资格后，才通过 `time_snapshot()` 捕获当前内存时间戳，避免排队等待期间发生的较新命名空间修改被陈旧快照覆盖。
+- **暂存失败不污染内存态**：显式设置时间或命名空间操作在事务准备阶段记录 `struct lwext4_staged_inode`。若准备失败（如内存不足）或事务回滚，暂存时间直接丢弃，内存与磁盘保持原值；事务提交成功后，仅清除那些**版本号未在期间继续递增**的脏字段标记，确保并发新到来的 `atime` 更新得以保留。
+- **区分读错误与同步边界**：
+  - 已知挂载错误在写路径拷贝用户数据前即刻返回；后续编码、日志提交或刷盘错误由节点、日志与挂载点持久保留，并在同步调用中上报。
+  - 读路径上的 `atime` 元数据错误按 Linux 语义绝不覆盖 `read()` 本身的成功返回值。
+  - 完整 `fsync()` 会先将脏时间戳编码进事务，再捕获持久化目标提交点；`fdatasync()` 保持“仅同步恢复数据所需元数据”的语义，纯时间戳脏位不会单独推进数据同步目标，但随数据页同事务编码的时间戳会一并落盘。
+
+---
+
+## 六、验证矩阵
+
+时间戳与所有权语义通过宿主级磁盘格式检验、内核日志事务测试及双架构 Linux 差分测试共同覆盖：
 
 ```sh
+# 真实 VFS / 日志线程交错测试（含无脏页 fsync、关闭后后台保存、无日志镜像后台写盘）
 make test-journal-group-riscv
+
+# 聚焦写进度与同步失败区分测试
 make test-files-partial-write-riscv
+
+# 宿主 128/256 字节 inode 时间边界（relatime/负纪元/2038/2106/e2fsck -fn）与属主/EA 测试
 make test-lwext4-host test-lwext4-metadata-host
+sh tests/host/lwext4-metadata.sh ownership
+
+# 用户态与同 ELF Linux 差分回归（含 utimensat、write maxbytes、pread 越界等全字段时间区间比对）
 make test-userland-riscv
 make test-diff-abi-riscv
 ```
 
-真实 VFS/journal worker 测试检查反复普通时间更新不增加操作事务、描述符共享可见性、
-显式事务 abort、较新 atime 与事务发布交错、OMIT、无脏数据页的 fsync、最后关闭后后台
-保存，以及卸载重挂后的时间值。无 journal 镜像另检查仅 atime 变脏后最后关闭文件，后台线程
-写入实际 inode-table 块并释放最后节点引用，不依赖显式同步或卸载。IRQ 唤醒交错由持有真实设备响应的 I/O sleep 测试检查，
-不以 QEMU 请求必须进入睡眠作为 journal 测试的前提。
-
-聚焦测试区分用户缓存写入进度与后续同步错误；journal 元数据错误不会被有效 fd 的历史 close 清理覆盖。host 显式时间故障测试验证准备 OOM 保持旧值、实际 write/flush 错误保留 sticky mount、重复重启恢复，并确认只改时间不主动写回无关 inode 数据。
-
-host 测试使用真实 128/256-byte inode ext4 镜像和控制时钟，覆盖未初始化时钟、只读挂载、
-relatime 相等/抑制/满 24 小时、负 epoch、2038/2106 边界、上限截断及纳秒编码；镜像最后经
-`e2fsck -fn` 检查。
-
-真实 musl 和固定 Linux 差分覆盖 create、write/read/pread、缓存命中、EOF、零长度、拒绝访问、
-首字节/部分 fault、同长度/扩大/缩小 truncate、unlink 及 unlink 后继续读写，并检查父目录。额外五组真实差分验证 write maxbytes 拒绝、pread 高地址（含零长度和 EOF）及原始 count 溢出的前置错误时机。
-原始观察保留全部时间字段及操作前后 CLOCK_REALTIME，不把时间戳归零后比较。
-Linux `current_time()` 可以取 coarse clock，所以操作区间在一次 50ms 等待前开始，
-比较实际变更字段是否落在完整区间内，以及字段相等/relatime 条件是否一致。
-显式 utimensat 差分另保留请求值、NOW/OMIT、纳秒、范围端点、fd/dirfd/nofollow、坏指针与错误优先级。当前更新时间的同步、挂载策略和映射行为见[VFS 模块](../modules/vfs-ext4.md)。
+在真实用户态差分对比中，测试不把时间戳归零比对，而是保留全部时间字段及操作前后 `CLOCK_REALTIME`（并在区间起始前留出 50 ms 窗口以兼容 Linux `current_time()` 粗粒度时钟特性），严格校验变更字段落入合法区间且相等/抑制关系与 Linux 一致；磁盘镜像测试最后均经独立 `e2fsck -fn` 校验格式完整性。

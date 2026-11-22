@@ -4,215 +4,218 @@
   <img src="assets/boaros_header.png" alt="BoarOS 吉祥物与字标" width="100%">
 </p>
 
-
 <p align="center">
-  <a href="docs/modules/riscv-boot.md"><img src="https://img.shields.io/badge/RISC--V-64--bit%20Sv39-blue?style=for-the-badge&logo=riscv&logoColor=white" alt="RISC-V 64"></a>
-  <a href="docs/modules/loongarch-boot.md"><img src="https://img.shields.io/badge/LoongArch-64--bit%20LA464-red?style=for-the-badge" alt="LoongArch 64"></a>
+  <a href="docs/modules/riscv-boot.md"><img src="https://img.shields.io/badge/RISC--V-64--bit%20Sv39-0369A1?style=for-the-badge&logo=riscv&logoColor=white" alt="RISC-V 64"></a>
+  <a href="docs/modules/loongarch-boot.md"><img src="https://img.shields.io/badge/LoongArch-64--bit%20LA464-9F1239?style=for-the-badge" alt="LoongArch 64"></a>
   <a href="docs/design.md"><img src="https://img.shields.io/badge/Kernel-Monolithic-059669?style=for-the-badge" alt="Monolithic Kernel"></a>
   <a href="docs/modules/kernel-syscall.md"><img src="https://img.shields.io/badge/Compatibility-Linux%20ABI-D97706?style=for-the-badge&logo=linux&logoColor=white" alt="Linux ABI Compatible"></a>
-  <a href="docs/modules/riscv-smp.md"><img src="https://img.shields.io/badge/SMP-1~8%20Cores-7C3AED?style=for-the-badge" alt="SMP 1~8 Cores"></a>
+  <a href="docs/modules/riscv-smp.md"><img src="https://img.shields.io/badge/SMP-1~8%20Cores-6D28D9?style=for-the-badge" alt="SMP 1~8 Cores"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPL--2.0-475569?style=for-the-badge" alt="License"></a>
 </p>
 
 ---
 
-## 📖 项目简介
+## 项目简介
 
-**BoarOS** 是面向 RISC-V 64 位与 LoongArch 64 位的单体内核，以兼容 Linux 用户态 ABI 为目标。内核主要用 C 编写，启动、异常入口和上下文切换使用架构汇编。
+**BoarOS** 是一个从零编写的、面向 **RISC-V 64** 与 **龙芯 LoongArch 64** 双架构的宏内核操作系统，以完整兼容 **Linux 应用二进制接口（Application Binary Interface，ABI）** 为设计目标。内核主体采用 GNU C11 编写，仅在启动引导、异常陷入与上下文切换等紧贴硬件的边界使用精简汇编，目前核心代码规模约 **14.6 万行**。
 
-目前在 QEMU virt 上验证，两种架构默认单核，多核版本可启动至八核。已运行基于 musl 和 glibc 的静态与动态 ELF，以及 BusyBox、SQLite 和 Lua 等程序。程序环境与运行方式见[程序环境](docs/modules/program-environment.md)；比赛适配在 `oscomp-compat` 分支维护，实板支持仍待验证。
+BoarOS 在 QEMU `virt` 虚拟平台上支持 **1～8 核对称多处理（Symmetric Multiprocessing，SMP）**，实现了 **273 个（RISC-V）/ 269 个（LoongArch）** Linux 系统调用。内核无需修改用户态源码，即可直接运行基于 `musl` 或 `glibc` 的静态与动态链接可执行文件（Executable and Linkable Format，ELF），已跑通 **BusyBox、SQLite、Lua、`strace`、原版 `bpftool`/`bpftrace`**，并支持在 BoarOS 客体机内完成**离线 C 语言预处理、编译、汇编、链接与执行**全流程。
+
+> [!NOTE]
+> **推荐阅读路线**
+> - 了解内核全局架构与多核并发模型：[系统总体架构设计](docs/design.md)
+> - 了解性能瓶颈归因方法与核心数据路径优化：[性能工程与关键优化](docs/performance.md)
+> - 了解内核兼容性与并发正确性的四层验证闭环：[正确性保证与验证体系](docs/verification.md)
+> - 全国大学生计算机系统能力大赛（OSComp）评测构建与赛题适配独立维护在 `oscomp-compat` 分支；真实开发板（VisionFive 2 与龙芯 2K1000LA）移植为后续独立阶段工作。
 
 ---
 
-## 🏛️ 内核架构
+## 核心技术亮点
 
-RISC-V 和 LoongArch 各自处理启动、异常入口、上下文切换和页表操作。系统调用进入内核后，由公共代码实现进程、内存、文件和网络接口。VirtIO 驱动通过各平台的传输接口访问设备；串口和 RTC 由平台代码接入。
-
-![BoarOS 内核架构：双架构异常入口与共用系统调用层，每核调度与跨核 TLB 失效，以及 ext4 和网络在调用核与 CPU0 的执行分工。](assets/kernel-architecture.svg)
+| 亮点方向 | 设计思路与达成能力 |
+| :--- | :--- |
+| **双架构真统一** | 通过构建期静态绑定接口，将 RISC-V 64（4 KiB 页、Sv39、设备树、VirtIO-MMIO）与 LoongArch 64（16 KiB 页、LA464、PCI/PCIe、VirtIO-PCI）的差异收敛在 `arch/` 与 `platform/`，上层调度、虚拟内存、文件系统、网络与扩展伯克利包过滤器（Extended Berkeley Packet Filter，eBPF）共享同一套内核源码，且不引入运行期虚函数表开销。 |
+| **真多核与分层锁序** | 采用“每核独立就绪队列 + 严格分层锁序 + 区间并发协调”的多核架构：虚拟内存支持不重叠区间的并发缺页与修改，ext4 支持多核目录级并行，传输控制协议（Transmission Control Protocol，TCP）已建立连接按四元组分片至归属核独立推进。 |
+| **面向瓶颈的体系化优化** | 内置 `COST_DIAGNOSTICS` 成本观测框架，按“执行、锁等待、业务排队、设备等待、唤醒延迟”五类时间做量化归因；据此落地了批量页表项发布、确认报文（Acknowledgment，ACK）合并、直连路由快照复用、VirtIO 队列合批、带保护页的内核栈缓存等系统级优化。 |
+| **现代 Linux 接口与原生 eBPF** | 除传统进程、信号与文件系统外，还实现了可写叠加文件系统（OverlayFS）、文件访问通知（`fanotify`）、挂载命名空间、原生大页、共享内存报文接收环（`TPACKET_V3`）以及 eBPF 校验器与解释器。内核构建时从自身调试信息生成 BPF 类型格式（BPF Type Format，BTF），供原版 `bpftool`、`libbpf` 与 `bpftrace` 使用。 |
+| **工业级四层验证闭环** | 建立了覆盖“宿主确定性并发与故障注入 → 同 ELF 上游 Linux 差分测试（主清单 1,744 项）→ 229 个真实用户程序矩阵与客体内离线编译 → 原版上游工具链校验”的自动化验证体系，确保行为语义与并发生命周期可重复核验。 |
 
 ---
 
-## 🧩 核心设计与子系统实现
+## 内核总体架构
+
+下图展示了用户空间、架构入口、内核子系统、设备驱动与硬件平台。系统调用由用户程序执行专用指令触发，缺页异常由处理器执行取指或访存时触发，设备中断由平台中断控制器送到 0 号核。三条路径都由对应架构接收，再按原因分别交给系统调用分派器、虚拟内存管理子系统或设备驱动。
+
+![BoarOS 内核总体架构。系统调用和缺页异常经双架构陷入入口分流，平台设备中断经 0 号核分派至驱动。](assets/kernel-architecture.svg)
+
+---
+
+## 核心子系统概览
 
 ### 1. 双架构抽象与平台适配
-- **RISC-V 64**：运行于 S-Mode（Supervisor Mode），由 OpenSBI 提供 SBI 服务。采用 4 KiB 页与 **Sv39** 三级页表；平台通过设备树发现设备，VirtIO 使用 MMIO 传输。
-- **LoongArch 64**：在 QEMU virt 的 **LA464** CPU 模型上运行，采用 16 KiB 页和三级页表。VirtIO 使用 PCI 传输；串口和 RTC 由平台代码接入。
-- **公共抽象层**：两种架构分别处理异常入口、寄存器切换、页表和硬件定时器，系统调用语义、调度、VFS 和网络由公共代码实现。
+- **RISC-V 64（RV64GC / Sv39）**：运行在监控模式（S-Mode），由 OpenSBI 固件提供定时器编程、从核启动（HSM）与远程页表缓存刷新（RFENCE）服务；采用 4 KiB 基页与 2 MiB 原生大页，支持双精度浮点（F/D）及向量扩展（RVV）上下文切换；通过扁平设备树（Flattened Device Tree，DTB）发现外设，VirtIO 使用内存映射输入输出（Memory-Mapped I/O，MMIO）传输。
+- **LoongArch 64（LA464）**：运行在内核特权级（PLV0），采用 16 KiB 基页与 32 MiB 原生大页，提供软件转换后备缓冲器（Translation Lookaside Buffer，TLB）重填与核间中断（Inter-Processor Interrupt，IPI）同步；支持浮点及 LSX/LASX 向量扩展；通过 PCI/PCIe 总线枚举设备，VirtIO 使用现代 PCI 传输。
+- **用户态加速通道（vDSO）**：双架构均内嵌虚拟动态共享对象（Virtual Dynamic Shared Object，vDSO），将高频时钟查询与信号处理返回蹦床（trampoline）直接映射到用户空间，减少不必要的内核态切换。
 
-### 2. 任务调度与多核 SMP
-- **Per-CPU 独立就绪队列**：每个 CPU 核心拥有独立的就绪任务队列，普通任务的入队、领取和运行权交接由所在 CPU 的队列保护；跨核控制仍协调共享状态。
-- **多核负载均衡与亲和性**：唤醒时按亲和性选择队列；空闲 CPU 可领取其他队列中允许迁移的就绪任务；已经忙碌的 CPU 也可按公平负载或实时优先级迁移候选。可用核数与具体负载的加速比是两回事。
-- **Futex 与快速同步机制**：支持等待、唤醒、重排、多地址等待（`futex_waitv`）和优先级继承，供 pthread 互斥锁和条件变量等使用。
-- **POSIX 信号体系**：支持实时信号与经典信号投递、专用信号栈 `sigaltstack` 以及通过 `sigreturn` 恢复被中断的执行现场。
+### 2. 任务调度、多核 SMP 与同步原语
+- **每核独立就绪队列**：每个处理器核独立维护自己的就绪队列。普通任务（`SCHED_OTHER` / `SCHED_BATCH` / `SCHED_IDLE`）按虚拟运行时间组织在平衡树中保证公平调度，并结合亲和性子树位图实现快速跨核窃取；实时任务（`SCHED_FIFO` / `SCHED_RR`）按 1～99 优先级分桶实现常数时间选取，并支持全局实时带宽限流，防止实时任务饿死普通任务。
+- **高效等待与同步机制**：引入基于全局单调代次的等待令牌，唤醒方在阻塞尚未提交时可通过原子状态跃迁直接完成通知（无锁快路径）；完整支持快速用户空间互斥锁（Fast Userspace Mutex，Futex）的等待、唤醒、队列重排、多地址等待（`futex_waitv`）以及优先级继承（Priority Inheritance，PI），满足标准多线程库（`pthread`）的互斥锁与条件变量需求。
+- **完整进程与信号体系**：支持进程/线程创建（`fork` / `vfork` / `clone` / `clone3`）、凭据与能力集（Capabilities）、PID/IPC/UTS/挂载命名空间、POSIX 标准与实时信号、专用信号栈以及进程调试跟踪（`ptrace`）。
 
-### 3. 现代虚拟内存体系（VMM）
-- **混合内存分配**：物理内存由页级伙伴系统（Buddy Allocator）统一管理，内核对象由细粒度 SLAB/堆分配器管理。
-- **虚存管理（VMA）**：按起始地址排序保存虚拟内存区域，用二分查找定位范围；每个区域记录访问权限及后备对象。
-- **按需调页与写时复制（CoW）**：ELF 和文件映射按需装页；`fork` 后，父子共享尚未修改的私有页，写入时再为写入方建立私有副本。
-- **跨核 TLB 一致性**：在 SMP 多核环境下，当发生虚存撤回或权限降级时，RV 使用 SBI RFENCE，LA 使用核间中断；在相关 CPU 确认旧地址转换已失效后，才归还退休的页。
+### 3. 现代虚拟内存管理（VMM）
+- **两级内存分配**：底层使用页级伙伴分配器（Buddy Allocator）管理连续物理页帧，支持多阶大页分配；上层使用细粒度对象分配器（Slab）管理内核小对象，降低碎片与锁争用。
+- **分层并发与区间认领**：同一地址空间内区分外层操作读写锁与内层虚拟内存区域（Virtual Memory Area，VMA）锁，并引入活动区间认领机制（`range_claim`），使互不重叠的匿名内存映射、缺页与解除映射能够在多核上真正并行。
+- **按需调页、写时复制与原生大页**：程序代码段与文件映射按需装入页帧；`fork` 后父子进程共享私有只读页，仅在首次写入时触发写时复制（Copy-on-Write，CoW）建立私有副本；支持 2 MiB（RV64）/ 32 MiB（LA64）原生大页，以及批量页表项发布与完整的内存锁定（`mlock`）/ 内存使用建议（`madvise`）语义。
+- **安全的跨核 TLB 一致性与用户内存访问**：解除映射或降权时，内核先确认所有可能缓存了旧地址映射的处理器核完成 TLB 失效，再延迟回收退役物理页与页表。RISC-V 在本核用户拷贝中直接访问用户虚拟地址并借助异常表精准恢复，省去逐页查软件页表的固定开销。
 
 ### 4. 虚拟文件系统（VFS）与存储持久化
-- **标准分层抽象**：VFS 分开维护路径、inode 和打开文件对象。改名后，已打开的 FD 仍指向原文件；`dup` 得到的 FD 共享打开对象及其文件位置。
-- **ext4 日志与页缓存**：文件数据经页缓存读写。带日志的 extent 文件在写入空洞时先预留空间，写回时再分配物理块。显式同步的数据写回可在调用核执行。多核时日志提交和 checkpoint 按在线核数选核，页缓存后台写回由 CPU0 推进；`fsync` 等待本次同步确定的持久化目标。
-- **多文件系统与挂载**：支持同时挂载 ext4、FAT32/VFAT、内存文件系统 tmpfs、进程状态文件系统 procfs 以及伪终端 devpts；支持挂载、bind、延迟卸载和 `chroot`；私有挂载命名空间可以复制挂载视图并隔离挂载变化。
+- **清晰的对象分层**：VFS 严格分离目录项（dentry，负责路径名称）、索引节点（inode，负责文件元数据与数据本体）以及打开文件描述（Open File Description，OFD，负责读写偏移与打开状态）。因此文件被重命名或删除后，已打开的描述符仍可正常读写；通过 `dup` 或 `fork` 继承的描述符共享同一读写偏移。
+- **高并发 ext4 与持久化保障**：文件读写与内存映射共用统一页缓存（Page Cache）；启用日志（JBD2）的 ext4 在写入文件空洞时采用延迟分配（先预留磁盘空间与元数据额度，写回时连续分配物理块以减少碎片）；多核下支持目录级并行读写锁，日志提交与检查点线程按挂载与在线核数选核执行；显式同步（`fsync`）严格等待对应事务与块设备 `FLUSH` 屏障落盘。
+- **丰富的文件系统生态与现代接口**：支持同时挂载 **ext4 / ext2、可写叠加文件系统（OverlayFS）、FAT32/VFAT、内存文件系统（tmpfs）、进程信息文件系统（procfs）、系统属性文件系统（sysfs）、伪终端（devpts）、跟踪文件系统（tracefs）与 BPF 文件系统（bpffs）**；支持 POSIX 访问控制列表（Access Control List，ACL）、扩展属性（xattr）、文件句柄重打开（`name_to_handle_at` / `open_by_handle_at`）、文件访问监控（`fanotify`）以及现代挂载配置接口（`fsopen` / `fsconfig` / `fsmount`）。
 
-### 5. 网络与事件等待
-- **网络协议**：使用 lwIP 处理 IPv4 TCP/UDP，与 IPv6 TCP/UDP，支持以太网链路本地地址、静态 IPv6 地址、SLAAC、默认路由和 MLDv1。用户数据复制和等待可在调用核执行。已建立的 TCP 连接由各归属核处理，UDP、监听和建连控制仍在 CPU0。IPv4 地址、掩码、MTU 和默认网关可在运行时配置。
-- **Linux 兼容 Socket API**：提供常用 Linux 套接字接口。UNIX 套接字还支持文件描述符传递与消息凭据。
-- **[BPF 过滤与跟踪](docs/modules/kernel-bpf.md)**：双架构共用校验器与解释器，提供 socket 过滤、map/bpffs/BTF、raw_syscalls tracepoint 和 ringbuf，供原版 bpftool、libbpf 与 bpftrace 使用。
-- **事件驱动多路复用**：通过 `epoll`、`poll` 和 `pselect` 等接口等待套接字、管道及事件 FD 的就绪状态。
+### 5. 多核网络协议栈、eBPF 与可观测性
+- **双栈协议与多核 TCP 分片**：基于 lwIP 深度定制，提供完整 IPv4 与 IPv6 的 TCP/UDP、无状态地址自动配置（SLAAC）、组播（IGMPv2 / MLDv1）以及原始 ICMP 套接字。多核下，已建立的 TCP 连接按四元组分片至归属核独立推进状态机，用户数据拷贝与阻塞等待留在调用核完成；同时支持相邻纯确认报文（ACK）合并、IPv4 直连路由快照复用以及回环连接直交快路径。
+- **套接字与共享报文环**。本地域套接字（`AF_UNIX`）支持传递文件描述符与进程凭据。链路层套接字（`AF_PACKET`）可将报文复制到共享内存接收环（`TPACKET_V3`），抓包程序映射该环后可直接读取整块报文，省去逐包接收系统调用和从环到用户缓冲区的复制。运行时网络配置使用 `rtnetlink`。
+- **原生 eBPF 与内置性能归因**：双架构共用静态安全校验器与每核独立解释器，支持 `ARRAY` / `HASH` / `PERCPU` / `RINGBUF` 等映射类型、套接字包过滤与 `raw_syscalls` 系统调用跟踪点；构建期利用 `pahole` 从内核自身调试信息生成真实 BTF 并挂载于 `/sys/kernel/btf/vmlinux`。调试构建还可开启 `COST_DIAGNOSTICS`，通过 `/proc/boaros_cost` 输出精细的内核时间与计数归因快照。
 
 ---
 
-## 📊 平台支持
+## 双平台特性对比
 
-| 特性 | RISC-V 64 平台 | 龙芯 LoongArch 64 平台 |
+| 特性维度 | RISC-V 64 平台 | LoongArch 64 平台 |
 | :--- | :--- | :--- |
-| **处理器架构** | RV64GC (Sv39) | LoongArch 64 (LA464) |
-| **运行级别** | S-Mode (Supervisor) | PLV0 (Kernel Privilege) |
-| **固件 / 引导** | OpenSBI | QEMU `-kernel` 与启动固件 |
-| **内存页大小** | 4 KiB | 16 KiB |
-| **MMU 页表级数** | 3 级页表 (Sv39) | 3 级页表 (Direct Map + Page Walk) |
-| **多核 SMP 支持** | 1 ~ 8 核 | 1 ~ 8 核 |
-| **外设总线** | VirtIO-MMIO | PCI / PCIe 总线 |
-| **浮点与 SIMD** | RV64D 双精度浮点，支持 V 的 CPU 提供 RV 向量寄存器上下文 | LA464 FR / LSX / LASX 向量扩展 |
-| **时钟源** | 架构计时器，期限由 SBI 设置 | 龙芯片上恒频时钟 + 硬件 RTC |
-| **运行与验证环境** | QEMU virt + OpenSBI（当前未适配实板） | QEMU virt + LA464（当前未适配实板） |
+| **处理器架构** | RV64GC（Sv39） | LoongArch 64（LA464） |
+| **内核特权级** | S-Mode（监管者模式） | PLV0（核心特权级） |
+| **引导方式** | OpenSBI 固件引导 | QEMU `-kernel` 直接引导 |
+| **页表与页大小** | 3 级页表 · 4 KiB 基页 / 2 MiB 大页 | 3 级页表 · 16 KiB 基页 / 32 MiB 大页 |
+| **多核 SMP 支持** | 1～8 核（OpenSBI HSM + RFENCE） | 1～8 核（IOCSR 邮箱 + 核间中断） |
+| **外设发现与总线** | 扁平设备树（DTB）· VirtIO-MMIO | PCI / PCIe 总线枚举 · VirtIO-PCI |
+| **浮点与向量扩展** | RV64D 双精度浮点 + RVV 向量上下文 | LA464 浮点 + LSX / LASX 向量上下文 |
+| **硬件时钟源** | 架构恒频计数器（SBI 编程定时器） | 片上恒频时钟 + 硬件实时时钟（RTC） |
+| **验证环境** | QEMU `virt` + OpenSBI（实板待适配） | QEMU `virt` + LA464（实板待适配） |
 
 ---
 
-## 🚀 快速上手
+## 快速上手
 
-### 构建并进入命令行
+### 方式一：一键编译并启动交互式 Shell
 
-在 Linux 上准备交叉工具链和 QEMU，再按目标架构选择一条命令。命令会构建内核、制作根盘并启动虚拟机。首次制盘会用 curl 下载静态 BusyBox，并用 e2fsprogs 制作 ext4 镜像。 [安装依赖和配置工具链](docs/toolchain.md)
+在 Linux 宿主上准备好交叉编译器与 QEMU 后（环境安装见 [工具链与环境指南](docs/toolchain.md)），一条命令即可完成内核编译、根文件系统镜像制作与虚拟机启动：
 
 ```sh
+# 编译并启动 RISC-V 64 交互式 Shell
 make shell-riscv
+
+# 编译并启动 LoongArch 64 交互式 Shell
 make shell-loongarch QEMU_LOONGARCH64=qemu-system-loongarch64
 ```
 
-LoongArch 命令中的 `QEMU_LOONGARCH64` 指定要运行的模拟器，可写程序名或绝对路径。
+> **提示**
+> - 首次制作根盘时会自动下载静态 BusyBox 并用 `e2fsprogs` 生成 ext4 镜像，缓存在 `build/rootfs/` 中，后续启动直接复用盘内数据。
+> - 内核构建默认离线编译仓库附带的 `pahole`（缓存于 `build/tools/pahole/`）以生成内核 BTF；若宿主机已安装 `pahole`，可追加 `PAHOLE=pahole` 直接调用系统版本。
+> - 看到 `Please press Enter to activate this console.` 后按回车进入 `/ #`，可执行 `ls /`、`uname -a` 等命令，输入 `poweroff -f` 安全关机。
 
-pahole 用来为内核生成类型信息。构建默认从仓库附带的源码编译它，并缓存到 `build/tools/pahole/`。已有系统 pahole 时，可在上面的命令后加 `PAHOLE=pahole`，让构建从 `PATH` 调用它。 [pahole 的构建依赖](docs/toolchain.md#从随仓库的源码构建-pahole)
+### 方式二：使用 Docker 容器零配置体验
 
-看到 `Please press Enter to activate this console.` 时按回车。进入 `/ #` 后可执行 `ls /`、`uname -a`，用 `poweroff -f` 关机。根盘存放在 `build/rootfs/`，后续启动会复用盘内改动。
-
-### 只编译内核
-
-```sh
-make            # RISC-V，生成 kernel-rv
-make kernel-la  # LoongArch，生成 kernel-la
-```
-
-只制作根盘时，使用 `make rootfs-riscv` 或 `make rootfs-loongarch`。
-
-<details>
-<summary>展开等价命令，指定工具路径、输出目录和虚拟机参数</summary>
-
-在仓库根目录执行下列其中一组命令。可将工具名换成绝对路径。示例使用独立的对象目录和根盘，首次制盘后可直接重复运行最后一条 QEMU 命令。
-
-**RISC-V**
+仓库提供与本地开发环境完全一致的 [Dockerfile](Dockerfile)（已预装双架构交叉工具链、QEMU 与 `pahole`）：
 
 ```sh
-# 改这里可以选择交叉工具链、模拟器、固件和客户机内存
-cross=riscv64-elf-
-rv_ld=riscv64-linux-gnu-ld
-qemu=qemu-system-riscv64
-firmware=default
-ram=1G
-
-# 对象文件、内核和根盘都放在这个目录下
-out="$PWD/build/manual-riscv"
-make -j"$(nproc)" CROSS_COMPILE="$cross" RV_VDSO_LD="$rv_ld" \
-  INIT_CONFIG=config/init.json BUILD_DIR="$out/obj" KERNEL_RV="$out/kernel-rv" "$out/kernel-rv"
-python3 -B tools/mkrootfs.py riscv64 "$out/root.img"
-
-# 使用 VirtIO 内存映射 I/O 块设备，串口接到当前终端
-"$qemu" -machine virt -bios "$firmware" -kernel "$out/kernel-rv" \
-  -m "$ram" -smp 1 -nographic -no-reboot -nic none \
-  -drive "file=$out/root.img,format=raw,if=none,id=root" \
-  -device virtio-blk-device,drive=root
-```
-
-**LoongArch**
-
-```sh
-# 按本机安装位置调整交叉编译器前缀和 QEMU 路径
-cross=loongarch64-unknown-linux-gnu-
-qemu=qemu-system-loongarch64
-ram=1G
-out="$PWD/build/manual-loongarch"
-
-# LA_BUILD 指定对象目录，KERNEL_LA 指定内核输出文件
-make -j"$(nproc)" LA_CROSS_COMPILE="$cross" \
-  INIT_CONFIG=config/init.json LA_BUILD="$out/obj" KERNEL_LA="$out/kernel-la" "$out/kernel-la"
-python3 -B tools/mkrootfs.py loongarch64 "$out/root.img"
-
-# 选择 LA464 处理器和现代 VirtIO PCI 块设备
-"$qemu" -machine virt -cpu la464 -kernel "$out/kernel-la" \
-  -m "$ram" -smp 1 -nographic -no-reboot -nic none \
-  -drive "file=$out/root.img,format=raw,if=none,id=root" \
-  -device virtio-blk-pci,drive=root,disable-legacy=on
-```
-
-以上命令使用默认单核内核。调整 `-smp` 前，RISC-V 需用 `SMP=1 USER_SMP=1 SMP_CPUS=4` 等参数编译对应容量的内核，LoongArch 需用 `LA_SMP=1 LA_SMP_CPUS=4` 等参数。给不同构建配置各自指定对象目录。
-
-</details>
-
-### 在 Docker 中构建和运行
-
-[Dockerfile](Dockerfile) 采用本地开发使用的 x86-64 Arch Linux 软件包版本和 LoongArch 交叉工具链。构建镜像后，在同一仓库根目录挂载源码并启动。
-
-```sh
+# 1. 构建开发镜像
 docker build --platform linux/amd64 -t boaros-dev .
 
-# 挂载当前仓库，以宿主用户身份写入内核和根盘
+# 2. 挂载仓库目录并启动 RISC-V 交互式 Shell（启动 LoongArch 将 shell-riscv 换为 shell-loongarch）
 docker run --rm -it --user "$(id -u):$(id -g)" \
   --mount "type=bind,source=$PWD,target=/workspace" \
   boaros-dev make -j4 shell-riscv
 ```
 
-启动 LoongArch 时将最后的 `shell-riscv` 换成 `shell-loongarch`。镜像已设置 `PAHOLE` 和 `QEMU_LOONGARCH64`。工具版本与宿主配置见[工具链指南](docs/toolchain.md)。
+### 方式三：仅编译内核或手动指定虚拟机参数
 
-开发和回归检查见[贡献指南](CONTRIBUTING.md)。
+```sh
+make            # 编译 RISC-V 64 内核 -> kernel-rv
+make kernel-la  # 编译 LoongArch 64 内核 -> kernel-la
+```
+
+<details>
+<summary>展开查看：手动指定工具链路径、构建多核内核与完整 QEMU 启动命令</summary>
+
+在仓库根目录执行以下任一组命令，对象文件、内核与根盘均输出在独立的 `build/manual-*` 目录中，互不污染。
+
+**RISC-V 64（单核默认；多核构建可追加 `SMP=1 USER_SMP=1 SMP_CPUS=4` 并同步调整 `-smp 4`）：**
+
+```sh
+cross=riscv64-elf-
+rv_ld=riscv64-linux-gnu-ld
+qemu=qemu-system-riscv64
+out="$PWD/build/manual-riscv"
+
+make -j"$(nproc)" CROSS_COMPILE="$cross" RV_VDSO_LD="$rv_ld" \
+  INIT_CONFIG=config/init.json BUILD_DIR="$out/obj" KERNEL_RV="$out/kernel-rv" "$out/kernel-rv"
+python3 -B tools/mkrootfs.py riscv64 "$out/root.img"
+
+"$qemu" -machine virt -bios default -kernel "$out/kernel-rv" \
+  -m 1G -smp 1 -nographic -no-reboot -nic none \
+  -drive "file=$out/root.img,format=raw,if=none,id=root" \
+  -device virtio-blk-device,drive=root
+```
+
+**LoongArch 64（单核默认；多核构建可追加 `LA_SMP=1 LA_SMP_CPUS=4` 并同步调整 `-smp 4`）：**
+
+```sh
+cross=loongarch64-unknown-linux-gnu-
+qemu=qemu-system-loongarch64
+out="$PWD/build/manual-loongarch"
+
+make -j"$(nproc)" LA_CROSS_COMPILE="$cross" \
+  INIT_CONFIG=config/init.json LA_BUILD="$out/obj" KERNEL_LA="$out/kernel-la" "$out/kernel-la"
+python3 -B tools/mkrootfs.py loongarch64 "$out/root.img"
+
+"$qemu" -machine virt -cpu la464 -kernel "$out/kernel-la" \
+  -m 1G -smp 1 -nographic -no-reboot -nic none \
+  -drive "file=$out/root.img,format=raw,if=none,id=root" \
+  -device virtio-blk-pci,drive=root,disable-legacy=on
+```
+
+</details>
 
 ---
 
-## 📂 目录结构
+## 仓库目录结构
 
-```
+```text
 BoarOS/
-├── arch/            # 体系结构相关实现（启动汇编、Trap 陷入、上下文切换、MMU）
-│   ├── riscv/       # RISC-V 64 专用源码（启动、异常入口、Sv39）
-│   └── loongarch/   # LoongArch 64 专用源码 (boot.S, tlb_refill.S, mmu.c 等)
-├── kernel/          # 通用启动、调度、系统调用、程序装载、信号、时钟、IPC 与物理页分配
-│   ├── sched/       # SMP 抢占式调度器、就绪队列、Futex
-│   └── syscall/     # Linux 系统调用统一分发与具体处理
-├── mm/              # 地址空间、VMA、缺页处理、用户内存访问与内核堆
-├── fs/              # 虚拟文件系统（VFS、ext4 事务日志实现、FAT32、tmpfs、procfs）
-├── net/             # 网络子系统（Socket 接口、以太网适配、lwIP 移植接入）
-├── drivers/         # 外设与总线驱动（VirtIO 块设备/网卡/RNG、PCI 总线、串口）
-├── platform/        # 平台初始化（RISC-V virt 平台、LoongArch virt 平台）
-├── include/         # 内核公共头文件与 Linux UAPI 兼容定义
-├── lib/             # 独立通用的基础 C 运行库函数（字符串、排序等）
-├── third_party/     # lwext4、lwIP 等第三方源码
-├── tests/           # 单元测试、集成测试、差分对比测试套件
-├── tools/           # 镜像制作、构建配置辅助脚本
-├── references/      # 外部规范、源码与本地构建输入
-├── sdcard/          # 本地评测原盘，按发布版本放置（Git 忽略）
-└── docs/            # 系统设计文档、模块说明与技术记录
+├── arch/            # 体系结构相关实现（启动汇编、陷入入口、上下文切换、MMU、向量现场）
+│   ├── riscv/       # RISC-V 64 平台（Sv39、OpenSBI、PLIC、VirtIO-MMIO、直接用户拷贝）
+│   └── loongarch/   # LoongArch 64 平台（16 KiB 三级页表、软件 TLB 重填、IPI、LSX/LASX）
+├── kernel/          # 内核公共核心（启动、调度器、系统调用、BPF、信号、时钟、IPC、页帧分配）
+│   ├── sched/       # SMP 抢占式调度器、每核就绪队列、分层锁、等待原语与 Futex
+│   ├── syscall/     # Linux 系统调用统一分发与各接口族处理
+│   └── bpf/         # eBPF/cBPF 校验器、解释器、Map、BTF 与 tracepoint 跟踪
+├── mm/              # 虚拟地址空间、VMA、区间并发协调、缺页处理、原生大页与内核 Slab 堆
+├── fs/              # 虚拟文件系统（VFS、页缓存、ext4/ext2、OverlayFS、FAT32、tmpfs、procfs 等）
+├── net/             # 网络子系统（多核 TCP 分片、Socket 端点、TPACKET_V3、rtnetlink、lwIP 适配）
+├── drivers/         # 外设与总线驱动（VirtIO 块设备 / 网卡 / RNG、PCI 总线、16550A 串口）
+├── platform/        # 平台级硬件初始化与中断路由（RISC-V virt、LoongArch virt）
+├── vdso/            # 内嵌用户态虚拟动态共享对象（时钟快路径与信号返回蹦床）
+├── include/         # 内核公共头文件、架构抽象契约与 Linux UAPI 兼容定义
+├── lib/             # 独立内核基础库函数
+├── third_party/     # 第三方开源组件源码（lwext4、lwIP、离线 pahole/elfutils 归档）
+├── tests/           # 四层验证套件（宿主并发测试、双架构启动测试、Linux 差分测试、性能实验）
+├── tools/           # 根盘制作、BTF 嵌入、工具链构建脚本
+└── docs/            # 系统架构设计、性能优化、验证体系与全子系统技术手册
 ```
 
 ---
 
-## 📚 文档索引
+## 文档导航
 
-更深入的设计考量与实现细节，请参考以下专题文档：
-
-- 📐 **共同设计契约**：[内核接口、并发与持久化约定](docs/design.md)
-- 🧭 **文档中心与导航**：[完整文档索引目录](docs/README.md)
-- 🛠️ **工具链与环境**：[交叉编译器与 QEMU 配置指南](docs/toolchain.md)
-- 🎯 **开发路线**：[未完成工作](docs/goals.md)
-- 📦 **第三方组件授权**：[第三方开源组件说明](docs/third-party.md)
-- 🤝 **参与贡献**：[贡献指南](CONTRIBUTING.md)
+| 文档 | 核心内容 |
+| :--- | :--- |
+| **[系统总体架构设计](docs/design.md)** | 双架构解耦设计、两级分层锁序模型、多核执行分工、对象生命周期与持久化契约 |
+| **[性能工程与关键优化](docs/performance.md)** | `COST_DIAGNOSTICS` 成本归因方法论与五大子系统核心优化的设计剖析 |
+| **[正确性保证与验证体系](docs/verification.md)** | 宿主并发与故障注入、同 ELF Linux 差分验证（1,744 项）、229 真实程序与离线自编译 |
+| **[完整文档中心](docs/README.md)** | 全仓库 60+ 篇子系统技术手册、机制专题与参考文档的分类索引 |
+| **[工具链与环境指南](docs/toolchain.md)** | RISC-V / LoongArch 交叉编译环境、QEMU 模拟器与 Docker 镜像配置 |
+| **[演进路线与待完成项](docs/goals.md)** | 当前边界说明、多核扩展规划、功能缺口与实板移植路线 |
+| **[第三方组件与许可](docs/third-party.md)** | 第三方开源代码来源、版本、本地修改边界与开源协议清单 |
+| **[参与贡献指南](CONTRIBUTING.md)** | 编码风格、测试规范、文档约定与 Git 提交格式 |

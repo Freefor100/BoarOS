@@ -1,202 +1,78 @@
-# 内核信号模块
+# POSIX 信号机制
 
-本文记录待决信号、用户 handler、signalfd 和可中断等待的当前契约。任务生命周期见[调度模块](kernel-scheduler.md)，用户态边界见[系统调用模块](kernel-syscall.md)。
+POSIX 信号是操作系统向进程或线程异步通知异常（如非法访存 `SIGSEGV`、算术异常 `SIGFPE`）、作业控制（停止/继续）以及外部事件的经典机制。BoarOS 在 `kernel/sched/signal.c`、`kernel/signal_pending.c`、`kernel/signal_stack.c` 与双架构陷入层中，完整实现了标准信号与实时信号队列、信号屏蔽掩码、专用信号栈、虚拟动态共享对象（vDSO）返回蹦床以及系统调用自动重启协议。
 
-## 职责与入口
+---
 
-- `fs/signal_fd.c`：共享FD接收掩码、128字节输出及调用线程的读取和就绪查询。
-- `kernel/signal_stack.c`：每线程备用栈登记、选择、边界与自动停用；
-- `kernel/sched/signal.c`：pending/blocked、disposition、默认动作、stop/continue、进程通知和重启策略。
-- `arch/riscv/signal.c`、`include/arch/riscv/signal.h`：RISC-V 信号帧编码、寄存器恢复和用户返回尾。
-- `arch/loongarch/signal.c`、`include/arch/loongarch/signal.h`：LA 整数/FP/LSX/LASX帧、END终止记录与ERA/GPR恢复；同样调用通用选择和重启策略。
-- `kernel/syscall/signal.c`：信号 syscall 的输入快照、状态提交及 errno；`kernel/syscall/time.c`：等待 deadline 和 restart_syscall。
-- `kernel/sched/private.h`：任务私有信号状态。syscall 不直接访问任务布局。
+## 一、源码组织
 
-## 状态与生命周期
+| 源码路径 | 核心职责 |
+| :--- | :--- |
+| `kernel/sched/signal.c`、`kernel/syscall/signal.c` | 信号发送、处置动作表（`sigaction`）、屏蔽掩码、作业控制停止/继续与自动重启决策 |
+| `kernel/signal_pending.c` | 经典信号位图合并、实时信号队列（`slots[64]`）与按 UID 计费的 `RLIMIT_SIGPENDING` |
+| `kernel/signal_stack.c` | 线程专用信号栈（`sigaltstack`，`SS_ONSTACK` / `SS_DISABLE` / `SS_AUTODISARM`） |
+| `arch/riscv/signal.c`、`arch/loongarch/signal.c` | 用户态信号帧（`siginfo_t` + `ucontext_t` + 浮点/向量扩展上下文）构造与 `rt_sigreturn` 恢复 |
+| `vdso/sigreturn.S` | 内嵌于 vDSO 的统一用户态信号返回蹦床（`__vdso_rt_sigreturn`） |
 
-每个线程使用 64 位 pending/blocked 位图，位 `sig-1` 对应信号；组长另持进程定向 pending。重复标准信号合并并保留首个 sender，handler 由一个未屏蔽成员执行。disposition 表按需分配一页，CLONE_SIGHAND 按引用共享，即使任务属于不同线程组；普通 fork 复制当时的表和调用线程 mask，清空 child pending。clone3 的 CLONE_CLEAR_SIGHAND 在新建的独立表中把自定义处理恢复默认，保留 SIG_IGN，并清除每项动作的 flags 和 mask；调用线程的 blocked mask 仍由 child 继承，父表不受影响。未分配表的独立任务以出生 PID 代次表示 SIGHAND 身份，分配后在表尾继承该值，线程共享沿用同一身份；两个空表指针不代表共享。信号表引用保留到任务身份已撤下且存储借用结束，因而僵尸仍保留 SIGHAND 身份；最终 collector 在锁外完成等待源关闭与页面归还。exec 收拢组后先分离仍由其他任务共享的 disposition 表，再重置自定义 handler；忽略 disposition、mask 和仍有效 pending 保留。SIGKILL/SIGSTOP 不能捕获、忽略或阻塞。
+---
 
-`SA_RESETHAND` 在交付时只将处理动作恢复为默认值，保留已登记的 action flags 和 mask，后续 rt_sigaction 查询仍可观察这些设置。
+## 二、信号排队、屏蔽掩码与投递优先级
 
-用户返回直接观察线程及组 pending 中未屏蔽的位；没有可交付信号、故障、退出请求或临时掩码恢复时立即返回，不取得锁；完整事件交付保留独立调用边界，使其临时载荷和保存寄存器留在有事件的路径。两架构返回尾先完成信号选择与重启决定，只有实际构造 handler 帧时才查询 MM；普通返回、忽略和重启不借用未使用的 MM。等待者的 wait_mask 不参与交付判断，被屏蔽的信号仍留给 sigtimedwait。需要处理事件时在调度 raw 内重取位与载荷；并发新增信号仍通过既有通知请求返回检查。
+### 2.1 标准信号与实时信号队列
 
-默认动作包括忽略、继续、停止、终止和core动作；MM 的所有执行者属于同一线程组时支持下述 ELF core 文件；wait 状态反映实际是否写出转储头与 notes，不能把收到 core 信号当作成功。SIGCONT 清除所有 pending stop 信号并恢复 stopped task；发送任一 stop 信号清除 pending SIGCONT。这些取消规则不依赖信号是否被阻塞。孤儿停止组的退出/reparent 事件发送 SIGHUP 后 SIGCONT；SI_KERNEL=128 同时贯通 sigtimedwait 与 SA_SIGINFO 用户帧。已孤儿组的默认 TSTP/TTIN/TTOU 不再停止任务，SIGSTOP 不受此规则影响。
+内核为每个线程维护私有待处理集合（`signal_pending`），为整个线程组维护进程共享待处理集合（`group_pending`），统一支持 1～64 号信号：
 
-SIGCHLD 的默认忽略不同于显式 SIG_IGN：默认仍保留 zombie 供 wait4 回收；显式 SIG_IGN 或 SA_NOCLDWAIT 在全组退出资源清理完成后自动回收。SA_NOCLDWAIT 不抑制退出通知，包括被阻塞的默认 SIGCHLD；SA_NOCLDSTOP 单独控制 stop/continue 通知。默认 SIGCHLD 被阻塞时，停止和继续也进入 pending，显式 SIG_IGN 则不进入。清理失败保留 task/owner，由 cleanup context 重试，不能丢失父进程的唤醒。kill 使用组 pending，tkill/tgkill 与同步产生的 SIGPIPE 使用线程 pending；SIGKILL 和默认致命动作终止全组。用户发送（含 signal=0）按调用者 real/effective UID 与目标 real/saved UID、CAP_KILL 判断；同线程组以及同 session 的 SIGCONT 保留对应许可。进程组内至少一个目标获准即成功，只有存在目标且全部无权限时返回 EPERM。内核产生的 TTY、故障和定时器事件沿其原有来源递送。 指定 PID/TID 的进程定向发送，授权和 UID 计费使用原目标线程；共享队列归组容器，唤醒者另行选择。线程用原始 syscall 改成不同身份时，也不会把这三个对象的身份混用。
+- **标准信号（1～31）**：未携带扩展负载时直接按 64 位位图合并（同号未决信号只保留一次）；若来自显式负载接口（如 `sigqueue`）或携带非零发件人身份，则分配独立队列记录以保留 `siginfo_t` 上下文。
+- **实时信号（32～64）**：严格按先入先出顺序排队在 `kernel_signal_queue.slots[64]` 中（每个队列常驻一个预分配备用槽 `spare`），不合并重复信号，并受发件人真实 UID 账户的 `RLIMIT_SIGPENDING` 配额（默认 4,096）约束，超限时用户态发送返回 `-EAGAIN`；POSIX 定时器则在创建时提前预留队列额度，确保到期投递不会因内存不足丢失。
+- **同步异常优先投递**：当返回用户态同时存在多个未决信号时，`signal_first_set()` 优先挑选硬件/同步异常类信号（`SIGILL=4`、`SIGTRAP=5`、`SIGBUS=7`、`SIGFPE=8`、`SIGSEGV=11`、`SIGSYS=31`），防止异步定时器信号掩盖刚刚发生的指令故障。
 
-`PR_SET_PDEATHSIG` 给调用线程设置 1～64 号信号，0 取消。fork 和线程 clone 创建的线程初值为 0。普通 exec 保留配置；secureexec、有效或文件系统 UID/GID 改变、permitted capabilities 增加时清除。单独设置 dumpable 保留配置。
+### 2.2 屏蔽掩码与临时掩码切换
 
-创建子进程的父线程退出时，即使父组内还有其他线程，每个已设置信号的子线程都可产生一次组定向发送。按退出父线程和各子线程的凭据检查许可，`SI_USER` 携带父进程 TGID 和父线程的真实 UID。变更实际父线程关系时保存信号，持有子组 PID 身份并在调度保护外投递到共享 pending；标准信号按原规则合并，实时信号分别排队。收养线程以后退出时按当时的配置再次发送。ptrace 的跟踪者关系独立于实际父线程。
+- 每个线程持有 64 位 `signal_blocked` 屏蔽掩码，但 `SIGKILL(9)` 与 `SIGSTOP(19)` 永远不可阻塞或捕获（由 `KERNEL_SIGNAL_UNBLOCKABLE_MASK` 强制放行）。
+- 支持两类原子临时掩码机制：`sigsuspend` 使用 `MASK_RESTORE_ON_HANDLER`（调用信号处理函数后在返回现场自动恢复旧掩码）；`ppoll`、`pselect6`、`epoll_pwait` 与 `io_pgetevents` 使用 `MASK_RESTORE_AFTER_WAIT`（等待返回或进入信号帧时精确恢复原掩码，杜绝“先改掩码再阻塞”的竞态窗口）。
 
-## 待决记录与计费
+---
 
-pending位图是就绪摘要。普通标准信号继续在任务原有字段保存首条来源；实时信号及完整用户载荷使用按需分配的记录。每个线程和线程组各有一个按信号编号分槽的FIFO索引，出队不遍历其他信号的记录；handler、sigtimedwait和signalfd共用一次出队和128字节siginfo快照。消费直接填写调用者的输出：内联事件先清零再填写有效字段，排队记录完整覆盖；handler的输出就是本线程delivery载荷，原生定时器在锁外完成期间继续借用这块存储，构帧前归还，不再暂存并复制载荷。同类标准信号合并，同类实时信号按FIFO；线程pending先于共享pending，每个集合按固定Linux的同步信号优先规则选择。
+## 三、用户态信号帧、专用栈与 vDSO 返回蹦床
 
-候选索引和缺少的记录在锁外分配，位图、记录和额度在调度短锁内共同发布。每个已建立的线程／组队列最多保存一个已消费的普通记录，下一次准备在同一保护内取走，随后由发送调用独占；它无需借用旧队列，目标退出不影响候选存储。消费时立即扣除额度并在锁外归还原UID账户，空闲记录不持有账户或定时器；其余记录和批量清除的记录沿原路径锁外释放。原生POSIX timer预留记录继续归timer所有。这个有界复用避免往返信号在每次清空队列时释放空slab、下一次再拆分物理页；RV/LA的记录实际落入256字节堆档位，每队列最多保留这一份存储。默认终止和停止动作先完成已摘记录的处理，再进入生命周期切换；空闲记录和索引随所属线程／线程组退出归还。组长交接在同一保护内移动共享索引和计费状态。fork的child无待决记录，exec保留有效pending；忽略动作、stop/continue取消和退出均使用共同清除路径。
+当线程从系统调用或异常返回用户态前检测到可递送的捕获型信号，架构层完成**“构帧 → 跳转用户处理函数 → 蹦床触发 `rt_sigreturn` → 完整恢复现场”**闭环：
 
-`RLIMIT_SIGPENDING(11)`默认软／硬额度4096，同组共享、fork复制、exec保留。使用量按接收目标的真实 UID 汇总，接纳按目标线程组的软额度判断，`/proc/<pid>/status`的`SigQ`展示使用量／额度。下调额度保留已有消息。实时排队发送额度不足返回EAGAIN；普通kill保留至少一个待决位，并按Linux允许丢失附带信息。标准信号合并不重复计费。每条队列记录及原生定时器预留持有接纳账户；内联标准信号共用一个账户引用。线程改 UID 后，旧事件继续向原账户归还额度，新账户事件在必要时使用已有队列记录；非零来源 UID 也由记录保存。没有记录存储时的普通 kill 沿 Linux 退化为不含来源的待决位。`make test-signal-pending-host`在4/16KiB页检查FIFO、跨组额度、候选竞争、分配失败、改 UID 后的账户归还、交接和最终归还。
+```mermaid
+sequenceDiagram
+    participant User as 用户线程原执行流
+    participant Trap as 架构陷入返回层（arch/*/signal.c）
+    participant VDSO as vDSO 蹦床（__vdso_rt_sigreturn）
 
-`tkill/tgkill`及`rt_sigqueueinfo(138)`、`rt_tgsigqueueinfo(240)`的普通／实时信号在发起CPU解析目标并排队。SIGKILL、SIGCONT及stop类发送即时改变组状态，仍取得CPU0服务资格；`kill`和pidfd发送保留现有执行位置。两条发送接口保留完整si_code、来源与64位sigval。进程定向发送持有实际PID身份，候选分配后按同一身份重新取得当前组容器及存活接收者；外部线程定向发送在目标查找保护内取得任务存储借用和TID代次，授权与组容器取得使用同一次保护快照；接纳前仍复核权限与代次，覆盖候选分配期间的改身份、退出与非组长exec。向当前执行线程发送时，执行资格已持有线程和组成员身份，复用其稳定TID与组容器；发布后沿用户返回检查处理，无需另做等待者唤醒。线程路径只比较代次，避免为不跨解锁访问的PID对象增加引用；非组长TID也可作为进程定向发送目标。候选由存活接收者的root堆分配，组容器只持有队列，退出的组长仍可保存存活组的待决记录；有效僵尸身份接受信号但不新增记录。额度耗尽时实时sigqueue和tgkill返回EAGAIN，普通kill保留待决事件。用户输入按固定Linux先导入48字节有效区；已知布局不读取未使用的80字节，未知布局检查扩展全零，否则E2BIG。输入EFAULT先于后续目标和来源检查。
+    User->>Trap: 系统调用/异常返回前检测到未决捕获信号
+    Trap->>Trap: 1. 选择目标栈（普通用户栈或 sigaltstack 专用栈）
+    Trap->>Trap: 2. 压入 128B siginfo_t + ucontext_t（含通用寄存器、旧掩码、FPU/向量上下文）
+    Trap->>Trap: 3. 修改返回 PC 指向 handler，设置返回地址 ra 指向 vDSO 蹦床
+    Trap-->>User: 4. 切换回用户态执行信号处理函数 handler(sig, info, uctx)
+    User->>VDSO: 5. handler 执行 return，自动跳转至 __vdso_rt_sigreturn
+    VDSO->>Trap: 6. 发起 rt_sigreturn(139) 系统调用
+    Trap->>Trap: 7. 校验并恢复原通用寄存器、浮点/向量现场、信号掩码与原栈状态
+    Trap-->>User: 8. 无缝回到被中断的原指令继续执行
+```
 
-handler与sigtimedwait取得同一规范记录，用户输出在消费之后发生；子进程退出通知带真实组CPU用量，STOP/CONT携带被报告线程的CPU用量；快照包含尚未归入累计字段的执行片段，单位为100Hz用户时钟tick。SIGCHLD使用任务尾部的紧凑状态，其他退出信号通过完整记录保留状态和用量。内核编号32～64均支持；libc预留编号由raw syscall短例覆盖。
+- **专用信号栈（`sigaltstack`）**：允许进程为信号处理函数预先注册独立栈区（RISC-V 最小栈要求 `2,048` 字节，LoongArch 最小 `4,096` 字节），即使主线程栈溢出触发 `SIGSEGV`，依然能安全在备用栈上执行崩溃处理；支持 `SS_AUTODISARM` 在进入信号处理时自动解除备用栈激活状态。
+- **浮点与向量扩展现场保全**：RISC-V 信号帧保存 F/D 浮点与 `RISCV_VECTOR_MAGIC` 向量状态；LoongArch 信号帧使用标准扩展块魔数分别保存 FPU（`0x46505501`）、LSX（`0x53580001`）与 LASX（`0x41535801`）上下文，确保信号处理函数内使用浮点/SIMD 指令不会破坏主程序计算结果。
 
-原生POSIX定时器的通知使用创建时预留记录和额度，凭内部来源识别重装行为；handler、sigwaitinfo和signalfd在消费时共用代次核对和超期计算。单次已到期查询、忽略停放、进程组控制与对象寿命见[POSIX定时器](kernel-time.md#posix-定时器对象)。
+---
 
+## 四、系统调用自动重启（`ERESTART*`）与多核执行边界
 
-## SIGIO 异步 I/O 通知
+- **系统调用自动重启**：当阻塞在慢速系统调用（如 `read`、`futex`、`nanosleep`）的线程被信号打断时，系统调用层向陷入边界登记内部重启类型（通用重启 `GENERIC`、无处理函数重启 `NOHAND`、`nanosleep` 重启或带超时 `futex` 重启）。在信号递送决策点，`kernel_signal_restart_decide()` 按以下规则处理：
+  - 若触发了带 `SA_RESTART` 的处理函数或未执行用户处理函数（如作业控制停止后恢复），则按类型选择**回退原 `PC` 重试**（`RESTART_RETRY`）或将系统调用号改为 `restart_syscall(128)` 继续等待剩余超时（`RESTART_BLOCK`）；
+  - 否则按常规返回 `-EINTR` 并推进 `PC += 4`。
+- **多核执行分工（SMP）**：信号队列、屏蔽掩码与动作表受 `kernel_wait_domain` 保护。在 `USER_SMP` 模式下，**普通私有信号选择、用户态信号帧构造与 `rt_sigreturn` 恢复直接在当前执行核本地完成**，无需迁回 CPU0；涉及整个线程组同步的作业控制停止（`SIGSTOP`/`SIGTSTP`）与 `sigsuspend` 协调则沿受控 CPU0 服务域推进。
 
-`F_SETOWN/F_SETOWN_EX` 在 OFD 中保存目标的 PID 身份引用、目标种类及设置者的 real/effective UID；dup、fork 和 FD 传递共用这份配置。投递时对原目标线程的当前 real/saved UID 检查权限，随后按线程、进程或进程组选择队列；进程定向 owner 指向非组长 TID 时仍使用该线程授权，共享 pending 归其线程组。退出或 exec 撤下原身份后，不按复用的数字寻找新目标。
+---
 
-管道、socket、TTY 和 inotify 从实际事件发布 `POLL_IN/OUT/ERR/HUP` 等原因，异步订阅与普通 poll 唤醒分开维护。源对象保护内捕获游标借用，保护外执行通知；`si_fd` 保留启用时的编号，别名上的无变化 `F_SETFL` 不改变它。最后 OFD 关闭先撤下订阅并结束所有回调借用，再释放配置及后备。
+<details>
+<summary>展开查看：定向验证入口</summary>
 
-未设置替代信号时发送普通 SIGIO，使用 `SI_KERNEL`。`F_SETSIG` 选择的信号携带完整的 `si_code/si_band/si_fd`，共用 handler、sigtimedwait 和 signalfd 的消费过程；与故障或子进程代码歧义的信号使用 `SI_SIGIO`。实时通知逐事件排队，额度或记录分配不足时按 Linux 回退为普通 SIGIO，不改变已经完成的 I/O 结果。
+- **同 ELF Linux 信号与返回帧差分**：`tests/diff-abi/signals.c`、`tests/diff-abi/sigreturn.c`、`make test-diff-abi-riscv`。
+- **专用栈、自动重启与浮点/向量信号现场**：`tests/workloads/signal/`、`tests/userland/riscv-vector.py`。
+- **多核并发信号与组停止**：`make test-user-smp-riscv`、`make test-user-smp-composition-riscv`。
 
-通知回调不进入内存回收或等待：信号索引及记录使用同一 slab/buddy 实现的一次尝试分配，所有候选准备均在源对象短保护外。SIGCONT 的恢复及其父进程 SIGCHLD 通知沿用同一非阻塞发送方式，保留 stop/continue 取消及组恢复规则；未采用的候选和消费后的记录仍由原释放路径归还。
-
-## signalfd与等待源
-
-`signalfd4(74)`创建独立OFD，保存接收掩码；dup/fork共享该掩码和NONBLOCK状态，CLOEXEC属于FD槽。更新已有FD只替换掩码，创建标志不改变现有FD。SIGKILL/SIGSTOP从接收集合移除，信号的blocked掩码由线程另行维护。
-
-每次read、readv和就绪查询都使用实际调用线程的线程pending及线程组pending。继承FD读取child自己的信号；epoll在ADD时登记的是当时调用线程的共享disposition等待源，fork复制disposition动作但创建新的等待队列。child需要重新登记，才能等待自己的信号通知。FD不持有创建者task或disposition引用。
-
-出队、计费和等待登记在同一调度短锁内完成，记录释放、用户复制和唤醒在锁外。首条消费后输出故障返回EFAULT；后续故障返回此前完整128字节记录数，发生故障的事件同样已消费。普通读要求至少128字节，剩余不足一条的空间忽略；定位I/O为ESPIPE，lseek沿Linux noop行为。read/poll/epoll均在调用CPU运行。
-
-共享等待源按本次信号位和实际接收线程筛选通知。直接read及poll登记持有真实OFD或调用者状态中的掩码引用，通知游标归还前保留其存储。epoll回调只按FD掩码筛选，因为之后的等待者可以是另一线程；它不会绑定ADD调用者的线程身份。进程定向信号通知所有掩码匹配者，线程定向信号只通知对应直接等待者及匹配回调。修改FD掩码及等待源撤销仍广播，分别触发条件复查和POLLFREE处理。筛选、登记和状态检查共用调度短锁，唤醒与回调在锁外执行。
-
-等待源随最后一个disposition使用者退出而撤销：先停止新登记，以内部POLLFREE回调让epoll摘除节点，再等待已存在的通知游标和回调归还，最后释放存储。撤销通知不产生用户可见的伪造就绪事件。`make test-wait-host`强制暂停撤销回调，并保留更早取得的游标，检查两者结束前destroy保持BUSY。
-
-## SMP上的状态和执行位置
-
-`rt_sigprocmask` 在调用线程所在核读写该线程的屏蔽集合，`rt_sigpending` 在同一位置取得待决集合快照。两者都复用信号状态的调度保护。`rt_sigaction` 查询也在调用核完成。线程组只有调用者、已拥有独占信号表且没有可移植操作系统接口（Portable Operating System Interface，POSIX）定时器时，调用者在同一保护内读取旧动作并安装新动作。当新动作忽略信号时，调用者处理自己与所属组中已经待决的该信号。共享信号表、需分配信号表或需重新检查 POSIX 定时器的操作沿用 CPU0 服务区。
-
-RV USER_SMP中的普通信号在实际执行线程所在CPU递送。pending及其来源、共享disposition、blocked和SA_RESETHAND的修改由调度raw保护。未被跟踪的线程在同一保护内取走pending、复制完整action、记录恢复mask、设置handler期间的屏蔽位并重置一次性动作；锁外只使用线程栈上的delivery快照，后续rt_sigaction替换保留新动作。被跟踪的线程先取走pending并完成原生定时器记录，再在锁外进入信号递送停点；tracer可抑制、替换信号或修改完整siginfo。恢复后重新读取最终信号的action，仅实际递送的handler提交mask和SA_RESETHAND；重新被屏蔽的信号带完整载荷放回原线程或组队列。已忽略的信号仍可被tracer观察，SIGKILL绕过递送停点。rt_sigaction的旧动作和新动作在同一提交点交换，fork复制与exec重置同样使用该保护。
-
-构造信号帧、用户复制、寄存器/FPU恢复由当前线程执行。任务执行所有权持有本线程存储、MM及disposition表引用；uaccess借用实际物理页，缺页和等待沿共同MM路径处理。调度raw不跨用户复制、缺页或等待。sigreturn完整导入并检查用户上下文后，在短锁内恢复mask，再更新本线程寄存器和FPU。
-
-既有返回通知字区分“CPU0业务”和“本地信号”两种工作。发布者在保护下置相应位，需要时通知远端CPU；共同返回准备读取一次通知字，已有本地信号时才消费本批通知并要求信号选择，普通返回复用原检查。消费期间的新发布留在下一轮，两种消费者只清除各自的位。mask解除屏蔽时重新检查旧pending，覆盖sigprocmask、sigreturn、sigsuspend和临时等待mask；一批信号中仍有可交付项时保留后续检查。新增屏蔽位若挡住仍pending的组信号，锁外复用组游标通知并唤醒另一合适成员；发布时也重查候选，退出者在proc_exiting提交后、组拆除前转交未消费的组信号。sigtimedwait的接收集合在同一raw内发布，结束等待时也转交因退出集合而被本线程屏蔽的组pending。SIGCONT恢复READY成员时重新发布已有可递送信号的通知。游标持有真实task存储，短锁不跨等待唤醒，单成员路径无需遍历。普通周期CPU定时器的handler和sigreturn沿该本地路径运行。
-
-组停止/退出仍进入进程生命周期的CPU0范围。被跟踪成员的组停请求由其执行者处理，不受该成员的信号mask或action影响；实际跟踪等待与普通STOPPED状态分别维护。SIGCONT清除尚未执行的组停请求，并通知LISTEN中的tracer；在信号递送停点期间收到的SIGCONT取消随后重注入的停止动作。tracer的SIGCHLD携带实际CLD_TRAPPED或CLD_STOPPED原因，信号状态不混入ptrace事件编号，最终退出沿CLD_EXITED/KILLED/DUMPED编码。默认停止动作先迁移、再重新选择和消费pending，途中SIGCONT清除的停止请求会被丢弃；REAL定时器消费后的重装仍进入CPU0的墙钟期限索引。临时mask尚需等待真正handler时沿原等待路径阻塞，相应操作在短锁外取得执行资格。新增屏蔽位转交与停止取消的Linux依据为固定`references/linux/kernel/signal.c`中的`retarget_shared_pending`、`__set_task_blocked`和`get_signal`。调度交接见[RV两核](riscv-smp.md#真实用户态与cpu0业务交接)，CPU定时器统计见[时间模块](kernel-time.md#进程-cpu-间隔定时器)。
-
-## 输入、信号帧与恢复
-
-### 每线程备用栈
-
-`sigaltstack(132)`使用RV64/LA64共同的24字节`stack_t`布局，地址、尺寸及原始标志存在线程对象尾部，由实际执行线程维护。syscall请求携带本次trap的真实用户SP；查询按`base < SP <= base+size`计算`SS_ONSTACK`，`SS_AUTODISARM`配置视为未在栈上。最小登记尺寸为RV 2048字节、LA 4096字节。登记只保存用户地址，实际构帧时通过uaccess检查映射和权限。
-
-设置先完整导入输入，检查当前SP后再检查标志和尺寸；栈内修改为EPERM，尺寸不足为ENOMEM。新状态提交后输出旧值，输出EFAULT保留新设置；输入输出可以别名。fork复制调用线程配置，`CLONE_VM`且未指定`CLONE_VFORK`的child停用；vfork保留。成功exec停用，失败exec保留。配置不随共享disposition传播。
-
-`SA_ONSTACK`首次从登记区顶端构帧；已在备用栈上的嵌套处理从当前SP继续向下。两架构按实际对齐后的整数、FP/SIMD帧检查范围，再通过共同uaccess复制；不可写、未映射或空间耗尽终止用户线程组并报告SIGSEGV。`uc_stack`保存交付前的原始登记状态，与查询时计算的`SS_ONSTACK`含义不同。完整构帧成功后，`SS_AUTODISARM`停用原配置，处理函数可以重新设置。sigreturn完整导入`uc_stack`和其他恢复输入后，按恢复后的SP应用登记；字段不可读为坏帧，可读设置产生的EINVAL、ENOMEM、EPERM按固定Linux的`restore_altstack`忽略。恢复后寄存器、mask及浮点状态继续沿原路径处理。
-
-rt_sigaction/rt_sigprocmask 先完整复制输入，再提交状态，最后输出旧状态，允许输入输出地址别名。输入 EFAULT 不提交；输出 EFAULT 不回滚已经提交的有效动作。复制 helper 返回真实 uaccess 状态，handler 映射 errno。rt_sigpending 返回组与线程 pending 的并集再与 blocked 取交集。`rt_sigtimedwait` 校验 8 字节 mask 和相对 timespec，在当前线程登记临时等待集合；匹配的标准信号可以唤醒线程，但只由等待 syscall 从线程或组 pending 中取走，不经普通 handler。返回 `siginfo` 的 signo、SI_USER/SI_TKILL/SI_KERNEL、发送者进程 ID 和 uid；SIGCHLD 另携带 CLD_EXITED/KILLED/DUMPED/STOPPED/CONTINUED 与对应退出码或信号。pending 位、来源和事件状态在调度 raw 保护内共同发布与取走，标准信号合并保留首个未消费事件。每个线程和组只各补充一份紧凑的子事件状态；`rt_sigtimedwait` 与 RV/LA 信号帧共用 128 字节 ABI 编码。`siginfo` 输出 EFAULT 发生在取走信号之后。登记等待后再次检查 ptrace 停止请求。等待返回时先取匹配的信号；没有匹配项时，超时返回 EAGAIN，信号或跟踪请求打断返回 EINTR，SA_RESTART 也保留这一返回。跟踪请求随后在返回用户态前产生 ptrace 停点。实时信号使用相同的FIFO待决记录。
-
-RISC-V 交付 frame 共 1088 字节，16 字节对齐：128 字节 siginfo 加 960 字节 ucontext。ucontext 内 sigmask 偏移 40、mcontext 偏移 176；mcontext 包含 32 个整数寄存器和按 Q 扩展容量保留的 528 字节、16 字节对齐 FP union。当前只填写 D 寄存器与 32 位 fcsr，其余扩展存储清零。内核静态断言和真实 musl ucontext 共同核对布局，不能仅用同一套手写偏移自证正确。
-
-handler 的 a0/a1/a2 分别为信号、siginfo 地址和 ucontext 地址；ra 指向固定 RX VDSO 的 rt_sigreturn ecall。用户帧不保存可由用户修改的特权 sstatus。sigreturn 先复制并检查恢复输入，再恢复 signal mask、整数和 FP 状态，保持受控的 S-mode 返回状态。恢复输入不要求 SP 仍为 16 字节对齐，可读的 8 字节偏移帧按固定 Linux 接受；不可读取或不支持的扩展帧以 SIGSEGV 终止任务。`test-sigreturn-boundary-riscv/loongarch` 检查正常/偏移/不可读恢复帧、mask 以及 RV F/D 与 FCSR。
-
-LA 整数帧为 592 字节、16 字节对齐：128 字节 siginfo、448 字节 ucontext 和16字节
-END。ucontext 的 mask/mcontext 偏移仍为40/176，sigcontext 是 PC、32个GPR、32位
-flags，再对齐至272字节。未used_math时只发布END；否则发布最高live宽度的
-FPU、LSX或LASX记录，完整布局、重复记录优先级及pending FCSR见[LA浮点/SIMD](loongarch-fpu.md)。
-END有效输入为8字节；不要求尾padding可读。未知或过短扩展（含未支持LBT）为坏帧。
-恢复先快照mask、context及选中有效payload，再提交用户寄存器；PRMD、内核TP不来自用户，r0保持零。
-handler 的 a0/a1/a2、ra 与 SP 使用 LA ABI，VDSO 执行 syscall 139；sigreturn 不再推进 ERA。
-内核交付帧保持16字节对齐；用户提供的恢复帧不另加这一拒绝条件，Linux接受
-可读的8字节偏移帧。仍完整检查范围、复制和不支持扩展，先快照后提交。
-
-## 等待与重启
-
-wait4、console read 和 pipe I/O 可被未阻塞信号唤醒；handler 的 SA_RESTART 决定这些可重启调用是重执行还是 EINTR。进入 handler 前清除任务内的外层重启状态，重执行所需参数保存在被中断的用户寄存器现场中。
-
-无超时 FUTEX_WAIT 使用 generic restart，handler 的 SA_RESTART 决定重试或 EINTR；重试会重新读取 futex word，值已变化返回 EAGAIN。带超时 FUTEX_WAIT 与 nanosleep 一样使用独立 tagged restart state：进入任何用户 handler 都返回 EINTR，不由 SA_RESTART 自动继续；没有进入 handler 的 stop/continue 等路径由 restart_syscall 使用首次调用保存的 monotonic absolute deadline，不能重新获得完整 relative timeout。
-
-nanosleep/clock_nanosleep 遇到用户 handler 始终返回 EINTR，不受 SA_RESTART 影响。没有进入 handler 的 stop/continue 等路径中，相对睡眠通过 restart_syscall 保留原到期期限；绝对睡眠重试原 syscall，重新导入用户请求。绝对睡眠不写 remaining。纳秒输入及 tick deadline 使用明确的饱和范围，tick 的未来距离不超过 INT64_MAX，避免远期时间被有符号差值误判为过去。
-
-sigsuspend 在等待和选择 handler 时保留临时 mask，把原 mask 写入信号恢复上下文，由 sigreturn 恢复。单独的 ptrace 停止请求会结束当前等待登记，线程停下供跟踪者观察，继续执行后仍使用同一临时 mask 等待信号。vfork 使用具体子进程的一次性完成条件，不由普通信号解除等待。
-
-## 验证与当前边界
-
-RV 构帧复用 prefix/mcontext 存储，不在内核栈放置整份1088字节frame；LA整数帧使用
-592字节整数帧，FP/LSX/LASX按实际宽度构造，最大1664字节；按片段复制而非整帧
-留在内核栈。编译帧预算由下面门禁读取实际产物，不沿用标量阶段数值。故障记录内嵌在线程
-控制块中，不为交付分配内存。函数与调用链预算通过 `make test-stack-usage`、
-`make test-stack-usage-la`、真实任务 canary 与退出时栈统计核对；单函数统计和
-一次回归不能证明所有深层 I/O/fault 清理链。
-
-`make test-signal-wait-abi-riscv test-signal-wait-abi-loongarch`提供等待的聚焦差分：包含空等待集合和SA_RESTART，子进程通过真实`/proc/<pid>/stat`睡眠状态握手后发信号，直接检查syscall返回，区分libc自身的EINTR重试。
-
-`tests/workloads/resource/ptrace_signal.c` 检查抑制时保留一次性动作和mask、被屏蔽替换信号的完整siginfo重排队、忽略动作的可观察性、SIGCONT取消停止，以及初始SEIZE停点、信号递送停点和退出的真实SIGCHLD原因。`tests/host/signal_owner.c` 在实际选择路径模拟tracer恢复决定，检查恢复后action重读、完整载荷、定时器完成时机和队列资源归还。
-
-`test-sched-concurrency-host`在真实选择解锁后让另一宿主线程替换action，检查旧delivery快照、mask、SA_RESETHAND及新动作均保持正确；旧实现会读到后来的handler。`test-user-smp-host`检查两类通知分别消费及晚发布、handler新增屏蔽位、接收者退出和结束sigtimedwait后转交组信号、真实COMMITTED等待者被唤醒及消费，以及CPU0换栈窗口中的SIGCONT取消STOP、恢复成员重新取得信号通知。`test-user-smp-riscv`的静态/动态musl案例另覆盖屏蔽后已pending的信号经sigsuspend解除屏蔽、嵌套handler和sigreturn恢复原mask，运行真实1/2CPU及双RAM。
-
-`make test-diff-abi-riscv` 以同一 RISC-V ELF 对照等待信号的参数、真实超时、线程/进程定向来源、阻塞送达、siginfo EFAULT 消费和其他 handler 打断；`tests/diff-abi/signals.c` 还对照 SIGCHLD 的停止/继续、退出/信号终止、首个事件合并、SA_NOCLDSTOP、SA_NOCLDWAIT、显式忽略及 SA_SIGINFO handler；`make test-userland-riscv` 以真实静态 musl 验证 handler/sigreturn、libc ucontext、sigsuspend、睡眠 EINTR、vfork、SIGCHLD 回收及 pipe 等待。架构和调度边界由 `make test-riscv` 回归。
-
-标准信号使用线程组与线程位图pending；实时记录、signalfd消费、发布与计费共用调度保护。libc内部信号与其他实时信号共用线程定向队列。siginfo 提供 SI_USER/SI_TKILL sender、孤儿组 SI_KERNEL 来源以及下述同步故障信息。组 stop/continue 与致命取消不能直接释放睡眠中的任务栈；不可中断的 vfork 有独立取消握手。
-
-## 同步故障
-
-LA 页故障同样经通用 force_fault 选择 handler，保留 ERA；未映射/权限为 SEGV
-MAPERR/ACCERR，EOF 为 BUS/ADRERR。ADE/ALE 的 si_addr 是 BADV，break 0 为
-TRAP/BRKPT、si_addr=ERA。固定 Linux LA do_ri 使用 SI_KERNEL=128、空地址，不能
-沿用 RV 的 ILL_ILLOPC。SC_ADDRERR_RD/WR 根据 Linux thread.error_code 的保留契约
-编码，后续异步帧和 clone 保留该值；PRMD 不发布在用户上下文。
-break 6/7 分别为 SIGFPE/FPE_INTOVF、FPE_INTDIV，按真实指令 immediate 解码，
-不能把整数运算 fault 全部归为 TRAP。两个类型也由同 ELF 的双侧 handler 验证。
-解码使用已驻留页的 USER/EXEC 资格借用物理owner，不要求普通数据READ权限；
-仅执行映射中的break6也由双侧真实程序保护，不全局放宽数据uaccess。
-`make test-signal-loongarch` 在512MiB/1GiB分别运行同一个真实 LP64S musl ELF，
-验证布局、来源/mask、嵌套、故障映射修复、整数寄存器/PC恢复、坏帧、pipe
-SA_RESTART/EINTR、nanosleep EINTR 和 sigsuspend。每次 BoarOS 退出要求根盘 owner、
-用户页/页表/任务栈和堆恢复基线。整数范围另由LP64D FPU及SIMD探针扩展，关闭扩展的CPU profile也已验收；用户态排队发送与共同消费见前文。
-
-U-mode 未映射/权限页故障分别记录 SIGSEGV/SEGV_MAPERR、SEGV_ACCERR，文件 EOF/I/O fault 记录 SIGBUS/BUS_ADRERR，`si_addr` 为故障 VA。非法指令与断点为 SIGILL/ILL_ILLOPC、SIGTRAP/TRAP_BRKPT；access/misaligned cause 按固定 Linux 映射，`si_addr` 为 PC。来源为本地 `references/linux/arch/riscv/kernel/traps.c`、`arch/riscv/mm/fault.c`、`kernel/signal.c::force_sig_info_to_task`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
-
-线程有一个独立同步故障记录，经统一用户返回路径优先选取；交付 handler 时保留故障 PC，可由 handler 修复映射后重试，或修改 ucontext 跳过指令。被阻塞或忽略的致命同步信号改为默认动作并解除阻塞；默认动作终止全组。坏 signal frame 同样终止全组。fork/exec 清除故障记录；syscall 用户复制仍返回 EFAULT，内核自身 trap 仍 fatal。
-
-`tests/userland/fault_signals.h` 验证 SEGV/BUS/ILL/TRAP siginfo、修复/上下文返回、默认组退出、阻塞/忽略和坏 frame；`tests/diff-abi/signals.c` 的 5 条真实故障对照固定 Linux，累计 1091 条差分一致。[ptrace](kernel-ptrace.md)在动作提交前提供信号递送停止；RV真实两核的递送与恢复使用上面的共同协议。
-
-TTY 的前台终端信号使用稳定 PGID 发向整个进程组；背景 TTIN/TTOU 和会话 HUP/CONT
-的 owner、忽略/阻塞/orphan 条件及生命周期见 [Serial TTY](kernel-tty.md)。终端 read/write
-实际已交付前缀后不留下 restart 标记，只有整次无进展的 ERESTARTSYS 由 trap 登记重试。
-
-FP/LSX/LASX记录、pending异常、首用与宽度升级和owner切换见[LA浮点/SIMD模块](loongarch-fpu.md)。
-
-`tests/workloads/signal/altstack.c`对照两架构Linux，覆盖登记ABI、嵌套、普通栈溢出、坏备用栈、可读无效与不可读恢复字段、fork/vfork/线程及非组长exec。LA在激活FPU/LSX/LASX后，另检查4KiB备用栈上的实际帧（FPU 880、LSX 1136、LASX 1648字节）及不足该宽度一帧的边界，父进程先取得成功构帧记录，再判定后续SIGSEGV。RV观察构建记录各在线核的构帧和sigreturn；复用composition的真实页pin暂停点检查mprotect已park等待，以及munmap返回后物理页仍由pin保活，再放行复制。共同状态检查入口为`make test-signal-stack-host`（4/16KiB页）；真实多核入口复用`tests/userland/run.py --workload altstack --observe`。
-
-
-## ELF core 文件与线程组退出
-
-默认 core 动作在释放 MM 前同步写当前目录的 `core`，不经过用户 FD 表。文件提供目标架构的 ELF64 `ET_CORE`、每个停驻线程的整数 `NT_PRSTATUS`（崩溃线程在先，线程、实际父线程、进程组与会话编号使用转储者的活动 PID 视图），以及保留起址、大小和读写执行权限的 `PT_LOAD`。`MADV_DONTDUMP` 和 vvar 区域只保留映射描述、不输出内容；与 Linux 一致，vDSO 是始终输出的例外。只在异常退出执行这一流程，普通 syscall/调度不新增扫描或分配；线程组长仅保留一个空 session 指针。
-
-仅 `PR_GET_DUMPABLE == 1`、CORE 软限额至少一个基页且 FSIZE 非零时尝试。输出逐段受两个软限额最小值限制；文件过小、目录不可写、空间不足或 I/O 失败不阻止进程退出，已写前缀可能保留。拒绝 symlink、非普通文件、多硬链接、非当前 fsuid 拥有或模式不为 0600 的文件；通过检查后才截断旧文件。新建模式为 0600。成功形成 notes 后才报告 WCOREDUMP/CLD_DUMPED，后续数据失败可能留下不完整 core，与成功完成全部 payload 不等价。
-
-`/proc/<tgid>/coredump_filter` 为 0644，读取八位十六进制值及换行；写入按 Linux base-0 解析十进制、`0` 前缀八进制及 `0x` 十六进制。支持可选 `+` 和单个末尾换行，不接受负数、空值和空白；超出 unsigned 32 位返回 ERANGE，低九位以外忽略。仅导入前 34 字节，导入失败不改变 mask；pwrite 可用但写操作不推进文件位置，writev 按各 iovec 依次生效并保留已成功的前缀。目标已退出时读无 MM 为 EOF、写为 ESRCH；身份消失为 ESRCH。按 Linux v6.15 的目录表，task/TID 子目录不提供该文件。
-
-mask 归属实际 MM：CLONE_VM 的调用者共享，fork 复制并独立修改，exec 提交新 MM 时继承。仅在 core 输出前读取一次，并保存每个映射的输出长度，避免 proc 写入或 inode 属性变化造成 program header 与实际输出范围不符。bit 0/1 为私有/共享匿名，bit 2/3 为私有/共享文件，bit 4 为文件 offset 0 的可读映射首基页（文件带执行位或映射字节含 ELF magic），bit 5/6 为私有/共享 hugetlb。bit 7/8 保留 Linux DAX mask 值，但系统尚无 DAX 映射。普通 SysV SHM、MAP_SHARED|MAP_ANONYMOUS 及已 unlink 的共享文件走匿名共享分类。
-
-私有文件发生写缺页后也归入 bit 0。首次建立私有匿名后备时记录 VMA 关联，随 fork、split、mremap 保留，MADV_DONTNEED 不清除，WIPEONFORK 则清除子映射关联。完全未触达的普通匿名和 ELF 零填充 VMA 没有该关联：仅保留 PT_LOAD 地址范围，p_filesz 为零，不逐页遍历、不消耗 CORE/FSIZE 的 payload 限额。初始 exec 栈已有内容、ELF 合成尾页已有私有 padzero 后备，建映射时记录关联。
-
-BoarOS 现有匿名首次读就分配私有可写零页，故读缺页也会建立关联；Linux 可使用共享只读零页，所以只读触达区域的选择仍可能不同。这个差别不扩大到完全未触达的大范围。普通匿名不新增写保护、缺页或复制，先读后写沿用现有可写 PTE；只在首次已有缺页建立关联时取得 VMA writer、更新映射代次，不在每次写入或每页增加扫描。已有关联的 VMA 仍按整段选择，有限限额下仍可能留下截断 core，不能无条件宣称重建内容相同。普通 DONTDUMP/vvar 排除；vDSO 与 Linux always_dump_vma 一样优先于 DONTDUMP 保持输出。
-
-逐页复用一个任务 scratch 页；没有整份地址空间复制。匿名非驻留页不触发缺页分配，全零页以文件空洞表达，结束时扩展逻辑大小。映射快照持有文件引用，所有正常错误路径关闭文件、释放 scratch 和快照引用。
-
-崩溃 owner 在 scheduler wait domain 中同时发布 session 和 group-exiting，禁止新的 clone/exec 发布。现有终止路径打断同组成员的可中断等待、停止态和远端用户执行；每个成员到达退出边界后保存自己的整数寄存器，再等待 owner 结束。这个边界早于 ptrace exit 通知、robust futex、clear_child_tid 和 MM 释放，因此不会用“其他线程已经销毁后的地址空间”冒充完整线程快照。线程从不同 CPU 逐个停驻，并非保证所有寄存器属于同一个硬件时刻；只有全部成员停驻后才枚举映射并输出内存。
-
-停驻最多等待 5 秒，超时或任何准备/写出失败均撤销 session、唤醒已经停驻的线程继续原来的致命退出。等待者只检查组长上的 session 身份，不在释放后解引用 session。到达通知仅唤醒 owner，已停驻线程使用独立的结束队列，避免每到达一个成员就反复唤醒其他成员。notes 存储按本次线程数分配，结束统一释放；没有每次调度的冻结检查或常驻 worker。
-
-开始读取前，MM 拒绝仍持有用户写 pin 或在途 `process_vm_*` borrower 的转储。远程借用与 dump 使用一个原子排他登记；转储期间新 `process_vm_*` 请求返回 ESRCH，在途请求使本次 dump 放弃而不是等待。借用在 syscall 的正常与异常 abort 路径归还。当前有 tracer 或正在访问 tracee 的线程组不转储，session 存续期间拒绝新 ptrace attach，避免寄存器和远程写的另一个 owner 跨睡眠修改现场。
-
-此阶段不是完整 Linux core 支持：
-
-- 支持组长或非组长崩溃，以及同组 blocked/running 成员。仍拒绝跨进程 CLONE_VM/vfork 共享 MM、已经进入资源清理的成员和上述 ptrace 情形。跨组共享 MM 需要独立的 MM 执行者索引及终止/恢复协议，不能把不属于致命信号目标组的进程直接杀掉。
-- 已实现 MM 所属的 `/proc/<tgid>/coredump_filter`，初始 mask 为 `0x33`；尚无 `core_pattern`/pipe helper。没有 NT_FILE、AUXV、浮点/SIMD notes；PRSTATUS 的 CPU times 未填充。调试器需要另行加载对应可执行文件，本阶段不能声称浮点或完整 Linux 调试信息。
-- 保证的是目标线程组停止用户执行、目标 MM 的映射遍历和对象生命周期安全，不是整份 core 内容对应同一时刻。不同 MM 通过匿名 MAP_SHARED、普通/hugetlb SysV SHM、共享 hugetlb 或文件映射访问同一后备存储时，外部写者继续运行；目标 MM 的远程借用登记和 pin 不会锁住这些别名。逐页复制可以组合出不同时刻的数据，甚至一次页内复制也不保证应用对象一致。未发生 COW 的私有文件映射亦不能据“private”标签推断后备文件不再变化。恶意同 UID 进程对输出文件的并发修改也不由此机制防护。
-
-Linux 的过滤和冻结是不同问题。[Linux v6.15 proc 文档](https://kernel.org/doc/html/v6.15/filesystems/proc.html#coredump-filter-which-memory-is-dumped)定义默认 mask `0x33`：包括匿名私有、匿名共享、ELF 头和私有 hugetlb，共享 hugetlb（bit 6）及 file-backed 分类（bit 2/3）默认未选中，私有文件映射已建立匿名 COW 后备或 ELF 首部另按相应条件处理。普通 SysV SHM 属于匿名共享；不能把所有 shared 映射一律排除后声称符合默认语义。[同版源码](https://github.com/torvalds/linux/blob/v6.15/fs/coredump.c)的 `zap_threads`/`coredump_wait` 等待致命线程组，`dump_vma_snapshot` 只保存目标 VMA 元数据，`dump_user_range` 逐页取得引用并输出，并不枚举和冻结所有共享后备对象的其他进程。因此不能从“Linux core”推导出跨进程共享内容的原子快照保证。
-
-当前继续输出被过滤器选中的共享内容，但明确按读取时观测解释；不为 core 停止无关进程，也不新增全局共享页锁。确实需要排除某个不稳定区域时，应用可以事先 `MADV_DONTDUMP`，输出保留该区域地址范围、文件内容长度为零。默认过滤也不会消除匿名共享页的并发写者。
-
-定向入口是 `tests/userland/run.py --only boaros --workload core_dump --arch riscv|loongarch --cpus N --memory 512M --kernel ...`。测试核对内容、权限、DONTDUMP、限额、dumpable、链接安全和旧文件替换；多线程案例严格要求对应成员数的不同 TID notes 和非零 PC/SP，分别覆盖双线程 pipe 阻塞、四线程用户态运行和双线程非组长崩溃，并检查写文件失败后退出及跨组 CLONE_VM 拒绝。单线程转储前执行成功的 process_vm 读写及 EFAULT 路径，检查它们归还远程登记后仍能转储。runner 导出 `core.elf`、`core-threads.elf`，对两个文件运行宿主 `readelf -h -l -n` 并检查 notes 数量。`tests/host/mm-remote.sh` 用两线程握手检查在途远程借用、新借用、写 pin 和释放后的重新接纳（4K/16K）；另用两个独立 MM 共享同一匿名后备，强制在两次读取间由另一 MM 按顺序更新两页，证明目标 MM 的 dump 登记不会将组合结果变成全局原子快照。该测试验证真实 MM 复制路径，不是完整 ELF 输出的跨进程竞态注入，也不代表已动态覆盖每种共享映射后端。
-
-过滤器的定向验证入口为 `sh tests/host/proc-coredump-filter.sh`（真实 proc 路由/解析、建模身份 provider）、`make test-proc-index-host`（真实身份/MM helper）及 `sh tests/host/mm-remote.sh`（真实 MM 默认值、fork 独立值和共享 owner）。RV SMP4/4K、LA SMP2/16K 的 `core_dump` workload 通过真实 proc/syscall 和 ELF 输出验证进制/溢出/短读/pwrite/writev/EFAULT、线程共享、fork/exec 继承，以及匿名、文件、SysV、ELF 首页、hugetlb、DONTDUMP 和 vDSO 例外；输出由 readelf 检查。文件私有先读后写再 DONTNEED 仍保留分类；确定性用例将 64 MiB 未触达匿名区放在有效数据之前，8 MiB CORE 限额下验证冷区 p_filesz=0 且后续 marker 实际可读。host 另外确认匿名先读后直接写 pin 成功，不需新增写缺页，DONTNEED 保留关联而 WIPEONFORK 清除子关联。宿主没有 `/proc/self/coredump_filter`，因此 native proc ABI 正向对照也不可用；Linux 行为依据固定 v6.15 源码，不把 host parser fixture 当成 Linux 对照。没有新增 DAC 用户切换、完整 ELF 设备故障注入或跨进程共享原子快照验证。
-
-调试时将对应 workload ELF 与 core 一同交给目标 GDB，例如 `riscv64-linux-gdb program core-threads.elf`，再执行 `info threads` 与 `thread apply all info registers pc sp`。RV 已用现有 GDB 直接识别两条线程及寄存器。LA 输出符合 Linux 的 480 字节 PRSTATUS；本环境 GDB 16.3 的旧 BFD 只接受 472 字节，原始 core 会报找不到通用寄存器。这是上游记录的 [LoongArch PRSTATUS 长度问题](https://sourceware.org/pipermail/binutils/2025-November/145528.html)，需要包含该修正的 debugger；不能为适配旧工具删去 Linux ABI 字段。LA guest 已检查两线程寄存器，readelf 能解析 notes，但本环境没有完成原始 LA core 的 GDB 消费验证。宿主 Linux 能验证双线程 SIGABRT 退出，但不会生成 core，故没有正向 Linux 文件内容对照。
+</details>

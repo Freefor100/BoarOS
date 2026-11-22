@@ -1,129 +1,130 @@
-# 进程映像替换模块
+# 进程映像替换（`execve` / `execveat`）
 
-本文描述 Linux `execve(221)`、`execveat(281)` 的准备事务、共用映像策略和 scheduler 提交边界。ELF source 与缺页规则见[用户 ELF64 装载模块](user-elf.md)，任务与 MM 生命周期见[内核调度与进程生命周期模块](kernel-scheduler.md)。
+程序装载与进程映像替换是操作系统从静态可执行文件过渡到活跃用户态执行流的关键桥梁。在 POSIX 与 Linux 接口中，`execve(221)` 和 `execveat(281)` 在保留当前进程标识符（Process Identifier，PID）、打开文件状态（非 `FD_CLOEXEC`）与工作目录的前提下，原子地销毁旧的地址空间并替换为全新程序映像。
 
-## 入口与职责
+BoarOS 将整个过程严格划分为**可回滚的准备阶段**与**不可返回的提交阶段**，在 RISC-V 64 位（RV64）和龙芯架构 64 位（LoongArch 64，LA64）上共享同一套事务状态机、脚本展开器、凭据计算器和可执行与可链接格式（Executable and Linkable Format，ELF）装载管线。ELF 只读源对象与按需缺页机制另见[用户 ELF64 装载模块](user-elf.md)，线程组与内存管理对象生命周期见[内核调度与进程生命周期模块](kernel-scheduler.md)。
 
-| 文件 | 职责 |
-|---|---|
-| `kernel/exec.c`、`include/kernel/exec.h` | 捕获用户路径/argv/envp，打开可执行文件，解析并持有主程序和解释器 source，管理准备期 owner |
-| `kernel/exec_image.c`、`kernel/elf_image.c` | 将 source 变成 MM、入口 PC、SP、VMA、栈和 auxv；页表操作构建期绑定 |
-| `include/arch/elf.h`、`include/arch/task.h` | machine/HWCAP/trampoline 与初始、clone、exec 寄存器操作 |
-| `kernel/sched/exec.c` | 撤下 CLOEXEC 后一致发布 MM 与凭据，重建 Trap Frame 并处理旧资源 |
-| `kernel/exec_credentials.c` | 从实际执行 ELF 的属性计算 set-ID、文件 capability、AT_SECURE 和 dumpable |
-| `kernel/syscall/process.c`、架构 trap 入口 | 解码 syscall 221/281 和提交动作 |
+---
 
-共用入口 `kernel_execveat_prepare()` 在旧 MM 上建立 `PREPARED` 事务；`kernel_execve_prepare()` 以 `AT_FDCWD` 和零 flags 调用该入口。`kernel_exec_image_prepare()` 调用共用 `kernel_elf_image_build()`。machine、页大小、MMU 和线程寄存器由构建期绑定的 RV/LA 实现提供，不使用运行期 vtable。RV 的旧入口保留薄包装；LA已通过内存reader、PCI根盘、原版LP64S静态和LP64D动态musl同一image/exec契约的双侧验收。
+## 一、源码组织
 
-`execveat` 的 dirfd 和 flags 按 Linux `int` 截断为 32 位。绝对路径忽略 dirfd；相对路径从实际目录 OFD 开始，`AT_FDCWD` 使用 cwd。支持 `AT_EMPTY_PATH` 和 `AT_SYMLINK_NOFOLLOW`，未知 flags 返回 EINVAL。名字先导入，但 NPROC 和未知 flags 错误先于名字错误返回；flags 有效时，未指定 `AT_EMPTY_PATH` 的空名返回 ENOENT。路径与 fd 的打开错误先于 argv/envp 导入错误。
+| 源码路径 | 核心职责 |
+| :--- | :--- |
+| `kernel/exec.c`、`include/kernel/exec.h`、`kernel/exec_internal.h` | 事务容器（`kernel_exec_transaction`）、用户路径与 `argv`/`envp` 捕获、`execveat` 目录描述符解析、`#!` 脚本展开及主程序/解释器打开 |
+| `kernel/exec_credentials.c` | 依据最终主 ELF 的属主、模式位与扩展属性计算候选凭据（`setuid`/`setgid`、文件能力）、`AT_SECURE` 与 `dumpable` |
+| `kernel/exec_image.c`、`include/kernel/exec_image.h`、`kernel/elf_image.c` | 调用共用 `kernel_elf_image_build()` 构造新内存描述符（Memory Management，MM）、虚拟内存区域（Virtual Memory Area，VMA）、初始用户栈与辅助向量（Auxiliary Vector，auxv） |
+| `kernel/sched/exec.c` | 不可返回提交边界：终止同组其他线程、清理健壮互斥锁链表、关闭 `FD_CLOEXEC`、激活新页表、原子发布新 MM 与凭据、重建陷入帧（Trap Frame）并通知 `vfork` 与 `ptrace` |
+| `include/arch/elf.h`、`include/arch/task.h` | 构建期绑定的架构常量（如 `ARCH_ELF_MACHINE`）与初始/替换后寄存器初始化 |
+| `kernel/syscall/process.c` | 系统调用 221（`execve`）与 281（`execveat`）解码与提交入口 |
 
-空名执行使用真实普通文件或 `O_PATH` OFD 的 path identity，重新检查当前执行者的权限和该 mount view 的 noexec，并取得独立执行租约。打开时的凭据不代替执行时权限；文件被 rename、unlink 或所属 mount view 被移动后，仍执行该 OFD 持有的对象。它不构造 proc 路径再解析。非空相对路径使用相同目录身份；fd 与 `FD_CLOEXEC` 在同一次 FD 表锁下捕获，临时 OFD owner 在成功打开后归还，真实关闭错误仍由事务保留。
+---
 
-## 准备事务
+## 二、两阶段事务流程与多核分工
 
-用户多核下，发起线程在调用核捕获参数、解析 ELF 并构造私有 MM。路径与文件访问按所属后端选核，准备完成后进入 CPU0 处理线程组、CLOEXEC、MM 与凭据替换。执行失败保留旧映像，ptrace 等待者在事务提交或中止时收到通知。
+为确保任何参数拷贝错误、权限不足、文件损坏或内存耗尽都不会破坏调用进程原有的地址空间与文件表，BoarOS 用 `struct kernel_exec_transaction` 管理完整生命周期（`PREPARING` → `PREPARED` → `COMMITTED_CLEANUP` / `ABORTED_CLEANUP` → `EMPTY_CLEANUP`）。在多核（Symmetric Multiprocessing，SMP）环境下，参数捕获、脚本展开、ELF 解析与新 MM 构建均在**调用核本地**并发完成；直到进入不可返回提交阶段才切入受控 CPU0 服务域，协调线程组退出与全局资源切换。
 
-准备顺序如下。
-
-```text
-清理上次仍有 owner 的事务
--> 捕获 filename，检查 flags 并选择 root/cwd/dirfd identity
--> 打开 regular executable OFD
--> 捕获 argv/envp 内核快照
--> 按 #! 转换解释器与 argv，最多五次
--> 建立一次解析的主 ELF source
--> 若有 PT_INTERP，解析并打开唯一解释器 source
--> 从已打开的最终主 ELF 取得 mode/owner/filecap，计算候选凭据
--> 构造新 MM、source-backed VMA、栈和含候选身份的 auxv
--> 发布 PREPARED
+```mermaid
+flowchart TD
+    A["execve(221) / execveat(281) 入口"] --> B["回收上次残留事务并校验 NPROC / flags / 路径"]
+    B --> C["打开可执行文件 OFD（支持 dirfd 与 AT_EMPTY_PATH）"]
+    C --> D["按栈软限额预算捕获 argv / envp 指针与字符串快照"]
+    D --> E{"首行是否为 #! 脚本？"}
+    E -- "是（最多 5 层）" --> F["替换 argv[0] 并打开脚本解释器 OFD"]
+    F --> E
+    E -- "否" --> G["解析主 ELF64 源对象；若有 PT_INTERP 则打开动态链接器"]
+    G --> H["计算候选凭据、AT_SECURE、dumpable 与 personality"]
+    H --> I["构建全新 MM、按需 VMA、随机化布局与初始用户栈"]
+    I --> J["发布 PREPARED 状态"]
+    J --> K["进入不可返回提交（kernel_scheduler_exec_commit）"]
+    K --> L["终止同组其余线程并清理 robust futex"]
+    L --> M["分离共享信号表/文件表，关闭 FD_CLOEXEC 描述符"]
+    M --> N["切换页表，原子发布新 MM/凭据/安全对象并重建陷入帧"]
+    N --> O["回收旧 MM/事务资源、唤醒 vfork 父进程、触发 ptrace 事件"]
 ```
 
-主程序支持 RISC-V `ET_EXEC` 和 `ET_DYN`；解释器支持非递归 `ET_EXEC`/`ET_DYN`。动态 source 的 `PT_DYNAMIC`/`PT_TLS` 等元数据留给用户动态链接器。主文件格式或架构错误映射为 `-ENOEXEC`；解释器路径不存在时保留路径 errno，不足64字节的解释器header按Linux elf_read返回 `-EIO`，完整header的格式或架构不正确映射为 `-ELIBBAD`；资源、I/O 和参数限制分别返回 `-ENOMEM`、`-EIO`、`-E2BIG`。解析、打开或构造失败时保留旧 MM、凭据、dumpable 和 FD 状态。
+### 2.1 `execveat` 与路径身份
 
-事务中的 `executable_file`/`interpreter_file` 是 source 创建前的 OFD owners；`path_file` 只持有打开期间的 dirfd pin。source 创建成功后由 source 持有 OFD，事务改为持有 source owner。映像构造给 MM 增加各 source 的引用，事务在提交后释放自己的引用。解析、打开或真实 VFS/I/O 清理失败时保留准确 owner；物理页、VMA metadata 和堆的合法释放完成即结束，分配器不变量错误进入 fatal。参数字符串、向量和路径的纯堆清理直接释放并清空指针，不生成 `CLEANUP_REQUIRED`；重试只处理仍持有的 MM、source 或 OFD。
+`kernel_execve_prepare()` 是以 `AT_FDCWD`（当前工作目录）和零标志调用 `kernel_execveat_prepare()` 的薄封装。对于 `execveat`：
 
-argv/envp 总预算为 `max(128 KiB, min(RLIMIT_STACK / 4, 6 MiB))`，软限制在导入前读取一次，并供映像布局共同使用。默认 8 MiB 栈允许 2 MiB 参数预算；先捕获两组指针并扣除其 64 位指针空间（空 argv 计一个指针），再导入环境和参数字符串。字符串计入 NUL 和 `AT_EXECFN` 名字；每个字符串独立限制为 32 个目标架构页，即 RV 128 KiB、LA 512 KiB。auxv、argc、向量终止符、随机字节和 16 字节对齐不扣减这一参数预算，但完整初始栈仍须符合实际栈映射限制。
+- **空路径执行（`AT_EMPTY_PATH`）**：允许直接执行一个已打开的普通文件或仅路径描述符（`O_PATH`）。内核直接复用该打开文件描述（Open File Description，OFD）持有的虚拟文件系统（Virtual File System，VFS）路径身份，而不拼接 `/proc/self/fd/...` 重新查找；即使文件在打开后被重命名、删除或挂载点被移动，仍能准确执行原对象，并按**当前执行者凭据**重新校验执行权限与挂载点的 `MS_NOEXEC` 标志。
+- **脚本路径命名**：若通过非 `AT_FDCWD` 的相对路径或空路径执行 `#!` 脚本，内核为解释器和 `AT_EXECFN` 生成 `/dev/fd/<dirfd>/<路径>` 或 `/dev/fd/<dirfd>` 名称；若 `dirfd` 带有 `FD_CLOEXEC`（执行时关闭）标记，脚本解释器启动后将无法再按该描述符打开脚本，因此内核直接拒绝并返回 `-ENOENT`，而 ELF 二进制可直接映射已打开文件，不受此限制。
 
-脚本展开沿用原指针预算，删除 argv[0] 的字符串空间后添加解释器、可选参数和脚本名。动态增长的事务缓冲区仅保存本次输入；E2BIG、EFAULT 或分配失败均在发布新映像前归还准备资源，旧 MM、FD_CLOEXEC、信号动作和凭据不变。
+### 2.2 参数与环境变量容量预算
 
-## 执行凭据
+为了避免超长参数耗尽新进程的用户栈空间，BoarOS 遵循 Linux 的动态参数预算公式（`kernel_exec_argument_limit()`）：
 
-主 ELF 的执行租约固定实际 inode；凭据计算从该对象取得一致的 mode/uid/gid 和 `security.capability`。脚本自身的 set-ID 位忽略，脚本展开后的 ELF 才是身份来源；`PT_INTERP` 负责加载，自己的 set-ID 或 capability 不替代主 ELF。主程序或解释器不可读时，另行降低新映像的 dumpable。
+$$\text{budget} = \max\left(128\ \text{KiB},\ \min\left(\frac{\text{RLIMIT\_STACK}_{\text{soft}}}{4},\ 6\ \text{MiB}\right)\right)$$
 
-ext4 文件 capability 通过已打开 inode 读取，支持 inode 内与外部 EA，以及 revision 1/2/3 的 12/20/24 字节布局。格式错误返回 EINVAL，实际读取错误按原错误返回；initial namespace 中 rev3 的非零 rootid 按无有效属性处理。有效的全零属性仍会清除 ambient。
+其中默认的栈软限制 `KERNEL_RLIMIT_STACK_DEFAULT` 为 `8 MiB`（对应预算 `2 MiB`），硬上限固定为 `6 MiB`（`KERNEL_RLIMIT_STACK_DEFAULT / 4 * 3`）。单个字符串上限为 `KERNEL_EXEC_STRING_PAGES`（32 个目标架构页），即 RV64（4 KiB 页）为 `128 KiB`、LA64（16 KiB 页）为 `512 KiB`。
 
-普通执行也把 saved/fs IDs 设为最终 effective IDs。setuid 使用文件 UID，setgid 还要求组执行位；`MS_NOSUID` 和 NNP 抑制 set-ID。文件 capability 的 permitted 组合为 `(B & file_P) | (I & file_I)`，随后按 root 兼容规则、securebits、NNP 和共享 FS 状态处理，再加入保留的 ambient。bounding 只约束 file_P 分支；带 effective 标志且所需 file_P 得不到满足时返回 EPERM。exec 清除 KEEP_CAPS 值并保留其锁定位。
+捕获阶段先扫描 `argv` 与 `envp` 指针数组并扣除其 64 位指针开销（空 `argv` 仍计 1 个空串指针），再导入字符串正文与 `AT_EXECFN`；`#!` 脚本展开沿用原指针预算并回收被丢弃的旧 `argv[0]` 字节空间。任何越界（`-E2BIG`）、非法地址（`-EFAULT`）或内存不足（`-ENOMEM`）都在进入提交前清理事务并返回错误，旧进程映像毫发无损。
 
-`AT_UID/AT_EUID/AT_GID/AT_EGID` 来自候选身份，`AT_SECURE` 表示安全装载要求。dumpable 独立计算：旧的 real/effective 身份关系、主程序和解释器可读性、effective/fs IDs 变化以及 permitted 增益共同决定结果。两者可不同，例如 NNP 抑制文件 capability 增益后仍可能要求安全装载，而新映像可以保持 dumpable。
+---
 
-dumpable 保存在任务持有的小型执行安全对象中：共享 MM 的线程和 vfork 子进程共用该对象，fork 复制当前值，exec 准备独立对象并与新 MM、凭据一同发布。任务退出后立即归还页表和映射；执行安全对象保留到最后一个任务或查询借用结束，因此僵尸和已退出组长的 proc 属主仍反映共享者后续的 dumpable 修改。
+## 三、执行凭据、文件能力与安全装载
 
-准备期间，FS record 在已有 VFS 状态保护下统计共享任务：存在组外共享者时按 unsafe exec 限制权限增益；仅组内共享时登记 `exec_users`，阻止新的 CLONE_FS 加入。成功、准备失败和执行线程退出都归还该登记，早于释放线程的 FS owner。非组长 exec 保留执行线程自己的凭据和 NNP。
+可执行文件可能携带特权提升属性，例如设置用户标识符（`setuid`，模式位 `04000`）、设置组标识符（`setgid`，需同时具备组执行位 `02010`）以及存储在 ext4 扩展属性 `security.capability` 中的细粒度文件能力（File Capabilities）。
 
-## 映像和初始状态
+- **身份来源**：只有最终被装载的**主 ELF 文件**决定新凭据。`#!` 脚本自身的 `setuid`/`setgid` 位会被忽略；动态链接器（`PT_INTERP`）仅负责加载，其权限位不会替代主程序。
+- **能力计算公式**：`kernel_exec_credentials_prepare()` 支持版本 1（12 字节）、版本 2（20 字节）与版本 3（24 字节，初始命名空间下要求 `rootid == 0`）的扩展属性格式，按以下公式计算新允许能力集（Permitted）：
+  $$P_{\text{new}} = (B \mathbin{\&} P_{\text{file}}) \mid (I \mathbin{\&} I_{\text{file}})$$
+  其中 $B$ 为能力边界集（Bounding），$I$ 为可继承集（Inheritable）。若文件能力启用了有效标志（Effective）但边界集裁剪了部分 $P_{\text{file}}$，则拒绝执行并返回 `-EPERM`。随后按超级用户兼容规则（受 `SECBIT_NOROOT` 约束）、不安全执行限制及环境能力集（Ambient）收口，并清除 `SECBIT_KEEP_CAPS` 位。
+- **不安全执行与特权抑制**：若挂载点带有 `MS_NOSUID`、线程已启用不可提权标记（`no_new_privs`）、文件系统上下文与线程组外进程共享（`CLONE_FS`），或当前正被不具备 `CAP_SYS_PTRACE` 能力的跟踪者调试（`kernel_ptrace_exec_unsafe()`），内核会抑制提权增益。组内共享 `CLONE_FS` 时，事务通过 `kernel_fs_context_exec_begin()` 登记执行锁，阻止准备期间有组外进程新加入共享。
+- **`AT_SECURE` 与 `dumpable` 分离**：两者独立计算。`AT_SECURE` 通过辅助向量通知动态链接器开启安全装载模式（忽略 `LD_PRELOAD` 等敏感环境变量）；`dumpable` 则保存在独立的 `kernel_exec_security` 对象中（共享 MM 的线程与 `vfork` 子进程共用，并在进程退出为僵尸后仍保留至最后查询结束），综合考量旧身份关系、主程序与解释器是否可读以及权限是否提升，决定其他进程能否通过 `ptrace` 或 `/proc` 访问该映像。
+- **关联属性清理**：当 `setuid`/`setgid` 生效时清除 `personality` 中的受限标志（`KERNEL_PERSONALITY_CLEAR_ON_SETID`）；当 `AT_SECURE` 为真时清除父进程死亡信号（`parent_death_signal`）。
 
-RISC-V 后端固定 Sv39/4 KiB，并支持：
+---
 
-- 非 PIE `ET_EXEC`，有或无 `PT_INTERP`；
-- 带解释器的 PIE `ET_DYN`；
-- 无解释器的 `ET_DYN`。
+## 四、新映像布局与不可返回提交
 
-`PT_LOAD` 不在 exec 时复制整段文件，而登记 `ELF_PRIVATE` VMA。完整文件页使用 page cache+COW，文件/BSS 边界和 BSS 页按需建立私有页。缺页 I/O 在用户边界产生 `SIGBUS`，物理耗尽终止本次用户操作；新建可执行页完成架构转换失效和取指同步后才可取指（RV 为 `SFENCE.VMA`/`FENCE.I`，LA 为 `INVTLB`/`IBAR`）。source 的 program headers 只解析一次，避免重新读取造成 TOCTOU。
+### 4.1 统一双架构 ELF 装载
 
-布局从随机核心产生独立的 PIE/解释器 bias、mmap base、stack、brk 和 vDSO 随机量；无启动材料时的布局及始终发布的 `AT_RANDOM` 见[共同 ELF 路径](user-elf.md#地址布局和初始栈)。初始 PC 是解释器入口（若有），`AT_ENTRY` 始终为主程序入口；初始栈保存真实 `AT_PHDR`、`AT_BASE`、`AT_ENTRY`、`AT_HWCAP`、`AT_RANDOM`、`AT_EXECFN`、指向 vDSO ELF 的 `AT_SYSINFO_EHDR` 等 auxv。入口 SP 按 RISC-V psABI 16 字节对齐，scheduler 允许入口页尚未驻留，但必须属于可执行 VMA。
+`kernel_exec_image_prepare()` 通过构建期绑定的页表分配器调用 `kernel_elf_image_build()`，在 RV64（Sv39，4 KiB 页）与 LA64（16 KiB 页）上统一支持非位置无关可执行文件（`ET_EXEC`，含或不含 `PT_INTERP`）与位置无关可执行文件（Position-Independent Executable，PIE，`ET_DYN`，含或不含 `PT_INTERP`）：
 
-## 不可返回提交
+- **按需映射与防检查-使用竞态（TOCTOU）**：程序头表在创建只读 `kernel_elf64_source` 时只解析一次，避免运行中文件内容变化导致不一致。`PT_LOAD` 段不立即拷贝整个文件，而是登记为 `ELF_PRIVATE` VMA，完整文件页复用页缓存与写时复制（Copy-on-Write，COW），文件末尾与未初始化数据段（BSS）按需分配零页。新建可执行页在架构层完成地址转换缓存刷新与指令缓存同步（RV64 执行 `SFENCE.VMA` / `FENCE.I`，LA64 执行 `INVTLB` / `IBAR`）。
+- **地址空间随机化与初始栈**：内核为 PIE 基址、解释器基址、`mmap` 基址、用户栈、堆顶（`brk`）与虚拟动态共享对象（Virtual Dynamic Shared Object，vDSO）注入独立随机偏移，在初始 16 字节对齐栈上填入 `argc`、`argv`、`envp` 以及完整的 `AT_PHDR`、`AT_BASE`、`AT_ENTRY`、`AT_HWCAP`、`AT_RANDOM`、`AT_EXECFN`、`AT_SYSINFO_EHDR`、`AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID` 与 `AT_SECURE`。
 
-提交前 scheduler 验证当前 task、新 MM 的 `satp`、入口可执行 VMA/PTE、栈 RW PTE 和 SP 对齐。线程组 exec 先终止其他成员并等待其调用栈与资源清理完成；非组长调用者接管原 TGID 和父子树位置。竞争 exec 的未提交事务由退出路径清理。随后：
+### 4.2 不可返回提交边界
 
-```text
-旧 MM 上使用原 TID 清理 robust-list
--> 分离仍被其他进程共享的信号动作表和文件表
--> 清 TID 并注销旧 MM 使用者，撤下 FD_CLOEXEC 槽，保留尚待清理的 OFD owner
--> 激活新地址空间
--> 在调度短锁内将 old MM 移入待清理 owner，同时发布新 MM 与候选凭据
--> 安装缓存地址空间信息，清零并重建 Trap Frame
--> 清理 old MM、source 和事务 owner
--> sret 到新入口
-```
+当 `kernel_scheduler_exec_commit()` 校验新 MM 上下文、入口可执行 VMA 以及用户栈可读写权限和 16 字节对齐无误后，进入不可返回点：
 
-提交后不撤销新映像。TGID、调用线程的 cwd 和 fs context、线程组的完整资源限额记录和非 `FD_CLOEXEC` fd/OFD offset 保留；共享文件表按实际槽位复制，旧表和复制失败时的 owner 由事务清理；新栈布局按保留的软限制建立。非组长执行 exec 时调用线程接管原 TGID 作为 TID，旧 TID 释放。信号 disposition 按 exec 规则重置，F/D 状态清零。vfork 的旧 MM 引用归还后即唤醒父进程，其余 source 或文件表的清理错误由事务继续重试，不延误父进程，也不改写新映像已经成功的结果。
+1. **线程组收敛**：若当前进程是多线程组，先终止其余成员并等待其资源与调用栈回收；若调用者并非原线程组组长，则接管原线程组标识符（Thread Group Identifier，TGID）与父子树位置，并释放旧线程标识符（Thread Identifier，TID）。
+2. **解绑旧共享状态**：在旧地址空间上使用原 TID 清理健壮快速用户态互斥锁（Robust Futex）链表，分离与其他进程共享的信号动作表与文件描述符表，随后注销旧 MM 使用者并关闭所有标记为 `FD_CLOEXEC` 的槽位。
+3. **原子切换与现场重建**：激活新地址空间页表，在调度域短锁内一次性替换 `thread->mm`、`thread->credentials`、`thread->exec_security` 与 `thread->personality`（继承原有 `coredump_filter`，清除 `fork_no_exec`），更新进程名 `comm`，清零浮点/向量寄存器并重建指向新入口与新栈顶的陷入帧，按 POSIX 规则重置信号处置动作。
+4. **收尾与外部通知**：唤醒等待旧地址空间归还的 `vfork` 父进程，尝试清理旧 MM 与事务临时资源（若底层设备关闭失败则保留事务对象延后重试，不影响新映像已成功的事实），最后触发 `kernel_ptrace_exec()` 通知调试器。
 
-## 验证与边界
+---
+
+<details>
+<summary>展开查看：边界语义契约与定向验证命令</summary>
+
+### 关键边界与错误优先级
+
+- **`execveat` 参数与错误顺序**：`dirfd` 与 `flags` 按 32 位有符号/无符号整数截断；未知标志（仅允许 `AT_EMPTY_PATH`、`AT_SYMLINK_NOFOLLOW`）返回 `-EINVAL`。`RLIMIT_NPROC` 超限与非法标志错误优先于路径名读取错误返回；未指定 `AT_EMPTY_PATH` 时的空路径返回 `-ENOENT`；路径和文件打开错误优先于 `argv`/`envp` 导入错误。
+- **`#!` 脚本解析细则**：首行扫描窗口为 256 字节，遇 NUL 字符停止；以空格或制表符分隔解释器路径，剩余去除尾部空白的内容整体作为一个可选参数（若无换行，解释器路径本身不得被截断，可选参数允许截断；解释器后存在空白紧接 NUL/EOF 时保留一个空串参数）。每次展开剥离原 `argv[0]`，前置 `[解释器, (可选参数), 当前脚本名]`，`AT_EXECFN` 始终保留最初执行名。递归深度最多 5 层（第 6 层若仍是脚本，先报告其自身的格式或解释器打开错误，再次分派时返回 `-ELOOP`）。脚本解释器与 `PT_INTERP` 均相对进程的根与当前工作目录解析，不相对 `dirfd`。
+- **ELF 与解释器错误码**：主文件格式或目标架构不匹配返回 `-ENOEXEC`；解释器路径不存在保留路径错误码；解释器头部不足 64 字节返回 `-EIO`，完整头部但格式/架构非法或出现递归 `PT_INTERP` 返回 `-ELIBBAD`。
+- **空路径 `comm` 命名**：普通路径取原始路径基名（最多 15 字节）；`AT_EMPTY_PATH` 空路径执行时，从最终可执行文件（经 `#!` 展开后、不含 `PT_INTERP`）的目录项提取名称。
+
+### 定向验证命令
 
 ```sh
+# 主线进程替换、根盘初始化与 glibc 静态/动态/PIE 验收
 make test-exec-riscv
 make test-root-init-riscv
 make test-glibc-riscv
 make test-riscv
+
+# argv/envp 容量边界（128 KiB 下限、栈软限额 1/4、6 MiB 上限与单串 32 页边界）
+python3 tests/userland/run.py --workload exec_capacity --arch riscv --cpus 1 --memory 512M --only boaros
+python3 tests/userland/run.py --workload exec_capacity --arch loongarch --cpus 1 --memory 512M --only boaros
+python3 tests/tools/test-init-config.py
+
+# execveat 与双侧 Linux 差分（含脚本嵌套、CLOEXEC、noexec、set-ID 与 CLONE_FS）
+python3 tests/userland/run.py --workload execveat --arch riscv --cpus 1 --memory 512M --kernel <kernel> --output <dir>
+make test-diff-abi-riscv
+
+# 凭据与文件能力宿主反例及 ext4 扩展属性样本测试
+sh tests/host/credentials.sh
 ```
 
-动态 ET_DYN/解释器的生产构造已经接入；真实 userland runner 已验证动态 musl PIE、解释器、额外 DSO、初始 TLS 和运行中 dlopen TLS。固定 glibc 2.44 的静态、动态、PIE、静态 PIE 与 pthread/TLS/信号组合另由 `test-glibc-riscv` 双侧验证。更广重定位矩阵留待后续；LA原版动态musl/初始及late DSO TLS已双侧验证。参数预算遵循上文的 Linux 大小计费，不再以 128 KiB 限制完整序列化映像。
-
-`python3 tests/userland/run.py --workload exec_capacity --arch riscv --cpus 1 --memory 512M --only boaros` 聚焦 argv/envp 容量；`--arch loongarch` 检查 16 KiB 页的单字符串边界。用例覆盖软栈限额的四分之一、128 KiB 下限、6 MiB 上限及各精确边界后一字节，多量空字符串的指针成本，脚本沿用原指针预算，以及 E2BIG/EFAULT 后 PID、旧数据、FD_CLOEXEC、信号动作与再次 exec。`python3 tests/tools/test-init-config.py` 检查初始进程构建期的同类计费。
-
-`python3 tests/userland/run.py --workload execveat --arch riscv --cpus 1 --memory 512M --kernel <kernel> --output <目录>` 运行原版 musl ELF 的 Linux/BoarOS 对照；`--arch loongarch` 使用 LA 后端。用例检查路径与 fd 身份、错误先后、argv/envp/auxv、CLOEXEC、解释器、当前权限、noexec、写入排斥、非组长 exec、set-ID/filecap、NNP、nosuid 和 unsafe CLONE_FS。
-
-凭据规则的宿主直接反例使用 `sh tests/host/credentials.sh`，覆盖 4/16 KiB 页配置和候选／账户归还。`tests/workloads/credentials/exec.c` 用同一真实 ELF 检查 set-ID、filecap、auxv、安全加载、失败 exec、非组长 exec、CLONE_FS、CLOEXEC 与权限清除；`tests/userland/credentials-fixture.py` 向独立 ext4 测试盘写入数字 UID/GID 和固定 EA 样本，并读回校验。固定 Linux 对照须启用 `CONFIG_EXT4_FS_SECURITY`，否则 ext4 不提供文件 capability 属性。
-
-## 脚本执行
-
-`#!` 首行读取窗口为 256 字节，空格/tab 分隔解释器路径，剩余去尾空格/tab的内容
-作为一个可选参数。没有换行时解释器路径必须完整；允许截断可选参数。
-每次转换删除旧 argv[0]，前置解释器、可选参数和当前脚本路径；保留 envp，
-`AT_EXECFN` 保留最初执行名。普通路径保留用户原始拼写；非 `AT_FDCWD` 的相对
-`execveat` 路径使用 `/dev/fd/<fd>/<原路径>`，空名使用 `/dev/fd/<fd>`。这些名字
-同时作为最初脚本的 argv 名，后续脚本层使用自己的解释器路径。若该名字依赖
-`FD_CLOEXEC` 的 fd，脚本返回 ENOENT；ELF 可直接映射已打开文件，允许 CLOEXEC fd。
-`#!` 指定的解释器及 ELF 的 `PT_INTERP` 仍按进程 root/cwd 解析，不相对于 dirfd。
-最多五次转换，超过返回 ELOOP；打开解释器保留
-ENOENT/EACCES 等错误，无 shebang 文本仍返回 ENOEXEC，由用户 shell 决定回退。
-
-脚本 OFD 在打开下一解释器前释放，释放失败仍由 exec 事务持有；字符串与向量仍使用
-原有总长度限制，重组时回收被丢弃 argv[0] 的序列化空间。失败不替换 MM、cwd 或 fd。
-聚焦命令为 `make test-diff-abi-riscv test-exec-riscv`；后者的缺失 `/bin/sh`
-fixture 现在验证 ENOENT。BusyBox 的回退与动态加载器搜索必须另用真实 shell 验证。
-
-深度检查发生在再次分派格式处理器之前；最后允许的脚本层仍先报告自身的 ENOEXEC 或解释器 ENOENT，不能用 ELOOP 提前掩盖这些错误。差分 `exec.script-five/six/depth-*` 覆盖边界。
-
-首行扫描遇 NUL 停止；无换行且解释器后有分隔空格、随后为 NUL/文件结束时，可选参数存在但长度为零，仍须保留空 argv。`exec.script-empty-arg-*` 与固定 Linux 双侧验证。
+</details>

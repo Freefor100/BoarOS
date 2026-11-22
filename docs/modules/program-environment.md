@@ -1,226 +1,153 @@
-# 用户程序构建环境
+# 用户程序构建环境与真实软件验证体系
 
-`tests/userland/inventory/environment.py` 为完整上游程序准备 RISC-V Linux 用户空间应用程序接口
-（Userspace Application Programming Interface，UAPI）头文件和 musl 1.2.5 工具链。它不修改 BusyBox 源码或关闭 applet，
-也不把宿主 glibc 头加入交叉编译器搜索路径。
+除了无 C 库的原生系统调用测试外，操作系统内核的工程成熟度最终必须接受**未经修改的上游真实用户态软件**检验——包括完整工具箱（BusyBox）、标准 C 库测试集（`libc-test`）、双架构 `glibc` 动态链接生态、客体内原生编译器（GCC + GNU Make 编译完整 Lua 工程）以及数据库事务与断电恢复（SQLite）。本文基于 `tests/userland/inventory/`、`tests/workloads/toolchain/offline_c.c`、`tests/userland/glibc/` 与 `references/sources.tsv` 的实际配置，介绍 BoarOS 的确定性用户程序构建环境与全栈软件验证矩阵。
 
-## 构建入口
+---
 
-- `prepare()` 从 `references/linux` 导出 RISC-V UAPI 头文件，供 libc-test 等程序使用。
-- `prepare(uapi='busybox')` 从 [Linux v6.6 源码归档](https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.tar.xz)
-  导出旧版头文件。将归档放到 `references/linux-uapi/linux-6.6.tar.xz`。
-  这版头文件保留 BusyBox 1.33.1 的 `tc` 所需的队列规则定义。
-- `build_busybox()` 从 [程序输入配置](../../tests/userland/inventory/inputs.json)
-  选择 BusyBox 源码和配置，再用 musl 静态链接。
+## 一、源码组织与固定输入
 
-两个 `prepare` 结果都返回 `include`、`cflags`、工具与源码身份、头文件树哈希。
-调用方必须使用返回的完整 `cflags`；目前由 `-idirafter` 添加目标 UAPI，
-并在编译器支持时使用 `-fno-link-libatomic`，避免发行版交叉 GCC 自动加入
-不存在的 `atomic_asneeded`。musl 自带头仍先于 Linux UAPI。
+| 路径 | 核心职责 |
+| :--- | :--- |
+| `tests/userland/inventory/environment.py` | 导出固定版本 RISC-V Linux **用户空间应用程序接口（UAPI）**头文件，校验 musl 1.2.5 工具链并构建完整 BusyBox |
+| `tests/userland/inventory/inputs.json` | 锁定 `oscomp/testsuits-for-oskernel` 提交、BusyBox 配置、`pre-2025` `libc-test` 修订及 BusyBox 专用 Linux v6.6 UAPI |
+| `tests/userland/inventory/{libc_build,run,suites,reports}.py` | 双架构（RV64 / LA64）完整 `libc-test` 与 BusyBox 构建、双侧（Linux vs BoarOS）隔离执行与契约校验 |
+| `tests/userland/glibc/inputs*.json` | 锁定 RV64（GCC 16.2.1 + glibc 2.44）与 LA64（GCC 15.1.0 + glibc 2.42）交叉工具链与动态运行时二进制身份 |
+| `tests/workloads/toolchain/offline_c.c` | 客体内离线 C 编译五阶段探针（支持 ext4 与 tmpfs 工作目录），驱动 Alpine 原生 GCC/binutils 与完整 Lua 5.4.3 构建 |
+| `tests/host/{nbd_fault,block_fault}.c` | 面向 SQLite 3.53.4 回滚日志与预写日志（WAL）的宿主 NBD 易失写与断电故障注入服务器 |
+| `references/sources.tsv` | 所有上游源码仓库、发布包与 Alpine APK 闭包的固定 URL、提交哈希与 SHA-256 清单 |
 
-Linux 7.2 UAPI 已移除 CBQ 定义，而固定 BusyBox 的 `tc` 仍引用这些定义。
-完整 6.6 UAPI 是其编译环境；运行 Linux 内核继续使用固定 7.2 commit。
-这里不混搭单个历史头，也不为通过构建裁剪 `tc`。这只建立编译兼容性，
-不表示 BoarOS 已支持这些 applets 所需的全部系统调用。
+---
 
-## 失败、缓存和证据
+## 二、可复现工具链与双 UAPI 头文件环境
 
-固定源码 HEAD 或内容不符、archive 哈希错误、缺少工具、头文件导出或程序构建失败
-均抛错。BusyBox `oldconfig` 若改变任一功能设置也失败；自动生成日期不参与此比较。
-无 smoke 回退。`environment.json` 记录源码、工具及生成头的 SHA；只有身份与头文件树
-均匹配才复用，重建旧 UAPI 时重新提取校验过的 archive。
+`environment.py` 严格隔离宿主环境变量（清除 `CPATH`、`C_INCLUDE_PATH`、`LIBRARY_PATH` 等，固定 `LC_ALL=C`、`TZ=UTC`），绝不将宿主 glibc 头文件混入交叉编译路径，并通过 `-idirafter` 确保 musl 1.2.5 自带头文件优先于 Linux UAPI：
 
-构建期间 `full-busybox/` 保存 `source.tar`、原配置、`competition.config`、configure/build
-日志、产物及 `build.json`；清理后只保留跨轮复用的源码构建树、配置、产物和身份文件。Linux 与 BusyBox 的源码许可证仍保留在各自固定来源或构建树中；
-校验后的 archive 保存在 `references/linux-uapi/linux-6.6.tar.xz`；临时解包源码和构建产物位于忽略的 `build/`，不复制进内核源树。
+```mermaid
+flowchart LR
+    Sources["固定来源: references/sources.tsv + inputs.json"]
+    RuntimeUAPI["prepare(): 导出主参考 Linux UAPI (供 libc-test 与通用程序)"]
+    BusyBoxUAPI["prepare(uapi=busybox): 导出 Linux v6.6 UAPI (保留 tc 所需 CBQ 定义)"]
+    Musl["musl 1.2.5 交叉编译器 + -fno-link-libatomic"]
+    Verify["环境指纹校验 (environment.json) + 静态头文件探针"]
 
-## 验证
+    Sources --> RuntimeUAPI
+    Sources --> BusyBoxUAPI
+    RuntimeUAPI --> Musl
+    BusyBoxUAPI --> Musl
+    Musl --> Verify
+```
 
-需要 `make`、宿主 GCC、RISC-V Linux GCC/binutils、`rsync`、`tar`、`curl` 与
-已构建的 musl 工具链。首次准备旧 UAPI 需下载固定 archive。
-`make prepare-program-environment`会沿其Make依赖构建musl；此前缺失工具时提示的
-`make musl-toolchain`不是有效目标，已改为上述真实入口。完整CI先用原程序runner
-`--build-only`准备两侧产物，再通过`--reuse-builds`核对和运行，失败不退回smoke输入。
+- **为何单独维护 Linux v6.6 UAPI**：较新的 Linux 主线 UAPI 已移除旧版流量控制队列规则（CBQ）定义，而上游固定版本 BusyBox 1.33.1 的 `tc` 小工具仍引用该定义。为坚持**零修改源码、零裁剪 applet**（保留全部 398 个 applet）原则，编译 BusyBox 时使用经 SHA-256 校验的完整 Linux v6.6 归档导出 UAPI，而运行时对比内核仍统一使用固定参考 Linux 提交。
+- **确定性缓存与失败阻断**：每次导出都会计算整个头文件目录树的 SHA-256 并编译运行静态探针，将工具链、源码与头文件哈希写入 `environment.json`。若源码 HEAD 不符、压缩包哈希错误或 `oldconfig` 意外改变了任何 BusyBox 功能开关，构建立即报错终止，绝不静默降级。
+
+---
+
+## 三、双架构真实程序清单（BusyBox + `libc-test`）
+
+`tests/userland/inventory/run.py` 在 **RISC-V 64** 与 **LoongArch 64** 上共用同一套上游用例、包装脚本与校验器，共覆盖 **229 个独立案例**：
+- **`libc-test`（219 项）**：完整编译上游 `pre-2025` 清单中的 **107 个静态链接**入口、**110 个动态链接**入口（RV64 解释器 `/lib/ld-musl-riscv64.so.1`，LA64 解释器 `/lib/ld-musl-loongarch64.so.1` 且链接 16 KiB 页对齐）以及静态/动态两份官方包装器。
+- **BusyBox（10 项）**：包含 `true`/`false`/`echo`/`cat`/`ls`/`sh`/`od`/`hexdump` 8 项基础调用、核对真实 RTC/内核日志/挂载容量的 `busybox.environment`，以及执行完整上游命令列表的 `busybox.official`。
+
+### 执行隔离与判定规则
+
+- **双侧同镜像隔离**：每个案例从同一基础 ext4 夹具克隆独立磁盘分别交由固定 Linux 与 BoarOS 运行；LA64 默认在 **512 MiB** 与 **1 GiB** 两种内存配置下执行完整矩阵，RV64 另支持 `--execution-profile rv-user-smp` 多核矩阵。
+- **监督驱动与输出判定**：客体内 `/init` 驱动挂载 `proc`、`sysfs`、`tmpfs`、`mqueue` 并配置 loopback，独立捕获子程序的 `stdout`/`stderr`、退出码、终止信号与超时。`reports.py` 对 `libc-test` 与基础命令执行严格逐字节一致比对；对包含真实时间戳/PID/磁盘容量的 `busybox.official` 则逐条解析全部命令契约与退出码，同时仍保留原始输出记录。
+- **磁盘回收策略**：每个案例的结果、日志完成 `fsync` 落盘后，通过案例自动删除三份可重建磁盘以节省空间，失败案例的磁盘与日志原样保留供排查（诊断时可加 `--keep-pass-images` 保留全部磁盘）。
+
+---
+
+## 四、双架构 glibc 动态运行时矩阵
+
+除 musl 外，BoarOS 还通过 `tests/userland/glibc/` 独立验证标准 GNU 工具链与完整 **glibc** 动态装载、**线程局部存储（Thread-Local Storage，TLS）**、`dlopen`、POSIX 线程取消与堆栈展开（`libgcc_s.so.1`）：
+
+| 架构 | 锁定工具链与运行时 | 动态加载器与页尺寸 | 验证程序形态（512 MiB / 1 GiB 双内存） |
+| :--- | :--- | :--- | :--- |
+| **RISC-V 64** | GCC 16.2.1 + glibc 2.44（`inputs.json`） | `/lib/ld-linux-riscv64-lp64d.so.1`（4 KiB 页） | 静态 `ET_EXEC`、动态 `ET_EXEC`、动态 `PIE`、静态 `PIE`、动态 `pthread PIE` + 独立 TLS 共享库 |
+| **LoongArch 64** | GCC 15.1.0 + glibc 2.42（`inputs-loongarch.json`） | `/usr/lib64/ld-linux-loongarch-lp64d.so.1`（16 KiB 页） | 同上五种 ELF 形态 + 独立 TLS 共享库（含完整的 `constructor`、`atexit`、阻塞取消清理与内核资源全归还检查） |
+
+---
+
+## 五、客体内原生离线编译、Lua 工程与 SQLite 断电恢复
+
+### 5.1 客体内原生 C 编译与完整 Lua 5.4.3 构建
+
+- **五阶段离线编译探针（`tests/workloads/toolchain/offline_c.c`）**：固定 Linux 与 BoarOS 运行同一静态 `/init`，解包来自官方 **Alpine Linux v3.22 `riscv64`** 的 16 个原生 APK 闭包（GCC 14.2.0-r6、binutils 2.44-r3、GNU Make 4.4.1-r3、musl 1.2.5-r12 及完整依赖库），在客体内依次执行：
+  1. `-E` 预处理（生成 `.i`）
+  2. `-S -O2` 编译（生成 `.s`）
+  3. `as` 汇编（生成 `.o`）
+  4. `-static -no-pie` 链接（生成可执行 ELF）
+  5. 运行新生成的可执行文件并捕获输出
+  - 每阶段将结果写入 `/work/stages.tsv` 并对产物和目录执行 `fsync`。宿主机在重放 ext4 日志后提取双侧全部产物，要求五阶段均以退出码 0 完成、全部中间/最终产物 **SHA-256 逐项一致**且文件系统检查通过。该探针同时支持 `tmpfs` 工作目录模式（将 `/work` 挂载为 64 MiB `tmpfs` 执行编译，结束后把产物拷贝至 `/offline-evidence` 供宿主核验）。
+- **原版 Lua 5.4.3 工程构建（`make test-offline-project-riscv`）**：在客体内直接调用原生 GNU Make 与 GCC 编译未修改的 Lua 5.4.3，覆盖干净 `-j1` 构建、无变化增量构建、单源文件增量编译、`clean` 重建、语法错误恢复、基于默认 **FIFO 令牌槽（jobserver）**的 `-j2` 并行构建、递归 jobserver 令牌回收及运行产出的 `lua`/`luac` 与 C 共享模块。
+
+### 5.2 SQLite 3.53.4 事务日志与 NBD 断电故障矩阵
+
+- **官方源码无修改构建**：直接解包官方 SQLite 3.53.4 合并源码（`sqlite-amalgamation-3530400.zip`），以 musl 1.2.5 编译静态与动态 CLI 及测试负载，启用 `THREADSAFE=1`、原生 Unix VFS 与 WAL 支持。
+- **常规多进程事务与恢复**：验证回滚日志（`journal_mode=DELETE`）与预写日志（`journal_mode=WAL`）模式下的多进程写者竞争、未提交大事务引发的临时目录探测（`faccessat`）与日志溢出（journal spill）、异常终止后的热日志（hot journal）恢复，以及跨重启的 `PRAGMA integrity_check`。
+- **NBD 逐事件写故障与断电注入**：宿主通过 `tests/host/nbd_fault.c` 与 `tests/host/block_fault.c` 向 QEMU 暴露符合 512 字节原子写、易失写缓冲与仅在 `FLUSH` 后落盘模型的 **网络块设备（Network Block Device，NBD）** 服务。测试框架对 SQLite 事务内的每一次写和刷盘事件精确编号，逐点注入写/刷盘错误或冻结磁盘模拟掉电，随后从持久化镜像重启客体恢复两次并运行 `e2fsck -fn`，严格验证未确认事务只能呈现完整旧值或完整新值、已确认提交绝不丢失且数据库与 ext4 均无损坏。
+
+---
+
+<details>
+<summary>展开查看：Alpine 原生编译闭包清单、产物清理与验证命令</summary>
+
+### 客体内离线编译 Alpine v3.22 `riscv64` 固定包清单
+
+| APK 包名 | 固定版本 | `.PKGINFO` 许可证 |
+| :--- | :--- | :--- |
+| `make` | `4.4.1-r3` | GPL-3.0-or-later |
+| `binutils` | `2.44-r3` | GPL-2.0-or-later AND LGPL-2.1-or-later AND BSD-3-Clause |
+| `gcc` | `14.2.0-r6` | GPL-2.0-or-later AND LGPL-2.1-or-later |
+| `gmp` | `6.3.0-r3` | LGPL-3.0-or-later OR GPL-2.0-or-later |
+| `isl26` | `0.26-r1` | MIT |
+| `jansson` | `2.14.1-r0` | MIT |
+| `libatomic` | `14.2.0-r6` | GPL-2.0-or-later AND LGPL-2.1-or-later |
+| `libgcc` | `14.2.0-r6` | GPL-2.0-or-later AND LGPL-2.1-or-later |
+| `libgomp` | `14.2.0-r6` | GPL-2.0-or-later AND LGPL-2.1-or-later |
+| `libstdc++` | `14.2.0-r6` | GPL-2.0-or-later AND LGPL-2.1-or-later |
+| `mpc1` | `1.3.1-r1` | LGPL-3.0-or-later |
+| `mpfr4` | `4.2.1_p1-r0` | LGPL-3.0-or-later |
+| `musl` / `musl-dev` | `1.2.5-r12` | MIT |
+| `zlib` | `1.3.2-r1` | Zlib |
+| `zstd-libs` | `1.5.7-r0` | BSD-3-Clause OR GPL-2.0-or-later |
+
+### 常用构建、验证与清理命令
 
 ```sh
+# 1. 环境准备与完整 BusyBox 构建
 make test-program-environment-host
 make prepare-program-environment
 make build-competition-busybox
-```
 
-host 测试保护源版本拒绝、头文件身份变化、配置功能不被裁剪及失败传播。
-真实构建还编译含 musl、Linux 和 RISC-V `asm` 头的静态 probe；完整 BusyBox
-产物必须交由 inventory 的 Linux/BoarOS 运行步骤继续验证。
+# 2. 双架构 229 项真实程序清单（BusyBox + libc-test）
+make inventory-userland-riscv
+python3 -B tests/userland/inventory/run.py --arch loongarch --reuse-builds --require-pass \
+  --output build/loongarch/inventory-check
 
-## 客体内离线 C 编译探针
-
-`tests/workloads/toolchain/offline_c.c` 是固定 Linux 与 BoarOS 共用的静态
-musl `/init`。它从 `/work/tools.conf` 读取客体内编译器、汇编器绝对路径，
-依次执行 `-E` 预处理、`-S` 编译、`as` 汇编、静态链接以及运行新 ELF。
-每步把退出码、信号或 `execve` errno 写入 `/work/stages.tsv`，失败后不执行
-依赖它的后续阶段。产物和目录均 `fsync`；宿主先重放 ext4 journal，再从
-两个独立镜像提取 `.i`、`.s`、`.o`、ELF 和程序输出，逐项比较 SHA-256、
-最终输出及文件系统检查。异常退出留下的 ext4 orphan 仅在严格核对修复项后
-按下次挂载语义清理；其他 fsck 修复仍使测试失败。版本字符串和目标文件存在本身不构成成功。
-
-`make test-offline-c-baseline-riscv` 是**诊断模式**：该镜像故意不安装客体编译器，
-同一 ELF 在两侧均应准确停在 `preprocess:exec:2`。它通过只说明探针可定位
-首个失败，不说明离线编译已可用。`make test-offline-c-riscv` 是**严格模式**，
-先验证并解包固定 Alpine v3.22 riscv64 APK 闭包到忽略的
-`build/offline-c/alpine-tree/`，再要求五阶段全部退出 0、产物齐全且哈希
-双侧一致、运行输出逐字节匹配；缺少固定编译器输入即失败。
-`OFFLINE_C_LINUX_KERNEL` 可指定已有的对照 Linux 内核。未指定时沿用对照构建入口。
-`make prepare-offline-c-toolchain` 单独准备编译器树，所需的 Alpine 包由
-[构建输入清单](../../references/sources.tsv)提供。
-
-runner 从同一稀疏 ext4 fixture 建立 Linux 与 BoarOS 的独立原始镜像，
-复制时保留空洞，避免为零区分配和写入宿主空间；QEMU 启动前同步 fixture
-与各副本，使镜像准备的写回成本单独计入准备阶段。预同步不代替客体块驱动
-对普通块读写的 30 秒请求期限，也不改变镜像内容、后续 journal 重放及产物比较
-规则。runner 记录副本的逻辑/占用字节和复制同步耗时供本次诊断，不设墙钟
-性能门槛。
-
-| APK 包名 | 固定版本 | `.PKGINFO` 许可 |
-|---|---|---|
-| make | 4.4.1-r3 | GPL-3.0-or-later |
-| binutils | 2.44-r3 | GPL-2.0-or-later AND LGPL-2.1-or-later AND BSD-3-Clause |
-| gcc | 14.2.0-r6 | GPL-2.0-or-later AND LGPL-2.1-or-later |
-| gmp | 6.3.0-r3 | LGPL-3.0-or-later OR GPL-2.0-or-later |
-| isl26 | 0.26-r1 | MIT |
-| jansson | 2.14.1-r0 | MIT |
-| libatomic | 14.2.0-r6 | GPL-2.0-or-later AND LGPL-2.1-or-later |
-| libgcc | 14.2.0-r6 | GPL-2.0-or-later AND LGPL-2.1-or-later |
-| libgomp | 14.2.0-r6 | GPL-2.0-or-later AND LGPL-2.1-or-later |
-| libstdc++ | 14.2.0-r6 | GPL-2.0-or-later AND LGPL-2.1-or-later |
-| mpc1 | 1.3.1-r1 | LGPL-3.0-or-later |
-| mpfr4 | 4.2.1_p1-r0 | LGPL-3.0-or-later |
-| musl | 1.2.5-r12 | MIT |
-| musl-dev | 1.2.5-r12 | MIT |
-| zlib | 1.3.2-r1 | Zlib |
-| zstd-libs | 1.5.7-r0 | BSD-3-Clause OR GPL-2.0-or-later |
-
-小探针证明此固定C源码的五阶段；中等工程流程见下节。C++、Rust或持续本机自举仍需独立验证。
-原版 libc-test `functional/socket.c` 的静态和动态 entry 可单独验收：
-
-```sh
+# 单例快速验收（例如 libc-test 静态与动态 socket）
 python3 tests/userland/inventory/run.py --suite libc \
-  --case libc.static.socket --case libc.dynamic.socket \
-  --require-pass --output build/socket-program-check
+  --case libc.static.socket --case libc.dynamic.socket --require-pass --output build/socket-check
+
+# 3. 双架构 glibc 五形态矩阵
+make test-glibc-riscv
+make test-glibc-loongarch
+
+# 4. 客体内离线 C 编译探针与原版 Lua 5.4.3 工程
+make prepare-offline-c-toolchain
+make test-offline-c-baseline-riscv   # 诊断基线：故意不装编译器，验证停在 preprocess:exec:2
+make test-offline-c-riscv            # 严格五阶段编译与 SHA-256 双侧一致校验
+make test-offline-c-tmpfs-riscv      # tmpfs 工作目录编译校验
+make test-offline-project-riscv      # 原版 Lua 5.4.3 多场景与 -j2 FIFO jobserver 构建
+
+# 5. SQLite 3.53.4 回滚 / WAL 与 NBD 断电故障矩阵
+make test-nbd-host
+make test-sqlite-rollback-riscv test-sqlite-wal-riscv
+make test-sqlite-recovery-riscv test-sqlite-recovery-matrix-riscv
+make test-sqlite-wal-recovery-riscv test-sqlite-wal-recovery-matrix-riscv
+
+# 6. 预览并清理一次性运行目录与临时镜像（保留工具链、SDK 与活动 worktree）
+python3 tests/tools/prune-build.py
+make prune-build
 ```
 
-源码版本由[程序输入配置](../../tests/userland/inventory/inputs.json)选择，
-同一 ELF 分别在固定 Linux 与 BoarOS 的独立镜像执行，并要求原始输出、退出状态与
-环境准备同时通过。复用已核验的构建缓存时可加 `--reuse-builds`。
-
-## SQLite 日志与 NBD 故障入口
-
-将官方 [SQLite 3.53.4 源码包](https://www.sqlite.org/2026/sqlite-amalgamation-3530400.zip) 放入 `references/sqlite/`。构建直接解包到 `build/riscv/sqlite/`，不修改上游源码；复用 musl 1.2.5 工具链，保留线程支持、WAL 编译能力及原生 Unix VFS。回滚负载实际检查版本、`THREADSAFE=1`、VFS 名和 `journal_mode=DELETE`、`locking_mode=NORMAL`、`mmap_size=0`、`synchronous=EXTRA/FULL` 返回值。静态与动态 CLI 的可执行文件由同一固定源码编译。
-
-`make test-sqlite-rollback-riscv` 在真实 U-mode 覆盖建表、提交/回滚、独立进程 writer 冲突、未提交大事务进程直接退出后的同次启动 hot journal 恢复、关闭重开，以及两种 CLI 对同盘数据库的 `integrity_check`。`make test-sqlite-nbd-riscv` 把同一负载接入宿主 C NBD 服务。`make test-sqlite-recovery-riscv` 以同一静态 ELF 在对照 Linux 与 BoarOS 执行 setup/mutate/recover；BoarOS 的 `EXTRA`、`FULL`、热日志与已确认提交路径经 NBD 重启两次，并用 `e2fsck -fn` 核对 ext4。小缓存 24 行事务制造 journal spill；恢复程序逐字节检查每行值、整事务状态和 `integrity_check`。
-
-`make test-sqlite-wal-riscv` 用同一静态 ELF、官方 Unix VFS、`journal_mode=WAL`、`locking_mode=NORMAL`、`mmap_size=0` 和 `synchronous=FULL` 分别在上述固定 Linux 与 BoarOS 启动两次。首次启动核对版本与 PRAGMA、独立进程 writer 竞争、先后提交及另一进程持有未提交事务直接退出；关闭重开与第二次启动都检查三条已提交记录、未提交记录缺席和 `integrity_check`。该入口证明普通多进程 WAL 的组合 ABI，不替代 NBD 断电故障矩阵或实板持久性验证。
-
-`make test-sqlite-wal-recovery-riscv` 与 `make test-sqlite-wal-recovery-matrix-riscv` 复用回滚日志的同一静态 ELF 和 NBD runner，通过客体 `/journal` 选择 WAL；启动核对实际 `journal_mode`，分别执行 EXTRA/FULL 正常事务、未关闭进程的 hot 状态、已确认提交、FULL 写/flush 失败及逐事件断电/错误矩阵。断电先冻结 NBD，再终止 QEMU，从稳定镜像启动新客体恢复两次，并运行 `e2fsck -fn`。恢复检查整事务旧值或新值、已确认提交保留新值、`integrity_check`；此入口仍只证明隔离镜像上的既定故障模型。
-
-SQLite 大事务需要 Unix VFS 探测临时目录。固定 `build/riscv/sqlite/sqlite-amalgamation-3530400/sqlite3.c::unixTempFileDir` 用 `access(path, W_OK|X_OK)`；musl 1.2.5将其转为 RV64 `faccessat` syscall 48。BoarOS 之前返回 `ENOSYS`，使 SQLite 在 journal spill 时返回 `SQLITE_IOERR_GETTEMPPATH`。当前按调用线程真实 UID/GID、补充组和 capability 检查目录搜索与最终对象权限，再判断最终挂载是否只读；普通文件执行仍要求相应执行位。`tests/diff-abi/access.c` 用固定 Linux 同一 ELF 验证该 raw ABI 的路径、mode 和 fault 边界。
-
-`tests/host/nbd_fault.c` 经 Unix socket 给 QEMU 提供 fixed-newstyle、simple replies 的 READ/WRITE/FLUSH/DISC，只宣告 `HAS_FLAGS|SEND_FLUSH`。`tests/host/block_fault.c` 是 512 字节原子写、易失可见内容、稳定镜像的真实故障模型；只有成功 FLUSH 承诺此前事件持久化。`make test-nbd-host` 检查握手、读写、写/flush 失败和丢失、部分保存、反序保存。`make test-sqlite-recovery-matrix-riscv` 使用串口与宿主信号握手，仅对 SQLite 事务内的 NBD 事件编号，逐个注入写/flush 错误和断电位置；断电先冻结服务，再杀 QEMU，从同一稳定初态恢复。断电切点的事件上限由与该次运行相同的 none/odd/reverse 持久化策略分别探测；默认策略探针只用于写/flush 故障点，不能把它的事件数借给其他策略。2026-09-27 的 DELETE 小事务有 100 次写和 47 次 flush；441 个断电组合与逐位置 147 个写/flush 失败均通过。这些入口使用隔离镜像，成功后清理一次性目录；未确认提交只允许完整旧值或完整新值，已确认提交必须保留新值。不证明实板持久性。
-
-## glibc 独立矩阵
-
-`tests/userland/glibc/inputs.json` 固定 RV64 GNU 工具链及 loader、`libc.so.6`、
-`libgcc_s.so.1` 的机器身份。当前 GNU 工具链为 GCC 16.2.1，libc 为 glibc 2.44；
-身份不符即失败，不用另一套运行库代跑。glibc 可能直到 pthread 取消／退出时才加载
-unwind 库，因此程序进入 main 不能证明运行依赖完整。源码背景使用
-`references/glibc/glibc-2.44.tar.xz`，二进制身份与源码构建证明分别维护。
-
-`make test-glibc-riscv` 编译同一源的静态 ET_EXEC、动态 ET_EXEC、动态 PIE、静态
-PIE 和动态 pthread PIE，以及独立 TLS DSO。runner 将同一 ELF 和完整运行库放入
-Linux 7.2 与 BoarOS 的隔离 ext4 镜像，在512MiB/1GiB分别执行同一ELF，分 constructor/main、运行时、atexit 和资源
-回收检查。组合探针覆盖独立 TLS、dlopen、pthread 创建／join、阻塞读取期间的取消及
-cleanup handler、信号 handler 和正常退出。取消时管道与暂存 owner 仍由原请求及
-共享文件表清理；不能由缺库 abort 冒充内核取消语义测试。任一内存配置失败均使入口失败，
-保留独立镜像与日志；identity明确记录两种RAM，host反例保护配置遗漏和第二配置失败。
-
-glibc 2.44 的 `pthread_join` 通过 `FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME` 等待线程退出；初始试跑在 BoarOS 返回 ENOSYS，glibc 因意外 futex 错误退出。`tests/diff-abi/futex_shared.c` 的同一 ELF 现在对照固定 Linux 检查 bitset 零值、绝对时钟、用户 fault、按掩码唤醒与 requeue；`tests/userland/pthread.c` 进一步检查 stop/continue 重启保留掩码与原截止时刻。当前内核 realtime offset 启动后不变，可一次换算为 monotonic；引入调时 syscall 时需重新处理阻塞中的 realtime deadline。
-
-LA使用`inputs-loongarch.json`固定已安装GCC15.1.0和原版glibc2.42，完整sysroot、
-工具、GCC frontend、builtin headers、CRT、libgcc的内容/权限/链接目标均校验。
-`make test-glibc-loongarch`复用上述五形态与探针，在512MiB/1GiB各执行同ELF的
-Linux/BoarOS对照；loader的真实搜索目录为`/usr/lib64`。2026-10-06五形态全部
-通过完整阶段marker、退出42及根页/堆/任务栈回收。初始启动遇到SIMD SIGILL、
-之后缺AT_RANDOM的SIGSEGV；实现SIMD及DTB早期材料后重跑通过，不修改原libc。
-RV2.44与LA2.42版本差异不参与跨架构数值比较，probe版本断言由profile提供。
-
-## 双侧执行与失败所有权
-
-`make inventory-userland-riscv` 调用 `run.py` 构建上述完整 BusyBox 和
-`libc_build.py` 的固定 libc-test，再经 `suites.run_suite()` 逐例启动两侧 QEMU。
-`--reuse-builds` 显式复用已核验的 revision 和 ELF/DSO 校验值；默认重新构建。
-`--case`、`--suite` 缩小运行集合；`--require-pass` 对本次所选集合要求每项完成且通过，未选项保持历史结果或 `not-run`。未指定 `--case` 时全量 228 项均需完成且通过。执行状态保存本次 `selection`，恢复运行可改变集合而不把未选项伪装成通过；runner 中断、环境错误、参考侧失败与未知案例仍为失败。
-`--output` 指定本次核对目录，默认 `build/program-inventory-full`。运行期间默认在每个案例结果、日志、输出及其目录完成 `fsync` 后删除已通过案例的三份可重建磁盘；失败案例磁盘和 suite 基础 fixture 暂存，以便当轮诊断。诊断时可用 `--keep-pass-images` 保留新执行案例的全部磁盘。核对后用 `python3 tests/tools/prune-build.py` 预览、`make prune-build` 清理整个一次性运行目录和旧缓存。
-
-suite identity 包含程序/驱动/内核/执行器/校验器身份、QEMU 与磁盘工具身份和超时配置。
-镜像由同一 fixture 独立复制；每例持久化结果后才继续。中断留下显式未运行项；恢复前核对完整
-身份，输入变化要求新输出目录。构建或执行器异常直接失败，没有精简程序的自动回退。
-
-`/init` 驱动准备 proc、sysfs、tmpfs、mqueue 和 loopback，父进程监督真实子程序。
-stdout/stderr 分开保留，子程序的文本不能伪造驱动边界。驱动分别记录 setup 与 exec errno，
-以及 wait status、终止信号和超时；超时杀死并回收子进程，外层另有启动/客体退出超时。
-Linux 环境准备失败使该例成为无效参考；BoarOS 缺能力的诊断保留，并继续执行不依赖它的程序。
-
-`reports.py` 校验上游 BusyBox/libc 脚本的完整有序断言，shell 退出码不足以证明通过。
-只有参考有效且双方退出状态、完整原始输出一致才记为 `pass`。suite 的 `complete` 仅表示
-manifest 所有项目完成；清单本身不是必过测试。原始命令、日志、输出及失败案例磁盘保留；通过案例的磁盘可从固定输入和基础 fixture 重建。不能因
-环境或参考失败把 BoarOS 标为通过。固定输入与分类规则由该清单维护。
-
-公共镜像提供RTC的10:135别名和根块节点252:0。原BusyBox包装器显式按全部逐项
-contract和wait status比较，保留原输出及raw_output_equal；日期、内核日志、PID和容量
-随系统变化，不能据字节不同虚构程序失败。其他案例默认字节比较不变。独立
-`busybox.environment`核对日志-r/-c/-n、真实RTC内容和df/statfs同客体一致性。
-
-
-## 原版 Lua 工程
-
-固定Lua5.4.3（MIT）与GNU make4.4.1-r3，GCC14.2.0-r6及Alpine依赖保持原包。
-`tests/userland/offline-c.py --project lua`使用原Lua构建规则和默认FIFO jobserver；
-`make test-offline-project-riscv`执行干净-j1、无变化、单源增量、clean重建、语法错误与
-恢复、-j2及产物运行。Lua/luac、静态库嵌入及C共享模块由客体原GCC生成和实际执行。
-递归jobserver另用共享计数核对两份资格和令牌归还，中断后检查子进程与临时FIFO清理。
-
-`--performance --repeat 3`仅测独立启动的干净-j1/-j2和产物验证/收尾；
-`make test-offline-project-tmpfs-riscv`是一次相同工作量的tmpfs归因对照。
-`--observe --only boaros`使用默认关闭的COST构建；输出只留忽略的build。
-程序、同步、根卸载分别计时，卸载使用已有ROOT_DRAIN_FIXTURE，不增加用户ABI。
-固定Linux的PID1退出以panic停机，不能把它等同于BoarOS的根卸载；离线检查先重放日志。
-输入与输出身份由机器清单校验。
-
-## LA 与 RV 共用真实程序清单
-
-`tests/userland/inventory/{libc_build,run,suites}.py --arch loongarch` 使用同一固定
-BusyBox/libc-test 案例、原包装脚本、输出校验和失败分类。LA BusyBox 保留原398个
-applets/配置，用整数静态 musl；libc-test 用原 LP64D musl 1.2.5 构建全部
-107 静态、110 动态 entry 和两个原包装器，链接页对齐16KiB、解释器为
-`/lib/ld-musl-loongarch64.so.1`。完整安装树、工具及产物身份必须匹配；不改上游程序。
-
-默认 LA 按512MiB和1GiB各执行一次完整 Linux/BoarOS 矩阵，包括 official 平台
-案例，不能把512MiB标签下的启动偷偷改成1GiB。程序/两个内核在运行前冻结，
-逐案例记录真实 wait 状态、stdout/stderr、加载/运行/超时与资源退出；所有四份
-结果必须完整。RV 原默认入口保留。当前清单共229个ID：原228个加已有
-`busybox.environment`，两种LA RAM均229 pass，与本轮RV229 pass逐ID一致；历史
-上游失败保留在学习记录，本次通过不归因于未经单独复现的某个修复。
-
-```sh
-make prepare-la-tools prepare-la-linux-platform prepare-la-userland prepare-la-dynamic
-python3 -B tests/userland/inventory/libc_build.py --arch loongarch --jobs 8 --uapi-include build/loongarch/uapi/include
-python3 -B tests/userland/inventory/run.py --arch loongarch --reuse-builds --require-pass --output build/loongarch/inventory-check
-```
-
-运行期间冻结工具缓存，避免重链接导致短暂不可执行。runner-error 不是用户程序
-失败，必须保留原因并在同一身份下重跑对应未完成项。完整比赛Harness与客体原生
-开发工具另行验收；229个ID通过不证明所有BusyBox applet均能使用。
-
-`make prune-build` 删除 inventory/ABI/SQLite/RTC 和 GNU 运行目录、临时磁盘、旧探针
-及可重建的编译树；仅保留实际使用的已安装工具链/SDK与QEMU二进制及身份记录。内核对象、参考Linux和旧程序可按固定输入重新构建，
-不以被忽略的运行目录作为永久档案；活动 Git worktree 另行保护。
-`python3 -B tests/tools/test-prune-build.py` 独立保护这项缓存/运行产物选择契约。
+</details>
