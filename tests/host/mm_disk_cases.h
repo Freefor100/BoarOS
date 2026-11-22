@@ -473,8 +473,12 @@ static void disk_fault_batch_case(struct kernel_heap *heap,
     assert(!kernel_mm_madvise(&mm,first_hole,BOAROS_PAGE_SIZE,4));
     assert(!kernel_mm_madvise(&mm,second_hole,BOAROS_PAGE_SIZE,4));
     assert(kernel_mm_lookup(&mm,second_hole,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
-    assert(!kernel_mm_resolve_user_fault(&mm,first_hole,KERNEL_MM_READ));
-    assert(!kernel_mm_lookup(&mm,second_hole,&mapping) && !(mapping.permissions&KERNEL_MM_WRITE));
+    assert(!kernel_mm_resolve_user_fault(&mm,second_hole,KERNEL_MM_READ));
+    assert(!kernel_mm_lookup(&mm,first_hole,&mapping) && !(mapping.permissions&KERNEL_MM_WRITE));
+    value=0x61;
+    assert(!kernel_copy_to_user(&mm,second_hole,&value,1,&done) && done==1);
+    value=0;
+    assert(!kernel_vfs_pread(&file->file,3U*BOAROS_PAGE_SIZE,&value,1,&done,NULL) && value==0x61);
     uint64_t neighbour=placed+65536-BOAROS_PAGE_SIZE;
     assert(!kernel_mm_lookup(&mm,neighbour,&mapping));
     uint64_t physical=mapping.physical_address;
