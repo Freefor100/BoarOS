@@ -168,6 +168,25 @@ class OfficialFlowTests(unittest.TestCase):
         self.assertEqual(result.returncode, 7, result.stderr)
         self.assertEqual(result.stdout, 'real-result\n')
 
+    def test_published_input_skips_are_limited_to_exact_names(self):
+        names = ('float_bessel', 'float_exp_log', 'float_iperb', 'float_power',
+                 'float_trigo', 'io_setup01', 'io_setup02')
+        for name in names:
+            with self.subTest(name=name):
+                program = Path(self.temp.name) / name
+                program.write_text('#!/bin/sh\necho PROGRAM-RAN\n')
+                program.chmod(0o755)
+                result = subprocess.run(['sh', str(HERE / 'ltp-case.sh'), str(self.binary),
+                    str(HERE / 'ltp-skips.tsv'), '3', '/bin/sh', str(program)],
+                    capture_output=True, text=True, timeout=5)
+                if name == 'io_setup02':
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, 'PROGRAM-RAN\n')
+                else:
+                    self.assertEqual(result.returncode, 125, result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    self.assertIn('BOAROS-CASE SKIP', result.stderr)
+
     def test_diagnostic_exclusion_is_explicit_and_never_passes(self):
         program = Path(self.temp.name) / 'finite-workload'
         program.write_text('#!/bin/sh\necho real-work\nexit 7\n')

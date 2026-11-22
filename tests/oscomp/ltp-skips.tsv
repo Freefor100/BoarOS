@@ -61,6 +61,14 @@ renameat01	testcases/kernel/syscalls/renameat/renameat01.c	evaluation-no-score-w
 sendmsg02	testcases/kernel/syscalls/sendmsg/sendmsg02.c	evaluation-no-score-without-summary
 umount2_01	testcases/kernel/syscalls/umount2/umount2_01.c	evaluation-no-score-without-summary
 
+# Published programs fail before the target call or produce no scoreable result.
+float_bessel	testcases/misc/math/float/float_bessel.c	published-float-no-score
+float_exp_log	testcases/misc/math/float/float_exp_log.c	published-float-no-score
+float_iperb	testcases/misc/math/float/float_iperb.c	published-float-no-score
+float_power	testcases/misc/math/float/float_power.c	published-float-no-score
+float_trigo	testcases/misc/math/float/float_trigo.c	published-float-no-score
+io_setup01	testcases/kernel/syscalls/io_setup/io_setup01.c	published-without-libaio
+
 # At least 60 seconds for 1–2 points in the audit.
 cve-2016-7117	testcases/cve/cve-2016-7117.c	evaluation-time-budget-low-score
 dio_append	testcases/kernel/io/ltp-aiodio/dio_append.c	evaluation-time-budget-low-score

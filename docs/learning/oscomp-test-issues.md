@@ -13,10 +13,10 @@
 | 项目 | 如何判断原因 | 处理 |
 |---|---|---|
 | `acl1` | 原发布文件仅包含可选访问控制列表（Access Control List，ACL）依赖不可用时的提示分支。固定 LTP 源码在未定义 `HAVE_LIBACL` 时构建此分支，程序输出 `The acl library was missing upon compilation.`，退出 32。 | 保留原文件。要执行完整测试，需用 libacl 重新构建，并提供文件、目录及指定的数字用户和组。原盘直接无参执行也无法满足这些前提。完整测试打印 `ACL TESTS RESULTS`，判读应结合实际输出。见[固定源码](https://github.com/linux-test-project/ltp/blob/20240524/testcases/network/nfsv4/acl/acl1.c)。 |
-| `io_setup01` | 初赛盘中 RISC-V 和 LoongArch 的 glibc、musl 四份发布文件均编入了未定义 `HAVE_LIBAIO` 时的提示分支。测例构建时需检测到 `libaio.h` 并能链接 `libaio` 的 `io_setup`。发布文件启动后报告 `TCONF` 并退出 32，未发起 `io_setup` 系统调用。 | 在对应架构和 C 库的构建环境中准备头文件及库，重新构建固定版本的测例。原生异步输入输出入口现已接入通用内核；发布程序仍需重新构建才能进入该入口。见[原测例源码](https://github.com/linux-test-project/ltp/blob/20240524/testcases/kernel/syscalls/io_setup/io_setup01.c)及[构建检测](https://github.com/linux-test-project/ltp/blob/20240524/m4/ltp-eventfd.m4)。 |
+| `io_setup01` | 初赛盘中 RISC-V 和 LoongArch 的 glibc、musl 四份发布文件均编入了未定义 `HAVE_LIBAIO` 时的提示分支。测例构建时需检测到 `libaio.h` 并能链接 `libaio` 的 `io_setup`。发布文件启动后报告 `TCONF` 并退出 32，未发起 `io_setup` 系统调用。 | 在对应架构和 C 库的构建环境中准备头文件及库，重新构建固定版本的测例。通用内核已接入原生异步输入输出（Asynchronous I/O，AIO）。当前初赛盘只跳过这个程序。发布方更换目标头文件和库后重新构建，程序才能验证该入口。见[原测例源码](https://github.com/linux-test-project/ltp/blob/20240524/testcases/kernel/syscalls/io_setup/io_setup01.c)及[构建检测](https://github.com/linux-test-project/ltp/blob/20240524/m4/ltp-eventfd.m4)。 |
 | `setxattr01` 在 LoongArch glibc 上提示缺少 `mkfs.ext4` | 同环境直接启动 `mkfs.ext4` 成功，但 `system("exit 0")` 也返回 127。跟踪 glibc 的 `posix_spawn` 可见其 `clone3` 请求包含 `CLONE_CLEAR_SIGHAND`，旧内核返回 `EOPNOTSUPP`（95），该库仅在收到 `EINVAL` 或 `ENOSYS` 时回退。 | 通用内核已实现子进程信号动作重置语义，原测例无需修改。 |
 | 使用 `getpwnam("nobody")` 的测例 | `access01`、`mkdir02`、`readlink01`、`pidfd_send_signal02`、`pidfd_getfd02`、`mlock02`、`mlock202`、`shmctl02`、`mount03`、`umount03`、`mq_open01`、`mq_unlink01` 依赖原盘账户数据库。缺少 `/etc/passwd` 时，准备阶段在目标操作前结束。 | 保留原盘。验证数字身份相关权限时，使用明确创建测试账户的独立运行环境。 |
-| glibc 的 `float_*` | 线程取消或退出时，glibc 需要 `libgcc_s.so.1` 展开线程栈。缺少这一库时可在日志中看到加载失败。 | 归为该运行库配置缺失。 |
+| glibc 的 `float_*` | 线程取消或退出时，glibc 需要 `libgcc_s.so.1` 展开线程栈。缺少这一库时可在日志中看到加载失败。 | 此发布输入的五个浮点程序按确切名称跳过。两架构的 musl 变体也均无可计分摘要。 |
 | LoongArch 原盘的动态程序 | 加载器路径取自程序的 `PT_INTERP` 段。glibc 的 `/lib64/ld-linux-loongarch-lp64d.so.1` 和 musl 的 `/lib64/ld-musl-loongarch-lp64d.so.1` 须指向原盘对应的加载器。固定 Linux 下缺同名链接也会在执行阶段失败。 | 启动脚本按发布盘清单创建实际路径链接。 |
 | LoongArch musl 调度包装 | 原库的四个调度函数直接返回 `ENOSYS`。捕获系统调用可核对这些包装没有进入内核。 | 由[动态共享对象适配](../modules/oscomp-compat.md#调度适配)接入原生系统调用。 |
 | libc-test 的脚本解释器 | 发布的 `run-static.sh` 和 `run-dynamic.sh` 无解释器声明行。LoongArch 原 musl BusyBox 直接执行时也会在 Linux 上失败。 | 临时外层脚本改用原盘对应的 BusyBox `sh` 显式调用两行，保留内层脚本和参数。 |
@@ -55,7 +55,16 @@ BuildStorm 的 Rust 工具链曾在准备阶段中止。沿 `Child::wait_with_ou
 - **LoongArch musl `mremap06`。** 发布文件以 4 KiB 为拆分步长，在 16 KiB 页系统上
   传入未对齐的源和目标地址。同一文件在 16 KiB 页 Linux 上也在第一次搬移报告 `TBROK`。
 - **`sigtimedwait01`、`sigwaitinfo01`。** 测例要求信号打断空集合上的等待并返回
-  `EINTR`。原 musl 的包装会重试；空集合始终无法取得信号，因此等待可能持续到内部监督到期。
+  `EINTR`。BoarOS 和固定 Linux 的调用轨迹显示，`rt_sigtimedwait` 已返回 `EINTR`
+  且信号处理函数已执行，原 musl 随后重新调用 `rt_sigtimedwait`。两架构的原 musl 库都包含此重试。
+  空集合无法取得匹配信号，原程序等到内部监督到期。检查内核的中断与消费语义时，
+  应直接调用 `rt_sigtimedwait`，并分别测试匹配信号和空集合。
+- **`mmap04`。** 固定 RISC-V Linux 为 `PROT_WRITE` 的映射添加 `VM_READ`，
+  所以 `/proc/<pid>/maps` 显示 `rw-`，原测例要求 `-w-`。LoongArch 保留请求的逻辑权限，
+  只写映射显示 `-w-`，处理器的有效访问规则仍允许读。两架构应分别比较映射显示和实际访问。
+- **RISC-V musl 的 `mount07`。** 启用 `MS_NOSYMFOLLOW` 后，原库的 `realpath()`
+  返回 `ELOOP`。同一发布程序和库在固定 Linux 上也返回这个错误。直接打开链接报
+  `ELOOP`，`readlink()` 可读链接目标，`statfs()` 报告挂载属性，这三项均通过。
 - **原 musl `sendmsg01`。** 对 RISC-V 原库的反汇编显示，包装先从用户的
   `msg_control` 复制数据，再进入系统调用。非法指针可在用户态触发 `SIGSEGV`，
   同一原文件和库在 Linux 上表现一致。
@@ -104,117 +113,49 @@ BuildStorm 的 Rust 工具链曾在准备阶段中止。沿 `Child::wait_with_ou
 
 ## 初赛单项审计与 7200 秒整机预算
 
-本轮使用兼容分支 `3a46215d` 和初赛盘原程序、原判分。每组以一个虚拟处理器和 1 GiB 内存执行，按架构与 C 标准库统计。为观察慢项的真实进展，本地审计关闭了逐项监督。遇到已挂载设备影响后续格式化、或者压力程序迟迟未结束时，在干净运行副本中从余项继续。下表是合并各段后的本地覆盖和原始小计，可用于决定检查顺序，不能直接当作一次平台运行的耗时或得分。平台按原始分数加总，整机预算为 7200 秒。兼容分支默认单项监督为 120 秒，两者独立。
+[正式跳过表](../../tests/oscomp/ltp-skips.tsv)按程序名应用于两架构、两种 C 标准库。
+评测平台按通过断言的原始分数加总，虚拟机的整轮预算为 7200 秒。单项监督在启动测例时单独计时。
+遇到截断的串口日志时，使用组结束标记、单项完成记录和原判分区分零分与未运行。
+各次执行的逐项结果保存在本地 `build/`。
 
-| 配置 | 有结束记录的程序 | 其中有得分 | 原始分数 | 有通过断言但无分数 |
-|---|---:|---:|---:|---:|
-| LoongArch glibc | 2804 | 851 | 6935 | 174 |
-| LoongArch musl | 2785 | 841 | 6886 | 168 |
-| RISC-V glibc | 2803 | 859 | 6999 | 173 |
-| RISC-V musl | 2784 | 848 | 6954 | 165 |
-| 合计 | 11176 | 3399 | 27774 | 680 |
+- **控制器与输入。** 正式脚本逐项执行目录中的程序。跳过表排除无参数单独执行时缺控制器、
+  结构化输入或配套服务的辅助程序。其配套测试仍可按原方式启动这些程序。
+- **有通过结果但无可计分摘要。** 已核实的 19 个程序在四个配置下均通过断言且退出为零，
+  但无原判分所需的摘要。测例名称和源文件见跳过表。`epoll-ltp` 使用旧式汇总，
+  正式流程仍运行它。其摘要格式和断言分别判读。
+- **发布程序缺依赖。** 跳过 `io_setup01` 和五个浮点程序 `float_bessel`、
+  `float_exp_log`、`float_iperb`、`float_power`、`float_trigo`。对应构建条件和运行库见上表。
+- **耗时长且得分低。** `dio_append`、`dio_sparse`、`inotify09`、`mmap1`、
+  `mmap3`、`starvation`、`cve-2016-7117` 至少有一组耗时达到 60 秒，
+  四组的最高观察分均不超过 2 分。`fs_fill` 使用独立盘检查写满、同步与卸载。
+  `shm_test` 的默认压力场景无内部上限、无计分摘要，可使用独立短例验证共享内存。
+- **准备阶段失败。** `fanotify` 测例还可能依赖叠加文件系统（OverlayFS）、ext2 或
+  `debugfs`，应分别定位。配额测例也可能缺 `quotacheck`。`io_uring01/02` 和部分模块测例
+  先检查 Linux 内核配置，判分为零时需核对是否执行了系统调用。
+- **原生入口和发布头文件。** 原 RISC-V `futex_waitv01/02/03` 的头文件将调用号设为
+  无效值 `-1`。LoongArch 的 Linux 原生接口没有 `getrlimit03` 所要求的旧入口。
+  旧的 `socketcall`、`readdir` 和 16 位用户标识符测例也需要查实际架构接口和构建头文件。
 
-另有 144 个程序实例因原跳过表或本轮隔离故障而未计入完成数量。逐项记录见本地 `build/ltp-audit-20261121/cases.tsv`。其中 `observed-scores.tsv` 的最高观察分和判分端观察到的断言合计均来自本地输出。条件编译、同一程序的多种后端及未到达的分支都会影响这些值，不能据此给每个可执行文件指定固定满分。判分会计入 `Summary:` 中的 `passed`，所以有通过断言、同时有失败或准备中止的程序仍可能取得部分分数。
+### 现行测例判读
 
-### 四种配置都通过断言、均得 0 分的慢项
+- `fanotify13` 先按变体反复格式化和挂载测试盘。基础变体随后探测文件通知接口，
+  其余变体还需要叠加文件系统。当前四组均在这些前置条件处跳过，主要耗时来自格式化。
+  启用两项能力的固定 Linux 能执行通知断言，原程序可作为后续接口与文件系统集成的验收。
+- `fallocate05` 先预分配，再写满测试盘，最后验证写入预分配区、耗尽空间后的继续分配、
+  打洞及打洞后的写入。超时样本在 `tst_fill_fs` 中仍持续写入，后续断言尚未执行。
+  顺利完成填盘的配置通过四项断言。定位此类超时应先记录格式化、填盘完成量及测试自己的限时，
+  再看空间不足后的操作是否实际运行。
 
-下列 19 个独立程序逐个核对了四份串口记录。每个配置的退出状态均为 0，均有 `TPASS`，均未输出 `Summary:`，并且未出现 `TFAIL` 或 `TBROK`。表中通过断言条数为**每个配置中的条数**，耗时是四种配置分别测得的宿主墙钟范围。部分程序有条件跳过的分支，例如 `rename11` 的链接数上限检查。
-
-| 程序 | 确认执行的工作 | 通过断言 | 单次秒数 |
-|---|---|---:|---:|
-| `rename11` | 查验符号链接循环和只读文件系统的改名错误，后者需要测试盘准备；链接数上限分支跳过 | 2 | 102.4–184.7 |
-| `renameat01` | 相对和绝对路径的改名，及坏目录描述符、非目录、只读文件系统等错误 | 7 | 99.8–182.6 |
-| `inode02` | 多进程创建、打开、写入和读取文件，检查文件及索引节点的使用 | 1 | 29.4–34.8 |
-| `sendmsg02` | 启动并发发送者，按旧框架默认运行 15 秒后检查子进程结果 | 1 | 15.1 |
-| `kill02` | 检查组内进程收到信号、组外进程不收到信号 | 2 | 10.1 |
-| `ftest01` | 父子进程的读取、写入、截断和同步 | 2 | 7.7–11.9 |
-| `ftest07` | 向量读取与写入，包含截断和同步 | 1 | 7.9–9.3 |
-| `open12` | `O_APPEND`、`O_NOATIME`、`O_CLOEXEC`、`O_LARGEFILE` 四项 | 4 | 6.7–9.7 |
-| `umount2_01` | 独立测试盘上的普通卸载 | 1 | 5.8–10.4 |
-| `ftest05` | 并发文件读写、截断和同步 | 1 | 7.1–7.8 |
-| `mknodat02` | 目录描述符相对创建设备节点与错误条件，包括只读文件系统 | 9 | 5.8–8.8 |
-| `lchown03` | 符号链接循环及只读文件系统错误 | 2 | 5.8–8.4 |
-| `ftest03` | 向量读写与文件长度检查，包含截断和同步 | 1 | 6.4–7.6 |
-| `fcntl14_64` | 记录锁操作及跨进程的锁结果，使用 64 位接口构建变体 | 96 | 5.7–5.9 |
-| `fcntl14` | 记录锁操作及跨进程的锁结果 | 96 | 5.7–5.8 |
-| `nptl01` | 本地 POSIX 线程库（Native POSIX Thread Library，NPTL）线程压力用例完成 | 1 | 2.7–8.5 |
-| `rename14` | 多进程改名压力用例完成 | 1 | 5.1 |
-| `ftest08` | 向量读写、文件重开与同步 | 1 | 3.5–4.7 |
-| `ftest04` | 向量读写、文件大小和同步检查 | 1 | 3.4–4.1 |
-
-三个同为四组零分但跨库结果不同的程序需单独看。`epoll-ltp` 在 LoongArch 两种库和 RISC-V glibc 上各有 33 条通过断言且无摘要。RISC-V musl 有 32 条通过断言和 1 条失败，失败项要求负数参数的 `epoll_create` 返回错误。`semop05` 的 musl 变体约 20 秒后完成且无摘要，glibc 变体在线程退出时报告缺少 `libgcc_s.so.1`。`profil01` 的 glibc 变体约 5 秒后验证采样数据且无摘要，musl 变体输出 `TCONF`。这些差异应随库分类。
-
-### 其他慢零分项的实际阻塞点
-
-| 分类 | 测例与证据 |
-|---|---|
-| 账户准备 | `chdir01`、`creat09`、`mknod07`、`mount03`、`mount04`、`openat04`、`prctl06`、`rename12`、`swapon02`、`swapoff02`、`umount03`、`utime02/03/05` 均在 `getpwnam("nobody")` 中止。多个程序在查账户前已经格式化或挂载，因此几秒到十余秒主要花在准备。 |
-| 设备枚举与进程文件 | `sync01`、`syncfs01`、`fsync04`、`fdatasync03`、`sync_file_range02` 在 `opendir("/sys/block/")` 停止。`readahead02` 需要 `/proc/self/io`，`msync04` 需要 `/proc/self/pagemap`。这些是实际缺失的内核观察接口。日志中的失败位置在各自目标操作之前。 |
-| 文件系统能力 | `execveat03`、`inotify07/08` 跳过叠加文件系统 OverlayFS。`fanotify01/03/05/06/09/10/13/14/15/16/17/18/19` 在通知接口或其准备检查处跳过，`fanotify13` 另需 OverlayFS，`fanotify23` 先在挂载 ext2 时得到 `ENODEV`。`swapoff01` 在准备交换文件时调用 `FIEMAP` 查询文件区间的物理映射，返回 `ENOTTY`。`swapon03` 报告不支持交换空间。 |
-| 现有接口的选项缺口 | `preadv203` 和 `preadv203_64` 需要非阻塞缓存读取标志 `RWF_NOWAIT`。`statx10` 缺直接输入输出（Direct I/O）对齐报告 `STATX_DIOALIGN`，`statx12` 缺挂载根属性 `STATX_ATTR_MOUNT_ROOT`。`fsconfig01` 和 `fspick01` 都因 `sync` 参数返回 `EINVAL`，详见下节。 |
-| 原程序自己的超时 | `send02` 和 `statx11` 四组均由测例自身在约 30 秒时终止，分别卡在回环连接小报文进展和测试设备准备，见下文。 |
-| 运行库和脚本 | `float_bessel`、`float_exp_log`、`float_iperb`、`float_power`、`float_trigo` 的 glibc 路径存在缺少 `libgcc_s.so.1` 的退出故障，musl 的退出与输出另计。`lchown03_16` 所需的旧 16 位标识符接口不属于两种原生 64 位接口。`memcg_test_4.sh` 使用相对路径调用 `./memcg_test_4`，当前工作目录找不到该程序。`run_sched_cliserv.sh` 的脚本启动结果跨库不同，均未提供可计分摘要。 |
-| 压力程序与纯退出 | `hackbench`、`ebizzy`、`mmap-corruption01`、`mmap2` 结束时均无可计分断言。前两项分别施加进程通信／调度和内存分配负载。`mmstress` 有非零退出，四组均无摘要，现有日志不足以统一归因。 |
-
-### 耗时长但有分数的压力程序
-
-| 程序 | 本地墙钟与实际得分 | 如何用于验收 |
-|---|---|---|
-| `dio_sparse` | 四组约 1143–1462 秒，各 1 分 | 直接输入输出下的稀疏文件压力。以 120 秒逐项监督运行时，预算模型不能计入该 1 分。 |
-| `dio_append` | RISC-V 两组 967、1016 秒，各 1 分；LoongArch 两组准备时报告空间不足，0 分 | 追加压力和盘容量是两个条件。需要另外验收时固定测试盘容量，检查完成的迭代和实际文件内容。 |
-| `mmap1` | 四组约 180 秒，各 1 分 | 映射与并发压力，运行时间由原负载决定。 |
-| `mmap3` | 两组 musl 约 61–63 秒，各 1 分。两组 glibc 约 60 秒，0 分 | 多轮写入和修改文件映射，原程序运行上限为 60 秒。 |
-| `inotify09` | 三组约 150 秒，各 1 分；RISC-V musl 约 180 秒后程序超时，0 分 | 保留库差异，后者需另查事件与等待。 |
-| `starvation` | 四组约 215–231 秒，各 2 分 | 同时验证调度进展和完成条件，单项限时会切掉原工作量。 |
-| `cve-2016-7117` | 三组约 60 秒，各 1 分；RISC-V musl 约 90 秒后程序超时，0 分 | 与前文已经解决的时钟错误覆盖问题分开处理。 |
-| `mallocstress` | 四组约 7–35 秒，各 1 分 | 记录分配压力和实际结果，区分主机上快慢配置。 |
-| `shm_test` | 无可计分摘要。独立观察约 54 秒只完成前 30 轮，随后停止 | 默认 30 线程、每线程 1000 轮，每访问一个字节调用 `sched_yield` 主动让出处理器。程序无内部时限。已经看到进度，未证实死锁。 |
-| `fs_fill` | 修复后独立运行 LoongArch glibc 原程序约 54 秒，2 项通过 | 继续用独立可写盘验收写满、同步和卸载，当前正式跳过表仍排除此项。 |
-
-正式[跳过表](../../tests/oscomp/ltp-skips.tsv)按程序名应用于两架构、两种库。新增上节逐项核实的
-19 个无摘要零分项，以及 `cve-2016-7117`、`dio_append`、`dio_sparse`、`inotify09`、
-`mmap1`、`mmap3`、`starvation`。后七项至少有一组实测耗时达到 60 秒且只得 1–2 分，
-各组最高观察分均不超过 2 分。`mallocstress` 实测 7–35 秒，仍按原流程运行。
-`shm_test` 也列入正式表。其默认压力场景没有内部时间上限，也不输出原判分所需的摘要。
-本地看到线程持续推进，故按运行预算排除。评估共享内存功能时可以独立设置线程数和轮数。
-
-按本地 LoongArch 顺序和既有前置组耗时模拟，旧表加 120 秒监督约在 6418 秒结束。若按
-配置排除所有耗时至少 3 秒且通过断言但无摘要的实例，估算约 5609 秒，模型内原分相同。
-这两个数用于选择预算策略。新表使用跨配置证据和不同的程序名集合，其实际平台耗时和分数
-应以平台原判分为准。原发布程序仍可在独立短例或专用盘中执行。
-
-### 内核功能补齐清单
-
-| 优先验证的能力 | 本轮最直接的证据及分数边界 |
-|---|---|
-| 文件句柄与挂载属性 | `name_to_handle_at01/02` 和 `open_by_handle_at01/02` 在获取文件句柄阶段遇到 `ENOSYS`，后续按句柄打开不能继续。`fsconfig01` 对 `FSCONFIG_SET_PATH` 的 `sync` 键返回 `EINVAL`，`fspick01` 对字符串形式的 `sync` 同样失败，后者已经取得挂载重配置上下文。`fallocate04` 已经取得 1 分，随后因 `SEEK_HOLE` 不支持提前停止，剩余断言尚未执行。`lseek11` 也已直接确认普通文件的 `SEEK_DATA/SEEK_HOLE` 缺口。 |
-| 改名、调度和时钟选项 | `renameat201/202` 需要 `RENAME_EXCHANGE/RENAME_WHITEOUT`，`sched_getattr01` 和 `sched_setattr01` 需要截止期调度 `SCHED_DEADLINE`。`rtc01/02` 缺实时时钟（Real-Time Clock，RTC）的闹钟、更新中断或设时操作，`leapsec01` 缺闰秒插入。上述原程序在四种配置中均未得分。 |
-| 文件通知和文件系统观察 | `fanotify` 的初始化与监视接口缺失。原盘 23 个同名程序还可能依赖 OverlayFS 或其他文件系统，补齐入口后仍需逐项核对。设备枚举、进程读写统计、页表映射信息和文件区间映射接口见上一节。`wqueue01–09` 还需要 `O_NOTIFICATION_PIPE` 的内核事件通知管道。当前有匿名与共享内存大页，`hugemmap*` 等因缺大页文件系统 `hugetlbfs` 无法准备。 |
-| 进程记账、密钥和内存操作 | `acct01/02` 缺进程记账，`keyctl01` 及相关程序缺内核密钥管理，`userfaultfd01` 缺用户态缺页处理入口，`remap_file_pages01/02` 缺对应的旧映射操作。各接口族使用独立探针复核，再量化可恢复分数。`ioctl_ns03` 缺命名空间所有者标识查询，`ioctl_ns06` 缺用户命名空间。 |
-| 网络套接字选项与协议 | `accept02` 先设置 IPv4 组播成员选项 `MCAST_JOIN_GROUP`，随后才检查接纳。`setsockopt04` 依赖强制发送缓冲区选项 `SO_SNDBUFFORCE`。这两个接口已通过直接消费者验证。`setsockopt02` 在创建 `AF_PACKET` 后使用 `TPACKET_V3` 的 `PACKET_RX_RING`，该接口已接入。独立消费者覆盖普通收包、满环、映射及关闭，原测例的判分结果仍以实际评测为准。`sendto02` 需要流控制传输协议（Stream Control Transmission Protocol，SCTP）。`accept03` 已有 17 分，文件通知、用户态缺页处理及性能事件等描述符构造分支跳过。 |
-| 更大范围的内存、设备与异步接口 | 交换空间、非均匀内存访问（Non-Uniform Memory Access，NUMA）的内存策略和迁移、内存保护密钥、`io_uring`、模块装载、文件系统配额分别核对。配额原程序还缺 `quotacheck` 等工具，`io_uring01/02` 与部分模块测例先检查 Linux 配置；此类零分记录本身不足以证明已执行对应 syscall。 |
-| 已接入但原程序无法核对的接口 | 新版本已有原生异步输入输出（Asynchronous I/O，AIO）、`sync_file_range`、`adjtimex`、`clock_adjtime` 及 `membarrier`。发布盘的 `io_setup01` 在构建时缺 libaio，运行未调用内核。当前审计中 `sync_file_range01`、`clock_adjtime01`、`membarrier01` 已分别在四种配置得到 5、9、12 分。`perf_event_open01` 在配置检查阶段停止，现有内核接口也只覆盖有限事件。 |
-
-按架构提供的旧入口要另外处理。例如原 RISC-V `futex_waitv01/02/03` 使用的是发布程序构建时的无效系统调用号 `-1`，而 LoongArch 版本已执行断言。`getrlimit03` 在 LoongArch 期待该架构的 Linux 原生接口未提供的旧 `getrlimit` 入口，RISC-V 对应原程序有 16 分。类似的 16 位用户标识符、旧 `socketcall` 和 `readdir` 测例，先核对架构应用二进制接口（Application Binary Interface，ABI）及发布程序的头文件。
-
-#### 稀疏定位、文件查询与统计接口的判读
-
-- `lseek11` 已能查找普通文件的数据与空洞。`fallocate04` 中的预分配、打洞和
-  `FALLOC_FL_ZERO_RANGE` 均可在 ext4 上执行原断言。清零断言同时检查读回的内容和
-  已分配的空间。随后测试 `FALLOC_FL_COLLAPSE_RANGE`（从文件中移除指定区间并前移后续数据）
-  时仍得到 `EOPNOTSUPP`，原程序将其标为 `TCONF`（当前配置不支持）。
-- `statx10` 查询文件系统上的普通文件，`statx11` 查询块设备。普通文件现在通过与直接输入输出（Direct I/O）相同的后端报告对齐要求。
-  LoongArch glibc 原 `statx10` 执行了两条对齐断言。`statx12` 已通过路径和文件描述符
-  检查挂载根和普通文件，区分同一文件系统的不同挂载视图。
-- 同步测例读取的是整盘或分区 `stat` 文件内的已完成扇区数及设备忙时长。现在这些值由块层按实际请求采样，
-  `sync_file_range02` 和 `fdatasync03` 已能在 ext4 上完成真实同步量的断言。`/proc/self/io` 已可读取实际的进程与线程用量。
-  `readahead02` 还需要测试环境提供缓存控制及设备预读参数。`/proc/self/pagemap` 已能查询驻留页，
-  原版 `mmap12` 可执行真实驻留断言。`msync04` 从该文件得到物理页帧编号，再读取
-  `/proc/kpageflags` 判断脏页。当前在 ext4 上，它能验证写入共享映射会设置脏标志，
-  且 `msync(MS_SYNC)` 完成后清除标志。
-- `msync03` 的锁页区间遇 `MS_INVALIDATE` 现在按预期返回 `EBUSY`。原程序的六条断言均通过，
-  它仍无判分用的 `Summary:`。`ioctl_ns03` 对主机名与域名命名空间发出 `NS_GET_OWNER_UID`，
-  现在检查到了预期的 `EINVAL`。
+- `fallocate04` 可以验证预分配、打洞和 `FALLOC_FL_ZERO_RANGE`。其后的
+  `FALLOC_FL_COLLAPSE_RANGE` 要求移除文件区间并前移后续数据，当前返回
+  `EOPNOTSUPP`，原程序按配置跳过。
+- `statx10/11` 分别查询普通文件和块设备的直接输入输出（Direct I/O）对齐要求。
+  `statx12` 检查的是挂载视图的根目录属性。发布程序的对齐字段见下文。
+- `readahead02` 依赖进程读写统计、缓存控制及设备预读参数。`msync04` 从
+  `/proc/self/pagemap` 得到页帧编号，通过 `/proc/kpageflags` 观察写入共享映射后的
+  脏页及同步后的状态。`msync03` 的锁页断言可以通过，发布程序无可计分摘要。
+- `accept03`、`readahead01` 和 `splice07` 依赖多类描述符构造者。分支在构造时
+  跳过，表示目标系统调用未收到该类描述符。
 
 #### 文件句柄测例的标准输入假设
 
