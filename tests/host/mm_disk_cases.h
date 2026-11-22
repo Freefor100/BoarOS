@@ -13,14 +13,21 @@ static _Thread_local unsigned disk_forbid_backing_scans;
 static _Thread_local unsigned *disk_sync_count;
 static _Thread_local unsigned disk_required_ready;
 unsigned __real_kernel_page_cache_acquire_ready(struct kernel_page_cache *,
-    const struct kernel_vfs_file *, uint64_t, unsigned, uint64_t *, unsigned, unsigned);
+    const struct kernel_vfs_file *, uint64_t, unsigned, uint64_t *, unsigned, unsigned,
+    struct kernel_page_cache_alias_binding *);
 unsigned __wrap_kernel_page_cache_acquire_ready(struct kernel_page_cache *cache,
     const struct kernel_vfs_file *file, uint64_t first, unsigned selected,
-    uint64_t *addresses, unsigned capacity, unsigned required)
+    uint64_t *addresses, unsigned capacity, unsigned required,
+    struct kernel_page_cache_alias_binding *bindings)
 {
     unsigned ready=__real_kernel_page_cache_acquire_ready(cache,file,first,selected,
-        addresses,capacity,required);
-    if (required && (ready & required)) disk_required_ready++;
+        addresses,capacity,required,bindings);
+    if (required && (ready & required)) {
+        assert(bindings);
+        for (unsigned slot=0; (ready >> slot) != 0; slot++)
+            if (ready & (1U << slot)) assert(bindings[slot].entry);
+        disk_required_ready++;
+    }
     return ready;
 }
 void __real_riscv_smp_sync_user(uint32_t,uint64_t,uint64_t,int);

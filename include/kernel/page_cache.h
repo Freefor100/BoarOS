@@ -219,11 +219,15 @@ enum kernel_page_cache_status kernel_page_cache_lookup_ready(
     int no_reuse);
 
 /* Selected bits are offsets from first. Return READY pages with one physical
- * reference per bit, in index order. Return no owners if required bits miss. */
+ * reference per bit, in index order. Return no owners if required bits miss.
+ * Optional bindings record entries by bit index, valid while the caller
+ * keeps both the file I/O qualification and each acquired page reference. */
 #define KERNEL_PAGE_CACHE_READY_WINDOW (65536U / BOAROS_PAGE_SIZE)
+struct kernel_page_cache_alias_binding;
 unsigned kernel_page_cache_acquire_ready(struct kernel_page_cache *,
     const struct kernel_vfs_file *, uint64_t first, unsigned selected,
-    uint64_t *addresses, unsigned capacity, unsigned required);
+    uint64_t *addresses, unsigned capacity, unsigned required,
+    struct kernel_page_cache_alias_binding *);
 
 enum kernel_page_cache_status kernel_page_cache_alias_attach(
     struct kernel_page_cache *cache, const struct kernel_vfs_file *file,
@@ -232,11 +236,12 @@ enum kernel_page_cache_status kernel_page_cache_alias_attach(
     uint64_t virtual_address,
     int (*rearm)(void *owner, uint64_t virtual_address));
 struct kernel_page_cache_alias_binding {
+    struct kernel_page_cache_entry *entry;
     struct kernel_page_cache_alias *alias;
     uint64_t physical_address;
 };
-/* One binding per selected bit, in page order. The caller holds the file
- * mapping qualification and owns each mapped physical page. */
+/* Each selected bit indexes its binding. An entry captured during READY
+ * acquisition can be reused; an uncaptured demand page uses an index lookup. */
 void kernel_page_cache_alias_attach_window(struct kernel_page_cache *,
     const struct kernel_vfs_file *, uint64_t first, unsigned selected,
     const struct kernel_page_cache_alias_binding *);

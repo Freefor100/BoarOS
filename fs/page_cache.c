@@ -1483,19 +1483,13 @@ void kernel_page_cache_alias_attach_window(struct kernel_page_cache *cache,
     if (!selected) return;
     struct kernel_vfs_node *node = kernel_vfs_file_node(file);
     CACHE_SCOPE(guard, cache);
-    while (!(selected & 1U)) {
-        selected >>= 1;
-        first++;
-    }
-    struct kernel_page_cache_entry *entry = index_at_or_after(node, first);
-    for (uint64_t index = first; selected; selected >>= 1, index++) {
+    for (uint64_t index = first; selected; selected >>= 1, index++, bindings++) {
         if (!(selected & 1U)) continue;
-        while (entry && entry->page_index < index)
-            entry = RB_NEXT(kernel_page_cache_tree, &node->cache_pages, entry);
-        if (!entry || entry->page_index != index ||
+        struct kernel_page_cache_entry *entry = bindings->entry;
+        if (!entry) entry = index_find(node, index);
+        if (!entry || entry->page_index != index || entry_retired(entry) ||
             entry->physical_address != bindings->physical_address) __builtin_trap();
         link_alias(entry, bindings->alias);
-        bindings++;
     }
 }
 
@@ -1883,7 +1877,8 @@ enum kernel_page_cache_status kernel_page_cache_lookup(
 
 unsigned kernel_page_cache_acquire_ready(struct kernel_page_cache *cache,
     const struct kernel_vfs_file *file, uint64_t first, unsigned selected,
-    uint64_t *addresses, unsigned capacity, unsigned required)
+    uint64_t *addresses, unsigned capacity, unsigned required,
+    struct kernel_page_cache_alias_binding *bindings)
 {
     _Static_assert(KERNEL_PAGE_CACHE_READY_WINDOW <= PHYSICAL_PAGE_REFERENCE_BATCH_MAX &&
         KERNEL_PAGE_CACHE_READY_WINDOW < 32, "bounded cache and physical reference batch");
@@ -1891,6 +1886,9 @@ unsigned kernel_page_cache_acquire_ready(struct kernel_page_cache *cache,
     struct kernel_vfs_node *node = kernel_vfs_file_node(file);
     if (!cache_live(cache) || !node || !addresses ||
         selected >> KERNEL_PAGE_CACHE_READY_WINDOW) __builtin_trap();
+#if BOAROS_LOCK_DEBUG
+    if (bindings && !kernel_lock_held(&node->io_lock,0)) __builtin_trap();
+#endif
 #if BOAROS_MAX_CPUS > 1
     CACHE_INDEX_SCOPE(guard, node);
     if (node->cache_index_closed) return 0;
@@ -1902,11 +1900,15 @@ unsigned kernel_page_cache_acquire_ready(struct kernel_page_cache *cache,
     unsigned acquired = 0, count = 0;
     struct kernel_page_cache_entry *entry = index_at_or_after(node, first);
     while (entry && count < capacity && entry->page_index - first < KERNEL_PAGE_CACHE_READY_WINDOW) {
-        unsigned bit = 1U << (entry->page_index - first);
+        unsigned slot = entry->page_index - first;
+        unsigned bit = 1U << slot;
         if (bit > selected || !size || entry->page_index > (size - 1) >> BOAROS_PAGE_SHIFT) break;
         if ((selected & bit) && read_entry_ready(entry)) {
             addresses[count++] = entry->physical_address;
             acquired |= bit;
+            /* File I/O qualification excludes replacement; the physical
+             * reference excludes clean reclaim until alias publication. */
+            if (bindings) bindings[slot].entry = entry;
             note_read_access(cache, entry, 0);
         }
         entry = RB_NEXT(kernel_page_cache_tree, &node->cache_pages, entry);

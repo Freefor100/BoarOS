@@ -787,7 +787,7 @@ unsigned kernel_elf64_source_acquire_ready(struct kernel_elf64_source *source,
     struct kernel_page_cache *cache=kernel_open_file_page_cache(source->file);
     if (!cache) return 0;
     return kernel_page_cache_acquire_ready(cache,kernel_open_file_vfs_borrow(source->file),
-        offset>>BOAROS_PAGE_SHIFT,selected,addresses,capacity,0);
+        offset>>BOAROS_PAGE_SHIFT,selected,addresses,capacity,0,NULL);
 }
 
 static void zero_page(void *page, uint64_t page_size)
