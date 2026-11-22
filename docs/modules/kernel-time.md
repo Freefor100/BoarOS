@@ -37,11 +37,11 @@ CLOCK_REALTIME 的初始墙钟来自启动 RTC 探测，运行期可由有权限
 
 ## 运行时调钟与绝对等待
 
-`clock_settime(112)` 当前只设置 CLOCK_REALTIME；`settimeofday(170)` 支持 timeval 和可选 timezone。两者要求当前线程具有 CAP_SYS_TIME。时间输入采用原生 64 位秒及纳秒／微秒，遵循固定 Linux 的有效范围，并拒绝把墙钟设置到当前 MONOTONIC 之前。MONOTONIC、BOOTTIME、CPU 时钟、相对睡眠与 ITIMER_REAL 不随调钟改变。
+`clock_settime(112)` 当前只设置 CLOCK_REALTIME；`settimeofday(170)` 支持 timeval 和可选 timezone。两者要求当前线程具有 CAP_SYS_TIME。时间输入采用原生 64 位秒及纳秒／微秒，遵循固定 Linux 的有效范围，并拒绝把墙钟设置到当前 MONOTONIC 之前。MONOTONIC、BOOTTIME、CPU 时钟、普通相对睡眠与 ITIMER_REAL 不随墙钟阶跃改变。
 
 clock_settime 先检查时钟编号，再导入并验证 timespec，最后检查权限。settimeofday 先导入 timeval 并检查微秒，再导入 timezone，检查时间范围与权限，随后检查 minuteswest 在 -900～900 内。timezone 先发布，因此后续墙钟下限检查失败不撤销时区。第一次成功提供 timezone 时，若没有 timeval，则按 minuteswest 将软件墙钟调整一次；同时提供 timeval 只消费首次资格、不执行额外调整。dsttime 原样保存；此接口不配置地域时区数据库。
 
-调钟使用一个任务互斥串行完成发布和各期限索引调整。现有调度短保护内同时提交新偏移、更新 vDSO 数据并重排已提交的绝对 REALTIME 等待；记录保存原始墙钟期限，尚未阻塞的请求在提交时重新换算。MQ、futex BITSET/waitv/PI 及绝对 clock_nanosleep 因而不需要撤销登记再重排队，也不会把调钟冒充实际唤醒。相对请求继续使用 MONOTONIC。信号重启保留原时钟域和期限；处理函数可观察的 EINTR 与无处理函数的自动重启规则不变。
+调钟使用一个任务互斥串行完成发布和各期限索引调整。现有调度短保护内同时提交新偏移、更新 vDSO 数据并重排已提交的绝对 REALTIME 等待；记录保存原始墙钟期限，尚未阻塞的请求在提交时重新换算。MQ、futex BITSET/waitv/PI 及绝对 clock_nanosleep 因而不需要撤销登记再重排队，也不会把调钟冒充实际唤醒。沿单调时钟计算的相对请求继续使用 MONOTONIC。信号重启保留原时钟域和期限；处理函数可观察的 EINTR 与无处理函数的自动重启规则不变。
 
 timerfd 和 POSIX 墙钟索引在各自已有保护内更新，通知和信号投递在保护外完成；远端修改通过既有 deadline IPI 让 CPU0 重新编程事件。期限处理再次核对有效时钟，覆盖偏移已经提交、对象索引尚未更新时的倒拨。正常时钟查询不取得调钟互斥，也不扫描等待者。硬件实时时钟只在启动时提供初始墙钟。
 
@@ -51,13 +51,15 @@ timerfd 和 POSIX 墙钟索引在各自已有保护内更新，通知和信号�
 
 `adjtimex(171)` 和 `clock_adjtime(266, CLOCK_REALTIME)` 使用相同的 208 字节原生 `timex` 结构。零模式查询和 `ADJ_OFFSET_SS_READ` 余量查询向普通用户开放，修改要求系统校时能力 `CAP_SYS_TIME`。两种接口都先从用户空间读取整个结构。`clock_adjtime` 随后区分未知时钟编号（`EINVAL`）和可查询但缺少校时方法的时钟（`EOPNOTSUPP`）。
 
+国际原子时（International Atomic Time，TAI）使用 `CLOCK_TAI`，等于当前墙钟加已发布的整秒偏移。具有 `CAP_SYS_TIME` 的调用者可通过 `ADJ_TAI` 设置偏移，输入取 `timex.constant`，采用固定 Linux 的 0 至 100000 秒范围。查询从 `timex.tai` 返回当前值。只修改这项偏移时，在原时间序列中发布新值，只重算 TAI 睡眠和定时器的期限。墙钟阶跃同时影响墙钟和 TAI 期限。
+
 原始硬件时间构成 `CLOCK_MONOTONIC_RAW`。内核以最近一次修改参数时的一对原始时间与单调时间为基准，把此后的计数增量换算为校准后的单调时间。频率参数采用百万分之一的 1/65536 为单位，范围为 ±500 ppm（parts per million，百万分比）。`ADJ_TICK` 可在每百分之一秒 9000 至 11000 微秒之间设置名义时长。网络时间协议（Network Time Protocol，NTP）的锁相环（phase-locked loop，PLL）按时间常数逐秒衰减剩余相位，在采样间隔较长时还可使用锁频环（frequency-locked loop，FLL）更新频率。单次渐调独立保存尚待施加的有符号微秒数，每秒最多消耗 500 微秒。各项校正以定点数相加后统一取整，保证负频率与负相位同时生效时单调时钟仍向前推进。
 
 `ADJ_MAXERROR` 和 `ADJ_ESTERROR` 设置最大误差与估计误差。最大误差按每秒 500 微秒累积，超过 16 秒时进入未同步状态。查询用已经过去的秒数一次计算累计量。成功调用返回同步状态 `TIME_OK`（0）或 `TIME_ERROR`（5，时钟未同步或请求的每秒脉冲信号不可用）。`ADJ_SETOFFSET` 以秒和非负秒内偏移之和调整墙钟，清除尚未施加的渐调和相位，并将时钟标为未同步。
 
 参数修改时，调度器根据等待记录保存的时钟域和目标纳秒，重新计算已提交等待的硬件期限。`ppoll`、`pselect6`、两种 `epoll_pwait` 和 `semtimedop` 在调用时把相对时限换算为单调时钟的绝对目标，后续重新登记仍使用同一目标。定时器文件描述符和可移植操作系统接口（Portable Operating System Interface，POSIX）定时器分别重排自己的期限索引。只有墙钟阶跃才会向设置了 `TFD_TIMER_CANCEL_ON_SET` 的定时器发出取消通知。虚拟动态共享对象（virtual dynamic shared object，vDSO）与系统调用使用同一套时钟换算公式和序列检查。调度执行预算与中央处理器（central processing unit，CPU）运行时间始终使用原始计数。计时中断沿用已有粗粒度时钟采样与到期处理，校准不增加周期性任务遍历。
 
-`tests/host/clock_discipline.c` 用可控计数器检查渐调余量、误差增长、组合校正的单调性和逆向换算。`tests/userland/clock-discipline.c` 检查两种系统调用、权限、vDSO 查询、调速前已阻塞的睡眠和定时器，以及墙钟阶跃取消通知。闰秒和国际原子时（International Atomic Time，TAI）偏移设置返回 `EOPNOTSUPP`。
+`tests/host/clock_discipline.c` 用可控计数器检查渐调余量、误差增长、TAI 偏移、组合校正的单调性和逆向换算。`tests/userland/clock-discipline.c` 检查两种系统调用、权限、vDSO 查询、调速前已阻塞的睡眠和定时器，以及墙钟阶跃取消通知。闰秒插入尚未接入。
 
 ## 用户态 vDSO
 
@@ -73,9 +75,13 @@ REALTIME、MONOTONIC、BOOTTIME 和 MONOTONIC_RAW 直接读取用户可用的架
 
 ## 消费者与验证
 
-syscall 层的 `clock_gettime(113)`、`clock_getres(114)` 支持 `CLOCK_REALTIME`、`CLOCK_MONOTONIC`、`CLOCK_MONOTONIC_RAW`（4）、`CLOCK_BOOTTIME`（7）、两种 `COARSE`（5、6）及[进程/线程 CPU 时钟](kernel-accounting.md#cpu-时钟)。RAW 返回原始硬件时间，MONOTONIC 返回校准后的时间。RAW 支持查询。系统持续运行期间，BOOTTIME 和 MONOTONIC 返回同一时钟域的时间，两者分辨率均为 1ns。未知 clockid 返回 `-EINVAL`。coarse getres 如实返回 10ms，NULL 输出成功，坏输出指针返回 EFAULT。`gettimeofday(169)` 使用 fine realtime；依次写出 timeval 和可选 timezone，后者返回系统保存的 timezone，两字段初始均为零。先前输出已成功时，后续用户地址错误返回 EFAULT 并保留该输出。
+syscall 层的 `clock_gettime(113)`、`clock_getres(114)` 支持 `CLOCK_REALTIME`、`CLOCK_MONOTONIC`、`CLOCK_MONOTONIC_RAW`（4）、`CLOCK_BOOTTIME`（7）、两种 `COARSE`（5、6）、TAI、可用的闹钟时钟及[进程/线程 CPU 时钟](kernel-accounting.md#cpu-时钟)。RAW 返回原始硬件时间，MONOTONIC 返回校准后的时间。RAW 支持查询。系统持续运行期间，BOOTTIME 和 MONOTONIC 返回同一时钟域的时间，两者分辨率均为 1ns。未知 clockid 返回 `-EINVAL`。coarse getres 如实返回 10ms，NULL 输出成功，坏输出指针返回 EFAULT。`gettimeofday(169)` 使用 fine realtime；依次写出 timeval 和可选 timezone，后者返回系统保存的 timezone，两字段初始均为零。先前输出已成功时，后续用户地址错误返回 EFAULT 并保留该输出。
 
-`clock_nanosleep(115)` 支持 REALTIME、MONOTONIC、进程 CPU 时钟及编码后的其他线程 CPU 时钟。CPU 睡眠在调用者 CPU 登记和返回，复用 POSIX CPU 期限索引，按目标实际执行时间到期；不建立用户可见 timer ID，也不预留信号队列额度。内建 CLOCK_THREAD_CPUTIME_ID、MONOTONIC_RAW 与 coarse 时钟在读取 timespec 前返回 EOPNOTSUPP，编码后的本线程时钟返回 EINVAL。进程时钟可以由同组其他线程推进；只有睡眠线程且没有其他执行者时，CPU 时间不会因墙钟流逝增加。
+`clock_nanosleep(115)` 支持 REALTIME、MONOTONIC、BOOTTIME、TAI、两类闹钟时钟、进程 CPU 时钟及编码后的其他线程 CPU 时钟。CPU 睡眠在调用者 CPU 登记和返回，复用 POSIX CPU 期限索引，按目标实际执行时间到期；不建立用户可见 timer ID，也不预留信号队列额度。内建 CLOCK_THREAD_CPUTIME_ID、MONOTONIC_RAW 与 coarse 时钟在读取 timespec 前返回 EOPNOTSUPP，编码后的本线程时钟返回 EINVAL。进程时钟可以由同组其他线程推进；只有睡眠线程且没有其他执行者时，CPU 时间不会因墙钟流逝增加。
+
+`CLOCK_REALTIME_ALARM` 以墙钟为基准，`CLOCK_BOOTTIME_ALARM` 以启动后的单调时间为基准。实时时钟（Real-Time Clock，RTC）的存在由平台启动探测明确发布，后续设置墙钟不改变这个状态。没有可用 RTC 时，闹钟时钟查询返回 `EINVAL`，睡眠和 POSIX 定时器的闹钟操作返回 `EOPNOTSUPP`。可用时，查询对普通用户开放，睡眠和创建闹钟要求 `CAP_WAKE_ALARM`。到期处理使用系统运行期间的计时中断。新增的 TAI 和闹钟时钟查询由虚拟动态共享对象（virtual dynamic shared object，vDSO）的现有系统调用回退处理。
+
+相对 REALTIME 睡眠落在单调时钟上。TAI 和 REALTIME_ALARM 的相对请求则换算成各自时钟上的绝对期限。信号中断时，相对等待返回同一时钟域计算出的剩余时间，并在进程停止和继续后沿原期限重启。绝对请求保留原用户参数，不写剩余量。
 
 CPU 睡眠对象由调用线程持有，期限检查和取消在共同调度保护内交接；到期直接完成等待，强制退出先摘除期限，再释放请求。目标退出只摘除其期限，不将退出当成到期；后续信号中断取消睡眠。相对睡眠中断报告剩余量，绝对睡眠不改 remaining；相对睡眠重启保留原 CPU 到期期限，绝对睡眠经 stop/continue 后重新读取用户请求。普通墙钟睡眠沿原期限路径。
 
@@ -147,13 +153,13 @@ OFD/fork/exec/错误指针和原 BusyBox hwclock/dmesg/df；两项清日志测�
 
 ## timerfd期限
 
-`timerfd_create/settime/gettime`提供MONOTONIC和REALTIME匿名OFD。设置、查询、计数读取和等待由发起CPU执行；CPU0在真实到期中断中发布可读状态。已启用对象进入侵入式AVL期限索引，索引和对象状态由同一短锁保护。发布的最早tick期限供调度器读取，调度锁内不再进入索引锁；远端更新通过既有deadline IPI要求CPU0重装硬件事件。空索引只有常数空检查。
+`timerfd_create/settime/gettime` 提供 MONOTONIC、REALTIME、BOOTTIME 和两种闹钟时钟的匿名打开文件描述（Open File Description，OFD）。创建与设置闹钟文件描述符时各自检查执行者的 `CAP_WAKE_ALARM`，其运行态到期可由计时中断独立完成。TAI 不能用于创建定时器文件描述符，返回 `EINVAL`。设置、查询、计数读取和等待由发起 CPU 执行，CPU0 在到期中断中发布可读状态。已启用对象沿用平衡树期限索引及状态短锁，远端修改通过既有跨核通知要求 CPU0 重装硬件事件。
 
 首次到期只记一次并通知。周期在read/gettime中按原绝对期限累计漏过次数、前移和重装，保留周期相位，避免短周期造成密集IRQ。settime完整导入输入后交换设置，输出旧值EFAULT不撤销新设置。timerfd read消费计数后复制，部分输出返回实际完成前缀，区别于eventfd的EFAULT返回。
 
-末次关闭从索引摘除对象后，等待已经取得的到期通知借用和等待游标结束，再归还对象。dup/fork共享设置和计数。BOOTTIME、ALARM时钟仍在能力目录。相对 REALTIME 设置使用 MONOTONIC，绝对 REALTIME 设置随墙钟偏移重新计算期限。
+末次关闭从索引摘除对象后，等待已经取得的到期通知借用和等待游标结束，再归还对象。dup 和 fork 共享设置和计数。相对 REALTIME 设置使用 MONOTONIC。绝对 REALTIME 及两种设定方式的 REALTIME_ALARM 均随墙钟偏移重新计算期限。
 
-REALTIME、ABSTIME、CANCEL_ON_SET 三者同时成立时登记取消通知，即使当前已停用。偏移改变后发布可读状态，下一次 read 返回一次 ECANCELED 并消费取消标记；底层尚未到期的计时器继续运行，后续调钟仍可再次通知。未消费取消时重新设置非零期限，先安装新设置，再返回 ECANCELED，不输出旧值；零期限不消费旧取消标记。取消资格被移除则不返回该错误。周期计时器到期后倒拨到原期限之前，read 可返回零字节并在原期限重装，不凭空前移一周期。
+REALTIME 和 REALTIME_ALARM 设置同时带 `TFD_TIMER_ABSTIME` 与 `TFD_TIMER_CANCEL_ON_SET` 时登记取消通知，零期限也能登记。墙钟偏移与创建时的快照不同时，发布可读状态并在下一次读返回 `ECANCELED`。消费取消时用当时的偏移更新快照。单独调整 TAI 偏移不触发取消。未消费取消时重新设置非零期限，先安装新设置，再返回 ECANCELED，不输出旧值；零期限不消费旧取消标记。取消资格被移除则不返回该错误。周期计时器到期后倒拨到原期限之前，read 可返回零字节并在原期限重装，不凭空前移一周期。
 
 ## POSIX 定时器对象
 
@@ -161,16 +167,18 @@ RV64/LA64使用107～111号入口和原生64字节sigevent、32字节itimerspec�
 
 创建为每只定时器预留通知记录和SIGPENDING额度，SIGEV_NONE同样计费。需要通知时先准备真实目标的pending索引。创建候选在ID输出成功后才发布，用户输出故障归还候选与额度；其他线程查询尚未发布的ID返回EINVAL。普通信号仍在消费时归还额度，预留额度由定时器对象持有。对象和PID身份的最后归还在状态保护外释放内存。
 
-REALTIME、MONOTONIC以及进程/线程CPU时钟均在调用CPU创建、设置、查询和删除，由CPU0推进到期。CPU clock目标解析与查询共用，保留PROF、VIRT、SCHED编码，分别使用用户加内核、仅用户、用户加内核时间。SIGEV_SIGNAL和原生SIGEV_THREAD向组投递，SIGEV_THREAD_ID绑定真实线程身份；libc的SIGEV_THREAD通过库的辅助线程完成回调。
+REALTIME、MONOTONIC、BOOTTIME、两种闹钟时钟、TAI 以及进程和线程的 CPU 时钟均在调用 CPU 创建、设置、查询和删除。墙钟相关定时器由 CPU0 推进到期。CPU 时钟目标解析与查询共用，保留PROF、VIRT、SCHED编码，分别使用用户加内核、仅用户、用户加内核时间。SIGEV_SIGNAL和原生SIGEV_THREAD向组投递，SIGEV_THREAD_ID绑定真实线程身份；libc的SIGEV_THREAD通过库的辅助线程完成回调。
 
 每个任务尾部内嵌进程及线程阈值索引，仅活动目标进入共同AVL；每目标按三种CPU时间维护最早阈值，旧VIRTUAL/PROF与原生进程定时器共用一次组采样。遍历按PID代次和角色递增，任务与PID借用覆盖锁外采样，回来后重新核对身份、设置代次和阈值。空集合在原timer路径只检查摘要，普通trap保持既有记账路径。CPU目标退出时摘除阈值，其他组持有的句柄继续有效：gettime归零、settime返回ESRCH，delete归还资源。非组长exec在TGID角色交接时移交进程阈值，创建者、通知目标和CPU时钟目标分别保活。
 
 通知记录区分普通分配和原生定时器预留：每只定时器最多有一条待决记录，不同定时器可同时使用同一标准信号。到期只使用创建时准备的存储。普通内联事件与排队记录共存时，索引保留内联事件的先后位置；原生记录消费不重复计费。用户提供的SI_TIMER仍是普通载荷，不据此执行重装。
 
-相对 REALTIME 设置的有效时钟为 MONOTONIC；只有绝对 REALTIME 设置随墙钟变化。REALTIME/MONOTONIC使用共享AVL算法和各自对象保护，调度器只读取最早期限摘要，远端提前设置沿既有deadline IPI通知CPU0。消费先在调度保护内取得记录及原设置快照，锁外计算进度，再核对设置代次决定重装；处理函数、sigwaitinfo和signalfd取得同一份最终overrun。删除或重设后的旧事件被丢弃，已取得的消费借用覆盖最后释放。周期按原期限推进，不按处理完成时刻重新起算。单次到期入队后查询剩余量为零，待决记录仍保留到消费或清除。STOP/CONT沿共同进程组流程清理相反待决信号并恢复停止组；KILL请求整组退出，这些组操作在状态保护外执行。
+相对 REALTIME 设置落在 MONOTONIC 上。REALTIME_ALARM 和 TAI 也接受相对间隔，换算后的期限仍归原时钟域。TAI 有独立的期限索引，两棵平衡树共享同一保护和最早期限摘要。这样单独修改 TAI 偏移时，只需重排 TAI 索引。消费先在调度保护内取得记录及原设置快照，锁外计算进度，再核对设置代次决定重装；处理函数、sigwaitinfo和signalfd取得同一份最终overrun。删除或重设后的旧事件被丢弃，已取得的消费借用覆盖最后释放。周期按原期限推进，不按处理完成时刻重新起算。单次到期入队后查询剩余量为零，待决记录仍保留到消费或清除。STOP/CONT沿共同进程组流程清理相反待决信号并恢复停止组；KILL请求整组退出，这些组操作在状态保护外执行。
 
 已排队或已领取的信号不因调钟改变设置代次或消失。周期推进允许零次；pending/claim 保留已经观察到的推进位置和累计 overrun，避免“前拨、gettime、倒拨、消费”丢失已累计的次数。
 
 SIG_IGN的周期事件停放并保留相位，恢复disposition时移回待决队列；单独屏蔽不会重新投递已经停放的事件。SIGEV_NONE只按查询推进，停用后的旧单次期限仍可能返回剩余量，沿固定Linux的common_timer_get行为。timer_settime只解释TIMER_ABSTIME位，其余位按参考Linux忽略；NULL新值返回EINVAL，旧值输出EFAULT保留新设置。exec清除原生及用户提供的SI_TIMER记录，保留其他排队消息的顺序。
 
 `make test-posix-timer-host`以4/16KiB页检查真实通知记录、额度、借用、代次及CPU阈值；`tests/userland/run.py --workload posix`提供两架构与固定Linux的原生ABI、真实handler/libc回调和生命周期检查。四核观察构建复用composition观察点核对调用CPU与CPU0到期位置。相同短例还以官方静态glibc在两架构的Linux/BoarOS运行，核对libc真实SIGEV_THREAD回调、输出EFAULT后的通知消费及输入输出别名。CPU时钟反例按被测时钟推进工作量，VIRT使用用户时间，PROF/SCHED使用合计时间。
+
+`tests/userland/api8.py --program clock_domains` 在两架构对照同一个可执行文件，覆盖 TAI 前拨和倒拨、睡眠中断和重启、BOOTTIME 周期计数、运行态闹钟及降权后的设置权限。

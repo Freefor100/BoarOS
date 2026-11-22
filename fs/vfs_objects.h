@@ -16,6 +16,7 @@
 #define VFS_FILE_STATE_CLEANUP UINT32_C(0x5646434c)
 
 struct kernel_vfs_notify_ops;
+struct kernel_fanotify_ops;
 struct kernel_vfs_export_ops {
     int type;
     void (*filesystem)(struct kernel_vfs_instance *, unsigned char [16]);
@@ -57,6 +58,8 @@ struct kernel_vfs_instance {
     struct kernel_vfs_mount *retry_view;
     const struct kernel_vfs_notify_ops *notify_ops;
     unsigned notify_marks; /* Protected by the active notification backend. */
+    unsigned fanotify_marks; /* Protected by the fanotify mark index. */
+    const struct kernel_fanotify_ops *fanotify_ops;
     uint64_t device_id; /* Filesystem st_dev, shared by every mount view. */
 };
 

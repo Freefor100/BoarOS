@@ -250,7 +250,7 @@ enum kernel_scheduler_status kernel_wait_prepare(struct kernel_wait_queue *queue
     KERNEL_IRQ_SCOPE(irq);
     return prepare_owner(0,deadline,interruptible,token);
 }
-static enum kernel_scheduler_status prepare_clock(struct kernel_wait_queue *queue,
+enum kernel_scheduler_status kernel_wait_prepare_clock(struct kernel_wait_queue *queue,
     uint64_t ns,int interruptible,struct kernel_wait_token *token,
     enum kernel_time_status (*convert)(uint64_t,uint64_t *))
 {
@@ -270,12 +270,12 @@ static enum kernel_scheduler_status prepare_clock(struct kernel_wait_queue *queu
 enum kernel_scheduler_status kernel_wait_prepare_realtime(struct kernel_wait_queue *queue,
     uint64_t ns,int interruptible,struct kernel_wait_token *token)
 {
-    return prepare_clock(queue,ns,interruptible,token,kernel_time_deadline_from_realtime);
+    return kernel_wait_prepare_clock(queue,ns,interruptible,token,kernel_time_deadline_from_realtime);
 }
 enum kernel_scheduler_status kernel_wait_prepare_monotonic(struct kernel_wait_queue *queue,
     uint64_t ns,int interruptible,struct kernel_wait_token *token)
 {
-    return prepare_clock(queue,ns,interruptible,token,kernel_time_deadline_from_monotonic);
+    return kernel_wait_prepare_clock(queue,ns,interruptible,token,kernel_time_deadline_from_monotonic);
 }
 static int notify_locked(const struct kernel_wait_token *token,uint32_t reason,
     int committed_locked)

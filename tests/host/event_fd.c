@@ -20,6 +20,8 @@ static unsigned released;
 static struct kernel_credentials credentials;
 static unsigned credential_references;
 const struct kernel_credentials *kernel_credentials_current(void){return &credentials;}
+int kernel_credentials_capable(const struct kernel_credentials *c,unsigned capability)
+{return !!(c->effective & (UINT64_C(1) << capability));}
 const struct kernel_credentials *kernel_credentials_get(const struct kernel_credentials *c)
 {assert(c==&credentials);credential_references++;return c;}
 void kernel_credentials_put(const struct kernel_credentials *c)
@@ -172,6 +174,32 @@ static void periodic_clock_rewind(void)
  now_ns+=200;kernel_timer_fd_expire(now_ns);assert(read_timer(fd,&value)==8&&value==1&&remaining(fd)==100);
  close_timer(fd);puts("PASS timerfd pending periodic expiry before wall rewind");
 }
+static void alarm_permissions_and_clock(void)
+{
+ int64_t result;
+ assert(!kernel_files_timerfd_create(&files,KERNEL_CLOCK_TAI,0,&result)&&result==-KERNEL_EINVAL);
+ assert(!kernel_files_timerfd_create(&files,KERNEL_CLOCK_REALTIME_ALARM,0,&result)&&result==-KERNEL_EPERM);
+ credentials.effective=UINT64_C(1)<<KERNEL_CAP_WAKE_ALARM;
+ int alarm=open_timer(KERNEL_CLOCK_REALTIME_ALARM);
+ int boot=open_timer(KERNEL_CLOCK_BOOTTIME),boot_alarm=open_timer(KERNEL_CLOCK_BOOTTIME_ALARM);
+ assert(!set_timer(alarm,0,100,0)&&!set_timer(boot,0,1000,0)&&!set_timer(boot_alarm,0,1000,0));
+ credentials.effective=0;
+ assert(set_timer(alarm,0,1000,0)==-KERNEL_EPERM&&remaining(alarm)==100);
+ wall_offset+=150;kernel_timer_fd_clock_changed();kernel_timer_fd_expire(now_ns+1);
+ uint64_t value;
+ assert(read_timer(alarm,&value)==8&&value==1&&remaining(boot)==1000&&remaining(boot_alarm)==1000);
+ credentials.effective=UINT64_C(1)<<KERNEL_CAP_WAKE_ALARM;
+ assert(!set_timer(alarm,3,kernel_time_realtime_ns()+100,0));
+ wall_offset-=150;kernel_timer_fd_clock_changed();
+ assert(read_timer(alarm,&value)==-KERNEL_EAGAIN);
+ wall_offset++;kernel_timer_fd_clock_changed();
+ assert(read_timer(alarm,&value)==-KERNEL_ECANCELED&&read_timer(alarm,&value)==-KERNEL_EAGAIN);
+ kernel_timer_fd_clock_changed();
+ assert(read_timer(alarm,&value)==-KERNEL_EAGAIN);
+ close_timer(alarm);close_timer(boot);close_timer(boot_alarm);
+ credentials.effective=0;
+ puts("PASS timerfd alarm permission, relative wall deadline, BOOTTIME and cancellation");
+}
 static void signal_then_cancel(void)
 {park_reason=KERNEL_WAIT_SIGNALLED;wall_offset++;kernel_timer_fd_clock_changed();}
 static void signal_then_expire(void)
@@ -198,4 +226,4 @@ static void interrupted_timer_read(void)
  on_park=0;park_reason=KERNEL_WAIT_WOKEN;close_timer(fd);
  puts("PASS timerfd published cancel/expiry after signal winner");
 }
-int main(void){counters();index_cases();lifecycle();clock_steps();clock_cancellation();periodic_clock_rewind();interrupted_timer_read();assert(!allocations&&!timer_root&&!cancel_timers&&!prepared&&!credential_references);printf("EVENT HOST PASS page=%lu\n",BOAROS_PAGE_SIZE);return 0;}
+int main(void){counters();index_cases();lifecycle();clock_steps();clock_cancellation();periodic_clock_rewind();alarm_permissions_and_clock();interrupted_timer_read();assert(!allocations&&!timer_root&&!cancel_timers&&!prepared&&!credential_references);printf("EVENT HOST PASS page=%lu\n",BOAROS_PAGE_SIZE);return 0;}

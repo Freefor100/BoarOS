@@ -374,11 +374,13 @@ enum kernel_files_status kernel_files_fstatfs(
         };
         return output_statfs(mm, user_buffer, &stat, linux_result);
     }
-    if (file->kind==KERNEL_OPEN_FILE_KIND_NAMESPACE || file->kind==KERNEL_OPEN_FILE_KIND_FS_CONTEXT) {
-        struct kernel_linux_statfs stat={.f_type=file->kind==KERNEL_OPEN_FILE_KIND_FS_CONTEXT?0x09041934:0x6e736673,.f_bsize=BOAROS_PAGE_SIZE,.f_namelen=255};
-        size_t copied;
-        *linux_result=kernel_copy_to_user(mm,user_buffer,&stat,sizeof(stat),&copied)?-KERNEL_EFAULT:0;
-        return KERNEL_FILES_STATUS_OK;
+    if (file->kind == KERNEL_OPEN_FILE_KIND_NAMESPACE || file->kind == KERNEL_OPEN_FILE_KIND_FS_CONTEXT ||
+        file->kind == KERNEL_OPEN_FILE_KIND_FANOTIFY) {
+        const struct kernel_linux_statfs stat = {
+            .f_type = file->kind == KERNEL_OPEN_FILE_KIND_NAMESPACE ? 0x6e736673 : 0x09041934,
+            .f_bsize = BOAROS_PAGE_SIZE, .f_namelen = 255,
+        };
+        return output_statfs(mm, user_buffer, &stat, linux_result);
     }
     if(file->kind==KERNEL_OPEN_FILE_KIND_MQUEUE){
         struct kernel_linux_statfs stat;

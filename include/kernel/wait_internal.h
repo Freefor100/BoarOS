@@ -6,6 +6,9 @@
 
 enum kernel_wait_phase { KERNEL_WAIT_FINISHED, KERNEL_WAIT_PREPARED,
     KERNEL_WAIT_COMMITTED, KERNEL_WAIT_NOTIFIED };
+enum kernel_scheduler_status kernel_wait_prepare_clock(struct kernel_wait_queue *,
+    uint64_t, int, struct kernel_wait_token *,
+    enum kernel_time_status (*convert)(uint64_t, uint64_t *));
 /* The request owner retains its node list through finish. Each event queue
  * protects links/cursors; the execution owner protects READY and stack handoff. */
 struct kernel_wait_record {

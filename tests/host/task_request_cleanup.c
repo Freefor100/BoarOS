@@ -29,13 +29,28 @@ void kernel_socket_call_abort(struct kernel_socket_call *call)
 { assert(call == owner.socket_call); consumed(64); owner.socket_call = 0; }
 void kernel_msg_abort(struct kernel_task *task)
 { assert(task == &owner); if (task->msg_request) { consumed(128); task->msg_request = 0; } }
+void kernel_fanotify_read_abort(struct kernel_fanotify_read *request)
+{ assert((uintptr_t)request == 10 && !owner.fanotify_read); consumed(256); }
+int kernel_remote_memory_abort(struct kernel_task *task)
+{ assert(task == &owner && !task->remote_memory_request); return 0; }
+void kernel_files_abort_flock(struct kernel_task *task)
+{ assert(task == &owner && !task->flock_file); }
+void kernel_futex_pi_abort(struct kernel_task *task)
+{ assert(task == &owner && !task->pi_request); }
+void kernel_futex_abort(struct kernel_task *task)
+{ assert(task == &owner && !task->futex_request); }
+void kernel_posix_cpu_sleep_abort(struct kernel_task *task) { assert(task == &owner); }
+void kernel_mqueue_abort(struct kernel_task *task) { assert(task == &owner); }
+void kernel_page_cache_put_batch(struct kernel_page_cache *cache,
+    struct kernel_page_cache_read_page *pages, size_t count)
+{ (void)cache; (void)pages; (void)count; __builtin_trap(); }
 enum physical_page_status physical_page_release(struct physical_page_allocator *allocator,
                                                 uint64_t address)
 { (void)allocator; (void)address; __builtin_trap(); }
 
 int main(void)
 {
-    for (expected = 0; expected < 256; expected++) {
+    for (expected = 0; expected < 512; expected++) {
         owner = (struct kernel_task){0};
         scratch = (struct kernel_task_io_buffer){0};
         seen = 0;
@@ -46,6 +61,7 @@ int main(void)
         if (expected & 32) owner.sem_request = (void *)(uintptr_t)7;
         if (expected & 64) owner.socket_call = (void *)(uintptr_t)8;
         if (expected & 128) owner.msg_request = (void *)(uintptr_t)9;
+        if (expected & 256) owner.fanotify_read = (void *)(uintptr_t)10;
         if (expected & 16) {
             owner.io_scratch_data = (void *)(uintptr_t)5;
             owner.io_scratch_physical_address = 4096;
@@ -58,11 +74,11 @@ int main(void)
         assert(seen == (expected & ~16U));
         assert(!owner.epoll_wait_request && !owner.socket_write_request &&
                !owner.socket_read_request && !owner.tty_request && !owner.io_buffer &&
-               !owner.sem_request && !owner.socket_call && !owner.msg_request);
+               !owner.sem_request && !owner.socket_call && !owner.msg_request && !owner.fanotify_read);
         assert(!scratch.allocator);
         cleanup_task_io_requests(&owner);
         assert(seen == (expected & ~16U));
     }
-    puts("PASS task request cleanup: 256 handle sets, scratch lifetime, retry");
+    puts("PASS task request cleanup: 512 handle sets, scratch lifetime, retry");
     return 0;
 }

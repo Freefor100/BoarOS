@@ -22,6 +22,8 @@ static uint32_t time_initialized;
 static uint64_t time_multiplier;
 static uint64_t time_ticks_multiplier;
 static uint64_t time_boot_realtime_ns;
+static int rtc_available;
+static int32_t time_tai_offset;
 static uint64_t time_coarse_monotonic_ns;
 static int32_t time_timezone[2];
 static uint32_t time_sequence, time_disciplined;
@@ -143,7 +145,7 @@ void kernel_time_vvar_release(struct physical_page_allocator *allocator, uint64_
 #endif
 
 enum kernel_time_status kernel_time_init(uint32_t timebase_frequency,
-                                         uint64_t boot_realtime_ns)
+                                         const uint64_t *boot_realtime_ns)
 {
     if (timebase_frequency == 0U) {
         return KERNEL_TIME_STATUS_INVALID_ARGUMENT;
@@ -160,7 +162,8 @@ enum kernel_time_status kernel_time_init(uint32_t timebase_frequency,
         (((uint64_t)timebase_frequency << KERNEL_TIME_MULTIPLIER_SHIFT) +
          KERNEL_TIME_NS_PER_SECOND - 1U) /
         KERNEL_TIME_NS_PER_SECOND;
-    time_boot_realtime_ns = boot_realtime_ns;
+    rtc_available = boot_realtime_ns != 0;
+    time_boot_realtime_ns = rtc_available ? *boot_realtime_ns : 0;
     __atomic_store_n(&time_coarse_monotonic_ns,
         kernel_time_ticks_to_ns(arch_time_read()), __ATOMIC_RELAXED);
 #if KERNEL_HAS_VDSO_ELF
@@ -181,6 +184,11 @@ enum kernel_time_status kernel_time_init(uint32_t timebase_frequency,
 uint32_t kernel_time_is_initialized(void)
 {
     return time_initialized;
+}
+
+int kernel_time_has_rtc(void)
+{
+    return rtc_available;
 }
 
 uint64_t kernel_time_ticks_to_ns(uint64_t ticks)
@@ -212,7 +220,7 @@ static __attribute__((noinline)) uint64_t apply_published_epoch(uint64_t raw)
     return kernel_clock_apply(&epoch,raw);
 }
 
-static uint64_t read_time(int realtime)
+static inline uint64_t read_time(enum kernel_time_domain domain)
 {
     for (;;) {
         uint32_t seq=__atomic_load_n(&time_sequence,__ATOMIC_ACQUIRE);
@@ -220,7 +228,11 @@ static uint64_t read_time(int realtime)
         uint64_t now=kernel_time_ticks_to_ns(clock_counter_ordered());
         if (__builtin_expect(__atomic_load_n(&time_disciplined,__ATOMIC_RELAXED),0))
             now=apply_published_epoch(now);
-        if (realtime) now+=__atomic_load_n(&time_boot_realtime_ns,__ATOMIC_RELAXED);
+        if (domain != KERNEL_TIME_MONOTONIC)
+            now += __atomic_load_n(&time_boot_realtime_ns, __ATOMIC_RELAXED);
+        if (domain == KERNEL_TIME_TAI)
+            now += (uint64_t)__atomic_load_n(&time_tai_offset, __ATOMIC_RELAXED) *
+                   KERNEL_TIME_NS_PER_SECOND;
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         if (seq==__atomic_load_n(&time_sequence,__ATOMIC_RELAXED)) return now;
     }
@@ -228,12 +240,17 @@ static uint64_t read_time(int realtime)
 
 uint64_t kernel_time_monotonic_ns(void)
 {
-    return read_time(0);
+    return read_time(KERNEL_TIME_MONOTONIC);
 }
 
 uint64_t kernel_time_realtime_ns(void)
 {
-    return read_time(1);
+    return read_time(KERNEL_TIME_REALTIME);
+}
+
+uint64_t kernel_time_tai_ns(void)
+{
+    return read_time(KERNEL_TIME_TAI);
 }
 
 void kernel_time_update_coarse(void)
@@ -498,7 +515,7 @@ int kernel_time_adjust(struct kernel_timex *tx,enum kernel_clock_change *change)
                                     tx->freq>INT64_MAX/65536000)) return -KERNEL_EINVAL;
     if ((mode&KADJ_SETOFFSET) && (uint64_t)tx->time.subsec >=
             ((mode&KADJ_NANO)?1000000000U:1000000U)) return -KERNEL_EINVAL;
-    if (!adjtime && ((mode&KADJ_TAI) || ((mode&KADJ_STATUS) && (tx->status&(KSTA_INS|KSTA_DEL)))))
+    if (!adjtime && (mode & KADJ_STATUS) && (tx->status & (KSTA_INS | KSTA_DEL)))
         return -KERNEL_EOPNOTSUPP;
 #if KERNEL_HAS_VDSO_ELF
     KERNEL_RAW_SCOPE(guard,&vvar_lock);
@@ -555,12 +572,17 @@ int kernel_time_adjust(struct kernel_timex *tx,enum kernel_clock_change *change)
                 time_constant=clamp64(tx->constant,0,10);
                 if (!(time_status&KSTA_NANO)) time_constant=clamp64(time_constant+4,0,10);
             }
+            if ((mode & KADJ_TAI) && tx->constant >= 0 && tx->constant <= 100000 &&
+                time_tai_offset != tx->constant) {
+                __atomic_store_n(&time_tai_offset, (int32_t)tx->constant, __ATOMIC_RELAXED);
+                *change |= KERNEL_CLOCK_TAI_OFFSET;
+            }
             if (mode&KADJ_OFFSET) apply_phase(&epoch,tx->offset,second);
         }
         if (mapping) {
             phase=epoch.phase_ns;
             publish_epoch(&epoch);
-            if (*change==KERNEL_CLOCK_UNCHANGED) *change=KERNEL_CLOCK_RATE;
+            if (!(*change & KERNEL_CLOCK_STEP)) *change |= KERNEL_CLOCK_RATE;
         }
         end_time_change();
     }
@@ -577,7 +599,8 @@ int kernel_time_adjust(struct kernel_timex *tx,enum kernel_clock_change *change)
     tx->time.sec=(int64_t)(sampled_wall/1000000000);
     tx->time.subsec=(int64_t)(sampled_wall%1000000000)/unit;
     tx->ppsfreq=tx->jitter=tx->stabil=tx->jitcnt=tx->calcnt=tx->errcnt=tx->stbcnt=0;
-    tx->shift=tx->tai=0;
+    tx->shift=0;
+    tx->tai=time_tai_offset;
     return (time_status&(KSTA_UNSYNC|KSTA_PPSFREQ|KSTA_PPSTIME))?5:0;
 }
 void kernel_time_get_timezone(int32_t timezone[2])
@@ -605,4 +628,21 @@ enum kernel_time_status kernel_time_deadline_from_realtime(uint64_t ns,uint64_t 
     enum kernel_time_status status=kernel_time_deadline_from_monotonic(ns>offset?ns-offset:0,deadline);
     if (status==KERNEL_TIME_STATUS_DEADLINE_PASSED) *deadline=arch_time_read()+1;
     return status;
+}
+
+enum kernel_time_status kernel_time_deadline_from_tai(uint64_t ns, uint64_t *deadline)
+{
+    for (;;) {
+        uint32_t seq = __atomic_load_n(&time_sequence, __ATOMIC_ACQUIRE);
+        if (seq & 1U) continue;
+        uint64_t offset = __atomic_load_n(&time_boot_realtime_ns, __ATOMIC_RELAXED) +
+            (uint64_t)__atomic_load_n(&time_tai_offset, __ATOMIC_RELAXED) *
+            KERNEL_TIME_NS_PER_SECOND;
+        enum kernel_time_status status =
+            kernel_time_deadline_from_monotonic(ns > offset ? ns - offset : 0, deadline);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (seq != __atomic_load_n(&time_sequence, __ATOMIC_RELAXED)) continue;
+        if (status == KERNEL_TIME_STATUS_DEADLINE_PASSED) *deadline = arch_time_read() + 1;
+        return status;
+    }
 }

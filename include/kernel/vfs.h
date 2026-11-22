@@ -213,6 +213,7 @@ struct kernel_vfs_file {
     uint32_t write_lease;
     uint32_t exec_lease;
     uint8_t location_owner;
+    uint8_t notify_suppressed; /* Opened by a file-event reader. */
 };
 
 /* Paths are borrowed for the duration of a call; successful opens own a path

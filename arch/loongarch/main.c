@@ -63,7 +63,7 @@ void la_kernel_main(uint64_t systab)
     int rtc=la_virt_rtc_initialize(&realtime);
     la_virt_puts(rtc ? "LA RTC unavailable; realtime uses boot-relative epoch\n" : "LA RTC UTC seconds resolution=1 boot-ns=");
     if(!rtc){la_virt_hex(realtime);la_virt_puts("\n");}
-    if (kernel_time_init(la_timer_frequency(),realtime)!=KERNEL_TIME_STATUS_OK ||
+    if (kernel_time_init(la_timer_frequency(),rtc?0:&realtime)!=KERNEL_TIME_STATUS_OK ||
         kernel_scheduler_init(&allocator,(uintptr_t)__boot_stack_bottom,(uintptr_t)__boot_stack_top)!=KERNEL_SCHEDULER_STATUS_OK) la_virt_fatal("scheduler init");
 #if BOAROS_MAX_CPUS > 1
     la_smp_start(la_timer_frequency());

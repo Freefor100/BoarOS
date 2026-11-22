@@ -31,7 +31,12 @@ static inline int kernel_timex_read_only(uint32_t modes)
     return !modes || ((modes & KADJ_SS_READ)==KADJ_SS_READ && !(modes & KADJ_SETOFFSET));
 }
 
-enum kernel_clock_change { KERNEL_CLOCK_UNCHANGED, KERNEL_CLOCK_RATE, KERNEL_CLOCK_STEP };
+enum kernel_clock_change {
+    KERNEL_CLOCK_UNCHANGED = 0,
+    KERNEL_CLOCK_RATE = 1,
+    KERNEL_CLOCK_STEP = 2,
+    KERNEL_CLOCK_TAI_OFFSET = 4,
+};
 /* The scheduler holds the wait domain across mutation and wait-tree reindexing. */
 int kernel_time_adjust(struct kernel_timex *, enum kernel_clock_change *);
 int kernel_scheduler_adjust_time(struct kernel_timex *, enum kernel_clock_change *);

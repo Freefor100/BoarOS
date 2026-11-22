@@ -410,6 +410,8 @@ enum kernel_syscall_status syscall_handle_timerfd(struct kernel_task *,
     const struct kernel_syscall_request *,struct kernel_syscall_result *);
 enum kernel_syscall_status syscall_handle_inotify(struct kernel_task *,
     const struct kernel_syscall_request *,struct kernel_syscall_result *);
+enum kernel_syscall_status syscall_handle_fanotify(struct kernel_task *,
+    const struct kernel_syscall_request *, struct kernel_syscall_result *);
 enum kernel_syscall_status syscall_handle_eventfd(struct kernel_task *,
     const struct kernel_syscall_request *, struct kernel_syscall_result *);
 

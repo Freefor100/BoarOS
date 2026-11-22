@@ -40,7 +40,8 @@ struct kernel_posix_timer {
     struct kernel_posix_timer *park_next;
     uint64_t queued_generation,claim_generation,claim_expiry,claim_interval;
     struct kernel_signal_wait_info *claim_output;
-    uint32_t indexed,armed,queued,busy,deferred,parked,realtime,claim_realtime;
+    uint32_t indexed,armed,queued,busy,deferred,parked;
+    enum kernel_time_domain domain, claim_domain;
 
 };
 /* Only user-visible timers have a registry owner. Internal CPU sleeps share
@@ -50,7 +51,7 @@ struct kernel_posix_cpu_sleep {
     struct kernel_wait_token token;
     int completed;
 };
-static struct kernel_avl_node *wall_root,*cpu_root;
+static struct kernel_avl_node *wall_root,*tai_root,*cpu_root;
 static uint32_t cpu_active;
 static int cpu_target_live(struct kernel_task *task,unsigned thread)
 {return task && (!task->proc_exiting || (!thread&&task->group_members>1));}
@@ -89,9 +90,18 @@ void kernel_posix_timer_changed(void)
 #endif
     kernel_scheduler_deadline_changed();
 }
-static void wall_publish_locked(void)
+static struct kernel_avl_node *wall_first_locked(void)
 {
     struct kernel_avl_node *node=kernel_avl_first(wall_root);
+    if (tai_root) {
+        struct kernel_avl_node *tai = kernel_avl_first(tai_root);
+        if (!node || (int64_t)(tai->key - node->key) < 0) node = tai;
+    }
+    return node;
+}
+static void wall_publish_locked(void)
+{
+    struct kernel_avl_node *node = wall_first_locked();
     __atomic_store_n(&wall_next,node?node->key:0,__ATOMIC_RELEASE);
 }
 uint64_t kernel_posix_timer_deadline(void)
@@ -111,7 +121,11 @@ static void accumulate_overrun(int64_t *overrun,uint64_t periods)
     else *overrun+=(int64_t)periods;
 }
 static uint64_t timer_now(struct kernel_posix_timer *t)
-{return t->realtime?kernel_time_realtime_ns():kernel_time_monotonic_ns();}
+{return kernel_time_domain_now(t->domain);}
+static struct kernel_avl_node **wall_index(enum kernel_time_domain domain)
+{
+    return domain == KERNEL_TIME_TAI ? &tai_root : &wall_root;
+}
 static void unpark_locked(struct kernel_posix_timer *t)
 {
     if(!t->parked)return;
@@ -127,10 +141,29 @@ static void deactivate_locked(struct kernel_posix_timer *t)
             index->timers[t->cpu.kind]=kernel_avl_remove_node(index->timers[t->cpu.kind],&t->deadline);
             t->cpu_index=0;t->indexed=0;scheduler_cpu_timer_update_locked(index->task,index->thread);
         } else {
-            wall_root=kernel_avl_remove_node(wall_root,&t->deadline);t->indexed=0;wall_publish_locked();
+            struct kernel_avl_node **root = wall_index(t->domain);
+            *root = kernel_avl_remove_node(*root, &t->deadline);
+            t->indexed = 0;
+            wall_publish_locked();
         }
     }
     t->armed=0;unpark_locked(t);
+}
+static void insert_wall_locked(struct kernel_posix_timer *t)
+{
+    t->deadline = (struct kernel_avl_node){.height=1};
+    enum kernel_time_status status;
+    if (t->domain == KERNEL_TIME_TAI)
+        status = kernel_time_deadline_from_tai(t->expires, &t->deadline.key);
+    else if (t->domain == KERNEL_TIME_REALTIME)
+        status = kernel_time_deadline_from_realtime(t->expires, &t->deadline.key);
+    else
+        status = kernel_time_deadline_from_monotonic(t->expires, &t->deadline.key);
+    if (status == KERNEL_TIME_STATUS_DEADLINE_PASSED) t->deadline.key = arch_time_read() + 1;
+    else if (status) __builtin_trap();
+    struct kernel_avl_node **root = wall_index(t->domain);
+    *root = kernel_avl_insert_node(*root, &t->deadline);
+    t->armed = t->indexed = 1;
 }
 static void arm_locked(struct kernel_posix_timer *t)
 {
@@ -144,13 +177,8 @@ static void arm_locked(struct kernel_posix_timer *t)
         t->cpu_index=index;t->indexed=t->armed=1;
         scheduler_cpu_timer_update_locked(target,t->cpu.thread);return;
     }
-    t->deadline=(struct kernel_avl_node){.height=1};
-    enum kernel_time_status status=t->realtime?
-        kernel_time_deadline_from_realtime(t->expires,&t->deadline.key):
-        kernel_time_deadline_from_monotonic(t->expires,&t->deadline.key);
-    if(status==KERNEL_TIME_STATUS_DEADLINE_PASSED)t->deadline.key=arch_time_read()+1;
-    else if(status)__builtin_trap();
-    t->armed=1;t->indexed=1;wall_root=kernel_avl_insert_node(wall_root,&t->deadline);wall_publish_locked();
+    insert_wall_locked(t);
+    wall_publish_locked();
 }
 static void snapshot_locked(struct kernel_posix_timer *t,uint64_t now,struct kernel_posix_itimerspec *out)
 {
@@ -237,7 +265,7 @@ int posix_timer_record_take_locked(struct signal_queue_record *record,struct ker
     if(t->busy)__builtin_trap();
     t->busy=1;t->claim_generation=t->generation;t->claim_expiry=t->expires;
     t->claim_interval=t->interval;t->claim_output=out;
-    t->claim_overrun=t->pending_overrun;t->claim_realtime=t->realtime;
+    t->claim_overrun=t->pending_overrun;t->claim_domain=t->domain;
     record->next=p->completed;p->completed=record;
     return 1;
 }
@@ -257,7 +285,7 @@ void posix_timer_record_complete(struct signal_queue_record *record)
         struct kernel_task_usage usage;
         alive=!scheduler_cpu_clock_sample(&t->cpu,&usage);
         now=alive?usage.user_ns+(t->cpu.kind==1?0:usage.kernel_ns):0;
-    } else now=t->claim_realtime?kernel_time_realtime_ns():kernel_time_monotonic_ns();
+    } else now=kernel_time_domain_now(t->claim_domain);
     struct kernel_wait_cursor cursor={0};struct kernel_task *wake=0;
     int free_it;
     {
@@ -290,8 +318,9 @@ int kernel_posix_timer_prepare(struct kernel_task *caller,int32_t clock,
 {
     struct kernel_heap *heap=caller->files.heap;
     struct kernel_posix_timer *t=0;
-    if(clock>=0 && clock!=0 && clock!=1 && clock!=2 && clock!=3)
-        return clock<=11?-KERNEL_EOPNOTSUPP:-KERNEL_EINVAL;
+    if (clock >= 4 && clock <= 6) return -KERNEL_EOPNOTSUPP;
+    if (clock > KERNEL_CLOCK_BOOTTIME_ALARM && clock != KERNEL_CLOCK_TAI)
+        return -KERNEL_EINVAL;
     enum kernel_heap_status allocation=kernel_heap_allocate_zeroed(heap,1,sizeof(*t),(void **)&t);
     if(allocation==KERNEL_HEAP_STATUS_EMPTY)return -KERNEL_EAGAIN;
     if(allocation)__builtin_trap();
@@ -377,9 +406,9 @@ int kernel_posix_timer_delete(struct kernel_task *caller,int32_t id)
 }
 /* CPU snapshots acquire the scheduler domain internally. The setting and
  * identity role are checked again before publishing a sampled result. */
-static int sample_timer(struct kernel_posix_timer *t,unsigned realtime,uint64_t *now)
+static int sample_timer(struct kernel_posix_timer *t,enum kernel_time_domain domain,uint64_t *now)
 {
-    if(!t->cpu.identity){*now=realtime?kernel_time_realtime_ns():kernel_time_monotonic_ns();return 0;}
+    if(!t->cpu.identity){*now=kernel_time_domain_now(domain);return 0;}
     struct kernel_task_usage usage;int error=scheduler_cpu_clock_sample(&t->cpu,&usage);
     if(!error)*now=usage.user_ns+(t->cpu.kind==1?0:usage.kernel_ns);
     return error;
@@ -389,9 +418,9 @@ int kernel_posix_timer_get(struct kernel_task *caller,int32_t id,struct kernel_p
     struct kernel_posix_timer *t=timer_get(caller,id);if(!t)return -KERNEL_EINVAL;
     int error=0;
     for(;;) {
-        uint64_t generation,now=0;unsigned realtime;
-        {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);generation=t->generation;realtime=t->realtime;}
-        int gone=sample_timer(t,realtime,&now);
+        uint64_t generation,now=0;enum kernel_time_domain domain;
+        {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);generation=t->generation;domain=t->domain;}
+        int gone=sample_timer(t,domain,&now);
         KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
         if(!t->valid){error=-KERNEL_EINVAL;break;}
         if(generation!=t->generation)continue;
@@ -419,9 +448,9 @@ int kernel_posix_timer_set(struct kernel_task *caller,int32_t id,int flags,
     uint64_t interval=in->interval.seconds>INT64_MAX/1000000000?INT64_MAX:add_time((uint64_t)in->interval.seconds*1000000000,(uint64_t)in->interval.nanoseconds);
     int error=0;
     for(;;) {
-        uint64_t generation,now=0;unsigned realtime;
-        {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);generation=t->generation;realtime=t->realtime;}
-        int gone=sample_timer(t,realtime,&now);
+        uint64_t generation,now=0;enum kernel_time_domain domain;
+        {KERNEL_RAW_SCOPE(g,&kernel_wait_domain);generation=t->generation;domain=t->domain;}
+        int gone=sample_timer(t,domain,&now);
         KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
         if(!t->valid){error=-KERNEL_EINVAL;break;}
         if(generation!=t->generation)continue;
@@ -429,7 +458,7 @@ int kernel_posix_timer_set(struct kernel_task *caller,int32_t id,int flags,
         snapshot_locked(t,now,old);deactivate_locked(t);t->generation++;t->deferred=0;t->overrun=0;
         t->interval=value?interval:0;t->pending_overrun=-1;
         if(value){
-            t->realtime=!t->cpu.identity&&t->clock==0&&(flags&1);
+            t->domain=kernel_time_timer_domain(t->clock, flags & 1);
             if(!t->cpu.identity)now=timer_now(t);
             t->expires=(flags&1)?value:add_time(now,value);arm_locked(t);
         }
@@ -522,7 +551,7 @@ void kernel_posix_timer_expire(uint64_t now)
     for(;;) {
         struct kernel_posix_timer *t;struct kernel_wait_cursor cursor={0};struct kernel_task *wake=0;
         {
-            KERNEL_RAW_SCOPE(g,&kernel_wait_domain);struct kernel_avl_node *node=kernel_avl_first(wall_root);
+            KERNEL_RAW_SCOPE(g,&kernel_wait_domain);struct kernel_avl_node *node=wall_first_locked();
             if(!node||(int64_t)(now-node->key)<0)break;
             t=(void *)((char *)node- offsetof(struct kernel_posix_timer,deadline));
             if(timer_now(t)<t->expires) {
@@ -535,21 +564,37 @@ void kernel_posix_timer_expire(uint64_t now)
         timer_put(t);
     }
 }
-static void wall_reindex_locked(struct kernel_avl_node *node)
+static void wall_reindex_nodes_locked(struct kernel_avl_node *node)
 {
     if(!node)return;
     struct kernel_avl_node *left=node->left,*right=node->right;
-    wall_reindex_locked(left);wall_reindex_locked(right);
+    wall_reindex_nodes_locked(left);wall_reindex_nodes_locked(right);
     struct kernel_posix_timer *t=(void *)((char *)node- offsetof(struct kernel_posix_timer,deadline));
-    t->indexed=0;arm_locked(t);
+    insert_wall_locked(t);
 }
-void kernel_posix_timer_clock_changed(void)
+static void reindex_wall_timers(int tai_only)
 {
     {
         KERNEL_RAW_SCOPE(g,&kernel_wait_domain);
-        struct kernel_avl_node *old=wall_root;wall_root=0;wall_reindex_locked(old);wall_publish_locked();
+        if (!tai_only) {
+            struct kernel_avl_node *old=wall_root;
+            wall_root=0;
+            wall_reindex_nodes_locked(old);
+        }
+        struct kernel_avl_node *old=tai_root;
+        tai_root=0;
+        wall_reindex_nodes_locked(old);
+        wall_publish_locked();
     }
     kernel_posix_timer_expire(arch_time_read());kernel_posix_timer_changed();
+}
+void kernel_posix_timer_clock_changed(void)
+{
+    reindex_wall_timers(0);
+}
+void kernel_posix_timer_tai_changed(void)
+{
+    reindex_wall_timers(1);
 }
 void kernel_posix_timer_unignore(struct kernel_task *task,unsigned sig)
 {

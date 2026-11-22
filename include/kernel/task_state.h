@@ -318,6 +318,7 @@ struct kernel_task {
     struct kernel_task *ready_wait_next, *ready_wait_previous;
     uint64_t ready_wait_deadline;
 #endif
+    struct kernel_fanotify_read *fanotify_read;
 } __attribute__((aligned(16)));
 
 #endif

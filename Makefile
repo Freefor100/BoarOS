@@ -354,6 +354,7 @@ COMMON_C_SOURCES := \
 	fs/files/epoll.c \
 	fs/event_fd.c \
 	fs/inotify.c \
+	fs/fanotify.c \
 	fs/mqueue.c \
 	fs/signal_fd.c \
 	fs/files/socket.c \
@@ -2468,11 +2469,21 @@ test-bpf-host:
 	sh tests/host/bpf-mmap.sh
 	python3 -B tests/host/bpf-socket-ingress.py
 
-.PHONY: test-async-io-host test-inotify-async-host
+.PHONY: test-async-io-host test-inotify-async-host test-fanotify-host
 test-async-io-host:
 	sh tests/host/async-io.sh
 test-inotify-async-host:
 	sh tests/host/inotify-async.sh
+test-fanotify-host:
+	@mkdir -p build/host
+	@set -eu; for shift in 12 14; do \
+		cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -pthread \
+		    -DBOAROS_MAX_CPUS=4 -DBOAROS_LOCK_DEBUG=1 -DBOAROS_PAGE_SHIFT=$$shift \
+		    -ffunction-sections -fdata-sections -Itests/host/sync -idirafter include \
+		    -fsanitize=address,undefined tests/host/fanotify_index.c kernel/raw_lock.c kernel/sched/park.c \
+		    -Wl,--gc-sections -o build/host/fanotify-$$shift; \
+		timeout -k 2s 30s build/host/fanotify-$$shift; \
+	done
 
 .PHONY: test-gpt-host
 test-gpt-host:

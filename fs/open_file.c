@@ -3,6 +3,7 @@
 #include <kernel/tmpfs.h>
 #include <kernel/pidfd.h>
 #include "open_file_internal.h"
+#include "fanotify_internal.h"
 #include <kernel/namespace.h>
 #include <kernel/procfs.h>
 #include <kernel/proc_task.h>
@@ -14,6 +15,7 @@
 #include "vfs_objects.h"
 #include "char_device_internal.h"
 #include "files/epoll_internal.h"
+#include "files/private.h"
 
 #include <arch/context.h>
 #include <arch/platform_io.h>
@@ -256,6 +258,7 @@ struct kernel_flock_identity *kernel_open_file_flock_identity(
     case KERNEL_OPEN_FILE_KIND_FS_CONTEXT:
     case KERNEL_OPEN_FILE_KIND_BPF:
     case KERNEL_OPEN_FILE_KIND_INOTIFY:
+    case KERNEL_OPEN_FILE_KIND_FANOTIFY:
     case KERNEL_OPEN_FILE_KIND_SIGNALFD: return kernel_flock_anonymous_identity();
     case KERNEL_OPEN_FILE_KIND_PIDFD: return kernel_pidfd_flock_identity(file);
     case KERNEL_OPEN_FILE_KIND_CONSOLE: return kernel_flock_bootstrap_console_identity();
@@ -278,22 +281,33 @@ static void release_record_locks(struct kernel_open_file_description *file)
                                &file->record_locks, file->heap);
 }
 
-static void initialize_path_description(struct kernel_open_file_description *file,
+static void initialize_description_owner(struct kernel_open_file_description *file,
     struct kernel_heap *heap)
 {
     file->heap = heap;
     file->references = 1U;
-    file->observed_mount_error = kernel_vfs_mount_error_sequence(file->file.mount);
     kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
+    file->credentials = kernel_credentials_get(kernel_credentials_current());
+}
+
+static void initialize_path_metadata(struct kernel_open_file_description *file)
+{
+    file->observed_mount_error = kernel_vfs_mount_error_sequence(file->file.mount);
     if (file->kind==KERNEL_OPEN_FILE_KIND_GENERATED && kernel_procfs_ipc_file(&file->file)) {
         file->ipc_proc_namespace=kernel_namespace_get(kernel_task_ipc_namespace());
         file->ipc_proc_pid_view=kernel_proc_view_acquire();
     }
     file->observed_writeback_error = kernel_vfs_error_sequence(&file->file);
-    file->credentials = kernel_credentials_get(kernel_credentials_current());
 }
 
-static int finish_path_open(struct kernel_open_file_description *file, struct kernel_heap *heap)
+static void initialize_path_description(struct kernel_open_file_description *file,
+    struct kernel_heap *heap)
+{
+    initialize_description_owner(file, heap);
+    initialize_path_metadata(file);
+}
+
+static int initialize_generated_path(struct kernel_open_file_description *file, struct kernel_heap *heap)
 {
     if (file->kind != KERNEL_OPEN_FILE_KIND_PATH && kernel_vfs_file_generated(&file->file)) {
         file->kind = KERNEL_OPEN_FILE_KIND_GENERATED;
@@ -302,18 +316,55 @@ static int finish_path_open(struct kernel_open_file_description *file, struct ke
         else {
             struct kernel_mm_pagemap *view = NULL;
             int error = kernel_procfs_pagemap_open(&file->file, heap, &view);
-            if (error) {
-                if (kernel_vfs_close(&file->file)) __builtin_trap();
-                return error;
-            }
+            if (error) return error;
             if (view) {
                 file->proc_pagemap = view;
                 file->proc_page_stream = KERNEL_PROC_PAGE_STREAM_PAGEMAP;
             }
         }
     }
+    return 0;
+}
+
+static int finish_path_open(struct kernel_open_file_description *file, struct kernel_heap *heap)
+{
+    int error = initialize_generated_path(file, heap);
+    if (error) {
+        if (kernel_vfs_close(&file->file)) __builtin_trap();
+        return error;
+    }
     initialize_path_description(file, heap);
     return 0;
+}
+
+int kernel_files_open_fanotify_event(struct kernel_files *files, struct kernel_vfs_path *path,
+    unsigned flags, struct kernel_open_file_description **owner)
+{
+    struct kernel_heap *heap = files->heap;
+    struct kernel_open_file_description *file;
+    enum kernel_heap_status allocation = kernel_heap_allocate_zeroed(heap, 1,
+        sizeof(*file), (void **)&file);
+    if (allocation != KERNEL_HEAP_STATUS_OK)
+        return allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+
+    initialize_description_owner(file, heap);
+    file->vfs_closed = 1;
+    *owner = file;
+    /* Like dentry_open_nonotify(), open this already owned path without
+     * pathname resolution. The event group's privilege and mark permissions
+     * qualify passing the resulting descriptor to its reader. The request
+     * owns this description even if a later qualification blocks. */
+    int error = kernel_vfs_fanotify_open(path, &file->file, &file->vfs_closed);
+    if (error) return error;
+    if ((file->file.mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR)
+        file->kind = KERNEL_OPEN_FILE_KIND_DIRECTORY;
+    error = initialize_generated_path(file, heap);
+    if (error) return error;
+    initialize_path_metadata(file);
+
+    if (flags & 04000000U) flags |= 010000U; /* __O_SYNC implies O_DSYNC. */
+    file->open_flags = flags & ~02000000U;
+    return flags & 3U ? kernel_vfs_file_acquire_write(&file->file) : 0;
 }
 
 static enum kernel_open_file_status create_open_file(
@@ -764,7 +815,10 @@ int kernel_open_file_pseudo_stat(
         mode = __atomic_load_n(&file->file.mode,__ATOMIC_ACQUIRE);
     else if (file->kind == KERNEL_OPEN_FILE_KIND_PIDFD)
         mode = 0700U; /* pidfs getattr deliberately masks S_IFMT. */
-    else if (file->kind == KERNEL_OPEN_FILE_KIND_BPF || file->kind == KERNEL_OPEN_FILE_KIND_INOTIFY || file->kind == KERNEL_OPEN_FILE_KIND_EPOLL || (file->kind == KERNEL_OPEN_FILE_KIND_EVENTFD || file->kind == KERNEL_OPEN_FILE_KIND_TIMERFD || file->kind == KERNEL_OPEN_FILE_KIND_SIGNALFD))
+    else if (file->kind == KERNEL_OPEN_FILE_KIND_BPF || file->kind == KERNEL_OPEN_FILE_KIND_INOTIFY ||
+             file->kind == KERNEL_OPEN_FILE_KIND_FANOTIFY || file->kind == KERNEL_OPEN_FILE_KIND_EPOLL ||
+             file->kind == KERNEL_OPEN_FILE_KIND_EVENTFD || file->kind == KERNEL_OPEN_FILE_KIND_TIMERFD ||
+             file->kind == KERNEL_OPEN_FILE_KIND_SIGNALFD)
         mode = 0600U;
     else if (file->kind == KERNEL_OPEN_FILE_KIND_CONSOLE) {
         mode = KERNEL_VFS_S_IFCHR | 0600U;
@@ -848,6 +902,8 @@ enum kernel_open_file_kind kernel_open_file_kind(
         return KERNEL_OPEN_FILE_KIND_NAMESPACE;
     case KERNEL_OPEN_FILE_KIND_INOTIFY:
         return KERNEL_OPEN_FILE_KIND_INOTIFY;
+    case KERNEL_OPEN_FILE_KIND_FANOTIFY:
+        return KERNEL_OPEN_FILE_KIND_FANOTIFY;
     case KERNEL_OPEN_FILE_KIND_MQUEUE:
         return KERNEL_OPEN_FILE_KIND_MQUEUE;
     case KERNEL_OPEN_FILE_KIND_PIDFD:
@@ -902,6 +958,7 @@ int kernel_open_file_supports_epoll(
         return file->device && file->device->poll;
     case KERNEL_OPEN_FILE_KIND_MQUEUE:
     case KERNEL_OPEN_FILE_KIND_INOTIFY:
+    case KERNEL_OPEN_FILE_KIND_FANOTIFY:
     case KERNEL_OPEN_FILE_KIND_PIDFD:
     case KERNEL_OPEN_FILE_KIND_SIGNALFD:
     case KERNEL_OPEN_FILE_KIND_TIMERFD:
@@ -1017,7 +1074,8 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
             if (file->file.private_data && kernel_vfs_close(&file->file))
                 return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED;
             file->vfs_closed = 1U;
-        } else if (file->kind==KERNEL_OPEN_FILE_KIND_INOTIFY || file->kind==KERNEL_OPEN_FILE_KIND_BPF) {
+        } else if (file->kind==KERNEL_OPEN_FILE_KIND_INOTIFY ||
+                   file->kind==KERNEL_OPEN_FILE_KIND_FANOTIFY || file->kind==KERNEL_OPEN_FILE_KIND_BPF) {
             file->device->release(file->device_instance);
             file->device_instance=NULL;file->vfs_closed=1;
         } else if(file->kind==KERNEL_OPEN_FILE_KIND_MQUEUE){
@@ -1226,6 +1284,7 @@ int kernel_open_file_readable(
     case KERNEL_OPEN_FILE_KIND_FS_CONTEXT:
     case KERNEL_OPEN_FILE_KIND_BPF:
     case KERNEL_OPEN_FILE_KIND_INOTIFY:
+    case KERNEL_OPEN_FILE_KIND_FANOTIFY:
     case KERNEL_OPEN_FILE_KIND_MQUEUE:
     case KERNEL_OPEN_FILE_KIND_BLOCK:
     case KERNEL_OPEN_FILE_KIND_GENERATED:

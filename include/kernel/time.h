@@ -12,14 +12,45 @@ enum kernel_time_status {
 };
 
 /*
- * `boot_realtime_ns` is the wall-clock reading captured at boot (0 when no
- * RTC source is available; CLOCK_REALTIME then tracks time since boot).
+ * `boot_realtime_ns` points to the RTC sample captured at boot. A null
+ * sample means there is no usable RTC and realtime starts at the boot epoch.
  * The hardware counter supplies the unadjusted clock and deadline domain.
  */
 enum kernel_time_status kernel_time_init(uint32_t timebase_frequency,
-                                         uint64_t boot_realtime_ns);
+                                        const uint64_t *boot_realtime_ns);
 
 uint32_t kernel_time_is_initialized(void);
+int kernel_time_has_rtc(void);
+
+enum kernel_clock_id {
+    KERNEL_CLOCK_REALTIME = 0,
+    KERNEL_CLOCK_MONOTONIC = 1,
+    KERNEL_CLOCK_BOOTTIME = 7,
+    KERNEL_CLOCK_REALTIME_ALARM = 8,
+    KERNEL_CLOCK_BOOTTIME_ALARM = 9,
+    KERNEL_CLOCK_TAI = 11,
+};
+
+static inline int kernel_clock_is_alarm(int32_t clock)
+{
+    return clock == KERNEL_CLOCK_REALTIME_ALARM || clock == KERNEL_CLOCK_BOOTTIME_ALARM;
+}
+
+enum kernel_time_domain {
+    KERNEL_TIME_MONOTONIC,
+    KERNEL_TIME_REALTIME,
+    KERNEL_TIME_TAI,
+};
+
+/* Relative ordinary realtime timers run in the monotonic domain. Alarms
+ * convert the relative value to a deadline in their own clock, as does TAI. */
+static inline enum kernel_time_domain kernel_time_timer_domain(int32_t clock, int absolute)
+{
+    if (clock == KERNEL_CLOCK_TAI) return KERNEL_TIME_TAI;
+    if (clock == KERNEL_CLOCK_REALTIME_ALARM ||
+        (clock == KERNEL_CLOCK_REALTIME && absolute)) return KERNEL_TIME_REALTIME;
+    return KERNEL_TIME_MONOTONIC;
+}
 
 /* Continuous disciplined clock and unadjusted hardware clock, respectively. */
 uint64_t kernel_time_monotonic_ns(void);
@@ -36,6 +67,13 @@ static inline uint64_t kernel_time_monotonic_after(uint64_t duration)
 
 /* Wall-clock nanoseconds: mutable offset plus monotonic, read consistently. */
 uint64_t kernel_time_realtime_ns(void);
+uint64_t kernel_time_tai_ns(void);
+
+static inline uint64_t kernel_time_domain_now(enum kernel_time_domain domain)
+{
+    if (domain == KERNEL_TIME_TAI) return kernel_time_tai_ns();
+    return domain == KERNEL_TIME_REALTIME ? kernel_time_realtime_ns() : kernel_time_monotonic_ns();
+}
 
 /* Init and each delivered timer interrupt publish one actual counter sample.
  * Both coarse clocks derive from that same sample; reads do not touch CSR time. */
@@ -68,4 +106,5 @@ enum kernel_time_status kernel_time_set_realtime(uint64_t nanoseconds);
 void kernel_time_get_timezone(int32_t timezone[2]);
 void kernel_time_set_timezone(const int32_t timezone[2]);
 enum kernel_time_status kernel_time_deadline_from_realtime(uint64_t nanoseconds, uint64_t *deadline);
+enum kernel_time_status kernel_time_deadline_from_tai(uint64_t nanoseconds, uint64_t *deadline);
 #endif
