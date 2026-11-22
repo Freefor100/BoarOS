@@ -1883,7 +1883,7 @@ enum kernel_page_cache_status kernel_page_cache_lookup(
 
 unsigned kernel_page_cache_acquire_ready(struct kernel_page_cache *cache,
     const struct kernel_vfs_file *file, uint64_t first, unsigned selected,
-    uint64_t *addresses, unsigned capacity)
+    uint64_t *addresses, unsigned capacity, unsigned required)
 {
     _Static_assert(KERNEL_PAGE_CACHE_READY_WINDOW <= PHYSICAL_PAGE_REFERENCE_BATCH_MAX &&
         KERNEL_PAGE_CACHE_READY_WINDOW < 32, "bounded cache and physical reference batch");
@@ -1907,11 +1907,13 @@ unsigned kernel_page_cache_acquire_ready(struct kernel_page_cache *cache,
         if ((selected & bit) && read_entry_ready(entry)) {
             addresses[count++] = entry->physical_address;
             acquired |= bit;
-            note_read_hit(cache, entry, 0);
+            note_read_access(cache, entry, 0);
         }
         entry = RB_NEXT(kernel_page_cache_tree, &node->cache_pages, entry);
     }
+    if ((acquired & required) != required) return 0;
     physical_page_acquire_batch(cache->allocator, addresses, count);
+    if (count) note_read_hits(cache, count);
     return acquired;
 }
 
