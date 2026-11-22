@@ -485,20 +485,13 @@ void ext4_bcache_scope_track(struct ext4_buf *buf)
     buf->writeback_scope=scope;buf->writeback_next=scope->head;scope->head=buf;
     buf->refctr++;
 }
-int ext4_bcache_scope_flush(struct ext4_bcache *bc, struct ext4_writeback_scope *scope)
-{
-    for (struct ext4_buf *buf = scope->head; buf; buf = buf->writeback_next) {
-        int result = ext4_block_flush_buf(bc->bdev, buf);
-        if (result) return result;
-    }
-    return EOK;
-}
-
 int ext4_bcache_scope_end(struct ext4_bcache *bc, struct ext4_writeback_scope *scope)
 {
     int result=EOK;
     struct ext4_buf *buf;
     { KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);buf=scope->head;if (!scope->previous) bc->writeback_scope=NULL; }
+    bool batch=bc->bdev->cache_write_back==1 && scope->batch;
+    if (batch) result=ext4_bcache_scope_flush(bc,scope);
     while (buf) {
         struct ext4_buf *next;
         struct ext4_block b;
@@ -507,7 +500,7 @@ int ext4_bcache_scope_end(struct ext4_bcache *bc, struct ext4_writeback_scope *s
             ext4_block_payload_get(buf->current_payload);
             b=(struct ext4_block){buf->lba,buf,buf->data,buf->current_payload};
         }
-        if (bc->bdev->cache_write_back==1) {
+        if (!batch && bc->bdev->cache_write_back==1) {
             int r=ext4_block_flush_buf(bc->bdev,buf);if (!result) result=r;
         }
         { KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);next=buf->writeback_next;buf->writeback_scope=NULL;buf->writeback_next=NULL; }

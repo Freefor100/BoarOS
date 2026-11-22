@@ -2024,12 +2024,15 @@ static int ext4_trans_start_mode(struct ext4_mountpoint *mp __unused, bool wait 
 #endif
     if (operation && operation->depth == UINT32_MAX) return EOVERFLOW;
     if (!operation) {
-        operation = ext4_calloc(1, sizeof(*operation));
+        bool batch = mp->fs.ext2_format && mp->fs.bdev->bdif->bwrite_batch;
+        size_t size = sizeof(*operation) + (batch ? sizeof(struct ext4_scope_batch) : 0);
+        operation = ext4_calloc(1, size);
         if (!operation) return ENOMEM;
         {
         EXT4_STATE_SCOPE(state, &mp->fs);
         ext4_operation_attach_locked(&mp->fs, operation, NULL);
         }
+        if (batch) operation->scope.batch = (struct ext4_scope_batch *)(operation + 1);
         ext4_bcache_scope_begin(&mp->bc, &operation->scope);
     }
     operation->depth++;

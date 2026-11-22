@@ -48,6 +48,7 @@ extern "C" {
 #include <misc/tree.h>
 #include <misc/queue.h>
 #include <kernel/raw_lock.h>
+#include <common/block_io.h>
 
 #define EXT4_BLOCK_ZERO() 	\
 	{.lb_id = 0, .data = 0}
@@ -105,9 +106,16 @@ struct ext4_block {
 };
 
 struct ext4_bcache;
+enum { EXT4_SCOPE_BATCH_MAX = 4 };
+struct ext4_scope_batch {
+    struct kernel_block_span spans[EXT4_SCOPE_BATCH_MAX];
+    struct ext4_buf *buffers[EXT4_SCOPE_BATCH_MAX];
+    struct ext4_block_payload *payloads[EXT4_SCOPE_BATCH_MAX];
+};
 struct ext4_writeback_scope {
 	struct ext4_buf *head;
 	struct ext4_writeback_scope *previous;
+	struct ext4_scope_batch *batch;
 };
 
 /**@brief   Single block descriptor*/
