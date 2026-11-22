@@ -142,21 +142,31 @@ class OfficialFlowTests(unittest.TestCase):
                     self.assertIn('command=' + str(program), result.stderr)
                     self.assertIn('reason=' + reason, result.stderr)
 
-    def test_budget_policy_skips_fs_fill_for_both_libcs(self):
+    def test_budget_policy_skips_selected_programs_for_both_libcs(self):
+        cases = {
+            'fs_fill': 'evaluation-time-budget',
+            'epoll-ltp': 'evaluation-no-score-without-summary',
+            'hackbench': 'evaluation-benchmark-without-score',
+            'semop05': 'evaluation-no-score-without-summary',
+            'copy_file_range01': 'evaluation-time-budget-low-score',
+            'fork14': 'evaluation-time-budget-low-score',
+            'mallocstress': 'evaluation-time-budget-low-score',
+            'mmapstress01': 'evaluation-time-budget-low-score',
+        }
         for libc in ('glibc', 'musl'):
-            with self.subTest(libc=libc):
-                program = Path(self.temp.name) / libc / 'fs_fill'
-                program.parent.mkdir()
-                program.write_text('#!/bin/sh\necho FILL-WORKLOAD-RAN\n')
-                program.chmod(0o755)
-                result = subprocess.run(['sh', str(HERE / 'ltp-case.sh'), str(self.binary),
-                    str(HERE / 'ltp-skips.tsv'), '3', '/bin/sh', str(program)],
-                    capture_output=True, text=True, timeout=5)
-                self.assertEqual(result.returncode, 125, result.stderr)
-                self.assertEqual(result.stdout, '')
-                self.assertIn('BOAROS-CASE SKIP', result.stderr)
-                self.assertIn('reason=evaluation-time-budget', result.stderr)
-                self.assertIn('source=testcases/kernel/fs/fs_fill/fs_fill.c', result.stderr)
+            for name, reason in cases.items():
+                with self.subTest(libc=libc, name=name):
+                    program = Path(self.temp.name) / libc / name
+                    program.parent.mkdir(exist_ok=True)
+                    program.write_text('#!/bin/sh\necho WORKLOAD-RAN\n')
+                    program.chmod(0o755)
+                    result = subprocess.run(['sh', str(HERE / 'ltp-case.sh'), str(self.binary),
+                        str(HERE / 'ltp-skips.tsv'), '3', '/bin/sh', str(program)],
+                        capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, 125, result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    self.assertIn('BOAROS-CASE SKIP', result.stderr)
+                    self.assertIn('reason=' + reason + ' ', result.stderr)
 
     def test_unlisted_case_keeps_native_exit_and_output(self):
         program = Path(self.temp.name) / 'ordinary-test'

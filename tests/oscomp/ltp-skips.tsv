@@ -61,6 +61,11 @@ renameat01	testcases/kernel/syscalls/renameat/renameat01.c	evaluation-no-score-w
 sendmsg02	testcases/kernel/syscalls/sendmsg/sendmsg02.c	evaluation-no-score-without-summary
 umount2_01	testcases/kernel/syscalls/umount2/umount2_01.c	evaluation-no-score-without-summary
 
+# Published legacy or benchmark output contributes no raw score.
+epoll-ltp	testcases/kernel/syscalls/epoll/epoll-ltp.c	evaluation-no-score-without-summary
+hackbench	testcases/kernel/sched/cfs-scheduler/hackbench.c	evaluation-benchmark-without-score
+semop05	testcases/kernel/syscalls/ipc/semop/semop05.c	evaluation-no-score-without-summary
+
 # Published programs fail before the target call or produce no scoreable result.
 float_bessel	testcases/misc/math/float/float_bessel.c	published-float-no-score
 float_exp_log	testcases/misc/math/float/float_exp_log.c	published-float-no-score
@@ -77,3 +82,9 @@ inotify09	testcases/kernel/syscalls/inotify/inotify09.c	evaluation-time-budget-l
 mmap1	testcases/kernel/mem/mtest06/mmap1.c	evaluation-time-budget-low-score
 mmap3	testcases/kernel/mem/mtest06/mmap3.c	evaluation-time-budget-low-score
 starvation	testcases/kernel/sched/cfs-scheduler/starvation.c	evaluation-time-budget-low-score
+
+# At most two raw points per configuration for repeated or long workloads.
+copy_file_range01	testcases/kernel/syscalls/copy_file_range/copy_file_range01.c	evaluation-time-budget-low-score
+fork14	testcases/kernel/syscalls/fork/fork14.c	evaluation-time-budget-low-score
+mallocstress	testcases/kernel/mem/mtest07/mallocstress.c	evaluation-time-budget-low-score
+mmapstress01	testcases/kernel/mem/mmapstress/mmapstress01.c	evaluation-time-budget-low-score

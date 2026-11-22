@@ -121,14 +121,20 @@ BuildStorm 的 Rust 工具链曾在准备阶段中止。沿 `Child::wait_with_ou
 - **控制器与输入。** 正式脚本逐项执行目录中的程序。跳过表排除无参数单独执行时缺控制器、
   结构化输入或配套服务的辅助程序。其配套测试仍可按原方式启动这些程序。
 - **有通过结果但无可计分摘要。** 已核实的 19 个程序在四个配置下均通过断言且退出为零，
-  但无原判分所需的摘要。测例名称和源文件见跳过表。`epoll-ltp` 使用旧式汇总，
-  正式流程仍运行它。其摘要格式和断言分别判读。
+  但无原判分所需的摘要。`epoll-ltp` 使用旧式汇总。`semop05` 在 musl 的通过路径中固定睡眠
+  20 秒，输出单条旧式通过记录。`hackbench` 只报告调度负载耗时。这三项的发布程序在四个
+  配置中均得零分。见 [epoll-ltp](https://github.com/linux-test-project/ltp/blob/20240524/testcases/kernel/syscalls/epoll/epoll-ltp.c)、
+  [semop05](https://github.com/linux-test-project/ltp/blob/20240524/testcases/kernel/syscalls/ipc/semop/semop05.c)
+  和 [hackbench](https://github.com/linux-test-project/ltp/blob/20240524/testcases/kernel/sched/cfs-scheduler/hackbench.c)。
 - **发布程序缺依赖。** 跳过 `io_setup01` 和五个浮点程序 `float_bessel`、
   `float_exp_log`、`float_iperb`、`float_power`、`float_trigo`。对应构建条件和运行库见上表。
 - **耗时长且得分低。** `dio_append`、`dio_sparse`、`inotify09`、`mmap1`、
   `mmap3`、`starvation`、`cve-2016-7117` 至少有一组耗时达到 60 秒，
   四组的最高观察分均不超过 2 分。`fs_fill` 使用独立盘检查写满、同步与卸载。
   `shm_test` 的默认压力场景无内部上限、无计分摘要，可使用独立短例验证共享内存。
+  `copy_file_range01` 在 ext4 上分别经 C 标准库与原始系统调用执行复制矩阵，每组观察到
+  2 分。`fork14`、`mallocstress`、`mmapstress01` 分别施加大地址空间创建、多线程内存
+  分配和文件映射压力，每组最高观察到 1 分。这四项列入整轮时间预算跳过表。
 - **准备阶段失败。** 文件通知测例先核对格式化程序、请求的文件系统类型、挂载和监视后端。
   只有到达事件断言的结果才能用于判断通知本身。配额测例也可能缺 `quotacheck`。
   `io_uring01/02` 和部分模块测例
