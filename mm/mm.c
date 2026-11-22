@@ -6383,7 +6383,10 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
     unsigned required = include_demand ? 1U << ((address-first)>>BOAROS_PAGE_SHIFT) : 0;
     unsigned selected=0,slots=KERNEL_PAGE_CACHE_READY_WINDOW;
     {
-        KERNEL_RAW_READ_SCOPE(raw,&record->metadata);
+        /* The demand window retains the MM writer from selection through
+         * publication. No compatible operation can edit this table. */
+        struct kernel_raw_read_guard raw __attribute__((cleanup(kernel_raw_read_scope_release)))={0};
+        if (!include_demand) kernel_raw_rwlock_read_acquire(&record->metadata,&raw);
         if (!source && record->resident_capacity-record->resident_count<slots)
             slots=record->resident_capacity-record->resident_count;
         if (!slots) return end;
@@ -6392,10 +6395,13 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
     }
     if (!selected || (selected & required) != required) return end;
     uint64_t refs[KERNEL_PAGE_CACHE_READY_WINDOW];
+    struct kernel_page_cache_alias_binding aliases[KERNEL_PAGE_CACHE_READY_WINDOW];
+    struct kernel_page_cache *cache = file ? kernel_open_file_page_cache(file) : NULL;
+    const struct kernel_vfs_file *backing = file ? kernel_open_file_vfs_borrow(file) : NULL;
     uint64_t offset=vma->backing_offset+first-vma->start;
     unsigned ready=source ? kernel_elf64_source_acquire_ready(source,offset,selected,refs,slots) :
-        kernel_page_cache_acquire_ready(kernel_open_file_page_cache(file),
-            kernel_open_file_vfs_borrow(file),offset>>BOAROS_PAGE_SHIFT,selected,refs,slots,required);
+        kernel_page_cache_acquire_ready(cache,backing,offset>>BOAROS_PAGE_SHIFT,
+            selected,refs,slots,required,shared ? aliases : NULL);
     if (!ready) return end;
     void *residents[KERNEL_PAGE_CACHE_READY_WINDOW] = {0};
     unsigned count = 0;
@@ -6435,16 +6441,17 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
             *targets = note_fault_change_locked(record,batch,0,
                 (vma->permissions & KERNEL_MM_EXECUTE) != 0);
     }
-    struct kernel_page_cache_alias_binding aliases[KERNEL_PAGE_CACHE_READY_WINDOW];
     unsigned demand_bit = demand && installed ?
         1U << ((demand->address - first) >> BOAROS_PAGE_SHIFT) : 0;
-    unsigned unused = 0, alias_count = 0, i = 0;
+    unsigned unused = 0, i = 0;
     for (unsigned bits = ready | demand_bit, index = 0; bits; bits >>= 1, index++) {
         if (!(bits & 1)) continue;
         unsigned bit = 1U << index;
         struct mm_file_resident *page;
-        if (bit == demand_bit) page = demand;
-        else {
+        if (bit == demand_bit) {
+            page = demand;
+            aliases[index].entry = NULL;
+        } else {
             page = residents[i];
             if (!(installed & bit)) {
                 refs[unused++] = refs[i++];
@@ -6460,14 +6467,13 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
             page->alias.owner = page;
             page->alias.virtual_address = page->address;
             page->alias.rearm = rearm_shared_file_alias;
-            aliases[alias_count++] = (struct kernel_page_cache_alias_binding){
-                .alias = &page->alias, .physical_address = page->physical_address,
-            };
+            aliases[index].alias = &page->alias;
+            aliases[index].physical_address = page->physical_address;
         }
     }
-    if (alias_count)
-        kernel_page_cache_alias_attach_window(kernel_open_file_page_cache(file),
-            kernel_open_file_vfs_borrow(file), offset>>BOAROS_PAGE_SHIFT, installed | demand_bit, aliases);
+    if (shared && installed)
+        kernel_page_cache_alias_attach_window(cache,backing,
+            offset>>BOAROS_PAGE_SHIFT,installed | demand_bit,aliases);
     physical_page_release_batch(record->space.allocator,refs,unused);
     return end;
 }

@@ -1846,11 +1846,10 @@ static struct jbd_block_rec *jbd_borrow_block_rec(struct jbd_journal *journal,
     return record;
 }
 
-static void jbd_put_private_record(struct jbd_journal *journal,
+static void jbd_put_private_record_state_held(struct jbd_journal *journal,
     struct jbd_block_rec *record)
 {
     if (!record) return;
-    JBD_STATE_SCOPE(journal);
     if (!record->private_refs) __builtin_trap();
     record->private_refs--;
     jbd_retire_block_rec(journal, record);
@@ -2421,7 +2420,7 @@ static int jbd_claim_versions(struct jbd_trans *trans,bool apply)
 /* All records and credits were reserved before publication. Validate the full
  * operation before publishing any home block; unrelated accepted bytes are
  * retained when separate records share one physical block. */
-static int jbd_publish_private(struct jbd_trans *trans)
+static int jbd_publish_private(struct jbd_trans *trans, struct jbd_trans *running)
 {
     COST_SCOPE(publish_cost, JOURNAL_PUBLISH_TICKS);
     struct jbd_journal *journal = trans->journal;
@@ -2473,7 +2472,9 @@ static int jbd_publish_private(struct jbd_trans *trans)
         int result=jbd_claim_versions(trans,true);
         if (result) return result;
     }
-    TAILQ_FOREACH(jb, &trans->buf_queue, buf_node) {
+    struct jbd_trans *owner = running ? running : trans;
+    struct jbd_buf *next_jb;
+    TAILQ_FOREACH_SAFE(jb, &trans->buf_queue, buf_node, next_jb) {
         if (!jb->private_access || !jb->modified) continue;
         struct ext4_block_payload *current = jb->block.buf->current_payload;
         /* STATE keeps the latest accepted version stable through this merge. */
@@ -2490,27 +2491,58 @@ static int jbd_publish_private(struct jbd_trans *trans)
          * needs to check whether another operation published first. */
         struct jbd_block_rec *rec=jb->block_rec;
         if (!rec) rec=jbd_trans_block_rec_lookup(journal,jb->block.lb_id);
-        if (rec) { jbd_free(jb->reserved_rec); jbd_trans_change_ownership(rec, trans); }
+        if (rec) {
+            jbd_free(jb->reserved_rec);
+            if (rec->trans != owner) jbd_trans_change_ownership(rec, owner);
+        }
         else {
             rec = jb->reserved_rec;
             if (!rec) __builtin_trap();
-            rec->lba = jb->block.lb_id; rec->trans = trans;
+            rec->lba = jb->block.lb_id; rec->trans = owner;
             TAILQ_INIT(&rec->dirty_buf_queue);
-            LIST_INSERT_HEAD(&trans->tbrec_list, rec, tbrec_node);
+            LIST_INSERT_HEAD(&owner->tbrec_list, rec, tbrec_node);
             if (RB_INSERT(jbd_block, &journal->block_rec_root, rec)) __builtin_trap();
         }
         /* The accepted transaction now owns the entry before its preparer
          * drops the borrow; no index gap or replacement allocation is needed. */
-        jbd_put_private_record(journal, jb->block_rec);
+        jbd_put_private_record_state_held(journal, jb->block_rec);
         jb->reserved_rec = NULL;
         jb->block_rec = rec;
+        struct ext4_buf *buf = jb->block.buf;
+        struct jbd_buf *old = running ? TAILQ_LAST(&rec->dirty_buf_queue, jbd_buf_dirty) : NULL;
+        if (running) {
+            TAILQ_REMOVE(&trans->buf_queue, jb, buf_node);
+            trans->data_cnt--;
+        }
+        if (old && old->trans == running) {
+            /* The running group already owns the wire record and its home
+             * pin. Replace its image without publishing a second record. */
+            buf->end_write = jbd_trans_end_write;
+            buf->end_write_arg = old;
+            ext4_bcache_publish(buf, &jb->after->payload);
+            ext4_block_rebind(&old->block, &jb->after->payload);
+            jbd_image_free(old->after);
+            old->after = jb->after;
+            ext4_bcache_set_dirty(buf);
+            jbd_unpin_version(journal, buf);
+            journal->jbd_fs->bdev->cache_write_back++;
+            ext4_block_set(journal->jbd_fs->bdev, &jb->block);
+            journal->jbd_fs->bdev->cache_write_back--;
+            jbd_free(jb);
+            continue;
+        }
+        if (running) {
+            jb->trans = running;
+            TAILQ_INSERT_TAIL(&running->buf_queue, jb, buf_node);
+            running->data_cnt++;
+        }
         TAILQ_INSERT_TAIL(&rec->dirty_buf_queue, jb, dirty_buf_node);
-        jb->block.buf->end_write = jbd_trans_end_write;
-        jb->block.buf->end_write_arg = jb;
-        ext4_bcache_publish(jb->block.buf, &jb->after->payload);
+        buf->end_write = jbd_trans_end_write;
+        buf->end_write_arg = jb;
+        ext4_bcache_publish(buf, &jb->after->payload);
         ext4_block_rebind(&jb->block, &jb->after->payload);
         jb->private_access = false;
-        ext4_bcache_set_dirty(jb->block.buf);
+        ext4_bcache_set_dirty(buf);
     }
     jbd_discard_allocation_claims(trans);
     return EOK;
@@ -2592,7 +2624,7 @@ void jbd_journal_free_trans_state_held(struct jbd_journal *journal,
             if (journal->grouped) jbd_unpin_version(journal, jbd_buf->block.buf);
             ext4_block_set(fs->bdev, &jbd_buf->block);
             jbd_image_free(jbd_buf->after); jbd_image_free(jbd_buf->before);
-            jbd_put_private_record(journal, jbd_buf->block_rec);
+            jbd_put_private_record_state_held(journal, jbd_buf->block_rec);
             jbd_free(jbd_buf->reserved_rec); jbd_free(jbd_buf);
             continue;
         }
@@ -3087,7 +3119,7 @@ int jbd_journal_commit_trans(struct jbd_journal *journal,
     int result;
     {
         JBD_STATE_SCOPE(journal);
-        result = jbd_publish_private(trans);
+        result = jbd_publish_private(trans, NULL);
         if (!result && (!TAILQ_EMPTY(&trans->buf_queue) || !RB_EMPTY(&trans->revoke_root))) {
             trans->trans_id = journal->alloc_trans_id;
             jbd_claim_logs(trans);
@@ -3176,7 +3208,7 @@ int jbd_journal_accept_state_held(struct jbd_journal *journal, struct jbd_trans 
 	unsigned credits = operation->reserved_logs + (running ? running->reserved_logs : 0);
 	uint32_t maxlen = jbd_get32(&journal->jbd_fs->sb, maxlen);
 	if (credits >= maxlen - journal->first) __builtin_trap();
-    int publication = jbd_publish_private(operation);
+    int publication = jbd_publish_private(operation, running);
     if (publication) return publication;
     ext4_operation_publish_super(&operation->operation);
 	ext4_orphan_trans_finish_state_held(operation, false);
@@ -3190,30 +3222,6 @@ int jbd_journal_accept_state_held(struct jbd_journal *journal, struct jbd_trans 
 		journal->running = running;
 	} else {
 		COST_ADD(JOURNAL_MERGED, 1);
-		struct jbd_buf *jb, *next;
-		TAILQ_FOREACH_SAFE(jb, &operation->buf_queue, buf_node, next) {
-			struct jbd_buf *old = TAILQ_PREV(jb, jbd_buf_dirty, dirty_buf_node);
-			if (old && old->trans != running) old = NULL;
-			TAILQ_REMOVE(&operation->buf_queue, jb, buf_node);
-			jbd_trans_change_ownership(jb->block_rec, running);
-			if (old) {
-				TAILQ_REMOVE(&jb->block_rec->dirty_buf_queue, jb, dirty_buf_node);
-				jb->block.buf->end_write_arg = old;
-				if (jb->after) jbd_unpin_version(journal, jb->block.buf);
-				journal->jbd_fs->bdev->cache_write_back++;
-				ext4_block_set(journal->jbd_fs->bdev, &jb->block);
-				journal->jbd_fs->bdev->cache_write_back--;
-            if (jb->after) {
-                ext4_block_rebind(&old->block, &jb->after->payload);
-                jbd_image_free(old->after); old->after = jb->after; jb->after = NULL;
-            }
-			jbd_free(jb);
-			} else {
-				jb->trans = running;
-				TAILQ_INSERT_TAIL(&running->buf_queue, jb, buf_node);
-				running->data_cnt++;
-			}
-		}
 		/* Moving into an empty running tree transfers the existing count.
 		 * Two populated trees become one only after all records have moved. */
 		bool merge_data_trees = running->ordered_count && operation->ordered_count;
