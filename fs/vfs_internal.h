@@ -57,6 +57,9 @@ struct kernel_vfs_file;
 /* An overlay inode retains both layer paths. Borrow the selected backing
  * file for the operation while the caller holds the visible file. */
 const struct kernel_vfs_file *kernel_vfs_data_file(const struct kernel_vfs_file *);
+int kernel_vfs_copy_range_files(const struct kernel_vfs_file *input,
+    const struct kernel_vfs_file *output, const struct kernel_vfs_file **source,
+    const struct kernel_vfs_file **target);
 struct kernel_vfs_path *kernel_vfs_backing_path(const struct kernel_vfs_file *);
 int kernel_vfs_file_atime_enabled(const struct kernel_vfs_file *);
 int kernel_vfs_file_noatime_allowed(const struct kernel_vfs_file *);

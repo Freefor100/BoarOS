@@ -22,6 +22,9 @@ enum kernel_proc_page_stream {
 
 int kernel_open_file_pread_mode(struct kernel_open_file_description *file,
     uint64_t offset, void *buffer, size_t size, uint32_t status_flags, size_t *bytes_read);
+int kernel_open_file_pread_backing(struct kernel_open_file_description *file,
+    struct kernel_vfs_file *backing, uint64_t offset, void *buffer, size_t size,
+    uint32_t status_flags, size_t *bytes_read);
 
 struct kernel_open_file_description {
     struct kernel_vfs_file file;

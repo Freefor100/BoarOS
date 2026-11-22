@@ -118,7 +118,8 @@ static int64_t regular_copy_output(struct kernel_open_file_description *out,
  * index nor its inode is locked while allocating or waiting on the target. */
 static __attribute__((noinline)) int64_t regular_cached_copy(
     struct kernel_open_file_description *input,struct kernel_open_file_description *output,
-    struct kernel_page_cache *cache,uint64_t start,uint64_t out_start,uint64_t count,
+    struct kernel_page_cache *cache,const struct kernel_vfs_file *source,
+    uint64_t start,uint64_t out_start,uint64_t count,
     struct kernel_vfs_size_limit *limit,uint32_t output_flags)
 {
     enum { COPY_WINDOW_PAGES=8 };
@@ -133,7 +134,7 @@ static __attribute__((noinline)) int64_t regular_cached_copy(
         if (wanted>count-total) wanted=count-total;
         size_t nr=(offset+wanted+BOAROS_PAGE_MASK)>>BOAROS_PAGE_SHIFT;
         kernel_open_file_read_begin(input,position);
-        if (kernel_page_cache_get_batch(cache,kernel_vfs_data_file(&input->file),position>>BOAROS_PAGE_SHIFT,pages,nr, kernel_open_file_read_no_reuse(input))
+        if (kernel_page_cache_get_batch(cache,kernel_vfs_data_file(source),position>>BOAROS_PAGE_SHIFT,pages,nr, kernel_open_file_read_no_reuse(input))
             ==KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT) __builtin_trap();
         size_t available=0,within=offset;
         int miss=0;
@@ -174,16 +175,19 @@ static __attribute__((noinline)) int64_t regular_cached_copy(
 static int64_t regular_file_copy(struct kernel_mm *mm,
     struct kernel_open_file_description *input,
     struct kernel_open_file_description *output,
+    const struct kernel_vfs_file *source,
     uint64_t start, uint64_t out_start, uint64_t count,
     struct kernel_vfs_size_limit *limit, int sync_each)
 {
     unsigned flags=kernel_open_file_flags(output),input_flags=kernel_open_file_flags(input);
     int synchronous=!!(flags&KERNEL_FILES_O_DSYNC);
     int datasync=(flags&KERNEL_FILES_O_SYNC)!=KERNEL_FILES_O_SYNC;
-    struct kernel_page_cache *cache=kernel_open_file_page_cache(input);
-    if (cache && !((flags|input_flags)&KERNEL_FILES_O_DIRECT) && !kernel_open_file_memory_backed(input) &&
-        !kernel_vfs_files_share_node(&input->file,&output->file) && !(sync_each && synchronous)) {
-        int64_t copied=regular_cached_copy(input,output,cache,start,out_start,count,limit,flags);
+    const struct kernel_vfs_file *target=source==&input->file ? &output->file :
+        kernel_vfs_data_file(&output->file);
+    struct kernel_page_cache *cache=kernel_vfs_file_page_cache(source);
+    if (cache && !((flags|input_flags)&KERNEL_FILES_O_DIRECT) && !kernel_vfs_file_memory(source) &&
+        !kernel_vfs_files_share_node(source,target) && !(sync_each && synchronous)) {
+        int64_t copied=regular_cached_copy(input,output,cache,source,start,out_start,count,limit,flags);
         if (copied>0 && synchronous) {
             int synced=kernel_vfs_sync(&output->file,datasync,&output->observed_writeback_error);
             if (synced) return synced;
@@ -197,7 +201,13 @@ static int64_t regular_file_copy(struct kernel_mm *mm,
     while (total < count) {
         size_t wanted = count - total > BOAROS_PAGE_SIZE
             ? BOAROS_PAGE_SIZE : (size_t)(count - total), available = 0;
-        error = kernel_open_file_pread_mode(input,start+total,buffer.data,wanted,input_flags,&available);
+        if (source==&input->file) {
+            error=kernel_open_file_pread_mode(input,start+total,buffer.data,wanted,input_flags,&available);
+        } else {
+            struct kernel_vfs_file backing=*source;
+            error=kernel_open_file_pread_backing(input,&backing,start+total,buffer.data,
+                wanted,input_flags,&available);
+        }
         if (available > wanted) __builtin_trap();
         if (!available) break;
         int64_t sent=regular_copy_output(output,buffer.data,NULL,0,available,out_start+total,limit,total==0,flags);
@@ -367,7 +377,8 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
     uint64_t source_size = kernel_open_file_size(input);
     if (count == 0U || start >= source_size) return 0;
     if (output->kind == KERNEL_OPEN_FILE_KIND_REGULAR) {
-        int64_t result = regular_file_copy(mm, input, output, start, out_start, count, &size_limit, 1);
+        int64_t result = regular_file_copy(mm, input, output, &input->file,
+            start, out_start, count, &size_limit, 1);
         kernel_files_size_limit_notify(&size_limit);
         if (result > 0) {
             if (explicit_offset || output != input) output->offset = out_start + (uint64_t)result;
@@ -605,14 +616,16 @@ check_ranges:
         return -KERNEL_EINVAL;
     if (!kernel_open_file_readable(input) || !kernel_files_description_writable(output) ||
         (kernel_open_file_flags(output) & KERNEL_FILES_O_APPEND)) return -KERNEL_EBADF;
-    if (input->file.mount->private_data != output->file.mount->private_data) return -KERNEL_EXDEV;
+    const struct kernel_vfs_file *source, *target;
+    int error=kernel_vfs_copy_range_files(&input->file,&output->file,&source,&target);
+    if (error) return error;
     if (kernel_vfs_node_attributes(output->file.private_data)&KERNEL_VFS_INODE_IMMUTABLE) return -KERNEL_EPERM;
     if (start > UINT64_MAX - count || out_start > UINT64_MAX - count) return -KERNEL_EOVERFLOW;
-    uint64_t size = kernel_open_file_size(input);
+    uint64_t size = source==&input->file ? kernel_open_file_size(input) : kernel_vfs_file_size(source);
     if ((int64_t)start >= (int64_t)size) count = 0;
     else if (count > size - start) count = size - start;
     size_t allowed = (size_t)count;
-    int error = kernel_vfs_check_write_limit(&limit, out_start, &allowed);
+    error = kernel_vfs_check_write_limit(&limit, out_start, &allowed);
     if (error) { kernel_files_size_limit_notify(&limit); return error; }
     count = allowed;
     uint64_t maximum = kernel_vfs_file_max_size(&output->file);
@@ -632,10 +645,17 @@ check_ranges:
         if (first || second) goto check_ranges;
     }
     if (!count) return 0;
+    if (source!=&input->file) {
+        /* The writable overlay description already has an upper file. Keep
+         * reading this source layer even if another open publishes a copy-up. */
+        if (source->mount->private_data!=target->mount->private_data) return -KERNEL_EXDEV;
+        if (kernel_vfs_files_share_node(source,target) &&
+            out_start+count>start && out_start<start+count) return -KERNEL_EINVAL;
+    }
     if (count > KERNEL_FILES_MAX_RW_COUNT) count = KERNEL_FILES_MAX_RW_COUNT;
     kernel_open_file_read_begin(input, start);
     kernel_vfs_file_accessed(&input->file,kernel_open_file_flags(input));
-    int64_t result = regular_file_copy(mm, input, output, start, out_start, count, &limit, 0);
+    int64_t result = regular_file_copy(mm, input, output, source, start, out_start, count, &limit, 0);
     kernel_files_size_limit_notify(&limit);
     if (result > 0) {
         position_in = (int64_t)(start + (uint64_t)result);

@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
 #include <unistd.h>
@@ -282,6 +283,75 @@ static void no_space_for_copy(void)
     CHECK(!fsync(fd) && !close(fd));
 }
 
+static void copy_across_volumes(int in)
+{
+    const char *name = access("/with-vfat", F_OK) ? "vdb" : "vdc";
+    char device[32], attribute[64];
+    snprintf(device, sizeof(device), "/dev/%s", name);
+    snprintf(attribute, sizeof(attribute), "/sys/class/block/%s/dev", name);
+    CHECK(!mkdir("/sys", 0755) || errno == EEXIST);
+    int sysfs = !mount("sysfs", "/sys", "sysfs", 0, NULL);
+    CHECK(sysfs || errno == EBUSY);
+    unsigned major = 252, minor = name[2] == 'b' ? 16 : 32;
+    FILE *numbers = fopen(attribute, "r");
+    if (numbers) CHECK(fscanf(numbers, "%u:%u", &major, &minor) == 2 && !fclose(numbers));
+    CHECK(!mknod(device, S_IFBLK | 0600, makedev(major, minor)) || errno == EEXIST);
+    CHECK(!mkdir(ROOT "/disk", 0755) && !mkdir(ROOT "/third", 0755));
+    CHECK(!mount(device, ROOT "/disk", "ext4", 0, NULL));
+    CHECK(!mkdir(ROOT "/disk/upper", 0755) && !mkdir(ROOT "/disk/work", 0755));
+    CHECK(!mount("overlay", ROOT "/third", "overlay", 0,
+                 "lowerdir=" LOWER ",upperdir=" ROOT "/disk/upper,workdir=" ROOT "/disk/work"));
+    int out = open(ROOT "/third/copy", O_RDWR | O_CREAT, 0600);
+    int lower = open(ROOT "/third/alpha", O_RDONLY);
+    int plain_in = open(UPPER "/only-upper", O_RDONLY);
+    int plain_out = open(ROOT "/disk/upper/copy", O_RDWR);
+    CHECK(out >= 0 && lower >= 0 && plain_in >= 0 && plain_out >= 0);
+    off_t from = 0, to = 0;
+    CHECK(syscall(SYS_copy_file_range, in, &from, out, &to, 5, 0) == -1 &&
+          errno == EXDEV && from == 0 && to == 0);
+    CHECK(syscall(SYS_copy_file_range, lower, NULL, out, NULL, 5, 0) == -1 &&
+          errno == EXDEV);
+    CHECK(syscall(SYS_copy_file_range, in, NULL, out, NULL, 0, 0) == 0);
+    CHECK(syscall(SYS_copy_file_range, plain_in, NULL, plain_out, NULL, 5, 0) == -1 &&
+          errno == EXDEV);
+    check_bytes(out, "");
+    CHECK(!close(plain_out) && !close(plain_in) && !close(lower) && !close(out));
+    CHECK(!umount(ROOT "/third") && !umount(ROOT "/disk"));
+    if (sysfs) CHECK(!umount("/sys"));
+}
+
+static void copy_across_views(void)
+{
+    const char *view = ROOT "/second";
+    CHECK(!mkdir(view, 0755) && !mkdir(ROOT "/upper2", 0755) &&
+          !mkdir(ROOT "/work2", 0755));
+    CHECK(!link(UPPER "/only-upper", ROOT "/upper2/alias"));
+    CHECK(!mount("overlay", view, "overlay", 0,
+                 "lowerdir=" LOWER ",upperdir=" ROOT "/upper2,workdir=" ROOT "/work2"));
+    int in = open(VIEW "/only-upper", O_RDONLY);
+    int out = open(ROOT "/second/copy", O_RDWR | O_CREAT, 0600);
+    int alias = open(ROOT "/second/alias", O_RDWR);
+    int plain = open(ROOT "/upper2/copy", O_RDONLY);
+    CHECK(in >= 0 && out >= 0 && alias >= 0 && plain >= 0);
+
+    off_t from = 0, to = 0;
+    CHECK(syscall(SYS_copy_file_range, in, &from, out, &to, 10, 0) == 10);
+    CHECK(from == 10 && to == 10 && lseek(in, 0, SEEK_CUR) == 0 &&
+          lseek(out, 0, SEEK_CUR) == 0);
+    check_bytes(plain, "upper-only");
+
+    from = 0; to = 1;
+    CHECK(syscall(SYS_copy_file_range, in, &from, alias, &to, 2, 0) == -1 &&
+          errno == EINVAL && from == 0 && to == 1);
+    check_bytes(alias, "upper-only");
+    CHECK(syscall(SYS_copy_file_range, plain, NULL, out, NULL, 1, 0) == -1 &&
+          errno == EXDEV);
+    copy_across_volumes(in);
+    CHECK(!close(plain) && !close(alias) && !close(out) && !close(in));
+    CHECK(!umount(view));
+    puts("OVERLAY CASE copy-range-cross-instance PASS");
+}
+
 int main(void)
 {
     populate();
@@ -319,6 +389,7 @@ int main(void)
     CHECK(source>=0 && target>=0);
     CHECK(syscall(SYS_copy_file_range,source,NULL,target,NULL,10,0)==10);
     CHECK(!fsync(target) && !close(source) && !close(target));
+    copy_across_views();
     CHECK(!umount(VIEW));
 
     mount_with_context();
