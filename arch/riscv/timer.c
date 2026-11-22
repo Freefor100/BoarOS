@@ -131,10 +131,11 @@ enum riscv_timer_status riscv_timer_set_scheduler_deadline(uint64_t deadline)
     uintptr_t irq = arch_interrupt_save();
     struct kernel_cpu *cpu = kernel_cpu_current();
     enum riscv_timer_status status = RISCV_TIMER_STATUS_OK;
-    /* 周期IRQ自行推进并重装硬件；相同的已确认事件不再次进入固件。
-     * 失败不发布候选，IRQ保护比较到提交之间不被tick改写。 */
+    /* 周期 IRQ 重新装载硬件。软件期限变化时，只有实际比较值改变才进入固件。 */
     if (cpu->timer_deadline != deadline) {
-        if (sbi_set_timer(earlier_deadline(timer_state.next_deadline, deadline)) != 0L)
+        uint64_t periodic = timer_state.next_deadline;
+        uint64_t target = earlier_deadline(periodic, deadline);
+        if (target != earlier_deadline(periodic, cpu->timer_deadline) && sbi_set_timer(target) != 0L)
             status = RISCV_TIMER_STATUS_SBI_SET_FAILED;
         else cpu->timer_deadline = deadline;
     }

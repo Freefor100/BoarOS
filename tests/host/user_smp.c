@@ -326,7 +326,7 @@ extern void scheduler_user_service_set_locked(struct kernel_task *, int);
 extern void scheduler_user_request_locked(struct kernel_task *);
 static int cancel_stop_on_handoff, local_rotation_active, local_run_required, forbid_cpu0_run;
 static const struct kernel_wait_token *local_park_token;
-static unsigned local_park_case, local_park_switched;
+static unsigned local_park_case, local_park_switched, local_park_run_locks;
 enum kernel_scheduler_status __real_kernel_scheduler_wake_signal(struct kernel_task *);
 
 static void local_park_wake(void)
@@ -394,11 +394,13 @@ static int scheduler_finish_local(struct kernel_cpu *cpu)
 enum kernel_scheduler_status scheduler_switch_claimed(struct kernel_task *old,struct kernel_task *next)
 {
     if (local_park_token) {
-        assert(active==&cpus[1] && next==active->idle && old==local_park_token->task);
+        int queued_peer=local_park_case==7;
+        assert(active==&cpus[1] && next==(queued_peer?&tasks[1]:active->idle) && old==local_park_token->task);
         assert(old->state==KERNEL_THREAD_STATE_BLOCKED && old->wait.on_cpu &&
             !old->ready_node.queued);
+        if (queued_peer) assert(local_park_run_locks==1);
         local_park_switched++;
-        if (local_park_case==3 || local_park_case==5) {
+        if (local_park_case==3 || local_park_case==5 || queued_peer) {
             local_park_wake();
             assert(old->wait.ready_pending && !old->ready_node.queued);
         }
@@ -407,7 +409,8 @@ enum kernel_scheduler_status scheduler_switch_claimed(struct kernel_task *old,st
         assert_ready_owner(old,active);
         struct kernel_task *resumed;
         uint64_t deadline;
-        assert(scheduler_select_local(0,0,0,&resumed,&deadline) && resumed==old);
+        if (queued_peer) next->state=KERNEL_THREAD_STATE_BLOCKED;
+        assert(scheduler_select_local(queued_peer,0,0,&resumed,&deadline) && resumed==old);
         assert(scheduler_finish_local(active));
         return KERNEL_SCHEDULER_STATUS_OK;
     }
@@ -481,6 +484,7 @@ void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_r
     assert(!local_run_required || lock!=&kernel_wait_domain);
     if (local_park_token && active==&cpus[1]) {
         assert(local_park_case==6 || lock!=&kernel_wait_domain);
+        if (lock==kernel_run_lock(active)) local_park_run_locks++;
         if (local_park_case==1 && lock==kernel_run_lock(active) &&
             kernel_wait_record_phase(&local_park_token->task->wait)==KERNEL_WAIT_PREPARED)
             local_park_wake();
@@ -624,33 +628,34 @@ static void ordinary_local_claim(void)
 
 static void ordinary_local_park(void)
 {
-    for (local_park_case=1;local_park_case<=6;local_park_case++) {
+    for (local_park_case=1;local_park_case<=7;local_park_case++) {
         reset_two_queues();active=&cpus[1];
         scheduler.initialized=KERNEL_SCHEDULER_INITIALIZED;
         {
             KERNEL_RAW_SCOPE(domain,&kernel_wait_domain);
             setup_task(0,2,0);
-            if (local_park_case>=5) tasks[0].arch.user_mode=1;
+            if (local_park_case==5 || local_park_case==6) tasks[0].arch.user_mode=1;
             if (local_park_case==6) tasks[0].signal_pending=UINT64_C(1)<<9;
             assert(scheduler_select_next_locked(active,active->idle,1)==&tasks[0]);
             kernel_wait_switch_finish_locked(&idles[1]);active->switch_previous=0;
+            if (local_park_case==7) setup_task(1,2,0);
         }
         struct kernel_wait_queue queue;
         struct kernel_wait_token token;
         enum kernel_wait_wake_reason reason;
         kernel_wait_queue_init(&queue);
         assert(!kernel_wait_prepare(&queue,0,local_park_case>=5,&token));
-        local_park_switched=0;local_park_token=&token;
+        local_park_switched=local_park_run_locks=0;local_park_token=&token;
         assert(!kernel_wait_park(&token,&reason));
         local_park_token=NULL;
-        assert(local_park_switched==(local_park_case>=3 && local_park_case<=5));
-        assert(reason==(local_park_case>=5?KERNEL_WAIT_SIGNALLED:KERNEL_WAIT_WOKEN) && active->current==&tasks[0] &&
+        assert(local_park_switched==(local_park_case==7 || (local_park_case>=3 && local_park_case<=5)));
+        assert(reason==((local_park_case==5 || local_park_case==6)?KERNEL_WAIT_SIGNALLED:KERNEL_WAIT_WOKEN) && active->current==&tasks[0] &&
             tasks[0].state==KERNEL_THREAD_STATE_RUNNING && tasks[0].wait.on_cpu);
         assert(!tasks[0].wait.ready_pending && !tasks[0].ready_node.queued && !active->switch_previous);
         assert(!kernel_wait_finish(&token));
         assert(!kernel_wait_queue_close(&queue) && !kernel_wait_queue_destroy(&queue));
     }
-    puts("PASS local park: early notification, old stack, locked notifier and interruptible waits");
+    puts("PASS local park: early notification, old stack, locked notifier, interruptible waits and one-lock local successor");
 }
 
 static void ordinary_local_wake(void)
