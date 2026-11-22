@@ -41,13 +41,19 @@ enum kernel_uaccess_status kernel_copy_to_user(struct kernel_mm *mm,uint64_t to,
 {(void)mm;(void)to;(void)from;(void)size;(void)copied;abort();}
 static void *allocate(size_t size)
 {void *p=calloc(1,size);assert(p);__atomic_fetch_add(&allocations,1,__ATOMIC_RELAXED);return p;}
+enum kernel_heap_status kernel_heap_allocate(struct kernel_heap *h,size_t size,void **out)
+{
+    assert(h==&heap&&!cpu.raw_locks);
+    *out=allocate(size);
+    return KERNEL_HEAP_STATUS_OK;
+}
 static struct inotify_group *new_group(void)
 {
     struct inotify_group *g=allocate(sizeof(*g));g->heap=&heap;g->references=1;g->account=&account;
     account.inotify_groups++;account.references++;
     kernel_wait_queue_init(&g->queue);kernel_wait_queue_init(&g->async_events);return g;
 }
-static int new_mark(struct inotify_group *g,struct kernel_vfs_instance *instance,unsigned inode,unsigned mask)
+static int new_mark(struct inotify_group *g,struct kernel_vfs_instance *instance,uint64_t inode,unsigned mask)
 {
     struct inotify_mark *m=allocate(sizeof(*m));memset(m,0xa5,sizeof(*m));m->heap=&heap;
     KERNEL_RAW_SCOPE(guard,&notify_lock);
@@ -143,8 +149,56 @@ static void colliding_descriptors(void)
     release_group(g);release_group(other);
     assert(!allocations&&account.references==1&&!account.inotify_groups&&!account.inotify_marks&&!instance.notify_marks);
 }
+static void fdinfo_filesystem(struct kernel_vfs_instance *instance,unsigned char id[16])
+{
+    (void)instance;
+    memset(id,0x4a,16);
+}
+static void fdinfo_rows(void)
+{
+    const struct kernel_vfs_export_ops export={.type=KERNEL_VFS_HANDLE_EXT4,.filesystem=fdinfo_filesystem};
+    const struct kernel_vfs_backend backend={.export=&export};
+    struct kernel_vfs_instance instance={.ops=&backend,.device_id=0x801};
+    struct inotify_group *group=new_group();
+    for (unsigned inode=1;inode<=12;inode++)
+        assert(new_mark(group,&instance,inode,IN_EXCL_UNLINK|IN_ONESHOT|VFS_NOTIFY_ACCESS)==(int)inode);
+
+    struct inotify_fdinfo_cursor cursor={.mark=group->marks};
+    group->fdinfo=&cursor;
+    assert(!watch_remove(group,12) && cursor.mark->wd==11);
+    assert(!watch_remove(group,11) && cursor.mark->wd==10);
+    group->fdinfo=NULL;
+
+    struct kernel_open_file_description file={.device_instance=group};
+    char *text=allocate(16);
+    memcpy(text,"pos:\t0\n",7);
+    size_t length=7;
+    assert(!kernel_inotify_fdinfo(&file,&heap,&text,&length));
+    assert(length>512 && !strncmp(text,"pos:\t0\n",7));
+    assert(strstr(text,"inotify wd:a ino:a sdev:800001 mask:84000001 ignored_mask:0 "));
+    assert(strstr(text,"fhandle-bytes:20 fhandle-type:4241 f_handle:"));
+    assert(strstr(text,"inotify wd:1 ino:1 ") && !strstr(text,"inotify wd:b "));
+    unsigned lines=0;
+    for (const char *p=text; (p=strchr(p,'\n')); p++) lines++;
+    assert(lines==11 && !group->fdinfo);
+    kernel_heap_release(&heap,text);
+    release_group(group);
+
+    instance.device_id=UINT32_MAX;
+    group=new_group();
+    group->next_wd=INT32_MAX-1;
+    assert(new_mark(group,&instance,UINT64_MAX,IN_EXCL_UNLINK|IN_ONESHOT|IN_EVENTS)==INT32_MAX);
+    file.device_instance=group;
+    text=allocate(1);
+    length=0;
+    assert(!kernel_inotify_fdinfo(&file,&heap,&text,&length));
+    assert(strstr(text,"inotify wd:7fffffff ino:ffffffffffffffff sdev:ffffffff mask:84000fff"));
+    kernel_heap_release(&heap,text);
+    release_group(group);
+    assert(!allocations&&!instance.notify_marks&&!account.inotify_marks);
+}
 int main(void)
 {
-    kernel_wait_domain_init();accepted_events();concurrent_retirement();colliding_descriptors();
-    puts("PASS inotify async: event cadence, poll dedup, concurrent and colliding descriptor retirement");
+    kernel_wait_domain_init();accepted_events();concurrent_retirement();colliding_descriptors();fdinfo_rows();
+    puts("PASS inotify: event cadence, poll dedup, descriptor retirement and fdinfo");
 }

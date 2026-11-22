@@ -313,6 +313,31 @@ static inline uint32_t mm_sync_targets(const struct kernel_mm_record *record, in
 #endif
 }
 
+/* A writable PTE is also readable on both supported architectures. RISC-V
+ * Linux records VM_READ too, as VM_WRITE alone denotes a shadow stack. */
+static inline uint32_t add_read_to_write(uint32_t permissions)
+{
+    return (permissions & KERNEL_MM_WRITE) ? permissions | KERNEL_MM_READ : permissions;
+}
+
+static inline uint32_t user_effective_permissions(uint32_t permissions)
+{
+#if defined(BOAROS_ARCH_LOONGARCH)
+    return add_read_to_write(permissions);
+#else
+    return permissions;
+#endif
+}
+
+static inline uint32_t user_vma_permissions(uint32_t permissions)
+{
+#if defined(BOAROS_ARCH_LOONGARCH)
+    return permissions;
+#else
+    return add_read_to_write(permissions);
+#endif
+}
+
 static uint32_t backend_permissions_from_mm(uint32_t permissions);
 static enum kernel_mm_status unmap_space_range(struct kernel_mm_record *,uint64_t,uint64_t);
 static uint32_t note_tlb_change_locked(struct kernel_mm_record *,
@@ -933,7 +958,7 @@ static int rearm_shared_file_alias(void *owner, uint64_t address)
         kernel_vma_set_lookup(record->vmas, address, &vma) !=
             KERNEL_VMA_STATUS_OK ||
         vma.kind != KERNEL_VMA_KIND_FILE_SHARED) return 0;
-    permissions = vma.permissions & ~KERNEL_MM_WRITE;
+    permissions = user_effective_permissions(vma.permissions) & ~KERNEL_MM_WRITE;
     struct kernel_mm_retirement batch={0}; uint32_t targets=0;
     {
         KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
@@ -1522,8 +1547,7 @@ static int valid_vma_range(uint64_t start,
            (end & BOAROS_PAGE_MASK) == 0U &&
            (permissions & ~known) == 0U &&
            (permissions & known) != 0U &&
-           !((permissions & KERNEL_MM_WRITE) != 0U &&
-             (permissions & KERNEL_MM_READ) == 0U);
+           user_vma_permissions(permissions) == permissions;
 }
 
 static enum kernel_mm_status mutable_vma_record(
@@ -1878,7 +1902,8 @@ static enum kernel_mm_status mm_fork_impl(
                     struct kernel_vma vma;
                     if (kernel_vma_set_lookup(destination_record->vmas,page->address,&vma) ||
                         arch_mmu_user_protect_owned_page(&destination_record->space,page->address,
-                            backend_permissions_from_mm(vma.permissions & ~KERNEL_MM_WRITE))) __builtin_trap();
+                            backend_permissions_from_mm(user_effective_permissions(vma.permissions) &
+                                ~KERNEL_MM_WRITE))) __builtin_trap();
                 }
                 kernel_page_cache_alias_clone(&page->alias,
                     &page->clone_source->alias, page);
@@ -1999,7 +2024,7 @@ static enum kernel_mm_status lookup_record(const struct kernel_mm_record *record
  * mapping. Readonly private stores still resolve COW before borrowing a page. */
 static int remote_access_allowed(const struct kernel_vma *vma, uint32_t access, int force)
 {
-    if (vma->permissions & access) return 1;
+    if (user_effective_permissions(vma->permissions) & access) return 1;
     if (!force || !(vma->maximum_permissions & access)) return 0;
     if (access == KERNEL_MM_READ) return 1;
     return (vma->kind == KERNEL_VMA_KIND_HUGETLB_PRIVATE || vma->kind == KERNEL_VMA_KIND_ANONYMOUS ||
@@ -2893,12 +2918,12 @@ static uint32_t mm_permissions_from_elf_flags(uint32_t flags)
         permissions |= KERNEL_MM_READ;
     }
     if ((flags & KERNEL_ELF64_FLAG_WRITE) != 0U) {
-        permissions |= KERNEL_MM_WRITE | KERNEL_MM_READ;
+        permissions |= KERNEL_MM_WRITE;
     }
     if ((flags & KERNEL_ELF64_FLAG_EXECUTE) != 0U) {
         permissions |= KERNEL_MM_EXECUTE;
     }
-    return permissions;
+    return user_vma_permissions(permissions);
 }
 
 enum kernel_mm_status kernel_mm_map_elf_source(
@@ -3352,10 +3377,7 @@ static int normalize_user_permissions(uint32_t permissions,
     if ((permissions & ~known) != 0U) {
         return 0;
     }
-    if ((permissions & KERNEL_MM_WRITE) != 0U) {
-        permissions |= KERNEL_MM_READ;
-    }
-    *normalized = permissions;
+    *normalized = user_vma_permissions(permissions);
     return 1;
 }
 
@@ -4533,7 +4555,8 @@ static uint32_t protection_for_leaf(struct kernel_mm_record *record, uint64_t le
     struct mm_file_resident *resident=find_file_resident(record,leaf);
     if (resident) {
         COST_ADD(MPROTECT_RESIDENT_VISITS, 1);
-        if (kernel_page_cache_alias_active(&resident->alias)) permissions&=~KERNEL_MM_WRITE;
+        if (kernel_page_cache_alias_active(&resident->alias))
+            permissions = user_effective_permissions(permissions) & ~KERNEL_MM_WRITE;
     }
     return permissions;
 }
@@ -4738,7 +4761,7 @@ static uint32_t backend_permissions_from_mm(uint32_t permissions)
 {
     uint32_t result = 0U;
 
-    if ((permissions & KERNEL_MM_READ) != 0U) {
+    if ((user_effective_permissions(permissions) & KERNEL_MM_READ) != 0U) {
         result |= ARCH_MMU_READ;
     }
     if ((permissions & KERNEL_MM_WRITE) != 0U) {
@@ -6335,7 +6358,7 @@ static enum kernel_mm_status mapped_object_fault(struct mm_operation *operation,
     uint64_t address,uint32_t access,const struct kernel_vma *vma)
 {
     struct kernel_mm_record *record=operation->record;
-    if (!(vma->permissions & access)) return KERNEL_MM_STATUS_ACCESS;
+    if (!(user_effective_permissions(vma->permissions) & access)) return KERNEL_MM_STATUS_ACCESS;
     KERNEL_RAW_WRITE_SCOPE(raw,&record->metadata);
     struct kernel_mm_mapping mapping;
     enum kernel_mm_status status=lookup_record(record,address,&mapping);
@@ -6406,7 +6429,7 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
         unsigned prepared_mask = ready ^ unprepared;
         if ((prepared_mask & required) == required)
             installed = arch_mmu_user_map_owned_window(&record->space, first, prepared_mask, refs,
-                backend_permissions_from_mm(vma->permissions & ~KERNEL_MM_WRITE), !shared);
+                backend_permissions_from_mm(user_effective_permissions(vma->permissions) & ~KERNEL_MM_WRITE), !shared);
         /* A required slot was selected under the continuously held MM writer. */
         if (installed && (installed & required) != required) __builtin_trap();
         unsigned i = 0;
@@ -6709,7 +6732,7 @@ prepare_file_tables:
             else {
                 backend = arch_mmu_user_map_prepared_page(&record->space,address,replacement,
                     backend_permissions_from_mm((!shared && access != KERNEL_MM_WRITE) || (shared && disk) ?
-                        vma->permissions & ~KERNEL_MM_WRITE : vma->permissions),
+                        user_effective_permissions(vma->permissions) & ~KERNEL_MM_WRITE : vma->permissions),
                     !shared && access != KERNEL_MM_WRITE,&prepared);
                 missing = prepared.table_mask;
             }
@@ -6787,7 +6810,8 @@ static __attribute__((noinline)) enum kernel_mm_status grow_fault_stack(struct k
     kernel_rwlock_write(&record->vma_lock, &vma_guard);
     uint64_t page = address & ~BOAROS_PAGE_MASK;
     if (kernel_vma_set_next(record->vmas, page, &vma) ||
-        !kernel_vma_grows_down(&vma) || !(vma.permissions & access) ||
+        !kernel_vma_grows_down(&vma) ||
+        !(user_effective_permissions(vma.permissions) & access) ||
         vma.end - page > kernel_task_current_stack_limit() ||
         !may_expand_current(record, &vma, vma.start - page) ||
         ((vma.flags & KERNEL_VMA_LOCKED) && !may_lock_memory(record, vma.start - page))) {
@@ -7209,8 +7233,8 @@ prepare_memory_tables:
                 else
 #endif
                 backend = arch_mmu_user_map_prepared_page(&record->space, address, replacement,
-                    backend_permissions_from_mm(source_shared ? vma->permissions & ~KERNEL_MM_WRITE :
-                        vma->permissions), source_shared, &prepared);
+                    backend_permissions_from_mm(source_shared ?
+                        user_effective_permissions(vma->permissions) & ~KERNEL_MM_WRITE : vma->permissions), source_shared, &prepared);
                 missing = prepared.table_mask;
                 if (backend == ARCH_MMU_STATUS_NEED_TABLES) {
                     refill = 1;
@@ -7483,7 +7507,7 @@ static __attribute__((noinline)) int try_elf_ready_fault(struct mm_operation *op
         if (kernel_vma_set_generation(record->vmas) == view->generation &&
             !fault_range_claimed(record,first,limit)) {
             installed = arch_mmu_user_map_owned_window(&record->space,first,ready,refs,
-                backend_permissions_from_mm(vma->permissions & ~KERNEL_MM_WRITE),1);
+                backend_permissions_from_mm(user_effective_permissions(vma->permissions) & ~KERNEL_MM_WRITE),1);
             if (installed) targets = note_fault_change_locked(record,&batch,0,instructions);
         }
     }
@@ -7523,7 +7547,7 @@ static enum kernel_mm_status dispatch_fault(struct mm_operation *operation, uint
         return mapped_file_fault(operation, address, access, view, force);
     case KERNEL_VMA_KIND_ELF_PRIVATE:
         if (operation->shared && !force && !operation->populate && !operation->fault_pin &&
-            access != KERNEL_MM_WRITE && (view->vma.permissions & access) &&
+            access != KERNEL_MM_WRITE && (user_effective_permissions(view->vma.permissions) & access) &&
             !(view->vma.flags & KERNEL_VMA_RANDOM_READ) && try_elf_ready_fault(operation,address,view))
             return KERNEL_MM_STATUS_OK;
         return memory_fault(operation, address, access, view, force);
@@ -8076,7 +8100,7 @@ static int populate_range(struct kernel_mm *mm, uint64_t start, uint64_t end,
         uint32_t access = requested ? requested : (vma->permissions & KERNEL_MM_WRITE) &&
             (vma->kind == KERNEL_VMA_KIND_ANONYMOUS || vma->kind == KERNEL_VMA_KIND_FILE_PRIVATE ||
              vma->kind == KERNEL_VMA_KIND_ELF_PRIVATE) ? KERNEL_MM_WRITE :
-            (vma->permissions & KERNEL_MM_READ) ? KERNEL_MM_READ : KERNEL_MM_EXECUTE;
+            (user_effective_permissions(vma->permissions) & KERNEL_MM_READ) ? KERNEL_MM_READ : KERNEL_MM_EXECUTE;
         if ((access & (access - 1)) || (access & ~KERNEL_VMA_ALL_PERMISSIONS))
             return -KERNEL_EFAULT;
         status = dispatch_fault(&operation, start, access, &view, 0);

@@ -45,13 +45,17 @@ struct inotify_mark {
     unsigned references, wd_overflow;
     uint64_t inode;
     int wd;
-    uint32_t mask;
+    uint32_t mask, generation;
     union {
         struct {
             struct inotify_mark *wd_next, **wd_previous;
         };
         RB_ENTRY(inotify_mark) wd_link;
     };
+};
+struct inotify_fdinfo_cursor {
+    struct inotify_fdinfo_cursor *next, **previous;
+    struct inotify_mark *mark;
 };
 struct inotify_group {
     struct kernel_heap *heap;
@@ -61,6 +65,8 @@ struct inotify_group {
     struct kernel_wait_cursor notification;
     struct inotify_group *pending;
     struct inotify_mark *marks;
+    struct inotify_fdinfo_cursor *fdinfo;
+    unsigned mark_count;
     unsigned references, head, used, last, next_wd, overflow, pending_wake;
     /* The descriptor index and the inode and group lists are published together
      * under notify_lock. Cap hash chains even when active descriptors are sparse. */
@@ -244,6 +250,9 @@ static void remove_mark(struct inotify_mark *mark,struct inotify_mark **retired,
     if (mark->next) mark->next->previous=mark->previous;
     *mark->group_previous=mark->group_next;
     if (mark->group_next) mark->group_next->group_previous=mark->group_previous;
+    for (struct inotify_fdinfo_cursor *cursor = mark->group->fdinfo; cursor; cursor = cursor->next)
+        if (cursor->mark == mark) cursor->mark = mark->group_next;
+    mark->group->mark_count--;
     descriptor_remove(mark);
     if (!--mark->instance->notify_marks)
         __atomic_store_n(&mark->instance->notify_ops,NULL,__ATOMIC_RELEASE);
@@ -444,6 +453,124 @@ static const struct kernel_char_device inotify_file_ops={
     .readv=inotify_readv, .poll=inotify_poll, .ioctl=inotify_ioctl,.async_source=inotify_async_source
 };
 
+struct inotify_fdinfo_row {
+    struct kernel_vfs_handle handle;
+    uint64_t device;
+    uint32_t wd, mask, handle_type;
+};
+
+static size_t fdinfo_hex(char *out, uint64_t value)
+{
+    static const char digits[] = "0123456789abcdef";
+    unsigned shift = 60;
+    while (shift && !(value >> shift)) shift -= 4;
+    size_t size = shift / 4 + 1;
+    for (size_t i = 0; i < size; i++, shift -= 4)
+        out[i] = digits[(value >> shift) & 15U];
+    return size;
+}
+
+static char *fdinfo_field(char *out, const char *label, uint64_t value)
+{
+    size_t length = strlen(label);
+    memcpy(out, label, length);
+    out += length;
+    return out + fdinfo_hex(out, value);
+}
+
+/* The OFD keeps the group alive. Allocate before linking the cursor so that
+ * the bounded mark snapshots and formatting cannot block with a live cursor. */
+int kernel_inotify_fdinfo(const struct kernel_open_file_description *file,
+                         struct kernel_heap *heap, char **buffer, size_t *length)
+{
+    const size_t line_capacity =
+        sizeof("inotify wd: ino: sdev: mask: ignored_mask:0 fhandle-bytes: fhandle-type: f_handle:\n") - 1 +
+        2 * (4 * sizeof(uint32_t) + sizeof(uint64_t) + sizeof(size_t) + sizeof(struct kernel_vfs_handle));
+    struct inotify_group *group = file->device_instance;
+    struct inotify_fdinfo_cursor cursor;
+    char *text;
+    size_t capacity = 0;
+    for (;;) {
+        {
+            KERNEL_RAW_SCOPE(guard, &notify_lock);
+            if (!group->mark_count) return 0;
+            capacity = group->mark_count;
+        }
+        enum kernel_heap_status allocation = kernel_heap_allocate(
+            heap, *length + capacity * line_capacity + 1, (void **)&text);
+        if (allocation) return allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+        {
+            KERNEL_RAW_SCOPE(guard, &notify_lock);
+            if (group->mark_count <= capacity) {
+                cursor = (struct inotify_fdinfo_cursor){group->fdinfo, &group->fdinfo, group->marks};
+                if (cursor.next) cursor.next->previous = &cursor.next;
+                group->fdinfo = &cursor;
+                break;
+            }
+        }
+        kernel_heap_release(heap, text);
+    }
+
+    memcpy(text, *buffer, *length);
+    char *out = text + *length;
+    for (;;) {
+        struct inotify_fdinfo_row rows[4];
+        size_t count = 0;
+        {
+            KERNEL_RAW_SCOPE(guard, &notify_lock);
+            while (count < sizeof(rows) / sizeof(rows[0]) && cursor.mark) {
+                const struct inotify_mark *mark = cursor.mark;
+                const struct kernel_vfs_export_ops *export = mark->instance->ops->export;
+                struct inotify_fdinfo_row *row = &rows[count++];
+                *row = (struct inotify_fdinfo_row){
+                    .handle = {.inode = mark->inode, .generation = mark->generation},
+                    .device = mark->instance->device_id, .wd = (uint32_t)mark->wd, .mask = mark->mask,
+                };
+                if (export) {
+                    row->handle_type = export->type;
+                    export->filesystem(mark->instance, row->handle.filesystem);
+                }
+                cursor.mark = mark->group_next;
+            }
+            if (!count) {
+                *cursor.previous = cursor.next;
+                if (cursor.next) cursor.next->previous = cursor.previous;
+            }
+        }
+        if (!count) break;
+        for (size_t i = 0; i < count; i++) {
+            const struct inotify_fdinfo_row *row = &rows[i];
+            out = fdinfo_field(out, "inotify wd:", row->wd);
+            out = fdinfo_field(out, " ino:", row->handle.inode);
+            /* VFS stores the userspace dev_t encoding; fdinfo uses the kernel dev_t. */
+            uint64_t major = (row->device >> 8) & 0xfffU;
+            uint64_t minor = (row->device & 0xffU) | ((row->device >> 12) & 0xfff00U);
+            out = fdinfo_field(out, " sdev:", (major << 20) | minor);
+            out = fdinfo_field(out, " mask:", row->mask);
+            out = fdinfo_field(out, " ignored_mask:", 0);
+            if (row->handle_type) {
+                static const char label[] = " f_handle:";
+                static const char digits[] = "0123456789abcdef";
+                out = fdinfo_field(out, " fhandle-bytes:", sizeof(row->handle));
+                out = fdinfo_field(out, " fhandle-type:", row->handle_type);
+                memcpy(out, label, sizeof(label) - 1);
+                out += sizeof(label) - 1;
+                const unsigned char *bytes = (const unsigned char *)&row->handle;
+                for (size_t n = 0; n < sizeof(row->handle); n++) {
+                    *out++ = digits[bytes[n] >> 4];
+                    *out++ = digits[bytes[n] & 15U];
+                }
+            }
+            *out++ = '\n';
+        }
+    }
+    *out = 0;
+    kernel_heap_release(heap, *buffer);
+    *buffer = text;
+    *length = (size_t)(out - text);
+    return 0;
+}
+
 static enum kernel_files_status create(struct kernel_files *files,uint32_t flags,int64_t *result)
 {
     if (flags&~(IN_CLOEXEC|IN_NONBLOCK)) {*result=-KERNEL_EINVAL;return 0;}
@@ -513,6 +640,7 @@ static int watch_install(struct inotify_group *group,struct kernel_vfs_instance 
     candidate->group_next=group->marks;candidate->group_previous=&group->marks;
     if (group->marks) group->marks->group_previous=&candidate->group_next;
     group->marks=candidate;
+    group->mark_count++;
     descriptor_insert(candidate);
     if (!instance->notify_marks++)
         __atomic_store_n(&instance->notify_ops,&inotify_ops,__ATOMIC_RELEASE);
@@ -547,6 +675,8 @@ static int watch_add(struct inotify_group *group,const struct kernel_fs_context 
             struct inotify_mark *candidate=NULL;
             if (!kernel_heap_allocate(group->heap,sizeof(*candidate),(void **)&candidate)) {
                 candidate->heap=group->heap;
+                const struct kernel_vfs_export_ops *export = node->instance->ops->export;
+                candidate->generation = export ? export->generation(node) : 0;
                 {
                     KERNEL_RAW_SCOPE(guard,&notify_lock);
                     error=watch_install(group,node->instance,node->inode,mask,candidate);

@@ -8,6 +8,7 @@
 #include <arch/context.h>
 #include <kernel/errno.h>
 #include <kernel/heap.h>
+#include <kernel/inotify.h>
 #include <kernel/fs_context.h>
 #include <kernel/open_file.h>
 #include <kernel/mqueue.h>
@@ -1495,7 +1496,7 @@ struct proc_mount_entry {
     uint64_t id,parent,device,shared,master,dominating;
     uint8_t unbindable,super_read_only;
     uint8_t is_proc, is_tmpfs, is_devpts;
-    uint8_t read_only,nosuid,nodev,noexec,atime_policy;
+    uint8_t read_only,nosuid,nodev,noexec,nosymfollow,atime_policy;
 };
 
 static void release_mount_entries(struct kernel_heap *heap,
@@ -1564,6 +1565,7 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
             if(!e->bpf_type)e->bpf_type=kernel_devtmpfs_is_mount(it) ? "devtmpfs" : instance->ops->type;
             e->is_proc=kernel_procfs_is_mount(it);e->is_tmpfs=kernel_tmpfs_is_mount(it);e->is_devpts=kernel_devpts_is_mount(it);
             e->nosuid=it->nosuid;e->nodev=it->nodev;e->noexec=it->noexec;e->atime_policy=it->atime_policy;
+            e->nosymfollow=it->nosymfollow;
             e->read_only=kernel_vfs_mount_is_readonly(it);e->super_read_only=instance->read_only;
             e->id=it->id;e->parent=it->parent?it->parent->id:it->id;e->device=instance->device_id;
             e->shared=it->propagation_group;e->master=it->master?it->master->propagation_group:0;
@@ -1623,7 +1625,7 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
         }
         const char *options[]={entries[i].read_only?" ro":" rw",
             entries[i].nosuid?",nosuid":"",entries[i].nodev?",nodev":"",
-            entries[i].noexec?",noexec":"",
+            entries[i].noexec?",noexec":"",entries[i].nosymfollow?",nosymfollow":"",
             entries[i].atime_policy&VFS_ATIME_NONE?",noatime":
                 entries[i].atime_policy&VFS_ATIME_STRICT?"":",relatime",
             entries[i].atime_policy&VFS_ATIME_NODIR?",nodiratime":""," 0 0\n"};
@@ -2074,7 +2076,10 @@ static int proc_fdinfo_snapshot(struct kernel_vfs_node *node,struct kernel_heap 
     if(error)return error;
     char *data=0;
     enum kernel_heap_status allocation=kernel_heap_allocate(heap,256+info.namespace_count*12U+info.extra_length,(void **)&data);
-    if(allocation)return allocation==KERNEL_HEAP_STATUS_EMPTY?-KERNEL_ENOMEM:-KERNEL_EIO;
+    if (allocation) {
+        if (info.inotify && kernel_open_file_release(&info.inotify)) __builtin_trap();
+        return allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+    }
     size_t used=append_number_line(data,"pos:\t",info.position,"\n");
     memcpy(data+used,"flags:\t",7);used+=7;
     char octal[24];unsigned n=0;uint64_t flags=info.flags;
@@ -2097,6 +2102,14 @@ static int proc_fdinfo_snapshot(struct kernel_vfs_node *node,struct kernel_heap 
         }
     }
     if(info.extra_length){memcpy(data+used,info.extra,info.extra_length);used+=info.extra_length;}
+    if (info.inotify) {
+        error = kernel_inotify_fdinfo(info.inotify, heap, &data, &used);
+        if (kernel_open_file_release(&info.inotify)) __builtin_trap();
+        if (error) {
+            kernel_heap_release(heap, data);
+            return error;
+        }
+    }
     data[used]=0;*buffer=data;*length=used;return 0;
 }
 

@@ -303,12 +303,24 @@ enum kernel_files_status kernel_files_fchownat(
     return status;
 }
 
+static enum kernel_files_status output_statfs(struct kernel_mm *mm, uint64_t user_buffer,
+    const struct kernel_linux_statfs *stat, int64_t *linux_result)
+{
+    size_t copied = 0;
+    enum kernel_uaccess_status access = kernel_copy_to_user(mm, user_buffer,
+                                                            stat, sizeof(*stat), &copied);
+    if (access == KERNEL_UACCESS_STATUS_FAULT) *linux_result = -KERNEL_EFAULT;
+    else if (access != KERNEL_UACCESS_STATUS_OK || copied != sizeof(*stat))
+        return KERNEL_FILES_STATUS_STATE;
+    else *linux_result = 0;
+    return KERNEL_FILES_STATUS_OK;
+}
+
 static enum kernel_files_status copy_statfs(struct kernel_mm *mm,
     struct kernel_vfs_mount *mount, uint64_t user_buffer, int64_t *linux_result)
 {
     struct kernel_vfs_statfs native;
     struct kernel_linux_statfs stat;
-    size_t copied = 0;
     if (!mount) { *linux_result = -KERNEL_ENOTSUP; return KERNEL_FILES_STATUS_OK; }
     int result = kernel_vfs_mount_statfs(mount, &native);
     if (result) { *linux_result = result; return KERNEL_FILES_STATUS_OK; }
@@ -324,13 +336,7 @@ static enum kernel_files_status copy_statfs(struct kernel_mm *mm,
     stat.f_fsid[1] = (int32_t)(uint32_t)(native.fsid >> 32U);
     stat.f_namelen = (int64_t)native.name_length;
     stat.f_flags = (int64_t)native.flags;
-    enum kernel_uaccess_status access = kernel_copy_to_user(mm, user_buffer,
-                                                    &stat, sizeof(stat), &copied);
-    if (access == KERNEL_UACCESS_STATUS_FAULT) *linux_result = -KERNEL_EFAULT;
-    else if (access != KERNEL_UACCESS_STATUS_OK || copied != sizeof(stat))
-        return KERNEL_FILES_STATUS_STATE;
-    else *linux_result = 0;
-    return KERNEL_FILES_STATUS_OK;
+    return output_statfs(mm, user_buffer, &stat, linux_result);
 }
 
 enum kernel_files_status kernel_files_statfs(
@@ -360,6 +366,14 @@ enum kernel_files_status kernel_files_fstatfs(
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     struct kernel_open_file_description *file = kernel_files_hold_fd(files, fd, &pin_guard);
     if (!file) { *linux_result = -KERNEL_EBADF; return KERNEL_FILES_STATUS_OK; }
+    if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE && !file->file.mount) {
+        const struct kernel_linux_statfs stat = {
+            .f_type = 0x50495045, /* PIPEFS_MAGIC */
+            .f_bsize = BOAROS_PAGE_SIZE, .f_frsize = BOAROS_PAGE_SIZE,
+            .f_namelen = 255, .f_flags = 0x20, /* ST_VALID */
+        };
+        return output_statfs(mm, user_buffer, &stat, linux_result);
+    }
     if (file->kind==KERNEL_OPEN_FILE_KIND_NAMESPACE || file->kind==KERNEL_OPEN_FILE_KIND_FS_CONTEXT) {
         struct kernel_linux_statfs stat={.f_type=file->kind==KERNEL_OPEN_FILE_KIND_FS_CONTEXT?0x09041934:0x6e736673,.f_bsize=BOAROS_PAGE_SIZE,.f_namelen=255};
         size_t copied;

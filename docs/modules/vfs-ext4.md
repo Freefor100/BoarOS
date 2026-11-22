@@ -279,9 +279,9 @@ ext4 转 RO 前排空至 checkpoint，再独占 journal 服务资格，暂停存
 
 当前创建类型为tmpfs、devpts、proc、mqueue、ext4、vfat、bpf、tracefs、sysfs。tmpfs支持size、nr_blocks、nr_inodes、mode；devpts支持newinstance、mode、ptmxmode、uid、gid、max；source使用字符串，块设备路径在创建时按本次调用者的root/cwd解析。新接口保留参数类型和完整值：旧mount的逗号选项与fsconfig的逐项参数复用后端标量解析，单个值不能被解释成多个选项。普通块设备创建复用已存在的实例及缓存/日志；CREATE_EXCL遇到已有实例返回EBUSY。
 
-ro/rw通过fsconfig控制实例状态；fsmount的RDONLY、NOSUID、NODEV、NOEXEC与atime属性控制新视图。fsconfig重新变为rw不会清除某个视图显式设置的RDONLY；旧remount仍按原规则同时更新实例及指定视图。CAP_SYS_ADMIN按实际调用者检查，创建者凭据仅用于创建实例时的默认归属。创建未接入、参数失败、FD耗尽和最后关闭均通过真实owner清理，设备错误保留既有退休/重试关系。
+ro/rw通过fsconfig控制实例状态。fsmount的RDONLY、NOSUID、NODEV、NOEXEC、NOSYMFOLLOW和atime属性控制新视图。fsconfig重新变为rw不会清除某个视图显式设置的RDONLY；旧remount仍按原规则同时更新实例及指定视图。CAP_SYS_ADMIN按实际调用者检查，创建者凭据仅用于创建实例时的默认归属。创建未接入、参数失败、FD耗尽和最后关闭均通过真实owner清理，设备错误保留既有退休/重试关系。
 
-当前重配置只支持共同的ro/rw，文件系统专用参数的在线修改仍未提供；同步、lazytime、NOSYMFOLLOW和ID映射没有因此开放。BINARY/PATH/FD形式完成原生参数和用户内存导入校验，当前后端没有使用这些类型的专用选项。配置FD使用anon_inode语义，可查询、dup、关闭和传递，不接受普通写入或定位I/O；当前不生成扩展诊断文本，无日志记录时read返回ENODATA。
+fsconfig 重配置支持共同的 ro/rw。BINARY/PATH/FD形式完成原生参数和用户内存导入校验，当前后端没有使用这些类型的专用选项。配置FD使用anon_inode语义，可查询、dup、关闭和传递，不接受普通写入或定位I/O；当前不生成扩展诊断文本，无日志记录时read返回ENODATA。
 
 直接消费者为`tests/workloads/resource/mount_namespace.c`的mount_context选择，复用`tests/userland/api8.py --program mount_context`。同ELF Linux差分覆盖状态、参数类型、实例/视图只读区别、命名空间、实际卸载、创建者凭据、FD耗尽和共享上下文竞争；宿主created-tree组覆盖根路径与命名空间接管的分配失败及owner归还。
 
@@ -289,7 +289,9 @@ ro/rw通过fsconfig控制实例状态；fsmount的RDONLY、NOSUID、NODEV、NOEX
 
 `move_mount(429)` 使用目录 FD 与路径，或 EMPTY_PATH 指向的实际对象，转移挂载连接；源、目标 OFD 的借用覆盖整个操作，避免并发关闭提前退休未连接的源树。已连接源须属于调用者命名空间；分离源须为所持树根并核对创建时的命名空间ID，不能单独提取其中的子挂载。成功挂入后，连接接管原树 owner，关闭原克隆 FD 不会卸载它。符号链接跟随和空路径由源、目标各自的 flags 控制。BENEATH 将源挂在目标覆盖挂载下面，目标的原内容继续可见；SET_GROUP 在同一文件系统、符合根范围与传播资格的视图之间建立对应 peer/master 关系。现有 mount(MS_MOVE) 使用同一移动实现。
 
-`mount_setattr(442)` 接受原生32字节 mount_attr，较大结构的扩展尾部必须为零。支持视图的 RDONLY、NOSUID、NODEV、NOEXEC、四种 atime 策略及传播类型；递归修改先按稳定实例顺序取得重配置资格，检查全部选中视图的写入者及状态，再共同发布。后代忙或准备分配失败时保留全部原属性，不用逐个 bind-remount 形成部分成功。atime 是枚举，改变策略时须在 attr_clr 中完整清除 ATIME 字段。该接口不重配置共享后端的只读状态；IDMAP 和 NOSYMFOLLOW 当前返回 EOPNOTSUPP。
+`mount_setattr(442)` 接受原生32字节 mount_attr，较大结构的扩展尾部必须为零。支持视图的 RDONLY、NOSUID、NODEV、NOEXEC、NOSYMFOLLOW、四种 atime 策略及传播类型。递归修改先按稳定实例顺序取得重配置资格，检查全部选中视图的写入者及状态，再共同发布。后代忙或准备分配失败时保留全部原属性，不用逐个 bind-remount 形成部分成功。atime 是枚举，改变策略时须在 attr_clr 中完整清除 ATIME 字段。该接口不重配置共享后端的只读状态，IDMAP 当前返回 EOPNOTSUPP。
+
+`MS_NOSYMFOLLOW` 和 `MOUNT_ATTR_NOSYMFOLLOW` 在实际挂载视图上禁止跟随符号链接。路径解析准备展开链接时，读取链接所在视图的标志，受限时返回 `ELOOP`。`readlink` 和 `O_PATH | O_NOFOLLOW` 打开的对象是链接自身，因此仍可使用。绑定挂载和克隆视图继承原标志，重配置只修改所选视图。`statfs` 和 `fstatfs` 以 `ST_NOSYMFOLLOW` 报告，`/proc/<pid>/mounts` 与 `mountinfo` 显示 `nosymfollow`。
 
 `pivot_root(41)` 将当前根挂载移到 new_root 下的 put_old，并把 new_root 放到原根的位置。路径关系、挂载根和 shared 父连接按固定 Linux 检查；连接转移及所有仍精确指向旧根的 root/cwd 在同一状态保护内发布。FS 上下文按实际共享对象登记，独立 fork 上下文和 CLONE_FS 使用者均得到对应更新，其他 cwd 保留原路径身份。命名空间 top 的快照单独持有路径引用，旧快照不会因根替换而悬空。初始根的内核启动 owner 与新建立的命名空间连接各持一份引用；命名空间退出可退休整棵替换树，启动 owner 留到关机时完成后端释放。
 

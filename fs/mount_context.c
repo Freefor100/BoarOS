@@ -39,6 +39,17 @@ void kernel_mount_discard(struct kernel_vfs_path **owner)
     kernel_vfs_close_tree(kernel_vfs_path_mount(*owner));
     if(kernel_vfs_path_release(owner))__builtin_trap();
 }
+
+static void mount_creation_flags(struct kernel_vfs_mount *mount, uint64_t flags)
+{
+    mount->nosuid = !!(flags & 2U);
+    mount->nodev = !!(flags & 4U);
+    mount->noexec = !!(flags & 8U);
+    mount->nosymfollow = !!(flags & VFS_MS_NOSYMFOLLOW);
+    mount->silent = !!(flags & 32768U);
+    mount->atime_policy = kernel_vfs_atime_policy(flags, 0, 0);
+}
+
 int kernel_mount_create(const struct kernel_fs_context *fs,const struct kernel_mount_parameters *p,
     const struct kernel_credentials *creator,int exclusive,struct kernel_vfs_path **owner)
 {
@@ -66,11 +77,7 @@ int kernel_mount_create(const struct kernel_fs_context *fs,const struct kernel_m
         struct kernel_vfs_mount *mount = kernel_vfs_path_mount(*owner);
         mount->detached_origin = kernel_fs_context_namespace_id(fs);
         mount->read_only = !!(p->flags & 1U);
-        mount->nosuid = !!(p->flags & 2U);
-        mount->nodev = !!(p->flags & 4U);
-        mount->noexec = !!(p->flags & 8U);
-        mount->silent = !!(p->flags & 32768U);
-        mount->atime_policy = kernel_vfs_atime_policy(p->flags, 0, 0);
+        mount_creation_flags(mount, p->flags);
         return 0;
     }
     if(strcmp(p->type,"tmpfs") && strcmp(p->type,"devpts") && p->options[0])return -KERNEL_ENOTSUP;
@@ -80,9 +87,8 @@ int kernel_mount_create(const struct kernel_fs_context *fs,const struct kernel_m
         if(reused<0)return reused;
         if(!reused){
             struct kernel_vfs_mount *mount=kernel_vfs_path_mount(*owner);
-            mount->read_only=!!(p->flags&1U);mount->nosuid=!!(p->flags&2U);
-            mount->nodev=!!(p->flags&4U);mount->noexec=!!(p->flags&8U);
-            mount->silent=!!(p->flags&32768U);mount->atime_policy=kernel_vfs_atime_policy(p->flags,0,0);
+            mount->read_only = !!(p->flags & 1U);
+            mount_creation_flags(mount, p->flags);
             int error=kernel_vfs_change_propagation(*owner,UINT64_C(262144),0);
             if(error)kernel_mount_discard(owner);
             return error;
@@ -94,9 +100,8 @@ int kernel_mount_create(const struct kernel_fs_context *fs,const struct kernel_m
         if(reused<0)return reused;
         if(!reused){
             struct kernel_vfs_mount *mount=kernel_vfs_path_mount(*owner);
-            mount->read_only=!!(p->flags&1U);mount->nosuid=!!(p->flags&2U);
-            mount->nodev=!!(p->flags&4U);mount->noexec=!!(p->flags&8U);
-            mount->silent=!!(p->flags&32768U);mount->atime_policy=kernel_vfs_atime_policy(p->flags,0,0);
+            mount->read_only = !!(p->flags & 1U);
+            mount_creation_flags(mount, p->flags);
             int error=kernel_vfs_change_propagation(*owner,UINT64_C(262144),0);
             if(error)kernel_mount_discard(owner);
             return error;
@@ -116,9 +121,7 @@ int kernel_mount_create(const struct kernel_fs_context *fs,const struct kernel_m
     kernel_credentials_override(previous);
 
     if(error)return error;
-    mount->nosuid=!!(p->flags&2U);mount->nodev=!!(p->flags&4U);
-    mount->noexec=!!(p->flags&8U);mount->silent=!!(p->flags&32768U);
-    mount->atime_policy=kernel_vfs_atime_policy(p->flags,0,0);
+    mount_creation_flags(mount, p->flags);
     error=kernel_vfs_detach_created_mount(mount,fs->heap,kernel_fs_context_namespace_id(fs),owner);
     if(error) {
         int cleanup=kernel_vfs_unmount(mount);
@@ -249,6 +252,7 @@ int kernel_mount_context_mount(struct kernel_open_file_description *file,const s
     mount->detached_origin=kernel_fs_context_namespace_id(fs);
     mount->read_only=!!(attributes&1U);mount->nosuid=!!(attributes&2U);
     mount->nodev=!!(attributes&4U);mount->noexec=!!(attributes&8U);
+    mount->nosymfollow=!!(attributes&VFS_MOUNT_ATTR_NOSYMFOLLOW);
     mount->atime_policy=((attributes&0x70U)==0x20U?VFS_ATIME_STRICT:attributes&0x10U?VFS_ATIME_NONE:0)|(attributes&0x80U?VFS_ATIME_NODIR:0);
     ctx->phase=2;ctx->parameters.flags=ctx->parameters.mask=0;
     ctx->source_set=0;ctx->parameters.options[0]=ctx->parameters.source[0]=0;

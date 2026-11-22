@@ -44,6 +44,7 @@
 #define LINUX_SOCKADDR_UN_SIZE 110
 #define LINUX_SOL_SOCKET 1
 #define LINUX_SOL_PACKET 263
+#define LINUX_SO_OOBINLINE 10
 #define LINUX_SO_PEERCRED 17
 #define LINUX_SO_RCVTIMEO 20
 #define LINUX_SO_SNDTIMEO 21
@@ -268,6 +269,7 @@ static int socket_option(int level, int name, enum kernel_socket_option *option)
         case 7: *option = KERNEL_SOCKET_SNDBUF; return 0;
         case 8: *option = KERNEL_SOCKET_RCVBUF; return 0;
         case 9: *option = KERNEL_SOCKET_KEEPALIVE; return 0;
+        case LINUX_SO_OOBINLINE: *option = KERNEL_SOCKET_OOBINLINE; return 0;
         case 16: *option = KERNEL_SOCKET_PASSCRED; return 0;
         case 30: *option = KERNEL_SOCKET_ACCEPTCONN; return 0;
         case 32: *option = KERNEL_SOCKET_SNDBUFFORCE; return 0;
@@ -571,6 +573,12 @@ static int sockopt(struct kernel_socket *socket, struct kernel_files *files, str
     if(level==41 && ((name>=17 && name<=21) || name==29))
         return ipv6_multicast_sockopt(socket,mm,request,get);
     if (get) {
+        /* TCP delegates other levels to the IP family; a foreign level is
+         * rejected before that family imports optlen. */
+        if (level != LINUX_SOL_SOCKET && level != LINUX_IPPROTO_TCP &&
+            level != 0 && kernel_socket_is_tcp(socket) &&
+            (level != 41 || kernel_socket_family(socket) != LINUX_AF_INET6))
+            return -KERNEL_EOPNOTSUPP;
         if (kernel_copy_from_user(mm, &length, request->arguments[4], sizeof(length), &copied) !=
                 KERNEL_UACCESS_STATUS_OK || copied != sizeof(length)) return -KERNEL_EFAULT;
     }
@@ -958,7 +966,7 @@ static enum kernel_syscall_status socket_message_pinned(
     *result=-KERNEL_EFAULT;
     if (kernel_copy_from_user(mm,&header,user_header,sizeof(header),&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=sizeof(header)) goto out;
     if (writing && batch) flags |= (uint32_t)header.flags & KERNEL_SOCKET_MSG_EOR;
-    if ((flags&~allowed) && !seqpacket) { *result=-KERNEL_EOPNOTSUPP; goto out; }
+    if (writing && (flags&~allowed) && !seqpacket) { *result=-KERNEL_EOPNOTSUPP; goto out; }
     if (!header.name) header.name_length=0;
     if (header.name_length<0) { *result=-KERNEL_EINVAL; goto out; }
     if (header.name_length>LINUX_SOCKADDR_STORAGE_SIZE) header.name_length=LINUX_SOCKADDR_STORAGE_SIZE;
@@ -972,18 +980,29 @@ static enum kernel_syscall_status socket_message_pinned(
     status=kernel_uaccess_iov_import(&snapshot,files->heap,mm,header.iov,header.iov_count,result);
     if (status || *result) goto out;
     if (writing && header.control_length) {
-        if (!unix_socket) { *result=-KERNEL_EOPNOTSUPP; goto out; }
+        if (!unix_socket && !kernel_socket_is_tcp(socket)) { *result=-KERNEL_EOPNOTSUPP; goto out; }
         *result=kernel_socket_control_copy(call,mm,header.control,header.control_length);
         if (*result) goto out;
+        if (!unix_socket) {
+            *result=kernel_socket_control_parse_tcp(call,header.control_length);
+            if (*result) goto out;
+        }
     }
     if (writing) {
         *result=kernel_socket_prepare_send(socket);
         if (*result) goto out;
-        *result=kernel_socket_control_parse(call,header.control_length);
-        if (*result) goto out;
+        if (unix_socket) {
+            *result=kernel_socket_control_parse(call,header.control_length);
+            if (*result) goto out;
+        }
     }
     if (flags&~allowed) {
         if (!writing) {
+            if ((flags & (KERNEL_SOCKET_MSG_OOB | KERNEL_SOCKET_MSG_ERRQUEUE)) &&
+                kernel_socket_is_tcp(socket)) {
+                *result=kernel_socket_tcp_receive_control(socket,flags);
+                goto out;
+            }
             *result=kernel_socket_prepare_receive(socket);
             if (*result) goto out;
         }
@@ -1277,8 +1296,13 @@ enum kernel_syscall_status syscall_handle_socket_operation(
         if (kernel_socket_is_seqpacket(socket) || kernel_socket_is_tcp(socket)) allowed|=KERNEL_SOCKET_MSG_WAITALL;
         if (kernel_socket_is_netlink(socket))allowed|=KERNEL_SOCKET_MSG_WAITALL|KERNEL_SOCKET_MSG_NOSIGNAL;
         if (flags & ~allowed) {
-            result=kernel_socket_prepare_receive(socket);
-            if (!result) result=-KERNEL_EOPNOTSUPP;
+            if ((flags & (KERNEL_SOCKET_MSG_OOB | KERNEL_SOCKET_MSG_ERRQUEUE)) &&
+                kernel_socket_is_tcp(socket))
+                result=kernel_socket_tcp_receive_control(socket,flags);
+            else {
+                result=kernel_socket_prepare_receive(socket);
+                if (!result) result=-KERNEL_EOPNOTSUPP;
+            }
             break;
         }
         const struct kernel_uaccess_iovec iov = {request->arguments[1],range_size};

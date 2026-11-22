@@ -173,7 +173,7 @@ struct kernel_socket {
     struct kernel_socket_tcp_info retired_info;
     uint32_t retired_info_ms;
     uint8_t nodelay, cork;
-    uint8_t broadcast, ipv4_ttl, multicast_ttl;
+    uint8_t broadcast, ipv4_ttl, multicast_ttl, oobinline;
     uint8_t ipv4_multicast_loop, ipv4_multicast_all;
     struct socket_ipv4_member *ipv4_members;
     uint8_t ipv6_multicast_index, ipv6_multicast_hops, ipv6_multicast_loop, ipv6_multicast_all;
@@ -2800,7 +2800,8 @@ static err_t socket_tcp_accepted(void *context, struct tcp_pcb *pcb,
     { KERNEL_IRQ_LOCK_SCOPE(state,socket_endpoint_lock(listener));
       socket_filter_inherit_locked(child,listener);
       child->receive_timeout_ns=listener->receive_timeout_ns;
-      child->send_timeout_ns=listener->send_timeout_ns; }
+      child->send_timeout_ns=listener->send_timeout_ns;
+      child->oobinline=listener->oobinline; }
     child->listener = listener; child->pending_ready = 1;
     child->heap = listener->heap;
     child->peercred=(struct unix_credentials){.uid=UINT32_MAX,.gid=UINT32_MAX};
@@ -5050,6 +5051,14 @@ void kernel_socket_protocol_snapshot(uint64_t values[KERNEL_SOCKET_PROTOCOL_VALU
 int kernel_socket_is_tcp(const struct kernel_socket *socket)
 { return socket && socket->domain == KERNEL_SOCKET_DOMAIN_INET && socket->type == SOCKET_STREAM; }
 
+int kernel_socket_tcp_receive_control(struct kernel_socket *socket, uint32_t flags)
+{
+    /* The TCP endpoint has neither a queued asynchronous error nor urgent data. */
+    if (flags & KERNEL_SOCKET_MSG_ERRQUEUE) return -KERNEL_EAGAIN;
+    SOCKET_ENDPOINT(state,socket);
+    return socket->listening ? -KERNEL_ENOTCONN : -KERNEL_EINVAL;
+}
+
 /* 调用者持raw资格；此处交付状态错误，不能先碰payload改变errno优先级。 */
 static int tcp_write_state(struct kernel_socket *socket, uint32_t flags, int observe, struct kernel_task *task)
 {
@@ -5732,7 +5741,12 @@ int kernel_socket_set_option(struct kernel_socket *socket,
          * per-socket timer/worker, and no restart of the last-activity clock. */
         kernel_socket_protocol_leave(&protocol);return 0;
     }
-    if(option==KERNEL_SOCKET_PASSCRED) {SOCKET_ENDPOINT(state,socket);socket->passcred=value!=0;return 0;}
+    if (option == KERNEL_SOCKET_PASSCRED || option == KERNEL_SOCKET_OOBINLINE) {
+        SOCKET_ENDPOINT(state,socket);
+        if (option == KERNEL_SOCKET_PASSCRED) socket->passcred = value != 0;
+        else socket->oobinline = value != 0;
+        return 0;
+    }
     int force = option==KERNEL_SOCKET_SNDBUFFORCE;
     int send = force || option==KERNEL_SOCKET_SNDBUF;
     if (send || option==KERNEL_SOCKET_RCVBUF) {
@@ -6008,6 +6022,7 @@ int kernel_socket_get_option(struct kernel_socket *socket,
     case KERNEL_SOCKET_SNDBUF: *value = (int)socket->tx_limit; break;
     case KERNEL_SOCKET_RCVBUF: *value = (int)socket->rx_limit; break;
     case KERNEL_SOCKET_PASSCRED: *value = socket->passcred; break;
+    case KERNEL_SOCKET_OOBINLINE: *value = socket->oobinline; break;
     case KERNEL_SOCKET_ACCEPTCONN: *value = socket->listening; break;
     case KERNEL_SOCKET_ERROR: {
         *value = -socket->pending_error; socket->pending_error = 0;

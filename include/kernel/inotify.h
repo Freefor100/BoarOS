@@ -3,6 +3,9 @@
 #include <kernel/files.h>
 
 struct kernel_fs_context;
+struct kernel_open_file_description;
+int kernel_inotify_fdinfo(const struct kernel_open_file_description *, struct kernel_heap *,
+                         char **buffer, size_t *length);
 enum kernel_files_status kernel_files_inotify(struct kernel_files *,
     const struct kernel_fs_context *, struct kernel_mm *, unsigned syscall,
     int fd_or_flags, uint64_t path_or_watch, uint32_t mask, int64_t *);

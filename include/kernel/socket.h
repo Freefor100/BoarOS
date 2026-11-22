@@ -140,6 +140,7 @@ int kernel_socket_write_unix(struct kernel_open_file_description **pin_owner,
     uint64_t count, uint32_t flags, int *user_fault, struct kernel_socket_message *message);
 void kernel_socket_abort_write(struct kernel_socket_write_request *request);
 int kernel_socket_is_tcp(const struct kernel_socket *socket);
+int kernel_socket_tcp_receive_control(struct kernel_socket *, uint32_t flags);
 void kernel_socket_stream_begin(struct kernel_socket_write_request *request,
     struct kernel_open_file_description **pin_owner);
 int kernel_socket_stream_reserve(struct kernel_socket_write_request *request,
@@ -257,6 +258,8 @@ int kernel_socket_wait_ready(struct kernel_socket *socket, uint32_t events,
 #define KERNEL_SOCKET_MSG_EOR 0x80U
 #define KERNEL_SOCKET_MSG_MORE 0x8000U
 #define KERNEL_SOCKET_MSG_WAITALL 0x100U
+#define KERNEL_SOCKET_MSG_OOB 0x1U
+#define KERNEL_SOCKET_MSG_ERRQUEUE 0x2000U
 #define KERNEL_SOCKET_IO_MESSAGE 0x80000000U
 #define KERNEL_SOCKET_IO_MORE 0x40000000U
 int kernel_socket_shutdown(struct kernel_socket *socket, int how);
@@ -265,7 +268,7 @@ enum kernel_socket_option {
     KERNEL_SOCKET_REUSEADDR, KERNEL_SOCKET_KEEPALIVE,
     KERNEL_SOCKET_SNDBUF, KERNEL_SOCKET_RCVBUF,
     KERNEL_SOCKET_TYPE, KERNEL_SOCKET_ERROR, KERNEL_SOCKET_ACCEPTCONN,
-    KERNEL_SOCKET_PASSCRED,
+    KERNEL_SOCKET_PASSCRED, KERNEL_SOCKET_OOBINLINE,
     KERNEL_SOCKET_NODELAY, KERNEL_SOCKET_CORK, KERNEL_SOCKET_MAXSEG, KERNEL_SOCKET_V6ONLY,
     KERNEL_SOCKET_KEEPIDLE, KERNEL_SOCKET_KEEPINTVL, KERNEL_SOCKET_KEEPCNT,
     KERNEL_SOCKET_BROADCAST, KERNEL_SOCKET_IPV4_TTL, KERNEL_SOCKET_MULTICAST_TTL,
