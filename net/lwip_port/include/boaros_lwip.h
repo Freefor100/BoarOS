@@ -14,10 +14,15 @@ struct kernel_lock_guard;
 struct pbuf;
 struct tcp_pcb;
 struct udp_pcb;
+/* Socket sends offer a private pbuf. Loopback output either adopts it into
+ * its queue or leaves it for the same protocol owner to deliver after send. */
 enum {
     BOAROS_UDP_LOOPBACK_TRANSFER = 1,
     BOAROS_UDP_LOOPBACK_QUEUED,
+    BOAROS_UDP_LOOPBACK_TRANSFER_INLINE,
+    BOAROS_UDP_LOOPBACK_INLINE,
 };
+void boaros_lwip_udp_loopback_input(struct netif *, struct pbuf *);
 struct boaros_lwip_hooks {
     void (*netif_removed)(struct netif *);
     int (*udp_multicast_receive)(struct udp_pcb *,struct pbuf *,struct netif *,const void *,uint16_t,uint16_t);

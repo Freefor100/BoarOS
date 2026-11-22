@@ -1173,8 +1173,9 @@ netif_set_link_callback(struct netif *netif, netif_status_callback_fn link_callb
 /**
  * @ingroup netif
  * Send an IP packet to be received on the same netif (loopif-like).
- * The pbuf is copied and added to an internal queue which is fed to 
- * netif->input by netif_poll().
+ * Normally the pbuf is copied into a queue which netif_poll() feeds to
+ * IP input. BoarOS socket UDP may transfer a private pbuf to loopback;
+ * a synchronous sender can finish input itself after output returns.
  * In multithreaded mode, the call to netif_poll() is queued to be done on the
  * TCP/IP thread.
  * In callback mode, the user has the responsibility to call netif_poll() in 
@@ -1211,6 +1212,30 @@ loopback_clone(struct netif *netif, struct pbuf *p)
   return pbuf_clone(PBUF_LINK, PBUF_RAM, p);
 }
 
+static void
+loopback_emitted(struct netif *netif, const struct pbuf *p)
+{
+  LWIP_UNUSED_ARG(netif);
+  LWIP_UNUSED_ARG(p);
+  /* Packet sockets see the same completed output before IP reads it. */
+#if BOAROS_LWIP_LINUX_LOOPBACK
+  extern void kernel_socket_packet_loopback(struct netif *, const struct pbuf *)
+      __attribute__((weak));
+  if (kernel_socket_packet_loopback) kernel_socket_packet_loopback(netif, p);
+#endif
+
+  LINK_STATS_INC(link.xmit);
+#if MIB2_STATS
+#if LWIP_HAVE_LOOPIF
+  struct netif *stats_if = &loop_netif;
+#else
+  struct netif *stats_if = netif;
+#endif
+  MIB2_STATS_NETIF_ADD(stats_if, ifoutoctets, p->tot_len);
+  MIB2_STATS_NETIF_INC(stats_if, ifoutucastpkts);
+#endif
+}
+
 err_t
 netif_loop_output(struct netif *netif, struct pbuf *p)
 {
@@ -1239,10 +1264,20 @@ netif_loop_output(struct netif *netif, struct pbuf *p)
   /* Only a socket UDP send to lo may give up its private, complete pbuf.
    * The IP owner prevents netif_poll_budget from removing it during send. */
 #if BOAROS_LWIP_LINUX_LOOPBACK && LWIP_HAVE_LOOPIF && !LWIP_NETIF_LOOPBACK_MULTITHREADING
-  int adopt = netif == &loop_netif && p->boaros_udp_loopback == BOAROS_UDP_LOOPBACK_TRANSFER;
+  int inline_input = p->boaros_udp_loopback == BOAROS_UDP_LOOPBACK_TRANSFER_INLINE;
+  int adopt = netif == &loop_netif &&
+              (inline_input || p->boaros_udp_loopback == BOAROS_UDP_LOOPBACK_TRANSFER);
   LWIP_ASSERT("private socket UDP payload", !adopt ||
               (!p->next && p->ref == 1 && p->storage_refs == 1 &&
                pbuf_match_type(p, PBUF_RAM) && !(p->flags & PBUF_FLAG_IS_CUSTOM)));
+  /* The IP owner serializes this test with lo queue publication. Do not
+   * bypass older packets, and leave input to the caller after output ends. */
+  if (adopt && inline_input && netif->loop_first == NULL) {
+    p->flags = 0;
+    p->boaros_udp_loopback = BOAROS_UDP_LOOPBACK_INLINE;
+    loopback_emitted(netif, p);
+    return ERR_OK;
+  }
 #else
   int adopt = 0;
 #endif
@@ -1307,20 +1342,11 @@ netif_loop_output(struct netif *netif, struct pbuf *p)
   }
   SYS_ARCH_UNPROTECT(lev);
 
-  /* Packet sockets see the same completed output before the protocol reads it. */
-#if BOAROS_LWIP_LINUX_LOOPBACK
-  extern void kernel_socket_packet_loopback(struct netif *, const struct pbuf *)
-      __attribute__((weak));
-  if (kernel_socket_packet_loopback) kernel_socket_packet_loopback(netif, p);
-#endif
+  loopback_emitted(netif, p);
   /* 队列已完整发布；通知端只标记工作和唤醒，不重入协议处理。 */
 #ifdef LWIP_HOOK_NETIF_LOOPBACK_QUEUED
   LWIP_HOOK_NETIF_LOOPBACK_QUEUED(netif);
 #endif
-
-  LINK_STATS_INC(link.xmit);
-  MIB2_STATS_NETIF_ADD(stats_if, ifoutoctets, p->tot_len);
-  MIB2_STATS_NETIF_INC(stats_if, ifoutucastpkts);
 
 #if LWIP_NETIF_LOOPBACK_MULTITHREADING
   /* For multithreading environment, schedule a call to netif_poll */
@@ -1356,6 +1382,36 @@ netif_loop_output_ipv6(struct netif *netif, struct pbuf *p, const ip6_addr_t *ad
 #endif /* LWIP_IPV6 */
 #endif /* LWIP_HAVE_LOOPIF */
 
+static void
+loopback_input(struct netif *netif, struct pbuf *p)
+{
+  p->if_idx = netif_get_index(netif);
+  LINK_STATS_INC(link.recv);
+#if MIB2_STATS
+#if LWIP_HAVE_LOOPIF
+  struct netif *stats_if = &loop_netif;
+#else
+  struct netif *stats_if = netif;
+#endif
+  MIB2_STATS_NETIF_ADD(stats_if, ifinoctets, p->tot_len);
+  MIB2_STATS_NETIF_INC(stats_if, ifinucastpkts);
+#endif
+  /* loopback packets are always IP packets! */
+  if (ip_input(p, netif) != ERR_OK) {
+    pbuf_free(p);
+  }
+}
+
+#if BOAROS_LWIP_LINUX_LOOPBACK && LWIP_HAVE_LOOPIF && !LWIP_NETIF_LOOPBACK_MULTITHREADING
+void
+boaros_lwip_udp_loopback_input(struct netif *netif, struct pbuf *p)
+{
+  LWIP_ASSERT("inline UDP packet", netif == &loop_netif &&
+              p->boaros_udp_loopback == BOAROS_UDP_LOOPBACK_INLINE);
+  p->boaros_udp_loopback = 0;
+  loopback_input(netif, p);
+}
+#endif
 
 /**
  * Call netif_poll() in the main loop of your application. This is to prevent
@@ -1367,15 +1423,6 @@ unsigned
 netif_poll_budget(struct netif *netif, unsigned budget)
 {
   unsigned handled = 0;
-  /* If we have a loopif, SNMP counters are adjusted for it,
-   * if not they are adjusted for 'netif'. */
-#if MIB2_STATS
-#if LWIP_HAVE_LOOPIF
-  struct netif *stats_if = &loop_netif;
-#else /* LWIP_HAVE_LOOPIF */
-  struct netif *stats_if = netif;
-#endif /* LWIP_HAVE_LOOPIF */
-#endif /* MIB2_STATS */
   SYS_ARCH_DECL_PROTECT(lev);
 
   LWIP_ASSERT("netif_poll: invalid netif", netif != NULL);
@@ -1417,15 +1464,7 @@ netif_poll_budget(struct netif *netif, unsigned budget)
     SYS_ARCH_UNPROTECT(lev);
 
     handled++;
-    in->if_idx = netif_get_index(netif);
-
-    LINK_STATS_INC(link.recv);
-    MIB2_STATS_NETIF_ADD(stats_if, ifinoctets, in->tot_len);
-    MIB2_STATS_NETIF_INC(stats_if, ifinucastpkts);
-    /* loopback packets are always IP packets! */
-    if (ip_input(in, netif) != ERR_OK) {
-      pbuf_free(in);
-    }
+    loopback_input(netif, in);
     SYS_ARCH_PROTECT(lev);
   }
   SYS_ARCH_UNPROTECT(lev);
