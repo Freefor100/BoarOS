@@ -589,6 +589,7 @@ static struct kernel_io_context *protocol_current_owner(void);
 /* TCP packets enter this ring after IP has checked and removed its header.
  * Ownership of the pbuf (and any DMA loan) transfers with the ring entry. */
 #define TCP_RX_RING 64U
+#define TCP_RX_BATCH 4U
 #define TCP_ROUTE_BUCKETS 64U
 /* Two ordinary loopback connections can share one context. Spread new
  * work once there are already four active endpoints on its preferred CPU. */
@@ -2495,6 +2496,14 @@ void kernel_socket_packet_detach(struct netif *interface)
     }
 }
 
+static int udp_receive_capacity(void)
+{
+    /* The NIC callback includes protocol heap, pool buffers and RX loans.
+     * Without a NIC, reserve space in the protocol heap for control traffic. */
+    if (network_udp_capacity) return network_udp_capacity(network_context);
+    return STATS_GET(mem.used) <= MEM_SIZE - (65536U + 4096U);
+}
+
 static struct socket_packet *udp_packet_allocate(struct kernel_socket *socket)
 {
     struct socket_packet *packet;
@@ -2521,9 +2530,7 @@ static void udp_received(void *context, struct udp_pcb *pcb,
     struct kernel_socket *socket = context;
     (void)pcb;
     uint32_t charge = payload->tot_len ? payload->tot_len : 1U;
-    /* 接收队列不能占尽共享协议堆：给下一条最大 UDP 和 TCP 控制报文留空间。 */
-    if ((network_udp_capacity && !network_udp_capacity(network_context)) ||
-        STATS_GET(mem.used) > MEM_SIZE - (65536U + 4096U)) {
+    if (!udp_receive_capacity()) {
         UDP_STATS_INC(udp.memerr);
         kernel_socket_pbuf_free(payload); return;
     }
@@ -2574,8 +2581,7 @@ static int socket_udp_multicast_receive(struct udp_pcb *pcb,struct pbuf *p,struc
     if(kept<8)kept=8;
     if(kept>p->tot_len)kept=p->tot_len;
     uint32_t charge=kept>8?kept-8:1;
-    if((network_udp_capacity && !network_udp_capacity(network_context)) ||
-       STATS_GET(mem.used)>MEM_SIZE-(65536U+4096U))return 1;
+    if (!udp_receive_capacity()) return 1;
     struct socket_packet *packet = udp_packet_allocate(socket);
     if (!packet) return 1;
     packet->length=kept;packet->consumed=8;pbuf_ref(p);packet->payload=p;
@@ -5305,15 +5311,6 @@ static int stream_copy_owned(struct kernel_socket_write_request *request,
         }
     }
     if (total) result = (int)total;
-    if (result > 0) {
-        request->progressed = SOCKET_WRITE_ACCEPTED;
-        if (flags & KERNEL_SOCKET_IO_MORE) {
-            KERNEL_IRQ_LOCK_SCOPE(endpoint,socket_endpoint_lock(socket));
-            uint32_t others = socket->tx_reserved - completed_reservations - request->reserved;
-            if (tcp_protocol_budget(socket) > others) request->progressed |= SOCKET_WRITE_DEFERRED;
-            else *flush = 1;
-        } else *flush = 1;
-    }
     if (result == -KERNEL_EAGAIN) {
         if (request->progressed && socket->tcp) boaros_lwip_tcp_push(socket->tcp);
         *flush = 1;
@@ -5345,9 +5342,20 @@ static void stream_commit_owned(struct kernel_socket_write_request **requests, u
         tcp_publish_capacity_locked(socket);
         if(socket->tx_reserved<reserved)__builtin_trap();
         socket->tx_reserved-=reserved;
-        for(unsigned i=0;i<count;i++) requests[i]->reserved=0;
+        uint32_t available=tcp_admission_capacity_locked(socket);
+        /* An IO_MORE prefix runs alone. Use the credit visible to its next
+         * reservation at publication to decide whether it can defer output. */
+        for (unsigned i=0;i<count;i++) {
+            struct kernel_socket_write_request *request=requests[i];
+            request->reserved=0;
+            if (request->result<=0) continue;
+            request->progressed=SOCKET_WRITE_ACCEPTED;
+            if ((request->flags & KERNEL_SOCKET_IO_MORE) && available)
+                request->progressed|=SOCKET_WRITE_DEFERRED;
+            else flush=1;
+        }
         /* COPY 消耗与预约归还共同决定额度变化，只有净增加才唤醒额度等待者。 */
-        if(tcp_admission_capacity_locked(socket)>previous) {
+        if(available>previous) {
             socket_state_notify(endpoint.owner,&socket->wait);socket_async(socket,KERNEL_ASYNC_POLL_OUT);
         }
     }
@@ -5458,12 +5466,17 @@ static int datagram_send_owned(struct kernel_socket_write_request *request)
             if (IP_IS_V4(&remote)?socket->ipv4_multicast_loop:socket->ipv6_multicast_loop)
                 socket->udp->flags|=UDP_FLAGS_MULTICAST_LOOP;
             else socket->udp->flags&=(uint8_t)~UDP_FLAGS_MULTICAST_LOOP;
+            if (route==netif_get_loopif() && !payload->next && !ip_addr_ismulticast(&remote))
+                payload->boaros_udp_loopback=BOAROS_UDP_LOOPBACK_TRANSFER;
         }
         if (IP_IS_V4(&remote)) payload->flags|=PBUF_FLAG_IP4_LOCAL_DF;
         failure=lwip_error(socket->raw?raw_sendto_if_src(socket->raw,payload,&remote,route,source):
             udp_sendto_if_src(socket->udp,payload,&remote,port,route,source));
     }
-    kernel_socket_pbuf_free(payload);
+    /* The queue may take the sole reference after IP/UDP finish the headers.
+     * No loopback input can reclaim it while this protocol owner is active. */
+    if (payload->boaros_udp_loopback!=BOAROS_UDP_LOOPBACK_QUEUED)
+        kernel_socket_pbuf_free(payload);
     request->protocol_payload=NULL;
     return failure?failure:(int)request->payload_size;
 }
@@ -6709,14 +6722,17 @@ static unsigned service_ready_socket(unsigned budget,struct socket_work_queue *q
     return 1;
 }
 #if BOAROS_USER_SMP
-static int tcp_owner_take_input(struct socket_tcp_owner *owner,struct socket_tcp_input *input)
+static unsigned tcp_owner_take_input(struct socket_tcp_owner *owner,
+                                     struct socket_tcp_input *input,unsigned limit)
 {
     KERNEL_RAW_SCOPE(ingress,&owner->ingress);
-    if (!owner->count) return 0;
-    *input=owner->ring[owner->head];
-    owner->head=(owner->head+1)%TCP_RX_RING;
-    owner->count--;
-    return 1;
+    unsigned count=owner->count<limit?owner->count:limit;
+    if (!count) return 0;
+    /* Copy the claimed entries before returning their slots to producers. */
+    for (unsigned i=0;i<count;i++) input[i]=owner->ring[(owner->head+i)%TCP_RX_RING];
+    owner->head=(owner->head+count)%TCP_RX_RING;
+    owner->count-=count;
+    return count;
 }
 
 static uint64_t tcp_owner_deadline(void)
@@ -6755,13 +6771,19 @@ static void tcp_owner_worker(void *arg)
         stopping=tcp_owner_stopping(owner);
         struct kernel_socket *ack_socket = NULL;
         owner->ack_waiter = &ack_socket;
-        struct socket_tcp_input input;
-        for (unsigned i=0;i<16 && tcp_owner_take_input(owner,&input);i++) {
+        struct socket_tcp_input input[TCP_RX_BATCH];
+        for (unsigned remaining=16;remaining;) {
+            unsigned limit=remaining<TCP_RX_BATCH?remaining:TCP_RX_BATCH;
+            unsigned count=tcp_owner_take_input(owner,input,limit);
+            if (!count) break;
+            remaining-=count;
+            for (unsigned i=0;i<count;i++) {
 #if BOAROS_COST_DIAGNOSTICS
-            kernel_cost_tcp_input_dequeue(input.queued_ticks,locking,locked);
+                kernel_cost_tcp_input_dequeue(input[i].queued_ticks,locking,locked);
 #endif
-            if (!stopping) tcp_owner_receive(owner,&input);
-            else pbuf_free(input.packet);
+                if (!stopping) tcp_owner_receive(owner,&input[i]);
+                else pbuf_free(input[i].packet);
+            }
         }
         owner->ack_waiter = NULL;
         struct kernel_wait_cursor ack_wake = {0};

@@ -218,6 +218,100 @@ udp_input_local_match(struct udp_pcb *pcb, struct netif *inp, u8_t broadcast)
   return 0;
 }
 
+static int
+udp_input_checksum_valid(struct pbuf *p, struct netif *inp)
+{
+  LWIP_UNUSED_ARG(p);
+  LWIP_UNUSED_ARG(inp);
+  LWIP_DEBUGF(UDP_DEBUG | LWIP_DBG_TRACE, ("udp_input: calculating checksum\n"));
+#if CHECKSUM_CHECK_UDP
+  IF__NETIF_CHECKSUM_ENABLED(inp, NETIF_CHECKSUM_CHECK_UDP) {
+    const struct udp_hdr *udphdr = (const struct udp_hdr *)p->payload;
+#if LWIP_UDPLITE
+    if (ip_current_header_proto() == IP_PROTO_UDPLITE) {
+      u16_t chklen = lwip_ntohs(udphdr->len);
+      if (chklen < UDP_HLEN) {
+        if (chklen != 0) {
+          /* Only zero (full datagram) may specify less than the header. */
+          return 0;
+        }
+        chklen = p->tot_len;
+      }
+      return ip_chksum_pseudo_partial(p, IP_PROTO_UDPLITE, p->tot_len, chklen,
+                                     ip_current_src_addr(), ip_current_dest_addr()) == 0;
+    }
+#endif /* LWIP_UDPLITE */
+    /* RFC 8200: ordinary IPv6 UDP cannot omit its checksum. */
+    if (udphdr->chksum == 0) {
+      return !ip_current_is_v6();
+    }
+    return ip_chksum_pseudo(p, IP_PROTO_UDP, p->tot_len,
+                            ip_current_src_addr(), ip_current_dest_addr()) == 0;
+  }
+#endif /* CHECKSUM_CHECK_UDP */
+  return 1;
+}
+
+static int
+udp_input_local_destination(struct netif *inp, int ipv6)
+{
+  LWIP_UNUSED_ARG(ipv6);
+#if LWIP_IPV6
+  if (ipv6) {
+    return netif_get_ip6_addr_match(inp, ip6_current_dest_addr()) >= 0;
+  }
+#endif /* LWIP_IPV6 */
+#if LWIP_IPV4
+  return ip4_addr_eq(netif_ip4_addr(inp), ip4_current_dest_addr());
+#else
+  return 0;
+#endif /* LWIP_IPV4 */
+}
+
+static int
+udp_input_multicast(struct pbuf *p, struct netif *inp, struct udp_pcb *target,
+                    u16_t src, u16_t dest, u8_t broadcast, int ipv6)
+{
+  /* IPv6 validates even with no recipient. IPv4 validates on the first
+   * eligible recipient unless the destination is the interface address. */
+  int verified = ipv6 || udp_input_local_destination(inp, ipv6);
+  if (verified && !udp_input_checksum_valid(p, inp)) {
+    return 0;
+  }
+
+  u16_t header_length = ip_current_header_tot_len();
+  const void *network = (const unsigned char *)ip_next_header_ptr() - header_length;
+  for (; target; target = target->next) {
+    if (target->local_port != dest || !udp_input_local_match(target, inp, broadcast)) {
+      continue;
+    }
+    if ((target->flags & UDP_FLAGS_CONNECTED) && (target->remote_port != src ||
+        (!ip_addr_isany_val(target->remote_ip) && !ip_addr_eq(&target->remote_ip, ip_current_src_addr())))) {
+      continue;
+    }
+    if (!verified) {
+      if (!udp_input_checksum_valid(p, inp)) {
+        return 0;
+      }
+      verified = 1;
+    }
+    /* Socket targets share immutable storage with independent BPF limits.
+     * Raw lwIP callbacks retain their private mutable payload. */
+    if (!boaros_lwip_udp_multicast_receive(target, p, inp, network, header_length, src) && target->recv) {
+      struct pbuf *copy = pbuf_clone(PBUF_RAW, PBUF_POOL, p);
+      if (copy) {
+        if (boaros_lwip_udp_ingress_filter(target, copy, inp, ipv6, network, header_length, UDP_HLEN) &&
+            !pbuf_remove_header(copy, UDP_HLEN)) {
+          target->recv(target->recv_arg, target, copy, ip_current_src_addr(), src);
+        } else {
+          pbuf_free(copy);
+        }
+      }
+    }
+  }
+  return 1;
+}
+
 /**
  * Process an incoming UDP datagram.
  *
@@ -238,7 +332,6 @@ udp_input(struct pbuf *p, struct netif *inp)
   struct udp_pcb *uncon_pcb;
   u16_t src, dest;
   u8_t broadcast;
-  u8_t for_us = 0;
 
   LWIP_UNUSED_ARG(inp);
 
@@ -283,13 +376,23 @@ udp_input(struct pbuf *p, struct netif *inp)
   ip_addr_debug_print_val(UDP_DEBUG, *ip_current_src_addr());
   LWIP_DEBUGF(UDP_DEBUG, (", %"U16_F")\n", lwip_ntohs(udphdr->src)));
 
-  pcb = NULL;
+  int ipv6 = ip_current_is_v6();
+  struct udp_pcb **bucket = udp_port_bucket(dest);
+  if (ip_addr_ismulticast(ip_current_dest_addr())) {
+    /* Fan-out walks the entire bucket; it does not need a unicast winner. */
+    if (!udp_input_multicast(p, inp, *bucket, src, dest, broadcast, ipv6)) {
+      goto chkerr;
+    }
+    pbuf_free(p);
+    goto end;
+  }
+
   uncon_pcb = NULL;
   /* Iterate through the UDP pcb list for a matching pcb.
    * 'Perfect match' pcbs (connected to the remote port & ip address) are
    * preferred. If no perfect match is found, the first unconnected pcb that
    * matches the local port and ip address gets the datagram. */
-  for (pcb = *udp_port_bucket(dest); pcb != NULL; pcb = pcb->next) {
+  for (pcb = *bucket; pcb != NULL; pcb = pcb->next) {
     /* print the PCB local and remote address */
     LWIP_DEBUGF(UDP_DEBUG, ("pcb ("));
     ip_addr_debug_print_val(UDP_DEBUG, pcb->local_ip);
@@ -329,7 +432,7 @@ udp_input(struct pbuf *p, struct netif *inp)
           (ip_addr_isany_val(pcb->remote_ip) ||
            ip_addr_eq(&pcb->remote_ip, ip_current_src_addr()))) {
         /* the first fully matching PCB */
-        if (pcb->previous != udp_port_bucket(dest)) {
+        if (pcb->previous != bucket) {
           udp_port_unlink(pcb);
           udp_port_insert(pcb);
         } else {
@@ -346,85 +449,11 @@ udp_input(struct pbuf *p, struct netif *inp)
   }
 
   /* Check checksum if this is a match or if it was directed at us. */
-  if (pcb != NULL) {
-    for_us = 1;
-  } else {
-#if LWIP_IPV6
-    if (ip_current_is_v6()) {
-      for_us = ip6_addr_ismulticast(ip6_current_dest_addr()) || netif_get_ip6_addr_match(inp, ip6_current_dest_addr()) >= 0;
+  if (pcb != NULL || udp_input_local_destination(inp, ipv6)) {
+    if (!udp_input_checksum_valid(p, inp)) {
+      goto chkerr;
     }
-#endif /* LWIP_IPV6 */
-#if LWIP_IPV4
-    if (!ip_current_is_v6()) {
-      for_us = ip4_addr_eq(netif_ip4_addr(inp), ip4_current_dest_addr());
-    }
-#endif /* LWIP_IPV4 */
-  }
-
-  if (for_us) {
-    LWIP_DEBUGF(UDP_DEBUG | LWIP_DBG_TRACE, ("udp_input: calculating checksum\n"));
-#if CHECKSUM_CHECK_UDP
-    IF__NETIF_CHECKSUM_ENABLED(inp, NETIF_CHECKSUM_CHECK_UDP) {
-#if LWIP_UDPLITE
-      if (ip_current_header_proto() == IP_PROTO_UDPLITE) {
-        /* Do the UDP Lite checksum */
-        u16_t chklen = lwip_ntohs(udphdr->len);
-        if (chklen < sizeof(struct udp_hdr)) {
-          if (chklen == 0) {
-            /* For UDP-Lite, checksum length of 0 means checksum
-               over the complete packet (See RFC 3828 chap. 3.1) */
-            chklen = p->tot_len;
-          } else {
-            /* At least the UDP-Lite header must be covered by the
-               checksum! (Again, see RFC 3828 chap. 3.1) */
-            goto chkerr;
-          }
-        }
-        if (ip_chksum_pseudo_partial(p, IP_PROTO_UDPLITE,
-                                     p->tot_len, chklen,
-                                     ip_current_src_addr(), ip_current_dest_addr()) != 0) {
-          goto chkerr;
-        }
-      } else
-#endif /* LWIP_UDPLITE */
-      {
-        /* RFC 8200: ordinary IPv6 UDP cannot omit its checksum. */
-        if (ip_current_is_v6() && udphdr->chksum == 0) {
-          goto chkerr;
-        }
-        if (udphdr->chksum != 0) {
-          if (ip_chksum_pseudo(p, IP_PROTO_UDP, p->tot_len,
-                               ip_current_src_addr(),
-                               ip_current_dest_addr()) != 0) {
-            goto chkerr;
-          }
-        }
-      }
-    }
-#endif /* CHECKSUM_CHECK_UDP */
-    if(ip_addr_ismulticast(ip_current_dest_addr())) {
-      /* All local and connected-peer predicates apply to each recipient.
-       * Socket targets share immutable storage with independent BPF limits;
-       * raw lwIP callbacks retain their legacy private mutable payload. */
-      const void *network=(const unsigned char *)ip_next_header_ptr()-ip_current_header_tot_len();
-      for(struct udp_pcb *target=*udp_port_bucket(dest);target;target=target->next) {
-        if(target->local_port!=dest || !udp_input_local_match(target,inp,broadcast))continue;
-        if((target->flags&UDP_FLAGS_CONNECTED) && (target->remote_port!=src ||
-           (!ip_addr_isany_val(target->remote_ip) && !ip_addr_eq(&target->remote_ip,ip_current_src_addr()))))continue;
-        if(boaros_lwip_udp_multicast_receive(target,p,inp,network,ip_current_header_tot_len(),src))continue;
-        if(target->recv) {
-          struct pbuf *copy=pbuf_clone(PBUF_RAW,PBUF_POOL,p);
-          if(copy) {
-            if(boaros_lwip_udp_ingress_filter(target,copy,inp,ip_current_is_v6(),
-                network,ip_current_header_tot_len(),UDP_HLEN) &&
-               !pbuf_remove_header(copy,UDP_HLEN))target->recv(target->recv_arg,target,copy,ip_current_src_addr(),src);
-            else pbuf_free(copy);
-          }
-        }
-      }
-      pbuf_free(p);goto end;
-    }
-    if (pcb && !boaros_lwip_udp_ingress_filter(pcb,p,inp,ip_current_is_v6(),
+    if (pcb && !boaros_lwip_udp_ingress_filter(pcb,p,inp,ipv6,
         ((const unsigned char *)ip_next_header_ptr()-ip_current_header_tot_len()),ip_current_header_tot_len(),UDP_HLEN)) {
       pbuf_free(p);
       goto end;
@@ -441,12 +470,11 @@ udp_input(struct pbuf *p, struct netif *inp)
     if (pcb != NULL) {
       MIB2_STATS_INC(mib2.udpindatagrams);
 #if SO_REUSE && SO_REUSE_RXTOALL
-      if (ip_get_option(pcb, SOF_REUSEADDR) &&
-          (broadcast || ip_addr_ismulticast(ip_current_dest_addr()))) {
-        /* pass broadcast- or multicast packets to all multicast pcbs
+      if (ip_get_option(pcb, SOF_REUSEADDR) && broadcast) {
+        /* pass broadcast packets to all matching pcbs
            if SOF_REUSEADDR is set on the first match */
         struct udp_pcb *mpcb;
-        for (mpcb = *udp_port_bucket(dest); mpcb != NULL; mpcb = mpcb->next) {
+        for (mpcb = *bucket; mpcb != NULL; mpcb = mpcb->next) {
           if (mpcb != pcb) {
             /* compare PCB local addr+port to UDP destination addr+port */
             if ((mpcb->local_port == dest) &&
@@ -479,10 +507,10 @@ udp_input(struct pbuf *p, struct netif *inp)
 #if LWIP_ICMP || LWIP_ICMP6
       /* No match was found, send ICMP destination port unreachable unless
          destination address was broadcast/multicast. */
-      if (!broadcast && !ip_addr_ismulticast(ip_current_dest_addr())) {
+      if (!broadcast) {
         /* move payload pointer back to ip header */
         pbuf_header_force(p, (s16_t)(ip_current_header_tot_len() + UDP_HLEN));
-        icmp_port_unreach(ip_current_is_v6(), p);
+        icmp_port_unreach(ipv6, p);
       }
 #endif /* LWIP_ICMP || LWIP_ICMP6 */
       UDP_STATS_INC(udp.proterr);
@@ -496,7 +524,6 @@ udp_input(struct pbuf *p, struct netif *inp)
 end:
   PERF_STOP("udp_input");
   return;
-#if CHECKSUM_CHECK_UDP
 chkerr:
   LWIP_DEBUGF(UDP_DEBUG | LWIP_DBG_LEVEL_SERIOUS,
               ("udp_input: UDP (or UDP Lite) datagram discarded due to failing checksum\n"));
@@ -505,7 +532,6 @@ chkerr:
   MIB2_STATS_INC(mib2.udpinerrors);
   pbuf_free(p);
   PERF_STOP("udp_input");
-#endif /* CHECKSUM_CHECK_UDP */
 }
 
 /**

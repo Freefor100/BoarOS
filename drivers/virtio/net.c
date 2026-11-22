@@ -483,30 +483,42 @@ static int service(struct virtio_net_device *d, int poll)
 int virtio_net_poll_service(struct virtio_net_device *d) { return service(d, 1); }
 int virtio_net_service(struct virtio_net_device *d) { return service(d, 0); }
 
-int virtio_net_receive(struct virtio_net_device *d, struct virtio_net_frame *frame)
+unsigned virtio_net_receive_batch(struct virtio_net_device *d,
+    struct virtio_net_frame *frames, unsigned capacity)
 {
     KERNEL_IRQ_LOCK_SCOPE(guard, &d->state);
-    if (d->stopping || d->failed) return 0;
+    if (!capacity || d->stopping || d->failed) return 0;
     /* A writer helping with receive need not wait for the worker to re-arm
      * interrupts if the device has already published another frame. */
     if (!d->ready_count && d->polling && d->split[0].used->index != d->split[0].last_used)
         harvest(d);
-    if (!d->ready_count || d->failed) return 0;
-    unsigned b = d->rx_ready[d->ready_head++ % 64]; d->ready_count--;
-    if (d->rx_state[b] != RX_READY) __builtin_trap();
-    d->rx_state[b] = RX_CPU;
-    *frame = (struct virtio_net_frame){
-        .data = (char *)rx_data(d, b) + header(d), .size = d->rx_length[b],
-        .buffer = b, .more_ready = d->ready_count != 0,
-    };
-    return 1;
+    if (d->failed) return 0;
+    unsigned count = d->ready_count < capacity ? d->ready_count : capacity;
+    for (unsigned i = 0; i < count; i++) {
+        unsigned b = d->rx_ready[d->ready_head++ % VIRTIO_NET_BUFFERS];
+        if (d->rx_state[b] != RX_READY) __builtin_trap();
+        d->rx_state[b] = RX_CPU;
+        frames[i] = (struct virtio_net_frame){
+            .data = (char *)rx_data(d, b) + header(d), .size = d->rx_length[b],
+            .buffer = b, .more_ready = i + 1 < d->ready_count,
+        };
+    }
+    d->ready_count -= (uint16_t)count;
+    return count;
 }
+int virtio_net_receive(struct virtio_net_device *d, struct virtio_net_frame *frame)
+{ return (int)virtio_net_receive_batch(d, frame, 1); }
+
+unsigned virtio_net_loan_count(const struct virtio_net_device *d)
+{ return __atomic_load_n(&d->loaned, __ATOMIC_RELAXED); }
+
 int virtio_net_lend(struct virtio_net_device *d, unsigned b)
 {
     KERNEL_IRQ_LOCK_SCOPE(guard, &d->state);
     if (b >= 64 || d->rx_state[b] != RX_CPU) __builtin_trap();
     if (d->loaned == 32) return -KERNEL_EAGAIN;
-    d->rx_state[b] = RX_LOAN; d->loaned++;
+    d->rx_state[b] = RX_LOAN;
+    __atomic_store_n(&d->loaned, d->loaned + 1, __ATOMIC_RELAXED);
     d->statistics.loan_packets++; d->statistics.loan_bytes += d->rx_length[b];
     if (d->loaned > d->statistics.loan_peak) d->statistics.loan_peak = d->loaned;
     return 0;
@@ -517,7 +529,10 @@ void virtio_net_release(struct virtio_net_device *d, unsigned b)
     {
         KERNEL_IRQ_LOCK_SCOPE(guard, &d->state);
         if (b >= 64 || (d->rx_state[b] != RX_CPU && d->rx_state[b] != RX_LOAN)) __builtin_trap();
-        if (d->rx_state[b] == RX_LOAN) { if (!d->loaned) __builtin_trap(); d->loaned--; }
+        if (d->rx_state[b] == RX_LOAN) {
+            if (!d->loaned) __builtin_trap();
+            __atomic_store_n(&d->loaned, d->loaned - 1, __ATOMIC_RELAXED);
+        }
         d->rx_state[b] = RX_FREE;
         if (d->rx_count == 64) __builtin_trap();
         notify = !d->rx_count;

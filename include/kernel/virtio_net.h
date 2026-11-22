@@ -82,6 +82,10 @@ int virtio_net_poll_service(struct virtio_net_device *device);
 int virtio_net_service(struct virtio_net_device *device);
 uint64_t virtio_net_watchdog_deadline(struct virtio_net_device *device);
 int virtio_net_receive(struct virtio_net_device *device, struct virtio_net_frame *frame);
+/* Each returned frame owns a separate CPU lease. Process in FIFO order. */
+unsigned virtio_net_receive_batch(struct virtio_net_device *device,
+    struct virtio_net_frame *frames, unsigned capacity);
+unsigned virtio_net_loan_count(const struct virtio_net_device *device);
 int virtio_net_lend(struct virtio_net_device *device, unsigned buffer);
 void virtio_net_release(struct virtio_net_device *device, unsigned buffer);
 int virtio_net_send(struct virtio_net_device *device, const void *data, uint32_t size);
