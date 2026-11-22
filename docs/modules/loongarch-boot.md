@@ -6,6 +6,10 @@
 `platform/loongarch_virt.c`。普通 `kernel-la` 从现代 PCI block 启动可配置根盘 PID 1；无根盘时报告启动错误。它不链接契约测试、内嵌用户 ELF 或故障包装函数。独立 `build/loongarch/kernel-contract-la` 保留无盘契约入口；平台存储生命周期在 `platform/loongarch_root.c`。
 默认 `all` 和 RV 测试入口保持原路径。
 
+链接脚本将异常入口、系统调用分派、执行时间记账和线程组编号查询集中在启动代码之后。
+文件系统和驱动代码增长时，这组入口保持原有位置。分析虚拟机上的入口耗时时，可以用相同
+的目标文件重新链接，区分指令地址变化与执行路径变化。
+
 ## 多核执行
 
 `make LA_SMP=1 kernel-la`使用独立的`build/loongarch-smp2/`对象和内核，默认容量为两核。
