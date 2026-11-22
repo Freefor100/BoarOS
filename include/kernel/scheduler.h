@@ -381,6 +381,7 @@ int kernel_scheduler_reap_pending(void);
  * through normal exit cleanup, leaving kernel I/O workers running.
  * Returns nonzero until their task/owner records have all been reaped. */
 int kernel_scheduler_stop_users(void);
+unsigned kernel_stack_cache_reclaim(struct physical_page_allocator *);
 
 void kernel_thread_exit(void) __attribute__((noreturn));
 

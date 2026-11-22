@@ -585,7 +585,7 @@ enum kernel_scheduler_status scheduler_switch_claimed(
 
 void clear_page(void *pointer)
 {
-    memset(pointer, 0, BOAROS_PAGE_SIZE);
+    arch_zero_owned_memory(pointer, BOAROS_PAGE_SIZE);
 }
 
 enum kernel_scheduler_status release_after_create_failure(
@@ -612,12 +612,32 @@ _Static_assert(KERNEL_STACK_ALIAS_PAGES > 1 &&
                    ARCH_KERNEL_STACK_SLOT_SIZE == 3 * BOAROS_PAGE_SIZE &&
                    (ARCH_KERNEL_STACK_WINDOW_BASE / BOAROS_PAGE_SIZE) % KERNEL_STACK_ALIAS_PAGES == 0,
                "stack aliases require an aligned three-page slot geometry");
-/* CPU0 owns the bitmap; reserve and release cannot schedule. */
 static uint64_t kernel_stack_slot_bitmap[KERNEL_STACK_SLOT_WORDS];
+static struct kernel_raw_lock kernel_stack_slot_lock = {
+    .rank = KERNEL_RAW_RANK_MM, .initialized = KERNEL_RAW_INITIALIZED,
+};
+
+/* A parked stack owns both its mapped slot and its physical allocation.
+ * Keep the handoff record in the dead stack, outside every task descriptor. */
+struct cached_kernel_stack {
+    uint64_t physical;
+    uintptr_t dirty_start;
+};
+static struct cached_kernel_stack *kernel_stack_cache[BOAROS_MAX_CPUS];
+
+static inline unsigned stack_cache_cpu(const struct kernel_cpu *cpu)
+{
+#if BOAROS_MAX_CPUS > 1
+    return cpu->logical_id;
+#else
+    (void)cpu;
+    return 0;
+#endif
+}
 
 static int kernel_stack_slot_acquire(uint64_t stack_address, uint64_t *window_address)
 {
-    KERNEL_IRQ_SCOPE(irq);
+    KERNEL_RAW_SCOPE(guard, &kernel_stack_slot_lock);
     /* 线性槽号曾让热栈与ext4对象反复争用QEMU soft-TLB同一槽；
      * 按物理栈页号分散别名。3的模逆元为(N+1)/3，无同色空槽仍用全容量。 */
     uint32_t selected = (uint32_t)(((stack_address / BOAROS_PAGE_SIZE - 1) *
@@ -645,7 +665,7 @@ found:
 
 static void kernel_stack_slot_release(uint64_t window_address)
 {
-    KERNEL_IRQ_SCOPE(irq);
+    KERNEL_RAW_SCOPE(guard, &kernel_stack_slot_lock);
     uint32_t index = (uint32_t)((window_address -
                                  ARCH_KERNEL_STACK_WINDOW_BASE) /
                                 ARCH_KERNEL_STACK_SLOT_SIZE);
@@ -658,6 +678,40 @@ static void kernel_stack_slots_reset(void)
 {
     for (uint32_t word = 0U; word < KERNEL_STACK_SLOT_WORDS; word++)
         kernel_stack_slot_bitmap[word] = 0U;
+}
+
+static struct cached_kernel_stack *take_cached_stack(unsigned cpu)
+{
+    if (!__atomic_load_n(&kernel_stack_cache[cpu], __ATOMIC_RELAXED)) return NULL;
+    return __atomic_exchange_n(&kernel_stack_cache[cpu], NULL, __ATOMIC_ACQUIRE);
+}
+
+static void release_mapped_stack(uintptr_t top, uint64_t physical)
+{
+    uint64_t base = top - KERNEL_STACK_BYTES;
+#if !defined(BOAROS_ARCH_LOONGARCH)
+    if (arch_mmu_kernel_window_unmap_pages(scheduler.allocator, base,
+            KERNEL_STACK_PAGES) != ARCH_MMU_STATUS_OK) __builtin_trap();
+#else
+    if (arch_mmu_kernel_window_unmap(scheduler.allocator, base) != ARCH_MMU_STATUS_OK ||
+        arch_mmu_kernel_window_unmap(scheduler.allocator, base + BOAROS_PAGE_SIZE) !=
+            ARCH_MMU_STATUS_OK) __builtin_trap();
+#endif
+    kernel_stack_slot_release(base - BOAROS_PAGE_SIZE);
+    (void)physical_page_release_order(scheduler.allocator, physical, KERNEL_STACK_ORDER);
+}
+
+unsigned kernel_stack_cache_reclaim(struct physical_page_allocator *allocator)
+{
+    if (allocator != scheduler.allocator) return 0;
+    unsigned released = 0;
+    for (unsigned cpu = 0; cpu < BOAROS_MAX_CPUS; cpu++) {
+        struct cached_kernel_stack *stack = take_cached_stack(cpu);
+        if (!stack) continue;
+        release_mapped_stack((uintptr_t)(stack + 1), stack->physical);
+        released += KERNEL_STACK_PAGES;
+    }
+    return released;
 }
 
 /* Allocate the metadata and execution stack before publishing any owner. */
@@ -688,6 +742,20 @@ enum kernel_scheduler_status allocate_task_pages(struct kernel_task **task)
     kernel_wait_node_init(&thread->default_wait_node, thread);
     thread->physical_address = metadata_address;
     thread->stack_physical_address = KERNEL_THREAD_NO_PAGE;
+    struct cached_kernel_stack *cached = take_cached_stack(stack_cache_cpu(thread->cpu));
+    if (cached) {
+        uintptr_t top = (uintptr_t)(cached + 1);
+        uintptr_t dirty = cached->dirty_start;
+        thread->stack_physical_address = cached->physical;
+        thread->stack_low = top - KERNEL_STACK_BYTES + KERNEL_STACK_GUARD_BYTES;
+        thread->stack_high = top;
+        thread->arch.kernel_sp = top;
+        if (dirty > (uintptr_t)cached)
+            memset(cached, KERNEL_STACK_FILL, dirty - (uintptr_t)cached);
+        arch_zero_owned_memory((void *)dirty, top - dirty);
+        *task = thread;
+        return KERNEL_SCHEDULER_STATUS_OK;
+    }
     status = physical_page_allocate_order(scheduler.allocator,
                                           KERNEL_STACK_ORDER, &stack_address);
     if (status != PHYSICAL_PAGE_STATUS_OK)
@@ -715,7 +783,7 @@ enum kernel_scheduler_status allocate_task_pages(struct kernel_task **task)
 /* The task is private until its mapped stack and saved context both exist. */
 enum kernel_scheduler_status map_task_stack(struct kernel_task *thread)
 {
-    kernel_assert_service_context();
+    if (thread->arch.kernel_sp) return KERNEL_SCHEDULER_STATUS_OK;
     uint64_t stack_address = thread->stack_physical_address;
     if (arch_mmu_kernel_window_active()) {
         uint64_t window;
@@ -772,6 +840,13 @@ enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task)
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
+static void clear_task_stack(struct kernel_task *thread)
+{
+    thread->stack_physical_address = KERNEL_THREAD_NO_PAGE;
+    thread->stack_low = thread->stack_high = 0;
+    thread->arch.kernel_sp = thread->context.sp = 0;
+}
+
 /* This runs only on another trusted stack, including construction rollback.
  * EXITED can be visited repeatedly while a real I/O owner is still retained,
  * and a GROUP_DEAD leader can later re-enter the exited queue. */
@@ -811,13 +886,15 @@ enum kernel_scheduler_status release_task_stack(struct kernel_task *thread)
             KERNEL_STACK_CANARY)
         return KERNEL_SCHEDULER_STATUS_STACK_CORRUPT;
     cursor = (const unsigned char *)thread->stack_low;
-    /* Scan eight words at a time in the unused prefix, then locate the first
-     * changed byte without reading beyond the stack. */
+    /* Only a change below the recorded minimum can lower it. The rest of the
+     * stack is conservatively repainted if this mapping is reused. */
+    uintptr_t scan_end = thread->stack_low + scheduler.stack_statistics.minimum_free_bytes;
+    if (scan_end > thread->stack_high) scan_end = thread->stack_high;
     _Static_assert(KERNEL_STACK_GUARD_BYTES % sizeof(uint64_t) == 0,
                    "stack fill scan must remain naturally aligned");
     const uint64_t fill = UINT64_C(0x0101010101010101) * KERNEL_STACK_FILL;
     typedef uint64_t stack_word __attribute__((may_alias));
-    while (thread->stack_high - (uintptr_t)cursor >= 8 * sizeof(stack_word)) {
+    while (scan_end - (uintptr_t)cursor >= 8 * sizeof(stack_word)) {
         const stack_word *words = (const stack_word *)cursor;
         if (((words[0] ^ fill) | (words[1] ^ fill) | (words[2] ^ fill) |
              (words[3] ^ fill) | (words[4] ^ fill) | (words[5] ^ fill) |
@@ -825,17 +902,20 @@ enum kernel_scheduler_status release_task_stack(struct kernel_task *thread)
             break;
         cursor += 8 * sizeof(stack_word);
     }
-    while (thread->stack_high - (uintptr_t)cursor >= sizeof(uint64_t)) {
+    while (scan_end - (uintptr_t)cursor >= sizeof(uint64_t)) {
         uint64_t word;
         __builtin_memcpy(&word, __builtin_assume_aligned(cursor, sizeof(word)), sizeof(word));
         if (word != fill) break;
         cursor += sizeof(word);
     }
-    while ((uintptr_t)cursor < thread->stack_high &&
+    while ((uintptr_t)cursor < scan_end &&
            *cursor == KERNEL_STACK_FILL)
         cursor++;
     free_bytes = (uintptr_t)cursor - thread->stack_low;
     used_bytes = thread->stack_high - (uintptr_t)cursor;
+    uintptr_t top = thread->stack_high;
+    uint64_t physical = thread->stack_physical_address;
+    int mapped = arch_mmu_kernel_window_active();
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         scheduler.stack_statistics.stacks_released++;
@@ -843,29 +923,24 @@ enum kernel_scheduler_status release_task_stack(struct kernel_task *thread)
             scheduler.stack_statistics.minimum_free_bytes = free_bytes;
         if (used_bytes > scheduler.stack_statistics.maximum_used_bytes)
             scheduler.stack_statistics.maximum_used_bytes = used_bytes;
+        if (mapped && thread->arch.user_mode && scheduler.cleanup_task && !scheduler.shutdown_waiting) {
+            unsigned cpu = stack_cache_cpu(thread->cpu);
+            /* Only the retirement side can populate a slot. Claimants and
+             * memory pressure only take its owner with an atomic exchange. */
+            if (!__atomic_load_n(&kernel_stack_cache[cpu], __ATOMIC_RELAXED)) {
+                struct cached_kernel_stack *stack = (struct cached_kernel_stack *)top - 1;
+                *stack = (struct cached_kernel_stack){physical, (uintptr_t)cursor};
+                clear_task_stack(thread);
+                __atomic_store_n(&kernel_stack_cache[cpu], stack, __ATOMIC_RELEASE);
+                return KERNEL_SCHEDULER_STATUS_OK;
+            }
+        }
     }
-    if (arch_mmu_kernel_window_active()) {
-        uint64_t window = (uint64_t)thread->stack_low -
-                          KERNEL_STACK_GUARD_BYTES - BOAROS_PAGE_SIZE;
-#if !defined(BOAROS_ARCH_LOONGARCH)
-        if (arch_mmu_kernel_window_unmap_pages(scheduler.allocator,
-                  window + BOAROS_PAGE_SIZE, 2) != ARCH_MMU_STATUS_OK) __builtin_trap();
-#else
-        (void)arch_mmu_kernel_window_unmap(scheduler.allocator,
-                                             window + BOAROS_PAGE_SIZE);
-        (void)arch_mmu_kernel_window_unmap(
-            scheduler.allocator, window + BOAROS_PAGE_SIZE * 2U);
-#endif
-        kernel_stack_slot_release(window);
-    }
-    (void)physical_page_release_order(scheduler.allocator,
-                                      thread->stack_physical_address,
-                                      KERNEL_STACK_ORDER);
-    thread->stack_physical_address = KERNEL_THREAD_NO_PAGE;
-    thread->stack_low = 0U;
-    thread->stack_high = 0U;
-    thread->arch.kernel_sp = 0U;
-    thread->context.sp = 0U;
+    if (mapped)
+        release_mapped_stack(top, physical);
+    else
+        (void)physical_page_release_order(scheduler.allocator, physical, KERNEL_STACK_ORDER);
+    clear_task_stack(thread);
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 

@@ -1059,8 +1059,8 @@ enum kernel_scheduler_status arch_process_clone_current(
     }
 
     /* Controlling TTY inheritance shares the lifecycle executor with setsid
-     * and hangup. Keep it through child publication and vfork completion. */
-    KERNEL_SERVICE_SCOPE(service);
+     * and hangup. Thread stack setup has its own short protection. */
+    KERNEL_SERVICE_SCOPE_IF(service, !thread_clone || vfork);
     status = map_task_stack(child);
     if (status != KERNEL_SCHEDULER_STATUS_OK)
         return finish_clone_failure(child, -KERNEL_ENOMEM, linux_result,
@@ -1908,6 +1908,7 @@ int kernel_scheduler_stop_users(void)
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         pending |= scheduler.retired_pending != 0;
     }
+    if (!pending) (void)kernel_stack_cache_reclaim(scheduler.allocator);
     return pending;
 }
 
