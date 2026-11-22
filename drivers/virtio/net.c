@@ -327,9 +327,10 @@ static void interrupt(void *owner)
     {
         KERNEL_IRQ_LOCK_SCOPE(guard, &d->state);
         /* 先ack再收割；新的完成必须仍能留下通知。IRQ不发布新RX/TX。 */
-        d->transport.ops.ack_interrupt(d->transport.context);
+        uint32_t pending = d->transport.ops.ack_interrupt(d->transport.context);
         arch_io_barrier(); check_status(d);
-        if (d->configured && link_read(d)) fail(d, "configuration", 0, 0, 0);
+        if ((pending & VIRTIO_INTERRUPT_CONFIG) && d->configured && link_read(d))
+            fail(d, "configuration", 0, 0, 0);
         d->statistics.interrupts++;
         if (harvest(d)) start_poll_locked(d);
     }

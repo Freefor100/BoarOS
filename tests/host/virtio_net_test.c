@@ -534,9 +534,13 @@ static void test_tx_timeout(unsigned version)
 static void test_configuration_irq(unsigned version)
 {
     struct riscv_virtio_mmio_net d; start(version, &d);
-    ((unsigned char *)regs)[MMIO_CONFIG + 6] = 0; trigger_interrupt(2);
+    assert(riscv_virtio_mmio_net_send(&d, "x", 1) == 1);
+    ((unsigned char *)regs)[MMIO_CONFIG + 6] = 0;
+    complete(1, next_head(1), 0, 1);
+    assert(d.link_up && d.tx_capacity_generation == 1);
+    trigger_interrupt(2);
     assert(!d.link_up && riscv_virtio_mmio_net_send(&d, "x", 1) == -KERNEL_ENETDOWN);
-    ((unsigned char *)regs)[MMIO_CONFIG + 6] = 1; trigger_interrupt(2);
+    ((unsigned char *)regs)[MMIO_CONFIG + 6] = 1; trigger_interrupt(3);
     assert(d.link_up && riscv_virtio_mmio_net_send(&d, "x", 1) == 1);
     complete(1, next_head(1), 0, 1); stop(&d);
     printf("PASS: VirtIO-net v%u MAC/config registers and link interrupt decoded independently\n", version);
