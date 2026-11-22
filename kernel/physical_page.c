@@ -9,6 +9,7 @@
 
 /* 宿主/无终端平台可没有该hook；已有同步sink仍可输出。 */
 extern void kernel_console_emergency_begin(void) __attribute__((weak));
+extern unsigned kernel_stack_cache_reclaim(struct physical_page_allocator *) __attribute__((weak));
 
 #define PHYSICAL_PAGE_ALLOCATOR_INITIALIZED UINT32_C(0x50414745)
 #define PHYSICAL_PAGE_ALLOCATOR_FINALIZED UINT32_C(0x42554459)
@@ -1470,6 +1471,9 @@ enum physical_page_status physical_page_allocate_order(
     enum physical_page_status status =
         physical_page_allocate_order_once(allocator, order, address, &hooks, &available);
     if (hooks.notify) hooks.notify(hooks.context, available);
+    if (status == PHYSICAL_PAGE_STATUS_EMPTY && kernel_stack_cache_reclaim &&
+        kernel_stack_cache_reclaim(allocator))
+        status = physical_page_allocate_order_once(allocator, order, address, NULL, NULL);
     if (status == PHYSICAL_PAGE_STATUS_EMPTY) {
         uint64_t (*lazy_reclaim)(struct physical_page_allocator *,uint64_t,uint64_t *)=
             __atomic_load_n(&allocator->lazy_reclaim,__ATOMIC_ACQUIRE);

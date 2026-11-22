@@ -1,6 +1,7 @@
 #ifndef BOAROS_ARCH_MMU_H
 #define BOAROS_ARCH_MMU_H
 #include <kernel/page.h>
+#include <string.h>
 #if defined(BOAROS_ARCH_LOONGARCH)
 #include <arch/loongarch/mmu.h>
 #else
@@ -106,4 +107,23 @@ static inline void arch_mmu_sync_user(uint32_t targets, uint64_t address,
 #endif
 }
 #endif
+
+static inline void arch_zero_owned_memory(void *pointer, size_t bytes)
+{
+#if defined(__riscv)
+    if (riscv_mmu_cboz64 && bytes >= 128) {
+        unsigned char *block = pointer;
+        size_t leading = -(uintptr_t)block & 63U;
+        if (leading) {
+            memset(block, 0, leading);
+            block += leading;
+            bytes -= leading;
+        }
+        for (; bytes >= 64; block += 64, bytes -= 64)
+            __asm__ volatile(".insn i 0x0f, 2, zero, %0, 4" :: "r"(block) : "memory");
+        pointer = block;
+    }
+#endif
+    if (bytes) memset(pointer, 0, bytes);
+}
 #endif

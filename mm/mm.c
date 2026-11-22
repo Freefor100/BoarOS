@@ -520,20 +520,7 @@ static void finish_handle(struct kernel_mm *mm, enum kernel_mm_state state)
 
 static void clear_page(void *pointer)
 {
-#if defined(__riscv)
-    if (riscv_mmu_cboz64 && !((uintptr_t)pointer & 63)) {
-        /* Only a common, explicitly advertised 64-byte granule enables
-         * block zeroing. These are complete blocks inside the owned page. */
-        for (size_t offset = 0; offset < BOAROS_PAGE_SIZE; offset += 64) {
-            void *block = (unsigned char *)pointer + offset;
-            /* cbo.zero has immediate 4 and no destination register. */
-            __asm__ volatile(".insn i 0x0f, 2, zero, %0, 4"
-                : : "r"(block) : "memory");
-        }
-        return;
-    }
-#endif
-    memset(pointer, 0, BOAROS_PAGE_SIZE);
+    arch_zero_owned_memory(pointer, BOAROS_PAGE_SIZE);
 }
 
 static enum kernel_mm_status resolve_record_storage(

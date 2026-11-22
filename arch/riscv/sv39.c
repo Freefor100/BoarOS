@@ -1,4 +1,5 @@
 #include <kernel/cost.h>
+#include <kernel/irq.h>
 #include <arch/riscv/smp.h>
 #include <arch/riscv/sv39.h>
 #include <arch/riscv/mmu_context.h>
@@ -470,9 +471,11 @@ static struct {
     uint64_t base;
     uint64_t size;
     uint32_t active;
-    /* Stack-window leaves are published and retired only by the service CPU. */
     uint16_t mapped_leaves[RISCV_SV39_INDEX_MASK + 1U];
 } kernel_stack_window;
+static struct kernel_raw_lock kernel_window_lock = {
+    .rank = KERNEL_RAW_RANK_MM, .initialized = KERNEL_RAW_INITIALIZED,
+};
 
 enum riscv_sv39_status riscv_sv39_kernel_window_reserve(
     struct riscv_sv39_page_table *table,
@@ -567,7 +570,6 @@ static int kernel_window_valid(uint64_t address, unsigned pages)
 enum riscv_sv39_status riscv_sv39_kernel_window_map_pages(
     struct physical_page_allocator *allocator, uint64_t va, uint64_t pa, unsigned pages)
 {
-    kernel_assert_service_context();
     if (!allocator || !kernel_window_valid(va, pages) || (pa & BOAROS_PAGE_MASK) ||
         pa > RISCV_SV39_PHYSICAL_LIMIT - pages * BOAROS_PAGE_SIZE)
         return RISCV_SV39_STATUS_INVALID;
@@ -578,11 +580,13 @@ enum riscv_sv39_status riscv_sv39_kernel_window_map_pages(
     enum riscv_sv39_status status;
     for (;;) {
         uintptr_t irq = arch_interrupt_save();
+        KERNEL_RAW_SCOPE(guard, &kernel_window_lock);
         uint64_t *level1, *data[2] = {0};
         status = resolve_runtime_table(allocator, kernel_stack_window.level1_address,
                                        &level1);
         unsigned missing = tables;
         if (status != RISCV_SV39_STATUS_OK) {
+            kernel_raw_lock_release(&guard);
             arch_interrupt_restore(irq);
             break;
         }
@@ -608,8 +612,8 @@ enum riscv_sv39_status riscv_sv39_kernel_window_map_pages(
                     break;
                 }
             }
+            int changed_parent = 0;
             if (status == RISCV_SV39_STATUS_OK) {
-                int changed_parent = 0;
                 /* 没有分配/睡眠：全部预检后发布，候选表的owner转给共享骨架。 */
                 for (unsigned i = 0; i < tables; i++) if (!level1[indexes[i]]) {
                     changed_parent = 1;
@@ -624,6 +628,9 @@ enum riscv_sv39_status riscv_sv39_kernel_window_map_pages(
                         __ATOMIC_RELEASE);
                     kernel_stack_window.mapped_leaves[indexes[group]]++;
                 }
+            }
+            kernel_raw_lock_release(&guard);
+            if (status == RISCV_SV39_STATUS_OK) {
                 /* 非叶PTE改变必须覆盖walk缓存，不能只请求远端叶子VA失效。 */
                 kernel_window_sync(changed_parent ? 0 : va,
                     changed_parent ? UINT64_MAX : pages * BOAROS_PAGE_SIZE);
@@ -631,6 +638,7 @@ enum riscv_sv39_status riscv_sv39_kernel_window_map_pages(
             arch_interrupt_restore(irq);
             break;
         }
+        kernel_raw_lock_release(&guard);
         arch_interrupt_restore(irq);
         if (status != RISCV_SV39_STATUS_OK) break;
         /* allocation可显式睡眠；下轮重新解析，绝不携带裸PTE。已有表不分配。 */
@@ -646,9 +654,9 @@ enum riscv_sv39_status riscv_sv39_kernel_window_map_pages(
 enum riscv_sv39_status riscv_sv39_kernel_window_unmap_pages(
     struct physical_page_allocator *allocator, uint64_t va, unsigned pages)
 {
-    kernel_assert_service_context();
     if (!allocator || !kernel_window_valid(va, pages)) return RISCV_SV39_STATUS_INVALID;
-    uintptr_t irq = arch_interrupt_save();
+    KERNEL_IRQ_SCOPE(irq);
+    KERNEL_RAW_SCOPE(guard, &kernel_window_lock);
     uint64_t *level1, *data[2] = {0}, retired[2] = {0};
     unsigned indexes[2] = {(va >> 21) & RISCV_SV39_INDEX_MASK,
         ((va + (pages - 1U) * BOAROS_PAGE_SIZE) >> 21) & RISCV_SV39_INDEX_MASK};
@@ -686,12 +694,12 @@ enum riscv_sv39_status riscv_sv39_kernel_window_unmap_pages(
     }
     /* 空表退休也覆盖walk缓存；确认所有在线hart停止旧翻译后才能归还owner。 */
     int changed_parent = retired[0] || retired[1];
+    kernel_raw_lock_release(&guard);
     kernel_window_sync(changed_parent ? 0 : va,
         changed_parent ? UINT64_MAX : pages * BOAROS_PAGE_SIZE);
     for (unsigned i = 0; i < tables; i++) if (retired[i])
         physical_page_release(allocator, retired[i]);
 out:
-    arch_interrupt_restore(irq);
     return status;
 }
 

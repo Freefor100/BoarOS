@@ -1,15 +1,17 @@
 /* Exercise the actual private slot allocator without exporting a test API. */
+#define _GNU_SOURCE
 #include <arch/task.h>
+#undef ARCH_KERNEL_STACK_WINDOW_BASE
+#define ARCH_KERNEL_STACK_WINDOW_BASE UINT64_C(0x4000000000)
 #if BOAROS_PAGE_SHIFT == 14
 /* The host executes RV boundary stubs; these constants check LA geometry. */
-#undef ARCH_KERNEL_STACK_WINDOW_BASE
 #undef ARCH_KERNEL_STACK_WINDOW_SIZE
-#define ARCH_KERNEL_STACK_WINDOW_BASE UINT64_C(0xffff800000000000)
 #define ARCH_KERNEL_STACK_WINDOW_SIZE UINT64_C(0x06000000)
 #endif
 #include "../../kernel/sched/core.c"
 #include <assert.h>
 #include <stdio.h>
+#include <sys/mman.h>
 
 _Thread_local uintptr_t sync_test_irq = 1;
 static struct kernel_cpu test_cpu;
@@ -27,7 +29,7 @@ void sync_test_current_task_set(void *task) { (void)task; __builtin_trap(); }
 uintptr_t sync_test_stack(void) { return 0; }
 enum physical_page_status physical_page_allocate(struct physical_page_allocator *owner, uint64_t *address)
 {
-    assert(owner == &allocator && !metadata_owned && !stack_owned);
+    assert(owner == &allocator && !metadata_owned);
     metadata_owned = 1; *address = UINT64_C(0x80000000);
     return PHYSICAL_PAGE_STATUS_OK;
 }
@@ -50,13 +52,13 @@ enum physical_page_status physical_page_release_order(struct physical_page_alloc
     uint64_t address, uint32_t order)
 {
     assert(owner == &allocator && address == physical_stack && order == KERNEL_STACK_ORDER);
-    assert(stack_owned && metadata_owned && !test_cpu.raw_locks);
+    assert(stack_owned && !test_cpu.raw_locks);
     stack_owned = 0; return PHYSICAL_PAGE_STATUS_OK;
 }
 enum physical_page_status physical_page_release(struct physical_page_allocator *owner, uint64_t address)
 {
     assert(owner == &allocator && address == UINT64_C(0x80000000));
-    assert(metadata_owned && !stack_owned && !test_cpu.raw_locks);
+    assert(metadata_owned && !test_cpu.raw_locks);
     metadata_owned = 0; return PHYSICAL_PAGE_STATUS_OK;
 }
 int riscv_sv39_kernel_window_active(void) { return 1; }
@@ -69,7 +71,21 @@ enum riscv_sv39_status riscv_sv39_kernel_window_map_pages(struct physical_page_a
         va + KERNEL_STACK_BYTES <= ARCH_KERNEL_STACK_WINDOW_BASE + ARCH_KERNEL_STACK_WINDOW_SIZE);
     assert((va - ARCH_KERNEL_STACK_WINDOW_BASE) % ARCH_KERNEL_STACK_SLOT_SIZE == BOAROS_PAGE_SIZE);
     mapped_stack = va; map_calls++;
+    if (map_result == RISCV_SV39_STATUS_OK) {
+        void *alias = mmap((void *)(uintptr_t)va, KERNEL_STACK_BYTES,
+            PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        assert(alias == (void *)(uintptr_t)va);
+        memcpy(alias, stack_pages, KERNEL_STACK_BYTES);
+    }
     return map_result;
+}
+
+enum riscv_sv39_status riscv_sv39_kernel_window_unmap_pages(
+    struct physical_page_allocator *owner, uint64_t va, unsigned pages)
+{
+    assert(owner == &allocator && va == mapped_stack && stack_owned && !test_cpu.raw_locks);
+    assert(pages == KERNEL_STACK_PAGES && !munmap((void *)(uintptr_t)va, KERNEL_STACK_BYTES));
+    return RISCV_SV39_STATUS_OK;
 }
 
 static uint32_t first_same_index(uint64_t physical)
@@ -100,6 +116,44 @@ static void failed_mapping(void)
     assert(!task && !metadata_owned && !stack_owned && map_calls == 2 && mapped_stack == expected);
     for (unsigned word = 0; word < KERNEL_STACK_SLOT_WORDS; word++)
         assert(!kernel_stack_slot_bitmap[word]);
+}
+
+static void cache_reuse_and_pressure(void)
+{
+    struct kernel_task *task;
+    static struct kernel_task cleanup;
+    scheduler.cleanup_task = &cleanup;
+    scheduler.stack_statistics.minimum_free_bytes = KERNEL_STACK_BYTES - KERNEL_STACK_GUARD_BYTES;
+    map_result = RISCV_SV39_STATUS_OK;
+    unsigned maps_before = map_calls;
+
+    assert(!allocate_task_pages(&task) && !map_task_stack(task));
+    uintptr_t low = task->stack_low;
+    uintptr_t high = task->stack_high;
+    ((unsigned char *)low)[127] = 0;
+    *(unsigned char *)(high - 1) = 0x5a;
+    task->arch.user_mode = 1;
+    assert(!release_task_stack(task));
+    assert(!physical_page_release(&allocator, task->physical_address));
+    assert(stack_owned && map_calls == maps_before + 1);
+    assert(scheduler.stack_statistics.minimum_free_bytes == 127);
+    assert(!allocate_task_pages(&task) && !map_task_stack(task));
+    assert(task->stack_low == low && task->stack_high == high && map_calls == maps_before + 1);
+    assert(((unsigned char *)low)[126] == KERNEL_STACK_FILL);
+    assert(((unsigned char *)low)[127] == 0);
+    assert(*(unsigned char *)(high - 1) == 0);
+    assert(*(uint64_t *)(low - sizeof(uint64_t)) == KERNEL_STACK_CANARY);
+    assert(!kernel_stack_cache_reclaim(&allocator));
+
+    /* A later, shallower stack leaves the historical minimum unchanged. */
+    task->arch.user_mode = 1;
+    assert(!release_task_stack(task));
+    assert(scheduler.stack_statistics.minimum_free_bytes == 127);
+    assert(!physical_page_release(&allocator, task->physical_address));
+    assert(kernel_stack_cache_reclaim(&allocator) == KERNEL_STACK_PAGES && !stack_owned);
+    assert(!kernel_stack_cache_reclaim(&allocator));
+    for (unsigned i = 0; i < KERNEL_STACK_SLOT_WORDS; i++)
+        assert(!kernel_stack_slot_bitmap[i]);
 }
 
 static uint32_t window_slot(uint64_t window)
@@ -178,6 +232,7 @@ int main(void)
     kernel_raw_lock_init(&kernel_wait_domain, KERNEL_RAW_RANK_SCHEDULER);
     scheduler.allocator = &allocator;
     failed_mapping();
+    cache_reuse_and_pressure();
     preference_cases();
     capacity_cases();
     printf("PASS stack slot page=%llu count=%u: all physical colors, next/fallback, full/release, padding and failed-map owners\n",
