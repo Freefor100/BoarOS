@@ -26,10 +26,17 @@ static uint64_t reads, fail_read;
 #include "lwext4_credit_parallel.h"
 static struct {
     struct ext4_buf *buffer;
+    struct ext4_buf *rebind_buffer;
     struct ext4_block_payload *current;
     uint32_t references, extra;
-    unsigned observed;
+    unsigned observed, rebinds;
 } publication_owner;
+void __real_ext4_block_rebind(struct ext4_block *, struct ext4_block_payload *);
+void __wrap_ext4_block_rebind(struct ext4_block *block, struct ext4_block_payload *next)
+{
+    if (block->buf == publication_owner.rebind_buffer) publication_owner.rebinds++;
+    __real_ext4_block_rebind(block, next);
+}
 void __real_ext4_bcache_publish(struct ext4_buf *, struct ext4_block_payload *);
 void __wrap_ext4_bcache_publish(struct ext4_buf *buffer, struct ext4_block_payload *next)
 {
@@ -464,7 +471,13 @@ static void publication_owners(struct ext4_blockdev *dev, struct jbd_journal *jo
         CHECK(ext4_block_set(dev, &private) == EOK);
         CHECK(jbd_trans_prepare_operation(operation) == EOK);
         publication_watch(original.buf, 0);
+        publication_owner.rebind_buffer = original.buf;
+        publication_owner.rebinds = 0;
         CHECK(jbd_journal_accept(journal, operation, 0) == EOK && !publication_owner.buffer);
+        publication_owner.rebind_buffer = NULL;
+        printf("publication image rebinds: running-group merge=%u count=%u\n",
+            round, publication_owner.rebinds);
+        CHECK(publication_owner.rebinds == 1);
         CHECK(original.data[0] == 'O');
         CHECK(ext4_block_get(dev, &visible, home) == EOK && visible.data[0] == 'A' + round);
         if (!round) older = visible;
