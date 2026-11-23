@@ -1755,8 +1755,8 @@ enum riscv_sv39_status riscv_sv39_user_cow_commit(struct riscv_sv39_user_space *
     uint64_t address, uint64_t cookie, uint64_t replacement, uint32_t permissions,
     struct kernel_mm_retirement *batch)
 { return riscv_sv39_user_cow_commit_order(s,address,cookie,replacement,permissions,0,batch); }
-enum riscv_sv39_status riscv_sv39_user_next_owned(struct riscv_sv39_user_space *s,
-    uint64_t *cursor, uint64_t end, uint64_t *address)
+static enum riscv_sv39_status next_owned_leaf(struct riscv_sv39_user_space *s,
+    uint64_t *cursor, uint64_t end, uint64_t *address, uint64_t **slot, unsigned *remaining)
 {
     if (!s || !cursor || !address || s->state != RISCV_SV39_USER_SPACE_LIVE ||
         *cursor > end || end > RISCV_SV39_USER_LIMIT || ((*cursor | end) & BOAROS_PAGE_MASK)) return RISCV_SV39_STATUS_INVALID;
@@ -1780,6 +1780,7 @@ enum riscv_sv39_status riscv_sv39_user_next_owned(struct riscv_sv39_user_space *
                 if (entry_address(middle[m]) & (RISCV_SV39_PAGE_SIZE_2M-1)) return RISCV_SV39_STATUS_STATE;
                 *address=((uint64_t)r<<30)|((uint64_t)m<<21);
                 *cursor=*address+RISCV_SV39_PAGE_SIZE_2M;
+                if (slot) { *slot = &middle[m]; *remaining = 0; }
                 return RISCV_SV39_STATUS_OK;
             }
             if (!valid_nonleaf_entry(middle[m])) return RISCV_SV39_STATUS_STATE;
@@ -1793,12 +1794,17 @@ enum riscv_sv39_status riscv_sv39_user_next_owned(struct riscv_sv39_user_space *
                 return RISCV_SV39_STATUS_STATE;
             *address = ((uint64_t)r << 30) | ((uint64_t)m << 21) | ((uint64_t)l << BOAROS_PAGE_SHIFT);
             *cursor = *address + BOAROS_PAGE_SIZE;
+            if (slot) { *slot = &leaves[l]; *remaining = leaf_limit - l; }
             return RISCV_SV39_STATUS_OK;
         }
     }
     *cursor = end;
     return RISCV_SV39_STATUS_NOT_MAPPED;
 }
+
+enum riscv_sv39_status riscv_sv39_user_next_owned(struct riscv_sv39_user_space *s,
+    uint64_t *cursor, uint64_t end, uint64_t *address)
+{ return next_owned_leaf(s, cursor, end, address, NULL, NULL); }
 enum riscv_sv39_status riscv_sv39_user_owned_snapshot(struct riscv_sv39_user_space *s,
     uint64_t address,uint64_t *physical,int *cow)
 {
@@ -1895,21 +1901,26 @@ static unsigned map_owned_window(struct riscv_sv39_user_space *s, uint64_t addre
     enum riscv_sv39_status result = resolve_leaf_order(s, address, &slot, &order, NULL);
     if (result && result != RISCV_SV39_STATUS_NOT_MAPPED) __builtin_trap();
     if (order || (required_slot >= 0 && slot[required_slot])) return 0;
+    uint64_t attributes = encode_user_entry(0, permissions, flags);
+    uint32_t *owned = permissions ? &s->leaf_pages : &s->protected_pages;
+    uint32_t available = UINT32_MAX - *owned;
+    if (cow && available > UINT32_MAX - s->cow_pages)
+        available = UINT32_MAX - s->cow_pages;
+    /* The caller holds the mapping writer. Order the prepared contents of
+     * every page before any page-table entry in this window becomes visible. */
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     unsigned installed = 0, count = 0;
     for (unsigned index = 0; pages; pages >>= 1, index++) {
         if (!(pages & 1)) continue;
         uint64_t p = *physical++;
         if (slot[index]) continue;
-        if (p & BOAROS_PAGE_MASK) __builtin_trap();
-        if ((permissions ? s->leaf_pages : s->protected_pages) >= UINT32_MAX-count ||
-            (cow && s->cow_pages >= UINT32_MAX-count)) __builtin_trap();
-        uint64_t entry = encode_user_entry(p, permissions, flags);
-        __atomic_store_n(&slot[index], entry, __ATOMIC_RELEASE);
+        if ((p & BOAROS_PAGE_MASK) || count == available) __builtin_trap();
+        uint64_t entry = ((p >> BOAROS_PAGE_SHIFT) << 10U) | attributes;
+        __atomic_store_n(&slot[index], entry, __ATOMIC_RELAXED);
         installed |= 1U << index;
         count++;
     }
-    if (permissions) s->leaf_pages += count;
-    else s->protected_pages += count;
+    *owned += count;
     if (cow) s->cow_pages += count;
     resident_peak(s);
     return installed;
@@ -2191,21 +2202,12 @@ enum riscv_sv39_status riscv_sv39_user_unmap_owned_range(
                                  end);
 }
 
-enum riscv_sv39_status riscv_sv39_user_protect_resident_page(
-    struct riscv_sv39_user_space *space, uint64_t address, uint32_t permissions)
+static enum riscv_sv39_status protect_leaf(struct riscv_sv39_user_space *space,
+    uint64_t *leaf, uint32_t permissions)
 {
-    uint64_t *leaf;
-    if (space == 0 || address < BOAROS_PAGE_SIZE ||
-        address >= RISCV_SV39_USER_LIMIT || (address & BOAROS_PAGE_MASK) != 0 ||
-        (permissions != 0 && !valid_user_permissions(permissions)))
-        return RISCV_SV39_STATUS_INVALID;
-    if (space->state != RISCV_SV39_USER_SPACE_LIVE) return RISCV_SV39_STATUS_STATE;
     if (space->leaf_pages > UINT32_MAX - space->protected_pages ||
         space->cow_pages > space->leaf_pages + space->protected_pages)
         return RISCV_SV39_STATUS_STATE;
-    /* The walk touches at most three entries, independent of other mappings. */
-    enum riscv_sv39_status status = resolve_existing_user_leaf(space, address, &leaf, &space->protect_visits);
-    if (status != RISCV_SV39_STATUS_OK) return status;
     uint64_t old = *leaf, replacement;
     int present = valid_user_leaf_entry(old);
     if (!present && !valid_protected_entry(old)) return RISCV_SV39_STATUS_STATE;
@@ -2233,6 +2235,46 @@ enum riscv_sv39_status riscv_sv39_user_protect_resident_page(
     if (replacement != old) {
         __atomic_store_n(leaf, replacement, __ATOMIC_RELEASE);
     }
+    return RISCV_SV39_STATUS_OK;
+}
+
+enum riscv_sv39_status riscv_sv39_user_protect_resident_page(
+    struct riscv_sv39_user_space *space, uint64_t address, uint32_t permissions)
+{
+    uint64_t *leaf;
+    if (space == 0 || address < BOAROS_PAGE_SIZE ||
+        address >= RISCV_SV39_USER_LIMIT || (address & BOAROS_PAGE_MASK) != 0 ||
+        (permissions != 0 && !valid_user_permissions(permissions)))
+        return RISCV_SV39_STATUS_INVALID;
+    if (space->state != RISCV_SV39_USER_SPACE_LIVE) return RISCV_SV39_STATUS_STATE;
+    enum riscv_sv39_status status = resolve_existing_user_leaf(space, address, &leaf, &space->protect_visits);
+    return status ? status : protect_leaf(space, leaf, permissions);
+}
+
+enum riscv_sv39_status riscv_sv39_user_protect_batch(struct riscv_sv39_user_space *space,
+    uint64_t *cursor, uint64_t begin, uint64_t end,
+    uint32_t (*permissions)(void *, uint64_t), void *context)
+{
+    uint64_t address, *entries;
+    unsigned count;
+    enum riscv_sv39_status status = next_owned_leaf(space, cursor, end, &address, &entries, &count);
+    if (status) return status;
+    if (!count) {
+        if (address < begin || *cursor > end) return RISCV_SV39_STATUS_INVALID;
+        return riscv_sv39_user_protect_owned_range(space, address, *cursor,
+                                                 permissions(context, address));
+    }
+    /* The page-table writer keeps this leaf table alive for the whole batch.
+     * Resume by address after dropping the lock. */
+    if (count > 16) count = 16;
+    space->protect_visits += count;
+    COST_ADD(MPROTECT_PTE_VISITS, count);
+    for (unsigned i = 0; i < count; i++, address += BOAROS_PAGE_SIZE) {
+        if (!entries[i]) continue;
+        status = protect_leaf(space, &entries[i], permissions(context, address));
+        if (status) return status;
+    }
+    *cursor = address;
     return RISCV_SV39_STATUS_OK;
 }
 enum riscv_sv39_status riscv_sv39_user_protect_owned_page(

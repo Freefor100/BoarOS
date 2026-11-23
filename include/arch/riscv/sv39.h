@@ -239,6 +239,9 @@ enum riscv_sv39_status riscv_sv39_user_protect_owned_range(
     uint32_t permissions);
 enum riscv_sv39_status riscv_sv39_user_protect_resident_page(
     struct riscv_sv39_user_space *, uint64_t, uint32_t);
+enum riscv_sv39_status riscv_sv39_user_protect_batch(struct riscv_sv39_user_space *,
+    uint64_t *cursor, uint64_t begin, uint64_t end,
+    uint32_t (*permissions)(void *, uint64_t), void *context);
 
 
 

@@ -2149,7 +2149,18 @@ static int ext4_backend_open_inode(struct kernel_vfs_mount *mount,
     ((struct lwext4_node *)node)->generation = ext4_inode_get_generation(&initial);
     node->uid=ext4_inode_get_uid(&initial);node->gid=ext4_inode_get_gid(&initial);
     node->attributes=ext4_inode_get_flags(&initial)&KERNEL_VFS_INODE_ATTRIBUTES;
-    if (!result) initialize_times(node,adapter,&initial);
+    if (!result) {
+        initialize_times(node,adapter,&initial);
+        /* An inline link's target is already in the validated inode snapshot.
+         * The live inode owns these immutable bytes across rename and unlink. */
+        if ((node->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFLNK &&
+            node->size < sizeof(initial.blocks) &&
+            !ext4_inode_get_blocks_count(&adapter->device.fs->sb, &initial)) {
+            struct lwext4_node *owner = (struct lwext4_node *)node;
+            memcpy(owner->inline_link, initial.blocks, node->size);
+            owner->inline_link_length = node->size;
+        }
+    }
     if(!result)result=retain_node_inode(node);
     if (result) {
         if (close_node_file(node) != EOK) {
@@ -3180,6 +3191,12 @@ static int ext4_backend_lookup(struct kernel_vfs_node *parent,
 }
 static int ext4_backend_readlink(struct kernel_vfs_node *node, char *buffer, size_t size, size_t *count)
 {
+    const struct lwext4_node *owner = (const struct lwext4_node *)node;
+    if (owner->inline_link_length) {
+        *count = size < owner->inline_link_length ? size : owner->inline_link_length;
+        if (*count) memcpy(buffer, owner->inline_link, *count);
+        return 0;
+    }
     KERNEL_LOCK_SCOPE(inode_guard);
     kernel_vfs_node_lock(node,&inode_guard,0);
     return lwext4_error(ext4_fpread(lwext4_node_file(node), 0, buffer, size, count));

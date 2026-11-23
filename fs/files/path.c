@@ -749,8 +749,9 @@ enum kernel_files_status kernel_files_readlinkat(
     uint64_t size,
     int64_t *linux_result)
 {
-    KERNEL_FS_PATHS(fs_paths, fs);
+    struct kernel_fs_paths fs_paths __attribute__((cleanup(kernel_fs_paths_release))) = {0};
     KERNEL_FILES_PATH_SCOPE(start);
+    struct kernel_vfs_path *lookup_start = NULL;
     struct kernel_task_io_buffer scratch __attribute__((cleanup(path_buffer_release))) = {0};
     size_t bytes_read = 0U;
     size_t copied = 0U;
@@ -783,13 +784,20 @@ enum kernel_files_status kernel_files_readlinkat(
     else if (access_status != KERNEL_UACCESS_STATUS_OK) fs_status = KERNEL_FS_CONTEXT_STATUS_STATE;
     else if (!length) {
         KERNEL_FILES_PIN_SCOPE(selected_fd);
-        struct kernel_open_file_description *file = kernel_files_hold_fd(files,dirfd,&selected_fd);
-        if (dirfd == KERNEL_FS_AT_FDCWD) start = fs_paths.cwd;
-        else if (file) start = file->file.path;
-        if (!start) result = file ? -KERNEL_EINVAL : -KERNEL_EBADF;
-        else result = kernel_vfs_path_acquire(start);
-        if (result) start = 0;
-    } else result = kernel_files_path_start(files, &fs_paths, dirfd, buffer, &start);
+        if (dirfd == KERNEL_FS_AT_FDCWD) {
+            fs_paths = kernel_fs_context_snapshot(fs);
+            lookup_start = fs_paths.cwd;
+            result = lookup_start ? 0 : -KERNEL_EBADF;
+        } else {
+            struct kernel_open_file_description *file = kernel_files_hold_fd(files,dirfd,&selected_fd);
+            struct kernel_vfs_path *path = file ? file->file.path : NULL;
+            result = path ? kernel_vfs_path_acquire(path) : file ? -KERNEL_EINVAL : -KERNEL_EBADF;
+            if (!result) lookup_start = start = path;
+        }
+    } else {
+        fs_paths = kernel_fs_context_path_snapshot(fs, dirfd == KERNEL_FS_AT_FDCWD && buffer[0] != '/');
+        result = borrow_lookup_start(files, &fs_paths, dirfd, buffer, &lookup_start, &start);
+    }
     if (fs_status != KERNEL_FS_CONTEXT_STATUS_OK) {
         return KERNEL_FILES_STATUS_STATE;
     }
@@ -797,8 +805,8 @@ enum kernel_files_status kernel_files_readlinkat(
         size_t capacity = size < KERNEL_FS_PATH_MAX ? (size_t)size :
                           KERNEL_FS_PATH_MAX;
         result = buffer[0] ?
-            kernel_vfs_readlink_at(start, fs_paths.root, buffer, buffer, capacity, &bytes_read) :
-            kernel_vfs_path_readlink(start, buffer, capacity, &bytes_read);
+            kernel_vfs_readlink_at(lookup_start, fs_paths.root, buffer, buffer, capacity, &bytes_read) :
+            kernel_vfs_path_readlink(lookup_start, buffer, capacity, &bytes_read);
     }
     if (result == 0) {
         access_status = kernel_copy_to_user(mm, user_buffer, buffer,
