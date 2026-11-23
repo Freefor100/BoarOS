@@ -8,30 +8,31 @@
 #include <kernel/task.h>
 #include <kernel/uaccess.h>
 
-struct hwprobe_cpu {
-    uint64_t ids[3], extensions;
-    unsigned ids_valid;
-};
-static struct hwprobe_cpu capabilities[BOAROS_MAX_CPUS];
+static struct riscv_hwprobe_cpu_info capabilities[BOAROS_MAX_CPUS];
 static uint32_t timebase;
+
+const struct riscv_hwprobe_cpu_info *riscv_hwprobe_get_cpu_info(unsigned cpu)
+{
+    return &capabilities[cpu];
+}
 
 void riscv_hwprobe_initialize(unsigned cpu, uint32_t features, uint32_t common, uint32_t frequency)
 {
-    struct hwprobe_cpu *values = &capabilities[cpu];
+    struct riscv_hwprobe_cpu_info *values = &capabilities[cpu];
     if (!cpu)
         timebase = frequency;
     values->ids_valid = sbi_hardware_ids(values->ids) == 0;
-    if (features & DTB_CPU_ISA_FD) values->extensions |= 1U;
-    if (features & DTB_CPU_ISA_C) values->extensions |= 2U;
-    if (common & DTB_CPU_ISA_V) values->extensions |= 4U;
-    if (features & DTB_CPU_ZBA) values->extensions |= 1U << 3;
-    if (features & DTB_CPU_ZBB) values->extensions |= 1U << 4;
-    if (features & DTB_CPU_ZBS) values->extensions |= 1U << 5;
+    if (features & DTB_CPU_ISA_FD) values->extensions |= RISCV_HWPROBE_FD;
+    if (features & DTB_CPU_ISA_C) values->extensions |= RISCV_HWPROBE_C;
+    if (common & DTB_CPU_ISA_V) values->extensions |= RISCV_HWPROBE_V;
+    if (features & DTB_CPU_ZBA) values->extensions |= RISCV_HWPROBE_ZBA;
+    if (features & DTB_CPU_ZBB) values->extensions |= RISCV_HWPROBE_ZBB;
+    if (features & DTB_CPU_ZBS) values->extensions |= RISCV_HWPROBE_ZBS;
     if (features & DTB_CPU_ZICBOZ_64) {
         /* Expose CBO.ZERO only after enabling and observing user permission. */
         uintptr_t envcfg;
         asm volatile("csrs 0x10a, %1; csrr %0, 0x10a" : "=r"(envcfg) : "r"(128UL) : "memory");
-        if (envcfg & 128U) values->extensions |= 1U << 6;
+        if (envcfg & 128U) values->extensions |= RISCV_HWPROBE_ZICBOZ;
     }
 }
 
@@ -75,7 +76,7 @@ static struct hwprobe_pair probe_pair(int64_t key, unsigned mask)
             mask &= mask - 1U;
             bits &= capabilities[cpu].extensions;
         }
-        pair.value = key == 4 ? bits : ((bits & (1U << 6)) ? 64U : 0U);
+        pair.value = key == 4 ? bits : ((bits & RISCV_HWPROBE_ZICBOZ) ? 64U : 0U);
     } else if (key == 7) {
         pair.value = RISCV_SV39_USER_LIMIT - 1;
     } else if (key == 8) {

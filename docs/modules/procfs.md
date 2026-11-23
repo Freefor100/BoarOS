@@ -10,6 +10,7 @@
 
 | 路径 | 类型 / 权限 | 核心内容与语义 |
 | :--- | :--- | :--- |
+| `/proc/cpuinfo` | 只读快照（`0444`） | 按逻辑处理器编号列出当前在线处理器。RISC-V 和 LoongArch 分别使用对应架构的字段。 |
 | `/proc/meminfo`、`/proc/uptime` | 只读快照（`0444`） | 物理内存快照（KiB：`MemTotal/Free/Available/Buffers/Cached/Shmem/Dirty/Writeback` 等）与系统运行/空闲时长 |
 | `/proc/filesystems`、`/proc/mounts` | 只读快照 / 符号链接 | 已注册文件系统类型表（非块设备带 `nodev`）；`/proc/mounts` 指向 `self/mounts` |
 | `/proc/self`、`/proc/thread-self` | 动态符号链接 | 每次解析动态返回调用者的 `<TGID>` 或 `<TGID>/task/<TID>`（在当前挂载的 PID 命名空间不可见时返回 `-ENOENT`） |
@@ -17,6 +18,7 @@
 | `/proc/sysvipc/{shm,sem,msg}` | 只读快照（`0444`） | 打开时捕获当前 IPC 与 PID 命名空间，按槽位枚举共享内存、信号量与消息队列元数据 |
 | `/proc/net/route` | 只读快照（`0444`） | 当前网络接口的默认路由与直连子网路由表 |
 | `/proc/sys/kernel/*` | 控制文件（`0644`；`pid_max` 为 `0444`） | `sched_rt_period_us`、`sched_rt_runtime_us`、`sched_rr_timeslice_ms`、`pid_max`、`unprivileged_bpf_disabled`、`hostname`、`domainname` |
+| `/proc/sys/kernel/keys/{maxkeys,maxbytes,root_maxkeys,root_maxbytes}` | 控制文件（`0644`） | 按真实用户标识执行的密钥数量和计费字节上限，分别配置普通用户和用户标识为 0 的账户。 |
 | `/proc/sys/vm/*` | 控制文件（`0644`；`drop_caches` 为 `0200`） | `nr_hugepages`、`drop_caches`（1 回收干净页缓存、2 回收目录项与后端元数据、3 两者皆回收）、`vfs_cache_pressure`（默认 100，设为 0 停用自动元数据回收） |
 | `/proc/sys/fs/*` | 控制文件（`aio-nr` `0444`、`aio-max-nr` `0644`） | 异步 I/O 全局在途请求计数与上限控制 |
 | `/proc/<pid>/*` | 进程目录与子项 | `stat`（前 41 个标准字段）、`status`、`comm`、`maps`、`io`、`pagemap`、`mounts`、`mountinfo`、`cgroup`、`coredump_filter`、对象链接 `exe`/`cwd`/`root`、目录 `fd/`、`fdinfo/`、`ns/`、`task/` |
@@ -53,8 +55,10 @@ flowchart LR
 
 | 文件类型 | 代表节点 | 读取与寻址（`lseek`）语义 | 写入与并发锁策略 |
 | :--- | :--- | :--- | :--- |
-| **生成式快照文件**（`seq_file` 语义） | `meminfo`、`stat`、`status`、`maps`、`mounts`、`mountinfo`、`io`、`sysvipc/*` | 首次非空顺序读或非零 `lseek` 时生成堆缓冲并归属于当前 OFD；后续连续短读、`readv`/`pread` 直接复用快照；`lseek` 回 0 后释放并在下次读取重新采样；`SEEK_END` 返回 `-EINVAL`；`fstat` 报告 `st_size == 0` | 所有内核元数据在短锁内抓取后立即释放锁，文本格式化、堆分配与用户空间拷贝均在锁外执行，不持锁睡眠 |
+| **生成式快照文件**（`seq_file` 语义） | `cpuinfo`、`meminfo`、`stat`、`status`、`maps`、`mounts`、`mountinfo`、`io`、`sysvipc/*` | 首次非空顺序读或非零 `lseek` 时生成堆缓冲并归属于当前 OFD；后续连续短读、`readv`/`pread` 直接复用快照；`lseek` 回 0 后释放并在下次读取重新采样；`SEEK_END` 返回 `-EINVAL`；`fstat` 报告 `st_size == 0` | 所有内核元数据在短锁内抓取后立即释放锁，文本格式化、堆分配与用户空间拷贝均在锁外执行，不持锁睡眠 |
 | **动态控制文件**（`generated_control`） | `sched_rt_*`、`sched_rr_timeslice_ms`、`hostname`、`domainname`、`nr_hugepages`、`drop_caches`、`vfs_cache_pressure`、`aio-max-nr`、`unprivileged_bpf_disabled`、`comm`、`coredump_filter` | 不缓存 OFD 快照；数值型 sysctl 在偏移 0 实时读出当前值，非零偏移直接 EOF；字符串型（`hostname`/`domainname`）按当前偏移续读；`lseek` 采用 Linux `default_llseek`（`SEEK_END` 以 0 为基准，`SEEK_DATA/HOLE` 返回 `-ENXIO`） | 先在锁外完整拷贝用户数据，再在原子 setter 或短锁内校验并发布；`drop_caches` 校验权限后先释放 proc 重配置锁再遍历各挂载回收；`hostname`/`domainname` 按每次操作实时取调用者 UTS 命名空间且仅 `euid == 0` 可写 |
+
+`cpuinfo` 依据已上线的处理器记录生成快照，枚举范围与读取线程的处理器亲和性无关。RISC-V 的 `hart` 为硬件线程编号，`isa` 列出各在线硬件线程共同支持且内核已探测的指令集架构（Instruction Set Architecture，ISA）扩展，`hart isa` 列出当前记录的扩展。`mmu` 显示 Sv39 分页模式，固件能提供厂商、架构和实现编号时才输出对应字段。LoongArch 输出逻辑编号、硬件编号 `global_id` 和指令集架构 `loongarch64`。
 
 ---
 

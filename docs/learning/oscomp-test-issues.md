@@ -22,8 +22,7 @@
 | **`libc-test` 缺少 shebang** | 发布盘 `run-static.sh` 与 `run-dynamic.sh` 首行无 `#!/bin/sh`，LoongArch 原 `musl` BusyBox 在参考 Linux 上亦拒绝直接执行。 | `libctest-hook.sh` 仅在临时外层脚本副本中改用原 C 库 BusyBox `sh` 显式解释两行，保留内层脚本与参数。 |
 | **`eventfd01/02`** | 准备阶段读取 Linux 内核配置，缺少 `CONFIG_EVENTFD` 配置项即以 `TBROK` 终止。 | 判读时归为准备阶段依赖缺失，实际 `eventfd` 语义由直接调用系统调用的测例覆盖。 |
 | **`acct02`** | 发布程序读取 Linux 配置以选择记账记录格式。BoarOS 固定输出 v3，正式启动流程没有提供 Linux 配置文件。 | 本地用原程序和实际支持的 `CONFIG_BSD_PROCESS_ACCT`、`CONFIG_BSD_PROCESS_ACCT_V3` 配置验证记录内容，两架构两种 C 库均通过。正式盘的配置读取失败属于准备阶段。 |
-| **`prctl09`** | 原程序在采集睡眠样本前读取 `/proc/cpuinfo` 判断虚拟化环境。当前该路径缺失，程序以 `TBROK` 结束。 | 定时器宽限的读取、继承与实际唤醒范围由直接短例验证。 |
-| **`keyctl02`** | 原程序在准备阶段读写 `/proc/sys/kernel/keys/root_maxkeys`。当前密钥环执行固定真实用户额度，缺少这个运行时配置项。 | 以准备失败计，基础密钥环操作由独立测例覆盖。 |
+| **`keyctl02`** | 原程序在准备阶段临时提高 `/proc/sys/kernel/keys/root_maxkeys`，再读取 `CONFIG_PREEMPT_RT` 和 `CONFIG_PREEMPT_RT_FULL`，据此决定循环中是否给实时内核的线程清理留出额外时间。密钥上限现已接入实际计费。正式启动流程缺少可供该程序读取的 Linux 配置文件时，准备阶段仍会报告 `Cannot parse kernel .config`。 | 本地验收用 `KCONFIG_PATH` 提供这两个选项的实际状态，保留发布程序及原有参数。 |
 | **`accept03` / `readahead01` / `splice07`** | 三者通过 [tst_fd.c](https://github.com/linux-test-project/ltp/blob/20240524/lib/tst_fd.c) 的 `tst_fd_next()` 构造多类描述符。当前可构造 `perf_event_open` 的软件 CPU 时钟计数器、`fsopen("ext2", 0)` 的配置描述符和 `userfaultfd` 描述符。仍有 `io_uring_setup` 和 `memfd_secret` 两类描述符在构造时以 `ENOSYS` 跳过。独立的 `userfaultfd01` 实际登记私有匿名映射，读取缺页事件并填入页面。 | 按日志区分构造阶段的配置跳过与实际系统调用断言；保留发布程序及原判分规则。 |
 | **`open_by_handle_at02` 标准输入挂载假设** | `stale-dfd` 子项用标准输入（FD 0）选定一个挂载点，期望它与测试文件所在卷属于不同文件系统实例。初赛启动脚本将根盘上的 `/dev/console` 作为 FD 0，测例又在同一 ext4 根盘的 `/tmp` 建文件，因此 FD 0 与目标文件落在同一挂载实例中，原句柄得以成功打开（其余 6 项均通过）。参考 Linux 因自动挂载设备临时文件系统（devtmpfs）使 `/dev/console` 位于独立挂载；本地将 `procfs` 中的普通文件重定向给 FD 0 后，BoarOS 同样返回 `ESTALE` 并通过全部 7 项。 | 保留正式启动脚本与原程序不变，判读该项时核对 FD 0 所属挂载实例即可。 |
 
