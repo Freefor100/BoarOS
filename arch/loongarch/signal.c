@@ -108,17 +108,16 @@ void la_signal_prepare_user_return(struct arch_trap_frame *frame)
 {
     struct kernel_task *task=kernel_task_current();
     struct kernel_signal_delivery delivery;
-    enum kernel_signal_select_result selected=kernel_signal_select(task,&delivery);
+    enum kernel_signal_restart restart;
+    enum kernel_signal_select_result selected=kernel_signal_prepare_user_return(task,&delivery,&restart);
     if(selected==KERNEL_SIGNAL_SELECT_EXIT)
         kernel_user_thread_exit(delivery.exit_reason,delivery.exit_status,delivery.exit_detail);
-    int handler=selected==KERNEL_SIGNAL_SELECT_HANDLER;
-    enum kernel_signal_restart restart=kernel_signal_restart_decide(task,handler,handler ? delivery.flags : 0);
     if(restart==KERNEL_SIGNAL_RESTART_BLOCK) frame->regs[11]=128;
     else if(restart==KERNEL_SIGNAL_RESTART_INTERRUPTED) {
         if(frame->era>UINT64_MAX-4) bad_frame();
         frame->regs[4]=(uint64_t)(int64_t)-KERNEL_EINTR;frame->era+=4;
     }
-    if(handler) {
+    if(selected==KERNEL_SIGNAL_SELECT_HANDLER) {
         /* 无handler的普通返回和重启只处理寄存器，不需要查询MM。 */
         struct kernel_mm *mm;
         if(kernel_task_mm_borrow_mutable(task,&mm)!=KERNEL_TASK_STATUS_OK) bad_frame();

@@ -3216,11 +3216,21 @@ static int compare_pages(struct kernel_userfault_page *a, struct kernel_userfaul
 }
 RB_GENERATE_INTERNAL(userfault_pages, kernel_userfault_page, index, compare_pages, static inline)
 
+static void free_userfault_page(struct kernel_userfault_ctx *ctx, struct kernel_userfault_page *page)
+{
+    if (kernel_wait_queue_close(&page->waiters) ||
+        kernel_wait_queue_destroy(&page->waiters)) __builtin_trap();
+    kernel_heap_release(ctx->heap, page);
+}
+
 void kernel_userfault_context_put(struct kernel_userfault_ctx *ctx)
 {
     if (__atomic_fetch_sub(&ctx->references, 1, __ATOMIC_ACQ_REL) != 1) return;
     if (!RB_EMPTY(&ctx->pages) || kernel_wait_queue_close(&ctx->ready) ||
         kernel_wait_queue_destroy(&ctx->ready)) __builtin_trap();
+    if (ctx->spare) free_userfault_page(ctx, ctx->spare);
+    if (ctx->zero_page != KERNEL_MM_NO_PAGE &&
+        physical_page_release(ctx->target.allocator, ctx->zero_page)) __builtin_trap();
     kernel_mm_pagemap_put(&ctx->target);
     kernel_heap_release(ctx->heap, ctx);
 }
@@ -3229,9 +3239,18 @@ static void page_put(struct kernel_userfault_ctx *ctx, struct kernel_userfault_p
 {
     if (__atomic_fetch_sub(&page->references, 1, __ATOMIC_ACQ_REL) != 1) return;
     if (page->active || page->previous || page->enrolled ||
-        kernel_wait_queue_close(&page->waiters) ||
-        kernel_wait_queue_destroy(&page->waiters)) __builtin_trap();
-    kernel_heap_release(ctx->heap, page);
+        kernel_wait_queue_registrations(&page->waiters)) __builtin_trap();
+    /* Every enrolled fault has finished its token and a detached waker has
+     * returned its cursor before dropping the final reference. Keep one
+     * empty queue for the next event on this context. */
+    {
+        KERNEL_RAW_SCOPE(guard, &ctx->lock);
+        if (!ctx->spare) {
+            ctx->spare = page;
+            return;
+        }
+    }
+    free_userfault_page(ctx, page);
 }
 
 static void dequeue_message(struct kernel_userfault_ctx *ctx, struct kernel_userfault_page *page)
@@ -3240,6 +3259,7 @@ static void dequeue_message(struct kernel_userfault_ctx *ctx, struct kernel_user
     *page->previous = page->next;
     if (page->next) page->next->previous = page->previous;
     else ctx->pending_tail = page->previous;
+    page->next = NULL;
     page->previous = NULL;
 }
 
@@ -3269,6 +3289,11 @@ static int kernel_userfault_prepare(struct kernel_userfault_ctx *ctx, uint64_t a
             kernel_raw_lock_release(&guard);
             if (candidate) page_put(ctx, candidate);
             return error;
+        }
+        if (!page && !candidate && ctx->spare) {
+            candidate = ctx->spare;
+            ctx->spare = NULL;
+            candidate->references = 1;
         }
         if (!page && !candidate) {
             kernel_raw_lock_release(&guard);
@@ -7265,8 +7290,8 @@ static __attribute__((noinline)) enum kernel_mm_status wait_for_userfault(
     int error;
     {
         KERNEL_LOCK_SCOPE(vmas);
-        if (operation->shared) kernel_rwlock_read(&record->vma_lock, &vmas);
-        {
+        if (BOAROS_MAX_CPUS > 1) {
+            if (operation->shared) kernel_rwlock_read(&record->vma_lock, &vmas);
             KERNEL_RAW_READ_SCOPE(raw, &record->metadata);
             struct kernel_mm_leaf leaf;
             if (memory_fault_view_changed(record, address, view) ||
@@ -7275,7 +7300,8 @@ static __attribute__((noinline)) enum kernel_mm_status wait_for_userfault(
                 return KERNEL_MM_STATUS_CONFLICT;
         }
         /* A manager's PTE publication and registration changes take the
-         * exclusive MM gate. The VMA reader also excludes shared-gate edits. */
+         * exclusive MM gate. The UP caller has held it since the absent
+         * leaf probe, while the VMA reader excludes SMP shared-gate edits. */
         error = kernel_userfault_prepare(ctx, address, access, operation->fault_origin, &wait);
     }
     if (error) {
@@ -7668,67 +7694,69 @@ int kernel_mm_userfault_check_fill(struct kernel_userfault_ctx *ctx, uint64_t st
     return error;
 }
 
-/* Source bytes already belong to the new physical page. Holding the
- * exclusive gate from VMA lookup through translation sync prevents remap and
- * unregister from publishing between validation and installation. */
+/* The caller supplies one reference for the new leaf. Holding the exclusive
+ * gate through translation sync prevents remap and unregister from publishing
+ * between validation and installation. A cached zero page needs no unlocked
+ * source preparation, so its first fill can also validate the range here. */
 int kernel_mm_userfault_fill(struct kernel_userfault_ctx *ctx, uint64_t address, uint64_t end,
-    uint64_t generation, uint64_t physical)
+    uint64_t *generation, uint64_t physical, int cow)
 {
     struct kernel_mm_record *record = ctx->target.record;
     struct kernel_mm_leaf_preparation prepared = KERNEL_MM_LEAF_PREPARATION_INIT;
     struct kernel_mm_retirement batch;
     batch.count = batch.nonleaf = batch.compound = 0;
     struct physical_page_allocator *allocator = ctx->target.allocator;
-    KERNEL_LOCK_SCOPE(gate);
-    kernel_rwlock_write(&record->operations, &gate);
+    struct mm_gate_scope gate __attribute__((cleanup(mm_gate_scope_end))) = {.record = record};
+    kernel_rwlock_write(&record->operations, &gate.guard);
     struct kernel_vma vma;
     int error = userfault_fill_vma(ctx, address, end, &vma);
-    if (error == -KERNEL_ESRCH) return error;
-    if (error) goto out;
+    if (error) return error;
     /* UFFDIO_COPY acquires the source bytes without the target gate. A
      * replacement may have re-registered this address in the meantime. */
-    if (kernel_vma_set_generation(record->vmas) != generation) {
-        error = -KERNEL_EAGAIN;
-        goto out;
-    }
+    uint64_t current_generation = kernel_vma_set_generation(record->vmas);
+    if (*generation && *generation != current_generation) return -KERNEL_EAGAIN;
+    *generation = current_generation;
 
     uint32_t targets;
-    unsigned missing;
-    {
-        struct kernel_mm_leaf leaf;
-        KERNEL_RAW_READ_SCOPE(raw, &record->metadata);
-        enum arch_mmu_status state = arch_mmu_user_leaf_probe(&record->space, address, &leaf, &missing);
-        if (state != ARCH_MMU_STATUS_NOT_MAPPED) {
-            error = state == ARCH_MMU_STATUS_OK ? -KERNEL_EEXIST : -KERNEL_EFAULT;
-            goto out;
-        }
-    }
-    for (unsigned i = 0; i < 2; i++) {
-        if (!(missing & (1U << i))) continue;
-        if (physical_page_allocate_order_nosleep(allocator, 0, &prepared.tables[i])) {
-            error = -KERNEL_ENOMEM;
-            goto out;
-        }
-        void *table;
-        if (physical_page_map_owned(allocator, prepared.tables[i], &table)) __builtin_trap();
-        clear_page(table);
-    }
     int executable = !!(vma.permissions & KERNEL_MM_EXECUTE);
-    {
-        KERNEL_RAW_WRITE_SCOPE(raw, &record->metadata);
-        enum arch_mmu_status state = arch_mmu_user_map_prepared_page(&record->space, address,
-            physical, backend_permissions_from_mm(vma.permissions), 0, &prepared);
-        if (state != ARCH_MMU_STATUS_OK) __builtin_trap();
-        if (!(vma.flags & KERNEL_VMA_ANON_HISTORY) &&
-            !kernel_vma_set_mark_anonymous(record->vmas, address, generation, &vma))
-            __builtin_trap();
-        targets = note_fault_change_locked(record, &batch, 0, executable);
+    for (;;) {
+        enum arch_mmu_status state;
+        {
+            KERNEL_RAW_WRITE_SCOPE(raw, &record->metadata);
+            state = arch_mmu_user_map_prepared_page(&record->space, address,
+                physical, backend_permissions_from_mm(vma.permissions), cow, &prepared);
+            if (state == ARCH_MMU_STATUS_OK) {
+                if (!(vma.flags & KERNEL_VMA_ANON_HISTORY) &&
+                    !kernel_vma_set_mark_anonymous(record->vmas, address, current_generation, &vma))
+                    __builtin_trap();
+                targets = note_fault_change_locked(record, &batch, 0, executable);
+                break;
+            }
+        }
+        if (state != ARCH_MMU_STATUS_NEED_TABLES) {
+            error = state == ARCH_MMU_STATUS_CONFLICT ? -KERNEL_EEXIST : -KERNEL_EFAULT;
+            goto out;
+        }
+        /* There is no competing editor under the writer gate. Retry the
+         * walk after preparing only the reported missing table pages. */
+        for (unsigned i = 0; i < 2; i++) {
+            if (!(prepared.table_mask & (1U << i))) continue;
+            if (prepared.tables[i] != KERNEL_MM_NO_PAGE) __builtin_trap();
+            if (physical_page_allocate_order_nosleep(allocator, 0, &prepared.tables[i])) {
+                error = -KERNEL_ENOMEM;
+                goto out;
+            }
+            void *table;
+            if (physical_page_map_owned(allocator, prepared.tables[i], &table)) __builtin_trap();
+            clear_page(table);
+        }
     }
+    unsigned missing = prepared.table_mask;
     finish_fault_change(record, &batch, targets, missing ? 0 : address,
         missing ? UINT64_MAX : BOAROS_PAGE_SIZE, 0, executable);
     error = 0;
 out:
-    mm_gate_release(record, &gate);
+    mm_gate_release(record, &gate.guard);
     for (unsigned i = 0; i < 2; i++) {
         if (prepared.tables[i] != KERNEL_MM_NO_PAGE &&
             physical_page_release(allocator, prepared.tables[i])) __builtin_trap();

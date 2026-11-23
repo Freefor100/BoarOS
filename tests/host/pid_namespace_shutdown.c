@@ -13,6 +13,11 @@ extern void signal_owner_heap_empty(void);
 extern void pid_namespace_ptrace_cases(struct kernel_task *,struct kernel_task *,struct kernel_task *,struct kernel_task *,struct kernel_task *);
 uint64_t kernel_mm_peak_resident_pages(const struct kernel_mm *mm)
 { assert(mm->state==KERNEL_MM_RELEASED);return 0; }
+unsigned kernel_stack_cache_reclaim(struct physical_page_allocator *allocator)
+{
+    assert(!allocator);
+    return 0;
+}
 struct kernel_task *pid_namespace_disposal_target;
 extern void pid_namespace_ptrace_final_link(struct kernel_task *,struct kernel_task *);
 static struct kernel_cpu main_cpu, worker_cpu;

@@ -215,21 +215,11 @@ void riscv_signal_prepare_user_return(struct riscv_trap_frame *frame)
     struct kernel_task *task = kernel_task_current();
     struct kernel_signal_delivery delivery;
     enum kernel_signal_restart restart;
-    kernel_pid_t tid;
-    int has_handler;
-    enum kernel_signal_select_result selection;
-
-    if (frame == 0 || (frame->sstatus & RISCV_SSTATUS_SPP) != 0U ||
-        kernel_task_tid(task, &tid) != KERNEL_TASK_STATUS_OK) {
-        return;
-    }
-    selection = kernel_signal_select(task, &delivery);
+    enum kernel_signal_select_result selection =
+        kernel_signal_prepare_user_return(task, &delivery, &restart);
     if (selection == KERNEL_SIGNAL_SELECT_EXIT)
         kernel_user_thread_exit(delivery.exit_reason, delivery.exit_status,
                                  delivery.exit_detail);
-    has_handler = selection == KERNEL_SIGNAL_SELECT_HANDLER;
-    restart = kernel_signal_restart_decide(task, has_handler,
-                                            has_handler ? delivery.flags : 0U);
     if (restart == KERNEL_SIGNAL_RESTART_BLOCK) {
         frame->a7 = 128U;
     } else if (restart == KERNEL_SIGNAL_RESTART_INTERRUPTED) {
@@ -239,7 +229,7 @@ void riscv_signal_prepare_user_return(struct riscv_trap_frame *frame)
         frame->a0 = (uint64_t)(int64_t)-KERNEL_EINTR;
         frame->sepc += 4U;
     }
-    if (has_handler) {
+    if (selection == KERNEL_SIGNAL_SELECT_HANDLER) {
         /* 普通返回和重启没有用户信号帧，只有构帧者需要MM。 */
         struct kernel_mm *mm;
         if (kernel_task_mm_borrow_mutable(task, &mm) != KERNEL_TASK_STATUS_OK)

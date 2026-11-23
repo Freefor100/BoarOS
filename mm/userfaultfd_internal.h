@@ -23,6 +23,8 @@ struct kernel_userfault_ctx {
     struct kernel_wait_queue ready;
     struct userfault_pages pages;
     struct kernel_userfault_page *pending, **pending_tail;
+    struct kernel_userfault_page *spare;
+    uint64_t zero_page;
     unsigned references;
     unsigned flags;
     int initialized, dead;
@@ -47,7 +49,7 @@ int kernel_mm_userfault_register(struct kernel_userfault_ctx *,
 int kernel_mm_userfault_check_fill(struct kernel_userfault_ctx *, uint64_t start, uint64_t end,
     uint64_t *generation);
 int kernel_mm_userfault_fill(struct kernel_userfault_ctx *, uint64_t destination, uint64_t end,
-    uint64_t generation, uint64_t physical);
+    uint64_t *generation, uint64_t physical, int cow);
 
 void kernel_userfault_context_put(struct kernel_userfault_ctx *);
 int kernel_userfault_next(struct kernel_userfault_ctx *, struct uffd_message *, int no_wait);

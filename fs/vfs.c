@@ -45,16 +45,6 @@
 #define LEASE_WRITER (UINT64_C(1) << 32)
 #define LEASE_READER UINT64_C(1)
 
-struct kernel_file_lease {
-    struct kernel_file_lease *next;
-    struct kernel_vfs_file *file;
-    struct kernel_open_file_description *description;
-    const struct kernel_lease_notify *notify;
-    uint64_t downgrade_deadline, unlock_deadline;
-    enum kernel_lease_type type;
-    bool downgrade_pending, unlock_pending;
-};
-
 struct kernel_inode_leases {
     struct kernel_mutex lock;
     struct kernel_wait_queue waiters;
@@ -90,17 +80,20 @@ static struct kernel_inode_leases *lease_context(struct kernel_vfs_node *node, b
 
 static void lease_wake(struct kernel_inode_leases *context)
 {
+    if (!kernel_wait_queue_registrations(&context->waiters)) return;
     KERNEL_IRQ_SCOPE(irq);
     if (kernel_wait_queue_wake_all(&context->waiters)) __builtin_trap();
 }
 
-static void lease_unlink(struct kernel_vfs_node *node,struct kernel_file_lease **slot)
+static void lease_unlink(struct kernel_file_lease **slot)
 {
     struct kernel_file_lease *lease=*slot;
     lease->notify->clear(lease->description);
-    __atomic_store_n(&lease->file->lease_owner,0,__ATOMIC_RELEASE);
     *slot=lease->next;
-    kernel_heap_release(node->instance->heap,lease);
+    lease->downgrade_pending=lease->unlock_pending=false;
+    lease->downgrade_deadline=lease->unlock_deadline=0;
+    /* Once the active marker clears, final close can free the record. */
+    __atomic_store_n(&lease->file->lease_owner,0,__ATOMIC_RELEASE);
 }
 
 static void lease_expire(struct kernel_vfs_node *node,struct kernel_inode_leases *context,uint64_t now)
@@ -109,7 +102,7 @@ static void lease_expire(struct kernel_vfs_node *node,struct kernel_inode_leases
     for (struct kernel_file_lease **slot=&context->first;*slot;) {
         struct kernel_file_lease *lease=*slot;
         if (lease->unlock_deadline && lease->unlock_deadline<=now) {
-            lease_unlink(node,slot);
+            lease_unlink(slot);
             changed=true;
             continue;
         }
@@ -159,8 +152,7 @@ static int lease_break(struct kernel_vfs_node *node,bool write,bool nonblock)
                 next=lease->downgrade_deadline;
             if (next && (!deadline || next<deadline)) deadline=next;
         }
-        if (deadline_changed && kernel_wait_queue_registrations(&context->waiters))
-            lease_wake(context);
+        if (deadline_changed) lease_wake(context);
         if (!conflict) return 0;
         if (nonblock) return -KERNEL_EAGAIN;
         struct kernel_wait_token token={0};
@@ -220,11 +212,11 @@ int kernel_vfs_lease_get(struct kernel_vfs_file *file)
 }
 
 static int lease_set_locked(struct kernel_vfs_node *node,struct kernel_inode_leases *context,
-    struct kernel_file_lease **fresh,enum kernel_lease_type type,int fd,struct kernel_vfs_file *file)
+    struct kernel_file_lease *record,enum kernel_lease_type type,int fd,struct kernel_vfs_file *file)
 {
     struct kernel_file_lease *own=NULL;
     for (struct kernel_file_lease *lease=context->first;lease;lease=lease->next) {
-        if (lease->file==file) own=lease;
+        if (lease==record) own=lease;
         else if (type==KERNEL_LEASE_WRITE || lease->unlock_pending) return -KERNEL_EAGAIN;
     }
     uint64_t opens=__atomic_fetch_or(&node->lease_access,LEASE_ACTIVE,__ATOMIC_ACQ_REL)&~LEASE_ACTIVE;
@@ -235,8 +227,7 @@ static int lease_set_locked(struct kernel_vfs_node *node,struct kernel_inode_lea
         return -KERNEL_EAGAIN;
     }
     if (!own) {
-        own=*fresh;
-        *fresh=NULL;
+        own=record;
         own->next=context->first;
         context->first=own;
         __atomic_store_n(&file->lease_owner,1,__ATOMIC_RELEASE);
@@ -252,48 +243,33 @@ static int lease_set_locked(struct kernel_vfs_node *node,struct kernel_inode_lea
 }
 
 int kernel_vfs_lease_set(struct kernel_vfs_file *file,enum kernel_lease_type type,int fd,
-    struct kernel_open_file_description *description,const struct kernel_lease_notify *notify)
+    struct kernel_file_lease *record)
 {
     struct kernel_vfs_node *node=kernel_vfs_file_node(file);
     if (!node || (file->mode&KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFREG ||
         (unsigned)type>KERNEL_LEASE_UNLOCK) return -KERNEL_EINVAL;
     const struct kernel_credentials *cred=kernel_credentials_current();
-    {
+    if (!kernel_credentials_capable(cred,KERNEL_CAP_LEASE)) {
         KERNEL_LOCK_SCOPE(guard);
         kernel_vfs_node_lock(node,&guard,0);
-        if (node->uid!=cred->fsuid && !kernel_credentials_capable(cred,KERNEL_CAP_LEASE))
-            return -KERNEL_EACCES;
+        if (node->uid!=cred->fsuid) return -KERNEL_EACCES;
     }
     struct kernel_inode_leases *context=lease_context(node,type!=KERNEL_LEASE_UNLOCK);
     if (!context) return type==KERNEL_LEASE_UNLOCK ? -KERNEL_EAGAIN : -KERNEL_ENOMEM;
-    struct kernel_file_lease *fresh=NULL;
-    if (type!=KERNEL_LEASE_UNLOCK) {
-        if (kernel_heap_allocate_zeroed(node->instance->heap,1,sizeof(*fresh),(void **)&fresh))
-            return -KERNEL_ENOMEM;
-        fresh->file=file;
-        fresh->description=description;
-        fresh->notify=notify;
+    KERNEL_LOCK_SCOPE(guard);
+    kernel_mutex_lock(&context->lock,&guard);
+    if (type==KERNEL_LEASE_UNLOCK) {
+        struct kernel_file_lease **slot=&context->first;
+        while (*slot && (*slot)->file!=file) slot=&(*slot)->next;
+        if (!*slot) return -KERNEL_EAGAIN;
+        lease_unlink(slot);
+        if (!context->first) __atomic_fetch_and(&node->lease_access,~LEASE_ACTIVE,__ATOMIC_RELEASE);
+        lease_wake(context);
+        return 0;
     }
-    int result=-KERNEL_EAGAIN;
-    {
-        KERNEL_LOCK_SCOPE(guard);
-        kernel_mutex_lock(&context->lock,&guard);
-        if (type==KERNEL_LEASE_UNLOCK) {
-            struct kernel_file_lease **slot=&context->first;
-            while (*slot && (*slot)->file!=file) slot=&(*slot)->next;
-            if (*slot) {
-                lease_unlink(node,slot);
-                if (!context->first) __atomic_fetch_and(&node->lease_access,~LEASE_ACTIVE,__ATOMIC_RELEASE);
-                lease_wake(context);
-                result=0;
-            }
-        } else {
-            lease_expire(node,context,kernel_time_monotonic_ns());
-            result=lease_set_locked(node,context,&fresh,type,fd,file);
-        }
-    }
-    if (fresh) kernel_heap_release(node->instance->heap,fresh);
-    return result;
+    if (!record || record->file!=file) __builtin_trap();
+    if (context->first) lease_expire(node,context,kernel_time_monotonic_ns());
+    return lease_set_locked(node,context,record,type,fd,file);
 }
 
 void kernel_vfs_lease_release(struct kernel_vfs_file *file)
@@ -306,7 +282,7 @@ void kernel_vfs_lease_release(struct kernel_vfs_file *file)
     struct kernel_file_lease **slot=&context->first;
     while (*slot && (*slot)->file!=file) slot=&(*slot)->next;
     if (!*slot) return; /* A racing access expired this lease. */
-    lease_unlink(node,slot);
+    lease_unlink(slot);
     if (!context->first) __atomic_fetch_and(&node->lease_access,~LEASE_ACTIVE,__ATOMIC_RELEASE);
     lease_wake(context);
 }

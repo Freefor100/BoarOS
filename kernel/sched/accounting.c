@@ -38,20 +38,25 @@ static inline void accounting_write_end(struct kernel_cpu *cpu)
     (void)cpu;
 #endif
 }
-static __attribute__((always_inline)) inline void account_time(struct kernel_cpu *cpu,uint64_t now)
+static inline void account_interval(struct kernel_cpu *cpu, uint64_t now, uint64_t *counter)
 {
     uint64_t started=__atomic_load_n(&cpu->accounting_started_ticks,__ATOMIC_RELAXED);
     if (now<started) __builtin_trap();
+    if (counter) __atomic_store_n(counter,
+        __atomic_load_n(counter,__ATOMIC_RELAXED) + (now - started), __ATOMIC_RELAXED);
+    __atomic_store_n(&cpu->accounting_started_ticks,now,__ATOMIC_RELAXED);
+}
+
+static __attribute__((always_inline)) inline void account_time(struct kernel_cpu *cpu,uint64_t now)
+{
     struct kernel_task *task=cpu->accounting_owner;
-    uint64_t elapsed=now-started;
+    uint64_t *counter = NULL;
     if (!task->idle && task!=cpu->idle) {
         uint32_t mode=__atomic_load_n(&task->accounting_mode,__ATOMIC_RELAXED);
-        uint64_t *counter=mode==ACCOUNT_USER ? &cpu->accounting_user_ticks :
+        counter=mode==ACCOUNT_USER ? &cpu->accounting_user_ticks :
             mode==ACCOUNT_KERNEL ? &cpu->accounting_kernel_ticks : 0;
-        if (counter) __atomic_store_n(counter,
-            __atomic_load_n(counter,__ATOMIC_RELAXED)+elapsed,__ATOMIC_RELAXED);
     }
-    __atomic_store_n(&cpu->accounting_started_ticks,now,__ATOMIC_RELAXED);
+    account_interval(cpu, now, counter);
 }
 /* 首次绑定有独立的控制资格和失败分支，保持在常规trap及用户返回的记账路径之外。 */
 static __attribute__((noinline)) int accounting_initialize(struct kernel_cpu *cpu)
@@ -207,16 +212,21 @@ void kernel_cpu_account_trap_begin(struct kernel_cpu_account_scope *scope,int us
     if (!cpu->accounting_owner && !accounting_initialize(cpu)) return;
     struct kernel_task *task=cpu->accounting_owner;
     accounting_write_begin(cpu);
-    account_time(cpu,accounting_counter());
-    scope->task=task;
-    /* U trap后续返回准备仍计内核工作；最终USER切换在架构返回入口完成。 */
-    scope->restore_mode=user ? ACCOUNT_KERNEL : task->accounting_mode;
+    uint64_t now = accounting_counter();
+    if (user) account_interval(cpu, now, &cpu->accounting_user_ticks);
+    else account_time(cpu, now);
+    /* Synchronous traps stay in kernel accounting through return preparation.
+     * Only an interrupt needs a saved mode and an end-of-handler transition. */
+    if (interrupt) {
+        scope->task = task;
+        scope->restore_mode = user ? ACCOUNT_KERNEL : task->accounting_mode;
+    }
     __atomic_store_n(&task->accounting_mode,interrupt ? ACCOUNT_INTERRUPT : ACCOUNT_KERNEL,__ATOMIC_RELAXED);
     accounting_write_end(cpu);
 }
-void kernel_cpu_account_trap_end(struct kernel_cpu_account_scope *scope)
+void kernel_cpu_account_interrupt_end(struct kernel_cpu_account_scope *scope)
 {
-    if (!scope->task || scope->task->accounting_mode==scope->restore_mode) return;
+    if (scope->task->accounting_mode==scope->restore_mode) return;
     struct kernel_cpu *cpu=kernel_cpu_current();
     if (cpu->accounting_owner!=scope->task) __builtin_trap();
     accounting_write_begin(cpu);
@@ -229,7 +239,7 @@ void kernel_cpu_account_user_return(void)
     struct kernel_cpu *cpu=kernel_cpu_current();
     if (!cpu->accounting_owner && !accounting_initialize(cpu)) __builtin_trap();
     accounting_write_begin(cpu);
-    account_time(cpu,accounting_counter());
+    account_interval(cpu, accounting_counter(), &cpu->accounting_kernel_ticks);
     __atomic_store_n(&cpu->accounting_owner->accounting_mode,ACCOUNT_USER,__ATOMIC_RELAXED);
     accounting_write_end(cpu);
 }

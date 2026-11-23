@@ -127,6 +127,27 @@ static int valid_range(struct uffd_range range)
         range.length <= ARCH_MMU_USER_LIMIT - range.start;
 }
 
+static int get_zero_page(struct kernel_userfault_ctx *ctx, uint64_t *physical)
+{
+    struct physical_page_allocator *allocator = ctx->target.allocator;
+    uint64_t candidate;
+    if (physical_page_allocate(allocator, &candidate)) {
+        *physical = __atomic_load_n(&ctx->zero_page, __ATOMIC_ACQUIRE);
+        return *physical == KERNEL_MM_NO_PAGE ? -KERNEL_ENOMEM : 0;
+    }
+    void *bytes;
+    if (physical_page_map_owned(allocator, candidate, &bytes)) __builtin_trap();
+    arch_zero_owned_memory(bytes, BOAROS_PAGE_SIZE);
+    /* Each installed COW leaf gets a separate reference. The context's
+     * reference prevents upgrading any live alias to writable in place. */
+    *physical = KERNEL_MM_NO_PAGE;
+    if (__atomic_compare_exchange_n(&ctx->zero_page, physical, candidate, 0,
+            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        *physical = candidate;
+    } else if (physical_page_release(allocator, candidate)) __builtin_trap();
+    return 0;
+}
+
 static int fill_range(struct kernel_userfault_ctx *ctx, struct kernel_mm *caller,
     struct uffd_range range, uint64_t source, int zero, uint64_t mode, uint64_t result_address)
 {
@@ -134,24 +155,37 @@ static int fill_range(struct kernel_userfault_ctx *ctx, struct kernel_mm *caller
         (!zero && (source < BOAROS_PAGE_SIZE || source >= ARCH_MMU_USER_LIMIT ||
             range.length > ARCH_MMU_USER_LIMIT - source))) return -KERNEL_EINVAL;
     uint64_t end = range.start + range.length;
-    uint64_t generation;
-    int error = kernel_mm_userfault_check_fill(ctx, range.start, end, &generation);
-    if (error == -KERNEL_ESRCH) return error;
+    uint64_t generation = 0;
+    uint64_t zero_page = zero ? __atomic_load_n(&ctx->zero_page, __ATOMIC_ACQUIRE) :
+        KERNEL_MM_NO_PAGE;
+    int error = 0;
+    if (zero_page == KERNEL_MM_NO_PAGE) {
+        /* Private allocation and source copying may sleep. Validate the
+         * original destination before dropping its MM qualification. */
+        error = kernel_mm_userfault_check_fill(ctx, range.start, end, &generation);
+        if (error == -KERNEL_ESRCH) return error;
+        if (!error && zero) error = get_zero_page(ctx, &zero_page);
+    }
     uint64_t done = 0;
     struct physical_page_allocator *allocator = ctx->target.allocator;
     while (!error && done < range.length) {
-        uint64_t physical;
-        if (physical_page_allocate(allocator, &physical)) {
-            error = -KERNEL_ENOMEM;
-            break;
+        uint64_t physical = zero_page;
+        if (zero) {
+            if (physical_page_acquire(allocator, physical)) __builtin_trap();
+        } else {
+            if (physical_page_allocate(allocator, &physical)) {
+                error = -KERNEL_ENOMEM;
+                break;
+            }
+            void *bytes;
+            if (physical_page_map_owned(allocator, physical, &bytes)) __builtin_trap();
+            error = copy_input(caller, bytes, source + done, BOAROS_PAGE_SIZE);
         }
-        void *bytes;
-        if (physical_page_map_owned(allocator, physical, &bytes)) __builtin_trap();
-        if (zero) arch_zero_owned_memory(bytes, BOAROS_PAGE_SIZE);
-        else error = copy_input(caller, bytes, source + done, BOAROS_PAGE_SIZE);
-        if (!error) error = kernel_mm_userfault_fill(ctx, range.start + done, end, generation, physical);
+        if (!error)
+            error = kernel_mm_userfault_fill(ctx, range.start + done, end, &generation, physical, zero);
         if (error) {
             if (physical_page_release(allocator, physical)) __builtin_trap();
+            if (!generation && error == -KERNEL_ESRCH) return error;
             break;
         }
         done += BOAROS_PAGE_SIZE;
@@ -252,6 +286,7 @@ enum kernel_files_status kernel_files_userfaultfd_create(struct kernel_files *fi
     ctx->heap = files->heap;
     ctx->flags = flags;
     ctx->references = 1;
+    ctx->zero_page = KERNEL_MM_NO_PAGE;
     ctx->pending_tail = &ctx->pending;
     kernel_raw_lock_init(&ctx->lock, KERNEL_RAW_RANK_OBJECT);
     kernel_wait_queue_init(&ctx->ready);

@@ -25,6 +25,7 @@ struct kernel_async_io {
     int owner_type,fd;
     unsigned signum,enabled,pipe_endpoint;
     int lease_fd;
+    struct kernel_file_lease lease;
 };
 
 static struct kernel_wait_queue *async_source(struct kernel_open_file_description *file)
@@ -76,6 +77,8 @@ static void async_notify(struct kernel_wait_node *node,uint32_t reason,uint64_t 
     async_deliver(async,(unsigned)event,0);
 }
 
+static const struct kernel_lease_notify lease_notify;
+
 static struct kernel_async_io *get_context(struct kernel_open_file_description *file)
 {
     struct kernel_async_io *async=__atomic_load_n(&file->async_io,__ATOMIC_ACQUIRE);
@@ -90,15 +93,19 @@ static struct kernel_async_io *get_context(struct kernel_open_file_description *
     candidate->file=file;
     candidate->lease_fd=-1;
     candidate->pipe_endpoint=file->kind==KERNEL_OPEN_FILE_KIND_PIPE?file->pipe_endpoint:0;
+    candidate->lease.file=&file->file;
+    candidate->lease.description=file;
+    candidate->lease.notify=&lease_notify;
     if (!__atomic_compare_exchange_n(&file->async_io,&async,candidate,0,
             __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) kernel_heap_release(file->heap,candidate);
     else async=candidate;
     return async;
 }
 
-int kernel_open_file_async_lease_prepare(struct kernel_open_file_description *file)
+struct kernel_file_lease *kernel_open_file_async_lease_prepare(struct kernel_open_file_description *file)
 {
-    return get_context(file) ? 0 : -KERNEL_ENOMEM;
+    struct kernel_async_io *async=get_context(file);
+    return async ? &async->lease : NULL;
 }
 
 static void async_lease_install(struct kernel_open_file_description *file,int fd)
@@ -145,7 +152,7 @@ static void async_lease_signal(struct kernel_open_file_description *file)
     async_deliver(file->async_io,KERNEL_ASYNC_POLL_MSG,1);
 }
 
-const struct kernel_lease_notify kernel_async_lease_notify={
+static const struct kernel_lease_notify lease_notify={
     .install=async_lease_install,
     .clear=async_lease_clear,
     .signal=async_lease_signal,
