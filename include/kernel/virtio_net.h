@@ -102,4 +102,7 @@ void virtio_net_tx_flush(struct virtio_net_device *device);
  * after DMA stopped. */
 unsigned virtio_net_tx_release(struct virtio_net_device *device,
     void (*release)(void *const *owners, unsigned count), int abandon);
+/* A sender that ran out of slots may reclaim completed slots in a small batch. */
+int virtio_net_tx_reclaim(struct virtio_net_device *device,
+    void (*release)(void *const *owners, unsigned count));
 #endif

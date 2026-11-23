@@ -104,7 +104,7 @@ struct kernel_socket_write_request {
     uint8_t operation, queued;
 #if BOAROS_USER_SMP
     uint8_t udp_output_owned;
-    uint8_t udp_rx_drained;
+    uint8_t *udp_batch_interface;
 #endif
     struct kernel_socket *unix_destination;
     struct kernel_wait_token completion;
@@ -119,6 +119,9 @@ int kernel_socket_is_seqpacket(const struct kernel_socket *socket);
 int kernel_socket_is_udp(const struct kernel_socket *socket);
 /* Linux SEQPACKET checks pending error/connection before SCM interpretation. */
 int kernel_socket_prepare_send(struct kernel_socket *socket);
+#if BOAROS_USER_SMP
+void kernel_socket_datagram_flush(uint8_t interface_index);
+#endif
 int kernel_socket_prepare_receive(struct kernel_socket *socket);
 int kernel_socket_is_unix(const struct kernel_socket *socket);
 int kernel_socket_is_netlink(const struct kernel_socket *socket);

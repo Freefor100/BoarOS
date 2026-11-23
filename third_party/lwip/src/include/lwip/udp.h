@@ -67,7 +67,7 @@ struct boaros_udp4_path {
   u16_t local_port, remote_port;
   u8_t ttl, tos, no_checksum, matches_peer;
 };
-err_t boaros_udp4_output_resolved(const struct boaros_udp4_path *, struct pbuf *);
+err_t boaros_udp4_output_resolved(const struct boaros_udp4_path *, struct pbuf *, int);
 #endif
 struct udp_pcb;
 

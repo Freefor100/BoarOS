@@ -681,6 +681,49 @@ int virtio_net_send_segments(struct virtio_net_device *d,
     }
     return slot >= 0 ? 0 : slot;
 }
+static void *tx_detach_owner(struct virtio_net_device *d, unsigned b)
+{
+    void *owner=d->tx_owner[b];
+    d->tx_owner[b]=0;
+    tx_slot_return(d,b);
+#if BOAROS_COST_DIAGNOSTICS
+    note_tx_free(d,b,arch_time_read());
+#endif
+    return owner;
+}
+
+static unsigned tx_take_completed(struct virtio_net_device *d)
+{
+    unsigned b=d->tx_done[d->tx_done_head++ % VIRTIO_NET_BUFFERS];
+    d->tx_done_count--;
+    if (d->tx_state[b]!=TX_DONE || !d->tx_owner[b]) __builtin_trap();
+    return b;
+}
+
+int virtio_net_tx_reclaim(struct virtio_net_device *d,
+    void (*release)(void *const *owners, unsigned count))
+{
+    void *owners[8];
+    unsigned count=0;
+    int available;
+    {
+        KERNEL_IRQ_LOCK_SCOPE(guard,&d->state);
+        /* Entries already moved to tx_retired no longer hold a slot.
+         * Leave those references to the worker. */
+        if (!d->tx_available && !tx_status(d)) {
+            while (d->tx_done_count && count<sizeof(owners)/sizeof(*owners))
+                owners[count++]=tx_detach_owner(d,tx_take_completed(d));
+        }
+        available=d->tx_available!=0;
+    }
+    if (count) {
+        COST_ADD(NET_TX_RETURN,count);
+        COST_ADD(NET_TX_RETURN_BATCHES,1);
+        release(owners,count);
+    }
+    return available;
+}
+
 unsigned virtio_net_tx_release(struct virtio_net_device *d,
     void (*release)(void *const *owners, unsigned count), int abandon)
 {
@@ -702,18 +745,9 @@ unsigned virtio_net_tx_release(struct virtio_net_device *d,
             if (abandon) {
                 b = next++;
                 if (!d->tx_owner[b]) continue;
-            } else {
-                b = d->tx_done[d->tx_done_head++ % VIRTIO_NET_BUFFERS];
-                d->tx_done_count--;
-                if (d->tx_state[b] != TX_DONE || !d->tx_owner[b]) __builtin_trap();
-            }
+            } else b=tx_take_completed(d);
             /* 先归还槽位与capacity，再在IRQ外释放已摘下的独立owner。 */
-            owners[released++] = d->tx_owner[b];
-            d->tx_owner[b] = 0;
-            tx_slot_return(d, b);
-#if BOAROS_COST_DIAGNOSTICS
-            note_tx_free(d, b, arch_time_read());
-#endif
+            owners[released++]=tx_detach_owner(d,b);
         }
         if (abandon) {
             d->tx_head = d->tx_count = d->tx_done_head = d->tx_done_count = 0;
