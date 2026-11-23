@@ -230,7 +230,7 @@ struct kernel_socket {
 #if BOAROS_USER_SMP
     unsigned tcp_cpu;
     uint16_t tcp_prepare_mss;
-    uint8_t udp_output_active, udp_rx_drained;
+    uint8_t udp_output_active, tcp_loopback;
 #endif
 };
 
@@ -2025,6 +2025,47 @@ static void tcp_wake_ack_waiters(struct kernel_wait_cursor *wake)
     arch_interrupt_restore(interrupts);
 }
 
+static unsigned tcp_owner_receive_batch(struct socket_tcp_owner *owner,unsigned limit,int stopping
+#if BOAROS_COST_DIAGNOSTICS
+                                       ,uint64_t locking,uint64_t locked
+#endif
+                                       );
+
+static unsigned tcp_try_receive_prefix(struct socket_tcp_owner *owner)
+{
+    struct kernel_socket_protocol_scope scope;
+    struct kernel_wait_cursor wake={0};
+#if BOAROS_COST_DIAGNOSTICS
+    uint64_t locking=kernel_cost_clock();
+#endif
+    if (!tcp_owner_lock(&scope,owner,1)) return 0;
+    unsigned count=0;
+    if (!tcp_owner_stopping(owner) && !network_is_stopping()) {
+        struct kernel_socket *ack_socket=NULL;
+        owner->ack_waiter=&ack_socket;
+        count=tcp_owner_receive_batch(owner,TCP_RX_BATCH,0
+#if BOAROS_COST_DIAGNOSTICS
+                                     ,locking,kernel_cost_clock()
+#endif
+                                     );
+        owner->ack_waiter=NULL;
+        tcp_prepare_ack_wake(ack_socket,&wake);
+    }
+    kernel_socket_protocol_leave(&scope);
+    tcp_wake_ack_waiters(&wake);
+    return count;
+}
+
+static void tcp_relieve_ingress(struct socket_tcp_owner *owner)
+{
+    if (current_tcp_owner()) return;
+    struct kernel_lock_guard *ip=boaros_lwip_ip_drop_current();
+    if (!ip) return;
+    /* Drain an existing FIFO prefix without waiting for the connection owner. */
+    (void)tcp_try_receive_prefix(owner);
+    boaros_lwip_ip_lock(ip);
+}
+
 static int tcp_try_inline_ack(struct socket_tcp_owner *owner, const struct socket_tcp_input *input)
 {
     /* Established ACKs can use an idle shard's qualification on the
@@ -2079,11 +2120,27 @@ static int tcp_dispatch(struct pbuf *p,struct netif *input,const ip_addr_t *src,
     }
     int queued;
     struct kernel_wait_cursor wake={0};
-    { KERNEL_RAW_SCOPE(ingress,&owner->ingress); queued=tcp_queue_input_locked(owner,p,input,src,dst,bucket,&wake);
-      if(queued) {
-          struct socket_tcp_input *entry=&owner->ring[(owner->head+owner->count-1)%TCP_RX_RING];
-          entry->network=((const unsigned char *)ip_next_header_ptr()-ip_current_header_tot_len());entry->network_length=ip_current_header_tot_len();
-      } }
+    uint16_t network_length=ip_current_header_tot_len();
+    const void *network=(const unsigned char *)ip_next_header_ptr()-network_length;
+    ip_addr_t saved_src,saved_dst;
+    for (unsigned attempt=0;;attempt++) {
+        {
+            KERNEL_RAW_SCOPE(ingress,&owner->ingress);
+            queued=tcp_queue_input_locked(owner,p,input,src,dst,bucket,&wake);
+            if (queued) {
+                struct socket_tcp_input *entry=&owner->ring[(owner->head+owner->count-1)%TCP_RX_RING];
+                entry->network=network;
+                entry->network_length=network_length;
+            }
+        }
+        if (queued || attempt || tcp_owner_stopping(owner)) break;
+        /* The decoder's scratch belongs to the IP scope. */
+        saved_src=*src;
+        saved_dst=*dst;
+        src=&saved_src;
+        dst=&saved_dst;
+        tcp_relieve_ingress(owner);
+    }
     if (queued) {
         COST_ADD(TCP_INPUT_QUEUED, 1);
 #if BOAROS_COST_DIAGNOSTICS
@@ -2235,7 +2292,10 @@ static unsigned tcp_pick_owner(const struct tcp_pcb *pcb,unsigned count,uint32_t
             return p->boaros_owner;
     }
     unsigned chosen=1+hash%count;
-    if (tcp_owner_active[chosen]<TCP_OWNER_SPREAD_AT) return chosen;
+    /* A loopback pair shares its owner and benefits from locality. External
+     * peers can fill a receive window independently and share the same
+     * bounded ingress ring, so spread their work at connection promotion. */
+    if (pcb->boaros_loopback && tcp_owner_active[chosen]<TCP_OWNER_SPREAD_AT) return chosen;
     for (unsigned cpu=1;cpu<=count && tcp_owner_active[chosen];cpu++)
         if (tcp_owner_active[cpu]<tcp_owner_active[chosen]) chosen=cpu;
     return chosen;
@@ -2390,8 +2450,17 @@ static void packet_publish_locked(struct kernel_socket *socket, struct socket_pa
     if (socket->packets_tail) socket->packets_tail->next = packet;
     else socket->packets_head = packet;
     socket->packets_tail = packet;
-    socket_state_notify(socket_state_owner(socket_endpoint_lock(socket)),&socket->wait);
-    socket_async(socket,KERNEL_ASYNC_POLL_IN);
+    struct socket_state_guard *state=socket_state_owner(socket_endpoint_lock(socket));
+#if BOAROS_USER_SMP
+    struct socket_tcp_owner *owner = kernel_socket_is_tcp(socket) && !socket->tcp_loopback ?
+        current_tcp_owner() : NULL;
+    struct kernel_socket **pending = owner ? owner->ack_waiter : NULL;
+    if (pending && (!*pending || *pending == socket)) {
+        if (!*pending && kernel_wait_queue_registrations(&socket->wait)) *pending = socket;
+    } else
+#endif
+        socket_state_notify(state,&socket->wait);
+    socket_state_async(state,&socket->async_events,KERNEL_ASYNC_POLL_IN);
 }
 
 static void packet_publish(struct kernel_socket *socket, struct socket_packet *packet, uint32_t charge)
@@ -2751,6 +2820,9 @@ static err_t tcp_connected(void *context, struct tcp_pcb *pcb, err_t error)
     socket->connecting = 0U;
     socket->connected = error == ERR_OK;
     if (error == ERR_OK) {
+#if BOAROS_USER_SMP
+        socket->tcp_loopback=pcb->boaros_loopback;
+#endif
         address_export(socket, &pcb->local_ip, pcb->local_port, &socket->saved_local);
         address_export(socket, &pcb->remote_ip, pcb->remote_port, &socket->saved_peer);
     }
@@ -2951,6 +3023,9 @@ static err_t socket_tcp_accepted(void *context, struct tcp_pcb *pcb,
     if (child->nodelay) tcp_nagle_disable(pcb);
     pcb->boaros_cork = child->cork;
     child->connected = 1U;
+#if BOAROS_USER_SMP
+    child->tcp_loopback=pcb->boaros_loopback;
+#endif
     address_export(child, &pcb->local_ip, pcb->local_port, &child->saved_local);
     address_export(child, &pcb->remote_ip, pcb->remote_port, &child->saved_peer);
     kernel_wait_queue_init(&child->wait);kernel_wait_queue_init(&child->async_events);
@@ -4393,10 +4468,6 @@ uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request, i
     if (partial) packet->consumed += partial;
     if (socket->rx_bytes < charge) __builtin_trap();
     socket->rx_bytes -= charge;
-#if BOAROS_USER_SMP
-    if (retired && request->datagram && udp4_output_socket(socket) && !retired->loopback)
-        socket->udp_rx_drained = !socket->packets_head;
-#endif
     if (kernel_socket_is_tcp(socket)) socket->receive_sequence += charge;
     if (!peek && request->datagram && (socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK ||
         socket->domain==KERNEL_SOCKET_DOMAIN_PACKET)) {
@@ -4413,6 +4484,9 @@ uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request, i
     if(charge && socket->type==SOCKET_STREAM && socket->peer)wake_socket(socket->peer);
     if (socket->domain == KERNEL_SOCKET_DOMAIN_INET) {
         int needs_reap=!socket->receive_credit && !socket->retired_head;
+#if BOAROS_USER_SMP
+        uint32_t old_credit = socket->receive_credit;
+#endif
         if (socket->receive_credit > UINT32_MAX - bytes) __builtin_trap();
         if (!peek && !request->datagram) socket->receive_credit += bytes;
         if (retired && (!boaros_lwip_parallel_enabled() ||
@@ -4424,6 +4498,18 @@ uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request, i
         }
         /* Only consumption owns work here. tcp_recved sends its own window
          * update; a peek, failed copy or zero-byte read creates no credit. */
+#if BOAROS_USER_SMP
+        if (kernel_socket_is_tcp(socket) && !socket->tcp_loopback && tcp_socket_cpu(socket)) {
+            uint32_t threshold = socket->rx_limit / 4U;
+            if (threshold > 8192U) threshold = 8192U;
+            if (!threshold) threshold = 1U;
+            /* Coalesce partial reads. When the input queue drains, no
+             * subsequent read is guaranteed to return the remaining credit. */
+            needs_reap = !peek && bytes && (!socket->packets_head ||
+                socket->receive_retry ||
+                (old_credit < threshold && socket->receive_credit >= threshold));
+        }
+#endif
         if (needs_reap && (socket->receive_credit || socket->retired_head)) {
             /* Publish the first retirement before clearing the request. Stop
              * drains both under the endpoint lock; callbacks must see neither lock. */
@@ -4940,12 +5026,6 @@ int kernel_socket_packet_prepare(struct kernel_socket_write_request *request,
                 request->destination=&request->inet_destination;
             }
             request->payload_size=count;request->flags=flags;
-#if BOAROS_USER_SMP
-            if (udp4_output_socket(socket)) {
-                request->udp_rx_drained=socket->udp_rx_drained;
-                socket->udp_rx_drained=0;
-            }
-#endif
         } else if (socket->domain==KERNEL_SOCKET_DOMAIN_NETLINK || socket->domain==KERNEL_SOCKET_DOMAIN_PACKET) {
             socket_write_begin(request,pin_owner,0);
             request->payload_size=count;request->flags=flags;
@@ -5529,6 +5609,9 @@ static void stream_commit_owned(struct kernel_socket_write_request **requests, u
     struct kernel_socket *socket=requests[0]->socket;
     uint32_t reserved=0;
     int flush=0;
+#if BOAROS_USER_SMP
+    int reap=0;
+#endif
     /* 预约在输出前仍计入远端可接纳额度；协议 owner 读实际 PCB 额度时，
      * 已处理请求的预约不再重复扣减。 */
     for(unsigned i=0;i<count;i++) {
@@ -5542,6 +5625,9 @@ static void stream_commit_owned(struct kernel_socket_write_request **requests, u
     {
         SOCKET_ENDPOINT(endpoint,socket);
         uint32_t previous=tcp_admission_capacity_locked(socket);
+#if BOAROS_USER_SMP
+        reap=!socket->tcp_loopback && socket->receive_credit!=0;
+#endif
         tcp_publish_capacity_locked(socket);
         if(socket->tx_reserved<reserved)__builtin_trap();
         socket->tx_reserved-=reserved;
@@ -5569,7 +5655,13 @@ static void stream_commit_owned(struct kernel_socket_write_request **requests, u
     if(flush && defer_output)socket_schedule(socket,SOCKET_WORK_OUTPUT);
     /* caller可立即归还请求栈；出包只借用协议scope固定的socket，不再访问requests。
      * 同一次服务仍完成原输出预算，最后close须等这份协议资格归还。 */
-    if(flush && !defer_output)tcp_flush_output(socket);
+    if(flush && !defer_output) {
+#if BOAROS_USER_SMP
+        if (reap && boaros_lwip_parallel_enabled())
+            retire_received(socket);
+#endif
+        tcp_flush_output(socket);
+    }
 }
 
 /* Each send already owns a copied PBUF_RAM. Keep the private buffers in
@@ -5775,13 +5867,30 @@ static int udp4_try_resolved(struct kernel_socket_write_request *request)
     int result=DATAGRAM_REQUIRES_WORKER;
     if (route.ip.generation==boaros_lwip_ipv4_path_generation()) {
         struct pbuf *payload=request->protocol_payload;
-        int error=lwip_error(boaros_udp4_output_resolved(&route,payload));
+        uint8_t *batch=request->udp_batch_interface;
+        uint8_t index=0;
+        if (batch && route.ip.interface->boaros_link_flush)
+            index=netif_get_index(route.ip.interface);
+        if (batch && *batch && *batch!=index) {
+            kernel_socket_datagram_flush(*batch);
+            *batch=0;
+        }
+        int more=index && (request->flags & KERNEL_SOCKET_IO_MORE);
+        int error=lwip_error(boaros_udp4_output_resolved(&route,payload,more));
+        if (!error && index) *batch=more?index:0;
         request->protocol_payload=NULL;
         kernel_socket_pbuf_free(payload);
         result=error ? error : (int)request->payload_size;
     }
     udp4_end_output(request);
     return result;
+}
+
+void kernel_socket_datagram_flush(uint8_t interface_index)
+{
+    BOAROS_LWIP_IP_SCOPE(ip);
+    struct netif *interface=netif_get_by_index(interface_index);
+    if (interface && interface->boaros_link_flush) interface->boaros_link_flush(interface);
 }
 
 static int datagram_try_caller(struct kernel_socket_write_request *request)
@@ -5791,11 +5900,13 @@ static int datagram_try_caller(struct kernel_socket_write_request *request)
         !boaros_lwip_parallel_enabled())
         return DATAGRAM_REQUIRES_WORKER;
 
-    /* Keep the response to an isolated receive on the normal path. An
-     * outbound burst or a reader with packets left can use the snapshot. */
-    if (!request->udp_rx_drained) {
-        int cached=udp4_try_resolved(request);
-        if (cached!=DATAGRAM_REQUIRES_WORKER) return cached;
+    int cached=udp4_try_resolved(request);
+    if (cached!=DATAGRAM_REQUIRES_WORKER) return cached;
+    if (request->udp_batch_interface && *request->udp_batch_interface) {
+        /* The next datagram may use a different route or block on the
+         * protocol owner. Submit the already admitted prefix first. */
+        kernel_socket_datagram_flush(*request->udp_batch_interface);
+        *request->udp_batch_interface=0;
     }
     if (!kernel_cpu_current()->logical_id ||
         !__atomic_load_n(&protocol_mutex_initialized,__ATOMIC_ACQUIRE))
@@ -5856,9 +5967,10 @@ static int protocol_request(struct kernel_socket_write_request *request,enum soc
             if (admit) {
                 if (operation == SOCKET_PROTOCOL_STREAM) COST_ADD(TCP_STREAM_INLINE, 1);
                 int result;
-                if (operation==SOCKET_PROTOCOL_STREAM && kernel_cpu_current()->logical_id!=cpu) {
-                    /* The shard lock owns the COPY transaction, not the CPU.
-                     * Queue only output work; no request or user pin escapes. */
+                if (operation==SOCKET_PROTOCOL_STREAM && request->socket->tcp &&
+                    request->socket->tcp->boaros_loopback && kernel_cpu_current()->logical_id!=cpu) {
+                    /* Keep traffic already paired with this shard local.
+                     * The caller can still copy while holding its qualification. */
                     stream_commit_owned(&request,1,1);
                     result=request->result;
                 } else result=execute_protocol_request(request);
@@ -6130,6 +6242,9 @@ int kernel_socket_set_option(struct kernel_socket *socket,
         limit *= 2;
         if (limit < minimum) limit = minimum;
         SOCKET_ENDPOINT(state,socket);
+#if BOAROS_USER_SMP
+        uint32_t previous_receive_limit=socket->rx_limit;
+#endif
         if (send) socket->tx_limit = limit;
         else {
             socket->rx_limit = limit;
@@ -6137,8 +6252,15 @@ int kernel_socket_set_option(struct kernel_socket *socket,
         }
         wake_socket(socket);
         socket_state_release(&state);
-        if (option==KERNEL_SOCKET_RCVBUF && tcp && socket->tcp)
+        if (option==KERNEL_SOCKET_RCVBUF && tcp && socket->tcp) {
             tcp_set_receive_limit(socket->tcp,limit);
+#if BOAROS_USER_SMP
+            /* Readers use the previous watermark to decide whether work
+             * has been queued. Drain that credit before releasing the PCB. */
+            if (limit<previous_receive_limit && tcp_socket_cpu(socket) && !socket->tcp_loopback)
+                retire_received(socket);
+#endif
+        }
         if (tcp) kernel_socket_protocol_leave(&protocol);
         return 0;
     }
@@ -7146,28 +7268,8 @@ static unsigned tcp_owner_receive_batch(struct socket_tcp_owner *owner,unsigned 
 static void tcp_owner_receive_before_wait(struct socket_tcp_owner *owner)
 {
     if (caller_owns_protocol()) return;
-    struct kernel_socket_protocol_scope scope;
-#if BOAROS_COST_DIAGNOSTICS
-    uint64_t locking=kernel_cost_clock();
-#endif
-    if (!tcp_owner_lock(&scope,owner,1)) return;
-    struct kernel_wait_cursor wake={0};
-    if (!tcp_owner_stopping(owner) && !network_is_stopping()) {
-        /* Process one FIFO prefix under the shard lock. The worker retains
-         * responsibility for the suffix, output requests and timers. */
-        struct kernel_socket *ack_socket=NULL;
-        owner->ack_waiter=&ack_socket;
-        unsigned count=tcp_owner_receive_batch(owner,TCP_RX_BATCH,0
-#if BOAROS_COST_DIAGNOSTICS
-                                               ,locking,kernel_cost_clock()
-#endif
-                                              );
-        owner->ack_waiter=NULL;
-        if (count) COST_ADD(TCP_INPUT_WAIT_ASSIST,count);
-        tcp_prepare_ack_wake(ack_socket,&wake);
-    }
-    kernel_socket_protocol_leave(&scope);
-    tcp_wake_ack_waiters(&wake);
+    unsigned count=tcp_try_receive_prefix(owner);
+    if (count) COST_ADD(TCP_INPUT_WAIT_ASSIST,count);
 }
 
 static uint64_t tcp_owner_deadline(void)

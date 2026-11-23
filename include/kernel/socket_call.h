@@ -19,6 +19,9 @@ struct kernel_socket_call {
     struct kernel_uaccess_iov_snapshot *iov_snapshot;
     uint32_t reserved_fd;
     unsigned fd_reserved;
+#if BOAROS_USER_SMP
+    uint8_t udp_batch_interface;
+#endif
 };
 int kernel_socket_call_begin(struct kernel_socket_call *, struct kernel_files *, struct kernel_open_file_description **);
 /* Release one message while the enclosing socket call keeps its OFD owner. */

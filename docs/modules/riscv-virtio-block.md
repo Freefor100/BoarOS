@@ -1,205 +1,112 @@
-# RISC-V VirtIO MMIO 块设备模块
+# VirtIO 块设备与通用块层
 
-本文描述 QEMU `virt` 上同步读写与批量读写块设备路径。DTB 节点来源见[DTB 与启动内存布局模块](dtb-memory.md)，上层文件语义见[VFS 与 ext4 模块](vfs-ext4.md)。
+BoarOS 的存储栈分为上下两层：下层是跨架构共用的 VirtIO 块设备驱动（`drivers/virtio/block.c`），依托[共用 VirtIO 框架](virtio-framework.md)统一驱动 RISC-V MMIO 与 LoongArch PCI 磁盘；上层是通用块设备层（`kernel/block.c`）与块设备文件接口（`fs/block_file.c`），负责整盘与分区管理、读写锁排序、裸设备字节与直接 I/O（Direct I/O，DIO）、`ioctl` 控制及统计导出。设备树发现详见[DTB 与启动内存布局](dtb-memory.md)，文件系统语义见[VFS 与 ext4 模块](vfs-ext4.md)。
 
-## 共用块核心与 RV 适配
+---
 
-`drivers/virtio/block.c` 和 `include/kernel/virtio_block.h` 拥有请求、八槽、批量/部分
-读写、FLUSH门闩、超时、DMA借用与统计；feature/status、配置、split ring及在途
-descriptor/token由[共用VirtIO框架](virtio-framework.md)提供。transport提供
-语义寄存器访问、先于used快照的IRQ acknowledge，以及IRQ owner登记/摘除。
-MMIO 与 PCI 的总线偏移、访问宽度和 read-to-clear 差异留在各自实现；IRQ/DMA
-CPU 屏障由构建期架构操作提供，不是运行期架构 vtable。
+## 一、架构分层与多核并发模型
 
-任务可在任意 CPU 调用共同块层的读取、写入、批量/阶段写入及 FLUSH。
-设备引用和物理父盘的传输资格覆盖普通调用；长阶段写另持完整阶段保护。VirtIO 的提交者与完成中断
-共用设备短保护，FLUSH 与实际写入按原屏障协议排序。设备配置和销毁
-继续由 CPU0 的管理现场执行。`test-block-host` 的双核模型从 CPU1 检查
-分区读写、RMW、批量与阶段写入、只读、FLUSH、错误及引用归还。
+| 源码路径 | 核心职责 |
+| :--- | :--- |
+| `kernel/block.c`、`include/kernel/block.h` | 通用块设备注册表、MBR/GPT 分区扫描、两级读写锁（`phase_barrier` / `transfer_lock`）、批量与阶段写入入口、17 列块统计 |
+| `fs/block_file.c` | 裸块设备节点打开/独占声明（`O_EXCL`）、非对齐字节读写、`O_DIRECT` 与 `BLK*` 系列 `ioctl` |
+| `drivers/virtio/block.c`、`include/kernel/virtio_block.h` | VirtIO 块核心：8 请求槽、64 描述符散列-聚集（Scatter-Gather，SG）、中转区读-改-写（RMW）、`FLUSH` 屏障、优先级预留与故障诊断 |
+| `arch/riscv/virtio_mmio_block.c`、`drivers/virtio/pci_block.c` | 平台薄适配层：RISC-V PLIC 中断与 MMIO 绑定、LoongArch 现代 PCI 绑定与所有权跟踪 |
 
-RV `arch/riscv/virtio_mmio_block.c` 负责PLIC绑定，MMIO身份/版本和寄存器映射由共用adapter实现；
-旧类型和入口保留薄适配。`riscv_virtio_mmio_block_base()` 仅暴露已有 MMIO 资源
-用于 DTB IRQ 匹配。启动 fixture 可在物理别名执行，函数指针必须从实际 PC 初始化，
-不能直接使用含高地址常量的静态回调表；生产内核仍在最终地址空间构造设备。
+在多核（SMP）配置下，**任意 CPU 上的任务都可以直接调用块层的读、写、批量读写、日志阶段写入和 `FLUSH` 接口**，而设备初始化、中断处理与最终销毁由 CPU0 执行。为了兼顾高并发对齐读写与非对齐读-改-写（Read-Modify-Write，RMW）的数据一致性，通用块层在物理父盘上维护两把固定加锁顺序的可睡眠读写锁：
 
-`make test-virtio-block-host` 用相同真实块核心分别经 MMIO 和独立语义 transport
-驱动 wire 模型，覆盖反序完成、索引回绕、超时/reset、八槽与 DMA owner。
-新 transport 的测试不构成真实 PCI 验收。`test-block-riscv`、`test-root-init-riscv`、
-四组合 `test-io-sleep-riscv` 与栈检查覆盖既有 RV 路径。
+```mermaid
+flowchart LR
+    Call["任意 CPU 发起请求<br/>(整盘或分区，先持设备引用)"] --> Check{"操作类型"}
+    Check -- "普通读 / 扇区对齐写 /<br/>对齐批量写" --> SharedT["共享 transfer_lock<br/>（多核并行提交到驱动）"]
+    Check -- "日志长阶段写<br/>(write_phase)" --> SharedP["共享 phase_barrier<br/>+ 共享 transfer_lock"]
+    Check -- "非扇区对齐写<br/>(触发 RMW)" --> ExclT["独占 transfer_lock<br/>（读扇区→改字节→写回原子化）"]
+    Check -- "FLUSH / 容量或只读变更 /<br/>loop 配置修改" --> ExclAll["独占 phase_barrier（秩 50）<br/>→ 独占 transfer_lock（秩 51）"]
 
-## 发现与 transport
-
-`dtb_read_boot_info()` 收集启用的 `compatible = "virtio,mmio"` 节点，翻译父总线 `ranges` 后按物理地址排序并拒绝重叠。最终 Sv39 页表只映射实际发现的 MMIO 范围。`arch/riscv/virtio_mmio_block.c` 依次探测这些 transport：非 block device 跳过，所有成功初始化的 block device 均登记，首个成为当前根设备，其余可通过设备节点挂载；已经表明自己是 block 但 transport/feature 不受支持时准确失败，不继续扫描磁盘内容。
-
-当前同时接受 VirtIO MMIO version 1 legacy 和 version 2 modern。modern 路径要求协商 `VIRTIO_F_VERSION_1` 并检查设备回显 `FEATURES_OK`；legacy 路径使用传统 feature 寄存器和状态序列，不伪造 modern feature。驱动在两种 transport 下均探测 `VIRTIO_BLK_F_RO`（bit 5）：若设备提供只读标志（如 QEMU `readonly=on`），驱动接受该 feature 并设置 `block.write = block.write_batch = 0`；若设备可写，则安装单次和批量写回调。设备状态按各自规范推进，失败和销毁会复位设备后再回收队列页。QEMU 默认 legacy 和显式 `-global virtio-mmio.force-legacy=false` 的 modern 配置都由同一驱动验证。
-
-## 请求和 DMA
-
-请求槽、描述符、used 收割、完成通知和设备失败状态共用设备元数据保护。
-任务和 IRQ 均使用 `KERNEL_IRQ_LOCK_SCOPE`：默认 UP 关闭本地中断并禁止抢占，
-SMP 使用完整 raw 锁。保护规则见[调度模块](kernel-scheduler.md)；驱动不再在同一
-元数据保护外重复保存中断状态。等待条件检查与 PREPARED 登记在保护内完成，
-释放后再 park/finish，重新取得保护后消费结果；提前到达的完成仍由原 token 接收。
-
-请求槽、描述符、used 收割、完成状态、接纳门闩、工作槽与统计由每设备的一把 raw 短锁保护。任务提交者与 CPU0 中断使用相同规则；读任务可在发起 CPU 调用 `kernel_block_read_at/read_batch`，物理盘及分区共用调用保护、传输读写锁和单队列。等待者在设备锁内检查条件并登记，释放锁后 park/finish，再取得锁消费结果。完成者持锁到私有等待队列通知结束，远端任务随后才能归还并复用请求槽。
-
-超时或队列损坏先停止接纳，在锁内完成同步 transport reset 并确认 DMA 停止，再发布错误和通知；调用者消费结果后归还槽和工作区。配置、IRQ 登记与最终销毁仍在 CPU0 执行，销毁要求没有活动调用和工作槽借用。设备锁内只做有界队列处理和直接 DMA 地址转换，分配、释放和休眠在锁外。
-
-轮询先检查共享 used index，没有进展时不访问中断状态寄存器；真实 IRQ 总会先确认中断再收割。一次收割向每个实际完成的请求或批次通知一次，并通知描述符等待者。请求槽等原调用者消费结果后才归还，届时通知槽位等待者。空闲槽由位图索引。低优先级写在常规队列中为前台保留槽和描述符；设备只提供 4 或 8 个描述符时，按可提交一条请求所需的 3 个描述符判断，只有一个请求槽时允许使用该槽。
-
-每个在途批次独占一份 2048 字节的工作区，持有完成队列。SG 地址和长度发布到设备描述符后，同一片暂存区用于登记额外的容量等待节点。结束等待并归还游标借用后，才能准备下一组 SG。标量请求只登记自己的等待节点。
-
-阶段写入由调用者在设备锁外准备下一组不可变 span。批量读取收割 DMA 后，调用者保留请求槽直至完成 bounce 区的数据复制，其他核可以同时向设备提交。启用成本诊断时，设备分别记录请求槽、描述符和批量工作区的使用峰值、全满时间和等待。多个任务的等待时间可以重叠；同时等待当前批完成或新增容量的次数单列。
-
-通用 `kernel_block_device` 暴露容量、逻辑块大小和精确字节范围的同步读写接口（`kernel_block_read_at`/`kernel_block_write_at`），统一检查空参数、越界和整数溢出。每个主分区持有不可变的父盘引用、起始偏移和容量，自身保留软块大小与只读设置。有效只读状态包含父盘软件只读和硬件能力。通用入口先按分区容量校验，再平移一次物理偏移；整盘及全部分区共用两项可睡眠资格：普通数据读及物理扇区对齐的单次、批量和阶段写共享 `transfer_lock`；写入只要包含一个非空部分扇区范围，就独占它并持有至整个调用结束。对齐按实际父盘逻辑扇区大小和加上分区起点后的物理偏移判断，空 span 不要求独占。入口先持共享资格读取可配置的扇区大小，需要 RMW 时归还共享资格后取得独占资格，再检查容量和只读状态；独占前没有设备 I/O。字节写入口已经持有独占资格，直接调用父盘读写回调完成 RMW。长阶段写额外共享 `phase_barrier`；支持阶段生产者的驱动持续借用传输资格，允许其他对齐请求同时提交，RMW 等该有限阶段全部结束；仅同步写回调的后端在窗口之间归还传输资格；flush、容量、只读和 loop 配置修改先独占阶段保护，再独占传输锁，因而同时等待两种调用。锁序固定为调用保护在前、传输保护在后。独立的对齐读写可共同提交请求；部分扇区写与所有数据传输互斥，批量内部仍可同时持有多个驱动请求。字节 RMW 在同一资格内读取扇区在设备容量以内的完整范围、修改指定字节并写回，因此文件系统的对齐写不能插入 RMW 的读写之间。容量末尾不足一个逻辑扇区时，只读取和写回实际剩余字节；loop 的容量仍按 Linux 的 512 字节单位取整。两种 transport 共用最多 64 个描述符的 split queue，最多八个在途请求槽；按设备 QueueNumMax 向下取可用容量，至少一个槽。请求槽只持有 header/status/bounce，head 与数据描述符从队列空闲项选择，不再与槽号固定对应。普通请求使用 header、一个或多个数据描述符、status；modern 的请求区从 2048 字节开始，避开扩大后的 descriptor/available/used 区域，编译断言检查它们不重叠。FLUSH 只用两个描述符。modern 分配连续两个架构页（RV为8KiB，LA为32KiB）；当前RV legacy分配四个4KiB页（16KiB），used ring按协议4KiB对齐。每槽独立持有 header/status、512 字节 bounce、任务 owner、完成状态与等待队列；同步调用拥有槽位直到完成确认，不能在 DMA 期间复用。
-
-`kernel_block_write_batch(device, spans, count)` 接受最多 32 个 `kernel_block_span { offset, buffer, size }`。设备与逻辑块大小必须有效，至少具有单写或批量写回调；缺少写回调返回 UNSUPPORTED；设备被设为只读后，非空写返回 READ_ONLY。通用层在任何写入前检查所有 span 的容量、指针范围和非空字节区间重叠；非空 span 之间重叠返回 INVALID。有效可写设备上的 `count == 0` 可以传空 spans，成功且不调用驱动；空 span 可以传空 buffer，但 offset 仍须不超过容量，全部为空也不调用驱动。可选 `device.write_batch` 一次接收原 span 数组，可能含空项；没有回调时跳过空项、按输入顺序调用单写，遇到首个错误即停止。它保留实际失败状态，不承诺整批原子性或自动 flush；已完成的写不会回滚，调用方须保持所有非空 buffer 有效直到函数返回。
-
-journal 内部的 `kernel_block_write_phase()` 先检查整阶段的容量、对齐和 RAM 边界，再把同一个不可变生产者直接交给支持阶段提交的驱动。分区适配只平移每段偏移，不重新构建描述符批次。VirtIO 按设备段数、段长和队列容量形成请求；一个请求完成后即补入后续数据，无需每 128 KiB 等待整批 DMA 排空。整个阶段持续持有共享传输资格，允许其他对齐读写提交；RMW、flush 和 loop offset／capacity 修改等该阶段全部结束。只有同步写回调的后端使用有界窗口并在窗口之间归还传输资格；有批量回调时每窗口提交一次。loop 使用这条路径，其后备文件 worker 在窗口之间继续处理已排队的读取，不把整个日志阶段串行占在一次 loop 请求里。错误停止后续提交，驱动完成或停止所有已提交 DMA 后才返回；生产者和稳定版本到实际返回才归还。范围不重叠由 journal 的块所有权保证，公共批量接口的检查保持原语义。
-
-`kernel_block_read_batch(device, spans, count, completion)` 同样最多 32 项，在发布前检查全部参数。
-分区偏移转换保留原批次，1～4 项使用独立小栈帧，5～32 项进入独立大帧；不使用运行期长度数组，也不把最大向量留在小请求的调用栈上。转换后的描述符由该调用持有到实际完成，读回调仍得到调用者原来的分区相对偏移与描述符。
-读 span 提供可写 buffer、已完成字节前缀和独立状态；磁盘范围可以重叠，但目标内存
-必须彼此及与描述符数组分离。预检失败不发布任何请求，未执行项保留 NOT_SUBMITTED。
-没有批量回调时按顺序执行全部标量读，保存每项结果；返回输入顺序中首个错误。
-VirtIO 批量读支持 direct DMA 与逐扇区 bounce；一个 span 出错不会取消其他独立 span，
-失败 span 只承诺其 completed 前缀。调用返回前必须排空所有已发布 DMA，或确认 reset。
-读取消同样不能提前归还目标内存；成功完成的部分不会因别的请求超时而改写为失败。
-
-单个扇区对齐、可由一个直接 DMA 段完成且不超过设备段长限制的读 span，直接取得一个高优先级请求槽，使用该请求原有的完成队列；不占用批量工作区，也不建立第二份成员进度。最终结果由同步返回交付，错误或 modern 短 used 长度保留零完成前缀，DMA 实际结束后才归还请求。多 span、非连续目标、非对齐和较大读取仍使用下面的 SG/bounce 过程。
-
-批量调用独占的工作槽保存成员进度和完成等待队列。提交时按段记录 DMA 地址与长度，写入设备描述符后即可复用这部分空间。批次同时等待完成和容量时，第二个登记节点使用该空间，等 wait_finish 归还节点借用后才准备下一批 SG 段。每槽 2048 字节，设备初始化按实际请求槽数保留工作区并紧凑放入普通架构页；八槽设备在 RV 上额外保留四个 4 KiB 页，在 16 KiB 页架构上保留一页。这些元数据不保存数据内容，也不参与 DMA。工作槽耗尽时在 workspaces 队列等待归还，不重新分配页，保证脏页回收在空闲页耗尽时仍能提交批量 I/O。调用消费全部完成或确认 reset 后才归还工作槽，销毁时统一释放保留页；初始化中途分配失败也先 reset 再回收已有页。单项和多项调用共用预留工作槽，不在单项分支保留完整 SG 段表。VFS 读取按实际页数准备描述，跨窗口复用；文件系统块适配的单项描述使用标量，多项按实际数量准备。无日志 lwext4 写回由原 direct owner 持有共同的字节描述符；全量预检后临时加入文件系统分区偏移，跨 adapter 直接借给块层，全部 DMA 结束后恢复相对偏移供缓存更新和失败映射修复使用。写批次在既有工作槽中一次建立磁盘顺序，相邻项沿后继合并；已有顺序的输入直接接到链尾，读取保留可重叠范围的查找规则。批量描述不能沿调用链反复叠放满容量数组。固定 COST 写负载同时检查完成后的任务栈余量。
-
-VirtIO 将发布、通知、等待和收割分开。同一 batch 将磁盘连续、扇区对齐且能直接 DMA 的多个 span 组成一个 SG 请求，各 span 保留独立的数据描述符，无需搬到连续内存；32 个独立 4 KiB 页可组成一个 128 KiB 请求，其完整链为 header、32 个数据描述符、status，共 34 项。设备 QueueNumMax 较小时向下选择队列容量并拆成多条请求；协商 SIZE_MAX/SEG_MAX 时读取对应上限，将每个数据描述符按整扇区截断，并限制每条链的数据段数。一个 span 可由多段描述符承载，其 completed 只在所属请求完成后推进。每个请求不超过 128 KiB，并受空闲描述符限制；请求槽维持八个，队列扩大不增加请求槽或 bounce。磁盘不连续的 span 在同一轮发布多个请求，然后只通知队列一次。请求可以乱序完成，并在其他调用释放槽或描述符后继续补发；不要求先凑齐整批资源。一个 SG 请求的成员共用设备完成状态，读失败时各成员保留此前已确认的 completed 前缀。每个请求保留独立的 I/O context、期限、状态、DMA buffer 和成本身份。batch 只占一个逻辑调用 owner，`active` 统计逻辑调用数，共用队列的 `inflight` 是已经发布的请求数的唯一计数；释放某个槽不会提前释放整批 owner。不同字节区间仍可能落在同一物理扇区，因此本批内涉及同扇区的 span 按输入顺序串行推进读改写，其他 span 可并发；不会因两个独立 bounce 快照覆盖相邻字节。
-
-## 用户态块设备
-
-文件后备loop为每个绑定保留独立worker，避免上层文件系统持锁时在同一调用栈
-取得后备文件锁。标量、批量及journal阶段请求均由原调用者持有至完成；一批描述符
-只交接一次，worker经过真实后备OFD访问VFS／页缓存。批量读逐项保存完成字节与
-错误，短后备文件不阻止后续独立范围读取；写入在首个错误后停止。结果随同步返回
-交付，调用者的提前完成回调不转移到worker执行。原FD关闭或文件unlink不改变绑定，
-flush仍同步实际后备对象，解绑与自动清理沿设备使用者和在途请求归还后推进。
-
-块设备节点按真实 `st_rdev` 查找登记设备，普通打开建立独立的 block OFD，保留设备节点路径与设备引用，不进入普通文件页缓存。read/write/readv/writev 支持非扇区对齐的字节范围；pread/pwrite 不修改共享偏移，dup/fork 别名共同持有同一偏移和设备打开引用。读取容量末尾返回 0，跨末尾写返回可容纳的前缀，末尾开始的非空写返回 ENOSPC；lseek 仅允许设备容量以内的位置。普通打开可以与挂载或独占打开并存，`O_EXCL` 与挂载 claim 竞争同一个独占 owner。设备、挂载、OFD 和请求引用全部释放后才能注销。
-
-块节点打开先按调用者 fs IDs 和节点权限判断，已打开 OFD 保留原读写权利。`BLKROSET`、`BLKBSZSET`、`BLKFLSBUF` 在读取用户参数之前检查当前调用者的 CAP_SYS_ADMIN，缺少时按固定 Linux 返回 EACCES。loop 的 SET_STATUS/SET_STATUS64/SET_CAPACITY 则允许“原 OFD 有写打开权利”或 CAP_SYS_ADMIN；两者都没有时为 EPERM。绑定、解绑和 control 操作继续按具体设备打开及操作规则处理。
-
-`O_DIRECT` 可以在块设备打开时指定，也可以通过 `F_SETFL` 在共享打开文件描述（OFD）
-上切换。一次读写或 splice 使用同一份状态标志。用户读写的偏移、有效总长度以及每个非空
-iovec 的地址和长度按设备逻辑扇区对齐。有效请求每次最多提交一个架构页，经过临时内核
-缓冲区完成用户复制和设备传输。用户源缺页时只提交已复制的完整扇区，保留设备确认的
-前缀。`O_SYNC`、`O_DSYNC` 和显式同步操作可以请求设备持久化。
-
-普通和 direct 块设备 FD 共用无页缓存的块层路径和传输锁。loop 上的 direct 块设备
-FD 仍按后备普通文件的文件系统规则读写。`O_DIRECT` 的块设备支持范围是未挂载设备，
-已挂载文件系统独立管理其缓存。普通文件支持情况见[文件模块](kernel-files.md)。
-
-系统文件系统（sysfs）在挂载时从块设备登记表取得快照，沿用设备临时文件系统
-（devtmpfs）的设备命名，并在 `/sys/block/<整盘>/queue/` 导出 `logical_block_size`
-和 `dma_alignment`。分区沿用父盘队列，设备借用在复制属性后归还。设备目录和队列属性
-反映挂载时的登记状态。对于已登记的块设备，`statx` 在请求 `STATX_DIOALIGN` 时按实际设备报告直接
-输入输出（Direct I/O，DIO）的内存地址和偏移对齐。当前用户读写统一按逻辑扇区对齐，
-因此这两个值为逻辑扇区大小，队列的 `dma_alignment` 对齐掩码为该值减一。
-
-`/sys/block/<整盘>/stat` 和 `/sys/block/<整盘>/<分区>/stat` 通过实际设备编号及
-登记代次采样。文件内容在第一次读取或回到偏移零时生成，旧视图不会延长设备寿命。
-设备撤下或以相同编号重新登记后，从旧视图取得新快照返回 `ENODEV`。
-
-统计按 Linux 的 17 列格式输出。一次单段提交、驱动批次或日志写入阶段分别形成一个
-块层完成边界。整盘包含其分区发出的请求，设备同步 `FLUSH` 只记入整盘。数据量以
-512 字节扇区为单位，批量读按驱动报告的完成量统计。批量写驱动返回整体错误时，
-块层记录本次完成及耗时，成功扇区只来自有确定结果的提交。已经发出的请求失败时仍计入
-完成次数。忙时长按真实请求开始与完成的单调时钟采样，以毫秒统计。合并和丢弃列为零，
-块层当前没有对应的独立请求事件。
-
-`FILE_IO_HOST_TCP=0 FILE_IO_BLOCK_ONLY=1 sh tests/host/file-io-concurrency.sh` 检查
-对齐、故障前缀和 splice 中途切换状态标志。`tests/userland/direct-block.py` 运行
-`tests/workloads/io/direct-block.c` 的静态 ELF，使用私有 VirtIO 盘和 loop 设备。
-同一 ELF 可以接受 Linux 上未挂载的私有块设备路径，检查对齐、盘尾截断和共享 OFD。
-
-块设备 ioctl 支持 `BLKGETSIZE`（512 字节扇区数）、`BLKGETSIZE64`（字节数）、`BLKSSZGET`、`BLKROGET/SET`、`BLKBSZGET/SET` 和 `BLKFLSBUF`。软件块大小是设备共享状态，只接受不小于逻辑扇区、介于 512 和架构页大小之间的 2 的幂；设置时需要已有独占资格或临时 claim。只读状态下仍允许以 `O_WRONLY/O_RDWR` 打开；新旧 OFD 的实际写入均返回 EPERM。fsync、fdatasync、`O_SYNC/O_DSYNC` 和 `BLKFLSBUF` 调用同一真实设备 flush；`BLKFLSBUF` 先持有挂载根路径并同步该设备上的文件系统，将缓存的文件数据和元数据交给设备。错误如实返回。没有裸设备缓存需要清除。mmap、discard、secure discard 和 zeroout 当前明确不支持。
-
-`kernel_block_flush()` 表示设备持久化边界。块设备显式声明 UNKNOWN、WRITETHROUGH 或 WRITEBACK；未知能力且没有 flush 回调返回 UNSUPPORTED，只有声明 write-through 的设备可以省略 flush。VirtIO 协商 `VIRTIO_BLK_F_FLUSH`（bit 9），发送独立的 type 4 请求，只有 header/status 两个描述符，不带数据。未协商 CONFIG_WCE，因此 FLUSH 存在表示 writeback，缺失表示 write-through；驱动不修改缓存模式。该规则依据固定 Linux `references/linux/drivers/block/virtio_blk.c` 的 `virtblk_get_cache_mode()`（`f4cdf7ca9a1fdcca413157df19753f388a5a224e`）与 QEMU `references/qemu/hw/block/virtio-blk.c`（v11.1.0，`84f07211cc5b4fc6a371559bf8a5de4fb068e648`）。设备错误和超时保持所属状态，flush 请求单独计数。
-
-此后端限定于 QEMU 同步 MMIO reset：写零后必须读回零，才能把借用的 DMA buffer 还给调用方或释放队列；违反该平台契约触发 fatal，普通请求超时在成功 reset 后仍返回 TIMEOUT。异步 reset 的实板需要独立的 DMA owner/完成协议，不能直接套用此检查。块 flush 不代表上层已实现 fsync、日志或崩溃恢复。
-
-reset 停止 DMA 的依据是固定 `references/qemu/hw/virtio/virtio-mmio.c` 的 `virtio_mmio_soft_reset()`/STATUS 写入路径，以及 `references/qemu/hw/block/virtio-blk.c` 的 `virtio_blk_reset()` 中 `blk_drain()`；版本为 v11.1.0，commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`。
-
-扇区对齐且位于 direct map 的目标缓冲区直接作为 DMA 地址，连续多扇区合并成一个请求；写入请求使用 `VIRTIO_BLOCK_REQUEST_OUT` 且数据描述符不设 `VIRTQ_DESC_WRITE`。非整扇区写入通过 bounce buffer 执行读-改-写（Read-Modify-Write）：先读出包含该范围的完整扇区，将修改字节合并到 bounce buffer，再将该扇区写回磁盘。启动阶段显式轮询；生产调度启用后，PLIC IRQ 先确认设备中断，再读取 used ring 并唤醒任务，使确认期间的新完成保留通知。轮询和期限唤醒都先收割已发布完成，再判定请求超时；期限唤醒只做一次收割，运行期不连续轮询。单次和批量调用在等待前都先收割 used；登记等待期间若发现 DMA 已完成而 IRQ 尚未处理，也经同一完成校验路径更新 request 状态，再决定是否 park。设备已完成的调用不增加 sleeps；没有新完成时仍阻塞，不建立运行期轮询。运行期满槽和设备等待均不可中断地睡眠，idle/IRQ 提交会 fatal，不能退回忙等。普通读写从请求发布起使用 DTB timebase 的30秒期限；到期仍无完成时停止提交并 reset，确认 DMA 停止后统一完成未完成请求，设备保持失败态，不自动重试写。FLUSH 则每30秒检查一次：仍未完成时输出等待提示并延长检查期限，保持同一个已发布请求、DMA owner 和软件屏障，直到设备返回真实结果；不重复发送、不复位、不将等待当作持久化成功。后备文件同步没有固定完成上限，永久不响应的 FLUSH 也会持续等待，提示用于区分这类停滞。设备返回 IOERR 或 UNSUPP 仍交付对应错误。IRQ 与期限检查在同一元数据保护内仲裁，完成、唤醒和槽归还各一次。固定 Linux 的 `references/linux/block/blk-mq.c` 在驱动未提供 timeout 回调时重新启动请求计时器；`references/linux/drivers/block/virtio_blk.c` 未注册该回调，因此不能将其默认30秒期限解释为到期立即复位。
-
-完成通知与资源归还分开：每个请求或批次等待自己的完成队列；DMA 完成只归还描述符并通知完成 owner，请求结果消费后才归还请求槽。普通调用入场、flush 等待逻辑调用排空、描述符、请求槽和批量工作区分别等待对应条件。只有 active 降到零才通知 flush，屏障结束后才放行普通调用。仍有在途请求又需要补发的批次，同时登记自己的完成和缺少的资源，不等无关的设备广播。故障确认 reset 后通知所有终止条件，也通知同轮先完成但尚未消费的 owner。
-
-批量读在调用任务即将继续等待时报告已完成 span；整批排空直接返回结果，不再逐项补发通知。同一 SG 链内的页一起完成。该 span 的全部 DMA 返回后才报告，回调后不再改写其 payload。描述、回调 context 和整批 buffer 的借用仍持续到同步调用返回。单个 span 的错误或提前可用不会释放其他在途资源。
-
-flush 先阻止新逻辑调用并排空此前逻辑调用，再发送 FLUSH，完成后才放行后续调用；已入场的 batch 在 flush 等待期间仍可补发余下 span，避免屏障与未发布项互锁。无 FLUSH 特性的 write-through 同样经过软件排空屏障。batch 收到一个错误后停止发布所有剩余项，包含已读入 bounce 但尚未写出的 RMW；已发布 DMA 继续收割，或在期限到达时 reset 并确认 DMA 停止，最后才返回实际失败。取消和信号不会中断内部等待或提前归还 buffer。普通构建记录提交数、实际最大已发布在途数、IRQ、完成等待睡眠/唤醒、队列等待及错误，不把已预留但未发布槽计入在途。仅 `BOAROS_COST_DIAGNOSTICS=1` 累计在途深度积分（inflight-ticks，单位 深度·tick）、忙时、总时间、队列等待与服务时间，销毁时将这些时间写入最终统计；普通构建不为这类统计读取时钟，相关字段保持零。请求期限仍在所有构建中正常检查。
-
-PLIC 路由由 `dtb_read_irq_info()` 根据 CPU interrupt-controller phandle、启动 hart 的 supervisor cause 9 和 VirtIO interrupt-parent 关联；不硬编码 IRQ/context 编号。外部中断执行 claim、设备分派/ack、complete；IRQ 不分配或做文件清理。设备允许 CPU0/CPU1 调用者同时等待，由 CPU0 处理设备中断。当前验证覆盖 QEMU 一致 DMA；实板、IOMMU 和非一致 DMA 由相应平台验证。
-
-完成队列的冷路径诊断在 reset 前输出 `block queue fault`：used 快照与消费差值超过槽容量为 `used-overflow`；完成项的描述符 head 超出队列范围、指向数据/status 描述符为 `used-element`；legacy 的零长度完成同样被拒绝；指向未发布 head、重复 head 或非 submitted 请求为 `slot-state`；设备 status 超出 OK/IOERR/UNSUPP 为 `device-status`。输出包含 transport context/device status、中断快照、transport、队列虚拟/物理地址及容量，used、consumed、avail、入口观察到的完成数，逻辑调用/在途数和 reserved/published/complete 槽数；每个固定槽记录 state、owner/completion 指针值、status、type、字节数、扇区与期限。只读取驱动持有的 transport、队列和最多八个固定槽，不追 owner/completion 或设备提供的描述符地址，不分配、不增加重试。used 是触发校验的快照，consumed 包含已经取出的非法项，avail/status 是打印期间的标量；它不是跨 DMA 的原子快照。modern IN 只有 used length 覆盖全部数据和末尾 status、且 status 成功时才交付数据；零长和其他短完成直接使该请求返回 I/O 错误，不读取未覆盖的 status，不补零，也不因此复位整台设备。合法 used 已结束本次 DMA，完成 owner 照常归还，后续请求仍可执行。legacy 保留现有长度兼容范围。正常完成、短完成和普通 IOERR/UNSUPP 不输出这段诊断，其他损坏的 reset 与 owner 回收契约不变。重复完成若发生在本次合法完成已收割之后，设备仍失败，但不会覆写已完成请求的真实结果。
-
-普通读写的纯超时也在reset前输出同一快照，原因为`timeout`，不附带不存在的非法完成项。
-这覆盖设备停止推进、used仍然合法的路径：固定QEMU的`virtio_error()`会将设备置为
-broken，legacy又不会发布modern的NEEDS_RESET状态，原先只有一行超时信息就reset会
-丢掉关键现场。新增输出仍返回TIMEOUT，且reset确认之前保留所有DMA owner；它用于
-定位停滞的设备与请求，不会仅凭超时判断是哪种设备故障或内存破坏。
-
-split ring 使用协议规定的自然对齐布局，available/used 的 16 位 index 必须以单次半字指令访问，不能使用使编译器拆成字节访问的 `packed`。例如 `0x00ff → 0x0100` 的字节写可能先暴露 `0x0000`；设备会把反向跳变当作大量待处理 head，重复消费并触发 `Virtqueue size exceeded`。单 hart 关中断不能阻止设备并行访问，写后的 fence 也不能消除已暴露的中间值。既有发布/收割屏障仍保留。布局与对齐由编译断言保护，RV64 访问宽度由聚焦测试核对；固定依据为 `references/linux/include/uapi/linux/virtio_ring.h` 和 QEMU v11.1.0 的 `references/qemu/hw/virtio/virtio.c`。
-
-## 验证
-
-```sh
-make test-block-riscv
-make test-block-host
-python3 -B tests/host/virtio_block_diagnostics.py
-make test-io-sleep-riscv
-# 聚焦一个代表配置；不替代默认四组合验收。
-BLOCK_TEST_TRANSPORT=modern BLOCK_TEST_CACHE=writeback make test-block-riscv
-python3 -B tests/riscv/io-sleep.py --kernel build/riscv/tests/kernel-io-sleep-rv --transport modern
+    SharedT --> DrvLock["VirtIO 驱动短锁 metadata<br/>（仅保护队列、位图与完成状态；锁外拷贝/分配/休眠）"]
+    SharedP --> DrvLock
+    ExclT --> DrvLock
+    ExclAll --> DrvLock
 ```
 
-测试使用真实 QEMU raw disk，分别以默认 legacy 和显式 modern 配置覆盖 feature/status negotiation、批量 direct DMA、非对齐 bounce、容量边界、超时/错误统计和队列页回收。默认无块设备的生产内核仍可进入 timer idle；挂入两种 transport 的根盘时由根启动测试继续消费本模块。
+- **分区与父盘共享锁**：主分区与 GPT 分区（每盘最多 15 个，设备号主号 `252`，名称 `vd[a..][1..15]`；回环设备主号 `7`，名称 `loopN`）保存不可变的父盘引用、起始偏移和容量。入口先按分区容量校验，再将偏移平移一次到物理父盘，并根据**平移后的物理偏移和物理父盘逻辑扇区大小**决定是否需要 RMW。
+- **动态升级无死锁**：对齐判断在持有共享 `transfer_lock` 时读取可配置的逻辑扇区大小；若发现包含任意非空非对齐区间，先释放共享锁再获取独占 `transfer_lock`，随后重新核对容量与只读状态，确保独占前不产生设备 I/O。
 
-块测试将两个 transport 分别与 writeback/writethrough 组合，检查协商结果、flush 完成与独立统计，并覆盖单批八个 direct DMA、32 个物理不连续 4 KiB 页组成的 128 KiB SG 读写（每方向恰好一条请求、页间 canary 与资源归还）、非对齐相邻字节/跨扇区的 RMW 回读及只读拒绝。host 测试检查未知能力拒绝和错误传播，以及 batch 的整批预检、零项、重叠、32 项边界、顺序回退和可选回调；`tests/host/block_registry.c` 检查稳定设备号查找、重复登记拒绝、跨设备独立 claim、同设备重复 claim 拒绝及 claim 释放后注销；`tests/host/block_file_cases.h` 通过真实 files/OFD、MM 用户复制和内核睡眠锁检查裸设备字节/向量/定位 I/O、dup/fork 共享偏移、容量边界、ioctl、只读、flush 错误及最终引用归还；`tests/host/block_fault.c` 提供以文件为稳定镜像、以内存为易失缓存的 512 字节原子写模型，可选择持久化任意事件、丢弃未同步写、注入 write/flush 失败。模型自测不是文件系统恢复验收。
+---
 
-`virtio_block_diagnostics.py` 仅在临时副本中将 RISC-V fence/time 指令替换为宿主 fence/受控时钟，编译实际驱动其余代码。legacy/modern 的 literal split-ring 反例检查上述四种错误分类、reset 前字段、非法指针值不被追踪、真实返回状态、一次发布及最终队列回收；正常完成与普通设备错误检查无诊断输出。它不验证真实 DMA 顺序、中断时序或 QEMU 完成行为。
+## 二、VirtIO 块驱动核心设计
 
-无完成反例验证timeout快照先于reset、返回值仍为TIMEOUT；独立设备侧计数模型在每种
-transport执行65544次请求，覆盖八槽复用、反序完成、重复IRQ及16位索引绕回，检查
-已发布head不重复、在途不超过八条且最终归零。它没有重现历史QEMU告警，不能证明
-所有设备交错都安全。真实NBD的八槽超时用例另检查reset前已记录全部在途槽和队列计数。
+### 2.1 设备发现、特性协商与内存布局
 
-请求、扇区与 direct/bounce 计数提供当前结构计数；QEMU 功能测试不能证明 VisionFive 2 上的吞吐、延迟、cache coherency 或 CPU 忙等成本。开发板接入后需要用相同镜像分别记录冷启动读量、周期、吞吐和 CPU 占用，再决定请求合并深度、队列并行度及 IRQ 唤醒优先级。
+- **发现与传输**：RISC-V 平台从设备树（DTB）收集所有 `compatible = "virtio,mmio"` 节点，按物理地址排序并拒绝重叠，成功初始化的块设备全部登记（首个为根盘）。同时支持 Legacy v1 与 Modern v2 MMIO，LoongArch 平台经 Modern v2 PCI 接入。
+- **特性协商**：尝试协商只读 `VIRTIO_BLK_F_RO`（bit 5）、持久化刷新 `VIRTIO_BLK_F_FLUSH`（bit 9）、单段上限 `VIRTIO_BLK_F_SIZE_MAX`（bit 1）与最大段数 `VIRTIO_BLK_F_SEG_MAX`（bit 2）。若设备声明只读，则将写回调全部置空。驱动不协商 `CONFIG_WCE`，因此 `VIRTIO_BLK_F_FLUSH` 存在即视为回写模式（`KERNEL_BLOCK_CACHE_WRITEBACK`），缺失即视为直写模式（`KERNEL_BLOCK_CACHE_WRITETHROUGH`）。
+- **队列与请求槽布局**：
 
-`test-io-sleep-riscv` 使用 NBD 控制握手暂扣和乱序释放响应：两个不同文件冷读必须先形成两个请求，期间计算与无关缓存命中完成；八槽满队列后验证逆序完成、flush 前后顺序及超时/reset。legacy/modern × writeback/writethrough 四种配置均运行。禁用 QEMU 请求合并，避免两个相邻 guest 请求合成一个 NBD 命令掩盖门槛；不靠宿主 sleep 猜时序。失败保留 guest/server 日志和镜像。
+| 资源项 | 规格说明 |
+| :--- | :--- |
+| **分裂队列容量** | 默认 `VIRTIO_QUEUE_SIZE = 64` 项描述符；若设备 `QueueNumMax` 更小，则按 2 的幂向下取整（最小要求 4 项） |
+| **在途请求槽** | 最多 **`VIRTIO_BLOCK_REQUEST_SLOTS = 8`** 槽（`slot_count = min(queue_size / 3, 8)`），每槽步长 `768 B`，独立包含 16 字节请求头、1 字节状态、512 字节中转缓冲区（Bounce Buffer）、任务归属和私有完成等待队列 |
+| **队列物理页** | **Modern v2**：分配连续 2 页（RV `8 KiB`、LA `32 KiB`），请求槽从偏移 `2048 B` 开始避开 64 项环形队列<br/>**Legacy v1**：分配连续 4 页（RV `16 KiB`），已用环按协议 `4 KiB` 页对齐，请求槽位于 `8 KiB` 处 |
+| **批量工作区池** | 每请求槽预留一份 **`2048 B`** 非 DMA 工作区（8 槽在 4 KiB 页架构占 4 页、16 KiB 页架构占 1 页），在设备初始化时一次性分配。耗尽时在 `workspaces` 队列等待归还，**绝不在写回或内存回收路径临时分配页** |
 
-batch 因果用例先要求同一个调用在任何响应释放前发布八项。随后用两个外部 writer 占槽：writeback 保持本批六个响应全部暂扣，释放外部响应后要求出现至少一项补发，再逆序释放本批已发布项并验证最后尾项出现在 guest FLUSH 前；writethrough 逆序释放首批八项，随后逐项释放两条补发请求，检查完整批次、屏障和持久字节，但不单独要求外部槽先于本批槽完成。
+### 2.2 零拷贝散列-聚集（SG）、中转 RMW 与流式阶段写
 
-writethrough 的响应波次依据固定 QEMU v11.1.0（`references/qemu`，commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`）：`block/block-backend.c` 的 `blk_co_do_pwritev_part()` 在写缓存关闭时加 FUA，`block/io.c` 的 `bdrv_driver_pwritev()` 在 backend 不支持 FUA 时以 `bdrv_co_flush()` 模拟。当前 NBD fixture 仅声明 SEND_FLUSH，故外部 WRITE 回复不是外部 VirtIO 写完成的充分握手；这些 backend FLUSH 回复即时释放。
+驱动将“准备描述符、发布、通知设备、等待完成和收割结果”彻底解耦，数据路径按请求形态自动选择最优策略：
 
-错误用例使第二个已发布 batch 写先失败，保留另一个 DMA，验证取消仍不能提前返回，再释放该 DMA 并回读确认未发布项未写入；正常单写与 batch 混合的八槽超时由 reset 结束，队列页和任务栈最终回收。等待前有限收割 used，没有完成时仍阻塞等待。
+1. **单段直接 DMA 快路径**：在 `virtio_block_read_batch()` 中，如果仅包含 1 个扇区对齐、位于内核直接映射区且不超过单段上限（`max_segment_size`）的读区间，驱动直接申请高优先级请求槽并复用请求自身的完成队列，完全跳过批量工作区分配与二次状态封装。
+2. **多段散列-聚集（Scatter-Gather，SG）**：批量接口（`kernel_block_read_batch` / `kernel_block_write_batch`，单批上限 **`KERNEL_BLOCK_BATCH_MAX = 32`** 项）将磁盘连续、扇区对齐且支持直接 DMA 的多个离散内存页（例如 32 个物理不连续的 4 KiB 页）拼成**单条最多 128 KiB（`VIRTIO_BLOCK_TRANSFER_BYTES`）的 SG 请求**——包含 1 个请求头描述符、最多 32 个数据描述符和 1 个状态描述符（共 34 项）——无需内存拷贝，也不必等待整批凑齐资源即可边释放边补发。磁盘不连续的多条请求可在同一轮全部入队后仅通知设备一次。
+3. **非对齐中转读-改-写（RMW）**：若写入偏移或长度未按 512 字节扇区对齐，驱动利用槽内 512 字节中转缓冲区先读出完整扇区、合入修改字节再写回。同一批次中若多个区间落入同一物理扇区，按输入顺序串行推进 RMW，避免并发快照相互覆盖；其余不冲突区间照常并发。
+4. **日志流式阶段写（`kernel_block_write_phase()`）**：文件系统日志层向驱动提供一个无副作用、可重入的不可变生产者游标，驱动在共享 `transfer_lock` 保护下按设备队列与段上限持续拉取并流水线化提交请求——每完成一条即刻补发后续数据，消除每 128 KiB 等待整批 DMA 排空的停顿。对于仅实现同步写回调的后端（如 `loop` 设备），通用块层自动拆分为不超过 32 项 / 128 KiB 的窗口并在窗口间归还 `transfer_lock`，避免饿死并发读。
 
-RT 组合进展由 `make test-multi-disk-rt-riscv`（调用 `tests/riscv/multi-disk-io.py --rt-load`）单独验证：默认全局 RT 预算下，持续 FIFO/RR 子任务存在时，普通父任务与两台真实 NBD 的 READ/WRITE/FLUSH 均可完成，随后检查子任务、动态挂载、根页/堆/栈回收和两盘持久字节。该模式使用同一个 `tests/userland/multi_disk_io.c` 的显式 `/rt-load` fixture 分支，原错误隔离模式不变。
+### 2.3 优先级预留、中断与等待语义
 
-双盘故障 runner 在确认隔离检查点后，通过 NBD `cut` 收到两盘的明确回执，再终止
-QEMU，避免直接 kill 截断健康盘的响应。诱导断线后的原始日志保留；进展和内核错误
-判断截至受控 cut 前，冷启动读回和 fsck 仍必须通过，服务器非零退出不被忽略。
-失败产物另含 guest/两盘退出码及 cut 请求/回执状态。
+- **前台保护（优先级预留）**：后台脏页写回使用低优先级（`KERNEL_BLOCK_PRIO_LOW`）。当槽总数 `> 4` 时为前台保留 2 个请求槽（`total > 1` 时保留 1 个，`total == 1` 时不保留），且当普通等待队列 `slots` 或 `descriptors` 非空时让行；队列容量 `≥ 12` 时，低优先级批量请求至少要求 12 个空闲描述符才启动提交（小队列降为 3 个）。
+- **轮询与中断协作**：启动早期采用显式轮询；启用外部中断控制器（RISC-V PLIC / LoongArch PCH-PIC）后，任务在等待前会先轻量检查 `used->index`（无进展时不访问中断寄存器），登记等待后再次检查，若 DMA 已就绪则不进入睡眠。真实中断总是**先确认设备中断再收割完成环**，确保确认期间新到达的完成项不会丢失通知。
+- **细粒度等待队列**：驱动内部划分 6 条独立等待队列（`admission` 入场、`idle` 刷新排空、`slots` 普通槽、`slots_low` 低优先级槽、`descriptors` 描述符、`workspaces` 批量工作区），加上每槽独立的完成队列 `done`。DMA 完成立即归还描述符并唤醒对应完成队列；请求槽则保留到原调用者消费完结果（如完成中转区拷贝）后才归还并唤醒槽位等待者。
+- **持久化屏障（`FLUSH`）与超时策略**：
+  - `FLUSH` 先置 `barrier_waiters` 阻断新逻辑调用，待所有已入场调用排空（`active == 0`）后发送类型 4 请求（仅头 + 状态共 2 个描述符；已入场的批量调用仍允许补发余下分片，避免互锁）。直写设备同样经过软件排空屏障但不下发硬件 `FLUSH`。
+  - **普通读写 30 秒超时**：从发布时刻起以平台时钟频率计算 30 秒期限；到期重查仍无进展时输出故障现场并执行同步复位，确认 DMA 停止后向所有在途请求交付 `TIMEOUT`，设备进入失败态。
+  - **`FLUSH` 持久等待**：后端同步无固定时间上界，因此 `FLUSH` 每 30 秒检查一次；若仍未完成，打印等待提示并顺延 30 秒期限，**不重发、不复位，也不虚报持久化成功**。
 
-成本诊断的请求带提交时标量 epoch/lane，正常 IRQ 和 timeout/reset 均按该身份记账；registry 磁盘归属与 unknown 字节见[成本观测](kernel-cost.md)。
+---
 
-批量读的旧驱动顺序回退在生产函数宿主模型中只能发布一个请求，新增“暂扣至八项”
-测试超时；新驱动同时发布八项。两种 transport 的反序完成、单项错误、错误时另项
-仍在途、超时 reset、非对齐、多片段和 505 字节成功前缀由同一实际驱动模型验证，
-这些是受控设备边界证据。新增 SG 模型检查 4/8/32/64 项队列、八段及 32 段内容与边界；32 个 4 KiB 页之间保留 4 KiB 空隙和 canary，检查一个 128 KiB 请求、一次通知、无 bounce，以及受 SIZE_MAX=1024、SEG_MAX=3 限制时的拆分、空闲描述符有洞时仍保留其他链、一次通知多个请求，以及 scalar/batch 的 DMA 先于 IRQ 零 park；设备在通知时发布 used，不靠驱动时钟推进完成。真实 `test-io-sleep-riscv` 四组合额外要求
-单次调用先产生八个 NBD READ，释放七个后取消/唤醒仍不得返回，最后一个回复后才
-检查完整数据、独立状态和 owner 回收。文件批量读的八个连续页则必须形成一个 32 KiB SG 请求，暂扣该响应期间取消不能使批量读提前返回。
+## 三、用户态裸块设备、直接 I/O 与 sysfs 导出
 
-VFS/ext4 和页缓存预读通过现有 batch span 接口提供独立目标页，连续磁盘窗口由块驱动形成 SG；预读暂扣用例按完整窗口字节数验证一个请求。发布吞吐候选、默认/最大候选恢复结果和未测平台见[数据路径最终报告](../learning/data-path-budget-experiments.md)。
+用户态进程可通过设备临时文件系统（`devtmpfs`）打开裸块设备节点（如 `/dev/vda`、`/dev/vda1`、`/dev/loop0`），独立建立块打开文件描述（Open File Description，OFD），不经过普通文件页缓存：
 
+- **字节与定位 I/O**：`read`/`write`/`readv`/`writev`/`pread`/`pwrite` 支持任意非扇区对齐范围（内部经通用块层字节读写与临时单扇区暂存区完成）。读取盘尾返回 `0`，跨盘尾写截断至剩余容量，盘尾处非空写返回 `-ENOSPC`。`O_EXCL` 与文件系统挂载竞争同一个独占声明所有权（`claim_owner`）。
+- **直接输入输出（`O_DIRECT`）**：可在打开时指定或经 `fcntl(F_SETFL)` 动态切换。要求偏移、总长度及每个非空向量的地址与长度均按设备逻辑扇区对齐，单次最多借用一个架构页完成用户态拷贝与块设备传输；若用户源地址缺页，仅提交已成功拷贝的完整扇区前缀。
+- **设备控制（`ioctl`）**：支持 `BLKGETSIZE`（512 字节扇区数）、`BLKGETSIZE64`（字节容量）、`BLKSSZGET`（逻辑扇区大小）、`BLKROGET`/`BLKROSET`（读写状态）、`BLKBSZGET`/`BLKBSZSET`（软件块大小，须为 `[逻辑扇区, 架构页大小]` 内的 2 的幂）与 `BLKFLSBUF`（先同步该设备上的已挂载文件系统再执行设备刷新）。修改类 `ioctl` 要求调用者具备 `CAP_SYS_ADMIN` 权能，否则返回 `-EACCES`；`DISCARD`/`SECURE_DISCARD`/`ZEROOUT` 明确返回 `-EOPNOTSUPP`。
+- **回环设备（`loop`）**：每个文件后备 `loop` 绑定拥有独立后台工作线程，避免上层文件系统持锁时在同一调用栈重入后备文件锁；支持标量、批量与日志阶段写，解绑与自动清理在所有引用与在途请求归还后推进。
+- **sysfs 与 `statx` 导出**：
+  - `/sys/block/<整盘>/queue/` 导出 `logical_block_size` 与 `dma_alignment`（对齐掩码 `逻辑扇区 - 1`）；`statx(STATX_DIOALIGN)` 据此报告精确的内存与偏移对齐。
+  - `/sys/block/<整盘>/stat` 与 `/sys/block/<整盘>/<分区>/stat` 按 Linux 17 列格式输出实时统计（含读写完成次数、512 字节扇区数、毫秒耗时、在途数、忙时长与 `FLUSH` 计数；整盘包含分区请求，刷新只记入整盘），通过设备号与登记代次防止旧句柄延长已注销设备寿命。
 
-IRQ 启用后的读取 fixture 检查两个真实任务的内容、两个新增请求和扇区完成量，
-并要求没有新增错误或超时；同时报告 interrupts 和 sleeps。used 在等待前完成时，
-收割会确认设备中断，PLIC 可以一次也未进入，因此不能要求快请求必须产生 IRQ。
-真实延迟完成、睡眠及唤醒由上面的 NBD 用例检查。2026-10-10 的 case47 旧记录
-缺少 IRQ 等计数，不能据此唯一归因；原内核和输出保留。
+---
+
+<details>
+<summary>展开查看：故障诊断快照、完成校验边界与定向验证入口</summary>
+
+### 队列故障诊断与现代短完成规则
+
+发生队列损坏或普通读写超时时，驱动在执行复位前会输出 `BoarOS: block queue fault` 冷路径诊断（仅读取驱动自有标量和最多 8 个固定槽位，不解引用外部指针、不分配内存），错误原因分为五类：
+
+| 原因分类 | 触发条件与处理 |
+| :--- | :--- |
+| `used-overflow` | `used->index - last_used` 超过请求槽上限 |
+| `used-element` | 完成头描述符越界、指向数据/状态描述符，或 Legacy 出现 0 字节完成 |
+| `used-length` | 完成长度超出该请求允许区间（读为 `数据总长 + 1`，写/刷新为 `1`） |
+| `slot-state` | 头描述符指向未发布槽位、重复完成或槽状态非 `submitted` |
+| `device-status` | 设备写回的状态字节超出 `OK(0)` / `IOERR(1)` / `UNSUPP(2)` |
+| `timeout` | 普通读写超过 30 秒无完成（不附带非法完成项，仅保存复位前现场） |
+
+- **Modern IN 短完成保护**：现代传输下读请求的状态字节紧跟全部数据之后；若设备返回的 `used` 长度小于 `data_length + 1`（含 0 字节），驱动不读取未覆盖的状态字节也不补零，仅将该单条请求判定为 I/O 错误，但因为合法 `used` 项已结束该请求的 DMA，不会复位整台设备，其他请求继续正常执行。
+- **分区栈帧控制**：通用块层在分区偏移平移时区分小批量（`1..4` 项，独立小栈帧）与大批量（`5..32` 项，独立大栈帧），避免小请求占用最大数组栈空间。
+- **成本诊断统计**：默认构建仅累计请求数、最大在途数、中断/睡眠/唤醒/队列等待与错误；开启 `BOAROS_COST_DIAGNOSTICS=1` 后额外累计在途深度积分（`inflight-ticks`）、忙时及槽位/描述符/工作区全满时间与峰值，详见[成本观测模块](kernel-cost.md)与[数据路径预算实验](../learning/data-path-budget-experiments.md)。
+
+### 定向验证入口
+
+- **宿主模型与边界检查**：`make test-block-host`、`make test-virtio-block-host`、`python3 -B tests/host/virtio_block_diagnostics.py`、`FILE_IO_HOST_TCP=0 FILE_IO_BLOCK_ONLY=1 sh tests/host/file-io-concurrency.sh`。
+- **双架构客机与真实 NBD 控序门禁**：`make test-block-riscv`、`make test-block-loongarch`、`make test-io-sleep-riscv`（覆盖 legacy/modern × writeback/writethrough 四组合）、`make test-multi-disk-rt-riscv`、`tests/userland/direct-block.py`。
+
+</details>

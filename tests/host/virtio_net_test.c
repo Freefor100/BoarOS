@@ -830,7 +830,7 @@ static void test_tx_retirement_pressure(unsigned version)
     uint64_t phys;
     *(unsigned char *)model_extra_memory(&phys) = 'p';
     struct riscv_net_tx_segment segment = {phys, 1};
-    enum { COUNT = VIRTIO_NET_QUEUE_SIZE + 2 };
+    enum { COUNT = VIRTIO_NET_QUEUE_SIZE + VIRTIO_NET_BUFFERS };
     unsigned owners[COUNT];
     for (unsigned i = 0; i < COUNT; i++) {
         owners[i] = i;
@@ -838,15 +838,22 @@ static void test_tx_retirement_pressure(unsigned version)
         complete(1, next_head(1), 0, 1);
     }
     assert(d.tx_capacity_generation == VIRTIO_NET_QUEUE_SIZE);
-    assert(d.tx_retired_count == VIRTIO_NET_QUEUE_SIZE && d.tx_done_count == 2);
+    assert(d.tx_retired_count == VIRTIO_NET_QUEUE_SIZE && d.tx_done_count == VIRTIO_NET_BUFFERS);
     assert(virtio_net_get_progress(&d).tx_done_count == COUNT);
+    assert(virtio_net_send(&d,"x",1)==-KERNEL_EAGAIN);
+    released_count = release_batches = 0;
+    assert(virtio_net_tx_reclaim(&d, collect_owner));
+    assert(released_count==8 && release_batches==1 && d.tx_capacity_generation==VIRTIO_NET_QUEUE_SIZE+8);
+    for (unsigned i=0;i<8;i++) assert(released_owner[i]==&owners[VIRTIO_NET_QUEUE_SIZE+i]);
+    assert(virtio_net_tx_reclaim(&d, collect_owner) && released_count==8);
     /* Reset must retain the old references, including those no longer
      * attached to a descriptor slot. */
     assert(riscv_virtio_mmio_net_stop(&d) == -KERNEL_EBUSY);
     released_count = release_batches = 0;
-    assert(riscv_virtio_mmio_net_tx_release(&d, collect_owner, 0) == COUNT);
-    assert(released_count == COUNT && release_batches == 1 && d.tx_capacity_generation == COUNT);
-    for (unsigned i = 0; i < COUNT; i++) assert(released_owner[i] == &owners[i]);
+    assert(riscv_virtio_mmio_net_tx_release(&d, collect_owner, 0) == COUNT-8);
+    assert(released_count == COUNT-8 && release_batches == 1 && d.tx_capacity_generation == COUNT);
+    for (unsigned i=0;i<VIRTIO_NET_QUEUE_SIZE;i++) assert(released_owner[i]==&owners[i]);
+    for (unsigned i=VIRTIO_NET_QUEUE_SIZE;i<COUNT-8;i++) assert(released_owner[i]==&owners[i+8]);
     assert(!riscv_virtio_mmio_net_tx_release(&d, collect_owner, 1));
     stop(&d);
     model_extra_free(phys);

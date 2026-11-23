@@ -1,21 +1,25 @@
-# RISC-V Timer 与内核 Tick 模块
+# RISC-V 定时器、调度期限与内核节拍
 
-本文描述当前 RISC-V 定时器、生产 timer trap 和架构无关 tick 计数的稳定接口。Trap Frame 与返回契约见 [RISC-V Trap 模块](riscv-trap.md)。
+BoarOS 的 RISC-V 时间驱动层由三部分组成：架构无关的 **100 Hz 全局节拍计数器**（`kernel/tick.c`）、基于监督者二进制接口（Supervisor Binary Interface，SBI）TIME 扩展的**每核硬件定时器状态机**（`arch/riscv/timer.c`），以及将周期节拍与高精度单次调度期限融合的**时钟中断分发路径**（`arch/riscv/trap.c`）。陷入入口与返回契约见 [RISC-V Trap 模块](riscv-trap.md)，高精度墙钟与 POSIX 时钟系统调用见 [内核时间子系统](kernel-time.md)，多核协同详见 [RISC-V 多核启动与同步](riscv-smp.md)。
 
-## 范围与入口
+---
 
-| 文件 | 当前职责 |
-|---|---|
-| `kernel/dtb.c`、`include/kernel/dtb.h` | 从根节点直属 `/cpus` 读取原始 `timebase-frequency` |
-| `arch/riscv/sbi.c`、`include/arch/riscv/sbi.h` | 探测 SBI 扩展并通过 TIME 设置绝对 deadline |
-| `arch/riscv/timer.c`、`include/arch/riscv/timer.h` | 维护单 hart timer 状态、读取 `time`、计算和重设 deadline、开启 STIE/SIE |
-| `arch/riscv/trap.c` | 处理 supervisor timer interrupt：重设 deadline 后依次驱动 deadline 到期、console 输入轮询和 scheduler tick |
-| `arch/riscv/virt_rtc.c`、`include/arch/riscv/virt_rtc.h` | goldfish RTC 墙钟读取，供内核时间子系统捕获启动时刻 |
-| `kernel/tick.c`、`include/kernel/tick.h` | 维护 100 Hz 策略使用的 64 位累计 tick |
-| `kernel/main.c` | 在最终 Sv39/direct map 后初始化时间子系统，再初始化 scheduler、启动 timer 并进入 `wfi` idle |
-| `tests/host/riscv_timer_events.c`、`tests/host/riscv_timer_events.py` | 在 TIME/SBI/IRQ 替身边界执行真实 timer 状态机 |
+## 一、源码组织
 
-通用 tick 接口为：
+| 源码路径 | 核心职责 |
+| :--- | :--- |
+| `kernel/dtb.c`、`include/kernel/dtb.h` | 从设备树根节点直属 `/cpus` 节点读取平台原始计数频率 `timebase-frequency` |
+| `arch/riscv/sbi.c`、`include/arch/riscv/sbi.h` | 探测 SBI TIME 扩展（`0x54494d45`）并调用 `sbi_set_timer()` 设置 64 位绝对硬件比较值 |
+| `arch/riscv/timer.c`、`include/arch/riscv/timer.h` | 维护每核定时器状态、有序读取 `time` CSR、计算无漂移周期相位与融合单次调度期限 |
+| `arch/riscv/virt_rtc.c`、`include/arch/riscv/virt_rtc.h` | 读取 QEMU `virt` Goldfish 实时时钟（RTC）墙钟时间，供启动期锚定真实纪元时间 |
+| `kernel/tick.c`、`include/kernel/tick.h` | 维护 100 Hz 策略驱动的 64 位无符号全局累计节拍计数（多核下使用 Release/Acquire 原子语义） |
+| `arch/riscv/trap.c` | 响应监督者时钟中断（`scause = IRQ | 5`），推进节拍、更新粗粒度时钟、唤醒到期任务并驱动调度抢占 |
+
+---
+
+## 二、核心接口与时间读取语义
+
+### 2.1 架构无关节拍接口（`kernel/tick.c`）
 
 ```c
 #define KERNEL_TICKS_PER_SECOND 100U
@@ -24,76 +28,114 @@ void kernel_tick_advance(uint64_t elapsed_ticks);
 uint64_t kernel_tick_count(void);
 ```
 
-当前计数使用无符号 64 位模运算。它没有测试重置、回调、锁或 per-hart 存储；调用者可以一次报告多个迟到周期。生产 dispatcher 在推进计数后把同一个 elapsed 值交给 scheduler，tick 计数模块本身不依赖线程或调度策略。
+全局节拍采用无符号 64 位计数，允许单次调用推进多个迟到的周期。在多核构建（`BOAROS_MAX_CPUS > 1`）中，仅由逻辑 CPU0 推进 `tick_count`，并分别以 `__ATOMIC_RELEASE` 写入、`__ATOMIC_ACQUIRE` 读取，保证跨核可见性且无锁开销。
 
-RISC-V timer 接口为：
+### 2.2 RISC-V 定时器与有序时间采样（`arch/riscv/timer.c`）
 
 ```c
-enum riscv_timer_status riscv_timer_start(
-    uint32_t timebase_frequency,
-    uint32_t ticks_per_second);
-
-enum riscv_timer_status riscv_timer_handle_interrupt(
-    uint64_t *elapsed_ticks);
+enum riscv_timer_status riscv_timer_start(uint32_t timebase_frequency,
+                                          uint32_t ticks_per_second);
+enum riscv_timer_status riscv_timer_handle_interrupt(uint64_t *elapsed_ticks);
+enum riscv_timer_status riscv_timer_set_scheduler_deadline(uint64_t deadline);
+uint64_t riscv_time_read(void);
+uint64_t riscv_time_read_ordered(void);
 ```
 
-成功启动只允许一次。失败状态区分参数或频率错误、重复启动、SBI probe 失败、TIME 不可用、set_timer 失败和未启动。输出参数只在整个处理成功后写入。
+- **单核与多核状态隔离**：单核构建使用静态全局 `timer_state`；多核构建（支持 2/4/8 核）将 `{period, next_deadline, armed}` 存放在每核控制块 `kernel_cpu_current()->timer` 中，同时每核独立保存软件调度期限 `cpu->timer_deadline`，各核自主响应本地时钟中断。
+- **有序采样 `riscv_time_read_ordered()`**：根据 RISC-V `Zicsr` 与内存模型规范，读取 `time` CSR 在硬件内存序中归类为 **I/O 输入（`I`）** 而非普通内存读（`R`），常规的 Acquire/Release 内存屏障无法约束它与普通读写之间的重排。因此，当内核在顺序锁（SeqLock）或跨核快照中需要把 `time` 采样严格夹在普通内存访存之间时，使用 `riscv_time_read_ordered()` 插入 `fence rw, i` 与 `fence i, r` 双向屏障。
+- **启动墙钟采样（`arch/riscv/virt_rtc.c`）**：Goldfish RTC 要求先读低 32 位 `TIME_LOW`（锁存高 32 位）再读 `TIME_HIGH`。`riscv_virt_rtc_read_ns()` 连续采样两次，确认时间晚于 2020-01-01 且两次间隔在 1 秒以内、单调不回退后才采纳，否则返回不可用并由时间子系统安全降级。
 
-## 启动和中断不变量
+---
 
-启动汇编先保持 `sie=0` 和 `sstatus.SIE=0`。`kernel_main` 完成最终页表激活、direct-map 访问绑定和启动期运行检查后，才把 DTB 频率与 100 Hz 策略传给 timer：
+## 三、原子启动、无漂移相位与期限融合
 
-1. 频率和 tick 频率必须非零，且 timebase 不低于 tick 频率；
-2. 通过 SBI Base probe 确认 TIME 扩展可用；
-3. `period = timebase_frequency / ticks_per_second`；不能整除时使用整数商；
-4. 读取 `time`，先通过 SBI 设置第一个未来绝对 deadline；
-5. SBI 成功后才提交 `{period, next_deadline, armed}`；
-6. 最后依次开启 `sie.STIE` 和全局 `sstatus.SIE`。
+### 3.1 原子启动序列（`riscv_timer_start`）
 
-因此初始化失败不会留下已 armed 的软件状态，也不会由本模块提前打开中断。QEMU `virt` 的 10 MHz 和 VisionFive 2 的 4 MHz 均能被 100 整除，对应周期分别为 100000 和 40000 个 timebase 计数。
+在最终 Sv39 页表、直接映射与调度器全部就绪后，内核才启动定时器。启动过程严格保证“先校验并完成固件编程，最后才提交软件状态并开中断”：
 
-Direct-mode dispatcher 精确匹配：
+1. 校验 `timebase_frequency` 与 `ticks_per_second` 非零且 `timebase_frequency >= ticks_per_second`，同时确认当前核尚未重复启动；
+2. 通过 `sbi_probe_extension(0x54494d45)` 确认固件支持 SBI TIME 扩展；
+3. 计算周期 `period = timebase_frequency / ticks_per_second`（QEMU `virt` 10 MHz 对应 `100,000` 个计数，VisionFive 2 的 4 MHz 对应 `40,000` 个计数）；
+4. 读取当前 `time` 并调用 `sbi_set_timer(now + period)` 设置首个未来绝对期限；
+5. 仅在 SBI 返回成功后，才提交 `{period, next_deadline, armed = 1}`；
+6. 最后依次置位 `sie.STIE`（bit 5）与全局 `sstatus.SIE`（bit 1），开放时钟中断。
 
-```text
-scause = interrupt bit | 5
+### 3.2 O(1) 无漂移周期推进与软件调度期限融合
+
+为了同时满足 100 Hz 固定周期节拍与高精度单次调度事件（如实时预算到期、时间片尾部与睡眠唤醒期限），内核在同一硬件定时器上维护两条逻辑轨道：**周期节拍期限 `next_deadline`** 与 **独立软件期限 `cpu->timer_deadline`**（为 `0` 表示无待触发事件）。
+
+```mermaid
+flowchart LR
+    Set["调度器更新软件期限 cpu->timer_deadline"]
+    Min["计算硬件目标 = earlier_deadline(periodic, event)"]
+    Cmp{"硬件目标是否改变?"}
+    SBI["调用 sbi_set_timer(target)"]
+    Skip["跳过 SBI 陷入 · 仅更新软件字段"]
+    IRQ["硬件触发时钟中断 (scause = IRQ|5)"]
+    Adv["O(1) 相位计算 elapsed · 检查 event 是否到期"]
+    Rearm["取下一次 min(candidate_periodic, remaining_event) 重装 SBI"]
+
+    Set --> Min --> Cmp
+    Cmp -- "是" --> SBI --> IRQ
+    Cmp -- "否" --> Skip --> IRQ
+    IRQ --> Adv --> Rearm
 ```
 
-timer trap 进入时硬件已把旧 SIE 保存到 SPIE 并清 SIE，当前 handler 不重新开启嵌套中断。它不修改 `sepc`；在 SBI 安排新的未来 deadline 后，dispatcher 依次执行：`kernel_tick_advance` 累计 tick、`kernel_scheduler_expire_deadlines(riscv_time_read())` 唤醒过期睡眠者（先于 tick 切换，使刚到期的任务可被同一次切换选中）、`kernel_console_poll_input()` 在 UART 有接收数据时唤醒 console 读阻塞者，最后调用 scheduler。没有 READY 竞争者时 Trap Frame 通过 `sret` 回到原被中断位置；发生切换时则先切目标 `satp`，再恢复被选任务先前的调用链。U-mode ecall 和同步故障由同一 dispatcher 的独立分支处理，其他未知 cause 进入 fatal 诊断。
+- **按需陷入固件**：`riscv_timer_set_scheduler_deadline(deadline)` 在关中断状态下比较新旧目标 `earlier_deadline(periodic, deadline)`。仅当实际需要写入硬件比较器的值发生改变时才调用 `sbi_set_timer()`；若比较值未变（例如新期限晚于下一次周期节拍），直接更新软件记录即可，大幅减少向 M-mode 的 SBI 陷入次数。若 SBI 调用失败，保留旧软件期限不变。
+- **相位锁定（无累积漂移）**：中断到来时，内核不以 `now + period` 重算下一次节拍，而是相对上一次计划相位 `previous_deadline` 做 O(1) 计算：
+  - `delta = now - previous_deadline`
+  - `elapsed = delta / period + 1`
+  - `next = previous_deadline + elapsed * period`
+  即使某次关中断窗口导致跨过多个周期，也能一次汇报全部逝去节拍，既不会因处理耗时逐次累加成时钟漂移，也不会陷入追赶中断风暴。
+- **早到中断容忍与原子提交**：根据 [RISC-V Sstc 规范](https://docs.riscv.org/reference/isa/v20250508/priv/sstc.html)，取消或推迟一次较早的调度期限后，旧的 `STIP` 挂起位可能延迟撤销，导致中断在当前所有有效期限之前进入。`riscv_timer_event_advance()` 识别出 64 位有符号差值为负（`RISCV_TIMER_STATUS_EARLY_INTERRUPT`）时，原样保留下一周期相位并返回 `elapsed_ticks = 0`，随后重装当前最早期限，绝不误扣任务时间片或打乱周期相位。所有候选值均先算在局部变量中，仅当 `sbi_set_timer()` 成功后才提交到 `timer_state`、`cpu->timer_deadline` 与输出参数。
 
-## Deadline 与失败原子性
+---
 
-handler 不使用 `now + period`，而是保持上一计划相位：
+## 四、时钟中断在内核中的执行顺序
 
-```text
-delta   = now - previous_deadline
-elapsed = delta / period + 1
-next    = previous_deadline + elapsed * period
-```
+陷入分发器捕获 `scause = RISCV_SCAUSE_INTERRUPT | 5` 后，全程在关中断状态下按严格顺序执行以下动作（不修改 `sepc`）：
 
-若 `now` 恰好等于旧 deadline，elapsed 为 1；若已经跨过多个周期，一次报告全部 elapsed，复杂度仍为 O(1)。这样 handler 耗时不会逐次累加成时钟漂移，也不会循环补发大量中断。
+1. 调用 `riscv_timer_handle_interrupt(&elapsed_ticks)` 重设下一次硬件比较值并清除已到期的软件事件；若失败则输出诊断信息并关机。
+2. 当 `elapsed_ticks > 0` 时：
+   - 仅逻辑 CPU0 推进全局节拍 `kernel_tick_advance(elapsed_ticks)` 并更新粗粒度时钟 `kernel_time_update_coarse()`；
+   - **每个核**都调用 `kernel_scheduler_charge_ticks(elapsed_ticks, from_user)` 为当前运行任务计账运行时间与实时看门狗预算。
+3. 仅逻辑 CPU0 执行 `kernel_scheduler_expire_deadlines(riscv_time_read())` 唤醒所有到期睡眠任务（必须先于调度抢占，使刚唤醒的高优先级任务能在同一轮切换中被立即选中），并调用 `kernel_console_poll_input()` 轮询早期控制台输入。
+4. **每个核**调用 `kernel_scheduler_on_tick(elapsed_ticks)` 决策是否发生任务切换：无更优就绪竞争者时通过 `sret` 直接回到被中断指令；发生切换时切入目标地址空间并恢复目标任务执行链。
 
-时间先后按 64 位模运算判断，要求两次有效处理的距离小于 `2^63` 个 timebase 计数。成功计算保证新 deadline 位于采样的 `now` 之后。候选 deadline 和 elapsed 先保存在局部变量；只有 SBI set_timer 成功后才提交新状态和输出。若固件调用失败，dispatcher 输出 timer 状态并关机，不以旧状态伪造成功。
+多核配置下，当远端核新增一个早于当前期限的睡眠任务时，通过核间中断（IPI）通知 CPU0 重新评估并装载本地硬件比较值。
 
-改写或取消调度期限后，旧的 STIP 可能尚未撤销，handler 因而会在当前所有期限之前进入。
-[RISC-V Sstc 规范](https://docs.riscv.org/reference/isa/v20250508/priv/sstc.html)允许这种延迟撤销。
-handler 此时保留下一周期 tick 和尚未到期的调度事件，重新设置当前最早期限，返回零个 elapsed tick。
-到期事件照常清除；这种晚到的中断不会增加 CPU 时间片或推进周期相位。
+---
 
-## 验证与限制
+<details>
+<summary>展开查看：错误状态码、回绕假设与验证入口</summary>
+
+### 定时器状态码（`enum riscv_timer_status`）
+
+| 状态码 | 含义 |
+| :--- | :--- |
+| `RISCV_TIMER_STATUS_OK` | 操作成功 |
+| `RISCV_TIMER_STATUS_INVALID_ARGUMENT` | 传入空指针或零周期等非法参数 |
+| `RISCV_TIMER_STATUS_INVALID_FREQUENCY` | `timebase_frequency` 或 `ticks_per_second` 为零，或前者小于后者 |
+| `RISCV_TIMER_STATUS_ALREADY_STARTED` | 当前核定时器已处于启动状态 |
+| `RISCV_TIMER_STATUS_SBI_PROBE_FAILED` | SBI Base 探测调用返回错误 |
+| `RISCV_TIMER_STATUS_SBI_TIME_UNAVAILABLE` | 固件不支持 SBI TIME 扩展 |
+| `RISCV_TIMER_STATUS_SBI_SET_FAILED` | `sbi_set_timer()` 返回非零错误码 |
+| `RISCV_TIMER_STATUS_NOT_STARTED` | 尚未启动定时器即尝试处理中断或设置调度期限 |
+| `RISCV_TIMER_STATUS_EARLY_INTERRUPT` | `now` 仍在 `previous_deadline` 之前（由 `riscv_timer_event_advance()` 内部吸收为 0 tick） |
+
+### 边界假设与后端说明
+
+- **64 位模运算比较**：时间先后按 64 位无符号减法最高位（等价于有符号 `int64_t` 差值）判断，要求任意两次有效处理或期限跨度小于 $2^{63}$ 个 `timebase` 计数。
+- **后端选择**：RISC-V 当前统一采用 SBI TIME 扩展后端与 100 Hz 基础周期 + 单次调度事件融合策略，尚未启用 Sstc 直写 `stimecmp` 或完全无节拍（Tickless）模式；LoongArch 的单次恒频定时器后端见 [LoongArch 64 引导与多核执行](loongarch-boot.md)。
+
+### 定向验证入口
 
 ```sh
 make test-riscv-timer-host
 make test-riscv
 ```
 
-`test-riscv-timer-host` 在真实 handler 的 TIME/SBI/IRQ 边界控制输入，覆盖取消及替换期限后的晚到中断、零 tick、周期相位、固件失败和两 CPU 状态独立。该宿主入口不执行真实 CSR 或 trap 汇编；客户机任务的中断与调度由真实 libc/pthread 和根启动路径执行。
+- `test-riscv-timer-host`：在宿主环境中直接编译真实 `arch/riscv/timer.c`，通过 TIME/SBI/IRQ 替身边界验证取消与替换期限后的早到中断、零 tick 返回、多周期迟到相位保持、SBI 失败原子回滚以及多 CPU 独立状态。
+- `make test-riscv`：在 QEMU 客户机中端到端验证真实时钟中断、睡眠唤醒与抢占调度。
 
-当前处理器记录调度事件的软件期限。硬件比较值取软件期限与下一周期节拍中较早的一个。
-关闭中断期间，只有比较值改变才通过监督者二进制接口（Supervisor Binary Interface，SBI）重设硬件。
-比较值相同时可直接更新软件期限，固件调用失败则保留旧期限。周期中断推进节拍、清除到期事件并重新装载硬件。
-
-默认配置为单hart、固定100Hz周期策略和SBI TIME后端。独立[RV受控两核配置](riscv-smp.md)将period、下一tick和armed放入CPU记录，
-两侧各记本地运行，CPU0单独推进全局tick/期限与服务；IPI请求CPU0重装远端新增期限。
-Scheduler把每个非零elapsed事件作为一次时间片到期，每次trap最多切换一次；deadline索引只处理到期者。
-SBI事件取本地RT预算、RR片尾与CPU0最早睡眠期限的最小值。正常UART通过PLIC接共用TTY。
-尚无tickless或Sstc直写；LA one-shot后端见[LA模块](loongarch-boot.md)。正常tick和调度不写UART。
+</details>

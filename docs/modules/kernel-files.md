@@ -1,815 +1,145 @@
-# 进程文件资源模块
+# 文件描述符、打开文件对象与通用 I/O 层
 
-本文描述当前用户任务持有的文件描述符表与文件系统上下文。底层文件对象见[VFS 与 ext4 模块](vfs-ext4.md)，用户指针复制见[用户内存访问模块](kernel-uaccess.md)，syscall 编号与分派见[系统调用解码模块](kernel-syscall.md)。
+在类 Unix 操作系统中，进程并不直接操作底层磁盘索引节点（`inode`），而是通过整数编号的**文件描述符（File Descriptor，FD）**访问内核的**打开文件描述（Open File Description，OFD）**，进而统一操纵普通文件、目录、管道、套接字、事件队列与监控对象。本文基于 `fs/files/`、`fs/open_file.c`、`fs/pipe.c`、`fs/event_fd.c`、`fs/inotify.c`、`fs/fanotify.c`、`fs/record_lock.c` 与 `fs/flock.c` 的实际代码，阐述 BoarOS 文件资源层的完整机制。
 
-## 对象与所有权
+---
 
-`include/kernel/files.h` 是公共接口；`fs/files/table.c` 管槽位、引用及回收，`io.c` 管普通读写/定位/枚举，`transfer.c` 管 sendfile、文件复制和管道搬运，`path.c` 管打开与 stat，`metadata.c` 管显式时间和文件系统统计，`console.c` 管 UART 输入等待，`fs/char_device.c` 按类别登记字符设备操作、在 pin 的 VFS 上下文中取得实例，`fs/pipe.c` 管 pipe endpoint 与 ring，`include/kernel/fs_context.h` 和 `fs/fs_context.c` 管理根挂载与当前工作目录。文件表与 fs context 都从同一内核堆分配，并随用户 task 一起被 scheduler 接管：
+## 一、源码组织
 
-- `kernel_files` 是进程可见的 fd 槽数组；槽保存 descriptor flags 和指向 open file description 的指针。
-- `kernel_open_file_description` 拥有一个 VFS file、当前 offset 和清理状态。分别打开同一路径会得到独立 description，因此 offset 互不影响。
-- pipe description 不拥有 VFS file，而是各自持有同一个 `struct kernel_pipe` 的读/写 endpoint；pipe 对象拥有16个片段槽、按需分配的单页后备、端点引用和等待队列。metadata raw 保护 ring、端点、代次与 readiness；用户复制、缺页和通知在 raw 外执行。关闭者保留本次已有 owner 至通知结束，再竞争最后销毁资格。核心分别返回接纳前缀和断端事实，SIGPIPE/重启由真实用户调用层处理。受控任务创建仍检查当前支持的消费者；这项检查不切换 pipe 同步方式；复制资格与页归还规则见下文 [pipe2](#pipe2-与-fifo-endpoint)。
-- socket description 同样不拥有 VFS file，而是独占 `struct kernel_socket`；fd 关闭、dup 覆盖、exec CLOEXEC 或退出导致最后一个真实 OFD 引用消失时，销毁 socket 并解绑 lwIP 回调。请求期间的 OFD pin 使 fd 复用不改变当前请求的 endpoint。普通 read/write 与向量路径使用 socket 数据队列，定位 I/O 返回 `ESPIPE`；`fstat` 报 `S_IFSOCK`。协议与等待契约见[网络模块](kernel-network.md)。
-- BPF description 持有程序、map、BTF、link 或 perf 事件对象；map 的共享映射独立持有 OFD，关闭 FD 不提前归还映射页。perf read/ioctl 及 ringbuf poll/epoll 接到实际对象，其余程序类对象不伪造文件读写能力；对象与 pin 生命周期见 [BPF](kernel-bpf.md)。
-- `kernel_fs_context` 在共同 VFS 状态短保护下读取和交换 umask，并为使用者生成带独立引用的 root/cwd 快照；cwd 替换、记录共享、移动和退出使用同一保护。它持有 root 和 cwd 的独立路径引用；普通 fork 复制两份引用，`CLONE_FS` 共享 context record，exec 保留。`chdir/fchdir/chroot/getcwd` 操作共享活目录项；exec 从当前目录对象解析相对路径。
+| 源码路径 | 核心职责 |
+| :--- | :--- |
+| `fs/files/table.c`、`fs/open_file.c` | 进程文件描述符表（位图槽分配、`CLOEXEC`、`dup`/`close_range`）与统一 OFD 对象生命周期 |
+| `fs/files/io.c`、`fs/files/transfer.c` | 普通与向量读写（`readv`/`writev`/`preadv2`/`pwritev2`）、`sendfile`、`splice`/`tee`/`vmsplice` 与 `copy_file_range` |
+| `fs/files/path.c` | 路径相关系统调用（`openat`/`openat2`、`statx`、`access`、`chmod`/`chown`、`renameat2`、文件句柄） |
+| `fs/pipe.c`、`fs/pipe_internal.h` | 匿名管道与命名管道（FIFO）环形页缓冲、原子写边界与动态容量调节 |
+| `fs/files/poll.c`、`fs/files/epoll.c` | `poll`/`ppoll`、`pselect6` 与红黑/AVL 树驱动的 `epoll` 事件多路复用 |
+| `fs/event_fd.c`、`fs/signal_fd.c` | 轻量级事件计数（`eventfd`）、定时器描述符（`timerfd`）与信号描述符（`signalfd`） |
+| `fs/inotify.c`、`fs/fanotify.c` | 文件系统事件监视（`inotify`）与支持权限拦截/文件句柄的高级访问通知（`fanotify`） |
+| `fs/record_lock.c`、`fs/flock.c` | 区间 AVL 树实现的字节范围记录锁（POSIX / OFD 锁）与整文件协作锁（`flock`） |
 
-`kernel_files_pin()` 为 fd 指向的 open file description 增加一个独立引用。file-private mmap
-用它把文件生命周期从 fd 槽中分离：映射成功后 MM 消耗该引用，之后即使所有 fd 都关闭，
-缺页仍能读取原文件；映射失败则调用者释放 pin。一个 MM 对同一 OFD 只保存一个来源节点，
-由该节点持有一份成功 mmap 转入的引用；重复映射不增加历史引用，
-多个 VMA 通过 backing 指针借用它，最后一个对应 VMA 消失后在冷清理路径释放。底层 VFS/I/O
-清理若暂时不能完成，来源节点由 MM registry 保留为唯一 owner，不重复累积引用；物理页和堆释放
-遵循 fail-stop 不变量。
+---
 
-OFD 引用采用非零/溢出检查的原子取得与归还，只有最后归还者进入后端清理；
-引用计数为零的 detached cleanup owner 仍可处理原有真实清理错误，不能重新 acquire。
-原子引用只保护存储寿命，不使 offset、设备或文件业务自动获得跨核同步。
-每张 FD record 的 rank30 raw 锁保护槽、预留编号、descriptor flags、record 引用和槽位数量。已持有句柄直接访问 record，查槽只检查编号和槽状态；可变不变量在实际修改处维护。调用、字节和分块计数使用 relaxed 原子更新，读取统计时分别取样；它们不参与 FD 所有权决策。
-lookup 与 OFD acquire 在同一临界区完成；跨解锁消费者持实际 OFD pin，已移除裸 description 查询入口。
-close/dup 替换在锁内摘槽，锁外处理选定 OFD；fd 复用不改变已 pin 请求的身份。
-同一把表锁保护占用位图和最低空闲编号 `next_fd`。已安装的槽和正在预留的槽都置位，安装已预留的槽沿用该位，取消预留或摘除槽时清除该位。普通分配直接读出最低空闲编号；`F_DUPFD` 指定的下界更高时，从下界按 64 位机器字查找。最低空闲编号被占用后也按机器字查找下一个空槽，最多检查 16 个机器字。分配同时受当前句柄的 `RLIMIT_NOFILE` 限制。共享表共同维护位图，独立复制的表按实际继承的槽重建位图和最低编号。
-扩容在锁外准备清零的槽数组。最多 512 槽时使用表内的位图，扩到 1024 槽时另在锁外分配 128 字节位图。锁内复查后最多复制 8 KiB 旧槽与 64 字节旧位图，一起发布新容量和存储。旧槽数组及竞争失败的候选在锁外释放，末次归还文件表时释放独立位图。
-open/pipe/socket 的编号预留保持到安装或取消；成对 fd 在用户输出成功后一起发布，复制失败不会按复用后的编号关闭对象。
-共享 OFD 的 APPEND/NONBLOCK 使用原子 status 更新，访问方向保持；F_SETFL 忽略不可变/open-only位，保留 O_SYNC/O_DSYNC、DIRECTORY/NOFOLLOW，DIRECT 仍返回 EINVAL。O_NOATIME 资格见[访问时间策略](vfs-ext4.md)。FD_CLOEXEC 仍属于各张表。
+## 二、文件描述符表与打开文件描述（OFD）
 
-通用 `ioctl(FIONBIO)` 从用户地址读取四字节整数，非零启用、零关闭 `O_NONBLOCK`。
-它适用于所有有效的普通 OFD，在设备专用 ioctl 分派前执行；dup、fork 和 FD 传递共享
-修改后的状态。更新仅原子修改这一位，不覆盖同时改变的 APPEND、NOATIME 或异步通知状态。
-FD 与 O_PATH 检查先于用户复制，输入 EFAULT 保留原标志。管道、socket 等对象仍由各自
-读写路径执行非阻塞行为，普通文件不会因此虚构 EAGAIN。
-普通与受控 FD 表共同使用这些保护和引用规则，不再封存 OFD、pipe 或表的并发资格。`kernel_files_check_task_domain()` 在受控任务创建时检查当前实际消费者和资源绑定；它不改变对象状态，也不要求额外保留 CPU0 控制引用来规避末次释放。
+### 2.1 三级映射关系
 
-`readv/preadv/writev/pwritev/sendmsg/recvmsg` 在入口通过同一导入实现取得描述符快照：8项以内用调用栈，更多项只有一次堆分配。快照将只读的 view、count、total 与可转移的 allocation owner 分开；后端借用同一份描述符，不重扫数值范围，实际用户页权限和缺页仍在复制或 pin 时检查。导入先检查全部有符号长度，再检查原始范围；单向量先裁剪长度，多向量检查未裁剪的每项范围后裁剪总量，因此达到总量上限也不会掩盖非法尾项。TTY等待期间接管堆owner和OFD，正常完成归还，强制取消消费；栈上view不会因owner置空而改变。标量read/pread保留各对象原有的范围、空读与类型错误顺序。读取分派只传调用者持有的真实OFD owner，pread也沿用该owner；后端入口借用一次description，避免同时传同一对象的裸指针与owner。
+```mermaid
+flowchart LR
+    FDTable["进程文件描述符表（struct kernel_files_record）<br/>slots[] + 512 位内联占用位图 + next_fd 提示<br/>记录每槽位 FD_CLOEXEC / FD_RESERVED"]
+    OFD["打开文件描述（struct kernel_open_file_description）<br/>独立读写偏移（offset_lock）· 打开标志 · 凭据引用 · 读写建议"]
+    Backend["底层内核对象（按 kind 统一分派）<br/>普通文件/目录 · 管道/FIFO · 套接字 · epoll · eventfd · timerfd · signalfd · inotify · fanotify · pidfd · BPF"]
 
-普通 `read/pread/readv/preadv` 与 `write/pwrite/writev/pwritev` 在发起 CPU 完成向量导入、用户缺页与复制以及缓存操作。分派在 OFD 引用覆盖的寿命内读取一次不可变对象类型，后续分类共用该值，不为 socket 的等待资格判断让普通文件重复查询类型。热读不创建执行请求；冷读在调用 CPU 准备未发布候选；ext4 由调用者完成缺失批次装入，其他磁盘后端沿其 CPU0 策略。tmpfs读取先固定目标用户页，再在源inode读资格下复查EOF、借用源页并直接复制；洞输出零，同页重叠使用memmove，同一目标页跨iovec复用pin。若源inode正被修改，先归还目标pin再等待，避免与共享映射撤权互等。写入直接进入最终缓存页，完整覆盖冷页不读旧块；部分页保留内容由同一缓存负责补齐。用户来源先完成缺页和 pin，再取得目标写资格，不能关闭目标尾页后等待同一共享映射来源。
-
-同一个写入窗口涉及两张已驻留的用户页时，共用一次 MM 映射保护借用，仍分别持有物理页引用；两页复制结束后共同归还。跨两页的标量读出也使用同一协议。第二页缺页或撤权时只接纳已借用的前缀，归还后再处理后续页，避免持旧借用等待正在撤映射的线程。跨多个缓存页或多段 iovec 的读取仍在当前批内复用已有输出页借用。
-
-共享 offset 的 rank10 mutex 覆盖普通读写、seek 和目录游标；需要后端的定位操作在提交前取得资格，worker 借用它而不重新等待。独立 fsync、fdatasync 和显式范围同步不读取文件位置，不取得或借用 offset mutex。ftruncate/fallocate 同样在排队前取得文件写操作门。普通写先在用户来源 pin 前按后端策略准备真实空间，ext4 在发起 CPU 完成，归还该步骤的 inode writer 后才解析来源；空间接纳与 legacy 格式的完成职责见 [VFS/ext4](vfs-ext4.md#文件节点与页缓存)。普通写在数据接纳后归还写操作门，再执行 O_SYNC/O_DSYNC；不能让 worker 等待调用者持有的锁而挡住其冷读。回调在 cache mutex 外执行；用户 pin 与缓存写借用不得跨请求发布。`pread/pwrite` 不改变共享位置，精确错误前缀保持。
-
-请求借用原调用现场和实际 OFD owner，直到 worker 完成及调用者等待现场退出；fd 关闭或复用不改变身份。普通 ext4 文件、目录与 O_PATH 的最后关闭在发起 CPU 结束；缓存退休清理继续由既有 worker 推进。pipe端点与关联清理按下文[pipe2](#pipe2-与-fifo-endpoint)选择执行位置。其他尚需 CPU0 的最终释放在实际关闭边界迁移原任务；若调用者仍持 pin 或 offset，现有 FD/MM 退休清理链保留原 owner，待用户返回准备归还这些资格后继续清理，不能将成功 I/O 改报内部失败。
-
-ext4 路径查找、目录操作与文件元数据在发起 CPU 执行；VFS 在实际解析出的后端选择执行位置。设备、proc等对象在取得锁和用户页借用前进入所需的CPU0范围，嵌套调用借用同一执行资格。冷读与后端操作共用既有 FIFO，16 项后检查写回并让出；停止取消尚未执行的请求，已经执行的请求须实际结束才能归还。执行位置见[RV 两核](riscv-smp.md#普通文件io的执行位置)。
-
-`make test-file-io-concurrency-host`覆盖4/16KiB、2/4线程的共享offset和独立追加OFD、冷匿名缓冲、精确EFAULT前缀、自持 pin 拒绝及最终引用回收，链接真实MM/VFS/tmpfs/cache/lwext4。
-host模型只提供线程/架构上下文及未开放消费者的abort；task定位与scratch使用生产实现。新增共享read/readv包唯一性、热读不排队、冷读期间同OFD seek在提交前等待，以及伪造guard和自持用户pin拒绝检查。暂停独立 fsync 或范围同步的调用时，同一 OFD 的热 read 与 SEEK_CUR 仍完成；竞争同步只消费一次已有写回错误，完成时请求及 OFD 引用归还。实际跨核执行见[两核模块](riscv-smp.md#普通文件io的执行位置)。
-宿主另强制交错执行中close/dup复用及worker停止：排队者被取消，执行者仍返回原OFD内容，最后请求/引用归零；调用 CPU 的冷缺页复制经 fork 私有页验证 COW 隔离。真实RV单/两核、双RAM与独立重启以及原静态/pthread组合见[普通文件交接](riscv-smp.md#普通文件io的执行位置)。
-`make test-files-concurrency-host`直接链接真实表/OFD/pipe、allocator、MM 和等待实现，
-在 4/16 KiB 模型核对 2/4 线程扩容/dup 编号唯一性、pin-close 交接、预留冲突、OOM 和引用归还，并验证跨位图字的最低编号、共享表中不同句柄的上限、独立复制及位图分配失败后的回滚。
-`make test-pipe-concurrency-host`另验证真实MM/uaccess的提前wake、fd复用后旧请求、EOF/部分EPIPE、
-复制期间poll、4095/4096/4097向量几何、故障片段撤销与munmap前缀；2/4线程检查内容隔离、ring wrap及无端点保留的EOF。
-其中tmpfs作为真实缺页复制缓冲，驻留/来源及后备owner在最终MM释放后归还；客户机磁盘缓冲与CPU0 worker的组合见[RV两核](riscv-smp.md#共享-fd-表与匿名-pipe)。
-这些宿主证据不代替真实两核和普通用户组合验收。
-相对 dirfd 和 AT_EMPTY_PATH 定位保持 OFD pin，直到借用路径取得独立引用；共享表 close 后，最后 pin 也不能早于这个交接结束。
-宿主窄反例强制在 guard 归还前关闭槽 owner，并验证路径交接与最终归还；sendfile 来源占独立片段，不并入可合并的 user-write 尾片段。
-
-
-描述符表初始有 32 个槽，按 2 倍增长，硬上限为 1024。`RLIMIT_NOFILE` 的组级软限制约束新 fd 的编号；open、pipe、dup 和 `F_DUPFD*` 均通过该上限，降低限制不关闭已有 fd，也不阻止继续使用它们。限额保存在组内共享的资源记录中，fd 表只维护槽位：即使不同组通过 `CLONE_FILES` 共用槽位，也各按自己的限额分配；每次 syscall 借用文件表时更新任务句柄的限额。分配总是从 `next_fd` 指示的最低可能空位向后搜索；关闭较小 fd 后会回退该提示，因此当前没有预装 stdin/stdout/stderr 时第一次成功打开返回 0。`O_CLOEXEC` 作为 descriptor flag 保存在槽上；exec 提交后批量摘除这些槽，其他 fd 和 open-file offset 保持不变。
-
-normal open、dup/F_DUPFD、console、pipe2 和 epoll_create1 最终都经过 `table.c` 的统一 fd 安装原语。新建 OFD 与调用者已 acquire 的共享 OFD 使用两个显式入口；两者都只消费传入 ownership，不暗中改变引用计数，并统一提交槽位、open/CLOEXEC 统计和 `next_fd`。表满或安装前失败不提交这些状态。
-
-`close_range(436)` 按实际表容量裁剪范围，每批最多摘除16槽，在表锁外处理关闭。
-`CLOSE_RANGE_CLOEXEC` 标记描述符而不关闭；并发安装的预留槽保留已发布的标志。
-`CLOSE_RANGE_UNSHARE` 只替换调用线程的表：先建立候选，关闭模式跳过范围内的引用复制，
-CLOEXEC模式保留共享OFD再标记。分配失败保留旧表。候选和退休表由任务持有，
-正常结束与退出共用清理入口；实际FD摘除保留关闭者身份及MQ通知、记录锁规则。
-
-普通 clone 通过 `kernel_files_fork()` 新建并复制 fd 槽数组和 descriptor flags，同时增加每个 open file description 的引用。因此父子可以分别 close 或修改各自的 `FD_CLOEXEC` 槽，但同一个已打开文件的 offset 与底层 VFS file 生命周期共享。fs context 通过 `kernel_fs_context_fork()` 独立持有 root/cwd 路径引用和同一个 root mount。`dup/dup2/dup3/fcntl(F_DUPFD*)` 复用同一 OFD：`dup` 不携带 `FD_CLOEXEC`，`dup3` 只接受 `O_CLOEXEC` 且 `oldfd == newfd` 返回 `-EINVAL`；内部 `dup2` 对相同且有效的 fd 成功，不改变槽位。`dup2/dup3` 都对越界目标返回 `-EBADF`，目标槽被替换时按 close 语义摘除；`F_DUPFD/F_DUPFD_CLOEXEC` 从下界向上找第一个空槽，下界越界则返回 `-EINVAL`。固定 Linux 快照中的 [`fs/file.c`](../../references/linux/fs/file.c)、[`fs/fcntl.c`](../../references/linux/fs/fcntl.c) 与 [Linux dup 接口说明](https://man7.org/linux/man-pages/man2/dup.2.html)可用于核对这些边界。
-
-`kernel_files_acquire()` 让另一个 handle 共享整张 fd 表及其 cleanup owner，`kernel_fs_context_acquire()` 同样共享 cwd/root context；两者只增加 record 引用，不复制槽、cwd 或 OFD。任一非末 handle release 只清空自身 handle，既不关闭 fd，也不释放 cwd；最后一个 handle 才处理仍由 VFS/I/O 持有的清理 owner。普通 fork 接口仍保持“独立表/独立 cwd、共享 OFD”。固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`kernel/fork.c`](../../references/linux/kernel/fork.c)、[`fs/file.c`](../../references/linux/fs/file.c) 与 [`fs/fs_struct.c`](../../references/linux/fs/fs_struct.c)分别提供 `CLONE_FILES`/`CLONE_FS` record 引用和末引用清理基线。
-
-生成式 VFS 普通文件使用独立 OFD kind，不进入普通文件页缓存或 mmap；第一次非空读取从后端取得有 owner 的数据快照。read/readv 共享 OFD offset，pread 保留 offset，短拷贝 fault 只推进已复制字节，seek 到零重新生成，末引用释放快照。当前消费者是 [procfs](procfs.md) 的 meminfo、stat/status 与 mounts；文件元数据 size 为零不决定生成式读取 EOF。
-
-`/proc/<pid>/fd` 在 CPU0 的目标任务借用范围内，通过 FD 锁取得临时 OFD pin；普通文件再取得路径引用，伪对象只复制 kind/身份，调用结束归还 pin。重新打开 pipe 时，先在该短区预留一个 endpoint 引用，解锁后分配新 OFD，最后无论成功失败都撤销临时引用。只读、只写和读写的新 OFD 分别拥有 reader、writer 或两者；`O_RDWR` 的 poll 等待使用同时由读写状态变化唤醒的聚合队列。socket/epoll 不复制底层句柄来冒充新打开。
-
-## 信号驱动 I/O
-
-`F_SETOWN/F_GETOWN`、`F_SETOWN_EX/F_GETOWN_EX` 和 `F_SETSIG/F_GETSIG` 的状态归 OFD，
-因此 dup、fork 和 SCM_RIGHTS 传递共享所有者、选择信号和通知登记。首次设置时才分配
-异步上下文；所有者持有稳定 PID 身份及设置者当时的 UID/EUID，目标退出后不跟随 PID
-数字复用。默认信号为 SIGIO，`F_SETSIG` 接受 0–64。目标选择、权限和队列回退规则见
-[调度与信号模块](kernel-scheduler.md)。
-
-`F_SETFL` 的 O_ASYNC 从关闭变为开启时，先准备上下文，再登记真实事件源并保存此次 fd。
-准备失败不改变其它状态标志。已经开启时通过另一个 dup 修改 O_NONBLOCK 不会替换通知的
-`si_fd`；关闭后重新开启才保存新的 fd。没有异步事件源的普通文件接受设置操作，查询时
-不保留 O_ASYNC。最终 OFD 关闭先摘除登记并等在途回调归还，
-再释放 PID 身份和底层对象；登记不为 OFD 自增引用。
-
-管道/FIFO 的信号源独立于普通 poll 等待队列。非空读操作结束通知写端 POLL_OUT，
-非空写操作结束和阻塞等待前通知读端 POLL_IN；一次多片段写入不会按内部复制页重复发送。
-一侧端点数归零而另一侧仍存在时，两方向分别收到 POLL_IN/POLL_OUT。端点方向决定各
-OFD 订阅的通知，`O_RDWR` 同时订阅两方向。对象短锁内取得等待游标，回调在锁外执行。
-TTY、socket 和 inotify 也提供自己的事件源，不把一次普通 poll 唤醒当作 I/O 事件。
-
-直接宿主检查为 `sh tests/host/async-io.sh`，覆盖共享状态、分配失败、保存的 fd 和末次
-关闭等待回调；真实用户消费者见 [async_io.c](../../tests/workloads/io/async_io.c)。
-
-## 向量 I/O 的按次选项
-
-`preadv/pwritev` 与 `preadv2/pwritev2` 共用一次 OFD 引用、一次 iovec 快照和读写核心。
-RV64／LA64 原生入口在第4参数传完整64位 offset，第5参数槽不参与拼接，第6参数取32位 flags。
-v2 的 offset=-1 使用并推进共享位置，非负值执行定位 I/O；原定位入口仍拒绝负偏移。
-8项以内描述符保存在栈内，超过后分配一份数组，最多1024项。空向量沿 Linux 的零长度规则返回，非空请求在导入后检查按次标志。
-
-支持 `RWF_HIPRI/DSYNC/SYNC/APPEND/NOAPPEND/NOSIGNAL`。HIPRI 使用现有缓冲 I/O，不启动 direct I/O 轮询；
-APPEND 与 NOAPPEND 同时指定返回 EINVAL。NOAPPEND 可覆盖本次 O_APPEND 行为，但不能绕过 inode 的 append-only 限制，
-这个限制也适用于带 O_APPEND 的只读 FD。NOSIGNAL 只抑制本次管道或 socket 的 SIGPIPE，不影响 FSIZE 的 SIGXFSZ。
-未知标志和当前不支持的 NOWAIT、ATOMIC、DONTCACHE 返回 EOPNOTSUPP；不会用可能阻塞的操作冒充 NOWAIT。
-
-追加、同步和信号选项保存在本次调用中，不修改共享 OFD 状态。按次同步复用实际完成范围及原有固定持久化目标、错误游标；
-数据已接纳后同步失败仍保留内容和应发生的位置更新。复制故障的已完成前缀、FSIZE、文件封印以及 set-ID／filecap 清除沿共同写入路径处理。
-
-## 文件访问建议与显式预读
-
-`fadvise64` 的 NORMAL、RANDOM、SEQUENTIAL、NOREUSE 策略归 OFD，dup、fork 与 FD 传递共享，独立 open 不共享。
-NORMAL 恢复默认窗口并清除 RANDOM／NOREUSE；RANDOM 取消该 OFD 的推测预读并禁止继续训练；
-SEQUENTIAL 清除 RANDOM，窗口上限为默认值两倍；NOREUSE 保留其他策略，读取命中仍统计和借用页面，但不提升缓存访问状态。
-窗口和状态在 OFD 的短保护内更新，锁外发布预读后重新检查，避免旧预测覆盖并发修改的策略。
-
-WILLNEED 与 `readahead` 将有界文件范围交给现有预读队列，队列持有真实 inode 引用；EOF、空槽、物理内存压力限制接纳量。
-工作区按原批次上限反复使用，不创建新 worker，也不安装用户 PTE。提示成功不承诺返回时全部驻留；
-队列满或装入失败不丢失后续真实读取应报告的错误。`readahead` 要求可读的普通文件；当前块设备没有文件缓存装入接口，返回 EINVAL。
-`fadvise64` 可以用于只写 FD，FIFO 返回 ESPIPE，O_PATH 返回 EBADF。tmpfs／memfd 没有 swap，合法建议不撤销其内存后备。
-
-DONTNEED 先尝试范围写回接纳，不执行 fsync、不等待日志 durable 目标；随后按 inode 索引遍历指定范围，
-复用压力回收的摘索引、借用和物理页归还过程。只回收干净、无用户映射、无读写借用、无在途装入／写回的页。
-首尾部分页按固定 Linux 的完整页及精确 EOF 规则处理；不会以全局 LRU 扫描或截断式失效替代范围回收。
-建议不改变文件位置、内容或时间戳。预读、关闭、卸载与停止仍按已有 inode／实例引用和队列排空规则交接。
-
-## 传统与 OFD 记录锁
-
-`fs/record_lock.c` 为每个活 VFS inode 维护按有符号闭区间排序、带子树最大终点的 AVL 树和等待队列；冲突查询、同 owner 区间合并、分拆预留和批量摘除都按该树的相关范围搜索，不遍历 owner 在其他 inode 上的锁。每个锁节点同时挂在 owner 的侵入式链上，供关闭时定向释放；批量摘除通过 AVL 子树合并恢复平衡。长度为零延伸到 `INT64_MAX`，负长度向文件前方锁定，锁可以超过 EOF。`fs/files/locks.c` 导入 RV64 `struct flock` 并分派 `F_GETLK/F_SETLK/F_SETLKW` 与 `F_OFD_GETLK/F_OFD_SETLK/F_OFD_SETLKW`；标量 `fcntl` 命令仍走原入口。传统锁只保存设置者当时的根 TGID：冲突查询在初始 PID 命名空间原样报告，即使设置者已退出；其他视图按查询时的根编号绑定翻译，不可见为 0，OFD 锁为 -1。区间转换、读写权限、`l_pid`、坏指针和溢出错误按固定 Linux `references/linux/fs/locks.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 核对。
-
-错误检查先 pin fd，再导入 `flock`，最后检查对象是否支持记录锁。坏 fd 返回
-`EBADF`；有效 TTY 或 pipe fd 的坏指针返回 `EFAULT`，不被对象类型错误遮蔽。
-OFD pin 覆盖可能缺页睡眠的复制。`make test-record-lock-riscv` 用同一 ELF
-对照固定 Linux，覆盖六种记录锁命令及两种错误的优先级。
-
-传统锁 owner 是共享的 `kernel_files_record`，所以普通 fork 的新表不继承它，同表线程共享；该 owner 关闭同 inode 的任意 fd 就定向释放它在该 inode 的全部传统锁。OFD 锁 owner 是打开文件对象，dup/fork 共用且在最后真实引用消失时释放。两类 owner 身份不同，但相同 inode、范围和读写类型之间真实检查冲突。锁节点不反向引用 owner；VFS inode 在树或等待队列非空时不得释放。close、dup 覆盖、CLOEXEC、退出都在摘除 fd 的既有生命周期中释放对应锁，不把 OFD 锁留给历史 I/O cleanup。首次传统锁接纳后还在 FD raw 下重查原 OFD 身份；若 close 或编号复用已发生，撤销该 inode 的传统锁并返回 EBADF。owner 链首发布使用原子存取，使远端 close 可以判断是否需要进入 CPU0；空链与首次接纳的竞争由上述身份重查处理。
-
-写入前预留分拆和替换所需节点；`ENOLCK` 不改动已有锁集合。解锁、关闭释放和唤醒不分配。阻塞请求 pin OFD，持有转换后的稳定范围，登记与冲突检查在单 hart 关中断临界区内完成；唤醒后重新检查 fd/冲突，信号使用既有 `ERESTARTSYS` 协议。传统锁沿固定 Linux 的十步边界进行有限等待链死锁检查，OFD 锁不承诺该检测。inode 树、owner 索引和等待链仍在 CPU0 服务范围串行；FD 摘槽与 OFD 引用使用共同跨核协议。关闭释放自行保护摘链与通知的短区间，允许开中断的 CPU0 worker 调用，后端关闭在该区间外执行。宿主强制在首次锁发布前关闭原 fd，检查 EBADF、锁树为空及最终 owner 归还；另经真实 worker 最后关闭持有 OFD 锁的文件，核对通知及中断状态恢复。
-
-聚焦入口为 `make test-record-lock-host`（随机独立区间模型、AVL 不变量和 OOM 原子性）、`make test-files-riscv` 及 `make test-diff-abi-riscv`。后者在固定 Linux 启用 `CONFIG_FILE_LOCKING` 后比较真实阻塞、信号重启、死锁、dup/exec/CLOEXEC 与 unlink。`make test-record-lock-riscv` 用同一个静态 musl ELF 在固定 Linux 与 BoarOS 核对 pthread 共享 owner、fork、不相关 fd close、等待期间 fd 复用和阻塞线程所在组强制退出；SQLite 原生 Unix VFS 的多进程争用另由 `make test-sqlite-rollback-riscv` 验证。
-
-## `flock` 整文件锁
-
-`flock(32)` 的 `LOCK_SH/LOCK_EX/LOCK_NB/LOCK_UN` 使用独立于字节范围锁的冲突域。锁由 OFD 持有，dup、fork 和 SCM_RIGHTS 保留同一 owner，最后真实 OFD 引用释放时解锁；不同 open 的 OFD 在相同 inode 上相互检查冲突。转换先释放旧锁，再检查新类型，非阻塞升级失败或阻塞升级被信号中断后不恢复旧锁。非法命令先返回 `EINVAL`，有效命令的坏 fd 或 O_PATH 返回 `EBADF`；固定 Linux 仍接受的 `LOCK_MAND` 保留为成功空操作。
-
-`fs/flock.c` 为普通 backing inode 按需分配锁上下文，仅保存读者数、独占标记与等待队列；每个 OFD 内嵌 owner。VFS 别名共享节点，匿名 pipe 两端共享管道 inode，socket 各自独立，pidfd 按目标 PID 共享，mqueue 按队列共享。eventfd、timerfd、signalfd 与 epoll 对照 `references/linux/fs/anon_inodes.c` 使用共同匿名 inode；永久匿名 inode 与启动 console 使用静态上下文，其他上下文随真实 backing 对象结束释放。状态检查与等待登记由对象 raw 保护，分配、通知和 park 在保护外，由实际调用 CPU 执行；任务的 `flock_file` 持有等待期间的 OFD pin，正常返回和强制退出都通过同一释放入口归还它，信号沿 `ERESTARTSYS` 返回。
-
-`sh tests/host/flock.sh` 通过实际 raw/park 实现检查转换、已提交等待、信号取消、并发首次分配及资源归还；`tests/workloads/locks/flock.c` 检查 syscall、inode 身份及 dup/fork/SCM_RIGHTS 生命周期。
-
-## `openat` 与路径边界
-
-`kernel_files_openat()` 接收用户路径、dirfd、flags 和 mode，普通 Linux 结果通过 `linux_result` 返回，内核对象损坏或清理所有权异常则使用 `kernel_files_status` 报告。路径先复制到一张 4096 字节临时堆缓冲区：找不到 NUL 返回 `-ENAMETOOLONG`，不可读用户页返回 `-EFAULT`，空路径返回 `-ENOENT`。
-
-绝对路径忽略 dirfd，从 root 对象开始；相对路径从 cwd 或目录 fd 持有的目录项开始。无效 fd 返回 `-EBADF`，非目录 fd 返回 `-ENOTDIR`。VFS 在 mount 内逐分量处理 `.`、`..`、相对/绝对符号链接目标、尾斜杠和最多 40 次链接展开；open/exec/stat 跟随最终链接，`O_NOFOLLOW` 只在最终分量为链接时返回 `-ELOOP`，`O_CREAT|O_EXCL` 对它返回 `-EEXIST`。`symlinkat/readlinkat` 和 `AT_SYMLINK_NOFOLLOW` 访问链接本身；创建和删除仅解析父路径。逐分量搜索、最终访问与父目录修改执行实际凭据检查；mount namespace 仍未实现。
-
-支持普通文件与目录的打开，以及新建文件，严格遵循 Linux 解析与权限控制流：
-- 标志支持：`O_RDONLY`、`O_WRONLY`、`O_RDWR`、`O_CREAT`、`O_EXCL`、`O_TRUNC`、`O_APPEND`、`O_NOATIME`、`O_NONBLOCK`、`O_LARGEFILE`、`O_CLOEXEC`、`O_DIRECTORY` 和 `O_NOFOLLOW`。regular file 与 directory 接受并在 OFD status flags 中保留 `O_NONBLOCK`，`F_GETFL/F_SETFL` 可观察和切换该位；普通文件 I/O 不因此伪造 pipe 风格的 `EAGAIN`。
-- 解析顺序与 RO 保护：先尝试解析打开已有文件；若文件已存在，`O_CREAT | O_EXCL` 返回 `-EEXIST`；已有目录上的 `O_CREAT` 返回 `EISDIR`，`O_CREAT|O_DIRECTORY` 返回 `EINVAL`。写访问模式（`O_WRONLY/O_RDWR`）或带有 `O_TRUNC` 在只读挂载下返回 `-EROFS`，只读打开（`O_RDONLY | O_CREAT`）在只读挂载下允许成功；若文件不存在，未指定 `O_CREAT` 一律返回 `-ENOENT`，指定 `O_CREAT` 时若挂载为只读才返回 `-EROFS`。
-- 可执行互斥保护（`ETXTBSY`）：若目标普通文件作为运行中进程的可执行映像处于活跃状态（`exec_users > 0`），请求写访问（`O_WRONLY/O_RDWR`）或 `O_TRUNC` 立即返回 `-ETXTBSY`；反之，已被写打开的文件在执行 `execve` 时亦返回 `-ETXTBSY`。
-- 创建语义：当指定 `O_CREAT` 且文件不存在时，调用 `kernel_open_file_create_mode()` 新建普通文件。
-- 目录检查：目录以写模式（`O_WRONLY/O_RDWR`）或带 `O_TRUNC` 打开时返回 `-EISDIR`；普通文件配 `O_DIRECTORY` 返回 `-ENOTDIR`。
-- 截断语义：对已存在的普通文件指定 `O_TRUNC` 时，在打开成功且取得写租约后调用 `kernel_vfs_ftruncate(&description->file, 0U)` 将大小截断为 0。
-- 打开成功后按 VFS mode 把描述符分类为 regular、directory 或 console；directory 描述符支持 `getdents64`、`lseek` 与 `fstat`，`read` 返回 `-EISDIR`。文件不存在等路径错误由 VFS 保留为负 Linux errno；表满返回 `-EMFILE`，堆耗尽返回 `-ENOMEM`。
-
-该标志行为依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `references/linux/include/linux/fcntl.h`、`references/linux/fs/open.c` 与 `references/linux/fs/fcntl.c`。固定 musl 1.2.5（`references/musl/musl-1.2.5.tar.gz`，SHA-256 `a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4`）的 `src/dirent/opendir.c` 使用 `O_RDONLY|O_DIRECTORY|O_CLOEXEC`，不依赖 `O_NONBLOCK`；因此本改动不把 musl `opendir` 作为新增能力。
-
-`chroot` 按最终目录检查类型、搜索权限和 `CAP_SYS_CHROOT`，在共同短保护内替换 root 引用，保留 cwd。fork复制记录，CLONE_FS共享记录中的 root/cwd；已有 dirfd 和 OFD 保持原对象及已打开权利，绝对路径与后续解释器从新root开始解析。
-
-`openat2(437)` 导入 24 字节的 `open_how`，接受全零的扩展尾部，单独校验 flags、mode 和 resolve。它与 `openat` 共用打开及创建路径。解析器在跨越挂载点（包括 bind）、跟随符号链接或 proc 对象链接时检查对应限制；`RESOLVE_BENEATH` 拒绝逃出起点，`RESOLVE_IN_ROOT` 将绝对路径、绝对链接和根处的 `..` 限制在起点。发生挂载拓扑或目录父链变化时，受限查找可返回 `EAGAIN`，调用方可用相同约束重试。`OPENAT2_REGULAR` 在打开设备或 FIFO 之前要求最终对象为普通文件。
-
-现有路径索引命中后仍需后端复核，`RESOLVE_CACHED` 返回 `EAGAIN`，应用可去掉该位重试并保留其他解析限制。`O_EMPTYPATH` 仍返回 `EOPNOTSUPP`。`O_TMPFILE` 支持 tmpfs 和启用 journal 的 ext4；其他后端仍返回 `EOPNOTSUPP`。`O_DIRECT` 支持[块设备](riscv-virtio-block.md#用户态块设备)、[ext4 普通文件](vfs-ext4.md#普通文件直接-io)和 [FAT 普通文件](fat32.md#普通文件直接-io)。启用日志的 ext4 匿名临时文件同样支持，tmpfs 普通文件返回 `EINVAL`。 `tests/userland/openat2.c` 检查参数、受限创建、bind 挂载和 proc 链接。
-
-`getcwd` 返回包含 NUL 的字节数；用户缓冲不足为 `ERANGE`，已断开的 cwd 为 `ENOENT`。仍连接在命名空间但位于新root之外的cwd，raw syscall返回`(unreachable)`前缀及命名空间绝对路径；libc据此处理ENOENT。proc cwd/exe/fd/maps的展示保留根外及摘树对象的绝对名称和删除后缀，实际对象链接跟随仍持有真实路径，不依赖这些展示文本。删除目录后，其持有者仍可对 `.` 打开/统计、经 `..` 访问父目录、通过 `fchdir` 切回；不能在已删除目录中新建名字。改名会更新所有持有同一目录项的 cwd/OFD 所观察到的父链。fork 独立复制 fs record，进程形式和线程形式的 `CLONE_FS` 都共享它；切换 cwd 先取得新引用再替换，失败不改变原目录。
-
-`renameat2` 支持 flags 0 和 `RENAME_NOREPLACE`；未知或互斥组合返回 `EINVAL`，EXCHANGE/WHITEOUT 返回 `ENOTSUP`。保留 `renameat(38)` 兼容入口；固定 RV64 Linux 与 musl 使用 `renameat2(276)` 完成普通 rename，因此差分也使用该原生入口。后端操作事务成功接受后发布内存目录项变化，异步 journal mount 的持久化由组提交及目录同步保证；覆盖目标的 OFD 保留原 inode 和内容。目录 `..`、两侧链接数和持久 orphan 由同一事务处理。
-
-## 普通文件和目录的 inode 标志
-
-ext4 和 tmpfs 的 `FS_IOC_GETFLAGS`、`FS_IOC_SETFLAGS` 使用 32 位数据。可先查询标志，修改 `FS_IMMUTABLE_FL`、`FS_APPEND_FL` 或 `FS_NODUMP_FL`，再提交完整结果。请求改变其他位返回 `EOPNOTSUPP`。同一 inode 的硬链接、bind 视图和打开的描述符均可观察修改，`statx` 通过 `stx_attributes` 和 `stx_attributes_mask` 报告这三位。成功设置会更新 ctime 并发出 `IN_ATTRIB`。
-
-可写挂载上的只读 FD 可以设置标志。调用者须是 inode 所有者或具有 `CAP_FOWNER`；改变 immutable 或 append 还需要 `CAP_LINUX_IMMUTABLE`。immutable 禁止新的写打开，append 要求新的写打开带 `O_APPEND` 并禁止截断。旧描述符保留其打开时的追加模式。两种标志都限制改名、删除、建立硬链接和显式修改权限、归属、时间、扩展属性；append 目录允许新增目录项。nodump 可由子 inode 继承，仅向备份工具报告属性。旧描述符写入和共享映射的细节见 [ext4](vfs-ext4.md) 与 [tmpfs](tmpfs.md)。
-
-## `memfd_create` 与文件封印
-
-`memfd_create(279)` 返回可读写的匿名 tmpfs 文件；名称只用于 `/proc/<pid>/fd` 等展示。文件没有目录项，可通过 dup、fork 或 UNIX socket 传递 FD，也可经 proc FD 链接重新打开。FD 与映射共同维持同一 inode 和内存后备的寿命。支持 `MFD_CLOEXEC`、`MFD_ALLOW_SEALING`、`MFD_EXEC` 和 `MFD_NOEXEC_SEAL`；`MFD_HUGETLB` 返回 `EOPNOTSUPP`。
-
-`F_GET_SEALS` 查询 inode 上的封印，`F_ADD_SEALS` 通过可写 FD 增加封印。SHRINK、GROW 和 WRITE 约束对应的文件修改；已有共享映射仍有写权限或可升级为写时，添加 WRITE 返回 `EBUSY`。FUTURE_WRITE 禁止新的写入和新的共享可写映射，保留原有映射的权限；后续建立的共享只读映射不能用 `mprotect` 加写权限。EXEC 锁定执行位，给已可执行的文件增加该封印时也封住写入和尺寸变更；SEAL 禁止继续增加封印。映射拆分、搬移和 fork 维护原 inode 的写资格，撤映射在旧 PTE 失效后归还。
-
-`tests/userland/memfd.c` 检查 FD 传递、共享映射、proc 重开、封印和尺寸变更。
-
-## `pipe2` 与 FIFO endpoint
-
-普通用户的匿名管道、已打开FIFO读写及普通文件到管道的sendfile在发起CPU执行，复用下述片段、读写资格和端点短保护。没有附加观察者的匿名管道末OFD在调用者结束端点并通知；存在epoll登记或FIFO inode时仍沿CPU0完成关联清理。pipe2创建和FIFO路径打开沿原CPU0执行位置。
-
-读者在预约管道头部时取得首个片段的数据指针和长度。读取资格和槽预约共同阻止
-扩缩容与尾部合并改变该片段。消费已复制前缀时，最后一个片段在同一次状态更新中撤销预约。
-发布端检查等待队列的登记计数，已登记的线程仍在休眠前重查数据或容量。
-
-`kernel_files_pipe2()` 创建两个新的 open file description 和两个 fd 槽，共享一个片段环。默认容量为16个目标页（RV64KiB、LA256KiB），对象内保留16个槽描述符；更大的环另外分配描述符数组。各槽在写入时才取得一张独立目标页，不要求连续物理区间；扩容不预分配数据页，空 pipe 只占对象和必要的环元数据。读端只增加 read-side 引用，写端只增加 write-side 引用。`O_CLOEXEC` 保存在两个 descriptor flag 中，`O_NONBLOCK` 保存在两个 OFD status 中；`F_SETFL` 可切换 `O_NONBLOCK`，并接受 64 位目标上 musl 每次带来的 `O_LARGEFILE` 兼容位而不改变该位。
-
-读端有数据时按 ring 顺序返回，空且仍有 writer 时：阻塞 fd 进入 interruptible wait，非阻塞 fd 返回 `-EAGAIN`。所有 writer 关闭后空读返回 EOF；写端没有 reader 时返回 `-EPIPE`，同时向当前 task 发送 SIGPIPE，因此有 handler 时先观察信号、无 handler 时按默认动作终止。写端空间不足时阻塞或返回 `-EAGAIN`；不超过 4096 字节的单次写由writer复制资格和完整片段发布保持原子，较大写按可用空间推进。EOF/EPIPE 唤醒全部受影响 waiter。发布数据通知读者，读取或 splice 从已满环中释放首个槽时通知写者。异步读写信号维持各自的操作时点。等待者被唤醒后重查条件，也可被未阻塞信号唤醒后返回 `-EINTR`/按 `SA_RESTART` 重启。
-
-每个已发布的管道片段持有一份物理页引用，完全消费后归还。尚未发布的写入页也先归槽所有，复制 fault 时撤销并释放，最后端点销毁会回收全部剩余槽页。`write/writev` 跨 iovec 复制完整片段后才增加有效长度；复制中途 fault 时丢弃尚未发布的片段，已发布的前缀仍返回。后续写入只按请求长度的页内余数尝试并入尾片段，其余使用新页片段。`read/readv` 对一个片段的本轮请求必须完整复制到用户空间才消费它；fault 可使用户缓冲区出现前缀，但该未完成片段仍可被再次读取。已消费的先前片段决定返回进度，之后不会为了下一 iovec 再等待新数据。当前容量的槽已占满时 `poll` 不报告可写，即使尾页尚有可合并空间；小写入仍可尝试尾页合并。这些边界按固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `references/linux/fs/pipe.c` 对照。
-
-普通管道复制写入独占物理页。读者消费最后一个字节后，可以将该引用交给物理页分配器的
-两个备用槽之一，后续管道写入原子地取走引用。此时页内只有新写入并发布的片段对读者可见。
-`tee` 或部分 `splice` 产生共享引用时，双方不再将该页交给备用槽。完整转移则沿用原页资格。
-分配器找不到合适的空闲块时先归还备用页再重试，销毁管道也会排空备用槽。
-
-用户复制可能因文件映射缺页而睡眠，关中断不能单独保护复制期间的片段。读者、写者各有 rank15 可睡眠复制锁，同向请求保留顺序；不同头、尾页可以同时复制。writer 避开正在复制的读槽，不把新字节并入该页；已取得尾页合并资格的 writer 则先完成复制、发布或 fault 撤销，reader 才能消费或释放这张页。reader 仅在这种同页冲突时按 read→write 的 key 顺序等待 writer，writer 不反向取得 read。当前槽标记只覆盖复制，成功和 fault 都先撤标记再释放资格；空读/满写的 interruptible wait 在标记建立前登记并释放复制锁。用户复制缺页的等待返回 C 调用，信号由返回路径处理，不会遗弃仍有资格的槽标记。
-
-`F_GETPIPE_SZ` 返回当前容量；`F_SETPIPE_SZ` 在64位目标上也只消费参数的低32位，按目标页向上取整为二次幂，最少一页，超过2GiB的参数返回 `EINVAL`。容量属于共享pipe，读写两端、dup/fork和FIFO的已打开OFD看到相同结果。缩容按已占用片段数判断，槽装不下时返回 `EBUSY`，不能仅按有效字节数判断。调整容量先在锁外准备候选元数据，再按read→write取得两个复制资格，等待已有读、写和尾页合并完成；按现有环顺序迁移描述符，保留页、偏移、长度和合并属性，只在短metadata保护内发布指针和索引，锁外释放旧数组并通知writer。
-
-容量页数记在创建者真实UID的账户上，与pipe的可改权属和当前调用者UID分开。固定默认软限额为16384个目标页、硬限额为0（不限制）；超过软限额的新pipe降为两页，非特权扩容会返回 `EPERM`。`CAP_SYS_RESOURCE` 或 `CAP_SYS_ADMIN` 可越过UID软硬限额，只有 `CAP_SYS_RESOURCE` 可越过非特权单pipe的1MiB容量上限；缩容不因现有额度超限而拒绝。创建、扩缩容、失败撤销和最终销毁更新账户，普通数据读写不访问账户锁；创建后传递OFD或改变UID仍向原账户归还额度。
-
-锁顺序为 OFD offset（10）→ pipe 复制（15）→ 缺页所需 inode/backend（20/40），OFD pin 覆盖全部等待与复制。`make test-pipe-concurrency-host` 在4KiB、16KiB目标页下以握手暂扣尾写入，检查独立头读取仍能完成，以及同页合并时 reader 必须等待 writer；同时核对空对象、单页按需分配、消费归还、合并 fault 与最终所有权；容量用例检查环回和尾槽合并、槽占用缩容拒绝、复制中调整容量、扩容唤醒满管道writer、元数据分配失败撤销，以及真实UID额度、能力区别与最终归还。`make test-io-sleep-riscv` 保留真实调度下的复制睡眠和多写者内容检查。
-
-匿名pipe的mode与创建时间由共享pipe对象持有，fchmod更新权限和ctime并保留FIFO类型；fstat与proc跟随查询报告稳定inode身份及同一元数据，两端、dup/fork和proc重开一致。数据读写不改变匿名pipe时间。`make test-fifo-riscv`的同ELF反例在旧内核以ENOTSUP失败，在固定Linux和修复后通过；raw ABI另保护改权及坏输出指针。
-
-pipe 的 `fstat` 以 `S_IFIFO` 形态报告，`lseek` 返回 `-ESPIPE`；匿名pipe不进入ext4页缓存；命名FIFO另持真实VFS node。两个 endpoint 的最后一个 OFD 关闭后，剩余槽页、等待队列和 pipe owner 一起释放。创建或双 fd 安装的任一步失败都会先回收已创建 description/fd；只有真实 VFS/I/O 清理错误才由文件表保留 pipe 或 OFD owner，物理页和堆释放不建立重试状态。
-
-## `read/readv`、offset 与部分复制
-
-`kernel_files_read()` 最多传送 Linux `MAX_RW_COUNT` 形态的 `INT32_MAX` 向下页对齐值。无效 fd 或普通文件 OFD 的访问模式为 `O_WRONLY` 时返回 `-EBADF`；该访问模式属于 OFD，因此 `dup`/fork 后仍保持。访问模式检查先于零长度和用户地址检查；通过后，零长度无需解引用用户地址并返回 0。`pread64` 对普通文件使用同一可读性契约，但按调用者给出的非负 offset 读取且不推进 OFD offset。它在 MAX_RW_COUNT 截断和 EOF 判断前校验原始用户范围，非法高地址即使 count 为零也返回 `-EFAULT`。与固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`fs/read_write.c`](../../references/linux/fs/read_write.c) 中 `vfs_read()` 顺序一致，非零读取先按调用者给出的原始 count 验证整个用户范围，再把实际请求截断到上限，从挂载共享缓存取得需求页并执行 `copy_to_user`。
-
-open file description 的 offset 只增加实际复制到用户空间的字节数。首块即发生用户 fault 时返回 `-EFAULT` 且 offset 不变；已经复制前缀后再 fault 或遇到底层读错误时返回前缀长度，并只提交该前缀。磁盘普通文件的缓冲读取先用当前文件长度裁剪需求批次。到达 EOF 直接结束，避免装入尾部的部分页。真正请求的页仍由页缓存复核当前 EOF。
-
-`kernel_files_readv()` 使用相同的普通文件读取核心，整个调用只钉住一次 OFD，并把用户 iovec 快照到最多 8 项的栈数组或最多 1024 项的受限堆数组。先检查 fd 的读权限，再导入向量；readv、writev 和 socket 消息共用 `fs/uaccess_iov_internal.h` 的导入规则，按固定 Linux 的 `references/linux/lib/iov_iter.c` 校验每项有符号长度和地址。单项向量先按 `MAX_RW_COUNT` 截断，多项向量先校验原始范围再截断累计长度；空区间允许地址等于用户上界，零项向量不访问描述符指针。零项向量返回 0，零长度段跳过；普通文件按实际交付量推进共享 OFD，EOF、短读、fault 与后端错误均结束本次请求。已发布 serial TTY 的 console/ttyS0/tty 完整 readv 由 [TTY 行规程](kernel-tty.md) 保持一次请求、64B continuation 与消费前缀；未建立 transport 的裸 UART fixture 仍只做一次输入暂存。pipe 按上述片段提交规则消费数据。epoll 描述符没有 read 操作，在向量导入前返回 `-EINVAL`。
-
-磁盘文件的 `read/readv/pread` 共用需求读取核心，先批量取得本次请求覆盖的缓存页，再逐页复制到用户。每个用户复制 chunk 最多覆盖当前基页剩余部分，用户方向仍按基页查询和固定映射。批量装入、SG 大小、错误与页引用规则见 [VFS 批量读](vfs-ext4.md#缓存版本内的批量读)；缓存到用户保留一次复制。模块统计调用/失败次数、字节、chunk、当前/峰值 fd、表容量与 close-on-exec 数量，页缓存另统计 hit/miss/insert/eviction/reclaim。没有直接用户页 I/O 或用户态异步 I/O 接口。
-
-## 描述符 `write`/`writev` 与文件修改
-
-`write` 与 `writev` 支持 console、pipe 以及具备写权限（`O_WRONLY/O_RDWR`）的常规文件：
-- 生产 console 经 [TTY](kernel-tty.md) 接受有界 TX、OPOST 和真实输入；不自动建立 ctty。未发布 serial transport 的裸 console fixture 经 kernel_console_putc/原输入暂存。用户 fault、短计数和阻塞 pin 保持所属请求的真实 owner。
-- pipe 的 `write/writev` 汇总后沿用 pipe 单次写空间、原子性、阻塞、EPIPE/SIGPIPE 和片段提交规则。
-- regular 文件通过 `kernel_vfs_write_user()` 把用户 iovec 直接复制到共享 inode 页缓存或 tmpfs 后备页。每次先固定来源用户页，再取得目标写资格；没有请求中转页。部分 usercopy 只发布成功复制的前缀，并推进对应 offset/逻辑大小。writeback 错误由 inode 保留，不能事后撤销已经接收的字节。
-- `kernel_files_sync()` pin 选定 OFD，分批交接目标 inode 数据，按后端执行策略捕获一次元数据durable目标，ext4在发起CPU准备，再由原调用者等待 journal 完成。栈上等待请求借用这份实际 OFD/file，关闭并复用 fd 不改变同步对象；后端执行者释放准备资格后由日志worker推进。完成事件在共享保护内一次性记录元数据错误、消费 OFD 错误游标并发布原请求结果，调用者取走结果直接返回；数据交接失败不重复递增错误序号。独立 open 各持观察位置，dup/fork 共用，同一历史错误只被该 OFD 观察一次。独立同步不以文件位置锁覆盖设备等待；普通文件和目录支持 fsync/fdatasync，pipe、字符设备、epoll 返回 EINVAL，无效 fd 返回 EBADF。分批、完成与停止边界见[VFS](vfs-ext4.md#文件节点与页缓存)。
-- `RLIMIT_FSIZE`来自原调用者线程组，在本次用户文件操作中以栈上限额对象传到VFS；CPU0执行者借用它，完成后由原调用线程处理SIGXFSZ。普通write/writev及定位变体按限额截短，起点已到限额时返回EFBIG并发送线程定向SI_USER信号；零长度写保留原地址检查。追加偏移在整次写操作保护内取实际EOF。sendfile按splice的剩余buffer继续接纳，因此跨限额时可返回已成功前缀并同时产生SIGXFSZ。
-- truncate仅在扩大文件时应用FSIZE；fallocate 的 mode0 扩大 EOF 时应用 FSIZE，tmpfs 的 KEEP_SIZE 在预留末端超过 EOF 时也检查 FSIZE；ext4 KEEP_SIZE 和打洞不扩大 EOF。限额拒绝发生在时间戳、用户复制和映射修改之前。普通内核pwrite、loop内部I/O、mmap脏页写回和已接纳版本的同步使用各自既有约束；下调用户限额不会使旧脏页失去持久化资格。
-- `O_SYNC/O_DSYNC` 在普通写的成功前缀之后，同步实际范围 `[end_offset-written,end_offset)`；append 使用本次取得的真实 EOF，定位写和 EFAULT 短前缀也沿用实际接纳结果。同步失败返回 errno，OFD offset 与已接受内容保持；这与 Linux `generic_write_sync()` 的顺序一致。full/data 目标、时间戳及挂载同步的职责见 [VFS 同步机制](vfs-ext4.md#文件节点与页缓存)。journal commit 屏障成功后发布 durable，checkpoint 独立回收旧版本。后台清脏和组提交不替代同步错误观察与屏障。
-- `writev` 沿用上述共用向量导入规则，再与 write 共用写入核心；`iovcnt` 上限 1024。
-
-## `sendfile` 与来源片段
-
-RV64 syscall 71 用内核有界复制支持 regular/tmpfs 输入，输出可为 regular、pipe、
-stream 或 datagram socket。输入、输出各有 OFD pin，正常或信号取消均沿保存的
-syscall 栈展开。stream socket 从取得引用的来源页送入协议后备，pipe 直接借用来源页，
-不经过请求中转页；同一 task I/O 登记在正常返回、信号取消和退出回收时归还
-来源页引用。借用固定后备页寿命，不将来源变成不可修改的快照；TCP 在提交时
-仍 COPY 到协议自己持有至 ACK 的版本。tmpfs 稀疏洞只生成当前零片段，不为
-读取建立文件页。regular 输出保留独立请求页，支持同 inode 及重叠区间复制。
-datagram 来源单独申请最多16个目标页的一批整包缓冲（RV64KiB、LA256KiB），
-不再同时取得未使用的 scratch，再接发送者整包 request owner/内存等待。
-每批是一条 datagram，页大小不改变用户指定长度或 UDP 最大 payload；
-不以普通 POLLOUT 预留整包。
-
-NULL offset 推进共享输入位置；显式 offset 只更新用户给定位置。两个 regular
-OFD 的位置锁按 rank/key 排序，同一 OFD 或 dup alias 只取一个锁、只推进一次。
-读取来源后释放 inode 数据锁，再经目标每批 rank 15 门闩写入；整次复制允许批次
-间交错，不跨另一个 inode 的读取持目标门闩。用户 offset 的初始读取先于 fd
-检查，最终复制在锁外；只读 offset 可在内容已经输出后返回 EFAULT，不能回滚
-真实副作用。
-
-每个同步输出批次都等待 O_SYNC/O_DSYNC。首批同步失败不发布位置，但保留真实
-修改的内容；后批失败仅返回此前成功同步批次的正前缀。这个位置规则与普通 write
-不同，依据固定 Linux v7.2 的 `fs/read_write.c::do_sendfile`、`fs/splice.c`
-和 `generic_write_sync`。不改变 journal、必要 FLUSH 或 durable 条件。
-
-sendfile 的管道目标复用下述 splice 文件来源路径，借用真实缓存／内存页；稀疏内存文件的空洞使用临时零页，
-不为读取在源文件中分配存储。文件或用户来源的共享片段禁止后继普通 write 并尾；
-普通 write/writev 自有页仍可合并。片段消费后归还真实页引用，复用槽位时重新发布来源属性。
-
-```sh
-python3 -B tests/userland/run.py --workload sendfile
-make test-files-partial-write-riscv
+    FDTable -- "dup / fork 共享同一 OFD" --> OFD
+    OFD --> Backend
 ```
 
-同一真实用户态探针检查位置、alias、错误顺序、传输后 offset fault、EOF/count
-上限、stream 短输出、datagram 边界和整包预算、pipe EINTR/EPIPE/SIGKILL，另有
-动态填满 pipe 后的来源组合回归。模块复用真实 FLUSH 错误，检查八种同步批次
-失败副作用；宿主、固定 RV64 Linux 与 BoarOS 证据见网络学习记录。管道容量支持 F_GETPIPE_SZ/F_SETPIPE_SZ；特殊设备和 proc 来源见下节 splice 的方向能力。
-
-## `splice`、`tee` 与 `vmsplice`
-
-RV64／LA64 原生编号分别为75（vmsplice）、76（splice）、77（tee）。这三个入口与 sendfile、
-copy_file_range 共用 `fs/files/transfer.c` 的传输逻辑，固定实际 OFD 引用后再处理数据，
-不会通过反复调用 read/write syscall 搬运，也不临时更改共享 OFD 标志。
-
-- splice 至少一端必须是管道，支持文件→管道、管道→文件、管道→管道及已有 socket 数据路径。
-  文件来源包括 tmpfs/memfd、ext4、VFAT、块设备、proc快照／控制文件和明确开放该方向的字符设备。
-  /dev/zero 支持读写、/dev/null 只开放输出、随机设备沿现有读写能力执行；未开放方向返回具体错误。
-- tee 只接受两个不同管道，复制片段描述和页引用，源数据不消费。完整 splice 片段移交原引用；
-  部分片段及 tee 另取引用，禁止目标并尾，最后一个实际使用者结束后释放页面。
-- vmsplice 的可写 FD 把用户页接入管道，可读 FD 向用户 iovec 复制。先导入一份向量快照，最多1024项；
-  来源页在权限／缺页准备后取得独立物理引用，再归还临时 MM pin。解除映射、fork/COW及退出不使排队页失效。
-  缺页内存不足返回 ENOMEM，坏地址或权限失败返回 EFAULT；有进展时保留已完成前缀。
-
-接受 MOVE、NONBLOCK、MORE、GIFT。MOVE/GIFT是提示，不强制迁走物理页或撤销用户映射；共享页引用保证存储存活，
-调用者应遵守 Linux 对共享／赠予页面的修改约束。普通 pipe 写入不得把数据追加到这些共享页中。
-NONBLOCK控制管道等待，实际文件装入和socket收发保留后端规则；vmsplice只依据本次NONBLOCK标志决定等待，
-不把FD的O_NONBLOCK替代为调用标志。未知标志返回EINVAL。splice的零长度先返回0，tee先校验标志；
-vmsplice先检查标志、FD模式和向量，空向量可以在不访问管道数据时返回0。
-
-管道端不能提供offset指针，返回ESPIPE；两个普通文件或同一个管道返回EINVAL。普通文件的位置指针显式指定时
-不改变共享位置，未提供时在同一OFD位置资格内更新；字符设备按自身回调处理位置，读零或丢弃写入不累加offset。
-用户offset输出故障保留已发生的数据和消费副作用。封印、FSIZE／SIGXFSZ、set-ID／filecap清除使用共同文件写入过程。
-O_SYNC／O_DSYNC目标等待已写范围的固定同步目标：同步失败保留真实文件内容修改，但不提交本次管道消费和文件位置。
-
-管道片段资格在OFD位置、UNIX控制／引用图及文件写操作资格之前取得。等待管道数据或容量时不占文件位置；
-入口短快照保留Linux错误顺序，开始搬运时重新检查实际共享位置。一次读取固定已发布的输入前缀，
-输出接纳后统一消费，不在已有进度后重新等待其他读者留下的数据。跨管道按实际资格键排序，复制、分配、
-用户缺页和物理引用释放都在状态短保护外完成。普通read/readv及vmsplice读取也使用这一前缀借用。
-
-TCP与UNIX STREAM沿已有发送接纳和接收预约处理；信号中断后的正前缀不会再次重启。数据报／SEQPACKET输出
-按最多16个管道片段形成有界批次，复用暂存空间，保留消息消费、控制消息丢弃和发送预算规则。
-预先排队的UNIX FD控制记录由原网络机制归还，不把FD当作管道内容交付。管道搬运触发访问／修改通知，
-不会把普通FIFO read/write的时间戳更新强加给splice、tee或vmsplice。
-
-`python3 tests/userland/api8.py --program splice --program copy_range` 在固定Linux和BoarOS运行同一ELF，
-检查原始入口与libc包装、页共享／unmap、EFAULT、管道容量、offset输出故障、稀疏内存文件、字符设备、
-proc控制、FIFO时间戳、FSIZE、文件封印、TCP／UNIX控制消息、分段数据报及调用CPU。
-`tests/host/pipe-concurrency.sh`检查4/16KiB页的真实物理引用、OOM前缀、反向搬运和原管道并发契约；
-`FILE_IO_TRANSFERS_ONLY=1 tests/host/file-io-concurrency.sh`检查同步错误、vmsplice等待与共同文件复制路径。
-
-## `copy_file_range`
-
-系统调用 285 支持在同一文件系统实例内复制普通文件，包括经绑定挂载取得的文件。
-ext2、ext4、tmpfs 和 VFAT 的普通文件跨实例复制返回 `EXDEV`，同一文件系统类型
-的两个实例也遵循这条规则。
-
-两个 OverlayFS 文件可以来自不同叠加实例。内核从已打开的源文件选定后备层，
-目标文件使用其可写上层，两个后备文件必须属于同一个文件系统实例。
-一端为 OverlayFS、另一端为普通后备文件系统时返回 `EXDEV`。
-已选定的源层随源文件描述符保活，复制过程中发生的上层副本发布不会切换来源。
-两个叠加视图指向同一个后备索引节点时，重叠的复制区间返回 `EINVAL`。
+- **高效槽位管理与锁外阻塞**：`struct kernel_files_record` 初始提供 `32` 个槽位，内置 `512` 位内联占用位图（`KERNEL_FILES_INLINE_BITMAP_CAPACITY`）和 `next_fd` 提示以快速分配最小空闲编号，最大容量受进程 `RLIMIT_NOFILE` 限制。打开或接收新描述符时，先在表短锁（`Rank 25`）内标记 `KERNEL_FILES_FD_RESERVED` 预留槽位，释放锁后再执行可能睡眠的文件打开或用户拷贝，成功则原子发布 OFD，失败则取消预留，避免持表锁睡眠。
+- **统一的引用计数与锁外释放**：所有系统调用入口先通过 `fd` 查找并递增 OFD 的引用计数，释放文件表锁后再执行实际 I/O；`close`、`close_range` 或 `exec`（清理带 `FD_CLOEXEC` 的槽位）只摘除槽位并递减引用，只有最后一份引用归还时才在锁外执行后端关闭与资源回收。
 
-`flags` 必须为零。目录返回 `EISDIR`，其他非普通文件返回 `EINVAL`；
-输入不可读、输出不可写或设置了 `O_APPEND` 时返回 `EBADF`。
-检查同一文件的复制区间是否重叠前，先按源文件末尾、目标文件最大尺寸及
-`RLIMIT_FSIZE` 缩短实际范围。
+---
 
-两端 fd 先取得独立 OFD pin，再读取显式用户 offset。隐式 offset 在 OFD 位置锁
-内取值并提交；两个锁按 key 排序，alias 只取一次。复制成功后按输入、输出顺序
-更新显式指针或共享位置，某一指针复制失败仍提交另一端；无数据复制时不写回
-用户 offset。与 sendfile 的普通文件目标共用复制路径：不同 inode 的磁盘文件
-可一次借用最多八个源缓存页，直接交给普通写入入口，由目标按实际页边界复制。
-一个窗口只做一次目标写入接纳；读源时未持有目标写锁，写目标时只借用源页内容，
-不持源 inode 或索引锁。每个窗口结束即归还全部页，包括错误后的未消费页。
-内存文件来源、同 inode 复制及需要逐批同步的 sendfile 使用单页暂存。
-后端保留权限位清除、部分写、空间耗尽及 I/O 错误处理；copy_file_range 的
-O_SYNC/O_DSYNC 在整次复制后同步一次，同步失败返回错误而不提交 offset。
+## 三、文件读写与内核内数据传输
 
-`tests/workloads/io/copy_range.c` 检查四种 offset 组合、EOF、同 inode 区间、错误
-顺序、copyout 副作用、FSIZE、独立 tmpfs 实例和绑定视图；环境变量
-`COPY_RANGE_VFAT` 可指定已挂载 VFAT 目录运行同一内容检查。
-`tests/workloads/fs/overlay.c` 使用独立 ext4 卷验证跨叠加实例复制、后备文件重叠及跨卷拒绝。
+### 3.1 标量、向量与定位读写
 
-## 目录与文件系统操作
-
-- `kernel_files_mkdirat()`：取得 root/cwd/dirfd 起点后调用 `kernel_vfs_mkdir_at()`；只读挂载返回 `-EROFS`。
-- `kernel_files_unlinkat()`：支持文件删除与目录删除（`AT_REMOVEDIR` 标志）。普通文件调用 `kernel_vfs_unlink()`，仍打开的对象保留页缓存；目录删除调用 `kernel_vfs_rmdir()`，非空目录返回 `-ENOTEMPTY`。
-- `kernel_files_ftruncate()`：校验 fd 具备可写权限且为常规文件，调用 `kernel_vfs_ftruncate()` 调整文件大小（向下截断或向上 sparse 扩展）并精确失效该节点页缓存；backend 已改变 inode 后才返回错误时，仍先同步 node/file size 并失效缓存，再把 errno 返回用户态。只读描述符返回 `-EINVAL`，目录返回 `-EISDIR`。向下截断根据实际新大小通知稳定 node–MM 登记，撤销所有相关 MM 中越过新 EOF 的整页 PTE（包含私有 COW 与 PROT_NONE），保留 VMA 以便随后 fault/SIGBUS。非对齐尾页的文件来源后缀清零，已私有化内容保留；来源记录不依赖缓存索引或 PTE COW 位。
-
-- `kernel_files_fallocate()` 从 FD 表取得真实 OFD，随后与 MADV_REMOVE 共用 `kernel_open_file_fallocate()`：检查可写模式、对象类型、有符号范围和模式，按实际后端执行，保持 OFD offset。MM 调用者先归还映射修改资格和用户 pin，再由来源借用保活 OFD，打洞过程可以反向撤销共享映射。RV64/LoongArch64 共用 syscall 47；ext4 与 tmpfs 均支持预留、保持大小和保持大小的打洞，其余后端或模式返回 `EOPNOTSUPP`。`O_SYNC/O_DSYNC` 成功操作在归还写操作资格后等待完整文件持久化，复用该 OFD 的写回错误游标；CPU0 后端请求借用原调用者凭据和写操作资格。实际 extent、缓存和 mmap 一致性见 [VFS 范围操作](vfs-ext4.md#文件空间预留与打洞)。
-
-`read/readv` 与 `write/writev` 在 fd lookup 后立即取得独立 OFD 引用，并在本次操作的全部复制、等待和唤醒处理结束后释放。共享表中的另一个线程即使在操作睡眠期间 close 并复用同一 fd 号，本次操作仍使用 lookup 时的 OFD；对于 pipe，这份引用也让原读/写 endpoint 在 in-flight I/O 结束前保持逻辑存活，避免提前产生 EOF/EPIPE 或释放等待队列。末次操作引用触发的底层 cleanup 失败会转交给共享文件表的原有 cleanup 链。该语义基线对应固定 Linux `f4cdf7ca9a1f` 中 [`fs/file.c`](../../references/linux/fs/file.c) 的 `fdget()`/`fdput()` 生命周期。
-
-标量读写在验证当前任务身份后，一次借用文件表和地址空间。已有文件描述符的读写无需查询
-新描述符的分配限额。`/dev/null`、`/dev/zero` 和 `/dev/full` 的数据操作在调用核完成。
-提供零值的设备共用只读零缓冲和用户页复制游标，复制故障保留已写到用户地址空间的前缀。
-丢弃写入仍检查文件访问模式和地址范围，随后由设备返回接受字节数或错误。
-
-## I/O 多路复用与 `poll/select`
-
-`kernel_files_ppoll()` 与 `kernel_files_pselect6()` 提供 Linux I/O 多路就绪通知：
-
-USER_SMP 中，FD快照、pipe/socket/epoll及普通文件的就绪查询、临时信号掩码、等待和结果复制在发起CPU执行。对具有实际就绪状态的对象，引擎先取得真实OFD引用，再按对象判断是否需要CPU0；设备集合在准备等待token前进入原业务范围。嵌套epoll在prepared token期间仅观察就绪提示，实际目标查询留在token结束后。
-
-- **普通文件立即就绪**：`kernel_files_scan_select()` 按每 64 个编号检查用户位图实际请求的槽位，
-  每字最多取得一次文件表保护。只查询普通文件且有可报告事件时，调用直接生成读写就绪位图。
-  同一编号可同时计入读集和写集。遇到具有实际就绪状态的对象时，后续查询持有真实文件引用并使用对象等待队列。
-
-- **OFD 就绪检查与等待契约**：每个 open file description 通过 `kernel_open_file_poll()` 报告当前就绪位（`KERNEL_POLLIN/OUT/PRI/ERR/HUP`）并导出所属事件等待队列。管道为空且无写者（`POLLHUP`）、读端有数据（`POLLIN`）、写端有空间（`POLLOUT`）、控制台输出可用或常规文件读取就绪等状态在第一遍扫描时直接确定；若已有就绪事件或指定超时为零，则完全跳过睡眠，并直接交付该次扫描的结果，不在返回前重复查询。需要查询状态的零超时调用准备 OFD 引用数组，等待节点仅供允许休眠的请求使用。
-- **多队列等待节点（Wait Node）泛化**：调度器等待队列泛化为由 `struct kernel_wait_node` 串联的双向链表。当 poll 需要睡眠等待时，在被关心的所有有效 OFD 等待队列上分别挂载独立的等待节点（均绑定同一个task/代次token），任一队列事件触发唤醒即退出阻塞，并在返回前可靠从全部队列脱链。登记后的复查和唤醒后的扫描直接填写 revents；登记、复查、park 的顺序仍保证事件不会丢失。
-- **OFD 钉住引用（Pinned References）生命周期**：进入阻塞前，poll 引擎通过 `kernel_files_pin()` 对所有被监听的有效 OFD 各获取一份独立引用。这确保了在多线程共享文件表环境中，即使另一线程在睡眠期间 `close()` 并复用相应 fd，正在被 poll 的 OFD 及其内部等待队列依然受保护，不会发生 Use-After-Free；唤醒与清理时统一通过 `kernel_open_file_release()` 释放。
-- **原子信号掩码替换**：`ppoll` 和 `pselect6` 支持以原子方式应用调用者指定的临时 `sigmask`，使阻塞等待能够被特定信号打断并返回 `-EINTR`，返回或打断时自动恢复原有信号掩码。
-- **紧凑栈预算与堆回退**：任务元数据虽已与 8 KiB 执行栈分离，仍需为 Trap 和深调用链保留余量；`poll` 与 `pselect6` 严格控制栈帧大小（快速路径最多 4 个描述符节点、select 最多 64 个 fd 的单字 bitset）；超出快速路径容量时统一从进程私有 `files->heap` 动态分配并在返回前完全回收，避免击穿内核栈金丝雀（Canary）。
-
-## epoll 事件通知子系统
-
-`kernel_files_epoll_create1()`、`kernel_files_epoll_ctl()` 与 `kernel_files_epoll_pwait()`
-负责 fd 安装、目标引用和用户 ABI。等待扫描、事件复制和park在发起CPU执行；创建、控制和最终销毁仍由CPU0完成。多个等待者沿已有scan owner和状态短锁竞争，设备目标只在锁外查询时进入其CPU0执行范围。创建复用普通 fd 安装原语；表满返回 `EMFILE`，
-归还尚未安装的 epoll/OFD，不覆盖已有槽。
-
-`epoll_pwait2(441)` 导入原生64位timespec，NULL表示无限等待，零值只查询。
-它与毫秒形式的`epoll_pwait`在入口计算一次单调期限，再共用扫描、临时信号掩码、
-等待登记和完整事件复制后的ET/ONESHOT消费；纳秒期限不先截成毫秒。
-
-登记身份是 `(fd, OFD)`，因此指向同一 OFD 的不同 dup fd 可以分别登记。关闭其中一个
-fd 不会使仍由其他引用保活的登记失效；目标 OFD 最终释放时才解绑关联。登记中的目标指针为弱关联；末引用归零至关闭者取得epoll状态锁解绑之间，扫描可能仍看到登记。扫描在状态保护内尝试取得活OFD引用，归零目标直接跳过；关闭者完成解绑后才释放存储，扫描不会复活关闭中的对象。支持具有真实
-等待通知的 pipe、console、socket 和 epoll；普通文件、目录返回 `EPERM`。自监控返回
-`EINVAL`；五个 epoll 对象到管道的链可建立，第六个 epoll 或成环返回 `ELOOP`。Linux 新版本提前检查深度并返回 ELOOP，旧 LTP 的 EINVAL 单值断言由上游 e84f0689 扩为接受两者。
-
-登记使用私有 AVL，ready/pending 是可直接摘除的双链。ADD 候选先分配，最终图检查、
-重复检查与发布之间禁止 CPU0 任务切换；索引、就绪链、扫描资格和控制代次由 epoll 短状态锁保护。远端通知先在保护内发布，再借用等待游标在锁外向上传播；删除先撤下登记，再在锁外等待回调归还。纯查询借用候选并刷新，
-不占用交付扫描、不消费 ET 或解除 ONESHOT。完整 16 字节 event 成功复制后才提交；
-复制故障保留失败项，返回完整前缀或首项 `EFAULT`。目标查询、用户复制及最终释放均
-在 prepared token 与协议资格之外。
-
-对象和等待关系见[子系统说明](../learning/epoll-subsystem.md)，交付、通知代次、
-并发取消及测试见[事件交付](../learning/epoll-delivery.md)。
-
-## `lseek`、`fstat`/`newfstatat` 与 `getdents64`
-
-`kernel_files_lseek()` 支持 `SEEK_SET/CUR/END` 的有符号运算与溢出检查，负结果返回 `-EINVAL` 且不移动 offset，越过 EOF 的定位成功；console 返回 `-ESPIPE`。目录也支持 `lseek`，其 offset 兼作 `getdents64` 的条目 cookie。
-
-`kernel_files_fstat()/newfstatat()` 按 riscv64 asm-generic 128 字节 `struct stat` 填充。regular file 与 directory 都先由 `kernel_vfs_fstat()` 取得同一份 filesystem-independent metadata，再转换为 Linux ABI；dev/ino/mode/nlink/uid/gid/size、512-byte `blocks`、filesystem `blksize` 和 atime/mtime/ctime 除 size 来自共享 node 的逻辑大小外，均来自当前 ext4 inode。打开后 unlink 的 file handle 仍指向活着的 inode，因此 `fstat` 可继续读取内容与 metadata，并观察到 `nlink == 0`。已登记块设备的 ext4 挂载以真实设备号作为 `st_dev`；未登记设备的独立模块 fixture 使用其 VFS mount ID。
-
-console、匿名pipe和epoll是不属于filesystem inode的合成对象，继续走各自的显式 stat 形态；console 呈现 5:1 字符设备，pipe 呈现 FIFO。`newfstatat` 支持 cwd/dirfd/绝对路径与 `AT_EMPTY_PATH`（按 fd 取对象，`AT_FDCWD` 取 cwd）；目录路径可统计，`AT_SYMLINK_NOFOLLOW` 通过路径 inode 查询返回链接自身的 mode、大小和时间戳。proc fd 的伪对象跟随式统计复用同一元数据快照。常规文件 create/read/pread/write/writev/truncate/unlink 已更新 realtime 时间戳：读取按 relatime（含缓存命中、非零 EOF 和 user fault），写入先校验 inode maxbytes，再在 usercopy 前修改 mtime/ctime，同长度 truncate 也更新；零长度或访问模式拒绝不更新。创建/移除更新父目录 mtime/ctime，unlink 后仍打开的 inode 继续通过 live handle 更新。扩展 inode 保留纳秒与 signed epoch，旧 128-byte inode 按秒截断；只读挂载不写 atime，未初始化时钟不覆盖 fixture metadata。触发、I/O 错误 owner 和固定 Linux 依据见[文件时间戳](../learning/file-timestamps.md)。
-
-`AT_EMPTY_PATH`接受空字符串和NULL pathname。已知空路径直接取得fd对象或cwd，
-不分配完整路径缓冲；正fd的空路径查询按固定Linux优先走fstat，包括其他查询位的
-错误顺序。非空路径接受NO_AUTOMOUNT和stat查询同步位；本地后端没有自动挂载或远端
-元数据缓存，不由这些位增加数据操作资格。依据为`references/linux` v7.2的
-`fs/namei.c::__getname_maybe_null`与`fs/stat.c::vfs_fstatat`，同ELF差分入口是
-`tests/diff-abi/path_only.c`；文件fixture另检查空路径不产生路径容量的分配。
-
-`faccessat` syscall 48 与 `faccessat2` syscall 439 共用权限判断。前者固定使用真实 UID/GID、补充组与对应 capability，忽略第四参数；后者以 `AT_EACCESS` 选择当前 fsuid/fsgid/effective capability，以 `AT_SYMLINK_NOFOLLOW` 查询最终链接本身，以 `AT_EMPTY_PATH` 查询 cwd 或实际 FD 的对象，包括 O_PATH、已删除文件与匿名对象。所选凭据同时用于逐级目录搜索、proc 敏感访问及最终对象判断。非法 mode/flags 先返回 `EINVAL`；路径输入 fault 为 `EFAULT`，固定 Linux 的 faccessat2 即使带 `AT_EMPTY_PATH` 也要求可读的空字符串，NULL 仍为 `EFAULT`。非目录执行的 DAC override 仍要求至少一个执行位；普通文件或目录的写请求检查最终挂载，只读时返回 `EROFS`，权限错误先于只读错误。普通文件的 X_OK 在最终 NOEXEC 挂载上返回 `EACCES`，先于 DAC 和只读写检查；目录 X_OK 仍检查搜索权限。NODEV 不改变设备节点的 access 权限回答，普通设备打开由 VFS 另行拒绝。ACL 仍未实现。边界由 `tests/diff-abi/access.c`、`faccessat2.c` 的同 ELF 差分核对；依据是本地 `references/linux/fs/open.c::do_faccessat`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
-
-`kernel_files_getdents64()` 只作用于目录描述符，其他类型返回 `-ENOTDIR`。每条记录按 linux_dirent64 编码（`d_reclen` 8 字节对齐，`d_type` 来自 ext4 filetype），`d_off` 是下一条记录的后端 cookie，不是条目计数；即使容量为零也先判断是否存在下一条记录：存在但放不下返回 `-EINVAL`，EOF 返回零。容量不足不消费该项 cookie；用户 fault 在已完整发出的记录上返回前缀计数。
-
-## 关闭与退出回收
+`fs/files/io.c` 统一处理 `read`/`write`、`pread64`/`pwrite64`（不改变 OFD 偏移的显式定位读写）、`readv`/`writev` 以及带逐次标志的 `preadv2`/`pwritev2`（最多支持 `1,024` 个 `iovec` 向量段，支持 `RWF_HIPRI`/`DSYNC`/`SYNC`/`APPEND` 等标志）。
 
-`close` 先从表中摘除选定 fd，并更新 open-fd/CLOEXEC/close 统计，再只释放该槽的 OFD；有效 close 返回 0，重复或无效 fd 返回 `-EBADF`。选定 OFD 的 VFS/I/O 清理需要重试时，文件表只将该 owner 入队一次。`close` 不会排空既有的 `cleanup_files`，因而不会释放或返回无关历史清理的结果；批量的 `close_on_exec` 和最终 `kernel_files_release()` 各自承担自己的清理回收。
+- **原子偏移与精确部分完成**：顺序读写在 OFD 级 `offset_lock`（Rank 10）保护下推进文件位置，确保并发读写同一描述符不发生偏移撕裂；如果前段向量成功传输后在后续向量触及无效用户地址，内核返回已完成的字节数，仅在首个字节前出错时返回 `-EFAULT`。
+- **异步 I/O 直通路径**：满足扇区对齐且单次不超过 `64 KiB` 的普通文件定位直接读写，可接入内核异步 I/O 后台执行者（见 [系统调用与异步 I/O](kernel-syscall.md)）。
 
-`kernel_files_close_on_exec()` 扫描 `FD_CLOEXEC` 槽并使用同一“先逻辑摘除、再物理清理”规则。它只在新映像已经提交后调用；普通 exec 失败不会触碰文件表。VFS close 的真实 I/O 清理错误返回 `CLEANUP_REQUIRED`，但被摘除的 fd 对新程序立即为 `EBADF`，待清理 owner 仍由文件表保存；堆释放不返回可重试状态。
+### 3.2 内核内数据传输（`sendfile` / `copy_file_range` / `splice`）
 
-用户 task 退出时先在任务仍位于自身内核栈、但硬件已经切回内核地址空间的边界处理重资源：
+为减少数据在“内核态 ↔ 用户态”之间往返拷贝，`fs/files/transfer.c` 实现了四类内核内直接传输通道：
 
-```text
-fd-slot OFD references -> files table -> fs context
--> mapped OFD references/MM -> zombie
-```
+| 接口 | 传输方向 | 内核实现机制 |
+| :--- | :--- | :--- |
+| **`sendfile`** | 普通文件 → 套接字 / 文件 | 向传输控制协议（Transmission Control Protocol，TCP）套接字发送时，`sendfile_tcp_cached()` 每批借用最多 **32 KiB** 的源文件缓存页，将内容交给协议发送路径，无需经过用户缓冲区 |
+| **`copy_file_range`** | 普通文件 → 普通文件 | 对支持批量缓存读取的不同文件，`regular_cached_copy()` 每批借用最多 **8 页**源缓存页，由目标写入路径复制数据 |
+| **`splice` / `tee`** | 文件/套接字 ↔ 管道，或管道 → 管道 | 支持共享页的路径传递页引用，其他路径复制数据。`tee` 将管道缓冲区的页引用交给目标管道，源管道仍可读取相同内容 |
+| **`vmsplice`** | 用户态缓冲区 → 管道 | 固定用户页或复制数据直接装入管道缓冲槽 |
 
-最后一个普通 OFD 引用才关闭底层 VFS file；pipe OFD 的最后一个读/写端引用在 detach（包括 dup 替换）时立即更新 endpoint 计数并在两端归零时释放 ring。父进程关闭 fd 不会使仍由子进程或任一 MM 文件映射引用的 OFD 失效。只有文件系统或块 I/O 清理错误需要把 task 留在 exited 队列，idle 才从记录状态重试；合法堆/页释放已经完成，分配器不变量错误直接 fatal。根 mount 必须活到 PID 1 及其子进程的 fd 与映射来源全部回收，之后生产根启动路径才能 purge cache、unmount 并检查 heap/物理页基线。
+### 3.3 `copy_file_range` 的文件组合与完成边界
 
-## 显式时间与文件系统统计
+`copy_file_range`（系统调用 285）按照文件系统实例和实际后备文件判断能否复制。绑定挂载提供另一套路径视图，视图中的普通文件仍由原实例管理。
 
-`umask` 属于 fs context：初值 `0022`，`CLONE_FS` 共享，普通 fork 复制；
-`openat(O_CREAT)` 与 `mkdirat` 在创建时用当前掩码削去权限位，打开已有文件
-不改权限。`fchmodat` 解析路径并跟随末端符号链接，`fchmod` 用 fd 持有的
-活 inode，故 unlink 后仍可修改；两者保留文件类型位、更新 ctime，
-只读挂载返回 `EROFS`。匿名pipe的mode、UID/GID和ctime属于共享pipe对象，
-两端、dup/fork与proc重开观察同一元数据。socket权限保存在其OFD所属的socket inode中，
-初值0777；权限修改检查当前调用者与创建身份。匿名epoll/eventfd/timerfd/signalfd改权返回`EOPNOTSUPP`。
-`fchmodat2(452)` 共用改权路径，接受`AT_EMPTY_PATH`及`AT_SYMLINK_NOFOLLOW`；
-空路径使用真实FD，包括O_PATH持有的路径、匿名pipe/socket及mqueue；末端符号链接本身返回`EOPNOTSUPP`。
-`O_PATH` 使用明确的路径OFD，拥有稳定path引用；它不打开字符设备、会合FIFO、
-初始化数据缓存或取得写/执行租约。open/openat先归一化为PATH、DIRECTORY、NOFOLLOW，
-CLOEXEC归fd槽；其他访问/创建/截断位不取得数据资格。dup/fork共享OFD，最后关闭释放path。
-fstat/fstatfs、目录相对操作、fchdir、FD标志和F_GETFL可用；空路径stat/chown/utimens、
-linkat和readlinkat使用原身份，NOFOLLOW可持有链接自身。数据、seek、mmap、ioctl、记录锁、
-直接fd改权/所有权/时间与同步入口先返回EBADF；网络ioctl/socket入口同样先检查资格。
-poll显示POLLNVAL；select按固定Linux的POLLIN/OUT/EX_SET将它映射到所请求的集合，
-不把有效路径fd误当成已经关闭的fd。
-unlink/rename及同名重建不会替换句柄身份。execveat以实际OFD/path重新检查执行权限，复用现有exec事务，见[执行模块](kernel-exec.md)。
-`make build/diff-abi/path-rv`配`tests/diff-abi/path-cases.txt`可聚焦差分；完整ABI仍包含同一记录。
-`O_NOCTTY` 是合法open flag，其控制终端语义见[TTY模块](kernel-tty.md)。
-固定 Linux
-`references/linux/fs/open.c`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）
-和 raw `tests/diff-abi/access.c`、`mode.c` 核对 errno、权限与 fork/共享边界。
+| 源文件与目标文件 | 复制条件 |
+| :--- | :--- |
+| 同一普通文件系统实例内的两个文件 | 可以复制，包括经过不同绑定挂载打开的文件。 |
+| 不同的 ext2、ext4、tmpfs 或 VFAT 实例 | 返回 `EXDEV`，即使两个实例使用相同的文件系统类型。 |
+| 两端都通过 OverlayFS 打开 | 两端可以位于不同的 OverlayFS 实例。内核选定源文件的当前后备层和目标文件的可写上层。实际需要搬运数据时，两个后备文件必须属于同一实例，否则返回 `EXDEV`。 |
+| 一端为 OverlayFS，另一端为普通文件系统 | 返回 `EXDEV`。从普通路径打开后备文件也属于这一情形。 |
 
-`fchown(55)`与`fchownat(54)`接受32位UID/GID；`UINT32_MAX`保留对应字段，
-其他值不会被截断到16位。路径形式支持cwd、dirfd、符号链接跟随及
-`AT_SYMLINK_NOFOLLOW`；空字符串配`AT_EMPTY_PATH`选取fd或cwd，NULL路径返回
-`EFAULT`。未知flags先返回`EINVAL`；空字符串无该flag返回`ENOENT`；有效fd
-不要求写访问模式，只读挂载返回`EROFS`。用户路径只复制一次且在存储锁外进行；
-fd形式从查表到后端修改结束持有选定OFD，unlink后仍修改原inode。
+- **来源和实际复制范围**。源文件的打开文件描述保活本次选定的后备文件。复制期间若另一个打开操作为源文件建立了上层副本，当前复制仍从已经选定的层读取。内核先结合源文件末尾、目标文件最大尺寸和 `RLIMIT_FSIZE` 文件大小限额缩短范围。两端指向同一个索引节点时，实际复制范围重叠返回 `EINVAL`，包括不同叠加视图中的名称指向同一个后备索引节点的情形。
+- **文件位置与失败处理**。输入描述符须可读，输出描述符须可写且未设置 `O_APPEND`，否则返回 `EBADF`。`flags` 必须为零。每一端都可独立指定位置指针或使用打开文件描述的共享位置。成功复制的数据由两端分别提交位置。若向其中一个位置指针写回失败，调用返回 `EFAULT`，实际复制的数据及另一端的位置更新仍保留。打开标志含 `O_SYNC` 或 `O_DSYNC` 时，本次复制的数据在搬运结束后统一同步，同步失败时返回错误，两端位置仍为调用前的值。
 
-所有权修改要求 CAP_CHOWN，或由所有者保持 UID 并把 GID 改为已所属组；修改更新 ctime、保留 atime/mtime。非目录清除 S_ISUID；带组执行位或调用者不属于原组且没有 CAP_FSETID 时清除 S_ISGID，目录保留 set-ID。ext4还在同一操作事务内删除`security.capability`，
-失败回滚UID/GID、mode、ctime与属性。setgid目录创建的节点继承父GID，子目录
-另继承setgid位。命名FIFO走VFS inode，匿名pipe走共享pipe元数据；没有真实后端
-的其他合成对象保留各自属性接口行为。文件 DAC、创建所属身份及执行属性快照见[VFS/ext4](vfs-ext4.md)。
+---
 
-### 扩展属性
+## 四、管道（Pipe）与命名管道（FIFO）
 
-`set/lset/fsetxattr`、`get/lget/fgetxattr`、`list/llist/flistxattr`和
-`remove/lremove/fremovexattr`使用两架构共同的syscall 5～16。路径接口只解析一次，
-FD接口持有实际OFD并操作同一inode，改名或unlink后仍可使用。O_PATH的FD接口返回EBADF。
-输入值先完整导入，输出在后端资格释放后复制；输入故障保留原属性，输出故障保留实际复制前缀。
-名称最多255字节，值与列表输出缓冲区最多64KiB；零长度列表查询返回实际所需容量。
-ext4还受inode内部及单个外部EA块的实际容量约束。
-普通属性的CREATE／REPLACE检查与修改处于同一inode写资格，失败保留原值。
+`fs/pipe.c` 实现匿名管道（`pipe2`）与文件系统中的命名管道（FIFO），内部使用环形物理页缓冲槽管理数据：
 
-共同权限层使用当前fsuid/fsgid和capability：`user.*`检查对象读写权限及sticky目录所有者；
-`trusted.*`只向CAP_SYS_ADMIN调用者公开，列表先过滤再检查容量；`security.capability`
-按固定Linux的格式及CAP_SETFCAP规则设置，其余`security.*`修改要求CAP_SYS_ADMIN。
-只读挂载拒绝修改。tmpfs和ext4支持`system.posix_acl_access`与
-`system.posix_acl_default`，按Linux ACL规则检查所有者、命名用户、所属组、掩码和其他用户；
-ACL修改要求文件所有者或CAP_FOWNER，默认ACL用于目录，ACL操作不采用CREATE／REPLACE语义。
-`chmod`同步更新访问ACL，新建对象按父目录默认ACL与请求mode确定权限；无默认ACL时才应用umask。
-其他`system.*`处理和匿名socketfs专属属性仍列后续。
-缺少属性后端的对象查询列表为空，其他操作返回该对象支持范围对应的错误。
+- **容量与内存额度**：默认容量为 **16 页**（`KERNEL_PIPE_DEFAULT_CAPACITY`：RISC-V 为 64 KiB，LoongArch 为 256 KiB），内置 16 个内联槽位减少小管道堆分配；支持通过 `fcntl(F_SETPIPE_SZ / F_GETPIPE_SZ)` 动态调整容量（非特权用户上限 `1 MiB`，受每用户软页配额 `16,384` 页约束）。
+- **原子写入保证（`PIPE_BUF`）**：单次写入长度不超过 `4,096` 字节（`KERNEL_PIPE_ATOMIC_WRITE`）时，保证与并发写入者不交错；非阻塞模式下若剩余空间不足 `4,096` 字节则直接返回 `-EAGAIN` 而不写入半截数据。
+- **多核本地执行**：已打开的管道与 FIFO 的数据读写与等待队列直接在发起核上并行推进，仅涉及关联 `epoll` 销毁等控制操作交由 CPU0 协调。
 
-filecap设置接受revision 2／3，revision 3的rootid=0查询为revision 2，其他有效rootid保留；
-原盘revision 1仍沿既有exec解析范围处理。空filecap的设置和无效值查询分别沿Linux规则，
-不把空值当成删除。tmpfs和ext4均把成功设置的原始属性交给exec；普通写入和chown等
-继续按原接口规则清除特权。实际存储与事务、缓存失效见[VFS与ext4](vfs-ext4.md)。
+---
 
-短例入口为`sh tests/host/xattr.sh`、`make test-posix-acl-host`、
-`make test-ext4-acl-xattr-host`和`python3 tests/userland/run.py --workload acl`；
-客机程序使用同一ELF对照固定Linux。
+## 五、事件多路复用（`poll` / `pselect` / `epoll`）与轻量事件描述符
 
+### 5.1 `poll`、`pselect6` 与 `epoll`
 
-`utimensat` 的 times 先完整复制，两项 `UTIME_OMIT` 随即成功，不解析路径、fd 或 flags。其他请求先检查 flags 并取得目标，再检查纳秒，最后检查只读挂载；不存在路径与坏 fd 优先于非法纳秒。NULL pathname 且 dirfd 不是 `AT_FDCWD` 是 musl `futimens` 使用的 fd 形式，只接受 flags=0；空字符串配 `AT_EMPTY_PATH` 支持 fd 与 cwd。`AT_SYMLINK_NOFOLLOW` 修改链接自身，默认跟随链接。NULL times 或 `UTIME_NOW` 使用本次同一个 realtime 值，`UTIME_OMIT` 保留字段，实际修改同时更新 ctime，不修改父目录时间。fd 无须写访问模式；显式时间要求所有者或 CAP_FOWNER，全部使用当前时间也允许具有写访问权限的调用者。
+- **`poll` / `ppoll` / `pselect6`（`fs/files/poll.c`）**：每次调用扫描监视列表，少量描述符（≤ 4 个）直接使用栈上缓冲 `KERNEL_POLL_STACK_CAPACITY = 4` 免除堆分配；`pselect6` 针对同一位图字中的少量普通文件提供单次加锁批量取引用快路径，若首次扫描已有就绪事件则跳过等待节点初始化直接返回。
+- **`epoll`（`fs/files/epoll.c`）**：
+  - 每个 `epoll` 实例（`struct kernel_epoll`）用 **AVL 平衡树 `items_root`** 按 `(target_fd, target_file)` 索引所有注册监视项，通过独立的 `ready_head` 就绪链表实现 O(1) 收集活跃事件，避免随总监视数线性扫描；
+  - 完整支持 **水平触发（LT）**、**边缘触发（`EPOLLET`，仅在状态新变就绪时交付一次）**、**单次触发（`EPOLLONESHOT`，交付一次后自动解除激活直至重新 `MOD`）** 与 **防惊群唤醒（`EPOLLEXCLUSIVE`）**；
+  - **环形嵌套深度检查（`epoll_check_nesting`）**：当把一个 `epoll` 描述符加入另一个 `epoll` 时，双向遍历上下游有向图，拒绝成环或嵌套深度超过 **4 层**（`KERNEL_EPOLL_MAX_NESTS = 4`）的请求并返回 `-ELOOP`。
 
-`statfs/fstatfs` 输出 RV64 asm-generic 的 120 字节布局，输出前取得真实 mount 统计；路径/fd 错误优先于输出指针 fault。fd 直接使用其持有的 mount，unlink 后仍可查询；匿名管道报告管道伪文件系统的 `PIPEFS_MAGIC`、架构页大小及零容量，命名管道沿打开时持有的文件系统挂载查询。没有文件系统挂载的匿名 epoll 和初始 console 返回 `ENOTSUP`。统计不触发文件数据写回，空闲块只计实际磁盘分配；容量扣除真实 ext4 元数据及内部 journal 开销，bavail 扣除 superblock 保留块。BoarOS 没有 Linux 的紧急 extent 保留池，因此不额外扣除不存在的池。只读和 relatime 标志来自实际挂载契约。
+### 5.2 `eventfd`、`timerfd` 与 `signalfd`
 
-固定依据为 `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `fs/utimes.c`、`fs/statfs.c`、`fs/ext4/super.c`、`fs/inode.c` 与 `include/uapi/asm-generic/statfs.h`。测试入口为 `make test-files-riscv test-lwext4-metadata-host test-userland-riscv test-diff-abi-riscv`。
-所有权窄宿主回归用`./tests/host/lwext4-metadata.sh ownership`，覆盖大ID、
-内联/外部/共享属性块、嵌套abort、逐分配点OOM、WRITE/FLUSH错误、重开与独立e2fsck；
-`tests/diff-abi/ownership.c`用同ELF比较ext4/tmpfs、pipe、符号链接、只读与错误顺序。
+为了将计数通知、定时器到期和异步信号统一纳入 `epoll`/`poll` 事件循环，BoarOS 实现了三类专用事件文件描述符：
+- **`eventfd`（`fs/event_fd.c`）**：维护 64 位无符号内核计数器，`write` 累加计数，`read` 读取并清零（启用 `EFD_SEMAPHORE` 信号量模式时每次只减 1 并返回 1），适合线程间与异步 I/O 完成通知。
+- **`timerfd`（`fs/event_fd.c`）**：将高精度单调/实时/闹钟定时器封装为可读描述符，到期时在全局 `timer_root` AVL 树中累计超时次数并唤醒 `epoll` 监视者，`read` 返回 8 字节的累计到期次数。
+- **`signalfd`（`fs/signal_fd.c`）**：将发往当前线程的待处理信号转为同步读取的 128 字节 `struct signal_fd_info` 记录，免去异步信号处理函数的重入风险。
 
-## 请求暂存与成本
+---
 
-普通文件写入以目标页组织接纳，直接填入最终页；来源用户页和 iovec 边界只决定复制片段。tmpfs 与磁盘页缓存共用至多两个来源页的有界借用，连续且可读的跨页来源可以一次覆盖整个目标页，冷完整覆盖无需先读旧数据。来源缺页在 inode 数据锁和目标写借用之外处理；持有首个 pin 后只尝试取得已驻留的后续页，遇到缺页或 MM 编辑先接纳可用前缀，归还 pin 后再处理。冷完整覆盖候选若缩为前缀，先放弃候选并按部分覆盖准备旧尾，随后重新取得来源。散布 iovec 超过两个不同来源页时分批处理，不暂存载荷；同物理页的重叠片段按原次序使用 `memmove`，旧 EOF 后的空隙在来源复制后清零。tmpfs 后端只提交尺寸和时间元数据。
+## 六、文件系统事件监控（`inotify` 与 `fanotify`）
 
-TCP 标量和向量写入共用有界用户页批次。取得接纳额度后，通常在协议保护外准备至多四个页引用和片段；RV 已迁入分片的连接最多准备九项，以覆盖未对齐的 32 KiB 回环窗口。同一用户页跨 iovec 复用引用，相邻片段在页内合并；已有引用时，后续缺页或 MM 编辑冲突先交付可用前缀，再归还页引用处理下一页。大批发送先把内容复制到最终 TCP 段，归还用户页后才取得分片接纳资格。小写入仍可填充已有 TCP 段的尾部。临时游标仅用于准备，实际接纳量决定正式游标推进；未接纳部分在等待后重新解析。一页输入的非连续片段超过批次上限时，复用同一工作区合并载荷；这条路径保留已复制但尚未接纳的尾部，直至实际接纳或调用结束。末批、窗口满或阻塞前推动出包；提前返回和退出也发送已接纳前缀。请求页不借给 TCP，协议保留 ACK 前的 COPY 版本。socket 接收直接从保活的 packet/pbuf 跨 iovec 复制到用户，AF_UNIX STREAM 直接填写最终队列块，INET UDP 直接填写最终 pbuf；datagram 保持整包 owner。pipe 保持自己的 ring 协议，console 保持小块暂存。普通文件的 offset、O_APPEND、定位写与同步错误观察规则不变；socket owner 细节见[网络模块](kernel-network.md)。
+| 机制 | 核心架构与支持能力 |
+| :--- | :--- |
+| **`inotify`（`fs/inotify.c`）** | 面向单目录/单文件的轻量级变更监控（创建、删除、修改、移动等）。采用 256 桶索引与 64 KiB 事件环形缓冲区（上限 128 个监视组、65,536 个监视标记，单桶链长超 16 自动溢出至红黑树），自动合并相邻重复事件。 |
+| **`fanotify`（`fs/fanotify.c`）** | 面向挂载点、整个文件系统或索引节点的高级监控与安全审计（上限 128 组、8,192 标记、16,384 待读事件）。除普通通知外，还支持：<br>• **权限拦截事件**（`FAN_CLASS_CONTENT` / `PRE_CONTENT`）：目标进程打开、读取或执行文件前阻塞等待安全监视进程向 `fanotify` 描述符写回 `FAN_ALLOW` 或 `FAN_DENY` 决定是否放行；<br>• **文件句柄报告模式**（`FAN_REPORT_FID` / `DIR_FID` / `NAME` / `TARGET_FID`）：无需为每个事件打开文件描述符，直接编码返回目录与目标文件的稳定句柄与文件名。 |
 
-## 验证与限制
+---
 
-`readv/writev` 的 8 项以内向量不分配导入缓冲；更长数组为完整输入快照分配至多 16 KiB 元数据，释放遵循堆不变量。数据仍直接从用户空间复制到 pipe 数据区，console 使用 64 字节暂存；目录条目在固定内核缓冲区中编码一次，再复制到用户空间，目录拆分没有引入转发层或额外数据复制。等待唤醒按实际事件队列通知，队列登记与任务状态由等待域保护。
+## 七、文件锁：字节范围记录锁与 `flock` 协作锁
 
-已删除且仍打开的目录枚举返回 `ENOENT`，保持 OFD 位置；普通已删除文件继续供原有 fd 使用。目录枚举由 OFD offset 保存可继续的后端 cookie，VFS 适配层隐藏 lwext4 类型；可变游标不放入按 inode 共享的 VFS node。独立 open 各自推进，dup 和 fork 共享同一 OFD 的目录位置。目录按有界内核批次打包，复制后只提交完整记录前缀；具体批次所有权与失败规则见 [VFS 目录游标](vfs-ext4.md)。当前线性 ext4 适配器的 `ext4_dir_iterate()` 区分真实 EOF 与正 errno，使用记录结束字节位置作为 cookie；未来的 htree 或其他文件系统可以替换编码而不改变文件资源接口。
+BoarOS 完整区分 Linux 中的三类文件协作锁，各自维护独立的所有权语义：
 
-实现保持以下语义：
+1. **传统 POSIX 字节范围锁（`fcntl(F_SETLK / F_SETLKW / F_GETLK)`）**：
+   - 使用按区段起点排序、并在每个节点维护子树最大终点 `max_end` 的 **增强区间 AVL 树**（`fs/record_lock.c`），实现 O(log N) 区间重叠查找、自动分裂与相邻合并；
+   - 归属于进程文件表（`files->record`）：同一进程关闭指向该 `inode` 的**任意**文件描述符都会释放该进程在该文件上的全部 POSIX 锁；阻塞等锁时自动沿等待图执行深度上限为 10 的**死锁环路检测**，发现成环返回 `-EDEADLK`。
+2. **打开文件描述范围锁（OFD 锁，`F_OFD_SETLK / F_OFD_SETLKW / F_OFD_GETLK`）**：
+   - 复用同一套增强区间 AVL 树，但锁归属于单个 **OFD 实例**而非整个进程——多线程可各自打开同一文件互相加锁，且仅在对应 OFD 的最后引用关闭时释放锁，不因关闭无关副本描述符误解锁。
+3. **整文件协作锁（`flock(32)`，`fs/flock.c`）**：
+   - 锁粒度为整个文件，同样绑定于 OFD 生命周期（`dup`/`fork` 共享同一把锁，独立 `open` 互斥），支持共享锁（`LOCK_SH`）、独占锁（`LOCK_EX`）、非阻塞（`LOCK_NB`）与解锁（`LOCK_UN`）。
 
-- 待输出位置与已提交位置分离；只有整条 dirent 成功复制后才提交 cookie。缓冲区不足或 usercopy 失败时不跳过未交付记录，已交付前缀仍返回字节数。
-- `d_off` 是可用于恢复枚举的位置 cookie，不要求调用者对它做序号算术。`lseek` 接受保存的 cookie；任意未对齐值由适配器向前规范化到下一个记录。
-- dot 项和目录尾记录按 ext4 inode 号处理；inode 为零的尾记录只用于推进，不会被当作 EOF。lwext4 块读取或格式错误向上转成 `-EIO` 等 errno。
-- 顺序完整枚举按每个物理记录一次推进，结构性条目访问为 O(N)。随机 seek 仍可能加载和扫描一个块，且尚未有开发板吞吐基线；不能把这一结构性结论写成未经测量的“更快”。
+---
 
-目录枚举与 seek 共用 OFD offset mutex，覆盖整次 cookie 读取、输出与提交；dup、fork 和跨 CPU 调用使用同一位置协议。
+<details>
+<summary>展开查看：路径与异步通知细节及定向验证入口</summary>
 
-## 成本与验证入口
+### 信号驱动 I/O 与路径扩展接口
 
-在当前 RV64 `-O2` 构建的编译器栈使用检查中，getdents 帧为 672 字节，writev 输入快照使用至多 8 个栈上 iovec；这些是静态成本，不是板级吞吐基准。QEMU 验证资源回收，开发板缓存行为和竞争负载性能尚缺实测。
+- **信号驱动异步 I/O（`O_ASYNC` / `F_SETOWN` / `F_SETSIG`）**：在 OFD 上记录目标进程/线程/进程组所有者与自定义实时信号；当管道、终端或套接字变为可读/可写时异步递送 `SIGIO` 或指定信号（附带 `POLL_IN`/`POLL_OUT`/`POLL_ERR`/`POLL_HUP` 详情）。
+- **受限路径解析（`openat2`）**：支持 `RESOLVE_BENEATH`（禁止越出起始目录子树）、`RESOLVE_IN_ROOT`（将起始目录视为临时根目录）、`RESOLVE_NO_SYMLINKS`、`RESOLVE_NO_XDEV` 与 `RESOLVE_NO_MAGICLINKS`。
+- **批量关闭与属性查询**：支持 `close_range(436)`（含 `CLOSE_RANGE_UNSHARE` 写时复制文件表与 `CLOSE_RANGE_CLOEXEC`）、`fchmodat2(452)` 与 `statx` 扩展元数据。
 
-```sh
-make test-uaccess-riscv
-make test-files-riscv
-make test-files-partial-write-riscv
-make test-exec-riscv
-make test-userland-riscv
-make test-diff-abi-riscv
-make test-root-init-riscv
-make test-riscv
-```
+### 定向验证入口
 
-`make test-files-partial-write-riscv` 覆盖跨入未映射页前可读 0、1、32、63、64、65 字节的普通写、append 和 writev（含已有进度及后续可读 iovec），核对返回值、offset、文件长度、内容和字节统计；真实 ext4 后端注入带前缀的写回错误，验证缓存内容与逻辑大小保留、重试完整写回，以及独立 open/dup 的错误观察。另注入设备 flush 错误，验证 O_SYNC/O_DSYNC 返回错误后 offset 与内容保留。`make test-userland-riscv` 以 `mmap/mprotect(PROT_NONE)` 对同组边界执行真实 musl 系统调用并核对内容和 metadata。
+- **epoll 与多路复用专题**：详见 [epoll 对象与事件通知](../learning/epoll-subsystem.md)、[epoll 事件交付与取消](../learning/epoll-delivery.md)；测试入口 `tests/workloads/epoll/`、`tests/userland/ipc-fds.py`。
+- **内核内传输与管道**可用 `python3 tests/userland/run.py --workload sendfile_tcp` 检查套接字发送。构建内核后，用 `python3 tests/userland/api8.py --only boaros --program copy_range --program overlay` 检查文件复制、叠加层选择和跨卷拒绝。进行 Linux 对照时，去掉 `--only boaros`，通过 `--linux-kernel` 指定启用了 `CONFIG_OVERLAY_FS` 的参考内核。管道与向量读写的测试程序位于 `tests/workloads/pipe/` 与 `tests/workloads/io/vectors_v2.c`。
+- **记录锁与 `flock`**：`tests/diff-abi/file_locks.c`、`tests/workloads/locks/`、`python3 tests/userland/api8.py`。
+- **文件访问通知**：`tests/workloads/fs/`、`tests/workloads/io/file-handles.c`。
 
-`make test-diff-abi-riscv` 用相同 raw-syscall ELF 比较固定 RISC-V Linux 和 BoarOS 的 readv 参数顺序、0/1/32/63/64/65 字节可写前缀、1024/1025 项、跨文件页/共享 OFD、pipe 片段故障后重读、尾片段合并、环回以及 poll 可写边界；保留原始串口与规范化差异。`make test-files-riscv` 注入 UART 三字节批次并核对 console readv 跨两个向量分散，同时注入长向量分配失败，核对 `ENOMEM`、OFD 释放和调用统计；`make test-userland-riscv` 以真实 musl 验证两个 pipe 读者及 readv 的 EINTR/SA_RESTART。固定 libc-test 的静态/动态 `ungetc` 和完整 BusyBox 的 `od/hexdump` 另以真实程序套件逐例比较完整输出。
-
-聚焦测试在真实 QEMU legacy 与 modern VirtIO/ext4 上覆盖绝对/相对路径、错误 flags、目录与缺失文件、4096 字节路径上限、最低 fd 复用、表扩容、统一 fd 安装统计、epoll 满表原子性、`O_CLOEXEC/O_NONBLOCK`、缓存命中后的跨页读取、EOF、部分 fault、fork 后 fd 表独立与 OFD offset 共享，以及 VFS orphan/I/O owner。stat 回归核对 regular/directory 的真实 inode metadata、allocated blocks、fstat/newfstatat 共同字段和 unlink-but-open 的零链接计数。它还在关闭 fd 后通过 MM backing 继续缺页，反复固定地址映射同一 OFD 并检查来源释放只发生一次，验证父子各自持有一份来源引用。生产 exec/clone 链验证普通 fd 与 offset 跨映像和父子保持、CLOEXEC fd 不可见，PID 1 的 stdio 与跨 exec 的 console 描述符由串口标记验证，并由最终资源基线证明退出清理生效。`make test-userland-riscv` 用静态和动态 musl 程序作为 PID 1 运行 stdio、readdir、read/lseek/fstat、dup、signal、pipe、pthread、TLS 和 dlopen；其中写打开普通文件的真实 `read/pread` 及其 dup 均验证 `EBADF`，是真实 U-mode 外部测例的入口。
-
-当前提供可共享的文件表与根 fs context handle，普通 clone 仍实现“复制表/复制 cwd、共享 OFD”；系统调用层是否选择共享由 clone flags 决定。当前已支持常规文件的读写（`write/writev/pwrite64/append`）、新建、删除（`unlinkat`）、截断（`truncate/ftruncate`）与目录修改（`mkdirat/rmdir`）及符号链接（`symlinkat/readlinkat`）；并支持 cwd/dirfd、普通/NOREPLACE rename；已有阈值驱动后台写回及可选到龄策略；默认按冷缺失训练顺序预读，窗口和回写策略见 [VFS 与 ext4](vfs-ext4.md#按需求装入反馈的有界顺序预读)；linkat 硬链接、tmpfs 和独立磁盘、MBR 主分区及 FAT32/VFAT 已接入，块节点按 `st_rdev` 打开独立块设备 OFD，语义见[块设备接口](riscv-virtio-block.md#用户态块设备)。OFD 引用已原子化，FD record 的槽/引用/统计及匿名 pipe 的内部同步已建立；普通文件数据访问和匿名用户复制在发起 CPU 执行；受控任务可以选择独立资源，但使用同一对象同步。管道、socket数据访问及poll/epoll等待在发起CPU执行，设备、控制和关联清理按所属业务进入CPU0。生产 console 接收由 DTB UART IRQ 收割、worker 推进行规程；raw/tick 轮询只保留在未建立 transport 的独立模块 fixture。IRQ、worker 和任务运行延迟没有硬实时上界，具体 continuation、termios 与 owner 见[TTY 模块](kernel-tty.md)。
-
-字符设备节点由 ext4 提供名称和 `st_rdev`；`openat` 只按设备号查找 `fs/char_device.c` 的内建操作表，未知设备号返回 `ENXIO`。OFD 持有选定的静态操作及 open 创建的实例，read/write/poll/ioctl 从它分派；初始标准 fd 也取得同一 console 后端。启动时优先打开根盘已有的 5:1 `/dev/console`，使标准 fd 持有真实路径；只有该节点缺失才使用无路径 UART OFD。其他查找/I/O 错误明确中止启动，不伪装为节点缺失。该表在当前执行地址域中初始化回调，兼容分页前模块测试与生产高半区。console 的 UART 输入等待支持非阻塞 `EAGAIN` 和信号打断；null 读 EOF、写消费请求长度，zero 读按实际用户复制进度填零；两者不经过普通文件页缓存和 ext4 数据 I/O。设备 OFD 由 fd 表安装和引用，dup/fork 共享，关闭 fd 不撤销已 pin 的 I/O。`readv/writev/pread64/pwrite64/lseek/fstat/ppoll` 及 console 非阻塞读取经固定 Linux 差分验证；未知 ioctl 对有效 fd 返回 `ENOTTY`。另登记 1:8 random 和 1:9 urandom：random 读取等待可信源初始化，遵循固定 Linux 的 random_read_iter，O_NONBLOCK 在未就绪时返回 EAGAIN；urandom 允许未初始化的不安全流。random poll 未就绪报告可写，就绪报告可读；urandom 始终可读写。用户写入经 BLAKE2s 混种但不计可信熵。随机 ioctl 的 RNDGETENTCNT 返回已计入的可信熵 bit 数（最多 256），RNDADDENTROPY 在完整复制并混入输入后按声明的 bit 数记账；字段检查、错误与就绪唤醒见[随机源](../learning/random-source.md)。未知请求返回 EINVAL，清池与重播种请求返回 ENOTSUP。random 支持 epoll，urandom 遵循固定 Linux 无 poll 回调的 EPERM 边界。节点仍由用户态 mknodat 建立。serial transport 发布后另按 rdev 登记 ttyS0/console/tty，并提供 [TTY 会话与行规程](kernel-tty.md)。没有动态设备注册、设备 mmap 或 devfs。
-
-设备号与操作依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`fs/char_dev.c`](../../references/linux/fs/char_dev.c)、[`drivers/char/mem.c`](../../references/linux/drivers/char/mem.c)、[`fs/eventpoll.c`](../../references/linux/fs/eventpoll.c) 与 [`fs/read_write.c`](../../references/linux/fs/read_write.c)。
-
-## 可睡眠文件调用
-
-共享 OFD 的普通读写、seek 和目录游标受 offset mutex 保护；定位 I/O 不取得 offset 锁。调用在可能等待前 pin OFD，元数据与目录操作同样适用；路径起点获得独立 path 引用，不借用可能被 close/chdir 替换的对象。open 先预留 fd，再执行可睡眠解析/创建；失败取消预留，fork 不复制未安装槽，dup3 对正在预留的目标返回 EBUSY。dup 替换在安装新 OFD 前不执行会睡眠的最后释放。延后清理链先摘下本轮集合，再执行可能等待的关闭并重新挂入仍有真实 owner 的失败项，避免并发 drain 覆盖新项。
-
-普通文件写在 inode 数据锁和目标页写借用之外解析、固定来源用户页，再取得目标资格并直接复制；来源可以是同一 inode 的尚未驻留映射，不会持目标锁重入文件缺页。读持引用取得数据，解除存储锁后复制到用户。files、partial-write、file-io-concurrency 与真实 userland 测试检查缺页重入、共享 offset、close 后 fd 复用及部分复制。
-
-## 节点创建
-
-`mknodat(33)` 复用 dirfd/cwd/root 路径快照，将请求权限和 umask 交给 VFS；
-创建后端根据父目录默认 ACL 决定使用哪一者。
-当前交付普通文件（类型 0 或 S_IFREG）、字符设备（S_IFCHR）与块设备节点（S_IFBLK）；目录返回 EPERM，
-非法类型EINVAL；FIFO节点与传输已接入，socket节点仍返回ENOTSUP。块节点按 st_rdev 查找实际块设备，支持裸设备 OFD 与独占挂载；未知设备返回 ENXIO。设备号取 Linux
-32 位编码；任意字符设备号可存储，打开时既有 null/zero/console/random/urandom 及RTC后端可用，
-未知号返回 ENXIO。不以路径名识别设备。
-
-用户路径复制在存储锁外完成；路径引用和临时堆缓冲在所有结果分支回收。已有节点
-返回 EEXIST，不覆盖类型或设备号；空路径、坏地址、坏 dirfd 与父目录错误保留原 errno。
-`make test-diff-abi-riscv` 的 `mknod.*` 保护创建、umask/stat、真实设备读写和错误。
-
-`kernel_files_linkat()` 固定源 path 或 fd 引用后再操作目标父目录，支持 flags 0、
-AT_SYMLINK_FOLLOW、AT_EMPTY_PATH。独立打开的硬链接有独立 OFD，记录锁按 inode
-共享；同 OFD 的 dup/fork 共享规则不变。tmpfs read/readv/pread 用无分配空洞读路径，
-只有 mmap 缺页或实际写入才消耗后备页配额。
-
-普通文件整次 write/writev/pwrite 由 VFS 写入口在用户页面片段循环外取得 inode 写操作锁（rank 15），内部写入核心借用同一个 owner；追加写的取 EOF 与数据接纳都在此锁内完成。数据接纳结束后先释放，再执行同步写收尾；非定位写先取得共享 OFD offset 锁（rank 10），位置资格覆盖整次调用。truncate 与直接 VFS pwrite 走同一写操作锁，fault/read/writeback 不取得它。`make test-io-sleep-riscv` 以独立 OFD 在复制等待时安排追加、重叠定位写与截断，检查整次结果和最终清理；`make test-file-io-concurrency-host` 检查同 inode 未驻留映射来源、双向重叠和旧 EOF 尾部来源，`make test-userland-riscv` 补真实系统调用。
-
-成本诊断版本记录真实请求、接受量、用户复制及仍有实际使用者的暂存容量；普通文件写入的暂存量为零。短写及同步尾部错误沿原语义处理；接口与单位见[成本观测](kernel-cost.md)。
-
-## 仅读RTC与OFD设备资格
-
-Goldfish RTC按st_rdev=10:135选择，/dev/rtc0、/dev/rtc和/dev/misc/rtc是同一设备身份，
-不是路径特判。`RTC_RD_TIME(0x80247009)`复制Linux九整数布局的UTC日历，秒值直接来自
-`riscv_virt_rtc_read_ns`；无设备/不合理读数返回ENODEV。`ioctl`命令在syscall边界截为
-unsigned32位，与Linux相同，兼容musl传来的符号扩展。未知命令ENOTTY，设置时间、
-告警/事件等已知但未交付操作ENOTSUP，普通事件read/write同样明确不支持。
-
-字符设备回调携带实例上下文、调用者及open flags；open在OFD发布前构造实例，
-失败不留下实例owner。最后OFD清理才release；dup/fork/请求pin不重新open。
-可选整次readv/writev入口用于有请求状态的后端，简单设备继续使用缓冲回调。
-RTC独占打开，dup/fork/请求pin增加同一OFD
-引用，不重新打开；最后真实引用脱离即释放资格，VFS后续清理错误不会继续霸占RTC。
-失败打开不发布资格；CLOEXEC、退出和最终关闭沿统一文件引用路径处理。
-验证：`make test-rtc-host test-environment-riscv`与固定Linux环境ABI记录，含闰日、
-2100世纪例外、dup/fork/exec、坏指针、符号扩展请求与失败后重开。依据固定Linux
-`include/uapi/linux/rtc.h`、`drivers/rtc/dev.c`及`Documentation/admin-guide/devices.txt`，
-commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；平台设备协议保持Goldfish原契约。
-
-## socket终止事件与接收独占（2026-10-02）
-
-阻塞接收的内部等待谓词由socket的实际数据/错误/EOF和reservation决定，不能把
-poll的HUP/ERR直接当作取得队首资格。等待期间释放CPU并保留当前请求/OFD owner，
-完成或fault释放reservation后唤醒后继；SO_RCVTIMEO与信号仍由同一次等待处理。
-`make test-io-sleep-riscv`的定向交错复用现有MM/uaccess包装器，保护完成、fault、
-超时和信号的结果以及页基线；对外poll和非阻塞语义另由network与固定ABI验证。
-
-## 命名 FIFO
-
-ext4/tmpfs 的 FIFO inode 保存持久身份、权限与时间，传输仍使用现有64KiB pipe。
-节点只保存弱关联；每个打开中或已打开的OFD同时钉住节点与pipe，最后owner先摘关联、
-丢弃内容，再关闭VFS引用。dup/fork共享OFD资格，hardlink/rename/unlink不改变实例；
-同名重建是新inode。创建节点不分配传输缓冲。
-
-阻塞只读/只写与对端会合，非阻塞只写无读者返回ENXIO，O_RDWR立即成功。
-到达代次保护对端出现后立即关闭的交错；初始非阻塞只读尚未见过写者时抑制HUP，
-后续写者离开才报告HUP。等待前没有namespace/inode锁；信号唤醒后先检查会合代次，只有对端未到达才按重启协议归还资格。
-pipe端点先关闭一次，真实VFS关闭错误继续归mount清理，不重新归还端点。
-
-正数读写更新命名节点时间，匿名pipe不更新；只读挂载允许FIFO传输而不修改时间。
-FIFO不可seek或fsync，节点由文件系统同步持久化，传输内容永不恢复。
-`make test-fifo-riscv`以同ELF核对Linux的身份、打开、poll/select/epoll、时间、信号、
-fd满、只读挂载与重启；`make test-files-riscv`另注入对象/缓冲OOM并验证重试与回收。
-
-RV64 `truncate(45)`复制完整pathname后取得稳定path；相对cwd、绝对路径和
-末端符号链接沿共同解析器，长度与错误顺序由`path_only.c`核对。
-`ftruncate/O_TRUNC/truncate`共用后端大小、时间、capability清理与映射失效；
-`make test-lwext4-metadata-host`包含共享EA、操作abort和持久化格式核对，
-`sh tests/host/lwext4-metadata.sh truncate`可只检查新增属性边界。
-
-RV64 `sync(81)`同步当前单一挂载树；`syncfs(267)`同步fd实际所属挂载，O_PATH返回
-EBADF，字符节点及命名FIFO不改变所属挂载。匿名pipe/socket/epoll与无路径console没有
-持久化后端，不能借它们同步根盘。tmpfs/procfs的同步不制造设备I/O。
-OFD持有独立挂载错误游标，新打开从当前序号开始，dup/fork共享观察位置；文件fsync
-的inode游标保持独立。内存不足保留脏数据和真实owner，可重试；真实EIO/ENOSPC记录到
-所属挂载，不因一次观察或任务退出而清除设备／journal冻结状态。
-全局sync始终返回0，并继续尝试其他挂载，因此工具退出0仍不能替代持久化结果验证。
-快照、durable边界及OOM退路见[VFS契约](vfs-ext4.md)；窄入口为
-`make test-vfs-riscv test-files-riscv`及`tests/diff-abi/sync-cases.txt`，真实libc入口为
-`tests/userland/sync.h`。
-
-
-INET TCP 的流写接纳先于 payload usercopy：请求把 OFD pin 和 byte reservation 登记到当前任务，
-页内 iovec span 受接纳量限制，缺页睡眠期间 OFD pin 保证 close/fd 复用不改变目标。
-完整请求正常展开或强制退出归还预留；标量和向量的用户页pin均在实际提交完成后归还，
-不跨协议容量等待；未接纳的iovec前缀按真实进度重新准备。
-数值地址范围检查仍在状态与容量判断之前，实际读页在之后；文件、UNIX 和数据报路径保持各自契约。
-接口与同 ELF 验证见[网络模块](kernel-network.md#tcp-发送接纳与复制2026-10-05)。
-
-
-普通磁盘文件的顺序预测保存在 OFD，dup 共享，独立 open 不共享。非零预读候选中，
-read/readv、pread 系列与 sendfile 在访问时间更新等首次可睡眠动作前调用
-`kernel_open_file_read_begin`，成功前缀才调用 read_progress；冷不连续读取不能先睡眠
-再撤销旧预测。seek 和最后释放 OFD 取消其 cookie，预读持有 inode 而非 fd 编号，
-因此 fd 复用不会继承旧预测。默认关闭及取消接纳边界见[VFS 预读](vfs-ext4.md#有界顺序预读候选)。
-
-## statx 与 LoongArch musl
-
-`kernel_files_statx()` 与 `fstatat` 共用路径、fd pin 和真实 inode 元数据，按 Linux
-固定的 256 字节布局写入用户缓冲。`stx_mask` 报告 `STATX_BASIC_STATS`；当前不发布 `STATX_BTIME`，文件创建时间查询得到“不提供”。后端支持的
-inode 属性由独立的 `stx_attributes_mask` 声明，见[普通文件和目录的 inode 标志](#普通文件和目录的-inode-标志)。未知 request mask 位忽略，
-保留 bit31 与同时指定 FORCE_SYNC/DONT_SYNC 返回 EINVAL。正 fd 的空路径可为 NULL，
-与固定 Linux 一样略过其他 lookup 位；路径查询仍校验 lookup 位。坏缓冲或跨入
-无权限页返回 EFAULT，fd/path owner 按原契约回收。
-
-LA musl1.2.5 不提供旧 `fstat/newfstatat` syscall，而通过 statx 实现 libc stat API。
-验证入口是 `make test-diff-abi-riscv`（新增22条 statx、总1366条）、
-`make test-root-loongarch`（原 musl 与 BusyBox），并保留 `make test-files-riscv`。
-固定依据为 `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`
-的 `fs/stat.c`、`include/uapi/linux/stat.h`，以及固定 musl1.2.5 归档的
-`src/stat/fstatat.c` 和 `arch/loongarch64/bits/syscall.h.in`。
-
-
-普通文件的标量 read/write/pread/pwrite 在限长前检查原始数值范围，空范围允许 NULL 和用户地址上界，拒绝高于上界的地址；通用零长度 uaccess 不改变。
-数值拒绝发生在复制、偏移及文件时间修改之前。socket sendto/recvfrom 则沿 Linux import_ubuf 先限长再检查，实际 iovec 使用同一限长值。
-`make test-abi-boundary-riscv test-abi-boundary-loongarch TEST_MEMORIES="512M 1G"` 以同一 ELF 对照固定 Linux，检查溢出无接纳、空范围、共享 OFD 标志和消息拒绝后的队列内容。
-
-## eventfd计数对象
-
-`eventfd2`创建独立的匿名OFD，dup、fork和共享FD表均引用同一计数。普通read取走全部计数，EFD_SEMAPHORE每次取走1；写入总和上限为UINT64_MAX−1，非阻塞的空读或额度不足返回EAGAIN。计数及登记由对象短锁保护，用户复制、缺页、唤醒和休眠在锁外。读、写及组合就绪登记分别使用实际等待队列，写入只通知可读，消费只通知可写；epoll按所请求方向登记，保留Linux的ET通知行为。数值地址范围由共同I/O层先检查，拒绝时保留计数；进入实际用户页复制前read消费计数，页权限导致的输出EFAULT保留已消费的状态；write先完整取得8字节输入再接纳。readv跨向量组成一次8字节读取，writev沿Linux的逐向量write规则接纳完成前缀。
-
-读写和就绪查询在发起CPU执行，epoll复用现有控制与关闭关联协议。无epoll观察者的末次关闭本地完成，有关联时由现有CPU0路径先拆除。匿名对象通过fstat及`/proc/<pid>/fd`显示身份；pread/pwrite返回ESPIPE，lseek保留Linux的noop行为。
-
-匿名事件的阻塞读写沿共同可重启调用协议返回ERESTARTSYS，由实际线程的handler设置决定EINTR或重执行。向量写已完成前缀时直接返回前缀，保留已接纳计数。timerfd行为见[时间模块](kernel-time.md#timerfd期限)。`tests/workloads/event/boundary.c`保留定位I/O、原始地址范围、定向ET、空向量及写入错误优先级的直接反例；`tests/userland/run.py --workload event`复用共同Linux/客户机对照入口，观察构建另核对实际载荷pin和执行CPU。
-
-## inotify 文件事件
-
-RV64／LA64 使用 `inotify_init1`、`inotify_add_watch` 和 `inotify_rm_watch`。
-监视按文件系统实例与 inode 建立；硬链接和 bind 视图可以引用同一个 inode，复用同一监视编号。
-目录监视记录直接子项的名称，重命名的两端共享一个非零 cookie。普通文件的读取、写入、
-打开和关闭，以及 VFS 的目录修改和属性变更发布对应事件。监视不持有 OFD：末链接删除后，
-最后使用者归还时发送 `IN_DELETE_SELF`，文件系统退役时发送 `IN_UNMOUNT`，
-两者都撤除监视并发送 `IN_IGNORED`。共享映射中的内存写入不产生 inotify 写事件。
-
-`inotify_rm_watch` 在文件描述符所属的监视组内查找监视描述符。描述符的低 8 位选择
-256 个哈希桶之一，每桶最多挂入 16 项。桶已满时，新监视按完整描述符插入该组的红黑树。
-删除调用先检查该桶，再在未命中时沿红黑树的一条路径查找。显式删除、单次事件后自动撤销、
-`IN_DELETE_SELF`、卸载和末次关闭共用 `remove_mark()`，在 `notify_lock` 保护下同时撤除
-描述符索引、文件监视链和组内监视链。末次关闭沿组内监视链分批撤除，每次持锁最多处理 32 项。
-
-`/proc/<pid>/fdinfo/<fd>` 持有查到的打开文件描述，按组内监视链读取实际监视编号、索引节点、
-设备号和事件掩码。支持导出文件句柄的文件系统还会列出对应句柄。读取者分批在 `notify_lock`
-下取得字段快照，锁外格式化。删除操作将仍指向该标记的读取游标推进至下一项，原描述符关闭或
-复用时，正在进行的读取仍使用已持有的监视组。
-
-每个真实 UID 最多 128 个实例、65,536 个监视；每个实例的未读记录使用 64 KiB 环。
-环为 `IN_Q_OVERFLOW` 保留位置，读返回完整记录，名称以 NUL 补齐到记录边界。
-阻塞读取、`IN_NONBLOCK`、poll/epoll 和 `FIONREAD` 使用同一队列状态。事件发布时借用
-等待游标，释放短锁后通知；最后关闭在拆除 epoll 关联后释放实例，已选中的通知保持独立引用。
-每个实际入队的记录向独立异步源发送一次 POLL_IN，包括 IN_IGNORED 和首次溢出记录；
-相邻合并及溢出后的抑制不发送信号。普通 poll 的 pending_wake 继续合并唤醒，不能代替
-记录数。遍历仅跨锁借用当前 mark 和后继，移除中的后继由独立退休链接保活；mark 的借用
-同时持有 group，因此另一线程关闭监视组后，锁外回调和剩余遍历仍有实际所有者覆盖。
-
-直接探针见 [inotify.c](../../tests/workloads/fs/inotify.c)，覆盖目录事件、事件消费、溢出、
-乱序删除及自动撤销后再次删除。`sh tests/host/inotify-async.sh` 检查通知次数、回调期间并发
-撤除后继监视项，以及哈希碰撞时显式删除、卸载和关闭对描述符索引的清理。
-
-## fanotify 文件访问通知
-
-RISC-V 和 LoongArch 的 `fanotify_init` 创建通知组，`fanotify_mark` 增加、移除或清空
-标记。索引节点标记跟随文件对象，挂载标记匹配实际视图，文件系统标记覆盖同一实例的
-全部视图。目录及直接子项按标记位选择。旧式 `FAN_MARK_IGNORED_MASK` 与
-`FAN_MARK_IGNORE` 分别按各自的目录及子项规则过滤事件；未要求跨修改保留时，
-修改清除相应忽略掩码。`FAN_MARK_EVICTABLE` 随实际索引节点回收撤下。
-
-每个真实用户最多持有 128 个组和 8192 个标记，每组最多排队 16384 个普通事件。
-索引按被监视对象查找匹配组。组内的队列按首次入队顺序读取，合并索引可将同一实际对象
-及发送者的后续事件并入尚未读出的记录。队列超过额度时报告 `FAN_Q_OVERFLOW`。
-读者以完整事件为单位读取，缓冲区不足时保留未取出的下一条记录。文件复制故障或描述符
-耗尽时，已摘出的事件和本次预留的资源沿实际失败路径归还。阻塞读与轮询共用组的等待队列。
-读取请求在等待期间持有组描述符引用和向量缓冲。摘出事件后，请求登记事件、预留的描述符编号和
-正在创建的打开文件描述（Open File Description，OFD）。打开文件所需的后端资格可能等待。
-事件的打开文件描述在等待前已经登记，退出回收能撤销预留并释放所有未交付的资源。
-
-传统通知记录持有实际路径，读者从自身文件表取得事件描述符。通过该描述符进行文件操作
-会抑制递归通知。文件标识（File Identifier，FID）记录的文件句柄和文件系统标识分别与
-`name_to_handle_at` 和 `statfs` 的输出一致。目录文件标识（Directory File Identifier，DFID）
-可以与名称和目标对象标识组合，用于报告创建、删除、移动和改名。改名以操作时确定的
-旧、新目录和名称报告命中的一侧或两侧。ext2、ext4 和 tmpfs 可导出能够重新打开的句柄，
-叠加文件系统（OverlayFS）提供用于比较的文件标识，叠加视图及后备对象分别匹配。
-普通用户可以建立受限的索引节点句柄通知组；其他进程触发的事件隐藏发送者进程号。
-
-特权内容组可在打开、读取或执行前取得权限事件。发起操作的线程借用实际对象等待，
-监视者通过组描述符写入 `FAN_ALLOW` 或 `FAN_DENY`。等待期间不持有文件系统操作锁；
-拒绝返回 `EPERM`，监视组最后关闭时允许尚未应答的请求继续。权限事件逐项等待和完成，
-不参与普通通知的合并。
-`copy_file_range` 也检查源文件的读取权限。需要等待监视者时先归还文件位置锁，允许后重新
-取得锁，按当时的共享位置重新检查范围并执行复制。
-
-实例保存已登记事件的摘要。无相关订阅时，共同文件操作跳过标记查找；
-只有需要匹配父目录或生成名称记录时才读取父目录信息。同一次操作只取得一份发送者
-身份，并复用同一对象生成的句柄。创建目录、符号链接或特殊文件时，只有目标句柄订阅者
-存在，才进入生成句柄的创建入口并使用相应的栈空间。
-`/proc/<pid>/fdinfo/<fd>` 输出通知组标志和实际登记的标记，包括监视掩码及忽略掩码。
-快照每次在标记保护内捕获四条记录，文本格式化在保护外完成。
-路径和挂载的退休交接见[文件系统生命周期](vfs-ext4.md#文件访问通知)。
-
-[直接消费者](../../tests/workloads/fs/fanotify.c) 检查事件描述符、读取故障、句柄内容、
-合并和标记范围，以及解绑后已排队事件的路径与低权限组的身份可见性。
-`make test-fanotify-host` 检查 4 KiB 和 16 KiB 页下的标记索引、队列溢出、
-描述符耗尽和读取请求中止。
-
-### O_TMPFILE 匿名文件
-
-`openat(dirfd, ".", O_TMPFILE | O_RDWR, mode)` 直接分配链接数为 0 的普通 inode，不先生成临时名称再 unlink。目录写入/搜索权限、只读挂载、umask、默认 ACL 和创建身份沿用普通创建路径。文件可读写、映射、dup；最后引用释放后回收。ext4 在创建事务中加入持久 orphan，首次发布在同一事务中建立目录项并移除 orphan，因此恢复不依赖内存中的临时名字。无 journal 的 ext4 不支持此操作。
-
-非 `O_EXCL` 文件可通过 `linkat(fd, "", dirfd, name, AT_EMPTY_PATH)` 或跟随 `/proc/self/fd/N` 发布。`O_EXCL` 禁止发布；首次发布后再删除最后一个链接，不能借旧 fd 复活。首次发布复用 inode 与页缓存，不复制内容；发布与正常 namespace 操作使用已有目录/inode 锁。tmpfs 首次发布不重复收取 inode 配额。proc fd 链接显示原创建目录下的 `#inode (deleted)` 匿名路径。
-
-定向验证：`tests/host/tmpfile.sh` 覆盖 tmpfs 4 KiB/16 KiB、inode 配额及分配失败回滚；`tests/host/lwext4-tmpfile.sh` 覆盖 orphan_file/legacy orphan、事务回滚、最后关闭和崩溃恢复。`tests/userland/tmpfile.c` 同源运行于 Linux 和 BoarOS，覆盖发布、拒绝复活、并发发布、权限、fd 耗尽和映射生命周期；guest 还覆盖只读挂载、跨挂载和不支持后端。`tests/userland/tmpfile.py --arch riscv|loongarch --kernel KERNEL --program STATIC_ELF [--cpus 2]` 运行定向 QEMU 契约并执行离线 fsck。Linux 宿主若不能切换 uid，可设 `TMPFILE_SKIP_UID=1`，该项明确打印跳过；guest 不设置此变量。此验证不是全量兼容性或性能结论。
-
-语义依据：[Linux open(2)](https://man7.org/linux/man-pages/man2/open.2.html) 与 [link(2)](https://man7.org/linux/man-pages/man2/link.2.html)。
-
-### tmpfs 空间预留
-
-`fallocate(mode=0)` 为请求范围内缺少的页分配真实零填充后备，并按需扩大 EOF；`KEEP_SIZE` 只预留页，不改变文件长度。页粒度配额在分配时收费，重复预留不再收费，也不改写已有数据。成功预留的区域可通过普通读写或共享映射使用，不需要第二次分配后备页。未请求的稀疏区保持不分配，读回零。
-
-memory object 在一次索引锁期间私有暂存新增页，全部分配成功后批量发布；失败只释放本次暂存页及预算，不撤销原有页和数据，不改变 EOF。复用页节点的链接保存暂存链，不分配逐页回滚数组，也不为每页增加再归还临时引用。索引容量按最终页数一次调整；已存在的映射准备页在成功预留后成为正式后备，准备者随后拒绝发布不能误删它。配额耗尽返回 `ENOSPC`，物理内存或元数据分配失败返回 `ENOMEM`。与 Linux shmem 一致，KEEP_SIZE 的预留末端超过 EOF 时也受 RLIMIT_FSIZE 约束，不能借此绕过文件大小限额。
-
-`KEEP_SIZE` 页可位于 EOF 之外。增长 ftruncate 保留它们，同尺寸或缩短 ftruncate 清除新 EOF 后的预留，打洞也能释放 EOF 之外的完整预留页。这些边界使用 Linux 同源契约核对。`tests/host/tmpfs-fallocate.sh` 检查 4 KiB/16 KiB 页、预算、分配故障和实际物理内存耗尽，`test-memory-object-concurrency-host` 另检查索引增长失败回滚与映射准备页归属。`tests/userland/tmpfs_fallocate.py` 运行 RV/LA 定向契约，其 C 程序可在 Linux 上传入 tmpfs 文件路径运行，挂载配额分支仅在客户机运行。`SEEK_DATA` 和 `SEEK_HOLE` 按文件的实际后备定位，见[稀疏文件定位](vfs-ext4.md#稀疏文件定位与挂载根属性)。
-
-预留接口语义参考：[Linux fallocate(2)](https://man7.org/linux/man-pages/man2/fallocate.2.html)。
+</details>

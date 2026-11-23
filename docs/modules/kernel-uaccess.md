@@ -1,79 +1,91 @@
 # 用户内存访问模块
 
-本文描述内核与当前已映射用户地址空间之间复制数据的稳定边界。页表格式和 MM 生命周期分别见 [RISC-V Sv39 分页模块](riscv-sv39.md)与[内核 MM 模块](kernel-mm.md)，消费者见[系统调用解码模块](kernel-syscall.md)和[进程文件资源模块](kernel-files.md)。
+内核在执行系统调用（如 `read`/`write`、`uname`、`execve` 读取参数向量与路径名）以及同步原语（如 `futex`）时，必须安全地读写用户态虚拟地址空间。用户传入的指针可能指向非法内核地址、未映射空洞、只读页面，或尚未触发按需装页与写时复制（Copy-on-Write，CoW）的合法映射。用户内存访问模块（User Access，简称 uaccess）为内核提供统一的安全拷贝与用户态原子操作边界，自动完成范围校验、按需缺页修复与精确部分完成回报，绝不允许一个错误的用户指针导致内核崩溃。
 
-## 接口与职责
+页表与地址空间机制见 [RISC-V Sv39 分页模块](riscv-sv39.md) 与 [虚拟内存管理（VMM）](kernel-mm.md)，主要消费者见 [系统调用模块](kernel-syscall.md) 与 [进程文件资源模块](kernel-files.md)。
 
-公共声明位于 `include/kernel/uaccess.h`，共享实现在 `mm/uaccess.c`，用户地址上界由 `include/arch/mmu.h` 绑定：
+---
 
-```c
-enum kernel_uaccess_status kernel_copy_to_user(
-    struct kernel_mm *mm,
-    uint64_t user_destination,
-    const void *kernel_source,
-    size_t size,
-    size_t *bytes_copied);
+## 一、源码组织
 
-enum kernel_uaccess_status kernel_copy_from_user(
-    struct kernel_mm *mm,
-    void *kernel_destination,
-    uint64_t user_source,
-    size_t size,
-    size_t *bytes_copied);
+| 源码路径 | 核心职责 |
+| :--- | :--- |
+| `include/kernel/uaccess.h` | 公开跨架构安全访问接口：`kernel_user_range_check`、`kernel_copy_to_user`、`kernel_copy_from_user`、`kernel_copy_string_from_user` 与 `kernel_user_cmpxchg_u32` |
+| `include/arch/uaccess.h`、`include/arch/riscv/uaccess.h` | 编译期路由开关 `ARCH_UACCESS_NATIVE`（RISC-V 为 `1`，LoongArch 与宿主测试模型为 `0`），零虚表开销选择本核原生快路径或软件页表路径 |
+| `mm/uaccess.c`、`mm/uaccess_internal.h` | 公共范围校验、本核直接拷贝重试循环、软件页表固定借用（Pin）拷贝、双页批借用与跨页写游标 `struct kernel_uaccess_write_cursor` |
+| `arch/riscv/user_copy.S`、`arch/riscv/uaccess.c` | RISC-V 64 汇编直接用户拷贝例程、`sstatus.SUM` 区间控制、`.rodata.riscv_uaccess_fixups` 异常恢复表与陷入恢复分派 `riscv_uaccess_fault()` |
 
-enum kernel_uaccess_status kernel_copy_string_from_user(
-    struct kernel_mm *mm,
-    char *kernel_destination,
-    uint64_t user_source,
-    size_t capacity,
-    size_t *string_length);
+---
+
+## 二、双路径执行架构
+
+BoarOS 根据目标体系结构以及“被访问的地址空间是否为当前处理器正在运行的用户线程空间”，自动路由至两条互补路径：
+
+```mermaid
+flowchart TD
+    Entry["uaccess 请求\n（copy_to / copy_from / copy_string）"] --> Check["1. 区间算术校验\nkernel_user_range_check()\n拦截越界与整数溢出"]
+    Check -->|非法| Fault["返回 FAULT\n（bytes_copied = 0）"]
+    Check -->|合法| Route{"ARCH_UACCESS_NATIVE\n且 local_user_mm(mm)?"}
+    Route -->|是（RISC-V 本核活跃空间）| Native["路径一：本核直接硬件拷贝\n• 临时置位 sstatus.SUM\n• 32 B / 8 B 汇编循环直接访存\n• 缺页经 fixup 表退回 C 层\n• 常规栈上调用 resolve_user_fault 并续传"]
+    Route -->|否（LoongArch / 跨空间 / cmpxchg）| Pin["路径二：软件页表固定借用（Pin）\n• 按基页或双页查询 PTE 并递增物理引用\n• 未驻留/CoW 时 resolve_user_pin\n• 通过直接映射 memcpy 或原子 CAS\n• 完成后立即归还 Pin"]
 ```
 
-构建期直接选择架构实现，不使用运行期 vtable。syscall、文件层和 exec 准备阶段从当前 task 借用 mutable MM 后调用这些接口，因为合法的 demand-zero 页可能在复制中首次提交。调用者不依赖 Sv39 PTE 位或物理地址布局。`uname(160)` 使用写入用户空间方向，路径和 exec 字符串使用有界字符串读取，exec 的指针向量使用固定长度读侧接口。公共 `kernel_user_range_check()` 在不访问页表的情况下校验整个用户半开区间。
+### 2.1 路径一：RISC-V 本核直接拷贝与异常恢复表
 
-## 范围、权限与部分复制
+当处理器处于 RISC-V 64 且目标 `mm` 正是当前核激活的用户地址空间（`active_mm_record == mm->record` 且当前任务携带用户上下文）时，`mm/uaccess.c` 直接调用 `arch/riscv/user_copy.S` 的汇编例程，免去逐页软件查表与频繁引用计数的开销：
 
-RISC-V 直接复制路径对齐后每轮复制 32 字节。向用户空间写入时，先读齐本轮的四个内核机器字，再连续写入用户地址，减少源和目标地址转换交替竞争。两个地址在机器字内的偏移不同时，先对齐目标地址，再用请求范围内读取的对齐内核机器字组装输出。首尾不足一字的部分逐字节处理。每条用户存储指令各有异常恢复点，恢复时按已经完成的存储报告前缀。从用户空间读取时，偏移不同的请求按字节处理，避免为了组装一个机器字提前访问后续不可读页面。
+- **最小化 `sstatus.SUM` 窗口**：RISC-V 监管态默认禁止直接访问带 `U` 位的用户页（防止内核意外解引用用户指针）。汇编例程仅在实际拷贝区间首尾通过 `csrs`/`csrc sstatus, 0x40000`（`SUM` 位，bit 18）开闭权限。
+- **高吞吐展开与对齐策略**：
+  - 当源地址与目标地址对 8 字节同余时，先逐字节对齐到 8 字节和 32 字节边界，随后进入每轮 **32 字节**（四条 64 位 `ld`/`sd`）的展开循环。写入用户空间（`riscv_copy_to_user`）时，先一口气读齐本轮的四个内核机器字（`t0, t2, t3, t4`），再连续写入用户地址，减少内核页与用户页地址转换交替竞争。
+  - 当源和目标的 8 字节页内偏移不同时：写入用户空间先将用户目标对齐到 8 字节，再从请求范围内的对齐内核字移位拼装出对齐的 64 位写入（`.Lshift_words`）；从用户空间读取（`riscv_copy_from_user`）则退回逐字节循环，避免为了拼装一个机器字而提前越界读取后续不可读页面、导致丢失原本合法的前缀。
+- **精确异常表恢复（`.rodata.riscv_uaccess_fixups`）**：
+  - 汇编宏 `recover` 仅将**访问用户地址的访存指令**及其对应的恢复标签（`.Lfail`、`.Lfail8`、`.Lfail16`、`.Lfail24`）成对登记在只读节 `.rodata.riscv_uaccess_fixups` 中；访问内核缓冲区的指令绝不登记，因此内核自身的野指针仍会直接触发致命陷入。
+  - 若某条用户访存触发异常，陷入处理器调用 `riscv_uaccess_fault()`：核对 `sstatus.SUM` 为 1、`stval < RISCV_SV39_USER_LIMIT` 且 `scause` 为加载/存储缺页（13 / 15）或加载/存储访问异常（5 / 7），检索到匹配 `sepc` 后把 `scause` 存入 `t5`、将 `sepc` 改写为恢复点并立刻清除 `sstatus.SUM`，然后干净地退出陷入帧。
+  - 恢复点扣除当前批次已完成的偏移，将精确剩余字节数与异常原因返回给 C 层的 `local_copy()` / `local_string()`。此时已完全脱离嵌套陷入栈帧：若是页故障（`cause == 13 || 15`），外层在常规可睡眠内核栈上调用 `kernel_mm_resolve_user_fault()` 完成按需零页、文件读盘或 CoW，随后从已完成前缀之后继续重试；若是访问故障（`cause == 5 || 7`），则立即终止并返回 `FAULT`。
 
-非零固定长度请求首先验证整个半开区间位于构建期架构用户范围 `[0, ARCH_MMU_USER_LIMIT)`（RV 为 2^38，LA 为 2^47）；整数溢出或越过上限在复制前返回 `KERNEL_UACCESS_STATUS_FAULT`，`bytes_copied=0`。零长度请求不检查用户地址或内核 buffer，直接成功并报告 0。
+### 2.2 路径二：软件页表固定借用（Pin）与直接映射访问
 
-不能直接访问目标地址空间时，合法范围按构建期基页边界切分（RV 4 KiB、LA 16 KiB）。每个片段先经 `kernel_mm_pin_user_page()` 查询物理地址、验证通用权限并取得实际物理页引用；若 PTE 尚未驻留或需要 COW，uaccess 用实际读/写方向调用 `kernel_mm_resolve_user_fault()`，成功后重新 pin。RISC-V 在本核已启用调用者地址空间时直接复制，遇到页故障由 `local_copy()` 返回公共解析器，再从完成前缀之后重试。anonymous `DEMAND_ZERO`、file-private 和 COW 页都复用该解析器。写入用户空间要求 `USER|WRITE`，读取用户空间要求 `USER|READ`。VMA 外、`PROT_NONE`、权限不足、文件整页越过 EOF 或缺页解析得到 `NO_MEMORY` 时返回 `FAULT`；MM 状态、页表结构、设备故障或已映射物理页无法解析返回 `STATE`，不能把真正的内核对象损坏伪装成普通用户 `EFAULT`。
+在 LoongArch 64、宿主测试模型、跨进程/非当前激活地址空间拷贝，以及 `kernel_user_cmpxchg_u32()` 原子操作中，内核经由软件页表固定协议访问用户物理页：
 
-固定长度复制不是事务。若前面的完整片段已经复制，后续页未映射或权限不足，函数保留已复制的连续前缀并精确报告 `bytes_copied`；这与 Linux usercopy 允许部分修改目标缓冲区的内部语义一致。文件 `read` 依据这个前缀提交 open-file offset；普通文件 `write/writev` 把可读前缀提交给 backend，只按 backend 实际写入量推进 offset，并在用户 fault 后结束整个请求；`uname` 和文件层只把 `FAULT` 转成用户可见的 `-EFAULT`，内核状态错误仍由 syscall/Trap 边界判为 fatal。
+- **固定借用与缺页修复**：每个基页片段先尝试 `kernel_mm_pin_user_page()`——在 MM 的 `metadata` 读锁（`KERNEL_RAW_RANK_MM = 15`）内查表、校验 `USER|READ` 或 `USER|WRITE` 权限、递增物理页引用计数及地址空间的 `access_pins`/`write_pins`，返回直接映射指针。若目标页尚未驻留或需要写时复制，则自动调用 `kernel_mm_resolve_user_pin()` 装页并重新固定。实际 `memcpy` 与原子指令全部在锁外完成，结束后立即归还借用令牌（`kernel_mm_unpin_user_page`）。
+- **两项热路径优化**：
+  - **写游标缓存（`struct kernel_uaccess_write_cursor`）**：供文件读等连续分片写入同一用户页的场景复用当前已固定的页句柄，直到跨页或结束前才归还（在 RISC-V 本核空间上仍自动切入 `local_copy`）；
+  - **跨双页批量固定（`copy_to_user_pair`）**：对于恰好跨越两张相邻基页的写入，通过 `kernel_uaccess_pin_user_pair()` 尝试一次借用两页并成对归还（仅首页触发缺页，次页通过 `kernel_mm_try_pin_user_page()` 就地借用已驻留页），减少锁往返。
+- **用户态 32 位原子比较交换（`kernel_user_cmpxchg_u32`）**：要求 4 字节对齐且位于用户地址空间内，以写权限固定目标页（完成必要的按需装页与 CoW）后，在直接映射地址上执行 `__atomic_compare_exchange_n(..., __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)` 并返回旧值，支撑 `futex` 等待与唤醒的原子语义。
 
-字符串接口最多读取 `capacity` 字节，成功时把 NUL 一并复制并用 `string_length` 返回不含 NUL 的长度。容量内无 NUL 返回 `TOO_LONG`；到达用户上限、未映射或不可读页返回 `FAULT`，同时保留并报告已复制前缀。它不接受容量 0，因而不会把未验证指针当作空字符串。
+---
 
-## 并发与性能边界
+## 三、范围校验、部分复制与错误语义
 
-当前uaccess只对已经激活的MM提交新页，驻留页的pin也可用于启动期I/O上下文。
-每个基页片段在MM rank15 raw内完成权限检查和取得页引用，复制及原子用户操作在锁外执行，
-token 记录本次取得的实际 MM 记录和 owner 链位置；归还不重新解析 MM 元数据，也不扫描其他活动 token，支持任意顺序结束借用。随后由同一任务/I/O owner归还。字符串发现NUL也先归还pin；失败保持精确前缀。
-调用者的LIVE MM句柄覆盖token的寿命；token不可复制或跨任务归还，重复登记/归还fatal。
-页引用要求已finalized的allocator，不把bootstrap单owner页伪装为可共享引用。
+| 规则维度 | 具体约定 |
+| :--- | :--- |
+| **用户地址上界** | `kernel_user_range_check()` 在触碰页表前检查整个半开区间 `[addr, addr + size)` 不溢出且不超过 `ARCH_MMU_USER_LIMIT`（RISC-V Sv39 为 $2^{38}$，LoongArch 64 为 $2^{47}$）；零长度固定拷贝直接返回 `OK` 且报告 `0` 字节 |
+| **非事务性前缀语义** | 固定长度拷贝不是全有或全无事务：若前若干字节或页面已成功传输、后续页遇到未映射或权限不足，函数保留已写入的连续前缀并通过 `bytes_copied` 精确报告已完成量。文件 `read`/`write`/`writev` 依此推进打开文件偏移量，符合 Linux 用户拷贝与短读写语义 |
+| **有界字符串读取** | `kernel_copy_string_from_user()` 拒绝 `capacity == 0`；最多扫描 `capacity` 字节，遇到 `'\0'` 时将终止符一并复制到内核缓冲区，`string_length` 返回不含 `'\0'` 的长度；若容限内无终止符返回 `KERNEL_UACCESS_STATUS_TOO_LONG`；遇未映射页或越界返回 `FAULT` 并保留已复制前缀 |
+| **错误隔离原则** | VMA 之外、`PROT_NONE`、权限不足、文件越过末尾（`BUS_FAULT`）或按需装页内存耗尽（`NO_MEMORY`）统一映射为 `KERNEL_UACCESS_STATUS_FAULT`（系统调用层转为用户态 `-EFAULT`）；而 MM 状态损坏、页表结构异常或物理页解析失败返回 `KERNEL_UACCESS_STATUS_STATE`，交由内核判定为致命错误，绝不把内核自身损坏伪装成普通 `-EFAULT` |
 
-pin防止已许可片段使用的页被撤映射后重新发放，不固定内容、权限或映射身份。
-普通逐页复制先归还当前片段再取下一个；显式自持同一MM pin的内部调用若gate忙或新许可关闭，返回`CONFLICT`，不得保留pin等待排空它的操作。冲突不发布新token，旧owner继续负责归还。
-普通用户与受控任务使用同一 pin 和 fault 路径。驻留匿名页复制不取得 operation gate；匿名缺页与 COW 可在调用 CPU 完成。磁盘冷页的后端读取仍交 CPU0 worker，可写共享文件 pin 同时持有 entry 写借用；快照撤 W、确认 RFENCE 后等待实际借用归还。fault 与 pin 之间再次遇临时撤 W 时重新判断，真正撤权或 EOF 仍返回 FAULT。mprotect 排空旧片段，fork 排空旧写片段；撤映射与 COW 的旧 owner 在 TLB 确认后归还。完整协议见[MM](kernel-mm.md#匿名-mm-的并发与回收)。
-驻留页每个基页进行一次三级软件页表查询、已持有物理页直接映射及 acquire/release，增加一个固定大小栈token；随后通过公共RAM `memcpy` 复制当前已pin片段。公共原语在源和目标同余对齐时使用 alias-safe 机器字与四字展开；不同偏移时，从片段内的对齐源字移位合成对齐目标字。首尾保留字节访问，两种 memmove 方向都不越过原片段边界；`memmove` 按实际重叠方向复制，清页/COW及heap清零/扩容复用相同RAM原语。它们不用于MMIO。首次提交的页额外承担 VMA 二分查找、页分配/清零、PTE 写入和架构转换失效。uaccess 经内核物理映射复制，不切换硬件用户地址空间；RV 不修改 `sstatus.SUM`。普通文件写使用同一 pin 解析器，从用户片段直接复制到最终页缓存或 tmpfs 页，详见[文件资源模块](kernel-files.md#请求暂存与成本)。文件读仍按持有的缓存页片段复制到用户。当前的页固定协议承担权限、COW、撤映射和真实引用寿命；硬件 SUM 加异常表需要另外实现这些保证，不能只替换复制指令。开发板吞吐、TLB miss 与 cache 开销尚未测量。
+---
 
-COST 构建在成功解析后的固定长度页内 chunk 记录实际复制字节、次数、单次最大值
-及经过 ticks；解析失败、权限检查和字符串扫描不归入该复制样本。采样不改变已复制
-前缀。用户页解析次数只通过已有 `COST_USER_RESOLUTIONS` 记录，普通构建不维护每页全局原子计数。
+## 四、并发安全与页固定（Pin）边界
 
-QEMU `virt` 与 VisionFive 2 共享这套 Sv39 实现，板级 RAM/MMIO 差异已由启动内存和页表建立隔离。LoongArch 已用同一策略和自己的 16 KiB/三级页表、用户范围验证真实 ELF 与跨页用户复制；见[首阶段范围](loongarch-boot.md)。
+- **Pin 保障物理存活而非内容互斥**：`pin` 通过物理页引用计数与 MM 的 `access_pins` / `write_pins` 计数（配合排空机制 `MM_PIN_CLOSED`），确保正在拷贝或执行 `futex` 的物理页不会被并发 `munmap` 或 CoW 释放后重新分配给他人；对于可写共享文件映射，写固定还同步持有页缓存写借用，确保回写快照排空在途写者。但它不替代用户态多线程之间的数据同步。
+- **禁止持旧 Pin 睡眠或重入**：调用者在换页、发起缺页或进入磁盘 I/O 等待前必须先归还已有 Pin；若同一调用链持有 Pin 时试图再向正在排空 Pin 的操作申请新固定，MM 返回冲突以避免自锁死锁。
+- **令牌所有权**：固定令牌 `struct kernel_mm_user_pin` 记录本次登记节点位置，归还为 $O(1)$ 且支持任意顺序释放；令牌不可复制、不可跨任务归还，重复归还直接触发 fatal trap。
 
-## 验证与限制
+---
 
-```sh
-make test-string-host
-make test-mm-pin-host test-mm-concurrency-host
-make test-mm-smp-riscv
-make test-uaccess-riscv
-make test-files-partial-write-riscv
-make test-userland-riscv
-make test-riscv
-```
+<details>
+<summary>展开查看：公共内存原语、成本采样与定向验证入口</summary>
 
-聚焦测试分别覆盖 copy-to、copy-from 和字符串复制的合法同页/跨页、零长度、整体用户范围、读写权限、容量内缺少 NUL、跨入未映射页后的精确前缀、非法内核参数、已释放 MM 和物理页访问失败。VMA 测试让 copy-to 首次提交匿名 mmap 页；真实 U-mode 测试验证 `uname` 的跨页 Linux ABI；文件测试验证跨页路径、超过一页的读缓冲区、`-EFAULT` 与 offset 提交；普通文件写测试覆盖 0、1、32、63、64、65 字节可读前缀、append、跨 iovec 进度和 backend 短写/错误，真实 U-mode 用 `mprotect(PROT_NONE)` 验证同一边界。
+### 公共内存原语与成本诊断
 
-当前没有 SUM/异常表快路径和完整 SMP 映射稳定协议；32位用户比较交换使用真实原子操作并由页pin覆盖。硬件 U-mode 缺页的页分配耗尽仍按任务资源耗尽处理；syscall 内 uaccess 则把无法完成本次 fault-in 的 `NO_MEMORY` 隔离为 `FAULT`，保留已复制前缀，由 `uname` 返回 `-EFAULT`、`read` 返回前缀或首字节 `-EFAULT`。这不等于已经实现进程级 OOM killer 或把其他内核分配失败统一转换为 `EFAULT`。
+- 软件固定路径的页内拷贝复用 `lib/string.c` 的对齐展开 `memcpy` 原语（同余时机器字与四字展开，不同偏移时从片段内对齐字移位合成，不越过页片段边界）。
+- 开启 `BOAROS_COST_DIAGNOSTICS` 构建时，在 RISC-V 直接拷贝与软件固定页拷贝处统一记录 `COST_UACCESS_COPY_BYTES`、`COST_UACCESS_COPY_TICKS`、`COST_COPY_TO_USER`、`COST_COPY_FROM_USER` 与 `COST_USER_RESOLUTIONS`；默认发布构建零额外采样开销。
+
+### 定向验证入口
+
+- **宿主字符串原语、页固定与并发协议**：`make test-string-host`、`make test-mm-pin-host`、`make test-mm-concurrency-host`
+- **RISC-V 客机直接拷贝、多核与部分写边界**：`make test-uaccess-riscv`、`make test-mm-smp-riscv`、`make test-files-partial-write-riscv`、`make test-userland-riscv`、`make test-riscv`
+- **LoongArch 跨页拷贝与真实 ELF 验证**：`make test-loongarch`（详见 [LoongArch 启动模块](loongarch-boot.md)）
+
+</details>

@@ -1,73 +1,92 @@
-# VirtIO RNG 与可信初始化
+# VirtIO 硬件随机数与熵源初始化
 
-共用入口是`drivers/virtio/rng.c`和`include/kernel/virtio_rng.h`，使用
-[VirtIO框架](virtio-framework.md)的transport/split queue。RV薄MMIO/PLIC适配仍为
-`arch/riscv/virtio_mmio_rng.c`；LA由`drivers/virtio/pci_rng.c`连接现代PCI，根从
-全部端点身份发现RNG，不假定槽位。支持RV legacy/modern MMIO和LA modern PCI；
-不包含packed ring或实板熵质量声明。
+操作系统的密码学随机数子系统（如 `getrandom(2)` 与 `/dev/urandom`）在启动早期必须收集足够的可信熵，才能避免生成可预测密钥。BoarOS 通过跨架构共用的 VirtIO 硬件随机数生成器（Random Number Generator，RNG）驱动，依托[共用 VirtIO 框架](virtio-framework.md)统一接入 RISC-V 内存映射 I/O（MMIO）与 LoongArch 现代 PCI 熵设备，由独立的内核后台线程持续为内核随机池注熵并周期性补种。随机核心与用户态语义可配合阅读[随机源设计说明](../learning/random-source.md)。
 
-## 请求与信任
+---
 
-每实例有独立IRQ owner、一个descriptor、DMA区和普通joinable内核worker。
-legacy分配两个目标物理页、used对齐到第二页；modern分配一个物理页，RV为4KiB、
-LA为16KiB。队列及64字节数据区由实例持有，不与块设备共享请求/等待者。
+## 一、源码组织与资源布局
 
-worker 首次运行即请求 64 字节。IRQ 获取 used index 后执行 DMA acquire barrier，检查仅一个新完成、descriptor ID 为 0、长度不超过 64，然后仅记录结果并唤醒 worker。worker 将成功的非零响应传给 `kernel_random_mix()`，然后按响应字节数乘 8 调用 `kernel_random_credit_bits()`，短响应在本轮累计到至少 32 字节后休眠 60 秒，再补种。可信累计和 ready 唤醒由随机核心负责；DTB seed 与用户写入不计熵。已 ready 后的设备失败不撤销 ready。
+| 源码路径 | 核心职责 |
+| :--- | :--- |
+| `drivers/virtio/rng.c`、`include/kernel/virtio_rng.h` | 共用 RNG 驱动核心：单描述符分裂队列、可汇合注熵线程、超时与退避策略、熵缓冲即时擦除与复位回收 |
+| `arch/riscv/virtio_mmio_rng.c` | RISC-V 平台适配：按 VirtIO 设备 ID `4` 探测 MMIO 设备并绑定平台级中断控制器（PLIC） |
+| `drivers/virtio/pci_rng.c` | LoongArch 平台适配：按设备 ID `4`（无需设备配置区，`config_size = 0`）探测现代 PCI 设备并管理 BAR 生命周期 |
 
-单次请求最多等待 5 秒。零响应、非法完成和超时先 reset，随后等待 60 秒才重新协商和请求，避免零响应忙循环；正常短响应可以立即继续。worker 的等待检查与 IRQ 唤醒由单 hart 关中断区协调，睡眠会让其他任务运行。IRQ 不生成或复制用户随机数据。
+### 队列与 DMA 内存规格
 
-## 生命周期与失败 owner
+RNG 是最精简的 VirtIO 设备之一，没有设备配置区，也不需要协商任何设备专属特性位：
 
-`riscv_virtio_mmio_rng_start()` 依次 reset、分配 DMA、协商队列、登记 IRQ、创建 worker。失败时按实际已获得的资源回滚。停止设置 stopping 并唤醒、join 回收 worker 栈，再确认 status reset 为 0 后注销 IRQ、擦除 DMA 和归还物理页。合法分配器释放失败是 fatal 不变量错误。
+| 参数 | Legacy v1（MMIO） | Modern v2（MMIO / PCI） |
+| :--- | :--- | :--- |
+| **物理页分配** | `order = 1`（连续 2 页，RV 占 `8 KiB`） | `order = 0`（单物理页，RV 占 `4 KiB`，LA 占 `16 KiB`） |
+| **队列深度** | `1` 项描述符（描述符表位于偏移 `0`，可用环位于偏移 `16`） | `1` 项描述符（描述符表位于偏移 `0`，可用环位于偏移 `16`） |
+| **已用环偏移** | `BOAROS_PAGE_SIZE`（协议要求页对齐） | `32 B` |
+| **熵数据缓冲区** | 紧随已用环后偏移 `+64 B`，长度 `64 B` | 紧随已用环后偏移 `+64 B`，长度 `64 B` |
 
-reset未确认时不得释放DMA：`stop()`返回`-EIO`，保留transport context、DMA和
-IRQ owner，允许显式重试。运行期间同样保留owner，60秒后先重试reset，不能继续
-向旧队列提交。启动错误只有清理成功后才可作为可选RNG不可用继续boot；若owner
-尚存，根启动明确失败。PCI包装层先消费worker/DMA/IRQ，再消费BAR；半成品也保持
-可停止，不能因core context已清空而遗漏剩余PCI function。
+每个 RNG 实例拥有独立的队列物理页、中断所有权和等待队列，与块设备、网卡完全隔离，互不争用队列槽或等待资源。
 
-`struct riscv_root_boot` 持有实例，其基线在 RNG 分配前采样。根结束和失败清理先 stop/join，再检查页及堆基线。joinable RNG 不发布用户 completion；根 cleanup 只识别 USER PID 1，不会把 RNG worker 当成剩余用户任务。没有 RNG 时用户仍可启动，普通 nonblocking getrandom 保持 `EAGAIN`。
+---
 
-## 用户请求
+## 二、异步采集、熵信用累计与故障退避
 
-## 固定依据与验证
+RNG 驱动不在中断上下文或用户态系统调用中同步等待硬件，而是通过独立的可汇合内核工作线程 `worker` 与中断处理函数 `interrupt` 异步协作：
 
-- Linux `references/linux/drivers/char/hw_random/virtio-rng.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`：请求缓冲、合法短响应和 reset 后回收。
-- QEMU `references/qemu/hw/virtio/virtio-rng.c`、`backends/rng-egd.c`，v11.1.0 / commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`：异步请求与 EGD 字节协议。
+```mermaid
+flowchart TD
+    Start["Worker 启动 / 新一轮采集<br/>collected = 0"]
+    Cfg{"设备已配置？"}
+    Init["configure()：复位、擦除 DMA 页、<br/>协商特性与队列并置 DRIVER_OK"]
+    Submit["submit()：投递 64 B 可写描述符<br/>（VIRTIO_DESC_WRITE），设置 5 秒期限"]
+    Wait["休眠等待 progress 队列<br/>（允许其他任务正常运行）"]
+    IRQ["硬件中断 interrupt()<br/>• 确认中断 · virtio_split_take() 校验 ID=0 且 len ≤ 64<br/>• 记录结果并唤醒 Worker（不混熵、不拷贝用户数据）"]
+    Check{"检查完成结果"}
+    Mix["kernel_random_mix() 混入随机池<br/>kernel_random_credit_bits(len × 8) 计入可信熵<br/>kernel_random_erase() 立即擦除 64 B DMA 缓冲"]
+    Enough{"本轮累计<br/>collected ≥ 32 B？"}
+    Sleep["休眠 60 秒后再次补种"]
+    Backoff["触发 reset() 重置设备<br/>进入 60 秒退避睡眠（防止忙循环）"]
 
-```sh
-python3 -B tests/host/virtio_rng.py
-make all
-build/riscv/musl-root/bin/musl-gcc -fno-link-libatomic -static -O2 \
-  -Wall -Wextra -Werror tests/userland/rng.c -o build/riscv/tests/user/rng-rv
-python3 -B tests/userland/rng.py
-python3 -B tests/userland/rng.py --memory 512M --memory 1G
-make test-rng-loongarch test-rng-failures-loongarch
+    Start --> Cfg
+    Cfg -- "否" --> Init
+    Init -- "失败" --> Backoff
+    Init -- "成功" --> Submit
+    Cfg -- "是" --> Submit
+    Submit --> Wait
+    IRQ -. "唤醒" .-> Wait
+    Wait --> Check
+    Check -- "超时(5s) / 非法完成 / 0 字节响应" --> Backoff
+    Check -- "有效响应（1..64 B）" --> Mix --> Enough
+    Enough -- "否（正常短响应）" --> Submit
+    Enough -- "是（≥ 256 bit）" --> Sleep --> Start
+    Backoff --> Start
 ```
 
-旧RV阶段host模拟覆盖两种队列的16+16短响应、零长度退避、非法长度/ID、5秒
-超时、60秒补种、ready后失败保持、启动分配/IRQ/worker失败、在途stop和回收。
-真实QEMU两种传输共八例，覆盖正常/缺失/EGD暂扣进展与在途结束，并核对根基线。
-EGD和host固定数据仅验证传输、等待和所有权，不是熵质量证据。固定QEMU拒绝
-reset确认的真实硬件故障没有动态重现；下述共用阶段补上拒绝确认的边界模型。
+关键安全与稳定性策略如下：
+- **可信熵累计与不可逆就绪**：只有经过硬件 RNG 返回的非零字节才会按 `response_length × 8` 位调用 `kernel_random_credit_bits()` 计入可信熵；设备树（DTB）启动种子与用户态写入仅参与混合，不计入可信熵。一旦随机池达到就绪阈值并唤醒等待中的 `getrandom(2)` 调用者，后续即使硬件 RNG 发生超时或故障，也**绝不撤销已就绪状态**。
+- **即时擦除敏感材料**：每次将设备写入的随机字节混入熵池后，工作线程立即调用 `kernel_random_erase(data, 64)` 清零 DMA 缓冲区；在重新配置队列和停止释放物理页前，同样整块擦除 DMA 内存，防止熵材料残留在空闲页中。
+- **区分正常短响应与故障退避**：硬件后端允许返回少于 64 字节的有效熵（例如每次 16 字节），驱动对此立即继续请求，直至本轮累计达到 **32 字节（256 位）** 后休眠 60 秒。但若出现 **5 秒超时**、**非法完成**（错误描述符 ID 或越界长度）或 **0 字节响应**，驱动则立即复位设备并退避 **60 秒**后再重新协商，彻底避免在熵源枯竭或后端故障时陷入忙循环。
 
-共用核心增加独立transport模型和16KiB模型，确认reset拒绝时worker可join但DMA/
-IRQ仍保留，随后确认成功才归还资源；同一实例可再次启动，无旧ring指针。该拒绝是
-边界模型，不声称固定QEMU真的拒绝reset。LA的DMA/任务页/栈页OOM及IRQ登记失败
-另有真实PCI注入，两种RAM均核对根页/堆/任务栈/BAR基线与未就绪等待的信号中断。
+---
 
-`tests/arch_profiles.py`提供双架构硬件事实，`tests/userland/rng.py`共用案例、EGD握手、
-退出/owner分类及输入身份。RV默认仍为两种MMIO、512MiB、BoarOS八例；LA为固定
-Linux先行、BoarOS随后、两种RAM、四种模式共16例。同一原探针ELF逐次校验，
-stdout、退出、输入身份与EGD请求保留在临时`rng-run.*`，成功后的镜像立即删除。
-在途停止模式先等待宿主观察到真实EGD请求，再经console输入放行用户退出；
-宿主始终扣住熵响应，并在结果中记录`stop_request_confirmed`。只打印停止标记
-或内核提交计数不能替代该握手。host门禁覆盖用户输出/后端请求的两种到达顺序。
-正常/缺设备/延迟/在途退出的LA16例及RV八例均通过；独立GNU五形态回归通过。
+## 三、启动生命周期与复位失败所有权保护
 
-Linux平台缓存为`build/linux-la-platform`，启用内建RNG/net/failover/RTC；旧
-`build/linux-la`保留。LA固定Linux在`fdt_setup`扫描seed后才`parse_early_param`，
-因此仅传`random.trust_bootloader=off`不能建立未就绪对照。RNG runner在vCPU
-启动前核对并将固件DTB的整个rng-seed property改为FDT_NOP，保留DTB布局与其他事实；
-GDB身份和操作在结果中记录，两侧同样使用无boot seed输入，不修改内核或libc。
-默认Boar启动仍接受DTB作为不计熵材料，不能据本测试改变其正常启动策略。
+1. **启动与原子回滚（`virtio_rng_start`）**：依次执行初始复位、分配物理页并解析内核虚拟地址、调用 `configure()` 完成协议协商与队列就绪、注册中断处理函数、创建可汇合内核线程 `worker`。任一步骤失败都统一调用 `virtio_rng_stop()` 按实际已获资源逆序回滚。若平台不存在 RNG 设备（或初始化失败但清理成功），系统仍可正常启动用户态进程，只是未就绪前的非阻塞 `getrandom(GRND_NONBLOCK)` 会保持返回 `-EAGAIN`。
+2. **停止与确认复位（`virtio_rng_stop`）**：设置 `stopping = 1` 并唤醒、汇合 `worker` 线程（回收线程栈），随后执行 `virtio_transport_reset()`。**只有在硬件确认复位成功（DMA 彻底停止）后**，才允许注销中断、擦除并释放 DMA 物理页、清空 `transport.context`。
+3. **复位拒绝时的所有权保留**：如果硬件拒绝确认复位，`virtio_rng_stop()` 返回 `-EIO`，此时工作线程虽已汇合，但驱动**保留 `transport.context`、DMA 物理页与中断注册所有权**，绝不释放可能仍被硬件访问的物理页，允许上层稍后显式重试 `stop()`；PCI 包装层（`virtio_pci_rng_stop()`）同样只有在核心停止成功后才归还 PCI function 与 BAR，防止半成品泄漏或覆盖设备所有权。
+
+---
+
+<details>
+<summary>展开查看：宿主模型与双架构 EGD 控序验证入口</summary>
+
+### 统计字段（`struct virtio_rng_device`）
+
+驱动维护五项生命周期计数：`requests`（已提交请求数）、`bytes`（已采集有效字节数）、`zero_responses`（零长度响应次数）、`errors`（配置/完成非法错误次数）与 `timeouts`（5 秒超时次数）。
+
+### 定向验证入口
+
+- **宿主驱动与边界模型**：`python3 -B tests/host/virtio_rng.py`（覆盖 Legacy/Modern 与 4 KiB/16 KiB 页模型下的 16+16 短响应拼接、零长度退避、非法长度/ID、5 秒超时、60 秒补种、就绪后故障保持、启动失败回滚、在途停止与复位拒绝重试恢复）。
+- **双架构客机与真实 EGD（Entropy Gathering Daemon）握手验证**：
+  - RISC-V MMIO：`python3 -B tests/userland/rng.py`（覆盖无设备、正常注熵、后端暂扣延迟就绪、在途退出与根资源基线核对）。
+  - LoongArch PCI 与故障注入：`make test-rng-loongarch`、`make test-rng-failures-loongarch`（覆盖 DMA/任务页/栈页内存耗尽与中断注册失败注入，以及未就绪等待被信号中断）。
+
+</details>

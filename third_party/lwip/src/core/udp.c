@@ -841,7 +841,7 @@ udp_finish_header(struct pbuf *p, const struct netif *netif, const ip_addr_t *so
 /* The caller owns this private payload and a resolved unicast path. No
  * mutable UDP PCB or shared network-layer state is needed after admission. */
 err_t
-boaros_udp4_output_resolved(const struct boaros_udp4_path *path, struct pbuf *p)
+boaros_udp4_output_resolved(const struct boaros_udp4_path *path, struct pbuf *p, int more)
 {
   if (pbuf_add_header(p, UDP_HLEN)) {
     return ERR_BUF;
@@ -856,7 +856,7 @@ boaros_udp4_output_resolved(const struct boaros_udp4_path *path, struct pbuf *p)
 #endif
       );
   p->flags |= PBUF_FLAG_IP4_LOCAL_DF;
-  err_t result = boaros_ipv4_output_resolved(&path->ip, p, IP_PROTO_UDP, path->ttl, path->tos, 0);
+  err_t result = boaros_ipv4_output_resolved(&path->ip, p, IP_PROTO_UDP, path->ttl, path->tos, more);
   MIB2_STATS_INC(mib2.udpoutdatagrams);
   UDP_STATS_INC(udp.xmit);
   return result;

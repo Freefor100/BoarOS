@@ -154,6 +154,9 @@ unsigned virtio_net_tx_release(struct virtio_net_device *d,
     }
     return released;
 }
+int virtio_net_tx_reclaim(struct virtio_net_device *d,
+    void (*release)(void *const *, unsigned))
+{ (void)d; (void)release; return 0; }
 int virtio_net_send_segments(struct virtio_net_device *d,
     const struct virtio_net_tx_segment *s, unsigned count, void *owner, int more)
 { (void)d; (void)s; (void)count; (void)owner; (void)more; return -KERNEL_ENOTSUP; }

@@ -1,267 +1,94 @@
-# 系统调用解码模块
+# Linux 系统调用统一分派与通用系统接口
 
-本文描述与架构 Trap Frame 解耦的系统调用语义接口。模块处理已经从用户寄存器复制出的请求、用户访问和所属子系统调用；RISC-V Trap 层负责 `a7/a0..a5` 转换、普通返回时的 `sepc` 推进、signal return 和 syscall restart，scheduler 负责退出、exec 提交与资源回收。
+系统调用是用户空间程序向操作系统内核请求服务的唯一受控入口。BoarOS 通过 `kernel/syscall/` 将**架构相关的寄存器约定**与**架构无关的系统调用语义**彻底解耦：RISC-V 64（`ECALL`，`a7` 传号、`a0..a5` 传参）与 LoongArch 64（`SYSCALL`，`$a7`/`regs[11]` 传号）的陷入代码将请求统一封装为 `struct kernel_syscall_request`，交由共享分派器执行，当前共覆盖 **RISC-V 273 个**、**LoongArch 269 个** Linux 系统调用编号。
 
-RV 与 LA 的用户陷入先切换到任务内核栈并关闭中断。系统调用入口使用内核 TP 所属任务，核对陷入帧与当前 CPU 记录后直接传入分派器；不再为同一次查找额外保存和恢复中断状态。内核其他调用仍使用 `kernel_task_current()`，以处理切栈期间 CPU 已发布下一任务、当前栈仍属于旧任务的情况。
+---
 
-## 接口
+## 一、源码组织与执行管线
 
-公共入口位于 `include/kernel/syscall.h`；`kernel/syscall/dispatch.c` 负责分派和简单系统信息，`file.c`、`memory.c`、`process.c`、`signal.c`、`time.c` 处理对应 ABI。实际执行命名为 `syscall_handle_*`，纯参数转换才使用 decode；共享声明限于 `private.h`，不引用 scheduler 私有任务布局：
+| 源码路径 | 核心职责 |
+| :--- | :--- |
+| `include/kernel/syscall.h`、`kernel/syscall/dispatch.c` | 公共请求/结果契约、高频标量快路径（172～178）与全表主分派器 `dispatch_operation()` |
+| `kernel/syscall/{file,mount,memory,process,sched,signal,time,socket,credentials,capability}.c` | 按子系统划分的 Linux ABI 参数导入、校验与业务转发 |
+| `kernel/syscall/aio.c` | 原生 Linux 异步输入输出（Asynchronous I/O，AIO：`io_setup` 至 `io_pgetevents`） |
+| `kernel/syscall/membarrier.c` | 跨核内存屏障同步（`membarrier(283)`） |
+| `kernel/syscall/process_vm.c`、`kernel/seccomp.c` | 跨进程向量内存读写（`process_vm_readv/writev`）与 `seccomp` 系统调用过滤 |
+| `arch/riscv/hwprobe.c` | RISC-V 硬件能力探测（`riscv_hwprobe(258)`） |
 
-```c
-enum kernel_syscall_status kernel_syscall_dispatch(
-    struct kernel_task *caller,
-    const struct kernel_syscall_request *request,
-    struct kernel_syscall_result *result);
+### 一次系统调用的完整生命周期
+
+```mermaid
+flowchart LR
+    Trap["1. 架构陷入入口<br/>切至任务内核栈 · 关中断<br/>提取调用号与 6 个 64 位参数"]
+    Filter["2. 前置钩子<br/>COST 窗口记账 · seccomp 过滤<br/>eBPF raw_syscalls:sys_enter"]
+    Fast{"3. 编号是否属于<br/>172～178 标量查询？"}
+    FastPath["标量快路径直出<br/>getpid/getppid/gettid<br/>getuid/geteuid/getgid/getegid"]
+    Table["主分派表 dispatch_operation()<br/>调用对应 syscall_handle_*"]
+    Action["4. 按 result.action 收尾<br/>写回返回值 / 切换 EXEC / CLONE / WAIT<br/>触发 sys_exit 跟踪 · 处理信号与自动重启"]
+
+    Trap --> Filter --> Fast
+    Fast -- "是" --> FastPath --> Action
+    Fast -- "否" --> Table --> Action
 ```
 
-调用者是 scheduler 当前不透明 task，供依赖任务身份或资源的系统调用取得明确上下文；通用解码层不从 RISC-V `tp` 隐式寻找 current。请求包含系统调用号和六个 64 位参数。结果动作定义在公共头中：
+- **高频标量快路径（编号 172～178）**：`getpid`、`getppid`、`gettid`、`getuid`、`geteuid`、`getgid`、`getegid` 这 7 个极高频无副作用查询在 `kernel_syscall_dispatch()` 中直接读取当前任务身份或不可变凭据指针返回，跳过大型主分派表路由。
+- **架构解耦的动作返回机制（`enum kernel_syscall_action`）**：分派器不直接操作底层寄存器帧，而是返回明确的动作码指导架构陷入层完成收尾——包括 `RETURN`（普通写回返回值）、`RETURN_FINAL`、`EXIT` / `EXIT_GROUP`（终止线程或进程组）、`EXEC`（装载新地址空间且不推进旧程序计数器）、`CLONE` / `CLONE3`（传递完整寄存器快照构造子任务）、`WAIT4` / `WAITID`、`YIELD` 与 `SIGNAL_RETURN`。
+- **双架构差异的 4 个系统调用**：RISC-V 额外提供 `163`（`getrlimit`）、`164`（`setrlimit`）、`258`（`riscv_hwprobe`）与 `259`（`riscv_flush_icache`）；其余 269 个编号两架构完全共享（LoongArch 统一使用现代 `prlimit64` 查询和修改资源限额）。
 
-当前分派覆盖 RISC-V 的 269 个编号和 LoongArch 的 265 个编号。各接口的具体支持范围见对应模块。
-`vhangup(58)` 提供有权限的控制终端挂断，旧实例失效而设备保持可重新打开；具体行为见[终端模块](kernel-tty.md)。`fcntl` 的异步 owner、所选信号和 `O_ASYNC` 见[文件接口](kernel-files.md)及[信号模块](kernel-signal.md#sigio-异步-io-通知)。
+---
 
+## 二、原生异步 I/O（AIO）、跨核内存屏障与硬件探测
 
-`pivot_root(41)`、`open_tree(428)`、`move_mount(429)`、`fsopen(430)`、`fsconfig(431)`、`fsmount(432)`、`fspick(433)`、`mount_setattr(442)`复用挂载控制与真实FD资源；挂载树、root/cwd及命名空间寿命见[VFS模块](vfs-ext4.md#挂载树-fd-与根切换)。
-`flock(32)`、`close_range(436)`、`epoll_pwait2(441)`、`fchmodat2(452)`和
-`copy_file_range(285)`见[文件接口](kernel-files.md)，`sendmmsg(269)`／`recvmmsg(243)`
-见[网络接口](kernel-network.md)。RV独有的`riscv_flush_icache(259)`见[MM](kernel-mm.md)；
-LA的259仍返回`ENOSYS`。这些入口的直接消费者可用`python3 tests/userland/api8.py`运行同ELF Linux对照。
+除分派至调度、内存、文件、网络和 eBPF 子系统的常规接口外，系统调用层还直接实现了三项关键的现代 Linux 机制：
 
-`ptrace(117)` 的线程跟踪、停止、寄存器与调试内存操作见[进程跟踪](kernel-ptrace.md)。
-`process_vm_readv(270)`／`process_vm_writev(271)` 在调用核固定目标 MM 后完成有界向量搬运，
-普通跨进程访问不要求停止目标，也不绕过映射权限；权限及借用规则见[内存管理](kernel-mm.md)。
+### 2.1 原生异步输入输出（`io_setup` ～ `io_pgetevents`）
 
-- `KERNEL_SYSCALL_ACTION_RETURN`：把 `value` 写回用户返回值寄存器后继续执行。
-- `KERNEL_SYSCALL_ACTION_EXIT`：以 `value` 作为退出状态终止当前用户任务。
-- `KERNEL_SYSCALL_ACTION_EXEC`：新映像已经准备完成；不推进旧 `sepc`，由 scheduler 切换 MM 并重建 Trap Frame。
-- `KERNEL_SYSCALL_ACTION_CLONE`：参数符合当前支持的进程/线程 clone 子集；架构 Trap 层把完整寄存器快照交给进程层构造任务。
-- `KERNEL_SYSCALL_ACTION_CLONE3`：两架构共用 clone3 专属处理，在持有寄存器快照的调用内导入参数和指定 TID 数组并同步消费。
-- `KERNEL_SYSCALL_ACTION_WAIT4`：参数保持 Linux ABI 形态，由 scheduler 完成选择、阻塞、唤醒与 zombie 回收。
-- `KERNEL_SYSCALL_ACTION_WAITID`：参数保持 Linux ABI 形态（支持 which, upid, infop, options, rusage），由 scheduler 完成选择、阻塞、唤醒与事件消费/zombie 回收。
-- `KERNEL_SYSCALL_ACTION_YIELD`：忽略无参数调用的残留寄存器，由 scheduler 把当前任务排到其优先级队尾，再按优先级与实时预算资格重选。
-- `KERNEL_SYSCALL_ACTION_SIGNAL_RETURN`：由架构信号返回路径恢复用户现场。
-- `KERNEL_SYSCALL_ACTION_EXIT_GROUP`：终止调用任务所属线程组，各成员沿原栈清理资源。
+`kernel/syscall/aio.c` 实现了 Linux 原生 AIO 接口（编号 `0`～`4` 与 `292`），允许应用程序批量提交非阻塞文件读写和同步请求，并通过用户空间共享完成环收割结果：
+- **地址空间共享完成环**：`io_setup` 在进程地址空间内映射一个共享完成环（`aio_ring`，魔数 `0xa10a10a1`，单上下文上限 `65,536` 事件），并随进程 `munmap`/`mremap`/退出自动管理生命周期；全系统上下文事件上限受 `/proc/sys/fs/aio-max-nr` 与 `aio-nr` 约束。
+- **支持的操作与后台执行**：支持 `IOCB_CMD_PREAD`、`PWRITE`、`PREADV`、`PWRITEV`、`FSYNC`、`FDSYNC` 与 `POLL`，并支持通过 `eventfd`（`resfd`）向 `epoll` 推送完成通知。满足扇区对齐且单次不超过 `64 KiB` 的普通文件直接读写交由懒启动的后台工作线程异步推进；其余需要特殊标志或额外页缓存借用的请求沿提交路径安全完成。
+- **原子信号掩码等待（`io_pgetevents(292)`）**：等待完成事件期间原子替换临时信号掩码；被信号打断时优先返回已交付的完成事件，若尚无事件且未执行用户信号处理函数，则通过 `NOHAND` 重启机制恢复掩码后自动重试。
 
-空调用者、空请求或空输出返回 `KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT`；依赖任务资源的调用无法取得有效身份、LIVE MM 或一致的文件资源，以及 uaccess 报告内核状态损坏时，也返回该状态并由 Trap 边界视为 fatal。失败时不修改输出。有效请求均返回 `KERNEL_SYSCALL_STATUS_OK`，包括负 Linux errno；具体语义由结果动作表达。
+### 2.2 跨核内存屏障（`membarrier(283)`）
 
-172–178 的进程、线程和 UID/GID 标量查询在公共参数检查与成本入口之后直接分发，复用原身份及凭据读取，完成后发布结果。其他调用继续使用业务分发表；这组查询不再经过两段通用表路由。
+在无锁数据结构（如 RCU 读侧）中，写者极少执行，但读者每次读取都插入昂贵的硬件全内存屏障代价过高。`membarrier(283)`（`kernel/syscall/membarrier.c`）允许写者显式向其他正在运行相关线程的处理器核发送核间中断（`KERNEL_IPI_MEMBARRIER`），迫使远端核执行串行化内存屏障，从而让高频读侧只需廉价的编译器屏障即可保证跨核内存可见性。
+- 支持命令：`GLOBAL`、`GLOBAL_EXPEDITED`、`REGISTER_GLOBAL_EXPEDITED`、`PRIVATE_EXPEDITED`（按活动地址空间筛选目标核）、`REGISTER_PRIVATE_EXPEDITED` 与 `GET_REGISTRATIONS`。
+- 多核下通过每核邮箱 `mailboxes[BOAROS_MAX_CPUS]` 发起 `rendezvous()` 同步握手，并在等待期间持续响应其他核发来的屏障请求，防止双核同时调用 `membarrier` 形成互等死锁。
 
-## 当前 ABI 与验证
+### 2.3 RISC-V 硬件能力探测（`riscv_hwprobe(258)`）
 
-当前采用 Linux RISC-V 系统调用编号和错误值：
+`arch/riscv/hwprobe.c` 为用户态动态库（如 `glibc` 的字符串/向量多版本函数分发 `IFUNC`）提供标准硬件特性查询：
+- 返回 OpenSBI 厂商/架构/实现标识（Key `0`～`2`）、基础指令集 `IMA`（Key `3`）、扩展特性位掩码（`F/D`、`C`、`V` 向量、`Zba`/`Zbb`/`Zbs` 位操作与受 `senvcfg` 门控的 `Zicboz` 零块指令，Key `4`）、`Zicboz` 块大小 `64` 字节（Key `6`）、最高用户虚拟地址（Key `7`）与时钟频率（Key `8`）；
+- 支持 `RISCV_HWPROBE_WHICH_CPUS` 按能力集反查满足条件的逻辑处理器掩码。
 
-| 调用族（RISC-V 编号） | 契约归属 |
-|---|---|
-| epoll_create1/ctl/pwait（20–22）、dup/dup3/fcntl（23–25） | [文件模块](kernel-files.md)：OFD 共享、就绪与生命周期 |
-| fanotify_init/mark（262/263） | [文件模块](kernel-files.md#fanotify-文件访问通知)：标记范围、目录和名称记录、文件句柄及权限事件响应 |
-| getcwd（17）、mkdirat/unlinkat/symlinkat（34–36）、renameat/renameat2（38/276）、chdir/fchdir（49/50）、openat/close（56/57）、readlinkat（78） | [文件模块](kernel-files.md)：路径、flags、dirfd 与错误 |
-| ftruncate/fallocate（46/47）、pipe2（59）、getdents64/lseek（61/62）、read/write/readv/writev/pread64/pwrite64/preadv/pwritev（63–70） | [文件模块](kernel-files.md)：部分成功、offset、pin、稀疏文件、pipe 与目录 cookie |
-| bpf（280）、perf_event_open（241） | [BPF 模块](kernel-bpf.md)：对象/map/程序/BTF、socket 过滤、raw_syscalls 跟踪和线程软件时钟 |
-| sendfile（71） | [文件模块](kernel-files.md)：有界内核复制、位置、来源片段、整包与同步错误 |
-| statfs/fstatfs（43/44）、utimensat（88） | [文件模块](kernel-files.md)：挂载统计、显式纳秒时间与 fd/nofollow |
-| `sync_file_range`（84） | 指定页范围的数据写回与等待，错误按打开文件对象的游标交付 |
-| `io_setup` 至 `io_getevents`（0–4）、`io_pgetevents`（292） | 地址空间拥有完成环，支持普通文件的定位读写、文件同步、轮询和事件描述符通知 |
-| pselect6/ppoll（72/73）、newfstatat/fstat（79/80） | [文件模块](kernel-files.md)：集合/信号屏蔽、stat 编码和元数据 |
+---
 
-`sync_file_range` 的 WRITE 请求可由页缓存执行者在调用返回后推进。WAIT_BEFORE
-及 WAIT_AFTER 等待相应范围的数据版本，ext4 也把已交给日志子系统的有序数据写到
-文件实际数据块。该调用提供数据写回完成点。元数据提交和设备缓存刷新由
-`fsync`、`fdatasync` 等接口负责。
+## 三、主要系统调用族索引
 
-异步输入输出（Asynchronous I/O，AIO）的映射和上下文随地址空间管理，完成环和
-事件描述符使用同一次实际完成。常规文件满足对齐、长度不超过 64 KiB 且符合提交
-条件时，直接数据读写由后台执行者完成。带逐次标志或需要额外页缓存借用等请求沿
-提交线程的既有路径完成。`io_pgetevents` 在信号中断时优先返回已交付事件。
-没有事件时，已执行信号处理函数的调用返回 `EINTR`，没有执行处理函数的调用
-在恢复信号掩码后重试。系统额度及使用量在 `/proc/sys/fs/aio-max-nr` 和 `aio-nr` 查看。
+| 功能域 | 代表性系统调用 | 所属子系统文档 |
+| :--- | :--- | :--- |
+| **进程、线程与调度** | `clone` / `clone3` / `execve` / `wait4` / `waitid` / `sched_setattr` / `setpriority` / `futex` / `futex_waitv` / `ptrace` | [调度与同步](kernel-scheduler.md) · [映像替换](kernel-exec.md) · [进程跟踪](kernel-ptrace.md) |
+| **虚拟内存** | `brk` / `mmap` / `munmap` / `mprotect` / `mremap` / `mlock*` / `madvise` / `msync` / `mincore` / `process_vm_readv/writev` | [虚拟内存管理](kernel-mm.md) · [原生大页](hugepages.md) |
+| **文件、路径与挂载** | `openat` / `openat2` / `readv` / `writev` / `sendfile` / `splice` / `copy_file_range` / `fallocate` / `statx` / `fsopen`～`move_mount` / `pivot_root` | [VFS 与 ext4](vfs-ext4.md) · [文件资源与 I/O](kernel-files.md) |
+| **事件、锁与通知** | `epoll_*` / `ppoll` / `pselect6` / `pipe2` / `eventfd2` / `timerfd_*` / `signalfd4` / `inotify_*` / `fanotify_*` / `flock` / `fcntl` | [文件资源与 I/O](kernel-files.md) |
+| **网络与套接字** | `socket` / `socketpair` / `bind` / `listen` / `accept4` / `connect` / `sendmsg` / `sendmmsg` / `recvmmsg` / `setsockopt` | [多核网络协议栈](kernel-network.md) · [rtnetlink](../network-rtnetlink.md) |
+| **信号、时钟与 IPC** | `rt_sigaction` / `rt_sigprocmask` / `rt_sigreturn` / `sigaltstack` / `clock_gettime` / `clock_nanosleep` / `timer_*` / `adjtimex` / SysV & POSIX IPC | [信号](kernel-signal.md) · [时钟与定时器](kernel-time.md) |
+| **安全、命名空间与观测** | `setuid*` / `capset` / `prctl` / `seccomp` / `unshare` / `setns` / `bpf` / `perf_event_open` / `membarrier` | [BPF 过滤与跟踪](kernel-bpf.md) · [成本观测](kernel-cost.md) |
 
-`membarrier`（283）提供全局和私有跨核屏障。私有屏障按活动地址空间选核，
-全局命令覆盖每个在线处理器。RISC-V `riscv_hwprobe`（258）从启动时取得的每核
-信息回答查询和 CPU 筛选。两个系统调用的普通路径开销可用
-`tests/workloads/resource/syscall_wave1_cost.c` 检查。
+---
 
-- `clock_gettime` 编号 113、`clock_getres` 编号 114、`gettimeofday` 编号 169、`clock_nanosleep` 编号 115 与 `nanosleep` 编号 101 构成时间族，语义见[内核时间模块](kernel-time.md)。
-- `setpriority(140)`、`getpriority(141)`支持线程、进程组和真实UID集合，权限、RLIMIT_NICE与实际CPU权重见[调度模块](kernel-scheduler.md)。
-- `sched_yield` 编号 124 把当前任务排到其优先级队尾，再按优先级与实时预算资格重选；只有较低优先级 READY 任务时 FIFO/RR 可继续当前任务，RR 保留剩余时间片。调度失败属于内核不变量破坏，由 Trap 边界 fatal。
-- `sched_getscheduler(120)`、`sched_getparam(121)`、`sched_getaffinity(123)`、`sched_rr_get_interval(127)` 与 `sched_getattr(275)` 在发起 CPU 执行。任务身份、策略、基础优先级及亲和掩码在 scheduler 身份保护下取得完整小快照，释放保护后才复制到用户内存；PI 临时继承的有效优先级不替换查询到的基础值。`sched_setparam(118)`、`sched_setscheduler(119)` 和 `sched_setaffinity(122)` 保持 CPU0 服务执行规则；优先级上下限查询 125/126 与 `getcpu(168)` 也在发起 CPU 执行。
-- `sched_setattr(274)`支持OTHER/BATCH/IDLE/FIFO/RR与KEEP/RESET标志，共用原设置接口的权限及队列交接；尺寸、自定义普通时间片和未支持扩展见[调度模块](kernel-scheduler.md)。
-- `sched_getattr(275)` 在 RV64/LA64 使用相同的 56 字节原生结构，接受 48 字节旧版、48～56 字节间的任意前缀，以及不超过架构基页大小的扩展结构。返回 `size=min(用户长度,56)`；扩展尾部先清零，再写已知前缀，因此尾部 `EFAULT` 不改写结构头。先检查空指针、负 TID 和长度，再查目标，随后检查 flags，最后输出；当前支持 OTHER/BATCH/IDLE/FIFO/RR，只有 flags=0 有效。策略与 RESET_ON_FORK 来自任务快照，nice 在非实时策略中来自目标线程，FIFO/RR 的该字段为0；OTHER/BATCH/IDLE 的 runtime 为默认请求量子 10ms，与 127 的普通策略间隔一致，FIFO/RR 的 runtime 为 0；deadline、period 与未启用的 util_min/util_max 为 0。Linux fair 类的 runtime 来自其自身调度 slice，具体数值不要求与 BoarOS 普通调度量子相等。
-- `preadv2/pwritev2` 编号286/287，与69/70的原定位向量共用I/O核心；offset=-1使用共享位置，其余合法值保持定位语义。按次追加、同步及信号选项见[文件模块](kernel-files.md#向量-io-的按次选项)，NOWAIT／ATOMIC／DONTCACHE当前返回EOPNOTSUPP。
-- `vmsplice(75)`、`splice(76)`、`tee(77)` 使用原生64位参数，页借用、offset、等待和失败消费规则见[文件模块](kernel-files.md#splice-tee-与-vmsplice)。
-- `fadvise64(223)` 支持六种建议，`readahead(213)` 接入有界显式预读；OFD策略、范围写回接纳和干净页回收见[文件模块](kernel-files.md#文件访问建议与显式预读)。
-- `exit` 编号 93 产生线程 `EXIT`，`exit_group` 编号 94 产生全组 `EXIT_GROUP`；状态保留参数 0 的低 8 位。组退出等待成员沿原内核调用栈释放在用资源，最后产生一次进程退出通知。
-- `set_tid_address` 编号 96 记录 clear_tid 用户指针并返回调用 TID；线程退出在释放 MM 前清零并唤醒同 key 的一个 futex waiter。坏用户指针不破坏内核状态。
-- `futex` 编号 98 支持 WAIT、WAKE、REQUEUE、CMP_REQUEUE、WAKE_OP、WAIT_BITSET、WAKE_BITSET、PI 锁及 PI 条件重排；`futex_waitv` 编号 449 支持多地址等待。key、排序、掩码、超时、错误码及扩展边界见[调度模块](kernel-scheduler.md#等待与-futex)；无超时等待按 SA_RESTART 选择 EINTR 或重新等待，带超时等待的用户 handler 总是看到 EINTR、无 handler restart 保持原 absolute deadline。
-- `uname` 编号为 160，把六个 65 字节字段组成的 Linux `new_utsname` 写到参数 0 指向的用户缓冲区；成功返回 0，用户范围、映射或写权限错误返回 `-EFAULT`（-14）。初始值为 `Linux/boaros/6.7.0-boaros/#1 BoarOS 0.1.0/<架构>/(none)`，机器名由架构构建配置提供。`kernel/uts.c` 持有各 UTS 命名空间的完整名称；`uname` 在调用线程当前命名空间的短锁内取得副本，在锁外写用户内存。release 供用户程序进行启动与最低版本检查，两个架构统一报告 6.7.0。BoarOS 自身版本保存在 version 字段，各接口以相应模块的支持范围为准。
-- `clock_settime(112)`、`settimeofday(170)` 修改软件墙钟和时区，要求 CAP_SYS_TIME；参数顺序、vDSO 发布和各类绝对期限的处理见[时间模块](kernel-time.md#运行时调钟与绝对等待)。
-- `sethostname`、`setdomainname` 编号为 161、162，参数为用户字节地址和有符号 32 位长度。沿固定 Linux `kernel/sys.c`，先检查 `CAP_SYS_ADMIN`（缺少时 `EPERM`），再检查长度是否在 0–64 内（否则 `EINVAL`），最后完整复制用户输入（失败为 `EFAULT`）。成功后一次替换对应字段并清零剩余字节；长度零清空名称且不访问用户地址，64 字节名称在第 65 字节补 NUL。它们与 `/proc/sys/kernel/{hostname,domainname}` 修改调用线程当前 UTS 命名空间的同一状态；普通 fork 共享，exec 保留，`CLONE_NEWUTS` 复制当前六字段后独立修改。proc 字符串的权限、偏移与截断规则见 [procfs 模块](procfs.md)。
-- `getpid` 编号为 172，返回调用任务在其进程标识命名空间中的线程组编号（Thread Group ID，TGID）。RISC-V 常规构建可从当前线程的线程组对象读取该编号，无需导入六个参数或进入通用分派。在启用跟踪、系统调用过滤或成本诊断时使用通用入口，两条路径继续共用系统调用记账和用户态返回流程。
-- `getppid` 编号为 173，返回当前父任务的 TGID；PID 1 或 parentless 进程返回 0，reparent 后观察到 PID 1。
-- `getuid/geteuid/getgid/getegid` 编号 174/175/176/177，返回调用线程当前真实／有效 UID/GID；调用无参数，忽略残留寄存器。`setregid/setgid/setreuid/setuid/setresuid/getresuid/setresgid/getresgid/setfsuid/setfsgid` 对应 143～152；`getgroups/setgroups` 为 158/159。raw 设置只影响调用线程，libc 负责全线程协调，凭据共享与发布见[用户凭据](kernel-scheduler.md#用户凭据)。
-- `gettid` 编号为 178，返回调用任务自己的 TID。
-- `brk` 编号为 214，通过调用任务的 mutable MM borrow 调整精确 program break。raw syscall 成功返回请求值；参数 0 查询当前值；越过 ELF heap 起点/栈 guard、VMA 冲突或 metadata OOM 时返回原 break，不使用负 errno。跨页增长登记 demand-zero heap，缩小撤销越界页；libc 把 raw 返回再包装成自己的 0/-1 接口，不属于内核 ABI。
-- `munmap` 编号为 215，要求页对齐起点和非零长度，长度向上按架构页大小对齐（RV 4 KiB、LA 16 KiB）；范围包含未映射洞仍成功。越界或未对齐返回 `-EINVAL`。
-- `mremap` 编号为 216，按五个原生64位参数调整普通匿名/文件映射，成功返回新地址。支持缩小、原地扩大、MAYMOVE与FIXED搬移，保留COW、共享后备与文件偏移，操作在发起CPU执行；涉及SysV附件的撤销部分沿CPU0执行规则。错误、副作用及未实现模式统一见[MM范围迁移](kernel-mm.md#mremap-区间调整与搬移)。
-- `clone` 编号为 220。支持 SIGCHLD fork/vfork 和 VM/FS/FILES/SIGHAND/THREAD 共享线程形态；进程形态接受 CHILD_SETTID、CHILD_CLEARTID 及 CLONE_FS，线程形态接受 SETTLS、PARENT_SETTID、CHILD_SETTID、CHILD_CLEARTID、SYSVSEM、DETACHED 位。RISC-V 参数顺序为 flags/stack/parent_tid/tls/child_tid。非法 flag 依赖返回 EINVAL，未支持的合法资源组合返回 ENOTSUP；资源、vfork 致命取消、发布和回滚契约见[调度模块](kernel-scheduler.md)。
-- `execve` 编号为 221，准备并提交 RISC-V `ET_EXEC`/`ET_DYN` 映像及非递归 `PT_INTERP` source；成功不返回，失败返回负 Linux errno。路径、解释器、提交点和资源保持规则见[进程映像替换模块](kernel-exec.md)。
-- `mmap` 编号为 222，当前接受 anonymous 或可读普通文件的 `MAP_PRIVATE/MAP_SHARED/MAP_SHARED_VALIDATE`，以及任意 `PROT_NONE/R/W/X` 组合。其中匿名映射接受 PRIVATE/SHARED；SHARED_VALIDATE 用于文件映射。普通 hint、`MAP_FIXED`、`MAP_FIXED_NOREPLACE`、`MAP_STACK` 和 `MAP_NORESERVE` 已实现；fixed-noreplace 冲突返回 `-EEXIST`，地址空间/metadata 不足返回 `-ENOMEM`。文件映射要求有效且非 `O_WRONLY` 的 fd 与页对齐 offset；零长度、非法 fixed 地址、offset 溢出与 fixed-noreplace 冲突在可读性检查前返回各自错误，不可读 OFD 才返回 `-EACCES`。两类拒绝都会释放 syscall 临时 pin 且不提交 VMA。成功后由 MM 独立持有 OFD，所以 close fd 不撤销映射；`MAP_SHARED` 文件写权限与后续 mprotect 升级受初始 OFD 权限约束，`MAP_POPULATE` 接受按需缺页的尽力填充语义；传统映射忽略未知扩展位，文件 SHARED_VALIDATE 对未知扩展返回 `EOPNOTSUPP`。未对齐 offset 或同时指定两种 fixed 模式返回 `EINVAL`，当前无巨大页 hstate，`MAP_HUGETLB` 返回 `EINVAL`，`MAP_GROWSDOWN` 接受私有匿名映射，shared/file 组合返回 `EINVAL`，具体增长和 `PROT_GROWSDOWN` 规则见 MM 模块；MAP_LOCKED、ONFAULT、MAP_POPULATE/NONBLOCK的实际预装与计费见[MM模块](kernel-mm.md)；anonymous fd 参数按 Linux 语义忽略。
-- `mprotect` 编号为 226，要求页对齐起点，整个非空范围必须已有 VMA；洞返回 `-ENOMEM`。长度 0 成功。`PROT_NONE` 保留 resident 内容，恢复权限后内容仍在；RISC-V 仅写请求被规范化为 RW。
-- `waitid` 编号为 95，支持 `P_ALL/P_PID/P_PGID/P_PIDFD`，`WEXITED/WSTOPPED/WCONTINUED/WNOHANG/WNOWAIT` 及 `__WNOTHREAD/__WCLONE/__WALL` 标志。P_PIDFD 持有实际 pidfd 身份；NONBLOCK 目标尚无事件返回 EAGAIN，显式 WNOHANG 返回空信息。waitid/wait4 在调用开始时持有 PID/进程组 identity，阻塞期间 setpgid 或数字重用不改变等待目标。事件先于用户态复制消费（WNOWAIT 保持事件未消费并保留 zombie）；退出事件支持 NULL infop，EFAULT 不回滚已消费事件。有事件时先输出 rusage，再输出 siginfo 六个定义字段；EINVAL、ECHILD、中断和无事件也写六个零字段，保留 siginfo padding 与其余字段，rusage 保持原值。siginfo 复制失败以 EFAULT 覆盖原错误。wait claim 与任务借用覆盖输出过程，归还 claim 时唤醒排队的父线程。
-- `getrusage(165)` 支持 SELF、THREAD、CHILDREN，字段、单位和退出归并见[资源记账](kernel-accounting.md)。
-- `wait4` 编号为 260，支持 Linux pid selector、`WNOHANG`、wait flag 校验与 rusage 输出；普通退出与同步故障产生 Linux 形态 status。无匹配子进程返回 `-ECHILD`，非法 option 返回 `-EINVAL`，status/rusage 用户指针错误返回 `-EFAULT`（事件消费与回收先行，子进程不可再次 wait）。
-- `capget(90)/capset(91)` 支持 Linux 版本1/2/3与版本协商，查询实际 E/P/I 状态；capget 可查询自身、有效 TID 和未回收 zombie，capset 只修改调用线程。设置保持 E⊆P，P 相对旧 P 只能缩减；I 受旧 I/P、bounding 和 CAP_SETPCAP 规则约束，ambient 随 P/I 缩减。版本1设置清除高32位，高于固定 CAP_LAST_CAP 的输入位按 Linux 屏蔽。
-- `prctl(167)` 支持线程名称、父线程死亡信号、subreaper，以及 capability bounding 查询／删除、KEEP_CAPS、securebits、ambient、NO_NEW_PRIVS 和 GET/SET_DUMPABLE。名称与proc交互见[procfs](procfs.md)，父子关系与继承见[调度模块](kernel-scheduler.md)。bounding 删除保留现有 E/P/I，锁定的 securebits 不能解锁；NNP 只能置1且不替换凭据对象。dumpable 修改共享 MM 的状态，设置只接受0或1。
-- `personality(92)` 按低 32 位解释参数，`0xffffffff` 查询原值，设置成功返回原值。支持 PER_LINUX 域与 ADDR_NO_RANDOMIZE、READ_IMPLIES_EXEC、UNAME26、STICKY_TIMEOUTS；其他域或标志返回 EOPNOTSUPP，保留原状态。状态属于调用线程，fork/clone 继承，线程随后独立修改。成功 exec 保留标志；实际生效的 set-ID 文件模式仅清除 ADDR_NO_RANDOMIZE 与 READ_IMPLIES_EXEC，失败 exec 不变。UNAME26 仅投影调用者的 uname release（6.7.0-boaros 为 2.6.67-boaros），不修改 UTS namespace。STICKY_TIMEOUTS 使原生 ppoll/pselect6 保留用户 timeout，包括 EINTR 返回；地址布局及隐含执行权限见[MM](kernel-mm.md)。直接消费者为 `tests/workloads/resource/personality.c`。
-- `prlimit64(261)`及 RV64 的原生 `getrlimit(163)`、`setrlimit(164)` 支持 Linux 0–15 全部限额的记录、查询和设置。两种结构均为两个 64 位无符号限额；LA64 不提供旧 163/164 入口。限额由线程组共享，fork复制，exec和组长替换保留；pid0选择自身，正pid选择可查询任务所属组，包含未回收zombie。新值先导入，权限、实际硬限额比较、旧值快照及更新在同一任务状态锁内完成，再输出旧值；输出EFAULT保留已提交的新值。旧 getrlimit 先校验 resource 后输出，旧 setrlimit 先导入再校验，坏指针与无效 resource 同时出现时分别返回 EINVAL 和 EFAULT。软值不得超过硬值，NOFILE硬限额受1024个fd容量约束；STACK默认软限额8MiB、硬限额无限，实际增长受软限额和地址空间约束。CORE默认0/无限，FSIZE、AS和DATA默认无限/无限；AS/DATA的映射、精确brk与主栈增长接纳见[MM](kernel-mm.md)。NPROC默认4096，MEMLOCK默认8MiB，MSGQUEUE默认819200，NICE/RTPRIO默认0，RSS/LOCKS/RTTIME默认无限；每项的执行约束在对应模块维护，记录可查询不代表某项子系统已接入执行。未知resource返回EINVAL。
-- CORE 提供状态管理及[线程组 ELF core 写出](kernel-signal.md#elf-core-文件与线程组退出)；wait状态仅在实际生成转储后才含core位。FSIZE在用户文件操作接纳处执行，短写、SIGXFSZ和后台写回边界见[文件接口](kernel-files.md#描述符-writewritev-与文件修改)。
-- `kill`/`tkill`/`tgkill` 编号为 129/130/131，按进程、线程或 TGID+TID 发送标准信号；`rt_sigsuspend`/`rt_sigaction`/`rt_sigprocmask`/`rt_sigpending` 编号为 133/134/135/136，`rt_sigreturn` 为 139，均采用 8 字节有效 signal set。公共用户返回尾负责默认动作、handler frame、stop/continue 和已登记 syscall 类别的 `SA_RESTART`；只有接入该框架的阻塞 syscall 才会在 sigreturn 后重执行，其他调用返回自身规定的 `-EINTR`，细节见[内核信号模块](kernel-signal.md)。
-- `restart_syscall` 编号为 128，当前用于 nanosleep 和带超时 FUTEX_WAIT 的绝对 deadline 重启；它不是可由用户任意伪造的通用成功存根。
-- RISC-V 使用 asm-generic syscall 编号，没有独立 dup2；musl 经 dup3 实现相应调用。编号 33 是 mknodat，支持普通文件、字符／块节点和 FIFO 创建。
-- `times` 编号为 153，填写可选的 32 字节 `tms`（`utime/stime/cutime/cstime`，单位为 scheduler tick，`CLK_TCK`=100）并返回自启动的 uptime tick 数；tms 为 NULL 时只返回 uptime。记账在 tick 边界记到被中断任务，idle 不记账；子进程记账在 wait 回收时回卷给父进程，孙辈随回收归并。
-- `shmget`/`shmctl`/`shmat`/`shmdt` 编号为 194/195/196/197，构成 System V 共享内存族。支持 `IPC_PRIVATE` 与命名 key，`IPC_STAT`/`IPC_SET`/`IPC_RMID` 控制命令，延迟释放与末引用清理，以及多进程跨地址附加；详见 [SysV 共享内存模块](sysv-shm.md)。
-- 其他编号产生 `RETURN`，返回 `-ENOSYS`（-38）。
+<details>
+<summary>展开查看：系统调用重启、UTS 命名空间与定向验证入口</summary>
 
-`brk`/mmap 已执行 AS/DATA 限制，当前仍没有 VMA 数量上限、内存承诺或 overcommit accounting；`MAP_NORESERVE` 因而与普通匿名映射等价。成功增长只承诺虚拟 VMA，实际物理页耗尽发生在后续 demand fault。这是明确的兼容性限制，不由伪造的 syscall 成功或预分配全部页来掩盖。
+### 关键通用语义约定
 
-生产用户任务拥有文件表、fs context 和 MM。底层 U-mode 调度探针可以有 MM 而故意没有进程文件资源，此时 `openat` 返回 `-ENODEV`，`read/close` 返回 `-EBADF`，用于明确区分探针配置与内核对象损坏；这不是生产进程模型。普通 clone 已覆盖独立父子进程，线程 clone 子集共享 MM、files、fs context 和信号 disposition；完整线程组与共享资源矩阵仍有限。接口语义和内部字段已经分离，内核任务与 idle 没有 Linux 身份，Trap 层只会从用户任务进入该接口。
+- **系统调用自动重启（`ERESTART*`）**：阻塞中的系统调用被可捕获信号打断时，返回内部重启码交由陷入层决策——若信号处理函数设置了 `SA_RESTART` 且操作支持透明重试，自动回退程序计数器重新执行或转入 `restart_syscall(128)` 继续等待剩余超时；否则向用户态返回 `-EINTR`。
+- **UTS 命名空间与命名空间 FD**：支持 `CLONE_NEWUTS` 隔离主机名（`sethostname`）与域名（`setdomainname`），并可通过 `/proc/<pid>/ns/{mnt,pid,ipc,uts}` 或 `pidfd` 配合 `setns` 动态加入目标命名空间。
+- **`sync_file_range(84)`**：支持按指定页范围异步发起写回（`WRITE`）及等待区间数据落盘（`WAIT_BEFORE` / `WAIT_AFTER`），仅负责数据范围写回而不替代 `fsync` 的元数据与设备 `FLUSH` 屏障。
 
-`make test-core-limit-abi-riscv test-core-limit-abi-loongarch test-capability-abi-riscv test-capability-abi-loongarch test-fsize-abi-riscv test-fsize-abi-loongarch`提供限额与capget的聚焦Linux对照；`make test-resource-limits-smp-riscv QEMU_RISCV_FIRMWARE=/absolute/fw_dynamic.bin`合并这些边界及CPU定时器，验证实际RV两核。
+### 定向验证入口
 
-`make test-selected-abi-riscv test-selected-abi-loongarch` 使用同 ELF Linux 对照定位向量、错误顺序、时间输出、信号和嵌套 epoll。`make test-uaccess-riscv`、`make test-files-riscv` 检查实际用户复制和文件生命周期；`make test-mmap-riscv` 从真实 ext4 ELF 检查 demand-zero、私有 COW、EOF/SIGBUS、PROT_NONE、固定替换及打洞。`make test-userland-riscv` 运行真实 libc 的 heap/fork/exec、文件访问、信号及管道消费者。早期模拟 syscall 分派和首个用户程序夹具已由这些实际调用者替代。
+- **全量同 ELF Linux 差分验证**：`make test-diff-abi-riscv`（主清单 1,744 项系统调用行为对照）。
+- **新增接口族对照消费者**：`python3 tests/userland/api8.py`、`tests/userland/seccomp.py`、`tests/userland/native_aio.c`。
+- **边界与参数错误序专项**：`make test-abi-boundary-riscv`、`make test-abi-boundary-loongarch`。
 
-`tests/workloads/resource/sched_query.c` 用同一原生 ELF 检查调度查询的结构长度、参数宽度、错误顺序、输出前缀、每个可用 CPU 的亲和性与 `getcpu`、其他 TID 及退出生命周期、RESET_ON_FORK 和 PI 基础优先级。策略竞争中，握手及更新序号确认稳定窗口的完整结果；BoarOS 的每次竞争查询还必须返回同一份任务快照。固定 Linux 的 getter 只以 RCU 保护目标存活，逐字段读取与 setter 没有共用锁，跨越修改的结果允许组合两个输入的字段。线程 join 完成后，以有界等待检查 TID 从身份索引撤销，不能把 clear_child_tid 唤醒直接当作 PID 已消失。固定 Linux 对照的 RV/LA 配置均未启用 UCLAMP_TASK；宿主机可用 `--host-safe` 运行不修改实时策略的部分。
-
-身份和能力接口依据仓库固定的 `references/linux/kernel/sys.c`、`kernel/groups.c`、`kernel/capability.c` 与 `security/commoncap.c`，版本由 `references/sources.tsv` 统一维护。`tests/diff-abi/credentials.c` 的独立子进程记录检查身份转换、组列表、capset/prctl、错误顺序和用户输出前缀；真实 musl/glibc 全线程 setxid 由 `tests/workloads/credentials/threads.c` 检查。
-
-`mknodat(33)` 已接入普通文件、字符／块节点和 FIFO；块节点按真实 `st_rdev` 打开块设备 OFD，FIFO 使用管道后端。具体接口见[文件模块](kernel-files.md#节点创建)。
-
-`sysinfo(179)` 使用 RV64 的 112 字节结构（编译期检查），先清零全部字段与填充。内存/共享/缓冲以字节返回且 `mem_unit=1`，无 swap/highmem 的字段为真实零；uptime 为 monotonic 秒向上取整，任务数与负载来自调度器。坏输出地址返回 `EFAULT`，查询不执行 I/O。`tests/diff-abi/proc.c` 验证字段边界和 fault，不要求两内核的 RAM 容量、启动时长和负载逐字相等。
-
-### 随机接口
-
-`getrandom(278)` 支持 GRND_NONBLOCK、GRND_RANDOM、GRND_INSECURE；未知标志或 RANDOM 与 INSECURE 同用返回 EINVAL。普通请求在可信 RNG 未就绪时等待，NONBLOCK 返回 EAGAIN，等待被信号打断按 SA_RESTART 选择重新等待或返回 EINTR；INSECURE 明确允许初始化前输出。长度最多 `0x7ffff000`，不在持有随机状态锁时执行用户复制。就绪后的 256 字节以内请求不因 pending signal 短返回；大请求按 256 字节分段，返回已复制进度，跨用户不可访问页同样保留已复制字节，首字节 fault 返回 EFAULT。核心与设备契约见[随机源](../learning/random-source.md)。
-
-RV64 `syslog(116)`交付完整klogctl 0–10；真实日志owner、游标、清空、fault和权限契约见[内核日志](kernel-log.md)。
-
-`statx(291)` 已接入通用 dispatch；参数按 Linux 的 int/unsigned 宽度截断后交给
-files 层，采用真实 `BASIC_STATS`，未实现的扩展字段不报告。LA 的 `clone(220)`
-用户参数顺序是 flags、stack、parent_tid、child_tid、TLS；trap 入口将最后两个
-重排后调用通用进程接口。真实父子 COW TID 写入由同 ELF 的 LA/Linux 对照保护。
-
-LA 的 rt_sigaction(134)/rt_sigreturn(139) 已接入共用信号策略；trap从a7/a0–a5
-解码并由LA后端恢复ERA/GPR和mask。完整整数frame、privileged状态边界和未支持
-扩展见[信号模块](kernel-signal.md)。真实静态musl pthread取消使用这一返回路径；
-FP/SIMD、动态musl与备用信号栈已接入；各接口的扩展边界见对应模块，未知syscall返回ENOSYS。
-
-### seccomp 系统调用过滤
-
-`seccomp(277)` 与 `PR_SET_SECCOMP`/`PR_GET_SECCOMP` 提供线程级 STRICT 和
-FILTER。STRICT 只允许 `read/write/exit/rt_sigreturn`，其他调用直接以 SIGKILL
-终止当前线程（不是整个线程组，也不执行被拒绝调用）。FILTER 安装需要
-`no_new_privs` 或 CAP_SYS_ADMIN；模式不能关闭或互相转换，过滤链只能追加。
-
-FILTER 支持常量返回 ALLOW、ERRNO、TRAP、TRACE、KILL_THREAD、KILL_PROCESS。
-ERRNO 数据截到 Linux 的 4095 上限，并直接返回用户态；即使值为 512 等
-内核 restart 编码，也不能触发自动重启；拒绝调用同时终结待处理的
-restart block，避免稍后的信号交付改写已完成调用的返回值和 PC。多个过滤器按有符号 action 优先级选择，
-同优先级保留最新过滤器的数据。未知 action 在最终选中时按 Linux 终止整个
-线程组，不能当 ALLOW。已知但尚未实现的 LOG、USER_NOTIF，以及
-动态 `RET A`，在安装时返回 `EOPNOTSUPP`，并不冒充完整 Linux FILTER 支持。
-安装 flags 支持 TSYNC；NEW_LISTENER、TSYNC_ESRCH 等其余位返回 `EINVAL`；
-GET_ACTION_AVAIL 只对上述六种 action 成功，GET_NOTIF_SIZES 尚不支持。
-
-TRAP 不执行系统调用，向触发线程强制投递 SIGSYS/SYS_SECCOMP，携带完整的
-调用号、AUDIT_ARCH、恢复 PC 及低 16 位策略数据（si_errno）。RV64/LA64 的
-a0 恢复到原始参数，处理器可在 ucontext 中写入模拟返回值；阻塞或忽略 SIGSYS
-不能绕过默认致命动作。复用同步信号槽，不为每次 TRAP 分配队列；ptrace 的
-信号交付停止可检查、编辑或抑制该信号，不能使已跳过的系统调用执行。
-
-TRACE 在启用 `PTRACE_O_TRACESECCOMP` 的跟踪关系中产生 SECCOMP 事件，
-消息为低 16 位策略数据；无跟踪者或未启用该选项时返回 ENOSYS。恢复后从
-真实寄存器重新读取调用号、原始 a0、其余参数和 PC，并重新检查最新过滤链，
-包含停止期间 TSYNC 发布的策略。重检 TRACE 只放行一次，不重复事件；
-ERRNO/TRAP/KILL 的较高优先级仍然生效。跟踪者把调用号改为负数时跳过执行，
-保留它设置的返回寄存器，且清除 restart block；致命恢复也不会执行调用。
-TRACE 将 `restart_syscall` 改为其他调用时终结原来的 timeout block，避免
-后续信号再改写替代调用的结果和 PC；未改号则保留它以继续原等待。
-普通 SECCOMP 事件恢复的附带信号不作为信号交付注入。实际 syscall-enter
-BPF 观测位于过滤及重检之后，使用最终调用号和参数。
-
-程序最多 4096 条指令，链路径上限 32768（每个旧过滤器额外计 4 条）。复用
-已有 cBPF 的前向控制流、除数、移位及 scratch 初始化验证；seccomp 另限制
-输入为 64 字节 `seccomp_data` 的本机字节序、四字节对齐读取，不经过 socket
-BPF 的网络字节序/包元数据解释路径，也不解引用用户参数中的指针。
-
-两个架构均在 ptrace syscall-enter 改号之后构造请求，并在公共 dispatcher
-的身份快速路径之前过滤；输入包含调用号、AUDIT_ARCH、恢复 PC 和完整六个
-64 位参数。未启用线程仅多一个 mode 判断；非 TRACE 事件的启用路径只遍历不可变链，不在
-每次调用分配、取全局锁或更新引用计数。fork/clone 共享链引用，exec（包括
-非 leader exec）保留当前线程自己的策略，无 TSYNC 的追加不改变兄弟线程；失败
-clone 与退出均在任务最终销毁时归还引用。KILL_THREAD 使用独立的线程终止
-入口，避免普通致命信号的整组退出语义。
-
-TSYNC 在调度域内先检查所有未退出线程，再一次提交全部叶指针和调用者的
-no_new_privs。目标必须尚未启用过滤，或持有调用者当前链的同一节点/祖先；
-指令相同但独立安装的节点不算祖先。不能同步时返回失败线程的正 TID，
-不安装调用者的新过滤器，也不改变其他线程。路径超限、复制或分配失败同样
-没有部分修改。每条旧链都仍由新链持有，启用线程只需 acquire 读取叶指针，
-不增加逐调用引用或全局锁；未启用线程只做 relaxed mode 读取。
-
-clone 准备资源后，在发布线程/进程的同一临界区继承最新过滤链和
-no_new_privs，避免准备期间的 TSYNC 被旧快照覆盖。TSYNC 等待已经开始的
-exec 凭据决策结束，普通信号延后交付；组退出或成功 exec 可以直接取消该
-等待，使退出线程不会反过来阻塞 exec。借用目标线程覆盖等待队列寿命。
-只在安装与生命周期交接取调度锁，不暂停整个线程组执行已进入的 syscall。
-
-语义核对依据 Linux v6.12 `kernel/seccomp.c` 与官方
-[Seccomp BPF 文档](https://docs.kernel.org/userspace-api/seccomp_filter.html)。
-`tests/workloads/seccomp/basic.c` 是 Linux/BoarOS 同源用例，覆盖安装错误、
-权限、参数/PC、组合优先级、ptrace 改号、fork/exec、线程独立性、线程/整组
-终止与 STRICT；受宿主策略限制的 STRICT/ptrace 会明确报告跳过。
-信号用例覆盖 TRAP 元数据、返回寄存器、线程隔离、阻塞/忽略和 ptrace 抑制，
-以及 handler 内过滤、STRICT 下的 rt_sigreturn、相对 nanosleep 与限时
-FUTEX_WAIT 经 STOP/CONT 后 restart_syscall 被拒绝和后续信号的恢复 PC/a0。
-其他阻塞 syscall 的自动重启路径尚未进行动态定向验证。
-`tests/userland/seccomp.py` 使用已编译 ELF 与内核在两架构启动；
-`make test-seccomp-host` 验证生产解释器、安装 OOM、祖先链和共享引用；
-生产调度安装与 exec 状态检查另覆盖准备前、复查后至 park、COMMITTED、
-finish 后的终止窗口，以及并行安装。fixture 替换机器等待边界，不代表真实
-clone/exec 的所有失败阶段。Linux/BoarOS 同源 `tests/workloads/seccomp/tsync.c`
-覆盖线程组传播、失败 TID、无部分修改、STRICT 兄弟线程、并行安装、
-clone 发布和非组长 exec；可交给同一 `tests/userland/seccomp.py` 启动。
-`tests/workloads/seccomp/trace.c` 覆盖事件数据及截短复制、ENTRY/SECCOMP/EXIT
-顺序、改号与参数、二次 TRACE、较高优先级动作、负调用号/内部 restart 数值、
-后续信号 PC、事件中修改恢复 PC、LA 原始参数槽、致命停止的零写副作用、
-停止期间 TSYNC、fork 继承及 exec、事件中 DETACH 和 tracer 退出（包括
-EXITKILL 零写副作用）。nanosleep/FUTEX_WAIT 的 STOP/CONT 用例同时检查
-restart_syscall 改号成功后的信号 PC/a0 和未改号时继续原等待。BPF 观测直接检查改号后的 enter 参数及
-拒绝路径不产生 enter。Linux 宿主禁止
-ptrace 时只运行无跟踪者行为并明确跳过事件用例；RV/LA guest 执行事件路径。
-
-
-## 双架构 ABI 差分入口
-
-`make test-diff-abi-riscv` 与 `make test-diff-abi-loongarch` 共用完整案例、严格记录
-协议、错误分类及时间戳关系校验。LA 使用独立 raw ELF/启动与 clone 汇编：Linux LA
-clone 的 child_tid/TLS 寄存器次序由适配层处理，信号 PC 与坏指令按 LA 编码。
-`ABI_PAGE_SIZE` 只决定目标页边界、映射/保护、管道槽和 tmpfs 页配额；文件块、扇区、
-4096 字节用户前缀、8192 字节消息和具体字符串解析用例保留原语义。
-
-差分 runner 在每种架构上只构建一次程序，使用同一 ELF 对照 Linux 与 BoarOS。它核对完整退出记录、返回值、内容和副作用；BoarOS 另检查根任务退出和资源归还。输入、内核与实际 QEMU 命令随本次运行记录，不用历史条目数量代替当前检查。
-
-proc 测试在 clear_child_tid 后等待实际 nr_threads=1；线程组长的 held status OFD
-通过 lseek/re-read 等待真实 zombie 发布。固定 Linux 的 clear_child_tid 先于
-exit_state 和最终 nr_threads 更新，不能把一个调度瞬间的 R/两线程当作稳定退出状态，
-也不能在解析器中把 R 改成 Z。等待有界、结果仍来自真实用户态读取。
-
-整体审查纠正了LA几处仍用4KiB指针偏移的fault夹具：UDP/TCP置于目标页尾2字节，
-null/zero置于尾4字节，sysctl置于尾1字节；预先断言实际EFAULT/partial4及失败
-offset不变，避免两侧都未触发fault时仍差分成功。夹具必须先断言预期页边界，避免两侧都未触发故障却被判为差分成功。
-
-### UTS 命名空间与命名空间 FD
-
-`clone(CLONE_NEWUTS)` 和 `unshare(CLONE_NEWUTS)` 要求 `CAP_SYS_ADMIN`，新对象从调用线程当前命名空间复制完整的 390 字节名称。任务分别持有 UTS、IPC 及 FS 挂载命名空间的真实引用；各后端共用 `kernel/namespace.c` 的类型、唯一 ID、引用归还与命名空间 FD，实现自身状态和销毁。UTS 的名称锁仅保护复制和字段修改，不跨用户复制、分配或阻塞操作。
-
-`/proc/<pid>/ns/uts` 和线程目录下对应链接打开为持有实际命名空间的 FD；`NS_GET_NSTYPE` 返回 `CLONE_NEWUTS`，`fstat` 的 inode 与链接中的 ID 相同，`fstatfs` 返回 nsfs 类型。dup、fork 和传递 FD 复用同一 OFD owner，源任务退出后仍可 `setns`。`setns` 接受 UTS FD，type 为零或 `CLONE_NEWUTS`；pidfd 形式按非零命名空间类型位选择目标任务的当前对象。名称状态由命名空间引用保持，最后引用归还后释放；初始命名空间保留启动 owner。字符串控制文件每次操作选择调用线程的当前 UTS，因而打开 FD 后再切换命名空间也观察新名称。
-
-直接用户消费者为 `tests/workloads/resource/uts_namespace.c`，覆盖复制与隔离、普通 fork 共享、线程单独切换、非组长 exec 保留、clone3 同时创建、pidfd 多类型一致快照、共享 FS 下单独加入 MNT 失败时的状态与 SEM_UNDO 保持、多类型加入成功后的共享路径与独立命名空间、SCM_RIGHTS 传递及源任务退出后的 FD 加入，以及字符串 FD 的按次选择和权限错误。宿主 `tests/host/mount-attributes.sh` 的 `namespace-uts` 组检查复制分配失败、共同引用与 ID、FD 寿命和准备后提交的 FS 上下文；`namespace-shared-fs` 组检查共享路径、独立挂载引用及 foreign root/cwd 的复制。
+</details>

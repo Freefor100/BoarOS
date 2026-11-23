@@ -55,6 +55,12 @@ void kernel_socket_call_message_end(struct kernel_socket_call *call)
 static void socket_call_cleanup(struct kernel_socket_call *call, int aborting)
 {
     kernel_socket_call_message_end(call);
+#if BOAROS_USER_SMP
+    if (call->udp_batch_interface) {
+        kernel_socket_datagram_flush(call->udp_batch_interface);
+        call->udp_batch_interface=0;
+    }
+#endif
     if (aborting && call->socket_owner) {
         enum kernel_files_status status=kernel_files_release_uninstalled_description(call->files,call->socket_owner);
         if (status!=KERNEL_FILES_STATUS_OK && status!=KERNEL_FILES_STATUS_CLEANUP_REQUIRED) __builtin_trap();

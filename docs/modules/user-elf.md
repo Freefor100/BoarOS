@@ -1,106 +1,141 @@
 # 用户 ELF64 装载模块
 
-本文描述共用 ELF64 解析、不可变来源、缺页 backing 和映像布局。RV 生产路径用 Sv39/4 KiB；LA 的内存与 PCI/ext4 静态 ELF 用 LA64/16 KiB/三级页表，能力范围见[LA 模块](loongarch-boot.md)。exec 事务见[进程映像替换模块](kernel-exec.md)。
+用户 ELF64 装载模块负责将 64 位可执行与可链接格式（Executable and Linkable Format，ELF64）程序——包括静态可执行文件、动态链接可执行文件、位置无关可执行文件（Position-Independent Executable，PIE）以及用户态动态链接器（`PT_INTERP`）——安全地解码、规范化并构建为完整的用户虚拟地址空间与初始进程栈。RISC-V 64（4 KiB 基页 / Sv39）与 LoongArch 64（16 KiB 基页 / 三级页表）共用同一套解码器、不可变来源对象与地址布局策略；`execve` 路径解析、脚本解释与进程替换事务见 [进程映像替换模块](kernel-exec.md)。
 
-## 稳定单元
+---
 
-| 文件 | 职责 |
-|---|---|
-| `include/kernel/elf64.h`、`kernel/elf64.c` | 有界 little-endian ELF64 header/program-header 解码；支持调用者提供的 program-header cache |
-| `include/kernel/elf64_source.h`、`kernel/elf64_source.c` | 拥有 executable OFD 或借用不可变 reader、一次解析结果和规范化 `PT_LOAD` 区间的引用计数来源 |
-| `include/kernel/elf_image.h`、`kernel/elf_image.c` | 共用地址布局、ASLR、初始栈/auxv 和 source-backed VMA 构造 |
-| `include/arch/elf.h`、`include/arch/mmu.h` | 构建期 machine、HWCAP、trampoline、用户范围及页表操作 |
-| `kernel/exec.c`、`kernel/exec_image.c` | `execve` 路径/解释器事务和共用映像绑定 |
+## 一、源码组织
 
-解析器入口为：
+| 源码路径 | 核心职责 |
+| :--- | :--- |
+| `include/kernel/elf64.h`、`kernel/elf64.c` | 有界小端 ELF64 文件头与程序头解码器，执行基础结构与 `PT_LOAD` 合法性校验，支持单遍缓存读取 |
+| `include/kernel/elf64_source.h`、`kernel/elf64_source.c` | 引用计数的不可变 ELF 来源对象 `struct kernel_elf64_source`：持有打开文件描述（OFD）或只读源、提取 `PT_INTERP`、将 `PT_LOAD` 规范化为无重叠页区间并提供按需缺页与邻页预取接口 |
+| `include/kernel/elf_image.h`、`kernel/elf_image.c` | 跨架构映像构造器 `kernel_elf_image_build()`：完成地址空间布局随机化（ASLR）、vDSO 映射、初始栈与辅助向量（auxv）构造、VMA 登记与资源限额验收 |
+| `include/arch/elf.h` | 编译期绑定目标架构机器号（`EM_RISCV = 243` / `EM_LOONGARCH = 258`）、硬件能力位（`AT_HWCAP`）、最小信号栈（`AT_MINSIGSTKSZ`）与内嵌 vDSO 镜像边界 |
+| `arch/riscv/elf_image.c`、`kernel/exec.c`、`kernel/exec_image.c` | 兼容包装与 `execve` 事务编排 |
 
-```c
-enum kernel_elf64_status kernel_elf64_open(
-    const struct kernel_read_source *source,
-    struct kernel_elf64_image *image);
+---
 
-enum kernel_elf64_status kernel_elf64_open_cached(
-    const struct kernel_read_source *source,
-    struct kernel_elf64_image *image,
-    struct kernel_elf64_program_header *program_headers,
-    uint16_t program_header_capacity);
+## 二、分层装载架构
+
+BoarOS 将 ELF 装载清晰地划分为三层，使文件解析、按需缺页数据供应和进程地址空间布局彻底解耦：
+
+```mermaid
+flowchart LR
+    File["磁盘可执行文件 / 内存只读源\n（OFD 或 kernel_read_source）"] --> Parser["1. ELF64 解码器\nkernel/elf64.c\n逐字节有界解码 + PT_LOAD 校验"]
+    Parser --> Source["2. 不可变 ELF Source\nkernel/elf64_source.c\n规范化 FILE / ZERO / COMPOSITE 区间\n支持引用计数与运行期按需供页"]
+    Source --> Image["3. 映像与栈构造器\nkernel/elf_image.c\nASLR 选址 + vDSO + 初始栈/auxv\n登记 ELF_PRIVATE 按需 VMA"]
+    Image --> MM["活跃进程 MM\n首次取指/访问经缺页从 Source 装页"]
 ```
 
-`kernel_read_source` 只有 `context`、总长度和精确 `read_at`；回调返回零必须表示整个请求已填满。解析器逐字节解码，不把文件映射成内核整块 buffer。成功要求 ELF64、小端、当前版本、标准 header 大小、1..128 个 program header，且每个 `PT_LOAD` 满足文件范围、`p_filesz <= p_memsz`、虚拟范围不溢出及合法的 `p_align`。非空内存段要求文件偏移与VA同余；`p_filesz=p_memsz=0` 的空LOAD不产生映射，不要求这一同余关系，仍保留文件范围和alignment格式检查。底层读取失败是独立的 `IO` 状态，输出保持不变。`open_cached` 在一次表扫描中把 program header 写入调用者存储，source 不再为布局/缺页重复读取 header。
+### 2.1 有界解码器（`kernel/elf64.c`）
 
-## 不可变 ELF source
+`kernel_elf64_open()` 与 `kernel_elf64_open_cached()` 仅通过抽象的精确读取接口 `struct kernel_read_source`（包含 `context`、总长度 `size` 与精确读回调 `read_at`）逐字节解码，绝不将整个可执行文件一次性读入内核内存：
 
-`kernel_elf64_source_create()` 接收一个已打开的 regular-file OFD 和当前架构 machine，成功后消费调用者的 OFD owner；失败仍由调用者持有。source 保存 header、program headers、唯一的绝对 `PT_INTERP` 路径和按虚拟页排序、无重叠的 FILE/ZERO/COMPOSITE runs。source 具备 `create/acquire/release` 引用协议；最后一个 release 按 file、解释器字符串、临时边界、run/table allocation 的顺序清理。真实 VFS/I/O 清理失败保持 source/OFD owner；纯堆指针无条件释放并清空，不派生清理失败状态。物理页与堆的合法释放完成即返回，分配器不变量错误进入 fatal。
+- 校验 ELF 魔数、64 位小端格式、当前版本号、标准头尺寸（文件头 64 字节、程序头 56 字节）以及程序头数量位于 `1..128`（`KERNEL_ELF64_MAX_PROGRAM_HEADERS`）；
+- 校验程序头表完整落在文件范围内；
+- 逐条校验每个 `PT_LOAD` 段：`p_filesz <= p_memsz`、文件区间不越界、虚拟地址区间不溢出；若 `p_align > 1`，要求其为 2 的幂，且非空内存段（`p_memsz > 0`）必须满足文件偏移与虚拟地址对 `p_align` 同余（`p_filesz == p_memsz == 0` 的空 `PT_LOAD` 不产生映射，豁免同余检查）。
+- `open_cached()` 在一次扫描中将所有程序头写入调用方提供的数组，避免后续布局与缺页阶段重复读取文件头。
 
-`kernel_elf64_source_create_reader()` 复制 `read_source` 描述符，不消费 backing。调用者必须让字节与 context 不可变且存活到最后一个 source 引用释放；LA fixture 使用内核只读区中的独立 ELF。reader 的完整 FILE 页同样分配并精确复制，不能按零页处理；OFD 仍走 page cache。两种 source 共用解析、runs、VMA、回滚与引用规则。
+### 2.2 不可变 ELF 来源与区间规范化（`kernel/elf64_source.c`）
 
-`kernel_elf64_source_page(source, allocator, offset, ...)` 以 source-relative、页对齐 offset 查找区间并二分定位：
+`struct kernel_elf64_source` 是被 VMA 与 MM 共享的不可变只读对象，以原子引用计数管理寿命：
 
-- 完整文件页从 OFD page cache 借用共享物理页，MM 以 COW PTE 发布；
-- 文件/BSS 边界页或页内多段贡献分配私有页，先清零，再精确读取文件字节；
-- 纯 BSS 页按需分配并保持全零。
+- **三种创建入口**：
+  - `kernel_elf64_source_create()`：接收普通文件的打开文件描述（OFD），成功后接管其所有权，失败仍归调用者持有；
+  - `kernel_elf64_source_create_interpreter()`：复用相同所有权契约，专门区分动态链接器文件短于 64 字节时的截断错误，按 Linux 惯例映射为 `IO`（`-EIO`），而完整但格式/架构错误的解释器映射为 `-ELIBBAD`；
+  - `kernel_elf64_source_create_reader()`：基于调用方保证生命周期的内存只读源创建（例如内嵌只读测试 ELF），不依赖文件系统。
+- **段校验与重叠拒绝**：
+  - 接受 `ET_EXEC` 与 `ET_DYN` 且机器号匹配当前架构，允许至多一条绝对路径（以 `'/'` 开头、NUL 结尾、最长 4096 字节）的 `PT_INTERP`；
+  - 拒绝任何两条非空 `PT_LOAD` 段的虚拟字节区间重叠；若两段落在同一架构页内（页级共享但字节不重叠），其合并权限不得同时包含写与执行（`PF_W | PF_X`）。单个自身同时声明 `PF_W | PF_X` 的装载段允许按 RWX 映射（共享文件页写入时仍先执行写时复制）。
+- **页区间切分与三类供页策略（`build_runs`）**：
+  构建阶段收集每个 `PT_LOAD` 段的 5 个关键页边界——段起始对齐页、首个完整页、最后一个完整文件页、文件尾所在页、段末端对齐页——按虚拟地址排序并合并为互不重叠的三类区间（`struct kernel_elf64_source_run`），供缺页时 `kernel_elf64_source_page()` 二分定位：
 
-完整FILE页的邻页PTE批量发布复用已有缓存引用，范围、COW和同步规则见[文件缺页的批量PTE发布](kernel-mm.md#文件缺页的批量pte发布)。reader来源、复合页和BSS不因此增加推测读取。
+| 区间类型 | 构成条件 | 缺页供页方式 |
+| :--- | :--- | :--- |
+| **`FILE`** | 单一 `PT_LOAD` 独占整页、全页位于 `p_filesz` 内且文件偏移页对齐 | 若后备为 OFD，直接通过页缓存借用共享物理页并以 **CoW** 方式映射（多进程共享同一代码页）；支持 `kernel_elf64_source_acquire_ready()` 在同区间内批量借用最多 64 KiB 已就绪缓存邻页。若后备为只读 `reader`，则分配私有页并精确复制 |
+| **`COMPOSITE`** | 文件与零填充（BSS）交界页、页内起始/末尾不对齐页，或多段同页拼合页 | 分配私有物理页，先全页清零，再遍历贡献该页的每个 `PT_LOAD` 段精确读入 `p_filesz` 范围内的文件字节，保持尾部 BSS 为零 |
+| **`ZERO`** | 完全超出 `p_filesz` 的纯零填充（BSS）页 | 按需分配并全页清零的私有物理页 |
 
-run 边界同时包含每个装载段的首个完整页、最后一个完整文件页和文件尾所在页；FILE 判定覆盖整个 run。这样多页 FILE 区间不会把最后一个不完整文件页一起映射为缓存页。该页由 COMPOSITE 私有物化，只读入 `p_filesz` 内的字节，并把其余 BSS 清零。
+---
 
-物理页分配后若解析或读取失败，source 先释放临时页再返回原始错误；合法释放不会产生重试状态。缺页 I/O 在 MM 层转为用户 `SIGBUS`，物理耗尽转为用户资源失败；source/OFD 的真实 VFS/I/O 清理错误不覆盖原始格式或 I/O 结果。
+## 三、用户地址空间布局、ASLR 与初始栈
 
-## RISC-V 映像与 ELF 形态
+`kernel_elf_image_build()` 在建立新地址空间时，以按需装页为核心原则：**构建阶段只向物理内存预提交覆盖初始参数的栈页与 vDSO 页**，主程序与动态链接器的所有 `PT_LOAD` 区间仅登记为 `ELF_PRIVATE` / `KERNEL_VMA_FAULT_ELF` VMA，直到用户态真正跳入入口点取指或访问数据时再由缺页处理按需装入。
 
-`kernel_elf_image_build()` 是共用入口，`riscv_elf_image_build()` 保留兼容包装。RV 生产路径固定 Sv39/4 KiB，并接受：
+### 3.1 静态/动态/PIE 形态与合法性检查
 
-- 非 PIE `ET_EXEC`，有或无解释器；
-- PIE `ET_DYN`，带 `PT_INTERP`；
-- 无解释器的 `ET_DYN`。
+- 支持静态与动态 `ET_EXEC`、带 `PT_INTERP` 的 PIE `ET_DYN` 以及独立无解释器的 `ET_DYN`；动态链接器本身不得递归声明 `PT_INTERP`。
+- 重定位（`PT_DYNAMIC`、`RELRO`）与线程局部存储（`PT_TLS`）的元信息完整保留在源程序头中，由用户态动态链接器（如 musl / glibc `ld.so`）依据辅助向量自行完成，内核无需在内核态解析动态符号。
+- 入口地址必须满足 2 字节指令对齐（兼容 RISC-V 压缩指令 `IALIGN = 16`）且落入某条可执行 `PT_LOAD` 段的文件字节内（不能落在 BSS 或空洞中）。
+- `AT_PHDR` 仅当完整程序头表落于某个 `PT_LOAD` 段的文件与内存范围内时填入其用户虚拟地址；PIE 或带解释器的动态映像缺少有效 `AT_PHDR` 视为格式错误。
 
-主程序和解释器各由 exec 事务持有一个 source；解释器不能递归含 `PT_INTERP`。`PT_DYNAMIC`、`PT_TLS`、GNU RELRO 等信息保留在 source 中，供动态链接器读取；主 ELF 最后一个 `PT_GNU_STACK` 的 PF_X 决定整个栈 VMA 及初始页的执行许可，解释器不覆盖，缺标记或非执行标记保持 NX；内核本身当前不执行重定位、加载额外 DSO 或分配 TLS。主文件格式/架构错误返回 `ENOEXEC`；解释器缺失保留路径错误，解释器短header返回 `EIO`，完整header的格式或架构错误返回 `ELIBBAD`。
+### 3.2 虚拟地址布局与地址空间布局随机化（ASLR）
 
-每个 source 的 `PT_LOAD` run 映射成 `ELF_PRIVATE` VMA，VMA 的 `backing_offset` 是 source-relative 起点，故障策略为 `ELF`。单个同时要求写与执行的装载段按 RWE 映射；共享文件页写入时仍先 COW，重叠装载段仍不得共享同一虚拟字节或形成跨段的写执行页。完整文件页共享 page cache，写入时 COW；复合页和 BSS 私有化。VMA 与 MM 各保留 source 引用：重复映射不会累积历史引用，fork 的子 MM 取得独立引用，最后一个相关 VMA 消失后释放。每次新建可执行页后先做架构地址转换失效并执行取指同步，覆盖先读后取指的路径。
+除非进程设置了 `ADDR_NO_RANDOMIZE` 个性位（`KERNEL_PERSONALITY_ADDR_NO_RANDOMIZE`）或随机子系统尚未获得任何种子材料，内核调用 `kernel/random.c` 的 ChaCha20 状态为以下 6 个区域独立生成随机偏移（并严格校验对齐、用户上限与互不冲突）：
 
-入口必须按 RISC-V IALIGN 2 字节对齐并落在可执行 `PT_LOAD` 的文件字节中，不能落在 BSS 或段间空洞。`AT_PHDR` 只有完整 program-header table 位于某个 `PT_LOAD` 的文件和内存范围内时才给出用户地址；动态/PIE 映像缺少该地址时视为格式错误。
+```mermaid
+flowchart TB
+    Top["用户空间上限 ARCH_MMU_USER_LIMIT\n（RV64: 2^38 / LA64: 2^47）"]
+    Stack["用户主栈（向下增长，顶部 18 bit 页随机）\n• 初始 VMA：参数区 + 128 KiB\n• 初始物理提交：参数区 + 64 KiB\n• 下方保留 256 页保护间隔"]
+    Mmap["mmap_base（自顶向下 mmap 上界，24 bit 页随机）"]
+    Interp["动态链接器 PT_INTERP（ET_DYN 时 24 bit 随机）"]
+    Vdso["vDSO 共享代码页（24 bit 空洞随机，RX）"]
+    Brk["堆 brk 区间（起点 18 bit 随机，向上增长）"]
+    Main["主程序 ELF PT_LOAD（PIE 时在 2/3 上限附近 24 bit 随机）"]
+    Zero["0x0000 .. PAGE_SIZE（永不映射的零页保护区）"]
 
-## 地址布局和初始栈
-
-DTB `/chosen/rng-seed` 至少 32 字节时，`kernel/random.c` 混入该材料并以 ChaCha20 产生独立布局值；DTB 材料不构成可信熵、不使 RNG ready。`kernel_random_available()` 仅表示已有材料；`kernel_random_ready()` 才表示累计取得至少 32 字节可信 VirtIO RNG 输入。每次 exec 都从当前随机核心生成并发布 16 字节 `AT_RANDOM`，供 libc 在进入 main 前初始化 canary；这与固定 Linux `fs/binfmt_elf.c::create_elf_tables()` 的非阻塞 `get_random_bytes()` 行为一致。既无 DTB 材料也无设备输入时，地址布局保持确定性，`AT_RANDOM` 仍由当前 ChaCha20 状态生成，其内容也可预测；该早期输出不计可信熵，不改变普通 `getrandom` 的等待或 `EAGAIN` 语义。可信源就绪后的输出使用同一状态并保留 ready，设备后续失败不撤回初始化状态。RISC-V 布局独立随机化 PIE/解释器 bias、mmap top-down base、用户栈顶端、brk 起点和 vDSO 页，并逐项检查对齐、Sv39 上界和 VMA 冲突。bias 只用于入口、PHDR 和映射重定位；冲突检测与 vDSO 洞选择使用经过溢出检查的 `[bias + 最低加载地址, bias + 最高加载末端)`，因此两个 bias 同为零、实际不相交的 ET_EXEC 主程序与解释器可以共存；brk 上限复用解释器的实际起点。无合法空洞返回 `ENOMEM`。
-
-初始栈 VMA 覆盖参数页并额外预留 128 KiB，按架构页大小对齐并受 exec 捕获的 `RLIMIT_STACK` 软限制约束。默认软限额为 8 MiB、硬限额为无限；有限的大栈限额会扩大栈与 mmap 布局之间的间隔，设置无限时沿现有布局选择。VMA 以下的栈缺页在 MM 操作锁内检查调用者当前 AS/STACK 限额及相邻映射，成功后扩展实际 VMA；与可访问的前一映射保持 256 个架构页的间隔。调低 STACK 不撤销已有 VMA 内的访问，调高后可继续增长。初次只提交覆盖序列化参数和最多 64 KiB headroom 的 RW 页（执行许可随 GNU_STACK），其余页由匿名 demand-zero fault 提交；参数大小按[exec 的 Linux 预算](kernel-exec.md#准备事务)检查；完整初始栈（含 auxv、随机字节和对齐）无法放进实际软栈限制时返回 `E2BIG` 并保持旧映像。新映像在提交前按 exec 的 AS/DATA 快照检查全部 VMA 用量，超限返回 `ENOMEM` 并释放候选 MM；主 ELF 的数据文件字节边界另行保存，供后续 brk 精确字节检查。入口栈按 psABI 16 字节对齐，依次包含 `argc`、`argv[]`、`envp[]`、auxv 和字符串。当前 auxv 提供真实 `AT_PAGESZ`、`AT_PHDR/AT_PHENT/AT_PHNUM`、`AT_BASE`、`AT_FLAGS`、`AT_ENTRY`、`AT_HWCAP=IMAFDC`、`AT_CLKTCK`、实际 UID/GID、由本次执行凭据转换确定的 `AT_SECURE`、`AT_RANDOM`、`AT_EXECFN` 和 `AT_NULL`。
-
-映像建立完成后，MM 记录 source-backed VMA、每 MM 的 mmap ceiling、vDSO 地址和从最高 `PT_LOAD` 内存末端得到的 brk 起点。scheduler 在提交点允许入口页尚未驻留，只要求它属于可执行 VMA；第一次取指由专用 ELF fault backing 完成。
-
-## 所有权和验证
-
-source、临时映像和 MM 的所有权按 exec 事务分层：事务持有创建期 source/OFD，MM 持有 VMA 所需 source 引用，提交成功后事务释放临时 owner。任何失败都先保留原 MM；新 MM 的合法页表/堆释放完成即结束，只有 source/OFD 的真实 VFS/I/O 清理错误进入持久 owner，不能返回“已清理”而丢失资源。
-
-```sh
-make test-elf-boundary-riscv test-elf-boundary-loongarch TEST_MEMORIES="512M 1G"
-make test-elf-rwx-riscv
-make test-elf-tail-riscv
-make test-demand-page-riscv
-make test-exec-riscv
-make test-root-init-riscv
-make test-riscv
+    Top --> Stack --> Mmap --> Interp --> Vdso --> Brk --> Main --> Zero
 ```
 
-真实根启动 fixture 验证 source-backed 静态入口；动态 musl PIE、解释器、额外 DSO、初始 TLS 和线程运行期间的 dlopen TLS 已通过生产入口验证，消费者复用 userland runner。固定 glibc 2.44 的静态/动态/PIE 与 pthread、dlopen TLS、信号子集由 `make test-glibc-riscv` 对照固定 Linux 验证。重定位与 TLS 分配由用户态动态链接器/libc 完成，不是待添加的内核 ELF 算法。更广 glibc 应用与真实开发板 I-cache/熵源仍需单独验证。LoongArch 已复用同一解析、source和映像策略，验证16 KiB/三级页表的整数内存与PCI/ext4静态ELF、LP64S musl TLS/pthread及整数信号。LA的PT_INTERP、原版LP64D musl动态PIE/非PIE和初始/late DSO TLS已双侧验收，标量FPU与信号扩展见LA模块。
+- **随机数与熵边界**：设备树 `/chosen/rng-seed` 提供不少于 32 字节材料时，`kernel/random.c` 将其混入 ChaCha20 状态以启用布局随机化，但不记作密码学可信熵（只有 VirtIO RNG 累计输入满 32 字节后 `kernel_random_ready()` 才就绪）。每次 `exec` 均以非阻塞方式生成 16 字节 `AT_RANDOM` 供 `libc` 在进入 `main` 前初始化栈金丝雀（Stack Canary），不阻塞也不改变 `getrandom` 系统调用的等待语义。
+- **栈权限与限额**：
+  - 栈默认不可执行（`RW`）；若主 ELF 中最后一个 `PT_GNU_STACK` 带有 `PF_X`，则赋予整个栈 VMA 与初始栈页执行权限（解释器的 `PT_GNU_STACK` 不覆盖主程序设置）。
+  - 初始栈 VMA 覆盖参数序列化区并向下预留 **128 KiB**（`KERNEL_ELF_STACK_EXPAND`），初次仅物理映射覆盖参数与最多 **64 KiB** 余量（`KERNEL_ELF_STACK_HEADROOM`）的页面，受 `RLIMIT_STACK`（默认软限 8 MiB）约束；完整初始栈放不进软栈限额或参数/环境变量超出预算时返回 `E2BIG` 并保留原进程映像。
+  - 在最终提交前，按 `exec` 捕获的 `RLIMIT_AS` 与 `RLIMIT_DATA` 快照整体验收全部 VMA 用量，超限返回 `ENOMEM` 并回收候选地址空间；主 ELF 的代码与数据文件边界（`start_code`/`end_code`/`start_data`/`end_data`）另行记录供 `/proc/<pid>/stat` 与后续 `brk` 字节级限额检查使用。
 
-`kernel_elf64_source_create_interpreter()` 复用create所有权契约，仅在完整64字节header之前
-区分短EOF的Linux EIO；运行期exec与RV/LA根启动均使用同一入口，失败保留OFD owner。
+### 3.3 初始栈帧与辅助向量（`auxv`）
 
-## 双架构 GNU runtime 验收入口
+初始栈指针 `sp` 按过程调用标准（psABI）向下 16 字节对齐，从低地址向高地址依次排布：
 
-`tests/userland/glibc/run.py --arch riscv|loongarch` 共用五种 ELF 形态、消费者和
-marker 顺序检查。RV 保持固定 glibc 2.44；LA 的 `inputs-loongarch.json` 固定
-已安装原版 glibc 2.42、GCC15.1.0、工具/完整 sysroot/CRT/libgcc 身份，包含内容、
-权限与 symlink 目标。probe 的版本来自 profile，GNU libc 本体不改写。
-LA runtime 实际系统搜索目录为 `/usr/lib64`；不能复制 RV 的 `/lib` fixture。
-LA root runner 可显式指定预期退出码，Linux supervisor 与 BoarOS 均核对该值。
+```text
+sp ──▶ [ argc ]
+       [ argv[0], ..., argv[argc-1], NULL ]
+       [ envp[0], ..., envp[envc-1], NULL ]
+       [ auxv (type, value) 键值对 ..., (AT_NULL, 0) ]
+       [ argv 字符串..., envp 字符串..., 可执行路径字符串, 16 字节 AT_RANDOM ] ──▶ stack_top
+```
 
-`make prepare-la-glibc test-glibc-profile-host` 验证输入及身份反例；
-`python3 -B tests/userland/glibc/run.py --arch loongarch --only linux` 的静态、动态、
-PIE、静态 PIE、pthread PIE 已在固定 Linux 的512MiB/1GiB通过。初始 BoarOS
-静态 ELF 在进入main前SIGILL；SIMD接入后推进至SIGSEGV，GDB在原程序
-`__libc_start_main_impl`确认空AT_RANDOM读取。这两项启动阻塞随后已修复；
-2026-10-07完整`test-glibc-loongarch`的五种形态在Linux/BoarOS、512MiB/1GiB
-通过，含TLS/pthread/取消/信号及正常root owner回收。DTB早期材料不计可信熵，
-无RNG仍不声明随机ready；更广GNU应用与原评测runtime另行验收。
+内核向用户态发布的完整辅助向量条目包括：
+
+| 辅助向量键（编号） | 写入值说明 |
+| :--- | :--- |
+| `AT_PAGESZ` (6) | 架构基页大小（RV64 为 4096，LA64 为 16384） |
+| `AT_PHDR` (3) / `AT_PHENT` (4) / `AT_PHNUM` (5) | 主程序头表用户虚拟地址、单条长度（56 字节）与条目数 |
+| `AT_BASE` (7) / `AT_FLAGS` (8) / `AT_ENTRY` (9) | 动态链接器装载偏移（无解释器为 0）、标志（0）与主程序入口地址 |
+| `AT_HWCAP` (16) | 硬件能力位图：RISC-V 为 `IMAFDC`（存在向量扩展 `riscv_vector_vlenb > 0` 时附加 `V` 位）；LoongArch 由 `la_user_hwcap()` 提供 |
+| `AT_MINSIGSTKSZ` (51) | RISC-V 架构额外发布：最小信号栈字节数（启用向量扩展时按 `1152 + 32 * vlenb` 计算，否则为 `1088`） |
+| `AT_CLKTCK` (17) | 时钟滴答频率（`100`） |
+| `AT_UID` (11) / `AT_EUID` (12) / `AT_GID` (13) / `AT_EGID` (14) / `AT_SECURE` (23) | 本次执行凭据转换后的真实/有效用户与组 ID 及安全执行模式标志 |
+| `AT_RANDOM` (25) / `AT_EXECFN` (31) | 栈上 16 字节随机数据地址与可执行路径字符串地址 |
+| `AT_SYSINFO_EHDR` (33) | 启用内嵌 vDSO ELF 时指向用户空间 vDSO 基址 |
+| `AT_NULL` (0) | 向量终止符 |
+
+---
+
+<details>
+<summary>展开查看：所有权清理分层与双架构验证入口</summary>
+
+### 分层所有权与失败回滚
+
+- `exec` 事务在构建期间临时持有主程序与解释器的 `kernel_elf64_source` 引用；映像构建成功后，MM 通过 VMA 与来源登记表持有独立引用，随后事务释放临时引用。
+- 构建任一步骤失败（格式错误、架构不匹配、地址冲突、栈超限或内存耗尽）均先完整保留调用进程原有 MM；候选空间通过 `cleanup_space()` 逐层释放 MM 与底层页表。
+- `kernel_elf64_source` 的最后一次 `release` 按“打开文件描述 → 解释器路径 → 临时边界 → runs 与程序头数组 → 自身对象”的顺序回收；只有关闭 OFD 时发生的真实 VFS/I/O 清理错误会返回 `CLEANUP_REQUIRED` 保留所有权供外层重试，绝不静默丢弃打开的文件句柄。
+
+### 双架构运行库支持与定向验证入口
+
+- **边界与段特性验证**：`make test-elf-boundary-riscv test-elf-boundary-loongarch TEST_MEMORIES="512M 1G"`、`make test-elf-rwx-riscv`、`make test-elf-tail-riscv`
+- **按需装页、执行事务与根启动**：`make test-demand-page-riscv`、`make test-exec-riscv`、`make test-root-init-riscv`、`make test-riscv`
+- **双架构 GNU/musl 运行库验收**：`make test-glibc-riscv`、`make test-glibc-loongarch`、`make prepare-la-glibc test-glibc-profile-host`、`python3 -B tests/userland/glibc/run.py --arch riscv|loongarch`（覆盖静态、动态、PIE、静态 PIE 与 pthread PIE 五种形态，含 TLS、dlopen TLS 与信号处理；LoongArch 平台细节见 [LoongArch 启动模块](loongarch-boot.md)）
+
+</details>

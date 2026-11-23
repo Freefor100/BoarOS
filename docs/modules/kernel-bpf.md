@@ -1,131 +1,103 @@
-# BPF 网络过滤与系统调用跟踪
+# eBPF 子系统与系统调用跟踪
 
-RV64 与 LoongArch64 共用 `kernel/bpf/` 的对象、校验器、解释器、map 和跟踪实现。
-Linux ABI 以 `references/sources.tsv` 固定的 Linux 为依据；原版工具的版本、归档和
-校验值也由同一清单维护。支持范围围绕 bpftool、libbpf 的 UDP 过滤程序和
-bpftrace 的 `raw_syscalls` 跟踪选择。
+扩展伯克利包过滤器（Extended Berkeley Packet Filter，eBPF）允许用户态程序在经过内核严格静态安全验证后，以沙箱字节码的形式动态注入内核执行，用于高性能网络包过滤、系统调用追踪与可观测性分析。
 
-## 对象、接口与权限
+BoarOS 在 `kernel/bpf/` 中为 RISC-V 64 与 LoongArch 64 实现了一套**双架构完全共享的 eBPF/cBPF 子系统**，包含静态安全校验器、每核独立解释器、五大标准映射结构（Map）、BPF 文件系统（`bpffs`）、基于内核自身调试信息自动生成的 **BPF 类型格式（BPF Type Format，BTF）**，以及面向 `raw_syscalls` 的跟踪点与软件 CPU 时钟计数器，可直接运行未经修改的上游 **`bpftool`、`libbpf` 与 `bpftrace`**。
 
-`bpf(280)` 提供程序/map/BTF/link 的创建或加载、信息查询、ID 枚举和按 ID 打开，
-以及 map 元素与批量操作、freeze、pin/get 和程序测试执行。FD/OFD 持有对象；
-程序持有它引用的 map 和 BTF，socket 或 perf 挂载持有程序，bpffs 节点持有被 pin
-的对象。关闭一个 FD、替换过滤器或 unlink pin 只解除对应的使用者；最后一个
-实际引用消失才从 ID 索引移除并释放。FD 关闭与执行并发时，运行方仍持有引用。
-`/proc/<pid>/fd` 和 `fdinfo` 展示实际 BPF 对象及其信息。
+---
 
-加载和特权对象操作检查 `CAP_BPF`，跟踪检查 `CAP_PERFMON`；对应接口保留
-Linux 的 `CAP_SYS_ADMIN` 兼容授权。TCP socket 过滤遵循固定 Linux 的网络管理
-权限要求。`/proc/sys/kernel/unprivileged_bpf_disabled` 初值为 2；有权调用者可
-在 0 与 2 间切换，写入 1 后不可恢复。sysctl 的写入要求 `CAP_SYS_ADMIN`。
+## 一、源码组织
 
-程序类型支持 `SOCKET_FILTER`、`TRACEPOINT`、`RAW_TRACEPOINT` 和为能力探测
-使用的 `KPROBE` 加载。原始 tracepoint 程序用于 BEGIN/END 测试执行；真实挂载
-由 tracepoint perf 事件完成。没有实现的命令、类型、helper 和挂载返回错误，
-不以空对象或成功返回代替实现。当前没有 JIT、XDP/TC、AF_PACKET、seccomp、
-硬件 PMU 或 kprobe/uprobe/fentry 挂载。
+| 源码路径 | 核心职责 |
+| :--- | :--- |
+| `kernel/bpf/syscall.c`、`objects.c` | `bpf(280)` 系统调用入口、对象引用计数与全局 ID 索引、冻结（Freeze）与权限校验 |
+| `kernel/bpf/verify.c`、`classic.c` | eBPF 路径敏感静态校验器、常量折叠、经典 cBPF DAG 校验与指令翻译 |
+| `kernel/bpf/vm.c`、`runtime.c`、`program.c` | 统一 eBPF 字节码解释器、每核预分配无锁执行工作区、辅助函数（Helper）与 `PROG_TEST_RUN` |
+| `kernel/bpf/maps.c`、`ringbuf.c` | `ARRAY`、`HASH`、`PERCPU_ARRAY`、`PERCPU_HASH` 与零拷贝共享环形缓冲 `RINGBUF` |
+| `kernel/bpf/btf.c`、`tools/embed-btf.py` | BTF v1 解析、类型环路校验、映射/程序绑定以及内核 ELF 的内嵌 `vmlinux` BTF 管线 |
+| `kernel/bpf/trace.c`、`fs/bpffs.c` | `perf_event_open(241)` 跟踪点绑定、软件 CPU 时钟计数器与 `bpffs` 对象持久化挂载 |
 
-## 校验与执行
+---
 
-eBPF 解释器执行标准整数、端序、访存、跳转、本地调用和原子操作；cBPF 先经过
-其控制流和初始化校验，再转换为同一执行器的指令。eBPF 校验器跟踪寄存器和
-栈初始化、标量范围、指针来源与范围、可空 map 指针、上下文访问、helper 参数
-以及 ringbuf 预留的提交/丢弃。控制流合并保留各路径必须满足的条件；有界循环
-需要在加载时证明终止。每帧栈 512 字节，最多 16 个调用帧，验证复杂度上限为
-1,000,000。日志返回实际失败原因及处理计数。只读且已经 freeze 的直接 ARRAY 值可以作为验证期常量读取；仍可由用户或程序改写的 map 不参与常量推导。
+## 二、安全校验器与每核独立解释器
 
-程序发布前完成校验、map 绑定和运行工作区准备。每个 CPU 使用本程序自己的
-工作区；执行期间禁止迁移，不持有对象索引锁或跟踪登记锁运行解释器。
-`PROG_TEST_RUN` 支持 socket filter 的 Ethernet 输入/L3 执行视图及 raw 程序的
-上下文输入；后者必须覆盖程序实际验证过的最大上下文偏移。输出按 Linux 的
-独立字段回写，较短的历史 attr 不要求输入区域也可写。
+### 2.1 静态校验器（`kernel/bpf/verify.c`）
 
-## Map、helper 与共享内存
+所有 eBPF 程序在加载发布前必须通过静态校验器验证，确保字节码绝不会越界读写内核内存、解引用空指针、陷入死循环或泄漏未初始化内核栈数据：
 
-支持 `ARRAY`、`HASH`、`PERCPU_ARRAY`、`PERCPU_HASH` 和 `RINGBUF`。普通和
-per-CPU map 提供查找、更新、删除、枚举及相应批量操作；全局数据与只读数据
-使用普通 ARRAY 和 freeze。hash 预分配存储；不支持的 NO_PREALLOC 等标志明确
-拒绝。per-CPU 用户值按 8 字节对齐，以实际 possible CPU 数量排列。
+- **寄存器与栈精确追踪**：逐指令跟踪全部 11 个通用寄存器与每帧 **512 字节**（`KERNEL_BPF_STACK_SIZE`）栈帧的初始化位图、标量上下界、指针来源与偏移范围、可空 Map 指针判空检查、上下文访问边界以及 RingBuf 预留句柄的配对提交/丢弃。
+- **有界复杂度与调用深度**：支持最多 **16 层**子程序调用帧（`KERNEL_BPF_MAX_FRAMES = 16`，拒绝递归），静态验证指令复杂度上限为 **1,000,000** 条（非特权程序指令数上限 `4,096`）；有界循环必须在加载时证明可终止。
+- **只读冻结数组常量推导**：当单元素 `ARRAY` Map 具有 `BPF_F_RDONLY_PROG` 标志且已通过 `BPF_MAP_FREEZE` 冻结（且当前无任何用户态可写映射）时，校验器在加载期直接将其读取结果折叠为精确常量标量，满足现代 `libbpf` 全局只读数据段（`.rodata`）的校验需求。
+- **经典 cBPF 兼容（`classic.c`）**：传统套接字过滤程序（最多 `4,096` 条指令）先通过有限前向无环图（DAG）与初始化校验，再通过 `kernel_bpf_classic_convert()` 转换为同一套 eBPF 解释器字节码执行。
 
-程序运行借用 map value；hash 删除或替换将仍被借用的旧值留到执行结束再回收。
-lookup-and-delete 在同一个 map 临界区取得值并删除。用户 FD 权限与 map 的
-用户/程序访问限制分别检查；WRITEONLY_PROG 允许查找后写值，禁止读值。
-批量修改先写出 count=0，再逐项导入和修改；后续复制故障保留实际完成前缀。
+### 2.2 每核预分配工作区执行
 
-helper 包括 map 操作、单调/启动时间、PID/TID、UID/GID、comm、CPU、包读取和
-ringbuf reserve/submit/discard/output/query。内存探测使用不等待的 nofault 访问，
-不为探测触发文件缺页 I/O。ringbuf 采用 Linux 的 consumer/producer 共享页布局
-和两次连续映射的数据窗口；记录发布与通知遵循 BUSY/DISCARD 状态，poll/epoll
-使用实际 ringbuf 等待队列。ARRAY 全局值也支持 mmap。
+程序加载校验通过后即完成所有 Map 引用绑定，并为每个处理器核预分配独立的执行工作区（`struct execution`，内含虚拟机寄存器上下文、最多 64 项 RingBuf 预留表与运行区）。运行时在禁止抢占上下文中直接调用 `kernel_bpf_vm_execute()`，不持有对象索引锁或跟踪登记锁，保证多核并发执行互不干扰且低延迟。
 
-map 存储拥有真实物理页；用户映射通过 OFD 持有 map，并直接引用这些页。
-mmap、freeze、fork、mprotect、munmap 和远程 TLB 回收的规则见
-[MM 的 BPF 共享映射](kernel-mm.md#bpf-对象共享映射)。
+---
 
-## Socket 与 syscall 事件
+## 三、数据映射（Map）、共享环形缓冲与 `bpffs`
 
-`SO_ATTACH_FILTER`、`SO_GET_FILTER`、`SO_DETACH_FILTER`、`SO_LOCK_FILTER`
-和 `SO_ATTACH_BPF` 使用 socket 自身的程序引用。返回 0 丢弃，正数保留相应长度。
-UDP/TCP 在协议状态变化前执行，保留协议处理所需的 UDP/TCP 头；包读取直接
-跨 pbuf 片段，不建立完整包副本。TCP accept 继承过滤器及锁定状态；UNIX 的
-DGRAM/SEQPACKET 在接收队列接纳前过滤，STREAM 依 Linux 语义不以该过滤器
-改变接收结果。具体接收位置和回调所有权见[网络模块](kernel-network.md)。
+```mermaid
+flowchart LR
+    User["用户态工具（bpftool / libbpf / bpftrace）"]
+    Syscall["bpf(280) 系统调用 / mmap 映射 / bpffs 路径"]
+    Maps["五大 Map 结构<br/>ARRAY · HASH · PERCPU_ARRAY · PERCPU_HASH · RINGBUF"]
+    Prog["已校验 eBPF 程序（每核独立执行）<br/>通过 Helper 读写 Map 与提交 RingBuf 记录"]
+    Hooks["内核挂载点<br/>Socket 过滤（TCP/UDP/UNIX/PACKET）· raw_syscalls 跟踪点"]
 
-tracefs 提供 `events/raw_syscalls/sys_enter`、`sys_exit` 的真实 ID 与 format。
-架构异常边界调用共同跟踪入口，覆盖快速查询、普通调用、等待、clone/exec、
-未知 syscall 和重启路径。exit 事件在信号处理和 restart 转换前记录返回值，
-保留可观察的 `-ERESTART*`；没有返回的退出调用不伪造 exit 事件。
-
-`perf_event_open(241)` 支持这两个 tracepoint 的标准 libbpf 绑定配置、启停和
-绑定 ioctl，以及 perf-event BPF link。按固定 Linux，挂在同一 tracepoint 上的
-BPF 程序都执行，perf 的 PID/CPU/启停条件控制该事件的计数；程序用自己的
-PID/TID 条件筛选跟踪目标。现代 link 独立持有 perf/program，legacy 绑定在
-perf FD 最后关闭时解除。运行方在登记锁内取得引用，锁外执行并通知等待者。
-
-sysfs 提供真实 CPU possible/online 和 `/sys/kernel/btf/vmlinux`。内核构建从本次
-BoarOS ELF 的 DWARF 生成 BTF，嵌入最终 ELF，再以只读文件页提供给工具读取
-和 mmap；没有复制参考 Linux 的结构或伪造内核类型。
-
-## 线程软件时钟
-
-`perf_event_open(241)` 可用 `PERF_TYPE_SOFTWARE` 和 `PERF_COUNT_SW_CPU_CLOCK`
-创建单个线程的计数器。`pid=0` 选中调用线程，正值从调用者可见的线程编号空间
-选择目标。调用时传入 `cpu=-1` 和 `group_fd=-1`。非特权调用者须设置
-`exclude_kernel` 并通过真实凭据访问检查。固定 Linux 接受 `exclude_kernel`
-和 `exclude_hv`，计数仍累计线程被调度期间的完整时钟差。
-
-内核在实际运行权交接时记录线程调度区间，区间包括执行期间处理中断的时间。
-`read` 返回累计纳秒数，可通过 `PERF_FORMAT_ID` 附加事件标识。启停和清零只修改
-当前计数器的起点与累计值。计数器用文件引用持有目标身份，跨核迁移时累计值随
-目标线程转移。线程退出并归还运行权后，保留的计数器仍可读取最终值。该接口
-当前提供独立的线程计数，采样、每处理器计数和事件组留待后续。
-
-## 构建与检查
-
-原版工具及其运行库构建在被忽略的缓存中，默认并行度为 2，客户机内存为 1 GiB。
-`build.py --help` 列出组件选择；Linux 对照内核由同目录 `linux.py` 构建。
-
-默认内核构建使用 `tools/build-pahole.py` 从随仓库保留的固定源码离线编译宿主 pahole，
-生成实际内核 ELF 的 BTF；RV 与 LA 共用 `build/tools/pahole/`。脚本校验归档、使用宿主
-编译器并串行保护共享缓存，成功后才发布工具及身份记录；已有且身份一致的工具直接复用。
-构建过程将 libdw、libelf、libbpf 静态链接进工具。宿主需提供 C
-编译器、make、CMake、Python、binutils、pkg-config 及 zlib 开发库。显式设置
-`PAHOLE=/path/to/pahole` 可改用已有工具。BTF 转换失败仍终止构建，不生成占位数据。
-`tests/host/bpf-btf.sh path/to/vmlinux.btf ...` 可将真实生成的数据交给内核解析器检查，
-同时检查引用与分配归还；省略文件时运行原有格式与损坏反例。
-
-```sh
-python3 tests/workloads/bpf/build.py --help
-python3 tests/workloads/bpf/linux.py --help
-make test-bpf-host
-python3 tests/workloads/bpf/abi.py --arch riscv --cpus 1 2 8
-python3 tests/workloads/bpf/abi.py --arch loongarch --cpus 1 2 8
-python3 tests/workloads/bpf/baseline.py --arch riscv --platform boaros --mode full --cpus 2 --kernel build/riscv-user-smp8/kernel-rv
-python3 tests/workloads/bpf/baseline.py --arch loongarch --platform boaros --mode full --cpus 2 --kernel build/loongarch-smp8/kernel-la
+    User <--> Syscall
+    Syscall <--> Maps
+    Hooks --> Prog
+    Prog <--> Maps
+    Maps -. "RingBuf / ARRAY 共享物理页零拷贝" .-> User
 ```
 
-同 ELF 用例检查 syscall/setsockopt/perf 参数、复制故障、映射权限与清理，以及
-真实 UDP/TCP/UNIX 行为。原版工具用例检查 bpftool 的 ELF/map/BTF/bpffs，
-libbpf map 更新改变 UDP 收包规则，并让原版 bpftrace 在客体中编译脚本，统计
-受控目标的 64 次 syscall、按线程配对耗时和 64 条 ringbuf 输出，再检查正常退出
-及 SIGINT 的 END/清理。Linux 对照和 BoarOS 使用相同的工具、ELF 与运行库。
+- **支持的 Map 类型**：
+  - `ARRAY`（1）与 `PERCPU_ARRAY`（5）：连续索引数组，支持 `BPF_F_MMAPABLE` 连续物理页映射（供全局变量/只读数据段共享）与 `BPF_MAP_FREEZE` 冻结；
+  - `HASH`（2）与 `PERCPU_HASH`（6）：预分配哈希表，支持原子 `LOOKUP_AND_DELETE`；并发删除或替换时将仍被运行中程序借用的旧值延迟至执行结束后回收；
+  - `RINGBUF`（27）：采用 Linux 标准共享页布局（1 页消费者指针 + 1 页生产者指针 + 连续两次映射的数据页环），通过 `BUSY`/`DISCARD` 头部状态原子发布记录，并接入 `poll`/`epoll` 等待队列，实现内核向用户态的高吞吐零拷贝事件流传输。
+- **批量操作与持久化挂载**：普通与 Per-CPU Map 均支持 `*_BATCH` 批量读写/删除；通过 `bpffs`（魔数 `0xcafe4a11`）的 `BPF_OBJ_PIN` / `BPF_OBJ_GET`，可将程序、Map、BTF 与 Link 持久化挂载到文件系统路径，解除对原进程文件描述符的依赖。
+
+---
+
+## 四、真实内核 BTF 管线、套接字过滤与系统调用跟踪
+
+### 4.1 由 BoarOS 自身构建自动生成的 BTF
+
+不同于硬编码伪造一份 Linux 结构体的做法，BoarOS 在构建流程中真正打通了完整的 BTF 工具链：
+1. 编译内核生成带完整 DWARF 调试信息的 ELF；
+2. 由离线构建或系统安装的 `pahole` 从本次编译出的 BoarOS 内核 ELF 直接提取生成真实二进制 BTF；
+3. `tools/embed-btf.py` 将其嵌入最终内核段 `__boaros_btf_start..__boaros_btf_end`；
+4. 运行时通过 `sysfs` 以只读共享页暴露于 `/sys/kernel/btf/vmlinux`，同时 `BPF_BTF_LOAD`（上限 16 MiB）支持校验加载用户态 BTF（检查 19 类类型定义、值依赖图无环性与位域边界）并绑定至 Map 和程序。
+
+### 4.2 套接字过滤、跟踪点与线程软件时钟
+
+- **套接字过滤（`BPF_PROG_TYPE_SOCKET_FILTER`）**：支持 `SO_ATTACH_FILTER` / `SO_ATTACH_BPF` / `SO_LOCK_FILTER`（TCP `accept` 自动继承过滤器与锁定状态）。UDP/TCP 在协议状态机变化前执行，直接跨 `pbuf` 链读取报文载荷而无需拼装完整副本；同时支持 `BPF_PROG_TEST_RUN` 离线测试以太网/三层输入。
+- **`raw_syscalls` 系统调用跟踪点**：`tracefs` 暴露真实的 `events/raw_syscalls/sys_enter` 与 `sys_exit` 事件 ID 和字段格式。用户通过 `perf_event_open(241)`（`PERF_TYPE_TRACEPOINT`）创建事件，再用 `PERF_EVENT_IOC_SET_BPF` 或现代 `BPF_LINK_CREATE` 挂载最多 64 个 eBPF 程序；钩子分别位于公共分派入口 `kernel_bpf_trace_enter()` 与架构返回边界 `kernel_bpf_trace_exit()`（在信号处理前记录真实返回值，包括 `-ERESTART*`）。
+- **单线程软件 CPU 时钟计数器**：`perf_event_open(241)` 同时支持 `PERF_TYPE_SOFTWARE` + `PERF_COUNT_SW_CPU_CLOCK`（`cpu = -1`），利用调度器实际运行权交接记录的线程累计调度纳秒数（`kernel_task_scheduled_ns`），支持启停、清零、`PERF_FORMAT_ID` 读取及跨核迁移跟随，线程退出后仍可读出最终累计值。
+
+---
+
+<details>
+<summary>展开查看：权限控制、支持范围边界与定向验证入口</summary>
+
+### 权限、辅助函数与当前边界
+
+| 项目 | 当前实现规则 |
+| :--- | :--- |
+| **特权与开关** | 加载特权程序与 Map 检查 `CAP_BPF`，跟踪检查 `CAP_PERFMON`（同时兼容 `CAP_SYS_ADMIN`）；`/proc/sys/kernel/unprivileged_bpf_disabled` 默认值 `2`，特权用户可在 `0`/`2` 间切换，置 `1` 后不可逆关闭。 |
+| **支持的程序类型** | `SOCKET_FILTER`、`TRACEPOINT`、`RAW_TRACEPOINT` 以及供工具能力探测使用的 `KPROBE` 加载；尚未接入即时编译（JIT）、`XDP`/`TC`、硬件性能监控单元（PMU）以及真实 `kprobe`/`uprobe`/`fentry` 挂载。 |
+| **内置 Helper 集合** | Map 查找/更新/删除、单调/启动时间、PID/TID、UID/GID、`comm`、当前 CPU、跨片段报文读取、无缺页内存探测（`nofault`，不触发磁盘 I/O）以及 RingBuf 预留/提交/丢弃/输出/查询。 |
+
+### 定向验证入口
+
+- **宿主校验器、Map、BTF 与执行器验证**：`make test-bpf-host`、`tests/host/bpf-btf.sh`（可直接检验真实生成的 `vmlinux.btf` 及损坏反例）。
+- **原版上游工具链验证（`bpftool` / `libbpf` / `bpftrace`）**：
+  ```sh
+  python3 tests/workloads/bpf/build.py --help
+  python3 tests/workloads/bpf/linux.py --help
+  ```
+- **内核 BTF 离线工具链**：默认由 `tools/build-pahole.py` 静态链接 `libdw`/`libelf`/`libbpf` 构建并缓存于 `build/tools/pahole/`；已有系统 `pahole` 时可传 `PAHOLE=pahole`。
+
+</details>

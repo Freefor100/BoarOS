@@ -907,6 +907,9 @@ static __attribute__((noinline)) enum kernel_files_status socket_prepare_message
         destination=&address;
     }
     if(kernel_open_file_flags(*file)&LINUX_SOCK_NONBLOCK)*flags|=KERNEL_SOCKET_MSG_DONTWAIT;
+#if BOAROS_USER_SMP
+    if(batch>1 && kernel_socket_is_udp(socket))*flags|=KERNEL_SOCKET_IO_MORE;
+#endif
     *result=kernel_socket_packet_prepare(&phase->write,file,snapshot->total,*flags,destination,0,&call->message);
     return KERNEL_FILES_STATUS_OK;
 }
@@ -923,6 +926,10 @@ static __attribute__((noinline)) enum kernel_syscall_status socket_send_message_
         batch,&snapshot,&phase,result);
     if(requested)*requested=snapshot.total;
     if(!status && !*result) {
+#if BOAROS_USER_SMP
+        if (batch && kernel_socket_is_udp(phase.write.socket))
+            phase.write.udp_batch_interface=&call->udp_batch_interface;
+#endif
         struct kernel_uaccess_iov_cursor cursor={snapshot.view,snapshot.count,0,0};
         *result=kernel_socket_packet_write(&phase.write,mm,&cursor,NULL,NULL,&call->message);
     }
@@ -1145,8 +1152,12 @@ enum kernel_syscall_status syscall_handle_socket_mmessage(
     while (completed<count) {
         uint64_t requested=0;
         uint64_t entry=request->arguments[1]+(uint64_t)completed*sizeof(struct linux_mmsghdr);
+        int batch=1;
+#if BOAROS_USER_SMP
+        if (writing && completed+1<count) batch=2;
+#endif
         if (socket_message_pinned(files,mm,&file,entry,
-                writing?flags:(flags&~UINT32_C(0x10000)),writing,1,&requested,&result,&call)!=KERNEL_SYSCALL_STATUS_OK) {
+                writing?flags:(flags&~UINT32_C(0x10000)),writing,batch,&requested,&result,&call)!=KERNEL_SYSCALL_STATUS_OK) {
             kernel_socket_call_end(&call);
             release_socket(&file);
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;

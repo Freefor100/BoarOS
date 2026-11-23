@@ -1,51 +1,130 @@
-# RISC-V 启动模块
+# RISC-V 64 引导、高半区切换与系统启动
 
-本文描述当前代码的稳定事实。异常入口与返回契约见 [RISC-V Trap 模块](riscv-trap.md)，启动内存边界见 [DTB 与启动内存布局模块](dtb-memory.md)，分页切换见 [RISC-V Sv39 分页模块](riscv-sv39.md)，启动后的 timer/idle 契约见 [RISC-V Timer 与内核 Tick 模块](riscv-timer.md)。
+BoarOS 在 **RISC-V 64（RV64）** 架构上运行于**监督者模式（Supervisor Mode，S-mode）**，支持 **1～8 核对称多处理（Symmetric Multiprocessing，SMP）**、**Sv39 三级分页（4 KiB 基页与 2 MiB 大页）**、高半区内核地址空间以及完整的设备发现与根文件系统启动流程。异常入口与返回契约见 [RISC-V Trap 模块](riscv-trap.md)，设备树与启动内存布局见 [DTB 与启动内存布局](dtb-memory.md)，分页实现见 [RISC-V Sv39 分页](riscv-sv39.md)，定时与调度节拍见 [RISC-V 定时器与内核节拍](riscv-timer.md)。
 
-## 范围与入口
+---
 
-`make all` 使用 RISC-V bare-metal GCC 生成根目录 ELF `kernel-rv`。QEMU `virt` 通过 `-kernel` 装载 ELF，默认 OpenSBI 初始化机器后以 S-mode 跳到 `_start`。
+## 一、源码组织
 
-| 文件 | 当前职责 |
-|---|---|
-| `Makefile` | 编译、链接以及运行、测试、调试入口 |
-| `arch/riscv/linker.ld` | ELF 入口、加载段、地址布局和启动栈 |
-| `arch/riscv/boot.S` | 建立最小 C 运行环境、初始化 trap CSR、调用 `kernel_main` 并完成高半区执行上下文切换 |
-| `arch/riscv/secondary.S`、`smp.c` | 独立两核配置的 HSM 入口、CPU 本地初始化、IPI 与 RFENCE；不重复清 BSS 或初始化服务 |
-| `kernel/dtb.c`、`kernel/boot_memory.c` | 读取 DTB 内存/设备事实并生成可用物理区间 |
-| `kernel/physical_page.c` | 对齐可用区间并建立单页物理分配器 |
-| `arch/riscv/direct_map.c` | 校验 direct-map 范围并转换物理/虚拟地址 |
-| `arch/riscv/sv39.c` | 建立 2 MiB/4 KiB 叶子并启用 Sv39 |
-| `kernel/main.c` | 建立启动内存布局、物理页分配器和启动地址空间，协调 root、PLIC、timer 与可调度 cleanup task |
-| `arch/riscv/root_boot.c` | 从 DTB 发现的根块设备挂载 ext4、装载 `/init` 并收口 PID 1 生命周期 |
-| `arch/riscv/virt_uart.c` | QEMU `virt` NS16550A 轮询输出，以及最终页表生效后的高半区 MMIO 基址切换 |
-| `arch/riscv/sbi.c` | 通过 SBI Base/TIME/SRST 探测扩展、设置 timer、请求关机或冷重启 |
+| 源码路径 | 核心职责 |
+| :--- | :--- |
+| `arch/riscv/linker.ld` | 定义内核物理装载基址、高半区虚拟基址、段权限对齐、缓存行隔离的 `.bss` 布局与 16 KiB 启动栈 |
+| `arch/riscv/boot.S` | 裸机入口 `_start`、最小 C 运行环境建立、陷入入口安装与高半区地址重定位 `riscv_relocate_to_high` |
+| `arch/riscv/secondary.S`、`smp.c` | 多核配置下的从核启动入口、核本地初始化、核间中断（IPI）与跨核 TLB 同步 |
+| `arch/riscv/direct_map.c` | 物理内存直接映射区与内核镜像区之间的物理/虚拟地址换算和边界校验 |
+| `arch/riscv/sv39.c` | 构建 Sv39 三级页表（4 KiB/2 MiB 叶子）并写入 `satp` 寄存器切换地址空间 |
+| `arch/riscv/sbi.c` | 封装监督者二进制接口（Supervisor Binary Interface，SBI）的 Base、TIME、HSM、IPI、RFENCE 与 SRST 调用 |
+| `arch/riscv/virt_uart.c`、`virt_rtc.c` | QEMU `virt` 平台的 NS16550A 早期轮询串口、高半区映射切换与 Goldfish 实时时钟（RTC）读取 |
+| `kernel/main.c` | 串联设备树解析、物理页分配器初始化、两阶段页表切换、调度器、外设中断、根启动、从核上线与时钟启动 |
+| `arch/riscv/root_boot.c` | 扫描 VirtIO 块设备、挂载 ext4 根文件系统、装载并启动 PID 1 及协调最终关机回收 |
 
-## 入口契约与不变量
+---
 
-- OpenSBI 进入 `_start` 时，`a0` 是 boot hart ID，`a1` 是 DTB 的 guest 物理地址。入口立即保存二者，建立环境后再按 C ABI 传给 `kernel_main`。
-- 链接脚本把内核 VMA 放在 `0xffffffff80000000`，同时把第一个 `PT_LOAD` 的物理地址和 ELF 入口设为 `0x80200000`。该物理地址位于 QEMU `virt` 从 `0x80000000` 开始的 RAM 中；分页关闭时，`-mcmodel=medany` 生成的 PC 相对代码在低物理装载地址执行。
-- `_start` 不继承固件栈。它初始化 `gp`、关闭 S-mode 中断、将 `__bss_start..__bss_end` 清零，再使用 BSS 末尾 16 KiB、16 字节对齐的单 hart 启动栈。该栈承载启动、idle 与测试 harness 主流程；4 KiB 时代在深文件路径（openat 经 fs context 解析进入 lwext4）确定性地溢出并破坏相邻 `.bss`，症状远离成因且随镜像布局移动，因此按内核路径深度预算放大。
-- 启动栈可用后，`_start` 将 `sscratch` 清零并把 `riscv_trap_entry` 写入 Direct-mode `stvec`。入口可以在当前内核栈保存完整整数 Frame 并执行 `sret`；生产 dispatcher 正式处理 timer interrupt，其他未处理 trap 仍进入致命诊断。
-- DTB 地址由 OpenSBI 在运行时通过 `a1` 传入，内核不假设固定值，也不要求它随 RAM 大小变化。`kernel_main` 读取第一段 RAM 和静态保留区，再加入 `[__kernel_start, __kernel_end)` 与 DTB 自身范围；只有形成非空可用区间后才报告启动布局。
-- 启动布局成功后，`kernel_main` 以 RISC-V 构建期固定的 4 KiB 页粒度初始化物理页分配器；不足一页的区间边缘不会进入分配器。
-- `kernel_main` 在 Bare 状态构建两张页表。过渡页表从内核镜像内 5 个静态 4 KiB 页取得页表页，把覆盖镜像的 2 MiB 对齐物理包络同时映射到低地址和高半区，并以物理地址精确映射 QEMU UART；两组镜像叶子只在中断关闭的切换窗口内临时使用 RWX。最终页表从正式物理页分配器取得页表页，只建立严格权限的高半区内核、固定偏移且全局 NX 的 RAM direct map，以及 supervisor-only UART 高半区别名。
-- 第一次写入 `satp.MODE=8` 后，过渡页表保证低地址返回路径和当前栈仍可访问；`riscv_relocate_to_high` 再把 `ra`、`sp`、`stvec` 加上固定偏移，跳到高地址代码并重新建立高地址 `gp`。切换前的 `kernel_main` 与不可内联的 `kernel_main_high` 分属两个 C 调用帧，后者只从静态启动状态重新取得 DTB 解析结果、内存布局和启动参数；切换前生成的局部指针和保留寄存器值不跨最终页表切换。高半区 continuation 第二次切换 `satp` 到最终页表，此后低地址映射不可访问；它立即把 UART 驱动切到高半区别名，再绑定高地址物理页访问函数并修正最终页表对象的 allocator 指针，物理页回收节点由此只通过 direct map 访问。
-- 过渡页表页属于内核静态镜像，不进入正式物理页分配器；正常启动日志中的最终页表数必须等于正式物理页总数与可用页数之差。
-- 最终页表和 direct-map 访问路径验证完成前保持中断关闭。Scheduler 发布后先尝试从 VirtIO MMIO legacy 或 modern virtio-blk/ext4 建立 PID 1，再从 DTB timebase 启动 SBI timer，先设置未来 deadline 后开启 STIE 和 SIE。无根设备时成功路径永久执行 `wfi`；有根设备时 PID 1 被完整 reaper 后卸载根并通过 SBI 关机。
-- UART 物理基址 `0x10000000` 是 QEMU `virt` 的 guest MMIO 地址，不是 RAM 或宿主 I/O 端口。过渡表按该低地址访问；最终 `satp` 生效后驱动切到 `0xffffffe000000000` 高半区别名。发送路径轮询 LSR bit 5，再向 THR 写一个字节。
-- 关机与冷重启使用 SBI System Reset 扩展：`a7=0x53525354`、`a6=0`，`a0` 分别为 shutdown(0) 或 cold reboot(1)，`a1=0`。调用若返回，输出真实 SBI error 并关中断停在 `wfi`。HALT 直接关中断停在 `wfi`，不请求断电。用户请求与全体 owner 回收顺序见[调度与退出](kernel-scheduler.md)。
+## 二、裸机入口与链接布局
 
-## 当前限制
+使用 `make all` 编译后，根目录生成可执行与可链接格式（Executable and Linkable Format，ELF）镜像 `kernel-rv`。在 QEMU `virt` 平台上，OpenSBI 固件完成机器模式（Machine Mode，M-mode）初始化后，以 S-mode 跳转至入口符号 `_start`，此时寄存器 `a0` 存放启动硬件线程号（Boot Hart ID），`a1` 存放扁平设备树（Flattened Device Tree，DTB）的客户机物理地址。
 
-默认启动为单 hart。独立[RV 受控两核配置](riscv-smp.md)通过 HSM 进入 secondary 物理入口，
-仅 boot hart 清 BSS、建立 allocator、页表、设备和全局时钟；secondary 使用独立静态栈与 CPU 记录。
-用户任务与现有文件、设备、网络和压力服务仍在 CPU0，尚无共享用户 MM 的跨核执行闭环。
-生产 ELF 支持 source-backed `ET_EXEC`/`ET_DYN`/非递归 `PT_INTERP`，已验证静态/动态 musl、DSO/TLS 与 glibc 五形态。
-QEMU ELF 的物理装载地址仍固定为 `0x80200000`；VisionFive 2 的装载地址、固件入口和存储后端须由板级适配提供，
-不能直接沿用平台常量。完整 Linux 文件及进程 ABI、实板和 LA 多核不在当前验收范围；LA 单核见[LA 模块](loongarch-boot.md)。
+### 2.1 段布局与内存隔离（`arch/riscv/linker.ld`）
 
-## 验证入口
+链接脚本将内核的虚拟基址（VMA）定在 `0xffffffff80000000`，同时将首个加载段（`PT_LOAD`）的物理装载地址（LMA）与 ELF 入口点定在 `0x80200000`（位于 QEMU `virt` 自 `0x80000000` 起始的物理内存内）。开启分页前，由于编译选项采用 `-mcmodel=medany`，编译器生成基于程序计数器（PC）相对寻址的指令，因此代码可以直接在低物理地址正确执行。
+
+内核镜像划分为三个独立权限的 `PT_LOAD` 段，且段间均按 4 KiB 页对齐，以便启用分页后赋予严格的最小权限：
+- `.text`（读 + 执行，R+X）：包含放置在最前端的 `.text.boot` 启动代码与常规内核代码；
+- `.rodata`（只读，R）：只读数据与常量表；
+- `.data` 与 `.bss`（读 + 写，R+W）：可写全局数据与零初始化区。`.bss` 开头将 `.bss.scheduler.cpu`、`.bss.scheduler.wait` 与 `.bss.scheduler.state` 按 64 字节缓存行（Cache Line）对齐分隔，避免多核并发访问热状态时产生伪共享（False Sharing）；`.bss` 末尾预留 **16 KiB**、16 字节对齐的静态启动栈（`__boot_stack_bottom` 到 `__boot_stack_top`）。
+
+### 2.2 最小运行环境建立（`arch/riscv/boot.S`）
+
+`_start` 不依赖也不继承固件留下的栈空间，依次完成以下初始化：
+1. 保存 `a0`（boot hart ID）与 `a1`（DTB 物理地址）至被调用者保存寄存器 `s0`、`s1`，将线程指针 `tp` 清零，并禁用链接器松弛（`.option norelax`）装载全局指针 `gp`（`__global_pointer$`）；
+2. 清零中断使能寄存器 `sie` 并清除 `sstatus.SIE`（bit 1），确保早期引导全程关中断；同时写 `scounteren = 2`，仅向用户态开放 `time` 计数器供虚拟动态共享对象（Virtual Dynamic Shared Object，vDSO）无陷入读取时间，不暴露 `cycle` 与 `instret`；
+3. 按 8 字节步长清零 `[__bss_start, __bss_end)`，然后将栈指针 `sp` 指向 16 字节对齐的 `__boot_stack_top`；
+4. 清零 `sscratch`（内核态运行期间恒为 0，用于陷入入口区分用户态与内核态），并将 `riscv_trap_entry` 写入直接模式（Direct Mode）的 `stvec`；
+5. 先调用 `kernel_cpu_boot_initialize(hart_id)` 初始化启动核的每核控制块，随后以 `(hart_id, dtb)` 参数进入 `kernel_main`。
+
+---
+
+## 三、两阶段分页与高半区地址空间
+
+开启分页后，正在执行的指令流会瞬间从物理地址切换到虚拟地址。为了平稳完成从物理低地址到高半区虚拟地址的过渡，BoarOS 在关闭分页（Bare 模式）阶段构建**两张页表**，通过一次“过渡切换 + 高半区重定位 + 最终切换”的两步跳转彻底告别低地址恒等映射。
+
+```mermaid
+flowchart TD
+    Boot["OpenSBI 进入 _start (物理地址 0x80200000)"]
+    Env["清零 .bss · 建立 16 KiB 栈 · 设 stvec/scounteren"]
+    Prep["kernel_main: 解析 DTB · 构建启动内存布局 · 初始化物理页分配器"]
+    Tables["Bare 模式下构建过渡页表 (5 个静态页) 与最终内核页表"]
+    Trans["激活过渡页表 (satp.MODE=8): 低地址恒等映射与高半区映射并存"]
+    Reloc["riscv_relocate_to_high: 偏移 ra/sp/tp/stvec · 跳转高半区并重载 gp"]
+    High["kernel_main_high (noinline): 激活最终内核页表 · 废弃低地址映射"]
+    Subsys["切高半区 UART · 切换伙伴分配器 · 探测指令集扩展 · 启调度/PLIC/根启动/SMP/时钟"]
+
+    Boot --> Env --> Prep --> Tables --> Trans --> Reloc --> High --> Subsys
+```
+
+### 3.1 过渡页表与高半区重定位
+
+1. **过渡页表（`build_transition_page_table`）**：页表页取自内核镜像内的 5 个静态 4 KiB 页（`transition_table_pages`），不占用正式物理页分配器。它将覆盖整个内核镜像的 2 MiB 对齐物理包络同时映射到**低地址恒等区间**与**高半区区间**（仅在关中断的切换窗口内临时使用 RWX 权限），并恒等映射 QEMU 串口物理地址 `0x10000000`。
+2. **最终内核页表（`build_kernel_page_table`）**：页表页取自正式物理页分配器，不再包含任何低地址用户区间映射，而是按最小权限原则建立完整的高半区布局：
+
+| 高半区虚拟地址区间 | 大小 / 基址宏 | 权限 | 用途说明 |
+| :--- | :--- | :--- | :--- |
+| `0xffffffc000000000` 起 | `128 GiB`（`RISCV_DIRECT_MAP_BASE`） | 全局不可执行（NX）；镜像 `.text`/`.rodata` 对应区为 R，其余 RAM 为 RW | 物理内存线性直接映射区，物理地址 `PA` 对应虚拟地址 `PA + 0xffffffc000000000` |
+| `0xffffffe000000000` 起 | 至 `0xffffffff80000000`（`RISCV_KERNEL_MMIO_BASE`） | RW（仅监督者模式） | 外设内存映射 I/O（MMIO）高半区别名区；早期 UART 位于 `0xffffffe010000000`，Goldfish RTC 位于 `0xffffffe000101000`，同时映射 DTB 发现的 UART、PLIC 与全部 VirtIO MMIO 区域 |
+| `0xffffffff80000000` 起 | 内核镜像长度（`RISCV_KERNEL_VIRTUAL_BASE`） | `.text` 为 RX，`.rodata` 为 R，`.data`/`.bss` 为 RW | 高半区内核代码与静态数据段 |
+| `0xffffffffc0000000` 起 | `128 MiB`（`RISCV_KERNEL_STACK_WINDOW_BASE`） | 预留空顶层页表子树，运行时按需插入 RW 叶子 | 内核任务栈窗口，每个槽位 `0x3000`（12 KiB）= 4 KiB 未映射保护页（Guard Page） + 8 KiB 内核栈；在任何用户进程复制内核根页表项前预留，保证所有地址空间共享同一内核栈窗口 |
+
+3. **地址切换与栈帧隔离**：`kernel_main` 先激活过渡页表，随即调用 `riscv_relocate_to_high(offset)` 将 `ra`、`sp`、`tp` 以及 `stvec` 统一加上高半区偏移量 `KERNEL_VIRTUAL_BASE - physical_start`，跳往高半区地址并重新装载高半区 `gp`。之后调用标记为 `__attribute__((noinline, noreturn))` 的 `kernel_main_high()`，确保切换前栈帧中可能残留的低地址局部指针不会跨入最终页表阶段。`kernel_main_high()` 激活最终页表后，低地址映射立即失效，随即调用 `virt_uart_use_kernel_mapping()` 将串口基址切换至高半区 `0xffffffe010000000`。
+
+---
+
+## 四、高半区子系统编排与启动完成
+
+进入 `kernel_main_high()` 并激活最终页表后，启动核在关中断状态下按严格的依赖顺序完成剩余初始化：
+
+1. **每核状态与硬件能力探测**：
+   - `kernel_cpu_boot_rebind()` 重新绑定高半区每核指针；
+   - `riscv_vector_boot(boot_features)` 检测标准 RVV 1.0 向量长度 `VLENB`，`riscv_hwprobe_initialize()` 记录硬件厂商/架构 ID 与指令集扩展；
+   - 根据 DTB 特征交集发布 `riscv_mmu_svvptc`（支持 `Svvptc` 免首次装页刷 TLB）与 `riscv_mmu_cboz64`（64 字节 `Zicboz` 零页指令）。
+2. **伙伴物理页分配器与直接映射验证**：
+   - 将物理页分配器的页访问回调绑定为 `direct_map_page_access`，随后调用 `physical_page_allocator_finalize()` 从引导期简单链表切换为正式伙伴分配器（Buddy Allocator）；
+   - 更新 `kernel_page_table.allocator` 指针，并通过 `verify_direct_map_runtime()` 实测一次物理页分配、直接映射读写、释放与复用，确保页表回收与堆管理全部走高半区直接映射路径。
+3. **调度器、中断控制器与根文件系统启动**：
+   - 调用 `kernel_scheduler_init()` 将当前启动上下文注册为 CPU0 空闲任务（Idle Task）；若探测到 VirtIO 块设备，提前创建专用的可调度存储清理线程 `storage_cleanup_worker`；
+   - 根据 DTB 发现的基址与上下文初始化平台级中断控制器（Platform-Level Interrupt Controller，PLIC）；
+   - 调用 `riscv_root_boot_start_with_irq()` 尝试挂载 ext4 根盘并建立 PID 1（详见 [RISC-V 根文件系统启动](riscv-root-boot.md)）。若存在根盘，则依次启动页缓存执行线程、块设备 PLIC 中断、可选的 VirtIO 随机数发生器（RNG）与 VirtIO 网卡。
+4. **时间子系统、浮点初态与多核上线**：
+   - 采样 Goldfish RTC 墙钟并调用 `kernel_time_init()` 初始化内核时间系统；
+   - **收敛 `sstatus.FS` 状态**：OpenSBI 移交控制权时可能遗留 `sstatus.FS = Dirty`，内核在此主动将其置为 `Clean`，防止纯内核执行在上下文切换时触发无意义的浮点寄存器保存；
+   - 若启用了多核编译选项（`BOAROS_MAX_CPUS > 1`），调用 `riscv_smp_start()` 通过 SBI 硬件线程状态管理扩展（Hart State Management，HSM）依次唤醒从核，并在从核全部上线后发布网络 TCP 所有者与日志后台线程（详见 [RISC-V 多核启动与同步](riscv-smp.md)）。
+5. **启动定时器与进入空闲循环**：
+   - 调用 `riscv_timer_start()` 设置首个未来时钟期限，随后依次开启 `sie.STIE` 与全局 `sstatus.SIE`，正式开放中断与多任务抢占；
+   - 启动核退化为空闲循环：在无根盘模式下原地回收已退出的内核测试线程，每次循环主动让出调度（`kernel_scheduler_yield_current`）后开中断执行 `wfi` 休眠等待下一次中断。
+
+---
+
+## 五、电源与系统复位控制
+
+`arch/riscv/sbi.c` 通过 SBI 系统复位扩展（System Reset Extension，SRST，扩展号 `0x53525354`，功能号 `0`）向固件请求关机或冷重启：
+- **关机（`sbi_shutdown`）**：传入复位类型 `0`（`SBI_SRST_SHUTDOWN`）、原因 `0`；
+- **冷重启（`sbi_cold_reboot`）**：传入复位类型 `1`（`SBI_SRST_COLD_REBOOT`）、原因 `0`；
+- **停机（`sbi_halt`）**：不向固件请求断电，直接关闭本核中断并进入永久 `wfi` 循环。若 `sbi_system_reset` 异常返回，内核会打印真实 SBI 错误码后转入 `sbi_halt()`。
+
+用户态发起的关机/重启请求由 `storage_cleanup_worker` 先终止用户进程、排空日志与卸载文件系统，确认全部资源归还后再调用上述 SBI 接口，完整流程见 [进程调度与生命周期](kernel-scheduler.md)。
+
+---
+
+<details>
+<summary>展开查看：启动边界契约、平台约束与验证入口</summary>
+
+### 关键边界与不变量
+
+- **DTB 与随机种子**：内核不假设 DTB 位于固定物理地址。`kernel_main` 在构建内存布局前先将 `/chosen/rng-seed` 混入内核随机数池并立即擦除临时缓冲区，随后把 `[__kernel_start, __kernel_end)` 与 DTB 自身区间加入保留区，再交由 `boot_memory_build()` 生成可用物理内存段。
+- **物理装载地址绑定**：在重定位到高半区前，`kernel_main` 通过 `riscv_image_bind_load_offset()` 记录 `RISCV_KERNEL_VIRTUAL_BASE - (uintptr_t)__kernel_start`，使后续需要查询内核镜像物理地址的直接内存访问（DMA）路径无需依赖绝对链接符号。
+- **串口紧急输出路径**：当启动期或运行期进入致命错误处理时，内核调用 `virt_uart_emergency_begin()` 立即关中断并切回同步轮询模式（轮询 LSR bit 5 后写 THR），避免后台 TTY 工作线程或日志缓冲与崩溃现场交错。多核配置下同时由 `claim_fatal()` 争抢唯一输出权，确保崩溃日志完整可读。
+- **平台常量约束**：当前镜像物理装载基址 `0x80200000` 针对 QEMU `virt` 平台；若移植至 VisionFive 2 等实板，需由板级适配提供对应的物理装载地址、固件入口与存储驱动。
+
+### 验证入口
 
 ```sh
 make run-riscv
@@ -55,4 +134,7 @@ make test-sv39-fault-riscv
 make debug-riscv
 ```
 
-`make test-riscv` 运行物理页、VirtIO block、VFS/ext4、Sv39、MM/VMA、用户复制、生产根启动及等待/调度生命周期测试。根启动 runner 把独立静态 ELF 写入真实 ext4，要求 PID 1 执行、回收和关机。`make debug-riscv` 会在第一条 guest 指令前暂停，并在宿主 TCP 端口 1234 等待 GDB。
+- `make test-riscv`：覆盖物理页分配、VirtIO 块设备、VFS/ext4、Sv39 页表、MM/VMA、用户空间拷贝、生产根启动及调度生命周期回归。
+- `make debug-riscv`：在第一条客户机指令前暂停 QEMU，并在宿主 TCP 端口 `1234` 等待 GDB 连接。
+
+</details>

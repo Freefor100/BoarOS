@@ -1,98 +1,101 @@
-# 共用 ns16550 串口传输
+# 通用 NS16550 串口传输与终端接入
 
-`drivers/serial/ns16550.c` 和 `include/kernel/ns16550.h` 实现单 CPU 的 RX/TX、IRQ/worker、线路配置、drain 与 console 生命周期。RV 的 `arch/riscv/uart_tty.c` 仅提供 DTB/PLIC 适配；LA 的 `platform/loongarch_virt.c` 提供固定 QEMU UART 与 PCH-PIC/EIOINTC 适配。线路规程、read/write/ioctl/poll、作业控制和 OFD 生命周期由 `kernel_tty` 负责，本模块只提供实际硬件能力。
+通用异步收发器（Universal Asynchronous Receiver-Transmitter，UART）既是操作系统的早期调试控制台，也是面向用户态交互式终端（`/dev/console`、`/dev/ttyS0`）的物理字符通道。BoarOS 将经典的 **NS16550** 串口控制器驱动抽离为跨架构共用的硬件传输层（`drivers/serial/ns16550.c`），同时服务于 RISC-V 与 LoongArch 平台；上层行规程、信号与作业控制、打开文件描述（OFD）生命周期则交由通用终端核心完成（见[TTY 与 PTY 终端子系统](kernel-tty.md)）。
 
-## 入口与 owner
+---
 
-root 的 heap 分配 port；port 保存 借用的 MMIO mapping、复制的 IRQ 回调和登记、joinable worker、1024 个字符/状态 RX 项和 1024 字节内核控制台队列。port 创建 TTY 后发布串口实例，标准 OFD 才能绑定它。`riscv_root_boot_start_with_irq` 是生产入口；原 `riscv_root_boot_start` 保留模块启动的早期 console。生产路径由 `kernel/main.c` 把固定早期 sink 与 DTB UART 的相交页合并后只映射一次，避免重复 PTE 冲突，然后初始化 PLIC，然后调用带 IRQ 的入口。
+## 一、源码组织与跨架构平台参数
 
-worker 使用调度器架构标准栈（RV 8 KiB、LA 32 KiB）和任务存储。root baseline 在创建 port/worker 前采集，正常 finish 必须先回收用户任务及其 OFD/session 引用，再 drain、停止和 join UART worker、注销 IRQ、销毁 TTY、释放 port。设备收尾统计在 UART 排空并停止后才打印，避免独立的 console 队列插进尚未发完的用户记录；最后检查 heap 与物理页。启动失败路径先释放准备期 OFD，再停止 UART；没有遗失的 port 指针。TTY 销毁仍被真实引用阻塞或硬件 drain 超时会保留 port，下一次 stop 可继续进展；合法 allocator 释放失败直接 fatal，不转换成清理重试。
+| 源码路径 | 核心职责 |
+| :--- | :--- |
+| `drivers/serial/ns16550.c`、`include/kernel/ns16550.h` | 共用 NS16550 驱动：中断接收、有界工作线程收发、内核控制台与用户 TTY 公平调度、线路与 `termios2` 波特率配置、排空与优雅关闭 |
+| `arch/riscv/uart_tty.c` | RISC-V 薄适配层：将设备树（DTB）解析的串口信息绑定至 PLIC 中断控制器，并合并早期控制台与 DTB 串口的页映射范围 |
+| `arch/riscv/virt_uart.c` | RISC-V 早期与紧急轮询输出通道：衔接内核日志环（`klog`）与运行时控制台队列，在致命异常时接管为同步轮询输出 |
+| `platform/loongarch_virt.c` | LoongArch 平台适配：构造 QEMU `virt` 固定串口（基址 `0x1fe001e0/0x100`，1 字节宽度，`shift = 0`，时钟 `1,843,200 Hz` = `115200 × 16`，PCH-PIC 引脚 `2`）并绑定中断 |
 
-## IRQ、worker 与线路
+在 RISC-V 生产启动路径中，内核先调用 `riscv_uart_tty_mapping_ranges()` 将早期固定串口页与设备树发现的串口页取并集（相交时合并为一段），避免页表重复映射冲突；随后初始化中断控制器，并通过 `ns16550_start()` 构造端口与内核 TTY 实例，发布后标准输入/输出/错误文件描述符才正式绑定到该串口终端。
 
-- 每次 UART handler 最多处理 64 个硬件字符。字符及 OE/PE/FE/BI 状态来自实际 LSR；IRQ 不分配、不睡眠、不调用线路规程。满 RX 环关闭 RDI/RLSI，worker 消费后恢复；硬件 OE 计入真实 overrun，满软件队列本身不伪造硬件错误。
-- worker 每轮最多提交 256 个 RX 项，发送内核 console 与 TTY 用户/echo 合计最多 256 字节，轮换先服务的来源。仍有可执行工作时 yield；THRE credit 缺失时启用发送就绪 IRQ，handler 关闭该中断并唤醒 worker。THRE 只证明可继续发送，drain 同时要求软件队列为空与实际 TEMT；最后的 TEMT 以 10 ms 请求期限再次观察，避免空转 IRQ；调度可能推迟实际恢复，不是硬上界。
-- `transmit` 逐次检查 THRE，返回真实接受字节；没有分配、睡眠或成功存根。default 115200/8N1/CREAD 的 divisor 来自 DTB 时钟；CS5–8、parity、stop bits 实际写 LCR。B0 撤 DTR/RTS；HUPCL 在 last close 撤 modem 输出，后续 configure 可恢复。独立输入速度归一到硬件输出速度，未实现的 CMSPAR 和 CRTSCTS 不对用户保留支持声明。
-- `virt_uart_putc` 先把真实内核字符保存在 16 KiB klog，再按 console level 送到独立 port 队列。`kernel_console_putc` 是不写 klog 的诊断输出；TTY 用户/echo 不经过这两条路径。queue 满时记录 `console_dropped`，IRQ 打印不阻塞。`virt_uart_emergency_begin` 使 fatal 输出改用既有固定轮询 sink；pre/post runtime 也保持轮询输出。
-- stop 首先阻止新 TTY 工作并关闭输入，在正常关闭中保留已接受且未 flush 的 TX。超过一秒仍无法 drain 返回 EIO，worker 已 join，但队列、MMIO 和 IRQ 登记仍有 port owner；再次 stop 可重建 worker 重试。成功停止在 join 后注销 IRQ，才释放 TTY/port。`stop_report` 在 drain/join 完成后、释放前冻结最终计数；失败或空 owner 不修改输出，root 保存该固定快照供聚焦验证。
+---
 
-fatal入口先关闭中断并选择同步sink，绕过日志级别和worker队列；物理页释放诊断也
-在打印元数据前选择该入口。普通内核日志仍按原环与级别处理。宿主反例证明旧路由
-在console关闭时丢失fatal字符，以及分配器诊断未选择同步sink；修复后硬件输出和
-allocator fatal原因均保留。该检查保护新UART接入，不反推历史fatal的唯一触发链。
+## 二、中断处理、工作线程与双源公平发送
 
-准备阶段在单hart关中断区间内创建core、登记IRQ和worker，最后才发布owner/TTY。
-仅在这个明确的setup rollback状态，软件对象尚未接受TX、没有可见客户，PIO硬件里
-早期raw的尾字节也不借用port/core内存：撤销IRQ、stop/join可能已有worker后，可以
-释放未发布的软件owner而不等待该尾字节。回调断言无接受的TX、无队列/登记/worker；
-这不放宽已发布port的tcdrain/stop TEMT承诺。正常启动从初始LSR记录尚忙的硬件尾字节，
-即使第一轮没有新TX也保留10ms观察期限，TEMT变空后通知真实core的drain等待者。
+串口硬件字节率远低于 CPU 速度，若在中断处理函数或系统调用中忙等发送寄存器空，会严重拖垮系统响应；若放任用户输出或内核日志单方面占满串口，则会导致另一方长时间饥饿。为此，NS16550 驱动采用**短中断 + 有界异步工作线程 + 轮换双源配额**的三段式流水线：
 
-RV64/COST关闭构建的DWARF对象大小为port **3296 B**、core **29032 B**。真实create模型
-核对了这两个分配请求；当前heap的大对象按请求页数上取整为buddy order，分别占1与8个
-4KiB页，合计9个heap页（36KiB）。worker另有标准8KiB物理栈（2页，含16B guard/canary区域）
-和2368B任务metadata（独立1页），固定直接owner合计12页（48KiB），不包含后续OFD实例、
-用户任务、session/PID引用或其他heap owner。此次编译worker自身栈帧608B，仍需与调用链及
-运行高水位分开解释，不以单个`.su`代替完整运行栈边界。
+```mermaid
+flowchart LR
+    HW["NS16550 硬件寄存器<br/>RBR/THR · IER · IIR/FCR · LCR · MCR · LSR"]
+    IRQ["串口中断处理 interrupt()<br/>• 每次最多读取 64 字符 + LSR 错误位<br/>• 写入 1024 项 rx[] 软件环<br/>• 满环屏蔽 RDI/RLSI · THRE 触发即屏蔽并唤醒"]
+    KLog["内核日志与诊断<br/>• virt_uart_putc() → 16 KiB klog → console 级别过滤<br/>• kernel_console_putc() → 1024 B console[] 环"]
+    Worker["可汇合工作线程 worker()<br/>• 每轮最多上交 256 项 RX 至 kernel_tty_receive()<br/>• 每轮发送上限 256 B，交替优先 TTY(128 B) / Console(128 B)<br/>• 无新字节但移位器未空时，设 10 ms 期限轮询 TEMT"]
+    TTY["通用 TTY 核心（kernel_tty）<br/>行规程 · 回显 · 作业控制 · read/write/poll"]
 
-## 验证
-
-```sh
-make test-uart-host
-make build/riscv/arch/riscv/uart_tty.o
+    HW -- "接收/线路状态/THRE 中断" --> IRQ
+    IRQ -- "唤醒 work 队列" --> Worker
+    KLog -- "入队 console[]" --> Worker
+    Worker -- "批量上交 RX / 拉取 TX" --> TTY
+    Worker -- "检查 LSR.THRE 写入 THR" --> HW
 ```
 
-宿主 fixture 使用生产传输实现与真实 IIR/LSR/IER 行为模型，TTY 边界只模拟回调；保护 IRQ 预算、满环/恢复和索引回绕、LSR 错误位、控制台 overflow、部分发送、发送 credit IRQ、TEMT 期限、modem/configure、四类启动失败与 unregister，以及关闭超时 owner 保留/恢复。新增fixture链接实际 `fs/tty.c`，分别保护TEMT忙时IRQ/worker启动失败的rollback、第一空worker期限/真实drain唤醒和正常stop超时保留/恢复；准备状态的公开入口不可接受TX，模型同时检查IRQ临界区。ASAN/UBSAN 验证 owner 清理。DTB fixture 另验证地址/clock/route/layout 与失败保持输出。双核组合测试在 PID1 退出后向真实 TTY 留下超过单轮发送预算的尾部，直到 stop 才允许 worker 发送；检查完整尾部先于设备收尾统计，解析器继续拒绝损坏的用户记录。真实 U-mode 和整合回归由集成 owner 验证，宿主 fixture 或 object 编译不等于真实 TTY ABI 已通过。
+### 2.1 中断边界与接收流控
 
-固定资料：`references/qemu/hw/riscv/virt.c` 与 `hw/char/serial.c`，QEMU v11.1.0 commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`；`references/linux/drivers/tty/serial/8250/8250_port.c`，Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。本实现没有复制外部代码。本传输范围不包含 modem 输入查询、硬件流控、多串口、DMA 或实板验证；
-PTY 使用独立软件 transport，见[TTY 模块](kernel-tty.md)。
+- **有界中断处理**：每次进入 `interrupt()` 最多处理 **64** 次硬件事件，读取中断识别寄存器（IIR，偏移 2）。若是发送保持寄存器空中断（THRE，`(iir & 14) == 2`），立即关闭 `IER` 中的 THRE 中断位（bit 1）并唤醒工作线程；若是接收事件，则读取线路状态寄存器（LSR，偏移 5）和数据寄存器（RBR，偏移 0），将字符连同真实硬件错误位（`OE` 溢出、`PE` 奇偶、`FE` 帧错、`BI` 中断，掩码 `0x1e`）写入 `1024` 项软件环形队列 `rx[]`。
+- **软件满环背压**：中断处理函数**绝不分配内存、绝不睡眠、也不调用 TTY 行规程**。当 1024 项软件接收环满时，驱动关闭接收数据就绪与线路状态中断（`RX_INTERRUPTS = 0x5`），待工作线程消费腾出空间后再恢复开启；只有硬件 LSR 报告真实 `OE` 时才计入 `overruns`，软件满环本身不伪造硬件溢出错误。
 
-## termios2 与线路速度
+### 2.2 双源公平发送与 THRE / TEMT 两级排空
 
-44 字节 termios2 支持标准速率与 BOTHER 数字速率。UART 使用同一个 RX/TX 时钟，
-将输入归一到输出；TTY core 保存回读速度，旧 36 字节 ioctl 不越界访问附加字段。
-设备设置先校验速度范围和 16 位 divisor，再在短发布区写 DLL/DLH、LCR、MCR、IER；
-失败保留旧硬件与软件状态。B0 保留原 divisor、撤 modem 输出并关闭 RX。
+- **轮换发送配额**：工作线程每轮最多向 TTY 上交 **256** 项接收记录，发送总预算为 **256 字节**。通过奇偶轮次标志 `p->turn++ & 1` 交替决定先服务用户 TTY 输出还是先服务 1024 字节内核控制台队列——首源最多取 128 字节，剩余配额（至多补足到 256 字节）全部让给次源，既防止持续内核日志饿死用户终端，也防止高频用户输出阻塞关键控制台信息。
+- **THRE 中断与 TEMT 10 ms 观察**：NS16550 硬件区分两个发送就绪位：
+  - **THRE（Transmitter Holding Register Empty，LSR bit 5）**：发送保持寄存器/FIFO 可接受新字节。当软件仍有待发数据但 `THRE == 0` 时，工作线程开启 THRE 中断后睡眠，硬件就绪触发中断再唤醒。
+  - **TEMT（Transmitter Empty，LSR bit 6）**：发送移位寄存器也已彻底把最后一位送上物理线路。`tcdrain(3)` 与停机排空必须等待 `TEMT == 1` 且软件队列清空。由于 NS16550 硬件**不提供 TEMT 中断**，工作线程在 `tx_active` 或 `stopping` 期间会以 **10 ms**（`(frequency + 99) / 100`）为睡眠期限周期观察 `LSR.TEMT`，确认物理发送完毕后调用 `kernel_tty_transport_ready()` 唤醒排空等待者。
 
-ABI 报告的是接受的名义速度，硬件通过 DTB 时钟及四舍五入的 divisor 实现近似线路
-速度，两者不是同一个测量值；固定 Linux 8250 也区分这两个边界。本驱动在 termios2
-硬件范围之外返回 EINVAL，不承诺完整复制 Linux 的超范围回退策略。
-CMSPAR/CRTSCTS 沿现有支持集合归一，不伪装硬件流控已经实现。
+---
 
-`make test-uart-host` 核对真实寄存器别名、divisor、线路格式、速度归一、B0 和
-错误不发布；`make test-tty-termios2-riscv` 用同一 ELF 在真实串口核对
-44 字节复制、标准/数字速度、坏指针、drain/flush 与旧 36 字节布局。
-探针先明确设置双方共有的线路基线，最后恢复各自原配置，不将不同启动默认值当作 ABI 差异。
+## 三、控制台输出分级与紧急故障直通路径
 
-## LA 平台与对照验收
+BoarOS 清晰区分三类字符输出，确保正常运行时高吞吐不阻塞、致命错误时不丢失任何现场字节：
 
-固定 QEMU `references/qemu/hw/loongarch/virt.c`、`include/hw/loongarch/virt.h`
-(commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`) 的第一 UART 为
-`0x1fe001e0/0x100`，字节寄存器、shift=0、clock=1843200 Hz、PCH pin2。
-该信息仅在平台层构造；共用核心不包含 RV CSR 或 PLIC 地址。IRQ callbacks 按值复制，
-mapping 由 root/platform 持有至 stop 成功。LA root 在创建标准 OFD 前发布 TTY，
-在用户/OFD/session owner 释放后 drain/join、注销 IRQ、销毁 core/port，再检查完整基线。
-正常 LA 内核日志进入同一 klog 环并遵守 console level；早期/退出后的 console 用轮询，
-fatal 先关中断并绕过日志级别与拥塞队列。
+| 输出入口 | 路径与行为 |
+| :--- | :--- |
+| **用户态 TTY 与回显** | 经 `kernel_tty` 行规程缓冲，由串口工作线程按 256 B 配额写入硬件，**不进入内核日志环 `klog`** |
+| **普通内核日志（`virt_uart_putc`）** | 先以级别 6（`KERN_INFO`）写入 `16 KiB` 内核日志环（见[内核日志模块](kernel-log.md)）；若低于当前控制台日志级别，再转交 `kernel_console_putc()` |
+| **诊断输出（`kernel_console_putc`）** | 不写 `klog`，直接入队串口 `1024 B` 控制台环 `console[]`（满时丢弃并递增 `console_dropped`，在中断内永不阻塞）；在串口工作线程启动前或停止后自动退回直接轮询发送 |
+| **紧急故障直通（`virt_uart_emergency_begin`）** | 致命异常或页分配器严重错误触发时，立即关闭本地中断并置 `emergency = 1`，**完全绕过日志级别过滤与异步控制台队列**，直接轮询 `LSR.THRE` 将故障信息同步刷出硬件 |
 
-`tests/userland/tty/riscv.py --arch loongarch` 共用原始串口字节通道、输入和结果解析。
-`tests/userland/tty/pty_riscv.py --arch loongarch` 共用 PTY 案例、原版 BusyBox、
-原版 glibc API 和磁盘真实重启检查。每架构内固定同一 ELF/fixture，
-Linux 先运行、BoarOS 后运行；LA 默认分别执行512 MiB/1 GiB。
-Linux PTY coordinator 作为真实 PID1 验证原 script 的收养/reap，退出42由 Linux panic
-报告实际 wait status；这不是 Linux 资源基线证据。BoarOS 根 owner 必须全部回收。
+---
 
-入口：`make test-tty-diff-loongarch test-tty-termios2-loongarch test-tty-loongarch
-test-pty-loongarch test-pty-apps-loongarch test-uart-failures-loongarch`。
-共同串口27、作业控制80、termios2 29条记录一致；PTY core9、musl/GNU API2、
-原 script21条及重启1条一致。原 ash/stty 交互覆盖Ctrl-C/Z、bg/fg、TTIN/TTOU和回收。
-UART port/core heap、worker任务页/栈、IRQ共五类构造失败不发布PID1，
-两种RAM回到页/堆/栈/BAR基线；另有活跃UART+console关闭+满队列的fatal轮询证据。
-宿主真实core模型保护超时保留owner与后续stop、THRE/TEMT和启动回滚。
-RTC和指定双架构程序矩阵已有各自验收，见[LA模块](loongarch-boot.md)；
-终端门禁仍不能代替更广应用或完整Harness证据。
+## 四、线路配置、`termios2` 波特率与生命周期管理
 
-交互cat门禁先等待前台子shell输出READY并exec原cat，再发送测试行。
-命令回显只证明输入被回显，不能证明foreground程序已经执行。固定Linux的LA
-1GiB反例只出现一条行规程echo，旧runner等待第二条真正回送超时；新同步后
-Linux/BoarOS的LA两种RAM与RV通过，保留echo和cat双回送、Ctrl-C及后续jobs门禁。
+### 4.1 线路参数与 `termios2` 数字波特率
+
+NS16550 支持传统的 36 字节 `termios` 与现代 44 字节 `termios2`（含独立 `ispeed`/`ospeed` 字段与 `BOTHER` 任意数字速率）：
+- **先校验后发布**：`configure_line()` 按串口输入时钟四舍五入计算 16 位分频系数 `divisor = (clock + 8 × rate) / (16 × rate)`，校验 `1 ≤ divisor ≤ 65535`；`configure2()` 进一步限制名义速率不超过 `(clock + clock / 100) / 16`（允许 1% 时钟量化余量），超界返回 `-EINVAL` 且不触碰任何硬件寄存器。校验通过后在关中断短区内原子更新 `DLL`/`DLH`、`LCR`（数据位 CS5–CS8、停止位、奇偶校验）、`MCR` 与 `IER`。
+- **单时钟归一与调制解调器控制**：由于 NS16550 收发共用同一波特率发生器，驱动始终将输入速率 `ispeed` 归一为输出速率 `ospeed`，并在 2% 误差范围内匹配标准波特率编码（否则标记 `BOTHER` `0x1000`）；未实现的硬件流控（`CRTSCTS`）与固定奇偶（`CMSPAR`）标志会被清除，不向用户态虚报支持。设置 `B0` 时保留旧分频系数、撤销调制解调器控制信号（`MCR = 0`，拉低 DTR/RTS）并关闭接收；配置 `HUPCL`（`0x400`）则在最后一个句柄关闭时经 `last_close()` 撤销调制解调器输出。
+
+### 4.2 启动回滚与停机排空所有权
+
+- **未发布阶段的快速回滚（`setup_rollback`）**：`ns16550_start()` 在关中断区内依次创建 TTY、记录早期硬件移位器是否仍在发送尾字节（`tx_active = !(LSR & 64)`）、注册中断和创建工作线程，最后才发布全局 `console_port` 与公开串口 TTY。如果准备中途失败，由于尚无外部客户也未接受任何运行期 TX，硬件中可能残留的早期原始轮询字节并不借用任何软件内存，驱动置位 `setup_rollback = 1`，注销中断并销毁未发布对象，无需等待硬件移位器排空。
+- **优雅停机与超时保留（`ns16550_stop_report`）**：停机首先置 `stopping = 1`、关闭 TTY 新输入与接收中断，设置 **1 秒排空期限**（`stop_deadline = now + frequency`），等待工作线程将用户未发完的尾字节与控制台队列彻底刷完并观测到 `TEMT == 1` 后才汇合退出。之后冻结最终统计快照、关闭全部中断、注销中断处理函数、销毁 TTY 并释放端口堆内存。若超过 1 秒硬件仍未排空（返回 `-EIO`）或 TTY 仍被外部引用占用，驱动保留端口与中断所有权，允许后续再次调用 `stop` 重建工作线程完成收尾。
+
+---
+
+<details>
+<summary>展开查看：内存占用快照、驱动统计与定向验证入口</summary>
+
+### 固定内存占用参考（RISC-V 64 位、关闭成本诊断）
+
+- **串口端口对象（`struct ns16550_port`）**：约 `3,296 B`（伙伴堆占 1 个 `4 KiB` 页）。
+- **TTY 核心对象（`struct kernel_tty`）**：约 `29,032 B`（伙伴堆向上取整占 8 个 `4 KiB` 页）。
+- **工作线程资源**：调度器标准内核栈（RISC-V `8 KiB` 含守卫区占 2 页；LoongArch `32 KiB`）加任务控制块 1 页。RISC-V 固定直接所有权合计 12 页（`48 KiB`）。
+
+### 统计字段（`struct ns16550_statistics`）
+
+`ns16550_stop_report()` 在排空汇合后、释放前冻结五项计数：`interrupts`（中断次数）、`received`（接收字符数）、`overruns`（硬件 LSR 溢出次数）、`console_dropped`（控制台满环丢弃字节数）与 `transmitted`（硬件实际接收发送的字节数）。
+
+### 定向验证入口
+
+- **宿主传输与行规程模型**：`make test-uart-host`（使用真实 `drivers/serial/ns16550.c` 与 `fs/tty.c`，覆盖 64 字符中断预算、1024 环满背压与恢复、LSR 错误位、THRE/TEMT 排空、44 字节 `termios2` 分频与 `B0`、启动回滚、停机 1 秒超时保留与重试、紧急轮询直通）。
+- **双架构客机与交互终端验证**：
+  - RISC-V：`make test-tty-termios2-riscv`、`tests/userland/tty/riscv.py`、`tests/userland/tty/pty_riscv.py`。
+  - LoongArch：`make test-tty-diff-loongarch test-tty-termios2-loongarch test-tty-loongarch test-pty-loongarch test-pty-apps-loongarch test-uart-failures-loongarch`。
+
+</details>

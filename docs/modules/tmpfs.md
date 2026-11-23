@@ -1,113 +1,121 @@
-# 内存文件与 tmpfs
+# 内存文件系统（tmpfs）、内存后备对象与 `memfd`
 
-入口是 `mm/memory_object.c`、`fs/tmpfs.c`、`fs/open_file.c` 和
-`arch/riscv/mm.c`。固定语义依据为 `references/linux/mm/shmem.c`、
-`references/linux/Documentation/filesystems/tmpfs.rst`、`references/linux/fs/inode.c`
-以及 `references/linux/lib/{cmdline,kstrtox}.c`，commit
-`f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
+在操作系统中，**临时文件系统（Temporary File System，tmpfs）**将文件数据直接存放在物理内存页缓存中而不绑定任何块设备，常用于临时目录、POSIX 共享内存（`/dev/shm`）以及无需落盘的高速中间产物存储。BoarOS 在 `mm/memory_object.c` 与 `fs/tmpfs.c` 中实现了稀疏内存后备对象与完整的 `tmpfs` 文件系统，并复用同一基础设施支撑匿名共享映射、**匿名内存文件（`memfd_create`）与文件密封（File Sealing）**，以及内核设备文件系统 **`devtmpfs`**。
 
-## 数据和所有权
+---
 
-共享匿名映射与 tmpfs 普通 inode 使用同一稀疏内存后备对象。对象拥有每个
-驻留页的一份引用；PTE、fork 别名和临时请求另持引用，不重复计量容量。
-普通文件仍保留 inode/OFD 身份，文件映射与执行文件沿原 inode–MM 登记。
-没有第二份磁盘页缓存数据，也没有共享文件 futex 的隐式实现。
+## 一、源码组织
 
-`find_page` 只查现有页；read/readv/pread 读取空洞时填零，不实例化数据页。
-映射缺页按需实例化。文件缺页接口返回本次是否新建；失败先释放临时 pin，
-仅撤销地址仍匹配且没有其他引用的新页；已有页不回滚。inode 锁 rank 30，
-对象锁 rank 35；对象分配禁止递归进入可睡眠脏页回收。
-对象引用采用原子非零/溢出检查，末次引用唯一负责销毁；每次对象操作必须由实际owner覆盖。
-跨对象预算及allocator共享页计数在后备页发布时原子收费，失败准备归还自己的页/metadata，
-PTE、fork及pin不重复收费。驻留数/statfs使用值读取，不承诺跨对象全局原子快照。
-对象索引仍使用原mutex；预算绑定/上限在私有构造期确定。此基础同步不开放tmpfs业务跨核。
-受控来源验证同时核对实际 tmpfs 普通 inode、对象、heap/allocator 和所属挂载的预算身份；
-共享匿名对象的域验证仍要求无 budget。该检查借用已有 OFD owner，不额外增加对象引用。
+| 源码路径 | 核心职责 |
+| :--- | :--- |
+| `mm/memory_object.c` | 稀疏内存后备对象（`struct kernel_memory_object`）：按需页哈希桶、原子配额计费、截断/打洞释放与映射追踪 |
+| `fs/tmpfs.c` | `tmpfs` VFS 后端：红黑树节点与目录项索引、挂载配额解析、POSIX 访问控制列表（ACL）、扩展属性、`O_TMPFILE`、匿名 `memfd` 及 `devtmpfs` |
+| `include/kernel/tmpfs.h` | `tmpfs` 挂载、参数校验、`memfd` 创建、文件密封与 `devtmpfs` 生命周期声明 |
+| `fs/open_file.c`、`mm/mm.c` | 内存文件与虚拟地址空间的共享/写时复制（CoW）缺页绑定与映射失效联动 |
 
-截断先撤销越界的所有 MM 映射（含私有 COW），再释放对象的越界页并清零
-末页尾部。私有 COW 仍属于 MM；文件尾页清零不改写独立私有副本。
-关闭或删除一个名字不会释放仍被打开、映射或执行的 inode。
+---
 
-`fallocate(PUNCH_HOLE|KEEP_SIZE)` 复用 inode 的映射失效过程，释放打洞范围内的完整后备页与页配额，边界页仅清除实际覆盖的字节；文件长度保留，独立私有 COW 不变。`MADV_REMOVE` 的共享映射检查、来源借用及内存对象代次见 [MM 模块](kernel-mm.md#madvise-与共享段锁定)。tmpfs 尚不实现 fallocate 的预分配模式，返回 EOPNOTSUPP。
+## 二、稀疏内存后备对象与数据所有权
 
-mode、UID/GID、inode 标志和时间由同一个 tmpfs inode 持有。硬链接与已 unlink 的 FD 仍可查询或设置标志，子 inode 继承父目录的 nodump 位。与固定 Linux 的 shmem 一致，通过原有可写 FD 仍可写入随后被设为 immutable 的文件，普通文件的原有可写 FD 也可对其执行 ftruncate。设置 immutable 后，原有共享映射仍可写入内存后备页。append 禁止用可写 FD 新建共享映射，包括初始只读映射。
-`fchown/fchownat`检查实际调用者身份；`UINT32_MAX`保留字段。非目录先按旧
-所属组决定set-ID清除，产生模式变更时再按新所属组过滤SGID；目录保留set-ID。
-创建在目录发布时设置fsuid/fsgid，SGID父目录决定新节点的GID及子目录SGID。
-属性与写入的互斥顺序沿用[共同VFS规则](vfs-ext4.md#文件节点与页缓存)。
-只读挂载拒绝元数据修改；tmpfs所有权与内容同样不跨重启持久保存。
+BoarOS 让共享匿名映射（`MAP_SHARED | MAP_ANONYMOUS`）、SysV 普通共享段与 `tmpfs` 普通文件共享同一套底层容器 **`struct kernel_memory_object`**，彻底消除磁盘页缓存与内存文件之间的双份拷贝。
 
-驻留内存后备页计入 Shmem，并包含于 Cached；无 swap 时不可驱逐，不计入
-MemAvailable 的文件回收估算，也不进入磁盘 Dirty/Writeback。短符号链接使用
-inode 内存，长符号链接使用有配额的后备页。
+```mermaid
+flowchart LR
+    VFS["tmpfs 普通节点 / memfd / 共享匿名映射"]
+    MemObj["稀疏内存后备对象 (struct kernel_memory_object)"]
+    Hash["动态页哈希桶 (初始 16 桶, 2 倍扩容)"]
+    Budget["每挂载页预算 (struct kernel_memory_budget)"]
+    Alloc["全局共享页计数 (allocator.shared_anon_pages)"]
 
-## 实例与空间限制
+    VFS --> MemObj
+    MemObj --> Hash
+    MemObj -- "物理页发布/释放时原子计费" --> Budget
+    MemObj -- "同步计入 /proc/meminfo Shmem" --> Alloc
+```
 
-每个挂载拥有独立 inode、目录项、页预算和 inode 预算。目录项与 inode 分离；
-硬链接共享数据、链接计数、锁，但独立打开产生独立 OFD。目录继续位置是
-稳定递增 cookie，修改期间不保证额外快照一致性。
+### 2.1 按需分配与精确计费
 
-挂载按 inode 号维护红黑树，每个目录分别按名字和 cookie 维护目录项红黑树；
-这些索引同时承担对象登记与卸载遍历，不保留另一份全挂载链表。inode 查找为
-O(log I)，名字查找和 cookie 继续定位为 O(log D)，其中 I 为挂载 inode 数，
-D 为当前目录的项数。读取一个目录不会扫描其他目录。目录项借用仍在索引中
-存活的父 inode，直接维护其大小；卸载先删除全部目录项，再释放 inode。
-创建先准备名字、inode 与后备对象，重命名先分配新名字；提交索引不再分配。
-重命名取得新 cookie，cookie 耗尽返回 EOVERFLOW 并保留原名字与替换目标。
+- **稀疏空洞零开销**：`find_page` 只查找已驻留物理页。对未写入空洞执行 `read`/`pread`/`readv` 直接向用户缓冲区填零，不分配物理页也不扣除配额；只有实际写入或内存映射缺页时才按需实例化物理页。
+- **不重复记账的所有权模型**：后备对象对每张驻留物理页持有一份所有权引用，并在页首次发布时原子扣除挂载页预算（`budget->used`）与全局共享页计数（`allocator->shared_anon_pages`）。页表项（PTE）、`fork` 子进程别名及临时 I/O 固定借用（pin）只增减物理页引用计数，不重复消耗配额。
+- **内存统计与不可驱逐性**：驻留页在 `/proc/meminfo` 中计入 `Shmem` 并包含于 `Cached`；由于当前无交换分区（swap），这些页不可作为干净磁盘页被回收，不计入 `MemAvailable` 的文件可回收估算，也不进入磁盘 `Dirty`/`Writeback`。`st_blocks` 遵循 POSIX ABI，始终以 512 字节为单位（`驻留页数 × (PAGE_SIZE / 512)`），在 4 KiB（RISC-V）与 16 KiB（LoongArch）页配置下保持一致。
 
-用户态创建挂载点并调用 mount；内核不会自动覆盖 `/tmp` 或 `/dev/shm`。
-设备节点可由 mknod 创建字符或块设备类型，inode 保留真实 `rdev`；它们不分配文件数据对象和数据页，stat 的大小与块数为 0。打开时由通用设备路径按 `rdev` 分派。
+### 2.2 截断、打洞与写时复制隔离
 
-支持 `size`、`nr_blocks`、`nr_inodes`、`mode`；默认页数和 inode 数分别为受管
-页数的一半，默认根模式 01777，根目录所属身份取创建者 fsuid/fsgid。零取消相应显式限额。数字按固定 Linux
-memparse 的 base 0、K/M/G/T/P/E、溢出和百分比规则解析，重复参数以后项为准；
-不支持的选项明确失败。大数行为以固定版本为准，不将容量限额当作物理内存保证。
+- **截断（`truncate`）**：先撤销所有虚拟地址空间（MM）中越界的共享与私有写时复制映射，再释放后备对象中越界的物理页并将新文件尾所在页的残余字节清零。各进程已分离的私有写时复制副本属于进程自身 MM，尾页清零不会污染独立私有副本。
+- **文件打洞（`fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`）**：复用映射失效流程，彻底释放打洞区间内覆盖的完整物理页并退还页配额，对首尾部分覆盖页仅清零落入区间内的字节；文件逻辑长度保持不变。`MADV_REMOVE` 共享同一底层释放路径（详见 [虚拟内存管理](kernel-mm.md)）。预分配模式当前返回 `-EOPNOTSUPP`。
 
-稀疏扩展不收费，页实例化才收费；额外硬链接占用 inode 预算。空间配额耗尽为
-ENOSPC，真实内存分配失败为 ENOMEM，已写部分仍返回进展。映射超过 EOF 或
-页配额用尽为用户 SIGBUS，不是内核 fatal。statfs、st_blocks 反映实际占用。
-fsync/fdatasync/msync 完成内存文件契约，不提交磁盘 I/O，也不承诺重启后数据保留。
+---
 
-只读和忙卸载沿通用 VFS 契约。尚无 remount、bind、move、lazy/force unmount、
-ACL和swap。SysV IPC由共同IPC模块提供。挂载扩展的剩余工作归[开发路线](../goals.md#功能缺口)。
+## 三、`tmpfs` 索引结构、挂载选项与安全属性
 
-扩展属性归inode所有，使用不可变的名称／值记录，在inode资格内替换、删除和查询；
-打开对象及硬链接保留它们，最后一个链接和使用者结束后释放。capability记录另有实际指针，
-普通写入无属性时只作空判断；设置、chown和截断按共同文件权限规则维护它。
-名称空间、Linux ABI和filecap查询格式见[共同文件接口](kernel-files.md#扩展属性)。
+### 3.1 O(log N) 红黑树索引与目录语义
 
-## 验证入口
+每个 `tmpfs` 挂载实例（`struct tmp_mount`）完全独立，拥有各自的节点预算、页预算与三类红黑树索引：
+- **全局节点树（`m->inodes`）**：按 `inode` 编号索引全挂载存活节点，查找复杂度为 `O(log I)`。
+- **每目录双索引（`names` 与 `cookies`）**：每个目录分别维护按名称排序与按单调递增 `cookie` 排序的两棵红黑树，名称查找与 `getdents64` 续读定位均为 `O(log D)`，遍历某个目录不会扫描其他目录。目录大小按 Linux `BOGO_DIRENT_SIZE`（`TMPFS_DIRENT_SIZE = 20` 字节）随目录项增减实时维护。
+- **节点类型全覆盖**：
+  - 支持普通文件、目录、硬链接（共享节点、链接数、锁与扩展属性，额外硬链接受节点预算约束）、`O_TMPFILE` 匿名临时文件与延迟链接（`link_tmpfile`）、文件导出句柄（用于 `fanotify` 与 `name_to_handle_at`）；
+  - 短符号链接存放在节点堆内存中，长符号链接存入计费的后备页；
+  - 命名管道（FIFO）与字符/块设备节点（`mknod`）保留真实 `rdev` 与节点配额，但不创建稀疏数据对象（详见 [文件描述符与通用 I/O 层](kernel-files.md)）。
+
+### 3.2 挂载选项与容量边界
+
+用户态自行创建挂载点并调用 `mount("none", target, "tmpfs", flags, options)`，内核不会隐式覆盖 `/tmp` 或 `/dev/shm`。支持的挂载参数严格按 Linux `memparse` 规则（基数 0、`K/M/G/T/P/E` 后缀、百分比与后项覆盖前项）解析：
+
+| 参数 | 默认值 | 含义 |
+| :--- | :--- | :--- |
+| `size` | 受管物理内存的一半 | 容量上限（字节或百分比，换算为页数）；设为 `0` 取消显式页限额 |
+| `nr_blocks` | 受管物理页数的一半 | 直接以架构页数为单位设置容量上限；`0` 表示取消显式限额 |
+| `nr_inodes` | 同默认页数上限 | 最大节点（`inode`）数量；`0` 表示取消显式限额 |
+| `mode` | `01777` | 根目录八进制权限位（含粘滞位），属主取挂载者 `fsuid`/`fsgid` |
+
+当页或节点预算耗尽时返回 `-ENOSPC`（已写入的前缀仍返回进展），底层物理内存枯竭时返回 `-ENOMEM`；对映射区超过文件尾或页预算耗尽的缺页向用户进程投递 `SIGBUS`。`fsync`/`fdatasync`/`msync` 按内存文件契约立即成功，不提交磁盘 I/O。
+
+### 3.3 扩展属性、POSIX ACL 与文件标志
+
+- **扩展属性与文件能力（`xattr`）**：每个节点维护不可变名称/值记录链（过滤非特权用户的 `trusted.*` 枚举），并对 `security.capability` 保留直达指针 `i->capability`，无扩展属性时普通写入仅做空指针判断；`chown`、写入与截断按统一权限规则剥离特权位与能力。
+- **POSIX 访问控制列表（POSIX ACL）**：支持 `system.posix_acl_access` 与 `system.posix_acl_default`；目录设置默认 ACL 后，新建子文件与子目录自动继承并结合 `mode` 计算最终权限，`acl_permission` 在权限校验时结合扩展 ACL 条目裁决。
+- **节点标志与所有权**：支持 `FS_IMMUTABLE_FL`、`FS_APPEND_FL`、`FS_NODUMP_FL`（子项继承父目录 `nodump` 位）。遵循 Linux `shmem` 语义：文件被设为不可变（immutable）前已打开的可写描述符与既有共享映射仍可写入；追加模式（append）禁止经可写描述符建立新的共享映射。
+
+---
+
+## 四、`memfd_create`、文件密封与 `devtmpfs`
+
+`fs/tmpfs.c` 将同一套内存文件机制复用到两个核心 Linux 内核特性中：
+
+1. **匿名内存文件（`memfd_create`）与文件密封（File Sealing）**：
+   - `kernel_tmpfs_memfd()` 在内核私有、无挂载路径且无显式配额限制的隐藏实例 `memfd_mount` 中创建匿名内存文件并附着虚拟路径名，进程间可通过 Unix 域套接字（`SCM_RIGHTS`）安全传递内存缓冲。
+   - `kernel_tmpfs_file_seals()` 实现 `fcntl(F_GET_SEALS / F_ADD_SEALS)`：支持 `F_SEAL_SEAL`（锁定密封集）、`F_SEAL_SHRINK`、`F_SEAL_GROW`、`F_SEAL_WRITE`（若存在活跃可写共享映射则返回 `-EBUSY`）、`F_SEAL_FUTURE_WRITE` 以及配合 `MFD_NOEXEC_SEAL` 的 `F_SEAL_EXEC`（锁定执行权限位）。
+2. **动态设备文件系统（`devtmpfs`）**：
+   - `kernel_devtmpfs_mount()` 懒初始化一个隐藏可写的共享 `tmpfs` 实例（根权限 `0755`），每次挂载 `/dev` 时仅克隆其挂载视图（即使所有用户挂载均被卸载，共享实例仍保留至系统关机）。
+   - 初始化时按已注册字符设备自动创建 `null`、`zero`、`full`、`random`、`urandom`、`console`、`tty`、`ttyS0`、`ptmx`、`rtc0`、`loop-control`，并通过 `kernel_block_set_devnode_publisher()` 订阅块设备热插拔回调，在块设备（含分区与 loop 设备）注册/注销时自动创建或清理对应块设备节点（若用户态已手动替换同名节点则保留用户版本）。
+
+---
+
+<details>
+<summary>展开查看：锁序、时间戳语义与定向验证入口</summary>
+
+### 并发锁序、时间戳与当前边界
+
+- **锁层级**：VFS 挂载重配置锁（rank 19）→ 命名空间锁（rank 20）→ 内存对象变更锁 `mutation`（rank 20）→ VFS `inode` 锁（rank 30）→ 内存对象索引锁 `lock`（rank 35）。内存对象物理页分配严格禁止递归进入可睡眠的脏页回收路径。
+- **共享映射时间戳语义**：共享映射首次写缺页在发布 PTE 后，通过 `inode` 元数据短自旋锁更新 `mtime`/`ctime`，不升级缺页持有的 `inode` 读锁；私有写时复制不更新文件时间。遵循 Linux `shmem` 无 `page_mkwrite` 回调的语义，读缺页可直接发布可写 PTE，后续普通写入不保证再次触发时间更新。
+- **当前边界**：`tmpfs` 后端尚未提供 `remount` 参数重配置回调及交换空间（swap）换出支持；通用挂载传播、绑定挂载（bind）与卸载语义由 [VFS 层](vfs-ext4.md) 统一提供。
+
+### 定向验证入口
 
 ```sh
-make test-vma-riscv test-files-riscv
+# 内存对象与文件映射并发回归、tmpfs 宿主红黑树与预算回归
 make test-memory-object-concurrency-host
 make test-tmpfs-host
 make test-file-mapping-concurrency-host
+
+# RISC-V 完整内核与差分 ABI / 真实用户态验证
+make test-vma-riscv test-files-riscv
 make test-diff-abi-riscv
 make test-userland-riscv
-make test-root-multi-block-riscv
+make test-fifo-riscv
 make test-offline-c-tmpfs-riscv
 make test-busybox-tmpfs-riscv
 ```
 
-差分覆盖配额、稀疏读、实际占用、尾页/COW、映射 SIGBUS、删除后经 proc fd
-重新打开并截断、所有权与setgid继承、硬链接限额和选项边界。musl 消费者实际调用 shm_open/shm_unlink，
-通过管道握手验证 fork、不同地址别名、重建同名对象与最后映射的忙引用。
-离线 GCC 的工作目录和 TMPDIR 都位于 tmpfs；最终产物复制到根盘仅用于主机
-核验，不是 tmpfs 持久化证据。
-
-宿主 tmpfs 用真实后端、内存对象、heap 和页分配器检查混合大目录的查找与
-枚举、cookie seek/继续、插入删除与跨目录重命名、替换和硬链接、分配失败回滚、
-inode/页预算及最终资源归还；VFS 发布由宿主适配，完整路径集成由文件与客户机测试覆盖。
-
-共享映射的直接写缺页更新 mtime/ctime，私有 COW 不更新文件时间。读缺页可以
-直接发布可写 PTE，之后的 store 不保证另一次时间通知；这与固定 Linux 的
-`mm/memory.c: fault_dirty_shared_page`、`mm/vma.c: vma_wants_writenotify`
-及 shmem 无 page_mkwrite 回调相符，不能为测试强制所有 tmpfs 首写陷入。
-时间更新在成功发布后使用已有 inode metadata raw 保护，不升级 fault 持有的 inode 读锁。stat 和 CPU0 显式时间修改使用同一保护。
-
-命名FIFO使用真实tmpfs inode与目录项，但不创建稀疏文件数据对象；打开才取得活动pipe。
-inode配额和只读创建检查与普通节点一致，传输不计入文件数据容量。打开/关闭及弱关联
-契约见[文件模块](kernel-files.md#命名-fifo)，同ELF验证入口为`make test-fifo-riscv`。
-
-`st_blocks` 以 512 字节为单位，驻留页数乘 `PAGE_SIZE / 512`；RV 4 KiB 和 LA 16 KiB 的页大小不改变该 ABI 单位。`tests/diff-abi/tmpfs.c` 的 `tmpfs.allocated-block-units` 使用同一目标 ELF 与固定 Linux 对照。时间字段更新和 stat 的读取使用已有 inode metadata 保护，不升级缺页的 I/O 读锁；这不开放命名空间跨核修改。
+</details>

@@ -1,539 +1,143 @@
-# 内核 MM 模块
+# 虚拟内存管理（VMM）
 
-本文描述任务地址空间的通用所有权接口、共享 MM 策略、RISC-V Sv39 与 LA64 后端。页表格式、映射规则和硬件切换见 [RISC-V Sv39 分页模块](riscv-sv39.md)。
+BoarOS 的虚拟内存管理子系统为每个进程提供独立的虚拟地址空间抽象，在 RISC-V 64（4 KiB 基页 / 2 MiB 大页）与 LoongArch 64（16 KiB 基页 / 32 MiB 大页）上共享核心策略层 `mm/mm.c`，通过编译期契约 `include/arch/mmu.h` 直接绑定各架构页表后端，在热路径上不引入运行期虚表分派开销。
 
-普通 MM、受控任务绑定的 MM 和 `USER_SMP` 使用分层并发协调协议：
-- `record->operations`（rank 25 读写锁）：非固定私有匿名映射创建、纯匿名撤销、匿名映射的权限增加、锁页属性修改和缺页初查可取得共享读资格；固定地址映射、fork、销毁、mremap、权限撤销和文件/ELF/SysV/BPF 对象映射使用独占写资格。撤销前在操作资格内判断映射类型；文件来源、resident 与 alias 仍由写者维护。默认 UP 使用独占资格。
+---
 
-SMP 匿名映射增加权限时先持 VMA 读锁确认范围和权限。若调用者是唯一读者、等待队列为空且当前没有交接，可原地转为 VMA 写锁。目标范围可以立即认领时，连续持锁完成 VMA 修改。升级或范围认领受阻时，先归还 VMA 锁，再等待范围资格并按代次复核。实际页表发布及失效确认结束后才归还范围资格，重叠操作等待该确认，不重叠范围可以继续推进。
-- 范围协调机制（`struct kernel_mm_range_claim`）：在 `record->metadata`（raw 自旋锁）保护下登记活动地址区间。不相交区间的匿名撤销、锁页及缺页可并行推进；重叠区间通过 `record->range_changed` 等待与排他协调。持有用户页借用的调用者非阻塞尝试范围资格，避免与排空 pin 的修改者相互等待。UP 的独占操作不重复登记范围。
-- VMA 局部锁（`record->vma_lock`，rank 31 读写锁）保护共享操作中的数组、用量及代次；锁页额度检查和属性提交使用同一次写资格。页表解绑、远端 TLB 广播和物理页归还在锁外执行。UP 的独占操作可直接使用 VMA 状态。
-- 并发缺页局部校验：私有匿名缺页在提交硬件页表前，在 `vma_lock` 保护下只校验目标地址对应的 VMA 一致性并检查范围认领冲突，其他核心对无关地址区间的 VMA 增删不会迫使当前缺页发生假冲突重试。
-- 首次私有后备标记需要 VMA 写资格。等待该资格期间若代次变化，在同一次查找中核对目标 VMA 的范围、权限、后备与策略。无关范围变化、并行缺页已完成同一标记时继续当前请求，避免返回 MM 接纳层重新取锁与查找。
-- 页表发布所持有的候选页引用固定其分配阶数。常规构建直接核对页首和阶数，锁诊断构建仍走完整 buddy 查验。实际分配、引用更新和最后释放仍使用分配器保护。COW 只有原地升级需要核对旧页是否仅有一个引用。用新页替换时，旧页引用转入 TLB 确认后的退休批次。
-- SMP 私有匿名新页沿已取得的共享读资格完成分配、清零和提交，不先归还再重新申请同一资格。分配器耗尽时先结束该资格，再执行可能等待映射编辑的回收；候选页仍由调用者持有，返回后按真实 VMA、范围认领及 PTE 重查。ELF 与共享后备仍在结束相应保护后准备；COW 替换继续持有真实旧页引用，并在提交时核对原 PTE。已持用户页借用的调用者仍不得排队等待可能依赖它的修改者。
-- 匿名缺页和驻留用户复制可在发起 CPU 完成，ext4 普通文件冷页在发起 CPU 完成缓存装入与请求提交，日志和后台写回由各自既有执行者推进。有效映射的非叶替换同步全范围，退休页在本地与远端 TLB 确认后才归还；RV 新映射发布按下文的 Svvptc 能力处理。实际执行边界见[RV SMP](riscv-smp.md#真实用户态与cpu0业务交接)。
+## 一、源码组织
 
-## 映射权限与实际访问
+| 源码路径 | 核心职责 |
+| :--- | :--- |
+| `include/kernel/mm.h`、`mm_backend.h` | 跨架构地址空间句柄 `struct kernel_mm`、权限标志与后端契约 |
+| `mm/mm.c` | 地址空间生命周期、三层并发协议、缺页解析、批量页表操作、`mmap`/`mremap`/`brk`/`mlock`/`madvise`/`msync` 与远端内存访问 |
+| `mm/vma.c`、`include/kernel/vma.h` | 有序虚拟内存区域数组、二分查找、两阶段无分配区间编辑与相邻合并 |
+| `mm/memory_object.c` | 共享匿名映射与 System V 共享内存的稀疏页后备对象 |
+| `mm/hugetlb.c` | 原生大页物理池、预留配额与私有写时复制撤销机制 |
+| `mm/uaccess.c`、`arch/riscv/user_copy.S` | 本核直接用户内存拷贝（异常表恢复）与跨空间页固定借用 |
+| `include/arch/mmu.h`、`arch/riscv/sv39.c`、`arch/loongarch/mmu.c` | 双架构页表遍历、权限位编码、大页映射与跨核 TLB 同步实现 |
 
-虚拟内存区域（Virtual Memory Area，VMA）保存 `mmap`、`mprotect` 设置并经架构转换后的逻辑权限。LoongArch 保留只写权限，在 `/proc/<pid>/maps` 显示为 `-w-`，与显式可读可写的相邻区域分别记录。固定版本的 RISC-V Linux 为可写区域补上读权限，将仅含写权限的组合留作影子栈的标记，BoarOS 采用相同的普通映射权限。两架构在处理缺页和建立页表时允许读取可写页。写时复制或共享文件写回暂时撤销页表写权限时，保留实际的读权限。`MADV_POPULATE_READ` 按区域的逻辑读权限检查。
+---
 
-## 本核用户复制与真正的页面借用
+## 二、地址空间结构与三层并发协议
 
-RV 的普通 `copy_from_user`、`copy_to_user` 和路径字符串导入，在调用线程自己的 MM 已激活时直接访问用户虚拟地址，不为每页重新查询软件 PTE、取得物理引用再归还。汇编只在实际用户 load/store 期间打开 SUM，异常入口先保存并清除 SUM。每条用户访问指令有明确的恢复 PC，非法内核操作数仍按内核故障处理；恢复结果包含已经完成的字节前缀及真实异常原因。
+### 2.1 句柄与记录分离
 
-可恢复的缺页先返回共同复制层，再调用原 `kernel_mm_resolve_user_fault()`，避免把装页、文件 I/O 和等待压在额外的 trap 帧下面。成功后从未完成位置重试；权限错误、空洞、文件越界或实际装页失败仍返回 EFAULT 及完成前缀，不向用户额外递送该内核复制产生的缺页信号。COW、共享文件首次写入与写回后的重新开放，均通过真实 PTE 和原缺页器完成。字符串在 NUL 处停止，不能因其后的不可访问页面失败。
+- **`struct kernel_mm`**：轻量级可移动所有权句柄，直接指向地址空间本体 `struct kernel_mm_record`（通过静态断言约束其大小不超过单张基页）。多线程（`CLONE_VM`）或 `vfork` 通过 `kernel_mm_acquire()` 共享同一份记录并递增引用计数；`fork` 则通过 `kernel_mm_fork()` 建立独立记录并克隆虚拟内存区域与写时复制页表；最后一个拥有者退出时销毁页表并释放记录页。
+- **`struct kernel_mm_record`**：集中保存架构页表根（`space`）、虚拟内存区域集合（`vmas`）、堆顶与映射布局（`start_brk`、`current_brk`、`mmap_base`、`vdso_address`、`vvar_page`）、活跃处理器位图与 TLB/指令缓存代次，以及用户页固定借用计数（`access_pins` / `write_pins`）。
 
-本核访问服从实际页表和 TLB 协议；munmap、撤权、写回重新保护映射及页面退休仍须完成原有失效确认。跨地址空间、尚未激活的 exec 候选 MM、受控任务、协议和 DMA 请求，以及 LA 普通复制，继续通过软件 PTE 取得真实页面 pin。异步请求持有 pin 的生命周期不因本核普通复制改造而缩短。RV 实现见 `arch/riscv/user_copy.S` 与 `uaccess.c`，直接消费者见 `tests/workloads/io/vectors_v2.c`。
+### 2.2 三层并发协调与区间认领（`range_claim`）
 
-## 文件缺页的批量PTE发布
+在多核对称多处理（SMP）环境下，为避免多线程对同一地址空间的操作全部串行在一把大锁上，`mm/mm.c` 采用从外到内的三层锁与区间协调机制：
 
-私有磁盘文件的只读缺页遇到已就绪的缓存页时，可在原地址空间操作资格下借用该页。需要补建父级页表时，先尝试分配必需的表页，再准备驻留记录。只有准备过程需要等待时才归还操作资格，重新进入后核对该映射和文件代次。
+```mermaid
+flowchart TD
+    Entry["地址空间并发请求"]
+    OpLock["第一层：record->operations（Rank 25 可睡眠读写锁）<br/>• 共享读：普通缺页 / 非固定匿名 mmap / 纯匿名 munmap / 匿名增权 / mlock / pagemap<br/>• 独占写：fork / mremap / 固定地址替换 / 文件或对象映射 / 降权 / madvise / 截断失效"]
+    RangeClaim["第二层：活动区间认领（struct kernel_mm_range_claim）<br/>在 metadata 锁下登记当前修改的 [start, end)<br/>互不重叠区间直接并行；仅相交区间在 range_changed 上等待"]
+    VmaLock["第三层：record->vma_lock（Rank 31 可睡眠读写锁）<br/>保护 VMA 有序数组、虚拟内存用量与代次"]
+    MetaLock["底层短锁：record->metadata（Rank 15 原始读写自旋锁）<br/>保护页表项更新、区间链表、文件驻留登记与固定页计数（锁内严禁睡眠）"]
 
-共享磁盘文件读缺页若已有末级页表、允许顺序预装、且能立即取得内存管理独占资格和 inode 读资格，
-则在同一批内借用需求页与就绪邻页，为它们申请驻留记录并发布只读页表项。缓存命中和驻留记录
-必须同时覆盖需求页，才会发布这一批。资源不足、锁忙或缓存未命中时，归还已准备的资源，
-由常规缺页流程完成需求页。批量借用在分配器锁内复用物理区域查询，逐页核对分配状态；
-堆分配器每个分配页只检查一次共同的槽分配状态，并按实际取出的槽数更新计数。
-连续持有地址空间写资格时，从该资格直接检查空叶槽，页表发布仍在元数据写保护内进行。
-页缓存索引首次查询同时交付缓存记录。文件读资格排斥截断和显式失效，物理页引用排斥干净页回收，
-因此登记别名可以复用该记录，只在需求页此前由单页路径取得时查找其缓存记录。
-
-普通私有文件映射和 ELF 完整 FILE 页共用邻页发布过程。一次真实缺页完成来源读取和VMA／代次复核后，在同一VMA、同一64KiB窗口内检查尚未映射的页，只借用已经 READY 的缓存页。私有文件映射成批申请独立驻留记录。发布时持有 MM 元数据保护，单次查找当前叶表并安装仍为空的表项。已被并发填充的表项保留原映射，未交付的物理引用和记录在锁外归还。ELF来源同时限制在完整文件run内，COMPOSITE和ZERO页继续各自物化；随机读取及NOREUSE建议、强制调试访问和显式预装不走这条推测发布路径。
-
-同一窗口只走一次上层页表，随后扫描叶槽生成空槽位图。缓存物理引用一次批量取得，普通文件需要的resident记录在MM短保护外尽力准备。发布时在MM元数据保护内核对容量和当前叶槽，逐项发布只读COW映射。竞争者已占用的槽或缺少父表的槽跳过，真实页面和记录在保护外归还。权限增加后的私有写仍经COW。前后实际发布的页共同形成同步范围，整批发布后仍需在返回前完成目标CPU的指令／TLB同步。
-
-首次文件或匿名缺页的最终查表同时处理占用检查和叶项发布。若并发撤销使原有父表消失，发布入口报告缺少的表页，调用者保留已准备的数据和来源引用，在锁外补齐后重新核对。单页 `mprotect` 同样在一次查表中确认驻留并修改权限，有驻留页时按原范围处理失效确认。
-
-共同 prepared-map 接口在安装叶子的同一次发布中设置 COW 状态及计数，不先发布普通只读叶再沿地址查找、改写一次。RV 安装过程只走一次实际父表，检查已发布父项与本次准备页，最后才发布叶子和缺少的父连接；COW 提交复用同次检查取得的真实叶槽。缺表、已有叶冲突和候选失败均不消费调用者的数据页，退休与指令同步仍由共同 MM 完成。
-
-文件缺页由 MM 在准备前捕获 inode 代次和大小，结束 MM/inode 资格后取得来源页，再在重新取得的真实 VMA/inode 保护内核对代次、EOF 和当前 PTE，决定是否发布。磁盘 OFD 装页函数只交付一份真实页引用，不重复承担映射验证；截断后仍被借用的旧页只保证存储有效，必须由 MM 拒绝旧代次并归还。WILLNEED 仅装入并归还页面，不需要映射代次。内存文件的候选创建/回滚仍由原 preparation/finish 和对象代次协议维护。
-
-普通文件映射只发布实际缺页槽时，在该次元数据保护内同时确定同步目标。还有邻页要发布时，LA 的翻译同步和 RV 的取指同步在整批发布后确定目标。RV 新增不可执行翻译无需额外更新失效代次，依然按平台能力执行必要的本地刷新。
-
-RISC-V 的共享磁盘文件映射在预留文件空间、登记脏页并授予写权限后，只刷新发起核的地址翻译。这次更新保留同一个物理页。另一个处理器若用旧的只读翻译写入，缺页处理核对当前页表项后按地址刷新本核，再重试原指令。截断、解除映射及写回前重新撤销写权限仍须等待所有目标处理器确认。
-
-实际装入邻页时，在发布这批 PTE 的同一份元数据保护内确定同步目标。撤映射在一次保护内至多摘除两个有界批次，每段发布失效代次并重新取得实际目标核。SMP 下移除较长范围时，可用非阻塞取得的临时存储收集最多八个批次，合并目标后一次跨核确认。短范围或临时存储不足时使用两个栈上批次。物理页和退休页表在所有目标确认后归还。
-
-冷文件取指缺页的缓存读取窗口可用普通窗口的两倍，受现有 128 KiB 批次、EOF 和内存余量限制。取指读取围绕缺页位置选择邻页，普通顺序预读仍向前推进。先为需求页准备描述和物理页，实际 I/O 按文件顺序合并。邻页需要的资源不足时保留需求读取；其他调用者已在装入的邻页不加入本次等待。`MADV_RANDOM`、文件随机读取建议和 `NOREUSE` 仍关闭推测读取。缓存读取窗口与上面的 64 KiB 页表发布窗口独立，扩大读取窗口不会提前发布更多执行页表项。
-
-## 远端用户内存
-
-`kernel_mm_remote_transfer` 为 `process_vm_readv/writev` 和 ptrace 访问真实目标 MM。调用者先取得独立 MM 引用，目标随后 exec 或退出不改变这次访问所属的地址空间；每页复用既有缺页、COW、物理 pin 和共享文件缓存写借用。错误保留实际复制前缀，process_vm 返回已完成字节，ptrace 的不足一字访问由调用层转为 EIO。
-
-process_vm 按 REALCREDS、dumpable 和 CAP_SYS_PTRACE 检查目标。两个 iovec 数组在访问前导入为内核快照，各自最多 1024 项，八项以内使用请求内缓冲，更多项由堆持有。远端地址在实际访问到对应页时检查，避免无效尾项抹掉已完成的前缀。源页先复制到任务已有的一页 I/O 工作区并归还 pin，再解析目的页；同一 MM 或两个 MM 之间都不跨目的缺页保留源页。活动请求由任务持有独立堆对象，在首次用户页等待前登记。正常返回和任务取消共同归还向量快照及工作区借用；若目标 exec 或退出后本请求成为旧 MM 的最后持有者，真实文件关闭失败会保留请求和 MM 清理状态供后续调用或退出重试，不借用已经返回的内核栈。
-
-普通远端访问服从当前页权限。ptrace 的 force 读取依据 VMA 的 MAYREAD；强制写只允许 MAYWRITE 的私有匿名、文件及 ELF 映射越过当前只读保护。它复用实际 COW 准备与提交，保留原 VMA 和最终 PTE 权限，PROT_NONE 仍用后端真实的受保护叶表示，不临时开放用户写权限。共享只读映射不能通过 force 写入，磁盘共享页沿原缓存写许可与脏页协议。远端写完成数据存储后发布 MM 指令代次并同步活动 CPU，RV 和 LA 使用各自的现有指令/TLB 同步后端。
-
-直接行为检查使用 `tests/workloads/resource/process_memory.c`；真实 MM 的只读 COW、PROT_NONE、前缀和引用归还由 `tests/host/mm-remote.sh` 检查。
-
-## 锁页、MEMLOCK 与驻留查询
-
-`mlock`、`mlock2`、`munlock`、`mlockall`、`munlockall` 和 `MAP_LOCKED` 使用同一份 VMA 属性。`LOCKED` 表示锁定范围，`ONFAULT` 表示保留按需装入；MM 保存未来映射策略。VMA 分裂、合并、替换、搬移和删除同时维护锁定虚拟字节数，合并必须具有相同锁定策略。`/proc/<pid>/status` 的 `VmLck` 包含尚未触页的 ONFAULT 范围。纯匿名范围的 `mlock` 与 `munlock` 接入范围协调并在 `vma_lock` 保护下更新锁定标记，互不重叠范围可在不同核心并发推进。
-
-接纳使用实际调用线程组的 MEMLOCK 软限额，按架构页取整，`CAP_IPC_LOCK` 豁免。锁定重叠范围只计一次；下调限额保留已有范围。mmap（含固定替换）、brk、新增栈范围、mremap 扩大和 SysV attach 在修改前检查额度。mmap 按 Linux 将本次完整长度加入旧锁定用量后检查，额度拒绝保留固定替换的旧映射；brk 拒绝返回旧 break，锁定映射的 mremap 扩大超限返回 EAGAIN。mprotect 保留策略。
-
-立即锁定先提交 VMA 属性，再释放 MM 修改资格，复用匿名、COW 和文件缺页路径逐页预装。调用者拥有预装资格，复用共同缺页后端；一次至多处理16页，并在 VMA 边界释放，允许排队的写者推进。预装先等待目标范围的修改结束，再取得当前 VMA 快照；私有匿名缺页直接使用该快照，候选页发布前仍重新检查实际 VMA 和页表。多 CPU 的私有匿名预装在批次内保留读资格，分配、清零、COW 复制和 TLB 确认不持 MM raw；真实分配耗尽时释放读资格，重新进入可等待内存压力进展的原分配路径，再校验 VMA 代次和 PTE。需要新映射同步的架构将非执行匿名新叶的目标和范围保存在当前操作中，在批次结束、释放资格、分配重试及错误返回前统一确认；新非叶在需要时即时确认全范围。具有 Svvptc 的 RV 不为这些首次有效映射发送冗余失效。COW 旧页退休、可执行映射及其他后备仍按实际变化确认。普通用户缺页和共享对象后备仍在资格外准备候选。文件和ELF缺页借用实际来源后在MM资格外读取，发布时重新取得操作资格并复核代次；共享／独占和PTE批次规则见[文件缺页的批量PTE发布](#文件缺页的批量pte发布)。PROT_NONE 范围保留属性而不装入，普通 mlock 返回 ENOMEM，ONFAULT 登记成功；纯执行权限范围沿执行缺页路径装入。普通 mlock 预装缺页失败转为 ENOMEM，物理内存不足转为 EAGAIN，已提交属性和已驻留前缀保留；mmap 和 mlockall 的预装按 Linux 采用尽力完成规则。`MCL_FUTURE` 的重复设置替换未来策略，munlockall 同时清除当前和未来策略。
-
-当前没有 swap；PTE 已持有真实物理引用，文件映射的 cache alias 也参与回收判断，因此锁页复用现有持有关系。munlock 解除策略和计费，显式 unmap、文件截断和打洞继续执行原失效及回收协议。fork 创建的新 MM 清除锁定属性和未来策略；CLONE_VM/vfork 共享原 MM；成功 exec 使用新 MM，失败 exec 保留原状态。
-
-mincore 每页输出最低位的驻留状态，查询本身不装入页面。MM raw 内查询已有页面归属，包含 PROT_NONE 页面；没有 PTE 时查询内存对象或已完成装入的文件缓存。一次最多处理 16 页，任务 I/O 工作区保存结果，用户输出在 MM 保护外完成。文件来源借用覆盖锁外权限和缓存查询，恢复 MM 资格后核对 VMA 代次；截断、解除映射和最终关闭沿原来源退休协议等待借用结束。文件所有者、CAP_FOWNER 或有当前写权限的调用者可见真实状态，其余调用者按 Linux 获得全 1；匿名映射直接返回真实状态。VMA 空洞返回 ENOMEM，之前完整输出的前缀保留。
-
-直接检查使用 `tests/workloads/resource/memlock.c` 和 `tests/host/mm-resource-limits.sh`；前者与固定 Linux 运行相同 ELF，后者检查映射接纳、计数、部分修改和物理分配失败。显式 `MAP_GROWSDOWN` 采用同一增长路径，仅接受私有匿名映射；增长标志独立于主栈角色，保留普通 mmap 的 `/proc/maps` 身份。VMA 拆分、fork 与合并保留该标志，固定普通映射替换则撤销它。增长按目标片段大小检查 RLIMIT_STACK、总地址空间与锁页限额，不按普通可写数据计费；非 fixed 地址选择避开已有增长映射下方的 256 页 guard gap。`PROT_GROWSDOWN` 在一次独占 MM 操作内定位当前片段并修改至其下边界，不改变普通 mprotect 的并发路径。
-
-`tests/userland/growdown.c` 是 Linux/BoarOS 同源行为检查；`growdown.py` 使用已有 ABI fixture 与启动器，覆盖错误组合、实际缺页增长、fork、保护拆分、孔洞再增长、guard/限额和固定替换。生产 MM host 用例还检查资源归还与两种页大小的 VMA 计费/选址。
-
-## madvise 与共享段锁定
-
-RV64/LA64 的 madvise(233) 支持 NORMAL、RANDOM、SEQUENTIAL、WILLNEED、DONTNEED、FREE、REMOVE，以及 DONTFORK/DOFORK、WIPEONFORK/KEEPONFORK、DONTDUMP/DODUMP和POPULATE_READ/WRITE，参数中的 advice 按 Linux 32 位 int 解释。RANDOM 在 VMA 上保存随机访问建议，禁止该范围冷缺页的邻页批量装入及已驻留邻页映射；NORMAL/SEQUENTIAL 清除此标志。建议随 VMA 分裂、合并、fork 和 mremap 保留，不改变权限或文件位置。未接入的扩展模式返回 EINVAL。
-
-DONTNEED 在 MM 修改资格内撤销范围的 PTE 和文件驻留登记，保留 VMA、保护位、AS/DATA 用量和后备对象。私有匿名页重新访问得到零，私有文件 COW 页面重新取文件内容；共享匿名、SysV 和共享文件的数据保存在真实后备中；BPF 对象映射保留 map 数据但不补回 PTE，再访问产生 SIGBUS（见[BPF 对象共享映射](#bpf-对象共享映射)）。vDSO 代码缺页从内核内嵌的 ELF 重新装入，并完成指令缓存与 TLB 同步；只读 vVAR 缺页重新映射本 MM 持有的共享时钟页。复用现有有界退页过程，页和页表在活动 CPU 完成 TLB 失效后释放。范围中的空洞最终返回 ENOMEM，空洞两侧的有效映射仍执行；遇到锁定 VMA 返回 EINVAL，保留此前范围已经完成的变化。
-
-FREE 作用于私有匿名页及纯 BSS 零后备，登记时保留原内容；共享或文件后备及锁定范围返回 EINVAL。登记先排空已有写 pin，把当前页标记为写时故障，完成 TLB 确认后才接入回收。之后用户写或内核向用户页写成功时撤销该页候选，原有 COW 用实际引用处理 fork 后的独立写；fork 为继承页面复制回收候选，mremap 随页表叶移动候选，unmap 和退出归还登记。候选页和 PROT_NONE 页都保留真实 PTE owner。
-
-物理分配失败时，匿名页压力轮次串行遍历已登记的 MM；竞争分配者等待已有轮次结束后重试分配，避免把正在扫描当成没有候选。轮次固定开始时的登记和候选上界，新增加的工作留待下一轮；每次取得 MM 修改资格最多检查 16 个候选，然后释放资格再续扫。栈上续扫游标由真实 MM 扫描借用保活，游标指向的候选被删除时同步推进。遇到忙碌的 MM 时，先检查其他 MM；没有进展且调用者未持其他对象锁或用户 pin 时，再归还游标、释放扫描资格，等待该 MM 的真实修改资格，并沿原候选上界重新扫描。持锁或持 pin 的调用者跳过等待，避免 MM 持有者正等其归还资源的死锁。等待获得的资格在重扫前归还；若持续被竞争者抢先取得，可能重复等待。FREE 登记已排空写 pin，之后写 pin 须先取消候选；已有读 pin 自持物理引用，撤映射后仍可完成读取。
-
-一次取得进展后最多撤除同一 MM 的 16 个映射，下一轮从下一个 MM 继续。撤 PTE 后等待所有活动 CPU 确认失效，再归还物理引用：共享页的映射撤除与最后一份物理页归还分开计数，前者只表示继续扫描有进展。每个 MM 按实际候选数量扩展哈希索引；最后候选退休时归还索引并摘出扫描链，已有扫描借用仍持续到真实结束。最后 MM owner 在销毁页表前排空扫描借用。候选按实际驻留页分配元数据，分配失败返回 ENOMEM；已处理的前缀保留。
-
-REMOVE 删除范围的共享后备数据，保留 VMA 和文件长度。锁定范围返回 EINVAL；私有匿名或无文件后备的范围返回 EINVAL；私有文件（含 ELF 文件范围）或最大权限不含写的共享映射返回 EACCES，纯 BSS 零后备按匿名范围处理。最大权限沿用 mmap/shmat 时的来源许可，随后 mprotect 降为只读仍可删除。文件来源借用固定原 OFD 和文件偏移，释放 MM 资格后复用普通 fallocate 的 PUNCH_HOLE|KEEP_SIZE 路径；只读挂载、后端不支持或 I/O 失败返回实际错误。文件失效回调撤销同 inode 在各 MM 中的共享页和未写私有页，保留独立私有 COW。tmpfs 释放完整后备页及配额，非整页打洞只清除保留页的边缘字节；ext4 沿原磁盘事务、缓存失效与写回协议。
-
-共享匿名和 SysV 的 MM 来源节点向真实内存对象登记；REMOVE 持有对象引用，在 MM 资格外关闭对象映射代次，逐个 MM 排空用户 pin、撤销对应 PTE，再删除对象页并重新开放缺页。节点摘除后在 MM 资格外等待已有通知借用结束，再归还对象。缺页准备保存对象代次，发布前拒绝已删除的旧页。持有该 MM 的用户 pin 时若遇对象关闭，缺页返回 CONFLICT，让调用者先归还 pin；无 pin 才等待对象开放，避免打洞与 pin 排空相互等待；fork 只在子 VMA、页表都构造完成后登记，代次发生变化时撤销子共享叶，由首次访问重新装入。范围空洞两侧仍执行并最终返回 ENOMEM；后续 VMA 或后端失败保留先前已经完成的删除。
-
-WILLNEED 使用已有文件缓存装入过程，单次建议至多准备16个数据页，不安装用户 PTE、不改变OFD offset。文件/ELF来源借用覆盖锁外I/O，最后一个映射或原FD关闭后，来源在建议结束时归还。返回0表示接纳建议；装入失败采用 Linux 忽略 fadvise 返回值的规则，实际读取/缺页继续处理其实际I/O结果。无swap时私有匿名、纯BSS和无文件身份的ELF来源返回EBADF，共享内存没有swap-in工作。
-
-POPULATE_READ/WRITE 与锁页预装共用缺页准备和后端分派，但要求范围具有明确的读／写权限；WRITE完成必要的私有COW或共享文件写准备。它们装入真实PTE，不改变锁定属性及MEMLOCK用量。权限或特殊PFN来源不适合返回EINVAL，VMA空洞及OOM返回ENOMEM，文件越界等缺页失败返回EFAULT；已有驻留前缀保留。分配、文件I/O和等待使用共同锁外阶段，恢复后重查实际VMA及来源，每批最多16页后归还资格。致命中断结束预装，不把SIGBUS/SIGSEGV改作一次用户故障递送。
-
-mmap 的 MAP_POPULATE 在映射提交后执行同一预装过程，失败保留映射及驻留前缀；MAP_POPULATE|MAP_NONBLOCK跳过预装，NONBLOCK本身不创建驻留页。普通MAP_LOCKED继续保留锁页自己的接纳与预装错误规则。
-
-DONTDUMP/DODUMP修改真实VMA策略位，随分裂、合并、fork、mprotect和mremap保留。VVAR及BPF对象映射默认排除；VVAR、VDSO和不可扩张对象不允许DODUMP。当前没有core文件写出，策略状态及生命周期检查不代表已经验证core内容。
-
-DONTFORK 使指定范围不进入新建子 MM，DOFORK 恢复继承；WIPEONFORK 保留子进程的私有匿名范围，但不继承父物理页，首次访问从零后备装入，KEEPONFORK 清除此策略。纯 ELF BSS 按实际零后备处理，文件及共享映射拒绝 WIPEONFORK。策略随 VMA 分裂、合并、mprotect、mremap 和后续 fork 保留；锁定与 fork 策略共用原 flags 字段、分别按位修改，munlockall 只清除锁位。
-
-fork 构造时直接筛选子 VMA，子 MM 只借用仍被继承范围使用的文件、ELF、共享匿名来源及驻留记录。fork 的两次页表遍历在父 MM 编辑资格内复用当前 VMA 的起止地址和继承策略。普通私有文件映射在首次私有写入前可由文件重新装入，子进程仅继承这段映射及其 OFD 引用，首次访问再建页表和驻留记录。已有匿名写入历史的私有文件映射保留驻留页并执行写时复制。RV 每张子叶表按最多 16 个相邻表项取得物理页引用。该批准备成功才发布表项，后续分配失败时能按已发布的子树归还引用。两架构页表准备明确区分 PRIVATE、SHARED、SKIP；DONTFORK 和 WIPEONFORK 不取得父页引用，只有实际进入子页表的私有叶才使父页转 COW。子构造失败由已有清理归还临时页表、来源和附件，子页表准备成功后，父页表按同一叶表内最多 16 项提交写保护。大页独立处理。只有实际修改父表才推进翻译失效，子进程发布前等待同步完成。共享 MM 的线程和 vfork 沿原共享地址空间规则。
-
-SHM_LOCK/UNLOCK 在既有CPU0共享内存控制路径执行。段保存首次LOCK时调用者真实UID的账户引用，按段尺寸向上取整的页数计费，以当前调用者MEMLOCK软限额接纳，CAP_IPC_LOCK豁免。无该capability时，euid须为owner或creator；LOCK零限额返回EPERM，超额返回ENOMEM。权限与零限额检查先于重复LOCK判断；重复操作沿用已有计费。IPC_SET保留锁定状态，IPC_STAT和`/proc/sysvipc/shm`显示SHM_LOCKED。
-
-LOCK保留按需装页，当前memory_object已经持有已驻留页。UID或owner改变后，UNLOCK或RMID后的最后attachment销毁向原账户归还。共享段的UID额度与普通mlock的MM虚拟字节、VmLck分别统计。
-
-共享内存查询与槽/代次规则见[SysV SHM](sysv-shm.md)。直接消费者为`tests/workloads/resource/madvise.c`、`vdso_dontneed.c`、`shm_lock.c`，可通过 `tests/userland/run.py --workload madvise` 或 `--workload vdso_dontneed` 选择；宿主入口为`tests/host/mm-resource-limits.sh`、`tests/host/madvise-remove.sh`、`tests/host/shm-lock.sh`和文件I/O并发检查。RV固定Linux参考关闭swap；madvise的LA对照使用独立的无swap参考缓存，与BoarOS保持相同条件：
-
-```sh
-python3 tests/loongarch/prepare.py --component linux --profile platform-noswap
+    Entry --> OpLock --> RangeClaim --> VmaLock --> MetaLock
 ```
 
-原`platform`参考缓存继续供其他消费者使用，配置和镜像身份分别检查。
-
-## 范围与入口
-
-| 文件 | 当前职责 |
-|---|---|
-| `include/kernel/mm.h` | 定义跨架构 MM 句柄、权限、状态、引用和 VMA 入口 |
-| `mm/mm.c`、`include/kernel/mm_backend.h` | MM 引用、VMA、后备来源、缺页与驻留策略；记录页拥有构建期选定的页表后端 |
-| `include/arch/mmu.h`、`arch/riscv/mm.c` | 构建期 MMU 操作绑定与既有 RV 创建/统计接口的薄适配 |
-| `arch/loongarch/mmu.c`、`tlb_refill.S` | 16 KiB/三级用户页表、COW 所有权、INVTLB 与软件 refill；LA 验收见[首阶段](loongarch-boot.md) |
-| `tests/riscv/mm_cases.c`、`tests/riscv/mm.sh`、`tests/riscv/mm-fatal.sh` | 验证创建、共享引用、移动、查询、页表回收和 resolution invariant fatal |
-| `tests/riscv/vma_cases.c`、`tests/riscv/vma.sh` | 验证 VMA 集成后的 fork、缺页解析、OOM 与所有权回收 |
-
-稳定接口为：
-
-```c
-enum kernel_mm_status riscv_kernel_mm_create(
-    struct kernel_mm *mm,
-    struct riscv_sv39_user_space *space);
-
-enum kernel_mm_status kernel_mm_acquire(
-    struct kernel_mm *destination,
-    const struct kernel_mm *source);
-
-enum kernel_mm_status kernel_mm_fork(
-    struct kernel_mm *destination,
-    struct kernel_mm *source);
-
-enum kernel_mm_status kernel_mm_move(
-    struct kernel_mm *destination,
-    struct kernel_mm *source);
-
-enum kernel_mm_status kernel_mm_lookup(
-    const struct kernel_mm *mm,
-    uint64_t virtual_address,
-    struct kernel_mm_mapping *mapping);
-
-enum kernel_mm_status kernel_mm_vma_enable(
-    struct kernel_mm *mm,
-    struct kernel_heap *heap);
-
-enum kernel_mm_status kernel_mm_vma_insert_anon(
-    struct kernel_mm *mm,
-    uint64_t start,
-    uint64_t end,
-    uint32_t permissions,
-    enum kernel_vma_role role,
-    enum kernel_vma_fault_policy fault_policy);
-
-enum kernel_mm_status kernel_mm_vma_lookup(
-    const struct kernel_mm *mm,
-    uint64_t virtual_address,
-    struct kernel_vma *vma);
-
-enum kernel_mm_status kernel_mm_brk_initialize(
-    struct kernel_mm *mm,
-    uint64_t start,
-    uint64_t limit);
-
-enum kernel_mm_status kernel_mm_brk(
-    struct kernel_mm *mm,
-    uint64_t requested,
-    uint64_t *result);
+- **局部校验消除假冲突**：私有匿名缺页在最终写入硬件页表前，仅在 `vma_lock` 与 `metadata` 下核对目标地址所属虚拟内存区域（VMA）与 `range_edit_generation` 是否冲突；其他线程在无关地址上的映射增删不会迫使当前缺页白白重试。
+- **原子排空固定页（`MM_PIN_CLOSED`）**：在撤销写权限、截断文件或登记懒回收前，修改者设置 `access_pins` 或 `write_pins` 最高位 `MM_PIN_CLOSED`，阻止新的用户页固定借用并等待已有借用归零后再执行页表变更，确保进行中的内核拷贝或直接内存访问（DMA）不会失去页保活。
 
-enum kernel_mm_status kernel_mm_mmap_anonymous(
-    struct kernel_mm *mm,
-    uint64_t hint,
-    uint64_t length,
-    uint32_t permissions,
-    uint32_t flags,
-    uint64_t *address);
+---
 
-enum kernel_mm_status kernel_mm_mmap_file_private(
-    struct kernel_mm *mm,
-    struct kernel_open_file_description **file,
-    uint64_t hint,
-    uint64_t length,
-    uint64_t file_offset,
-    uint32_t permissions,
-    uint32_t flags,
-    uint64_t *address);
+## 三、虚拟内存区域（VMA）与后备类型
 
-enum kernel_mm_status kernel_mm_munmap(
-    struct kernel_mm *mm,
-    uint64_t address,
-    uint64_t length);
+`struct kernel_vma_set` 将进程的所有虚拟内存区域按起始地址升序保存在连续动态数组中（初始容量 8，按 2 倍扩容），利用二分查找定位区间，并在 `record->recent_fault_vma` 缓存最近缺页命中的区域以加速连续访问。所有区间修改（分裂、替换、合并、重映射）均采用 **两阶段 `prepare → commit` 模型**：先在准备阶段申请足够容量，确保最终提交阶段绝不分配内存、绝不出现半提交状态。
 
-enum kernel_mm_status kernel_mm_mprotect(
-    struct kernel_mm *mm,
-    uint64_t address,
-    uint64_t length,
-    uint32_t permissions);
+| VMA 类别 | 对应系统调用与用途 | 后备存储与缺页策略 |
+| :--- | :--- | :--- |
+| **私有匿名映射** | 堆（`brk`）、主栈、`MAP_PRIVATE \| MAP_ANONYMOUS` | 按需分配零页；支持向下自动扩展栈（`MAP_GROWSDOWN`），默认在其下方预留 **256 页**保护间隔防止与普通映射碰撞 |
+| **共享匿名与 SysV 共享内存** | `MAP_SHARED \| MAP_ANONYMOUS`、`shmat` | 由稀疏页后备对象 `struct kernel_memory_object` 维护物理页，`fork` 后父子保持可写共享 |
+| **私有 / 共享文件映射** | 普通文件的 `mmap` | 与文件读写共用统一页缓存（Page Cache）；私有映射首次写入触发写时复制，共享映射通过反向别名登记追踪脏页与写回 |
+| **ELF 程序段映射** | `execve` 加载可执行文件与动态库 | 使用独立 `kernel_elf64_source`：纯文件页共享页缓存，文件与零填充（BSS）边界页按需私有物化并精确清零尾部 |
+| **原生大页映射** | `MAP_HUGETLB`、`SHM_HUGETLB` | 由 `mm/hugetlb.c` 维护连续高阶物理页池与预留配额，直接安装中间级大页表项 |
+| **内核对象共享映射** | eBPF Map / RingBuf、`AF_PACKET` 接收环（`TPACKET_V3`） | 映射建立时直接安装固定内核物理页，不参与普通按需装页；解除映射后访问未映射槽位触发总线错误（`SIGBUS`） |
+| **vDSO 与 vVAR** | 内核向每个进程注入的快速时钟与信号返回页 | `vDSO` 映射内核内嵌共享代码页，`vVAR` 只读映射共享时钟数据页（默认排除出核心转储） |
 
-enum kernel_mm_status kernel_mm_resolve_user_fault(
-    struct kernel_mm *mm,
-    uint64_t virtual_address,
-    uint32_t access);
+---
 
-enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm);
-```
+## 四、缺页解析、批量页表操作与跨核 TLB 同步
 
-`riscv_kernel_mm_satp()` 是 RISC-V scheduler 创建任务时使用的架构入口。通用层不暴露 Sv39 对象，也没有运行期 vtable；RISC-V 构建通过 `include/arch/mmu.h` 直接绑定 Sv39 操作；通用策略位于 `mm/mm.c`。LoongArch 构建以后为同一后端契约提供 16 KiB/三级页表实现。这样任务和 syscall 层依赖 MM 语义，而不依赖页表格式，调用热路径也没有间接分派。
+### 4.1 按需调页与写时复制（CoW）
 
-`kernel_mm_pin_user_page()`只对resident且已许可的基页成功，在rank15短读资格内
-完成PTE和权限检查并取得实际物理引用；`NOT_MAPPED/ACCESS`要求调用者fault后重查。输出token零初始化，
-成功才发布；同一I/O owner在复制完成后调用`kernel_mm_unpin_user_page()`。
-调用者保持LIVE MM句柄，末引用释放时仍有pin属于非法生命周期并fatal。
-原`kernel_mm_lookup()`仍只返回快照，不能将其物理指针借用当成pin。
-`make test-mm-pin-host`链接生产MM/VMA/Sv39 walker，只替换硬件CSR/fence；
-文件/SysV等范围外入口一旦被调用就中止。反例先证明旧lookup只有PTE引用，
-新实现检查撤映射、耗尽/复用、权限、复制前缀、token错误和最终allocator审计。
-此入口不替代硬件TLB或两核验收。
+- **匿名缺页与顺序写推测窗口**：首次访问未映射的匿名页时分配物理页并清零（RISC-V 硬件支持 `cbo.zero` 时自动加速）。在 RISC-V 上，针对持续向同一方向推进的非执行匿名写缺页，内核自动启用推测预装窗口（初始 **8 页**，持续顺写扩至 **16 页**），在已有末级页表内一次批量映射多个零页，大幅减少逐页陷入次数。
+- **写时复制（Copy-on-Write，CoW）**：写入只读共享的私有页时，内核在 `metadata` 锁内检查该物理页的引用计数：
+  - 若引用计数为 **1**（说明父子进程中另一方已退出或已改写），直接**原地升级**清除 CoW 标记并恢复写权限，避免无谓拷贝；
+  - 若引用计数大于 **1**，则在锁外分配新页并复制数据，重新获取保护并校验页表项代次未变后提交新页，将旧物理页放入退休批次延迟归还。
 
-## 句柄、引用与状态
+### 4.2 批量页表项发布与 16 项批处理
 
-`struct kernel_mm` 是一个可移动的拥有型引用，不是地址空间本体。句柄直接持有内核记录指针，`record_page_address` 只用于归还记录页。记录保存引用计数、清理阶段和架构页表；创建、fork 的成功与清理分支、acquire、move 和最终 release 共同维护指针与所有权。正常访问不再从物理句柄重新解析记录，也不重复审计整份 VMA/来源/清理状态。多个 LIVE 句柄可以指向同一记录：
+- **64 KiB 文件/ELF 邻页批量发布**：处理普通文件或 ELF 只读缺页时，内核在完成需求页装入后，在同一 VMA 的 **64 KiB 窗口**（`KERNEL_PAGE_CACHE_READY_WINDOW`：RISC-V 为 16 页，LoongArch 为 4 页）内只遍历一次上层页表，批量借用页缓存中已经就绪的相邻页，在单次 `metadata` 锁内一次性安装多条叶页表项（若用户通过 `madvise(MADV_RANDOM)` 声明随机读取模式，则自动关闭推测预装）。
+- **16 项批处理与合并撤映射**：
+  - `fork` 克隆子页表与将父页表标记为写时复制时，按叶表内最多 **16 项**分批获取物理引用和修改表项；
+  - `munmap` 解除映射时，每段收集最多 **16 个**退役项进 `struct kernel_mm_retirement`（大范围撤映射在多核下可临时申请合并最多 **8 个**批次），统一广播一次跨核 TLB 失效后再批量归还物理页与空页表。
+- **虚假缺页（Spurious Fault）处理**：多核并发访问同一未驻留页时，后到的核拿到锁后若发现先到的核已把满足权限的页表项装好，只需就地执行一次本核本地 TLB 刷新即可直接重试指令，不重复发送跨核远程同步。
 
-- `acquire` 增加引用计数并发布一个新的独立 owner；vfork 与线程 clone 用它共享地址空间，任一线程释放自己的引用不撤销其他 owner。共享 MM 的 VMA/PTE 使用同一 operation gate 与 metadata raw；发布变更后同步活动 CPU 的翻译，确认完成才回收旧页，具体见下文并发协议；
-- `fork` 创建独立地址空间，克隆 VMA/文件来源并让父子暂时共享用户物理页，逻辑 MM 和后续写入仍独立；
-- `move` 转移一个 owner，不改变引用计数；
-- `release` 消耗一个 owner，非末引用只减计数，末引用才销毁页表树和记录页；
-- `lookup` 把架构权限翻译为 `KERNEL_MM_READ/WRITE/EXECUTE/USER`，不让通用调用者依赖 RISC-V PTE 位值。
+### 4.3 跨核 TLB 失效与延迟退休协议
 
-LA 的有效 PTE 权限按固定 Linux `arch/loongarch/mm/cache.c::protection_map`：
-非 PROT_NONE 用户页可读，EXEC 独立控制 NX。请求的 VMA 权限保持原值；因此
-未驻留的纯 EXEC 页数据读取被 VMA 拒绝，页经合法写入或取指驻留后可由 PTE
-读取。uaccess 同样先看实际 PTE，冷页才走原通用 fault 权限检查。不能统一把
-VMA 的 EXEC 改写成 READ，也不能只修改用户硬件权限而使复制仍误报 EFAULT。
-`make test-permissions-loongarch` 用同 ELF 验证两种 RAM 下的冷/驻留页、取指
-物化、mprotect、fork、uaccess 和撤执行权限；PROT_NONE、COW及回收契约保留。
+每当解除映射、权限降级或替换已有物理页时，`note_tlb_change_locked()` 递增 `tlb_generation`（若涉及可执行页同步递增 `instruction_generation`），并在全内存屏障后读取目标核集合（`active_cpus | borrowed_cpus`）。退出自旋锁后，`finish_tlb_change()` 驱动架构后端完成同步：
+- **RISC-V 64**：本地执行 `sfence.vma` / `fence.i`，远端通过 OpenSBI `sbi_remote_sfence` / `sbi_remote_fence_i` 同步（纯新增的非替换普通数据映射无需触发远端刷新）；
+- **LoongArch 64**：本地执行 `invtlb` / `ibar 0`，远端通过每核同步槽与核间中断 `LA_IPI_TLB` 确认。
 
-输入目标必须是全零 `EMPTY` 句柄。成功移动后源进入 `MOVED`，成功释放后进入 `RELEASED`；二者都不再拥有资源。分配器释放属于 fail-stop 契约，不能由调用者按错误码重试；只有文件/OFD 等真实 I/O owner 的清理状态会交给上层继续处理。
+所有目标核确认失效后，内核才调用 `kernel_mm_retirement_release()` 将退休批次中的物理页与页表安全归还给伙伴分配器。
 
-RISC-V 创建先分配并解析记录页，最后才把 LIVE Sv39 空间移入记录；成功后输入空间成为 MOVED。记录页及页表的合法释放完成即结束；若同时持有 VFS/file-source owner，则仅保留对应的 I/O cleanup 状态。
+---
 
-## Program break 与匿名 heap
+## 五、本核直接用户拷贝与软件页表固定借用
 
-exec 的 ADDR_NO_RANDOMIZE 候选状态控制主 ELF/解释器、mmap ceiling、brk、vDSO 与栈的所有地址随机抽样。禁用后相同映像与参数得到确定布局；AT_RANDOM 的 16 字节仍独立从随机源生成。候选只在成功 exec 提交到任务，失败保留原状态。
+内核读写用户空间数据时根据场景采用两条互补路径：
 
-`kernel_mm_brk_initialize()` 只用于尚未发布、只有一个 owner 且已经启用 VMA 的新映像。它记录页对齐的起始 break、当前精确 break 和页对齐上界；RISC-V ELF image 把最高非空 `PT_LOAD` 的 `p_vaddr + p_memsz` 向上对齐作为起点，并将独立布局计算出的 mmap ceiling/vDSO 作为约束。每次 exec 因而得到由新 ELF 独立计算的 break，而 fork 复制父进程调用时的精确值。
+1. **RISC-V 本核直接用户拷贝（`arch/riscv/user_copy.S`）**：当访问当前处理器已激活线程自身的地址空间时，汇编拷贝例程仅在实际访存指令区间开启 `sstatus.SUM`（允许内核态访问用户页），采用 32 字节/8 字节展开循环直接拷贝用户虚拟地址，并将每条访存指令登记到 `.rodata.riscv_uaccess_fixups` 异常恢复表。若拷贝中途触发缺页，陷入入口立即清除 `SUM` 并跳转恢复点，返回精确的已完成字节数与异常原因，随后由外层公共拷贝逻辑在常规内核栈上调用 `kernel_mm_resolve_user_fault()` 按需装页并重试——既免去逐页查软件页表的开销，又避免在嵌套陷入帧下阻塞做磁盘 I/O。
+2. **软件页表固定借用（`kernel_mm_pin_user_page`）**：用于跨地址空间访问（如 `process_vm_readv`、`ptrace`）、原子比较交换（`futex`）、DMA 设备缓冲以及 LoongArch 常规拷贝。在 `metadata` 读锁内查询页表项、核对权限、递增物理页引用计数与 `access_pins`/`write_pins`，返回后借用页帧在释放前始终保持存活，读写结束后通过 `kernel_mm_unpin_user_page()` 成对归还。
 
-`kernel_mm_brk()` 实现 raw Linux syscall 所需的返回语义：参数 0 查询当前值；落在起点以下、上界以上、溢出或因 VMA 冲突/metadata OOM 无法增长时，MM 保持不变并把原 break 写入结果，而不是产生负 errno。成功结果保留字节粒度；只有 VMA 和 PTE 操作向上按 4 KiB 对齐。
+---
 
-跨页增长只把新增 `[old_page_end, new_page_end)` 登记为 RW anonymous `DEMAND_ZERO` heap VMA，不提前分配数据页。首次 U-mode load/store 复用普通匿名 fault 路径分配零页。跨页缩小通过通用区间编辑撤销目标范围，因此能容忍用户先用 `munmap` 打洞、用 `mprotect` 分段或用 fixed mmap 替换局部区域；它不再依赖一个从 break 起点连续延伸的阶段性 heap VMA。缩小先让范围内用户 PTE 失效并刷新本 hart TLB，再无分配地提交 VMA 删除和精确 break；物理页释放完成后该操作才返回。
+## 六、内存控制接口与跨进程内存访问
 
-## 匿名与文件映射
+BoarOS 完整实现了现代 Linux 进程内存控制接口，各项机制均复用上述核心路径：
 
-调用线程的 READ_IMPLIES_EXEC 在 mmap 接纳时把 PROT_READ 转为可读可执行；文件来源位于 noexec 挂载时不添加执行权限，显式 PROT_EXEC 仍按原规则拒绝。mprotect 在一次范围修改资格内按 VMA 的 maximum_permissions 决定是否添加隐含执行权限，最大权限不含 EXEC 的范围仍可设为只读；显式执行请求继续校验最大权限。真实 VMA、驻留 PTE 和后续缺页使用相同权限，遇到后续空洞或拒绝时保留已提交前缀。
+- **堆管理（`brk`）与重映射（`mremap`）**：`brk` 维护字节级精确堆顶并按页对齐增删堆区 VMA，受 `RLIMIT_DATA` / `RLIMIT_AS` / `RLIMIT_MEMLOCK` 约束；`mremap` 支持原地缩扩、允许搬移（`MREMAP_MAYMOVE`）、指定目标搬移（`MREMAP_FIXED`）与保留旧区域（`MREMAP_DONTUNMAP`），搬移叶表项时同步迁移文件驻留与懒回收登记。
+- **内存锁定与驻留查询（`mlock` / `mlock2` / `mlockall` / `mincore`）**：记录 VMA 锁定标志与未来锁定策略（`MCL_FUTURE`），按线程组 `RLIMIT_MEMLOCK` 软限额计费（拥有 `CAP_IPC_LOCK` 豁免）；`mlock2(MLOCK_ONFAULT)` 允许仅登记锁定策略而推迟至首次缺页装入；`mincore` 每次批量查询最多 16 页的实际物理驻留状态而不触发装页。
+- **内存使用建议（`madvise`）与同步（`msync`）**：
+  - 访问模式提示：`MADV_NORMAL` / `RANDOM` / `SEQUENTIAL`（控制邻页预装）；`MADV_WILLNEED` 预热最多 16 页文件缓存而不建页表；`MADV_POPULATE_READ` / `POPULATE_WRITE` 主动预装真实页表项。
+  - 页面回收与打洞：`MADV_DONTNEED` 立即撤销映射（私有页重读得零，文件/共享页保留后备数据）；`MADV_FREE` 将私有匿名页标记为懒回收候选（通过写保护感知再次写入，仅在物理内存紧张时由 `kernel_mm_reclaim_lazy` 批量回收）；`MADV_REMOVE` 直接删除共享匿名对象页或调用文件系统的打洞路径释放磁盘块。
+  - 继承与转储策略：`MADV_DONTFORK` / `DOFORK`（子进程是否继承）、`MADV_WIPEONFORK` / `KEEPONFORK`（子进程继承为空白零页）、`MADV_DONTDUMP` / `DODUMP`。
+  - `msync` 支持 `MS_ASYNC`、`MS_SYNC`（按段写回共享文件脏页并同步落盘）与 `MS_INVALIDATE`（遇锁页返回 `EBUSY`）。
+- **跨进程内存访问（`kernel_mm_remote_transfer`）**：同时支撑 `process_vm_readv`/`writev`（遵循目标当前权限，保留精确完成前缀）与 `ptrace` 调试读写（`force = 1`，允许依据 VMA 最大允许权限对只读私有代码段/数据段执行写时复制修改，写入完成后广播指令缓存同步）。
 
-`kernel_mm_mmap_anonymous()` 实现 private demand-zero 与 `MAP_SHARED|MAP_ANONYMOUS`。非 fixed 请求优先使用空闲的页对齐 hint，否则在每个 MM 的随机 mmap ceiling 以下、栈 guard 之外 top-down 选址；`FIXED_NOREPLACE` 只检查冲突，`FIXED` 则撤销旧页和 VMA 后替换。长度向上按 4 KiB 对齐，返回地址只在成功时写入。RISC-V 的 W&&!R PTE 编码保留，因此仅写保护被规范化为 RW。
+---
 
-共享匿名 mmap 在提交 VMA 前建立独立对象；MM registry 对每个仍使用的对象持一份引用，VMA 只借用并保存连续字节偏移。对象以稀疏页索引保存已产生的零页，每个页槽持一个物理引用，每个 PTE 另持一个。fork 先为子 MM 取得对象引用，再克隆页表；已驻留共享页在父子保持可写共享，未驻留页由任一方按对象和索引首次发布。`PROT_NONE`/恢复保留共享属性，不借用 COW 标记。撤映射、fixed replace 与 MM 销毁在最后使用它的 VMA 消失时释放本 MM 的对象引用；对象末引用释放所有页槽。仍有对象引用时，局部撤映射不截断对象内容；首版没有 swap 回收。
+## 七、原生大页与双架构权限差异
 
-`kernel_mm_validate_file_private_mapping()` 复用真实映射的规范化、范围、选址和 fixed-noreplace 冲突检查，但不分配来源节点、不编辑 VMA，也不预留返回的区间；当前单 hart syscall 在该检查与真实提交之间不会调度。`kernel_mm_mmap_file_private()` 接收调用者已经 pin 的可读普通文件 OFD、页对齐文件偏移和同一组选址/权限参数；传入 `KERNEL_MM_MAP_SHARED` 时建立 `FILE_SHARED` VMA。syscall 层先完成无副作用校验，使零长度、非法 fixed 地址、offset 溢出和既有映射冲突保持原 errno 优先级；范围与选址校验后，无副作用地检查锁页接纳；显式 MAP_LOCKED 无资格时返回 `EPERM`，额度不足时返回 `EAGAIN`，真实提交仍重新检查。随后按 OFD 的打开模式检查读权限和共享可写映射的写权限，不符返回 `-EACCES` 并释放本次临时 pin；对象是否提供 read 操作不参与这项判断。随后按 OFD 保留的实际 mount 检查 NOEXEC：请求 `PROT_EXEC` 时返回 `EPERM`，早于无映射后端对象的 `ENODEV`；拒绝不会替换已有 MAP_FIXED 区间。允许的非执行文件映射会从 VMA 的 `maximum_permissions` 去掉 EXEC，后续 `mprotect` 增加执行权限返回 `EACCES`，关闭 FD、fork、区间拆分和 mremap 都保留这项限制。普通文件的 mode 执行位不参与 mmap 资格，匿名映射也不受文件 mount 属性限制。成功时 MM 消耗 pin，失败时仍由调用者持有。MM 对每个不同 OFD 只建一个来源节点，并由该节点持有一份来源引用；重复 mmap 不累积历史引用，VMA backing 借用同一对象。VMA 提交后若来源已存在，只递减一个由调用者刚取得且必然不是末引用的临时 pin；新来源则直接转移 pin，因此系统调用不会出现“返回错误但映射已生效”。关闭 fd 不影响映射；fork 为子 MM 建立独立来源节点并取得一份引用。`munmap`/fixed replace 在提交 VMA 后的冷路径释放已经没有 VMA 使用的来源节点，真实 VFS/OFD 清理错误由其 owner 状态向上转交。页故障查到 VMA 后直接取得 backing，不在 fault 热路径遍历 fd 表或来源链。
+- **原生大页（Hugepages）**：RISC-V Sv39 支持 **2 MiB**（`order = 9`）中间级大页，LoongArch 64 支持 **32 MiB**（`order = 11`）大页（硬件 `LDDIR`/`LDPTE` 路径原生覆盖两个 16 MiB `EntryLo`）。大页物理池、`/proc/sys/vm/nr_hugepages` 容量控制、预留配额及父进程 CoW 耗尽时的子映射撤销逻辑集中在 `mm/hugetlb.c`（详见 [原生大页与复合页](hugepages.md)）。
+- **只写映射（`PROT_WRITE`）的架构权限差异**：
+  - **RISC-V Sv39**：硬件规范禁止 `W=1, R=0` 的页表项编码，因此 `user_vma_permissions()` 与上游 RISC-V Linux 一致，在 VMA 层面即将纯写请求规范化为可读可写（`rw-`）。
+  - **LoongArch 64**：VMA 保留用户请求的只写属性（`/proc/<pid>/maps` 显示为 `-w-`），但页表有效权限按架构规范允许读取已驻留页；未驻留的纯执行页仍由 VMA 权限拒绝数据读取。
 
-文件 VMA 不预分配数据页。`FILE_PRIVATE` read/execute 首次缺页从挂载页缓存取得共享页并建立 COW PTE；首次写准备真实来源页后复制到私有页，不将来源缓存页直接暴露为可写。已有 COW 叶在末引用时原地恢复权限，否则复制；PTE 提交与退休由共同 MM 统一执行实际 TLB／指令同步。文件最后一页的有效内容之后补零；故障页起点已经不小于文件大小时返回 `BUS_FAULT`。普通 read/write 与后续私有缺页共用 inode 页缓存；已私有化的 COW 页继续隔离。
+---
 
-`FILE_SHARED` 的每个驻留 PTE 持缓存物理页引用，MM 持对应 OFD 来源引用；同一 inode 页在独立 open、独立 MM 和多个 VA 中维持同一数据源。MM 分配驻留记录后安装只读共享 PTE，再把记录挂入缓存页的反向索引；失败撤销 PTE，未发布的记录由 MM 回收。写故障在缓存项标记当前有效字节脏、推进 generation 后将本 PTE 升为可写。缓存写回前按反向索引重新保护别名，写回中再次写入会重新故障并改变 generation，旧写回不能清除新脏状态。MM 拥有记录，缓存借用链接，PTE 持物理页；fork 预留子记录并在页表共享成功后挂入索引，munmap/fixed replace/退出无分配地摘除。只读 fd 建立的共享 VMA 保存不可升级的写资格，`mprotect` 请求写返回 `EACCES`，合法权限变化重新建立首次写追踪。
+<details>
+<summary>展开查看：核心内部接口清单与定向验证入口</summary>
 
-`make test-files-partial-write-riscv` 对共享映射注入 flush EIO、重试后再次写 fault；在 ext4 写回已复制旧值、页缓存比较 generation 前，通过第二个驻留 VA 别名触发真实用户写 fault，下一次同步与驱逐重读必须看到新值。测试还扫描 fork metadata 分配失败、固定地址替换分配失败时保留原映射、别名和 OFD，最后检查页资源基线。该确定性交错仍在单 hart 上运行，第二个 hart 的真实并发、跨核 TLB 与发布协议由 P6 验证。
+### 公共内存管理入口（`include/kernel/mm.h`）
 
-`kernel_mm_msync()` 按固定 Linux `references/linux/mm/msync.c`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）检查 flags、对齐和范围；长度零成功，空洞在处理已映射片段后返回 `ENOMEM`。`MS_SYNC` 对共享文件 VMA 的对应 inode 范围写回，再同步元数据并传递块 flush，错误沿 inode/OFD 序列传播；`MS_ASYNC` 不提交 I/O。映射保持 OFD/node 引用，所以关闭 fd 或 unlink 后仍能同步。
+| 接口函数 | 职责说明 |
+| :--- | :--- |
+| `kernel_mm_acquire` / `kernel_mm_fork` / `kernel_mm_move` / `kernel_mm_release` | 共享地址空间引用、创建写时复制子空间、转移所有权句柄与最终回收 |
+| `kernel_mm_mmap_anonymous` / `kernel_mm_mmap_file_private` / `kernel_mm_mmap_object_shared` / `kernel_mm_mmap_hugetlb` | 建立匿名、私有/共享文件、内核对象及原生大页映射 |
+| `kernel_mm_munmap` / `kernel_mm_mprotect` / `kernel_mm_mremap` / `kernel_mm_brk` | 解除映射、修改权限、重映射搬移与堆顶调整 |
+| `kernel_mm_resolve_user_fault` / `kernel_mm_pin_user_page` / `kernel_mm_remote_transfer` | 统一缺页解析、用户物理页固定借用与跨进程向量传输 |
+| `kernel_mm_mlock` / `kernel_mm_mlockall` / `kernel_mm_madvise` / `kernel_mm_msync` / `kernel_mm_mincore` | 锁页配额控制、内存访问建议、同步落盘与驻留状态查询 |
 
-调用设置 `MS_INVALIDATE` 时，内核沿虚拟内存区域（Virtual Memory Area，VMA）的地址顺序检查锁页状态。遇到已锁定的区域立即返回 `EBUSY`，按需锁页 `MLOCK_ONFAULT` 即使尚未装页也属于锁定状态。若同时设置 `MS_SYNC`，每段共享文件映射在释放地址空间操作锁后完成同步，再重新查找下一段。后段返回 `EBUSY` 时，前段已完成的同步仍然有效。
+### 定向验证入口
 
-ELF image 使用独立的 `kernel_elf64_source`，不把 `PT_LOAD` 当作普通 file-private mmap。source 在 exec 时一次解析 program headers，并将页区间规范化为 `ELF_PRIVATE` VMA 的 `backing_offset`。完整文件页可以共享 page cache；文件/BSS 边界页、多个段贡献页和 BSS 页由 fault 路径私有分配、清零并精确填充。source 引用由 MM 记录，重复映射不增加历史引用，fork 子 MM 获取独立引用，最后一个相关 VMA 消失才 release。可执行页发布后执行本地 `SFENCE.VMA` 和必要 `FENCE.I`，覆盖先读后取指。source 的 OFD/I/O 清理错误仍由 source owner 保留，堆和物理页释放不建立重试状态。
+- **页固定借用、并发与边界（宿主）**：`make test-mm-pin-host`、`tests/host/mm-resource-limits.sh`、`tests/host/madvise-remove.sh`、`tests/host/mm-remote.sh`、`make test-mm-huge-host`、`make test-hugetlb-host`。
+- **双架构客机与大页/权限验证**：`tests/riscv/mm.sh`、`tests/riscv/vma.sh`、`make test-huge-riscv`、`make test-permissions-loongarch`、`make test-files-partial-write-riscv`。
+- **用户态行为对照**：`tests/userland/run.py --workload madvise`、`tests/userland/growdown.py`、`tests/userland/hugetlb.py`、`tests/workloads/resource/memlock.c`、`tests/workloads/resource/process_memory.c`。
 
-MM 还单独持有主 ELF 的执行 OFD，供 `/proc/<pid>/exe` 查询。它在新映像全部构造成功后取得，exec 失败不改变旧 MM；线程共享同一 MM，fork 子 MM 另取引用，末次 MM 清理在 ELF source 仍持有 OFD 时先释放该引用。`PT_INTERP` 只决定实际入口，不改变 exe 所指主文件；查询返回带引用的路径，调用者不能在任务退出后借用 MM 指针。
-
-`kernel_mm_proc_memory_snapshot()` 无分配读取 VMA 集合在成功编辑时更新的覆盖字节数，以及 Sv39 有效/受保护页计数，供 proc 的 VmSize/VmRSS 使用。受保护页仍拥有物理页，故计入驻留；未发生缺页的虚拟映射只计入 VmSize。数值是瞬时 MM 统计，不把页缓存全局占用误计为该进程 RSS。
-
-`kernel_mm_munmap()` 采用 Linux 洞语义：输入范围中没有 VMA 或只覆盖部分 VMA 仍可成功；resident、`PROT_NONE` 和待释放页都由 Sv39 owner 状态处理。`kernel_mm_mprotect()` 在 MM gate 内由 VMA 层一次顺序遍历合并覆盖、权限和资源限制检查，以局部 DATA 用量投影判定可成功的前缀，同时预留首尾拆分空间；独占路径随后一次修改该前缀的已有 PTE、提交 metadata 并完成 TLB 同步。遍历只在起点查询数组下标，不复制整份 VMA，也不再将已检查的前缀交回通用保护接口重验。遇洞、权限或限额失败保留成功前缀，首段拆分 OOM 不修改权限，末段拆分 OOM 仍提交此前前缀。同权限段无需修改。长度 0 对齐地址直接成功。`PROT_NONE` 不释放物理页，恢复权限后仍看到原内容。 SMP 中，完全由匿名 VMA 覆盖且只增加权限的范围使用共享操作资格和范围预约。VMA 检查、准备与提交在同一次 VMA 写保护内完成，随后在预约范围内更新已有 PTE 并完成同步；其他地址的缺页可以继续。同权限请求在 VMA 读保护下直接完成；没有实际驻留页的范围不产生 TLB 或指令同步。增加权限不会撤销已有用户页借用，因此无需关闭或排空它们；权限撤销、文件来源及 READ_IMPLIES_EXEC 转换仍使用原独占路径。
-
-AS/DATA 限额属于当前调用者的线程组，MM 只保存 VMA 用量；`CLONE_VM` 的独立线程组共享用量但分别受自身限制约束。VMA 原有统计遍历同时维护总虚拟字节与私有可写、非栈的 DATA 字节；拆分、保护、替换、搬移和 fork 使用同一统计来源。mmap、shmat、brk、mremap、mprotect 和栈增长均在已有 MM 操作锁内检查并修改用量。当前执行者保持组身份存活，接纳按字段原子读取限额；跨任务查询及候选 exec 仍在调度保护内取得快照。mprotect 仅在原非 DATA 区间变为 DATA 时读取并检查限额，降低权限和同分类修改沿原接纳规则处理。降低限制保留当前映射，后续增长检查当前限额；DATA 软限制为零时，映射扩张采用硬限制，brk 的精确字节检查仍使用零软限制。
-
-`brk` 先检查主 ELF 的 `end_data-start_data` 加 `requested-start_brk`，包括同页调整，再对新增页检查 AS/DATA。`MAP_FIXED` 以全部覆盖字节抵扣扩张量，在撤映射前检查限额；mremap 扩张同样先检查限额，因此此类失败保留固定目标。mprotect 使用固定 Linux 的新旧属性检查，并逐段保留成功前缀。初始栈和 exec 的限制检查见 [用户 ELF](user-elf.md)。
-
-底层撤映射遍历跳过空页表和未映射区间。遍历窗口与退休数组容量分别受限。只有摘下的实际页填满栈上批次后，才尝试扩大临时退休数组。已发布的撤销仍按实际地址范围和目标处理器集合完成失效确认，随后才能归还物理页及页表页。
-
-## `mremap` 区间调整与搬移
-
-`kernel_mm_mremap()` 返回零或负 Linux errno，成功才写入新地址。普通 mmap 建立的私有/共享匿名及普通文件映射支持缩小、原地扩大、`MREMAP_MAYMOVE` 自动选址和 `MREMAP_FIXED|MREMAP_MAYMOVE` 固定搬移；源可以是单个 VMA 的子范围。非固定缩小沿用 munmap 尾部语义，等长不移动直接保留地址；原地扩大要求旧范围结束于源 VMA 末端，新增区间无映射。新增页继续按原后备缺页，不预分配整段数据内存。
-
-入口在 MM gate 下分别检查固定目标和实际缩小旧尾；保留源映射的操作还检查源地址。任一区间含 SysV 附件时先结束 operation、转入 CPU0 服务再重取 gate 并重查，避免远端修改附件目录引用，也不把两区间之间的无关映射纳入迁移判断。搬移在共同 MM gate 下准备 VMA 两端拆分及插入容量，关闭新用户页 pin 并排空已有 pin，再按驻留页预留目标页表。两架构后端转移原始叶 PTE，保留物理引用、COW、`PROT_NONE` 和访问权限，数据页不复制，RSS 不变；同一次 raw 修改迁移文件 resident 的地址哈希与链表登记。整个区间的叶转移后同步活动 CPU 的新旧翻译，确认完成再通过普通退休协议回收源空表；VMA 提交无需分配。准备阶段 OOM 归还未发布候选，已经发布的空目标表也经失效确认后回收，源叶仍保留。
-
-VMA 保留后备对象、文件权限上限和源子范围偏移。共享匿名对象以最初映射长度为后备边界，SysV 对象以段的页对齐长度为边界；扩大或复制 VMA 不扩大后备，边界外缺页返回 SIGBUS。fork 及多个视图持有同一对象，边界和已分配页随对象存活。文件来源 OFD、node–MM 登记和缓存 alias 在搬移期间继续由原 owner 持有；缓存回调取得 MM gate 后读取 resident 的当前地址，因此搬移前已借出的旧地址回调仍保护新地址。截断回调同样在取得 gate 后按当前 VMA/offset 处理 EOF，旧地址被其他映射复用不改变新映射。
-
-`MREMAP_DONTUNMAP` 将原有页表项移到目标并保留源 VMA；源地址再次访问时按原后备对象缺页。目标保留锁页属性，源区间解除锁定，虚拟内存额度计入新旧两个区间。共享映射的 `old_size=0` 新建同一后备对象的别名，目标按需缺页；SysV 别名建立独立附件并继承源 `shmat` 的文件身份。`shmdt` 以地址和后备偏移确定原起点，移除同一文件身份、同一起点且落在段长度内的片段；其他独立 `shmat` 的文件身份保持独立。VMA 编辑先准备全部容量，再迁移页表并发布，不因后续分配失败留下半次搬移。
-
-参数校验顺序依据固定的 [`mm/mremap.c`](../../references/linux/mm/mremap.c)。固定目标先撤销，随后页表准备失败不会恢复该目标；固定缩小也可先撤源尾部，接口不承诺整次失败无副作用。特殊映射搬移，以及跨多个连续 VMA 的等长固定搬移返回 `EOPNOTSUPP`；私有映射零旧长度、缺失 MAYMOVE、重叠固定区间等仍先返回对应参数错误。跨 VMA 扩大及包含洞的跨 VMA 搬移返回 `EFAULT`。
-
-`sh tests/host/mm-remap.sh` 检查物理身份、COW/保护页、子范围、共享对象、文件偏移/EOF、准备 OOM、pin 排空及延迟 TLB 确认后的 owner 归还；文件截断用明确握手覆盖回调等待期间的再次搬移和旧 VA 复用。`CACHE_HOST_BLOCKS=4096 sh tests/host/mm-disk-concurrency.sh mremap` 使用真实 ext4 与页缓存检查搬移前借出的 alias 回调、搬移后写入和同步，以及资源归还。宿主 MM 用 RV64/4 KiB 后端；LA64/16 KiB 使用真实用户差分验证，不能由修改宿主页大小宏替代。
-
-## 硬件用户缺页解析
-
-私有匿名缺页取得只读 MM 操作资格后，在 VMA 读保护内复制描述符并记录地址范围编辑代次。准备页面期间持续持有该 MM 资格时，发布者可在页表元数据保护内验证两件事。当前没有覆盖目标地址的范围编辑声明，且复制描述符后没有完成的范围编辑。两项都成立时可直接发布。发生编辑、回收压力导致 MM 资格中断，或缺页涉及文件后备时，仍取得当前 VMA 资格并按原规则校验。RISC-V 原地恢复 COW 写权限时只刷新本核地址翻译。其他核若仍缓存只读翻译，其下一次写缺页会识别已可写的页表项并本地刷新。更换物理页仍先确认跨核失效，再归还旧页。
-
-RISC-V 上相邻的首次匿名写可以触发同一方向的邻页装入。先用对齐的 8 页窗口。继续在同一方向紧邻前一个窗口边界发生缺页时，可扩大到对齐的 16 页窗口。候选限制在当前 VMA 和同一叶页表内。在初次查页表时选取空槽，把实际缺页的页和邻页交给同一次批量分配。清零后在同一个元数据保护区内核对范围代次、活动编辑和实际缺页槽，再一起发布。范围失效时可回到单页提交，实际缺页槽已被其他线程占用时归还未发布的候选。预装只在具有 Svvptc、文件后备为空、目标映射允许写且未指定随机访问或锁页时启用。内存余量低时只装入实际触发缺页的页。所有在线 hart 都声明 64 字节 Zicboz 清零粒度时，按块清零已持有的物理页。
-
-SMP 的短 MM 元数据读写锁使用同一个原子字维护写者准入位和读者计数。写者置位后等待此前登记的读者退出，读者只在准入位清除时登记。登记和关闭准入在同一原子修改序列中排序，省去分别更新两个状态字时所需的全栅栏。写入发布、最后读者归还、本核中断和抢占保护仍沿用原语义。
-
-缺页入口一次取得目标 VMA 和代次，同一份快照用于分派、权限判断和候选准备。发布前比较代次；代次改变时，文件映射重试，私有匿名映射可在局部读锁下核对目标 VMA 后继续。lwext4 单范围读取的临时片段存储按实际可能涉及的文件系统块数取值，上限仍为八；冷页批量装入沿用页缓存的堆工作区和 DMA 借用规则；热命中不租用冷读工作区。
-
-首次匿名访问或私有文件首次写入时，缺页处理在取得虚拟内存区域（Virtual Memory Area，VMA）快照的同一次读保护内登记匿名后备历史。地址空间的短元数据锁串行化历史标志和延后合并标记的修改，并发快照以原子读取得标志。该历史用于派生地址空间时选择继承方式，登记时不推进映射代次；相邻区域仍由后续实际编辑合并。
-
-`kernel_mm_resolve_user_fault()` 的 `access` 必须恰为 READ、WRITE、EXECUTE 之一。通用层先检查用户范围、VMA、逻辑权限和现有 PTE；地址无 VMA 返回 `NOT_MAPPED`，合法 VMA 的权限不足返回 `ACCESS`。`ELF_PRIVATE/ELF` VMA 按 source 区间二分取得 FILE、COMPOSITE 或 ZERO backing，再按实际缺失的资源准备候选。硬件缺页与 uaccess 使用同一解析器，不为非法软件访问分配页面。
-
-匿名成功路径按架构页大小对齐故障地址，分配并清零一页，以 VMA 权限建立用户 PTE。文件路径按上述缓存/私有策略取得页面。实际提交者根据本次 PTE 变化决定同步范围及是否推进翻译、指令代次。RV 在启动时读取实际运行 hart 的 Svvptc 能力交集；支持时，首次 invalid→valid 发布不执行 `SFENCE.VMA`，包含新非叶，因为该扩展保证新有效项的可见性。不支持时保留本地刷新：已有表内的新叶按页，新非叶按全范围。新执行映射另推进指令代次并确认活动 CPU 的 `FENCE.I`，不为不存在的旧翻译广播远端 TLB 失效。替换、撤权及旧页面退休仍确认实际目标的 TLB 失效；只有发布了新内容或新的可执行映射时才同时同步取指。同步由 MM 在 raw 锁外完成，后端不在每次改单页时隐含执行。dispatcher 保持 `sepc` 不变，`sret` 后硬件重试原 load/store/fetch。`NOT_MAPPED/ACCESS` 在 Trap 边界形成 `SIGSEGV` 的 MAPERR/ACCERR，文件整页越过 EOF 的 `BUS_FAULT` 形成 `SIGBUS`；uaccess 将这些用户访问错误转换为 `EFAULT`。物理页耗尽精确返回 `NO_MEMORY`，非法页表或分配器状态直接 fatal。
-
-scheduler 的 U-mode 硬件页故障和当前任务的 uaccess 都可进入该入口。RV 本核复制在硬件访问恢复后解析；使用 pin 的其他路径在遇到未驻留或需要写故障处理的页面时解析，成功后重新 pin。VMA 外或权限不符仍按用户访问错误处理。
-
-并发 fault 可以在候选准备期间由另一任务先完成同一地址的映射或权限升级。恢复 gate 后，若 VMA 仍允许且 PTE 已满足请求，匿名、ELF 和文件 resolver 在 raw 锁外全量刷新本地翻译，再成功返回；执行映射另补本地指令同步，不重复发送远端 RFENCE。全量刷新同时覆盖该 CPU 在新非叶发布前缓存的 invalid 父项。RV 的新映射没有旧物理页、权限或退休引用可撤销，不推进用于旧翻译失效的代次；新执行页仍独立推进指令代次并确认取指同步。其他 CPU 若仍缓存 invalid 项，会进入上述 spurious-fault 路径。同一 MM 的线程切换不因新页发布额外清空 TLB，首次加入或跨根重新进入仍执行全量刷新。旧映射的撤销和资源归还仍先完成全部目标确认，不把旧 positive 翻译当作 invalid 处理。固定资料 [`pgtable.h`](../../references/linux/arch/riscv/include/asm/pgtable.h) 的 `update_mmu_cache_range()` 同样按 Svvptc 判断是否需要本地刷新；[`mm/memory.c`](../../references/linux/mm/memory.c) 的 `fix_spurious_fault()` 用于核对并发已满足的 fault 语义。映射代次、来源、EOF 或权限已经变化时丢弃本次候选并重新判断，不能把过期候选提交给新 VMA。真实匿名及文件同页竞争见[RV SMP](riscv-smp.md#用户态原程序与压力组合)。
-
-磁盘文件映射的普通读或取指缺页还会映射同一自然对齐的 64 KiB 窗口内已经装好的缓存页。窗口受虚拟内存区域（Virtual Memory Area，VMA）和文件长度约束。需求页先准备真实来源、驻留记录、实际缺失的页表和索引空间，再用不等待回收的入口准备可选邻页的驻留记录，数量受现有索引空槽限制。可选分配失败时，需求页仍可按原规则完成。邻页不会触发装盘或新建页表。
-
-需求页发布后，内存管理资格和 inode 读资格固定映射区间及文件版本。内存管理层从页表选取空叶项，页缓存沿 inode 的有序页树收集已装好的页，在一次分配器保护内取得物理页引用。已安装的只读页表项（Page Table Entry，PTE）接收对应引用，未安装的引用批量归还。私有叶标记写时复制（Copy-on-Write，COW）。共享叶保留文件后备，内存管理层在写资格和 inode 读资格释放前向页缓存登记每个新别名，后续共享写故障才可取得写许可。进程创建、截断、打洞与解除映射沿用同一驻留索引和回收顺序。内存后备、写缺页、强制访问、显式预装和 RANDOM／NOREUSE 建议跳过邻页准备。本批只对实际发布的范围执行必要同步，已映射的邻页仍持有真实物理页引用。直接用例见 `tests/host/mm-disk-concurrency.sh fault-batch` 和 `tests/host/fault-read-window.sh`。
-
-## fork 与 COW
-
-`kernel_mm_fork()` 先克隆所有会分配的 VMA、共享匿名对象引用和文件来源 metadata，最后才调用 Sv39 两阶段 fork。子页表先取得每个 active/`PROT_NONE` 4 KiB 页的物理引用；共享匿名页保持原权限，其他页以 COW 形态建立。全部构造成功后再把父进程私有可写叶子去掉 W 并标记 COW，随后刷新父地址空间 TLB。metadata 或子页表构造失败时父 PTE 不变；父提交阶段不再分配。无效或已撤销的页不进入子地址空间，内核高半区仍只借用稳定映射。
-
-写 fault 只接受软件明确标记的 present COW 页，不能把真正只读页误当成可写。若物理引用数大于 1，就分配并复制新页、把当前 PTE 改回 VMA 权限并释放旧引用；若只剩一个引用，则原地恢复写权限而不复制；它没有修改页面内容，不推进指令代次或发送取指同步，仍完成写权限变更所需的TLB失效。`mprotect(PROT_NONE)` 使用不同 RSW 编码保存 exclusive/COW 属性，恢复后仍能正确决定是否复制。uaccess 写入也进入同一 resolver，因此内核代用户写内存不会绕过 COW。
-
-创建失败时，目标句柄要么仍为 EMPTY，要么仍持有尚未发布的完整 owner；分配器释放不失败，调用者不按释放错误建立重试状态。Fork 仍需遍历已提交页并构造子页表；共享页分类在子构造和父提交时对每个驻留页查询 VMA，成本为 `O(P log V)`（P 为驻留页数，V 为 VMA 数），另有 metadata 和页表遍历，但不在 fork 时复制每页内容或预留同量数据内存。额外数据页成本只落在之后真正写入的页。fork 在 gate 下构造私有 child，分配和复制在 MM raw 外完成，父私有叶的 COW 发布在 raw 内完成，确认远端失效后再归还旧引用。文件登记与实际来源沿同一协议迁移。
-
-## 末引用回收
-
-在 RV 上销毁已退出所有 CPU 的用户页表时，内核逐项核对普通页、受保护页和 COW 页的计数，清除页表项后按最多 16 个基页合批归还物理引用。若中途遇到无效页表项，函数先归还此前已摘下的引用，再报告错误。活动地址空间的撤映射仍待本地及远端地址翻译失效完成后归还旧页。
-
-末引用只能在其 `satp` 已不活动时释放。有 VMA 时回收按四个阶段执行：
-
-```text
-LIVE(last ref)
-  -> release VMA metadata
-  -> release file/ELF-source registry
-  -> release user-leaf references and destroy page tables
-  -> release MM record page
-  -> RELEASED
-```
-
-`CLEANUP_VMAS`、`CLEANUP_FILE_SOURCES` 和 `CLEANUP_ELF_SOURCES` 只表示仍由 MM 持有的文件/OFD/source owner 需要完成真实 VFS/I/O 清理；页表树、VMA metadata、记录页和物理页的合法释放完成即推进流程，不产生 allocator retry。所有 CLEANUP 句柄都只能 move 或由所属上层继续处理，不能 acquire、lookup 或生成 `satp`。非末引用释放不触碰 VMA、文件来源或页表树。
-
-MM、页表及用户 pin 已持有实际物理页生命周期时，通过 `physical_page_map_owned()` 直接调用绑定的映射函数，不再取得分配器锁、查询 buddy 所有权树。页表页没有异步缺页、I/O 或其他能让映射失败条件稍后消失的 producer；映射失败表示内部不变量损坏。因此 Sv39 teardown 直接触发 fatal trap，不保留 `CLEANUP_SPACE`，也不允许下一次 `release` 把部分释放的树伪装成恢复成功。VFS/OFD 的真实外部 I/O owner 仍使用各自 cleanup 状态。
-
-用户退出路径先切到内核根页表，再在仍有效的任务内核栈上调用 `kernel_mm_release()`；只有真实 VFS/OFD cleanup 仍有 owner 时才交给后续回收上下文处理。MM 完成后才允许任务成为 zombie，zombie 只保留身份、亲缘、wait status 和任务页。
-
-RV 调度到没有用户 MM 的内核任务时，可以继续使用上一用户页表的内核高半区，避免用户任务阻塞、内核执行者处理、原任务恢复期间两次无用换根。CPU 分别持有根页及 MM 记录页的物理引用，不增加逻辑 MM 使用者，不延长 VMA、文件来源或用户数据页的寿命；`active_cpus` 与仅借用根页的 `borrowed_cpus` 分开维护。用户任务重新进入时先发布活动位，再检查真实 MM 身份、翻译与指令代次；相同根、翻译代次未变且支持 Svvptc 时可保留已有翻译，指令代次仍独立检查。转入不同 MM 或显式切到内核根时，先停止使用旧根，再归还两个物理引用。
-
-撤权限、撤映射及退休页表的同步包含根页借用者；纯指令发布只同步实际用户执行者，借用者在下次用户进入时补齐指令代次。末个逻辑 MM 使用者销毁用户树时，先断开用户半区的父表项，等待所有核确认失效，再释放子页表和数据；远端内核任务最多保留已清空的根及记录页存储，最后由实际 CPU 归还。关机在检查空闲页基线前逐核归还这些存储引用，确认完成后才检查资源和停止 secondary。
-
-## 并发与性能边界
-
-MM 句柄各自持有一个实际引用，引用和 user 计数使用原子操作；句柄本身不能被其他执行者并发 move/release。每个 MM 的映射编辑使用自身 rank25 操作资格；该 MM 的 rank15 专用 raw 读写资格保护页表、pin 许可和 resident 哈希，页引用取得可嵌套 physical rank20。哈希候选在 raw 外分配，重排、发布和摘除使用写资格，旧存储在 raw 外释放。普通驻留匿名页复制共享短读资格，不取得 operation gate，也不因同一 MM 存在文件映射而增加额外保护。末次释放要求 pin、活动 CPU 和退休批次归零。
-
-共享 MM 的非固定私有匿名 mmap 在 `vma_lock` 写资格内选取空隙、检查范围认领及额度，并修改有序 VMA 数组；数组扩容和搬移也在该资格内。空隙查询从上界的二分位置向前遍历。虚拟总量、DATA 和锁页用量按新增或被修改的区间增量更新，准备及提交失败不提前发布统计。纯匿名 munmap 的不相交范围可共同持有 operation 读资格，但 VMA 拆分、删除和相邻合并仍使用同一 `vma_lock` 写资格，页表解绑另使用同一 metadata 写资格。固定 mmap、mprotect、fork 和 mremap 继续取得 operation 写资格。这些共同数据的编辑范围决定并发推进的边界。
-
-## 验证与限制
-
-```sh
-make test-mm-riscv
-make test-vma-riscv
-make test-brk-riscv
-make test-mmap-riscv
-make test-demand-page-riscv
-make test-diff-abi-riscv
-make test-sqlite-wal-riscv
-make test-riscv
-```
-
-MM 聚焦测试覆盖创建失败原子性、共享引用、移动、COW fork 的父子共享/写隔离/末引用原地恢复、`PROT_NONE` COW 属性，以及正常页表回收和物理页基线；VMA 聚焦测试另覆盖共享匿名页的 fork 前驻留、双方首次 fault 顺序、权限拆分、部分撤映射、替换、退出和 OOM 回滚。同一 MM target 还运行独立 fatal kernel，注入一次页表 backing 无法解析并确认只产生一个 fatal 结果、不会返回 retry/success 路径。文件测试覆盖 cache hit/miss、write-first、尾页补零、整页越 EOF、fd 关闭后 fault、fork 后 OFD 来源和最终回收。`test-userland-riscv` 用真实 musl mmap 覆盖匿名共享的双向可见、fd 忽略、fixed 冲突，以及原有私有 mmap。`test-mmap-riscv` 与真实 ext4 `/init` 从 U-mode 完成匿名/文件私有 mmap、COW、SIGBUS、mprotect/munmap 生命周期；`test-diff-abi-riscv` 与 `test-sqlite-wal-riscv` 另验证文件共享 mmap、`msync` 和独立进程 WAL。
-
-已接入构建期绑定的RV64 Sv39/4 KiB与LA64 16 KiB/三级页表后端；共用策略处理私有/共享匿名、ELF、SysV 及 tmpfs/ext4 映射；SysV attachment 和未并行化后端的实际业务仍在 CPU0 边界处理。普通 fork 使用独立 MM，私有页 COW、共享匿名与共享文件页保持共享；线程 clone/vfork 共享同一 MM record。匿名映射和 ELF image 使用每 MM 的 ASLR mmap ceiling（无任何随机材料时确定性降级；仅 DTB 混种不提供可信安全保证），但没有 commit accounting。栈 VMA 随实际向下增长更新，VmSize 不计尚未扩展的最大栈窗口。可读普通文件支持 MAP_PRIVATE/MAP_SHARED 与 `msync`。文件表和信号表不属于 MM。private futex 使用 MM 创建时分配的单调身份号与用户地址，避免 MM record 页回收后重用身份；共享映射的 futex 身份与引用由 MM 一并解析，具体规则见[调度模块](kernel-scheduler.md#等待与-futex)。
-
-## 驻留文件映射与截断
-
-MM record 拥有按 VFS node 去重的稳定关联记录，以及每个驻留文件页的地址、物理页
-身份和私有化状态。VFS 只借用关联；OFD 来源持有 node 的生命周期。共享 MM 不重复
-登记，fork 在页表共享提交前复制来源/关联/驻留元数据，成功后登记新 MM。mmap 在
-VMA/PTE 修改前预留关联；失败不消耗调用者 OFD。末个 VMA 消失或销毁时先解除关联，
-再释放 OFD；文件 fault/msync 在途操作 pin 推迟最后来源释放，直至睡眠操作完成。真实 close 错误仍保留来源 owner。不得登记可移动的 VMA 数组元素或 MM handle 地址。
-
-首次文件 fault 在发布 PTE/alias 前预留驻留记录和地址哈希容量；COW 成功后更新私有标志及物理地址。
-缓存命中的 write-first fault 若 COW 物理分配失败，必须撤销临时 cache PTE 后返回，
-不能留下无来源记录的 PTE。fork 后私有页面即使再次带 COW 标志，仍保持私有来源。
-munmap/fixed replace 清除对应驻留记录，mprotect/PROT_NONE 保留来源。
-
-VFS 向下截断按实际 live size（包括部分生效后报错）同步通知相关 MM。保留 VMA，
-撤销文件内页起点不小于新 EOF 的 PTE；非对齐尾页只清零文件来源页的后缀，保留
-private 页内容。范围摘除复用下面的有界遍历，剩余 resident 链只检查保留尾页。
-登记与来源借用维持跨等待寿命；PTE 变更在 MM raw 内发布，锁外确认本地及远端
-翻译失效后才归还旧页，尾页可执行内容改变时另推进指令同步。
-
-关联只扫描相关 MM；每个 MM 以动态虚拟页地址哈希查询驻留记录，保留链表负责遍历。哈希碰撞比较完整地址，装载因子不超过 1，按二倍扩容；分配成功后无分配地重建并替换桶，失败保留旧索引。fork 提前准备全部桶，unmap/fixed replace/截断同步摘除索引与链表；最后 MM 释放桶。查找为平均常数成本。munmap/fixed replace 与截断使用有界区间摘除：每个撤销批次最多处理 16 次驻留页处理或页表边界推进，并受 16 项退休数组限制。RISC-V 的空叶项只需读取，另有每批 64 项的扫描上限。这样稀疏区间可以在当前批次内越过多个空叶项，减少重新定位同一叶表。目标范围只访问相关叶，缺失子树直接跳过；叶表及 middle 表释放前，在同一次写资格内完整检查当前表是否为空（RV 最多 512 项、LA 最多 2048 项）。其他范围可在批次间向已经扫过的位置发布新叶，所以跨同步只保留 VA 与阶段，不保存 PTE 指针、空前缀或占用结论。续扫时重新解析当前父表；其他范围已将其撤销时直接跳过，换表后检查新表，不能据旧表状态回收。后端在清 PTE 前把 VA/物理身份交给 MM，由 MM 解绑 resident 的哈希和活动链；alias 清理和实际页引用释放均在 raw 外完成。mprotect 仍以有结束地址的遍历访问驻留叶，包括 PROT_NONE。mprotect 对仍共享缓存的叶保留写保护，不再先开放写权限后全表 rearm。完整链表用于销毁与 fork；截断先按 VMA 形成 EOF 外的连续区间并复用同一有界摘除；剩余驻留链只处理保留尾页。元数据随驻留规模增长；不在 tick 热路径扫描。
-`test-files-riscv` 扫描准备阶段分配失败与 fork 回滚，并注入缓存命中后的 COW
-物理分配失败；`test-userland-riscv` 与 `test-diff-abi-riscv` 验证真实驻留/COW、
-PROT_NONE、非当前 MM、尾页、关闭 fd、unlink、O_TRUNC 与重新增长。
-
-`riscv_kernel_mm_get_statistics` 提供诊断快照。驻留探测、准备页、pin 获取/等待、退休批次和 fault 重试等纯统计只在 `COST_DIAGNOSTICS=1` 更新；pin 数、页引用、活动 CPU 与 TLB 代次始终参与正确性。测试用链接包装观察实际 pin、锁与解析调用。驻留匿名页的 1、64、4096 字节双向复制均不调用受检查地址解析；MM 读资格覆盖权限许可与物理引用取得，归还物理引用在 MM 资格外完成。首次写开放权限、写回 rearm、mprotect 和未发布 fork child 使用纯单页 PTE 修改，不在后端执行 SFENCE 或指令同步。需要失效旧翻译或发布指令的 MM 修改在 raw 内登记翻译/指令代次，raw 外按实际范围统一同步；未发布 child 由首次激活完成同步。单页降权/恢复合计只访问两个相关 resident，不随其他驻留页增长。VMA 权限编辑后以一次读写游标压缩相邻可合并项，被合并的 attachment 引用各归还一次，不再逐次左移后缀。宿主用巨大稀疏范围检查遍历跳过空子树并遵守结束地址。引用与脏代次协议保持不变。
-
-调度器在任务发布及新映像提交时调用 `kernel_mm_add_user`，在退出或旧映像退休前调用 `kernel_mm_remove_user`。活跃使用者与 MM 资源引用分开：清理任务暂存的旧 MM 不影响 CHILD_CLEARTID 条件；fork 创建零使用者的新 MM，acquire/move 不隐式注册任务。计数下溢、溢出属于内核 owner 错误。
-
-活跃使用者在可睡眠的清 TID 复制/唤醒结束后才注销；其他任务同时退出时仍须看到正在退出但尚未完成 mm_release 的使用者。`test-mm-riscv` 通过用户复制挂起点的确定性交错检查两个用户字均清零及最终物理页归还；真实 U-mode 的生命周期另由 tid.* 差分覆盖。
-
-## 统一内存后备对象
-
-共享匿名与其 futex key 使用 `kernel_memory_object` 的稳定对象身份。对象拥有每个稀疏驻留页的一份引用，get/find 成功返回额外页引用；find 遇空洞不分配。对象锁 rank 35 位于 inode 30 之后；无磁盘 I/O。truncate 摘除越界的对象页引用并清零保留尾页，调用者须先撤销受影响 PTE 并持有对象；匿名缺页通过 prepare/finish 归还失败引用或记录 PTE 接纳，准备计数归零后才撤销未接纳页。tmpfs 已接入同一对象及按实例共享的页预算；普通文件的 inode/OFD 与 MM 登记仍保留，内存数据页不进入磁盘缓存。内存文件缺页使用 prepare/finish：每次准备持有实际来源及额外页引用，接纳后转给 PTE 或作为复制来源归还；最后失败者仅撤销未被接纳且身份匹配的后备页。磁盘来源仍沿原页缓存协议。文件配额耗尽为 BUS_FAULT，普通分配耗尽仍为 NO_MEMORY。详见 [tmpfs](tmpfs.md)。
-
-缺页解析在合法 VMA 上权限不足返回 ACCESS，地址无映射返回 NOT_MAPPED；trap 层据此提供 SEGV_ACCERR/MAPERR，uaccess 将两者统一映射为用户复制 FAULT。这个区分不把 syscall 坏指针变成异步故障信号。
-
-硬件用户缺页直接沿用调度入口已经确认的本核当前任务和活动 MM。用户复制、显式预装及跨地址空间访问继续由各自入口识别执行者和维护目标 MM 的借用。
-
-默认关闭的 C3 成本观测记录 VMA 查询比较、coverage/权限检查、prepare/commit 时长、
-数组移动/编辑、全集合合并/字节重计、file_residents 遍历、实际 PTE 访问和地址/全局 TLB 失效。
-计数入口在实际循环或修改点，不改变 prepare 失败原子性；单页 PTE 路径与原 MM 统计独立核对。
-
-
-## 匿名 MM 的并发与回收
-
-缺页初查用已经持有的 MM 元数据资格读取一次页表，直接返回实际叶快照或缺失的上层表掩码。正常 COW 从同一快照取旧页与身份，真正替换时仍在发布保护内核对当前页表项。范围认领的链头用 release 发布，缺页只用 acquire 判断空链。空链跳过等待查询的短锁，有认领时仍在原锁内检查覆盖和登记等待。
-
-撤映射先在有序 VMA 数组中二分定位起点，再检查相交条目。显式移除直接保留范围两端仍有效的片段，最多搬移一次后续条目，只有从单个 VMA 中间挖洞才可能需要增加一个条目。后备偏移、映射额度和 SysV 共享内存的拆分及关闭记录按实际删除范围更新。大页边界检查和锁页额度查询也从相交范围开始。LA 分批摘除页表时只在首次验证整个范围边界，续批仍对实际遇到的大页核对范围。
-
-创建独立 MM 的 clone 在父 MM 操作资格下对每条文件驻留记录只判断一次继承策略。保留的副本先暂存，子索引成功预留后再装入尚未公开的子 MM，无需逐条取得子 MM 元数据锁。预留失败直接销毁暂存记录，子 PTE 与缓存别名尚未发布。
-
-撤销文件映射后先按实际 VMA 筛选仍活动的文件来源，再根据活动来源决定哪些 inode 映射登记需要保留。登记清理复用第一次筛选结果，避免对同一来源再扫描一遍 VMA。已摘除的来源在登记停止和回调排空前继续持有 OFD。
-
-一轮撤映射最多把两个有界摘除批次交给一次 TLB 确认。每批仍在 MM 元数据保护内公布各自的代次并捕获目标 CPU，确认范围覆盖两批的实际页，目标为两次采样的并集。含页表页的批次走全量失效，孤立的基页保留单地址失效。两批实际引用均等确认后再归还。
-
-VMA 编辑使用写资格，匿名、COW 与共享内存缺页在多 CPU 构建中使用读资格；栈扩展释放读资格后重新取得写资格并复查，不能原地升级。相同地址的竞争者在 MM raw 下比较 PTE/COW 快照，未发布的候选仍由各自调用者归还。不同地址的翻译同步可以同时进行，每个调用者只归还自己那批已确认失效的退休页。读者先完成自己的新页本地同步范围再释放资格；提取退休来源、排空回调和重新开放 pin 许可属于原写操作。并行预装者尚未完成批量本地同步时，实际 fault 也按[硬件用户缺页解析](#硬件用户缺页解析)刷新本地翻译后重试。UP 不包含共享模式字段、读资格分支或批量确认状态。
-
-自持同一 MM pin 的调用者只尝试取得 operation gate；忙时返回 `CONFLICT`，原 pin、映射和未发布的输出保持。新 pin 许可已关闭也不等待；缺页准备后的重取 gate 使用同一规则，冲突归还候选及 COW 临时引用后返回，不在保留 pin 时自旋重试。调用者归还原 pin 后可重试，无争用的自持 pin 撤映射仍有效。零长度 mprotect 不进入 gate。
-
-`kernel_mm_check_task_domain()` 仅在创建受控内核任务时检查实际消费者、来源和 heap/allocator 关系，不修改 MM 的同步方式，也不关闭系统分配器的压力挂钩。普通用户 MM 无需启用远端或并发资格。受控测试仍可使用自己的资源和交错，匿名、文件 pin 与映射修改使用相同生产协议。
-
-每个复制片段共享 MM raw 的短读资格，在同一资格内完成 PTE/权限检查、文件写借用与真实物理 acquire，复制在资格外；同一 task/I/O owner 归还 pin。页表、resident 与许可修改取得写资格，先关闭新读者，再排空已取得短资格的读者；不同 pin 的资格取得可以并行。总 pin 与写 pin 各使用一个 64 位状态字，低 32 位计数，高位表示该类许可关闭；关闭与最后归还作用于同一原子字。普通归还先归还写计数，再以 release 归还总计数，不取 MM raw；排空者以 acquire 观察完成。关闭期间最后一次对应归还先跨过 metadata 短读资格，再在资格外唤醒，使排空者的计数检查与等待登记不会漏过通知。调用者在整个归还函数内保持 LIVE MM 句柄，计数归零后仍由该实际引用保活 record。物理引用和文件写借用继续在 MM 资格外归还。UP 取得 pin 使用原独占 raw；归还仅在不含调用的链表及计数更新片段临时关闭中断，使用普通计数操作。pin 固定页存活，不固定映射身份或内容。`munmap` 可先撤销映射，旧片段靠 pin 完成；`mprotect` 关闭新许可并排空旧片段，fork 关闭写许可并排空旧写 pin。已持有需要排空的 pin 时不能等待自己，非法 owner fatal；零长度及无效参数不进入 drain。精确复制前缀保持。
-
-`kernel_copy_to_user()` 与普通文件读共用复制游标。RV当前MM按[本核用户复制](#本核用户复制与真正的页面借用)执行；其余路径在本批已经取得的缓存页内保留当前用户页pin，跨来源页或iovec片段不重复解析同一目标页。换目标页时先归还再处理缺页，整批结束或出错时归还，下一次存储等待不携带用户pin。该游标只延长现有片段借用，不缓存映射身份；切换到本核直接复制前也先归还旧pin。撤映射、撤权限及共享页写回仍遵守各自实际访问与借用的失效协议。成本与吞吐分别见 [VFS/ext4](vfs-ext4.md#当前成本边界)。
-
-futex 的登记与 pin 顺序见[调度模块](kernel-scheduler.md#等待与-futex)。共享磁盘写 pin 还取得该 entry 的写借用；普通匿名复制不因此普遍增加 gate。需要pin的请求可将最终借用交给共同缺页过程：私有匿名或ELF页在发布PTE的同一次MM保护内取得真实物理引用、登记pin计数与调用者清理owner，不再释放资格后重新查询刚发布的页。pin许可关闭时保留原有重取过程；共享匿名、文件及缓存别名仍在缺页后重新检查实际PTE、权限和文件写借用，不能用准备结果绕过撤权或写回。双页pin复制在取得需求页后，只非阻塞尝试第二页，缺页时先完成并归还当前前缀。pin的归还不等待gate。
-
-文件与 ELF 的来源节点持有实际 OFD/ELF owner；缺页、WILLNEED、mincore、msync 和 REMOVE 在锁外使用来源时借用该节点。VMA 编辑确认最后映射消失后，在 MM 写资格内将来源从活动表摘到原退休链；仍有 operations/faults 借用的节点留在该链上，不提前关闭，也不因自持 pin 无法重取资格而丢失清理义务。归还来源只递减实际借用，不扫描全部来源和 VMA。操作结束仍持有 MM 写资格时，只在当前执行者已归还全部用户 pin 后摘出借用数为零的退休节点；忙节点及自持 pin 时的就绪节点继续留在原链，避免关闭失败重挂时等待正排空该 pin 的 writer。单次检查后即释放资格，不等待借用或反复处理空批次。映射登记先在 gate 内停止和摘除，gate、inode 与 raw 外排空回调，再关闭本批就绪来源。最后借用在 gate 外归还时，由随后操作或实际用户返回前的 kernel_mm_drain_sources 继续处理；用户返回时 offset/pin 等调用资格已经归还。关闭失败或暂时需要 CPU0/真实 I/O 清理时，同一退休节点继续持有 owner 并沿原路径重试，不复活已退休来源，也不建立第二组引用。
-
-TLB 代次与退休批次在 MM raw 写资格内维护，代次以 release 发布。多 CPU 构建的活动集合使用原子位图，加入和离开不取得 MM raw。调用者的实际 MM 引用固定根页表，加入者先以顺序一致原子操作发布本 CPU 的 bit，再捕获翻译和指令代次、切根并执行本地全量失效；每个MM在既有元数据页内保存各CPU已完成的指令代次；零表示未同步，发布代次从1开始。只有未完成当前代次时才执行指令同步，切换到其他MM或内核上下文不清除这份完成记录。每个CPU在关中断或禁止抢占时只写自己的槽，不为重入增加MM raw取得。需要远端确认的发布者完成 PTE/代次写入后先执行全屏障，再原子采样目标集合：采到加入者则等待该目标确认，未采到则由加入者置位后的本地失效覆盖已发布的 PTE。多 CPU RISC-V 的新非执行映射不推进失效代次，也不采样目标集合；晚加入者仍先刷新本地翻译，首次进入与本地 invalid-fault 规则覆盖并发发布。离开者在旧根停止使用并完成本地失效后原子清 bit；已经采样的目标仍须实际确认，清 bit 不提前归还退休页。UP 保留原来的活动集合与 raw 协议。
-
-撤映射、降权、COW 和截断先固定退休 owner，raw 外完成本地失效与架构远端确认，之后才将同批数据和表页的引用交给[物理页分配器](physical-pages.md)；固件失败保留实际资源并 fatal。已登记 CPU 再次激活同一 MM 时以 acquire 读取代次，相同代次保留 TLB。CPU 只记录失效前捕获的代次，不把同步期间的新发布记成已经完成。可执行页的填充、COW、执行权限发布及文件尾清零另推进指令代次；首次进入和未观察到该代次的 CPU 执行指令同步，不把普通 PTE 修改一概当作代码变化。
-
-RISC-V的riscv_flush_icache(259)复用上述指令代次，按固定[`sys_riscv.c`](../../references/linux/arch/riscv/kernel/sys_riscv.c)忽略start/end，仅接受LOCAL标志。`kernel_mm_flush_instructions`持有独立MM引用，在禁止抢占期间推进指令代次并捕获活动CPU集合，先用数据fence发布代码写入，再执行本地FENCE.I；全MM调用通过同步SBI远端FENCE.I等待已活动CPU确认，整个过程不修改PTE或刷新TLB。LOCAL只同步当前CPU，其他CPU在随后激活该MM时补齐。捕获集合后加入的CPU同样检查代次；调用者只记录本次捕获的代次，远端等待期间并发发布的新代次仍须另行观察。
-
-`kernel_mm_proc_memory_snapshot()`在 gate 下固定 VMA 数组、raw 下取得页表计数；statistics 使用 raw 快照。匿名 `msync` 保留既有区间和 errno，在 gate 下读取；自持 pin 的 gate 忙冲突在此 int 接口对应 `-EAGAIN`，不伪报资源不足。共享文件映射遵守同一来源与 alias 协议。SysV 的 attachment 修改在实际业务边界进入 CPU0，匿名范围编辑不迁移。设备、网络和命名空间仍在各自串行边界执行。
-
-```sh
-make test-mm-pin-host test-mm-concurrency-host
-make test-memory-object-concurrency-host test-mm-shared-concurrency-host
-make test-mm-smp-riscv
-make test-mm-smp-userland-riscv INIT_CONFIG=config/init.json
-```
-
-host 链接真实 MM/VMA/Sv39/allocator/uaccess/等待实现，只替换硬件及调度后端；2/4 actor 模型与两逻辑 CPU 活动集合模型分列。真实 MTTCG 双RAM验证见[两核模块](riscv-smp.md)。
-
-## BPF 对象共享映射
-
-`OBJECT_SHARED` VMA 以 BPF map OFD 和 map 内偏移作为来源，同一个 MM 的来源列表持有 OFD，因此关闭 FD 后，fork、拆分和移动仍保留原 map。对象页没有 inode、page cache 或截断登记；ARRAY 值区与 RINGBUF 重复数据窗口直接取得 map 存储的真实物理页引用。mmap 在独占 MM 修改资格内装入整个范围，再发布 VMA；页表分配在 raw metadata 锁外完成，每个 PTE 接收一个真实页引用，初始 PROT_NONE 直接安装受保护的 PTE。中途失败撤销已经安装的页，并归还页表和来源；MAP_FIXED 失败留下空洞。撤销沿共同 TLB 确认和页退休路径归还引用。
-
-mmap 从 map 的 `mapping_lock` 接纳到 VMA 发布都与 freeze 串行。调用者的 OFD pin 保留至 admission 锁释放；MM 仅在首次登记该来源时另取一个引用，所以并发 munmap 与 FD close 不能释放尚未解锁的 map。最初可写映射把 `shared_mapping_bytes` 指向 map 的计数，VMA 拆分、fork、替换、移动和释放按映射字节维护；mprotect 降为只读仍保留可写上限及计数。最初只读映射清除 WRITE 上限，所有对象映射清除 EXEC 上限。MADV_DONTNEED 撤销 PTE 后保留 VMA 和 map 数据，但该映射没有补页路径，再访问返回 SIGBUS；fork、mprotect 和 mremap 都不会恢复已丢弃的页，新 mmap 可重新映射同一份数据。这与固定 Linux `remap_vmalloc_range` 预装页、BPF 默认 vm_ops 没有 fault 回调的行为一致。mremap 可移动或缩小；扩大范围或 old_size=0 复制返回 EFAULT，MREMAP_DONTUNMAP 返回 EINVAL，沿用 VM_DONTEXPAND 的限制。共享 futex 对此类没有 inode/匿名身份的 vmalloc 页返回 EFAULT，私有 futex 仍按 MM 和虚拟地址取键，与固定 Linux 的 BPF 映射规则一致。
-
-### 链路层套接字接收环
-
-`AF_PACKET` 的 `TPACKET_V3` 接收环复用 `OBJECT_SHARED` 映射路径。映射必须从偏移
-零开始，覆盖已配置的整个环。接纳期间持有接收环配置互斥，页表逐页取得现有后备页的
-引用。`shared_mapping_bytes` 统计可读或可写的所有环映射。虚拟区域分裂、派生子进程和
-取消映射时沿用同一计数规则，因此只要有实际映射，改配环就返回 `EBUSY`。即使最后一个
-用户文件描述符已关闭，映射也继续持有打开文件描述，直到最后一个区域撤销、页引用归还
-并完成关闭。接收块的交付和归还见[网络模块](kernel-network.md)。
-
-## tmpfs 文件映射
-
-文件缺页初查时在 MM gate25 下取得 VMA 快照与来源节点的在途借用。多 CPU 上已满足的文件页可在共享读资格下完成本地翻译刷新。读盘、私有复制及表页候选分配在 MM 和 inode 资格外进行。私有文件首次缺页在驻留索引有余量时使用 MM 读资格；PTE 和驻留记录在同一次 metadata 写保护内发布。索引扩容、COW 替换和共享文件 alias 发布仍取得 MM 写资格。发布前在 VMA 保护内核对代次，并重新核对 inode 代次、EOF 和 PTE。相邻热页的借用在锁外完成，发布时复查是否已被另一缺页者安装，归还重复借用。文件范围编辑及截断仍通过 MM 写资格排除这段发布。重取 gate 后还须重新查询 PTE 和缺失的非叶层级：相邻文件的最后一个 resident 可被截断并回收共用页表，而不改变本 VMA 代次。若缺表增加，保留已准备的数据页、来源和表页引用，释放 gate/inode 后只补空的 prepared 槽，再重复上述校验；普通 backend INVALID 仍是地址空间错误。同步范围由本次实际发布的非叶决定，已有表内的单页发布只做该页同步。共享叶使用同一后备页，私有初始别名只读且标记 COW，没有短暂可写发布。首次共享缺页只发布、收费一份后备；共享 fork/写缺页不复制数据页。既有驻留 hash、扩容及范围扫描复杂度保持。
-
-截断的 rank15 写操作门保留。校验后在 inode 写保护下关闭旧代次，释放 I/O 再逐登记取得一个 MM gate，撤销整页 EOF 外的 PTE/驻留并确认 SFENCE/RFENCE；最后在 inode 写保护下截断后备、处理尾页、提交尺寸/时间并开放代次。关闭后不新增分配或磁盘 I/O。固件失败保留数据、表、来源及退休 owner 后 fatal，不进入后备截断。旧 pin 仅保证存活，私有 COW 尾页保留自身内容，共享后备尾零；重新增长不暴露已截断内容。
-
-登记由 MM 拥有，来源 OFD 保持 inode；有借用的游标覆盖同步回调和退休后继。停止登记在 gate 内摘链，drain 在 gate、inode I/O 和 raw 外完成，之后才释放登记/MM存储。首次登记状态 OOM 在 VMA 发布前返回。并发 fork 私有准备及 inode 读保护在父提交前完成，父私有叶失效确认后才发布完整 child 登记；关闭的代次返回 CONFLICT，不发布半成品 child。
-
-```sh
-make test-file-mapping-concurrency-host test-mm-file-concurrency-host
-make test-mm-file-smp-riscv
-make test-mm-file-smp-userland-riscv INIT_CONFIG=config/init.json
-```
-
-宿主链接实际 VFS/tmpfs/OFD/object/MM，4/16 KiB 的登记与来源 owner 模型、Sv39 4 KiB 的跨 MM 模型分别报告。真实 RV 使用独立 `build/riscv-mm-file-smp-test/`、MTTCG 两核及一核退化；默认用户和 LA 仍单 CPU。执行器身份和自然退出 owner 检查沿用 [RV SMP](riscv-smp.md)。
-
-## ext4 文件映射
-
-来源准备在 MM gate 下取得实际来源借用。调用 CPU 在 MM 保护外准备冷页和描述，并执行 ext4 后端读取。恢复 gate 和 inode 读保护后重查 VMA 和文件代次、EOF、权限及 PTE，过期候选归还本次取得的引用。
-inode 的文件映射代次和关闭位在一个原子字中发布，缓存接纳与缺页检查可直接读取一致快照。登记、撤销及截断通知仍由登记表保护。
-普通读或取指缺页先确认缺叶。需求页已驻留时，调用者在 inode 缓存索引保护内直接取得物理页引用，即使还缺少页表。调用者先准备需求页的页表，再分配驻留描述符。持读资格的私有映射可以在准备立即完成时继续使用该资格。共享映射发布前取得写资格以登记别名。可能等待数据或分配的过程释放内存管理资格，已取得的需求引用随候选保持。发布前重新取得 inode 输入输出读资格，核对映射代次、文件长度和实际页表。已有叶和调试强制访问沿各自的完整检查路径执行。
-私有匿名页的零填充与 COW 复制复用已有 MM 读资格。COW 复制持有旧页真实引用，内存分配遇到回收压力时先释放该资格，重新进入后按原规则校验 VMA 和页表。
-共享叶与其他MM使用同一缓存页，初始RO；私有叶保持只读后备别名/COW，fork按VMA分类。
-磁盘可写pin附带按页写借用，快照关闭后不能新增许可；等待重开先释放gate和inode保护。
-fault成功后pin若遇快照临时撤W，重新解析；真正的VMA撤权或EOF仍按用户故障结束。
-
-范围同步每批固定最多16份OFD与范围，释放gate后执行，以免写回回调等待同一gate。
-共享文件读缺页预装相邻页时，将需求页和成功发布的相邻页放入同一批。内核按文件偏移
-一次定位页缓存索引，再顺序登记该批别名。只有需求页成功时，复用发布时取得的驻留记录
-登记单页，省去一次虚拟页地址查询。
-调用者持有内存管理写资格和 inode 输入输出读资格。每项登记核对它引用的物理页。
-撤销映射时，页表删除回调复用驻留页哈希查询得到的链位置。当前批次完成翻译失效后，
-按页缓存实例成批摘除别名。摘链时无回调借用的记录可成批归还给堆分配器。连续归还
-同一分配页上的记录时，复用已经核对的分配页身份，仍逐项核对槽位的分配状态。
-仍被借用的记录在内存管理、inode 与原始锁之外排空。等待内存管理资格的后台重试持有实际别名引用，
-借用结束前不会释放其记录。
-缓存写回/截断的交接见[VFS](vfs-ext4.md#后台写回与水位回收)，真实两核及独立重启
-见[RV SMP](riscv-smp.md)。`make test-mm-disk-concurrency-host`链接真实Sv39、VFS/OFD、
-lwext4及镜像读写；宿主模型不证明硬件TLB或用户线程跨核ABI。
-
-用户 fault 统计由 `kernel_mm_resolve_user_fault()` 的共用完成出口负责，后备实现只返回解析结果；成功一次计一次，失败/内部重试不计，服务任务处理其他 MM 不计到服务者。
-`make test-fault-count-riscv test-fault-count-loongarch TEST_MEMORIES="512M 1G"` 使用真实 tmpfs 映射和 proc stat 对照共享首次读取、私有 COW 的计数增长及失败不增长，不比较两系统偶然的累计数值。
+</details>

@@ -1,139 +1,130 @@
-# TTY、串口与作业控制
+# 终端子系统（TTY）、伪终端（PTY）与作业控制
 
-`fs/tty.c` 是软件行规程，`kernel/sched/tty.c` 连接线程组、稳定 PID 身份、信号与
-proc 快照；RV/LA 共用硬件入口见 [UART transport](riscv-uart-tty.md)。生产启动在标准 OFD
-建立之前创建、配置并发布根 TTY，默认 canonical、echo、ISIG、115200 8N1、CREAD，
-winsize 初始为零。固定设备类别由 `st_rdev` 选择；open 另借用调用期间已 pin 的 VFS file/path，
-动态 devpts 实例按节点绑定识别，不能仅靠复用的设备号选择。ttyS0 为 4:64、console 为 5:1、当前
-控制终端为 5:0。console 不自动取得控制终端；没有 ctty 的 `/dev/tty` 返回 ENXIO。
-未建立 transport 的独立内核 fixture 仍使用原裸 UART console，不能当作 TTY 验收。
+终端（Teletype，TTY）子系统在操作系统中负责将原始字节流（来自物理串口或伪终端对端）转化为面向交互式会话的编辑行、回显输出与作业控制信号（如 `Ctrl-C` 触发 `SIGINT`、`Ctrl-Z` 触发 `SIGTSTP`）。
 
-## 对象与 owner
+BoarOS 实现了统一的软件行规程核心（Line Discipline，`N_TTY`）、面向会话与进程组的作业控制层，以及支持多实例隔离的 Unix 98 伪终端（Pseudo-Terminal，PTY）和 `devpts` 虚拟文件系统。底层 16550 通用异步收发器（Universal Asynchronous Receiver-Transmitter，UART）串口驱动见[共用 ns16550 串口传输](riscv-uart-tty.md)。
 
-根启动拥有 core；每个 OFD 从自己的 heap 创建一个实例并持有 core 引用，dup/fork
-共享该 OFD。每个有 ctty 的线程组另持一个 core 引用，线程成员借用 leader 的关联。
-TTY 的 SID/前台 PGID 是持引用的 `kernel_pid`，身份成员链只借用 task，不构成引用环。
-fork 继承 ctty，线程 clone 共享，setsid 清除本线程组关联，普通 exec 保留；非 leader
-exec 转移 leader 的既有 ctty 引用。PID 号码退出后可由真实 SID/PGID owner 继续保留。
+---
 
-会话 leader 可在非 O_NOCTTY 的可读 ttyS0 open 自动取得 ctty，或经 TIOCSCTTY
-取得；steal 要求调用者实际具备 CAP_SYS_ADMIN。TIOCNOTTY 对
-leader 清除整个会话关联并向前台 PGID 发 HUP/CONT，对普通线程组只撤销自身关联。
-leader 最后成员退出的 serial hangup 向 session leader 发 HUP/CONT，并向前台组发 HUP；
-既有实例的 generation 随 hangup 失效，后来的新 session 不会复活旧 OFD。普通 close
-不触发会话 hangup，最后一次真实 OFD close 的 HUPCL 由 transport 操作硬件 modem。
-`vhangup` 先检查 CAP_SYS_TTY_CONFIG；具备该能力但没有 ctty 时成功返回。
-有 ctty 时清空输入/输出、撤销会话关联，向 session leader 发 HUP/CONT；它不额外
-向前台组发 HUP，也不关闭 transport。旧普通 OFD 读返回 EOF、写和 ioctl 返回 EIO
-（TIOCSPGRP 返回 ENOTTY），poll 返回 IN/OUT/ERR/HUP；新 open 取得当前 generation。
-`/dev/console` 的重定向写实例保留使用资格，真实 shutdown 才使其失效。
-proc stat 的 tty_nr/tpgid 来自同一受保护的实际关联快照。
-TIOCSPGRP 查找数字身份：身份不存在返回 ESRCH；存在但属于其他 session 或没有活成员
-返回 EPERM。按固定 Linux 在无 PGID 成员时检查 PID 成员的 session，成功才更新前台引用。
+## 一、源码组织
 
-完整 readv/writev 与可阻塞 ioctl 的调用拥有 OFD pin 和已导入的 heap iov。进入 hook
-时从调用者 owner 指针移交，正常返回恢复供原调用者收尾；强制终止则消费这些 owner，
-先释放请求的 read/mode 状态和 vectors/OFD pin，再清理 files/MM。请求仍借用退出 task
-的栈，因此 reaper 在归还栈页之前执行 abort。OFD 后端真实 close I/O 失败仍交给对应
-files cleanup owner，TTY 不引入成功存根或重复释放。
+| 源码路径 | 核心职责 |
+| :--- | :--- |
+| `fs/tty.c`、`include/kernel/tty.h` | `N_TTY` 软件行规程：输入/输出/回显环形缓冲区、规范与原始模式处理、`termios`/`termios2` 配置、`ioctl`、轮询与异步 I/O（`O_ASYNC`）事件 |
+| `kernel/sched/tty.c`、`include/kernel/tty_task.h` | 控制终端（Controlling TTY，ctty）与线程组绑定、会话/前台进程组身份查询、作业控制信号投递与 `/proc/<pid>/stat` 快照 |
+| `fs/pty.c`、`fs/pty_internal.h` | Unix 98 PTY 主从端配对管理、双向 4 KiB 先进先出队列（FIFO）、后台转发工作线程与包模式（`TIOCPKT`） |
+| `fs/devpts.c`、`fs/devpts_internal.h`、`include/kernel/devpts.h` | `devpts` 文件系统实现、动态从端编号分配、挂载选项解析及 `/dev/ptmx` 入口绑定 |
 
-## 行规程与 I/O
+---
 
-输入有独立 4096 字节环；canonical 保留最多 4095 个普通字节加 delimiter，超长普通
-输入丢弃而控制字符继续处理，raw 容量为 4095。支持 CR/NL 映射、strip、break/parity
-处理与 PARMRK、IXON/IXANY/IXOFF、canonical erase/kill/word erase/literal next/reprint、
-IUTF8 erase、EOF/EOL/EOL2、ISIG 与 NOFLSH。禁用 cc 不作为特殊字符；IMAXBEL 与
-固定 Linux 一样不产生额外机制。错误 marker 按整个展开记录保留，不发布截断 FF/00。
-流控与信号检查在 CR/NL 映射之前，canonical 编辑在映射之后。
+## 二、设备身份、控制终端与会话生命周期
 
-readv 的初次资格、64 字节 scratch、read serialization、mode guard、绝对 deadline 与
-continuation 属于一个请求。短 publication 区把输入复制到独立 scratch 并同时消费，
-随后在 publication 区外 usercopy；fault 返回实际交付前缀或 EFAULT，已消费的 staging
-尾部不回滚。只按 continuation 许可继续，不为每个 iov/64B 块重新发起新 read。
-canonical 读在 delimiter 处停止，EOF 不交付；容量恰好结束或 fault 后的零长度 cookie
-清理按固定 Linux 跳过紧邻 EOF。VMIN 超过 64 时初次 staging 仍可在填满 64 后返回；
-这不是把 minimum 偷改为整次用户请求长度。raw 的四种 VMIN/VTIME、O_NONBLOCK、
-信号前缀与 restart 分别处理，spurious wake 不刷新期限。
+### 2.1 字符设备分类与所有权
 
-Flush/改 mode 与 read continuation 的 mode guard 串行，等输入时释放 guard，使配置
-与 RX worker 可推进。ISIG 的 flush 先发组信号；串口 worker 可等逻辑 guard 排空，非阻塞接收则登记延后 flush，
-在 guard 归还后完成，保留后续尚未处理的输入；
-等待不持 inode/namespace/device 锁，后续输入不会被先前延后的 flush 误删。前台控制
-信号针对整个 PGID；背景读发 TTIN，TOSTOP 写和修改型 ioctl 发 TTOU，blocked/ignored
-及 orphan 条件按固定 Linux 返回/放行。partial 结果不留下 syscall restart 标记。
+系统在启动建立标准描述符前初始化并发布根串口终端（默认规范模式、回显开启、`ISIG` 开启、115200 8N1、`CREAD`，窗口尺寸初始为 `0`）。固定终端设备按 `st_rdev` 主次设备号识别，而伪终端从端严格依赖 `devpts` 节点的内部绑定指针（防止因设备号复用而错绑）：
 
-用户 writev 先完整复制最多 2 KiB 的请求暂存块，复制失败不发布该块；已经发布的
-完整块构成短写前缀。暂存归请求 owner，取消与 OOM 归还；整次写资格保护并发写入，
-不把 2 KiB 缓冲放入 8 KiB 内核栈。用户 TX 与 echo 各有独立 4KiB 容量，合并顺序队列维持已接受输出的先后。echo 以完整
-字符/编辑操作提交，空间不足丢弃该完整操作，RX 不等待 echo 空间；software xchar 优先
-且不受 stopped output 阻挡。OPOST 支持 ONLCR/OCRNL/ONOCR/ONLRET 与 TAB3，并维护
-列位置。transport 只写实际硬件 credit，不串口 busy-wait。shutdown 拒绝新 input/open，
-唤醒旧实例并打开停止流控，仍服务已经接受且未 flush 的输出；root 在真实 drain/join
-以及所有 OFD/ctty owner 释放后才能 destroy。
+| 设备路径 | 主次设备号 | 语义说明 |
+| :--- | :--- | :--- |
+| `/dev/ttyS0` | `4:64`（`0x440`） | 根串口终端；会话组长在未设 `O_NOCTTY` 且可读打开时可自动取得控制终端 |
+| `/dev/console` | `5:1`（`0x501`） | 系统控制台；不自动取得控制终端，其重定向写实例在 `vhangup` 后保持有效直到真实关机 |
+| `/dev/tty` | `5:0`（`0x500`） | 当前线程组的控制终端别名；无控制终端时打开返回 `-ENXIO` |
+| `/dev/ptmx` | `5:2` | Unix 98 伪终端多路复用入口，打开时在关联的 `devpts` 实例中分配一对全新主从 PTY |
+| `/dev/pts/<N>` | `136:N`（`0x8800 + N`） | 动态创建的伪终端从端节点 |
 
-TCGETS/TCSETS/TCSETSW/TCSETSF 使用 Linux RV64 **36 字节** kernel termios，不能复制
-libc 的更大布局。硬件普通配置由 transport configure 校验并回写生效值；unsupported
-软件 bits 清除，TCGETS2/TCSETS2/TCSETSW2/TCSETSF2 使用独立的 44 字节布局，旧 TCGETS 系列仍只复制
-36 字节。PTY 保存独立输入/输出速度；UART 按单时钟归一，详见[串口传输](riscv-uart-tty.md)。
-其他 ldisc 与完整 modem ioctl 未实现，返回明确错误。真实应用收口状态见[开发路线](../goals.md)。
-支持 winsize、TCXONC、TCFLSH、FIONREAD、TIOCOUTQ、TIOCGETD(N_TTY)、前台 PGID/SID
-与 ctty 操作。TCSBRK 的非零参数真实 drain；零参数没有 break 生成 owner，返回 ENOTSUP。
-read/write/poll 共用等待事件队列；canonical IN 需要完整 line/EOF，raw poll 按其
-minimum/time 规则，hungup 实例返回实际 HUP 与 EOF/EIO。
-O_ASYNC 订阅另用独立队列：canonical delimiter/EOF、实际 raw 输入和输出容量恢复
-分别发布 POLL_IN/POLL_OUT；设置变更、流控和普通等待唤醒不冒充异步数据事件。
-OFD 首次启用时以 TTY 前台 PGID 为默认 owner，没有前台组则用调用者 TGID；
-显式 F_SETOWN 保持调用者选择。hangup 摘除失效 generation 的异步订阅并清除 O_ASYNC，
-保留 console 和新 generation 的订阅。事件游标在输入/输出状态发布时取得，回调在该
-发布区外执行，订阅 owner 的生命周期由 OFD 负责。
+所有权模型避免任何循环引用：
+- 底层传输层（串口或 PTY 对）持有 `struct kernel_tty` 的基础引用；每个打开文件描述（OFD）创建一个 `tty_instance` 并持有内核 TTY 的外部引用；每个关联了控制终端的线程组也通过组长持有一次外部引用（同组其他线程借用组长）。
+- `struct kernel_tty` 保存的会话（`session`）与前台进程组（`foreground`）是指向稳定 `struct kernel_pid` 对象的引用计数指针，即使原组长进程退出，只要前台组内仍有存活成员或引用，身份依然准确有效。
+- `fork` 继承控制终端，`clone` 线程共享组长关联，`setsid` 清除关联，普通 `exec` 保留关联，非组长 `exec` 则接管原组长的控制终端引用。
 
-## 固定依据与验证
+### 2.2 控制终端获取、挂断与 `vhangup`
 
-固定源码：`references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`，
-`drivers/tty/n_tty.c`（canonical/64B cookie、VMIN/VTIME、软件 flags）、
-`drivers/tty/tty_io.c`（iterate_tty_read/consume-before-copy/故障 cookie 清理）、
-`drivers/tty/tty_jobctrl.c`（ctty、SIGTTIN/TTOU、HUP/CONT）和
-`include/uapi/asm-generic/termbits.h`（36B ABI/flags）。
+- **获取与释放**：会话组长可通过 `TIOCSCTTY` 绑定控制终端（传入参数 `1` 强夺其他会话的控制终端需要 `CAP_SYS_ADMIN`）。`TIOCNOTTY` 对会话组长会解除整个会话的绑定并向前台进程组发送 `SIGHUP`/`SIGCONT`；对普通进程仅撤销自身关联。
+- **挂断代数（Generation）隔离**：每次会话组长最后成员退出导致的串行挂断，或由具备 `CAP_SYS_TTY_CONFIG` 的进程调用 `vhangup()` 时，都会递增 TTY 的 `generation` 计数器并撤销会话关联。既有普通 OFD 因代数过期立即失效（读返回 EOF、写与多数 `ioctl` 返回 `-EIO`、`TIOCSPGRP` 返回 `-ENOTTY`、`poll` 返回 `POLLIN | POLLOUT | POLLERR | POLLHUP`），此后重新打开才会获得新代数，绝不会让旧描述符“复活”到新会话中。
+
+---
+
+## 三、行规程核心与 I/O 数据通路
+
+`struct kernel_tty` 内部维护独立的输入环形缓冲区（`input[4096]`）、用户输出缓冲区（`tx[4096]`）、回显缓冲区（`echo[4096]`）以及 8 KiB 的合并顺序输出队列（`order[8192]`），确保用户输入、软件回显与程序输出在并发场景下严格保序且互不死锁。
+
+```mermaid
+flowchart LR
+    subgraph RX["接收路径（串口 / PTY 对端）"]
+        A["原始字节 + LSR 状态"] --> B["流控 IXON/IXOFF 与信号 ISIG 检查"]
+        B --> C["CR/NL 映射与奇偶/Break 处理"]
+        C --> D{"ICANON 规范模式？"}
+        D -- "是" --> E["行编辑（擦除/删词/IUTF8/重印）+ 回显提交"]
+        D -- "否" --> F["直入 4096 B 输入环（可用 4095 B）"]
+        E --> F
+    end
+    subgraph READ["用户 readv 路径"]
+        F --> G["短发布区拷贝至 64 B 暂存并消费"]
+        G --> H["发布区外 copy_to_user（fault 不回滚已消费尾部）"]
+    end
+    subgraph TX["输出与回显路径"]
+        I["用户 writev（堆上 2 KiB 暂存块）"] --> J["OPOST（ONLCR/TAB3 等）写入 4 KiB tx 环"]
+        E -. "原子提交完整编辑回显" .-> K["4 KiB echo 环"]
+        J --> L["8 KiB 合并顺序队列 + 高优先级 xchar"]
+        K --> L
+        L --> M["transport->transmit 非阻塞按硬件额度发送"]
+    end
+```
+
+### 3.1 规范模式、原始模式与读延续（Read Continuation）
+
+- **容量与行编辑**：规范模式（`ICANON`）下每行最多保留 4,095 个普通字节加 1 个定界符（`\n`、`EOF`、`EOL`、`EOL2`），超长行丢弃多余普通字符但继续响应控制字符；支持 `VERASE`（含 `IUTF8` 多字节字符回删）、`VKILL`、`VWERASE`、`VLNEXT`、`VREPRINT` 以及 `PARMRK` 错误标记（整条 3 字节序列原子入队，不截断）。流控与 `ISIG` 信号判定在 CR/NL 映射前完成，行编辑在映射后完成。
+- **单请求语义**：一次 `readv` 在请求对象（`struct kernel_tty_request`，栈占用编译期约束不超过 160 字节）内统一维护初次资格检查、读串行化、模式保护锁（`mode_owner`）、绝对超时期限与延续状态。在短发布区内将最多 64 字节拷贝到暂存并立即消费，随后在发布区外执行用户拷贝；即使中途发生页故障（`-EFAULT`），已交付的前缀保留且不回滚已消费字节。原始模式完整支持四种 `VMIN`/`VTIME` 组合、`O_NONBLOCK` 与信号打断重启语义，虚假唤醒不刷新已开始的绝对超时期限。
+- **并发与强制退出安全**：修改 `termios` 或执行 `TCFLSH` 与读延续互斥，但读线程在等待新输入时会释放模式锁，允许配置变更与串口接收推进。阻塞中的 `readv`/`writev`/`ioctl` 将 OFD 引用与堆上向量数组移交给请求对象托管；若线程被 `SIGKILL` 强制终止，回收器在释放任务内核栈前先执行请求中止，精准归还所有资源。
+
+### 3.2 后台作业控制与输出处理
+
+- **前台保护**：后台进程组尝试读取控制终端时收到 `SIGTTIN`；若设置了 `TOSTOP`，后台写入或修改型 `ioctl` 收到 `SIGTTOU`。信号被阻塞、忽略或属于孤儿进程组时，严格遵循 POSIX 放行或返回 `-EIO` 规则。
+- **非阻塞传输与回显策略**：用户 `writev` 先在堆上复制最多 2 KiB 暂存块（不占用 8 KiB 内核栈），再按 `OPOST`（`ONLCR`/`OCRNL`/`ONOCR`/`ONLRET`/`TAB3`）写入 `tx` 环。回显以完整字符/编辑操作为单位原子提交，若 `echo` 环已满则直接丢弃该次操作，确保接收路径永不阻塞等待回显空间。软件流控字符（`xchar`）优先级最高且不受输出暂停状态阻挡。
+
+### 3.3 `termios` ABI 与异步事件
+
+- **精确结构大小**：`TCGETS`/`TCSETS`/`TCSETSW`/`TCSETSF` 使用 RV64/LA64 通用的 **36 字节**内核 `struct kernel_tty_termios`（而非 C 库扩展结构）；`TCGETS2`/`TCSETS2`/`TCSETSW2`/`TCSETSF2` 使用独立的 **44 字节** `struct kernel_tty_termios2`（附带自定义 `ispeed`/`ospeed`）。
+- **异步通知（`O_ASYNC`）**：维护独立于普通 `poll` 的异步订阅队列，仅在真正产生规范行/EOF、原始输入字节或输出空间恢复时分别派发 `POLL_IN`/`POLL_OUT`；首次启用时默认属主为 TTY 前台进程组（无前台组时取调用者 TGID），挂断时自动摘除旧代数的异步订阅。
+
+---
+
+## 四、Unix 98 伪终端（PTY）与 `devpts`
+
+PTY 由一对互联的 `struct kernel_tty` 构成（主端 `PTY_MASTER` 默认原始模式，从端 `PTY_SLAVE` 默认规范模式/回显/`ISIG`，初始 `cflag` 为 `B38400 | CS8 | CREAD`），两端各自拥有 4 KiB 出向 FIFO，由所属 `devpts` 挂载的独立内核工作线程批量转发（每批 `PTY_BATCH = 256` 字节），同时在 `read`/`poll` 路径提供有界同步推进，避免无谓忙等。
+
+- **隔离与配额**：每个 `devpts` 挂载实例独立维护从端编号位图（默认单挂载上限 `KERNEL_DEVPTS_DEFAULT_MAX = 32`，硬上限 `KERNEL_DEVPTS_LIMIT = 64`；挂载参数 `max=` 语法接受至多 `1,048,576`，分配时取 `min(max, 64)`），全局同时存活的 PTY 对上限由 `BOAROS_PTY_MAX`（默认 `64`）约束。支持 `newinstance`、`uid`、`gid`、`mode`（默认 `0600`）、`ptmxmode`、`max` 等标准挂载选项。
+- **主从控制与 `ioctl` 语义**：
+  - 在主端调用 `TCGETS`/`TCSETS` 系列时，按 Linux 规则实际查询/修改的是**从端**的行规程配置，不改变主端自身的原始输入模式；窗口尺寸（`TIOCGWINSZ`/`TIOCSWINSZ`）在主从两端同步，尺寸真正变化时向对应前台进程组发送 `SIGWINCH`。
+  - 支持 `TIOCGPTN`（获取从端编号）、`TIOCSPTLCK`/`TIOCGPTLCK`（加锁/查询从端锁定状态，新分配 PTY 默认锁定直到 `unlockpt`）、`TIOCGPTPEER`（沿主端当前挂载视图直接打开从端 FD，免去路径竞态）及 `TIOCSIG`（由主端直接向从端前台组投递 `SIGINT`/`SIGQUIT`/`SIGTSTP`）。
+- **包模式（`TIOCPKT`）与 `EXTPROC`**：开启 `TIOCPKT` 后，主端读取的每段常规数据前附加 1 字节 `0x00` 前缀；发生流控切换（`STOP`/`START`、`DOSTOP`/`NOSTOP`）、队列清空（`FLUSHREAD`/`FLUSHWRITE`）或 `EXTPROC` 下 `termios` 变更时，合并最新控制状态字节并优先通过 `POLLPRI` 交付给主端。
+
+---
+
+<details>
+<summary>展开查看：支持的 ioctl 清单、细节契约与验证命令</summary>
+
+### 支持的 `ioctl` 总览
+
+- **通用终端**：`TCGETS`/`TCSETS`/`TCSETSW`/`TCSETSF`、`TCGETS2`/`TCSETS2`/`TCSETSW2`/`TCSETSF2`、`TCSBRK`（非零参数执行真实排空；参数 0 返回 `-ENOTSUP`）、`TCXONC`（`TCOOFF`/`TCOON`/`TCIOFF`/`TCION`）、`TCFLSH`、`TIOCSCTTY`、`TIOCNOTTY`、`TIOCGPGRP`、`TIOCSPGRP`、`TIOCGSID`、`TIOCGWINSZ`、`TIOCSWINSZ`、`FIONREAD`、`TIOCOUTQ`、`TIOCGETD`/`TIOCSETD`（仅支持 `N_TTY = 0`）。
+- **伪终端专属**：`TIOCGPTN`、`TIOCSPTLCK`、`TIOCGPTLCK`、`TIOCGPTPEER`、`TIOCPKT`、`TIOCGPKT`、`TIOCSIG`。
+
+### 关键细节契约
+
+- `TIOCSPGRP` 查找目标进程组时，若数字身份不存在返回 `-ESRCH`；若无 `PGID` 成员则按 Linux `session_of_pgrp` 规则检查同号 `PID` 成员的会话，跨会话或无活成员均返回 `-EPERM`。
+- 串口非阻塞接收接口 `kernel_tty_receive_nonblocking()` 返回实际已消费的字节前缀：原始模式缓冲区满时保留后缀交由传输层背压；若正在等待读延续释放模式锁，触发 `ISIG` 时立即投递组信号并将输入清空（flush）延后至模式锁归还时执行，且不会误删后续新到达的未处理输入。
+- 仅有 `136:N` 主次设备号但未绑定真实 `devpts` 条目的普通字符节点无法作为从端打开，返回 `-EIO`（`O_PATH` 打开除外）。
+
+### 定向验证命令
 
 ```sh
+# 宿主核心单测（行规程标志、原子回显、超时延续、页故障前缀与强制终止清理）
 make test-tty-host
+
+# 双侧同 ELF 客户机差分（真实原始 PTY 通道与作业控制握手）
 make all
 build/riscv/musl-root/bin/musl-gcc -fno-link-libatomic -static -pthread -O2 \
   -Wall -Wextra -Werror tests/workloads/tty/probe.c -o build/tty/probe-rv
 python3 -B tests/userland/tty/riscv.py --only both --kernel kernel-rv --probe build/tty/probe-rv
 ```
 
-宿主测试执行真实 core，覆盖软件 flags、限长/原子 echo、deadline/continuation、fault
-前缀、可失败分配和放弃阻塞调用栈后的 owner 清理；依赖 transport/scheduler 模型不代表
-UART/CSR 或真实用户信号已经验收。相同 probe ELF 在固定 Linux 与 BoarOS 中通过 raw
-host PTY 与独立 serial/monitor-off 通道运行，按完整 TTY_REQUEST/FIONREAD/任务 state
-handshake 注入；原始字节不做文本归一化。原 BusyBox ash、stty 与完整 job-control 验收
-由同一独立 launcher/runner 完成，结果收口在开发路线与 learning，不由宿主模型代替。
-
-## 配对 transport 接缝
-
-TTY core 仍由 transport 的 base owner 管理；外部 OFD/ctty 和跨发布区的操作引用通过
-可选通知保活配对，base 引用不反向保活配对。打开上下文只借用已 pin 的路径，实例不借用临时
-用户指针。分配完成后在发布区重新核对锁定和对端关闭，防止检查到安装之间的状态变化。
-
-`kernel_tty_receive_nonblocking` 返回已经处理的前缀。raw 容量不足保留后缀；
-canonical 超长行仍按行规程处理。普通 RX 不等待 read continuation 的 mode guard，
-信号立即交付而必要的 flush 延后。read/poll 可通过 transport 做有界推进，随后按真实
-数据、peer 状态和 packet 控制状态判断；无进展必须等待事件。
-
-PTY 两端拥有各自行规程状态；master 初始 raw，slave 初始 canonical/echo/ISIG。
-按 Linux 的 mode ioctl 规则，master 上 TCGETS/TCSETS 系列查询和设置 slave termios；
-这不改变 master 自身的 raw 输入处理。
-设备身份从 core 读取，ctty/proc 不再假定串口设备号。winsize 在配对内同步，尺寸改变
-才发送 SIGWINCH；master 的 TIOCSCTTY 和前台组/SID 查询使用 slave 的控制身份。
-普通字符节点只有设备号而没有 devpts 绑定时不能打开 slave，返回 EIO；O_PATH 仍可持有节点身份。
-
-TIOCPKT 默认关闭，控制状态优先于数据；正常非 canonical 数据前缀为零，
-单字节读取只交付前缀。STOP/START、DOSTOP/NOSTOP 保留最新互斥状态，flush 位
-可合并，POLLPRI 只表示实际待读控制状态。EXTPROC 保留必要的输入、EOF 和
-termios 通知契约。固定依据另见 `references/linux` v7.2 的
-`drivers/tty/{pty,n_tty,tty_ioctl,tty_jobctrl}.c`。
-重复停止/恢复不产生新控制包；VSTART、IXANY、信号和关闭 IXON 经统一状态转换，
-不能越过 TCOOFF 的停止资格。
-
-LA入口与同ELF两种RAM验收、原script真实重启和UART回收见[共用UART](riscv-uart-tty.md#la-平台与对照验收)。LA/RV均采用asm-generic36/44字节内核termios/termios2；字符设备号和PTY所有权共用。
+</details>

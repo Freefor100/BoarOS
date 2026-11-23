@@ -1,352 +1,100 @@
-# LoongArch QEMU 启动与根盘
+# LoongArch 64 引导、16 KiB 分页与多核执行
 
-当前平台范围为 QEMU virt、LA464、LA64、16 KiB/三级页表，默认单核，可选最多八核；
-覆盖整数/FPU/LSX/LASX状态与代表性用户程序；更广应用及客体原生开发另行验收。
-入口为 `arch/loongarch/boot.S` 与 `main.c`，平台事实独立放在
-`platform/loongarch_virt.c`。普通 `kernel-la` 从现代 PCI block 启动可配置根盘 PID 1；无根盘时报告启动错误。它不链接契约测试、内嵌用户 ELF 或故障包装函数。独立 `build/loongarch/kernel-contract-la` 保留无盘契约入口；平台存储生命周期在 `platform/loongarch_root.c`。
-默认 `all` 和 RV 测试入口保持原路径。
+BoarOS 完整支持龙芯 **LoongArch 64（LA464 处理器模型）** 架构，运行于内核特权级 **PLV0**，支持 **1～8 核对称多处理（SMP）**、**16 KiB 基页 / 32 MiB 原生大页**三级页表、软件转换后备缓冲器（Translation Lookaside Buffer，TLB）重填、PCI/PCIe 现代 VirtIO 设备以及浮点/LSX/LASX 向量上下文，与 RISC-V 64 共享全部上层内核子系统。
 
-链接脚本将异常入口、系统调用分派、执行时间记账和线程组编号查询集中在启动代码之后。
-文件系统和驱动代码增长时，这组入口保持原有位置。分析虚拟机上的入口耗时时，可以用相同
-的目标文件重新链接，区分指令地址变化与执行路径变化。
+---
 
-## 多核执行
+## 一、源码组织
 
-`make LA_SMP=1 kernel-la`使用独立的`build/loongarch-smp2/`对象和内核，默认容量为两核。
-`LA_SMP_CPUS=4`或`8`选择对应容量及`build/loongarch-smp4/`或`build/loongarch-smp8/`，
-实际启动数可为一至容量上限之间的任意核数。
-普通`kernel-la`及官方默认参数保留单核。
-DTB的CPU列表在启动其他CPU前校验，启动CPU为逻辑CPU0，其余ID排序；超容量和非法拓扑
-在发布启动数据前拒绝。IOCSR目标CPU ID支持0～1023，容量限制的是实际CPU数量。
-平台范围仍为QEMU virt；实板另行验收。
+| 源码路径 | 核心职责 |
+| :--- | :--- |
+| `arch/loongarch/boot.S`、`main.c`、`linker.ld` | 直接映射窗口配置、开启分页跳转高半区、引导初始化与根盘启动 |
+| `arch/loongarch/mmu.c`、`tlb_refill.S` | 16 KiB 三级页表、32 MiB 原生大页、硬件辅助 `LDDIR`/`LDPTE` 软件 TLB 重填 |
+| `arch/loongarch/smp.c`、`secondary.S` | 片上 IOCSR 邮箱从核唤醒、IPI 事件分发与跨核 `INVTLB` 同步协议 |
+| `arch/loongarch/trap.c`、`trap_entry.S`、`context.c`、`fpu.c` | 陷入与中断分发、上下文切换、浮点与 LSX/LASX 向量扩展现场切换 |
+| `platform/loongarch_pci.c`、`loongarch_root.c`、`kernel/pci.c` | PCIe ECAM 配置空间扫描、BAR 资源分配、VirtIO-PCI 探测与 EIOINTC 中断初始化 |
 
-CPU0顺序启动secondary：通过IOCSR MBUF1发布目标CPU的常驻启动描述符，MBUF0发布物理入口，
-再发送启动IPI。固定QEMU固件在停驻循环中清MBUF0并把它用作跳转入口，因此描述符单独放在MBUF1。
-secondary不清BSS，先配置DMW并进入高地址，从描述符取得自己的idle及16KiB启动栈；
-描述符的汇编前缀偏移由C静态断言核对。每个CPU分别设置异常、MMU与timer，
-共用永久内核栈页表根，各自持有PGDH；timer的周期期限与调度期限归实际CPU。
-每个secondary完成本地timer和IPI握手后发布ONLINE，全部CPU在线后CPU0才启动普通用户任务。
-固件入口及IOCSR布局对照固定QEMU的`hw/loongarch/boot.c`和固定Linux的
-`arch/loongarch/kernel/smp.c`，版本统一由`references/sources.tsv`维护。
+---
 
-调度队列、任务唯一执行者、CPU0服务资格沿共同实现。用户执行、信号构帧／恢复、共享MM、
-普通文件、管道及事件对象复用各自已经具备的跨核保护。设备外部中断、网络协议与控制、
-ext4 日志线程和已建立 TCP 连接可在副核运行；后台缓存写回仍由 CPU0 推进。副核只启用本地 timer 和 IPI 中断。全局 tick、粗粒度时间与
-期限扫描由CPU0推进；各核的周期 tick 都为当前任务检查 `RLIMIT_RTTIME`，沿用全局 tick 去重，避免迁移重复计费。只有调度期限到期、没有周期 tick 的中断不计费。共同等待、POSIX timer和timerfd通过`arch/smp.h`选择实际架构的
-CPU0通知，不再直接调用RV接口。中断入口只分发ESTAT快照与当前ECFG共同允许的来源；来源撤回或快照仅含屏蔽位时直接返回，保留原任务与记账现场。未知的非零有效来源仍按原错误路径报告。
+## 二、早期引导与直接映射窗口（DMW）
 
-每个发起CPU持有一份同步TLB请求，包含地址、范围、指令同步要求、代次、目标集合和待确认集合。
-发起者禁止本地中断以固定执行CPU，在发布PTE后发布请求，并在各目标 CPU 的待处理位图中登记发送者，再发送 IPI。接收者只访问位图指明的请求；普通调度 IPI 无 TLB 工作时不扫描发送者。等待其他核确认的发起者也处理自己的待接收请求，保证互相发送时仍能推进。
-接收方只借用包含自己待确认位的请求：短保护内取得快照，退出保护后失效TLB并按需要执行IBAR，
-再在短保护内核对代次并清自己的位。非目标CPU不能确认其他CPU的工作；全部待确认位清零前，
-发起者不复用请求存储。迟到IPI只检查当前代次和自己的位，不复用旧的确认含义。
-等待者同时处理远端请求，即使自己的确认已经先到，也在返回前处理对端请求；
-所有CPU同时屏蔽中断发起同步仍能推进。硬件IPI清除完成后才消费软件事件，
-后续通知由新事件或pending中断保留。页和页表沿共同MM退休集合持有，远端确认后才释放。
-内核栈槽的发布／撤销同样同步全部在线CPU。
+LoongArch 64 架构提供硬件**直接映射配置窗口（Direct Mapping Window，DMW）**，无需建立传统恒等页表即可在开启分页后直接将高地址映射到物理内存。`arch/loongarch/boot.S` 与 `secondary.S` 在启动早期按三步完成虚拟地址空间切换：
 
-撤销用户映射时，每次持有 MM 元数据保护的扫描复用已解析的根、中间及叶页表地址；
-父表条目变化后重新解析。每次仍有界扫描，摘下的页表在退出保护并完成 TLB 同步后释放。
+1. **配置永久直接映射窗口**：
+   - `CSR.DMW0`（`0x180`）设为 `0x9000000000000011`（`LA_DIRECT_BASE`，可缓存一致访存 `MAT=1`），供内核直接访问物理内存；
+   - `CSR.DMW1`（`0x181`）设为 `0x8000000000000001`（`LA_UNCACHED_BASE`，强序非缓存 `MAT=0`），供内核访问外设寄存器与 PCI 配置空间。
+2. **临时过渡窗口与开启分页**：将 `CSR.DMW2`（`0x182`）临时设为 `0x11` 覆盖当前低物理地址取指区间，随后写 `CSR.CRMD`（`0x0`）开启分页模式（`PG=1`）。
+3. **跳转高半区并清除过渡窗口**：跳转至高半区标签 `.Lmapped`（从核为 `.Lsecondary_high`）后立即清零 `CSR.DMW2`，正式进入常规高半区内核运行态。
 
-停止先逐核检查secondary已无用户、就绪资格及活动MM，发送STOP后逐核等待关中断、停timer并发布
-STOPPED，再清理根盘对象。停驻循环继续占用镜像常驻的AP栈、idle和CPU记录，不把它们
-当作可复用内存。启动、握手、TLB或停止确认失败输出目标CPU和阶段，并保持可能仍被使用的
-资源。每个逻辑CPU各有独立的16KiB紧急故障栈；汇编入口按常驻硬件ID选择紧急栈，
-在调用C前不向已经耗尽的栈写入数据，同时发生guard错误时也不共用报错现场。
+---
 
-短例使用`tests/workloads/smp/loongarch.c`，复用既有整数/FPU/SIMD寄存器探针。
-`tests/loongarch/smp.py`固定内核和ELF快照，覆盖实际CPU、信号、共享MM撤权／替换／解除映射、
-futex、CPU定时器、ext4并发及fork/COW/exec；整数/FPU/SIMD/TLS、信号、共享MM、文件及
-CPU定时器均由每个实际在线CPU执行。runner核对每核用户trap、返回、IPI及最终停止状态；
-同一程序可在固定Linux上运行。
-动态musl使用既有`dynamic-dp-v2`工具链；`--loader`要求ELF包含实际的musl解释器入口，
-快照解释器并核对盘内文件内容，拒绝把静态程序当作动态验证。
-`LA_SMP_TEST=1`仅在独立测试内核中强制全部发起者同时发布TLB请求，随后扣住最后一个目标确认，
-检查其余回复不能完成请求；最后复用payload并向非目标CPU送入迟到IPI，检查它们不能代为确认。
-runner的`--expect-protocol`要求这三组结果全部出现。2～5分别向最后一个secondary注入attach、
-握手、TLB及停止确认失败，失败输出实际目标CPU和阶段。
-`make LA_SMP=1 LA_SMP_CPUS=8 test-smp-guard-loongarch`同时触发八核guard错误并核对紧急栈分离。
+## 三、16 KiB 三级页表与软件 TLB 重填
 
-`COST_DIAGNOSTICS=1 LA_BUILD=build/cost/loongarch-smp2`可复用共同成本观察器，
-记录服务交接、共享锁及唤醒至运行。rank40为挂载状态，rank45为页缓存状态。
-诊断的trap边界位于C入口及返回准备；完整物理入口／出口的IRQ关闭时长另行核对，
-这些诊断值不与关闭诊断的正式耗时混用。
+### 3.1 页表几何与 32 MiB 原生大页
 
-不可恢复的内核异常和栈溢出入口在输出任何寄存器或前缀前切换紧急控制台，
-直接轮询UART，绕过日志发布、TTY和等待通知。这样首错即使发生在调度域保护内，
-诊断也不会重入该锁。`test-loongarch-fatal`用真实持锁load fault及栈故障报告检查
-首条原因完整、没有二次断点，再保留既有allocator/页表owner的fatal检查。
+与 RISC-V Sv39 的 4 KiB 硬件页表遍历不同，BoarOS 在 LoongArch 64 上采用 **16 KiB 基页**（`BOAROS_PAGE_SHIFT = 14`），每张页表恰好容纳 `2,048` 项 8 字节页表项（每级索引 11 位），构建经典的三级页表（索引位偏移 `14 / 25 / 36`，分别编程至 `CSR.PWCL` 与 `CSR.PWCH`）：
+- **用户页表根**存于 `CSR.PGDL`（`0x19`），**内核栈高半区页表根**存于 `CSR.PGDH`（`0x1a`）；
+- **32 MiB 原生大页**：直接由中间目录级（PMD）大叶表示（`ARCH_MMU_HUGE_ORDER = 11`，页表项置 `PTE_HUGE = 1 << 6`），单条 32 MiB PMD 恰好覆盖龙芯硬件一对 16 MiB `EntryLo` 表项；
+- **软件权限编码**：`arch/loongarch/mmu.c` 使用 `PTE_VALID`（`1`）、`PTE_DIRTY`（`2`）、`PTE_PRESENT`（`1<<7`）、`PTE_WRITE`（`1<<8`）、`PTE_COW`（`1<<9`）、`PTE_NONE`（`1<<10`）、`PTE_NR`（`1<<61`）与 `PTE_NX`（`1<<62`），`PROT_NONE` 保留 `PTE_PRESENT | PTE_NONE`（清除 `PTE_VALID`）而不丢弃物理页所有权与 CoW 标记。
 
-```sh
-make kernel-la                 # 普通 LP64S 内核，需要 PCI 根盘
-make kernel-la-contract        # 独立启动/MMU/heap/内嵌用户 ELF 契约
-make test-root-loongarch        # PCI/ext4/LP64S musl/原 BusyBox 与 Linux 对照
-make test-root-io-loongarch     # 真正的块写错误与持久 owner
-make test-la-userland-host      # 缓存输入/完整安装树的9个拒绝反例
-make test-loongarch-boot        # 512 MiB/1 GiB 启动与后续契约
-make test-boot-random-loongarch # DTB材料可用、可信熵仍为零，两种RAM
-make test-rng-loongarch        # 同ELF双侧、两种RAM、四种真实PCI RNG模式
-make test-network-external-loongarch # 同ELF、实际PCI收发与原BusyBox HTTP
-make test-net-failures-loongarch      # DMA/IRQ/worker/reset失败及BAR回收
-make test-rng-failures-loongarch # DMA/任务/栈OOM、IRQ登记失败与回收
-make test-loongarch             # 同时准备固定 Linux，对照同一个用户 ELF
-make test-stack-usage-la
-make test-signal-loongarch     # 同一静态 musl ELF 的整数信号/恢复/重启对照
-make test-pthread-loongarch    # 静态 TLS/线程、原 BusyBox ash 非交互 trap/wait
-make test-pthread-oom-loongarch # 两处 clone 构造 OOM、真实 pthread EAGAIN/重试
-make test-permissions-loongarch # 冷/驻留 EXEC 页、fork、uaccess 与改权对照
+### 3.2 基于 `LDDIR` / `LDPTE` 的超短软件 TLB 重填
+
+LoongArch 发生 TLB 缺失时跳转到 `CSR.TLBREBASE` 指向的物理地址例外入口 `la_tlb_refill`（`arch/loongarch/tlb_refill.S`）。BoarOS 利用龙芯硬件页表遍历辅助指令，仅需极少指令即可同时处理 16 KiB 基页与 32 MiB 大页重填：
+
+```mermaid
+flowchart LR
+    Refill["TLB 重填例外（la_tlb_refill）<br/>暂存 $t0 至 CSR.TLBRSAVE · 读 CSR.PGD"]
+    Walk["lddir $t0, $t0, 3（取一级目录）<br/>lddir $t0, $t0, 1（取二级 PMD；若为大页自动保留）"]
+    Load["ldpte $t0, 0（装载偶页表项至 TLBRELO0）<br/>ldpte $t0, 1（装载奇页表项至 TLBRELO1）"]
+    Fill["tlbfill 写入硬件 TLB · ertn 返回用户指令"]
+    Miss["若目录项缺失：清零 TLBRELO0/1 并设 PS=14 后 tlbfill<br/>由硬件随即转入常规缺页异常交给 mm/mm.c 按需装页"]
+
+    Refill --> Walk --> Load --> Fill
+    Walk -. "空目录项" .-> Miss
 ```
 
-契约 runner 使用 `kernel-contract-la`；普通根盘、网络和用户程序 runner 使用 `kernel-la`。共用生产源在 `COMMON_C_SOURCES` 维护一次，RV 的链接顺序为 CPU/锁、架构后端、其余通用代码；LA 直接组合共用源与自身架构源，不从含 RV 测试配置的列表排除条目。普通与契约产物共享通用对象，启动 main/root 与测试对象分开保存。编译配置记录编译器身份、全局宏和 flags，链接配置记录对象集合与 wrappers；同目录反向切换也会更新受影响产物，内容未变时保留缓存。
+---
 
-`prepare-la-tools` 从固定 QEMU 与 RTC 补丁构建派生模拟器，`QEMU_LOONGARCH64` 可指定实际使用的工具。缓存命中时核对固定源码版本、补丁、编译器、配置参数，以及可执行文件的内容、权限、链接和 user-network 能力。运行已生成的二进制不要求继续保留派生源码和对象；`--rebuild` 重新展开固定输入并构建，构建期间检查实际源码和依赖。
+## 四、PCIe 设备枚举、VirtIO-PCI 与扩展中断控制器（EIOINTC）
 
-`make prune-build` 只保留该模拟器的二进制与身份记录，以及已安装 SDK。参考 Linux、内核对象、运行盘及日志均可重建并默认清理；`prepare-la-linux` 等准备入口负责再次生成各自参考配置。`LA_CROSS_COMPILE` 可指定编译器，版本改变时须使用对应输入重新构建。
+- **PCIe 总线与 VirtIO-PCI（`platform/loongarch_pci.c`、`loongarch_root.c`）**：平台通过 `LA_UNCACHED_BASE` 映射 128 MiB ECAM 配置空间（物理基址 `0x20000000`）与内存 BAR 地址窗（`0x40000000`～`0x80000000`）；启动时扫描 BDF `0..255`，自动识别现代 VirtIO-PCI 块设备（ID `2`）、硬件随机数（ID `4`）与网卡（ID `1`），解析标准 VirtIO PCI Capability 1～4 并由 `pci_function_assign()` 分配内存 BAR 资源，对接与 RISC-V 完全一致的公共 VirtIO 驱动层。
+- **7A1000 PCH-PIC 与 EIOINTC 中断路由**：`la_virt_irq_initialize()` 初始化桥片中断控制器并通过 IOCSR `0x420` 启用扩展 I/O 中断控制器（EIOINTC），将外部中断源 `0..63` 路由至逻辑 CPU0（PCI INTx 按 `16 + (((bdf >> 3) + pin - 1) & 3)` 映射），由 CPU0 的 `la_virt_irq_dispatch()` 统一分发外设中断；每核本地恒频定时器（`ECFG` bit 11）与核间中断（`ECFG` bit 12）则由各处理器核独立响应。
 
-内核物理装载地址为2MiB，高地址为缓存DMW的`0x9000000000200000`。
-开启分页前临时建立低地址DMW，跳到高地址后立即撤销；用户模式不可使用
-内核PLV0的DMW。平台从直接启动传入的EFI system table定位DTB，检查签名、
-表数与范围；按DTB中所有RAM bank排序，扣除启动信息、DTB、内核和保留区。
-物理分配器复用通用buddy实现，页大小在构建期固定为16KiB。
-完整启动布局验证成功后，将DTB的rng-seed交给共用随机核心作为不计熵材料，随后
-擦除临时副本；原DTB仍属于固件。缺种子不伪造材料或ready；共同ELF路径仍提供
-libc所需的16字节`AT_RANDOM`，早期输出不代表可信初始化，见[用户ELF](user-elf.md)。
-`getrandom`的可信初始化仍等待真实RNG设备输入。
-根现从PCI身份发现device4，以共用RNG核心及joinable worker提供真实可信材料。
-根退出在消费设备/BAR前stop/join并确认DMA停止，错误保留实际owner；未就绪实验
-的固件输入与正常DTB策略分开，见[随机设备模块](riscv-virtio-rng.md)。
+---
 
-架构 MMU 设置 PWCL/PWCH、STLBPS 和独立 TLB refill 入口；根目录/中间目录缺失时
-refill 写入无效 paired entry，交由普通用户缺页路径处理，不能读取物理地址零。
-用户 PTE 的 PLV3、NR/NX、dirty 与软件 COW/PROT_NONE 状态由 LA 后端拥有。
-非 NONE 用户 PTE 按固定 Linux LA 映射表保持可读；请求 VMA 权限不改写，
-所以冷 EXEC 页的数据读取与合法取指后的驻留页行为分别验证。
-撤映射先失效转换再归还页；地址空间切换使用 PGDL、ASID0 和全量失效。
-用户页、目录页及 COW 引用均按通用 MM owner 协议转移或回滚，所有权损坏 fatal。
-内核代码/数据继续使用PLV0 DMW；任务栈使用独立PGDH窗口，RW/NX叶仅允许PLV0，
-每槽下方留一个16KiB未映射guard页。窗口骨架属于永久boot owner，任务栈页仍由
-调度器持有；撤叶先刷新TLB，切回可信栈后再释放物理页。SP恰好为栈上界时以
-其下方字节决定槽位；不能容纳304字节trap frame时改用永久16KiB emergency栈。
-`make test-stack-guard-loongarch`验证实际guard/SP越界/NX/旧翻译故障、用户访问
-拒绝、slot改映射复用及全部骨架分配OOM回滚，均覆盖512MiB/1GiB。
+## 五、基于 IOCSR 邮箱的多核引导与跨核 TLB 同步
 
-调度器通过 `arch/task.h`、`context.h`、`timer.h` 和 `mmu.h` 构建期选择实现。
-LA 保存完整整数 trap frame（304 字节）、内核 ABI context、用户 SP/TP/ERA/PRMD；
-KS0 用于区分并交换用户/内核 TP。timer 使用 CPUCFG 频率、RDTIME.D 和 one-shot
-TCFG，接入共用 tick、deadline、预算与调度。已编入的相同调度期限不重复写TCFG；
-timer IRQ仍清中断、推进周期并重装下一期限。UART通过PCH-PIC/EIOINTC接入共用TTY，
-timer保留兼容轮询。未使用FP/SIMD的task保持EUEN关闭；已使用者
-按实际宽度启用FPE/SXE/ASXE并保存内嵌状态，具体见[FP/SIMD模块](loongarch-fpu.md)。LBT未支持。
+### 5.1 从核唤醒与上线（`arch/loongarch/smp.c` / `secondary.S`）
 
-内存 reader 经共用 source、映像、MM、任务创建与 syscall dispatch 路径进入 PLV3。
-LA syscall 从 a7/a0–a5 解码，返回 a0 并恢复 ERA+4。未知 syscall 返回 ENOSYS；
-坏复制指针返回 EFAULT；权限/未映射故障和访问内核地址按实际用户故障处理。
-合法缺页 OOM 使用 RESOURCE/NO_MEMORY 退出，不能误报为用户地址非法。
-rt_sigaction/rt_sigreturn 已接入共用信号策略和 LA 整数帧；布局、故障与重启契约见
-[信号模块](kernel-signal.md)。FPU/LSX/LASX扩展帧和备用信号栈已接入，见[LA浮点/SIMD](loongarch-fpu.md)与信号模块。
+LoongArch 不依赖外部固件启核，而是通过片上 **IOCSR 邮箱与核间中断寄存器**直接引导从核：
+1. CPU0 将从核上下文虚拟指针写入目标核 `MBUF1`，将 `la_secondary_entry` 物理入口地址写入 `MBUF0`（经 IOCSR `0x1048` 邮寄），再向 `0x1040` 发送唤醒 IPI；
+2. 从核启动后完成 DMW 窗口与高半区切换，从 `MBUF1`（`0x1028`）取回栈指针 `$sp` 与任务指针 `$tp`，配置异常入口与 `CSR.PGDH`，使能本地 IPI 与恒频定时器；
+3. 与 CPU0 完成 `LA_IPI_HANDSHAKE` 握手并观察到首次本地时钟中断后，正式发布 `KERNEL_CPU_ONLINE` 加入多核调度。
 
-2026-10-06 在 512 MiB 和 1 GiB 下完成：
+### 5.2 无死锁的跨核 `INVTLB` 同步协议
 
-- 内核保留区/RAM 布局、真实页写读、16 KiB slab 位图及 MMU/COW/PROT_NONE 回收；非法/重复页释放与损坏页表 owner 在两种 RAM 各自独立启动中均 fatal。
-- 两个不主动 yield 的内核任务、fork 出的两个用户计算任务均经 timer 前进；整数寄存器、SP、TP 和恢复 PC 保持。
-- 正常段、整页 FILE、BSS 尾页、初始栈/AT_PAGESZ、跨页复制、PID/TID、yield、时钟/睡眠、匿名 mmap/mprotect/munmap、exit/exit_group。
-- 只读、PROT_NONE、NX、撤映射后访问及内核 DMW 访问；9 组同 ELF 的 Linux/BoarOS 退出契约一致。
-- 损坏 header、错误 machine、重叠布局、16 个构造分配失败边界、两处任务/栈构造 OOM 和缺页 OOM；失败不发布任务，页数回到预热基线，最后 heap live 为零。
-- 首阶段可信 idle 栈回收 13 个任务栈，实测最小余量 31,016 字节、最大使用 1,736 字节；编译器 2,066 条函数记录（含 fatal fixture）最大单帧 3,392 字节。单帧检查不证明完整调用链上界。
+在 LoongArch 上，解除映射或降权时由 `la_smp_sync_user()` / `la_smp_sync_kernel()` 驱动跨核 TLB 失效确认：
+- 发起核将本次失效请求 `(generation, address, size, instructions, targets, pending)` 写入自己的每核槽 `fences[self]`，向目标核的 `incoming_fences[target].sources` 置位并发送 `LA_IPI_TLB`；
+- 目标核在 IPI 处理中根据范围执行精确页失效（`invtlb 0x5`）或全量失效（`invtlb 0x0`），涉及可执行页时追加 `ibar 0` 指令屏障，核对代次后清除 `pending` 对应位；
+- **防互等死锁机制**：发起核在自旋等待全部 `pending` 位清零期间，持续主动调用 `consume(0)` 消费发给自己的远端 TLB 失效请求，确保即使两颗核同时在关中断上下文发起跨核刷页，也能各自推进而绝不互等死锁。
 
-本轮 RV allocator、MM/VMA、uaccess、context、scheduler、exec 及 `test-riscv`、
+---
 
-固定依据为`references/qemu` v11.1.0，commit
-`84f07211cc5b4fc6a371559bf8a5de4fb068e648`的`hw/loongarch/boot.c`、
-`include/hw/loongarch/virt.h`和FDT生成代码。工具为本机
-`loongarch64-unknown-linux-gnu-gcc`15.1.0；内核使用LP64S、禁用浮点和LSX/LASX。
-实际 RTC 派生模拟器与缓存规则见本文的工具准备说明。
-Linux 对照与工具版本由 `references/sources.tsv` 统一维护。
+<details>
+<summary>展开查看：LoongArch 构建与多核验证入口</summary>
 
-## 第二阶段：PCI 块设备已验证
+### 构建配置
 
-`kernel/pci.c` 有界解析 capability、按真实 BAR mask 分配不重叠资源，失败恢复
-原 BAR/command 并归还 claim。`drivers/virtio/pci_block.c` 将共用块核心与
-`drivers/virtio/pci.c`的现代PCI adapter绑定；[共用框架](virtio-framework.md)拥有
-feature/status和split queue。总线访问宽度、read-to-clear ISR和通知地址由PCI实现，
-ECAM、uncached 映射及 INTx 来源由 `platform/loongarch_pci.c` 提供。BAR 地址
-不能假设由固件分配：无 BIOS QEMU 上先 sizing/分配，再确认 reset，最后打开
-bus-master，销毁按 stop DMA→摘 IRQ→释放队列→恢复 BAR/command 的 owner 顺序。
+| 配置 | 命令 / 参数 | 说明 |
+| :--- | :--- | :--- |
+| 默认单核内核 | `make kernel-la` | 生成单核生产内核 `kernel-la` |
+| 交互式 Shell | `make shell-loongarch QEMU_LOONGARCH64=qemu-system-loongarch64` | 自动制作 ext4 根盘并启动进入 `/ #` |
+| 多核 SMP 内核 | `LA_SMP=1 LA_SMP_CPUS=4`（支持 `2`/`4`/`8`） | 配合 `-smp 4` 启动龙芯多核虚拟机 |
 
-QEMU 平台采用128个bus的ECAM、低PCI memory aperture、根bus现代端点及
-PCH-PIC→EXTIOI→CPU0/HWI0。资源 claim 有64个槽，耗尽明确失败；无桥、热插拔、
-纯legacy PCI传输、MSI-X 或实板验证；transitional身份的modern接口已接入。控制器为共享level pin在逐设备ISR之间保持mask，
-unmask重新采样intirr；trap只分发ESTAT与ECFG交集，同时处理已启用的timer。
-外部中断活动状态属于CPU0；CPU1执行块设备调用时不继承CPU0正在派发的中断上下文。
+### 定向验证入口
 
-```sh
-make test-pci-host
-make test-block-loongarch
-```
+- **基础启动、页表、大页与驱动回归**：`make test-loongarch`、`make test-permissions-loongarch`、`tests/loongarch/mmu.c`（覆盖 32 MiB 大页两半访问、末字节、CoW 与退役）。
+- **龙芯多核执行与压力验证**：`tests/loongarch/smp.py`。
+- **工具与参考内核准备**：`make prepare-la-tools`（RTC 补丁 QEMU）、`make prepare-la-userland`（16 KiB 对齐 LP64S 用户态工具链）。
 
-512MiB/1GiB各验证两个共享INTx pin的真实PCI盘、启动轮询和运行期IRQ、
-八个内存片段合成一次SG读取、CPU进展、只读与范围错误、写入/FLUSH后的宿主字节和完整
-任务/队列/PCI claim回收。queue OOM在真实设备初始化中恢复BAR、command和
-页基线；销毁时的页归还检查包含队列和批量工作区，最终reset失败仅保留PCI资源，再次销毁不得重复释放这些页。宿主模型额外覆盖capability循环/截断/溢出、BAR资源不足回滚，以及
-不依赖handler遍历顺序的共享level迟到完成。掩蔽外设的pending状态不能在
-timer trap中被分发。测试通过已有NBD后端扣住SG读取的响应，确认I/O任务实际等待后才释放；PCI仍被屏蔽时观察used ring完成并跨过一次timer tick，之后打开PCI中断，检查真实IRQ、任务完成和资源归还。快速完成可以由驱动直接收割，不能用普通内存盘请求必有IRQ作为测试前提。
-
-固定依据：QEMU上述commit的 `hw/pci-host/gpex.c`、`hw/intc/loongarch_{pch_pic,extioi}.c`
-及 `include/standard-headers/linux/virtio_pci.h`；Linux上述commit的
-`drivers/virtio/virtio_pci_modern_dev.c` 和 `drivers/irqchip/irq-loongson-{pch-pic,eiointc}.c`。
-
-
-## 根盘、静态 musl 与回收
-
-根 bus 按 BDF 顺序枚举 block 端点，最多8盘，首盘是 raw whole-disk ext4；一旦发现
-block，不通过后续磁盘或内存 fixture 掩盖启动错误。仅有legacy接口的PCI明确ENOTSUP，
-数量超限 ENOSPC，损坏 ext4 保留后端 EUCLEAN。默认 `/init` 的 path/argv/envp
-使用与 RV 相同的 `INIT_CONFIG=config/init.json` 生成方式，LA 有独立生成依赖。
-PT_INTERP已按fs context打开唯一解释器source并交给共用image，路径错误保留errno；
-短64字节header为EIO，完整但损坏/错误架构为ELIBBAD，失败不发布PID1。
-解释器含另一个PT_INTERP仍按现有明确子集拒绝，不声称Linux递归解释器全部行为。
-
-永久可信 cleanup 栈在页基线前创建，启动构造也在该内核任务上执行。设备与
-cache/mount/files/fs/source/image 的真实字段一直保存 owner；映像准备、I/O worker
-就绪后才原子转交 MM/files/fs 并发布 PID 1。页缓存和 journal 使用原共用 worker，
-运行期 I/O 通过 PCI IRQ 睡眠；idle 只负责调度。PID 1 completion 或显式 reboot
-请求后先停止全部用户 owner，回收用户任务，再 stop/join cache worker、卸载 journal/mount、销毁
-cache、摘 block 注册并 stop DMA/IRQ、释放队列和 BAR claims。成功要求 heap live
-和 heap pages 均为0，物理页回到排除永久 cleanup 栈后的精确基线；当前栈不提前释放。
-
-完成上述回收后才停止其他 CPU。POWER_OFF 向 ACPI GED sleep control
-`0x100e001c` 写入 `0x34`；RESTART/RESTART2 向 GED reset `0x100e001e` 写入
-`0x42`，地址与值来自固定 QEMU `hw/loongarch/virt.c` 和
-`include/hw/acpi/generic_event_device.h`。HALT 关闭本核中断并停在 `idle 0`，
-不访问这两个寄存器。请求发布和 syscall 行为见[调度与退出](kernel-scheduler.md)。
-
-真实 I/O 清理失败仍由原对象持有，最多三次清理后报告并关机，不打印资源回收成功。
-`test-root-io-loongarch` 用原 NBD fault server 在真实现代 PCI 盘注入 write EIO，
-确认用户失败、mount/cache/device/claim 仍存在且没有成功标记。非法 allocator
-释放或元数据损坏继续 fatal，不进入该重试路径。
-
-2026-10-06 的两种 RAM 验收均通过：正常/只读根盘（只读镜像整盘哈希不变）、
-缺失/无 execute bit/错误 machine init、损坏 superblock、legacy PCI、用户 fault，
-以及 image、task、cache worker 构造 OOM。失败不发布 PID 1；无 I/O 故障的各条路径
-均恢复根页/堆/PCI基线。静态 musl probe 检查16KiB auxv/BSS、跨页文件读/私有和
-共享映射、fd offset、msync/fsync 持久数据、clock/sleep、fork/exec/wait；原 BusyBox
-完整配置未裁剪，执行cp/cmp/grep/cat/echo/uname/dd。相同 probe 和 BusyBox ELF 在
-固定 Linux 的 PCI ext4 上分别运行，验证关系和持久字节，不比较偶然 PID/时间。
-这是七个原 applet 与组合 ABI 的验收，未运行完整 BusyBox、RV 的 FP/signal/ucontext
-用户探针或完整比赛 Harness。最新 RV完整架构、真实用户态、五种glibc、1366条ABI、
-栈检查及共享驱动的SQLite DELETE/WAL/恢复与四种io-sleep门禁均通过。
-
-LP64S 工具缓存由 `make prepare-la-userland` 重建并校验：固定 GCC15.1.0 archive
-构建 `loongarch64-unknown-linux-gnusf` C 编译器和匹配 libgcc/CRT，使用固定 musl1.2.5
-headers bootstrap runtime，再构建静态 libc；BusyBox 使用清单 commit 和原配置，
-UAPI 从固定 Linux v6.6 `ARCH=loongarch headers` 导出后原样安装，不混宿主 glibc 头。
-编译源码与可复用产物、工具/配置/ELF身份留在 `build/loongarch`，完整安装树包含helpers/specs/headers与链接目标；冷构建先生成子配置。运行目录、镜像、
-日志及早期失败构建用 `make prune-build` 清除。ELF 使用 SOFT-FLOAT ABI，EUEN关闭；
-没有用忽略 ABI mismatch 或成功存根绕过硬件限制。
-
-## 整数信号与静态线程
-
-2026-10-06 `test-signal-loongarch` 与 `test-pthread-loongarch` 在固定 Linux 和
-BoarOS 的512MiB/1GiB运行相同LP64S静态ELF。信号覆盖真实musl布局、mask、嵌套、
-SEGV/BUS/ILL/TRAP/FPE、用户映射修复与上下文返回、坏帧及pipe/nanosleep/sigsuspend。
-线程覆盖11组：纯计算timer进展、整数寄存器/SP/TP、TLS data/BSS与errno隔离、
-mutex/cond/barrier/超时、取消cleanup、阻塞fd pin、组长退出/非组长exec/exit_group、
-futex重启及非PI robust注册/查询/owner死亡/raw exit/COW。原BusyBox完整配置的ash
-另执行非交互trap、后台sleep和wait；不据此宣称LA UART控制终端或PTY作业控制。
-
-`tests/loongarch/pthread.c` 直接调用已有RV用户测试的适用函数，没有裁剪原RV入口；
-此静态入口不执行动态DSO；动态入口在下节另测。socket和RV的未支持PI marker
-门禁保留在原目录，不能把这一静态选择集
-称为原pthread全量测试。Linux对照发现并修正测试的join/PID摘除时序，以及WAKE
-后目标可能退出的假设；内核不按测试输入特判。
-
-clone的任务页、栈分配两处故障分别在两种RAM注入，真实pthread_create返回EAGAIN、
-未执行半成品worker，任务/栈页立即恢复，随后成功create/join。此四组是BoarOS注入
-证据，与同ELF Linux语义对照分别报告。每次正常、故障、OOM根启动收口要求
-heap live/pages为0，所有可回收物理页、根盘/cache/PCI owner回到预热基线。
-
-整数信号阶段的RV信号/syscall、完整架构、原静态/动态用户态、五种固定glibc、
-1366条ABI和栈门禁通过；当时未改文件映射/COW或块核心，未重跑SQLite/存储
-恢复矩阵。当时的标量FP、动态musl/DSO TLS限制已由下节解除，SIMD、LA完整
-终端/网络和比赛Harness仍缺。
-
-## 原版动态 musl、解释器与 DSO TLS
-
-`make prepare-la-dynamic` 在独立dynamic-dp-v2缓存构建固定musl1.2.5原源码，
-用户使用已安装GCC15.1.0 LP64D和匹配CRT/libgcc；内核仍LP64S。输入记录
-compiler/frontend/内建headers、runtime、原archive/flags；完整安装树记录文件
-内容、权限和链接目标。`test-la-dynamic-host` 的9个反例先验证合法命中，再
-拒绝loader/header/specs/CRT/mode/link/ABI及compiler/runtime身份变化。原静态
-SF缓存独立，`test-la-userland-host` 原9个反例继续通过。
-
-`make test-dynamic-loongarch` 对相同PIE和非PIE ELF执行原late-dlopen TLS案例与
-11组线程消费者，另有DT_NEEDED、ORIGIN RPATH、RELRO链接及初始DSO TLS。
-均在Linux/BoarOS两种RAM实际运行；ldso/libc和DSO由用户运行时装载、重定位、
-分配TLS，不在内核另写动态链接器。依赖库与程序在运行期间逐文件核对SHA。
-
-`make test-exec-errors-loongarch` 双侧核对缺失、无执行位、错误架构、损坏完整
-header和短header的errno；失败后旧PID、TLS、存活线程、CLOEXEC fd/offset、
-信号handler保持。初始动态PID1的上述五条失败及image构造物理OOM，在两种
-RAM共12次启动中不发布任务，主/解释器source、MM、页/堆与PCI/root owner
-准确回收。真实VFS/block I/O清理失败仍按原owner契约保留。
-
-```sh
-make test-fpu-loongarch test-dynamic-loongarch test-exec-errors-loongarch
-make test-la-dynamic-host
-```
-
-该动态musl阶段的FP限制已由标量FPU解除；当时SIMD、glibc、更广应用与TTY/网络
-尚未验收。当前指定矩阵已完成，SMP/实板、完整Harness等仍在范围之外。
-
-动态musl阶段RV完整架构、原静态/动态用户态、五种glibc、1366条ABI、栈和SQLite
-DELETE/WAL多进程/重启通过；当时未跑NBD全恢复和LA原SQLite。后者已在当前
-单核对齐轮完成，见下节及[SQLite](vfs-ext4.md#双架构-sqlite-deletewal-原程序)。
-
-共用net核心和Ethernet已接入LA现代PCI。root枚举device1、持有BAR和device，
-网络层借用它；missing NIC仍有timer worker保障loopback与AF_UNIX。块addr1、
-net addr5、RNG addr9的共享INTx是测试输入，生产扫描不依赖槽位。真实TAP、
-九类失败与资源证据见[net模块](riscv-virtio-net.md)。本轮TTY UART IRQ、RTC、
-AF_UNIX sendfile计费及指定原程序均已验收；范围外应用仍不能由此声明全部等价。
-
-## LS7A RTC 与派生模拟器
-
-`platform/loongarch_rtc.c` 按 [时间模块](kernel-time.md#la-ls7a-rtc) 初始化和读取
-真实 UTC。正常用户态仍复用共用只读 RTC 字符设备，运行期不持有 RTC IRQ owner。
-原 BusyBox dmesg/hwclock/df、OFD 独占、dup/fork/exec、错误指针与最终根资源释放，
-同一 ELF 已在 Linux/BoarOS、512 MiB/1 GiB 验证。日志探针与原脚本各自清空日志，
-因此分别启动，不能以人为打印启动标记补偿已经消耗的日志内容。
-
-用户选择 A 后，模拟器采用 `tests/loongarch/qemu-ls7a-rtc.patch` 的派生构建。
-固定 `references/qemu` commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`
-保持原样；补丁 SHA-256 为
-`a2951479d2f45afed8ffc9e69ed4a44efd7174b00a688b03d5d786332515cf2d`。
-`tests/loongarch/qemu_rtc.py` 导出固定 commit 与三个固定 Meson wrap commit，
-校验源文件、构建配置、编译器及模拟器内容/权限/链接目标。派生缓存是
-`build/qemu-la-rtc`；原版缓存 `build/qemu-la` 可由 `prepare-la-original-tools` 重建。
-普通命中拒绝身份变化，已确认的补丁修改通过 `--rebuild` 重新导出和构建。
-
-补丁补齐 Linux 使用的 RTC PM 子集：PM1_STS.RTC_STS 是真实锁存的 W1C 状态，
-PM1_EN.RTC_EN 与 PM1_CNT.INT_EN 控制独立 SCI 输出。六个 TOY/RTC 比较器各自
-持有 pending，重写只清除本比较器；match=0 的无效 TOY 日期清除直接 IRQ。
-原 virt 聚合计时 IRQ 保持 pin6，PM SCI 与 GED 经 OR 共享 pin7，避免互相覆盖。
-复位撤销定时器和 IRQ；迁移保存 pending/PM 状态并恢复尚未触发的比较器。
-RTC counter 按 32 位回绕；六位年份的过去 TOY match 等待下一个 64 年周期。
-`system/rtc.c` 日期差值改用实际 `rtc_clock`，修复 clock=vm 的宿主时钟错配。
-
-直接 ELF 启动 profile 显式传入 `-global ls7a_rtc.toy-enabled=on`，代表已初始化的
-电池时钟输入；设备默认复位值仍为关闭。无需改 Linux 驱动或 RTC compatible。
-该 PM 子集不声明完整 ACPI 电源管理、休眠或调频支持；TOY 的当前模拟分辨率仍为
-1 秒，不能引用芯片手册的 0.1 秒作为 QEMU 实测能力。
-
-```sh
-make test-rtc-loongarch-host
-make test-rtc-model-loongarch    # 实际 MMIO、W1C、独立 IRQ、重编程、回绕、复位、迁移
-make test-rtc-alarm-loongarch    # 原版 Linux 两次告警/跨年，混合 block/RNG/UART 与实际退出
-make test-environment-loongarch  # 两个独立清日志场景，各在双侧、两种 RAM
-```
-
-2026-10-07原Harness设备调查发现默认transitional PCI同时提供modern接口。
-此前按PCI ID提前拒绝并把PIO BAR当作整设备不支持，导致原盘尚未启动PID1就ENOTSUP。
-现按subsystem device枚举，保持未使用PIO关闭；host反例及真实根盘transitional/modern
-在512MiB和1GiB验证正常PID1退出、页/堆/任务栈/BAR基线，纯legacy负例仍ENOTSUP。
-同一个静态root ELF在固定Linux对照两个设备形态；命令仍为`make test-root-loongarch`。
+</details>

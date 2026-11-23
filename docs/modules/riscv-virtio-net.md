@@ -1,160 +1,121 @@
-# VirtIO-net 与 Ethernet 接收 owner
+# VirtIO 网卡与以太网数据路径
 
-`drivers/virtio/net.c` 使用共用 transport/split queue，实现设备请求与缓冲策略；
-`arch/riscv/virtio_mmio_net.c` 仅绑定 MMIO/PLIC，`drivers/virtio/pci_net.c` 绑定 LA PCI。
-平台/root 持有设备与 transport，`net/ethernet.c` 借用设备，持有 netif、custom pbuf
-记录和 joinable worker，在
-PID 1 与后代收口后停止网络，最后检查堆与物理页基线。DTB 的 device ID 1 和
-PLIC route 决定设备与 IRQ，不按槽位或测试配置硬编码。无设备保留 loopback。
+BoarOS 的物理网络接入由共用的 VirtIO 网卡驱动（`drivers/virtio/net.c`）与以太网协议适配层（`net/ethernet.c`）组成。下层依托[共用 VirtIO 框架](virtio-framework.md)在 RISC-V MMIO 与 LoongArch PCI 上实现统一硬件抽象，提供**接收缓冲区零拷贝借用**、**发送间接描述符零拷贝散列-聚集**、**发送合批通知**与**类 NAPI 中断抑制轮询**；上层则通过独立的可汇合内核工作线程将以太网帧接入多核 `lwIP` 协议栈（见[多核网络协议栈与套接字](kernel-network.md)）。
 
-每个 RX/TX 队列 32 个描述符，分别预分配 64 个 2 KiB 缓冲。legacy 的两个队列
-在 RV 占 16 KiB，modern 占 8 KiB；RV 的直接内存访问（Direct Memory Access，DMA）
-总量分别为 272/264 KiB。LA modern
-队列占一个 16 KiB 页，两个数据池仍各128KiB，共272KiB；不把2KiB帧槽改为页大小。控制对象大小在启动时
-报告，worker 的独立栈由调度器管理，最终栈统计另计。协商 MAC、可用的 STATUS
-和 modern 的 VERSION_1；不协商 mergeable RX、checksum/GSO、packed ring 或
-多队列。网络头分别为 10/12 字节，帧起点统一留在槽内 16 字节之后。
+---
 
-## 发布、完成与借用
+## 一、源码组织与内存布局
 
-接收补充和发送提交通过 `virtio_split_stage()` 准备描述符。每个非空批次只推进一次设备可见的可用索引，
-并在设备允许时发出一次通知。队列中途填满也发布已准备的前缀，空批次不通知。
+| 源码路径 | 核心职责 |
+| :--- | :--- |
+| `drivers/virtio/net.c`、`include/kernel/virtio_net.h` | VirtIO 网卡驱动核心：RX/TX 分裂队列管理、64 槽缓冲池、接收借用计数、间接表零拷贝发送、发送合批与 5 秒看门狗 |
+| `arch/riscv/virtio_mmio_net.c`、`drivers/virtio/pci_net.c` | 平台薄适配层：按设备 ID `1` 发现并绑定 RISC-V MMIO/PLIC 或 LoongArch Modern PCI |
+| `net/ethernet.c`、`include/kernel/network.h` | 以太网 `netif` 注册、自定义 `pbuf` 零拷贝接收包装、UDP 预算接纳、工作线程有界轮询与无网卡定时器工作线程 |
 
-接收描述符与帧缓冲区分别交接。设备完成后描述符可再次使用。在既有协议执行资格内，
-接收者一次取得设备状态锁，依次取走最多八个已经完成的帧，随即开始处理。每个帧有独立的
-处理器借用，之后可以移交给自定义协议缓冲区。最多同时借出 32 个缓冲；
-最后一个 pbuf 引用归还前，设备不能覆盖原内容。custom 回调只归还槽、唤醒
-worker，不分配、不睡眠。达到借用上限则复制到有界 PBUF_POOL，并立即归还
-DMA 槽。用户数据报协议（User Datagram Protocol，UDP）接纳同时检查 DMA 缓冲区借用、
-协议堆和备用池占用，保留至少 16 个备用缓冲区给流式连接和控制报文，额度不足时丢弃数据报。
-预算判断只读取当前借用数量。增加借用仍由接收执行资格串行，其他核归还借用时，已取的计数可能高估占用。
+### 队列与 DMA 缓冲池规格
 
-TX 在协商 indirect（bit28）后按包发布槽内 indirect 表：首项为设备头（驱动缓冲），其余为最多两段 pbuf（PBUF_RAM/POOL 且地址落在内核镜像映射内），驱动通过 `pbuf_ref()` 保持载荷有效。驱动收割完成项时，只要还有退休队列额度，就摘下旧载荷引用、归还描述符槽并更新容量代次。退休队列最多容纳 32 个引用，与设备发送队列深度相同。队列满时，后续完成项继续占用原槽位。网络执行线程成批摘下这些引用，在设备锁外释放。串行协议路径按批取得一次协议互斥锁，并行协议路径由缓冲区的引用计数及分配器保护各自的释放。设备失败/超时不提前归还：失败不等于 DMA 停止，设备仍可能读取已投递的描述符与 payload，在途 owner 保留到 stop 复位确认后才 abandon，与 RX 借用同一策略；已完成 owner 仍由 worker 归还。未协商 indirect、段数超限、volatile 或地址不可换算时回退为复制路径；`tx-sg`/`tx-copy` 统计两条路径的包数。最多 64 个排队，32 个可发布。
-`linkoutput` 不睡眠，容量不足返回 ERR_MEM。TCP 已接受的内容仍归协议，完成
-唤醒 worker 后先释放已完成 owner 和槽，再重试 unsent 数据，无需用户再次进入 syscall。零拷贝 TX 持引用期间 TCP 段保持 busy，完成后才可重传。
+驱动协商网卡硬件地址 `VIRTIO_NET_F_MAC`（bit 5，必需）、链路状态 `VIRTIO_NET_F_STATUS`（bit 16）与间接描述符 `VIRTIO_RING_F_INDIRECT_DESC`（bit 28）；不协商可合并接收缓冲区、校验和/分段卸载（Checksum/GSO）、压缩环或多队列。
 
-驱动在设备状态锁内用 64 位位图维护空闲发送槽。位图记录已经归还的发送槽。槽位在复制发送完成、提交取消、分段发送完成且旧引用安全摘下时归还。有空闲槽时，提交者从位图直接取得槽位，收发完成环继续由中断处理和执行线程读取。槽位耗尽时，提交者再检查一次完成环，已有完成项可以腾出槽位。待释放的分段载荷引用由执行线程处理。
+| 资源项 | 规格与对齐 |
+| :--- | :--- |
+| **RX / TX 队列深度** | 各 **`VIRTIO_NET_QUEUE_SIZE = 32`** 个描述符 |
+| **RX / TX 数据缓冲池** | 各预分配 **`VIRTIO_NET_BUFFERS = 64`** 个槽位，每槽 **`2048 B`**（各占 `128 KiB` 连续物理内存，合 `256 KiB`） |
+| **队列控制页开销** | RISC-V Legacy：`16 KiB`（DMA 总计 `272 KiB`）<br/>RISC-V Modern：`8 KiB`（DMA 总计 `264 KiB`）<br/>LoongArch Modern：`16 KiB`（单 16 KiB 页，DMA 总计 `272 KiB`） |
+| **帧头与槽内对齐** | Legacy 网卡头 `10 B`、Modern 网卡头 `12 B`；槽内前置填充 `16 - header` 字节，使**以太网帧起点统一对齐在槽偏移 16 字节处** |
 
-独立发送直接通知设备。传输控制协议（Transmission Control Protocol，TCP）在一次 `tcp_output()` 中连续发送时，驱动按原顺序接纳报文，在批次结束、积累八个待发布项或空闲槽用尽时，先备齐该批描述符及队列项，再推进一次设备可见的索引并发出一次通知。协议在部分发送失败的返回路径也刷新已接纳的前缀。完成中断通知执行线程。执行线程每次睡眠前取最早在途描述符的超时点。队列为空时，执行线程仍在五秒内检查，睡眠期间新提交的报文由已有期限覆盖。若检查时某个描述符尚未到期，执行线程按该描述符的提交时刻重新设置期限。复制失败及提交者发现实际完成的情形仍可通知执行线程。归还接收缓冲区时，只在此前缺少可补充的缓冲区、且当前有可用描述符时发出重填通知。
+---
 
-在固定 QEMU 源码中，`virtio_net_flush_tx()` 在一次设备处理轮中逐个取出描述符链，调用
-`qemu_sendv_packet_async()` 向宿主网络后端交付每个帧。队列通知合批能减少客户机与设备之间的
-通知次数。宿主后端是否需要复制载荷取决于后端接口。TAP 接口可接收分段缓冲区。
-QEMU 的套接字数据报后端要求连续缓冲区，去除 VirtIO 头后仍有多段时，`nc_sendv_compat()`
-会先合拢这些数据段。设备收到帧时，`virtio_net_receive_rcu()` 将帧写入客户机提供的接收缓冲区。
+## 二、接收路径：零拷贝借用与预算接纳
 
-协议缓冲区分配器支持并行访问时，网卡完成回调只经引用计数和分配器自身的保护归还缓冲区。中断处理发现实际完成项后，要求设备暂缓收发队列的完成中断，并唤醒执行线程继续处理队列。执行线程在有界的当轮轮询期间保持抑制状态。需要发送额度的应用线程在等待前仍可借用协议执行资格处理接收队列。若驱动尚未收割新完成项，辅助接收会检查设备已经发布的进度。
+网卡接收路径将“硬件描述符归还”与“帧缓冲区归还”分离：一旦设备写入完成，32 个硬件描述符槽立即可以重新投递其他空闲缓冲区，而装载着数据的 2 KiB 缓冲区则通过自定义协议缓冲区（`pbuf_custom`）直接借给上层协议栈，避免在收包热路径逐包复制以太网载荷。
 
-执行线程轮末恢复中断，然后执行直接内存访问（Direct Memory Access，DMA）屏障并检查完成索引。此前完成的工作由轮询者取得，此后完成的工作可以再次发出中断。等待前还会检查轮询是否仍然生效，覆盖轮末重新收到中断、其他执行者先消费报文的交错。执行线程用同一份设备状态快照发布发送容量变化；容量发布只修改套接字工作链及其代次，并使用该工作链自身的短锁。
+```mermaid
+flowchart TD
+    IRQ["网卡完成中断<br/>• 确认中断并收割 RX/TX 完成环<br/>• 若有进展，置位 NO_INTERRUPT 切入轮询模式并唤醒 Worker"]
+    Batch["Worker / 辅助接收调用 virtio_net_receive_batch()<br/>（每批最多 8 帧，每帧持独立 RX_CPU 租约）"]
+    Budget{"UDP / 非直接 TCP·ICMPv6<br/>检查容量预算"}
+    Drop["统计 drops 并立即归还 RX 槽"]
+    Lend{"virtio_net_lend()<br/>当前借用 < 32？"}
+    ZeroCopy["零拷贝借用（RX_LOAN）<br/>包装为 pbuf_custom 交协议栈<br/>末引用释放触发 rx_free() 归还槽位"]
+    UdpBorrow{"本地未分片 IPv4 UDP<br/>且无原始套接字监听？"}
+    LazyCopy["临时借用包装<br/>仅当套接字接纳时才拷贝至 PBUF_POOL"]
+    PoolCopy["拷贝至 PBUF_POOL<br/>立即归还 DMA 槽位"]
 
-中断处理先确认事件，再校验并收割完成，随后通知执行线程。配置变化中断负责读取链路状态和
-检查设备复位要求，普通完成中断处理已经发布的描述符。驱动校验完成索引的差值、描述符编号、
-发布资格、长度和未协商的卸载标志。现代传输接口在直接发送、执行线程补充队列及延迟发送批次
-实际发布之前检查 `DEVICE_NEEDS_RESET`。配置中断丢失时，这些入口仍可发现复位要求，
-未发布的发送描述符保留其引用并交给复位清理。
-失败保留冷路径队列现场并停止
-新发布：除设备/队列现场外打印槽级快照（loaned/ready/pending/done、队列索引与
-每个非空闲 RX/TX 槽的状态、长度、age、owner），只读驱动自有数组，不追描述符
-地址、不分配。只有已发布 TX 使用五秒设备完成期限，正常 RX 空闲不是设备故障。
-worker 在首次收割后、RX 与协议回调前释放完成 owner；link/RX 有界批次、协议服务及等待登记共用一个外层协议资格。本轮末尾收割产生的待释放引用由下一轮开头处理。睡眠判断重查当前工作链、发送容量代次、待释放引用数量和可取走的接收项。容量代次在发送槽实际归还时递增。有新容量或RX才继续服务，单纯窗口关闭的unsent不会形成自旋。
-worker 在任务上下文推进 Ethernet/ARP、协议定时器和重试，每批 RX 最多八帧，另独立限制 loopback 八包、socket 八个工作单元、一个 timer 回调；批次
-之间开放中断并让出运行机会。失败 NIC 不再收发，但共享的 loopback 和协议期限
-仍继续推进；不能在错误分支永久睡眠并停止 TIME_WAIT/重组回收。
-raw API 由调用者栈 scope 持有任务 mutex，同 owner 回调可嵌套，协议执行开放 IRQ；具体规则见 [网络协议执行资格](kernel-network.md)。无 NIC 时 `kernel_network_start`
-不创建收发 worker，但保留同一 `kernel_network` owner 与 timer-only worker：循环
-使用相同有界服务，先排空可立即执行的软件工作，再按 min(下一 socket 期限, now+5×frequency) 阻塞，期限/IRQ 只唤醒
-它，最后的 OFD 定时回收不再依赖用户再次进入 syscall，`kernel_network_stop`
-同样禁止新工作、join 后释放。
-
-停止先短暂关闭 IRQ 发布停止并唤醒，随后在协议 mutex 和 IRQ 临界区外 join worker、通过 `virtio_net_quiesce` reset 并确认 DMA 已停。再取得协议资格清理重组/ARP、移除 netif，释放资格后归还剩余 TX owner。netif 移除会同步按旧本地地址 abort active/bound TCP PCB，
-包括已脱离 socket 登记的 FIN_WAIT，释放其乱序 RX 引用；TIME_WAIT 转入前已 purge，
-此处不依赖已 join worker 的后续 timer。reset 未确认保留 DMA；reset 已确认但协议或接收请求
-仍持 pbuf，也保留整个设备 owner，返回 EBUSY。最后引用归还后才可释放队列页、
-RX/TX 页。网络层先释放自身控制对象，平台随后调用 core stop 与 PCI destroy；
-core stop 遇到 CPU lease、RX loan 或未归还 TX owner 返回 EBUSY，reset 拒绝返回 EIO
-并保留 DMA、IRQ、transport 和实际 owner，不能因 worker 已 join 而提前释放。设备故障与连接拒绝、RST、协议超时分别交付；错误回调
-不读取已经释放的 PCB。该协议未覆盖非一致 DMA、IOMMU、多 hart 或实板。
-
-## 地址与用户接口
-
-默认 `eth0` 为 10.77.0.2/24、MTU 1500，MAC 来自设备。构建参数 `NET_IPV4` 和
-`NET_NETMASK` 写入独立生成配置；未配置默认网关。bind 接受真实本地地址，路由
-由 netif 决定；保留 IPv6 loopback 与双栈监听。外部 IPv6 提供 MAC 派生的链路本地地址、静态全局地址、RA/SLAAC、ND/DAD 和 TCP/UDP，范围、生命周期与验证见[Ethernet IPv6](kernel-network.md#ethernet-ipv6-静态配置raslaac-与通信)，不宣称公网或内核 DNS/TLS 服务。
-
-`SIOCGIFFLAGS/SIOCSIFFLAGS` 查询并控制 UP/DOWN；`SIOCGIFADDR/NETMASK/HWADDR/MTU/INDEX/NAME/CONF`
-输出实际接口快照，RV64/LA64 ifreq/ifconf 为 40/16 字节。`SIOCSIFADDR`、
-`SIOCSIFNETMASK` 和 `SIOCSIFMTU` 修改实际接口，`SIOCADDRT/SIOCDELRT` 管理一条
-带网关的 IPv4 默认路由，`/proc/net/route` 展示实际接口网段和默认路由。修改需要
-`CAP_NET_ADMIN`，无效掩码、接口或不可达网关在修改前返回错误。以太网 MTU 上限为
-1500，受当前发送设备的帧长度约束；loopback 使用 68～65536。地址变化保留既有
-TCP/UDP 套接字的绑定。网络服务停止并确认 DMA 停止后，归还已无 socket 使用者的
-TCP 连接记录，再移除设备；其他对象沿各自生命周期处理。协议栈实际使用网关进行 ARP；
-跨核调用沿现有协议执行者处理。快照不借用 netif 给用户复制；copy fault 不延长设备生命。
-IPv4 多地址、非默认静态路由及路由度量仍待实现。通过 `NETLINK_ROUTE` 可以查询
-接口、地址和部分路由信息，修改当前走上述设备控制接口。
-loopback 的协议 MTU=0 表示无 L2 限制，对应公开的 65536；较小设置直接用于协议栈。
-
-## 验证与固定资料
-
-`COST_DIAGNOSTICS=1` 的 final 行另报 `tx-done-free-*` 与 `tx-free-post-*` 的
-count、ticks、max、时钟频率和 overflow 标志，发布构建不增加时间戳或计数。
-DONE 从软件收割 used ring 开始，不是硬件 DMA 完成时刻；copy 完成直接归还计零。
-FREE→post 跟踪同一槽再次发布，包含正常空闲和排队时间，不能直接解释成可运行工作的
-延迟。首次使用没有 FREE 样本，reset 撤销未完成 owner 不计完成；统计范围为设备整个
-生命期，溢出会显式拒绝该实验结果。宿主模型在两种构建/传输下核对已知时间差、重复
-release、copy 与 abandon，实际进展仍由 worker/NIC-only 契约单独验证。
-
-```sh
-make test-virtio-net-host test-lwip-reassembly-host test-ethernet-worker-host
-python3 -B tests/userland/run.py --only boaros --workload interface
-python3 -B tests/userland/network-external.py --transport both
-python3 -B tests/userland/network-external.py --only linux --transport modern
+    IRQ --> Batch --> Budget
+    Budget -- "超出预算" --> Drop
+    Budget -- "通过" --> Lend
+    Lend -- "是" --> ZeroCopy
+    Lend -- "否（已达 32 上限）" --> UdpBorrow
+    UdpBorrow -- "是" --> LazyCopy
+    UdpBorrow -- "否" --> PoolCopy
 ```
 
-宿主模型独立解码寄存器银行与 split-ring 字节，63 项覆盖两种传输、头部、64 位
-地址、队列满、非法完成、索引绕回、indirect 表展开与未协商回退、abandon 归还
-语义、启动失败、超时、借用、reset owner 与失败槽级快照。它不能
-替代真实 DMA/IRQ。`python3 -B tests/host/ethernet_worker.py` 另编译实际 worker，
-用协议/调度边界模型验证设备失败后仍推进期限并按下一期限等待，且失败只归还
-已完成 owner、不 abandon 在途引用；同一1514字节
-输入的custom路径零复制、回退路径精确复制1514字节，最后引用、OOM、控制余量
-及input失败回收均核对。边界模型不验证实际协议时钟或DMA。真实 TAP runner 在无特权 user/network namespace 内运行，
-不启用 vhost/offload、不设置网关，输出只留 build。应用入口见[网络模块](kernel-network.md)。
+- **32 槽借用上限与备用池保护**：64 个接收槽中最多同时借出 **32 个**（`loaned == 32`）给协议栈，保留其余 32 个随时补充到硬件 RX 队列以保持满深度接收。`rx_free()` 回调仅将缓冲区归还空闲队列，且仅当此前无空闲缓冲区可补发且当前存在空闲 RX 描述符时才唤醒工作线程，避免冗余唤醒。
+- **UDP 接纳预算与控制余量**：对于 IPv4 UDP 及可能落入 UDP 的 IPv6 扩展头流量，`udp_capacity_after()` 同时统计已用 `PBUF_POOL`、协议堆和当前 DMA 借用（每槽按 2048 字节计），强制保留至少 **16 个 `PBUF_POOL` 缓冲区**与 **`68 KiB`**（`65536 + 4096`）协议堆余量给 TCP 与控制报文；超出预算直接丢弃。
+- **本地 UDP 延迟拷贝**：即使 32 个 DMA 借用已满，对于目的地址为本机且无分片的 IPv4 UDP 帧（且无原始套接字观察者），驱动仍先以临时借用视图递交协议栈，仅在目标套接字实际接收时通过 `boaros_lwip_udp_copy_borrowed()` 拷贝至 `PBUF_POOL`，减少无主数据报的无效拷贝。
 
-协议依据固定 `references/qemu` v11.1.0 的 MMIO 与 virtio_net 标准头、
-`references/linux` v7.2 的 VirtIO-net 实现、`references/lwip` 2.2.1 的 Ethernet
-入口；精确身份由 sources.tsv 管理。重组的本地修补范围见[第三方组件](../third-party.md)。
+---
 
-## LA PCI 与共用框架验收（2026-10-07）
+## 三、发送路径：间接表零拷贝、合批通知与异步退休
 
-```sh
-python3 -B tests/host/virtio_net.py --sanitize
-python3 -B tests/host/network_owner.py --sanitize
-make test-net-failures-loongarch
-python3 -B tests/userland/run.py --workload contract
-python3 -B tests/userland/run.py --workload content
-python3 -B tests/userland/run.py --workload timer
-python3 -B tests/userland/run.py --workload admission
-python3 -B tests/userland/network-external.py --arch loongarch
-python3 -B tests/userland/network-external.py --transport both
-```
+网卡发送端同样围绕“减少数据拷贝”与“减少虚拟机退出通知”两条主线优化：
 
-原宿主寄存器/ring模型在4KiB/16KiB、诊断开/关下运行实际共用核心，ASan/UBSan
-检查所有权与边界；新增在途SG reset拒绝、确认后归还且不重复释放。Ethernet/lwIP
-实际路径验证失败NIC仍推进期限、复制和SG容量通知、RX最后引用及协议对象回收。
-这些模型不能替代硬件；真实LA现代PCI、RV legacy/modern MMIO另有完整TAP内容校验。
+1. **间接描述符零拷贝（`virtio_net_send_segments`）**：当设备协商了 `VIRTIO_RING_F_INDIRECT_DESC`（bit 28），且待发送 `pbuf` 链不超过 **`VIRTIO_NET_TX_SEGMENTS = 2`** 段、无需拷贝（非 `PBUF_NEEDS_COPY`）且所有段均落在内核直接映射区时，`submit_link_frame()` 通过 `pbuf_ref()` 增加引用计数，在对应发送槽的偏移 `64 B`（`VIRTIO_NET_TX_TABLE_OFFSET`）处原地构造间接描述符表（第 0 项指向 10/12 字节 VirtIO 头，后续 1~2 项直指 `pbuf` 物理载荷），零拷贝直交硬件。若条件不满足则无缝回退至拷贝路径（`virtio_net_send_copy`），两者分别由 `tx-sg` 与 `tx-copy` 统计。
+2. **64 位空闲槽位图与按需回收**：驱动在设备状态短锁内用 64 位位图 `tx_available` 分配发送槽，避免热路径遍历数组；仅当发送槽全部耗尽时，提交者才在返回 `-EAGAIN`（向上转为 `ERR_MEM`）前主动扫描一次完成环，尽快腾出刚完成的槽位。
+3. **发送合批与统一通知**：独立发送报文立即提交并通知硬件；TCP 在单次 `tcp_output()` 连续输出多个段时传入 `more = 1`，驱动按序放入 `tx_pending` 队列，待批次结束（`!more`）、积攒满 **8 个待发包**（`tx_count >= 8`）或空闲槽耗尽时调用 `flush_tx()`，通过 `virtio_split_stage()` 批量写入描述符，再一次性推进可用环索引并发出单次设备通知。协议层退出发送循环时也会显式调用 `virtio_net_tx_flush()` 兜底刷新。
+4. **锁外批量退休引用**：硬件完成零拷贝发送后，中断或轮询不能在持有设备原始自旋锁期间调用协议栈 `pbuf_free()`。收割逻辑将已完成载荷指针迅速摘入 32 槽退休环 `tx_retired` 并立即释放发送槽、递增容量代次 `tx_capacity_generation`（若退休环已满则退回 `tx_done` 暂留原槽），随后由网络工作线程通过 `virtio_net_tx_release()` 在设备锁外成批释放 `pbuf` 引用，既缩短临界区又避免重复锁开销。
 
-LA同一个ELF先跑固定Linux再跑BoarOS，512MiB/1GiB各覆盖16MiB TCP、五个8MiB
-连接、UDP 64/1472/1473/65507字节、UDP池压力和原版BusyBox httpd/wget CGI。
-原程序、helper和BusyBox由父runner固定一次，reference标记只配置Linux网络；
-每个boot保持独立namespace。BoarOS要求loan-peak=32、真实复制回退、SG和设备errors=0，
-共享INTx17上的块/RNG/net完成及页/堆/任务栈/BAR基线，退出42也单独检查。
-这是功能与所有权证据，不把执行时间或统计代次称为吞吐保证。
+---
 
-真实PCI上另注入队列/RX/TX三处分配、IRQ登记、网络控制堆、worker任务/栈和
-初始/退出reset确认九个边界，各两种RAM。启动失败不发布PID1，退出reset失败后
-保留真实owner重试；18次均最终回到基线。无NIC的AF_UNIX和IPv4/IPv6 loopback、
-内容/期限/接纳故障与取消也双侧通过。扩大的sendfile测例另发现AF_UNIX固定64KiB
-上限与LA Linux datagram批次的差异；随后按[网络模块](kernel-network.md)的
-发送者计费路线修复并完成双侧budget/sendfile验收。完整LA平台/程序矩阵仍需
-独立收口，不能由本节声明全部能力等价。
+## 四、中断抑制轮询、工作线程与停止回收
+
+### 4.1 中断抑制与有界服务轮询
+
+为降低高吞吐下的中断风暴，网卡实现了类似 Linux NAPI（New API）的中断-轮询切换：
+- **进入轮询**：硬件中断处理函数 `interrupt()` 先确认中断（若是配置变更中断，还检查 `DEVICE_NEEDS_RESET` 并刷新链路状态），再收割 RX/TX 完成环。只要发现实际完成项，就向两条队列的 `available->flags` 写入 `VIRTIO_AVAIL_NO_INTERRUPT`（置 `polling = 1`），请求设备暂缓中断，并唤醒工作线程。
+- **有界工作轮次**：工作线程（`worker`）每轮依次执行：释放 UNIX 权能环路、调用 `virtio_net_poll_service()`（收割、5 秒发送超时检测、补充 RX 与刷新 TX）、锁外批量释放已完成发送引用、在协议执行资格内通告发送容量变化并处理最多 **8 帧** RX（`KERNEL_NETWORK_RECEIVE_BATCH`），再服务最多 **8 个回环包**、**8 个套接字工作项**与 **1 个协议定时器**。
+- **退出轮询防丢包**：本轮末调用 `virtio_net_service()` 清除 `available->flags` 重新开启中断，**紧接着执行 DMA 屏障并再次收割完成环**——确保屏蔽期间到达的报文由轮询者收走，之后的报文则恢复由中断唤醒。睡眠前重查工作链、容量代次、待释放引用、可取 RX 项及 `polling` 标志；睡眠期限取协议下一超时与最早在途 TX 5 秒看门狗的较小值（队列为空时最迟 5 秒唤醒一次）。
+- **无物理网卡模式**：若平台未挂载 VirtIO 网卡，`kernel_network_start()` 以 `device == NULL` 启动轻量级的 `timer_worker`，保留相同的有界回环与协议定时推进能力，确保套接字定时器与资源回收不依赖用户态重新陷入系统调用。
+
+### 4.2 故障隔离与严谨的停止顺序
+
+设备出现非法完成、`DEVICE_NEEDS_RESET`、未协商的卸载标志或已发布发送超时（5 秒）时，驱动冻结并打印槽级冷路径快照（仅由工作线程在锁外输出），停止新发布并向协议栈报告链路断开，但**不提前回收在途发送引用或借出接收槽**——因为设备故障不等于硬件 DMA 已停止，且协议栈的回环与定时器仍需继续推进。
+
+系统退出或网络关闭时遵循严格的所有权清理顺序：
+1. `virtio_net_begin_stop()` 阻断新提交，注销网络回调挂钩并唤醒工作线程。
+2. 在协议锁和关中断区外 `kernel_thread_join()` 汇合工作线程，并停止多核 TCP 归属核（SMP）。
+3. `virtio_net_quiesce()` 复位硬件并确认 DMA 停止，随后注销硬件中断；若设备拒绝确认复位，返回 `-EIO` 并保留全部 DMA/中断所有权供后续重试。
+4. 取得协议资格清理 IPv4 分片重组表、ARP 缓存与链路层抓包器，卸载 `netif`（同步中止仍关联旧本地地址的活跃/孤儿 TCP 控制块，归还其乱序队列中借用的 RX `pbuf`）。
+5. 此时硬件 DMA 已确认停止，调用 `virtio_net_tx_release(..., abandon = 1)` 回收全部残留发送引用；确认所有接收借用与发送所有者归零后，`virtio_net_stop()` 释放队列与 RX/TX 物理页，平台最后销毁 PCI 传输并归还 BAR。若仍有未归还引用，返回 `-EBUSY` 绝不提前释放物理页。
+
+---
+
+## 五、网络接口配置与用户态控制
+
+默认网卡接口 `eth0` 的静态 IPv4 地址由构建参数 `BOAROS_NET_IPV4` / `BOAROS_NET_NETMASK`（默认 `10.77.0.2/24`）生成，MTU 固定上限 `1500`（回环接口 `lo` 范围 `68..65536`，协议栈内部 MTU `0` 对外映射为 `65536`），同时自动按 MAC 派生 IPv6 链路本地地址并执行重复地址检测（DAD）。
+
+用户态接口控制如下：
+- **查询接口**：`SIOCGIFFLAGS`、`SIOCGIFADDR`、`SIOCGIFNETMASK`、`SIOCGIFHWADDR`、`SIOCGIFMTU`、`SIOCGIFINDEX`、`SIOCGIFNAME`、`SIOCGIFCONF`（64 位下 `ifreq` 为 40 字节、`ifconf` 为 16 字节），以及只读 `NETLINK_ROUTE` 查询（见[只读 rtnetlink 路由接口](../network-rtnetlink.md)）。
+- **修改接口与路由**：`SIOCSIFFLAGS`（UP/DOWN）、`SIOCSIFADDR`、`SIOCSIFNETMASK`、`SIOCSIFMTU`、`SIOCADDRT`/`SIOCDELRT`（管理一条带网关的 IPv4 默认路由，导出至 `/proc/net/route`），修改操作均要求 `CAP_NET_ADMIN` 权能。
+
+---
+
+<details>
+<summary>展开查看：生命周期存储前提、成本诊断指标与定向验证入口</summary>
+
+### 存储生命周期与诊断统计
+
+- **冷启动对象前提**：`virtio_net_init()` 要求传入全新的零初始化 `struct virtio_net_device`。仅在 `virtio_net_stop()` 返回 `0` 归还全部借用、发送引用、DMA 页和中断所有权后，调用方才可清零并复用该存储；若复位失败返回 `-EIO`，必须保留原对象继续完成停止流程。
+- **成本诊断指标**：开启 `BOAROS_COST_DIAGNOSTICS=1` 时，退出统计额外报告 `tx-done-free-*`（从软件收割完成到槽位归还）与 `tx-free-post-*`（同一槽归还至下次发布）的次数、总 tick、最大值、时钟频率及溢出标记；发布构建不引入额外时钟读取开销。
+- **串行纯 ACK 合并**：单核或串行接收路径下，`receive_inline()` 在观察到 `frames[0].more_ready` 时自动开启纯 ACK 批次合并，遇到非纯 ACK 以太网帧时先冲刷当前批次再递交。
+
+### 定向验证入口
+
+- **宿主驱动与所有权模型**：`make test-virtio-net-host`、`make test-lwip-reassembly-host`、`make test-ethernet-worker-host`、`python3 -B tests/host/virtio_net.py --sanitize`、`python3 -B tests/host/network_owner.py --sanitize`。
+- **双架构客机与真实 TAP 外部网络验证**：
+  - `python3 -B tests/userland/network-external.py --transport both`（RISC-V legacy/modern MMIO）
+  - `python3 -B tests/userland/network-external.py --arch loongarch`（LoongArch modern PCI）
+  - `make test-net-failures-loongarch`（9 类分配/IRQ/复位失败注入与资源基线回收）
+  - `python3 -B tests/userland/run.py --only boaros --workload interface`
+
+</details>

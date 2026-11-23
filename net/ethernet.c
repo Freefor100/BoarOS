@@ -52,6 +52,12 @@ static void rx_free(struct pbuf *p)
 }
 static int copy_pbuf(const void *context, void *destination, uint32_t length)
 { return pbuf_copy_partial(context, destination, (u16_t)length, 0) == length; }
+#if BOAROS_USER_SMP
+static void free_tx_pbuf_direct(void *const *payloads, unsigned count)
+{
+    for (unsigned i = 0; i < count; i++) pbuf_free(payloads[i]);
+}
+#endif
 static err_t submit_link_frame(struct netif *interface, struct pbuf *p, int more)
 {
     COST_SCOPE(output_cost, NET_TX_OUTPUT_TICKS);
@@ -75,6 +81,11 @@ static err_t submit_link_frame(struct netif *interface, struct pbuf *p, int more
         if (eligible && count != 0) {
             pbuf_ref(p);
             int result = virtio_net_send_segments(n->device, segments, count, p, more);
+#if BOAROS_USER_SMP
+            if (result == -KERNEL_EAGAIN && boaros_lwip_parallel_enabled() &&
+                virtio_net_tx_reclaim(n->device, free_tx_pbuf_direct))
+                result = virtio_net_send_segments(n->device, segments, count, p, more);
+#endif
             if (result == 0) return ERR_OK;
             pbuf_free(p);
             if (result == -KERNEL_EAGAIN) { kernel_socket_network_blocked(); return ERR_MEM; }
@@ -83,6 +94,11 @@ static err_t submit_link_frame(struct netif *interface, struct pbuf *p, int more
         }
     }
     int result = virtio_net_send_copy(n->device, p->tot_len, copy_pbuf, p, more);
+#if BOAROS_USER_SMP
+    if (result == -KERNEL_EAGAIN && boaros_lwip_parallel_enabled() &&
+        virtio_net_tx_reclaim(n->device, free_tx_pbuf_direct))
+        result = virtio_net_send_copy(n->device, p->tot_len, copy_pbuf, p, more);
+#endif
     /* 复制回退耗尽的仍是 NIC 槽；只等协议池归还会漏掉真实 TX 完成。 */
     if (result == -KERNEL_EAGAIN) { kernel_socket_network_blocked(); return ERR_MEM; }
     return result >= 0 ? ERR_OK : result == -KERNEL_EMSGSIZE ? ERR_BUF : ERR_IF;
