@@ -7,6 +7,7 @@
 #include <stdint.h>
 
 #define PHYSICAL_PAGE_MAX_ORDER 31U
+#define PHYSICAL_PAGE_FAULT_BATCH 8U
 
 enum physical_page_status {
     PHYSICAL_PAGE_STATUS_OK = 0,
@@ -82,6 +83,10 @@ struct physical_page_allocator {
     uint64_t recycled_head;
     /* Unpublished order-zero backing. Each nonzero slot owns one reference. */
     uint64_t pipe_spares[2];
+#if BOAROS_MAX_CPUS == 1
+    uint64_t fault_spares[PHYSICAL_PAGE_FAULT_BATCH];
+    unsigned fault_spare_count;
+#endif
     uint64_t metadata_address;
     uint64_t metadata_pages;
     uint32_t range_count;
@@ -178,6 +183,11 @@ void physical_page_pipe_drain(struct physical_page_allocator *);
 #define PHYSICAL_PAGE_ALLOCATION_BATCH_MAX 16U
 unsigned physical_page_allocate_batch(struct physical_page_allocator *,
     uint64_t *addresses, unsigned count);
+
+/* Try to supply one base page without running reclaim or waiting. The
+ * single-core allocator can refill a bounded reserve in one buddy operation. */
+int physical_page_try_fault(struct physical_page_allocator *, uint64_t *address);
+void physical_page_drain_faults(struct physical_page_allocator *);
 void physical_page_release_batch(struct physical_page_allocator *allocator,
     const uint64_t *addresses, unsigned count);
 

@@ -586,6 +586,34 @@ static void test_batch_allocation(void)
     assert(physical_page_available(&allocator)==initial && !physical_page_allocator_audit(&allocator));
 }
 
+static void test_fault_reserve(void)
+{
+    setup();
+    uint64_t initial = physical_page_available(&allocator), pages[256];
+    assert(physical_page_try_fault(&allocator, &pages[0]));
+    assert(physical_page_available(&allocator) == initial - PHYSICAL_PAGE_FAULT_BATCH);
+    assert(physical_page_try_fault(&allocator, &pages[1]) && pages[0] != pages[1]);
+    assert(physical_page_available(&allocator) == initial - PHYSICAL_PAGE_FAULT_BATCH);
+    unsigned count = 2;
+    while (count < initial && !physical_page_allocate(&allocator, &pages[count])) count++;
+    assert(count == initial); /* Exhaustion of the buddy lists releases the spare owners. */
+    uint64_t kept = UINT64_C(0x7184);
+    assert(!physical_page_try_fault(&allocator, &kept) && kept == UINT64_C(0x7184));
+    while (count) assert(!physical_page_release(&allocator, pages[--count]));
+
+    uint64_t page;
+    uint32_t references;
+    assert(physical_page_try_fault(&allocator, &page));
+    const uint64_t pair[] = {page, page};
+    physical_page_acquire_batch(&allocator, pair, 2);
+    physical_page_release_batch(&allocator, pair, 2);
+    assert(!physical_page_reference_count(&allocator, page, &references) && references == 1);
+    assert(!physical_page_acquire(&allocator, page));
+    physical_page_release_batch(&allocator, pair, 2);
+    physical_page_drain_faults(&allocator);
+    assert(physical_page_available(&allocator) == initial && !physical_page_allocator_audit(&allocator));
+}
+
 struct recycle_test { uint64_t head; unsigned calls, retained; };
 static int retain_compound(void *context, uint64_t head, uint32_t order)
 {
@@ -692,6 +720,7 @@ int main(void)
     test_compound_references();
     test_no_sleep_allocation();
     test_batch_allocation();
+    test_fault_reserve();
     test_legal_release_is_silent();
     test_retired_payload_is_not_owner();
     for (unsigned int i = 0; i < 33; i++) {

@@ -173,6 +173,7 @@ static int release_root(void)
         root.count--;
     }
     if (kernel_hstate_shutdown(root.heap.page_allocator)) return -KERNEL_EBUSY;
+    physical_page_drain_faults(root.heap.page_allocator);
     struct kernel_heap_statistics stats; kernel_heap_get_statistics(&root.heap,&stats);
     uint64_t available=physical_page_available(root.heap.page_allocator);
     if(stats.live_allocations || stats.current_pages || available!=root.baseline || pci_host_claimed(la_virt_pci_host())) {
