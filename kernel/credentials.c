@@ -2,6 +2,7 @@
 #include <kernel/errno.h>
 #include <kernel/heap.h>
 #include <kernel/io_context.h>
+#include <kernel/keys.h>
 #include <kernel/task.h>
 #include <kernel/task_state.h>
 #include <kernel/wait_internal.h>
@@ -203,6 +204,7 @@ struct kernel_credentials *kernel_credentials_clone(struct kernel_heap *heap,con
     *candidate=*old;candidate->heap=heap;candidate->references=1;
     if(candidate->groups){uint32_t before=__atomic_fetch_add(&candidate->groups->references,1,__ATOMIC_RELAXED);if(!before||before==UINT32_MAX)__builtin_trap();}
     {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);kernel_uid_account_get_locked(candidate->account);}
+    kernel_keys_credentials_get(candidate);
     return candidate;
 }
 int kernel_credentials_set_account(struct kernel_credentials *cred,uint32_t uid)
@@ -219,16 +221,21 @@ void kernel_credentials_put(const struct kernel_credentials *cred)
     uint32_t before=__atomic_fetch_sub((uint32_t *)&cred->references,1,__ATOMIC_ACQ_REL);
     if(!before)__builtin_trap();
     if(before!=1)return;
+    kernel_keys_credentials_put(cred);
     kernel_credential_groups_put(cred->groups);
     kernel_uid_account_put(cred->account);
     kernel_heap_release(cred->heap,(void *)cred);
 }
 void kernel_credentials_publish(struct kernel_task *task,struct kernel_credentials *candidate)
 {
-    const struct kernel_credentials *old;
+    /* Only the running caller publishes its own credentials. Update the
+     * thread ring before publishing the replacement, outside scheduler raw. */
+    const struct kernel_credentials *old=kernel_credentials_task_locked(task);
+    if (candidate->thread_keyring &&
+        (candidate->fsuid!=old->fsuid || candidate->fsgid!=old->fsgid))
+        kernel_keys_credentials_change_ids(old,candidate);
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
-        old=kernel_credentials_task_locked(task);
         kernel_credentials_changed_locked(task,old,candidate);
         task->credentials=candidate;
     }

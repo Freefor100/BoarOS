@@ -19,7 +19,7 @@
 
 **BoarOS** 是一个从零编写的、面向 **RISC-V 64** 与 **龙芯 LoongArch 64** 双架构的宏内核操作系统，以完整兼容 **Linux 应用二进制接口（Application Binary Interface，ABI）** 为设计目标。内核主体采用 GNU C11 编写，仅在启动引导、异常陷入与上下文切换等紧贴硬件的边界使用精简汇编，目前核心代码规模约 **14.6 万行**。
 
-BoarOS 在 QEMU `virt` 虚拟平台上支持 **1～8 核对称多处理（Symmetric Multiprocessing，SMP）**，实现了 **273 个（RISC-V）/ 269 个（LoongArch）** Linux 系统调用。内核无需修改用户态源码，即可直接运行基于 `musl` 或 `glibc` 的静态与动态链接可执行文件（Executable and Linkable Format，ELF），已跑通 **BusyBox、SQLite、Lua、`strace`、原版 `bpftool`/`bpftrace`**，并支持在 BoarOS 客体机内完成**离线 C 语言预处理、编译、汇编、链接与执行**全流程。
+BoarOS 在 QEMU `virt` 虚拟平台上支持 **1～8 核对称多处理（Symmetric Multiprocessing，SMP）**，实现了 **277 个（RISC-V）/ 273 个（LoongArch）** Linux 系统调用。内核无需修改用户态源码，即可直接运行基于 `musl` 或 `glibc` 的静态与动态链接可执行文件（Executable and Linkable Format，ELF），已跑通 **BusyBox、SQLite、Lua、`strace`、原版 `bpftool`/`bpftrace`**，并支持在 BoarOS 客体机内完成**离线 C 语言预处理、编译、汇编、链接与执行**全流程。
 
 > [!NOTE]
 > **推荐阅读路线**

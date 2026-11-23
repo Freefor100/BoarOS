@@ -279,9 +279,12 @@ static int64_t futex_wait_until(struct kernel_task *task, uint64_t address,
     struct kernel_futex_request request={.task=task,.entries=&entry,.count=1};
     if(task->futex_request)__builtin_trap();
     task->futex_request=&request;
+    uint64_t effective = has_timeout ?
+        kernel_time_slack_deadline(realtime ? KERNEL_TIME_REALTIME : KERNEL_TIME_MONOTONIC,
+                                   deadline_ns, kernel_task_timerslack_get(task)) : 0;
     *status=has_timeout && realtime ?
-        kernel_wait_prepare_realtime(0,deadline_ns,1,&request.token) :
-        has_timeout ? kernel_wait_prepare_monotonic(0,deadline_ns,1,&request.token) :
+        kernel_wait_prepare_realtime(0,effective,1,&request.token) :
+        has_timeout ? kernel_wait_prepare_monotonic(0,effective,1,&request.token) :
         kernel_wait_prepare(0,0,1,&request.token);
     if(!*status) {
         entry.priority=futex_wait_priority(task);

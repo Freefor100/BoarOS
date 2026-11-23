@@ -998,6 +998,7 @@ static enum kernel_files_status epoll_pwait_deadline(
         return KERNEL_FILES_STATUS_OK;
     }
 
+    uint64_t effective = 0;
     for (;;) {
         int64_t delivered = epoll_deliver(&request, mm, user_events, (size_t)maxevents);
         if (delivered) {
@@ -1010,13 +1011,14 @@ static enum kernel_files_status epoll_pwait_deadline(
             break;
         }
 
+        if (!effective && target_ns) effective = kernel_time_select_deadline(task, target_ns);
         /* Block on epoll wait queue */
         {
             enum kernel_wait_wake_reason wake_reason = KERNEL_WAIT_WOKEN;
             EPOLL_STATE(saved_intr);
             struct kernel_wait_token token;
-            enum kernel_scheduler_status sched_status = target_ns ?
-                kernel_wait_prepare_monotonic(&epoll->wait_queue,target_ns,1,&token) :
+            enum kernel_scheduler_status sched_status = effective ?
+                kernel_wait_prepare_monotonic(&epoll->wait_queue,effective,1,&token) :
                 kernel_wait_prepare(&epoll->wait_queue,0,1,&token);
             if (sched_status == KERNEL_SCHEDULER_STATUS_OK) {
                 int ready = !epoll->scan_owner && epoll->ready_head;

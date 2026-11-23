@@ -11,9 +11,11 @@
 #include <kernel/proc_task.h>
 #include <kernel/posix_timer.h>
 #include <kernel/credentials.h>
+#include <kernel/keys.h>
 #include <arch/task.h>
 #include <arch/context.h>
 #include <kernel/errno.h>
+#include <kernel/process_acct.h>
 #include <kernel/irq.h>
 #include <kernel/epoll.h>
 #include <kernel/exec.h>
@@ -883,8 +885,14 @@ enum kernel_scheduler_status arch_process_clone_current(
     child->magic = KERNEL_THREAD_MAGIC;
     /* f_cred 身份用于空路径 linkat；普通 fork 与 Linux 一样产生独立
      * credential 对象，补充组和 UID 账户仍共享真实引用。 */
-    child->credentials = thread_clone ? kernel_credentials_get(parent->credentials) :
-        kernel_credentials_clone(parent->files.heap,parent->credentials);
+    if (thread_clone && !parent->credentials->thread_keyring) {
+        child->credentials = kernel_credentials_get(parent->credentials);
+    } else {
+        struct kernel_credentials *candidate = kernel_credentials_clone(parent->files.heap,
+            parent->credentials);
+        if (candidate) kernel_keys_credentials_fork(candidate, thread_clone);
+        child->credentials = candidate;
+    }
     if (!child->credentials)
         return finish_clone_failure(child,-KERNEL_ENOMEM,linux_result,KERNEL_SCHEDULER_STATUS_OK);
     int admitted=process_clone_admit(child,parent,flags);
@@ -1011,8 +1019,11 @@ enum kernel_scheduler_status arch_process_clone_current(
         struct kernel_sched_policy inherited;
         scheduler_policy_snapshot_locked(parent, &inherited);
         kernel_sched_policy_fork(&child->scheduling,&inherited);
+        child->timer_slack_ns = child->default_timer_slack_ns =
+            kernel_task_timerslack_get(parent);
     }
     child->proc_start_ticks = kernel_tick_count();
+    if (!thread_clone) child->limits->acct_start_ns = kernel_time_raw_ns();
     child->group_leader = child;
     child->group_members = 1U;
     child->fork_no_exec = 1U;
@@ -2053,6 +2064,11 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
             }
             /* Namespace reboot replaces SIGKILL only after final drain. */
             result=thread->completion;
+            /* An orphaned or traced zombie may visit cleanup again. */
+            if (!thread->limits->acct_finalized) {
+                thread->limits->acct_finalized = 1U;
+                kernel_process_acct_exit(thread);
+            }
         }
         /* The creator still owns its TID, credentials and group identity here.
          * A leader returning from GROUP_DEAD has already moved its children. */
@@ -2289,6 +2305,7 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
     enum kernel_files_status files_status;
     enum kernel_fs_context_status fs_status;
 
+    if (kernel_process_acct_enabled()) kernel_process_acct_collect_memory(thread);
     files_status=finish_files_change(thread);
     if(files_status) return files_status==KERNEL_FILES_STATUS_CLEANUP_REQUIRED
         ? KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP : KERNEL_SCHEDULER_STATUS_INVALID_STATE;
@@ -2732,6 +2749,7 @@ static void namespace_reboot_completion_locked(struct kernel_task *leader,
         leader->completion.status=space->reboot_signal;
         leader->completion.detail=0;
         leader->wait_status=user_wait_status(&leader->completion);
+        leader->limits->acct_leader_status=leader->wait_status;
     }
 }
 
@@ -2750,6 +2768,7 @@ static int process_pid_namespace_drain(struct kernel_task *leader)
             if (space->shutdown_reaper != leader || space->numbers->allocated != 1)
                 __builtin_trap();
             namespace_reboot_completion_locked(leader,space);
+            leader->limits->acct_leader_status = leader->wait_status;
             return 0;
         }
         kernel_pid_registry_disable(space);
@@ -2826,6 +2845,18 @@ static void process_begin_exit(struct kernel_task *current,
         if (kernel_wait_record_phase(&current->wait) != KERNEL_WAIT_FINISHED || current->wait.nodes || kernel_wait_record_borrows(&current->wait))
             __builtin_trap();
         current->proc_exiting = 1;
+        if (current->arch.user_mode && current->group_leader && current->limits) {
+            /* The scheduler publishes exits here. Cleanup can finish in a
+             * different order or revisit a leader after its siblings leave. */
+            struct kernel_resource_limits *limits = current->limits;
+            limits->acct_last_nonleader = current != current->group_leader;
+            if (limits->acct_last_nonleader) {
+                const struct kernel_credentials *cred = kernel_credentials_task_locked(current);
+                limits->acct_last_uid = cred->uid;
+                limits->acct_last_gid = cred->gid;
+                memcpy(limits->acct_last_comm, current->comm, sizeof(limits->acct_last_comm));
+            }
+        }
         if (current->group_leader && !live_reaper_locked(current->group_leader, current))
             process_pid_reaper_disable_locked(current->group_leader);
         if (!current->group_exiting) current->completion = *completion;
@@ -2889,6 +2920,8 @@ static void kernel_thread_finish(
                 : cleanup_user_task_resources(current);
         }
         current->wait_status = user_wait_status(&current->completion);
+        if (current->group_leader == current && current->limits)
+            current->limits->acct_leader_status = current->wait_status;
     }
     (void)cleanup_status;
     struct kernel_cpu *cpu = kernel_cpu_current();

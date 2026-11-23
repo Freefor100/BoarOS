@@ -2,6 +2,7 @@
 #include <kernel/async_io.h>
 #include "private.h"
 #include "../open_file_internal.h"
+#include "../lease.h"
 #include "../pipe_internal.h"
 #include "../record_lock.h"
 #include <kernel/mqueue.h>
@@ -1219,6 +1220,23 @@ enum kernel_files_status kernel_files_fcntl(
         }
         return dup_from(files, fd, (uint32_t)argument,
             command==KERNEL_FILES_F_DUPFD_CLOEXEC ? KERNEL_FILES_FD_CLOEXEC : 0, result);
+    }
+    if (command==KERNEL_FILES_F_SETLEASE || command==KERNEL_FILES_F_GETLEASE) {
+        KERNEL_FILES_PIN_SCOPE(pin);
+        struct kernel_open_file_description *file=kernel_files_hold_fd(files,fd,&pin);
+        unsigned type=(uint32_t)argument;
+        if (!file || file->kind==KERNEL_OPEN_FILE_KIND_PATH) *result=-KERNEL_EBADF;
+        else if (command==KERNEL_FILES_F_GETLEASE) *result=kernel_vfs_lease_get(&file->file);
+        else if (file->kind != KERNEL_OPEN_FILE_KIND_REGULAR ||
+                 type>KERNEL_LEASE_UNLOCK ||
+                 (kernel_open_file_mode(file)&KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFREG)
+            *result=-KERNEL_EINVAL;
+        else {
+            *result=type==KERNEL_LEASE_UNLOCK ? 0 : kernel_open_file_async_lease_prepare(file);
+            if (!*result)
+                *result=kernel_vfs_lease_set(&file->file,type,(int)fd,file,&kernel_async_lease_notify);
+        }
+        return KERNEL_FILES_STATUS_OK;
     }
     if (command==KERNEL_FILES_F_ADD_SEALS || command==KERNEL_FILES_F_GET_SEALS) {
         KERNEL_FILES_PIN_SCOPE(pin);

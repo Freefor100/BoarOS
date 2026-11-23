@@ -36,6 +36,7 @@ struct kernel_vfs_instance {
     struct kernel_vfs_node *cleanup_nodes;
     struct kernel_vfs_dentry *paths; /* Weak canonical directory-entry registry. */
     uint32_t external_files;
+    uint32_t accounting_files; /* Protected by kernel_vfs_state_lock. */
     uint64_t writeback_error_sequence;
     int writeback_error;
     uint8_t read_only;
@@ -91,6 +92,8 @@ struct kernel_vfs_node {
     uint32_t mode;
     uint32_t references;
     uint32_t open_files;
+    uint64_t lease_access;
+    struct kernel_inode_leases *leases;
     unsigned fanotify_pins;
     uint32_t write_openers;
     uint32_t exec_users;

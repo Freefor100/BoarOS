@@ -479,6 +479,9 @@ int64_t kernel_futex_wait_requeue_pi(struct kernel_task *task,uint64_t address,
     int result=pi_deadline(task,timeout,realtime,&deadline,&deadline_ns);
     if(result)return result;
     if(address==target)return -KERNEL_EINVAL;
+    uint64_t effective=timeout ? kernel_time_slack_deadline(
+        realtime ? KERNEL_TIME_REALTIME : KERNEL_TIME_MONOTONIC,
+        deadline_ns,kernel_task_timerslack_get(task)) : 0;
     struct kernel_futex_pi_request pi_request={.task=task,.address=target,.operation=operation,.requeue_stage=1};
     struct kernel_futex_entry entry={.node={.task=task},.kind=FUTEX_ENTRY_REQUEUE_PI,.bitset=UINT32_MAX,.pi=&pi_request};
     struct kernel_futex_request request={.task=task,.entries=&entry,.count=1};
@@ -500,8 +503,8 @@ int64_t kernel_futex_wait_requeue_pi(struct kernel_task *task,uint64_t address,
         if(__atomic_load_n(word,__ATOMIC_ACQUIRE)!=value){result=-KERNEL_EAGAIN;goto out;}
         KERNEL_RAW_SCOPE(raw,&kernel_wait_domain);
         enum kernel_scheduler_status prepared=timeout && realtime ?
-            kernel_wait_prepare_realtime(0,deadline_ns,1,&pi_request.token) :
-            timeout ? kernel_wait_prepare_monotonic(0,deadline_ns,1,&pi_request.token) :
+            kernel_wait_prepare_realtime(0,effective,1,&pi_request.token) :
+            timeout ? kernel_wait_prepare_monotonic(0,effective,1,&pi_request.token) :
             kernel_wait_prepare(0,0,1,&pi_request.token);
         if(prepared)__builtin_trap();
         entry.priority=scheduler_base_priority(task);

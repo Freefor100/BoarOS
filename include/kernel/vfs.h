@@ -214,8 +214,11 @@ struct kernel_vfs_file {
     uint32_t write_lease;
     uint32_t exec_lease;
     uint8_t location_owner;
+    uint8_t lease_access; /* A real open or pathname mutation counted for file leases. */
+    uint8_t lease_owner;
     uint8_t notify_suppressed; /* Opened by a file-event reader. */
     uint8_t notify_access_perm; /* Open-time fanotify access permission interest. */
+    uint8_t accounting; /* A published accounting handle closed by mount retirement. */
 };
 
 /* Paths are borrowed for the duration of a call; successful opens own a path
@@ -300,6 +303,13 @@ int kernel_vfs_exec_metadata(struct kernel_vfs_file *file,
  * result reports creation and may own a pathless final link on failure. */
 int kernel_vfs_open_resolved(struct kernel_vfs_path *, struct kernel_vfs_file *,
     const struct kernel_vfs_open_request *);
+/* Open can block on a lease and returns a file with regular mount ownership.
+ * Publish runs under the accounting lock and attaches the file to the mount's
+ * detach callback, leaving only the inode open. */
+int kernel_vfs_acct_open(struct kernel_vfs_path *cwd, struct kernel_vfs_path *root,
+                         const char *path, struct kernel_vfs_file *file);
+int kernel_vfs_acct_publish(struct kernel_vfs_file *);
+int kernel_vfs_append_record(struct kernel_vfs_file *, const void *, size_t);
 int kernel_vfs_open_at(struct kernel_vfs_path *start,
                        struct kernel_vfs_path *root, const char *path,
                        const struct kernel_vfs_open_request *request,

@@ -75,6 +75,13 @@ static inline uint64_t kernel_time_domain_now(enum kernel_time_domain domain)
     return domain == KERNEL_TIME_REALTIME ? kernel_time_realtime_ns() : kernel_time_monotonic_ns();
 }
 
+/* A timeout may be grouped with others only within its chosen slack.
+ * Keep the original deadline for clock restart and user remaining time. */
+uint64_t kernel_time_slack_deadline(enum kernel_time_domain, uint64_t deadline,
+                                   uint64_t slack_ns);
+struct kernel_task;
+uint64_t kernel_time_select_deadline(const struct kernel_task *, uint64_t deadline);
+
 /* Init and each delivered timer interrupt publish one actual counter sample.
  * Both coarse clocks derive from that same sample; reads do not touch CSR time. */
 void kernel_time_update_coarse(void);

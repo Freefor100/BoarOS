@@ -28,6 +28,8 @@ static struct kernel_pid *delivered_owner;
 void *sync_test_cpu(void){cpu.bootstrap_io=&io;return &cpu;}
 void *sync_test_current_task(void){return NULL;}
 struct kernel_task *kernel_task_current(void){return NULL;}
+enum kernel_task_status kernel_task_user_tid(const struct kernel_task *task,kernel_pid_t *tid)
+{ (void)task; *tid=identities[0].number; return KERNEL_TASK_STATUS_OK; }
 void kernel_cpu_flush_notifications(void){assert(!cpu.outbound);}
 void kernel_assert_can_block(void){assert(!cpu.raw_locks);}
 void kernel_preempt_disable(void){assert(!cpu.raw_locks);cpu.preempt_depth++;}
@@ -39,6 +41,7 @@ void kernel_heap_release(struct kernel_heap *h,void *p)
 {assert(h==&heap&&p&&!cpu.raw_locks&&allocations);allocations--;free(p);}
 int kernel_task_identity_get_user(int32_t number,struct kernel_pid **out)
 {*out=NULL;
+ if(!number){kernel_task_identity_retain(&identities[0]);*out=&identities[0];return 0;}
  if(extra_lookup&&kernel_pid_number_in(extra_lookup,observer)==number){kernel_task_identity_retain(extra_lookup);*out=extra_lookup;return 0;}
  for(unsigned i=0;i<2;i++)if(kernel_pid_number_in(&identities[i],observer)==number){kernel_task_identity_retain(&identities[i]);*out=&identities[i];return 0;}
  return -KERNEL_ESRCH;}
@@ -57,7 +60,8 @@ void kernel_signal_sigio(struct kernel_pid *id,int type,uint32_t uid,uint32_t eu
 }
 struct kernel_wait_queue *kernel_socket_async_source(struct kernel_socket *s){(void)s;abort();}
 void kernel_open_file_set_status_flags(struct kernel_open_file_description *f,uint32_t flags)
-{const unsigned mask=02000|04000|020000|01000000;__atomic_store_n(&f->open_flags,(f->open_flags&~mask)|(flags&mask),__ATOMIC_RELAXED);}
+{const unsigned mask=02000|04000|01000000|(f->kind==KERNEL_OPEN_FILE_KIND_REGULAR?0:020000);
+ __atomic_store_n(&f->open_flags,(f->open_flags&~mask)|(flags&mask),__ATOMIC_RELAXED);}
 enum kernel_uaccess_status kernel_copy_from_user(struct kernel_mm *mm,void *to,uint64_t from,size_t size,size_t *copied)
 {(void)mm;if(from<4096)return KERNEL_UACCESS_STATUS_FAULT;memcpy(to,(void *)(uintptr_t)from,size);*copied=size;return 0;}
 enum kernel_uaccess_status kernel_copy_to_user(struct kernel_mm *mm,uint64_t to,const void *from,size_t size,size_t *copied)
@@ -159,7 +163,23 @@ int main(void)
     assert(!kernel_open_file_async_fcntl(&retained,KERNEL_FILES_F_GETOWN,0,NULL));
     assert(ctx->owner==&child.id && ctx->owner!=&identities[0]);
     kernel_open_file_async_close(&retained);extra_lookup=NULL;assert(child.id.references==1&&!allocations);
-    puts("PASS async OFD: owner/signum, allocation rollback, saved fd, pipe direction, and close/callback drain");
+    assert(!kernel_open_file_async_lease_prepare(&regular));
+    kernel_async_lease_notify.install(&regular,11);
+    assert(regular.open_flags==(020000|04000));
+    assert(!kernel_open_file_async_flags(&regular,11,0)&&regular.open_flags==020000);
+    assert(kernel_open_file_async_fcntl(&regular,KERNEL_FILES_F_GETOWN,0,NULL)==41);
+    assert(!kernel_open_file_async_fcntl(&regular,KERNEL_FILES_F_SETOWN,42,NULL));
+    assert(!kernel_open_file_async_fcntl(&regular,KERNEL_FILES_F_SETSIG,35,NULL));
+    kernel_async_lease_notify.install(&regular,12);
+    kernel_async_lease_notify.signal(&regular);
+    assert(signals==7&&delivered_owner==&identities[1]&&delivered_fd==12&&
+           delivered_signum==35&&delivered_reason==KERNEL_ASYNC_POLL_MSG);
+    kernel_async_lease_notify.clear(&regular);
+    assert(!regular.open_flags&&!kernel_open_file_async_fcntl(&regular,KERNEL_FILES_F_GETOWN,0,NULL)&&
+           !kernel_open_file_async_fcntl(&regular,KERNEL_FILES_F_GETSIG,0,NULL));
+    kernel_open_file_async_close(&regular);
+    assert(!allocations&&identities[0].references==1&&identities[1].references==1);
+    puts("PASS async OFD: owner/signum, allocation rollback, saved fd, pipe direction, lease and close/callback drain");
 }
 
 kernel_pid_t kernel_task_identity_user_number(const struct kernel_pid *id)

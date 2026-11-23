@@ -1474,6 +1474,8 @@ enum kernel_scheduler_status kernel_user_thread_create(
     }
     tid = thread->tid;
     thread->proc_start_ticks = kernel_tick_count();
+    thread->limits->acct_start_ns = kernel_time_raw_ns();
+    thread->timer_slack_ns = thread->default_timer_slack_ns = KERNEL_DEFAULT_TIMER_SLACK_NS;
     thread->publish_completion = 1U;
     thread->wait_status = 0U;
     thread->group_leader = thread;

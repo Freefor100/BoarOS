@@ -62,6 +62,14 @@ enum kernel_syscall_status syscall_handle_prctl(
                 (uint32_t)request->arguments[1]==1 ? 0 : request->arguments[2]);
         return KERNEL_SYSCALL_STATUS_OK;
     }
+    if (option == 29U || option == 30U) {
+        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+        if (option == 29U) {
+            kernel_task_timerslack_set(caller, request->arguments[1]);
+            decoded->value = 0;
+        } else decoded->value = (int64_t)kernel_task_timerslack_get(caller);
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
     if (option != 1U && option != 2U && option != 15U && option != 16U &&
         option != 36U && option != 37U)
         return syscall_handle_prctl_credentials(caller, request, decoded);

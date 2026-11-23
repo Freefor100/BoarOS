@@ -1284,7 +1284,7 @@ static enum kernel_files_status control_write(
             *linux_result = -KERNEL_ESPIPE; return KERNEL_FILES_STATUS_OK;
         }
         prefix &= ~KERNEL_VFS_CONTROL_PREFIX_POSITIONED;
-        char buffer[35];
+        char buffer[67];
         if (prefix >= sizeof(buffer)) __builtin_trap();
         uint64_t total = 0;
         for (size_t i = 0; i < iov_count; i++) {

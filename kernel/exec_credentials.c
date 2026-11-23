@@ -1,5 +1,6 @@
 #include <kernel/credentials.h>
 #include <kernel/errno.h>
+#include <kernel/keys.h>
 #include <kernel/vfs.h>
 #include "exec_internal.h"
 
@@ -16,6 +17,7 @@ int kernel_exec_credentials_prepare(struct kernel_credentials *next,
 {
     uint64_t file_permitted=0, file_inheritable=0;
     int effective=0, has_filecap=0;
+    kernel_keys_credentials_exec(next);
     next->permitted=0;
     if (!file->nosuid && !no_new_privs) {
         if (file->mode & 04000U) next->euid=file->uid;

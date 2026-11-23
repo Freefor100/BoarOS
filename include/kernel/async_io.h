@@ -17,5 +17,8 @@ struct kernel_mm;
 int kernel_open_file_async_flags(struct kernel_open_file_description *,int fd,uint32_t flags);
 int64_t kernel_open_file_async_fcntl(struct kernel_open_file_description *,unsigned command,
     uint64_t argument,struct kernel_mm *);
+struct kernel_lease_notify;
+extern const struct kernel_lease_notify kernel_async_lease_notify;
+int kernel_open_file_async_lease_prepare(struct kernel_open_file_description *);
 void kernel_open_file_async_close(struct kernel_open_file_description *);
 #endif

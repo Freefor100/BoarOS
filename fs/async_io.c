@@ -10,6 +10,7 @@
 #include <kernel/uaccess.h>
 #include <kernel/wait_internal.h>
 #include "char_device_internal.h"
+#include "lease.h"
 #include "open_file_internal.h"
 #include "pipe_internal.h"
 
@@ -23,6 +24,7 @@ struct kernel_async_io {
     uint32_t uid,euid;
     int owner_type,fd;
     unsigned signum,enabled,pipe_endpoint;
+    int lease_fd;
 };
 
 static struct kernel_wait_queue *async_source(struct kernel_open_file_description *file)
@@ -31,6 +33,28 @@ static struct kernel_wait_queue *async_source(struct kernel_open_file_descriptio
     if (file->kind==KERNEL_OPEN_FILE_KIND_SOCKET) return kernel_socket_async_source(file->socket);
     return file->device && file->device->async_source ?
         file->device->async_source(file->device_instance) : NULL;
+}
+
+static void async_deliver(struct kernel_async_io *async,unsigned event,int lease)
+{
+    struct kernel_pid *owner;
+    uint32_t uid,euid;
+    int type,fd;
+    unsigned signum;
+    {
+        KERNEL_RAW_SCOPE(guard,&async->metadata);
+        if ((!lease && !async->enabled) || !async->owner) return;
+        if (async->pipe_endpoint &&
+            ((event==KERNEL_ASYNC_POLL_IN && !(async->pipe_endpoint&1)) ||
+             (event==KERNEL_ASYNC_POLL_OUT && !(async->pipe_endpoint&2)))) return;
+        owner=async->owner;
+        kernel_task_identity_retain(owner);
+        uid=async->uid;euid=async->euid;type=async->owner_type;
+        fd=lease ? async->lease_fd : async->fd;
+        signum=async->signum;
+    }
+    kernel_signal_sigio(owner,type,uid,euid,signum,fd,event);
+    kernel_task_identity_put(owner);
 }
 
 static void async_notify(struct kernel_wait_node *node,uint32_t reason,uint64_t event)
@@ -49,20 +73,7 @@ static void async_notify(struct kernel_wait_node *node,uint32_t reason,uint64_t 
         return;
     }
     if (reason!=KERNEL_WAIT_WOKEN || event<1 || event>6) return;
-    struct kernel_pid *owner=NULL;
-    uint32_t uid=0,euid=0;int type=0,fd=0;unsigned signum=0;
-    {
-        KERNEL_RAW_SCOPE(guard,&async->metadata);
-        if (!async->enabled || !async->owner) return;
-        if (async->pipe_endpoint &&
-            ((event==KERNEL_ASYNC_POLL_IN && !(async->pipe_endpoint&1)) ||
-             (event==KERNEL_ASYNC_POLL_OUT && !(async->pipe_endpoint&2)))) return;
-        owner=async->owner;kernel_task_identity_retain(owner);
-        uid=async->uid;euid=async->euid;type=async->owner_type;
-        fd=async->fd;signum=async->signum;
-    }
-    kernel_signal_sigio(owner,type,uid,euid,signum,fd,(unsigned)event);
-    kernel_task_identity_put(owner);
+    async_deliver(async,(unsigned)event,0);
 }
 
 static struct kernel_async_io *get_context(struct kernel_open_file_description *file)
@@ -77,12 +88,68 @@ static struct kernel_async_io *get_context(struct kernel_open_file_description *
     kernel_raw_lock_init(&candidate->metadata,KERNEL_RAW_RANK_OBJECT);
     kernel_wait_node_init_callback(&candidate->subscription,async_notify,candidate);
     candidate->file=file;
+    candidate->lease_fd=-1;
     candidate->pipe_endpoint=file->kind==KERNEL_OPEN_FILE_KIND_PIPE?file->pipe_endpoint:0;
     if (!__atomic_compare_exchange_n(&file->async_io,&async,candidate,0,
             __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) kernel_heap_release(file->heap,candidate);
     else async=candidate;
     return async;
 }
+
+int kernel_open_file_async_lease_prepare(struct kernel_open_file_description *file)
+{
+    return get_context(file) ? 0 : -KERNEL_ENOMEM;
+}
+
+static void async_lease_install(struct kernel_open_file_description *file,int fd)
+{
+    struct kernel_async_io *async=file->async_io;
+    const struct kernel_credentials *cred=kernel_credentials_current();
+    struct kernel_pid *owner=NULL;
+    kernel_pid_t tid;
+    if (kernel_task_user_tid(kernel_task_current(),&tid) ||
+        kernel_task_identity_get_user(tid,&owner)) __builtin_trap();
+    {
+        KERNEL_RAW_SCOPE(guard,&async->metadata);
+        async->lease_fd=fd;
+        __atomic_fetch_or(&file->open_flags,(uint32_t)KERNEL_FILES_O_ASYNC,__ATOMIC_RELAXED);
+        if (!async->owner) {
+            async->owner=owner;
+            async->owner_type=1;
+            async->uid=cred->uid;
+            async->euid=cred->euid;
+            owner=NULL;
+        }
+    }
+    if (owner) kernel_task_identity_put(owner);
+}
+
+static void async_lease_clear(struct kernel_open_file_description *file)
+{
+    struct kernel_async_io *async=file->async_io;
+    struct kernel_pid *owner;
+    {
+        KERNEL_RAW_SCOPE(guard,&async->metadata);
+        owner=async->owner;
+        async->owner=NULL;
+        async->owner_type=1;
+        async->signum=0;
+        async->lease_fd=-1;
+        __atomic_fetch_and(&file->open_flags,~(uint32_t)KERNEL_FILES_O_ASYNC,__ATOMIC_RELAXED);
+    }
+    if (owner) kernel_task_identity_put(owner);
+}
+
+static void async_lease_signal(struct kernel_open_file_description *file)
+{
+    async_deliver(file->async_io,KERNEL_ASYNC_POLL_MSG,1);
+}
+
+const struct kernel_lease_notify kernel_async_lease_notify={
+    .install=async_lease_install,
+    .clear=async_lease_clear,
+    .signal=async_lease_signal,
+};
 
 static int owner_number(const struct kernel_async_io *async)
 {

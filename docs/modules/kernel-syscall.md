@@ -1,6 +1,6 @@
 # Linux 系统调用统一分派与通用系统接口
 
-系统调用是用户空间程序向操作系统内核请求服务的唯一受控入口。BoarOS 通过 `kernel/syscall/` 将**架构相关的寄存器约定**与**架构无关的系统调用语义**彻底解耦：RISC-V 64（`ECALL`，`a7` 传号、`a0..a5` 传参）与 LoongArch 64（`SYSCALL`，`$a7`/`regs[11]` 传号）的陷入代码将请求统一封装为 `struct kernel_syscall_request`，交由共享分派器执行，当前共覆盖 **RISC-V 273 个**、**LoongArch 269 个** Linux 系统调用编号。
+系统调用是用户空间程序向操作系统内核请求服务的唯一受控入口。BoarOS 通过 `kernel/syscall/` 将**架构相关的寄存器约定**与**架构无关的系统调用语义**彻底解耦：RISC-V 64（`ECALL`，`a7` 传号、`a0..a5` 传参）与 LoongArch 64（`SYSCALL`，`$a7`/`regs[11]` 传号）的陷入代码将请求统一封装为 `struct kernel_syscall_request`，交由共享分派器执行，当前共覆盖 **RISC-V 277 个**、**LoongArch 273 个** Linux 系统调用编号。
 
 ---
 
@@ -33,7 +33,7 @@ flowchart LR
 
 - **高频标量快路径（编号 172～178）**：`getpid`、`getppid`、`gettid`、`getuid`、`geteuid`、`getgid`、`getegid` 这 7 个极高频无副作用查询在 `kernel_syscall_dispatch()` 中直接读取当前任务身份或不可变凭据指针返回，跳过大型主分派表路由。
 - **架构解耦的动作返回机制（`enum kernel_syscall_action`）**：分派器不直接操作底层寄存器帧，而是返回明确的动作码指导架构陷入层完成收尾——包括 `RETURN`（普通写回返回值）、`RETURN_FINAL`、`EXIT` / `EXIT_GROUP`（终止线程或进程组）、`EXEC`（装载新地址空间且不推进旧程序计数器）、`CLONE` / `CLONE3`（传递完整寄存器快照构造子任务）、`WAIT4` / `WAITID`、`YIELD` 与 `SIGNAL_RETURN`。
-- **双架构差异的 4 个系统调用**：RISC-V 额外提供 `163`（`getrlimit`）、`164`（`setrlimit`）、`258`（`riscv_hwprobe`）与 `259`（`riscv_flush_icache`）；其余 269 个编号两架构完全共享（LoongArch 统一使用现代 `prlimit64` 查询和修改资源限额）。
+- **双架构差异的 4 个系统调用**：RISC-V 额外提供 `163`（`getrlimit`）、`164`（`setrlimit`）、`258`（`riscv_hwprobe`）与 `259`（`riscv_flush_icache`）；其余 273 个编号两架构完全共享（LoongArch 统一使用现代 `prlimit64` 查询和修改资源限额）。
 
 ---
 
@@ -72,7 +72,7 @@ flowchart LR
 | **事件、锁与通知** | `epoll_*` / `ppoll` / `pselect6` / `pipe2` / `eventfd2` / `timerfd_*` / `signalfd4` / `inotify_*` / `fanotify_*` / `flock` / `fcntl` | [文件资源与 I/O](kernel-files.md) |
 | **网络与套接字** | `socket` / `socketpair` / `bind` / `listen` / `accept4` / `connect` / `sendmsg` / `sendmmsg` / `recvmmsg` / `setsockopt` | [多核网络协议栈](kernel-network.md) · [rtnetlink](../network-rtnetlink.md) |
 | **信号、时钟与 IPC** | `rt_sigaction` / `rt_sigprocmask` / `rt_sigreturn` / `sigaltstack` / `clock_gettime` / `clock_nanosleep` / `timer_*` / `adjtimex` / SysV & POSIX IPC | [信号](kernel-signal.md) · [时钟与定时器](kernel-time.md) |
-| **安全、命名空间与观测** | `setuid*` / `capset` / `prctl` / `seccomp` / `unshare` / `setns` / `bpf` / `perf_event_open` / `membarrier` | [BPF 过滤与跟踪](kernel-bpf.md) · [成本观测](kernel-cost.md) |
+| **安全、命名空间与观测** | `setuid*` / `capset` / `add_key` / `request_key` / `keyctl` / `acct` / `prctl` / `seccomp` / `unshare` / `setns` / `bpf` / `perf_event_open` / `membarrier` | [进程与凭据](kernel-scheduler.md) · [BPF 过滤与跟踪](kernel-bpf.md) |
 
 ---
 

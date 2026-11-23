@@ -4,6 +4,7 @@
 #endif
 
 #include <kernel/cost.h>
+#include <kernel/process_acct.h>
 #include <kernel/seccomp.h>
 #include <kernel/task_state.h>
 #include <kernel/errno.h>
@@ -27,6 +28,7 @@
 #define LINUX_SYSCALL_STATFS 43U
 #define LINUX_SYSCALL_FSTATFS 44U
 #define LINUX_SYSCALL_UTIMENSAT 88U
+#define LINUX_SYSCALL_ACCT 89U
 #define LINUX_SYSCALL_FCHMOD 52U
 #define LINUX_SYSCALL_FCHMODAT 53U
 #define LINUX_SYSCALL_FCHOWNAT 54U
@@ -399,6 +401,9 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
     } else if (request->number == LINUX_SYSCALL_UTIMENSAT) {
         if (syscall_handle_utimensat(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == LINUX_SYSCALL_ACCT) {
+        decoded.action = KERNEL_SYSCALL_ACTION_RETURN;
+        decoded.value = kernel_process_acct_set(caller, request->arguments[0]);
     } else if (request->number == LINUX_SYSCALL_UMASK) {
         if (syscall_handle_umask(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK)
@@ -799,6 +804,9 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
+    } else if (request->number >= 217U && request->number <= 219U) {
+        if (syscall_handle_keys(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_CLONE) {
         /* The legacy syscall consumes only the low 32 flag bits; libc's
          * signed int CLONE_IO argument may be sign-extended in registers. */
