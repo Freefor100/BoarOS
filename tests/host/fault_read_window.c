@@ -9,7 +9,7 @@
 static _Thread_local unsigned window_allocate_actor,window_allocate_count;
 static unsigned window_allocate_entered,window_allocate_resume;
 static _Thread_local unsigned window_pause_after_get;
-static _Thread_local unsigned window_fault_get_calls;
+static _Thread_local unsigned window_fault_get_calls,window_fault_try_get_calls;
 static _Thread_local unsigned window_pause_ready_descriptor;
 static unsigned window_ready_entered,window_ready_resume;
 static unsigned window_get_entered,window_get_resume;
@@ -86,6 +86,7 @@ int __wrap_kernel_open_file_try_prepare_disk_mapping_page(struct kernel_open_fil
 {
     /* The slow-path race pauses after the blocking lookup has taken its
      * reference. Exercise that route even when a cached page could go fast. */
+    window_fault_try_get_calls++;
     return window_pause_after_get ? 0 :
         __real_kernel_open_file_try_prepare_disk_mapping_page(file,index,prepared);
 }
@@ -533,6 +534,34 @@ static void window_mm_ready_gate(struct kernel_page_cache *cache,struct kernel_h
     }
     demand_idle(cache,0);
     puts("PASS READY private faults preserve the existing MM qualification; descriptor fallback retains the acquired page");
+}
+static void window_mm_ready_batch(struct kernel_page_cache *cache,struct kernel_heap *heap,
+    struct physical_page_allocator *pages,struct kernel_open_file_description *file)
+{
+    const uint64_t base=0x400000,p=BOAROS_PAGE_SIZE;
+    window_ready_pair(cache,file);
+    struct kernel_open_file_page_preparation prepared={0};
+    assert(!kernel_open_file_prepare_mapping_page(file,2,0,&prepared));
+    kernel_open_file_finish_mapping_page(file,&prepared,0);
+    struct window_mm view={0};window_mm_create(&view,heap,pages);
+    window_map(&view,file,base,3*p);
+    assert(!kernel_mm_madvise(&view.mm,base,3*p,KERNEL_MM_ADVICE_RANDOM));
+    assert(window_mm_read(&view.mm,view.context,base)==0x30);
+    assert(!kernel_mm_madvise(&view.mm,base,3*p,KERNEL_MM_ADVICE_NORMAL));
+    unsigned scalar=window_fault_try_get_calls,reads=source_reads;
+    mm_test_bind(&view.mm);mm_test_context=view.context;
+    assert(!kernel_mm_resolve_user_fault(&view.mm,base+2*p,KERNEL_MM_READ));
+    mm_test_bind(NULL);mm_test_context=0;
+    struct kernel_mm_mapping mapping;
+    assert(!kernel_mm_lookup(&view.mm,base+p,&mapping) &&
+        (mapping.permissions&(KERNEL_MM_READ|KERNEL_MM_WRITE|KERNEL_MM_EXECUTE))==KERNEL_MM_READ);
+    assert(window_mm_read(&view.mm,view.context,base+p)==0x31);
+    assert(window_mm_read(&view.mm,view.context,base+2*p)==0x32 && source_reads==reads);
+    unsigned scalar_calls=window_fault_try_get_calls-scalar;
+    printf("READY private demand and neighbour: scalar lookups=%u backend reads=%u\n",
+        scalar_calls,source_reads-reads);
+    assert(!scalar_calls && "a READY private window must carry the demand without a scalar lookup");
+    window_mm_close(&view,pages);demand_idle(cache,0);
 }
 struct window_hot_lookup {
     struct kernel_page_cache *cache;
@@ -1023,6 +1052,7 @@ int main(int argc,char **argv)
     window_stop(&cache,file);
     window_mm_faultaround(&cache,&heap,&pages,file);
     window_mm_ready_gate(&cache,&heap,&pages,file);
+    window_mm_ready_batch(&cache,&heap,&pages,file);
     window_mm_faultaround_policy(&cache,&heap,&pages,file);
     window_mm_faultaround_existing(&cache,&heap,&pages,file);
     window_mm_faultaround_oom(&cache,&heap,&pages,file);

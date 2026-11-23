@@ -335,6 +335,35 @@ static void fork_cow(void)
     assert(!kernel_mm_lookup(&mm[0], address, &child_mapping));
     assert(parent_mapping.physical_address == child_mapping.physical_address); /* 最后引用原地恢复。 */
 }
+
+static void anonymous_zero_aliases(void)
+{
+    const uint64_t page = BOAROS_PAGE_SIZE;
+    uint64_t base;
+    assert(!kernel_mm_mmap_anonymous(&mm[0], 0x62000000, 16 * page,
+        KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED, &base));
+    assert(!kernel_mm_resolve_user_fault(&mm[0], base, KERNEL_MM_READ));
+    assert(!kernel_mm_resolve_user_fault(&mm[0], base + 2 * page, KERNEL_MM_READ));
+    struct kernel_mm_mapping first, neighbour;
+    assert(!kernel_mm_lookup(&mm[0], base, &first));
+    assert(!kernel_mm_lookup(&mm[0], base + 2 * page, &neighbour));
+    assert(first.physical_address == neighbour.physical_address);
+    assert(!(neighbour.permissions & KERNEL_MM_WRITE));
+
+    assert(!kernel_mm_fork(&child, &mm[0]));
+    assert(!kernel_mm_context(&child, &child_context));
+    size_t copied;
+    unsigned char value = 0x3a;
+    assert(!kernel_copy_to_user(&mm[0], base, &value, 1, &copied) && copied == 1);
+    assert(!kernel_copy_from_user(&mm[0], &value, base + 2 * page, 1, &copied) && value == 0);
+    mm_test_context = child_context;
+    assert(!kernel_copy_from_user(&child, &value, base, 1, &copied) && value == 0);
+    mm_test_context = context;
+    assert(!kernel_mm_release(&child));
+    child = (struct kernel_mm){0};
+    assert(!kernel_mm_munmap(&mm[0], base, 16 * page));
+    puts("MM read faults share zero backing with isolated writes and fork");
+}
 static void *race_fault(void *argument)
 {
     unsigned id = (unsigned)(uintptr_t)argument;
@@ -756,6 +785,7 @@ int main(void)
     self_pin_fault();
     fault_candidates();
     fork_cow();
+    anonymous_zero_aliases();
     retirement();
 #else
     assert(!kernel_mm_munmap(&mm[0], address, BOAROS_PAGE_SIZE));

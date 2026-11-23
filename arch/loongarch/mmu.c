@@ -62,7 +62,7 @@ void la_mmu_initialize(void)
 }
 static struct arch_mmu_user_space kernel_window;
 int arch_mmu_kernel_window_active(void) { return kernel_window.root_address!=0; }
-static uint64_t *table(struct arch_mmu_user_space *s, uint64_t address)
+static uint64_t *table(const struct arch_mmu_user_space *s, uint64_t address)
 {
     void *p;
     if (!address || (address&BOAROS_PAGE_MASK) || physical_page_map_owned(s->allocator,address,&p)!=PHYSICAL_PAGE_STATUS_OK)
@@ -70,27 +70,33 @@ static uint64_t *table(struct arch_mmu_user_space *s, uint64_t address)
     return p;
 }
 static int live(const struct arch_mmu_user_space *s)
-{ return s && s->state==ARCH_MMU_USER_SPACE_LIVE && s->allocator && s->root_address && s->table_pages; }
-static enum arch_mmu_status allocate_table(struct arch_mmu_user_space *s, uint64_t *address)
+{ return s && s->state==ARCH_MMU_USER_SPACE_LIVE && s->allocator && s->root_entries && s->table_pages; }
+static enum arch_mmu_status allocate_table(struct arch_mmu_user_space *s,
+    uint64_t *address, uint64_t **entries)
 {
     if (physical_page_allocate(s->allocator,address)!=PHYSICAL_PAGE_STATUS_OK) return ARCH_MMU_STATUS_NO_MEMORY;
-    memset(table(s,*address),0,BOAROS_PAGE_SIZE); s->table_pages++; return ARCH_MMU_STATUS_OK;
+    uint64_t *words = table(s, *address);
+    memset(words, 0, BOAROS_PAGE_SIZE);
+    if (entries) *entries = words;
+    s->table_pages++;
+    return ARCH_MMU_STATUS_OK;
 }
 enum arch_mmu_status la_mmu_kernel_window_initialize(struct physical_page_allocator *a)
 {
     if(!a)return ARCH_MMU_STATUS_INVALID;
     if(kernel_window.root_address)return ARCH_MMU_STATUS_STATE;
     struct arch_mmu_user_space candidate={.allocator=a,.state=ARCH_MMU_USER_SPACE_LIVE};
-    enum arch_mmu_status status=allocate_table(&candidate,&candidate.root_address);
+    enum arch_mmu_status status=allocate_table(&candidate,&candidate.root_address,&candidate.root_entries);
     uint64_t middle=0;
-    if(status==ARCH_MMU_STATUS_OK)status=allocate_table(&candidate,&middle);
+    uint64_t *middle_entries;
+    if(status==ARCH_MMU_STATUS_OK)status=allocate_table(&candidate,&middle,&middle_entries);
     if(status==ARCH_MMU_STATUS_OK) {
-        table(&candidate,candidate.root_address)[(ARCH_KERNEL_STACK_WINDOW_BASE>>36)&(ENTRIES-1)]=middle;
+        candidate.root_entries[(ARCH_KERNEL_STACK_WINDOW_BASE>>36)&(ENTRIES-1)]=middle;
         for(uint64_t offset=0;offset<ARCH_KERNEL_STACK_WINDOW_SIZE;offset+=UINT64_C(1)<<25) {
             uint64_t child;
-            status=allocate_table(&candidate,&child);
+            status=allocate_table(&candidate,&child,NULL);
             if(status!=ARCH_MMU_STATUS_OK)break;
-            table(&candidate,middle)[((ARCH_KERNEL_STACK_WINDOW_BASE+offset)>>25)&(ENTRIES-1)]=child;
+            middle_entries[((ARCH_KERNEL_STACK_WINDOW_BASE+offset)>>25)&(ENTRIES-1)]=child;
         }
     }
     if(status!=ARCH_MMU_STATUS_OK) {
@@ -115,7 +121,7 @@ static enum arch_mmu_status kernel_slot(struct physical_page_allocator *a,uint64
     if(v<ARCH_KERNEL_STACK_WINDOW_BASE || v-ARCH_KERNEL_STACK_WINDOW_BASE>=ARCH_KERNEL_STACK_WINDOW_SIZE ||
        (v&BOAROS_PAGE_MASK) || (v-ARCH_KERNEL_STACK_WINDOW_BASE)%ARCH_KERNEL_STACK_SLOT_SIZE<BOAROS_PAGE_SIZE)
         return ARCH_MMU_STATUS_INVALID;
-    uint64_t root=table(&kernel_window,kernel_window.root_address)[(v>>36)&(ENTRIES-1)];
+    uint64_t root=kernel_window.root_entries[(v>>36)&(ENTRIES-1)];
     uint64_t leaf=table(&kernel_window,root)[(v>>25)&(ENTRIES-1)];
     *slot=&table(&kernel_window,leaf)[(v>>14)&(ENTRIES-1)];return ARCH_MMU_STATUS_OK;
 }
@@ -190,14 +196,14 @@ static enum arch_mmu_status walk_order(struct arch_mmu_user_space *s, uint64_t v
 {
     if (!live(s) || v >= ARCH_MMU_USER_LIMIT || !supported_order(order))
         return ARCH_MMU_STATUS_INVALID;
-    uint64_t *current = table(s, s->root_address);
+    uint64_t *current = s->root_entries;
     unsigned stop = order ? 1 : 0;
     for (unsigned level = 2; level > stop; level--) {
         unsigned index = (v >> (14 + level * 11)) & (ENTRIES - 1);
         if (!current[index]) {
             if (!create) return ARCH_MMU_STATUS_NOT_MAPPED;
             uint64_t physical;
-            enum arch_mmu_status status = allocate_table(s, &physical);
+            enum arch_mmu_status status = allocate_table(s, &physical, NULL);
             if (status) return status;
             __atomic_store_n(&current[index], physical, __ATOMIC_RELEASE);
         }
@@ -213,12 +219,11 @@ static enum arch_mmu_status walk_order(struct arch_mmu_user_space *s, uint64_t v
 static enum arch_mmu_status walk(struct arch_mmu_user_space *s, uint64_t v,
     int create, uint64_t **slot)
 { return walk_order(s, v, 0, create, slot); }
-static enum arch_mmu_status walk_leaf(const struct arch_mmu_user_space *space,
+static enum arch_mmu_status walk_leaf(const struct arch_mmu_user_space *s,
     uint64_t v, uint64_t **slot, uint32_t *order)
 {
-    struct arch_mmu_user_space *s = (struct arch_mmu_user_space *)space;
     if (!live(s) || v >= ARCH_MMU_USER_LIMIT) return ARCH_MMU_STATUS_INVALID;
-    uint64_t *current = table(s, s->root_address);
+    uint64_t *current = s->root_entries;
     for (unsigned level = 2;; level--) {
         uint64_t *entry = &current[(v >> (14 + level * 11)) & (ENTRIES - 1)];
         if (!*entry) { *slot=entry;*order=level*HUGE_ORDER;return ARCH_MMU_STATUS_NOT_MAPPED; }
@@ -233,9 +238,10 @@ static enum arch_mmu_status walk_leaf(const struct arch_mmu_user_space *space,
         current = table(s, *entry);
     }
 }
-enum arch_mmu_status arch_mmu_user_leaf_probe(const struct arch_mmu_user_space *s,
-    uint64_t v, struct kernel_mm_leaf *out, unsigned *missing_tables)
+enum arch_mmu_status arch_mmu_user_leaf_probe_slot(const struct arch_mmu_user_space *s,
+    uint64_t v, struct kernel_mm_leaf *out, unsigned *missing_tables, uint64_t **base_slot)
 {
+    if (base_slot) *base_slot = NULL;
     if (!out) return ARCH_MMU_STATUS_INVALID;
     uint64_t *slot; uint32_t order;
     enum arch_mmu_status status = walk_leaf(s, v, &slot, &order);
@@ -245,13 +251,19 @@ enum arch_mmu_status arch_mmu_user_leaf_probe(const struct arch_mmu_user_space *
         else if (status==ARCH_MMU_STATUS_OK) *missing_tables=0;
     }
     if (status) return status;
+    if (base_slot && !order) *base_slot = slot;
+    uint64_t entry = *slot;
     *out = (struct kernel_mm_leaf){
         .virtual_address = v & ~(leaf_size(order) - 1),
-        .physical_address = *slot & PTE_ADDRESS, .cookie = *slot,
-        .permissions = leaf_permissions(*slot), .order = order,
-        .cow = !!(*slot & PTE_COW)};
+        .physical_address = entry & PTE_ADDRESS, .cookie = entry,
+        .permissions = leaf_permissions(entry), .order = order,
+        .cow = !!(entry & PTE_COW)};
     return ARCH_MMU_STATUS_OK;
 }
+
+enum arch_mmu_status arch_mmu_user_leaf_probe(const struct arch_mmu_user_space *s,
+    uint64_t v, struct kernel_mm_leaf *out, unsigned *missing_tables)
+{ return arch_mmu_user_leaf_probe_slot(s,v,out,missing_tables,NULL); }
 
 enum arch_mmu_status arch_mmu_user_leaf_snapshot(const struct arch_mmu_user_space *s,
     uint64_t v, struct kernel_mm_leaf *out)
@@ -279,7 +291,7 @@ enum arch_mmu_status arch_mmu_user_leaf_missing_order(struct arch_mmu_user_space
     if (!live(s) || !mask || !supported_order(order) ||
         (v & (leaf_size(order) - 1)) || v < BOAROS_PAGE_SIZE ||
         v >= ARCH_MMU_USER_LIMIT) return ARCH_MMU_STATUS_INVALID;
-    uint64_t middle = table(s, s->root_address)[(v >> 36) & (ENTRIES - 1)];
+    uint64_t middle = s->root_entries[(v >> 36) & (ENTRIES - 1)];
     if (!middle) { *mask = order ? 1 : 3; return ARCH_MMU_STATUS_OK; }
     if (!directory_entry(middle)) return ARCH_MMU_STATUS_STATE;
     uint64_t leaf = table(s, middle)[(v >> 25) & (ENTRIES - 1)];
@@ -301,7 +313,7 @@ static enum arch_mmu_status install_prepared_leaf(struct arch_mmu_user_space *s,
     if (!live(s) || !prepared || !supported_order(order) ||
         (v & (leaf_size(order) - 1)) || v < BOAROS_PAGE_SIZE ||
         v >= ARCH_MMU_USER_LIMIT) return ARCH_MMU_STATUS_INVALID;
-    uint64_t *root = table(s, s->root_address);
+    uint64_t *root = s->root_entries;
     unsigned r = (v >> 36) & (ENTRIES - 1), m = (v >> 25) & (ENTRIES - 1);
     uint64_t middle_address=root[r];
     if (middle_address && !directory_entry(middle_address)) return ARCH_MMU_STATUS_STATE;
@@ -399,6 +411,36 @@ enum arch_mmu_status arch_mmu_user_cow_snapshot(struct arch_mmu_user_space *s,
     *cookie = *slot; *physical = *slot & PTE_ADDRESS;
     return ARCH_MMU_STATUS_OK;
 }
+static enum arch_mmu_status store_cow_leaf(struct arch_mmu_user_space *s, uint64_t *slot,
+    uint64_t old, uint64_t target, uint32_t permissions, uint32_t order)
+{
+    uint32_t pages = 1U << order;
+    if ((old & PTE_NONE) && permissions) {
+        if (s->protected_pages < pages || s->leaf_pages > UINT32_MAX-pages) return ARCH_MMU_STATUS_STATE;
+        s->protected_pages -= pages;
+        s->leaf_pages += pages;
+    }
+    if (!(old & PTE_NONE) && !permissions) {
+        if (s->leaf_pages < pages || s->protected_pages > UINT32_MAX-pages) return ARCH_MMU_STATUS_STATE;
+        s->leaf_pages -= pages;
+        s->protected_pages += pages;
+    }
+    __atomic_store_n(slot, encode(target, permissions, 0) | (order ? PTE_HUGE : 0), __ATOMIC_RELEASE);
+    s->cow_pages -= pages;
+    return ARCH_MMU_STATUS_OK;
+}
+enum arch_mmu_status arch_mmu_user_cow_upgrade(struct arch_mmu_user_space *s,
+    uint64_t *slot, uint64_t cookie, uint32_t permissions)
+{
+    if (!slot || (permissions & ~7U)) return ARCH_MMU_STATUS_INVALID;
+    uint64_t actual = *slot;
+    if (actual != cookie) return ARCH_MMU_STATUS_CONFLICT;
+    if (!(actual & PTE_COW)) return ARCH_MMU_STATUS_NOT_MAPPED;
+    if (!s->cow_pages) return ARCH_MMU_STATUS_STATE;
+    enum arch_mmu_status status = store_cow_leaf(s, slot, actual, actual & PTE_ADDRESS, permissions, 0);
+    if (!status) s->cow_in_place++;
+    return status;
+}
 enum arch_mmu_status arch_mmu_user_cow_commit_order(struct arch_mmu_user_space *s, uint64_t v,
     uint64_t cookie, uint64_t replacement, uint32_t permissions, uint32_t order,
     struct kernel_mm_retirement *batch)
@@ -423,17 +465,9 @@ enum arch_mmu_status arch_mmu_user_cow_commit_order(struct arch_mmu_user_space *
     } else if (!physical_page_owned_order(s->allocator, replacement, order)) {
         return ARCH_MMU_STATUS_INVALID;
     }
-    if ((actual & PTE_NONE) && permissions) {
-        if (s->protected_pages < pages || s->leaf_pages > UINT32_MAX-pages) return ARCH_MMU_STATUS_STATE;
-        s->protected_pages -= pages; s->leaf_pages += pages;
-    }
-    if (!(actual & PTE_NONE) && !permissions) {
-        if (s->leaf_pages < pages || s->protected_pages > UINT32_MAX-pages) return ARCH_MMU_STATUS_STATE;
-        s->leaf_pages -= pages; s->protected_pages += pages;
-    }
-    __atomic_store_n(slot, encode(replacement == KERNEL_MM_NO_PAGE ? physical : replacement,
-        permissions, 0) | (order ? PTE_HUGE : 0), __ATOMIC_RELEASE);
-    s->cow_pages -= pages;
+    uint64_t target = replacement == KERNEL_MM_NO_PAGE ? physical : replacement;
+    status = store_cow_leaf(s, slot, actual, target, permissions, order);
+    if (status) return status;
     if (replacement != KERNEL_MM_NO_PAGE) {
         s->cow_copies++; kernel_mm_retirement_add_order(batch, physical, order, 0);
     } else s->cow_in_place++;
@@ -450,7 +484,7 @@ enum arch_mmu_status arch_mmu_user_next_owned(struct arch_mmu_user_space *s,
     if (*cursor == end) return ARCH_MMU_STATUS_NOT_MAPPED;
     unsigned first_r = *cursor >> 36, first_m = (*cursor >> 25) & (ENTRIES - 1);
     unsigned first_l = (*cursor >> 14) & (ENTRIES - 1);
-    uint64_t *root = table(s, s->root_address);
+    uint64_t *root = s->root_entries;
     for (unsigned r = first_r; r < ENTRIES && ((uint64_t)r << 36) < end; r++) {
         if (!root[r]) continue;
         if (!directory_entry(root[r])) return ARCH_MMU_STATUS_STATE;
@@ -589,9 +623,10 @@ enum arch_mmu_status arch_mmu_user_space_init(struct arch_mmu_user_space *s,
 {
     if (!s || !a || !kernel || kernel->allocator!=a || kernel->state!=ARCH_MMU_STATE_ACTIVE)
         return ARCH_MMU_STATUS_INVALID;
-    if (s->state!=ARCH_MMU_USER_SPACE_EMPTY || s->allocator || s->root_address) return ARCH_MMU_STATUS_STATE;
+    if (s->state!=ARCH_MMU_USER_SPACE_EMPTY || s->allocator || s->root_address || s->root_entries)
+        return ARCH_MMU_STATUS_STATE;
     struct arch_mmu_user_space candidate={.allocator=a,.state=ARCH_MMU_USER_SPACE_LIVE};
-    enum arch_mmu_status status=allocate_table(&candidate,&candidate.root_address);
+    enum arch_mmu_status status=allocate_table(&candidate,&candidate.root_address,&candidate.root_entries);
     if (status==ARCH_MMU_STATUS_OK) *s=candidate;
     return status;
 }
@@ -683,7 +718,7 @@ enum arch_mmu_status arch_mmu_user_detach_range(
     }
     /* MM metadata protection keeps these table pages owned for this call;
      * detached pages are not released until after the caller drops it. */
-    uint64_t *root=table(s,s->root_address), *middle=0, *leaves=0;
+    uint64_t *root=s->root_entries, *middle=0, *leaves=0;
     uint64_t middle_physical=0, leaf_physical=0;
     unsigned visits=0;
     while (visits<16 && batch->count<=KERNEL_MM_RETIRE_CAPACITY-3) {
@@ -886,7 +921,8 @@ enum arch_mmu_status arch_mmu_user_space_context(const struct arch_mmu_user_spac
 enum arch_mmu_status arch_mmu_user_space_move(struct arch_mmu_user_space *to,struct arch_mmu_user_space *from)
 {
     if (!to || to==from || !live(from)) return ARCH_MMU_STATUS_INVALID;
-    if (to->state!=ARCH_MMU_USER_SPACE_EMPTY || to->allocator || to->root_address) return ARCH_MMU_STATUS_STATE;
+    if (to->state!=ARCH_MMU_USER_SPACE_EMPTY || to->allocator || to->root_address || to->root_entries)
+        return ARCH_MMU_STATUS_STATE;
     *to=*from; *from=(struct arch_mmu_user_space){.state=ARCH_MMU_USER_SPACE_MOVED}; return ARCH_MMU_STATUS_OK;
 }
 enum arch_mmu_status arch_mmu_user_space_destroy(struct arch_mmu_user_space *s)
