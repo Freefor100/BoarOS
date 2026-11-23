@@ -230,8 +230,9 @@ struct kernel_socket {
 #if BOAROS_USER_SMP
     unsigned tcp_cpu;
     uint16_t tcp_prepare_mss;
-    uint8_t udp_output_active, tcp_loopback;
+    uint8_t udp_output_active;
 #endif
+    uint8_t tcp_loopback;
 };
 
 /* Link-level taps and their bind configuration share the IP qualification.
@@ -2820,9 +2821,7 @@ static err_t tcp_connected(void *context, struct tcp_pcb *pcb, err_t error)
     socket->connecting = 0U;
     socket->connected = error == ERR_OK;
     if (error == ERR_OK) {
-#if BOAROS_USER_SMP
         socket->tcp_loopback=pcb->boaros_loopback;
-#endif
         address_export(socket, &pcb->local_ip, pcb->local_port, &socket->saved_local);
         address_export(socket, &pcb->remote_ip, pcb->remote_port, &socket->saved_peer);
     }
@@ -3023,9 +3022,7 @@ static err_t socket_tcp_accepted(void *context, struct tcp_pcb *pcb,
     if (child->nodelay) tcp_nagle_disable(pcb);
     pcb->boaros_cork = child->cork;
     child->connected = 1U;
-#if BOAROS_USER_SMP
     child->tcp_loopback=pcb->boaros_loopback;
-#endif
     address_export(child, &pcb->local_ip, pcb->local_port, &child->saved_local);
     address_export(child, &pcb->remote_ip, pcb->remote_port, &child->saved_peer);
     kernel_wait_queue_init(&child->wait);kernel_wait_queue_init(&child->async_events);
@@ -3246,6 +3243,23 @@ static void retire_received(struct kernel_socket *socket)
         u16_t part = credit > UINT16_MAX ? UINT16_MAX : (u16_t)credit;
         tcp_recved(socket->tcp, part); credit -= part;
     }
+}
+
+/* The serial NIC path can return credit and receive buffers before the
+ * reader gives up its OFD pin. A contended owner keeps the queued path. */
+static __attribute__((noinline)) int try_retire_received(struct kernel_socket *socket, int need_input)
+{
+    struct kernel_socket_protocol_scope scope;
+    if (!protocol_enter(&scope, 1, 1)) return 0;
+    if (socket->receive_retry || network_is_stopping()) {
+        kernel_socket_protocol_leave(&scope);
+        return 0;
+    }
+    retire_received(socket);
+    if (need_input && scope.outer && network_receive_inline)
+        (void)network_receive_inline(network_context);
+    kernel_socket_protocol_leave(&scope);
+    return 1;
 }
 
 /* A pending child can be destroyed recursively. Keep the UNIX graph and
@@ -4511,11 +4525,25 @@ uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request, i
         }
 #endif
         if (needs_reap && (socket->receive_credit || socket->retired_head)) {
-            /* Publish the first retirement before clearing the request. Stop
-             * drains both under the endpoint lock; callbacks must see neither lock. */
-            KERNEL_IRQ_LOCK_SCOPE(work,&socket_state_lock);
-            unsigned flags=SOCKET_WORK_REAP | (socket->receive_retry?SOCKET_WORK_RECEIVE:0);
-            socket_schedule_locked(socket,flags,scope.owner);
+            if (kernel_socket_is_tcp(socket) && !boaros_lwip_parallel_enabled() &&
+                !socket->tcp_loopback && !socket->receive_retry && !network_is_stopping() &&
+                !kernel_io_context_inline()->locks) {
+                /* Splice still holds its pipe write lease here. Leave the
+                 * credit and NIC work to the existing protocol owner. */
+                int need_input = !socket->packets_head && !socket->peer_closed &&
+                    !socket->read_closed && !socket->pending_error;
+                socket_state_release(&scope);
+                int done = try_retire_received(socket, need_input);
+                socket_state_acquire_lock(&scope,socket_endpoint_lock(socket));
+                if (done) needs_reap = 0;
+            }
+            if (needs_reap && (socket->receive_credit || socket->retired_head)) {
+                /* Publish the first retirement before clearing the request. Stop
+                 * drains both under the endpoint lock; callbacks must see neither lock. */
+                KERNEL_IRQ_LOCK_SCOPE(work,&socket_state_lock);
+                unsigned flags=SOCKET_WORK_REAP | (socket->receive_retry?SOCKET_WORK_RECEIVE:0);
+                socket_schedule_locked(socket,flags,scope.owner);
+            }
         }
         if (retired) {
             /* During a UDP burst the reader returns buffers while more

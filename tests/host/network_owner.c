@@ -510,6 +510,9 @@ int virtio_net_send_segments(struct virtio_net_device *device,
 #endif
     return -KERNEL_ENOTSUP;
 }
+int virtio_net_tx_reclaim(struct virtio_net_device *device,
+    void (*release)(void *const *, unsigned))
+{ (void)device; (void)release; return 0; }
 void virtio_net_tx_flush(struct virtio_net_device *device)
 {
     (void)device;
@@ -3024,6 +3027,112 @@ static void retired_payload_free(struct pbuf *payload)
     CHECK(payload && protocol_owner == &test_context && protocol_depth && arch_interrupt_is_enabled());
     retired_payloads++;
 }
+static void *hold_tcp_receive_protocol(void *unused)
+{
+    (void)unused;
+    struct kernel_socket_protocol_scope scope;
+    kernel_socket_protocol_enter(&scope);
+    CHECK(!pthread_mutex_lock(&remote_gate));
+    remote_work = 1;
+    CHECK(!pthread_cond_broadcast(&remote_changed));
+    while (!remote_done) CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
+    CHECK(!pthread_mutex_unlock(&remote_gate));
+    kernel_socket_protocol_leave(&scope);
+    return NULL;
+}
+
+struct serial_receive_input {
+    struct kernel_socket *socket;
+    struct kernel_socket_read_request *request;
+    struct pbuf *payload;
+    unsigned calls;
+};
+
+static unsigned serial_receive_inline(void *context)
+{
+    struct serial_receive_input *input=context;
+    struct kernel_socket *socket=input->socket;
+    CHECK(input->calls++==0 && input->payload && !kernel_cpu_current()->raw_locks);
+    CHECK(protocol_current_owner()==&test_context && arch_interrupt_is_enabled());
+    CHECK(socket->read_request==input->request && input->request->pin==(void *)socket);
+    CHECK(retired_payloads==1 && !socket->rx_bytes && !socket->receive_credit &&
+          !socket->packets_head && !socket->retired_head && !socket->peer_closed);
+    CHECK(tcp_data_received(socket,socket->tcp,input->payload,ERR_OK)==ERR_OK);
+    input->payload=NULL;
+    CHECK(tcp_data_received(socket,socket->tcp,NULL,ERR_OK)==ERR_OK);
+    return 1;
+}
+
+static void serial_tcp_receive_credit(void)
+{
+#if BOAROS_USER_SMP
+    model_boot_cpus = 1;
+#endif
+    kernel_socket_network_initialize();
+    kernel_wait_queue_init(&model_work_queue);
+    struct kernel_socket_read_request request={0};
+    struct serial_receive_input input={.request=&request};
+    kernel_socket_network_hooks(NULL,&model_work_queue,NULL,serial_receive_inline,&input);
+    struct kernel_socket *socket=NULL;
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_STREAM,0,&socket));
+    socket->connected=1;
+    input.socket=socket;
+    struct tcp_pcb *pcb=socket->tcp;
+    struct kernel_socket_protocol_scope scope;
+    kernel_socket_protocol_enter(&scope);
+    uint32_t window=pcb->rcv_wnd;
+    pcb->rcv_ann_right_edge=window;
+    pcb->rcv_nxt=8;
+    pcb->rcv_wnd-=8;
+    struct pbuf_custom first={.custom_free_function=retired_payload_free};
+    struct pbuf_custom second={.custom_free_function=retired_payload_free};
+    unsigned char bytes[]="datafin!", out[4]={0};
+    struct pbuf *payload=pbuf_alloced_custom(PBUF_RAW,4,PBUF_REF,&first,bytes,4);
+    CHECK(payload && tcp_data_received(socket,pcb,payload,ERR_OK)==ERR_OK);
+    input.payload=pbuf_alloced_custom(PBUF_RAW,4,PBUF_REF,&second,bytes+4,4);
+    CHECK(input.payload && !socket->peer_closed);
+    kernel_socket_protocol_leave(&scope);
+
+    struct kernel_open_file_description *pin=(void *)socket;
+    struct kernel_socket_message peek={.flags=KERNEL_SOCKET_MSG_PEEK};
+    CHECK(kernel_socket_reserve_read(socket,NULL,&request,&pin,4,0,&peek)==4);
+    kernel_socket_copy_read(&request,0,out,4);
+    CHECK(kernel_socket_finish_read(&request,0)==4 && !memcmp(out,"data",4));
+    CHECK(!retired_payloads && !socket->receive_credit && socket->rx_bytes==4 && !input.calls);
+
+    CHECK(kernel_socket_reserve_read(socket,NULL,&request,&pin,4,0,NULL)==4);
+    CHECK(kernel_socket_finish_read(&request,1)==0);
+    CHECK(!retired_payloads && !socket->receive_credit && socket->rx_bytes==4 && !input.calls);
+    CHECK(kernel_socket_reserve_read(socket,NULL,&request,&pin,4,0,NULL)==4);
+    CHECK(kernel_socket_finish_read(&request,0)==4);
+    CHECK(retired_payloads==1 && !socket->receive_credit && !socket->retired_head &&
+          pcb->rcv_wnd==window-4 && !ready_work.head);
+    CHECK(input.calls==1 && !input.payload && socket->peer_closed && socket->rx_bytes==4);
+
+    pthread_t holder;
+    CHECK(!pthread_create(&holder,NULL,hold_tcp_receive_protocol,NULL));
+    CHECK(!pthread_mutex_lock(&remote_gate));
+    while (!remote_work) CHECK(!pthread_cond_wait(&remote_changed,&remote_gate));
+    CHECK(!pthread_mutex_unlock(&remote_gate));
+    CHECK(kernel_socket_reserve_read(socket,NULL,&request,&pin,4,0,NULL)==4);
+    kernel_socket_copy_read(&request,0,out,4);
+    CHECK(kernel_socket_finish_read(&request,0)==4 && !memcmp(out,"fin!",4));
+    CHECK(retired_payloads==1 && socket->receive_credit==4 && socket->retired_head &&
+          socket->work_flags==SOCKET_WORK_REAP && ready_work.head==socket && input.calls==1);
+    CHECK(!pthread_mutex_lock(&remote_gate));
+    remote_done=1;
+    CHECK(!pthread_cond_broadcast(&remote_changed) && !pthread_mutex_unlock(&remote_gate));
+    CHECK(!pthread_join(holder,NULL));
+
+    (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+    CHECK(retired_payloads==2 && !socket->retired_head && !socket->receive_credit &&
+          pcb->rcv_wnd==window && !ready_work.head);
+    CHECK(kernel_socket_reserve_read(socket,NULL,&request,&pin,4,0,NULL)==0 && !request.socket);
+    kernel_socket_destroy(socket);
+    CHECK(!heap_live);
+    puts("PASS serial TCP read: immediate credit, follow-on input, PEEK, copy fault, busy owner fallback and FIN");
+}
+
 static void endpoint_ownership(void)
 {
     kernel_socket_network_initialize();
@@ -6117,6 +6226,7 @@ int main(int argc, char **argv)
         tcp_passive_capacity_retry(1);
     }
     else if (!strcmp(argv[1], "tcp-loopback-checksum")) tcp_loopback_checksum();
+    else if (!strcmp(argv[1], "serial-tcp-credit")) serial_tcp_receive_credit();
     else if (!strcmp(argv[1], "tcp-ack-batch")) tcp_ack_receive_batch();
 #if BOAROS_USER_SMP
     else if (!strcmp(argv[1], "tcp-single-cpu-service")) tcp_single_cpu_service();
