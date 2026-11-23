@@ -213,10 +213,10 @@ enum riscv_sv39_status riscv_sv39_user_fork_commit_window(
 /* One base-leaf table. Transfer owned base-page references for returned
  * bits only, consuming the packed vector in increasing selected-bit order. */
 unsigned riscv_sv39_user_map_owned_window(struct riscv_sv39_user_space *, uint64_t,
-    unsigned, const uint64_t *, uint32_t, int cow);
+    unsigned, const uint64_t *, uint32_t, int flags);
 /* Publish the window only if its required demand slot is still empty. */
 unsigned riscv_sv39_user_map_required_window(struct riscv_sv39_user_space *, uint64_t,
-    unsigned, const uint64_t *, uint32_t, int cow, unsigned required_slot);
+    unsigned, const uint64_t *, uint32_t, int flags, unsigned required_slot);
 enum riscv_sv39_status riscv_sv39_user_mark_cow_page(
     struct riscv_sv39_user_space *, uint64_t);
 enum riscv_sv39_status riscv_sv39_user_space_fork_prepare(

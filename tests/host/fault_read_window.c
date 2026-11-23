@@ -10,11 +10,12 @@ static _Thread_local unsigned window_allocate_actor,window_allocate_count;
 static unsigned window_allocate_entered,window_allocate_resume;
 static _Thread_local unsigned window_pause_after_get;
 static _Thread_local unsigned window_fault_get_calls,window_fault_try_get_calls;
-static _Thread_local unsigned window_pause_ready_descriptor;
+static _Thread_local unsigned window_pause_ready_reference;
 static unsigned window_ready_entered,window_ready_resume;
 static unsigned window_get_entered,window_get_resume;
 static uint64_t window_get_address;
 static _Thread_local unsigned window_fail_nosleep,window_nosleep_failures;
+static _Thread_local unsigned window_batch_allocations;
 static _Thread_local struct {
     struct physical_page_allocator *pages;
     uint64_t *borrowed;
@@ -52,12 +53,6 @@ enum kernel_heap_status __wrap_kernel_heap_allocate_nosleep(struct kernel_heap *
 enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed_nosleep(struct kernel_heap *heap,
     size_t count,size_t size,void **out)
 {
-    if (window_pause_ready_descriptor) {
-        window_pause_ready_descriptor=0;
-        assert(kernel_io_context_current()->locks && !kernel_cpu_current()->raw_locks);
-        __atomic_store_n(&window_ready_entered,1,__ATOMIC_RELEASE);
-        wait_progress(&window_ready_resume,1);
-    }
     if (window_fail_nosleep) {
         window_nosleep_failures++;
         return KERNEL_HEAP_STATUS_EMPTY;
@@ -76,6 +71,7 @@ unsigned __wrap_kernel_heap_allocate_zeroed_batch_nosleep(struct kernel_heap *he
         return 0;
     }
     unsigned allocated = __real_kernel_heap_allocate_zeroed_batch_nosleep(heap, count, size, out);
+    window_batch_allocations += allocated;
     if (allocated) window_borrow_after_optional();
     return allocated;
 }
@@ -87,8 +83,15 @@ int __wrap_kernel_open_file_try_prepare_disk_mapping_page(struct kernel_open_fil
     /* The slow-path race pauses after the blocking lookup has taken its
      * reference. Exercise that route even when a cached page could go fast. */
     window_fault_try_get_calls++;
-    return window_pause_after_get ? 0 :
-        __real_kernel_open_file_try_prepare_disk_mapping_page(file,index,prepared);
+    if (window_pause_after_get) return 0;
+    int ready = __real_kernel_open_file_try_prepare_disk_mapping_page(file,index,prepared);
+    if (ready && window_pause_ready_reference) {
+        window_pause_ready_reference=0;
+        assert(kernel_io_context_current()->locks && !kernel_cpu_current()->raw_locks);
+        __atomic_store_n(&window_ready_entered,1,__ATOMIC_RELEASE);
+        wait_progress(&window_ready_resume,1);
+    }
+    return ready;
 }
 enum kernel_page_cache_status __real_kernel_page_cache_get_for_fault(struct kernel_page_cache *,
     const struct kernel_vfs_file *,uint64_t,uint64_t *,size_t *,int,int);
@@ -440,6 +443,15 @@ static void window_map(struct window_mm *view,struct kernel_open_file_descriptio
     assert(!kernel_mm_mmap_file_private(&view->mm,&source,address,length,0,KERNEL_MM_READ,
         KERNEL_MM_MAP_FIXED,&mapped) && !source && mapped==address);
 }
+static void window_map_shared(struct window_mm *view,struct kernel_open_file_description *file,
+    uint64_t address,uint64_t length)
+{
+    struct kernel_open_file_description *source=file;
+    uint64_t mapped;
+    assert(!kernel_open_file_acquire(source));
+    assert(!kernel_mm_mmap_file_private(&view->mm,&source,address,length,0,KERNEL_MM_READ,
+        KERNEL_MM_MAP_FIXED|KERNEL_MM_MAP_SHARED,&mapped) && !source && mapped==address);
+}
 static void expect_random(struct kernel_mm *mm,uint64_t address,int random)
 {
     struct kernel_vma vma;assert(!kernel_mm_vma_lookup(mm,address,&vma));
@@ -524,7 +536,7 @@ static void window_mm_ready_gate(struct kernel_page_cache *cache,struct kernel_h
     window_fail_nosleep=1;window_nosleep_failures=0;
     assert(window_mm_read(&view.mm,view.context,base+2*p)==0x32);
     window_fail_nosleep=0;
-    assert(window_nosleep_failures && window_fault_get_calls==ordinary && source_reads==reads);
+    assert(!window_nosleep_failures && window_fault_get_calls==ordinary && source_reads==reads);
     window_mm_close(&view,pages);
     for (unsigned i=0;i<3;i++) {
         uint64_t cached;size_t valid;uint32_t refs;
@@ -533,7 +545,7 @@ static void window_mm_ready_gate(struct kernel_page_cache *cache,struct kernel_h
         assert(!physical_page_release(pages,cached));
     }
     demand_idle(cache,0);
-    puts("PASS READY private faults preserve the existing MM qualification; descriptor fallback retains the acquired page");
+    puts("PASS scalar READY private faults retain the acquired page without allocating resident metadata");
 }
 static void window_mm_ready_batch(struct kernel_page_cache *cache,struct kernel_heap *heap,
     struct physical_page_allocator *pages,struct kernel_open_file_description *file)
@@ -549,6 +561,7 @@ static void window_mm_ready_batch(struct kernel_page_cache *cache,struct kernel_
     assert(window_mm_read(&view.mm,view.context,base)==0x30);
     assert(!kernel_mm_madvise(&view.mm,base,3*p,KERNEL_MM_ADVICE_NORMAL));
     unsigned scalar=window_fault_try_get_calls,reads=source_reads;
+    unsigned descriptors=window_batch_allocations;
     mm_test_bind(&view.mm);mm_test_context=view.context;
     assert(!kernel_mm_resolve_user_fault(&view.mm,base+2*p,KERNEL_MM_READ));
     mm_test_bind(NULL);mm_test_context=0;
@@ -558,10 +571,85 @@ static void window_mm_ready_batch(struct kernel_page_cache *cache,struct kernel_
     assert(window_mm_read(&view.mm,view.context,base+p)==0x31);
     assert(window_mm_read(&view.mm,view.context,base+2*p)==0x32 && source_reads==reads);
     unsigned scalar_calls=window_fault_try_get_calls-scalar;
-    printf("READY private demand and neighbour: scalar lookups=%u backend reads=%u\n",
-        scalar_calls,source_reads-reads);
+    printf("READY private demand and neighbour: scalar lookups=%u backend reads=%u descriptors=%u\n",
+        scalar_calls,source_reads-reads,window_batch_allocations-descriptors);
     assert(!scalar_calls && "a READY private window must carry the demand without a scalar lookup");
+    assert(window_batch_allocations==descriptors && "private READY pages need no resident descriptors");
     window_mm_close(&view,pages);demand_idle(cache,0);
+}
+
+static void window_mm_private_punch(struct kernel_heap *heap,
+    struct physical_page_allocator *pages, struct kernel_vfs_mount *mount)
+{
+    const uint64_t base = 0x400000, moved = 0x800000, p = BOAROS_PAGE_SIZE;
+    struct kernel_open_file_description *file = NULL;
+    int error;
+    assert(!kernel_open_file_create_mode(heap, mount, "/fault-punch", 0600, &file, &error) && !error);
+    file->open_flags = 2;
+    unsigned char bytes[BOAROS_PAGE_SIZE];
+    size_t copied;
+    memset(bytes, 0xa3, sizeof(bytes));
+    const uint64_t window = 65536;
+    for (unsigned i = 0; i < 4*window/p; i++)
+        assert(!kernel_vfs_pwrite(&file->file, i*p, bytes, sizeof(bytes), &copied) && copied == p);
+
+    struct window_mm parent = {0};
+    window_mm_create(&parent, heap, pages);
+    window_map(&parent, file, base, 4*window);
+    assert(!kernel_mm_madvise(&parent.mm, base, 4*window, KERNEL_MM_ADVICE_RANDOM));
+    assert(window_mm_read(&parent.mm, parent.context, base) == 0xa3);
+    assert(!kernel_mm_madvise(&parent.mm, base, 4*window, KERNEL_MM_ADVICE_NORMAL));
+    struct kernel_mm_mapping mapping;
+    mm_test_bind(&parent.mm); mm_test_context = parent.context;
+    assert(!kernel_mm_resolve_user_fault(&parent.mm, base+window, KERNEL_MM_READ));
+    mm_test_bind(NULL); mm_test_context = 0;
+    assert(window_mm_read(&parent.mm, parent.context, base+window) == 0xa3);
+    assert(kernel_mm_lookup(&parent.mm, base+2*window, &mapping) == KERNEL_MM_STATUS_NOT_MAPPED);
+    mm_test_bind(&parent.mm); mm_test_context = parent.context;
+    assert(!kernel_mm_resolve_user_fault(&parent.mm, base+2*window, KERNEL_MM_READ));
+    mm_test_bind(NULL); mm_test_context = 0;
+    assert(window_mm_read(&parent.mm, parent.context, base+2*window) == 0xa3);
+    assert(!kernel_mm_lookup(&parent.mm, base+3*window, &mapping));
+    assert(kernel_mm_lookup(&parent.mm, base+4*window, &mapping) == KERNEL_MM_STATUS_NOT_MAPPED);
+    assert(!kernel_mm_munmap(&parent.mm, base, 4*window));
+
+    window_map(&parent, file, base, 2*p);
+    assert(!kernel_mm_mprotect(&parent.mm, base, 2*p, KERNEL_MM_READ|KERNEL_MM_WRITE));
+    assert(window_mm_read(&parent.mm, parent.context, base) == 0xa3);
+    assert(window_mm_read(&parent.mm, parent.context, base+p) == 0xa3);
+    mm_test_bind(&parent.mm); mm_test_context = parent.context;
+    unsigned char private = 0x73;
+    assert(!kernel_copy_to_user(&parent.mm, base+p, &private, 1, &copied) && copied == 1);
+    mm_test_bind(NULL); mm_test_context = 0;
+    uint64_t result;
+    assert(!kernel_mm_mremap(&parent.mm, base, 2*p, 2*p, 3, moved, &result) && result == moved);
+    assert(!kernel_mm_mprotect(&parent.mm, moved, p, 0));
+
+    struct kernel_mm child = {0};
+    assert(!kernel_mm_fork(&child, &parent.mm));
+    uint64_t child_context;
+    assert(!kernel_mm_context(&child, &child_context));
+    kernel_mm_add_user(&child);
+    struct kernel_mm_pagemap pagemap;
+    kernel_mm_pagemap_hold(&child, &pagemap);
+    uint64_t entries[2];
+    unsigned completed;
+    const uint64_t present = UINT64_C(1) << 63, from_file = UINT64_C(1) << 61;
+    assert(!kernel_mm_pagemap_read(&pagemap, moved/p, 2, 0, entries, &completed) && completed == 2);
+    assert(entries[0] == (present|from_file) && entries[1] == present);
+
+    assert(!kernel_vfs_fallocate(&file->file, KERNEL_VFS_FALLOC_PUNCH_HOLE|KERNEL_VFS_FALLOC_KEEP_SIZE, 0, 2*p));
+    assert(!kernel_mm_pagemap_read(&pagemap, moved/p, 2, 0, entries, &completed) && completed == 2);
+    assert(!entries[0] && entries[1] == present);
+    assert(!kernel_mm_mprotect(&child, moved, p, KERNEL_MM_READ));
+    assert(window_mm_read(&child, child_context, moved) == 0);
+    assert(window_mm_read(&child, child_context, moved+p) == private);
+    assert(window_mm_read(&parent.mm, parent.context, moved+p) == private);
+    kernel_mm_pagemap_put(&pagemap);
+    assert(!kernel_mm_remove_user(&child) && !kernel_mm_release(&child));
+    window_mm_close(&parent, pages);
+    assert(!kernel_open_file_release(&file) && !kernel_vfs_unlink(mount, "/fault-punch"));
+    puts("PASS disk-private provenance survives move, PROT_NONE and fork; hole punch preserves COW data");
 }
 struct window_hot_lookup {
     struct kernel_page_cache *cache;
@@ -621,7 +709,7 @@ static int window_mm_faultaround_oom_order(struct kernel_page_cache *cache,struc
     struct kernel_page_cache_read_page held[2]={0};
     assert(!kernel_page_cache_get_batch(cache,&file->file,0,held,2,0));
     for (unsigned i=0;i<2;i++) assert(!held[i].status && held[i].entry && held[i].valid_bytes==p);
-    struct window_mm view={0};window_mm_create(&view,heap,pages);window_map(&view,file,base,2*p);
+    struct window_mm view={0};window_mm_create(&view,heap,pages);window_map_shared(&view,file,base,2*p);
     struct kernel_mm_mapping mapping;
     assert(kernel_mm_lookup(&view.mm,base,&mapping)==KERNEL_MM_STATUS_NOT_MAPPED);
     window_oom_order.pages=pages;window_oom_order.count=window_oom_order.triggered=0;
@@ -721,7 +809,7 @@ static void window_mm_faultaround_oom(struct kernel_page_cache *cache,struct ker
 {
     const uint64_t base=0x400000,p=BOAROS_PAGE_SIZE;
     window_ready_pair(cache,file);struct window_mm view={0};window_mm_create(&view,heap,pages);
-    window_map(&view,file,base,2*p);window_nosleep_failures=0;window_fail_nosleep=1;
+    window_map_shared(&view,file,base,2*p);window_nosleep_failures=0;window_fail_nosleep=1;
     assert(window_mm_read(&view.mm,view.context,base)==0x30 && source_reads==2);
     window_fail_nosleep=0;
     struct kernel_mm_mapping mapping;
@@ -771,7 +859,7 @@ static void *window_mm_fault_actor(void *argument)
     cache_test_attach(2);
     mm_test_bind(&call->view->mm);
     mm_test_context=call->view->context;
-    window_pause_ready_descriptor=call->ready;
+    window_pause_ready_reference=call->ready;
     window_pause_after_get=!call->ready;
     call->status=kernel_mm_resolve_user_fault(&call->view->mm,call->address,KERNEL_MM_READ);
     mm_test_bind(NULL);
@@ -1053,6 +1141,7 @@ int main(int argc,char **argv)
     window_mm_faultaround(&cache,&heap,&pages,file);
     window_mm_ready_gate(&cache,&heap,&pages,file);
     window_mm_ready_batch(&cache,&heap,&pages,file);
+    window_mm_private_punch(&heap,&pages,&mount);
     window_mm_faultaround_policy(&cache,&heap,&pages,file);
     window_mm_faultaround_existing(&cache,&heap,&pages,file);
     window_mm_faultaround_oom(&cache,&heap,&pages,file);

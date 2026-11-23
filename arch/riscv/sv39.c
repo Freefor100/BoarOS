@@ -20,6 +20,11 @@ unsigned riscv_mmu_cboz64;
 #define RISCV_SV39_PTE_COW UINT64_C(0x100)
 #define RISCV_SV39_PTE_PROTECTED UINT64_C(0x200)
 #define RISCV_SV39_PTE_PROTECTED_COW UINT64_C(0x300)
+/* RSW[1] marks file provenance while valid. A PROT_NONE leaf uses that
+ * bit to identify its software encoding, so its otherwise-clear R bit
+ * preserves provenance while V is clear. */
+#define RISCV_SV39_PTE_FILE RISCV_SV39_PTE_PROTECTED
+#define RISCV_SV39_PTE_PROTECTED_FILE RISCV_SV39_PTE_READ
 #define RISCV_SV39_PTE_FLAGS_MASK UINT64_C(0x3ff)
 #define RISCV_SV39_PTE_ALLOWED_MASK ((UINT64_C(1) << 54U) - UINT64_C(1))
 #define RISCV_SV39_INDEX_MASK UINT64_C(0x1ff)
@@ -723,14 +728,10 @@ static int valid_user_leaf_entry(uint64_t entry)
                             RISCV_SV39_PTE_WRITE |
                             RISCV_SV39_PTE_EXECUTE);
 
-    uint64_t software = entry & (RISCV_SV39_PTE_COW |
-                                 RISCV_SV39_PTE_PROTECTED);
-
     return (entry & ~RISCV_SV39_PTE_ALLOWED_MASK) == 0U &&
            (entry & RISCV_SV39_PTE_VALID) != 0U &&
            (entry & RISCV_SV39_PTE_USER) != 0U && rwx != 0U &&
-           software != RISCV_SV39_PTE_PROTECTED &&
-           software != RISCV_SV39_PTE_PROTECTED_COW &&
+           (!(entry & RISCV_SV39_PTE_FILE) || (entry & RISCV_SV39_PTE_COW)) &&
            !((entry & RISCV_SV39_PTE_WRITE) != 0U &&
              (entry & RISCV_SV39_PTE_READ) == 0U) &&
            !((entry & RISCV_SV39_PTE_COW) != 0U &&
@@ -752,17 +753,16 @@ static int invalidated_owned_entry(uint64_t entry)
 
 static int valid_protected_entry(uint64_t entry)
 {
-    return (entry & ~RISCV_SV39_PTE_ALLOWED_MASK) == 0U &&
-           ((entry & RISCV_SV39_PTE_FLAGS_MASK) ==
-                RISCV_SV39_PTE_PROTECTED ||
-            (entry & RISCV_SV39_PTE_FLAGS_MASK) ==
-                RISCV_SV39_PTE_PROTECTED_COW);
+    uint64_t flags = entry & RISCV_SV39_PTE_FLAGS_MASK;
+    return (entry & ~RISCV_SV39_PTE_ALLOWED_MASK) == 0 &&
+        (flags == RISCV_SV39_PTE_PROTECTED ||
+         (flags & ~RISCV_SV39_PTE_PROTECTED_FILE) == RISCV_SV39_PTE_PROTECTED_COW);
 }
 
 static int protected_cow_entry(uint64_t entry)
 {
     return (entry & ~RISCV_SV39_PTE_ALLOWED_MASK) == 0U &&
-           (entry & RISCV_SV39_PTE_FLAGS_MASK) ==
+           (entry & (RISCV_SV39_PTE_FLAGS_MASK & ~RISCV_SV39_PTE_PROTECTED_FILE)) ==
                RISCV_SV39_PTE_PROTECTED_COW;
 }
 
@@ -807,6 +807,28 @@ static uint64_t user_cow_entry(uint64_t address,
     return user_leaf_entry(address,
                            permissions & ~RISCV_SV39_WRITE) |
            RISCV_SV39_PTE_COW;
+}
+
+static int user_entry_file_backed(uint64_t entry)
+{
+    return (entry & (entry & RISCV_SV39_PTE_VALID ?
+        RISCV_SV39_PTE_FILE : RISCV_SV39_PTE_PROTECTED_FILE)) != 0;
+}
+
+static unsigned user_entry_flags(uint64_t entry)
+{
+    return ((entry & RISCV_SV39_PTE_COW) ? KERNEL_MM_LEAF_COW : 0) |
+        (user_entry_file_backed(entry) ? KERNEL_MM_LEAF_FILE : 0);
+}
+
+static uint64_t encode_user_entry(uint64_t address, uint32_t permissions, unsigned flags)
+{
+    int cow = (flags & KERNEL_MM_LEAF_COW) != 0;
+    int file = (flags & KERNEL_MM_LEAF_FILE) != 0;
+    if (!permissions)
+        return protected_entry(address, cow) | (file ? RISCV_SV39_PTE_PROTECTED_FILE : 0);
+    uint64_t leaf = cow ? user_cow_entry(address, permissions) : user_leaf_entry(address, permissions);
+    return leaf | (file ? RISCV_SV39_PTE_FILE : 0);
 }
 
 enum riscv_sv39_status riscv_sv39_user_space_init(
@@ -1207,7 +1229,8 @@ enum riscv_sv39_status riscv_sv39_user_leaf_probe_slot(const struct riscv_sv39_u
     *out=(struct kernel_mm_leaf){.virtual_address=v&~(size-1),
         .physical_address=entry_address(entry),.cookie=entry,.order=order,
         .permissions=valid_protected_entry(entry)?0:entry_permissions(entry),
-        .cow=present_cow_entry(entry)||protected_cow_entry(entry)};
+        .cow=present_cow_entry(entry)||protected_cow_entry(entry),
+        .file_backed=user_entry_file_backed(entry)};
     return RISCV_SV39_STATUS_OK;
 }
 
@@ -1347,6 +1370,11 @@ enum riscv_sv39_status riscv_sv39_user_detach_range(
         } else if (valid_user_leaf_entry(middle[m]) || valid_protected_entry(middle[m])) {
             uint64_t old=middle[m], base=address & ~(leaf_span-1);
             if (address!=base || base+leaf_span>end) return RISCV_SV39_STATUS_INVALID;
+            if (cursor->file_only) {
+                cursor->address=base+leaf_span;
+                visits++;
+                continue;
+            }
             int present=valid_user_leaf_entry(old), cow=present_cow_entry(old)||protected_cow_entry(old);
             if ((present ? s->leaf_pages : s->protected_pages)<512 || (cow && s->cow_pages<512))
                 return RISCV_SV39_STATUS_STATE;
@@ -1370,7 +1398,7 @@ enum riscv_sv39_status riscv_sv39_user_detach_range(
              * slots while the number of actual removals stays bounded. */
             do {
                 uint64_t old=leaves[l];
-                if (old) {
+                if (old && (!cursor->file_only || user_entry_file_backed(old))) {
                     visits++;
                     int present=valid_user_leaf_entry(old), protected=valid_protected_entry(old);
                     int cow=present_cow_entry(old)||protected_cow_entry(old);
@@ -1591,12 +1619,14 @@ enum riscv_sv39_status riscv_sv39_user_prepare_move(struct riscv_sv39_user_space
     return install_prepared_leaf(s, address, 0, 0, prepared);
 }
 enum riscv_sv39_status riscv_sv39_user_map_prepared_order(struct riscv_sv39_user_space *s,
-    uint64_t address, uint64_t physical, uint32_t permissions, int cow, uint32_t order,
+    uint64_t address, uint64_t physical, uint32_t permissions, int flags, uint32_t order,
     struct kernel_mm_leaf_preparation *prepared)
 {
     if ((order != 0 && order != 9) || !s || (permissions && !valid_user_permissions(permissions)) ||
+        ((flags & KERNEL_MM_LEAF_FILE) && (order || !(flags & KERNEL_MM_LEAF_COW))) ||
         ((physical|address) & (((uint64_t)BOAROS_PAGE_SIZE<<order)-1)))
         return RISCV_SV39_STATUS_INVALID;
+    int cow = (flags & KERNEL_MM_LEAF_COW) != 0;
     void *owner;
     uint32_t pages=1U<<order;
     if (!physical_page_owned_order(s->allocator,physical,order) ||
@@ -1605,8 +1635,7 @@ enum riscv_sv39_status riscv_sv39_user_map_prepared_order(struct riscv_sv39_user
         physical_page_map_owned(s->allocator, physical, &owner) != PHYSICAL_PAGE_STATUS_OK)
         return RISCV_SV39_STATUS_STATE;
     enum riscv_sv39_status status = install_prepared_leaf(s, address,
-        permissions ? (cow ? user_cow_entry(physical,permissions) : user_leaf_entry(physical, permissions)) :
-        protected_entry(physical,cow != 0), order, prepared);
+        encode_user_entry(physical, permissions, flags), order, prepared);
     if (status) return status;
     if (permissions) s->leaf_pages+=pages; else s->protected_pages+=pages;
     if (cow) s->cow_pages+=pages;
@@ -1614,9 +1643,9 @@ enum riscv_sv39_status riscv_sv39_user_map_prepared_order(struct riscv_sv39_user
     return RISCV_SV39_STATUS_OK;
 }
 enum riscv_sv39_status riscv_sv39_user_map_prepared_page(struct riscv_sv39_user_space *s,
-    uint64_t address, uint64_t physical, uint32_t permissions, int cow,
+    uint64_t address, uint64_t physical, uint32_t permissions, int flags,
     struct kernel_mm_leaf_preparation *prepared)
-{ return riscv_sv39_user_map_prepared_order(s,address,physical,permissions,cow,0,prepared); }
+{ return riscv_sv39_user_map_prepared_order(s,address,physical,permissions,flags,0,prepared); }
 enum riscv_sv39_status riscv_sv39_user_move_leaf(struct riscv_sv39_user_space *s,
     uint64_t from, uint64_t to)
 {
@@ -1851,13 +1880,15 @@ enum riscv_sv39_status riscv_sv39_user_fork_commit_window(
 }
 
 static unsigned map_owned_window(struct riscv_sv39_user_space *s, uint64_t address,
-    unsigned pages, const uint64_t *physical, uint32_t permissions, int cow,
+    unsigned pages, const uint64_t *physical, uint32_t permissions, int flags,
     int required_slot)
 {
     if (!pages) return 0;
+    int cow = (flags & KERNEL_MM_LEAF_COW) != 0;
     unsigned slots = (RISCV_SV39_PAGE_SIZE_2M - (address & (RISCV_SV39_PAGE_SIZE_2M-1))) / BOAROS_PAGE_SIZE;
     if ((address & BOAROS_PAGE_MASK) || address < BOAROS_PAGE_SIZE ||
-        (slots < 32 && (pages >> slots)) || (permissions && !valid_user_permissions(permissions)))
+        (slots < 32 && (pages >> slots)) || (permissions && !valid_user_permissions(permissions)) ||
+        ((flags & KERNEL_MM_LEAF_FILE) && !cow))
         __builtin_trap();
     uint64_t *slot;
     uint32_t order;
@@ -1872,9 +1903,7 @@ static unsigned map_owned_window(struct riscv_sv39_user_space *s, uint64_t addre
         if (p & BOAROS_PAGE_MASK) __builtin_trap();
         if ((permissions ? s->leaf_pages : s->protected_pages) >= UINT32_MAX-count ||
             (cow && s->cow_pages >= UINT32_MAX-count)) __builtin_trap();
-        uint64_t entry = permissions ?
-            (cow ? user_cow_entry(p, permissions) : user_leaf_entry(p, permissions)) :
-            protected_entry(p, cow);
+        uint64_t entry = encode_user_entry(p, permissions, flags);
         __atomic_store_n(&slot[index], entry, __ATOMIC_RELEASE);
         installed |= 1U << index;
         count++;
@@ -1887,16 +1916,16 @@ static unsigned map_owned_window(struct riscv_sv39_user_space *s, uint64_t addre
 }
 
 unsigned riscv_sv39_user_map_owned_window(struct riscv_sv39_user_space *s, uint64_t address,
-    unsigned pages, const uint64_t *physical, uint32_t permissions, int cow)
+    unsigned pages, const uint64_t *physical, uint32_t permissions, int flags)
 {
-    return map_owned_window(s, address, pages, physical, permissions, cow, -1);
+    return map_owned_window(s, address, pages, physical, permissions, flags, -1);
 }
 
 unsigned riscv_sv39_user_map_required_window(struct riscv_sv39_user_space *s, uint64_t address,
-    unsigned pages, const uint64_t *physical, uint32_t permissions, int cow, unsigned required_slot)
+    unsigned pages, const uint64_t *physical, uint32_t permissions, int flags, unsigned required_slot)
 {
     if (required_slot >= 32 || !(pages & (1U << required_slot))) __builtin_trap();
-    return map_owned_window(s, address, pages, physical, permissions, cow, (int)required_slot);
+    return map_owned_window(s, address, pages, physical, permissions, flags, (int)required_slot);
 }
 
 
@@ -2190,7 +2219,7 @@ enum riscv_sv39_status riscv_sv39_user_protect_resident_page(
     if (permissions == 0) {
         if (!present) return RISCV_SV39_STATUS_OK;
         if (space->protected_pages == UINT32_MAX) return RISCV_SV39_STATUS_STATE;
-        replacement = protected_entry(entry_address(old), cow);
+        replacement = encode_user_entry(entry_address(old), 0, user_entry_flags(old));
         space->leaf_pages--;
         space->protected_pages++;
     } else {
@@ -2199,8 +2228,7 @@ enum riscv_sv39_status riscv_sv39_user_protect_resident_page(
             space->protected_pages--;
             space->leaf_pages++;
         }
-        replacement = cow ? user_cow_entry(entry_address(old), permissions)
-                          : user_leaf_entry(entry_address(old), permissions);
+        replacement = encode_user_entry(entry_address(old), permissions, user_entry_flags(old));
     }
     if (replacement != old) {
         __atomic_store_n(leaf, replacement, __ATOMIC_RELEASE);
@@ -2313,9 +2341,7 @@ enum riscv_sv39_status riscv_sv39_user_protect_owned_range(
             }
             uint64_t old=level1[level1_index];
             if (valid_user_leaf_entry(old) || valid_protected_entry(old)) {
-                int cow=present_cow_entry(old)||protected_cow_entry(old);
-                uint64_t replacement=permissions ? (cow ? user_cow_entry(entry_address(old),permissions) :
-                    user_leaf_entry(entry_address(old),permissions)) : protected_entry(entry_address(old),cow);
+                uint64_t replacement=encode_user_entry(entry_address(old), permissions, user_entry_flags(old));
                 if (replacement!=old) {
                     __atomic_store_n(&level1[level1_index],replacement,__ATOMIC_RELEASE); changed=1;
                 }
@@ -2341,20 +2367,9 @@ enum riscv_sv39_status riscv_sv39_user_protect_owned_range(
                 if (page_base < start || page_base >= end) {
                     continue;
                 }
-                if (valid_user_leaf_entry(level0[level0_index])) {
-                    int cow = present_cow_entry(level0[level0_index]);
-
-                    replacement = permissions == 0U
-                                      ? protected_entry(entry_address(
-                                            level0[level0_index]),
-                                                        cow)
-                                      : cow
-                                            ? user_cow_entry(entry_address(
-                                                  level0[level0_index]),
-                                                             permissions)
-                                            : user_leaf_entry(entry_address(
-                                                  level0[level0_index]),
-                                                              permissions);
+                uint64_t leaf = level0[level0_index];
+                if (valid_user_leaf_entry(leaf)) {
+                    replacement = encode_user_entry(entry_address(leaf), permissions, user_entry_flags(leaf));
                     if (replacement != level0[level0_index]) {
                         level0[level0_index] = replacement;
                         changed = 1;
@@ -2363,19 +2378,9 @@ enum riscv_sv39_status riscv_sv39_user_protect_owned_range(
                         space->leaf_pages--;
                         space->protected_pages++;
                     }
-                } else if (permissions != 0U &&
-                           valid_protected_entry(
-                               level0[level0_index])) {
-                    int cow = protected_cow_entry(
-                        level0[level0_index]);
-
-                    level0[level0_index] = cow
-                        ? user_cow_entry(
-                              entry_address(level0[level0_index]),
-                              permissions)
-                        : user_leaf_entry(
-                              entry_address(level0[level0_index]),
-                              permissions);
+                } else if (permissions != 0U && valid_protected_entry(leaf)) {
+                    level0[level0_index] = encode_user_entry(entry_address(leaf), permissions,
+                        user_entry_flags(leaf));
                     space->protected_pages--;
                     space->leaf_pages++;
                     changed = 1;
@@ -2530,9 +2535,8 @@ static enum riscv_sv39_status fork_leaf_entry(uint64_t old, int action, uint64_t
             return RISCV_SV39_STATUS_STATE;
         *entry = old;
     } else if (action == RISCV_SV39_FORK_PRIVATE) {
-        uint64_t physical = entry_address(old);
-        *entry = valid_protected_entry(old) ? protected_entry(physical, 1) :
-            user_cow_entry(physical, entry_permissions(old) & ~RISCV_SV39_USER);
+        uint32_t permissions = valid_protected_entry(old) ? 0 : entry_permissions(old) & ~RISCV_SV39_USER;
+        *entry = encode_user_entry(entry_address(old), permissions, user_entry_flags(old) | KERNEL_MM_LEAF_COW);
     } else return RISCV_SV39_STATUS_STATE;
     return RISCV_SV39_STATUS_OK;
 }

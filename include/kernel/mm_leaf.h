@@ -2,6 +2,11 @@
 #define BOAROS_KERNEL_MM_LEAF_H
 #include <stdint.h>
 #include <kernel/page.h>
+
+enum kernel_mm_leaf_flags {
+    KERNEL_MM_LEAF_COW = 1U,
+    KERNEL_MM_LEAF_FILE = 2U, /* Unmodified page of a private disk mapping; implies COW. */
+};
 /* Snapshot while the caller holds the MM metadata qualification. The PTE owns
  * exactly one reference to physical_address at order, including PROT_NONE.
  * Snapshot values are not references: retain the existing owner before dropping
@@ -13,6 +18,7 @@ struct kernel_mm_leaf {
     uint32_t permissions;     /* effective ARCH_MMU_* flags; zero for PROT_NONE */
     uint32_t order;           /* number of base-page address bits in this leaf */
     uint32_t cow;
+    uint32_t file_backed;
 };
 /* A leaf probe also states which parents are missing for a base-page install:
  * bit 0 is the middle table, bit 1 the leaf table. Present or PROT_NONE leaves

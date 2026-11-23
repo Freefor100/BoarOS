@@ -11,6 +11,7 @@
 struct kernel_mm_detach_cursor {
     uint64_t address, middle_address;
     unsigned phase;
+    int file_only; /* Preserve private copies when the disk range is invalidated. */
 };
 struct kernel_mm_retirement {
     uint64_t pages[KERNEL_MM_RETIRE_CAPACITY];
