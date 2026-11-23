@@ -2298,13 +2298,19 @@ void kernel_signal_force_seccomp(struct kernel_task *task, uint64_t address,
         .signal=31,.code=1,.address=address,.error=error,.syscall=syscall,.arch=arch});
 }
 
-static inline int signal_return_work(const struct kernel_task *task)
+static inline int signal_return_pending(const struct kernel_task *task,
+    const struct kernel_task *leader)
 {
-    struct kernel_task *leader = signal_group_leader(task);
     uint64_t observed = __atomic_load_n(&task->signal_pending,__ATOMIC_RELAXED) |
         (leader ? __atomic_load_n(&leader->group_pending,__ATOMIC_RELAXED) : 0);
     return task->signal_fault.signal || task->terminate_requested ||
-           task->signal_restore_mask || (observed & ~__atomic_load_n(&task->signal_blocked,__ATOMIC_RELAXED));
+        task->signal_restore_mask ||
+        (observed && (observed & ~__atomic_load_n(&task->signal_blocked,__ATOMIC_RELAXED)));
+}
+
+static inline int signal_return_work(const struct kernel_task *task)
+{
+    return signal_return_pending(task, signal_group_leader(task));
 }
 
 static uint64_t signal_commit_handler_locked(struct kernel_task *task,uint32_t sig,
@@ -2461,4 +2467,31 @@ enum kernel_signal_select_result kernel_signal_select(
 {
     if (!signal_return_work(task)) return KERNEL_SIGNAL_SELECT_NONE;
     return signal_select_active(task, delivery);
+}
+
+static __attribute__((noinline)) enum kernel_signal_select_result signal_prepare_active_return(
+    struct kernel_task *task, struct kernel_signal_delivery *delivery,
+    enum kernel_signal_restart *restart)
+{
+    enum kernel_signal_select_result selected = kernel_signal_select(task, delivery);
+    *restart = KERNEL_SIGNAL_RESTART_NONE;
+    if (selected != KERNEL_SIGNAL_SELECT_EXIT &&
+        task->syscall_restart.kind != KERNEL_SYSCALL_RESTART_NONE) {
+        int handler = selected == KERNEL_SIGNAL_SELECT_HANDLER;
+        *restart = kernel_signal_restart_decide(task, handler, handler ? delivery->flags : 0);
+    }
+    return selected;
+}
+
+enum kernel_signal_select_result kernel_signal_prepare_user_return(
+    struct kernel_task *task, struct kernel_signal_delivery *delivery,
+    enum kernel_signal_restart *restart)
+{
+    /* A running user task retains its group leader. Delivery takes the
+     * scheduler lock to select from the actual pending records. */
+    if (task->syscall_restart.kind != KERNEL_SYSCALL_RESTART_NONE ||
+        signal_return_pending(task, task->group_leader))
+        return signal_prepare_active_return(task, delivery, restart);
+    *restart = KERNEL_SIGNAL_RESTART_NONE;
+    return KERNEL_SIGNAL_SELECT_NONE;
 }

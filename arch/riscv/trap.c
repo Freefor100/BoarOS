@@ -261,18 +261,26 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
         kernel_cpu_current()->syscall_dispatches++;
 #endif
 #if !BOAROS_COST_DIAGNOSTICS
-        /* This query has no arguments. Import the full frame whenever a
-         * tracer or filter may inspect it. The common user return still
-         * performs accounting, pending work and rescheduling. */
-        if (frame->a7==LINUX_SYSCALL_GETPID && !tracer && frame->sepc<=UINT64_MAX-4 &&
+        uint64_t number = frame->a7;
+        uint32_t option = (uint32_t)frame->a0;
+        int timer_slack = number == LINUX_SYSCALL_PRCTL &&
+            option - LINUX_PR_SET_TIMERSLACK <= LINUX_PR_GET_TIMERSLACK - LINUX_PR_SET_TIMERSLACK;
+        if ((number == LINUX_SYSCALL_GETPID || timer_slack) && !tracer && frame->sepc <= UINT64_MAX - 4 &&
             !__atomic_load_n(&caller->seccomp_mode,__ATOMIC_RELAXED) &&
             !kernel_bpf_trace_active()) {
-            kernel_pid_t pid;
-            if (kernel_task_user_tgid(caller,&pid)!=KERNEL_TASK_STATUS_OK) riscv_trap_fatal(frame);
-            kernel_bpf_trace_exit(caller,LINUX_SYSCALL_GETPID,pid);
-            frame->a0=(uint64_t)pid;
+            int64_t value;
+            if (number == LINUX_SYSCALL_GETPID) {
+                kernel_pid_t pid;
+                if (kernel_task_user_tgid(caller,&pid)!=KERNEL_TASK_STATUS_OK) riscv_trap_fatal(frame);
+                value = pid;
+            } else if (option == LINUX_PR_SET_TIMERSLACK) {
+                kernel_task_timerslack_set(caller, frame->a1);
+                value = 0;
+            } else value = (int64_t)kernel_task_timerslack_get(caller);
+            kernel_bpf_trace_exit(caller, number, value);
+            frame->a0=(uint64_t)value;
             frame->sepc+=4;
-            if (caller->ptrace) kernel_ptrace_syscall_exit(caller,frame,LINUX_SYSCALL_GETPID);
+            if (caller->ptrace) kernel_ptrace_syscall_exit(caller, frame, number);
             return;
         }
 #endif
@@ -451,11 +459,10 @@ void riscv_trap_return_prepare(struct riscv_trap_frame *frame)
         kernel_cpu_current()->user_returns++;
     } else kernel_scheduler_prepare_idle_return();
 #else
-    if ((frame->sstatus & RISCV_SSTATUS_SPP) == 0U) kernel_task_prepare_user_return();
-    else kernel_scheduler_prepare_idle_return();
-    riscv_signal_prepare_user_return(frame);
-    if(!(frame->sstatus&RISCV_SSTATUS_SPP) && kernel_task_current()->ptrace)
-        kernel_ptrace_user_return(kernel_task_current(),frame);
+    if ((frame->sstatus & RISCV_SSTATUS_SPP) == 0U) {
+        if (kernel_task_prepare_user_return()) riscv_signal_prepare_user_return(frame);
+        if (kernel_task_current()->ptrace) kernel_ptrace_user_return(kernel_task_current(), frame);
+    } else kernel_scheduler_prepare_idle_return();
 #endif
 #if BOAROS_COST_DIAGNOSTICS
     if ((frame->sstatus & RISCV_SSTATUS_SPP) == 0U) kernel_cost_user_return();

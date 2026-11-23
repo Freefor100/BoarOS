@@ -163,20 +163,27 @@ int main(void)
     assert(!kernel_open_file_async_fcntl(&retained,KERNEL_FILES_F_GETOWN,0,NULL));
     assert(ctx->owner==&child.id && ctx->owner!=&identities[0]);
     kernel_open_file_async_close(&retained);extra_lookup=NULL;assert(child.id.references==1&&!allocations);
-    assert(!kernel_open_file_async_lease_prepare(&regular));
-    kernel_async_lease_notify.install(&regular,11);
+    allocation_failure=1;
+    assert(!kernel_open_file_async_lease_prepare(&regular) && !regular.async_io);
+    allocation_failure=0;
+    struct kernel_file_lease *lease=kernel_open_file_async_lease_prepare(&regular);
+    assert(lease && lease->file==&regular.file && lease->description==&regular);
+    lease->notify->install(lease->description,11);
     assert(regular.open_flags==(020000|04000));
     assert(!kernel_open_file_async_flags(&regular,11,0)&&regular.open_flags==020000);
     assert(kernel_open_file_async_fcntl(&regular,KERNEL_FILES_F_GETOWN,0,NULL)==41);
     assert(!kernel_open_file_async_fcntl(&regular,KERNEL_FILES_F_SETOWN,42,NULL));
     assert(!kernel_open_file_async_fcntl(&regular,KERNEL_FILES_F_SETSIG,35,NULL));
-    kernel_async_lease_notify.install(&regular,12);
-    kernel_async_lease_notify.signal(&regular);
+    lease->notify->install(lease->description,12);
+    lease->notify->signal(lease->description);
     assert(signals==7&&delivered_owner==&identities[1]&&delivered_fd==12&&
            delivered_signum==35&&delivered_reason==KERNEL_ASYNC_POLL_MSG);
-    kernel_async_lease_notify.clear(&regular);
+    lease->notify->clear(lease->description);
     assert(!regular.open_flags&&!kernel_open_file_async_fcntl(&regular,KERNEL_FILES_F_GETOWN,0,NULL)&&
            !kernel_open_file_async_fcntl(&regular,KERNEL_FILES_F_GETSIG,0,NULL));
+    allocation_failure=1;
+    assert(kernel_open_file_async_lease_prepare(&regular)==lease && allocations==1);
+    allocation_failure=0;
     kernel_open_file_async_close(&regular);
     assert(!allocations&&identities[0].references==1&&identities[1].references==1);
     puts("PASS async OFD: owner/signum, allocation rollback, saved fd, pipe direction, lease and close/callback drain");

@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 #include <poll.h>
 #include <pthread.h>
 #include <sched.h>
@@ -121,6 +123,18 @@ int main(int argc, char **argv)
     param.sched_priority = 0;
     CHECK(syscall(SYS_sched_setscheduler, 0, SCHED_OTHER, &param) == 0);
     CHECK(slack() == 50000);
+
+    struct sock_filter filter[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_prctl, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EACCES),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_fprog program = {.len = sizeof(filter) / sizeof(filter[0]), .filter = filter};
+    CHECK(syscall(SYS_prctl, PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0);
+    CHECK(syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &program) == 0);
+    CHECK(slack() == -1 && errno == EACCES);
+    CHECK(setslack(70000) == -1 && errno == EACCES);
     puts(failures ? "timer slack FAIL" : "timer slack PASS");
     fflush(stdout);
     reboot(RB_POWER_OFF);

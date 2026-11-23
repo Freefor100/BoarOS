@@ -159,6 +159,9 @@ enum kernel_signal_select_result kernel_signal_select(
     struct kernel_signal_delivery *delivery);
 enum kernel_signal_restart kernel_signal_restart_decide(
     struct kernel_task *task, int has_handler, uint64_t flags);
+enum kernel_signal_select_result kernel_signal_prepare_user_return(
+    struct kernel_task *task, struct kernel_signal_delivery *delivery,
+    enum kernel_signal_restart *restart);
 void kernel_signal_clear_syscall_restart(struct kernel_task *task);
 /* Restart payload belongs to syscall 128. Tracer replacements use the full
  * dispatcher number, not seccomp_data's truncated signed nr. */

@@ -142,7 +142,6 @@
 #define LINUX_SYSCALL_PRLIMIT64 261U
 #define LINUX_SYSCALL_CAPGET 90U
 #define LINUX_SYSCALL_CAPSET 91U
-#define LINUX_SYSCALL_PRCTL 167U
 #define LINUX_SYSCALL_SETREGID 143U
 #define LINUX_SYSCALL_SETFSGID 152U
 #define LINUX_SYSCALL_GETGROUPS 158U
@@ -592,9 +591,6 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
     } else if (request->number == LINUX_SYSCALL_CAPSET) {
         if (syscall_handle_capset(caller,request,&decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-    } else if (request->number == LINUX_SYSCALL_PRCTL) {
-        if (syscall_handle_prctl(caller,request,&decoded) != KERNEL_SYSCALL_STATUS_OK)
-            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if ((request->number>=LINUX_SYSCALL_SETREGID && request->number<=LINUX_SYSCALL_SETFSGID) ||
                request->number==LINUX_SYSCALL_GETGROUPS || request->number==LINUX_SYSCALL_SETGROUPS) {
         if (syscall_handle_credentials(caller,request,&decoded) != KERNEL_SYSCALL_STATUS_OK)
@@ -962,5 +958,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         *result = decoded;
         return KERNEL_SYSCALL_STATUS_OK;
     }
+    if (request->number == LINUX_SYSCALL_PRCTL)
+        return syscall_handle_prctl(caller, request, result);
     return dispatch_operation(caller,request,result);
 }

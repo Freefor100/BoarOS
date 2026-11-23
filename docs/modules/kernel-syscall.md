@@ -32,6 +32,7 @@ flowchart LR
 ```
 
 - **高频标量快路径（编号 172～178）**：`getpid`、`getppid`、`gettid`、`getuid`、`geteuid`、`getgid`、`getegid` 这 7 个极高频无副作用查询在 `kernel_syscall_dispatch()` 中直接读取当前任务身份或不可变凭据指针返回，跳过大型主分派表路由。
+- **线程控制与用户返回**。`prctl` 经过系统调用过滤和入口追踪后直接进入线程控制分派。RISC-V 对当前线程的定时器宽限查询和设置提供简化入口，启用过滤或追踪时使用完整系统调用分派。返回用户空间时，调度器先处理退役资源和需要重新调度的任务，再从待处理位判断是否进入信号交付。同步系统调用持续计入内核执行时间，只有中断处理需要保存并恢复前一记账状态。
 - **架构解耦的动作返回机制（`enum kernel_syscall_action`）**：分派器不直接操作底层寄存器帧，而是返回明确的动作码指导架构陷入层完成收尾——包括 `RETURN`（普通写回返回值）、`RETURN_FINAL`、`EXIT` / `EXIT_GROUP`（终止线程或进程组）、`EXEC`（装载新地址空间且不推进旧程序计数器）、`CLONE` / `CLONE3`（传递完整寄存器快照构造子任务）、`WAIT4` / `WAITID`、`YIELD` 与 `SIGNAL_RETURN`。
 - **双架构差异的 4 个系统调用**：RISC-V 额外提供 `163`（`getrlimit`）、`164`（`setrlimit`）、`258`（`riscv_hwprobe`）与 `259`（`riscv_flush_icache`）；其余 274 个编号两架构完全共享（LoongArch 统一使用现代 `prlimit64` 查询和修改资源限额）。
 

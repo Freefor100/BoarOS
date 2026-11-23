@@ -135,6 +135,23 @@ static void close_releases_waiter(void)
     CHECK(munmap(memory, page_size) == 0);
 }
 
+static void zero_page_writes_stay_private(void)
+{
+    unsigned char *memory = anonymous_pages(2);
+    int fd = open_faults(memory, 2);
+    struct uffd_zero zero = {.range = {(uintptr_t)memory, 2 * page_size}};
+    CHECK(ioctl(fd, UFFD_ZEROPAGE, &zero) == 0 && zero.copied == (int64_t)(2 * page_size));
+    CHECK(mprotect(memory, page_size, PROT_READ) == 0);
+    CHECK(mprotect(memory, page_size, PROT_READ | PROT_WRITE) == 0);
+    CHECK(memory[0] == 0 && memory[page_size] == 0);
+    memory[0] = 0x35;
+    CHECK(memory[page_size] == 0);
+    CHECK(close(fd) == 0);
+    memory[page_size] = 0x69;
+    CHECK(memory[0] == 0x35 && memory[page_size] == 0x69);
+    CHECK(munmap(memory, 2 * page_size) == 0);
+}
+
 static void remote_resolution(void)
 {
     unsigned char *memory = anonymous_pages(1);
@@ -163,6 +180,7 @@ int main(void)
     CHECK(page_size == 4096 || page_size == 16384);
     resolve_and_unregister();
     close_releases_waiter();
+    zero_page_writes_stay_private();
     remote_resolution();
     puts("UFFD PASS");
     fflush(stdout);

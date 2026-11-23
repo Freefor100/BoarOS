@@ -3536,9 +3536,12 @@ int kernel_task_setns(struct kernel_task *task,int32_t fd,uint32_t type)
 
 int kernel_task_prepare_user_return(void)
 {
-    if (kernel_cpu_schedule_requested(kernel_cpu_current()) && scheduler_reschedule(0, 0, 0) != KERNEL_SCHEDULER_STATUS_OK)
-        __builtin_trap();
-    struct kernel_task *task = kernel_cpu_current()->current;
+    struct kernel_cpu *cpu = kernel_cpu_current();
+    if (kernel_cpu_schedule_requested(cpu)) {
+        if (scheduler_reschedule(0, 0, 0) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+        cpu = kernel_cpu_current();
+    }
+    struct kernel_task *task = cpu->current;
     if (task == 0 || task->arch.user_mode != 1U) return 0;
     if (task->files.state==KERNEL_FILES_LIVE) (void)kernel_files_drain_file_cleanup(&task->files);
     kernel_mm_drain_sources(&task->mm);

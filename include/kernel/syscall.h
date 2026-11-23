@@ -4,7 +4,10 @@
 #include <stdint.h>
 
 #define KERNEL_SYSCALL_ARGUMENT_COUNT 6U
+#define LINUX_SYSCALL_PRCTL 167U
 #define LINUX_SYSCALL_GETPID 172U
+#define LINUX_PR_SET_TIMERSLACK 29U
+#define LINUX_PR_GET_TIMERSLACK 30U
 
 struct kernel_task;
 

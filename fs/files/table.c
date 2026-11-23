@@ -1232,9 +1232,10 @@ enum kernel_files_status kernel_files_fcntl(
                  (kernel_open_file_mode(file)&KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFREG)
             *result=-KERNEL_EINVAL;
         else {
-            *result=type==KERNEL_LEASE_UNLOCK ? 0 : kernel_open_file_async_lease_prepare(file);
-            if (!*result)
-                *result=kernel_vfs_lease_set(&file->file,type,(int)fd,file,&kernel_async_lease_notify);
+            struct kernel_file_lease *record=type==KERNEL_LEASE_UNLOCK ?
+                NULL : kernel_open_file_async_lease_prepare(file);
+            *result=type!=KERNEL_LEASE_UNLOCK && !record ? -KERNEL_ENOMEM :
+                kernel_vfs_lease_set(&file->file,type,(int)fd,record);
         }
         return KERNEL_FILES_STATUS_OK;
     }
