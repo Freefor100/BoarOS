@@ -381,6 +381,8 @@ void boaros_lwip_tcp_timer_arm(struct boaros_lwip_tcp_context *ctx, u32_t now);
 #if BOAROS_USER_SMP
 int boaros_lwip_tcp_reclaim_timewait(void);
 /* The caller owns the input bucket and every PCB linked in it. */
+unsigned boaros_lwip_tcp_receive_train(struct pbuf *const packets[], unsigned count,
+    struct netif *inp, const ip_addr_t *src, const ip_addr_t *dst, struct tcp_pcb **owner_bucket);
 void boaros_lwip_tcp_input_packet(struct pbuf *p, struct netif *inp,
     const ip_addr_t *src, const ip_addr_t *dst, const void *network, u16_t network_length,
     struct tcp_pcb **owner_bucket);
